@@ -3,13 +3,17 @@
 #include <iostream>
 
 void Engine::Initialize(){
-    std::cout << "Engine initialized.\n";
+    if(!m_window.Initialize()){
+        std::cerr << "Failed to initialize window.\n";
+    }
 }
 
 void Engine::Run(){
-    std::cout << "Engine running.\n";
+    while(!m_window.ShouldClose()){
+        m_window.ProcessMessages();
+    }
 }
 
 void Engine::Shutdown(){
-    std::cout << "Engine shutting down.\n";
+    m_window.Shutdown();
 }

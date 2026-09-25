@@ -12,4 +12,10 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 add_executable(Engine
     src/main.cpp
     src/Engine/Engine.cpp
+    src/Platform/Windows/WindowsWindow.cpp
+)
+
+target_include_directories(Engine
+    PRIVATE
+        src
 )
