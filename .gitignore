@@ -1,0 +1,21 @@
+# Build Directories
+/build/
+/out/
+/cmake-build-*/
+
+# VS Code
+.vscode/
+
+# CMake
+CmakeUserPresets.json
+
+# Compiled binaries
+*.exe
+*.dll
+*.lib
+*.obj
+*.pdb
+
+# Debug symbols / genned files
+*.ilk
+*.exp
