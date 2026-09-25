@@ -3,16 +3,78 @@
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
 
+#include <utility>
+
 LRESULT CALLBACK WindowProc(
     HWND hwnd,
     UINT uMsg,
     WPARAM wParam,
     LPARAM lParam
 ){
-    switch(uMsg){
-        case WM_CLOSE:
-            DestroyWindow(hwnd);
+    WindowsWindow* window = nullptr;
+
+    if(uMsg == WM_NCCREATE)
+    {
+        const CREATESTRUCTW* createStruct =
+            reinterpret_cast<const CREATESTRUCTW*>(lParam);
+
+        window =
+            static_cast<WindowsWindow*>(createStruct->lpCreateParams);
+
+        SetWindowLongPtrW(
+            hwnd,
+            GWLP_USERDATA,
+            reinterpret_cast<LONG_PTR>(window)
+        );
+    }
+    else
+    {
+        window =
+            reinterpret_cast<WindowsWindow*>(
+                GetWindowLongPtrW(hwnd, GWLP_USERDATA)
+            );
+    }
+
+    switch(uMsg)
+    {
+        case WM_KEYDOWN:
+        {
+            Event event;
+            event.type = EventType::KeyPressed;
+            event.keyCode = static_cast<unsigned int>(wParam);
+
+            if(window){
+                window->DispatchEvent(event);
+            }
+
             return 0;
+        }
+
+        case WM_KEYUP:
+        {
+            Event event;
+            event.type = EventType::KeyReleased;
+            event.keyCode = static_cast<unsigned int>(wParam);
+
+            if(window){
+                window->DispatchEvent(event);
+            }
+
+            return 0;
+        }
+
+        case WM_CLOSE:
+        {
+            Event event;
+            event.type = EventType::WindowClose;
+
+            if (window)
+            {
+                window->DispatchEvent(event);
+            }
+
+            return 0;
+        }
 
         case WM_DESTROY:
             PostQuitMessage(0);
@@ -56,7 +118,7 @@ bool WindowsWindow::Initialize()
         nullptr,
         nullptr,
         instance,
-        nullptr
+        this
     );
 
     if(m_windowHandle == nullptr){
@@ -99,4 +161,21 @@ void WindowsWindow::ProcessMessages()
 bool WindowsWindow::ShouldClose() const
 {
     return m_shouldClose;
+}
+
+void WindowsWindow::Close(){
+    m_shouldClose = true;
+}
+
+void WindowsWindow::SetEventCallback(EventCallback callback)
+{
+    m_eventCallback = std::move(callback);
+}
+
+void WindowsWindow::DispatchEvent(const Event& event)
+{
+    if (m_eventCallback)
+    {
+        m_eventCallback(event);
+    }
 }

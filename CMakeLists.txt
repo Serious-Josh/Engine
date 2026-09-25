@@ -13,6 +13,8 @@ add_executable(Engine
     src/main.cpp
     src/Engine/Engine.cpp
     src/Platform/Windows/WindowsWindow.cpp
+    src/Core/Time.cpp
+    src/Core/Input.cpp
 )
 
 target_include_directories(Engine

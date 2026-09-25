@@ -1,17 +1,30 @@
 #pragma once
 
-class WindowsWindow{
-    public:
-        WindowsWindow();
-        ~WindowsWindow();
+#include "Core/Events/Event.h"
 
-        bool Initialize();
-        void Shutdown();
+#include <functional>
 
-        void ProcessMessages();
-        bool ShouldClose() const;
+class WindowsWindow
+{
+public:
+    using EventCallback = std::function<void(const Event&)>;
 
-    private:
-        void* m_windowHandle = nullptr;
-        bool m_shouldClose = false;
+    WindowsWindow();
+    ~WindowsWindow();
+
+    bool Initialize();
+    void Shutdown();
+
+    void ProcessMessages();
+    bool ShouldClose() const;
+    void Close();
+
+    void SetEventCallback(EventCallback callback);
+    void DispatchEvent(const Event& event);
+
+private:
+    void* m_windowHandle = nullptr;
+    bool m_shouldClose = false;
+
+    EventCallback m_eventCallback;
 };
