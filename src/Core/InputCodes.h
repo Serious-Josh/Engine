@@ -9,3 +9,10 @@ namespace KeyCode
     constexpr unsigned int Space = 0x20;
     constexpr unsigned int Escape = 0x1B;
 }
+
+namespace MouseButton
+{
+    constexpr unsigned int Left = 0;
+    constexpr unsigned int Right = 1;
+    constexpr unsigned int Middle = 2;
+}

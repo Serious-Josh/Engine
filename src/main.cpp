@@ -3,7 +3,10 @@
 int main(){
     Engine engine;
 
-    engine.Initialize();
+    if(!engine.Initialize()){
+        return 1;
+    }
+    
     engine.Run();
     engine.Shutdown();
     

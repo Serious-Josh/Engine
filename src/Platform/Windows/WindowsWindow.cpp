@@ -1,7 +1,10 @@
 #include "WindowsWindow.h"
+#include "Core/InputCodes.h"
+#include "Core/Assert.h"
 
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
+#include <Windowsx.h>
 
 #include <utility>
 
@@ -37,11 +40,119 @@ LRESULT CALLBACK WindowProc(
 
     switch(uMsg)
     {
+        case WM_MOUSEMOVE:
+        {
+            Event event;
+            event.type = EventType::MouseMoved;
+            event.mouseX = static_cast<int>(GET_X_LPARAM(lParam));
+            event.mouseY = static_cast<int>(GET_Y_LPARAM(lParam));
+
+            if(window){
+                window->DispatchEvent(event);
+            }
+
+            return 0;
+
+        }
+
+        case WM_LBUTTONDOWN:
+        {
+            Event event;
+            event.type = EventType::MouseButtonPressed;
+            event.code = MouseButton::Left;
+
+            if(window){
+                window->DispatchEvent(event);
+            }
+
+            return 0;
+        }
+
+        case WM_LBUTTONUP:
+        {
+            Event event;
+            event.type = EventType::MouseButtonReleased;
+            event.code = MouseButton::Left;
+
+            if(window){
+                window->DispatchEvent(event);
+            }
+
+            return 0;
+        }
+
+        case WM_RBUTTONDOWN:
+        {
+            Event event;
+            event.type = EventType::MouseButtonPressed;
+            event.code = MouseButton::Right;
+
+            if(window){
+                window->DispatchEvent(event);
+            }
+
+            return 0;
+        }
+
+        case WM_RBUTTONUP:
+        {
+            Event event;
+            event.type = EventType::MouseButtonReleased;
+            event.code = MouseButton::Right;
+
+            if(window){
+                window->DispatchEvent(event);
+            }
+
+            return 0;
+        }
+
+        case WM_MBUTTONDOWN:
+        {
+            Event event;
+            event.type = EventType::MouseButtonPressed;
+            event.code = MouseButton::Middle;
+
+            if(window){
+                window->DispatchEvent(event);
+            }
+
+            return 0;
+        }
+
+        case WM_MBUTTONUP:
+        {
+            Event event;
+            event.type = EventType::MouseButtonReleased;
+            event.code = MouseButton::Middle;
+
+            if(window){
+                window->DispatchEvent(event);
+            }
+
+            return 0;
+        }
+
+        case WM_MOUSEWHEEL:
+        {
+            Event event;
+            event.type = EventType::MouseScrolled;
+
+            const short delta = GET_WHEEL_DELTA_WPARAM(wParam);
+            event.scrollY = static_cast<float>(delta) / WHEEL_DELTA;
+
+            if(window){
+                window->DispatchEvent(event);
+            }
+
+            return 0;
+        }
+
         case WM_KEYDOWN:
         {
             Event event;
             event.type = EventType::KeyPressed;
-            event.keyCode = static_cast<unsigned int>(wParam);
+            event.code = static_cast<unsigned int>(wParam);
 
             if(window){
                 window->DispatchEvent(event);
@@ -54,7 +165,7 @@ LRESULT CALLBACK WindowProc(
         {
             Event event;
             event.type = EventType::KeyReleased;
-            event.keyCode = static_cast<unsigned int>(wParam);
+            event.code = static_cast<unsigned int>(wParam);
 
             if(window){
                 window->DispatchEvent(event);
@@ -169,6 +280,7 @@ void WindowsWindow::Close(){
 
 void WindowsWindow::SetEventCallback(EventCallback callback)
 {
+    ENGINE_ASSERT(callback);
     m_eventCallback = std::move(callback);
 }
 

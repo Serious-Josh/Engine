@@ -6,7 +6,7 @@
 
 class Engine {
 public:
-    void Initialize();
+    bool Initialize();
     void Run();
     void Shutdown();
 

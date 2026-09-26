@@ -1,11 +1,11 @@
 #include "Engine.h"
 #include "Core/InputCodes.h"
+#include "Core/Log.h"
 
-#include <iostream>
-
-void Engine::Initialize(){
+bool Engine::Initialize(){
     if(!m_window.Initialize()){
-        std::cerr << "Failed to initialize window.\n";
+        Log::Error("Failed to initialize window.");
+        return false;
     }
 
     m_time.Initialize();
@@ -18,14 +18,29 @@ void Engine::Initialize(){
                     m_window.Close();
                     break;
                 case EventType::KeyPressed:
-                    m_input.SetKeyState(event.keyCode, true);
+                    m_input.SetKeyState(event.code, true);
                     break;
                 case EventType::KeyReleased:
-                    m_input.SetKeyState(event.keyCode, false);
+                    m_input.SetKeyState(event.code, false);
+                    break;
+                case EventType::MouseButtonPressed:
+                    m_input.SetMouseButtonState(event.code, true);
+                    break;
+                case EventType::MouseButtonReleased:
+                    m_input.SetMouseButtonState(event.code, false);
+                    break;
+                case EventType::MouseMoved:
+                    m_input.SetMousePosition(event.mouseX, event.mouseY);
+                    break;
+                case EventType::MouseScrolled:
+                    m_input.SetScroll(event.scrollX, event.scrollY);
                     break;
             }
         }
     );
+
+    Log::Info("Engine initialized.");
+    return true;
 }
 
 void Engine::Run(){
@@ -37,11 +52,14 @@ void Engine::Run(){
 void Engine::Frame(){
     m_time.Update();
 
+    m_input.Update();
     m_window.ProcessMessages();
 }
 
 void Engine::Shutdown(){
     m_window.Shutdown();
+
+    Log::Info("Engine shutting down.");
 }
 
 Input& Engine::GetInput(){

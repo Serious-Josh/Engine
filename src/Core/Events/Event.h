@@ -7,10 +7,17 @@ enum class EventType{
     KeyReleased,
     MouseButtonPressed,
     MouseButtonReleased,
-    MouseMoved
+    MouseMoved,
+    MouseScrolled
 };
 
 struct Event{
     EventType type = EventType::None;
-    unsigned int keyCode = 0;
+    unsigned int code = 0;
+
+    int mouseX = 0;
+    int mouseY = 0;
+
+    float scrollX = 0.0f;
+    float scrollY = 0.0f;
 };
