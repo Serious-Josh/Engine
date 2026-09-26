@@ -71,6 +71,8 @@ void Engine::Frame()
 
     m_input.Update();
     m_window.ProcessMessages();
+
+    m_renderer.Render();
 }
 
 void Engine::Shutdown()
