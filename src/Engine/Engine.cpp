@@ -25,6 +25,7 @@ bool Engine::Initialize()
             switch(event.type){
                 case EventType::WindowResized:
                     m_window.SetSize(event.width, event.height);
+                    m_renderer.Resize(event.width, event.height);
                     break;
                 case EventType::WindowClose:
                     m_window.Close();
