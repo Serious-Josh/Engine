@@ -1,18 +1,18 @@
-struct VSInput
-{
-    float3 position : POSITION;
-};
-
 struct VSOutput
 {
     float4 position : SV_POSITION;
 };
 
-VSOutput VSMain(VSInput input)
+VSOutput VSMain(uint vertexID : SV_VertexID)
 {
     VSOutput output;
 
-    output.position = float4(input.position, 1.0f);
+    if (vertexID == 0)
+        output.position = float4(0.0f, 0.5f, 0.0f, 1.0f);
+    else if (vertexID == 1)
+        output.position = float4(0.5f, -0.5f, 0.0f, 1.0f);
+    else
+        output.position = float4(-0.5f, -0.5f, 0.0f, 1.0f);
 
     return output;
 }

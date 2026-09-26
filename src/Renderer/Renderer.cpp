@@ -1,52 +1,14 @@
 #include "Renderer.h"
+#include "Triangle.h"
+#include "Core/Log.h"
 
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
 
-#include <fstream>
-#include <vector>
 #include <cstring>
 #include <dxgi1_6.h>
 #include <d3d12.h>
-
-
-struct Vertex
-{
-    float x;
-    float y;
-    float z;
-};
-
-
-// --------------
-// Helpers
-// --------------
-
-static std::vector<char> LoadBinaryFile(const char* path)
-{
-    std::ifstream file(path, std::ios::binary | std::ios::ate);
-
-    if(!file){
-        return {};
-    }
-
-    const std::streamsize size = file.tellg();
-
-    if(size <= 0){
-        return {};
-    }
-
-    std::vector<char> data(static_cast<size_t>(size));
-
-    file.seekg(0, std::ios::beg);
-    file.read(data.data(), size);
-
-    if(!file){
-        return {};
-    }
-
-    return data;
-}
+#include <d3d12sdklayers.h>
 
 
 // --------------
@@ -55,19 +17,6 @@ static std::vector<char> LoadBinaryFile(const char* path)
 
 bool Renderer::Initialize(void* windowHandle, unsigned int width, unsigned int height)
 {
-    #if defined(_DEBUG)
-        {
-            ID3D12Debug* debugController = nullptr;
-
-            if(SUCCEEDED(D3D12GetDebugInterface(
-                IID_PPV_ARGS(&debugController))))
-            {
-                debugController->EnableDebugLayer();
-                debugController->Release();
-            }
-        }
-    #endif
-
     m_width = width;
     m_height = height;
 
@@ -96,6 +45,17 @@ bool Renderer::Initialize(void* windowHandle, unsigned int width, unsigned int h
 
 bool Renderer::InitializeDevice()
 {
+#ifdef _DEBUG
+    ID3D12Debug* debugController = nullptr;
+
+    if(SUCCEEDED(D3D12GetDebugInterface(
+        IID_PPV_ARGS(&debugController))))
+    {
+        debugController->EnableDebugLayer();
+        debugController->Release();
+    }
+#endif
+
     // Getting graphics adapter and creating D3D12 device
 
     HRESULT result = CreateDXGIFactory2(
@@ -322,6 +282,10 @@ bool Renderer::InitializeSwapChain(void* windowHandle)
             return false;
         }
 
+        m_backBuffers[index]->SetName(
+            index == 0 ? L"Back Buffer 0" : L"Back Buffer 1"
+        );
+
         m_device->CreateRenderTargetView(
             m_backBuffers[index],
             nullptr,
@@ -336,240 +300,24 @@ bool Renderer::InitializeSwapChain(void* windowHandle)
 
 bool Renderer::InitializePipeline()
 {
-    // Creating root signature
-
-    D3D12_ROOT_SIGNATURE_DESC rootSignatureDescription{};
-
-    rootSignatureDescription.NumParameters = 0;
-    rootSignatureDescription.pParameters = nullptr;
-    rootSignatureDescription.NumStaticSamplers = 0;
-    rootSignatureDescription.pStaticSamplers = nullptr;
-    rootSignatureDescription.Flags =
-        D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
-
-    ID3DBlob* rootSignatureBlob = nullptr;
-    ID3DBlob* rootSignatureError = nullptr;
-
-    HRESULT result = D3D12SerializeRootSignature(
-        &rootSignatureDescription,
-        D3D_ROOT_SIGNATURE_VERSION_1,
-        &rootSignatureBlob,
-        &rootSignatureError
+    return m_pipeline.Initialize(
+        m_device,
+        "src/Renderer/Shaders/TriangleVS.cso",
+        "src/Renderer/Shaders/TrianglePS.cso"
     );
-
-    if(FAILED(result))
-    {
-        if(rootSignatureError)
-        {
-            rootSignatureError->Release();
-        }
-
-        return false;
-    }
-
-    result = m_device->CreateRootSignature(
-        0,
-        rootSignatureBlob->GetBufferPointer(),
-        rootSignatureBlob->GetBufferSize(),
-        IID_PPV_ARGS(&m_rootSignature)
-    );
-
-    rootSignatureBlob->Release();
-
-    if(rootSignatureError)
-    {
-        rootSignatureError->Release();
-    }
-
-    if(FAILED(result))
-    {
-        return false;
-    }
-
-    // Loading shaders
-
-    const std::vector<char> vertexShader =
-        LoadBinaryFile("src/Renderer/Shaders/TriangleVS.cso");
-
-    const std::vector<char> pixelShader =
-        LoadBinaryFile("src/Renderer/Shaders/TrianglePS.cso");
-
-    if(vertexShader.empty() || pixelShader.empty())
-    {
-        return false;
-    }
-
-    // Creating PSO
-
-    D3D12_INPUT_ELEMENT_DESC inputElement{};
-
-    inputElement.SemanticName = "POSITION";
-    inputElement.SemanticIndex = 0;
-    inputElement.Format = DXGI_FORMAT_R32G32B32_FLOAT;
-    inputElement.InputSlot = 0;
-    inputElement.AlignedByteOffset = 0;
-    inputElement.InputSlotClass =
-        D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA;
-    inputElement.InstanceDataStepRate = 0;
-
-    D3D12_RASTERIZER_DESC rasterizerDescription{};
-
-    rasterizerDescription.FillMode = D3D12_FILL_MODE_SOLID;
-    rasterizerDescription.CullMode = D3D12_CULL_MODE_BACK;
-    rasterizerDescription.FrontCounterClockwise = FALSE;
-    rasterizerDescription.DepthBias = 0;
-    rasterizerDescription.DepthBiasClamp = 0.0f;
-    rasterizerDescription.SlopeScaledDepthBias = 0.0f;
-    rasterizerDescription.DepthClipEnable = TRUE;
-    rasterizerDescription.MultisampleEnable = FALSE;
-    rasterizerDescription.AntialiasedLineEnable = FALSE;
-    rasterizerDescription.ForcedSampleCount = 0;
-    rasterizerDescription.ConservativeRaster =
-        D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF;
-
-    D3D12_BLEND_DESC blendDescription{};
-
-    blendDescription.AlphaToCoverageEnable = FALSE;
-    blendDescription.IndependentBlendEnable = FALSE;
-
-    blendDescription.RenderTarget[0].BlendEnable = FALSE;
-    blendDescription.RenderTarget[0].LogicOpEnable = FALSE;
-    blendDescription.RenderTarget[0].SrcBlend = D3D12_BLEND_ONE;
-    blendDescription.RenderTarget[0].DestBlend = D3D12_BLEND_ZERO;
-    blendDescription.RenderTarget[0].BlendOp = D3D12_BLEND_OP_ADD;
-    blendDescription.RenderTarget[0].SrcBlendAlpha = D3D12_BLEND_ONE;
-    blendDescription.RenderTarget[0].DestBlendAlpha = D3D12_BLEND_ZERO;
-    blendDescription.RenderTarget[0].BlendOpAlpha = D3D12_BLEND_OP_ADD;
-    blendDescription.RenderTarget[0].LogicOp = D3D12_LOGIC_OP_NOOP;
-    blendDescription.RenderTarget[0].RenderTargetWriteMask =
-        D3D12_COLOR_WRITE_ENABLE_ALL;
-
-    D3D12_DEPTH_STENCIL_DESC depthStencilDescription{};
-
-    depthStencilDescription.DepthEnable = FALSE;
-    depthStencilDescription.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
-    depthStencilDescription.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
-    depthStencilDescription.StencilEnable = FALSE;
-    depthStencilDescription.StencilReadMask =
-        D3D12_DEFAULT_STENCIL_READ_MASK;
-    depthStencilDescription.StencilWriteMask =
-        D3D12_DEFAULT_STENCIL_WRITE_MASK;
-
-    D3D12_GRAPHICS_PIPELINE_STATE_DESC pipelineDescription{};
-
-    pipelineDescription.pRootSignature = m_rootSignature;
-
-    pipelineDescription.VS.pShaderBytecode = vertexShader.data();
-    pipelineDescription.VS.BytecodeLength = vertexShader.size();
-
-    pipelineDescription.PS.pShaderBytecode = pixelShader.data();
-    pipelineDescription.PS.BytecodeLength = pixelShader.size();
-
-    pipelineDescription.BlendState = blendDescription;
-    pipelineDescription.SampleMask = UINT_MAX;
-    pipelineDescription.RasterizerState = rasterizerDescription;
-    pipelineDescription.DepthStencilState = depthStencilDescription;
-
-    pipelineDescription.InputLayout.pInputElementDescs =
-        &inputElement;
-    pipelineDescription.InputLayout.NumElements = 1;
-
-    pipelineDescription.PrimitiveTopologyType =
-        D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-
-    pipelineDescription.NumRenderTargets = 1;
-    pipelineDescription.RTVFormats[0] =
-        DXGI_FORMAT_R8G8B8A8_UNORM;
-
-    pipelineDescription.SampleDesc.Count = 1;
-
-    result = m_device->CreateGraphicsPipelineState(
-        &pipelineDescription,
-        IID_PPV_ARGS(&m_pipelineState)
-    );
-
-    if(FAILED(result))
-    {
-        return false;
-    }
-
-    return true;
 }
 
 bool Renderer::InitializeGeometry()
 {
-    const Vertex vertices[] =
-    {
-        {0.0f, 0.5f, 0.0f},
-        {0.5f, -0.5f, 0.0f},
-        {-0.5f, -0.5f, 0.0f}
-    };
-
-    // Creating vertex buffer
-
-    D3D12_HEAP_PROPERTIES heapProperties{};
-
-    heapProperties.Type = D3D12_HEAP_TYPE_UPLOAD;
-
-    D3D12_RESOURCE_DESC resourceDescription{};
-
-    resourceDescription.Dimension =
-        D3D12_RESOURCE_DIMENSION_BUFFER;
-    resourceDescription.Width = sizeof(vertices);
-    resourceDescription.Height = 1;
-    resourceDescription.DepthOrArraySize = 1;
-    resourceDescription.MipLevels = 1;
-    resourceDescription.Format = DXGI_FORMAT_UNKNOWN;
-    resourceDescription.SampleDesc.Count = 1;
-    resourceDescription.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-
-    HRESULT result = m_device->CreateCommittedResource(
-        &heapProperties,
-        D3D12_HEAP_FLAG_NONE,
-        &resourceDescription,
-        D3D12_RESOURCE_STATE_GENERIC_READ,
-        nullptr,
-        IID_PPV_ARGS(&m_vertexBuffer)
-    );
-
-    if(FAILED(result))
+    if(!m_triangleMesh.Initialize(
+        m_device,
+        TriangleVertices,
+        3,
+        sizeof(TriangleVertex)
+    ))
     {
         return false;
     }
-
-    // Putting vertices into buffer
-
-    void* mappedData = nullptr;
-
-    D3D12_RANGE readRange{};
-
-    readRange.Begin = 0;
-    readRange.End = 0;
-
-    result = m_vertexBuffer->Map(
-        0,
-        &readRange,
-        &mappedData
-    );
-
-    if(FAILED(result))
-    {
-        return false;
-    }
-
-    memcpy(
-        mappedData,
-        vertices,
-        sizeof(vertices)
-    );
-
-    m_vertexBuffer->Unmap(0, nullptr);
-
-    m_vertexBufferView.BufferLocation =
-        m_vertexBuffer->GetGPUVirtualAddress();
-
-    m_vertexBufferView.StrideInBytes = sizeof(Vertex);
-    m_vertexBufferView.SizeInBytes = sizeof(vertices);
 
     return true;
 }
@@ -583,64 +331,97 @@ void Renderer::WaitForGPU()
 {
     const unsigned int long long fenceValue = m_fenceValue;
 
-    HRESULT result = m_commandQueue->Signal(m_fence, fenceValue);
+    HRESULT result = m_commandQueue->Signal(
+        m_fence,
+        fenceValue
+    );
 
-    if(FAILED(result)){
+    if(FAILED(result))
+    {
         return;
     }
 
     m_fenceValue++;
 
-    if(m_fence->GetCompletedValue() < fenceValue){
-        result = m_fence->SetEventOnCompletion(fenceValue, static_cast<HANDLE>(m_fenceEvent));
+    if(m_fence->GetCompletedValue() < fenceValue)
+    {
+        result = m_fence->SetEventOnCompletion(
+            fenceValue,
+            static_cast<HANDLE>(m_fenceEvent)
+        );
 
-        if(FAILED(result)){
+        if(FAILED(result))
+        {
             return;
         }
 
-        WaitForSingleObject(static_cast<HANDLE>(m_fenceEvent), INFINITE);
+        WaitForSingleObject(
+            static_cast<HANDLE>(m_fenceEvent),
+            INFINITE
+        );
     }
 }
 
 void Renderer::Resize(unsigned int width, unsigned int height)
 {
-    if(width == 0 || height == 0){
+    if(width == 0 || height == 0)
+    {
         return;
     }
 
     WaitForGPU();
 
-    for(ID3D12Resource*& BackBuffer : m_backBuffers){
-        if(BackBuffer){
-            BackBuffer->Release();
-            BackBuffer = nullptr;
+    for(ID3D12Resource*& backBuffer : m_backBuffers)
+    {
+        if(backBuffer)
+        {
+            backBuffer->Release();
+            backBuffer = nullptr;
         }
     }
 
-    HRESULT result = m_swapChain->ResizeBuffers(2, width, height, DXGI_FORMAT_R8G8B8A8_UNORM, 0);
+    HRESULT result = m_swapChain->ResizeBuffers(
+        2,
+        width,
+        height,
+        DXGI_FORMAT_R8G8B8A8_UNORM,
+        0
+    );
 
-    if(FAILED(result)){
+    if(FAILED(result))
+    {
         return;
     }
 
     m_width = width;
     m_height = height;
 
-    D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = m_renderTargetHeap->GetCPUDescriptorHandleForHeapStart();
+    D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle =
+        m_renderTargetHeap->GetCPUDescriptorHandleForHeapStart();
 
-    for(UINT index = 0; index < 0; ++index){
-        result = m_swapChain->GetBuffer(index, IID_PPV_ARGS(&m_backBuffers[index]));
+    for(UINT index = 0; index < 2; ++index)
+    {
+        result = m_swapChain->GetBuffer(
+            index,
+            IID_PPV_ARGS(&m_backBuffers[index])
+        );
 
-        if(FAILED(result)){
+        if(FAILED(result))
+        {
             return;
         }
 
-        m_device->CreateRenderTargetView(m_backBuffers[index], nullptr, rtvHandle);
+        m_device->CreateRenderTargetView(
+            m_backBuffers[index],
+            nullptr,
+            rtvHandle
+        );
 
         rtvHandle.ptr += m_rtvDescriptorSize;
     }
 
-    m_currentBackBuffer = m_swapChain->GetCurrentBackBufferIndex();
+    m_currentBackBuffer =
+        m_swapChain->GetCurrentBackBufferIndex();
 }
 
 
@@ -650,34 +431,17 @@ void Renderer::Resize(unsigned int width, unsigned int height)
 
 void Renderer::Render()
 {
-    HRESULT result = m_commandAllocator->Reset();
+    m_commandAllocator->Reset();
 
-    if(FAILED(result))
-    {
-        return;
-    }
-
-    result = m_commandList->Reset(
+    m_commandList->Reset(
         m_commandAllocator,
         nullptr
     );
 
-    if(FAILED(result))
-    {
-        return;
-    }
-
-    ID3D12Resource* backBuffer =
-        m_backBuffers[m_currentBackBuffer];
-
     D3D12_RESOURCE_BARRIER barrier{};
-
-    barrier.Type =
-        D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    barrier.Flags =
-        D3D12_RESOURCE_BARRIER_FLAG_NONE;
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     barrier.Transition.pResource =
-        backBuffer;
+        m_backBuffers[m_currentBackBuffer];
     barrier.Transition.Subresource =
         D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     barrier.Transition.StateBefore =
@@ -685,27 +449,25 @@ void Renderer::Render()
     barrier.Transition.StateAfter =
         D3D12_RESOURCE_STATE_RENDER_TARGET;
 
-    m_commandList->ResourceBarrier(1, &barrier);
+    m_commandList->ResourceBarrier(
+        1,
+        &barrier
+    );
 
-    m_commandList->SetPipelineState(m_pipelineState);
-    m_commandList->SetGraphicsRootSignature(m_rootSignature);
+    m_pipeline.Bind(m_commandList);
 
     m_commandList->IASetPrimitiveTopology(
         D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST
     );
 
-    m_commandList->IASetVertexBuffers(
-        0,
-        1,
-        &m_vertexBufferView
-    );
+    m_triangleMesh.Bind(m_commandList);
 
     D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle =
         m_renderTargetHeap->GetCPUDescriptorHandleForHeapStart();
 
-    rtvHandle.ptr += static_cast<SIZE_T>(
-        m_currentBackBuffer * m_rtvDescriptorSize
-    );
+    rtvHandle.ptr +=
+        static_cast<SIZE_T>(m_currentBackBuffer) *
+        m_rtvDescriptorSize;
 
     m_commandList->OMSetRenderTargets(
         1,
@@ -715,7 +477,6 @@ void Renderer::Render()
     );
 
     D3D12_VIEWPORT viewport{};
-
     viewport.TopLeftX = 0.0f;
     viewport.TopLeftY = 0.0f;
     viewport.Width = static_cast<float>(m_width);
@@ -728,20 +489,18 @@ void Renderer::Render()
         &viewport
     );
 
-    D3D12_RECT scissorRect{};
-
-    scissorRect.left = 0;
-    scissorRect.top = 0;
-    scissorRect.right = static_cast<LONG>(m_width);
-    scissorRect.bottom = static_cast<LONG>(m_height);
+    D3D12_RECT scissor{};
+    scissor.left = 0;
+    scissor.top = 0;
+    scissor.right = static_cast<LONG>(m_width);
+    scissor.bottom = static_cast<LONG>(m_height);
 
     m_commandList->RSSetScissorRects(
         1,
-        &scissorRect
+        &scissor
     );
 
-    const float clearColor[] =
-    {
+    const float clearColor[] = {
         0.1f,
         0.2f,
         0.4f,
@@ -772,15 +531,9 @@ void Renderer::Render()
         &barrier
     );
 
-    result = m_commandList->Close();
+    m_commandList->Close();
 
-    if(FAILED(result))
-    {
-        return;
-    }
-
-    ID3D12CommandList* commandLists[] =
-    {
+    ID3D12CommandList* commandLists[] = {
         m_commandList
     };
 
@@ -791,11 +544,15 @@ void Renderer::Render()
 
     WaitForGPU();
 
-    m_swapChain->Present(1, 0);
+    m_swapChain->Present(
+        1,
+        0
+    );
 
     m_currentBackBuffer =
         m_swapChain->GetCurrentBackBufferIndex();
 }
+
 
 // --------------
 // Shutdown
@@ -854,23 +611,7 @@ void Renderer::Shutdown()
         m_commandAllocator = nullptr;
     }
 
-    if(m_rootSignature)
-    {
-        m_rootSignature->Release();
-        m_rootSignature = nullptr;
-    }
-
-    if(m_vertexBuffer)
-    {
-        m_vertexBuffer->Release();
-        m_vertexBuffer = nullptr;
-    }
-
-    if(m_pipelineState)
-    {
-        m_pipelineState->Release();
-        m_pipelineState = nullptr;
-    }
+    m_pipeline.Shutdown();
 
     if(m_device)
     {

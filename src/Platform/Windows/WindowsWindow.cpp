@@ -7,6 +7,7 @@
 #include <Windowsx.h>
 
 #include <utility>
+#include <Core/Log.h>
 
 LRESULT CALLBACK WindowProc(
     HWND hwnd,
@@ -40,6 +41,23 @@ LRESULT CALLBACK WindowProc(
 
     switch(uMsg)
     {
+        case WM_SETCURSOR:
+        {
+            if(LOWORD(lParam) == HTCLIENT)
+            {
+                SetCursor(
+                    LoadCursorW(
+                        nullptr,
+                        MAKEINTRESOURCEW(32512)
+                    )
+                );
+
+                return TRUE;
+            }
+
+            break;
+        }
+
         case WM_MOUSEMOVE:
         {
             Event event;
@@ -190,6 +208,8 @@ LRESULT CALLBACK WindowProc(
 
         case WM_CLOSE:
         {
+            Log::Info("WM_CLOSE received.");
+
             Event event;
             event.type = EventType::WindowClose;
 
@@ -227,8 +247,10 @@ bool WindowsWindow::Initialize(const WindowProperties& properties)
     std::wstring title(properties.title.begin(), properties.title.end());
 
     WNDCLASSW windowClass{};
+
     windowClass.lpfnWndProc = WindowProc;
     windowClass.hInstance = instance;
+    windowClass.hCursor = LoadCursorW(nullptr, reinterpret_cast<LPCWSTR>(32512));
     windowClass.lpszClassName = L"EngineWindowClass";
 
     if(!RegisterClassW(&windowClass)){

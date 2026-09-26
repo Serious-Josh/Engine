@@ -17,6 +17,9 @@ add_executable(Engine
     src/Core/Input.cpp
     src/Core/Log.cpp
     src/Renderer/Renderer.cpp
+    src/Renderer/Buffer.cpp
+    src/Renderer/Mesh.cpp
+    src/Renderer/Pipeline.cpp
 )
 
 target_include_directories(Engine

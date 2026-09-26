@@ -60,10 +60,12 @@ bool Engine::Initialize()
 void Engine::Run()
 {
     ENGINE_ASSERT(m_state == EngineState::Running);
-    
+
     while(!m_window.ShouldClose()){
         Frame();
     }
+
+    Log::Info("Engine loop ended.");
 }
 
 void Engine::Frame()
@@ -81,8 +83,6 @@ void Engine::Shutdown()
     ENGINE_ASSERT(m_state == EngineState::Running);
 
     m_state = EngineState::Stopped;
-
-    Log::Info("Engine shutting down.");
 
     m_renderer.Shutdown();
     m_window.Shutdown();

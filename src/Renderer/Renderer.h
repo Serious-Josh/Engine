@@ -1,5 +1,8 @@
 #pragma once
 
+#include "Buffer.h"
+#include "Mesh.h"
+#include "Pipeline.h"
 #include <d3d12.h>
 
 struct IDXGIFactory4;
@@ -48,11 +51,10 @@ class Renderer
         unsigned long long m_fenceValue = 0;
         void* m_fenceEvent = nullptr;
 
-        ID3D12RootSignature* m_rootSignature = nullptr;
-        ID3D12PipelineState* m_pipelineState = nullptr;
+        Pipeline m_pipeline;
 
-        ID3D12Resource* m_vertexBuffer = nullptr;
-        D3D12_VERTEX_BUFFER_VIEW m_vertexBufferView{};
+        //for vertex buffer
+        Mesh m_triangleMesh;
 
         unsigned int m_width = 0;
         unsigned int m_height = 0;
