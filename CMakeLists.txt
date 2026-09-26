@@ -16,9 +16,16 @@ add_executable(Engine
     src/Core/Time.cpp
     src/Core/Input.cpp
     src/Core/Log.cpp
+    src/Renderer/Renderer.cpp
 )
 
 target_include_directories(Engine
     PRIVATE
         src
+)
+
+target_link_libraries(Engine
+    PRIVATE
+        dxgi
+        d3d12
 )

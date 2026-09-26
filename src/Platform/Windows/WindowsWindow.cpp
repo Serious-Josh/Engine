@@ -311,6 +311,11 @@ unsigned int WindowsWindow::GetHeight() const
     return m_clientHeight;
 }
 
+void* WindowsWindow::GetNativeHandle() const
+{
+    return m_windowHandle;
+}
+
 void WindowsWindow::SetEventCallback(EventCallback callback)
 {
     ENGINE_ASSERT(callback);

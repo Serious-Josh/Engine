@@ -14,6 +14,11 @@ bool Engine::Initialize()
 
     m_time.Initialize();
 
+    if(!m_renderer.Initialize(m_window.GetNativeHandle(), m_window.GetWidth(), m_window.GetHeight())){
+        Log::Error("Failed to initialize renderer.");
+        return false;
+    }
+
     m_window.SetEventCallback(
         [this](const Event& event)
         {
@@ -76,6 +81,7 @@ void Engine::Shutdown()
 
     Log::Info("Engine shutting down.");
 
+    m_renderer.Shutdown();
     m_window.Shutdown();
 }
 

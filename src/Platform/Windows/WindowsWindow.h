@@ -24,6 +24,8 @@ public:
     unsigned int GetWidth() const;
     unsigned int GetHeight() const;
 
+    void* GetNativeHandle() const;
+
     void SetEventCallback(EventCallback callback);
     void DispatchEvent(const Event& event);
 
