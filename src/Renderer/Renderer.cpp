@@ -143,6 +143,22 @@ bool Renderer::Initialize(void* windowHandle, unsigned int width, unsigned int h
         return false;
     }
 
+
+    //Create Allocator Fence
+    result = m_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&m_fence));
+
+    if(FAILED(result)){
+        return false;
+    }
+
+    m_fenceValue = 1;
+
+    m_fenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+
+    if(m_fenceEvent == nullptr){
+        return false;
+    }
+
     return true;
 }
 
@@ -193,12 +209,43 @@ void Renderer::Render()
 
     ID3D12CommandList* commandLists[] = {m_commandList};
     m_commandQueue->ExecuteCommandLists(1, commandLists);
+    
+    const unsigned long long currentFenceValue = m_fenceValue;
+
+    result = m_commandQueue->Signal(m_fence, currentFenceValue);
+
+    if(FAILED(result)){
+        return;
+    }
+
+    m_fenceValue++;
+
+    if(m_fence->GetCompletedValue() < currentFenceValue){
+        result = m_fence->SetEventOnCompletion(currentFenceValue, static_cast<HANDLE>(m_fenceEvent));
+
+        if(FAILED(result)){
+            return;
+        }
+
+        WaitForSingleObject(static_cast<HANDLE>(m_fenceEvent), INFINITE);
+    }
+
     m_swapChain->Present(1, 0);
     m_currentBackBuffer = m_swapChain->GetCurrentBackBufferIndex();
 }
 
 void Renderer::Shutdown()
 {
+    if(m_fence){
+        m_fence->Release();
+        m_fence = nullptr;
+    }
+
+    if(m_fenceEvent){
+        CloseHandle(static_cast<HANDLE>(m_fenceEvent));
+        m_fenceEvent = nullptr;
+    }
+
     for(ID3D12Resource*& backBuffer : m_backBuffers){
         if(backBuffer){
             backBuffer->Release();

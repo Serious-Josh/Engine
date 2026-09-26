@@ -8,6 +8,7 @@ struct ID3D12Resource;
 struct ID3D12DescriptorHeap;
 struct ID3D12CommandAllocator;
 struct ID3D12GraphicsCommandList;
+struct ID3D12Fence;
 
 class Renderer
 {
@@ -25,9 +26,12 @@ class Renderer
         ID3D12DescriptorHeap* m_renderTargetHeap = nullptr;
 
         unsigned int m_rtvDescriptorSize = 0;
+        unsigned int m_currentBackBuffer = 0;
 
         ID3D12CommandAllocator* m_commandAllocator = nullptr;
         ID3D12GraphicsCommandList* m_commandList = nullptr;
 
-        unsigned int m_currentBackBuffer = 0;
+        ID3D12Fence* m_fence = nullptr;
+        unsigned long long m_fenceValue = 0;
+        void* m_fenceEvent = nullptr;
 };
