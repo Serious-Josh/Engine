@@ -8,6 +8,11 @@
 class Mesh
 {
     public:
+        Mesh() = default;
+
+        Mesh(const Mesh&) = delete;
+        Mesh& operator=(const Mesh&) = delete;
+
         bool Initialize(ID3D12Device* device, const void* vertices, size_t vertexCount, const VertexLayout& layout);
         void Shutdown();
         void Bind(ID3D12GraphicsCommandList* commandList) const;

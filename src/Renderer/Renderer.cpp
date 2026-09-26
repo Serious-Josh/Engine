@@ -563,6 +563,17 @@ void Renderer::Render()
 
 void Renderer::Shutdown()
 {
+    if(m_commandQueue && m_fence && m_fenceEvent){
+        WaitForGPU();
+    }
+
+    ///
+
+    m_pipeline.Shutdown();
+    m_triangleMesh.Shutdown();
+
+    ///
+
     if(m_fence)
     {
         m_fence->Release();
@@ -574,6 +585,8 @@ void Renderer::Shutdown()
         CloseHandle(static_cast<HANDLE>(m_fenceEvent));
         m_fenceEvent = nullptr;
     }
+
+    ///
 
     for(ID3D12Resource*& backBuffer : m_backBuffers)
     {
@@ -596,11 +609,7 @@ void Renderer::Shutdown()
         m_swapChain = nullptr;
     }
 
-    if(m_commandQueue)
-    {
-        m_commandQueue->Release();
-        m_commandQueue = nullptr;
-    }
+    ///
 
     if(m_commandList)
     {
@@ -614,7 +623,13 @@ void Renderer::Shutdown()
         m_commandAllocator = nullptr;
     }
 
-    m_pipeline.Shutdown();
+    if(m_commandQueue)
+    {
+        m_commandQueue->Release();
+        m_commandQueue = nullptr;
+    }
+
+    ///
 
     if(m_device)
     {
