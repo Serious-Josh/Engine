@@ -1,39 +1,5 @@
 #include "Pipeline.h"
 
-#include <fstream>
-#include <vector>
-
-static std::vector<char> LoadBinaryFile(const char* path)
-{
-    std::ifstream file(path, std::ios::binary | std::ios::ate);
-
-    if(!file)
-    {
-        return {};
-    }
-
-    const std::streamsize size = file.tellg();
-
-    if(size <= 0)
-    {
-        return {};
-    }
-
-    std::vector<char> data(
-        static_cast<size_t>(size)
-    );
-
-    file.seekg(0, std::ios::beg);
-    file.read(data.data(), size);
-
-    if(!file)
-    {
-        return {};
-    }
-
-    return data;
-}
-
 bool Pipeline::Initialize(
     ID3D12Device* device,
     const char* vertexShaderPath,
@@ -89,14 +55,12 @@ bool Pipeline::Initialize(
         return false;
     }
 
-    const std::vector<char> vertexShader =
-        LoadBinaryFile(vertexShaderPath);
+    if(!m_vertexShader.Load(vertexShaderPath)){
+        return false;
+    }
 
-    const std::vector<char> pixelShader =
-        LoadBinaryFile(pixelShaderPath);
-
-    if(vertexShader.empty() || pixelShader.empty())
-    {
+    if(!m_pixelShader.Load(pixelShaderPath)){
+        m_vertexShader.Unload();
         return false;
     }
 
@@ -162,10 +126,10 @@ bool Pipeline::Initialize(
     D3D12_GRAPHICS_PIPELINE_STATE_DESC pipelineDescription{};
 
     pipelineDescription.pRootSignature = m_rootSignature;
-    pipelineDescription.VS.pShaderBytecode = vertexShader.data();
-    pipelineDescription.VS.BytecodeLength = vertexShader.size();
-    pipelineDescription.PS.pShaderBytecode = pixelShader.data();
-    pipelineDescription.PS.BytecodeLength = pixelShader.size();
+    pipelineDescription.VS.pShaderBytecode = m_vertexShader.GetByteCode();
+    pipelineDescription.VS.BytecodeLength = m_vertexShader.GetBytecodeSize();
+    pipelineDescription.PS.pShaderBytecode = m_pixelShader.GetByteCode();
+    pipelineDescription.PS.BytecodeLength = m_pixelShader.GetBytecodeSize();
     pipelineDescription.BlendState = blendDescription;
     pipelineDescription.SampleMask = UINT_MAX;
     pipelineDescription.RasterizerState = rasterizerDescription;
@@ -192,6 +156,9 @@ bool Pipeline::Initialize(
 
 void Pipeline::Shutdown()
 {
+    m_vertexShader.Unload();
+    m_pixelShader.Unload();
+    
     if(m_pipelineState){
         m_pipelineState->Release();
         m_pipelineState = nullptr;

@@ -25,6 +25,7 @@ add_executable(Engine
     src/Renderer/Mesh.cpp
     src/Renderer/Pipeline.cpp
     src/Renderer/VertexLayout.cpp
+    src/Renderer/Shader.cpp
 )
 
 target_include_directories(Engine

@@ -2,6 +2,25 @@
 
 #include <cstring>
 
+Buffer::Buffer(Buffer&& other) noexcept
+    : m_resource(other.m_resource)
+{
+    other.m_resource = nullptr;
+}
+
+Buffer& Buffer::operator=(Buffer&& other) noexcept
+{
+    if(this != &other)
+    {
+        Shutdown();
+
+        m_resource = other.m_resource;
+        other.m_resource = nullptr;
+    }
+
+    return *this;
+}
+
 bool Buffer::Initialize(
     ID3D12Device* device,
     const void* data,

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Renderer/VertexLayout.h"
+#include "Renderer/Shader.h"
 
 #include <d3d12.h>
 
@@ -16,4 +17,7 @@ class Pipeline
     private:
         ID3D12RootSignature* m_rootSignature = nullptr;
         ID3D12PipelineState* m_pipelineState = nullptr;
+
+        Shader m_vertexShader;
+        Shader m_pixelShader;
 };
