@@ -52,9 +52,8 @@ class Renderer
         void* m_fenceEvent = nullptr;
 
         Pipeline m_pipeline;
-
-        //for vertex buffer
         Mesh m_triangleMesh;
+        VertexLayout m_triangleVertexLayout;
 
         unsigned int m_width = 0;
         unsigned int m_height = 0;

@@ -37,7 +37,8 @@ static std::vector<char> LoadBinaryFile(const char* path)
 bool Pipeline::Initialize(
     ID3D12Device* device,
     const char* vertexShaderPath,
-    const char* pixelShaderPath
+    const char* pixelShaderPath,
+    const VertexLayout& vertexLayout
 )
 {
     D3D12_ROOT_SIGNATURE_DESC rootSignatureDescription{};
@@ -99,16 +100,13 @@ bool Pipeline::Initialize(
         return false;
     }
 
-    D3D12_INPUT_ELEMENT_DESC inputElement{};
+    std::vector<D3D12_INPUT_ELEMENT_DESC> inputElements;
 
-    inputElement.SemanticName = "POSITION";
-    inputElement.SemanticIndex = 0;
-    inputElement.Format = DXGI_FORMAT_R32G32B32_FLOAT;
-    inputElement.InputSlot = 0;
-    inputElement.AlignedByteOffset = 0;
-    inputElement.InputSlotClass =
-        D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA;
-    inputElement.InstanceDataStepRate = 0;
+    for(const VertexAttribute& attribute : vertexLayout.GetAttributes()){
+        inputElements.push_back({
+            attribute.semantic, attribute.semanticIndex, VertexLayout::GetDXGIFormat(attribute.type), 0, attribute.offset, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0
+        });
+    }
 
     D3D12_RASTERIZER_DESC rasterizerDescription{};
 
@@ -163,46 +161,20 @@ bool Pipeline::Initialize(
 
     D3D12_GRAPHICS_PIPELINE_STATE_DESC pipelineDescription{};
 
-    pipelineDescription.pRootSignature =
-        m_rootSignature;
-
-    pipelineDescription.VS.pShaderBytecode =
-        vertexShader.data();
-
-    pipelineDescription.VS.BytecodeLength =
-        vertexShader.size();
-
-    pipelineDescription.PS.pShaderBytecode =
-        pixelShader.data();
-
-    pipelineDescription.PS.BytecodeLength =
-        pixelShader.size();
-
-    pipelineDescription.BlendState =
-        blendDescription;
-
-    pipelineDescription.SampleMask =
-        UINT_MAX;
-
-    pipelineDescription.RasterizerState =
-        rasterizerDescription;
-
-    pipelineDescription.DepthStencilState =
-        depthStencilDescription;
-
-    pipelineDescription.InputLayout.pInputElementDescs =
-        &inputElement;
-
-    pipelineDescription.InputLayout.NumElements = 1;
-
-    pipelineDescription.PrimitiveTopologyType =
-        D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-
+    pipelineDescription.pRootSignature = m_rootSignature;
+    pipelineDescription.VS.pShaderBytecode = vertexShader.data();
+    pipelineDescription.VS.BytecodeLength = vertexShader.size();
+    pipelineDescription.PS.pShaderBytecode = pixelShader.data();
+    pipelineDescription.PS.BytecodeLength = pixelShader.size();
+    pipelineDescription.BlendState = blendDescription;
+    pipelineDescription.SampleMask = UINT_MAX;
+    pipelineDescription.RasterizerState = rasterizerDescription;
+    pipelineDescription.DepthStencilState = depthStencilDescription;
+    pipelineDescription.InputLayout.pInputElementDescs = inputElements.data();
+    pipelineDescription.InputLayout.NumElements = static_cast<UINT>(inputElements.size());
+    pipelineDescription.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     pipelineDescription.NumRenderTargets = 1;
-
-    pipelineDescription.RTVFormats[0] =
-        DXGI_FORMAT_R8G8B8A8_UNORM;
-
+    pipelineDescription.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
     pipelineDescription.SampleDesc.Count = 1;
 
     result = device->CreateGraphicsPipelineState(

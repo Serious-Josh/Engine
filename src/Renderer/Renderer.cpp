@@ -20,6 +20,8 @@ bool Renderer::Initialize(void* windowHandle, unsigned int width, unsigned int h
     m_width = width;
     m_height = height;
 
+    m_triangleVertexLayout = CreateTriangleVertexLayout();
+
     if(!InitializeDevice())
     {
         return false;
@@ -302,8 +304,9 @@ bool Renderer::InitializePipeline()
 {
     return m_pipeline.Initialize(
         m_device,
-        "src/Renderer/Shaders/TriangleVS.cso",
-        "src/Renderer/Shaders/TrianglePS.cso"
+        ENGINE_SHADER_DIR "/TriangleVS.cso",
+        ENGINE_SHADER_DIR "/TrianglePS.cso",
+        m_triangleVertexLayout
     );
 }
 
@@ -313,7 +316,7 @@ bool Renderer::InitializeGeometry()
         m_device,
         TriangleVertices,
         3,
-        sizeof(TriangleVertex)
+        m_triangleVertexLayout
     ))
     {
         return false;
