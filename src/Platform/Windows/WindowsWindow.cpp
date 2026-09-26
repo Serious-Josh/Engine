@@ -174,6 +174,20 @@ LRESULT CALLBACK WindowProc(
             return 0;
         }
 
+        case WM_SIZE:
+        {
+            Event event;
+            event.type = EventType::WindowResized;
+            event.width = static_cast<unsigned int>(LOWORD(lParam));
+            event.height = static_cast<unsigned int>(HIWORD(lParam));
+
+            if(window){
+                window->DispatchEvent(event);
+            }
+
+            return DefWindowProcW(hwnd, uMsg, wParam, lParam);
+        }
+
         case WM_CLOSE:
         {
             Event event;
@@ -204,9 +218,13 @@ WindowsWindow::~WindowsWindow()
     Shutdown();
 }
 
-bool WindowsWindow::Initialize()
+bool WindowsWindow::Initialize(const WindowProperties& properties)
 {
+    SetSize(properties.width, properties.height);
+
     HINSTANCE instance = GetModuleHandle(nullptr);
+
+    std::wstring title(properties.title.begin(), properties.title.end());
 
     WNDCLASSW windowClass{};
     windowClass.lpfnWndProc = WindowProc;
@@ -220,12 +238,12 @@ bool WindowsWindow::Initialize()
     m_windowHandle = CreateWindowExW(
         0,
         L"EngineWindowClass",
-        L"Engine",
+        title.c_str(),
         WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT,
         CW_USEDEFAULT,
-        1280,
-        720,
+        static_cast<int>(properties.width),
+        static_cast<int>(properties.height),
         nullptr,
         nullptr,
         instance,
@@ -276,6 +294,21 @@ bool WindowsWindow::ShouldClose() const
 
 void WindowsWindow::Close(){
     m_shouldClose = true;
+}
+
+void WindowsWindow::SetSize(unsigned int width, unsigned int height){
+    m_clientWidth = width;
+    m_clientHeight = height;
+}
+
+unsigned int WindowsWindow::GetWidth() const
+{
+    return m_clientWidth;
+}
+
+unsigned int WindowsWindow::GetHeight() const
+{
+    return m_clientHeight;
 }
 
 void WindowsWindow::SetEventCallback(EventCallback callback)

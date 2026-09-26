@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Core/Events/Event.h"
+#include "Platform/WindowProperties.h"
 
 #include <functional>
 
@@ -12,12 +13,16 @@ public:
     WindowsWindow();
     ~WindowsWindow();
 
-    bool Initialize();
+    bool Initialize(const WindowProperties& properties);
     void Shutdown();
 
     void ProcessMessages();
     bool ShouldClose() const;
     void Close();
+
+    void SetSize(unsigned int width, unsigned int height);
+    unsigned int GetWidth() const;
+    unsigned int GetHeight() const;
 
     void SetEventCallback(EventCallback callback);
     void DispatchEvent(const Event& event);
@@ -27,4 +32,7 @@ private:
     bool m_shouldClose = false;
 
     EventCallback m_eventCallback;
+
+    unsigned int m_clientWidth = 0;
+    unsigned int m_clientHeight = 0;
 };

@@ -1,9 +1,13 @@
 #include "Engine.h"
 #include "Core/InputCodes.h"
 #include "Core/Log.h"
+#include <Core/Assert.h>
 
-bool Engine::Initialize(){
-    if(!m_window.Initialize()){
+bool Engine::Initialize()
+{
+    ENGINE_ASSERT(m_state == EngineState::Uninitialized);
+
+    if(!m_window.Initialize(m_windowProperties)){
         Log::Error("Failed to initialize window.");
         return false;
     }
@@ -14,6 +18,9 @@ bool Engine::Initialize(){
         [this](const Event& event)
         {
             switch(event.type){
+                case EventType::WindowResized:
+                    m_window.SetSize(event.width, event.height);
+                    break;
                 case EventType::WindowClose:
                     m_window.Close();
                     break;
@@ -39,29 +46,49 @@ bool Engine::Initialize(){
         }
     );
 
+    m_state = EngineState::Running;
     Log::Info("Engine initialized.");
     return true;
 }
 
-void Engine::Run(){
+void Engine::Run()
+{
+    ENGINE_ASSERT(m_state == EngineState::Running);
+    
     while(!m_window.ShouldClose()){
         Frame();
     }
 }
 
-void Engine::Frame(){
+void Engine::Frame()
+{
     m_time.Update();
 
     m_input.Update();
     m_window.ProcessMessages();
 }
 
-void Engine::Shutdown(){
-    m_window.Shutdown();
+void Engine::Shutdown()
+{
+    ENGINE_ASSERT(m_state == EngineState::Running);
+
+    m_state = EngineState::Stopped;
 
     Log::Info("Engine shutting down.");
+
+    m_window.Shutdown();
 }
 
 Input& Engine::GetInput(){
     return m_input;
+}
+
+unsigned int Engine::GetWindowWidth() const
+{
+    return m_window.GetWidth();
+}
+
+unsigned int Engine::GetWindowHeight() const
+{
+    return m_window.GetHeight();
 }

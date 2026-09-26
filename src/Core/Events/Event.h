@@ -3,6 +3,7 @@
 enum class EventType{
     None,
     WindowClose,
+    WindowResized,
     KeyPressed,
     KeyReleased,
     MouseButtonPressed,
@@ -20,4 +21,7 @@ struct Event{
 
     float scrollX = 0.0f;
     float scrollY = 0.0f;
+
+    unsigned int width = 0;
+    unsigned int height = 0;
 };
