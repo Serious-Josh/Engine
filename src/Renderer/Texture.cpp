@@ -11,11 +11,13 @@ Texture::Texture(Texture&& other) noexcept
     , m_height(other.m_height)
     , m_initialData(std::move(other.m_initialData))
     , m_descriptorIndex(other.m_descriptorIndex)
+    , m_descriptorHeap(other.m_descriptorHeap)
 {
     other.m_resource = nullptr;
     other.m_width = 0;
     other.m_height = 0;
     other.m_descriptorIndex = UINT_MAX;
+    other.m_descriptorHeap = nullptr;
 }
 
 Texture& Texture::operator=(Texture&& other) noexcept
@@ -29,7 +31,10 @@ Texture& Texture::operator=(Texture&& other) noexcept
         m_height = other.m_height;
         m_initialData = std::move(other.m_initialData);
         m_descriptorIndex = other.m_descriptorIndex;
+        m_descriptorHeap = other.m_descriptorHeap;
 
+        other.m_descriptorIndex = UINT_MAX;
+        other.m_descriptorHeap = nullptr;
         other.m_resource = nullptr;
         other.m_width = 0;
         other.m_height = 0;
@@ -74,6 +79,13 @@ bool Texture::Initialize(ID3D12Device* device, const void* data, unsigned int wi
 
 void Texture::Shutdown()
 {
+    if(m_descriptorHeap && m_descriptorIndex != UINT_MAX){
+        m_descriptorHeap->Free(m_descriptorIndex);
+
+        m_descriptorIndex = UINT_MAX;
+        m_descriptorHeap = nullptr;
+    }
+
     if(m_resource){
         m_resource->Release();
         m_resource = nullptr;
@@ -96,6 +108,8 @@ bool Texture::CreateSRV(ID3D12Device* device, DescriptorHeap& descriptorHeap)
     if(descriptorIndex == UINT_MAX){
         return false;
     }
+
+    m_descriptorHeap = &descriptorHeap;
 
     D3D12_SHADER_RESOURCE_VIEW_DESC description{};
     description.Format = m_resource->GetDesc().Format;

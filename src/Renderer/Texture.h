@@ -35,6 +35,7 @@ class Texture
         unsigned int m_height;
 
         unsigned int m_descriptorIndex = UINT_MAX;
+        DescriptorHeap* m_descriptorHeap = nullptr;
 
         std::vector<unsigned char> m_initialData;
 };
