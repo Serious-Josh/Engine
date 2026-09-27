@@ -26,6 +26,9 @@ add_executable(Engine
     src/Renderer/Pipeline.cpp
     src/Renderer/VertexLayout.cpp
     src/Renderer/Shader.cpp
+    src/Renderer/Texture.cpp
+    src/Renderer/DiscriptorHead.cpp
+    src/Renderer/ResourceUploader.cpp
 )
 
 target_include_directories(Engine

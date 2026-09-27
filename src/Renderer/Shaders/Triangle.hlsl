@@ -1,23 +1,34 @@
+struct VSInput
+{
+    float3 position : POSITION;
+    float2 uv : TEXCOORD;
+};
+
 struct VSOutput
 {
     float4 position : SV_POSITION;
+    float2 uv : TEXCOORD;
 };
 
-VSOutput VSMain(uint vertexID : SV_VertexID)
+Texture2D texture0 : register(t0);
+SamplerState sampler0 : register(s0);
+
+VSOutput VSMain(VSInput input)
 {
     VSOutput output;
 
-    if (vertexID == 0)
-        output.position = float4(0.0f, 0.5f, 0.0f, 1.0f);
-    else if (vertexID == 1)
-        output.position = float4(0.5f, -0.5f, 0.0f, 1.0f);
-    else
-        output.position = float4(-0.5f, -0.5f, 0.0f, 1.0f);
+    output.position =
+        float4(input.position, 1.0f);
+
+    output.uv = input.uv;
 
     return output;
 }
 
-float4 PSMain() : SV_TARGET
+float4 PSMain(VSOutput input) : SV_TARGET
 {
-    return float4(1.0f, 0.2f, 0.1f, 1.0f);
+    return texture0.Sample(
+        sampler0,
+        input.uv
+    );
 }

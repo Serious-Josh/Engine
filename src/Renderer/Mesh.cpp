@@ -10,9 +10,9 @@ bool Mesh::Initialize(ID3D12Device* device, const void* vertices, size_t vertexC
 
     m_vertexBufferView.BufferLocation = m_vertexBuffer.GetGPUAddress();
 
-    m_vertexBufferView.StrideInBytes = static_cast<UINT>(vertexCount * layout.GetStride());
+    m_vertexBufferView.StrideInBytes = static_cast<UINT>(layout.GetStride());
 
-    m_vertexBufferView.SizeInBytes = static_cast<UINT>(layout.GetStride());
+    m_vertexBufferView.SizeInBytes = static_cast<UINT>(vertexCount * layout.GetStride());
 
     return true;
 }

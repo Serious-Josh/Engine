@@ -27,6 +27,44 @@ bool Renderer::Initialize(void* windowHandle, unsigned int width, unsigned int h
         return false;
     }
 
+
+    //texture testing
+    const unsigned int texturePixels[] =
+    {
+        0xFFFF0000,
+        0xFF00FF00,
+        0xFF0000FF,
+        0xFFFFFFFF
+    };
+
+    if(!m_testTexture.Initialize(m_device, texturePixels, 2, 2)){
+        Log::Error("Failed to init test texture.");
+        return false;
+    }
+
+    if(!m_resourceUploader.Initialize(m_device))
+    {
+        Log::Error("Failed to initialize resource uploader.");
+        return false;
+    }
+
+    if(!m_resourceUploader.UploadTexture(m_testTexture.GetResource(), m_testTexture.GetInitialData(), m_testTexture.GetInitialDataSize(), 2, 2)){
+        Log::Error("Failed to upload test texture.");
+        return false;
+    }
+
+    if(!m_resourceDescriptorHeap.Initialize(m_device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 16, true)){
+        Log::Error("Failed to init resource descriptor heap.");
+        return false;
+    }
+
+    if(!m_testTexture.CreateSRV(m_device, m_resourceDescriptorHeap, 0)){
+        Log::Error("Failed to create test texture SRV.");
+        return false;
+    }
+
+
+    //continue init
     if(!InitializeSwapChain(windowHandle))
     {
         return false;
@@ -459,6 +497,10 @@ void Renderer::Render()
 
     m_pipeline.Bind(m_commandList);
 
+    ID3D12DescriptorHeap* descriptorHeaps[] = {m_resourceDescriptorHeap.GetHeap()};
+    m_commandList->SetDescriptorHeaps(1, descriptorHeaps);
+    m_commandList->SetGraphicsRootDescriptorTable(0, m_resourceDescriptorHeap.GetGPUHandle(0));
+
     m_commandList->IASetPrimitiveTopology(
         D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST
     );
@@ -628,6 +670,12 @@ void Renderer::Shutdown()
         m_commandQueue->Release();
         m_commandQueue = nullptr;
     }
+
+    ///
+
+    m_resourceUploader.Shutdown();
+    m_resourceDescriptorHeap.Shutdown();
+    m_testTexture.Shutdown();
 
     ///
 

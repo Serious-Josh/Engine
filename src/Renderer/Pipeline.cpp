@@ -7,12 +7,40 @@ bool Pipeline::Initialize(
     const VertexLayout& vertexLayout
 )
 {
+    D3D12_DESCRIPTOR_RANGE descriptorRange{};
+    descriptorRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    descriptorRange.NumDescriptors = 1;
+    descriptorRange.BaseShaderRegister = 0;
+    descriptorRange.RegisterSpace = 0;
+    descriptorRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+
+    D3D12_ROOT_PARAMETER rootParameter{};
+    rootParameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    rootParameter.DescriptorTable.NumDescriptorRanges = 1;
+    rootParameter.DescriptorTable.pDescriptorRanges = &descriptorRange;
+    rootParameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+    D3D12_STATIC_SAMPLER_DESC sampler{};
+    sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+    sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler.MipLODBias = 0.0f;
+    sampler.MaxAnisotropy = 1;
+    sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+    sampler.BorderColor = D3D12_STATIC_BORDER_COLOR_OPAQUE_BLACK;
+    sampler.MinLOD = 0.0f;
+    sampler.MaxLOD = D3D12_FLOAT32_MAX;
+    sampler.ShaderRegister = 0;
+    sampler.RegisterSpace = 0;
+    sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
     D3D12_ROOT_SIGNATURE_DESC rootSignatureDescription{};
 
-    rootSignatureDescription.NumParameters = 0;
-    rootSignatureDescription.pParameters = nullptr;
-    rootSignatureDescription.NumStaticSamplers = 0;
-    rootSignatureDescription.pStaticSamplers = nullptr;
+    rootSignatureDescription.NumParameters = 1;
+    rootSignatureDescription.pParameters = &rootParameter;
+    rootSignatureDescription.NumStaticSamplers = 1;
+    rootSignatureDescription.pStaticSamplers = &sampler;
     rootSignatureDescription.Flags =
         D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
 

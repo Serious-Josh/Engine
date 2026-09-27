@@ -1,0 +1,90 @@
+#include "DescriptorHeap.h"
+
+DescriptorHeap::DescriptorHeap(DescriptorHeap&& other) noexcept
+    : m_heap(other.m_heap)
+    , m_type(other.m_type)
+    , m_descriptorSize(other.m_descriptorSize)
+    , m_capacity(other.m_capacity)
+    , m_shaderVisible(other.m_shaderVisible)
+{
+    other.m_heap = nullptr;
+    other.m_descriptorSize = 0;
+    other.m_capacity = 0;
+}
+
+DescriptorHeap& DescriptorHeap::operator=(DescriptorHeap&& other) noexcept
+{
+    if(this != &other)
+    {
+        Shutdown();
+
+        m_heap = other.m_heap;
+        m_type = other.m_type;
+        m_descriptorSize = other.m_descriptorSize;
+        m_capacity = other.m_capacity;
+        m_shaderVisible = other.m_shaderVisible;
+
+        other.m_heap = nullptr;
+        other.m_descriptorSize = 0;
+        other.m_capacity = 0;
+    }
+
+    return *this;
+}
+
+bool DescriptorHeap::Initialize(ID3D12Device* device, D3D12_DESCRIPTOR_HEAP_TYPE type, unsigned int capacity, bool shaderVisible)
+{
+    m_type = type;
+    m_capacity = capacity;
+    m_shaderVisible = shaderVisible;
+
+    D3D12_DESCRIPTOR_HEAP_DESC description{};
+    description.Type = type;
+    description.NumDescriptors = capacity;
+    description.Flags = shaderVisible ? D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE : D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+
+    HRESULT result = device-> CreateDescriptorHeap(&description, IID_PPV_ARGS(&m_heap));
+
+    if(FAILED(result)){
+        m_heap = nullptr;
+        return false;
+    }
+
+    m_descriptorSize = device->GetDescriptorHandleIncrementSize(type);
+
+    return true;
+}
+
+void DescriptorHeap::Shutdown()
+{
+    if(m_heap){
+        m_heap->Release();
+        m_heap = nullptr;
+    }
+
+    m_descriptorSize = 0;
+    m_capacity = 0;
+}
+
+D3D12_CPU_DESCRIPTOR_HANDLE DescriptorHeap::GetCPUHandle(unsigned int index) const
+{
+    D3D12_CPU_DESCRIPTOR_HANDLE handle = m_heap->GetCPUDescriptorHandleForHeapStart();
+
+    handle.ptr += static_cast<SIZE_T>(index) * m_descriptorSize;
+
+    return handle;
+}
+
+D3D12_GPU_DESCRIPTOR_HANDLE DescriptorHeap::GetGPUHandle(unsigned int index) const
+{
+    D3D12_GPU_DESCRIPTOR_HANDLE handle = m_heap->GetGPUDescriptorHandleForHeapStart();
+
+    handle.ptr += static_cast<UINT64>(index) * m_descriptorSize;
+
+    return handle;
+}
+
+ID3D12DescriptorHeap* DescriptorHeap::GetHeap() const
+{
+    return m_heap;
+}

@@ -3,6 +3,10 @@
 #include "Buffer.h"
 #include "Mesh.h"
 #include "Pipeline.h"
+#include "Renderer/ResourceUploader.h"
+#include "Renderer/DescriptorHeap.h"
+#include "Texture.h"
+
 #include <d3d12.h>
 
 struct IDXGIFactory4;
@@ -54,6 +58,10 @@ class Renderer
         Pipeline m_pipeline;
         Mesh m_triangleMesh;
         VertexLayout m_triangleVertexLayout;
+
+        ResourceUploader m_resourceUploader;
+        DescriptorHeap m_resourceDescriptorHeap;
+        Texture m_testTexture;
 
         unsigned int m_width = 0;
         unsigned int m_height = 0;
