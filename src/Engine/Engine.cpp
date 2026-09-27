@@ -19,6 +19,11 @@ bool Engine::Initialize()
         return false;
     }
 
+    if(!m_renderer.InitializeDemoScene(m_demoScene)){
+        Log::Error("Failed to init demo scene.");
+        return false;
+    }
+
     m_window.SetEventCallback(
         [this](const Event& event)
         {
@@ -75,7 +80,7 @@ void Engine::Frame()
     m_input.Update();
     m_window.ProcessMessages();
 
-    m_renderer.Render();
+    m_renderer.Render(m_demoScene.GetRenderObject());
 }
 
 void Engine::Shutdown()
@@ -84,6 +89,7 @@ void Engine::Shutdown()
 
     m_state = EngineState::Stopped;
 
+    m_demoScene.Shutdown();
     m_renderer.Shutdown();
     m_window.Shutdown();
 }

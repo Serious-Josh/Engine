@@ -23,6 +23,7 @@ class Texture
         ID3D12Resource* GetResource() const;
         const void* GetInitialData() const;
         size_t GetInitialDataSize() const;
+        unsigned int GetDescriptorIndex() const;
 
         bool CreateSRV(ID3D12Device* device, DescriptorHeap& descriptorHeap, unsigned int descriptorIndex);
     
@@ -31,6 +32,8 @@ class Texture
 
         unsigned int m_width;
         unsigned int m_height;
+
+        unsigned int m_descriptorIndex = 0;
 
         std::vector<unsigned char> m_initialData;
 };

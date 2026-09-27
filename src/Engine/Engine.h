@@ -2,6 +2,7 @@
 
 #include "Core/Time.h"
 #include "Core/Input.h"
+#include "DemoContent/DemoScene.h"
 #include "Platform/Windows/WindowsWindow.h"
 #include "Platform/WindowProperties.h"
 #include "Renderer/Renderer.h"
@@ -33,6 +34,8 @@ private:
     Time m_time;
     Input m_input;
     Renderer m_renderer;
+
+    DemoScene m_demoScene;
 
     EngineState m_state = EngineState::Uninitialized;
 };

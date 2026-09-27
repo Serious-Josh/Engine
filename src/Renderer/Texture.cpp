@@ -94,6 +94,8 @@ bool Texture::CreateSRV(ID3D12Device* device, DescriptorHeap& descriptorHeap, un
 
     device->CreateShaderResourceView(m_resource, &description, descriptorHeap.GetCPUHandle(descriptorIndex));
 
+    m_descriptorIndex = descriptorIndex;
+
     return true;
 }
 
@@ -110,4 +112,9 @@ const void* Texture::GetInitialData() const
 size_t Texture::GetInitialDataSize() const
 {
     return m_initialData.size();
+}
+
+unsigned int Texture::GetDescriptorIndex() const
+{
+    return m_descriptorIndex;
 }

@@ -1,6 +1,8 @@
 #include "Core/Log.h"
 #include "Renderer.h"
-#include "Triangle.h"
+#include "DemoContent/DemoScene.h"
+#include "Renderer/Texture.h"
+#include "Material.h"
 
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
@@ -20,8 +22,6 @@ bool Renderer::Initialize(void* windowHandle, unsigned int width, unsigned int h
     m_width = width;
     m_height = height;
 
-    m_triangleVertexLayout = CreateTriangleVertexLayout();
-
     if(!InitializeDevice())
     {
         return false;
@@ -29,29 +29,8 @@ bool Renderer::Initialize(void* windowHandle, unsigned int width, unsigned int h
 
     ID3D12Device* device = m_graphicsDevice.GetDevice();
 
-
-    //texture testing
-    const unsigned int texturePixels[] =
-    {
-        0xFFFF0000,
-        0xFF00FF00,
-        0xFF0000FF,
-        0xFFFFFFFF
-    };
-
-    if(!m_testTexture.Initialize(device, texturePixels, 2, 2)){
-        Log::Error("Failed to init test texture.");
-        return false;
-    }
-
-    if(!m_resourceUploader.Initialize(device))
-    {
-        Log::Error("Failed to initialize resource uploader.");
-        return false;
-    }
-
-    if(!m_resourceUploader.UploadTexture(m_testTexture.GetResource(), m_testTexture.GetInitialData(), m_testTexture.GetInitialDataSize(), 2, 2)){
-        Log::Error("Failed to upload test texture.");
+    if(!m_resourceUploader.Initialize(device)){
+        Log::Error("Failed to init resource uploader.");
         return false;
     }
 
@@ -60,24 +39,8 @@ bool Renderer::Initialize(void* windowHandle, unsigned int width, unsigned int h
         return false;
     }
 
-    if(!m_testTexture.CreateSRV(device, m_resourceDescriptorHeap, 0)){
-        Log::Error("Failed to create test texture SRV.");
-        return false;
-    }
-
-
     //continue init
     if(!InitializeSwapChain(windowHandle))
-    {
-        return false;
-    }
-
-    if(!InitializePipeline())
-    {
-        return false;
-    }
-
-    if(!InitializeGeometry())
     {
         return false;
     }
@@ -105,23 +68,8 @@ bool Renderer::InitializeSwapChain(void* windowHandle)
     return m_swapChain.Initialize(m_graphicsDevice.GetFactory(), m_graphicsDevice.GetDevice(), m_commandContext.GetCommandQueue(), windowHandle, m_width, m_height);
 }
 
-bool Renderer::InitializePipeline()
-{
-    return m_pipeline.Initialize(m_graphicsDevice.GetDevice(), ENGINE_SHADER_DIR "/TriangleVS.cso", ENGINE_SHADER_DIR "/TrianglePS.cso", m_triangleVertexLayout);
-}
 
-bool Renderer::InitializeGeometry()
-{
-    if(!m_triangleMesh.Initialize(m_graphicsDevice.GetDevice(), TriangleVertices, 3, m_triangleVertexLayout))
-    {
-        return false;
-    }
-
-    return true;
-}
-
-//Resize function
-
+//Other functions needed for Render
 void Renderer::Resize(unsigned int width, unsigned int height)
 {
     if(width == 0 || height == 0){
@@ -139,12 +87,27 @@ void Renderer::Resize(unsigned int width, unsigned int height)
     m_height = height;
 }
 
+void Renderer::Draw(ID3D12GraphicsCommandList* commandList, const RenderObject& object)
+{
+    if(!object.mesh || !object.material || !object.material->pipeline || !object.material->texture){
+        return;
+    }
+
+    object.material->pipeline->Bind(commandList);
+
+    commandList->SetGraphicsRootDescriptorTable(0, m_resourceDescriptorHeap.GetGPUHandle(object.material->texture->GetDescriptorIndex()));
+
+    object.mesh->Bind(commandList);
+
+    commandList->DrawInstanced(static_cast<UINT>(object.mesh->GetVertexCount()), 1, 0, 0);
+}
+
 
 // --------------
 // Rendering
 // --------------
 
-void Renderer::Render()
+void Renderer::Render(const RenderObject& object)
 {
     if(!m_commandContext.Begin()){
         Log::Error("failed to begin command recording.");
@@ -162,15 +125,10 @@ void Renderer::Render()
 
     commandList->ResourceBarrier(1, &barrier);
 
-    m_pipeline.Bind(commandList);
-
     ID3D12DescriptorHeap* descriptorHeaps[] = {m_resourceDescriptorHeap.GetHeap()};
     commandList->SetDescriptorHeaps(1, descriptorHeaps);
-    commandList->SetGraphicsRootDescriptorTable(0, m_resourceDescriptorHeap.GetGPUHandle(0));
 
     commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-
-    m_triangleMesh.Bind(commandList);
 
     D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = m_swapChain.GetCurrentRTV();
 
@@ -203,7 +161,7 @@ void Renderer::Render()
 
     commandList->ClearRenderTargetView(rtvHandle, clearColor, 0, nullptr);
 
-    commandList->DrawInstanced(3, 1, 0, 0);
+    Draw(commandList, object);
 
     barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
     barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
@@ -224,6 +182,13 @@ void Renderer::Render()
 }
 
 
+//Demo Scene
+bool Renderer::InitializeDemoScene(DemoScene& scene)
+{
+    return scene.Initialize(m_graphicsDevice.GetDevice(), m_resourceUploader, m_resourceDescriptorHeap);
+}
+
+
 // --------------
 // Shutdown
 // --------------
@@ -231,11 +196,6 @@ void Renderer::Render()
 void Renderer::Shutdown()
 {
     m_commandContext.WaitForGPU();
-
-    ///
-
-    m_pipeline.Shutdown();
-    m_triangleMesh.Shutdown();
 
     ///
 
@@ -249,7 +209,6 @@ void Renderer::Shutdown()
 
     m_resourceUploader.Shutdown();
     m_resourceDescriptorHeap.Shutdown();
-    m_testTexture.Shutdown();
 
     ///
 

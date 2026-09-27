@@ -32,6 +32,7 @@ add_executable(Engine
     src/Renderer/SwapChain.cpp
     src/Renderer/CommandContext.cpp
     src/Renderer/GraphicsDevice.cpp
+    src/DemoContent/DemoScene.cpp
 )
 
 target_include_directories(Engine

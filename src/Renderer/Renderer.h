@@ -6,6 +6,7 @@
 #include "Renderer/CommandContext.h"
 #include "Renderer/DescriptorHeap.h"
 #include "Renderer/GraphicsDevice.h"
+#include "Renderer/RenderObject.h"
 #include "Renderer/ResourceUploader.h"
 #include "Renderer/SwapChain.h"
 #include "Texture.h"
@@ -22,31 +23,29 @@ struct ID3D12Fence;
 struct ID3D12RootSignature;
 struct ID3D12PipelineState;
 
+class DemoScene;
+
 class Renderer
 {
     public:
         bool Initialize(void* windowHandle, unsigned int width, unsigned int height);
-        void Render();
+        void Render(const RenderObject& object);
         void Shutdown();
 
         void Resize(unsigned int width, unsigned int height);
+
+        bool InitializeDemoScene(DemoScene& scene);
     private:
         bool InitializeDevice();
         bool InitializeSwapChain(void* windowHandle);
-        bool InitializePipeline();
-        bool InitializeGeometry();
+        void Draw(ID3D12GraphicsCommandList* commandList, const RenderObject& object);
 
         GraphicsDevice m_graphicsDevice;
         SwapChain m_swapChain;
         CommandContext m_commandContext;
-        Pipeline m_pipeline;
-
-        Mesh m_triangleMesh;
-        VertexLayout m_triangleVertexLayout;
 
         ResourceUploader m_resourceUploader;
         DescriptorHeap m_resourceDescriptorHeap;
-        Texture m_testTexture;
 
         unsigned int m_width = 0;
         unsigned int m_height = 0;

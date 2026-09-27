@@ -3,6 +3,7 @@
 bool Mesh::Initialize(ID3D12Device* device, const void* vertices, size_t vertexCount, const VertexLayout& layout)
 {
     m_layout = layout;
+    m_vertexCount = vertexCount;
 
     if(!m_vertexBuffer.Initialize(device, vertices, vertexCount * layout.GetStride())){
         return false;
@@ -19,6 +20,7 @@ bool Mesh::Initialize(ID3D12Device* device, const void* vertices, size_t vertexC
 
 void Mesh::Shutdown(){
     m_vertexBuffer.Shutdown();
+    m_vertexCount = 0;
 }
 
 void Mesh::Bind(ID3D12GraphicsCommandList* commandList) const
@@ -29,4 +31,9 @@ void Mesh::Bind(ID3D12GraphicsCommandList* commandList) const
 const VertexLayout& Mesh::GetLayout() const
 {
     return m_layout;
+}
+
+size_t Mesh::GetVertexCount() const
+{
+    return m_vertexCount;
 }
