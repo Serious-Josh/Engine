@@ -58,13 +58,13 @@ add_custom_command(
 
     COMMAND ${DXC}
         "${SHADER_SOURCE_DIR}/Triangle.hlsl"
-        /T vs_6_0
+        /T vs_6_6
         /E VSMain
         /Fo "${SHADER_OUTPUT_DIR}/TriangleVS.cso"
 
     COMMAND ${DXC}
         "${SHADER_SOURCE_DIR}/Triangle.hlsl"
-        /T ps_6_0
+        /T ps_6_6
         /E PSMain
         /Fo "${SHADER_OUTPUT_DIR}/TrianglePS.cso"
 

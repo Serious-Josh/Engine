@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <climits>
 #include <d3d12.h>
 #include <vector>
 
@@ -25,7 +26,7 @@ class Texture
         size_t GetInitialDataSize() const;
         unsigned int GetDescriptorIndex() const;
 
-        bool CreateSRV(ID3D12Device* device, DescriptorHeap& descriptorHeap, unsigned int descriptorIndex);
+        bool CreateSRV(ID3D12Device* device, DescriptorHeap& descriptorHeap);
     
     private:
         ID3D12Resource* m_resource = nullptr;
@@ -33,7 +34,7 @@ class Texture
         unsigned int m_width;
         unsigned int m_height;
 
-        unsigned int m_descriptorIndex = 0;
+        unsigned int m_descriptorIndex = UINT_MAX;
 
         std::vector<unsigned char> m_initialData;
 };

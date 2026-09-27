@@ -7,17 +7,11 @@ bool Pipeline::Initialize(
     const VertexLayout& vertexLayout
 )
 {
-    D3D12_DESCRIPTOR_RANGE descriptorRange{};
-    descriptorRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    descriptorRange.NumDescriptors = 1;
-    descriptorRange.BaseShaderRegister = 0;
-    descriptorRange.RegisterSpace = 0;
-    descriptorRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
-
     D3D12_ROOT_PARAMETER rootParameter{};
-    rootParameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    rootParameter.DescriptorTable.NumDescriptorRanges = 1;
-    rootParameter.DescriptorTable.pDescriptorRanges = &descriptorRange;
+    rootParameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    rootParameter.Constants.ShaderRegister = 0;
+    rootParameter.Constants.RegisterSpace = 0;
+    rootParameter.Constants.Num32BitValues = 1;
     rootParameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
     D3D12_STATIC_SAMPLER_DESC sampler{};
@@ -42,7 +36,8 @@ bool Pipeline::Initialize(
     rootSignatureDescription.NumStaticSamplers = 1;
     rootSignatureDescription.pStaticSamplers = &sampler;
     rootSignatureDescription.Flags =
-        D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+        D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT |
+        D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED;
 
     ID3DBlob* rootSignatureBlob = nullptr;
     ID3DBlob* rootSignatureError = nullptr;

@@ -2,6 +2,7 @@
 #include "DescriptorHeap.h"
 
 #include <cstring>
+#include <climits>
 #include <utility>
 
 Texture::Texture(Texture&& other) noexcept
@@ -9,10 +10,12 @@ Texture::Texture(Texture&& other) noexcept
     , m_width(other.m_width)
     , m_height(other.m_height)
     , m_initialData(std::move(other.m_initialData))
+    , m_descriptorIndex(other.m_descriptorIndex)
 {
     other.m_resource = nullptr;
     other.m_width = 0;
     other.m_height = 0;
+    other.m_descriptorIndex = UINT_MAX;
 }
 
 Texture& Texture::operator=(Texture&& other) noexcept
@@ -25,6 +28,7 @@ Texture& Texture::operator=(Texture&& other) noexcept
         m_width = other.m_width;
         m_height = other.m_height;
         m_initialData = std::move(other.m_initialData);
+        m_descriptorIndex = other.m_descriptorIndex;
 
         other.m_resource = nullptr;
         other.m_width = 0;
@@ -75,14 +79,21 @@ void Texture::Shutdown()
         m_resource = nullptr;
     }
 
+    m_descriptorIndex = UINT_MAX;
     m_width = 0;
     m_height = 0;
     m_initialData.clear();
 }
 
-bool Texture::CreateSRV(ID3D12Device* device, DescriptorHeap& descriptorHeap, unsigned int descriptorIndex)
+bool Texture::CreateSRV(ID3D12Device* device, DescriptorHeap& descriptorHeap)
 {
     if(!m_resource){
+        return false;
+    }
+
+    unsigned int descriptorIndex = descriptorHeap.Allocate();
+
+    if(descriptorIndex == UINT_MAX){
         return false;
     }
 

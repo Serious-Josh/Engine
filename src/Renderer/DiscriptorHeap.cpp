@@ -1,11 +1,15 @@
 #include "DescriptorHeap.h"
 
+#include <climits>
+#include <utility>
+
 DescriptorHeap::DescriptorHeap(DescriptorHeap&& other) noexcept
     : m_heap(other.m_heap)
     , m_type(other.m_type)
     , m_descriptorSize(other.m_descriptorSize)
     , m_capacity(other.m_capacity)
     , m_shaderVisible(other.m_shaderVisible)
+    , m_freeIndices(std::move(other.m_freeIndices))
 {
     other.m_heap = nullptr;
     other.m_descriptorSize = 0;
@@ -23,6 +27,7 @@ DescriptorHeap& DescriptorHeap::operator=(DescriptorHeap&& other) noexcept
         m_descriptorSize = other.m_descriptorSize;
         m_capacity = other.m_capacity;
         m_shaderVisible = other.m_shaderVisible;
+        m_freeIndices = std::move(other.m_freeIndices);
 
         other.m_heap = nullptr;
         other.m_descriptorSize = 0;
@@ -52,6 +57,13 @@ bool DescriptorHeap::Initialize(ID3D12Device* device, D3D12_DESCRIPTOR_HEAP_TYPE
 
     m_descriptorSize = device->GetDescriptorHandleIncrementSize(type);
 
+    m_freeIndices.clear();
+    m_freeIndices.reserve(m_capacity);
+
+    for(unsigned int i = m_capacity; i > 0; --i){
+        m_freeIndices.push_back(i - 1);
+    }
+
     return true;
 }
 
@@ -62,8 +74,30 @@ void DescriptorHeap::Shutdown()
         m_heap = nullptr;
     }
 
+    m_freeIndices.clear();
     m_descriptorSize = 0;
     m_capacity = 0;
+}
+
+unsigned int DescriptorHeap::Allocate()
+{
+    if(m_freeIndices.empty()){
+        return UINT_MAX;
+    }
+
+    unsigned int index = m_freeIndices.back();
+    m_freeIndices.pop_back();
+
+    return index;
+}
+
+void DescriptorHeap::Free(unsigned int index)
+{
+    if(index >= m_capacity){
+        return;
+    }
+
+    m_freeIndices.push_back(index);
 }
 
 D3D12_CPU_DESCRIPTOR_HANDLE DescriptorHeap::GetCPUHandle(unsigned int index) const

@@ -95,7 +95,7 @@ void Renderer::Draw(ID3D12GraphicsCommandList* commandList, const RenderObject& 
 
     object.material->pipeline->Bind(commandList);
 
-    commandList->SetGraphicsRootDescriptorTable(0, m_resourceDescriptorHeap.GetGPUHandle(object.material->texture->GetDescriptorIndex()));
+    commandList->SetGraphicsRoot32BitConstant(0, object.material->texture->GetDescriptorIndex(), 0);
 
     object.mesh->Bind(commandList);
 

@@ -29,7 +29,7 @@ bool DemoScene::Initialize(ID3D12Device* device, ResourceUploader& uploader, Des
         return false;
     }
 
-    if(!m_texture.CreateSRV(device, descriptorHeap, 0)){
+    if(!m_texture.CreateSRV(device, descriptorHeap)){
         return false;
     }
 

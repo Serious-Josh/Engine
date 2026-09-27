@@ -1,6 +1,7 @@
 #pragma once
 
 #include <d3d12.h>
+#include <vector>
 
 class DescriptorHeap
 {
@@ -17,6 +18,9 @@ class DescriptorHeap
 
         void Shutdown();
 
+        unsigned int Allocate();
+        void Free(unsigned int index);
+
         D3D12_CPU_DESCRIPTOR_HANDLE GetCPUHandle(unsigned int index) const;
         D3D12_GPU_DESCRIPTOR_HANDLE GetGPUHandle(unsigned int index) const;
 
@@ -29,5 +33,6 @@ class DescriptorHeap
 
         unsigned int m_descriptorSize = 0;
         unsigned int m_capacity = 0;
+        std::vector<unsigned int> m_freeIndices;
         bool m_shaderVisible = false;
 };

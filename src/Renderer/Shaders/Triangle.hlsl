@@ -10,7 +10,11 @@ struct VSOutput
     float2 uv : TEXCOORD;
 };
 
-Texture2D texture0 : register(t0);
+cbuffer MaterialConstants : register(b0)
+{
+    uint textureIndex;
+}
+
 SamplerState sampler0 : register(s0);
 
 VSOutput VSMain(VSInput input)
@@ -27,8 +31,6 @@ VSOutput VSMain(VSInput input)
 
 float4 PSMain(VSOutput input) : SV_TARGET
 {
-    return texture0.Sample(
-        sampler0,
-        input.uv
-    );
+    Texture2D<float4> texture0 = ResourceDescriptorHeap[textureIndex];
+    return texture0.Sample(sampler0, input.uv);
 }
