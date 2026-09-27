@@ -3,14 +3,15 @@
 #include "Buffer.h"
 #include "Mesh.h"
 #include "Pipeline.h"
-#include "Renderer/ResourceUploader.h"
+#include "Renderer/CommandContext.h"
 #include "Renderer/DescriptorHeap.h"
+#include "Renderer/GraphicsDevice.h"
+#include "Renderer/ResourceUploader.h"
+#include "Renderer/SwapChain.h"
 #include "Texture.h"
 
 #include <d3d12.h>
 
-struct IDXGIFactory4;
-struct ID3D12Device;
 struct ID3D12CommandQueue;
 struct IDXGISwapChain3;
 struct ID3D12Resource;
@@ -34,28 +35,12 @@ class Renderer
         bool InitializeSwapChain(void* windowHandle);
         bool InitializePipeline();
         bool InitializeGeometry();
-        
-        void WaitForGPU();
 
-        IDXGIFactory4* m_factory = nullptr;
-        ID3D12Device* m_device = nullptr;
-        ID3D12CommandQueue* m_commandQueue = nullptr;
-        IDXGISwapChain3* m_swapChain = nullptr;
-
-        ID3D12Resource* m_backBuffers[2]{};
-        ID3D12DescriptorHeap* m_renderTargetHeap = nullptr;
-
-        unsigned int m_rtvDescriptorSize = 0;
-        unsigned int m_currentBackBuffer = 0;
-
-        ID3D12CommandAllocator* m_commandAllocator = nullptr;
-        ID3D12GraphicsCommandList* m_commandList = nullptr;
-
-        ID3D12Fence* m_fence = nullptr;
-        unsigned long long m_fenceValue = 0;
-        void* m_fenceEvent = nullptr;
-
+        GraphicsDevice m_graphicsDevice;
+        SwapChain m_swapChain;
+        CommandContext m_commandContext;
         Pipeline m_pipeline;
+
         Mesh m_triangleMesh;
         VertexLayout m_triangleVertexLayout;
 

@@ -29,7 +29,7 @@ class SwapChain
 
         void UpdateBackBufferIndex();
 
-        IDXGISwapChain3* GetNativeSwapChain() const;
+        bool Present();
 
     private:
         bool CreateBackBufferViews();

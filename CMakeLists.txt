@@ -27,8 +27,11 @@ add_executable(Engine
     src/Renderer/VertexLayout.cpp
     src/Renderer/Shader.cpp
     src/Renderer/Texture.cpp
-    src/Renderer/DiscriptorHead.cpp
+    src/Renderer/DiscriptorHeap.cpp
     src/Renderer/ResourceUploader.cpp
+    src/Renderer/SwapChain.cpp
+    src/Renderer/CommandContext.cpp
+    src/Renderer/GraphicsDevice.cpp
 )
 
 target_include_directories(Engine
