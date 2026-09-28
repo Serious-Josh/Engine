@@ -8,18 +8,16 @@ bool DemoScene::Initialize(
 {
     m_vertexLayout = CreateTriangleVertexLayout();
 
-    PipelineRenderTargets renderTargets{};
-    renderTargets.count = 2;
-    renderTargets.formats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
-    renderTargets.formats[1] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    PipelineDescription pipelineDescription{};
+    pipelineDescription.vertexShaderPath = ENGINE_SHADER_DIR "/TriangleVS.cso";
+    pipelineDescription.pixelShaderPath = ENGINE_SHADER_DIR "/TrianglePS.cso";
+    pipelineDescription.vertexLayout = &m_vertexLayout;
+    pipelineDescription.renderTargets.count = 2;
+    pipelineDescription.renderTargets.formats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    pipelineDescription.renderTargets.formats[1] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    pipelineDescription.rootConstantCount = 1;
 
-    if(!m_pipeline.Initialize(
-        device,
-        ENGINE_SHADER_DIR "/TriangleVS.cso",
-        ENGINE_SHADER_DIR "/TrianglePS.cso",
-        &m_vertexLayout,
-        renderTargets,
-        1))
+    if(!m_pipeline.Initialize(device, pipelineDescription))
     {
         return false;
     }

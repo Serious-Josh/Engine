@@ -29,18 +29,15 @@ bool Renderer::Initialize(void* windowHandle, unsigned int width, unsigned int h
 
     ID3D12Device* device = m_graphicsDevice.GetDevice();
 
-    PipelineRenderTargets compositeTargets{};
-    compositeTargets.count = 1;
-    compositeTargets.formats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    PipelineDescription compositeDescription{};
+    compositeDescription.vertexShaderPath = ENGINE_SHADER_DIR "/CompositeVS.cso";
+    compositeDescription.pixelShaderPath = ENGINE_SHADER_DIR "/CompositePS.cso";
+    compositeDescription.vertexLayout = nullptr;
+    compositeDescription.renderTargets.count = 1;
+    compositeDescription.renderTargets.formats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    compositeDescription.rootConstantCount = 2;
 
-    if(!m_compositePipeline.Initialize(
-        device,
-        ENGINE_SHADER_DIR "/CompositeVS.cso",
-        ENGINE_SHADER_DIR "/CompositePS.cso",
-        nullptr,
-        compositeTargets,
-        2
-    )){
+    if(!m_compositePipeline.Initialize(device, compositeDescription)){
         Log::Error("Failed to init composite test pipeline.");
         return false;
     }
@@ -137,6 +134,58 @@ void Renderer::Draw(ID3D12GraphicsCommandList* commandList, const RenderObject& 
 
 
 // --------------
+// Deferred Passes
+// --------------
+void Renderer::BeginGeometryPass(ID3D12GraphicsCommandList* commandList)
+{
+    RenderTarget& albedo = m_gBuffer.GetAlbedo();
+    RenderTarget& normal = m_gBuffer.GetNormal();
+
+    albedo.Transition(commandList, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    normal.Transition(commandList, D3D12_RESOURCE_STATE_RENDER_TARGET);
+
+    const float albedoClearColor[] =
+    {
+        1.0f, 0.0f, 1.0f, 1.0f
+    };
+
+    const float normalClearColor[] =
+    {
+        0.0f, 1.0f, 0.0f, 1.0f
+    };
+
+    D3D12_CPU_DESCRIPTOR_HANDLE renderTargets[] = {albedo.GetRTV(), normal.GetRTV()};
+
+    commandList->ClearRenderTargetView(renderTargets[0], albedoClearColor, 0, nullptr);
+    commandList->ClearRenderTargetView(renderTargets[1], normalClearColor, 0, nullptr);
+    commandList->OMSetRenderTargets(2, renderTargets, FALSE, nullptr);
+}
+
+void Renderer::EndGeometryPass(ID3D12GraphicsCommandList* commandList)
+{
+    m_gBuffer.GetAlbedo().Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    m_gBuffer.GetNormal().Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+}
+
+void Renderer::ExecuteCompositePass(ID3D12GraphicsCommandList* commandList, D3D12_CPU_DESCRIPTOR_HANDLE backBufferRTV)
+{
+    commandList->OMSetRenderTargets(1, &backBufferRTV, FALSE, nullptr);
+    
+    m_compositePipeline.Bind(commandList);
+
+    unsigned int gBufferIndices[] =
+    {
+        m_gBuffer.GetAlbedo().GetSRVIndex(),
+        m_gBuffer.GetNormal().GetSRVIndex()
+    };
+
+    commandList->SetGraphicsRoot32BitConstants(0, 2, gBufferIndices, 0);
+
+    commandList->DrawInstanced(3, 1, 0, 0);
+}
+
+
+// --------------
 // Rendering
 // --------------
 
@@ -149,29 +198,6 @@ void Renderer::Render(const RenderObject& object)
     }
 
     ID3D12GraphicsCommandList* commandList = m_commandContext.GetCommandList();
-
-    D3D12_CPU_DESCRIPTOR_HANDLE albedoRTV = m_gBuffer.GetAlbedo().GetRTV();
-    D3D12_CPU_DESCRIPTOR_HANDLE normalRTV = m_gBuffer.GetNormal().GetRTV();
-
-    const float albedoClearColor[] = {
-        1.0f,
-        0.0f,
-        1.0f,
-        1.0f
-    };
-
-    const float normalClearColor[] = {
-        0.0f,
-        1.0f,
-        0.0f,
-        1.0f
-    };
-
-    m_gBuffer.GetAlbedo().Transition(commandList, D3D12_RESOURCE_STATE_RENDER_TARGET);
-    m_gBuffer.GetNormal().Transition(commandList, D3D12_RESOURCE_STATE_RENDER_TARGET);
-
-    commandList->ClearRenderTargetView(albedoRTV, albedoClearColor, 0, nullptr);
-    commandList->ClearRenderTargetView(normalRTV, normalClearColor, 0, nullptr);
 
     D3D12_RESOURCE_BARRIER barrier{};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -188,10 +214,6 @@ void Renderer::Render(const RenderObject& object)
     commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
     D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = m_swapChain.GetCurrentRTV();
-
-    D3D12_CPU_DESCRIPTOR_HANDLE gBufferRTVs[] = {albedoRTV, normalRTV};
-
-    commandList->OMSetRenderTargets(2, gBufferRTVs, FALSE, nullptr);
 
     D3D12_VIEWPORT viewport{};
     viewport.TopLeftX = 0.0f;
@@ -220,22 +242,10 @@ void Renderer::Render(const RenderObject& object)
 
     commandList->ClearRenderTargetView(rtvHandle, clearColor, 0, nullptr);
 
+    BeginGeometryPass(commandList);
     Draw(commandList, object);
-
-    m_gBuffer.GetAlbedo().Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-    m_gBuffer.GetNormal().Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-
-    commandList->OMSetRenderTargets(1, &rtvHandle, FALSE, nullptr);
-    m_compositePipeline.Bind(commandList);
-
-    unsigned int gBufferIndices[] =
-    {
-        m_gBuffer.GetAlbedo().GetSRVIndex(),
-        m_gBuffer.GetNormal().GetSRVIndex()
-    };
-
-    commandList->SetGraphicsRoot32BitConstants(0, 2, gBufferIndices, 0);
-    commandList->DrawInstanced(3, 1, 0, 0);
+    EndGeometryPass(commandList);
+    ExecuteCompositePass(commandList, rtvHandle);
 
     barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
     barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;

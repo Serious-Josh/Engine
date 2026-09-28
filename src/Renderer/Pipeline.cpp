@@ -1,8 +1,8 @@
 #include "Pipeline.h"
 
-bool Pipeline::Initialize(ID3D12Device* device, const char* vertexShaderPath, const char* pixelShaderPath, const VertexLayout* vertexLayout, const PipelineRenderTargets& renderTargets, unsigned int rootConstantCount)
+bool Pipeline::Initialize(ID3D12Device* device, const PipelineDescription& description)
 {
-    if(renderTargets.count > 8){
+    if(description.renderTargets.count > 8){
         return false;
     }
     
@@ -10,7 +10,7 @@ bool Pipeline::Initialize(ID3D12Device* device, const char* vertexShaderPath, co
     rootParameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     rootParameter.Constants.ShaderRegister = 0;
     rootParameter.Constants.RegisterSpace = 0;
-    rootParameter.Constants.Num32BitValues = rootConstantCount;
+    rootParameter.Constants.Num32BitValues = description.rootConstantCount;
     rootParameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
     D3D12_STATIC_SAMPLER_DESC sampler{};
@@ -78,19 +78,19 @@ bool Pipeline::Initialize(ID3D12Device* device, const char* vertexShaderPath, co
     }
 
 
-    if(!m_vertexShader.Load(vertexShaderPath)){
+    if(!m_vertexShader.Load(description.vertexShaderPath)){
         return false;
     }
 
-    if(!m_pixelShader.Load(pixelShaderPath)){
+    if(!m_pixelShader.Load(description.pixelShaderPath)){
         m_vertexShader.Unload();
         return false;
     }
 
     std::vector<D3D12_INPUT_ELEMENT_DESC> inputElements;
 
-    if(vertexLayout){
-        for(const VertexAttribute& attribute : vertexLayout->GetAttributes())
+    if(description.vertexLayout){
+        for(const VertexAttribute& attribute : description.vertexLayout->GetAttributes())
         {
             inputElements.push_back({attribute.semantic, attribute.semanticIndex, VertexLayout::GetDXGIFormat(attribute.type), 0, attribute.offset, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0});
         }
@@ -120,7 +120,7 @@ bool Pipeline::Initialize(ID3D12Device* device, const char* vertexShaderPath, co
     blendDescription.AlphaToCoverageEnable = FALSE;
     blendDescription.IndependentBlendEnable = FALSE;
 
-    for(unsigned int i = 0; i < renderTargets.count; ++i)
+    for(unsigned int i = 0; i < description.renderTargets.count; ++i)
     {
         blendDescription.RenderTarget[i].BlendEnable = FALSE;
         blendDescription.RenderTarget[i].LogicOpEnable = FALSE;
@@ -163,10 +163,10 @@ bool Pipeline::Initialize(ID3D12Device* device, const char* vertexShaderPath, co
     pipelineDescription.InputLayout.NumElements = static_cast<UINT>(inputElements.size());
     pipelineDescription.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     
-    pipelineDescription.NumRenderTargets = renderTargets.count;
+    pipelineDescription.NumRenderTargets = description.renderTargets.count;
 
-    for(unsigned int i = 0; i < renderTargets.count; ++i){
-        pipelineDescription.RTVFormats[i] = renderTargets.formats[i];
+    for(unsigned int i = 0; i < description.renderTargets.count; ++i){
+        pipelineDescription.RTVFormats[i] = description.renderTargets.formats[i];
     }
 
     pipelineDescription.SampleDesc.Count = 1;

@@ -12,6 +12,18 @@ struct PipelineRenderTargets
     unsigned int count = 0;
 };
 
+struct PipelineDescription
+{
+    const char* vertexShaderPath = nullptr;
+    const char* pixelShaderPath = nullptr;
+
+    const VertexLayout* vertexLayout = nullptr;
+
+    PipelineRenderTargets renderTargets{};
+
+    unsigned int rootConstantCount = 0;
+};
+
 class Pipeline
 {
     public:
@@ -20,7 +32,7 @@ class Pipeline
         Pipeline(const Pipeline&) = delete;
         Pipeline& operator=(const Pipeline&) = delete;
         
-        bool Initialize(ID3D12Device* device, const char* vertexShaderPath, const char* pixelShaderPath, const VertexLayout* vertexLayout, const PipelineRenderTargets& renderTargets, unsigned int rootConstantCount);
+        bool Initialize(ID3D12Device* device, const PipelineDescription& description);
         void Shutdown();
         void Bind(ID3D12GraphicsCommandList* commandList) const;
 

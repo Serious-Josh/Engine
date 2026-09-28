@@ -34,6 +34,11 @@ class Renderer
 
         void Resize(unsigned int width, unsigned int height);
 
+        void BeginGeometryPass(ID3D12GraphicsCommandList* commandList);
+        void EndGeometryPass(ID3D12GraphicsCommandList* commandList);
+
+        void ExecuteCompositePass(ID3D12GraphicsCommandList* commandList, D3D12_CPU_DESCRIPTOR_HANDLE backBufferRTV);
+
         bool InitializeDemoScene(DemoScene& scene);
     private:
         bool InitializeDevice();

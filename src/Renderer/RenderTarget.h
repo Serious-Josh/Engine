@@ -42,8 +42,8 @@ class RenderTarget
         unsigned int m_rtvIndex = UINT_MAX;
         unsigned int m_srvIndex = UINT_MAX;
 
-        unsigned int m_width;
-        unsigned int m_height;
+        unsigned int m_width = 0;
+        unsigned int m_height = 0;
 
         DXGI_FORMAT m_format = DXGI_FORMAT_UNKNOWN;
 
