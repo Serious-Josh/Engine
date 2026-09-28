@@ -16,6 +16,8 @@ bool DemoScene::Initialize(
     pipelineDescription.renderTargets.formats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
     pipelineDescription.renderTargets.formats[1] = DXGI_FORMAT_R16G16B16A16_FLOAT;
     pipelineDescription.rootConstantCount = 1;
+    pipelineDescription.depthEnabled = true;
+    pipelineDescription.depthFormat = DXGI_FORMAT_D32_FLOAT;
 
     if(!m_pipeline.Initialize(device, pipelineDescription))
     {

@@ -22,6 +22,9 @@ struct PipelineDescription
     PipelineRenderTargets renderTargets{};
 
     unsigned int rootConstantCount = 0;
+
+    bool depthEnabled = false;
+    DXGI_FORMAT depthFormat = DXGI_FORMAT_UNKNOWN;
 };
 
 class Pipeline

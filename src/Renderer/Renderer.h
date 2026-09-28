@@ -51,7 +51,8 @@ class Renderer
 
         ResourceUploader m_resourceUploader;
         DescriptorHeap m_resourceDescriptorHeap;
-        DescriptorHeap m_rtvDescriptorheap;
+        DescriptorHeap m_rtvDescriptorHeap;
+        DescriptorHeap m_dsvDescriptorHeap;
         Pipeline m_compositePipeline;
 
         unsigned int m_width = 0;

@@ -137,16 +137,12 @@ bool Pipeline::Initialize(ID3D12Device* device, const PipelineDescription& descr
 
     D3D12_DEPTH_STENCIL_DESC depthStencilDescription{};
 
-    depthStencilDescription.DepthEnable = FALSE;
-    depthStencilDescription.DepthWriteMask =
-        D3D12_DEPTH_WRITE_MASK_ZERO;
-    depthStencilDescription.DepthFunc =
-        D3D12_COMPARISON_FUNC_ALWAYS;
+    depthStencilDescription.DepthEnable = description.depthEnabled;
+    depthStencilDescription.DepthWriteMask = description.depthEnabled ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
+    depthStencilDescription.DepthFunc = description.depthEnabled ? D3D12_COMPARISON_FUNC_LESS : D3D12_COMPARISON_FUNC_ALWAYS;
     depthStencilDescription.StencilEnable = FALSE;
-    depthStencilDescription.StencilReadMask =
-        D3D12_DEFAULT_STENCIL_READ_MASK;
-    depthStencilDescription.StencilWriteMask =
-        D3D12_DEFAULT_STENCIL_WRITE_MASK;
+    depthStencilDescription.StencilReadMask = D3D12_DEFAULT_STENCIL_READ_MASK;
+    depthStencilDescription.StencilWriteMask = D3D12_DEFAULT_STENCIL_WRITE_MASK;
 
     D3D12_GRAPHICS_PIPELINE_STATE_DESC pipelineDescription{};
 
@@ -168,6 +164,8 @@ bool Pipeline::Initialize(ID3D12Device* device, const PipelineDescription& descr
     for(unsigned int i = 0; i < description.renderTargets.count; ++i){
         pipelineDescription.RTVFormats[i] = description.renderTargets.formats[i];
     }
+
+    pipelineDescription.DSVFormat = description.depthEnabled ? description.depthFormat : DXGI_FORMAT_UNKNOWN;
 
     pipelineDescription.SampleDesc.Count = 1;
 

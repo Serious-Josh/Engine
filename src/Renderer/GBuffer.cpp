@@ -1,7 +1,7 @@
 #include "GBuffer.h"
 #include "DescriptorHeap.h"
 
-bool GBuffer::Initialize(ID3D12Device* device, unsigned int width, unsigned int height, DescriptorHeap& rtvHeap, DescriptorHeap& resourceHeap)
+bool GBuffer::Initialize(ID3D12Device* device, unsigned int width, unsigned int height, DescriptorHeap& rtvHeap, DescriptorHeap& dsvHeap, DescriptorHeap& resourceHeap)
 {
     if(!m_albedo.Initialize(
         device,
@@ -26,19 +26,25 @@ bool GBuffer::Initialize(ID3D12Device* device, unsigned int width, unsigned int 
         return false;
     }
 
+    if(!m_depth.Initialize(device, width, height, dsvHeap, resourceHeap)){
+        m_normal.Shutdown();
+        m_albedo.Shutdown();
+        return false;
+    }
 
     return true;
 }
 
-bool GBuffer::Resize(ID3D12Device* device, unsigned int width, unsigned int height, DescriptorHeap& rtvHeap, DescriptorHeap& resourceHeap)
+bool GBuffer::Resize(ID3D12Device* device, unsigned int width, unsigned int height, DescriptorHeap& rtvHeap, DescriptorHeap& dsvHeap, DescriptorHeap& resourceHeap)
 {
     Shutdown();
 
-    return Initialize(device, width, height, rtvHeap, resourceHeap);
+    return Initialize(device, width, height, rtvHeap, dsvHeap, resourceHeap);
 }
 
 void GBuffer::Shutdown()
 {
+    m_depth.Shutdown();
     m_normal.Shutdown();
     m_albedo.Shutdown();
 }
@@ -53,6 +59,11 @@ RenderTarget& GBuffer::GetNormal()
     return m_normal;
 }
 
+DepthBuffer& GBuffer::GetDepth()
+{
+    return m_depth;
+}
+
 const RenderTarget& GBuffer::GetAlbedo() const
 {
     return m_albedo;
@@ -61,4 +72,9 @@ const RenderTarget& GBuffer::GetAlbedo() const
 const RenderTarget& GBuffer::GetNormal() const
 {
     return m_normal;
+}
+
+const DepthBuffer& GBuffer::GetDepth() const
+{
+    return m_depth;
 }

@@ -52,12 +52,17 @@ bool Renderer::Initialize(void* windowHandle, unsigned int width, unsigned int h
         return false;
     }
 
-    if(!m_rtvDescriptorheap.Initialize(device, D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 16, false)){
+    if(!m_rtvDescriptorHeap.Initialize(device, D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 16, false)){
         Log::Error("Failed to init rtv descriptor heap.");
         return false;
     }
 
-    if(!m_gBuffer.Initialize(device, m_width, m_height, m_rtvDescriptorheap, m_resourceDescriptorHeap)){
+    if(!m_dsvDescriptorHeap.Initialize(device, D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 16, false)){
+        Log::Error("Failed to init dsv descriptor heap.");
+        return false;
+    }
+
+    if(!m_gBuffer.Initialize(device, m_width, m_height, m_rtvDescriptorHeap, m_dsvDescriptorHeap, m_resourceDescriptorHeap)){
         Log::Error("Failed to init G-Buffer.");
         return false;
     }
@@ -108,7 +113,7 @@ void Renderer::Resize(unsigned int width, unsigned int height)
         return;
     }
 
-    if(!m_gBuffer.Resize(m_graphicsDevice.GetDevice(), width, height, m_rtvDescriptorheap, m_resourceDescriptorHeap)){
+    if(!m_gBuffer.Resize(m_graphicsDevice.GetDevice(), width, height, m_rtvDescriptorHeap, m_dsvDescriptorHeap, m_resourceDescriptorHeap)){
         Log::Error("Failed to resize G-Buffer.");
         return;
     }
@@ -140,9 +145,11 @@ void Renderer::BeginGeometryPass(ID3D12GraphicsCommandList* commandList)
 {
     RenderTarget& albedo = m_gBuffer.GetAlbedo();
     RenderTarget& normal = m_gBuffer.GetNormal();
+    DepthBuffer& depth = m_gBuffer.GetDepth();
 
     albedo.Transition(commandList, D3D12_RESOURCE_STATE_RENDER_TARGET);
     normal.Transition(commandList, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    depth.Transition(commandList, D3D12_RESOURCE_STATE_DEPTH_WRITE);
 
     const float albedoClearColor[] =
     {
@@ -158,7 +165,11 @@ void Renderer::BeginGeometryPass(ID3D12GraphicsCommandList* commandList)
 
     commandList->ClearRenderTargetView(renderTargets[0], albedoClearColor, 0, nullptr);
     commandList->ClearRenderTargetView(renderTargets[1], normalClearColor, 0, nullptr);
-    commandList->OMSetRenderTargets(2, renderTargets, FALSE, nullptr);
+    commandList->ClearDepthStencilView(depth.GetDSV(), D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+
+    D3D12_CPU_DESCRIPTOR_HANDLE dsv = depth.GetDSV();
+
+    commandList->OMSetRenderTargets(2, renderTargets, FALSE, &dsv);
 }
 
 void Renderer::EndGeometryPass(ID3D12GraphicsCommandList* commandList)
@@ -296,6 +307,7 @@ void Renderer::Shutdown()
     m_compositePipeline.Shutdown();
     
     m_resourceDescriptorHeap.Shutdown();
-    m_rtvDescriptorheap.Shutdown();
+    m_rtvDescriptorHeap.Shutdown();
+    m_dsvDescriptorHeap.Shutdown();
     m_graphicsDevice.Shutdown();
 }
