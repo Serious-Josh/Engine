@@ -15,7 +15,12 @@ bool DemoScene::Initialize(
     pipelineDescription.renderTargets.count = 2;
     pipelineDescription.renderTargets.formats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
     pipelineDescription.renderTargets.formats[1] = DXGI_FORMAT_R16G16B16A16_FLOAT;
-    pipelineDescription.rootConstantCount = 1;
+
+    pipelineDescription.rootParameters.push_back({RootParameterType::Constants, 0, 1, D3D12_SHADER_VISIBILITY_PIXEL});
+
+    pipelineDescription.rootParameters.push_back({RootParameterType::ConstantBuffer, 1, 0, D3D12_SHADER_VISIBILITY_VERTEX});
+    pipelineDescription.rootParameters.push_back({RootParameterType::ConstantBuffer, 2, 0, D3D12_SHADER_VISIBILITY_VERTEX});
+
     pipelineDescription.depthEnabled = true;
     pipelineDescription.depthFormat = DXGI_FORMAT_D32_FLOAT;
 
@@ -60,7 +65,6 @@ bool DemoScene::Initialize(
     m_renderObject.mesh = &m_mesh;
     m_renderObject.material = &m_material;
 
-
     return true;
 }
 
@@ -77,7 +81,17 @@ void DemoScene::Shutdown()
     m_renderObject.material = nullptr;
 }
 
+void DemoScene::SetAspectRatio(float aspectRatio)
+{
+    m_camera.SetAspectRatio(aspectRatio);
+}
+
 const RenderObject& DemoScene::GetRenderObject() const
 {
     return m_renderObject;
+}
+
+const Camera& DemoScene::GetCamera() const
+{
+    return m_camera;
 }

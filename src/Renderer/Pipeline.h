@@ -5,6 +5,23 @@
 
 #include <d3d12.h>
 #include <array>
+#include <vector>
+
+enum class RootParameterType
+{
+    Constants,
+    ConstantBuffer
+};
+
+struct RootParameterDescription
+{
+    RootParameterType type = RootParameterType::Constants;
+    
+    unsigned int shaderRegister= 0;
+    unsigned int constantCount = 0;
+    
+    D3D12_SHADER_VISIBILITY visibility = D3D12_SHADER_VISIBILITY_ALL;
+};
 
 struct PipelineRenderTargets
 {
@@ -21,7 +38,7 @@ struct PipelineDescription
 
     PipelineRenderTargets renderTargets{};
 
-    unsigned int rootConstantCount = 0;
+    std::vector<RootParameterDescription> rootParameters;
 
     bool depthEnabled = false;
     DXGI_FORMAT depthFormat = DXGI_FORMAT_UNKNOWN;

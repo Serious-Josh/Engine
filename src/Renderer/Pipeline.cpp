@@ -6,12 +6,35 @@ bool Pipeline::Initialize(ID3D12Device* device, const PipelineDescription& descr
         return false;
     }
     
-    D3D12_ROOT_PARAMETER rootParameter{};
-    rootParameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    rootParameter.Constants.ShaderRegister = 0;
-    rootParameter.Constants.RegisterSpace = 0;
-    rootParameter.Constants.Num32BitValues = description.rootConstantCount;
-    rootParameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    std::vector<D3D12_ROOT_PARAMETER> rootParameters;
+    rootParameters.reserve(description.rootParameters.size());
+
+    for(const RootParameterDescription& parameterDescription : description.rootParameters){
+        D3D12_ROOT_PARAMETER parameter{};
+
+        parameter.ShaderVisibility = parameterDescription.visibility;
+
+        switch(parameterDescription.type){
+            case RootParameterType::Constants:
+            {
+                parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+                parameter.Constants.ShaderRegister = parameterDescription.shaderRegister;
+                parameter.Constants.RegisterSpace = 0;
+                parameter.Constants.Num32BitValues = parameterDescription.constantCount;
+                break;
+            }
+
+            case RootParameterType::ConstantBuffer:
+            {
+                parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+                parameter.Descriptor.ShaderRegister = parameterDescription.shaderRegister;
+                parameter.Descriptor.RegisterSpace = 0;
+                break;
+            }
+        }
+
+        rootParameters.push_back(parameter);
+    }
 
     D3D12_STATIC_SAMPLER_DESC sampler{};
     sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
@@ -30,8 +53,8 @@ bool Pipeline::Initialize(ID3D12Device* device, const PipelineDescription& descr
 
     D3D12_ROOT_SIGNATURE_DESC rootSignatureDescription{};
 
-    rootSignatureDescription.NumParameters = 1;
-    rootSignatureDescription.pParameters = &rootParameter;
+    rootSignatureDescription.NumParameters = static_cast<UINT>(rootParameters.size());
+    rootSignatureDescription.pParameters = rootParameters.empty() ? nullptr : rootParameters.data();
     rootSignatureDescription.NumStaticSamplers = 1;
     rootSignatureDescription.pStaticSamplers = &sampler;
     rootSignatureDescription.Flags =

@@ -36,6 +36,7 @@ add_executable(Engine
     src/Renderer/RenderTarget.cpp
     src/Renderer/GBuffer.cpp
     src/Renderer/DepthBuffer.cpp
+    src/Renderer/UploadBuffer.cpp
 )
 
 target_include_directories(Engine

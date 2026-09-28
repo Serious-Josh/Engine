@@ -3,6 +3,8 @@
 #include "DemoContent/DemoScene.h"
 #include "Renderer/Texture.h"
 #include "Material.h"
+#include "Scene/Camera.h"
+#include "ShaderData.h"
 
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
@@ -35,7 +37,8 @@ bool Renderer::Initialize(void* windowHandle, unsigned int width, unsigned int h
     compositeDescription.vertexLayout = nullptr;
     compositeDescription.renderTargets.count = 1;
     compositeDescription.renderTargets.formats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
-    compositeDescription.rootConstantCount = 2;
+    
+    compositeDescription.rootParameters.push_back({RootParameterType::Constants, 0, 2, D3D12_SHADER_VISIBILITY_PIXEL});
 
     if(!m_compositePipeline.Initialize(device, compositeDescription)){
         Log::Error("Failed to init composite test pipeline.");
@@ -44,6 +47,11 @@ bool Renderer::Initialize(void* windowHandle, unsigned int width, unsigned int h
 
     if(!m_resourceUploader.Initialize(device)){
         Log::Error("Failed to init resource uploader.");
+        return false;
+    }
+
+    if(!m_uploadBuffer.Initialize(device, 1024 * 1024)){
+        Log::Error("Failed to init upload buffer.");
         return false;
     }
 
@@ -122,15 +130,28 @@ void Renderer::Resize(unsigned int width, unsigned int height)
     m_height = height;
 }
 
-void Renderer::Draw(ID3D12GraphicsCommandList* commandList, const RenderObject& object)
+void Renderer::Draw(ID3D12GraphicsCommandList* commandList, const RenderObject& object, D3D12_GPU_VIRTUAL_ADDRESS cameraConstantsAddress)
 {
     if(!object.mesh || !object.material || !object.material->pipeline || !object.material->texture){
+        return;
+    }
+
+    ObjectConstants objectConstants{};
+    objectConstants.model = object.transform.GetModelMatrix();
+
+    D3D12_GPU_VIRTUAL_ADDRESS objectConstantsAddress = m_uploadBuffer.Allocate(&objectConstants, sizeof(ObjectConstants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
+
+    if(objectConstantsAddress == 0){
+        Log::Error("Failed to allocate object constants.");
         return;
     }
 
     object.material->pipeline->Bind(commandList);
 
     commandList->SetGraphicsRoot32BitConstant(0, object.material->texture->GetDescriptorIndex(), 0);
+
+    commandList->SetGraphicsRootConstantBufferView(1, cameraConstantsAddress);
+    commandList->SetGraphicsRootConstantBufferView(2, objectConstantsAddress);
 
     object.mesh->Bind(commandList);
 
@@ -200,8 +221,20 @@ void Renderer::ExecuteCompositePass(ID3D12GraphicsCommandList* commandList, D3D1
 // Rendering
 // --------------
 
-void Renderer::Render(const RenderObject& object)
+void Renderer::Render(const RenderObject& object, const Camera& camera)
 {
+    m_uploadBuffer.Reset();
+
+    CameraConstants cameraConstants{};
+    cameraConstants.view = camera.GetViewMatrix();
+    cameraConstants.projection = camera.GetProjectionMatrix();
+
+    D3D12_GPU_VIRTUAL_ADDRESS cameraConstantsAddress = m_uploadBuffer.Allocate(&cameraConstants, sizeof(CameraConstants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
+
+    if(cameraConstantsAddress == 0){
+        Log::Error("Failed to allocate camera constants.");
+        return;
+    }
 
     if(!m_commandContext.Begin()){
         Log::Error("failed to begin command recording.");
@@ -254,7 +287,7 @@ void Renderer::Render(const RenderObject& object)
     commandList->ClearRenderTargetView(rtvHandle, clearColor, 0, nullptr);
 
     BeginGeometryPass(commandList);
-    Draw(commandList, object);
+    Draw(commandList, object, cameraConstantsAddress);
     EndGeometryPass(commandList);
     ExecuteCompositePass(commandList, rtvHandle);
 
@@ -287,6 +320,11 @@ bool Renderer::InitializeDemoScene(DemoScene& scene)
         m_resourceDescriptorHeap
     );
 
+    if(!result){
+        return false;
+    }
+
+    scene.SetAspectRatio(static_cast<float>(m_width) / static_cast<float>(m_height));
 
     return result;
 }
@@ -306,6 +344,7 @@ void Renderer::Shutdown()
     m_gBuffer.Shutdown();
     m_compositePipeline.Shutdown();
     
+    m_uploadBuffer.Shutdown();
     m_resourceDescriptorHeap.Shutdown();
     m_rtvDescriptorHeap.Shutdown();
     m_dsvDescriptorHeap.Shutdown();

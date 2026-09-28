@@ -4,6 +4,7 @@
 #include "Mesh.h"
 #include "Pipeline.h"
 #include "GBuffer.h"
+#include "UploadBuffer.h"
 #include "Renderer/CommandContext.h"
 #include "Renderer/DescriptorHeap.h"
 #include "Renderer/GraphicsDevice.h"
@@ -29,7 +30,7 @@ class Renderer
 {
     public:
         bool Initialize(void* windowHandle, unsigned int width, unsigned int height);
-        void Render(const RenderObject& object);
+        void Render(const RenderObject& object, const Camera& camera);
         void Shutdown();
 
         void Resize(unsigned int width, unsigned int height);
@@ -43,7 +44,7 @@ class Renderer
     private:
         bool InitializeDevice();
         bool InitializeSwapChain(void* windowHandle);
-        void Draw(ID3D12GraphicsCommandList* commandList, const RenderObject& object);
+        void Draw(ID3D12GraphicsCommandList* commandList, const RenderObject& object, D3D12_GPU_VIRTUAL_ADDRESS cameraConstantsAddress);
 
         GraphicsDevice m_graphicsDevice;
         SwapChain m_swapChain;
@@ -59,4 +60,5 @@ class Renderer
         unsigned int m_height = 0;
 
         GBuffer m_gBuffer;
+        UploadBuffer m_uploadBuffer;
 };

@@ -35,6 +35,11 @@ bool Engine::Initialize()
             switch(event.type){
                 case EventType::WindowResized:
                     m_window.SetSize(event.width, event.height);
+
+                    if(event.height > 0){
+                        m_demoScene.SetAspectRatio(static_cast<float>(event.width) / static_cast<float>(event.height));
+                    }
+
                     m_renderer.Resize(event.width, event.height);
                     break;
                 case EventType::WindowClose:
@@ -85,7 +90,7 @@ void Engine::Frame()
     m_input.Update();
     m_window.ProcessMessages();
 
-    m_renderer.Render(m_demoScene.GetRenderObject());
+    m_renderer.Render(m_demoScene.GetRenderObject(), m_demoScene.GetCamera());
 }
 
 void Engine::Shutdown()
