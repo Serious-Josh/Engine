@@ -1,17 +1,16 @@
 #include "Pipeline.h"
 
-bool Pipeline::Initialize(
-    ID3D12Device* device,
-    const char* vertexShaderPath,
-    const char* pixelShaderPath,
-    const VertexLayout& vertexLayout
-)
+bool Pipeline::Initialize(ID3D12Device* device, const char* vertexShaderPath, const char* pixelShaderPath, const VertexLayout* vertexLayout, const PipelineRenderTargets& renderTargets, unsigned int rootConstantCount)
 {
+    if(renderTargets.count > 8){
+        return false;
+    }
+    
     D3D12_ROOT_PARAMETER rootParameter{};
     rootParameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     rootParameter.Constants.ShaderRegister = 0;
     rootParameter.Constants.RegisterSpace = 0;
-    rootParameter.Constants.Num32BitValues = 1;
+    rootParameter.Constants.Num32BitValues = rootConstantCount;
     rootParameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
     D3D12_STATIC_SAMPLER_DESC sampler{};
@@ -78,6 +77,7 @@ bool Pipeline::Initialize(
         return false;
     }
 
+
     if(!m_vertexShader.Load(vertexShaderPath)){
         return false;
     }
@@ -89,10 +89,11 @@ bool Pipeline::Initialize(
 
     std::vector<D3D12_INPUT_ELEMENT_DESC> inputElements;
 
-    for(const VertexAttribute& attribute : vertexLayout.GetAttributes()){
-        inputElements.push_back({
-            attribute.semantic, attribute.semanticIndex, VertexLayout::GetDXGIFormat(attribute.type), 0, attribute.offset, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0
-        });
+    if(vertexLayout){
+        for(const VertexAttribute& attribute : vertexLayout->GetAttributes())
+        {
+            inputElements.push_back({attribute.semantic, attribute.semanticIndex, VertexLayout::GetDXGIFormat(attribute.type), 0, attribute.offset, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0});
+        }
     }
 
     D3D12_RASTERIZER_DESC rasterizerDescription{};
@@ -119,19 +120,20 @@ bool Pipeline::Initialize(
     blendDescription.AlphaToCoverageEnable = FALSE;
     blendDescription.IndependentBlendEnable = FALSE;
 
-    blendDescription.RenderTarget[0].BlendEnable = FALSE;
-    blendDescription.RenderTarget[0].LogicOpEnable = FALSE;
-    blendDescription.RenderTarget[0].SrcBlend = D3D12_BLEND_ONE;
-    blendDescription.RenderTarget[0].DestBlend = D3D12_BLEND_ZERO;
-    blendDescription.RenderTarget[0].BlendOp = D3D12_BLEND_OP_ADD;
-    blendDescription.RenderTarget[0].SrcBlendAlpha = D3D12_BLEND_ONE;
-    blendDescription.RenderTarget[0].DestBlendAlpha = D3D12_BLEND_ZERO;
-    blendDescription.RenderTarget[0].BlendOpAlpha = D3D12_BLEND_OP_ADD;
-    blendDescription.RenderTarget[0].LogicOp =
-        D3D12_LOGIC_OP_NOOP;
-
-    blendDescription.RenderTarget[0].RenderTargetWriteMask =
-        D3D12_COLOR_WRITE_ENABLE_ALL;
+    for(unsigned int i = 0; i < renderTargets.count; ++i)
+    {
+        blendDescription.RenderTarget[i].BlendEnable = FALSE;
+        blendDescription.RenderTarget[i].LogicOpEnable = FALSE;
+        blendDescription.RenderTarget[i].SrcBlend = D3D12_BLEND_ONE;
+        blendDescription.RenderTarget[i].DestBlend = D3D12_BLEND_ZERO;
+        blendDescription.RenderTarget[i].BlendOp = D3D12_BLEND_OP_ADD;
+        blendDescription.RenderTarget[i].SrcBlendAlpha = D3D12_BLEND_ONE;
+        blendDescription.RenderTarget[i].DestBlendAlpha = D3D12_BLEND_ZERO;
+        blendDescription.RenderTarget[i].BlendOpAlpha = D3D12_BLEND_OP_ADD;
+        blendDescription.RenderTarget[i].LogicOp = D3D12_LOGIC_OP_NOOP;
+        blendDescription.RenderTarget[i].RenderTargetWriteMask =
+            D3D12_COLOR_WRITE_ENABLE_ALL;
+    }
 
     D3D12_DEPTH_STENCIL_DESC depthStencilDescription{};
 
@@ -160,8 +162,13 @@ bool Pipeline::Initialize(
     pipelineDescription.InputLayout.pInputElementDescs = inputElements.data();
     pipelineDescription.InputLayout.NumElements = static_cast<UINT>(inputElements.size());
     pipelineDescription.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-    pipelineDescription.NumRenderTargets = 1;
-    pipelineDescription.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    
+    pipelineDescription.NumRenderTargets = renderTargets.count;
+
+    for(unsigned int i = 0; i < renderTargets.count; ++i){
+        pipelineDescription.RTVFormats[i] = renderTargets.formats[i];
+    }
+
     pipelineDescription.SampleDesc.Count = 1;
 
     result = device->CreateGraphicsPipelineState(

@@ -1,11 +1,26 @@
 #include "DemoScene.h"
 #include "Renderer/Triangle.h"
 
-bool DemoScene::Initialize(ID3D12Device* device, ResourceUploader& uploader, DescriptorHeap& descriptorHeap)
+bool DemoScene::Initialize(
+    ID3D12Device* device,
+    ResourceUploader& uploader,
+    DescriptorHeap& descriptorHeap)
 {
     m_vertexLayout = CreateTriangleVertexLayout();
 
-    if(!m_pipeline.Initialize(device, ENGINE_SHADER_DIR "/TriangleVS.cso", ENGINE_SHADER_DIR "/TrianglePS.cso", m_vertexLayout)){
+    PipelineRenderTargets renderTargets{};
+    renderTargets.count = 2;
+    renderTargets.formats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    renderTargets.formats[1] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+
+    if(!m_pipeline.Initialize(
+        device,
+        ENGINE_SHADER_DIR "/TriangleVS.cso",
+        ENGINE_SHADER_DIR "/TrianglePS.cso",
+        &m_vertexLayout,
+        renderTargets,
+        1))
+    {
         return false;
     }
 
@@ -25,7 +40,13 @@ bool DemoScene::Initialize(ID3D12Device* device, ResourceUploader& uploader, Des
         return false;
     }
 
-    if(!uploader.UploadTexture(m_texture.GetResource(), m_texture.GetInitialData(), m_texture.GetInitialDataSize(), 2, 2)){
+    if(!uploader.UploadTexture(
+        m_texture.GetResource(),
+        m_texture.GetInitialData(),
+        m_texture.GetInitialDataSize(),
+        2,
+        2))
+    {
         return false;
     }
 
@@ -38,6 +59,7 @@ bool DemoScene::Initialize(ID3D12Device* device, ResourceUploader& uploader, Des
 
     m_renderObject.mesh = &m_mesh;
     m_renderObject.material = &m_material;
+
 
     return true;
 }

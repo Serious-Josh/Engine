@@ -3,13 +3,13 @@
 #include "Buffer.h"
 #include "Mesh.h"
 #include "Pipeline.h"
+#include "GBuffer.h"
 #include "Renderer/CommandContext.h"
 #include "Renderer/DescriptorHeap.h"
 #include "Renderer/GraphicsDevice.h"
 #include "Renderer/RenderObject.h"
 #include "Renderer/ResourceUploader.h"
 #include "Renderer/SwapChain.h"
-#include "Texture.h"
 
 #include <d3d12.h>
 
@@ -46,7 +46,11 @@ class Renderer
 
         ResourceUploader m_resourceUploader;
         DescriptorHeap m_resourceDescriptorHeap;
+        DescriptorHeap m_rtvDescriptorheap;
+        Pipeline m_compositePipeline;
 
         unsigned int m_width = 0;
         unsigned int m_height = 0;
+
+        GBuffer m_gBuffer;
 };

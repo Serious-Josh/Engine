@@ -19,10 +19,15 @@ bool Engine::Initialize()
         return false;
     }
 
-    if(!m_renderer.InitializeDemoScene(m_demoScene)){
-        Log::Error("Failed to init demo scene.");
+    Log::Info("Initializing demo scene.");
+
+    if(!m_renderer.InitializeDemoScene(m_demoScene))
+    {
+        Log::Error("Failed to initialize demo scene.");
         return false;
     }
+
+    Log::Info("Demo scene initialization complete.");
 
     m_window.SetEventCallback(
         [this](const Event& event)

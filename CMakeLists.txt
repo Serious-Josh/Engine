@@ -33,6 +33,8 @@ add_executable(Engine
     src/Renderer/CommandContext.cpp
     src/Renderer/GraphicsDevice.cpp
     src/DemoContent/DemoScene.cpp
+    src/Renderer/RenderTarget.cpp
+    src/Renderer/GBuffer.cpp
 )
 
 target_include_directories(Engine
@@ -52,6 +54,8 @@ add_custom_command(
     OUTPUT
         "${SHADER_OUTPUT_DIR}/TriangleVS.cso"
         "${SHADER_OUTPUT_DIR}/TrianglePS.cso"
+        "${SHADER_OUTPUT_DIR}/CompositeVS.cso"
+        "${SHADER_OUTPUT_DIR}/CompositePS.cso"
 
     COMMAND ${CMAKE_COMMAND} -E make_directory
         "${SHADER_OUTPUT_DIR}"
@@ -68,8 +72,21 @@ add_custom_command(
         /E PSMain
         /Fo "${SHADER_OUTPUT_DIR}/TrianglePS.cso"
 
+    COMMAND ${DXC}
+        "${SHADER_SOURCE_DIR}/Composite.hlsl"
+        /T vs_6_6
+        /E VSMain
+        /Fo "${SHADER_OUTPUT_DIR}/CompositeVS.cso"
+
+    COMMAND ${DXC}
+        "${SHADER_SOURCE_DIR}/Composite.hlsl"
+        /T ps_6_6
+        /E PSMain
+        /Fo "${SHADER_OUTPUT_DIR}/CompositePS.cso"
+
     DEPENDS
         "${SHADER_SOURCE_DIR}/Triangle.hlsl"
+        "${SHADER_SOURCE_DIR}/Composite.hlsl"
 
     COMMENT "Compiling shaders"
 )
@@ -78,6 +95,8 @@ add_custom_target(CompileShaders ALL
     DEPENDS
         "${SHADER_OUTPUT_DIR}/TriangleVS.cso"
         "${SHADER_OUTPUT_DIR}/TrianglePS.cso"
+        "${SHADER_OUTPUT_DIR}/CompositeVS.cso"
+        "${SHADER_OUTPUT_DIR}/CompositePS.cso"
 )
 
 add_dependencies(Engine CompileShaders)

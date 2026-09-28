@@ -1,4 +1,5 @@
 #include "DescriptorHeap.h"
+#include "Core/Log.h"
 
 #include <climits>
 #include <utility>
@@ -81,12 +82,16 @@ void DescriptorHeap::Shutdown()
 
 unsigned int DescriptorHeap::Allocate()
 {
-    if(m_freeIndices.empty()){
+
+    if(m_freeIndices.empty())
+    {
+        Log::Error("Descriptor heap is full.");
         return UINT_MAX;
     }
 
     unsigned int index = m_freeIndices.back();
     m_freeIndices.pop_back();
+
 
     return index;
 }
