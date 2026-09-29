@@ -111,6 +111,157 @@ struct Matrix4
         return RotationZ(rotation.z) * RotationY(rotation.y) * RotationX(rotation.x);
     }
 
+    Matrix4 Transpose() const
+    {
+        Matrix4 result{};
+
+        for(std::size_t row = 0; row < 4; ++row){
+            for(std::size_t column = 0; column < 4; ++column){
+                result.m[row][column] = m[column][row];
+            }
+        }
+
+        return result;
+    }
+
+    Matrix4 Inverse() const
+    {
+        const float* values = &m[0][0];
+
+        Matrix4 result{};
+        float* inverse = &result.m[0][0];
+
+        inverse[0] = values[5]  * values[10] * values[15] -
+                    values[5]  * values[11] * values[14] -
+                    values[9]  * values[6]  * values[15] +
+                    values[9]  * values[7]  * values[14] +
+                    values[13] * values[6]  * values[11] -
+                    values[13] * values[7]  * values[10];
+
+        inverse[4] = -values[4]  * values[10] * values[15] +
+                    values[4]  * values[11] * values[14] +
+                    values[8]  * values[6]  * values[15] -
+                    values[8]  * values[7]  * values[14] -
+                    values[12] * values[6]  * values[11] +
+                    values[12] * values[7]  * values[10];
+
+        inverse[8] = values[4]  * values[9] * values[15] -
+                    values[4]  * values[11] * values[13] -
+                    values[8]  * values[5] * values[15] +
+                    values[8]  * values[7] * values[13] +
+                    values[12] * values[5] * values[11] -
+                    values[12] * values[7] * values[9];
+
+        inverse[12] = -values[4]  * values[9] * values[14] +
+                    values[4]  * values[10] * values[13] +
+                    values[8]  * values[5] * values[14] -
+                    values[8]  * values[6] * values[13] -
+                    values[12] * values[5] * values[10] +
+                    values[12] * values[6] * values[9];
+
+        inverse[1] = -values[1]  * values[10] * values[15] +
+                    values[1]  * values[11] * values[14] +
+                    values[9]  * values[2] * values[15] -
+                    values[9]  * values[3] * values[14] -
+                    values[13] * values[2] * values[11] +
+                    values[13] * values[3] * values[10];
+
+        inverse[5] = values[0]  * values[10] * values[15] -
+                    values[0]  * values[11] * values[14] -
+                    values[8]  * values[2] * values[15] +
+                    values[8]  * values[3] * values[14] +
+                    values[12] * values[2] * values[11] -
+                    values[12] * values[3] * values[10];
+
+        inverse[9] = -values[0]  * values[9] * values[15] +
+                    values[0]  * values[11] * values[13] +
+                    values[8]  * values[1] * values[15] -
+                    values[8]  * values[3] * values[13] -
+                    values[12] * values[1] * values[11] +
+                    values[12] * values[3] * values[9];
+
+        inverse[13] = values[0]  * values[9] * values[14] -
+                    values[0]  * values[10] * values[13] -
+                    values[8]  * values[1] * values[14] +
+                    values[8]  * values[2] * values[13] +
+                    values[12] * values[1] * values[10] -
+                    values[12] * values[2] * values[9];
+
+        inverse[2] = values[1]  * values[6] * values[15] -
+                    values[1]  * values[7] * values[14] -
+                    values[5]  * values[2] * values[15] +
+                    values[5]  * values[3] * values[14] +
+                    values[13] * values[2] * values[7] -
+                    values[13] * values[3] * values[6];
+
+        inverse[6] = -values[0]  * values[6] * values[15] +
+                    values[0]  * values[7] * values[14] +
+                    values[4]  * values[2] * values[15] -
+                    values[4]  * values[3] * values[14] -
+                    values[12] * values[2] * values[7] +
+                    values[12] * values[3] * values[6];
+
+        inverse[10] = values[0]  * values[5] * values[15] -
+                    values[0]  * values[7] * values[13] -
+                    values[4]  * values[1] * values[15] +
+                    values[4]  * values[3] * values[13] +
+                    values[12] * values[1] * values[7] -
+                    values[12] * values[3] * values[5];
+
+        inverse[14] = -values[0]  * values[5] * values[14] +
+                    values[0]  * values[6] * values[13] +
+                    values[4]  * values[1] * values[14] -
+                    values[4]  * values[2] * values[13] -
+                    values[12] * values[1] * values[6] +
+                    values[12] * values[2] * values[5];
+
+        inverse[3] = -values[1] * values[6] * values[11] +
+                    values[1] * values[7] * values[10] +
+                    values[5] * values[2] * values[11] -
+                    values[5] * values[3] * values[10] -
+                    values[9] * values[2] * values[7] +
+                    values[9] * values[3] * values[6];
+
+        inverse[7] = values[0] * values[6] * values[11] -
+                    values[0] * values[7] * values[10] -
+                    values[4] * values[2] * values[11] +
+                    values[4] * values[3] * values[10] +
+                    values[8] * values[2] * values[7] -
+                    values[8] * values[3] * values[6];
+
+        inverse[11] = -values[0] * values[5] * values[11] +
+                    values[0] * values[7] * values[9] +
+                    values[4] * values[1] * values[11] -
+                    values[4] * values[3] * values[9] -
+                    values[8] * values[1] * values[7] +
+                    values[8] * values[3] * values[5];
+
+        inverse[15] = values[0] * values[5] * values[10] -
+                    values[0] * values[6] * values[9] -
+                    values[4] * values[1] * values[10] +
+                    values[4] * values[2] * values[9] +
+                    values[8] * values[1] * values[6] -
+                    values[8] * values[2] * values[5];
+
+        const float determinant =
+            values[0] * inverse[0] +
+            values[1] * inverse[4] +
+            values[2] * inverse[8] +
+            values[3] * inverse[12];
+
+        if(std::abs(determinant) < 0.000001f){
+            return Identity();
+        }
+
+        const float inverseDeterminant = 1.0f / determinant;
+
+        for(std::size_t i = 0; i < 16; ++i){
+            inverse[i] *= inverseDeterminant;
+        }
+
+        return result;
+    }
+
     float* operator[](std::size_t row)
     {
         return m[row];

@@ -38,7 +38,7 @@ class Renderer
         void BeginGeometryPass(ID3D12GraphicsCommandList* commandList);
         void EndGeometryPass(ID3D12GraphicsCommandList* commandList);
 
-        void ExecuteCompositePass(ID3D12GraphicsCommandList* commandList, D3D12_CPU_DESCRIPTOR_HANDLE backBufferRTV);
+        void ExecuteCompositePass(ID3D12GraphicsCommandList* commandList, D3D12_CPU_DESCRIPTOR_HANDLE backBufferRTV, D3D12_GPU_VIRTUAL_ADDRESS reconstructionConstantsAddress);
 
         bool InitializeDemoScene(DemoScene& scene);
     private:

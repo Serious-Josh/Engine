@@ -1,12 +1,14 @@
 struct VSInput
 {
     float3 position : POSITION;
+    float3 normal : NORMAL;
     float2 uv : TEXCOORD;
 };
 
 struct VSOutput
 {
     float4 position : SV_POSITION;
+    float3 worldNormal : NORMAL;
     float2 uv : TEXCOORD;
 };
 
@@ -30,6 +32,7 @@ cbuffer CameraConstants : register(b1)
 cbuffer ObjectConstants : register(b2)
 {
     row_major float4x4 model;
+    row_major float4x4 normalMatrix;
 }
 
 SamplerState sampler0 : register(s0);
@@ -40,8 +43,10 @@ VSOutput VSMain(VSInput input)
 
     float4 worldPosition = mul(model, float4(input.position, 1.0f));
     float4 viewPosition = mul(view, worldPosition);
+
     output.position = mul(projection, viewPosition);
 
+    output.worldNormal = normalize(mul((float3x3)normalMatrix, input.normal));
     output.uv = input.uv;
 
     return output;
@@ -54,7 +59,7 @@ PSOutput PSMain(VSOutput input)
     PSOutput output;
 
     output.albedo = texture0.Sample(sampler0, input.uv);
-    output.normal = float4(0.0f, 0.0f, 1.0f, 1.0f);
+    output.normal = float4(normalize(input.worldNormal), 1.0f);
 
     return output;
 }

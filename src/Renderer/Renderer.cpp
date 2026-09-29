@@ -38,7 +38,8 @@ bool Renderer::Initialize(void* windowHandle, unsigned int width, unsigned int h
     compositeDescription.renderTargets.count = 1;
     compositeDescription.renderTargets.formats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
     
-    compositeDescription.rootParameters.push_back({RootParameterType::Constants, 0, 2, D3D12_SHADER_VISIBILITY_PIXEL});
+    compositeDescription.rootParameters.push_back({RootParameterType::Constants, 0, 3, D3D12_SHADER_VISIBILITY_PIXEL});
+    compositeDescription.rootParameters.push_back({RootParameterType::ConstantBuffer, 1, 0, D3D12_SHADER_VISIBILITY_PIXEL});
 
     if(!m_compositePipeline.Initialize(device, compositeDescription)){
         Log::Error("Failed to init composite test pipeline.");
@@ -138,6 +139,7 @@ void Renderer::Draw(ID3D12GraphicsCommandList* commandList, const RenderObject& 
 
     ObjectConstants objectConstants{};
     objectConstants.model = object.transform.GetModelMatrix();
+    objectConstants.normalMatrix = objectConstants.model.Inverse().Transpose();
 
     D3D12_GPU_VIRTUAL_ADDRESS objectConstantsAddress = m_uploadBuffer.Allocate(&objectConstants, sizeof(ObjectConstants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
 
@@ -197,9 +199,10 @@ void Renderer::EndGeometryPass(ID3D12GraphicsCommandList* commandList)
 {
     m_gBuffer.GetAlbedo().Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     m_gBuffer.GetNormal().Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    m_gBuffer.GetDepth().Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 }
 
-void Renderer::ExecuteCompositePass(ID3D12GraphicsCommandList* commandList, D3D12_CPU_DESCRIPTOR_HANDLE backBufferRTV)
+void Renderer::ExecuteCompositePass(ID3D12GraphicsCommandList* commandList, D3D12_CPU_DESCRIPTOR_HANDLE backBufferRTV, D3D12_GPU_VIRTUAL_ADDRESS reconstructionConstantsAddress)
 {
     commandList->OMSetRenderTargets(1, &backBufferRTV, FALSE, nullptr);
     
@@ -208,10 +211,12 @@ void Renderer::ExecuteCompositePass(ID3D12GraphicsCommandList* commandList, D3D1
     unsigned int gBufferIndices[] =
     {
         m_gBuffer.GetAlbedo().GetSRVIndex(),
-        m_gBuffer.GetNormal().GetSRVIndex()
+        m_gBuffer.GetNormal().GetSRVIndex(),
+        m_gBuffer.GetDepth().GetSRVIndex()
     };
 
-    commandList->SetGraphicsRoot32BitConstants(0, 2, gBufferIndices, 0);
+    commandList->SetGraphicsRoot32BitConstants(0, 3, gBufferIndices, 0);
+    commandList->SetGraphicsRootConstantBufferView(1, reconstructionConstantsAddress);
 
     commandList->DrawInstanced(3, 1, 0, 0);
 }
@@ -233,6 +238,17 @@ void Renderer::Render(const RenderObject& object, const Camera& camera)
 
     if(cameraConstantsAddress == 0){
         Log::Error("Failed to allocate camera constants.");
+        return;
+    }
+
+    ReconstructionConstants reconstructionConstants{};
+    const Matrix4 viewProjection = cameraConstants.projection * cameraConstants.view;
+    reconstructionConstants.inverseViewProjection = viewProjection.Inverse();
+
+    D3D12_GPU_VIRTUAL_ADDRESS reconstructionConstantsAddress = m_uploadBuffer.Allocate(&reconstructionConstants, sizeof(ReconstructionConstants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
+
+    if(reconstructionConstantsAddress == 0){
+        Log::Error("Failed to allocate reconstruction constants.");
         return;
     }
 
@@ -289,7 +305,7 @@ void Renderer::Render(const RenderObject& object, const Camera& camera)
     BeginGeometryPass(commandList);
     Draw(commandList, object, cameraConstantsAddress);
     EndGeometryPass(commandList);
-    ExecuteCompositePass(commandList, rtvHandle);
+    ExecuteCompositePass(commandList, rtvHandle, reconstructionConstantsAddress);
 
     barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
     barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
