@@ -12,6 +12,7 @@
 #include "Renderer/ResourceUploader.h"
 #include "Renderer/SwapChain.h"
 #include "Renderer/Shader/ShaderLibrary.h"
+#include "Debug/DebugUI.h"
 
 #include <d3d12.h>
 #include <filesystem>
@@ -58,6 +59,8 @@ class Renderer
         DescriptorHeap m_dsvDescriptorHeap;
         Pipeline m_compositePipeline;
         ShaderLibrary m_shaderLibrary;
+
+        DebugUI m_debugUI;
 
         unsigned int m_width = 0;
         unsigned int m_height = 0;

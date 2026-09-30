@@ -39,6 +39,13 @@ add_executable(Engine
     src/Renderer/UploadBuffer.cpp
     src/Renderer/Shader/ShaderCompiler.cpp
     src/Renderer/Shader/ShaderLibrary.cpp
+    external/imgui/imgui.cpp
+    external/imgui/imgui_draw.cpp
+    external/imgui/imgui_tables.cpp
+    external/imgui/imgui_widgets.cpp
+    external/imgui/imgui_impl_win32.cpp
+    external/imgui/imgui_impl_dx12.cpp
+    src/Debug/DebugUI.cpp
 )
 
 add_custom_command(
@@ -63,6 +70,7 @@ add_custom_command(
 target_include_directories(Engine
     PRIVATE
         src
+        external/imgui
 )
 
 target_link_libraries(Engine

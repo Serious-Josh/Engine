@@ -102,12 +102,15 @@ bool Renderer::Initialize(void* windowHandle, unsigned int width, unsigned int h
         return false;
     }
 
+    if(!m_debugUI.Initialize(static_cast<HWND>(windowHandle), device, m_commandContext.GetCommandQueue(), m_resourceDescriptorHeap)){
+        Log::Error("Failed to init debug UI.");
+        return false;
+    }
+
     if(!m_gBuffer.Initialize(device, m_width, m_height, m_rtvDescriptorHeap, m_dsvDescriptorHeap, m_resourceDescriptorHeap)){
         Log::Error("Failed to init G-Buffer.");
         return false;
     }
-
-
 
     if(!InitializeSwapChain(windowHandle))
     {
@@ -259,6 +262,8 @@ void Renderer::ExecuteCompositePass(ID3D12GraphicsCommandList* commandList, D3D1
 
 void Renderer::Render(const RenderObject& object, const Camera& camera)
 {
+    m_debugUI.BeginFrame();
+
     m_uploadBuffer.Reset();
 
     CameraConstants cameraConstants{};
@@ -338,6 +343,8 @@ void Renderer::Render(const RenderObject& object, const Camera& camera)
     EndGeometryPass(commandList);
     ExecuteCompositePass(commandList, rtvHandle, reconstructionConstantsAddress);
 
+    m_debugUI.EndFrame(commandList);
+
     barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
     barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
 
@@ -403,6 +410,9 @@ bool Renderer::InitializeDemoScene(DemoScene& scene)
 void Renderer::Shutdown()
 {
     m_commandContext.WaitForGPU();
+
+    m_debugUI.Shutdown();
+
     m_swapChain.Shutdown();
     m_commandContext.Shutdown();
     m_resourceUploader.Shutdown();

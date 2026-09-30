@@ -26,6 +26,8 @@ class DescriptorHeap
 
         ID3D12DescriptorHeap* GetHeap() const;
 
+        unsigned int GetIndex(D3D12_CPU_DESCRIPTOR_HANDLE handle) const;
+
     private:
         ID3D12DescriptorHeap* m_heap = nullptr;
 

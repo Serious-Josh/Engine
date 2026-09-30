@@ -1,13 +1,16 @@
 #include "WindowsWindow.h"
 #include "Core/InputCodes.h"
 #include "Core/Assert.h"
+#include <Core/Log.h>
 
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
 #include <Windowsx.h>
 
 #include <utility>
-#include <Core/Log.h>
+#include "imgui_impl_win32.h"
+
+extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
 LRESULT CALLBACK WindowProc(
     HWND hwnd,
@@ -38,6 +41,8 @@ LRESULT CALLBACK WindowProc(
                 GetWindowLongPtrW(hwnd, GWLP_USERDATA)
             );
     }
+
+    ImGui_ImplWin32_WndProcHandler(hwnd, uMsg, wParam, lParam);
 
     switch(uMsg)
     {

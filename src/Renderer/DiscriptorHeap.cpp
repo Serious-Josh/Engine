@@ -127,3 +127,30 @@ ID3D12DescriptorHeap* DescriptorHeap::GetHeap() const
 {
     return m_heap;
 }
+
+unsigned int DescriptorHeap::GetIndex(D3D12_CPU_DESCRIPTOR_HANDLE handle) const
+{
+    if(!m_heap || m_descriptorSize == 0){
+        return UINT_MAX;
+    }
+
+    D3D12_CPU_DESCRIPTOR_HANDLE start = m_heap->GetCPUDescriptorHandleForHeapStart();
+
+    if(handle.ptr < start.ptr){
+        return UINT_MAX;
+    }
+
+    SIZE_T offset = handle.ptr - start.ptr;
+
+    if(offset % m_descriptorSize != 0){
+        return UINT_MAX;
+    }
+
+    unsigned int index = static_cast<unsigned int>(offset / m_descriptorSize);
+
+    if(index >= m_capacity){
+        return UINT_MAX;
+    }
+
+    return index;
+}
