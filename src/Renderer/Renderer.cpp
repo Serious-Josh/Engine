@@ -5,6 +5,8 @@
 #include "Material.h"
 #include "Scene/Camera.h"
 #include "ShaderData.h"
+#include "Scene/DirectionalLight.h"
+#include "Scene/Scene.h"
 
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
@@ -71,6 +73,7 @@ bool Renderer::Initialize(void* windowHandle, unsigned int width, unsigned int h
     
     compositeDescription.rootParameters.push_back({RootParameterType::Constants, 0, 3, D3D12_SHADER_VISIBILITY_PIXEL});
     compositeDescription.rootParameters.push_back({RootParameterType::ConstantBuffer, 1, 0, D3D12_SHADER_VISIBILITY_PIXEL});
+    compositeDescription.rootParameters.push_back({RootParameterType::ConstantBuffer, 2, 0, D3D12_SHADER_VISIBILITY_PIXEL});
 
     if(!m_compositePipeline.Initialize(device, compositeDescription)){
         Log::Error("Failed to init composite test pipeline.");
@@ -82,7 +85,7 @@ bool Renderer::Initialize(void* windowHandle, unsigned int width, unsigned int h
         return false;
     }
 
-    if(!m_uploadBuffer.Initialize(device, 1024 * 1024)){
+    if(!m_uploadBuffer.Initialize(device, 1024 * 1024, 2)){
         Log::Error("Failed to init upload buffer.");
         return false;
     }
@@ -191,7 +194,12 @@ void Renderer::Draw(ID3D12GraphicsCommandList* commandList, const RenderObject& 
 
     object.mesh->Bind(commandList);
 
-    commandList->DrawInstanced(static_cast<UINT>(object.mesh->GetVertexCount()), 1, 0, 0);
+    if(object.mesh->IsIndexed()){
+        commandList->DrawIndexedInstanced(static_cast<UINT>(object.mesh->GetIndexCount()), 1, 0, 0, 0);
+    }
+    else{
+        commandList->DrawInstanced(static_cast<UINT>(object.mesh->GetVertexCount()), 1, 0, 0);
+    }
 }
 
 
@@ -236,7 +244,10 @@ void Renderer::EndGeometryPass(ID3D12GraphicsCommandList* commandList)
     m_gBuffer.GetDepth().Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 }
 
-void Renderer::ExecuteCompositePass(ID3D12GraphicsCommandList* commandList, D3D12_CPU_DESCRIPTOR_HANDLE backBufferRTV, D3D12_GPU_VIRTUAL_ADDRESS reconstructionConstantsAddress)
+void Renderer::ExecuteCompositePass(ID3D12GraphicsCommandList* commandList,
+    D3D12_CPU_DESCRIPTOR_HANDLE backBufferRTV,
+    D3D12_GPU_VIRTUAL_ADDRESS reconstructionConstantsAddress,
+    D3D12_GPU_VIRTUAL_ADDRESS lightConstantsAddress)
 {
     commandList->OMSetRenderTargets(1, &backBufferRTV, FALSE, nullptr);
     
@@ -251,6 +262,7 @@ void Renderer::ExecuteCompositePass(ID3D12GraphicsCommandList* commandList, D3D1
 
     commandList->SetGraphicsRoot32BitConstants(0, 3, gBufferIndices, 0);
     commandList->SetGraphicsRootConstantBufferView(1, reconstructionConstantsAddress);
+    commandList->SetGraphicsRootConstantBufferView(2, lightConstantsAddress);
 
     commandList->DrawInstanced(3, 1, 0, 0);
 }
@@ -260,11 +272,21 @@ void Renderer::ExecuteCompositePass(ID3D12GraphicsCommandList* commandList, D3D1
 // Rendering
 // --------------
 
-void Renderer::Render(const RenderObject& object, const Camera& camera)
+void Renderer::Render(const Scene& scene)
 {
     m_debugUI.BeginFrame();
 
-    m_uploadBuffer.Reset();
+    const unsigned int frameIndex = m_swapChain.GetCurrentBackBufferIndex();
+
+    if(!m_commandContext.Begin(frameIndex)){
+        Log::Error("failed to begin command recording.");
+        return;
+    }
+
+    m_uploadBuffer.Reset(frameIndex);
+
+    const Camera& camera = scene.GetCamera();
+    const DirectionalLight& light = scene.GetDirectionalLight();
 
     CameraConstants cameraConstants{};
     cameraConstants.view = camera.GetViewMatrix();
@@ -288,8 +310,22 @@ void Renderer::Render(const RenderObject& object, const Camera& camera)
         return;
     }
 
-    if(!m_commandContext.Begin()){
-        Log::Error("failed to begin command recording.");
+    DirectionalLightConstants lightConstants{};
+
+    lightConstants.direction[0] = light.direction.x;
+    lightConstants.direction[1] = light.direction.y;
+    lightConstants.direction[2] = light.direction.z;
+    lightConstants.intensity = light.intensity;
+
+    lightConstants.color[0] = light.color.x;
+    lightConstants.color[1] = light.color.y;
+    lightConstants.color[2] = light.color.z;
+    lightConstants.ambientStrength = light.ambientStrength;
+
+    D3D12_GPU_VIRTUAL_ADDRESS lightConstantsAddress = m_uploadBuffer.Allocate(&lightConstants, sizeof(DirectionalLightConstants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
+
+    if(lightConstantsAddress == 0){
+        Log::Error("Failed to allocate directional light constants.");
         return;
     }
 
@@ -339,9 +375,15 @@ void Renderer::Render(const RenderObject& object, const Camera& camera)
     commandList->ClearRenderTargetView(rtvHandle, clearColor, 0, nullptr);
 
     BeginGeometryPass(commandList);
-    Draw(commandList, object, cameraConstantsAddress);
+    
+    for(const RenderObject& object : scene.GetRenderObjects()){
+        Draw(commandList, object, cameraConstantsAddress);
+    }
+
     EndGeometryPass(commandList);
-    ExecuteCompositePass(commandList, rtvHandle, reconstructionConstantsAddress);
+
+
+    ExecuteCompositePass(commandList, rtvHandle, reconstructionConstantsAddress, lightConstantsAddress);
 
     m_debugUI.EndFrame(commandList);
 
@@ -355,8 +397,10 @@ void Renderer::Render(const RenderObject& object, const Camera& camera)
         return;
     }
 
-    m_commandContext.Execute();
-    m_commandContext.WaitForGPU();
+    if(!m_commandContext.Execute(frameIndex)){
+        Log::Error("Failed to execute command list.");
+        return;
+    }
 
     if(!m_swapChain.Present()){
         Log::Error("Failed to present swap chain.");
@@ -409,10 +453,15 @@ bool Renderer::InitializeDemoScene(DemoScene& scene)
 
 void Renderer::Shutdown()
 {
+    Log::Info("Renderer shutdown: waiting for GPU...");
     m_commandContext.WaitForGPU();
+    Log::Info("Renderer shutdown: GPU finished.");
 
+    Log::Info("Renderer shutdown: shutting down DebugUI...");
     m_debugUI.Shutdown();
+    Log::Info("Renderer shutdown: DebugUI finished.");
 
+    Log::Info("Renderer shutdown: releasing renderer resources...");
     m_swapChain.Shutdown();
     m_commandContext.Shutdown();
     m_resourceUploader.Shutdown();
@@ -426,6 +475,7 @@ void Renderer::Shutdown()
     m_dsvDescriptorHeap.Shutdown();
 
     m_shaderLibrary.Shutdown();
+    Log::Info("Renderer shutdown: resources released.");
 
     m_graphicsDevice.Shutdown();
 }

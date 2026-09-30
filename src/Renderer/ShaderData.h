@@ -19,6 +19,15 @@ struct ReconstructionConstants
     Matrix4 inverseViewProjection;
 };
 
+struct DirectionalLightConstants
+{
+    float direction[3];
+    float intensity;
+
+    float color[3];
+    float ambientStrength;
+};
+
 static_assert(sizeof(Matrix4) == 64);
 static_assert(sizeof(CameraConstants) == 128);
 static_assert(sizeof(ObjectConstants) == 128);

@@ -7,3 +7,5 @@ Engine is an in development game engine. Features listed here:
 Future goals listed here:
 
 - PBR
+- Multi-threaded rendering
+- ReSTIR Path Tracing

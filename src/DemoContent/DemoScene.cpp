@@ -1,9 +1,10 @@
 #include "DemoScene.h"
-#include "Renderer/Triangle.h"
+#include "Renderer/Vertex.h"
+#include "Renderer/Geometry/SphereGenerator.h"
 
 bool DemoScene::Initialize(ID3D12Device* device, ResourceUploader& uploader, DescriptorHeap& descriptorHeap, const Shader* vertexShader, const Shader* pixelShader)
 {
-    m_vertexLayout = CreateTriangleVertexLayout();
+    m_vertexLayout = CreateVertexLayout();
 
     if(!vertexShader || !pixelShader){
         return false;
@@ -30,7 +31,9 @@ bool DemoScene::Initialize(ID3D12Device* device, ResourceUploader& uploader, Des
         return false;
     }
 
-    if(!m_mesh.Initialize(device, TriangleVertices, 3, m_vertexLayout)){
+    SphereGeometry sphere = SphereGenerator::Generate(1.0f, 32, 64);
+
+    if(!m_mesh.Initialize(device, sphere.vertices.data(), sphere.vertices.size(), m_vertexLayout, sphere.indices.data(), sphere.indices.size())){
         return false;
     }
 
@@ -63,36 +66,48 @@ bool DemoScene::Initialize(ID3D12Device* device, ResourceUploader& uploader, Des
     m_material.pipeline = &m_pipeline;
     m_material.texture = &m_texture;
 
-    m_renderObject.mesh = &m_mesh;
-    m_renderObject.material = &m_material;
+    RenderObject firstObject{};
+    firstObject.mesh = &m_mesh;
+    firstObject.material = &m_material;
+    firstObject.transform.position = Vector3{-1.25f, 0.0f, 0.0f};
+
+    m_scene.AddRenderObject(firstObject);
+
+    RenderObject secondObject{};
+    secondObject.mesh = &m_mesh;
+    secondObject.material = &m_material;
+    secondObject.transform.position = Vector3{1.25f, 0.0f, 0.0f};
+
+    m_scene.AddRenderObject(secondObject);
+
+    //m_scene.GetDirectionalLight().color = {1.0f, 0.0f, 0.0f};
 
     return true;
 }
 
 void DemoScene::Shutdown()
 {
+    m_scene.GetRenderObjects().clear();
+
     m_mesh.Shutdown();
     m_texture.Shutdown();
     m_pipeline.Shutdown();
 
     m_material.pipeline = nullptr;
     m_material.texture = nullptr;
-
-    m_renderObject.mesh = nullptr;
-    m_renderObject.material = nullptr;
 }
 
 void DemoScene::SetAspectRatio(float aspectRatio)
 {
-    m_camera.SetAspectRatio(aspectRatio);
+    m_scene.GetCamera().SetAspectRatio(aspectRatio);
 }
 
-const RenderObject& DemoScene::GetRenderObject() const
+Scene& DemoScene::GetScene()
 {
-    return m_renderObject;
+    return m_scene;
 }
 
-const Camera& DemoScene::GetCamera() const
+const Scene& DemoScene::GetScene() const
 {
-    return m_camera;
+    return m_scene;
 }

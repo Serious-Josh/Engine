@@ -1,5 +1,3 @@
-#include "Common.hlsli"
-
 struct VSOutput
 {
     float4 position : SV_POSITION;
@@ -16,6 +14,15 @@ cbuffer GBufferConstants : register(b0)
 cbuffer ReconstructionConstants : register(b1)
 {
     row_major float4x4 inverseViewProjection;
+}
+
+cbuffer DirectionalLightConstants : register(b2)
+{
+    float3 lightDirection;
+    float lightIntensity;
+
+    float3 lightColor;
+    float ambientStrength;
 }
 
 SamplerState sampler0 : register(s0);
@@ -68,13 +75,14 @@ float4 PSMain(VSOutput input) : SV_Target0
     float3 albedo = albedoTexture.Sample(sampler0, input.uv).rgb;
     float3 normal = normalize(normalTexture.Sample(sampler0, input.uv).xyz);
 
-    float3 lightDirection = normalize(float3(0.5f, -0.5f, 1.0f));
+    float3 direction = normalize(lightDirection);
 
-    float diffuse = max(dot(normal, -lightDirection), 0.0f);
+    float diffuse = max(dot(normal, -direction), 0.0f);
 
-    float ambientStrength = 0.15f;
+    float3 ambient = albedo * ambientStrength;
+    float3 directional = albedo * lightColor * diffuse * lightIntensity;
 
-    float3 lighting = albedo * (ambientStrength + diffuse);
+    float3 lighting = ambient + directional;
 
     return float4(lighting, 1.0f);
 }

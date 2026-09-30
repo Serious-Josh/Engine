@@ -59,8 +59,6 @@ bool Buffer::Initialize(
         return false;
     }
 
-    m_resource->SetName(L"Vertex Buffer");
-
     void* mappedData = nullptr;
 
     D3D12_RANGE readRange{};

@@ -46,6 +46,8 @@ add_executable(Engine
     external/imgui/imgui_impl_win32.cpp
     external/imgui/imgui_impl_dx12.cpp
     src/Debug/DebugUI.cpp
+    src/Scene/Scene.cpp
+    src/Renderer/Geometry/SphereGenerator.cpp
 )
 
 add_custom_command(

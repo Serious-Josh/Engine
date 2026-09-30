@@ -9,6 +9,8 @@
 #include "Renderer/Material.h"
 #include "Renderer/Pipeline.h"
 #include "Scene/Camera.h"
+#include "Scene/DirectionalLight.h"
+#include "Scene/Scene.h"
 
 class Shader;
 
@@ -20,8 +22,8 @@ class DemoScene
 
         void SetAspectRatio(float aspectRatio);
 
-        const RenderObject& GetRenderObject() const;
-        const Camera& GetCamera() const;
+        Scene& GetScene();
+        const Scene& GetScene() const;
 
     private:
         VertexLayout m_vertexLayout;
@@ -30,7 +32,6 @@ class DemoScene
         Pipeline m_pipeline;
 
         Material m_material;
-        RenderObject m_renderObject;
 
-        Camera m_camera;
+        Scene m_scene;
 };

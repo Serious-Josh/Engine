@@ -7,11 +7,13 @@ static std::size_t AlignUp(std::size_t value, std::size_t alignment)
     return (value + alignment - 1) & ~(alignment - 1);
 }
 
-bool UploadBuffer::Initialize(ID3D12Device* device, std::size_t capacity)
+bool UploadBuffer::Initialize(ID3D12Device* device, std::size_t capacityPerFrame, unsigned int frameCount)
 {
-    if(!device || capacity == 0){
+    if(!device || capacityPerFrame == 0 || frameCount == 0){
         return false;
     }
+
+    const std::size_t totalCapacity = capacityPerFrame * frameCount;
 
     D3D12_HEAP_PROPERTIES heapProperties{};
     heapProperties.Type = D3D12_HEAP_TYPE_UPLOAD;
@@ -19,7 +21,7 @@ bool UploadBuffer::Initialize(ID3D12Device* device, std::size_t capacity)
     D3D12_RESOURCE_DESC resourceDescription{};
     resourceDescription.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
 
-    resourceDescription.Width = capacity;
+    resourceDescription.Width = totalCapacity;
     resourceDescription.Height = 1;
     resourceDescription.DepthOrArraySize = 1;
     resourceDescription.MipLevels = 1;
@@ -41,7 +43,9 @@ bool UploadBuffer::Initialize(ID3D12Device* device, std::size_t capacity)
         return false;
     }
 
-    m_capacity = capacity;
+    m_capacityPerFrame = capacityPerFrame;
+    m_frameCount = frameCount;
+    m_frameOffset = 0;
     m_offset = 0;
 
     return true;
@@ -56,13 +60,20 @@ void UploadBuffer::Shutdown()
     }
 
     m_mappedData = nullptr;
-    m_capacity = 0;
+    m_capacityPerFrame = 0;
+    m_frameOffset = 0;
     m_offset = 0;
+    m_frameCount = 0;
 }
 
-void UploadBuffer::Reset()
+void UploadBuffer::Reset(unsigned int frameIndex)
 {
-    m_offset = 0;
+    if(frameIndex >= m_frameCount){
+        return;
+    }
+
+    m_frameOffset = m_capacityPerFrame * frameIndex;
+    m_offset = m_frameOffset;
 }
 
 D3D12_GPU_VIRTUAL_ADDRESS UploadBuffer::Allocate(const void* data, std::size_t size, std::size_t alignment)
@@ -72,8 +83,9 @@ D3D12_GPU_VIRTUAL_ADDRESS UploadBuffer::Allocate(const void* data, std::size_t s
     }
 
     const std::size_t alignedOffset = AlignUp(m_offset, alignment);
+    const std::size_t frameEnd = m_frameOffset + m_capacityPerFrame;
 
-    if(alignedOffset + size > m_capacity){
+    if(alignedOffset + size > frameEnd){
         return 0;
     }
 

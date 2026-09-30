@@ -25,15 +25,16 @@ bool CommandContext::Initialize(ID3D12Device* device)
     }
 
     // Creating command allocator
-    result = device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&m_commandAllocator));
+    for(unsigned int i = 0; i < FrameCount; ++i){
+        result = device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&m_commandAllocators[i]));
 
-    if(FAILED(result))
-    {
-        return false;
+        if(FAILED(result)){
+            return false;
+        }
     }
 
     // Creating command list
-    result = device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, m_commandAllocator, nullptr, IID_PPV_ARGS(&m_commandList));
+    result = device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, m_commandAllocators[0], nullptr, IID_PPV_ARGS(&m_commandList));
 
     if(FAILED(result))
     {
@@ -90,10 +91,11 @@ void CommandContext::Shutdown()
         m_commandList = nullptr;
     }
 
-    if(m_commandAllocator)
-    {
-        m_commandAllocator->Release();
-        m_commandAllocator = nullptr;
+    for(unsigned int i = 0; i < FrameCount; ++i){
+        if(m_commandAllocators[i]){
+            m_commandAllocators[i]->Release();
+            m_commandAllocators[i] = nullptr;
+        }
     }
 
     if(m_commandQueue)
@@ -103,17 +105,39 @@ void CommandContext::Shutdown()
     }
 
     m_fenceValue = 0;
+
+    for(unsigned int i = 0; i < FrameCount; ++i){
+        m_frameFenceValues[i] = 0;
+    }
 }
 
-bool CommandContext::Begin()
+bool CommandContext::Begin(unsigned int frameIndex)
 {
-    HRESULT result = m_commandAllocator->Reset();
+    if(frameIndex >= FrameCount){
+        return false;
+    }
+
+    const unsigned long long frameFenceValue = m_frameFenceValues[frameIndex];
+
+    if(frameFenceValue != 0 && m_fence->GetCompletedValue() < frameFenceValue){
+        HRESULT result = m_fence->SetEventOnCompletion(frameFenceValue, static_cast<HANDLE>(m_fenceEvent));
+
+        if(FAILED(result)){
+            return false;
+        }
+
+        WaitForSingleObject(static_cast<HANDLE>(m_fenceEvent), INFINITE);
+    }
+
+    ID3D12CommandAllocator* commandAllocator = m_commandAllocators[frameIndex];
+
+    HRESULT result = commandAllocator->Reset();
 
     if(FAILED(result)){
         return false;
     }
 
-    result = m_commandList->Reset(m_commandAllocator, nullptr);
+    result = m_commandList->Reset(commandAllocator, nullptr);
 
     return SUCCEEDED(result);
 }
@@ -123,15 +147,32 @@ bool CommandContext::End()
     return SUCCEEDED(m_commandList->Close());
 }
 
-void CommandContext::Execute()
+bool CommandContext::Execute(unsigned int frameIndex)
 {
+    if(frameIndex >= FrameCount){
+        return false;
+    }
+
     ID3D12CommandList* commandLists[] = {m_commandList};
     m_commandQueue->ExecuteCommandLists(1, commandLists);
+
+    const unsigned long long fenceValue = m_fenceValue;
+
+    HRESULT result = m_commandQueue->Signal(m_fence, fenceValue);
+
+    if(FAILED(result)){
+        return false;
+    }
+
+    m_frameFenceValues[frameIndex] = fenceValue;
+    ++m_fenceValue;
+
+    return true;
 }
 
 void CommandContext::WaitForGPU()
 {
-    const unsigned int long long fenceValue = m_fenceValue;
+    const unsigned long long fenceValue = m_fenceValue;
 
     HRESULT result = m_commandQueue->Signal(m_fence, fenceValue);
 

@@ -93,7 +93,7 @@ void Engine::Frame()
     m_input.Update();
     m_window.ProcessMessages();
 
-    m_renderer.Render(m_demoScene.GetRenderObject(), m_demoScene.GetCamera());
+    m_renderer.Render(m_demoScene.GetScene());
 }
 
 void Engine::Shutdown()

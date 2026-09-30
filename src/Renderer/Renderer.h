@@ -27,13 +27,16 @@ struct ID3D12Fence;
 struct ID3D12RootSignature;
 struct ID3D12PipelineState;
 
+struct DirectionalLight;
+
 class DemoScene;
+class Scene;
 
 class Renderer
 {
     public:
         bool Initialize(void* windowHandle, unsigned int width, unsigned int height, const std::filesystem::path& assetRoot);
-        void Render(const RenderObject& object, const Camera& camera);
+        void Render(const Scene& scene);
         void Shutdown();
 
         void Resize(unsigned int width, unsigned int height);
@@ -41,7 +44,7 @@ class Renderer
         void BeginGeometryPass(ID3D12GraphicsCommandList* commandList);
         void EndGeometryPass(ID3D12GraphicsCommandList* commandList);
 
-        void ExecuteCompositePass(ID3D12GraphicsCommandList* commandList, D3D12_CPU_DESCRIPTOR_HANDLE backBufferRTV, D3D12_GPU_VIRTUAL_ADDRESS reconstructionConstantsAddress);
+        void ExecuteCompositePass(ID3D12GraphicsCommandList* commandList, D3D12_CPU_DESCRIPTOR_HANDLE backBufferRTV, D3D12_GPU_VIRTUAL_ADDRESS reconstructionConstantsAddress, D3D12_GPU_VIRTUAL_ADDRESS lightConstantsAddress);
 
         bool InitializeDemoScene(DemoScene& scene);
     private:
