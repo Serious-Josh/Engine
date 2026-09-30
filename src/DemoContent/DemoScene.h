@@ -10,10 +10,12 @@
 #include "Renderer/Pipeline.h"
 #include "Scene/Camera.h"
 
+class Shader;
+
 class DemoScene
 {
     public:
-        bool Initialize(ID3D12Device* device, ResourceUploader& uploader, DescriptorHeap& descriptorHeap);
+        bool Initialize(ID3D12Device* device, ResourceUploader& uploader, DescriptorHeap& descriptorHeap, const Shader* vertexShader, const Shader* pixelShader);
         void Shutdown();
 
         void SetAspectRatio(float aspectRatio);

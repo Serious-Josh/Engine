@@ -19,7 +19,7 @@
 // Initialization
 // --------------
 
-bool Renderer::Initialize(void* windowHandle, unsigned int width, unsigned int height)
+bool Renderer::Initialize(void* windowHandle, unsigned int width, unsigned int height, const std::filesystem::path& assetRoot)
 {
     m_width = width;
     m_height = height;
@@ -31,9 +31,40 @@ bool Renderer::Initialize(void* windowHandle, unsigned int width, unsigned int h
 
     ID3D12Device* device = m_graphicsDevice.GetDevice();
 
+    const std::filesystem::path shaderRoot = assetRoot / "Shaders";
+
+    if(!m_shaderLibrary.Initialize(shaderRoot)){
+        Log::Error("Failed to initialize shader library.");
+        return false;
+    }
+
+    ShaderDescription compositeVertexDescription{};
+    compositeVertexDescription.path = "Composite.hlsl";
+    compositeVertexDescription.entryPoint = "VSMain";
+    compositeVertexDescription.stage = ShaderStage::Vertex;
+
+    Shader* compositeVertexShader = m_shaderLibrary.Load(compositeVertexDescription);
+
+    if(!compositeVertexShader){
+        Log::Error("Failed to load composite vertex shader.");
+        return false;
+    }
+
+    ShaderDescription compositePixelDescription{};
+    compositePixelDescription.path = "Composite.hlsl";
+    compositePixelDescription.entryPoint = "PSMain";
+    compositePixelDescription.stage = ShaderStage::Pixel;
+
+    Shader* compositePixelShader = m_shaderLibrary.Load(compositePixelDescription);
+
+    if(!compositePixelShader){
+        Log::Error("Failed to load composite pixel shader.");
+        return false;
+    }
+
     PipelineDescription compositeDescription{};
-    compositeDescription.vertexShaderPath = ENGINE_SHADER_DIR "/CompositeVS.cso";
-    compositeDescription.pixelShaderPath = ENGINE_SHADER_DIR "/CompositePS.cso";
+    compositeDescription.vertexShader = compositeVertexShader;
+    compositeDescription.pixelShader = compositePixelShader;
     compositeDescription.vertexLayout = nullptr;
     compositeDescription.renderTargets.count = 1;
     compositeDescription.renderTargets.formats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -329,12 +360,31 @@ void Renderer::Render(const RenderObject& object, const Camera& camera)
 //Demo Scene
 bool Renderer::InitializeDemoScene(DemoScene& scene)
 {
+    ShaderDescription vertexShaderDescription{};
+    vertexShaderDescription.path = "Triangle.hlsl";
+    vertexShaderDescription.entryPoint = "VSMain";
+    vertexShaderDescription.stage = ShaderStage::Vertex;
 
-    bool result = scene.Initialize(
-        m_graphicsDevice.GetDevice(),
-        m_resourceUploader,
-        m_resourceDescriptorHeap
-    );
+    Shader* vertexShader = m_shaderLibrary.Load(vertexShaderDescription);
+
+    if(!vertexShader){
+        Log::Error("Failed to load demo vertex shader.");
+        return false;
+    }
+
+    ShaderDescription pixelShaderDescription{};
+    pixelShaderDescription.path = "Triangle.hlsl";
+    pixelShaderDescription.entryPoint = "PSMain";
+    pixelShaderDescription.stage = ShaderStage::Pixel;
+
+    Shader* pixelShader = m_shaderLibrary.Load(pixelShaderDescription);
+
+    if(!pixelShader){
+        Log::Error("Failed to load demo pixel shader.");
+        return false;
+    }
+
+    bool result = scene.Initialize(m_graphicsDevice.GetDevice(), m_resourceUploader, m_resourceDescriptorHeap, vertexShader, pixelShader);
 
     if(!result){
         return false;
@@ -364,5 +414,8 @@ void Renderer::Shutdown()
     m_resourceDescriptorHeap.Shutdown();
     m_rtvDescriptorHeap.Shutdown();
     m_dsvDescriptorHeap.Shutdown();
+
+    m_shaderLibrary.Shutdown();
+
     m_graphicsDevice.Shutdown();
 }

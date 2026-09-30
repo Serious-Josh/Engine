@@ -351,3 +351,16 @@ void WindowsWindow::DispatchEvent(const Event& event)
         m_eventCallback(event);
     }
 }
+
+std::filesystem::path WindowsWindow::GetExecutableDirectory()
+{
+    wchar_t executablePath[MAX_PATH];
+
+    DWORD length = GetModuleFileNameW(nullptr, executablePath, MAX_PATH);
+
+    if(length == 0 || length == MAX_PATH){
+        return {};
+    }
+
+    return std::filesystem::path(executablePath).parent_path();
+}

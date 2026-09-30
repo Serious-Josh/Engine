@@ -1,0 +1,140 @@
+#include "Core/Log.h"
+#include "ShaderCompiler.h"
+
+bool ShaderCompiler::Initialize()
+{
+    HRESULT result = DxcCreateInstance(CLSID_DxcUtils, IID_PPV_ARGS(&m_utils));
+
+    if(FAILED(result)){
+        return false;
+    }
+
+    result = DxcCreateInstance(CLSID_DxcCompiler, IID_PPV_ARGS(&m_compiler));
+
+    if(FAILED(result)){
+        m_utils->Release();
+        m_utils = nullptr;
+
+        return false;
+    }
+
+    return true;
+
+}
+
+void ShaderCompiler::Shutdown()
+{
+    if(m_compiler){
+        m_compiler->Release();
+        m_compiler = nullptr;
+    }
+
+    if(m_utils){
+        m_utils->Release();
+        m_utils = nullptr;
+    }
+}
+
+bool ShaderCompiler::Compile(const ShaderCompileDescription& description, ShaderCompileResult& output)
+{
+    output.bytecode.clear();
+
+    if(!m_utils || !m_compiler){
+        return false;
+    }
+
+    if(!description.path || !description.entryPoint){
+        return false;
+    }
+
+    const wchar_t* profile = GetShaderProfile(description.stage);
+
+    if(!profile){
+        return false;
+    }
+
+    IDxcBlobEncoding* source = nullptr;
+
+    HRESULT result = m_utils->LoadFile(description.path, nullptr, &source);
+
+    if(FAILED(result)){
+        return false;
+    }
+
+    DxcBuffer sourceBuffer{};
+    sourceBuffer.Ptr = source->GetBufferPointer();
+    sourceBuffer.Size = source->GetBufferSize();
+    sourceBuffer.Encoding = DXC_CP_UTF8;
+
+    const wchar_t* arguements[] =
+    {
+        description.path,
+        L"-E", description.entryPoint,
+        L"-T", profile,
+        L"-HV", L"2021"
+    };
+
+    IDxcResult* compileResult = nullptr;
+
+    result = m_compiler->Compile(&sourceBuffer, arguements, static_cast<UINT32>(sizeof(arguements) / sizeof(arguements[0])), nullptr, IID_PPV_ARGS(&compileResult));
+
+    if(FAILED(result)){
+        source->Release();
+        return false;
+    }
+
+    HRESULT compileStatus = S_OK;
+    compileResult->GetStatus(&compileStatus);
+
+    IDxcBlobUtf8* errors = nullptr;
+
+    result = compileResult->GetOutput(DXC_OUT_ERRORS, IID_PPV_ARGS(&errors), nullptr);
+
+    if(SUCCEEDED(result) && errors && errors->GetStringLength() > 0){
+        Log::Error(errors->GetStringPointer());
+    }
+
+    if(errors){
+        errors->Release();
+    }
+
+    if(FAILED(compileStatus)){
+        compileResult->Release();
+        source->Release();
+        return false;
+    }
+
+    IDxcBlob* object = nullptr;
+
+    result = compileResult->GetOutput(DXC_OUT_OBJECT, IID_PPV_ARGS(&object), nullptr);
+
+    if(FAILED(result)){
+        compileResult->Release();
+        source->Release();
+        return false;
+    }
+
+    const char* bytecodeBegin = static_cast<const char*>(object->GetBufferPointer());
+    const char* bytecodeEnd = bytecodeBegin + object->GetBufferSize();
+
+    output.bytecode.assign(bytecodeBegin, bytecodeEnd);
+
+    object->Release();
+
+    compileResult->Release();
+    source->Release();
+
+    return true;
+}
+
+const wchar_t* ShaderCompiler::GetShaderProfile(ShaderStage stage) const
+{
+    switch(stage){
+        case ShaderStage::Vertex:
+            return L"vs_6_6";
+        case ShaderStage::Pixel:
+            return L"ps_6_6";
+    }
+
+    return nullptr;
+}

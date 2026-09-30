@@ -1,16 +1,17 @@
 #include "DemoScene.h"
 #include "Renderer/Triangle.h"
 
-bool DemoScene::Initialize(
-    ID3D12Device* device,
-    ResourceUploader& uploader,
-    DescriptorHeap& descriptorHeap)
+bool DemoScene::Initialize(ID3D12Device* device, ResourceUploader& uploader, DescriptorHeap& descriptorHeap, const Shader* vertexShader, const Shader* pixelShader)
 {
     m_vertexLayout = CreateTriangleVertexLayout();
 
+    if(!vertexShader || !pixelShader){
+        return false;
+    }
+
     PipelineDescription pipelineDescription{};
-    pipelineDescription.vertexShaderPath = ENGINE_SHADER_DIR "/TriangleVS.cso";
-    pipelineDescription.pixelShaderPath = ENGINE_SHADER_DIR "/TrianglePS.cso";
+    pipelineDescription.vertexShader = vertexShader;
+    pipelineDescription.pixelShader = pixelShader;
     pipelineDescription.vertexLayout = &m_vertexLayout;
     pipelineDescription.renderTargets.count = 2;
     pipelineDescription.renderTargets.formats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;

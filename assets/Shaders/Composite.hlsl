@@ -63,7 +63,16 @@ float4 PSMain(VSOutput input) : SV_Target0
     float4 worldPosition = mul(inverseViewProjection, clipPosition);
     worldPosition /= worldPosition.w;
 
-    float3 displayPosition = abs(worldPosition.xyz);
+    float3 albedo = albedoTexture.Sample(sampler0, input.uv).rgb;
+    float3 normal = normalize(normalTexture.Sample(sampler0, input.uv).xyz);
 
-    return float4(displayPosition, 1.0f);
+    float3 lightDirection = normalize(float3(0.5f, -0.5f, 1.0f));
+
+    float diffuse = max(dot(normal, -lightDirection), 0.0f);
+
+    float ambientStrength = 0.15f;
+
+    float3 lighting = albedo * (ambientStrength + diffuse);
+
+    return float4(lighting, 1.0f);
 }

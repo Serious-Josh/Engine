@@ -11,8 +11,10 @@
 #include "Renderer/RenderObject.h"
 #include "Renderer/ResourceUploader.h"
 #include "Renderer/SwapChain.h"
+#include "Renderer/Shader/ShaderLibrary.h"
 
 #include <d3d12.h>
+#include <filesystem>
 
 struct ID3D12CommandQueue;
 struct IDXGISwapChain3;
@@ -29,7 +31,7 @@ class DemoScene;
 class Renderer
 {
     public:
-        bool Initialize(void* windowHandle, unsigned int width, unsigned int height);
+        bool Initialize(void* windowHandle, unsigned int width, unsigned int height, const std::filesystem::path& assetRoot);
         void Render(const RenderObject& object, const Camera& camera);
         void Shutdown();
 
@@ -55,6 +57,7 @@ class Renderer
         DescriptorHeap m_rtvDescriptorHeap;
         DescriptorHeap m_dsvDescriptorHeap;
         Pipeline m_compositePipeline;
+        ShaderLibrary m_shaderLibrary;
 
         unsigned int m_width = 0;
         unsigned int m_height = 0;

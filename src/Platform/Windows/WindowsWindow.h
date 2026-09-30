@@ -4,6 +4,7 @@
 #include "Platform/WindowProperties.h"
 
 #include <functional>
+#include <filesystem>
 
 class WindowsWindow
 {
@@ -28,6 +29,8 @@ public:
 
     void SetEventCallback(EventCallback callback);
     void DispatchEvent(const Event& event);
+
+    static std::filesystem::path GetExecutableDirectory();
 
 private:
     void* m_windowHandle = nullptr;

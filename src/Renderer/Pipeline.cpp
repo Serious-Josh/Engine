@@ -100,13 +100,11 @@ bool Pipeline::Initialize(ID3D12Device* device, const PipelineDescription& descr
         return false;
     }
 
-
-    if(!m_vertexShader.Load(description.vertexShaderPath)){
+    if(!description.vertexShader || !description.pixelShader){
         return false;
     }
 
-    if(!m_pixelShader.Load(description.pixelShaderPath)){
-        m_vertexShader.Unload();
+    if(description.vertexShader->GetBytecodeSize() == 0 || description.pixelShader->GetBytecodeSize() == 0){
         return false;
     }
 
@@ -170,10 +168,10 @@ bool Pipeline::Initialize(ID3D12Device* device, const PipelineDescription& descr
     D3D12_GRAPHICS_PIPELINE_STATE_DESC pipelineDescription{};
 
     pipelineDescription.pRootSignature = m_rootSignature;
-    pipelineDescription.VS.pShaderBytecode = m_vertexShader.GetByteCode();
-    pipelineDescription.VS.BytecodeLength = m_vertexShader.GetBytecodeSize();
-    pipelineDescription.PS.pShaderBytecode = m_pixelShader.GetByteCode();
-    pipelineDescription.PS.BytecodeLength = m_pixelShader.GetBytecodeSize();
+    pipelineDescription.VS.pShaderBytecode = description.vertexShader->GetByteCode();
+    pipelineDescription.VS.BytecodeLength = description.vertexShader->GetBytecodeSize();
+    pipelineDescription.PS.pShaderBytecode = description.pixelShader->GetByteCode();
+    pipelineDescription.PS.BytecodeLength = description.pixelShader->GetBytecodeSize();
     pipelineDescription.BlendState = blendDescription;
     pipelineDescription.SampleMask = UINT_MAX;
     pipelineDescription.RasterizerState = rasterizerDescription;
@@ -206,10 +204,7 @@ bool Pipeline::Initialize(ID3D12Device* device, const PipelineDescription& descr
 }
 
 void Pipeline::Shutdown()
-{
-    m_vertexShader.Unload();
-    m_pixelShader.Unload();
-    
+{   
     if(m_pipelineState){
         m_pipelineState->Release();
         m_pipelineState = nullptr;

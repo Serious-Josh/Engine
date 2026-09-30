@@ -14,7 +14,10 @@ bool Engine::Initialize()
 
     m_time.Initialize();
 
-    if(!m_renderer.Initialize(m_window.GetNativeHandle(), m_window.GetWidth(), m_window.GetHeight())){
+    const std::filesystem::path executableDirectory = WindowsWindow::GetExecutableDirectory();
+    const std::filesystem::path assetRoot = executableDirectory / "assets";
+
+    if(!m_renderer.Initialize(m_window.GetNativeHandle(), m_window.GetWidth(), m_window.GetHeight(), assetRoot)){
         Log::Error("Failed to initialize renderer.");
         return false;
     }

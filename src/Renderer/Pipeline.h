@@ -1,7 +1,7 @@
 #pragma once
 
 #include "Renderer/VertexLayout.h"
-#include "Renderer/Shader.h"
+#include "Renderer/Shader/Shader.h"
 
 #include <d3d12.h>
 #include <array>
@@ -31,8 +31,8 @@ struct PipelineRenderTargets
 
 struct PipelineDescription
 {
-    const char* vertexShaderPath = nullptr;
-    const char* pixelShaderPath = nullptr;
+    const Shader* vertexShader = nullptr;
+    const Shader* pixelShader = nullptr;
 
     const VertexLayout* vertexLayout = nullptr;
 
@@ -61,7 +61,4 @@ class Pipeline
     private:
         ID3D12RootSignature* m_rootSignature = nullptr;
         ID3D12PipelineState* m_pipelineState = nullptr;
-
-        Shader m_vertexShader;
-        Shader m_pixelShader;
 };
