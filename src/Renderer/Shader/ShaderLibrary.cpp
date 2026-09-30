@@ -1,4 +1,5 @@
 #include "ShaderLibrary.h"
+#include "Core/Log.h"
 
 bool ShaderLibrary::Initialize(const std::filesystem::path& shaderRoot)
 {
@@ -13,7 +14,7 @@ bool ShaderLibrary::Initialize(const std::filesystem::path& shaderRoot)
 
 void ShaderLibrary::Shutdown()
 {
-    for(std::unique_ptr<Shader>& shader : m_shaders){
+    for(auto& [key, shader] : m_shaders){
         shader->Unload();
     }
 
@@ -26,6 +27,17 @@ Shader* ShaderLibrary::Load(const ShaderDescription& description)
 {
     if(!description.path || !description.entryPoint){
         return nullptr;
+    }
+
+    ShaderKey key{};
+    key.path = description.path;
+    key.entryPoint = description.entryPoint;
+    key.stage = description.stage;
+
+    auto existingShader = m_shaders.find(key);
+
+    if(existingShader != m_shaders.end()){
+        return existingShader->second.get();
     }
 
     const std::filesystem::path shaderPath = m_shaderRoot / description.path;
@@ -52,7 +64,7 @@ Shader* ShaderLibrary::Load(const ShaderDescription& description)
 
     Shader* shaderPointer = shader.get();
 
-    m_shaders.push_back(std::move(shader));
+    m_shaders.emplace(std::move(key), std::move(shader));
 
     return shaderPointer;
 }

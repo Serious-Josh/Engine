@@ -1,6 +1,8 @@
 #include "Core/Log.h"
 #include "ShaderCompiler.h"
 
+#include <filesystem>
+
 bool ShaderCompiler::Initialize()
 {
     HRESULT result = DxcCreateInstance(CLSID_DxcUtils, IID_PPV_ARGS(&m_utils));
@@ -66,17 +68,32 @@ bool ShaderCompiler::Compile(const ShaderCompileDescription& description, Shader
     sourceBuffer.Size = source->GetBufferSize();
     sourceBuffer.Encoding = DXC_CP_UTF8;
 
+    IDxcIncludeHandler* includeHandler = nullptr;
+
+    result = m_utils->CreateDefaultIncludeHandler(&includeHandler);
+
+    if(FAILED(result)){
+        source->Release();
+        return false;
+    }
+
+    std::filesystem::path shaderPath = description.path;
+    std::wstring shaderDirectory = shaderPath.parent_path().wstring();
+
     const wchar_t* arguements[] =
     {
         description.path,
         L"-E", description.entryPoint,
         L"-T", profile,
-        L"-HV", L"2021"
+        L"-HV", L"2021",
+        L"-I", shaderDirectory.c_str()
     };
 
     IDxcResult* compileResult = nullptr;
 
-    result = m_compiler->Compile(&sourceBuffer, arguements, static_cast<UINT32>(sizeof(arguements) / sizeof(arguements[0])), nullptr, IID_PPV_ARGS(&compileResult));
+    result = m_compiler->Compile(&sourceBuffer, arguements, static_cast<UINT32>(sizeof(arguements) / sizeof(arguements[0])), includeHandler, IID_PPV_ARGS(&compileResult));
+
+    includeHandler->Release();
 
     if(FAILED(result)){
         source->Release();
