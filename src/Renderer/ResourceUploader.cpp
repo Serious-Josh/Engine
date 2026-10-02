@@ -90,9 +90,9 @@ ResourceUploader::~ResourceUploader()
     Shutdown();
 }
 
-bool ResourceUploader::UploadTexture(ID3D12Resource* destination, const void* data, size_t dataSize, unsigned int width, unsigned int height)
+bool ResourceUploader::UploadTexture(ID3D12Resource* destination, const void* data, size_t dataSize)
 {
-    if(!m_device || !m_commandQueue || !m_commandAllocator || !m_commandList || !m_fence || !m_fenceEvent || !destination || !data || dataSize == 0 || width == 0 || height == 0){
+    if(!m_device || !m_commandQueue || !m_commandAllocator || !m_commandList || !m_fence || !m_fenceEvent || !destination || !data || dataSize == 0){
         return false;
     }
 
@@ -169,17 +169,12 @@ bool ResourceUploader::UploadTexture(ID3D12Resource* destination, const void* da
 
     m_commandList->CopyTextureRegion(&destinationLocation, 0, 0, 0, &source, nullptr);
 
-    D3D12_RESOURCE_BARRIER barrier{};
-    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    return FinishUpload(uploadBuffer);
+}
 
-    barrier.Transition.pResource = destination;
-    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-
-    m_commandList->ResourceBarrier(1, &barrier);
-
-    result = m_commandList->Close();
+bool ResourceUploader::FinishUpload(ID3D12Resource* uploadBuffer)
+{
+    HRESULT result = m_commandList->Close();
 
     if(FAILED(result)){
         uploadBuffer->Release();
@@ -213,4 +208,75 @@ bool ResourceUploader::UploadTexture(ID3D12Resource* destination, const void* da
     uploadBuffer->Release();
 
     return true;
+}
+
+bool ResourceUploader::UploadBuffer(ID3D12Resource* destination, const void* data, size_t dataSize, D3D12_RESOURCE_STATES finalState)
+{
+    if(!m_device || !m_commandQueue || !m_commandAllocator || !m_commandList || !m_fence || !m_fenceEvent || !destination || !data || dataSize == 0){
+        return false;
+    }
+
+    const D3D12_RESOURCE_DESC description = destination->GetDesc();
+    if(description.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || dataSize > description.Width){
+        return false;
+    }
+
+    ID3D12Resource* uploadBuffer = nullptr;
+
+    D3D12_HEAP_PROPERTIES heapProperties{};
+    heapProperties.Type = D3D12_HEAP_TYPE_UPLOAD;
+
+    D3D12_RESOURCE_DESC bufferDescription{};
+    bufferDescription.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bufferDescription.Width = dataSize;
+    bufferDescription.Height = 1;
+    bufferDescription.DepthOrArraySize = 1;
+    bufferDescription.MipLevels = 1;
+    bufferDescription.SampleDesc.Count = 1;
+    bufferDescription.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+    HRESULT result = m_device->CreateCommittedResource(&heapProperties, D3D12_HEAP_FLAG_NONE, &bufferDescription, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&uploadBuffer));
+
+    if(FAILED(result)){
+        return false;
+    }
+
+    void* mappedData = nullptr;
+
+    D3D12_RANGE readRange{};
+    result = uploadBuffer->Map(0, &readRange, &mappedData);
+
+    if(FAILED(result)){
+        uploadBuffer->Release();
+        return false;
+    }
+
+    std::memcpy(mappedData, data, dataSize);
+    uploadBuffer->Unmap(0, nullptr);
+
+    result = m_commandAllocator->Reset();
+    if(FAILED(result)){
+        uploadBuffer->Release();
+        return false;
+    }
+
+    result = m_commandList->Reset(m_commandAllocator, nullptr);
+    if(FAILED(result)){
+        uploadBuffer->Release();
+        return false;
+    }
+
+    m_commandList->CopyBufferRegion(destination, 0, uploadBuffer, 0, dataSize);
+
+    if(finalState != D3D12_RESOURCE_STATE_COPY_DEST){
+        D3D12_RESOURCE_BARRIER barrier{};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition.pResource = destination;
+        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        barrier.Transition.StateAfter = finalState;
+        m_commandList->ResourceBarrier(1, &barrier);
+    }
+
+    return FinishUpload(uploadBuffer);
 }

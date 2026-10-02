@@ -201,8 +201,8 @@ LRESULT CALLBACK WindowProc(
         {
             Event event;
             event.type = EventType::WindowResized;
-            event.width = static_cast<unsigned int>(LOWORD(lParam));
-            event.height = static_cast<unsigned int>(HIWORD(lParam));
+            event.width = (wParam == SIZE_MINIMIZED) ? 0u : static_cast<unsigned int>(LOWORD(lParam));
+            event.height = (wParam == SIZE_MINIMIZED) ? 0u : static_cast<unsigned int>(HIWORD(lParam));
 
             if(window){
                 window->DispatchEvent(event);
@@ -312,6 +312,11 @@ void WindowsWindow::ProcessMessages()
         TranslateMessage(&message);
         DispatchMessageW(&message);
     }
+}
+
+void WindowsWindow::WaitForMessage()
+{
+    WaitMessage();
 }
 
 bool WindowsWindow::ShouldClose() const

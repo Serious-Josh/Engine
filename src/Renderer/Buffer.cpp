@@ -1,6 +1,6 @@
 #include "Buffer.h"
 
-#include <cstring>
+#include "ResourceUploader.h"
 
 Buffer::Buffer(Buffer&& other) noexcept
     : m_resource(other.m_resource)
@@ -23,13 +23,19 @@ Buffer& Buffer::operator=(Buffer&& other) noexcept
 
 bool Buffer::Initialize(
     ID3D12Device* device,
+    ResourceUploader& uploader,
     const void* data,
-    size_t size
+    size_t size,
+    D3D12_RESOURCE_STATES finalState
 )
 {
+    if(!device || !data || size == 0){
+        return false;
+    }
+
     D3D12_HEAP_PROPERTIES heapProperties{};
 
-    heapProperties.Type = D3D12_HEAP_TYPE_UPLOAD;
+    heapProperties.Type = D3D12_HEAP_TYPE_DEFAULT;
 
     D3D12_RESOURCE_DESC resourceDescription{};
 
@@ -49,7 +55,7 @@ bool Buffer::Initialize(
         &heapProperties,
         D3D12_HEAP_FLAG_NONE,
         &resourceDescription,
-        D3D12_RESOURCE_STATE_GENERIC_READ,
+        D3D12_RESOURCE_STATE_COPY_DEST,
         nullptr,
         IID_PPV_ARGS(&m_resource)
     );
@@ -59,24 +65,10 @@ bool Buffer::Initialize(
         return false;
     }
 
-    void* mappedData = nullptr;
-
-    D3D12_RANGE readRange{};
-
-    result = m_resource->Map(
-        0,
-        &readRange,
-        &mappedData
-    );
-
-    if(FAILED(result))
-    {
+    if(!uploader.UploadBuffer(m_resource, data, size, finalState)){
+        Shutdown();
         return false;
     }
-
-    memcpy(mappedData, data, size);
-
-    m_resource->Unmap(0, nullptr);
 
     return true;
 }

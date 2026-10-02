@@ -3,7 +3,7 @@
 #include "Scene/Transform.h"
 
 class Mesh;
-class Material;
+struct Material;
 
 struct RenderObject
 {

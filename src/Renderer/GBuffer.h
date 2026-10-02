@@ -19,16 +19,16 @@ class GBuffer
 
         void Shutdown();
 
-        RenderTarget& GetAlbedo();
-        RenderTarget& GetNormal();
+        RenderTarget& GetMaterial();
+        RenderTarget& GetSurface();
         DepthBuffer& GetDepth();
 
-        const RenderTarget& GetAlbedo() const;
-        const RenderTarget& GetNormal() const;
+        const RenderTarget& GetMaterial() const;
+        const RenderTarget& GetSurface() const;
         const DepthBuffer& GetDepth() const;
     
     private:
-        RenderTarget m_albedo;
-        RenderTarget m_normal;
+        RenderTarget m_material;
+        RenderTarget m_surface;
         DepthBuffer m_depth;
 };

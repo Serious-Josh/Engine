@@ -1,7 +1,8 @@
 #include "Engine.h"
 #include "Core/InputCodes.h"
 #include "Core/Log.h"
-#include <Core/Assert.h>
+#include "Core/Assert.h"
+#include "Core/Time.h"
 
 bool Engine::Initialize()
 {
@@ -24,13 +25,54 @@ bool Engine::Initialize()
 
     Log::Info("Initializing demo scene.");
 
-    if(!m_renderer.InitializeDemoScene(m_demoScene))
+    ShaderDescription vertexShaderDescription{};
+    vertexShaderDescription.path = "Triangle.hlsl";
+    vertexShaderDescription.entryPoint = "VSMain";
+    vertexShaderDescription.stage = ShaderStage::Vertex;
+
+    Shader* vertexShader =
+        m_renderer.GetShaderLibrary().Load(vertexShaderDescription);
+
+    if(!vertexShader){
+        Log::Error("Failed to load demo vertex shader.");
+        return false;
+    }
+
+    ShaderDescription pixelShaderDescription{};
+    pixelShaderDescription.path = "Triangle.hlsl";
+    pixelShaderDescription.entryPoint = "PSMain";
+    pixelShaderDescription.stage = ShaderStage::Pixel;
+
+    Shader* pixelShader =
+        m_renderer.GetShaderLibrary().Load(pixelShaderDescription);
+
+    if(!pixelShader){
+        Log::Error("Failed to load demo pixel shader.");
+        return false;
+    }
+
+    if(!m_demoScene.Initialize(
+        m_renderer.GetDevice(),
+        m_renderer.GetResourceUploader(),
+        m_renderer.GetResourceDescriptorHeap(),
+        vertexShader,
+        pixelShader))
     {
         Log::Error("Failed to initialize demo scene.");
         return false;
     }
 
     Log::Info("Demo scene initialization complete.");
+
+    if(!m_renderer.InitializeMaterials(m_demoScene.GetMaterials())){
+        Log::Error("Failed to initialize demo materials.");
+        return false;
+    }
+
+    m_demoScene.SetAspectRatio(
+        static_cast<float>(m_window.GetWidth()) /
+        static_cast<float>(m_window.GetHeight())
+    );
 
     m_window.SetEventCallback(
         [this](const Event& event)
@@ -39,7 +81,7 @@ bool Engine::Initialize()
                 case EventType::WindowResized:
                     m_window.SetSize(event.width, event.height);
 
-                    if(event.height > 0){
+                    if(event.width > 0 && event.height > 0){
                         m_demoScene.SetAspectRatio(static_cast<float>(event.width) / static_cast<float>(event.height));
                     }
 
@@ -93,18 +135,40 @@ void Engine::Frame()
     m_input.Update();
     m_window.ProcessMessages();
 
+    if(m_window.ShouldClose()){
+        return;
+    }
+
+    if(m_window.GetWidth() == 0 || m_window.GetHeight() == 0){
+        m_window.WaitForMessage();
+        // Exclude the suspended interval from the next simulation update.
+        m_time.Update();
+        return;
+    }
+
     m_renderer.Render(m_demoScene.GetScene());
+    m_demoScene.Update(m_time.GetDeltaTime());
 }
 
 void Engine::Shutdown()
 {
     ENGINE_ASSERT(m_state == EngineState::Running);
+    Log::Info("Engine shutdown: starting.");
 
     m_state = EngineState::Stopped;
 
+    Log::Info("Engine shutdown: waiting for GPU.");
+    m_renderer.WaitForGPU();
+    Log::Info("Engine shutdown: GPU finished.");
+
     m_demoScene.Shutdown();
+
+    Log::Info("Engine shutdown: starting renderer shutdown.");
     m_renderer.Shutdown();
+    Log::Info("Engine shutdown: renderer shutdown finished.");
+
     m_window.Shutdown();
+    Log::Info("Engine shutdown: finished.");
 }
 
 Input& Engine::GetInput(){

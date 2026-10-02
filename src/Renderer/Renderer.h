@@ -5,6 +5,7 @@
 #include "Pipeline.h"
 #include "GBuffer.h"
 #include "UploadBuffer.h"
+#include "StructuredBuffer.h"
 #include "Renderer/CommandContext.h"
 #include "Renderer/DescriptorHeap.h"
 #include "Renderer/GraphicsDevice.h"
@@ -13,6 +14,13 @@
 #include "Renderer/SwapChain.h"
 #include "Renderer/Shader/ShaderLibrary.h"
 #include "Debug/DebugUI.h"
+#include "Renderer/EnvironmentMap.h"
+#include "RenderTarget.h"
+#include "Renderer/Passes/ToneMapPass.h"
+#include "Renderer/Passes/DeferredLightingPass.h"
+#include "Renderer/Passes/EquirectangularToCubemapPass.h"
+#include "Renderer/Passes/EnvironmentMipPass.h"
+#include "Renderer/Passes/BRDFIntegrationPass.h"
 
 #include <d3d12.h>
 #include <filesystem>
@@ -29,7 +37,6 @@ struct ID3D12PipelineState;
 
 struct DirectionalLight;
 
-class DemoScene;
 class Scene;
 
 class Renderer
@@ -44,9 +51,14 @@ class Renderer
         void BeginGeometryPass(ID3D12GraphicsCommandList* commandList);
         void EndGeometryPass(ID3D12GraphicsCommandList* commandList);
 
-        void ExecuteCompositePass(ID3D12GraphicsCommandList* commandList, D3D12_CPU_DESCRIPTOR_HANDLE backBufferRTV, D3D12_GPU_VIRTUAL_ADDRESS reconstructionConstantsAddress, D3D12_GPU_VIRTUAL_ADDRESS lightConstantsAddress);
+        ID3D12Device* GetDevice();
+        ResourceUploader& GetResourceUploader();
+        DescriptorHeap& GetResourceDescriptorHeap();
+        ShaderLibrary& GetShaderLibrary();
 
-        bool InitializeDemoScene(DemoScene& scene);
+        bool InitializeMaterials(const std::vector<Material*>& materials);
+
+        void WaitForGPU();
     private:
         bool InitializeDevice();
         bool InitializeSwapChain(void* windowHandle);
@@ -60,7 +72,13 @@ class Renderer
         DescriptorHeap m_resourceDescriptorHeap;
         DescriptorHeap m_rtvDescriptorHeap;
         DescriptorHeap m_dsvDescriptorHeap;
-        Pipeline m_compositePipeline;
+
+        DeferredLightingPass m_deferredLightingPass;
+        ToneMapPass m_toneMapPass;
+        EquirectangularToCubemapPass m_equirectangularToCubemapPass;
+        EnvironmentMipPass m_environmentMipPass;
+        BRDFIntegrationPass m_brdfIntegrationPass;
+
         ShaderLibrary m_shaderLibrary;
 
         DebugUI m_debugUI;
@@ -70,4 +88,10 @@ class Renderer
 
         GBuffer m_gBuffer;
         UploadBuffer m_uploadBuffer;
+        StructuredBuffer m_materialBuffer;
+
+        EnvironmentMap m_environment;
+        RenderTarget m_sceneColor;
+
+        Texture m_brdfIntegrationLUT;
 };

@@ -1,20 +1,23 @@
 #include "Core/Log.h"
 #include "Renderer.h"
-#include "DemoContent/DemoScene.h"
 #include "Renderer/Texture.h"
 #include "Material.h"
 #include "Scene/Camera.h"
 #include "ShaderData.h"
 #include "Scene/DirectionalLight.h"
 #include "Scene/Scene.h"
+#include "ImageLoader.h"
 
 #define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
 #include <Windows.h>
 
+#include <string>
 #include <cstring>
 #include <dxgi1_6.h>
 #include <d3d12.h>
 #include <d3d12sdklayers.h>
+#include <algorithm>
 
 
 // --------------
@@ -40,43 +43,13 @@ bool Renderer::Initialize(void* windowHandle, unsigned int width, unsigned int h
         return false;
     }
 
-    ShaderDescription compositeVertexDescription{};
-    compositeVertexDescription.path = "Composite.hlsl";
-    compositeVertexDescription.entryPoint = "VSMain";
-    compositeVertexDescription.stage = ShaderStage::Vertex;
-
-    Shader* compositeVertexShader = m_shaderLibrary.Load(compositeVertexDescription);
-
-    if(!compositeVertexShader){
-        Log::Error("Failed to load composite vertex shader.");
+    if(!m_deferredLightingPass.Initialize(device, m_shaderLibrary)){
+        Log::Error("Failed to initialize deferred lighting pass.");
         return false;
     }
 
-    ShaderDescription compositePixelDescription{};
-    compositePixelDescription.path = "Composite.hlsl";
-    compositePixelDescription.entryPoint = "PSMain";
-    compositePixelDescription.stage = ShaderStage::Pixel;
-
-    Shader* compositePixelShader = m_shaderLibrary.Load(compositePixelDescription);
-
-    if(!compositePixelShader){
-        Log::Error("Failed to load composite pixel shader.");
-        return false;
-    }
-
-    PipelineDescription compositeDescription{};
-    compositeDescription.vertexShader = compositeVertexShader;
-    compositeDescription.pixelShader = compositePixelShader;
-    compositeDescription.vertexLayout = nullptr;
-    compositeDescription.renderTargets.count = 1;
-    compositeDescription.renderTargets.formats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
-    
-    compositeDescription.rootParameters.push_back({RootParameterType::Constants, 0, 3, D3D12_SHADER_VISIBILITY_PIXEL});
-    compositeDescription.rootParameters.push_back({RootParameterType::ConstantBuffer, 1, 0, D3D12_SHADER_VISIBILITY_PIXEL});
-    compositeDescription.rootParameters.push_back({RootParameterType::ConstantBuffer, 2, 0, D3D12_SHADER_VISIBILITY_PIXEL});
-
-    if(!m_compositePipeline.Initialize(device, compositeDescription)){
-        Log::Error("Failed to init composite test pipeline.");
+    if(!m_toneMapPass.Initialize(device, m_shaderLibrary)){
+        Log::Error("Failed to initialize tone map pass.");
         return false;
     }
 
@@ -90,13 +63,119 @@ bool Renderer::Initialize(void* windowHandle, unsigned int width, unsigned int h
         return false;
     }
 
-    if(!m_resourceDescriptorHeap.Initialize(device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 16, true)){
+    if(!m_resourceDescriptorHeap.Initialize(device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 256, true)){
         Log::Error("Failed to init resource descriptor heap.");
         return false;
     }
 
-    if(!m_rtvDescriptorHeap.Initialize(device, D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 16, false)){
+    if(!m_rtvDescriptorHeap.Initialize(device, D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 128, false)){
         Log::Error("Failed to init rtv descriptor heap.");
+        return false;
+    }
+
+    if(!m_brdfIntegrationLUT.Initialize(device, 512, 512, 1, 1, DXGI_FORMAT_R16G16_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET)){
+        Log::Error("Failed to init BRDF integration LUT.");
+        return false;
+    }
+
+    if(!m_brdfIntegrationLUT.CreateSRV(device, m_resourceDescriptorHeap)){
+        Log::Error("Failed to create BRDF integration LUT SRV.");
+        return false;
+    }
+
+    if(!m_brdfIntegrationPass.Initialize(device, m_shaderLibrary, m_rtvDescriptorHeap, m_brdfIntegrationLUT)){
+        Log::Error("Failed to init BRDF integration pass.");
+        return false;
+    }
+
+    const std::filesystem::path environmentPath =
+    assetRoot / "Textures" / "Environment" / "TestEnvironment.hdr";
+
+    if(!m_environment.Initialize(
+        device,
+        environmentPath,
+        m_resourceUploader,
+        m_resourceDescriptorHeap))
+    {
+        Log::Error("Failed to initialize environment map.");
+        return false;
+    }
+
+    if(!m_environmentMipPass.Initialize(
+        device,
+        m_shaderLibrary,
+        m_rtvDescriptorHeap,
+        m_environment.GetSourceTexture()))
+    {
+        Log::Error(
+            "Failed to initialize environment mip pass."
+        );
+        return false;
+    }
+
+    if(!m_equirectangularToCubemapPass.Initialize(
+        device,
+        m_shaderLibrary,
+        m_rtvDescriptorHeap,
+        m_environment.GetCubemap()))
+    {
+        Log::Error(
+            "Failed to initialize equirectangular-to-cubemap pass."
+        );
+        return false;
+    }
+
+    if(!m_commandContext.Begin(0)){
+        Log::Error(
+            "Failed to begin environment preprocessing."
+        );
+        return false;
+    }
+
+    ID3D12GraphicsCommandList* preprocessingCommandList =
+        m_commandContext.GetCommandList();
+
+    ID3D12DescriptorHeap* descriptorHeaps[] =
+    {
+        m_resourceDescriptorHeap.GetHeap()
+    };
+
+    preprocessingCommandList->SetDescriptorHeaps(
+        1,
+        descriptorHeaps
+    );
+
+    m_environmentMipPass.Execute(
+        preprocessingCommandList,
+        m_environment.GetSourceTexture()
+    );
+
+    m_equirectangularToCubemapPass.Execute(
+        preprocessingCommandList,
+        m_environment.GetSourceTexture(),
+        m_environment.GetCubemap()
+    );
+
+    m_brdfIntegrationPass.Execute(preprocessingCommandList, m_brdfIntegrationLUT);
+
+    if(!m_commandContext.End()){
+        Log::Error(
+            "Failed to end environment preprocessing."
+        );
+        return false;
+    }
+
+    if(!m_commandContext.Execute(0)){
+        Log::Error(
+            "Failed to execute environment preprocessing."
+        );
+        return false;
+    }
+
+    m_commandContext.WaitForGPU();
+
+    if(!m_sceneColor.Initialize(device, m_width, m_height, DXGI_FORMAT_R16G16B16A16_FLOAT, m_rtvDescriptorHeap, m_resourceDescriptorHeap)){
+        Log::Error("Failed to init HDR scene color");
         return false;
     }
 
@@ -164,6 +243,13 @@ void Renderer::Resize(unsigned int width, unsigned int height)
         return;
     }
 
+    m_sceneColor.Shutdown();
+
+    if(!m_sceneColor.Initialize(m_graphicsDevice.GetDevice(), width, height, DXGI_FORMAT_R16G16B16A16_FLOAT, m_rtvDescriptorHeap, m_resourceDescriptorHeap)){
+        Log::Error("Failed to resize HDR scene color.");
+        return;
+    }
+
     m_width = width;
     m_height = height;
 }
@@ -187,7 +273,15 @@ void Renderer::Draw(ID3D12GraphicsCommandList* commandList, const RenderObject& 
 
     object.material->pipeline->Bind(commandList);
 
-    commandList->SetGraphicsRoot32BitConstant(0, object.material->texture->GetDescriptorIndex(), 0);
+    MaterialConstants materialConstants{};
+    materialConstants.textureIndex = object.material->texture->GetDescriptorIndex();
+    materialConstants.roughness = object.material->roughness;
+    materialConstants.materialIndex = object.material->gpuIndex;
+    materialConstants.baseColor[0] = object.material->baseColor[0];
+    materialConstants.baseColor[1] = object.material->baseColor[1];
+    materialConstants.baseColor[2] = object.material->baseColor[2];
+
+    commandList->SetGraphicsRoot32BitConstants(0, 3, &materialConstants, 0);
 
     commandList->SetGraphicsRootConstantBufferView(1, cameraConstantsAddress);
     commandList->SetGraphicsRootConstantBufferView(2, objectConstantsAddress);
@@ -208,8 +302,8 @@ void Renderer::Draw(ID3D12GraphicsCommandList* commandList, const RenderObject& 
 // --------------
 void Renderer::BeginGeometryPass(ID3D12GraphicsCommandList* commandList)
 {
-    RenderTarget& albedo = m_gBuffer.GetAlbedo();
-    RenderTarget& normal = m_gBuffer.GetNormal();
+    RenderTarget& albedo = m_gBuffer.GetMaterial();
+    RenderTarget& normal = m_gBuffer.GetSurface();
     DepthBuffer& depth = m_gBuffer.GetDepth();
 
     albedo.Transition(commandList, D3D12_RESOURCE_STATE_RENDER_TARGET);
@@ -239,32 +333,37 @@ void Renderer::BeginGeometryPass(ID3D12GraphicsCommandList* commandList)
 
 void Renderer::EndGeometryPass(ID3D12GraphicsCommandList* commandList)
 {
-    m_gBuffer.GetAlbedo().Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-    m_gBuffer.GetNormal().Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    m_gBuffer.GetMaterial().Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    m_gBuffer.GetSurface().Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     m_gBuffer.GetDepth().Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 }
 
-void Renderer::ExecuteCompositePass(ID3D12GraphicsCommandList* commandList,
-    D3D12_CPU_DESCRIPTOR_HANDLE backBufferRTV,
-    D3D12_GPU_VIRTUAL_ADDRESS reconstructionConstantsAddress,
-    D3D12_GPU_VIRTUAL_ADDRESS lightConstantsAddress)
+bool Renderer::InitializeMaterials(const std::vector<Material*>& materials)
 {
-    commandList->OMSetRenderTargets(1, &backBufferRTV, FALSE, nullptr);
-    
-    m_compositePipeline.Bind(commandList);
+    if(materials.empty()){
+        Log::Error("Cannot init an empty material buffer.");
+        return false;
+    }
 
-    unsigned int gBufferIndices[] =
-    {
-        m_gBuffer.GetAlbedo().GetSRVIndex(),
-        m_gBuffer.GetNormal().GetSRVIndex(),
-        m_gBuffer.GetDepth().GetSRVIndex()
-    };
+    std::vector<GPUMaterial> gpuMaterials;
+    gpuMaterials.reserve(materials.size());
 
-    commandList->SetGraphicsRoot32BitConstants(0, 3, gBufferIndices, 0);
-    commandList->SetGraphicsRootConstantBufferView(1, reconstructionConstantsAddress);
-    commandList->SetGraphicsRootConstantBufferView(2, lightConstantsAddress);
+    for(size_t i = 0; i < materials.size(); ++i){
+        if(!materials[i]){
+            Log::Error("Cannot init null material.");
+            return false;
+        }
 
-    commandList->DrawInstanced(3, 1, 0, 0);
+        materials[i]->gpuIndex = static_cast<unsigned int>(i);
+        gpuMaterials.push_back(materials[i]->GetGPUData());
+    }
+
+    if(!m_materialBuffer.Initialize(m_graphicsDevice.GetDevice(), m_resourceUploader, gpuMaterials.data(), sizeof(GPUMaterial), gpuMaterials.size(), m_resourceDescriptorHeap)){
+        Log::Error("Failed to init material buffer.");
+        return false;
+    }
+
+    return true;
 }
 
 
@@ -289,8 +388,7 @@ void Renderer::Render(const Scene& scene)
     const DirectionalLight& light = scene.GetDirectionalLight();
 
     CameraConstants cameraConstants{};
-    cameraConstants.view = camera.GetViewMatrix();
-    cameraConstants.projection = camera.GetProjectionMatrix();
+    cameraConstants.viewProjection = camera.GetProjectionMatrix() * camera.GetViewMatrix();
 
     D3D12_GPU_VIRTUAL_ADDRESS cameraConstantsAddress = m_uploadBuffer.Allocate(&cameraConstants, sizeof(CameraConstants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
 
@@ -300,8 +398,14 @@ void Renderer::Render(const Scene& scene)
     }
 
     ReconstructionConstants reconstructionConstants{};
-    const Matrix4 viewProjection = cameraConstants.projection * cameraConstants.view;
-    reconstructionConstants.inverseViewProjection = viewProjection.Inverse();
+    reconstructionConstants.inverseViewProjection = cameraConstants.viewProjection.Inverse();
+
+    const Vector3& cameraPosition = camera.GetPosition();
+
+    reconstructionConstants.cameraPosition[0] = cameraPosition.x;
+    reconstructionConstants.cameraPosition[1] = cameraPosition.y;
+    reconstructionConstants.cameraPosition[2] = cameraPosition.z;
+    reconstructionConstants.padding = 0.0f;
 
     D3D12_GPU_VIRTUAL_ADDRESS reconstructionConstantsAddress = m_uploadBuffer.Allocate(&reconstructionConstants, sizeof(ReconstructionConstants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
 
@@ -312,9 +416,10 @@ void Renderer::Render(const Scene& scene)
 
     DirectionalLightConstants lightConstants{};
 
-    lightConstants.direction[0] = light.direction.x;
-    lightConstants.direction[1] = light.direction.y;
-    lightConstants.direction[2] = light.direction.z;
+    const Vector3 lightDirection = light.direction.Normalized();
+    lightConstants.direction[0] = lightDirection.x;
+    lightConstants.direction[1] = lightDirection.y;
+    lightConstants.direction[2] = lightDirection.z;
     lightConstants.intensity = light.intensity;
 
     lightConstants.color[0] = light.color.x;
@@ -383,7 +488,8 @@ void Renderer::Render(const Scene& scene)
     EndGeometryPass(commandList);
 
 
-    ExecuteCompositePass(commandList, rtvHandle, reconstructionConstantsAddress, lightConstantsAddress);
+    m_deferredLightingPass.Execute(commandList, m_gBuffer, m_materialBuffer, m_environment.GetSourceTexture(), m_environment.GetCubemap(), m_brdfIntegrationLUT, m_sceneColor, reconstructionConstantsAddress, lightConstantsAddress);
+    m_toneMapPass.Execute(commandList, m_sceneColor, rtvHandle);
 
     m_debugUI.EndFrame(commandList);
 
@@ -408,45 +514,6 @@ void Renderer::Render(const Scene& scene)
 }
 
 
-//Demo Scene
-bool Renderer::InitializeDemoScene(DemoScene& scene)
-{
-    ShaderDescription vertexShaderDescription{};
-    vertexShaderDescription.path = "Triangle.hlsl";
-    vertexShaderDescription.entryPoint = "VSMain";
-    vertexShaderDescription.stage = ShaderStage::Vertex;
-
-    Shader* vertexShader = m_shaderLibrary.Load(vertexShaderDescription);
-
-    if(!vertexShader){
-        Log::Error("Failed to load demo vertex shader.");
-        return false;
-    }
-
-    ShaderDescription pixelShaderDescription{};
-    pixelShaderDescription.path = "Triangle.hlsl";
-    pixelShaderDescription.entryPoint = "PSMain";
-    pixelShaderDescription.stage = ShaderStage::Pixel;
-
-    Shader* pixelShader = m_shaderLibrary.Load(pixelShaderDescription);
-
-    if(!pixelShader){
-        Log::Error("Failed to load demo pixel shader.");
-        return false;
-    }
-
-    bool result = scene.Initialize(m_graphicsDevice.GetDevice(), m_resourceUploader, m_resourceDescriptorHeap, vertexShader, pixelShader);
-
-    if(!result){
-        return false;
-    }
-
-    scene.SetAspectRatio(static_cast<float>(m_width) / static_cast<float>(m_height));
-
-    return result;
-}
-
-
 // --------------
 // Shutdown
 // --------------
@@ -467,9 +534,19 @@ void Renderer::Shutdown()
     m_resourceUploader.Shutdown();
 
     m_gBuffer.Shutdown();
-    m_compositePipeline.Shutdown();
+    m_deferredLightingPass.Shutdown();
+    m_toneMapPass.Shutdown();
+    m_environmentMipPass.Shutdown();
+    m_equirectangularToCubemapPass.Shutdown();
+    m_brdfIntegrationPass.Shutdown();
     
     m_uploadBuffer.Shutdown();
+    m_materialBuffer.Shutdown();
+    m_environment.Shutdown();
+    m_sceneColor.Shutdown();
+
+    m_brdfIntegrationLUT.Shutdown();
+
     m_resourceDescriptorHeap.Shutdown();
     m_rtvDescriptorHeap.Shutdown();
     m_dsvDescriptorHeap.Shutdown();
@@ -478,4 +555,29 @@ void Renderer::Shutdown()
     Log::Info("Renderer shutdown: resources released.");
 
     m_graphicsDevice.Shutdown();
+}
+
+void Renderer::WaitForGPU()
+{
+    m_commandContext.WaitForGPU();
+}
+
+ID3D12Device* Renderer::GetDevice()
+{
+    return m_graphicsDevice.GetDevice();
+}
+
+ResourceUploader& Renderer::GetResourceUploader()
+{
+    return m_resourceUploader;
+}
+
+DescriptorHeap& Renderer::GetResourceDescriptorHeap()
+{
+    return m_resourceDescriptorHeap;
+}
+
+ShaderLibrary& Renderer::GetShaderLibrary()
+{
+    return m_shaderLibrary;
 }

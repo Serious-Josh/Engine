@@ -18,8 +18,13 @@ class Texture
         Texture(Texture&& other) noexcept;
         Texture& operator=(Texture&& other) noexcept;
 
-        bool Initialize(ID3D12Device* device, const void* data, unsigned int width, unsigned int height);
+        bool Initialize(ID3D12Device* device, const void* data, unsigned int width, unsigned int height, DXGI_FORMAT format, size_t bytesPerPixel);
+        bool Initialize(ID3D12Device* device, unsigned int width, unsigned int height, unsigned int arraySize, unsigned int mipLevels, DXGI_FORMAT format, D3D12_RESOURCE_FLAGS flags, D3D12_RESOURCE_STATES initialState);
         void Shutdown();
+
+        void Transition(ID3D12GraphicsCommandList* commandList, D3D12_RESOURCE_STATES newState);
+        void Transition(ID3D12GraphicsCommandList* commandList, D3D12_RESOURCE_STATES newState, unsigned int subresource);
+        void SetInitialData(const void* data, size_t dataSize);
 
         ID3D12Resource* GetResource() const;
         const void* GetInitialData() const;
@@ -27,15 +32,21 @@ class Texture
         unsigned int GetDescriptorIndex() const;
 
         bool CreateSRV(ID3D12Device* device, DescriptorHeap& descriptorHeap);
+        bool CreateCubeSRV(ID3D12Device* device, DescriptorHeap& descriptorHeap);
     
     private:
         ID3D12Resource* m_resource = nullptr;
 
-        unsigned int m_width;
-        unsigned int m_height;
+        unsigned int m_width = 0;
+        unsigned int m_height = 0;
 
         unsigned int m_descriptorIndex = UINT_MAX;
         DescriptorHeap* m_descriptorHeap = nullptr;
 
         std::vector<unsigned char> m_initialData;
+
+        DXGI_FORMAT m_format = DXGI_FORMAT_UNKNOWN;
+        size_t m_bytesPerPixel = 0;
+
+        std::vector<D3D12_RESOURCE_STATES> m_subresourceStates;
 };

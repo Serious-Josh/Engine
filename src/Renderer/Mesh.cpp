@@ -1,11 +1,11 @@
 #include "Mesh.h"
 
-bool Mesh::Initialize(ID3D12Device* device, const void* vertices, size_t vertexCount, const VertexLayout& layout)
+bool Mesh::Initialize(ID3D12Device* device, ResourceUploader& uploader, const void* vertices, size_t vertexCount, const VertexLayout& layout)
 {
     m_layout = layout;
     m_vertexCount = vertexCount;
 
-    if(!m_vertexBuffer.Initialize(device, vertices, vertexCount * layout.GetStride())){
+    if(!m_vertexBuffer.Initialize(device, uploader, vertices, vertexCount * layout.GetStride(), D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER)){
         return false;
     }
 
@@ -18,17 +18,18 @@ bool Mesh::Initialize(ID3D12Device* device, const void* vertices, size_t vertexC
     return true;
 }
 
-bool Mesh::Initialize(ID3D12Device* device, const void* vertices, size_t vertexCount, const VertexLayout& layout, const unsigned int* indices, size_t indexCount)
+bool Mesh::Initialize(ID3D12Device* device, ResourceUploader& uploader, const void* vertices, size_t vertexCount, const VertexLayout& layout, const unsigned int* indices, size_t indexCount)
 {
-    if(!Initialize(device, vertices, vertexCount, layout)){
-        return false;
-    }
-
     if(!indices || indexCount == 0){
         return false;
     }
 
-    if(!m_indexBuffer.Initialize(device, indices, indexCount * sizeof(unsigned int))){
+    if(!Initialize(device, uploader, vertices, vertexCount, layout)){
+        return false;
+    }
+
+    if(!m_indexBuffer.Initialize(device, uploader, indices, indexCount * sizeof(unsigned int), D3D12_RESOURCE_STATE_INDEX_BUFFER)){
+        Shutdown();
         return false;
     }
 

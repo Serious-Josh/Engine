@@ -18,6 +18,7 @@ public:
     void Shutdown();
 
     void ProcessMessages();
+    void WaitForMessage();
     bool ShouldClose() const;
     void Close();
 

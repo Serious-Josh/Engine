@@ -2,6 +2,8 @@
 
 #include <d3d12.h>
 
+class ResourceUploader;
+
 class Buffer
 {
     public:
@@ -13,7 +15,7 @@ class Buffer
         Buffer(Buffer&& other) noexcept;
         Buffer& operator=(Buffer&& other) noexcept;
 
-        bool Initialize(ID3D12Device* device, const void* data, size_t size);
+        bool Initialize(ID3D12Device* device, ResourceUploader& uploader, const void* data, size_t size, D3D12_RESOURCE_STATES finalState);
         void Shutdown();
 
         D3D12_GPU_VIRTUAL_ADDRESS GetGPUAddress() const;

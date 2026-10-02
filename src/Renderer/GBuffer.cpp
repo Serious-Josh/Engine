@@ -3,7 +3,7 @@
 
 bool GBuffer::Initialize(ID3D12Device* device, unsigned int width, unsigned int height, DescriptorHeap& rtvHeap, DescriptorHeap& dsvHeap, DescriptorHeap& resourceHeap)
 {
-    if(!m_albedo.Initialize(
+    if(!m_material.Initialize(
         device,
         width,
         height,
@@ -14,7 +14,7 @@ bool GBuffer::Initialize(ID3D12Device* device, unsigned int width, unsigned int 
         return false;
     }
 
-    if(!m_normal.Initialize(
+    if(!m_surface.Initialize(
         device,
         width,
         height,
@@ -22,13 +22,13 @@ bool GBuffer::Initialize(ID3D12Device* device, unsigned int width, unsigned int 
         rtvHeap,
         resourceHeap))
     {
-        m_albedo.Shutdown();
+        m_material.Shutdown();
         return false;
     }
 
     if(!m_depth.Initialize(device, width, height, dsvHeap, resourceHeap)){
-        m_normal.Shutdown();
-        m_albedo.Shutdown();
+        m_surface.Shutdown();
+        m_material.Shutdown();
         return false;
     }
 
@@ -45,18 +45,18 @@ bool GBuffer::Resize(ID3D12Device* device, unsigned int width, unsigned int heig
 void GBuffer::Shutdown()
 {
     m_depth.Shutdown();
-    m_normal.Shutdown();
-    m_albedo.Shutdown();
+    m_surface.Shutdown();
+    m_material.Shutdown();
 }
 
-RenderTarget& GBuffer::GetAlbedo()
+RenderTarget& GBuffer::GetMaterial()
 {
-    return m_albedo;
+    return m_material;
 }
 
-RenderTarget& GBuffer::GetNormal()
+RenderTarget& GBuffer::GetSurface()
 {
-    return m_normal;
+    return m_surface;
 }
 
 DepthBuffer& GBuffer::GetDepth()
@@ -64,14 +64,14 @@ DepthBuffer& GBuffer::GetDepth()
     return m_depth;
 }
 
-const RenderTarget& GBuffer::GetAlbedo() const
+const RenderTarget& GBuffer::GetMaterial() const
 {
-    return m_albedo;
+    return m_material;
 }
 
-const RenderTarget& GBuffer::GetNormal() const
+const RenderTarget& GBuffer::GetSurface() const
 {
-    return m_normal;
+    return m_surface;
 }
 
 const DepthBuffer& GBuffer::GetDepth() const

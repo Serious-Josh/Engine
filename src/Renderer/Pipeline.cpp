@@ -37,19 +37,26 @@ bool Pipeline::Initialize(ID3D12Device* device, const PipelineDescription& descr
     }
 
     D3D12_STATIC_SAMPLER_DESC sampler{};
-    sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
-    sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-    sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-    sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler.Filter =
+        description.sampler.filter;
+
+    sampler.AddressU =
+        description.sampler.addressU;
+
+    sampler.AddressV =
+        description.sampler.addressV;
+
+    sampler.AddressW =
+        description.sampler.addressW;
     sampler.MipLODBias = 0.0f;
     sampler.MaxAnisotropy = 1;
     sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
     sampler.BorderColor = D3D12_STATIC_BORDER_COLOR_OPAQUE_BLACK;
     sampler.MinLOD = 0.0f;
     sampler.MaxLOD = D3D12_FLOAT32_MAX;
-    sampler.ShaderRegister = 0;
+    sampler.ShaderRegister = description.sampler.shaderRegister;
     sampler.RegisterSpace = 0;
-    sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    sampler.ShaderVisibility = description.sampler.visibility;
 
     D3D12_ROOT_SIGNATURE_DESC rootSignatureDescription{};
 

@@ -29,6 +29,26 @@ struct PipelineRenderTargets
     unsigned int count = 0;
 };
 
+struct StaticSamplerDescription
+{
+    D3D12_FILTER filter =
+        D3D12_FILTER_MIN_MAG_MIP_POINT;
+
+    D3D12_TEXTURE_ADDRESS_MODE addressU =
+        D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+
+    D3D12_TEXTURE_ADDRESS_MODE addressV =
+        D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+
+    D3D12_TEXTURE_ADDRESS_MODE addressW =
+        D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+
+    unsigned int shaderRegister = 0;
+
+    D3D12_SHADER_VISIBILITY visibility =
+        D3D12_SHADER_VISIBILITY_PIXEL;
+};
+
 struct PipelineDescription
 {
     const Shader* vertexShader = nullptr;
@@ -37,12 +57,14 @@ struct PipelineDescription
     const VertexLayout* vertexLayout = nullptr;
 
     PipelineRenderTargets renderTargets{};
+    StaticSamplerDescription sampler{};
 
     std::vector<RootParameterDescription> rootParameters;
 
     bool depthEnabled = false;
     DXGI_FORMAT depthFormat = DXGI_FORMAT_UNKNOWN;
 };
+
 
 class Pipeline
 {

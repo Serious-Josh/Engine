@@ -48,6 +48,14 @@ add_executable(Engine
     src/Debug/DebugUI.cpp
     src/Scene/Scene.cpp
     src/Renderer/Geometry/SphereGenerator.cpp
+    src/Renderer/StructuredBuffer.cpp
+    src/Renderer/ImageLoader.cpp
+    src/Renderer/Passes/ToneMapPass.cpp
+    src/Renderer/Passes/DeferrerLightingPass.cpp
+    src/Renderer/EnvironmentMap.cpp
+    src/Renderer/Passes/EquirectangularToCubemapPass.cpp
+    src/Renderer/Passes/EnvironmentMipPass.cpp
+    src/Renderer/Passes/BRDFIntegrationpass.cpp
 )
 
 add_custom_command(
@@ -73,6 +81,7 @@ target_include_directories(Engine
     PRIVATE
         src
         external/imgui
+        external/stb
 )
 
 target_link_libraries(Engine

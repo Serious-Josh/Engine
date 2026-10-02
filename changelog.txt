@@ -1,0 +1,97 @@
+--10/2 Update--
+
+Deferrered Rendering
+- Reworked the renderer to a full deferred rendering pipeline
+- Added GBuffer with separate material and surface targets plus depth
+- Material GBuffer stores base color and roughness
+- Surface GBuffer stores world-space normals and material indices
+- Added world-position reconstruction from the depth buffer using inverse view-projection matricies
+- Added HDR scene-color rendering before final presentation
+- Extracted deferred lighting into a dedicated pass
+- Extracted tonemapping into a dedicated pass
+- Renderer now primarily is for orchestration
+
+HDR / tonemapping
+- Added an HDR scene-color target
+- Added AgX tonemapping instead of applying lighting directly to swapchain
+- Added explicit output conversion for srgb output
+- Environment and lighting calcs now remain in linear HDR space until tonemapping
+
+Runtime Shader System
+- Moved shader compilation to runtime using DXC
+- Added shader loading/compliation infrastucture through ShaderCompiler / ShaderLibrary
+- Removed build-time shader comp from CMake
+- Added runtime DXC dependencies to dev/runtime setup
+- Shader resources are now nested from the engine's asset directory
+
+GPU Resource / Upload Improvements
+- Added a dedicated ResourceUploader with its own command queue, allocator, command list, fence, and synchronization
+- Converted static vertex, index, and material buffers to default-heap GPU resources instead of leaving them in upload memory
+- Added StructuredBuffer support for GPU material data
+- Added a shader-visible resource descriptor heap with descriptor allocation/freeing
+- Extended Texture to support GPU-only textures, arrays, mip chains, cubemap SRVs, and per-subresource state tracking
+- Fixed texture move semantics
+- Added persistent frame-partitioned uplod-buffer support for dynamic data
+- Improved minimized window behavior
+
+Material System
+- Added explicit material models:
+    - Metallic/roughness
+    - Dielectric
+    - Conductor
+- Added dielectric IOR representation
+- Added complex RGB n/k optical constants for conductor materials
+- Added GPU material storage and material indices
+- Added constant material base color
+- Removed the old 2x2 generated diag texture
+- Materials now provide uniform base colors for BRDF/material testing
+
+Physically Based BRDF
+- Added GGX microfacet specular evaluation
+- Added Schlick Fresnel support for dielectric/specular calcs
+- Added complex-IOR Fresnel evaluation for conductor materials
+- Added EON rough diffuse
+- Added physically distinct direct-lighting paths for dielectirc and conductor materials
+- Conductor direct lighting evaluates Fresnel from its complex n/k optical constants
+
+Environment Maps/Specular IBL
+- Added HDR environment-image loading
+- Added HDR equirectangular environment rendering for the scene background
+- Added EnvironmentMap resource ownership
+- Added equirectangular HDR mip generation through EnvironmentMipPass
+- Added GPU-generated cubemap resources and cubemap SRVs
+- Added EquirectangularToCubemapPass
+- Added GGX importance-sampled environment prefiltered across the cubemap mip chain
+- Added PDF/solid-angle-based source-mip selection while prefiltering
+- Added roughness-based selection of the prefiltered environment mip at runtime
+- Added specular environment lighting for dielectric materials
+- Added approximate real-time conductor IBL while retaining complex-IOR Fresnel for direct conductor lighting
+
+BRDF Integration LUT
+- Added BRDFIntegrationPass
+- Added runtime generation of a 512x512 R16G16_FLOAT split-sum BRDF integration LUT
+- Added GGX BRDF integration using a Hammersley sequence
+- Integrated conductor n/k materials with the real-time split-sum path by deriving RBG normal-incidence F0 for complex Fresnel
+- Kept the more accurate complex Fresnel eval for direct conductor lighting
+
+Environment Prefilter Fixes
+- Diagnosed severe geometric artifacts at high material roughness
+- Identified the terminal cubemap mip as a major source of high-roughness cubemap-face artifacts
+- Changed the terminal 1x1 cubemap mip to use a shared spherical average fo the HDR environment across all six faces
+- This prevents six independently generated 1x1 face values from producing large discontinuities at maximum roughness
+- Switched the current environment prefilter to a deterministic Hammersley sequence for stable/reproducible preprocessing
+- High-roughness prefilter quality significantly Improved
+
+Scene/Renderer Separation
+- Removed direct DemoScene/test-shader knowledge from Renderer
+- Scene objects now provide lightweight RenderObject records to the renderer
+- Added renderer-side material init from scene material collections
+- Demo content owns its resource/materials rather than the renderer hardcoding them
+- Maintained a simple V1 scene with one active camera and directional light
+
+Rendering/Math Cleanup
+- Precompute Projection * View on the CPU instead of per object
+- Normalize directional-light direction on the CPU
+- Deferred GBuffer reads now use exact pixel-coordinate Load() operations
+- Retained filtered sampling where appropriate for environment maps and other continuous textures
+- Continued using the engine's column-vector transform convention
