@@ -16,6 +16,8 @@ cbuffer CubemapConstants : register(b0)
 
 SamplerState sampler0 : register(s0);
 
+static const float SOURCE_MIP_BIAS = 1.0f;
+
 VSOutput VSMain(uint vertexID : SV_VertexID)
 {
     VSOutput output;
@@ -91,11 +93,18 @@ float DistributionGGX(
         (alphaSquared - 1.0f) +
         1.0f;
 
+    denominator =
+        max(
+            denominator,
+            1.0e-7f
+        );
+
     return
         alphaSquared /
-        max(
-            PI * denominator * denominator,
-            0.000001f
+        (
+            PI *
+            denominator *
+            denominator
         );
 }
 
@@ -263,25 +272,26 @@ float CalculateSourceMip(
         sourceMipCount
     );
 
-    // A single GGX sample represents approximately
-    // this much solid angle.
-    float sampleSolidAngle =
-        1.0f /
+    float safePdf =
         max(
-            float(sampleCount) * pdf,
-            0.000001f
+            pdf,
+            1.0e-12f
         );
 
-    // Equirectangular texels do not all cover the
-    // same solid angle. Their area shrinks toward
-    // the poles by cos(latitude).
+    float sampleSolidAngle =
+        1.0f /
+        (
+            float(sampleCount) *
+            safePdf
+        );
+
     float cosLatitude =
         sqrt(
             max(
+                0.0f,
                 1.0f -
                 sampleDirection.y *
-                sampleDirection.y,
-                0.000001f
+                sampleDirection.y
             )
         );
 
@@ -298,17 +308,21 @@ float CalculateSourceMip(
         latitudeStep *
         cosLatitude;
 
-    // Each mip level increases a texel's area by
-    // approximately four, hence 0.5 * log2().
+    float safeTexelSolidAngle =
+        max(
+            texelSolidAngle,
+            1.0e-12f
+        );
+
     float sourceMip =
         0.5f *
         log2(
             sampleSolidAngle /
-            max(
-                texelSolidAngle,
-                0.000001f
-            )
+            safeTexelSolidAngle
         );
+
+    sourceMip +=
+        SOURCE_MIP_BIAS;
 
     return clamp(
         sourceMip,
@@ -347,10 +361,8 @@ float4 PSMain(VSOutput input) : SV_Target0
         );
     }
 
-    // At maximum roughness the reflection is extremely broad.
-    // A 1x1 cubemap mip cannot remain continuous if each face
-    // stores a different value, so all six terminal faces use
-    // the same spherical average of the environment.
+    // The terminal 1x1 mip uses one common spherical
+    // average for all six faces so it remains continuous.
     if(mipIndex == mipCount - 1)
     {
         static const uint SPHERE_SAMPLE_COUNT = 2048u;
@@ -401,7 +413,7 @@ float4 PSMain(VSOutput input) : SV_Target0
     float totalWeight =
         0.0f;
 
-    static const uint SAMPLE_COUNT = 512u;
+    static const uint SAMPLE_COUNT = 4096u;
 
     for(uint i = 0u; i < SAMPLE_COUNT; ++i)
     {
@@ -458,8 +470,6 @@ float4 PSMain(VSOutput input) : SV_Target0
                     roughness
                 );
 
-            // Convert the half-vector GGX PDF into
-            // the corresponding reflected-direction PDF.
             float pdf =
                 (
                     distribution *
@@ -467,7 +477,7 @@ float4 PSMain(VSOutput input) : SV_Target0
                 ) /
                 max(
                     4.0f * HdotV,
-                    0.000001f
+                    1.0e-7f
                 );
 
             float sourceMip =
