@@ -390,15 +390,15 @@ bool Renderer::InitializeMaterials(const std::vector<Material*>& materials)
     return true;
 }
 
-bool Renderer::InitializeDemoBLAS(const Mesh& mesh)
+bool Renderer::InitializeDemoRayTracing(const Mesh& mesh, const Scene& scene)
 {
     if(!m_graphicsDevice.SupportsRayTracing()){
-        Log::Error("Cannot initialize demo BLAS: ray tracing is not supported.");
+        Log::Error("Cannot initialize demo ray tracing: ray tracing is not supported.");
         return false;
     }
 
     if(!m_commandContext.Begin(0)){
-        Log::Error("Failed to begin BLAS construction.");
+        Log::Error("Failed to begin acceleration structure construction.");
         return false;
     }
 
@@ -411,19 +411,37 @@ bool Renderer::InitializeDemoBLAS(const Mesh& mesh)
         return false;
     }
 
+    if(!m_demoTLAS.Initialize(
+        m_graphicsDevice.GetRayTracingDevice(),
+        m_commandContext.GetRayTracingCommandList(),
+        scene,
+        m_demoBLAS))
+    {
+        Log::Error("Failed to initialize demo TLAS.");
+        return false;
+    }
+
+    if(!m_demoRayTracingPipeline.Initialize(m_graphicsDevice.GetRayTracingDevice(), m_shaderLibrary, "RayTracingTest.hlsl")){
+        Log::Error("Failed to init demo ray tracing pipeline.");
+        return false;
+    }
+
+    Log::Info("Demo ray tracing pipeline init successful.");
+
     if(!m_commandContext.End()){
-        Log::Error("Failed to end BLAS construction.");
+        Log::Error("Failed to end acceleration structure construction.");
         return false;
     }
 
     if(!m_commandContext.Execute(0)){
-        Log::Error("Failed to execute BLAS construction.");
+        Log::Error("Failed to execute acceleration structure construction.");
         return false;
     }
 
     m_commandContext.WaitForGPU();
 
-    Log::Info("Demo sphere BLAS built successfully.");
+    Log::Info("Demo acceleration structures built successfully.");
+
     return true;
 }
 
@@ -617,6 +635,8 @@ void Renderer::Shutdown()
     m_ggxAverageAlbedoPass.Shutdown();
     m_ggxMultiscatterIrradiancePass.Shutdown();
     
+    m_demoRayTracingPipeline.Shutdown();
+    m_demoTLAS.Shutdown();
     m_demoBLAS.Shutdown();
 
     m_uploadBuffer.Shutdown();

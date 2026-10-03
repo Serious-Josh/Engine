@@ -94,3 +94,12 @@ void BottomLevelAccelerationStructure::Shutdown()
         m_resource = nullptr;
     }
 }
+
+D3D12_GPU_VIRTUAL_ADDRESS BottomLevelAccelerationStructure::GetGPUAddress() const
+{
+    if(!m_resource){
+        return 0;
+    }
+
+    return m_resource->GetGPUVirtualAddress();
+}

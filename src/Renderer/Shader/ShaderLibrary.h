@@ -49,6 +49,8 @@ class ShaderLibrary
 
         Shader* Load(const ShaderDescription& description);
 
+        bool CompileLibrary(const std::filesystem::path& path, ShaderLibraryCompileResult& output);
+
     private:
         ShaderCompiler m_compiler;
         std::filesystem::path m_shaderRoot;

@@ -68,3 +68,14 @@ Shader* ShaderLibrary::Load(const ShaderDescription& description)
 
     return shaderPointer;
 }
+
+bool ShaderLibrary::CompileLibrary(const std::filesystem::path& path, ShaderLibraryCompileResult& output)
+{
+    const std::filesystem::path shaderPath = m_shaderRoot / path;
+    const std::wstring shaderPathString = shaderPath.wstring();
+
+    ShaderLibraryCompileDescription description{};
+    description.path = shaderPathString.c_str();
+
+    return m_compiler.CompileLibrary(description, output);
+}

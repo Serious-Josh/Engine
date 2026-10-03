@@ -60,6 +60,8 @@ add_executable(Engine
     src/Renderer/Passes/GGXAverageAlbedoPass.cpp
     src/Renderer/Passes/GGXMultiscatterIrradiancePass.cpp
     src/Renderer/RayTracing/BottomLevelAccelerationStructure.cpp
+    src/Renderer/RayTracing/TopLevelAccelerationStructure.cpp
+    src/Renderer/RayTracing/RayTracingPipeline.cpp
 )
 
 add_custom_command(

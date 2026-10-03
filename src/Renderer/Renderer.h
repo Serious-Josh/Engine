@@ -25,6 +25,8 @@
 #include "Renderer/Passes/GGXAverageAlbedoPass.h"
 #include "Renderer/Passes/GGXMultiscatterIrradiancePass.h"
 #include "Renderer/RayTracing/BottomLevelAccelerationStructure.h"
+#include "Renderer/RayTracing/TopLevelAccelerationStructure.h"
+#include "Renderer/RayTracing/RayTracingPipeline.h"
 
 #include <d3d12.h>
 #include <filesystem>
@@ -62,7 +64,7 @@ class Renderer
 
         bool InitializeMaterials(const std::vector<Material*>& materials);
 
-        bool InitializeDemoBLAS(const Mesh& mesh);
+        bool InitializeDemoRayTracing(const Mesh& mesh, const Scene& scene);
 
         void WaitForGPU();
     private:
@@ -106,4 +108,6 @@ class Renderer
         Texture m_ggxAverageAlbedoLUT;
 
         BottomLevelAccelerationStructure m_demoBLAS;
+        TopLevelAccelerationStructure m_demoTLAS;
+        RayTracingPipeline m_demoRayTracingPipeline;
 };

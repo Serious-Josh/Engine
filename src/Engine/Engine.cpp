@@ -64,8 +64,8 @@ bool Engine::Initialize()
 
     Log::Info("Demo scene initialization complete.");
 
-    if(!m_renderer.InitializeDemoBLAS(m_demoScene.GetMesh())){
-        Log::Error("Failed to init demo BLAS");
+    if(!m_renderer.InitializeDemoRayTracing(m_demoScene.GetMesh(), m_demoScene.GetScene())){
+        Log::Error("Failed to init demo ray tracing.");
         return false;
     }
 

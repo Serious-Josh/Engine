@@ -19,6 +19,16 @@ struct ShaderCompileResult
     std::vector<char> bytecode;
 };
 
+struct ShaderLibraryCompileDescription
+{
+    const wchar_t* path = nullptr;
+};
+
+struct ShaderLibraryCompileResult
+{
+    std::vector<char> bytecode;
+};
+
 class ShaderCompiler
 {
     public:
@@ -30,6 +40,7 @@ class ShaderCompiler
         void Shutdown();
 
         bool Compile(const ShaderCompileDescription& desription, ShaderCompileResult& output);
+        bool CompileLibrary(const ShaderLibraryCompileDescription& description, ShaderLibraryCompileResult& output);
 
     private:
         const wchar_t* GetShaderProfile(ShaderStage stage) const;

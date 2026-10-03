@@ -155,3 +155,127 @@ const wchar_t* ShaderCompiler::GetShaderProfile(ShaderStage stage) const
 
     return nullptr;
 }
+
+bool ShaderCompiler::CompileLibrary(
+    const ShaderLibraryCompileDescription& description,
+    ShaderLibraryCompileResult& output)
+{
+    output.bytecode.clear();
+
+    if(!m_utils || !m_compiler){
+        return false;
+    }
+
+    if(!description.path){
+        return false;
+    }
+
+    IDxcBlobEncoding* source = nullptr;
+
+    HRESULT result = m_utils->LoadFile(
+        description.path,
+        nullptr,
+        &source);
+
+    if(FAILED(result)){
+        return false;
+    }
+
+    DxcBuffer sourceBuffer{};
+    sourceBuffer.Ptr = source->GetBufferPointer();
+    sourceBuffer.Size = source->GetBufferSize();
+    sourceBuffer.Encoding = DXC_CP_UTF8;
+
+    IDxcIncludeHandler* includeHandler = nullptr;
+
+    result = m_utils->CreateDefaultIncludeHandler(&includeHandler);
+
+    if(FAILED(result)){
+        source->Release();
+        return false;
+    }
+
+    std::filesystem::path shaderPath = description.path;
+    std::wstring shaderDirectory = shaderPath.parent_path().wstring();
+
+    const wchar_t* arguments[] =
+    {
+        description.path,
+        L"-T", L"lib_6_6",
+        L"-HV", L"2021",
+        L"-I", shaderDirectory.c_str()
+    };
+
+    IDxcResult* compileResult = nullptr;
+
+    result = m_compiler->Compile(
+        &sourceBuffer,
+        arguments,
+        static_cast<UINT32>(
+            sizeof(arguments) / sizeof(arguments[0])),
+        includeHandler,
+        IID_PPV_ARGS(&compileResult));
+
+    includeHandler->Release();
+
+    if(FAILED(result)){
+        source->Release();
+        return false;
+    }
+
+    HRESULT compileStatus = S_OK;
+    compileResult->GetStatus(&compileStatus);
+
+    IDxcBlobUtf8* errors = nullptr;
+
+    result = compileResult->GetOutput(
+        DXC_OUT_ERRORS,
+        IID_PPV_ARGS(&errors),
+        nullptr);
+
+    if(SUCCEEDED(result) &&
+       errors &&
+       errors->GetStringLength() > 0)
+    {
+        Log::Error(errors->GetStringPointer());
+    }
+
+    if(errors){
+        errors->Release();
+    }
+
+    if(FAILED(compileStatus)){
+        compileResult->Release();
+        source->Release();
+        return false;
+    }
+
+    IDxcBlob* object = nullptr;
+
+    result = compileResult->GetOutput(
+        DXC_OUT_OBJECT,
+        IID_PPV_ARGS(&object),
+        nullptr);
+
+    if(FAILED(result)){
+        compileResult->Release();
+        source->Release();
+        return false;
+    }
+
+    const char* bytecodeBegin =
+        static_cast<const char*>(object->GetBufferPointer());
+
+    const char* bytecodeEnd =
+        bytecodeBegin + object->GetBufferSize();
+
+    output.bytecode.assign(
+        bytecodeBegin,
+        bytecodeEnd);
+
+    object->Release();
+    compileResult->Release();
+    source->Release();
+
+    return true;
+}
