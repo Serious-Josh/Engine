@@ -100,6 +100,31 @@ bool EnvironmentMap::Initialize(
         return false;
     }
 
+    constexpr unsigned int ggxMultiscatterSize = 64;
+    constexpr unsigned int ggxMultiscatterMipLevels = 7;
+
+    if(!m_ggxMultiscatterIrradiance.Initialize(
+        device,
+        ggxMultiscatterSize,
+        ggxMultiscatterSize,
+        6,
+        ggxMultiscatterMipLevels,
+        DXGI_FORMAT_R16G16B16A16_FLOAT,
+        D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+        D3D12_RESOURCE_STATE_RENDER_TARGET))
+    {
+        Log::Error("Failed to init GGX multiscatter irradiance cubemap.");
+        return false;
+    }
+
+    if(!m_ggxMultiscatterIrradiance.CreateCubeSRV(
+        device,
+        descriptorHeap))
+    {
+        Log::Error("Failed to create GGX multiscatter irradiance cubemap SRV.");
+        return false;
+    }
+
     return true;
 }
 
@@ -108,6 +133,7 @@ void EnvironmentMap::Shutdown()
     m_sourceTexture.Shutdown();
     m_cubemap.Shutdown();
     m_diffuseIrradiance.Shutdown();
+    m_ggxMultiscatterIrradiance.Shutdown();
 }
 
 Texture& EnvironmentMap::GetSourceTexture()
@@ -138,4 +164,14 @@ Texture& EnvironmentMap::GetDiffuseIrradiance()
 const Texture& EnvironmentMap::GetDiffuseIrradiance() const
 {
     return m_diffuseIrradiance;
+}
+
+Texture& EnvironmentMap::GetGGXMultiscatterIrradiance()
+{
+    return m_ggxMultiscatterIrradiance;
+}
+
+const Texture& EnvironmentMap::GetGGXMultiscatterIrradiance() const
+{
+    return m_ggxMultiscatterIrradiance;
 }

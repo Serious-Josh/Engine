@@ -104,9 +104,14 @@ float DistributionGGX(
         NdotHSquared * (alphaSquared - 1.0f) + 1.0f;
 
     denominator =
-        PI * denominator * denominator;
+        max(
+            denominator,
+            1.0e-7f
+        );
 
-    return alphaSquared / max(denominator, 1.0e-6f);
+    return
+        alphaSquared /
+        (PI * denominator * denominator);
 }
 
 float GeometrySmithGGX(
@@ -308,6 +313,107 @@ float3 EvaluateGGXConductor(
     return
         D * G * F /
         max(denominator, 1.0e-6f);
+}
+
+
+// -----------------------------------------------------------------------------
+// GGX multiple scattering
+// -----------------------------------------------------------------------------
+
+float3 AverageSchlickFresnel(float3 F0)
+{
+    // Cosine-weighted hemispherical average of Schlick Fresnel:
+    //
+    // F(mu) = F0 + (1 - F0) * (1 - mu)^5
+    //
+    // 2 * integral[0,1] F(mu) * mu dmu
+    //
+    // = F0 + (1 - F0) / 21.
+    return
+        F0 +
+        (1.0f - F0) *
+        (1.0f / 21.0f);
+}
+
+float3 EvaluateGGXMultipleScatterFresnel(
+    float averageAlbedo,
+    float3 averageFresnel)
+{
+    averageAlbedo =
+        saturate(averageAlbedo);
+
+    averageFresnel =
+        saturate(averageFresnel);
+
+    return
+        (averageFresnel * averageFresnel) *
+        averageAlbedo /
+        max(
+            float3(
+                1.0e-6f,
+                1.0e-6f,
+                1.0e-6f
+            ),
+            1.0f -
+            averageFresnel *
+            (1.0f - averageAlbedo)
+        );
+}
+
+float3 EvaluateGGXMultipleScattering(
+    float directionalAlbedoLight,
+    float directionalAlbedoView,
+    float averageAlbedo,
+    float3 averageFresnel)
+{
+    directionalAlbedoLight =
+        saturate(directionalAlbedoLight);
+
+    directionalAlbedoView =
+        saturate(directionalAlbedoView);
+
+    averageAlbedo =
+        saturate(averageAlbedo);
+
+    float oneMinusAverageAlbedo =
+        max(
+            1.0f - averageAlbedo,
+            1.0e-6f
+        );
+
+    float3 multipleScatterFresnel =
+        EvaluateGGXMultipleScatterFresnel(
+            averageAlbedo,
+            averageFresnel
+        );
+
+    float directionalFactor =
+        (1.0f - directionalAlbedoLight) *
+        (1.0f - directionalAlbedoView) /
+        oneMinusAverageAlbedo;
+
+    return
+        multipleScatterFresnel *
+        INV_PI *
+        directionalFactor;
+}
+
+float3 EvaluateGGXMultipleScatteringSchlick(
+    float directionalAlbedoLight,
+    float directionalAlbedoView,
+    float averageAlbedo,
+    float3 F0)
+{
+    float3 averageFresnel =
+        AverageSchlickFresnel(F0);
+
+    return
+        EvaluateGGXMultipleScattering(
+            directionalAlbedoLight,
+            directionalAlbedoView,
+            averageAlbedo,
+            averageFresnel
+        );
 }
 
 #endif

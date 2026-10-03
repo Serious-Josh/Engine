@@ -18,6 +18,9 @@ struct GPUMaterial
 
     float3 conductorK;
     float padding1;
+
+    float3 averageConductorFresnel;
+    float padding2;
 };
 
 cbuffer GBufferConstants : register(b0)
@@ -30,6 +33,8 @@ cbuffer GBufferConstants : register(b0)
     uint environmentCubemapIndex;
     uint diffuseIrradianceIndex;
     uint brdfIntegrationLUTIndex;
+    uint ggxAverageAlbedoLUTIndex;
+    uint ggxMultiscatterIrradianceIndex;
 }
 
 cbuffer ReconstructionConstants : register(b1)
@@ -149,6 +154,16 @@ float4 PSMain(VSOutput input) : SV_Target0
     Texture2D<float2> brdfIntegrationLUT =
         ResourceDescriptorHeap[
             brdfIntegrationLUTIndex
+        ];
+
+    Texture2D<float> ggxAverageAlbedoLUT =
+        ResourceDescriptorHeap[
+            ggxAverageAlbedoLUTIndex
+        ];
+
+    TextureCube<float4> ggxMultiscatterIrradiance =
+        ResourceDescriptorHeap[
+            ggxMultiscatterIrradianceIndex
         ];
 
     int2 pixel =
@@ -273,6 +288,14 @@ float4 PSMain(VSOutput input) : SV_Target0
             )
         );
 
+    float NdotV =
+        saturate(
+            dot(
+                normal,
+                viewDirection
+            )
+        );
+
     float3 directBRDF =
         float3(
             0.0f,
@@ -294,7 +317,227 @@ float4 PSMain(VSOutput input) : SV_Target0
             0.0f
         );
 
-    if(gpuMaterial.model == 1)
+    if(gpuMaterial.model == 0)
+    {
+        float metallic =
+            saturate(
+                gpuMaterial.metallic
+            );
+
+        float3 dielectricF0 =
+            float3(
+                0.04f,
+                0.04f,
+                0.04f
+            );
+
+        float3 F0 =
+            lerp(
+                dielectricF0,
+                baseColor,
+                metallic
+            );
+
+        float3 diffuseColor =
+            baseColor *
+            (1.0f - metallic);
+
+        float3 fresnel =
+            EvaluateGGXFresnel(
+                directionToLight,
+                viewDirection,
+                F0
+            );
+
+        float3 diffuseBRDF =
+            EvaluateEONDiffuse(
+                diffuseColor,
+                roughness,
+                normal,
+                directionToLight,
+                viewDirection
+            );
+
+        float3 specularBRDF =
+            EvaluateGGXSpecular(
+                roughness,
+                normal,
+                directionToLight,
+                viewDirection,
+                F0
+            );
+
+        if(NdotL > 0.0f && NdotV > 0.0f)
+        {
+            float2 directionalAlbedoLightData =
+                brdfIntegrationLUT.SampleLevel(
+                    sampler0,
+                    float2(
+                        NdotL,
+                        roughness
+                    ),
+                    0.0f
+                ).rg;
+
+            float2 directionalAlbedoViewData =
+                brdfIntegrationLUT.SampleLevel(
+                    sampler0,
+                    float2(
+                        NdotV,
+                        roughness
+                    ),
+                    0.0f
+                ).rg;
+
+            float directionalAlbedoLight =
+                directionalAlbedoLightData.x +
+                directionalAlbedoLightData.y;
+
+            float directionalAlbedoView =
+                directionalAlbedoViewData.x +
+                directionalAlbedoViewData.y;
+
+            float averageAlbedo =
+                ggxAverageAlbedoLUT.SampleLevel(
+                    sampler0,
+                    float2(
+                        roughness,
+                        0.5f
+                    ),
+                    0.0f
+                ).r;
+
+            specularBRDF +=
+                EvaluateGGXMultipleScatteringSchlick(
+                    directionalAlbedoLight,
+                    directionalAlbedoView,
+                    averageAlbedo,
+                    F0
+                );
+        }
+
+        float3 diffuseWeight =
+            1.0f - fresnel;
+
+        directBRDF =
+            diffuseWeight *
+            diffuseBRDF +
+            specularBRDF;
+
+        float3 reflectionDirection =
+            reflect(
+                -viewDirection,
+                normal
+            );
+
+        float maxEnvironmentMip =
+            10.0f;
+
+        float environmentMip =
+            roughness *
+            maxEnvironmentMip;
+
+        float3 prefilteredEnvironment =
+            environmentCubemap.SampleLevel(
+                sampler0,
+                reflectionDirection,
+                environmentMip
+            ).rgb;
+
+        float2 integratedBRDF =
+            brdfIntegrationLUT.SampleLevel(
+                sampler0,
+                float2(
+                    NdotV,
+                    roughness
+                ),
+                0.0f
+            ).rg;
+
+        environmentSpecular =
+            prefilteredEnvironment *
+            (
+                F0 *
+                integratedBRDF.x +
+                integratedBRDF.y
+            );
+
+        float directionalAlbedoView =
+            saturate(
+                integratedBRDF.x +
+                integratedBRDF.y
+            );
+
+        float averageAlbedo =
+            ggxAverageAlbedoLUT.SampleLevel(
+                sampler0,
+                float2(
+                    roughness,
+                    0.5f
+                ),
+                0.0f
+            ).r;
+
+        float3 averageFresnel =
+            AverageSchlickFresnel(F0);
+
+        float3 multipleScatterFresnel =
+            EvaluateGGXMultipleScatterFresnel(
+                averageAlbedo,
+                averageFresnel
+            );
+
+        float multiscatterMip =
+            roughness * 6.0f;
+
+        float3 multiscatterIrradiance =
+            ggxMultiscatterIrradiance.SampleLevel(
+                sampler0,
+                normal,
+                multiscatterMip
+            ).rgb;
+
+        float multiscatterNormalization =
+            max(
+                1.0f - averageAlbedo,
+                1.0e-6f
+            );
+
+        float3 environmentMultipleScatter =
+            multiscatterIrradiance *
+            multipleScatterFresnel *
+            (1.0f - directionalAlbedoView) *
+            INV_PI /
+            multiscatterNormalization;
+
+        environmentSpecular +=
+            environmentMultipleScatter;
+
+        float3 irradiance =
+            diffuseIrradiance.SampleLevel(
+                sampler0,
+                normal,
+                0.0f
+            ).rgb;
+
+        float3 environmentFresnel =
+            F0 +
+            (1.0f - F0) *
+            pow(
+                1.0f - NdotV,
+                5.0f
+            );
+
+        float3 environmentDiffuseWeight =
+            1.0f -
+            environmentFresnel;
+
+        environmentDiffuse =
+            environmentDiffuseWeight *
+            (diffuseColor / PI) *
+            irradiance;
+    }
+    else if(gpuMaterial.model == 1)
     {
         float iorDifference =
             gpuMaterial.ior - 1.0f;
@@ -338,6 +581,55 @@ float4 PSMain(VSOutput input) : SV_Target0
                 F0
             );
 
+        if(NdotL > 0.0f && NdotV > 0.0f)
+        {
+            float2 directionalAlbedoLightData =
+                brdfIntegrationLUT.SampleLevel(
+                    sampler0,
+                    float2(
+                        NdotL,
+                        roughness
+                    ),
+                    0.0f
+                ).rg;
+
+            float2 directionalAlbedoViewData =
+                brdfIntegrationLUT.SampleLevel(
+                    sampler0,
+                    float2(
+                        NdotV,
+                        roughness
+                    ),
+                    0.0f
+                ).rg;
+
+            float directionalAlbedoLight =
+                directionalAlbedoLightData.x +
+                directionalAlbedoLightData.y;
+
+            float directionalAlbedoView =
+                directionalAlbedoViewData.x +
+                directionalAlbedoViewData.y;
+
+            float averageAlbedo =
+                ggxAverageAlbedoLUT.SampleLevel(
+                    sampler0,
+                    float2(
+                        roughness,
+                        0.5f
+                    ),
+                    0.0f
+                ).r;
+
+            specularBRDF +=
+                EvaluateGGXMultipleScatteringSchlick(
+                    directionalAlbedoLight,
+                    directionalAlbedoView,
+                    averageAlbedo,
+                    F0
+                );
+        }
+
         float3 diffuseWeight =
             1.0f - fresnel;
 
@@ -345,14 +637,6 @@ float4 PSMain(VSOutput input) : SV_Target0
             diffuseWeight *
             diffuseBRDF +
             specularBRDF;
-
-        float NdotV =
-            saturate(
-                dot(
-                    normal,
-                    viewDirection
-                )
-            );
 
         float3 reflectionDirection =
             reflect(
@@ -392,6 +676,57 @@ float4 PSMain(VSOutput input) : SV_Target0
                 integratedBRDF.y
             );
 
+        float directionalAlbedoView =
+            saturate(
+                integratedBRDF.x +
+                integratedBRDF.y
+            );
+
+        float averageAlbedo =
+            ggxAverageAlbedoLUT.SampleLevel(
+                sampler0,
+                float2(
+                    roughness,
+                    0.5f
+                ),
+                0.0f
+            ).r;
+
+        float3 averageFresnel =
+            AverageSchlickFresnel(F0);
+
+        float3 multipleScatterFresnel =
+            EvaluateGGXMultipleScatterFresnel(
+                averageAlbedo,
+                averageFresnel
+            );
+
+        float multiscatterMip =
+            roughness * 6.0f;
+
+        float3 multiscatterIrradiance =
+            ggxMultiscatterIrradiance.SampleLevel(
+                sampler0,
+                normal,
+                multiscatterMip
+            ).rgb;
+
+        float multiscatterNormalization =
+            max(
+                1.0f - averageAlbedo,
+                1.0e-6f
+            );
+
+        float3 environmentMultipleScatter =
+            multiscatterIrradiance *
+            multipleScatterFresnel *
+            (1.0f - directionalAlbedoView) *
+            INV_PI /
+            multiscatterNormalization;
+
+        environmentSpecular +=
+            environmentMultipleScatter;
+
         float3 irradiance =
             diffuseIrradiance.SampleLevel(
                 sampler0,
@@ -418,7 +753,7 @@ float4 PSMain(VSOutput input) : SV_Target0
     }
     else if(gpuMaterial.model == 2)
     {
-        directBRDF =
+        float3 specularBRDF =
             EvaluateGGXConductor(
                 roughness,
                 normal,
@@ -428,13 +763,57 @@ float4 PSMain(VSOutput input) : SV_Target0
                 gpuMaterial.conductorK
             );
 
-        float NdotV =
-            saturate(
-                dot(
-                    normal,
-                    viewDirection
-                )
-            );
+        if(NdotL > 0.0f && NdotV > 0.0f)
+        {
+            float2 directionalAlbedoLightData =
+                brdfIntegrationLUT.SampleLevel(
+                    sampler0,
+                    float2(
+                        NdotL,
+                        roughness
+                    ),
+                    0.0f
+                ).rg;
+
+            float2 directionalAlbedoViewData =
+                brdfIntegrationLUT.SampleLevel(
+                    sampler0,
+                    float2(
+                        NdotV,
+                        roughness
+                    ),
+                    0.0f
+                ).rg;
+
+            float directionalAlbedoLight =
+                directionalAlbedoLightData.x +
+                directionalAlbedoLightData.y;
+
+            float directionalAlbedoView =
+                directionalAlbedoViewData.x +
+                directionalAlbedoViewData.y;
+
+            float averageAlbedo =
+                ggxAverageAlbedoLUT.SampleLevel(
+                    sampler0,
+                    float2(
+                        roughness,
+                        0.5f
+                    ),
+                    0.0f
+                ).r;
+
+            specularBRDF +=
+                EvaluateGGXMultipleScattering(
+                    directionalAlbedoLight,
+                    directionalAlbedoView,
+                    averageAlbedo,
+                    gpuMaterial.averageConductorFresnel
+                );
+        }
+
+        directBRDF =
+            specularBRDF;
 
         float3 reflectionDirection =
             reflect(
@@ -480,6 +859,54 @@ float4 PSMain(VSOutput input) : SV_Target0
                 integratedBRDF.x +
                 integratedBRDF.y
             );
+
+        float directionalAlbedoView =
+            saturate(
+                integratedBRDF.x +
+                integratedBRDF.y
+            );
+
+        float averageAlbedo =
+            ggxAverageAlbedoLUT.SampleLevel(
+                sampler0,
+                float2(
+                    roughness,
+                    0.5f
+                ),
+                0.0f
+            ).r;
+
+        float3 multipleScatterFresnel =
+            EvaluateGGXMultipleScatterFresnel(
+                averageAlbedo,
+                gpuMaterial.averageConductorFresnel
+            );
+
+        float multiscatterMip =
+            roughness * 6.0f;
+
+        float3 multiscatterIrradiance =
+            ggxMultiscatterIrradiance.SampleLevel(
+                sampler0,
+                normal,
+                multiscatterMip
+            ).rgb;
+
+        float multiscatterNormalization =
+            max(
+                1.0f - averageAlbedo,
+                1.0e-6f
+            );
+
+        float3 environmentMultipleScatter =
+            multiscatterIrradiance *
+            multipleScatterFresnel *
+            (1.0f - directionalAlbedoView) *
+            INV_PI /
+            multiscatterNormalization;
+
+        environmentSpecular +=
+            environmentMultipleScatter;
     }
 
     float3 directional =

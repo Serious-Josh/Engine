@@ -53,6 +53,9 @@ struct GPUMaterial
 
     float conductorK[3];
     float padding1;
+
+    float averageConductorFresnel[3];
+    float padding2;
 };
 
 static_assert(sizeof(MaterialConstants) == 32);
@@ -60,4 +63,4 @@ static_assert(sizeof(Matrix4) == 64);
 static_assert(sizeof(CameraConstants) == 64);
 static_assert(sizeof(ObjectConstants) == 128);
 static_assert(sizeof(ReconstructionConstants) == 80);
-static_assert(sizeof(GPUMaterial) == 48);
+static_assert(sizeof(GPUMaterial) == 64);

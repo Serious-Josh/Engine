@@ -41,6 +41,7 @@ class DemoScene
 
         std::array<Material, MaterialSampleCount> m_dielectricMaterials;
         std::array<Material, MaterialSampleCount> m_conductorMaterials;
+        std::array<Material, MaterialSampleCount> m_metallicRoughnessMaterials;
 
         Scene m_scene;
 

@@ -68,7 +68,7 @@ bool Renderer::Initialize(void* windowHandle, unsigned int width, unsigned int h
         return false;
     }
 
-    if(!m_rtvDescriptorHeap.Initialize(device, D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 128, false)){
+    if(!m_rtvDescriptorHeap.Initialize(device, D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 256, false)){
         Log::Error("Failed to init rtv descriptor heap.");
         return false;
     }
@@ -85,6 +85,21 @@ bool Renderer::Initialize(void* windowHandle, unsigned int width, unsigned int h
 
     if(!m_brdfIntegrationPass.Initialize(device, m_shaderLibrary, m_rtvDescriptorHeap, m_brdfIntegrationLUT)){
         Log::Error("Failed to init BRDF integration pass.");
+        return false;
+    }
+
+    if(!m_ggxAverageAlbedoLUT.Initialize(device, 512, 1, 1, 1, DXGI_FORMAT_R16_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET)){
+        Log::Error("Failed to init GGX average albedo LUT.");
+        return false;
+    }
+
+    if(!m_ggxAverageAlbedoLUT.CreateSRV(device, m_resourceDescriptorHeap)){
+        Log::Error("Failed to create GGX average albedo LUT SRV.");
+        return false;
+    }
+
+    if(!m_ggxAverageAlbedoPass.Initialize(device, m_shaderLibrary, m_rtvDescriptorHeap, m_ggxAverageAlbedoLUT)){
+        Log::Error("Failed to init GGX average albedo pass.");
         return false;
     }
 
@@ -130,6 +145,16 @@ bool Renderer::Initialize(void* windowHandle, unsigned int width, unsigned int h
         return false;
     }
 
+    if(!m_ggxMultiscatterIrradiancePass.Initialize(
+        device,
+        m_shaderLibrary,
+        m_rtvDescriptorHeap,
+        m_environment.GetGGXMultiscatterIrradiance()))
+    {
+        Log::Error("Failed to init GGX multiscatter irradiance pass.");
+        return false;
+    }
+
     if(!m_commandContext.Begin(0)){
         Log::Error(
             "Failed to begin environment preprocessing."
@@ -150,20 +175,12 @@ bool Renderer::Initialize(void* windowHandle, unsigned int width, unsigned int h
         descriptorHeaps
     );
 
-    m_environmentMipPass.Execute(
-        preprocessingCommandList,
-        m_environment.GetSourceTexture()
-    );
-
-    m_diffuseIrradiancePass.Execute(preprocessingCommandList, m_environment.GetSourceTexture(), m_environment.GetCubemap());
-
-    m_equirectangularToCubemapPass.Execute(
-        preprocessingCommandList,
-        m_environment.GetSourceTexture(),
-        m_environment.GetCubemap()
-    );
-
+    m_environmentMipPass.Execute(preprocessingCommandList, m_environment.GetSourceTexture());
+    m_diffuseIrradiancePass.Execute(preprocessingCommandList, m_environment.GetSourceTexture(), m_environment.GetDiffuseIrradiance());
+    m_equirectangularToCubemapPass.Execute(preprocessingCommandList, m_environment.GetSourceTexture(), m_environment.GetCubemap());
     m_brdfIntegrationPass.Execute(preprocessingCommandList, m_brdfIntegrationLUT);
+    m_ggxAverageAlbedoPass.Execute(preprocessingCommandList, m_ggxAverageAlbedoLUT);
+    m_ggxMultiscatterIrradiancePass.Execute(preprocessingCommandList, m_environment.GetSourceTexture(), m_brdfIntegrationLUT, m_environment.GetGGXMultiscatterIrradiance());
 
     if(!m_commandContext.End()){
         Log::Error(
@@ -495,7 +512,20 @@ void Renderer::Render(const Scene& scene)
     EndGeometryPass(commandList);
 
 
-    m_deferredLightingPass.Execute(commandList, m_gBuffer, m_materialBuffer, m_environment.GetSourceTexture(), m_environment.GetCubemap(), m_environment.GetDiffuseIrradiance(), m_brdfIntegrationLUT, m_sceneColor, reconstructionConstantsAddress, lightConstantsAddress);
+    m_deferredLightingPass.Execute(
+        commandList,
+        m_gBuffer,
+        m_materialBuffer,
+        m_environment.GetSourceTexture(),
+        m_environment.GetCubemap(),
+        m_environment.GetDiffuseIrradiance(),
+        m_brdfIntegrationLUT,
+        m_ggxAverageAlbedoLUT,
+        m_environment.GetGGXMultiscatterIrradiance(),
+        m_sceneColor,
+        reconstructionConstantsAddress,
+        lightConstantsAddress
+    );
     m_toneMapPass.Execute(commandList, m_sceneColor, rtvHandle);
 
     m_debugUI.EndFrame(commandList);
@@ -547,6 +577,8 @@ void Renderer::Shutdown()
     m_equirectangularToCubemapPass.Shutdown();
     m_diffuseIrradiancePass.Shutdown();
     m_brdfIntegrationPass.Shutdown();
+    m_ggxAverageAlbedoPass.Shutdown();
+    m_ggxMultiscatterIrradiancePass.Shutdown();
     
     m_uploadBuffer.Shutdown();
     m_materialBuffer.Shutdown();
@@ -554,6 +586,7 @@ void Renderer::Shutdown()
     m_sceneColor.Shutdown();
 
     m_brdfIntegrationLUT.Shutdown();
+    m_ggxAverageAlbedoLUT.Shutdown();
 
     m_resourceDescriptorHeap.Shutdown();
     m_rtvDescriptorHeap.Shutdown();

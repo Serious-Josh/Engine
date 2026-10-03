@@ -53,7 +53,7 @@ bool DeferredLightingPass::Initialize(ID3D12Device* device, ShaderLibrary& shade
         D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
 
     pipelineDescription.rootParameters.push_back(
-        {RootParameterType::Constants, 0, 8, D3D12_SHADER_VISIBILITY_PIXEL}
+        {RootParameterType::Constants, 0, 10, D3D12_SHADER_VISIBILITY_PIXEL}
     );
 
     pipelineDescription.rootParameters.push_back(
@@ -80,6 +80,8 @@ void DeferredLightingPass::Execute(
     Texture& environmentalCubemap,
     Texture& diffuseIrradiance,
     Texture& brdfIntegrationLUT,
+    Texture& ggxAverageAlbedoLUT,
+    Texture& ggxMultiscatterIrradiance,
     RenderTarget& sceneColor,
     D3D12_GPU_VIRTUAL_ADDRESS reconstructionConstantsAddress,
     D3D12_GPU_VIRTUAL_ADDRESS lightConstantsAddress)
@@ -125,12 +127,14 @@ void DeferredLightingPass::Execute(
         environmentTexture.GetDescriptorIndex(),
         environmentalCubemap.GetDescriptorIndex(),
         diffuseIrradiance.GetDescriptorIndex(),
-        brdfIntegrationLUT.GetDescriptorIndex()
+        brdfIntegrationLUT.GetDescriptorIndex(),
+        ggxAverageAlbedoLUT.GetDescriptorIndex(),
+        ggxMultiscatterIrradiance.GetDescriptorIndex()
     };
 
     commandList->SetGraphicsRoot32BitConstants(
         0,
-        8,
+        10,
         resourceIndices,
         0
     );

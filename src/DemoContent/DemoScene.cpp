@@ -184,6 +184,91 @@ bool DemoScene::Initialize(ID3D12Device* device, ResourceUploader& uploader, Des
         );
     }
 
+    const float metallicValues[MaterialSampleCount] =
+    {
+        0.0f,
+        0.0f,
+        0.5f,
+        1.0f,
+        1.0f
+    };
+
+    const float metallicRoughnessValues[MaterialSampleCount] =
+    {
+        0.05f,
+        1.00f,
+        0.35f,
+        0.05f,
+        1.00f
+    };
+
+    for(unsigned int i = 0; i < MaterialSampleCount; ++i)
+    {
+        Material& material =
+            m_metallicRoughnessMaterials[i];
+
+        material.pipeline = &m_pipeline;
+        material.texture = &m_texture;
+
+        material.model =
+            MaterialModel::MetallicRoughness;
+
+        material.roughness =
+            metallicRoughnessValues[i];
+
+        material.metallic =
+            metallicValues[i];
+
+        material.baseColor[0] = 0.80f;
+        material.baseColor[1] = 0.20f;
+        material.baseColor[2] = 0.05f;
+
+        RenderObject object{};
+
+        object.mesh =
+            &m_mesh;
+
+        object.material =
+            &material;
+
+        object.transform.position =
+            Vector3{
+                startX +
+                horizontalSpacing * float(i),
+                verticalSpacing * 1.5f,
+                0.0f
+            };
+
+        object.transform.scale =
+            Vector3{
+                0.65f,
+                0.65f,
+                0.65f
+            };
+
+        m_scene.AddRenderObject(
+            object
+        );
+    }
+
+    Camera& camera = m_scene.GetCamera();
+
+    camera.SetPosition(
+        Vector3{
+            0.0f,
+            0.825f,
+            -7.0f
+        }
+    );
+
+    camera.SetTarget(
+        Vector3{
+            0.0f,
+            0.825f,
+            0.0f
+        }
+    );
+
     //m_scene.GetDirectionalLight().color = {1.0f, 0.0f, 0.0f};
     DirectionalLight& light = m_scene.GetDirectionalLight();
 
@@ -251,7 +336,7 @@ std::vector<Material*> DemoScene::GetMaterials()
     std::vector<Material*> materials;
 
     materials.reserve(
-        MaterialSampleCount * 2
+        MaterialSampleCount * 3
     );
 
     for(Material& material : m_dielectricMaterials){
@@ -259,6 +344,10 @@ std::vector<Material*> DemoScene::GetMaterials()
     }
 
     for(Material& material : m_conductorMaterials){
+        materials.push_back(&material);
+    }
+
+    for(Material& material : m_metallicRoughnessMaterials){
         materials.push_back(&material);
     }
 

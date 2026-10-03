@@ -57,6 +57,8 @@ add_executable(Engine
     src/Renderer/Passes/EnvironmentMipPass.cpp
     src/Renderer/Passes/BRDFIntegrationpass.cpp
     src/Renderer/Passes/DiffuseIrradiancePass.cpp
+    src/Renderer/Passes/GGXAverageAlbedoPass.cpp
+    src/Renderer/Passes/GGXMultiscatterIrradiancePass.cpp
 )
 
 add_custom_command(
