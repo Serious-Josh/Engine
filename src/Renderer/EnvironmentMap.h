@@ -19,9 +19,12 @@ class EnvironmentMap
 
         Texture& GetCubemap();
         const Texture& GetCubemap() const;
+        Texture& GetDiffuseIrradiance();
+        const Texture& GetDiffuseIrradiance() const;
         
 
     private:
         Texture m_sourceTexture;
         Texture m_cubemap;
+        Texture m_diffuseIrradiance;
 };

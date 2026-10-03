@@ -19,6 +19,7 @@ class DeferredLightingPass
             StructuredBuffer& materialBuffer,
             Texture& environmentTexture,
             Texture& environmentalCubemap,
+            Texture& diffuseIrradiance,
             Texture& brdfIntegrationLUT,
             RenderTarget& sceneColor,
             D3D12_GPU_VIRTUAL_ADDRESS reconstructionConstantsAddress,

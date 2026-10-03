@@ -21,6 +21,7 @@
 #include "Renderer/Passes/EquirectangularToCubemapPass.h"
 #include "Renderer/Passes/EnvironmentMipPass.h"
 #include "Renderer/Passes/BRDFIntegrationPass.h"
+#include "Renderer/Passes/DiffuseIrradiancePass.h"
 
 #include <d3d12.h>
 #include <filesystem>
@@ -78,6 +79,7 @@ class Renderer
         EquirectangularToCubemapPass m_equirectangularToCubemapPass;
         EnvironmentMipPass m_environmentMipPass;
         BRDFIntegrationPass m_brdfIntegrationPass;
+        DiffuseIrradiancePass m_diffuseIrradiancePass;
 
         ShaderLibrary m_shaderLibrary;
 

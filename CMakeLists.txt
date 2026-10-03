@@ -56,6 +56,7 @@ add_executable(Engine
     src/Renderer/Passes/EquirectangularToCubemapPass.cpp
     src/Renderer/Passes/EnvironmentMipPass.cpp
     src/Renderer/Passes/BRDFIntegrationpass.cpp
+    src/Renderer/Passes/DiffuseIrradiancePass.cpp
 )
 
 add_custom_command(

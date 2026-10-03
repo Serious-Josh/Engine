@@ -64,45 +64,125 @@ bool DemoScene::Initialize(ID3D12Device* device, ResourceUploader& uploader, Des
         return false;
     }
 
-    m_leftMaterial.pipeline = &m_pipeline;
-    m_leftMaterial.texture = &m_texture;
-    m_leftMaterial.model = MaterialModel::Dielectric;
-    m_leftMaterial.roughness = 0.1f;
-    m_leftMaterial.ior = 1.536f;
-    m_leftMaterial.baseColor[0] = 0.5f;
-    m_leftMaterial.baseColor[1] = 0.5f;
-    m_leftMaterial.baseColor[2] = 0.5f;
+    const float roughnessValues[MaterialSampleCount] =
+    {
+        0.05f,
+        0.25f,
+        0.50f,
+        0.75f,
+        1.00f
+    };
 
-    m_rightMaterial.pipeline = &m_pipeline;
-    m_rightMaterial.texture = &m_texture;
-    m_rightMaterial.model = MaterialModel::Conductor;
-    m_rightMaterial.roughness = 0.85f;
-    
-    m_rightMaterial.conductorN[0] = 0.2f;
-    m_rightMaterial.conductorN[1] = 0.9f;
-    m_rightMaterial.conductorN[2] = 1.1f;
+    constexpr float horizontalSpacing = 1.65f;
+    constexpr float verticalSpacing = 1.65f;
 
-    m_rightMaterial.conductorK[0] = 3.9f;
-    m_rightMaterial.conductorK[1] = 2.5f;
-    m_rightMaterial.conductorK[2] = 2.1f;
+    const float startX =
+        -horizontalSpacing *
+        float(MaterialSampleCount - 1) *
+        0.5f;
 
-    m_rightMaterial.baseColor[0] = 0.5f;
-    m_rightMaterial.baseColor[1] = 0.5f;
-    m_rightMaterial.baseColor[2] = 0.5f;
+    for(unsigned int i = 0; i < MaterialSampleCount; ++i)
+    {
+        Material& material =
+            m_dielectricMaterials[i];
 
-    RenderObject firstObject{};
-    firstObject.mesh = &m_mesh;
-    firstObject.material = &m_leftMaterial;
-    firstObject.transform.position = Vector3{-1.25f, 0.0f, 0.0f};
+        material.pipeline = &m_pipeline;
+        material.texture = &m_texture;
 
-    m_scene.AddRenderObject(firstObject);
+        material.model =
+            MaterialModel::Dielectric;
 
-    RenderObject secondObject{};
-    secondObject.mesh = &m_mesh;
-    secondObject.material = &m_rightMaterial;
-    secondObject.transform.position = Vector3{1.25f, 0.0f, 0.0f};
+        material.roughness =
+            roughnessValues[i];
 
-    m_scene.AddRenderObject(secondObject);
+        material.ior =
+            1.536f;
+
+        material.baseColor[0] = 0.5f;
+        material.baseColor[1] = 0.5f;
+        material.baseColor[2] = 0.5f;
+
+        RenderObject object{};
+
+        object.mesh =
+            &m_mesh;
+
+        object.material =
+            &material;
+
+        object.transform.position =
+            Vector3{
+                startX +
+                horizontalSpacing * float(i),
+                verticalSpacing * 0.5f,
+                0.0f
+            };
+
+        object.transform.scale =
+            Vector3{
+                0.65f,
+                0.65f,
+                0.65f
+            };
+
+        m_scene.AddRenderObject(
+            object
+        );
+    }
+
+    for(unsigned int i = 0; i < MaterialSampleCount; ++i)
+    {
+        Material& material =
+            m_conductorMaterials[i];
+
+        material.pipeline = &m_pipeline;
+        material.texture = &m_texture;
+
+        material.model =
+            MaterialModel::Conductor;
+
+        material.roughness =
+            roughnessValues[i];
+
+        material.conductorN[0] = 0.2f;
+        material.conductorN[1] = 0.9f;
+        material.conductorN[2] = 1.1f;
+
+        material.conductorK[0] = 3.9f;
+        material.conductorK[1] = 2.5f;
+        material.conductorK[2] = 2.1f;
+
+        material.baseColor[0] = 0.5f;
+        material.baseColor[1] = 0.5f;
+        material.baseColor[2] = 0.5f;
+
+        RenderObject object{};
+
+        object.mesh =
+            &m_mesh;
+
+        object.material =
+            &material;
+
+        object.transform.position =
+            Vector3{
+                startX +
+                horizontalSpacing * float(i),
+                -verticalSpacing * 0.5f,
+                0.0f
+            };
+
+        object.transform.scale =
+            Vector3{
+                0.65f,
+                0.65f,
+                0.65f
+            };
+
+        m_scene.AddRenderObject(
+            object
+        );
+    }
 
     //m_scene.GetDirectionalLight().color = {1.0f, 0.0f, 0.0f};
     DirectionalLight& light = m_scene.GetDirectionalLight();
@@ -149,11 +229,6 @@ void DemoScene::Shutdown()
     Log::Info("DemoScene shutdown: pipeline done.");
 
     Log::Info("DemoScene shutdown: complete.");
-    m_leftMaterial.pipeline = nullptr;
-    m_leftMaterial.texture = nullptr;
-
-    m_rightMaterial.pipeline = nullptr;
-    m_rightMaterial.texture = nullptr;
 }
 
 void DemoScene::SetAspectRatio(float aspectRatio)
@@ -173,8 +248,19 @@ const Scene& DemoScene::GetScene() const
 
 std::vector<Material*> DemoScene::GetMaterials()
 {
-    return {
-        &m_leftMaterial,
-        &m_rightMaterial
-    };
+    std::vector<Material*> materials;
+
+    materials.reserve(
+        MaterialSampleCount * 2
+    );
+
+    for(Material& material : m_dielectricMaterials){
+        materials.push_back(&material);
+    }
+
+    for(Material& material : m_conductorMaterials){
+        materials.push_back(&material);
+    }
+
+    return materials;
 }

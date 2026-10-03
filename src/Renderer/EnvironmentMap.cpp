@@ -88,6 +88,18 @@ bool EnvironmentMap::Initialize(
         return false;
     }
 
+    constexpr unsigned int diffuseIrradianceSize = 32;
+
+    if(!m_diffuseIrradiance.Initialize(device, diffuseIrradianceSize, diffuseIrradianceSize, 6, 1, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET)){
+        Log::Error("Failed to init diffuse irradiance cubemap.");
+        return false;
+    }
+
+    if(!m_diffuseIrradiance.CreateCubeSRV(device, descriptorHeap)){
+        Log::Error("Failed to create diffuse irradiance cubemap SRV.");
+        return false;
+    }
+
     return true;
 }
 
@@ -95,6 +107,7 @@ void EnvironmentMap::Shutdown()
 {
     m_sourceTexture.Shutdown();
     m_cubemap.Shutdown();
+    m_diffuseIrradiance.Shutdown();
 }
 
 Texture& EnvironmentMap::GetSourceTexture()
@@ -115,4 +128,14 @@ Texture& EnvironmentMap::GetCubemap()
 const Texture& EnvironmentMap::GetCubemap() const
 {
     return m_cubemap;
+}
+
+Texture& EnvironmentMap::GetDiffuseIrradiance()
+{
+    return m_diffuseIrradiance;
+}
+
+const Texture& EnvironmentMap::GetDiffuseIrradiance() const
+{
+    return m_diffuseIrradiance;
 }

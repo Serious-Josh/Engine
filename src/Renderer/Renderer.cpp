@@ -125,6 +125,11 @@ bool Renderer::Initialize(void* windowHandle, unsigned int width, unsigned int h
         return false;
     }
 
+    if(!m_diffuseIrradiancePass.Initialize(device, m_shaderLibrary, m_rtvDescriptorHeap, m_environment.GetDiffuseIrradiance())){
+        Log::Error("Failed to init diffuse irradiance pass.");
+        return false;
+    }
+
     if(!m_commandContext.Begin(0)){
         Log::Error(
             "Failed to begin environment preprocessing."
@@ -149,6 +154,8 @@ bool Renderer::Initialize(void* windowHandle, unsigned int width, unsigned int h
         preprocessingCommandList,
         m_environment.GetSourceTexture()
     );
+
+    m_diffuseIrradiancePass.Execute(preprocessingCommandList, m_environment.GetSourceTexture(), m_environment.GetCubemap());
 
     m_equirectangularToCubemapPass.Execute(
         preprocessingCommandList,
@@ -488,7 +495,7 @@ void Renderer::Render(const Scene& scene)
     EndGeometryPass(commandList);
 
 
-    m_deferredLightingPass.Execute(commandList, m_gBuffer, m_materialBuffer, m_environment.GetSourceTexture(), m_environment.GetCubemap(), m_brdfIntegrationLUT, m_sceneColor, reconstructionConstantsAddress, lightConstantsAddress);
+    m_deferredLightingPass.Execute(commandList, m_gBuffer, m_materialBuffer, m_environment.GetSourceTexture(), m_environment.GetCubemap(), m_environment.GetDiffuseIrradiance(), m_brdfIntegrationLUT, m_sceneColor, reconstructionConstantsAddress, lightConstantsAddress);
     m_toneMapPass.Execute(commandList, m_sceneColor, rtvHandle);
 
     m_debugUI.EndFrame(commandList);
@@ -538,6 +545,7 @@ void Renderer::Shutdown()
     m_toneMapPass.Shutdown();
     m_environmentMipPass.Shutdown();
     m_equirectangularToCubemapPass.Shutdown();
+    m_diffuseIrradiancePass.Shutdown();
     m_brdfIntegrationPass.Shutdown();
     
     m_uploadBuffer.Shutdown();

@@ -13,6 +13,7 @@
 #include "Scene/Scene.h"
 
 #include <vector>
+#include <array>
 
 class Shader;
 
@@ -36,8 +37,10 @@ class DemoScene
         Texture m_texture;
         Pipeline m_pipeline;
 
-        Material m_leftMaterial;
-        Material m_rightMaterial;
+        static constexpr unsigned int MaterialSampleCount = 5;
+
+        std::array<Material, MaterialSampleCount> m_dielectricMaterials;
+        std::array<Material, MaterialSampleCount> m_conductorMaterials;
 
         Scene m_scene;
 
