@@ -31,6 +31,8 @@ class DemoScene
         const Scene& GetScene() const;
         std::vector<Material*> GetMaterials();
 
+        const Mesh& GetMesh() const;
+
     private:
         VertexLayout m_vertexLayout;
         Mesh m_mesh;

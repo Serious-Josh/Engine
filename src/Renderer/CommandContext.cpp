@@ -41,6 +41,12 @@ bool CommandContext::Initialize(ID3D12Device* device)
         return false;
     }
 
+    result = m_commandList->QueryInterface(IID_PPV_ARGS(&m_rayTracingCommandList));
+
+    if(FAILED(result)){
+        return false;
+    }
+
     result = m_commandList->Close();
 
     if(FAILED(result))
@@ -83,6 +89,11 @@ void CommandContext::Shutdown()
         );
 
         m_fenceEvent = nullptr;
+    }
+
+    if(m_rayTracingCommandList){
+        m_rayTracingCommandList->Release();
+        m_rayTracingCommandList = nullptr;
     }
 
     if(m_commandList)
@@ -204,4 +215,9 @@ ID3D12GraphicsCommandList* CommandContext::GetCommandList() const
 ID3D12CommandQueue* CommandContext::GetCommandQueue() const
 {
     return m_commandQueue;
+}
+
+ID3D12GraphicsCommandList4* CommandContext::GetRayTracingCommandList() const
+{
+    return m_rayTracingCommandList;
 }

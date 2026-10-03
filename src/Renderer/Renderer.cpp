@@ -390,6 +390,43 @@ bool Renderer::InitializeMaterials(const std::vector<Material*>& materials)
     return true;
 }
 
+bool Renderer::InitializeDemoBLAS(const Mesh& mesh)
+{
+    if(!m_graphicsDevice.SupportsRayTracing()){
+        Log::Error("Cannot initialize demo BLAS: ray tracing is not supported.");
+        return false;
+    }
+
+    if(!m_commandContext.Begin(0)){
+        Log::Error("Failed to begin BLAS construction.");
+        return false;
+    }
+
+    if(!m_demoBLAS.Initialize(
+        m_graphicsDevice.GetRayTracingDevice(),
+        m_commandContext.GetRayTracingCommandList(),
+        mesh))
+    {
+        Log::Error("Failed to initialize demo BLAS.");
+        return false;
+    }
+
+    if(!m_commandContext.End()){
+        Log::Error("Failed to end BLAS construction.");
+        return false;
+    }
+
+    if(!m_commandContext.Execute(0)){
+        Log::Error("Failed to execute BLAS construction.");
+        return false;
+    }
+
+    m_commandContext.WaitForGPU();
+
+    Log::Info("Demo sphere BLAS built successfully.");
+    return true;
+}
+
 
 // --------------
 // Rendering
@@ -580,6 +617,8 @@ void Renderer::Shutdown()
     m_ggxAverageAlbedoPass.Shutdown();
     m_ggxMultiscatterIrradiancePass.Shutdown();
     
+    m_demoBLAS.Shutdown();
+
     m_uploadBuffer.Shutdown();
     m_materialBuffer.Shutdown();
     m_environment.Shutdown();

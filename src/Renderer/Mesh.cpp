@@ -77,3 +77,23 @@ bool Mesh::IsIndexed() const
 {
     return m_indexCount > 0;
 }
+
+D3D12_GPU_VIRTUAL_ADDRESS Mesh::GetVertexBufferAddress() const
+{
+    return m_vertexBuffer.GetGPUAddress();
+}
+
+D3D12_GPU_VIRTUAL_ADDRESS Mesh::GetIndexBufferAddress() const
+{
+    return m_indexBuffer.GetGPUAddress();
+}
+
+UINT Mesh::GetVertexStride() const
+{
+    return m_vertexBufferView.StrideInBytes;
+}
+
+DXGI_FORMAT Mesh::GetIndexFormat() const
+{
+    return m_indexBufferView.Format;
+}

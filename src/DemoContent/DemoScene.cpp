@@ -353,3 +353,8 @@ std::vector<Material*> DemoScene::GetMaterials()
 
     return materials;
 }
+
+const Mesh& DemoScene::GetMesh() const
+{
+    return m_mesh;
+}

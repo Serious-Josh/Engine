@@ -24,6 +24,12 @@ class Mesh
         size_t GetIndexCount() const;
         bool IsIndexed() const;
 
+        D3D12_GPU_VIRTUAL_ADDRESS GetVertexBufferAddress() const;
+        D3D12_GPU_VIRTUAL_ADDRESS GetIndexBufferAddress() const;
+
+        UINT GetVertexStride() const;
+        DXGI_FORMAT GetIndexFormat() const;
+
     private:
         Buffer m_vertexBuffer;
         Buffer m_indexBuffer;

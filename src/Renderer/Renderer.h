@@ -24,6 +24,7 @@
 #include "Renderer/Passes/DiffuseIrradiancePass.h"
 #include "Renderer/Passes/GGXAverageAlbedoPass.h"
 #include "Renderer/Passes/GGXMultiscatterIrradiancePass.h"
+#include "Renderer/RayTracing/BottomLevelAccelerationStructure.h"
 
 #include <d3d12.h>
 #include <filesystem>
@@ -60,6 +61,8 @@ class Renderer
         ShaderLibrary& GetShaderLibrary();
 
         bool InitializeMaterials(const std::vector<Material*>& materials);
+
+        bool InitializeDemoBLAS(const Mesh& mesh);
 
         void WaitForGPU();
     private:
@@ -101,4 +104,6 @@ class Renderer
 
         Texture m_brdfIntegrationLUT;
         Texture m_ggxAverageAlbedoLUT;
+
+        BottomLevelAccelerationStructure m_demoBLAS;
 };
