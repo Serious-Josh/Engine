@@ -32,7 +32,7 @@ class Texture
         unsigned int GetDescriptorIndex() const;
         unsigned int GetUAVIndex() const;
 
-        bool CreateSRV(ID3D12Device* device, DescriptorHeap& descriptorHeap);
+        bool CreateSRV(ID3D12Device* device, DescriptorHeap& descriptorHeap, DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN);
         bool CreateCubeSRV(ID3D12Device* device, DescriptorHeap& descriptorHeap);
         bool CreateUAV(ID3D12Device* device, DescriptorHeap& descriptorHeap);
     

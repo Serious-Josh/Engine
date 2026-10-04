@@ -14,7 +14,7 @@ bool EnvironmentMap::Initialize(
     ResourceUploader& uploader,
     DescriptorHeap& descriptorHeap)
 {
-    ImageData image{};
+    HDRImageData image{};
 
     if(!ImageLoader::LoadHDR(path, image)){
         Log::Error("Failed to load HDR environment.");

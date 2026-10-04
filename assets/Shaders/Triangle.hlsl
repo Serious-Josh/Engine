@@ -40,15 +40,37 @@ cbuffer ObjectConstants : register(b2)
     row_major float4x4 normalMatrix;
 }
 
+SamplerState sampler0 : register(s0);
+
 VSOutput VSMain(VSInput input)
 {
     VSOutput output;
 
-    float4 worldPosition = mul(model, float4(input.position, 1.0f));
-    output.position = mul(viewProjection, worldPosition);
+    float4 worldPosition =
+        mul(
+            model,
+            float4(
+                input.position,
+                1.0f
+            )
+        );
 
-    output.worldNormal = normalize(mul((float3x3)normalMatrix, input.normal));
-    output.uv = input.uv;
+    output.position =
+        mul(
+            viewProjection,
+            worldPosition
+        );
+
+    output.worldNormal =
+        normalize(
+            mul(
+                (float3x3)normalMatrix,
+                input.normal
+            )
+        );
+
+    output.uv =
+        input.uv;
 
     return output;
 }
@@ -57,15 +79,34 @@ PSOutput PSMain(VSOutput input)
 {
     PSOutput output;
 
-    output.material = float4(
-        baseColor,
-        roughness
-    );
+    Texture2D<float4> baseColorTexture =
+        ResourceDescriptorHeap[
+            textureIndex
+        ];
 
-    output.surface = float4(
-        normalize(input.worldNormal),
-        float(materialIndex)
-    );
+    float3 sampledBaseColor =
+        baseColorTexture.Sample(
+            sampler0,
+            input.uv
+        ).rgb;
+
+    float3 finalBaseColor =
+        baseColor *
+        sampledBaseColor;
+
+    output.material =
+        float4(
+            finalBaseColor,
+            roughness
+        );
+
+    output.surface =
+        float4(
+            normalize(
+                input.worldNormal
+            ),
+            float(materialIndex)
+        );
 
     return output;
 }

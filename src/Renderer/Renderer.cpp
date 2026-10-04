@@ -315,7 +315,7 @@ void Renderer::Draw(ID3D12GraphicsCommandList* commandList, const RenderObject& 
     materialConstants.baseColor[1] = object.material->baseColor[1];
     materialConstants.baseColor[2] = object.material->baseColor[2];
 
-    commandList->SetGraphicsRoot32BitConstants(0, 3, &materialConstants, 0);
+    commandList->SetGraphicsRoot32BitConstants(0, 8, &materialConstants, 0);
 
     commandList->SetGraphicsRootConstantBufferView(1, cameraConstantsAddress);
     commandList->SetGraphicsRootConstantBufferView(2, objectConstantsAddress);

@@ -224,7 +224,7 @@ float CalculateSourceMip(
             sampleSolidAngle /
             max(
                 texelSolidAngle,
-                0.000001f
+                1.0e-12f
             )
         );
 
@@ -291,7 +291,7 @@ float4 PSMain(
     );
 
     static const uint SAMPLE_COUNT =
-        1024u;
+        4096u;
 
     float3 irradiance =
         float3(

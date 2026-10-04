@@ -250,7 +250,7 @@ void Texture::Transition(
     currentState = newState;
 }
 
-bool Texture::CreateSRV(ID3D12Device* device, DescriptorHeap& descriptorHeap)
+bool Texture::CreateSRV(ID3D12Device* device, DescriptorHeap& descriptorHeap, DXGI_FORMAT format)
 {
     if(!device || !m_resource){
         return false;
@@ -265,7 +265,7 @@ bool Texture::CreateSRV(ID3D12Device* device, DescriptorHeap& descriptorHeap)
     m_descriptorHeap = &descriptorHeap;
 
     D3D12_SHADER_RESOURCE_VIEW_DESC description{};
-    description.Format = m_resource->GetDesc().Format;
+    description.Format = format == DXGI_FORMAT_UNKNOWN ? m_resource->GetDesc().Format : format;
     description.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     description.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     description.Texture2D.MipLevels = m_resource->GetDesc().MipLevels;

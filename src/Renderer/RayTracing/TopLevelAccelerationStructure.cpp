@@ -3,6 +3,7 @@
 #include "BottomLevelAccelerationStructure.h"
 #include "Math/Matrix4.h"
 
+#include <algorithm>
 #include <cstring>
 #include <vector>
 
@@ -110,7 +111,8 @@ bool TopLevelAccelerationStructure::Initialize(ID3D12Device5* device, ID3D12Grap
         &prebuildInfo);
 
     if(prebuildInfo.ResultDataMaxSizeInBytes == 0 ||
-       prebuildInfo.ScratchDataSizeInBytes == 0)
+        prebuildInfo.ScratchDataSizeInBytes == 0 ||
+        prebuildInfo.UpdateScratchDataSizeInBytes == 0)
     {
         Shutdown();
         return false;
@@ -129,8 +131,7 @@ bool TopLevelAccelerationStructure::Initialize(ID3D12Device5* device, ID3D12Grap
     resourceDescription.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     resourceDescription.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
 
-    resourceDescription.Width = prebuildInfo.ScratchDataSizeInBytes;
-
+    resourceDescription.Width = (std::max)(prebuildInfo.ScratchDataSizeInBytes, prebuildInfo.UpdateScratchDataSizeInBytes);
     HRESULT result = device->CreateCommittedResource(
         &defaultHeapProperties,
         D3D12_HEAP_FLAG_NONE,

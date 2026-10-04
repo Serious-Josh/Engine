@@ -2,6 +2,7 @@
 #include "Renderer/Vertex.h"
 #include "Renderer/Geometry/SphereGenerator.h"
 #include "Core/Log.h"
+#include "Renderer/ImageLoader.h"
 
 #include <cmath>
 
@@ -21,7 +22,7 @@ bool DemoScene::Initialize(ID3D12Device* device, ResourceUploader& uploader, Des
     pipelineDescription.renderTargets.formats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
     pipelineDescription.renderTargets.formats[1] = DXGI_FORMAT_R16G16B16A16_FLOAT;
 
-    pipelineDescription.rootParameters.push_back({RootParameterType::Constants, 0, 3, D3D12_SHADER_VISIBILITY_PIXEL});
+    pipelineDescription.rootParameters.push_back({RootParameterType::Constants, 0, 8, D3D12_SHADER_VISIBILITY_PIXEL});
 
     pipelineDescription.rootParameters.push_back({RootParameterType::ConstantBuffer, 1, 0, D3D12_SHADER_VISIBILITY_VERTEX});
     pipelineDescription.rootParameters.push_back({RootParameterType::ConstantBuffer, 2, 0, D3D12_SHADER_VISIBILITY_VERTEX});
@@ -82,15 +83,16 @@ bool DemoScene::Initialize(ID3D12Device* device, ResourceUploader& uploader, Des
         return false;
     }
 
-    const unsigned int texturePixels[] =
-    {
-        0xFFFF0000,
-        0xFF00FF00,
-        0xFF0000FF,
-        0xFFFFFFFF
-    };
+    const std::filesystem::path texturePath = "assets/Textures/Materials/TestBaseColor.jpg";
 
-    if(!m_texture.Initialize(device, texturePixels, 2, 2, DXGI_FORMAT_B8G8R8A8_UNORM, 4)){
+    ImageData image;
+
+    if(!ImageLoader::Load(texturePath, image)){
+        Log::Error("Failed to load test base color texture.");
+        return false;
+    }
+
+    if(!m_texture.Initialize(device, image.pixels.data(), image.width, image.height, DXGI_FORMAT_R8G8B8A8_UNORM, 4)){
         return false;
     }
 
@@ -102,7 +104,7 @@ bool DemoScene::Initialize(ID3D12Device* device, ResourceUploader& uploader, Des
         return false;
     }
 
-    if(!m_texture.CreateSRV(device, descriptorHeap)){
+    if(!m_texture.CreateSRV(device, descriptorHeap, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB)){
         return false;
     }
 
@@ -369,7 +371,7 @@ bool DemoScene::Initialize(ID3D12Device* device, ResourceUploader& uploader, Des
     return true;
 }
 
-/*
+
 void DemoScene::Update(float deltaTime)
 {
     m_lightAngle += deltaTime * m_lightRotationSpeed;
@@ -388,11 +390,11 @@ void DemoScene::Update(float deltaTime)
     light.direction.y = y / length;
     light.direction.z = z / length;
 }
-*/
+
 
 
 //moving sphere test update
-
+/*
 void DemoScene::Update(float deltaTime)
 {
     m_lightAngle += deltaTime * m_lightRotationSpeed;
@@ -415,6 +417,7 @@ void DemoScene::Update(float deltaTime)
         0,
         transform);
 }
+        */
 
 
 
