@@ -60,10 +60,32 @@ bool RayTracedShadowPass::Initialize(GraphicsDevice& graphicsDevice, ShaderLibra
     pipelineDescription.shaderPath = "RayTracedShadow.hlsl";
     pipelineDescription.rayGenerationShader = L"RayGeneration";
     pipelineDescription.missShaders = {L"Miss"};
+
     pipelineDescription.hitGroups =
     {
         {L"HitGroup", L"ClosestHit", L""}
     };
+
+    pipelineDescription.rootParameters = 
+    {
+        {
+            RootParameterType::ShaderResource,
+            0
+        },
+        {
+            RootParameterType::DescriptorTable,
+            0,
+            0,
+            D3D12_SHADER_VISIBILITY_ALL,
+            DescriptorRangeType::UnorderedAccess,
+            1
+        },
+        {
+            RootParameterType::ConstantBuffer,
+            0
+        }
+    };
+
     pipelineDescription.maxPayloadSize = sizeof(unsigned int);
     pipelineDescription.maxAttributeSize = sizeof(float) * 2;
     pipelineDescription.maxRecursionDepth = 1;
@@ -109,8 +131,8 @@ void RayTracedShadowPass::Execute(
     historyLengthRead.Transition(commandList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     historyLengthWrite.Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
-    commandList->SetPipelineState1(m_pipeline.GetStateObject());
-    commandList->SetComputeRootSignature(m_pipeline.GetGlobalRootSignature());
+    m_pipeline.Bind(commandList);
+    
     commandList->SetComputeRootShaderResourceView(0, rayTracingScene.GetTopLevel().GetGPUAddress());
 
     const D3D12_GPU_DESCRIPTOR_HANDLE outputUAV = descriptorHeap.GetGPUHandle(historyWrite.GetUAVIndex());
@@ -118,9 +140,7 @@ void RayTracedShadowPass::Execute(
     commandList->SetComputeRootDescriptorTable(1, outputUAV);
     commandList->SetComputeRootConstantBufferView(2, shadowConstantsAddress);
 
-    D3D12_DISPATCH_RAYS_DESC dispatchDescription = m_pipeline.CreateDispatchDescription(width, height);
-
-    commandList->DispatchRays(&dispatchDescription);
+    m_pipeline.Dispatch(commandList, width, height);
 
     historyWrite.Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 

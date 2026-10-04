@@ -5,7 +5,15 @@
 enum class RootParameterType
 {
     Constants,
-    ConstantBuffer
+    ConstantBuffer,
+    ShaderResource,
+    DescriptorTable
+};
+
+enum class DescriptorRangeType
+{
+    ShaderResource,
+    UnorderedAccess
 };
 
 struct RootParameterDescription
@@ -16,4 +24,8 @@ struct RootParameterDescription
     unsigned int constantCount = 0;
 
     D3D12_SHADER_VISIBILITY visibility = D3D12_SHADER_VISIBILITY_ALL;
+
+    DescriptorRangeType descriptorRangeType = DescriptorRangeType::ShaderResource;
+
+    unsigned int descriptorCount = 1;
 };

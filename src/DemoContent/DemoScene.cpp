@@ -373,7 +373,6 @@ bool DemoScene::Initialize(ID3D12Device* device, ResourceUploader& uploader, Des
 }
 
 //rotating light
-/*
 void DemoScene::Update(float deltaTime)
 {
     m_lightAngle += deltaTime * m_lightRotationSpeed;
@@ -392,7 +391,6 @@ void DemoScene::Update(float deltaTime)
     light.direction.y = y / length;
     light.direction.z = z / length;
 }
-    */
 
 
 
@@ -423,6 +421,7 @@ void DemoScene::Update(float deltaTime)
 */
 
 //moving camera
+/*
 void DemoScene::Update(float deltaTime)
 {
     m_lightAngle += deltaTime * 0.25f;
@@ -454,6 +453,7 @@ void DemoScene::Update(float deltaTime)
         }
     );
 }
+    */
 
 
 void DemoScene::Shutdown()

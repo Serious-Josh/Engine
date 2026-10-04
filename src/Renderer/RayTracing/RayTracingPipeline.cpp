@@ -13,12 +13,14 @@ bool RayTracingPipeline::Initialize(ID3D12Device5* device, ShaderLibrary& shader
         description.rayGenerationShader.empty() ||
         description.missShaders.empty() ||
         description.hitGroups.empty() ||
+        description.rootParameters.empty() ||
         description.maxPayloadSize == 0 ||
         description.maxAttributeSize == 0 ||
         description.maxRecursionDepth == 0)
     {
         return false;
     }
+
 
     for(const std::wstring& missShader : description.missShaders){
         if(missShader.empty()){
@@ -103,38 +105,76 @@ bool RayTracingPipeline::Initialize(ID3D12Device5* device, ShaderLibrary& shader
     D3D12_RAYTRACING_PIPELINE_CONFIG pipelineConfig{};
     pipelineConfig.MaxTraceRecursionDepth = description.maxRecursionDepth;
 
-    D3D12_ROOT_PARAMETER rootParameters[3]{};
+    std::vector<D3D12_ROOT_PARAMETER> rootParameters;
+    rootParameters.reserve(description.rootParameters.size());
 
-    // t0 - TLAS
-    rootParameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
-    rootParameters[0].Descriptor.ShaderRegister = 0;
-    rootParameters[0].Descriptor.RegisterSpace = 0;
-    rootParameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    std::vector<D3D12_DESCRIPTOR_RANGE> descriptorRanges;
+    descriptorRanges.reserve(description.rootParameters.size());
 
-    D3D12_DESCRIPTOR_RANGE outputUAVRange{};
-    outputUAVRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-    outputUAVRange.NumDescriptors = 1;
-    outputUAVRange.BaseShaderRegister = 0;
-    outputUAVRange.RegisterSpace = 0;
-    outputUAVRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+    for(const RootParameterDescription& parameterDescription : description.rootParameters){
+        D3D12_ROOT_PARAMETER parameter{};
+        parameter.ShaderVisibility = parameterDescription.visibility;
 
-    // u0 - output texture
-    rootParameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        switch(parameterDescription.type){
+            case RootParameterType::Constants:
+            {
+                parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+                parameter.Constants.ShaderRegister = parameterDescription.shaderRegister;
+                parameter.Constants.RegisterSpace = 0;
+                parameter.Constants.Num32BitValues = parameterDescription.constantCount;
+                break;
+            }
+            case RootParameterType::ConstantBuffer:
+            {
+                parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+                parameter.Descriptor.ShaderRegister = parameterDescription.shaderRegister;
+                parameter.Descriptor.RegisterSpace = 0;
+                break;
+            }
+            case RootParameterType::ShaderResource:
+            {
+                parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+                parameter.Descriptor.ShaderRegister = parameterDescription.shaderRegister;
+                parameter.Descriptor.RegisterSpace = 0;
+                break;
+            }
+            case RootParameterType::DescriptorTable:
+            {
+                D3D12_DESCRIPTOR_RANGE range{};
 
-    rootParameters[1].DescriptorTable.NumDescriptorRanges = 1;
-    rootParameters[1].DescriptorTable.pDescriptorRanges = &outputUAVRange;
+                switch(parameterDescription.descriptorRangeType){
+                    case DescriptorRangeType::ShaderResource:
+                    {
+                        range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+                        break;
+                    }
+                    case DescriptorRangeType::UnorderedAccess:
+                    {
+                        range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+                        break;
+                    }
+                }
 
-    rootParameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+                range.NumDescriptors = parameterDescription.descriptorCount;
+                range.BaseShaderRegister = parameterDescription.shaderRegister;
+                range.RegisterSpace = 0;
+                range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+                
+                descriptorRanges.push_back(range);
 
-    // b0 - camera
-    rootParameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
-    rootParameters[2].Descriptor.ShaderRegister = 0;
-    rootParameters[2].Descriptor.RegisterSpace = 0;
-    rootParameters[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+                parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+                parameter.DescriptorTable.NumDescriptorRanges = 1;
+                parameter.DescriptorTable.pDescriptorRanges = &descriptorRanges.back();
+                break;
+            }
+        }
+
+        rootParameters.push_back(parameter);
+    }
 
     D3D12_ROOT_SIGNATURE_DESC rootSignatureDescription{};
-    rootSignatureDescription.NumParameters = 3;
-    rootSignatureDescription.pParameters = rootParameters;
+    rootSignatureDescription.NumParameters = static_cast<UINT>(rootParameters.size());
+    rootSignatureDescription.pParameters = rootParameters.empty() ? nullptr : rootParameters.data();
     rootSignatureDescription.NumStaticSamplers = 0;
     rootSignatureDescription.pStaticSamplers = nullptr;
     rootSignatureDescription.Flags = D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED;
@@ -288,18 +328,22 @@ void RayTracingPipeline::Shutdown()
     }
 }
 
-ID3D12StateObject* RayTracingPipeline::GetStateObject() const
+void RayTracingPipeline::Bind(ID3D12GraphicsCommandList4* commandList) const
 {
-    return m_stateObject;
+    if(!commandList){
+        return;
+    }
+
+    commandList->SetPipelineState1(m_stateObject);
+    commandList->SetComputeRootSignature(m_globalRootSignature);
 }
 
-ID3D12RootSignature* RayTracingPipeline::GetGlobalRootSignature() const
+void RayTracingPipeline::Dispatch(ID3D12GraphicsCommandList4* commandList, unsigned int width, unsigned int height, unsigned int depth) const
 {
-    return m_globalRootSignature;
-}
+    if(!commandList || width == 0 || height == 0 || depth == 0){
+        return;
+    }
 
-D3D12_DISPATCH_RAYS_DESC RayTracingPipeline::CreateDispatchDescription(unsigned int width, unsigned int height, unsigned int depth) const
-{
     D3D12_DISPATCH_RAYS_DESC description{};
     description.RayGenerationShaderRecord.StartAddress = m_rayGenerationShaderTable.GetGPUAddress();
     description.RayGenerationShaderRecord.SizeInBytes = m_rayGenerationShaderTable.GetRecordSize();
@@ -314,5 +358,5 @@ D3D12_DISPATCH_RAYS_DESC RayTracingPipeline::CreateDispatchDescription(unsigned 
     description.Height = height;
     description.Depth = depth;
 
-    return description;
+    commandList->DispatchRays(&description);
 }

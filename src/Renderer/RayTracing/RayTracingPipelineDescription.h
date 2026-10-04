@@ -1,5 +1,7 @@
 #pragma once
 
+#include "Renderer/PipelineDescription.h"
+
 #include <cstdint>
 #include <filesystem>
 #include <string>
@@ -19,6 +21,8 @@ struct RayTracingPipelineDescription
     std::wstring rayGenerationShader;
     std::vector<std::wstring> missShaders;
     std::vector<RayTracingHitGroupDescription> hitGroups;
+
+    std::vector<RootParameterDescription> rootParameters;
 
     std::uint32_t maxPayloadSize = 0;
     std::uint32_t maxAttributeSize = 0;

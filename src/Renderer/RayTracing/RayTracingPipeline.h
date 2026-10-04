@@ -17,14 +17,11 @@ class RayTracingPipeline
         bool Initialize(ID3D12Device5* device, ShaderLibrary& shaderLibrary, const RayTracingPipelineDescription& description);
         void Shutdown();
 
-        ID3D12StateObject* GetStateObject() const;
-        ID3D12RootSignature* GetGlobalRootSignature() const;
-
-        D3D12_DISPATCH_RAYS_DESC CreateDispatchDescription(unsigned int width, unsigned int height, unsigned int depth = 1) const;
+        void Bind(ID3D12GraphicsCommandList4* commandList) const;
+        void Dispatch(ID3D12GraphicsCommandList4* commandList, unsigned int width, unsigned int height, unsigned int depth = 1) const;
 
     private:
         ID3D12StateObject* m_stateObject = nullptr;
-
         ID3D12RootSignature* m_globalRootSignature = nullptr;
 
         ShaderTable m_rayGenerationShaderTable;
