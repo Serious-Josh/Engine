@@ -367,11 +367,13 @@ bool DemoScene::Initialize(ID3D12Device* device, ResourceUploader& uploader, Des
 
     light.intensity = 3.0f;
     light.ambientStrength = 0.0f;
+    light.angularRadius = ToRadians(5.0f);
 
     return true;
 }
 
-
+//rotating light
+/*
 void DemoScene::Update(float deltaTime)
 {
     m_lightAngle += deltaTime * m_lightRotationSpeed;
@@ -390,6 +392,7 @@ void DemoScene::Update(float deltaTime)
     light.direction.y = y / length;
     light.direction.z = z / length;
 }
+    */
 
 
 
@@ -417,9 +420,40 @@ void DemoScene::Update(float deltaTime)
         0,
         transform);
 }
-        */
+*/
 
+//moving camera
+void DemoScene::Update(float deltaTime)
+{
+    m_lightAngle += deltaTime * 0.25f;
 
+    Camera& camera = m_scene.GetCamera();
+
+    constexpr float orbitRadius = 7.0f;
+    constexpr float cameraHeight = 0.825f;
+
+    const float x =
+        std::sin(m_lightAngle) * orbitRadius;
+
+    const float z =
+        -std::cos(m_lightAngle) * orbitRadius;
+
+    camera.SetPosition(
+        Vector3{
+            x,
+            cameraHeight,
+            z
+        }
+    );
+
+    camera.SetTarget(
+        Vector3{
+            0.0f,
+            cameraHeight,
+            0.0f
+        }
+    );
+}
 
 
 void DemoScene::Shutdown()

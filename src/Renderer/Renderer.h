@@ -16,6 +16,8 @@
 #include "Debug/DebugUI.h"
 #include "Renderer/EnvironmentMap.h"
 #include "RenderTarget.h"
+#include "Math/Vector3.h"
+#include "Math/Matrix4.h"
 #include "Renderer/Passes/ToneMapPass.h"
 #include "Renderer/Passes/DeferredLightingPass.h"
 #include "Renderer/Passes/EquirectangularToCubemapPass.h"
@@ -26,6 +28,7 @@
 #include "Renderer/Passes/GGXMultiscatterIrradiancePass.h"
 #include "Renderer/RayTracing/RayTracingSceneResources.h"
 #include "Renderer/Passes/RayTracedShadowPass.h"
+#include "Passes/ShadowDenoisePass.h"
 
 #include <d3d12.h>
 #include <filesystem>
@@ -89,6 +92,7 @@ class Renderer
         DiffuseIrradiancePass m_diffuseIrradiancePass;
         GGXMultiscatterIrradiancePass m_ggxMultiscatterIrradiancePass;
         RayTracedShadowPass m_rayTracedShadowPass;
+        ShadowDenoisePass m_shadowDenoisePass;
 
         ShaderLibrary m_shaderLibrary;
 
@@ -96,6 +100,7 @@ class Renderer
 
         unsigned int m_width = 0;
         unsigned int m_height = 0;
+        unsigned int m_shadowSampleIndex = 0;
 
         GBuffer m_gBuffer;
         UploadBuffer m_uploadBuffer;
@@ -108,4 +113,10 @@ class Renderer
         Texture m_ggxAverageAlbedoLUT;
 
         RayTracingSceneResources m_rayTracingScene;
+
+        Matrix4 m_previousViewProjection{};
+        bool m_hasPreviousViewProjection = false;
+
+        Vector3 m_previousShadowLightDirection{};
+        bool m_hasPreviousShadowLightDirection = false;
 };

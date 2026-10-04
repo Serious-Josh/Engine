@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Math/Vector3.h"
+#include "Math/Math.h"
 
 struct DirectionalLight
 {
@@ -9,4 +10,6 @@ struct DirectionalLight
 
     Vector3 color{1.0f, 1.0f, 1.0f};
     float ambientStrength = 0.15f;
+
+    float angularRadius = ToRadians(0.27f);
 };

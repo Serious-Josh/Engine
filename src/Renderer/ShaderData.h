@@ -35,11 +35,23 @@ struct ReconstructionConstants
 struct ShadowConstants
 {
     Matrix4 inverseViewProjection;
+    Matrix4 previousViewProjection;
+    Matrix4 previousInverseViewProjection;
 
     float lightDirection[3];
     unsigned int depthIndex;
 
     unsigned int surfaceIndex;
+    float lightAngularRadius;
+    unsigned int frameIndex;
+    unsigned int historyIndex;
+
+    unsigned int previousDepthIndex;
+    unsigned int outputDepthIndex;
+    unsigned int previousHistoryLengthIndex;
+    unsigned int outputHistoryLengthIndex;
+
+    unsigned int accumulatedFrameCount;
     float padding[3];
 };
 
@@ -75,4 +87,4 @@ static_assert(sizeof(CameraConstants) == 64);
 static_assert(sizeof(ObjectConstants) == 128);
 static_assert(sizeof(ReconstructionConstants) == 80);
 static_assert(sizeof(GPUMaterial) == 64);
-static_assert(sizeof(ShadowConstants) == 96);
+static_assert(sizeof(ShadowConstants) == 256);

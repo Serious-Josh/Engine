@@ -108,6 +108,11 @@ bool Renderer::Initialize(void* windowHandle, unsigned int width, unsigned int h
         return false;
     }
 
+    if(!m_shadowDenoisePass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap, m_width, m_height)){
+        Log::Error("Failed to init shadow denoise pass.");
+        return false;
+    }
+
     const std::filesystem::path environmentPath =
     assetRoot / "Textures" / "Environment" / "TestEnvironment.hdr";
 
@@ -276,6 +281,8 @@ void Renderer::Resize(unsigned int width, unsigned int height)
         Log::Error("Failed to resize ray traced shadow pass.");
         return;
     }
+
+    m_shadowDenoisePass.Resize(m_graphicsDevice, m_resourceDescriptorHeap, width, height);
 
     m_sceneColor.Shutdown();
 
@@ -511,13 +518,47 @@ void Renderer::Render(const Scene& scene)
         return;
     }
 
+    const Vector3 currentLightDirection = light.direction.Normalized();
+
+    if(m_hasPreviousShadowLightDirection){
+        const float directionDifference = (currentLightDirection - m_previousShadowLightDirection).Length();
+
+        if(directionDifference > 0.0001f){
+            m_rayTracedShadowPass.ResetHistory();
+        }
+    }
+
+    m_previousShadowLightDirection = currentLightDirection;
+    m_hasPreviousShadowLightDirection = true;
+
     ShadowConstants shadowConstants{};
     shadowConstants.inverseViewProjection = reconstructionConstants.inverseViewProjection;
+
+    if(m_hasPreviousViewProjection){
+        shadowConstants.previousViewProjection = m_previousViewProjection;
+        shadowConstants.previousInverseViewProjection = m_previousViewProjection.Inverse();
+    }
+    else{
+        shadowConstants.previousViewProjection = cameraConstants.viewProjection;
+        shadowConstants.previousInverseViewProjection = reconstructionConstants.inverseViewProjection;
+    }
+
     shadowConstants.lightDirection[0] = lightDirection.x;
     shadowConstants.lightDirection[1] = lightDirection.y;
     shadowConstants.lightDirection[2] = lightDirection.z;
     shadowConstants.depthIndex = m_gBuffer.GetDepth().GetSRVIndex();
     shadowConstants.surfaceIndex = m_gBuffer.GetSurface().GetSRVIndex();
+    shadowConstants.lightAngularRadius = light.angularRadius;
+    shadowConstants.frameIndex = m_shadowSampleIndex++;
+    shadowConstants.historyIndex = m_rayTracedShadowPass.GetVisibilityTexture().GetDescriptorIndex();
+    shadowConstants.previousDepthIndex = m_rayTracedShadowPass.GetPreviousDepthIndex();
+    shadowConstants.outputDepthIndex = m_rayTracedShadowPass.GetOutputDepthIndex();
+    shadowConstants.previousHistoryLengthIndex =m_rayTracedShadowPass.GetPreviousHistoryLengthIndex();
+    shadowConstants.outputHistoryLengthIndex = m_rayTracedShadowPass.GetOutputHistoryLengthIndex();
+    shadowConstants.accumulatedFrameCount = m_rayTracedShadowPass.GetAccumulatedFrameCount();
+
+    m_previousViewProjection = cameraConstants.viewProjection;
+    m_hasPreviousViewProjection = true;
 
     D3D12_GPU_VIRTUAL_ADDRESS shadowConstantsAddress = m_uploadBuffer.Allocate(&shadowConstants, sizeof(ShadowConstants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
 
@@ -588,6 +629,7 @@ void Renderer::Render(const Scene& scene)
         m_height
     );
 
+    m_shadowDenoisePass.Execute(commandList, m_rayTracedShadowPass.GetVisibilityTexture(), m_gBuffer, m_uploadBuffer, reconstructionConstants.inverseViewProjection, m_width, m_height);
 
     m_deferredLightingPass.Execute(
         commandList,
@@ -599,7 +641,7 @@ void Renderer::Render(const Scene& scene)
         m_brdfIntegrationLUT,
         m_ggxAverageAlbedoLUT,
         m_environment.GetGGXMultiscatterIrradiance(),
-        m_rayTracedShadowPass.GetVisibilityTexture(),
+        m_shadowDenoisePass.GetFilteredVisibilityTexture(),
         m_sceneColor,
         reconstructionConstantsAddress,
         lightConstantsAddress
@@ -669,6 +711,7 @@ void Renderer::Shutdown()
     m_ggxAverageAlbedoPass.Shutdown();
     m_ggxMultiscatterIrradiancePass.Shutdown();
     m_rayTracedShadowPass.Shutdown();
+    m_shadowDenoisePass.Shutdown();
 
     m_rayTracingScene.Shutdown();
 

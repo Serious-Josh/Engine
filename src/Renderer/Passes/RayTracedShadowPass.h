@@ -26,7 +26,20 @@ class RayTracedShadowPass
         Texture& GetVisibilityTexture();
         const Texture& GetVisibilityTexture() const;
 
+        unsigned int GetAccumulatedFrameCount() const;
+        void ResetHistory();
+
+        unsigned int GetPreviousDepthIndex() const;
+        unsigned int GetOutputDepthIndex() const;    
+        unsigned int GetPreviousHistoryLengthIndex() const;
+    unsigned int GetOutputHistoryLengthIndex() const;  
+
     private:
-        Texture m_visibilityTexture;
+        Texture m_historyTextures[2];
+        Texture m_depthHistoryTextures[2];
+        Texture m_historyLengthTextures[2];
         RayTracingPipeline m_pipeline;
+
+        unsigned int m_historyReadIndex = 0;
+        unsigned int m_accumulatedFrameCount = 0;
 };

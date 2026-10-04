@@ -6,7 +6,8 @@
 enum class ShaderStage
 {
     Vertex,
-    Pixel
+    Pixel,
+    Compute
 };
 
 struct ShaderDescription

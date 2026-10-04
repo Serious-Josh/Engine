@@ -151,6 +151,8 @@ const wchar_t* ShaderCompiler::GetShaderProfile(ShaderStage stage) const
             return L"vs_6_6";
         case ShaderStage::Pixel:
             return L"ps_6_6";
+        case ShaderStage::Compute:
+            return L"cs_6_6";
     }
 
     return nullptr;

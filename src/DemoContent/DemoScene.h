@@ -52,5 +52,5 @@ class DemoScene
 
         float m_lightAngle = 0.0f;
         float m_lightRotationSpeed = 1.0f;
-        float m_lightVerticalAngle = ToRadians(15); // 15 degrees
+        float m_lightVerticalAngle = ToRadians(50); // 15 degrees
 };
