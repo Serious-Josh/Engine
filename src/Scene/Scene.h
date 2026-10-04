@@ -4,7 +4,10 @@
 #include "DirectionalLight.h"
 #include "Renderer/RenderObject.h"
 
+#include <cstddef>
 #include <vector>
+
+using RenderObjectID = std::size_t;
 
 class Scene
 {
@@ -14,7 +17,12 @@ class Scene
         Scene(const Scene&) = delete;
         Scene& operator=(const Scene&) = delete;
 
-        void AddRenderObject(const RenderObject& object);
+        RenderObjectID AddRenderObject(const RenderObject& object);
+
+        void SetRenderObjectTransform(RenderObjectID id, const Transform& transform);
+
+        const std::vector<RenderObjectID>& GetChangedTransforms() const;
+        void ClearChangedTransforms();
 
         std::vector<RenderObject>& GetRenderObjects();
         const std::vector<RenderObject>& GetRenderObjects() const;
@@ -27,6 +35,8 @@ class Scene
 
     private:
         std::vector<RenderObject> m_renderObjects;
+        std::vector<RenderObjectID> m_changedTransforms;
+        std::vector<bool> m_transformDirty;
 
         Camera m_camera;
         DirectionalLight m_directionalLight;

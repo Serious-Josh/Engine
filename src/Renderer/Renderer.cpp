@@ -449,6 +449,13 @@ void Renderer::Render(const Scene& scene)
 
     m_uploadBuffer.Reset(frameIndex);
 
+    if(!scene.GetChangedTransforms().empty()){
+        if(!m_rayTracingScene.Update(m_commandContext.GetRayTracingCommandList(), scene)){
+            Log::Error("Failed to update ray tracing scene.");
+            return;
+        }
+    }
+
     const Camera& camera = scene.GetCamera();
     const DirectionalLight& light = scene.GetDirectionalLight();
 

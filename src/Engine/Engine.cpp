@@ -151,8 +151,9 @@ void Engine::Frame()
         return;
     }
 
-    m_renderer.Render(m_demoScene.GetScene());
     m_demoScene.Update(m_time.GetDeltaTime());
+    m_renderer.Render(m_demoScene.GetScene());
+    m_demoScene.GetScene().ClearChangedTransforms();
 }
 
 void Engine::Shutdown()

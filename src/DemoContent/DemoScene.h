@@ -1,5 +1,6 @@
 #pragma once
 
+#include "Math/Math.h"
 #include "Renderer/Mesh.h"
 #include "Renderer/Texture.h"
 #include "Renderer/VertexLayout.h"
@@ -50,6 +51,6 @@ class DemoScene
         Scene m_scene;
 
         float m_lightAngle = 0.0f;
-        float m_lightRotationSpeed = 0.5f;
-        float m_lightVerticalAngle = 0.261799f; // 15 degrees
+        float m_lightRotationSpeed = 1.0f;
+        float m_lightVerticalAngle = ToRadians(15); // 15 degrees
 };

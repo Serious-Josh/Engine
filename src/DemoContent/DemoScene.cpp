@@ -388,6 +388,32 @@ void DemoScene::Update(float deltaTime)
     light.direction.z = z / length;
 }
 
+//moving sphere test update
+/*
+void DemoScene::Update(float deltaTime)
+{
+    m_lightAngle += deltaTime * m_lightRotationSpeed;
+
+    const std::vector<RenderObject>& renderObjects =
+        m_scene.GetRenderObjects();
+
+    if(renderObjects.empty()){
+        return;
+    }
+
+    Transform transform =
+        renderObjects[0].transform;
+
+    transform.position.y =
+        0.825f +
+        std::sin(m_lightAngle) * 0.75f;
+
+    m_scene.SetRenderObjectTransform(
+        0,
+        transform);
+}
+*/
+
 void DemoScene::Shutdown()
 {
     m_scene.GetRenderObjects().clear();

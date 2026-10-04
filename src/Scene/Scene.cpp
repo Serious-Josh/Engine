@@ -1,8 +1,41 @@
 #include "Scene.h"
 
-void Scene::AddRenderObject(const RenderObject& object)
+RenderObjectID Scene::AddRenderObject(const RenderObject& object)
 {
+    const RenderObjectID id = m_renderObjects.size();
+
     m_renderObjects.push_back(object);
+    m_transformDirty.push_back(false);
+
+    return id;
+}
+
+void Scene::SetRenderObjectTransform(RenderObjectID id, const Transform& transform)
+{
+    if(id >= m_renderObjects.size()){
+        return;
+    }
+
+    m_renderObjects[id].transform = transform;
+
+    if(!m_transformDirty[id]){
+        m_transformDirty[id] = true;
+        m_changedTransforms.push_back(id);
+    }
+}
+
+const std::vector<RenderObjectID>& Scene::GetChangedTransforms() const
+{
+    return m_changedTransforms;
+}
+
+void Scene::ClearChangedTransforms()
+{
+    for(RenderObjectID id : m_changedTransforms){
+        m_transformDirty[id] = false;
+    }
+
+    m_changedTransforms.clear();
 }
 
 std::vector<RenderObject>& Scene::GetRenderObjects()
