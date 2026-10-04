@@ -36,6 +36,7 @@ class DemoScene
     private:
         VertexLayout m_vertexLayout;
         Mesh m_mesh;
+        Mesh m_planeMesh;
         Texture m_texture;
         Pipeline m_pipeline;
 
@@ -44,6 +45,7 @@ class DemoScene
         std::array<Material, MaterialSampleCount> m_dielectricMaterials;
         std::array<Material, MaterialSampleCount> m_conductorMaterials;
         std::array<Material, MaterialSampleCount> m_metallicRoughnessMaterials;
+        Material m_floorMaterial;
 
         Scene m_scene;
 

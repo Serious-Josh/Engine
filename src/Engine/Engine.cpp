@@ -64,7 +64,7 @@ bool Engine::Initialize()
 
     Log::Info("Demo scene initialization complete.");
 
-    if(!m_renderer.InitializeRayTracingScene(m_demoScene.GetMesh(), m_demoScene.GetScene())){
+    if(!m_renderer.InitializeRayTracingScene(m_demoScene.GetScene())){
         Log::Error("Failed to init demo ray tracing.");
         return false;
     }

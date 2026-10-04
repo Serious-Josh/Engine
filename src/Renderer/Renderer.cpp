@@ -401,7 +401,7 @@ bool Renderer::InitializeMaterials(const std::vector<Material*>& materials)
     return true;
 }
 
-bool Renderer::InitializeRayTracingScene(const Mesh& mesh, const Scene& scene)
+bool Renderer::InitializeRayTracingScene(const Scene& scene)
 {
     if(!m_graphicsDevice.SupportsRayTracing()){
         Log::Error("Cannot initialize ray tracing scene: ray tracing is not supported.");
@@ -413,7 +413,7 @@ bool Renderer::InitializeRayTracingScene(const Mesh& mesh, const Scene& scene)
         return false;
     }
 
-    if(!m_rayTracingScene.Initialize(m_graphicsDevice.GetRayTracingDevice(), m_commandContext.GetRayTracingCommandList(), mesh, scene)){
+    if(!m_rayTracingScene.Initialize(m_graphicsDevice.GetRayTracingDevice(), m_commandContext.GetRayTracingCommandList(), scene)){
         Log::Error("Failed to init ray tracing scene resources.");
         return false;
     }

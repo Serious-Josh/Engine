@@ -63,7 +63,7 @@ class Renderer
 
         bool InitializeMaterials(const std::vector<Material*>& materials);
 
-        bool InitializeRayTracingScene(const Mesh& mesh, const Scene& scene);
+        bool InitializeRayTracingScene(const Scene& scene);
 
         void WaitForGPU();
     private:

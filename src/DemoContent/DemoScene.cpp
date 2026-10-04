@@ -40,6 +40,48 @@ bool DemoScene::Initialize(ID3D12Device* device, ResourceUploader& uploader, Des
         return false;
     }
 
+    const Vertex planeVertices[] =
+    {
+        {
+            {-1.0f, 0.0f, -1.0f},
+            {0.0f, 1.0f, 0.0f},
+            {0.0f, 0.0f}
+        },
+        {
+            {-1.0f, 0.0f, 1.0f},
+            {0.0f, 1.0f, 0.0f},
+            {0.0f, 1.0f}
+        },
+        {
+            {1.0f, 0.0f, 1.0f},
+            {0.0f, 1.0f, 0.0f},
+            {1.0f, 1.0f}
+        },
+        {
+            {1.0f, 0.0f, -1.0f},
+            {0.0f, 1.0f, 0.0f},
+            {1.0f, 0.0f}
+        }
+    };
+
+    const unsigned int planeIndices[] =
+    {
+        0, 1, 2,
+        0, 2, 3
+    };
+
+    if(!m_planeMesh.Initialize(
+        device,
+        uploader,
+        planeVertices,
+        4,
+        m_vertexLayout,
+        planeIndices,
+        6))
+    {
+        return false;
+    }
+
     const unsigned int texturePixels[] =
     {
         0xFFFF0000,
@@ -251,6 +293,55 @@ bool DemoScene::Initialize(ID3D12Device* device, ResourceUploader& uploader, Des
         );
     }
 
+    m_floorMaterial.pipeline =
+        &m_pipeline;
+
+    m_floorMaterial.texture =
+        &m_texture;
+
+    m_floorMaterial.model =
+        MaterialModel::Dielectric;
+
+    m_floorMaterial.roughness =
+        0.7f;
+
+    m_floorMaterial.ior =
+        1.5f;
+
+    m_floorMaterial.baseColor[0] =
+        0.35f;
+
+    m_floorMaterial.baseColor[1] =
+        0.35f;
+
+    m_floorMaterial.baseColor[2] =
+        0.35f;
+
+    RenderObject floor{};
+
+    floor.mesh =
+        &m_planeMesh;
+
+    floor.material =
+        &m_floorMaterial;
+
+    floor.transform.position =
+        Vector3{
+            0.0f,
+            -1.5f,
+            0.0f
+        };
+
+    floor.transform.scale =
+        Vector3{
+            5.0f,
+            1.0f,
+            5.0f
+        };
+
+    m_scene.AddRenderObject(
+        floor);
+
     Camera& camera = m_scene.GetCamera();
 
     camera.SetPosition(
@@ -307,6 +398,7 @@ void DemoScene::Shutdown()
 
     Log::Info("DemoScene shutdown: mesh...");
     m_mesh.Shutdown();
+    m_planeMesh.Shutdown();
     Log::Info("DemoScene shutdown: mesh done.");
 
     Log::Info("DemoScene shutdown: pipeline...");
@@ -336,8 +428,7 @@ std::vector<Material*> DemoScene::GetMaterials()
     std::vector<Material*> materials;
 
     materials.reserve(
-        MaterialSampleCount * 3
-    );
+        MaterialSampleCount * 3 + 1);
 
     for(Material& material : m_dielectricMaterials){
         materials.push_back(&material);
@@ -350,6 +441,8 @@ std::vector<Material*> DemoScene::GetMaterials()
     for(Material& material : m_metallicRoughnessMaterials){
         materials.push_back(&material);
     }
+
+    materials.push_back(&m_floorMaterial);
 
     return materials;
 }
