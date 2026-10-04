@@ -151,8 +151,16 @@ void Engine::Frame()
         return;
     }
 
+    DebugUI& debugUI = m_renderer.GetDebugUI();
+
+    debugUI.BeginFrame();
+    debugUI.DrawPerformanceWindow();
+
+    m_editor.Draw(m_demoScene);
+
     m_demoScene.Update(m_time.GetDeltaTime());
     m_renderer.Render(m_demoScene.GetScene());
+
     m_demoScene.GetScene().ClearChangedTransforms();
 }
 

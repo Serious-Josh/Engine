@@ -6,6 +6,7 @@
 #include "Platform/Windows/WindowsWindow.h"
 #include "Platform/WindowProperties.h"
 #include "Renderer/Renderer.h"
+#include "Editor/Editor.h"
 
 enum class EngineState
 {
@@ -36,6 +37,7 @@ private:
     Renderer m_renderer;
 
     DemoScene m_demoScene;
+    Editor m_editor;
 
     EngineState m_state = EngineState::Uninitialized;
 };

@@ -18,6 +18,14 @@
 
 class Shader;
 
+enum class DemoUpdateMode
+{
+    None,
+    RotateLight,
+    MoveSphere,
+    OrbitCamera
+};
+
 class DemoScene
 {
     public:
@@ -34,7 +42,24 @@ class DemoScene
 
         const Mesh& GetMesh() const;
 
+        void ResetCamera();
+        void ResetDirectionalLight();
+
+        void SetUpdateMode(DemoUpdateMode mode);
+        DemoUpdateMode GetUpdateMode() const;
+
+        void SetLightRotationSpeed(float speed);
+        float GetLightRotationSpeed() const;
+        void SetCameraOrbitSpeed(float speed);
+        float GetCameraOrbitSpeed() const;
+        void SetLightVerticalAngle(float angle);
+        float GetLightVerticalAngle() const;
+
     private:
+        void UpdateRotatingLight(float deltaTime);
+        void UpdateMovingSphere(float deltaTime);
+        void UpdateOrbitingCamera(float deltaTime);
+
         VertexLayout m_vertexLayout;
         Mesh m_mesh;
         Mesh m_planeMesh;
@@ -52,5 +77,9 @@ class DemoScene
 
         float m_lightAngle = 0.0f;
         float m_lightRotationSpeed = 1.0f;
-        float m_lightVerticalAngle = ToRadians(50); // 15 degrees
+        float m_cameraOrbitAngle = 0.0f;
+        float m_cameraOrbitSpeed = 0.25f;
+        float m_lightVerticalAngle = ToRadians(50);
+
+        DemoUpdateMode m_updateMode = DemoUpdateMode::None;
 };

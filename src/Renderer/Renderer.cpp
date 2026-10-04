@@ -445,8 +445,6 @@ bool Renderer::InitializeRayTracingScene(const Scene& scene)
 
 void Renderer::Render(const Scene& scene)
 {
-    m_debugUI.BeginFrame();
-
     const unsigned int frameIndex = m_swapChain.GetCurrentBackBufferIndex();
 
     if(!m_commandContext.Begin(frameIndex)){
@@ -756,4 +754,9 @@ DescriptorHeap& Renderer::GetResourceDescriptorHeap()
 ShaderLibrary& Renderer::GetShaderLibrary()
 {
     return m_shaderLibrary;
+}
+
+DebugUI& Renderer::GetDebugUI()
+{
+    return m_debugUI;
 }

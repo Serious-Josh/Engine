@@ -24,6 +24,7 @@ class DebugUI
         void Shutdown();
 
         void BeginFrame();
+        void DrawPerformanceWindow();
         void EndFrame(ID3D12GraphicsCommandList* commandList);
 
         void SetTLASUpdated(bool updated);

@@ -3,6 +3,7 @@
 #include "Renderer/Geometry/SphereGenerator.h"
 #include "Core/Log.h"
 #include "Renderer/ImageLoader.h"
+#include "imgui.h"
 
 #include <cmath>
 
@@ -344,36 +345,31 @@ bool DemoScene::Initialize(ID3D12Device* device, ResourceUploader& uploader, Des
     m_scene.AddRenderObject(
         floor);
 
-    Camera& camera = m_scene.GetCamera();
 
-    camera.SetPosition(
-        Vector3{
-            0.0f,
-            0.825f,
-            -7.0f
-        }
-    );
-
-    camera.SetTarget(
-        Vector3{
-            0.0f,
-            0.825f,
-            0.0f
-        }
-    );
-
-    //m_scene.GetDirectionalLight().color = {1.0f, 0.0f, 0.0f};
-    DirectionalLight& light = m_scene.GetDirectionalLight();
-
-    light.intensity = 3.0f;
-    light.ambientStrength = 0.0f;
-    light.angularRadius = ToRadians(5.0f);
+    ResetCamera();
+    ResetDirectionalLight();
 
     return true;
 }
 
-//rotating light
 void DemoScene::Update(float deltaTime)
+{
+    switch(m_updateMode){
+        case DemoUpdateMode::None:
+            break;
+        case DemoUpdateMode::RotateLight:
+            UpdateRotatingLight(deltaTime);
+            break;
+        case DemoUpdateMode::MoveSphere:
+            UpdateMovingSphere(deltaTime);
+            break;
+        case DemoUpdateMode::OrbitCamera:
+            UpdateOrbitingCamera(deltaTime);
+            break;
+    }
+}
+
+void DemoScene::UpdateRotatingLight(float deltaTime)
 {
     m_lightAngle += deltaTime * m_lightRotationSpeed;
 
@@ -392,11 +388,7 @@ void DemoScene::Update(float deltaTime)
     light.direction.z = z / length;
 }
 
-
-
-//moving sphere test update
-/*
-void DemoScene::Update(float deltaTime)
+void DemoScene::UpdateMovingSphere(float deltaTime)
 {
     m_lightAngle += deltaTime * m_lightRotationSpeed;
 
@@ -418,13 +410,11 @@ void DemoScene::Update(float deltaTime)
         0,
         transform);
 }
-*/
 
-//moving camera
-/*
-void DemoScene::Update(float deltaTime)
+void DemoScene::UpdateOrbitingCamera(float deltaTime)
 {
-    m_lightAngle += deltaTime * 0.25f;
+    m_cameraOrbitAngle += deltaTime * m_cameraOrbitSpeed;
+    const float angle = m_cameraOrbitAngle;
 
     Camera& camera = m_scene.GetCamera();
 
@@ -432,10 +422,10 @@ void DemoScene::Update(float deltaTime)
     constexpr float cameraHeight = 0.825f;
 
     const float x =
-        std::sin(m_lightAngle) * orbitRadius;
+        std::sin(angle) * orbitRadius;
 
     const float z =
-        -std::cos(m_lightAngle) * orbitRadius;
+        -std::cos(angle) * orbitRadius;
 
     camera.SetPosition(
         Vector3{
@@ -453,8 +443,44 @@ void DemoScene::Update(float deltaTime)
         }
     );
 }
-    */
 
+void DemoScene::ResetCamera()
+{
+    Camera& camera = m_scene.GetCamera();
+
+    camera.SetPosition(
+        Vector3{
+            0.0f,
+            0.825f,
+            -7.0f
+        }
+    );
+
+    camera.SetTarget(
+        Vector3{
+            0.0f,
+            0.825f,
+            0.0f
+        }
+    );
+}
+
+void DemoScene::ResetDirectionalLight()
+{
+    DirectionalLight& light =
+        m_scene.GetDirectionalLight();
+
+    light.direction =
+        Vector3{
+            0.0f,
+            -1.0f,
+            0.0f
+        };
+
+    light.intensity = 3.0f;
+    light.ambientStrength = 0.0f;
+    light.angularRadius = ToRadians(5.0f);
+}
 
 void DemoScene::Shutdown()
 {
@@ -518,4 +544,44 @@ std::vector<Material*> DemoScene::GetMaterials()
 const Mesh& DemoScene::GetMesh() const
 {
     return m_mesh;
+}
+
+void DemoScene::SetUpdateMode(DemoUpdateMode mode)
+{
+    m_updateMode = mode;
+}
+
+DemoUpdateMode DemoScene::GetUpdateMode() const
+{
+    return m_updateMode;
+}
+
+void DemoScene::SetLightRotationSpeed(float speed)
+{
+    m_lightRotationSpeed = speed;
+}
+
+float DemoScene::GetLightRotationSpeed() const
+{
+    return m_lightRotationSpeed;
+}
+
+void DemoScene::SetCameraOrbitSpeed(float speed)
+{
+    m_cameraOrbitSpeed = speed;
+}
+
+float DemoScene::GetCameraOrbitSpeed() const
+{
+    return m_cameraOrbitSpeed;
+}
+
+void DemoScene::SetLightVerticalAngle(float angle)
+{
+    m_lightVerticalAngle = angle;
+}
+
+float DemoScene::GetLightVerticalAngle() const
+{
+    return m_lightVerticalAngle;
 }

@@ -63,6 +63,7 @@ class Renderer
         ResourceUploader& GetResourceUploader();
         DescriptorHeap& GetResourceDescriptorHeap();
         ShaderLibrary& GetShaderLibrary();
+        DebugUI& GetDebugUI();
 
         bool InitializeMaterials(const std::vector<Material*>& materials);
 

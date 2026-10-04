@@ -53,6 +53,11 @@ class Camera
             return m_position;
         }
 
+        const Vector3& GetTarget() const
+        {
+            return m_target;
+        }
+
     private:
         Vector3 m_position{0.0f, 0.0f, -5.0f};
         Vector3 m_target{0.0f, 0.0f, 0.0f};

@@ -67,6 +67,7 @@ add_executable(Engine
     src/Renderer/Passes/RayTracedShadowPass.cpp
     src/Renderer/Passes/ShadowDenoisePass.cpp
     src/Renderer/ComputePipeline.cpp
+    src/Editor/Editor.cpp
 )
 
 add_custom_command(
