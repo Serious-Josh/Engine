@@ -1,50 +1,46 @@
 #include "TopLevelAccelerationStructure.h"
 
 #include "BottomLevelAccelerationStructure.h"
-#include "Scene/Scene.h"
-#include "Renderer/RenderObject.h"
 #include "Math/Matrix4.h"
 
 #include <cstring>
 #include <vector>
 
-bool TopLevelAccelerationStructure::Initialize(
-    ID3D12Device5* device,
-    ID3D12GraphicsCommandList4* commandList,
-    const Scene& scene,
-    const BottomLevelAccelerationStructure& blas)
+bool TopLevelAccelerationStructure::Initialize(ID3D12Device5* device, ID3D12GraphicsCommandList4* commandList, const RayTracingTopLevelDescription& description, const std::vector<const BottomLevelAccelerationStructure*>& bottomLevelStructures)
 {
-    if(!device || !commandList || blas.GetGPUAddress() == 0){
+    if(!device || !commandList || description.instances.empty() || bottomLevelStructures.empty()){
         return false;
     }
 
-    const std::vector<RenderObject>& renderObjects = scene.GetRenderObjects();
+    std::vector<D3D12_RAYTRACING_INSTANCE_DESC> instanceDescriptions(description.instances.size());
 
-    if(renderObjects.empty()){
-        return false;
-    }
+    for(std::size_t i = 0; i < description.instances.size(); ++i){
+        const RayTracingInstanceDescription& sourceInstance = description.instances[i];
 
-    std::vector<D3D12_RAYTRACING_INSTANCE_DESC> instanceDescriptions(
-        renderObjects.size());
+        if(sourceInstance.bottomLevelIndex >= bottomLevelStructures.size()){
+            return false;
+        }
 
-    for(std::size_t i = 0; i < renderObjects.size(); ++i){
-        const RenderObject& object = renderObjects[i];
+        const BottomLevelAccelerationStructure* bottomLevel = bottomLevelStructures[sourceInstance.bottomLevelIndex];
+
+        if(!bottomLevel || bottomLevel->GetGPUAddress() == 0){
+            return false;
+        }
 
         D3D12_RAYTRACING_INSTANCE_DESC& instance = instanceDescriptions[i];
 
-        const Matrix4 modelMatrix = object.transform.GetModelMatrix();
-
         for(std::size_t row = 0; row < 3; ++row){
             for(std::size_t column = 0; column < 4; ++column){
-                instance.Transform[row][column] = modelMatrix[row][column];
+                instance.Transform[row][column] = sourceInstance.transform[row][column];
             }
         }
 
-        instance.InstanceID = static_cast<UINT>(i);
-        instance.InstanceMask = 0xFF;
+        instance.InstanceID = sourceInstance.instanceID;
+        instance.InstanceMask = sourceInstance.mask;
         instance.InstanceContributionToHitGroupIndex = 0;
         instance.Flags = D3D12_RAYTRACING_INSTANCE_FLAG_NONE;
-        instance.AccelerationStructure = blas.GetGPUAddress();
+
+        instance.AccelerationStructure = bottomLevel->GetGPUAddress();
     }
 
     const UINT64 instanceBufferSize =
@@ -100,8 +96,9 @@ bool TopLevelAccelerationStructure::Initialize(
     buildInputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
     buildInputs.NumDescs = static_cast<UINT>(instanceDescriptions.size());
     buildInputs.InstanceDescs = m_instanceBuffer->GetGPUVirtualAddress();
-    buildInputs.Flags =
-        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
+    buildInputs.Flags = description.buildPreference == RayTracingAccelerationStructureBuildPreference::FastBuild
+        ? D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_BUILD
+        : D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
 
     D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO prebuildInfo{};
 
@@ -197,4 +194,11 @@ void TopLevelAccelerationStructure::Shutdown()
         m_resource->Release();
         m_resource = nullptr;
     }
+}
+
+D3D12_GPU_VIRTUAL_ADDRESS TopLevelAccelerationStructure::GetGPUAddress() const
+{
+    return m_resource
+        ? m_resource->GetGPUVirtualAddress()
+        : 0;
 }

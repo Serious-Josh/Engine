@@ -1,8 +1,8 @@
 #pragma once
 
-#include <d3d12.h>
+#include "RayTracingAccelerationStructure.h"
 
-class Mesh;
+#include <d3d12.h>
 
 class BottomLevelAccelerationStructure
 {
@@ -14,7 +14,7 @@ class BottomLevelAccelerationStructure
         BottomLevelAccelerationStructure& operator=(
             const BottomLevelAccelerationStructure&) = delete;
 
-        bool Initialize(ID3D12Device5* device, ID3D12GraphicsCommandList4* commandList, const Mesh& mesh);
+        bool Initialize(ID3D12Device5* device, ID3D12GraphicsCommandList4* commandList, const RayTracingBottomLevelDescription& description);
         void Shutdown();
 
         D3D12_GPU_VIRTUAL_ADDRESS GetGPUAddress() const;

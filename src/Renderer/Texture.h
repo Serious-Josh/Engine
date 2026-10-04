@@ -30,9 +30,11 @@ class Texture
         const void* GetInitialData() const;
         size_t GetInitialDataSize() const;
         unsigned int GetDescriptorIndex() const;
+        unsigned int GetUAVIndex() const;
 
         bool CreateSRV(ID3D12Device* device, DescriptorHeap& descriptorHeap);
         bool CreateCubeSRV(ID3D12Device* device, DescriptorHeap& descriptorHeap);
+        bool CreateUAV(ID3D12Device* device, DescriptorHeap& descriptorHeap);
     
     private:
         ID3D12Resource* m_resource = nullptr;
@@ -40,7 +42,8 @@ class Texture
         unsigned int m_width = 0;
         unsigned int m_height = 0;
 
-        unsigned int m_descriptorIndex = UINT_MAX;
+        unsigned int m_srvIndex = UINT_MAX;
+        unsigned int m_uavIndex = UINT_MAX;
         DescriptorHeap* m_descriptorHeap = nullptr;
 
         std::vector<unsigned char> m_initialData;

@@ -24,9 +24,7 @@
 #include "Renderer/Passes/DiffuseIrradiancePass.h"
 #include "Renderer/Passes/GGXAverageAlbedoPass.h"
 #include "Renderer/Passes/GGXMultiscatterIrradiancePass.h"
-#include "Renderer/RayTracing/BottomLevelAccelerationStructure.h"
-#include "Renderer/RayTracing/TopLevelAccelerationStructure.h"
-#include "Renderer/RayTracing/RayTracingPipeline.h"
+#include "Renderer/Passes/RayTracingTestPass.h"
 
 #include <d3d12.h>
 #include <filesystem>
@@ -89,6 +87,7 @@ class Renderer
         GGXAverageAlbedoPass m_ggxAverageAlbedoPass;
         DiffuseIrradiancePass m_diffuseIrradiancePass;
         GGXMultiscatterIrradiancePass m_ggxMultiscatterIrradiancePass;
+        RayTracingTestPass m_rayTracingTestPass;
 
         ShaderLibrary m_shaderLibrary;
 
@@ -106,8 +105,4 @@ class Renderer
 
         Texture m_brdfIntegrationLUT;
         Texture m_ggxAverageAlbedoLUT;
-
-        BottomLevelAccelerationStructure m_demoBLAS;
-        TopLevelAccelerationStructure m_demoTLAS;
-        RayTracingPipeline m_demoRayTracingPipeline;
 };

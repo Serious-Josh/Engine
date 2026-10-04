@@ -9,7 +9,7 @@ Texture::Texture(Texture&& other) noexcept
     : m_resource(other.m_resource)
     , m_width(other.m_width)
     , m_height(other.m_height)
-    , m_descriptorIndex(other.m_descriptorIndex)
+    , m_srvIndex(other.m_srvIndex)
     , m_descriptorHeap(other.m_descriptorHeap)
     , m_initialData(std::move(other.m_initialData))
     , m_format(other.m_format)
@@ -19,7 +19,7 @@ Texture::Texture(Texture&& other) noexcept
     other.m_resource = nullptr;
     other.m_width = 0;
     other.m_height = 0;
-    other.m_descriptorIndex = UINT_MAX;
+    other.m_srvIndex = UINT_MAX;
     other.m_descriptorHeap = nullptr;
     other.m_format = DXGI_FORMAT_UNKNOWN;
     other.m_bytesPerPixel = 0;
@@ -37,13 +37,13 @@ Texture& Texture::operator=(Texture&& other) noexcept
         m_width = other.m_width;
         m_height = other.m_height;
         m_initialData = std::move(other.m_initialData);
-        m_descriptorIndex = other.m_descriptorIndex;
+        m_srvIndex = other.m_srvIndex;
         m_descriptorHeap = other.m_descriptorHeap;
         m_format = other.m_format;
         m_bytesPerPixel = other.m_bytesPerPixel;
         m_subresourceStates = std::move(other.m_subresourceStates);
 
-        other.m_descriptorIndex = UINT_MAX;
+        other.m_srvIndex = UINT_MAX;
         other.m_descriptorHeap = nullptr;
         other.m_resource = nullptr;
         other.m_width = 0;
@@ -158,10 +158,10 @@ bool Texture::Initialize(ID3D12Device* device, unsigned int width, unsigned int 
 
 void Texture::Shutdown()
 {
-    if(m_descriptorHeap && m_descriptorIndex != UINT_MAX){
-        m_descriptorHeap->Free(m_descriptorIndex);
+    if(m_descriptorHeap && m_srvIndex != UINT_MAX){
+        m_descriptorHeap->Free(m_srvIndex);
 
-        m_descriptorIndex = UINT_MAX;
+        m_srvIndex = UINT_MAX;
         m_descriptorHeap = nullptr;
     }
 
@@ -171,7 +171,7 @@ void Texture::Shutdown()
     }
 
     m_subresourceStates.clear();
-    m_descriptorIndex = UINT_MAX;
+    m_srvIndex = UINT_MAX;
     m_width = 0;
     m_height = 0;
     m_format = DXGI_FORMAT_UNKNOWN;
@@ -264,7 +264,7 @@ bool Texture::CreateSRV(ID3D12Device* device, DescriptorHeap& descriptorHeap)
 
     device->CreateShaderResourceView(m_resource, &description, descriptorHeap.GetCPUHandle(descriptorIndex));
 
-    m_descriptorIndex = descriptorIndex;
+    m_srvIndex = descriptorIndex;
 
     return true;
 }
@@ -300,7 +300,7 @@ bool Texture::CreateCubeSRV(ID3D12Device* device, DescriptorHeap& descriptorHeap
     device->CreateShaderResourceView(m_resource, &description, descriptorHeap.GetCPUHandle(descriptorIndex));
 
     m_descriptorHeap = &descriptorHeap;
-    m_descriptorIndex = descriptorIndex;
+    m_srvIndex = descriptorIndex;
 
     return true;
 }
@@ -316,11 +316,49 @@ void Texture::SetInitialData(
 
     m_initialData.resize(dataSize);
 
-    std::memcpy(
-        m_initialData.data(),
-        data,
-        dataSize
-    );
+    std::memcpy(m_initialData.data(), data, dataSize);
+}
+
+bool Texture::CreateUAV(ID3D12Device* device, DescriptorHeap& descriptorHeap)
+{
+    if(!device || !m_resource){
+        return false;
+    }
+
+    if(m_uavIndex != UINT_MAX){
+        return false;
+    }
+
+    const D3D12_RESOURCE_DESC resourceDescription = m_resource->GetDesc();
+
+    if((resourceDescription.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) == 0)
+    {
+        return false;
+    }
+
+    const unsigned int descriptorIndex = descriptorHeap.Allocate();
+
+    if(descriptorIndex == UINT_MAX){
+        return false;
+    }
+
+    D3D12_UNORDERED_ACCESS_VIEW_DESC description{};
+    description.Format = resourceDescription.Format;
+    description.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    description.Texture2D.MipSlice = 0;
+    description.Texture2D.PlaneSlice = 0;
+
+    device->CreateUnorderedAccessView(m_resource, nullptr, &description, descriptorHeap.GetCPUHandle(descriptorIndex));
+
+    m_descriptorHeap = &descriptorHeap;
+    m_uavIndex = descriptorIndex;
+
+    return true;
+}
+
+unsigned int Texture::GetUAVIndex() const
+{
+    return m_uavIndex;
 }
 
 ID3D12Resource* Texture::GetResource() const
@@ -340,5 +378,5 @@ size_t Texture::GetInitialDataSize() const
 
 unsigned int Texture::GetDescriptorIndex() const
 {
-    return m_descriptorIndex;
+    return m_srvIndex;
 }

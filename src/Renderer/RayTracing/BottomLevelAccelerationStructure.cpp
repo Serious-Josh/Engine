@@ -2,30 +2,45 @@
 
 #include "Renderer/Mesh.h"
 
-bool BottomLevelAccelerationStructure::Initialize(ID3D12Device5* device, ID3D12GraphicsCommandList4* commandList, const Mesh& mesh)
+#include <vector>
+
+bool BottomLevelAccelerationStructure::Initialize(ID3D12Device5* device, ID3D12GraphicsCommandList4* commandList, const RayTracingBottomLevelDescription& description)
 {
-    if(!device || !commandList || !mesh.IsIndexed()){
+    if(!device || !commandList || description.geometries.empty()){
         return false;
     }
 
-    D3D12_RAYTRACING_GEOMETRY_DESC geometryDescription{};
+    std::vector<D3D12_RAYTRACING_GEOMETRY_DESC> geometryDescriptions;
+    geometryDescriptions.reserve(description.geometries.size());
 
-    geometryDescription.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
-    geometryDescription.Flags = D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE;
-    geometryDescription.Triangles.VertexBuffer.StartAddress = mesh.GetVertexBufferAddress();
-    geometryDescription.Triangles.VertexBuffer.StrideInBytes = mesh.GetVertexStride();
-    geometryDescription.Triangles.VertexCount = static_cast<UINT>(mesh.GetVertexCount());
-    geometryDescription.Triangles.VertexFormat = DXGI_FORMAT_R32G32B32_FLOAT;
-    geometryDescription.Triangles.IndexBuffer = mesh.GetIndexBufferAddress();
-    geometryDescription.Triangles.IndexCount = static_cast<UINT>(mesh.GetIndexCount());
-    geometryDescription.Triangles.IndexFormat = mesh.GetIndexFormat();
+    for(const RayTracingGeometryDescription& geometry : description.geometries){
+        if(!geometry.mesh || !geometry.mesh->IsIndexed()){
+            return false;
+        }
 
-    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS buildInputs{};
+        const Mesh& mesh = *geometry.mesh;
+
+        D3D12_RAYTRACING_GEOMETRY_DESC geometryDescription{};
+        geometryDescription.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
+        geometryDescription.Flags = geometry.opaque ? D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE : D3D12_RAYTRACING_GEOMETRY_FLAG_NONE;
+        geometryDescription.Triangles.VertexBuffer.StartAddress = mesh.GetVertexBufferAddress();
+        geometryDescription.Triangles.VertexBuffer.StrideInBytes = mesh.GetVertexStride();
+        geometryDescription.Triangles.VertexCount = static_cast<UINT>(mesh.GetVertexCount());
+        geometryDescription.Triangles.VertexFormat = DXGI_FORMAT_R32G32B32_FLOAT;
+        geometryDescription.Triangles.IndexBuffer = mesh.GetIndexBufferAddress();
+        geometryDescription.Triangles.IndexCount = static_cast<UINT>(mesh.GetIndexCount());
+        geometryDescription.Triangles.IndexFormat = mesh.GetIndexFormat();
+        geometryDescriptions.push_back(geometryDescription);
+    }
+
+    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS buildInputs;
     buildInputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
     buildInputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
-    buildInputs.NumDescs = 1;
-    buildInputs.pGeometryDescs = &geometryDescription;
-    buildInputs.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
+    buildInputs.NumDescs = static_cast<UINT>(geometryDescriptions.size());
+    buildInputs.pGeometryDescs = geometryDescriptions.data();
+    buildInputs.Flags = description.buildPreference == RayTracingAccelerationStructureBuildPreference::FastBuild ?
+        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_BUILD
+        : D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
 
 
     D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO prebuildInfo{};

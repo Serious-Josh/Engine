@@ -402,45 +402,29 @@ bool Renderer::InitializeDemoRayTracing(const Mesh& mesh, const Scene& scene)
         return false;
     }
 
-    if(!m_demoBLAS.Initialize(
-        m_graphicsDevice.GetRayTracingDevice(),
+    if(!m_rayTracingTestPass.Initialize(
+        m_graphicsDevice,
         m_commandContext.GetRayTracingCommandList(),
-        mesh))
-    {
-        Log::Error("Failed to initialize demo BLAS.");
-        return false;
-    }
-
-    if(!m_demoTLAS.Initialize(
-        m_graphicsDevice.GetRayTracingDevice(),
-        m_commandContext.GetRayTracingCommandList(),
+        m_shaderLibrary,
+        m_resourceDescriptorHeap,
+        mesh,
         scene,
-        m_demoBLAS))
+        m_width,
+        m_height))
     {
-        Log::Error("Failed to initialize demo TLAS.");
+        Log::Error("Failed to init ray tracing test pass.");
         return false;
     }
-
-    if(!m_demoRayTracingPipeline.Initialize(m_graphicsDevice.GetRayTracingDevice(), m_shaderLibrary, "RayTracingTest.hlsl")){
-        Log::Error("Failed to init demo ray tracing pipeline.");
-        return false;
-    }
-
-    Log::Info("Demo ray tracing pipeline init successful.");
 
     if(!m_commandContext.End()){
-        Log::Error("Failed to end acceleration structure construction.");
         return false;
     }
 
     if(!m_commandContext.Execute(0)){
-        Log::Error("Failed to execute acceleration structure construction.");
         return false;
     }
 
     m_commandContext.WaitForGPU();
-
-    Log::Info("Demo acceleration structures built successfully.");
 
     return true;
 }
@@ -581,6 +565,15 @@ void Renderer::Render(const Scene& scene)
         reconstructionConstantsAddress,
         lightConstantsAddress
     );
+
+    m_rayTracingTestPass.Execute(
+        m_commandContext.GetRayTracingCommandList(),
+        m_resourceDescriptorHeap,
+        reconstructionConstantsAddress,
+        m_sceneColor,
+        m_width,
+        m_height);
+
     m_toneMapPass.Execute(commandList, m_sceneColor, rtvHandle);
 
     m_debugUI.EndFrame(commandList);
@@ -634,10 +627,7 @@ void Renderer::Shutdown()
     m_brdfIntegrationPass.Shutdown();
     m_ggxAverageAlbedoPass.Shutdown();
     m_ggxMultiscatterIrradiancePass.Shutdown();
-    
-    m_demoRayTracingPipeline.Shutdown();
-    m_demoTLAS.Shutdown();
-    m_demoBLAS.Shutdown();
+    m_rayTracingTestPass.Shutdown();
 
     m_uploadBuffer.Shutdown();
     m_materialBuffer.Shutdown();
