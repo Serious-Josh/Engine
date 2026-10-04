@@ -25,6 +25,7 @@
 #include "Renderer/Passes/GGXAverageAlbedoPass.h"
 #include "Renderer/Passes/GGXMultiscatterIrradiancePass.h"
 #include "Renderer/Passes/RayTracingTestPass.h"
+#include "Renderer/RayTracing/RayTracingSceneResources.h"
 
 #include <d3d12.h>
 #include <filesystem>
@@ -105,4 +106,6 @@ class Renderer
 
         Texture m_brdfIntegrationLUT;
         Texture m_ggxAverageAlbedoLUT;
+
+        RayTracingSceneResources m_rayTracingScene;
 };

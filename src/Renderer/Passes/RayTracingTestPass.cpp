@@ -8,61 +8,18 @@
 #include "Scene/Scene.h"
 #include "Renderer/Shader/ShaderLibrary.h"
 #include "Renderer/RenderTarget.h"
+#include "Renderer/RayTracing/RayTracingSceneResources.h"
 
 #include <vector>
 
 bool RayTracingTestPass::Initialize(
     GraphicsDevice& graphicsDevice,
-    ID3D12GraphicsCommandList4* commandList,
     ShaderLibrary& shaderLibrary,
     DescriptorHeap& descriptorHeap,
-    const Mesh& mesh,
-    const Scene& scene,
     unsigned int width,
     unsigned int height)
 {
-    if(!graphicsDevice.SupportsRayTracing() || !commandList){
-        return false;
-    }
-
-    RayTracingBottomLevelDescription bottomLevelDescription{};
-
-    RayTracingGeometryDescription geometryDescription{};
-    geometryDescription.mesh = &mesh;
-    geometryDescription.opaque = true;
-
-    bottomLevelDescription.geometries.push_back(geometryDescription);
-    bottomLevelDescription.buildPreference = RayTracingAccelerationStructureBuildPreference::FastTrace;
-
-    if(!m_blas.Initialize(graphicsDevice.GetRayTracingDevice(), commandList, bottomLevelDescription))
-    {
-        return false;
-    }
-
-    RayTracingTopLevelDescription topLevelDescription{};
-
-    const std::vector<RenderObject>& renderObjects = scene.GetRenderObjects();
-
-    topLevelDescription.instances.reserve(renderObjects.size());
-
-    for(unsigned int i = 0; i < renderObjects.size(); ++i)
-    {
-        RayTracingInstanceDescription instanceDescription{};
-
-        instanceDescription.transform = renderObjects[i].transform.GetModelMatrix();
-        instanceDescription.instanceID = i;
-        instanceDescription.mask = 0xFF;
-        instanceDescription.bottomLevelIndex = 0;
-
-        topLevelDescription.instances.push_back(instanceDescription);
-    }
-
-    topLevelDescription.buildPreference = RayTracingAccelerationStructureBuildPreference::FastTrace;
-
-    const std::vector<const BottomLevelAccelerationStructure*> bottomLevelStructures = {&m_blas};
-
-    if(!m_tlas.Initialize(graphicsDevice.GetRayTracingDevice(), commandList, topLevelDescription, bottomLevelStructures))
-    {
+    if(!graphicsDevice.SupportsRayTracing()){
         return false;
     }
 
@@ -98,6 +55,7 @@ bool RayTracingTestPass::Initialize(
 void RayTracingTestPass::Execute(
     ID3D12GraphicsCommandList4* commandList,
     DescriptorHeap& descriptorHeap,
+    const RayTracingSceneResources& rayTracingScene,
     D3D12_GPU_VIRTUAL_ADDRESS reconstructionConstantsAddress,
     RenderTarget& sceneColor,
     unsigned int width,
@@ -111,7 +69,7 @@ void RayTracingTestPass::Execute(
 
     commandList->SetPipelineState1(m_pipeline.GetStateObject());
     commandList->SetComputeRootSignature(m_pipeline.GetGlobalRootSignature());
-    commandList->SetComputeRootShaderResourceView(0, m_tlas.GetGPUAddress());
+    commandList->SetComputeRootShaderResourceView(0, rayTracingScene.GetTopLevel().GetGPUAddress());
 
     const D3D12_GPU_DESCRIPTOR_HANDLE outputUAV = descriptorHeap.GetGPUHandle(m_output.GetUAVIndex());
 
@@ -132,7 +90,5 @@ void RayTracingTestPass::Execute(
 void RayTracingTestPass::Shutdown()
 {
     m_pipeline.Shutdown();
-    m_tlas.Shutdown();
-    m_blas.Shutdown();
     m_output.Shutdown();
 }

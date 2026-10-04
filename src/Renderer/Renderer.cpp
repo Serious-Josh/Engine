@@ -402,13 +402,15 @@ bool Renderer::InitializeDemoRayTracing(const Mesh& mesh, const Scene& scene)
         return false;
     }
 
+    if(!m_rayTracingScene.Initialize(m_graphicsDevice.GetRayTracingDevice(), m_commandContext.GetRayTracingCommandList(), mesh, scene)){
+        Log::Error("Failed to init ray tracing scene resources.");
+        return false;
+    }
+
     if(!m_rayTracingTestPass.Initialize(
         m_graphicsDevice,
-        m_commandContext.GetRayTracingCommandList(),
         m_shaderLibrary,
         m_resourceDescriptorHeap,
-        mesh,
-        scene,
         m_width,
         m_height))
     {
@@ -569,6 +571,7 @@ void Renderer::Render(const Scene& scene)
     m_rayTracingTestPass.Execute(
         m_commandContext.GetRayTracingCommandList(),
         m_resourceDescriptorHeap,
+        m_rayTracingScene,
         reconstructionConstantsAddress,
         m_sceneColor,
         m_width,
@@ -628,6 +631,8 @@ void Renderer::Shutdown()
     m_ggxAverageAlbedoPass.Shutdown();
     m_ggxMultiscatterIrradiancePass.Shutdown();
     m_rayTracingTestPass.Shutdown();
+
+    m_rayTracingScene.Shutdown();
 
     m_uploadBuffer.Shutdown();
     m_materialBuffer.Shutdown();
