@@ -10,6 +10,7 @@ Texture::Texture(Texture&& other) noexcept
     , m_width(other.m_width)
     , m_height(other.m_height)
     , m_srvIndex(other.m_srvIndex)
+    , m_uavIndex(other.m_uavIndex)
     , m_descriptorHeap(other.m_descriptorHeap)
     , m_initialData(std::move(other.m_initialData))
     , m_format(other.m_format)
@@ -20,6 +21,7 @@ Texture::Texture(Texture&& other) noexcept
     other.m_width = 0;
     other.m_height = 0;
     other.m_srvIndex = UINT_MAX;
+    other.m_uavIndex = UINT_MAX;
     other.m_descriptorHeap = nullptr;
     other.m_format = DXGI_FORMAT_UNKNOWN;
     other.m_bytesPerPixel = 0;
@@ -38,12 +40,14 @@ Texture& Texture::operator=(Texture&& other) noexcept
         m_height = other.m_height;
         m_initialData = std::move(other.m_initialData);
         m_srvIndex = other.m_srvIndex;
+        m_uavIndex = other.m_uavIndex;
         m_descriptorHeap = other.m_descriptorHeap;
         m_format = other.m_format;
         m_bytesPerPixel = other.m_bytesPerPixel;
         m_subresourceStates = std::move(other.m_subresourceStates);
 
         other.m_srvIndex = UINT_MAX;
+        other.m_uavIndex = UINT_MAX;
         other.m_descriptorHeap = nullptr;
         other.m_resource = nullptr;
         other.m_width = 0;
@@ -160,9 +164,12 @@ void Texture::Shutdown()
 {
     if(m_descriptorHeap && m_srvIndex != UINT_MAX){
         m_descriptorHeap->Free(m_srvIndex);
-
         m_srvIndex = UINT_MAX;
-        m_descriptorHeap = nullptr;
+    }
+
+    if(m_descriptorHeap && m_uavIndex != UINT_MAX){
+        m_descriptorHeap->Free(m_uavIndex);
+        m_uavIndex = UINT_MAX;
     }
 
     if(m_resource){
@@ -172,6 +179,7 @@ void Texture::Shutdown()
 
     m_subresourceStates.clear();
     m_srvIndex = UINT_MAX;
+    m_descriptorHeap = nullptr;
     m_width = 0;
     m_height = 0;
     m_format = DXGI_FORMAT_UNKNOWN;

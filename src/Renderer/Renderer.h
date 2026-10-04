@@ -24,8 +24,8 @@
 #include "Renderer/Passes/DiffuseIrradiancePass.h"
 #include "Renderer/Passes/GGXAverageAlbedoPass.h"
 #include "Renderer/Passes/GGXMultiscatterIrradiancePass.h"
-#include "Renderer/Passes/RayTracingTestPass.h"
 #include "Renderer/RayTracing/RayTracingSceneResources.h"
+#include "Renderer/Passes/RayTracedShadowPass.h"
 
 #include <d3d12.h>
 #include <filesystem>
@@ -63,7 +63,7 @@ class Renderer
 
         bool InitializeMaterials(const std::vector<Material*>& materials);
 
-        bool InitializeDemoRayTracing(const Mesh& mesh, const Scene& scene);
+        bool InitializeRayTracingScene(const Mesh& mesh, const Scene& scene);
 
         void WaitForGPU();
     private:
@@ -88,7 +88,7 @@ class Renderer
         GGXAverageAlbedoPass m_ggxAverageAlbedoPass;
         DiffuseIrradiancePass m_diffuseIrradiancePass;
         GGXMultiscatterIrradiancePass m_ggxMultiscatterIrradiancePass;
-        RayTracingTestPass m_rayTracingTestPass;
+        RayTracedShadowPass m_rayTracedShadowPass;
 
         ShaderLibrary m_shaderLibrary;
 

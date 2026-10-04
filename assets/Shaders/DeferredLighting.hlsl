@@ -35,6 +35,7 @@ cbuffer GBufferConstants : register(b0)
     uint brdfIntegrationLUTIndex;
     uint ggxAverageAlbedoLUTIndex;
     uint ggxMultiscatterIrradianceIndex;
+    uint shadowVisibilityIndex;
 }
 
 cbuffer ReconstructionConstants : register(b1)
@@ -166,6 +167,11 @@ float4 PSMain(VSOutput input) : SV_Target0
             ggxMultiscatterIrradianceIndex
         ];
 
+    Texture2D<float> shadowVisibilityTexture =
+        ResourceDescriptorHeap[
+            shadowVisibilityIndex
+        ];
+
     int2 pixel =
         int2(input.position.xy);
 
@@ -201,6 +207,14 @@ float4 PSMain(VSOutput input) : SV_Target0
             1.0f
         );
     }
+
+    float shadowVisibility =
+        shadowVisibilityTexture.Load(
+            int3(
+                pixel,
+                0
+            )
+        );
 
     float2 ndc;
 
@@ -913,7 +927,8 @@ float4 PSMain(VSOutput input) : SV_Target0
         directBRDF *
         lightColor *
         lightIntensity *
-        NdotL;
+        NdotL *
+        shadowVisibility;
 
     float3 lighting =
         directional +

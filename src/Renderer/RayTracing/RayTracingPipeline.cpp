@@ -137,7 +137,7 @@ bool RayTracingPipeline::Initialize(ID3D12Device5* device, ShaderLibrary& shader
     rootSignatureDescription.pParameters = rootParameters;
     rootSignatureDescription.NumStaticSamplers = 0;
     rootSignatureDescription.pStaticSamplers = nullptr;
-    rootSignatureDescription.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+    rootSignatureDescription.Flags = D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED;
 
     ID3DBlob* serializedRootSignature = nullptr;
     ID3DBlob* rootSignatureErrors = nullptr;

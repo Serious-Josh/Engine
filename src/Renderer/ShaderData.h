@@ -32,6 +32,17 @@ struct ReconstructionConstants
     float padding;
 };
 
+struct ShadowConstants
+{
+    Matrix4 inverseViewProjection;
+
+    float lightDirection[3];
+    unsigned int depthIndex;
+
+    unsigned int surfaceIndex;
+    float padding[3];
+};
+
 struct DirectionalLightConstants
 {
     float direction[3];
@@ -64,3 +75,4 @@ static_assert(sizeof(CameraConstants) == 64);
 static_assert(sizeof(ObjectConstants) == 128);
 static_assert(sizeof(ReconstructionConstants) == 80);
 static_assert(sizeof(GPUMaterial) == 64);
+static_assert(sizeof(ShadowConstants) == 96);

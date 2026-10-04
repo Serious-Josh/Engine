@@ -63,8 +63,8 @@ add_executable(Engine
     src/Renderer/RayTracing/TopLevelAccelerationStructure.cpp
     src/Renderer/RayTracing/RayTracingPipeline.cpp
     src/Renderer/RayTracing/ShaderTable.cpp
-    src/Renderer/Passes/RayTracingTestPass.cpp
     src/Renderer/RayTracing/RayTracingSceneResources.cpp
+    src/Renderer/Passes/RayTracedShadowPass.cpp
 )
 
 add_custom_command(

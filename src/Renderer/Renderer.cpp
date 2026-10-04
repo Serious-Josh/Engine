@@ -103,6 +103,11 @@ bool Renderer::Initialize(void* windowHandle, unsigned int width, unsigned int h
         return false;
     }
 
+    if(!m_rayTracedShadowPass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap, m_width, m_height)){
+        Log::Error("Faield to init ray traced shadow pass.");
+        return false;
+    }
+
     const std::filesystem::path environmentPath =
     assetRoot / "Textures" / "Environment" / "TestEnvironment.hdr";
 
@@ -267,6 +272,11 @@ void Renderer::Resize(unsigned int width, unsigned int height)
         return;
     }
 
+    if(!m_rayTracedShadowPass.Resize(m_graphicsDevice.GetDevice(), m_resourceDescriptorHeap, width, height)){
+        Log::Error("Failed to resize ray traced shadow pass.");
+        return;
+    }
+
     m_sceneColor.Shutdown();
 
     if(!m_sceneColor.Initialize(m_graphicsDevice.GetDevice(), width, height, DXGI_FORMAT_R16G16B16A16_FLOAT, m_rtvDescriptorHeap, m_resourceDescriptorHeap)){
@@ -357,9 +367,10 @@ void Renderer::BeginGeometryPass(ID3D12GraphicsCommandList* commandList)
 
 void Renderer::EndGeometryPass(ID3D12GraphicsCommandList* commandList)
 {
+    constexpr D3D12_RESOURCE_STATES shaderReadState = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     m_gBuffer.GetMaterial().Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-    m_gBuffer.GetSurface().Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-    m_gBuffer.GetDepth().Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    m_gBuffer.GetSurface().Transition(commandList, shaderReadState);
+    m_gBuffer.GetDepth().Transition(commandList, shaderReadState);
 }
 
 bool Renderer::InitializeMaterials(const std::vector<Material*>& materials)
@@ -390,10 +401,10 @@ bool Renderer::InitializeMaterials(const std::vector<Material*>& materials)
     return true;
 }
 
-bool Renderer::InitializeDemoRayTracing(const Mesh& mesh, const Scene& scene)
+bool Renderer::InitializeRayTracingScene(const Mesh& mesh, const Scene& scene)
 {
     if(!m_graphicsDevice.SupportsRayTracing()){
-        Log::Error("Cannot initialize demo ray tracing: ray tracing is not supported.");
+        Log::Error("Cannot initialize ray tracing scene: ray tracing is not supported.");
         return false;
     }
 
@@ -404,17 +415,6 @@ bool Renderer::InitializeDemoRayTracing(const Mesh& mesh, const Scene& scene)
 
     if(!m_rayTracingScene.Initialize(m_graphicsDevice.GetRayTracingDevice(), m_commandContext.GetRayTracingCommandList(), mesh, scene)){
         Log::Error("Failed to init ray tracing scene resources.");
-        return false;
-    }
-
-    if(!m_rayTracingTestPass.Initialize(
-        m_graphicsDevice,
-        m_shaderLibrary,
-        m_resourceDescriptorHeap,
-        m_width,
-        m_height))
-    {
-        Log::Error("Failed to init ray tracing test pass.");
         return false;
     }
 
@@ -499,6 +499,21 @@ void Renderer::Render(const Scene& scene)
         return;
     }
 
+    ShadowConstants shadowConstants{};
+    shadowConstants.inverseViewProjection = reconstructionConstants.inverseViewProjection;
+    shadowConstants.lightDirection[0] = lightDirection.x;
+    shadowConstants.lightDirection[1] = lightDirection.y;
+    shadowConstants.lightDirection[2] = lightDirection.z;
+    shadowConstants.depthIndex = m_gBuffer.GetDepth().GetSRVIndex();
+    shadowConstants.surfaceIndex = m_gBuffer.GetSurface().GetSRVIndex();
+
+    D3D12_GPU_VIRTUAL_ADDRESS shadowConstantsAddress = m_uploadBuffer.Allocate(&shadowConstants, sizeof(ShadowConstants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
+
+    if(shadowConstantsAddress == 0){
+        Log::Error("Failed to allocate ray traced shadow constants.");
+        return;
+    }
+
     ID3D12GraphicsCommandList* commandList = m_commandContext.GetCommandList();
 
     D3D12_RESOURCE_BARRIER barrier{};
@@ -552,6 +567,15 @@ void Renderer::Render(const Scene& scene)
 
     EndGeometryPass(commandList);
 
+    m_rayTracedShadowPass.Execute(
+        m_commandContext.GetRayTracingCommandList(),
+        m_resourceDescriptorHeap,
+        m_rayTracingScene,
+        shadowConstantsAddress,
+        m_width,
+        m_height
+    );
+
 
     m_deferredLightingPass.Execute(
         commandList,
@@ -563,12 +587,13 @@ void Renderer::Render(const Scene& scene)
         m_brdfIntegrationLUT,
         m_ggxAverageAlbedoLUT,
         m_environment.GetGGXMultiscatterIrradiance(),
+        m_rayTracedShadowPass.GetVisibilityTexture(),
         m_sceneColor,
         reconstructionConstantsAddress,
         lightConstantsAddress
     );
 
-    m_rayTracingTestPass.Execute(
+    /**m_rayTracingTestPass.Execute(
         m_commandContext.GetRayTracingCommandList(),
         m_resourceDescriptorHeap,
         m_rayTracingScene,
@@ -576,6 +601,7 @@ void Renderer::Render(const Scene& scene)
         m_sceneColor,
         m_width,
         m_height);
+    **/
 
     m_toneMapPass.Execute(commandList, m_sceneColor, rtvHandle);
 
@@ -630,7 +656,7 @@ void Renderer::Shutdown()
     m_brdfIntegrationPass.Shutdown();
     m_ggxAverageAlbedoPass.Shutdown();
     m_ggxMultiscatterIrradiancePass.Shutdown();
-    m_rayTracingTestPass.Shutdown();
+    m_rayTracedShadowPass.Shutdown();
 
     m_rayTracingScene.Shutdown();
 
