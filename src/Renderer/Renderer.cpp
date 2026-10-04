@@ -449,8 +449,13 @@ void Renderer::Render(const Scene& scene)
 
     m_uploadBuffer.Reset(frameIndex);
 
-    if(!scene.GetChangedTransforms().empty()){
-        if(!m_rayTracingScene.Update(m_commandContext.GetRayTracingCommandList(), scene)){
+    const bool tlasNeedsUpdate = !scene.GetChangedTransforms().empty();
+
+    m_debugUI.SetTLASUpdated(tlasNeedsUpdate);
+
+    if(tlasNeedsUpdate){
+        if(!m_rayTracingScene.Update(m_commandContext.GetRayTracingCommandList(), frameIndex, scene))
+        {
             Log::Error("Failed to update ray tracing scene.");
             return;
         }

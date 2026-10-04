@@ -1,11 +1,12 @@
 #pragma once
 
 #include <climits>
+#include <cstdint>
 
 struct ID3D12Device;
 struct ID3D12GraphicsCommandList;
 struct ID3D12CommandQueue;
-struct HWND__;
+struct HWND__;  
 
 using HWND = HWND__*;
 
@@ -25,6 +26,11 @@ class DebugUI
         void BeginFrame();
         void EndFrame(ID3D12GraphicsCommandList* commandList);
 
+        void SetTLASUpdated(bool updated);
+
     private:
         DescriptorHeap* m_descriptorHeap = nullptr;
+
+        bool m_tlasUpdated = false;
+        std::uint64_t m_totalTLASUpdates = 0;
 };

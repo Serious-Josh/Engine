@@ -12,7 +12,8 @@ bool TopLevelAccelerationStructure::Initialize(ID3D12Device5* device, ID3D12Grap
         return false;
     }
 
-    std::vector<D3D12_RAYTRACING_INSTANCE_DESC> instanceDescriptions(description.instances.size());
+    m_instanceDescriptions.clear();
+    m_instanceDescriptions.resize(description.instances.size());
 
     for(std::size_t i = 0; i < description.instances.size(); ++i){
         const RayTracingInstanceDescription& sourceInstance = description.instances[i];
@@ -27,7 +28,7 @@ bool TopLevelAccelerationStructure::Initialize(ID3D12Device5* device, ID3D12Grap
             return false;
         }
 
-        D3D12_RAYTRACING_INSTANCE_DESC& instance = instanceDescriptions[i];
+        D3D12_RAYTRACING_INSTANCE_DESC& instance = m_instanceDescriptions[i];
 
         for(std::size_t row = 0; row < 3; ++row){
             for(std::size_t column = 0; column < 4; ++column){
@@ -45,7 +46,7 @@ bool TopLevelAccelerationStructure::Initialize(ID3D12Device5* device, ID3D12Grap
 
     const UINT64 instanceBufferSize =
         sizeof(D3D12_RAYTRACING_INSTANCE_DESC) *
-        instanceDescriptions.size();
+        m_instanceDescriptions.size();
 
     D3D12_HEAP_PROPERTIES uploadHeapProperties{};
     uploadHeapProperties.Type = D3D12_HEAP_TYPE_UPLOAD;
@@ -60,42 +61,42 @@ bool TopLevelAccelerationStructure::Initialize(ID3D12Device5* device, ID3D12Grap
     instanceBufferDescription.SampleDesc.Count = 1;
     instanceBufferDescription.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
 
-    HRESULT result = device->CreateCommittedResource(
-        &uploadHeapProperties,
-        D3D12_HEAP_FLAG_NONE,
-        &instanceBufferDescription,
-        D3D12_RESOURCE_STATE_GENERIC_READ,
-        nullptr,
-        IID_PPV_ARGS(&m_instanceBuffer));
+    for(unsigned int i = 0; i < FrameCount; ++i){
+        HRESULT result = device->CreateCommittedResource(&uploadHeapProperties, D3D12_HEAP_FLAG_NONE, &instanceBufferDescription, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&m_instanceBuffers[i]));
 
-    if(FAILED(result)){
-        Shutdown();
-        return false;
+        if(FAILED(result)){
+            Shutdown();
+            return false;
+        }
     }
 
-    void* mappedData = nullptr;
+    for(unsigned int frameIndex = 0; frameIndex < FrameCount; ++frameIndex){
+        void* mappedData = nullptr;
 
-    result = m_instanceBuffer->Map(0, nullptr, &mappedData);
+        HRESULT result = m_instanceBuffers[frameIndex]->Map(0, nullptr, &mappedData);
 
-    if(FAILED(result)){
-        Shutdown();
-        return false;
+        if(FAILED(result)){
+            Shutdown();
+            return false;
+        }
+
+        std::memcpy(mappedData, m_instanceDescriptions.data(), static_cast<std::size_t>(instanceBufferSize));
+
+        m_instanceBuffers[frameIndex]->Unmap(0, nullptr);
     }
 
-    std::memcpy(
-        mappedData,
-        instanceDescriptions.data(),
-        static_cast<std::size_t>(instanceBufferSize));
-
-    m_instanceBuffer->Unmap(0, nullptr);
+    for(unsigned int frameIndex = 0; frameIndex < FrameCount; ++frameIndex){
+        m_pendingInstanceUpdates[frameIndex].clear();
+        m_pendingInstanceUpdates[frameIndex].resize(m_instanceDescriptions.size(), false);
+    }
 
     D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS buildInputs{};
     buildInputs.Type =
         D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
 
     buildInputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
-    buildInputs.NumDescs = static_cast<UINT>(instanceDescriptions.size());
-    buildInputs.InstanceDescs = m_instanceBuffer->GetGPUVirtualAddress();
+    buildInputs.NumDescs = static_cast<UINT>(m_instanceDescriptions.size());
+    buildInputs.InstanceDescs = m_instanceBuffers[0]->GetGPUVirtualAddress();
     buildInputs.Flags = description.buildPreference == RayTracingAccelerationStructureBuildPreference::FastBuild
         ? D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_BUILD
         : D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
@@ -130,7 +131,7 @@ bool TopLevelAccelerationStructure::Initialize(ID3D12Device5* device, ID3D12Grap
 
     resourceDescription.Width = prebuildInfo.ScratchDataSizeInBytes;
 
-    result = device->CreateCommittedResource(
+    HRESULT result = device->CreateCommittedResource(
         &defaultHeapProperties,
         D3D12_HEAP_FLAG_NONE,
         &resourceDescription,
@@ -184,39 +185,42 @@ bool TopLevelAccelerationStructure::Initialize(ID3D12Device5* device, ID3D12Grap
 
 bool TopLevelAccelerationStructure::Update(
     ID3D12GraphicsCommandList4* commandList,
-    const RayTracingTopLevelDescription& description,
+    unsigned int frameIndex,
+    const std::vector<RayTracingInstanceDescription>& instances,
+    const std::vector<std::size_t>& changedInstanceIndices,
     const std::vector<const BottomLevelAccelerationStructure*>& bottomLevelStructures)
 {
-    if(!commandList ||
+    if(frameIndex >= FrameCount ||
+       !commandList ||
        !m_resource ||
        !m_scratchResource ||
-       !m_instanceBuffer ||
-       description.instances.empty() ||
-       description.instances.size() != m_instanceCount ||
+       !m_instanceBuffers[frameIndex] ||
+       instances.size() != m_instanceCount ||
        bottomLevelStructures.empty())
     {
         return false;
     }
 
-    std::vector<D3D12_RAYTRACING_INSTANCE_DESC> instanceDescriptions(description.instances.size());
-
-    for(std::size_t i = 0; i < description.instances.size(); ++i)
-    {
-        const RayTracingInstanceDescription& sourceInstance = description.instances[i];
-
-        if(sourceInstance.bottomLevelIndex >= bottomLevelStructures.size())
+    // Update the persistent native DXR descriptors for the instances whose scene transforms changed.
+    for(std::size_t instanceIndex : changedInstanceIndices){
+        if(instanceIndex >= instances.size() || instanceIndex >= m_instanceDescriptions.size())
         {
+            return false;
+        }
+
+        const RayTracingInstanceDescription& sourceInstance = instances[instanceIndex];
+
+        if(sourceInstance.bottomLevelIndex >= bottomLevelStructures.size()){
             return false;
         }
 
         const BottomLevelAccelerationStructure* bottomLevel = bottomLevelStructures[sourceInstance.bottomLevelIndex];
 
-        if(!bottomLevel || bottomLevel->GetGPUAddress() == 0)
-        {
+        if(!bottomLevel || bottomLevel->GetGPUAddress() == 0){
             return false;
         }
 
-        D3D12_RAYTRACING_INSTANCE_DESC& instance = instanceDescriptions[i];
+        D3D12_RAYTRACING_INSTANCE_DESC& instance = m_instanceDescriptions[instanceIndex];
 
         for(std::size_t row = 0; row < 3; ++row){
             for(std::size_t column = 0; column < 4; ++column){
@@ -229,28 +233,43 @@ bool TopLevelAccelerationStructure::Update(
         instance.InstanceContributionToHitGroupIndex = 0;
         instance.Flags = D3D12_RAYTRACING_INSTANCE_FLAG_NONE;
         instance.AccelerationStructure = bottomLevel->GetGPUAddress();
+
+        for(unsigned int pendingFrame = 0; pendingFrame < FrameCount; ++pendingFrame){
+            if(!m_pendingInstanceUpdates[pendingFrame][instanceIndex]){
+                m_pendingInstanceUpdates[pendingFrame][instanceIndex] = true;
+
+                m_pendingInstanceIndices[pendingFrame].push_back(instanceIndex);
+            }
+        }
     }
 
     void* mappedData = nullptr;
 
-    HRESULT result = m_instanceBuffer->Map(0, nullptr, &mappedData);
+    HRESULT result = m_instanceBuffers[frameIndex]->Map(0, nullptr, &mappedData);
 
     if(FAILED(result)){
         return false;
     }
 
-    const std::size_t instanceBufferSize = sizeof(D3D12_RAYTRACING_INSTANCE_DESC) * instanceDescriptions.size();
+    auto* mappedInstances = static_cast<D3D12_RAYTRACING_INSTANCE_DESC*>(mappedData);
 
-    std::memcpy(mappedData, instanceDescriptions.data(), instanceBufferSize);
+    for(std::size_t instanceIndex : m_pendingInstanceIndices[frameIndex]){
+        mappedInstances[instanceIndex] = m_instanceDescriptions[instanceIndex];
 
-    m_instanceBuffer->Unmap(0, nullptr);
+        m_pendingInstanceUpdates[frameIndex][instanceIndex] = false;
+    }
+
+    m_pendingInstanceIndices[frameIndex].clear();
+
+    m_instanceBuffers[frameIndex]->Unmap(0, nullptr);
 
     D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS buildInputs{};
 
     buildInputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
     buildInputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
-    buildInputs.NumDescs = static_cast<UINT>(instanceDescriptions.size());
-    buildInputs.InstanceDescs = m_instanceBuffer->GetGPUVirtualAddress();
+    buildInputs.NumDescs = static_cast<UINT>(m_instanceDescriptions.size());
+    buildInputs.InstanceDescs = m_instanceBuffers[frameIndex]->GetGPUVirtualAddress();
+
     buildInputs.Flags =
         D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE |
         D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE |
@@ -263,11 +282,10 @@ bool TopLevelAccelerationStructure::Update(
     buildDescription.DestAccelerationStructureData = m_resource->GetGPUVirtualAddress();
     buildDescription.ScratchAccelerationStructureData = m_scratchResource->GetGPUVirtualAddress();
 
-    commandList->BuildRaytracingAccelerationStructure(&buildDescription, 0, nullptr);
+    commandList->BuildRaytracingAccelerationStructure( &buildDescription, 0, nullptr);
 
     D3D12_RESOURCE_BARRIER barrier{};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-
     barrier.UAV.pResource = m_resource;
 
     commandList->ResourceBarrier(1, &barrier);
@@ -277,9 +295,11 @@ bool TopLevelAccelerationStructure::Update(
 
 void TopLevelAccelerationStructure::Shutdown()
 {
-    if(m_instanceBuffer){
-        m_instanceBuffer->Release();
-        m_instanceBuffer = nullptr;
+    for(unsigned int i = 0; i < FrameCount; ++i){
+        if(m_instanceBuffers[i]){
+            m_instanceBuffers[i]->Release();
+            m_instanceBuffers[i] = nullptr;
+        }
     }
 
     if(m_scratchResource){
@@ -290,6 +310,13 @@ void TopLevelAccelerationStructure::Shutdown()
     if(m_resource){
         m_resource->Release();
         m_resource = nullptr;
+    }
+
+    m_instanceDescriptions.clear();
+
+    for(unsigned int frameIndex = 0; frameIndex < FrameCount; ++frameIndex){
+        m_pendingInstanceUpdates[frameIndex].clear();
+        m_pendingInstanceIndices[frameIndex].clear();
     }
 
     m_instanceCount = 0;

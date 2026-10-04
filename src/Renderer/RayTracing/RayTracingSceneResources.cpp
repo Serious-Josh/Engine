@@ -51,8 +51,11 @@ bool RayTracingSceneResources::Initialize(ID3D12Device5* device, ID3D12GraphicsC
         return false;
     }
 
-    RayTracingTopLevelDescription topLevelDescription{};
-    topLevelDescription.instances.reserve(renderObjects.size());
+    m_instances.clear();
+    m_instances.reserve(renderObjects.size());
+
+    m_renderObjectToInstance.clear();
+    m_renderObjectToInstance.resize(renderObjects.size(), InvalidInstanceIndex);
 
     for(unsigned int i = 0; i < renderObjects.size(); ++i){
         const RenderObject& renderObject = renderObjects[i];
@@ -73,70 +76,68 @@ bool RayTracingSceneResources::Initialize(ID3D12Device5* device, ID3D12GraphicsC
         instanceDescription.mask = 0xFF;
         instanceDescription.bottomLevelIndex = bottomLevelIt->second;
         
-        topLevelDescription.instances.push_back(instanceDescription);
+        const std::size_t instanceIndex = m_instances.size();
+
+        m_renderObjectToInstance[i] = instanceIndex;
+
+        m_instances.push_back(instanceDescription);
     }
 
+    RayTracingTopLevelDescription topLevelDescription{};
+    topLevelDescription.instances = m_instances;
     topLevelDescription.buildPreference = RayTracingAccelerationStructureBuildPreference::FastTrace;
 
-    std::vector<const BottomLevelAccelerationStructure*> bottomLevelStructures;
-
-    bottomLevelStructures.reserve(m_bottomLevels.size());
+    m_bottomLevelPointers.clear();
+    m_bottomLevelPointers.reserve(m_bottomLevels.size());
 
     for(const auto& bottomLevel : m_bottomLevels){
-        bottomLevelStructures.push_back(bottomLevel.get());
+        m_bottomLevelPointers.push_back(bottomLevel.get());
     }
 
-    if(!m_topLevel.Initialize(device, commandList, topLevelDescription, bottomLevelStructures)){
+    if(!m_topLevel.Initialize(device, commandList, topLevelDescription, m_bottomLevelPointers)){
         return false;
     }
 
     return true;
 }
 
-bool RayTracingSceneResources::Update(ID3D12GraphicsCommandList4* commandList, const Scene& scene)
+bool RayTracingSceneResources::Update(ID3D12GraphicsCommandList4* commandList, unsigned int frameIndex, const Scene& scene)
 {
     if(!commandList){
         return false;
     }
 
     const std::vector<RenderObject>& renderObjects = scene.GetRenderObjects();
+    const std::vector<RenderObjectID>& changedTransforms = scene.GetChangedTransforms();
 
-    RayTracingTopLevelDescription topLevelDescrption{};
-    topLevelDescrption.instances.reserve(renderObjects.size());
+    if(renderObjects.size() != m_renderObjectToInstance.size())
+    {
+        return false;
+    }
 
-    for(unsigned int i = 0; i < renderObjects.size(); ++i){
-        const RenderObject& renderObject = renderObjects[i];
+    std::vector<std::size_t> changedInstanceIndices; changedInstanceIndices.reserve(changedTransforms.size());
 
-        if(!renderObject.mesh){
-            continue;
-        }
-
-        const auto bottomLevelIt = m_meshToBottomLevel.find(renderObject.mesh);
-
-        if(bottomLevelIt == m_meshToBottomLevel.end()){
+    for(RenderObjectID renderObjectID : changedTransforms){
+        if(renderObjectID >= renderObjects.size()){
             return false;
         }
 
-        RayTracingInstanceDescription instanceDescrpition{};
-        instanceDescrpition.transform = renderObject.transform.GetModelMatrix();
-        instanceDescrpition.instanceID = i;
-        instanceDescrpition.mask = 0xFF;
-        instanceDescrpition.bottomLevelIndex = bottomLevelIt->second;
-        
-        topLevelDescrption.instances.push_back(instanceDescrpition);
+        const std::size_t instanceIndex = m_renderObjectToInstance[renderObjectID];
+
+        if(instanceIndex == InvalidInstanceIndex){
+            continue;
+        }
+
+        if(instanceIndex >= m_instances.size()){
+            return false;
+        }
+
+        m_instances[instanceIndex].transform = renderObjects[renderObjectID].transform.GetModelMatrix();
+
+        changedInstanceIndices.push_back(instanceIndex);
     }
 
-    topLevelDescrption.buildPreference = RayTracingAccelerationStructureBuildPreference::FastTrace;
-
-    std::vector<const BottomLevelAccelerationStructure*> bottomLevelStructures;
-
-    bottomLevelStructures.reserve(m_bottomLevels.size());
-
-    for(const auto& bottomLevel : m_bottomLevels){
-        bottomLevelStructures.push_back(bottomLevel.get());
-    }
-
-    return m_topLevel.Update(commandList, topLevelDescrption, bottomLevelStructures);
+    return m_topLevel.Update(commandList, frameIndex, m_instances, changedInstanceIndices, m_bottomLevelPointers);
 }
 
 void RayTracingSceneResources::Shutdown()
@@ -147,6 +148,9 @@ void RayTracingSceneResources::Shutdown()
         bottomLevel->Shutdown();
     }
 
+    m_instances.clear();
+    m_renderObjectToInstance.clear();
+    m_bottomLevelPointers.clear();
     m_bottomLevels.clear();
     m_meshToBottomLevel.clear();
 }

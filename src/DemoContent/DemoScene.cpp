@@ -369,6 +369,7 @@ bool DemoScene::Initialize(ID3D12Device* device, ResourceUploader& uploader, Des
     return true;
 }
 
+/*
 void DemoScene::Update(float deltaTime)
 {
     m_lightAngle += deltaTime * m_lightRotationSpeed;
@@ -387,9 +388,11 @@ void DemoScene::Update(float deltaTime)
     light.direction.y = y / length;
     light.direction.z = z / length;
 }
+*/
+
 
 //moving sphere test update
-/*
+
 void DemoScene::Update(float deltaTime)
 {
     m_lightAngle += deltaTime * m_lightRotationSpeed;
@@ -412,7 +415,9 @@ void DemoScene::Update(float deltaTime)
         0,
         transform);
 }
-*/
+
+
+
 
 void DemoScene::Shutdown()
 {

@@ -110,6 +110,11 @@ void DebugUI::BeginFrame()
         ImGui::Text("%.2f ms", 1000.0f / io.Framerate);
     }
 
+    ImGui::Separator();
+
+    ImGui::Text("TLAS update %s", m_tlasUpdated ? "yes" : "no");
+    ImGui::Text("TLAS updates: %llu", static_cast<unsigned long long>(m_totalTLASUpdates));
+
     ImGui::End();
 }
 
@@ -117,4 +122,13 @@ void DebugUI::EndFrame(ID3D12GraphicsCommandList* commandList)
 {
     ImGui::Render();
     ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), commandList);
+}
+
+void DebugUI::SetTLASUpdated(bool updated)
+{
+    m_tlasUpdated = updated;
+
+    if(updated){
+        ++m_totalTLASUpdates;
+    }
 }
