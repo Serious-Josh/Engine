@@ -1,7 +1,9 @@
 #pragma once
 
 #include "Renderer/ShaderData.h"
+#include "Renderer/Texture.h"
 
+#include <climits>
 #include <algorithm>
 #include <cmath>
 
@@ -149,6 +151,12 @@ struct Material
         data.roughness = roughness;
         data.ior = ior;
         data.metallic = metallic;
+
+        data.baseColor[0] = baseColor[0];
+        data.baseColor[1] = baseColor[1];
+        data.baseColor[2] = baseColor[2];
+
+        data.textureIndex = texture ? texture->GetDescriptorIndex() : UINT_MAX;
 
         data.conductorN[0] = conductorN[0];
         data.conductorN[1] = conductorN[1];

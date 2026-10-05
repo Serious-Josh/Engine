@@ -6,6 +6,8 @@
 #include <d3d12.h>
 #include <cstddef>
 
+class DescriptorHeap;
+
 class Mesh
 {
     public:
@@ -14,8 +16,8 @@ class Mesh
         Mesh(const Mesh&) = delete;
         Mesh& operator=(const Mesh&) = delete;
 
-        bool Initialize(ID3D12Device* device, ResourceUploader& uploader, const void* vertices, size_t vertexCount, const VertexLayout& layout);
-        bool Initialize(ID3D12Device* device, ResourceUploader& uploader, const void* vertices, size_t vertexCount, const VertexLayout& layout, const unsigned int* indices, size_t indexCount);
+        bool Initialize(ID3D12Device* device, ResourceUploader& uploader, DescriptorHeap& descriptorHeap, const void* vertices, size_t vertexCount, const VertexLayout& layout);
+        bool Initialize(ID3D12Device* device, ResourceUploader& uploader, DescriptorHeap& descriptorHeap, const void* vertices, size_t vertexCount, const VertexLayout& layout, const unsigned int* indices, size_t indexCount);
         void Shutdown();
         void Bind(ID3D12GraphicsCommandList* commandList) const;
 
@@ -29,6 +31,10 @@ class Mesh
 
         UINT GetVertexStride() const;
         DXGI_FORMAT GetIndexFormat() const;
+        const VertexLayout& GetVertexLayout() const;
+
+        unsigned int GetVertexBufferDescriptorIndex() const;
+        unsigned int GetIndexBufferDescriptorIndex() const;
 
     private:
         Buffer m_vertexBuffer;

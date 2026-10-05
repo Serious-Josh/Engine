@@ -38,7 +38,7 @@ bool DemoScene::Initialize(ID3D12Device* device, ResourceUploader& uploader, Des
 
     SphereGeometry sphere = SphereGenerator::Generate(1.0f, 32, 64);
 
-    if(!m_mesh.Initialize(device, uploader, sphere.vertices.data(), sphere.vertices.size(), m_vertexLayout, sphere.indices.data(), sphere.indices.size())){
+    if(!m_mesh.Initialize(device, uploader, descriptorHeap, sphere.vertices.data(), sphere.vertices.size(), m_vertexLayout, sphere.indices.data(), sphere.indices.size())){
         return false;
     }
 
@@ -74,7 +74,7 @@ bool DemoScene::Initialize(ID3D12Device* device, ResourceUploader& uploader, Des
 
     if(!m_planeMesh.Initialize(
         device,
-        uploader,
+        uploader, descriptorHeap,
         planeVertices,
         4,
         m_vertexLayout,

@@ -29,6 +29,9 @@
 #include "Renderer/RayTracing/RayTracingSceneResources.h"
 #include "Renderer/Passes/RayTracedShadowPass.h"
 #include "Passes/ShadowDenoisePass.h"
+#include "Renderer/Passes/RayTracedReflectionPass.h"
+#include "Passes/RayTracedReflectionTemporalPass.h"
+#include "Passes/RayTracedReflectionDenoisePass.h"
 
 #include <d3d12.h>
 #include <filesystem>
@@ -93,6 +96,9 @@ class Renderer
         DiffuseIrradiancePass m_diffuseIrradiancePass;
         GGXMultiscatterIrradiancePass m_ggxMultiscatterIrradiancePass;
         RayTracedShadowPass m_rayTracedShadowPass;
+        RayTracedReflectionPass m_rayTracedReflectionPass;
+        RayTracedReflectionTemporalPass m_rayTracedReflectionTemporalPass;
+        RayTracedReflectionDenoisePass m_rayTracedReflectionDenoisePass;
         ShadowDenoisePass m_shadowDenoisePass;
 
         ShaderLibrary m_shaderLibrary;
@@ -102,6 +108,7 @@ class Renderer
         unsigned int m_width = 0;
         unsigned int m_height = 0;
         unsigned int m_shadowSampleIndex = 0;
+        unsigned int m_reflectionSampleIndex = 0;
 
         GBuffer m_gBuffer;
         UploadBuffer m_uploadBuffer;

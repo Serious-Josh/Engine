@@ -1,11 +1,19 @@
 #include "Mesh.h"
+#include "Renderer/DescriptorHeap.h"
 
-bool Mesh::Initialize(ID3D12Device* device, ResourceUploader& uploader, const void* vertices, size_t vertexCount, const VertexLayout& layout)
+bool Mesh::Initialize(ID3D12Device* device, ResourceUploader& uploader, DescriptorHeap& descriptorHeap, const void* vertices, size_t vertexCount, const VertexLayout& layout)
 {
     m_layout = layout;
     m_vertexCount = vertexCount;
 
-    if(!m_vertexBuffer.Initialize(device, uploader, vertices, vertexCount * layout.GetStride(), D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER)){
+    const D3D12_RESOURCE_STATES vertexState = D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+
+    if(!m_vertexBuffer.Initialize(device, uploader, vertices, vertexCount * layout.GetStride(), vertexState)){
+        return false;
+    }
+
+    if(!m_vertexBuffer.CreateRawSRV(device, descriptorHeap)){
+        Shutdown();
         return false;
     }
 
@@ -18,17 +26,24 @@ bool Mesh::Initialize(ID3D12Device* device, ResourceUploader& uploader, const vo
     return true;
 }
 
-bool Mesh::Initialize(ID3D12Device* device, ResourceUploader& uploader, const void* vertices, size_t vertexCount, const VertexLayout& layout, const unsigned int* indices, size_t indexCount)
+bool Mesh::Initialize(ID3D12Device* device, ResourceUploader& uploader, DescriptorHeap& descriptorHeap, const void* vertices, size_t vertexCount, const VertexLayout& layout, const unsigned int* indices, size_t indexCount)
 {
     if(!indices || indexCount == 0){
         return false;
     }
 
-    if(!Initialize(device, uploader, vertices, vertexCount, layout)){
+    if(!Initialize(device, uploader, descriptorHeap, vertices, vertexCount, layout)){
         return false;
     }
 
-    if(!m_indexBuffer.Initialize(device, uploader, indices, indexCount * sizeof(unsigned int), D3D12_RESOURCE_STATE_INDEX_BUFFER)){
+    const D3D12_RESOURCE_STATES indexState = D3D12_RESOURCE_STATE_INDEX_BUFFER | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+
+    if(!m_indexBuffer.Initialize(device, uploader, indices, indexCount * sizeof(unsigned int), indexState)){
+        Shutdown();
+        return false;
+    }
+
+    if(!m_indexBuffer.CreateRawSRV(device, descriptorHeap)){
         Shutdown();
         return false;
     }
@@ -96,4 +111,19 @@ UINT Mesh::GetVertexStride() const
 DXGI_FORMAT Mesh::GetIndexFormat() const
 {
     return m_indexBufferView.Format;
+}
+
+unsigned int Mesh::GetVertexBufferDescriptorIndex() const
+{
+    return m_vertexBuffer.GetDescriptorIndex();
+}
+
+unsigned int Mesh::GetIndexBufferDescriptorIndex() const
+{
+    return m_indexBuffer.GetDescriptorIndex();
+}
+
+const VertexLayout& Mesh::GetVertexLayout() const
+{
+    return m_layout;
 }

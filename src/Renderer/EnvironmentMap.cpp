@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <vector>
 
 bool EnvironmentMap::Initialize(
     ID3D12Device* device,
@@ -26,6 +27,216 @@ bool EnvironmentMap::Initialize(
         std::to_string(image.width) +
         "x" +
         std::to_string(image.height)
+    );
+
+    std::vector<float> conditionalCDF(
+        static_cast<size_t>(image.width) *
+        static_cast<size_t>(image.height)
+    );
+
+    std::vector<float> marginalCDF(
+        image.height
+    );
+
+    std::vector<double> rowWeights(
+        image.height,
+        0.0
+    );
+
+    m_importanceWidth =
+        image.width;
+
+    m_importanceHeight =
+        image.height;
+
+    m_importanceTotalWeight =
+        0.0f;
+
+    double totalWeight =
+        0.0;
+
+    constexpr float pi =
+        3.14159265358979323846f;
+
+    for(unsigned int y = 0; y < image.height; ++y)
+    {
+        const float theta =
+            pi *
+            (
+                static_cast<float>(y) +
+                0.5f
+            ) /
+            static_cast<float>(image.height);
+
+        const float solidAngleWeight =
+            std::sin(theta);
+
+        double rowWeight =
+            0.0;
+
+        for(unsigned int x = 0; x < image.width; ++x)
+        {
+            const size_t pixelIndex =
+                static_cast<size_t>(y) *
+                static_cast<size_t>(image.width) +
+                static_cast<size_t>(x);
+
+            const size_t pixelOffset =
+                pixelIndex * 4;
+
+            const float red =
+                image.pixels[pixelOffset + 0];
+
+            const float green =
+                image.pixels[pixelOffset + 1];
+
+            const float blue =
+                image.pixels[pixelOffset + 2];
+
+            const float luminance =
+                (std::max)(
+                    0.2126f * red +
+                    0.7152f * green +
+                    0.0722f * blue,
+                    0.0f
+                );
+
+            const float weight =
+                luminance *
+                solidAngleWeight;
+
+            rowWeight +=
+                weight;
+
+            conditionalCDF[pixelIndex] = static_cast<float>(rowWeight);
+        }
+
+        rowWeights[y] =
+            rowWeight;
+
+        totalWeight +=
+            rowWeight;
+
+        if(rowWeight > 0.0f)
+        {
+            const size_t rowStart =
+                static_cast<size_t>(y) *
+                static_cast<size_t>(image.width);
+
+            for(unsigned int x = 0; x < image.width; ++x)
+            {
+                conditionalCDF[
+                    rowStart +
+                    static_cast<size_t>(x)
+                ] /=
+                    static_cast<float>(rowWeight);
+            }
+        }
+        else
+        {
+            const size_t rowStart =
+                static_cast<size_t>(y) *
+                static_cast<size_t>(image.width);
+
+            for(unsigned int x = 0; x < image.width; ++x)
+            {
+                conditionalCDF[
+                    rowStart +
+                    static_cast<size_t>(x)
+                ] =
+                    (
+                        static_cast<float>(x) +
+                        1.0f
+                    ) /
+                    static_cast<float>(image.width);
+            }
+        }
+    }
+
+    if(totalWeight <= 0.0)
+    {
+        Log::Error(
+            "Failed to build environment importance distribution."
+        );
+
+        return false;
+    }
+
+    m_importanceTotalWeight =
+        static_cast<float>(totalWeight);
+
+    double accumulatedMarginalWeight =
+        0.0;
+
+    for(unsigned int y = 0; y < image.height; ++y)
+    {
+        accumulatedMarginalWeight +=
+            rowWeights[y];
+
+        marginalCDF[y] =
+            static_cast<float>(
+                accumulatedMarginalWeight /
+                totalWeight
+            );
+    }
+
+    // Force the final entries to exactly 1.0f.
+    // This avoids floating-point accumulation leaving the CDF
+    // slightly below one.
+    for(unsigned int y = 0; y < image.height; ++y)
+    {
+        conditionalCDF[
+            static_cast<size_t>(y) *
+            static_cast<size_t>(image.width) +
+            static_cast<size_t>(image.width - 1)
+        ] =
+            1.0f;
+    }
+
+    marginalCDF.back() =
+        1.0f;
+
+    if(!m_importanceConditionalCDF.Initialize(
+        device,
+        uploader,
+        conditionalCDF.data(),
+        sizeof(float),
+        static_cast<unsigned int>(
+            conditionalCDF.size()
+        ),
+        descriptorHeap))
+    {
+        Log::Error(
+            "Failed to upload environment conditional CDF."
+        );
+
+        return false;
+    }
+
+    if(!m_importanceMarginalCDF.Initialize(
+        device,
+        uploader,
+        marginalCDF.data(),
+        sizeof(float),
+        static_cast<unsigned int>(
+            marginalCDF.size()
+        ),
+        descriptorHeap))
+    {
+        Log::Error(
+            "Failed to upload environment marginal CDF."
+        );
+
+        return false;
+    }
+
+    Log::Info(
+        "Environment importance CDF built: " +
+        std::to_string(m_importanceWidth) +
+        "x" +
+        std::to_string(m_importanceHeight) +
+        ", total weight = " +
+        std::to_string(m_importanceTotalWeight)
     );
 
     const unsigned int sourceMipLevels =
@@ -134,6 +345,13 @@ void EnvironmentMap::Shutdown()
     m_cubemap.Shutdown();
     m_diffuseIrradiance.Shutdown();
     m_ggxMultiscatterIrradiance.Shutdown();
+
+    m_importanceConditionalCDF.Shutdown();
+    m_importanceMarginalCDF.Shutdown();
+
+    m_importanceWidth = 0;
+    m_importanceHeight = 0;
+    m_importanceTotalWeight = 0.0f;
 }
 
 Texture& EnvironmentMap::GetSourceTexture()
@@ -174,4 +392,39 @@ Texture& EnvironmentMap::GetGGXMultiscatterIrradiance()
 const Texture& EnvironmentMap::GetGGXMultiscatterIrradiance() const
 {
     return m_ggxMultiscatterIrradiance;
+}
+
+StructuredBuffer& EnvironmentMap::GetImportanceConditionalCDF()
+{
+    return m_importanceConditionalCDF;
+}
+
+const StructuredBuffer& EnvironmentMap::GetImportanceConditionalCDF() const
+{
+    return m_importanceConditionalCDF;
+}
+
+StructuredBuffer& EnvironmentMap::GetImportanceMarginalCDF()
+{
+    return m_importanceMarginalCDF;
+}
+
+const StructuredBuffer& EnvironmentMap::GetImportanceMarginalCDF() const
+{
+    return m_importanceMarginalCDF;
+}
+
+unsigned int EnvironmentMap::GetImportanceWidth() const
+{
+    return m_importanceWidth;
+}
+
+unsigned int EnvironmentMap::GetImportanceHeight() const
+{
+    return m_importanceHeight;
+}
+
+float EnvironmentMap::GetImportanceTotalWeight() const
+{
+    return m_importanceTotalWeight;
 }

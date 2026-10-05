@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Renderer/Texture.h"
+#include "Renderer/StructuredBuffer.h"
 
 #include <filesystem>
 
@@ -16,19 +17,32 @@ class EnvironmentMap
 
         Texture& GetSourceTexture();
         const Texture& GetSourceTexture() const;
-
         Texture& GetCubemap();
         const Texture& GetCubemap() const;
-
         Texture& GetDiffuseIrradiance();
         const Texture& GetDiffuseIrradiance() const;
-
         Texture& GetGGXMultiscatterIrradiance();
         const Texture& GetGGXMultiscatterIrradiance() const;
+        StructuredBuffer& GetImportanceConditionalCDF();
+        const StructuredBuffer& GetImportanceConditionalCDF() const;
+
+        StructuredBuffer& GetImportanceMarginalCDF();
+        const StructuredBuffer& GetImportanceMarginalCDF() const;
+
+        unsigned int GetImportanceWidth() const;
+        unsigned int GetImportanceHeight() const;
+        float GetImportanceTotalWeight() const;
 
     private:
         Texture m_sourceTexture;
         Texture m_cubemap;
         Texture m_diffuseIrradiance;
         Texture m_ggxMultiscatterIrradiance;
+
+        StructuredBuffer m_importanceConditionalCDF;
+        StructuredBuffer m_importanceMarginalCDF;
+
+        unsigned int m_importanceWidth = 0;
+        unsigned int m_importanceHeight = 0;
+        float m_importanceTotalWeight = 0.0f;
 };

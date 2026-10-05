@@ -24,6 +24,7 @@ class DeferredLightingPass
             Texture& ggxAverageAlbedoLUT,
             Texture& ggxMultiscatterIrradiance,
             Texture& shadowVisiblity,
+            Texture& reflectionTexture,
             RenderTarget& sceneColor,
             D3D12_GPU_VIRTUAL_ADDRESS reconstructionConstantsAddress,
             D3D12_GPU_VIRTUAL_ADDRESS lightConstantsAddress

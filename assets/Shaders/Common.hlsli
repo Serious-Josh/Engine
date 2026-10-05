@@ -31,4 +31,26 @@ float2 DirectionToEquirectangularUV(float3 direction)
     return uv;
 }
 
+float3 EquirectangularUVToDirection(float2 uv)
+{
+    float longitude =
+        (uv.x - 0.5f) *
+        2.0f *
+        PI;
+
+    float latitude =
+        (0.5f - uv.y) *
+        PI;
+
+    float cosLatitude =
+        cos(latitude);
+
+    return
+        float3(
+            cosLatitude * cos(longitude),
+            sin(latitude),
+            cosLatitude * sin(longitude)
+        );
+}
+
 #endif

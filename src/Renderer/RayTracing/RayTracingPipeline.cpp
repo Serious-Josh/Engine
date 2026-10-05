@@ -172,11 +172,36 @@ bool RayTracingPipeline::Initialize(ID3D12Device5* device, ShaderLibrary& shader
         rootParameters.push_back(parameter);
     }
 
+    D3D12_STATIC_SAMPLER_DESC staticSampler{};
+    staticSampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+    staticSampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    staticSampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    staticSampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    staticSampler.MipLODBias = 0.0f;
+    staticSampler.MaxAnisotropy = 1;
+    staticSampler.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+    staticSampler.BorderColor = D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK;
+    staticSampler.MinLOD = 0.0f;
+    staticSampler.MaxLOD = D3D12_FLOAT32_MAX;
+    staticSampler.ShaderRegister = 0;
+    staticSampler.RegisterSpace = 0;
+    staticSampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+    // Keep material texture wrapping at s0; equirectangular environments
+    // wrap longitude but clamp latitude at s1.
+    D3D12_STATIC_SAMPLER_DESC staticSamplers[2] =
+    {
+        staticSampler,
+        staticSampler
+    };
+    staticSamplers[1].ShaderRegister = 1;
+    staticSamplers[1].AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+
     D3D12_ROOT_SIGNATURE_DESC rootSignatureDescription{};
     rootSignatureDescription.NumParameters = static_cast<UINT>(rootParameters.size());
     rootSignatureDescription.pParameters = rootParameters.empty() ? nullptr : rootParameters.data();
-    rootSignatureDescription.NumStaticSamplers = 0;
-    rootSignatureDescription.pStaticSamplers = nullptr;
+    rootSignatureDescription.NumStaticSamplers = 2;
+    rootSignatureDescription.pStaticSamplers = staticSamplers;
     rootSignatureDescription.Flags = D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED;
 
     ID3DBlob* serializedRootSignature = nullptr;

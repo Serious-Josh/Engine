@@ -4,11 +4,14 @@
 #include "Renderer/RayTracing/RayTracingAccelerationStructure.h"
 #include "Renderer/RenderObject.h"
 #include "Scene/Scene.h"
+#include "Renderer/Material.h"
+#include "Renderer/ShaderData.h"
 
+#include <cstring>
 #include <unordered_map>
 #include <vector>
 
-bool RayTracingSceneResources::Initialize(ID3D12Device5* device, ID3D12GraphicsCommandList4* commandList, const Scene& scene)
+bool RayTracingSceneResources::Initialize(ID3D12Device5* device, ID3D12GraphicsCommandList4* commandList, ResourceUploader& uploader, DescriptorHeap& descriptorHeap, const Scene& scene)
 {
     if(!device || !commandList){
         return false;
@@ -57,6 +60,8 @@ bool RayTracingSceneResources::Initialize(ID3D12Device5* device, ID3D12GraphicsC
     m_renderObjectToInstance.clear();
     m_renderObjectToInstance.resize(renderObjects.size(), InvalidInstanceIndex);
 
+    std::vector<RayTracingInstanceData> instanceData(renderObjects.size());
+
     for(unsigned int i = 0; i < renderObjects.size(); ++i){
         const RenderObject& renderObject = renderObjects[i];
 
@@ -70,6 +75,38 @@ bool RayTracingSceneResources::Initialize(ID3D12Device5* device, ID3D12GraphicsC
             return false;
         }
 
+        if(!renderObject.material){
+            return false;
+        }
+
+        unsigned int normalOffset = UINT_MAX;
+        unsigned int uvOffset = UINT_MAX;
+
+        for(const VertexAttribute& attribute : renderObject.mesh->GetVertexLayout().GetAttributes()){
+            if(std::strcmp(attribute.semantic, "NORMAL") == 0 && attribute.semanticIndex == 0 && attribute.type == VertexAttributeType::Float3){
+                normalOffset = attribute.offset;
+            }
+
+            if(std::strcmp(attribute.semantic, "TEXCOORD") == 0 && attribute.semanticIndex == 0 && attribute.type == VertexAttributeType::Float2){
+                uvOffset = attribute.offset;
+            }
+        }
+
+        if(normalOffset == UINT_MAX || uvOffset == UINT_MAX){
+            return false;
+        }
+
+        RayTracingInstanceData gpuInstance{};
+        gpuInstance.vertexBufferIndex = renderObject.mesh->GetVertexBufferDescriptorIndex();
+        gpuInstance.indexBufferIndex = renderObject.mesh->IsIndexed() ? renderObject.mesh->GetIndexBufferDescriptorIndex() : UINT_MAX;
+        gpuInstance.materialIndex = renderObject.material->gpuIndex;
+        gpuInstance.vertexStride = renderObject.mesh->GetVertexStride();
+        gpuInstance.normalOffset = normalOffset;
+        gpuInstance.uvOffset = uvOffset;
+        gpuInstance.indexed = renderObject.mesh->IsIndexed() ? 1u : 0u;
+
+        instanceData[i] = gpuInstance;
+
         RayTracingInstanceDescription instanceDescription{};
         instanceDescription.transform = renderObject.transform.GetModelMatrix();
         instanceDescription.instanceID = i;
@@ -81,6 +118,10 @@ bool RayTracingSceneResources::Initialize(ID3D12Device5* device, ID3D12GraphicsC
         m_renderObjectToInstance[i] = instanceIndex;
 
         m_instances.push_back(instanceDescription);
+    }
+
+    if(!m_instanceDataBuffer.Initialize(device, uploader, instanceData.data(), sizeof(RayTracingInstanceData), static_cast<unsigned int>(instanceData.size()), descriptorHeap)){
+        return false;
     }
 
     RayTracingTopLevelDescription topLevelDescription{};
@@ -148,6 +189,7 @@ void RayTracingSceneResources::Shutdown()
         bottomLevel->Shutdown();
     }
 
+    m_instanceDataBuffer.Shutdown();
     m_instances.clear();
     m_renderObjectToInstance.clear();
     m_bottomLevelPointers.clear();
@@ -158,4 +200,9 @@ void RayTracingSceneResources::Shutdown()
 const TopLevelAccelerationStructure& RayTracingSceneResources::GetTopLevel() const
 {
     return m_topLevel;
+}
+
+unsigned int RayTracingSceneResources::GetInstanceDataDescriptorIndex() const
+{
+    return m_instanceDataBuffer.GetDescriptorIndex();
 }

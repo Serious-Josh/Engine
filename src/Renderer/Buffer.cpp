@@ -1,11 +1,16 @@
 #include "Buffer.h"
 
+#include "DescriptorHeap.h"
 #include "ResourceUploader.h"
 
 Buffer::Buffer(Buffer&& other) noexcept
-    : m_resource(other.m_resource)
+    : m_resource(other.m_resource),
+      m_descriptorHeap(other.m_descriptorHeap),
+      m_descriptorIndex(other.m_descriptorIndex)
 {
     other.m_resource = nullptr;
+    other.m_descriptorHeap = nullptr;
+    other.m_descriptorIndex = UINT_MAX;
 }
 
 Buffer& Buffer::operator=(Buffer&& other) noexcept
@@ -15,7 +20,11 @@ Buffer& Buffer::operator=(Buffer&& other) noexcept
         Shutdown();
 
         m_resource = other.m_resource;
+        m_descriptorHeap = other.m_descriptorHeap;
+        m_descriptorIndex = other.m_descriptorIndex;
         other.m_resource = nullptr;
+        other.m_descriptorHeap = nullptr;
+        other.m_descriptorIndex = UINT_MAX;
     }
 
     return *this;
@@ -73,12 +82,52 @@ bool Buffer::Initialize(
     return true;
 }
 
+bool Buffer::CreateRawSRV(ID3D12Device* device, DescriptorHeap& descriptorHeap)
+{
+    if(!device || !m_resource){
+        return false;
+    }
+
+    m_descriptorIndex = descriptorHeap.Allocate();
+
+    if(m_descriptorIndex == UINT_MAX){
+        return false;
+    }
+
+    const D3D12_RESOURCE_DESC resourceDescription = m_resource->GetDesc();
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC srvDescription{};
+    srvDescription.Format = DXGI_FORMAT_R32_TYPELESS;
+    srvDescription.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    srvDescription.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srvDescription.Buffer.FirstElement = 0;
+    srvDescription.Buffer.NumElements = static_cast<UINT>(resourceDescription.Width / 4);
+    srvDescription.Buffer.StructureByteStride = 0;
+    srvDescription.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+
+    device->CreateShaderResourceView(m_resource, &srvDescription, descriptorHeap.GetCPUHandle(m_descriptorIndex));
+
+    m_descriptorHeap = &descriptorHeap;
+
+    return true;
+}
+
 void Buffer::Shutdown()
 {
+    if(m_descriptorHeap && m_descriptorIndex != UINT_MAX)
+    {
+        m_descriptorHeap->Free(
+            m_descriptorIndex
+        );
+    }
+
     if(m_resource){
         m_resource->Release();
         m_resource = nullptr;
     }
+
+    m_descriptorHeap = nullptr;
+    m_descriptorIndex = UINT_MAX;
 }
 
 D3D12_GPU_VIRTUAL_ADDRESS Buffer::GetGPUAddress() const
@@ -93,4 +142,9 @@ D3D12_GPU_VIRTUAL_ADDRESS Buffer::GetGPUAddress() const
 ID3D12Resource* Buffer::GetResource() const
 {
     return m_resource;
+}
+
+unsigned int Buffer::GetDescriptorIndex() const
+{
+    return m_descriptorIndex;
 }

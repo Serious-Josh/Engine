@@ -55,6 +55,34 @@ struct ShadowConstants
     float padding[3];
 };
 
+struct ReflectionConstants
+{
+    Matrix4 inverseViewProjection;
+
+    float cameraPosition[3];
+    unsigned int depthIndex;
+
+    unsigned int materialIndex;
+    unsigned int surfaceIndex;
+    unsigned int instanceDataIndex;
+    unsigned int materialBufferIndex;
+
+    unsigned int environmentIndex;
+    unsigned int environmentCubemapIndex;
+    unsigned int diffuseIrradianceIndex;
+    unsigned int ggxMultiscatterIrradianceIndex;
+
+    unsigned int brdfIntegrationLUTIndex;
+    unsigned int ggxAverageAlbedoLUTIndex;
+    unsigned int frameIndex;
+    unsigned int importanceConditionalCDFIndex;
+
+    unsigned int importanceMarginalCDFIndex;
+    unsigned int importanceWidth;
+    unsigned int importanceHeight;
+    float importanceTotalWeight;
+};
+
 struct DirectionalLightConstants
 {
     float direction[3];
@@ -71,6 +99,9 @@ struct GPUMaterial
     float ior;
     float metallic;
 
+    float baseColor[3];
+    unsigned int textureIndex;
+
     float conductorN[3];
     float padding0;
 
@@ -81,10 +112,25 @@ struct GPUMaterial
     float padding2;
 };
 
+struct RayTracingInstanceData
+{
+    unsigned int vertexBufferIndex;
+    unsigned int indexBufferIndex;
+    unsigned int materialIndex;
+    unsigned int vertexStride;
+
+    unsigned int normalOffset;
+    unsigned int uvOffset;
+    unsigned int indexed;
+    unsigned int padding;
+};
+
 static_assert(sizeof(MaterialConstants) == 32);
 static_assert(sizeof(Matrix4) == 64);
 static_assert(sizeof(CameraConstants) == 64);
 static_assert(sizeof(ObjectConstants) == 128);
 static_assert(sizeof(ReconstructionConstants) == 80);
-static_assert(sizeof(GPUMaterial) == 64);
+static_assert(sizeof(GPUMaterial) == 80);
 static_assert(sizeof(ShadowConstants) == 256);
+static_assert(sizeof(ReflectionConstants) == 144);
+static_assert(sizeof(RayTracingInstanceData) == 32);

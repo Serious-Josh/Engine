@@ -108,6 +108,21 @@ bool Renderer::Initialize(void* windowHandle, unsigned int width, unsigned int h
         return false;
     }
 
+    if(!m_rayTracedReflectionPass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap, m_width, m_height)){
+        Log::Error("Failed to init ray traced reflection pass.");
+        return false;
+    }
+
+    if(!m_rayTracedReflectionTemporalPass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap, m_width, m_height)){
+        Log::Error("Failed to init ray traced reflection temporal pass.");
+        return false;
+    }
+
+    if(!m_rayTracedReflectionDenoisePass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap, m_width, m_height)){
+        Log::Error("Failed to init ray traced reflection denoise pass.");
+        return false;
+    }
+
     if(!m_shadowDenoisePass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap, m_width, m_height)){
         Log::Error("Failed to init shadow denoise pass.");
         return false;
@@ -282,6 +297,18 @@ void Renderer::Resize(unsigned int width, unsigned int height)
         return;
     }
 
+    if(!m_rayTracedReflectionPass.Resize(m_graphicsDevice.GetDevice(), m_resourceDescriptorHeap, width, height)){
+        Log::Error("Failed to resize ray traced reflection pass.");
+        return;
+    }
+
+    if(!m_rayTracedReflectionTemporalPass.Resize(m_graphicsDevice.GetDevice(), m_resourceDescriptorHeap, width, height))
+    {
+        Log::Error("Failed to resize ray traced reflection temporal pass.");
+        return;
+    }
+
+    m_rayTracedReflectionDenoisePass.Resize(m_graphicsDevice, m_resourceDescriptorHeap, width, height);
     m_shadowDenoisePass.Resize(m_graphicsDevice, m_resourceDescriptorHeap, width, height);
 
     m_sceneColor.Shutdown();
@@ -375,7 +402,7 @@ void Renderer::BeginGeometryPass(ID3D12GraphicsCommandList* commandList)
 void Renderer::EndGeometryPass(ID3D12GraphicsCommandList* commandList)
 {
     constexpr D3D12_RESOURCE_STATES shaderReadState = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-    m_gBuffer.GetMaterial().Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    m_gBuffer.GetMaterial().Transition(commandList, shaderReadState);
     m_gBuffer.GetSurface().Transition(commandList, shaderReadState);
     m_gBuffer.GetDepth().Transition(commandList, shaderReadState);
 }
@@ -420,7 +447,7 @@ bool Renderer::InitializeRayTracingScene(const Scene& scene)
         return false;
     }
 
-    if(!m_rayTracingScene.Initialize(m_graphicsDevice.GetRayTracingDevice(), m_commandContext.GetRayTracingCommandList(), scene)){
+    if(!m_rayTracingScene.Initialize(m_graphicsDevice.GetRayTracingDevice(), m_commandContext.GetRayTracingCommandList(), m_resourceUploader, m_resourceDescriptorHeap, scene)){
         Log::Error("Failed to init ray tracing scene resources.");
         return false;
     }
@@ -555,6 +582,30 @@ void Renderer::Render(const Scene& scene)
     shadowConstants.outputHistoryLengthIndex = m_rayTracedShadowPass.GetOutputHistoryLengthIndex();
     shadowConstants.accumulatedFrameCount = m_rayTracedShadowPass.GetAccumulatedFrameCount();
 
+    ReflectionConstants reflectionConstants{};
+
+    reflectionConstants.inverseViewProjection = reconstructionConstants.inverseViewProjection;
+    reflectionConstants.cameraPosition[0] = cameraPosition.x;
+    reflectionConstants.cameraPosition[1] = cameraPosition.y;
+    reflectionConstants.cameraPosition[2] = cameraPosition.z;
+    reflectionConstants.depthIndex = m_gBuffer.GetDepth().GetSRVIndex();
+    reflectionConstants.surfaceIndex = m_gBuffer.GetSurface().GetSRVIndex();
+    reflectionConstants.instanceDataIndex = m_rayTracingScene.GetInstanceDataDescriptorIndex();
+    reflectionConstants.materialBufferIndex = m_materialBuffer.GetDescriptorIndex();
+    reflectionConstants.environmentIndex = m_environment.GetSourceTexture().GetDescriptorIndex();
+    reflectionConstants.brdfIntegrationLUTIndex = m_brdfIntegrationLUT.GetDescriptorIndex();
+    reflectionConstants.ggxAverageAlbedoLUTIndex = m_ggxAverageAlbedoLUT.GetDescriptorIndex();
+    reflectionConstants.frameIndex = m_reflectionSampleIndex++;
+    reflectionConstants.environmentCubemapIndex = m_environment.GetCubemap().GetDescriptorIndex();
+    reflectionConstants.diffuseIrradianceIndex = m_environment.GetDiffuseIrradiance().GetDescriptorIndex();
+    reflectionConstants.ggxMultiscatterIrradianceIndex = m_environment.GetGGXMultiscatterIrradiance().GetDescriptorIndex();
+    reflectionConstants.materialIndex = m_gBuffer.GetMaterial().GetSRVIndex();
+    reflectionConstants.importanceConditionalCDFIndex = m_environment.GetImportanceConditionalCDF().GetDescriptorIndex();
+    reflectionConstants.importanceMarginalCDFIndex = m_environment.GetImportanceMarginalCDF().GetDescriptorIndex();
+    reflectionConstants.importanceWidth = m_environment.GetImportanceWidth();
+    reflectionConstants.importanceHeight = m_environment.GetImportanceHeight();
+    reflectionConstants.importanceTotalWeight = m_environment.GetImportanceTotalWeight();
+
     m_previousViewProjection = cameraConstants.viewProjection;
     m_hasPreviousViewProjection = true;
 
@@ -562,6 +613,13 @@ void Renderer::Render(const Scene& scene)
 
     if(shadowConstantsAddress == 0){
         Log::Error("Failed to allocate ray traced shadow constants.");
+        return;
+    }
+
+    D3D12_GPU_VIRTUAL_ADDRESS reflectionConstantsAddress = m_uploadBuffer.Allocate(&reflectionConstants, sizeof(ReflectionConstants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
+
+    if(reflectionConstantsAddress == 0){
+        Log::Error("Failed to allocate ray traced reflection constants.");
         return;
     }
 
@@ -627,6 +685,40 @@ void Renderer::Render(const Scene& scene)
         m_height
     );
 
+    constexpr D3D12_RESOURCE_STATES shaderReadState =
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+
+    m_environment.GetSourceTexture().Transition(commandList, shaderReadState);
+    m_environment.GetCubemap().Transition(commandList, shaderReadState);
+    m_environment.GetDiffuseIrradiance().Transition(commandList, shaderReadState);
+    m_environment.GetGGXMultiscatterIrradiance().Transition(commandList, shaderReadState);
+    m_brdfIntegrationLUT.Transition(commandList, shaderReadState);
+    m_ggxAverageAlbedoLUT.Transition(commandList, shaderReadState);
+
+    m_rayTracedReflectionPass.Execute(m_commandContext.GetRayTracingCommandList(), m_resourceDescriptorHeap, m_rayTracingScene, reflectionConstantsAddress, lightConstantsAddress, m_width, m_height);
+
+    m_rayTracedReflectionTemporalPass.Execute(
+        commandList,
+        m_rayTracedReflectionPass.GetRawReflectionTexture(),
+        m_gBuffer,
+        m_uploadBuffer,
+        reflectionConstants.inverseViewProjection,
+        shadowConstants.previousViewProjection,
+        shadowConstants.previousInverseViewProjection,
+        m_width,
+        m_height);
+
+    m_rayTracedReflectionDenoisePass.Execute(
+        commandList,
+        m_rayTracedReflectionTemporalPass.GetReflectionTexture(),
+        m_rayTracedReflectionPass.GetHitDistanceTexture(),
+        m_gBuffer,
+        m_uploadBuffer,
+        reflectionConstants.inverseViewProjection,
+        m_width,
+        m_height);
+
     m_shadowDenoisePass.Execute(commandList, m_rayTracedShadowPass.GetVisibilityTexture(), m_gBuffer, m_uploadBuffer, reconstructionConstants.inverseViewProjection, m_width, m_height);
 
     m_deferredLightingPass.Execute(
@@ -640,20 +732,11 @@ void Renderer::Render(const Scene& scene)
         m_ggxAverageAlbedoLUT,
         m_environment.GetGGXMultiscatterIrradiance(),
         m_shadowDenoisePass.GetFilteredVisibilityTexture(),
+        m_rayTracedReflectionDenoisePass.GetFilteredReflectionTexture(),
         m_sceneColor,
         reconstructionConstantsAddress,
         lightConstantsAddress
     );
-
-    /**m_rayTracingTestPass.Execute(
-        m_commandContext.GetRayTracingCommandList(),
-        m_resourceDescriptorHeap,
-        m_rayTracingScene,
-        reconstructionConstantsAddress,
-        m_sceneColor,
-        m_width,
-        m_height);
-    **/
 
     m_toneMapPass.Execute(commandList, m_sceneColor, rtvHandle);
 
@@ -709,6 +792,9 @@ void Renderer::Shutdown()
     m_ggxAverageAlbedoPass.Shutdown();
     m_ggxMultiscatterIrradiancePass.Shutdown();
     m_rayTracedShadowPass.Shutdown();
+    m_rayTracedReflectionPass.Shutdown();
+    m_rayTracedReflectionTemporalPass.Shutdown();
+    m_rayTracedReflectionDenoisePass.Shutdown();
     m_shadowDenoisePass.Shutdown();
 
     m_rayTracingScene.Shutdown();
