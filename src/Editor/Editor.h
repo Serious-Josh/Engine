@@ -1,14 +1,16 @@
 #pragma once
 
-class DemoScene;
+class IDemoScene;
+class SphereGridScene;
+class DemoSceneManager;
 
 class Editor
 {
     public:
-        void Draw(DemoScene& demoScene);
+        void Draw(IDemoScene& demoScene, DemoSceneManager& sceneManager, SphereGridScene* sphereGridScene = nullptr);
 
     private:
-        void DrawDemoControls(DemoScene& demoScene);
-        void DrawDirectionalLight(DemoScene& demoScene);
-        void DrawCamera(DemoScene& demoScene);
+        void DrawSphereGridControls(SphereGridScene& demoScene);
+        void DrawDirectionalLight(IDemoScene& demoScene);
+        void DrawCamera(IDemoScene& demoScene);
 };

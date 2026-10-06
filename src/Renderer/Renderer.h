@@ -72,15 +72,18 @@ class Renderer
         ShaderLibrary& GetShaderLibrary();
         DebugUI& GetDebugUI();
 
-        bool InitializeMaterials(const std::vector<Material*>& materials);
+        bool InitializeSceneResources(const Scene& scene, const std::vector<Material*>& materials);
 
-        bool InitializeRayTracingScene(const Scene& scene);
+        void ReleaseSceneResources();
+        void ResetSceneHistory();
 
         void WaitForGPU();
     private:
         bool InitializeDevice();
         bool InitializeSwapChain(void* windowHandle);
         void Draw(ID3D12GraphicsCommandList* commandList, const RenderObject& object, D3D12_GPU_VIRTUAL_ADDRESS cameraConstantsAddress);
+        bool InitializeMaterials(const std::vector<Material*>& materials);
+        bool InitializeRayTracingScene(const Scene& scene);
 
         GraphicsDevice m_graphicsDevice;
         SwapChain m_swapChain;

@@ -1,18 +1,38 @@
 #include "Editor.h"
 
-#include "DemoContent/DemoScene.h"
+#include "DemoContent/IDemoScene.h"
+#include "DemoContent/SphereGridScene.h"
 #include "Scene/DirectionalLight.h"
 #include "Scene/Scene.h"
+#include "DemoContent/DemoSceneManager.h"
 
 #include "imgui.h"
 
-void Editor::Draw(DemoScene& demoScene)
+void Editor::Draw(IDemoScene& demoScene, DemoSceneManager& sceneManager, SphereGridScene* sphereGridScene)
 {
     ImGui::Begin("Editor");
 
-    DrawDemoControls(demoScene);
+    const char* sceneNames[] =
+    {
+        "Sphere Grid",
+        "Mirror Test"
+    };
+
+    int selectedScene = static_cast<int>(sceneManager.GetActiveSceneId());
+
+    if(ImGui::Combo("Demo Scene", &selectedScene, sceneNames, IM_ARRAYSIZE(sceneNames)))
+    {
+        sceneManager.RequestScene(static_cast<DemoSceneId>(selectedScene));
+    }
 
     ImGui::Separator();
+
+    if(sphereGridScene)
+    {
+        DrawSphereGridControls(*sphereGridScene);
+
+        ImGui::Separator();
+    }
 
     DrawCamera(demoScene);
 
@@ -23,7 +43,7 @@ void Editor::Draw(DemoScene& demoScene)
     ImGui::End();
 }
 
-void Editor::DrawDemoControls(DemoScene& demoScene)
+void Editor::DrawSphereGridControls(SphereGridScene& demoScene)
 {
     if(!ImGui::CollapsingHeader("Diagnostics", ImGuiTreeNodeFlags_DefaultOpen)){
         return;
@@ -87,7 +107,7 @@ void Editor::DrawDemoControls(DemoScene& demoScene)
     }
 }
 
-void Editor::DrawDirectionalLight(DemoScene& demoScene)
+void Editor::DrawDirectionalLight(IDemoScene& demoScene)
 {
     if(!ImGui::CollapsingHeader("Directional Light", ImGuiTreeNodeFlags_DefaultOpen)){
         return;
@@ -110,7 +130,7 @@ void Editor::DrawDirectionalLight(DemoScene& demoScene)
     }
 }
 
-void Editor::DrawCamera(DemoScene& demoScene)
+void Editor::DrawCamera(IDemoScene& demoScene)
 {
     if(!ImGui::CollapsingHeader("Camera", ImGuiTreeNodeFlags_DefaultOpen))
     {

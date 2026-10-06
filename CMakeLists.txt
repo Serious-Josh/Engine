@@ -32,7 +32,7 @@ add_executable(Engine
     src/Renderer/SwapChain.cpp
     src/Renderer/CommandContext.cpp
     src/Renderer/GraphicsDevice.cpp
-    src/DemoContent/DemoScene.cpp
+    src/DemoContent/SphereGridScene.cpp
     src/Renderer/RenderTarget.cpp
     src/Renderer/GBuffer.cpp
     src/Renderer/DepthBuffer.cpp
@@ -75,6 +75,8 @@ add_executable(Engine
     src/Renderer/Passes/NrdReflectionPreparePass.cpp
     src/Renderer/Passes/ReflectionContributionLimitPass.cpp
     src/Renderer/Passes/NrdReflectionResolvePass.cpp
+    src/DemoContent/DemoSceneManager.cpp
+    src/DemoContent/MirrorTestScene.cpp
 )
 
 add_custom_command(

@@ -460,6 +460,24 @@ void Renderer::EndGeometryPass(ID3D12GraphicsCommandList* commandList)
     m_gBuffer.GetDepth().Transition(commandList, shaderReadState);
 }
 
+bool Renderer::InitializeSceneResources(const Scene& scene, const std::vector<Material*>& materials)
+{
+    if(!InitializeMaterials(materials)){
+        Log::Error("Failed to init scene materials.");
+        return false;
+    }
+
+    if(!InitializeRayTracingScene(scene)){
+        Log::Error("Failed to init ray tracing scene.");
+        m_materialBuffer.Shutdown();
+        return false;
+    }
+
+    ResetSceneHistory();
+
+    return true;
+}
+
 bool Renderer::InitializeMaterials(const std::vector<Material*>& materials)
 {
     if(materials.empty()){
@@ -518,6 +536,30 @@ bool Renderer::InitializeRayTracingScene(const Scene& scene)
     return true;
 }
 
+void Renderer::ReleaseSceneResources()
+{
+    m_rayTracingScene.Shutdown();
+    m_materialBuffer.Shutdown();
+
+    ResetSceneHistory();
+}
+
+void Renderer::ResetSceneHistory()
+{
+    m_rayTracedShadowPass.ResetHistory();
+    m_rayTracedReflectionTemporalPass.ResetHistory();
+
+    m_hasPreviousViewProjection = false;
+    m_hasPreviousShadowLightDirection = false;
+    m_hasPreviousNrdCamera = false;
+
+    m_nrdExecutedLastFrame = false;
+    m_nativeReflectionExecutedLastFrame = false;
+
+    m_shadowSampleIndex = 0;
+    m_reflectionSampleIndex = 0;
+    m_nrdFrameIndex = 0;
+}
 
 // --------------
 // Rendering
@@ -986,10 +1028,7 @@ void Renderer::Shutdown()
     m_nrdReflectionResolvePass.Shutdown();
     m_shadowDenoisePass.Shutdown();
 
-    m_rayTracingScene.Shutdown();
-
     m_uploadBuffer.Shutdown();
-    m_materialBuffer.Shutdown();
     m_environment.Shutdown();
     m_sceneColor.Shutdown();
 

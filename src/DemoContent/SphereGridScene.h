@@ -12,6 +12,7 @@
 #include "Scene/Camera.h"
 #include "Scene/DirectionalLight.h"
 #include "Scene/Scene.h"
+#include "DemoContent/IDemoScene.h"
 
 #include <vector>
 #include <array>
@@ -26,24 +27,22 @@ enum class DemoUpdateMode
     OrbitCamera
 };
 
-class DemoScene
+class SphereGridScene : public IDemoScene
 {
     public:
-        bool Initialize(ID3D12Device* device, ResourceUploader& uploader, DescriptorHeap& descriptorHeap, const Shader* vertexShader, const Shader* pixelShader);
-        void Shutdown();
+        bool Initialize(ID3D12Device* device, ResourceUploader& uploader, DescriptorHeap& descriptorHeap, const Shader* vertexShader, const Shader* pixelShader) override;
+        void Shutdown() override;
 
-        void Update(float deltaTime);
+        void Update(float deltaTime) override;
 
-        void SetAspectRatio(float aspectRatio);
+        void SetAspectRatio(float aspectRatio) override;
 
-        Scene& GetScene();
-        const Scene& GetScene() const;
-        std::vector<Material*> GetMaterials();
+        Scene& GetScene() override;
+        const Scene& GetScene() const override;
+        std::vector<Material*> GetMaterials() override;
 
-        const Mesh& GetMesh() const;
-
-        void ResetCamera();
-        void ResetDirectionalLight();
+        void ResetCamera() override;
+        void ResetDirectionalLight() override;
 
         void SetUpdateMode(DemoUpdateMode mode);
         DemoUpdateMode GetUpdateMode() const;

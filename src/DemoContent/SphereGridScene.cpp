@@ -1,4 +1,4 @@
-#include "DemoScene.h"
+#include "SphereGridScene.h"
 #include "Renderer/Vertex.h"
 #include "Renderer/Geometry/SphereGenerator.h"
 #include "Core/Log.h"
@@ -7,7 +7,7 @@
 
 #include <cmath>
 
-bool DemoScene::Initialize(ID3D12Device* device, ResourceUploader& uploader, DescriptorHeap& descriptorHeap, const Shader* vertexShader, const Shader* pixelShader)
+bool SphereGridScene::Initialize(ID3D12Device* device, ResourceUploader& uploader, DescriptorHeap& descriptorHeap, const Shader* vertexShader, const Shader* pixelShader)
 {
     m_vertexLayout = CreateVertexLayout();
 
@@ -352,7 +352,7 @@ bool DemoScene::Initialize(ID3D12Device* device, ResourceUploader& uploader, Des
     return true;
 }
 
-void DemoScene::Update(float deltaTime)
+void SphereGridScene::Update(float deltaTime)
 {
     switch(m_updateMode){
         case DemoUpdateMode::None:
@@ -369,7 +369,7 @@ void DemoScene::Update(float deltaTime)
     }
 }
 
-void DemoScene::UpdateRotatingLight(float deltaTime)
+void SphereGridScene::UpdateRotatingLight(float deltaTime)
 {
     m_lightAngle += deltaTime * m_lightRotationSpeed;
 
@@ -388,7 +388,7 @@ void DemoScene::UpdateRotatingLight(float deltaTime)
     light.direction.z = z / length;
 }
 
-void DemoScene::UpdateMovingSphere(float deltaTime)
+void SphereGridScene::UpdateMovingSphere(float deltaTime)
 {
     m_lightAngle += deltaTime * m_lightRotationSpeed;
 
@@ -411,7 +411,7 @@ void DemoScene::UpdateMovingSphere(float deltaTime)
         transform);
 }
 
-void DemoScene::UpdateOrbitingCamera(float deltaTime)
+void SphereGridScene::UpdateOrbitingCamera(float deltaTime)
 {
     m_cameraOrbitAngle += deltaTime * m_cameraOrbitSpeed;
     const float angle = m_cameraOrbitAngle;
@@ -444,7 +444,7 @@ void DemoScene::UpdateOrbitingCamera(float deltaTime)
     );
 }
 
-void DemoScene::ResetCamera()
+void SphereGridScene::ResetCamera()
 {
     Camera& camera = m_scene.GetCamera();
 
@@ -465,7 +465,7 @@ void DemoScene::ResetCamera()
     );
 }
 
-void DemoScene::ResetDirectionalLight()
+void SphereGridScene::ResetDirectionalLight()
 {
     DirectionalLight& light =
         m_scene.GetDirectionalLight();
@@ -482,7 +482,7 @@ void DemoScene::ResetDirectionalLight()
     light.angularRadius = ToRadians(5.0f);
 }
 
-void DemoScene::Shutdown()
+void SphereGridScene::Shutdown()
 {
     m_scene.GetRenderObjects().clear();
 
@@ -502,22 +502,22 @@ void DemoScene::Shutdown()
     Log::Info("DemoScene shutdown: complete.");
 }
 
-void DemoScene::SetAspectRatio(float aspectRatio)
+void SphereGridScene::SetAspectRatio(float aspectRatio)
 {
     m_scene.GetCamera().SetAspectRatio(aspectRatio);
 }
 
-Scene& DemoScene::GetScene()
+Scene& SphereGridScene::GetScene()
 {
     return m_scene;
 }
 
-const Scene& DemoScene::GetScene() const
+const Scene& SphereGridScene::GetScene() const
 {
     return m_scene;
 }
 
-std::vector<Material*> DemoScene::GetMaterials()
+std::vector<Material*> SphereGridScene::GetMaterials()
 {
     std::vector<Material*> materials;
 
@@ -541,47 +541,42 @@ std::vector<Material*> DemoScene::GetMaterials()
     return materials;
 }
 
-const Mesh& DemoScene::GetMesh() const
-{
-    return m_mesh;
-}
-
-void DemoScene::SetUpdateMode(DemoUpdateMode mode)
+void SphereGridScene::SetUpdateMode(DemoUpdateMode mode)
 {
     m_updateMode = mode;
 }
 
-DemoUpdateMode DemoScene::GetUpdateMode() const
+DemoUpdateMode SphereGridScene::GetUpdateMode() const
 {
     return m_updateMode;
 }
 
-void DemoScene::SetLightRotationSpeed(float speed)
+void SphereGridScene::SetLightRotationSpeed(float speed)
 {
     m_lightRotationSpeed = speed;
 }
 
-float DemoScene::GetLightRotationSpeed() const
+float SphereGridScene::GetLightRotationSpeed() const
 {
     return m_lightRotationSpeed;
 }
 
-void DemoScene::SetCameraOrbitSpeed(float speed)
+void SphereGridScene::SetCameraOrbitSpeed(float speed)
 {
     m_cameraOrbitSpeed = speed;
 }
 
-float DemoScene::GetCameraOrbitSpeed() const
+float SphereGridScene::GetCameraOrbitSpeed() const
 {
     return m_cameraOrbitSpeed;
 }
 
-void DemoScene::SetLightVerticalAngle(float angle)
+void SphereGridScene::SetLightVerticalAngle(float angle)
 {
     m_lightVerticalAngle = angle;
 }
 
-float DemoScene::GetLightVerticalAngle() const
+float SphereGridScene::GetLightVerticalAngle() const
 {
     return m_lightVerticalAngle;
 }

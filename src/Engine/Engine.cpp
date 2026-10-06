@@ -3,6 +3,7 @@
 #include "Core/Log.h"
 #include "Core/Assert.h"
 #include "Core/Time.h"
+#include "Scene/Scene.h"
 
 bool Engine::Initialize()
 {
@@ -30,10 +31,9 @@ bool Engine::Initialize()
     vertexShaderDescription.entryPoint = "VSMain";
     vertexShaderDescription.stage = ShaderStage::Vertex;
 
-    Shader* vertexShader =
-        m_renderer.GetShaderLibrary().Load(vertexShaderDescription);
+    m_demoVertexShader =m_renderer.GetShaderLibrary().Load(vertexShaderDescription);
 
-    if(!vertexShader){
+    if(!m_demoVertexShader){
         Log::Error("Failed to load demo vertex shader.");
         return false;
     }
@@ -43,41 +43,37 @@ bool Engine::Initialize()
     pixelShaderDescription.entryPoint = "PSMain";
     pixelShaderDescription.stage = ShaderStage::Pixel;
 
-    Shader* pixelShader =
-        m_renderer.GetShaderLibrary().Load(pixelShaderDescription);
+    m_demoPixelShader = m_renderer.GetShaderLibrary().Load(pixelShaderDescription);
 
-    if(!pixelShader){
+    if(!m_demoPixelShader){
         Log::Error("Failed to load demo pixel shader.");
         return false;
     }
 
-    if(!m_demoScene.Initialize(
+    const float aspectRatio = static_cast<float>(m_window.GetWidth()) / static_cast<float>(m_window.GetHeight());
+
+    if(!m_demoSceneManager.Initialize(
+        DemoSceneId::SphereGrid,
         m_renderer.GetDevice(),
         m_renderer.GetResourceUploader(),
         m_renderer.GetResourceDescriptorHeap(),
-        vertexShader,
-        pixelShader))
+        m_demoVertexShader,
+        m_demoPixelShader,
+        aspectRatio))
     {
-        Log::Error("Failed to initialize demo scene.");
+        Log::Error("Failed to initialize demo scene manager.");
         return false;
     }
 
     Log::Info("Demo scene initialization complete.");
 
-    if(!m_renderer.InitializeRayTracingScene(m_demoScene.GetScene())){
-        Log::Error("Failed to init demo ray tracing.");
+    IDemoScene& activeDemo = m_demoSceneManager.GetActiveScene();
+
+    if(!m_renderer.InitializeSceneResources(activeDemo.GetScene(), activeDemo.GetMaterials()))
+    {
+        Log::Error("Failed to initialize demo renderer resources.");
         return false;
     }
-
-    if(!m_renderer.InitializeMaterials(m_demoScene.GetMaterials())){
-        Log::Error("Failed to initialize demo materials.");
-        return false;
-    }
-
-    m_demoScene.SetAspectRatio(
-        static_cast<float>(m_window.GetWidth()) /
-        static_cast<float>(m_window.GetHeight())
-    );
 
     m_window.SetEventCallback(
         [this](const Event& event)
@@ -87,7 +83,7 @@ bool Engine::Initialize()
                     m_window.SetSize(event.width, event.height);
 
                     if(event.width > 0 && event.height > 0){
-                        m_demoScene.SetAspectRatio(static_cast<float>(event.width) / static_cast<float>(event.height));
+                        m_demoSceneManager.SetAspectRatio(static_cast<float>(event.width) / static_cast<float>(event.height));
                     }
 
                     m_renderer.Resize(event.width, event.height);
@@ -151,17 +147,47 @@ void Engine::Frame()
         return;
     }
 
+    if(m_demoSceneManager.HasPendingSceneChange())
+    {
+        m_renderer.WaitForGPU();
+        m_renderer.ReleaseSceneResources();
+
+        if(!m_demoSceneManager.ApplyPendingSceneChange(
+            m_renderer.GetDevice(),
+            m_renderer.GetResourceUploader(),
+            m_renderer.GetResourceDescriptorHeap(),
+            m_demoVertexShader,
+            m_demoPixelShader))
+        {
+            Log::Error("Failed to switch demo scene.");
+            m_window.Close();
+            return;
+        }
+
+        IDemoScene& switchedDemo = m_demoSceneManager.GetActiveScene();
+
+        if(!m_renderer.InitializeSceneResources(switchedDemo.GetScene(), switchedDemo.GetMaterials()))
+        {
+            Log::Error("Failed to initialize renderer resources for switched demo scene.");
+            m_window.Close();
+            return;
+        }
+    }
+
     DebugUI& debugUI = m_renderer.GetDebugUI();
 
     debugUI.BeginFrame();
     debugUI.DrawPerformanceWindow();
 
-    m_editor.Draw(m_demoScene);
+    IDemoScene& activeDemo = m_demoSceneManager.GetActiveScene();
 
-    m_demoScene.Update(m_time.GetDeltaTime());
-    m_renderer.Render(m_demoScene.GetScene());
+    m_editor.Draw(activeDemo, m_demoSceneManager, m_demoSceneManager.GetActiveSphereGridScene());
 
-    m_demoScene.GetScene().ClearChangedTransforms();
+    activeDemo.Update(m_time.GetDeltaTime());
+
+    m_renderer.Render(activeDemo.GetScene());
+
+    activeDemo.GetScene().ClearChangedTransforms();
 }
 
 void Engine::Shutdown()
@@ -171,15 +197,12 @@ void Engine::Shutdown()
 
     m_state = EngineState::Stopped;
 
-    Log::Info("Engine shutdown: waiting for GPU.");
     m_renderer.WaitForGPU();
-    Log::Info("Engine shutdown: GPU finished.");
 
-    m_demoScene.Shutdown();
-
-    Log::Info("Engine shutdown: starting renderer shutdown.");
+    m_renderer.ReleaseSceneResources();
+    m_demoSceneManager.Shutdown();
+    
     m_renderer.Shutdown();
-    Log::Info("Engine shutdown: renderer shutdown finished.");
 
     m_window.Shutdown();
     Log::Info("Engine shutdown: finished.");

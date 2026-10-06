@@ -2,7 +2,7 @@
 
 #include "Core/Time.h"
 #include "Core/Input.h"
-#include "DemoContent/DemoScene.h"
+#include "DemoContent/DemoSceneManager.h"
 #include "Platform/Windows/WindowsWindow.h"
 #include "Platform/WindowProperties.h"
 #include "Renderer/Renderer.h"
@@ -36,7 +36,11 @@ private:
     Input m_input;
     Renderer m_renderer;
 
-    DemoScene m_demoScene;
+    DemoSceneManager m_demoSceneManager;
+
+    Shader* m_demoVertexShader = nullptr;
+    Shader* m_demoPixelShader = nullptr;
+    
     Editor m_editor;
 
     EngineState m_state = EngineState::Uninitialized;
