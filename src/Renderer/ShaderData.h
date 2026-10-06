@@ -16,11 +16,15 @@ struct MaterialConstants
 struct CameraConstants
 {
     Matrix4 viewProjection;
+    Matrix4 previousViewProjection;
+    Matrix4 view;
+    Matrix4 previousView;
 };
 
 struct ObjectConstants
 {
     Matrix4 model;
+    Matrix4 previousModel;
     Matrix4 normalMatrix;
 };
 
@@ -127,8 +131,8 @@ struct RayTracingInstanceData
 
 static_assert(sizeof(MaterialConstants) == 32);
 static_assert(sizeof(Matrix4) == 64);
-static_assert(sizeof(CameraConstants) == 64);
-static_assert(sizeof(ObjectConstants) == 128);
+static_assert(sizeof(CameraConstants) == 256);
+static_assert(sizeof(ObjectConstants) == 192);
 static_assert(sizeof(ReconstructionConstants) == 80);
 static_assert(sizeof(GPUMaterial) == 80);
 static_assert(sizeof(ShadowConstants) == 256);

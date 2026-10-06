@@ -1,5 +1,6 @@
 #pragma once
 
+#include "Renderer/RendererStatistics.h"
 #include "Renderer/Passes/ToneMapPass.h"
 
 #include <climits>
@@ -30,7 +31,7 @@ class DebugUI
         void Shutdown();
 
         void BeginFrame();
-        void DrawPerformanceWindow(const std::vector<std::string>& environmentNames, size_t currentEnvironmentIndex);
+        void DrawPerformanceWindow(const std::vector<std::string>& environmentNames, size_t currentEnvironmentIndex, const RendererStatistics& statistics);
         void EndFrame(ID3D12GraphicsCommandList* commandList);
 
         void SetTLASUpdated(bool updated);

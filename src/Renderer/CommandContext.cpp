@@ -217,3 +217,21 @@ ID3D12GraphicsCommandList4* CommandContext::GetRayTracingCommandList() const
 {
     return m_rayTracingCommandList;
 }
+
+uint64_t CommandContext::GetCompletedFenceValue() const
+{
+    if(!m_fence){
+        return 0;
+    }
+
+    return m_fence->GetCompletedValue();
+}
+
+uint64_t CommandContext::GetFrameFenceValue(unsigned int frameIndex) const
+{
+    if(frameIndex >= FrameCount){
+        return 0;
+    }
+
+    return m_frameFenceValues[frameIndex];
+}

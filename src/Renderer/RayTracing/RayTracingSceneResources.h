@@ -24,6 +24,7 @@ class RayTracingSceneResources
         const TopLevelAccelerationStructure& GetTopLevel() const;
 
         unsigned int GetInstanceDataDescriptorIndex() const;
+        std::size_t GetInstanceCount() const;
 
     private:
         static constexpr std::size_t InvalidInstanceIndex = static_cast<std::size_t>(-1);

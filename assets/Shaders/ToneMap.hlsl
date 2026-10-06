@@ -172,6 +172,14 @@ float4 PSMain(VSOutput input) : SV_TARGET
         return float4(LinearToSRGB(AgX(max(decoded.xyz, 0.0f))), 1);
     }
 
+    if(toneMapConstants.debugView == 9)
+    {
+        Texture2D<float4> motionTexture = ResourceDescriptorHeap[toneMapConstants.debugTextureIndex];
+        float3 motion = motionTexture.Load(int3(pixel, 0)).xyz;
+        float3 display = saturate(0.5f + motion * float3(2000.0f, 2000.0f, 10.0f));
+        return float4(display, 1.0f);
+    }
+
     Texture2D<float4> sceneColor =
         // Mode 8 is already unpacked, remodulated linear HDR reflection RGB.
         ResourceDescriptorHeap[toneMapConstants.debugView == 8

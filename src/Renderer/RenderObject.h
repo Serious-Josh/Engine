@@ -11,4 +11,5 @@ struct RenderObject
     Material* material = nullptr;
 
     Transform transform;
+    Transform previousTransform;
 };

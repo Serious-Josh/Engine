@@ -11,6 +11,7 @@ struct NrdReflectionPrepareConstants
     uint depthIndex;
     uint materialIndex;
     uint surfaceIndex;
+    uint motionInputIndex;
     uint materialBufferIndex;
     uint rawReflectionIndex;
     uint trackingDistanceIndex;
@@ -24,6 +25,7 @@ struct NrdReflectionPrepareConstants
     uint motionOutputIndex;
     uint normalRoughnessOutputIndex;
     uint specRadianceHitDistOutputIndex;
+    uint3 padding;
 };
 
 ConstantBuffer<NrdReflectionPrepareConstants> constants : register(b0);
@@ -95,6 +97,13 @@ void CSMain(uint3 dispatchThreadID : SV_DispatchThreadID)
         F0 = FresnelConductor(1.0f, material.conductorN, material.conductorK);
     else
         return;
+
+    Texture2D<float4> motionInput = ResourceDescriptorHeap[constants.motionInputIndex];
+    float3 genericMotion = motionInput.Load(int3(pixel, 0)).xyz;
+    if(all(isfinite(genericMotion)))
+    {
+        motionOutput[pixel] = float4(-genericMotion.xy, genericMotion.z, 0.0f);
+    }
 
     float3 diffuseFactor, specularFactor;
     NRD_MaterialFactors(normal, V, materialData.rgb, F0, roughness, diffuseFactor, specularFactor);

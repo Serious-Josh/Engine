@@ -18,25 +18,28 @@ struct NrdReflectionPrepareConstants
     unsigned int depthIndex;
     unsigned int materialIndex;
     unsigned int surfaceIndex;
-    unsigned int materialBufferIndex;
+    unsigned int motionInputIndex;
 
+    unsigned int materialBufferIndex;
     unsigned int rawReflectionIndex;
     unsigned int trackingDistanceIndex;
     unsigned int width;
-    unsigned int height;
 
+    unsigned int height;
     float hitDistanceA;
     float hitDistanceB;
     float hitDistanceC;
-    float denoisingRange;
 
+    float denoisingRange;
     unsigned int viewZOutputIndex;
     unsigned int motionOutputIndex;
     unsigned int normalRoughnessOutputIndex;
+
     unsigned int specRadianceHitDistOutputIndex;
+    unsigned int padding[3];
 };
 
-static_assert(sizeof(NrdReflectionPrepareConstants) == 192);
+static_assert(sizeof(NrdReflectionPrepareConstants) == 208);
 
 class NrdReflectionPreparePass
 {

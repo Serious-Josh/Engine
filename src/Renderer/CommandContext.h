@@ -1,6 +1,7 @@
 #pragma once
 
 #include <d3d12.h>
+#include <cstdint>
 
 class CommandContext
 {
@@ -22,6 +23,9 @@ class CommandContext
         ID3D12GraphicsCommandList* GetCommandList() const;
         ID3D12CommandQueue* GetCommandQueue() const;
         ID3D12GraphicsCommandList4* GetRayTracingCommandList() const;
+        
+        uint64_t GetCompletedFenceValue() const;
+        uint64_t GetFrameFenceValue(unsigned int frameIndex) const;
 
     private:
         static constexpr unsigned int FrameCount = 2;

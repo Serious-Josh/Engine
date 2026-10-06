@@ -38,6 +38,11 @@ bool Renderer::Initialize(void* windowHandle, unsigned int width, unsigned int h
         return false;
     }
 
+    if(!m_gpuTimestampProfiler.Initialize(m_graphicsDevice.GetDevice(), m_commandContext.GetCommandQueue())){
+        Log::Error("Failed to init GPU timestamp profiler.");
+        return false;
+    }
+
     ID3D12Device* device = m_graphicsDevice.GetDevice();
 
     m_assetRoot = assetRoot;
@@ -361,6 +366,7 @@ void Renderer::Draw(ID3D12GraphicsCommandList* commandList, const RenderObject& 
 
     ObjectConstants objectConstants{};
     objectConstants.model = object.transform.GetModelMatrix();
+    objectConstants.previousModel = object.previousTransform.GetModelMatrix();
     objectConstants.normalMatrix = objectConstants.model.Inverse().Transpose();
 
     D3D12_GPU_VIRTUAL_ADDRESS objectConstantsAddress = m_uploadBuffer.Allocate(&objectConstants, sizeof(ObjectConstants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
@@ -388,10 +394,20 @@ void Renderer::Draw(ID3D12GraphicsCommandList* commandList, const RenderObject& 
     object.mesh->Bind(commandList);
 
     if(object.mesh->IsIndexed()){
+        const uint64_t indexCount = static_cast<uint64_t>(object.mesh->GetIndexCount());
+
         commandList->DrawIndexedInstanced(static_cast<UINT>(object.mesh->GetIndexCount()), 1, 0, 0, 0);
+
+        ++m_currentFrameStatistics.geometryDrawCalls;
+        m_currentFrameStatistics.submittedTriangles += indexCount / 3;
     }
     else{
+        const uint64_t vertexCount = static_cast<uint64_t>(object.mesh->GetVertexCount());
+
         commandList->DrawInstanced(static_cast<UINT>(object.mesh->GetVertexCount()), 1, 0, 0);
+
+        ++m_currentFrameStatistics.geometryDrawCalls;
+        m_currentFrameStatistics.submittedTriangles += vertexCount / 3;
     }
 }
 
@@ -403,10 +419,12 @@ void Renderer::BeginGeometryPass(ID3D12GraphicsCommandList* commandList)
 {
     RenderTarget& albedo = m_gBuffer.GetMaterial();
     RenderTarget& normal = m_gBuffer.GetSurface();
+    RenderTarget& motion = m_gBuffer.GetMotion();
     DepthBuffer& depth = m_gBuffer.GetDepth();
 
     albedo.Transition(commandList, D3D12_RESOURCE_STATE_RENDER_TARGET);
     normal.Transition(commandList, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    motion.Transition(commandList, D3D12_RESOURCE_STATE_RENDER_TARGET);
     depth.Transition(commandList, D3D12_RESOURCE_STATE_DEPTH_WRITE);
 
     const float albedoClearColor[] =
@@ -419,15 +437,21 @@ void Renderer::BeginGeometryPass(ID3D12GraphicsCommandList* commandList)
         0.0f, 1.0f, 0.0f, 1.0f
     };
 
-    D3D12_CPU_DESCRIPTOR_HANDLE renderTargets[] = {albedo.GetRTV(), normal.GetRTV()};
+    const float motionClearColor[] =
+    {
+        0.0f, 0.0f, 0.0f, 0.0f
+    };
+
+    D3D12_CPU_DESCRIPTOR_HANDLE renderTargets[] = {albedo.GetRTV(), normal.GetRTV(), motion.GetRTV()};
 
     commandList->ClearRenderTargetView(renderTargets[0], albedoClearColor, 0, nullptr);
     commandList->ClearRenderTargetView(renderTargets[1], normalClearColor, 0, nullptr);
+    commandList->ClearRenderTargetView(renderTargets[2], motionClearColor, 0, nullptr);
     commandList->ClearDepthStencilView(depth.GetDSV(), D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
 
     D3D12_CPU_DESCRIPTOR_HANDLE dsv = depth.GetDSV();
 
-    commandList->OMSetRenderTargets(2, renderTargets, FALSE, &dsv);
+    commandList->OMSetRenderTargets(3, renderTargets, FALSE, &dsv);
 }
 
 void Renderer::EndGeometryPass(ID3D12GraphicsCommandList* commandList)
@@ -435,6 +459,7 @@ void Renderer::EndGeometryPass(ID3D12GraphicsCommandList* commandList)
     constexpr D3D12_RESOURCE_STATES shaderReadState = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     m_gBuffer.GetMaterial().Transition(commandList, shaderReadState);
     m_gBuffer.GetSurface().Transition(commandList, shaderReadState);
+    m_gBuffer.GetMotion().Transition(commandList, shaderReadState);
     m_gBuffer.GetDepth().Transition(commandList, shaderReadState);
 }
 
@@ -554,6 +579,36 @@ void Renderer::Render(const Scene& scene)
         return;
     }
 
+    if(m_gpuTimestampProfiler.CollectCompleted(m_commandContext.GetCompletedFenceValue())){
+        const GpuTimestampProfiler::Results& gpuResults = m_gpuTimestampProfiler.GetResults();
+
+        for(unsigned int i = 0; i < GpuTimestampProfiler::FrameCount; ++i){
+            PendingRendererStatistics& pending = m_pendingStatistics[i];
+
+            if(!pending.valid){
+                continue;
+            }
+
+            if(pending.statistics.frameSerial != gpuResults.frameSerial){
+                continue;
+            }
+
+            m_statistics = pending.statistics;
+            m_statistics.gpuTimings = gpuResults;
+
+            pending.valid = false;
+            break;
+        }
+    }
+    
+    ID3D12GraphicsCommandList* commandList = m_commandContext.GetCommandList();
+    m_gpuTimestampProfiler.BeginFrame(commandList, frameIndex);
+
+    m_currentFrameStatistics = {};
+    m_currentFrameStatistics.frameSerial = m_gpuProfilerFrameSerial;
+    m_currentFrameStatistics.renderObjectCount = static_cast<uint64_t>(scene.GetRenderObjects().size());
+    m_currentFrameStatistics.tlasInstanceCount = static_cast<uint64_t>(m_rayTracingScene.GetInstanceCount());
+
     m_uploadBuffer.Reset(frameIndex);
 
     const bool tlasNeedsUpdate = !scene.GetChangedTransforms().empty();
@@ -577,9 +632,13 @@ void Renderer::Render(const Scene& scene)
 
     CameraConstants cameraConstants{};
     cameraConstants.viewProjection = currentViewProjection;
+    cameraConstants.previousViewProjection = m_hasPreviousViewProjection ? m_previousViewProjection : currentViewProjection;
+    cameraConstants.view = currentView;
+    cameraConstants.previousView = m_hasPreviousViewProjection ? m_previousView : currentView;
 
-    const Matrix4 previousNrdView = m_hasPreviousNrdCamera ? m_previousView : currentView;
-    const Matrix4 previousNrdProjection = m_hasPreviousNrdCamera ? m_previousProjection : currentProjection;
+    const Matrix4 previousNrdView = m_hasPreviousNrdCamera ? m_previousNrdView : currentView;
+
+    const Matrix4 previousNrdProjection = m_hasPreviousNrdCamera ? m_previousNrdProjection : currentProjection;
 
     D3D12_GPU_VIRTUAL_ADDRESS cameraConstantsAddress = m_uploadBuffer.Allocate(&cameraConstants, sizeof(CameraConstants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
 
@@ -689,6 +748,7 @@ void Renderer::Render(const Scene& scene)
     reflectionConstants.importanceTotalWeight = m_environment.GetImportanceTotalWeight();
 
     m_previousViewProjection = cameraConstants.viewProjection;
+    m_previousView = cameraConstants.view;
     m_hasPreviousViewProjection = true;
 
     D3D12_GPU_VIRTUAL_ADDRESS shadowConstantsAddress = m_uploadBuffer.Allocate(&shadowConstants, sizeof(ShadowConstants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
@@ -704,8 +764,6 @@ void Renderer::Render(const Scene& scene)
         Log::Error("Failed to allocate ray traced reflection constants.");
         return;
     }
-
-    ID3D12GraphicsCommandList* commandList = m_commandContext.GetCommandList();
 
     D3D12_RESOURCE_BARRIER barrier{};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -750,6 +808,8 @@ void Renderer::Render(const Scene& scene)
 
     commandList->ClearRenderTargetView(rtvHandle, clearColor, 0, nullptr);
 
+    m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::Geometry);
+
     BeginGeometryPass(commandList);
     
     for(const RenderObject& object : scene.GetRenderObjects()){
@@ -757,6 +817,10 @@ void Renderer::Render(const Scene& scene)
     }
 
     EndGeometryPass(commandList);
+
+    m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::Geometry);
+
+    m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::RayTracedShadows);
 
     m_rayTracedShadowPass.Execute(
         m_commandContext.GetRayTracingCommandList(),
@@ -766,6 +830,8 @@ void Renderer::Render(const Scene& scene)
         m_width,
         m_height
     );
+
+    m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::RayTracedShadows);
 
     constexpr D3D12_RESOURCE_STATES shaderReadState =
         D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
@@ -778,7 +844,19 @@ void Renderer::Render(const Scene& scene)
     m_brdfIntegrationLUT.Transition(commandList, shaderReadState);
     m_ggxAverageAlbedoLUT.Transition(commandList, shaderReadState);
 
-    m_rayTracedReflectionPass.Execute(m_commandContext.GetRayTracingCommandList(), m_resourceDescriptorHeap, m_rayTracingScene, reflectionConstantsAddress, lightConstantsAddress, m_width, m_height);
+    m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::RayTracedReflections);
+
+    m_rayTracedReflectionPass.Execute(
+        m_commandContext.GetRayTracingCommandList(),
+        m_resourceDescriptorHeap,
+        m_rayTracingScene,
+        reflectionConstantsAddress,
+        lightConstantsAddress,
+        m_width,
+        m_height
+    );
+
+    m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::RayTracedReflections);
 
     constexpr float nrdDenoisingRange = 1000.0f;
     const bool limiterEnabled = m_debugUI.IsReflectionContributionLimiterEnabled();
@@ -821,13 +899,20 @@ void Renderer::Render(const Scene& scene)
         Texture* nrdInput = &m_rayTracedReflectionPass.GetRawReflectionTexture();
         if(limiterEnabled)
         {
+            m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::ReflectionContributionLimiter);
+
             if(!m_reflectionContributionLimitPass.Execute(commandList, *nrdInput, m_uploadBuffer, m_width, m_height))
             {
                 Log::Error("Failed to execute reflection contribution limiter.");
                 return;
             }
+
+            m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::ReflectionContributionLimiter);
+
             nrdInput = &m_reflectionContributionLimitPass.GetOutputTexture();
         }
+
+        m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::NrdPrepare);
 
         m_nrdReflectionPreparePass.Execute(
             commandList,
@@ -842,6 +927,10 @@ void Renderer::Render(const Scene& scene)
             m_height,
             nrdDenoisingRange);
 
+        m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::NrdPrepare);
+
+        m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::NrdReblur);
+
         m_nrdReflectionDenoiser.Denoise(
             commandList,
             m_nrdReflectionPreparePass.GetMotionTexture(),
@@ -849,9 +938,13 @@ void Renderer::Render(const Scene& scene)
             m_nrdReflectionPreparePass.GetViewZTexture(),
             m_nrdReflectionPreparePass.GetSpecRadianceHitDistTexture());
 
+        m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::NrdReblur);
+
         commandList->SetDescriptorHeaps(
             1,
             descriptorHeaps);
+
+        m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::NrdResolve);
 
         m_nrdReflectionResolvePass.Execute(
             commandList,
@@ -863,6 +956,8 @@ void Renderer::Render(const Scene& scene)
             m_materialBuffer.GetDescriptorIndex(),
             m_width,
             m_height);
+
+        m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::NrdResolve);
     }
 
     if(runNative)
@@ -895,7 +990,13 @@ void Renderer::Render(const Scene& scene)
         ? m_nrdReflectionResolvePass.GetOutputTexture()
         : m_rayTracedReflectionDenoisePass.GetFilteredReflectionTexture();
 
+    m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::ShadowDenoise);
+
     m_shadowDenoisePass.Execute(commandList, m_rayTracedShadowPass.GetVisibilityTexture(), m_gBuffer, m_uploadBuffer, reconstructionConstants.inverseViewProjection, m_width, m_height);
+
+    m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::ShadowDenoise);
+
+    m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::DeferredLighting);
 
     m_deferredLightingPass.Execute(
         commandList,
@@ -914,9 +1015,14 @@ void Renderer::Render(const Scene& scene)
         lightConstantsAddress
     );
 
+    m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::DeferredLighting);
+
     Texture* debugTexture = nullptr;
+    RenderTarget* debugRenderTarget = nullptr;
     switch(debugView)
     {
+        case ToneMapDebugView::GBufferMotion:
+            debugRenderTarget = &m_gBuffer.GetMotion(); break;
         case ToneMapDebugView::SpecularTrackingDistance:
             debugTexture = &m_rayTracedReflectionPass.GetSpecularTrackingDistanceTexture(); break;
         case ToneMapDebugView::NrdViewZ:
@@ -933,8 +1039,13 @@ void Renderer::Render(const Scene& scene)
             debugTexture = &m_nrdReflectionResolvePass.GetOutputTexture(); break;
         default: break;
     }
+
+    m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::ToneMap);
+
     m_toneMapPass.Execute(commandList, m_sceneColor, rtvHandle,
-        debugTexture, debugView, nrdDenoisingRange);
+        debugTexture, debugView, nrdDenoisingRange, debugRenderTarget);
+
+    m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::ToneMap);
 
     m_debugUI.EndFrame(commandList);
 
@@ -942,6 +1053,8 @@ void Renderer::Render(const Scene& scene)
     barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
 
     commandList->ResourceBarrier(1, &barrier);
+
+    m_gpuTimestampProfiler.EndFrameAndResolve(commandList, frameIndex);
 
     if(!m_commandContext.End()){
         Log::Error("Failed to end command recording.");
@@ -953,12 +1066,21 @@ void Renderer::Render(const Scene& scene)
         return;
     }
 
+    const uint64_t submissionFence = m_commandContext.GetFrameFenceValue(frameIndex);
+
+    m_gpuTimestampProfiler.MarkSubmitted(frameIndex, submissionFence, m_gpuProfilerFrameSerial);
+
+    m_pendingStatistics[frameIndex].statistics = m_currentFrameStatistics;
+    m_pendingStatistics[frameIndex].valid = true;
+
+    ++m_gpuProfilerFrameSerial;
+
     if(!m_swapChain.Present()){
         Log::Error("Failed to present swap chain.");
     }
 
-    m_previousView = currentView;
-    m_previousProjection = currentProjection;
+    m_previousNrdView = currentView;
+    m_previousNrdProjection = currentProjection;
     m_hasPreviousNrdCamera = true;
     m_nrdExecutedLastFrame = runNrd;
     m_nativeReflectionExecutedLastFrame = runNative;
@@ -986,6 +1108,7 @@ void Renderer::Shutdown()
 
     Log::Info("Renderer shutdown: releasing renderer resources...");
     m_swapChain.Shutdown();
+    m_gpuTimestampProfiler.Shutdown();
     m_commandContext.Shutdown();
     m_resourceUploader.Shutdown();
 
@@ -1272,9 +1395,7 @@ bool Renderer::PreprocessEnvironment(EnvironmentMap& environment)
     }
 
     const bool submitted = m_commandContext.Execute(0);
-
-    // Execute may have submitted GPU work even if its final fence operation
-    // reports failure, so keep the temporary passes alive through this wait.
+    
     m_commandContext.WaitForGPU();
 
     cleanup();
@@ -1286,4 +1407,9 @@ bool Renderer::PreprocessEnvironment(EnvironmentMap& environment)
     }
 
     return true;
+}
+
+const RendererStatistics& Renderer::GetStatistics() const
+{
+    return m_statistics;
 }

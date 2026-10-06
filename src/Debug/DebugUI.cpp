@@ -89,7 +89,7 @@ void DebugUI::BeginFrame()
     ImGui::NewFrame();
 }
 
-void DebugUI::DrawPerformanceWindow(const std::vector<std::string>& environmentNames, size_t currentEnvironmentIndex)
+void DebugUI::DrawPerformanceWindow(const std::vector<std::string>& environmentNames, size_t currentEnvironmentIndex, const RendererStatistics& statistics)
 {
     ImGuiIO& io = ImGui::GetIO();
 
@@ -112,6 +112,98 @@ void DebugUI::DrawPerformanceWindow(const std::vector<std::string>& environmentN
     if(io.Framerate > 0.0f){
         ImGui::Text("%.2f ms", 1000.0f / io.Framerate);
     }
+
+    ImGui::Separator();
+
+    ImGui::Text(
+        "Geometry draws: %llu",
+        static_cast<unsigned long long>(
+            statistics.geometryDrawCalls));
+
+    ImGui::Text(
+        "Triangles: %llu",
+        static_cast<unsigned long long>(
+            statistics.submittedTriangles));
+
+    ImGui::Text(
+        "Render objects: %llu",
+        static_cast<unsigned long long>(
+            statistics.renderObjectCount));
+
+    ImGui::Text(
+        "TLAS instances: %llu",
+        static_cast<unsigned long long>(
+            statistics.tlasInstanceCount));
+
+    ImGui::Separator();
+
+    const GpuTimestampProfiler::Results& gpu =
+        statistics.gpuTimings;
+
+    auto drawGpuTiming =
+        [&](const char* name, GpuTimestampProfiler::Region region)
+    {
+        const unsigned int index =
+            static_cast<unsigned int>(region);
+
+        const uint32_t mask = 1u << index;
+
+        if((gpu.validRegions & mask) != 0)
+        {
+            ImGui::Text(
+                "%s: %.3f ms",
+                name,
+                gpu.milliseconds[index]);
+        }
+        else
+        {
+            ImGui::Text("%s: --", name);
+        }
+    };
+
+    drawGpuTiming(
+        "GPU frame",
+        GpuTimestampProfiler::Region::TotalFrame);
+
+    drawGpuTiming(
+        "  Geometry",
+        GpuTimestampProfiler::Region::Geometry);
+
+    drawGpuTiming(
+        "  RT shadows",
+        GpuTimestampProfiler::Region::RayTracedShadows);
+
+    drawGpuTiming(
+        "  Shadow denoise",
+        GpuTimestampProfiler::Region::ShadowDenoise);
+
+    drawGpuTiming(
+        "  RT reflections",
+        GpuTimestampProfiler::Region::RayTracedReflections);
+
+    drawGpuTiming(
+        "  Reflection limiter",
+        GpuTimestampProfiler::Region::ReflectionContributionLimiter);
+
+    drawGpuTiming(
+        "  NRD prepare",
+        GpuTimestampProfiler::Region::NrdPrepare);
+
+    drawGpuTiming(
+        "  NRD REBLUR",
+        GpuTimestampProfiler::Region::NrdReblur);
+
+    drawGpuTiming(
+        "  NRD resolve",
+        GpuTimestampProfiler::Region::NrdResolve);
+
+    drawGpuTiming(
+        "  Deferred lighting",
+        GpuTimestampProfiler::Region::DeferredLighting);
+
+    drawGpuTiming(
+        "  Tone map",
+        GpuTimestampProfiler::Region::ToneMap);
 
     ImGui::Separator();
 
@@ -153,7 +245,7 @@ void DebugUI::DrawPerformanceWindow(const std::vector<std::string>& environmentN
 
     const char* views[] = {"None", "Specular tracking distance", "NRD ViewZ", "NRD Normal",
         "NRD Roughness", "NRD Motion", "NRD Spec Radiance", "NRD Hit Distance",
-        "NrdResolvedReflection"};
+        "NrdResolvedReflection", "GBuffer Motion"};
     const char* denoisers[] = {"NRD", "Native"};
     ImGui::Combo("Reflection denoiser", &m_reflectionDenoiserMode, denoisers, IM_ARRAYSIZE(denoisers));
     ImGui::Checkbox("NRD contribution limiter", &m_contributionLimiterEnabled);
@@ -161,6 +253,9 @@ void DebugUI::DrawPerformanceWindow(const std::vector<std::string>& environmentN
     ImGui::Separator();
     if(GetToneMapDebugView() == ToneMapDebugView::SpecularTrackingDistance){
         ImGui::TextUnformatted("Magenta: invalid | Blue: environment miss | Gray: geometry");
+    }
+    else if(GetToneMapDebugView() == ToneMapDebugView::GBufferMotion){
+        ImGui::TextUnformatted("Gray: zero UV motion | R: signed X | G: signed Y (20x)");
     }
     else if(GetToneMapDebugView() == ToneMapDebugView::NrdViewZ){
         ImGui::TextUnformatted("Gray: Z / (Z + 10) | Magenta: beyond NRD range | Red: invalid Z");

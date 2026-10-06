@@ -206,3 +206,8 @@ unsigned int RayTracingSceneResources::GetInstanceDataDescriptorIndex() const
 {
     return m_instanceDataBuffer.GetDescriptorIndex();
 }
+
+std::size_t RayTracingSceneResources::GetInstanceCount() const
+{
+    return m_instances.size();
+}

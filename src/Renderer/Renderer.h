@@ -6,7 +6,9 @@
 #include "Renderer/CommandContext.h"
 #include "Renderer/DescriptorHeap.h"
 #include "Renderer/GraphicsDevice.h"
+#include "Renderer/GpuTimestampProfiler.h"
 #include "Renderer/RenderObject.h"
+#include "Renderer/RendererStatistics.h"
 #include "Renderer/ResourceUploader.h"
 #include "Renderer/SwapChain.h"
 #include "Renderer/Shader/ShaderLibrary.h"
@@ -78,6 +80,8 @@ class Renderer
 
         bool SetEnvironment(size_t index);
 
+        const RendererStatistics& GetStatistics() const;
+
     private:
         bool InitializeDevice();
         bool InitializeSwapChain(void* windowHandle);
@@ -92,6 +96,8 @@ class Renderer
         GraphicsDevice m_graphicsDevice;
         SwapChain m_swapChain;
         CommandContext m_commandContext;
+        GpuTimestampProfiler m_gpuTimestampProfiler;
+        uint64_t m_gpuProfilerFrameSerial = 0;
 
         ResourceUploader m_resourceUploader;
         DescriptorHeap m_resourceDescriptorHeap;
@@ -138,9 +144,11 @@ class Renderer
         RayTracingSceneResources m_rayTracingScene;
 
         Matrix4 m_previousViewProjection{};
-        bool m_hasPreviousViewProjection = false;
         Matrix4 m_previousView{};
-        Matrix4 m_previousProjection{};
+        bool m_hasPreviousViewProjection = false;
+
+        Matrix4 m_previousNrdView{};
+        Matrix4 m_previousNrdProjection{};
         bool m_hasPreviousNrdCamera = false;
 
         Vector3 m_previousShadowLightDirection{};
@@ -149,4 +157,14 @@ class Renderer
         std::filesystem::path m_assetRoot;
         std::vector<EnvironmentAsset> m_availableEnvironments;
         size_t m_currentEnvironmentIndex = 0;
+
+        RendererStatistics m_statistics{};
+        RendererStatistics m_currentFrameStatistics{};
+        struct PendingRendererStatistics
+        {
+            RendererStatistics statistics{};
+            bool valid = false;
+        };
+
+        PendingRendererStatistics m_pendingStatistics[GpuTimestampProfiler::FrameCount]{};
 };

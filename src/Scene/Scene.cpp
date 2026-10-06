@@ -5,6 +5,8 @@ RenderObjectID Scene::AddRenderObject(const RenderObject& object)
     const RenderObjectID id = m_renderObjects.size();
 
     m_renderObjects.push_back(object);
+    m_renderObjects.back().previousTransform = object.transform;
+
     m_transformDirty.push_back(false);
 
     return id;
@@ -32,6 +34,8 @@ const std::vector<RenderObjectID>& Scene::GetChangedTransforms() const
 void Scene::ClearChangedTransforms()
 {
     for(RenderObjectID id : m_changedTransforms){
+        m_renderObjects[id].previousTransform = m_renderObjects[id].transform;
+        
         m_transformDirty[id] = false;
     }
 

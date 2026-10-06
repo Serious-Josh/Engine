@@ -56,7 +56,8 @@ void ToneMapPass::Execute(
     D3D12_CPU_DESCRIPTOR_HANDLE outputRTV,
     Texture* debugTexture,
     ToneMapDebugView debugView,
-    float nrdDenoisingRange)
+    float nrdDenoisingRange,
+    RenderTarget* debugRenderTarget)
 {
     sceneColor.Transition(
         commandList,
@@ -65,6 +66,10 @@ void ToneMapPass::Execute(
 
     if(debugTexture){
         debugTexture->Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    }
+
+    if(debugRenderTarget){
+        debugRenderTarget->Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     }
 
     commandList->OMSetRenderTargets(
@@ -88,8 +93,9 @@ void ToneMapPass::Execute(
     ToneMapConstants constants{};
     constants.sceneColorIndex = sceneColor.GetSRVIndex();
     constants.exposure = 1.0f;
-    constants.debugTextureIndex = debugTexture ? debugTexture->GetDescriptorIndex() : 0;
-    constants.debugView = debugTexture ? static_cast<unsigned int>(debugView) : 0;
+    constants.debugTextureIndex = debugRenderTarget ? debugRenderTarget->GetSRVIndex()
+        : (debugTexture ? debugTexture->GetDescriptorIndex() : 0);
+    constants.debugView = (debugTexture || debugRenderTarget) ? static_cast<unsigned int>(debugView) : 0;
     constants.nrdDenoisingRange = nrdDenoisingRange;
 
     commandList->SetGraphicsRoot32BitConstants(

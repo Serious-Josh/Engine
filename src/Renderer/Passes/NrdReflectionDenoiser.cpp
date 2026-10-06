@@ -166,7 +166,7 @@ bool NrdReflectionDenoiser::SetFrameSettings(
     commonSettings.motionVectorScale[1] = 1.0f;
     commonSettings.motionVectorScale[2] = 1.0f;
 
-    commonSettings.isMotionVectorInWorldSpace = true;
+    commonSettings.isMotionVectorInWorldSpace = false;
 
     commonSettings.cameraJitter[0] = 0.0f;
     commonSettings.cameraJitter[1] = 0.0f;

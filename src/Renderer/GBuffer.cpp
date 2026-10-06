@@ -26,11 +26,23 @@ bool GBuffer::Initialize(ID3D12Device* device, unsigned int width, unsigned int 
         return false;
     }
 
-    if(!m_depth.Initialize(device, width, height, dsvHeap, resourceHeap)){
+    if(!m_motion.Initialize(device, width, height, DXGI_FORMAT_R16G16B16A16_FLOAT, rtvHeap, resourceHeap)){
         m_surface.Shutdown();
         m_material.Shutdown();
         return false;
     }
+
+    if(!m_depth.Initialize(device, width, height, dsvHeap, resourceHeap)){
+        m_motion.Shutdown();
+        m_surface.Shutdown();
+        m_material.Shutdown();
+        return false;
+    }
+
+    m_depth.GetResource()->SetName(L"GBuffer Depth");
+    m_material.GetResource()->SetName(L"GBuffer Material");
+    m_surface.GetResource()->SetName(L"GBuffer Surface");
+    m_motion.GetResource()->SetName(L"GBuffer Motion");
 
     return true;
 }
@@ -45,6 +57,7 @@ bool GBuffer::Resize(ID3D12Device* device, unsigned int width, unsigned int heig
 void GBuffer::Shutdown()
 {
     m_depth.Shutdown();
+    m_motion.Shutdown();
     m_surface.Shutdown();
     m_material.Shutdown();
 }
@@ -77,4 +90,14 @@ const RenderTarget& GBuffer::GetSurface() const
 const DepthBuffer& GBuffer::GetDepth() const
 {
     return m_depth;
+}
+
+RenderTarget& GBuffer::GetMotion()
+{
+    return m_motion;
+}
+
+const RenderTarget& GBuffer::GetMotion() const
+{
+    return m_motion;
 }

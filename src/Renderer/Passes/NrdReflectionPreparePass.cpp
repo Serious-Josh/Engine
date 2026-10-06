@@ -79,11 +79,17 @@ void NrdReflectionPreparePass::Execute(
         return;
     }
 
-    gBuffer.GetDepth().Transition(commandList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    gBuffer.GetMaterial().Transition(commandList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    gBuffer.GetSurface().Transition(commandList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    constexpr D3D12_RESOURCE_STATES gBufferReadState =
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+
+    gBuffer.GetDepth().Transition(commandList, gBufferReadState);
+    gBuffer.GetMaterial().Transition(commandList, gBufferReadState);
+    gBuffer.GetSurface().Transition(commandList, gBufferReadState);
+    gBuffer.GetMotion().Transition(commandList, gBufferReadState);
     rawReflection.Transition(commandList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     trackingDistance.Transition(commandList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
     m_viewZTexture.Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     m_motionTexture.Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     m_normalRoughnessTexture.Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -97,21 +103,23 @@ void NrdReflectionPreparePass::Execute(
     constants.depthIndex = gBuffer.GetDepth().GetSRVIndex();
     constants.materialIndex = gBuffer.GetMaterial().GetSRVIndex();
     constants.surfaceIndex = gBuffer.GetSurface().GetSRVIndex();
-    constants.materialBufferIndex = materialBufferIndex;
+    constants.motionInputIndex = gBuffer.GetMotion().GetSRVIndex();
 
+    constants.materialBufferIndex = materialBufferIndex;
     constants.rawReflectionIndex = rawReflection.GetDescriptorIndex();
     constants.trackingDistanceIndex = trackingDistance.GetDescriptorIndex();
     constants.width = width;
-    constants.height = height;
 
+    constants.height = height;
     constants.hitDistanceA = 3.0f;
     constants.hitDistanceB = 0.1f;
     constants.hitDistanceC = 20.0f;
-    constants.denoisingRange = denoisingRange;
 
+    constants.denoisingRange = denoisingRange;
     constants.viewZOutputIndex = m_viewZTexture.GetUAVIndex();
     constants.motionOutputIndex = m_motionTexture.GetUAVIndex();
     constants.normalRoughnessOutputIndex = m_normalRoughnessTexture.GetUAVIndex();
+    
     constants.specRadianceHitDistOutputIndex = m_specRadianceHitDistTexture.GetUAVIndex();
 
     const D3D12_GPU_VIRTUAL_ADDRESS constantsAddress = uploadBuffer.Allocate(&constants, sizeof(constants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
@@ -130,10 +138,14 @@ void NrdReflectionPreparePass::Execute(
 
     commandList->Dispatch(groupCountX, groupCountY, 1);
 
-    m_viewZTexture.Transition(commandList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    m_motionTexture.Transition(commandList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    m_normalRoughnessTexture.Transition(commandList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    m_specRadianceHitDistTexture.Transition(commandList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    constexpr D3D12_RESOURCE_STATES nrdInputState =
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+
+    m_viewZTexture.Transition(commandList, nrdInputState);
+    m_motionTexture.Transition(commandList, nrdInputState);
+    m_normalRoughnessTexture.Transition(commandList, nrdInputState);
+    m_specRadianceHitDistTexture.Transition(commandList, nrdInputState);
 }
 
 void NrdReflectionPreparePass::Shutdown()
@@ -248,6 +260,18 @@ bool NrdReflectionPreparePass::CreateTextures(
         Shutdown();
         return false;
     }
+
+    m_viewZTexture.GetResource()->SetName(
+        L"NRD Prepare ViewZ");
+
+    m_motionTexture.GetResource()->SetName(
+        L"NRD Prepare Motion");
+
+    m_normalRoughnessTexture.GetResource()->SetName(
+        L"NRD Prepare NormalRoughness");
+
+    m_specRadianceHitDistTexture.GetResource()->SetName(
+        L"NRD Prepare SpecRadianceHitDist");
 
     return true;
 }

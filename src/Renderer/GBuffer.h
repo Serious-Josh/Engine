@@ -22,13 +22,16 @@ class GBuffer
         RenderTarget& GetMaterial();
         RenderTarget& GetSurface();
         DepthBuffer& GetDepth();
+        RenderTarget& GetMotion();
 
         const RenderTarget& GetMaterial() const;
         const RenderTarget& GetSurface() const;
         const DepthBuffer& GetDepth() const;
+        const RenderTarget& GetMotion() const;
     
     private:
         RenderTarget m_material;
         RenderTarget m_surface;
+        RenderTarget m_motion;
         DepthBuffer m_depth;
 };

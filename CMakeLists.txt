@@ -77,6 +77,7 @@ add_executable(Engine
     src/Renderer/Passes/NrdReflectionResolvePass.cpp
     src/DemoContent/DemoSceneManager.cpp
     src/DemoContent/MirrorTestScene.cpp
+    src/Renderer/GpuTimestampProfiler.cpp
 )
 
 add_custom_command(

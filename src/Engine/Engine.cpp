@@ -199,7 +199,7 @@ void Engine::Frame()
     }
 
     debugUI.BeginFrame();
-    debugUI.DrawPerformanceWindow(environmentNames, m_renderer.GetCurrentEnvironmentIndex());
+    debugUI.DrawPerformanceWindow(environmentNames, m_renderer.GetCurrentEnvironmentIndex(), m_renderer.GetStatistics());
 
     IDemoScene& activeDemo = m_demoSceneManager.GetActiveScene();
 
