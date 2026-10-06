@@ -19,7 +19,6 @@ class GraphicsDevice
         IDXGIFactory4* GetFactory() const;
 
         bool SupportsRayTracing() const;
-        D3D12_RAYTRACING_TIER GetRayTracingTier() const;
 
         ID3D12Device5* GetRayTracingDevice() const;
 

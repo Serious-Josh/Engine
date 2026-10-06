@@ -56,7 +56,6 @@ bool StructuredBuffer::Initialize(ID3D12Device* device, ResourceUploader& upload
     device->CreateShaderResourceView(m_resource, &srvDescription, descriptorHeap.GetCPUHandle(m_descriptorIndex));
 
     m_descriptorHeap = &descriptorHeap;
-    m_elementCount = elementCount;
 
     return true;
 }
@@ -74,7 +73,6 @@ void StructuredBuffer::Shutdown()
 
     m_descriptorHeap = nullptr;
     m_descriptorIndex = UINT_MAX;
-    m_elementCount = 0;
 }
 
 ID3D12Resource* StructuredBuffer::GetResource() const
@@ -85,9 +83,4 @@ ID3D12Resource* StructuredBuffer::GetResource() const
 unsigned int StructuredBuffer::GetDescriptorIndex() const
 {
     return m_descriptorIndex;
-}
-
-unsigned int StructuredBuffer::GetElementCount() const
-{
-    return m_elementCount;
 }

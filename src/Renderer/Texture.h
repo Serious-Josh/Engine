@@ -49,7 +49,6 @@ class Texture
         std::vector<unsigned char> m_initialData;
 
         DXGI_FORMAT m_format = DXGI_FORMAT_UNKNOWN;
-        size_t m_bytesPerPixel = 0;
 
         std::vector<D3D12_RESOURCE_STATES> m_subresourceStates;
 };

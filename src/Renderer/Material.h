@@ -8,7 +8,6 @@
 #include <cmath>
 
 class Pipeline;
-class Texture;
 
 enum class MaterialModel
 {

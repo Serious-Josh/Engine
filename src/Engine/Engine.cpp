@@ -1,5 +1,4 @@
 #include "Engine.h"
-#include "Core/InputCodes.h"
 #include "Core/Log.h"
 #include "Core/Assert.h"
 #include "Core/Time.h"
@@ -31,7 +30,7 @@ bool Engine::Initialize()
     vertexShaderDescription.entryPoint = "VSMain";
     vertexShaderDescription.stage = ShaderStage::Vertex;
 
-    m_demoVertexShader =m_renderer.GetShaderLibrary().Load(vertexShaderDescription);
+    m_demoVertexShader = m_renderer.GetShaderLibrary().Load(vertexShaderDescription);
 
     if(!m_demoVertexShader){
         Log::Error("Failed to load demo vertex shader.");
@@ -229,18 +228,4 @@ void Engine::Shutdown()
 
     m_window.Shutdown();
     Log::Info("Engine shutdown: finished.");
-}
-
-Input& Engine::GetInput(){
-    return m_input;
-}
-
-unsigned int Engine::GetWindowWidth() const
-{
-    return m_window.GetWidth();
-}
-
-unsigned int Engine::GetWindowHeight() const
-{
-    return m_window.GetHeight();
 }

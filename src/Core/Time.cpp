@@ -10,13 +10,8 @@ void Time::Update(){
     m_deltaTime = std::chrono::duration<double>(currentTime - m_previousTime).count();
 
     m_previousTime = currentTime;
-    m_elapsedTime += m_deltaTime;
 }
 
 double Time::GetDeltaTime() const{
     return m_deltaTime;
-}
-
-double Time::GetElapsedTime() const{
-    return m_elapsedTime;
 }

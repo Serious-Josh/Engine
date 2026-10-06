@@ -1,4 +1,9 @@
 #include "MirrorTestScene.h"
+#include "Renderer/ResourceUploader.h"
+#include "Renderer/DescriptorHeap.h"
+#include "Renderer/RenderObject.h"
+#include "Scene/Camera.h"
+#include "Scene/DirectionalLight.h"
 
 #include "Renderer/Vertex.h"
 #include "Renderer/Geometry/SphereGenerator.h"

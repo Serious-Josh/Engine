@@ -4,19 +4,16 @@
 #include "Renderer/Mesh.h"
 #include "Renderer/Texture.h"
 #include "Renderer/VertexLayout.h"
-#include "Renderer/RenderObject.h"
-#include "Renderer/ResourceUploader.h"
-#include "Renderer/DescriptorHeap.h"
 #include "Renderer/Material.h"
 #include "Renderer/Pipeline.h"
-#include "Scene/Camera.h"
-#include "Scene/DirectionalLight.h"
 #include "Scene/Scene.h"
 #include "DemoContent/IDemoScene.h"
 
 #include <vector>
 
 class Shader;
+class ResourceUploader;
+class DescriptorHeap;
 
 class MirrorTestScene : public IDemoScene
 {

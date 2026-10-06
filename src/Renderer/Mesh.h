@@ -21,7 +21,6 @@ class Mesh
         void Shutdown();
         void Bind(ID3D12GraphicsCommandList* commandList) const;
 
-        const VertexLayout& GetLayout() const;
         size_t GetVertexCount() const;
         size_t GetIndexCount() const;
         bool IsIndexed() const;

@@ -1,5 +1,4 @@
 #include "ShaderLibrary.h"
-#include "Core/Log.h"
 
 bool ShaderLibrary::Initialize(const std::filesystem::path& shaderRoot)
 {

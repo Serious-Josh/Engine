@@ -14,7 +14,6 @@ Texture::Texture(Texture&& other) noexcept
     , m_descriptorHeap(other.m_descriptorHeap)
     , m_initialData(std::move(other.m_initialData))
     , m_format(other.m_format)
-    , m_bytesPerPixel(other.m_bytesPerPixel)
     , m_subresourceStates(std::move(other.m_subresourceStates))
 {
     other.m_resource = nullptr;
@@ -24,7 +23,6 @@ Texture::Texture(Texture&& other) noexcept
     other.m_uavIndex = UINT_MAX;
     other.m_descriptorHeap = nullptr;
     other.m_format = DXGI_FORMAT_UNKNOWN;
-    other.m_bytesPerPixel = 0;
     other.m_initialData.clear();
     other.m_subresourceStates.clear();
 }
@@ -43,7 +41,6 @@ Texture& Texture::operator=(Texture&& other) noexcept
         m_uavIndex = other.m_uavIndex;
         m_descriptorHeap = other.m_descriptorHeap;
         m_format = other.m_format;
-        m_bytesPerPixel = other.m_bytesPerPixel;
         m_subresourceStates = std::move(other.m_subresourceStates);
 
         other.m_srvIndex = UINT_MAX;
@@ -53,7 +50,6 @@ Texture& Texture::operator=(Texture&& other) noexcept
         other.m_width = 0;
         other.m_height = 0;
         other.m_format = DXGI_FORMAT_UNKNOWN;
-        other.m_bytesPerPixel = 0;
         other.m_initialData.clear();
         other.m_subresourceStates.clear();
     }
@@ -98,7 +94,6 @@ bool Texture::Initialize(ID3D12Device* device, const void* data, unsigned int wi
     m_width = width;
     m_height = height;
     m_format = format;
-    m_bytesPerPixel = bytesPerPixel;
 
     m_initialData.resize(static_cast<size_t>(width) * static_cast<size_t>(height) * bytesPerPixel);
     std::memcpy(m_initialData.data(), data, m_initialData.size());
@@ -154,7 +149,6 @@ bool Texture::Initialize(ID3D12Device* device, unsigned int width, unsigned int 
     m_width = width;
     m_height = height;
     m_format = format;
-    m_bytesPerPixel = 0;
     m_initialData.clear();
 
     return true;
@@ -183,7 +177,6 @@ void Texture::Shutdown()
     m_width = 0;
     m_height = 0;
     m_format = DXGI_FORMAT_UNKNOWN;
-    m_bytesPerPixel = 0;
     m_initialData.clear();
 }
 

@@ -21,14 +21,6 @@ class Camera
             m_aspectRatio = aspectRatio;
         }
 
-        void SetPerspective(float verticalFov, float aspectRatio, float nearPlane, float farPlane)
-        {
-            m_verticalFov = verticalFov;
-            m_aspectRatio = aspectRatio;
-            m_nearPlane = nearPlane;
-            m_farPlane = farPlane;
-        }
-
         Matrix4 GetViewMatrix() const
         {
             return Matrix4::LookAt(

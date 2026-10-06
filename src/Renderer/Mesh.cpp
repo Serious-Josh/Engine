@@ -73,11 +73,6 @@ void Mesh::Bind(ID3D12GraphicsCommandList* commandList) const
     }
 }
 
-const VertexLayout& Mesh::GetLayout() const
-{
-    return m_layout;
-}
-
 size_t Mesh::GetVertexCount() const
 {
     return m_vertexCount;

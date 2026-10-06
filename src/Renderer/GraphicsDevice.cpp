@@ -20,7 +20,6 @@ bool GraphicsDevice::Initialize()
     }
 #endif
 
-    // Getting graphics adapter and creating D3D12 device
     HRESULT result = CreateDXGIFactory2(
         0,
         IID_PPV_ARGS(&m_factory)
@@ -70,7 +69,6 @@ bool GraphicsDevice::Initialize()
         return false;
     }
 
-    // Query DirectX Raytracing support
     D3D12_FEATURE_DATA_D3D12_OPTIONS5 options5{};
 
     result = m_device->CheckFeatureSupport(
@@ -164,11 +162,6 @@ bool GraphicsDevice::SupportsRayTracing() const
     return
         m_rayTracingTier !=
         D3D12_RAYTRACING_TIER_NOT_SUPPORTED;
-}
-
-D3D12_RAYTRACING_TIER GraphicsDevice::GetRayTracingTier() const
-{
-    return m_rayTracingTier;
 }
 
 ID3D12Device5* GraphicsDevice::GetRayTracingDevice() const

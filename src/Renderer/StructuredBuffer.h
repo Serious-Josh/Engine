@@ -20,12 +20,10 @@ class StructuredBuffer
 
         ID3D12Resource* GetResource() const;
         unsigned int GetDescriptorIndex() const;
-        unsigned int GetElementCount() const;
 
     private:
         ID3D12Resource* m_resource = nullptr;
 
         DescriptorHeap* m_descriptorHeap = nullptr;
         unsigned int m_descriptorIndex = UINT_MAX;
-        unsigned int m_elementCount = 0;
 };

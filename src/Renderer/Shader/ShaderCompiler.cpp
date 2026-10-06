@@ -80,7 +80,7 @@ bool ShaderCompiler::Compile(const ShaderCompileDescription& description, Shader
     std::filesystem::path shaderPath = description.path;
     std::wstring shaderDirectory = shaderPath.parent_path().wstring();
 
-    const wchar_t* arguements[] =
+    const wchar_t* arguments[] =
     {
         description.path,
         L"-E", description.entryPoint,
@@ -91,7 +91,7 @@ bool ShaderCompiler::Compile(const ShaderCompileDescription& description, Shader
 
     IDxcResult* compileResult = nullptr;
 
-    result = m_compiler->Compile(&sourceBuffer, arguements, static_cast<UINT32>(sizeof(arguements) / sizeof(arguements[0])), includeHandler, IID_PPV_ARGS(&compileResult));
+    result = m_compiler->Compile(&sourceBuffer, arguments, static_cast<UINT32>(sizeof(arguments) / sizeof(arguments[0])), includeHandler, IID_PPV_ARGS(&compileResult));
 
     includeHandler->Release();
 
@@ -144,19 +144,6 @@ bool ShaderCompiler::Compile(const ShaderCompileDescription& description, Shader
     return true;
 }
 
-const wchar_t* ShaderCompiler::GetShaderProfile(ShaderStage stage) const
-{
-    switch(stage){
-        case ShaderStage::Vertex:
-            return L"vs_6_6";
-        case ShaderStage::Pixel:
-            return L"ps_6_6";
-        case ShaderStage::Compute:
-            return L"cs_6_6";
-    }
-
-    return nullptr;
-}
 
 bool ShaderCompiler::CompileLibrary(
     const ShaderLibraryCompileDescription& description,
@@ -280,4 +267,18 @@ bool ShaderCompiler::CompileLibrary(
     source->Release();
 
     return true;
+}
+
+const wchar_t* ShaderCompiler::GetShaderProfile(ShaderStage stage) const
+{
+    switch(stage){
+        case ShaderStage::Vertex:
+            return L"vs_6_6";
+        case ShaderStage::Pixel:
+            return L"ps_6_6";
+        case ShaderStage::Compute:
+            return L"cs_6_6";
+    }
+
+    return nullptr;
 }

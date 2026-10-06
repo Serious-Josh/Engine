@@ -9,7 +9,6 @@ bool CommandContext::Initialize(ID3D12Device* device)
         return false;
     }
 
-    // Creating command queue
     D3D12_COMMAND_QUEUE_DESC queueDescription{};
 
     queueDescription.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
@@ -24,7 +23,6 @@ bool CommandContext::Initialize(ID3D12Device* device)
         return false;
     }
 
-    // Creating command allocator
     for(unsigned int i = 0; i < FrameCount; ++i){
         result = device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&m_commandAllocators[i]));
 
@@ -33,7 +31,6 @@ bool CommandContext::Initialize(ID3D12Device* device)
         }
     }
 
-    // Creating command list
     result = device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, m_commandAllocators[0], nullptr, IID_PPV_ARGS(&m_commandList));
 
     if(FAILED(result))
@@ -54,7 +51,6 @@ bool CommandContext::Initialize(ID3D12Device* device)
         return false;
     }
 
-    // Creating fence
     result = device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&m_fence));
 
     if(FAILED(result))

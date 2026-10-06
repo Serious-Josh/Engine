@@ -22,11 +22,6 @@ public:
     void Run();
     void Shutdown();
 
-    Input& GetInput();
-
-    unsigned int GetWindowWidth() const;
-    unsigned int GetWindowHeight() const;
-
 private:
     void Frame();
 

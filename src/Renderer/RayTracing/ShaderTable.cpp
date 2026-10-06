@@ -113,8 +113,3 @@ unsigned int ShaderTable::GetSizeInBytes() const
 {
     return m_sizeInBytes;
 }
-
-unsigned int ShaderTable::GetRecordCount() const
-{
-    return m_recordCount;
-}

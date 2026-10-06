@@ -2,7 +2,6 @@
 
 #include "Shader.h"
 
-#define WIN32_LEAN_AND_CLEAN
 #include <Windows.h>
 #include <dxcapi.h>
 #include <vector>
@@ -39,7 +38,7 @@ class ShaderCompiler
         bool Initialize();
         void Shutdown();
 
-        bool Compile(const ShaderCompileDescription& desription, ShaderCompileResult& output);
+        bool Compile(const ShaderCompileDescription& description, ShaderCompileResult& output);
         bool CompileLibrary(const ShaderLibraryCompileDescription& description, ShaderLibraryCompileResult& output);
 
     private:

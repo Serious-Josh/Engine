@@ -1,8 +1,5 @@
 #pragma once
 
-#include "Buffer.h"
-#include "Mesh.h"
-#include "Pipeline.h"
 #include "GBuffer.h"
 #include "UploadBuffer.h"
 #include "StructuredBuffer.h"
@@ -20,12 +17,8 @@
 #include "Math/Matrix4.h"
 #include "Renderer/Passes/ToneMapPass.h"
 #include "Renderer/Passes/DeferredLightingPass.h"
-#include "Renderer/Passes/EquirectangularToCubemapPass.h"
-#include "Renderer/Passes/EnvironmentMipPass.h"
 #include "Renderer/Passes/BRDFIntegrationPass.h"
-#include "Renderer/Passes/DiffuseIrradiancePass.h"
 #include "Renderer/Passes/GGXAverageAlbedoPass.h"
-#include "Renderer/Passes/GGXMultiscatterIrradiancePass.h"
 #include "Renderer/RayTracing/RayTracingSceneResources.h"
 #include "Renderer/Passes/RayTracedShadowPass.h"
 #include "Passes/ShadowDenoisePass.h"
@@ -42,17 +35,6 @@
 #include <string>
 #include <vector>
 
-struct ID3D12CommandQueue;
-struct IDXGISwapChain3;
-struct ID3D12Resource;
-struct ID3D12DescriptorHeap;
-struct ID3D12CommandAllocator;
-struct ID3D12GraphicsCommandList;
-struct ID3D12Fence;
-struct ID3D12RootSignature;
-struct ID3D12PipelineState;
-struct DirectionalLight;
-
 struct EnvironmentAsset
 {
     std::string displayName;
@@ -60,6 +42,7 @@ struct EnvironmentAsset
 };
 
 class Scene;
+struct Material;
 
 class Renderer
 {
@@ -69,9 +52,6 @@ class Renderer
         void Shutdown();
 
         void Resize(unsigned int width, unsigned int height);
-
-        void BeginGeometryPass(ID3D12GraphicsCommandList* commandList);
-        void EndGeometryPass(ID3D12GraphicsCommandList* commandList);
 
         ID3D12Device* GetDevice();
         ResourceUploader& GetResourceUploader();
@@ -102,6 +82,8 @@ class Renderer
         bool InitializeDevice();
         bool InitializeSwapChain(void* windowHandle);
         void Draw(ID3D12GraphicsCommandList* commandList, const RenderObject& object, D3D12_GPU_VIRTUAL_ADDRESS cameraConstantsAddress);
+        void BeginGeometryPass(ID3D12GraphicsCommandList* commandList);
+        void EndGeometryPass(ID3D12GraphicsCommandList* commandList);
         bool InitializeMaterials(const std::vector<Material*>& materials);
         bool InitializeRayTracingScene(const Scene& scene);
         bool DiscoverEnvironments();

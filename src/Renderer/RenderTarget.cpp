@@ -1,7 +1,6 @@
 #include "RenderTarget.h"
 #include "DescriptorHeap.h"
 
-#include <utility>
 
 RenderTarget::RenderTarget(RenderTarget&& other) noexcept
     : m_resource(other.m_resource)

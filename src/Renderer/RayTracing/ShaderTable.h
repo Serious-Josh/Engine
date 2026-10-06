@@ -26,7 +26,6 @@ class ShaderTable
 
         unsigned int GetRecordSize() const;
         unsigned int GetSizeInBytes() const;
-        unsigned int GetRecordCount() const;
 
     private:
         ID3D12Resource* m_resource = nullptr;

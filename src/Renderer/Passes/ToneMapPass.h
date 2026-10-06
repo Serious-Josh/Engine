@@ -8,7 +8,7 @@ class ShaderLibrary;
 class RenderTarget;
 class Texture;
 
-// Temporary renderer diagnostics; values match ToneMap.hlsl.
+// Renderer diagnostic views; values match ToneMap.hlsl.
 enum class ToneMapDebugView : unsigned int
 {
     None, SpecularTrackingDistance, NrdViewZ, NrdNormal,

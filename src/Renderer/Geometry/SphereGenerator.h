@@ -13,5 +13,5 @@ struct SphereGeometry
 class SphereGenerator
 {
     public:
-        static SphereGeometry  Generate(float radius, unsigned int latitudeSegments, unsigned int longitudeSegments);
+        static SphereGeometry Generate(float radius, unsigned int latitudeSegments, unsigned int longitudeSegments);
 };

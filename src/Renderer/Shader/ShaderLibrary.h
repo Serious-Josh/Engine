@@ -3,15 +3,10 @@
 #include "Shader.h"
 #include "ShaderCompiler.h"
 
-
 #include <memory>
 #include <filesystem>
 #include <string>
 #include <unordered_map>
-#include <dxcapi.h>
-
-struct IDxCUtils;
-struct IDxcCompiler3;
 
 struct ShaderKey
 {

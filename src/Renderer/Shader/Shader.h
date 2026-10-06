@@ -27,7 +27,6 @@ class Shader
         
         bool Initialize(const void* bytecode, size_t size);
 
-        bool Load(const char* path);
         void Unload();
 
         const void* GetByteCode() const;

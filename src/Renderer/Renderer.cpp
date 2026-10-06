@@ -1,24 +1,27 @@
 #include "Core/Log.h"
 #include "Renderer.h"
+#include "Renderer/Mesh.h"
+#include "Renderer/Passes/EquirectangularToCubemapPass.h"
+#include "Renderer/Passes/EnvironmentMipPass.h"
+#include "Renderer/Passes/DiffuseIrradiancePass.h"
+#include "Renderer/Passes/GGXMultiscatterIrradiancePass.h"
 #include "Renderer/Texture.h"
 #include "Material.h"
 #include "Scene/Camera.h"
 #include "ShaderData.h"
 #include "Scene/DirectionalLight.h"
 #include "Scene/Scene.h"
-#include "ImageLoader.h"
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <Windows.h>
 
 #include <string>
-#include <cstring>
-#include <dxgi1_6.h>
 #include <d3d12.h>
-#include <d3d12sdklayers.h>
 #include <algorithm>
 #include <cctype>
+#include <iterator>
+#include <utility>
 
 
 // --------------
@@ -163,23 +166,29 @@ bool Renderer::Initialize(void* windowHandle, unsigned int width, unsigned int h
         return false;
     }
 
-    const std::filesystem::path defaultEnvironmentPath = std::filesystem::path("Textures") / "Environment" / "TestEnvironment.hdr";
-
-    const auto environmentIt = std::find_if(m_availableEnvironments.begin(), m_availableEnvironments.end(), [&defaultEnvironmentPath](const EnvironmentAsset& asset){return asset.relativePath == defaultEnvironmentPath;});
-
-    if(environmentIt == m_availableEnvironments.end()){
-        Log::Error("Default environment TestEnvironment.hdr was not discovered.");
+    if(m_availableEnvironments.empty()){
+        Log::Error("No HDR environments were discovered.");
         return false;
     }
 
-    m_currentEnvironmentIndex = static_cast<size_t>(std::distance(m_availableEnvironments.begin(), environmentIt));
+    m_currentEnvironmentIndex = 0;
 
-    const std::filesystem::path environmentPath = m_assetRoot / environmentIt->relativePath;
+    const EnvironmentAsset& defaultEnvironment = m_availableEnvironments[m_currentEnvironmentIndex];
+    const std::filesystem::path environmentPath = m_assetRoot / defaultEnvironment.relativePath;
 
-    if(!m_environment.Initialize(device, environmentPath, m_resourceUploader, m_resourceDescriptorHeap)){
-        Log::Error("Failed to init environment map.");
+    if(!m_environment.Initialize(
+        device,
+        environmentPath,
+        m_resourceUploader,
+        m_resourceDescriptorHeap))
+    {
+        Log::Error("Failed to initialize environment: " + defaultEnvironment.displayName);
+
+        m_environment.Shutdown();
         return false;
     }
+
+    Log::Info("Initial environment: " + defaultEnvironment.displayName);
 
     if(!m_commandContext.Begin(0))
     {
@@ -270,7 +279,7 @@ bool Renderer::InitializeSwapChain(void* windowHandle)
 }
 
 
-//Other functions needed for Render
+// Resize and geometry drawing
 void Renderer::Resize(unsigned int width, unsigned int height)
 {
     if(width == 0 || height == 0){
@@ -388,7 +397,7 @@ void Renderer::Draw(ID3D12GraphicsCommandList* commandList, const RenderObject& 
 
 
 // --------------
-// Deferred Passes
+// Geometry pass
 // --------------
 void Renderer::BeginGeometryPass(ID3D12GraphicsCommandList* commandList)
 {
@@ -428,6 +437,8 @@ void Renderer::EndGeometryPass(ID3D12GraphicsCommandList* commandList)
     m_gBuffer.GetSurface().Transition(commandList, shaderReadState);
     m_gBuffer.GetDepth().Transition(commandList, shaderReadState);
 }
+
+// Scene resources and history
 
 bool Renderer::InitializeSceneResources(const Scene& scene, const std::vector<Material*>& materials)
 {
@@ -1040,6 +1051,8 @@ DebugUI& Renderer::GetDebugUI()
     return m_debugUI;
 }
 
+// Runtime environment discovery and preprocessing
+
 bool Renderer::DiscoverEnvironments()
 {
     m_availableEnvironments.clear();
@@ -1132,6 +1145,7 @@ bool Renderer::SetEnvironment(size_t index)
         m_resourceDescriptorHeap))
     {
         Log::Error("Failed to initialize environment: " + asset.displayName);
+        m_environment.Shutdown();
         return false;
     }
 

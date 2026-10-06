@@ -3,11 +3,6 @@
 
 static const float PI = 3.14159265f;
 
-float3 ApplyTestTint(float3 color)
-{
-    return color * float3(1.0f, 0.5f, 0.5f);
-}
-
 float2 DirectionToEquirectangularUV(float3 direction)
 {
     direction = normalize(direction);

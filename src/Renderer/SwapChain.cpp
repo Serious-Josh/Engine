@@ -46,7 +46,6 @@ bool SwapChain::Initialize(IDXGIFactory4* factory, ID3D12Device* device, ID3D12C
         return false;
     }
 
-    // Creating RTV heap for swap chain back buffers
 
     D3D12_DESCRIPTOR_HEAP_DESC heapDescription{};
 
@@ -73,7 +72,7 @@ bool SwapChain::Resize(unsigned int width, unsigned int height)
         return false;
     }
 
-    //Checking to see if the GPU is finished with back buffers before calling Resize() or crashes
+    // The caller must wait for the GPU before releasing the back buffers.
     for(ID3D12Resource*& backBuffer : m_backBuffers){
         if(backBuffer){
             backBuffer->Release();

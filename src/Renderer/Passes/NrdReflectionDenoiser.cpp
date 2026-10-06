@@ -159,7 +159,7 @@ bool NrdReflectionDenoiser::SetFrameSettings(
     commonSettings.rectSize[0] = static_cast<uint16_t>(m_width);
     commonSettings.rectSize[1] = static_cast<uint16_t>(m_height);
 
-    commonSettings.rectSizePrev[0] =static_cast<uint16_t>(m_width);
+    commonSettings.rectSizePrev[0] = static_cast<uint16_t>(m_width);
     commonSettings.rectSizePrev[1] = static_cast<uint16_t>(m_height);
 
     commonSettings.motionVectorScale[0] = 1.0f;

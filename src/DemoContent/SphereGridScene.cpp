@@ -1,9 +1,13 @@
 #include "SphereGridScene.h"
+#include "Renderer/ResourceUploader.h"
+#include "Renderer/DescriptorHeap.h"
+#include "Renderer/RenderObject.h"
+#include "Scene/Camera.h"
+#include "Scene/DirectionalLight.h"
 #include "Renderer/Vertex.h"
 #include "Renderer/Geometry/SphereGenerator.h"
 #include "Core/Log.h"
 #include "Renderer/ImageLoader.h"
-#include "imgui.h"
 
 #include <cmath>
 
