@@ -39,6 +39,8 @@
 
 #include <d3d12.h>
 #include <filesystem>
+#include <string>
+#include <vector>
 
 struct ID3D12CommandQueue;
 struct IDXGISwapChain3;
@@ -49,8 +51,13 @@ struct ID3D12GraphicsCommandList;
 struct ID3D12Fence;
 struct ID3D12RootSignature;
 struct ID3D12PipelineState;
-
 struct DirectionalLight;
+
+struct EnvironmentAsset
+{
+    std::string displayName;
+    std::filesystem::path relativePath;
+};
 
 class Scene;
 
@@ -78,12 +85,27 @@ class Renderer
         void ResetSceneHistory();
 
         void WaitForGPU();
+
+        const std::vector<EnvironmentAsset>& GetAvailableEnvironments() const
+        {
+            return m_availableEnvironments;
+        }
+
+        size_t GetCurrentEnvironmentIndex() const
+        {
+            return m_currentEnvironmentIndex;
+        }
+
+        bool SetEnvironment(size_t index);
+
     private:
         bool InitializeDevice();
         bool InitializeSwapChain(void* windowHandle);
         void Draw(ID3D12GraphicsCommandList* commandList, const RenderObject& object, D3D12_GPU_VIRTUAL_ADDRESS cameraConstantsAddress);
         bool InitializeMaterials(const std::vector<Material*>& materials);
         bool InitializeRayTracingScene(const Scene& scene);
+        bool DiscoverEnvironments();
+        bool PreprocessEnvironment(EnvironmentMap& environment);
 
         GraphicsDevice m_graphicsDevice;
         SwapChain m_swapChain;
@@ -96,12 +118,8 @@ class Renderer
 
         DeferredLightingPass m_deferredLightingPass;
         ToneMapPass m_toneMapPass;
-        EquirectangularToCubemapPass m_equirectangularToCubemapPass;
-        EnvironmentMipPass m_environmentMipPass;
         BRDFIntegrationPass m_brdfIntegrationPass;
         GGXAverageAlbedoPass m_ggxAverageAlbedoPass;
-        DiffuseIrradiancePass m_diffuseIrradiancePass;
-        GGXMultiscatterIrradiancePass m_ggxMultiscatterIrradiancePass;
         RayTracedShadowPass m_rayTracedShadowPass;
         RayTracedReflectionPass m_rayTracedReflectionPass;
         RayTracedReflectionTemporalPass m_rayTracedReflectionTemporalPass;
@@ -145,4 +163,8 @@ class Renderer
 
         Vector3 m_previousShadowLightDirection{};
         bool m_hasPreviousShadowLightDirection = false;
+
+        std::filesystem::path m_assetRoot;
+        std::vector<EnvironmentAsset> m_availableEnvironments;
+        size_t m_currentEnvironmentIndex = 0;
 };

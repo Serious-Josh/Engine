@@ -147,6 +147,21 @@ void Engine::Frame()
         return;
     }
 
+    DebugUI& debugUI = m_renderer.GetDebugUI();
+
+    if(debugUI.HasEnvironmentChangeRequest())
+    {
+        const size_t environmentIndex =
+            debugUI.ConsumeEnvironmentChangeRequest();
+
+        if(!m_renderer.SetEnvironment(environmentIndex))
+        {
+            Log::Error("Failed to switch environment.");
+            m_window.Close();
+            return;
+        }
+    }
+
     if(m_demoSceneManager.HasPendingSceneChange())
     {
         m_renderer.WaitForGPU();
@@ -174,10 +189,18 @@ void Engine::Frame()
         }
     }
 
-    DebugUI& debugUI = m_renderer.GetDebugUI();
+    const std::vector<EnvironmentAsset>& environments = m_renderer.GetAvailableEnvironments();
+
+    std::vector<std::string> environmentNames;
+    environmentNames.reserve(environments.size());
+
+    for(const EnvironmentAsset& environment : environments)
+    {
+        environmentNames.push_back(environment.displayName);
+    }
 
     debugUI.BeginFrame();
-    debugUI.DrawPerformanceWindow();
+    debugUI.DrawPerformanceWindow(environmentNames, m_renderer.GetCurrentEnvironmentIndex());
 
     IDemoScene& activeDemo = m_demoSceneManager.GetActiveScene();
 

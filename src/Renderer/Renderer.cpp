@@ -18,6 +18,7 @@
 #include <d3d12.h>
 #include <d3d12sdklayers.h>
 #include <algorithm>
+#include <cctype>
 
 
 // --------------
@@ -36,7 +37,13 @@ bool Renderer::Initialize(void* windowHandle, unsigned int width, unsigned int h
 
     ID3D12Device* device = m_graphicsDevice.GetDevice();
 
-    const std::filesystem::path shaderRoot = assetRoot / "Shaders";
+    m_assetRoot = assetRoot;
+
+    const std::filesystem::path shaderRoot = m_assetRoot / "Shaders";
+
+    if(!DiscoverEnvironments()){
+        return false;
+    }
 
     if(!m_shaderLibrary.Initialize(shaderRoot)){
         Log::Error("Failed to initialize shader library.");
@@ -156,100 +163,62 @@ bool Renderer::Initialize(void* windowHandle, unsigned int width, unsigned int h
         return false;
     }
 
-    const std::filesystem::path environmentPath =
-    assetRoot / "Textures" / "Environment" / "TestEnvironment.hdr";
+    const std::filesystem::path defaultEnvironmentPath = std::filesystem::path("Textures") / "Environment" / "TestEnvironment.hdr";
 
-    if(!m_environment.Initialize(
-        device,
-        environmentPath,
-        m_resourceUploader,
-        m_resourceDescriptorHeap))
+    const auto environmentIt = std::find_if(m_availableEnvironments.begin(), m_availableEnvironments.end(), [&defaultEnvironmentPath](const EnvironmentAsset& asset){return asset.relativePath == defaultEnvironmentPath;});
+
+    if(environmentIt == m_availableEnvironments.end()){
+        Log::Error("Default environment TestEnvironment.hdr was not discovered.");
+        return false;
+    }
+
+    m_currentEnvironmentIndex = static_cast<size_t>(std::distance(m_availableEnvironments.begin(), environmentIt));
+
+    const std::filesystem::path environmentPath = m_assetRoot / environmentIt->relativePath;
+
+    if(!m_environment.Initialize(device, environmentPath, m_resourceUploader, m_resourceDescriptorHeap)){
+        Log::Error("Failed to init environment map.");
+        return false;
+    }
+
+    if(!m_commandContext.Begin(0))
     {
-        Log::Error("Failed to initialize environment map.");
+        Log::Error("Failed to begin environment-independent LUT generation.");
         return false;
     }
 
-    if(!m_environmentMipPass.Initialize(
-        device,
-        m_shaderLibrary,
-        m_rtvDescriptorHeap,
-        m_environment.GetSourceTexture()))
-    {
-        Log::Error(
-            "Failed to initialize environment mip pass."
-        );
-        return false;
-    }
-
-    if(!m_equirectangularToCubemapPass.Initialize(
-        device,
-        m_shaderLibrary,
-        m_rtvDescriptorHeap,
-        m_environment.GetCubemap()))
-    {
-        Log::Error(
-            "Failed to initialize equirectangular-to-cubemap pass."
-        );
-        return false;
-    }
-
-    if(!m_diffuseIrradiancePass.Initialize(device, m_shaderLibrary, m_rtvDescriptorHeap, m_environment.GetDiffuseIrradiance())){
-        Log::Error("Failed to init diffuse irradiance pass.");
-        return false;
-    }
-
-    if(!m_ggxMultiscatterIrradiancePass.Initialize(
-        device,
-        m_shaderLibrary,
-        m_rtvDescriptorHeap,
-        m_environment.GetGGXMultiscatterIrradiance()))
-    {
-        Log::Error("Failed to init GGX multiscatter irradiance pass.");
-        return false;
-    }
-
-    if(!m_commandContext.Begin(0)){
-        Log::Error(
-            "Failed to begin environment preprocessing."
-        );
-        return false;
-    }
-
-    ID3D12GraphicsCommandList* preprocessingCommandList =
-        m_commandContext.GetCommandList();
+    ID3D12GraphicsCommandList* lutCommandList = m_commandContext.GetCommandList();
 
     ID3D12DescriptorHeap* descriptorHeaps[] =
     {
         m_resourceDescriptorHeap.GetHeap()
     };
 
-    preprocessingCommandList->SetDescriptorHeaps(
-        1,
-        descriptorHeaps
-    );
+    lutCommandList->SetDescriptorHeaps(1, descriptorHeaps);
 
-    m_environmentMipPass.Execute(preprocessingCommandList, m_environment.GetSourceTexture());
-    m_diffuseIrradiancePass.Execute(preprocessingCommandList, m_environment.GetSourceTexture(), m_environment.GetDiffuseIrradiance());
-    m_equirectangularToCubemapPass.Execute(preprocessingCommandList, m_environment.GetSourceTexture(), m_environment.GetCubemap());
-    m_brdfIntegrationPass.Execute(preprocessingCommandList, m_brdfIntegrationLUT);
-    m_ggxAverageAlbedoPass.Execute(preprocessingCommandList, m_ggxAverageAlbedoLUT);
-    m_ggxMultiscatterIrradiancePass.Execute(preprocessingCommandList, m_environment.GetSourceTexture(), m_brdfIntegrationLUT, m_environment.GetGGXMultiscatterIrradiance());
+    m_brdfIntegrationPass.Execute(lutCommandList, m_brdfIntegrationLUT);
 
-    if(!m_commandContext.End()){
-        Log::Error(
-            "Failed to end environment preprocessing."
-        );
+    m_ggxAverageAlbedoPass.Execute(lutCommandList, m_ggxAverageAlbedoLUT);
+
+    if(!m_commandContext.End())
+    {
+        Log::Error("Failed to end environment-independent LUT generation.");
         return false;
     }
 
-    if(!m_commandContext.Execute(0)){
-        Log::Error(
-            "Failed to execute environment preprocessing."
-        );
+    if(!m_commandContext.Execute(0))
+    {
+        Log::Error("Failed to execute environment-independent LUT generation.");
         return false;
     }
 
     m_commandContext.WaitForGPU();
+
+    if(!PreprocessEnvironment(m_environment))
+    {
+        Log::Error("Failed to preprocess environment.");
+        return false;
+    }
 
     if(!m_sceneColor.Initialize(device, m_width, m_height, DXGI_FORMAT_R16G16B16A16_FLOAT, m_rtvDescriptorHeap, m_resourceDescriptorHeap)){
         Log::Error("Failed to init HDR scene color");
@@ -1012,12 +981,8 @@ void Renderer::Shutdown()
     m_gBuffer.Shutdown();
     m_deferredLightingPass.Shutdown();
     m_toneMapPass.Shutdown();
-    m_environmentMipPass.Shutdown();
-    m_equirectangularToCubemapPass.Shutdown();
-    m_diffuseIrradiancePass.Shutdown();
     m_brdfIntegrationPass.Shutdown();
     m_ggxAverageAlbedoPass.Shutdown();
-    m_ggxMultiscatterIrradiancePass.Shutdown();
     m_rayTracedShadowPass.Shutdown();
     m_rayTracedReflectionPass.Shutdown();
     m_rayTracedReflectionTemporalPass.Shutdown();
@@ -1073,4 +1038,238 @@ ShaderLibrary& Renderer::GetShaderLibrary()
 DebugUI& Renderer::GetDebugUI()
 {
     return m_debugUI;
+}
+
+bool Renderer::DiscoverEnvironments()
+{
+    m_availableEnvironments.clear();
+
+    const std::filesystem::path environmentDirectory = m_assetRoot / "Textures" / "Environment";
+
+    std::error_code error;
+
+    if(!std::filesystem::exists(environmentDirectory, error) || error){
+        Log::Error("Failed to discover environment directory.");
+        return false;
+    }
+
+    std::filesystem::directory_iterator iterator(environmentDirectory, error);
+    const std::filesystem::directory_iterator end;
+
+    if(error){
+        Log::Error("Failed iterating through environment directory.");
+        return false;
+    }
+
+    for(; iterator != end; iterator.increment(error)){
+        if(error){
+            Log::Error("Error iterating through directory.");
+            m_availableEnvironments.clear();
+            return false;
+        }
+
+        const auto& entry = *iterator;
+
+        if(!entry.is_regular_file(error)){
+            if(error){
+                m_availableEnvironments.clear();
+                return false;
+            }
+
+            continue;
+        }
+
+        std::string extension = entry.path().extension().string();
+
+        std::transform(extension.begin(), extension.end(), extension.begin(), [](unsigned char c){return static_cast<char>(std::tolower(c));});
+
+        if(extension != ".hdr"){
+            continue;
+        }
+
+        EnvironmentAsset asset;
+        asset.displayName = entry.path().stem().string();
+        asset.relativePath = std::filesystem::relative(entry.path(), m_assetRoot, error);
+
+        if(error){
+            m_availableEnvironments.clear();
+            return false;
+        }
+
+        m_availableEnvironments.push_back(std::move(asset));
+    }
+
+    std::sort(m_availableEnvironments.begin(), m_availableEnvironments.end(), [](const EnvironmentAsset& a, const EnvironmentAsset& b){return a.displayName < b.displayName;});
+
+    return true;
+}
+
+bool Renderer::SetEnvironment(size_t index)
+{
+    if(index >= m_availableEnvironments.size())
+    {
+        Log::Error("Invalid environment index.");
+        return false;
+    }
+
+    if(index == m_currentEnvironmentIndex)
+    {
+        return true;
+    }
+
+    m_commandContext.WaitForGPU();
+
+    m_environment.Shutdown();
+
+    const EnvironmentAsset& asset = m_availableEnvironments[index];
+
+    const std::filesystem::path environmentPath = m_assetRoot / asset.relativePath;
+
+    if(!m_environment.Initialize(
+        m_graphicsDevice.GetDevice(),
+        environmentPath,
+        m_resourceUploader,
+        m_resourceDescriptorHeap))
+    {
+        Log::Error("Failed to initialize environment: " + asset.displayName);
+        return false;
+    }
+
+    if(!PreprocessEnvironment(m_environment))
+    {
+        Log::Error("Failed to preprocess environment: " + asset.displayName);
+
+        m_environment.Shutdown();
+        return false;
+    }
+
+    m_currentEnvironmentIndex = index;
+
+    ResetSceneHistory();
+
+    Log::Info("Environment changed to: " + asset.displayName);
+
+    return true;
+}
+
+bool Renderer::PreprocessEnvironment(EnvironmentMap& environment)
+{
+    EnvironmentMipPass environmentMipPass;
+    EquirectangularToCubemapPass equirectangularToCubemapPass;
+    DiffuseIrradiancePass diffuseIrradiancePass;
+    GGXMultiscatterIrradiancePass ggxMultiscatterIrradiancePass;
+
+    auto cleanup = [&]()
+    {
+        ggxMultiscatterIrradiancePass.Shutdown();
+        diffuseIrradiancePass.Shutdown();
+        equirectangularToCubemapPass.Shutdown();
+        environmentMipPass.Shutdown();
+    };
+
+    ID3D12Device* device = m_graphicsDevice.GetDevice();
+
+    if(!environmentMipPass.Initialize(
+        device,
+        m_shaderLibrary,
+        m_rtvDescriptorHeap,
+        environment.GetSourceTexture()))
+    {
+        Log::Error("Failed to initialize environment mip pass.");
+        cleanup();
+        return false;
+    }
+
+    if(!equirectangularToCubemapPass.Initialize(
+        device,
+        m_shaderLibrary,
+        m_rtvDescriptorHeap,
+        environment.GetCubemap()))
+    {
+        Log::Error("Failed to initialize equirectangular-to-cubemap pass.");
+        cleanup();
+        return false;
+    }
+
+    if(!diffuseIrradiancePass.Initialize(
+        device,
+        m_shaderLibrary,
+        m_rtvDescriptorHeap,
+        environment.GetDiffuseIrradiance()))
+    {
+        Log::Error("Failed to initialize diffuse irradiance pass.");
+        cleanup();
+        return false;
+    }
+
+    if(!ggxMultiscatterIrradiancePass.Initialize(
+        device,
+        m_shaderLibrary,
+        m_rtvDescriptorHeap,
+        environment.GetGGXMultiscatterIrradiance()))
+    {
+        Log::Error("Failed to initialize GGX multiscatter irradiance pass.");
+        cleanup();
+        return false;
+    }
+
+    if(!m_commandContext.Begin(0))
+    {
+        Log::Error("Failed to begin environment preprocessing.");
+        cleanup();
+        return false;
+    }
+
+    ID3D12GraphicsCommandList* commandList =
+        m_commandContext.GetCommandList();
+
+    ID3D12DescriptorHeap* descriptorHeaps[] =
+    {
+        m_resourceDescriptorHeap.GetHeap()
+    };
+
+    commandList->SetDescriptorHeaps(1, descriptorHeaps);
+
+    environmentMipPass.Execute(
+        commandList,
+        environment.GetSourceTexture());
+
+    diffuseIrradiancePass.Execute(
+        commandList,
+        environment.GetSourceTexture(),
+        environment.GetDiffuseIrradiance());
+
+    equirectangularToCubemapPass.Execute(
+        commandList,
+        environment.GetSourceTexture(),
+        environment.GetCubemap());
+
+    ggxMultiscatterIrradiancePass.Execute(
+        commandList,
+        environment.GetSourceTexture(),
+        m_brdfIntegrationLUT,
+        environment.GetGGXMultiscatterIrradiance());
+
+    if(!m_commandContext.End())
+    {
+        Log::Error("Failed to end environment preprocessing.");
+        cleanup();
+        return false;
+    }
+
+    const bool submitted = m_commandContext.Execute(0);
+
+    // Execute may have submitted GPU work even if its final fence operation
+    // reports failure, so keep the temporary passes alive through this wait.
+    m_commandContext.WaitForGPU();
+
+    cleanup();
+
+    if(!submitted)
+    {
+        Log::Error("Failed to execute environment preprocessing.");
+        return false;
+    }
+
+    return true;
 }

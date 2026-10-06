@@ -89,7 +89,7 @@ void DebugUI::BeginFrame()
     ImGui::NewFrame();
 }
 
-void DebugUI::DrawPerformanceWindow()
+void DebugUI::DrawPerformanceWindow(const std::vector<std::string>& environmentNames, size_t currentEnvironmentIndex)
 {
     ImGuiIO& io = ImGui::GetIO();
 
@@ -121,6 +121,36 @@ void DebugUI::DrawPerformanceWindow()
     ImGui::End();
 
     ImGui::Begin("Rendering debug");
+
+    ImGui::TextUnformatted("Environment");
+
+    const char* currentEnvironmentName =
+        currentEnvironmentIndex < environmentNames.size()
+            ? environmentNames[currentEnvironmentIndex].c_str()
+            : "Unknown";
+
+    if(ImGui::BeginCombo("HDRI", currentEnvironmentName))
+    {
+        for(size_t i = 0; i < environmentNames.size(); ++i)
+        {
+            const bool selected = i == currentEnvironmentIndex;
+
+            if(ImGui::Selectable(environmentNames[i].c_str(), selected))
+            {
+                m_requestedEnvironmentIndex = static_cast<int>(i);
+            }
+
+            if(selected)
+            {
+                ImGui::SetItemDefaultFocus();
+            }
+        }
+
+        ImGui::EndCombo();
+    }
+
+    ImGui::Separator();
+
     const char* views[] = {"None", "Specular tracking distance", "NRD ViewZ", "NRD Normal",
         "NRD Roughness", "NRD Motion", "NRD Spec Radiance", "NRD Hit Distance",
         "NrdResolvedReflection"};

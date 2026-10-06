@@ -1,8 +1,11 @@
 #pragma once
 
+#include "Renderer/Passes/ToneMapPass.h"
+
 #include <climits>
 #include <cstdint>
-#include "Renderer/Passes/ToneMapPass.h"
+#include <string>
+#include <vector>
 
 struct ID3D12Device;
 struct ID3D12GraphicsCommandList;
@@ -27,13 +30,28 @@ class DebugUI
         void Shutdown();
 
         void BeginFrame();
-        void DrawPerformanceWindow();
+        void DrawPerformanceWindow(const std::vector<std::string>& environmentNames, size_t currentEnvironmentIndex);
         void EndFrame(ID3D12GraphicsCommandList* commandList);
 
         void SetTLASUpdated(bool updated);
         ReflectionDenoiserMode GetReflectionDenoiserMode() const { return static_cast<ReflectionDenoiserMode>(m_reflectionDenoiserMode); }
         bool IsReflectionContributionLimiterEnabled() const { return m_contributionLimiterEnabled; }
         ToneMapDebugView GetToneMapDebugView() const { return static_cast<ToneMapDebugView>(m_toneMapDebugView); }
+
+        bool HasEnvironmentChangeRequest() const
+        {
+            return m_requestedEnvironmentIndex >= 0;
+        }
+
+        size_t ConsumeEnvironmentChangeRequest()
+        {
+            const size_t index =
+                static_cast<size_t>(m_requestedEnvironmentIndex);
+
+            m_requestedEnvironmentIndex = -1;
+
+            return index;
+        }
 
     private:
         DescriptorHeap* m_descriptorHeap = nullptr;
@@ -43,4 +61,6 @@ class DebugUI
         int m_reflectionDenoiserMode = static_cast<int>(ReflectionDenoiserMode::Nrd);
         bool m_contributionLimiterEnabled = true;
         std::uint64_t m_totalTLASUpdates = 0;
+
+        int m_requestedEnvironmentIndex = -1;
 };
