@@ -32,6 +32,10 @@
 #include "Renderer/Passes/RayTracedReflectionPass.h"
 #include "Passes/RayTracedReflectionTemporalPass.h"
 #include "Passes/RayTracedReflectionDenoisePass.h"
+#include "Passes/ReflectionContributionLimitPass.h"
+#include "Passes/NrdReflectionDenoiser.h"
+#include "Passes/NrdReflectionPreparePass.h"
+#include "Passes/NrdReflectionResolvePass.h"
 
 #include <d3d12.h>
 #include <filesystem>
@@ -99,6 +103,13 @@ class Renderer
         RayTracedReflectionPass m_rayTracedReflectionPass;
         RayTracedReflectionTemporalPass m_rayTracedReflectionTemporalPass;
         RayTracedReflectionDenoisePass m_rayTracedReflectionDenoisePass;
+        ReflectionContributionLimitPass m_reflectionContributionLimitPass;
+        bool m_previousContributionLimiterEnabled = false;
+        bool m_nrdExecutedLastFrame = false;
+        bool m_nativeReflectionExecutedLastFrame = false;
+        NrdReflectionDenoiser m_nrdReflectionDenoiser;
+        NrdReflectionPreparePass m_nrdReflectionPreparePass;
+        NrdReflectionResolvePass m_nrdReflectionResolvePass;
         ShadowDenoisePass m_shadowDenoisePass;
 
         ShaderLibrary m_shaderLibrary;
@@ -109,6 +120,7 @@ class Renderer
         unsigned int m_height = 0;
         unsigned int m_shadowSampleIndex = 0;
         unsigned int m_reflectionSampleIndex = 0;
+        uint32_t m_nrdFrameIndex = 0;
 
         GBuffer m_gBuffer;
         UploadBuffer m_uploadBuffer;
@@ -124,6 +136,9 @@ class Renderer
 
         Matrix4 m_previousViewProjection{};
         bool m_hasPreviousViewProjection = false;
+        Matrix4 m_previousView{};
+        Matrix4 m_previousProjection{};
+        bool m_hasPreviousNrdCamera = false;
 
         Vector3 m_previousShadowLightDirection{};
         bool m_hasPreviousShadowLightDirection = false;

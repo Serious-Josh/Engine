@@ -2,6 +2,7 @@
 
 #include <climits>
 #include <cstdint>
+#include "Renderer/Passes/ToneMapPass.h"
 
 struct ID3D12Device;
 struct ID3D12GraphicsCommandList;
@@ -11,6 +12,8 @@ struct HWND__;
 using HWND = HWND__*;
 
 class DescriptorHeap;
+
+enum class ReflectionDenoiserMode { Nrd, Native };
 
 class DebugUI
 {
@@ -28,10 +31,16 @@ class DebugUI
         void EndFrame(ID3D12GraphicsCommandList* commandList);
 
         void SetTLASUpdated(bool updated);
+        ReflectionDenoiserMode GetReflectionDenoiserMode() const { return static_cast<ReflectionDenoiserMode>(m_reflectionDenoiserMode); }
+        bool IsReflectionContributionLimiterEnabled() const { return m_contributionLimiterEnabled; }
+        ToneMapDebugView GetToneMapDebugView() const { return static_cast<ToneMapDebugView>(m_toneMapDebugView); }
 
     private:
         DescriptorHeap* m_descriptorHeap = nullptr;
 
         bool m_tlasUpdated = false;
+        int m_toneMapDebugView = 0;
+        int m_reflectionDenoiserMode = static_cast<int>(ReflectionDenoiserMode::Nrd);
+        bool m_contributionLimiterEnabled = true;
         std::uint64_t m_totalTLASUpdates = 0;
 };

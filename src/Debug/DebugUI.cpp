@@ -119,6 +119,34 @@ void DebugUI::DrawPerformanceWindow()
     ImGui::Text("TLAS updates: %llu", static_cast<unsigned long long>(m_totalTLASUpdates));
 
     ImGui::End();
+
+    ImGui::Begin("Rendering debug");
+    const char* views[] = {"None", "Specular tracking distance", "NRD ViewZ", "NRD Normal",
+        "NRD Roughness", "NRD Motion", "NRD Spec Radiance", "NRD Hit Distance",
+        "NrdResolvedReflection"};
+    const char* denoisers[] = {"NRD", "Native"};
+    ImGui::Combo("Reflection denoiser", &m_reflectionDenoiserMode, denoisers, IM_ARRAYSIZE(denoisers));
+    ImGui::Checkbox("NRD contribution limiter", &m_contributionLimiterEnabled);
+    ImGui::Combo("Diagnostic view", &m_toneMapDebugView, views, IM_ARRAYSIZE(views));
+    ImGui::Separator();
+    if(GetToneMapDebugView() == ToneMapDebugView::SpecularTrackingDistance){
+        ImGui::TextUnformatted("Magenta: invalid | Blue: environment miss | Gray: geometry");
+    }
+    else if(GetToneMapDebugView() == ToneMapDebugView::NrdViewZ){
+        ImGui::TextUnformatted("Gray: Z / (Z + 10) | Magenta: beyond NRD range | Red: invalid Z");
+    }
+    else if(GetToneMapDebugView() == ToneMapDebugView::NrdMotion){
+        ImGui::TextUnformatted("Black: exact zero XYZ | RGB: amplified absolute XYZ (100x)");
+        ImGui::TextUnformatted("Any nonzero component has at least 25% intensity; camera motion should stay black.");
+    }
+    else if(GetToneMapDebugView() == ToneMapDebugView::NrdSpecularRadiance){
+        ImGui::TextUnformatted("Decoded demodulated radiance with AgX display mapping");
+    }
+    else if(GetToneMapDebugView() == ToneMapDebugView::NrdRoughness ||
+            GetToneMapDebugView() == ToneMapDebugView::NrdHitDistance){
+        ImGui::TextUnformatted("Decoded value: 0 = black | 1 = white");
+    }
+    ImGui::End();
 }
 
 void DebugUI::EndFrame(ID3D12GraphicsCommandList* commandList)

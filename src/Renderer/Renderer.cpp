@@ -123,6 +123,34 @@ bool Renderer::Initialize(void* windowHandle, unsigned int width, unsigned int h
         return false;
     }
 
+    if(!m_reflectionContributionLimitPass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap, m_width, m_height))
+    {
+        Log::Error("Failed to initialize reflection contribution limiter.");
+        return false;
+    }
+
+    if(!m_nrdReflectionPreparePass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap, m_width, m_height))
+    {
+        Log::Error("Failed to initialize NRD reflection preparation pass.");
+        return false;
+    }
+
+    if(!m_nrdReflectionResolvePass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap, m_width, m_height))
+    {
+        Log::Error("Failed to initialize NRD reflection resolve pass.");
+        return false;
+    }
+
+    if(!m_nrdReflectionDenoiser.Initialize(device, m_commandContext.GetCommandQueue(), m_resourceDescriptorHeap, m_width, m_height, 2)){
+        Log::Error("Failed to init NRD reflection denoiser.");
+        return false;
+    }
+
+    Log::Info("NRD REBLUR initialized.");
+    Log::Info("NRD persistent memory: " + std::to_string(m_nrdReflectionDenoiser.GetPersistentMemoryUsageInMb()) + " MiB");
+    Log::Info("NRD transient memory: " + std::to_string(m_nrdReflectionDenoiser.GetAliasableMemoryUsageInMb()) + " MiB");
+    Log::Info("NRD total memory: " + std::to_string(m_nrdReflectionDenoiser.GetTotalMemoryUsageInMb()) + " MiB");
+
     if(!m_shadowDenoisePass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap, m_width, m_height)){
         Log::Error("Failed to init shadow denoise pass.");
         return false;
@@ -307,6 +335,31 @@ void Renderer::Resize(unsigned int width, unsigned int height)
         Log::Error("Failed to resize ray traced reflection temporal pass.");
         return;
     }
+
+    if(!m_reflectionContributionLimitPass.Resize(m_graphicsDevice, m_resourceDescriptorHeap, width, height))
+    {
+        Log::Error("Failed to resize reflection contribution limiter.");
+        return;
+    }
+
+    if(!m_nrdReflectionPreparePass.Resize(m_graphicsDevice, m_resourceDescriptorHeap, width, height))
+    {
+        Log::Error("Failed to resize NRD reflection preparation pass.");
+        return;
+    }
+
+    if(!m_nrdReflectionResolvePass.Resize(m_graphicsDevice, m_resourceDescriptorHeap, width, height))
+    {
+        Log::Error("Failed to resize NRD reflection resolve pass.");
+        return;
+    }
+
+    if(!m_nrdReflectionDenoiser.Resize(m_resourceDescriptorHeap, width, height)){
+        Log::Error("Failed to resize NRD reflection denoiser.");
+        return;
+    }
+
+    m_hasPreviousNrdCamera = false;
 
     m_rayTracedReflectionDenoisePass.Resize(m_graphicsDevice, m_resourceDescriptorHeap, width, height);
     m_shadowDenoisePass.Resize(m_graphicsDevice, m_resourceDescriptorHeap, width, height);
@@ -496,8 +549,15 @@ void Renderer::Render(const Scene& scene)
     const Camera& camera = scene.GetCamera();
     const DirectionalLight& light = scene.GetDirectionalLight();
 
+    const Matrix4 currentView = camera.GetViewMatrix();
+    const Matrix4 currentProjection = camera.GetProjectionMatrix();
+    const Matrix4 currentViewProjection = currentProjection * currentView;
+
     CameraConstants cameraConstants{};
-    cameraConstants.viewProjection = camera.GetProjectionMatrix() * camera.GetViewMatrix();
+    cameraConstants.viewProjection = currentViewProjection;
+
+    const Matrix4 previousNrdView = m_hasPreviousNrdCamera ? m_previousView : currentView;
+    const Matrix4 previousNrdProjection = m_hasPreviousNrdCamera ? m_previousProjection : currentProjection;
 
     D3D12_GPU_VIRTUAL_ADDRESS cameraConstantsAddress = m_uploadBuffer.Allocate(&cameraConstants, sizeof(CameraConstants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
 
@@ -698,26 +758,120 @@ void Renderer::Render(const Scene& scene)
 
     m_rayTracedReflectionPass.Execute(m_commandContext.GetRayTracingCommandList(), m_resourceDescriptorHeap, m_rayTracingScene, reflectionConstantsAddress, lightConstantsAddress, m_width, m_height);
 
-    m_rayTracedReflectionTemporalPass.Execute(
-        commandList,
-        m_rayTracedReflectionPass.GetRawReflectionTexture(),
-        m_gBuffer,
-        m_uploadBuffer,
-        reflectionConstants.inverseViewProjection,
-        shadowConstants.previousViewProjection,
-        shadowConstants.previousInverseViewProjection,
-        m_width,
-        m_height);
+    constexpr float nrdDenoisingRange = 1000.0f;
+    const bool limiterEnabled = m_debugUI.IsReflectionContributionLimiterEnabled();
+    const ReflectionDenoiserMode reflectionMode = m_debugUI.GetReflectionDenoiserMode();
+    const ToneMapDebugView debugView = m_debugUI.GetToneMapDebugView();
+    bool runNrd = reflectionMode == ReflectionDenoiserMode::Nrd;
+    // Native production can still inspect fresh NRD diagnostics without changing its lighting input.
+    switch(debugView)
+    {
+        case ToneMapDebugView::NrdViewZ:
+        case ToneMapDebugView::NrdNormal:
+        case ToneMapDebugView::NrdRoughness:
+        case ToneMapDebugView::NrdMotion:
+        case ToneMapDebugView::NrdSpecularRadiance:
+        case ToneMapDebugView::NrdHitDistance:
+        case ToneMapDebugView::NrdResolvedReflection:
+            runNrd = true; break;
+        default: break;
+    }
+    const bool runNative = reflectionMode == ReflectionDenoiserMode::Native;
+    const bool resetNrdHistory = !m_hasPreviousNrdCamera || !m_nrdExecutedLastFrame ||
+        limiterEnabled != m_previousContributionLimiterEnabled;
 
-    m_rayTracedReflectionDenoisePass.Execute(
-        commandList,
-        m_rayTracedReflectionTemporalPass.GetReflectionTexture(),
-        m_rayTracedReflectionPass.GetHitDistanceTexture(),
-        m_gBuffer,
-        m_uploadBuffer,
-        reflectionConstants.inverseViewProjection,
-        m_width,
-        m_height);
+    if(runNrd)
+    {
+        m_nrdReflectionDenoiser.NewFrame();
+
+        if(!m_nrdReflectionDenoiser.SetFrameSettings(
+            currentView,
+            currentProjection,
+            previousNrdView,
+            previousNrdProjection,
+            m_nrdFrameIndex,
+            nrdDenoisingRange,
+            resetNrdHistory)){
+            Log::Error("Failed to set NRD reflection frame settings.");
+            return;
+        }
+
+        Texture* nrdInput = &m_rayTracedReflectionPass.GetRawReflectionTexture();
+        if(limiterEnabled)
+        {
+            if(!m_reflectionContributionLimitPass.Execute(commandList, *nrdInput, m_uploadBuffer, m_width, m_height))
+            {
+                Log::Error("Failed to execute reflection contribution limiter.");
+                return;
+            }
+            nrdInput = &m_reflectionContributionLimitPass.GetOutputTexture();
+        }
+
+        m_nrdReflectionPreparePass.Execute(
+            commandList,
+            m_gBuffer,
+            *nrdInput,
+            m_rayTracedReflectionPass.GetSpecularTrackingDistanceTexture(),
+            m_uploadBuffer,
+            reconstructionConstants.inverseViewProjection,
+            currentView,
+            m_materialBuffer.GetDescriptorIndex(),
+            m_width,
+            m_height,
+            nrdDenoisingRange);
+
+        m_nrdReflectionDenoiser.Denoise(
+            commandList,
+            m_nrdReflectionPreparePass.GetMotionTexture(),
+            m_nrdReflectionPreparePass.GetNormalRoughnessTexture(),
+            m_nrdReflectionPreparePass.GetViewZTexture(),
+            m_nrdReflectionPreparePass.GetSpecRadianceHitDistTexture());
+
+        commandList->SetDescriptorHeaps(
+            1,
+            descriptorHeaps);
+
+        m_nrdReflectionResolvePass.Execute(
+            commandList,
+            m_gBuffer,
+            m_nrdReflectionDenoiser.GetOutputTexture(),
+            m_uploadBuffer,
+            reconstructionConstants.inverseViewProjection,
+            currentView,
+            m_materialBuffer.GetDescriptorIndex(),
+            m_width,
+            m_height);
+    }
+
+    if(runNative)
+    {
+        if(!m_nativeReflectionExecutedLastFrame)
+            m_rayTracedReflectionTemporalPass.ResetHistory();
+        m_rayTracedReflectionTemporalPass.Execute(
+            commandList,
+            m_rayTracedReflectionPass.GetRawReflectionTexture(),
+            m_gBuffer,
+            m_uploadBuffer,
+            reflectionConstants.inverseViewProjection,
+            shadowConstants.previousViewProjection,
+            shadowConstants.previousInverseViewProjection,
+            m_width,
+            m_height);
+
+        m_rayTracedReflectionDenoisePass.Execute(
+            commandList,
+            m_rayTracedReflectionTemporalPass.GetReflectionTexture(),
+            m_rayTracedReflectionPass.GetHitDistanceTexture(),
+            m_gBuffer,
+            m_uploadBuffer,
+            reflectionConstants.inverseViewProjection,
+            m_width,
+            m_height);
+    }
+
+    Texture& finalReflection = reflectionMode == ReflectionDenoiserMode::Nrd
+        ? m_nrdReflectionResolvePass.GetOutputTexture()
+        : m_rayTracedReflectionDenoisePass.GetFilteredReflectionTexture();
 
     m_shadowDenoisePass.Execute(commandList, m_rayTracedShadowPass.GetVisibilityTexture(), m_gBuffer, m_uploadBuffer, reconstructionConstants.inverseViewProjection, m_width, m_height);
 
@@ -732,13 +886,33 @@ void Renderer::Render(const Scene& scene)
         m_ggxAverageAlbedoLUT,
         m_environment.GetGGXMultiscatterIrradiance(),
         m_shadowDenoisePass.GetFilteredVisibilityTexture(),
-        m_rayTracedReflectionDenoisePass.GetFilteredReflectionTexture(),
+        finalReflection,
         m_sceneColor,
         reconstructionConstantsAddress,
         lightConstantsAddress
     );
 
-    m_toneMapPass.Execute(commandList, m_sceneColor, rtvHandle);
+    Texture* debugTexture = nullptr;
+    switch(debugView)
+    {
+        case ToneMapDebugView::SpecularTrackingDistance:
+            debugTexture = &m_rayTracedReflectionPass.GetSpecularTrackingDistanceTexture(); break;
+        case ToneMapDebugView::NrdViewZ:
+            debugTexture = &m_nrdReflectionPreparePass.GetViewZTexture(); break;
+        case ToneMapDebugView::NrdNormal:
+        case ToneMapDebugView::NrdRoughness:
+            debugTexture = &m_nrdReflectionPreparePass.GetNormalRoughnessTexture(); break;
+        case ToneMapDebugView::NrdMotion:
+            debugTexture = &m_nrdReflectionPreparePass.GetMotionTexture(); break;
+        case ToneMapDebugView::NrdSpecularRadiance:
+        case ToneMapDebugView::NrdHitDistance:
+            debugTexture = &m_nrdReflectionPreparePass.GetSpecRadianceHitDistTexture(); break;
+        case ToneMapDebugView::NrdResolvedReflection:
+            debugTexture = &m_nrdReflectionResolvePass.GetOutputTexture(); break;
+        default: break;
+    }
+    m_toneMapPass.Execute(commandList, m_sceneColor, rtvHandle,
+        debugTexture, debugView, nrdDenoisingRange);
 
     m_debugUI.EndFrame(commandList);
 
@@ -759,6 +933,17 @@ void Renderer::Render(const Scene& scene)
 
     if(!m_swapChain.Present()){
         Log::Error("Failed to present swap chain.");
+    }
+
+    m_previousView = currentView;
+    m_previousProjection = currentProjection;
+    m_hasPreviousNrdCamera = true;
+    m_nrdExecutedLastFrame = runNrd;
+    m_nativeReflectionExecutedLastFrame = runNative;
+    if(runNrd)
+    {
+        m_previousContributionLimiterEnabled = limiterEnabled;
+        ++m_nrdFrameIndex;
     }
 }
 
@@ -795,6 +980,10 @@ void Renderer::Shutdown()
     m_rayTracedReflectionPass.Shutdown();
     m_rayTracedReflectionTemporalPass.Shutdown();
     m_rayTracedReflectionDenoisePass.Shutdown();
+    m_reflectionContributionLimitPass.Shutdown();
+    m_nrdReflectionPreparePass.Shutdown();
+    m_nrdReflectionDenoiser.Shutdown();
+    m_nrdReflectionResolvePass.Shutdown();
     m_shadowDenoisePass.Shutdown();
 
     m_rayTracingScene.Shutdown();

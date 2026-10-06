@@ -212,10 +212,10 @@ void CSMain(
                 sampleHitDistance >= 0.0f;
 
             //
-            // A geometry reflection hit and an environment
-            // reflection miss represent fundamentally
-            // different reflection events. Do not blur
-            // radiance across that boundary.
+            // DISABLED: current raw stochastic ray metadata does not describe
+            // temporally accumulated RGB. Non-geometry states are distinct:
+            // -1 = traced environment miss, -2 = no ray / invalid.
+            // The geometry predicate above does not classify either as a miss.
             //
             //if(centerHitGeometry !=
             //   sampleHitGeometry)
@@ -291,9 +291,8 @@ void CSMain(
             // difference so this behaves reasonably
             // across both near and distant geometry.
             //
-            // If both rays missed into the environment,
-            // hit distance provides no additional
-            // distinction and the weight remains 1.
+            // Non-geometry states (miss or invalid) leave this unused weight at 1.
+            // This weight is deliberately NOT included in the spatial blend.
             //
             float hitDistanceWeight =
                 1.0f;

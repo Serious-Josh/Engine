@@ -16,15 +16,19 @@ class RayTracedReflectionPass
         bool Resize(ID3D12Device* device, DescriptorHeap& descriptorHeap, unsigned int width, unsigned int height);
         void Shutdown();
 
+        // R32_FLOAT raw MIS-selected ray metadata: >0 geometry distance,
+        // -1 environment miss, -2 no ray / invalid. Not a specular tracking guide.
         Texture& GetHitDistanceTexture();
         const Texture& GetHitDistanceTexture() const;
         Texture& GetRawReflectionTexture();
         const Texture& GetRawReflectionTexture() const;
-
+        Texture& GetSpecularTrackingDistanceTexture();
+        const Texture& GetSpecularTrackingDistanceTexture() const;
 
     private:
         Texture m_rawReflectionTexture;
         Texture m_hitDistanceTexture;
+        Texture m_specularTrackingDistanceTexture;
 
         RayTracingPipeline m_pipeline;
 };

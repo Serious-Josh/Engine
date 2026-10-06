@@ -1,7 +1,12 @@
+#include "NRD/NRD.hlsli"
+
 struct ToneMapConstants
 {
     uint sceneColorIndex;
     float exposure;
+    uint debugTextureIndex;
+    uint debugView;
+    float nrdDenoisingRange;
 };
 
 ConstantBuffer<ToneMapConstants> toneMapConstants : register(b0);
@@ -113,10 +118,64 @@ VSOutput VSMain(uint vertexID : SV_VertexID)
 
 float4 PSMain(VSOutput input) : SV_TARGET
 {
-    Texture2D<float4> sceneColor =
-        ResourceDescriptorHeap[toneMapConstants.sceneColorIndex];
-
     uint2 pixel = uint2(input.position.xy);
+    if(toneMapConstants.debugView == 1)
+    {
+        Texture2D<float> trackingDistance =
+            ResourceDescriptorHeap[toneMapConstants.debugTextureIndex];
+        float distance = trackingDistance.Load(int3(uint2(input.position.xy), 0));
+        if(distance == -1.0f)
+            return float4(0.0f, 0.0f, 1.0f, 1.0f);
+        if(distance > 0.0f)
+        {
+            float gray = distance / (distance + 5.0f);
+            return float4(gray, gray, gray, 1.0f);
+        }
+        return float4(1.0f, 0.0f, 1.0f, 1.0f);
+    }
+
+    if(toneMapConstants.debugView == 2)
+    {
+        Texture2D<float> viewZTexture = ResourceDescriptorHeap[toneMapConstants.debugTextureIndex];
+        float z = viewZTexture.Load(int3(pixel, 0));
+        if(!isfinite(z) || z <= 0.0f)
+            return float4(1, 0, 0, 1); // Invalid depth.
+        if(z > toneMapConstants.nrdDenoisingRange)
+            return float4(1, 0, 1, 1);
+        float gray = z / (z + 10.0f);
+        return float4(gray.xxx, 1);
+    }
+    if(toneMapConstants.debugView >= 3 && toneMapConstants.debugView <= 7)
+    {
+        Texture2D<float4> preparedTexture = ResourceDescriptorHeap[toneMapConstants.debugTextureIndex];
+        float4 prepared = preparedTexture.Load(int3(pixel, 0));
+        if(!all(isfinite(prepared)))
+            return float4(1, 0, 1, 1);
+        if(toneMapConstants.debugView == 3 || toneMapConstants.debugView == 4)
+        {
+            float4 decoded = NRD_FrontEnd_UnpackNormalAndRoughness(prepared);
+            return float4(toneMapConstants.debugView == 3 ? decoded.xyz * 0.5f + 0.5f : decoded.www, 1);
+        }
+        if(toneMapConstants.debugView == 5)
+        {
+            // Exact zero is black. Amplify absolute world-space XYZ components;
+            // any nonzero component gets a visible minimum intensity.
+            float3 components = abs(prepared.xyz);
+            float3 display = max(saturate(components * 100.0f), step(1.0e-30f, components) * 0.25f);
+            return float4(display, 1);
+        }
+        // The preparation helper stores YCoCg, not ordinary RGB. The REBLUR
+        // backend unpack helper is also the inverse for this frontend packing.
+        float4 decoded = REBLUR_BackEnd_UnpackRadianceAndNormHitDist(prepared);
+        if(toneMapConstants.debugView == 7)
+            return float4(saturate(decoded.www), 1);
+        return float4(LinearToSRGB(AgX(max(decoded.xyz, 0.0f))), 1);
+    }
+
+    Texture2D<float4> sceneColor =
+        // Mode 8 is already unpacked, remodulated linear HDR reflection RGB.
+        ResourceDescriptorHeap[toneMapConstants.debugView == 8
+            ? toneMapConstants.debugTextureIndex : toneMapConstants.sceneColorIndex];
 
     float3 hdrColor =
         sceneColor.Load(int3(pixel, 0)).rgb;

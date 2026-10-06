@@ -71,6 +71,10 @@ add_executable(Engine
     src/Renderer/Passes/RayTracedReflectionPass.cpp
     src/Renderer/Passes/RayTracedReflectionDenoisePass.cpp
     src/Renderer/Passes/RayTracedReflectionTemporalPass.cpp
+    src/Renderer/Passes/NrdReflectionDenoiser.cpp
+    src/Renderer/Passes/NrdReflectionPreparePass.cpp
+    src/Renderer/Passes/ReflectionContributionLimitPass.cpp
+    src/Renderer/Passes/NrdReflectionResolvePass.cpp
 )
 
 add_custom_command(
@@ -89,6 +93,22 @@ add_custom_command(
         "${DXC_RUNTIME_DIR}/dxil.dll"
         "$<TARGET_FILE_DIR:Engine>/dxil.dll"
 
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/external/NRD/Lib/$<CONFIG>/NRD.dll"
+        "$<TARGET_FILE_DIR:Engine>/NRD.dll"
+
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/external/NRI/Lib/$<CONFIG>/NRI.dll"
+        "$<TARGET_FILE_DIR:Engine>/NRI.dll"
+
+    COMMAND ${CMAKE_COMMAND} -E make_directory
+        "$<TARGET_FILE_DIR:Engine>/assets/Shaders/NRD"
+
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/external/NRD/Shaders/NRD.hlsli"
+        "${CMAKE_CURRENT_SOURCE_DIR}/external/NRD/Shaders/NRDConfig.hlsli"
+        "$<TARGET_FILE_DIR:Engine>/assets/Shaders/NRD"
+
     COMMENT "Copying runtime assets and dependencies"
 )
 
@@ -97,6 +117,9 @@ target_include_directories(Engine
         src
         external/imgui
         external/stb
+        external/NRD/Include
+        external/NRD/Integration
+        external/NRI/Include
 )
 
 target_link_libraries(Engine
@@ -104,4 +127,10 @@ target_link_libraries(Engine
         dxgi
         d3d12
         dxcompiler
+
+        "$<$<CONFIG:Debug>:${CMAKE_CURRENT_SOURCE_DIR}/external/NRD/Lib/Debug/NRD.lib>"
+        "$<$<CONFIG:Release>:${CMAKE_CURRENT_SOURCE_DIR}/external/NRD/Lib/Release/NRD.lib>"
+
+        "$<$<CONFIG:Debug>:${CMAKE_CURRENT_SOURCE_DIR}/external/NRI/Lib/Debug/NRI.lib>"
+        "$<$<CONFIG:Release>:${CMAKE_CURRENT_SOURCE_DIR}/external/NRI/Lib/Release/NRI.lib>"
 )

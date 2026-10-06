@@ -1,5 +1,11 @@
 #include "MaterialLighting.hlsli"
 
+// Raw metadata for the actual MIS-selected stochastic ray, not a reconstructed
+// or in-lobe specular tracking distance. Geometry hits store RayTCurrent() > 0.
+// Finite, exactly representable R32_FLOAT sentinels distinguish the other states.
+static const float RAW_REFLECTION_RAY_MISS = -1.0f;
+static const float RAW_REFLECTION_RAY_INVALID = -2.0f;
+
 struct ReflectionPayload
 {
     float3 color;
@@ -64,6 +70,9 @@ RWTexture2D<float4> reflectionTexture :
 
 RWTexture2D<float> hitDistanceTexture :
     register(u1);
+
+RWTexture2D<float> specularTrackingDistanceTexture :
+    register(u2);
 
 ConstantBuffer<ReflectionConstants> reflectionConstants :
     register(b0);
@@ -735,7 +744,10 @@ void RayGeneration()
             );
 
         hitDistanceTexture[pixelIndex] =
-            -1.0f;
+            RAW_REFLECTION_RAY_INVALID;
+
+        specularTrackingDistanceTexture[pixelIndex] =
+            RAW_REFLECTION_RAY_INVALID;
 
         return;
     }
@@ -970,7 +982,7 @@ void RayGeneration()
         );
 
     payload.hitDistance =
-        -1.0f;
+        RAW_REFLECTION_RAY_INVALID;
 
     if(validReflectionSample)
     {
@@ -988,6 +1000,65 @@ void RayGeneration()
 
 
     }
+
+    float trackingHitDistance = RAW_REFLECTION_RAY_INVALID;
+
+    if(useGGXStrategy && validReflectionSample)
+    {
+        trackingHitDistance = payload.hitDistance;
+    }
+    else
+    {
+        // Auxiliary guide samples are independent of the radiance Sobol sequence.
+        uint trackingSeed = ReflectionScrambleHash(
+            ReflectionScrambleHash(pixelIndex.x ^ 0xD1B54A35u) ^
+            ReflectionScrambleHash(pixelIndex.y ^ 0x94D049BBu) ^
+            ReflectionScrambleHash(reflectionConstants.frameIndex ^ 0x369DEA0Fu));
+        float2 trackingSample = float2(
+            ReflectionScrambleHash(trackingSeed ^ 0xA24BAED5u) >> 8u,
+            ReflectionScrambleHash(trackingSeed ^ 0x9FB21C65u) >> 8u
+        ) * (1.0f / 16777216.0f);
+
+        float3 trackingHalfVector;
+        float3 trackingDirection = SampleGGXReflectionDirection(
+            normal, viewDirection, primaryMaterial.roughness,
+            trackingSample, trackingHalfVector);
+        bool validTrackingSample =
+            dot(normal, viewDirection) > 0.0f &&
+            dot(trackingDirection, normal) > 0.0f;
+
+        if(!mirrorReflection)
+        {
+            float3 halfVectorSum = viewDirection + trackingDirection;
+            float halfVectorLengthSquared = dot(halfVectorSum, halfVectorSum);
+            if(isfinite(halfVectorLengthSquared) && halfVectorLengthSquared > 1.0e-8f)
+            {
+                trackingHalfVector = halfVectorSum * rsqrt(halfVectorLengthSquared);
+                validTrackingSample = validTrackingSample &&
+                    dot(viewDirection, trackingHalfVector) > 0.0f;
+            }
+            else
+            {
+                validTrackingSample = false;
+            }
+        }
+
+        if(validTrackingSample)
+        {
+            RayDesc trackingRay = ray;
+            trackingRay.Direction = trackingDirection;
+            ReflectionPayload trackingPayload;
+            trackingPayload.color = float3(0.0f, 0.0f, 0.0f);
+            trackingPayload.hitDistance = RAW_REFLECTION_RAY_INVALID;
+            TraceRay(scene, RAY_FLAG_NONE, 0xFF, 1, 1, 1,
+                trackingRay, trackingPayload);
+            trackingHitDistance = trackingPayload.hitDistance;
+        }
+    }
+
+    specularTrackingDistanceTexture[pixelIndex] = trackingHitDistance;
+
+    // Snapshot the radiance payload before primary BRDF/MIS weighting.
 
     if(validReflectionSample)
     {
@@ -1153,9 +1224,25 @@ void RayGeneration()
 }
 
 [shader("miss")]
+void TrackingMiss(inout ReflectionPayload payload)
+{
+    payload.hitDistance = RAW_REFLECTION_RAY_MISS;
+}
+
+[shader("closesthit")]
+void TrackingClosestHit(
+    inout ReflectionPayload payload,
+    BuiltInTriangleIntersectionAttributes attributes)
+{
+    payload.hitDistance = RayTCurrent();
+}
+
+[shader("miss")]
 void Miss(
     inout ReflectionPayload payload)
 {
+    payload.hitDistance = RAW_REFLECTION_RAY_MISS;
+
     Texture2D<float4> environmentTexture =
         ResourceDescriptorHeap[
             reflectionConstants.environmentIndex

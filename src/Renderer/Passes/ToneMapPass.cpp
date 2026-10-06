@@ -2,6 +2,7 @@
 
 #include "Core/Log.h"
 #include "Renderer/RenderTarget.h"
+#include "Renderer/Texture.h"
 #include "Renderer/Shader/ShaderLibrary.h"
 
 bool ToneMapPass::Initialize(ID3D12Device* device, ShaderLibrary& shaderLibrary)
@@ -38,7 +39,7 @@ bool ToneMapPass::Initialize(ID3D12Device* device, ShaderLibrary& shaderLibrary)
     pipelineDescription.renderTargets.formats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
 
     pipelineDescription.rootParameters.push_back(
-        {RootParameterType::Constants, 0, 2, D3D12_SHADER_VISIBILITY_PIXEL}
+        {RootParameterType::Constants, 0, 5, D3D12_SHADER_VISIBILITY_PIXEL}
     );
 
     if(!m_pipeline.Initialize(device, pipelineDescription)){
@@ -52,12 +53,19 @@ bool ToneMapPass::Initialize(ID3D12Device* device, ShaderLibrary& shaderLibrary)
 void ToneMapPass::Execute(
     ID3D12GraphicsCommandList* commandList,
     RenderTarget& sceneColor,
-    D3D12_CPU_DESCRIPTOR_HANDLE outputRTV)
+    D3D12_CPU_DESCRIPTOR_HANDLE outputRTV,
+    Texture* debugTexture,
+    ToneMapDebugView debugView,
+    float nrdDenoisingRange)
 {
     sceneColor.Transition(
         commandList,
         D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
     );
+
+    if(debugTexture){
+        debugTexture->Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    }
 
     commandList->OMSetRenderTargets(
         1,
@@ -72,15 +80,21 @@ void ToneMapPass::Execute(
     {
         unsigned int sceneColorIndex;
         float exposure;
+        unsigned int debugTextureIndex;
+        unsigned int debugView;
+        float nrdDenoisingRange;
     };
 
     ToneMapConstants constants{};
     constants.sceneColorIndex = sceneColor.GetSRVIndex();
     constants.exposure = 1.0f;
+    constants.debugTextureIndex = debugTexture ? debugTexture->GetDescriptorIndex() : 0;
+    constants.debugView = debugTexture ? static_cast<unsigned int>(debugView) : 0;
+    constants.nrdDenoisingRange = nrdDenoisingRange;
 
     commandList->SetGraphicsRoot32BitConstants(
         0,
-        2,
+        5,
         &constants,
         0
     );

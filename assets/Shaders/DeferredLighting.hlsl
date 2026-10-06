@@ -1,7 +1,7 @@
 #include "MaterialLighting.hlsli"
 
-static const float RT_REFLECTION_ROUGHNESS_FADE_START = 0.40f;
-static const float RT_REFLECTION_ROUGHNESS_FADE_END = 0.60f;
+static const float RT_REFLECTION_ROUGHNESS_FADE_START = 0.30f;
+static const float RT_REFLECTION_ROUGHNESS_FADE_END = 0.40f;
 
 struct VSOutput
 {

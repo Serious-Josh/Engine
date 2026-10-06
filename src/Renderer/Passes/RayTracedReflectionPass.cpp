@@ -5,7 +5,6 @@
 #include "Renderer/GraphicsDevice.h"
 #include "Renderer/RayTracing/RayTracingSceneResources.h"
 #include "Renderer/Shader/ShaderLibrary.h"
-
 bool RayTracedReflectionPass::Initialize(
     GraphicsDevice& graphicsDevice,
     ShaderLibrary& shaderLibrary,
@@ -39,7 +38,7 @@ bool RayTracedReflectionPass::Initialize(
     }
 
     if(!m_hitDistanceTexture.Initialize(device, width, height, 1, 1,
-        DXGI_FORMAT_R16_FLOAT,
+        DXGI_FORMAT_R32_FLOAT,
         D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
     {
@@ -56,17 +55,40 @@ bool RayTracedReflectionPass::Initialize(
         return false;
     }
 
+    if(!m_specularTrackingDistanceTexture.Initialize(device, width, height, 1, 1,
+        DXGI_FORMAT_R32_FLOAT,
+        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
+    {
+            return false;
+    }
+
+    if(!m_specularTrackingDistanceTexture.CreateSRV(device, descriptorHeap))
+    {
+        return false;
+    }
+
+    if(!m_specularTrackingDistanceTexture.CreateUAV(device, descriptorHeap))
+    {
+        return false;
+    }
+
     RayTracingPipelineDescription pipelineDescription{};
 
     pipelineDescription.shaderPath = "RayTracedReflection.hlsl";
     pipelineDescription.rayGenerationShader = L"RayGeneration";
-    pipelineDescription.missShaders = {L"Miss"};
+    pipelineDescription.missShaders = {L"Miss", L"TrackingMiss"};
 
     pipelineDescription.hitGroups =
     {
         {
             L"HitGroup",
             L"ClosestHit",
+            L""
+        },
+        {
+            L"TrackingHitGroup",
+            L"TrackingClosestHit",
             L""
         }
     };
@@ -76,6 +98,7 @@ bool RayTracedReflectionPass::Initialize(
         {RootParameterType::ShaderResource, 0},
         {RootParameterType::DescriptorTable, 0, 0, D3D12_SHADER_VISIBILITY_ALL, DescriptorRangeType::UnorderedAccess, 1},
         {RootParameterType::DescriptorTable, 1, 0, D3D12_SHADER_VISIBILITY_ALL, DescriptorRangeType::UnorderedAccess, 1},
+        {RootParameterType::DescriptorTable, 2, 0, D3D12_SHADER_VISIBILITY_ALL, DescriptorRangeType::UnorderedAccess, 1},
         {RootParameterType::ConstantBuffer, 0},
         {RootParameterType::ConstantBuffer, 1}
     };
@@ -110,6 +133,7 @@ void RayTracedReflectionPass::Execute(
     m_rawReflectionTexture.Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
     m_hitDistanceTexture.Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    m_specularTrackingDistanceTexture.Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
     m_pipeline.Bind(commandList);
 
@@ -117,11 +141,13 @@ void RayTracedReflectionPass::Execute(
 
     const D3D12_GPU_DESCRIPTOR_HANDLE outputUAV = descriptorHeap.GetGPUHandle(m_rawReflectionTexture.GetUAVIndex());
     const D3D12_GPU_DESCRIPTOR_HANDLE hitDistanceUAV = descriptorHeap.GetGPUHandle(m_hitDistanceTexture.GetUAVIndex());
+    const D3D12_GPU_DESCRIPTOR_HANDLE trackingDistanceUAV = descriptorHeap.GetGPUHandle(m_specularTrackingDistanceTexture.GetUAVIndex());
 
     commandList->SetComputeRootDescriptorTable(1, outputUAV);
     commandList->SetComputeRootDescriptorTable(2, hitDistanceUAV);
-    commandList->SetComputeRootConstantBufferView(3, reflectionConstantsAddress);
-    commandList->SetComputeRootConstantBufferView(4, lightConstantsAddress);
+    commandList->SetComputeRootDescriptorTable(3, trackingDistanceUAV);
+    commandList->SetComputeRootConstantBufferView(4, reflectionConstantsAddress);
+    commandList->SetComputeRootConstantBufferView(5, lightConstantsAddress);
 
     m_pipeline.Dispatch(commandList, width, height);
 
@@ -132,6 +158,7 @@ void RayTracedReflectionPass::Execute(
     m_rawReflectionTexture.Transition(commandList, shaderReadState);
 
     m_hitDistanceTexture.Transition(commandList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    m_specularTrackingDistanceTexture.Transition(commandList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 }
 
 bool RayTracedReflectionPass::Resize(ID3D12Device* device, DescriptorHeap& descriptorHeap, unsigned int width, unsigned int height)
@@ -143,6 +170,7 @@ bool RayTracedReflectionPass::Resize(ID3D12Device* device, DescriptorHeap& descr
 
     m_rawReflectionTexture.Shutdown();
     m_hitDistanceTexture.Shutdown();
+    m_specularTrackingDistanceTexture.Shutdown();
 
     if(!m_rawReflectionTexture.Initialize(device, width, height, 1, 1,
         DXGI_FORMAT_R16G16B16A16_FLOAT,
@@ -169,7 +197,7 @@ bool RayTracedReflectionPass::Resize(ID3D12Device* device, DescriptorHeap& descr
     }
 
     if(!m_hitDistanceTexture.Initialize(device, width, height, 1, 1,
-        DXGI_FORMAT_R16_FLOAT,
+        DXGI_FORMAT_R32_FLOAT,
         D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
     {
@@ -192,6 +220,27 @@ bool RayTracedReflectionPass::Resize(ID3D12Device* device, DescriptorHeap& descr
         return false;
     }
 
+    if(!m_specularTrackingDistanceTexture.Initialize(device, width, height, 1, 1,
+        DXGI_FORMAT_R32_FLOAT,
+        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
+    {
+        Log::Error("Failed to resize ray traced reflection specular tracking distance texture.");
+        return false;
+    }
+
+    if(!m_specularTrackingDistanceTexture.CreateSRV(device, descriptorHeap))
+    {
+        Log::Error("Failed to resize ray traced reflection specular tracking distance srv.");
+        return false;
+    }
+
+    if(!m_specularTrackingDistanceTexture.CreateUAV(device, descriptorHeap))
+    {
+        Log::Error("Failed to resize ray traced reflection specular tracking distance uav.");
+        return false;
+    }
+
     return true;
 }
 
@@ -201,6 +250,7 @@ void RayTracedReflectionPass::Shutdown()
 
     m_rawReflectionTexture.Shutdown();
     m_hitDistanceTexture.Shutdown();
+    m_specularTrackingDistanceTexture.Shutdown();
 }
 
 Texture& RayTracedReflectionPass::GetRawReflectionTexture()
@@ -221,4 +271,14 @@ Texture& RayTracedReflectionPass::GetHitDistanceTexture()
 const Texture& RayTracedReflectionPass::GetHitDistanceTexture() const
 {
     return m_hitDistanceTexture;
+}
+
+Texture& RayTracedReflectionPass::GetSpecularTrackingDistanceTexture()
+{
+    return m_specularTrackingDistanceTexture;
+}
+
+const Texture& RayTracedReflectionPass::GetSpecularTrackingDistanceTexture() const
+{
+    return m_specularTrackingDistanceTexture;
 }
