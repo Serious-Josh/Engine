@@ -755,7 +755,33 @@ struct SecondaryLighting
     float3 multipleScatterEnvironmentSpecular;
 };
 
-float3 ShadeSecondarySurface(ReflectionPayload surface, float3 rayDirection,
+// Called only from RayGen: independent local state, never NRD tracking metadata.
+float HardDirectionalVisibility(float3 worldPosition, float3 worldNormal)
+{
+    if(!all(isfinite(worldPosition)) || !all(isfinite(worldNormal)) ||
+        !all(isfinite(lightConstants.lightDirection)))
+        return 0.0f;
+
+    float3 normal = normalize(worldNormal);
+    float3 directionToLight = normalize(-lightConstants.lightDirection);
+    if(!all(isfinite(normal)) || !all(isfinite(directionToLight)) ||
+        !(dot(normal, directionToLight) > 0.0f))
+        return 0.0f;
+
+    RayDesc visibilityRay;
+    visibilityRay.Origin = worldPosition + normal * 0.001f;
+    visibilityRay.Direction = directionToLight;
+    visibilityRay.TMin = 0.001f;
+    visibilityRay.TMax = 10000.0f;
+    TrackingPayload visibilityPayload;
+    visibilityPayload.hitDistance = RAW_REFLECTION_RAY_INVALID;
+    TraceRay(scene,
+        RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER,
+        0xFF, 1, 1, 1, visibilityRay, visibilityPayload);
+    return visibilityPayload.hitDistance == RAW_REFLECTION_RAY_MISS ? 1.0f : 0.0f;
+}
+
+float3 ShadeSecondarySurface(ReflectionPayload surface, float3 rayDirection, float directionalVisibility,
     out SecondaryLighting lighting)
 {
     lighting = (SecondaryLighting)0;
@@ -931,7 +957,8 @@ float3 ShadeSecondarySurface(ReflectionPayload surface, float3 rayDirection,
         directBRDF *
         lightConstants.lightColor *
         lightConstants.lightIntensity *
-        NdotL;
+        NdotL *
+        directionalVisibility;
 
     float3 environmentDiffuse =
         float3(
@@ -1593,8 +1620,9 @@ void RayGeneration()
     if(payload.hitDistance > 0.0f)
     {
         float3 secondaryPosition = ray.Origin + ray.Direction * payload.hitDistance;
+        float secondaryVisibility = HardDirectionalVisibility(secondaryPosition, payload.worldNormal);
         SecondaryLighting secondaryLighting;
-        secondaryRadiance = ShadeSecondarySurface(payload, ray.Direction, secondaryLighting);
+        secondaryRadiance = ShadeSecondarySurface(payload, ray.Direction, secondaryVisibility, secondaryLighting);
 
         GPUMaterial secondaryMaterial = materialBuffer[payload.materialIndex];
         // Preserve the validated deterministic mirror continuation.
@@ -1620,9 +1648,10 @@ void RayGeneration()
                 if(bounce2Payload.hitDistance > 0.0f)
                 {
                     float3 tertiaryPosition = bounce2Ray.Origin + bounce2Ray.Direction * bounce2Payload.hitDistance;
+                    float tertiaryVisibility = HardDirectionalVisibility(tertiaryPosition, bounce2Payload.worldNormal);
                     // Terminal shading: even a tertiary mirror cannot launch bounce 3.
                     SecondaryLighting tertiaryLighting;
-                    tertiaryRadiance = ShadeSecondarySurface(bounce2Payload, bounce2Ray.Direction, tertiaryLighting);
+                    tertiaryRadiance = ShadeSecondarySurface(bounce2Payload, bounce2Ray.Direction, tertiaryVisibility, tertiaryLighting);
                 }
                 else if(bounce2Payload.hitDistance == RAW_REFLECTION_RAY_MISS)
                 {
@@ -1682,9 +1711,11 @@ void RayGeneration()
                         float3 tertiaryRadiance = float3(0.0f, 0.0f, 0.0f);
                         if(bounce2Payload.hitDistance > 0.0f)
                         {
+                            float3 tertiaryPosition = bounce2Ray.Origin + bounce2Ray.Direction * bounce2Payload.hitDistance;
+                            float tertiaryVisibility = HardDirectionalVisibility(tertiaryPosition, bounce2Payload.worldNormal);
                             SecondaryLighting tertiaryLighting;
                             tertiaryRadiance = ShadeSecondarySurface(
-                                bounce2Payload, bounce2Ray.Direction, tertiaryLighting);
+                                bounce2Payload, bounce2Ray.Direction, tertiaryVisibility, tertiaryLighting);
                         }
                         else if(bounce2Payload.hitDistance == RAW_REFLECTION_RAY_MISS)
                         {
