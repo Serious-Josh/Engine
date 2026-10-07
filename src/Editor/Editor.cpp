@@ -12,17 +12,22 @@ void Editor::Draw(IDemoScene& demoScene, DemoSceneManager& sceneManager, SphereG
 {
     ImGui::Begin("Editor");
 
-    const char* sceneNames[] =
-    {
-        "Sphere Grid",
-        "Mirror Test"
-    };
+    const std::string_view activeSceneName = sceneManager.GetActiveSceneName();
 
-    int selectedScene = static_cast<int>(sceneManager.GetActiveSceneId());
+    if(ImGui::BeginCombo("Demo Scene", activeSceneName.data())){
+        for(const DemoSceneEntry& entry : sceneManager.GetAvailableScenes()){
+            const bool isSelected = entry.name == activeSceneName;
 
-    if(ImGui::Combo("Demo Scene", &selectedScene, sceneNames, IM_ARRAYSIZE(sceneNames)))
-    {
-        sceneManager.RequestScene(static_cast<DemoSceneId>(selectedScene));
+            if(ImGui::Selectable(entry.name.c_str(), isSelected)){
+                sceneManager.RequestScene(entry.name);
+            }
+
+            if(isSelected){
+                ImGui::SetItemDefaultFocus();
+            }
+        }
+
+        ImGui::EndCombo();
     }
 
     ImGui::Separator();

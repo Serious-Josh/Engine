@@ -1,22 +1,19 @@
 #pragma once
 
 #include "DemoContent/IDemoScene.h"
+#include "DemoContent/SceneRegistry.h"
 
 #include <memory>
+#include <span>
+#include <string_view>
 
 class SphereGridScene;
-
-enum class DemoSceneId
-{
-    SphereGrid,
-    MirrorTest
-};
 
 class DemoSceneManager
 {
 public:
     bool Initialize(
-        DemoSceneId sceneId,
+        std::string_view sceneName,
         ID3D12Device* device,
         ResourceUploader& uploader,
         DescriptorHeap& descriptorHeap,
@@ -26,8 +23,10 @@ public:
 
     void Shutdown();
 
-    void RequestScene(DemoSceneId sceneId);
+    bool RequestScene(std::string_view sceneName);
+
     bool HasPendingSceneChange() const;
+
     bool ApplyPendingSceneChange(
         ID3D12Device* device,
         ResourceUploader& uploader,
@@ -42,15 +41,14 @@ public:
 
     SphereGridScene* GetActiveSphereGridScene();
 
-    DemoSceneId GetActiveSceneId() const;
+    std::span<const DemoSceneEntry> GetAvailableScenes() const;
+    std::string_view GetActiveSceneName() const;
 
 private:
-    std::unique_ptr<IDemoScene> CreateScene(DemoSceneId sceneId) const;
-
     std::unique_ptr<IDemoScene> m_activeScene;
 
-    DemoSceneId m_activeSceneId = DemoSceneId::SphereGrid;
-    DemoSceneId m_requestedSceneId = DemoSceneId::SphereGrid;
+    const DemoSceneEntry* m_activeSceneEntry = nullptr;
+    const DemoSceneEntry* m_requestedSceneEntry = nullptr;
 
     float m_aspectRatio = 1.0f;
     bool m_hasPendingSceneChange = false;

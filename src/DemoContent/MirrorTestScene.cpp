@@ -10,7 +10,11 @@
 #include "Renderer/ImageLoader.h"
 #include "Core/Log.h"
 
+#include "DemoContent/SceneRegistry.h"
+
 #include <cstdint>
+
+REGISTER_DEMO_SCENE("Mirror Test", MirrorTestScene);
 
 bool MirrorTestScene::Initialize(
     ID3D12Device* device,

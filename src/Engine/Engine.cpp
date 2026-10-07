@@ -3,6 +3,7 @@
 #include "Core/Assert.h"
 #include "Core/Time.h"
 #include "Scene/Scene.h"
+#include "DemoContent/SceneRegistry.h"
 
 bool Engine::Initialize()
 {
@@ -52,7 +53,7 @@ bool Engine::Initialize()
     const float aspectRatio = static_cast<float>(m_window.GetWidth()) / static_cast<float>(m_window.GetHeight());
 
     if(!m_demoSceneManager.Initialize(
-        DemoSceneId::SphereGrid,
+        "Sphere Grid",
         m_renderer.GetDevice(),
         m_renderer.GetResourceUploader(),
         m_renderer.GetResourceDescriptorHeap(),

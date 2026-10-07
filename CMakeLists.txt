@@ -13,6 +13,21 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+include(FetchContent)
+
+# Assimp
+set(ASSIMP_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(ASSIMP_BUILD_ASSIMP_TOOLS OFF CACHE BOOL "" FORCE)
+set(ASSIMP_BUILD_SAMPLES OFF CACHE BOOL "" FORCE)
+set(ASSIMP_INSTALL OFF CACHE BOOL "" FORCE)
+
+FetchContent_Declare(
+    assimp
+    URL https://github.com/assimp/assimp/archive/refs/tags/v6.0.2.tar.gz
+)
+
+FetchContent_MakeAvailable(assimp)
+
 add_executable(Engine
     src/main.cpp
     src/Engine/Engine.cpp
@@ -78,6 +93,10 @@ add_executable(Engine
     src/DemoContent/DemoSceneManager.cpp
     src/DemoContent/MirrorTestScene.cpp
     src/Renderer/GpuTimestampProfiler.cpp
+    src/assets/ModelImporter.cpp
+    src/DemoContent/CornellBoxScene.cpp
+    src/DemoContent/SceneRegistry.cpp
+    src/DemoContent/StressTestScene.cpp
 )
 
 add_custom_command(
@@ -115,6 +134,10 @@ add_custom_command(
         "${CMAKE_CURRENT_SOURCE_DIR}/external/NRD/Shaders/NRDConfig.hlsli"
         "$<TARGET_FILE_DIR:Engine>/assets/Shaders/NRD"
 
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        $<TARGET_FILE:assimp>
+        $<TARGET_FILE_DIR:Engine>
+
     COMMENT "Copying runtime assets and dependencies"
 )
 
@@ -139,4 +162,6 @@ target_link_libraries(Engine
 
         "$<$<CONFIG:Debug>:${CMAKE_CURRENT_SOURCE_DIR}/external/NRI/Lib/Debug/NRI.lib>"
         "$<$<CONFIG:Release>:${CMAKE_CURRENT_SOURCE_DIR}/external/NRI/Lib/Release/NRI.lib>"
+
+        assimp
 )

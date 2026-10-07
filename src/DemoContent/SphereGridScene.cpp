@@ -8,8 +8,11 @@
 #include "Renderer/Geometry/SphereGenerator.h"
 #include "Core/Log.h"
 #include "Renderer/ImageLoader.h"
+#include "DemoContent/SceneRegistry.h"
 
 #include <cmath>
+
+REGISTER_DEMO_SCENE("Sphere Grid", SphereGridScene);
 
 bool SphereGridScene::Initialize(ID3D12Device* device, ResourceUploader& uploader, DescriptorHeap& descriptorHeap, const Shader* vertexShader, const Shader* pixelShader)
 {

@@ -140,8 +140,7 @@ void DebugUI::DrawPerformanceWindow(const std::vector<std::string>& environmentN
     const GpuTimestampProfiler::Results& gpu =
         statistics.gpuTimings;
 
-    auto drawGpuTiming =
-        [&](const char* name, GpuTimestampProfiler::Region region)
+    auto drawGpuTiming = [&](const char* name, GpuTimestampProfiler::Region region)
     {
         const unsigned int index =
             static_cast<unsigned int>(region);
@@ -150,10 +149,7 @@ void DebugUI::DrawPerformanceWindow(const std::vector<std::string>& environmentN
 
         if((gpu.validRegions & mask) != 0)
         {
-            ImGui::Text(
-                "%s: %.3f ms",
-                name,
-                gpu.milliseconds[index]);
+            ImGui::Text("%s: %.3f ms", name, gpu.milliseconds[index]);
         }
         else
         {
