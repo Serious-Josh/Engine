@@ -13,7 +13,7 @@ class DemoSceneManager;
 class Editor
 {
     public:
-        void Draw(IDemoScene& demoScene, DemoSceneManager& sceneManager, float viewportWidth, float viewportHeight);
+        void Draw(IDemoScene& demoScene, DemoSceneManager& sceneManager, float viewportWidth, float viewportHeight, float deltaTime);
 
         size_t GetSelectedObject() const
         {
@@ -42,6 +42,7 @@ class Editor
         void DrawTransformGizmo(IDemoScene& demoScene, float viewportWidth, float viewportHeight);
         void HandleViewportSelection(IDemoScene& demoScene, float viewportWidth, float viewportHeight);
         void UpdateCameraLook(IDemoScene& demoScene, float viewportWidth, float viewportHeight);
+        void UpdateCameraMovement(IDemoScene& demoScene, float deltaTime);
         void DrawObjectControls(IDemoScene& demoScene, DemoSceneManager& sceneManager);
         void DrawStressTestControls(StressTestScene& demoScene);
         void DrawSphereGridControls(SphereGridScene& demoScene);

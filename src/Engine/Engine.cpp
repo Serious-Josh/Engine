@@ -208,7 +208,7 @@ void Engine::Frame()
 
     IDemoScene& activeDemo = m_demoSceneManager.GetActiveScene();
 
-    m_editor.Draw(activeDemo, m_demoSceneManager, static_cast<float>(m_window.GetWidth()), static_cast<float>(m_window.GetHeight()));
+    m_editor.Draw(activeDemo, m_demoSceneManager, static_cast<float>(m_window.GetWidth()), static_cast<float>(m_window.GetHeight()), m_time.GetDeltaTime());
 
     activeDemo.Update(m_time.GetDeltaTime());
 

@@ -252,7 +252,7 @@ namespace
     }
 }
 
-void Editor::Draw(IDemoScene& demoScene, DemoSceneManager& sceneManager, float viewportWidth, float viewportHeight)
+void Editor::Draw(IDemoScene& demoScene, DemoSceneManager& sceneManager, float viewportWidth, float viewportHeight, float deltaTime)
 {
     const ImGuiIO& io = ImGui::GetIO();
 
@@ -316,6 +316,8 @@ void Editor::Draw(IDemoScene& demoScene, DemoSceneManager& sceneManager, float v
     ImGui::End();
 
     UpdateCameraLook(demoScene, viewportWidth, viewportHeight);
+
+    UpdateCameraMovement(demoScene, deltaTime);
 
     DrawTransformGizmo(demoScene, viewportWidth, viewportHeight);
 
@@ -758,6 +760,60 @@ void Editor::UpdateCameraLook(IDemoScene& demoScene, float viewportWidth, float 
     Camera& camera = demoScene.GetScene().GetCamera();
 
     camera.SetTarget(camera.GetPosition() + direction);
+}
+
+void Editor::UpdateCameraMovement(IDemoScene& demoScene, float deltaTime)
+{
+    if(!m_cameraLooking || deltaTime <= 0.0f){
+        return;
+    }
+
+    Camera& camera = demoScene.GetScene().GetCamera();
+
+    const Vector3 forward{
+        std::sin(m_cameraYaw) * std::cos(m_cameraPitch),
+        std::sin(m_cameraPitch),
+        std::cos(m_cameraYaw) * std::cos(m_cameraPitch)
+    };
+
+    const Vector3 right{
+        std::cos(m_cameraYaw),
+        0.0f,
+        -std::sin(m_cameraYaw)
+    };
+
+    const Vector3 up{0.0f, 1.0f, 0.0f};
+
+    Vector3 movement{0.0f, 0.0f, 0.0f};
+
+    if(ImGui::IsKeyDown(ImGuiKey_W)) movement = movement + forward;
+    if(ImGui::IsKeyDown(ImGuiKey_S)) movement = movement - forward;
+
+    if(ImGui::IsKeyDown(ImGuiKey_D)) movement = movement + right;
+    if(ImGui::IsKeyDown(ImGuiKey_A)) movement = movement - right;
+
+    if(ImGui::IsKeyDown(ImGuiKey_E) || ImGui::IsKeyDown(ImGuiKey_Space)) movement = movement + up;
+    if(ImGui::IsKeyDown(ImGuiKey_Q)) movement = movement - up;
+
+    const float length = movement.Length();
+
+    if(length <= 0.000001f){
+        return;
+    }
+
+    movement = movement * (1.0f / length);
+
+    constexpr float normalSpeed = 5.0f;
+    constexpr float fastSpeed = 15.0f;
+
+    const bool shiftHelp = ImGui::IsKeyDown(ImGuiKey_LeftShift) || ImGui::IsKeyDown(ImGuiKey_RightShift);
+
+    const float speed = shiftHelp ? fastSpeed : normalSpeed;
+
+    const Vector3 offset = movement * (speed * deltaTime);
+
+    camera.SetPosition(camera.GetPosition() + offset);
+    camera.SetTarget(camera.GetTarget() + offset);
 }
 
 void Editor::DrawCamera(IDemoScene& demoScene)
