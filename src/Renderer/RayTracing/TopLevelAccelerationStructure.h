@@ -36,6 +36,7 @@ class TopLevelAccelerationStructure
             ID3D12Resource* m_instanceBuffers[FrameCount]{};
 
             std::size_t m_instanceCount = 0;
+            D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAGS m_buildFlags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_NONE;
 
             std::vector<D3D12_RAYTRACING_INSTANCE_DESC> m_instanceDescriptions;
             std::vector<bool> m_pendingInstanceUpdates[FrameCount];

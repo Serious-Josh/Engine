@@ -39,7 +39,7 @@ class RayTracedReflectionDenoisePass
             DescriptorHeap& descriptorHeap,
             unsigned int width,
             unsigned int height);
-        void Resize(GraphicsDevice& graphicsDevice, DescriptorHeap& descriptorHeap, unsigned int width, unsigned int height);
+        bool Resize(GraphicsDevice& graphicsDevice, DescriptorHeap& descriptorHeap, unsigned int width, unsigned int height);
         void Shutdown();
         
         void Execute(

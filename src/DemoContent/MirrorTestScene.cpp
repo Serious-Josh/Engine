@@ -35,7 +35,7 @@ bool MirrorTestScene::Initialize(
     pipelineDescription.pixelShader = pixelShader;
     pipelineDescription.vertexLayout = &m_vertexLayout;
 
-    pipelineDescription.renderTargets.count = 2;
+    pipelineDescription.renderTargets.count = 3;
     pipelineDescription.renderTargets.formats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
     pipelineDescription.renderTargets.formats[1] = DXGI_FORMAT_R16G16B16A16_FLOAT;
     pipelineDescription.renderTargets.formats[2] = DXGI_FORMAT_R16G16B16A16_FLOAT;

@@ -3,6 +3,7 @@
 #include <d3d12.h>
 #include <dxgiformat.h>
 #include <climits>
+#include <array>
 
 class DescriptorHeap;
 
@@ -17,7 +18,7 @@ class RenderTarget
         RenderTarget(RenderTarget&& other) noexcept;
         RenderTarget& operator=(RenderTarget&& other) noexcept;
 
-        bool Initialize(ID3D12Device* device, unsigned int width, unsigned int height, DXGI_FORMAT format, DescriptorHeap& rtvHeap, DescriptorHeap& resourceHeap);
+        bool Initialize(ID3D12Device* device, unsigned int width, unsigned int height, DXGI_FORMAT format, DescriptorHeap& rtvHeap, DescriptorHeap& resourceHeap, const std::array<float, 4>& optimizedClearColor = {0.0f, 0.0f, 0.0f, 1.0f});
 
         void Shutdown();
 

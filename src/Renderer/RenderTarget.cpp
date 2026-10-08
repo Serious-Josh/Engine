@@ -1,5 +1,8 @@
 #include "RenderTarget.h"
 #include "DescriptorHeap.h"
+#include "Core/Log.h"
+
+#include <string>
 
 
 RenderTarget::RenderTarget(RenderTarget&& other) noexcept
@@ -54,7 +57,7 @@ RenderTarget& RenderTarget::operator=(RenderTarget&& other) noexcept
     return *this;
 }
 
-bool RenderTarget::Initialize(ID3D12Device* device, unsigned int width, unsigned int height, DXGI_FORMAT format, DescriptorHeap& rtvHeap, DescriptorHeap& resourceHeap)
+bool RenderTarget::Initialize(ID3D12Device* device, unsigned int width, unsigned int height, DXGI_FORMAT format, DescriptorHeap& rtvHeap, DescriptorHeap& resourceHeap, const std::array<float, 4>& optimizedClearColor)
 {
     if(!device || width == 0 || height == 0){
         return false;
@@ -76,14 +79,15 @@ bool RenderTarget::Initialize(ID3D12Device* device, unsigned int width, unsigned
 
     D3D12_CLEAR_VALUE clearValue{};
     clearValue.Format = format;
-    clearValue.Color[0] = 0.0f;
-    clearValue.Color[1] = 0.0f;
-    clearValue.Color[2] = 0.0f;
-    clearValue.Color[3] = 1.0f;
+    clearValue.Color[0] = optimizedClearColor[0];
+    clearValue.Color[1] = optimizedClearColor[1];
+    clearValue.Color[2] = optimizedClearColor[2];
+    clearValue.Color[3] = optimizedClearColor[3];
 
     HRESULT result = device->CreateCommittedResource(&heapProperties, D3D12_HEAP_FLAG_NONE, &description, D3D12_RESOURCE_STATE_RENDER_TARGET, &clearValue, IID_PPV_ARGS(&m_resource));
 
     if(FAILED(result)){
+        Log::Error("Failed to allocate render-target resource. HRESULT: " + std::to_string(result));
         return false;
     }
 

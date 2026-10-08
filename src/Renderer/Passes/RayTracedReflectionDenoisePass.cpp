@@ -67,7 +67,7 @@ bool RayTracedReflectionDenoisePass::Initialize(
     return true;
 }
 
-void RayTracedReflectionDenoisePass::Resize(
+bool RayTracedReflectionDenoisePass::Resize(
     GraphicsDevice& graphicsDevice,
     DescriptorHeap& descriptorHeap,
     unsigned int width,
@@ -87,21 +87,22 @@ void RayTracedReflectionDenoisePass::Resize(
             D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
         {
-            return;
+            return false;
         }
 
         if(!m_filteredReflection[i].CreateSRV(device, descriptorHeap))
         {
-            return;
+            return false;
         }
 
         if(!m_filteredReflection[i].CreateUAV(device, descriptorHeap))
         {
-            return;
+            return false;
         }
     }
 
     m_outputIndex = 0;
+    return true;
 }
 
 void RayTracedReflectionDenoisePass::Shutdown()

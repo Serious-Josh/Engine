@@ -1,7 +1,9 @@
 #include "BottomLevelAccelerationStructure.h"
+#include "Core/Log.h"
 
 #include "Renderer/Mesh.h"
 
+#include <string>
 #include <vector>
 
 bool BottomLevelAccelerationStructure::Initialize(ID3D12Device5* device, ID3D12GraphicsCommandList4* commandList, const RayTracingBottomLevelDescription& description)
@@ -65,9 +67,10 @@ bool BottomLevelAccelerationStructure::Initialize(ID3D12Device5* device, ID3D12G
     resourceDescription.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     resourceDescription.Width = prebuildInfo.ScratchDataSizeInBytes;
 
-    HRESULT result = device->CreateCommittedResource(&heapProperties, D3D12_HEAP_FLAG_NONE, &resourceDescription, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&m_scratchResource));
+    HRESULT result = device->CreateCommittedResource(&heapProperties, D3D12_HEAP_FLAG_NONE, &resourceDescription, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&m_scratchResource));
 
     if(FAILED(result)){
+        Log::Error("Failed to allocate BLAS scratch resource. HRESULT: " + std::to_string(result));
         Shutdown();
         return false;
     }
@@ -77,6 +80,7 @@ bool BottomLevelAccelerationStructure::Initialize(ID3D12Device5* device, ID3D12G
     result = device->CreateCommittedResource(&heapProperties, D3D12_HEAP_FLAG_NONE, &resourceDescription, D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE, nullptr, IID_PPV_ARGS(&m_resource));
 
     if(FAILED(result)){
+        Log::Error("Failed to allocate BLAS result resource. HRESULT: " + std::to_string(result));
         Shutdown();
         return false;
     }

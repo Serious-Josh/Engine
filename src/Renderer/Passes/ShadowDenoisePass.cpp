@@ -57,7 +57,7 @@ bool ShadowDenoisePass::Initialize(GraphicsDevice& graphicsDevice, ShaderLibrary
     return true;
 }
 
-void ShadowDenoisePass::Resize(GraphicsDevice& graphicsDevice, DescriptorHeap& descriptorHeap, unsigned int width, unsigned int height)
+bool ShadowDenoisePass::Resize(GraphicsDevice& graphicsDevice, DescriptorHeap& descriptorHeap, unsigned int width, unsigned int height)
 {
     ID3D12Device* device = graphicsDevice.GetDevice();
 
@@ -70,21 +70,22 @@ void ShadowDenoisePass::Resize(GraphicsDevice& graphicsDevice, DescriptorHeap& d
     {
         if(!m_filteredVisibility[i].Initialize(device, width, height, 1, 1, DXGI_FORMAT_R16_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
         {
-            return;
+            return false;
         }
 
         if(!m_filteredVisibility[i].CreateSRV(device, descriptorHeap))
         {
-            return;
+            return false;
         }
 
         if(!m_filteredVisibility[i].CreateUAV(device, descriptorHeap))
         {
-            return;
+            return false;
         }
     }
 
     m_outputIndex = 0;
+    return true;
 }
 
 void ShadowDenoisePass::Shutdown()

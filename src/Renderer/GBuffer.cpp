@@ -9,7 +9,8 @@ bool GBuffer::Initialize(ID3D12Device* device, unsigned int width, unsigned int 
         height,
         DXGI_FORMAT_R8G8B8A8_UNORM,
         rtvHeap,
-        resourceHeap))
+        resourceHeap,
+        {1.0f, 0.0f, 1.0f, 1.0f}))
     {
         return false;
     }
@@ -20,13 +21,14 @@ bool GBuffer::Initialize(ID3D12Device* device, unsigned int width, unsigned int 
         height,
         DXGI_FORMAT_R16G16B16A16_FLOAT,
         rtvHeap,
-        resourceHeap))
+        resourceHeap,
+        {0.0f, 1.0f, 0.0f, 1.0f}))
     {
         m_material.Shutdown();
         return false;
     }
 
-    if(!m_motion.Initialize(device, width, height, DXGI_FORMAT_R16G16B16A16_FLOAT, rtvHeap, resourceHeap)){
+    if(!m_motion.Initialize(device, width, height, DXGI_FORMAT_R16G16B16A16_FLOAT, rtvHeap, resourceHeap, {0.0f, 0.0f, 0.0f, 0.0f})){
         m_surface.Shutdown();
         m_material.Shutdown();
         return false;

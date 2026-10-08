@@ -66,10 +66,10 @@ class Renderer
 {
     public:
         bool Initialize(void* windowHandle, unsigned int width, unsigned int height, const std::filesystem::path& assetRoot);
-        void Render(const Scene& scene, const RendererOptions& options);
+        bool Render(const Scene& scene, const RendererOptions& options);
         void Shutdown();
 
-        void Resize(unsigned int width, unsigned int height);
+        bool Resize(unsigned int width, unsigned int height);
 
         ID3D12Device* GetDevice();
         ResourceUploader& GetResourceUploader();
@@ -82,7 +82,7 @@ class Renderer
         void ReleaseSceneResources();
         void ResetSceneHistory();
 
-        void WaitForGPU();
+        bool WaitForGPU();
 
         const std::vector<EnvironmentAsset>& GetAvailableEnvironments() const
         {

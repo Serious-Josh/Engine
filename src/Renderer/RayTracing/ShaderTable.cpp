@@ -1,7 +1,9 @@
 #include "ShaderTable.h"
+#include "Core/Log.h"
 
 #include <algorithm>
 #include <cstring>
+#include <string>
 
 namespace
 {
@@ -51,6 +53,7 @@ bool ShaderTable::Initialize(ID3D12Device* device, const std::vector<ShaderRecor
     HRESULT result = device->CreateCommittedResource(&heapProperties, D3D12_HEAP_FLAG_NONE, &resourceDescription, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&m_resource));
 
     if(FAILED(result)){
+        Log::Error("Failed to allocate DXR shader-table resource. HRESULT: " + std::to_string(result));
         m_recordSize = 0;
         return false;
     }
@@ -60,6 +63,7 @@ bool ShaderTable::Initialize(ID3D12Device* device, const std::vector<ShaderRecor
     result = m_resource->Map(0, nullptr, &mappedData);
 
     if(FAILED(result)){
+        Log::Error("Failed to map DXR shader-table resource. HRESULT: " + std::to_string(result));
         Shutdown();
         return false;
     }

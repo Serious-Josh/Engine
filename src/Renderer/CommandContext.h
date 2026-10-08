@@ -18,7 +18,7 @@ class CommandContext
         bool End();
 
         bool Execute(unsigned int frameIndex);
-        void WaitForGPU();
+        bool WaitForGPU();
 
         ID3D12GraphicsCommandList* GetCommandList() const;
         ID3D12CommandQueue* GetCommandQueue() const;

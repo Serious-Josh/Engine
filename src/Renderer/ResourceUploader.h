@@ -14,6 +14,7 @@ public:
     bool Initialize(ID3D12Device* device);
     void Shutdown();
 
+    // Unconfirmed post-submission completion aborts before staging or destination teardown.
     // Destination must start in COPY_DEST; returns after the GPU copy completes.
     bool UploadBuffer(ID3D12Resource* destination, const void* data, size_t dataSize, D3D12_RESOURCE_STATES finalState);
     bool UploadTexture(ID3D12Resource* destination, const void* data, size_t dataSize);

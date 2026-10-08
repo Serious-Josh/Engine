@@ -5,6 +5,8 @@
 #include "Scene/Scene.h"
 #include "DemoContent/SceneRegistry.h"
 
+#include <cstdlib>
+
 bool Engine::Initialize()
 {
     ENGINE_ASSERT(m_state == EngineState::Uninitialized);
@@ -80,6 +82,10 @@ bool Engine::Initialize()
     m_window.SetEventCallback(
         [this](const Event& event)
         {
+            if(m_window.ShouldClose()){
+                return;
+            }
+
             switch(event.type){
                 case EventType::WindowResized:
                     m_window.SetSize(event.width, event.height);
@@ -88,7 +94,10 @@ bool Engine::Initialize()
                         m_demoSceneManager.SetAspectRatio(static_cast<float>(event.width) / static_cast<float>(event.height));
                     }
 
-                    m_renderer.Resize(event.width, event.height);
+                    if(!m_renderer.Resize(event.width, event.height)){
+                        Log::Error("Renderer resize failed; requesting application shutdown.");
+                        m_window.Close();
+                    }
                     break;
                 case EventType::WindowClose:
                     m_window.Close();
@@ -166,7 +175,11 @@ void Engine::Frame()
 
     if(m_demoSceneManager.HasPendingSceneChange())
     {
-        m_renderer.WaitForGPU();
+        if(!m_renderer.WaitForGPU()){
+            Log::Error("Failed to confirm GPU completion before scene switch; requesting application shutdown.");
+            m_window.Close();
+            return;
+        }
         m_renderer.ReleaseSceneResources();
 
         if(!m_demoSceneManager.ApplyPendingSceneChange(
@@ -215,7 +228,11 @@ void Engine::Frame()
     Scene& activeScene = activeDemo.GetScene();
 
     if(activeScene.GetStructureRevision() != m_renderedSceneStructureRevision){
-        m_renderer.WaitForGPU();
+        if(!m_renderer.WaitForGPU()){
+            Log::Error("Failed to confirm GPU completion before scene rebuild; requesting application shutdown.");
+            m_window.Close();
+            return;
+        }
         m_renderer.ReleaseSceneResources();
 
         if(!m_renderer.InitializeSceneResources(activeScene, activeDemo.GetMaterials())){
@@ -235,7 +252,11 @@ void Engine::Frame()
         rendererOptions.selectedObject = selectedObject;
     }
 
-    m_renderer.Render(activeScene, rendererOptions);
+    if(!m_renderer.Render(activeScene, rendererOptions)){
+        Log::Error("Frame rendering failed; requesting application shutdown.");
+        m_window.Close();
+        return;
+    }
 
     activeScene.ClearChangedTransforms();
 }
@@ -247,7 +268,10 @@ void Engine::Shutdown()
 
     m_state = EngineState::Stopped;
 
-    m_renderer.WaitForGPU();
+    if(!m_renderer.WaitForGPU()){
+        Log::Error("Engine shutdown: GPU completion is unconfirmed; aborting without resource teardown.");
+        std::abort();
+    }
 
     m_renderer.ReleaseSceneResources();
     m_demoSceneManager.Shutdown();

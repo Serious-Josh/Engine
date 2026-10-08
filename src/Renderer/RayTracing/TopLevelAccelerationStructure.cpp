@@ -1,10 +1,12 @@
 #include "TopLevelAccelerationStructure.h"
+#include "Core/Log.h"
 
 #include "BottomLevelAccelerationStructure.h"
 #include "Math/Matrix4.h"
 
 #include <algorithm>
 #include <cstring>
+#include <string>
 #include <vector>
 
 bool TopLevelAccelerationStructure::Initialize(ID3D12Device5* device, ID3D12GraphicsCommandList4* commandList, const RayTracingTopLevelDescription& description, const std::vector<const BottomLevelAccelerationStructure*>& bottomLevelStructures)
@@ -66,6 +68,7 @@ bool TopLevelAccelerationStructure::Initialize(ID3D12Device5* device, ID3D12Grap
         HRESULT result = device->CreateCommittedResource(&uploadHeapProperties, D3D12_HEAP_FLAG_NONE, &instanceBufferDescription, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&m_instanceBuffers[i]));
 
         if(FAILED(result)){
+            Log::Error("Failed to create initial TLAS instance buffer. HRESULT: " + std::to_string(result));
             Shutdown();
             return false;
         }
@@ -77,6 +80,7 @@ bool TopLevelAccelerationStructure::Initialize(ID3D12Device5* device, ID3D12Grap
         HRESULT result = m_instanceBuffers[frameIndex]->Map(0, nullptr, &mappedData);
 
         if(FAILED(result)){
+            Log::Error("Failed to map initial TLAS instance buffer. HRESULT: " + std::to_string(result));
             Shutdown();
             return false;
         }
@@ -136,11 +140,12 @@ bool TopLevelAccelerationStructure::Initialize(ID3D12Device5* device, ID3D12Grap
         &defaultHeapProperties,
         D3D12_HEAP_FLAG_NONE,
         &resourceDescription,
-        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        D3D12_RESOURCE_STATE_COMMON,
         nullptr,
         IID_PPV_ARGS(&m_scratchResource));
 
     if(FAILED(result)){
+        Log::Error("Failed to allocate TLAS scratch resource. HRESULT: " + std::to_string(result));
         Shutdown();
         return false;
     }
@@ -156,6 +161,7 @@ bool TopLevelAccelerationStructure::Initialize(ID3D12Device5* device, ID3D12Grap
         IID_PPV_ARGS(&m_resource));
 
     if(FAILED(result)){
+        Log::Error("Failed to allocate TLAS result resource. HRESULT: " + std::to_string(result));
         Shutdown();
         return false;
     }
@@ -180,6 +186,7 @@ bool TopLevelAccelerationStructure::Initialize(ID3D12Device5* device, ID3D12Grap
     commandList->ResourceBarrier(1, &barrier);
 
     m_instanceCount = description.instances.size();
+    m_buildFlags = buildInputs.Flags;
 
     return true;
 }
@@ -249,6 +256,7 @@ bool TopLevelAccelerationStructure::Update(
     HRESULT result = m_instanceBuffers[frameIndex]->Map(0, nullptr, &mappedData);
 
     if(FAILED(result)){
+        Log::Error("Failed to map TLAS instance buffer for update. HRESULT: " + std::to_string(result));
         return false;
     }
 
@@ -272,8 +280,7 @@ bool TopLevelAccelerationStructure::Update(
     buildInputs.InstanceDescs = m_instanceBuffers[frameIndex]->GetGPUVirtualAddress();
 
     buildInputs.Flags =
-        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE |
-        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE |
+        m_buildFlags |
         D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE;
 
     D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC buildDescription{};
@@ -321,6 +328,7 @@ void TopLevelAccelerationStructure::Shutdown()
     }
 
     m_instanceCount = 0;
+    m_buildFlags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_NONE;
 }
 
 D3D12_GPU_VIRTUAL_ADDRESS TopLevelAccelerationStructure::GetGPUAddress() const

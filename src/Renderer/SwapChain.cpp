@@ -1,4 +1,10 @@
 #include "SwapChain.h"
+#include "Core/Log.h"
+#ifdef _DEBUG
+#include "GraphicsDevice.h"
+#endif
+
+#include <string>
 
 #include <dxgi1_6.h>
 #include <Windows.h>
@@ -83,6 +89,10 @@ bool SwapChain::Resize(unsigned int width, unsigned int height)
     HRESULT result = m_swapChain->ResizeBuffers(2, width, height, DXGI_FORMAT_R8G8B8A8_UNORM, 0);
 
     if(FAILED(result)){
+        Log::Error("Failed to resize swap-chain buffers. HRESULT: " + std::to_string(result));
+#ifdef _DEBUG
+        GraphicsDevice::ReportDeviceRemovedData(m_device, "SwapChain::Resize ResizeBuffers");
+#endif
         return false;
     }
 
@@ -129,6 +139,7 @@ bool SwapChain::CreateBackBufferViews()
 
         if(FAILED(result))
         {
+            Log::Error("Failed to acquire swap-chain back buffer " + std::to_string(index) + ". HRESULT: " + std::to_string(result));
             return false;
         }
 
@@ -173,6 +184,10 @@ bool SwapChain::Present()
     HRESULT result = m_swapChain->Present(1, 0);
 
     if(FAILED(result)){
+        Log::Error("Failed to present swap chain. Back-buffer index: " + std::to_string(m_currentBackBuffer) + "; HRESULT: " + std::to_string(result));
+#ifdef _DEBUG
+        GraphicsDevice::ReportDeviceRemovedData(m_device, "SwapChain::Present");
+#endif
         return false;
     }
 

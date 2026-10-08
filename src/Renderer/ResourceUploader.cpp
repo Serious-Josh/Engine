@@ -1,9 +1,29 @@
 #include "ResourceUploader.h"
+#include "Core/Log.h"
+#ifdef _DEBUG
+#include "GraphicsDevice.h"
+#endif
 
 #include <cstring>
+#include <cstdlib>
+#include <string>
 
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
+
+namespace
+{
+    [[noreturn]] void FailUploadSynchronization(ID3D12Device* device, const std::string& message)
+    {
+        Log::Error(message);
+        Log::Error("Upload device removal HRESULT: " + std::to_string(device->GetDeviceRemovedReason()));
+#ifdef _DEBUG
+        GraphicsDevice::ReportDeviceRemovedData(device, "ResourceUploader::FailUploadSynchronization");
+#endif
+        Log::Error("Upload work may still be in flight; aborting without staging release or resource teardown.");
+        std::abort();
+    }
+}
 
 bool ResourceUploader::Initialize(ID3D12Device* device)
 {
@@ -34,7 +54,11 @@ bool ResourceUploader::Initialize(ID3D12Device* device)
         return false;
     }
 
-    m_commandList->Close();
+    result = m_commandList->Close();
+    if(FAILED(result)){
+        Log::Error("Failed to close initial upload command list. HRESULT: " + std::to_string(result));
+        return false;
+    }
 
     result = m_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&m_fence));
 
@@ -53,6 +77,7 @@ bool ResourceUploader::Initialize(ID3D12Device* device)
 
 void ResourceUploader::Shutdown()
 {
+    // Submitted uploads complete synchronously or abort before reaching teardown.
     if(m_fenceEvent){
         CloseHandle(
             static_cast<HANDLE>(m_fenceEvent)
@@ -153,9 +178,19 @@ bool ResourceUploader::UploadTexture(ID3D12Resource* destination, const void* da
 
     uploadBuffer->Unmap(0, nullptr);
 
-    m_commandAllocator->Reset();
+    result = m_commandAllocator->Reset();
+    if(FAILED(result)){
+        Log::Error("Failed to reset texture upload allocator. HRESULT: " + std::to_string(result));
+        uploadBuffer->Release();
+        return false;
+    }
 
-    m_commandList->Reset(m_commandAllocator, nullptr);
+    result = m_commandList->Reset(m_commandAllocator, nullptr);
+    if(FAILED(result)){
+        Log::Error("Failed to reset texture upload command list. HRESULT: " + std::to_string(result));
+        uploadBuffer->Release();
+        return false;
+    }
 
     D3D12_TEXTURE_COPY_LOCATION source{};
     source.pResource = uploadBuffer;
@@ -177,6 +212,7 @@ bool ResourceUploader::FinishUpload(ID3D12Resource* uploadBuffer)
     HRESULT result = m_commandList->Close();
 
     if(FAILED(result)){
+        Log::Error("Failed to close upload command list before submission. HRESULT: " + std::to_string(result));
         uploadBuffer->Release();
         return false;
     }
@@ -185,24 +221,41 @@ bool ResourceUploader::FinishUpload(ID3D12Resource* uploadBuffer)
     
     m_commandQueue->ExecuteCommandLists(1, commandLists);
 
+    // From here, failure must not return to callers that may release the destination.
     ++m_fenceValue;
 
     result = m_commandQueue->Signal(m_fence, m_fenceValue);
-
     if(FAILED(result)){
-        uploadBuffer->Release();
-        return false;
+        FailUploadSynchronization(m_device, "Failed to signal upload fence after submission. HRESULT: " + std::to_string(result));
     }
 
-    if(m_fence->GetCompletedValue() < m_fenceValue){
-        result = m_fence->SetEventOnCompletion(m_fenceValue, static_cast<HANDLE>(m_fenceEvent));
+    unsigned long long completedValue = m_fence->GetCompletedValue();
+    if(completedValue == UINT64_MAX){
+        FailUploadSynchronization(m_device, "Upload fence reports device removal after submission.");
+    }
 
+    if(completedValue < m_fenceValue){
+        result = m_fence->SetEventOnCompletion(m_fenceValue, static_cast<HANDLE>(m_fenceEvent));
         if(FAILED(result)){
-            uploadBuffer->Release();
-            return false;
+            FailUploadSynchronization(m_device, "Failed to register upload fence event. HRESULT: " + std::to_string(result));
         }
 
-        WaitForSingleObject(static_cast<HANDLE>(m_fenceEvent), INFINITE);
+        const DWORD waitResult = WaitForSingleObject(static_cast<HANDLE>(m_fenceEvent), INFINITE);
+        if(waitResult == WAIT_FAILED){
+            const DWORD error = GetLastError();
+            FailUploadSynchronization(m_device, "Upload fence wait failed. Win32 error: " + std::to_string(error));
+        }
+        if(waitResult != WAIT_OBJECT_0){
+            FailUploadSynchronization(m_device, "Unexpected upload fence wait result: " + std::to_string(waitResult));
+        }
+    }
+
+    completedValue = m_fence->GetCompletedValue();
+    if(completedValue == UINT64_MAX){
+        FailUploadSynchronization(m_device, "Upload fence reports device removal while verifying completion.");
+    }
+    if(completedValue < m_fenceValue){
+        FailUploadSynchronization(m_device, "Upload fence has not completed. Requested: " + std::to_string(m_fenceValue) + "; completed: " + std::to_string(completedValue));
     }
 
     uploadBuffer->Release();

@@ -22,6 +22,7 @@
 #include <cctype>
 #include <iterator>
 #include <utility>
+#include <cstdlib>
 
 
 // --------------
@@ -220,13 +221,17 @@ bool Renderer::Initialize(void* windowHandle, unsigned int width, unsigned int h
         return false;
     }
 
-    if(!m_commandContext.Execute(0))
-    {
-        Log::Error("Failed to execute environment-independent LUT generation.");
+    const bool lutSubmitted = m_commandContext.Execute(0);
+
+    // Execute can fail to signal after submitting work; still attempt to drain it.
+    if(!m_commandContext.WaitForGPU()){
+        Log::Error("Failed to confirm GPU completion after LUT generation.");
         return false;
     }
-
-    m_commandContext.WaitForGPU();
+    if(!lutSubmitted){
+        Log::Error("Failed to execute or signal environment-independent LUT generation.");
+        return false;
+    }
 
     if(!PreprocessEnvironment(m_environment))
     {
@@ -290,84 +295,95 @@ bool Renderer::InitializeSwapChain(void* windowHandle)
 
 
 // Resize and geometry drawing
-void Renderer::Resize(unsigned int width, unsigned int height)
+bool Renderer::Resize(unsigned int width, unsigned int height)
 {
     if(width == 0 || height == 0){
-        return;
+        return true;
     }
 
-    m_commandContext.WaitForGPU();
+    if(!m_commandContext.WaitForGPU()){
+        Log::Error("Failed to confirm GPU completion before resize.");
+        return false;
+    }
 
     if(!m_swapChain.Resize(width, height)){
         Log::Error("Failed to resize swap chain.");
-        return;
+        return false;
     }
 
     if(!m_gBuffer.Resize(m_graphicsDevice.GetDevice(), width, height, m_rtvDescriptorHeap, m_dsvDescriptorHeap, m_resourceDescriptorHeap)){
         Log::Error("Failed to resize G-Buffer.");
-        return;
+        return false;
     }
 
     if(!m_rayTracedShadowPass.Resize(m_graphicsDevice.GetDevice(), m_resourceDescriptorHeap, width, height)){
         Log::Error("Failed to resize ray traced shadow pass.");
-        return;
+        return false;
     }
 
     if(!m_rayTracedReflectionPass.Resize(m_graphicsDevice.GetDevice(), m_resourceDescriptorHeap, width, height)){
         Log::Error("Failed to resize ray traced reflection pass.");
-        return;
+        return false;
     }
 
     if(!m_rayTracedReflectionTemporalPass.Resize(m_graphicsDevice.GetDevice(), m_resourceDescriptorHeap, width, height))
     {
         Log::Error("Failed to resize ray traced reflection temporal pass.");
-        return;
+        return false;
     }
 
     if(!m_reflectionContributionLimitPass.Resize(m_graphicsDevice, m_resourceDescriptorHeap, width, height))
     {
         Log::Error("Failed to resize reflection contribution limiter.");
-        return;
+        return false;
     }
 
     if(!m_nrdReflectionPreparePass.Resize(m_graphicsDevice, m_resourceDescriptorHeap, width, height))
     {
         Log::Error("Failed to resize NRD reflection preparation pass.");
-        return;
+        return false;
     }
 
     if(!m_nrdReflectionResolvePass.Resize(m_graphicsDevice, m_resourceDescriptorHeap, width, height))
     {
         Log::Error("Failed to resize NRD reflection resolve pass.");
-        return;
+        return false;
     }
 
     if(!m_nrdReflectionDenoiser.Resize(m_resourceDescriptorHeap, width, height)){
         Log::Error("Failed to resize NRD reflection denoiser.");
-        return;
+        return false;
     }
 
     m_hasPreviousNrdCamera = false;
 
-    m_rayTracedReflectionDenoisePass.Resize(m_graphicsDevice, m_resourceDescriptorHeap, width, height);
-    m_shadowDenoisePass.Resize(m_graphicsDevice, m_resourceDescriptorHeap, width, height);
+    if(!m_rayTracedReflectionDenoisePass.Resize(m_graphicsDevice, m_resourceDescriptorHeap, width, height)){
+        Log::Error("Failed to resize ray traced reflection denoise pass.");
+        return false;
+    }
+
+    if(!m_shadowDenoisePass.Resize(m_graphicsDevice, m_resourceDescriptorHeap, width, height)){
+        Log::Error("Failed to resize shadow denoise pass.");
+        return false;
+    }
 
     m_sceneColor.Shutdown();
 
     if(!m_sceneColor.Initialize(m_graphicsDevice.GetDevice(), width, height, DXGI_FORMAT_R16G16B16A16_FLOAT, m_rtvDescriptorHeap, m_resourceDescriptorHeap)){
         Log::Error("Failed to resize HDR scene color.");
-        return;
+        return false;
     }
 
     m_selectionMask.Shutdown();
 
     if(!m_selectionMask.Initialize(m_graphicsDevice.GetDevice(), width, height, DXGI_FORMAT_R8_UNORM, m_rtvDescriptorHeap, m_resourceDescriptorHeap)){
         Log::Error("Failed to resize selection mask.");
-        return;
+        return false;
     }
 
     m_width = width;
     m_height = height;
+    return true;
 }
 
 void Renderer::Draw(ID3D12GraphicsCommandList* commandList, const RenderObject& object, D3D12_GPU_VIRTUAL_ADDRESS cameraConstantsAddress)
@@ -404,6 +420,11 @@ void Renderer::Draw(ID3D12GraphicsCommandList* commandList, const RenderObject& 
     commandList->SetGraphicsRootConstantBufferView(2, objectConstantsAddress);
 
     object.mesh->Bind(commandList);
+
+    object.material->texture->Transition(
+        commandList,
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
     if(object.mesh->IsIndexed()){
         const uint64_t indexCount = static_cast<uint64_t>(object.mesh->GetIndexCount());
@@ -519,7 +540,7 @@ bool Renderer::InitializeSceneResources(const Scene& scene, const std::vector<Ma
 
     if(!InitializeRayTracingScene(scene)){
         Log::Error("Failed to init ray tracing scene.");
-        m_materialBuffer.Shutdown();
+        // Retain resources until shutdown confirms completion of any submitted build.
         return false;
     }
 
@@ -595,11 +616,17 @@ bool Renderer::InitializeRayTracingScene(const Scene& scene)
         return false;
     }
 
-    if(!m_commandContext.Execute(0)){
+    const bool buildSubmitted = m_commandContext.Execute(0);
+
+    // A failed submission fence signal does not mean the build was discarded.
+    if(!m_commandContext.WaitForGPU()){
+        Log::Error("Failed to confirm acceleration structure build completion.");
         return false;
     }
-
-    m_commandContext.WaitForGPU();
+    if(!buildSubmitted){
+        Log::Error("Failed to execute or signal acceleration structure construction.");
+        return false;
+    }
 
     return true;
 }
@@ -635,13 +662,13 @@ void Renderer::ResetSceneHistory()
 // Rendering
 // --------------
 
-void Renderer::Render(const Scene& scene, const RendererOptions& options)
+bool Renderer::Render(const Scene& scene, const RendererOptions& options)
 {
     const unsigned int frameIndex = m_swapChain.GetCurrentBackBufferIndex();
 
     if(!m_commandContext.Begin(frameIndex)){
         Log::Error("failed to begin command recording.");
-        return;
+        return false;
     }
 
     if(m_gpuTimestampProfiler.CollectCompleted(m_commandContext.GetCompletedFenceValue())){
@@ -684,7 +711,7 @@ void Renderer::Render(const Scene& scene, const RendererOptions& options)
         if(!m_rayTracingScene.Update(m_commandContext.GetRayTracingCommandList(), frameIndex, scene))
         {
             Log::Error("Failed to update ray tracing scene.");
-            return;
+            return false;
         }
     }
 
@@ -709,7 +736,7 @@ void Renderer::Render(const Scene& scene, const RendererOptions& options)
 
     if(cameraConstantsAddress == 0){
         Log::Error("Failed to allocate camera constants.");
-        return;
+        return false;
     }
 
     ReconstructionConstants reconstructionConstants{};
@@ -726,7 +753,7 @@ void Renderer::Render(const Scene& scene, const RendererOptions& options)
 
     if(reconstructionConstantsAddress == 0){
         Log::Error("Failed to allocate reconstruction constants.");
-        return;
+        return false;
     }
 
     DirectionalLightConstants lightConstants{};
@@ -746,7 +773,7 @@ void Renderer::Render(const Scene& scene, const RendererOptions& options)
 
     if(lightConstantsAddress == 0){
         Log::Error("Failed to allocate directional light constants.");
-        return;
+        return false;
     }
 
     const Vector3 currentLightDirection = light.direction.Normalized();
@@ -820,14 +847,14 @@ void Renderer::Render(const Scene& scene, const RendererOptions& options)
 
     if(shadowConstantsAddress == 0){
         Log::Error("Failed to allocate ray traced shadow constants.");
-        return;
+        return false;
     }
 
     D3D12_GPU_VIRTUAL_ADDRESS reflectionConstantsAddress = m_uploadBuffer.Allocate(&reflectionConstants, sizeof(ReflectionConstants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
 
     if(reflectionConstantsAddress == 0){
         Log::Error("Failed to allocate ray traced reflection constants.");
-        return;
+        return false;
     }
 
     D3D12_RESOURCE_BARRIER barrier{};
@@ -883,7 +910,7 @@ void Renderer::Render(const Scene& scene, const RendererOptions& options)
 
     m_selectionMask.Transition(commandList, D3D12_RESOURCE_STATE_RENDER_TARGET);
 
-    const float maskClearColor[] = {0.0f, 0.0f, 0.0f, 0.0f};
+    const float maskClearColor[] = {0.0f, 0.0f, 0.0f, 1.0f};
     commandList->ClearRenderTargetView(m_selectionMask.GetRTV(), maskClearColor, 0, nullptr);
 
     const auto& renderObjects = scene.GetRenderObjects();
@@ -986,7 +1013,7 @@ void Renderer::Render(const Scene& scene, const RendererOptions& options)
             nrdDenoisingRange,
             resetNrdHistory)){
             Log::Error("Failed to set NRD reflection frame settings.");
-            return;
+            return false;
         }
 
         Texture* nrdInput = &m_rayTracedReflectionPass.GetRawReflectionTexture();
@@ -997,7 +1024,7 @@ void Renderer::Render(const Scene& scene, const RendererOptions& options)
             if(!m_reflectionContributionLimitPass.Execute(commandList, *nrdInput, m_uploadBuffer, m_width, m_height))
             {
                 Log::Error("Failed to execute reflection contribution limiter.");
-                return;
+                return false;
             }
 
             m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::ReflectionContributionLimiter);
@@ -1163,12 +1190,12 @@ void Renderer::Render(const Scene& scene, const RendererOptions& options)
 
     if(!m_commandContext.End()){
         Log::Error("Failed to end command recording.");
-        return;
+        return false;
     }
 
     if(!m_commandContext.Execute(frameIndex)){
-        Log::Error("Failed to execute command list.");
-        return;
+        Log::Error("Failed to submit command list or signal its fence; GPU work may already be in flight.");
+        return false;
     }
 
     const uint64_t submissionFence = m_commandContext.GetFrameFenceValue(frameIndex);
@@ -1182,6 +1209,7 @@ void Renderer::Render(const Scene& scene, const RendererOptions& options)
 
     if(!m_swapChain.Present()){
         Log::Error("Failed to present swap chain.");
+        return false;
     }
 
     m_previousNrdView = currentView;
@@ -1194,6 +1222,8 @@ void Renderer::Render(const Scene& scene, const RendererOptions& options)
         m_previousContributionLimiterEnabled = limiterEnabled;
         ++m_nrdFrameIndex;
     }
+
+    return true;
 }
 
 
@@ -1204,7 +1234,10 @@ void Renderer::Render(const Scene& scene, const RendererOptions& options)
 void Renderer::Shutdown()
 {
     Log::Info("Renderer shutdown: waiting for GPU...");
-    m_commandContext.WaitForGPU();
+    if(!m_commandContext.WaitForGPU()){
+        Log::Error("Renderer shutdown: GPU completion is unconfirmed; aborting without resource teardown.");
+        std::abort();
+    }
     Log::Info("Renderer shutdown: GPU finished.");
 
     Log::Info("Renderer shutdown: shutting down DebugUI...");
@@ -1251,9 +1284,9 @@ void Renderer::Shutdown()
     m_graphicsDevice.Shutdown();
 }
 
-void Renderer::WaitForGPU()
+bool Renderer::WaitForGPU()
 {
-    m_commandContext.WaitForGPU();
+    return m_commandContext.WaitForGPU();
 }
 
 ID3D12Device* Renderer::GetDevice()
@@ -1360,7 +1393,10 @@ bool Renderer::SetEnvironment(size_t index)
         return true;
     }
 
-    m_commandContext.WaitForGPU();
+    if(!m_commandContext.WaitForGPU()){
+        Log::Error("Failed to confirm GPU completion before environment switch.");
+        return false;
+    }
 
     m_environment.Shutdown();
 
@@ -1383,7 +1419,7 @@ bool Renderer::SetEnvironment(size_t index)
     {
         Log::Error("Failed to preprocess environment: " + asset.displayName);
 
-        m_environment.Shutdown();
+        // Defer resource release to shutdown: preprocessing may have submitted work.
         return false;
     }
 
@@ -1503,7 +1539,12 @@ bool Renderer::PreprocessEnvironment(EnvironmentMap& environment)
 
     const bool submitted = m_commandContext.Execute(0);
     
-    m_commandContext.WaitForGPU();
+    if(!m_commandContext.WaitForGPU()){
+        Log::Error("Failed to confirm environment preprocessing completion; retaining temporary GPU resources until process exit.");
+        // These passes own raw D3D12 pointers. Do not release them or recycle their
+        // descriptors while submitted work may still reference them.
+        return false;
+    }
 
     cleanup();
 

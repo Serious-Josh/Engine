@@ -1,8 +1,23 @@
 #include "RayTracingPipeline.h"
 
 #include "Renderer/Shader/ShaderLibrary.h"
+#include "Core/Log.h"
 
+#include <string>
 #include <vector>
+
+namespace
+{
+    std::string ExportNameForLog(const std::wstring& name)
+    {
+        std::string result;
+        result.reserve(name.size());
+        for(wchar_t character : name){
+            result += static_cast<unsigned int>(character) <= 0x7F ? static_cast<char>(character) : '?';
+        }
+        return result;
+    }
+}
 
 bool RayTracingPipeline::Initialize(ID3D12Device5* device, ShaderLibrary& shaderLibrary, const RayTracingPipelineDescription& description)
 {
@@ -210,7 +225,11 @@ bool RayTracingPipeline::Initialize(ID3D12Device5* device, ShaderLibrary& shader
     HRESULT result = D3D12SerializeRootSignature(&rootSignatureDescription, D3D_ROOT_SIGNATURE_VERSION_1, &serializedRootSignature, &rootSignatureErrors);
 
     if(FAILED(result)){
+        Log::Error("Failed to serialize DXR global root signature. HRESULT: " + std::to_string(result));
         if(rootSignatureErrors){
+            if(rootSignatureErrors->GetBufferPointer() && rootSignatureErrors->GetBufferSize() > 0){
+                Log::Error(std::string(static_cast<const char*>(rootSignatureErrors->GetBufferPointer()), rootSignatureErrors->GetBufferSize()));
+            }
             rootSignatureErrors->Release();
         }
 
@@ -222,6 +241,7 @@ bool RayTracingPipeline::Initialize(ID3D12Device5* device, ShaderLibrary& shader
     serializedRootSignature->Release();
 
     if(FAILED(result)){
+        Log::Error("Failed to create DXR global root signature. HRESULT: " + std::to_string(result));
         return false;
     }
 
@@ -270,6 +290,7 @@ bool RayTracingPipeline::Initialize(ID3D12Device5* device, ShaderLibrary& shader
     result = device->CreateStateObject(&stateObjectDescription, IID_PPV_ARGS(&m_stateObject));
 
     if(FAILED(result)){
+        Log::Error("Failed to create DXR pipeline state object. HRESULT: " + std::to_string(result));
         return false;
     }
 
@@ -278,6 +299,7 @@ bool RayTracingPipeline::Initialize(ID3D12Device5* device, ShaderLibrary& shader
     result = m_stateObject->QueryInterface(IID_PPV_ARGS(&stateObjectProperties));
 
     if(FAILED(result)){
+        Log::Error("Failed to query ID3D12StateObjectProperties. HRESULT: " + std::to_string(result));
         Shutdown();
         return false;
     }
@@ -285,6 +307,7 @@ bool RayTracingPipeline::Initialize(ID3D12Device5* device, ShaderLibrary& shader
     const void* rayGenerationIdentifier = stateObjectProperties->GetShaderIdentifier(rayGenerationShader.c_str());
 
     if(!rayGenerationIdentifier){
+        Log::Error("Missing DXR ray-generation shader identifier for export: " + ExportNameForLog(rayGenerationShader));
         stateObjectProperties->Release();
         Shutdown();
         return false;
@@ -299,6 +322,7 @@ bool RayTracingPipeline::Initialize(ID3D12Device5* device, ShaderLibrary& shader
         const void* identifier = stateObjectProperties->GetShaderIdentifier(missShader.c_str());
 
         if(!identifier){
+            Log::Error("Missing DXR miss shader identifier for export: " + ExportNameForLog(missShader));
             stateObjectProperties->Release();
             Shutdown();
             return false;
@@ -314,6 +338,7 @@ bool RayTracingPipeline::Initialize(ID3D12Device5* device, ShaderLibrary& shader
         const void* identifier = stateObjectProperties->GetShaderIdentifier(hitGroup.name.c_str());
 
         if(!identifier){
+            Log::Error("Missing DXR hit-group shader identifier for export: " + ExportNameForLog(hitGroup.name));
             stateObjectProperties->Release();
             Shutdown();
             return false;

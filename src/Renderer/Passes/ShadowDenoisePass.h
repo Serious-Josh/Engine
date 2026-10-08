@@ -31,7 +31,7 @@ class ShadowDenoisePass
 {
     public:
         bool Initialize(GraphicsDevice& graphicsDevice, ShaderLibrary& shaderLibrary, DescriptorHeap& descriptorHeap, unsigned int width, unsigned int height);
-        void Resize(GraphicsDevice& graphicsDevice, DescriptorHeap& descriptorHeap, unsigned int width, unsigned int height);
+        bool Resize(GraphicsDevice& graphicsDevice, DescriptorHeap& descriptorHeap, unsigned int width, unsigned int height);
         void Shutdown();
 
         void Execute(ID3D12GraphicsCommandList* commandList, Texture& inputVisibility, GBuffer& gBuffer, UploadBuffer& uploadBuffer, const Matrix4& inverseViewProjection, unsigned int width, unsigned int height);

@@ -88,13 +88,7 @@ VSOutput VSMain(VSInput input)
         mul(previousView, previousWorldPosition).z
     );
 
-    output.worldNormal =
-        normalize(
-            mul(
-                (float3x3)normalMatrix,
-                input.normal
-            )
-        );
+    output.worldNormal = mul((float3x3)normalMatrix, input.normal);
 
     output.uv =
         input.uv;

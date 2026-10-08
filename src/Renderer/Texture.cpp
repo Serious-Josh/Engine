@@ -1,9 +1,11 @@
 #include "Texture.h"
 #include "DescriptorHeap.h"
+#include "Core/Log.h"
 
 #include <cstring>
 #include <climits>
 #include <utility>
+#include <string>
 
 Texture::Texture(Texture&& other) noexcept
     : m_resource(other.m_resource)
@@ -135,6 +137,7 @@ bool Texture::Initialize(ID3D12Device* device, unsigned int width, unsigned int 
     );
 
     if(FAILED(result)){
+        Log::Error("Failed to allocate texture resource. HRESULT: " + std::to_string(result));
         return false;
     }
 

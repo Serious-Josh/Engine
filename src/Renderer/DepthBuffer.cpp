@@ -1,5 +1,8 @@
 #include "DepthBuffer.h"
 #include "DescriptorHeap.h"
+#include "Core/Log.h"
+
+#include <string>
 
 
 bool DepthBuffer::Initialize(ID3D12Device* device, unsigned int width, unsigned int height, DescriptorHeap& dsvHeap, DescriptorHeap& resourceHeap)
@@ -34,6 +37,7 @@ bool DepthBuffer::Initialize(ID3D12Device* device, unsigned int width, unsigned 
     HRESULT result = device->CreateCommittedResource(&heapProperties, D3D12_HEAP_FLAG_NONE, &description, D3D12_RESOURCE_STATE_DEPTH_WRITE, &clearValue, IID_PPV_ARGS(&m_resource));
 
     if(FAILED(result)){
+        Log::Error("Failed to allocate depth resource. HRESULT: " + std::to_string(result));
         return false;
     }
 

@@ -2033,16 +2033,8 @@ void ClosestHit(
             normal2 * barycentric2
         );
 
-    float3x3 objectToWorld =
-        (float3x3)ObjectToWorld3x4();
-
     float3 worldNormal =
-        normalize(
-            mul(
-                objectToWorld,
-                objectNormal
-            )
-        );
+        normalize(mul(objectNormal, (float3x3)WorldToObject3x4()));
 
     payload.worldNormal = worldNormal;
     payload.uv = hitUV;

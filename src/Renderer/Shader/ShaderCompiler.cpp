@@ -2,6 +2,7 @@
 #include "ShaderCompiler.h"
 
 #include <filesystem>
+#include <string>
 
 bool ShaderCompiler::Initialize()
 {
@@ -101,7 +102,14 @@ bool ShaderCompiler::Compile(const ShaderCompileDescription& description, Shader
     }
 
     HRESULT compileStatus = S_OK;
-    compileResult->GetStatus(&compileStatus);
+    result = compileResult->GetStatus(&compileStatus);
+
+    if(FAILED(result)){
+        Log::Error("Failed to retrieve DXC shader compilation status (GetStatus). HRESULT: " + std::to_string(result));
+        compileResult->Release();
+        source->Release();
+        return false;
+    }
 
     IDxcBlobUtf8* errors = nullptr;
 
@@ -213,7 +221,14 @@ bool ShaderCompiler::CompileLibrary(
     }
 
     HRESULT compileStatus = S_OK;
-    compileResult->GetStatus(&compileStatus);
+    result = compileResult->GetStatus(&compileStatus);
+
+    if(FAILED(result)){
+        Log::Error("Failed to retrieve DXC shader-library compilation status (GetStatus). HRESULT: " + std::to_string(result));
+        compileResult->Release();
+        source->Release();
+        return false;
+    }
 
     IDxcBlobUtf8* errors = nullptr;
 

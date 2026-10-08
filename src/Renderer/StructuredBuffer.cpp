@@ -25,7 +25,7 @@ bool StructuredBuffer::Initialize(ID3D12Device* device, ResourceUploader& upload
     resourceDescription.SampleDesc.Count = 1;
     resourceDescription.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
 
-    HRESULT result = device->CreateCommittedResource(&heapProperties, D3D12_HEAP_FLAG_NONE, &resourceDescription, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&m_resource));
+    HRESULT result = device->CreateCommittedResource(&heapProperties, D3D12_HEAP_FLAG_NONE, &resourceDescription, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&m_resource));
 
     if(FAILED(result)){
         return false;

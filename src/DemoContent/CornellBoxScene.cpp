@@ -40,7 +40,7 @@ bool CornellBoxScene::Initialize(
     pipelineDescription.pixelShader = pixelShader;
     pipelineDescription.vertexLayout = &m_vertexLayout;
 
-    pipelineDescription.renderTargets.count = 2;
+    pipelineDescription.renderTargets.count = 3;
     pipelineDescription.renderTargets.formats[0] =
         DXGI_FORMAT_R8G8B8A8_UNORM;
     pipelineDescription.renderTargets.formats[1] =

@@ -88,6 +88,11 @@ void DeferredLightingPass::Execute(
     D3D12_GPU_VIRTUAL_ADDRESS reconstructionConstantsAddress,
     D3D12_GPU_VIRTUAL_ADDRESS lightConstantsAddress)
 {
+    gBuffer.GetMaterial().Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    gBuffer.GetSurface().Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    gBuffer.GetDepth().Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    reflectionTexture.Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+
     sceneColor.Transition(
         commandList,
         D3D12_RESOURCE_STATE_RENDER_TARGET

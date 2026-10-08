@@ -5,10 +5,12 @@
 #include "Renderer/Passes/NrdReflectionDenoiser.h"
 #include "Renderer/DescriptorHeap.h"
 #include "Math/Matrix4.h"
+#include "Core/Log.h"
 
 #include <NRDIntegration.hpp>
 
 #include <cstring>
+#include <string>
 
 namespace
 {
@@ -104,6 +106,7 @@ bool NrdReflectionDenoiser::Recreate(DescriptorHeap& descriptorHeap, uint32_t wi
     const nrd::Result result = m_Integration.RecreateD3D12(integrationDesc, instanceDesc, deviceDesc);
 
     if(result != nrd::Result::SUCCESS){
+        Log::Error("Failed to recreate NRD reflection denoiser. nrd::Result: " + std::to_string(static_cast<uint32_t>(result)));
         return false;
     }
 
