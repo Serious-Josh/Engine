@@ -1,9 +1,12 @@
 #pragma once
 
+#include "Scene/Transform.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <string>
+#include <vector>
 
 class IDemoScene;
 class SphereGridScene;
@@ -26,6 +29,8 @@ class Editor
         }
 
     private:
+        static constexpr size_t InvalidObjectSelection = (std::numeric_limits<size_t>::max)();
+
         enum class GizmoMode
         {
             Translate,
@@ -38,9 +43,28 @@ class Editor
         bool m_cameraLooking = false;
         float m_cameraYaw = 0.0f;
         float m_cameraPitch = 0.0f;
+        
+        struct TransformUndoEntry
+        {
+            size_t objectIndex;
+            Transform previousTransform;
+        };
+
+        std::vector<TransformUndoEntry> m_transformUndoHistory;
+        std::vector<TransformUndoEntry> m_transformRedoHistory;
+
+        bool m_gizmoWasUsing = false;
+        size_t m_gizmoUndoObject = InvalidObjectSelection;
+        Transform m_gizmoUndoStart;
+        bool m_transformFieldEditing = false;
+        size_t m_transformFieldUndoObject = InvalidObjectSelection;
+        Transform m_transformFieldUndoStart;
 
         void DrawTransformGizmo(IDemoScene& demoScene, float viewportWidth, float viewportHeight);
         void HandleViewportSelection(IDemoScene& demoScene, float viewportWidth, float viewportHeight);
+        void HandleTransformUndo(IDemoScene& demoScene);
+        void HandleTransformRedo(IDemoScene& demoScene);
+        void ClearTransformUndoHistory();
         void UpdateCameraLook(IDemoScene& demoScene, float viewportWidth, float viewportHeight);
         void UpdateCameraMovement(IDemoScene& demoScene, float deltaTime);
         void DrawObjectControls(IDemoScene& demoScene, DemoSceneManager& sceneManager);
@@ -49,7 +73,6 @@ class Editor
         void DrawDirectionalLight(IDemoScene& demoScene);
         void DrawCamera(IDemoScene& demoScene);
 
-        static constexpr size_t InvalidObjectSelection = (std::numeric_limits<size_t>::max)();
         size_t m_selectedObject = InvalidObjectSelection;
         uint64_t m_selectionStructureRevision = 0;
         std::string m_selectionSceneName;

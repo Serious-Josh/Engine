@@ -315,6 +315,9 @@ void Editor::Draw(IDemoScene& demoScene, DemoSceneManager& sceneManager, float v
 
     ImGui::End();
 
+    HandleTransformUndo(demoScene);
+    HandleTransformRedo(demoScene);
+
     UpdateCameraLook(demoScene, viewportWidth, viewportHeight);
 
     UpdateCameraMovement(demoScene, deltaTime);
@@ -460,6 +463,8 @@ void Editor::DrawObjectControls(IDemoScene& demoScene, DemoSceneManager& sceneMa
     const uint64_t structureRevision = scene.GetStructureRevision();
 
     if(m_selectionSceneName != activeSceneName || m_selectionStructureRevision != structureRevision){
+        ClearTransformUndoHistory();
+
         m_selectedObject = InvalidObjectSelection;
         m_selectionSceneName = activeSceneName;
         m_selectionStructureRevision = structureRevision;
@@ -511,10 +516,18 @@ void Editor::DrawObjectControls(IDemoScene& demoScene, DemoSceneManager& sceneMa
     Transform transform = objects[m_selectedObject].transform;
     bool transformChanged = false;
 
+    const Transform originalTransform = transform;
+
+    bool fieldActivated = false;
+    bool fieldDeactivated = false;
+
     ImGui::Separator();
     ImGui::PushID("SelectedObjectTransform");
 
     transformChanged |= ImGui::DragFloat3("Position", &transform.position.x, 0.05f);
+
+    fieldActivated |= ImGui::IsItemActivated();
+    fieldDeactivated |= ImGui::IsItemDeactivatedAfterEdit();
 
     float rotationDegrees[3] =
     {
@@ -533,7 +546,10 @@ void Editor::DrawObjectControls(IDemoScene& demoScene, DemoSceneManager& sceneMa
         transformChanged = true;
     }
 
-    if(transformChanged |= ImGui::DragFloat3("Scale", &transform.scale.x, 0.01f, 0.01f, 100.0f)){
+    fieldActivated |= ImGui::IsItemActivated();
+    fieldDeactivated |= ImGui::IsItemDeactivatedAfterEdit();
+
+    if(ImGui::DragFloat3("Scale", &transform.scale.x, 0.01f, 0.01f, 100.0f)){
         transform.scale.x = (std::max)(0.01f, transform.scale.x);
         transform.scale.y = (std::max)(0.01f, transform.scale.y);
         transform.scale.z = (std::max)(0.01f, transform.scale.z);
@@ -541,10 +557,51 @@ void Editor::DrawObjectControls(IDemoScene& demoScene, DemoSceneManager& sceneMa
         transformChanged = true;
     }
 
+    fieldActivated |= ImGui::IsItemActivated();
+    fieldDeactivated |= ImGui::IsItemDeactivatedAfterEdit();
+
+    if(fieldActivated && !m_transformFieldEditing){
+        m_transformFieldEditing = true;
+        m_transformFieldUndoObject = m_selectedObject;
+        m_transformFieldUndoStart = originalTransform;
+    }
+
     ImGui::PopID();
 
     if(transformChanged){
         scene.SetRenderObjectTransform(m_selectedObject, transform);
+    }
+
+    if(fieldDeactivated && m_transformFieldEditing)
+    {
+        const auto& currentObjects = static_cast<const Scene&>(scene).GetRenderObjects();
+
+        if(m_transformFieldUndoObject < currentObjects.size())
+        {
+            const Transform& current = currentObjects[m_transformFieldUndoObject].transform;
+
+            const Transform& previous = m_transformFieldUndoStart;
+
+            const bool changed =
+                current.position.x != previous.position.x ||
+                current.position.y != previous.position.y ||
+                current.position.z != previous.position.z ||
+                current.rotation.x != previous.rotation.x ||
+                current.rotation.y != previous.rotation.y ||
+                current.rotation.z != previous.rotation.z ||
+                current.scale.x != previous.scale.x ||
+                current.scale.y != previous.scale.y ||
+                current.scale.z != previous.scale.z;
+
+            if(changed)
+            {
+                m_transformRedoHistory.clear();
+                m_transformUndoHistory.push_back({m_transformFieldUndoObject, previous});
+            }
+        }
+
+        m_transformFieldEditing = false;
+        m_transformFieldUndoObject = InvalidObjectSelection;
     }
 }
 
@@ -608,7 +665,14 @@ void Editor::DrawTransformGizmo(IDemoScene& demoScene, float viewportWidth, floa
 
     ImGui::End();
 
-    if(ImGuizmo::IsUsing())
+    const bool gizmoUsing = ImGuizmo::IsUsing();
+
+    if(gizmoUsing && !m_gizmoWasUsing){
+        m_gizmoUndoObject = m_selectedObject;
+        m_gizmoUndoStart = transform;
+    }
+
+    if(gizmoUsing)
     {
         float translation[3];
         float rotationDegrees[3];
@@ -673,6 +737,39 @@ void Editor::DrawTransformGizmo(IDemoScene& demoScene, float viewportWidth, floa
             scene.SetRenderObjectTransform(m_selectedObject, transform);
         }
     }
+
+    if(!gizmoUsing && m_gizmoWasUsing && m_gizmoUndoObject != InvalidObjectSelection)
+    {
+        const auto& currentObjects = static_cast<const Scene&>(scene).GetRenderObjects();
+
+        if(m_gizmoUndoObject < currentObjects.size())
+        {
+            const Transform& current = currentObjects[m_gizmoUndoObject].transform;
+
+            const Transform& previous = m_gizmoUndoStart;
+
+            const bool changed =
+                current.position.x != previous.position.x ||
+                current.position.y != previous.position.y ||
+                current.position.z != previous.position.z ||
+                current.rotation.x != previous.rotation.x ||
+                current.rotation.y != previous.rotation.y ||
+                current.rotation.z != previous.rotation.z ||
+                current.scale.x != previous.scale.x ||
+                current.scale.y != previous.scale.y ||
+                current.scale.z != previous.scale.z;
+
+            if(changed)
+            {
+                m_transformRedoHistory.clear();
+                m_transformUndoHistory.push_back({m_gizmoUndoObject, previous});
+            }
+        }
+
+        m_gizmoUndoObject = InvalidObjectSelection;
+    }
+
+    m_gizmoWasUsing = gizmoUsing;
 }
 
 void Editor::HandleViewportSelection(IDemoScene& demoScene, float viewportWidth, float viewportHeight)
@@ -703,6 +800,88 @@ void Editor::HandleViewportSelection(IDemoScene& demoScene, float viewportWidth,
     const Scene& scene = demoScene.GetScene();
 
     m_selectedObject = PickObject(scene, mouse.x, mouse.y, viewportWidth, viewportHeight);
+}
+
+void Editor::ClearTransformUndoHistory()
+{
+    m_transformUndoHistory.clear();
+    m_transformRedoHistory.clear();
+
+    m_gizmoWasUsing = false;
+    m_gizmoUndoObject = InvalidObjectSelection;
+
+    m_transformFieldEditing = false;
+    m_transformFieldUndoObject = InvalidObjectSelection;
+}
+
+void Editor::HandleTransformUndo(IDemoScene& demoScene)
+{
+    const ImGuiIO& io = ImGui::GetIO();
+
+    if(!io.KeyCtrl ||
+        !ImGui::IsKeyPressed(ImGuiKey_Z, false) ||
+        io.KeyShift ||
+        io.WantTextInput ||
+        ImGui::IsAnyItemActive() ||
+        ImGuizmo::IsUsing() ||
+        m_cameraLooking ||
+        m_transformFieldEditing ||
+        m_transformUndoHistory.empty())
+    {
+        return;
+    }
+
+    Scene& scene = demoScene.GetScene();
+
+    const TransformUndoEntry entry = m_transformUndoHistory.back();
+    m_transformUndoHistory.pop_back();
+
+    if(entry.objectIndex >= scene.GetRenderObjects().size()){
+        return;
+    }
+
+    const auto& objects = static_cast<const Scene&>(scene).GetRenderObjects();
+
+    const Transform currentTransform = objects[entry.objectIndex].transform;
+
+    m_transformRedoHistory.push_back({entry.objectIndex, currentTransform});
+
+    scene.SetRenderObjectTransform(entry.objectIndex, entry.previousTransform);
+}
+
+void Editor::HandleTransformRedo(IDemoScene& demoScene)
+{
+    const ImGuiIO& io = ImGui::GetIO();
+
+    const bool redoPressed = io.KeyCtrl && (ImGui::IsKeyPressed(ImGuiKey_Y, false) || (io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_Z, false)));
+
+    if(!redoPressed ||
+       io.WantTextInput ||
+       ImGui::IsAnyItemActive() ||
+       ImGuizmo::IsUsing() ||
+       m_cameraLooking ||
+       m_transformFieldEditing ||
+       m_transformRedoHistory.empty())
+    {
+        return;
+    }
+
+    Scene& scene = demoScene.GetScene();
+
+    const TransformUndoEntry entry = m_transformRedoHistory.back();
+    m_transformRedoHistory.pop_back();
+
+    const auto& objects = static_cast<const Scene&>(scene).GetRenderObjects();
+
+    if(entry.objectIndex >= objects.size()){
+        return;
+    }
+
+    const Transform currentTransform = objects[entry.objectIndex].transform;
+
+    m_transformUndoHistory.push_back({entry.objectIndex, currentTransform});
+
+    scene.SetRenderObjectTransform(entry.objectIndex, entry.previousTransform);
 }
 
 void Editor::UpdateCameraLook(IDemoScene& demoScene, float viewportWidth, float viewportHeight)
