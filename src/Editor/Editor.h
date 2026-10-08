@@ -26,8 +26,22 @@ class Editor
         }
 
     private:
-        void DrawTranslationGizmo(IDemoScene& demoScene, float viewportWidth, float viewportHeight);
+        enum class GizmoMode
+        {
+            Translate,
+            Rotate,
+            Scale
+        };
+
+        GizmoMode m_gizmoMode = GizmoMode::Translate;
+
+        bool m_cameraLooking = false;
+        float m_cameraYaw = 0.0f;
+        float m_cameraPitch = 0.0f;
+
+        void DrawTransformGizmo(IDemoScene& demoScene, float viewportWidth, float viewportHeight);
         void HandleViewportSelection(IDemoScene& demoScene, float viewportWidth, float viewportHeight);
+        void UpdateCameraLook(IDemoScene& demoScene, float viewportWidth, float viewportHeight);
         void DrawObjectControls(IDemoScene& demoScene, DemoSceneManager& sceneManager);
         void DrawStressTestControls(StressTestScene& demoScene);
         void DrawSphereGridControls(SphereGridScene& demoScene);

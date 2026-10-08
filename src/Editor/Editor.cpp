@@ -254,6 +254,20 @@ namespace
 
 void Editor::Draw(IDemoScene& demoScene, DemoSceneManager& sceneManager, float viewportWidth, float viewportHeight)
 {
+    const ImGuiIO& io = ImGui::GetIO();
+
+    if(!io.WantCaptureKeyboard && !ImGuizmo::IsUsing() && !ImGui::IsMouseDown(ImGuiMouseButton_Right)){
+        if(ImGui::IsKeyPressed(ImGuiKey_W, false)){
+            m_gizmoMode = GizmoMode::Translate;
+        }
+        else if(ImGui::IsKeyPressed(ImGuiKey_E, false)){
+            m_gizmoMode = GizmoMode::Rotate;
+        }
+        else if(ImGui::IsKeyPressed(ImGuiKey_R, false)){
+            m_gizmoMode = GizmoMode::Scale;
+        }
+    }
+
     ImGui::Begin("Editor");
 
     const std::string_view activeSceneName = sceneManager.GetActiveSceneName();
@@ -301,7 +315,9 @@ void Editor::Draw(IDemoScene& demoScene, DemoSceneManager& sceneManager, float v
 
     ImGui::End();
 
-    DrawTranslationGizmo(demoScene, viewportWidth, viewportHeight);
+    UpdateCameraLook(demoScene, viewportWidth, viewportHeight);
+
+    DrawTransformGizmo(demoScene, viewportWidth, viewportHeight);
 
     HandleViewportSelection(demoScene, viewportWidth, viewportHeight);
 }
@@ -530,7 +546,7 @@ void Editor::DrawObjectControls(IDemoScene& demoScene, DemoSceneManager& sceneMa
     }
 }
 
-void Editor::DrawTranslationGizmo(IDemoScene& demoScene, float viewportWidth, float viewportHeight)
+void Editor::DrawTransformGizmo(IDemoScene& demoScene, float viewportWidth, float viewportHeight)
 {
     if(m_selectedObject == InvalidObjectSelection || viewportWidth <= 0.0f || viewportHeight <= 0.0f){
         return;
@@ -572,24 +588,86 @@ void Editor::DrawTranslationGizmo(IDemoScene& demoScene, float viewportWidth, fl
     ImGuizmo::SetDrawlist();
     ImGuizmo::SetRect(0.0f, 0.0f, viewportWidth, viewportHeight);
 
-    ImGuizmo::Manipulate(&view.m[0][0], &projection.m[0][0], ImGuizmo::TRANSLATE, ImGuizmo::WORLD, &model.m[0][0]);
+    ImGuizmo::OPERATION operation = ImGuizmo::TRANSLATE;
+
+    switch(m_gizmoMode){
+        case GizmoMode::Translate:
+            operation = ImGuizmo::TRANSLATE;
+            break;
+        case GizmoMode::Rotate:
+            operation = ImGuizmo::ROTATE;
+            break;
+        case GizmoMode::Scale:
+            operation = ImGuizmo::SCALE;
+            break;
+    }
+
+    ImGuizmo::Manipulate(&view.m[0][0], &projection.m[0][0], operation, ImGuizmo::WORLD, &model.m[0][0]);
 
     ImGui::End();
 
-    if(ImGuizmo::IsUsing()){
-        const Matrix4 updatedModel = model.Transpose();
+    if(ImGuizmo::IsUsing())
+    {
+        float translation[3];
+        float rotationDegrees[3];
+        float scale[3];
 
-        const Vector3 newPosition{
-            updatedModel.m[0][3],
-            updatedModel.m[1][3],
-            updatedModel.m[2][3]
-        };
+        ImGuizmo::DecomposeMatrixToComponents(
+            &model.m[0][0],
+            translation,
+            rotationDegrees,
+            scale);
 
-        if(newPosition.x != transform.position.x ||
-        newPosition.y != transform.position.y ||
-        newPosition.z != transform.position.z)
+        bool changed = false;
+
+        switch(m_gizmoMode)
         {
-            transform.position = newPosition;
+            case GizmoMode::Translate:
+            {
+                const Vector3 newPosition{
+                    translation[0],
+                    translation[1],
+                    translation[2]
+                };
+
+                if(newPosition.x != transform.position.x ||
+                newPosition.y != transform.position.y ||
+                newPosition.z != transform.position.z)
+                {
+                    transform.position = newPosition;
+                    changed = true;
+                }
+
+                break;
+            }
+
+            case GizmoMode::Rotate:
+            {
+                const Vector3 newRotation{
+                    ToRadians(rotationDegrees[0]),
+                    ToRadians(rotationDegrees[1]),
+                    ToRadians(rotationDegrees[2])
+                };
+
+                transform.rotation = newRotation;
+                changed = true;
+                break;
+            }
+
+            case GizmoMode::Scale:
+            {
+                transform.scale = Vector3{
+                    (std::max)(0.01f, scale[0]),
+                    (std::max)(0.01f, scale[1]),
+                    (std::max)(0.01f, scale[2])
+                };
+
+                changed = true;
+                break;
+            }
+        }
+
+        if(changed){
             scene.SetRenderObjectTransform(m_selectedObject, transform);
         }
     }
@@ -623,6 +701,63 @@ void Editor::HandleViewportSelection(IDemoScene& demoScene, float viewportWidth,
     const Scene& scene = demoScene.GetScene();
 
     m_selectedObject = PickObject(scene, mouse.x, mouse.y, viewportWidth, viewportHeight);
+}
+
+void Editor::UpdateCameraLook(IDemoScene& demoScene, float viewportWidth, float viewportHeight)
+{
+    const ImGuiIO& io = ImGui::GetIO();
+
+    if(!ImGui::IsMouseDown(ImGuiMouseButton_Right)){
+
+        if(m_cameraLooking){
+            ImGui::SetMouseCursor(ImGuiMouseCursor_Arrow);
+        }
+
+        m_cameraLooking = false;
+        return;
+    }
+
+    if(!m_cameraLooking){
+        if(io.WantCaptureMouse ||
+            io.MousePos.x < 0.0f ||
+            io.MousePos.y < 0.0f ||
+            io.MousePos.x >= viewportWidth ||
+            io.MousePos.y >= viewportHeight ||
+            ImGuizmo::IsUsing())
+        {
+            return;
+        }
+
+        Camera& camera = demoScene.GetScene().GetCamera();
+
+        const Vector3 direction = camera.GetTarget() - camera.GetPosition();
+        const float horizontalLength = std::sqrt(direction.x * direction.x + direction.z * direction.z);
+
+        m_cameraYaw = std::atan2(direction.x, direction.z);
+        m_cameraPitch = std::atan2(direction.y, horizontalLength);
+
+        m_cameraLooking = true;
+        ImGui::SetMouseCursor(ImGuiMouseCursor_None);
+    }
+
+    ImGui::SetMouseCursor(ImGuiMouseCursor_None);
+
+    constexpr float sensitivity = 0.003f;
+
+    m_cameraYaw += io.MouseDelta.x * sensitivity;
+    m_cameraPitch -= io.MouseDelta.y * sensitivity;
+
+    m_cameraPitch = (std::clamp)(m_cameraPitch, -1.55334f, 1.55334f);
+
+    const Vector3 direction{
+        std::sin(m_cameraYaw) * std::cos(m_cameraPitch),
+        std::sin(m_cameraPitch),
+        std::cos(m_cameraYaw) * std::cos(m_cameraPitch)
+    };
+
+    Camera& camera = demoScene.GetScene().GetCamera();
+
+    camera.SetTarget(camera.GetPosition() + direction);
 }
 
 void Editor::DrawCamera(IDemoScene& demoScene)
