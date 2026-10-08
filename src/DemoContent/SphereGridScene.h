@@ -1,12 +1,15 @@
 #pragma once
 
 #include "Math/Math.h"
+
 #include "Renderer/Mesh.h"
 #include "Renderer/Texture.h"
 #include "Renderer/VertexLayout.h"
 #include "Renderer/Material.h"
 #include "Renderer/Pipeline.h"
+
 #include "Scene/Scene.h"
+
 #include "DemoContent/IDemoScene.h"
 
 #include <vector>

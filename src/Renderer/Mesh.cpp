@@ -1,10 +1,86 @@
 #include "Mesh.h"
+
 #include "Renderer/DescriptorHeap.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <limits>
+#include <string_view>
+
+namespace{
+    MeshBounds CalculateBounds(const void* vertices, size_t vertexCount, const VertexLayout& layout)
+    {
+        MeshBounds bounds{};
+
+        if(!vertices || vertexCount == 0){
+            return bounds;
+        }
+
+        const size_t stride = layout.GetStride();
+
+        if(stride == 0){
+            return bounds;
+        }
+
+        const VertexAttribute* positionAttritube = nullptr;
+
+        for(const VertexAttribute& attribute : layout.GetAttributes()){
+            if(std::string_view(attribute.semantic ? attribute.semantic : "") == "POSITION" && attribute.semanticIndex == 0 && attribute.type == VertexAttributeType::Float3){
+                positionAttritube = &attribute;
+                break;
+            }
+        }
+
+        if(!positionAttritube){
+            return bounds;
+        }
+
+        const size_t offset = positionAttritube->offset;
+
+        if(offset > stride || sizeof(float) * 3 > stride - offset){
+            return bounds;
+        }
+
+        const auto* vertexBytes = static_cast<const unsigned char*>(vertices);
+
+        const float largest = (std::numeric_limits<float>::max)();
+
+        bounds.min = Vector3{largest, largest, largest};
+        bounds.max = Vector3{-largest, -largest, -largest};
+
+        for(size_t i = 0; i < vertexCount; ++i){
+            float position[3];
+
+            std::memcpy(position, vertexBytes + i * stride + offset, sizeof(position));
+
+            if(!std::isfinite(position[0]) ||
+               !std::isfinite(position[1]) ||
+               !std::isfinite(position[2]))
+            {
+                return MeshBounds{};
+            }
+
+            bounds.min.x = (std::min)(bounds.min.x, position[0]);
+            bounds.min.y = (std::min)(bounds.min.y, position[1]);
+            bounds.min.z = (std::min)(bounds.min.z, position[2]);
+
+            bounds.max.x = (std::max)(bounds.max.x, position[0]);
+            bounds.max.y = (std::max)(bounds.max.y, position[1]);
+            bounds.max.z = (std::max)(bounds.max.z, position[2]);
+        }
+
+        bounds.valid = true;
+        return bounds;
+    }
+}
 
 bool Mesh::Initialize(ID3D12Device* device, ResourceUploader& uploader, DescriptorHeap& descriptorHeap, const void* vertices, size_t vertexCount, const VertexLayout& layout)
 {
     m_layout = layout;
     m_vertexCount = vertexCount;
+
+    m_bounds = CalculateBounds(vertices, vertexCount, layout);
 
     const D3D12_RESOURCE_STATES vertexState = D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 
@@ -62,6 +138,7 @@ void Mesh::Shutdown(){
     m_indexBuffer.Shutdown();
     m_vertexCount = 0;
     m_indexCount = 0;
+    m_bounds = {};
 }
 
 void Mesh::Bind(ID3D12GraphicsCommandList* commandList) const
@@ -121,4 +198,9 @@ unsigned int Mesh::GetIndexBufferDescriptorIndex() const
 const VertexLayout& Mesh::GetVertexLayout() const
 {
     return m_layout;
+}
+
+const MeshBounds& Mesh::GetBounds() const
+{
+    return m_bounds;
 }

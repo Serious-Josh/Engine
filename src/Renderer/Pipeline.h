@@ -48,6 +48,9 @@ struct PipelineDescription
 
     bool depthEnabled = false;
     DXGI_FORMAT depthFormat = DXGI_FORMAT_UNKNOWN;
+
+    D3D12_COMPARISON_FUNC depthComparison = D3D12_COMPARISON_FUNC_LESS;
+    D3D12_DEPTH_WRITE_MASK depthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
 };
 
 

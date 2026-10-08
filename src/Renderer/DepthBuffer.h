@@ -23,6 +23,7 @@ class DepthBuffer
         ID3D12Resource* GetResource() const;
 
         D3D12_CPU_DESCRIPTOR_HANDLE GetDSV() const;
+        D3D12_CPU_DESCRIPTOR_HANDLE GetReadOnlyDSV() const;
 
         unsigned int GetSRVIndex() const;
 
@@ -36,6 +37,7 @@ class DepthBuffer
         DescriptorHeap* m_resourceHeap = nullptr;
 
         unsigned int m_dsvIndex = UINT_MAX;
+        unsigned int m_readOnlyDsvIndex = UINT_MAX;
         unsigned int m_srvIndex = UINT_MAX;
 
         unsigned int m_width = 0;

@@ -129,27 +129,17 @@ bool SphereGridScene::Initialize(ID3D12Device* device, ResourceUploader& uploade
     constexpr float horizontalSpacing = 1.65f;
     constexpr float verticalSpacing = 1.65f;
 
-    const float startX =
-        -horizontalSpacing *
-        float(MaterialSampleCount - 1) *
-        0.5f;
+    const float startX = -horizontalSpacing * float(MaterialSampleCount - 1) * 0.5f;
 
     for(unsigned int i = 0; i < MaterialSampleCount; ++i)
     {
-        Material& material =
-            m_dielectricMaterials[i];
+        Material& material = m_dielectricMaterials[i];
 
         material.pipeline = &m_pipeline;
         material.texture = &m_texture;
-
-        material.model =
-            MaterialModel::Dielectric;
-
-        material.roughness =
-            roughnessValues[i];
-
-        material.ior =
-            1.536f;
+        material.model = MaterialModel::Dielectric;
+        material.roughness = roughnessValues[i];
+        material.ior = 1.536f;
 
         material.baseColor[0] = 0.5f;
         material.baseColor[1] = 0.5f;
@@ -157,45 +147,22 @@ bool SphereGridScene::Initialize(ID3D12Device* device, ResourceUploader& uploade
 
         RenderObject object{};
 
-        object.mesh =
-            &m_mesh;
+        object.mesh = &m_mesh;
+        object.material = &material;
+        object.transform.position = Vector3{startX + horizontalSpacing * float(i), verticalSpacing * 0.5f, 0.0f};
+        object.transform.scale = Vector3{0.65f, 0.65f, 0.65f};
 
-        object.material =
-            &material;
-
-        object.transform.position =
-            Vector3{
-                startX +
-                horizontalSpacing * float(i),
-                verticalSpacing * 0.5f,
-                0.0f
-            };
-
-        object.transform.scale =
-            Vector3{
-                0.65f,
-                0.65f,
-                0.65f
-            };
-
-        m_scene.AddRenderObject(
-            object
-        );
+        m_scene.AddRenderObject(object);
     }
 
     for(unsigned int i = 0; i < MaterialSampleCount; ++i)
     {
-        Material& material =
-            m_conductorMaterials[i];
+        Material& material = m_conductorMaterials[i];
 
         material.pipeline = &m_pipeline;
         material.texture = &m_texture;
-
-        material.model =
-            MaterialModel::Conductor;
-
-        material.roughness =
-            roughnessValues[i];
+        material.model = MaterialModel::Conductor;
+        material.roughness = roughnessValues[i];
 
         material.conductorN[0] = 0.2f;
         material.conductorN[1] = 0.9f;
@@ -211,30 +178,12 @@ bool SphereGridScene::Initialize(ID3D12Device* device, ResourceUploader& uploade
 
         RenderObject object{};
 
-        object.mesh =
-            &m_mesh;
+        object.mesh = &m_mesh;
+        object.material = &material;
+        object.transform.position = Vector3{startX + horizontalSpacing * float(i), -verticalSpacing * 0.5f, 0.0f};
+        object.transform.scale = Vector3{0.65f, 0.65f, 0.65f};
 
-        object.material =
-            &material;
-
-        object.transform.position =
-            Vector3{
-                startX +
-                horizontalSpacing * float(i),
-                -verticalSpacing * 0.5f,
-                0.0f
-            };
-
-        object.transform.scale =
-            Vector3{
-                0.65f,
-                0.65f,
-                0.65f
-            };
-
-        m_scene.AddRenderObject(
-            object
-        );
+        m_scene.AddRenderObject(object);
     }
 
     const float metallicValues[MaterialSampleCount] =
@@ -257,20 +206,13 @@ bool SphereGridScene::Initialize(ID3D12Device* device, ResourceUploader& uploade
 
     for(unsigned int i = 0; i < MaterialSampleCount; ++i)
     {
-        Material& material =
-            m_metallicRoughnessMaterials[i];
+        Material& material = m_metallicRoughnessMaterials[i];
 
         material.pipeline = &m_pipeline;
         material.texture = &m_texture;
-
-        material.model =
-            MaterialModel::MetallicRoughness;
-
-        material.roughness =
-            metallicRoughnessValues[i];
-
-        material.metallic =
-            metallicValues[i];
+        material.model = MaterialModel::MetallicRoughness;
+        material.roughness = metallicRoughnessValues[i];
+        material.metallic = metallicValues[i];
 
         material.baseColor[0] = 0.80f;
         material.baseColor[1] = 0.20f;
@@ -278,81 +220,31 @@ bool SphereGridScene::Initialize(ID3D12Device* device, ResourceUploader& uploade
 
         RenderObject object{};
 
-        object.mesh =
-            &m_mesh;
+        object.mesh = &m_mesh;
+        object.material = &material;
+        object.transform.position = Vector3{startX + horizontalSpacing * float(i), verticalSpacing * 1.5f, 0.0f};
+        object.transform.scale = Vector3{0.65f, 0.65f, 0.65f};
 
-        object.material =
-            &material;
-
-        object.transform.position =
-            Vector3{
-                startX +
-                horizontalSpacing * float(i),
-                verticalSpacing * 1.5f,
-                0.0f
-            };
-
-        object.transform.scale =
-            Vector3{
-                0.65f,
-                0.65f,
-                0.65f
-            };
-
-        m_scene.AddRenderObject(
-            object
-        );
+        m_scene.AddRenderObject(object);
     }
 
-    m_floorMaterial.pipeline =
-        &m_pipeline;
-
-    m_floorMaterial.texture =
-        &m_texture;
-
-    m_floorMaterial.model =
-        MaterialModel::Dielectric;
-
-    m_floorMaterial.roughness =
-        0.7f;
-
-    m_floorMaterial.ior =
-        1.5f;
-
-    m_floorMaterial.baseColor[0] =
-        0.35f;
-
-    m_floorMaterial.baseColor[1] =
-        0.35f;
-
-    m_floorMaterial.baseColor[2] =
-        0.35f;
+    m_floorMaterial.pipeline = &m_pipeline;
+    m_floorMaterial.texture = &m_texture;
+    m_floorMaterial.model = MaterialModel::Dielectric;
+    m_floorMaterial.roughness = 0.7f;
+    m_floorMaterial.ior = 1.5f;
+    m_floorMaterial.baseColor[0] = 0.35f;
+    m_floorMaterial.baseColor[1] = 0.35f;
+    m_floorMaterial.baseColor[2] = 0.35f;
 
     RenderObject floor{};
 
-    floor.mesh =
-        &m_planeMesh;
+    floor.mesh = &m_planeMesh;
+    floor.material = &m_floorMaterial;
+    floor.transform.position = Vector3{0.0f, -1.5f, 0.0f};
+    floor.transform.scale = Vector3{5.0f, 1.0f, 5.0f};
 
-    floor.material =
-        &m_floorMaterial;
-
-    floor.transform.position =
-        Vector3{
-            0.0f,
-            -1.5f,
-            0.0f
-        };
-
-    floor.transform.scale =
-        Vector3{
-            5.0f,
-            1.0f,
-            5.0f
-        };
-
-    m_scene.AddRenderObject(
-        floor);
-
+    m_scene.AddRenderObject(floor);
 
     ResetCamera();
     ResetDirectionalLight();
@@ -400,23 +292,17 @@ void SphereGridScene::UpdateMovingSphere(float deltaTime)
 {
     m_lightAngle += deltaTime * m_lightRotationSpeed;
 
-    const std::vector<RenderObject>& renderObjects =
-        m_scene.GetRenderObjects();
+    const std::vector<RenderObject>& renderObjects = m_scene.GetRenderObjects();
 
     if(renderObjects.empty()){
         return;
     }
 
-    Transform transform =
-        renderObjects[0].transform;
+    Transform transform = renderObjects[0].transform;
 
-    transform.position.y =
-        0.825f +
-        std::sin(m_lightAngle) * 0.75f;
+    transform.position.y = 0.825f + std::sin(m_lightAngle) * 0.75f;
 
-    m_scene.SetRenderObjectTransform(
-        0,
-        transform);
+    m_scene.SetRenderObjectTransform(0, transform);
 }
 
 void SphereGridScene::UpdateOrbitingCamera(float deltaTime)
@@ -429,61 +315,27 @@ void SphereGridScene::UpdateOrbitingCamera(float deltaTime)
     constexpr float orbitRadius = 7.0f;
     constexpr float cameraHeight = 0.825f;
 
-    const float x =
-        std::sin(angle) * orbitRadius;
+    const float x = std::sin(angle) * orbitRadius;
+    const float z = -std::cos(angle) * orbitRadius;
 
-    const float z =
-        -std::cos(angle) * orbitRadius;
+    camera.SetPosition(Vector3{x, cameraHeight, z});
 
-    camera.SetPosition(
-        Vector3{
-            x,
-            cameraHeight,
-            z
-        }
-    );
-
-    camera.SetTarget(
-        Vector3{
-            0.0f,
-            cameraHeight,
-            0.0f
-        }
-    );
+    camera.SetTarget(Vector3{0.0f, cameraHeight, 0.0f});
 }
 
 void SphereGridScene::ResetCamera()
 {
     Camera& camera = m_scene.GetCamera();
 
-    camera.SetPosition(
-        Vector3{
-            0.0f,
-            0.825f,
-            -7.0f
-        }
-    );
-
-    camera.SetTarget(
-        Vector3{
-            0.0f,
-            0.825f,
-            0.0f
-        }
-    );
+    camera.SetPosition(Vector3{0.0f, 0.825f, -7.0f});
+    camera.SetTarget(Vector3{0.0f, 0.825f, 0.0f});
 }
 
 void SphereGridScene::ResetDirectionalLight()
 {
-    DirectionalLight& light =
-        m_scene.GetDirectionalLight();
+    DirectionalLight& light = m_scene.GetDirectionalLight();
 
-    light.direction =
-        Vector3{
-            0.0f,
-            -1.0f,
-            0.0f
-        };
+    light.direction = Vector3{0.0f, -1.0f, 0.0f};
 
     light.intensity = 3.0f;
     light.ambientStrength = 0.0f;
@@ -492,7 +344,7 @@ void SphereGridScene::ResetDirectionalLight()
 
 void SphereGridScene::Shutdown()
 {
-    m_scene.GetRenderObjects().clear();
+    m_scene.ClearRenderObjects();
 
     Log::Info("DemoScene shutdown: texture...");
     m_texture.Shutdown();
@@ -529,8 +381,7 @@ std::vector<Material*> SphereGridScene::GetMaterials()
 {
     std::vector<Material*> materials;
 
-    materials.reserve(
-        MaterialSampleCount * 3 + 1);
+    materials.reserve(MaterialSampleCount * 3 + 1);
 
     for(Material& material : m_dielectricMaterials){
         materials.push_back(&material);

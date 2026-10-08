@@ -166,8 +166,8 @@ bool Pipeline::Initialize(ID3D12Device* device, const PipelineDescription& descr
     D3D12_DEPTH_STENCIL_DESC depthStencilDescription{};
 
     depthStencilDescription.DepthEnable = description.depthEnabled;
-    depthStencilDescription.DepthWriteMask = description.depthEnabled ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
-    depthStencilDescription.DepthFunc = description.depthEnabled ? D3D12_COMPARISON_FUNC_LESS : D3D12_COMPARISON_FUNC_ALWAYS;
+    depthStencilDescription.DepthWriteMask = description.depthEnabled ? description.depthWriteMask : D3D12_DEPTH_WRITE_MASK_ZERO;
+    depthStencilDescription.DepthFunc = description.depthEnabled ? description.depthComparison : D3D12_COMPARISON_FUNC_ALWAYS;
     depthStencilDescription.StencilEnable = FALSE;
     depthStencilDescription.StencilReadMask = D3D12_DEFAULT_STENCIL_READ_MASK;
     depthStencilDescription.StencilWriteMask = D3D12_DEFAULT_STENCIL_WRITE_MASK;

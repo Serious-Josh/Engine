@@ -3,10 +3,19 @@
 #include "Renderer/Buffer.h"
 #include "Renderer/VertexLayout.h"
 
+#include "Math/Vector3.h"
+
 #include <d3d12.h>
 #include <cstddef>
 
 class DescriptorHeap;
+
+struct MeshBounds
+{
+    Vector3 min{};
+    Vector3 max{};
+    bool valid = false;
+};
 
 class Mesh
 {
@@ -35,6 +44,8 @@ class Mesh
         unsigned int GetVertexBufferDescriptorIndex() const;
         unsigned int GetIndexBufferDescriptorIndex() const;
 
+        const MeshBounds& GetBounds() const;
+
     private:
         Buffer m_vertexBuffer;
         Buffer m_indexBuffer;
@@ -45,4 +56,6 @@ class Mesh
 
         D3D12_VERTEX_BUFFER_VIEW m_vertexBufferView{};
         D3D12_INDEX_BUFFER_VIEW m_indexBufferView{};
+
+        MeshBounds m_bounds;
 };

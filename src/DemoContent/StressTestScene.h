@@ -1,16 +1,21 @@
 #pragma once
 
 #include "Math/Math.h"
+
 #include "Renderer/Mesh.h"
 #include "Renderer/Texture.h"
 #include "Renderer/VertexLayout.h"
 #include "Renderer/Material.h"
 #include "Renderer/Pipeline.h"
+
 #include "Scene/Scene.h"
+
 #include "DemoContent/IDemoScene.h"
 
 #include <vector>
-
+#include <cstdint>
+#include <limits>
+#include <string>
 
 class Shader;
 class ResourceUploader;
@@ -41,7 +46,14 @@ public:
     void ResetCamera() override;
     void ResetDirectionalLight() override;
 
+    void SetGridSize(unsigned int grideSize);
+    unsigned int GetGridSize() const;
+
 private:
+    void RebuildGrid();
+
+    unsigned int m_gridSize = 20;
+    
     VertexLayout m_vertexLayout;
 
     Mesh m_sphereMesh;

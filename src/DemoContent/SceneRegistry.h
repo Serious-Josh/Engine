@@ -8,8 +8,7 @@
 
 class IDemoScene;
 
-using DemoSceneFactory =
-    std::unique_ptr<IDemoScene>(*)();
+using DemoSceneFactory = std::unique_ptr<IDemoScene>(*)();
 
 struct DemoSceneEntry
 {
@@ -22,9 +21,7 @@ class SceneRegistry
 public:
     static SceneRegistry& Instance();
 
-    bool Register(
-        std::string_view name,
-        DemoSceneFactory factory);
+    bool Register(std::string_view name, DemoSceneFactory factory);
 
     bool Finalize();
 

@@ -82,12 +82,8 @@ bool CornellBoxScene::Initialize(
         return false;
     }
 
-    //
+
     // White fallback texture
-    //
-    // All imported geometry uses this for now. We'll assign the actual
-    // Cornell-box and tank materials after geometry/placement is validated.
-    //
 
     const std::uint8_t whitePixel[4] =
     {
@@ -124,9 +120,8 @@ bool CornellBoxScene::Initialize(
         return false;
     }
 
-    //
+
     // Temporary default material
-    //
 
     m_defaultMaterial.pipeline = &m_pipeline;
     m_defaultMaterial.texture = &m_whiteTexture;
@@ -141,9 +136,8 @@ bool CornellBoxScene::Initialize(
     m_defaultMaterial.baseColor[1] = 0.7f;
     m_defaultMaterial.baseColor[2] = 0.7f;
 
-    //
+
     // Cornell box
-    //
 
     const auto cornellBox =
         ModelImporter::Load(
@@ -178,9 +172,8 @@ bool CornellBoxScene::Initialize(
         m_cornellMeshes.push_back(std::move(mesh));
     }
 
-    //
+
     // Tank
-    //
 
     const auto tank =
         ModelImporter::Load(
@@ -215,12 +208,8 @@ bool CornellBoxScene::Initialize(
         m_tankMeshes.push_back(std::move(mesh));
     }
 
-    //
+
     // Cornell box render objects
-    //
-    // The importer has already baked the FBX node hierarchy into the
-    // vertices. Keep the scene-level transform at identity.
-    //
 
     for (const auto& mesh : m_cornellMeshes)
     {
@@ -245,13 +234,8 @@ bool CornellBoxScene::Initialize(
         m_scene.AddRenderObject(boxPart);
     }
 
-    //
+
     // Tank render objects
-    //
-    // Leave the tank at its authored transform for the first combined
-    // scene test. If the two FBXs were authored together, their relative
-    // placement may already be correct.
-    //
 
     for (const auto& mesh : m_tankMeshes)
     {
@@ -285,12 +269,7 @@ bool CornellBoxScene::Initialize(
 
 void CornellBoxScene::Shutdown()
 {
-    //
-    // RenderObjects contain non-owning pointers to the scene-owned
-    // meshes/materials, so remove them first.
-    //
-
-    m_scene.GetRenderObjects().clear();
+    m_scene.ClearRenderObjects();
 
     for (const auto& mesh : m_tankMeshes)
     {
@@ -347,13 +326,6 @@ void CornellBoxScene::ResetCamera()
 {
     Camera& camera = m_scene.GetCamera();
 
-    //
-    // Temporary camera.
-    //
-    // Once we've seen the actual combined FBX bounds, we'll position this
-    // to look through the open front of the Cornell box like the reference.
-    //
-
     camera.SetPosition(
         Vector3{
             0.0f,
@@ -372,14 +344,7 @@ void CornellBoxScene::ResetCamera()
 
 void CornellBoxScene::ResetDirectionalLight()
 {
-    DirectionalLight& light =
-        m_scene.GetDirectionalLight();
-
-    //
-    // Temporary direct light for geometry validation.
-    // Eventually the Cornell scene should get lighting appropriate
-    // for the ceiling emitter / RTGI tests.
-    //
+    DirectionalLight& light = m_scene.GetDirectionalLight();
 
     light.direction =
         Vector3{

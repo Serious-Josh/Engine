@@ -5,6 +5,7 @@
 #include "imgui.h"
 #include "imgui_impl_win32.h"
 #include "imgui_impl_dx12.h"
+#include "ImGuizmo.h"
 
 static void AllocateImGuiDescriptor(ImGui_ImplDX12_InitInfo* info, D3D12_CPU_DESCRIPTOR_HANDLE* cpuHandle, D3D12_GPU_DESCRIPTOR_HANDLE* gpuHandle)
 {
@@ -87,6 +88,8 @@ void DebugUI::BeginFrame()
     ImGui_ImplDX12_NewFrame();
     ImGui_ImplWin32_NewFrame();
     ImGui::NewFrame();
+
+    ImGuizmo::BeginFrame();
 }
 
 void DebugUI::DrawPerformanceWindow(const std::vector<std::string>& environmentNames, size_t currentEnvironmentIndex, const RendererStatistics& statistics)

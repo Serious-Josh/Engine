@@ -3,44 +3,60 @@
 #include "GBuffer.h"
 #include "UploadBuffer.h"
 #include "StructuredBuffer.h"
-#include "Renderer/CommandContext.h"
-#include "Renderer/DescriptorHeap.h"
-#include "Renderer/GraphicsDevice.h"
-#include "Renderer/GpuTimestampProfiler.h"
-#include "Renderer/RenderObject.h"
-#include "Renderer/RendererStatistics.h"
-#include "Renderer/ResourceUploader.h"
-#include "Renderer/SwapChain.h"
-#include "Renderer/Shader/ShaderLibrary.h"
-#include "Debug/DebugUI.h"
-#include "Renderer/EnvironmentMap.h"
+#include "CommandContext.h"
+#include "DescriptorHeap.h"
+#include "GraphicsDevice.h"
+#include "GpuTimestampProfiler.h"
+#include "RenderObject.h"
+#include "RendererStatistics.h"
+#include "ResourceUploader.h"
+#include "SwapChain.h"
+#include "EnvironmentMap.h"
 #include "RenderTarget.h"
+
+#include "Debug/DebugUI.h"
+
 #include "Math/Vector3.h"
 #include "Math/Matrix4.h"
-#include "Renderer/Passes/ToneMapPass.h"
-#include "Renderer/Passes/DeferredLightingPass.h"
-#include "Renderer/Passes/BRDFIntegrationPass.h"
-#include "Renderer/Passes/GGXAverageAlbedoPass.h"
-#include "Renderer/RayTracing/RayTracingSceneResources.h"
-#include "Renderer/Passes/RayTracedShadowPass.h"
+
+#include "Shader/ShaderLibrary.h"
+
+#include "RayTracing/RayTracingSceneResources.h"
+
+#include "Passes/ToneMapPass.h"
+#include "Passes/DeferredLightingPass.h"
+#include "Passes/BRDFIntegrationPass.h"
+#include "Passes/GGXAverageAlbedoPass.h"
+#include "Passes/RayTracedShadowPass.h"
+#include "Passes/RayTracedReflectionPass.h"
 #include "Passes/ShadowDenoisePass.h"
-#include "Renderer/Passes/RayTracedReflectionPass.h"
 #include "Passes/RayTracedReflectionTemporalPass.h"
 #include "Passes/RayTracedReflectionDenoisePass.h"
 #include "Passes/ReflectionContributionLimitPass.h"
 #include "Passes/NrdReflectionDenoiser.h"
 #include "Passes/NrdReflectionPreparePass.h"
 #include "Passes/NrdReflectionResolvePass.h"
+#include "Passes/SelectionMaskPass.h"
 
 #include <d3d12.h>
 #include <filesystem>
 #include <string>
 #include <vector>
+#include <cstddef>
+#include <limits>
 
 struct EnvironmentAsset
 {
     std::string displayName;
     std::filesystem::path relativePath;
+};
+
+struct RendererOptions
+{
+    size_t selectedObject = (std::numeric_limits<size_t>::max)();
+
+    Vector3 selectionOutlineColor{1.0f, 0.72f, 0.0f};
+    unsigned int selectionOutlineThickness = 2;
 };
 
 class Scene;
@@ -50,7 +66,7 @@ class Renderer
 {
     public:
         bool Initialize(void* windowHandle, unsigned int width, unsigned int height, const std::filesystem::path& assetRoot);
-        void Render(const Scene& scene);
+        void Render(const Scene& scene, const RendererOptions& options);
         void Shutdown();
 
         void Resize(unsigned int width, unsigned int height);
@@ -86,6 +102,7 @@ class Renderer
         bool InitializeDevice();
         bool InitializeSwapChain(void* windowHandle);
         void Draw(ID3D12GraphicsCommandList* commandList, const RenderObject& object, D3D12_GPU_VIRTUAL_ADDRESS cameraConstantsAddress);
+        void DrawSelectionMask(ID3D12GraphicsCommandList* commandList, const RenderObject& object, D3D12_GPU_VIRTUAL_ADDRESS cameraConstantsAddress);
         void BeginGeometryPass(ID3D12GraphicsCommandList* commandList);
         void EndGeometryPass(ID3D12GraphicsCommandList* commandList);
         bool InitializeMaterials(const std::vector<Material*>& materials);
@@ -113,13 +130,15 @@ class Renderer
         RayTracedReflectionTemporalPass m_rayTracedReflectionTemporalPass;
         RayTracedReflectionDenoisePass m_rayTracedReflectionDenoisePass;
         ReflectionContributionLimitPass m_reflectionContributionLimitPass;
-        bool m_previousContributionLimiterEnabled = false;
-        bool m_nrdExecutedLastFrame = false;
-        bool m_nativeReflectionExecutedLastFrame = false;
         NrdReflectionDenoiser m_nrdReflectionDenoiser;
         NrdReflectionPreparePass m_nrdReflectionPreparePass;
         NrdReflectionResolvePass m_nrdReflectionResolvePass;
         ShadowDenoisePass m_shadowDenoisePass;
+        SelectionMaskPass m_selectionMaskPass;
+
+        bool m_previousContributionLimiterEnabled = false;
+        bool m_nrdExecutedLastFrame = false;
+        bool m_nativeReflectionExecutedLastFrame = false;
 
         ShaderLibrary m_shaderLibrary;
 
@@ -137,6 +156,7 @@ class Renderer
 
         EnvironmentMap m_environment;
         RenderTarget m_sceneColor;
+        RenderTarget m_selectionMask;
 
         Texture m_brdfIntegrationLUT;
         Texture m_ggxAverageAlbedoLUT;

@@ -72,12 +72,7 @@ bool MirrorTestScene::Initialize(
         return false;
     }
 
-    //
-    // Sphere mesh
-    //
-
-    SphereGeometry sphere =
-        SphereGenerator::Generate(1.0f, 32, 64);
+    SphereGeometry sphere = SphereGenerator::Generate(1.0f, 32, 64);
 
     if(!m_sphereMesh.Initialize(
         device,
@@ -91,10 +86,6 @@ bool MirrorTestScene::Initialize(
     {
         return false;
     }
-
-    //
-    // Plane mesh
-    //
 
     const Vertex planeVertices[] =
     {
@@ -139,15 +130,7 @@ bool MirrorTestScene::Initialize(
         return false;
     }
 
-    //
-    // Sphere texture
-    //
-    // Keep the existing brick texture on the sphere so it remains
-    // visually recognizable in reflections.
-    //
-
-    const std::filesystem::path sphereTexturePath =
-        "assets/Textures/Materials/TestBaseColor.jpg";
+    const std::filesystem::path sphereTexturePath = "assets/Textures/Materials/TestBaseColor.jpg";
 
     ImageData sphereImage;
 
@@ -187,13 +170,8 @@ bool MirrorTestScene::Initialize(
         return false;
     }
 
-    //
+
     // Neutral plane texture
-    //
-    // A single white texel keeps the mirror and floor free of
-    // high-frequency texture detail. Their appearance is controlled
-    // entirely by their material base colors.
-    //
 
     const std::uint8_t whitePixel[4] =
     {
@@ -230,12 +208,8 @@ bool MirrorTestScene::Initialize(
         return false;
     }
 
-    //
+
     // Mirror A material
-    //
-    // Mirror A remains a perfect mirror so the first reflection segment
-    // stays deterministic while testing rough secondary transport on B.
-    //
 
     m_mirrorAMaterial.pipeline = &m_pipeline;
     m_mirrorAMaterial.texture = &m_whiteTexture;
@@ -250,12 +224,8 @@ bool MirrorTestScene::Initialize(
     m_mirrorAMaterial.baseColor[1] = 1.0f;
     m_mirrorAMaterial.baseColor[2] = 1.0f;
 
-    //
+
     // Mirror B material
-    //
-    // Mirror B is intentionally rough so the validated A -> B -> sphere
-    // path exercises the stochastic rough second-bounce implementation.
-    //
 
     m_mirrorBMaterial.pipeline = &m_pipeline;
     m_mirrorBMaterial.texture = &m_whiteTexture;
@@ -270,9 +240,9 @@ bool MirrorTestScene::Initialize(
     m_mirrorBMaterial.baseColor[1] = 1.0f;
     m_mirrorBMaterial.baseColor[2] = 1.0f;
 
-    //
+
+
     // Red sphere material
-    //
 
     m_coloredMaterial.pipeline = &m_pipeline;
     m_coloredMaterial.texture = &m_sphereTexture;
@@ -287,9 +257,8 @@ bool MirrorTestScene::Initialize(
     m_coloredMaterial.baseColor[1] = 0.02f;
     m_coloredMaterial.baseColor[2] = 0.02f;
 
-    //
+
     // Floor material
-    //
 
     m_floorMaterial.pipeline = &m_pipeline;
     m_floorMaterial.texture = &m_whiteTexture;
@@ -304,12 +273,8 @@ bool MirrorTestScene::Initialize(
     m_floorMaterial.baseColor[1] = 0.25f;
     m_floorMaterial.baseColor[2] = 0.25f;
 
-    //
+
     // Mirror A
-    //
-    // This is our observation mirror. Its current transform is kept
-    // fixed because Mirror B is already visibly reflected inside it.
-    //
 
     RenderObject mirrorA{};
     mirrorA.mesh = &m_planeMesh;
@@ -338,12 +303,8 @@ bool MirrorTestScene::Initialize(
 
     m_scene.AddRenderObject(mirrorA);
 
-    //
+
     // Mirror B
-    //
-    // This transform is also kept fixed because B is now visibly
-    // reflected by Mirror A.
-    //
 
     RenderObject mirrorB{};
     mirrorB.mesh = &m_planeMesh;
@@ -372,12 +333,8 @@ bool MirrorTestScene::Initialize(
 
     m_scene.AddRenderObject(mirrorB);
 
-    //
+
     // Red terminal object
-    //
-    // This is positioned approximately along the specular direction
-    // leaving Mirror B for rays arriving from Mirror A.
-    //
 
     RenderObject coloredSphere{};
     coloredSphere.mesh = &m_sphereMesh;
@@ -399,9 +356,8 @@ bool MirrorTestScene::Initialize(
 
     m_scene.AddRenderObject(coloredSphere);
 
-    //
+
     // Floor
-    //
 
     RenderObject floor{};
     floor.mesh = &m_planeMesh;
@@ -431,7 +387,7 @@ bool MirrorTestScene::Initialize(
 
 void MirrorTestScene::Shutdown()
 {
-    m_scene.GetRenderObjects().clear();
+    m_scene.ClearRenderObjects();
 
     m_sphereTexture.Shutdown();
     m_whiteTexture.Shutdown();

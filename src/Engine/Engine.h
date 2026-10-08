@@ -2,11 +2,17 @@
 
 #include "Core/Time.h"
 #include "Core/Input.h"
+
 #include "DemoContent/DemoSceneManager.h"
+
 #include "Platform/Windows/WindowsWindow.h"
 #include "Platform/WindowProperties.h"
+
 #include "Renderer/Renderer.h"
+
 #include "Editor/Editor.h"
+
+#include <cstdint>
 
 enum class EngineState
 {
@@ -32,6 +38,7 @@ private:
     Renderer m_renderer;
 
     DemoSceneManager m_demoSceneManager;
+    uint64_t m_renderedSceneStructureRevision = 0;
 
     Shader* m_demoVertexShader = nullptr;
     Shader* m_demoPixelShader = nullptr;

@@ -75,6 +75,8 @@ bool Engine::Initialize()
         return false;
     }
 
+    m_renderedSceneStructureRevision = activeDemo.GetScene().GetStructureRevision();
+
     m_window.SetEventCallback(
         [this](const Event& event)
         {
@@ -187,6 +189,8 @@ void Engine::Frame()
             m_window.Close();
             return;
         }
+
+        m_renderedSceneStructureRevision = switchedDemo.GetScene().GetStructureRevision();
     }
 
     const std::vector<EnvironmentAsset>& environments = m_renderer.GetAvailableEnvironments();
@@ -204,13 +208,36 @@ void Engine::Frame()
 
     IDemoScene& activeDemo = m_demoSceneManager.GetActiveScene();
 
-    m_editor.Draw(activeDemo, m_demoSceneManager, m_demoSceneManager.GetActiveSphereGridScene());
+    m_editor.Draw(activeDemo, m_demoSceneManager, static_cast<float>(m_window.GetWidth()), static_cast<float>(m_window.GetHeight()));
 
     activeDemo.Update(m_time.GetDeltaTime());
 
-    m_renderer.Render(activeDemo.GetScene());
+    Scene& activeScene = activeDemo.GetScene();
 
-    activeDemo.GetScene().ClearChangedTransforms();
+    if(activeScene.GetStructureRevision() != m_renderedSceneStructureRevision){
+        m_renderer.WaitForGPU();
+        m_renderer.ReleaseSceneResources();
+
+        if(!m_renderer.InitializeSceneResources(activeScene, activeDemo.GetMaterials())){
+            Log::Error("Failed to rebuild renderer resources after scene structure change.");
+            m_window.Close();
+            return;
+        }
+
+        m_renderedSceneStructureRevision = activeScene.GetStructureRevision();
+    }
+
+    RendererOptions rendererOptions{};
+    
+    const size_t selectedObject = m_editor.GetSelectedObject();
+
+    if(m_editor.GetSelectionStructureRevision() == activeScene.GetStructureRevision() && selectedObject < activeScene.GetRenderObjects().size()){
+        rendererOptions.selectedObject = selectedObject;
+    }
+
+    m_renderer.Render(activeScene, rendererOptions);
+
+    activeScene.ClearChangedTransforms();
 }
 
 void Engine::Shutdown()

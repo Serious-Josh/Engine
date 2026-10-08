@@ -9,7 +9,18 @@ RenderObjectID Scene::AddRenderObject(const RenderObject& object)
 
     m_transformDirty.push_back(false);
 
+    ++m_structureRevision;
+
     return id;
+}
+
+void Scene::ClearRenderObjects()
+{
+    m_renderObjects.clear();
+    m_changedTransforms.clear();
+    m_transformDirty.clear();
+
+    ++m_structureRevision;
 }
 
 void Scene::SetRenderObjectTransform(RenderObjectID id, const Transform& transform)
@@ -40,6 +51,11 @@ void Scene::ClearChangedTransforms()
     }
 
     m_changedTransforms.clear();
+}
+
+uint64_t Scene::GetStructureRevision() const
+{
+    return m_structureRevision;
 }
 
 std::vector<RenderObject>& Scene::GetRenderObjects()

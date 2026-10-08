@@ -47,6 +47,14 @@ bool DepthBuffer::Initialize(ID3D12Device* device, unsigned int width, unsigned 
     }
 
     m_dsvHeap = &dsvHeap;
+
+    m_readOnlyDsvIndex = dsvHeap.Allocate();
+
+    if(m_readOnlyDsvIndex == UINT_MAX){
+        Shutdown();
+        return false;
+    }
+
     m_srvIndex = resourceHeap.Allocate();
 
     if(m_srvIndex == UINT_MAX){
@@ -62,6 +70,11 @@ bool DepthBuffer::Initialize(ID3D12Device* device, unsigned int width, unsigned 
     dsvDescription.Flags = D3D12_DSV_FLAG_NONE;
 
     device->CreateDepthStencilView(m_resource, &dsvDescription, dsvHeap.GetCPUHandle(m_dsvIndex));
+
+    D3D12_DEPTH_STENCIL_VIEW_DESC readOnlyDsvDescription = dsvDescription;
+    readOnlyDsvDescription.Flags = D3D12_DSV_FLAG_READ_ONLY_DEPTH;
+
+    device->CreateDepthStencilView(m_resource, &readOnlyDsvDescription, dsvHeap.GetCPUHandle(m_readOnlyDsvIndex));
 
     D3D12_SHADER_RESOURCE_VIEW_DESC srvDescription{};
     srvDescription.Format = DXGI_FORMAT_R32_FLOAT;
@@ -101,6 +114,10 @@ void DepthBuffer::Shutdown()
         m_dsvHeap->Free(m_dsvIndex);
     }
 
+    if(m_dsvHeap && m_readOnlyDsvIndex != UINT_MAX){
+        m_dsvHeap->Free(m_readOnlyDsvIndex);
+    }
+
     if(m_resourceHeap && m_srvIndex != UINT_MAX){
         m_resourceHeap->Free(m_srvIndex);
     }
@@ -114,6 +131,7 @@ void DepthBuffer::Shutdown()
     m_resourceHeap = nullptr;
 
     m_dsvIndex = UINT_MAX;
+    m_readOnlyDsvIndex = UINT_MAX;
     m_srvIndex = UINT_MAX;
 
     m_width = 0;
@@ -134,6 +152,15 @@ D3D12_CPU_DESCRIPTOR_HANDLE DepthBuffer::GetDSV() const
     }
 
     return m_dsvHeap->GetCPUHandle(m_dsvIndex);
+}
+
+D3D12_CPU_DESCRIPTOR_HANDLE DepthBuffer::GetReadOnlyDSV() const
+{
+    if(!m_dsvHeap || m_readOnlyDsvIndex == UINT_MAX){
+        return {};
+    }
+
+    return m_dsvHeap->GetCPUHandle(m_readOnlyDsvIndex);
 }
 
 unsigned int DepthBuffer::GetSRVIndex() const

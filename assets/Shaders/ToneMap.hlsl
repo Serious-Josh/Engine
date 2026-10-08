@@ -7,6 +7,10 @@ struct ToneMapConstants
     uint debugTextureIndex;
     uint debugView;
     float nrdDenoisingRange;
+
+    uint selectionMaskIndex;
+    uint outlineThickness;
+    float3 outlineColor;
 };
 
 ConstantBuffer<ToneMapConstants> toneMapConstants : register(b0);
@@ -180,6 +184,16 @@ float4 PSMain(VSOutput input) : SV_TARGET
         return float4(display, 1.0f);
     }
 
+    if(toneMapConstants.debugView == 10)
+    {
+        Texture2D<float> selectionMask =
+            ResourceDescriptorHeap[toneMapConstants.debugTextureIndex];
+
+        float mask = selectionMask.Load(int3(pixel, 0));
+
+        return float4(mask, mask, mask, 1.0f);
+    }
+
     Texture2D<float4> sceneColor =
         // Mode 8 is already unpacked, remodulated linear HDR reflection RGB.
         ResourceDescriptorHeap[toneMapConstants.debugView == 8
@@ -194,5 +208,45 @@ float4 PSMain(VSOutput input) : SV_TARGET
 
     float3 displaySRGB = LinearToSRGB(displayLinear);
 
-    return float4(displaySRGB, 1.0);
+    if(toneMapConstants.debugView == 0 && toneMapConstants.outlineThickness > 0)
+    {
+        Texture2D<float> selectionMask =
+            ResourceDescriptorHeap[toneMapConstants.selectionMaskIndex];
+
+        uint width, height;
+        selectionMask.GetDimensions(width, height);
+
+        int2 position = int2(pixel);
+
+        if(selectionMask.Load(int3(position, 0)) > 0.5f)
+        {
+            bool isOutline = false;
+            int radius = int(min(toneMapConstants.outlineThickness, 8u));
+
+            for(int y = -radius; y <= radius && !isOutline; ++y)
+            {
+                for(int x = -radius; x <= radius; ++x)
+                {
+                    // Use a circular neighborhood.
+                    if(x * x + y * y > radius * radius)
+                        continue;
+
+                    int2 neighbor = position + int2(x, y);
+
+                    if(any(neighbor < int2(0, 0)) ||
+                    any(neighbor >= int2(width, height)) ||
+                    selectionMask.Load(int3(neighbor, 0)) <= 0.5f)
+                    {
+                        isOutline = true;
+                        break;
+                    }
+                }
+            }
+
+            if(isOutline)
+                displaySRGB = toneMapConstants.outlineColor;
+        }
+    }
+
+    return float4(displaySRGB, 1.0f);
 }

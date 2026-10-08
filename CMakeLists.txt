@@ -60,6 +60,7 @@ add_executable(Engine
     external/imgui/imgui_widgets.cpp
     external/imgui/imgui_impl_win32.cpp
     external/imgui/imgui_impl_dx12.cpp
+    external/ImGuizmo/ImGuizmo.cpp
     src/Debug/DebugUI.cpp
     src/Scene/Scene.cpp
     src/Renderer/Geometry/SphereGenerator.cpp
@@ -97,6 +98,7 @@ add_executable(Engine
     src/DemoContent/CornellBoxScene.cpp
     src/DemoContent/SceneRegistry.cpp
     src/DemoContent/StressTestScene.cpp
+    src/Renderer/Passes/SelectionMaskPass.cpp
 )
 
 add_custom_command(
@@ -145,6 +147,7 @@ target_include_directories(Engine
     PRIVATE
         src
         external/imgui
+        external/ImGuizmo
         external/stb
         external/NRD/Include
         external/NRD/Integration

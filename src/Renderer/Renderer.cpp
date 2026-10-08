@@ -254,6 +254,11 @@ bool Renderer::Initialize(void* windowHandle, unsigned int width, unsigned int h
         return false;
     }
 
+    if(!m_selectionMask.Initialize(device, m_width, m_height, DXGI_FORMAT_R8_UNORM, m_rtvDescriptorHeap, m_resourceDescriptorHeap)){
+        Log::Error("Failed to init selection mask.");
+        return false;
+    }
+
     if(!InitializeSwapChain(windowHandle))
     {
         return false;
@@ -354,6 +359,13 @@ void Renderer::Resize(unsigned int width, unsigned int height)
         return;
     }
 
+    m_selectionMask.Shutdown();
+
+    if(!m_selectionMask.Initialize(m_graphicsDevice.GetDevice(), width, height, DXGI_FORMAT_R8_UNORM, m_rtvDescriptorHeap, m_resourceDescriptorHeap)){
+        Log::Error("Failed to resize selection mask.");
+        return;
+    }
+
     m_width = width;
     m_height = height;
 }
@@ -408,6 +420,39 @@ void Renderer::Draw(ID3D12GraphicsCommandList* commandList, const RenderObject& 
 
         ++m_currentFrameStatistics.geometryDrawCalls;
         m_currentFrameStatistics.submittedTriangles += vertexCount / 3;
+    }
+}
+
+void Renderer::DrawSelectionMask(ID3D12GraphicsCommandList* commandList, const RenderObject& object, D3D12_GPU_VIRTUAL_ADDRESS cameraConstantsAddress)
+{
+    if(!object.mesh){
+        return;
+    }
+
+    ObjectConstants objectConstants{};
+    objectConstants.model = object.transform.GetModelMatrix();
+    objectConstants.previousModel = object.previousTransform.GetModelMatrix();
+    objectConstants.normalMatrix = objectConstants.model.Inverse().Transpose();
+
+    const D3D12_GPU_VIRTUAL_ADDRESS objectConstantsAddress = m_uploadBuffer.Allocate(&objectConstants, sizeof(ObjectConstants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
+
+    if(objectConstantsAddress == 0){
+        Log::Error("Failed to allocate selection mask object constants.");
+        return;
+    }
+
+    m_selectionMaskPass.Bind(commandList);
+
+    commandList->SetGraphicsRootConstantBufferView(0, cameraConstantsAddress);
+    commandList->SetGraphicsRootConstantBufferView(1, objectConstantsAddress);
+
+    object.mesh->Bind(commandList);
+
+    if(object.mesh->IsIndexed()){
+        commandList->DrawIndexedInstanced(static_cast<UINT>(object.mesh->GetIndexCount()), 1, 0, 0, 0);
+    }
+    else{
+        commandList->DrawInstanced(static_cast<UINT>(object.mesh->GetVertexCount()), 1, 0, 0);
     }
 }
 
@@ -478,6 +523,24 @@ bool Renderer::InitializeSceneResources(const Scene& scene, const std::vector<Ma
         return false;
     }
 
+    m_selectionMaskPass.Shutdown();
+
+    const RenderObject* firstRenderableObject = nullptr;
+
+    for(const RenderObject& object : scene.GetRenderObjects()){
+        if(object.mesh){
+            firstRenderableObject = &object;
+            break;
+        }
+    }
+
+    if(firstRenderableObject){
+        if(!m_selectionMaskPass.Initialize(m_graphicsDevice.GetDevice(), m_shaderLibrary, firstRenderableObject->mesh->GetVertexLayout())){
+            Log::Error("Failed to init selection mask pass.");
+            return false;
+        }
+    }
+
     ResetSceneHistory();
 
     return true;
@@ -546,6 +609,8 @@ void Renderer::ReleaseSceneResources()
     m_rayTracingScene.Shutdown();
     m_materialBuffer.Shutdown();
 
+    m_selectionMaskPass.Shutdown();
+
     ResetSceneHistory();
 }
 
@@ -570,7 +635,7 @@ void Renderer::ResetSceneHistory()
 // Rendering
 // --------------
 
-void Renderer::Render(const Scene& scene)
+void Renderer::Render(const Scene& scene, const RendererOptions& options)
 {
     const unsigned int frameIndex = m_swapChain.GetCurrentBackBufferIndex();
 
@@ -811,10 +876,38 @@ void Renderer::Render(const Scene& scene)
     m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::Geometry);
 
     BeginGeometryPass(commandList);
-    
+
     for(const RenderObject& object : scene.GetRenderObjects()){
         Draw(commandList, object, cameraConstantsAddress);
     }
+
+    m_selectionMask.Transition(commandList, D3D12_RESOURCE_STATE_RENDER_TARGET);
+
+    const float maskClearColor[] = {0.0f, 0.0f, 0.0f, 0.0f};
+    commandList->ClearRenderTargetView(m_selectionMask.GetRTV(), maskClearColor, 0, nullptr);
+
+    const auto& renderObjects = scene.GetRenderObjects();
+
+    if(options.selectedObject < renderObjects.size())
+    {
+        const RenderObject& selectedObject = renderObjects[options.selectedObject];
+
+        if(selectedObject.mesh)
+        {
+            DepthBuffer& depth = m_gBuffer.GetDepth();
+
+            depth.Transition(commandList, D3D12_RESOURCE_STATE_DEPTH_READ);
+
+            const D3D12_CPU_DESCRIPTOR_HANDLE maskRTV = m_selectionMask.GetRTV();
+            const D3D12_CPU_DESCRIPTOR_HANDLE depthDSV = depth.GetReadOnlyDSV();
+
+            commandList->OMSetRenderTargets(1, &maskRTV, FALSE, &depthDSV);
+
+            DrawSelectionMask(commandList, selectedObject, cameraConstantsAddress);
+        }
+    }
+
+    m_selectionMask.Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
     EndGeometryPass(commandList);
 
@@ -1037,13 +1130,25 @@ void Renderer::Render(const Scene& scene)
             debugTexture = &m_nrdReflectionPreparePass.GetSpecRadianceHitDistTexture(); break;
         case ToneMapDebugView::NrdResolvedReflection:
             debugTexture = &m_nrdReflectionResolvePass.GetOutputTexture(); break;
+        case ToneMapDebugView::SelectionMask:
+            debugRenderTarget = &m_selectionMask; break;
         default: break;
     }
 
     m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::ToneMap);
 
-    m_toneMapPass.Execute(commandList, m_sceneColor, rtvHandle,
-        debugTexture, debugView, nrdDenoisingRange, debugRenderTarget);
+    m_toneMapPass.Execute(
+        commandList,
+        m_sceneColor,
+        rtvHandle,
+        debugTexture,
+        debugView,
+        nrdDenoisingRange,
+        debugRenderTarget,
+        &m_selectionMask,
+        options.selectionOutlineColor,
+        debugView == ToneMapDebugView::None ? options.selectionOutlineThickness : 0
+    );
 
     m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::ToneMap);
 
@@ -1126,10 +1231,12 @@ void Renderer::Shutdown()
     m_nrdReflectionDenoiser.Shutdown();
     m_nrdReflectionResolvePass.Shutdown();
     m_shadowDenoisePass.Shutdown();
+    m_selectionMaskPass.Shutdown();
 
     m_uploadBuffer.Shutdown();
     m_environment.Shutdown();
     m_sceneColor.Shutdown();
+    m_selectionMask.Shutdown();
 
     m_brdfIntegrationLUT.Shutdown();
     m_ggxAverageAlbedoLUT.Shutdown();

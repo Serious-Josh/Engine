@@ -10,9 +10,7 @@ SceneRegistry& SceneRegistry::Instance()
 }
 
 
-bool SceneRegistry::Register(
-    std::string_view name,
-    DemoSceneFactory factory)
+bool SceneRegistry::Register(std::string_view name, DemoSceneFactory factory)
 {
     if (m_finalized || name.empty() || factory == nullptr)
     {
@@ -67,15 +65,13 @@ bool SceneRegistry::Finalize()
 }
 
 
-std::span<const DemoSceneEntry>
-SceneRegistry::GetScenes() const
+std::span<const DemoSceneEntry>SceneRegistry::GetScenes() const
 {
     return m_scenes;
 }
 
 
-const DemoSceneEntry* SceneRegistry::Find(
-    std::string_view name) const
+const DemoSceneEntry* SceneRegistry::Find(std::string_view name) const
 {
     const auto result = std::find_if(m_scenes.begin(), m_scenes.end(), [name](const DemoSceneEntry& entry){return entry.name == name;});
 

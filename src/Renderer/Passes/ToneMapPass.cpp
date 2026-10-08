@@ -38,9 +38,7 @@ bool ToneMapPass::Initialize(ID3D12Device* device, ShaderLibrary& shaderLibrary)
     pipelineDescription.renderTargets.count = 1;
     pipelineDescription.renderTargets.formats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
 
-    pipelineDescription.rootParameters.push_back(
-        {RootParameterType::Constants, 0, 5, D3D12_SHADER_VISIBILITY_PIXEL}
-    );
+    pipelineDescription.rootParameters.push_back({RootParameterType::Constants, 0, 10, D3D12_SHADER_VISIBILITY_PIXEL});
 
     if(!m_pipeline.Initialize(device, pipelineDescription)){
         Log::Error("Failed to initialize tone map pipeline.");
@@ -57,7 +55,10 @@ void ToneMapPass::Execute(
     Texture* debugTexture,
     ToneMapDebugView debugView,
     float nrdDenoisingRange,
-    RenderTarget* debugRenderTarget)
+    RenderTarget* debugRenderTarget,
+    RenderTarget* selectionMask,
+    const Vector3& outlineColor,
+    unsigned int outlineThickness )
 {
     sceneColor.Transition(
         commandList,
@@ -70,6 +71,10 @@ void ToneMapPass::Execute(
 
     if(debugRenderTarget){
         debugRenderTarget->Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    }
+
+    if(selectionMask){
+        selectionMask->Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     }
 
     commandList->OMSetRenderTargets(
@@ -88,19 +93,27 @@ void ToneMapPass::Execute(
         unsigned int debugTextureIndex;
         unsigned int debugView;
         float nrdDenoisingRange;
+
+        unsigned int selectionMaskIndex;
+        unsigned int outlineThickness;
+        float outlineColor[3];
     };
 
     ToneMapConstants constants{};
     constants.sceneColorIndex = sceneColor.GetSRVIndex();
     constants.exposure = 1.0f;
-    constants.debugTextureIndex = debugRenderTarget ? debugRenderTarget->GetSRVIndex()
-        : (debugTexture ? debugTexture->GetDescriptorIndex() : 0);
+    constants.debugTextureIndex = debugRenderTarget ? debugRenderTarget->GetSRVIndex() : (debugTexture ? debugTexture->GetDescriptorIndex() : 0);
     constants.debugView = (debugTexture || debugRenderTarget) ? static_cast<unsigned int>(debugView) : 0;
     constants.nrdDenoisingRange = nrdDenoisingRange;
+    constants.selectionMaskIndex = selectionMask ? selectionMask->GetSRVIndex() : 0;
+    constants.outlineThickness = selectionMask ? outlineThickness : 0;
+    constants.outlineColor[0] = outlineColor.x;
+    constants.outlineColor[1] = outlineColor.y;
+    constants.outlineColor[2] = outlineColor.z;
 
     commandList->SetGraphicsRoot32BitConstants(
         0,
-        5,
+        10,
         &constants,
         0
     );
