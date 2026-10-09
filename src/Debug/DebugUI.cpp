@@ -156,7 +156,7 @@ void DebugUI::DrawPerformanceWindow(const std::vector<std::string>& environmentN
         }
         else
         {
-            ImGui::Text("%s: --", name);
+            ImGui::Text("%s: -- (inactive / unavailable)", name);
         }
     };
 
@@ -164,10 +164,14 @@ void DebugUI::DrawPerformanceWindow(const std::vector<std::string>& environmentN
         "GPU frame",
         GpuTimestampProfiler::Region::TotalFrame);
 
+    ImGui::TextUnformatted("Geometry / scene");
+    drawGpuTiming("  TLAS update", GpuTimestampProfiler::Region::TlasUpdate);
     drawGpuTiming(
         "  Geometry",
         GpuTimestampProfiler::Region::Geometry);
+    drawGpuTiming("  Selection mask", GpuTimestampProfiler::Region::SelectionMask);
 
+    ImGui::TextUnformatted("Shadows");
     drawGpuTiming(
         "  RT shadows",
         GpuTimestampProfiler::Region::RayTracedShadows);
@@ -176,6 +180,12 @@ void DebugUI::DrawPerformanceWindow(const std::vector<std::string>& environmentN
         "  Shadow denoise",
         GpuTimestampProfiler::Region::ShadowDenoise);
 
+    ImGui::TextUnformatted("Ambient occlusion");
+    drawGpuTiming("  Ray-Traced AO", GpuTimestampProfiler::Region::RayTracedAO);
+    drawGpuTiming("  AO Temporal", GpuTimestampProfiler::Region::AOTemporal);
+    drawGpuTiming("  AO Denoise", GpuTimestampProfiler::Region::AODenoise);
+
+    ImGui::TextUnformatted("Reflections");
     drawGpuTiming(
         "  RT reflections",
         GpuTimestampProfiler::Region::RayTracedReflections);
@@ -183,6 +193,8 @@ void DebugUI::DrawPerformanceWindow(const std::vector<std::string>& environmentN
     drawGpuTiming(
         "  Reflection limiter",
         GpuTimestampProfiler::Region::ReflectionContributionLimiter);
+    drawGpuTiming("  Native temporal", GpuTimestampProfiler::Region::ReflectionTemporal);
+    drawGpuTiming("  Native spatial denoise", GpuTimestampProfiler::Region::ReflectionDenoise);
 
     drawGpuTiming(
         "  NRD prepare",
@@ -193,9 +205,14 @@ void DebugUI::DrawPerformanceWindow(const std::vector<std::string>& environmentN
         GpuTimestampProfiler::Region::NrdReblur);
 
     drawGpuTiming(
-        "  NRD resolve",
+        "  NRD reflection resolve",
         GpuTimestampProfiler::Region::NrdResolve);
 
+    ImGui::TextUnformatted("Global illumination");
+    drawGpuTiming("  Ray-Traced GI", GpuTimestampProfiler::Region::RayTracedGI);
+    drawGpuTiming("  NRD diffuse resolve", GpuTimestampProfiler::Region::NrdDiffuseResolve);
+
+    ImGui::TextUnformatted("Deferred lighting / presentation");
     drawGpuTiming(
         "  Deferred lighting",
         GpuTimestampProfiler::Region::DeferredLighting);
@@ -203,6 +220,7 @@ void DebugUI::DrawPerformanceWindow(const std::vector<std::string>& environmentN
     drawGpuTiming(
         "  Tone map",
         GpuTimestampProfiler::Region::ToneMap);
+    drawGpuTiming("  DebugUI rendering", GpuTimestampProfiler::Region::DebugUI);
 
     ImGui::Separator();
 
@@ -256,7 +274,10 @@ void DebugUI::DrawPerformanceWindow(const std::vector<std::string>& environmentN
         "Selection Mask (BLACK SCREEN)",
         "GI Raw",
         "GI Hit Distance",
-        "GI Denoised"
+        "GI Denoised",
+        "AO Raw",
+        "AO Temporal",
+        "AO Filtered"
     };
     const char* denoisers[] = {"NRD", "Native"};
     ImGui::Combo("Reflection denoiser", &m_reflectionDenoiserMode, denoisers, IM_ARRAYSIZE(denoisers));
@@ -291,6 +312,18 @@ void DebugUI::DrawPerformanceWindow(const std::vector<std::string>& environmentN
     else if(GetToneMapDebugView() == ToneMapDebugView::GIHitDistance){
         ImGui::TextUnformatted(
             "Gray: hit distance | Blue: miss | Magenta: invalid");
+    }
+    else if(GetToneMapDebugView() == ToneMapDebugView::AORaw){
+        ImGui::TextUnformatted(
+            "White: unoccluded | Black: occluded | Background: white");
+    }
+    else if(GetToneMapDebugView() == ToneMapDebugView::AOTemporal){
+        ImGui::TextUnformatted(
+            "Temporally accumulated ray-traced ambient occlusion.");
+    }
+    else if(GetToneMapDebugView() == ToneMapDebugView::AOFiltered){
+        ImGui::TextUnformatted(
+            "Temporally accumulated AO after edge-aware spatial filtering.");
     }
     ImGui::End();
 }

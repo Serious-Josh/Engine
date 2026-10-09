@@ -134,6 +134,24 @@ bool Renderer::Initialize(void* windowHandle, unsigned int width, unsigned int h
         return false;
     }
 
+    if(!m_rayTracedAOPass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap, m_width, m_height))
+    {
+        Log::Error("Failed to init ray traced AO pass.");
+        return false;
+    }
+
+    if(!m_aoTemporalPass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap, m_width, m_height))
+    {
+        Log::Error("Failed to init AO temporal pass.");
+        return false;
+    }
+
+    if(!m_aoDenoisePass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap, m_width, m_height))
+    {
+        Log::Error("Failed to init ray traced ao denoise pass.");
+        return false;
+    }
+
     if(!m_rayTracedReflectionTemporalPass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap, m_width, m_height)){
         Log::Error("Failed to init ray traced reflection temporal pass.");
         return false;
@@ -339,6 +357,24 @@ bool Renderer::Resize(unsigned int width, unsigned int height)
 
     if(!m_rayTracedGIPass.Resize(m_graphicsDevice.GetDevice(), m_resourceDescriptorHeap, width, height)){
         Log::Error("Failed to resize ray traced GI pass.");
+        return false;
+    }
+
+    if(!m_rayTracedAOPass.Resize(m_graphicsDevice.GetDevice(), m_resourceDescriptorHeap, width, height))
+    {
+        Log::Error("Failed to resize ray traced AO pass.");
+        return false;
+    }
+
+    if(!m_aoTemporalPass.Resize(m_graphicsDevice, m_resourceDescriptorHeap, width, height))
+    {
+        Log::Error("Failed to resize AO temporal pass.");
+        return false;
+    }
+
+    if(!m_aoDenoisePass.Resize(m_graphicsDevice, m_resourceDescriptorHeap, width, height))
+    {
+        Log::Error("Failed to resize AO denoise pass.");
         return false;
     }
 
@@ -667,6 +703,7 @@ void Renderer::ResetSceneHistory()
 {
     m_rayTracedShadowPass.ResetHistory();
     m_rayTracedReflectionTemporalPass.ResetHistory();
+    m_aoTemporalPass.ResetHistory();
 
     m_hasPreviousViewProjection = false;
     m_hasPreviousShadowLightDirection = false;
@@ -674,6 +711,7 @@ void Renderer::ResetSceneHistory()
 
     m_nrdExecutedLastFrame = false;
     m_nativeReflectionExecutedLastFrame = false;
+    m_aoExecutedLastFrame = false;
 
     m_shadowSampleIndex = 0;
     m_reflectionSampleIndex = 0;
@@ -687,6 +725,11 @@ void Renderer::ResetSceneHistory()
 bool Renderer::Render(const Scene& scene, const RendererOptions& options)
 {
     const unsigned int frameIndex = m_swapChain.GetCurrentBackBufferIndex();
+    const ToneMapDebugView debugView = m_debugUI.GetToneMapDebugView();
+    const bool runAO = !options.enableRTGI ||
+        debugView == ToneMapDebugView::AORaw ||
+        debugView == ToneMapDebugView::AOTemporal ||
+        debugView == ToneMapDebugView::AOFiltered;
 
     if(!m_commandContext.Begin(frameIndex)){
         Log::Error("failed to begin command recording.");
@@ -730,7 +773,10 @@ bool Renderer::Render(const Scene& scene, const RendererOptions& options)
     m_debugUI.SetTLASUpdated(tlasNeedsUpdate);
 
     if(tlasNeedsUpdate){
-        if(!m_rayTracingScene.Update(m_commandContext.GetRayTracingCommandList(), frameIndex, scene))
+        m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::TlasUpdate);
+        const bool updated = m_rayTracingScene.Update(m_commandContext.GetRayTracingCommandList(), frameIndex, scene);
+        m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::TlasUpdate);
+        if(!updated)
         {
             Log::Error("Failed to update ray tracing scene.");
             return false;
@@ -947,6 +993,9 @@ bool Renderer::Render(const Scene& scene, const RendererOptions& options)
         Draw(commandList, object, cameraConstantsAddress);
     }
 
+    m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::Geometry);
+    m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::SelectionMask);
+
     m_selectionMask.Transition(commandList, D3D12_RESOURCE_STATE_RENDER_TARGET);
 
     const float maskClearColor[] = {0.0f, 0.0f, 0.0f, 1.0f};
@@ -975,9 +1024,67 @@ bool Renderer::Render(const Scene& scene, const RendererOptions& options)
 
     m_selectionMask.Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
+    m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::SelectionMask);
+
     EndGeometryPass(commandList);
 
-    m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::Geometry);
+    if(runAO)
+    {
+        AOConstants aoConstants{};
+
+        aoConstants.inverseViewProjection = reconstructionConstants.inverseViewProjection;
+        aoConstants.depthIndex = m_gBuffer.GetDepth().GetSRVIndex();
+        aoConstants.surfaceIndex = m_gBuffer.GetSurface().GetSRVIndex();
+        aoConstants.frameIndex = reflectionConstants.frameIndex;
+
+        aoConstants.maxDistance = 1.5f;
+        aoConstants.originBias = 0.01f;
+        aoConstants.rayTMin = 0.001f;
+
+        const D3D12_GPU_VIRTUAL_ADDRESS aoConstantsAddress = m_uploadBuffer.Allocate(&aoConstants, sizeof(AOConstants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
+
+        if(aoConstantsAddress == 0){
+            Log::Error("Failed to allocate ray traced AO constants.");
+            return false;
+        }
+
+        if(!m_aoExecutedLastFrame)
+            m_aoTemporalPass.ResetHistory();
+
+        m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::RayTracedAO);
+        m_rayTracedAOPass.Execute(
+            m_commandContext.GetRayTracingCommandList(),
+            m_resourceDescriptorHeap,
+            m_rayTracingScene,
+            aoConstantsAddress,
+            m_width,
+            m_height);
+        m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::RayTracedAO);
+
+        m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::AOTemporal);
+        m_aoTemporalPass.Execute(
+            commandList,
+            m_rayTracedAOPass.GetRawAOTexture(),
+            m_gBuffer,
+            m_uploadBuffer,
+            reconstructionConstants.inverseViewProjection,
+            shadowConstants.previousViewProjection,
+            shadowConstants.previousInverseViewProjection,
+            m_width,
+            m_height);
+        m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::AOTemporal);
+
+        m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::AODenoise);
+        m_aoDenoisePass.Execute(
+            commandList,
+            m_aoTemporalPass.GetAccumulatedAOTexture(),
+            m_gBuffer,
+            m_uploadBuffer,
+            reconstructionConstants.inverseViewProjection,
+            m_width,
+            m_height);
+        m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::AODenoise);
+    }
 
     m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::RayTracedShadows);
 
@@ -1017,6 +1124,7 @@ bool Renderer::Render(const Scene& scene, const RendererOptions& options)
 
     m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::RayTracedReflections);
 
+    m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::RayTracedGI);
     m_rayTracedGIPass.Execute(
         m_commandContext.GetRayTracingCommandList(),
         m_resourceDescriptorHeap,
@@ -1025,11 +1133,11 @@ bool Renderer::Render(const Scene& scene, const RendererOptions& options)
         lightConstantsAddress,
         m_width,
         m_height);
+    m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::RayTracedGI);
 
     constexpr float nrdDenoisingRange = 1000.0f;
     const bool limiterEnabled = m_debugUI.IsReflectionContributionLimiterEnabled();
     const ReflectionDenoiserMode reflectionMode = m_debugUI.GetReflectionDenoiserMode();
-    const ToneMapDebugView debugView = m_debugUI.GetToneMapDebugView();
     bool runNrd = reflectionMode == ReflectionDenoiserMode::Nrd;
     // Native production can still inspect fresh NRD diagnostics without changing its lighting input.
     switch(debugView)
@@ -1071,13 +1179,13 @@ bool Renderer::Render(const Scene& scene, const RendererOptions& options)
         {
             m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::ReflectionContributionLimiter);
 
-            if(!m_reflectionContributionLimitPass.Execute(commandList, *nrdInput, m_uploadBuffer, m_width, m_height))
+            const bool limited = m_reflectionContributionLimitPass.Execute(commandList, *nrdInput, m_uploadBuffer, m_width, m_height);
+            m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::ReflectionContributionLimiter);
+            if(!limited)
             {
                 Log::Error("Failed to execute reflection contribution limiter.");
                 return false;
             }
-
-            m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::ReflectionContributionLimiter);
 
             nrdInput = &m_reflectionContributionLimitPass.GetOutputTexture();
         }
@@ -1132,6 +1240,7 @@ bool Renderer::Render(const Scene& scene, const RendererOptions& options)
 
         m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::NrdResolve);
 
+        m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::NrdDiffuseResolve);
         m_nrdDiffuseResolvePass.Execute(
             commandList,
             m_nrdReflectionDenoiser.GetDiffuseOutputTexture(),
@@ -1140,12 +1249,14 @@ bool Renderer::Render(const Scene& scene, const RendererOptions& options)
             m_width,
             m_height,
             nrdDenoisingRange);
+        m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::NrdDiffuseResolve);
     }
 
     if(runNative)
     {
         if(!m_nativeReflectionExecutedLastFrame)
             m_rayTracedReflectionTemporalPass.ResetHistory();
+        m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::ReflectionTemporal);
         m_rayTracedReflectionTemporalPass.Execute(
             commandList,
             m_rayTracedReflectionPass.GetRawReflectionTexture(),
@@ -1156,7 +1267,9 @@ bool Renderer::Render(const Scene& scene, const RendererOptions& options)
             shadowConstants.previousInverseViewProjection,
             m_width,
             m_height);
+        m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::ReflectionTemporal);
 
+        m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::ReflectionDenoise);
         m_rayTracedReflectionDenoisePass.Execute(
             commandList,
             m_rayTracedReflectionTemporalPass.GetReflectionTexture(),
@@ -1166,6 +1279,7 @@ bool Renderer::Render(const Scene& scene, const RendererOptions& options)
             reflectionConstants.inverseViewProjection,
             m_width,
             m_height);
+        m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::ReflectionDenoise);
     }
 
     Texture& finalReflection = reflectionMode == ReflectionDenoiserMode::Nrd
@@ -1193,6 +1307,7 @@ bool Renderer::Render(const Scene& scene, const RendererOptions& options)
         m_shadowDenoisePass.GetFilteredVisibilityTexture(),
         finalReflection,
         m_nrdDiffuseResolvePass.GetOutputTexture(),
+        m_aoDenoisePass.GetFilteredAOTexture(),
         options.enableRTGI,
         m_sceneColor,
         reconstructionConstantsAddress,
@@ -1229,6 +1344,12 @@ bool Renderer::Render(const Scene& scene, const RendererOptions& options)
             debugTexture = &m_rayTracedGIPass.GetHitDistanceTexture(); break;
         case ToneMapDebugView::GIDenoised:
             debugTexture = &m_nrdDiffuseResolvePass.GetOutputTexture(); break;
+        case ToneMapDebugView::AORaw:
+            debugTexture = &m_rayTracedAOPass.GetRawAOTexture(); break;
+        case ToneMapDebugView::AOTemporal:
+            debugTexture = &m_aoTemporalPass.GetAccumulatedAOTexture(); break;
+        case ToneMapDebugView::AOFiltered:
+            debugTexture = &m_aoDenoisePass.GetFilteredAOTexture(); break;
         default: break;
     }
 
@@ -1249,7 +1370,9 @@ bool Renderer::Render(const Scene& scene, const RendererOptions& options)
 
     m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::ToneMap);
 
+    m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::DebugUI);
     m_debugUI.EndFrame(commandList);
+    m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::DebugUI);
 
     barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
     barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
@@ -1271,6 +1394,7 @@ bool Renderer::Render(const Scene& scene, const RendererOptions& options)
     const uint64_t submissionFence = m_commandContext.GetFrameFenceValue(frameIndex);
 
     m_gpuTimestampProfiler.MarkSubmitted(frameIndex, submissionFence, m_gpuProfilerFrameSerial);
+    m_aoExecutedLastFrame = runAO;
 
     m_pendingStatistics[frameIndex].statistics = m_currentFrameStatistics;
     m_pendingStatistics[frameIndex].valid = true;
@@ -1328,6 +1452,9 @@ void Renderer::Shutdown()
     m_rayTracedShadowPass.Shutdown();
     m_rayTracedReflectionPass.Shutdown();
     m_rayTracedGIPass.Shutdown();
+    m_rayTracedAOPass.Shutdown();
+    m_aoDenoisePass.Shutdown();
+    m_aoTemporalPass.Shutdown();
     m_rayTracedReflectionTemporalPass.Shutdown();
     m_rayTracedReflectionDenoisePass.Shutdown();
     m_reflectionContributionLimitPass.Shutdown();

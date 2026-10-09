@@ -22,6 +22,16 @@ class GpuTimestampProfiler
             NrdResolve,
             DeferredLighting,
             ToneMap,
+            TlasUpdate,
+            SelectionMask,
+            RayTracedAO,
+            AOTemporal,
+            AODenoise,
+            RayTracedGI,
+            ReflectionTemporal,
+            ReflectionDenoise,
+            NrdDiffuseResolve,
+            DebugUI,
 
             Count
         };
@@ -54,6 +64,7 @@ class GpuTimestampProfiler
         static unsigned int GetEndQueryIndex(unsigned int frameIndex, Region region);
 
         static constexpr unsigned int RegionCount = static_cast<unsigned int>(Region::Count);
+        static_assert(RegionCount <= 32, "GPU region validity masks use 32 bits.");
 
         static constexpr unsigned int QueriesPerRegion = 2;
         static constexpr unsigned int QueriesPerFrame = RegionCount * QueriesPerRegion;

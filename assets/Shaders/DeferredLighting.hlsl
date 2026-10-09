@@ -25,6 +25,7 @@ cbuffer GBufferConstants : register(b0)
     uint reflectionIndex;
     uint giIrradianceIndex;
     uint enableRTGI;
+    uint aoVisibilityIndex;
 }
 
 cbuffer ReconstructionConstants : register(b1)
@@ -361,6 +362,9 @@ float4 PSMain(VSOutput input) : SV_Target0
         else
         {
             irradiance = diffuseIrradiance.SampleLevel(sampler0, normal, 0.0f).rgb;
+            Texture2D<float> aoVisibility = ResourceDescriptorHeap[aoVisibilityIndex];
+            float visibility = saturate(aoVisibility.Load(int3(pixel, 0)));
+            irradiance *= visibility;
         }
     }
 

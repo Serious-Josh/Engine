@@ -53,7 +53,7 @@ bool DeferredLightingPass::Initialize(ID3D12Device* device, ShaderLibrary& shade
         D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
 
     pipelineDescription.rootParameters.push_back(
-        {RootParameterType::Constants, 0, 14, D3D12_SHADER_VISIBILITY_PIXEL}
+        {RootParameterType::Constants, 0, 15, D3D12_SHADER_VISIBILITY_PIXEL}
     );
 
     pipelineDescription.rootParameters.push_back(
@@ -85,6 +85,7 @@ void DeferredLightingPass::Execute(
     Texture& shadowVisiblity,
     Texture& reflectionTexture,
     Texture& giIrradiance,
+    Texture& aoVisibility,
     bool enableRTGI,
     RenderTarget& sceneColor,
     D3D12_GPU_VIRTUAL_ADDRESS reconstructionConstantsAddress,
@@ -95,14 +96,12 @@ void DeferredLightingPass::Execute(
     gBuffer.GetDepth().Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     reflectionTexture.Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     giIrradiance.Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    if(!enableRTGI)
+        aoVisibility.Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
-    sceneColor.Transition(
-        commandList,
-        D3D12_RESOURCE_STATE_RENDER_TARGET
-    );
+    sceneColor.Transition(commandList, D3D12_RESOURCE_STATE_RENDER_TARGET);
 
-    D3D12_CPU_DESCRIPTOR_HANDLE sceneColorRTV =
-        sceneColor.GetRTV();
+    D3D12_CPU_DESCRIPTOR_HANDLE sceneColorRTV = sceneColor.GetRTV();
 
     const float clearColor[] =
     {
@@ -143,12 +142,13 @@ void DeferredLightingPass::Execute(
         shadowVisiblity.GetDescriptorIndex(),
         reflectionTexture.GetDescriptorIndex(),
         giIrradiance.GetDescriptorIndex(),
-        enableRTGI ? 1u : 0u
+        enableRTGI ? 1u : 0u,
+        aoVisibility.GetDescriptorIndex()
     };
 
     commandList->SetGraphicsRoot32BitConstants(
         0,
-        14,
+        15,
         resourceIndices,
         0
     );

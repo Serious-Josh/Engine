@@ -216,6 +216,16 @@ float4 PSMain(VSOutput input) : SV_TARGET
         return float4(1.0f, 0.0f, 1.0f, 1.0f);
     }
 
+    if(toneMapConstants.debugView == 14 ||
+       toneMapConstants.debugView == 15 ||
+       toneMapConstants.debugView == 16)
+    {
+        Texture2D<float> aoTexture =
+            ResourceDescriptorHeap[toneMapConstants.debugTextureIndex];
+        float visibility = aoTexture.Load(int3(pixel, 0));
+        return float4(visibility, visibility, visibility, 1.0f);
+    }
+
     Texture2D<float4> sceneColor =
         // Mode 8 is already unpacked, remodulated linear HDR reflection RGB.
         ResourceDescriptorHeap[toneMapConstants.debugView == 8

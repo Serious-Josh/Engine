@@ -102,6 +102,21 @@ struct GIConstants
     unsigned int padding1 = 0;
 };
 
+struct AOConstants
+{
+    Matrix4 inverseViewProjection;
+
+    unsigned int depthIndex = 0;
+    unsigned int surfaceIndex = 0;
+    unsigned int frameIndex = 0;
+    unsigned int padding0 = 0;
+
+    float maxDistance = 1.5f;
+    float originBias = 0.01f;
+    float rayTMin = 0.001f;
+    float padding1 = 0.0f;
+};
+
 struct DirectionalLightConstants
 {
     float direction[3];
@@ -154,3 +169,4 @@ static_assert(sizeof(ShadowConstants) == 256);
 static_assert(sizeof(ReflectionConstants) == 144);
 static_assert(sizeof(RayTracingInstanceData) == 32);
 static_assert(sizeof(GIConstants) == 96);
+static_assert(sizeof(AOConstants) == 96);

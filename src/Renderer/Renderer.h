@@ -38,6 +38,9 @@
 #include "Passes/NrdReflectionResolvePass.h"
 #include "Passes/SelectionMaskPass.h"
 #include "Passes/RayTracedGIPass.h"
+#include "Passes/RayTracedAOPass.h"
+#include "Passes/AOTemporalPass.h"
+#include "Passes/AODenoisePass.h"
 #include "Passes/NrdDiffuseResolvePass.h"
 
 #include <d3d12.h>
@@ -134,6 +137,9 @@ class Renderer
         RayTracedReflectionTemporalPass m_rayTracedReflectionTemporalPass;
         RayTracedReflectionDenoisePass m_rayTracedReflectionDenoisePass;
         RayTracedGIPass m_rayTracedGIPass;
+        RayTracedAOPass m_rayTracedAOPass;
+        AOTemporalPass m_aoTemporalPass;
+        AODenoisePass m_aoDenoisePass;
         ReflectionContributionLimitPass m_reflectionContributionLimitPass;
         NrdReflectionDenoiser m_nrdReflectionDenoiser;
         NrdReflectionPreparePass m_nrdReflectionPreparePass;
@@ -145,6 +151,7 @@ class Renderer
         bool m_previousContributionLimiterEnabled = false;
         bool m_nrdExecutedLastFrame = false;
         bool m_nativeReflectionExecutedLastFrame = false;
+        bool m_aoExecutedLastFrame = false;
 
         ShaderLibrary m_shaderLibrary;
 

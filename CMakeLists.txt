@@ -101,6 +101,9 @@ add_executable(Engine
     src/Renderer/Passes/SelectionMaskPass.cpp
     src/Renderer/Passes/RayTracedGIPass.cpp
     src/Renderer/Passes/NrdDiffuseResolvePass.cpp
+    src/Renderer/Passes/RayTracedAOPass.cpp
+    src/Renderer/Passes/AOTemporalPass.cpp
+    src/Renderer/Passes/AODenoisePass.cpp
 )
 
 add_custom_command(
