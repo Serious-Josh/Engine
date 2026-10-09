@@ -245,6 +245,7 @@ void Engine::Frame()
     }
 
     RendererOptions rendererOptions{};
+    rendererOptions.enableRTGI = debugUI.IsRTGIEnabled();
     
     const size_t selectedObject = m_editor.GetSelectedObject();
 

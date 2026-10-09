@@ -129,6 +129,11 @@ bool Renderer::Initialize(void* windowHandle, unsigned int width, unsigned int h
         return false;
     }
 
+    if(!m_rayTracedGIPass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap, m_width, m_height)){
+        Log::Error("Failed to init ray traced gi pass.");
+        return false;
+    }
+
     if(!m_rayTracedReflectionTemporalPass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap, m_width, m_height)){
         Log::Error("Failed to init ray traced reflection temporal pass.");
         return false;
@@ -323,6 +328,11 @@ bool Renderer::Resize(unsigned int width, unsigned int height)
 
     if(!m_rayTracedReflectionPass.Resize(m_graphicsDevice.GetDevice(), m_resourceDescriptorHeap, width, height)){
         Log::Error("Failed to resize ray traced reflection pass.");
+        return false;
+    }
+
+    if(!m_rayTracedGIPass.Resize(m_graphicsDevice.GetDevice(), m_resourceDescriptorHeap, width, height)){
+        Log::Error("Failed to resize ray traced GI pass.");
         return false;
     }
 
@@ -857,6 +867,23 @@ bool Renderer::Render(const Scene& scene, const RendererOptions& options)
         return false;
     }
 
+    GIConstants giConstants{};
+    giConstants.inverseViewProjection = reconstructionConstants.inverseViewProjection;
+    giConstants.depthIndex = m_gBuffer.GetDepth().GetSRVIndex();
+    giConstants.surfaceIndex = m_gBuffer.GetSurface().GetSRVIndex();
+    giConstants.frameIndex = reflectionConstants.frameIndex;
+    giConstants.instanceDataIndex = reflectionConstants.instanceDataIndex;
+    giConstants.materialBufferIndex = reflectionConstants.materialBufferIndex;
+    giConstants.environmentIndex = reflectionConstants.environmentIndex;
+    giConstants.diffuseIrradianceIndex = m_environment.GetDiffuseIrradiance().GetDescriptorIndex();
+
+    const D3D12_GPU_VIRTUAL_ADDRESS giConstantsAddress = m_uploadBuffer.Allocate( &giConstants, sizeof(GIConstants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
+
+    if(giConstantsAddress == 0){
+        Log::Error("Failed to allocate ray traced GI constants.");
+        return false;
+    }
+
     D3D12_RESOURCE_BARRIER barrier{};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     barrier.Transition.pResource = m_swapChain.GetCurrentBackBuffer();
@@ -977,6 +1004,15 @@ bool Renderer::Render(const Scene& scene, const RendererOptions& options)
     );
 
     m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::RayTracedReflections);
+
+    m_rayTracedGIPass.Execute(
+        m_commandContext.GetRayTracingCommandList(),
+        m_resourceDescriptorHeap,
+        m_rayTracingScene,
+        giConstantsAddress,
+        lightConstantsAddress,
+        m_width,
+        m_height);
 
     constexpr float nrdDenoisingRange = 1000.0f;
     const bool limiterEnabled = m_debugUI.IsReflectionContributionLimiterEnabled();
@@ -1130,6 +1166,8 @@ bool Renderer::Render(const Scene& scene, const RendererOptions& options)
         m_environment.GetGGXMultiscatterIrradiance(),
         m_shadowDenoisePass.GetFilteredVisibilityTexture(),
         finalReflection,
+        m_rayTracedGIPass.GetRawGITexture(),
+        options.enableRTGI,
         m_sceneColor,
         reconstructionConstantsAddress,
         lightConstantsAddress
@@ -1159,6 +1197,10 @@ bool Renderer::Render(const Scene& scene, const RendererOptions& options)
             debugTexture = &m_nrdReflectionResolvePass.GetOutputTexture(); break;
         case ToneMapDebugView::SelectionMask:
             debugRenderTarget = &m_selectionMask; break;
+        case ToneMapDebugView::GIRaw:
+            debugTexture = &m_rayTracedGIPass.GetRawGITexture(); break;
+        case ToneMapDebugView::GIHitDistance:
+            debugTexture = &m_rayTracedGIPass.GetHitDistanceTexture(); break;
         default: break;
     }
 
@@ -1257,6 +1299,7 @@ void Renderer::Shutdown()
     m_ggxAverageAlbedoPass.Shutdown();
     m_rayTracedShadowPass.Shutdown();
     m_rayTracedReflectionPass.Shutdown();
+    m_rayTracedGIPass.Shutdown();
     m_rayTracedReflectionTemporalPass.Shutdown();
     m_rayTracedReflectionDenoisePass.Shutdown();
     m_reflectionContributionLimitPass.Shutdown();

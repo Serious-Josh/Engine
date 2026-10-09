@@ -242,12 +242,25 @@ void DebugUI::DrawPerformanceWindow(const std::vector<std::string>& environmentN
 
     ImGui::Separator();
 
-    const char* views[] = {"None", "Specular tracking distance", "NRD ViewZ", "NRD Normal",
-        "NRD Roughness", "NRD Motion", "NRD Spec Radiance", "NRD Hit Distance",
-        "NrdResolvedReflection", "GBuffer Motion"};
+    const char* views[] = {
+        "None",
+        "Specular tracking distance",
+        "NRD ViewZ",
+        "NRD Normal",
+        "NRD Roughness",
+        "NRD Motion",
+        "NRD Spec Radiance",
+        "NRD Hit Distance",
+        "NrdResolvedReflection",
+        "GBuffer Motion",
+        "Selection Mask (BLACK SCREEN)",
+        "GI Raw",
+        "GI Hit Distance"
+    };
     const char* denoisers[] = {"NRD", "Native"};
     ImGui::Combo("Reflection denoiser", &m_reflectionDenoiserMode, denoisers, IM_ARRAYSIZE(denoisers));
     ImGui::Checkbox("NRD contribution limiter", &m_contributionLimiterEnabled);
+    ImGui::Checkbox("Enable RTGI", &m_rtgiEnabled);
     ImGui::Combo("Diagnostic view", &m_toneMapDebugView, views, IM_ARRAYSIZE(views));
     ImGui::Separator();
     if(GetToneMapDebugView() == ToneMapDebugView::SpecularTrackingDistance){
@@ -269,6 +282,14 @@ void DebugUI::DrawPerformanceWindow(const std::vector<std::string>& environmentN
     else if(GetToneMapDebugView() == ToneMapDebugView::NrdRoughness ||
             GetToneMapDebugView() == ToneMapDebugView::NrdHitDistance){
         ImGui::TextUnformatted("Decoded value: 0 = black | 1 = white");
+    }
+    else if(GetToneMapDebugView() == ToneMapDebugView::GIRaw){
+        ImGui::TextUnformatted(
+            "Raw diffuse GI irradiance (noisy) | Black: invalid surface");
+    }
+    else if(GetToneMapDebugView() == ToneMapDebugView::GIHitDistance){
+        ImGui::TextUnformatted(
+            "Gray: hit distance | Blue: miss | Magenta: invalid");
     }
     ImGui::End();
 }

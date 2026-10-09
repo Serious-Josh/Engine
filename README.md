@@ -11,6 +11,7 @@ Engine is an in development game engine. The goal is to make an actually usable 
 - RayTracing
     - RT soft shadows
     - RT reflections
+    - RTGI (WIP)
 
 Future goals listed here:
 

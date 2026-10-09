@@ -23,6 +23,8 @@ cbuffer GBufferConstants : register(b0)
     uint ggxMultiscatterIrradianceIndex;
     uint shadowVisibilityIndex;
     uint reflectionIndex;
+    uint giIrradianceIndex;
+    uint enableRTGI;
 }
 
 cbuffer ReconstructionConstants : register(b1)
@@ -348,6 +350,20 @@ float4 PSMain(VSOutput input) : SV_Target0
             )
         ).rgb;
 
+    float3 irradiance = float3(0.0f, 0.0f, 0.0f);
+    if(gpuMaterial.model == 0 || gpuMaterial.model == 1)
+    {
+        if(enableRTGI != 0)
+        {
+            Texture2D<float4> giIrradiance = ResourceDescriptorHeap[giIrradianceIndex];
+            irradiance = giIrradiance.Load(int3(pixel, 0)).rgb;
+        }
+        else
+        {
+            irradiance = diffuseIrradiance.SampleLevel(sampler0, normal, 0.0f).rgb;
+        }
+    }
+
     if(gpuMaterial.model == 0)
     {
         float metallic =
@@ -529,13 +545,6 @@ float4 PSMain(VSOutput input) : SV_Target0
 
         finalSpecular =
             lerp(environmentSpecular, rayTracedSpecular, rtWeight);
-
-        float3 irradiance =
-            diffuseIrradiance.SampleLevel(
-                sampler0,
-                normal,
-                0.0f
-            ).rgb;
 
         float3 environmentFresnel =
             F0 +
@@ -729,13 +738,6 @@ float4 PSMain(VSOutput input) : SV_Target0
 
         finalSpecular =
             lerp(environmentSpecular, rayTracedSpecular, rtWeight);
-
-        float3 irradiance =
-            diffuseIrradiance.SampleLevel(
-                sampler0,
-                normal,
-                0.0f
-            ).rgb;
 
         float3 environmentFresnel =
             F0 +

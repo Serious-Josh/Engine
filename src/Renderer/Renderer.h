@@ -37,6 +37,7 @@
 #include "Passes/NrdReflectionPreparePass.h"
 #include "Passes/NrdReflectionResolvePass.h"
 #include "Passes/SelectionMaskPass.h"
+#include "Passes/RayTracedGIPass.h"
 
 #include <d3d12.h>
 #include <filesystem>
@@ -57,6 +58,8 @@ struct RendererOptions
 
     Vector3 selectionOutlineColor{1.0f, 0.72f, 0.0f};
     unsigned int selectionOutlineThickness = 2;
+
+    bool enableRTGI = true;
 };
 
 class Scene;
@@ -129,6 +132,7 @@ class Renderer
         RayTracedReflectionPass m_rayTracedReflectionPass;
         RayTracedReflectionTemporalPass m_rayTracedReflectionTemporalPass;
         RayTracedReflectionDenoisePass m_rayTracedReflectionDenoisePass;
+        RayTracedGIPass m_rayTracedGIPass;
         ReflectionContributionLimitPass m_reflectionContributionLimitPass;
         NrdReflectionDenoiser m_nrdReflectionDenoiser;
         NrdReflectionPreparePass m_nrdReflectionPreparePass;

@@ -53,7 +53,7 @@ bool DeferredLightingPass::Initialize(ID3D12Device* device, ShaderLibrary& shade
         D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
 
     pipelineDescription.rootParameters.push_back(
-        {RootParameterType::Constants, 0, 12, D3D12_SHADER_VISIBILITY_PIXEL}
+        {RootParameterType::Constants, 0, 14, D3D12_SHADER_VISIBILITY_PIXEL}
     );
 
     pipelineDescription.rootParameters.push_back(
@@ -84,6 +84,8 @@ void DeferredLightingPass::Execute(
     Texture& ggxMultiscatterIrradiance,
     Texture& shadowVisiblity,
     Texture& reflectionTexture,
+    Texture& giIrradiance,
+    bool enableRTGI,
     RenderTarget& sceneColor,
     D3D12_GPU_VIRTUAL_ADDRESS reconstructionConstantsAddress,
     D3D12_GPU_VIRTUAL_ADDRESS lightConstantsAddress)
@@ -92,6 +94,7 @@ void DeferredLightingPass::Execute(
     gBuffer.GetSurface().Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     gBuffer.GetDepth().Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     reflectionTexture.Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    giIrradiance.Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
     sceneColor.Transition(
         commandList,
@@ -138,12 +141,14 @@ void DeferredLightingPass::Execute(
         ggxAverageAlbedoLUT.GetDescriptorIndex(),
         ggxMultiscatterIrradiance.GetDescriptorIndex(),
         shadowVisiblity.GetDescriptorIndex(),
-        reflectionTexture.GetDescriptorIndex()
+        reflectionTexture.GetDescriptorIndex(),
+        giIrradiance.GetDescriptorIndex(),
+        enableRTGI ? 1u : 0u
     };
 
     commandList->SetGraphicsRoot32BitConstants(
         0,
-        12,
+        14,
         resourceIndices,
         0
     );

@@ -14,7 +14,8 @@ class DeferredLightingPass
 {
     public:
         bool Initialize(ID3D12Device* device, ShaderLibrary& shaderLibrary);
-        void Execute(ID3D12GraphicsCommandList* commandList,
+        void Execute(
+            ID3D12GraphicsCommandList* commandList,
             GBuffer& gBuffer,
             StructuredBuffer& materialBuffer,
             Texture& environmentTexture,
@@ -25,6 +26,8 @@ class DeferredLightingPass
             Texture& ggxMultiscatterIrradiance,
             Texture& shadowVisiblity,
             Texture& reflectionTexture,
+            Texture& giIrradiance,
+            bool enableRTGI,
             RenderTarget& sceneColor,
             D3D12_GPU_VIRTUAL_ADDRESS reconstructionConstantsAddress,
             D3D12_GPU_VIRTUAL_ADDRESS lightConstantsAddress

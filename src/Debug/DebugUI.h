@@ -39,6 +39,8 @@ class DebugUI
         bool IsReflectionContributionLimiterEnabled() const { return m_contributionLimiterEnabled; }
         ToneMapDebugView GetToneMapDebugView() const { return static_cast<ToneMapDebugView>(m_toneMapDebugView); }
 
+        bool IsRTGIEnabled() const {return m_rtgiEnabled; }
+
         bool HasEnvironmentChangeRequest() const
         {
             return m_requestedEnvironmentIndex >= 0;
@@ -64,4 +66,6 @@ class DebugUI
         std::uint64_t m_totalTLASUpdates = 0;
 
         int m_requestedEnvironmentIndex = -1;
+
+        bool m_rtgiEnabled = true;
 };

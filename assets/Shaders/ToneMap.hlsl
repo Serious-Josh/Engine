@@ -194,6 +194,28 @@ float4 PSMain(VSOutput input) : SV_TARGET
         return float4(mask, mask, mask, 1.0f);
     }
 
+    if(toneMapConstants.debugView == 11)
+    {
+        Texture2D<float4> rawGI =
+            ResourceDescriptorHeap[toneMapConstants.debugTextureIndex];
+        return float4(rawGI.Load(int3(pixel, 0)).rgb, 1.0f);
+    }
+
+    if(toneMapConstants.debugView == 12)
+    {
+        Texture2D<float> giHitDistance =
+            ResourceDescriptorHeap[toneMapConstants.debugTextureIndex];
+        float distance = giHitDistance.Load(int3(pixel, 0));
+        if(distance == -1.0f)
+            return float4(0.0f, 0.0f, 1.0f, 1.0f);
+        if(isfinite(distance) && distance > 0.0f)
+        {
+            float gray = distance / (distance + 5.0f);
+            return float4(gray, gray, gray, 1.0f);
+        }
+        return float4(1.0f, 0.0f, 1.0f, 1.0f);
+    }
+
     Texture2D<float4> sceneColor =
         // Mode 8 is already unpacked, remodulated linear HDR reflection RGB.
         ResourceDescriptorHeap[toneMapConstants.debugView == 8

@@ -99,6 +99,7 @@ add_executable(Engine
     src/DemoContent/SceneRegistry.cpp
     src/DemoContent/StressTestScene.cpp
     src/Renderer/Passes/SelectionMaskPass.cpp
+    src/Renderer/Passes/RayTracedGIPass.cpp
 )
 
 add_custom_command(

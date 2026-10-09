@@ -87,6 +87,21 @@ struct ReflectionConstants
     float importanceTotalWeight;
 };
 
+struct GIConstants
+{
+    Matrix4 inverseViewProjection;
+
+    unsigned int depthIndex = 0;
+    unsigned int surfaceIndex = 0;
+    unsigned int frameIndex = 0;
+    unsigned int instanceDataIndex = 0;
+
+    unsigned int materialBufferIndex = 0;
+    unsigned int environmentIndex = 0;
+    unsigned int diffuseIrradianceIndex = 0;
+    unsigned int padding1 = 0;
+};
+
 struct DirectionalLightConstants
 {
     float direction[3];
@@ -138,3 +153,4 @@ static_assert(sizeof(GPUMaterial) == 80);
 static_assert(sizeof(ShadowConstants) == 256);
 static_assert(sizeof(ReflectionConstants) == 144);
 static_assert(sizeof(RayTracingInstanceData) == 32);
+static_assert(sizeof(GIConstants) == 96);

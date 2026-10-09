@@ -48,6 +48,8 @@ private:
 
     Pipeline m_pipeline;
     Material m_defaultMaterial;
+    Material m_redWallMaterial;
+    Material m_greenWallMaterial;
 
     Scene m_scene;
 };

@@ -136,6 +136,16 @@ bool CornellBoxScene::Initialize(
     m_defaultMaterial.baseColor[1] = 0.7f;
     m_defaultMaterial.baseColor[2] = 0.7f;
 
+    m_redWallMaterial = m_defaultMaterial;
+    m_redWallMaterial.baseColor[0] = 0.75f;
+    m_redWallMaterial.baseColor[1] = 0.08f;
+    m_redWallMaterial.baseColor[2] = 0.06f;
+
+    m_greenWallMaterial = m_defaultMaterial;
+    m_greenWallMaterial.baseColor[0] = 0.08f;
+    m_greenWallMaterial.baseColor[1] = 0.65f;
+    m_greenWallMaterial.baseColor[2] = 0.10f;
+
 
     // Cornell box
 
@@ -211,11 +221,27 @@ bool CornellBoxScene::Initialize(
 
     // Cornell box render objects
 
-    for (const auto& mesh : m_cornellMeshes)
+    for (size_t i = 0; i < m_cornellMeshes.size(); ++i)
     {
         RenderObject boxPart{};
-        boxPart.mesh = mesh.get();
-        boxPart.material = &m_defaultMaterial;
+        boxPart.mesh = m_cornellMeshes[i].get();
+
+        // Assign Cornell box wall materials.
+        if (i == 1)
+        {
+            // Object 1: left wall
+            boxPart.material = &m_redWallMaterial;
+        }
+        else if (i == 2)
+        {
+            // Object 2: right wall
+            boxPart.material = &m_greenWallMaterial;
+        }
+        else
+        {
+            // Floor, ceiling, and remaining walls
+            boxPart.material = &m_defaultMaterial;
+        }
 
         boxPart.transform.position =
             Vector3{
@@ -250,11 +276,18 @@ bool CornellBoxScene::Initialize(
                 0.0f
             };
 
+        tankPart.transform.rotation =
+            Vector3{
+                0.0f,
+                ToRadians(45.0f),
+                0.0f
+            };
+
         tankPart.transform.scale =
             Vector3{
-                1.0f,
-                1.0f,
-                1.0f
+                0.5f,
+                0.5f,
+                0.5f
             };
 
         m_scene.AddRenderObject(tankPart);
@@ -317,7 +350,9 @@ const Scene& CornellBoxScene::GetScene() const
 std::vector<Material*> CornellBoxScene::GetMaterials()
 {
     return {
-        &m_defaultMaterial
+        &m_defaultMaterial,
+        &m_redWallMaterial,
+        &m_greenWallMaterial
     };
 }
 
