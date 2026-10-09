@@ -255,7 +255,8 @@ void DebugUI::DrawPerformanceWindow(const std::vector<std::string>& environmentN
         "GBuffer Motion",
         "Selection Mask (BLACK SCREEN)",
         "GI Raw",
-        "GI Hit Distance"
+        "GI Hit Distance",
+        "GI Denoised"
     };
     const char* denoisers[] = {"NRD", "Native"};
     ImGui::Combo("Reflection denoiser", &m_reflectionDenoiserMode, denoisers, IM_ARRAYSIZE(denoisers));

@@ -194,7 +194,7 @@ float4 PSMain(VSOutput input) : SV_TARGET
         return float4(mask, mask, mask, 1.0f);
     }
 
-    if(toneMapConstants.debugView == 11)
+    if(toneMapConstants.debugView == 11 || toneMapConstants.debugView == 13)
     {
         Texture2D<float4> rawGI =
             ResourceDescriptorHeap[toneMapConstants.debugTextureIndex];

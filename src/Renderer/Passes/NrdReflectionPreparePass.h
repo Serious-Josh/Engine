@@ -36,7 +36,9 @@ struct NrdReflectionPrepareConstants
     unsigned int normalRoughnessOutputIndex;
 
     unsigned int specRadianceHitDistOutputIndex;
-    unsigned int padding[3];
+    unsigned int rawGIIndex;
+    unsigned int giHitDistanceIndex;
+    unsigned int diffRadianceHitDistOutputIndex;
 };
 
 static_assert(sizeof(NrdReflectionPrepareConstants) == 208);
@@ -51,6 +53,8 @@ class NrdReflectionPreparePass
             GBuffer& gBuffer,
             Texture& rawReflection,
             Texture& trackingDistance,
+            Texture& rawGI,
+            Texture& giHitDistance,
             UploadBuffer& uploadBuffer,
             const Matrix4& inverseViewProjection,
             const Matrix4& view,
@@ -73,6 +77,9 @@ class NrdReflectionPreparePass
         Texture& GetSpecRadianceHitDistTexture();
         const Texture& GetSpecRadianceHitDistTexture() const;
 
+        Texture& GetDiffRadianceHitDistTexture();
+        const Texture& GetDiffRadianceHitDistTexture() const;
+
     private:
         bool CreateTextures(GraphicsDevice& graphicsDevice, DescriptorHeap& descriptorHeap, unsigned int width, unsigned int height);
 
@@ -80,6 +87,7 @@ class NrdReflectionPreparePass
         Texture m_motionTexture;
         Texture m_normalRoughnessTexture;
         Texture m_specRadianceHitDistTexture;
+        Texture m_diffRadianceHitDistTexture;
 
         ComputePipeline m_pipeline;
 };

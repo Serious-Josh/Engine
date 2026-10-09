@@ -100,6 +100,7 @@ add_executable(Engine
     src/DemoContent/StressTestScene.cpp
     src/Renderer/Passes/SelectionMaskPass.cpp
     src/Renderer/Passes/RayTracedGIPass.cpp
+    src/Renderer/Passes/NrdDiffuseResolvePass.cpp
 )
 
 add_custom_command(

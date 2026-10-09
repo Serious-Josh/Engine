@@ -57,6 +57,7 @@ bool NrdReflectionPreparePass::Resize(
     m_motionTexture.Shutdown();
     m_normalRoughnessTexture.Shutdown();
     m_specRadianceHitDistTexture.Shutdown();
+    m_diffRadianceHitDistTexture.Shutdown();
 
     return CreateTextures(graphicsDevice, descriptorHeap, width, height);
 }
@@ -66,6 +67,8 @@ void NrdReflectionPreparePass::Execute(
     GBuffer& gBuffer,
     Texture& rawReflection,
     Texture& trackingDistance,
+    Texture& rawGI,
+    Texture& giHitDistance,
     UploadBuffer& uploadBuffer,
     const Matrix4& inverseViewProjection,
     const Matrix4& view,
@@ -89,11 +92,14 @@ void NrdReflectionPreparePass::Execute(
     gBuffer.GetMotion().Transition(commandList, gBufferReadState);
     rawReflection.Transition(commandList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     trackingDistance.Transition(commandList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    rawGI.Transition(commandList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    giHitDistance.Transition(commandList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
     m_viewZTexture.Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     m_motionTexture.Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     m_normalRoughnessTexture.Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     m_specRadianceHitDistTexture.Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    m_diffRadianceHitDistTexture.Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
     NrdReflectionPrepareConstants constants{};
 
@@ -121,6 +127,9 @@ void NrdReflectionPreparePass::Execute(
     constants.normalRoughnessOutputIndex = m_normalRoughnessTexture.GetUAVIndex();
     
     constants.specRadianceHitDistOutputIndex = m_specRadianceHitDistTexture.GetUAVIndex();
+    constants.rawGIIndex = rawGI.GetDescriptorIndex();
+    constants.giHitDistanceIndex = giHitDistance.GetDescriptorIndex();
+    constants.diffRadianceHitDistOutputIndex = m_diffRadianceHitDistTexture.GetUAVIndex();
 
     const D3D12_GPU_VIRTUAL_ADDRESS constantsAddress = uploadBuffer.Allocate(&constants, sizeof(constants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
 
@@ -146,6 +155,7 @@ void NrdReflectionPreparePass::Execute(
     m_motionTexture.Transition(commandList, nrdInputState);
     m_normalRoughnessTexture.Transition(commandList, nrdInputState);
     m_specRadianceHitDistTexture.Transition(commandList, nrdInputState);
+    m_diffRadianceHitDistTexture.Transition(commandList, nrdInputState);
 }
 
 void NrdReflectionPreparePass::Shutdown()
@@ -154,6 +164,7 @@ void NrdReflectionPreparePass::Shutdown()
     m_motionTexture.Shutdown();
     m_normalRoughnessTexture.Shutdown();
     m_specRadianceHitDistTexture.Shutdown();
+    m_diffRadianceHitDistTexture.Shutdown();
     m_pipeline.Shutdown();
 }
 
@@ -261,6 +272,30 @@ bool NrdReflectionPreparePass::CreateTextures(
         return false;
     }
 
+    if(!m_diffRadianceHitDistTexture.Initialize(device, width, height, 1, 1,
+        DXGI_FORMAT_R16G16B16A16_FLOAT,
+        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
+    {
+        Log::Error("Failed to create NRD diffuse radiance/hit-distance texture.");
+        Shutdown();
+        return false;
+    }
+
+    if(!m_diffRadianceHitDistTexture.CreateSRV(device, descriptorHeap))
+    {
+        Log::Error("Failed to create NRD diffuse radiance/hit-distance SRV.");
+        Shutdown();
+        return false;
+    }
+
+    if(!m_diffRadianceHitDistTexture.CreateUAV(device, descriptorHeap))
+    {
+        Log::Error("Failed to create NRD diffuse radiance/hit-distance UAV.");
+        Shutdown();
+        return false;
+    }
+
     m_viewZTexture.GetResource()->SetName(
         L"NRD Prepare ViewZ");
 
@@ -272,6 +307,9 @@ bool NrdReflectionPreparePass::CreateTextures(
 
     m_specRadianceHitDistTexture.GetResource()->SetName(
         L"NRD Prepare SpecRadianceHitDist");
+
+    m_diffRadianceHitDistTexture.GetResource()->SetName(
+        L"NRD Prepare DiffRadianceHitDist");
 
     return true;
 }
@@ -314,4 +352,14 @@ Texture& NrdReflectionPreparePass::GetSpecRadianceHitDistTexture()
 const Texture& NrdReflectionPreparePass::GetSpecRadianceHitDistTexture() const
 {
     return m_specRadianceHitDistTexture;
+}
+
+Texture& NrdReflectionPreparePass::GetDiffRadianceHitDistTexture()
+{
+    return m_diffRadianceHitDistTexture;
+}
+
+const Texture& NrdReflectionPreparePass::GetDiffRadianceHitDistTexture() const
+{
+    return m_diffRadianceHitDistTexture;
 }

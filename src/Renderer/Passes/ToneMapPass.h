@@ -16,7 +16,7 @@ enum class ToneMapDebugView : unsigned int
     None, SpecularTrackingDistance, NrdViewZ, NrdNormal,
     NrdRoughness, NrdMotion, NrdSpecularRadiance, NrdHitDistance,
     NrdResolvedReflection, GBufferMotion, SelectionMask,
-    GIRaw, GIHitDistance
+    GIRaw, GIHitDistance, GIDenoised
 };
 
 class ToneMapPass

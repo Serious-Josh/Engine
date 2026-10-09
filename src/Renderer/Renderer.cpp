@@ -162,6 +162,12 @@ bool Renderer::Initialize(void* windowHandle, unsigned int width, unsigned int h
         return false;
     }
 
+    if(!m_nrdDiffuseResolvePass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap, m_width, m_height))
+    {
+        Log::Error("Failed to initialize NRD diffuse resolve pass.");
+        return false;
+    }
+
     if(!m_nrdReflectionDenoiser.Initialize(device, m_commandContext.GetCommandQueue(), m_resourceDescriptorHeap, m_width, m_height, 2)){
         Log::Error("Failed to init NRD reflection denoiser.");
         return false;
@@ -357,6 +363,12 @@ bool Renderer::Resize(unsigned int width, unsigned int height)
     if(!m_nrdReflectionResolvePass.Resize(m_graphicsDevice, m_resourceDescriptorHeap, width, height))
     {
         Log::Error("Failed to resize NRD reflection resolve pass.");
+        return false;
+    }
+
+    if(!m_nrdDiffuseResolvePass.Resize(m_graphicsDevice, m_resourceDescriptorHeap, width, height))
+    {
+        Log::Error("Failed to resize NRD diffuse resolve pass.");
         return false;
     }
 
@@ -1029,9 +1041,11 @@ bool Renderer::Render(const Scene& scene, const RendererOptions& options)
         case ToneMapDebugView::NrdSpecularRadiance:
         case ToneMapDebugView::NrdHitDistance:
         case ToneMapDebugView::NrdResolvedReflection:
+        case ToneMapDebugView::GIDenoised:
             runNrd = true; break;
         default: break;
     }
+    runNrd = runNrd || options.enableRTGI;
     const bool runNative = reflectionMode == ReflectionDenoiserMode::Native;
     const bool resetNrdHistory = !m_hasPreviousNrdCamera || !m_nrdExecutedLastFrame ||
         limiterEnabled != m_previousContributionLimiterEnabled;
@@ -1075,6 +1089,8 @@ bool Renderer::Render(const Scene& scene, const RendererOptions& options)
             m_gBuffer,
             *nrdInput,
             m_rayTracedReflectionPass.GetSpecularTrackingDistanceTexture(),
+            m_rayTracedGIPass.GetRawGITexture(),
+            m_rayTracedGIPass.GetHitDistanceTexture(),
             m_uploadBuffer,
             reconstructionConstants.inverseViewProjection,
             currentView,
@@ -1092,7 +1108,8 @@ bool Renderer::Render(const Scene& scene, const RendererOptions& options)
             m_nrdReflectionPreparePass.GetMotionTexture(),
             m_nrdReflectionPreparePass.GetNormalRoughnessTexture(),
             m_nrdReflectionPreparePass.GetViewZTexture(),
-            m_nrdReflectionPreparePass.GetSpecRadianceHitDistTexture());
+            m_nrdReflectionPreparePass.GetSpecRadianceHitDistTexture(),
+            m_nrdReflectionPreparePass.GetDiffRadianceHitDistTexture());
 
         m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::NrdReblur);
 
@@ -1114,6 +1131,15 @@ bool Renderer::Render(const Scene& scene, const RendererOptions& options)
             m_height);
 
         m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::NrdResolve);
+
+        m_nrdDiffuseResolvePass.Execute(
+            commandList,
+            m_nrdReflectionDenoiser.GetDiffuseOutputTexture(),
+            m_nrdReflectionPreparePass.GetViewZTexture(),
+            m_uploadBuffer,
+            m_width,
+            m_height,
+            nrdDenoisingRange);
     }
 
     if(runNative)
@@ -1166,7 +1192,7 @@ bool Renderer::Render(const Scene& scene, const RendererOptions& options)
         m_environment.GetGGXMultiscatterIrradiance(),
         m_shadowDenoisePass.GetFilteredVisibilityTexture(),
         finalReflection,
-        m_rayTracedGIPass.GetRawGITexture(),
+        m_nrdDiffuseResolvePass.GetOutputTexture(),
         options.enableRTGI,
         m_sceneColor,
         reconstructionConstantsAddress,
@@ -1201,6 +1227,8 @@ bool Renderer::Render(const Scene& scene, const RendererOptions& options)
             debugTexture = &m_rayTracedGIPass.GetRawGITexture(); break;
         case ToneMapDebugView::GIHitDistance:
             debugTexture = &m_rayTracedGIPass.GetHitDistanceTexture(); break;
+        case ToneMapDebugView::GIDenoised:
+            debugTexture = &m_nrdDiffuseResolvePass.GetOutputTexture(); break;
         default: break;
     }
 
@@ -1306,6 +1334,7 @@ void Renderer::Shutdown()
     m_nrdReflectionPreparePass.Shutdown();
     m_nrdReflectionDenoiser.Shutdown();
     m_nrdReflectionResolvePass.Shutdown();
+    m_nrdDiffuseResolvePass.Shutdown();
     m_shadowDenoisePass.Shutdown();
     m_selectionMaskPass.Shutdown();
 

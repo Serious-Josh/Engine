@@ -50,10 +50,14 @@ class NrdReflectionDenoiser
             Texture& motion,
             Texture& normalRoughness,
             Texture& viewZ,
-            Texture& specRadianceHitDist);
+            Texture& specRadianceHitDist,
+            Texture& diffRadianceHitDist);
 
         Texture& GetOutputTexture();
         const Texture& GetOutputTexture() const;
+
+        Texture& GetDiffuseOutputTexture();
+        const Texture& GetDiffuseOutputTexture() const;
 
         void NewFrame();
 
@@ -68,6 +72,7 @@ class NrdReflectionDenoiser
             uint32_t height);
 
         Texture m_outputTexture;
+        Texture m_diffuseOutputTexture;
 
         nrd::Integration m_Integration;
 

@@ -8,6 +8,9 @@
 #define GI_MODE_SECONDARY_ENVIRONMENT_ONLY 3
 #define GI_MODE_WHITE_DIFFUSE_SECONDARY 4
 #define GI_MODE_BASELINE_CORRECTION 5
+#define GI_MODE_PRIMARY_BASELINE_ONLY 6
+#define GI_MODE_SIGNED_CORRECTION_DEBUG 7
+#define GI_MODE_PRECLAMP_NEGATIVE_DEBUG 8
 #define GI_MODE_PRODUCTION GI_MODE_BASELINE_CORRECTION
 #ifndef GI_DIAGNOSTIC_MODE
 #define GI_DIAGNOSTIC_MODE GI_MODE_PRODUCTION
@@ -245,7 +248,8 @@ float3 ShadeGISecondarySurface(GIPayload surface, float3 secondaryPosition)
 
     TextureCube<float4> diffuseIrradiance = ResourceDescriptorHeap[diffuseIrradianceIndex];
     float3 environmentIrradiance = diffuseIrradiance.SampleLevel(materialSampler, normal, 0.0f).rgb;
-    float3 environmentRadiance = (diffuseColor / PI) * environmentIrradiance;
+    // RTGI.4C-1A diagnostic: isolate secondary environment fill.
+    float3 environmentRadiance = 0.0f;
     if(!all(isfinite(environmentRadiance)))
         environmentRadiance = 0.0f;
 
@@ -454,7 +458,10 @@ void GIRayGeneration()
     TraceRay(scene, RAY_FLAG_NONE, 0xFF, 0, 1, 0, ray, payload);
 
     hitDistanceTexture[pixel] = payload.hitDistance;
-#if GI_DIAGNOSTIC_MODE == GI_MODE_BASELINE_CORRECTION
+#if GI_DIAGNOSTIC_MODE == GI_MODE_BASELINE_CORRECTION || \
+    GI_DIAGNOSTIC_MODE == GI_MODE_PRIMARY_BASELINE_ONLY || \
+    GI_DIAGNOSTIC_MODE == GI_MODE_SIGNED_CORRECTION_DEBUG || \
+    GI_DIAGNOSTIC_MODE == GI_MODE_PRECLAMP_NEGATIVE_DEBUG
     TextureCube<float4> diffuseIrradiance = ResourceDescriptorHeap[diffuseIrradianceIndex];
     float3 baselineIrradiance = diffuseIrradiance.SampleLevel(materialSampler, normal, 0.0f).rgb;
     float3 environmentRadiance = SampleGIEnvironment(ray.Direction);
@@ -467,8 +474,35 @@ void GIRayGeneration()
     else if(payload.hitDistance == -1.0f)
         tracedRadiance = environmentRadiance; // Identical finite values give exactly zero correction.
 
+#if GI_DIAGNOSTIC_MODE == GI_MODE_PRIMARY_BASELINE_ONLY
+    float3 irradiance = baselineIrradiance;
+#elif GI_DIAGNOSTIC_MODE == GI_MODE_SIGNED_CORRECTION_DEBUG
+    float3 correction = PI * (tracedRadiance - environmentRadiance);
+    const float correctionDisplayScale = 1.0f;
+    // Neutral gray also marks nonfinite corrections; invalid primary pixels remain black.
+    float3 encodedCorrection = float3(0.5f, 0.5f, 0.5f);
+    if(all(isfinite(correction)))
+        encodedCorrection = 0.5f + 0.5f *
+            (correction / (correctionDisplayScale + abs(correction)));
+    // Display encoding only: inspect in GI Raw, not as irradiance or through NRD.
+    giTexture[pixel] = float4(encodedCorrection, 1.0f);
+    return;
+#else
     // Keep the correction signed until it has been added to the irradiance baseline.
     float3 irradiance = baselineIrradiance + PI * (tracedRadiance - environmentRadiance);
+#if GI_DIAGNOSTIC_MODE == GI_MODE_PRECLAMP_NEGATIVE_DEBUG
+    float3 visualization = float3(1.0f, 0.0f, 1.0f); // Nonfinite estimate.
+    if(all(isfinite(irradiance)))
+    {
+        const float negativeDisplayScale = 1.0f;
+        float3 negativeMagnitude = max(-irradiance, 0.0f);
+        visualization = negativeMagnitude / (negativeDisplayScale + negativeMagnitude);
+    }
+    // Display encoding only: inspect in GI Raw. Invalid primary pixels remain black.
+    giTexture[pixel] = float4(visualization, 1.0f);
+    return;
+#endif
+#endif
 #else
     float3 incomingRadiance;
 #if GI_DIAGNOSTIC_MODE == GI_MODE_ENVIRONMENT_REFERENCE_4096
@@ -506,8 +540,11 @@ void GIRayGeneration()
     // cos(theta) / PDF = PI; reference samples are averaged before this conversion.
     float3 irradiance = incomingRadiance * PI;
 #endif
+#if GI_DIAGNOSTIC_MODE != GI_MODE_SIGNED_CORRECTION_DEBUG && \
+    GI_DIAGNOSTIC_MODE != GI_MODE_PRECLAMP_NEGATIVE_DEBUG
     if(all(isfinite(irradiance)))
         giTexture[pixel] = float4(clamp(irradiance, 0.0f, 65504.0f), 1.0f);
+#endif
 }
 
 [shader("miss")]

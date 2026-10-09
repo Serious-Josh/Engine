@@ -38,6 +38,7 @@
 #include "Passes/NrdReflectionResolvePass.h"
 #include "Passes/SelectionMaskPass.h"
 #include "Passes/RayTracedGIPass.h"
+#include "Passes/NrdDiffuseResolvePass.h"
 
 #include <d3d12.h>
 #include <filesystem>
@@ -137,6 +138,7 @@ class Renderer
         NrdReflectionDenoiser m_nrdReflectionDenoiser;
         NrdReflectionPreparePass m_nrdReflectionPreparePass;
         NrdReflectionResolvePass m_nrdReflectionResolvePass;
+        NrdDiffuseResolvePass m_nrdDiffuseResolvePass;
         ShadowDenoisePass m_shadowDenoisePass;
         SelectionMaskPass m_selectionMaskPass;
 
