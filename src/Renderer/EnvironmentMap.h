@@ -21,6 +21,7 @@ class EnvironmentMap
         const Texture& GetCubemap() const;
         Texture& GetDiffuseIrradiance();
         const Texture& GetDiffuseIrradiance() const;
+        unsigned int GetDiffuseIrradianceArrayIndex() const { return m_diffuseIrradianceArrayIndex; }
         Texture& GetGGXMultiscatterIrradiance();
         const Texture& GetGGXMultiscatterIrradiance() const;
         StructuredBuffer& GetImportanceConditionalCDF();
@@ -37,6 +38,8 @@ class EnvironmentMap
         Texture m_sourceTexture;
         Texture m_cubemap;
         Texture m_diffuseIrradiance;
+        DescriptorHeap* m_diffuseIrradianceArrayHeap = nullptr;
+        unsigned int m_diffuseIrradianceArrayIndex = UINT_MAX;
         Texture m_ggxMultiscatterIrradiance;
 
         StructuredBuffer m_importanceConditionalCDF;

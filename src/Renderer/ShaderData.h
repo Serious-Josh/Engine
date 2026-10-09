@@ -7,7 +7,7 @@ struct MaterialConstants
     unsigned int textureIndex;
     float roughness;
     unsigned int materialIndex;
-    float padding;
+    unsigned int normalTextureIndex;
 
     float baseColor[3];
     float padding2;
@@ -56,7 +56,8 @@ struct ShadowConstants
     unsigned int outputHistoryLengthIndex;
 
     unsigned int accumulatedFrameCount;
-    float padding[3];
+    unsigned int geometricNormalIndex;
+    float padding[2];
 };
 
 struct ReflectionConstants
@@ -85,6 +86,9 @@ struct ReflectionConstants
     unsigned int importanceWidth;
     unsigned int importanceHeight;
     float importanceTotalWeight;
+
+    unsigned int geometricNormalIndex;
+    unsigned int padding[3];
 };
 
 struct GIConstants
@@ -99,7 +103,10 @@ struct GIConstants
     unsigned int materialBufferIndex = 0;
     unsigned int environmentIndex = 0;
     unsigned int diffuseIrradianceIndex = 0;
-    unsigned int padding1 = 0;
+    unsigned int diffuseIrradianceArrayIndex = 0;
+
+    unsigned int geometricNormalIndex = 0;
+    unsigned int padding[3] = {};
 };
 
 struct AOConstants
@@ -143,7 +150,7 @@ struct GPUMaterial
     float padding1;
 
     float averageConductorFresnel[3];
-    float padding2;
+    unsigned int normalTextureIndex;
 };
 
 struct RayTracingInstanceData
@@ -156,7 +163,7 @@ struct RayTracingInstanceData
     unsigned int normalOffset;
     unsigned int uvOffset;
     unsigned int indexed;
-    unsigned int padding;
+    unsigned int tangentOffset;
 };
 
 static_assert(sizeof(MaterialConstants) == 32);
@@ -166,7 +173,7 @@ static_assert(sizeof(ObjectConstants) == 192);
 static_assert(sizeof(ReconstructionConstants) == 80);
 static_assert(sizeof(GPUMaterial) == 80);
 static_assert(sizeof(ShadowConstants) == 256);
-static_assert(sizeof(ReflectionConstants) == 144);
+static_assert(sizeof(ReflectionConstants) == 160);
 static_assert(sizeof(RayTracingInstanceData) == 32);
-static_assert(sizeof(GIConstants) == 96);
+static_assert(sizeof(GIConstants) == 112);
 static_assert(sizeof(AOConstants) == 96);

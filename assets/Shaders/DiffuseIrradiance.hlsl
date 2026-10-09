@@ -1,4 +1,5 @@
 #include "Common.hlsli"
+#include "DiffuseHDRIConfig.hlsli"
 
 struct VSOutput
 {
@@ -332,13 +333,7 @@ float4 PSMain(
         float pdf =
             NdotL / PI;
 
-        float sourceMip =
-            CalculateSourceMip(
-                sourceTexture,
-                sampleDirection,
-                pdf,
-                SAMPLE_COUNT
-            );
+        float sourceMip = float(DIFFUSE_HDRI_SOURCE_MIP);
 
         float2 environmentUV =
             DirectionToEquirectangularUV(

@@ -31,7 +31,8 @@ class DeferredLightingPass
             bool enableRTGI,
             RenderTarget& sceneColor,
             D3D12_GPU_VIRTUAL_ADDRESS reconstructionConstantsAddress,
-            D3D12_GPU_VIRTUAL_ADDRESS lightConstantsAddress
+            D3D12_GPU_VIRTUAL_ADDRESS lightConstantsAddress,
+            unsigned int debugView = 0
         );
 
         void Shutdown();

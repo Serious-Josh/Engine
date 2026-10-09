@@ -38,7 +38,7 @@ bool ToneMapPass::Initialize(ID3D12Device* device, ShaderLibrary& shaderLibrary)
     pipelineDescription.renderTargets.count = 1;
     pipelineDescription.renderTargets.formats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
 
-    pipelineDescription.rootParameters.push_back({RootParameterType::Constants, 0, 10, D3D12_SHADER_VISIBILITY_PIXEL});
+    pipelineDescription.rootParameters.push_back({RootParameterType::Constants, 0, 11, D3D12_SHADER_VISIBILITY_PIXEL});
 
     if(!m_pipeline.Initialize(device, pipelineDescription)){
         Log::Error("Failed to initialize tone map pipeline.");
@@ -58,7 +58,8 @@ void ToneMapPass::Execute(
     RenderTarget* debugRenderTarget,
     RenderTarget* selectionMask,
     const Vector3& outlineColor,
-    unsigned int outlineThickness )
+    unsigned int outlineThickness,
+    unsigned int debugDepthIndex )
 {
     sceneColor.Transition(
         commandList,
@@ -96,14 +97,27 @@ void ToneMapPass::Execute(
 
         unsigned int selectionMaskIndex;
         unsigned int outlineThickness;
+        unsigned int debugDepthIndex;
         float outlineColor[3];
     };
 
     ToneMapConstants constants{};
     constants.sceneColorIndex = sceneColor.GetSRVIndex();
     constants.exposure = 1.0f;
+    constants.debugDepthIndex = debugDepthIndex;
     constants.debugTextureIndex = debugRenderTarget ? debugRenderTarget->GetSRVIndex() : (debugTexture ? debugTexture->GetDescriptorIndex() : 0);
-    constants.debugView = (debugTexture || debugRenderTarget) ? static_cast<unsigned int>(debugView) : 0;
+    const bool lightingDebug = debugView == ToneMapDebugView::EnvironmentSpecularOnly ||
+        debugView == ToneMapDebugView::DirectLightingOnly || debugView == ToneMapDebugView::HDRIDiffuseAmbientOnly ||
+        debugView == ToneMapDebugView::HDRIDiffuseAmbientWithoutAO ||
+        debugView == ToneMapDebugView::HDRIDiffuseAmbientDirectIntegral ||
+        debugView == ToneMapDebugView::IrradianceCubemapMinusDirectIntegral ||
+        debugView == ToneMapDebugView::HDRIIrradianceTangentFrameDifference ||
+        debugView == ToneMapDebugView::HDRIDiffuseAmbientMultiOrientation ||
+        debugView == ToneMapDebugView::MultiOrientationMinusSingleOrientation ||
+        debugView == ToneMapDebugView::HDRIDirectIntegralMip0 ||
+        debugView == ToneMapDebugView::HDRIDirectIntegralMip4 ||
+        debugView == ToneMapDebugView::HDRIDirectIntegralMip6;
+    constants.debugView = (debugTexture || debugRenderTarget || lightingDebug) ? static_cast<unsigned int>(debugView) : 0;
     constants.nrdDenoisingRange = nrdDenoisingRange;
     constants.selectionMaskIndex = selectionMask ? selectionMask->GetSRVIndex() : 0;
     constants.outlineThickness = selectionMask ? outlineThickness : 0;
@@ -113,7 +127,7 @@ void ToneMapPass::Execute(
 
     commandList->SetGraphicsRoot32BitConstants(
         0,
-        10,
+        11,
         &constants,
         0
     );

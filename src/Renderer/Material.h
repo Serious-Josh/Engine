@@ -20,6 +20,7 @@ struct Material
 {
     Pipeline* pipeline = nullptr;
     Texture* texture = nullptr;
+    Texture* normalTexture = nullptr;
 
     MaterialModel model = MaterialModel::Dielectric;
 
@@ -156,6 +157,7 @@ struct Material
         data.baseColor[2] = baseColor[2];
 
         data.textureIndex = texture ? texture->GetDescriptorIndex() : UINT_MAX;
+        data.normalTextureIndex = normalTexture ? normalTexture->GetDescriptorIndex() : UINT_MAX;
 
         data.conductorN[0] = conductorN[0];
         data.conductorN[1] = conductorN[1];

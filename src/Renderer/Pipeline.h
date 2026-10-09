@@ -43,6 +43,7 @@ struct PipelineDescription
 
     PipelineRenderTargets renderTargets{};
     StaticSamplerDescription sampler{};
+    std::vector<D3D12_STATIC_SAMPLER_DESC> additionalSamplers;
 
     std::vector<RootParameterDescription> rootParameters;
 

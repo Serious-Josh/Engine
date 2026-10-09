@@ -81,6 +81,7 @@ bool RayTracingSceneResources::Initialize(ID3D12Device5* device, ID3D12GraphicsC
 
         unsigned int normalOffset = UINT_MAX;
         unsigned int uvOffset = UINT_MAX;
+        unsigned int tangentOffset = UINT_MAX;
 
         for(const VertexAttribute& attribute : renderObject.mesh->GetVertexLayout().GetAttributes()){
             if(std::strcmp(attribute.semantic, "NORMAL") == 0 && attribute.semanticIndex == 0 && attribute.type == VertexAttributeType::Float3){
@@ -89,6 +90,11 @@ bool RayTracingSceneResources::Initialize(ID3D12Device5* device, ID3D12GraphicsC
 
             if(std::strcmp(attribute.semantic, "TEXCOORD") == 0 && attribute.semanticIndex == 0 && attribute.type == VertexAttributeType::Float2){
                 uvOffset = attribute.offset;
+            }
+
+            if (std::strcmp(attribute.semantic, "TANGENT") == 0 && attribute.semanticIndex == 0 && attribute.type == VertexAttributeType::Float4)
+            {
+                tangentOffset = attribute.offset;
             }
         }
 
@@ -103,6 +109,7 @@ bool RayTracingSceneResources::Initialize(ID3D12Device5* device, ID3D12GraphicsC
         gpuInstance.vertexStride = renderObject.mesh->GetVertexStride();
         gpuInstance.normalOffset = normalOffset;
         gpuInstance.uvOffset = uvOffset;
+        gpuInstance.tangentOffset = tangentOffset;
         gpuInstance.indexed = renderObject.mesh->IsIndexed() ? 1u : 0u;
 
         instanceData[i] = gpuInstance;

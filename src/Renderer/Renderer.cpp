@@ -23,6 +23,7 @@
 #include <iterator>
 #include <utility>
 #include <cstdlib>
+#include <climits>
 
 
 // --------------
@@ -468,6 +469,7 @@ void Renderer::Draw(ID3D12GraphicsCommandList* commandList, const RenderObject& 
     materialConstants.textureIndex = object.material->texture->GetDescriptorIndex();
     materialConstants.roughness = object.material->roughness;
     materialConstants.materialIndex = object.material->gpuIndex;
+    materialConstants.normalTextureIndex = object.material->normalTexture ? object.material->normalTexture->GetDescriptorIndex() : UINT_MAX;;
     materialConstants.baseColor[0] = object.material->baseColor[0];
     materialConstants.baseColor[1] = object.material->baseColor[1];
     materialConstants.baseColor[2] = object.material->baseColor[2];
@@ -483,6 +485,14 @@ void Renderer::Draw(ID3D12GraphicsCommandList* commandList, const RenderObject& 
         commandList,
         D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+    if(object.material->normalTexture)
+    {
+        object.material->normalTexture->Transition(
+            commandList,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    }
 
     if(object.mesh->IsIndexed()){
         const uint64_t indexCount = static_cast<uint64_t>(object.mesh->GetIndexCount());
@@ -544,11 +554,13 @@ void Renderer::BeginGeometryPass(ID3D12GraphicsCommandList* commandList)
     RenderTarget& albedo = m_gBuffer.GetMaterial();
     RenderTarget& normal = m_gBuffer.GetSurface();
     RenderTarget& motion = m_gBuffer.GetMotion();
+    RenderTarget& geometricNormal = m_gBuffer.GetGeometricNormal();
     DepthBuffer& depth = m_gBuffer.GetDepth();
 
     albedo.Transition(commandList, D3D12_RESOURCE_STATE_RENDER_TARGET);
     normal.Transition(commandList, D3D12_RESOURCE_STATE_RENDER_TARGET);
     motion.Transition(commandList, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    geometricNormal.Transition(commandList, D3D12_RESOURCE_STATE_RENDER_TARGET);
     depth.Transition(commandList, D3D12_RESOURCE_STATE_DEPTH_WRITE);
 
     const float albedoClearColor[] =
@@ -566,16 +578,20 @@ void Renderer::BeginGeometryPass(ID3D12GraphicsCommandList* commandList)
         0.0f, 0.0f, 0.0f, 0.0f
     };
 
-    D3D12_CPU_DESCRIPTOR_HANDLE renderTargets[] = {albedo.GetRTV(), normal.GetRTV(), motion.GetRTV()};
+    const float geometricNormalClearColor[] = {0.0f, 1.0f, 0.0f, 0.0f};
+
+    D3D12_CPU_DESCRIPTOR_HANDLE renderTargets[] = {albedo.GetRTV(), normal.GetRTV(), motion.GetRTV(), geometricNormal.GetRTV()};
 
     commandList->ClearRenderTargetView(renderTargets[0], albedoClearColor, 0, nullptr);
     commandList->ClearRenderTargetView(renderTargets[1], normalClearColor, 0, nullptr);
     commandList->ClearRenderTargetView(renderTargets[2], motionClearColor, 0, nullptr);
+    commandList->ClearRenderTargetView(renderTargets[3], geometricNormalClearColor, 0, nullptr);
+
     commandList->ClearDepthStencilView(depth.GetDSV(), D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
 
     D3D12_CPU_DESCRIPTOR_HANDLE dsv = depth.GetDSV();
 
-    commandList->OMSetRenderTargets(3, renderTargets, FALSE, &dsv);
+    commandList->OMSetRenderTargets(4, renderTargets, FALSE, &dsv);
 }
 
 void Renderer::EndGeometryPass(ID3D12GraphicsCommandList* commandList)
@@ -584,6 +600,7 @@ void Renderer::EndGeometryPass(ID3D12GraphicsCommandList* commandList)
     m_gBuffer.GetMaterial().Transition(commandList, shaderReadState);
     m_gBuffer.GetSurface().Transition(commandList, shaderReadState);
     m_gBuffer.GetMotion().Transition(commandList, shaderReadState);
+    m_gBuffer.GetGeometricNormal().Transition(commandList, shaderReadState);
     m_gBuffer.GetDepth().Transition(commandList, shaderReadState);
 }
 
@@ -729,7 +746,8 @@ bool Renderer::Render(const Scene& scene, const RendererOptions& options)
     const bool runAO = !options.enableRTGI ||
         debugView == ToneMapDebugView::AORaw ||
         debugView == ToneMapDebugView::AOTemporal ||
-        debugView == ToneMapDebugView::AOFiltered;
+        debugView == ToneMapDebugView::AOFiltered ||
+        debugView == ToneMapDebugView::HDRIDiffuseAmbientOnly;
 
     if(!m_commandContext.Begin(frameIndex)){
         Log::Error("failed to begin command recording.");
@@ -874,6 +892,7 @@ bool Renderer::Render(const Scene& scene, const RendererOptions& options)
     shadowConstants.lightDirection[2] = lightDirection.z;
     shadowConstants.depthIndex = m_gBuffer.GetDepth().GetSRVIndex();
     shadowConstants.surfaceIndex = m_gBuffer.GetSurface().GetSRVIndex();
+    shadowConstants.geometricNormalIndex = m_gBuffer.GetGeometricNormal().GetSRVIndex();
     shadowConstants.lightAngularRadius = light.angularRadius;
     shadowConstants.frameIndex = m_shadowSampleIndex++;
     shadowConstants.historyIndex = m_rayTracedShadowPass.GetVisibilityTexture().GetDescriptorIndex();
@@ -891,6 +910,7 @@ bool Renderer::Render(const Scene& scene, const RendererOptions& options)
     reflectionConstants.cameraPosition[2] = cameraPosition.z;
     reflectionConstants.depthIndex = m_gBuffer.GetDepth().GetSRVIndex();
     reflectionConstants.surfaceIndex = m_gBuffer.GetSurface().GetSRVIndex();
+    reflectionConstants.geometricNormalIndex = m_gBuffer.GetGeometricNormal().GetSRVIndex();
     reflectionConstants.instanceDataIndex = m_rayTracingScene.GetInstanceDataDescriptorIndex();
     reflectionConstants.materialBufferIndex = m_materialBuffer.GetDescriptorIndex();
     reflectionConstants.environmentIndex = m_environment.GetSourceTexture().GetDescriptorIndex();
@@ -929,11 +949,13 @@ bool Renderer::Render(const Scene& scene, const RendererOptions& options)
     giConstants.inverseViewProjection = reconstructionConstants.inverseViewProjection;
     giConstants.depthIndex = m_gBuffer.GetDepth().GetSRVIndex();
     giConstants.surfaceIndex = m_gBuffer.GetSurface().GetSRVIndex();
+    giConstants.geometricNormalIndex = m_gBuffer.GetGeometricNormal().GetSRVIndex();
     giConstants.frameIndex = reflectionConstants.frameIndex;
     giConstants.instanceDataIndex = reflectionConstants.instanceDataIndex;
     giConstants.materialBufferIndex = reflectionConstants.materialBufferIndex;
     giConstants.environmentIndex = reflectionConstants.environmentIndex;
     giConstants.diffuseIrradianceIndex = m_environment.GetDiffuseIrradiance().GetDescriptorIndex();
+    giConstants.diffuseIrradianceArrayIndex = m_environment.GetDiffuseIrradianceArrayIndex();
 
     const D3D12_GPU_VIRTUAL_ADDRESS giConstantsAddress = m_uploadBuffer.Allocate( &giConstants, sizeof(GIConstants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
 
@@ -1311,7 +1333,8 @@ bool Renderer::Render(const Scene& scene, const RendererOptions& options)
         options.enableRTGI,
         m_sceneColor,
         reconstructionConstantsAddress,
-        lightConstantsAddress
+        lightConstantsAddress,
+        static_cast<unsigned int>(debugView)
     );
 
     m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::DeferredLighting);
@@ -1320,6 +1343,10 @@ bool Renderer::Render(const Scene& scene, const RendererOptions& options)
     RenderTarget* debugRenderTarget = nullptr;
     switch(debugView)
     {
+        case ToneMapDebugView::GBufferWorldNormal:
+            debugRenderTarget = &m_gBuffer.GetSurface(); break;
+        case ToneMapDebugView::GBufferAlbedo:
+            debugRenderTarget = &m_gBuffer.GetMaterial(); break;
         case ToneMapDebugView::GBufferMotion:
             debugRenderTarget = &m_gBuffer.GetMotion(); break;
         case ToneMapDebugView::SpecularTrackingDistance:
@@ -1365,7 +1392,8 @@ bool Renderer::Render(const Scene& scene, const RendererOptions& options)
         debugRenderTarget,
         &m_selectionMask,
         options.selectionOutlineColor,
-        debugView == ToneMapDebugView::None ? options.selectionOutlineThickness : 0
+        debugView == ToneMapDebugView::None ? options.selectionOutlineThickness : 0,
+        m_gBuffer.GetDepth().GetSRVIndex()
     );
 
     m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::ToneMap);

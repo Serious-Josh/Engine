@@ -58,12 +58,14 @@ bool Pipeline::Initialize(ID3D12Device* device, const PipelineDescription& descr
     sampler.RegisterSpace = 0;
     sampler.ShaderVisibility = description.sampler.visibility;
 
+    std::vector<D3D12_STATIC_SAMPLER_DESC> samplers{sampler};
+    samplers.insert(samplers.end(), description.additionalSamplers.begin(), description.additionalSamplers.end());
     D3D12_ROOT_SIGNATURE_DESC rootSignatureDescription{};
 
     rootSignatureDescription.NumParameters = static_cast<UINT>(rootParameters.size());
     rootSignatureDescription.pParameters = rootParameters.empty() ? nullptr : rootParameters.data();
-    rootSignatureDescription.NumStaticSamplers = 1;
-    rootSignatureDescription.pStaticSamplers = &sampler;
+    rootSignatureDescription.NumStaticSamplers = static_cast<UINT>(samplers.size());
+    rootSignatureDescription.pStaticSamplers = samplers.data();
     rootSignatureDescription.Flags =
         D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT |
         D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED;

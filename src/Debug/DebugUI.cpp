@@ -277,13 +277,65 @@ void DebugUI::DrawPerformanceWindow(const std::vector<std::string>& environmentN
         "GI Denoised",
         "AO Raw",
         "AO Temporal",
-        "AO Filtered"
+        "AO Filtered",
+        "GBuffer World Normal",
+        "GBuffer Albedo",
+        "Environment Specular Only",
+        "Direct Lighting Only",
+        "HDRI Diffuse Ambient Only",
+        "HDRI Diffuse Ambient Without AO",
+        "HDRI Diffuse Ambient Direct Integral",
+        "Irradiance Cubemap Minus Direct Integral",
+        "HDRI Irradiance Tangent Frame Difference",
+        "HDRI Diffuse Ambient Multi-Orientation",
+        "Multi-Orientation Minus Single-Orientation",
+        "HDRI Direct Integral Mip 0",
+        "HDRI Direct Integral Mip 4",
+        "HDRI Direct Integral Mip 6"
     };
     const char* denoisers[] = {"NRD", "Native"};
     ImGui::Combo("Reflection denoiser", &m_reflectionDenoiserMode, denoisers, IM_ARRAYSIZE(denoisers));
     ImGui::Checkbox("NRD contribution limiter", &m_contributionLimiterEnabled);
     ImGui::Checkbox("Enable RTGI", &m_rtgiEnabled);
     ImGui::Combo("Diagnostic view", &m_toneMapDebugView, views, IM_ARRAYSIZE(views));
+    if(GetToneMapDebugView() == ToneMapDebugView::HDRIDirectIntegralMip0 ||
+       GetToneMapDebugView() == ToneMapDebugView::HDRIDirectIntegralMip4 ||
+       GetToneMapDebugView() == ToneMapDebugView::HDRIDirectIntegralMip6){
+        ImGui::TextUnformatted("4096-sample direct HDRI diffuse integral at selected source mip; no AO, standard display mapping.");
+    }
+    if(GetToneMapDebugView() == ToneMapDebugView::HDRIDiffuseAmbientMultiOrientation){
+        ImGui::TextUnformatted("Four 1024-sample HDRI integrals at 0/45/90/135 degrees, averaged; no AO, standard display mapping.");
+    }
+    else if(GetToneMapDebugView() == ToneMapDebugView::MultiOrientationMinusSingleOrientation){
+        ImGui::TextUnformatted("Multi 4x1024 minus single 4096 samples; residual scale 10, no tone mapping.");
+    }
+    if(GetToneMapDebugView() == ToneMapDebugView::HDRIIrradianceTangentFrameDifference){
+        ImGui::TextUnformatted("4096 samples per tangent frame: original minus 90-degree rotated; residual scale 10, no tone mapping.");
+    }
+    if(GetToneMapDebugView() == ToneMapDebugView::HDRIDiffuseAmbientDirectIntegral){
+        ImGui::TextUnformatted("4096-sample mip-0 HDRI diffuse integral at the raster normal, without AO; expensive.");
+    }
+    else if(GetToneMapDebugView() == ToneMapDebugView::IrradianceCubemapMinusDirectIntegral){
+        ImGui::TextUnformatted("Cube minus direct irradiance: gray zero, red positive, blue negative; scale 10, no tone mapping.");
+    }
+    if(GetToneMapDebugView() == ToneMapDebugView::EnvironmentSpecularOnly){
+        ImGui::TextUnformatted("Production environment specular before DXR blending; standard display mapping.");
+    }
+    else if(GetToneMapDebugView() == ToneMapDebugView::DirectLightingOnly){
+        ImGui::TextUnformatted("Production directional diffuse and specular, including shadows; standard display mapping.");
+    }
+    else if(GetToneMapDebugView() == ToneMapDebugView::HDRIDiffuseAmbientOnly){
+        ImGui::TextUnformatted("Production RTGI-off HDRI diffuse ambient including AO; standard display mapping.");
+    }
+    else if(GetToneMapDebugView() == ToneMapDebugView::HDRIDiffuseAmbientWithoutAO){
+        ImGui::TextUnformatted("Same HDRI diffuse ambient with AO visibility fixed to one; standard display mapping.");
+    }
+    if(GetToneMapDebugView() == ToneMapDebugView::GBufferWorldNormal){
+        ImGui::TextUnformatted("Raw raster world normal: XYZ mapped to RGB; black background, magenta invalid.");
+    }
+    else if(GetToneMapDebugView() == ToneMapDebugView::GBufferAlbedo){
+        ImGui::TextUnformatted("Raster linear albedo encoded to sRGB for display; no lighting or tone mapping.");
+    }
     ImGui::Separator();
     if(GetToneMapDebugView() == ToneMapDebugView::SpecularTrackingDistance){
         ImGui::TextUnformatted("Magenta: invalid | Blue: environment miss | Gray: geometry");

@@ -23,7 +23,8 @@ struct ShadowConstants
     uint outputHistoryLengthIndex;
 
     uint accumulatedFrameCount;
-    float3 padding;
+    uint geometricNormalIndex;
+    float2 padding;
 };
 
 RaytracingAccelerationStructure scene : register(t0);
@@ -259,9 +260,9 @@ void RayGeneration()
             shadowConstants.depthIndex
         ];
 
-    Texture2D<float4> surfaceTexture =
+    Texture2D<float4> geometricNormalTexture =
         ResourceDescriptorHeap[
-            shadowConstants.surfaceIndex
+            shadowConstants.geometricNormalIndex
         ];
 
     Texture2D<float> historyTexture =
@@ -339,9 +340,9 @@ void RayGeneration()
     worldPosition /=
         worldPosition.w;
 
-    float3 normal =
+    float3 geometricNormal =
         normalize(
-            surfaceTexture.Load(
+            geometricNormalTexture.Load(
                 int3(
                     pixelIndex,
                     0
@@ -371,7 +372,7 @@ void RayGeneration()
 
     ray.Origin =
         worldPosition.xyz +
-        normal * 0.001f;
+        geometricNormal * 0.001f;
 
     ray.Direction =
         sampledDirectionToLight;
@@ -535,7 +536,7 @@ void RayGeneration()
                     abs(
                         dot(
                             positionDifference,
-                            normal
+                            geometricNormal
                         )
                     );
 

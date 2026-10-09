@@ -30,7 +30,7 @@ struct RayTracingInstanceData
     uint normalOffset;
     uint uvOffset;
     uint indexed;
-    uint padding;
+    uint tangentOffset;
 };
 
 struct ReflectionConstants
@@ -59,6 +59,8 @@ struct ReflectionConstants
     uint importanceWidth;
     uint importanceHeight;
     float importanceTotalWeight;
+    uint geometricNormalIndex;
+    uint3 padding;
 };
 
 struct DirectionalLightConstants
@@ -1521,9 +1523,13 @@ void RayGeneration()
 
     RayDesc ray;
 
+    Texture2D<float4> geometricNormalTexture =
+        ResourceDescriptorHeap[reflectionConstants.geometricNormalIndex];
+    float3 geometricNormal = normalize(geometricNormalTexture.Load(int3(pixelIndex, 0)).rgb);
+
     ray.Origin =
         worldPosition.xyz +
-        normal * 0.001f;
+        geometricNormal * 0.001f;
 
     ray.Direction =
         reflectionDirection;

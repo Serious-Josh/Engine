@@ -52,8 +52,21 @@ bool DeferredLightingPass::Initialize(ID3D12Device* device, ShaderLibrary& shade
     pipelineDescription.sampler.addressW =
         D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
 
+    // Match the convolution's HDRI sampler without altering production sampler0.
+    D3D12_STATIC_SAMPLER_DESC referenceSampler{};
+    referenceSampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+    referenceSampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    referenceSampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    referenceSampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    referenceSampler.MaxAnisotropy = 1;
+    referenceSampler.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+    referenceSampler.MaxLOD = D3D12_FLOAT32_MAX;
+    referenceSampler.ShaderRegister = 1;
+    referenceSampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    pipelineDescription.additionalSamplers.push_back(referenceSampler);
+
     pipelineDescription.rootParameters.push_back(
-        {RootParameterType::Constants, 0, 15, D3D12_SHADER_VISIBILITY_PIXEL}
+        {RootParameterType::Constants, 0, 16, D3D12_SHADER_VISIBILITY_PIXEL}
     );
 
     pipelineDescription.rootParameters.push_back(
@@ -89,14 +102,15 @@ void DeferredLightingPass::Execute(
     bool enableRTGI,
     RenderTarget& sceneColor,
     D3D12_GPU_VIRTUAL_ADDRESS reconstructionConstantsAddress,
-    D3D12_GPU_VIRTUAL_ADDRESS lightConstantsAddress)
+    D3D12_GPU_VIRTUAL_ADDRESS lightConstantsAddress,
+    unsigned int debugView)
 {
     gBuffer.GetMaterial().Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     gBuffer.GetSurface().Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     gBuffer.GetDepth().Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     reflectionTexture.Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     giIrradiance.Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-    if(!enableRTGI)
+    if(!enableRTGI || debugView == 21u)
         aoVisibility.Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
     sceneColor.Transition(commandList, D3D12_RESOURCE_STATE_RENDER_TARGET);
@@ -143,12 +157,13 @@ void DeferredLightingPass::Execute(
         reflectionTexture.GetDescriptorIndex(),
         giIrradiance.GetDescriptorIndex(),
         enableRTGI ? 1u : 0u,
-        aoVisibility.GetDescriptorIndex()
+        aoVisibility.GetDescriptorIndex(),
+        debugView
     };
 
     commandList->SetGraphicsRoot32BitConstants(
         0,
-        15,
+        16,
         resourceIndices,
         0
     );

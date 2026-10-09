@@ -4,6 +4,8 @@
 #include "Renderer/DescriptorHeap.h"
 #include "Renderer/RenderObject.h"
 #include "Renderer/Vertex.h"
+#include "Renderer/ImageLoader.h"
+#include "Renderer/TangentGenerator.h"
 
 #include "Scene/Camera.h"
 #include "Scene/DirectionalLight.h"
@@ -40,13 +42,11 @@ bool CornellBoxScene::Initialize(
     pipelineDescription.pixelShader = pixelShader;
     pipelineDescription.vertexLayout = &m_vertexLayout;
 
-    pipelineDescription.renderTargets.count = 3;
-    pipelineDescription.renderTargets.formats[0] =
-        DXGI_FORMAT_R8G8B8A8_UNORM;
-    pipelineDescription.renderTargets.formats[1] =
-        DXGI_FORMAT_R16G16B16A16_FLOAT;
-    pipelineDescription.renderTargets.formats[2] =
-        DXGI_FORMAT_R16G16B16A16_FLOAT;
+    pipelineDescription.renderTargets.count = 4;
+    pipelineDescription.renderTargets.formats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    pipelineDescription.renderTargets.formats[1] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    pipelineDescription.renderTargets.formats[2] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    pipelineDescription.renderTargets.formats[3] = DXGI_FORMAT_R16G16B16A16_FLOAT;
 
     pipelineDescription.rootParameters.push_back(
         {
@@ -126,8 +126,7 @@ bool CornellBoxScene::Initialize(
     m_defaultMaterial.pipeline = &m_pipeline;
     m_defaultMaterial.texture = &m_whiteTexture;
 
-    m_defaultMaterial.model =
-        MaterialModel::Dielectric;
+    m_defaultMaterial.model = MaterialModel::Dielectric;
 
     m_defaultMaterial.roughness = 0.7f;
     m_defaultMaterial.ior = 1.5f;
@@ -149,14 +148,11 @@ bool CornellBoxScene::Initialize(
 
     // Cornell box
 
-    const auto cornellBox =
-        ModelImporter::Load(
-            "assets/Models/CornellBox/cornell_box.fbx");
+    const auto cornellBox = ModelImporter::Load("assets/Models/CornellBox/cornell_box.fbx");
 
     if (cornellBox.empty())
     {
-        throw std::runtime_error(
-            "Cornell box import produced no meshes.");
+        throw std::runtime_error("Cornell box import produced no meshes.");
     }
 
     m_cornellMeshes.reserve(cornellBox.size());
@@ -185,6 +181,74 @@ bool CornellBoxScene::Initialize(
 
     // Tank
 
+    ImageData tankAlbedo;
+    if (!ImageLoader::Load("assets/Textures/Materials/tank_sample_alb.png", tankAlbedo))
+    {
+        throw std::runtime_error("Failed to load tank albedo atlas.");
+    }
+
+    if (!m_tankAlbedoTexture.Initialize(
+        device, tankAlbedo.pixels.data(), tankAlbedo.width, tankAlbedo.height,
+        DXGI_FORMAT_R8G8B8A8_UNORM, 4))
+    {
+        return false;
+    }
+
+    if (!uploader.UploadTexture(
+        m_tankAlbedoTexture.GetResource(), m_tankAlbedoTexture.GetInitialData(),
+        m_tankAlbedoTexture.GetInitialDataSize()))
+    {
+        return false;
+    }
+
+    if (!m_tankAlbedoTexture.CreateSRV(device, descriptorHeap, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB))
+    {
+        return false;
+    }
+
+    // Tank tangent-space normal map.
+    // Store and sample as linear data, never sRGB.
+    ImageData tankNormal;
+
+    if (!ImageLoader::Load("assets/Textures/Materials/tank_sample_n.png", tankNormal))
+    {
+        throw std::runtime_error("Failed to load tank normal map.");
+    }
+
+    if (!m_tankNormalTexture.Initialize(
+        device,
+        tankNormal.pixels.data(),
+        tankNormal.width,
+        tankNormal.height,
+        DXGI_FORMAT_R8G8B8A8_UNORM,
+        4))
+    {
+        return false;
+    }
+
+    if (!uploader.UploadTexture(
+        m_tankNormalTexture.GetResource(),
+        m_tankNormalTexture.GetInitialData(),
+        m_tankNormalTexture.GetInitialDataSize()))
+    {
+        return false;
+    }
+
+    if (!m_tankNormalTexture.CreateSRV(
+        device,
+        descriptorHeap,
+        DXGI_FORMAT_R8G8B8A8_UNORM))
+    {
+        return false;
+    }
+
+    m_tankMaterial = m_defaultMaterial;
+    m_tankMaterial.texture = &m_tankAlbedoTexture;
+    m_tankMaterial.normalTexture = &m_tankNormalTexture;
+    m_tankMaterial.baseColor[0] = 1.0f;
+    m_tankMaterial.baseColor[1] = 1.0f;
+    m_tankMaterial.baseColor[2] = 1.0f;
+
     const auto tank =
         ModelImporter::Load(
             "assets/Models/CornellBox/tank_sample.fbx");
@@ -201,18 +265,29 @@ bool CornellBoxScene::Initialize(
     {
         auto mesh = std::make_unique<Mesh>();
 
+        // The FBX atlas UVs use bottom-origin V; ImageLoader preserves PNG row order.
+        // Adjust the shared vertex data so rasterization and DXR sample the same atlas.
+        std::vector<Vertex> tankVertices = importedMesh.vertices;
+        std::vector<std::uint32_t> tankIndices = importedMesh.indices;
+
+        for (Vertex& vertex : tankVertices)
+        {
+            vertex.uv[1] = 1.0f - vertex.uv[1];
+        }
+
+        TangentGenerator::GenerateTangents(tankVertices, tankIndices);
+
         if (!mesh->Initialize(
             device,
             uploader,
             descriptorHeap,
-            importedMesh.vertices.data(),
-            importedMesh.vertices.size(),
+            tankVertices.data(),
+            tankVertices.size(),
             m_vertexLayout,
-            importedMesh.indices.data(),
-            importedMesh.indices.size()))
+            tankIndices.data(),
+            tankIndices.size()))
         {
-            throw std::runtime_error(
-                "Failed to create imported tank mesh.");
+            throw std::runtime_error("Failed to create imported tank mesh.");
         }
 
         m_tankMeshes.push_back(std::move(mesh));
@@ -267,7 +342,7 @@ bool CornellBoxScene::Initialize(
     {
         RenderObject tankPart{};
         tankPart.mesh = mesh.get();
-        tankPart.material = &m_defaultMaterial;
+        tankPart.material = &m_tankMaterial;
 
         tankPart.transform.position =
             Vector3{
@@ -319,6 +394,8 @@ void CornellBoxScene::Shutdown()
     m_cornellMeshes.clear();
 
     m_whiteTexture.Shutdown();
+    m_tankAlbedoTexture.Shutdown();
+    m_tankNormalTexture.Shutdown();
     m_pipeline.Shutdown();
 }
 
@@ -352,7 +429,8 @@ std::vector<Material*> CornellBoxScene::GetMaterials()
     return {
         &m_defaultMaterial,
         &m_redWallMaterial,
-        &m_greenWallMaterial
+        &m_greenWallMaterial,
+        &m_tankMaterial
     };
 }
 

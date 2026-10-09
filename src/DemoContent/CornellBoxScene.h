@@ -45,11 +45,14 @@ private:
     std::vector<std::unique_ptr<Mesh>> m_tankMeshes;
 
     Texture m_whiteTexture;
+    Texture m_tankAlbedoTexture;
+    Texture m_tankNormalTexture;
 
     Pipeline m_pipeline;
     Material m_defaultMaterial;
     Material m_redWallMaterial;
     Material m_greenWallMaterial;
+    Material m_tankMaterial;
 
     Scene m_scene;
 };

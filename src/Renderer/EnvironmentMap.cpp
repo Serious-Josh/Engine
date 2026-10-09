@@ -299,7 +299,7 @@ bool EnvironmentMap::Initialize(
         return false;
     }
 
-    constexpr unsigned int diffuseIrradianceSize = 32;
+    constexpr unsigned int diffuseIrradianceSize = 128;
 
     if(!m_diffuseIrradiance.Initialize(device, diffuseIrradianceSize, diffuseIrradianceSize, 6, 1, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET)){
         Log::Error("Failed to init diffuse irradiance cubemap.");
@@ -310,6 +310,23 @@ bool EnvironmentMap::Initialize(
         Log::Error("Failed to create diffuse irradiance cubemap SRV.");
         return false;
     }
+
+    m_diffuseIrradianceArrayIndex = descriptorHeap.Allocate();
+    if(m_diffuseIrradianceArrayIndex == UINT_MAX){
+        Log::Error("Failed to allocate diffuse irradiance array SRV.");
+        return false;
+    }
+    m_diffuseIrradianceArrayHeap = &descriptorHeap;
+    D3D12_SHADER_RESOURCE_VIEW_DESC arrayView{};
+    arrayView.Format = m_diffuseIrradiance.GetResource()->GetDesc().Format;
+    arrayView.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+    arrayView.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    arrayView.Texture2DArray.MostDetailedMip = 0;
+    arrayView.Texture2DArray.MipLevels = 1;
+    arrayView.Texture2DArray.FirstArraySlice = 0;
+    arrayView.Texture2DArray.ArraySize = 6;
+    device->CreateShaderResourceView(m_diffuseIrradiance.GetResource(), &arrayView,
+        descriptorHeap.GetCPUHandle(m_diffuseIrradianceArrayIndex));
 
     constexpr unsigned int ggxMultiscatterSize = 64;
     constexpr unsigned int ggxMultiscatterMipLevels = 7;
@@ -341,6 +358,11 @@ bool EnvironmentMap::Initialize(
 
 void EnvironmentMap::Shutdown()
 {
+    if(m_diffuseIrradianceArrayHeap && m_diffuseIrradianceArrayIndex != UINT_MAX){
+        m_diffuseIrradianceArrayHeap->Free(m_diffuseIrradianceArrayIndex);
+    }
+    m_diffuseIrradianceArrayHeap = nullptr;
+    m_diffuseIrradianceArrayIndex = UINT_MAX;
     m_sourceTexture.Shutdown();
     m_cubemap.Shutdown();
     m_diffuseIrradiance.Shutdown();

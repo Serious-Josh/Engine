@@ -10,6 +10,7 @@ struct ToneMapConstants
 
     uint selectionMaskIndex;
     uint outlineThickness;
+    uint debugDepthIndex;
     float3 outlineColor;
 };
 
@@ -123,6 +124,29 @@ VSOutput VSMain(uint vertexID : SV_VertexID)
 float4 PSMain(VSOutput input) : SV_TARGET
 {
     uint2 pixel = uint2(input.position.xy);
+    if(toneMapConstants.debugView == 17 || toneMapConstants.debugView == 18)
+    {
+        Texture2D<float> depthTexture = ResourceDescriptorHeap[toneMapConstants.debugDepthIndex];
+        float depth = depthTexture.Load(int3(pixel, 0));
+        if(!isfinite(depth) || depth < 0.0f)
+            return float4(1.0f, 0.0f, 1.0f, 1.0f);
+        if(depth >= 1.0f)
+            return float4(0.0f, 0.0f, 0.0f, 1.0f);
+        Texture2D<float4> gBufferTexture = ResourceDescriptorHeap[toneMapConstants.debugTextureIndex];
+        float3 value = gBufferTexture.Load(int3(pixel, 0)).rgb;
+        if(!all(isfinite(value)))
+            return float4(1.0f, 0.0f, 1.0f, 1.0f);
+        if(toneMapConstants.debugView == 17)
+        {
+            // The surface target stores signed world-space XYZ.
+            float lengthSquared = dot(value, value);
+            if(!isfinite(lengthSquared) || lengthSquared < 1.0e-8f)
+                return float4(1.0f, 0.0f, 1.0f, 1.0f);
+            return float4(normalize(value) * 0.5f + 0.5f, 1.0f);
+        }
+        // G-buffer RGB is linear after sRGB albedo sampling. Encode only for display.
+        return float4(LinearToSRGB(value), 1.0f);
+    }
     if(toneMapConstants.debugView == 1)
     {
         Texture2D<float> trackingDistance =
@@ -234,7 +258,13 @@ float4 PSMain(VSOutput input) : SV_TARGET
     float3 hdrColor =
         sceneColor.Load(int3(pixel, 0)).rgb;
 
+    if(toneMapConstants.debugView == 24u || toneMapConstants.debugView == 25u || toneMapConstants.debugView == 27u)
+        return float4(all(isfinite(hdrColor)) ? hdrColor : float3(1.0f, 0.0f, 1.0f), 1.0f);
+
     hdrColor *= toneMapConstants.exposure;
+    if(((toneMapConstants.debugView >= 19u && toneMapConstants.debugView <= 23u) || toneMapConstants.debugView == 26u ||
+        (toneMapConstants.debugView >= 28u && toneMapConstants.debugView <= 30u)) && !all(isfinite(hdrColor)))
+        return float4(1.0f, 0.0f, 1.0f, 1.0f);
 
     float3 displayLinear = AgX(hdrColor);
 

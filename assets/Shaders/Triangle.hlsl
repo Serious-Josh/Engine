@@ -3,6 +3,7 @@ struct VSInput
     float3 position : POSITION;
     float3 normal : NORMAL;
     float2 uv : TEXCOORD;
+    float4 tangent : TANGENT;
 };
 
 struct VSOutput
@@ -13,6 +14,7 @@ struct VSOutput
     float4 currentClipPosition : TEXCOORD1;
     float4 previousClipPosition : TEXCOORD2;
     float2 viewDepths : TEXCOORD3;
+    float4 worldTangent : TEXCOORD4;
 };
 
 struct PSOutput
@@ -20,6 +22,7 @@ struct PSOutput
     float4 material : SV_Target0;
     float4 surface : SV_Target1;
     float4 motion : SV_Target2;
+    float4 geometricNormal : SV_Target3;
 };
 
 cbuffer MaterialConstants : register(b0)
@@ -27,7 +30,7 @@ cbuffer MaterialConstants : register(b0)
     uint textureIndex;
     float roughness;
     uint materialIndex;
-    float padding;
+    uint normalTextureIndex;
 
     float3 baseColor;
     float padding2;
@@ -89,6 +92,10 @@ VSOutput VSMain(VSInput input)
     );
 
     output.worldNormal = mul((float3x3)normalMatrix, input.normal);
+    output.worldTangent = float4(
+        normalize(mul((float3x3)normalMatrix, input.tangent.xyz)),
+        input.tangent.w
+    );
 
     output.uv =
         input.uv;
@@ -121,13 +128,35 @@ PSOutput PSMain(VSOutput input)
             roughness
         );
 
-    output.surface =
-        float4(
-            normalize(
-                input.worldNormal
-            ),
-            float(materialIndex)
-        );
+    float3 N = normalize(input.worldNormal);
+    float3 mappedNormal = N;
+
+    if(normalTextureIndex != 0xFFFFFFFFu)
+    {
+        Texture2D<float4> normalTexture = ResourceDescriptorHeap[normalTextureIndex];
+        float3 sampledNormal = normalTexture.Sample(sampler0, input.uv).rgb * 2.0f - 1.0f;
+        float3 tangent = input.worldTangent.xyz - N * dot(N, input.worldTangent.xyz);
+        float tangentLengthSquared = dot(tangent, tangent);
+        float sampledLengthSquared = dot(sampledNormal, sampledNormal);
+        float handedness = input.worldTangent.w;
+        if(all(isfinite(N)) && all(isfinite(tangent)) &&
+           isfinite(tangentLengthSquared) && tangentLengthSquared > 1.0e-8f &&
+           all(isfinite(sampledNormal)) && isfinite(sampledLengthSquared) &&
+           sampledLengthSquared > 1.0e-8f && isfinite(handedness) && abs(handedness) > 1.0e-8f)
+        {
+            float3 T = normalize(tangent);
+            float3 B = cross(N, T) * handedness;
+            float3 worldMappedNormal = T * sampledNormal.x + B * sampledNormal.y + N * sampledNormal.z;
+            float mappedLengthSquared = dot(worldMappedNormal, worldMappedNormal);
+            if(all(isfinite(B)) && all(isfinite(worldMappedNormal)) &&
+               isfinite(mappedLengthSquared) && mappedLengthSquared > 1.0e-8f)
+                mappedNormal = normalize(worldMappedNormal);
+        }
+    }
+
+    output.surface = float4(mappedNormal, float(materialIndex));
+
+    output.geometricNormal = float4(normalize(input.worldNormal), 0.0f);
 
     output.motion = float4(0.0f, 0.0f, 0.0f, 0.0f);
 
