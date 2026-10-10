@@ -8,11 +8,12 @@ static const float RAW_REFLECTION_RAY_INVALID = -2.0f;
 
 struct ReflectionPayload
 {
-    // Seven 32-bit scalars: 28-byte radiance surface payload.
+    // Ten 32-bit scalars: 40-byte radiance surface payload.
     float hitDistance;
     float3 worldNormal;
     float2 uv;
     uint materialIndex;
+    float3 shadingNormal;
 };
 
 struct TrackingPayload
@@ -110,6 +111,15 @@ float3 LoadVertexNormal(
         vertexBuffer.Load3(address);
 
     return asfloat(packedNormal);
+}
+
+float4 LoadVertexTangent(
+    ByteAddressBuffer vertexBuffer,
+    uint vertexIndex,
+    uint vertexStride,
+    uint tangentOffset)
+{
+    return asfloat(vertexBuffer.Load4(vertexIndex * vertexStride + tangentOffset));
 }
 
 float2 LoadVertexUV(
@@ -790,7 +800,7 @@ float3 ShadeSecondarySurface(ReflectionPayload surface, float3 rayDirection, flo
     StructuredBuffer<GPUMaterial> materialBuffer =
         ResourceDescriptorHeap[reflectionConstants.materialBufferIndex];
     GPUMaterial material = materialBuffer[surface.materialIndex];
-    float3 worldNormal = surface.worldNormal;
+    float3 worldNormal = surface.shadingNormal;
     float2 hitUV = surface.uv;
     Texture2D<float4> materialTexture =
         ResourceDescriptorHeap[
@@ -1543,6 +1553,7 @@ void RayGeneration()
     ReflectionPayload payload;
 
     payload.worldNormal = float3(0.0f, 0.0f, 0.0f);
+    payload.shadingNormal = float3(0.0f, 0.0f, 0.0f);
     payload.uv = float2(0.0f, 0.0f);
     payload.materialIndex = 0u;
     float3 secondaryRadiance = float3(0.0f, 0.0f, 0.0f);
@@ -1635,9 +1646,9 @@ void RayGeneration()
         if(secondaryMaterial.roughness <= 0.001f && secondaryMaterial.model <= 2u)
         {
             float3 secondaryView = normalize(-ray.Direction);
-            float secondaryNdotV = dot(payload.worldNormal, secondaryView);
-            float3 bounce2Direction = normalize(reflect(ray.Direction, payload.worldNormal));
-            if(secondaryNdotV > 0.0f && dot(payload.worldNormal, bounce2Direction) > 0.0f &&
+            float secondaryNdotV = dot(payload.shadingNormal, secondaryView);
+            float3 bounce2Direction = normalize(reflect(ray.Direction, payload.shadingNormal));
+            if(secondaryNdotV > 0.0f && dot(payload.shadingNormal, bounce2Direction) > 0.0f &&
                 all(isfinite(bounce2Direction)) && all(isfinite(secondaryPosition)))
             {
                 RayDesc bounce2Ray;
@@ -1679,10 +1690,10 @@ void RayGeneration()
                 ReflectionSobol01(pixelIndex, sampleIndex, 6u));
             float3 secondaryHalfVector;
             float3 bounce2Direction = SampleGGXReflectionDirection(
-                payload.worldNormal, secondaryView, secondaryMaterial.roughness,
+                payload.shadingNormal, secondaryView, secondaryMaterial.roughness,
                 secondarySample, secondaryHalfVector);
-            float secondaryNdotV = saturate(dot(payload.worldNormal, secondaryView));
-            float secondaryNdotL = saturate(dot(payload.worldNormal, bounce2Direction));
+            float secondaryNdotV = saturate(dot(payload.shadingNormal, secondaryView));
+            float secondaryNdotL = saturate(dot(payload.shadingNormal, bounce2Direction));
             float secondaryVdotH = saturate(dot(secondaryView, secondaryHalfVector));
 
             if(secondaryNdotV > 0.0f && secondaryNdotL > 0.0f && secondaryVdotH > 0.0f &&
@@ -1691,14 +1702,14 @@ void RayGeneration()
                 all(isfinite(secondaryPosition)))
             {
                 float secondaryPDF = EvaluateGGXVNDFPDF(
-                    payload.worldNormal, secondaryView, bounce2Direction, secondaryMaterial.roughness);
+                    payload.shadingNormal, secondaryView, bounce2Direction, secondaryMaterial.roughness);
                 if(isfinite(secondaryPDF) && secondaryPDF > 0.0f)
                 {
                     // The material Fresnel helper accepts a cosine; rough GGX uses V dot H.
                     float3 F2 = EvaluateSecondaryMirrorFresnel(
                         secondaryMaterial, payload.uv, secondaryVdotH);
                     float D2 = DistributionGGX(
-                        payload.worldNormal, secondaryHalfVector, secondaryMaterial.roughness);
+                        payload.shadingNormal, secondaryHalfVector, secondaryMaterial.roughness);
                     float G2 = GeometrySmithGGX(
                         secondaryNdotL, secondaryNdotV, secondaryMaterial.roughness);
                     float3 W2 = F2 * D2 * G2 / (4.0f * secondaryNdotV * secondaryPDF);
@@ -2042,7 +2053,46 @@ void ClosestHit(
     float3 worldNormal =
         normalize(mul(objectNormal, (float3x3)WorldToObject3x4()));
 
+    float3 shadingNormal = worldNormal;
+    StructuredBuffer<GPUMaterial> materialBuffer =
+        ResourceDescriptorHeap[reflectionConstants.materialBufferIndex];
+    GPUMaterial material = materialBuffer[instanceData.materialIndex];
+    if(material.normalTextureIndex != 0xFFFFFFFFu && instanceData.tangentOffset != 0xFFFFFFFFu)
+    {
+        float4 objectTangent =
+            LoadVertexTangent(vertexBuffer, vertexIndex0, instanceData.vertexStride, instanceData.tangentOffset) * barycentric0 +
+            LoadVertexTangent(vertexBuffer, vertexIndex1, instanceData.vertexStride, instanceData.tangentOffset) * barycentric1 +
+            LoadVertexTangent(vertexBuffer, vertexIndex2, instanceData.vertexStride, instanceData.tangentOffset) * barycentric2;
+        // Row-vector multiplication by world-to-object equals the raster
+        // inverse-transpose normalMatrix convention.
+        float3 tangent = mul(objectTangent.xyz, (float3x3)WorldToObject3x4());
+        tangent -= worldNormal * dot(worldNormal, tangent);
+        float tangentLengthSquared = dot(tangent, tangent);
+        // A reflected instance reverses the cross-product frame orientation.
+        float instanceDeterminant = determinant((float3x3)ObjectToWorld3x4());
+        float handedness = objectTangent.w * (instanceDeterminant < 0.0f ? -1.0f : 1.0f);
+        Texture2D<float4> normalTexture =
+            ResourceDescriptorHeap[NonUniformResourceIndex(material.normalTextureIndex)];
+        float3 sampledNormal = normalTexture.SampleLevel(materialSampler, hitUV, 0.0f).rgb * 2.0f - 1.0f;
+        float sampledLengthSquared = dot(sampledNormal, sampledNormal);
+        if(all(isfinite(worldNormal)) && all(isfinite(tangent)) &&
+           isfinite(tangentLengthSquared) && tangentLengthSquared > 1.0e-8f &&
+           all(isfinite(sampledNormal)) && isfinite(sampledLengthSquared) &&
+           sampledLengthSquared > 1.0e-8f && isfinite(handedness) && abs(handedness) > 1.0e-8f &&
+           isfinite(instanceDeterminant) && instanceDeterminant != 0.0f)
+        {
+            float3 T = normalize(tangent);
+            float3 B = cross(worldNormal, T) * handedness;
+            float3 worldMappedNormal = T * sampledNormal.x + B * sampledNormal.y + worldNormal * sampledNormal.z;
+            float mappedLengthSquared = dot(worldMappedNormal, worldMappedNormal);
+            if(all(isfinite(B)) && all(isfinite(worldMappedNormal)) &&
+               isfinite(mappedLengthSquared) && mappedLengthSquared > 1.0e-8f)
+                shadingNormal = normalize(worldMappedNormal);
+        }
+    }
+
     payload.worldNormal = worldNormal;
+    payload.shadingNormal = shadingNormal;
     payload.uv = hitUV;
     payload.materialIndex = instanceData.materialIndex;
 }

@@ -19,7 +19,7 @@ struct GPUMaterial
     float padding1;
 
     float3 averageConductorFresnel;
-    float padding2;
+    uint normalTextureIndex;
 };
 
 float3 EvaluateMetallicRoughnessDirectBRDF(

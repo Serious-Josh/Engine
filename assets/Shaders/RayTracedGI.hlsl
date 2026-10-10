@@ -55,6 +55,7 @@ struct GIPayload
     float3 worldNormal;
     float2 uv;
     uint materialIndex;
+    float3 shadingNormal;
 };
 
 struct GIVisibilityPayload
@@ -123,6 +124,15 @@ float3 LoadVertexNormal(
         vertexBuffer.Load3(address);
 
     return asfloat(packedNormal);
+}
+
+float4 LoadVertexTangent(
+    ByteAddressBuffer vertexBuffer,
+    uint vertexIndex,
+    uint vertexStride,
+    uint tangentOffset)
+{
+    return asfloat(vertexBuffer.Load4(vertexIndex * vertexStride + tangentOffset));
 }
 
 float2 LoadVertexUV(
@@ -214,12 +224,12 @@ float3 ShadeGIWhiteDiffuseSecondary(float3 secondaryNormal)
 
 float3 ShadeGISecondaryEnvironmentOnly(GIPayload surface, float3 secondaryPosition)
 {
-    float normalLengthSquared = dot(surface.worldNormal, surface.worldNormal);
-    if(!all(isfinite(secondaryPosition)) || !all(isfinite(surface.worldNormal)) ||
+    float normalLengthSquared = dot(surface.shadingNormal, surface.shadingNormal);
+    if(!all(isfinite(secondaryPosition)) || !all(isfinite(surface.shadingNormal)) ||
        !all(isfinite(surface.uv)) || !isfinite(normalLengthSquared) || normalLengthSquared < 1.0e-8f)
         return 0.0f;
 
-    float3 normal = normalize(surface.worldNormal);
+    float3 normal = normalize(surface.shadingNormal);
 
     StructuredBuffer<GPUMaterial> materials = ResourceDescriptorHeap[materialBufferIndex];
     uint materialCount, materialStride;
@@ -255,12 +265,12 @@ float3 SampleGICosineHemisphere(float3 normal, uint2 pixel, uint sampleIndex);
 
 float3 ShadeGISecondarySurface(GIPayload surface, float3 secondaryPosition, uint2 pixel, uint sampleIndex, float sourceMip = 0.0f)
 {
-    float normalLengthSquared = dot(surface.worldNormal, surface.worldNormal);
-    if(!all(isfinite(secondaryPosition)) || !all(isfinite(surface.worldNormal)) ||
+    float normalLengthSquared = dot(surface.shadingNormal, surface.shadingNormal);
+    if(!all(isfinite(secondaryPosition)) || !all(isfinite(surface.shadingNormal)) ||
        !all(isfinite(surface.uv)) || !isfinite(normalLengthSquared) || normalLengthSquared < 1.0e-8f)
         return 0.0f;
 
-    float3 normal = normalize(surface.worldNormal);
+    float3 normal = normalize(surface.shadingNormal);
 
     StructuredBuffer<GPUMaterial> materials = ResourceDescriptorHeap[materialBufferIndex];
     uint materialCount, materialStride;
@@ -288,7 +298,7 @@ float3 ShadeGISecondarySurface(GIPayload surface, float3 secondaryPosition, uint
     // A distinct sampling stream from the primary ray, varying with pixel and frame.
     float3 environmentDirection = SampleGICosineHemisphere(normal, pixel, sampleIndex ^ 0xD1B54A35u);
     RayDesc environmentRay;
-    environmentRay.Origin = secondaryPosition + normal * 0.001f;
+    environmentRay.Origin = secondaryPosition + normalize(surface.worldNormal) * 0.001f;
     environmentRay.Direction = environmentDirection;
     environmentRay.TMin = 0.001f;
     environmentRay.TMax = 10000.0f;
@@ -321,7 +331,7 @@ float3 ShadeGISecondarySurface(GIPayload surface, float3 secondaryPosition, uint
         return environmentRadiance;
 
     RayDesc visibilityRay;
-    visibilityRay.Origin = secondaryPosition + normal * 0.001f;
+    visibilityRay.Origin = secondaryPosition + normalize(surface.worldNormal) * 0.001f;
     visibilityRay.Direction = directionToLight;
     visibilityRay.TMin = 0.001f;
     visibilityRay.TMax = 10000.0f;
@@ -881,7 +891,7 @@ void GIRayGeneration()
 #elif GI_DIAGNOSTIC_MODE == GI_MODE_WHITE_DIFFUSE_SECONDARY
     incomingRadiance = 0.0f;
     if(payload.hitDistance > 0.0f)
-        incomingRadiance = ShadeGIWhiteDiffuseSecondary(payload.worldNormal);
+        incomingRadiance = ShadeGIWhiteDiffuseSecondary(payload.shadingNormal);
     else if(payload.hitDistance == -1.0f)
         incomingRadiance = SampleGIEnvironment(ray.Direction);
 #else
@@ -1023,7 +1033,46 @@ void GIClosestHit(
     float3 worldNormal =
         normalize(mul(objectNormal, (float3x3)WorldToObject3x4()));
 
+    float3 shadingNormal = worldNormal;
+    StructuredBuffer<GPUMaterial> materialBuffer =
+        ResourceDescriptorHeap[materialBufferIndex];
+    GPUMaterial material = materialBuffer[instanceData.materialIndex];
+    if(material.normalTextureIndex != 0xFFFFFFFFu && instanceData.tangentOffset != 0xFFFFFFFFu)
+    {
+        float4 objectTangent =
+            LoadVertexTangent(vertexBuffer, vertexIndex0, instanceData.vertexStride, instanceData.tangentOffset) * barycentric0 +
+            LoadVertexTangent(vertexBuffer, vertexIndex1, instanceData.vertexStride, instanceData.tangentOffset) * barycentric1 +
+            LoadVertexTangent(vertexBuffer, vertexIndex2, instanceData.vertexStride, instanceData.tangentOffset) * barycentric2;
+        // Row-vector multiplication by world-to-object equals the raster
+        // inverse-transpose normalMatrix convention.
+        float3 tangent = mul(objectTangent.xyz, (float3x3)WorldToObject3x4());
+        tangent -= worldNormal * dot(worldNormal, tangent);
+        float tangentLengthSquared = dot(tangent, tangent);
+        // A reflected instance reverses the cross-product frame orientation.
+        float instanceDeterminant = determinant((float3x3)ObjectToWorld3x4());
+        float handedness = objectTangent.w * (instanceDeterminant < 0.0f ? -1.0f : 1.0f);
+        Texture2D<float4> normalTexture =
+            ResourceDescriptorHeap[NonUniformResourceIndex(material.normalTextureIndex)];
+        float3 sampledNormal = normalTexture.SampleLevel(materialSampler, hitUV, 0.0f).rgb * 2.0f - 1.0f;
+        float sampledLengthSquared = dot(sampledNormal, sampledNormal);
+        if(all(isfinite(worldNormal)) && all(isfinite(tangent)) &&
+           isfinite(tangentLengthSquared) && tangentLengthSquared > 1.0e-8f &&
+           all(isfinite(sampledNormal)) && isfinite(sampledLengthSquared) &&
+           sampledLengthSquared > 1.0e-8f && isfinite(handedness) && abs(handedness) > 1.0e-8f &&
+           isfinite(instanceDeterminant) && instanceDeterminant != 0.0f)
+        {
+            float3 T = normalize(tangent);
+            float3 B = cross(worldNormal, T) * handedness;
+            float3 worldMappedNormal = T * sampledNormal.x + B * sampledNormal.y + worldNormal * sampledNormal.z;
+            float mappedLengthSquared = dot(worldMappedNormal, worldMappedNormal);
+            if(all(isfinite(B)) && all(isfinite(worldMappedNormal)) &&
+               isfinite(mappedLengthSquared) && mappedLengthSquared > 1.0e-8f)
+                shadingNormal = normalize(worldMappedNormal);
+        }
+    }
+
     payload.worldNormal = worldNormal;
+    payload.shadingNormal = shadingNormal;
     payload.uv = hitUV;
     payload.materialIndex = instanceData.materialIndex;
 }

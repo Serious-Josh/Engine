@@ -40,7 +40,7 @@ bool RayTracedGIPass::Initialize(GraphicsDevice& graphicsDevice, ShaderLibrary& 
         {RootParameterType::ConstantBuffer, 1} 
     };
 
-    pipelineDescription.maxPayloadSize = 28; // Hit distance, world normal, UV, material index.
+    pipelineDescription.maxPayloadSize = 40; // Hit distance, world normal, UV, material index.
     pipelineDescription.maxAttributeSize = 8;
     pipelineDescription.maxRecursionDepth = 1;
 
