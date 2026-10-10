@@ -42,6 +42,7 @@
 #include "Passes/AOTemporalPass.h"
 #include "Passes/AODenoisePass.h"
 #include "Passes/NrdDiffuseResolvePass.h"
+#include "Passes/GISpatialDenoisePass.h"
 
 #include <d3d12.h>
 #include <filesystem>
@@ -143,6 +144,7 @@ class Renderer
         ReflectionContributionLimitPass m_reflectionContributionLimitPass;
         NrdDenoiser m_nrdReflectionDenoiser;
         NrdDenoiser m_nrdGIDenoiser;
+        GISpatialDenoisePass m_giSpatialDenoisePass;
         NrdPreparePass m_nrdReflectionPreparePass;
         NrdPreparePass m_nrdGIPreparePass;
         NrdReflectionResolvePass m_nrdReflectionResolvePass;

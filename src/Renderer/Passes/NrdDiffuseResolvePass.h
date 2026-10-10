@@ -17,11 +17,13 @@ struct NrdDiffuseResolveConstants
 
     unsigned int viewZIndex;
     float denoisingRange;
-    unsigned int padding0;
-    unsigned int padding1;
+    unsigned int depthIndex;
+    unsigned int normalIndex;
 };
 
 static_assert(sizeof(NrdDiffuseResolveConstants) == 32);
+
+class GBuffer;
 
 class NrdDiffuseResolvePass
 {
@@ -41,6 +43,7 @@ public:
 
     void Execute(
         ID3D12GraphicsCommandList* commandList,
+        GBuffer& gBuffer,
         Texture& nrdOutput,
         Texture& viewZ,
         UploadBuffer& uploadBuffer,

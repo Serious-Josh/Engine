@@ -32,6 +32,7 @@ class GpuTimestampProfiler
             ReflectionDenoise,
             NrdDiffuseResolve,
             DebugUI,
+            GISpatialDenoise,
 
             Count
         };

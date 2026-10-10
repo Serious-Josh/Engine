@@ -211,6 +211,7 @@ void DebugUI::DrawPerformanceWindow(const std::vector<std::string>& environmentN
     ImGui::TextUnformatted("Global illumination");
     drawGpuTiming("  Ray-Traced GI", GpuTimestampProfiler::Region::RayTracedGI);
     drawGpuTiming("  NRD diffuse resolve", GpuTimestampProfiler::Region::NrdDiffuseResolve);
+    drawGpuTiming("  GI spatial denoise", GpuTimestampProfiler::Region::GISpatialDenoise);
 
     ImGui::TextUnformatted("Deferred lighting / presentation");
     drawGpuTiming(

@@ -2,8 +2,11 @@
 
 #include "Renderer/DescriptorHeap.h"
 #include "Renderer/GraphicsDevice.h"
-#include "Renderer/Shader/ShaderLibrary.h"
 #include "Renderer/UploadBuffer.h"
+#include "Renderer/GBuffer.h"
+
+#include "Renderer/Shader/ShaderLibrary.h"
+
 #include "Core/Log.h"
 
 bool NrdDiffuseResolvePass::Initialize(
@@ -70,6 +73,7 @@ bool NrdDiffuseResolvePass::Resize(
 
 void NrdDiffuseResolvePass::Execute(
     ID3D12GraphicsCommandList* commandList,
+    GBuffer& gBuffer,
     Texture& nrdOutput,
     Texture& viewZ,
     UploadBuffer& uploadBuffer,
@@ -82,6 +86,8 @@ void NrdDiffuseResolvePass::Execute(
         return;
     }
 
+    gBuffer.GetDepth().Transition(commandList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    gBuffer.GetSurface().Transition(commandList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     nrdOutput.Transition(commandList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     viewZ.Transition(commandList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
@@ -94,6 +100,8 @@ void NrdDiffuseResolvePass::Execute(
     constants.height = height;
     constants.viewZIndex = viewZ.GetDescriptorIndex();
     constants.denoisingRange = denoisingRange;
+    constants.depthIndex = gBuffer.GetDepth().GetSRVIndex();
+    constants.normalIndex = gBuffer.GetSurface().GetSRVIndex();
 
     const D3D12_GPU_VIRTUAL_ADDRESS constantsAddress = uploadBuffer.Allocate(&constants, sizeof(constants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
 

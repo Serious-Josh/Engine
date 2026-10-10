@@ -276,7 +276,8 @@ bool NrdDenoiser::SetFrameSettings(
     diffuseSettings.hitDistanceParameters.B = 0.1f;
     diffuseSettings.hitDistanceParameters.C = 20.0f;
 
-    diffuseSettings.maxAccumulatedFrameNum = 8;
+    diffuseSettings.maxAccumulatedFrameNum = 30;
+    diffuseSettings.diffusePrepassBlurRadius = 30.0f;
     diffuseSettings.checkerboardMode = nrd::CheckerboardMode::OFF;
     diffuseSettings.hitDistanceReconstructionMode = nrd::HitDistanceReconstructionMode::OFF;
 

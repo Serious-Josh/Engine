@@ -196,6 +196,12 @@ bool Renderer::Initialize(void* windowHandle, unsigned int width, unsigned int h
         return false;
     }
 
+    if (!m_giSpatialDenoisePass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap, m_width, m_height))
+    {
+        Log::Error("Failed to init the ray traced GI spatial denoise pass.");
+        return false;
+    }
+
     if(!m_nrdReflectionDenoiser.Initialize(device, m_commandContext.GetCommandQueue(), m_resourceDescriptorHeap, m_width, m_height, 2, NrdDenoiser::Signal::Specular)){
         Log::Error("Failed to init NRD reflection denoiser.");
         return false;
@@ -429,6 +435,12 @@ bool Renderer::Resize(unsigned int width, unsigned int height)
     if(!m_nrdDiffuseResolvePass.Resize(m_graphicsDevice, m_resourceDescriptorHeap, width, height))
     {
         Log::Error("Failed to resize NRD diffuse resolve pass.");
+        return false;
+    }
+
+    if(!m_giSpatialDenoisePass.Resize(m_graphicsDevice, m_resourceDescriptorHeap, width, height))
+    {
+        Log::Error("Failed to resize gi spatial denoise pass.");
         return false;
     }
 
@@ -1333,6 +1345,7 @@ bool Renderer::Render(const Scene& scene, const RendererOptions& options)
         m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::NrdDiffuseResolve);
         m_nrdDiffuseResolvePass.Execute(
             commandList,
+            m_gBuffer,
             m_nrdGIDenoiser.GetDiffuseOutputTexture(),
             m_nrdGIPreparePass.GetViewZTexture(),
             m_uploadBuffer,
@@ -1340,6 +1353,16 @@ bool Renderer::Render(const Scene& scene, const RendererOptions& options)
             m_height,
             nrdDenoisingRange);
         m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::NrdDiffuseResolve);
+
+        m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::GISpatialDenoise);
+        m_giSpatialDenoisePass.Execute(
+            commandList,
+            m_gBuffer,
+            m_nrdDiffuseResolvePass.GetOutputTexture(),
+            m_uploadBuffer,
+            m_width,
+            m_height);
+        m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::GISpatialDenoise);
     }
 
     if(runNative)
@@ -1396,7 +1419,7 @@ bool Renderer::Render(const Scene& scene, const RendererOptions& options)
         m_environment.GetGGXMultiscatterIrradiance(),
         m_shadowDenoisePass.GetFilteredVisibilityTexture(),
         finalReflection,
-        m_nrdDiffuseResolvePass.GetOutputTexture(),
+        m_giSpatialDenoisePass.GetOutputTexture(),
         m_aoDenoisePass.GetFilteredAOTexture(),
         options.enableRTGI,
         m_sceneColor,
@@ -1438,7 +1461,7 @@ bool Renderer::Render(const Scene& scene, const RendererOptions& options)
         case ToneMapDebugView::GIHitDistance:
             debugTexture = &m_rayTracedGIPass.GetHitDistanceTexture(); break;
         case ToneMapDebugView::GIDenoised:
-            debugTexture = &m_nrdDiffuseResolvePass.GetOutputTexture(); break;
+            debugTexture = &m_giSpatialDenoisePass.GetOutputTexture(); break;
         case ToneMapDebugView::AORaw:
             debugTexture = &m_rayTracedAOPass.GetRawAOTexture(); break;
         case ToneMapDebugView::AOTemporal:
@@ -1560,6 +1583,7 @@ void Renderer::Shutdown()
     m_nrdGIDenoiser.Shutdown();
     m_nrdReflectionResolvePass.Shutdown();
     m_nrdDiffuseResolvePass.Shutdown();
+    m_giSpatialDenoisePass.Shutdown();
     m_shadowDenoisePass.Shutdown();
     m_selectionMaskPass.Shutdown();
 

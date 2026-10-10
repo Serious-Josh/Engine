@@ -104,6 +104,7 @@ add_executable(Engine
     src/Renderer/Passes/RayTracedAOPass.cpp
     src/Renderer/Passes/AOTemporalPass.cpp
     src/Renderer/Passes/AODenoisePass.cpp
+    src/Renderer/Passes/GISpatialDenoisePass.cpp
 )
 
 add_custom_command(
