@@ -300,7 +300,6 @@ void DebugUI::DrawPerformanceWindow(const std::vector<std::string>& environmentN
     ImGui::Combo("Reflection denoiser", &m_reflectionDenoiserMode, denoisers, IM_ARRAYSIZE(denoisers));
     ImGui::Checkbox("NRD contribution limiter", &m_contributionLimiterEnabled);
     ImGui::Checkbox("Enable RTGI", &m_rtgiEnabled);
-    ImGui::Checkbox("Legacy GI Estimator", &m_legacyGIEstimator);
     ImGui::SliderFloat("RTGI Contact AO Strength", &m_rtgiContactAOStrength, 0.0f, 1.0f, "%.2f");
     ImGui::SliderFloat("RTGI Contact AO Radius", &m_rtgiContactAORadius, 0.05f, 5.0f, "%.2f");
     ImGui::Combo("Diagnostic view", &m_toneMapDebugView, views, IM_ARRAYSIZE(views));

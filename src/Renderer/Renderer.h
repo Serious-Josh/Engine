@@ -68,7 +68,6 @@ struct RendererOptions
     bool enableRTGI = true;
     float rtgiContactAOStrength = 1.0f;
     float rtgiContactAORadius = 2.5f;
-    bool enableGISignedCorrection = true;
 };
 
 class Scene;
@@ -151,7 +150,7 @@ class Renderer
         GISpatialDenoisePass m_giSpatialDenoisePass;
         GISignedCorrectionPass m_giSignedCorrectionPass;
         bool m_giSignedCorrectionInitialized = false;
-        bool m_previousSignedCorrectionNrdInput = false;
+        bool m_signedCorrectionExecutedLastFrame = false;
         NrdPreparePass m_nrdReflectionPreparePass;
         NrdPreparePass m_nrdGIPreparePass;
         NrdReflectionResolvePass m_nrdReflectionResolvePass;

@@ -764,7 +764,7 @@ void Renderer::ReleaseSceneResources()
 void Renderer::ResetSceneHistory()
 {
     m_giSignedCorrectionPass.ResetHistory();
-    m_previousSignedCorrectionNrdInput = false;
+    m_signedCorrectionExecutedLastFrame = false;
     m_rayTracedShadowPass.ResetHistory();
     m_rayTracedReflectionTemporalPass.ResetHistory();
     m_aoTemporalPass.ResetHistory();
@@ -800,7 +800,7 @@ bool Renderer::Render(const Scene& scene, const RendererOptions& options)
     } signedHistoryFrame{m_giSignedCorrectionPass};
     // Compile-time mode selection is shared with the shader; diagnostics never consume stale corrections.
 #if GI_DIAGNOSTIC_MODE == GI_MODE_BASELINE_CORRECTION
-    const bool runSignedCorrection = options.enableGISignedCorrection  && options.enableRTGI;
+    const bool runSignedCorrection = options.enableRTGI;
 #else
     const bool runSignedCorrection = false;
 #endif
@@ -1317,7 +1317,8 @@ bool Renderer::Render(const Scene& scene, const RendererOptions& options)
     runNrd = runNrd || options.enableRTGI;
     const bool runNative = reflectionMode == ReflectionDenoiserMode::Native;
     const bool resetNrdHistory = !m_hasPreviousNrdCamera || !m_nrdExecutedLastFrame || limiterEnabled != m_previousContributionLimiterEnabled;
-    const bool resetGIHistory = resetNrdHistory || runSignedCorrection != m_previousSignedCorrectionNrdInput;
+    // Restart diffuse NRD history when signed production GI resumes after being inactive.
+    const bool resetGIHistory = resetNrdHistory || runSignedCorrection != m_signedCorrectionExecutedLastFrame;
 
     if(runNrd)
     {
@@ -1633,7 +1634,7 @@ bool Renderer::Render(const Scene& scene, const RendererOptions& options)
     if(runNrd)
     {
         m_previousContributionLimiterEnabled = limiterEnabled;
-        m_previousSignedCorrectionNrdInput = runSignedCorrection;
+        m_signedCorrectionExecutedLastFrame = runSignedCorrection;
         ++m_nrdFrameIndex;
     }
 
