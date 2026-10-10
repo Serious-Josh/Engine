@@ -36,11 +36,17 @@ float3 SampleAOCosineHemisphere(float3 normal, uint2 pixel, uint sampleIndex)
 {
     uint seed = AOHash(
         AOHash(pixel.x ^ 0xA511E9B3u) ^
-        AOHash(pixel.y ^ 0x63D83595u) ^
-        AOHash(sampleIndex ^ 0x369DEA0Fu));
-    // Match GI's dimension salts and upper-24-bit mapping to [0, 1).
-    float u1 = float(AOHash(seed ^ 0xA24BAED5u) >> 8u) * (1.0f / 16777216.0f);
-    float u2 = float(AOHash(seed ^ 0x9FB21C65u) >> 8u) * (1.0f / 16777216.0f);
+        AOHash(pixel.y ^ 0x63D83595u));
+    // An odd multiplier is coprime to 16: this permutes every stratum once.
+    uint temporalSample = sampleIndex % 16u;
+    uint stride = (AOHash(seed ^ 0x369DEA0Fu) & 15u) | 1u;
+    uint stratum = (temporalSample * stride + (seed & 15u)) & 15u;
+    uint jitterSeed = AOHash(seed ^ AOHash(stratum ^ 0xD1B54A35u));
+    // Use 20 bits so adding jitter to a stratum coordinate cannot round to 4.
+    float jitterX = float(AOHash(jitterSeed ^ 0xA24BAED5u) >> 12u) * (1.0f / 1048576.0f);
+    float jitterY = float(AOHash(jitterSeed ^ 0x9FB21C65u) >> 12u) * (1.0f / 1048576.0f);
+    float u1 = (float(stratum & 3u) + jitterX) * 0.25f;
+    float u2 = (float(stratum >> 2u) + jitterY) * 0.25f;
 
     float r = sqrt(u1);
     float phi = 6.28318530718f * u2;
@@ -60,13 +66,26 @@ float3 SampleAOCosineHemisphere(float3 normal, uint2 pixel, uint sampleIndex)
 [shader("raygeneration")]
 void AORayGeneration()
 {
-    const uint2 pixel = DispatchRaysIndex().xy;
-    aoTexture[pixel] = 1.0f;
+    const uint2 aoPixel = DispatchRaysIndex().xy;
+    aoTexture[aoPixel] = 1.0f;
 
     Texture2D<float> depthTexture = ResourceDescriptorHeap[depthIndex];
     Texture2D<float4> surfaceTexture = ResourceDescriptorHeap[surfaceIndex];
 
-    const float depth = depthTexture.Load(int3(pixel, 0));
+    uint2 fullResolution;
+    depthTexture.GetDimensions(fullResolution.x, fullResolution.y);
+
+    if(any(fullResolution == 0u))
+    {
+        return;
+    }
+
+    // Preserve full-resolution dispatch; otherwise select the center of each 2x2 footprint.
+    const uint2 fullPixel = all(DispatchRaysDimensions().xy == fullResolution)
+        ? aoPixel
+        : min(aoPixel * 2u + 1u, fullResolution - 1u);
+
+    const float depth = depthTexture.Load(int3(fullPixel, 0));
 
     if(!isfinite(depth) || depth < 0.0f || depth >= 1.0f)
     {
@@ -75,7 +94,7 @@ void AORayGeneration()
 
     // Match GI: pixel centers, flipped NDC Y, D3D [0, 1] depth,
     // and a row-major inverse view-projection multiplying a column vector.
-    const float2 uv = (float2(pixel) + 0.5f) / float2(DispatchRaysDimensions().xy);
+    const float2 uv = (float2(fullPixel) + 0.5f) / float2(fullResolution);
     const float2 ndc = float2(uv.x * 2.0f - 1.0f, 1.0f - uv.y * 2.0f);
     float4 worldPosition = mul(inverseViewProjection, float4(ndc, depth, 1.0f));
 
@@ -92,7 +111,7 @@ void AORayGeneration()
     }
 
     // Surface RGB stores the world-space normal directly, without remapping.
-    const float3 surfaceNormal = surfaceTexture.Load(int3(pixel, 0)).rgb;
+    const float3 surfaceNormal = surfaceTexture.Load(int3(fullPixel, 0)).rgb;
     const float normalLengthSquared = dot(surfaceNormal, surfaceNormal);
 
     if(!all(isfinite(surfaceNormal)) || !isfinite(normalLengthSquared) ||
@@ -105,7 +124,7 @@ void AORayGeneration()
 
     RayDesc ray;
     ray.Origin = worldPosition.xyz + normal * originBias;
-    ray.Direction = SampleAOCosineHemisphere(normal, pixel, frameIndex);
+    ray.Direction = SampleAOCosineHemisphere(normal, aoPixel, frameIndex);
     ray.TMin = rayTMin;
     ray.TMax = maxDistance;
 
@@ -114,7 +133,7 @@ void AORayGeneration()
     TraceRay(scene, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER,
         0xFF, 0, 1, 0, ray, payload);
 
-    aoTexture[pixel] = float(payload.visible);
+    aoTexture[aoPixel] = float(payload.visible);
 }
 
 [shader("miss")]

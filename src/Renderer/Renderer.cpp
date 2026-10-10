@@ -134,26 +134,35 @@ bool Renderer::Initialize(void* windowHandle, unsigned int width, unsigned int h
     const uint32_t giWidth = (m_width + 1u) / 2u;
     const uint32_t giHeight = (m_height + 1u) / 2u;
 
+    const uint32_t aoWidth = (m_width + 1u) / 2u;
+    const uint32_t aoHeight = (m_height + 1u) / 2u;
+
     if(!m_rayTracedGIPass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap, giWidth, giHeight)){
         Log::Error("Failed to init ray traced gi pass.");
         return false;
     }
 
-    if(!m_rayTracedAOPass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap, m_width, m_height))
+    if(!m_rayTracedAOPass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap, aoWidth, aoHeight))
     {
         Log::Error("Failed to init ray traced AO pass.");
         return false;
     }
 
-    if(!m_aoTemporalPass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap, m_width, m_height))
+    if(!m_aoTemporalPass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap, aoWidth, aoHeight))
     {
         Log::Error("Failed to init AO temporal pass.");
         return false;
     }
 
-    if(!m_aoDenoisePass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap, m_width, m_height))
+    if(!m_aoDenoisePass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap, aoWidth, aoHeight))
     {
         Log::Error("Failed to init ray traced ao denoise pass.");
+        return false;
+    }
+
+    if(!m_aoResolvePass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap, m_width, m_height))
+    {
+        Log::Error("Failed to initialize AO resolve pass.");
         return false;
     }
 
@@ -380,6 +389,9 @@ bool Renderer::Resize(unsigned int width, unsigned int height)
     const uint32_t giWidth = (width + 1u) / 2u;
     const uint32_t giHeight = (height + 1u) / 2u;
 
+    const uint32_t aoWidth = (width + 1u) / 2u;
+    const uint32_t aoHeight = (height + 1u) / 2u;
+
     if(m_giSignedCorrectionInitialized &&
        !m_giSignedCorrectionPass.Resize(m_graphicsDevice, m_resourceDescriptorHeap, width, height))
         return false;
@@ -389,21 +401,27 @@ bool Renderer::Resize(unsigned int width, unsigned int height)
         return false;
     }
 
-    if(!m_rayTracedAOPass.Resize(m_graphicsDevice.GetDevice(), m_resourceDescriptorHeap, width, height))
+    if(!m_rayTracedAOPass.Resize(m_graphicsDevice.GetDevice(), m_resourceDescriptorHeap, aoWidth, aoHeight))
     {
         Log::Error("Failed to resize ray traced AO pass.");
         return false;
     }
 
-    if(!m_aoTemporalPass.Resize(m_graphicsDevice, m_resourceDescriptorHeap, width, height))
+    if(!m_aoTemporalPass.Resize(m_graphicsDevice, m_resourceDescriptorHeap, aoWidth, aoHeight))
     {
         Log::Error("Failed to resize AO temporal pass.");
         return false;
     }
 
-    if(!m_aoDenoisePass.Resize(m_graphicsDevice, m_resourceDescriptorHeap, width, height))
+    if(!m_aoDenoisePass.Resize(m_graphicsDevice, m_resourceDescriptorHeap, aoWidth, aoHeight))
     {
         Log::Error("Failed to resize AO denoise pass.");
+        return false;
+    }
+
+    if(!m_aoResolvePass.Resize(m_graphicsDevice, m_resourceDescriptorHeap, width, height))
+    {
+        Log::Error("Failed to resize AO resolve pass.");
         return false;
     }
 
@@ -862,10 +880,6 @@ bool Renderer::Render(const Scene& scene, const RendererOptions& options)
 
     const bool tlasNeedsUpdate = !scene.GetChangedTransforms().empty();
 
-    if(tlasNeedsUpdate){
-        m_giSignedCorrectionPass.ResetHistory();
-    }
-
     m_debugUI.SetTLASUpdated(tlasNeedsUpdate);
 
     if(tlasNeedsUpdate){
@@ -1152,6 +1166,9 @@ bool Renderer::Render(const Scene& scene, const RendererOptions& options)
 
     EndGeometryPass(commandList);
 
+    const uint32_t aoWidth = (m_width + 1u) / 2u;
+    const uint32_t aoHeight = (m_height + 1u) / 2u;
+
     if(runAO)
     {
         AOConstants aoConstants{};
@@ -1184,8 +1201,8 @@ bool Renderer::Render(const Scene& scene, const RendererOptions& options)
             m_resourceDescriptorHeap,
             m_rayTracingScene,
             aoConstantsAddress,
-            m_width,
-            m_height);
+            aoWidth,
+            aoHeight);
         m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::RayTracedAO);
 
         m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::AOTemporal);
@@ -1197,8 +1214,8 @@ bool Renderer::Render(const Scene& scene, const RendererOptions& options)
             reconstructionConstants.inverseViewProjection,
             shadowConstants.previousViewProjection,
             shadowConstants.previousInverseViewProjection,
-            m_width,
-            m_height);
+            aoWidth,
+            aoHeight);
         m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::AOTemporal);
 
         m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::AODenoise);
@@ -1208,9 +1225,18 @@ bool Renderer::Render(const Scene& scene, const RendererOptions& options)
             m_gBuffer,
             m_uploadBuffer,
             reconstructionConstants.inverseViewProjection,
+            aoWidth,
+            aoHeight);
+        m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::AODenoise);
+
+        m_aoResolvePass.Execute(
+            commandList,
+            m_aoDenoisePass.GetFilteredAOTexture(),
+            m_gBuffer.GetDepth(),
+            m_gBuffer.GetSurface(),
+            m_uploadBuffer,
             m_width,
             m_height);
-        m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::AODenoise);
     }
 
     m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::RayTracedShadows);
@@ -1514,7 +1540,7 @@ bool Renderer::Render(const Scene& scene, const RendererOptions& options)
         m_shadowDenoisePass.GetFilteredVisibilityTexture(),
         finalReflection,
         m_giSpatialDenoisePass.GetOutputTexture(),
-        m_aoDenoisePass.GetFilteredAOTexture(),
+        m_aoResolvePass.GetOutputTexture(),
         options.enableRTGI,
         options.rtgiContactAOStrength,
         m_sceneColor,
@@ -1675,6 +1701,7 @@ void Renderer::Shutdown()
     m_rayTracedReflectionPass.Shutdown();
     m_rayTracedGIPass.Shutdown();
     m_rayTracedAOPass.Shutdown();
+    m_aoResolvePass.Shutdown();
     m_aoDenoisePass.Shutdown();
     m_aoTemporalPass.Shutdown();
     m_rayTracedReflectionTemporalPass.Shutdown();

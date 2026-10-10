@@ -36,7 +36,17 @@ float NormalWeight(float3 centerNormal, float3 sampleNormal)
     return weight;
 }
 
-bool ReconstructWorldPosition(uint2 pixel, float depth, out float3 position)
+uint2 AOToFullPixel(uint2 aoPixel, uint2 fullResolution)
+{
+    if(all(uint2(constants.width, constants.height) == fullResolution))
+    {
+        return aoPixel;
+    }
+
+    return min(aoPixel * 2u + 1u, fullResolution - 1u);
+}
+
+bool ReconstructWorldPosition(uint2 fullPixel, float depth, uint2 fullResolution, out float3 position)
 {
     position = 0.0f;
 
@@ -46,7 +56,7 @@ bool ReconstructWorldPosition(uint2 pixel, float depth, out float3 position)
     }
 
     // Match ShadowDenoise: pixel centers, flipped NDC Y, D3D [0, 1] depth.
-    float2 uv = (float2(pixel) + 0.5f) / float2(constants.width, constants.height);
+    float2 uv = (float2(fullPixel) + 0.5f) / float2(fullResolution);
     float2 ndc = float2(uv.x * 2.0f - 1.0f, 1.0f - uv.y * 2.0f);
     float4 worldPosition = mul(constants.inverseViewProjection, float4(ndc, depth, 1.0f));
 
@@ -77,9 +87,9 @@ bool NormalizeWorldNormal(float3 surfaceNormal, out float3 normal)
 [numthreads(8, 8, 1)]
 void CSMain(uint3 dispatchThreadID : SV_DispatchThreadID)
 {
-    uint2 pixel = dispatchThreadID.xy;
+    uint2 aoPixel = dispatchThreadID.xy;
 
-    if(pixel.x >= constants.width || pixel.y >= constants.height)
+    if(aoPixel.x >= constants.width || aoPixel.y >= constants.height)
     {
         return;
     }
@@ -89,11 +99,21 @@ void CSMain(uint3 dispatchThreadID : SV_DispatchThreadID)
     Texture2D<float4> surfaceTexture = ResourceDescriptorHeap[constants.surfaceIndex];
     RWTexture2D<float> outputTexture = ResourceDescriptorHeap[constants.outputAOIndex];
 
-    float centerVisibility = aoTexture.Load(int3(pixel, 0));
-    float centerDepth = depthTexture.Load(int3(pixel, 0));
+    uint2 fullResolution;
+    depthTexture.GetDimensions(fullResolution.x, fullResolution.y);
+
+    if(any(fullResolution == 0u))
+    {
+        outputTexture[aoPixel] = 1.0f;
+        return;
+    }
+
+    uint2 fullPixel = AOToFullPixel(aoPixel, fullResolution);
+    float centerVisibility = aoTexture.Load(int3(aoPixel, 0));
+    float centerDepth = depthTexture.Load(int3(fullPixel, 0));
     if(!isfinite(centerDepth) || centerDepth < 0.0f || centerDepth >= 1.0f)
     {
-        outputTexture[pixel] = 1.0f;
+        outputTexture[aoPixel] = 1.0f;
         return;
     }
 
@@ -105,13 +125,13 @@ void CSMain(uint3 dispatchThreadID : SV_DispatchThreadID)
         centerVisibility = 1.0f;
     }
 
-    float3 centerSurfaceNormal = surfaceTexture.Load(int3(pixel, 0)).rgb;
+    float3 centerSurfaceNormal = surfaceTexture.Load(int3(fullPixel, 0)).rgb;
     float3 centerNormal;
     float3 centerPosition;
     if(!NormalizeWorldNormal(centerSurfaceNormal, centerNormal) ||
-       !ReconstructWorldPosition(pixel, centerDepth, centerPosition))
+       !ReconstructWorldPosition(fullPixel, centerDepth, fullResolution, centerPosition))
     {
-        outputTexture[pixel] = saturate(centerVisibility);
+        outputTexture[aoPixel] = saturate(centerVisibility);
         return;
     }
 
@@ -134,7 +154,7 @@ void CSMain(uint3 dispatchThreadID : SV_DispatchThreadID)
             }
 
             int2 offset = int2(x, y) * int(constants.stepWidth);
-            int2 samplePixel = int2(pixel) + offset;
+            int2 samplePixel = int2(aoPixel) + offset;
 
             if(any(samplePixel < 0) ||
                samplePixel.x >= int(constants.width) || samplePixel.y >= int(constants.height))
@@ -142,7 +162,8 @@ void CSMain(uint3 dispatchThreadID : SV_DispatchThreadID)
                 continue;
             }
 
-            float sampleDepth = depthTexture.Load(int3(samplePixel, 0));
+            uint2 sampleFullPixel = AOToFullPixel(uint2(samplePixel), fullResolution);
+            float sampleDepth = depthTexture.Load(int3(sampleFullPixel, 0));
 
             if(!isfinite(sampleDepth) || sampleDepth < 0.0f || sampleDepth >= 1.0f)
             {
@@ -151,7 +172,7 @@ void CSMain(uint3 dispatchThreadID : SV_DispatchThreadID)
 
             float3 sampleNormal;
 
-            if(!NormalizeWorldNormal(surfaceTexture.Load(int3(samplePixel, 0)).rgb, sampleNormal))
+            if(!NormalizeWorldNormal(surfaceTexture.Load(int3(sampleFullPixel, 0)).rgb, sampleNormal))
             {
                 continue;
             }
@@ -172,7 +193,7 @@ void CSMain(uint3 dispatchThreadID : SV_DispatchThreadID)
 
             float3 samplePosition;
 
-            if(!ReconstructWorldPosition(uint2(samplePixel), sampleDepth, samplePosition))
+            if(!ReconstructWorldPosition(sampleFullPixel, sampleDepth, fullResolution, samplePosition))
             {
                 continue;
             }
@@ -195,5 +216,5 @@ void CSMain(uint3 dispatchThreadID : SV_DispatchThreadID)
     }
 
     float visibility = totalWeight > 0.0f ? weightedVisibility / totalWeight : centerVisibility;
-    outputTexture[pixel] = saturate(visibility);
+    outputTexture[aoPixel] = saturate(visibility);
 }

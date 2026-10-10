@@ -542,7 +542,14 @@ float4 PSMain(VSOutput input) : SV_Target0
             {
                 Texture2D<float> aoVisibility = ResourceDescriptorHeap[aoVisibilityIndex];
                 float filteredAO = aoVisibility.Load(int3(pixel, 0));
-                irradiance *= lerp(1.0f, saturate(filteredAO), saturate(rtgiContactAOStrength));
+
+                float aoContrast = pow(saturate(filteredAO), 2.0f);
+
+                irradiance *= lerp(
+                    1.0f,
+                    aoContrast,
+                    saturate(rtgiContactAOStrength)
+                );
             }
         }
         else
@@ -562,6 +569,18 @@ float4 PSMain(VSOutput input) : SV_Target0
             }
         }
     }
+
+    Texture2D<float> specularAOTexture =
+        ResourceDescriptorHeap[aoVisibilityIndex];
+
+    float specularVisibility =
+        specularAOTexture.Load(int3(pixel, 0));
+
+    float specularAO = lerp(
+        1.0f,
+        isfinite(specularVisibility) ? saturate(specularVisibility) : 1.0f,
+        saturate(rtgiContactAOStrength)
+    );
 
     if(gpuMaterial.model == 0)
     {
@@ -743,7 +762,7 @@ float4 PSMain(VSOutput input) : SV_Target0
             reflectionRadiance;
 
         finalSpecular =
-            lerp(environmentSpecular, rayTracedSpecular, rtWeight);
+            lerp(environmentSpecular * specularAO, rayTracedSpecular, rtWeight);
 
         float3 environmentFresnel =
             F0 +
@@ -936,7 +955,7 @@ float4 PSMain(VSOutput input) : SV_Target0
             reflectionRadiance;
 
         finalSpecular =
-            lerp(environmentSpecular, rayTracedSpecular, rtWeight);
+            lerp(environmentSpecular * specularAO, rayTracedSpecular, rtWeight);
 
         float3 environmentFresnel =
             F0 +
@@ -1115,7 +1134,7 @@ float4 PSMain(VSOutput input) : SV_Target0
             reflectionRadiance;
 
         finalSpecular =
-            lerp(environmentSpecular, rayTracedSpecular, rtWeight);
+            lerp(environmentSpecular * specularAO, rayTracedSpecular, rtWeight);
     }
 
     float3 directional =

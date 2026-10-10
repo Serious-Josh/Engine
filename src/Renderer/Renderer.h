@@ -41,6 +41,7 @@
 #include "Passes/RayTracedAOPass.h"
 #include "Passes/AOTemporalPass.h"
 #include "Passes/AODenoisePass.h"
+#include "Passes/AOResolvePass.h"
 #include "Passes/NrdDiffuseResolvePass.h"
 #include "Passes/GISpatialDenoisePass.h"
 #include "Passes/GISignedCorrectionPass.h"
@@ -144,6 +145,7 @@ class Renderer
         RayTracedAOPass m_rayTracedAOPass;
         AOTemporalPass m_aoTemporalPass;
         AODenoisePass m_aoDenoisePass;
+        AOResolvePass m_aoResolvePass;
         ReflectionContributionLimitPass m_reflectionContributionLimitPass;
         NrdDenoiser m_nrdReflectionDenoiser;
         NrdDenoiser m_nrdGIDenoiser;

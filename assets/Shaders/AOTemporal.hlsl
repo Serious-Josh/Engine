@@ -22,6 +22,16 @@ struct AOTemporalConstants
 
 ConstantBuffer<AOTemporalConstants> constants : register(b0);
 
+uint2 AOToFullPixel(uint2 aoPixel, uint2 fullResolution)
+{
+    if(all(uint2(constants.width, constants.height) == fullResolution))
+    {
+        return aoPixel;
+    }
+
+    return min(aoPixel * 2u + 1u, fullResolution - 1u);
+}
+
 bool ReconstructWorldPosition(int2 pixel, float depth, uint2 dimensions,
     float4x4 inverseVP, out float3 position)
 {
@@ -46,7 +56,8 @@ bool ReconstructWorldPosition(int2 pixel, float depth, uint2 dimensions,
     return all(isfinite(position));
 }
 
-bool ReprojectWorldPosition(float3 position, uint2 dimensions, out float2 previousPixel)
+bool ReprojectWorldPosition(float3 position, uint2 dimensions, uint2 fullResolution,
+    out float2 previousPixel)
 {
     previousPixel = 0.0f;
     float4 clip = mul(constants.previousViewProjection, float4(position, 1.0f));
@@ -70,17 +81,39 @@ bool ReprojectWorldPosition(float3 position, uint2 dimensions, out float2 previo
         return false;
     }
 
-    previousPixel = uv * float2(dimensions) - 0.5f;
+    float2 previousFullPixel = uv * float2(fullResolution) - 0.5f;
+
+    if(all(dimensions == fullResolution))
+    {
+        previousPixel = previousFullPixel;
+    }
+    else
+    {
+        previousPixel = (previousFullPixel - 1.0f) * 0.5f;
+
+        // At an odd-sized edge, the last representative is clamped: the final
+        // interval spans one full-resolution pixel rather than two.
+        for(uint axis = 0u; axis < 2u; ++axis)
+        {
+            if((fullResolution[axis] & 1u) != 0u &&
+               dimensions[axis] == (fullResolution[axis] + 1u) / 2u &&
+               previousFullPixel[axis] > float(fullResolution[axis]) - 2.0f)
+            {
+                previousPixel[axis] = float(dimensions[axis] - 1u) +
+                    previousFullPixel[axis] - float(fullResolution[axis] - 1u);
+            }
+        }
+    }
     return all(isfinite(previousPixel));
 }
 
 [numthreads(8, 8, 1)]
 void CSMain(uint3 dispatchThreadID : SV_DispatchThreadID)
 {
-    uint2 pixel = dispatchThreadID.xy;
+    uint2 aoPixel = dispatchThreadID.xy;
     uint2 dimensions = uint2(constants.width, constants.height);
 
-    if(any(pixel >= dimensions))
+    if(any(aoPixel >= dimensions))
     {
         return;
     }
@@ -92,15 +125,27 @@ void CSMain(uint3 dispatchThreadID : SV_DispatchThreadID)
     RWTexture2D<float> outputDepth = ResourceDescriptorHeap[constants.outputDepthIndex];
     RWTexture2D<float> outputHistoryLength = ResourceDescriptorHeap[constants.outputHistoryLengthIndex];
 
-    float rawVisibility = rawAOTexture.Load(int3(pixel, 0));
-    float depth = depthTexture.Load(int3(pixel, 0));
-    float3 surfaceNormal = surfaceTexture.Load(int3(pixel, 0)).rgb;
-    outputDepth[pixel] = depth;
+    uint2 fullResolution;
+    depthTexture.GetDimensions(fullResolution.x, fullResolution.y);
+
+    if(any(fullResolution == 0u))
+    {
+        outputAO[aoPixel] = 1.0f;
+        outputDepth[aoPixel] = 1.0f;
+        outputHistoryLength[aoPixel] = 1.0f;
+        return;
+    }
+
+    uint2 fullPixel = AOToFullPixel(aoPixel, fullResolution);
+    float rawVisibility = rawAOTexture.Load(int3(aoPixel, 0));
+    float depth = depthTexture.Load(int3(fullPixel, 0));
+    float3 surfaceNormal = surfaceTexture.Load(int3(fullPixel, 0)).rgb;
+    outputDepth[aoPixel] = depth;
 
     if(!isfinite(depth) || depth < 0.0f || depth >= 1.0f)
     {
-        outputAO[pixel] = 1.0f;
-        outputHistoryLength[pixel] = 1.0f;
+        outputAO[aoPixel] = 1.0f;
+        outputHistoryLength[aoPixel] = 1.0f;
         return;
     }
 
@@ -115,9 +160,9 @@ void CSMain(uint3 dispatchThreadID : SV_DispatchThreadID)
     {
         float3 worldPosition;
         float2 previousPixelPosition;
-        if(ReconstructWorldPosition(int2(pixel), depth, dimensions,
+        if(ReconstructWorldPosition(int2(fullPixel), depth, fullResolution,
             constants.inverseViewProjection, worldPosition) &&
-           ReprojectWorldPosition(worldPosition, dimensions, previousPixelPosition))
+           ReprojectWorldPosition(worldPosition, dimensions, fullResolution, previousPixelPosition))
         {
             // History resources are accessed only after the first frame and valid reprojection.
             Texture2D<float> previousAO = ResourceDescriptorHeap[constants.previousAOIndex];
@@ -153,7 +198,9 @@ void CSMain(uint3 dispatchThreadID : SV_DispatchThreadID)
                 float candidateDepth = previousDepth.Load(int3(candidate, 0));
                 float3 previousWorldPosition;
 
-                if(!ReconstructWorldPosition(candidate, candidateDepth, dimensions,
+                uint2 candidateFullPixel = AOToFullPixel(uint2(candidate), fullResolution);
+
+                if(!ReconstructWorldPosition(int2(candidateFullPixel), candidateDepth, fullResolution,
                     constants.previousInverseViewProjection, previousWorldPosition))
                 {
                     continue;
@@ -194,6 +241,6 @@ void CSMain(uint3 dispatchThreadID : SV_DispatchThreadID)
         }
     }
 
-    outputAO[pixel] = accumulatedAO;
-    outputHistoryLength[pixel] = historyLength;
+    outputAO[aoPixel] = accumulatedAO;
+    outputHistoryLength[aoPixel] = historyLength;
 }
