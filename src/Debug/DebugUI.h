@@ -2,6 +2,10 @@
 
 #include "Renderer/RendererStatistics.h"
 #include "Renderer/Passes/ToneMapPass.h"
+#include "GpuTimingMonitor.h"
+#include "GpuTimingGraph.h"
+#include "CpuFrameTiming.h"
+#include "FramePacingMonitor.h"
 
 #include <climits>
 #include <cstdint>
@@ -35,6 +39,9 @@ class DebugUI
         void EndFrame(ID3D12GraphicsCommandList* commandList);
 
         void SetTLASUpdated(bool updated);
+        void RecordFramePacingCpuTiming(const CpuTiming::FrameSample& sample) { m_framePacingMonitor.RecordCpu(sample); }
+        void RecordFramePacingGaps(const GpuTimestampProfiler::Results& results) { m_framePacingMonitor.RecordGaps(results); }
+        void RecordCpuFrameTiming(const CpuTiming::FrameSample& sample);
         ReflectionDenoiserMode GetReflectionDenoiserMode() const { return static_cast<ReflectionDenoiserMode>(m_reflectionDenoiserMode); }
         bool IsReflectionContributionLimiterEnabled() const { return m_contributionLimiterEnabled; }
         ToneMapDebugView GetToneMapDebugView() const { return static_cast<ToneMapDebugView>(m_toneMapDebugView); }
@@ -59,6 +66,19 @@ class DebugUI
         }
 
     private:
+        void DrawFramePacingSpikes();
+        FramePacingMonitor m_framePacingMonitor;
+        std::array<FramePacingMonitor::Event, 16> m_pausedFramePacingEvents{};
+        unsigned int m_pausedFramePacingEventCount = 0;
+        bool m_framePacingViewPaused = false;
+        void DrawCpuTiming();
+        std::array<CpuTiming::FrameSample, 120> m_cpuFrameSamples{};
+        unsigned int m_cpuFrameSampleCount = 0;
+        unsigned int m_nextCpuFrameSample = 0;
+        void DrawGpuTimingMonitor(const GpuTimestampProfiler::Results& results);
+        GpuTimingMonitor m_gpuTimingMonitor;
+        GpuTimingGraph m_gpuTimingGraph;
+
         DescriptorHeap* m_descriptorHeap = nullptr;
 
         bool m_tlasUpdated = false;

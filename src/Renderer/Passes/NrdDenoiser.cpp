@@ -256,6 +256,14 @@ bool NrdDenoiser::SetFrameSettings(
 
     if(m_signal != Signal::Diffuse)
     {
+        // Temporary A/B test: skip specular reconstruction after history rejection.
+        // NRD permits zero reconstructed frames; keep the remaining History Fix work.
+        constexpr bool kDisableSpecularHistoryReconstruction = true;
+        if(kDisableSpecularHistoryReconstruction)
+        {
+            reblurSettings.historyFixFrameNum = 0;
+        }
+
         const nrd::Result specularResult =
             m_Integration.SetDenoiserSettings(
                 kSpecularDenoiserIdentifier,

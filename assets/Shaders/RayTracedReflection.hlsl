@@ -1464,12 +1464,15 @@ void RayGeneration()
     }
 
     static const float GGX_STRATEGY_PROBABILITY = 0.5f;
+    // Temporary A/B diagnostic: use only GGX VNDF for primary reflections.
+    static const bool REFLECTION_DIAGNOSTIC_GGX_ONLY = true;
 
     bool mirrorReflection =
         primaryMaterial.roughness <= 0.001f;
 
     bool useGGXStrategy =
         mirrorReflection ||
+        REFLECTION_DIAGNOSTIC_GGX_ONLY ||
         strategySample < GGX_STRATEGY_PROBABILITY;
 
     float3 halfVector =
@@ -1890,25 +1893,30 @@ void RayGeneration()
                     primaryMaterial.roughness
                 );
 
-            float environmentPDF =
-                EvaluateEnvironmentPDF(
-                    reflectionDirection
-                );
+            // GGX-only sampling uses its own PDF, without the MIS mixture factors.
+            float samplingPDF = ggxPDF;
+            if(!REFLECTION_DIAGNOSTIC_GGX_ONLY)
+            {
+                float environmentPDF =
+                    EvaluateEnvironmentPDF(
+                        reflectionDirection
+                    );
 
-            float environmentStrategyProbability =
-                1.0f - GGX_STRATEGY_PROBABILITY;
+                float environmentStrategyProbability =
+                    1.0f - GGX_STRATEGY_PROBABILITY;
 
-            float mixturePDF =
-                GGX_STRATEGY_PROBABILITY *
-                ggxPDF +
-                environmentStrategyProbability *
-                environmentPDF;
+                samplingPDF =
+                    GGX_STRATEGY_PROBABILITY *
+                    ggxPDF +
+                    environmentStrategyProbability *
+                    environmentPDF;
+            }
 
-            if(mixturePDF > 0.0f)
+            if(samplingPDF > 0.0f)
             {
                 sampleWeight =
                     F * D * G /
-                    (4.0f * NdotV * mixturePDF);
+                    (4.0f * NdotV * samplingPDF);
             }
         }
 

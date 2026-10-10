@@ -73,6 +73,10 @@ void GpuTimestampProfiler::Shutdown()
 
     m_results = {};
     m_timestampFrequency = 0;
+    m_frameSequence = 0;
+    m_previousBoundaryValid = false;
+    m_gapSampleCount = 0;
+    m_nextGapSample = 0;
 }
 
 void GpuTimestampProfiler::BeginFrame(ID3D12GraphicsCommandList* commandList, unsigned int frameIndex)
@@ -82,6 +86,7 @@ void GpuTimestampProfiler::BeginFrame(ID3D12GraphicsCommandList* commandList, un
     }
 
     m_frameSlots[frameIndex].recordedRegions = 0;
+    m_frameSlots[frameIndex].sequence = m_frameSequence;
 
     BeginRegion(commandList, frameIndex, Region::TotalFrame);
 }
@@ -196,8 +201,10 @@ bool GpuTimestampProfiler::CollectCompleted(uint64_t completedFenceValue)
     const uint64_t readbackOffset = static_cast<uint64_t>(newestCompletedFrameIndex) * ReadbackBytesPerFrame;
 
     D3D12_RANGE readRange{};
-    readRange.Begin = static_cast<SIZE_T>(readbackOffset);
-    readRange.End = static_cast<SIZE_T>(readbackOffset + ReadbackBytesPerFrame);
+    // Inspect every completed slot for boundary continuity, while publishing
+    // the newest per-pass result exactly as before. Never read an incomplete slot.
+    readRange.Begin = 0;
+    readRange.End = static_cast<SIZE_T>(ReadbackBufferSize);
 
     void* mappedData = nullptr;
 
@@ -214,6 +221,33 @@ bool GpuTimestampProfiler::CollectCompleted(uint64_t completedFenceValue)
     Results collected{};
     collected.frameSerial = newestCompletedSlot->frameSerial;
     collected.validRegions = newestCompletedSlot->recordedRegions;
+
+    bool processed[FrameCount]{};
+    for(unsigned int completed = 0; completed < FrameCount; ++completed)
+    {
+        unsigned int oldestIndex = FrameCount;
+        for(unsigned int i = 0; i < FrameCount; ++i)
+        {
+            const FrameSlot& slot = m_frameSlots[i];
+            if(processed[i] || !slot.pending || slot.submissionFence > completedFenceValue)
+            {
+                continue;
+            }
+            if(oldestIndex == FrameCount || slot.frameSerial < m_frameSlots[oldestIndex].frameSerial)
+            {
+                oldestIndex = i;
+            }
+        }
+        if(oldestIndex == FrameCount)
+        {
+            break;
+        }
+
+        processed[oldestIndex] = true;
+        const uint64_t* frameTimestamps = reinterpret_cast<const uint64_t*>(
+            bytes + static_cast<uint64_t>(oldestIndex) * ReadbackBytesPerFrame);
+        CollectInterFrameGap(m_frameSlots[oldestIndex], frameTimestamps, collected);
+    }
 
     for(unsigned int regionIndex = 0; regionIndex < RegionCount; ++regionIndex)
     {
@@ -260,6 +294,66 @@ bool GpuTimestampProfiler::CollectCompleted(uint64_t completedFenceValue)
 const GpuTimestampProfiler::Results& GpuTimestampProfiler::GetResults() const
 {
     return m_results;
+}
+
+void GpuTimestampProfiler::BreakFrameSequence()
+{
+    // Tag future recordings; pending readbacks retain their original sequence.
+    ++m_frameSequence;
+}
+
+void GpuTimestampProfiler::CollectInterFrameGap(
+    const FrameSlot& slot, const uint64_t* timestamps, Results& results)
+{
+    const unsigned int boundaryIndex = static_cast<unsigned int>(Region::TotalFrame) * QueriesPerRegion;
+    const uint64_t begin = timestamps[boundaryIndex];
+    const uint64_t end = timestamps[boundaryIndex + 1u];
+    const uint32_t boundaryBit = 1u << static_cast<unsigned int>(Region::TotalFrame);
+    const bool boundaryValid = (slot.recordedRegions & boundaryBit) != 0 &&
+        end >= begin && m_timestampFrequency != 0;
+    const bool consecutive = m_previousBoundaryValid &&
+        slot.sequence == m_previousBoundarySequence && slot.frameSerial > m_previousBoundarySerial &&
+        slot.frameSerial - m_previousBoundarySerial == 1u;
+
+    results.interFrameGapValid = false;
+    const bool frameOutOfOrder = (slot.recordedRegions & boundaryBit) != 0 && end < begin;
+    results.interFrameGapOutOfOrder = frameOutOfOrder ||
+        (boundaryValid && consecutive && begin < m_previousFrameEnd);
+    if(boundaryValid && consecutive && !results.interFrameGapOutOfOrder)
+    {
+        results.interFrameGapValid = true;
+        results.interFrameGapMilliseconds = static_cast<double>(begin - m_previousFrameEnd) *
+            1000.0 / static_cast<double>(m_timestampFrequency);
+        if(results.resolvedGapCount < FrameCount)
+        {
+            results.resolvedGaps[results.resolvedGapCount++] = {
+                m_previousBoundarySerial, slot.frameSerial, results.interFrameGapMilliseconds};
+        }
+        m_gapSamples[m_nextGapSample] = results.interFrameGapMilliseconds;
+        m_nextGapSample = (m_nextGapSample + 1u) % 120u;
+        if(m_gapSampleCount < 120u)
+        {
+            ++m_gapSampleCount;
+        }
+    }
+
+    double sum = 0.0;
+    results.interFrameGapMaximum = 0.0;
+    for(unsigned int i = 0; i < m_gapSampleCount; ++i)
+    {
+        sum += m_gapSamples[i];
+        if(m_gapSamples[i] > results.interFrameGapMaximum)
+        {
+            results.interFrameGapMaximum = m_gapSamples[i];
+        }
+    }
+    results.interFrameGapSampleCount = m_gapSampleCount;
+    results.interFrameGapAverage = m_gapSampleCount != 0 ? sum / m_gapSampleCount : 0.0;
+
+    m_previousBoundaryValid = boundaryValid && !results.interFrameGapOutOfOrder;
+    m_previousBoundarySequence = slot.sequence;
+    m_previousBoundarySerial = slot.frameSerial;
+    m_previousFrameEnd = end;
 }
 
 unsigned int GpuTimestampProfiler::GetBeginQueryIndex(unsigned int frameIndex, Region region)

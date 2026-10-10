@@ -1,4 +1,5 @@
 #pragma once
+#include "Debug/CpuFrameTiming.h"
 
 #include "GBuffer.h"
 #include "UploadBuffer.h"
@@ -109,8 +110,13 @@ class Renderer
         bool SetEnvironment(size_t index);
 
         const RendererStatistics& GetStatistics() const;
+        const CpuTiming::FrameSample& GetCpuFrameTiming() const { return m_cpuFrameTiming; }
+        void ResetCpuSubmissionCadence() { m_hasPreviousRenderExecute = false; }
 
     private:
+        CpuTiming::FrameSample m_cpuFrameTiming;
+        CpuTiming::Clock::time_point m_previousRenderExecuteStart;
+        bool m_hasPreviousRenderExecute = false;
         bool InitializeDevice();
         bool InitializeSwapChain(void* windowHandle);
         void Draw(ID3D12GraphicsCommandList* commandList, const RenderObject& object, D3D12_GPU_VIRTUAL_ADDRESS cameraConstantsAddress);

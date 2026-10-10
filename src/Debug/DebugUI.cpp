@@ -7,6 +7,383 @@
 #include "imgui_impl_dx12.h"
 #include "ImGuizmo.h"
 
+void DebugUI::RecordCpuFrameTiming(const CpuTiming::FrameSample& sample)
+{
+    if(!sample.valid)
+    {
+        return;
+    }
+
+    m_cpuFrameSamples[m_nextCpuFrameSample] = sample;
+    m_nextCpuFrameSample = (m_nextCpuFrameSample + 1u) % m_cpuFrameSamples.size();
+    m_cpuFrameSampleCount = (std::min)(m_cpuFrameSampleCount + 1u,
+        static_cast<unsigned int>(m_cpuFrameSamples.size()));
+}
+
+void DebugUI::DrawFramePacingSpikes()
+{
+    if(!ImGui::CollapsingHeader("Frame Pacing Spikes"))
+    {
+        return;
+    }
+    ImGui::TextWrapped("GPU boundary gaps above 10 ms; newest 16. These are not proven GPU idle times or evidence of causation.");
+    if(ImGui::Button(m_framePacingViewPaused ? "Resume##FramePacing" : "Pause##FramePacing"))
+    {
+        m_framePacingViewPaused = !m_framePacingViewPaused;
+        if(m_framePacingViewPaused)
+        {
+            // Freeze only the view; live collection and pending CPU matches continue.
+            m_pausedFramePacingEventCount = m_framePacingMonitor.EventCount();
+            for(unsigned int i = 0; i < m_pausedFramePacingEventCount; ++i)
+            {
+                m_pausedFramePacingEvents[i] = m_framePacingMonitor.NewestEvent(i);
+            }
+        }
+    }
+    if(m_framePacingViewPaused)
+    {
+        ImGui::SameLine();
+        ImGui::TextUnformatted("View paused; collection continues.");
+    }
+    const unsigned int eventCount = m_framePacingViewPaused
+        ? m_pausedFramePacingEventCount : m_framePacingMonitor.EventCount();
+    if(eventCount == 0)
+    {
+        ImGui::TextUnformatted("No qualifying gaps collected.");
+    }
+    for(unsigned int i = 0; i < eventCount; ++i)
+    {
+        const auto& event = m_framePacingViewPaused
+            ? m_pausedFramePacingEvents[i] : m_framePacingMonitor.NewestEvent(i);
+        const bool hasPrevious = event.previous.state == FramePacingMonitor::RecordState::Available;
+        const bool hasCurrent = event.current.state == FramePacingMonitor::RecordState::Available;
+        const auto& previous = event.previous.sample;
+        const auto& current = event.current.sample;
+        ImGui::PushID(&event);
+        const bool expanded = ImGui::TreeNode("Event", "GPU gap %.3f ms | frames %llu -> %llu%s",
+            event.gap.milliseconds,
+            static_cast<unsigned long long>(event.gap.previousSerial),
+            static_cast<unsigned long long>(event.gap.currentSerial),
+            hasPrevious && hasCurrent ? "" : " | incomplete");
+
+        const auto timing = [](const char* label, bool available, double milliseconds)
+        {
+            if(available)
+            {
+                ImGui::Text("%s: %.3f ms", label, milliseconds);
+            }
+            else
+            {
+                ImGui::Text("%s: unavailable", label);
+            }
+        };
+        timing("Previous Present", hasPrevious && previous.presentationReturned, previous.present);
+        timing("Current fence wait", hasCurrent, current.fenceWait);
+        timing("Current command recording", hasCurrent, current.recording);
+        const auto interval = [](CpuTiming::Clock::time_point begin, CpuTiming::Clock::time_point end)
+        {
+            return std::chrono::duration<double, std::milli>(end - begin).count();
+        };
+        timing("Execute start-to-start", hasPrevious && hasCurrent,
+            interval(previous.executeStart, current.executeStart));
+        if(expanded)
+        {
+            const auto status = [](const char* label, FramePacingMonitor::RecordState state)
+            {
+                if(state != FramePacingMonitor::RecordState::Available)
+                {
+                    ImGui::Text("%s CPU record: %s", label,
+                        state == FramePacingMonitor::RecordState::Pending
+                            ? "awaiting publication" : "missing or expired");
+                }
+            };
+            status("Previous", event.previous.state);
+            status("Current", event.current.state);
+            timing("Previous Execute duration", hasPrevious, previous.execute);
+            timing("Current Execute duration", hasCurrent, current.execute);
+            timing("Previous frame execution", hasPrevious, previous.frameExecution);
+            timing("Current frame execution", hasCurrent, current.frameExecution);
+            timing("Previous command recording", hasPrevious, previous.recording);
+            timing("Previous fence wait", hasPrevious, previous.fenceWait);
+            timing("Current Present", hasCurrent && current.presentationReturned, current.present);
+            timing("Previous Present return to current Execute", hasPrevious && hasCurrent && previous.presentationReturned,
+                interval(previous.presentReturn, current.executeStart));
+            // Relative CPU anchors preserve ordering without exposing implementation-specific clock epochs.
+            timing("Previous Execute after previous frame start", hasPrevious,
+                interval(previous.frameStart, previous.executeStart));
+            timing("Previous Present return after previous frame start", hasPrevious && previous.presentationReturned,
+                interval(previous.frameStart, previous.presentReturn));
+            timing("Current frame start after previous frame start", hasPrevious && hasCurrent,
+                interval(previous.frameStart, current.frameStart));
+            timing("Current Execute after previous frame start", hasPrevious && hasCurrent,
+                interval(previous.frameStart, current.executeStart));
+            if(hasCurrent)
+            {
+                ImGui::Text("Current Begin waited: %s", current.fenceWaited ? "yes" : "no");
+            }
+            ImGui::TreePop();
+        }
+        ImGui::PopID();
+        ImGui::Separator();
+    }
+}
+
+void DebugUI::DrawCpuTiming()
+{
+    if(!ImGui::CollapsingHeader("CPU Timing"))
+    {
+        return;
+    }
+
+    if(m_cpuFrameSampleCount == 0)
+    {
+        ImGui::TextUnformatted("Waiting for a completed CPU frame.");
+        return;
+    }
+
+    const unsigned int latestIndex =
+        (m_nextCpuFrameSample + m_cpuFrameSamples.size() - 1u) % m_cpuFrameSamples.size();
+    const CpuTiming::FrameSample& latest = m_cpuFrameSamples[latestIndex];
+    ImGui::Text("Completed CPU frame %llu | Begin fence wait: %s",
+        static_cast<unsigned long long>(latest.frameSerial), latest.fenceWaited ? "entered" : "not needed");
+    ImGui::TextUnformatted("Wall-clock durations, including blocking. Latest / last 120 average / maximum.");
+    ImGui::TextUnformatted("Begin contains wait + reset; Render contains all renderer stages.");
+    ImGui::TextUnformatted("Start interval ends at this frame's entry; execution measures this frame's work.");
+    ImGui::TextUnformatted("Execute start-to-start is CPU submission cadence, not GPU start or idle time.");
+
+    struct TimingRow
+    {
+        const char* label;
+        double CpuTiming::FrameSample::* value;
+        bool CpuTiming::FrameSample::* valid = nullptr;
+    };
+    static constexpr TimingRow rows[] = {
+        {"Frame start-to-start", &CpuTiming::FrameSample::frameInterval, &CpuTiming::FrameSample::frameIntervalValid},
+        {"Frame execution (incl. messages/UI)", &CpuTiming::FrameSample::frameExecution},
+        {"Renderer::Render total", &CpuTiming::FrameSample::render},
+        {"CommandContext::Begin total", &CpuTiming::FrameSample::begin},
+        {"Begin fence wait only", &CpuTiming::FrameSample::fenceWait},
+        {"Begin allocator/list reset", &CpuTiming::FrameSample::commandReset},
+        {"Renderer command recording", &CpuTiming::FrameSample::recording},
+        {"CommandContext::End", &CpuTiming::FrameSample::end},
+        {"CommandContext::Execute (incl. Signal)", &CpuTiming::FrameSample::execute},
+        {"Execute start-to-start", &CpuTiming::FrameSample::executeInterval, &CpuTiming::FrameSample::executeIntervalValid},
+        {"SwapChain::Present (VSync)", &CpuTiming::FrameSample::present}
+    };
+
+    if(ImGui::BeginTable("CPU frame durations", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV))
+    {
+        for(const char* heading : {"CPU stage", "Latest ms", "Average ms", "Maximum ms"})
+        {
+            ImGui::TableSetupColumn(heading);
+        }
+        ImGui::TableHeadersRow();
+
+        for(const TimingRow& row : rows)
+        {
+            double sum = 0.0;
+            double maximum = 0.0;
+            unsigned int count = 0;
+            for(unsigned int i = 0; i < m_cpuFrameSampleCount; ++i)
+            {
+                const CpuTiming::FrameSample& sample = m_cpuFrameSamples[i];
+                if(row.valid != nullptr && !(sample.*(row.valid)))
+                {
+                    continue;
+                }
+                const double value = sample.*(row.value);
+                sum += value;
+                maximum = (std::max)(maximum, value);
+                ++count;
+            }
+
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(row.label);
+            ImGui::TableNextColumn();
+            if(row.valid == nullptr || latest.*(row.valid))
+            {
+                ImGui::Text("%.3f", latest.*(row.value));
+            }
+            else
+            {
+                ImGui::TextUnformatted("--");
+            }
+            ImGui::TableNextColumn();
+            if(count > 0)
+            {
+                ImGui::Text("%.3f", sum / count);
+            }
+            else
+            {
+                ImGui::TextUnformatted("--");
+            }
+            ImGui::TableNextColumn();
+            if(count > 0)
+            {
+                ImGui::Text("%.3f", maximum);
+            }
+            else
+            {
+                ImGui::TextUnformatted("--");
+            }
+        }
+        ImGui::EndTable();
+    }
+}
+
+void DebugUI::DrawGpuTimingMonitor(const GpuTimestampProfiler::Results& results)
+{
+    GpuTimingMonitor& monitor = m_gpuTimingMonitor;
+    const bool open = ImGui::CollapsingHeader("GPU Timing Monitor");
+    if(open)
+    {
+        if(ImGui::Checkbox("Monitoring enabled", &monitor.enabled))
+        {
+            // A disabled interval should not leave an old excursion latched.
+            monitor.ResetExcursions();
+        }
+        if(ImGui::SliderFloat("Spike/drop threshold (ms)", &monitor.threshold, 0.01f, 5.0f, "%.2f"))
+        {
+            monitor.ResetExcursions();
+        }
+        if(ImGui::Button(monitor.frozen ? "Unfreeze" : "Freeze"))
+        {
+            monitor.frozen = !monitor.frozen;
+        }
+
+        ImGui::SameLine();
+        if(ImGui::Button("Clear history"))
+        {
+            monitor.Clear();
+        }
+    }
+    // Continue collecting even when this section is collapsed.
+    monitor.Update(results);
+    if(!open)
+    {
+        return;
+    }
+
+    ImGui::TextUnformatted("Resolved GPU frames; freeze pauses monitor sampling. Times in ms.");
+    if(monitor.hasFrame)
+    {
+        ImGui::Text("Monitor GPU frame: %llu", static_cast<unsigned long long>(monitor.sampledFrame));
+    }
+
+    ImGui::TextUnformatted("Recent events (newest first)");
+    ImGui::BeginChild("GPU timing events", ImVec2(0.0f, ImGui::GetTextLineHeightWithSpacing() * 6.0f), false,
+        ImGuiWindowFlags_HorizontalScrollbar);
+    if(monitor.eventCount == 0)
+    {
+        ImGui::TextUnformatted("No events (requires 10 previous valid samples).");
+    }
+
+    for(unsigned int i = 0; i < monitor.eventCount; ++i)
+    {
+        const unsigned int eventIndex =
+            (monitor.nextEvent + GpuTimingMonitor::EventCapacity - 1u - i) % GpuTimingMonitor::EventCapacity;
+        const GpuTimingMonitor::Event& event = monitor.events[eventIndex];
+        const bool spike = event.delta > 0.0;
+        const ImVec4 eventColor = spike
+            ? ImVec4(1.0f, 0.55f, 0.35f, 1.0f)
+            : ImVec4(0.35f, 0.85f, 1.0f, 1.0f);
+
+        ImGui::TextColored(eventColor,
+            "%s | %s | %.3f -> %.3f | %+.3f ms | frame %llu", GpuTimingRegionNames[event.region],
+            spike ? "Spike" : "Drop", event.baseline, event.current, event.delta,
+            static_cast<unsigned long long>(event.frame));
+    }
+    ImGui::EndChild();
+
+    struct RegionStatistics
+    {
+        unsigned int region;
+        double average;
+        double minimum;
+        double maximum;
+    };
+
+    std::array<RegionStatistics, GpuTimingMonitor::RegionCount> rows{};
+    for(unsigned int region = 0; region < rows.size(); ++region)
+    {
+        const GpuTimingMonitor::History& history = monitor.histories[region];
+        RegionStatistics& row = rows[region];
+        row.region = region;
+        if(history.count == 0)
+        {
+            continue;
+        }
+
+        row.minimum = history.samples[0];
+        row.maximum = history.samples[0];
+        for(unsigned int sampleIndex = 0; sampleIndex < history.count; ++sampleIndex)
+        {
+            const double value = history.samples[sampleIndex];
+            row.average += value;
+            row.minimum = (std::min)(row.minimum, value);
+            row.maximum = (std::max)(row.maximum, value);
+        }
+        row.average /= history.count;
+    }
+    std::sort(rows.begin(), rows.end(), [](const RegionStatistics& left, const RegionStatistics& right)
+    {
+        const double leftRange = left.maximum - left.minimum;
+        const double rightRange = right.maximum - right.minimum;
+        if(leftRange == rightRange)
+        {
+            return left.region < right.region;
+        }
+
+        return leftRange > rightRange;
+    });
+    ImGui::TextUnformatted("Last 120 valid samples per region, sorted by range");
+    if(ImGui::BeginTable("GPU timing statistics", 6,
+        ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY,
+        ImVec2(0.0f, ImGui::GetTextLineHeightWithSpacing() * 12.0f)))
+    {
+        ImGui::TableSetupScrollFreeze(0, 1);
+        for(const char* heading : {"Region", "Current", "Average", "Min", "Max", "Range"})
+        {
+            ImGui::TableSetupColumn(heading);
+        }
+
+        ImGui::TableHeadersRow();
+        for(const RegionStatistics& row : rows)
+        {
+            const GpuTimingMonitor::History& history = monitor.histories[row.region];
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(GpuTimingRegionNames[row.region]);
+
+            ImGui::TableNextColumn();
+            if(history.currentValid)
+            {
+                ImGui::Text("%.3f", history.current);
+            }
+            else
+            {
+                ImGui::TextUnformatted("--");
+            }
+
+            const double values[] = {row.average, row.minimum, row.maximum, row.maximum - row.minimum};
+            for(double value : values)
+            {
+                ImGui::TableNextColumn();
+                if(history.count != 0)
+                {
+                    ImGui::Text("%.3f", value);
+                }
+                else
+                {
+                    ImGui::TextUnformatted("--");
+                }
+            }
+        }
+        ImGui::EndTable();
+    }
+}
+
 static void AllocateImGuiDescriptor(ImGui_ImplDX12_InitInfo* info, D3D12_CPU_DESCRIPTOR_HANDLE* cpuHandle, D3D12_GPU_DESCRIPTOR_HANDLE* gpuHandle)
 {
     DescriptorHeap* descriptorHeap = static_cast<DescriptorHeap*>(info->UserData);
@@ -113,7 +490,7 @@ void DebugUI::DrawPerformanceWindow(const std::vector<std::string>& environmentN
     ImGui::Text("%.1f FPS", io.Framerate);
 
     if(io.Framerate > 0.0f){
-        ImGui::Text("%.2f ms", 1000.0f / io.Framerate);
+        ImGui::Text("%.2f ms (smoothed frame interval)", 1000.0f / io.Framerate);
     }
 
     ImGui::Separator();
@@ -164,6 +541,26 @@ void DebugUI::DrawPerformanceWindow(const std::vector<std::string>& environmentN
         "GPU frame",
         GpuTimestampProfiler::Region::TotalFrame);
 
+    if(gpu.interFrameGapValid)
+    {
+        ImGui::Text("GPU inter-frame gap: %.3f ms", gpu.interFrameGapMilliseconds);
+    }
+    else
+    {
+        ImGui::Text("GPU inter-frame gap: -- (%s)", gpu.interFrameGapOutOfOrder
+            ? "timestamp order error" : "unavailable");
+    }
+    if(gpu.interFrameGapSampleCount > 0)
+    {
+        ImGui::Text("  Last 120 valid: average %.3f ms | max %.3f ms",
+            gpu.interFrameGapAverage, gpu.interFrameGapMaximum);
+    }
+    else
+    {
+        ImGui::TextUnformatted("  Last 120 valid: average -- | max --");
+    }
+    ImGui::TextUnformatted("  Timestamp boundary interval; not proven GPU idle time.");
+
     ImGui::TextUnformatted("Geometry / scene");
     drawGpuTiming("  TLAS update", GpuTimestampProfiler::Region::TlasUpdate);
     drawGpuTiming(
@@ -201,8 +598,23 @@ void DebugUI::DrawPerformanceWindow(const std::vector<std::string>& environmentN
         GpuTimestampProfiler::Region::NrdPrepare);
 
     drawGpuTiming(
-        "  NRD REBLUR",
-        GpuTimestampProfiler::Region::NrdReblur);
+        "  NRD REBLUR Specular",
+        GpuTimestampProfiler::Region::NrdReblurSpecular);
+    drawGpuTiming(
+        "  NRD REBLUR Diffuse",
+        GpuTimestampProfiler::Region::NrdReblurDiffuse);
+
+    const unsigned int specularIndex = static_cast<unsigned int>(GpuTimestampProfiler::Region::NrdReblurSpecular);
+    const unsigned int diffuseIndex = static_cast<unsigned int>(GpuTimestampProfiler::Region::NrdReblurDiffuse);
+    const uint32_t reblurMask = (1u << specularIndex) | (1u << diffuseIndex);
+    if((gpu.validRegions & reblurMask) == reblurMask)
+    {
+        ImGui::Text("  NRD REBLUR: %.3f ms", gpu.milliseconds[specularIndex] + gpu.milliseconds[diffuseIndex]);
+    }
+    else
+    {
+        ImGui::TextUnformatted("  NRD REBLUR: -- (inactive / unavailable)");
+    }
 
     drawGpuTiming(
         "  NRD reflection resolve",
@@ -223,6 +635,7 @@ void DebugUI::DrawPerformanceWindow(const std::vector<std::string>& environmentN
         GpuTimestampProfiler::Region::ToneMap);
     drawGpuTiming("  DebugUI rendering", GpuTimestampProfiler::Region::DebugUI);
 
+
     ImGui::Separator();
 
     ImGui::Text("TLAS update %s", m_tlasUpdated ? "yes" : "no");
@@ -231,6 +644,13 @@ void DebugUI::DrawPerformanceWindow(const std::vector<std::string>& environmentN
     ImGui::End();
 
     ImGui::Begin("Rendering debug");
+
+    DrawCpuTiming();
+    DrawFramePacingSpikes();
+
+    ImGui::Checkbox("GPU Timing Graph", &m_gpuTimingGraph.visible);
+
+    DrawGpuTimingMonitor(gpu);
 
     ImGui::TextUnformatted("Environment");
 
@@ -392,6 +812,7 @@ void DebugUI::DrawPerformanceWindow(const std::vector<std::string>& environmentN
 
 void DebugUI::EndFrame(ID3D12GraphicsCommandList* commandList)
 {
+    m_gpuTimingGraph.Draw(m_gpuTimingMonitor);
     ImGui::Render();
     ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), commandList);
 }

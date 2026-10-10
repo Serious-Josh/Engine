@@ -1,4 +1,5 @@
 #include "CommandContext.h"
+#include "Debug/CpuFrameTiming.h"
 #include "Core/Log.h"
 #ifdef _DEBUG
 #include "GraphicsDevice.h"
@@ -126,6 +127,10 @@ void CommandContext::Shutdown()
 
 bool CommandContext::Begin(unsigned int frameIndex)
 {
+    m_beginWaitedForFence = false;
+    m_beginFenceWaitMilliseconds = 0.0;
+    m_beginResetMilliseconds = 0.0;
+
     if(frameIndex >= FrameCount){
         return false;
     }
@@ -161,7 +166,10 @@ bool CommandContext::Begin(unsigned int frameIndex)
             return false;
         }
 
+        m_beginWaitedForFence = true;
+        const auto waitStart = CpuTiming::Clock::now();
         const DWORD waitResult = WaitForSingleObject(static_cast<HANDLE>(m_fenceEvent), INFINITE);
+        m_beginFenceWaitMilliseconds = CpuTiming::MillisecondsSince(waitStart);
         if(waitResult == WAIT_FAILED){
             const DWORD error = GetLastError();
             Log::Error("Frame fence wait failed. Win32 error: " + std::to_string(error));
@@ -184,6 +192,8 @@ bool CommandContext::Begin(unsigned int frameIndex)
     }
 
     ID3D12CommandAllocator* commandAllocator = m_commandAllocators[frameIndex];
+
+    CpuTiming::ScopedDuration resetDuration(m_beginResetMilliseconds);
 
     HRESULT result = commandAllocator->Reset();
 

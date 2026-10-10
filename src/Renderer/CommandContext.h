@@ -27,8 +27,16 @@ class CommandContext
         uint64_t GetCompletedFenceValue() const;
         uint64_t GetFrameFenceValue(unsigned int frameIndex) const;
 
+        bool DidBeginWaitForFence() const { return m_beginWaitedForFence; }
+        double GetBeginFenceWaitMilliseconds() const { return m_beginFenceWaitMilliseconds; }
+        double GetBeginResetMilliseconds() const { return m_beginResetMilliseconds; }
+
     private:
         static constexpr unsigned int FrameCount = 2;
+
+        bool m_beginWaitedForFence = false;
+        double m_beginFenceWaitMilliseconds = 0.0;
+        double m_beginResetMilliseconds = 0.0;
 
         ID3D12CommandQueue* m_commandQueue = nullptr;
         ID3D12CommandAllocator* m_commandAllocators[FrameCount]{};

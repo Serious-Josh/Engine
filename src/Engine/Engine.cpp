@@ -133,8 +133,48 @@ void Engine::Run()
 {
     ENGINE_ASSERT(m_state == EngineState::Running);
 
+    CpuTiming::Clock::time_point previousFrameStart;
+    bool hasPreviousFrameStart = false;
+    uint64_t lastRecordedFrame = 0;
+    bool hasRecordedFrame = false;
+    uint64_t lastPacingFrame = 0;
+    bool hasPacingFrame = false;
+
     while(!m_window.ShouldClose()){
+        const auto frameStart = CpuTiming::Clock::now();
+        const double frameInterval = hasPreviousFrameStart
+            ? std::chrono::duration<double, std::milli>(frameStart - previousFrameStart).count()
+            : 0.0;
+        const bool intervalValid = hasPreviousFrameStart;
+        previousFrameStart = frameStart;
+        hasPreviousFrameStart = true;
+
         Frame();
+
+        const double frameExecution = CpuTiming::MillisecondsSince(frameStart);
+        CpuTiming::FrameSample sample = m_renderer.GetCpuFrameTiming();
+        if(sample.submitted && (!hasPacingFrame || sample.frameSerial != lastPacingFrame))
+        {
+            sample.frameStart = frameStart;
+            sample.frameExecution = frameExecution;
+            m_renderer.GetDebugUI().RecordFramePacingCpuTiming(sample);
+            lastPacingFrame = sample.frameSerial;
+            hasPacingFrame = true;
+        }
+        // Skipped/minimized frames must not publish the previous Render sample again.
+        if(sample.valid && (!hasRecordedFrame || sample.frameSerial != lastRecordedFrame))
+        {
+            sample.frameInterval = frameInterval;
+            sample.frameIntervalValid = intervalValid;
+            sample.frameExecution = frameExecution;
+            m_renderer.GetDebugUI().RecordCpuFrameTiming(sample);
+            lastRecordedFrame = sample.frameSerial;
+            hasRecordedFrame = true;
+        }
+        else
+        {
+            m_renderer.ResetCpuSubmissionCadence();
+        }
     }
 
     Log::Info("Engine loop ended.");

@@ -357,6 +357,8 @@ bool Renderer::InitializeSwapChain(void* windowHandle)
 // Resize and geometry drawing
 bool Renderer::Resize(unsigned int width, unsigned int height)
 {
+    m_gpuTimestampProfiler.BreakFrameSequence();
+    ResetCpuSubmissionCadence();
     if(width == 0 || height == 0){
         return true;
     }
@@ -781,6 +783,8 @@ void Renderer::ReleaseSceneResources()
 
 void Renderer::ResetSceneHistory()
 {
+    m_gpuTimestampProfiler.BreakFrameSequence();
+    ResetCpuSubmissionCadence();
     m_giSignedCorrectionPass.ResetHistory();
     m_signedCorrectionExecutedLastFrame = false;
     m_rayTracedShadowPass.ResetHistory();
@@ -807,6 +811,13 @@ void Renderer::ResetSceneHistory()
 
 bool Renderer::Render(const Scene& scene, const RendererOptions& options)
 {
+    const bool hasPreviousExecute = m_hasPreviousRenderExecute;
+    // Any early return breaks the sequence; only a completed frame re-arms it.
+    m_hasPreviousRenderExecute = false;
+    m_cpuFrameTiming = {};
+    m_cpuFrameTiming.frameSerial = m_gpuProfilerFrameSerial;
+    CpuTiming::ScopedDuration renderDuration(m_cpuFrameTiming.render);
+
     const unsigned int frameIndex = m_swapChain.GetCurrentBackBufferIndex();
     const ToneMapDebugView debugView = m_debugUI.GetToneMapDebugView();
     // An aborted/skipped frame must not leave CPU history state pointing at unsubmitted writes.
@@ -841,13 +852,22 @@ bool Renderer::Render(const Scene& scene, const RendererOptions& options)
         debugView == ToneMapDebugView::AOFiltered ||
         debugView == ToneMapDebugView::HDRIDiffuseAmbientOnly;
 
-    if(!m_commandContext.Begin(frameIndex)){
+    const auto beginStart = CpuTiming::Clock::now();
+    const bool beganRecording = m_commandContext.Begin(frameIndex);
+    m_cpuFrameTiming.begin = CpuTiming::MillisecondsSince(beginStart);
+    m_cpuFrameTiming.fenceWaited = m_commandContext.DidBeginWaitForFence();
+    m_cpuFrameTiming.fenceWait = m_commandContext.GetBeginFenceWaitMilliseconds();
+    m_cpuFrameTiming.commandReset = m_commandContext.GetBeginResetMilliseconds();
+
+    if(!beganRecording){
         Log::Error("failed to begin command recording.");
         return false;
     }
 
+    const auto recordingStart = CpuTiming::Clock::now();
     if(m_gpuTimestampProfiler.CollectCompleted(m_commandContext.GetCompletedFenceValue())){
         const GpuTimestampProfiler::Results& gpuResults = m_gpuTimestampProfiler.GetResults();
+        m_debugUI.RecordFramePacingGaps(gpuResults);
 
         for(unsigned int i = 0; i < GpuTimestampProfiler::FrameCount; ++i){
             PendingRendererStatistics& pending = m_pendingStatistics[i];
@@ -1423,7 +1443,7 @@ bool Renderer::Render(const Scene& scene, const RendererOptions& options)
 
         m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::NrdPrepare);
 
-        m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::NrdReblur);
+        m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::NrdReblurSpecular);
 
         m_nrdReflectionDenoiser.Denoise(
             commandList,
@@ -1433,6 +1453,10 @@ bool Renderer::Render(const Scene& scene, const RendererOptions& options)
             m_nrdReflectionPreparePass.GetSpecRadianceHitDistTexture(),
             NrdDenoiser::Signal::Specular);
 
+        m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::NrdReblurSpecular);
+
+        m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::NrdReblurDiffuse);
+
         m_nrdGIDenoiser.Denoise(
             commandList,
             m_nrdGIPreparePass.GetMotionTexture(),
@@ -1441,7 +1465,7 @@ bool Renderer::Render(const Scene& scene, const RendererOptions& options)
             m_nrdGIPreparePass.GetDiffRadianceHitDistTexture(),
             NrdDenoiser::Signal::Diffuse);
 
-        m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::NrdReblur);
+        m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::NrdReblurDiffuse);
 
         commandList->SetDescriptorHeaps(
             1,
@@ -1627,14 +1651,33 @@ bool Renderer::Render(const Scene& scene, const RendererOptions& options)
 
     m_gpuTimestampProfiler.EndFrameAndResolve(commandList, frameIndex);
 
-    if(!m_commandContext.End()){
+    m_cpuFrameTiming.recording = CpuTiming::MillisecondsSince(recordingStart);
+    const auto endStart = CpuTiming::Clock::now();
+    const bool endedRecording = m_commandContext.End();
+    m_cpuFrameTiming.end = CpuTiming::MillisecondsSince(endStart);
+    if(!endedRecording){
         Log::Error("Failed to end command recording.");
         return false;
     }
 
-    if(!m_commandContext.Execute(frameIndex)){
+    const auto executeStart = CpuTiming::Clock::now();
+    const bool executed = m_commandContext.Execute(frameIndex);
+    m_cpuFrameTiming.execute = CpuTiming::MillisecondsSince(executeStart);
+    if(!executed){
+        m_gpuTimestampProfiler.BreakFrameSequence();
         Log::Error("Failed to submit command list or signal its fence; GPU work may already be in flight.");
         return false;
+    }
+
+    m_cpuFrameTiming.submitted = true;
+    m_cpuFrameTiming.executeStart = executeStart;
+
+    // CPU call-entry cadence, not GPU execution start or idle time.
+    if(hasPreviousExecute)
+    {
+        m_cpuFrameTiming.executeInterval = std::chrono::duration<double, std::milli>(
+            executeStart - m_previousRenderExecuteStart).count();
+        m_cpuFrameTiming.executeIntervalValid = true;
     }
 
     const uint64_t submissionFence = m_commandContext.GetFrameFenceValue(frameIndex);
@@ -1647,7 +1690,12 @@ bool Renderer::Render(const Scene& scene, const RendererOptions& options)
 
     ++m_gpuProfilerFrameSerial;
 
-    if(!m_swapChain.Present()){
+    const auto presentStart = CpuTiming::Clock::now();
+    const bool presented = m_swapChain.Present();
+    m_cpuFrameTiming.present = CpuTiming::MillisecondsSince(presentStart);
+    m_cpuFrameTiming.presentReturn = CpuTiming::Clock::now();
+    m_cpuFrameTiming.presentationReturned = true;
+    if(!presented){
         Log::Error("Failed to present swap chain.");
         return false;
     }
@@ -1665,6 +1713,9 @@ bool Renderer::Render(const Scene& scene, const RendererOptions& options)
     }
 
     signedHistoryFrame.completed = true;
+    m_cpuFrameTiming.valid = true;
+    m_previousRenderExecuteStart = executeStart;
+    m_hasPreviousRenderExecute = true;
     return true;
 }
 

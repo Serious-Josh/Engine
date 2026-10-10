@@ -181,7 +181,7 @@ void SwapChain::UpdateBackBufferIndex()
 
 bool SwapChain::Present()
 {
-    HRESULT result = m_swapChain->Present(1, 0);
+    HRESULT result = m_swapChain->Present(0, 0);
 
     if(FAILED(result)){
         Log::Error("Failed to present swap chain. Back-buffer index: " + std::to_string(m_currentBackBuffer) + "; HRESULT: " + std::to_string(result));
