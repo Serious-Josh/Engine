@@ -60,6 +60,8 @@ private:
     Mesh m_planeMesh;
 
     Texture m_whiteTexture;
+    Texture m_normalTexture;
+    Texture m_roughnessTexture;
 
     Pipeline m_pipeline;
 

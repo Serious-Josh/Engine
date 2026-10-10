@@ -28,6 +28,19 @@ FetchContent_Declare(
 
 FetchContent_MakeAvailable(assimp)
 
+# DirectXTex - DDS loading and texture processing
+set(BUILD_TOOLS OFF CACHE BOOL "" FORCE)
+set(BUILD_SAMPLE OFF CACHE BOOL "" FORCE)
+set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
+
+FetchContent_Declare(
+    directxtex
+    GIT_REPOSITORY https://github.com/microsoft/DirectXTex.git
+    GIT_TAG main
+)
+
+FetchContent_MakeAvailable(directxtex)
+
 add_executable(Engine
     src/main.cpp
     src/Engine/Engine.cpp
@@ -107,6 +120,7 @@ add_executable(Engine
     src/Renderer/Passes/GISpatialDenoisePass.cpp
     src/Renderer/Passes/GISignedCorrectionPass.cpp
     src/Renderer/Passes/AOResolvePass.cpp
+    src/Renderer/DDSLoader.cpp
 )
 
 add_custom_command(
@@ -148,6 +162,10 @@ add_custom_command(
         $<TARGET_FILE:assimp>
         $<TARGET_FILE_DIR:Engine>
 
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        $<TARGET_FILE:DirectXTex>
+        $<TARGET_FILE_DIR:Engine>
+
     COMMENT "Copying runtime assets and dependencies"
 )
 
@@ -175,4 +193,5 @@ target_link_libraries(Engine
         "$<$<CONFIG:Release>:${CMAKE_CURRENT_SOURCE_DIR}/external/NRI/Lib/Release/NRI.lib>"
 
         assimp
+        DirectXTex
 )

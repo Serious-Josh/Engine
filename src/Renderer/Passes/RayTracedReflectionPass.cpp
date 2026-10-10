@@ -103,9 +103,9 @@ bool RayTracedReflectionPass::Initialize(
         {RootParameterType::ConstantBuffer, 1}
     };
 
-    // ReflectionPayload: hit distance + world normal + UV + material index + shading normal (40 bytes).
+    // ReflectionPayload: hit distance + world normal + UV + material index + shading normal + cone width/spread (48 bytes).
     // TrackingPayload needs only 4 bytes; the pipeline limit covers the larger payload.
-    pipelineDescription.maxPayloadSize = sizeof(float) * 9 + sizeof(unsigned int);
+    pipelineDescription.maxPayloadSize = sizeof(float) * 12 + sizeof(unsigned int);
     pipelineDescription.maxAttributeSize = sizeof(float) * 2;
     pipelineDescription.maxRecursionDepth = 1;
 

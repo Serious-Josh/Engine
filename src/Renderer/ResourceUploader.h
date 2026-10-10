@@ -1,6 +1,14 @@
 #pragma once
 
 #include <d3d12.h>
+#include <cstddef>
+
+struct TextureSubresourceData
+{
+    const void* data = nullptr;
+    size_t rowPitch = 0;
+    size_t slicePitch = 0;
+};
 
 class ResourceUploader
 {
@@ -18,6 +26,7 @@ public:
     // Destination must start in COPY_DEST; returns after the GPU copy completes.
     bool UploadBuffer(ID3D12Resource* destination, const void* data, size_t dataSize, D3D12_RESOURCE_STATES finalState);
     bool UploadTexture(ID3D12Resource* destination, const void* data, size_t dataSize);
+    bool UploadTexture(ID3D12Resource* destination, const TextureSubresourceData* subresources, unsigned int subresourceCount);
 
 private:
     bool FinishUpload(ID3D12Resource* uploadBuffer);

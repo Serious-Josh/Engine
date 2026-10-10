@@ -5,9 +5,10 @@
 #include "Scene/Camera.h"
 #include "Scene/DirectionalLight.h"
 #include "Renderer/Vertex.h"
+#include "Renderer/TangentGenerator.h"
 #include "Renderer/Geometry/SphereGenerator.h"
 #include "Core/Log.h"
-#include "Renderer/ImageLoader.h"
+#include "Renderer/DDSLoader.h"
 #include "DemoContent/SceneRegistry.h"
 
 #include <cmath>
@@ -46,12 +47,13 @@ bool SphereGridScene::Initialize(ID3D12Device* device, ResourceUploader& uploade
     }
 
     SphereGeometry sphere = SphereGenerator::Generate(1.0f, 32, 64);
+    TangentGenerator::GenerateTangents(sphere.vertices, sphere.indices);
 
     if(!m_mesh.Initialize(device, uploader, descriptorHeap, sphere.vertices.data(), sphere.vertices.size(), m_vertexLayout, sphere.indices.data(), sphere.indices.size())){
         return false;
     }
 
-    const Vertex planeVertices[] =
+    std::vector<Vertex> planeVertices =
     {
         {
             {-1.0f, 0.0f, -1.0f},
@@ -75,57 +77,61 @@ bool SphereGridScene::Initialize(ID3D12Device* device, ResourceUploader& uploade
         }
     };
 
-    const unsigned int planeIndices[] =
+    std::vector<std::uint32_t> planeIndices =
     {
         0, 1, 2,
         0, 2, 3
     };
 
+    TangentGenerator::GenerateTangents(planeVertices, planeIndices);
+
     if(!m_planeMesh.Initialize(
         device,
         uploader, descriptorHeap,
-        planeVertices,
-        4,
+        planeVertices.data(),
+        planeVertices.size(),
         m_vertexLayout,
-        planeIndices,
-        6))
+        planeIndices.data(),
+        planeIndices.size()))
     {
         return false;
     }
 
-    const std::filesystem::path texturePath = "assets/Textures/Materials/TestBaseColor.jpg";
-
-    ImageData image;
-
-    if(!ImageLoader::Load(texturePath, image)){
-        Log::Error("Failed to load test base color texture.");
-        return false;
-    }
-
-    if(!m_texture.Initialize(device, image.pixels.data(), image.width, image.height, DXGI_FORMAT_R8G8B8A8_UNORM, 4)){
-        return false;
-    }
-
-    if(!uploader.UploadTexture(
-        m_texture.GetResource(),
-        m_texture.GetInitialData(),
-        m_texture.GetInitialDataSize()))
+    // Brick diffuse texture: BC1 with sRGB sampling.
+    if(!DDSLoader::LoadTexture(
+        device,
+        uploader,
+        descriptorHeap,
+        "assets/Textures/Materials/stacked_brick_wall_diff_4k.dds",
+        m_texture,
+        true))
     {
         return false;
     }
 
-    if(!m_texture.CreateSRV(device, descriptorHeap, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB)){
+    // Brick normal map: BC5 with linear sampling and the existing DirectX convention.
+    if(!DDSLoader::LoadTexture(
+        device,
+        uploader,
+        descriptorHeap,
+        "assets/Textures/Materials/stacked_brick_wall_nor_dx_4k.dds",
+        m_normalTexture,
+        false))
+    {
         return false;
     }
 
-    const float roughnessValues[MaterialSampleCount] =
+    // Brick roughness map: BC4 with linear sampling.
+    if(!DDSLoader::LoadTexture(
+        device,
+        uploader,
+        descriptorHeap,
+        "assets/Textures/Materials/stacked_brick_wall_rough_4k.dds",
+        m_roughnessTexture,
+        false))
     {
-        0.05f,
-        0.25f,
-        0.50f,
-        0.75f,
-        1.00f
-    };
+        return false;
+    }
 
     constexpr float horizontalSpacing = 1.65f;
     constexpr float verticalSpacing = 1.65f;
@@ -138,8 +144,10 @@ bool SphereGridScene::Initialize(ID3D12Device* device, ResourceUploader& uploade
 
         material.pipeline = &m_pipeline;
         material.texture = &m_texture;
+        material.normalTexture = &m_normalTexture;
         material.model = MaterialModel::Dielectric;
-        material.roughness = roughnessValues[i];
+        material.roughnessTexture = &m_roughnessTexture;
+        material.roughness = 1.0f;
         material.ior = 1.536f;
 
         material.baseColor[0] = 0.5f;
@@ -162,8 +170,28 @@ bool SphereGridScene::Initialize(ID3D12Device* device, ResourceUploader& uploade
 
         material.pipeline = &m_pipeline;
         material.texture = &m_texture;
+        material.normalTexture = &m_normalTexture;
         material.model = MaterialModel::Conductor;
-        material.roughness = roughnessValues[i];
+        material.roughnessTexture = &m_roughnessTexture;
+        material.roughness = 1.0f;
+        if(i == 0)
+        {
+            // Temporary A/B diagnostic: restore this sphere's pre-texture roughness; keep its normal map.
+            material.roughnessTexture = nullptr;
+            material.roughness = 0.05f;
+        }
+        else if(i == 1)
+        {
+            material.roughness = 0.15f;
+        }
+        else if(i == 2)
+        {
+            material.roughness = 0.35f;
+        }
+        else if(i == 3)
+        {
+            material.roughness = 0.65f;
+        }
 
         material.conductorN[0] = 0.2f;
         material.conductorN[1] = 0.9f;
@@ -196,23 +224,16 @@ bool SphereGridScene::Initialize(ID3D12Device* device, ResourceUploader& uploade
         1.0f
     };
 
-    const float metallicRoughnessValues[MaterialSampleCount] =
-    {
-        0.05f,
-        1.00f,
-        0.35f,
-        0.05f,
-        1.00f
-    };
-
     for(unsigned int i = 0; i < MaterialSampleCount; ++i)
     {
         Material& material = m_metallicRoughnessMaterials[i];
 
         material.pipeline = &m_pipeline;
         material.texture = &m_texture;
+        material.normalTexture = &m_normalTexture;
         material.model = MaterialModel::MetallicRoughness;
-        material.roughness = metallicRoughnessValues[i];
+        material.roughnessTexture = &m_roughnessTexture;
+        material.roughness = 1.0f;
         material.metallic = metallicValues[i];
 
         material.baseColor[0] = 0.80f;
@@ -231,6 +252,7 @@ bool SphereGridScene::Initialize(ID3D12Device* device, ResourceUploader& uploade
 
     m_floorMaterial.pipeline = &m_pipeline;
     m_floorMaterial.texture = &m_texture;
+    m_floorMaterial.normalTexture = &m_normalTexture;
     m_floorMaterial.model = MaterialModel::Dielectric;
     m_floorMaterial.roughness = 0.7f;
     m_floorMaterial.ior = 1.5f;
@@ -349,6 +371,8 @@ void SphereGridScene::Shutdown()
 
     Log::Info("DemoScene shutdown: texture...");
     m_texture.Shutdown();
+    m_normalTexture.Shutdown();
+    m_roughnessTexture.Shutdown();
     Log::Info("DemoScene shutdown: texture done.");
 
     Log::Info("DemoScene shutdown: mesh...");

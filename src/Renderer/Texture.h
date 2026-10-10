@@ -20,6 +20,12 @@ class Texture
 
         bool Initialize(ID3D12Device* device, const void* data, unsigned int width, unsigned int height, DXGI_FORMAT format, size_t bytesPerPixel);
         bool Initialize(ID3D12Device* device, unsigned int width, unsigned int height, unsigned int arraySize, unsigned int mipLevels, DXGI_FORMAT format, D3D12_RESOURCE_FLAGS flags, D3D12_RESOURCE_STATES initialState);
+        bool InitializeMipmapped(
+            ID3D12Device* device,
+            unsigned int width,
+            unsigned int height,
+            unsigned int mipLevels,
+            DXGI_FORMAT format);
         void Shutdown();
 
         void Transition(ID3D12GraphicsCommandList* commandList, D3D12_RESOURCE_STATES newState);
@@ -35,6 +41,8 @@ class Texture
         bool CreateSRV(ID3D12Device* device, DescriptorHeap& descriptorHeap, DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN);
         bool CreateCubeSRV(ID3D12Device* device, DescriptorHeap& descriptorHeap);
         bool CreateUAV(ID3D12Device* device, DescriptorHeap& descriptorHeap);
+
+        static unsigned int CalculateMipLevels(unsigned int width, unsigned int height);
     
     private:
         ID3D12Resource* m_resource = nullptr;

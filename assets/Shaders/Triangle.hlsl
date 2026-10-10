@@ -33,7 +33,7 @@ cbuffer MaterialConstants : register(b0)
     uint normalTextureIndex;
 
     float3 baseColor;
-    float padding2;
+    uint roughnessTextureIndex;
 }
 
 cbuffer CameraConstants : register(b1)
@@ -122,10 +122,18 @@ PSOutput PSMain(VSOutput input)
         baseColor *
         sampledBaseColor;
 
+    float finalRoughness = roughness;
+    if(roughnessTextureIndex != 0xFFFFFFFFu)
+    {
+        Texture2D<float4> roughnessTexture = ResourceDescriptorHeap[roughnessTextureIndex];
+        float sampledRoughness = roughnessTexture.Sample(sampler0, input.uv).r;
+        finalRoughness = saturate(roughness * sampledRoughness);
+    }
+
     output.material =
         float4(
             finalBaseColor,
-            roughness
+            finalRoughness
         );
 
     float3 N = normalize(input.worldNormal);
@@ -134,7 +142,9 @@ PSOutput PSMain(VSOutput input)
     if(normalTextureIndex != 0xFFFFFFFFu)
     {
         Texture2D<float4> normalTexture = ResourceDescriptorHeap[normalTextureIndex];
-        float3 sampledNormal = normalTexture.Sample(sampler0, input.uv).rgb * 2.0f - 1.0f;
+        float2 normalXY = normalTexture.Sample(sampler0, input.uv).rg * 2.0f - 1.0f;
+        float normalZ = sqrt(saturate(1.0f - dot(normalXY, normalXY)));
+        float3 sampledNormal = float3(normalXY, normalZ);
         float3 tangent = input.worldTangent.xyz - N * dot(N, input.worldTangent.xyz);
         float tangentLengthSquared = dot(tangent, tangent);
         float sampledLengthSquared = dot(sampledNormal, sampledNormal);

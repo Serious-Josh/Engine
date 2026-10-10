@@ -1,16 +1,18 @@
-#include "MirrorTestScene.h"
+#include "DemoContent/MirrorTestScene.h"
+#include "DemoContent/SceneRegistry.h"
+
 #include "Renderer/ResourceUploader.h"
 #include "Renderer/DescriptorHeap.h"
 #include "Renderer/RenderObject.h"
+#include "Renderer/Vertex.h"
+#include "Renderer/TangentGenerator.h"
+#include "Renderer/Geometry/SphereGenerator.h"
+#include "Renderer/DDSLoader.h"
+
 #include "Scene/Camera.h"
 #include "Scene/DirectionalLight.h"
 
-#include "Renderer/Vertex.h"
-#include "Renderer/Geometry/SphereGenerator.h"
-#include "Renderer/ImageLoader.h"
 #include "Core/Log.h"
-
-#include "DemoContent/SceneRegistry.h"
 
 #include <cstdint>
 
@@ -74,6 +76,7 @@ bool MirrorTestScene::Initialize(
     }
 
     SphereGeometry sphere = SphereGenerator::Generate(1.0f, 32, 64);
+    TangentGenerator::GenerateTangents(sphere.vertices, sphere.indices);
 
     if(!m_sphereMesh.Initialize(
         device,
@@ -131,46 +134,17 @@ bool MirrorTestScene::Initialize(
         return false;
     }
 
-    const std::filesystem::path sphereTexturePath = "assets/Textures/Materials/TestBaseColor.jpg";
-
-    ImageData sphereImage;
-
-    if(!ImageLoader::Load(
-        sphereTexturePath,
-        sphereImage))
-    {
-        Log::Error(
-            "Failed to load mirror test sphere texture.");
-        return false;
-    }
-
-    if(!m_sphereTexture.Initialize(
+    // Brick diffuse texture — BC1 with sRGB sampling.
+    if(!DDSLoader::LoadTexture(
         device,
-        sphereImage.pixels.data(),
-        sphereImage.width,
-        sphereImage.height,
-        DXGI_FORMAT_R8G8B8A8_UNORM,
-        4))
-    {
-        return false;
-    }
-
-    if(!uploader.UploadTexture(
-        m_sphereTexture.GetResource(),
-        m_sphereTexture.GetInitialData(),
-        m_sphereTexture.GetInitialDataSize()))
-    {
-        return false;
-    }
-
-    if(!m_sphereTexture.CreateSRV(
-        device,
+        uploader,
         descriptorHeap,
-        DXGI_FORMAT_R8G8B8A8_UNORM_SRGB))
+        "assets/Textures/Materials/stacked_brick_wall_diff_4k.dds",
+        m_sphereTexture,
+        true))
     {
         return false;
     }
-
 
     // Neutral plane texture
 
@@ -210,6 +184,30 @@ bool MirrorTestScene::Initialize(
     }
 
 
+    // Brick normal map — BC5 with linear sampling.
+    if(!DDSLoader::LoadTexture(
+        device,
+        uploader,
+        descriptorHeap,
+        "assets/Textures/Materials/stacked_brick_wall_nor_dx_4k.dds",
+        m_normalTexture,
+        false))
+    {
+        return false;
+    }
+
+    // Brick roughness map — BC4 with linear sampling.
+    if(!DDSLoader::LoadTexture(
+        device,
+        uploader,
+        descriptorHeap,
+        "assets/Textures/Materials/stacked_brick_wall_rough_4k.dds",
+        m_roughnessTexture,
+        false))
+    {
+        return false;
+    }
+
     // Mirror A material
 
     m_mirrorAMaterial.pipeline = &m_pipeline;
@@ -247,11 +245,13 @@ bool MirrorTestScene::Initialize(
 
     m_coloredMaterial.pipeline = &m_pipeline;
     m_coloredMaterial.texture = &m_sphereTexture;
+    m_coloredMaterial.normalTexture = &m_normalTexture;
+    m_coloredMaterial.roughnessTexture = &m_roughnessTexture;
 
     m_coloredMaterial.model =
         MaterialModel::MetallicRoughness;
 
-    m_coloredMaterial.roughness = 0.5f;
+    m_coloredMaterial.roughness = 1.0f;
     m_coloredMaterial.metallic = 0.0f;
 
     m_coloredMaterial.baseColor[0] = 1.0f;
@@ -391,6 +391,8 @@ void MirrorTestScene::Shutdown()
     m_scene.ClearRenderObjects();
 
     m_sphereTexture.Shutdown();
+    m_normalTexture.Shutdown();
+    m_roughnessTexture.Shutdown();
     m_whiteTexture.Shutdown();
 
     m_sphereMesh.Shutdown();

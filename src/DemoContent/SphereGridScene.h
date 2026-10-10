@@ -63,6 +63,8 @@ class SphereGridScene : public IDemoScene
         Mesh m_mesh;
         Mesh m_planeMesh;
         Texture m_texture;
+        Texture m_normalTexture;
+        Texture m_roughnessTexture;
         Pipeline m_pipeline;
 
         static constexpr unsigned int MaterialSampleCount = 5;

@@ -10,7 +10,7 @@ struct MaterialConstants
     unsigned int normalTextureIndex;
 
     float baseColor[3];
-    float padding2;
+    unsigned int roughnessTextureIndex;
 };
 
 struct CameraConstants
@@ -145,7 +145,7 @@ struct GPUMaterial
     unsigned int textureIndex;
 
     float conductorN[3];
-    float padding0;
+    unsigned int roughnessTextureIndex;
 
     float conductorK[3];
     float padding1;

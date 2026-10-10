@@ -8,12 +8,15 @@ static const float RAW_REFLECTION_RAY_INVALID = -2.0f;
 
 struct ReflectionPayload
 {
-    // Ten 32-bit scalars: 40-byte radiance surface payload.
+    // Thirteen 32-bit scalars: 52-byte radiance surface payload.
     float hitDistance;
     float3 worldNormal;
     float2 uv;
     uint materialIndex;
     float3 shadingNormal;
+    float coneWidth;  // Approximate world-space footprint diameter at the ray origin.
+    float coneSpread; // Approximate diameter growth per unit of ray travel.
+    float textureDensity; // UV units per world-space unit, including incidence adjustment.
 };
 
 struct TrackingPayload
@@ -800,6 +803,38 @@ float HardDirectionalVisibility(float3 worldPosition, float3 worldNormal)
     return visibilityPayload.hitDistance == RAW_REFLECTION_RAY_MISS ? 1.0f : 0.0f;
 }
 
+// Isotropic ray-cone approximation, not exact ray differentials. Density is
+// texture-independent: each texture supplies its own resolution and mip range.
+float ReflectionTextureLOD(Texture2D<float4> texture, float footprint, float density)
+{
+    if(!isfinite(footprint) || footprint <= 0.0f ||
+       !isfinite(density) || density <= 0.0f)
+        return 0.0f;
+
+    uint width, height, mipCount;
+    texture.GetDimensions(0u, width, height, mipCount);
+    if(width == 0u || height == 0u || mipCount == 0u)
+        return 0.0f;
+
+    float texelFootprint = footprint * density * float(max(width, height));
+    if(!isfinite(texelFootprint) || texelFootprint <= 0.0f)
+        return 0.0f;
+    return clamp(log2(texelFootprint), 0.0f, float(mipCount - 1u));
+}
+
+float SecondarySurfaceRoughness(GPUMaterial material, ReflectionPayload surface)
+{
+    float roughness = material.roughness;
+    if(material.roughnessTextureIndex == 0xFFFFFFFFu)
+        return roughness;
+
+    Texture2D<float4> roughnessTexture = ResourceDescriptorHeap[
+        NonUniformResourceIndex(material.roughnessTextureIndex)];
+    float sampledRoughness = roughnessTexture.SampleLevel(materialSampler, surface.uv,
+        ReflectionTextureLOD(roughnessTexture, surface.coneWidth, surface.textureDensity)).r;
+    return saturate(roughness * sampledRoughness);
+}
+
 float3 ShadeSecondarySurface(ReflectionPayload surface, float3 rayDirection, float directionalVisibility,
     out SecondaryLighting lighting)
 {
@@ -807,6 +842,7 @@ float3 ShadeSecondarySurface(ReflectionPayload surface, float3 rayDirection, flo
     StructuredBuffer<GPUMaterial> materialBuffer =
         ResourceDescriptorHeap[reflectionConstants.materialBufferIndex];
     GPUMaterial material = materialBuffer[surface.materialIndex];
+    material.roughness = SecondarySurfaceRoughness(material, surface);
     float3 worldNormal = surface.shadingNormal;
     float2 hitUV = surface.uv;
     Texture2D<float4> materialTexture =
@@ -821,7 +857,7 @@ float3 ShadeSecondarySurface(ReflectionPayload surface, float3 rayDirection, flo
         materialTexture.SampleLevel(
             materialSampler,
             hitUV,
-            0.0f
+            ReflectionTextureLOD(materialTexture, surface.coneWidth, surface.textureDensity)
         ).rgb;
 
     float3 directionToLight =
@@ -868,6 +904,13 @@ float3 ShadeSecondarySurface(ReflectionPayload surface, float3 rayDirection, flo
             reflectionConstants.brdfIntegrationLUTIndex
         ];
 
+    // Diagnostic: keep linear WRAP sampling inside this nonperiodic LUT.
+    // All three mip-zero lookups share bounds from its actual dimensions.
+    uint brdfLUTWidth, brdfLUTHeight;
+    brdfIntegrationLUT.GetDimensions(brdfLUTWidth, brdfLUTHeight);
+    float2 brdfLUTMinUV = 0.5f / float2(brdfLUTWidth, brdfLUTHeight);
+    float2 brdfLUTMaxUV = 1.0f - brdfLUTMinUV;
+
     Texture2D<float> ggxAverageAlbedoLUT =
         ResourceDescriptorHeap[
             reflectionConstants.ggxAverageAlbedoLUTIndex
@@ -887,20 +930,20 @@ float3 ShadeSecondarySurface(ReflectionPayload surface, float3 rayDirection, flo
         float2 directionalAlbedoLightData =
             brdfIntegrationLUT.SampleLevel(
                 materialSampler,
-                float2(
+                clamp(float2(
                     NdotL,
                     material.roughness
-                ),
+                ), brdfLUTMinUV, brdfLUTMaxUV),
                 0.0f
             ).rg;
 
         float2 directionalAlbedoViewData =
             brdfIntegrationLUT.SampleLevel(
                 materialSampler,
-                float2(
+                clamp(float2(
                     NdotV,
                     material.roughness
-                ),
+                ), brdfLUTMinUV, brdfLUTMaxUV),
                 0.0f
             ).rg;
 
@@ -1013,10 +1056,10 @@ float3 ShadeSecondarySurface(ReflectionPayload surface, float3 rayDirection, flo
     float2 integratedBRDF =
         brdfIntegrationLUT.SampleLevel(
             materialSampler,
-            float2(
+            clamp(float2(
                 NdotV,
                 material.roughness
-            ),
+            ), brdfLUTMinUV, brdfLUTMaxUV),
             0.0f
         ).rg;
 
@@ -1261,12 +1304,13 @@ float3 ShadeSecondarySurface(ReflectionPayload surface, float3 rayDirection, flo
 }
 
 // Deterministic delta-mirror weight, matching the existing primary mirror model handling.
-float3 EvaluateSecondaryMirrorFresnel(GPUMaterial material, float2 uv, float cosine)
+float3 EvaluateSecondaryMirrorFresnel(GPUMaterial material, ReflectionPayload surface, float cosine)
 {
     if(material.model == 0)
     {
         Texture2D<float4> texture = ResourceDescriptorHeap[NonUniformResourceIndex(material.textureIndex)];
-        float3 baseColor = material.baseColor * texture.SampleLevel(materialSampler, uv, 0.0f).rgb;
+        float3 baseColor = material.baseColor * texture.SampleLevel(materialSampler, surface.uv,
+            ReflectionTextureLOD(texture, surface.coneWidth, surface.textureDensity)).rgb;
         float3 F0 = lerp(float3(0.04f, 0.04f, 0.04f), baseColor, saturate(material.metallic));
         return FresnelSchlick(cosine, F0);
     }
@@ -1364,6 +1408,38 @@ void RayGeneration()
     worldPosition /=
         worldPosition.w;
 
+    // Reconstruct virtual neighbors at this pixel's depth, never across an
+    // actual depth discontinuity. No extra texture reads are needed. The sum
+    // of the two pixel edge lengths conservatively bounds the pixel diagonal
+    // on this constant-depth plane, but does not model surface slope/curvature
+    // or widening from roughness. Invalid reconstruction uses a zero cone.
+    float initialConeWidth = 0.0f;
+    float initialConeSpread = 0.0f;
+    float4 neighborX = mul(reflectionConstants.inverseViewProjection,
+        clipPosition + float4(2.0f / float(dimensions.x), 0.0f, 0.0f, 0.0f));
+    float4 neighborY = mul(reflectionConstants.inverseViewProjection,
+        clipPosition + float4(0.0f, -2.0f / float(dimensions.y), 0.0f, 0.0f));
+    if(all(isfinite(worldPosition)) && all(isfinite(neighborX)) &&
+       all(isfinite(neighborY)) && abs(neighborX.w) > 1.0e-8f &&
+       abs(neighborY.w) > 1.0e-8f)
+    {
+        float width = length(neighborX.xyz / neighborX.w - worldPosition.xyz) +
+            length(neighborY.xyz / neighborY.w - worldPosition.xyz);
+        float cameraDistance = length(worldPosition.xyz - reflectionConstants.cameraPosition);
+        if(isfinite(width) && width >= 0.0f)
+        {
+            initialConeWidth = width;
+            // Perspective-camera approximation; retain width with zero growth
+            // if the camera distance cannot provide a safe angular estimate.
+            if(isfinite(cameraDistance) && cameraDistance > 1.0e-8f)
+            {
+                float spread = width / cameraDistance;
+                if(isfinite(spread))
+                    initialConeSpread = spread;
+            }
+        }
+    }
+
     float4 surfaceData =
         surfaceTexture.Load(
             int3(
@@ -1402,6 +1478,8 @@ void RayGeneration()
         materialBuffer[
             materialIndex
         ];
+    // Local effective material: raster already sampled the primary roughness.
+    primaryMaterial.roughness = materialData.a;
 
     float3 viewDirection =
         normalize(
@@ -1565,6 +1643,9 @@ void RayGeneration()
 
     ReflectionPayload payload;
 
+    payload.coneWidth = initialConeWidth;
+    payload.coneSpread = initialConeSpread;
+    payload.textureDensity = 0.0f;
     payload.worldNormal = float3(0.0f, 0.0f, 0.0f);
     payload.shadingNormal = float3(0.0f, 0.0f, 0.0f);
     payload.uv = float2(0.0f, 0.0f);
@@ -1653,6 +1734,7 @@ void RayGeneration()
         secondaryRadiance = ShadeSecondarySurface(payload, ray.Direction, secondaryVisibility, secondaryLighting);
 
         GPUMaterial secondaryMaterial = materialBuffer[payload.materialIndex];
+        secondaryMaterial.roughness = SecondarySurfaceRoughness(secondaryMaterial, payload);
         // Preserve the validated deterministic mirror continuation.
         if(secondaryMaterial.roughness <= 0.001f && secondaryMaterial.model <= 2u)
         {
@@ -1669,6 +1751,8 @@ void RayGeneration()
                 bounce2Ray.TMax = 10000.0f;
                 // Keep the first payload intact for raw metadata and NRD tracking.
                 ReflectionPayload bounce2Payload = (ReflectionPayload)0;
+                bounce2Payload.coneWidth = payload.coneWidth;
+                bounce2Payload.coneSpread = payload.coneSpread;
                 bounce2Payload.hitDistance = RAW_REFLECTION_RAY_INVALID;
                 TraceRay(scene, RAY_FLAG_NONE, 0xFF, 0, 1, 0, bounce2Ray, bounce2Payload);
 
@@ -1686,7 +1770,7 @@ void RayGeneration()
                     tertiaryRadiance = SampleReflectionEnvironment(bounce2Ray.Direction);
                 }
                 float3 secondaryFresnel = EvaluateSecondaryMirrorFresnel(
-                    secondaryMaterial, payload.uv, saturate(secondaryNdotV));
+                    secondaryMaterial, payload, saturate(secondaryNdotV));
                 // Replace, never add to, the old single-scatter environment approximation.
                 secondaryRadiance = secondaryLighting.directional + secondaryLighting.environmentDiffuse +
                     (secondaryFresnel * tertiaryRadiance + secondaryLighting.multipleScatterEnvironmentSpecular);
@@ -1718,7 +1802,7 @@ void RayGeneration()
                 {
                     // The material Fresnel helper accepts a cosine; rough GGX uses V dot H.
                     float3 F2 = EvaluateSecondaryMirrorFresnel(
-                        secondaryMaterial, payload.uv, secondaryVdotH);
+                        secondaryMaterial, payload, secondaryVdotH);
                     float D2 = DistributionGGX(
                         payload.shadingNormal, secondaryHalfVector, secondaryMaterial.roughness);
                     float G2 = GeometrySmithGGX(
@@ -1733,6 +1817,8 @@ void RayGeneration()
                         bounce2Ray.TMax = 10000.0f;
                         // Separate terminal payload leaves first-segment metadata untouched.
                         ReflectionPayload bounce2Payload = (ReflectionPayload)0;
+                        bounce2Payload.coneWidth = payload.coneWidth;
+                        bounce2Payload.coneSpread = payload.coneSpread;
                         bounce2Payload.hitDistance = RAW_REFLECTION_RAY_INVALID;
                         TraceRay(scene, RAY_FLAG_NONE, 0xFF, 0, 1, 0, bounce2Ray, bounce2Payload);
 
@@ -1961,6 +2047,11 @@ void ClosestHit(
     inout ReflectionPayload payload,
     BuiltInTriangleIntersectionAttributes attributes)
 {
+    float incomingConeWidth = payload.coneWidth;
+    float incomingConeSpread = payload.coneSpread;
+    payload.coneWidth = incomingConeWidth + RayTCurrent() * incomingConeSpread;
+    payload.coneSpread = incomingConeSpread;
+
     payload.hitDistance =
         RayTCurrent();
 
@@ -2034,6 +2125,51 @@ void ClosestHit(
         uv1 * barycentric1 +
         uv2 * barycentric2;
 
+    // Vertex.h puts float3 position at offset zero; the BLAS also uses the
+    // unoffset vertex buffer address with R32G32B32_FLOAT and this stride.
+    float3 position0 = mul(ObjectToWorld3x4(), float4(
+        asfloat(vertexBuffer.Load3(vertexIndex0 * instanceData.vertexStride)), 1.0f));
+    float3 position1 = mul(ObjectToWorld3x4(), float4(
+        asfloat(vertexBuffer.Load3(vertexIndex1 * instanceData.vertexStride)), 1.0f));
+    float3 position2 = mul(ObjectToWorld3x4(), float4(
+        asfloat(vertexBuffer.Load3(vertexIndex2 * instanceData.vertexStride)), 1.0f));
+    float3 edge1 = position1 - position0;
+    float3 edge2 = position2 - position0;
+    float3 areaVector = cross(edge1, edge2);
+    float twiceWorldArea = length(areaVector);
+    float2 uvEdge1 = uv1 - uv0;
+    float2 uvEdge2 = uv2 - uv0;
+    float twiceUVArea = abs(uvEdge1.x * uvEdge2.y - uvEdge1.y * uvEdge2.x);
+    payload.textureDensity = 0.0f;
+    if(all(isfinite(position0)) && all(isfinite(position1)) && all(isfinite(position2)) &&
+       all(isfinite(uv0)) && all(isfinite(uv1)) && all(isfinite(uv2)) &&
+       isfinite(twiceWorldArea) && twiceWorldArea > 1.0e-12f &&
+       isfinite(twiceUVArea) && twiceUVArea > 1.0e-12f)
+    {
+        float3 triangleNormal = areaVector / twiceWorldArea;
+        // Dual edge vectors map world displacement to triangle coordinates.
+        // The UV Jacobian's Frobenius norm bounds its largest stretch, unlike
+        // the area ratio alone, which can underestimate elongated UV mappings.
+        float3 dual1 = cross(edge2, triangleNormal) / twiceWorldArea;
+        float3 dual2 = cross(triangleNormal, edge1) / twiceWorldArea;
+        float3 gradientU = uvEdge1.x * dual1 + uvEdge2.x * dual2;
+        float3 gradientV = uvEdge1.y * dual1 + uvEdge2.y * dual2;
+        float areaDensity = sqrt(twiceUVArea / twiceWorldArea);
+        float stretchDensity = sqrt(dot(gradientU, gradientU) + dot(gradientV, gradientV));
+        float rayLength = length(WorldRayDirection());
+        if(isfinite(rayLength) && rayLength > 1.0e-8f)
+        {
+            float incidence = abs(dot(triangleNormal, WorldRayDirection() / rayLength));
+            // Bound the grazing singularity; isotropic filtering overestimates
+            // the minor axis and cannot reproduce anisotropic ray differentials.
+            float density = max(areaDensity, stretchDensity);
+            if(all(isfinite(gradientU)) && all(isfinite(gradientV)) &&
+               isfinite(areaDensity) && isfinite(stretchDensity) &&
+               isfinite(incidence) && isfinite(density) && density > 0.0f)
+                payload.textureDensity = density;
+        }
+    }
+
     float3 normal0 =
         LoadVertexNormal(
             vertexBuffer,
@@ -2088,7 +2224,10 @@ void ClosestHit(
         float handedness = objectTangent.w * (instanceDeterminant < 0.0f ? -1.0f : 1.0f);
         Texture2D<float4> normalTexture =
             ResourceDescriptorHeap[NonUniformResourceIndex(material.normalTextureIndex)];
-        float3 sampledNormal = normalTexture.SampleLevel(materialSampler, hitUV, 0.0f).rgb * 2.0f - 1.0f;
+        float2 normalXY = normalTexture.SampleLevel(materialSampler, hitUV,
+            ReflectionTextureLOD(normalTexture, payload.coneWidth, payload.textureDensity)).rg * 2.0f - 1.0f;
+        float normalZ = sqrt(saturate(1.0f - dot(normalXY, normalXY)));
+        float3 sampledNormal = float3(normalXY, normalZ);
         float sampledLengthSquared = dot(sampledNormal, sampledNormal);
         if(all(isfinite(worldNormal)) && all(isfinite(tangent)) &&
            isfinite(tangentLengthSquared) && tangentLengthSquared > 1.0e-8f &&

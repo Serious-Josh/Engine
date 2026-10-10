@@ -13,7 +13,7 @@ struct GPUMaterial
     uint textureIndex;
 
     float3 conductorN;
-    float padding0;
+    uint roughnessTextureIndex;
 
     float3 conductorK;
     float padding1;

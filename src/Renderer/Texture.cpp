@@ -157,6 +157,53 @@ bool Texture::Initialize(ID3D12Device* device, unsigned int width, unsigned int 
     return true;
 }
 
+unsigned int Texture::CalculateMipLevels(unsigned int width, unsigned int height)
+{
+    if(width == 0 || height == 0)
+    {
+        return 0;
+    }
+
+    unsigned int mipLevels = 1;
+    unsigned int largestDimension = width > height ? width : height;
+
+    while(largestDimension > 1)
+    {
+        largestDimension >>= 1;
+        ++mipLevels;
+    }
+
+    return mipLevels;
+}
+
+bool Texture::InitializeMipmapped(
+    ID3D12Device* device,
+    unsigned int width,
+    unsigned int height,
+    unsigned int mipLevels,
+    DXGI_FORMAT format)
+{
+    if(!device || width == 0 || height== 0){
+        return false;
+    }
+
+    const unsigned int maximumMipLevels = CalculateMipLevels(width, height);
+
+    if(mipLevels == 0 || mipLevels > maximumMipLevels){
+        return false;
+    }
+
+    return Initialize(
+        device,
+        width,
+        height,
+        1,
+        mipLevels,
+        format,
+        D3D12_RESOURCE_FLAG_NONE,
+        D3D12_RESOURCE_STATE_COPY_DEST);
+}
+
 void Texture::Shutdown()
 {
     if(m_descriptorHeap && m_srvIndex != UINT_MAX){
