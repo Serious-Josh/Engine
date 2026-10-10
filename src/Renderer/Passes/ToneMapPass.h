@@ -22,7 +22,8 @@ enum class ToneMapDebugView : unsigned int
     HDRIDiffuseAmbientWithoutAO = 22, HDRIDiffuseAmbientDirectIntegral = 23,
     IrradianceCubemapMinusDirectIntegral = 24, HDRIIrradianceTangentFrameDifference = 25,
     HDRIDiffuseAmbientMultiOrientation = 26, MultiOrientationMinusSingleOrientation = 27,
-    HDRIDirectIntegralMip0 = 28, HDRIDirectIntegralMip4 = 29, HDRIDirectIntegralMip6 = 30
+    HDRIDirectIntegralMip0 = 28, HDRIDirectIntegralMip4 = 29, HDRIDirectIntegralMip6 = 30,
+    GISignedReconstructed = 31
 };
 
 class ToneMapPass

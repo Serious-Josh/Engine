@@ -40,6 +40,9 @@ class DebugUI
         ToneMapDebugView GetToneMapDebugView() const { return static_cast<ToneMapDebugView>(m_toneMapDebugView); }
 
         bool IsRTGIEnabled() const {return m_rtgiEnabled; }
+        bool IsLegacyGIEstimatorEnabled() const {return m_legacyGIEstimator; }
+        float GetRTGIContactAOStrength() const {return m_rtgiContactAOStrength; }
+        float GetRTGIContactAORadius() const {return m_rtgiContactAORadius; }
 
         bool HasEnvironmentChangeRequest() const
         {
@@ -68,4 +71,7 @@ class DebugUI
         int m_requestedEnvironmentIndex = -1;
 
         bool m_rtgiEnabled = true;
+        bool m_legacyGIEstimator = false;
+        float m_rtgiContactAOStrength = 1.0f;
+        float m_rtgiContactAORadius = 2.5f;
 };

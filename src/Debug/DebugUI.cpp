@@ -292,13 +292,23 @@ void DebugUI::DrawPerformanceWindow(const std::vector<std::string>& environmentN
         "Multi-Orientation Minus Single-Orientation",
         "HDRI Direct Integral Mip 0",
         "HDRI Direct Integral Mip 4",
-        "HDRI Direct Integral Mip 6"
+        "HDRI Direct Integral Mip 6",
+        "GI Signed Reconstructed (Pre-NRD)"
     };
     const char* denoisers[] = {"NRD", "Native"};
+
     ImGui::Combo("Reflection denoiser", &m_reflectionDenoiserMode, denoisers, IM_ARRAYSIZE(denoisers));
     ImGui::Checkbox("NRD contribution limiter", &m_contributionLimiterEnabled);
     ImGui::Checkbox("Enable RTGI", &m_rtgiEnabled);
+    ImGui::Checkbox("Legacy GI Estimator", &m_legacyGIEstimator);
+    ImGui::SliderFloat("RTGI Contact AO Strength", &m_rtgiContactAOStrength, 0.0f, 1.0f, "%.2f");
+    ImGui::SliderFloat("RTGI Contact AO Radius", &m_rtgiContactAORadius, 0.05f, 5.0f, "%.2f");
     ImGui::Combo("Diagnostic view", &m_toneMapDebugView, views, IM_ARRAYSIZE(views));
+
+    if(GetToneMapDebugView() == ToneMapDebugView::GISignedReconstructed){
+        ImGui::TextWrapped("Signed reconstructed irradiance before NRD. Requires active signed GI; otherwise displays normal rendering.");
+    }
+
     if(GetToneMapDebugView() == ToneMapDebugView::HDRIDirectIntegralMip0 ||
        GetToneMapDebugView() == ToneMapDebugView::HDRIDirectIntegralMip4 ||
        GetToneMapDebugView() == ToneMapDebugView::HDRIDirectIntegralMip6){

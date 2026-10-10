@@ -67,27 +67,39 @@ void AORayGeneration()
     Texture2D<float4> surfaceTexture = ResourceDescriptorHeap[surfaceIndex];
 
     const float depth = depthTexture.Load(int3(pixel, 0));
+
     if(!isfinite(depth) || depth < 0.0f || depth >= 1.0f)
+    {
         return;
+    }
 
     // Match GI: pixel centers, flipped NDC Y, D3D [0, 1] depth,
     // and a row-major inverse view-projection multiplying a column vector.
     const float2 uv = (float2(pixel) + 0.5f) / float2(DispatchRaysDimensions().xy);
     const float2 ndc = float2(uv.x * 2.0f - 1.0f, 1.0f - uv.y * 2.0f);
     float4 worldPosition = mul(inverseViewProjection, float4(ndc, depth, 1.0f));
+
     if(!all(isfinite(worldPosition)) || abs(worldPosition.w) < 1.0e-8f)
+    {
         return;
+    }
 
     worldPosition /= worldPosition.w;
+
     if(!all(isfinite(worldPosition)))
+    {
         return;
+    }
 
     // Surface RGB stores the world-space normal directly, without remapping.
     const float3 surfaceNormal = surfaceTexture.Load(int3(pixel, 0)).rgb;
     const float normalLengthSquared = dot(surfaceNormal, surfaceNormal);
+
     if(!all(isfinite(surfaceNormal)) || !isfinite(normalLengthSquared) ||
        normalLengthSquared < 1.0e-8f)
+    {
         return;
+    }
 
     const float3 normal = normalize(surfaceNormal);
 

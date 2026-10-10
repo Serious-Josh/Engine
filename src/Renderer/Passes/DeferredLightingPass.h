@@ -29,6 +29,7 @@ class DeferredLightingPass
             Texture& giIrradiance,
             Texture& aoVisibility,
             bool enableRTGI,
+            float rtgiContactAOStrength,
             RenderTarget& sceneColor,
             D3D12_GPU_VIRTUAL_ADDRESS reconstructionConstantsAddress,
             D3D12_GPU_VIRTUAL_ADDRESS lightConstantsAddress,

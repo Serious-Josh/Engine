@@ -1,5 +1,6 @@
 #include "Core/Log.h"
 #include "Renderer.h"
+#include "../../assets/Shaders/GIModeConfig.hlsli"
 #include "Renderer/Mesh.h"
 #include "Renderer/Passes/EquirectangularToCubemapPass.h"
 #include "Renderer/Passes/EnvironmentMipPass.h"
@@ -378,6 +379,10 @@ bool Renderer::Resize(unsigned int width, unsigned int height)
 
     const uint32_t giWidth = (width + 1u) / 2u;
     const uint32_t giHeight = (height + 1u) / 2u;
+
+    if(m_giSignedCorrectionInitialized &&
+       !m_giSignedCorrectionPass.Resize(m_graphicsDevice, m_resourceDescriptorHeap, width, height))
+        return false;
 
     if(!m_rayTracedGIPass.Resize(m_graphicsDevice.GetDevice(), m_resourceDescriptorHeap, giWidth, giHeight)){
         Log::Error("Failed to resize ray traced GI pass.");
@@ -758,12 +763,15 @@ void Renderer::ReleaseSceneResources()
 
 void Renderer::ResetSceneHistory()
 {
+    m_giSignedCorrectionPass.ResetHistory();
+    m_previousSignedCorrectionNrdInput = false;
     m_rayTracedShadowPass.ResetHistory();
     m_rayTracedReflectionTemporalPass.ResetHistory();
     m_aoTemporalPass.ResetHistory();
 
     m_hasPreviousViewProjection = false;
     m_hasPreviousShadowLightDirection = false;
+    m_hasPreviousGILight = false;
     m_hasPreviousNrdCamera = false;
 
     m_nrdExecutedLastFrame = false;
@@ -783,7 +791,33 @@ bool Renderer::Render(const Scene& scene, const RendererOptions& options)
 {
     const unsigned int frameIndex = m_swapChain.GetCurrentBackBufferIndex();
     const ToneMapDebugView debugView = m_debugUI.GetToneMapDebugView();
-    const bool runAO = !options.enableRTGI ||
+    // An aborted/skipped frame must not leave CPU history state pointing at unsubmitted writes.
+    struct SignedHistoryFrameGuard
+    {
+        GISignedCorrectionPass& pass;
+        bool completed = false;
+        ~SignedHistoryFrameGuard() { if(!completed) pass.ResetHistory(); }
+    } signedHistoryFrame{m_giSignedCorrectionPass};
+    // Compile-time mode selection is shared with the shader; diagnostics never consume stale corrections.
+#if GI_DIAGNOSTIC_MODE == GI_MODE_BASELINE_CORRECTION
+    const bool runSignedCorrection = options.enableGISignedCorrection  && options.enableRTGI;
+#else
+    const bool runSignedCorrection = false;
+#endif
+
+    if(runSignedCorrection && !m_giSignedCorrectionInitialized)
+    {
+        if(!m_giSignedCorrectionPass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap, m_width, m_height)) return false;
+        m_giSignedCorrectionInitialized = true;
+    }
+
+    if(!runSignedCorrection) m_giSignedCorrectionPass.ResetHistory();
+
+    const bool runContactAO = options.enableRTGI && options.rtgiContactAOStrength > 0.0f;
+
+    const float aoRadius = runContactAO && debugView != ToneMapDebugView::HDRIDiffuseAmbientOnly ? options.rtgiContactAORadius : 1.5f;
+
+    const bool runAO = !options.enableRTGI || runContactAO ||
         debugView == ToneMapDebugView::AORaw ||
         debugView == ToneMapDebugView::AOTemporal ||
         debugView == ToneMapDebugView::AOFiltered ||
@@ -827,6 +861,10 @@ bool Renderer::Render(const Scene& scene, const RendererOptions& options)
     m_uploadBuffer.Reset(frameIndex);
 
     const bool tlasNeedsUpdate = !scene.GetChangedTransforms().empty();
+
+    if(tlasNeedsUpdate){
+        m_giSignedCorrectionPass.ResetHistory();
+    }
 
     m_debugUI.SetTLASUpdated(tlasNeedsUpdate);
 
@@ -909,11 +947,29 @@ bool Renderer::Render(const Scene& scene, const RendererOptions& options)
 
         if(directionDifference > 0.0001f){
             m_rayTracedShadowPass.ResetHistory();
+            m_giSignedCorrectionPass.ResetHistory();
         }
     }
 
     m_previousShadowLightDirection = currentLightDirection;
     m_hasPreviousShadowLightDirection = true;
+
+    if(m_hasPreviousGILight){
+        const bool intensityChanged = light.intensity != m_previousGILightIntensity;
+
+        const bool colorChanged =
+            light.color.x != m_previousGILightColor.x ||
+            light.color.y != m_previousGILightColor.y ||
+            light.color.z != m_previousGILightColor.z;
+
+            if(intensityChanged || colorChanged){
+                m_giSignedCorrectionPass.ResetHistory();
+            }
+    }
+
+    m_previousGILightIntensity = light.intensity;
+    m_previousGILightColor = light.color;
+    m_hasPreviousGILight = true;
 
     ShadowConstants shadowConstants{};
     shadowConstants.inverseViewProjection = reconstructionConstants.inverseViewProjection;
@@ -998,6 +1054,10 @@ bool Renderer::Render(const Scene& scene, const RendererOptions& options)
     giConstants.environmentIndex = reflectionConstants.environmentIndex;
     giConstants.diffuseIrradianceIndex = m_environment.GetDiffuseIrradiance().GetDescriptorIndex();
     giConstants.diffuseIrradianceArrayIndex = m_environment.GetDiffuseIrradianceArrayIndex();
+
+    if(runSignedCorrection){
+        giConstants.signedCorrectionIndex = m_giSignedCorrectionPass.GetSignedCorrectionTexture().GetUAVIndex();
+    }
 
     const D3D12_GPU_VIRTUAL_ADDRESS giConstantsAddress = m_uploadBuffer.Allocate( &giConstants, sizeof(GIConstants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
 
@@ -1101,7 +1161,7 @@ bool Renderer::Render(const Scene& scene, const RendererOptions& options)
         aoConstants.surfaceIndex = m_gBuffer.GetSurface().GetSRVIndex();
         aoConstants.frameIndex = reflectionConstants.frameIndex;
 
-        aoConstants.maxDistance = 1.5f;
+        aoConstants.maxDistance = aoRadius;
         aoConstants.originBias = 0.01f;
         aoConstants.rayTMin = 0.001f;
 
@@ -1112,8 +1172,11 @@ bool Renderer::Render(const Scene& scene, const RendererOptions& options)
             return false;
         }
 
-        if(!m_aoExecutedLastFrame)
+        if(!m_aoExecutedLastFrame || m_previousAORadius != aoRadius){
             m_aoTemporalPass.ResetHistory();
+        }
+
+        m_previousAORadius = aoRadius;
 
         m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::RayTracedAO);
         m_rayTracedAOPass.Execute(
@@ -1192,6 +1255,11 @@ bool Renderer::Render(const Scene& scene, const RendererOptions& options)
     const uint32_t giHeight = (m_height + 1u) / 2u;
 
     m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::RayTracedGI);
+
+    if(runSignedCorrection){
+        m_giSignedCorrectionPass.GetSignedCorrectionTexture().Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    }
+
     m_rayTracedGIPass.Execute(
         m_commandContext.GetRayTracingCommandList(),
         m_resourceDescriptorHeap,
@@ -1202,11 +1270,36 @@ bool Renderer::Render(const Scene& scene, const RendererOptions& options)
         giHeight);
     m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::RayTracedGI);
 
+    Texture* giNrdInput = &m_rayTracedGIPass.GetRawGITexture();
+    bool signedGIReconstructed = false;
+
+    if(runSignedCorrection)
+    {
+        m_giSignedCorrectionPass.GetSignedCorrectionTexture().Transition(commandList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+        if(!m_giSignedCorrectionPass.Execute(commandList, m_uploadBuffer, m_gBuffer, currentView, currentProjection))
+        {
+            m_giSignedCorrectionPass.ResetHistory();
+            Log::Error("Failed to execute signed GI correction accumulation.");
+            return false;
+        }
+
+        if(!m_giSignedCorrectionPass.Reconstruct(commandList, m_uploadBuffer, m_gBuffer,
+            m_environment.GetDiffuseIrradiance(), m_rayTracedGIPass.GetRawGITexture()))
+        {
+            Log::Error("Failed to reconstruct signed GI irradiance.");
+            return false;
+        }
+
+        giNrdInput = &m_giSignedCorrectionPass.GetReconstructedTexture();
+        signedGIReconstructed = true;
+    }
+
     constexpr float nrdDenoisingRange = 1000.0f;
     const bool limiterEnabled = m_debugUI.IsReflectionContributionLimiterEnabled();
     const ReflectionDenoiserMode reflectionMode = m_debugUI.GetReflectionDenoiserMode();
     bool runNrd = reflectionMode == ReflectionDenoiserMode::Nrd;
-    // Native production can still inspect fresh NRD diagnostics without changing its lighting input.
+
     switch(debugView)
     {
         case ToneMapDebugView::NrdViewZ:
@@ -1223,8 +1316,8 @@ bool Renderer::Render(const Scene& scene, const RendererOptions& options)
 
     runNrd = runNrd || options.enableRTGI;
     const bool runNative = reflectionMode == ReflectionDenoiserMode::Native;
-    const bool resetNrdHistory = !m_hasPreviousNrdCamera || !m_nrdExecutedLastFrame ||
-        limiterEnabled != m_previousContributionLimiterEnabled;
+    const bool resetNrdHistory = !m_hasPreviousNrdCamera || !m_nrdExecutedLastFrame || limiterEnabled != m_previousContributionLimiterEnabled;
+    const bool resetGIHistory = resetNrdHistory || runSignedCorrection != m_previousSignedCorrectionNrdInput;
 
     if(runNrd)
     {
@@ -1250,7 +1343,7 @@ bool Renderer::Render(const Scene& scene, const RendererOptions& options)
             previousNrdProjection,
             m_nrdFrameIndex,
             nrdDenoisingRange,
-            resetNrdHistory))
+            resetGIHistory))
         {
             return false;
         }
@@ -1289,7 +1382,7 @@ bool Renderer::Render(const Scene& scene, const RendererOptions& options)
         m_nrdGIPreparePass.ExecuteGI(
             commandList,
             m_gBuffer,
-            m_rayTracedGIPass.GetRawGITexture(),
+            *giNrdInput,
             m_rayTracedGIPass.GetHitDistanceTexture(),
             m_uploadBuffer,
             reconstructionConstants.inverseViewProjection,
@@ -1422,6 +1515,7 @@ bool Renderer::Render(const Scene& scene, const RendererOptions& options)
         m_giSpatialDenoisePass.GetOutputTexture(),
         m_aoDenoisePass.GetFilteredAOTexture(),
         options.enableRTGI,
+        options.rtgiContactAOStrength,
         m_sceneColor,
         reconstructionConstantsAddress,
         lightConstantsAddress,
@@ -1462,6 +1556,12 @@ bool Renderer::Render(const Scene& scene, const RendererOptions& options)
             debugTexture = &m_rayTracedGIPass.GetHitDistanceTexture(); break;
         case ToneMapDebugView::GIDenoised:
             debugTexture = &m_giSpatialDenoisePass.GetOutputTexture(); break;
+        case ToneMapDebugView::GISignedReconstructed:
+            // A null debug input safely falls back to normal rendering in ToneMapPass.
+            if(runSignedCorrection && signedGIReconstructed){
+                debugTexture = &m_giSignedCorrectionPass.GetReconstructedTexture();
+            }
+            break;
         case ToneMapDebugView::AORaw:
             debugTexture = &m_rayTracedAOPass.GetRawAOTexture(); break;
         case ToneMapDebugView::AOTemporal:
@@ -1533,9 +1633,11 @@ bool Renderer::Render(const Scene& scene, const RendererOptions& options)
     if(runNrd)
     {
         m_previousContributionLimiterEnabled = limiterEnabled;
+        m_previousSignedCorrectionNrdInput = runSignedCorrection;
         ++m_nrdFrameIndex;
     }
 
+    signedHistoryFrame.completed = true;
     return true;
 }
 
@@ -1584,6 +1686,8 @@ void Renderer::Shutdown()
     m_nrdReflectionResolvePass.Shutdown();
     m_nrdDiffuseResolvePass.Shutdown();
     m_giSpatialDenoisePass.Shutdown();
+    m_giSignedCorrectionPass.Shutdown();
+    m_giSignedCorrectionInitialized = false;
     m_shadowDenoisePass.Shutdown();
     m_selectionMaskPass.Shutdown();
 

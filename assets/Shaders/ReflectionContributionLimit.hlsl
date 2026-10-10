@@ -14,8 +14,13 @@ static const float EPSILON = 1.0e-6f; // Numerical guard, not an HDR ceiling.
 void CSMain(uint3 thread : SV_DispatchThreadID)
 {
     uint2 pixel = thread.xy;
-    if(pixel.x >= width || pixel.y >= height) return;
+
+    if(pixel.x >= width || pixel.y >= height)
+    {
+        return;
+    }
     Texture2D<float4> raw = ResourceDescriptorHeap[inputIndex];
+
     RWTexture2D<float4> limited = ResourceDescriptorHeap[outputIndex];
     float4 center = raw.Load(int3(pixel, 0));
     float luminance = dot(center.rgb, LUMA);
@@ -26,10 +31,19 @@ void CSMain(uint3 thread : SV_DispatchThreadID)
     for(int x = -2; x <= 2; ++x)
     {
         int2 q = int2(pixel) + int2(x, y);
-        if((x == 0 && y == 0) || any(q < 0) || q.x >= int(width) || q.y >= int(height)) continue;
+
+        if((x == 0 && y == 0) || any(q < 0) || q.x >= int(width) || q.y >= int(height))
+        {
+            continue;
+        }
         float value = dot(raw.Load(int3(q, 0)).rgb, LUMA);
-        if(!isfinite(value)) continue;
+
+        if(!isfinite(value))
+        {
+            continue;
+        }
         value = max(value, 0.0f);
+
         samples[count++] = value;
     }
     if(count >= 8 && all(isfinite(center.rgb)) && isfinite(luminance) && luminance > EPSILON)
@@ -43,7 +57,10 @@ void CSMain(uint3 thread : SV_DispatchThreadID)
             uint largest = 0;
             for(uint i = 1; i <= end; ++i)
             {
-                if(samples[i] > samples[largest]) largest = i;
+                if(samples[i] > samples[largest])
+                {
+                    largest = i;
+                }
             }
             float value = samples[end];
             samples[end] = samples[largest];
@@ -54,7 +71,10 @@ void CSMain(uint3 thread : SV_DispatchThreadID)
         if(reference > EPSILON)
         {
             float bound = TAIL_MULTIPLIER * reference;
-            if(luminance > bound) center.rgb *= bound / max(luminance, EPSILON);
+            if(luminance > bound)
+            {
+                center.rgb *= bound / max(luminance, EPSILON);
+            }
         }
     }
     limited[pixel] = center;

@@ -246,6 +246,9 @@ void Engine::Frame()
 
     RendererOptions rendererOptions{};
     rendererOptions.enableRTGI = debugUI.IsRTGIEnabled();
+    rendererOptions.enableGISignedCorrection = !debugUI.IsLegacyGIEstimatorEnabled();
+    rendererOptions.rtgiContactAOStrength = debugUI.GetRTGIContactAOStrength();
+    rendererOptions.rtgiContactAORadius = debugUI.GetRTGIContactAORadius();
     
     const size_t selectedObject = m_editor.GetSelectedObject();
 

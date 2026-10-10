@@ -107,7 +107,7 @@ struct GIConstants
 
     unsigned int geometricNormalIndex = 0;
     unsigned int fullResolution[2];
-    unsigned int padding;
+    unsigned int signedCorrectionIndex = 0xFFFFFFFFu;
 };
 
 struct AOConstants

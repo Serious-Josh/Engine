@@ -128,20 +128,35 @@ float4 PSMain(VSOutput input) : SV_TARGET
     {
         Texture2D<float> depthTexture = ResourceDescriptorHeap[toneMapConstants.debugDepthIndex];
         float depth = depthTexture.Load(int3(pixel, 0));
+
         if(!isfinite(depth) || depth < 0.0f)
+        {
             return float4(1.0f, 0.0f, 1.0f, 1.0f);
+        }
+
         if(depth >= 1.0f)
+        {
             return float4(0.0f, 0.0f, 0.0f, 1.0f);
+        }
+
         Texture2D<float4> gBufferTexture = ResourceDescriptorHeap[toneMapConstants.debugTextureIndex];
         float3 value = gBufferTexture.Load(int3(pixel, 0)).rgb;
+
         if(!all(isfinite(value)))
+        {
             return float4(1.0f, 0.0f, 1.0f, 1.0f);
+        }
+
         if(toneMapConstants.debugView == 17)
         {
             // The surface target stores signed world-space XYZ.
             float lengthSquared = dot(value, value);
+
             if(!isfinite(lengthSquared) || lengthSquared < 1.0e-8f)
+            {
                 return float4(1.0f, 0.0f, 1.0f, 1.0f);
+            }
+
             return float4(normalize(value) * 0.5f + 0.5f, 1.0f);
         }
         // G-buffer RGB is linear after sRGB albedo sampling. Encode only for display.
@@ -152,8 +167,12 @@ float4 PSMain(VSOutput input) : SV_TARGET
         Texture2D<float> trackingDistance =
             ResourceDescriptorHeap[toneMapConstants.debugTextureIndex];
         float distance = trackingDistance.Load(int3(uint2(input.position.xy), 0));
+
         if(distance == -1.0f)
+        {
             return float4(0.0f, 0.0f, 1.0f, 1.0f);
+        }
+
         if(distance > 0.0f)
         {
             float gray = distance / (distance + 5.0f);
@@ -166,10 +185,17 @@ float4 PSMain(VSOutput input) : SV_TARGET
     {
         Texture2D<float> viewZTexture = ResourceDescriptorHeap[toneMapConstants.debugTextureIndex];
         float z = viewZTexture.Load(int3(pixel, 0));
+
         if(!isfinite(z) || z <= 0.0f)
+        {
             return float4(1, 0, 0, 1); // Invalid depth.
+        }
+
         if(z > toneMapConstants.nrdDenoisingRange)
+        {
             return float4(1, 0, 1, 1);
+        }
+
         float gray = z / (z + 10.0f);
         return float4(gray.xxx, 1);
     }
@@ -177,8 +203,12 @@ float4 PSMain(VSOutput input) : SV_TARGET
     {
         Texture2D<float4> preparedTexture = ResourceDescriptorHeap[toneMapConstants.debugTextureIndex];
         float4 prepared = preparedTexture.Load(int3(pixel, 0));
+
         if(!all(isfinite(prepared)))
+        {
             return float4(1, 0, 1, 1);
+        }
+
         if(toneMapConstants.debugView == 3 || toneMapConstants.debugView == 4)
         {
             float4 decoded = NRD_FrontEnd_UnpackNormalAndRoughness(prepared);
@@ -195,8 +225,12 @@ float4 PSMain(VSOutput input) : SV_TARGET
         // The preparation helper stores YCoCg, not ordinary RGB. The REBLUR
         // backend unpack helper is also the inverse for this frontend packing.
         float4 decoded = REBLUR_BackEnd_UnpackRadianceAndNormHitDist(prepared);
+
         if(toneMapConstants.debugView == 7)
+        {
             return float4(saturate(decoded.www), 1);
+        }
+
         return float4(LinearToSRGB(AgX(max(decoded.xyz, 0.0f))), 1);
     }
 
@@ -218,11 +252,50 @@ float4 PSMain(VSOutput input) : SV_TARGET
         return float4(mask, mask, mask, 1.0f);
     }
 
-    if(toneMapConstants.debugView == 11 || toneMapConstants.debugView == 13)
+    if(toneMapConstants.debugView == 11 || toneMapConstants.debugView == 13 ||
+       toneMapConstants.debugView == 31)
     {
         Texture2D<float4> rawGI =
             ResourceDescriptorHeap[toneMapConstants.debugTextureIndex];
-        return float4(rawGI.Load(int3(pixel, 0)).rgb, 1.0f);
+        uint sourceWidth, sourceHeight;
+        rawGI.GetDimensions(sourceWidth, sourceHeight);
+
+        if(sourceWidth == 0u || sourceHeight == 0u)
+        {
+            return float4(0.0f, 0.0f, 0.0f, 1.0f);
+        }
+
+        // Raw and signed reconstructed GI represent full-resolution pixels (2*x, 2*y).
+        // Denoised GI has already been reconstructed to full resolution.
+        uint2 sourcePixel = toneMapConstants.debugView == 13 ? pixel : pixel / 2u;
+        sourcePixel = min(sourcePixel, uint2(sourceWidth, sourceHeight) - 1u);
+        float4 giValue = rawGI.Load(int3(sourcePixel, 0));
+        // Primary visibility is already normalized; bypass HDR mapping and color conversion.
+
+        if(toneMapConstants.debugView == 11 && giValue.a == -2.0f)
+        {
+            return float4(all(isfinite(giValue.rgb)) ? giValue.rgb : float3(1, 0, 1), 1.0f);
+        }
+
+        // Negative alpha identifies pre-encoded RTGI diagnostics, excluded from NRD.
+
+        if(toneMapConstants.debugView == 11 && giValue.a < 0.0f)
+        {
+            return float4(all(isfinite(giValue.rgb)) ? LinearToSRGB(giValue.rgb) : float3(1, 0, 1), 1.0f);
+        }
+
+        float3 irradiance = giValue.rgb;
+
+        if(!all(isfinite(irradiance)))
+        {
+            return float4(1.0f, 0.0f, 1.0f, 1.0f);
+        }
+
+        // Fixed diagnostic scale: 1 irradiance unit maps to 0.5.
+        // All three views bypass exposure and AgX, then encode identically for display.
+        float3 color = max(irradiance, 0.0f);
+        float3 displayLinear = color / (1.0f + color);
+        return float4(LinearToSRGB(displayLinear), 1.0f);
     }
 
     if(toneMapConstants.debugView == 12)
@@ -230,8 +303,12 @@ float4 PSMain(VSOutput input) : SV_TARGET
         Texture2D<float> giHitDistance =
             ResourceDescriptorHeap[toneMapConstants.debugTextureIndex];
         float distance = giHitDistance.Load(int3(pixel, 0));
+
         if(distance == -1.0f)
+        {
             return float4(0.0f, 0.0f, 1.0f, 1.0f);
+        }
+
         if(isfinite(distance) && distance > 0.0f)
         {
             float gray = distance / (distance + 5.0f);
@@ -259,12 +336,17 @@ float4 PSMain(VSOutput input) : SV_TARGET
         sceneColor.Load(int3(pixel, 0)).rgb;
 
     if(toneMapConstants.debugView == 24u || toneMapConstants.debugView == 25u || toneMapConstants.debugView == 27u)
+    {
         return float4(all(isfinite(hdrColor)) ? hdrColor : float3(1.0f, 0.0f, 1.0f), 1.0f);
+    }
 
     hdrColor *= toneMapConstants.exposure;
+
     if(((toneMapConstants.debugView >= 19u && toneMapConstants.debugView <= 23u) || toneMapConstants.debugView == 26u ||
         (toneMapConstants.debugView >= 28u && toneMapConstants.debugView <= 30u)) && !all(isfinite(hdrColor)))
+    {
         return float4(1.0f, 0.0f, 1.0f, 1.0f);
+    }
 
     float3 displayLinear = AgX(hdrColor);
 
@@ -290,8 +372,11 @@ float4 PSMain(VSOutput input) : SV_TARGET
                 for(int x = -radius; x <= radius; ++x)
                 {
                     // Use a circular neighborhood.
+
                     if(x * x + y * y > radius * radius)
+                    {
                         continue;
+                    }
 
                     int2 neighbor = position + int2(x, y);
 
@@ -306,7 +391,9 @@ float4 PSMain(VSOutput input) : SV_TARGET
             }
 
             if(isOutline)
+            {
                 displaySRGB = toneMapConstants.outlineColor;
+            }
         }
     }
 

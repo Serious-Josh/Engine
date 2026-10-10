@@ -43,6 +43,7 @@
 #include "Passes/AODenoisePass.h"
 #include "Passes/NrdDiffuseResolvePass.h"
 #include "Passes/GISpatialDenoisePass.h"
+#include "Passes/GISignedCorrectionPass.h"
 
 #include <d3d12.h>
 #include <filesystem>
@@ -65,6 +66,9 @@ struct RendererOptions
     unsigned int selectionOutlineThickness = 2;
 
     bool enableRTGI = true;
+    float rtgiContactAOStrength = 1.0f;
+    float rtgiContactAORadius = 2.5f;
+    bool enableGISignedCorrection = true;
 };
 
 class Scene;
@@ -145,6 +149,9 @@ class Renderer
         NrdDenoiser m_nrdReflectionDenoiser;
         NrdDenoiser m_nrdGIDenoiser;
         GISpatialDenoisePass m_giSpatialDenoisePass;
+        GISignedCorrectionPass m_giSignedCorrectionPass;
+        bool m_giSignedCorrectionInitialized = false;
+        bool m_previousSignedCorrectionNrdInput = false;
         NrdPreparePass m_nrdReflectionPreparePass;
         NrdPreparePass m_nrdGIPreparePass;
         NrdReflectionResolvePass m_nrdReflectionResolvePass;
@@ -156,6 +163,7 @@ class Renderer
         bool m_nrdExecutedLastFrame = false;
         bool m_nativeReflectionExecutedLastFrame = false;
         bool m_aoExecutedLastFrame = false;
+        float m_previousAORadius = 1.5f;
 
         ShaderLibrary m_shaderLibrary;
 
@@ -190,6 +198,10 @@ class Renderer
 
         Vector3 m_previousShadowLightDirection{};
         bool m_hasPreviousShadowLightDirection = false;
+
+        Vector3 m_previousGILightColor{};
+        float m_previousGILightIntensity = 0.0f;
+        bool m_hasPreviousGILight = false;
 
         std::filesystem::path m_assetRoot;
         std::vector<EnvironmentAsset> m_availableEnvironments;

@@ -26,15 +26,21 @@ bool ReconstructWorldPosition(int2 pixel, float depth, uint2 dimensions,
     float4x4 inverseVP, out float3 position)
 {
     position = 0.0f;
+
     if(!isfinite(depth) || depth < 0.0f || depth >= 1.0f)
+    {
         return false;
+    }
 
     // Match shadow reconstruction: pixel centers, flipped NDC Y, D3D depth.
     float2 uv = (float2(pixel) + 0.5f) / float2(dimensions);
     float2 ndc = float2(uv.x * 2.0f - 1.0f, 1.0f - uv.y * 2.0f);
     float4 world = mul(inverseVP, float4(ndc, depth, 1.0f));
+
     if(!all(isfinite(world)) || abs(world.w) < 1.0e-8f)
+    {
         return false;
+    }
 
     position = world.xyz / world.w;
     return all(isfinite(position));
@@ -44,16 +50,25 @@ bool ReprojectWorldPosition(float3 position, uint2 dimensions, out float2 previo
 {
     previousPixel = 0.0f;
     float4 clip = mul(constants.previousViewProjection, float4(position, 1.0f));
+
     if(!all(isfinite(clip)) || clip.w < 1.0e-8f)
+    {
         return false;
+    }
 
     float3 ndc = clip.xyz / clip.w;
+
     if(!all(isfinite(ndc)) || ndc.z < 0.0f || ndc.z > 1.0f)
+    {
         return false;
+    }
 
     float2 uv = float2(ndc.x * 0.5f + 0.5f, 0.5f - ndc.y * 0.5f);
+
     if(any(uv < 0.0f) || any(uv >= 1.0f))
+    {
         return false;
+    }
 
     previousPixel = uv * float2(dimensions) - 0.5f;
     return all(isfinite(previousPixel));
@@ -64,8 +79,11 @@ void CSMain(uint3 dispatchThreadID : SV_DispatchThreadID)
 {
     uint2 pixel = dispatchThreadID.xy;
     uint2 dimensions = uint2(constants.width, constants.height);
+
     if(any(pixel >= dimensions))
+    {
         return;
+    }
 
     Texture2D<float> rawAOTexture = ResourceDescriptorHeap[constants.rawAOIndex];
     Texture2D<float> depthTexture = ResourceDescriptorHeap[constants.depthIndex];
@@ -126,27 +144,39 @@ void CSMain(uint3 dispatchThreadID : SV_DispatchThreadID)
             for(int i = 0; i < 4; ++i)
             {
                 int2 candidate = basePixel + offsets[i];
+
                 if(weights[i] <= 0.0f || any(candidate < 0) || any(candidate >= int2(dimensions)))
+                {
                     continue;
+                }
 
                 float candidateDepth = previousDepth.Load(int3(candidate, 0));
                 float3 previousWorldPosition;
+
                 if(!ReconstructWorldPosition(candidate, candidateDepth, dimensions,
                     constants.previousInverseViewProjection, previousWorldPosition))
+                {
                     continue;
+                }
 
                 float3 difference = previousWorldPosition - worldPosition;
                 float planeDistance = abs(dot(difference, normal));
                 float worldDistance = length(difference);
+
                 if(!isfinite(planeDistance) || !isfinite(worldDistance) ||
                    planeDistance > planeDistanceThreshold || worldDistance > worldDistanceThreshold)
+                {
                     continue;
+                }
 
                 float candidateAO = previousAO.Load(int3(candidate, 0));
                 float candidateHistoryLength = previousHistoryLength.Load(int3(candidate, 0));
+
                 if(!isfinite(candidateAO) || !isfinite(candidateHistoryLength) ||
                    candidateHistoryLength < 1.0f)
+                {
                     continue;
+                }
 
                 weightedAO += candidateAO * weights[i];
                 weightedHistoryLength += min(candidateHistoryLength, 20.0f) * weights[i];

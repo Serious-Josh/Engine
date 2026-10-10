@@ -37,8 +37,8 @@ bool ComputePipeline::Initialize(ID3D12Device* device, const ComputePipelineDesc
     D3D12_ROOT_SIGNATURE_DESC rootSignatureDescription{};
     rootSignatureDescription.NumParameters = static_cast<UINT>(rootParameters.size());
     rootSignatureDescription.pParameters = rootParameters.empty() ? nullptr : rootParameters.data();
-    rootSignatureDescription.NumStaticSamplers = 0;
-    rootSignatureDescription.pStaticSamplers = nullptr;
+    rootSignatureDescription.NumStaticSamplers = static_cast<UINT>(description.staticSamplers.size());
+    rootSignatureDescription.pStaticSamplers = description.staticSamplers.empty() ? nullptr : description.staticSamplers.data();
     rootSignatureDescription.Flags = D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED;
 
     ID3DBlob* rootSignatureBlob = nullptr;

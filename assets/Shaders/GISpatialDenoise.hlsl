@@ -40,8 +40,11 @@ bool ValidNormal(float3 normal)
 void CSMain(uint3 dispatchThreadID : SV_DispatchThreadID)
 {
     uint2 pixel = dispatchThreadID.xy;
+
     if(pixel.x >= width || pixel.y >= height)
+    {
         return;
+    }
 
     Texture2D<float4> inputTexture = ResourceDescriptorHeap[inputIndex];
     RWTexture2D<float4> outputTexture = ResourceDescriptorHeap[outputIndex];
@@ -56,21 +59,31 @@ void CSMain(uint3 dispatchThreadID : SV_DispatchThreadID)
     float centerDepth = depthTexture.Load(int3(pixel, 0));
     // Surface RGB stores signed world-space shading normals directly.
     float3 centerNormal = normalTexture.Load(int3(pixel, 0)).rgb;
+
     if(!ValidDepth(centerDepth) || !ValidNormal(centerNormal) ||
        !all(isfinite(center.rgb)) || !isfinite(depthSigma) || depthSigma <= 0.0f ||
        !isfinite(normalPower) || normalPower < 0.0f)
+    {
         return;
+    }
 
     float centerViewZ = HardwareDepthToViewZ(centerDepth);
+
     if(!isfinite(centerViewZ) || centerViewZ <= 0.0f)
+    {
         return;
+    }
+
     centerNormal = normalize(centerNormal);
 
     // Same relative depth scale as the GI reconstruction, with depthSigma
     // controlling its width. Reject beyond three sigmas at discontinuities.
     float depthScale = depthSigma * max(centerViewZ * 0.01f, 0.01f);
+
     if(!isfinite(depthScale) || depthScale <= 0.0f)
+    {
         return;
+    }
 
     static const float kernel[5] = {1.0f / 16.0f, 4.0f / 16.0f, 6.0f / 16.0f, 4.0f / 16.0f, 1.0f / 16.0f};
     float3 accumulated = 0.0f;
@@ -82,28 +95,50 @@ void CSMain(uint3 dispatchThreadID : SV_DispatchThreadID)
         for(int x = -2; x <= 2; ++x)
         {
             int2 samplePixel = int2(pixel) + int2(x, y) * int(stepWidth);
+
             if(any(samplePixel < 0) || any(samplePixel >= int2(width, height)))
+            {
                 continue;
+            }
 
             float sampleDepth = depthTexture.Load(int3(samplePixel, 0));
             float3 sampleNormal = normalTexture.Load(int3(samplePixel, 0)).rgb;
+
             if(!ValidDepth(sampleDepth) || !ValidNormal(sampleNormal))
+            {
                 continue;
+            }
+
             float sampleViewZ = HardwareDepthToViewZ(sampleDepth);
+
             if(!isfinite(sampleViewZ) || sampleViewZ <= 0.0f)
+            {
                 continue;
+            }
+
             float depthDifference = abs(sampleViewZ - centerViewZ) / depthScale;
             float normalSimilarity = saturate(dot(centerNormal, normalize(sampleNormal)));
+
             if(depthDifference > 3.0f || normalSimilarity <= 0.0f)
+            {
                 continue;
+            }
 
             float3 radiance = inputTexture.Load(int3(samplePixel, 0)).rgb;
+
             if(!all(isfinite(radiance)))
+            {
                 continue;
+            }
+
             float weight = kernel[x + 2] * kernel[y + 2] *
                 exp(-0.5f * depthDifference * depthDifference) * pow(normalSimilarity, normalPower);
+
             if(!isfinite(weight) || weight <= 0.0f)
+            {
                 continue;
+            }
+
             accumulated += min(max(radiance, 0.0f), 65504.0f) * weight;
             totalWeight += weight;
         }
@@ -112,7 +147,10 @@ void CSMain(uint3 dispatchThreadID : SV_DispatchThreadID)
     if(isfinite(totalWeight) && totalWeight > 1.0e-8f)
     {
         float3 filtered = accumulated / totalWeight;
+
         if(all(isfinite(filtered)))
+        {
             outputTexture[pixel] = float4(min(max(filtered, 0.0f), 65504.0f), alpha);
+        }
     }
 }

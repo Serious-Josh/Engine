@@ -11,6 +11,7 @@ struct ComputePipelineDescription
     const Shader* computeShader = nullptr;
 
     std::vector<RootParameterDescription> rootParameters;
+    std::vector<D3D12_STATIC_SAMPLER_DESC> staticSamplers;
 };
 
 class ComputePipeline

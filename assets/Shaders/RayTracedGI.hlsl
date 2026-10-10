@@ -1,21 +1,24 @@
 #include "MaterialLighting.hlsli"
 #include "DiffuseHDRIConfig.hlsli"
 
-// Production defaults to baseline correction; retain legacy and diagnostic selections for A/B tests.
-#define GI_MODE_LEGACY_SECONDARY_SURFACE 0
-#define GI_MODE_SECONDARY_SURFACE GI_MODE_LEGACY_SECONDARY_SURFACE
-#define GI_MODE_ENVIRONMENT_ONLY 1
-#define GI_MODE_ENVIRONMENT_REFERENCE_4096 2
-#define GI_MODE_SECONDARY_ENVIRONMENT_ONLY 3
-#define GI_MODE_WHITE_DIFFUSE_SECONDARY 4
-#define GI_MODE_BASELINE_CORRECTION 5
-#define GI_MODE_PRIMARY_BASELINE_ONLY 6
-#define GI_MODE_SIGNED_CORRECTION_DEBUG 7
-#define GI_MODE_PRECLAMP_NEGATIVE_DEBUG 8
-#define GI_MODE_CLAMP_BIAS_DEBUG 9
-#define GI_MODE_BASELINE_RESIDUAL_DEBUG 10
-#define GI_MODE_SAME_NORMAL_INTEGRATION_DEBUG 11
-#define GI_MODE_CUBEMAP_TEXEL_DEBUG 12
+#include "GIModeConfig.hlsli"
+#ifndef GI_PRODUCTION_CLAMP_SAMPLES
+#define GI_PRODUCTION_CLAMP_SAMPLES 64
+#endif
+#ifndef GI_PRODUCTION_CLAMP_DISPLAY
+// 0 = A (mean clamped), 1 = B (clamped mean), 2 = A-B (signed).
+#define GI_PRODUCTION_CLAMP_DISPLAY 0
+#endif
+#ifndef GI_PRODUCTION_CLAMP_BLACK_SECONDARY
+#define GI_PRODUCTION_CLAMP_BLACK_SECONDARY 0
+#endif
+#ifndef GI_PRODUCTION_CLAMP_NUMERIC_OUTPUT
+// Mode 13 only: raw RGB = luminance(A), luminance(B), luminance(A-B); alpha = validity.
+#define GI_PRODUCTION_CLAMP_NUMERIC_OUTPUT 1
+#endif
+#if GI_PRODUCTION_CLAMP_SAMPLES != 16 && GI_PRODUCTION_CLAMP_SAMPLES != 64
+#error GI_PRODUCTION_CLAMP_SAMPLES must be 16 or 64
+#endif
 #ifndef GI_CUBEMAP_TEXEL_DISPLAY
 #define GI_CUBEMAP_TEXEL_DISPLAY 3
 #endif
@@ -23,7 +26,6 @@
 // Mode 11: 0 = A, 1 = B, 2 = C, 3 = C-B, 4 = A-C.
 #define GI_SAME_NORMAL_DISPLAY 4
 #endif
-#define GI_MODE_PRODUCTION GI_MODE_BASELINE_CORRECTION
 #ifndef GI_BASELINE_REFERENCE_SAMPLES
 #define GI_BASELINE_REFERENCE_SAMPLES 4096
 #endif
@@ -41,9 +43,6 @@
 #endif
 #ifndef GI_SECONDARY_ENV_VISIBILITY
 #define GI_SECONDARY_ENV_VISIBILITY 1
-#endif
-#ifndef GI_DIAGNOSTIC_MODE
-#define GI_DIAGNOSTIC_MODE GI_MODE_PRODUCTION
 #endif
 #if (GI_DIAGNOSTIC_MODE == GI_MODE_BASELINE_RESIDUAL_DEBUG || GI_DIAGNOSTIC_MODE == GI_MODE_SAME_NORMAL_INTEGRATION_DEBUG || GI_DIAGNOSTIC_MODE == GI_MODE_CUBEMAP_TEXEL_DEBUG) && GI_BASELINE_REFERENCE_SAMPLES < 1
 #error GI_BASELINE_REFERENCE_SAMPLES must be positive
@@ -103,7 +102,7 @@ cbuffer GIConstants : register(b0)
     uint diffuseIrradianceArrayIndex;
     uint geometricNormalIndex;
     uint2 fullResolution;
-    uint padding;
+    uint signedCorrectionIndex;
 };
 
 RaytracingAccelerationStructure scene : register(t0);
@@ -213,8 +212,11 @@ float3 SampleGIEnvironment(float3 rayDirection, float sourceMip = 0.0f)
 float3 ShadeGIWhiteDiffuseSecondary(float3 secondaryNormal)
 {
     float normalLengthSquared = dot(secondaryNormal, secondaryNormal);
+
     if(!all(isfinite(secondaryNormal)) || !isfinite(normalLengthSquared) || normalLengthSquared < 1.0e-8f)
+    {
         return 0.0f;
+    }
 
     float3 normal = normalize(secondaryNormal);
     TextureCube<float4> diffuseIrradiance = ResourceDescriptorHeap[diffuseIrradianceIndex];
@@ -226,38 +228,61 @@ float3 ShadeGIWhiteDiffuseSecondary(float3 secondaryNormal)
 float3 ShadeGISecondaryEnvironmentOnly(GIPayload surface, float3 secondaryPosition)
 {
     float normalLengthSquared = dot(surface.shadingNormal, surface.shadingNormal);
+
     if(!all(isfinite(secondaryPosition)) || !all(isfinite(surface.shadingNormal)) ||
        !all(isfinite(surface.uv)) || !isfinite(normalLengthSquared) || normalLengthSquared < 1.0e-8f)
+    {
         return 0.0f;
+    }
 
     float3 normal = normalize(surface.shadingNormal);
 
     StructuredBuffer<GPUMaterial> materials = ResourceDescriptorHeap[materialBufferIndex];
     uint materialCount, materialStride;
     materials.GetDimensions(materialCount, materialStride);
+
     if(surface.materialIndex >= materialCount)
+    {
         return 0.0f;
+    }
+
     GPUMaterial material = materials[surface.materialIndex];
     // Model 0 is metallic-roughness, model 1 dielectric; conductors have no diffuse lobe.
+
     if(material.model > 1u || !all(isfinite(material.baseColor)) ||
        (material.model == 0u && !isfinite(material.metallic)))
+    {
         return 0.0f;
+    }
 
     Texture2D<float4> materialTexture = ResourceDescriptorHeap[NonUniformResourceIndex(material.textureIndex)];
     float3 sampledColor = materialTexture.SampleLevel(materialSampler, surface.uv, 0.0f).rgb;
+
     if(!all(isfinite(sampledColor)))
+    {
         return 0.0f;
+    }
+
     float3 diffuseColor = max(material.baseColor * sampledColor, 0.0f);
+
     if(material.model == 0u)
+    {
         diffuseColor *= 1.0f - saturate(material.metallic);
+    }
+
     if(!all(isfinite(diffuseColor)) || !any(diffuseColor > 0.0f))
+    {
         return 0.0f;
+    }
 
     TextureCube<float4> diffuseIrradiance = ResourceDescriptorHeap[diffuseIrradianceIndex];
     float3 environmentIrradiance = diffuseIrradiance.SampleLevel(materialSampler, normal, 0.0f).rgb;
     float3 environmentRadiance = (diffuseColor / PI) * environmentIrradiance;
+
     if(!all(isfinite(environmentRadiance)))
+    {
         environmentRadiance = 0.0f;
+    }
 
     return environmentRadiance;
 }
@@ -267,69 +292,104 @@ float3 SampleGICosineHemisphere(float3 normal, uint2 pixel, uint sampleIndex);
 float3 ShadeGISecondarySurface(GIPayload surface, float3 secondaryPosition, uint2 pixel, uint sampleIndex, float sourceMip = 0.0f)
 {
     float normalLengthSquared = dot(surface.shadingNormal, surface.shadingNormal);
+
     if(!all(isfinite(secondaryPosition)) || !all(isfinite(surface.shadingNormal)) ||
        !all(isfinite(surface.uv)) || !isfinite(normalLengthSquared) || normalLengthSquared < 1.0e-8f)
+    {
         return 0.0f;
+    }
 
     float3 normal = normalize(surface.shadingNormal);
 
     StructuredBuffer<GPUMaterial> materials = ResourceDescriptorHeap[materialBufferIndex];
     uint materialCount, materialStride;
     materials.GetDimensions(materialCount, materialStride);
+
     if(surface.materialIndex >= materialCount)
+    {
         return 0.0f;
+    }
+
     GPUMaterial material = materials[surface.materialIndex];
     // Model 0 is metallic-roughness, model 1 dielectric; conductors have no diffuse lobe.
+
     if(material.model > 1u || !all(isfinite(material.baseColor)) ||
        (material.model == 0u && !isfinite(material.metallic)))
+    {
         return 0.0f;
+    }
 
     Texture2D<float4> materialTexture = ResourceDescriptorHeap[NonUniformResourceIndex(material.textureIndex)];
     float3 sampledColor = materialTexture.SampleLevel(materialSampler, surface.uv, 0.0f).rgb;
+
     if(!all(isfinite(sampledColor)))
+    {
         return 0.0f;
+    }
+
     float3 diffuseColor = max(material.baseColor * sampledColor, 0.0f);
+
     if(material.model == 0u)
+    {
         diffuseColor *= 1.0f - saturate(material.metallic);
+    }
+
     if(!all(isfinite(diffuseColor)) || !any(diffuseColor > 0.0f))
+    {
         return 0.0f;
+    }
 
     float3 environmentRadiance = 0.0f;
 #if GI_SECONDARY_ENV_VISIBILITY
-    // A distinct sampling stream from the primary ray, varying with pixel and frame.
-    float3 environmentDirection = SampleGICosineHemisphere(normal, pixel, sampleIndex ^ 0xD1B54A35u);
-    RayDesc environmentRay;
-    environmentRay.Origin = secondaryPosition + normalize(surface.worldNormal) * 0.001f;
-    environmentRay.Direction = environmentDirection;
-    environmentRay.TMin = 0.001f;
-    environmentRay.TMax = 10000.0f;
-    if(all(isfinite(environmentRay.Origin)) && all(isfinite(environmentDirection)))
+    // Average four independently seeded secondary environment visibility samples.
+    for(uint environmentSample = 0u; environmentSample < 4u; ++environmentSample)
     {
-        GIVisibilityPayload environmentPayload;
-        environmentPayload.visible = 0u;
-        // Launched from raygen after the primary trace; hit group 0 is skipped, miss record 1.
-        TraceRay(scene, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER,
-            0xFF, 0, 1, 1, environmentRay, environmentPayload);
-        if(environmentPayload.visible != 0u)
+        uint environmentSampleIndex = sampleIndex ^ 0xD1B54A35u ^ (environmentSample * 0x9E3779B9u);
+        float3 environmentDirection = SampleGICosineHemisphere(normal, pixel, environmentSampleIndex);
+        RayDesc environmentRay;
+        environmentRay.Origin = secondaryPosition + normalize(surface.worldNormal) * 0.001f;
+        environmentRay.Direction = environmentDirection;
+        environmentRay.TMin = 0.001f;
+        environmentRay.TMax = 10000.0f;
+        if(all(isfinite(environmentRay.Origin)) && all(isfinite(environmentDirection)))
         {
-            // Lambertian BRDF * cosine / cosine-weighted PDF cancels PI.
-            environmentRadiance = diffuseColor * SampleGIEnvironment(environmentDirection, sourceMip);
+            GIVisibilityPayload environmentPayload;
+            environmentPayload.visible = 0u;
+            // Launched from raygen after the primary trace; hit group 0 is skipped, miss record 1.
+            TraceRay(scene, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER,
+                0xFF, 0, 1, 1, environmentRay, environmentPayload);
+            if(environmentPayload.visible != 0u)
+            {
+                // Lambertian BRDF * cosine / cosine-weighted PDF cancels PI.
+                environmentRadiance += diffuseColor * SampleGIEnvironment(environmentDirection, sourceMip);
+            }
         }
     }
+    environmentRadiance *= 0.25f;
 #endif
+
     if(!all(isfinite(environmentRadiance)))
+    {
         environmentRadiance = 0.0f;
+    }
 
     // Invalid or back-facing directional lighting must not suppress environment diffuse.
     float lightLengthSquared = dot(lightConstants.lightDirection, lightConstants.lightDirection);
+
     if(!all(isfinite(lightConstants.lightDirection)) || !isfinite(lightLengthSquared) || lightLengthSquared < 1.0e-8f ||
        !all(isfinite(lightConstants.lightColor)) || !isfinite(lightConstants.lightIntensity) ||
        lightConstants.lightIntensity <= 0.0f)
+    {
         return environmentRadiance;
+    }
+
     float3 directionToLight = normalize(-lightConstants.lightDirection);
     float NdotL = saturate(dot(normal, directionToLight));
+
     if(NdotL <= 0.0f)
+    {
         return environmentRadiance;
+    }
 
     RayDesc visibilityRay;
     visibilityRay.Origin = secondaryPosition + normalize(surface.worldNormal) * 0.001f;
@@ -510,8 +570,12 @@ float3 IntegrateGISameNormalConvolution(float3 normal)
         float3 sampleColor = sourceTexture.SampleLevel(
             environmentSampler, environmentUV, 0.0f).rgb;
         // Propagate invalid samples to the caller's magenta handling.
+
         if(!all(isfinite(sampleColor)))
+        {
             return sampleColor;
+        }
+
         irradiance += sampleColor;
     }
     irradiance *= PI / float(GI_BASELINE_REFERENCE_SAMPLES);
@@ -528,45 +592,102 @@ void GIRayGeneration()
         fullResolution - 1u);
 
     giTexture[pixel] = float4(0.0f, 0.0f, 0.0f, 1.0f);
+#if GI_DIAGNOSTIC_MODE == GI_MODE_PRODUCTION_CLAMP_BIAS_DEBUG && GI_PRODUCTION_CLAMP_NUMERIC_OUTPUT
+    giTexture[pixel] = float4(0.0f, 0.0f, 0.0f, 0.0f);
+#endif
+#if GI_DIAGNOSTIC_MODE == GI_MODE_PRIMARY_VISIBILITY_DEBUG
+    // Magenta distinguishes invalid/background pixels. Alpha -2 selects raw grayscale in GI Raw.
+    giTexture[pixel] = float4(1.0f, 0.0f, 1.0f, -2.0f);
+#endif
     hitDistanceTexture[pixel] = -2.0f;
+#if GI_DIAGNOSTIC_MODE == GI_MODE_BASELINE_CORRECTION
+    if(signedCorrectionIndex != 0xFFFFFFFFu)
+    {
+        RWTexture2D<float4> signedCorrectionTexture = ResourceDescriptorHeap[signedCorrectionIndex];
+        signedCorrectionTexture[pixel] = 0.0f; // Invalid/background: no signed sample.
+    }
+#endif
 
     Texture2D<float> depthTexture = ResourceDescriptorHeap[depthIndex];
     Texture2D<float4> surfaceTexture = ResourceDescriptorHeap[surfaceIndex];
 
     const float depth = depthTexture.Load(int3(gbufferPixel, 0));
+
     if(!isfinite(depth) || depth < 0.0f || depth >= 1.0f)
+    {
         return;
+    }
 
     // Match reflection/shadow reconstruction: pixel centers, flipped NDC Y,
     // D3D depth in [0, 1], and a row-major matrix multiplying a column vector.
     const float2 uv = (float2(gbufferPixel) + 0.5f) / float2(fullResolution);
     const float2 ndc = float2(uv.x * 2.0f - 1.0f, 1.0f - uv.y * 2.0f);
     float4 worldPosition = mul(inverseViewProjection, float4(ndc, depth, 1.0f));
+
     if(!all(isfinite(worldPosition)) || abs(worldPosition.w) < 1.0e-8f)
+    {
         return;
+    }
 
     worldPosition /= worldPosition.w;
+
     if(!all(isfinite(worldPosition)))
+    {
         return;
+    }
 
     // Surface RGB already stores a world-space normal, without remapping.
     const float3 surfaceNormal = surfaceTexture.Load(int3(gbufferPixel, 0)).rgb;
     const float normalLengthSquared = dot(surfaceNormal, surfaceNormal);
+
     if(!all(isfinite(surfaceNormal)) || !isfinite(normalLengthSquared) ||
        normalLengthSquared < 1.0e-8f)
+    {
         return;
+    }
 
     const float3 normal = normalize(surfaceNormal);
 
     Texture2D<float4> geometricNormalTexture = ResourceDescriptorHeap[geometricNormalIndex];
     const float3 geometricNormalValue = geometricNormalTexture.Load(int3(gbufferPixel, 0)).rgb;
     const float geometricNormalLengthSquared = dot(geometricNormalValue, geometricNormalValue);
+
     if(!all(isfinite(geometricNormalValue)) || !isfinite(geometricNormalLengthSquared) ||
        geometricNormalLengthSquared < 1.0e-8f)
+    {
         return;
+    }
+
     const float3 geometricNormal = normalize(geometricNormalValue);
 
-#if GI_DIAGNOSTIC_MODE == GI_MODE_CUBEMAP_TEXEL_DEBUG
+#if GI_DIAGNOSTIC_MODE == GI_MODE_PRIMARY_VISIBILITY_DEBUG
+    // Temporary geometry-only diagnostic: production primary parameters, without hit shading.
+    uint environmentMisses = 0u;
+    [loop]
+    for(uint sampleIndex = 0u; sampleIndex < 64u; ++sampleIndex)
+    {
+        RayDesc visibilityRay;
+        visibilityRay.Origin = worldPosition.xyz + geometricNormal * 0.001f;
+        visibilityRay.Direction = SampleGICosineHemisphere(normal, pixel, frameIndex * 64u + sampleIndex);
+        visibilityRay.TMin = 0.001f;
+        visibilityRay.TMax = 10000.0f;
+
+        if(!all(isfinite(visibilityRay.Origin)) || !all(isfinite(visibilityRay.Direction)))
+        {
+            return;
+        }
+
+        GIVisibilityPayload visibilityPayload;
+        visibilityPayload.visible = 0u;
+        TraceRay(scene, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER,
+            0xFF, 0, 1, 1, visibilityRay, visibilityPayload);
+        environmentMisses += visibilityPayload.visible;
+    }
+    const float visibility = float(environmentMisses) / 64.0f;
+    giTexture[pixel] = float4(visibility, visibility, visibility, -2.0f);
+    // Leave hit distance at no-data: this visualization is not an NRD lighting input.
+    return;
+#elif GI_DIAGNOSTIC_MODE == GI_MODE_CUBEMAP_TEXEL_DEBUG
     Texture2DArray<float4> arrayTexture = ResourceDescriptorHeap[diffuseIrradianceArrayIndex];
     TextureCube<float4> cubeTexture = ResourceDescriptorHeap[diffuseIrradianceIndex];
     uint width, height, layers;
@@ -624,7 +745,10 @@ void GIRayGeneration()
     // Actual IEEE binary16 conversion, followed by conversion back to float32.
     float3 rounded = f16tof32(f32tof16(reference));
     outputValue = stored - rounded;
-    if(!all(isfinite(rounded))) reference = rounded;
+    if(!all(isfinite(rounded)))
+    {
+        reference = rounded;
+    }
 #elif GI_CUBEMAP_TEXEL_DISPLAY == 4
     float3 interpolated = cubeTexture.SampleLevel(materialSampler, normal, 0.0f).rgb;
     float3 convolution = IntegrateGISameNormalConvolution(normal);
@@ -729,6 +853,98 @@ void GIRayGeneration()
 #endif
     // No TraceRay calls: retain the initialized hit-distance sentinel (-2).
     return;
+#elif GI_DIAGNOSTIC_MODE == GI_MODE_PRODUCTION_CLAMP_BIAS_DEBUG
+    // Compare both averaging orders using exactly the same paths, before NRD.
+    const uint sampleCount = GI_PRODUCTION_CLAMP_SAMPLES;
+    TextureCube<float4> diagnosticIrradiance = ResourceDescriptorHeap[diffuseIrradianceIndex];
+    float3 diagnosticBaseline = diagnosticIrradiance.SampleLevel(materialSampler, normal, 0.0f).rgb;
+    if(!all(isfinite(diagnosticBaseline)))
+    {
+#if !GI_PRODUCTION_CLAMP_NUMERIC_OUTPUT
+        giTexture[pixel] = float4(1.0f, 0.0f, 1.0f, -1.0f);
+#endif
+        return;
+    }
+
+    float3 clampedSum = 0.0f;
+    float3 signedSum = 0.0f;
+    bool estimatesFinite = true;
+    [loop]
+    for(uint sample = 0u; sample < sampleCount; ++sample)
+    {
+        // Distinct indices within a frame; the existing secondary helper salts this again.
+        uint sampleSeed = frameIndex * sampleCount + sample;
+        RayDesc diagnosticRay;
+        diagnosticRay.Origin = worldPosition.xyz + geometricNormal * 0.001f;
+        diagnosticRay.Direction = SampleGICosineHemisphere(normal, pixel, sampleSeed);
+        diagnosticRay.TMin = 0.001f;
+        diagnosticRay.TMax = 60.0f;
+
+        GIPayload diagnosticPayload = (GIPayload)0;
+        diagnosticPayload.hitDistance = -2.0f;
+        TraceRay(scene, RAY_FLAG_NONE, 0xFF, 0, 1, 0, diagnosticRay, diagnosticPayload);
+        // Leave output hit distance at -2: diagnostic colors must not enter valid NRD GI input.
+
+        float3 diagnosticEnvironment = SampleGIEnvironment(diagnosticRay.Direction, float(DIFFUSE_HDRI_SOURCE_MIP));
+        float3 diagnosticTraced = 0.0f;
+        if(diagnosticPayload.hitDistance > 0.0f)
+        {
+            float3 secondaryPosition = diagnosticRay.Origin +
+                diagnosticRay.Direction * diagnosticPayload.hitDistance;
+#if !GI_PRODUCTION_CLAMP_BLACK_SECONDARY
+            diagnosticTraced = ShadeGISecondarySurface(
+                diagnosticPayload, secondaryPosition, pixel, sampleSeed, float(DIFFUSE_HDRI_SOURCE_MIP));
+#endif
+        }
+        else if(diagnosticPayload.hitDistance == -1.0f)
+        {
+            diagnosticTraced = diagnosticEnvironment;
+        }
+
+        float3 estimate = diagnosticBaseline + PI * (diagnosticTraced - diagnosticEnvironment);
+        if(!all(isfinite(diagnosticEnvironment)) || !all(isfinite(diagnosticTraced)) ||
+           !all(isfinite(estimate)))
+        {
+            estimatesFinite = false;
+            continue; // Do not replace invalid paths with zeros or change the averaging denominator.
+        }
+        clampedSum += clamp(estimate, 0.0f, 65504.0f);
+        signedSum += estimate;
+    }
+
+    if(!estimatesFinite || !all(isfinite(clampedSum)) || !all(isfinite(signedSum)))
+    {
+#if !GI_PRODUCTION_CLAMP_NUMERIC_OUTPUT
+        giTexture[pixel] = float4(1.0f, 0.0f, 1.0f, -1.0f);
+#endif
+        return;
+    }
+    float3 averageClamped = clampedSum / float(sampleCount);
+    float3 clampedAverage = clamp(signedSum / float(sampleCount), 0.0f, 65504.0f);
+#if GI_PRODUCTION_CLAMP_NUMERIC_OUTPUT
+    const float3 luminanceWeights = float3(0.2126f, 0.7152f, 0.0722f);
+    giTexture[pixel] = float4(
+        dot(averageClamped, luminanceWeights),
+        dot(clampedAverage, luminanceWeights),
+        dot(averageClamped - clampedAverage, luminanceWeights),
+        1.0f);
+#else
+#if GI_PRODUCTION_CLAMP_DISPLAY == 0
+    float3 selected = averageClamped;
+#elif GI_PRODUCTION_CLAMP_DISPLAY == 1
+    float3 selected = clampedAverage;
+#elif GI_PRODUCTION_CLAMP_DISPLAY == 2
+    float3 selected = averageClamped - clampedAverage;
+#else
+#error GI_PRODUCTION_CLAMP_DISPLAY must be 0, 1 or 2
+#endif
+    // Identical signed HDR encoding for all three views, scale = 1 irradiance unit.
+    // Zero = 0.5 linear, +1 = 0.75, -1 = 0.25. No per-pixel normalization.
+    // Alpha -1 marks pre-encoded diagnostic color for ToneMap's GI Raw path.
+    float3 display = 0.5f + 0.5f * (selected / (1.0f + abs(selected)));
+    giTexture[pixel] = float4(display, -1.0f);
+#endif
+    return;
 #elif GI_DIAGNOSTIC_MODE == GI_MODE_CLAMP_BIAS_DEBUG
     // Compare both averaging orders using exactly the same paths, before NRD.
     const uint sampleCount = 16u;
@@ -758,8 +974,11 @@ void GIRayGeneration()
         diagnosticPayload.hitDistance = -2.0f;
         TraceRay(scene, RAY_FLAG_NONE, 0xFF, 0, 1, 0, diagnosticRay, diagnosticPayload);
         // Keep a representative primary hit distance with the existing sentinel conventions.
+
         if(sample == 0u)
+        {
             hitDistanceTexture[pixel] = diagnosticPayload.hitDistance;
+        }
 
         float3 diagnosticEnvironment = SampleGIEnvironment(diagnosticRay.Direction);
         float3 diagnosticTraced = 0.0f;
@@ -771,7 +990,9 @@ void GIRayGeneration()
                 diagnosticPayload, secondaryPosition, pixel, sampleSeed);
         }
         else if(diagnosticPayload.hitDistance == -1.0f)
+        {
             diagnosticTraced = diagnosticEnvironment;
+        }
 
         float3 estimate = diagnosticBaseline + PI * (diagnosticTraced - diagnosticEnvironment);
         if(!all(isfinite(diagnosticEnvironment)) || !all(isfinite(diagnosticTraced)) ||
@@ -808,7 +1029,11 @@ void GIRayGeneration()
     ray.Origin = worldPosition.xyz + geometricNormal * 0.001f;
     ray.Direction = SampleGICosineHemisphere(normal, pixel, frameIndex);
     ray.TMin = 0.001f;
+#if GI_DIAGNOSTIC_MODE == GI_MODE_BASELINE_CORRECTION
+    ray.TMax = 60.0f;
+#else
     ray.TMax = 10000.0f;
+#endif
 
     GIPayload payload = (GIPayload)0;
     payload.hitDistance = -2.0f;
@@ -837,7 +1062,9 @@ void GIRayGeneration()
         tracedRadiance = ShadeGISecondarySurface(payload, secondaryPosition, pixel, frameIndex, diffuseSourceMip);
     }
     else if(payload.hitDistance == -1.0f)
+    {
         tracedRadiance = environmentRadiance; // Identical finite values give exactly zero correction.
+    }
 
 #if GI_DIAGNOSTIC_MODE == GI_MODE_PRIMARY_BASELINE_ONLY
     float3 irradiance = baselineIrradiance;
@@ -846,15 +1073,32 @@ void GIRayGeneration()
     const float correctionDisplayScale = 1.0f;
     // Neutral gray also marks nonfinite corrections; invalid primary pixels remain black.
     float3 encodedCorrection = float3(0.5f, 0.5f, 0.5f);
+
     if(all(isfinite(correction)))
+    {
         encodedCorrection = 0.5f + 0.5f *
             (correction / (correctionDisplayScale + abs(correction)));
+    }
+
     // Display encoding only: inspect in GI Raw, not as irradiance or through NRD.
     giTexture[pixel] = float4(encodedCorrection, 1.0f);
     return;
 #else
     // Keep the correction signed until it has been added to the irradiance baseline.
     float3 irradiance = baselineIrradiance + PI * (tracedRadiance - environmentRadiance);
+#if GI_DIAGNOSTIC_MODE == GI_MODE_BASELINE_CORRECTION
+    if(signedCorrectionIndex != 0xFFFFFFFFu)
+    {
+        float3 signedCorrection = PI * (tracedRadiance - environmentRadiance);
+        if((payload.hitDistance > 0.0f || payload.hitDistance == -1.0f) &&
+           all(isfinite(baselineIrradiance)) && all(isfinite(environmentRadiance)) &&
+           all(isfinite(tracedRadiance)) && all(isfinite(irradiance)) && all(isfinite(signedCorrection)))
+        {
+            RWTexture2D<float4> signedCorrectionTexture = ResourceDescriptorHeap[signedCorrectionIndex];
+            signedCorrectionTexture[pixel] = float4(signedCorrection, 1.0f);
+        }
+    }
+#endif
 #if GI_DIAGNOSTIC_MODE == GI_MODE_PRECLAMP_NEGATIVE_DEBUG
     float3 visualization = float3(1.0f, 0.0f, 1.0f); // Nonfinite estimate.
     if(all(isfinite(irradiance)))
@@ -882,7 +1126,10 @@ void GIRayGeneration()
             incomingRadiance = ShadeGISecondarySurface(payload, secondaryPosition, pixel, frameIndex);
         }
         else if(payload.hitDistance == -1.0f)
+        {
             incomingRadiance = SampleGIEnvironment(ray.Direction);
+        }
+
 #elif GI_DIAGNOSTIC_MODE == GI_MODE_SECONDARY_ENVIRONMENT_ONLY
     incomingRadiance = 0.0f;
     if(payload.hitDistance > 0.0f)
@@ -891,13 +1138,22 @@ void GIRayGeneration()
         incomingRadiance = ShadeGISecondaryEnvironmentOnly(payload, secondaryPosition);
     }
     else if(payload.hitDistance == -1.0f)
+    {
         incomingRadiance = SampleGIEnvironment(ray.Direction);
+    }
+
 #elif GI_DIAGNOSTIC_MODE == GI_MODE_WHITE_DIFFUSE_SECONDARY
     incomingRadiance = 0.0f;
+
     if(payload.hitDistance > 0.0f)
+    {
         incomingRadiance = ShadeGIWhiteDiffuseSecondary(payload.shadingNormal);
+    }
     else if(payload.hitDistance == -1.0f)
+    {
         incomingRadiance = SampleGIEnvironment(ray.Direction);
+    }
+
 #else
 #error Unsupported GI_DIAGNOSTIC_MODE
 #endif
@@ -907,8 +1163,12 @@ void GIRayGeneration()
 #endif
 #if GI_DIAGNOSTIC_MODE != GI_MODE_SIGNED_CORRECTION_DEBUG && \
     GI_DIAGNOSTIC_MODE != GI_MODE_PRECLAMP_NEGATIVE_DEBUG
+
     if(all(isfinite(irradiance)))
+    {
         giTexture[pixel] = float4(clamp(irradiance, 0.0f, 65504.0f), 1.0f);
+    }
+
 #endif
 #endif // GI_MODE_CLAMP_BIAS_DEBUG
 }
@@ -1069,9 +1329,12 @@ void GIClosestHit(
             float3 B = cross(worldNormal, T) * handedness;
             float3 worldMappedNormal = T * sampledNormal.x + B * sampledNormal.y + worldNormal * sampledNormal.z;
             float mappedLengthSquared = dot(worldMappedNormal, worldMappedNormal);
+
             if(all(isfinite(B)) && all(isfinite(worldMappedNormal)) &&
                isfinite(mappedLengthSquared) && mappedLengthSquared > 1.0e-8f)
+            {
                 shadingNormal = normalize(worldMappedNormal);
+            }
         }
     }
 

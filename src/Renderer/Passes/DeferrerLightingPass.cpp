@@ -66,7 +66,7 @@ bool DeferredLightingPass::Initialize(ID3D12Device* device, ShaderLibrary& shade
     pipelineDescription.additionalSamplers.push_back(referenceSampler);
 
     pipelineDescription.rootParameters.push_back(
-        {RootParameterType::Constants, 0, 16, D3D12_SHADER_VISIBILITY_PIXEL}
+        {RootParameterType::Constants, 0, 17, D3D12_SHADER_VISIBILITY_PIXEL}
     );
 
     pipelineDescription.rootParameters.push_back(
@@ -100,6 +100,7 @@ void DeferredLightingPass::Execute(
     Texture& giIrradiance,
     Texture& aoVisibility,
     bool enableRTGI,
+    float rtgiContactAOStrength,
     RenderTarget& sceneColor,
     D3D12_GPU_VIRTUAL_ADDRESS reconstructionConstantsAddress,
     D3D12_GPU_VIRTUAL_ADDRESS lightConstantsAddress,
@@ -110,7 +111,8 @@ void DeferredLightingPass::Execute(
     gBuffer.GetDepth().Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     reflectionTexture.Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     giIrradiance.Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-    if(!enableRTGI || debugView == 21u)
+
+    if(!enableRTGI || debugView == 21u || rtgiContactAOStrength > 0.0f)
         aoVisibility.Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
     sceneColor.Transition(commandList, D3D12_RESOURCE_STATE_RENDER_TARGET);
@@ -168,15 +170,10 @@ void DeferredLightingPass::Execute(
         0
     );
 
-    commandList->SetGraphicsRootConstantBufferView(
-        1,
-        reconstructionConstantsAddress
-    );
 
-    commandList->SetGraphicsRootConstantBufferView(
-        2,
-        lightConstantsAddress
-    );
+    commandList->SetGraphicsRoot32BitConstants(0, 1, &rtgiContactAOStrength, 16);
+    commandList->SetGraphicsRootConstantBufferView(1, reconstructionConstantsAddress);
+    commandList->SetGraphicsRootConstantBufferView(2, lightConstantsAddress);
 
     commandList->DrawInstanced(3, 1, 0, 0);
 }

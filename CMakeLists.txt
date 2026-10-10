@@ -105,6 +105,7 @@ add_executable(Engine
     src/Renderer/Passes/AOTemporalPass.cpp
     src/Renderer/Passes/AODenoisePass.cpp
     src/Renderer/Passes/GISpatialDenoisePass.cpp
+    src/Renderer/Passes/GISignedCorrectionPass.cpp
 )
 
 add_custom_command(

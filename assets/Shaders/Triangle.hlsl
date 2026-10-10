@@ -148,9 +148,12 @@ PSOutput PSMain(VSOutput input)
             float3 B = cross(N, T) * handedness;
             float3 worldMappedNormal = T * sampledNormal.x + B * sampledNormal.y + N * sampledNormal.z;
             float mappedLengthSquared = dot(worldMappedNormal, worldMappedNormal);
+
             if(all(isfinite(B)) && all(isfinite(worldMappedNormal)) &&
                isfinite(mappedLengthSquared) && mappedLengthSquared > 1.0e-8f)
+            {
                 mappedNormal = normalize(worldMappedNormal);
+            }
         }
     }
 

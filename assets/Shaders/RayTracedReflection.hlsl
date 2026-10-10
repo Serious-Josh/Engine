@@ -294,7 +294,9 @@ uint ReflectionSobolBits(uint sampleIndex, uint dimension)
     for(uint bit = 0u; bit < 32u; ++bit)
     {
         if((grayIndex & (1u << bit)) != 0u)
+        {
             coordinate ^= REFLECTION_SOBOL_DIRECTIONS[dimension][bit];
+        }
     }
     return coordinate;
 }
@@ -772,13 +774,18 @@ float HardDirectionalVisibility(float3 worldPosition, float3 worldNormal)
 {
     if(!all(isfinite(worldPosition)) || !all(isfinite(worldNormal)) ||
         !all(isfinite(lightConstants.lightDirection)))
+    {
         return 0.0f;
+    }
 
     float3 normal = normalize(worldNormal);
     float3 directionToLight = normalize(-lightConstants.lightDirection);
+
     if(!all(isfinite(normal)) || !all(isfinite(directionToLight)) ||
         !(dot(normal, directionToLight) > 0.0f))
+    {
         return 0.0f;
+    }
 
     RayDesc visibilityRay;
     visibilityRay.Origin = worldPosition + normal * 0.001f;
@@ -1271,7 +1278,10 @@ float3 EvaluateSecondaryMirrorFresnel(GPUMaterial material, float2 uv, float cos
         return FresnelSchlick(cosine, float3(F0, F0, F0));
     }
     if(material.model == 2)
+    {
         return FresnelConductor(cosine, material.conductorN, material.conductorK);
+    }
+
     return float3(0.0f, 0.0f, 0.0f);
 }
 
@@ -1573,8 +1583,6 @@ void RayGeneration()
             ray,
             payload
         );
-
-
 
     }
 
@@ -1938,7 +1946,6 @@ void Miss(
 {
     payload.hitDistance = RAW_REFLECTION_RAY_MISS;
 
-
 }
 
 [shader("closesthit")]
@@ -2085,9 +2092,12 @@ void ClosestHit(
             float3 B = cross(worldNormal, T) * handedness;
             float3 worldMappedNormal = T * sampledNormal.x + B * sampledNormal.y + worldNormal * sampledNormal.z;
             float mappedLengthSquared = dot(worldMappedNormal, worldMappedNormal);
+
             if(all(isfinite(B)) && all(isfinite(worldMappedNormal)) &&
                isfinite(mappedLengthSquared) && mappedLengthSquared > 1.0e-8f)
+            {
                 shadingNormal = normalize(worldMappedNormal);
+            }
         }
     }
 

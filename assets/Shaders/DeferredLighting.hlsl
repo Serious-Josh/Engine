@@ -27,6 +27,7 @@ cbuffer GBufferConstants : register(b0)
     uint enableRTGI;
     uint aoVisibilityIndex;
     uint lightingDebugView;
+    float rtgiContactAOStrength;
 }
 
 cbuffer ReconstructionConstants : register(b1)
@@ -66,8 +67,12 @@ float3 IntegrateDiagnosticHDRIFrame(float3 normal, float3 tangent, float3 bitang
             bitangent * localDirection.y + normal * localDirection.z);
         float3 radiance = sourceTexture.SampleLevel(diagnosticEnvironmentSampler,
             DirectionToEquirectangularUV(direction), sourceMip).rgb;
+
         if(!all(isfinite(radiance)))
+        {
             return radiance;
+        }
+
         sum += radiance;
     }
     return sum * (PI / float(sampleCount));
@@ -211,7 +216,6 @@ float4 PSMain(VSOutput input) : SV_Target0
     int2 pixel =
         int2(input.position.xy);
 
-
     float depth =
         depthTexture.Load(
             int3(
@@ -222,8 +226,12 @@ float4 PSMain(VSOutput input) : SV_Target0
 
     const bool sourceMipDebug = lightingDebugView >= 28u && lightingDebugView <= 30u;
     const bool lightingDebug = lightingDebugView >= 19u && lightingDebugView <= 30u;
+
     if(lightingDebug && (!isfinite(depth) || depth < 0.0f || depth >= 1.0f))
+    {
         return float4(0.0f, 0.0f, 0.0f, 1.0f);
+    }
+
     if(depth >= 1.0f)
     {
         float3 worldDirection =
@@ -282,7 +290,9 @@ float4 PSMain(VSOutput input) : SV_Target0
         worldPosition.w;
 
     if(lightingDebug && !all(isfinite(worldPosition)))
+    {
         return float4(0.0f, 0.0f, 0.0f, 1.0f);
+    }
 
     float4 materialData =
         materialTexture.Load(
@@ -309,7 +319,9 @@ float4 PSMain(VSOutput input) : SV_Target0
         );
 
     if(lightingDebug && (!all(isfinite(surfaceData.rgb)) || dot(surfaceData.rgb, surfaceData.rgb) < 1.0e-8f))
+    {
         return float4(0.0f, 0.0f, 0.0f, 1.0f);
+    }
 
     uint gpuMaterialIndex =
         (uint)round(
@@ -409,11 +421,18 @@ float4 PSMain(VSOutput input) : SV_Target0
         uint requestedMip = lightingDebugView == 28u ? 0u : (lightingDebugView == 29u ? 4u : 6u);
         uint sourceWidth, sourceHeight, sourceMipCount;
         environmentTexture.GetDimensions(0u, sourceWidth, sourceHeight, sourceMipCount);
+
         if(requestedMip >= sourceMipCount)
+        {
             return float4(1.0f, 0.0f, 1.0f, 1.0f); // Never silently clamp an unavailable mip.
+        }
+
         diagnosticDirectIrradiance = IntegrateDiagnosticHDRIIrradiance(normal, 4096u, false, float(requestedMip));
+
         if(!all(isfinite(diagnosticDirectIrradiance)))
+        {
             return float4(diagnosticDirectIrradiance, 1.0f);
+        }
     }
     [branch]
     if(lightingDebugView == 26u || lightingDebugView == 27u)
@@ -437,20 +456,32 @@ float4 PSMain(VSOutput input) : SV_Target0
             float3 rotatedTangent = c * tangent + s * bitangent;
             float3 rotatedBitangent = -s * tangent + c * bitangent;
             float3 estimate = IntegrateDiagnosticHDRIFrame(normal, rotatedTangent, rotatedBitangent, 1024u);
+
             if(!all(isfinite(estimate)))
+            {
                 return float4(estimate, 1.0f);
+            }
+
             multi += estimate;
         }
         // Each estimate already includes PI/1024; averaging yields PI/4096 overall.
         multi *= 0.25f;
+
         if(!all(isfinite(multi)))
+        {
             return float4(multi, 1.0f);
+        }
+
         if(lightingDebugView == 27u)
         {
             float3 single = IntegrateDiagnosticHDRIFrame(normal, tangent, bitangent, 4096u);
             float3 residual = multi - single;
+
             if(!all(isfinite(residual)))
+            {
                 return float4(1.0f, 0.0f, 1.0f, 1.0f);
+            }
+
             const float residualScale = 10.0f;
             float positive = saturate(max(residual.r, max(residual.g, residual.b)) / residualScale);
             float negative = saturate(-min(residual.r, min(residual.g, residual.b)) / residualScale);
@@ -465,8 +496,12 @@ float4 PSMain(VSOutput input) : SV_Target0
         // View 23 convergence experiment; retain View 24's 4096-sample comparison.
         uint referenceSampleCount = lightingDebugView == 23u ? 16384u : 4096u;
         diagnosticDirectIrradiance = IntegrateDiagnosticHDRIIrradiance(normal, referenceSampleCount, false);
+
         if(!all(isfinite(diagnosticDirectIrradiance)))
+        {
             return float4(diagnosticDirectIrradiance, 1.0f);
+        }
+
         if(lightingDebugView == 24u || lightingDebugView == 25u)
         {
             float3 residual;
@@ -482,7 +517,10 @@ float4 PSMain(VSOutput input) : SV_Target0
                 residual = cubeIrradiance - diagnosticDirectIrradiance;
             }
             if(!all(isfinite(residual)))
+            {
                 return float4(1.0f, 0.0f, 1.0f, 1.0f);
+            }
+
             const float residualScale = 10.0f;
             float positive = saturate(max(residual.r, max(residual.g, residual.b)) / residualScale);
             float negative = saturate(-min(residual.r, min(residual.g, residual.b)) / residualScale);
@@ -499,6 +537,13 @@ float4 PSMain(VSOutput input) : SV_Target0
         {
             Texture2D<float4> giIrradiance = ResourceDescriptorHeap[giIrradianceIndex];
             irradiance = giIrradiance.Load(int3(pixel, 0)).rgb;
+            // Opt-in contact correction after GI denoising; indirect diffuse only.
+            if(rtgiContactAOStrength > 0.0f)
+            {
+                Texture2D<float> aoVisibility = ResourceDescriptorHeap[aoVisibilityIndex];
+                float filteredAO = aoVisibility.Load(int3(pixel, 0));
+                irradiance *= lerp(1.0f, saturate(filteredAO), saturate(rtgiContactAOStrength));
+            }
         }
         else
         {
@@ -510,8 +555,11 @@ float4 PSMain(VSOutput input) : SV_Target0
                 visibility = saturate(aoVisibility.Load(int3(pixel, 0)));
             }
             irradiance *= visibility;
+
             if(lightingDebugView == 23u || lightingDebugView == 26u || sourceMipDebug)
+            {
                 irradiance = diagnosticDirectIrradiance;
+            }
         }
     }
 
@@ -1083,12 +1131,19 @@ float4 PSMain(VSOutput input) : SV_Target0
         finalSpecular;
 
     // Observe the exact production terms without changing their calculations.
+
     if(lightingDebugView == 19u)
+    {
         lighting = environmentSpecular;
+    }
     else if(lightingDebugView == 20u)
+    {
         lighting = directional;
+    }
     else if(lightingDebugView == 21u || lightingDebugView == 22u || lightingDebugView == 23u || lightingDebugView == 26u || sourceMipDebug)
+    {
         lighting = environmentDiffuse;
+    }
 
     return float4(
         lighting,

@@ -27,8 +27,11 @@ float HardwareDepthToViewZ(float depth)
 void CSMain(uint3 dispatchThreadID : SV_DispatchThreadID)
 {
     uint2 pixel = dispatchThreadID.xy;
+
     if(pixel.x >= width || pixel.y >= height)
+    {
         return;
+    }
 
     RWTexture2D<float4> outputTexture = ResourceDescriptorHeap[outputIndex];
     outputTexture[pixel] = float4(0.0f, 0.0f, 0.0f, 1.0f);
@@ -37,14 +40,21 @@ void CSMain(uint3 dispatchThreadID : SV_DispatchThreadID)
     float depth = depthTexture.Load(int3(pixel, 0));
     float3 normal = normalTexture.Load(int3(pixel, 0)).rgb;
     float normalLengthSquared = dot(normal, normal);
+
     if(!isfinite(depth) || depth < 0.0f || depth >= 1.0f ||
        !all(isfinite(normal)) || !isfinite(normalLengthSquared) || normalLengthSquared < 1.0e-8f)
+    {
         return;
+    }
+
     // GBuffer surface normals are signed world-space values, without decoding.
     normal = normalize(normal);
     float centerViewZ = HardwareDepthToViewZ(depth);
+
     if(!isfinite(centerViewZ) || centerViewZ <= 0.0f || centerViewZ >= denoisingRange)
+    {
         return;
+    }
 
     uint2 halfResolution = uint2((width + 1u) / 2u, (height + 1u) / 2u);
     // Low-resolution texel i represents full-resolution pixel 2*i.
@@ -70,16 +80,27 @@ void CSMain(uint3 dispatchThreadID : SV_DispatchThreadID)
             float3 sampleNormal = normalTexture.Load(int3(representative, 0)).rgb;
             float sampleNormalLengthSquared = dot(sampleNormal, sampleNormal);
             float sampleViewZ = viewZTexture.Load(int3(halfPixel, 0));
+
             if(!isfinite(sampleDepth) || sampleDepth < 0.0f || sampleDepth >= 1.0f ||
                !all(isfinite(sampleNormal)) || !isfinite(sampleNormalLengthSquared) || sampleNormalLengthSquared < 1.0e-8f ||
                !isfinite(sampleViewZ) || sampleViewZ <= 0.0f || sampleViewZ >= denoisingRange)
+            {
                 continue;
+            }
+
             float4 decoded = REBLUR_BackEnd_UnpackRadianceAndNormHitDist(nrdOutput.Load(int3(halfPixel, 0)));
+
             if(!all(isfinite(decoded.rgb)))
+            {
                 continue;
+            }
+
             float3 irradiance = min(max(decoded.rgb * PI, 0.0f), 65504.0f);
+
             if(!all(isfinite(irradiance)))
+            {
                 continue;
+            }
 
             float2 delta = float2(halfPixel) - halfPosition;
             float distanceSquared = dot(delta, delta);
@@ -94,13 +115,20 @@ void CSMain(uint3 dispatchThreadID : SV_DispatchThreadID)
             float depthWeight = exp(-abs(sampleViewZ - centerViewZ) / max(centerViewZ * 0.01f, 0.01f));
             float normalWeight = pow(saturate(dot(normal, normalize(sampleNormal))), 32.0f);
             float weight = spatialWeight * depthWeight * normalWeight;
+
             if(!isfinite(weight) || weight <= 0.0f)
+            {
                 continue;
+            }
+
             accumulated += irradiance * weight;
             totalWeight += weight;
         }
     }
     float3 result = totalWeight > 1.0e-8f ? accumulated / totalWeight : fallback;
+
     if(all(isfinite(result)))
+    {
         outputTexture[pixel] = float4(min(max(result, 0.0f), 65504.0f), 1.0f);
+    }
 }
