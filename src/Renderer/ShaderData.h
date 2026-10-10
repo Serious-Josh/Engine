@@ -7,7 +7,7 @@ struct MaterialConstants
     unsigned int textureIndex;
     float roughness;
     unsigned int materialIndex;
-    unsigned int normalTextureIndex;
+    unsigned int materialBufferIndex;
 
     float baseColor[3];
     unsigned int roughnessTextureIndex;
@@ -33,7 +33,7 @@ struct ReconstructionConstants
     Matrix4 inverseViewProjection;
 
     float cameraPosition[3];
-    float padding;
+    unsigned int geometricNormalIndex;
 };
 
 struct ShadowConstants
@@ -148,7 +148,7 @@ struct GPUMaterial
     unsigned int roughnessTextureIndex;
 
     float conductorK[3];
-    float padding1;
+    unsigned int metallicTextureIndex;
 
     float averageConductorFresnel[3];
     unsigned int normalTextureIndex;

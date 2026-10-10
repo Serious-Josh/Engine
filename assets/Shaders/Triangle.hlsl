@@ -1,3 +1,5 @@
+#include "MaterialLighting.hlsli"
+
 struct VSInput
 {
     float3 position : POSITION;
@@ -30,7 +32,7 @@ cbuffer MaterialConstants : register(b0)
     uint textureIndex;
     float roughness;
     uint materialIndex;
-    uint normalTextureIndex;
+    uint materialBufferIndex;
 
     float3 baseColor;
     uint roughnessTextureIndex;
@@ -106,6 +108,10 @@ VSOutput VSMain(VSInput input)
 PSOutput PSMain(VSOutput input)
 {
     PSOutput output;
+    // Reuse the normal descriptor DWORD for access to the complete GPU material.
+    StructuredBuffer<GPUMaterial> materials = ResourceDescriptorHeap[materialBufferIndex];
+    GPUMaterial material = materials[materialIndex];
+    uint normalTextureIndex = material.normalTextureIndex;
 
     Texture2D<float4> baseColorTexture =
         ResourceDescriptorHeap[
@@ -169,7 +175,20 @@ PSOutput PSMain(VSOutput input)
 
     output.surface = float4(mappedNormal, float(materialIndex));
 
-    output.geometricNormal = float4(normalize(input.worldNormal), 0.0f);
+    float effectiveMetallic = 0.0f;
+    if(material.model == 0u)
+    {
+        effectiveMetallic = saturate(material.metallic);
+        if(material.metallicTextureIndex != 0xFFFFFFFFu)
+        {
+            Texture2D<float4> metallicTexture = ResourceDescriptorHeap[
+                NonUniformResourceIndex(material.metallicTextureIndex)];
+            float sampledMetallic = metallicTexture.Sample(sampler0, input.uv).r;
+            effectiveMetallic = saturate(effectiveMetallic * sampledMetallic);
+        }
+    }
+
+    output.geometricNormal = float4(normalize(input.worldNormal), effectiveMetallic);
 
     output.motion = float4(0.0f, 0.0f, 0.0f, 0.0f);
 

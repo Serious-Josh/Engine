@@ -225,6 +225,24 @@ float3 ShadeGIWhiteDiffuseSecondary(float3 secondaryNormal)
     return environmentIrradiance / PI;
 }
 
+float GISecondarySurfaceMetallic(GPUMaterial material, float2 uv)
+{
+    if(material.model != 0u)
+        return material.metallic;
+
+    float metallic = saturate(material.metallic);
+    if(material.metallicTextureIndex == 0xFFFFFFFFu)
+        return metallic;
+
+    Texture2D<float4> metallicTexture = ResourceDescriptorHeap[
+        NonUniformResourceIndex(material.metallicTextureIndex)];
+    float sampledMetallic = metallicTexture.SampleLevel(materialSampler, uv, 0.0f).r;
+    // Preserve invalid samples for the caller's zero-radiance fallback.
+    if(!isfinite(sampledMetallic))
+        return sampledMetallic;
+    return saturate(metallic * sampledMetallic);
+}
+
 float3 ShadeGISecondaryEnvironmentOnly(GIPayload surface, float3 secondaryPosition)
 {
     float normalLengthSquared = dot(surface.shadingNormal, surface.shadingNormal);
@@ -267,7 +285,10 @@ float3 ShadeGISecondaryEnvironmentOnly(GIPayload surface, float3 secondaryPositi
 
     if(material.model == 0u)
     {
-        diffuseColor *= 1.0f - saturate(material.metallic);
+        float effectiveMetallic = GISecondarySurfaceMetallic(material, surface.uv);
+        if(!isfinite(effectiveMetallic))
+            return 0.0f;
+        diffuseColor *= 1.0f - effectiveMetallic;
     }
 
     if(!all(isfinite(diffuseColor)) || !any(diffuseColor > 0.0f))
@@ -331,7 +352,10 @@ float3 ShadeGISecondarySurface(GIPayload surface, float3 secondaryPosition, uint
 
     if(material.model == 0u)
     {
-        diffuseColor *= 1.0f - saturate(material.metallic);
+        float effectiveMetallic = GISecondarySurfaceMetallic(material, surface.uv);
+        if(!isfinite(effectiveMetallic))
+            return 0.0f;
+        diffuseColor *= 1.0f - effectiveMetallic;
     }
 
     if(!all(isfinite(diffuseColor)) || !any(diffuseColor > 0.0f))

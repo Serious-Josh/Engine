@@ -19,9 +19,11 @@ enum class MaterialModel
 struct Material
 {
     Pipeline* pipeline = nullptr;
+
     Texture* texture = nullptr;
     Texture* normalTexture = nullptr;
     Texture* roughnessTexture = nullptr;
+    Texture* metallicTexture = nullptr;
 
     MaterialModel model = MaterialModel::Dielectric;
 
@@ -160,6 +162,7 @@ struct Material
         data.textureIndex = texture ? texture->GetDescriptorIndex() : UINT_MAX;
         data.normalTextureIndex = normalTexture ? normalTexture->GetDescriptorIndex() : UINT_MAX;
         data.roughnessTextureIndex = roughnessTexture ? roughnessTexture->GetDescriptorIndex() : UINT_MAX;
+        data.metallicTextureIndex = metallicTexture ? metallicTexture->GetDescriptorIndex() : UINT_MAX;
 
         data.conductorN[0] = conductorN[0];
         data.conductorN[1] = conductorN[1];

@@ -534,7 +534,7 @@ void Renderer::Draw(ID3D12GraphicsCommandList* commandList, const RenderObject& 
     materialConstants.textureIndex = object.material->texture->GetDescriptorIndex();
     materialConstants.roughness = object.material->roughness;
     materialConstants.materialIndex = object.material->gpuIndex;
-    materialConstants.normalTextureIndex = object.material->normalTexture ? object.material->normalTexture->GetDescriptorIndex() : UINT_MAX;
+    materialConstants.materialBufferIndex = m_materialBuffer.GetDescriptorIndex();
     materialConstants.roughnessTextureIndex = object.material->roughnessTexture ? object.material->roughnessTexture->GetDescriptorIndex() : UINT_MAX;
     materialConstants.baseColor[0] = object.material->baseColor[0];
     materialConstants.baseColor[1] = object.material->baseColor[1];
@@ -563,6 +563,14 @@ void Renderer::Draw(ID3D12GraphicsCommandList* commandList, const RenderObject& 
     if(object.material->roughnessTexture)
     {
         object.material->roughnessTexture->Transition(
+            commandList,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    }
+
+    if(object.material->metallicTexture)
+    {
+        object.material->metallicTexture->Transition(
             commandList,
             D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -954,7 +962,7 @@ bool Renderer::Render(const Scene& scene, const RendererOptions& options)
     reconstructionConstants.cameraPosition[0] = cameraPosition.x;
     reconstructionConstants.cameraPosition[1] = cameraPosition.y;
     reconstructionConstants.cameraPosition[2] = cameraPosition.z;
-    reconstructionConstants.padding = 0.0f;
+    reconstructionConstants.geometricNormalIndex = m_gBuffer.GetGeometricNormal().GetSRVIndex();
 
     D3D12_GPU_VIRTUAL_ADDRESS reconstructionConstantsAddress = m_uploadBuffer.Allocate(&reconstructionConstants, sizeof(ReconstructionConstants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
 

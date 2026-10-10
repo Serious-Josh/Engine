@@ -35,7 +35,7 @@ cbuffer ReconstructionConstants : register(b1)
     row_major float4x4 inverseViewProjection;
 
     float3 cameraPosition;
-    float padding;
+    uint geometricNormalIndex;
 }
 
 cbuffer DirectionalLightConstants : register(b2)
@@ -337,6 +337,12 @@ float4 PSMain(VSOutput input) : SV_Target0
         materialBuffer[
             gpuMaterialIndex
         ];
+
+    if(gpuMaterial.model == 0u)
+    {
+        Texture2D<float4> geometricNormalTexture = ResourceDescriptorHeap[geometricNormalIndex];
+        gpuMaterial.metallic = saturate(geometricNormalTexture.Load(int3(pixel, 0)).a);
+    }
 
     float roughness =
         gpuMaterial.roughness;

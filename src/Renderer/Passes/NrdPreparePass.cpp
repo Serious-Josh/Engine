@@ -89,6 +89,7 @@ void NrdPreparePass::ExecuteReflections(
     gBuffer.GetDepth().Transition(commandList, gBufferReadState);
     gBuffer.GetMaterial().Transition(commandList, gBufferReadState);
     gBuffer.GetSurface().Transition(commandList, gBufferReadState);
+    gBuffer.GetGeometricNormal().Transition(commandList, gBufferReadState);
     gBuffer.GetMotion().Transition(commandList, gBufferReadState);
     rawReflection.Transition(commandList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     trackingDistance.Transition(commandList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -124,7 +125,7 @@ void NrdPreparePass::ExecuteReflections(
     constants.normalRoughnessOutputIndex = m_normalRoughnessTexture.GetUAVIndex();
     
     constants.specRadianceHitDistOutputIndex = m_specRadianceHitDistTexture.GetUAVIndex();
-    constants.rawGIIndex = 0;
+    constants.geometricNormalIndex = gBuffer.GetGeometricNormal().GetSRVIndex();
     constants.giHitDistanceIndex = 0;
     constants.diffRadianceHitDistOutputIndex = 0;
 

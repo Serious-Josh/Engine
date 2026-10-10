@@ -80,6 +80,7 @@ void NrdReflectionResolvePass::Execute(
     gBuffer.GetDepth().Transition(commandList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     gBuffer.GetMaterial().Transition(commandList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     gBuffer.GetSurface().Transition(commandList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    gBuffer.GetGeometricNormal().Transition(commandList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     nrdOutput.Transition(commandList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     m_outputTexture.Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
@@ -95,6 +96,7 @@ void NrdReflectionResolvePass::Execute(
     constants.outputIndex = m_outputTexture.GetUAVIndex();
     constants.width = width;
     constants.height = height;
+    constants.geometricNormalIndex = gBuffer.GetGeometricNormal().GetSRVIndex();
 
     const D3D12_GPU_VIRTUAL_ADDRESS constantsAddress = uploadBuffer.Allocate(&constants, sizeof(constants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
 

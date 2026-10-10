@@ -3,6 +3,7 @@
 #include "Math/Matrix4.h"
 #include "Renderer/Texture.h"
 #include "Renderer/ComputePipeline.h"
+#include <cstddef>
 
 class GraphicsDevice;
 class DescriptorHeap;
@@ -24,9 +25,13 @@ struct NrdReflectionResolveConstants
     unsigned int outputIndex;
     unsigned int width;
     unsigned int height;
+    unsigned int geometricNormalIndex;
+    unsigned int padding[3];
 };
 
-static_assert(sizeof(NrdReflectionResolveConstants) == 160);
+static_assert(sizeof(NrdReflectionResolveConstants) == 176);
+static_assert(offsetof(NrdReflectionResolveConstants, geometricNormalIndex) == 160);
+static_assert(offsetof(NrdReflectionResolveConstants, padding) == 164);
 
 class NrdReflectionResolvePass
 {

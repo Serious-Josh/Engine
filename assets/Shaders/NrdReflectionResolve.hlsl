@@ -1,7 +1,7 @@
 #include "MaterialLighting.hlsli"
 #include "NRD/NRD.hlsli"
 
-// Matches the 160-byte Engine contract: matrices at 0/64, uint groups at 128/144.
+// Matches the 176-byte Engine contract: matrices at 0/64, descriptor at 160.
 struct NrdReflectionResolveConstants
 {
     row_major float4x4 inverseViewProjection;
@@ -14,6 +14,8 @@ struct NrdReflectionResolveConstants
     uint outputIndex;
     uint width;
     uint height;
+    uint geometricNormalIndex;
+    uint3 padding;
 };
 
 ConstantBuffer<NrdReflectionResolveConstants> constants : register(b0);
@@ -90,7 +92,9 @@ void CSMain(uint3 dispatchThreadID : SV_DispatchThreadID)
 
     if(material.model == 0)
     {
-        F0 = lerp(float3(0.04f, 0.04f, 0.04f), materialData.rgb, saturate(material.metallic));
+        Texture2D<float4> geometricNormalTexture = ResourceDescriptorHeap[constants.geometricNormalIndex];
+        float effectiveMetallic = saturate(geometricNormalTexture.Load(int3(pixel, 0)).a);
+        F0 = lerp(float3(0.04f, 0.04f, 0.04f), materialData.rgb, effectiveMetallic);
     }
     else if(material.model == 1)
     {

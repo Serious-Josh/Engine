@@ -3,6 +3,7 @@
 #include "Math/Matrix4.h"
 #include "Renderer/Texture.h"
 #include "Renderer/ComputePipeline.h"
+#include <cstddef>
 
 class GraphicsDevice;
 class DescriptorHeap;
@@ -36,7 +37,7 @@ struct NrdReflectionPrepareConstants
     unsigned int normalRoughnessOutputIndex;
 
     unsigned int specRadianceHitDistOutputIndex;
-    unsigned int rawGIIndex;
+    unsigned int geometricNormalIndex;
     unsigned int giHitDistanceIndex;
     unsigned int diffRadianceHitDistOutputIndex;
 };
@@ -74,6 +75,7 @@ struct NrdGIPrepareConstants
 
 static_assert(sizeof(NrdGIPrepareConstants) == 208);
 static_assert(sizeof(NrdReflectionPrepareConstants) == 208);
+static_assert(offsetof(NrdReflectionPrepareConstants, geometricNormalIndex) == 196);
 
 class NrdPreparePass
 {

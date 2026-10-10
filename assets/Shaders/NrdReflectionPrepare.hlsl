@@ -25,7 +25,7 @@ struct NrdReflectionPrepareConstants
     uint motionOutputIndex;
     uint normalRoughnessOutputIndex;
     uint specRadianceHitDistOutputIndex;
-    uint rawGIIndex;
+    uint geometricNormalIndex;
     uint giHitDistanceIndex;
     uint diffRadianceHitDistOutputIndex;
 };
@@ -110,7 +110,9 @@ void CSMain(uint3 dispatchThreadID : SV_DispatchThreadID)
 
     if(material.model == 0)
     {
-        F0 = lerp(float3(0.04f, 0.04f, 0.04f), materialData.rgb, saturate(material.metallic));
+        Texture2D<float4> geometricNormalTexture = ResourceDescriptorHeap[constants.geometricNormalIndex];
+        float effectiveMetallic = saturate(geometricNormalTexture.Load(int3(pixel, 0)).a);
+        F0 = lerp(float3(0.04f, 0.04f, 0.04f), materialData.rgb, effectiveMetallic);
     }
     else if(material.model == 1)
     {

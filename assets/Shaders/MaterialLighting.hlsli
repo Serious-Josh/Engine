@@ -16,7 +16,7 @@ struct GPUMaterial
     uint roughnessTextureIndex;
 
     float3 conductorK;
-    float padding1;
+    uint metallicTextureIndex;
 
     float3 averageConductorFresnel;
     uint normalTextureIndex;

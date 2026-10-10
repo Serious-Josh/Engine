@@ -835,6 +835,22 @@ float SecondarySurfaceRoughness(GPUMaterial material, ReflectionPayload surface)
     return saturate(roughness * sampledRoughness);
 }
 
+float SecondarySurfaceMetallic(GPUMaterial material, ReflectionPayload surface)
+{
+    if(material.model != 0u)
+        return material.metallic;
+
+    float metallic = saturate(material.metallic);
+    if(material.metallicTextureIndex == 0xFFFFFFFFu)
+        return metallic;
+
+    Texture2D<float4> metallicTexture = ResourceDescriptorHeap[
+        NonUniformResourceIndex(material.metallicTextureIndex)];
+    float sampledMetallic = metallicTexture.SampleLevel(materialSampler, surface.uv,
+        ReflectionTextureLOD(metallicTexture, surface.coneWidth, surface.textureDensity)).r;
+    return saturate(metallic * sampledMetallic);
+}
+
 float3 ShadeSecondarySurface(ReflectionPayload surface, float3 rayDirection, float directionalVisibility,
     out SecondaryLighting lighting)
 {
@@ -842,6 +858,8 @@ float3 ShadeSecondarySurface(ReflectionPayload surface, float3 rayDirection, flo
     StructuredBuffer<GPUMaterial> materialBuffer =
         ResourceDescriptorHeap[reflectionConstants.materialBufferIndex];
     GPUMaterial material = materialBuffer[surface.materialIndex];
+    if(material.model == 0u)
+        material.metallic = SecondarySurfaceMetallic(material, surface);
     material.roughness = SecondarySurfaceRoughness(material, surface);
     float3 worldNormal = surface.shadingNormal;
     float2 hitUV = surface.uv;
@@ -1626,7 +1644,10 @@ void RayGeneration()
 
     Texture2D<float4> geometricNormalTexture =
         ResourceDescriptorHeap[reflectionConstants.geometricNormalIndex];
-    float3 geometricNormal = normalize(geometricNormalTexture.Load(int3(pixelIndex, 0)).rgb);
+    float4 geometricNormalData = geometricNormalTexture.Load(int3(pixelIndex, 0));
+    float3 geometricNormal = normalize(geometricNormalData.rgb);
+    if(primaryMaterial.model == 0u)
+        primaryMaterial.metallic = saturate(geometricNormalData.a);
 
     ray.Origin =
         worldPosition.xyz +
@@ -1734,6 +1755,8 @@ void RayGeneration()
         secondaryRadiance = ShadeSecondarySurface(payload, ray.Direction, secondaryVisibility, secondaryLighting);
 
         GPUMaterial secondaryMaterial = materialBuffer[payload.materialIndex];
+        if(secondaryMaterial.model == 0u)
+            secondaryMaterial.metallic = SecondarySurfaceMetallic(secondaryMaterial, payload);
         secondaryMaterial.roughness = SecondarySurfaceRoughness(secondaryMaterial, payload);
         // Preserve the validated deterministic mirror continuation.
         if(secondaryMaterial.roughness <= 0.001f && secondaryMaterial.model <= 2u)
