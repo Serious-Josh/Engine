@@ -102,7 +102,8 @@ cbuffer GIConstants : register(b0)
     uint diffuseIrradianceIndex;
     uint diffuseIrradianceArrayIndex;
     uint geometricNormalIndex;
-    uint3 padding;
+    uint2 fullResolution;
+    uint padding;
 };
 
 RaytracingAccelerationStructure scene : register(t0);
@@ -522,6 +523,9 @@ float3 IntegrateGISameNormalConvolution(float3 normal)
 void GIRayGeneration()
 {
     const uint2 pixel = DispatchRaysIndex().xy;
+    const uint2 gbufferPixel = min(
+        pixel * 2u,
+        fullResolution - 1u);
 
     giTexture[pixel] = float4(0.0f, 0.0f, 0.0f, 1.0f);
     hitDistanceTexture[pixel] = -2.0f;
@@ -529,13 +533,13 @@ void GIRayGeneration()
     Texture2D<float> depthTexture = ResourceDescriptorHeap[depthIndex];
     Texture2D<float4> surfaceTexture = ResourceDescriptorHeap[surfaceIndex];
 
-    const float depth = depthTexture.Load(int3(pixel, 0));
+    const float depth = depthTexture.Load(int3(gbufferPixel, 0));
     if(!isfinite(depth) || depth < 0.0f || depth >= 1.0f)
         return;
 
     // Match reflection/shadow reconstruction: pixel centers, flipped NDC Y,
     // D3D depth in [0, 1], and a row-major matrix multiplying a column vector.
-    const float2 uv = (float2(pixel) + 0.5f) / float2(DispatchRaysDimensions().xy);
+    const float2 uv = (float2(gbufferPixel) + 0.5f) / float2(fullResolution);
     const float2 ndc = float2(uv.x * 2.0f - 1.0f, 1.0f - uv.y * 2.0f);
     float4 worldPosition = mul(inverseViewProjection, float4(ndc, depth, 1.0f));
     if(!all(isfinite(worldPosition)) || abs(worldPosition.w) < 1.0e-8f)
@@ -546,7 +550,7 @@ void GIRayGeneration()
         return;
 
     // Surface RGB already stores a world-space normal, without remapping.
-    const float3 surfaceNormal = surfaceTexture.Load(int3(pixel, 0)).rgb;
+    const float3 surfaceNormal = surfaceTexture.Load(int3(gbufferPixel, 0)).rgb;
     const float normalLengthSquared = dot(surfaceNormal, surfaceNormal);
     if(!all(isfinite(surfaceNormal)) || !isfinite(normalLengthSquared) ||
        normalLengthSquared < 1.0e-8f)
@@ -555,7 +559,7 @@ void GIRayGeneration()
     const float3 normal = normalize(surfaceNormal);
 
     Texture2D<float4> geometricNormalTexture = ResourceDescriptorHeap[geometricNormalIndex];
-    const float3 geometricNormalValue = geometricNormalTexture.Load(int3(pixel, 0)).rgb;
+    const float3 geometricNormalValue = geometricNormalTexture.Load(int3(gbufferPixel, 0)).rgb;
     const float geometricNormalLengthSquared = dot(geometricNormalValue, geometricNormalValue);
     if(!all(isfinite(geometricNormalValue)) || !isfinite(geometricNormalLengthSquared) ||
        geometricNormalLengthSquared < 1.0e-8f)

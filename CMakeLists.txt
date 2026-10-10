@@ -87,8 +87,8 @@ add_executable(Engine
     src/Renderer/Passes/RayTracedReflectionPass.cpp
     src/Renderer/Passes/RayTracedReflectionDenoisePass.cpp
     src/Renderer/Passes/RayTracedReflectionTemporalPass.cpp
-    src/Renderer/Passes/NrdReflectionDenoiser.cpp
-    src/Renderer/Passes/NrdReflectionPreparePass.cpp
+    src/Renderer/Passes/NrdDenoiser.cpp
+    src/Renderer/Passes/NrdPreparePass.cpp
     src/Renderer/Passes/ReflectionContributionLimitPass.cpp
     src/Renderer/Passes/NrdReflectionResolvePass.cpp
     src/DemoContent/DemoSceneManager.cpp

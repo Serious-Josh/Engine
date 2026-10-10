@@ -44,15 +44,11 @@ void CSMain(uint3 dispatchThreadID : SV_DispatchThreadID)
     RWTexture2D<float4> normalRoughnessOutput = ResourceDescriptorHeap[constants.normalRoughnessOutputIndex];
     RWTexture2D<float4> radianceOutput = ResourceDescriptorHeap[constants.specRadianceHitDistOutputIndex];
 
-    RWTexture2D<float4> diffuseOutput = ResourceDescriptorHeap[constants.diffRadianceHitDistOutputIndex];
-
     // Finite defaults also cover invalid primary data. View Z is R32_FLOAT.
     viewZOutput[pixel] = max(constants.denoisingRange, 0.0f) * 2.0f + 1.0f;
     motionOutput[pixel] = 0.0f;
     normalRoughnessOutput[pixel] = NRD_FrontEnd_PackNormalAndRoughness(float3(0, 0, 1), 1.0f, 0.0f);
     radianceOutput[pixel] = REBLUR_FrontEnd_PackRadianceAndNormHitDist(float3(0, 0, 0), 0.0f, true);
-
-    diffuseOutput[pixel] = REBLUR_FrontEnd_PackRadianceAndNormHitDist(float3(0, 0, 0), 0.0f, true);
 
     Texture2D<float> depthTexture = ResourceDescriptorHeap[constants.depthIndex];
     float depth = depthTexture.Load(int3(pixel, 0));
@@ -129,20 +125,4 @@ void CSMain(uint3 dispatchThreadID : SV_DispatchThreadID)
     viewZOutput[pixel] = viewPosition.z;
     normalRoughnessOutput[pixel] = NRD_FrontEnd_PackNormalAndRoughness(normal, roughness, 0.0f);
     radianceOutput[pixel] = REBLUR_FrontEnd_PackRadianceAndNormHitDist(radiance, normalizedDistance, true);
-
-    Texture2D<float4> rawGI = ResourceDescriptorHeap[constants.rawGIIndex];
-    Texture2D<float> giHitDistanceTexture = ResourceDescriptorHeap[constants.giHitDistanceIndex];
-    float giHitDistance = giHitDistanceTexture.Load(int3(pixel, 0));
-    float diffuseNormalizedDistance = 0.0f;
-    if(isfinite(giHitDistance) && giHitDistance > 0.0f)
-        diffuseNormalizedDistance = REBLUR_FrontEnd_GetNormHitDist(giHitDistance, viewPosition.z,
-            float3(constants.hitDistanceA, constants.hitDistanceB, constants.hitDistanceC), 1.0f);
-    else if(giHitDistance == -1.0f)
-        diffuseNormalizedDistance = 1.0f;
-    else
-        return; // Invalid GI leaves the diffuse no-data default; shared guides stay unchanged.
-
-    // Complete irradiance already includes the baseline and excludes primary albedo.
-    float3 diffuseRadiance = rawGI.Load(int3(pixel, 0)).rgb / PI;
-    diffuseOutput[pixel] = REBLUR_FrontEnd_PackRadianceAndNormHitDist(diffuseRadiance, diffuseNormalizedDistance, true);
 }

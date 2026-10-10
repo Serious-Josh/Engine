@@ -41,20 +41,64 @@ struct NrdReflectionPrepareConstants
     unsigned int diffRadianceHitDistOutputIndex;
 };
 
+struct NrdGIPrepareConstants
+{
+    Matrix4 inverseViewProjection;
+    Matrix4 view;
+
+    unsigned int depthIndex;
+    unsigned int materialIndex;
+    unsigned int surfaceIndex;
+    unsigned int motionInputIndex;
+
+    unsigned int materialBufferIndex;
+    unsigned int rawGIIndex;
+    unsigned int giHitDistanceIndex;
+    unsigned int viewZOutputIndex;
+
+    unsigned int motionOutputIndex;
+    unsigned int normalRoughnessOutputIndex;
+    unsigned int diffRadianceHitDistOutputIndex;
+    unsigned int fullWidth;
+
+    unsigned int fullHeight;
+    unsigned int giWidth;
+    unsigned int giHeight;
+    unsigned int padding;
+
+    float hitDistanceA;
+    float hitDistanceB;
+    float hitDistanceC;
+    float denoisingRange;
+};
+
+static_assert(sizeof(NrdGIPrepareConstants) == 208);
 static_assert(sizeof(NrdReflectionPrepareConstants) == 208);
 
-class NrdReflectionPreparePass
+class NrdPreparePass
 {
     public:
-        bool Initialize(GraphicsDevice& graphicsDevice, ShaderLibrary& shaderLibrary, DescriptorHeap& descriptorHeap, unsigned int width, unsigned int height);
+
+        enum class Signal
+        {
+            Specular,
+            Diffuse
+        };
+
+        bool Initialize(
+            GraphicsDevice& graphicsDevice,
+            ShaderLibrary& shaderLibrary,
+            DescriptorHeap& descriptorHeap,
+            unsigned int width,
+            unsigned int height,
+            Signal signal = Signal::Specular);
         bool Resize(GraphicsDevice& graphicsDevice, DescriptorHeap& descriptorHeap, unsigned int width, unsigned int height);
-        void Execute(
+
+        void ExecuteReflections(
             ID3D12GraphicsCommandList* commandList,
             GBuffer& gBuffer,
             Texture& rawReflection,
             Texture& trackingDistance,
-            Texture& rawGI,
-            Texture& giHitDistance,
             UploadBuffer& uploadBuffer,
             const Matrix4& inverseViewProjection,
             const Matrix4& view,
@@ -63,6 +107,22 @@ class NrdReflectionPreparePass
             unsigned int height,
             float denoisingRange
         );
+
+        void ExecuteGI(
+            ID3D12GraphicsCommandList* commandList,
+            GBuffer& gBuffer,
+            Texture& rawGI,
+            Texture& giHitDistance,
+            UploadBuffer& uploadBuffer,
+            const Matrix4& inverseViewProjection,
+            const Matrix4& view,
+            unsigned int materialBufferIndex,
+            unsigned int fullWidth,
+            unsigned int fullHeight,
+            unsigned int giWidth,
+            unsigned int giHeight,
+            float denoisingRange);
+
         void Shutdown();
 
         Texture& GetViewZTexture();
@@ -90,4 +150,6 @@ class NrdReflectionPreparePass
         Texture m_diffRadianceHitDistTexture;
 
         ComputePipeline m_pipeline;
+
+        Signal m_signal = Signal::Specular;
 };

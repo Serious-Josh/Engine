@@ -106,7 +106,8 @@ struct GIConstants
     unsigned int diffuseIrradianceArrayIndex = 0;
 
     unsigned int geometricNormalIndex = 0;
-    unsigned int padding[3] = {};
+    unsigned int fullResolution[2];
+    unsigned int padding;
 };
 
 struct AOConstants

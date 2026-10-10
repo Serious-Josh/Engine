@@ -130,7 +130,10 @@ bool Renderer::Initialize(void* windowHandle, unsigned int width, unsigned int h
         return false;
     }
 
-    if(!m_rayTracedGIPass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap, m_width, m_height)){
+    const uint32_t giWidth = (m_width + 1u) / 2u;
+    const uint32_t giHeight = (m_height + 1u) / 2u;
+
+    if(!m_rayTracedGIPass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap, giWidth, giHeight)){
         Log::Error("Failed to init ray traced gi pass.");
         return false;
     }
@@ -175,6 +178,12 @@ bool Renderer::Initialize(void* windowHandle, unsigned int width, unsigned int h
         return false;
     }
 
+    if(!m_nrdGIPreparePass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap, giWidth, giHeight, NrdPreparePass::Signal::Diffuse))
+    {
+        Log::Error("Failed to initialize NRD GI preparation pass.");
+        return false;
+    }
+
     if(!m_nrdReflectionResolvePass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap, m_width, m_height))
     {
         Log::Error("Failed to initialize NRD reflection resolve pass.");
@@ -187,8 +196,13 @@ bool Renderer::Initialize(void* windowHandle, unsigned int width, unsigned int h
         return false;
     }
 
-    if(!m_nrdReflectionDenoiser.Initialize(device, m_commandContext.GetCommandQueue(), m_resourceDescriptorHeap, m_width, m_height, 2)){
+    if(!m_nrdReflectionDenoiser.Initialize(device, m_commandContext.GetCommandQueue(), m_resourceDescriptorHeap, m_width, m_height, 2, NrdDenoiser::Signal::Specular)){
         Log::Error("Failed to init NRD reflection denoiser.");
+        return false;
+    }
+
+    if(!m_nrdGIDenoiser.Initialize(device, m_commandContext.GetCommandQueue(), m_resourceDescriptorHeap, giWidth, giHeight, 2, NrdDenoiser::Signal::Diffuse)){
+        Log::Error("Failed to init NRD diffuse GI denoiser.");
         return false;
     }
 
@@ -356,7 +370,10 @@ bool Renderer::Resize(unsigned int width, unsigned int height)
         return false;
     }
 
-    if(!m_rayTracedGIPass.Resize(m_graphicsDevice.GetDevice(), m_resourceDescriptorHeap, width, height)){
+    const uint32_t giWidth = (width + 1u) / 2u;
+    const uint32_t giHeight = (height + 1u) / 2u;
+
+    if(!m_rayTracedGIPass.Resize(m_graphicsDevice.GetDevice(), m_resourceDescriptorHeap, giWidth, giHeight)){
         Log::Error("Failed to resize ray traced GI pass.");
         return false;
     }
@@ -396,6 +413,12 @@ bool Renderer::Resize(unsigned int width, unsigned int height)
         Log::Error("Failed to resize NRD reflection preparation pass.");
         return false;
     }
+    
+    if(!m_nrdGIPreparePass.Resize(m_graphicsDevice, m_resourceDescriptorHeap, giWidth, giHeight))
+    {
+        Log::Error("Failed to resize NRD GI preparation pass.");
+        return false;
+    }
 
     if(!m_nrdReflectionResolvePass.Resize(m_graphicsDevice, m_resourceDescriptorHeap, width, height))
     {
@@ -411,6 +434,11 @@ bool Renderer::Resize(unsigned int width, unsigned int height)
 
     if(!m_nrdReflectionDenoiser.Resize(m_resourceDescriptorHeap, width, height)){
         Log::Error("Failed to resize NRD reflection denoiser.");
+        return false;
+    }
+
+    if(!m_nrdGIDenoiser.Resize(m_resourceDescriptorHeap, giWidth, giHeight)){
+        Log::Error("Failed to resize NRD diffuse GI denoiser.");
         return false;
     }
 
@@ -950,6 +978,8 @@ bool Renderer::Render(const Scene& scene, const RendererOptions& options)
     giConstants.depthIndex = m_gBuffer.GetDepth().GetSRVIndex();
     giConstants.surfaceIndex = m_gBuffer.GetSurface().GetSRVIndex();
     giConstants.geometricNormalIndex = m_gBuffer.GetGeometricNormal().GetSRVIndex();
+    giConstants.fullResolution[0] = m_width;
+    giConstants.fullResolution[1] = m_height;
     giConstants.frameIndex = reflectionConstants.frameIndex;
     giConstants.instanceDataIndex = reflectionConstants.instanceDataIndex;
     giConstants.materialBufferIndex = reflectionConstants.materialBufferIndex;
@@ -1146,6 +1176,9 @@ bool Renderer::Render(const Scene& scene, const RendererOptions& options)
 
     m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::RayTracedReflections);
 
+    const uint32_t giWidth = (m_width + 1u) / 2u;
+    const uint32_t giHeight = (m_height + 1u) / 2u;
+
     m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::RayTracedGI);
     m_rayTracedGIPass.Execute(
         m_commandContext.GetRayTracingCommandList(),
@@ -1153,8 +1186,8 @@ bool Renderer::Render(const Scene& scene, const RendererOptions& options)
         m_rayTracingScene,
         giConstantsAddress,
         lightConstantsAddress,
-        m_width,
-        m_height);
+        giWidth,
+        giHeight);
     m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::RayTracedGI);
 
     constexpr float nrdDenoisingRange = 1000.0f;
@@ -1175,6 +1208,7 @@ bool Renderer::Render(const Scene& scene, const RendererOptions& options)
             runNrd = true; break;
         default: break;
     }
+
     runNrd = runNrd || options.enableRTGI;
     const bool runNative = reflectionMode == ReflectionDenoiserMode::Native;
     const bool resetNrdHistory = !m_hasPreviousNrdCamera || !m_nrdExecutedLastFrame ||
@@ -1183,6 +1217,7 @@ bool Renderer::Render(const Scene& scene, const RendererOptions& options)
     if(runNrd)
     {
         m_nrdReflectionDenoiser.NewFrame();
+        m_nrdGIDenoiser.NewFrame();
 
         if(!m_nrdReflectionDenoiser.SetFrameSettings(
             currentView,
@@ -1191,8 +1226,20 @@ bool Renderer::Render(const Scene& scene, const RendererOptions& options)
             previousNrdProjection,
             m_nrdFrameIndex,
             nrdDenoisingRange,
-            resetNrdHistory)){
-            Log::Error("Failed to set NRD reflection frame settings.");
+            resetNrdHistory))
+        {
+            return false;
+        }
+
+        if(!m_nrdGIDenoiser.SetFrameSettings(
+            currentView,
+            currentProjection,
+            previousNrdView,
+            previousNrdProjection,
+            m_nrdFrameIndex,
+            nrdDenoisingRange,
+            resetNrdHistory))
+        {
             return false;
         }
 
@@ -1214,11 +1261,22 @@ bool Renderer::Render(const Scene& scene, const RendererOptions& options)
 
         m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::NrdPrepare);
 
-        m_nrdReflectionPreparePass.Execute(
+        m_nrdReflectionPreparePass.ExecuteReflections(
             commandList,
             m_gBuffer,
             *nrdInput,
             m_rayTracedReflectionPass.GetSpecularTrackingDistanceTexture(),
+            m_uploadBuffer,
+            reconstructionConstants.inverseViewProjection,
+            currentView,
+            m_materialBuffer.GetDescriptorIndex(),
+            m_width,
+            m_height,
+            nrdDenoisingRange);
+
+        m_nrdGIPreparePass.ExecuteGI(
+            commandList,
+            m_gBuffer,
             m_rayTracedGIPass.GetRawGITexture(),
             m_rayTracedGIPass.GetHitDistanceTexture(),
             m_uploadBuffer,
@@ -1227,6 +1285,8 @@ bool Renderer::Render(const Scene& scene, const RendererOptions& options)
             m_materialBuffer.GetDescriptorIndex(),
             m_width,
             m_height,
+            giWidth,
+            giHeight,
             nrdDenoisingRange);
 
         m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::NrdPrepare);
@@ -1239,7 +1299,15 @@ bool Renderer::Render(const Scene& scene, const RendererOptions& options)
             m_nrdReflectionPreparePass.GetNormalRoughnessTexture(),
             m_nrdReflectionPreparePass.GetViewZTexture(),
             m_nrdReflectionPreparePass.GetSpecRadianceHitDistTexture(),
-            m_nrdReflectionPreparePass.GetDiffRadianceHitDistTexture());
+            NrdDenoiser::Signal::Specular);
+
+        m_nrdGIDenoiser.Denoise(
+            commandList,
+            m_nrdGIPreparePass.GetMotionTexture(),
+            m_nrdGIPreparePass.GetNormalRoughnessTexture(),
+            m_nrdGIPreparePass.GetViewZTexture(),
+            m_nrdGIPreparePass.GetDiffRadianceHitDistTexture(),
+            NrdDenoiser::Signal::Diffuse);
 
         m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::NrdReblur);
 
@@ -1265,8 +1333,8 @@ bool Renderer::Render(const Scene& scene, const RendererOptions& options)
         m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::NrdDiffuseResolve);
         m_nrdDiffuseResolvePass.Execute(
             commandList,
-            m_nrdReflectionDenoiser.GetDiffuseOutputTexture(),
-            m_nrdReflectionPreparePass.GetViewZTexture(),
+            m_nrdGIDenoiser.GetDiffuseOutputTexture(),
+            m_nrdGIPreparePass.GetViewZTexture(),
             m_uploadBuffer,
             m_width,
             m_height,
@@ -1487,7 +1555,9 @@ void Renderer::Shutdown()
     m_rayTracedReflectionDenoisePass.Shutdown();
     m_reflectionContributionLimitPass.Shutdown();
     m_nrdReflectionPreparePass.Shutdown();
+    m_nrdGIPreparePass.Shutdown();
     m_nrdReflectionDenoiser.Shutdown();
+    m_nrdGIDenoiser.Shutdown();
     m_nrdReflectionResolvePass.Shutdown();
     m_nrdDiffuseResolvePass.Shutdown();
     m_shadowDenoisePass.Shutdown();

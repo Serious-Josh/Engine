@@ -20,16 +20,25 @@
 
 class DescriptorHeap;
 
-class NrdReflectionDenoiser
+class NrdDenoiser
 {
     public:
+
+        enum class Signal
+        {
+            Combined,
+            Specular,
+            Diffuse
+        };
+
         bool Initialize(
             ID3D12Device* device,
             ID3D12CommandQueue* graphicsQueue,
             DescriptorHeap& descriptorHeap,
             uint32_t width,
             uint32_t height,
-            uint32_t queuedFrameCount);
+            uint32_t queuedFrameCount,
+            Signal signal = Signal::Combined);
         bool Resize(
             DescriptorHeap& descriptorHeap,
             uint32_t width,
@@ -50,8 +59,8 @@ class NrdReflectionDenoiser
             Texture& motion,
             Texture& normalRoughness,
             Texture& viewZ,
-            Texture& specRadianceHitDist,
-            Texture& diffRadianceHitDist);
+            Texture& radianceHitDist,
+            Signal signal = Signal::Combined);
 
         Texture& GetOutputTexture();
         const Texture& GetOutputTexture() const;
@@ -82,4 +91,6 @@ class NrdReflectionDenoiser
 
         uint32_t m_width = 0;
         uint32_t m_height = 0;
+
+        Signal m_signal = Signal::Combined;
 };

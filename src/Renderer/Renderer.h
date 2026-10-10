@@ -33,8 +33,8 @@
 #include "Passes/RayTracedReflectionTemporalPass.h"
 #include "Passes/RayTracedReflectionDenoisePass.h"
 #include "Passes/ReflectionContributionLimitPass.h"
-#include "Passes/NrdReflectionDenoiser.h"
-#include "Passes/NrdReflectionPreparePass.h"
+#include "Passes/NrdDenoiser.h"
+#include "Passes/NrdPreparePass.h"
 #include "Passes/NrdReflectionResolvePass.h"
 #include "Passes/SelectionMaskPass.h"
 #include "Passes/RayTracedGIPass.h"
@@ -141,8 +141,10 @@ class Renderer
         AOTemporalPass m_aoTemporalPass;
         AODenoisePass m_aoDenoisePass;
         ReflectionContributionLimitPass m_reflectionContributionLimitPass;
-        NrdReflectionDenoiser m_nrdReflectionDenoiser;
-        NrdReflectionPreparePass m_nrdReflectionPreparePass;
+        NrdDenoiser m_nrdReflectionDenoiser;
+        NrdDenoiser m_nrdGIDenoiser;
+        NrdPreparePass m_nrdReflectionPreparePass;
+        NrdPreparePass m_nrdGIPreparePass;
         NrdReflectionResolvePass m_nrdReflectionResolvePass;
         NrdDiffuseResolvePass m_nrdDiffuseResolvePass;
         ShadowDenoisePass m_shadowDenoisePass;
