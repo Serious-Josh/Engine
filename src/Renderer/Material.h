@@ -24,6 +24,9 @@ struct Material
     Texture* normalTexture = nullptr;
     Texture* roughnessTexture = nullptr;
     Texture* metallicTexture = nullptr;
+    Texture* armTexture = nullptr;
+    Texture* aoTexture = nullptr;
+    bool preferARM = true;
 
     MaterialModel model = MaterialModel::Dielectric;
 
@@ -163,6 +166,9 @@ struct Material
         data.normalTextureIndex = normalTexture ? normalTexture->GetDescriptorIndex() : UINT_MAX;
         data.roughnessTextureIndex = roughnessTexture ? roughnessTexture->GetDescriptorIndex() : UINT_MAX;
         data.metallicTextureIndex = metallicTexture ? metallicTexture->GetDescriptorIndex() : UINT_MAX;
+        data.armTextureIndex = armTexture ? armTexture->GetDescriptorIndex() : UINT_MAX;
+        data.preferARM = preferARM ? 1u : 0u;
+        data.aoTextureIndex = aoTexture ? aoTexture->GetDescriptorIndex() : UINT_MAX;
 
         data.conductorN[0] = conductorN[0];
         data.conductorN[1] = conductorN[1];

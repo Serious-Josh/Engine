@@ -6,6 +6,8 @@
 #include "Renderer/Vertex.h"
 #include "Renderer/ImageLoader.h"
 #include "Renderer/TangentGenerator.h"
+#include "Renderer/Geometry/SphereGenerator.h"
+#include "Renderer/DDSLoader.h"
 
 #include "Scene/Camera.h"
 #include "Scene/DirectionalLight.h"
@@ -294,6 +296,63 @@ bool CornellBoxScene::Initialize(
     }
 
 
+    // Brick sphere: match Mirror Test geometry and material textures.
+    SphereGeometry sphere = SphereGenerator::Generate(1.0f, 32, 64);
+    TangentGenerator::GenerateTangents(sphere.vertices, sphere.indices);
+
+    if (!m_brickSphereMesh.Initialize(
+        device, uploader, descriptorHeap,
+        sphere.vertices.data(), sphere.vertices.size(), m_vertexLayout,
+        sphere.indices.data(), sphere.indices.size()))
+    {
+        return false;
+    }
+
+    if (!DDSLoader::LoadTexture(
+        device, uploader, descriptorHeap,
+        "assets/Textures/Materials/stacked_brick_wall_diff_4k.dds",
+        m_brickDiffuseTexture, true))
+    {
+        return false;
+    }
+
+    if (!DDSLoader::LoadTexture(
+        device, uploader, descriptorHeap,
+        "assets/Textures/Materials/stacked_brick_wall_nor_dx_4k.dds",
+        m_brickNormalTexture, false))
+    {
+        return false;
+    }
+
+    if (!DDSLoader::LoadTexture(
+        device, uploader, descriptorHeap,
+        "assets/Textures/Materials/stacked_brick_wall_rough_4k.dds",
+        m_brickRoughnessTexture, false))
+    {
+        return false;
+    }
+
+    if (!DDSLoader::LoadTexture(
+        device, uploader, descriptorHeap,
+        "assets/Textures/Materials/stacked_brick_wall_arm_4k.dds",
+        m_brickARMTexture, false))
+    {
+        return false;
+    }
+
+    m_brickMaterial.pipeline = &m_pipeline;
+    m_brickMaterial.texture = &m_brickDiffuseTexture;
+    m_brickMaterial.normalTexture = &m_brickNormalTexture;
+    m_brickMaterial.roughnessTexture = &m_brickRoughnessTexture;
+    m_brickMaterial.armTexture = &m_brickARMTexture;
+    m_brickMaterial.preferARM = true;
+    m_brickMaterial.model = MaterialModel::MetallicRoughness;
+    m_brickMaterial.roughness = 1.0f;
+    m_brickMaterial.metallic = 0.0f;
+    m_brickMaterial.baseColor[0] = 1.0f;
+    m_brickMaterial.baseColor[1] = 0.02f;
+    m_brickMaterial.baseColor[2] = 0.02f;
+
     // Cornell box render objects
 
     for (size_t i = 0; i < m_cornellMeshes.size(); ++i)
@@ -368,6 +427,14 @@ bool CornellBoxScene::Initialize(
         m_scene.AddRenderObject(tankPart);
     }
 
+    RenderObject brickSphere{};
+    brickSphere.mesh = &m_brickSphereMesh;
+    brickSphere.material = &m_brickMaterial;
+    // Raised above the tank and reduced to clear the imported ceiling geometry.
+    brickSphere.transform.position = Vector3{0.0f, 2.75f, 0.0f};
+    brickSphere.transform.scale = Vector3{0.5f, 0.5f, 0.5f};
+    m_scene.AddRenderObject(brickSphere);
+
     ResetCamera();
     ResetDirectionalLight();
 
@@ -396,6 +463,11 @@ void CornellBoxScene::Shutdown()
     m_whiteTexture.Shutdown();
     m_tankAlbedoTexture.Shutdown();
     m_tankNormalTexture.Shutdown();
+    m_brickDiffuseTexture.Shutdown();
+    m_brickNormalTexture.Shutdown();
+    m_brickRoughnessTexture.Shutdown();
+    m_brickARMTexture.Shutdown();
+    m_brickSphereMesh.Shutdown();
     m_pipeline.Shutdown();
 }
 
@@ -430,7 +502,8 @@ std::vector<Material*> CornellBoxScene::GetMaterials()
         &m_defaultMaterial,
         &m_redWallMaterial,
         &m_greenWallMaterial,
-        &m_tankMaterial
+        &m_tankMaterial,
+        &m_brickMaterial
     };
 }
 

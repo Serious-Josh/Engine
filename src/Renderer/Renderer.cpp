@@ -576,6 +576,22 @@ void Renderer::Draw(ID3D12GraphicsCommandList* commandList, const RenderObject& 
                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     }
 
+    if(object.material->armTexture)
+    {
+        object.material->armTexture->Transition(
+            commandList,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    }
+
+    if(object.material->aoTexture)
+    {
+        object.material->aoTexture->Transition(
+            commandList,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    }
+
     if(object.mesh->IsIndexed()){
         const uint64_t indexCount = static_cast<uint64_t>(object.mesh->GetIndexCount());
 
@@ -963,6 +979,7 @@ bool Renderer::Render(const Scene& scene, const RendererOptions& options)
     reconstructionConstants.cameraPosition[1] = cameraPosition.y;
     reconstructionConstants.cameraPosition[2] = cameraPosition.z;
     reconstructionConstants.geometricNormalIndex = m_gBuffer.GetGeometricNormal().GetSRVIndex();
+    reconstructionConstants.motionIndex = m_gBuffer.GetMotion().GetSRVIndex();
 
     D3D12_GPU_VIRTUAL_ADDRESS reconstructionConstantsAddress = m_uploadBuffer.Allocate(&reconstructionConstants, sizeof(ReconstructionConstants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
 

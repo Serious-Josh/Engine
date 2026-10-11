@@ -825,6 +825,14 @@ float ReflectionTextureLOD(Texture2D<float4> texture, float footprint, float den
 float SecondarySurfaceRoughness(GPUMaterial material, ReflectionPayload surface)
 {
     float roughness = material.roughness;
+    if(material.armTextureIndex != 0xFFFFFFFFu && material.preferARM != 0u)
+    {
+        Texture2D<float4> armTexture = ResourceDescriptorHeap[
+            NonUniformResourceIndex(material.armTextureIndex)];
+        float sampledRoughness = armTexture.SampleLevel(materialSampler, surface.uv,
+            ReflectionTextureLOD(armTexture, surface.coneWidth, surface.textureDensity)).g;
+        return saturate(roughness * sampledRoughness);
+    }
     if(material.roughnessTextureIndex == 0xFFFFFFFFu)
         return roughness;
 
@@ -841,6 +849,14 @@ float SecondarySurfaceMetallic(GPUMaterial material, ReflectionPayload surface)
         return material.metallic;
 
     float metallic = saturate(material.metallic);
+    if(material.armTextureIndex != 0xFFFFFFFFu && material.preferARM != 0u)
+    {
+        Texture2D<float4> armTexture = ResourceDescriptorHeap[
+            NonUniformResourceIndex(material.armTextureIndex)];
+        float sampledMetallic = armTexture.SampleLevel(materialSampler, surface.uv,
+            ReflectionTextureLOD(armTexture, surface.coneWidth, surface.textureDensity)).b;
+        return saturate(metallic * sampledMetallic);
+    }
     if(material.metallicTextureIndex == 0xFFFFFFFFu)
         return metallic;
 

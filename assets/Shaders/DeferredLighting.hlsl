@@ -36,6 +36,8 @@ cbuffer ReconstructionConstants : register(b1)
 
     float3 cameraPosition;
     uint geometricNormalIndex;
+    uint motionIndex;
+    uint3 reconstructionPadding;
 }
 
 cbuffer DirectionalLightConstants : register(b2)
@@ -293,6 +295,10 @@ float4 PSMain(VSOutput input) : SV_Target0
     {
         return float4(0.0f, 0.0f, 0.0f, 1.0f);
     }
+
+    // Reserved for material AO composition; leave lighting unchanged in this step.
+    Texture2D<float4> motionTexture = ResourceDescriptorHeap[motionIndex];
+    float materialAO = saturate(motionTexture.Load(int3(pixel, 0)).a);
 
     float4 materialData =
         materialTexture.Load(
@@ -1141,6 +1147,14 @@ float4 PSMain(VSOutput input) : SV_Target0
 
         finalSpecular =
             lerp(environmentSpecular * specularAO, rayTracedSpecular, rtWeight);
+    }
+
+    // Apply receiver material AO once after indirect composition for every model.
+    // Keep raw/reference lighting diagnostics independent of material AO.
+    if(!lightingDebug)
+    {
+        environmentDiffuse *= materialAO;
+        finalSpecular *= materialAO;
     }
 
     float3 directional =

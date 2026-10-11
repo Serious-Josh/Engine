@@ -51,6 +51,7 @@ private:
     Texture m_sphereTexture;
     Texture m_normalTexture;
     Texture m_roughnessTexture;
+    Texture m_armTexture;
     Texture m_whiteTexture;
 
     Pipeline m_pipeline;

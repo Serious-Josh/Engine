@@ -208,6 +208,18 @@ bool MirrorTestScene::Initialize(
         return false;
     }
 
+    // Brick ARM map — BC1 with linear sampling.
+    if(!DDSLoader::LoadTexture(
+        device,
+        uploader,
+        descriptorHeap,
+        "assets/Textures/Materials/stacked_brick_wall_arm_4k.dds",
+        m_armTexture,
+        false))
+    {
+        return false;
+    }
+
     // Mirror A material
 
     m_mirrorAMaterial.pipeline = &m_pipeline;
@@ -247,6 +259,8 @@ bool MirrorTestScene::Initialize(
     m_coloredMaterial.texture = &m_sphereTexture;
     m_coloredMaterial.normalTexture = &m_normalTexture;
     m_coloredMaterial.roughnessTexture = &m_roughnessTexture;
+    m_coloredMaterial.armTexture = &m_armTexture;
+    m_coloredMaterial.preferARM = true;
 
     m_coloredMaterial.model =
         MaterialModel::MetallicRoughness;
@@ -393,6 +407,7 @@ void MirrorTestScene::Shutdown()
     m_sphereTexture.Shutdown();
     m_normalTexture.Shutdown();
     m_roughnessTexture.Shutdown();
+    m_armTexture.Shutdown();
     m_whiteTexture.Shutdown();
 
     m_sphereMesh.Shutdown();

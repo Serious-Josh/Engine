@@ -231,6 +231,16 @@ float GISecondarySurfaceMetallic(GPUMaterial material, float2 uv)
         return material.metallic;
 
     float metallic = saturate(material.metallic);
+    if(material.armTextureIndex != 0xFFFFFFFFu && material.preferARM != 0u)
+    {
+        Texture2D<float4> armTexture = ResourceDescriptorHeap[
+            NonUniformResourceIndex(material.armTextureIndex)];
+        float sampledMetallic = armTexture.SampleLevel(materialSampler, uv, 0.0f).b;
+        // Preserve invalid samples for the caller's zero-radiance fallback.
+        if(!isfinite(sampledMetallic))
+            return sampledMetallic;
+        return saturate(metallic * sampledMetallic);
+    }
     if(material.metallicTextureIndex == 0xFFFFFFFFu)
         return metallic;
 

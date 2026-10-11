@@ -128,8 +128,30 @@ PSOutput PSMain(VSOutput input)
         baseColor *
         sampledBaseColor;
 
+    bool useARM = material.armTextureIndex != 0xFFFFFFFFu && material.preferARM != 0u;
+    float2 armRoughnessMetallic = float2(1.0f, 1.0f);
+    float materialAO = 1.0f;
+    if(useARM)
+    {
+        Texture2D<float4> armTexture = ResourceDescriptorHeap[
+            NonUniformResourceIndex(material.armTextureIndex)];
+        float3 sampledARM = armTexture.Sample(sampler0, input.uv).rgb;
+        armRoughnessMetallic = sampledARM.gb;
+        materialAO = saturate(sampledARM.r);
+    }
+    else if(material.aoTextureIndex != 0xFFFFFFFFu)
+    {
+        Texture2D<float4> aoTexture = ResourceDescriptorHeap[
+            NonUniformResourceIndex(material.aoTextureIndex)];
+        materialAO = saturate(aoTexture.Sample(sampler0, input.uv).r);
+    }
+
     float finalRoughness = roughness;
-    if(roughnessTextureIndex != 0xFFFFFFFFu)
+    if(useARM)
+    {
+        finalRoughness = saturate(roughness * armRoughnessMetallic.x);
+    }
+    else if(roughnessTextureIndex != 0xFFFFFFFFu)
     {
         Texture2D<float4> roughnessTexture = ResourceDescriptorHeap[roughnessTextureIndex];
         float sampledRoughness = roughnessTexture.Sample(sampler0, input.uv).r;
@@ -179,7 +201,11 @@ PSOutput PSMain(VSOutput input)
     if(material.model == 0u)
     {
         effectiveMetallic = saturate(material.metallic);
-        if(material.metallicTextureIndex != 0xFFFFFFFFu)
+        if(useARM)
+        {
+            effectiveMetallic = saturate(effectiveMetallic * armRoughnessMetallic.y);
+        }
+        else if(material.metallicTextureIndex != 0xFFFFFFFFu)
         {
             Texture2D<float4> metallicTexture = ResourceDescriptorHeap[
                 NonUniformResourceIndex(material.metallicTextureIndex)];
@@ -221,6 +247,8 @@ PSOutput PSMain(VSOutput input)
             output.motion = motionVector;
         }
     }
+
+    output.motion.a = materialAO;
 
     return output;
 }

@@ -1,6 +1,8 @@
 #pragma once
 
 #include "Math/Matrix4.h"
+#include <cstddef>
+#include <cstdint>
 
 struct MaterialConstants
 {
@@ -34,6 +36,8 @@ struct ReconstructionConstants
 
     float cameraPosition[3];
     unsigned int geometricNormalIndex;
+    uint32_t motionIndex;
+    uint32_t padding[3];
 };
 
 struct ShadowConstants
@@ -152,6 +156,9 @@ struct GPUMaterial
 
     float averageConductorFresnel[3];
     unsigned int normalTextureIndex;
+    unsigned int armTextureIndex;
+    unsigned int preferARM;
+    uint32_t aoTextureIndex;
 };
 
 struct RayTracingInstanceData
@@ -171,8 +178,28 @@ static_assert(sizeof(MaterialConstants) == 32);
 static_assert(sizeof(Matrix4) == 64);
 static_assert(sizeof(CameraConstants) == 256);
 static_assert(sizeof(ObjectConstants) == 192);
-static_assert(sizeof(ReconstructionConstants) == 80);
-static_assert(sizeof(GPUMaterial) == 80);
+static_assert(sizeof(ReconstructionConstants) == 96);
+static_assert(offsetof(ReconstructionConstants, inverseViewProjection) == 0);
+static_assert(offsetof(ReconstructionConstants, cameraPosition) == 64);
+static_assert(offsetof(ReconstructionConstants, geometricNormalIndex) == 76);
+static_assert(offsetof(ReconstructionConstants, motionIndex) == 80);
+static_assert(offsetof(ReconstructionConstants, padding) == 84);
+static_assert(sizeof(GPUMaterial) == 92);
+static_assert(offsetof(GPUMaterial, model) == 0);
+static_assert(offsetof(GPUMaterial, roughness) == 4);
+static_assert(offsetof(GPUMaterial, ior) == 8);
+static_assert(offsetof(GPUMaterial, metallic) == 12);
+static_assert(offsetof(GPUMaterial, baseColor) == 16);
+static_assert(offsetof(GPUMaterial, textureIndex) == 28);
+static_assert(offsetof(GPUMaterial, conductorN) == 32);
+static_assert(offsetof(GPUMaterial, roughnessTextureIndex) == 44);
+static_assert(offsetof(GPUMaterial, conductorK) == 48);
+static_assert(offsetof(GPUMaterial, metallicTextureIndex) == 60);
+static_assert(offsetof(GPUMaterial, averageConductorFresnel) == 64);
+static_assert(offsetof(GPUMaterial, normalTextureIndex) == 76);
+static_assert(offsetof(GPUMaterial, armTextureIndex) == 80);
+static_assert(offsetof(GPUMaterial, preferARM) == 84);
+static_assert(offsetof(GPUMaterial, aoTextureIndex) == 88);
 static_assert(sizeof(ShadowConstants) == 256);
 static_assert(sizeof(ReflectionConstants) == 160);
 static_assert(sizeof(RayTracingInstanceData) == 32);
