@@ -16,6 +16,7 @@ class CommandContext
 
         bool Begin(unsigned int frameIndex);
         bool End();
+        bool AbortRecording();
 
         bool Execute(unsigned int frameIndex);
         bool WaitForGPU();

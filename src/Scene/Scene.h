@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <vector>
+#include <array>
 
 using RenderObjectID = std::size_t;
 
@@ -38,6 +39,20 @@ class Scene
         DirectionalLight& GetDirectionalLight();
         const DirectionalLight& GetDirectionalLight() const;
 
+        static constexpr std::size_t kDisplacementPatchCount = 64;
+
+        void SetDisplacementPatchLODs(
+            const std::array<std::uint32_t, kDisplacementPatchCount>& patchLODs)
+        {
+            m_displacementPatchLODs = patchLODs;
+        }
+
+        const std::array<std::uint32_t, kDisplacementPatchCount>&
+        GetDisplacementPatchLODs() const
+        {
+            return m_displacementPatchLODs;
+        }
+
     private:
         std::vector<RenderObject> m_renderObjects;
         std::vector<RenderObjectID> m_changedTransforms;
@@ -47,4 +62,8 @@ class Scene
 
         Camera m_camera;
         DirectionalLight m_directionalLight;
+
+        // Temporary camera-selected displacement LOD diagnostic.
+        std::array<std::uint32_t, kDisplacementPatchCount>
+            m_displacementPatchLODs{};
 };

@@ -1351,7 +1351,9 @@ void GIClosestHit(
         float handedness = objectTangent.w * (instanceDeterminant < 0.0f ? -1.0f : 1.0f);
         Texture2D<float4> normalTexture =
             ResourceDescriptorHeap[NonUniformResourceIndex(material.normalTextureIndex)];
-        float3 sampledNormal = normalTexture.SampleLevel(materialSampler, hitUV, 0.0f).rgb * 2.0f - 1.0f;
+        float2 normalXY = normalTexture.SampleLevel(materialSampler, hitUV, 0.0f).rg * 2.0f - 1.0f;
+        float normalZ = sqrt(saturate(1.0f - dot(normalXY, normalXY)));
+        float3 sampledNormal = float3(normalXY, normalZ);
         float sampledLengthSquared = dot(sampledNormal, sampledNormal);
         if(all(isfinite(worldNormal)) && all(isfinite(tangent)) &&
            isfinite(tangentLengthSquared) && tangentLengthSquared > 1.0e-8f &&
@@ -1359,6 +1361,7 @@ void GIClosestHit(
            sampledLengthSquared > 1.0e-8f && isfinite(handedness) && abs(handedness) > 1.0e-8f &&
            isfinite(instanceDeterminant) && instanceDeterminant != 0.0f)
         {
+            sampledNormal = normalize(sampledNormal);
             float3 T = normalize(tangent);
             float3 B = cross(worldNormal, T) * handedness;
             float3 worldMappedNormal = T * sampledNormal.x + B * sampledNormal.y + worldNormal * sampledNormal.z;

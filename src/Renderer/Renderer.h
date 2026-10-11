@@ -53,6 +53,7 @@
 #include <vector>
 #include <cstddef>
 #include <limits>
+#include <climits>
 
 struct EnvironmentAsset
 {
@@ -96,6 +97,13 @@ class Renderer
         void ResetSceneHistory();
 
         bool WaitForGPU();
+
+        bool ReplaceMeshGeometry(
+            Mesh& mesh,
+            const void* vertices,
+            size_t vertexCount,
+            const unsigned int* indices,
+            size_t indexCount);
 
         const std::vector<EnvironmentAsset>& GetAvailableEnvironments() const
         {
@@ -186,6 +194,10 @@ class Renderer
         UploadBuffer m_uploadBuffer;
         StructuredBuffer m_materialBuffer;
 
+        static constexpr unsigned int kDisplacementLODFrameCount = 2;
+
+        unsigned int m_displacementLODDescriptorIndices[kDisplacementLODFrameCount] = {UINT_MAX, UINT_MAX};
+
         EnvironmentMap m_environment;
         RenderTarget m_sceneColor;
         RenderTarget m_selectionMask;
@@ -194,6 +206,8 @@ class Renderer
         Texture m_ggxAverageAlbedoLUT;
 
         RayTracingSceneResources m_rayTracingScene;
+        bool m_geometryUpdateFailed = false;
+        bool m_pendingGeometryTLASRefresh[2]{};
 
         Matrix4 m_previousViewProjection{};
         Matrix4 m_previousView{};

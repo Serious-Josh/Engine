@@ -1,11 +1,17 @@
 #include "Engine.h"
+
 #include "Core/Log.h"
 #include "Core/Assert.h"
 #include "Core/Time.h"
+#include "Debug/CpuFrameTiming.h"
+
 #include "Scene/Scene.h"
+
 #include "DemoContent/SceneRegistry.h"
+#include "DemoContent/MirrorTestScene.h"
 
 #include <cstdlib>
+#include <chrono>
 
 bool Engine::Initialize()
 {
@@ -282,6 +288,57 @@ void Engine::Frame()
         }
 
         m_renderedSceneStructureRevision = activeScene.GetStructureRevision();
+    }
+
+    // Apply camera-selected displacement geometry before rendering.
+    if(auto* mirrorScene = dynamic_cast<MirrorTestScene*>(&activeDemo))
+    {
+        if(mirrorScene->HasPendingDisplacementGeometryUpdate())
+        {
+            DisplacementGeometry geometry{};
+
+            const auto generationStart = CpuTiming::Clock::now();
+            if(!mirrorScene->GenerateCameraDisplacementGeometry(geometry))
+            {
+                Log::Error("Failed to regenerate displacement geometry.");
+                m_window.Close();
+                return;
+            }
+
+            const auto generationEnd = CpuTiming::Clock::now();
+            const auto replacementStart = CpuTiming::Clock::now();
+            if(!m_renderer.ReplaceMeshGeometry(
+                mirrorScene->GetDisplacementTestMesh(),
+                geometry.vertices.data(),
+                geometry.vertices.size(),
+                geometry.indices.data(),
+                geometry.indices.size()))
+            {
+                Log::Error("Failed to replace displacement mesh geometry.");
+                m_window.Close();
+                return;
+            }
+
+            const auto replacementEnd = CpuTiming::Clock::now();
+            mirrorScene->MarkDisplacementGeometryUpdated();
+
+            // Temporary CPU timing for the camera-selected geometry update.
+            const double generationMs = std::chrono::duration<double, std::milli>(
+                generationEnd - generationStart).count();
+            const double replacementMs = std::chrono::duration<double, std::milli>(
+                replacementEnd - replacementStart).count();
+            const double totalMs = std::chrono::duration<double, std::milli>(
+                replacementEnd - generationStart).count();
+
+            Log::Info(
+                "Displacement geometry replaced: vertices=" +
+                std::to_string(geometry.vertices.size()) +
+                ", indices=" +
+                std::to_string(geometry.indices.size()) +
+                ", CPU generation ms=" + std::to_string(generationMs) +
+                ", mesh replacement ms=" + std::to_string(replacementMs) +
+                ", total geometry update ms=" + std::to_string(totalMs));
+        }
     }
 
     RendererOptions rendererOptions{};

@@ -3,6 +3,8 @@
 #include <d3d12.h>
 #include <cstddef>
 
+class DescriptorHeap;
+
 class UploadBuffer
 {
     public:
@@ -18,6 +20,18 @@ class UploadBuffer
         void Reset(unsigned int frameIndex);
 
         D3D12_GPU_VIRTUAL_ADDRESS Allocate(const void* data, std::size_t size, std::size_t alignment);
+
+        ID3D12Resource* GetResource() const
+        {
+            return m_resource;
+        };
+
+        bool CreateRawSRV(
+            ID3D12Device* device,
+            DescriptorHeap& descriptorHeap,
+            D3D12_GPU_VIRTUAL_ADDRESS gpuAddress,
+            std::size_t size,
+            unsigned int& descriptorIndex) const;
 
     private:
         ID3D12Resource* m_resource = nullptr;

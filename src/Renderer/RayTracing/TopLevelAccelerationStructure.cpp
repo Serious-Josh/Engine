@@ -301,6 +301,35 @@ bool TopLevelAccelerationStructure::Update(
     return true;
 }
 
+bool TopLevelAccelerationStructure::RefreshBLASReferences(
+    ID3D12GraphicsCommandList4* commandList,
+    unsigned int frameIndex,
+    const std::vector<RayTracingInstanceDescription>& instances,
+    const std::vector<const BottomLevelAccelerationStructure*>& bottomLevelStructures)
+{
+    if(!commandList ||
+       frameIndex >= FrameCount ||
+       instances.size() != m_instanceCount)
+    {
+        return false;
+    }
+
+    std::vector<std::size_t> changedInstanceIndices;
+    changedInstanceIndices.reserve(instances.size());
+
+    for(std::size_t i = 0; i < instances.size(); ++i)
+    {
+        changedInstanceIndices.push_back(i);
+    }
+
+    return Update(
+        commandList,
+        frameIndex,
+        instances,
+        changedInstanceIndices,
+        bottomLevelStructures);
+}
+
 void TopLevelAccelerationStructure::Shutdown()
 {
     for(unsigned int i = 0; i < FrameCount; ++i){

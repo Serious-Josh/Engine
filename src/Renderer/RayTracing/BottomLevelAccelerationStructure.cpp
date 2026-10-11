@@ -5,6 +5,7 @@
 
 #include <string>
 #include <vector>
+#include <utility>
 
 bool BottomLevelAccelerationStructure::Initialize(ID3D12Device5* device, ID3D12GraphicsCommandList4* commandList, const RayTracingBottomLevelDescription& description)
 {
@@ -97,6 +98,31 @@ bool BottomLevelAccelerationStructure::Initialize(ID3D12Device5* device, ID3D12G
     barrier.UAV.pResource = m_resource;
 
     commandList->ResourceBarrier(1, &barrier);
+
+    return true;
+}
+
+bool BottomLevelAccelerationStructure::Rebuild(
+    ID3D12Device5* device,
+    ID3D12GraphicsCommandList4* commandList,
+    const RayTracingBottomLevelDescription& description)
+{
+    if(!device || !commandList || !m_resource)
+    {
+        return false;
+    }
+
+    BottomLevelAccelerationStructure replacement;
+
+    if(!replacement.Initialize(device, commandList, description))
+    {
+        return false;
+    }
+
+    std::swap(m_resource, replacement.m_resource);
+    std::swap(m_scratchResource, replacement.m_scratchResource);
+
+    replacement.Shutdown();
 
     return true;
 }

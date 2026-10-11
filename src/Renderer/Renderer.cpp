@@ -540,7 +540,15 @@ void Renderer::Draw(ID3D12GraphicsCommandList* commandList, const RenderObject& 
     materialConstants.baseColor[1] = object.material->baseColor[1];
     materialConstants.baseColor[2] = object.material->baseColor[2];
 
-    commandList->SetGraphicsRoot32BitConstants(0, 8, &materialConstants, 0);
+    commandList->SetGraphicsRoot32BitConstants(
+        0, 8, &materialConstants, 0);
+
+    const unsigned int displacementLODDescriptorIndex =
+        m_displacementLODDescriptorIndices[
+            m_swapChain.GetCurrentBackBufferIndex()];
+
+    commandList->SetGraphicsRoot32BitConstants(
+        0, 1, &displacementLODDescriptorIndex, 8);
 
     commandList->SetGraphicsRootConstantBufferView(1, cameraConstantsAddress);
     commandList->SetGraphicsRootConstantBufferView(2, objectConstantsAddress);
@@ -844,6 +852,14 @@ void Renderer::ResetSceneHistory()
 
 bool Renderer::Render(const Scene& scene, const RendererOptions& options)
 {
+    if(m_geometryUpdateFailed)
+    {
+        Log::Error(
+            "Rendering disabled: a geometry update failed and "
+            "ray tracing scene consistency cannot be guaranteed.");
+        return false;
+    }
+
     const bool hasPreviousExecute = m_hasPreviousRenderExecute;
     // Any early return breaks the sequence; only a completed frame re-arms it.
     m_hasPreviousRenderExecute = false;
@@ -931,19 +947,57 @@ bool Renderer::Render(const Scene& scene, const RendererOptions& options)
 
     m_uploadBuffer.Reset(frameIndex);
 
+    // Camera-selected displacement LODs.
+    // Diagnostic only; does not modify geometry.
+    const auto& diagnosticPatchLODs =
+        scene.GetDisplacementPatchLODs();
+
+    const D3D12_GPU_VIRTUAL_ADDRESS diagnosticLODAddress =
+        m_uploadBuffer.Allocate(
+            diagnosticPatchLODs.data(),
+            sizeof(diagnosticPatchLODs),
+            256);
+
+    if(diagnosticLODAddress == 0)
+    {
+        Log::Error("Failed to allocate displacement LOD diagnostic data.");
+        return false;
+    }
+
+    unsigned int& diagnosticLODDescriptorIndex =
+        m_displacementLODDescriptorIndices[frameIndex];
+
+    if(diagnosticLODDescriptorIndex == UINT_MAX)
+    {
+        if(!m_uploadBuffer.CreateRawSRV(
+            m_graphicsDevice.GetDevice(),
+            m_resourceDescriptorHeap,
+            diagnosticLODAddress,
+            sizeof(diagnosticPatchLODs),
+            diagnosticLODDescriptorIndex))
+        {
+            Log::Error(
+                "Failed to create displacement LOD diagnostic SRV.");
+            return false;
+        }
+    }
+
     const bool tlasNeedsUpdate = !scene.GetChangedTransforms().empty();
 
-    m_debugUI.SetTLASUpdated(tlasNeedsUpdate);
+    m_debugUI.SetTLASUpdated(tlasNeedsUpdate || m_pendingGeometryTLASRefresh[frameIndex]);
 
-    if(tlasNeedsUpdate){
+    if(tlasNeedsUpdate || m_pendingGeometryTLASRefresh[frameIndex]){
         m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::TlasUpdate);
         const bool updated = m_rayTracingScene.Update(m_commandContext.GetRayTracingCommandList(), frameIndex, scene);
         m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::TlasUpdate);
+
         if(!updated)
         {
             Log::Error("Failed to update ray tracing scene.");
             return false;
         }
+
+        m_pendingGeometryTLASRefresh[frameIndex] = false;
     }
 
     const Camera& camera = scene.GetCamera();
@@ -1804,6 +1858,15 @@ void Renderer::Shutdown()
     m_shadowDenoisePass.Shutdown();
     m_selectionMaskPass.Shutdown();
 
+    for(unsigned int& descriptorIndex : m_displacementLODDescriptorIndices)
+    {
+        if(descriptorIndex != UINT_MAX)
+        {
+            m_resourceDescriptorHeap.Free(descriptorIndex);
+            descriptorIndex = UINT_MAX;
+        }
+    }
+
     m_uploadBuffer.Shutdown();
     m_environment.Shutdown();
     m_sceneColor.Shutdown();
@@ -1820,6 +1883,104 @@ void Renderer::Shutdown()
     Log::Info("Renderer shutdown: resources released.");
 
     m_graphicsDevice.Shutdown();
+}
+
+bool Renderer::ReplaceMeshGeometry(
+    Mesh& mesh,
+    const void* vertices,
+    size_t vertexCount,
+    const unsigned int* indices,
+    size_t indexCount)
+{
+    if(m_geometryUpdateFailed)
+        return false;
+
+    // No outstanding graphics work may reference the old buffers or BLAS.
+    if(!m_commandContext.WaitForGPU())
+    {
+        m_geometryUpdateFailed = true;
+        return false;
+    }
+
+    // Failure before this point leaves the existing geometry intact.
+    if(!mesh.ReplaceGeometry(
+        m_graphicsDevice.GetDevice(),
+        m_resourceUploader,
+        m_resourceDescriptorHeap,
+        vertices,
+        vertexCount,
+        indices,
+        indexCount))
+    {
+        // Conservatively stop rendering: a partial replacement must
+        // never be followed by ray tracing against stale geometry.
+        m_geometryUpdateFailed = true;
+        return false;
+    }
+
+    // From here onward, the existing BLAS must not be used again
+    // until the replacement and TLAS refresh complete.
+    m_geometryUpdateFailed = true;
+
+    constexpr unsigned int buildFrameIndex = 0;
+
+    if(!m_commandContext.Begin(buildFrameIndex))
+    {
+        Log::Error("Failed to begin geometry acceleration structure update.");
+        return false;
+    }
+
+    ID3D12GraphicsCommandList4* commandList =
+        m_commandContext.GetRayTracingCommandList();
+
+    if(!m_rayTracingScene.RebuildMeshBLAS(
+        m_graphicsDevice.GetRayTracingDevice(),
+        commandList,
+        &mesh))
+    {
+        m_commandContext.AbortRecording();
+        Log::Error("Failed to rebuild mesh BLAS.");
+        return false;
+    }
+
+    if(!m_rayTracingScene.RefreshTLASReferences(
+        commandList,
+        buildFrameIndex))
+    {
+        m_commandContext.AbortRecording();
+        Log::Error("Failed to refresh TLAS references.");
+        return false;
+    }
+
+    if(!m_commandContext.End())
+    {
+        Log::Error("Failed to close geometry update command list.");
+        return false;
+    }
+
+    const bool submitted =
+        m_commandContext.Execute(buildFrameIndex);
+
+    // Execute() may fail after GPU submission. Always attempt to drain.
+    if(!m_commandContext.WaitForGPU())
+    {
+        Log::Error("GPU completion unconfirmed after geometry update.");
+        return false;
+    }
+
+    if(!submitted)
+    {
+        Log::Error("Geometry update submission failed.");
+        return false;
+    }
+
+    ResetSceneHistory();
+
+    m_pendingGeometryTLASRefresh[0] = true;
+    m_pendingGeometryTLASRefresh[1] = true;
+    m_geometryUpdateFailed = false;
+
+    return true;
 }
 
 bool Renderer::WaitForGPU()

@@ -24,6 +24,13 @@ class TopLevelAccelerationStructure
             const std::vector<RayTracingInstanceDescription>& instances,
             const std::vector<std::size_t>& changedInstanceIndices,
             const std::vector<const BottomLevelAccelerationStructure*>& bottomLevelStructures);
+
+        bool RefreshBLASReferences(
+            ID3D12GraphicsCommandList4* commandList,
+            unsigned int frameIndex,
+            const std::vector<RayTracingInstanceDescription>& instances,
+            const std::vector<const BottomLevelAccelerationStructure*>& bottomLevelStructures);
+
         void Shutdown();
 
         D3D12_GPU_VIRTUAL_ADDRESS GetGPUAddress() const;

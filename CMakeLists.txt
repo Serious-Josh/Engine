@@ -77,6 +77,7 @@ add_executable(Engine
     src/Debug/DebugUI.cpp
     src/Scene/Scene.cpp
     src/Renderer/Geometry/SphereGenerator.cpp
+    src/Renderer/Geometry/DisplacementMeshGenerator.cpp
     src/Renderer/StructuredBuffer.cpp
     src/Renderer/ImageLoader.cpp
     src/Renderer/Passes/ToneMapPass.cpp

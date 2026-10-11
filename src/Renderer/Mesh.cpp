@@ -7,6 +7,8 @@
 #include <cstring>
 #include <limits>
 #include <string_view>
+#include <cstdint>
+#include <climits>
 
 namespace{
     MeshBounds CalculateBounds(const void* vertices, size_t vertexCount, const VertexLayout& layout)
@@ -128,6 +130,104 @@ bool Mesh::Initialize(ID3D12Device* device, ResourceUploader& uploader, Descript
 
     m_indexBufferView.BufferLocation = m_indexBuffer.GetGPUAddress();
     m_indexBufferView.SizeInBytes = static_cast<UINT>(indexCount * sizeof(unsigned int));
+    m_indexBufferView.Format = DXGI_FORMAT_R32_UINT;
+
+    return true;
+}
+
+bool Mesh::ReplaceGeometry(
+    ID3D12Device* device,
+    ResourceUploader& uploader,
+    DescriptorHeap& descriptorHeap,
+    const void* vertices,
+    size_t vertexCount,
+    const unsigned int* indices,
+    size_t indexCount)
+{
+    (void)descriptorHeap;
+
+    const size_t stride = m_layout.GetStride();
+
+    if(!device || !vertices || !indices ||
+       vertexCount == 0 || indexCount == 0 ||
+       !IsIndexed() ||
+       stride == 0 ||
+       stride > UINT_MAX ||
+       vertexCount > UINT_MAX / stride ||
+       indexCount > UINT_MAX / sizeof(unsigned int) ||
+       m_vertexBuffer.GetDescriptorIndex() == UINT_MAX ||
+       m_indexBuffer.GetDescriptorIndex() == UINT_MAX)
+    {
+        return false;
+    }
+
+    const MeshBounds newBounds = CalculateBounds(vertices, vertexCount, m_layout);
+
+    if(!newBounds.valid)
+    {
+        return false;
+    }
+
+    const size_t vertexBytes = vertexCount * stride;
+    const size_t indexBytes = indexCount * sizeof(unsigned int);
+
+    const D3D12_RESOURCE_STATES vertexState =
+        D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER |
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+
+    const D3D12_RESOURCE_STATES indexState =
+        D3D12_RESOURCE_STATE_INDEX_BUFFER |
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+
+    Buffer preparedVertices;
+    Buffer preparedIndices;
+
+    if(!m_vertexBuffer.PrepareReplacement(
+        device, uploader, vertices, vertexBytes,
+        vertexState, preparedVertices))
+    {
+        return false;
+    }
+
+    if(!m_indexBuffer.PrepareReplacement(
+        device, uploader, indices, indexBytes,
+        indexState, preparedIndices))
+    {
+        preparedVertices.Shutdown();
+        return false;
+    }
+
+    // Both allocations and uploads have succeeded.
+    // The caller must have drained rendering GPU work
+    // before this method is invoked.
+
+    const bool vertexCommitted =
+        m_vertexBuffer.CommitReplacement(
+            device, preparedVertices);
+
+    const bool indexCommitted =
+        vertexCommitted &&
+        m_indexBuffer.CommitReplacement(
+            device, preparedIndices);
+
+    preparedVertices.Shutdown();
+    preparedIndices.Shutdown();
+
+    if(!vertexCommitted || !indexCommitted)
+    {
+        return false;
+    }
+
+    m_vertexCount = vertexCount;
+    m_indexCount = indexCount;
+    m_bounds = newBounds;
+
+    m_vertexBufferView.BufferLocation = m_vertexBuffer.GetGPUAddress();
+    m_vertexBufferView.StrideInBytes = static_cast<UINT>(stride);
+    m_vertexBufferView.SizeInBytes = static_cast<UINT>(vertexBytes);
+    
+    m_indexBufferView.BufferLocation = m_indexBuffer.GetGPUAddress();
+    m_indexBufferView.SizeInBytes = static_cast<UINT>(indexBytes);
     m_indexBufferView.Format = DXGI_FORMAT_R32_UINT;
 
     return true;

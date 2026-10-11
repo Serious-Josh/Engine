@@ -7,6 +7,7 @@
 #include "Renderer/Vertex.h"
 #include "Renderer/TangentGenerator.h"
 #include "Renderer/Geometry/SphereGenerator.h"
+#include "Renderer/Geometry/DisplacementMeshGenerator.h"
 #include "Renderer/DDSLoader.h"
 
 #include "Scene/Camera.h"
@@ -15,6 +16,12 @@
 #include "Core/Log.h"
 
 #include <cstdint>
+#include <array>
+#include <vector>
+#include <algorithm>
+#include <limits>
+#include <cmath>
+#include <utility>
 
 REGISTER_DEMO_SCENE("Mirror Test", MirrorTestScene);
 
@@ -47,7 +54,7 @@ bool MirrorTestScene::Initialize(
         {
             RootParameterType::Constants,
             0,
-            8,
+            9,
             D3D12_SHADER_VISIBILITY_PIXEL
         });
 
@@ -134,6 +141,151 @@ bool MirrorTestScene::Initialize(
         return false;
     }
 
+    // Temporary CPU displacement heightmap validation.
+    DirectX::ScratchImage displacementDDS;
+
+    if(!DDSLoader::Load(
+        "assets/Textures/Materials/stacked_brick_wall_disp_4k.dds",
+        displacementDDS))
+    {
+        return false;
+    }
+
+    const DirectX::TexMetadata& displacementMetadata =
+        displacementDDS.GetMetadata();
+
+    if(displacementMetadata.format != DXGI_FORMAT_BC4_UNORM)
+    {
+        Log::Error("Displacement heightmap must use BC4 UNORM.");
+        return false;
+    }
+
+    DirectX::ScratchImage decompressedHeightmap;
+
+    constexpr std::size_t displacementMip = 4;
+
+    if(displacementMetadata.mipLevels <= displacementMip)
+    {
+        Log::Error("Displacement DDS does not contain mip level 5.");
+        return false;
+    }
+
+    const DirectX::Image* sourceHeightImage =
+        displacementDDS.GetImage(displacementMip, 0, 0);
+
+    if(!sourceHeightImage)
+    {
+        Log::Error("Displacement DDS has no base mip.");
+        return false;
+    }
+
+    const HRESULT decompressResult = DirectX::Decompress(
+        *sourceHeightImage,
+        DXGI_FORMAT_R8_UNORM,
+        decompressedHeightmap);
+
+    if(FAILED(decompressResult))
+    {
+        Log::Error("Failed to decompress displacement heightmap.");
+        return false;
+    }
+
+    const DirectX::Image* heightImage =
+        decompressedHeightmap.GetImage(0, 0, 0);
+
+    if(!heightImage || !heightImage->pixels)
+    {
+        Log::Error("Displacement heightmap has no valid pixels.");
+        return false;
+    }
+
+    std::uint8_t minHeight = 255;
+    std::uint8_t maxHeight = 0;
+
+    for(std::size_t y = 0; y < heightImage->height; ++y)
+    {
+        const std::uint8_t* row =
+            heightImage->pixels + y * heightImage->rowPitch;
+
+        for(std::size_t x = 0; x < heightImage->width; ++x)
+        {
+            const std::uint8_t value = row[x];
+
+            minHeight = (std::min)(minHeight, value);
+            maxHeight = (std::max)(maxHeight, value);
+        }
+    }
+
+    Log::Info(
+        "Displacement heightmap: " +
+        std::to_string(heightImage->width) + "x" +
+        std::to_string(heightImage->height) +
+        ", min=" + std::to_string(minHeight) +
+        ", max=" + std::to_string(maxHeight));
+
+
+    m_displacementHeightWidth = heightImage->width;
+    m_displacementHeightHeight = heightImage->height;
+    m_displacementHeightRowPitch = heightImage->rowPitch;
+
+    const std::size_t heightDataSize =
+        m_displacementHeightRowPitch * m_displacementHeightHeight;
+
+    m_displacementHeightPixels.assign(
+        heightImage->pixels,
+        heightImage->pixels + heightDataSize);
+
+    const DisplacementHeightmap heightmap{
+        m_displacementHeightPixels.data(),
+        m_displacementHeightWidth,
+        m_displacementHeightHeight,
+        m_displacementHeightRowPitch
+    };
+
+    DisplacementMeshSettings displacementSettings{};
+    std::array<std::uint32_t, 8 * 8> patchLODs{};
+    // Match the generator's patchX * patchesPerAxis + patchZ ordering.
+    patchLODs[3 * 8 + 3] = 1u;
+    patchLODs[4 * 8 + 3] = 1u;
+    patchLODs[3 * 8 + 4] = 1u;
+    displacementSettings.patchLODs = patchLODs;
+    DisplacementGeometry displacement =
+        DisplacementMeshGenerator::Generate(heightmap, displacementSettings);
+
+    auto& gridVertices = displacement.vertices;
+    auto& gridIndices = displacement.indices;
+
+    Log::Info("Displacement geometry: vertices=" + std::to_string(gridVertices.size()) +
+        ", indices=" + std::to_string(gridIndices.size()) +
+        ", triangles=" + std::to_string(gridIndices.size() / 3) +
+        ", patches=" + std::to_string(displacement.patches.size()));
+
+    if(gridVertices.empty() || gridIndices.empty() || gridIndices.size() % 3 != 0 ||
+       displacement.patches.size() != displacementSettings.patchesPerAxis * displacementSettings.patchesPerAxis ||
+       std::any_of(gridIndices.begin(), gridIndices.end(),
+           [&](std::uint32_t index) { return index >= gridVertices.size(); }))
+    {
+        Log::Error("Unexpected displacement prototype geometry counts.");
+        return false;
+    }
+
+    TangentGenerator::GenerateTangents(
+        gridVertices,
+        gridIndices);
+
+    if(!m_displacementTestMesh.Initialize(
+        device,
+        uploader,
+        descriptorHeap,
+        gridVertices.data(),
+        gridVertices.size(),
+        m_vertexLayout,
+        gridIndices.data(),
+        gridIndices.size()))
+    {
+        return false;
+    }
+
     // Brick diffuse texture — BC1 with sRGB sampling.
     if(!DDSLoader::LoadTexture(
         device,
@@ -182,7 +334,6 @@ bool MirrorTestScene::Initialize(
     {
         return false;
     }
-
 
     // Brick normal map — BC5 with linear sampling.
     if(!DDSLoader::LoadTexture(
@@ -271,6 +422,11 @@ bool MirrorTestScene::Initialize(
     m_coloredMaterial.baseColor[0] = 1.0f;
     m_coloredMaterial.baseColor[1] = 0.02f;
     m_coloredMaterial.baseColor[2] = 0.02f;
+
+    m_displacementMaterial = m_coloredMaterial;
+    m_displacementMaterial.normalTexture = &m_normalTexture;
+    m_displacementMaterial.armTexture = nullptr;
+    m_displacementMaterial.preferARM = false;
 
 
     // Floor material
@@ -394,6 +550,18 @@ bool MirrorTestScene::Initialize(
 
     m_scene.AddRenderObject(floor);
 
+    // Temporary geometry-displacement test surface.
+    RenderObject displacementTest{};
+
+    displacementTest.mesh = &m_displacementTestMesh;
+    displacementTest.material = &m_displacementMaterial;
+
+    displacementTest.transform.position = Vector3{0.0f, -0.8f, 0.0f};
+
+    displacementTest.transform.scale = Vector3{1.0f, 1.0f, 1.0f};
+
+    m_scene.AddRenderObject(displacementTest);
+
     ResetCamera();
     ResetDirectionalLight();
 
@@ -412,6 +580,12 @@ void MirrorTestScene::Shutdown()
 
     m_sphereMesh.Shutdown();
     m_planeMesh.Shutdown();
+    m_displacementTestMesh.Shutdown();
+
+    m_displacementHeightPixels.clear();
+    m_displacementHeightWidth = 0;
+    m_displacementHeightHeight = 0;
+    m_displacementHeightRowPitch = 0;
 
     m_pipeline.Shutdown();
 }
@@ -419,6 +593,127 @@ void MirrorTestScene::Shutdown()
 void MirrorTestScene::Update(float deltaTime)
 {
     (void)deltaTime;
+
+    const Vector3& cameraPosition =
+        m_scene.GetCamera().GetPosition();
+
+    constexpr float lodDistance = 3.0f;
+    constexpr float lodDistanceSquared =
+        lodDistance * lodDistance;
+
+    constexpr float surfaceMin = -1.0f;
+    constexpr float surfaceSize = 2.0f;
+    constexpr float surfaceY = -0.8f;
+
+    constexpr float patchSize =
+        surfaceSize / static_cast<float>(kDisplacementPatchesPerAxis);
+
+    for(std::uint32_t patchX = 0;
+        patchX < kDisplacementPatchesPerAxis;
+        ++patchX)
+    {
+        for(std::uint32_t patchZ = 0;
+            patchZ < kDisplacementPatchesPerAxis;
+            ++patchZ)
+        {
+            const float centerX =
+                surfaceMin + (static_cast<float>(patchX) + 0.5f) * patchSize;
+
+            const float centerZ =
+                surfaceMin + (static_cast<float>(patchZ) + 0.5f) * patchSize;
+
+            const float dx = cameraPosition.x - centerX;
+            const float dy = cameraPosition.y - surfaceY;
+            const float dz = cameraPosition.z - centerZ;
+
+            const float distanceSquared =
+                dx * dx + dy * dy + dz * dz;
+
+            const std::uint32_t lod =
+                distanceSquared < lodDistanceSquared ? 0u : 1u;
+
+            const std::size_t patchIndex =
+                patchX * kDisplacementPatchesPerAxis + patchZ;
+
+            m_cameraPatchLODs[patchIndex] = lod;
+        }
+    }
+
+    const bool lodMapChanged =
+        !m_cameraPatchLODsInitialized ||
+        m_cameraPatchLODs != m_scene.GetDisplacementPatchLODs();
+
+    m_cameraPatchLODsInitialized = true;
+
+    if(lodMapChanged)
+    {
+        m_scene.SetDisplacementPatchLODs(m_cameraPatchLODs);
+        m_displacementGeometryUpdatePending = true;
+
+        Log::Info("Displacement camera LOD map changed.");
+    }
+}
+
+bool MirrorTestScene::GenerateCameraDisplacementGeometry(DisplacementGeometry& geometry) const
+{
+    if(!m_cameraPatchLODsInitialized ||
+       m_displacementHeightPixels.empty() ||
+       m_displacementHeightWidth == 0 ||
+       m_displacementHeightHeight == 0)
+    {
+        return false;
+    }
+
+    const DisplacementHeightmap heightmap{
+        m_displacementHeightPixels.data(),
+        m_displacementHeightWidth,
+        m_displacementHeightHeight,
+        m_displacementHeightRowPitch
+    };
+
+    DisplacementMeshSettings settings{};
+    settings.patchesPerAxis = kDisplacementPatchesPerAxis;
+    settings.patchLODs = m_cameraPatchLODs;
+
+    DisplacementGeometry generated = DisplacementMeshGenerator::Generate(heightmap, settings);
+
+    if(generated.vertices.empty() ||
+       generated.indices.empty() ||
+       generated.indices.size() % 3 != 0 ||
+       generated.patches.size() != m_cameraPatchLODs.size() ||
+       std::any_of(
+           generated.indices.begin(),
+           generated.indices.end(),
+           [&](std::uint32_t index)
+           {
+               return index >= generated.vertices.size();
+           }))
+    {
+        Log::Error("Failed to generate camera-selected displacement geometry.");
+        return false;
+    }
+
+    TangentGenerator::GenerateTangents(
+        generated.vertices,
+        generated.indices);
+
+    geometry = std::move(generated);
+    return true;
+}
+
+bool MirrorTestScene::HasPendingDisplacementGeometryUpdate() const
+{
+    return m_displacementGeometryUpdatePending;
+}
+
+Mesh& MirrorTestScene::GetDisplacementTestMesh()
+{
+    return m_displacementTestMesh;
+}
+
+void MirrorTestScene::MarkDisplacementGeometryUpdated()
+{
+    m_displacementGeometryUpdatePending = false;
 }
 
 void MirrorTestScene::SetAspectRatio(float aspectRatio)
@@ -442,6 +737,7 @@ std::vector<Material*> MirrorTestScene::GetMaterials()
         &m_mirrorAMaterial,
         &m_mirrorBMaterial,
         &m_coloredMaterial,
+        &m_displacementMaterial,
         &m_floorMaterial
     };
 }

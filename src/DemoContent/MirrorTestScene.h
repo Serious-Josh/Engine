@@ -12,7 +12,11 @@
 
 #include "DemoContent/IDemoScene.h"
 
+#include "Renderer/Geometry/DisplacementMeshGenerator.h"
+
 #include <vector>
+#include <array>
+#include <cstdint>
 
 class Shader;
 class ResourceUploader;
@@ -42,11 +46,24 @@ public:
     void ResetCamera() override;
     void ResetDirectionalLight() override;
 
+    bool GenerateCameraDisplacementGeometry(DisplacementGeometry& geometry) const;
+
+    bool HasPendingDisplacementGeometryUpdate() const;
+    Mesh& GetDisplacementTestMesh();
+    void MarkDisplacementGeometryUpdated();
+
 private:
     VertexLayout m_vertexLayout;
 
     Mesh m_sphereMesh;
     Mesh m_planeMesh;
+    Mesh m_displacementTestMesh;
+
+    // CPU heightmap retained for runtime displacement regeneration.
+    std::vector<std::uint8_t> m_displacementHeightPixels;
+    std::size_t m_displacementHeightWidth = 0;
+    std::size_t m_displacementHeightHeight = 0;
+    std::size_t m_displacementHeightRowPitch = 0;
 
     Texture m_sphereTexture;
     Texture m_normalTexture;
@@ -60,6 +77,18 @@ private:
     Material m_mirrorBMaterial;
     Material m_coloredMaterial;
     Material m_floorMaterial;
+    Material m_displacementMaterial;
 
     Scene m_scene;
+
+    // Diagnostic camera-selected displacement LODs.
+    // Does not affect the currently rendered mesh.
+    static constexpr std::uint32_t kDisplacementPatchesPerAxis = 8;
+
+    std::array<std::uint32_t,
+        kDisplacementPatchesPerAxis * kDisplacementPatchesPerAxis>
+        m_cameraPatchLODs{};
+
+    bool m_cameraPatchLODsInitialized = false;
+    bool m_displacementGeometryUpdatePending = false;
 };

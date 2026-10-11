@@ -19,6 +19,15 @@ class RayTracingSceneResources
     public:
         bool Initialize(ID3D12Device5* device, ID3D12GraphicsCommandList4* commandList, ResourceUploader& uploader, DescriptorHeap& descriptorHeap, const Scene& scene);
         bool Update(ID3D12GraphicsCommandList4* commandList, unsigned int frameIndex, const Scene& scene);
+        bool RebuildMeshBLAS(
+            ID3D12Device5* device,
+            ID3D12GraphicsCommandList4* commandList,
+            const Mesh* mesh);
+
+        bool RefreshTLASReferences(
+            ID3D12GraphicsCommandList4* commandList,
+            unsigned int frameIndex);
+
         void Shutdown();
 
         const TopLevelAccelerationStructure& GetTopLevel() const;

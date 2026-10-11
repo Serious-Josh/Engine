@@ -1,5 +1,7 @@
 #include "UploadBuffer.h"
+#include "DescriptorHeap.h"
 
+#include <climits>
 #include <cstring>
 
 static std::size_t AlignUp(std::size_t value, std::size_t alignment)
@@ -96,4 +98,63 @@ D3D12_GPU_VIRTUAL_ADDRESS UploadBuffer::Allocate(const void* data, std::size_t s
     m_offset = alignedOffset + size;
 
     return gpuAddress;
+}
+
+bool UploadBuffer::CreateRawSRV(
+    ID3D12Device* device,
+    DescriptorHeap& descriptorHeap,
+    D3D12_GPU_VIRTUAL_ADDRESS gpuAddress,
+    std::size_t size,
+    unsigned int& descriptorIndex) const
+{
+    descriptorIndex = UINT_MAX;
+
+    if(!device || !m_resource || size == 0 ||
+       size % sizeof(std::uint32_t) != 0)
+    {
+        return false;
+    }
+
+    const D3D12_GPU_VIRTUAL_ADDRESS baseAddress = m_resource->GetGPUVirtualAddress();
+
+    if(gpuAddress < baseAddress)
+    {
+        return false;
+    }
+
+    const UINT64 offset = gpuAddress - baseAddress;
+    const UINT64 capacity = m_resource->GetDesc().Width;
+
+    if(offset % sizeof(std::uint32_t) != 0 ||
+       offset > capacity ||
+       size > capacity - offset ||
+       size / sizeof(std::uint32_t) > UINT_MAX)
+    {
+        return false;
+    }
+
+    const unsigned int index = descriptorHeap.Allocate();
+
+    if(index == UINT_MAX)
+    {
+        return false;
+    }
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    srv.Format = DXGI_FORMAT_R32_TYPELESS;
+    srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+
+    srv.Buffer.FirstElement = offset / sizeof(std::uint32_t);
+    srv.Buffer.NumElements = static_cast<UINT>(size / sizeof(std::uint32_t));
+    srv.Buffer.StructureByteStride = 0;
+    srv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+
+    device->CreateShaderResourceView(
+        m_resource,
+        &srv,
+        descriptorHeap.GetCPUHandle(index));
+
+    descriptorIndex = index;
+    return true;
 }

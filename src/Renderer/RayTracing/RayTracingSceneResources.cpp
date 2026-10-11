@@ -188,6 +188,64 @@ bool RayTracingSceneResources::Update(ID3D12GraphicsCommandList4* commandList, u
     return m_topLevel.Update(commandList, frameIndex, m_instances, changedInstanceIndices, m_bottomLevelPointers);
 }
 
+bool RayTracingSceneResources::RebuildMeshBLAS(
+    ID3D12Device5* device,
+    ID3D12GraphicsCommandList4* commandList,
+    const Mesh* mesh)
+{
+    if(!device || !commandList || !mesh)
+    {
+        return false;
+    }
+
+    const auto it = m_meshToBottomLevel.find(mesh);
+
+    if(it == m_meshToBottomLevel.end())
+    {
+        return false;
+    }
+
+    const std::size_t bottomLevelIndex = it->second;
+
+    if(bottomLevelIndex >= m_bottomLevels.size() ||
+       !m_bottomLevels[bottomLevelIndex])
+    {
+        return false;
+    }
+
+    RayTracingBottomLevelDescription description{};
+
+    RayTracingGeometryDescription geometry{};
+    geometry.mesh = mesh;
+    geometry.opaque = true;
+
+    description.geometries.push_back(geometry);
+
+    description.buildPreference = RayTracingAccelerationStructureBuildPreference::FastTrace;
+
+    return m_bottomLevels[bottomLevelIndex]->Rebuild(
+        device,
+        commandList,
+        description);
+}
+
+bool RayTracingSceneResources::RefreshTLASReferences(
+    ID3D12GraphicsCommandList4* commandList,
+    unsigned int frameIndex)
+{
+    if(!commandList || m_instances.empty() ||
+       m_bottomLevelPointers.empty())
+    {
+        return false;
+    }
+
+    return m_topLevel.RefreshBLASReferences(
+        commandList,
+        frameIndex,
+        m_instances,
+        m_bottomLevelPointers);
+}
+
 void RayTracingSceneResources::Shutdown()
 {
     m_topLevel.Shutdown();

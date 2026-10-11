@@ -211,6 +211,18 @@ bool CommandContext::End()
     return SUCCEEDED(m_commandList->Close());
 }
 
+bool CommandContext::AbortRecording()
+{
+    if(!m_commandList)
+    {
+        return false;
+    }
+
+    // Close the command list without submitting it.
+    // The next Begin() will reset it.
+    return SUCCEEDED(m_commandList->Close());
+}
+
 bool CommandContext::Execute(unsigned int frameIndex)
 {
     if(frameIndex >= FrameCount){

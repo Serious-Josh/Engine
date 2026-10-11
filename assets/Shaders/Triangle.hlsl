@@ -1,5 +1,8 @@
 #include "MaterialLighting.hlsli"
 
+#define DEBUG_DISPLACEMENT_PATCH_LOD 1
+#define DEBUG_DISPLACEMENT_TEST_LOD 1
+
 struct VSInput
 {
     float3 position : POSITION;
@@ -36,6 +39,7 @@ cbuffer MaterialConstants : register(b0)
 
     float3 baseColor;
     uint roughnessTextureIndex;
+    uint displacementLODDescriptorIndex;
 }
 
 cbuffer CameraConstants : register(b1)
@@ -128,6 +132,29 @@ PSOutput PSMain(VSOutput input)
         baseColor *
         sampledBaseColor;
 
+#if DEBUG_DISPLACEMENT_PATCH_LOD
+    // Temporary MirrorTestScene assumption; index 3 may identify unrelated materials in other scenes.
+    if(materialIndex == 3u)
+    {
+        uint2 patchCoord = min(
+            uint2(saturate(input.uv) * 8.0f),
+            uint2(7u, 7u));
+        uint patchIndex = patchCoord.x * 8u + patchCoord.y;
+        ByteAddressBuffer patchLODs =
+            ResourceDescriptorHeap[displacementLODDescriptorIndex];
+        uint patchLOD = patchLODs.Load(patchIndex * 4u);
+        switch(patchLOD)
+        {
+            case 0u: finalBaseColor = float3(0.1f, 0.9f, 0.2f); break;
+            case 1u: finalBaseColor = float3(1.0f, 0.9f, 0.0f); break;
+            case 2u: finalBaseColor = float3(1.0f, 0.5f, 0.0f); break;
+            case 3u: finalBaseColor = float3(1.0f, 0.1f, 0.1f); break;
+            case 4u: finalBaseColor = float3(0.6f, 0.2f, 1.0f); break;
+            case 5u: finalBaseColor = float3(0.0f, 0.9f, 0.9f); break;
+        }
+    }
+#endif
+
     bool useARM = material.armTextureIndex != 0xFFFFFFFFu && material.preferARM != 0u;
     float2 armRoughnessMetallic = float2(1.0f, 1.0f);
     float materialAO = 1.0f;
@@ -171,6 +198,7 @@ PSOutput PSMain(VSOutput input)
     {
         Texture2D<float4> normalTexture = ResourceDescriptorHeap[normalTextureIndex];
         float2 normalXY = normalTexture.Sample(sampler0, input.uv).rg * 2.0f - 1.0f;
+        normalXY *= 0.5f;
         float normalZ = sqrt(saturate(1.0f - dot(normalXY, normalXY)));
         float3 sampledNormal = float3(normalXY, normalZ);
         float3 tangent = input.worldTangent.xyz - N * dot(N, input.worldTangent.xyz);

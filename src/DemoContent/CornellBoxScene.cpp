@@ -54,7 +54,7 @@ bool CornellBoxScene::Initialize(
         {
             RootParameterType::Constants,
             0,
-            8,
+            9,
             D3D12_SHADER_VISIBILITY_PIXEL
         });
 

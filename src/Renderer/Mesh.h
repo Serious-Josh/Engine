@@ -27,6 +27,15 @@ class Mesh
 
         bool Initialize(ID3D12Device* device, ResourceUploader& uploader, DescriptorHeap& descriptorHeap, const void* vertices, size_t vertexCount, const VertexLayout& layout);
         bool Initialize(ID3D12Device* device, ResourceUploader& uploader, DescriptorHeap& descriptorHeap, const void* vertices, size_t vertexCount, const VertexLayout& layout, const unsigned int* indices, size_t indexCount);
+        bool ReplaceGeometry(
+            ID3D12Device* device,
+            ResourceUploader& uploader,
+            DescriptorHeap& descriptorHeap,
+            const void* vertices,
+            size_t vertexCount,
+            const unsigned int* indices,
+            size_t indexCount);
+            
         void Shutdown();
         void Bind(ID3D12GraphicsCommandList* commandList) const;
 

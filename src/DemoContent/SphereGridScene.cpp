@@ -33,7 +33,7 @@ bool SphereGridScene::Initialize(ID3D12Device* device, ResourceUploader& uploade
     pipelineDescription.renderTargets.formats[2] = DXGI_FORMAT_R16G16B16A16_FLOAT;
     pipelineDescription.renderTargets.formats[3] = DXGI_FORMAT_R16G16B16A16_FLOAT;
 
-    pipelineDescription.rootParameters.push_back({RootParameterType::Constants, 0, 8, D3D12_SHADER_VISIBILITY_PIXEL});
+    pipelineDescription.rootParameters.push_back({RootParameterType::Constants, 0, 9, D3D12_SHADER_VISIBILITY_PIXEL});
 
     pipelineDescription.rootParameters.push_back({RootParameterType::ConstantBuffer, 1, 0, D3D12_SHADER_VISIBILITY_VERTEX});
     pipelineDescription.rootParameters.push_back({RootParameterType::ConstantBuffer, 2, 0, D3D12_SHADER_VISIBILITY_VERTEX});
