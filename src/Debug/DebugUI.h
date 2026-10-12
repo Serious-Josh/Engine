@@ -43,6 +43,7 @@ class DebugUI
     void Shutdown();
 
     void BeginFrame();
+    void DrawMenu();
     void DrawPerformanceWindow(
         const std::vector<std::string>& environmentNames,
         size_t currentEnvironmentIndex,
@@ -102,6 +103,8 @@ class DebugUI
     }
 
     private:
+    bool m_showRenderingSettings = true;
+
     void DrawFramePacingSpikes();
     FramePacingMonitor m_framePacingMonitor;
 

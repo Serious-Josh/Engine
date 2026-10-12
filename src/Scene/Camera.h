@@ -21,6 +21,21 @@ class Camera
         m_aspectRatio = aspectRatio;
     }
 
+    void SetVerticalFov(float verticalFov)
+    {
+        m_verticalFov = verticalFov;
+    }
+
+    void SetNearPlane(float nearPlane)
+    {
+        m_nearPlane = nearPlane;
+    }
+
+    void SetFarPlane(float farPlane)
+    {
+        m_farPlane = farPlane;
+    }
+
     Matrix4 GetViewMatrix() const
     {
         return Matrix4::LookAt(m_position, m_target, {0.0f, 1.0f, 0.0f});
@@ -39,6 +54,26 @@ class Camera
     const Vector3& GetTarget() const
     {
         return m_target;
+    }
+
+    float GetVerticalFov() const
+    {
+        return m_verticalFov;
+    }
+
+    float GetAspectRatio() const
+    {
+        return m_aspectRatio;
+    }
+
+    float GetNearPlane() const
+    {
+        return m_nearPlane;
+    }
+
+    float GetFarPlane() const
+    {
+        return m_farPlane;
     }
 
     private:

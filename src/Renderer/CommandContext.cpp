@@ -5,6 +5,8 @@
 #include "GraphicsDevice.h"
 #endif
 
+#include <wrl/client.h>
+
 #include <string>
 #include <atomic>
 #include <cstdlib>
@@ -798,4 +800,63 @@ SubmissionFenceStatus CommandContext::QuerySubmissionFenceStatus(SubmissionFence
     device->Release();
 
     return completed >= token.fenceValue ? SubmissionFenceStatus::Complete : SubmissionFenceStatus::Pending;
+}
+
+bool CommandContext::DiscardCommandsAfterGPUDrain()
+{
+    if (!m_commandList || !m_rayTracingCommandList || !m_commandAllocators[0] || HasSubmissionReservations())
+    {
+        return false;
+    }
+
+    for (const auto& token : m_retainedSubmissionFences)
+    {
+        if (token.retentionID != 0)
+        {
+            return false;
+        }
+    }
+
+    if (!WaitForGPU())
+    {
+        return false;
+    }
+
+    // Use a fresh allocator: the old list might still be open or poisoned by
+    // a failed Close/Reset. Nothing is replaced until the new closed list is ready.
+    Microsoft::WRL::ComPtr<ID3D12Device> device;
+    Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocator;
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> commands;
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList4> rayTracingCommands;
+
+    if (FAILED(m_commandList->GetDevice(IID_PPV_ARGS(&device))))
+    {
+        return false;
+    }
+
+    if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator))))
+    {
+        return false;
+    }
+
+    if (FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr,
+                                        IID_PPV_ARGS(&commands))))
+    {
+        return false;
+    }
+
+    if (FAILED(commands.As(&rayTracingCommands)) || FAILED(commands->Close()))
+    {
+        return false;
+    }
+
+    m_rayTracingCommandList->Release();
+    m_commandList->Release();
+    m_commandAllocators[0]->Release();
+
+    m_commandList = commands.Detach();
+    m_rayTracingCommandList = rayTracingCommands.Detach();
+    m_commandAllocators[0] = allocator.Detach();
+    m_lastSubmissionFence = 0;
+    return true;
 }

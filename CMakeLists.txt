@@ -41,6 +41,14 @@ FetchContent_Declare(
 
 FetchContent_MakeAvailable(directxtex)
 
+# JSON serialization for persistent scene and material assets
+FetchContent_Declare(
+    nlohmann_json
+    URL https://github.com/nlohmann/json/releases/download/v3.12.0/json.tar.xz
+)
+
+FetchContent_MakeAvailable(nlohmann_json)
+
 add_executable(Engine
     src/main.cpp
     src/Engine/Engine.cpp
@@ -132,6 +140,23 @@ add_executable(Engine
     src/Renderer/Passes/DisplacementIndicesPass.cpp
     src/Renderer//DisplacementGPUIndexLayout.cpp
     src/Renderer/DisplacementGPUPatchBuffer.cpp
+    src/Scene/SceneDocument.cpp
+    src/Scene/SceneSerializer.cpp
+    src/Scene/SceneFileCreation.cpp
+    src/Project/ProjectPaths.cpp
+    src/Project/ProjectLocator.cpp
+    src/Scene/FileScene.cpp
+    src/Scene/SceneDocumentAdapter.cpp
+    src/Scene/SceneObjectResolver.cpp
+    src/Scene/PreparedScene.cpp
+    src/Scene/SceneCommit.cpp
+    src/Scene/FileSceneRuntime.cpp
+    src/Scene/FileSceneAssetCatalog.cpp
+    src/DemoContent/FileBackedDemoScene.cpp
+)
+
+target_compile_definitions(Engine PRIVATE
+    ENGINE_SOURCE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}"
 )
 
 add_custom_command(
@@ -193,6 +218,7 @@ target_include_directories(Engine
 
 target_link_libraries(Engine
     PRIVATE
+        ole32
         dxgi
         d3d12
         dxcompiler
@@ -205,4 +231,75 @@ target_link_libraries(Engine
 
         assimp
         DirectXTex
+        nlohmann_json
 )
+
+add_executable(SceneSerializerTests
+    tests/SceneSerializerTests.cpp
+    src/Scene/SceneDocument.cpp
+    src/Scene/SceneSerializer.cpp
+    src/Scene/FileScene.cpp
+)
+
+target_include_directories(SceneSerializerTests PRIVATE src)
+
+target_link_libraries(SceneSerializerTests
+    PRIVATE nlohmann_json::nlohmann_json
+)
+
+add_executable(SceneDocumentAdapterTests
+    tests/SceneDocumentAdapterTests.cpp
+    src/Scene/SceneDocumentAdapter.cpp
+    src/Scene/SceneDocument.cpp
+    src/Scene/Scene.cpp
+)
+
+target_include_directories(SceneDocumentAdapterTests PRIVATE src)
+
+add_executable(SceneObjectResolverTests
+    tests/SceneObjectResolverTests.cpp
+    src/Scene/SceneObjectResolver.cpp
+    src/Scene/SceneDocument.cpp
+)
+
+target_include_directories(SceneObjectResolverTests PRIVATE src)
+
+add_executable(SceneCommitTests
+    tests/SceneCommitTests.cpp
+    src/Scene/SceneCommit.cpp
+    src/Scene/Scene.cpp
+    src/Scene/SceneDocument.cpp
+)
+
+target_include_directories(SceneCommitTests PRIVATE src)
+
+add_executable(FileSceneRuntimeTests
+    src/Scene/SceneDocumentAdapter.cpp
+    tests/FileSceneRuntimeTests.cpp
+    src/Scene/FileSceneRuntime.cpp
+    src/Scene/FileScene.cpp
+    src/Scene/PreparedScene.cpp
+    src/Scene/SceneCommit.cpp
+    src/Scene/SceneObjectResolver.cpp
+    src/Scene/SceneDocument.cpp
+    src/Scene/SceneSerializer.cpp
+    src/Scene/Scene.cpp
+)
+
+target_include_directories(FileSceneRuntimeTests PRIVATE src)
+
+target_link_libraries(FileSceneRuntimeTests PRIVATE
+    nlohmann_json::nlohmann_json
+)
+add_executable(SceneFileCreationTests
+    tests/SceneFileCreationTests.cpp
+    src/Scene/SceneFileCreation.cpp
+    src/Scene/SceneSerializer.cpp
+    src/Scene/SceneDocument.cpp
+    src/Project/ProjectPaths.cpp
+    src/Project/ProjectLocator.cpp
+)
+
+target_include_directories(SceneFileCreationTests PRIVATE src)
+target_compile_definitions(SceneFileCreationTests PRIVATE ENGINE_SOURCE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}")
+target_link_libraries(SceneFileCreationTests PRIVATE nlohmann_json::nlohmann_json ole32)

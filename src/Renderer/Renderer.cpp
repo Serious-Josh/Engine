@@ -320,6 +320,13 @@ void Renderer::InvalidateRecordingEligibility()
 
 bool Renderer::BeginTrackedRecording(unsigned int frameSlot)
 {
+    if (m_sceneInitializationAttempt.candidate &&
+        (m_sceneInitializationAttempt.failed ||
+         m_sceneInitializationAttempt.commands != SceneInitializationCommands::BeginAttempted))
+    {
+        return false;
+    }
+
     if (m_displacementCoverage.enabled)
     {
         const auto outcome = m_displacementCoverage.current.outcome;
@@ -513,6 +520,13 @@ bool Renderer::AbortTrackedRecording()
 
 bool Renderer::ExecuteTrackedRecording(unsigned int frameSlot)
 {
+    if (m_sceneInitializationAttempt.candidate &&
+        (m_sceneInitializationAttempt.failed ||
+         m_sceneInitializationAttempt.commands != SceneInitializationCommands::SubmissionAttempted))
+    {
+        return false;
+    }
+
     if (m_displacementCoverage.enabled)
     {
         m_displacementCoverage.failed = true;
@@ -3363,6 +3377,13 @@ bool Renderer::InitializeSceneResources(
     const Scene& scene,
     const std::vector<Material*>& materials)
 {
+    if (m_sceneInitializationAttempt.candidate || m_sceneResourceScene || m_activeRecordingGeneration != 0 ||
+        m_displacementExitScopeGeneration != 0)
+    {
+        Log::Error("Scene initialization requires checked release and no unresolved initialization or recording.");
+        return false;
+    }
+
     if (m_heightmapRegistration.owner)
     {
         Log::Error("Cannot replace registered scene resources before checked release.");
@@ -3385,51 +3406,80 @@ bool Renderer::InitializeSceneResources(
         return false;
     }
 
-    // A failed replacement has no valid published lifetime identity.
-    m_sceneResourceLifetime = 0;
-    m_sceneResourceScene = nullptr;
+    m_sceneInitializationAttempt = {};
+    m_sceneInitializationAttempt.candidate = &scene;
 
-    if (!InitializeMaterials(materials))
+    const auto initialize = [&]() -> bool
     {
-        Log::Error("Failed to init scene materials.");
-        return false;
-    }
+        // A failed replacement has no valid published lifetime identity.
+        m_sceneResourceLifetime = 0;
+        m_sceneResourceScene = nullptr;
 
-    if (!InitializeRayTracingScene(scene))
-    {
-        Log::Error("Failed to init ray tracing scene.");
-        // Retain resources until shutdown confirms completion of any submitted build.
-        return false;
-    }
-
-    m_selectionMaskPass.Shutdown();
-
-    const RenderObject* firstRenderableObject = nullptr;
-
-    for (const RenderObject& object : scene.GetRenderObjects())
-    {
-        if (object.mesh)
+        if (!InitializeMaterials(materials))
         {
-            firstRenderableObject = &object;
-            break;
-        }
-    }
-
-    if (firstRenderableObject)
-    {
-        if (!m_selectionMaskPass.Initialize(m_graphicsDevice.GetDevice(), m_shaderLibrary,
-                                            firstRenderableObject->mesh->GetVertexLayout()))
-        {
-            Log::Error("Failed to init selection mask pass.");
+            Log::Error("Failed to init scene materials.");
             return false;
         }
+
+        if (!InitializeRayTracingScene(scene))
+        {
+            Log::Error("Failed to init ray tracing scene.");
+            // Retain resources until checked failed-attempt cleanup proves safety.
+            return false;
+        }
+
+        m_selectionMaskPass.Shutdown();
+
+        const RenderObject* firstRenderableObject = nullptr;
+
+        for (const RenderObject& object : scene.GetRenderObjects())
+        {
+            if (object.mesh)
+            {
+                firstRenderableObject = &object;
+                break;
+            }
+        }
+
+        if (firstRenderableObject)
+        {
+            if (!m_selectionMaskPass.Initialize(m_graphicsDevice.GetDevice(), m_shaderLibrary,
+                                                firstRenderableObject->mesh->GetVertexLayout()))
+            {
+                Log::Error("Failed to init selection mask pass.");
+                return false;
+            }
+        }
+
+        ResetSceneHistory();
+        m_sceneResourceLifetime = lifetime;
+        m_sceneResourceScene = &scene;
+
+        return true;
+    };
+
+    bool initialized = false;
+
+    try
+    {
+        initialized = initialize();
+    }
+    catch (...)
+    {
+        m_sceneInitializationAttempt.failed = true;
+        throw;
     }
 
-    ResetSceneHistory();
-    m_sceneResourceLifetime = lifetime;
-    m_sceneResourceScene = &scene;
+    if (initialized)
+    {
+        m_sceneInitializationAttempt = {};
+    }
+    else
+    {
+        m_sceneInitializationAttempt.failed = true;
+    }
 
-    return true;
+    return initialized;
 }
 
 bool Renderer::InitializeMaterials(const std::vector<Material*>& materials)
@@ -3483,12 +3533,18 @@ bool Renderer::InitializeRayTracingScene(const Scene& scene)
         return false;
     }
 
+    auto& attempt = m_sceneInitializationAttempt;
+    attempt.commands = SceneInitializationCommands::BeginAttempted;
+
     if (!BeginTrackedRecording(0))
     {
         Log::Error("Failed to begin acceleration structure construction.");
 
         return false;
     }
+
+    attempt.commands = SceneInitializationCommands::Recording;
+    attempt.recordingGeneration = m_activeRecordingGeneration;
 
     if (!m_rayTracingScene.Initialize(m_graphicsDevice.GetRayTracingDevice(),
                                       m_commandContext.GetRayTracingCommandList(), m_resourceUploader,
@@ -3498,12 +3554,22 @@ bool Renderer::InitializeRayTracingScene(const Scene& scene)
         return false;
     }
 
+    attempt.commands = SceneInitializationCommands::Recorded;
+    attempt.commands = SceneInitializationCommands::CloseAttempted;
+
     if (!EndTrackedRecording())
     {
         return false;
     }
 
+    attempt.commands = SceneInitializationCommands::Closed;
+    attempt.commands = SceneInitializationCommands::SubmissionAttempted;
     const bool buildSubmitted = ExecuteTrackedRecording(0);
+
+    if (buildSubmitted)
+    {
+        attempt.commands = SceneInitializationCommands::Submitted;
+    }
 
     // A failed submission fence signal does not mean the build was discarded.
 
@@ -3514,6 +3580,9 @@ bool Renderer::InitializeRayTracingScene(const Scene& scene)
         return false;
     }
 
+    attempt.gpuCompletionProven = true;
+    attempt.commands = SceneInitializationCommands::Complete;
+
     if (!buildSubmitted)
     {
         Log::Error("Failed to execute or signal acceleration structure construction.");
@@ -3523,8 +3592,55 @@ bool Renderer::InitializeRayTracingScene(const Scene& scene)
     return true;
 }
 
+bool Renderer::CleanupFailedSceneInitialization(const Scene& candidate)
+{
+    auto& attempt = m_sceneInitializationAttempt;
+
+    if (attempt.candidate != &candidate || !attempt.failed || m_sceneResourceScene || m_sceneResourceLifetime != 0)
+    {
+        return false;
+    }
+
+    if (HasUnresolvedDisplacementUpdate() || m_heightmapRegistration.owner ||
+        m_completedDisplacementUpdate.requestRevision != 0 || m_displacementExitScopeGeneration != 0)
+    {
+        return false;
+    }
+
+    if (m_activeRecordingGeneration != 0 &&
+        (m_activeRecordingGeneration != attempt.recordingGeneration || m_activeRecordingSlot != 0))
+    {
+        return false;
+    }
+
+    // Also handles Begin/Close failures and ended-but-unsubmitted lists. A
+    // successful drain alone does not prevent those old commands executing later.
+    if (!m_commandContext.DiscardCommandsAfterGPUDrain())
+    {
+        return false;
+    }
+
+    attempt.gpuCompletionProven = true;
+    attempt.commands = SceneInitializationCommands::Abandoned;
+    InvalidateRecordingEligibility();
+
+    m_rayTracingScene.Shutdown();
+    m_materialBuffer.Shutdown();
+    m_selectionMaskPass.Shutdown();
+    ResetSceneHistory();
+
+    m_sceneInitializationAttempt = {};
+    return true;
+}
+
 bool Renderer::ReleaseSceneResources()
 {
+    if (m_sceneInitializationAttempt.candidate)
+    {
+        Log::Error("Partial scene initialization requires checked failed-attempt cleanup.");
+        return false;
+    }
+
     if (m_completedDisplacementUpdate.requestRevision != 0)
     {
         Log::Error("Cannot release scene resources before delivering displacement completion.");
@@ -3959,6 +4075,11 @@ Renderer::FrameRenderResult Renderer::Render(
     const Scene& scene,
     const RendererOptions& options)
 {
+    if (m_sceneInitializationAttempt.candidate)
+    {
+        return FrameRenderResult::Error;
+    }
+
     std::optional<FrameHitchProbe> admissionProbe;
 
     if constexpr (kEnableFrameHitchDiagnostics)
@@ -5200,6 +5321,12 @@ bool Renderer::RecordRenderFrame(
 
 void Renderer::Shutdown()
 {
+    if (m_sceneInitializationAttempt.candidate)
+    {
+        Log::Error("Renderer shutdown: failed scene initialization requires checked cleanup; aborting.");
+        std::abort();
+    }
+
     if (m_heightmapRegistration.owner)
     {
         Log::Error("Renderer shutdown requires checked scene-resource release before heightmap teardown.");

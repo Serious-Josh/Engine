@@ -679,202 +679,209 @@ void DebugUI::DrawPerformanceWindow(
 
     ImGui::End();
 
-    ImGui::Begin("Rendering debug");
-
-    DrawCpuTiming();
-    DrawFramePacingSpikes();
-
-    ImGui::Checkbox("GPU Timing Graph", &m_gpuTimingGraph.visible);
-
-    DrawGpuTimingMonitor(gpu);
-
-    ImGui::TextUnformatted("Environment");
-
-    const char* currentEnvironmentName = currentEnvironmentIndex < environmentNames.size()
-                                             ? environmentNames[currentEnvironmentIndex].c_str()
-                                             : "Unknown";
-
-    if (ImGui::BeginCombo("HDRI", currentEnvironmentName))
+    if (m_showRenderingSettings)
     {
-        for (size_t i = 0; i < environmentNames.size(); ++i)
+        if (ImGui::Begin("Rendering Settings", &m_showRenderingSettings))
         {
-            const bool selected = i == currentEnvironmentIndex;
 
-            if (ImGui::Selectable(environmentNames[i].c_str(), selected))
+            DrawCpuTiming();
+            DrawFramePacingSpikes();
+
+
+
+            DrawGpuTimingMonitor(gpu);
+
+            ImGui::TextUnformatted("Environment");
+
+            const char* currentEnvironmentName = currentEnvironmentIndex < environmentNames.size()
+                                                     ? environmentNames[currentEnvironmentIndex].c_str()
+                                                     : "Unknown";
+
+            if (ImGui::BeginCombo("HDRI", currentEnvironmentName))
             {
-                m_requestedEnvironmentIndex = static_cast<int>(i);
+                for (size_t i = 0; i < environmentNames.size(); ++i)
+                {
+                    const bool selected = i == currentEnvironmentIndex;
+
+                    if (ImGui::Selectable(environmentNames[i].c_str(), selected))
+                    {
+                        m_requestedEnvironmentIndex = static_cast<int>(i);
+                    }
+
+                    if (selected)
+                    {
+                        ImGui::SetItemDefaultFocus();
+                    }
+                }
+
+                ImGui::EndCombo();
             }
 
-            if (selected)
+            ImGui::Separator();
+
+            const char* views[] = {"None",
+                                   "Specular tracking distance",
+                                   "NRD ViewZ",
+                                   "NRD Normal",
+                                   "NRD Roughness",
+                                   "NRD Motion",
+                                   "NRD Spec Radiance",
+                                   "NRD Hit Distance",
+                                   "NrdResolvedReflection",
+                                   "GBuffer Motion",
+                                   "Selection Mask (BLACK SCREEN)",
+                                   "GI Raw",
+                                   "GI Hit Distance",
+                                   "GI Denoised",
+                                   "AO Raw",
+                                   "AO Temporal",
+                                   "AO Filtered",
+                                   "GBuffer World Normal",
+                                   "GBuffer Albedo",
+                                   "Environment Specular Only",
+                                   "Direct Lighting Only",
+                                   "HDRI Diffuse Ambient Only",
+                                   "HDRI Diffuse Ambient Without AO",
+                                   "HDRI Diffuse Ambient Direct Integral",
+                                   "Irradiance Cubemap Minus Direct Integral",
+                                   "HDRI Irradiance Tangent Frame Difference",
+                                   "HDRI Diffuse Ambient Multi-Orientation",
+                                   "Multi-Orientation Minus Single-Orientation",
+                                   "HDRI Direct Integral Mip 0",
+                                   "HDRI Direct Integral Mip 4",
+                                   "HDRI Direct Integral Mip 6",
+                                   "GI Signed Reconstructed (Pre-NRD)"};
+            const char* denoisers[] = {"NRD", "Native"};
+
+            ImGui::Combo("Reflection denoiser", &m_reflectionDenoiserMode, denoisers, IM_ARRAYSIZE(denoisers));
+            ImGui::Checkbox("NRD contribution limiter", &m_contributionLimiterEnabled);
+            ImGui::Checkbox("Enable RTGI", &m_rtgiEnabled);
+            ImGui::SliderFloat("RTGI Contact AO Strength", &m_rtgiContactAOStrength, 0.0f, 1.0f, "%.2f");
+            ImGui::SliderFloat("RTGI Contact AO Radius", &m_rtgiContactAORadius, 0.05f, 5.0f, "%.2f");
+            ImGui::Combo("Diagnostic view", &m_toneMapDebugView, views, IM_ARRAYSIZE(views));
+
+            if (GetToneMapDebugView() == ToneMapDebugView::GISignedReconstructed)
             {
-                ImGui::SetItemDefaultFocus();
+                ImGui::TextWrapped("Signed reconstructed irradiance before NRD. Requires active signed GI; otherwise displays normal rendering.");
+            }
+
+            if (GetToneMapDebugView() == ToneMapDebugView::HDRIDirectIntegralMip0 ||
+                GetToneMapDebugView() == ToneMapDebugView::HDRIDirectIntegralMip4 ||
+                GetToneMapDebugView() == ToneMapDebugView::HDRIDirectIntegralMip6)
+            {
+                ImGui::TextUnformatted(
+                    "4096-sample direct HDRI diffuse integral at selected source mip; no AO, standard display mapping.");
+            }
+
+            if (GetToneMapDebugView() == ToneMapDebugView::HDRIDiffuseAmbientMultiOrientation)
+            {
+                ImGui::TextUnformatted(
+                    "Four 1024-sample HDRI integrals at 0/45/90/135 degrees, averaged; no AO, standard display mapping.");
+            }
+            else if (GetToneMapDebugView() == ToneMapDebugView::MultiOrientationMinusSingleOrientation)
+            {
+                ImGui::TextUnformatted("Multi 4x1024 minus single 4096 samples; residual scale 10, no tone mapping.");
+            }
+            if (GetToneMapDebugView() == ToneMapDebugView::HDRIIrradianceTangentFrameDifference)
+            {
+                ImGui::TextUnformatted(
+                    "4096 samples per tangent frame: original minus 90-degree rotated; residual scale 10, no tone mapping.");
+            }
+
+            if (GetToneMapDebugView() == ToneMapDebugView::HDRIDiffuseAmbientDirectIntegral)
+            {
+                ImGui::TextUnformatted("4096-sample mip-0 HDRI diffuse integral at the raster normal, without AO; expensive.");
+            }
+
+            else if (GetToneMapDebugView() == ToneMapDebugView::IrradianceCubemapMinusDirectIntegral)
+            {
+                ImGui::TextUnformatted(
+                    "Cube minus direct irradiance: gray zero, red positive, blue negative; scale 10, no tone mapping.");
+            }
+
+            if (GetToneMapDebugView() == ToneMapDebugView::EnvironmentSpecularOnly)
+            {
+                ImGui::TextUnformatted("Production environment specular before DXR blending; standard display mapping.");
+            }
+            else if (GetToneMapDebugView() == ToneMapDebugView::DirectLightingOnly)
+            {
+                ImGui::TextUnformatted(
+                    "Production directional diffuse and specular, including shadows; standard display mapping.");
+            }
+            else if (GetToneMapDebugView() == ToneMapDebugView::HDRIDiffuseAmbientOnly)
+            {
+                ImGui::TextUnformatted("Production RTGI-off HDRI diffuse ambient including AO; standard display mapping.");
+            }
+            else if (GetToneMapDebugView() == ToneMapDebugView::HDRIDiffuseAmbientWithoutAO)
+            {
+                ImGui::TextUnformatted("Same HDRI diffuse ambient with AO visibility fixed to one; standard display mapping.");
+            }
+            if (GetToneMapDebugView() == ToneMapDebugView::GBufferWorldNormal)
+            {
+                ImGui::TextUnformatted("Raw raster world normal: XYZ mapped to RGB; black background, magenta invalid.");
+            }
+            else if (GetToneMapDebugView() == ToneMapDebugView::GBufferAlbedo)
+            {
+                ImGui::TextUnformatted("Raster linear albedo encoded to sRGB for display; no lighting or tone mapping.");
+            }
+            ImGui::Separator();
+
+            if (GetToneMapDebugView() == ToneMapDebugView::SpecularTrackingDistance)
+            {
+                ImGui::TextUnformatted("Magenta: invalid | Blue: environment miss | Gray: geometry");
+            }
+            else if (GetToneMapDebugView() == ToneMapDebugView::GBufferMotion)
+            {
+                ImGui::TextUnformatted("Gray: zero UV motion | R: signed X | G: signed Y (20x)");
+            }
+
+            else if (GetToneMapDebugView() == ToneMapDebugView::NrdViewZ)
+            {
+                ImGui::TextUnformatted("Gray: Z / (Z + 10) | Magenta: beyond NRD range | Red: invalid Z");
+            }
+
+            else if (GetToneMapDebugView() == ToneMapDebugView::NrdMotion)
+            {
+                ImGui::TextUnformatted("Black: exact zero XYZ | RGB: amplified absolute XYZ (100x)");
+
+                ImGui::TextUnformatted("Any nonzero component has at least 25% intensity; camera motion should stay black.");
+            }
+            else if (GetToneMapDebugView() == ToneMapDebugView::NrdSpecularRadiance)
+            {
+                ImGui::TextUnformatted("Decoded demodulated radiance with AgX display mapping");
+            }
+            else if (GetToneMapDebugView() == ToneMapDebugView::NrdRoughness ||
+                     GetToneMapDebugView() == ToneMapDebugView::NrdHitDistance)
+            {
+
+                ImGui::TextUnformatted("Decoded value: 0 = black | 1 = white");
+            }
+            else if (GetToneMapDebugView() == ToneMapDebugView::GIRaw)
+            {
+                ImGui::TextUnformatted("Raw diffuse GI irradiance (noisy) | Black: invalid surface");
+            }
+            else if (GetToneMapDebugView() == ToneMapDebugView::GIHitDistance)
+            {
+                ImGui::TextUnformatted("Gray: hit distance | Blue: miss | Magenta: invalid");
+            }
+            else if (GetToneMapDebugView() == ToneMapDebugView::AORaw)
+            {
+                ImGui::TextUnformatted("White: unoccluded | Black: occluded | Background: white");
+            }
+            else if (GetToneMapDebugView() == ToneMapDebugView::AOTemporal)
+            {
+
+                ImGui::TextUnformatted("Temporally accumulated ray-traced ambient occlusion.");
+            }
+            else if (GetToneMapDebugView() == ToneMapDebugView::AOFiltered)
+            {
+                ImGui::TextUnformatted("Temporally accumulated AO after edge-aware spatial filtering.");
             }
         }
 
-        ImGui::EndCombo();
+        ImGui::End();
     }
 
-    ImGui::Separator();
-
-    const char* views[] = {"None",
-                           "Specular tracking distance",
-                           "NRD ViewZ",
-                           "NRD Normal",
-                           "NRD Roughness",
-                           "NRD Motion",
-                           "NRD Spec Radiance",
-                           "NRD Hit Distance",
-                           "NrdResolvedReflection",
-                           "GBuffer Motion",
-                           "Selection Mask (BLACK SCREEN)",
-                           "GI Raw",
-                           "GI Hit Distance",
-                           "GI Denoised",
-                           "AO Raw",
-                           "AO Temporal",
-                           "AO Filtered",
-                           "GBuffer World Normal",
-                           "GBuffer Albedo",
-                           "Environment Specular Only",
-                           "Direct Lighting Only",
-                           "HDRI Diffuse Ambient Only",
-                           "HDRI Diffuse Ambient Without AO",
-                           "HDRI Diffuse Ambient Direct Integral",
-                           "Irradiance Cubemap Minus Direct Integral",
-                           "HDRI Irradiance Tangent Frame Difference",
-                           "HDRI Diffuse Ambient Multi-Orientation",
-                           "Multi-Orientation Minus Single-Orientation",
-                           "HDRI Direct Integral Mip 0",
-                           "HDRI Direct Integral Mip 4",
-                           "HDRI Direct Integral Mip 6",
-                           "GI Signed Reconstructed (Pre-NRD)"};
-    const char* denoisers[] = {"NRD", "Native"};
-
-    ImGui::Combo("Reflection denoiser", &m_reflectionDenoiserMode, denoisers, IM_ARRAYSIZE(denoisers));
-    ImGui::Checkbox("NRD contribution limiter", &m_contributionLimiterEnabled);
-    ImGui::Checkbox("Enable RTGI", &m_rtgiEnabled);
-    ImGui::SliderFloat("RTGI Contact AO Strength", &m_rtgiContactAOStrength, 0.0f, 1.0f, "%.2f");
-    ImGui::SliderFloat("RTGI Contact AO Radius", &m_rtgiContactAORadius, 0.05f, 5.0f, "%.2f");
-    ImGui::Combo("Diagnostic view", &m_toneMapDebugView, views, IM_ARRAYSIZE(views));
-
-    if (GetToneMapDebugView() == ToneMapDebugView::GISignedReconstructed)
-    {
-        ImGui::TextWrapped("Signed reconstructed irradiance before NRD. Requires active signed GI; otherwise displays normal rendering.");
-    }
-
-    if (GetToneMapDebugView() == ToneMapDebugView::HDRIDirectIntegralMip0 ||
-        GetToneMapDebugView() == ToneMapDebugView::HDRIDirectIntegralMip4 ||
-        GetToneMapDebugView() == ToneMapDebugView::HDRIDirectIntegralMip6)
-    {
-        ImGui::TextUnformatted(
-            "4096-sample direct HDRI diffuse integral at selected source mip; no AO, standard display mapping.");
-    }
-
-    if (GetToneMapDebugView() == ToneMapDebugView::HDRIDiffuseAmbientMultiOrientation)
-    {
-        ImGui::TextUnformatted(
-            "Four 1024-sample HDRI integrals at 0/45/90/135 degrees, averaged; no AO, standard display mapping.");
-    }
-    else if (GetToneMapDebugView() == ToneMapDebugView::MultiOrientationMinusSingleOrientation)
-    {
-        ImGui::TextUnformatted("Multi 4x1024 minus single 4096 samples; residual scale 10, no tone mapping.");
-    }
-    if (GetToneMapDebugView() == ToneMapDebugView::HDRIIrradianceTangentFrameDifference)
-    {
-        ImGui::TextUnformatted(
-            "4096 samples per tangent frame: original minus 90-degree rotated; residual scale 10, no tone mapping.");
-    }
-
-    if (GetToneMapDebugView() == ToneMapDebugView::HDRIDiffuseAmbientDirectIntegral)
-    {
-        ImGui::TextUnformatted("4096-sample mip-0 HDRI diffuse integral at the raster normal, without AO; expensive.");
-    }
-
-    else if (GetToneMapDebugView() == ToneMapDebugView::IrradianceCubemapMinusDirectIntegral)
-    {
-        ImGui::TextUnformatted(
-            "Cube minus direct irradiance: gray zero, red positive, blue negative; scale 10, no tone mapping.");
-    }
-
-    if (GetToneMapDebugView() == ToneMapDebugView::EnvironmentSpecularOnly)
-    {
-        ImGui::TextUnformatted("Production environment specular before DXR blending; standard display mapping.");
-    }
-    else if (GetToneMapDebugView() == ToneMapDebugView::DirectLightingOnly)
-    {
-        ImGui::TextUnformatted(
-            "Production directional diffuse and specular, including shadows; standard display mapping.");
-    }
-    else if (GetToneMapDebugView() == ToneMapDebugView::HDRIDiffuseAmbientOnly)
-    {
-        ImGui::TextUnformatted("Production RTGI-off HDRI diffuse ambient including AO; standard display mapping.");
-    }
-    else if (GetToneMapDebugView() == ToneMapDebugView::HDRIDiffuseAmbientWithoutAO)
-    {
-        ImGui::TextUnformatted("Same HDRI diffuse ambient with AO visibility fixed to one; standard display mapping.");
-    }
-    if (GetToneMapDebugView() == ToneMapDebugView::GBufferWorldNormal)
-    {
-        ImGui::TextUnformatted("Raw raster world normal: XYZ mapped to RGB; black background, magenta invalid.");
-    }
-    else if (GetToneMapDebugView() == ToneMapDebugView::GBufferAlbedo)
-    {
-        ImGui::TextUnformatted("Raster linear albedo encoded to sRGB for display; no lighting or tone mapping.");
-    }
-    ImGui::Separator();
-
-    if (GetToneMapDebugView() == ToneMapDebugView::SpecularTrackingDistance)
-    {
-        ImGui::TextUnformatted("Magenta: invalid | Blue: environment miss | Gray: geometry");
-    }
-    else if (GetToneMapDebugView() == ToneMapDebugView::GBufferMotion)
-    {
-        ImGui::TextUnformatted("Gray: zero UV motion | R: signed X | G: signed Y (20x)");
-    }
-
-    else if (GetToneMapDebugView() == ToneMapDebugView::NrdViewZ)
-    {
-        ImGui::TextUnformatted("Gray: Z / (Z + 10) | Magenta: beyond NRD range | Red: invalid Z");
-    }
-
-    else if (GetToneMapDebugView() == ToneMapDebugView::NrdMotion)
-    {
-        ImGui::TextUnformatted("Black: exact zero XYZ | RGB: amplified absolute XYZ (100x)");
-
-        ImGui::TextUnformatted("Any nonzero component has at least 25% intensity; camera motion should stay black.");
-    }
-    else if (GetToneMapDebugView() == ToneMapDebugView::NrdSpecularRadiance)
-    {
-        ImGui::TextUnformatted("Decoded demodulated radiance with AgX display mapping");
-    }
-    else if (GetToneMapDebugView() == ToneMapDebugView::NrdRoughness ||
-             GetToneMapDebugView() == ToneMapDebugView::NrdHitDistance)
-    {
-
-        ImGui::TextUnformatted("Decoded value: 0 = black | 1 = white");
-    }
-    else if (GetToneMapDebugView() == ToneMapDebugView::GIRaw)
-    {
-        ImGui::TextUnformatted("Raw diffuse GI irradiance (noisy) | Black: invalid surface");
-    }
-    else if (GetToneMapDebugView() == ToneMapDebugView::GIHitDistance)
-    {
-        ImGui::TextUnformatted("Gray: hit distance | Blue: miss | Magenta: invalid");
-    }
-    else if (GetToneMapDebugView() == ToneMapDebugView::AORaw)
-    {
-        ImGui::TextUnformatted("White: unoccluded | Black: occluded | Background: white");
-    }
-    else if (GetToneMapDebugView() == ToneMapDebugView::AOTemporal)
-    {
-
-        ImGui::TextUnformatted("Temporally accumulated ray-traced ambient occlusion.");
-    }
-    else if (GetToneMapDebugView() == ToneMapDebugView::AOFiltered)
-    {
-        ImGui::TextUnformatted("Temporally accumulated AO after edge-aware spatial filtering.");
-    }
-    ImGui::End();
 }
 
 void DebugUI::EndFrame(
@@ -914,4 +921,11 @@ void DebugUI::SetTLASUpdated(bool updated)
     {
         ++m_totalTLASUpdates;
     }
+}
+
+void DebugUI::DrawMenu()
+{
+    ImGui::MenuItem("Rendering Settings", nullptr, &m_showRenderingSettings);
+    ImGui::Separator();
+    ImGui::MenuItem("GPU Timing Graph", nullptr, &m_gpuTimingGraph.visible);
 }

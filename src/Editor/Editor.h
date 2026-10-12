@@ -4,7 +4,9 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <limits>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -12,13 +14,47 @@ class IDemoScene;
 class SphereGridScene;
 class StressTestScene;
 class DemoSceneManager;
+class DebugUI;
 
 class Editor
 {
     public:
+    enum class FileRequestType
+    {
+        New,
+        Save,
+        Load,
+        Demo
+    };
+
+    struct FileRequest
+    {
+        FileRequestType type;
+
+        std::filesystem::path path;
+        std::string sceneName;
+    };
+
+    enum class SceneChangeDecision
+    {
+        None,
+        Save,
+        Discard,
+        Cancel
+    };
+
+    void SetSceneOperationPending(bool pending) noexcept;
+    void OnSceneActivated();
+    SceneChangeDecision DrawSceneChangeConfirmation(const std::string& error);
+
+    // Taking a request clears it. Pending actions cannot be overwritten.
+    std::optional<FileRequest> TakeFileRequest();
+    bool HasFileRequest(FileRequestType type) const noexcept;
+
     void Draw(
       IDemoScene& demoScene,
       DemoSceneManager& sceneManager,
+      DebugUI& debugUI,
       float viewportWidth,
       float viewportHeight,
       float deltaTime);
@@ -34,6 +70,15 @@ class Editor
     }
 
     private:
+    void DrawMainMenu(
+        const IDemoScene& demoScene,
+        DemoSceneManager& sceneManager,
+        DebugUI& debugUI);
+
+    std::optional<FileRequest> m_fileRequest;
+    bool m_sceneOperationPending = false;
+    bool m_showEditorPanel = true;
+
     static constexpr size_t InvalidObjectSelection = (std::numeric_limits<size_t>::max)();
 
     enum class GizmoMode
@@ -90,9 +135,7 @@ class Editor
     void UpdateCameraMovement(
         IDemoScene& demoScene,
         float deltaTime);
-    void DrawObjectControls(
-        IDemoScene& demoScene,
-        DemoSceneManager& sceneManager);
+    void DrawObjectControls(IDemoScene& demoScene);
     void DrawStressTestControls(StressTestScene& demoScene);
     void DrawSphereGridControls(SphereGridScene& demoScene);
     void DrawDirectionalLight(IDemoScene& demoScene);

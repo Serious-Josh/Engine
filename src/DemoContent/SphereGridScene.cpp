@@ -44,7 +44,7 @@ bool SphereGridScene::Initialize(
     pipelineDescription.rootParameters.push_back({RootParameterType::Constants, 0, 9, D3D12_SHADER_VISIBILITY_PIXEL});
 
     pipelineDescription.rootParameters.push_back(
-        {RootParameterType::ConstantBuffer, 1, 0, D3D12_SHADER_VISIBILITY_VERTEX});
+        {RootParameterType::ConstantBuffer, 1, 0, D3D12_SHADER_VISIBILITY_ALL});
     pipelineDescription.rootParameters.push_back(
         {RootParameterType::ConstantBuffer, 2, 0, D3D12_SHADER_VISIBILITY_VERTEX});
 

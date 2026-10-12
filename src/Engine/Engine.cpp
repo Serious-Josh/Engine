@@ -6,9 +6,14 @@
 #include "Debug/CpuFrameTiming.h"
 
 #include "Scene/Scene.h"
+#include "Scene/SceneFileCreation.h"
+
+#include "Project/ProjectLocator.h"
+#include "Project/ProjectPaths.h"
 
 #include "DemoContent/SceneRegistry.h"
 #include "DemoContent/MirrorTestScene.h"
+#include "DemoContent/FileBackedDemoScene.h"
 #include "imgui.h"
 
 #include <cstdlib>
@@ -68,9 +73,308 @@ namespace
     }
 }
 
+bool Engine::ActivateRequestedFileScene()
+{
+    IDemoScene* previous = m_demoSceneManager.TryGetActiveScene();
+
+    if (!previous)
+    {
+        Log::Error("File scene activation requires an active scene owner.");
+        return false;
+    }
+
+    std::string error;
+
+    if (!m_demoSceneManager.GetStagedFileScene() &&
+        !m_demoSceneManager.StageRequestedFileScene(
+            m_renderer.GetDevice(), m_renderer.GetResourceUploader(), m_renderer.GetResourceDescriptorHeap(),
+            m_demoVertexShader, m_demoPixelShader, &error))
+    {
+        Log::Error("File scene staging failed; keeping the current scene: " + error);
+        m_demoSceneManager.CancelFileSceneRequest();
+        return true;
+    }
+
+    IDemoScene* candidate = m_demoSceneManager.GetStagedFileScene();
+
+    if (!candidate)
+    {
+        Log::Error("File scene staging did not produce a candidate.");
+        return false;
+    }
+
+    if (!DrainAndResolveSceneDisplacement(m_renderer, *previous))
+    {
+        Log::Error("Displacement drain failed before file scene activation; retaining both scene owners.");
+        return false;
+    }
+
+    if (!m_renderer.ReleaseSceneResources())
+    {
+        Log::Error("Scene resource release rejected before file scene activation.");
+        return false;
+    }
+
+    m_sceneResourcesReleasedForSwitch = true;
+
+    if (m_renderer.InitializeSceneResources(candidate->GetScene(), candidate->GetMaterials()))
+    {
+        if (!m_demoSceneManager.CommitStagedFileScene(&error))
+        {
+            Log::Error("File scene commit failed; retaining candidate Renderer ownership: " + error);
+            return false;
+        }
+
+        m_sceneResourcesReleasedForSwitch = false;
+        m_editor.OnSceneActivated();
+        m_renderedSceneStructureRevision = m_demoSceneManager.GetActiveScene().GetScene().GetStructureRevision();
+        return true;
+    }
+
+    Log::Error("Candidate Renderer initialization failed for " +
+               m_demoSceneManager.GetRequestedFileScenePath().string() +
+               "; file preserved; attempting checked cleanup.");
+
+    if (!m_renderer.CleanupFailedSceneInitialization(candidate->GetScene()))
+    {
+        Log::Error("Candidate cleanup could not prove GPU safety; retaining both scene owners.");
+        return false;
+    }
+
+    // The manager still owns the old scene. Only now may candidate assets die.
+    m_demoSceneManager.CancelFileSceneRequest();
+
+    if (!m_renderer.InitializeSceneResources(previous->GetScene(), previous->GetMaterials()))
+    {
+        Log::Error("Failed to restore previous scene Renderer resources; requesting fail-closed shutdown.");
+        return false;
+    }
+
+    if (auto* mirror = dynamic_cast<MirrorTestScene*>(previous))
+    {
+        // The drain delivered completed async revisions before registration
+        // release. Rebuild current camera geometry rather than reverting an
+        // already acknowledged revision to seed LODs.
+        const bool hasCameraSettings = mirror->HasCurrentDisplacementSettings();
+        const auto revision = mirror->GetRequestedDisplacementRevision();
+        const auto settings = hasCameraSettings
+            ? mirror->GetCurrentDisplacementSettings()
+            : mirror->GetSeedDisplacementSettings();
+
+        if (!m_renderer.RegisterDisplacementHeightmap(*mirror) ||
+            !m_renderer.GenerateDisplacementMeshGPU(*mirror, settings))
+        {
+            Log::Error("Failed to restore Mirror Test displacement; requesting fail-closed shutdown.");
+            return false;
+        }
+
+        if (hasCameraSettings)
+        {
+            mirror->MarkDisplacementGeometryUpdated(revision);
+        }
+    }
+
+    m_sceneResourcesReleasedForSwitch = false;
+    Log::Info("Previous scene Renderer resources restored after failed file scene activation.");
+    return true;
+}
+
+void Engine::QueueEditorSceneOperation()
+{
+    if (!m_pendingEditorSceneOperation)
+    {
+        return;
+    }
+
+    const auto request = std::move(*m_pendingEditorSceneOperation);
+    m_pendingEditorSceneOperation.reset();
+    m_sceneOperationError.clear();
+    std::string error;
+
+    if (request.type == Editor::FileRequestType::Demo)
+    {
+        if (!m_demoSceneManager.RequestScene(request.sceneName))
+        {
+            Log::Error("Failed to request demo scene: " + request.sceneName);
+        }
+
+        return;
+    }
+
+    std::filesystem::path path = request.path;
+
+    if (request.type == Editor::FileRequestType::New)
+    {
+        if (!CreateNewSceneFile(path, &error))
+        {
+            Log::Error("Failed to create scene: " + error);
+            return;
+        }
+
+        Log::Info("Created scene file: " + path.string());
+    }
+
+    if (!m_demoSceneManager.RequestFileScene(path, &error))
+    {
+        Log::Error("Failed to request file scene; any newly created file is preserved: " + error);
+    }
+}
+
+void Engine::ProcessEditorSceneRequests(IDemoScene& activeScene)
+{
+    auto* fileScene = dynamic_cast<FileBackedDemoScene*>(&activeScene);
+
+    if (const auto request = m_editor.TakeFileRequest())
+    {
+        if (m_pendingEditorSceneOperation || m_demoSceneManager.HasPendingSceneChange())
+        {
+            Log::Error("Scene operation rejected: another operation is pending.");
+        }
+        else if (request->type == Editor::FileRequestType::Save)
+        {
+            std::string error;
+
+            if (!fileScene)
+            {
+                Log::Error("Save rejected: the active scene is not file-backed.");
+            }
+            else if (!fileScene->Save(&error))
+            {
+                Log::Error("Failed to save scene: " + error);
+            }
+            else
+            {
+                Log::Info("Saved file-backed scene: " + fileScene->GetDisplayName());
+            }
+        }
+        else
+        {
+            auto operation = *request;
+            bool valid = true;
+
+            if (operation.type == Editor::FileRequestType::Load)
+            {
+                // Resolve symlinks/junctions before checking component containment.
+                // Save the resolved path so staging does not reuse the menu's alias.
+                std::error_code error;
+                const ProjectPaths project(ProjectLocator::GetDefaultProjectRoot());
+                const auto directory = std::filesystem::canonical(project.GetScenesDirectory(), error);
+
+                if (error || !operation.path.is_absolute() || operation.path.extension() != ".scene")
+                {
+                    valid = false;
+                }
+                else
+                {
+                    const auto path = std::filesystem::canonical(operation.path, error);
+
+                    if (error || path.extension() != ".scene" ||
+                        !std::filesystem::is_regular_file(path, error) || error)
+                    {
+                        valid = false;
+                    }
+                    else
+                    {
+                        const auto relative = path.lexically_relative(directory);
+                        valid = !relative.empty() && !relative.is_absolute();
+
+                        for (const auto& component : relative)
+                        {
+                            if (component == "..")
+                            {
+                                valid = false;
+                            }
+                        }
+
+                        operation.path = path;
+                    }
+                }
+
+                if (!valid)
+                {
+                    Log::Error("Load rejected: select a regular .scene file inside the project's Scenes directory.");
+                }
+            }
+
+            bool dirty = false;
+            std::string error;
+
+            if (valid && fileScene && !fileScene->CheckUnsavedChanges(dirty, &error))
+            {
+                Log::Error("Cannot safely check unsaved scene changes: " + error);
+                valid = false;
+            }
+
+            if (valid)
+            {
+                m_pendingEditorSceneOperation = std::move(operation);
+                m_sceneOperationError.clear();
+
+                if (!dirty)
+                {
+                    QueueEditorSceneOperation();
+                }
+            }
+        }
+    }
+
+    if (!m_pendingEditorSceneOperation)
+    {
+        return;
+    }
+
+    const auto decision = m_editor.DrawSceneChangeConfirmation(m_sceneOperationError);
+
+    if (decision == Editor::SceneChangeDecision::Cancel)
+    {
+        m_pendingEditorSceneOperation.reset();
+        m_sceneOperationError.clear();
+    }
+    else if (decision == Editor::SceneChangeDecision::Discard)
+    {
+        QueueEditorSceneOperation();
+    }
+    else if (decision == Editor::SceneChangeDecision::Save)
+    {
+        if (!fileScene || !fileScene->Save(&m_sceneOperationError))
+        {
+            if (!fileScene)
+            {
+                m_sceneOperationError = "Active scene is no longer file-backed.";
+            }
+
+            Log::Error("Scene switch paused: Save failed: " + m_sceneOperationError);
+        }
+        else
+        {
+            Log::Info("Saved file-backed scene: " + fileScene->GetDisplayName());
+            QueueEditorSceneOperation();
+        }
+    }
+}
+
 bool Engine::Initialize()
 {
     ENGINE_ASSERT(m_state == EngineState::Uninitialized);
+
+    // Initialize persistent project storage before GPU resources.
+    const ProjectPaths projectPaths(
+        ProjectLocator::GetDefaultProjectRoot());
+
+    std::string projectError;
+
+    if (!projectPaths.EnsureDirectories(&projectError))
+    {
+        Log::Error(
+            "Failed to initialize default project directories: " +
+            projectError);
+
+        return false;
+    }
+
+    Log::Info(
+        "Default project directory: " +
+        projectPaths.GetRoot().string());
 
     if (!m_window.Initialize(m_windowProperties))
     {
@@ -380,53 +684,68 @@ void Engine::Frame()
             m_renderer,
             Renderer::FrameHitchRegion::EngineSwitch);
 
-        if (!DrainAndResolveSceneDisplacement(m_renderer, m_demoSceneManager.GetActiveScene()))
+        if (!m_demoSceneManager.GetRequestedFileScenePath().empty())
         {
-            Log::Error("GPU drain or displacement resolution failed before scene switch; requesting shutdown.");
-
-            m_window.Close();
-            return;
-        }
-
-        if (!m_renderer.ReleaseSceneResources())
-        {
-            Log::Error("Scene resource release rejected before scene switch; requesting shutdown.");
-            m_window.Close();
-            return;
-        }
-
-        if (!m_demoSceneManager.ApplyPendingSceneChange(m_renderer.GetDevice(), m_renderer.GetResourceUploader(),
-                                                        m_renderer.GetResourceDescriptorHeap(), m_demoVertexShader,
-                                                        m_demoPixelShader))
-        {
-            Log::Error("Failed to switch demo scene.");
-
-            m_window.Close();
-            return;
-        }
-
-        IDemoScene& switchedDemo = m_demoSceneManager.GetActiveScene();
-
-        if (!m_renderer.InitializeSceneResources(switchedDemo.GetScene(), switchedDemo.GetMaterials()))
-        {
-            Log::Error("Failed to initialize renderer resources for switched demo scene.");
-            m_window.Close();
-            return;
-        }
-
-        if (auto* mirrorScene = dynamic_cast<MirrorTestScene*>(&switchedDemo))
-        {
-            if (!m_renderer.RegisterDisplacementHeightmap(*mirrorScene) ||
-                !m_renderer.GenerateDisplacementMeshGPU(*mirrorScene, mirrorScene->GetSeedDisplacementSettings()))
+            if (!ActivateRequestedFileScene())
             {
-                Log::Error("Failed to generate Mirror Test GPU displacement geometry after scene switch.");
-
                 m_window.Close();
                 return;
             }
         }
+        else
+        {
+            if (!DrainAndResolveSceneDisplacement(m_renderer, m_demoSceneManager.GetActiveScene()))
+            {
+                Log::Error("GPU drain or displacement resolution failed before scene switch; requesting shutdown.");
 
-        m_renderedSceneStructureRevision = switchedDemo.GetScene().GetStructureRevision();
+                m_window.Close();
+                return;
+            }
+
+            if (!m_renderer.ReleaseSceneResources())
+            {
+                Log::Error("Scene resource release rejected before scene switch; requesting shutdown.");
+                m_window.Close();
+                return;
+            }
+
+            m_sceneResourcesReleasedForSwitch = true;
+
+            if (!m_demoSceneManager.ApplyPendingSceneChange(m_renderer.GetDevice(), m_renderer.GetResourceUploader(),
+                                                            m_renderer.GetResourceDescriptorHeap(), m_demoVertexShader,
+                                                            m_demoPixelShader))
+            {
+                Log::Error("Failed to switch demo scene.");
+
+                m_window.Close();
+                return;
+            }
+
+            IDemoScene& switchedDemo = m_demoSceneManager.GetActiveScene();
+
+            if (!m_renderer.InitializeSceneResources(switchedDemo.GetScene(), switchedDemo.GetMaterials()))
+            {
+                Log::Error("Failed to initialize renderer resources for switched demo scene.");
+                m_window.Close();
+                return;
+            }
+
+            m_sceneResourcesReleasedForSwitch = false;
+
+            if (auto* mirrorScene = dynamic_cast<MirrorTestScene*>(&switchedDemo))
+            {
+                if (!m_renderer.RegisterDisplacementHeightmap(*mirrorScene) ||
+                    !m_renderer.GenerateDisplacementMeshGPU(*mirrorScene, mirrorScene->GetSeedDisplacementSettings()))
+                {
+                    Log::Error("Failed to generate Mirror Test GPU displacement geometry after scene switch.");
+
+                    m_window.Close();
+                    return;
+                }
+            }
+
+            m_renderedSceneStructureRevision = switchedDemo.GetScene().GetStructureRevision();
+        }
     }
 
     std::optional<Renderer::FrameHitchProbe> uiProbe;
@@ -450,8 +769,12 @@ void Engine::Frame()
 
     IDemoScene& activeDemo = m_demoSceneManager.GetActiveScene();
 
-    m_editor.Draw(activeDemo, m_demoSceneManager, static_cast<float>(m_window.GetWidth()),
+    m_editor.SetSceneOperationPending(m_pendingEditorSceneOperation.has_value() ||
+                                      m_demoSceneManager.HasPendingSceneChange());
+    m_editor.Draw(activeDemo, m_demoSceneManager, debugUI, static_cast<float>(m_window.GetWidth()),
                   static_cast<float>(m_window.GetHeight()), m_time.GetDeltaTime());
+
+    ProcessEditorSceneRequests(activeDemo);
 
     activeDemo.Update(m_time.GetDeltaTime());
     if constexpr (Renderer::IsFrameHitchDiagnosticsEnabled())
@@ -615,6 +938,7 @@ void Engine::Frame()
     activeScene.ClearChangedTransforms();
 }
 
+
 void Engine::Shutdown()
 {
     ENGINE_ASSERT(m_state == EngineState::Running);
@@ -623,23 +947,46 @@ void Engine::Shutdown()
 
     m_state = EngineState::Stopped;
 
-    if (!DrainAndResolveSceneDisplacement(m_renderer, m_demoSceneManager.GetActiveScene()))
+    IDemoScene* activeDemo = m_demoSceneManager.TryGetActiveScene();
+
+    if (!activeDemo)
     {
-        Log::Error("Engine shutdown: GPU drain or displacement resolution failed; aborting without teardown.");
-        std::abort();
+        // Only the successfully released scene-switch path may
+        // reach shutdown without an active scene owner.
+        if (!m_sceneResourcesReleasedForSwitch)
+        {
+            Log::Error(
+                "Engine shutdown: no active scene without confirmed "
+                "scene-resource release; aborting without teardown.");
+            std::abort();
+        }
+
+        Log::Info(
+            "Engine shutdown: scene switch failed after prior "
+            "scene resources were released.");
     }
-
-    if (!m_renderer.ReleaseSceneResources())
+    else
     {
-        Log::Error("Engine shutdown: scene resource release rejected; aborting without teardown.");
+        if (!DrainAndResolveSceneDisplacement(m_renderer, *activeDemo))
+        {
+            Log::Error(
+                "Engine shutdown: GPU drain or displacement "
+                "resolution failed; aborting without teardown.");
+            std::abort();
+        }
 
-        std::abort();
+        if (!m_renderer.ReleaseSceneResources())
+        {
+            Log::Error(
+                "Engine shutdown: scene resource release rejected; "
+                "aborting without teardown.");
+            std::abort();
+        }
     }
 
     m_demoSceneManager.Shutdown();
-
     m_renderer.Shutdown();
-
     m_window.Shutdown();
+
     Log::Info("Engine shutdown: finished.");
 }

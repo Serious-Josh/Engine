@@ -19,3 +19,6 @@ CmakeUserPresets.json
 # Debug symbols / genned files
 *.ilk
 *.exp
+
+# Test project directory
+/Projects

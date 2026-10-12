@@ -3,6 +3,8 @@
 #include "DemoContent/IDemoScene.h"
 #include "DemoContent/SceneRegistry.h"
 
+#include <filesystem>
+#include <string>
 #include <memory>
 #include <span>
 #include <string_view>
@@ -25,6 +27,33 @@ class DemoSceneManager
 
     bool RequestScene(std::string_view sceneName);
 
+    bool RequestFileScene(
+        const std::filesystem::path& path,
+        std::string* errorMessage = nullptr);
+
+    // Call on the Engine thread outside Renderer command recording. Uploads complete
+    // through ResourceUploader before success; no active-scene resources are changed.
+    bool StageRequestedFileScene(
+        ID3D12Device* device,
+        ResourceUploader& uploader,
+        DescriptorHeap& descriptorHeap,
+        const Shader* vertexShader,
+        const Shader* pixelShader,
+        std::string* errorMessage = nullptr);
+
+    // Borrowed access only. Staging never initializes Renderer scene resources.
+    IDemoScene* GetStagedFileScene() noexcept;
+    const IDemoScene* GetStagedFileScene() const noexcept;
+    std::string_view GetStagedFileSceneName() const noexcept;
+    const std::filesystem::path& GetRequestedFileScenePath() const noexcept;
+
+    // Caller must first resolve GPU use and release Renderer references to the old scene.
+    // No Renderer initialization or rollback is performed here.
+    bool CommitStagedFileScene(std::string* errorMessage = nullptr);
+
+    // Only while Renderer has never acquired references to the staged candidate.
+    void CancelFileSceneRequest();
+
     bool HasPendingSceneChange() const;
 
     bool ApplyPendingSceneChange(
@@ -39,6 +68,9 @@ class DemoSceneManager
     IDemoScene& GetActiveScene();
     const IDemoScene& GetActiveScene() const;
 
+    IDemoScene* TryGetActiveScene() noexcept;
+    const IDemoScene* TryGetActiveScene() const noexcept;
+
     SphereGridScene* GetActiveSphereGridScene();
 
     std::span<const DemoSceneEntry> GetAvailableScenes() const;
@@ -46,6 +78,11 @@ class DemoSceneManager
 
     private:
     std::unique_ptr<IDemoScene> m_activeScene;
+    std::unique_ptr<IDemoScene> m_stagedFileScene;
+
+    std::filesystem::path m_requestedFilePath;
+    std::string m_stagedFileName;
+    std::string m_activeFileName;
 
     const DemoSceneEntry* m_activeSceneEntry = nullptr;
     const DemoSceneEntry* m_requestedSceneEntry = nullptr;

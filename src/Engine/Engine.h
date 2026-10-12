@@ -30,6 +30,9 @@ class Engine
 
     private:
     void Frame();
+    bool ActivateRequestedFileScene();
+    void ProcessEditorSceneRequests(IDemoScene& activeScene);
+    void QueueEditorSceneOperation();
 
     WindowProperties m_windowProperties;
 
@@ -52,5 +55,10 @@ class Engine
 
     Editor m_editor;
 
+    std::optional<Editor::FileRequest> m_pendingEditorSceneOperation;
+    std::string m_sceneOperationError;
+
     EngineState m_state = EngineState::Uninitialized;
+
+    bool m_sceneResourcesReleasedForSwitch = false;
 };

@@ -1,4 +1,5 @@
 #include "Editor.h"
+#include "Debug/DebugUI.h"
 
 #include "Math/Math.h"
 
@@ -6,6 +7,10 @@
 #include "DemoContent/SphereGridScene.h"
 #include "DemoContent/StressTestScene.h"
 #include "DemoContent/DemoSceneManager.h"
+#include "DemoContent/FileBackedDemoScene.h"
+
+#include "Project/ProjectLocator.h"
+#include "Project/ProjectPaths.h"
 
 #include "Renderer/Mesh.h"
 
@@ -18,6 +23,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <utility>
 
 namespace
 {
@@ -247,13 +253,149 @@ namespace
     }
 }
 
+std::optional<Editor::FileRequest> Editor::TakeFileRequest()
+{
+    return std::exchange(m_fileRequest, std::nullopt);
+}
+
+bool Editor::HasFileRequest(FileRequestType type) const noexcept
+{
+    return m_fileRequest && m_fileRequest->type == type;
+}
+
+void Editor::DrawMainMenu(
+    const IDemoScene& demoScene,
+    DemoSceneManager& sceneManager,
+    DebugUI& debugUI)
+{
+    if (!ImGui::BeginMainMenuBar())
+    {
+        return;
+    }
+
+    if (ImGui::BeginMenu("File"))
+    {
+        ImGui::BeginDisabled(m_sceneOperationPending || m_fileRequest.has_value());
+        if (ImGui::MenuItem("New"))
+        {
+            m_fileRequest = FileRequest{FileRequestType::New, {}};
+        }
+
+        const bool fileBacked = dynamic_cast<const FileBackedDemoScene*>(&demoScene) != nullptr;
+        ImGui::BeginDisabled(!fileBacked);
+
+        if (ImGui::MenuItem("Save", "Ctrl+S"))
+        {
+            m_fileRequest = FileRequest{FileRequestType::Save, {}};
+        }
+
+        ImGui::EndDisabled();
+
+        if (ImGui::BeginMenu("Load"))
+        {
+            const ProjectPaths paths(ProjectLocator::GetDefaultProjectRoot());
+            std::vector<std::filesystem::path> scenes;
+            std::error_code error;
+            std::filesystem::directory_iterator iterator(paths.GetScenesDirectory(), error);
+            const std::filesystem::directory_iterator end;
+
+            while (!error && iterator != end)
+            {
+                std::error_code entryError;
+
+                if (iterator->is_regular_file(entryError) && !entryError && iterator->path().extension() == ".scene")
+                {
+                    scenes.push_back(iterator->path());
+                }
+
+                iterator.increment(error);
+            }
+
+            std::sort(scenes.begin(), scenes.end(), [](const auto& left, const auto& right)
+            {
+                return left.filename().native() < right.filename().native();
+            });
+
+            for (const auto& scene : scenes)
+            {
+                const std::string filename = scene.filename().string();
+
+                if (ImGui::MenuItem(filename.c_str()))
+                {
+                    m_fileRequest = FileRequest{FileRequestType::Load, scene};
+                }
+            }
+
+            if (error)
+            {
+                ImGui::TextDisabled("Scenes directory unavailable or incomplete");
+            }
+            else if (scenes.empty())
+            {
+                ImGui::TextDisabled("No scene files found");
+            }
+
+            ImGui::EndMenu();
+        }
+
+        ImGui::EndDisabled();
+        ImGui::EndMenu();
+    }
+
+    if (ImGui::BeginMenu("Editor"))
+    {
+        ImGui::MenuItem("Scene Inspector", nullptr, &m_showEditorPanel);
+        ImGui::Separator();
+
+        const std::string_view activeSceneName = sceneManager.GetActiveSceneName();
+
+        ImGui::BeginDisabled(m_sceneOperationPending || m_fileRequest.has_value());
+
+        if (ImGui::BeginCombo("Demo Scene", activeSceneName.data()))
+        {
+
+            for (const DemoSceneEntry& entry : sceneManager.GetAvailableScenes())
+            {
+                const bool isSelected = entry.name == activeSceneName;
+
+                if (ImGui::Selectable(entry.name.c_str(), isSelected))
+                {
+                    m_fileRequest = FileRequest{FileRequestType::Demo, {}, entry.name};
+                }
+
+                if (isSelected)
+                {
+                    ImGui::SetItemDefaultFocus();
+                }
+            }
+
+            ImGui::EndCombo();
+        }
+
+        ImGui::EndDisabled();
+
+        ImGui::EndMenu();
+    }
+
+    if (ImGui::BeginMenu("Debug"))
+    {
+        debugUI.DrawMenu();
+        ImGui::EndMenu();
+    }
+
+    ImGui::EndMainMenuBar();
+}
+
 void Editor::Draw(
     IDemoScene& demoScene,
     DemoSceneManager& sceneManager,
+    DebugUI& debugUI,
     float viewportWidth,
     float viewportHeight,
     float deltaTime)
 {
+    DrawMainMenu(demoScene, sceneManager, debugUI);
+
     const ImGuiIO& io = ImGui::GetIO();
 
     if (!io.WantCaptureKeyboard && !ImGuizmo::IsUsing() && !ImGui::IsMouseDown(ImGuiMouseButton_Right))
@@ -273,59 +415,72 @@ void Editor::Draw(
         }
     }
 
-    ImGui::Begin("Editor");
+    Scene& scene = demoScene.GetScene();
+    const std::string activeSceneName(sceneManager.GetActiveSceneName());
+    const uint64_t structureRevision = scene.GetStructureRevision();
 
-    const std::string_view activeSceneName = sceneManager.GetActiveSceneName();
-
-    if (ImGui::BeginCombo("Demo Scene", activeSceneName.data()))
+    if (m_selectionSceneName != activeSceneName || m_selectionStructureRevision != structureRevision)
     {
+        ClearTransformUndoHistory();
 
-        for (const DemoSceneEntry& entry : sceneManager.GetAvailableScenes())
+        m_selectedObject = InvalidObjectSelection;
+        m_selectionSceneName = activeSceneName;
+        m_selectionStructureRevision = structureRevision;
+    }
+
+    const Scene& constScene = scene;
+    const auto& objects = constScene.GetRenderObjects();
+
+    if (m_selectedObject >= objects.size())
+    {
+        m_selectedObject = InvalidObjectSelection;
+    }
+
+    if (m_showEditorPanel)
+    {
+        if (ImGui::Begin("Scene Inspector", &m_showEditorPanel))
         {
-            const bool isSelected = entry.name == activeSceneName;
 
-            if (ImGui::Selectable(entry.name.c_str(), isSelected))
+            if (auto* sphereGridScene = dynamic_cast<SphereGridScene*>(&demoScene))
             {
-                sceneManager.RequestScene(entry.name);
+
+                DrawSphereGridControls(*sphereGridScene);
+
+                ImGui::Separator();
             }
 
-            if (isSelected)
+            if (auto* stressTestScene = dynamic_cast<StressTestScene*>(&demoScene))
             {
-                ImGui::SetItemDefaultFocus();
+                DrawStressTestControls(*stressTestScene);
+
+                ImGui::Separator();
             }
+
+            DrawObjectControls(demoScene);
+
+            ImGui::Separator();
+
+            DrawCamera(demoScene);
+
+            ImGui::Separator();
+
+            DrawDirectionalLight(demoScene);
+
         }
 
-        ImGui::EndCombo();
+        ImGui::End();
     }
 
-    ImGui::Separator();
-
-    if (auto* sphereGridScene = dynamic_cast<SphereGridScene*>(&demoScene))
+    // Save is an application shortcut even when a property input owns keyboard
+    // focus. Do not gate it on WantCaptureKeyboard or consume text-edit input.
+    if (!m_sceneOperationPending && !m_fileRequest &&
+        dynamic_cast<const FileBackedDemoScene*>(&demoScene))
     {
-
-        DrawSphereGridControls(*sphereGridScene);
-
-        ImGui::Separator();
+        if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_S, false))
+        {
+            m_fileRequest = FileRequest{FileRequestType::Save, {}};
+        }
     }
-
-    if (auto* stressTestScene = dynamic_cast<StressTestScene*>(&demoScene))
-    {
-        DrawStressTestControls(*stressTestScene);
-
-        ImGui::Separator();
-    }
-
-    DrawObjectControls(demoScene, sceneManager);
-
-    ImGui::Separator();
-
-    DrawCamera(demoScene);
-
-    ImGui::Separator();
-
-    DrawDirectionalLight(demoScene);
-
-    ImGui::End();
 
     HandleTransformUndo(demoScene);
     HandleTransformRedo(demoScene);
@@ -446,30 +601,11 @@ void Editor::DrawDirectionalLight(IDemoScene& demoScene)
 }
 
 void Editor::DrawObjectControls(
-    IDemoScene& demoScene,
-    DemoSceneManager& sceneManager)
+    IDemoScene& demoScene)
 {
     Scene& scene = demoScene.GetScene();
 
-    const std::string activeSceneName(sceneManager.GetActiveSceneName());
-    const uint64_t structureRevision = scene.GetStructureRevision();
-
-    if (m_selectionSceneName != activeSceneName || m_selectionStructureRevision != structureRevision)
-    {
-        ClearTransformUndoHistory();
-
-        m_selectedObject = InvalidObjectSelection;
-        m_selectionSceneName = activeSceneName;
-        m_selectionStructureRevision = structureRevision;
-    }
-
-    const Scene& constScene = scene;
-    const auto& objects = constScene.GetRenderObjects();
-
-    if (m_selectedObject >= objects.size())
-    {
-        m_selectedObject = InvalidObjectSelection;
-    }
+    const auto& objects = scene.GetRenderObjects();
 
     if (!ImGui::CollapsingHeader("Objects", ImGuiTreeNodeFlags_DefaultOpen))
     {
@@ -1039,4 +1175,69 @@ void Editor::DrawCamera(IDemoScene& demoScene)
     {
         demoScene.ResetCamera();
     }
+}
+
+void Editor::SetSceneOperationPending(bool pending) noexcept
+{
+    m_sceneOperationPending = pending;
+}
+
+Editor::SceneChangeDecision Editor::DrawSceneChangeConfirmation(const std::string& error)
+{
+    constexpr const char* title = "Unsaved scene changes";
+
+    if (!ImGui::IsPopupOpen(title))
+    {
+        ImGui::OpenPopup(title);
+    }
+
+    SceneChangeDecision decision = SceneChangeDecision::None;
+
+    if (ImGui::BeginPopupModal(title, nullptr, ImGuiWindowFlags_AlwaysAutoResize))
+    {
+        ImGui::TextUnformatted("Save changes before leaving this scene?");
+
+        if (!error.empty())
+        {
+            ImGui::TextWrapped("%s", error.c_str());
+        }
+
+        if (ImGui::Button("Save"))
+        {
+            decision = SceneChangeDecision::Save;
+        }
+
+        ImGui::SameLine();
+
+        if (ImGui::Button("Discard"))
+        {
+            decision = SceneChangeDecision::Discard;
+        }
+
+        ImGui::SameLine();
+
+        if (ImGui::Button("Cancel"))
+        {
+            decision = SceneChangeDecision::Cancel;
+        }
+
+        // Save failure is handled by Engine and reopens the modal next frame.
+        if (decision != SceneChangeDecision::None)
+        {
+            ImGui::CloseCurrentPopup();
+        }
+
+        ImGui::EndPopup();
+    }
+
+    return decision;
+}
+
+void Editor::OnSceneActivated()
+{
+    // Different files may share a display name and structure revision.
+    ClearTransformUndoHistory();
+    m_selectedObject = InvalidObjectSelection;
+    m_selectionSceneName.clear();
+    m_selectionStructureRevision = 0;
 }

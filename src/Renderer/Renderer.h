@@ -158,6 +158,10 @@ class Renderer
         const Scene& scene,
         const std::vector<Material*>& materials);
 
+    // Failed-attempt recovery only; may drain the queue. Candidate assets must
+    // remain alive until this succeeds. Does not resolve async displacement.
+    [[nodiscard]] bool CleanupFailedSceneInitialization(const Scene& candidate);
+
     [[nodiscard]] bool ReleaseSceneResources();
     // Checked teardown only: performs the caller's existing queue drain, then
     // resolves exact successful submissions or cancels an unrecorded request.
@@ -639,6 +643,32 @@ class Renderer
         const DrawGeometryBinding& binding) const;
     // Zero/null until successful initialization; unique across Renderer
     // instances and reinitialization. Scene remains caller-owned.
+    enum class SceneInitializationCommands
+    {
+        None,
+        BeginAttempted,
+        Recording,
+        Recorded,
+        CloseAttempted,
+        Closed,
+        SubmissionAttempted,
+        Submitted,
+        Complete,
+        Abandoned
+    };
+
+    struct SceneInitializationAttempt
+    {
+        const Scene* candidate = nullptr;
+        SceneInitializationCommands commands = SceneInitializationCommands::None;
+
+        std::uint64_t recordingGeneration = 0;
+        bool failed = false;
+        bool gpuCompletionProven = false;
+    };
+
+    SceneInitializationAttempt m_sceneInitializationAttempt;
+
     std::uint64_t m_sceneResourceLifetime = 0;
     const Scene* m_sceneResourceScene = nullptr;
 

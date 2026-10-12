@@ -46,6 +46,13 @@ class CommandContext
     bool End();
     bool AbortRecording();
 
+    // Teardown/recovery only. Requires exclusive command-context use and no
+    // retained tokens or reservations. Drains first, then replaces the list
+    // and its allocator so abandoned commands cannot be submitted by Execute.
+    // Failure authorizes no caller resource release. Borrowed list pointers
+    // must not be retained across this operation.
+    bool DiscardCommandsAfterGPUDrain();
+
     bool Execute(unsigned int frameIndex);
     bool WaitForGPU();
 
