@@ -4,6 +4,9 @@
 #include "Project/ProjectLocator.h"
 #include "Project/ProjectPaths.h"
 #include "imgui.h"
+#include "imgui_internal.h"
+#include "assets/ProjectTextureImportService.h"
+#include "Core/Log.h"
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -168,7 +171,10 @@ void AssetBrowser::DrawMaterialCreationModal()
         m_openMaterialModal = false;
     }
 
-    if (ImGui::BeginPopupModal("Create Material", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
+    bool creationOpen = true;
+
+    // Closing is equivalent to Cancel: no creation request is issued.
+    if (ImGui::BeginPopupModal("Create Material", &creationOpen, ImGuiWindowFlags_AlwaysAutoResize))
     {
         if (ImGui::IsWindowAppearing())
         {
@@ -337,6 +343,7 @@ void AssetBrowser::Navigate(const std::filesystem::path& path)
 
     if (CanBrowse(path, m_error))
     {
+        m_thumbnailResetRequested = true;
         m_directory = path;
         m_selection.clear();
     }
@@ -360,6 +367,7 @@ void AssetBrowser::DrawTree(
     }
 
     const bool open = ImGui::TreeNodeEx("##Directory", flags, "%s", label.c_str());
+    CaptureDropTarget(path);
 
     if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen())
     {
@@ -415,12 +423,46 @@ void AssetBrowser::DrawContents()
             // Submit the icon and filename in normal layout order. The group
             // includes both items in the tile's hover and click bounds.
             ImGui::BeginGroup();
-            const bool pressed = ImGui::Selectable(entry.directory ? "[Folder]" : "[File]",
-                m_selection == entry.path, ImGuiSelectableFlags_AllowDoubleClick, ImVec2(0.0f, 48.0f));
+            const auto registered = m_textureRecords.find(entry.path.lexically_normal());
+            const bool isTexture = !entry.directory && registered != m_textureRecords.end();
+            const auto tilePosition = ImGui::GetCursorScreenPos();
+            constexpr float thumbnailSize = 96.0f;
+            const bool pressed = ImGui::Selectable(isTexture ? "##Texture" : entry.directory ? "[Folder]" : "[File]",
+                m_selection == entry.path, ImGuiSelectableFlags_AllowDoubleClick,
+                isTexture ? ImVec2(thumbnailSize, thumbnailSize) : ImVec2(0.0f, 48.0f));
+            const TextureThumbnailCache::Preview* preview = nullptr;
+
+            if(isTexture && ImGui::IsItemVisible())
+            {
+                if(!m_thumbnailResetRequested && m_thumbnailPaths && m_thumbnailRegistry)
+                {
+                    preview = m_thumbnails.FindOrCreate(*m_thumbnailPaths, *m_thumbnailRegistry, registered->second);
+                }
+
+                auto* draw = ImGui::GetWindowDrawList();
+                const ImVec2 start(tilePosition.x + 3.0f, tilePosition.y + 3.0f);
+                const ImVec2 end(tilePosition.x + thumbnailSize - 3.0f, tilePosition.y + thumbnailSize - 3.0f);
+                draw->AddRectFilled(start, end, IM_COL32(55, 55, 55, 255));
+
+                if(preview && preview->texture.GetResource())
+                {
+                    const float scale = (thumbnailSize - 6.0f) / static_cast<float>((std::max)(preview->width, preview->height));
+                    const ImVec2 size(preview->width * scale, preview->height * scale);
+                    const ImVec2 position(tilePosition.x + (thumbnailSize - size.x) * 0.5f,
+                        tilePosition.y + (thumbnailSize - size.y) * 0.5f);
+                    draw->AddImage(static_cast<ImTextureID>(m_thumbnails.GetHandle(*preview).ptr), position,
+                        ImVec2(position.x + size.x, position.y + size.y));
+                }
+                else
+                {
+                    draw->AddText(ImVec2(start.x + 5.0f, start.y + 5.0f), IM_COL32(190, 190, 190, 255), "Texture");
+                }
+            }
             ImGui::PushTextWrapPos(0.0f);
             ImGui::TextUnformatted(entry.name.c_str());
             ImGui::PopTextWrapPos();
             ImGui::EndGroup();
+            CaptureDropTarget(entry.navigable ? entry.path : std::filesystem::path{});
             const bool hovered = ImGui::IsItemHovered();
             tileHovered = tileHovered || hovered;
 
@@ -436,8 +478,9 @@ void AssetBrowser::DrawContents()
 
             if (hovered)
             {
-                ImGui::SetTooltip("%s%s", entry.name.c_str(),
-                    entry.directory && !entry.navigable ? " (directory link; browsing disabled)" : "");
+                ImGui::SetTooltip("%s%s%s", entry.name.c_str(),
+                    entry.directory && !entry.navigable ? " (directory link; browsing disabled)" : "",
+                    preview && !preview->error.empty() ? ("\n" + preview->error).c_str() : "");
             }
 
             ImGui::PopID();
@@ -489,6 +532,9 @@ void AssetBrowser::DrawContents()
 
 void AssetBrowser::Draw(const EditorWorkspaceRect& rectangle)
 {
+    m_thumbnails.BeginFrame();
+    m_dropTargets.clear();
+    m_dropFrame = ImGui::GetFrameCount();
     if(rectangle.size.x <= 0.0f || rectangle.size.y <= 0.0f)
     {
         return;
@@ -499,7 +545,8 @@ void AssetBrowser::Draw(const EditorWorkspaceRect& rectangle)
     ImGui::PushStyleVar(ImGuiStyleVar_WindowMinSize, ImVec2(1.0f, 1.0f));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
     ImGuiWindowFlags fixedFlags = ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize |
-        ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings;
+        ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings |
+        ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoFocusOnAppearing;
 
     // ImGui otherwise enforces title-bar height even when the assigned panel is smaller.
     if(rectangle.size.y < ImGui::GetFrameHeight())
@@ -509,9 +556,11 @@ void AssetBrowser::Draw(const EditorWorkspaceRect& rectangle)
 
     if(ImGui::Begin("Asset Browser", nullptr, fixedFlags))
     {
+        EditorWorkspace::KeepCurrentWindowBehindFloatingUI();
         if (ImGui::Button("Refresh"))
         {
             m_listings.clear();
+            m_thumbnailResetRequested = true;
             m_selection.clear();
             m_error.clear();
         }
@@ -552,6 +601,11 @@ void AssetBrowser::Draw(const EditorWorkspaceRect& rectangle)
             ImGui::TextWrapped("%s", m_error.c_str());
         }
 
+        if(!m_importFeedback.empty())
+        {
+            ImGui::TextWrapped("%s", m_importFeedback.c_str());
+        }
+
         if (ImGui::BeginTable("BrowserPanes", 2, ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV))
         {
             ImGui::TableSetupColumn("Directories", ImGuiTableColumnFlags_WidthFixed, 180.0f);
@@ -562,6 +616,7 @@ void AssetBrowser::Draw(const EditorWorkspaceRect& rectangle)
             ImGui::EndChild();
             ImGui::TableNextColumn();
             ImGui::BeginChild("ContentGrid");
+            CaptureDropTarget(m_directory, true);
             DrawContents();
             ImGui::EndChild();
             ImGui::EndTable();
@@ -572,4 +627,125 @@ void AssetBrowser::Draw(const EditorWorkspaceRect& rectangle)
 
     ImGui::End();
     ImGui::PopStyleVar(2);
+}
+
+void AssetBrowser::CaptureDropTarget(const std::filesystem::path& directory, bool contentArea)
+{
+    const ImGuiWindow* window = ImGui::GetCurrentWindow();
+    ImRect bounds = contentArea ? window->InnerRect : ImRect(ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    bounds.ClipWith(window->ClipRect);
+    m_dropTargets.push_back({bounds.Min.x, bounds.Min.y, bounds.Max.x, bounds.Max.y, window->ID, directory});
+}
+
+void AssetBrowser::ImportFileDrop(
+    const std::vector<std::filesystem::path>& files,
+    float screenX,
+    float screenY,
+    const ProjectPaths& paths,
+    ProjectAssetRegistry& registry)
+{
+    m_importFeedback.clear();
+    const ImVec2 point(screenX, screenY);
+    const DropTarget* target = nullptr;
+    ImGuiID topWindow = 0;
+
+    // Use this frame's final window order, including floating windows and splitters.
+    const ImGuiContext& context = *ImGui::GetCurrentContext();
+
+    for(int index = context.Windows.Size - 1; index >= 0; --index)
+    {
+        const ImGuiWindow* window = context.Windows[index];
+
+        if(window->LastFrameActive != ImGui::GetFrameCount() || window->Hidden ||
+           (window->Flags & ImGuiWindowFlags_NoMouseInputs))
+        {
+            continue;
+        }
+
+        if(window->OuterRectClipped.Contains(point))
+        {
+            topWindow = window->ID;
+            break;
+        }
+    }
+
+    if(m_dropFrame == ImGui::GetFrameCount() &&
+       !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel))
+    {
+        for(auto iterator = m_dropTargets.rbegin(); iterator != m_dropTargets.rend(); ++iterator)
+        {
+            if(screenX >= iterator->left && screenX < iterator->right &&
+               screenY >= iterator->top && screenY < iterator->bottom && iterator->windowID == topWindow)
+            {
+                target = &*iterator;
+                break;
+            }
+        }
+    }
+
+    if(!target || target->directory.empty())
+    {
+        m_importFeedback = "Drop rejected: use a visible texture folder or empty Asset Browser content area.";
+        Log::Info(m_importFeedback);
+        return;
+    }
+
+    size_t successes = 0;
+    std::string failures;
+    std::string renamed;
+
+    for(const auto& source : files)
+    {
+        std::filesystem::path imported;
+        std::string error;
+
+        if(ProjectTextureImportService::Import(paths, registry, source, target->directory, imported, error))
+        {
+            ++successes;
+
+            if(imported.filename() != source.filename())
+            {
+                renamed += "\nCollision resolved: " + source.filename().string() + " -> " + imported.filename().string();
+            }
+
+            Log::Info("Imported texture: " + imported.string());
+        }
+        else
+        {
+            failures += "\n" + source.filename().string() + ": " + error;
+            Log::Error("Texture import failed: " + source.string() + ": " + error);
+        }
+    }
+
+    m_importFeedback = "Imported " + std::to_string(successes) + " of " + std::to_string(files.size()) + " textures." + renamed + failures;
+
+    if(successes != 0)
+    {
+        // Refresh without clearing folder navigation, selection, or Inspector edits.
+        m_listings.clear();
+    }
+}
+
+void AssetBrowser::SetThumbnailProject(const ProjectPaths& paths, const ProjectAssetRegistry& registry)
+{
+    if(!m_thumbnailProjectRoot.empty() && m_thumbnailProjectRoot != paths.GetRoot())
+    {
+        m_thumbnailResetRequested = true;
+    }
+
+    m_thumbnailProjectRoot = paths.GetRoot();
+    m_thumbnailPaths = paths;
+    m_thumbnailRegistry = &registry;
+    m_textureRecords.clear();
+
+    for(const auto& record : registry.GetAssets(AssetType::Texture))
+    {
+        m_textureRecords.emplace((paths.GetRoot() / record.relativePath).lexically_normal(), record);
+    }
+}
+
+void AssetBrowser::ClearThumbnailsAfterGPUDrain()
+{
+    m_thumbnails.ClearAfterGPUDrain();
+    m_thumbnailResetRequested = false;
 }

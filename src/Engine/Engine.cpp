@@ -546,6 +546,11 @@ bool Engine::Initialize()
 
     const float aspectRatio = static_cast<float>(m_window.GetWidth()) / static_cast<float>(m_window.GetHeight());
 
+    m_editor.ConfigureThumbnails(m_renderer.GetDevice(), m_renderer.GetResourceUploader(),
+        m_renderer.GetResourceDescriptorHeap());
+
+    m_demoSceneManager.SetProjectAssets(ProjectLocator::GetDefaultProjectRoot(), m_projectAssetRegistry);
+
     if(!m_demoSceneManager.Initialize(
             "Sphere Grid", m_renderer.GetDevice(), m_renderer.GetResourceUploader(),
             m_renderer.GetResourceDescriptorHeap(), m_demoVertexShader, m_demoPixelShader,
@@ -609,7 +614,11 @@ bool Engine::Initialize()
 
                 break;
             case EventType::WindowClose:
-                m_window.Close();
+                if(m_editor.RequestApplicationClose())
+                {
+                    m_window.Close();
+                }
+
                 break;
             case EventType::KeyPressed:
                 m_input.SetKeyState(event.code, true);
@@ -883,6 +892,18 @@ void Engine::Frame()
         environmentNames.push_back(environment.displayName);
     }
 
+    if(m_editor.NeedsThumbnailReset())
+    {
+        if(!m_renderer.WaitForGPU())
+        {
+            Log::Error("Thumbnail retirement GPU drain failed; retaining resources and stopping.");
+            m_window.Close();
+            return;
+        }
+
+        m_editor.ClearThumbnailsAfterGPUDrain();
+    }
+
     debugUI.BeginFrame();
 
     IDemoScene& activeDemo = m_demoSceneManager.GetActiveScene();
@@ -938,11 +959,29 @@ void Engine::Frame()
     m_demoSceneManager.SetAspectRatio(static_cast<float>(finalSceneImage.width) /
                                     static_cast<float>(finalSceneImage.height));
 
+    const ProjectPaths inspectorPaths(ProjectLocator::GetDefaultProjectRoot());
     m_editor.Draw(activeDemo, m_demoSceneManager, debugUI, finalSceneImage.srv.ptr,
-                  finalSceneImage.width, finalSceneImage.height, m_time.GetDeltaTime());
+                  finalSceneImage.width, finalSceneImage.height, m_time.GetDeltaTime(),
+                  inspectorPaths, m_projectAssetRegistry);
 
     debugUI.DrawPerformanceWindow(environmentNames, m_renderer.GetCurrentEnvironmentIndex(),
                                   m_renderer.GetStatistics());
+
+    for(const auto& drop : m_window.TakeFileDrops())
+    {
+        // Win32 drops are client-relative. ImGui's main viewport uses client
+        // coordinates in this non-platform-viewport backend, not desktop pixels.
+        const ImVec2 origin = ImGui::GetMainViewport()->Pos;
+        m_editor.ImportFileDrop(drop.files, origin.x + static_cast<float>(drop.x),
+            origin.y + static_cast<float>(drop.y), inspectorPaths, m_projectAssetRegistry);
+    }
+
+    if(m_editor.TakeApplicationCloseApproval())
+    {
+        ImGui::EndFrame();
+        m_window.Close();
+        return;
+    }
 
     ProcessEditorSceneRequests(activeDemo);
     ProcessEditorMaterialRequests();
@@ -1062,6 +1101,7 @@ void Engine::Frame()
     }
 
     RendererOptions rendererOptions{};
+    rendererOptions.editorTextures = m_editor.GetThumbnailTextures();
 
     rendererOptions.enableRTGI = debugUI.IsRTGIEnabled();
     rendererOptions.rtgiContactAOStrength = debugUI.GetRTGIContactAOStrength();
@@ -1155,6 +1195,7 @@ void Engine::Shutdown()
         }
     }
 
+    m_editor.ClearThumbnailsAfterGPUDrain();
     m_demoSceneManager.Shutdown();
     m_renderer.Shutdown();
     m_window.Shutdown();

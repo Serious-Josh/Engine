@@ -24,6 +24,8 @@ public:
         const Shader* vertexShader,
         const Shader* pixelShader) override;
 
+    void SetProjectAssets(const std::filesystem::path& root, const ProjectAssetRegistry& registry);
+
     const std::string& GetDisplayName() const noexcept;
     bool Save(std::string* errorMessage = nullptr);
     bool CheckUnsavedChanges(bool& dirty, std::string* errorMessage = nullptr) const;
@@ -42,6 +44,8 @@ public:
 
 private:
     std::filesystem::path m_scenePath;
+    std::filesystem::path m_projectRoot;
+    const ProjectAssetRegistry* m_registry = nullptr;
 
     FileSceneAssetCatalog m_assets;
     FileSceneRuntime m_runtime;

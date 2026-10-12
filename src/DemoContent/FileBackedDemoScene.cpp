@@ -39,6 +39,14 @@ FileBackedDemoScene::FileBackedDemoScene(
 {
 }
 
+void FileBackedDemoScene::SetProjectAssets(
+    const std::filesystem::path& root,
+    const ProjectAssetRegistry& registry)
+{
+    m_projectRoot = root;
+    m_registry = &registry;
+}
+
 bool FileBackedDemoScene::Initialize(
     ID3D12Device* device,
     ResourceUploader& uploader,
@@ -77,9 +85,14 @@ bool FileBackedDemoScene::Initialize(
         return false;
     }
 
+    if(m_registry)
+    {
+        m_assets.SetProjectAssets(ProjectPaths(m_projectRoot), *m_registry);
+    }
+
     if (!m_runtime.Prepare(m_assets, &error))
     {
-        Log::Error("Failed to prepare file-backed scene: " + error);
+        Log::Error("Failed to prepare file-backed scene: " + error + " " + m_assets.GetLastMaterialError());
         Shutdown();
         return false;
     }

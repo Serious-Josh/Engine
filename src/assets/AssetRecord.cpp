@@ -12,7 +12,7 @@ bool ValidateAssetRecord(const AssetRecord& record)
             expectedDirectory = "Meshes";
             break;
         case AssetType::Texture:
-            expectedDirectory = "Textures";
+            // Texture identity is independent of organizational folders.
             break;
 
         default:
@@ -38,6 +38,11 @@ bool ValidateAssetRecord(const AssetRecord& record)
            component == ".."){
             return false;
         }
+    }
+
+    if(record.type == AssetType::Texture)
+    {
+        return true;
     }
 
     auto it = path.begin();

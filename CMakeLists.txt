@@ -114,6 +114,7 @@ add_executable(Engine
     src/Editor/Editor.cpp
     src/Editor/EditorWorkspace.cpp
     src/Editor/InspectorPanel.cpp
+    src/Editor/TextureThumbnailCache.cpp
     src/Editor/AssetBrowser.cpp
     src/Renderer/Passes/RayTracedReflectionPass.cpp
     src/Renderer/Passes/RayTracedReflectionDenoisePass.cpp
@@ -162,6 +163,7 @@ add_executable(Engine
     src/assets/AssetRegistrySerializer.cpp
     src/assets/ProjectAssetResolver.cpp
     src/assets/MaterialAssetSerializer.cpp
+    src/assets/ProjectTextureImportService.cpp
     src/assets/ProjectMaterialAssetService.cpp
 )
 
@@ -228,6 +230,7 @@ target_include_directories(Engine
 
 target_link_libraries(Engine
     PRIVATE
+        shell32
         ole32
         dxgi
         d3d12

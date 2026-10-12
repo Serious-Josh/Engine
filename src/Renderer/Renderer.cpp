@@ -3323,6 +3323,12 @@ void Renderer::Draw(
                                                                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     }
 
+    if(object.material->heightTexture)
+    {
+        object.material->heightTexture->Transition(commandList,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    }
+
     if (geometry.indexed)
     {
         const uint64_t indexCount = static_cast<uint64_t>(geometry.indexCount);
@@ -5253,6 +5259,12 @@ bool Renderer::RecordRenderFrame(
     m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::ToneMap);
 
     m_finalSceneColor.Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+
+    // Uploaded editor previews use the same tracked transitions as material textures.
+    for(Texture* texture : options.editorTextures)
+    {
+        texture->Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    }
 
     // UI composes the scene image onto a clean application-sized background.
     commandList->ClearRenderTargetView(rtvHandle, clearColor, 0, nullptr);

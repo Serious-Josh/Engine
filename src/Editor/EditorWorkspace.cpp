@@ -1,4 +1,5 @@
 #include "EditorWorkspace.h"
+#include "imgui_internal.h"
 
 #include <algorithm>
 
@@ -10,6 +11,8 @@ namespace
 
     struct SplitterInteraction
     {
+        ImDrawList* drawList = nullptr;
+
         float delta = 0.0f;
 
         bool hovered = false;
@@ -58,11 +61,14 @@ namespace
         ImGui::PushStyleVar(ImGuiStyleVar_WindowMinSize, ImVec2(1.0f, 1.0f));
         const ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
             ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBackground |
-            ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoNav;
+            ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoNav |
+            ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoFocusOnAppearing;
         SplitterInteraction interaction;
 
         if(ImGui::Begin(name, nullptr, flags))
         {
+            EditorWorkspace::KeepCurrentWindowBehindFloatingUI();
+            interaction.drawList = ImGui::GetWindowDrawList();
             ImGui::InvisibleButton("Resize", rectangle.size);
 
             interaction.active = ImGui::IsItemActive();
@@ -91,7 +97,7 @@ namespace
         bool vertical,
         const SplitterInteraction& interaction)
     {
-        if(rectangle.size.x <= 0.0f || rectangle.size.y <= 0.0f)
+        if(rectangle.size.x <= 0.0f || rectangle.size.y <= 0.0f || !interaction.drawList)
         {
             return;
         }
@@ -114,14 +120,26 @@ namespace
 
         // Fill the existing layout strip so the narrow visible line leaves no unused gap.
         const ImVec2 end(rectangle.position.x + rectangle.size.x, rectangle.position.y + rectangle.size.y);
-        ImGui::GetForegroundDrawList()->AddRectFilled(rectangle.position, end, ImGui::GetColorU32(ImGuiCol_WindowBg));
+        // Draw in the input window's normal layer, at the final same-frame boundary.
+        // Its initial clip rectangle may precede a drag-induced layout change.
+        interaction.drawList->PushClipRect(rectangle.position, end, false);
+        interaction.drawList->AddRectFilled(rectangle.position, end, ImGui::GetColorU32(ImGuiCol_WindowBg));
         const ImGuiCol color = interaction.active ? ImGuiCol_SeparatorActive :
             interaction.hovered ? ImGuiCol_SeparatorHovered : ImGuiCol_Separator;
-        ImGui::GetForegroundDrawList()->AddRectFilled(
+        interaction.drawList->AddRectFilled(
             divider.position,
             ImVec2(divider.position.x + divider.size.x, divider.position.y + divider.size.y),
             ImGui::GetColorU32(color));
+        interaction.drawList->PopClipRect();
     }
+}
+
+void EditorWorkspace::KeepCurrentWindowBehindFloatingUI()
+{
+    // ImGui's public window flags prevent focus promotion but do not establish a
+    // persistent lower layer. Limit this internal display-order operation to fixed
+    // workspace windows; popup/modal focus and input blocking remain ImGui-owned.
+    ImGui::BringWindowToDisplayBack(ImGui::GetCurrentWindow());
 }
 
 void EditorWorkspace::Calculate()
@@ -214,6 +232,8 @@ void EditorWorkspace::Update()
         auto tail = m_horizontalSplitter;
         tail.position.x += m_sceneViewport.size.x;
         tail.size.x -= m_sceneViewport.size.x;
-        PositionSplitter("##WorkspaceHorizontalTail", tail, tail, false, horizontal);
+        horizontalTail.hovered = horizontal.hovered;
+        horizontalTail.active = horizontal.active;
+        PositionSplitter("##WorkspaceHorizontalTail", tail, tail, false, horizontalTail);
     }
 }

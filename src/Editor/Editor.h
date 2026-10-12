@@ -18,6 +18,8 @@ class SphereGridScene;
 class StressTestScene;
 class DemoSceneManager;
 class DebugUI;
+class ProjectPaths;
+class ProjectAssetRegistry;
 
 class Editor
 {
@@ -45,6 +47,39 @@ public:
         Discard,
         Cancel
     };
+
+    // Normal user-close requests may be deferred until material edits are resolved.
+    bool RequestApplicationClose();
+    bool TakeApplicationCloseApproval();
+
+    void ImportFileDrop(
+        const std::vector<std::filesystem::path>& files,
+        float screenX,
+        float screenY,
+        const ProjectPaths& paths,
+        ProjectAssetRegistry& registry);
+
+    void ConfigureThumbnails(
+        ID3D12Device* device,
+        ResourceUploader& uploader,
+        DescriptorHeap& heap)
+    {
+        m_assetBrowser.ConfigureThumbnails(device, uploader, heap);
+    }
+    bool NeedsThumbnailReset() const
+    {
+        return m_assetBrowser.NeedsThumbnailReset();
+    }
+
+    void ClearThumbnailsAfterGPUDrain()
+    {
+        m_assetBrowser.ClearThumbnailsAfterGPUDrain();
+    }
+
+    std::vector<Texture*> GetThumbnailTextures()
+    {
+        return m_assetBrowser.GetThumbnailTextures();
+    }
 
     void SetSceneOperationPending(bool pending) noexcept;
     void OnSceneActivated();
@@ -76,7 +111,9 @@ public:
         std::uint64_t sceneTextureHandle,
         unsigned int sceneWidth,
         unsigned int sceneHeight,
-        float deltaTime);
+        float deltaTime,
+        const ProjectPaths& projectPaths,
+        const ProjectAssetRegistry& assetRegistry);
 
     size_t GetSelectedObject() const
     {
@@ -98,6 +135,22 @@ private:
         const IDemoScene& demoScene,
         DemoSceneManager& sceneManager,
         DebugUI& debugUI);
+
+    enum class MaterialLeaveAction
+    {
+        None,
+        Selection,
+        Refresh,
+        Hide,
+        Scene,
+        Close
+    };
+
+    MaterialLeaveAction m_materialLeaveAction = MaterialLeaveAction::None;
+    std::filesystem::path m_inspectedAssetSelection;
+    std::filesystem::path m_pendingAssetSelection;
+
+    bool m_applicationCloseApproved = false;
 
     std::optional<FileRequest> m_fileRequest;
 

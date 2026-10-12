@@ -6,6 +6,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
 #include <Windowsx.h>
+#include <shellapi.h>
 
 #include <utility>
 #include "imgui_impl_win32.h"
@@ -41,6 +42,37 @@ LRESULT CALLBACK WindowProc(
 
     switch (uMsg)
     {
+    case WM_DROPFILES:
+    {
+        const HDROP drop = reinterpret_cast<HDROP>(wParam);
+        POINT point{};
+        WindowsWindow::FileDrop request;
+
+        if(window && DragQueryPoint(drop, &point))
+        {
+            request.x = point.x;
+            request.y = point.y;
+            const UINT count = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
+
+            for(UINT index = 0; index < count; ++index)
+            {
+                const UINT length = DragQueryFileW(drop, index, nullptr, 0);
+                std::wstring path(length + 1, L'\0');
+
+                if(DragQueryFileW(drop, index, path.data(), length + 1))
+                {
+                    path.resize(length);
+                    request.files.emplace_back(path);
+                }
+            }
+
+            window->QueueFileDrop(std::move(request));
+        }
+
+        DragFinish(drop);
+        return 0;
+    }
+
     case WM_SETCURSOR:
     {
         if (LOWORD(lParam) == HTCLIENT)
@@ -285,6 +317,7 @@ bool WindowsWindow::Initialize(const WindowProperties& properties)
         return false;
     }
 
+    DragAcceptFiles(static_cast<HWND>(m_windowHandle), TRUE);
     ShowWindow(static_cast<HWND>(m_windowHandle), SW_SHOW);
 
     return true;
@@ -292,6 +325,7 @@ bool WindowsWindow::Initialize(const WindowProperties& properties)
 
 void WindowsWindow::Shutdown()
 {
+    m_fileDrops.clear();
     if (m_windowHandle != nullptr)
     {
         DestroyWindow(static_cast<HWND>(m_windowHandle));
@@ -301,6 +335,16 @@ void WindowsWindow::Shutdown()
     HINSTANCE instance = GetModuleHandle(nullptr);
 
     UnregisterClassW(L"EngineWindowClass", instance);
+}
+
+void WindowsWindow::QueueFileDrop(FileDrop drop)
+{
+    m_fileDrops.push_back(std::move(drop));
+}
+
+std::vector<WindowsWindow::FileDrop> WindowsWindow::TakeFileDrops()
+{
+    return std::exchange(m_fileDrops, {});
 }
 
 void WindowsWindow::ProcessMessages()

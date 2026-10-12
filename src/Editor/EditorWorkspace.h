@@ -14,6 +14,9 @@ class EditorWorkspace
 public:
     void Update();
 
+    // Call inside a fixed panel's Begin/End scope, never from floating UI.
+    static void KeepCurrentWindowBehindFloatingUI();
+
     bool IsSplitterDragging() const
     {
         return m_splitterDragging;

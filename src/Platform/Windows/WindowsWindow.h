@@ -5,6 +5,7 @@
 
 #include <functional>
 #include <filesystem>
+#include <vector>
 
 class WindowsWindow
 {
@@ -17,6 +18,15 @@ class WindowsWindow
     bool Initialize(const WindowProperties& properties);
     void Shutdown();
 
+    struct FileDrop
+    {
+        std::vector<std::filesystem::path> files;
+        int x = 0;
+        int y = 0;
+    };
+
+    void QueueFileDrop(FileDrop drop);
+    std::vector<FileDrop> TakeFileDrops();
     void ProcessMessages();
     void WaitForMessage();
     bool ShouldClose() const;
@@ -36,6 +46,8 @@ class WindowsWindow
     static std::filesystem::path GetExecutableDirectory();
 
     private:
+    std::vector<FileDrop> m_fileDrops;
+
     void* m_windowHandle = nullptr;
 
     bool m_shouldClose = false;

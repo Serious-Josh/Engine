@@ -39,7 +39,8 @@ namespace
                 return paths.GetMeshesDirectory();
 
             case AssetType::Texture:
-                return paths.GetTexturesDirectory();
+                // Textures may live anywhere below the project's asset root.
+                return paths.GetRoot();
 
             default:
                 return {};
@@ -94,8 +95,11 @@ AssetResolution ProjectAssetResolver::Resolve(
         return { AssetAvailability::Unreadable, {} };
     }
 
-    // The category directory itself must remain inside the project.
-    if(!IsContainedWithin(resolvedCategory, resolvedRoot))
+    // Texture resolution uses the root itself; other category directories
+    // must still remain strictly inside it, including through junctions.
+    const bool textureRoot = record->type == AssetType::Texture && resolvedCategory == resolvedRoot;
+
+    if(!textureRoot && !IsContainedWithin(resolvedCategory, resolvedRoot))
     {
         return { AssetAvailability::InvalidPath, {} };
     }

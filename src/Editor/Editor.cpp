@@ -1,3 +1,4 @@
+#include "Core/Log.h"
 #include "Editor.h"
 #include "Debug/DebugUI.h"
 
@@ -254,8 +255,44 @@ namespace
     }
 }
 
+bool Editor::RequestApplicationClose()
+{
+    if(m_materialLeaveAction != MaterialLeaveAction::None || m_sceneOperationPending || m_fileRequest)
+    {
+        return false;
+    }
+
+    if(!m_inspectorPanel.HasUnsavedChanges())
+    {
+        return true;
+    }
+
+    m_materialLeaveAction = MaterialLeaveAction::Close;
+    return false;
+}
+
+bool Editor::TakeApplicationCloseApproval()
+{
+    return std::exchange(m_applicationCloseApproved, false);
+}
+
 std::optional<Editor::FileRequest> Editor::TakeFileRequest()
 {
+    if(m_fileRequest && m_fileRequest->type != FileRequestType::Save && m_inspectorPanel.HasUnsavedChanges())
+    {
+        if(m_materialLeaveAction == MaterialLeaveAction::None)
+        {
+            m_materialLeaveAction = MaterialLeaveAction::Scene;
+        }
+
+        return std::nullopt;
+    }
+
+    if(m_materialLeaveAction != MaterialLeaveAction::None)
+    {
+        return std::nullopt;
+    }
+
     return std::exchange(
         m_fileRequest,
         std::nullopt);
@@ -290,7 +327,7 @@ void Editor::DrawMainMenu(
 
     if (ImGui::BeginMenu("File"))
     {
-        ImGui::BeginDisabled(m_sceneOperationPending || m_fileRequest.has_value());
+        ImGui::BeginDisabled(m_sceneOperationPending || m_fileRequest.has_value() || m_materialLeaveAction != MaterialLeaveAction::None);
 
         if (ImGui::MenuItem("New"))
         {
@@ -363,13 +400,27 @@ void Editor::DrawMainMenu(
     if (ImGui::BeginMenu("Editor"))
     {
         ImGui::MenuItem("Scene Inspector", nullptr, &m_showEditorPanel);
-        ImGui::MenuItem("Inspector", nullptr, &m_workspace.InspectorVisible());
+        ImGui::BeginDisabled(m_materialLeaveAction != MaterialLeaveAction::None);
+
+        if(ImGui::MenuItem("Inspector", nullptr, m_workspace.InspectorVisible()))
+        {
+            if(m_workspace.InspectorVisible() && m_inspectorPanel.HasUnsavedChanges())
+            {
+                m_materialLeaveAction = MaterialLeaveAction::Hide;
+            }
+            else
+            {
+                m_workspace.InspectorVisible() = !m_workspace.InspectorVisible();
+            }
+        }
+
+        ImGui::EndDisabled();
         ImGui::MenuItem("Asset Browser", nullptr, &m_workspace.AssetBrowserVisible());
         ImGui::Separator();
 
         const std::string_view activeSceneName = sceneManager.GetActiveSceneName();
 
-        ImGui::BeginDisabled(m_sceneOperationPending || m_fileRequest.has_value());
+        ImGui::BeginDisabled(m_sceneOperationPending || m_fileRequest.has_value() || m_materialLeaveAction != MaterialLeaveAction::None);
 
         if (ImGui::BeginCombo("Demo Scene", activeSceneName.data()))
         {
@@ -430,6 +481,7 @@ void Editor::DrawSceneViewport(
 
     if(ImGui::Begin("Scene Viewport", nullptr, flags))
     {
+        EditorWorkspace::KeepCurrentWindowBehindFloatingUI();
         if(sceneTextureHandle != 0 && sceneWidth != 0 && sceneHeight != 0)
         {
             const ImVec2 framebufferScale = ImGui::GetIO().DisplayFramebufferScale;
@@ -476,19 +528,111 @@ void Editor::Draw(
     std::uint64_t sceneTextureHandle,
     unsigned int sceneWidth,
     unsigned int sceneHeight,
-    float deltaTime)
+    float deltaTime,
+    const ProjectPaths& projectPaths,
+    const ProjectAssetRegistry& assetRegistry)
 {
 
     (void)debugUI;
-
-    if(m_workspace.InspectorVisible())
-    {
-        m_inspectorPanel.Draw(m_workspace.GetInspector());
-    }
+    m_assetBrowser.SetThumbnailProject(projectPaths, assetRegistry);
+    ImGui::BeginDisabled(m_materialLeaveAction != MaterialLeaveAction::None || m_sceneOperationPending);
 
     if(m_workspace.AssetBrowserVisible())
     {
         m_assetBrowser.Draw(m_workspace.GetAssetBrowser());
+    }
+
+    ImGui::EndDisabled();
+
+    if(m_materialLeaveAction == MaterialLeaveAction::None &&
+       m_assetBrowser.GetSelection() != m_inspectedAssetSelection)
+    {
+        if(m_inspectorPanel.HasUnsavedChanges())
+        {
+            m_pendingAssetSelection = m_assetBrowser.GetSelection();
+            m_materialLeaveAction = MaterialLeaveAction::Selection;
+        }
+        else
+        {
+            m_inspectedAssetSelection = m_assetBrowser.GetSelection();
+            m_inspectorPanel.LoadSelection(m_inspectedAssetSelection, projectPaths, assetRegistry);
+        }
+    }
+
+    const bool disableInspector = m_materialLeaveAction != MaterialLeaveAction::None || m_sceneOperationPending;
+
+    // This ImGui version's color picker restores alpha whenever a disabled scope exists,
+    // including BeginDisabled(false), whose alpha backup may never have been initialized.
+    if(disableInspector)
+    {
+        ImGui::BeginDisabled();
+    }
+
+    if(m_workspace.InspectorVisible())
+    {
+        m_inspectorPanel.Draw(
+            m_workspace.GetInspector(), projectPaths, assetRegistry,
+            m_materialLeaveAction != MaterialLeaveAction::None);
+    }
+
+    if(disableInspector)
+    {
+        ImGui::EndDisabled();
+    }
+
+    if(m_inspectorPanel.TakeRefreshRequest() && m_materialLeaveAction == MaterialLeaveAction::None)
+    {
+        if(m_inspectorPanel.HasUnsavedChanges())
+        {
+            m_materialLeaveAction = MaterialLeaveAction::Refresh;
+        }
+        else
+        {
+            m_inspectorPanel.LoadSelection(m_inspectedAssetSelection, projectPaths, assetRegistry);
+        }
+    }
+
+    if(m_materialLeaveAction != MaterialLeaveAction::None)
+    {
+        const auto decision = m_inspectorPanel.DrawUnsavedConfirmation(projectPaths, assetRegistry);
+
+        if(decision == InspectorPanel::LeaveDecision::Proceed)
+        {
+            switch(m_materialLeaveAction)
+            {
+            case MaterialLeaveAction::Selection:
+                m_inspectedAssetSelection = m_pendingAssetSelection;
+                m_inspectorPanel.LoadSelection(m_inspectedAssetSelection, projectPaths, assetRegistry);
+                break;
+            case MaterialLeaveAction::Refresh:
+                m_inspectorPanel.LoadSelection(m_inspectedAssetSelection, projectPaths, assetRegistry);
+                break;
+            case MaterialLeaveAction::Hide:
+                m_workspace.InspectorVisible() = false;
+                break;
+            case MaterialLeaveAction::Close:
+                m_applicationCloseApproved = true;
+                break;
+            default:
+                break;
+            }
+
+            m_materialLeaveAction = MaterialLeaveAction::None;
+        }
+        else if(decision == InspectorPanel::LeaveDecision::Cancel)
+        {
+            if(m_materialLeaveAction == MaterialLeaveAction::Selection)
+            {
+                m_assetBrowser.RestoreSelection(m_inspectedAssetSelection);
+            }
+
+            if(m_materialLeaveAction == MaterialLeaveAction::Scene)
+            {
+                m_fileRequest.reset();
+            }
+
+            m_materialLeaveAction = MaterialLeaveAction::None;
+        }
     }
 
     DrawSceneViewport(sceneTextureHandle, sceneWidth, sceneHeight);
@@ -579,7 +723,7 @@ void Editor::Draw(
     // Save is an application shortcut even when a property input owns keyboard
     // focus. Do not gate it on WantCaptureKeyboard or consume text-edit input.
 
-    if (!m_sceneOperationPending && !m_fileRequest &&
+    if (!m_sceneOperationPending && !m_fileRequest && m_materialLeaveAction == MaterialLeaveAction::None &&
         dynamic_cast<const FileBackedDemoScene*>(&demoScene))
     {
         if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_S, false))
@@ -1308,7 +1452,9 @@ Editor::SceneChangeDecision Editor::DrawSceneChangeConfirmation(const std::strin
 
     SceneChangeDecision decision = SceneChangeDecision::None;
 
-    if (ImGui::BeginPopupModal(title, nullptr, ImGuiWindowFlags_AlwaysAutoResize))
+    bool confirmationOpen = true;
+
+    if (ImGui::BeginPopupModal(title, &confirmationOpen, ImGuiWindowFlags_AlwaysAutoResize))
     {
         ImGui::TextUnformatted("Save changes before leaving this scene?");
 
@@ -1346,6 +1492,11 @@ Editor::SceneChangeDecision Editor::DrawSceneChangeConfirmation(const std::strin
         ImGui::EndPopup();
     }
 
+    if(!confirmationOpen)
+    {
+        decision = SceneChangeDecision::Cancel;
+    }
+
     return decision;
 }
 
@@ -1368,4 +1519,20 @@ void Editor::OnSceneActivated()
     m_selectedObject = InvalidObjectSelection;
     m_selectionSceneName.clear();
     m_selectionStructureRevision = 0;
+}
+
+void Editor::ImportFileDrop(
+    const std::vector<std::filesystem::path>& files,
+    float screenX,
+    float screenY,
+    const ProjectPaths& paths,
+    ProjectAssetRegistry& registry)
+{
+    if(m_sceneOperationPending || m_materialLeaveAction != MaterialLeaveAction::None)
+    {
+        Log::Info("Texture drop rejected while an editor operation is pending.");
+        return;
+    }
+
+    m_assetBrowser.ImportFileDrop(files, screenX, screenY, paths, registry);
 }

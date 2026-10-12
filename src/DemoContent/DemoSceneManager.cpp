@@ -6,6 +6,24 @@
 
 #include <utility>
 
+void DemoSceneManager::SetProjectAssets(
+    const std::filesystem::path& root,
+    const ProjectAssetRegistry& registry)
+{
+    m_projectRoot = root;
+    m_registry = &registry;
+}
+
+void DemoSceneManager::ConfigureProjectAssets(IDemoScene& scene) const
+{
+    auto* fileScene = dynamic_cast<FileBackedDemoScene*>(&scene);
+
+    if(fileScene && m_registry)
+    {
+        fileScene->SetProjectAssets(m_projectRoot, *m_registry);
+    }
+}
+
 bool DemoSceneManager::Initialize(
     std::string_view sceneName,
     ID3D12Device* device,
@@ -37,6 +55,8 @@ bool DemoSceneManager::Initialize(
         Log::Error("Failed to create demo scene.");
         return false;
     }
+
+    ConfigureProjectAssets(*m_activeScene);
 
     if (!m_activeScene->Initialize(device, uploader, descriptorHeap, vertexShader, pixelShader))
     {
@@ -143,6 +163,8 @@ bool DemoSceneManager::ApplyPendingSceneChange(
         Log::Error("Failed to create requested demo scene.");
         return false;
     }
+
+    ConfigureProjectAssets(*newScene);
 
     if (!newScene->Initialize(device, uploader, descriptorHeap, vertexShader, pixelShader))
     {
@@ -284,6 +306,8 @@ bool DemoSceneManager::StageRequestedFileScene(
     try
     {
         candidate = std::make_unique<FileBackedDemoScene>(m_requestedFilePath);
+
+        ConfigureProjectAssets(*candidate);
 
         if (!candidate->Initialize(device, uploader, descriptorHeap, vertexShader, pixelShader))
         {

@@ -10,6 +10,7 @@
 #include <string_view>
 
 class SphereGridScene;
+class ProjectAssetRegistry;
 
 class DemoSceneManager
 {
@@ -24,6 +25,9 @@ class DemoSceneManager
       float aspectRatio);
 
     void Shutdown();
+
+    // Engine owns the live registry; scene instances only borrow it.
+    void SetProjectAssets(const std::filesystem::path& root, const ProjectAssetRegistry& registry);
 
     bool RequestScene(std::string_view sceneName);
 
@@ -77,6 +81,11 @@ class DemoSceneManager
     std::string_view GetActiveSceneName() const;
 
     private:
+    void ConfigureProjectAssets(IDemoScene& scene) const;
+
+    std::filesystem::path m_projectRoot;
+    const ProjectAssetRegistry* m_registry = nullptr;
+
     std::unique_ptr<IDemoScene> m_activeScene;
     std::unique_ptr<IDemoScene> m_stagedFileScene;
 

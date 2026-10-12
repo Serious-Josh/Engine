@@ -74,6 +74,9 @@ struct EnvironmentAsset
 
 struct RendererOptions
 {
+    // Borrowed only for this Render call; Editor retains resources through GPU completion.
+    std::vector<Texture*> editorTextures;
+
     size_t selectedObject = (std::numeric_limits<size_t>::max)();
 
     Vector3 selectionOutlineColor{1.0f, 0.72f, 0.0f};
