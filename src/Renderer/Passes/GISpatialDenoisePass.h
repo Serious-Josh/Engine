@@ -31,13 +31,13 @@ static_assert(sizeof(GISpatialDenoiseConstants) == 48);
 
 class GISpatialDenoisePass
 {
-public:
+    public:
     bool Initialize(
-        GraphicsDevice& graphicsDevice,
-        ShaderLibrary& shaderLibrary,
-        DescriptorHeap& descriptorHeap,
-        unsigned int width,
-        unsigned int height);
+      GraphicsDevice& graphicsDevice,
+      ShaderLibrary& shaderLibrary,
+      DescriptorHeap& descriptorHeap,
+      unsigned int width,
+      unsigned int height);
 
     bool Resize(
         GraphicsDevice& graphicsDevice,
@@ -58,12 +58,12 @@ public:
     Texture& GetOutputTexture();
     const Texture& GetOutputTexture() const;
 
-private:
+    private:
     bool CreateTextures(
-        GraphicsDevice& graphicsDevice,
-        DescriptorHeap& descriptorHeap,
-        unsigned int width,
-        unsigned int height);
+      GraphicsDevice& graphicsDevice,
+      DescriptorHeap& descriptorHeap,
+      unsigned int width,
+      unsigned int height);
 
     Texture m_pingTexture;
     Texture m_pongTexture;

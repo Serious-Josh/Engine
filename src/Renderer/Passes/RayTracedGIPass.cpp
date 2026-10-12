@@ -10,13 +10,20 @@
 #include "Renderer/RayTracing/RayTracingPipelineDescription.h"
 #include "Renderer/RayTracing/RayTracingSceneResources.h"
 
-bool RayTracedGIPass::Initialize(GraphicsDevice& graphicsDevice, ShaderLibrary& shaderLibrary, DescriptorHeap& descriptorHeap, unsigned int width, unsigned int height)
+bool RayTracedGIPass::Initialize(
+    GraphicsDevice& graphicsDevice,
+    ShaderLibrary& shaderLibrary,
+    DescriptorHeap& descriptorHeap,
+    unsigned int width,
+    unsigned int height)
 {
-    if(!graphicsDevice.SupportsRayTracing() || width == 0 || height == 0){
+    if (!graphicsDevice.SupportsRayTracing() || width == 0 || height == 0)
+    {
         return false;
     }
 
-    if(!CreateTextures(graphicsDevice.GetDevice(), descriptorHeap, width, height)){
+    if (!CreateTextures(graphicsDevice.GetDevice(), descriptorHeap, width, height))
+    {
         Shutdown();
         return false;
     }
@@ -27,24 +34,21 @@ bool RayTracedGIPass::Initialize(GraphicsDevice& graphicsDevice, ShaderLibrary& 
     pipelineDescription.rayGenerationShader = L"GIRayGeneration";
     pipelineDescription.missShaders = {L"GIMiss", L"GIVisibilityMiss"};
 
-    pipelineDescription.hitGroups = {
-        {L"GIHitGroup", L"GIClosestHit", L""}
-    };
+    pipelineDescription.hitGroups = {{L"GIHitGroup", L"GIClosestHit", L""}};
 
-    pipelineDescription.rootParameters =
-    {
-        {RootParameterType::ShaderResource, 0},
-        {RootParameterType::DescriptorTable, 0, 0, D3D12_SHADER_VISIBILITY_ALL, DescriptorRangeType::UnorderedAccess, 1},
-        {RootParameterType::DescriptorTable, 1, 0, D3D12_SHADER_VISIBILITY_ALL, DescriptorRangeType::UnorderedAccess, 1},
-        {RootParameterType::ConstantBuffer, 0},
-        {RootParameterType::ConstantBuffer, 1} 
-    };
+    pipelineDescription.rootParameters = {{RootParameterType::ShaderResource, 0},
+                                          {RootParameterType::DescriptorTable, 0, 0, D3D12_SHADER_VISIBILITY_ALL,
+                                           DescriptorRangeType::UnorderedAccess, 1},
+                                          {RootParameterType::DescriptorTable, 1, 0, D3D12_SHADER_VISIBILITY_ALL,
+                                           DescriptorRangeType::UnorderedAccess, 1},
+                                          {RootParameterType::ConstantBuffer, 0},
+                                          {RootParameterType::ConstantBuffer, 1}};
 
     pipelineDescription.maxPayloadSize = 40; // Hit distance, world normal, UV, material index.
     pipelineDescription.maxAttributeSize = 8;
     pipelineDescription.maxRecursionDepth = 1;
 
-    if(!m_pipeline.Initialize(graphicsDevice.GetRayTracingDevice(), shaderLibrary, pipelineDescription))
+    if (!m_pipeline.Initialize(graphicsDevice.GetRayTracingDevice(), shaderLibrary, pipelineDescription))
     {
         Log::Error("Failed to initialize ray traced GI DXR pipeline.");
         Shutdown();
@@ -54,63 +58,80 @@ bool RayTracedGIPass::Initialize(GraphicsDevice& graphicsDevice, ShaderLibrary& 
     return true;
 }
 
-bool RayTracedGIPass::CreateTextures(ID3D12Device* device, DescriptorHeap& descriptorHeap, unsigned int width, unsigned int height)
+bool RayTracedGIPass::CreateTextures(
+
+    ID3D12Device* device,
+    DescriptorHeap& descriptorHeap,
+    unsigned int width,
+    unsigned int height)
 {
-    if(!device || width == 0 || height == 0){
+    if (!device || width == 0 || height == 0)
+    {
         return false;
     }
 
-    if(!m_rawGITexture.Initialize(device, width, height, 1, 1,
-        DXGI_FORMAT_R16G16B16A16_FLOAT,
-        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-        D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
+    if (!m_rawGITexture.Initialize(device, width, height, 1, 1, DXGI_FORMAT_R16G16B16A16_FLOAT,
+                                   D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
     {
         Log::Error("Failed to create raw ray traced GI texture.");
         return false;
     }
 
-    if(!m_rawGITexture.CreateSRV(device, descriptorHeap)){
+    if (!m_rawGITexture.CreateSRV(device, descriptorHeap))
+    {
+
         Log::Error("Failed to create raw ray traced GI SRV.");
         return false;
     }
 
-    if(!m_rawGITexture.CreateUAV(device, descriptorHeap)){
+    if (!m_rawGITexture.CreateUAV(device, descriptorHeap))
+    {
         Log::Error("Failed to create raw ray traced GI UAV.");
+
         return false;
     }
 
-    if(!m_hitDistanceTexture.Initialize(device, width, height, 1, 1,
-        DXGI_FORMAT_R32_FLOAT,
-        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-        D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
+    if (!m_hitDistanceTexture.Initialize(device, width, height, 1, 1, DXGI_FORMAT_R32_FLOAT,
+                                         D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                         D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
     {
         Log::Error("Failed to create raw ray traced hit distance texture.");
         return false;
     }
 
-    if(!m_hitDistanceTexture.CreateSRV(device, descriptorHeap)){
+    if (!m_hitDistanceTexture.CreateSRV(device, descriptorHeap))
+    {
         Log::Error("Failed to create raw ray traced hit distance SRV.");
+
         return false;
     }
 
-    if(!m_hitDistanceTexture.CreateUAV(device, descriptorHeap)){
+    if (!m_hitDistanceTexture.CreateUAV(device, descriptorHeap))
+    {
         Log::Error("Failed to create raw ray traced hit distance UAV.");
+
         return false;
     }
 
     return true;
 }
 
-bool RayTracedGIPass::Resize(ID3D12Device* device, DescriptorHeap& descriptorHeap, unsigned int width, unsigned int height)
+bool RayTracedGIPass::Resize(
+    ID3D12Device* device,
+    DescriptorHeap& descriptorHeap,
+    unsigned int width,
+    unsigned int height)
 {
-    if(!device || width == 0 || height == 0){
+    if (!device || width == 0 || height == 0)
+    {
         return false;
     }
 
     m_rawGITexture.Shutdown();
     m_hitDistanceTexture.Shutdown();
 
-    if(!CreateTextures(device, descriptorHeap, width, height)){
+    if (!CreateTextures(device, descriptorHeap, width, height))
+    {
         Shutdown();
         return false;
     }
@@ -127,7 +148,8 @@ void RayTracedGIPass::Execute(
     unsigned int width,
     unsigned int height)
 {
-    if(!commandList || width == 0 || height == 0){
+    if (!commandList || width == 0 || height == 0)
+    {
         return;
     }
 
@@ -145,8 +167,7 @@ void RayTracedGIPass::Execute(
     m_pipeline.Dispatch(commandList, width, height);
 
     constexpr D3D12_RESOURCE_STATES shaderReadState =
-        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
-        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 
     m_rawGITexture.Transition(commandList, shaderReadState);
     m_hitDistanceTexture.Transition(commandList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);

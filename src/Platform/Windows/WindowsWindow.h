@@ -8,7 +8,7 @@
 
 class WindowsWindow
 {
-public:
+    public:
     using EventCallback = std::function<void(const Event&)>;
 
     WindowsWindow();
@@ -22,7 +22,9 @@ public:
     bool ShouldClose() const;
     void Close();
 
-    void SetSize(unsigned int width, unsigned int height);
+    void SetSize(
+        unsigned int width,
+        unsigned int height);
     unsigned int GetWidth() const;
     unsigned int GetHeight() const;
 
@@ -33,8 +35,9 @@ public:
 
     static std::filesystem::path GetExecutableDirectory();
 
-private:
+    private:
     void* m_windowHandle = nullptr;
+
     bool m_shouldClose = false;
 
     EventCallback m_eventCallback;

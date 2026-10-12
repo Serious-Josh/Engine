@@ -23,74 +23,75 @@ class DescriptorHeap;
 class NrdDenoiser
 {
     public:
+    enum class Signal
+    {
+        Combined,
+        Specular,
+        Diffuse
+    };
 
-        enum class Signal
-        {
-            Combined,
-            Specular,
-            Diffuse
-        };
+    bool Initialize(
+        ID3D12Device* device,
+        ID3D12CommandQueue* graphicsQueue,
+        DescriptorHeap& descriptorHeap,
+        uint32_t width,
+        uint32_t height,
+        uint32_t queuedFrameCount,
+        Signal signal = Signal::Combined);
+    bool Resize(
+        DescriptorHeap& descriptorHeap,
+        uint32_t width,
+        uint32_t height);
+    void Shutdown();
 
-        bool Initialize(
-            ID3D12Device* device,
-            ID3D12CommandQueue* graphicsQueue,
-            DescriptorHeap& descriptorHeap,
-            uint32_t width,
-            uint32_t height,
-            uint32_t queuedFrameCount,
-            Signal signal = Signal::Combined);
-        bool Resize(
-            DescriptorHeap& descriptorHeap,
-            uint32_t width,
-            uint32_t height);
-        void Shutdown();
+    bool SetFrameSettings(
+        const Matrix4& view,
+        const Matrix4& projection,
+        const Matrix4& previousView,
+        const Matrix4& previousProjection,
+        uint32_t frameIndex,
+        float denoisingRange,
+        bool resetHistory);
 
-        bool SetFrameSettings(
-            const Matrix4& view,
-            const Matrix4& projection,
-            const Matrix4& previousView,
-            const Matrix4& previousProjection,
-            uint32_t frameIndex,
-            float denoisingRange,
-            bool resetHistory);
+    void Denoise(
+        ID3D12GraphicsCommandList* commandList,
+        Texture& motion,
+        Texture& normalRoughness,
+        Texture& viewZ,
+        Texture& radianceHitDist,
+        Signal signal = Signal::Combined);
 
-        void Denoise(
-            ID3D12GraphicsCommandList* commandList,
-            Texture& motion,
-            Texture& normalRoughness,
-            Texture& viewZ,
-            Texture& radianceHitDist,
-            Signal signal = Signal::Combined);
+    Texture& GetOutputTexture();
+    const Texture& GetOutputTexture() const;
 
-        Texture& GetOutputTexture();
-        const Texture& GetOutputTexture() const;
+    Texture& GetDiffuseOutputTexture();
+    const Texture& GetDiffuseOutputTexture() const;
 
-        Texture& GetDiffuseOutputTexture();
-        const Texture& GetDiffuseOutputTexture() const;
+    void NewFrame();
 
-        void NewFrame();
-
-        double GetTotalMemoryUsageInMb() const;
-        double GetPersistentMemoryUsageInMb() const;
-        double GetAliasableMemoryUsageInMb() const;
+    double GetTotalMemoryUsageInMb() const;
+    double GetPersistentMemoryUsageInMb() const;
+    double GetAliasableMemoryUsageInMb() const;
 
     private:
-        bool Recreate(
-            DescriptorHeap& descriptorHeap,
-            uint32_t width,
-            uint32_t height);
+    bool Recreate(
+      DescriptorHeap& descriptorHeap,
+      uint32_t width,
+      uint32_t height);
 
-        Texture m_outputTexture;
-        Texture m_diffuseOutputTexture;
+    Texture m_outputTexture;
+    Texture m_diffuseOutputTexture;
 
-        nrd::Integration m_Integration;
+    nrd::Integration m_Integration;
 
-        ID3D12Device* m_device = nullptr;
-        ID3D12CommandQueue* m_graphicsQueue = nullptr;
-        uint32_t m_queuedFrameCount = 0;
+    ID3D12Device* m_device = nullptr;
 
-        uint32_t m_width = 0;
-        uint32_t m_height = 0;
+    ID3D12CommandQueue* m_graphicsQueue = nullptr;
 
-        Signal m_signal = Signal::Combined;
+    uint32_t m_queuedFrameCount = 0;
+
+    uint32_t m_width = 0;
+    uint32_t m_height = 0;
+
+    Signal m_signal = Signal::Combined;
 };

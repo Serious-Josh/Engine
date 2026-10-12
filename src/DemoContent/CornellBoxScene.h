@@ -18,13 +18,13 @@ class DescriptorHeap;
 
 class CornellBoxScene : public IDemoScene
 {
-public:
+    public:
     bool Initialize(
-        ID3D12Device* device,
-        ResourceUploader& uploader,
-        DescriptorHeap& descriptorHeap,
-        const Shader* vertexShader,
-        const Shader* pixelShader) override;
+      ID3D12Device* device,
+      ResourceUploader& uploader,
+      DescriptorHeap& descriptorHeap,
+      const Shader* vertexShader,
+      const Shader* pixelShader) override;
 
     void Shutdown() override;
     void Update(float deltaTime) override;
@@ -38,26 +38,30 @@ public:
     void ResetCamera() override;
     void ResetDirectionalLight() override;
 
-private:
+    private:
     VertexLayout m_vertexLayout;
 
     std::vector<std::unique_ptr<Mesh>> m_cornellMeshes;
     std::vector<std::unique_ptr<Mesh>> m_tankMeshes;
+
     Mesh m_brickSphereMesh;
 
     Texture m_whiteTexture;
     Texture m_tankAlbedoTexture;
     Texture m_tankNormalTexture;
     Texture m_brickDiffuseTexture;
+
     Texture m_brickNormalTexture;
     Texture m_brickRoughnessTexture;
     Texture m_brickARMTexture;
 
     Pipeline m_pipeline;
+
     Material m_defaultMaterial;
     Material m_redWallMaterial;
     Material m_greenWallMaterial;
     Material m_tankMaterial;
+
     Material m_brickMaterial;
 
     Scene m_scene;

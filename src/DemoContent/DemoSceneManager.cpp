@@ -5,7 +5,6 @@
 
 #include <utility>
 
-
 bool DemoSceneManager::Initialize(
     std::string_view sceneName,
     ID3D12Device* device,
@@ -20,29 +19,25 @@ bool DemoSceneManager::Initialize(
 
     const DemoSceneEntry* sceneEntry = SceneRegistry::Instance().Find(sceneName);
 
-    if(!sceneEntry)
+    if (!sceneEntry)
     {
         Log::Error("Failed to find demo scene.");
         return false;
     }
 
     m_activeSceneEntry = sceneEntry;
+
     m_requestedSceneEntry = sceneEntry;
 
     m_activeScene = sceneEntry->create();
 
-    if(!m_activeScene)
+    if (!m_activeScene)
     {
         Log::Error("Failed to create demo scene.");
         return false;
     }
 
-    if(!m_activeScene->Initialize(
-        device,
-        uploader,
-        descriptorHeap,
-        vertexShader,
-        pixelShader))
+    if (!m_activeScene->Initialize(device, uploader, descriptorHeap, vertexShader, pixelShader))
     {
         Log::Error("Failed to initialize demo scene.");
         m_activeScene.reset();
@@ -56,7 +51,7 @@ bool DemoSceneManager::Initialize(
 
 void DemoSceneManager::Shutdown()
 {
-    if(m_activeScene)
+    if (m_activeScene)
     {
         m_activeScene->Shutdown();
         m_activeScene.reset();
@@ -64,24 +59,24 @@ void DemoSceneManager::Shutdown()
 
     m_activeSceneEntry = nullptr;
     m_requestedSceneEntry = nullptr;
+
     m_hasPendingSceneChange = false;
 }
 
-bool DemoSceneManager::RequestScene(
-    std::string_view sceneName)
+bool DemoSceneManager::RequestScene(std::string_view sceneName)
 {
-    const DemoSceneEntry* sceneEntry =
-        SceneRegistry::Instance().Find(sceneName);
+    const DemoSceneEntry* sceneEntry = SceneRegistry::Instance().Find(sceneName);
 
-    if(!sceneEntry)
+    if (!sceneEntry)
     {
         Log::Error("Requested demo scene was not found.");
         return false;
     }
 
-    if(sceneEntry == m_activeSceneEntry)
+    if (sceneEntry == m_activeSceneEntry)
     {
         m_hasPendingSceneChange = false;
+
         m_requestedSceneEntry = m_activeSceneEntry;
         return true;
     }
@@ -104,18 +99,19 @@ bool DemoSceneManager::ApplyPendingSceneChange(
     const Shader* vertexShader,
     const Shader* pixelShader)
 {
-    if(!m_hasPendingSceneChange)
+    if (!m_hasPendingSceneChange)
     {
         return true;
     }
 
-    if(!m_requestedSceneEntry)
+    if (!m_requestedSceneEntry)
     {
         Log::Error("Requested demo scene entry is invalid.");
+
         return false;
     }
 
-    if(m_activeScene)
+    if (m_activeScene)
     {
         m_activeScene->Shutdown();
         m_activeScene.reset();
@@ -123,20 +119,17 @@ bool DemoSceneManager::ApplyPendingSceneChange(
 
     std::unique_ptr<IDemoScene> newScene = m_requestedSceneEntry->create();
 
-    if(!newScene)
+    if (!newScene)
     {
+
         Log::Error("Failed to create requested demo scene.");
         return false;
     }
 
-    if(!newScene->Initialize(
-        device,
-        uploader,
-        descriptorHeap,
-        vertexShader,
-        pixelShader))
+    if (!newScene->Initialize(device, uploader, descriptorHeap, vertexShader, pixelShader))
     {
         Log::Error("Failed to initialize requested demo scene.");
+
         newScene->Shutdown();
         return false;
     }
@@ -145,6 +138,7 @@ bool DemoSceneManager::ApplyPendingSceneChange(
 
     m_activeScene = std::move(newScene);
     m_activeSceneEntry = m_requestedSceneEntry;
+
     m_hasPendingSceneChange = false;
 
     return true;
@@ -154,7 +148,7 @@ void DemoSceneManager::SetAspectRatio(float aspectRatio)
 {
     m_aspectRatio = aspectRatio;
 
-    if(m_activeScene)
+    if (m_activeScene)
     {
         m_activeScene->SetAspectRatio(aspectRatio);
     }
@@ -172,18 +166,17 @@ const IDemoScene& DemoSceneManager::GetActiveScene() const
 
 SphereGridScene* DemoSceneManager::GetActiveSphereGridScene()
 {
-    return dynamic_cast<SphereGridScene*>(
-        m_activeScene.get());
+    return dynamic_cast<SphereGridScene*>(m_activeScene.get());
 }
 
-std::span<const DemoSceneEntry>DemoSceneManager::GetAvailableScenes() const
+std::span<const DemoSceneEntry> DemoSceneManager::GetAvailableScenes() const
 {
     return SceneRegistry::Instance().GetScenes();
 }
 
 std::string_view DemoSceneManager::GetActiveSceneName() const
 {
-    if(!m_activeSceneEntry)
+    if (!m_activeSceneEntry)
     {
         return {};
     }

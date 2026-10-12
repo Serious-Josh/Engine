@@ -5,9 +5,14 @@
 #include "Renderer/Texture.h"
 #include "Renderer/Shader/ShaderLibrary.h"
 
-bool GGXAverageAlbedoPass::Initialize(ID3D12Device* device, ShaderLibrary& shaderLibrary, DescriptorHeap& rtvHeap, Texture& texture)
+bool GGXAverageAlbedoPass::Initialize(
+    ID3D12Device* device,
+    ShaderLibrary& shaderLibrary,
+    DescriptorHeap& rtvHeap,
+    Texture& texture)
 {
-    if(!device || !texture.GetResource()){
+    if (!device || !texture.GetResource())
+    {
         return false;
     }
 
@@ -20,19 +25,22 @@ bool GGXAverageAlbedoPass::Initialize(ID3D12Device* device, ShaderLibrary& shade
 
     Shader* vertexShader = shaderLibrary.Load(vertexDescription);
 
-    if(!vertexShader){
+    if (!vertexShader)
+    {
         Log::Error("Failed to load GGX average albedo vertex shader.");
         return false;
     }
 
     ShaderDescription pixelDescription{};
+
     pixelDescription.path = "GGXAverageAlbedo.hlsl";
     pixelDescription.entryPoint = "PSMain";
     pixelDescription.stage = ShaderStage::Pixel;
 
     Shader* pixelShader = shaderLibrary.Load(pixelDescription);
 
-    if(!pixelShader){
+    if (!pixelShader)
+    {
         Log::Error("Failed to load GGX average albedo pixel shader.");
         return false;
     }
@@ -46,17 +54,20 @@ bool GGXAverageAlbedoPass::Initialize(ID3D12Device* device, ShaderLibrary& shade
     pipelineDescription.vertexShader = vertexShader;
     pipelineDescription.pixelShader = pixelShader;
     pipelineDescription.vertexLayout = nullptr;
+
     pipelineDescription.renderTargets.count = 1;
     pipelineDescription.renderTargets.formats[0] = textureDescription.Format;
 
-    if(!m_pipeline.Initialize(device, pipelineDescription)){
+    if (!m_pipeline.Initialize(device, pipelineDescription))
+    {
         Log::Error("Failed to init GGX average albedo pipeline.");
         return false;
     }
 
     m_rtvIndex = rtvHeap.Allocate();
 
-    if(m_rtvIndex == UINT_MAX){
+    if (m_rtvIndex == UINT_MAX)
+    {
         Log::Error("Failed to allocate GGX average albedo RTV.");
         Shutdown();
         return false;
@@ -64,6 +75,7 @@ bool GGXAverageAlbedoPass::Initialize(ID3D12Device* device, ShaderLibrary& shade
 
     D3D12_RENDER_TARGET_VIEW_DESC rtvDescription{};
     rtvDescription.Format = textureDescription.Format;
+
     rtvDescription.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
     rtvDescription.Texture2D.MipSlice = 0;
     rtvDescription.Texture2D.PlaneSlice = 0;
@@ -73,14 +85,17 @@ bool GGXAverageAlbedoPass::Initialize(ID3D12Device* device, ShaderLibrary& shade
     return true;
 }
 
-void GGXAverageAlbedoPass::Execute(ID3D12GraphicsCommandList* commandList, Texture& texture)
+void GGXAverageAlbedoPass::Execute(
+    ID3D12GraphicsCommandList* commandList,
+    Texture& texture)
 {
-    if(!commandList || !m_rtvHeap || m_rtvIndex == UINT_MAX){
+    if (!commandList || !m_rtvHeap || m_rtvIndex == UINT_MAX)
+    {
         return;
     }
 
     texture.Transition(commandList, D3D12_RESOURCE_STATE_RENDER_TARGET);
-    
+
     commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
     m_pipeline.Bind(commandList);
@@ -89,25 +104,21 @@ void GGXAverageAlbedoPass::Execute(ID3D12GraphicsCommandList* commandList, Textu
     viewport.TopLeftX = 0.0f;
     viewport.TopLeftY = 0.0f;
     viewport.Width = static_cast<float>(m_width);
+
     viewport.Height = static_cast<float>(m_height);
     viewport.MinDepth = 0.0f;
     viewport.MaxDepth = 1.0f;
 
-    commandList->RSSetViewports(
-        1,
-        &viewport
-    );
+    commandList->RSSetViewports(1, &viewport);
 
     D3D12_RECT scissor{};
     scissor.left = 0;
     scissor.top = 0;
     scissor.right = static_cast<LONG>(m_width);
+
     scissor.bottom = static_cast<LONG>(m_height);
 
-    commandList->RSSetScissorRects(
-        1,
-        &scissor
-    );
+    commandList->RSSetScissorRects(1, &scissor);
 
     D3D12_CPU_DESCRIPTOR_HANDLE rtv = m_rtvHeap->GetCPUHandle(m_rtvIndex);
 
@@ -120,7 +131,8 @@ void GGXAverageAlbedoPass::Execute(ID3D12GraphicsCommandList* commandList, Textu
 
 void GGXAverageAlbedoPass::Shutdown()
 {
-     if(m_rtvHeap && m_rtvIndex != UINT_MAX){
+    if (m_rtvHeap && m_rtvIndex != UINT_MAX)
+    {
         m_rtvHeap->Free(m_rtvIndex);
 
         m_rtvIndex = UINT_MAX;

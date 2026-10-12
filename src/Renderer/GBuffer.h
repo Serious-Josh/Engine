@@ -8,33 +8,46 @@ class DescriptorHeap;
 class GBuffer
 {
     public:
-        GBuffer() = default;
+    GBuffer() = default;
 
-        GBuffer(const GBuffer&) = delete;
-        GBuffer& operator=(const GBuffer&) = delete;
+    GBuffer(const GBuffer&) = delete;
+    GBuffer& operator=(const GBuffer&) = delete;
 
-        bool Initialize(ID3D12Device* device, unsigned int width, unsigned int height, DescriptorHeap& rtvHeap, DescriptorHeap& dsvHeap, DescriptorHeap& resourceHeap);
-        
-        bool Resize(ID3D12Device* device, unsigned int width, unsigned int height, DescriptorHeap& rtvHeap, DescriptorHeap& dsvHeap, DescriptorHeap& resourceHeap);
+    bool Initialize(
+        ID3D12Device* device,
+        unsigned int width,
+        unsigned int height,
+        DescriptorHeap& rtvHeap,
+        DescriptorHeap& dsvHeap,
+        DescriptorHeap& resourceHeap);
 
-        void Shutdown();
+    bool Resize(
+        ID3D12Device* device,
+        unsigned int width,
+        unsigned int height,
+        DescriptorHeap& rtvHeap,
+        DescriptorHeap& dsvHeap,
+        DescriptorHeap& resourceHeap);
 
-        RenderTarget& GetMaterial();
-        RenderTarget& GetSurface();
-        RenderTarget& GetGeometricNormal();
-        DepthBuffer& GetDepth();
-        RenderTarget& GetMotion();
+    void Shutdown();
 
-        const RenderTarget& GetMaterial() const;
-        const RenderTarget& GetSurface() const;
-        const RenderTarget& GetGeometricNormal() const;
-        const DepthBuffer& GetDepth() const;
-        const RenderTarget& GetMotion() const;
-    
+    RenderTarget& GetMaterial();
+    RenderTarget& GetSurface();
+    RenderTarget& GetGeometricNormal();
+    DepthBuffer& GetDepth();
+    RenderTarget& GetMotion();
+
+    const RenderTarget& GetMaterial() const;
+    const RenderTarget& GetSurface() const;
+    const RenderTarget& GetGeometricNormal() const;
+    const DepthBuffer& GetDepth() const;
+    const RenderTarget& GetMotion() const;
+
     private:
-        RenderTarget m_material;
-        RenderTarget m_surface;
-        RenderTarget m_geometricNormal;
-        RenderTarget m_motion;
-        DepthBuffer m_depth;
+    RenderTarget m_material;
+    RenderTarget m_surface;
+    RenderTarget m_geometricNormal;
+    RenderTarget m_motion;
+
+    DepthBuffer m_depth;
 };

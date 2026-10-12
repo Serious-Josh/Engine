@@ -23,11 +23,13 @@ bool AOTemporalPass::Initialize(
 
     Shader* computeShader = shaderLibrary.Load(shaderDescription);
 
-    if(!computeShader){
+    if (!computeShader)
+    {
         return false;
     }
 
     ComputePipelineDescription pipelineDescription{};
+
     pipelineDescription.computeShader = computeShader;
 
     RootParameterDescription constants{};
@@ -37,15 +39,12 @@ bool AOTemporalPass::Initialize(
 
     pipelineDescription.rootParameters.push_back(constants);
 
-    if(!m_pipeline.Initialize(device, pipelineDescription)){
+    if (!m_pipeline.Initialize(device, pipelineDescription))
+    {
         return false;
     }
 
-    return Resize(
-        graphicsDevice,
-        descriptorHeap,
-        width,
-        height);
+    return Resize(graphicsDevice, descriptorHeap, width, height);
 }
 bool AOTemporalPass::Resize(
     GraphicsDevice& graphicsDevice,
@@ -55,7 +54,7 @@ bool AOTemporalPass::Resize(
 {
     ID3D12Device* device = graphicsDevice.GetDevice();
 
-    for(unsigned int i = 0; i < 2; ++i)
+    for (unsigned int i = 0; i < 2; ++i)
     {
         m_accumulatedAO[i].Shutdown();
         m_historyDepth[i].Shutdown();
@@ -64,33 +63,33 @@ bool AOTemporalPass::Resize(
 
     auto createTexture = [&](Texture& texture, DXGI_FORMAT format) -> bool
     {
-        if(!texture.Initialize(
-            device,
-            width,
-            height,
-            1,
-            1,
-            format,
-            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
+        if (!texture.Initialize(device, width, height, 1, 1, format, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
         {
             return false;
         }
 
-        if(!texture.CreateSRV(device, descriptorHeap))
-            return false;
+        if (!texture.CreateSRV(device, descriptorHeap))
+        {
 
-        if(!texture.CreateUAV(device, descriptorHeap))
             return false;
+        }
+
+        if (!texture.CreateUAV(device, descriptorHeap))
+        {
+
+            return false;
+        }
 
         return true;
     };
 
-    for(unsigned int i = 0; i < 2; ++i)
+    for (unsigned int i = 0; i < 2; ++i)
     {
-        if(!createTexture(m_accumulatedAO[i], DXGI_FORMAT_R16_FLOAT) ||
-        !createTexture(m_historyDepth[i], DXGI_FORMAT_R32_FLOAT) ||
-        !createTexture(m_historyLength[i], DXGI_FORMAT_R16_FLOAT))
+        if (!createTexture(m_accumulatedAO[i], DXGI_FORMAT_R16_FLOAT) ||
+
+            !createTexture(m_historyDepth[i], DXGI_FORMAT_R32_FLOAT) ||
+            !createTexture(m_historyLength[i], DXGI_FORMAT_R16_FLOAT))
         {
             return false;
         }
@@ -106,9 +105,10 @@ void AOTemporalPass::Shutdown()
 {
     m_pipeline.Shutdown();
 
-    for(unsigned int i = 0; i < 2; ++i)
+    for (unsigned int i = 0; i < 2; ++i)
     {
         m_accumulatedAO[i].Shutdown();
+
         m_historyDepth[i].Shutdown();
         m_historyLength[i].Shutdown();
     }
@@ -139,7 +139,7 @@ void AOTemporalPass::Execute(
     gBuffer.GetDepth().Transition(commandList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     gBuffer.GetSurface().Transition(commandList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
-    if(m_accumulatedFrameCount > 0)
+    if (m_accumulatedFrameCount > 0)
     {
         m_accumulatedAO[readIndex].Transition(commandList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         m_historyDepth[readIndex].Transition(commandList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -148,6 +148,7 @@ void AOTemporalPass::Execute(
 
     outputAO.Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     outputDepth.Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
     outputHistoryLength.Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
     AOTemporalConstants constants{};
@@ -171,9 +172,10 @@ void AOTemporalPass::Execute(
     constants.height = height;
     constants.accumulatedFrameCount = m_accumulatedFrameCount;
 
-    const D3D12_GPU_VIRTUAL_ADDRESS constantsAddress = uploadBuffer.Allocate(&constants, sizeof(AOTemporalConstants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
+    const D3D12_GPU_VIRTUAL_ADDRESS constantsAddress =
+        uploadBuffer.Allocate(&constants, sizeof(AOTemporalConstants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
 
-    if(constantsAddress == 0)
+    if (constantsAddress == 0)
     {
         return;
     }
@@ -184,17 +186,15 @@ void AOTemporalPass::Execute(
 
     commandList->Dispatch((width + 7u) / 8u, (height + 7u) / 8u, 1);
 
-    outputAO.Transition(
-        commandList,
-        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
-        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    outputAO.Transition(commandList,
+                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
     outputDepth.Transition(commandList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     outputHistoryLength.Transition(commandList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
     m_historyIndex = writeIndex;
 
-    if(m_accumulatedFrameCount < 20u)
+    if (m_accumulatedFrameCount < 20u)
     {
         ++m_accumulatedFrameCount;
     }

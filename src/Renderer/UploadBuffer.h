@@ -8,39 +8,45 @@ class DescriptorHeap;
 class UploadBuffer
 {
     public:
-        UploadBuffer() = default;
+    UploadBuffer() = default;
 
-        UploadBuffer(const UploadBuffer&) = delete;
-        UploadBuffer& operator=(const UploadBuffer&) = delete;
+    UploadBuffer(const UploadBuffer&) = delete;
+    UploadBuffer& operator=(const UploadBuffer&) = delete;
 
-        bool Initialize(ID3D12Device* device, std::size_t capacityPerFrame, unsigned int frameCount);
+    bool Initialize(
+        ID3D12Device* device,
+        std::size_t capacityPerFrame,
+        unsigned int frameCount);
 
-        void Shutdown();
+    void Shutdown();
 
-        void Reset(unsigned int frameIndex);
+    void Reset(unsigned int frameIndex);
 
-        D3D12_GPU_VIRTUAL_ADDRESS Allocate(const void* data, std::size_t size, std::size_t alignment);
+    D3D12_GPU_VIRTUAL_ADDRESS Allocate(
+        const void* data,
+        std::size_t size,
+        std::size_t alignment);
 
-        ID3D12Resource* GetResource() const
-        {
-            return m_resource;
-        };
+    ID3D12Resource* GetResource() const
+    {
+        return m_resource;
+    };
 
-        bool CreateRawSRV(
-            ID3D12Device* device,
-            DescriptorHeap& descriptorHeap,
-            D3D12_GPU_VIRTUAL_ADDRESS gpuAddress,
-            std::size_t size,
-            unsigned int& descriptorIndex) const;
+    bool CreateRawSRV(
+        ID3D12Device* device,
+        DescriptorHeap& descriptorHeap,
+        D3D12_GPU_VIRTUAL_ADDRESS gpuAddress,
+        std::size_t size,
+        unsigned int& descriptorIndex) const;
 
     private:
-        ID3D12Resource* m_resource = nullptr;
+    ID3D12Resource* m_resource = nullptr;
 
-        unsigned char* m_mappedData = nullptr;
+    unsigned char* m_mappedData = nullptr;
 
-        std::size_t m_capacityPerFrame = 0;
-        std::size_t m_frameOffset = 0;
-        std::size_t m_offset = 0;
+    std::size_t m_capacityPerFrame = 0;
+    std::size_t m_frameOffset = 0;
+    std::size_t m_offset = 0;
 
-        unsigned int m_frameCount = 0;
+    unsigned int m_frameCount = 0;
 };

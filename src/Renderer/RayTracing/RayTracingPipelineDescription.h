@@ -19,7 +19,9 @@ struct RayTracingPipelineDescription
     std::filesystem::path shaderPath;
 
     std::wstring rayGenerationShader;
+
     std::vector<std::wstring> missShaders;
+
     std::vector<RayTracingHitGroupDescription> hitGroups;
 
     std::vector<RootParameterDescription> rootParameters;

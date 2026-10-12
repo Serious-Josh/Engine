@@ -31,19 +31,24 @@ struct ShaderLibraryCompileResult
 class ShaderCompiler
 {
     public:
-        ShaderCompiler() = default;
-        ShaderCompiler(const ShaderCompiler&) = delete;
-        ShaderCompiler& operator=(const ShaderCompiler&) = delete;
+    ShaderCompiler() = default;
+    ShaderCompiler(const ShaderCompiler&) = delete;
+    ShaderCompiler& operator=(const ShaderCompiler&) = delete;
 
-        bool Initialize();
-        void Shutdown();
+    bool Initialize();
+    void Shutdown();
 
-        bool Compile(const ShaderCompileDescription& description, ShaderCompileResult& output);
-        bool CompileLibrary(const ShaderLibraryCompileDescription& description, ShaderLibraryCompileResult& output);
+    bool Compile(
+        const ShaderCompileDescription& description,
+        ShaderCompileResult& output);
+    bool CompileLibrary(
+        const ShaderLibraryCompileDescription& description,
+        ShaderLibraryCompileResult& output);
 
     private:
-        const wchar_t* GetShaderProfile(ShaderStage stage) const;
+    const wchar_t* GetShaderProfile(ShaderStage stage) const;
 
-        IDxcUtils* m_utils = nullptr;
-        IDxcCompiler3* m_compiler = nullptr;
+    IDxcUtils* m_utils = nullptr;
+
+    IDxcCompiler3* m_compiler = nullptr;
 };

@@ -13,7 +13,7 @@ bool RayTracedReflectionTemporalPass::Initialize(
     unsigned int width,
     unsigned int height)
 {
-    if(width == 0 || height == 0)
+    if (width == 0 || height == 0)
     {
         return false;
     }
@@ -27,12 +27,13 @@ bool RayTracedReflectionTemporalPass::Initialize(
 
     Shader* computeShader = shaderLibrary.Load(shaderDescription);
 
-    if(!computeShader)
+    if (!computeShader)
     {
         return false;
     }
 
     ComputePipelineDescription pipelineDescription{};
+
     pipelineDescription.computeShader = computeShader;
 
     RootParameterDescription constants{};
@@ -42,63 +43,61 @@ bool RayTracedReflectionTemporalPass::Initialize(
 
     pipelineDescription.rootParameters.push_back(constants);
 
-    if(!m_pipeline.Initialize(device, pipelineDescription))
+    if (!m_pipeline.Initialize(device, pipelineDescription))
     {
         return false;
     }
 
-    for(unsigned int i = 0; i < 2; ++i)
+    for (unsigned int i = 0; i < 2; ++i)
     {
-        if(!m_historyTextures[i].Initialize(device, width, height, 1, 1,
-            DXGI_FORMAT_R16G16B16A16_FLOAT,
-            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
+        if (!m_historyTextures[i].Initialize(device, width, height, 1, 1, DXGI_FORMAT_R16G16B16A16_FLOAT,
+                                             D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                             D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
         {
             return false;
         }
 
-        if(!m_historyTextures[i].CreateSRV(device, descriptorHeap))
+        if (!m_historyTextures[i].CreateSRV(device, descriptorHeap))
         {
             return false;
         }
 
-        if(!m_historyTextures[i].CreateUAV(device, descriptorHeap))
+        if (!m_historyTextures[i].CreateUAV(device, descriptorHeap))
         {
             return false;
         }
 
-        if(!m_depthHistoryTextures[i].Initialize(device, width, height, 1, 1,
-            DXGI_FORMAT_R32_FLOAT,
-            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
+        if (!m_depthHistoryTextures[i].Initialize(device, width, height, 1, 1, DXGI_FORMAT_R32_FLOAT,
+                                                  D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                                  D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
         {
             return false;
         }
 
-        if(!m_depthHistoryTextures[i].CreateSRV(device, descriptorHeap))
+        if (!m_depthHistoryTextures[i].CreateSRV(device, descriptorHeap))
         {
             return false;
         }
 
-        if(!m_depthHistoryTextures[i].CreateUAV(device, descriptorHeap))
+        if (!m_depthHistoryTextures[i].CreateUAV(device, descriptorHeap))
         {
             return false;
         }
 
-        if(!m_historyLengthTextures[i].Initialize(device, width, height, 1, 1,
-            DXGI_FORMAT_R32_FLOAT,
-            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
+        if (!m_historyLengthTextures[i].Initialize(device, width, height, 1, 1, DXGI_FORMAT_R32_FLOAT,
+                                                   D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                                   D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
         {
             return false;
         }
 
-        if(!m_historyLengthTextures[i].CreateSRV(device, descriptorHeap))
+        if (!m_historyLengthTextures[i].CreateSRV(device, descriptorHeap))
         {
+
             return false;
         }
 
-        if(!m_historyLengthTextures[i].CreateUAV(device, descriptorHeap))
+        if (!m_historyLengthTextures[i].CreateUAV(device, descriptorHeap))
         {
             return false;
         }
@@ -110,69 +109,72 @@ bool RayTracedReflectionTemporalPass::Initialize(
     return true;
 }
 
-bool RayTracedReflectionTemporalPass::Resize(ID3D12Device* device, DescriptorHeap& descriptorHeap, unsigned int width, unsigned int height)
+bool RayTracedReflectionTemporalPass::Resize(
+
+    ID3D12Device* device,
+    DescriptorHeap& descriptorHeap,
+    unsigned int width,
+    unsigned int height)
 {
-    if(!device || width == 0 || height == 0)
+    if (!device || width == 0 || height == 0)
     {
         return false;
     }
 
-    for(Texture& texture : m_historyTextures)
+    for (Texture& texture : m_historyTextures)
     {
         texture.Shutdown();
     }
 
-    for(Texture& texture : m_depthHistoryTextures)
+    for (Texture& texture : m_depthHistoryTextures)
     {
         texture.Shutdown();
     }
 
-    for(Texture& texture : m_historyLengthTextures)
+    for (Texture& texture : m_historyLengthTextures)
     {
         texture.Shutdown();
     }
 
-    for(unsigned int i = 0; i < 2; ++i)
+    for (unsigned int i = 0; i < 2; ++i)
     {
-        if(!m_historyTextures[i].Initialize(device, width, height, 1, 1,
-            DXGI_FORMAT_R16G16B16A16_FLOAT,
-            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
+        if (!m_historyTextures[i].Initialize(device, width, height, 1, 1, DXGI_FORMAT_R16G16B16A16_FLOAT,
+                                             D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                             D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
         {
             return false;
         }
 
-        if(!m_historyTextures[i].CreateSRV(device, descriptorHeap) ||
-           !m_historyTextures[i].CreateUAV(device, descriptorHeap))
+        if (!m_historyTextures[i].CreateSRV(device, descriptorHeap) ||
+            !m_historyTextures[i].CreateUAV(device, descriptorHeap))
         {
             return false;
         }
 
-        if(!m_depthHistoryTextures[i].Initialize(device, width, height, 1, 1,
-            DXGI_FORMAT_R32_FLOAT,
-            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
+        if (!m_depthHistoryTextures[i].Initialize(device, width, height, 1, 1, DXGI_FORMAT_R32_FLOAT,
+                                                  D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                                  D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
         {
             return false;
         }
 
-        if(!m_depthHistoryTextures[i].CreateSRV(device, descriptorHeap) ||
-           !m_depthHistoryTextures[i].CreateUAV(device, descriptorHeap))
+        if (!m_depthHistoryTextures[i].CreateSRV(device, descriptorHeap) ||
+            !m_depthHistoryTextures[i].CreateUAV(device, descriptorHeap))
         {
             return false;
         }
 
-        if(!m_historyLengthTextures[i].Initialize(device, width, height, 1, 1,
-            DXGI_FORMAT_R32_FLOAT,
-            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
+        if (!m_historyLengthTextures[i].Initialize(device, width, height, 1, 1, DXGI_FORMAT_R32_FLOAT,
+                                                   D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                                   D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
         {
             return false;
         }
 
-        if(!m_historyLengthTextures[i].CreateSRV(device, descriptorHeap) ||
-           !m_historyLengthTextures[i].CreateUAV(device, descriptorHeap))
+        if (!m_historyLengthTextures[i].CreateSRV(device, descriptorHeap) ||
+            !m_historyLengthTextures[i].CreateUAV(device, descriptorHeap))
         {
+
             return false;
         }
     }
@@ -187,17 +189,17 @@ void RayTracedReflectionTemporalPass::Shutdown()
 {
     m_pipeline.Shutdown();
 
-    for(Texture& texture : m_historyTextures)
+    for (Texture& texture : m_historyTextures)
     {
         texture.Shutdown();
     }
 
-    for(Texture& texture : m_depthHistoryTextures)
+    for (Texture& texture : m_depthHistoryTextures)
     {
         texture.Shutdown();
     }
 
-    for(Texture& texture : m_historyLengthTextures)
+    for (Texture& texture : m_historyLengthTextures)
     {
         texture.Shutdown();
     }
@@ -207,6 +209,7 @@ void RayTracedReflectionTemporalPass::Shutdown()
 }
 
 void RayTracedReflectionTemporalPass::Execute(
+
     ID3D12GraphicsCommandList* commandList,
     Texture& rawReflection,
     GBuffer& gBuffer,
@@ -217,7 +220,7 @@ void RayTracedReflectionTemporalPass::Execute(
     unsigned int width,
     unsigned int height)
 {
-    if(!commandList || width == 0 || height == 0)
+    if (!commandList || width == 0 || height == 0)
     {
         return;
     }
@@ -227,6 +230,7 @@ void RayTracedReflectionTemporalPass::Execute(
     Texture& historyRead = m_historyTextures[m_historyReadIndex];
     Texture& historyWrite = m_historyTextures[writeIndex];
     Texture& depthHistoryRead = m_depthHistoryTextures[m_historyReadIndex];
+
     Texture& depthHistoryWrite = m_depthHistoryTextures[writeIndex];
     Texture& historyLengthRead = m_historyLengthTextures[m_historyReadIndex];
     Texture& historyLengthWrite = m_historyLengthTextures[writeIndex];
@@ -248,21 +252,25 @@ void RayTracedReflectionTemporalPass::Execute(
     constants.previousViewProjection = previousViewProjection;
     constants.previousInverseViewProjection = previousInverseViewProjection;
     constants.rawReflectionIndex = rawReflection.GetDescriptorIndex();
+
     constants.depthIndex = gBuffer.GetDepth().GetSRVIndex();
     constants.surfaceIndex = gBuffer.GetSurface().GetSRVIndex();
     constants.historyIndex = historyRead.GetDescriptorIndex();
     constants.previousDepthIndex = depthHistoryRead.GetDescriptorIndex();
+
     constants.outputDepthIndex = depthHistoryWrite.GetUAVIndex();
     constants.previousHistoryLengthIndex = historyLengthRead.GetDescriptorIndex();
     constants.outputHistoryLengthIndex = historyLengthWrite.GetUAVIndex();
     constants.outputReflectionIndex = historyWrite.GetUAVIndex();
+
     constants.width = width;
     constants.height = height;
     constants.accumulatedFrameCount = m_accumulatedFrameCount;
 
-    const D3D12_GPU_VIRTUAL_ADDRESS constantsAddress = uploadBuffer.Allocate(&constants, sizeof(constants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
+    const D3D12_GPU_VIRTUAL_ADDRESS constantsAddress =
+        uploadBuffer.Allocate(&constants, sizeof(constants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
 
-    if(constantsAddress == 0)
+    if (constantsAddress == 0)
     {
         return;
     }

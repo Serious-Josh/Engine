@@ -23,26 +23,33 @@ enum class EngineState
 
 class Engine
 {
-public:
+    public:
     bool Initialize();
     void Run();
     void Shutdown();
 
-private:
+    private:
     void Frame();
 
     WindowProperties m_windowProperties;
+
     WindowsWindow m_window;
+
     Time m_time;
+
     Input m_input;
+
     Renderer m_renderer;
 
+    std::optional<Renderer::FrameRenderResult> m_diagnosticRenderOutcome;
+
     DemoSceneManager m_demoSceneManager;
+
     uint64_t m_renderedSceneStructureRevision = 0;
 
     Shader* m_demoVertexShader = nullptr;
     Shader* m_demoPixelShader = nullptr;
-    
+
     Editor m_editor;
 
     EngineState m_state = EngineState::Uninitialized;

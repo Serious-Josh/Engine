@@ -12,63 +12,60 @@ bool RayTracedReflectionPass::Initialize(
     unsigned int width,
     unsigned int height)
 {
-    if(!graphicsDevice.SupportsRayTracing() || width == 0 || height == 0)
+    if (!graphicsDevice.SupportsRayTracing() || width == 0 || height == 0)
     {
         return false;
     }
 
     ID3D12Device* device = graphicsDevice.GetDevice();
 
-    if(!m_rawReflectionTexture.Initialize(device, width, height, 1, 1,
-        DXGI_FORMAT_R16G16B16A16_FLOAT,
-        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-        D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
+    if (!m_rawReflectionTexture.Initialize(device, width, height, 1, 1, DXGI_FORMAT_R16G16B16A16_FLOAT,
+                                           D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                           D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
     {
         return false;
     }
 
-    if(!m_rawReflectionTexture.CreateSRV(device, descriptorHeap))
+    if (!m_rawReflectionTexture.CreateSRV(device, descriptorHeap))
     {
         return false;
     }
 
-    if(!m_rawReflectionTexture.CreateUAV(device, descriptorHeap))
+    if (!m_rawReflectionTexture.CreateUAV(device, descriptorHeap))
     {
         return false;
     }
 
-    if(!m_hitDistanceTexture.Initialize(device, width, height, 1, 1,
-        DXGI_FORMAT_R32_FLOAT,
-        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-        D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
+    if (!m_hitDistanceTexture.Initialize(device, width, height, 1, 1, DXGI_FORMAT_R32_FLOAT,
+                                         D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                         D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
     {
         return false;
     }
 
-    if(!m_hitDistanceTexture.CreateSRV(device, descriptorHeap))
+    if (!m_hitDistanceTexture.CreateSRV(device, descriptorHeap))
     {
         return false;
     }
 
-    if(!m_hitDistanceTexture.CreateUAV(device, descriptorHeap))
+    if (!m_hitDistanceTexture.CreateUAV(device, descriptorHeap))
     {
         return false;
     }
 
-    if(!m_specularTrackingDistanceTexture.Initialize(device, width, height, 1, 1,
-        DXGI_FORMAT_R32_FLOAT,
-        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-        D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
-    {
-            return false;
-    }
-
-    if(!m_specularTrackingDistanceTexture.CreateSRV(device, descriptorHeap))
+    if (!m_specularTrackingDistanceTexture.Initialize(device, width, height, 1, 1, DXGI_FORMAT_R32_FLOAT,
+                                                      D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                                      D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
     {
         return false;
     }
 
-    if(!m_specularTrackingDistanceTexture.CreateUAV(device, descriptorHeap))
+    if (!m_specularTrackingDistanceTexture.CreateSRV(device, descriptorHeap))
+    {
+        return false;
+    }
+
+    if (!m_specularTrackingDistanceTexture.CreateUAV(device, descriptorHeap))
     {
         return false;
     }
@@ -76,32 +73,22 @@ bool RayTracedReflectionPass::Initialize(
     RayTracingPipelineDescription pipelineDescription{};
 
     pipelineDescription.shaderPath = "RayTracedReflection.hlsl";
+
     pipelineDescription.rayGenerationShader = L"RayGeneration";
     pipelineDescription.missShaders = {L"Miss", L"TrackingMiss"};
 
-    pipelineDescription.hitGroups =
-    {
-        {
-            L"HitGroup",
-            L"ClosestHit",
-            L""
-        },
-        {
-            L"TrackingHitGroup",
-            L"TrackingClosestHit",
-            L""
-        }
-    };
+    pipelineDescription.hitGroups = {{L"HitGroup", L"ClosestHit", L""},
+                                     {L"TrackingHitGroup", L"TrackingClosestHit", L""}};
 
-    pipelineDescription.rootParameters =
-    {
-        {RootParameterType::ShaderResource, 0},
-        {RootParameterType::DescriptorTable, 0, 0, D3D12_SHADER_VISIBILITY_ALL, DescriptorRangeType::UnorderedAccess, 1},
-        {RootParameterType::DescriptorTable, 1, 0, D3D12_SHADER_VISIBILITY_ALL, DescriptorRangeType::UnorderedAccess, 1},
-        {RootParameterType::DescriptorTable, 2, 0, D3D12_SHADER_VISIBILITY_ALL, DescriptorRangeType::UnorderedAccess, 1},
-        {RootParameterType::ConstantBuffer, 0},
-        {RootParameterType::ConstantBuffer, 1}
-    };
+    pipelineDescription.rootParameters = {{RootParameterType::ShaderResource, 0},
+                                          {RootParameterType::DescriptorTable, 0, 0, D3D12_SHADER_VISIBILITY_ALL,
+                                           DescriptorRangeType::UnorderedAccess, 1},
+                                          {RootParameterType::DescriptorTable, 1, 0, D3D12_SHADER_VISIBILITY_ALL,
+                                           DescriptorRangeType::UnorderedAccess, 1},
+                                          {RootParameterType::DescriptorTable, 2, 0, D3D12_SHADER_VISIBILITY_ALL,
+                                           DescriptorRangeType::UnorderedAccess, 1},
+                                          {RootParameterType::ConstantBuffer, 0},
+                                          {RootParameterType::ConstantBuffer, 1}};
 
     // ReflectionPayload: hit distance + world normal + UV + material index + shading normal + cone width/spread (48 bytes).
     // TrackingPayload needs only 4 bytes; the pipeline limit covers the larger payload.
@@ -109,7 +96,7 @@ bool RayTracedReflectionPass::Initialize(
     pipelineDescription.maxAttributeSize = sizeof(float) * 2;
     pipelineDescription.maxRecursionDepth = 1;
 
-    if(!m_pipeline.Initialize(graphicsDevice.GetRayTracingDevice(), shaderLibrary, pipelineDescription))
+    if (!m_pipeline.Initialize(graphicsDevice.GetRayTracingDevice(), shaderLibrary, pipelineDescription))
     {
         Shutdown();
         return false;
@@ -127,7 +114,7 @@ void RayTracedReflectionPass::Execute(
     unsigned int width,
     unsigned int height)
 {
-    if(!commandList || reflectionConstantsAddress == 0 || lightConstantsAddress == 0)
+    if (!commandList || reflectionConstantsAddress == 0 || lightConstantsAddress == 0)
     {
         return;
     }
@@ -135,6 +122,7 @@ void RayTracedReflectionPass::Execute(
     m_rawReflectionTexture.Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
     m_hitDistanceTexture.Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
     m_specularTrackingDistanceTexture.Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
     m_pipeline.Bind(commandList);
@@ -143,7 +131,8 @@ void RayTracedReflectionPass::Execute(
 
     const D3D12_GPU_DESCRIPTOR_HANDLE outputUAV = descriptorHeap.GetGPUHandle(m_rawReflectionTexture.GetUAVIndex());
     const D3D12_GPU_DESCRIPTOR_HANDLE hitDistanceUAV = descriptorHeap.GetGPUHandle(m_hitDistanceTexture.GetUAVIndex());
-    const D3D12_GPU_DESCRIPTOR_HANDLE trackingDistanceUAV = descriptorHeap.GetGPUHandle(m_specularTrackingDistanceTexture.GetUAVIndex());
+    const D3D12_GPU_DESCRIPTOR_HANDLE trackingDistanceUAV =
+        descriptorHeap.GetGPUHandle(m_specularTrackingDistanceTexture.GetUAVIndex());
 
     commandList->SetComputeRootDescriptorTable(1, outputUAV);
     commandList->SetComputeRootDescriptorTable(2, hitDistanceUAV);
@@ -154,8 +143,7 @@ void RayTracedReflectionPass::Execute(
     m_pipeline.Dispatch(commandList, width, height);
 
     constexpr D3D12_RESOURCE_STATES shaderReadState =
-        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
-        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 
     m_rawReflectionTexture.Transition(commandList, shaderReadState);
 
@@ -163,81 +151,83 @@ void RayTracedReflectionPass::Execute(
     m_specularTrackingDistanceTexture.Transition(commandList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 }
 
-bool RayTracedReflectionPass::Resize(ID3D12Device* device, DescriptorHeap& descriptorHeap, unsigned int width, unsigned int height)
+bool RayTracedReflectionPass::Resize(
+    ID3D12Device* device,
+    DescriptorHeap& descriptorHeap,
+    unsigned int width,
+    unsigned int height)
 {
-    if(!device || width == 0 || height == 0)
+    if (!device || width == 0 || height == 0)
     {
         return false;
     }
 
     m_rawReflectionTexture.Shutdown();
+
     m_hitDistanceTexture.Shutdown();
     m_specularTrackingDistanceTexture.Shutdown();
 
-    if(!m_rawReflectionTexture.Initialize(device, width, height, 1, 1,
-        DXGI_FORMAT_R16G16B16A16_FLOAT,
-        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-        D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
+    if (!m_rawReflectionTexture.Initialize(device, width, height, 1, 1, DXGI_FORMAT_R16G16B16A16_FLOAT,
+                                           D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                           D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
     {
         Log::Error("Failed to resize raw ray traced reflection texture.");
 
         return false;
     }
 
-    if(!m_rawReflectionTexture.CreateSRV(device, descriptorHeap))
+    if (!m_rawReflectionTexture.CreateSRV(device, descriptorHeap))
     {
         Log::Error("Failed to recreate raw ray traced reflection SRV.");
 
         return false;
     }
 
-    if(!m_rawReflectionTexture.CreateUAV(device, descriptorHeap))
+    if (!m_rawReflectionTexture.CreateUAV(device, descriptorHeap))
     {
         Log::Error("Failed to recreate raw ray traced reflection UAV.");
 
         return false;
     }
 
-    if(!m_hitDistanceTexture.Initialize(device, width, height, 1, 1,
-        DXGI_FORMAT_R32_FLOAT,
-        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-        D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
+    if (!m_hitDistanceTexture.Initialize(device, width, height, 1, 1, DXGI_FORMAT_R32_FLOAT,
+                                         D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                         D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
     {
         Log::Error("Failed to resize ray traced reflection hit distance texture.");
 
         return false;
     }
 
-    if(!m_hitDistanceTexture.CreateSRV(device, descriptorHeap))
+    if (!m_hitDistanceTexture.CreateSRV(device, descriptorHeap))
     {
         Log::Error("Failed to recreate ray traced reflection hit distance SRV.");
 
         return false;
     }
 
-    if(!m_hitDistanceTexture.CreateUAV(device, descriptorHeap))
+    if (!m_hitDistanceTexture.CreateUAV(device, descriptorHeap))
     {
         Log::Error("Failed to recreate ray traced reflection hit distance UAV.");
 
         return false;
     }
 
-    if(!m_specularTrackingDistanceTexture.Initialize(device, width, height, 1, 1,
-        DXGI_FORMAT_R32_FLOAT,
-        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-        D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
+    if (!m_specularTrackingDistanceTexture.Initialize(device, width, height, 1, 1, DXGI_FORMAT_R32_FLOAT,
+                                                      D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                                      D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
     {
         Log::Error("Failed to resize ray traced reflection specular tracking distance texture.");
         return false;
     }
 
-    if(!m_specularTrackingDistanceTexture.CreateSRV(device, descriptorHeap))
+    if (!m_specularTrackingDistanceTexture.CreateSRV(device, descriptorHeap))
     {
         Log::Error("Failed to resize ray traced reflection specular tracking distance srv.");
         return false;
     }
 
-    if(!m_specularTrackingDistanceTexture.CreateUAV(device, descriptorHeap))
+    if (!m_specularTrackingDistanceTexture.CreateUAV(device, descriptorHeap))
     {
         Log::Error("Failed to resize ray traced reflection specular tracking distance uav.");
         return false;

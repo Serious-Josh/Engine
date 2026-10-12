@@ -4,32 +4,27 @@
 
 #include <string>
 
-
 RenderTarget::RenderTarget(RenderTarget&& other) noexcept
-    : m_resource(other.m_resource)
-    , m_rtvHeap(other.m_rtvHeap)
-    , m_resourceHeap(other.m_resourceHeap)
-    , m_rtvIndex(other.m_rtvIndex)
-    , m_srvIndex(other.m_srvIndex)
-    , m_width(other.m_width)
-    , m_height(other.m_height)
-    , m_format(other.m_format)
-    , m_state(other.m_state)
+    : m_resource(other.m_resource), m_rtvHeap(other.m_rtvHeap), m_resourceHeap(other.m_resourceHeap),
+      m_rtvIndex(other.m_rtvIndex), m_srvIndex(other.m_srvIndex), m_width(other.m_width), m_height(other.m_height),
+      m_format(other.m_format), m_state(other.m_state)
 {
     other.m_resource = nullptr;
     other.m_rtvHeap = nullptr;
     other.m_resourceHeap = nullptr;
     other.m_rtvIndex = UINT_MAX;
+
     other.m_srvIndex = UINT_MAX;
     other.m_width = 0;
     other.m_height = 0;
     other.m_format = DXGI_FORMAT_UNKNOWN;
+
     other.m_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
 }
 
 RenderTarget& RenderTarget::operator=(RenderTarget&& other) noexcept
 {
-    if(this != &other)
+    if (this != &other)
     {
         Shutdown();
 
@@ -37,38 +32,53 @@ RenderTarget& RenderTarget::operator=(RenderTarget&& other) noexcept
         m_rtvHeap = other.m_rtvHeap;
         m_resourceHeap = other.m_resourceHeap;
         m_rtvIndex = other.m_rtvIndex;
+
         m_srvIndex = other.m_srvIndex;
         m_width = other.m_width;
         m_height = other.m_height;
         m_format = other.m_format;
+
         m_state = other.m_state;
 
         other.m_resource = nullptr;
         other.m_rtvHeap = nullptr;
         other.m_resourceHeap = nullptr;
         other.m_rtvIndex = UINT_MAX;
+
         other.m_srvIndex = UINT_MAX;
         other.m_width = 0;
         other.m_height = 0;
         other.m_format = DXGI_FORMAT_UNKNOWN;
+
         other.m_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
     }
 
     return *this;
 }
 
-bool RenderTarget::Initialize(ID3D12Device* device, unsigned int width, unsigned int height, DXGI_FORMAT format, DescriptorHeap& rtvHeap, DescriptorHeap& resourceHeap, const std::array<float, 4>& optimizedClearColor)
+bool RenderTarget::Initialize(
+
+    ID3D12Device* device,
+    unsigned int width,
+    unsigned int height,
+    DXGI_FORMAT format,
+    DescriptorHeap& rtvHeap,
+    DescriptorHeap& resourceHeap,
+    const std::array<float, 4>& optimizedClearColor)
 {
-    if(!device || width == 0 || height == 0){
+    if (!device || width == 0 || height == 0)
+    {
         return false;
     }
 
     D3D12_RESOURCE_DESC description{};
     description.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+
     description.Width = width;
     description.Height = height;
     description.DepthOrArraySize = 1;
     description.MipLevels = 1;
+
     description.Format = format;
     description.SampleDesc.Count = 1;
     description.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
@@ -81,12 +91,16 @@ bool RenderTarget::Initialize(ID3D12Device* device, unsigned int width, unsigned
     clearValue.Format = format;
     clearValue.Color[0] = optimizedClearColor[0];
     clearValue.Color[1] = optimizedClearColor[1];
+
     clearValue.Color[2] = optimizedClearColor[2];
     clearValue.Color[3] = optimizedClearColor[3];
 
-    HRESULT result = device->CreateCommittedResource(&heapProperties, D3D12_HEAP_FLAG_NONE, &description, D3D12_RESOURCE_STATE_RENDER_TARGET, &clearValue, IID_PPV_ARGS(&m_resource));
+    HRESULT result =
+        device->CreateCommittedResource(&heapProperties, D3D12_HEAP_FLAG_NONE, &description,
+                                        D3D12_RESOURCE_STATE_RENDER_TARGET, &clearValue, IID_PPV_ARGS(&m_resource));
 
-    if(FAILED(result)){
+    if (FAILED(result))
+    {
         Log::Error("Failed to allocate render-target resource. HRESULT: " + std::to_string(result));
         return false;
     }
@@ -95,16 +109,20 @@ bool RenderTarget::Initialize(ID3D12Device* device, unsigned int width, unsigned
 
     m_rtvIndex = rtvHeap.Allocate();
 
-    if(m_rtvIndex == UINT_MAX){
+    if (m_rtvIndex == UINT_MAX)
+    {
         Shutdown();
         return false;
     }
 
     m_srvIndex = resourceHeap.Allocate();
 
-    if(m_srvIndex == UINT_MAX){
+    if (m_srvIndex == UINT_MAX)
+    {
         m_rtvHeap = &rtvHeap;
+
         Shutdown();
+
         return false;
     }
 
@@ -112,6 +130,7 @@ bool RenderTarget::Initialize(ID3D12Device* device, unsigned int width, unsigned
     m_resourceHeap = &resourceHeap;
 
     D3D12_RENDER_TARGET_VIEW_DESC rtvDescription{};
+
     rtvDescription.Format = format;
     rtvDescription.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
 
@@ -121,6 +140,7 @@ bool RenderTarget::Initialize(ID3D12Device* device, unsigned int width, unsigned
     srvDescription.Format = format;
     srvDescription.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     srvDescription.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+
     srvDescription.Texture2D.MipLevels = 1;
 
     device->CreateShaderResourceView(m_resource, &srvDescription, resourceHeap.GetCPUHandle(m_srvIndex));
@@ -132,15 +152,20 @@ bool RenderTarget::Initialize(ID3D12Device* device, unsigned int width, unsigned
     return true;
 }
 
-void RenderTarget::Transition(ID3D12GraphicsCommandList* commandList, D3D12_RESOURCE_STATES newState)
+void RenderTarget::Transition(
+    ID3D12GraphicsCommandList* commandList,
+    D3D12_RESOURCE_STATES newState)
 {
-    if(!m_resource || !commandList || m_state == newState){
+    if (!m_resource || !commandList || m_state == newState)
+    {
         return;
     }
 
     D3D12_RESOURCE_BARRIER barrier{};
+
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     barrier.Transition.pResource = m_resource;
+
     barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     barrier.Transition.StateBefore = m_state;
     barrier.Transition.StateAfter = newState;
@@ -152,16 +177,20 @@ void RenderTarget::Transition(ID3D12GraphicsCommandList* commandList, D3D12_RESO
 
 void RenderTarget::Shutdown()
 {
-    if(m_rtvHeap && m_rtvIndex != UINT_MAX){
+    if (m_rtvHeap && m_rtvIndex != UINT_MAX)
+    {
         m_rtvHeap->Free(m_rtvIndex);
     }
 
-    if(m_resourceHeap && m_srvIndex != UINT_MAX){
+    if (m_resourceHeap && m_srvIndex != UINT_MAX)
+    {
         m_resourceHeap->Free(m_srvIndex);
     }
 
-    if(m_resource){
+    if (m_resource)
+    {
         m_resource->Release();
+
         m_resource = nullptr;
     }
 
@@ -169,11 +198,13 @@ void RenderTarget::Shutdown()
     m_resourceHeap = nullptr;
 
     m_rtvIndex = UINT_MAX;
+
     m_srvIndex = UINT_MAX;
 
     m_width = 0;
     m_height = 0;
     m_format = DXGI_FORMAT_UNKNOWN;
+
     m_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
 }
 
@@ -184,7 +215,7 @@ ID3D12Resource* RenderTarget::GetResource() const
 
 D3D12_CPU_DESCRIPTOR_HANDLE RenderTarget::GetRTV() const
 {
-    if(!m_rtvHeap || m_rtvIndex == UINT_MAX)
+    if (!m_rtvHeap || m_rtvIndex == UINT_MAX)
     {
         return {};
     }

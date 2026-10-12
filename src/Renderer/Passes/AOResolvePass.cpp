@@ -22,12 +22,13 @@ bool AOResolvePass::Initialize(
 
     Shader* computeShader = shaderLibrary.Load(shaderDescription);
 
-    if(!computeShader)
+    if (!computeShader)
     {
         return false;
     }
 
     ComputePipelineDescription pipelineDescription{};
+
     pipelineDescription.computeShader = computeShader;
 
     RootParameterDescription constants{};
@@ -37,12 +38,12 @@ bool AOResolvePass::Initialize(
 
     pipelineDescription.rootParameters.push_back(constants);
 
-    if(!m_pipeline.Initialize(graphicsDevice.GetDevice(), pipelineDescription))
+    if (!m_pipeline.Initialize(graphicsDevice.GetDevice(), pipelineDescription))
     {
         return false;
     }
 
-    if(!CreateTexture(graphicsDevice, descriptorHeap, width, height))
+    if (!CreateTexture(graphicsDevice, descriptorHeap, width, height))
     {
         m_pipeline.Shutdown();
         return false;
@@ -52,6 +53,7 @@ bool AOResolvePass::Initialize(
 }
 
 bool AOResolvePass::CreateTexture(
+
     GraphicsDevice& graphicsDevice,
     DescriptorHeap& descriptorHeap,
     unsigned int width,
@@ -59,24 +61,23 @@ bool AOResolvePass::CreateTexture(
 {
     ID3D12Device* device = graphicsDevice.GetDevice();
 
-    if(!m_outputTexture.Initialize(device, width, height, 1, 1,
-        DXGI_FORMAT_R16_FLOAT,
-        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-        D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
+    if (!m_outputTexture.Initialize(device, width, height, 1, 1, DXGI_FORMAT_R16_FLOAT,
+                                    D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
     {
         Log::Error("Failed to create AO resolve texture.");
         return false;
     }
 
-    if(!m_outputTexture.CreateSRV(device, descriptorHeap))
+    if (!m_outputTexture.CreateSRV(device, descriptorHeap))
     {
         Log::Error("Failed to create AO resolve SRV.");
         m_outputTexture.Shutdown();
         return false;
     }
 
-    if(!m_outputTexture.CreateUAV(device, descriptorHeap))
+    if (!m_outputTexture.CreateUAV(device, descriptorHeap))
     {
+
         Log::Error("Failed to create AO resolve UAV.");
         m_outputTexture.Shutdown();
         return false;
@@ -105,12 +106,13 @@ void AOResolvePass::Execute(
     unsigned int width,
     unsigned int height)
 {
-    if(!commandList || width == 0 || height == 0)
+    if (!commandList || width == 0 || height == 0)
     {
         return;
     }
 
     filteredAO.Transition(commandList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
     depthTexture.Transition(commandList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     surfaceTexture.Transition(commandList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     m_outputTexture.Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -119,13 +121,15 @@ void AOResolvePass::Execute(
     constants.inputAOIndex = filteredAO.GetDescriptorIndex();
     constants.depthIndex = depthTexture.GetSRVIndex();
     constants.surfaceIndex = surfaceTexture.GetSRVIndex();
+
     constants.outputAOIndex = m_outputTexture.GetUAVIndex();
     constants.width = width;
     constants.height = height;
-    
-    const D3D12_GPU_VIRTUAL_ADDRESS constantsAddress = uploadBuffer.Allocate(&constants, sizeof(constants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
 
-    if(constantsAddress == 0)
+    const D3D12_GPU_VIRTUAL_ADDRESS constantsAddress =
+        uploadBuffer.Allocate(&constants, sizeof(constants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
+
+    if (constantsAddress == 0)
     {
         return;
     }
@@ -136,7 +140,8 @@ void AOResolvePass::Execute(
 
     commandList->Dispatch((width + 7u) / 8u, (height + 7u) / 8u, 1u);
 
-    m_outputTexture.Transition(commandList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    m_outputTexture.Transition(commandList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+                                                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 }
 
 void AOResolvePass::Shutdown()

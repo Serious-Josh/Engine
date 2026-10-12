@@ -49,6 +49,12 @@ add_executable(Engine
     src/Core/Input.cpp
     src/Core/Log.cpp
     src/Renderer/Renderer.cpp
+    src/Renderer/Displacement/DisplacementUpdateState.cpp
+    src/Renderer/Displacement/DisplacementUpdateCoordinator.cpp
+    src/Renderer/Displacement/DisplacementCommandRecorder.cpp
+    src/Renderer/Displacement/DisplacementRequestValidation.cpp
+    src/Renderer/Diagnostics/FrameHitchDiagnostics.cpp
+    src/Renderer/Displacement/DisplacementGeometryBinding.cpp
     src/Renderer/Buffer.cpp
     src/Renderer/Mesh.cpp
     src/Renderer/Pipeline.cpp
@@ -122,6 +128,10 @@ add_executable(Engine
     src/Renderer/Passes/GISignedCorrectionPass.cpp
     src/Renderer/Passes/AOResolvePass.cpp
     src/Renderer/DDSLoader.cpp
+    src/Renderer/Passes/DisplacementVerticesPass.cpp
+    src/Renderer/Passes/DisplacementIndicesPass.cpp
+    src/Renderer//DisplacementGPUIndexLayout.cpp
+    src/Renderer/DisplacementGPUPatchBuffer.cpp
 )
 
 add_custom_command(

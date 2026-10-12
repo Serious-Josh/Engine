@@ -5,12 +5,9 @@
 #include <utility>
 
 DescriptorHeap::DescriptorHeap(DescriptorHeap&& other) noexcept
-    : m_heap(other.m_heap)
-    , m_type(other.m_type)
-    , m_descriptorSize(other.m_descriptorSize)
-    , m_capacity(other.m_capacity)
-    , m_shaderVisible(other.m_shaderVisible)
-    , m_freeIndices(std::move(other.m_freeIndices))
+    : m_heap(other.m_heap), m_type(other.m_type), m_descriptorSize(other.m_descriptorSize),
+      m_capacity(other.m_capacity), m_shaderVisible(other.m_shaderVisible),
+      m_freeIndices(std::move(other.m_freeIndices))
 {
     other.m_heap = nullptr;
     other.m_descriptorSize = 0;
@@ -19,7 +16,7 @@ DescriptorHeap::DescriptorHeap(DescriptorHeap&& other) noexcept
 
 DescriptorHeap& DescriptorHeap::operator=(DescriptorHeap&& other) noexcept
 {
-    if(this != &other)
+    if (this != &other)
     {
         Shutdown();
 
@@ -27,6 +24,7 @@ DescriptorHeap& DescriptorHeap::operator=(DescriptorHeap&& other) noexcept
         m_type = other.m_type;
         m_descriptorSize = other.m_descriptorSize;
         m_capacity = other.m_capacity;
+
         m_shaderVisible = other.m_shaderVisible;
         m_freeIndices = std::move(other.m_freeIndices);
 
@@ -38,7 +36,12 @@ DescriptorHeap& DescriptorHeap::operator=(DescriptorHeap&& other) noexcept
     return *this;
 }
 
-bool DescriptorHeap::Initialize(ID3D12Device* device, D3D12_DESCRIPTOR_HEAP_TYPE type, unsigned int capacity, bool shaderVisible)
+bool DescriptorHeap::Initialize(
+
+    ID3D12Device* device,
+    D3D12_DESCRIPTOR_HEAP_TYPE type,
+    unsigned int capacity,
+    bool shaderVisible)
 {
     m_type = type;
     m_capacity = capacity;
@@ -49,9 +52,10 @@ bool DescriptorHeap::Initialize(ID3D12Device* device, D3D12_DESCRIPTOR_HEAP_TYPE
     description.NumDescriptors = capacity;
     description.Flags = shaderVisible ? D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE : D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
 
-    HRESULT result = device-> CreateDescriptorHeap(&description, IID_PPV_ARGS(&m_heap));
+    HRESULT result = device->CreateDescriptorHeap(&description, IID_PPV_ARGS(&m_heap));
 
-    if(FAILED(result)){
+    if (FAILED(result))
+    {
         m_heap = nullptr;
         return false;
     }
@@ -61,7 +65,8 @@ bool DescriptorHeap::Initialize(ID3D12Device* device, D3D12_DESCRIPTOR_HEAP_TYPE
     m_freeIndices.clear();
     m_freeIndices.reserve(m_capacity);
 
-    for(unsigned int i = m_capacity; i > 0; --i){
+    for (unsigned int i = m_capacity; i > 0; --i)
+    {
         m_freeIndices.push_back(i - 1);
     }
 
@@ -70,7 +75,8 @@ bool DescriptorHeap::Initialize(ID3D12Device* device, D3D12_DESCRIPTOR_HEAP_TYPE
 
 void DescriptorHeap::Shutdown()
 {
-    if(m_heap){
+    if (m_heap)
+    {
         m_heap->Release();
         m_heap = nullptr;
     }
@@ -83,22 +89,23 @@ void DescriptorHeap::Shutdown()
 unsigned int DescriptorHeap::Allocate()
 {
 
-    if(m_freeIndices.empty())
+    if (m_freeIndices.empty())
     {
         Log::Error("Descriptor heap is full.");
+
         return UINT_MAX;
     }
 
     unsigned int index = m_freeIndices.back();
     m_freeIndices.pop_back();
 
-
     return index;
 }
 
 void DescriptorHeap::Free(unsigned int index)
 {
-    if(index >= m_capacity){
+    if (index >= m_capacity)
+    {
         return;
     }
 
@@ -130,25 +137,29 @@ ID3D12DescriptorHeap* DescriptorHeap::GetHeap() const
 
 unsigned int DescriptorHeap::GetIndex(D3D12_CPU_DESCRIPTOR_HANDLE handle) const
 {
-    if(!m_heap || m_descriptorSize == 0){
+    if (!m_heap || m_descriptorSize == 0)
+    {
         return UINT_MAX;
     }
 
     D3D12_CPU_DESCRIPTOR_HANDLE start = m_heap->GetCPUDescriptorHandleForHeapStart();
 
-    if(handle.ptr < start.ptr){
+    if (handle.ptr < start.ptr)
+    {
         return UINT_MAX;
     }
 
     SIZE_T offset = handle.ptr - start.ptr;
 
-    if(offset % m_descriptorSize != 0){
+    if (offset % m_descriptorSize != 0)
+    {
         return UINT_MAX;
     }
 
     unsigned int index = static_cast<unsigned int>(offset / m_descriptorSize);
 
-    if(index >= m_capacity){
+    if (index >= m_capacity)
+    {
         return UINT_MAX;
     }
 

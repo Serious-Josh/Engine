@@ -23,15 +23,19 @@ void Scene::ClearRenderObjects()
     ++m_structureRevision;
 }
 
-void Scene::SetRenderObjectTransform(RenderObjectID id, const Transform& transform)
+void Scene::SetRenderObjectTransform(
+    RenderObjectID id,
+    const Transform& transform)
 {
-    if(id >= m_renderObjects.size()){
+    if (id >= m_renderObjects.size())
+    {
         return;
     }
 
     m_renderObjects[id].transform = transform;
 
-    if(!m_transformDirty[id]){
+    if (!m_transformDirty[id])
+    {
         m_transformDirty[id] = true;
         m_changedTransforms.push_back(id);
     }
@@ -44,9 +48,10 @@ const std::vector<RenderObjectID>& Scene::GetChangedTransforms() const
 
 void Scene::ClearChangedTransforms()
 {
-    for(RenderObjectID id : m_changedTransforms){
+    for (RenderObjectID id : m_changedTransforms)
+    {
         m_renderObjects[id].previousTransform = m_renderObjects[id].transform;
-        
+
         m_transformDirty[id] = false;
     }
 

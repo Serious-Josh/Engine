@@ -37,41 +37,45 @@ static_assert(sizeof(ReflectionTemporalConstants) == 240);
 class RayTracedReflectionTemporalPass
 {
     public:
-        bool Initialize(
-            GraphicsDevice& graphicsDevice,
-            ShaderLibrary& shaderLibrary,
-            DescriptorHeap& descriptorHeap,
-            unsigned int width,
-            unsigned int height);
+    bool Initialize(
+      GraphicsDevice& graphicsDevice,
+      ShaderLibrary& shaderLibrary,
+      DescriptorHeap& descriptorHeap,
+      unsigned int width,
+      unsigned int height);
 
-        bool Resize(ID3D12Device* device, DescriptorHeap& descriptorHeap, unsigned int width, unsigned int height);
+    bool Resize(
+        ID3D12Device* device,
+        DescriptorHeap& descriptorHeap,
+        unsigned int width,
+        unsigned int height);
 
-        void Shutdown();
+    void Shutdown();
 
-        void Execute(
-            ID3D12GraphicsCommandList* commandList,
-            Texture& rawReflection,
-            GBuffer& gBuffer,
-            UploadBuffer& uploadBuffer,
-            const Matrix4& inverseViewProjection,
-            const Matrix4& previousViewProjection,
-            const Matrix4& previousInverseViewProjection,
-            unsigned int width,
-            unsigned int height);
+    void Execute(
+        ID3D12GraphicsCommandList* commandList,
+        Texture& rawReflection,
+        GBuffer& gBuffer,
+        UploadBuffer& uploadBuffer,
+        const Matrix4& inverseViewProjection,
+        const Matrix4& previousViewProjection,
+        const Matrix4& previousInverseViewProjection,
+        unsigned int width,
+        unsigned int height);
 
-        Texture& GetReflectionTexture();
-        const Texture& GetReflectionTexture() const;
+    Texture& GetReflectionTexture();
+    const Texture& GetReflectionTexture() const;
 
-        unsigned int GetAccumulatedFrameCount() const;
-        void ResetHistory();
+    unsigned int GetAccumulatedFrameCount() const;
+    void ResetHistory();
 
     private:
-        ComputePipeline m_pipeline;
+    ComputePipeline m_pipeline;
 
-        Texture m_historyTextures[2];
-        Texture m_depthHistoryTextures[2];
-        Texture m_historyLengthTextures[2];
+    Texture m_historyTextures[2];
+    Texture m_depthHistoryTextures[2];
+    Texture m_historyLengthTextures[2];
 
-        unsigned int m_historyReadIndex = 0;
-        unsigned int m_accumulatedFrameCount = 0;
+    unsigned int m_historyReadIndex = 0;
+    unsigned int m_accumulatedFrameCount = 0;
 };

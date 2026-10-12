@@ -44,7 +44,14 @@ struct HDRImageData
 class ImageLoader
 {
     public:
-        static bool Load(const std::filesystem::path& path, ImageData& image);
-        static bool LoadHDR(const std::filesystem::path& path, HDRImageData& image);
-        static bool GenerateMipChain(const ImageData& source, MipFilterMode filterMode, ImageMipChain& output);
+    static bool Load(
+      const std::filesystem::path& path,
+      ImageData& image);
+    static bool LoadHDR(
+        const std::filesystem::path& path,
+        HDRImageData& image);
+    static bool GenerateMipChain(
+        const ImageData& source,
+        MipFilterMode filterMode,
+        ImageMipChain& output);
 };

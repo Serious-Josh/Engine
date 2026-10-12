@@ -9,7 +9,8 @@ namespace Log
         std::cout << "[Info] " << message << "\n";
     }
 
-    void Warning(std::string_view message){
+    void Warning(std::string_view message)
+    {
         std::cout << "[Warning] " << message << "\n";
     }
 

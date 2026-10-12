@@ -1,40 +1,37 @@
 #include "GBuffer.h"
 #include "DescriptorHeap.h"
 
-bool GBuffer::Initialize(ID3D12Device* device, unsigned int width, unsigned int height, DescriptorHeap& rtvHeap, DescriptorHeap& dsvHeap, DescriptorHeap& resourceHeap)
+bool GBuffer::Initialize(
+    ID3D12Device* device,
+    unsigned int width,
+    unsigned int height,
+    DescriptorHeap& rtvHeap,
+    DescriptorHeap& dsvHeap,
+    DescriptorHeap& resourceHeap)
 {
-    if(!m_material.Initialize(
-        device,
-        width,
-        height,
-        DXGI_FORMAT_R8G8B8A8_UNORM,
-        rtvHeap,
-        resourceHeap,
-        {1.0f, 0.0f, 1.0f, 1.0f}))
+    if (!m_material.Initialize(device, width, height, DXGI_FORMAT_R8G8B8A8_UNORM, rtvHeap, resourceHeap,
+                               {1.0f, 0.0f, 1.0f, 1.0f}))
     {
         return false;
     }
 
-    if(!m_surface.Initialize(
-        device,
-        width,
-        height,
-        DXGI_FORMAT_R16G16B16A16_FLOAT,
-        rtvHeap,
-        resourceHeap,
-        {0.0f, 1.0f, 0.0f, 1.0f}))
+    if (!m_surface.Initialize(device, width, height, DXGI_FORMAT_R16G16B16A16_FLOAT, rtvHeap, resourceHeap,
+                              {0.0f, 1.0f, 0.0f, 1.0f}))
     {
         m_material.Shutdown();
         return false;
     }
 
-    if(!m_motion.Initialize(device, width, height, DXGI_FORMAT_R16G16B16A16_FLOAT, rtvHeap, resourceHeap, {0.0f, 0.0f, 0.0f, 0.0f})){
+    if (!m_motion.Initialize(device, width, height, DXGI_FORMAT_R16G16B16A16_FLOAT, rtvHeap, resourceHeap,
+                             {0.0f, 0.0f, 0.0f, 0.0f}))
+    {
         m_surface.Shutdown();
         m_material.Shutdown();
         return false;
     }
 
-    if (!m_geometricNormal.Initialize(device, width, height, DXGI_FORMAT_R16G16B16A16_FLOAT, rtvHeap, resourceHeap, {0.0f, 1.0f, 0.0f, 0.0f}))
+    if (!m_geometricNormal.Initialize(device, width, height, DXGI_FORMAT_R16G16B16A16_FLOAT, rtvHeap, resourceHeap,
+                                      {0.0f, 1.0f, 0.0f, 0.0f}))
     {
         m_motion.Shutdown();
         m_surface.Shutdown();
@@ -42,7 +39,8 @@ bool GBuffer::Initialize(ID3D12Device* device, unsigned int width, unsigned int 
         return false;
     }
 
-    if(!m_depth.Initialize(device, width, height, dsvHeap, resourceHeap)){
+    if (!m_depth.Initialize(device, width, height, dsvHeap, resourceHeap))
+    {
         m_motion.Shutdown();
         m_geometricNormal.Shutdown();
         m_surface.Shutdown();
@@ -51,6 +49,7 @@ bool GBuffer::Initialize(ID3D12Device* device, unsigned int width, unsigned int 
     }
 
     m_depth.GetResource()->SetName(L"GBuffer Depth");
+
     m_material.GetResource()->SetName(L"GBuffer Material");
     m_surface.GetResource()->SetName(L"GBuffer Surface");
     m_geometricNormal.GetResource()->SetName(L"GBuffer Geometric Normal");
@@ -59,7 +58,13 @@ bool GBuffer::Initialize(ID3D12Device* device, unsigned int width, unsigned int 
     return true;
 }
 
-bool GBuffer::Resize(ID3D12Device* device, unsigned int width, unsigned int height, DescriptorHeap& rtvHeap, DescriptorHeap& dsvHeap, DescriptorHeap& resourceHeap)
+bool GBuffer::Resize(
+    ID3D12Device* device,
+    unsigned int width,
+    unsigned int height,
+    DescriptorHeap& rtvHeap,
+    DescriptorHeap& dsvHeap,
+    DescriptorHeap& resourceHeap)
 {
     Shutdown();
 

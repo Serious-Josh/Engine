@@ -15,19 +15,27 @@
 
 REGISTER_DEMO_SCENE("Sphere Grid", SphereGridScene);
 
-bool SphereGridScene::Initialize(ID3D12Device* device, ResourceUploader& uploader, DescriptorHeap& descriptorHeap, const Shader* vertexShader, const Shader* pixelShader)
+bool SphereGridScene::Initialize(
+    ID3D12Device* device,
+    ResourceUploader& uploader,
+    DescriptorHeap& descriptorHeap,
+    const Shader* vertexShader,
+    const Shader* pixelShader)
 {
     m_vertexLayout = CreateVertexLayout();
 
-    if(!vertexShader || !pixelShader){
+    if (!vertexShader || !pixelShader)
+    {
         return false;
     }
 
     PipelineDescription pipelineDescription{};
+
     pipelineDescription.vertexShader = vertexShader;
     pipelineDescription.pixelShader = pixelShader;
     pipelineDescription.vertexLayout = &m_vertexLayout;
     pipelineDescription.renderTargets.count = 4;
+
     pipelineDescription.renderTargets.formats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
     pipelineDescription.renderTargets.formats[1] = DXGI_FORMAT_R16G16B16A16_FLOAT;
     pipelineDescription.renderTargets.formats[2] = DXGI_FORMAT_R16G16B16A16_FLOAT;
@@ -35,100 +43,64 @@ bool SphereGridScene::Initialize(ID3D12Device* device, ResourceUploader& uploade
 
     pipelineDescription.rootParameters.push_back({RootParameterType::Constants, 0, 9, D3D12_SHADER_VISIBILITY_PIXEL});
 
-    pipelineDescription.rootParameters.push_back({RootParameterType::ConstantBuffer, 1, 0, D3D12_SHADER_VISIBILITY_VERTEX});
-    pipelineDescription.rootParameters.push_back({RootParameterType::ConstantBuffer, 2, 0, D3D12_SHADER_VISIBILITY_VERTEX});
+    pipelineDescription.rootParameters.push_back(
+        {RootParameterType::ConstantBuffer, 1, 0, D3D12_SHADER_VISIBILITY_VERTEX});
+    pipelineDescription.rootParameters.push_back(
+        {RootParameterType::ConstantBuffer, 2, 0, D3D12_SHADER_VISIBILITY_VERTEX});
 
     pipelineDescription.depthEnabled = true;
     pipelineDescription.depthFormat = DXGI_FORMAT_D32_FLOAT;
 
-    if(!m_pipeline.Initialize(device, pipelineDescription))
+    if (!m_pipeline.Initialize(device, pipelineDescription))
     {
         return false;
     }
 
     SphereGeometry sphere = SphereGenerator::Generate(1.0f, 32, 64);
+
     TangentGenerator::GenerateTangents(sphere.vertices, sphere.indices);
 
-    if(!m_mesh.Initialize(device, uploader, descriptorHeap, sphere.vertices.data(), sphere.vertices.size(), m_vertexLayout, sphere.indices.data(), sphere.indices.size())){
+    if (!m_mesh.Initialize(device, uploader, descriptorHeap, sphere.vertices.data(), sphere.vertices.size(),
+                           m_vertexLayout, sphere.indices.data(), sphere.indices.size()))
+    {
         return false;
     }
 
-    std::vector<Vertex> planeVertices =
-    {
-        {
-            {-1.0f, 0.0f, -1.0f},
-            {0.0f, 1.0f, 0.0f},
-            {0.0f, 0.0f}
-        },
-        {
-            {-1.0f, 0.0f, 1.0f},
-            {0.0f, 1.0f, 0.0f},
-            {0.0f, 1.0f}
-        },
-        {
-            {1.0f, 0.0f, 1.0f},
-            {0.0f, 1.0f, 0.0f},
-            {1.0f, 1.0f}
-        },
-        {
-            {1.0f, 0.0f, -1.0f},
-            {0.0f, 1.0f, 0.0f},
-            {1.0f, 0.0f}
-        }
-    };
+    std::vector<Vertex> planeVertices = {{{-1.0f, 0.0f, -1.0f}, {0.0f, 1.0f, 0.0f}, {0.0f, 0.0f}},
+                                         {{-1.0f, 0.0f, 1.0f}, {0.0f, 1.0f, 0.0f}, {0.0f, 1.0f}},
+                                         {{1.0f, 0.0f, 1.0f}, {0.0f, 1.0f, 0.0f}, {1.0f, 1.0f}},
+                                         {{1.0f, 0.0f, -1.0f}, {0.0f, 1.0f, 0.0f}, {1.0f, 0.0f}}};
 
-    std::vector<std::uint32_t> planeIndices =
-    {
-        0, 1, 2,
-        0, 2, 3
-    };
+    std::vector<std::uint32_t> planeIndices = {0, 1, 2, 0, 2, 3};
 
     TangentGenerator::GenerateTangents(planeVertices, planeIndices);
 
-    if(!m_planeMesh.Initialize(
-        device,
-        uploader, descriptorHeap,
-        planeVertices.data(),
-        planeVertices.size(),
-        m_vertexLayout,
-        planeIndices.data(),
-        planeIndices.size()))
+    if (!m_planeMesh.Initialize(device, uploader, descriptorHeap, planeVertices.data(), planeVertices.size(),
+                                m_vertexLayout, planeIndices.data(), planeIndices.size()))
     {
         return false;
     }
 
     // Brick diffuse texture: BC1 with sRGB sampling.
-    if(!DDSLoader::LoadTexture(
-        device,
-        uploader,
-        descriptorHeap,
-        "assets/Textures/Materials/stacked_brick_wall_diff_4k.dds",
-        m_texture,
-        true))
+
+    if (!DDSLoader::LoadTexture(device, uploader, descriptorHeap,
+                                "assets/Textures/Materials/stacked_brick_wall_diff_4k.dds", m_texture, true))
     {
         return false;
     }
 
     // Brick normal map: BC5 with linear sampling and the existing DirectX convention.
-    if(!DDSLoader::LoadTexture(
-        device,
-        uploader,
-        descriptorHeap,
-        "assets/Textures/Materials/stacked_brick_wall_nor_dx_4k.dds",
-        m_normalTexture,
-        false))
+
+    if (!DDSLoader::LoadTexture(device, uploader, descriptorHeap,
+                                "assets/Textures/Materials/stacked_brick_wall_nor_dx_4k.dds", m_normalTexture, false))
     {
         return false;
     }
 
     // Brick roughness map: BC4 with linear sampling.
-    if(!DDSLoader::LoadTexture(
-        device,
-        uploader,
-        descriptorHeap,
-        "assets/Textures/Materials/stacked_brick_wall_rough_4k.dds",
-        m_roughnessTexture,
-        false))
+
+    if (!DDSLoader::LoadTexture(device, uploader, descriptorHeap,
+                                "assets/Textures/Materials/stacked_brick_wall_rough_4k.dds", m_roughnessTexture, false))
     {
         return false;
     }
@@ -138,7 +110,7 @@ bool SphereGridScene::Initialize(ID3D12Device* device, ResourceUploader& uploade
 
     const float startX = -horizontalSpacing * float(MaterialSampleCount - 1) * 0.5f;
 
-    for(unsigned int i = 0; i < MaterialSampleCount; ++i)
+    for (unsigned int i = 0; i < MaterialSampleCount; ++i)
     {
         Material& material = m_dielectricMaterials[i];
 
@@ -146,6 +118,7 @@ bool SphereGridScene::Initialize(ID3D12Device* device, ResourceUploader& uploade
         material.texture = &m_texture;
         material.normalTexture = &m_normalTexture;
         material.model = MaterialModel::Dielectric;
+
         material.roughnessTexture = &m_roughnessTexture;
         material.roughness = 1.0f;
         material.ior = 1.536f;
@@ -164,40 +137,46 @@ bool SphereGridScene::Initialize(ID3D12Device* device, ResourceUploader& uploade
         m_scene.AddRenderObject(object);
     }
 
-    for(unsigned int i = 0; i < MaterialSampleCount; ++i)
+    for (unsigned int i = 0; i < MaterialSampleCount; ++i)
     {
         Material& material = m_conductorMaterials[i];
 
         material.pipeline = &m_pipeline;
+
         material.texture = &m_texture;
         material.normalTexture = &m_normalTexture;
         material.model = MaterialModel::Conductor;
         material.roughnessTexture = &m_roughnessTexture;
+
         material.roughness = 1.0f;
-        if(i == 0)
+
+        if (i == 0)
         {
             // Temporary A/B diagnostic: restore this sphere's pre-texture roughness; keep its normal map.
+
             material.roughnessTexture = nullptr;
             material.roughness = 0.05f;
         }
-        else if(i == 1)
+        else if (i == 1)
         {
             material.roughness = 0.15f;
         }
-        else if(i == 2)
+        else if (i == 2)
         {
             material.roughness = 0.35f;
         }
-        else if(i == 3)
+        else if (i == 3)
         {
             material.roughness = 0.65f;
         }
 
         material.conductorN[0] = 0.2f;
         material.conductorN[1] = 0.9f;
+
         material.conductorN[2] = 1.1f;
 
         material.conductorK[0] = 3.9f;
+
         material.conductorK[1] = 2.5f;
         material.conductorK[2] = 2.1f;
 
@@ -215,23 +194,18 @@ bool SphereGridScene::Initialize(ID3D12Device* device, ResourceUploader& uploade
         m_scene.AddRenderObject(object);
     }
 
-    const float metallicValues[MaterialSampleCount] =
-    {
-        0.0f,
-        0.0f,
-        0.5f,
-        1.0f,
-        1.0f
-    };
+    const float metallicValues[MaterialSampleCount] = {0.0f, 0.0f, 0.5f, 1.0f, 1.0f};
 
-    for(unsigned int i = 0; i < MaterialSampleCount; ++i)
+    for (unsigned int i = 0; i < MaterialSampleCount; ++i)
     {
         Material& material = m_metallicRoughnessMaterials[i];
 
         material.pipeline = &m_pipeline;
+
         material.texture = &m_texture;
         material.normalTexture = &m_normalTexture;
         material.model = MaterialModel::MetallicRoughness;
+
         material.roughnessTexture = &m_roughnessTexture;
         material.roughness = 1.0f;
         material.metallic = metallicValues[i];
@@ -254,7 +228,9 @@ bool SphereGridScene::Initialize(ID3D12Device* device, ResourceUploader& uploade
     m_floorMaterial.texture = &m_texture;
     m_floorMaterial.normalTexture = &m_normalTexture;
     m_floorMaterial.model = MaterialModel::Dielectric;
+
     m_floorMaterial.roughness = 0.7f;
+
     m_floorMaterial.ior = 1.5f;
     m_floorMaterial.baseColor[0] = 0.35f;
     m_floorMaterial.baseColor[1] = 0.35f;
@@ -277,18 +253,19 @@ bool SphereGridScene::Initialize(ID3D12Device* device, ResourceUploader& uploade
 
 void SphereGridScene::Update(float deltaTime)
 {
-    switch(m_updateMode){
-        case DemoUpdateMode::None:
-            break;
-        case DemoUpdateMode::RotateLight:
-            UpdateRotatingLight(deltaTime);
-            break;
-        case DemoUpdateMode::MoveSphere:
-            UpdateMovingSphere(deltaTime);
-            break;
-        case DemoUpdateMode::OrbitCamera:
-            UpdateOrbitingCamera(deltaTime);
-            break;
+    switch (m_updateMode)
+    {
+    case DemoUpdateMode::None:
+        break;
+    case DemoUpdateMode::RotateLight:
+        UpdateRotatingLight(deltaTime);
+        break;
+    case DemoUpdateMode::MoveSphere:
+        UpdateMovingSphere(deltaTime);
+        break;
+    case DemoUpdateMode::OrbitCamera:
+        UpdateOrbitingCamera(deltaTime);
+        break;
     }
 }
 
@@ -317,7 +294,8 @@ void SphereGridScene::UpdateMovingSphere(float deltaTime)
 
     const std::vector<RenderObject>& renderObjects = m_scene.GetRenderObjects();
 
-    if(renderObjects.empty()){
+    if (renderObjects.empty())
+    {
         return;
     }
 
@@ -331,6 +309,7 @@ void SphereGridScene::UpdateMovingSphere(float deltaTime)
 void SphereGridScene::UpdateOrbitingCamera(float deltaTime)
 {
     m_cameraOrbitAngle += deltaTime * m_cameraOrbitSpeed;
+
     const float angle = m_cameraOrbitAngle;
 
     Camera& camera = m_scene.GetCamera();
@@ -408,15 +387,18 @@ std::vector<Material*> SphereGridScene::GetMaterials()
 
     materials.reserve(MaterialSampleCount * 3 + 1);
 
-    for(Material& material : m_dielectricMaterials){
+    for (Material& material : m_dielectricMaterials)
+    {
         materials.push_back(&material);
     }
 
-    for(Material& material : m_conductorMaterials){
+    for (Material& material : m_conductorMaterials)
+    {
         materials.push_back(&material);
     }
 
-    for(Material& material : m_metallicRoughnessMaterials){
+    for (Material& material : m_metallicRoughnessMaterials)
+    {
         materials.push_back(&material);
     }
 

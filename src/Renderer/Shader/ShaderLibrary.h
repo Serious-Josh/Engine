@@ -12,6 +12,7 @@ struct ShaderKey
 {
     std::string path;
     std::string entryPoint;
+
     ShaderStage stage = ShaderStage::Vertex;
 
     bool operator==(const ShaderKey& other) const
@@ -35,20 +36,23 @@ struct ShaderKeyHash
 class ShaderLibrary
 {
     public:
-        ShaderLibrary() = default;
-        ShaderLibrary(const ShaderLibrary&) = delete;
-        ShaderLibrary& operator=(const ShaderLibrary&) = delete;
+    ShaderLibrary() = default;
+    ShaderLibrary(const ShaderLibrary&) = delete;
+    ShaderLibrary& operator=(const ShaderLibrary&) = delete;
 
-        bool Initialize(const std::filesystem::path& shaderRoot);
-        void Shutdown();
+    bool Initialize(const std::filesystem::path& shaderRoot);
+    void Shutdown();
 
-        Shader* Load(const ShaderDescription& description);
+    Shader* Load(const ShaderDescription& description);
 
-        bool CompileLibrary(const std::filesystem::path& path, ShaderLibraryCompileResult& output);
+    bool CompileLibrary(
+        const std::filesystem::path& path,
+        ShaderLibraryCompileResult& output);
 
     private:
-        ShaderCompiler m_compiler;
-        std::filesystem::path m_shaderRoot;
+    ShaderCompiler m_compiler;
 
-        std::unordered_map<ShaderKey, std::unique_ptr<Shader>, ShaderKeyHash> m_shaders;
+    std::filesystem::path m_shaderRoot;
+
+    std::unordered_map<ShaderKey, std::unique_ptr<Shader>, ShaderKeyHash> m_shaders;
 };

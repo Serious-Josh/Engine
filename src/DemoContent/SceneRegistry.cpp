@@ -2,15 +2,15 @@
 
 #include <algorithm>
 
-
 SceneRegistry& SceneRegistry::Instance()
 {
     static SceneRegistry registry;
     return registry;
 }
 
-
-bool SceneRegistry::Register(std::string_view name, DemoSceneFactory factory)
+bool SceneRegistry::Register(
+    std::string_view name,
+    DemoSceneFactory factory)
 {
     if (m_finalized || name.empty() || factory == nullptr)
     {
@@ -18,14 +18,8 @@ bool SceneRegistry::Register(std::string_view name, DemoSceneFactory factory)
         return false;
     }
 
-    const auto existing =
-        std::find_if(
-            m_scenes.begin(),
-            m_scenes.end(),
-            [name](const DemoSceneEntry& entry)
-            {
-                return entry.name == name;
-            });
+    const auto existing = std::find_if(m_scenes.begin(), m_scenes.end(),
+                                       [name](const DemoSceneEntry& entry) { return entry.name == name; });
 
     if (existing != m_scenes.end())
     {
@@ -34,6 +28,7 @@ bool SceneRegistry::Register(std::string_view name, DemoSceneFactory factory)
     }
 
     DemoSceneEntry entry{};
+
     entry.name = name;
     entry.create = factory;
 
@@ -42,7 +37,6 @@ bool SceneRegistry::Register(std::string_view name, DemoSceneFactory factory)
     return true;
 }
 
-
 bool SceneRegistry::Finalize()
 {
     if (m_finalized)
@@ -50,30 +44,23 @@ bool SceneRegistry::Finalize()
         return !m_registrationError;
     }
 
-    std::sort(
-        m_scenes.begin(),
-        m_scenes.end(),
-        [](const DemoSceneEntry& a,
-           const DemoSceneEntry& b)
-        {
-            return a.name < b.name;
-        });
+    std::sort(m_scenes.begin(), m_scenes.end(),
+              [](const DemoSceneEntry& a, const DemoSceneEntry& b) { return a.name < b.name; });
 
     m_finalized = true;
 
     return !m_registrationError;
 }
 
-
-std::span<const DemoSceneEntry>SceneRegistry::GetScenes() const
+std::span<const DemoSceneEntry> SceneRegistry::GetScenes() const
 {
     return m_scenes;
 }
 
-
 const DemoSceneEntry* SceneRegistry::Find(std::string_view name) const
 {
-    const auto result = std::find_if(m_scenes.begin(), m_scenes.end(), [name](const DemoSceneEntry& entry){return entry.name == name;});
+    const auto result = std::find_if(m_scenes.begin(), m_scenes.end(),
+                                     [name](const DemoSceneEntry& entry) { return entry.name == name; });
 
     if (result == m_scenes.end())
     {

@@ -14,57 +14,133 @@ struct MeshBounds
 {
     Vector3 min{};
     Vector3 max{};
+
     bool valid = false;
 };
 
 class Mesh
 {
     public:
-        Mesh() = default;
+    Mesh() = default;
 
-        Mesh(const Mesh&) = delete;
-        Mesh& operator=(const Mesh&) = delete;
+    Mesh(const Mesh&) = delete;
+    Mesh& operator=(const Mesh&) = delete;
 
-        bool Initialize(ID3D12Device* device, ResourceUploader& uploader, DescriptorHeap& descriptorHeap, const void* vertices, size_t vertexCount, const VertexLayout& layout);
-        bool Initialize(ID3D12Device* device, ResourceUploader& uploader, DescriptorHeap& descriptorHeap, const void* vertices, size_t vertexCount, const VertexLayout& layout, const unsigned int* indices, size_t indexCount);
-        bool ReplaceGeometry(
-            ID3D12Device* device,
-            ResourceUploader& uploader,
-            DescriptorHeap& descriptorHeap,
-            const void* vertices,
-            size_t vertexCount,
-            const unsigned int* indices,
-            size_t indexCount);
-            
-        void Shutdown();
-        void Bind(ID3D12GraphicsCommandList* commandList) const;
+    bool Initialize(
+        ID3D12Device* device,
+        ResourceUploader& uploader,
+        DescriptorHeap& descriptorHeap,
+        const void* vertices,
+        size_t vertexCount,
+        const VertexLayout& layout);
+    bool Initialize(
+        ID3D12Device* device,
+        ResourceUploader& uploader,
+        DescriptorHeap& descriptorHeap,
+        const void* vertices,
+        size_t vertexCount,
+        const VertexLayout& layout,
+        const unsigned int* indices,
+        size_t indexCount);
 
-        size_t GetVertexCount() const;
-        size_t GetIndexCount() const;
-        bool IsIndexed() const;
+    bool InitializeGPUWritable(
+        ID3D12Device* device,
+        DescriptorHeap& descriptorHeap,
+        const VertexLayout& layout,
+        size_t vertexCapacity,
+        size_t indexCapacity,
+        const MeshBounds& bounds);
 
-        D3D12_GPU_VIRTUAL_ADDRESS GetVertexBufferAddress() const;
-        D3D12_GPU_VIRTUAL_ADDRESS GetIndexBufferAddress() const;
+    bool SetGPUGeneratedGeometryCounts(
+        size_t vertexCount,
+        size_t indexCount);
 
-        UINT GetVertexStride() const;
-        DXGI_FORMAT GetIndexFormat() const;
-        const VertexLayout& GetVertexLayout() const;
+    // Empty mesh only. Bounds must enclose the seed and all future GPU output.
+    // Seed vertices must match the displacement Vertex ABI (48-byte stride).
+    bool InitializeGPUWritableSeeded(
+        ID3D12Device* device,
+        ResourceUploader& uploader,
+        DescriptorHeap& descriptorHeap,
+        const VertexLayout& layout,
+        const void* vertices,
+        size_t vertexCount,
+        const unsigned int* indices,
+        size_t indexCount,
+        size_t vertexCapacity,
+        size_t indexCapacity,
+        const MeshBounds& bounds);
 
-        unsigned int GetVertexBufferDescriptorIndex() const;
-        unsigned int GetIndexBufferDescriptorIndex() const;
+    bool ReplaceGeometry(
+        ID3D12Device* device,
+        ResourceUploader& uploader,
+        DescriptorHeap& descriptorHeap,
+        const void* vertices,
+        size_t vertexCount,
+        const unsigned int* indices,
+        size_t indexCount);
 
-        const MeshBounds& GetBounds() const;
+    void Shutdown();
+    void Bind(ID3D12GraphicsCommandList* commandList) const;
+
+    size_t GetVertexCount() const;
+    size_t GetIndexCount() const;
+    bool IsIndexed() const;
+
+    D3D12_GPU_VIRTUAL_ADDRESS GetVertexBufferAddress() const;
+    D3D12_GPU_VIRTUAL_ADDRESS GetIndexBufferAddress() const;
+
+    UINT GetVertexStride() const;
+    DXGI_FORMAT GetIndexFormat() const;
+    const VertexLayout& GetVertexLayout() const;
+
+    unsigned int GetVertexBufferDescriptorIndex() const;
+    unsigned int GetIndexBufferDescriptorIndex() const;
+
+    unsigned int GetVertexBufferUAVDescriptorIndex() const;
+    unsigned int GetIndexBufferUAVDescriptorIndex() const;
+
+    ID3D12Resource* GetVertexBufferResource() const;
+    ID3D12Resource* GetIndexBufferResource() const;
+    D3D12_RESOURCE_STATES GetVertexBufferState() const;
+    D3D12_RESOURCE_STATES GetIndexBufferState() const;
+
+    // Only valid when the command list containing the transitions was discarded.
+    void RestoreBufferStatesAfterAbort(
+        D3D12_RESOURCE_STATES vertexState,
+        D3D12_RESOURCE_STATES indexState)
+    {
+        m_vertexBuffer.RestoreStateAfterAbort(vertexState);
+        m_indexBuffer.RestoreStateAfterAbort(indexState);
+    }
+
+    void TransitionVertexBuffer(
+        ID3D12GraphicsCommandList* commandList,
+        D3D12_RESOURCE_STATES newState);
+    void TransitionIndexBuffer(
+        ID3D12GraphicsCommandList* commandList,
+        D3D12_RESOURCE_STATES newState);
+
+    size_t GetVertexCapacity() const;
+    size_t GetIndexCapacity() const;
+
+    const MeshBounds& GetBounds() const;
 
     private:
-        Buffer m_vertexBuffer;
-        Buffer m_indexBuffer;
-        VertexLayout m_layout;
+    Buffer m_vertexBuffer;
+    Buffer m_indexBuffer;
 
-        size_t m_vertexCount = 0;
-        size_t m_indexCount = 0;
+    VertexLayout m_layout;
 
-        D3D12_VERTEX_BUFFER_VIEW m_vertexBufferView{};
-        D3D12_INDEX_BUFFER_VIEW m_indexBufferView{};
+    size_t m_vertexCount = 0;
+    size_t m_indexCount = 0;
+    size_t m_vertexCapacity = 0;
+    size_t m_indexCapacity = 0;
 
-        MeshBounds m_bounds;
+    bool m_gpuWritable = false;
+
+    D3D12_VERTEX_BUFFER_VIEW m_vertexBufferView{};
+
+    D3D12_INDEX_BUFFER_VIEW m_indexBufferView{};
+
+    MeshBounds m_bounds;
 };

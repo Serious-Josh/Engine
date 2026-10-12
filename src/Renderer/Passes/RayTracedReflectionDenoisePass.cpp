@@ -15,18 +15,19 @@ bool RayTracedReflectionDenoisePass::Initialize(
     ID3D12Device* device = graphicsDevice.GetDevice();
 
     ShaderDescription shaderDescription{};
-    shaderDescription.path ="RayTracedReflectionsDenoise.hlsl";
+    shaderDescription.path = "RayTracedReflectionsDenoise.hlsl";
     shaderDescription.entryPoint = "CSMain";
     shaderDescription.stage = ShaderStage::Compute;
 
     Shader* computeShader = shaderLibrary.Load(shaderDescription);
 
-    if(!computeShader)
+    if (!computeShader)
     {
         return false;
     }
 
     ComputePipelineDescription pipelineDescription{};
+
     pipelineDescription.computeShader = computeShader;
 
     RootParameterDescription constants{};
@@ -36,27 +37,26 @@ bool RayTracedReflectionDenoisePass::Initialize(
 
     pipelineDescription.rootParameters.push_back(constants);
 
-    if(!m_pipeline.Initialize(device, pipelineDescription))
+    if (!m_pipeline.Initialize(device, pipelineDescription))
     {
         return false;
     }
 
-    for(unsigned int i = 0; i < 2; ++i)
+    for (unsigned int i = 0; i < 2; ++i)
     {
-        if(!m_filteredReflection[i].Initialize(device, width, height, 1, 1,
-            DXGI_FORMAT_R16G16B16A16_FLOAT,
-            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
+        if (!m_filteredReflection[i].Initialize(device, width, height, 1, 1, DXGI_FORMAT_R16G16B16A16_FLOAT,
+                                                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
         {
             return false;
         }
 
-        if(!m_filteredReflection[i].CreateSRV(device, descriptorHeap))
+        if (!m_filteredReflection[i].CreateSRV(device, descriptorHeap))
         {
             return false;
         }
 
-        if(!m_filteredReflection[i].CreateUAV(device, descriptorHeap))
+        if (!m_filteredReflection[i].CreateUAV(device, descriptorHeap))
         {
             return false;
         }
@@ -68,6 +68,7 @@ bool RayTracedReflectionDenoisePass::Initialize(
 }
 
 bool RayTracedReflectionDenoisePass::Resize(
+
     GraphicsDevice& graphicsDevice,
     DescriptorHeap& descriptorHeap,
     unsigned int width,
@@ -75,28 +76,29 @@ bool RayTracedReflectionDenoisePass::Resize(
 {
     ID3D12Device* device = graphicsDevice.GetDevice();
 
-    for(Texture& texture : m_filteredReflection)
+    for (Texture& texture : m_filteredReflection)
     {
         texture.Shutdown();
     }
 
-    for(unsigned int i = 0; i < 2; ++i)
+    for (unsigned int i = 0; i < 2; ++i)
     {
-        if(!m_filteredReflection[i].Initialize(device, width, height, 1, 1,
-            DXGI_FORMAT_R16G16B16A16_FLOAT,
-            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
+        if (!m_filteredReflection[i].Initialize(device, width, height, 1, 1, DXGI_FORMAT_R16G16B16A16_FLOAT,
+                                                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
         {
             return false;
         }
 
-        if(!m_filteredReflection[i].CreateSRV(device, descriptorHeap))
+        if (!m_filteredReflection[i].CreateSRV(device, descriptorHeap))
         {
+
             return false;
         }
 
-        if(!m_filteredReflection[i].CreateUAV(device, descriptorHeap))
+        if (!m_filteredReflection[i].CreateUAV(device, descriptorHeap))
         {
+
             return false;
         }
     }
@@ -109,7 +111,7 @@ void RayTracedReflectionDenoisePass::Shutdown()
 {
     m_pipeline.Shutdown();
 
-    for(Texture& texture : m_filteredReflection)
+    for (Texture& texture : m_filteredReflection)
     {
         texture.Shutdown();
     }
@@ -130,19 +132,14 @@ void RayTracedReflectionDenoisePass::Execute(
     inputReflection.Transition(commandList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     hitDistance.Transition(commandList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
-    const unsigned int stepWidths[] =
-    {
-        1,
-        2,
-        4
-    };
+    const unsigned int stepWidths[] = {1, 2, 4};
 
     const unsigned int groupCountX = (width + 7) / 8;
     const unsigned int groupCountY = (height + 7) / 8;
 
     Texture* currentInput = &inputReflection;
 
-    for(unsigned int passIndex = 0; passIndex < 3; ++passIndex)
+    for (unsigned int passIndex = 0; passIndex < 3; ++passIndex)
     {
         const unsigned int writeIndex = passIndex % 2;
 
@@ -158,16 +155,19 @@ void RayTracedReflectionDenoisePass::Execute(
         constants.reflectionIndex = currentInput->GetDescriptorIndex();
         constants.depthIndex = gBuffer.GetDepth().GetSRVIndex();
         constants.surfaceIndex = gBuffer.GetSurface().GetSRVIndex();
+
         constants.materialIndex = gBuffer.GetMaterial().GetSRVIndex();
         constants.outputIndex = output.GetUAVIndex();
         constants.width = width;
         constants.height = height;
+
         constants.stepWidth = stepWidths[passIndex];
         constants.hitDistanceIndex = hitDistance.GetDescriptorIndex();
 
-        const D3D12_GPU_VIRTUAL_ADDRESS gpuVirtualAddress = uploadBuffer.Allocate(&constants, sizeof(constants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
+        const D3D12_GPU_VIRTUAL_ADDRESS gpuVirtualAddress =
+            uploadBuffer.Allocate(&constants, sizeof(constants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
 
-        if(gpuVirtualAddress == 0)
+        if (gpuVirtualAddress == 0)
         {
             return;
         }

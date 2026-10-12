@@ -4,7 +4,8 @@ bool ShaderLibrary::Initialize(const std::filesystem::path& shaderRoot)
 {
     m_shaderRoot = shaderRoot;
 
-    if(!m_compiler.Initialize()){
+    if (!m_compiler.Initialize())
+    {
         return false;
     }
 
@@ -13,7 +14,8 @@ bool ShaderLibrary::Initialize(const std::filesystem::path& shaderRoot)
 
 void ShaderLibrary::Shutdown()
 {
-    for(auto& [key, shader] : m_shaders){
+    for (auto& [key, shader] : m_shaders)
+    {
         shader->Unload();
     }
 
@@ -24,18 +26,21 @@ void ShaderLibrary::Shutdown()
 
 Shader* ShaderLibrary::Load(const ShaderDescription& description)
 {
-    if(!description.path || !description.entryPoint){
+    if (!description.path || !description.entryPoint)
+    {
         return nullptr;
     }
 
     ShaderKey key{};
     key.path = description.path;
+
     key.entryPoint = description.entryPoint;
     key.stage = description.stage;
 
     auto existingShader = m_shaders.find(key);
 
-    if(existingShader != m_shaders.end()){
+    if (existingShader != m_shaders.end())
+    {
         return existingShader->second.get();
     }
 
@@ -51,13 +56,15 @@ Shader* ShaderLibrary::Load(const ShaderDescription& description)
 
     ShaderCompileResult compileResult{};
 
-    if(!m_compiler.Compile(compileDescription, compileResult)){
+    if (!m_compiler.Compile(compileDescription, compileResult))
+    {
         return nullptr;
     }
 
     std::unique_ptr<Shader> shader = std::make_unique<Shader>();
 
-    if(!shader->Initialize(compileResult.bytecode.data(), compileResult.bytecode.size())){
+    if (!shader->Initialize(compileResult.bytecode.data(), compileResult.bytecode.size()))
+    {
         return nullptr;
     }
 
@@ -68,7 +75,9 @@ Shader* ShaderLibrary::Load(const ShaderDescription& description)
     return shaderPointer;
 }
 
-bool ShaderLibrary::CompileLibrary(const std::filesystem::path& path, ShaderLibraryCompileResult& output)
+bool ShaderLibrary::CompileLibrary(
+    const std::filesystem::path& path,
+    ShaderLibraryCompileResult& output)
 {
     const std::filesystem::path shaderPath = m_shaderRoot / path;
     const std::wstring shaderPathString = shaderPath.wstring();

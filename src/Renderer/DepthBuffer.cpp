@@ -4,18 +4,25 @@
 
 #include <string>
 
-
-bool DepthBuffer::Initialize(ID3D12Device* device, unsigned int width, unsigned int height, DescriptorHeap& dsvHeap, DescriptorHeap& resourceHeap)
+bool DepthBuffer::Initialize(
+    ID3D12Device* device,
+    unsigned int width,
+    unsigned int height,
+    DescriptorHeap& dsvHeap,
+    DescriptorHeap& resourceHeap)
 {
-    if(!device || width == 0 || height == 0){
+    if (!device || width == 0 || height == 0)
+    {
         return false;
     }
 
     D3D12_RESOURCE_DESC description{};
+
     description.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     description.Width = width;
     description.Height = height;
     description.DepthOrArraySize = 1;
+
     description.MipLevels = 1;
 
     // Typeless so the same resource can be viewed as
@@ -34,9 +41,12 @@ bool DepthBuffer::Initialize(ID3D12Device* device, unsigned int width, unsigned 
     clearValue.DepthStencil.Depth = 1.0f;
     clearValue.DepthStencil.Stencil = 0;
 
-    HRESULT result = device->CreateCommittedResource(&heapProperties, D3D12_HEAP_FLAG_NONE, &description, D3D12_RESOURCE_STATE_DEPTH_WRITE, &clearValue, IID_PPV_ARGS(&m_resource));
+    HRESULT result =
+        device->CreateCommittedResource(&heapProperties, D3D12_HEAP_FLAG_NONE, &description,
+                                        D3D12_RESOURCE_STATE_DEPTH_WRITE, &clearValue, IID_PPV_ARGS(&m_resource));
 
-    if(FAILED(result)){
+    if (FAILED(result))
+    {
         Log::Error("Failed to allocate depth resource. HRESULT: " + std::to_string(result));
         return false;
     }
@@ -45,7 +55,8 @@ bool DepthBuffer::Initialize(ID3D12Device* device, unsigned int width, unsigned 
 
     m_dsvIndex = dsvHeap.Allocate();
 
-    if(m_dsvIndex == UINT_MAX){
+    if (m_dsvIndex == UINT_MAX)
+    {
         Shutdown();
         return false;
     }
@@ -54,21 +65,25 @@ bool DepthBuffer::Initialize(ID3D12Device* device, unsigned int width, unsigned 
 
     m_readOnlyDsvIndex = dsvHeap.Allocate();
 
-    if(m_readOnlyDsvIndex == UINT_MAX){
+    if (m_readOnlyDsvIndex == UINT_MAX)
+    {
         Shutdown();
         return false;
     }
 
     m_srvIndex = resourceHeap.Allocate();
 
-    if(m_srvIndex == UINT_MAX){
+    if (m_srvIndex == UINT_MAX)
+    {
         Shutdown();
+
         return false;
     }
 
     m_resourceHeap = &resourceHeap;
 
-    D3D12_DEPTH_STENCIL_VIEW_DESC  dsvDescription{};
+    D3D12_DEPTH_STENCIL_VIEW_DESC dsvDescription{};
+
     dsvDescription.Format = DXGI_FORMAT_D32_FLOAT;
     dsvDescription.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
     dsvDescription.Flags = D3D12_DSV_FLAG_NONE;
@@ -84,6 +99,7 @@ bool DepthBuffer::Initialize(ID3D12Device* device, unsigned int width, unsigned 
     srvDescription.Format = DXGI_FORMAT_R32_FLOAT;
     srvDescription.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     srvDescription.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+
     srvDescription.Texture2D.MipLevels = 1;
 
     device->CreateShaderResourceView(m_resource, &srvDescription, resourceHeap.GetCPUHandle(m_srvIndex));
@@ -94,15 +110,19 @@ bool DepthBuffer::Initialize(ID3D12Device* device, unsigned int width, unsigned 
     return true;
 }
 
-void DepthBuffer::Transition(ID3D12GraphicsCommandList* commandList, D3D12_RESOURCE_STATES newState)
+void DepthBuffer::Transition(
+    ID3D12GraphicsCommandList* commandList,
+    D3D12_RESOURCE_STATES newState)
 {
-    if(!m_resource || !commandList || m_state == newState){
+    if (!m_resource || !commandList || m_state == newState)
+    {
         return;
     }
 
     D3D12_RESOURCE_BARRIER barrier{};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     barrier.Transition.pResource = m_resource;
+
     barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     barrier.Transition.StateBefore = m_state;
     barrier.Transition.StateAfter = newState;
@@ -114,24 +134,30 @@ void DepthBuffer::Transition(ID3D12GraphicsCommandList* commandList, D3D12_RESOU
 
 void DepthBuffer::Shutdown()
 {
-    if(m_dsvHeap && m_dsvIndex != UINT_MAX){
+    if (m_dsvHeap && m_dsvIndex != UINT_MAX)
+    {
         m_dsvHeap->Free(m_dsvIndex);
     }
 
-    if(m_dsvHeap && m_readOnlyDsvIndex != UINT_MAX){
+    if (m_dsvHeap && m_readOnlyDsvIndex != UINT_MAX)
+    {
         m_dsvHeap->Free(m_readOnlyDsvIndex);
     }
 
-    if(m_resourceHeap && m_srvIndex != UINT_MAX){
+    if (m_resourceHeap && m_srvIndex != UINT_MAX)
+    {
         m_resourceHeap->Free(m_srvIndex);
     }
 
-    if(m_resource){
+    if (m_resource)
+    {
+
         m_resource->Release();
         m_resource = nullptr;
     }
 
     m_dsvHeap = nullptr;
+
     m_resourceHeap = nullptr;
 
     m_dsvIndex = UINT_MAX;
@@ -151,7 +177,8 @@ ID3D12Resource* DepthBuffer::GetResource() const
 
 D3D12_CPU_DESCRIPTOR_HANDLE DepthBuffer::GetDSV() const
 {
-    if(!m_dsvHeap || m_dsvIndex == UINT_MAX){
+    if (!m_dsvHeap || m_dsvIndex == UINT_MAX)
+    {
         return {};
     }
 
@@ -160,7 +187,8 @@ D3D12_CPU_DESCRIPTOR_HANDLE DepthBuffer::GetDSV() const
 
 D3D12_CPU_DESCRIPTOR_HANDLE DepthBuffer::GetReadOnlyDSV() const
 {
-    if(!m_dsvHeap || m_readOnlyDsvIndex == UINT_MAX){
+    if (!m_dsvHeap || m_readOnlyDsvIndex == UINT_MAX)
+    {
         return {};
     }
 

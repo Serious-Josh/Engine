@@ -12,6 +12,13 @@ struct Vertex
     float tangent[4] = {1.0f, 0.0f, 0.0f, 1.0f};
 };
 
+static_assert(sizeof(Vertex) == 48);
+
+static_assert(offsetof(Vertex, position) == 0);
+static_assert(offsetof(Vertex, normal) == 12);
+static_assert(offsetof(Vertex, uv) == 24);
+static_assert(offsetof(Vertex, tangent) == 32);
+
 inline VertexLayout CreateVertexLayout()
 {
     VertexLayout layout;

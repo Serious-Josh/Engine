@@ -30,16 +30,32 @@ static_assert(sizeof(DenoiseConstants) == 96);
 class ShadowDenoisePass
 {
     public:
-        bool Initialize(GraphicsDevice& graphicsDevice, ShaderLibrary& shaderLibrary, DescriptorHeap& descriptorHeap, unsigned int width, unsigned int height);
-        bool Resize(GraphicsDevice& graphicsDevice, DescriptorHeap& descriptorHeap, unsigned int width, unsigned int height);
-        void Shutdown();
+    bool Initialize(
+      GraphicsDevice& graphicsDevice,
+      ShaderLibrary& shaderLibrary,
+      DescriptorHeap& descriptorHeap,
+      unsigned int width,
+      unsigned int height);
+    bool Resize(
+        GraphicsDevice& graphicsDevice,
+        DescriptorHeap& descriptorHeap,
+        unsigned int width,
+        unsigned int height);
+    void Shutdown();
 
-        void Execute(ID3D12GraphicsCommandList* commandList, Texture& inputVisibility, GBuffer& gBuffer, UploadBuffer& uploadBuffer, const Matrix4& inverseViewProjection, unsigned int width, unsigned int height);
+    void Execute(
+        ID3D12GraphicsCommandList* commandList,
+        Texture& inputVisibility,
+        GBuffer& gBuffer,
+        UploadBuffer& uploadBuffer,
+        const Matrix4& inverseViewProjection,
+        unsigned int width,
+        unsigned int height);
 
-        Texture& GetFilteredVisibilityTexture();
+    Texture& GetFilteredVisibilityTexture();
 
     private:
-        ComputePipeline m_pipeline;
-        Texture m_filteredVisibility[2];
-        unsigned int m_outputIndex = 0;
+    ComputePipeline m_pipeline;
+    Texture m_filteredVisibility[2];
+    unsigned int m_outputIndex = 0;
 };

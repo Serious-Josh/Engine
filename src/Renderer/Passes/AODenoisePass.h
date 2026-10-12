@@ -30,13 +30,13 @@ static_assert(sizeof(AODenoiseConstants) == 96);
 
 class AODenoisePass
 {
-public:
+    public:
     bool Initialize(
-        GraphicsDevice& graphicsDevice,
-        ShaderLibrary& shaderLibrary,
-        DescriptorHeap& descriptorHeap,
-        unsigned int width,
-        unsigned int height);
+      GraphicsDevice& graphicsDevice,
+      ShaderLibrary& shaderLibrary,
+      DescriptorHeap& descriptorHeap,
+      unsigned int width,
+      unsigned int height);
 
     bool Resize(
         GraphicsDevice& graphicsDevice,
@@ -57,7 +57,7 @@ public:
 
     Texture& GetFilteredAOTexture();
 
-private:
+    private:
     ComputePipeline m_pipeline;
     Texture m_filteredAO[2];
     unsigned int m_outputIndex = 0;

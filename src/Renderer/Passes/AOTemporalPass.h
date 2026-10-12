@@ -37,13 +37,13 @@ static_assert(sizeof(AOTemporalConstants) == 240);
 
 class AOTemporalPass
 {
-public:
+    public:
     bool Initialize(
-        GraphicsDevice& graphicsDevice,
-        ShaderLibrary& shaderLibrary,
-        DescriptorHeap& descriptorHeap,
-        unsigned int width,
-        unsigned int height);
+      GraphicsDevice& graphicsDevice,
+      ShaderLibrary& shaderLibrary,
+      DescriptorHeap& descriptorHeap,
+      unsigned int width,
+      unsigned int height);
 
     bool Resize(
         GraphicsDevice& graphicsDevice,
@@ -68,7 +68,7 @@ public:
 
     Texture& GetAccumulatedAOTexture();
 
-private:
+    private:
     ComputePipeline m_pipeline;
 
     Texture m_accumulatedAO[2];

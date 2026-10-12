@@ -30,57 +30,67 @@ enum class DemoUpdateMode
 class SphereGridScene : public IDemoScene
 {
     public:
-        bool Initialize(ID3D12Device* device, ResourceUploader& uploader, DescriptorHeap& descriptorHeap, const Shader* vertexShader, const Shader* pixelShader) override;
-        void Shutdown() override;
+    bool Initialize(
+      ID3D12Device* device,
+      ResourceUploader& uploader,
+      DescriptorHeap& descriptorHeap,
+      const Shader* vertexShader,
+      const Shader* pixelShader) override;
+    void Shutdown() override;
 
-        void Update(float deltaTime) override;
+    void Update(float deltaTime) override;
 
-        void SetAspectRatio(float aspectRatio) override;
+    void SetAspectRatio(float aspectRatio) override;
 
-        Scene& GetScene() override;
-        const Scene& GetScene() const override;
-        std::vector<Material*> GetMaterials() override;
+    Scene& GetScene() override;
+    const Scene& GetScene() const override;
+    std::vector<Material*> GetMaterials() override;
 
-        void ResetCamera() override;
-        void ResetDirectionalLight() override;
+    void ResetCamera() override;
+    void ResetDirectionalLight() override;
 
-        void SetUpdateMode(DemoUpdateMode mode);
-        DemoUpdateMode GetUpdateMode() const;
+    void SetUpdateMode(DemoUpdateMode mode);
+    DemoUpdateMode GetUpdateMode() const;
 
-        void SetLightRotationSpeed(float speed);
-        float GetLightRotationSpeed() const;
-        void SetCameraOrbitSpeed(float speed);
-        float GetCameraOrbitSpeed() const;
-        void SetLightVerticalAngle(float angle);
-        float GetLightVerticalAngle() const;
+    void SetLightRotationSpeed(float speed);
+    float GetLightRotationSpeed() const;
+    void SetCameraOrbitSpeed(float speed);
+    float GetCameraOrbitSpeed() const;
+    void SetLightVerticalAngle(float angle);
+    float GetLightVerticalAngle() const;
 
     private:
-        void UpdateRotatingLight(float deltaTime);
-        void UpdateMovingSphere(float deltaTime);
-        void UpdateOrbitingCamera(float deltaTime);
+    void UpdateRotatingLight(float deltaTime);
+    void UpdateMovingSphere(float deltaTime);
+    void UpdateOrbitingCamera(float deltaTime);
 
-        VertexLayout m_vertexLayout;
-        Mesh m_mesh;
-        Mesh m_planeMesh;
-        Texture m_texture;
-        Texture m_normalTexture;
-        Texture m_roughnessTexture;
-        Pipeline m_pipeline;
+    VertexLayout m_vertexLayout;
 
-        static constexpr unsigned int MaterialSampleCount = 5;
+    Mesh m_mesh;
+    Mesh m_planeMesh;
 
-        std::array<Material, MaterialSampleCount> m_dielectricMaterials;
-        std::array<Material, MaterialSampleCount> m_conductorMaterials;
-        std::array<Material, MaterialSampleCount> m_metallicRoughnessMaterials;
-        Material m_floorMaterial;
+    Texture m_texture;
+    Texture m_normalTexture;
+    Texture m_roughnessTexture;
 
-        Scene m_scene;
+    Pipeline m_pipeline;
 
-        float m_lightAngle = 0.0f;
-        float m_lightRotationSpeed = 1.0f;
-        float m_cameraOrbitAngle = 0.0f;
-        float m_cameraOrbitSpeed = 0.25f;
-        float m_lightVerticalAngle = ToRadians(50);
+    static constexpr unsigned int MaterialSampleCount = 5;
 
-        DemoUpdateMode m_updateMode = DemoUpdateMode::None;
+    std::array<Material, MaterialSampleCount> m_dielectricMaterials;
+    std::array<Material, MaterialSampleCount> m_conductorMaterials;
+    std::array<Material, MaterialSampleCount> m_metallicRoughnessMaterials;
+
+    Material m_floorMaterial;
+
+    Scene m_scene;
+
+    float m_lightAngle = 0.0f;
+    float m_lightRotationSpeed = 1.0f;
+    float m_cameraOrbitAngle = 0.0f;
+    float m_cameraOrbitSpeed = 0.25f;
+
+    float m_lightVerticalAngle = ToRadians(50);
+
+    DemoUpdateMode m_updateMode = DemoUpdateMode::None;
 };

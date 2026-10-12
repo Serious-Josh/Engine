@@ -7,7 +7,9 @@
 #include "Renderer/Texture.h"
 #include "Renderer/Shader/ShaderLibrary.h"
 
-bool DeferredLightingPass::Initialize(ID3D12Device* device, ShaderLibrary& shaderLibrary)
+bool DeferredLightingPass::Initialize(
+    ID3D12Device* device,
+    ShaderLibrary& shaderLibrary)
 {
     ShaderDescription vertexDescription{};
     vertexDescription.path = "DeferredLighting.hlsl";
@@ -16,68 +18,68 @@ bool DeferredLightingPass::Initialize(ID3D12Device* device, ShaderLibrary& shade
 
     Shader* vertexShader = shaderLibrary.Load(vertexDescription);
 
-    if(!vertexShader){
+    if (!vertexShader)
+    {
         Log::Error("Failed to load deferred lighting vertex shader.");
         return false;
     }
 
     ShaderDescription pixelDescription{};
+
     pixelDescription.path = "DeferredLighting.hlsl";
     pixelDescription.entryPoint = "PSMain";
     pixelDescription.stage = ShaderStage::Pixel;
 
     Shader* pixelShader = shaderLibrary.Load(pixelDescription);
 
-    if(!pixelShader){
+    if (!pixelShader)
+    {
         Log::Error("Failed to load deferred lighting pixel shader.");
         return false;
     }
 
     PipelineDescription pipelineDescription{};
+
     pipelineDescription.vertexShader = vertexShader;
     pipelineDescription.pixelShader = pixelShader;
     pipelineDescription.vertexLayout = nullptr;
     pipelineDescription.renderTargets.count = 1;
+
     pipelineDescription.renderTargets.formats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;
 
-    pipelineDescription.sampler.filter =
-        D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+    pipelineDescription.sampler.filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
 
-    pipelineDescription.sampler.addressU =
-        D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    pipelineDescription.sampler.addressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
 
-    pipelineDescription.sampler.addressV =
-        D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    pipelineDescription.sampler.addressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
 
-    pipelineDescription.sampler.addressW =
-        D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    pipelineDescription.sampler.addressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
 
     // Match the convolution's HDRI sampler without altering production sampler0.
     D3D12_STATIC_SAMPLER_DESC referenceSampler{};
     referenceSampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
     referenceSampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
     referenceSampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+
     referenceSampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
     referenceSampler.MaxAnisotropy = 1;
     referenceSampler.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
     referenceSampler.MaxLOD = D3D12_FLOAT32_MAX;
+
     referenceSampler.ShaderRegister = 1;
     referenceSampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     pipelineDescription.additionalSamplers.push_back(referenceSampler);
 
-    pipelineDescription.rootParameters.push_back(
-        {RootParameterType::Constants, 0, 17, D3D12_SHADER_VISIBILITY_PIXEL}
-    );
+    pipelineDescription.rootParameters.push_back({RootParameterType::Constants, 0, 17, D3D12_SHADER_VISIBILITY_PIXEL});
 
     pipelineDescription.rootParameters.push_back(
-        {RootParameterType::ConstantBuffer, 1, 0, D3D12_SHADER_VISIBILITY_PIXEL}
-    );
+        {RootParameterType::ConstantBuffer, 1, 0, D3D12_SHADER_VISIBILITY_PIXEL});
 
     pipelineDescription.rootParameters.push_back(
-        {RootParameterType::ConstantBuffer, 2, 0, D3D12_SHADER_VISIBILITY_PIXEL}
-    );
+        {RootParameterType::ConstantBuffer, 2, 0, D3D12_SHADER_VISIBILITY_PIXEL});
 
-    if(!m_pipeline.Initialize(device, pipelineDescription)){
+    if (!m_pipeline.Initialize(device, pipelineDescription))
+    {
         Log::Error("Failed to initialize deferred lighting pipeline.");
         return false;
     }
@@ -114,64 +116,34 @@ void DeferredLightingPass::Execute(
     reflectionTexture.Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     giIrradiance.Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
-    if(!enableRTGI || debugView == 21u || rtgiContactAOStrength > 0.0f)
+    if (!enableRTGI || debugView == 21u || rtgiContactAOStrength > 0.0f)
+    {
         aoVisibility.Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    }
 
     sceneColor.Transition(commandList, D3D12_RESOURCE_STATE_RENDER_TARGET);
 
     D3D12_CPU_DESCRIPTOR_HANDLE sceneColorRTV = sceneColor.GetRTV();
 
-    const float clearColor[] =
-    {
-        0.0f,
-        0.0f,
-        0.0f,
-        1.0f
-    };
+    const float clearColor[] = {0.0f, 0.0f, 0.0f, 1.0f};
 
-    commandList->ClearRenderTargetView(
-        sceneColorRTV,
-        clearColor,
-        0,
-        nullptr
-    );
+    commandList->ClearRenderTargetView(sceneColorRTV, clearColor, 0, nullptr);
 
-    commandList->OMSetRenderTargets(
-        1,
-        &sceneColorRTV,
-        FALSE,
-        nullptr
-    );
+    commandList->OMSetRenderTargets(1, &sceneColorRTV, FALSE, nullptr);
 
     m_pipeline.Bind(commandList);
 
-    unsigned int resourceIndices[] =
-    {
-        gBuffer.GetMaterial().GetSRVIndex(),
-        gBuffer.GetSurface().GetSRVIndex(),
-        gBuffer.GetDepth().GetSRVIndex(),
-        materialBuffer.GetDescriptorIndex(),
-        environmentTexture.GetDescriptorIndex(),
-        environmentalCubemap.GetDescriptorIndex(),
-        diffuseIrradiance.GetDescriptorIndex(),
-        brdfIntegrationLUT.GetDescriptorIndex(),
-        ggxAverageAlbedoLUT.GetDescriptorIndex(),
-        ggxMultiscatterIrradiance.GetDescriptorIndex(),
-        shadowVisiblity.GetDescriptorIndex(),
-        reflectionTexture.GetDescriptorIndex(),
-        giIrradiance.GetDescriptorIndex(),
-        enableRTGI ? 1u : 0u,
-        aoVisibility.GetDescriptorIndex(),
-        debugView
-    };
+    unsigned int resourceIndices[] = {
+        gBuffer.GetMaterial().GetSRVIndex(),      gBuffer.GetSurface().GetSRVIndex(),
+        gBuffer.GetDepth().GetSRVIndex(),         materialBuffer.GetDescriptorIndex(),
+        environmentTexture.GetDescriptorIndex(),  environmentalCubemap.GetDescriptorIndex(),
+        diffuseIrradiance.GetDescriptorIndex(),   brdfIntegrationLUT.GetDescriptorIndex(),
+        ggxAverageAlbedoLUT.GetDescriptorIndex(), ggxMultiscatterIrradiance.GetDescriptorIndex(),
+        shadowVisiblity.GetDescriptorIndex(),     reflectionTexture.GetDescriptorIndex(),
+        giIrradiance.GetDescriptorIndex(),        enableRTGI ? 1u : 0u,
+        aoVisibility.GetDescriptorIndex(),        debugView};
 
-    commandList->SetGraphicsRoot32BitConstants(
-        0,
-        16,
-        resourceIndices,
-        0
-    );
-
+    commandList->SetGraphicsRoot32BitConstants(0, 16, resourceIndices, 0);
 
     commandList->SetGraphicsRoot32BitConstants(0, 1, &rtgiContactAOStrength, 16);
     commandList->SetGraphicsRootConstantBufferView(1, reconstructionConstantsAddress);

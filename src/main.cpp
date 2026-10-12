@@ -3,16 +3,19 @@
 
 #include <cstdlib>
 
-int main(){
+int main()
+{
     Engine engine;
 
-    if(!engine.Initialize()){
+    if (!engine.Initialize())
+    {
         Log::Error("Engine initialization failed; aborting without automatic resource teardown because GPU completion may be unconfirmed.");
         std::abort();
     }
-    
+
     engine.Run();
+
     engine.Shutdown();
-    
+
     return 0;
 }

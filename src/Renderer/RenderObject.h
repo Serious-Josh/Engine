@@ -8,6 +8,7 @@ struct Material;
 struct RenderObject
 {
     Mesh* mesh = nullptr;
+
     Material* material = nullptr;
 
     Transform transform;

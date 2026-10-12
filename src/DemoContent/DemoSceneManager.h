@@ -11,15 +11,15 @@ class SphereGridScene;
 
 class DemoSceneManager
 {
-public:
+    public:
     bool Initialize(
-        std::string_view sceneName,
-        ID3D12Device* device,
-        ResourceUploader& uploader,
-        DescriptorHeap& descriptorHeap,
-        const Shader* vertexShader,
-        const Shader* pixelShader,
-        float aspectRatio);
+      std::string_view sceneName,
+      ID3D12Device* device,
+      ResourceUploader& uploader,
+      DescriptorHeap& descriptorHeap,
+      const Shader* vertexShader,
+      const Shader* pixelShader,
+      float aspectRatio);
 
     void Shutdown();
 
@@ -44,12 +44,13 @@ public:
     std::span<const DemoSceneEntry> GetAvailableScenes() const;
     std::string_view GetActiveSceneName() const;
 
-private:
+    private:
     std::unique_ptr<IDemoScene> m_activeScene;
 
     const DemoSceneEntry* m_activeSceneEntry = nullptr;
     const DemoSceneEntry* m_requestedSceneEntry = nullptr;
 
     float m_aspectRatio = 1.0f;
+
     bool m_hasPendingSceneChange = false;
 };

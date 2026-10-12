@@ -13,31 +13,32 @@ class Texture;
 class DeferredLightingPass
 {
     public:
-        bool Initialize(ID3D12Device* device, ShaderLibrary& shaderLibrary);
-        void Execute(
-            ID3D12GraphicsCommandList* commandList,
-            GBuffer& gBuffer,
-            StructuredBuffer& materialBuffer,
-            Texture& environmentTexture,
-            Texture& environmentalCubemap,
-            Texture& diffuseIrradiance,
-            Texture& brdfIntegrationLUT,
-            Texture& ggxAverageAlbedoLUT,
-            Texture& ggxMultiscatterIrradiance,
-            Texture& shadowVisiblity,
-            Texture& reflectionTexture,
-            Texture& giIrradiance,
-            Texture& aoVisibility,
-            bool enableRTGI,
-            float rtgiContactAOStrength,
-            RenderTarget& sceneColor,
-            D3D12_GPU_VIRTUAL_ADDRESS reconstructionConstantsAddress,
-            D3D12_GPU_VIRTUAL_ADDRESS lightConstantsAddress,
-            unsigned int debugView = 0
-        );
+    bool Initialize(
+      ID3D12Device* device,
+      ShaderLibrary& shaderLibrary);
+    void Execute(
+        ID3D12GraphicsCommandList* commandList,
+        GBuffer& gBuffer,
+        StructuredBuffer& materialBuffer,
+        Texture& environmentTexture,
+        Texture& environmentalCubemap,
+        Texture& diffuseIrradiance,
+        Texture& brdfIntegrationLUT,
+        Texture& ggxAverageAlbedoLUT,
+        Texture& ggxMultiscatterIrradiance,
+        Texture& shadowVisiblity,
+        Texture& reflectionTexture,
+        Texture& giIrradiance,
+        Texture& aoVisibility,
+        bool enableRTGI,
+        float rtgiContactAOStrength,
+        RenderTarget& sceneColor,
+        D3D12_GPU_VIRTUAL_ADDRESS reconstructionConstantsAddress,
+        D3D12_GPU_VIRTUAL_ADDRESS lightConstantsAddress,
+        unsigned int debugView = 0);
 
-        void Shutdown();
+    void Shutdown();
 
     private:
-        Pipeline m_pipeline;
+    Pipeline m_pipeline;
 };

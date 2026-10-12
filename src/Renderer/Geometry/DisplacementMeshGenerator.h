@@ -22,7 +22,9 @@ struct DisplacementMeshSettings
     std::uint32_t subdivisionsPerPatch = 32;
     std::uint32_t testPatchX = 3;
     std::uint32_t testPatchZ = 3;
+
     std::uint32_t testPatchLOD = 1;
+
     float displacementScale = 0.10f;
     float displacementMidpoint = 0.5f;
     // Optional CPU-only LOD map for validation, indexed by patchX * patchesPerAxis + patchZ.
@@ -36,6 +38,7 @@ struct DisplacementPatch
     std::uint32_t patchZ;
     std::uint32_t lodLevel;
     std::uint32_t subdivisions;
+
     std::uint32_t firstIndex;
     std::uint32_t indexCount;
 };
@@ -43,13 +46,15 @@ struct DisplacementPatch
 struct DisplacementGeometry
 {
     std::vector<Vertex> vertices;
+
     std::vector<std::uint32_t> indices;
+
     std::vector<DisplacementPatch> patches;
 };
 
 class DisplacementMeshGenerator
 {
-public:
+    public:
     // Fixed X/Z bounds [-1,1]. Stitching supports one-LOD neighbors, including
     // adjacent stitched edges using a shared corner transition.
     // Requires valid R8 data and nonzero, compatible subdivision settings.

@@ -80,78 +80,85 @@ static_assert(offsetof(NrdReflectionPrepareConstants, geometricNormalIndex) == 1
 class NrdPreparePass
 {
     public:
+    enum class Signal
+    {
+        Specular,
+        Diffuse
+    };
 
-        enum class Signal
-        {
-            Specular,
-            Diffuse
-        };
+    bool Initialize(
+        GraphicsDevice& graphicsDevice,
+        ShaderLibrary& shaderLibrary,
+        DescriptorHeap& descriptorHeap,
+        unsigned int width,
+        unsigned int height,
+        Signal signal = Signal::Specular);
+    bool Resize(
+        GraphicsDevice& graphicsDevice,
+        DescriptorHeap& descriptorHeap,
+        unsigned int width,
+        unsigned int height);
 
-        bool Initialize(
-            GraphicsDevice& graphicsDevice,
-            ShaderLibrary& shaderLibrary,
-            DescriptorHeap& descriptorHeap,
-            unsigned int width,
-            unsigned int height,
-            Signal signal = Signal::Specular);
-        bool Resize(GraphicsDevice& graphicsDevice, DescriptorHeap& descriptorHeap, unsigned int width, unsigned int height);
+    void ExecuteReflections(
+        ID3D12GraphicsCommandList* commandList,
+        GBuffer& gBuffer,
+        Texture& rawReflection,
+        Texture& trackingDistance,
+        UploadBuffer& uploadBuffer,
+        const Matrix4& inverseViewProjection,
+        const Matrix4& view,
+        unsigned int materialBufferIndex,
+        unsigned int width,
+        unsigned int height,
+        float denoisingRange);
 
-        void ExecuteReflections(
-            ID3D12GraphicsCommandList* commandList,
-            GBuffer& gBuffer,
-            Texture& rawReflection,
-            Texture& trackingDistance,
-            UploadBuffer& uploadBuffer,
-            const Matrix4& inverseViewProjection,
-            const Matrix4& view,
-            unsigned int materialBufferIndex,
-            unsigned int width,
-            unsigned int height,
-            float denoisingRange
-        );
+    void ExecuteGI(
+        ID3D12GraphicsCommandList* commandList,
+        GBuffer& gBuffer,
+        Texture& rawGI,
+        Texture& giHitDistance,
+        UploadBuffer& uploadBuffer,
+        const Matrix4& inverseViewProjection,
+        const Matrix4& view,
+        unsigned int materialBufferIndex,
+        unsigned int fullWidth,
+        unsigned int fullHeight,
+        unsigned int giWidth,
+        unsigned int giHeight,
+        float denoisingRange);
 
-        void ExecuteGI(
-            ID3D12GraphicsCommandList* commandList,
-            GBuffer& gBuffer,
-            Texture& rawGI,
-            Texture& giHitDistance,
-            UploadBuffer& uploadBuffer,
-            const Matrix4& inverseViewProjection,
-            const Matrix4& view,
-            unsigned int materialBufferIndex,
-            unsigned int fullWidth,
-            unsigned int fullHeight,
-            unsigned int giWidth,
-            unsigned int giHeight,
-            float denoisingRange);
+    void Shutdown();
 
-        void Shutdown();
+    Texture& GetViewZTexture();
+    const Texture& GetViewZTexture() const;
 
-        Texture& GetViewZTexture();
-        const Texture& GetViewZTexture() const;
+    Texture& GetMotionTexture();
+    const Texture& GetMotionTexture() const;
 
-        Texture& GetMotionTexture();
-        const Texture& GetMotionTexture() const;
+    Texture& GetNormalRoughnessTexture();
+    const Texture& GetNormalRoughnessTexture() const;
 
-        Texture& GetNormalRoughnessTexture();
-        const Texture& GetNormalRoughnessTexture() const;
+    Texture& GetSpecRadianceHitDistTexture();
+    const Texture& GetSpecRadianceHitDistTexture() const;
 
-        Texture& GetSpecRadianceHitDistTexture();
-        const Texture& GetSpecRadianceHitDistTexture() const;
-
-        Texture& GetDiffRadianceHitDistTexture();
-        const Texture& GetDiffRadianceHitDistTexture() const;
+    Texture& GetDiffRadianceHitDistTexture();
+    const Texture& GetDiffRadianceHitDistTexture() const;
 
     private:
-        bool CreateTextures(GraphicsDevice& graphicsDevice, DescriptorHeap& descriptorHeap, unsigned int width, unsigned int height);
+    bool CreateTextures(
+      GraphicsDevice& graphicsDevice,
+      DescriptorHeap& descriptorHeap,
+      unsigned int width,
+      unsigned int height);
 
-        Texture m_viewZTexture;
-        Texture m_motionTexture;
-        Texture m_normalRoughnessTexture;
-        Texture m_specRadianceHitDistTexture;
-        Texture m_diffRadianceHitDistTexture;
+    Texture m_viewZTexture;
+    Texture m_motionTexture;
+    Texture m_normalRoughnessTexture;
+    Texture m_specRadianceHitDistTexture;
 
-        ComputePipeline m_pipeline;
+    Texture m_diffRadianceHitDistTexture;
 
-        Signal m_signal = Signal::Specular;
+    ComputePipeline m_pipeline;
+
+    Signal m_signal = Signal::Specular;
 };

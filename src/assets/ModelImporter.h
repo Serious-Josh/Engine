@@ -8,5 +8,5 @@
 class ModelImporter
 {
     public:
-        static std::vector<ImportedMesh> Load(const std::filesystem::path& path);
+    static std::vector<ImportedMesh> Load(const std::filesystem::path& path);
 };

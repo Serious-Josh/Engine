@@ -13,7 +13,7 @@ namespace
 {
     float SRGBToLinear(float value)
     {
-        if(value <= 0.04045f)
+        if (value <= 0.04045f)
         {
             return value / 12.92f;
         }
@@ -25,7 +25,7 @@ namespace
     {
         value = std::clamp(value, 0.0f, 1.0f);
 
-        if(value <= 0.0031308f)
+        if (value <= 0.0031308f)
         {
             return value * 12.92f;
         }
@@ -41,7 +41,9 @@ namespace
     }
 }
 
-bool ImageLoader::Load(const std::filesystem::path& path, ImageData& image)
+bool ImageLoader::Load(
+    const std::filesystem::path& path,
+    ImageData& image)
 {
     int width = 0;
     int height = 0;
@@ -49,11 +51,13 @@ bool ImageLoader::Load(const std::filesystem::path& path, ImageData& image)
 
     unsigned char* pixels = stbi_load(path.string().c_str(), &width, &height, &channels, 4);
 
-    if(!pixels){
+    if (!pixels)
+    {
         return false;
     }
 
     image.width = static_cast<unsigned int>(width);
+
     image.height = static_cast<unsigned int>(height);
     image.channels = 4;
 
@@ -66,19 +70,24 @@ bool ImageLoader::Load(const std::filesystem::path& path, ImageData& image)
     return true;
 }
 
-bool ImageLoader::LoadHDR(const std::filesystem::path& path, HDRImageData& image){
+bool ImageLoader::LoadHDR(
+    const std::filesystem::path& path,
+    HDRImageData& image)
+{
     int width = 0;
     int height = 0;
     int channels = 0;
 
     float* pixels = stbi_loadf(path.string().c_str(), &width, &height, &channels, 4);
 
-    if(!pixels){
+    if (!pixels)
+    {
         return false;
     }
 
     image.width = static_cast<unsigned int>(width);
     image.height = static_cast<unsigned int>(height);
+
     image.channels = 4;
 
     const size_t pixelCount = static_cast<size_t>(width) * static_cast<size_t>(height) * 4;
@@ -97,7 +106,7 @@ bool ImageLoader::GenerateMipChain(
 {
     output.levels.clear();
 
-    if(source.width == 0 || source.height == 0)
+    if (source.width == 0 || source.height == 0)
     {
         return false;
     }
@@ -105,26 +114,27 @@ bool ImageLoader::GenerateMipChain(
     const size_t width = source.width;
     const size_t height = source.height;
 
-    if(width > (std::numeric_limits<size_t>::max)() / height / 4)
+    if (width > (std::numeric_limits<size_t>::max)() / height / 4)
     {
         return false;
     }
 
     const size_t expectedSize = width * height * 4;
 
-    if(source.pixels.size() != expectedSize)
+    if (source.pixels.size() != expectedSize)
     {
         return false;
     }
 
     ImageMipLevel baseLevel{};
+
     baseLevel.width = source.width;
     baseLevel.height = source.height;
     baseLevel.pixels = source.pixels;
 
     output.levels.push_back(std::move(baseLevel));
 
-    while(output.levels.back().width > 1 || output.levels.back().height > 1)
+    while (output.levels.back().width > 1 || output.levels.back().height > 1)
     {
         const ImageMipLevel& previous = output.levels.back();
 
@@ -133,16 +143,17 @@ bool ImageLoader::GenerateMipChain(
         next.height = std::max(1u, previous.height / 2);
         next.pixels.resize(static_cast<size_t>(next.width) * next.height * 4);
 
-        for(unsigned int y = 0; y < next.height; ++y)
+        for (unsigned int y = 0; y < next.height; ++y)
         {
-            for(unsigned int x = 0; x < next.width; ++x)
+            for (unsigned int x = 0; x < next.width; ++x)
             {
                 float accumulated[4] = {};
+
                 unsigned int sampleCount = 0;
 
-                for(unsigned int dy = 0; dy < 2; ++dy)
+                for (unsigned int dy = 0; dy < 2; ++dy)
                 {
-                    for(unsigned int dx = 0; dx < 2; ++dx)
+                    for (unsigned int dx = 0; dx < 2; ++dx)
                     {
                         const unsigned int sx = std::min(x * 2 + dx, previous.width - 1);
 
@@ -152,19 +163,21 @@ bool ImageLoader::GenerateMipChain(
 
                         const unsigned char* pixel = previous.pixels.data() + sourceIndex;
 
-                        if(filterMode == MipFilterMode::NormalMap)
+                        if (filterMode == MipFilterMode::NormalMap)
                         {
                             accumulated[0] += pixel[0] / 255.0f * 2.0f - 1.0f;
+
                             accumulated[1] += pixel[1] / 255.0f * 2.0f - 1.0f;
                             accumulated[2] += pixel[2] / 255.0f * 2.0f - 1.0f;
                         }
                         else
                         {
-                            for(unsigned int channel = 0; channel < 3; ++channel)
+                            for (unsigned int channel = 0; channel < 3; ++channel)
                             {
+
                                 float value = pixel[channel] / 255.0f;
 
-                                if(filterMode == MipFilterMode::SRGBColor)
+                                if (filterMode == MipFilterMode::SRGBColor)
                                 {
                                     value = SRGBToLinear(value);
                                 }
@@ -174,25 +187,25 @@ bool ImageLoader::GenerateMipChain(
                         }
 
                         accumulated[3] += pixel[3] / 255.0f;
+
                         ++sampleCount;
                     }
                 }
 
                 const float inverseCount = 1.0f / sampleCount;
 
-                for(float& value : accumulated)
+                for (float& value : accumulated)
                 {
                     value *= inverseCount;
                 }
 
-                if(filterMode == MipFilterMode::NormalMap)
+                if (filterMode == MipFilterMode::NormalMap)
                 {
-                    const float lengthSquared =
-                        accumulated[0] * accumulated[0] +
-                        accumulated[1] * accumulated[1] +
-                        accumulated[2] * accumulated[2];
+                    const float lengthSquared = accumulated[0] * accumulated[0] + accumulated[1] * accumulated[1] +
 
-                    if(lengthSquared > 1e-12f)
+                                                accumulated[2] * accumulated[2];
+
+                    if (lengthSquared > 1e-12f)
                     {
                         const float inverseLength = 1.0f / std::sqrt(lengthSquared);
 
@@ -207,14 +220,15 @@ bool ImageLoader::GenerateMipChain(
                         accumulated[2] = 1.0f;
                     }
 
-                    for(unsigned int channel = 0; channel < 3; ++channel)
+                    for (unsigned int channel = 0; channel < 3; ++channel)
                     {
                         accumulated[channel] = accumulated[channel] * 0.5f + 0.5f;
                     }
                 }
-                else if(filterMode == MipFilterMode::SRGBColor)
+
+                else if (filterMode == MipFilterMode::SRGBColor)
                 {
-                    for(unsigned int channel = 0; channel < 3; ++channel)
+                    for (unsigned int channel = 0; channel < 3; ++channel)
                     {
                         accumulated[channel] = LinearToSRGB(accumulated[channel]);
                     }
@@ -222,7 +236,7 @@ bool ImageLoader::GenerateMipChain(
 
                 const size_t destinationIndex = (static_cast<size_t>(y) * next.width + x) * 4;
 
-                for(unsigned int channel = 0; channel < 4; ++channel)
+                for (unsigned int channel = 0; channel < 4; ++channel)
                 {
                     next.pixels[destinationIndex + channel] = FloatToByte(accumulated[channel]);
                 }

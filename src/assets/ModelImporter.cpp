@@ -7,7 +7,9 @@
 #include <stdexcept>
 #include <string>
 
-static ImportedMesh ConvertMesh(const aiMesh* sourceMesh, const aiMatrix4x4& transform)
+static ImportedMesh ConvertMesh(
+    const aiMesh* sourceMesh,
+    const aiMatrix4x4& transform)
 {
     aiMatrix3x3 normalTransform(transform);
     normalTransform.Inverse();
@@ -44,7 +46,7 @@ static ImportedMesh ConvertMesh(const aiMesh* sourceMesh, const aiMatrix4x4& tra
         importedMesh.vertices.push_back(vertex);
     }
 
-    for (unsigned int faceIndex = 0;faceIndex < sourceMesh->mNumFaces; ++faceIndex)
+    for (unsigned int faceIndex = 0; faceIndex < sourceMesh->mNumFaces; ++faceIndex)
     {
         const aiFace& face = sourceMesh->mFaces[faceIndex];
 
@@ -54,6 +56,7 @@ static ImportedMesh ConvertMesh(const aiMesh* sourceMesh, const aiMatrix4x4& tra
         }
 
         importedMesh.indices.push_back(face.mIndices[0]);
+
         importedMesh.indices.push_back(face.mIndices[1]);
         importedMesh.indices.push_back(face.mIndices[2]);
     }
@@ -89,7 +92,8 @@ std::vector<ImportedMesh> ModelImporter::Load(const std::filesystem::path& path)
 
     const aiScene* scene = importer.ReadFile(path.string(), aiProcess_Triangulate);
 
-    if(scene == nullptr){
+    if (scene == nullptr)
+    {
         throw std::runtime_error("Failed to import model '" + path.string() + "': " + importer.GetErrorString());
     }
 
@@ -98,11 +102,7 @@ std::vector<ImportedMesh> ModelImporter::Load(const std::filesystem::path& path)
 
     const aiMatrix4x4 identity;
 
-    ProcessNode(
-        scene,
-        scene->mRootNode,
-        identity,
-        importedMeshes);
+    ProcessNode(scene, scene->mRootNode, identity, importedMeshes);
 
     return importedMeshes;
 }

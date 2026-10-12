@@ -21,16 +21,15 @@ class Shader;
 class ResourceUploader;
 class DescriptorHeap;
 
-
 class StressTestScene : public IDemoScene
 {
-public:
+    public:
     bool Initialize(
-        ID3D12Device* device,
-        ResourceUploader& uploader,
-        DescriptorHeap& descriptorHeap,
-        const Shader* vertexShader,
-        const Shader* pixelShader) override;
+      ID3D12Device* device,
+      ResourceUploader& uploader,
+      DescriptorHeap& descriptorHeap,
+      const Shader* vertexShader,
+      const Shader* pixelShader) override;
 
     void Shutdown() override;
 
@@ -49,11 +48,11 @@ public:
     void SetGridSize(unsigned int grideSize);
     unsigned int GetGridSize() const;
 
-private:
+    private:
     void RebuildGrid();
 
     unsigned int m_gridSize = 20;
-    
+
     VertexLayout m_vertexLayout;
 
     Mesh m_sphereMesh;

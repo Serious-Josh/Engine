@@ -3,119 +3,147 @@
 #include <d3d12.h>
 #include <cstdint>
 
-
 class GpuTimestampProfiler
 {
     public:
-        static constexpr unsigned int FrameCount = 2;
+    static constexpr unsigned int FrameCount = 2;
 
-        enum class Region : unsigned int
-        {
-            TotalFrame,
-            Geometry,
-            RayTracedShadows,
-            ShadowDenoise,
-            RayTracedReflections,
-            ReflectionContributionLimiter,
-            NrdPrepare,
-            NrdReblurSpecular,
-            NrdResolve,
-            DeferredLighting,
-            ToneMap,
-            TlasUpdate,
-            SelectionMask,
-            RayTracedAO,
-            AOTemporal,
-            AODenoise,
-            RayTracedGI,
-            ReflectionTemporal,
-            ReflectionDenoise,
-            NrdDiffuseResolve,
-            DebugUI,
-            GISpatialDenoise,
-            NrdReblurDiffuse,
+    enum class Region : unsigned int
+    {
+        TotalFrame,
+        Geometry,
+        RayTracedShadows,
+        ShadowDenoise,
+        RayTracedReflections,
+        ReflectionContributionLimiter,
+        NrdPrepare,
+        NrdReblurSpecular,
+        NrdResolve,
+        DeferredLighting,
+        ToneMap,
+        TlasUpdate,
+        SelectionMask,
+        RayTracedAO,
+        AOTemporal,
+        AODenoise,
+        RayTracedGI,
+        ReflectionTemporal,
+        ReflectionDenoise,
+        NrdDiffuseResolve,
+        DebugUI,
+        GISpatialDenoise,
+        NrdReblurDiffuse,
+        Count
+    };
 
-            Count
-        };
+    struct FrameGap
+    {
+        uint64_t previousSerial = 0;
+        uint64_t currentSerial = 0;
 
-        struct FrameGap
-        {
-            uint64_t previousSerial = 0;
-            uint64_t currentSerial = 0;
-            double milliseconds = 0.0;
-        };
+        double milliseconds = 0.0;
+    };
 
-        struct Results
-        {
-            uint64_t frameSerial = 0;
-            // Every valid pair resolved in this batch, including older buffered frames.
-            FrameGap resolvedGaps[FrameCount]{};
-            unsigned int resolvedGapCount = 0;
-            double milliseconds[static_cast<unsigned int>(Region::Count)]{};
-            uint32_t validRegions = 0;
-            bool interFrameGapValid = false;
-            bool interFrameGapOutOfOrder = false;
-            double interFrameGapMilliseconds = 0.0;
-            double interFrameGapAverage = 0.0;
-            double interFrameGapMaximum = 0.0;
-            unsigned int interFrameGapSampleCount = 0;
-        };
+    struct Results
+    {
+        uint64_t frameSerial = 0;
+        // Every valid pair resolved in this batch, including older buffered frames.
+        FrameGap resolvedGaps[FrameCount]{};
+        unsigned int resolvedGapCount = 0;
+        double milliseconds[static_cast<unsigned int>(Region::Count)]{};
+        uint32_t validRegions = 0;
 
-        bool Initialize(ID3D12Device* device, ID3D12CommandQueue* commandQueue);
-        void Shutdown();
+        bool interFrameGapValid = false;
+        bool interFrameGapOutOfOrder = false;
 
-        uint64_t GetTimestampFrequency() const;
+        double interFrameGapMilliseconds = 0.0;
+        double interFrameGapAverage = 0.0;
+        double interFrameGapMaximum = 0.0;
+        unsigned int interFrameGapSampleCount = 0;
+    };
 
-        void BeginFrame(ID3D12GraphicsCommandList* commandList, unsigned int frameIndex);
-        void BeginRegion(ID3D12GraphicsCommandList* commandList, unsigned int frameIndex, Region region);
-        void EndRegion(ID3D12GraphicsCommandList* commandList, unsigned int frameIndex, Region region);
-        void EndFrameAndResolve(ID3D12GraphicsCommandList* commandList, unsigned int frameIndex);
+    bool Initialize(
+        ID3D12Device* device,
+        ID3D12CommandQueue* commandQueue);
+    void Shutdown();
 
-        void MarkSubmitted(unsigned int frameIndex, uint64_t submissionFence, uint64_t frameSerial);
+    uint64_t GetTimestampFrequency() const;
 
-        bool CollectCompleted(uint64_t completedFenceValue);
+    void BeginFrame(
+        ID3D12GraphicsCommandList* commandList,
+        unsigned int frameIndex);
+    void BeginRegion(
+        ID3D12GraphicsCommandList* commandList,
+        unsigned int frameIndex,
+        Region region);
+    void EndRegion(
+        ID3D12GraphicsCommandList* commandList,
+        unsigned int frameIndex,
+        Region region);
+    void EndFrameAndResolve(
+        ID3D12GraphicsCommandList* commandList,
+        unsigned int frameIndex);
 
-        const Results& GetResults() const;
-        void BreakFrameSequence();
+    void MarkSubmitted(
+        unsigned int frameIndex,
+        uint64_t submissionFence,
+        uint64_t frameSerial);
+
+    bool CollectCompleted(uint64_t completedFenceValue);
+
+    const Results& GetResults() const;
+    void BreakFrameSequence();
 
     private:
-        static unsigned int GetBeginQueryIndex(unsigned int frameIndex, Region region);
-        static unsigned int GetEndQueryIndex(unsigned int frameIndex, Region region);
+    static unsigned int GetBeginQueryIndex(
+      unsigned int frameIndex,
+      Region region);
+    static unsigned int GetEndQueryIndex(
+        unsigned int frameIndex,
+        Region region);
 
-        static constexpr unsigned int RegionCount = static_cast<unsigned int>(Region::Count);
-        static_assert(RegionCount <= 32, "GPU region validity masks use 32 bits.");
+    static constexpr unsigned int RegionCount = static_cast<unsigned int>(Region::Count);
+    static_assert(RegionCount <= 32, "GPU region validity masks use 32 bits.");
 
-        static constexpr unsigned int QueriesPerRegion = 2;
-        static constexpr unsigned int QueriesPerFrame = RegionCount * QueriesPerRegion;
-        static constexpr unsigned int QueryCount = QueriesPerFrame * FrameCount;
+    static constexpr unsigned int QueriesPerRegion = 2;
+    static constexpr unsigned int QueriesPerFrame = RegionCount * QueriesPerRegion;
+    static constexpr unsigned int QueryCount = QueriesPerFrame * FrameCount;
 
-        static constexpr uint64_t ReadbackBytesPerFrame = QueriesPerFrame * sizeof(uint64_t);
-        static constexpr uint64_t ReadbackBufferSize = ReadbackBytesPerFrame * FrameCount;
+    static constexpr uint64_t ReadbackBytesPerFrame = QueriesPerFrame * sizeof(uint64_t);
+    static constexpr uint64_t ReadbackBufferSize = ReadbackBytesPerFrame * FrameCount;
 
-        ID3D12QueryHeap* m_queryHeap = nullptr;
-        ID3D12Resource* m_readbackBuffer = nullptr;
+    ID3D12QueryHeap* m_queryHeap = nullptr;
 
-        uint64_t m_timestampFrequency = 0;
+    ID3D12Resource* m_readbackBuffer = nullptr;
 
-        struct FrameSlot
-        {
-            uint64_t submissionFence = 0;
-            uint64_t frameSerial = 0;
-            uint32_t recordedRegions = 0;
-            bool pending = false;
-            uint64_t sequence = 0;
-        };
+    uint64_t m_timestampFrequency = 0;
 
-        FrameSlot m_frameSlots[FrameCount]{};
-        Results m_results{};
+    struct FrameSlot
+    {
+        uint64_t submissionFence = 0;
+        uint64_t frameSerial = 0;
 
-        void CollectInterFrameGap(const FrameSlot& slot, const uint64_t* timestamps, Results& results);
-        uint64_t m_frameSequence = 0;
-        uint64_t m_previousBoundarySequence = 0;
-        uint64_t m_previousBoundarySerial = 0;
-        uint64_t m_previousFrameEnd = 0;
-        bool m_previousBoundaryValid = false;
-        double m_gapSamples[120]{};
-        unsigned int m_gapSampleCount = 0;
-        unsigned int m_nextGapSample = 0;
+        uint32_t recordedRegions = 0;
+
+        bool pending = false;
+
+        uint64_t sequence = 0;
+    };
+
+    FrameSlot m_frameSlots[FrameCount]{};
+    Results m_results{};
+
+    void CollectInterFrameGap(
+        const FrameSlot& slot,
+        const uint64_t* timestamps,
+        Results& results);
+    uint64_t m_frameSequence = 0;
+    uint64_t m_previousBoundarySequence = 0;
+    uint64_t m_previousBoundarySerial = 0;
+    uint64_t m_previousFrameEnd = 0;
+
+    bool m_previousBoundaryValid = false;
+    double m_gapSamples[120]{};
+    unsigned int m_gapSampleCount = 0;
+    unsigned int m_nextGapSample = 0;
 };

@@ -33,29 +33,33 @@ static_assert(sizeof(ReflectionDenoiseConstants) == 112);
 class RayTracedReflectionDenoisePass
 {
     public:
-        bool Initialize(
-            GraphicsDevice& graphicsDevice,
-            ShaderLibrary& shaderLibrary,
-            DescriptorHeap& descriptorHeap,
-            unsigned int width,
-            unsigned int height);
-        bool Resize(GraphicsDevice& graphicsDevice, DescriptorHeap& descriptorHeap, unsigned int width, unsigned int height);
-        void Shutdown();
-        
-        void Execute(
-            ID3D12GraphicsCommandList* commandList,
-            Texture& inputReflection,
-            Texture& hitDistance,
-            GBuffer& gBuffer,
-            UploadBuffer& uploadBuffer,
-            const Matrix4& inverseViewProjection,
-            unsigned int width,
-            unsigned int height);
+    bool Initialize(
+      GraphicsDevice& graphicsDevice,
+      ShaderLibrary& shaderLibrary,
+      DescriptorHeap& descriptorHeap,
+      unsigned int width,
+      unsigned int height);
+    bool Resize(
+        GraphicsDevice& graphicsDevice,
+        DescriptorHeap& descriptorHeap,
+        unsigned int width,
+        unsigned int height);
+    void Shutdown();
 
-        Texture& GetFilteredReflectionTexture();
+    void Execute(
+        ID3D12GraphicsCommandList* commandList,
+        Texture& inputReflection,
+        Texture& hitDistance,
+        GBuffer& gBuffer,
+        UploadBuffer& uploadBuffer,
+        const Matrix4& inverseViewProjection,
+        unsigned int width,
+        unsigned int height);
+
+    Texture& GetFilteredReflectionTexture();
 
     private:
-        ComputePipeline m_pipeline;
-        Texture m_filteredReflection[2];
-        unsigned int m_outputIndex = 0;
+    ComputePipeline m_pipeline;
+    Texture m_filteredReflection[2];
+    unsigned int m_outputIndex = 0;
 };

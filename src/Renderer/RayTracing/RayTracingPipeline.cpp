@@ -12,45 +12,66 @@ namespace
     {
         std::string result;
         result.reserve(name.size());
-        for(wchar_t character : name){
+
+        for (wchar_t character : name)
+        {
             result += static_cast<unsigned int>(character) <= 0x7F ? static_cast<char>(character) : '?';
         }
+
         return result;
     }
 }
 
-bool RayTracingPipeline::Initialize(ID3D12Device5* device, ShaderLibrary& shaderLibrary, const RayTracingPipelineDescription& description)
+bool RayTracingPipeline::Initialize(
+    ID3D12Device5* device,
+    ShaderLibrary& shaderLibrary,
+    const RayTracingPipelineDescription& description)
 {
     const std::filesystem::path& shaderPath = description.shaderPath;
 
-    if(!device ||
+    if (!device ||
         description.shaderPath.empty() ||
         description.rayGenerationShader.empty() ||
-        description.missShaders.empty() ||
-        description.hitGroups.empty() ||
-        description.rootParameters.empty() ||
-        description.maxPayloadSize == 0 ||
-        description.maxAttributeSize == 0 ||
-        description.maxRecursionDepth == 0)
+        description.missShaders.empty())
     {
         return false;
     }
 
+    if (description.hitGroups.empty() ||
+        description.rootParameters.empty() ||
+        description.maxPayloadSize == 0 ||
+        description.maxAttributeSize == 0)
+    {
+        return false;
+    }
 
-    for(const std::wstring& missShader : description.missShaders){
-        if(missShader.empty()){
+    if (description.maxRecursionDepth == 0)
+    {
+        return false;
+    }
+
+    for (const std::wstring& missShader : description.missShaders)
+    {
+
+        if (missShader.empty())
+        {
             return false;
         }
     }
 
-    for(const RayTracingHitGroupDescription& hitGroup : description.hitGroups){
-        if(hitGroup.name.empty() || hitGroup.closestHitShader.empty()){
+    for (const RayTracingHitGroupDescription& hitGroup : description.hitGroups)
+    {
+
+        if (hitGroup.name.empty() || hitGroup.closestHitShader.empty())
+        {
             return false;
         }
     }
 
     ShaderLibraryCompileResult compileResult{};
-    if(!shaderLibrary.CompileLibrary(shaderPath, compileResult)){
+
+    if (!shaderLibrary.CompileLibrary(shaderPath, compileResult))
+    {
         return false;
     }
 
@@ -58,31 +79,37 @@ bool RayTracingPipeline::Initialize(ID3D12Device5* device, ShaderLibrary& shader
 
     std::vector<D3D12_EXPORT_DESC> exports;
 
-    auto AddExport =
-        [&exports](const std::wstring& name)
+    auto AddExport = [&exports](const std::wstring& name)
+    {
+        for (const D3D12_EXPORT_DESC& existingExport : exports)
         {
-            for(const D3D12_EXPORT_DESC& existingExport : exports){
-                if(name == existingExport.Name){
-                    return;
-                }
+
+            if (name == existingExport.Name)
+            {
+                return;
             }
+        }
 
-            D3D12_EXPORT_DESC exportDescription{};
-            exportDescription.Name = name.c_str();
+        D3D12_EXPORT_DESC exportDescription{};
+        exportDescription.Name = name.c_str();
 
-            exports.push_back(exportDescription);
-        };
+        exports.push_back(exportDescription);
+    };
 
     AddExport(description.rayGenerationShader);
 
-    for(const std::wstring& missShader : description.missShaders){
+    for (const std::wstring& missShader : description.missShaders)
+    {
         AddExport(missShader);
     }
 
-    for(const RayTracingHitGroupDescription& hitGroup : description.hitGroups){
+    for (const RayTracingHitGroupDescription& hitGroup : description.hitGroups)
+    {
+
         AddExport(hitGroup.closestHitShader);
 
-        if(!hitGroup.anyHitShader.empty()){
+        if (!hitGroup.anyHitShader.empty())
+        {
             AddExport(hitGroup.anyHitShader);
         }
     }
@@ -90,6 +117,7 @@ bool RayTracingPipeline::Initialize(ID3D12Device5* device, ShaderLibrary& shader
     D3D12_DXIL_LIBRARY_DESC libraryDescription{};
 
     D3D12_SHADER_BYTECODE libraryBytecode{};
+
     libraryBytecode.pShaderBytecode = compileResult.bytecode.data();
     libraryBytecode.BytecodeLength = compileResult.bytecode.size();
 
@@ -100,13 +128,15 @@ bool RayTracingPipeline::Initialize(ID3D12Device5* device, ShaderLibrary& shader
     std::vector<D3D12_HIT_GROUP_DESC> hitGroupDescriptions;
     hitGroupDescriptions.reserve(description.hitGroups.size());
 
-    for(const RayTracingHitGroupDescription& hitGroup : description.hitGroups){
+    for (const RayTracingHitGroupDescription& hitGroup : description.hitGroups)
+    {
         D3D12_HIT_GROUP_DESC hitGroupDescription{};
         hitGroupDescription.HitGroupExport = hitGroup.name.c_str();
         hitGroupDescription.Type = D3D12_HIT_GROUP_TYPE_TRIANGLES;
         hitGroupDescription.ClosestHitShaderImport = hitGroup.closestHitShader.c_str();
 
-        if(!hitGroup.anyHitShader.empty()){
+        if (!hitGroup.anyHitShader.empty())
+        {
             hitGroupDescription.AnyHitShaderImport = hitGroup.anyHitShader.c_str();
         }
 
@@ -114,6 +144,7 @@ bool RayTracingPipeline::Initialize(ID3D12Device5* device, ShaderLibrary& shader
     }
 
     D3D12_RAYTRACING_SHADER_CONFIG shaderConfig{};
+
     shaderConfig.MaxPayloadSizeInBytes = description.maxPayloadSize;
     shaderConfig.MaxAttributeSizeInBytes = description.maxAttributeSize;
 
@@ -126,62 +157,66 @@ bool RayTracingPipeline::Initialize(ID3D12Device5* device, ShaderLibrary& shader
     std::vector<D3D12_DESCRIPTOR_RANGE> descriptorRanges;
     descriptorRanges.reserve(description.rootParameters.size());
 
-    for(const RootParameterDescription& parameterDescription : description.rootParameters){
+    for (const RootParameterDescription& parameterDescription : description.rootParameters)
+    {
         D3D12_ROOT_PARAMETER parameter{};
+
         parameter.ShaderVisibility = parameterDescription.visibility;
 
-        switch(parameterDescription.type){
-            case RootParameterType::Constants:
-            {
-                parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-                parameter.Constants.ShaderRegister = parameterDescription.shaderRegister;
-                parameter.Constants.RegisterSpace = 0;
-                parameter.Constants.Num32BitValues = parameterDescription.constantCount;
-                break;
-            }
-            case RootParameterType::ConstantBuffer:
-            {
-                parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
-                parameter.Descriptor.ShaderRegister = parameterDescription.shaderRegister;
-                parameter.Descriptor.RegisterSpace = 0;
-                break;
-            }
-            case RootParameterType::ShaderResource:
-            {
-                parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
-                parameter.Descriptor.ShaderRegister = parameterDescription.shaderRegister;
-                parameter.Descriptor.RegisterSpace = 0;
-                break;
-            }
-            case RootParameterType::DescriptorTable:
-            {
-                D3D12_DESCRIPTOR_RANGE range{};
+        switch (parameterDescription.type)
+        {
+        case RootParameterType::Constants:
+        {
+            parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+            parameter.Constants.ShaderRegister = parameterDescription.shaderRegister;
+            parameter.Constants.RegisterSpace = 0;
+            parameter.Constants.Num32BitValues = parameterDescription.constantCount;
+            break;
+        }
+        case RootParameterType::ConstantBuffer:
+        {
+            parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+            parameter.Descriptor.ShaderRegister = parameterDescription.shaderRegister;
+            parameter.Descriptor.RegisterSpace = 0;
+            break;
+        }
+        case RootParameterType::ShaderResource:
+        {
+            parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+            parameter.Descriptor.ShaderRegister = parameterDescription.shaderRegister;
+            parameter.Descriptor.RegisterSpace = 0;
+            break;
+        }
+        case RootParameterType::DescriptorTable:
+        {
+            D3D12_DESCRIPTOR_RANGE range{};
 
-                switch(parameterDescription.descriptorRangeType){
-                    case DescriptorRangeType::ShaderResource:
-                    {
-                        range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-                        break;
-                    }
-                    case DescriptorRangeType::UnorderedAccess:
-                    {
-                        range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-                        break;
-                    }
-                }
-
-                range.NumDescriptors = parameterDescription.descriptorCount;
-                range.BaseShaderRegister = parameterDescription.shaderRegister;
-                range.RegisterSpace = 0;
-                range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
-                
-                descriptorRanges.push_back(range);
-
-                parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-                parameter.DescriptorTable.NumDescriptorRanges = 1;
-                parameter.DescriptorTable.pDescriptorRanges = &descriptorRanges.back();
+            switch (parameterDescription.descriptorRangeType)
+            {
+            case DescriptorRangeType::ShaderResource:
+            {
+                range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
                 break;
             }
+            case DescriptorRangeType::UnorderedAccess:
+            {
+                range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+                break;
+            }
+            }
+
+            range.NumDescriptors = parameterDescription.descriptorCount;
+            range.BaseShaderRegister = parameterDescription.shaderRegister;
+            range.RegisterSpace = 0;
+            range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+
+            descriptorRanges.push_back(range);
+
+            parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            parameter.DescriptorTable.NumDescriptorRanges = 1;
+            parameter.DescriptorTable.pDescriptorRanges = &descriptorRanges.back();
+            break;
+        }
         }
 
         rootParameters.push_back(parameter);
@@ -191,24 +226,23 @@ bool RayTracingPipeline::Initialize(ID3D12Device5* device, ShaderLibrary& shader
     staticSampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
     staticSampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
     staticSampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+
     staticSampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
     staticSampler.MipLODBias = 0.0f;
     staticSampler.MaxAnisotropy = 1;
     staticSampler.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+
     staticSampler.BorderColor = D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK;
     staticSampler.MinLOD = 0.0f;
     staticSampler.MaxLOD = D3D12_FLOAT32_MAX;
     staticSampler.ShaderRegister = 0;
+
     staticSampler.RegisterSpace = 0;
     staticSampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
     // Keep material texture wrapping at s0; equirectangular environments
     // wrap longitude but clamp latitude at s1.
-    D3D12_STATIC_SAMPLER_DESC staticSamplers[2] =
-    {
-        staticSampler,
-        staticSampler
-    };
+    D3D12_STATIC_SAMPLER_DESC staticSamplers[2] = {staticSampler, staticSampler};
     staticSamplers[1].ShaderRegister = 1;
     staticSamplers[1].AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
 
@@ -216,51 +250,67 @@ bool RayTracingPipeline::Initialize(ID3D12Device5* device, ShaderLibrary& shader
     rootSignatureDescription.NumParameters = static_cast<UINT>(rootParameters.size());
     rootSignatureDescription.pParameters = rootParameters.empty() ? nullptr : rootParameters.data();
     rootSignatureDescription.NumStaticSamplers = 2;
+
     rootSignatureDescription.pStaticSamplers = staticSamplers;
     rootSignatureDescription.Flags = D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED;
 
     ID3DBlob* serializedRootSignature = nullptr;
     ID3DBlob* rootSignatureErrors = nullptr;
 
-    HRESULT result = D3D12SerializeRootSignature(&rootSignatureDescription, D3D_ROOT_SIGNATURE_VERSION_1, &serializedRootSignature, &rootSignatureErrors);
+    HRESULT result = D3D12SerializeRootSignature(&rootSignatureDescription, D3D_ROOT_SIGNATURE_VERSION_1,
+                                                 &serializedRootSignature, &rootSignatureErrors);
 
-    if(FAILED(result)){
+    if (FAILED(result))
+    {
         Log::Error("Failed to serialize DXR global root signature. HRESULT: " + std::to_string(result));
-        if(rootSignatureErrors){
-            if(rootSignatureErrors->GetBufferPointer() && rootSignatureErrors->GetBufferSize() > 0){
-                Log::Error(std::string(static_cast<const char*>(rootSignatureErrors->GetBufferPointer()), rootSignatureErrors->GetBufferSize()));
+
+        if (rootSignatureErrors)
+        {
+
+            if (rootSignatureErrors->GetBufferPointer() && rootSignatureErrors->GetBufferSize() > 0)
+            {
+                Log::Error(std::string(static_cast<const char*>(rootSignatureErrors->GetBufferPointer()),
+                                       rootSignatureErrors->GetBufferSize()));
             }
+
             rootSignatureErrors->Release();
         }
 
         return false;
     }
 
-    result = device->CreateRootSignature(0, serializedRootSignature->GetBufferPointer(), serializedRootSignature->GetBufferSize(), IID_PPV_ARGS(&m_globalRootSignature));
+    result =
+        device->CreateRootSignature(0, serializedRootSignature->GetBufferPointer(),
+                                    serializedRootSignature->GetBufferSize(), IID_PPV_ARGS(&m_globalRootSignature));
 
     serializedRootSignature->Release();
 
-    if(FAILED(result)){
+    if (FAILED(result))
+    {
         Log::Error("Failed to create DXR global root signature. HRESULT: " + std::to_string(result));
         return false;
     }
 
     D3D12_GLOBAL_ROOT_SIGNATURE globalRootSignatureDescription{};
+
     globalRootSignatureDescription.pGlobalRootSignature = m_globalRootSignature;
 
     std::vector<D3D12_STATE_SUBOBJECT> subobjects;
     subobjects.reserve(4 + hitGroupDescriptions.size());
 
     D3D12_STATE_SUBOBJECT librarySubobject{};
+
     librarySubobject.Type = D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY;
     librarySubobject.pDesc = &libraryDescription;
 
     subobjects.push_back(librarySubobject);
 
-    for(D3D12_HIT_GROUP_DESC& hitGroupDescription : hitGroupDescriptions){
+    for (D3D12_HIT_GROUP_DESC& hitGroupDescription : hitGroupDescriptions)
+    {
         D3D12_STATE_SUBOBJECT hitGroupSubobject{};
         hitGroupSubobject.Type = D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP;
         hitGroupSubobject.pDesc = &hitGroupDescription;
+
         subobjects.push_back(hitGroupSubobject);
     }
 
@@ -271,6 +321,7 @@ bool RayTracingPipeline::Initialize(ID3D12Device5* device, ShaderLibrary& shader
     subobjects.push_back(shaderConfigSubobject);
 
     D3D12_STATE_SUBOBJECT pipelineConfigSubobject{};
+
     pipelineConfigSubobject.Type = D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG;
     pipelineConfigSubobject.pDesc = &pipelineConfig;
 
@@ -289,7 +340,8 @@ bool RayTracingPipeline::Initialize(ID3D12Device5* device, ShaderLibrary& shader
 
     result = device->CreateStateObject(&stateObjectDescription, IID_PPV_ARGS(&m_stateObject));
 
-    if(FAILED(result)){
+    if (FAILED(result))
+    {
         Log::Error("Failed to create DXR pipeline state object. HRESULT: " + std::to_string(result));
         return false;
     }
@@ -298,7 +350,8 @@ bool RayTracingPipeline::Initialize(ID3D12Device5* device, ShaderLibrary& shader
 
     result = m_stateObject->QueryInterface(IID_PPV_ARGS(&stateObjectProperties));
 
-    if(FAILED(result)){
+    if (FAILED(result))
+    {
         Log::Error("Failed to query ID3D12StateObjectProperties. HRESULT: " + std::to_string(result));
         Shutdown();
         return false;
@@ -306,10 +359,12 @@ bool RayTracingPipeline::Initialize(ID3D12Device5* device, ShaderLibrary& shader
 
     const void* rayGenerationIdentifier = stateObjectProperties->GetShaderIdentifier(rayGenerationShader.c_str());
 
-    if(!rayGenerationIdentifier){
+    if (!rayGenerationIdentifier)
+    {
         Log::Error("Missing DXR ray-generation shader identifier for export: " + ExportNameForLog(rayGenerationShader));
         stateObjectProperties->Release();
         Shutdown();
+
         return false;
     }
 
@@ -318,11 +373,14 @@ bool RayTracingPipeline::Initialize(ID3D12Device5* device, ShaderLibrary& shader
     std::vector<ShaderRecord> missRecords;
     missRecords.reserve(description.missShaders.size());
 
-    for(const std::wstring& missShader : description.missShaders){
+    for (const std::wstring& missShader : description.missShaders)
+    {
         const void* identifier = stateObjectProperties->GetShaderIdentifier(missShader.c_str());
 
-        if(!identifier){
+        if (!identifier)
+        {
             Log::Error("Missing DXR miss shader identifier for export: " + ExportNameForLog(missShader));
+
             stateObjectProperties->Release();
             Shutdown();
             return false;
@@ -332,13 +390,17 @@ bool RayTracingPipeline::Initialize(ID3D12Device5* device, ShaderLibrary& shader
     }
 
     std::vector<ShaderRecord> hitGroupRecords;
+
     hitGroupRecords.reserve(description.hitGroups.size());
 
-    for(const RayTracingHitGroupDescription& hitGroup : description.hitGroups){
+    for (const RayTracingHitGroupDescription& hitGroup : description.hitGroups)
+    {
         const void* identifier = stateObjectProperties->GetShaderIdentifier(hitGroup.name.c_str());
 
-        if(!identifier){
+        if (!identifier)
+        {
             Log::Error("Missing DXR hit-group shader identifier for export: " + ExportNameForLog(hitGroup.name));
+
             stateObjectProperties->Release();
             Shutdown();
             return false;
@@ -347,19 +409,19 @@ bool RayTracingPipeline::Initialize(ID3D12Device5* device, ShaderLibrary& shader
         hitGroupRecords.push_back({identifier});
     }
 
-    if(!m_rayGenerationShaderTable.Initialize(device, rayGenerationRecords) ||
-       !m_missShaderTable.Initialize(device, missRecords) ||
-       !m_hitGroupShaderTable.Initialize(device, hitGroupRecords))
-       {
+    if (!m_rayGenerationShaderTable.Initialize(device, rayGenerationRecords) ||
+        !m_missShaderTable.Initialize(device, missRecords) ||
+        !m_hitGroupShaderTable.Initialize(device, hitGroupRecords))
+    {
         stateObjectProperties->Release();
         Shutdown();
         return false;
-       }
+    }
 
     stateObjectProperties->Release();
 
-        return true;
-    }
+    return true;
+}
 
 void RayTracingPipeline::Shutdown()
 {
@@ -367,20 +429,24 @@ void RayTracingPipeline::Shutdown()
     m_missShaderTable.Shutdown();
     m_rayGenerationShaderTable.Shutdown();
 
-    if(m_stateObject){
+    if (m_stateObject)
+    {
         m_stateObject->Release();
         m_stateObject = nullptr;
     }
 
-    if(m_globalRootSignature){
+    if (m_globalRootSignature)
+    {
         m_globalRootSignature->Release();
+
         m_globalRootSignature = nullptr;
     }
 }
 
 void RayTracingPipeline::Bind(ID3D12GraphicsCommandList4* commandList) const
 {
-    if(!commandList){
+    if (!commandList)
+    {
         return;
     }
 
@@ -388,18 +454,28 @@ void RayTracingPipeline::Bind(ID3D12GraphicsCommandList4* commandList) const
     commandList->SetComputeRootSignature(m_globalRootSignature);
 }
 
-void RayTracingPipeline::Dispatch(ID3D12GraphicsCommandList4* commandList, unsigned int width, unsigned int height, unsigned int depth) const
+void RayTracingPipeline::Dispatch(
+
+    ID3D12GraphicsCommandList4* commandList,
+    unsigned int width,
+    unsigned int height,
+    unsigned int depth) const
 {
-    if(!commandList || width == 0 || height == 0 || depth == 0){
+    if (!commandList || width == 0 || height == 0 || depth == 0)
+    {
         return;
     }
 
     D3D12_DISPATCH_RAYS_DESC description{};
+
     description.RayGenerationShaderRecord.StartAddress = m_rayGenerationShaderTable.GetGPUAddress();
     description.RayGenerationShaderRecord.SizeInBytes = m_rayGenerationShaderTable.GetRecordSize();
     description.MissShaderTable.StartAddress = m_missShaderTable.GetGPUAddress();
+
     description.MissShaderTable.SizeInBytes = m_missShaderTable.GetSizeInBytes();
+
     description.MissShaderTable.StrideInBytes = m_missShaderTable.GetRecordSize();
+
     description.HitGroupTable.StartAddress = m_hitGroupShaderTable.GetGPUAddress();
     description.HitGroupTable.SizeInBytes = m_hitGroupShaderTable.GetSizeInBytes();
     description.HitGroupTable.StrideInBytes = m_hitGroupShaderTable.GetRecordSize();

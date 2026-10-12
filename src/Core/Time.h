@@ -2,16 +2,18 @@
 
 #include <chrono>
 
-class Time{
+class Time
+{
     public:
-        void Initialize();
-        void Update();
+    void Initialize();
+    void Update();
 
-        double GetDeltaTime() const;
+    double GetDeltaTime() const;
 
     private:
-        using Clock = std::chrono::steady_clock;
+    using Clock = std::chrono::steady_clock;
 
-        Clock::time_point m_previousTime;
-        double m_deltaTime = 0.0;
+    Clock::time_point m_previousTime;
+
+    double m_deltaTime = 0.0;
 };

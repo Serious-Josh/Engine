@@ -48,13 +48,13 @@ static_assert(sizeof(GISignedReconstructConstants) == 48);
 
 class GISignedCorrectionPass
 {
-public:
+    public:
     bool Initialize(
-        GraphicsDevice& device,
-        ShaderLibrary& shaders,
-        DescriptorHeap& heap,
-        unsigned int width,
-        unsigned int height);
+      GraphicsDevice& device,
+      ShaderLibrary& shaders,
+      DescriptorHeap& heap,
+      unsigned int width,
+      unsigned int height);
     bool Resize(
         GraphicsDevice& device,
         DescriptorHeap& heap,
@@ -69,7 +69,8 @@ public:
 
     void ResetHistory();
 
-    bool Reconstruct(ID3D12GraphicsCommandList* commandList,
+    bool Reconstruct(
+        ID3D12GraphicsCommandList* commandList,
         UploadBuffer& uploadBuffer,
         GBuffer& gBuffer,
         Texture& baseline,
@@ -77,12 +78,25 @@ public:
 
     void Shutdown();
 
-    Texture& GetSignedCorrectionTexture() { return m_correction; }
-    Texture& GetHistoryTexture() { return m_history[m_readIndex]; }
-    Texture& GetReconstructedTexture() { return m_reconstructed; }
+    Texture& GetSignedCorrectionTexture()
+    {
+        return m_correction;
+    }
+    Texture& GetHistoryTexture()
+    {
+        return m_history[m_readIndex];
+    }
+    Texture& GetReconstructedTexture()
+    {
+        return m_reconstructed;
+    }
 
-private:
-    bool CreateTextures(GraphicsDevice& device, DescriptorHeap& heap, unsigned int width, unsigned int height);
+    private:
+    bool CreateTextures(
+      GraphicsDevice& device,
+      DescriptorHeap& heap,
+      unsigned int width,
+      unsigned int height);
 
     Texture m_correction;
     Texture m_history[2];

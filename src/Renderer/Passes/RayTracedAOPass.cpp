@@ -17,11 +17,13 @@ bool RayTracedAOPass::Initialize(
     unsigned int width,
     unsigned int height)
 {
-    if(!graphicsDevice.SupportsRayTracing() || width == 0 || height == 0){
+    if (!graphicsDevice.SupportsRayTracing() || width == 0 || height == 0)
+    {
         return false;
     }
 
-    if(!CreateTextures(graphicsDevice.GetDevice(), descriptorHeap, width, height)){
+    if (!CreateTextures(graphicsDevice.GetDevice(), descriptorHeap, width, height))
+    {
         Shutdown();
         return false;
     }
@@ -32,25 +34,18 @@ bool RayTracedAOPass::Initialize(
     pipelineDescription.rayGenerationShader = L"AORayGeneration";
     pipelineDescription.missShaders = {L"AOMiss"};
 
-    pipelineDescription.hitGroups = {
-        {L"AOHitGroup", L"AOClosestHit", L""}
-    };
+    pipelineDescription.hitGroups = {{L"AOHitGroup", L"AOClosestHit", L""}};
 
-    pipelineDescription.rootParameters =
-    {
-        {RootParameterType::ShaderResource, 0},
-        {RootParameterType::DescriptorTable, 0, 0, D3D12_SHADER_VISIBILITY_ALL, DescriptorRangeType::UnorderedAccess, 1},
-        {RootParameterType::ConstantBuffer, 0}
-    };
+    pipelineDescription.rootParameters = {{RootParameterType::ShaderResource, 0},
+                                          {RootParameterType::DescriptorTable, 0, 0, D3D12_SHADER_VISIBILITY_ALL,
+                                           DescriptorRangeType::UnorderedAccess, 1},
+                                          {RootParameterType::ConstantBuffer, 0}};
 
     pipelineDescription.maxPayloadSize = 4;
     pipelineDescription.maxAttributeSize = 8;
     pipelineDescription.maxRecursionDepth = 1;
 
-    if(!m_pipeline.Initialize(
-        graphicsDevice.GetRayTracingDevice(),
-        shaderLibrary,
-        pipelineDescription))
+    if (!m_pipeline.Initialize(graphicsDevice.GetRayTracingDevice(), shaderLibrary, pipelineDescription))
     {
         Log::Error("Failed to initialize ray traced AO DXR pipeline.");
         Shutdown();
@@ -61,32 +56,35 @@ bool RayTracedAOPass::Initialize(
 }
 
 bool RayTracedAOPass::CreateTextures(
+
     ID3D12Device* device,
     DescriptorHeap& descriptorHeap,
     unsigned int width,
     unsigned int height)
 {
-    if(!device || width == 0 || height == 0){
+    if (!device || width == 0 || height == 0)
+    {
         return false;
     }
 
-    if(!m_rawAOTexture.Initialize(
-        device, width, height, 1, 1,
-        DXGI_FORMAT_R16_FLOAT,
-        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-        D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
+    if (!m_rawAOTexture.Initialize(device, width, height, 1, 1, DXGI_FORMAT_R16_FLOAT,
+                                   D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
     {
         Log::Error("Failed to create raw ray traced AO texture.");
         return false;
     }
 
-    if(!m_rawAOTexture.CreateSRV(device, descriptorHeap)){
+    if (!m_rawAOTexture.CreateSRV(device, descriptorHeap))
+    {
+
         Log::Error("Failed to create raw ray traced AO SRV.");
         return false;
     }
 
-    if(!m_rawAOTexture.CreateUAV(device, descriptorHeap)){
+    if (!m_rawAOTexture.CreateUAV(device, descriptorHeap))
+    {
         Log::Error("Failed to create raw ray traced AO UAV.");
+
         return false;
     }
 
@@ -99,14 +97,17 @@ bool RayTracedAOPass::Resize(
     unsigned int width,
     unsigned int height)
 {
-    if(!device || width == 0 || height == 0){
+    if (!device || width == 0 || height == 0)
+    {
         return false;
     }
 
     m_rawAOTexture.Shutdown();
 
-    if(!CreateTextures(device, descriptorHeap, width, height)){
+    if (!CreateTextures(device, descriptorHeap, width, height))
+    {
         Shutdown();
+
         return false;
     }
 
@@ -121,7 +122,8 @@ void RayTracedAOPass::Execute(
     unsigned int width,
     unsigned int height)
 {
-    if(!commandList || width == 0 || height == 0){
+    if (!commandList || width == 0 || height == 0)
+    {
         return;
     }
 
@@ -136,8 +138,7 @@ void RayTracedAOPass::Execute(
     m_pipeline.Dispatch(commandList, width, height);
 
     constexpr D3D12_RESOURCE_STATES shaderReadState =
-        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
-        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 
     m_rawAOTexture.Transition(commandList, shaderReadState);
 }

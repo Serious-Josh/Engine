@@ -17,6 +17,7 @@ struct PipelineRenderTargets
 struct StaticSamplerDescription
 {
     D3D12_FILTER filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+
     D3D12_TEXTURE_ADDRESS_MODE addressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
     D3D12_TEXTURE_ADDRESS_MODE addressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
     D3D12_TEXTURE_ADDRESS_MODE addressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
@@ -34,34 +35,40 @@ struct PipelineDescription
     const VertexLayout* vertexLayout = nullptr;
 
     PipelineRenderTargets renderTargets{};
+
     StaticSamplerDescription sampler{};
+
     std::vector<D3D12_STATIC_SAMPLER_DESC> additionalSamplers;
 
     std::vector<RootParameterDescription> rootParameters;
 
     bool depthEnabled = false;
+
     DXGI_FORMAT depthFormat = DXGI_FORMAT_UNKNOWN;
 
     D3D12_COMPARISON_FUNC depthComparison = D3D12_COMPARISON_FUNC_LESS;
+
     D3D12_DEPTH_WRITE_MASK depthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
 };
-
 
 class Pipeline
 {
     public:
-        Pipeline() = default;
+    Pipeline() = default;
 
-        Pipeline(const Pipeline&) = delete;
-        Pipeline& operator=(const Pipeline&) = delete;
-        
-        bool Initialize(ID3D12Device* device, const PipelineDescription& description);
-        void Shutdown();
-        void Bind(ID3D12GraphicsCommandList* commandList) const;
+    Pipeline(const Pipeline&) = delete;
+    Pipeline& operator=(const Pipeline&) = delete;
 
-        ID3D12RootSignature* GetRootSignature() const;
+    bool Initialize(
+        ID3D12Device* device,
+        const PipelineDescription& description);
+    void Shutdown();
+    void Bind(ID3D12GraphicsCommandList* commandList) const;
+
+    ID3D12RootSignature* GetRootSignature() const;
 
     private:
-        ID3D12RootSignature* m_rootSignature = nullptr;
-        ID3D12PipelineState* m_pipelineState = nullptr;
+    ID3D12RootSignature* m_rootSignature = nullptr;
+
+    ID3D12PipelineState* m_pipelineState = nullptr;
 };

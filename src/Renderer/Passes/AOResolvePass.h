@@ -27,13 +27,13 @@ static_assert(sizeof(AOResolveConstants) == 32);
 
 class AOResolvePass
 {
-public:
+    public:
     bool Initialize(
-        GraphicsDevice& graphicsDevice,
-        ShaderLibrary& shaderLibrary,
-        DescriptorHeap& descriptorHeap,
-        unsigned int width,
-        unsigned int height);
+      GraphicsDevice& graphicsDevice,
+      ShaderLibrary& shaderLibrary,
+      DescriptorHeap& descriptorHeap,
+      unsigned int width,
+      unsigned int height);
 
     bool Resize(
         GraphicsDevice& graphicsDevice,
@@ -55,13 +55,14 @@ public:
     Texture& GetOutputTexture();
     const Texture& GetOutputTexture() const;
 
-private:
+    private:
     bool CreateTexture(
-        GraphicsDevice& graphicsDevice,
-        DescriptorHeap& descriptorHeap,
-        unsigned int width,
-        unsigned int height);
+      GraphicsDevice& graphicsDevice,
+      DescriptorHeap& descriptorHeap,
+      unsigned int width,
+      unsigned int height);
 
     Texture m_outputTexture;
+
     ComputePipeline m_pipeline;
 };

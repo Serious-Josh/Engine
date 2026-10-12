@@ -1,6 +1,7 @@
 #pragma once
 
-enum class EventType{
+enum class EventType
+{
     None,
     WindowClose,
     WindowResized,
@@ -12,7 +13,8 @@ enum class EventType{
     MouseScrolled
 };
 
-struct Event{
+struct Event
+{
     EventType type = EventType::None;
     unsigned int code = 0;
 

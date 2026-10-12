@@ -1,12 +1,16 @@
 #include "Shader.h"
 
-bool Shader::Initialize(const void* bytecode, size_t size)
+bool Shader::Initialize(
+    const void* bytecode,
+    size_t size)
 {
-    if(!bytecode || size == 0){
+    if (!bytecode || size == 0)
+    {
         return false;
     }
 
     const char* bytecodeBegin = static_cast<const char*>(bytecode);
+
     const char* bytecodeEnd = bytecodeBegin + size;
 
     m_bytecode.assign(bytecodeBegin, bytecodeEnd);

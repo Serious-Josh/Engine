@@ -25,14 +25,18 @@ struct VertexAttribute
 class VertexLayout
 {
     public:
-        void Add(const char* semantic, unsigned int semanticIndex, VertexAttributeType type, unsigned int offset);
-        const std::vector<VertexAttribute>& GetAttributes() const;
+    void Add(
+      const char* semantic,
+      unsigned int semanticIndex,
+      VertexAttributeType type,
+      unsigned int offset);
+    const std::vector<VertexAttribute>& GetAttributes() const;
 
-        unsigned int GetStride() const;
+    unsigned int GetStride() const;
 
-        static DXGI_FORMAT GetDXGIFormat(VertexAttributeType type);
-    
+    static DXGI_FORMAT GetDXGIFormat(VertexAttributeType type);
+
     private:
-        std::vector<VertexAttribute> m_attributes;
-        unsigned int m_stride = 0;
+    std::vector<VertexAttribute> m_attributes;
+    unsigned int m_stride = 0;
 };

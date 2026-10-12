@@ -20,18 +20,20 @@ struct ShaderDescription
 class Shader
 {
     public:
-        Shader() = default;
+    Shader() = default;
 
-        Shader(const Shader&) = delete;
-        Shader& operator=(const Shader&) = delete;
-        
-        bool Initialize(const void* bytecode, size_t size);
+    Shader(const Shader&) = delete;
+    Shader& operator=(const Shader&) = delete;
 
-        void Unload();
+    bool Initialize(
+        const void* bytecode,
+        size_t size);
 
-        const void* GetByteCode() const;
-        size_t GetBytecodeSize() const;
+    void Unload();
+
+    const void* GetByteCode() const;
+    size_t GetBytecodeSize() const;
 
     private:
-        std::vector<char> m_bytecode;
+    std::vector<char> m_bytecode;
 };

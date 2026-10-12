@@ -36,42 +36,43 @@ static_assert(offsetof(NrdReflectionResolveConstants, padding) == 164);
 class NrdReflectionResolvePass
 {
     public:
-        bool Initialize(
-            GraphicsDevice& graphicsDevice,
-            ShaderLibrary& shaderLibrary,
-            DescriptorHeap& descriptorHeap,
-            unsigned int width,
-            unsigned int height);
+    bool Initialize(
+      GraphicsDevice& graphicsDevice,
+      ShaderLibrary& shaderLibrary,
+      DescriptorHeap& descriptorHeap,
+      unsigned int width,
+      unsigned int height);
 
-        bool Resize(
-            GraphicsDevice& graphicsDevice,
-            DescriptorHeap& descriptorHeap,
-            unsigned int width,
-            unsigned int height);
+    bool Resize(
+        GraphicsDevice& graphicsDevice,
+        DescriptorHeap& descriptorHeap,
+        unsigned int width,
+        unsigned int height);
 
-        void Execute(
-            ID3D12GraphicsCommandList* commandList,
-            GBuffer& gBuffer,
-            Texture& nrdOutput,
-            UploadBuffer& uploadBuffer,
-            const Matrix4& inverseViewProjection,
-            const Matrix4& view,
-            unsigned int materialBufferIndex,
-            unsigned int width,
-            unsigned int height);
+    void Execute(
+        ID3D12GraphicsCommandList* commandList,
+        GBuffer& gBuffer,
+        Texture& nrdOutput,
+        UploadBuffer& uploadBuffer,
+        const Matrix4& inverseViewProjection,
+        const Matrix4& view,
+        unsigned int materialBufferIndex,
+        unsigned int width,
+        unsigned int height);
 
-        void Shutdown();
+    void Shutdown();
 
-        Texture& GetOutputTexture();
-        const Texture& GetOutputTexture() const;
+    Texture& GetOutputTexture();
+    const Texture& GetOutputTexture() const;
 
     private:
-        bool CreateTexture(
-            GraphicsDevice& graphicsDevice,
-            DescriptorHeap& descriptorHeap,
-            unsigned int width,
-            unsigned int height);
+    bool CreateTexture(
+      GraphicsDevice& graphicsDevice,
+      DescriptorHeap& descriptorHeap,
+      unsigned int width,
+      unsigned int height);
 
-        Texture m_outputTexture;
-        ComputePipeline m_pipeline;
+    Texture m_outputTexture;
+
+    ComputePipeline m_pipeline;
 };

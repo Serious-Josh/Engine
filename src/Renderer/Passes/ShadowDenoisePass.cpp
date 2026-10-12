@@ -5,7 +5,12 @@
 #include "../Shader/ShaderLibrary.h"
 #include "../GBuffer.h"
 
-bool ShadowDenoisePass::Initialize(GraphicsDevice& graphicsDevice, ShaderLibrary& shaderLibrary, DescriptorHeap& descriptorHeap, unsigned int width, unsigned int height)
+bool ShadowDenoisePass::Initialize(
+    GraphicsDevice& graphicsDevice,
+    ShaderLibrary& shaderLibrary,
+    DescriptorHeap& descriptorHeap,
+    unsigned int width,
+    unsigned int height)
 {
     ID3D12Device* device = graphicsDevice.GetDevice();
 
@@ -16,11 +21,13 @@ bool ShadowDenoisePass::Initialize(GraphicsDevice& graphicsDevice, ShaderLibrary
 
     Shader* computeShader = shaderLibrary.Load(shaderDescription);
 
-    if(!computeShader){
+    if (!computeShader)
+    {
         return false;
     }
 
     ComputePipelineDescription pipelineDescription{};
+
     pipelineDescription.computeShader = computeShader;
 
     RootParameterDescription constants{};
@@ -30,23 +37,26 @@ bool ShadowDenoisePass::Initialize(GraphicsDevice& graphicsDevice, ShaderLibrary
 
     pipelineDescription.rootParameters.push_back(constants);
 
-    if(!m_pipeline.Initialize(device, pipelineDescription)){
+    if (!m_pipeline.Initialize(device, pipelineDescription))
+    {
         return false;
     }
 
-    for(unsigned int i = 0; i < 2; ++i)
+    for (unsigned int i = 0; i < 2; ++i)
     {
-        if(!m_filteredVisibility[i].Initialize(device, width, height, 1, 1, DXGI_FORMAT_R16_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
+        if (!m_filteredVisibility[i].Initialize(device, width, height, 1, 1, DXGI_FORMAT_R16_FLOAT,
+                                                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
         {
             return false;
         }
 
-        if(!m_filteredVisibility[i].CreateSRV(device, descriptorHeap))
+        if (!m_filteredVisibility[i].CreateSRV(device, descriptorHeap))
         {
             return false;
         }
 
-        if(!m_filteredVisibility[i].CreateUAV(device, descriptorHeap))
+        if (!m_filteredVisibility[i].CreateUAV(device, descriptorHeap))
         {
             return false;
         }
@@ -57,29 +67,38 @@ bool ShadowDenoisePass::Initialize(GraphicsDevice& graphicsDevice, ShaderLibrary
     return true;
 }
 
-bool ShadowDenoisePass::Resize(GraphicsDevice& graphicsDevice, DescriptorHeap& descriptorHeap, unsigned int width, unsigned int height)
+bool ShadowDenoisePass::Resize(
+
+    GraphicsDevice& graphicsDevice,
+    DescriptorHeap& descriptorHeap,
+    unsigned int width,
+    unsigned int height)
 {
     ID3D12Device* device = graphicsDevice.GetDevice();
 
-    for(Texture& texture : m_filteredVisibility)
+    for (Texture& texture : m_filteredVisibility)
     {
         texture.Shutdown();
     }
 
-    for(unsigned int i = 0; i < 2; ++i)
+    for (unsigned int i = 0; i < 2; ++i)
     {
-        if(!m_filteredVisibility[i].Initialize(device, width, height, 1, 1, DXGI_FORMAT_R16_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
+        if (!m_filteredVisibility[i].Initialize(device, width, height, 1, 1, DXGI_FORMAT_R16_FLOAT,
+                                                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
         {
             return false;
         }
 
-        if(!m_filteredVisibility[i].CreateSRV(device, descriptorHeap))
+        if (!m_filteredVisibility[i].CreateSRV(device, descriptorHeap))
         {
+
             return false;
         }
 
-        if(!m_filteredVisibility[i].CreateUAV(device, descriptorHeap))
+        if (!m_filteredVisibility[i].CreateUAV(device, descriptorHeap))
         {
+
             return false;
         }
     }
@@ -92,7 +111,7 @@ void ShadowDenoisePass::Shutdown()
 {
     m_pipeline.Shutdown();
 
-    for(Texture& texture : m_filteredVisibility)
+    for (Texture& texture : m_filteredVisibility)
     {
         texture.Shutdown();
     }
@@ -100,7 +119,14 @@ void ShadowDenoisePass::Shutdown()
     m_outputIndex = 0;
 }
 
-void ShadowDenoisePass::Execute(ID3D12GraphicsCommandList* commandList, Texture& inputVisibility, GBuffer& gBuffer, UploadBuffer& uploadBuffer, const Matrix4& inverseViewProjection, unsigned int width, unsigned int height)
+void ShadowDenoisePass::Execute(
+    ID3D12GraphicsCommandList* commandList,
+    Texture& inputVisibility,
+    GBuffer& gBuffer,
+    UploadBuffer& uploadBuffer,
+    const Matrix4& inverseViewProjection,
+    unsigned int width,
+    unsigned int height)
 {
     inputVisibility.Transition(commandList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
@@ -110,7 +136,8 @@ void ShadowDenoisePass::Execute(ID3D12GraphicsCommandList* commandList, Texture&
 
     Texture* currentInput = &inputVisibility;
 
-    for(unsigned int passIndex = 0; passIndex < 3; ++passIndex){
+    for (unsigned int passIndex = 0; passIndex < 3; ++passIndex)
+    {
         const unsigned int writeIndex = passIndex % 2;
 
         Texture& output = m_filteredVisibility[writeIndex];
@@ -122,15 +149,19 @@ void ShadowDenoisePass::Execute(ID3D12GraphicsCommandList* commandList, Texture&
         constants.inverseViewProjection = inverseViewProjection;
         constants.visibilityIndex = currentInput->GetDescriptorIndex();
         constants.depthIndex = gBuffer.GetDepth().GetSRVIndex();
+
         constants.surfaceIndex = gBuffer.GetSurface().GetSRVIndex();
         constants.outputIndex = output.GetUAVIndex();
         constants.width = width;
         constants.height = height;
+
         constants.stepWidth = stepWidths[passIndex];
 
-        const D3D12_GPU_VIRTUAL_ADDRESS gpuVirtualAddress = uploadBuffer.Allocate(&constants, sizeof(constants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
+        const D3D12_GPU_VIRTUAL_ADDRESS gpuVirtualAddress =
+            uploadBuffer.Allocate(&constants, sizeof(constants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
 
-        if(gpuVirtualAddress == 0){
+        if (gpuVirtualAddress == 0)
+        {
             return;
         }
 

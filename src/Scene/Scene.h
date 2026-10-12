@@ -14,56 +14,58 @@ using RenderObjectID = std::size_t;
 class Scene
 {
     public:
-        Scene() = default;
+    Scene() = default;
 
-        Scene(const Scene&) = delete;
-        Scene& operator=(const Scene&) = delete;
+    Scene(const Scene&) = delete;
+    Scene& operator=(const Scene&) = delete;
 
-        RenderObjectID AddRenderObject(const RenderObject& object);
+    RenderObjectID AddRenderObject(const RenderObject& object);
 
-        void ClearRenderObjects();
+    void ClearRenderObjects();
 
-        void SetRenderObjectTransform(RenderObjectID id, const Transform& transform);
+    void SetRenderObjectTransform(
+        RenderObjectID id,
+        const Transform& transform);
 
-        const std::vector<RenderObjectID>& GetChangedTransforms() const;
-        void ClearChangedTransforms();
+    const std::vector<RenderObjectID>& GetChangedTransforms() const;
+    void ClearChangedTransforms();
 
-        uint64_t GetStructureRevision() const;
+    uint64_t GetStructureRevision() const;
 
-        std::vector<RenderObject>& GetRenderObjects();
-        const std::vector<RenderObject>& GetRenderObjects() const;
+    std::vector<RenderObject>& GetRenderObjects();
+    const std::vector<RenderObject>& GetRenderObjects() const;
 
-        Camera& GetCamera();
-        const Camera& GetCamera() const;
+    Camera& GetCamera();
+    const Camera& GetCamera() const;
 
-        DirectionalLight& GetDirectionalLight();
-        const DirectionalLight& GetDirectionalLight() const;
+    DirectionalLight& GetDirectionalLight();
+    const DirectionalLight& GetDirectionalLight() const;
 
-        static constexpr std::size_t kDisplacementPatchCount = 64;
+    static constexpr std::size_t kDisplacementPatchCount = 64;
 
-        void SetDisplacementPatchLODs(
-            const std::array<std::uint32_t, kDisplacementPatchCount>& patchLODs)
-        {
-            m_displacementPatchLODs = patchLODs;
-        }
+    void SetDisplacementPatchLODs(const std::array<std::uint32_t, kDisplacementPatchCount>& patchLODs)
+    {
+        m_displacementPatchLODs = patchLODs;
+    }
 
-        const std::array<std::uint32_t, kDisplacementPatchCount>&
-        GetDisplacementPatchLODs() const
-        {
-            return m_displacementPatchLODs;
-        }
+    const std::array<std::uint32_t, kDisplacementPatchCount>& GetDisplacementPatchLODs() const
+    {
+        return m_displacementPatchLODs;
+    }
 
     private:
-        std::vector<RenderObject> m_renderObjects;
-        std::vector<RenderObjectID> m_changedTransforms;
-        std::vector<bool> m_transformDirty;
+    std::vector<RenderObject> m_renderObjects;
 
-        uint64_t m_structureRevision = 0;
+    std::vector<RenderObjectID> m_changedTransforms;
 
-        Camera m_camera;
-        DirectionalLight m_directionalLight;
+    std::vector<bool> m_transformDirty;
 
-        // Temporary camera-selected displacement LOD diagnostic.
-        std::array<std::uint32_t, kDisplacementPatchCount>
-            m_displacementPatchLODs{};
+    uint64_t m_structureRevision = 0;
+
+    Camera m_camera;
+
+    DirectionalLight m_directionalLight;
+
+    // Temporary camera-selected displacement LOD diagnostic.
+    std::array<std::uint32_t, kDisplacementPatchCount> m_displacementPatchLODs{};
 };

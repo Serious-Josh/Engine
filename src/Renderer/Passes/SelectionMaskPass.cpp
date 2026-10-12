@@ -4,7 +4,10 @@
 
 #include "Renderer/Shader/ShaderLibrary.h"
 
-bool SelectionMaskPass::Initialize(ID3D12Device* device, ShaderLibrary& shaderLibrary, const VertexLayout& vertexLayout)
+bool SelectionMaskPass::Initialize(
+    ID3D12Device* device,
+    ShaderLibrary& shaderLibrary,
+    const VertexLayout& vertexLayout)
 {
     ShaderDescription vertexDescription{};
     vertexDescription.path = "SelectionMask.hlsl";
@@ -13,24 +16,28 @@ bool SelectionMaskPass::Initialize(ID3D12Device* device, ShaderLibrary& shaderLi
 
     Shader* vertexShader = shaderLibrary.Load(vertexDescription);
 
-    if(!vertexShader){
+    if (!vertexShader)
+    {
         Log::Error("Failed to load selection mask vertex shader.");
         return false;
     }
 
     ShaderDescription pixelDescription{};
+
     pixelDescription.path = "SelectionMask.hlsl";
     pixelDescription.entryPoint = "PSMain";
     pixelDescription.stage = ShaderStage::Pixel;
 
     Shader* pixelShader = shaderLibrary.Load(pixelDescription);
 
-    if(!pixelShader){
+    if (!pixelShader)
+    {
         Log::Error("Failed to load selection mask pixel shader.");
         return false;
     }
 
     PipelineDescription description{};
+
     description.vertexShader = vertexShader;
     description.pixelShader = pixelShader;
     description.vertexLayout = &vertexLayout;
@@ -55,7 +62,8 @@ bool SelectionMaskPass::Initialize(ID3D12Device* device, ShaderLibrary& shaderLi
     objectParameter.visibility = D3D12_SHADER_VISIBILITY_VERTEX;
     description.rootParameters.push_back(objectParameter);
 
-    if(!m_pipeline.Initialize(device, description)){
+    if (!m_pipeline.Initialize(device, description))
+    {
         Log::Error("Failed to initialize selection mask pipeline.");
         return false;
     }

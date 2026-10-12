@@ -9,13 +9,21 @@
 #include <dxgi1_6.h>
 #include <Windows.h>
 
-bool SwapChain::Initialize(IDXGIFactory4* factory, ID3D12Device* device, ID3D12CommandQueue* commandQueue, void* windowHandle, unsigned int width, unsigned int height)
+bool SwapChain::Initialize(
+    IDXGIFactory4* factory,
+    ID3D12Device* device,
+    ID3D12CommandQueue* commandQueue,
+    void* windowHandle,
+    unsigned int width,
+    unsigned int height)
 {
-    if(!factory || !device || !commandQueue || !windowHandle){
+    if (!factory || !device || !commandQueue || !windowHandle)
+    {
         return false;
     }
 
     m_device = device;
+
     m_width = width;
     m_height = height;
 
@@ -25,10 +33,12 @@ bool SwapChain::Initialize(IDXGIFactory4* factory, ID3D12Device* device, ID3D12C
     swapChainDescription.Height = m_height;
     swapChainDescription.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     swapChainDescription.Stereo = FALSE;
+
     swapChainDescription.SampleDesc.Count = 1;
     swapChainDescription.SampleDesc.Quality = 0;
     swapChainDescription.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     swapChainDescription.BufferCount = 2;
+
     swapChainDescription.Scaling = DXGI_SCALING_STRETCH;
     swapChainDescription.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     swapChainDescription.AlphaMode = DXGI_ALPHA_MODE_UNSPECIFIED;
@@ -36,9 +46,10 @@ bool SwapChain::Initialize(IDXGIFactory4* factory, ID3D12Device* device, ID3D12C
 
     IDXGISwapChain1* swapChain = nullptr;
 
-    HRESULT result = factory->CreateSwapChainForHwnd(commandQueue, static_cast<HWND>(windowHandle), &swapChainDescription, nullptr, nullptr, &swapChain);
+    HRESULT result = factory->CreateSwapChainForHwnd(commandQueue, static_cast<HWND>(windowHandle),
+                                                     &swapChainDescription, nullptr, nullptr, &swapChain);
 
-    if(FAILED(result))
+    if (FAILED(result))
     {
         return false;
     }
@@ -47,22 +58,22 @@ bool SwapChain::Initialize(IDXGIFactory4* factory, ID3D12Device* device, ID3D12C
 
     swapChain->Release();
 
-    if(FAILED(result))
+    if (FAILED(result))
     {
         return false;
     }
 
-
     D3D12_DESCRIPTOR_HEAP_DESC heapDescription{};
 
     heapDescription.NumDescriptors = 2;
+
     heapDescription.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
     heapDescription.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
     heapDescription.NodeMask = 0;
 
     result = m_device->CreateDescriptorHeap(&heapDescription, IID_PPV_ARGS(&m_rtvHeap));
 
-    if(FAILED(result))
+    if (FAILED(result))
     {
         return false;
     }
@@ -72,23 +83,32 @@ bool SwapChain::Initialize(IDXGIFactory4* factory, ID3D12Device* device, ID3D12C
     return CreateBackBufferViews();
 }
 
-bool SwapChain::Resize(unsigned int width, unsigned int height)
+bool SwapChain::Resize(
+    unsigned int width,
+    unsigned int height)
 {
-    if(width == 0 || height == 0){
+    if (width == 0 || height == 0)
+    {
         return false;
     }
 
     // The caller must wait for the GPU before releasing the back buffers.
-    for(ID3D12Resource*& backBuffer : m_backBuffers){
-        if(backBuffer){
+
+    for (ID3D12Resource*& backBuffer : m_backBuffers)
+    {
+
+        if (backBuffer)
+        {
             backBuffer->Release();
+
             backBuffer = nullptr;
         }
     }
 
     HRESULT result = m_swapChain->ResizeBuffers(2, width, height, DXGI_FORMAT_R8G8B8A8_UNORM, 0);
 
-    if(FAILED(result)){
+    if (FAILED(result))
+    {
         Log::Error("Failed to resize swap-chain buffers. HRESULT: " + std::to_string(result));
 #ifdef _DEBUG
         GraphicsDevice::ReportDeviceRemovedData(m_device, "SwapChain::Resize ResizeBuffers");
@@ -104,26 +124,33 @@ bool SwapChain::Resize(unsigned int width, unsigned int height)
 
 void SwapChain::Shutdown()
 {
-    for(ID3D12Resource*& backBuffer : m_backBuffers){
-        if(backBuffer){
+    for (ID3D12Resource*& backBuffer : m_backBuffers)
+    {
+
+        if (backBuffer)
+        {
             backBuffer->Release();
             backBuffer = nullptr;
         }
     }
 
-    if(m_rtvHeap){
+    if (m_rtvHeap)
+    {
         m_rtvHeap->Release();
         m_rtvHeap = nullptr;
     }
 
-    if(m_swapChain){
+    if (m_swapChain)
+    {
         m_swapChain->Release();
+
         m_swapChain = nullptr;
     }
 
     m_device = nullptr;
 
     m_rtvDescriptorSize = 0;
+
     m_currentBackBuffer = 0;
     m_width = 0;
     m_height = 0;
@@ -133,13 +160,15 @@ bool SwapChain::CreateBackBufferViews()
 {
     D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = m_rtvHeap->GetCPUDescriptorHandleForHeapStart();
 
-    for(UINT index = 0; index < 2; ++index)
+    for (UINT index = 0; index < 2; ++index)
     {
         HRESULT result = m_swapChain->GetBuffer(index, IID_PPV_ARGS(&m_backBuffers[index]));
 
-        if(FAILED(result))
+        if (FAILED(result))
         {
-            Log::Error("Failed to acquire swap-chain back buffer " + std::to_string(index) + ". HRESULT: " + std::to_string(result));
+            Log::Error("Failed to acquire swap-chain back buffer " + std::to_string(index) +
+
+                       ". HRESULT: " + std::to_string(result));
             return false;
         }
 
@@ -183,8 +212,11 @@ bool SwapChain::Present()
 {
     HRESULT result = m_swapChain->Present(0, 0);
 
-    if(FAILED(result)){
-        Log::Error("Failed to present swap chain. Back-buffer index: " + std::to_string(m_currentBackBuffer) + "; HRESULT: " + std::to_string(result));
+    if (FAILED(result))
+    {
+        Log::Error("Failed to present swap chain. Back-buffer index: " + std::to_string(m_currentBackBuffer) +
+                   "; HRESULT: " + std::to_string(result));
+
 #ifdef _DEBUG
         GraphicsDevice::ReportDeviceRemovedData(m_device, "SwapChain::Present");
 #endif

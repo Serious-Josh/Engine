@@ -24,11 +24,13 @@ bool NrdPreparePass::Initialize(
 
     Shader* computeShader = shaderLibrary.Load(shaderDescription);
 
-    if(!computeShader){
+    if (!computeShader)
+    {
         return false;
     }
 
     ComputePipelineDescription pipelineDescription{};
+
     pipelineDescription.computeShader = computeShader;
 
     RootParameterDescription constants{};
@@ -38,11 +40,13 @@ bool NrdPreparePass::Initialize(
 
     pipelineDescription.rootParameters.push_back(constants);
 
-    if(!m_pipeline.Initialize(graphicsDevice.GetDevice(), pipelineDescription)){
+    if (!m_pipeline.Initialize(graphicsDevice.GetDevice(), pipelineDescription))
+    {
         return false;
     }
 
-    if(!CreateTextures(graphicsDevice, descriptorHeap, width, height)){
+    if (!CreateTextures(graphicsDevice, descriptorHeap, width, height))
+    {
         return false;
     }
 
@@ -50,6 +54,7 @@ bool NrdPreparePass::Initialize(
 }
 
 bool NrdPreparePass::Resize(
+
     GraphicsDevice& graphicsDevice,
     DescriptorHeap& descriptorHeap,
     unsigned int width,
@@ -77,14 +82,13 @@ void NrdPreparePass::ExecuteReflections(
     unsigned int height,
     float denoisingRange)
 {
-    if(m_signal != Signal::Specular || !commandList || width == 0 || height == 0)
+    if (m_signal != Signal::Specular || !commandList || width == 0 || height == 0)
     {
         return;
     }
 
     constexpr D3D12_RESOURCE_STATES gBufferReadState =
-        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
-        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 
     gBuffer.GetDepth().Transition(commandList, gBufferReadState);
     gBuffer.GetMaterial().Transition(commandList, gBufferReadState);
@@ -123,15 +127,16 @@ void NrdPreparePass::ExecuteReflections(
     constants.viewZOutputIndex = m_viewZTexture.GetUAVIndex();
     constants.motionOutputIndex = m_motionTexture.GetUAVIndex();
     constants.normalRoughnessOutputIndex = m_normalRoughnessTexture.GetUAVIndex();
-    
+
     constants.specRadianceHitDistOutputIndex = m_specRadianceHitDistTexture.GetUAVIndex();
     constants.geometricNormalIndex = gBuffer.GetGeometricNormal().GetSRVIndex();
     constants.giHitDistanceIndex = 0;
     constants.diffRadianceHitDistOutputIndex = 0;
 
-    const D3D12_GPU_VIRTUAL_ADDRESS constantsAddress = uploadBuffer.Allocate(&constants, sizeof(constants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
+    const D3D12_GPU_VIRTUAL_ADDRESS constantsAddress =
+        uploadBuffer.Allocate(&constants, sizeof(constants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
 
-    if(constantsAddress == 0)
+    if (constantsAddress == 0)
     {
         return;
     }
@@ -141,13 +146,13 @@ void NrdPreparePass::ExecuteReflections(
     commandList->SetComputeRootConstantBufferView(0, constantsAddress);
 
     const unsigned int groupCountX = (width + 7) / 8;
+
     const unsigned int groupCountY = (height + 7) / 8;
 
     commandList->Dispatch(groupCountX, groupCountY, 1);
 
     constexpr D3D12_RESOURCE_STATES nrdInputState =
-        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
-        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 
     m_viewZTexture.Transition(commandList, nrdInputState);
     m_motionTexture.Transition(commandList, nrdInputState);
@@ -171,15 +176,14 @@ void NrdPreparePass::ExecuteGI(
     unsigned int giHeight,
     float denoisingRange)
 {
-    if(m_signal != Signal::Diffuse || !commandList ||
-       fullWidth == 0 || fullHeight == 0 || giWidth == 0 || giHeight == 0)
+    if (m_signal != Signal::Diffuse || !commandList || fullWidth == 0 || fullHeight == 0 || giWidth == 0 ||
+        giHeight == 0)
     {
         return;
     }
 
     constexpr D3D12_RESOURCE_STATES gBufferReadState =
-        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
-        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 
     gBuffer.GetDepth().Transition(commandList, gBufferReadState);
     gBuffer.GetMaterial().Transition(commandList, gBufferReadState);
@@ -224,9 +228,10 @@ void NrdPreparePass::ExecuteGI(
     constants.hitDistanceC = 20.0f;
     constants.denoisingRange = denoisingRange;
 
-    const D3D12_GPU_VIRTUAL_ADDRESS constantsAddress = uploadBuffer.Allocate(&constants, sizeof(constants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
+    const D3D12_GPU_VIRTUAL_ADDRESS constantsAddress =
+        uploadBuffer.Allocate(&constants, sizeof(constants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
 
-    if(constantsAddress == 0)
+    if (constantsAddress == 0)
     {
         return;
     }
@@ -236,11 +241,11 @@ void NrdPreparePass::ExecuteGI(
 
     const unsigned int groupCountX = (giWidth + 7) / 8;
     const unsigned int groupCountY = (giHeight + 7) / 8;
+
     commandList->Dispatch(groupCountX, groupCountY, 1);
 
     constexpr D3D12_RESOURCE_STATES nrdInputState =
-        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
-        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 
     m_viewZTexture.Transition(commandList, nrdInputState);
     m_motionTexture.Transition(commandList, nrdInputState);
@@ -266,97 +271,97 @@ bool NrdPreparePass::CreateTextures(
 {
     ID3D12Device* device = graphicsDevice.GetDevice();
 
-    if(!m_viewZTexture.Initialize(device, width, height, 1, 1,
-        DXGI_FORMAT_R32_FLOAT,
-        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-        D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
+    if (!m_viewZTexture.Initialize(device, width, height, 1, 1, DXGI_FORMAT_R32_FLOAT,
+                                   D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
     {
         Log::Error("Failed to create NRD view-Z texture.");
         Shutdown();
         return false;
     }
 
-    if(!m_viewZTexture.CreateSRV(device, descriptorHeap))
+    if (!m_viewZTexture.CreateSRV(device, descriptorHeap))
     {
         Log::Error("Failed to create NRD view-Z SRV.");
         Shutdown();
         return false;
     }
 
-    if(!m_viewZTexture.CreateUAV(device, descriptorHeap))
+    if (!m_viewZTexture.CreateUAV(device, descriptorHeap))
     {
+
         Log::Error("Failed to create NRD view-Z UAV.");
         Shutdown();
         return false;
     }
 
-    if(!m_motionTexture.Initialize(device, width, height, 1, 1,
-        DXGI_FORMAT_R16G16B16A16_FLOAT,
-        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-        D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
+    if (!m_motionTexture.Initialize(device, width, height, 1, 1, DXGI_FORMAT_R16G16B16A16_FLOAT,
+                                    D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
     {
         Log::Error("Failed to create NRD motion texture.");
+
         Shutdown();
         return false;
     }
 
-    if(!m_motionTexture.CreateSRV(device, descriptorHeap))
+    if (!m_motionTexture.CreateSRV(device, descriptorHeap))
     {
         Log::Error("Failed to create NRD motion SRV.");
         Shutdown();
         return false;
     }
 
-    if(!m_motionTexture.CreateUAV(device, descriptorHeap))
+    if (!m_motionTexture.CreateUAV(device, descriptorHeap))
     {
         Log::Error("Failed to create NRD motion UAV.");
+
         Shutdown();
         return false;
     }
 
-    if(!m_normalRoughnessTexture.Initialize(device, width, height, 1, 1,
-        DXGI_FORMAT_R10G10B10A2_UNORM,
-        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-        D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
+    if (!m_normalRoughnessTexture.Initialize(device, width, height, 1, 1, DXGI_FORMAT_R10G10B10A2_UNORM,
+                                             D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                             D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
     {
         Log::Error("Failed to create NRD normal/roughness texture.");
         Shutdown();
         return false;
     }
 
-    if(!m_normalRoughnessTexture.CreateSRV(device, descriptorHeap))
+    if (!m_normalRoughnessTexture.CreateSRV(device, descriptorHeap))
     {
         Log::Error("Failed to create NRD normal/roughness SRV.");
         Shutdown();
         return false;
     }
 
-    if(!m_normalRoughnessTexture.CreateUAV(device, descriptorHeap))
+    if (!m_normalRoughnessTexture.CreateUAV(device, descriptorHeap))
     {
         Log::Error("Failed to create NRD normal/roughness UAV.");
+
         Shutdown();
         return false;
     }
 
-    if(m_signal == Signal::Specular){
-        if(!m_specRadianceHitDistTexture.Initialize(device, width, height, 1, 1,
-            DXGI_FORMAT_R16G16B16A16_FLOAT,
-            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
+    if (m_signal == Signal::Specular)
+    {
+
+        if (!m_specRadianceHitDistTexture.Initialize(device, width, height, 1, 1, DXGI_FORMAT_R16G16B16A16_FLOAT,
+                                                     D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
         {
             Log::Error("Failed to create NRD specular radiance/hit-distance texture.");
             Shutdown();
             return false;
         }
 
-        if(!m_specRadianceHitDistTexture.CreateSRV(device, descriptorHeap))
+        if (!m_specRadianceHitDistTexture.CreateSRV(device, descriptorHeap))
         {
             Log::Error("Failed to create NRD specular radiance/hit-distance SRV.");
             Shutdown();
             return false;
         }
 
-        if(!m_specRadianceHitDistTexture.CreateUAV(device, descriptorHeap))
+        if (!m_specRadianceHitDistTexture.CreateUAV(device, descriptorHeap))
         {
             Log::Error("Failed to create NRD specular radiance/hit-distance UAV.");
             Shutdown();
@@ -364,50 +369,47 @@ bool NrdPreparePass::CreateTextures(
         }
     }
 
-    if(m_signal == Signal::Diffuse){
-        if(!m_diffRadianceHitDistTexture.Initialize(device, width, height, 1, 1,
-            DXGI_FORMAT_R16G16B16A16_FLOAT,
-            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
+    if (m_signal == Signal::Diffuse)
+    {
+
+        if (!m_diffRadianceHitDistTexture.Initialize(device, width, height, 1, 1, DXGI_FORMAT_R16G16B16A16_FLOAT,
+                                                     D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
         {
             Log::Error("Failed to create NRD diffuse radiance/hit-distance texture.");
             Shutdown();
             return false;
         }
 
-        if(!m_diffRadianceHitDistTexture.CreateSRV(device, descriptorHeap))
+        if (!m_diffRadianceHitDistTexture.CreateSRV(device, descriptorHeap))
         {
             Log::Error("Failed to create NRD diffuse radiance/hit-distance SRV.");
             Shutdown();
             return false;
         }
 
-        if(!m_diffRadianceHitDistTexture.CreateUAV(device, descriptorHeap))
+        if (!m_diffRadianceHitDistTexture.CreateUAV(device, descriptorHeap))
         {
             Log::Error("Failed to create NRD diffuse radiance/hit-distance UAV.");
+
             Shutdown();
             return false;
         }
     }
 
-    m_viewZTexture.GetResource()->SetName(
-        L"NRD Prepare ViewZ");
+    m_viewZTexture.GetResource()->SetName(L"NRD Prepare ViewZ");
 
-    m_motionTexture.GetResource()->SetName(
-        L"NRD Prepare Motion");
+    m_motionTexture.GetResource()->SetName(L"NRD Prepare Motion");
 
-    m_normalRoughnessTexture.GetResource()->SetName(
-        L"NRD Prepare NormalRoughness");
+    m_normalRoughnessTexture.GetResource()->SetName(L"NRD Prepare NormalRoughness");
 
-    if(m_signal == Signal::Specular)
+    if (m_signal == Signal::Specular)
     {
-        m_specRadianceHitDistTexture.GetResource()->SetName(
-            L"NRD Prepare SpecRadianceHitDist");
+        m_specRadianceHitDistTexture.GetResource()->SetName(L"NRD Prepare SpecRadianceHitDist");
     }
     else
     {
-        m_diffRadianceHitDistTexture.GetResource()->SetName(
-            L"NRD Prepare DiffRadianceHitDist");
+        m_diffRadianceHitDistTexture.GetResource()->SetName(L"NRD Prepare DiffRadianceHitDist");
     }
 
     return true;

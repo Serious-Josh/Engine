@@ -23,12 +23,13 @@ bool AODenoisePass::Initialize(
 
     Shader* computeShader = shaderLibrary.Load(shaderDescription);
 
-    if(!computeShader)
+    if (!computeShader)
     {
         return false;
     }
 
     ComputePipelineDescription pipelineDescription{};
+
     pipelineDescription.computeShader = computeShader;
 
     RootParameterDescription constants{};
@@ -38,16 +39,12 @@ bool AODenoisePass::Initialize(
 
     pipelineDescription.rootParameters.push_back(constants);
 
-    if(!m_pipeline.Initialize(device, pipelineDescription))
+    if (!m_pipeline.Initialize(device, pipelineDescription))
     {
         return false;
     }
 
-    return Resize(
-        graphicsDevice,
-        descriptorHeap,
-        width,
-        height);
+    return Resize(graphicsDevice, descriptorHeap, width, height);
 }
 
 bool AODenoisePass::Resize(
@@ -58,30 +55,30 @@ bool AODenoisePass::Resize(
 {
     ID3D12Device* device = graphicsDevice.GetDevice();
 
-    for(unsigned int i = 0; i < 2; ++i)
+    for (unsigned int i = 0; i < 2; ++i)
     {
         m_filteredAO[i].Shutdown();
     }
 
-    for(unsigned int i = 0; i < 2; ++i)
+    for (unsigned int i = 0; i < 2; ++i)
     {
         Texture& texture = m_filteredAO[i];
 
-        if(!texture.Initialize(device, width, height, 1, 1,
-            DXGI_FORMAT_R16_FLOAT,
-            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
+        if (!texture.Initialize(device, width, height, 1, 1, DXGI_FORMAT_R16_FLOAT,
+                                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
         {
             return false;
         }
 
-        if(!texture.CreateSRV(device, descriptorHeap))
+        if (!texture.CreateSRV(device, descriptorHeap))
         {
+
             return false;
         }
 
-        if(!texture.CreateUAV(device, descriptorHeap))
+        if (!texture.CreateUAV(device, descriptorHeap))
         {
+
             return false;
         }
     }
@@ -92,6 +89,7 @@ bool AODenoisePass::Resize(
 }
 
 void AODenoisePass::Execute(
+
     ID3D12GraphicsCommandList* commandList,
     Texture& accumulatedAO,
     GBuffer& gBuffer,
@@ -101,8 +99,7 @@ void AODenoisePass::Execute(
     unsigned int height)
 {
     constexpr D3D12_RESOURCE_STATES shaderReadState =
-        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
-        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
 
     accumulatedAO.Transition(commandList, shaderReadState);
     gBuffer.GetDepth().Transition(commandList, shaderReadState);
@@ -114,7 +111,7 @@ void AODenoisePass::Execute(
 
     const unsigned int stepWidths[3] = {1u, 2u, 4u};
 
-    for(unsigned int iteration = 0; iteration < 3; ++iteration)
+    for (unsigned int iteration = 0; iteration < 3; ++iteration)
     {
         const unsigned int outputIndex = iteration % 2u;
         Texture& outputTexture = m_filteredAO[outputIndex];
@@ -126,15 +123,18 @@ void AODenoisePass::Execute(
         constants.inverseViewProjection = inverseViewProjection;
         constants.inputAOIndex = inputTexture->GetDescriptorIndex();
         constants.depthIndex = gBuffer.GetDepth().GetSRVIndex();
+
         constants.surfaceIndex = gBuffer.GetSurface().GetSRVIndex();
         constants.outputAOIndex = outputTexture.GetUAVIndex();
         constants.width = width;
         constants.height = height;
+
         constants.stepWidth = stepWidths[iteration];
 
-        const D3D12_GPU_VIRTUAL_ADDRESS constantsAddress = uploadBuffer.Allocate(&constants, sizeof(AODenoiseConstants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
+        const D3D12_GPU_VIRTUAL_ADDRESS constantsAddress = uploadBuffer.Allocate(
+            &constants, sizeof(AODenoiseConstants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
 
-        if(constantsAddress == 0)
+        if (constantsAddress == 0)
         {
             return;
         }
@@ -154,7 +154,7 @@ void AODenoisePass::Shutdown()
 {
     m_pipeline.Shutdown();
 
-    for(unsigned int i = 0; i < 2; ++i)
+    for (unsigned int i = 0; i < 2; ++i)
     {
         m_filteredAO[i].Shutdown();
     }

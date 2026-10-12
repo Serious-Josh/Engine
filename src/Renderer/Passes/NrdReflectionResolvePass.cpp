@@ -21,12 +21,13 @@ bool NrdReflectionResolvePass::Initialize(
 
     Shader* computeShader = shaderLibrary.Load(shaderDescription);
 
-    if(!computeShader)
+    if (!computeShader)
     {
         return false;
     }
 
     ComputePipelineDescription pipelineDescription{};
+
     pipelineDescription.computeShader = computeShader;
 
     RootParameterDescription constants{};
@@ -36,12 +37,12 @@ bool NrdReflectionResolvePass::Initialize(
 
     pipelineDescription.rootParameters.push_back(constants);
 
-    if(!m_pipeline.Initialize(graphicsDevice.GetDevice(), pipelineDescription))
+    if (!m_pipeline.Initialize(graphicsDevice.GetDevice(), pipelineDescription))
     {
         return false;
     }
 
-    if(!CreateTexture(graphicsDevice, descriptorHeap, width, height))
+    if (!CreateTexture(graphicsDevice, descriptorHeap, width, height))
     {
         m_pipeline.Shutdown();
         return false;
@@ -51,6 +52,7 @@ bool NrdReflectionResolvePass::Initialize(
 }
 
 bool NrdReflectionResolvePass::Resize(
+
     GraphicsDevice& graphicsDevice,
     DescriptorHeap& descriptorHeap,
     unsigned int width,
@@ -72,12 +74,13 @@ void NrdReflectionResolvePass::Execute(
     unsigned int width,
     unsigned int height)
 {
-    if(!commandList || width == 0 || height == 0)
+    if (!commandList || width == 0 || height == 0)
     {
         return;
     }
 
     gBuffer.GetDepth().Transition(commandList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
     gBuffer.GetMaterial().Transition(commandList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     gBuffer.GetSurface().Transition(commandList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     gBuffer.GetGeometricNormal().Transition(commandList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -90,17 +93,20 @@ void NrdReflectionResolvePass::Execute(
     constants.view = view;
     constants.depthIndex = gBuffer.GetDepth().GetSRVIndex();
     constants.materialIndex = gBuffer.GetMaterial().GetSRVIndex();
+
     constants.surfaceIndex = gBuffer.GetSurface().GetSRVIndex();
     constants.materialBufferIndex = materialBufferIndex;
     constants.nrdOutputIndex = nrdOutput.GetDescriptorIndex();
     constants.outputIndex = m_outputTexture.GetUAVIndex();
+
     constants.width = width;
     constants.height = height;
     constants.geometricNormalIndex = gBuffer.GetGeometricNormal().GetSRVIndex();
 
-    const D3D12_GPU_VIRTUAL_ADDRESS constantsAddress = uploadBuffer.Allocate(&constants, sizeof(constants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
+    const D3D12_GPU_VIRTUAL_ADDRESS constantsAddress =
+        uploadBuffer.Allocate(&constants, sizeof(constants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
 
-    if(constantsAddress == 0)
+    if (constantsAddress == 0)
     {
         return;
     }
@@ -131,18 +137,15 @@ bool NrdReflectionResolvePass::CreateTexture(
 {
     ID3D12Device* device = graphicsDevice.GetDevice();
 
-    if(!m_outputTexture.Initialize(device, width, height, 1, 1,
-        DXGI_FORMAT_R16G16B16A16_FLOAT,
-        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-        D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
+    if (!m_outputTexture.Initialize(device, width, height, 1, 1, DXGI_FORMAT_R16G16B16A16_FLOAT,
+                                    D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
     {
-        Log::Error(
-            "Failed to create NRD resolved reflection texture.");
+        Log::Error("Failed to create NRD resolved reflection texture.");
 
         return false;
     }
 
-    if(!m_outputTexture.CreateSRV(device, descriptorHeap))
+    if (!m_outputTexture.CreateSRV(device, descriptorHeap))
     {
         Log::Error("Failed to create NRD resolved reflection SRV.");
 
@@ -150,7 +153,7 @@ bool NrdReflectionResolvePass::CreateTexture(
         return false;
     }
 
-    if(!m_outputTexture.CreateUAV(device, descriptorHeap))
+    if (!m_outputTexture.CreateUAV(device, descriptorHeap))
     {
         Log::Error("Failed to create NRD resolved reflection UAV.");
 

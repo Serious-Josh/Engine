@@ -24,8 +24,10 @@ struct Material
     Texture* normalTexture = nullptr;
     Texture* roughnessTexture = nullptr;
     Texture* metallicTexture = nullptr;
+
     Texture* armTexture = nullptr;
     Texture* aoTexture = nullptr;
+
     bool preferARM = true;
 
     MaterialModel model = MaterialModel::Dielectric;
@@ -47,73 +49,35 @@ struct Material
         float n,
         float k)
     {
-        cosTheta =
-            std::clamp(
-                cosTheta,
-                0.0f,
-                1.0f
-            );
+        cosTheta = std::clamp(cosTheta, 0.0f, 1.0f);
 
-        float cosThetaSquared =
-            cosTheta * cosTheta;
+        float cosThetaSquared = cosTheta * cosTheta;
 
-        float sinThetaSquared =
-            1.0f - cosThetaSquared;
+        float sinThetaSquared = 1.0f - cosThetaSquared;
 
-        float nSquared =
-            n * n;
+        float nSquared = n * n;
 
-        float kSquared =
-            k * k;
+        float kSquared = k * k;
 
-        float t0 =
-            nSquared -
-            kSquared -
-            sinThetaSquared;
+        float t0 = nSquared - kSquared - sinThetaSquared;
 
-        float a2PlusB2 =
-            std::sqrt(
-                t0 * t0 +
-                4.0f * nSquared * kSquared
-            );
+        float a2PlusB2 = std::sqrt(t0 * t0 + 4.0f * nSquared * kSquared);
 
-        float t1 =
-            a2PlusB2 +
-            cosThetaSquared;
+        float t1 = a2PlusB2 + cosThetaSquared;
 
-        float a =
-            std::sqrt(
-                0.5f *
-                (a2PlusB2 + t0)
-            );
+        float a = std::sqrt(0.5f * (a2PlusB2 + t0));
 
-        float t2 =
-            2.0f *
-            cosTheta *
-            a;
+        float t2 = 2.0f * cosTheta * a;
 
-        float Rs =
-            (t1 - t2) /
-            (t1 + t2);
+        float Rs = (t1 - t2) / (t1 + t2);
 
-        float t3 =
-            cosThetaSquared *
-            a2PlusB2 +
-            sinThetaSquared *
-            sinThetaSquared;
+        float t3 = cosThetaSquared * a2PlusB2 + sinThetaSquared * sinThetaSquared;
 
-        float t4 =
-            t2 *
-            sinThetaSquared;
+        float t4 = t2 * sinThetaSquared;
 
-        float Rp =
-            Rs *
-            (t3 - t4) /
-            (t3 + t4);
+        float Rp = Rs * (t3 - t4) / (t3 + t4);
 
-        return
-            0.5f *
-            (Rp + Rs);
+        return 0.5f * (Rp + Rs);
     }
 
     static float CalculateAverageConductorFresnel(
@@ -124,29 +88,17 @@ struct Material
 
         float integral = 0.0f;
 
-        for(unsigned int sample = 0; sample < sampleCount; ++sample)
+        for (unsigned int sample = 0; sample < sampleCount; ++sample)
         {
             // Midpoint integration over mu = cos(theta).
-            float mu =
-                (static_cast<float>(sample) + 0.5f) /
-                static_cast<float>(sampleCount);
+            float mu = (static_cast<float>(sample) + 0.5f) / static_cast<float>(sampleCount);
 
-            float fresnel =
-                EvaluateConductorFresnel(
-                    mu,
-                    n,
-                    k
-                );
+            float fresnel = EvaluateConductorFresnel(mu, n, k);
 
-            integral +=
-                fresnel *
-                mu;
+            integral += fresnel * mu;
         }
 
-        return
-            2.0f *
-            integral /
-            static_cast<float>(sampleCount);
+        return 2.0f * integral / static_cast<float>(sampleCount);
     }
 
     GPUMaterial GetGPUData() const
@@ -166,6 +118,7 @@ struct Material
         data.normalTextureIndex = normalTexture ? normalTexture->GetDescriptorIndex() : UINT_MAX;
         data.roughnessTextureIndex = roughnessTexture ? roughnessTexture->GetDescriptorIndex() : UINT_MAX;
         data.metallicTextureIndex = metallicTexture ? metallicTexture->GetDescriptorIndex() : UINT_MAX;
+
         data.armTextureIndex = armTexture ? armTexture->GetDescriptorIndex() : UINT_MAX;
         data.preferARM = preferARM ? 1u : 0u;
         data.aoTextureIndex = aoTexture ? aoTexture->GetDescriptorIndex() : UINT_MAX;
@@ -178,23 +131,11 @@ struct Material
         data.conductorK[1] = conductorK[1];
         data.conductorK[2] = conductorK[2];
 
-        data.averageConductorFresnel[0] =
-        CalculateAverageConductorFresnel(
-                conductorN[0],
-                conductorK[0]
-            );
+        data.averageConductorFresnel[0] = CalculateAverageConductorFresnel(conductorN[0], conductorK[0]);
 
-        data.averageConductorFresnel[1] =
-            CalculateAverageConductorFresnel(
-                conductorN[1],
-                conductorK[1]
-            );
+        data.averageConductorFresnel[1] = CalculateAverageConductorFresnel(conductorN[1], conductorK[1]);
 
-        data.averageConductorFresnel[2] =
-            CalculateAverageConductorFresnel(
-                conductorN[2],
-                conductorK[2]
-            );
+        data.averageConductorFresnel[2] = CalculateAverageConductorFresnel(conductorN[2], conductorK[2]);
 
         return data;
     }

@@ -29,6 +29,7 @@ bool GISpatialDenoisePass::Initialize(
     }
 
     ComputePipelineDescription pipelineDescription{};
+
     pipelineDescription.computeShader = computeShader;
 
     RootParameterDescription constants{};
@@ -53,6 +54,7 @@ bool GISpatialDenoisePass::Initialize(
 }
 
 bool GISpatialDenoisePass::CreateTextures(
+
     GraphicsDevice& graphicsDevice,
     DescriptorHeap& descriptorHeap,
     unsigned int width,
@@ -60,35 +62,29 @@ bool GISpatialDenoisePass::CreateTextures(
 {
     ID3D12Device* device = graphicsDevice.GetDevice();
 
-    if(!m_pingTexture.Initialize(device, width, height, 1, 1,
-        DXGI_FORMAT_R16G16B16A16_FLOAT,
-        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-        D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
+    if (!m_pingTexture.Initialize(device, width, height, 1, 1, DXGI_FORMAT_R16G16B16A16_FLOAT,
+                                  D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
     {
         Log::Error("Failed to create GI spatial denoise ping texture.");
         return false;
     }
 
-    if(!m_pingTexture.CreateSRV(device, descriptorHeap) ||
-       !m_pingTexture.CreateUAV(device, descriptorHeap))
+    if (!m_pingTexture.CreateSRV(device, descriptorHeap) || !m_pingTexture.CreateUAV(device, descriptorHeap))
     {
         Log::Error("Failed to create GI spatial denoise ping descriptors.");
         m_pingTexture.Shutdown();
         return false;
     }
 
-    if(!m_pongTexture.Initialize(device, width, height, 1, 1,
-        DXGI_FORMAT_R16G16B16A16_FLOAT,
-        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-        D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
+    if (!m_pongTexture.Initialize(device, width, height, 1, 1, DXGI_FORMAT_R16G16B16A16_FLOAT,
+                                  D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
     {
         Log::Error("Failed to create GI spatial denoise pong texture.");
         m_pingTexture.Shutdown();
         return false;
     }
 
-    if(!m_pongTexture.CreateSRV(device, descriptorHeap) ||
-       !m_pongTexture.CreateUAV(device, descriptorHeap))
+    if (!m_pongTexture.CreateSRV(device, descriptorHeap) || !m_pongTexture.CreateUAV(device, descriptorHeap))
     {
         Log::Error("Failed to create GI spatial denoise pong descriptors.");
         m_pongTexture.Shutdown();
@@ -126,6 +122,7 @@ void GISpatialDenoisePass::Execute(
 
     gBuffer.GetDepth().Transition(commandList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     gBuffer.GetSurface().Transition(commandList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
     inputGI.Transition(commandList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     m_pingTexture.Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
@@ -146,14 +143,17 @@ void GISpatialDenoisePass::Execute(
         constants.inputIndex = source.GetDescriptorIndex();
         constants.outputIndex = destination.GetUAVIndex();
         constants.depthIndex = gBuffer.GetDepth().GetSRVIndex();
+
         constants.normalIndex = gBuffer.GetSurface().GetSRVIndex();
         constants.width = width;
         constants.height = height;
         constants.stepWidth = 1u << iteration;
+
         constants.depthSigma = 1.0f;
         constants.normalPower = 32.0f;
 
-        const D3D12_GPU_VIRTUAL_ADDRESS constantsAddress = uploadBuffer.Allocate(&constants, sizeof(constants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
+        const D3D12_GPU_VIRTUAL_ADDRESS constantsAddress =
+            uploadBuffer.Allocate(&constants, sizeof(constants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
 
         if (constantsAddress == 0)
         {
@@ -171,6 +171,7 @@ void GISpatialDenoisePass::Execute(
 void GISpatialDenoisePass::Shutdown()
 {
     m_pingTexture.Shutdown();
+
     m_pongTexture.Shutdown();
     m_pipeline.Shutdown();
 }

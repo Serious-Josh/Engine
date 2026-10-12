@@ -10,43 +10,47 @@ class DescriptorHeap;
 class RenderTarget
 {
     public:
-        RenderTarget() = default;
+    RenderTarget() = default;
 
-        RenderTarget(const RenderTarget&) = delete;
-        RenderTarget& operator=(const RenderTarget&) = delete;
+    RenderTarget(const RenderTarget&) = delete;
+    RenderTarget& operator=(const RenderTarget&) = delete;
 
-        RenderTarget(RenderTarget&& other) noexcept;
-        RenderTarget& operator=(RenderTarget&& other) noexcept;
+    RenderTarget(RenderTarget&& other) noexcept;
+    RenderTarget& operator=(RenderTarget&& other) noexcept;
 
-        bool Initialize(ID3D12Device* device, unsigned int width, unsigned int height, DXGI_FORMAT format, DescriptorHeap& rtvHeap, DescriptorHeap& resourceHeap, const std::array<float, 4>& optimizedClearColor = {0.0f, 0.0f, 0.0f, 1.0f});
+    bool Initialize(ID3D12Device* device, unsigned int width, unsigned int height, DXGI_FORMAT format,
+                    DescriptorHeap& rtvHeap, DescriptorHeap& resourceHeap,
+                    const std::array<float, 4>& optimizedClearColor = {0.0f, 0.0f, 0.0f, 1.0f});
 
-        void Shutdown();
+    void Shutdown();
 
-        void Transition(ID3D12GraphicsCommandList* commandList, D3D12_RESOURCE_STATES newState);
+    void Transition(
+        ID3D12GraphicsCommandList* commandList,
+        D3D12_RESOURCE_STATES newState);
 
-        ID3D12Resource* GetResource() const;
+    ID3D12Resource* GetResource() const;
 
-        D3D12_CPU_DESCRIPTOR_HANDLE GetRTV() const;
+    D3D12_CPU_DESCRIPTOR_HANDLE GetRTV() const;
 
-        unsigned int GetSRVIndex() const;
+    unsigned int GetSRVIndex() const;
 
-        unsigned int GetWidth() const;
-        unsigned int GetHeight() const;
-        DXGI_FORMAT GetFormat() const;
+    unsigned int GetWidth() const;
+    unsigned int GetHeight() const;
+    DXGI_FORMAT GetFormat() const;
 
     private:
-        ID3D12Resource* m_resource = nullptr;
+    ID3D12Resource* m_resource = nullptr;
 
-        DescriptorHeap* m_rtvHeap = nullptr;
-        DescriptorHeap* m_resourceHeap = nullptr;
+    DescriptorHeap* m_rtvHeap = nullptr;
+    DescriptorHeap* m_resourceHeap = nullptr;
 
-        unsigned int m_rtvIndex = UINT_MAX;
-        unsigned int m_srvIndex = UINT_MAX;
+    unsigned int m_rtvIndex = UINT_MAX;
+    unsigned int m_srvIndex = UINT_MAX;
 
-        unsigned int m_width = 0;
-        unsigned int m_height = 0;
+    unsigned int m_width = 0;
+    unsigned int m_height = 0;
 
-        DXGI_FORMAT m_format = DXGI_FORMAT_UNKNOWN;
+    DXGI_FORMAT m_format = DXGI_FORMAT_UNKNOWN;
 
-        D3D12_RESOURCE_STATES m_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    D3D12_RESOURCE_STATES m_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
 };

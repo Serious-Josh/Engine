@@ -2,20 +2,25 @@
 
 #include <cmath>
 
-SphereGeometry SphereGenerator::Generate(float radius, unsigned int latitudeSegments, unsigned int longitudeSegments)
+SphereGeometry SphereGenerator::Generate(
+    float radius,
+    unsigned int latitudeSegments,
+    unsigned int longitudeSegments)
 {
     SphereGeometry geometry;
 
     const float pi = 3.14159265358979323846f;
 
-    for(unsigned int latitude = 0; latitude <= latitudeSegments; ++latitude){
+    for (unsigned int latitude = 0; latitude <= latitudeSegments; ++latitude)
+    {
         const float v = static_cast<float>(latitude) / static_cast<float>(latitudeSegments);
         const float theta = v * pi;
 
         const float sinTheta = std::sin(theta);
         const float cosTheta = std::cos(theta);
 
-        for(unsigned int longitude = 0; longitude <= longitudeSegments; ++longitude){
+        for (unsigned int longitude = 0; longitude <= longitudeSegments; ++longitude)
+        {
             const float u = static_cast<float>(longitude) / static_cast<float>(longitudeSegments);
             const float phi = u * 2.0f * pi;
 
@@ -43,13 +48,14 @@ SphereGeometry SphereGenerator::Generate(float radius, unsigned int latitudeSegm
         }
     }
 
-    for(unsigned int latitude = 0; latitude < latitudeSegments; ++latitude){
-        for(unsigned int longitude = 0; longitude < longitudeSegments; ++longitude){
-            const unsigned int first =
-                latitude * (longitudeSegments + 1) + longitude;
+    for (unsigned int latitude = 0; latitude < latitudeSegments; ++latitude)
+    {
 
-            const unsigned int second =
-                first + longitudeSegments + 1;
+        for (unsigned int longitude = 0; longitude < longitudeSegments; ++longitude)
+        {
+            const unsigned int first = latitude * (longitudeSegments + 1) + longitude;
+
+            const unsigned int second = first + longitudeSegments + 1;
 
             geometry.indices.push_back(first);
             geometry.indices.push_back(first + 1);
