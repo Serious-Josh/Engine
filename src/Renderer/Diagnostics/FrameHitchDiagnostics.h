@@ -110,6 +110,8 @@ namespace RendererDiagnostics
 
     struct FrameHitchDiagnostics
     {
+        bool loggingEnabled = false;
+
         FrameHitchSnapshot current{};
 
         std::array<FrameHitchSnapshot, 256> frames{};

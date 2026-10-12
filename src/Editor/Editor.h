@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Scene/Transform.h"
+#include "AssetBrowser.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -18,7 +19,7 @@ class DebugUI;
 
 class Editor
 {
-    public:
+public:
     enum class FileRequestType
     {
         New,
@@ -50,14 +51,18 @@ class Editor
     // Taking a request clears it. Pending actions cannot be overwritten.
     std::optional<FileRequest> TakeFileRequest();
     bool HasFileRequest(FileRequestType type) const noexcept;
+    std::optional<AssetBrowser::MaterialCreationRequest> TakeMaterialCreationRequest();
+    void OnMaterialCreationCompleted(
+        const std::filesystem::path& relativePath,
+        const std::string& error);
 
     void Draw(
-      IDemoScene& demoScene,
-      DemoSceneManager& sceneManager,
-      DebugUI& debugUI,
-      float viewportWidth,
-      float viewportHeight,
-      float deltaTime);
+        IDemoScene& demoScene,
+        DemoSceneManager& sceneManager,
+        DebugUI& debugUI,
+        float viewportWidth,
+        float viewportHeight,
+        float deltaTime);
 
     size_t GetSelectedObject() const
     {
@@ -69,15 +74,19 @@ class Editor
         return m_selectionStructureRevision;
     }
 
-    private:
+private:
     void DrawMainMenu(
         const IDemoScene& demoScene,
         DemoSceneManager& sceneManager,
         DebugUI& debugUI);
 
     std::optional<FileRequest> m_fileRequest;
+
     bool m_sceneOperationPending = false;
-    bool m_showEditorPanel = true;
+    bool m_showEditorPanel = false;
+    bool m_showAssetBrowser = true;
+
+    AssetBrowser m_assetBrowser;
 
     static constexpr size_t InvalidObjectSelection = (std::numeric_limits<size_t>::max)();
 

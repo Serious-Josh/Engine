@@ -71,7 +71,6 @@ namespace
         const float inverseW = 1.0f / w;
 
         result = {(inverseViewProjection.m[0][0] * x + inverseViewProjection.m[0][1] * y +
-
                    inverseViewProjection.m[0][2] * z + inverseViewProjection.m[0][3]) *
                       inverseW,
                   (inverseViewProjection.m[1][0] * x + inverseViewProjection.m[1][1] * y +
@@ -107,7 +106,6 @@ namespace
         Vector3 farPoint;
 
         if (!UnprojectPoint(inverseViewProjection, x, y, 0.0f, nearPoint) ||
-
             !UnprojectPoint(inverseViewProjection, x, y, 1.0f, farPoint))
         {
             return false;
@@ -215,7 +213,10 @@ namespace
 
         const Vector3 localDirection = TransformDirection(inverseModel, ray.direction);
 
-        return IntersectAABB(localOrigin, localDirection, object.mesh->GetBounds(), ray.maxDistance, hitDistance);
+        return IntersectAABB(
+            localOrigin,
+            localDirection,
+            object.mesh->GetBounds(), ray.maxDistance, hitDistance);
     }
 
     size_t PickObject(
@@ -255,7 +256,21 @@ namespace
 
 std::optional<Editor::FileRequest> Editor::TakeFileRequest()
 {
-    return std::exchange(m_fileRequest, std::nullopt);
+    return std::exchange(
+        m_fileRequest,
+        std::nullopt);
+}
+
+std::optional<AssetBrowser::MaterialCreationRequest> Editor::TakeMaterialCreationRequest()
+{
+    return m_assetBrowser.TakeMaterialCreationRequest();
+}
+
+void Editor::OnMaterialCreationCompleted(
+    const std::filesystem::path& relativePath,
+    const std::string& error)
+{
+    m_assetBrowser.OnMaterialCreationCompleted(relativePath, error);
 }
 
 bool Editor::HasFileRequest(FileRequestType type) const noexcept
@@ -276,6 +291,7 @@ void Editor::DrawMainMenu(
     if (ImGui::BeginMenu("File"))
     {
         ImGui::BeginDisabled(m_sceneOperationPending || m_fileRequest.has_value());
+
         if (ImGui::MenuItem("New"))
         {
             m_fileRequest = FileRequest{FileRequestType::New, {}};
@@ -296,7 +312,9 @@ void Editor::DrawMainMenu(
             const ProjectPaths paths(ProjectLocator::GetDefaultProjectRoot());
             std::vector<std::filesystem::path> scenes;
             std::error_code error;
-            std::filesystem::directory_iterator iterator(paths.GetScenesDirectory(), error);
+            std::filesystem::directory_iterator iterator(
+                paths.GetScenesDirectory(),
+                error);
             const std::filesystem::directory_iterator end;
 
             while (!error && iterator != end)
@@ -345,6 +363,7 @@ void Editor::DrawMainMenu(
     if (ImGui::BeginMenu("Editor"))
     {
         ImGui::MenuItem("Scene Inspector", nullptr, &m_showEditorPanel);
+        ImGui::MenuItem("Asset Browser", nullptr, &m_showAssetBrowser);
         ImGui::Separator();
 
         const std::string_view activeSceneName = sceneManager.GetActiveSceneName();
@@ -353,7 +372,6 @@ void Editor::DrawMainMenu(
 
         if (ImGui::BeginCombo("Demo Scene", activeSceneName.data()))
         {
-
             for (const DemoSceneEntry& entry : sceneManager.GetAvailableScenes())
             {
                 const bool isSelected = entry.name == activeSceneName;
@@ -395,12 +413,12 @@ void Editor::Draw(
     float deltaTime)
 {
     DrawMainMenu(demoScene, sceneManager, debugUI);
+    m_assetBrowser.Draw(m_showAssetBrowser);
 
     const ImGuiIO& io = ImGui::GetIO();
 
     if (!io.WantCaptureKeyboard && !ImGuizmo::IsUsing() && !ImGui::IsMouseDown(ImGuiMouseButton_Right))
     {
-
         if (ImGui::IsKeyPressed(ImGuiKey_W, false))
         {
             m_gizmoMode = GizmoMode::Translate;
@@ -440,10 +458,8 @@ void Editor::Draw(
     {
         if (ImGui::Begin("Scene Inspector", &m_showEditorPanel))
         {
-
             if (auto* sphereGridScene = dynamic_cast<SphereGridScene*>(&demoScene))
             {
-
                 DrawSphereGridControls(*sphereGridScene);
 
                 ImGui::Separator();
@@ -473,6 +489,7 @@ void Editor::Draw(
 
     // Save is an application shortcut even when a property input owns keyboard
     // focus. Do not gate it on WantCaptureKeyboard or consume text-edit input.
+
     if (!m_sceneOperationPending && !m_fileRequest &&
         dynamic_cast<const FileBackedDemoScene*>(&demoScene))
     {
@@ -556,7 +573,6 @@ void Editor::DrawStressTestControls(StressTestScene& demoScene)
 
     for (int i = 0; i < IM_ARRAYSIZE(gridSizes); ++i)
     {
-
         if (gridSizes[i] == currentGridSize)
         {
             selectedIndex = i;
@@ -711,7 +727,6 @@ void Editor::DrawObjectControls(
 
     if (fieldDeactivated && m_transformFieldEditing)
     {
-
         const auto& currentObjects = static_cast<const Scene&>(scene).GetRenderObjects();
 
         if (m_transformFieldUndoObject < currentObjects.size())
@@ -759,7 +774,6 @@ void Editor::DrawTransformGizmo(
 
     if (m_selectedObject >= objects.size())
     {
-
         return;
     }
 
@@ -928,7 +942,6 @@ void Editor::HandleViewportSelection(
 
     if (mouse.x < 0.0f || mouse.y < 0.0f || mouse.x >= viewportWidth || mouse.y >= viewportHeight)
     {
-
         return;
     }
 
@@ -954,9 +967,12 @@ void Editor::HandleTransformUndo(IDemoScene& demoScene)
     const ImGuiIO& io = ImGui::GetIO();
 
     if (!io.KeyCtrl || !ImGui::IsKeyPressed(ImGuiKey_Z, false) || io.KeyShift || io.WantTextInput ||
+        ImGui::IsAnyItemActive())
+    {
+        return;
+    }
 
-        ImGui::IsAnyItemActive() || ImGuizmo::IsUsing() || m_cameraLooking || m_transformFieldEditing ||
-
+    if (ImGuizmo::IsUsing() || m_cameraLooking || m_transformFieldEditing ||
         m_transformUndoHistory.empty())
     {
         return;
@@ -988,7 +1004,12 @@ void Editor::HandleTransformRedo(IDemoScene& demoScene)
     const bool redoPressed = io.KeyCtrl && (ImGui::IsKeyPressed(ImGuiKey_Y, false) ||
                                             (io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_Z, false)));
 
-    if (!redoPressed || io.WantTextInput || ImGui::IsAnyItemActive() || ImGuizmo::IsUsing() || m_cameraLooking ||
+    if (!redoPressed || io.WantTextInput || ImGui::IsAnyItemActive() || ImGuizmo::IsUsing())
+    {
+        return;
+    }
+
+    if (m_cameraLooking ||
         m_transformFieldEditing || m_transformRedoHistory.empty())
     {
         return;
@@ -1014,7 +1035,6 @@ void Editor::HandleTransformRedo(IDemoScene& demoScene)
 }
 
 void Editor::UpdateCameraLook(
-
     IDemoScene& demoScene,
     float viewportWidth,
     float viewportHeight)
@@ -1023,10 +1043,8 @@ void Editor::UpdateCameraLook(
 
     if (!ImGui::IsMouseDown(ImGuiMouseButton_Right))
     {
-
         if (m_cameraLooking)
         {
-
             ImGui::SetMouseCursor(ImGuiMouseCursor_Arrow);
         }
 
@@ -1036,9 +1054,13 @@ void Editor::UpdateCameraLook(
 
     if (!m_cameraLooking)
     {
-
         if (io.WantCaptureMouse || io.MousePos.x < 0.0f || io.MousePos.y < 0.0f || io.MousePos.x >= viewportWidth ||
-            io.MousePos.y >= viewportHeight || ImGuizmo::IsUsing())
+            io.MousePos.y >= viewportHeight)
+        {
+            return;
+        }
+
+        if (ImGuizmo::IsUsing())
         {
             return;
         }
@@ -1222,6 +1244,7 @@ Editor::SceneChangeDecision Editor::DrawSceneChangeConfirmation(const std::strin
         }
 
         // Save failure is handled by Engine and reopens the modal next frame.
+
         if (decision != SceneChangeDecision::None)
         {
             ImGui::CloseCurrentPopup();

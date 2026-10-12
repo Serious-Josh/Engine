@@ -2,26 +2,13 @@
 
 #include "Renderer/ShaderData.h"
 #include "Renderer/Texture.h"
+#include "Renderer/MaterialTypes.h"
 
 #include <climits>
 #include <algorithm>
 #include <cmath>
 
 class Pipeline;
-
-enum class MaterialModel
-{
-    MetallicRoughness,
-    Dielectric,
-    Conductor
-};
-
-enum class SurfaceDetailMode : uint32_t
-{
-    NormalOnly = 0,
-    ParallaxOcclusion = 1,
-    GeometryWithParallaxFallback = 2
-};
 
 struct Material
 {

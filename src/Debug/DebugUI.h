@@ -103,7 +103,7 @@ class DebugUI
     }
 
     private:
-    bool m_showRenderingSettings = true;
+    bool m_showRenderingSettings = false;
 
     void DrawFramePacingSpikes();
     FramePacingMonitor m_framePacingMonitor;

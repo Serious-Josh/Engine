@@ -12,6 +12,8 @@
 
 #include "Editor/Editor.h"
 
+#include "assets/ProjectAssetRegistry.h"
+
 #include <cstdint>
 
 enum class EngineState
@@ -32,6 +34,7 @@ class Engine
     void Frame();
     bool ActivateRequestedFileScene();
     void ProcessEditorSceneRequests(IDemoScene& activeScene);
+    void ProcessEditorMaterialRequests();
     void QueueEditorSceneOperation();
 
     WindowProperties m_windowProperties;
@@ -61,4 +64,6 @@ class Engine
     EngineState m_state = EngineState::Uninitialized;
 
     bool m_sceneResourcesReleasedForSwitch = false;
+
+    ProjectAssetRegistry m_projectAssetRegistry;
 };

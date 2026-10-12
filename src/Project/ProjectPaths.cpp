@@ -34,6 +34,11 @@ std::filesystem::path ProjectPaths::GetTexturesDirectory() const
     return m_root / "Textures";
 }
 
+std::filesystem::path ProjectPaths::GetAssetRegistryPath() const
+{
+    return m_root / "Assets.registry.json";
+}
+
 bool ProjectPaths::EnsureDirectories(
     std::string* errorMessage) const
 {

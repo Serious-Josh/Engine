@@ -1,8 +1,9 @@
-#include "Engine.h"
+#include "Engine/Engine.h"
 
 #include "Core/Log.h"
 #include "Core/Assert.h"
 #include "Core/Time.h"
+
 #include "Debug/CpuFrameTiming.h"
 
 #include "Scene/Scene.h"
@@ -10,12 +11,18 @@
 
 #include "Project/ProjectLocator.h"
 #include "Project/ProjectPaths.h"
+#include "assets/ProjectMaterialAssetService.h"
 
 #include "DemoContent/SceneRegistry.h"
 #include "DemoContent/MirrorTestScene.h"
 #include "DemoContent/FileBackedDemoScene.h"
+
+#include "assets/AssetRegistrySerializer.h"
+#include "assets/ProjectAssetResolver.h"
 #include "imgui.h"
 
+#include <filesystem>
+#include <system_error>
 #include <cstdlib>
 #include <chrono>
 #include <string>
@@ -220,6 +227,26 @@ void Engine::QueueEditorSceneOperation()
     }
 }
 
+void Engine::ProcessEditorMaterialRequests()
+{
+    if(const auto request = m_editor.TakeMaterialCreationRequest())
+    {
+        const ProjectPaths projectPaths(ProjectLocator::GetDefaultProjectRoot());
+        auto createdID = AssetID::Generate();
+        std::string error;
+        if(!createdID)
+        {
+            error = "Failed to initialize material asset ID.";
+        }
+        else if(!ProjectMaterialAssetService::Create(projectPaths, m_projectAssetRegistry,
+            request->relativePath, MaterialAssetData{}, *createdID, &error) && error.empty())
+        {
+            error = "Failed to create material.";
+        }
+        m_editor.OnMaterialCreationCompleted(request->relativePath, error);
+    }
+}
+
 void Engine::ProcessEditorSceneRequests(IDemoScene& activeScene)
 {
     auto* fileScene = dynamic_cast<FileBackedDemoScene*>(&activeScene);
@@ -358,23 +385,114 @@ bool Engine::Initialize()
     ENGINE_ASSERT(m_state == EngineState::Uninitialized);
 
     // Initialize persistent project storage before GPU resources.
-    const ProjectPaths projectPaths(
-        ProjectLocator::GetDefaultProjectRoot());
+    const ProjectPaths projectPaths( ProjectLocator::GetDefaultProjectRoot());
 
     std::string projectError;
 
-    if (!projectPaths.EnsureDirectories(&projectError))
+    if(!projectPaths.EnsureDirectories(&projectError))
     {
-        Log::Error(
-            "Failed to initialize default project directories: " +
-            projectError);
+        Log::Error("Failed to initialize default project directories: " + projectError);
 
         return false;
     }
 
+    Log::Info("Default project directory: " + projectPaths.GetRoot().string());
+
+    // Initialize the project asset registry before runtime resources.
+    const std::filesystem::path registryPath = projectPaths.GetAssetRegistryPath();
+
+    std::error_code registryError;
+    const bool registryExists = std::filesystem::exists(registryPath, registryError);
+
+    if(registryError)
+    {
+        Log::Error("Failed to inspect project asset registry: " + registryError.message());
+        return false;
+    }
+
+    if(registryExists)
+    {
+        // Never overwrite an existing malformed or unreadable manifest.
+        if(!AssetRegistrySerializer::LoadFromFile(
+                registryPath,
+                m_projectAssetRegistry,
+                &projectError))
+        {
+            Log::Error("Failed to load project asset registry: " + projectError);
+            return false;
+        }
+
+        Log::Info("Loaded project asset registry: " + registryPath.string());
+    }
+    else
+    {
+        ProjectAssetRegistry emptyRegistry;
+
+        if(!AssetRegistrySerializer::SaveToFile(
+                emptyRegistry,
+                registryPath,
+                &projectError))
+        {
+            Log::Error("Failed to create project asset registry: " + projectError);
+            return false;
+        }
+
+        m_projectAssetRegistry = std::move(emptyRegistry);
+
+        Log::Info("Created empty project asset registry: " + registryPath.string());
+    }
+
+    // Inspect registered project assets without modifying the registry.
+    std::size_t availableAssets = 0;
+    std::size_t missingAssets = 0;
+    std::size_t invalidAssets = 0;
+    std::size_t unreadableAssets = 0;
+
+    for(const AssetRecord& record : m_projectAssetRegistry.GetAssets())
+    {
+        const AssetResolution resolution =
+            ProjectAssetResolver::Resolve(
+                projectPaths,
+                m_projectAssetRegistry,
+                record.id);
+
+        const std::string assetDescription =
+            record.id.ToReference() + " (" +
+            record.relativePath.generic_string() + ")";
+
+        switch (resolution.status){
+            case AssetAvailability::Available:
+                ++availableAssets;
+                break;
+
+            case AssetAvailability::Missing:
+                ++missingAssets;
+                Log::Error("Project asset missing: " + assetDescription);
+                break;
+
+            case AssetAvailability::InvalidPath:
+                ++invalidAssets;
+                Log::Error("Project asset has an invalid path: " + assetDescription);
+                break;
+
+            case AssetAvailability::Unreadable:
+                ++unreadableAssets;
+                Log::Error("Project asset cannot be inspected: " + assetDescription);
+                break;
+
+            case AssetAvailability::NotRegistered:
+                ++invalidAssets;
+                Log::Error("Registered asset lookup failed: " + assetDescription);
+                break;
+        }
+    }
+
     Log::Info(
-        "Default project directory: " +
-        projectPaths.GetRoot().string());
+        "Project asset scan: " +
+        std::to_string(availableAssets) + " available, " +
+        std::to_string(missingAssets) + " missing, " +
+        std::to_string(invalidAssets) + " invalid, " +
+        std::to_string(unreadableAssets) + " unreadable.");
 
     if (!m_window.Initialize(m_windowProperties))
     {
@@ -419,7 +537,7 @@ bool Engine::Initialize()
 
     m_demoPixelShader = m_renderer.GetShaderLibrary().Load(pixelShaderDescription);
 
-    if (!m_demoPixelShader)
+    if(!m_demoPixelShader)
     {
         Log::Error("Failed to load demo pixel shader.");
 
@@ -428,9 +546,10 @@ bool Engine::Initialize()
 
     const float aspectRatio = static_cast<float>(m_window.GetWidth()) / static_cast<float>(m_window.GetHeight());
 
-    if (!m_demoSceneManager.Initialize("Sphere Grid", m_renderer.GetDevice(), m_renderer.GetResourceUploader(),
-                                       m_renderer.GetResourceDescriptorHeap(), m_demoVertexShader, m_demoPixelShader,
-                                       aspectRatio))
+    if(!m_demoSceneManager.Initialize(
+            "Sphere Grid", m_renderer.GetDevice(), m_renderer.GetResourceUploader(),
+            m_renderer.GetResourceDescriptorHeap(), m_demoVertexShader, m_demoPixelShader,
+            aspectRatio))
     {
         Log::Error("Failed to initialize demo scene manager.");
         return false;
@@ -440,7 +559,7 @@ bool Engine::Initialize()
 
     IDemoScene& activeDemo = m_demoSceneManager.GetActiveScene();
 
-    if (!m_renderer.InitializeSceneResources(activeDemo.GetScene(), activeDemo.GetMaterials()))
+    if(!m_renderer.InitializeSceneResources(activeDemo.GetScene(), activeDemo.GetMaterials()))
     {
         Log::Error("Failed to initialize demo renderer resources.");
         return false;
@@ -448,9 +567,9 @@ bool Engine::Initialize()
 
     // Initial BLAS/TLAS registration is complete before generation rebuilds it.
 
-    if (auto* mirrorScene = dynamic_cast<MirrorTestScene*>(&activeDemo))
+    if(auto* mirrorScene = dynamic_cast<MirrorTestScene*>(&activeDemo))
     {
-        if (!m_renderer.RegisterDisplacementHeightmap(*mirrorScene) ||
+        if(!m_renderer.RegisterDisplacementHeightmap(*mirrorScene) ||
 
             !m_renderer.GenerateDisplacementMeshGPU(*mirrorScene, mirrorScene->GetSeedDisplacementSettings()))
         {
@@ -464,24 +583,24 @@ bool Engine::Initialize()
     m_window.SetEventCallback(
         [this](const Event& event)
         {
-            if (m_window.ShouldClose())
+            if(m_window.ShouldClose())
             {
                 return;
             }
 
-            switch (event.type)
+            switch(event.type)
             {
             case EventType::WindowResized:
                 m_window.SetSize(event.width, event.height);
 
-                if (event.width > 0 && event.height > 0)
+                if(event.width > 0 && event.height > 0)
                 {
                     m_demoSceneManager.SetAspectRatio(static_cast<float>(event.width) /
 
                                                       static_cast<float>(event.height));
                 }
 
-                if (!m_renderer.Resize(event.width, event.height))
+                if(!m_renderer.Resize(event.width, event.height))
                 {
                     Log::Error("Renderer resize failed; requesting application shutdown.");
 
@@ -537,7 +656,7 @@ void Engine::Run()
 
     std::uint64_t diagnosticEngineSerial = 0;
 
-    while (!m_window.ShouldClose())
+    while(!m_window.ShouldClose())
     {
         const auto frameStart = CpuTiming::Clock::now();
         const double frameInterval =
@@ -561,7 +680,7 @@ void Engine::Run()
         }
         CpuTiming::FrameSample sample = m_renderer.GetCpuFrameTiming();
 
-        if (sample.submitted && (!hasPacingFrame || sample.frameSerial != lastPacingFrame))
+        if(sample.submitted && (!hasPacingFrame || sample.frameSerial != lastPacingFrame))
         {
             sample.frameStart = frameStart;
             sample.frameExecution = frameExecution;
@@ -573,7 +692,7 @@ void Engine::Run()
 
         // Skipped/minimized frames must not publish the previous Render sample again.
 
-        if (sample.valid && (!hasRecordedFrame || sample.frameSerial != lastRecordedFrame))
+        if(sample.valid && (!hasRecordedFrame || sample.frameSerial != lastRecordedFrame))
         {
             sample.frameInterval = frameInterval;
             sample.frameIntervalValid = intervalValid;
@@ -605,12 +724,12 @@ void Engine::Frame()
     m_window.ProcessMessages();
     inputProbe.reset();
 
-    if (m_window.ShouldClose())
+    if(m_window.ShouldClose())
     {
         return;
     }
 
-    if (m_window.GetWidth() == 0 || m_window.GetHeight() == 0)
+    if(m_window.GetWidth() == 0 || m_window.GetHeight() == 0)
     {
         m_window.WaitForMessage();
         // Exclude the suspended interval from the next simulation update.
@@ -622,7 +741,7 @@ void Engine::Frame()
 
     bool displacementCompletionDelivered = false;
 
-    if (Renderer::IsAsyncDisplacementEnabled())
+    if(Renderer::IsAsyncDisplacementEnabled())
     {
         Renderer::FrameHitchProbe completionProbe(
             m_renderer,
@@ -633,14 +752,14 @@ void Engine::Frame()
         // until this owner-aware delivery on the next update.
         const auto completion = m_renderer.ProcessDisplacementCompletion();
 
-        if (completion == Renderer::DisplacementCompletionStatus::Error)
+        if(completion == Renderer::DisplacementCompletionStatus::Error)
         {
             Log::Error("Asynchronous displacement completion failed; requesting shutdown.");
             m_window.Close();
             return;
         }
 
-        if (completion == Renderer::DisplacementCompletionStatus::Finalized)
+        if(completion == Renderer::DisplacementCompletionStatus::Finalized)
         {
             auto* mirrorScene = dynamic_cast<MirrorTestScene*>(&m_demoSceneManager.GetActiveScene());
 
@@ -775,6 +894,7 @@ void Engine::Frame()
                   static_cast<float>(m_window.GetHeight()), m_time.GetDeltaTime());
 
     ProcessEditorSceneRequests(activeDemo);
+    ProcessEditorMaterialRequests();
 
     activeDemo.Update(m_time.GetDeltaTime());
     if constexpr (Renderer::IsFrameHitchDiagnosticsEnabled())

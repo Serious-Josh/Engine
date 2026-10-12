@@ -13,6 +13,7 @@ public:
     std::filesystem::path GetMaterialsDirectory() const;
     std::filesystem::path GetMeshesDirectory() const;
     std::filesystem::path GetTexturesDirectory() const;
+    std::filesystem::path GetAssetRegistryPath() const;
 
     // Creates the standard project content directories.
     bool EnsureDirectories(std::string* errorMessage = nullptr) const;

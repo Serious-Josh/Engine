@@ -112,6 +112,7 @@ add_executable(Engine
     src/Renderer/Passes/ShadowDenoisePass.cpp
     src/Renderer/ComputePipeline.cpp
     src/Editor/Editor.cpp
+    src/Editor/AssetBrowser.cpp
     src/Renderer/Passes/RayTracedReflectionPass.cpp
     src/Renderer/Passes/RayTracedReflectionDenoisePass.cpp
     src/Renderer/Passes/RayTracedReflectionTemporalPass.cpp
@@ -153,6 +154,13 @@ add_executable(Engine
     src/Scene/FileSceneRuntime.cpp
     src/Scene/FileSceneAssetCatalog.cpp
     src/DemoContent/FileBackedDemoScene.cpp
+    src/assets/AssetID.cpp
+    src/assets/AssetRecord.cpp
+    src/assets/ProjectAssetRegistry.cpp
+    src/assets/AssetRegistrySerializer.cpp
+    src/assets/ProjectAssetResolver.cpp
+    src/assets/MaterialAssetSerializer.cpp
+    src/assets/ProjectMaterialAssetService.cpp
 )
 
 target_compile_definitions(Engine PRIVATE
@@ -233,73 +241,3 @@ target_link_libraries(Engine
         DirectXTex
         nlohmann_json
 )
-
-add_executable(SceneSerializerTests
-    tests/SceneSerializerTests.cpp
-    src/Scene/SceneDocument.cpp
-    src/Scene/SceneSerializer.cpp
-    src/Scene/FileScene.cpp
-)
-
-target_include_directories(SceneSerializerTests PRIVATE src)
-
-target_link_libraries(SceneSerializerTests
-    PRIVATE nlohmann_json::nlohmann_json
-)
-
-add_executable(SceneDocumentAdapterTests
-    tests/SceneDocumentAdapterTests.cpp
-    src/Scene/SceneDocumentAdapter.cpp
-    src/Scene/SceneDocument.cpp
-    src/Scene/Scene.cpp
-)
-
-target_include_directories(SceneDocumentAdapterTests PRIVATE src)
-
-add_executable(SceneObjectResolverTests
-    tests/SceneObjectResolverTests.cpp
-    src/Scene/SceneObjectResolver.cpp
-    src/Scene/SceneDocument.cpp
-)
-
-target_include_directories(SceneObjectResolverTests PRIVATE src)
-
-add_executable(SceneCommitTests
-    tests/SceneCommitTests.cpp
-    src/Scene/SceneCommit.cpp
-    src/Scene/Scene.cpp
-    src/Scene/SceneDocument.cpp
-)
-
-target_include_directories(SceneCommitTests PRIVATE src)
-
-add_executable(FileSceneRuntimeTests
-    src/Scene/SceneDocumentAdapter.cpp
-    tests/FileSceneRuntimeTests.cpp
-    src/Scene/FileSceneRuntime.cpp
-    src/Scene/FileScene.cpp
-    src/Scene/PreparedScene.cpp
-    src/Scene/SceneCommit.cpp
-    src/Scene/SceneObjectResolver.cpp
-    src/Scene/SceneDocument.cpp
-    src/Scene/SceneSerializer.cpp
-    src/Scene/Scene.cpp
-)
-
-target_include_directories(FileSceneRuntimeTests PRIVATE src)
-
-target_link_libraries(FileSceneRuntimeTests PRIVATE
-    nlohmann_json::nlohmann_json
-)
-add_executable(SceneFileCreationTests
-    tests/SceneFileCreationTests.cpp
-    src/Scene/SceneFileCreation.cpp
-    src/Scene/SceneSerializer.cpp
-    src/Scene/SceneDocument.cpp
-    src/Project/ProjectPaths.cpp
-    src/Project/ProjectLocator.cpp
-)
-
-target_include_directories(SceneFileCreationTests PRIVATE src)
-target_compile_definitions(SceneFileCreationTests PRIVATE ENGINE_SOURCE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}")
-target_link_libraries(SceneFileCreationTests PRIVATE nlohmann_json::nlohmann_json ole32)

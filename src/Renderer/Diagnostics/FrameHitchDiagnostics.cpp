@@ -86,6 +86,11 @@ void RendererDiagnostics::FrameHitchDiagnostics::Report(
     CpuTiming::Clock::time_point now,
     double hitchThresholdMilliseconds) const
 {
+    if (!loggingEnabled)
+    {
+        return;
+    }
+
     const auto describe = [hitchThresholdMilliseconds](const HitchSampleWindow& window)
     {
         if (window.count == 0)
