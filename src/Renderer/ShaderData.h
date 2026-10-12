@@ -159,6 +159,11 @@ struct GPUMaterial
     unsigned int armTextureIndex;
     unsigned int preferARM;
     uint32_t aoTextureIndex;
+
+    uint32_t surfaceDetailMode;
+    uint32_t heightTextureIndex;
+    float heightScale;
+    float heightBias;
 };
 
 struct RayTracingInstanceData
@@ -184,7 +189,7 @@ static_assert(offsetof(ReconstructionConstants, cameraPosition) == 64);
 static_assert(offsetof(ReconstructionConstants, geometricNormalIndex) == 76);
 static_assert(offsetof(ReconstructionConstants, motionIndex) == 80);
 static_assert(offsetof(ReconstructionConstants, padding) == 84);
-static_assert(sizeof(GPUMaterial) == 92);
+static_assert(sizeof(GPUMaterial) == 108);
 static_assert(offsetof(GPUMaterial, model) == 0);
 static_assert(offsetof(GPUMaterial, roughness) == 4);
 static_assert(offsetof(GPUMaterial, ior) == 8);
@@ -200,6 +205,10 @@ static_assert(offsetof(GPUMaterial, normalTextureIndex) == 76);
 static_assert(offsetof(GPUMaterial, armTextureIndex) == 80);
 static_assert(offsetof(GPUMaterial, preferARM) == 84);
 static_assert(offsetof(GPUMaterial, aoTextureIndex) == 88);
+static_assert(offsetof(GPUMaterial, surfaceDetailMode) == 92);
+static_assert(offsetof(GPUMaterial, heightTextureIndex) == 96);
+static_assert(offsetof(GPUMaterial, heightScale) == 100);
+static_assert(offsetof(GPUMaterial, heightBias) == 104);
 static_assert(sizeof(ShadowConstants) == 256);
 static_assert(sizeof(ReflectionConstants) == 160);
 static_assert(sizeof(RayTracingInstanceData) == 32);

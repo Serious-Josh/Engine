@@ -16,6 +16,13 @@ enum class MaterialModel
     Conductor
 };
 
+enum class SurfaceDetailMode : uint32_t
+{
+    NormalOnly = 0,
+    ParallaxOcclusion = 1,
+    GeometryWithParallaxFallback = 2
+};
+
 struct Material
 {
     Pipeline* pipeline = nullptr;
@@ -27,6 +34,12 @@ struct Material
 
     Texture* armTexture = nullptr;
     Texture* aoTexture = nullptr;
+    Texture* heightTexture = nullptr;
+
+    SurfaceDetailMode surfaceDetailMode = SurfaceDetailMode::NormalOnly;
+
+    float heightScale = 0.0f;
+    float heightBias = 0.0f;
 
     bool preferARM = true;
 
@@ -52,27 +65,18 @@ struct Material
         cosTheta = std::clamp(cosTheta, 0.0f, 1.0f);
 
         float cosThetaSquared = cosTheta * cosTheta;
-
         float sinThetaSquared = 1.0f - cosThetaSquared;
-
         float nSquared = n * n;
-
         float kSquared = k * k;
 
         float t0 = nSquared - kSquared - sinThetaSquared;
-
         float a2PlusB2 = std::sqrt(t0 * t0 + 4.0f * nSquared * kSquared);
-
         float t1 = a2PlusB2 + cosThetaSquared;
-
         float a = std::sqrt(0.5f * (a2PlusB2 + t0));
 
         float t2 = 2.0f * cosTheta * a;
-
         float Rs = (t1 - t2) / (t1 + t2);
-
         float t3 = cosThetaSquared * a2PlusB2 + sinThetaSquared * sinThetaSquared;
-
         float t4 = t2 * sinThetaSquared;
 
         float Rp = Rs * (t3 - t4) / (t3 + t4);
@@ -122,6 +126,11 @@ struct Material
         data.armTextureIndex = armTexture ? armTexture->GetDescriptorIndex() : UINT_MAX;
         data.preferARM = preferARM ? 1u : 0u;
         data.aoTextureIndex = aoTexture ? aoTexture->GetDescriptorIndex() : UINT_MAX;
+        data.surfaceDetailMode = static_cast<uint32_t>(surfaceDetailMode);
+
+        data.heightTextureIndex = heightTexture ? heightTexture->GetDescriptorIndex() : UINT_MAX;
+        data.heightScale = heightScale;
+        data.heightBias = heightBias;
 
         data.conductorN[0] = conductorN[0];
         data.conductorN[1] = conductorN[1];

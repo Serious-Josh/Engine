@@ -13,10 +13,10 @@ Engine is an in development game engine. The goal is to make an actually usable 
     - RT reflections
     - RTGI
     - RTAO
+- GPU-Driven Adaptive Displacement w/ DXR Support
 
 Future goals listed here:
 
-- Expanded material system
 - Mesh Shading System
 - Multi-threaded rendering
 - ReSTIR Path Tracing

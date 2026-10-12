@@ -2,6 +2,10 @@
 
 #include "BRDF.hlsli"
 
+static const uint SurfaceDetailModeNormalOnly = 0u;
+static const uint SurfaceDetailModeParallaxOcclusion = 1u;
+static const uint SurfaceDetailModeGeometryWithParallaxFallback = 2u;
+
 struct GPUMaterial
 {
     uint model;
@@ -23,6 +27,11 @@ struct GPUMaterial
     uint armTextureIndex;
     uint preferARM;
     uint aoTextureIndex;
+
+    uint surfaceDetailMode;
+    uint heightTextureIndex;
+    float heightScale;
+    float heightBias;
 };
 
 float3 EvaluateMetallicRoughnessDirectBRDF(
