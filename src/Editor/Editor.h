@@ -2,6 +2,8 @@
 
 #include "Scene/Transform.h"
 #include "AssetBrowser.h"
+#include "EditorWorkspace.h"
+#include "InspectorPanel.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -46,6 +48,12 @@ public:
 
     void SetSceneOperationPending(bool pending) noexcept;
     void OnSceneActivated();
+    void SuspendViewportInteraction();
+
+    bool IsWorkspaceSplitterDragging() const
+    {
+        return m_workspace.IsSplitterDragging();
+    }
     SceneChangeDecision DrawSceneChangeConfirmation(const std::string& error);
 
     // Taking a request clears it. Pending actions cannot be overwritten.
@@ -56,12 +64,18 @@ public:
         const std::filesystem::path& relativePath,
         const std::string& error);
 
+    const EditorWorkspaceRect& PrepareWorkspace(
+        IDemoScene& demoScene,
+        DemoSceneManager& sceneManager,
+        DebugUI& debugUI);
+
     void Draw(
         IDemoScene& demoScene,
         DemoSceneManager& sceneManager,
         DebugUI& debugUI,
-        float viewportWidth,
-        float viewportHeight,
+        std::uint64_t sceneTextureHandle,
+        unsigned int sceneWidth,
+        unsigned int sceneHeight,
         float deltaTime);
 
     size_t GetSelectedObject() const
@@ -75,6 +89,11 @@ public:
     }
 
 private:
+    void DrawSceneViewport(
+        std::uint64_t sceneTextureHandle,
+        unsigned int sceneWidth,
+        unsigned int sceneHeight);
+
     void DrawMainMenu(
         const IDemoScene& demoScene,
         DemoSceneManager& sceneManager,
@@ -84,9 +103,10 @@ private:
 
     bool m_sceneOperationPending = false;
     bool m_showEditorPanel = false;
-    bool m_showAssetBrowser = true;
 
     AssetBrowser m_assetBrowser;
+    EditorWorkspace m_workspace;
+    InspectorPanel m_inspectorPanel;
 
     static constexpr size_t InvalidObjectSelection = (std::numeric_limits<size_t>::max)();
 
@@ -100,6 +120,11 @@ private:
     GizmoMode m_gizmoMode = GizmoMode::Translate;
 
     bool m_cameraLooking = false;
+    bool m_viewportHovered = false;
+    bool m_viewportFocused = false;
+
+    EditorWorkspaceRect m_viewportImage;
+
 
     float m_cameraYaw = 0.0f;
     float m_cameraPitch = 0.0f;

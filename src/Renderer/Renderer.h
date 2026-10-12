@@ -148,6 +148,19 @@ class Renderer
         unsigned int width,
         unsigned int height);
 
+    struct FinalSceneImage
+    {
+        D3D12_GPU_DESCRIPTOR_HANDLE srv{};
+
+        unsigned int width = 0;
+        unsigned int height = 0;
+    };
+
+    // Borrowed descriptor: valid until checked renderer resize or shutdown, never owned by ImGui.
+    [[nodiscard]] bool TryGetFinalSceneImage(FinalSceneImage& image) const;
+
+    bool ResizeScene(unsigned int width, unsigned int height);
+
     ID3D12Device* GetDevice();
     ResourceUploader& GetResourceUploader();
     DescriptorHeap& GetResourceDescriptorHeap();
@@ -679,6 +692,15 @@ class Renderer
     bool m_hasPreviousRenderExecute = false;
     bool InitializeDevice();
     bool InitializeSwapChain(void* windowHandle);
+
+    // Private resize stages: called only after Resize() confirms the queue is idle.
+    bool ResizeApplicationResources(
+        unsigned int width,
+        unsigned int height);
+    bool ResizeSceneResources(
+        unsigned int width,
+        unsigned int height);
+
     void Draw(
         ID3D12GraphicsCommandList* commandList,
         const RenderObject& object,
@@ -776,8 +798,15 @@ class Renderer
 
     DebugUI m_debugUI;
 
-    unsigned int m_width = 0;
-    unsigned int m_height = 0;
+    unsigned int m_applicationWidth = 0;
+    unsigned int m_applicationHeight = 0;
+
+    // Zero denotes an invalid/incomplete scene resource extent after resize failure.
+    unsigned int m_sceneWidth = 0;
+    unsigned int m_sceneHeight = 0;
+
+    bool m_resizeFailed = false;
+
     unsigned int m_shadowSampleIndex = 0;
     unsigned int m_reflectionSampleIndex = 0;
     uint32_t m_nrdFrameIndex = 0;
@@ -795,6 +824,7 @@ class Renderer
     EnvironmentMap m_environment;
 
     RenderTarget m_sceneColor;
+    RenderTarget m_finalSceneColor;
     RenderTarget m_selectionMask;
 
     Texture m_brdfIntegrationLUT;

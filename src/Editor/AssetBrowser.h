@@ -7,11 +7,13 @@
 #include <string>
 #include <vector>
 
+struct EditorWorkspaceRect;
+
 class AssetBrowser
 {
 public:
     AssetBrowser();
-    void Draw(bool& visible);
+    void Draw(const EditorWorkspaceRect& rectangle);
 
     struct MaterialCreationRequest
     {
@@ -60,8 +62,6 @@ private:
     std::map<std::filesystem::path, Listing> m_listings;
 
     std::string m_error;
-
-    float m_panelHeight = 260.0f;
 
     std::optional<MaterialCreationRequest> m_materialRequest;
 

@@ -290,10 +290,6 @@ void DebugUI::DrawGpuTimingMonitor(const GpuTimestampProfiler::Results& results)
         }
     }
 
-    // Continue collecting even when this section is collapsed.
-
-    monitor.Update(results);
-
     if (!open)
     {
         return;
@@ -549,135 +545,141 @@ void DebugUI::DrawPerformanceWindow(
     const RendererStatistics& statistics)
 {
     ImGuiIO& io = ImGui::GetIO();
-
-    ImGui::SetNextWindowPos(ImVec2(10.0f, 10.0f), ImGuiCond_Always);
-    ImGui::SetNextWindowBgAlpha(0.35f);
-
-    ImGui::Begin("Performance", nullptr,
-                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings |
-                     ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoInputs);
-
-    ImGui::Text("%.1f FPS", io.Framerate);
-
-    if (io.Framerate > 0.0f)
-    {
-        ImGui::Text("%.2f ms (smoothed frame interval)", 1000.0f / io.Framerate);
-    }
-
-    ImGui::Separator();
-
-    ImGui::Text("Geometry draws: %llu", static_cast<unsigned long long>(statistics.geometryDrawCalls));
-
-    ImGui::Text("Triangles: %llu", static_cast<unsigned long long>(statistics.submittedTriangles));
-
-    ImGui::Text("Render objects: %llu", static_cast<unsigned long long>(statistics.renderObjectCount));
-
-    ImGui::Text("TLAS instances: %llu", static_cast<unsigned long long>(statistics.tlasInstanceCount));
-
-    ImGui::Separator();
-
     const GpuTimestampProfiler::Results& gpu = statistics.gpuTimings;
 
-    auto drawGpuTiming = [&](const char* name, GpuTimestampProfiler::Region region)
+    // Sample completed results independently of timing-window visibility.
+    m_gpuTimingMonitor.Update(gpu);
+
+    if(m_showPassTimings)
     {
-        const unsigned int index = static_cast<unsigned int>(region);
+        ImGui::SetNextWindowPos(ImVec2(20.0f, 40.0f), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(460.0f, 650.0f), ImGuiCond_FirstUseEver);
 
-        const uint32_t mask = 1u << index;
-
-        if ((gpu.validRegions & mask) != 0)
+        if(ImGui::Begin("Pass Timings", &m_showPassTimings))
         {
-            ImGui::Text("%s: %.3f ms", name, gpu.milliseconds[index]);
+            ImGui::Text("%.1f FPS", io.Framerate);
+
+            if (io.Framerate > 0.0f)
+            {
+                ImGui::Text("%.2f ms (smoothed frame interval)", 1000.0f / io.Framerate);
+            }
+
+            ImGui::Separator();
+
+            ImGui::Text("Geometry draws: %llu", static_cast<unsigned long long>(statistics.geometryDrawCalls));
+
+            ImGui::Text("Triangles: %llu", static_cast<unsigned long long>(statistics.submittedTriangles));
+
+            ImGui::Text("Render objects: %llu", static_cast<unsigned long long>(statistics.renderObjectCount));
+
+            ImGui::Text("TLAS instances: %llu", static_cast<unsigned long long>(statistics.tlasInstanceCount));
+
+            ImGui::Separator();
+
+
+            auto drawGpuTiming = [&](const char* name, GpuTimestampProfiler::Region region)
+            {
+                const unsigned int index = static_cast<unsigned int>(region);
+
+                const uint32_t mask = 1u << index;
+
+                if ((gpu.validRegions & mask) != 0)
+                {
+                    ImGui::Text("%s: %.3f ms", name, gpu.milliseconds[index]);
+                }
+                else
+                {
+                    ImGui::Text("%s: -- (inactive / unavailable)", name);
+                }
+            };
+
+            drawGpuTiming("GPU frame", GpuTimestampProfiler::Region::TotalFrame);
+
+            if (gpu.interFrameGapValid)
+            {
+                ImGui::Text("GPU inter-frame gap: %.3f ms", gpu.interFrameGapMilliseconds);
+            }
+            else
+            {
+                ImGui::Text("GPU inter-frame gap: -- (%s)",
+                            gpu.interFrameGapOutOfOrder ? "timestamp order error" : "unavailable");
+            }
+            if (gpu.interFrameGapSampleCount > 0)
+            {
+                ImGui::Text("  Last 120 valid: average %.3f ms | max %.3f ms", gpu.interFrameGapAverage,
+                            gpu.interFrameGapMaximum);
+            }
+            else
+            {
+                ImGui::TextUnformatted("  Last 120 valid: average -- | max --");
+            }
+            ImGui::TextUnformatted("  Timestamp boundary interval; not proven GPU idle time.");
+
+            ImGui::TextUnformatted("Geometry / scene");
+
+            drawGpuTiming("  TLAS update", GpuTimestampProfiler::Region::TlasUpdate);
+
+            drawGpuTiming("  Geometry", GpuTimestampProfiler::Region::Geometry);
+            drawGpuTiming("  Selection mask", GpuTimestampProfiler::Region::SelectionMask);
+
+            ImGui::TextUnformatted("Shadows");
+            drawGpuTiming("  RT shadows", GpuTimestampProfiler::Region::RayTracedShadows);
+
+            drawGpuTiming("  Shadow denoise", GpuTimestampProfiler::Region::ShadowDenoise);
+
+            ImGui::TextUnformatted("Ambient occlusion");
+            drawGpuTiming("  Ray-Traced AO", GpuTimestampProfiler::Region::RayTracedAO);
+            drawGpuTiming("  AO Temporal", GpuTimestampProfiler::Region::AOTemporal);
+            drawGpuTiming("  AO Denoise", GpuTimestampProfiler::Region::AODenoise);
+
+            ImGui::TextUnformatted("Reflections");
+            drawGpuTiming("  RT reflections", GpuTimestampProfiler::Region::RayTracedReflections);
+
+            drawGpuTiming("  Reflection limiter", GpuTimestampProfiler::Region::ReflectionContributionLimiter);
+            drawGpuTiming("  Native temporal", GpuTimestampProfiler::Region::ReflectionTemporal);
+            drawGpuTiming("  Native spatial denoise", GpuTimestampProfiler::Region::ReflectionDenoise);
+
+            drawGpuTiming("  NRD prepare", GpuTimestampProfiler::Region::NrdPrepare);
+
+            drawGpuTiming("  NRD REBLUR Specular", GpuTimestampProfiler::Region::NrdReblurSpecular);
+            drawGpuTiming("  NRD REBLUR Diffuse", GpuTimestampProfiler::Region::NrdReblurDiffuse);
+
+            const unsigned int specularIndex = static_cast<unsigned int>(GpuTimestampProfiler::Region::NrdReblurSpecular);
+            const unsigned int diffuseIndex = static_cast<unsigned int>(GpuTimestampProfiler::Region::NrdReblurDiffuse);
+            const uint32_t reblurMask = (1u << specularIndex) | (1u << diffuseIndex);
+
+            if ((gpu.validRegions & reblurMask) == reblurMask)
+            {
+                ImGui::Text("  NRD REBLUR: %.3f ms", gpu.milliseconds[specularIndex] + gpu.milliseconds[diffuseIndex]);
+            }
+            else
+            {
+                ImGui::TextUnformatted("  NRD REBLUR: -- (inactive / unavailable)");
+            }
+
+            drawGpuTiming("  NRD reflection resolve", GpuTimestampProfiler::Region::NrdResolve);
+
+            ImGui::TextUnformatted("Global illumination");
+            drawGpuTiming("  Ray-Traced GI", GpuTimestampProfiler::Region::RayTracedGI);
+            drawGpuTiming("  NRD diffuse resolve", GpuTimestampProfiler::Region::NrdDiffuseResolve);
+
+            drawGpuTiming("  GI spatial denoise", GpuTimestampProfiler::Region::GISpatialDenoise);
+
+            ImGui::TextUnformatted("Deferred lighting / presentation");
+            drawGpuTiming("  Deferred lighting", GpuTimestampProfiler::Region::DeferredLighting);
+
+            drawGpuTiming("  Tone map", GpuTimestampProfiler::Region::ToneMap);
+            drawGpuTiming("  DebugUI rendering", GpuTimestampProfiler::Region::DebugUI);
+
+            ImGui::Separator();
+
+            ImGui::Text("TLAS update %s", m_tlasUpdated ? "yes" : "no");
+            ImGui::Text("TLAS updates: %llu", static_cast<unsigned long long>(m_totalTLASUpdates));
+
         }
-        else
-        {
-            ImGui::Text("%s: -- (inactive / unavailable)", name);
-        }
-    };
 
-    drawGpuTiming("GPU frame", GpuTimestampProfiler::Region::TotalFrame);
-
-    if (gpu.interFrameGapValid)
-    {
-        ImGui::Text("GPU inter-frame gap: %.3f ms", gpu.interFrameGapMilliseconds);
+        ImGui::End();
     }
-    else
-    {
-        ImGui::Text("GPU inter-frame gap: -- (%s)",
-                    gpu.interFrameGapOutOfOrder ? "timestamp order error" : "unavailable");
-    }
-    if (gpu.interFrameGapSampleCount > 0)
-    {
-        ImGui::Text("  Last 120 valid: average %.3f ms | max %.3f ms", gpu.interFrameGapAverage,
-                    gpu.interFrameGapMaximum);
-    }
-    else
-    {
-        ImGui::TextUnformatted("  Last 120 valid: average -- | max --");
-    }
-    ImGui::TextUnformatted("  Timestamp boundary interval; not proven GPU idle time.");
-
-    ImGui::TextUnformatted("Geometry / scene");
-
-    drawGpuTiming("  TLAS update", GpuTimestampProfiler::Region::TlasUpdate);
-
-    drawGpuTiming("  Geometry", GpuTimestampProfiler::Region::Geometry);
-    drawGpuTiming("  Selection mask", GpuTimestampProfiler::Region::SelectionMask);
-
-    ImGui::TextUnformatted("Shadows");
-    drawGpuTiming("  RT shadows", GpuTimestampProfiler::Region::RayTracedShadows);
-
-    drawGpuTiming("  Shadow denoise", GpuTimestampProfiler::Region::ShadowDenoise);
-
-    ImGui::TextUnformatted("Ambient occlusion");
-    drawGpuTiming("  Ray-Traced AO", GpuTimestampProfiler::Region::RayTracedAO);
-    drawGpuTiming("  AO Temporal", GpuTimestampProfiler::Region::AOTemporal);
-    drawGpuTiming("  AO Denoise", GpuTimestampProfiler::Region::AODenoise);
-
-    ImGui::TextUnformatted("Reflections");
-    drawGpuTiming("  RT reflections", GpuTimestampProfiler::Region::RayTracedReflections);
-
-    drawGpuTiming("  Reflection limiter", GpuTimestampProfiler::Region::ReflectionContributionLimiter);
-    drawGpuTiming("  Native temporal", GpuTimestampProfiler::Region::ReflectionTemporal);
-    drawGpuTiming("  Native spatial denoise", GpuTimestampProfiler::Region::ReflectionDenoise);
-
-    drawGpuTiming("  NRD prepare", GpuTimestampProfiler::Region::NrdPrepare);
-
-    drawGpuTiming("  NRD REBLUR Specular", GpuTimestampProfiler::Region::NrdReblurSpecular);
-    drawGpuTiming("  NRD REBLUR Diffuse", GpuTimestampProfiler::Region::NrdReblurDiffuse);
-
-    const unsigned int specularIndex = static_cast<unsigned int>(GpuTimestampProfiler::Region::NrdReblurSpecular);
-    const unsigned int diffuseIndex = static_cast<unsigned int>(GpuTimestampProfiler::Region::NrdReblurDiffuse);
-    const uint32_t reblurMask = (1u << specularIndex) | (1u << diffuseIndex);
-
-    if ((gpu.validRegions & reblurMask) == reblurMask)
-    {
-        ImGui::Text("  NRD REBLUR: %.3f ms", gpu.milliseconds[specularIndex] + gpu.milliseconds[diffuseIndex]);
-    }
-    else
-    {
-        ImGui::TextUnformatted("  NRD REBLUR: -- (inactive / unavailable)");
-    }
-
-    drawGpuTiming("  NRD reflection resolve", GpuTimestampProfiler::Region::NrdResolve);
-
-    ImGui::TextUnformatted("Global illumination");
-    drawGpuTiming("  Ray-Traced GI", GpuTimestampProfiler::Region::RayTracedGI);
-    drawGpuTiming("  NRD diffuse resolve", GpuTimestampProfiler::Region::NrdDiffuseResolve);
-
-    drawGpuTiming("  GI spatial denoise", GpuTimestampProfiler::Region::GISpatialDenoise);
-
-    ImGui::TextUnformatted("Deferred lighting / presentation");
-    drawGpuTiming("  Deferred lighting", GpuTimestampProfiler::Region::DeferredLighting);
-
-    drawGpuTiming("  Tone map", GpuTimestampProfiler::Region::ToneMap);
-    drawGpuTiming("  DebugUI rendering", GpuTimestampProfiler::Region::DebugUI);
-
-    ImGui::Separator();
-
-    ImGui::Text("TLAS update %s", m_tlasUpdated ? "yes" : "no");
-    ImGui::Text("TLAS updates: %llu", static_cast<unsigned long long>(m_totalTLASUpdates));
-
-    ImGui::End();
 
     if (m_showRenderingSettings)
     {
@@ -925,6 +927,12 @@ void DebugUI::SetTLASUpdated(bool updated)
 
 void DebugUI::DrawMenu()
 {
+    if(ImGui::MenuItem("Pass Timings", nullptr, &m_showPassTimings) && m_showPassTimings)
+    {
+        ImGui::SetWindowFocus("Pass Timings");
+    }
+
+
     ImGui::MenuItem("Rendering Settings", nullptr, &m_showRenderingSettings);
     ImGui::Separator();
     ImGui::MenuItem("GPU Timing Graph", nullptr, &m_gpuTimingGraph.visible);

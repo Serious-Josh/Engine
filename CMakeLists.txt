@@ -112,6 +112,8 @@ add_executable(Engine
     src/Renderer/Passes/ShadowDenoisePass.cpp
     src/Renderer/ComputePipeline.cpp
     src/Editor/Editor.cpp
+    src/Editor/EditorWorkspace.cpp
+    src/Editor/InspectorPanel.cpp
     src/Editor/AssetBrowser.cpp
     src/Renderer/Passes/RayTracedReflectionPass.cpp
     src/Renderer/Passes/RayTracedReflectionDenoisePass.cpp

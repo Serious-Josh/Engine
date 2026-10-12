@@ -1,4 +1,5 @@
 #include "AssetBrowser.h"
+#include "EditorWorkspace.h"
 
 #include "Project/ProjectLocator.h"
 #include "Project/ProjectPaths.h"
@@ -486,70 +487,27 @@ void AssetBrowser::DrawContents()
     }
 }
 
-void AssetBrowser::Draw(bool& visible)
+void AssetBrowser::Draw(const EditorWorkspaceRect& rectangle)
 {
-    if (!visible)
+    if(rectangle.size.x <= 0.0f || rectangle.size.y <= 0.0f)
     {
         return;
     }
 
-    const auto* viewport = ImGui::GetMainViewport();
-
-    if (viewport->WorkSize.x <= 0.0f || viewport->WorkSize.y <= 0.0f)
-    {
-        return;
-    }
-
-    // Reserve at least 40% of the work area (and 180 pixels when possible)
-    // for the scene. Reduce the minimum panel height for very small windows.
-    const float maxHeight = (std::max)(1.0f,
-        (std::min)(viewport->WorkSize.y * 0.6f, viewport->WorkSize.y - 180.0f));
-    const float minHeight = (std::min)(140.0f, maxHeight);
-    m_panelHeight = (std::clamp)(m_panelHeight, minHeight, maxHeight);
-    const float splitterHeight = (std::min)(6.0f, m_panelHeight);
-
-    ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x,
-        viewport->WorkPos.y + viewport->WorkSize.y - m_panelHeight), ImGuiCond_Always);
-    ImGui::SetNextWindowSize(ImVec2(viewport->WorkSize.x, splitterHeight), ImGuiCond_Always);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+    ImGui::SetNextWindowPos(rectangle.position, ImGuiCond_Always);
+    ImGui::SetNextWindowSize(rectangle.size, ImGuiCond_Always);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowMinSize, ImVec2(1.0f, 1.0f));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
-    const ImGuiWindowFlags fixedFlags = ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize |
+    ImGuiWindowFlags fixedFlags = ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize |
         ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings;
 
-    if (ImGui::Begin("##AssetBrowserSplitter", nullptr, fixedFlags | ImGuiWindowFlags_NoTitleBar |
-        ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoNav))
+    // ImGui otherwise enforces title-bar height even when the assigned panel is smaller.
+    if(rectangle.size.y < ImGui::GetFrameHeight())
     {
-        ImGui::InvisibleButton("Height", ImVec2(viewport->WorkSize.x, splitterHeight));
-        const bool active = ImGui::IsItemActive();
-        const bool hovered = ImGui::IsItemHovered();
-
-        if (active || hovered)
-        {
-            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
-        }
-
-        const ImU32 color = ImGui::GetColorU32(active ? ImGuiCol_SeparatorActive :
-            hovered ? ImGuiCol_SeparatorHovered : ImGuiCol_Separator);
-        ImGui::GetWindowDrawList()->AddRectFilled(ImGui::GetItemRectMin(), ImGui::GetItemRectMax(), color);
-
-        if (active)
-        {
-            m_panelHeight = (std::clamp)(m_panelHeight - ImGui::GetIO().MouseDelta.y, minHeight, maxHeight);
-        }
+        fixedFlags |= ImGuiWindowFlags_NoTitleBar;
     }
 
-    ImGui::End();
-    ImGui::PopStyleVar(3);
-
-    ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x,
-        viewport->WorkPos.y + viewport->WorkSize.y - m_panelHeight + splitterHeight), ImGuiCond_Always);
-    ImGui::SetNextWindowSize(ImVec2(viewport->WorkSize.x,
-        (std::max)(1.0f, m_panelHeight - splitterHeight)), ImGuiCond_Always);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowMinSize, ImVec2(1.0f, 1.0f));
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
-
-    if (ImGui::Begin("Asset Browser", &visible, fixedFlags))
+    if(ImGui::Begin("Asset Browser", nullptr, fixedFlags))
     {
         if (ImGui::Button("Refresh"))
         {

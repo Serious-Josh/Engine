@@ -2449,8 +2449,10 @@ bool Renderer::Initialize(
     m_sceneResourceLifetime = 0;
     m_sceneResourceScene = nullptr;
 
-    m_width = width;
-    m_height = height;
+    m_applicationWidth = width;
+    m_applicationHeight = height;
+    m_sceneWidth = width;
+    m_sceneHeight = height;
 
     if (!InitializeDevice())
     {
@@ -2576,26 +2578,26 @@ bool Renderer::Initialize(
         return false;
     }
 
-    if (!m_rayTracedShadowPass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap, m_width,
-                                          m_height))
+    if (!m_rayTracedShadowPass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap, m_sceneWidth,
+                                          m_sceneHeight))
     {
         Log::Error("Faield to init ray traced shadow pass.");
         return false;
     }
 
-    if (!m_rayTracedReflectionPass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap, m_width,
-                                              m_height))
+    if (!m_rayTracedReflectionPass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap, m_sceneWidth,
+                                              m_sceneHeight))
     {
         Log::Error("Failed to init ray traced reflection pass.");
         return false;
     }
 
-    const uint32_t giWidth = (m_width + 1u) / 2u;
+    const uint32_t giWidth = (m_sceneWidth + 1u) / 2u;
 
-    const uint32_t giHeight = (m_height + 1u) / 2u;
+    const uint32_t giHeight = (m_sceneHeight + 1u) / 2u;
 
-    const uint32_t aoWidth = (m_width + 1u) / 2u;
-    const uint32_t aoHeight = (m_height + 1u) / 2u;
+    const uint32_t aoWidth = (m_sceneWidth + 1u) / 2u;
+    const uint32_t aoHeight = (m_sceneHeight + 1u) / 2u;
 
     if (!m_rayTracedGIPass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap, giWidth, giHeight))
     {
@@ -2624,14 +2626,14 @@ bool Renderer::Initialize(
         return false;
     }
 
-    if (!m_aoResolvePass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap, m_width, m_height))
+    if (!m_aoResolvePass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap, m_sceneWidth, m_sceneHeight))
     {
         Log::Error("Failed to initialize AO resolve pass.");
         return false;
     }
 
     if (!m_rayTracedReflectionTemporalPass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap,
-                                                      m_width, m_height))
+                                                      m_sceneWidth, m_sceneHeight))
     {
         Log::Error("Failed to init ray traced reflection temporal pass.");
 
@@ -2639,21 +2641,21 @@ bool Renderer::Initialize(
     }
 
     if (!m_rayTracedReflectionDenoisePass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap,
-                                                     m_width, m_height))
+                                                     m_sceneWidth, m_sceneHeight))
     {
         Log::Error("Failed to init ray traced reflection denoise pass.");
         return false;
     }
 
     if (!m_reflectionContributionLimitPass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap,
-                                                      m_width, m_height))
+                                                      m_sceneWidth, m_sceneHeight))
     {
         Log::Error("Failed to initialize reflection contribution limiter.");
         return false;
     }
 
-    if (!m_nrdReflectionPreparePass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap, m_width,
-                                               m_height))
+    if (!m_nrdReflectionPreparePass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap, m_sceneWidth,
+                                               m_sceneHeight))
     {
         Log::Error("Failed to initialize NRD reflection preparation pass.");
         return false;
@@ -2667,22 +2669,22 @@ bool Renderer::Initialize(
         return false;
     }
 
-    if (!m_nrdReflectionResolvePass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap, m_width,
-                                               m_height))
+    if (!m_nrdReflectionResolvePass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap, m_sceneWidth,
+                                               m_sceneHeight))
     {
         Log::Error("Failed to initialize NRD reflection resolve pass.");
         return false;
     }
 
-    if (!m_nrdDiffuseResolvePass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap, m_width,
-                                            m_height))
+    if (!m_nrdDiffuseResolvePass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap, m_sceneWidth,
+                                            m_sceneHeight))
     {
         Log::Error("Failed to initialize NRD diffuse resolve pass.");
         return false;
     }
 
-    if (!m_giSpatialDenoisePass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap, m_width,
-                                           m_height))
+    if (!m_giSpatialDenoisePass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap, m_sceneWidth,
+                                           m_sceneHeight))
     {
         Log::Error("Failed to init the ray traced GI spatial denoise pass.");
 
@@ -2690,7 +2692,7 @@ bool Renderer::Initialize(
     }
 
     if (!m_nrdReflectionDenoiser.Initialize(device, m_commandContext.GetCommandQueue(), m_resourceDescriptorHeap,
-                                            m_width, m_height, 2, NrdDenoiser::Signal::Specular))
+                                            m_sceneWidth, m_sceneHeight, 2, NrdDenoiser::Signal::Specular))
     {
         Log::Error("Failed to init NRD reflection denoiser.");
 
@@ -2714,7 +2716,7 @@ bool Renderer::Initialize(
               " MiB");
     Log::Info("NRD total memory: " + std::to_string(m_nrdReflectionDenoiser.GetTotalMemoryUsageInMb()) + " MiB");
 
-    if (!m_shadowDenoisePass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap, m_width, m_height))
+    if (!m_shadowDenoisePass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap, m_sceneWidth, m_sceneHeight))
     {
         Log::Error("Failed to init shadow denoise pass.");
 
@@ -2788,10 +2790,17 @@ bool Renderer::Initialize(
         return false;
     }
 
-    if (!m_sceneColor.Initialize(device, m_width, m_height, DXGI_FORMAT_R16G16B16A16_FLOAT, m_rtvDescriptorHeap,
+    if (!m_sceneColor.Initialize(device, m_sceneWidth, m_sceneHeight, DXGI_FORMAT_R16G16B16A16_FLOAT, m_rtvDescriptorHeap,
                                  m_resourceDescriptorHeap))
     {
         Log::Error("Failed to init HDR scene color");
+        return false;
+    }
+
+    if(!m_finalSceneColor.Initialize(device, m_sceneWidth, m_sceneHeight, DXGI_FORMAT_R8G8B8A8_UNORM,
+                                    m_rtvDescriptorHeap, m_resourceDescriptorHeap))
+    {
+        Log::Error("Failed to initialize final scene color.");
         return false;
     }
 
@@ -2809,14 +2818,14 @@ bool Renderer::Initialize(
         return false;
     }
 
-    if (!m_gBuffer.Initialize(device, m_width, m_height, m_rtvDescriptorHeap, m_dsvDescriptorHeap,
+    if (!m_gBuffer.Initialize(device, m_sceneWidth, m_sceneHeight, m_rtvDescriptorHeap, m_dsvDescriptorHeap,
                               m_resourceDescriptorHeap))
     {
         Log::Error("Failed to init G-Buffer.");
         return false;
     }
 
-    if (!m_selectionMask.Initialize(device, m_width, m_height, DXGI_FORMAT_R8_UNORM, m_rtvDescriptorHeap,
+    if (!m_selectionMask.Initialize(device, m_sceneWidth, m_sceneHeight, DXGI_FORMAT_R8_UNORM, m_rtvDescriptorHeap,
                                     m_resourceDescriptorHeap))
     {
         Log::Error("Failed to init selection mask.");
@@ -2828,6 +2837,7 @@ bool Renderer::Initialize(
         return false;
     }
 
+    m_resizeFailed = false;
     return true;
 }
 
@@ -2853,7 +2863,7 @@ bool Renderer::InitializeDevice()
 bool Renderer::InitializeSwapChain(void* windowHandle)
 {
     return m_swapChain.Initialize(m_graphicsDevice.GetFactory(), m_graphicsDevice.GetDevice(),
-                                  m_commandContext.GetCommandQueue(), windowHandle, m_width, m_height);
+                                  m_commandContext.GetCommandQueue(), windowHandle, m_applicationWidth, m_applicationHeight);
 }
 
 // Resize and geometry drawing
@@ -2862,29 +2872,96 @@ bool Renderer::Resize(
     unsigned int height)
 {
     m_gpuTimestampProfiler.BreakFrameSequence();
-
     ResetCpuSubmissionCadence();
 
-    if (width == 0 || height == 0)
+    if(m_resizeFailed)
+    {
+        return false;
+    }
+
+    if(width == 0 || height == 0)
     {
         return true;
     }
 
-    if (!m_commandContext.WaitForGPU())
+    if(!m_commandContext.WaitForGPU())
     {
+        m_resizeFailed = true;
         Log::Error("Failed to confirm GPU completion before resize.");
-
         return false;
     }
 
-    if (!m_swapChain.Resize(width, height))
+    // In-place recreation is not transactional. Keep rendering disabled until both stages succeed.
+    m_resizeFailed = true;
+
+    if(!ResizeApplicationResources(width, height))
+    {
+        return false;
+    }
+
+    m_resizeFailed = false;
+    return true;
+}
+
+bool Renderer::ResizeScene(unsigned int width, unsigned int height)
+{
+    if(m_resizeFailed || m_activeRecordingGeneration != 0 || m_displacementExitScopeGeneration != 0)
+    {
+        return false;
+    }
+
+    if(width == 0 || height == 0 || (width == m_sceneWidth && height == m_sceneHeight))
+    {
+        return true;
+    }
+
+    m_gpuTimestampProfiler.BreakFrameSequence();
+    ResetCpuSubmissionCadence();
+    m_resizeFailed = true;
+
+    if(!m_commandContext.WaitForGPU())
+    {
+        Log::Error("Failed to confirm GPU completion before scene resize.");
+        return false;
+    }
+
+    if(!ResizeSceneResources(width, height))
+    {
+        return false;
+    }
+
+    m_resizeFailed = false;
+    return true;
+}
+
+bool Renderer::ResizeApplicationResources(
+    unsigned int width,
+    unsigned int height)
+{
+    // ResizeBuffers or view creation can fail after destroying the previous backbuffers.
+    m_applicationWidth = 0;
+    m_applicationHeight = 0;
+
+    if(!m_swapChain.Resize(width, height))
     {
         Log::Error("Failed to resize swap chain.");
-
         return false;
     }
 
-    if (!m_gBuffer.Resize(m_graphicsDevice.GetDevice(), width, height, m_rtvDescriptorHeap, m_dsvDescriptorHeap,
+    m_applicationWidth = width;
+    m_applicationHeight = height;
+    return true;
+}
+
+bool Renderer::ResizeSceneResources(
+    unsigned int width,
+    unsigned int height)
+{
+    // No coherent scene extent is published while resources are partially recreated.
+    m_sceneWidth = 0;
+    m_sceneHeight = 0;
+
+    if(!m_gBuffer.Resize(m_graphicsDevice.GetDevice(), width, height, m_rtvDescriptorHeap, m_dsvDescriptorHeap,
                           m_resourceDescriptorHeap))
     {
         Log::Error("Failed to resize G-Buffer.");
@@ -2892,14 +2969,14 @@ bool Renderer::Resize(
         return false;
     }
 
-    if (!m_rayTracedShadowPass.Resize(m_graphicsDevice.GetDevice(), m_resourceDescriptorHeap, width, height))
+    if(!m_rayTracedShadowPass.Resize(m_graphicsDevice.GetDevice(), m_resourceDescriptorHeap, width, height))
     {
         Log::Error("Failed to resize ray traced shadow pass.");
 
         return false;
     }
 
-    if (!m_rayTracedReflectionPass.Resize(m_graphicsDevice.GetDevice(), m_resourceDescriptorHeap, width, height))
+    if(!m_rayTracedReflectionPass.Resize(m_graphicsDevice.GetDevice(), m_resourceDescriptorHeap, width, height))
     {
         Log::Error("Failed to resize ray traced reflection pass.");
 
@@ -2912,44 +2989,44 @@ bool Renderer::Resize(
     const uint32_t aoWidth = (width + 1u) / 2u;
     const uint32_t aoHeight = (height + 1u) / 2u;
 
-    if (m_giSignedCorrectionInitialized &&
+    if(m_giSignedCorrectionInitialized &&
 
         !m_giSignedCorrectionPass.Resize(m_graphicsDevice, m_resourceDescriptorHeap, width, height))
     {
         return false;
     }
 
-    if (!m_rayTracedGIPass.Resize(m_graphicsDevice.GetDevice(), m_resourceDescriptorHeap, giWidth, giHeight))
+    if(!m_rayTracedGIPass.Resize(m_graphicsDevice.GetDevice(), m_resourceDescriptorHeap, giWidth, giHeight))
     {
         Log::Error("Failed to resize ray traced GI pass.");
         return false;
     }
 
-    if (!m_rayTracedAOPass.Resize(m_graphicsDevice.GetDevice(), m_resourceDescriptorHeap, aoWidth, aoHeight))
+    if(!m_rayTracedAOPass.Resize(m_graphicsDevice.GetDevice(), m_resourceDescriptorHeap, aoWidth, aoHeight))
     {
         Log::Error("Failed to resize ray traced AO pass.");
         return false;
     }
 
-    if (!m_aoTemporalPass.Resize(m_graphicsDevice, m_resourceDescriptorHeap, aoWidth, aoHeight))
+    if(!m_aoTemporalPass.Resize(m_graphicsDevice, m_resourceDescriptorHeap, aoWidth, aoHeight))
     {
         Log::Error("Failed to resize AO temporal pass.");
         return false;
     }
 
-    if (!m_aoDenoisePass.Resize(m_graphicsDevice, m_resourceDescriptorHeap, aoWidth, aoHeight))
+    if(!m_aoDenoisePass.Resize(m_graphicsDevice, m_resourceDescriptorHeap, aoWidth, aoHeight))
     {
         Log::Error("Failed to resize AO denoise pass.");
         return false;
     }
 
-    if (!m_aoResolvePass.Resize(m_graphicsDevice, m_resourceDescriptorHeap, width, height))
+    if(!m_aoResolvePass.Resize(m_graphicsDevice, m_resourceDescriptorHeap, width, height))
     {
         Log::Error("Failed to resize AO resolve pass.");
         return false;
     }
 
-    if (!m_rayTracedReflectionTemporalPass.Resize(m_graphicsDevice.GetDevice(), m_resourceDescriptorHeap, width,
+    if(!m_rayTracedReflectionTemporalPass.Resize(m_graphicsDevice.GetDevice(), m_resourceDescriptorHeap, width,
                                                   height))
     {
         Log::Error("Failed to resize ray traced reflection temporal pass.");
@@ -2957,49 +3034,49 @@ bool Renderer::Resize(
         return false;
     }
 
-    if (!m_reflectionContributionLimitPass.Resize(m_graphicsDevice, m_resourceDescriptorHeap, width, height))
+    if(!m_reflectionContributionLimitPass.Resize(m_graphicsDevice, m_resourceDescriptorHeap, width, height))
     {
         Log::Error("Failed to resize reflection contribution limiter.");
         return false;
     }
 
-    if (!m_nrdReflectionPreparePass.Resize(m_graphicsDevice, m_resourceDescriptorHeap, width, height))
+    if(!m_nrdReflectionPreparePass.Resize(m_graphicsDevice, m_resourceDescriptorHeap, width, height))
     {
         Log::Error("Failed to resize NRD reflection preparation pass.");
         return false;
     }
 
-    if (!m_nrdGIPreparePass.Resize(m_graphicsDevice, m_resourceDescriptorHeap, giWidth, giHeight))
+    if(!m_nrdGIPreparePass.Resize(m_graphicsDevice, m_resourceDescriptorHeap, giWidth, giHeight))
     {
         Log::Error("Failed to resize NRD GI preparation pass.");
         return false;
     }
 
-    if (!m_nrdReflectionResolvePass.Resize(m_graphicsDevice, m_resourceDescriptorHeap, width, height))
+    if(!m_nrdReflectionResolvePass.Resize(m_graphicsDevice, m_resourceDescriptorHeap, width, height))
     {
         Log::Error("Failed to resize NRD reflection resolve pass.");
         return false;
     }
 
-    if (!m_nrdDiffuseResolvePass.Resize(m_graphicsDevice, m_resourceDescriptorHeap, width, height))
+    if(!m_nrdDiffuseResolvePass.Resize(m_graphicsDevice, m_resourceDescriptorHeap, width, height))
     {
         Log::Error("Failed to resize NRD diffuse resolve pass.");
         return false;
     }
 
-    if (!m_giSpatialDenoisePass.Resize(m_graphicsDevice, m_resourceDescriptorHeap, width, height))
+    if(!m_giSpatialDenoisePass.Resize(m_graphicsDevice, m_resourceDescriptorHeap, width, height))
     {
         Log::Error("Failed to resize gi spatial denoise pass.");
         return false;
     }
 
-    if (!m_nrdReflectionDenoiser.Resize(m_resourceDescriptorHeap, width, height))
+    if(!m_nrdReflectionDenoiser.Resize(m_resourceDescriptorHeap, width, height))
     {
         Log::Error("Failed to resize NRD reflection denoiser.");
         return false;
     }
 
-    if (!m_nrdGIDenoiser.Resize(m_resourceDescriptorHeap, giWidth, giHeight))
+    if(!m_nrdGIDenoiser.Resize(m_resourceDescriptorHeap, giWidth, giHeight))
     {
 
         Log::Error("Failed to resize NRD diffuse GI denoiser.");
@@ -3008,13 +3085,13 @@ bool Renderer::Resize(
 
     m_hasPreviousNrdCamera = false;
 
-    if (!m_rayTracedReflectionDenoisePass.Resize(m_graphicsDevice, m_resourceDescriptorHeap, width, height))
+    if(!m_rayTracedReflectionDenoisePass.Resize(m_graphicsDevice, m_resourceDescriptorHeap, width, height))
     {
         Log::Error("Failed to resize ray traced reflection denoise pass.");
         return false;
     }
 
-    if (!m_shadowDenoisePass.Resize(m_graphicsDevice, m_resourceDescriptorHeap, width, height))
+    if(!m_shadowDenoisePass.Resize(m_graphicsDevice, m_resourceDescriptorHeap, width, height))
     {
         Log::Error("Failed to resize shadow denoise pass.");
         return false;
@@ -3022,7 +3099,7 @@ bool Renderer::Resize(
 
     m_sceneColor.Shutdown();
 
-    if (!m_sceneColor.Initialize(m_graphicsDevice.GetDevice(), width, height, DXGI_FORMAT_R16G16B16A16_FLOAT,
+    if(!m_sceneColor.Initialize(m_graphicsDevice.GetDevice(), width, height, DXGI_FORMAT_R16G16B16A16_FLOAT,
                                  m_rtvDescriptorHeap, m_resourceDescriptorHeap))
     {
         Log::Error("Failed to resize HDR scene color.");
@@ -3032,7 +3109,7 @@ bool Renderer::Resize(
 
     m_selectionMask.Shutdown();
 
-    if (!m_selectionMask.Initialize(m_graphicsDevice.GetDevice(), width, height, DXGI_FORMAT_R8_UNORM,
+    if(!m_selectionMask.Initialize(m_graphicsDevice.GetDevice(), width, height, DXGI_FORMAT_R8_UNORM,
                                     m_rtvDescriptorHeap, m_resourceDescriptorHeap))
     {
 
@@ -3040,8 +3117,17 @@ bool Renderer::Resize(
         return false;
     }
 
-    m_width = width;
-    m_height = height;
+    m_finalSceneColor.Shutdown();
+
+    if(!m_finalSceneColor.Initialize(m_graphicsDevice.GetDevice(), width, height, DXGI_FORMAT_R8G8B8A8_UNORM,
+                                    m_rtvDescriptorHeap, m_resourceDescriptorHeap))
+    {
+        Log::Error("Failed to resize final scene color.");
+        return false;
+    }
+
+    m_sceneWidth = width;
+    m_sceneHeight = height;
     return true;
 }
 
@@ -4075,6 +4161,11 @@ Renderer::FrameRenderResult Renderer::Render(
     const Scene& scene,
     const RendererOptions& options)
 {
+    if(m_resizeFailed || m_applicationWidth == 0 || m_applicationHeight == 0)
+    {
+        return FrameRenderResult::Error;
+    }
+
     if (m_sceneInitializationAttempt.candidate)
     {
         return FrameRenderResult::Error;
@@ -4135,6 +4226,14 @@ bool Renderer::RecordRenderFrame(
     const Scene& scene,
     const RendererOptions& options)
 {
+    FinalSceneImage finalImage{};
+
+    if(!TryGetFinalSceneImage(finalImage) || !m_swapChain.GetCurrentBackBuffer())
+    {
+        Log::Error("Scene presentation requires a valid final texture and application backbuffer.");
+        return false;
+    }
+
     std::optional<FrameHitchProbe> validationProbe;
     if constexpr (kEnableFrameHitchDiagnostics)
     {
@@ -4224,8 +4323,8 @@ bool Renderer::RecordRenderFrame(
 
     if (runSignedCorrection && !m_giSignedCorrectionInitialized)
     {
-        if (!m_giSignedCorrectionPass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap, m_width,
-                                                 m_height))
+        if (!m_giSignedCorrectionPass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap, m_sceneWidth,
+                                                 m_sceneHeight))
         {
             return false;
         }
@@ -4669,8 +4768,8 @@ bool Renderer::RecordRenderFrame(
     giConstants.surfaceIndex = m_gBuffer.GetSurface().GetSRVIndex();
 
     giConstants.geometricNormalIndex = m_gBuffer.GetGeometricNormal().GetSRVIndex();
-    giConstants.fullResolution[0] = m_width;
-    giConstants.fullResolution[1] = m_height;
+    giConstants.fullResolution[0] = m_sceneWidth;
+    giConstants.fullResolution[1] = m_sceneHeight;
     giConstants.frameIndex = reflectionConstants.frameIndex;
 
     giConstants.instanceDataIndex = reflectionConstants.instanceDataIndex;
@@ -4714,9 +4813,9 @@ bool Renderer::RecordRenderFrame(
     D3D12_VIEWPORT viewport{};
     viewport.TopLeftX = 0.0f;
     viewport.TopLeftY = 0.0f;
-    viewport.Width = static_cast<float>(m_width);
+    viewport.Width = static_cast<float>(m_sceneWidth);
 
-    viewport.Height = static_cast<float>(m_height);
+    viewport.Height = static_cast<float>(m_sceneHeight);
     viewport.MinDepth = 0.0f;
     viewport.MaxDepth = 1.0f;
 
@@ -4725,9 +4824,9 @@ bool Renderer::RecordRenderFrame(
     D3D12_RECT scissor{};
     scissor.left = 0;
     scissor.top = 0;
-    scissor.right = static_cast<LONG>(m_width);
+    scissor.right = static_cast<LONG>(m_sceneWidth);
 
-    scissor.bottom = static_cast<LONG>(m_height);
+    scissor.bottom = static_cast<LONG>(m_sceneHeight);
 
     commandList->RSSetScissorRects(1, &scissor);
 
@@ -4779,8 +4878,8 @@ bool Renderer::RecordRenderFrame(
 
     EndGeometryPass(commandList);
 
-    const uint32_t aoWidth = (m_width + 1u) / 2u;
-    const uint32_t aoHeight = (m_height + 1u) / 2u;
+    const uint32_t aoWidth = (m_sceneWidth + 1u) / 2u;
+    const uint32_t aoHeight = (m_sceneHeight + 1u) / 2u;
 
     if (runAO)
     {
@@ -4830,13 +4929,13 @@ bool Renderer::RecordRenderFrame(
         m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::AODenoise);
 
         m_aoResolvePass.Execute(commandList, m_aoDenoisePass.GetFilteredAOTexture(), m_gBuffer.GetDepth(),
-                                m_gBuffer.GetSurface(), m_uploadBuffer, m_width, m_height);
+                                m_gBuffer.GetSurface(), m_uploadBuffer, m_sceneWidth, m_sceneHeight);
     }
 
     m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::RayTracedShadows);
 
     m_rayTracedShadowPass.Execute(m_commandContext.GetRayTracingCommandList(), m_resourceDescriptorHeap,
-                                  m_rayTracingScene, shadowConstantsAddress, m_width, m_height);
+                                  m_rayTracingScene, shadowConstantsAddress, m_sceneWidth, m_sceneHeight);
 
     m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::RayTracedShadows);
 
@@ -4855,13 +4954,13 @@ bool Renderer::RecordRenderFrame(
     m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::RayTracedReflections);
 
     m_rayTracedReflectionPass.Execute(m_commandContext.GetRayTracingCommandList(), m_resourceDescriptorHeap,
-                                      m_rayTracingScene, reflectionConstantsAddress, lightConstantsAddress, m_width,
-                                      m_height);
+                                      m_rayTracingScene, reflectionConstantsAddress, lightConstantsAddress, m_sceneWidth,
+                                      m_sceneHeight);
 
     m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::RayTracedReflections);
 
-    const uint32_t giWidth = (m_width + 1u) / 2u;
-    const uint32_t giHeight = (m_height + 1u) / 2u;
+    const uint32_t giWidth = (m_sceneWidth + 1u) / 2u;
+    const uint32_t giHeight = (m_sceneHeight + 1u) / 2u;
 
     m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::RayTracedGI);
 
@@ -4960,7 +5059,7 @@ bool Renderer::RecordRenderFrame(
                                                GpuTimestampProfiler::Region::ReflectionContributionLimiter);
 
             const bool limited =
-                m_reflectionContributionLimitPass.Execute(commandList, *nrdInput, m_uploadBuffer, m_width, m_height);
+                m_reflectionContributionLimitPass.Execute(commandList, *nrdInput, m_uploadBuffer, m_sceneWidth, m_sceneHeight);
             m_gpuTimestampProfiler.EndRegion(commandList, frameIndex,
                                              GpuTimestampProfiler::Region::ReflectionContributionLimiter);
 
@@ -4978,11 +5077,11 @@ bool Renderer::RecordRenderFrame(
         m_nrdReflectionPreparePass.ExecuteReflections(
             commandList, m_gBuffer, *nrdInput, m_rayTracedReflectionPass.GetSpecularTrackingDistanceTexture(),
             m_uploadBuffer, reconstructionConstants.inverseViewProjection, currentView,
-            m_materialBuffer.GetDescriptorIndex(), m_width, m_height, nrdDenoisingRange);
+            m_materialBuffer.GetDescriptorIndex(), m_sceneWidth, m_sceneHeight, nrdDenoisingRange);
 
         m_nrdGIPreparePass.ExecuteGI(commandList, m_gBuffer, *giNrdInput, m_rayTracedGIPass.GetHitDistanceTexture(),
                                      m_uploadBuffer, reconstructionConstants.inverseViewProjection, currentView,
-                                     m_materialBuffer.GetDescriptorIndex(), m_width, m_height, giWidth, giHeight,
+                                     m_materialBuffer.GetDescriptorIndex(), m_sceneWidth, m_sceneHeight, giWidth, giHeight,
                                      nrdDenoisingRange);
 
         m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::NrdPrepare);
@@ -5010,20 +5109,20 @@ bool Renderer::RecordRenderFrame(
 
         m_nrdReflectionResolvePass.Execute(commandList, m_gBuffer, m_nrdReflectionDenoiser.GetOutputTexture(),
                                            m_uploadBuffer, reconstructionConstants.inverseViewProjection, currentView,
-                                           m_materialBuffer.GetDescriptorIndex(), m_width, m_height);
+                                           m_materialBuffer.GetDescriptorIndex(), m_sceneWidth, m_sceneHeight);
 
         m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::NrdResolve);
 
         m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::NrdDiffuseResolve);
         m_nrdDiffuseResolvePass.Execute(commandList, m_gBuffer, m_nrdGIDenoiser.GetDiffuseOutputTexture(),
-                                        m_nrdGIPreparePass.GetViewZTexture(), m_uploadBuffer, m_width, m_height,
+                                        m_nrdGIPreparePass.GetViewZTexture(), m_uploadBuffer, m_sceneWidth, m_sceneHeight,
                                         nrdDenoisingRange);
 
         m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::NrdDiffuseResolve);
 
         m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::GISpatialDenoise);
         m_giSpatialDenoisePass.Execute(commandList, m_gBuffer, m_nrdDiffuseResolvePass.GetOutputTexture(),
-                                       m_uploadBuffer, m_width, m_height);
+                                       m_uploadBuffer, m_sceneWidth, m_sceneHeight);
         m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::GISpatialDenoise);
     }
 
@@ -5038,15 +5137,15 @@ bool Renderer::RecordRenderFrame(
         m_rayTracedReflectionTemporalPass.Execute(commandList, m_rayTracedReflectionPass.GetRawReflectionTexture(),
                                                   m_gBuffer, m_uploadBuffer, reflectionConstants.inverseViewProjection,
                                                   shadowConstants.previousViewProjection,
-                                                  shadowConstants.previousInverseViewProjection, m_width, m_height);
+                                                  shadowConstants.previousInverseViewProjection, m_sceneWidth, m_sceneHeight);
 
         m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::ReflectionTemporal);
 
         m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::ReflectionDenoise);
         m_rayTracedReflectionDenoisePass.Execute(commandList, m_rayTracedReflectionTemporalPass.GetReflectionTexture(),
                                                  m_rayTracedReflectionPass.GetHitDistanceTexture(), m_gBuffer,
-                                                 m_uploadBuffer, reflectionConstants.inverseViewProjection, m_width,
-                                                 m_height);
+                                                 m_uploadBuffer, reflectionConstants.inverseViewProjection, m_sceneWidth,
+                                                 m_sceneHeight);
         m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::ReflectionDenoise);
     }
 
@@ -5057,7 +5156,7 @@ bool Renderer::RecordRenderFrame(
     m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::ShadowDenoise);
 
     m_shadowDenoisePass.Execute(commandList, m_rayTracedShadowPass.GetVisibilityTexture(), m_gBuffer, m_uploadBuffer,
-                                reconstructionConstants.inverseViewProjection, m_width, m_height);
+                                reconstructionConstants.inverseViewProjection, m_sceneWidth, m_sceneHeight);
 
     m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::ShadowDenoise);
 
@@ -5145,12 +5244,19 @@ bool Renderer::RecordRenderFrame(
 
     m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::ToneMap);
 
-    m_toneMapPass.Execute(commandList, m_sceneColor, rtvHandle, debugTexture, debugView, nrdDenoisingRange,
+    m_finalSceneColor.Transition(commandList, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    m_toneMapPass.Execute(commandList, m_sceneColor, m_finalSceneColor.GetRTV(), debugTexture, debugView, nrdDenoisingRange,
                           debugRenderTarget, &m_selectionMask, options.selectionOutlineColor,
                           debugView == ToneMapDebugView::None ? options.selectionOutlineThickness : 0,
                           m_gBuffer.GetDepth().GetSRVIndex());
 
     m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::ToneMap);
+
+    m_finalSceneColor.Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+
+    // UI composes the scene image onto a clean application-sized background.
+    commandList->ClearRenderTargetView(rtvHandle, clearColor, 0, nullptr);
+    commandList->OMSetRenderTargets(1, &rtvHandle, FALSE, nullptr);
 
     ordinaryProbe.reset();
     m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::DebugUI);
@@ -5410,6 +5516,7 @@ void Renderer::Shutdown()
     m_uploadBuffer.Shutdown();
     m_environment.Shutdown();
     m_sceneColor.Shutdown();
+    m_finalSceneColor.Shutdown();
     m_selectionMask.Shutdown();
 
     m_brdfIntegrationLUT.Shutdown();
@@ -5886,6 +5993,27 @@ bool Renderer::DrainAndResolveSceneDisplacement(
 bool Renderer::WaitForGPU()
 {
     return m_commandContext.WaitForGPU();
+}
+
+bool Renderer::TryGetFinalSceneImage(FinalSceneImage& image) const
+{
+    image = {};
+
+    if(m_resizeFailed || !m_finalSceneColor.GetResource() || m_finalSceneColor.GetSRVIndex() == UINT_MAX)
+    {
+        return false;
+    }
+
+    if(m_sceneWidth == 0 || m_sceneHeight == 0 ||
+       m_finalSceneColor.GetWidth() != m_sceneWidth || m_finalSceneColor.GetHeight() != m_sceneHeight)
+    {
+        return false;
+    }
+
+    image.srv = m_resourceDescriptorHeap.GetGPUHandle(m_finalSceneColor.GetSRVIndex());
+    image.width = m_sceneWidth;
+    image.height = m_sceneHeight;
+    return true;
 }
 
 ID3D12Device* Renderer::GetDevice()

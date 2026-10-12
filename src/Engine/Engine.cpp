@@ -731,6 +731,7 @@ void Engine::Frame()
 
     if(m_window.GetWidth() == 0 || m_window.GetHeight() == 0)
     {
+        m_editor.SuspendViewportInteraction();
         m_window.WaitForMessage();
         // Exclude the suspended interval from the next simulation update.
         m_time.Update();
@@ -883,15 +884,65 @@ void Engine::Frame()
     }
 
     debugUI.BeginFrame();
-    debugUI.DrawPerformanceWindow(environmentNames, m_renderer.GetCurrentEnvironmentIndex(),
-                                  m_renderer.GetStatistics());
 
     IDemoScene& activeDemo = m_demoSceneManager.GetActiveScene();
 
     m_editor.SetSceneOperationPending(m_pendingEditorSceneOperation.has_value() ||
                                       m_demoSceneManager.HasPendingSceneChange());
-    m_editor.Draw(activeDemo, m_demoSceneManager, debugUI, static_cast<float>(m_window.GetWidth()),
-                  static_cast<float>(m_window.GetHeight()), m_time.GetDeltaTime());
+    const auto& viewportRectangle = m_editor.PrepareWorkspace(activeDemo, m_demoSceneManager, debugUI);
+    const ImVec2 framebufferScale = ImGui::GetIO().DisplayFramebufferScale;
+
+    if(viewportRectangle.size.x <= 0.0f || viewportRectangle.size.y <= 0.0f)
+    {
+        m_editor.SuspendViewportInteraction();
+        ImGui::EndFrame();
+        return;
+    }
+
+    const auto renderPixels = [](float logical, float scale) -> unsigned int
+    {
+        const double pixels = static_cast<double>(logical) * static_cast<double>(scale);
+
+        if(!std::isfinite(pixels) || pixels <= 0.0)
+        {
+            return 0;
+        }
+
+        return static_cast<unsigned int>((std::clamp)(std::floor(pixels), 1.0, 16384.0));
+    };
+    const unsigned int sceneWidth = renderPixels(viewportRectangle.size.x, framebufferScale.x);
+    const unsigned int sceneHeight = renderPixels(viewportRectangle.size.y, framebufferScale.y);
+
+    // Coalesce splitter movement without storing a potentially stale pending extent.
+    // The release frame always uses the latest finalized layout.
+    const bool resizeScene = !m_editor.IsWorkspaceSplitterDragging();
+
+    if(sceneWidth == 0 || sceneHeight == 0 || (resizeScene && !m_renderer.ResizeScene(sceneWidth, sceneHeight)))
+    {
+        Log::Error("Scene viewport resize failed; requesting application shutdown.");
+        ImGui::EndFrame();
+        m_window.Close();
+        return;
+    }
+
+    Renderer::FinalSceneImage finalSceneImage{};
+
+    if(!m_renderer.TryGetFinalSceneImage(finalSceneImage))
+    {
+        Log::Error("Final scene image is unavailable; requesting application shutdown.");
+        m_window.Close();
+        return;
+    }
+
+    // During dragging the camera follows the retained texture extent, not the requested layout extent.
+    m_demoSceneManager.SetAspectRatio(static_cast<float>(finalSceneImage.width) /
+                                    static_cast<float>(finalSceneImage.height));
+
+    m_editor.Draw(activeDemo, m_demoSceneManager, debugUI, finalSceneImage.srv.ptr,
+                  finalSceneImage.width, finalSceneImage.height, m_time.GetDeltaTime());
+
+    debugUI.DrawPerformanceWindow(environmentNames, m_renderer.GetCurrentEnvironmentIndex(),
+                                  m_renderer.GetStatistics());
 
     ProcessEditorSceneRequests(activeDemo);
     ProcessEditorMaterialRequests();

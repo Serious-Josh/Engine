@@ -363,7 +363,8 @@ void Editor::DrawMainMenu(
     if (ImGui::BeginMenu("Editor"))
     {
         ImGui::MenuItem("Scene Inspector", nullptr, &m_showEditorPanel);
-        ImGui::MenuItem("Asset Browser", nullptr, &m_showAssetBrowser);
+        ImGui::MenuItem("Inspector", nullptr, &m_workspace.InspectorVisible());
+        ImGui::MenuItem("Asset Browser", nullptr, &m_workspace.AssetBrowserVisible());
         ImGui::Separator();
 
         const std::string_view activeSceneName = sceneManager.GetActiveSceneName();
@@ -404,20 +405,108 @@ void Editor::DrawMainMenu(
     ImGui::EndMainMenuBar();
 }
 
+void Editor::DrawSceneViewport(
+    std::uint64_t sceneTextureHandle,
+    unsigned int sceneWidth,
+    unsigned int sceneHeight)
+{
+    m_viewportImage = {};
+    m_viewportHovered = false;
+    const auto& rectangle = m_workspace.GetSceneViewport();
+
+    if(rectangle.size.x <= 0.0f || rectangle.size.y <= 0.0f)
+    {
+        return;
+    }
+
+    ImGui::SetNextWindowPos(rectangle.position, ImGuiCond_Always);
+    ImGui::SetNextWindowSize(rectangle.size, ImGuiCond_Always);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowMinSize, ImVec2(1.0f, 1.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.0f, 0.0f, 0.0f, 1.0f));
+    const ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+        ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoFocusOnAppearing;
+
+    if(ImGui::Begin("Scene Viewport", nullptr, flags))
+    {
+        if(sceneTextureHandle != 0 && sceneWidth != 0 && sceneHeight != 0)
+        {
+            const ImVec2 framebufferScale = ImGui::GetIO().DisplayFramebufferScale;
+            const ImVec2 logicalSize(static_cast<float>(sceneWidth) / framebufferScale.x,
+                                     static_cast<float>(sceneHeight) / framebufferScale.y);
+            const float scale = (std::min)(rectangle.size.x / logicalSize.x, rectangle.size.y / logicalSize.y);
+            const ImVec2 size(logicalSize.x * scale, logicalSize.y * scale);
+            const ImVec2 position(rectangle.position.x + (rectangle.size.x - size.x) * 0.5f,
+                                  rectangle.position.y + (rectangle.size.y - size.y) * 0.5f);
+            m_viewportImage = {position, size};
+            const ImVec2 mouse = ImGui::GetIO().MousePos;
+            const bool inside = mouse.x >= position.x && mouse.y >= position.y &&
+                mouse.x < position.x + size.x && mouse.y < position.y + size.y;
+            m_viewportHovered = inside && !m_workspace.IsSplitterDragging() &&
+                !ImGui::IsWindowHovered(ImGuiHoveredFlags_AnyWindow) &&
+                !ImGui::IsAnyItemActive() && !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId);
+
+            ImGui::GetWindowDrawList()->AddImage(
+                ImTextureRef(static_cast<ImTextureID>(sceneTextureHandle)),
+                position,
+                ImVec2(position.x + size.x, position.y + size.y));
+        }
+    }
+
+    ImGui::End();
+    ImGui::PopStyleColor();
+    ImGui::PopStyleVar(3);
+}
+
+const EditorWorkspaceRect& Editor::PrepareWorkspace(
+    IDemoScene& demoScene,
+    DemoSceneManager& sceneManager,
+    DebugUI& debugUI)
+{
+    DrawMainMenu(demoScene, sceneManager, debugUI);
+    m_workspace.Update();
+    return m_workspace.GetSceneViewport();
+}
+
 void Editor::Draw(
     IDemoScene& demoScene,
     DemoSceneManager& sceneManager,
     DebugUI& debugUI,
-    float viewportWidth,
-    float viewportHeight,
+    std::uint64_t sceneTextureHandle,
+    unsigned int sceneWidth,
+    unsigned int sceneHeight,
     float deltaTime)
 {
-    DrawMainMenu(demoScene, sceneManager, debugUI);
-    m_assetBrowser.Draw(m_showAssetBrowser);
+
+    (void)debugUI;
+
+    if(m_workspace.InspectorVisible())
+    {
+        m_inspectorPanel.Draw(m_workspace.GetInspector());
+    }
+
+    if(m_workspace.AssetBrowserVisible())
+    {
+        m_assetBrowser.Draw(m_workspace.GetAssetBrowser());
+    }
+
+    DrawSceneViewport(sceneTextureHandle, sceneWidth, sceneHeight);
 
     const ImGuiIO& io = ImGui::GetIO();
 
-    if (!io.WantCaptureKeyboard && !ImGuizmo::IsUsing() && !ImGui::IsMouseDown(ImGuiMouseButton_Right))
+    if(ImGui::IsMouseClicked(ImGuiMouseButton_Left) || ImGui::IsMouseClicked(ImGuiMouseButton_Right))
+    {
+        m_viewportFocused = m_viewportHovered;
+    }
+
+    if(io.AppFocusLost || m_sceneOperationPending || m_viewportImage.size.x <= 0.0f || m_workspace.IsSplitterDragging())
+    {
+        m_viewportFocused = false;
+        m_cameraLooking = false;
+    }
+
+    if(m_viewportFocused && !io.WantTextInput && !ImGuizmo::IsUsing() && !ImGui::IsMouseDown(ImGuiMouseButton_Right))
     {
         if (ImGui::IsKeyPressed(ImGuiKey_W, false))
         {
@@ -499,16 +588,16 @@ void Editor::Draw(
         }
     }
 
+    // Projection is driven by the actual render extent, including after Inspector controls.
+    scene.GetCamera().SetAspectRatio(static_cast<float>(sceneWidth) / static_cast<float>(sceneHeight));
+
     HandleTransformUndo(demoScene);
     HandleTransformRedo(demoScene);
 
-    UpdateCameraLook(demoScene, viewportWidth, viewportHeight);
-
+    UpdateCameraLook(demoScene, m_viewportImage.size.x, m_viewportImage.size.y);
     UpdateCameraMovement(demoScene, deltaTime);
-
-    DrawTransformGizmo(demoScene, viewportWidth, viewportHeight);
-
-    HandleViewportSelection(demoScene, viewportWidth, viewportHeight);
+    DrawTransformGizmo(demoScene, m_viewportImage.size.x, m_viewportImage.size.y);
+    HandleViewportSelection(demoScene, m_viewportImage.size.x, m_viewportImage.size.y);
 }
 
 void Editor::DrawSphereGridControls(SphereGridScene& demoScene)
@@ -786,20 +875,20 @@ void Editor::DrawTransformGizmo(
     Matrix4 projection = camera.GetProjectionMatrix().Transpose();
     Matrix4 model = transform.GetModelMatrix().Transpose();
 
-    ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f));
-    ImGui::SetNextWindowSize(ImVec2(viewportWidth, viewportHeight));
-
-    constexpr ImGuiWindowFlags viewportFlags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
-                                               ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoSavedSettings |
-
-                                               ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoBringToFrontOnFocus |
-                                               ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoInputs;
-
-    ImGui::Begin("##GizmoViewport", nullptr, viewportFlags);
+    // Append to the image's window: separate root windows have independent display ordering.
+    // The first Begin in DrawSceneViewport owns placement, sizing and style for this frame.
+    const ImGuiWindowFlags viewportFlags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+        ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoFocusOnAppearing;
+    ImGui::Begin("Scene Viewport", nullptr, viewportFlags);
 
     ImGuizmo::SetOrthographic(false);
     ImGuizmo::SetDrawlist();
-    ImGuizmo::SetRect(0.0f, 0.0f, viewportWidth, viewportHeight);
+    ImGui::GetWindowDrawList()->PushClipRect(m_viewportImage.position,
+        ImVec2(m_viewportImage.position.x + viewportWidth, m_viewportImage.position.y + viewportHeight), true);
+    ImGuizmo::SetRect(m_viewportImage.position.x, m_viewportImage.position.y, viewportWidth, viewportHeight);
+    const bool allowGizmo = !ImGui::GetIO().AppFocusLost && !m_sceneOperationPending &&
+        !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId) && !m_cameraLooking;
+    ImGuizmo::Enable(allowGizmo && !m_workspace.IsSplitterDragging() && (m_viewportHovered || ImGuizmo::IsUsing()));
 
     ImGuizmo::OPERATION operation = ImGuizmo::TRANSLATE;
 
@@ -817,6 +906,7 @@ void Editor::DrawTransformGizmo(
     }
 
     ImGuizmo::Manipulate(&view.m[0][0], &projection.m[0][0], operation, ImGuizmo::WORLD, &model.m[0][0]);
+    ImGui::GetWindowDrawList()->PopClipRect();
 
     ImGui::End();
 
@@ -927,7 +1017,7 @@ void Editor::HandleViewportSelection(
 
     const ImGuiIO& io = ImGui::GetIO();
 
-    if (io.WantCaptureMouse || ImGui::IsAnyItemActive() || ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId) ||
+    if(!m_viewportHovered || m_sceneOperationPending || ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId) ||
         ImGuizmo::IsUsing())
     {
         return;
@@ -938,7 +1028,7 @@ void Editor::HandleViewportSelection(
         return;
     }
 
-    const ImVec2 mouse = io.MousePos;
+    const ImVec2 mouse(io.MousePos.x - m_viewportImage.position.x, io.MousePos.y - m_viewportImage.position.y);
 
     if (mouse.x < 0.0f || mouse.y < 0.0f || mouse.x >= viewportWidth || mouse.y >= viewportHeight)
     {
@@ -1041,7 +1131,11 @@ void Editor::UpdateCameraLook(
 {
     const ImGuiIO& io = ImGui::GetIO();
 
-    if (!ImGui::IsMouseDown(ImGuiMouseButton_Right))
+    (void)viewportWidth;
+    (void)viewportHeight;
+
+    if(!ImGui::IsMouseDown(ImGuiMouseButton_Right) || io.AppFocusLost || !m_viewportFocused ||
+       ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId))
     {
         if (m_cameraLooking)
         {
@@ -1054,8 +1148,7 @@ void Editor::UpdateCameraLook(
 
     if (!m_cameraLooking)
     {
-        if (io.WantCaptureMouse || io.MousePos.x < 0.0f || io.MousePos.y < 0.0f || io.MousePos.x >= viewportWidth ||
-            io.MousePos.y >= viewportHeight)
+        if(!m_viewportHovered || !ImGui::IsMouseClicked(ImGuiMouseButton_Right) || m_sceneOperationPending)
         {
             return;
         }
@@ -1256,8 +1349,20 @@ Editor::SceneChangeDecision Editor::DrawSceneChangeConfirmation(const std::strin
     return decision;
 }
 
+void Editor::SuspendViewportInteraction()
+{
+    m_cameraLooking = false;
+    m_viewportFocused = false;
+    m_viewportHovered = false;
+    m_viewportImage = {};
+    ImGuizmo::Enable(false);
+}
+
 void Editor::OnSceneActivated()
 {
+    m_cameraLooking = false;
+    m_viewportFocused = false;
+
     // Different files may share a display name and structure revision.
     ClearTransformUndoHistory();
     m_selectedObject = InvalidObjectSelection;
