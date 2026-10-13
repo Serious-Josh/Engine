@@ -3,6 +3,7 @@
 #include "Diagnostics/FrameHitchDiagnostics.h"
 
 #include "GBuffer.h"
+#include "Preview/MaterialPreviewRenderer.h"
 #include "UploadBuffer.h"
 #include "StructuredBuffer.h"
 #include "CommandContext.h"
@@ -74,6 +75,8 @@ struct EnvironmentAsset
 
 struct RendererOptions
 {
+    std::optional<MaterialPreviewRequest> materialPreview;
+
     // Borrowed only for this Render call; Editor retains resources through GPU completion.
     std::vector<Texture*> editorTextures;
 
@@ -162,6 +165,61 @@ class Renderer
     // Borrowed descriptor: valid until checked renderer resize or shutdown, never owned by ImGui.
     [[nodiscard]] bool TryGetFinalSceneImage(FinalSceneImage& image) const;
 
+    std::optional<MaterialPreviewImage> GetMaterialPreviewImage() const
+    {
+        return m_materialPreviewRenderer.GetImage(m_resourceDescriptorHeap);
+    }
+
+    // Enqueue between frames, before command recording; true means accepted, not image-ready.
+    bool RequestSavedMaterialThumbnail(
+        const ProjectPaths& paths,
+        const ProjectAssetRegistry& registry,
+        const AssetID& id,
+        std::string& error)
+    {
+        return m_materialPreviewRenderer.RequestSavedThumbnail(
+            paths, registry, id, m_commandContext.GetCompletedFenceValue(), error);
+    }
+
+    std::optional<MaterialPreviewImage> GetSavedMaterialThumbnailImage()
+    {
+        return m_materialPreviewRenderer.GetThumbnailImage(m_resourceDescriptorHeap);
+    }
+
+    std::optional<MaterialPreviewImage> GetSavedMaterialThumbnailImage(
+        const ProjectPaths& paths, const AssetID& id)
+    {
+        return m_materialPreviewRenderer.GetThumbnailImage(m_resourceDescriptorHeap, paths, id);
+    }
+
+    void BeginSavedMaterialThumbnailWorkingSet()
+    {
+        m_materialPreviewRenderer.BeginThumbnailWorkingSet();
+    }
+
+    void DiscardSavedMaterialThumbnailRequests()
+    {
+        m_materialPreviewRenderer.DiscardThumbnailRequests();
+    }
+
+    void InvalidateSavedMaterialThumbnailImages()
+    {
+        m_materialPreviewRenderer.InvalidateThumbnailImages();
+    }
+
+    void InvalidateSavedMaterialThumbnailSource(const std::filesystem::path& path)
+    {
+        m_materialPreviewRenderer.InvalidateThumbnailSource(path);
+    }
+
+    void PrepareMaterialPreviewTextures(
+        const std::optional<MaterialPreviewRequest>& request,
+        const ProjectAssetRegistry& registry)
+    {
+        m_materialPreviewRenderer.PollThumbnailCapture(m_commandContext.GetCompletedFenceValue());
+        m_materialPreviewRenderer.PrepareTextures(request, registry);
+    }
+
     bool ResizeScene(unsigned int width, unsigned int height);
 
     ID3D12Device* GetDevice();
@@ -184,6 +242,10 @@ class Renderer
     // Output is empty when nothing finalized; no scene acknowledgment here.
     [[nodiscard]] bool DrainAndResolveSceneDisplacement(const Scene& scene, DisplacementCompletionResult& result);
     void ResetSceneHistory();
+
+    // Nonblocking editor resource retirement; valid only within this Renderer lifetime.
+    std::uint64_t GetEditorCompletedFence() const;
+    std::uint64_t GetEditorSubmissionFence() const;
 
     bool WaitForGPU();
 
@@ -815,6 +877,8 @@ class Renderer
     uint32_t m_nrdFrameIndex = 0;
 
     GBuffer m_gBuffer;
+
+    MaterialPreviewRenderer m_materialPreviewRenderer;
 
     UploadBuffer m_uploadBuffer;
 

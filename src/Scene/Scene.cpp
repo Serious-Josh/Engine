@@ -1,5 +1,7 @@
 #include "Scene.h"
 
+#include <algorithm>
+
 RenderObjectID Scene::AddRenderObject(const RenderObject& object)
 {
     const RenderObjectID id = m_renderObjects.size();
@@ -91,4 +93,12 @@ DirectionalLight& Scene::GetDirectionalLight()
 const DirectionalLight& Scene::GetDirectionalLight() const
 {
     return m_directionalLight;
+}
+
+bool Scene::HasRenderableMeshes() const noexcept
+{
+    return std::any_of(m_renderObjects.begin(), m_renderObjects.end(), [](const RenderObject& object)
+    {
+        return object.mesh != nullptr;
+    });
 }

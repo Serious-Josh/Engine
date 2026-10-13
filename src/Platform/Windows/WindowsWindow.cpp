@@ -38,7 +38,15 @@ LRESULT CALLBACK WindowProc(
         window = reinterpret_cast<WindowsWindow*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
     }
 
-    ImGui_ImplWin32_WndProcHandler(hwnd, uMsg, wParam, lParam);
+    const LRESULT imguiResult = ImGui_ImplWin32_WndProcHandler(hwnd, uMsg, wParam, lParam);
+
+    // ImGui owns client-area cursor selection while its backend is active.
+    // Do not replace its handled cursor with the fallback arrow below.
+    // Other messages still reach Engine's input/event dispatch as before.
+    if(uMsg == WM_SETCURSOR && imguiResult != 0)
+    {
+        return imguiResult;
+    }
 
     switch (uMsg)
     {

@@ -1,3 +1,5 @@
+#include "assets/ProjectAssetRename.h"
+#include "assets/ProjectAssetDeletion.h"
 #include "Core/Log.h"
 #include "Editor.h"
 #include "Debug/DebugUI.h"
@@ -530,7 +532,8 @@ void Editor::Draw(
     unsigned int sceneHeight,
     float deltaTime,
     const ProjectPaths& projectPaths,
-    const ProjectAssetRegistry& assetRegistry)
+    const ProjectAssetRegistry& assetRegistry,
+    const std::optional<MaterialPreviewImage>& materialPreview)
 {
 
     (void)debugUI;
@@ -540,6 +543,10 @@ void Editor::Draw(
     if(m_workspace.AssetBrowserVisible())
     {
         m_assetBrowser.Draw(m_workspace.GetAssetBrowser());
+    }
+    else
+    {
+        m_assetBrowser.PauseMaterialThumbnails();
     }
 
     ImGui::EndDisabled();
@@ -572,6 +579,7 @@ void Editor::Draw(
     {
         m_inspectorPanel.Draw(
             m_workspace.GetInspector(), projectPaths, assetRegistry,
+            materialPreview,
             m_materialLeaveAction != MaterialLeaveAction::None);
     }
 
@@ -634,6 +642,17 @@ void Editor::Draw(
             m_materialLeaveAction = MaterialLeaveAction::None;
         }
     }
+
+    if(const auto savedSource = m_inspectorPanel.TakeSavedMaterialSource())
+    {
+        m_assetBrowser.InvalidateMaterialSource(*savedSource);
+    }
+
+    m_assetBrowser.DrawRenameModal(m_inspectorPanel.HasUnsavedChanges() ||
+        m_materialLeaveAction != MaterialLeaveAction::None || m_sceneOperationPending);
+
+    m_assetBrowser.DrawDeletionConfirmation(m_inspectorPanel.HasUnsavedChanges() ||
+        m_materialLeaveAction != MaterialLeaveAction::None || m_sceneOperationPending);
 
     DrawSceneViewport(sceneTextureHandle, sceneWidth, sceneHeight);
 
@@ -1535,4 +1554,92 @@ void Editor::ImportFileDrop(
     }
 
     m_assetBrowser.ImportFileDrop(files, screenX, screenY, paths, registry);
+}
+
+void Editor::ProcessAssetDeletion(const ProjectPaths& paths, ProjectAssetRegistry& registry)
+{
+    const auto request = m_assetBrowser.TakeDeletionRequest();
+
+    if(!request)
+    {
+        return;
+    }
+
+    std::string error;
+
+    if(m_inspectorPanel.HasUnsavedChanges() || m_materialLeaveAction != MaterialLeaveAction::None || m_sceneOperationPending)
+    {
+        error = "Deletion rejected while editor changes or a scene operation are pending.";
+    }
+    else
+    {
+        ProjectAssetDeletion::RemoveFile(paths, registry, *request, error);
+    }
+
+    m_assetBrowser.OnDeletionCompleted(*request, error);
+
+    if(error.empty())
+    {
+        Log::Info("Deleted project file: " + request->string());
+    }
+    else
+    {
+        Log::Error("Project file deletion failed: " + error);
+    }
+
+    if(error.empty() && m_inspectedAssetSelection == *request)
+    {
+        m_inspectedAssetSelection.clear();
+        m_pendingAssetSelection.clear();
+        m_inspectorPanel.LoadSelection({}, paths, registry);
+    }
+}
+
+void Editor::ProcessAssetRename(
+    const ProjectPaths& paths,
+    ProjectAssetRegistry& registry,
+    const std::filesystem::path& activeScenePath)
+{
+    const auto request = m_assetBrowser.TakeRenameRequest();
+
+    if(!request)
+    {
+        return;
+    }
+
+    std::string error;
+    std::filesystem::path destination;
+
+    if(m_inspectorPanel.HasUnsavedChanges() || m_materialLeaveAction != MaterialLeaveAction::None || m_sceneOperationPending)
+    {
+        error = "Rename rejected while editor changes or a scene operation are pending.";
+    }
+    else if(!activeScenePath.empty() &&
+        _wcsicmp(std::filesystem::absolute(request->source).lexically_normal().c_str(),
+            std::filesystem::absolute(activeScenePath).lexically_normal().c_str()) == 0)
+    {
+        error = "The active scene retains its Save path. Open another scene before renaming this file.";
+    }
+    else
+    {
+        ProjectAssetRename::RenameFile(paths, registry, request->source, request->stem, destination, error);
+    }
+
+    m_assetBrowser.OnRenameCompleted(request->source, destination, error);
+
+    if(!error.empty())
+    {
+        Log::Error("Project file rename failed: " + error);
+    }
+    else
+    {
+        Log::Info("Renamed project file: " + request->source.string() + " -> " + destination.string());
+
+        if(m_inspectedAssetSelection == request->source && request->source != destination)
+        {
+            m_inspectedAssetSelection = destination;
+            m_pendingAssetSelection.clear();
+            m_inspectorPanel.LoadSelection(destination, paths, registry);
+        }
+    }
 }

@@ -18,6 +18,8 @@
 #include "DemoContent/FileBackedDemoScene.h"
 
 #include "assets/AssetRegistrySerializer.h"
+#include "assets/AssetReconciliationTransaction.h"
+#include "assets/ProjectAssetReconciliation.h"
 #include "assets/ProjectAssetResolver.h"
 #include "imgui.h"
 
@@ -399,6 +401,12 @@ bool Engine::Initialize()
     Log::Info("Default project directory: " + projectPaths.GetRoot().string());
 
     // Initialize the project asset registry before runtime resources.
+    if(!AssetReconciliationTransaction::Recover(projectPaths, projectError))
+    {
+        Log::Error("Project reconciliation recovery failed: " + projectError);
+        return false;
+    }
+
     const std::filesystem::path registryPath = projectPaths.GetAssetRegistryPath();
 
     std::error_code registryError;
@@ -442,7 +450,34 @@ bool Engine::Initialize()
         Log::Info("Created empty project asset registry: " + registryPath.string());
     }
 
-    // Inspect registered project assets without modifying the registry.
+    ProjectAssetReconciliation::Report reconciliation;
+
+    if(!ProjectAssetReconciliation::Run(projectPaths, m_projectAssetRegistry, reconciliation, projectError))
+    {
+        Log::Error("Project asset reconciliation failed: " + projectError);
+        return false;
+    }
+
+    for(const auto& skipped : reconciliation.skipped)
+    {
+        Log::Warning("Asset reconciliation skipped " + skipped);
+    }
+
+    if(reconciliation.registrationsRemoved)
+    {
+        Log::Warning("Project asset reconciliation: " + std::to_string(reconciliation.missingDetected) +
+            " missing registrations detected, " + std::to_string(reconciliation.registrationsRemoved) +
+            " removed; " + std::to_string(reconciliation.materialReferencesCleared) +
+            " material and " + std::to_string(reconciliation.sceneReferencesCleared) +
+            " scene references cleared; " + std::to_string(reconciliation.filesModified.size()) + " files modified.");
+
+        for(const auto& file : reconciliation.filesModified)
+        {
+            Log::Info("Reconciled project file: " + file);
+        }
+    }
+
+    // Inspect the reconciled registry without modifying it further.
     std::size_t availableAssets = 0;
     std::size_t missingAssets = 0;
     std::size_t invalidAssets = 0;
@@ -548,6 +583,7 @@ bool Engine::Initialize()
 
     m_editor.ConfigureThumbnails(m_renderer.GetDevice(), m_renderer.GetResourceUploader(),
         m_renderer.GetResourceDescriptorHeap());
+    m_editor.ConfigureMaterialThumbnails(m_renderer);
 
     m_demoSceneManager.SetProjectAssets(ProjectLocator::GetDefaultProjectRoot(), m_projectAssetRegistry);
 
@@ -904,6 +940,8 @@ void Engine::Frame()
         m_editor.ClearThumbnailsAfterGPUDrain();
     }
 
+    m_editor.SetThumbnailCompletedFence(m_renderer.GetEditorCompletedFence());
+
     debugUI.BeginFrame();
 
     IDemoScene& activeDemo = m_demoSceneManager.GetActiveScene();
@@ -962,10 +1000,15 @@ void Engine::Frame()
     const ProjectPaths inspectorPaths(ProjectLocator::GetDefaultProjectRoot());
     m_editor.Draw(activeDemo, m_demoSceneManager, debugUI, finalSceneImage.srv.ptr,
                   finalSceneImage.width, finalSceneImage.height, m_time.GetDeltaTime(),
-                  inspectorPaths, m_projectAssetRegistry);
+                  inspectorPaths, m_projectAssetRegistry, m_renderer.GetMaterialPreviewImage());
 
     debugUI.DrawPerformanceWindow(environmentNames, m_renderer.GetCurrentEnvironmentIndex(),
                                   m_renderer.GetStatistics());
+
+    const auto* activeFileScene = dynamic_cast<const FileBackedDemoScene*>(&activeDemo);
+    m_editor.ProcessAssetRename(inspectorPaths, m_projectAssetRegistry,
+        activeFileScene ? activeFileScene->GetScenePath() : std::filesystem::path{});
+    m_editor.ProcessAssetDeletion(inspectorPaths, m_projectAssetRegistry);
 
     for(const auto& drop : m_window.TakeFileDrops())
     {
@@ -1102,6 +1145,8 @@ void Engine::Frame()
 
     RendererOptions rendererOptions{};
     rendererOptions.editorTextures = m_editor.GetThumbnailTextures();
+    rendererOptions.materialPreview = m_editor.GetMaterialPreviewRequest();
+    m_renderer.PrepareMaterialPreviewTextures(rendererOptions.materialPreview, m_projectAssetRegistry);
 
     rendererOptions.enableRTGI = debugUI.IsRTGIEnabled();
     rendererOptions.rtgiContactAOStrength = debugUI.GetRTGIContactAOStrength();
@@ -1145,6 +1190,8 @@ void Engine::Frame()
         // The next update can poll completion without submitting another frame.
         return;
     }
+
+    m_editor.ConfirmThumbnailSubmission(m_renderer.GetEditorSubmissionFence());
 
     activeScene.ClearChangedTransforms();
 }

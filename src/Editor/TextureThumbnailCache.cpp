@@ -1,4 +1,5 @@
 #include "TextureThumbnailCache.h"
+#include "TextureThumbnailDiskCache.h"
 #include "Renderer/ImageLoader.h"
 #include "Renderer/DDSLoader.h"
 #include "Renderer/ResourceUploader.h"
@@ -21,6 +22,55 @@ void TextureThumbnailCache::BeginFrame()
     m_createdThisFrame = false;
 }
 
+void TextureThumbnailCache::Invalidate(const std::filesystem::path& path)
+{
+    for(auto& [key, preview] : m_previews)
+    {
+        if(preview.sourcePath == path.lexically_normal())
+        {
+            preview.invalidated = true;
+        }
+    }
+}
+
+void TextureThumbnailCache::SetCompletedFence(std::uint64_t completedFence)
+{
+    // UINT64_MAX denotes device removal, never successful completion.
+    m_completedFence = completedFence == UINT64_MAX ? 0 : completedFence;
+
+    for(auto entry = m_previews.begin(); entry != m_previews.end();)
+    {
+        auto& preview = entry->second;
+
+        if(preview.invalidated && !preview.awaitingSubmission && preview.lastSubmissionFence <= m_completedFence)
+        {
+            preview.texture.Shutdown();
+            entry = m_previews.erase(entry);
+        }
+        else
+        {
+            ++entry;
+        }
+    }
+}
+
+void TextureThumbnailCache::ConfirmSubmission(std::uint64_t submissionFence)
+{
+    if(submissionFence == 0 || submissionFence == UINT64_MAX)
+    {
+        return;
+    }
+
+    for(auto& [key, preview] : m_previews)
+    {
+        if(preview.awaitingSubmission)
+        {
+            preview.lastSubmissionFence = submissionFence;
+            preview.awaitingSubmission = false;
+        }
+    }
+}
+
 const TextureThumbnailCache::Preview* TextureThumbnailCache::FindOrCreate(
     const ProjectPaths& paths,
     const ProjectAssetRegistry& registry,
@@ -31,16 +81,14 @@ const TextureThumbnailCache::Preview* TextureThumbnailCache::FindOrCreate(
 
     if(existing != m_previews.end())
     {
-        return &existing->second;
-    }
+        if(existing->second.invalidated)
+        {
+            return nullptr;
+        }
 
-    // Bounded GPU memory/descriptors and one decode/upload per frame.
-    if(m_previews.size() >= 64)
-    {
-        // Retire at the next checked Engine boundary, never while this frame's
-        // ImGui draw commands or an earlier submission can reference the cache.
-        m_retirementRequested = true;
-        return nullptr;
+        existing->second.lastUse = ++m_useSerial;
+        existing->second.awaitingSubmission = true;
+        return &existing->second;
     }
 
     if(!m_device || m_createdThisFrame)
@@ -48,8 +96,42 @@ const TextureThumbnailCache::Preview* TextureThumbnailCache::FindOrCreate(
         return nullptr;
     }
 
+    // A capacity miss consumes this frame's attempt even if retirement must wait.
     m_createdThisFrame = true;
+
+    if(m_previews.size() >= 64)
+    {
+        auto victim = m_previews.end();
+
+        for(auto entry = m_previews.begin(); entry != m_previews.end(); ++entry)
+        {
+            const auto& candidate = entry->second;
+
+            if(candidate.awaitingSubmission || candidate.lastSubmissionFence > m_completedFence)
+            {
+                continue;
+            }
+
+            if(victim == m_previews.end() || candidate.lastUse < victim->second.lastUse)
+            {
+                victim = entry;
+            }
+        }
+
+        if(victim == m_previews.end())
+        {
+            return nullptr;
+        }
+
+        // No current UI reference and every submitted use has completed.
+        victim->second.texture.Shutdown();
+        m_previews.erase(victim);
+    }
+
     auto& preview = m_previews.try_emplace(key).first->second;
+    preview.sourcePath = (paths.GetRoot() / record.relativePath).lexically_normal();
+    preview.lastUse = ++m_useSerial;
+    preview.awaitingSubmission = true;
 
     try
     {
@@ -60,83 +142,103 @@ const TextureThumbnailCache::Preview* TextureThumbnailCache::FindOrCreate(
             throw std::runtime_error("Texture unavailable. Refresh after restoring the file.");
         }
 
-        std::string extension = resolved.resolvedPath.extension().string();
-        std::transform(extension.begin(), extension.end(), extension.begin(), [](unsigned char value)
-        {
-            return static_cast<char>(std::tolower(value));
-        });
-        DirectX::ScratchImage decoded;
-        ImageData standard;
-        DirectX::Image source{};
+        const auto diskSource = TextureThumbnailDiskCache::Describe(paths, record, resolved.resolvedPath);
+        TextureThumbnailDiskCache::Image pixels;
 
-        if(extension == ".dds")
+        if(!TextureThumbnailDiskCache::Load(diskSource, pixels))
         {
-            DirectX::ScratchImage compressed;
-
-            if(!DDSLoader::Load(resolved.resolvedPath, compressed))
+            std::string extension = resolved.resolvedPath.extension().string();
+            std::transform(extension.begin(), extension.end(), extension.begin(), [](unsigned char value)
             {
-                throw std::runtime_error("Cannot decode DDS thumbnail.");
+                return static_cast<char>(std::tolower(value));
+            });
+            DirectX::ScratchImage decoded;
+            ImageData standard;
+            DirectX::Image source{};
+
+            if(extension == ".dds")
+            {
+                DirectX::ScratchImage compressed;
+
+                if(!DDSLoader::Load(resolved.resolvedPath, compressed))
+                {
+                    throw std::runtime_error("Cannot decode DDS thumbnail.");
+                }
+
+                const auto format = compressed.GetMetadata().format;
+
+                if(format != DXGI_FORMAT_BC1_UNORM && format != DXGI_FORMAT_BC1_UNORM_SRGB &&
+                   format != DXGI_FORMAT_BC4_UNORM && format != DXGI_FORMAT_BC5_UNORM)
+                {
+                    throw std::runtime_error("Unsupported DDS thumbnail format.");
+                }
+
+                if(FAILED(DirectX::Decompress(*compressed.GetImage(0, 0, 0), DXGI_FORMAT_R8G8B8A8_UNORM, decoded)))
+                {
+                    throw std::runtime_error("Cannot decompress DDS thumbnail.");
+                }
+
+                source = *decoded.GetImage(0, 0, 0);
+            }
+            else if(extension == ".hdr")
+            {
+                HDRImageData hdr;
+
+                if(!ImageLoader::LoadHDR(resolved.resolvedPath, hdr))
+                {
+                    throw std::runtime_error("Cannot decode HDR thumbnail.");
+                }
+
+                standard.width = hdr.width;
+                standard.height = hdr.height;
+                standard.pixels.resize(static_cast<size_t>(hdr.width) * hdr.height * 4);
+
+                for(size_t index = 0; index < standard.pixels.size(); ++index)
+                {
+                    float value = hdr.pixels[index];
+                    value = std::isfinite(value) ? (std::max)(0.0f, value) : 0.0f;
+                    standard.pixels[index] = index % 4 == 3 ? 255 :
+                        static_cast<unsigned char>(255.0f * std::pow(value / (1.0f + value), 1.0f / 2.2f));
+                }
+            }
+            else if(!ImageLoader::Load(resolved.resolvedPath, standard))
+            {
+                throw std::runtime_error("Cannot decode image thumbnail.");
             }
 
-            const auto format = compressed.GetMetadata().format;
-
-            if(format != DXGI_FORMAT_BC1_UNORM && format != DXGI_FORMAT_BC1_UNORM_SRGB &&
-               format != DXGI_FORMAT_BC4_UNORM && format != DXGI_FORMAT_BC5_UNORM)
+            if(extension != ".dds")
             {
-                throw std::runtime_error("Unsupported DDS thumbnail format.");
+                source = {standard.width, standard.height, DXGI_FORMAT_R8G8B8A8_UNORM,
+                    static_cast<size_t>(standard.width) * 4, standard.pixels.size(), standard.pixels.data()};
             }
 
-            if(FAILED(DirectX::Decompress(*compressed.GetImage(0, 0, 0), DXGI_FORMAT_R8G8B8A8_UNORM, decoded)))
+            const double scale = (std::min)(1.0, 96.0 / static_cast<double>((std::max)(source.width, source.height)));
+            preview.width = static_cast<unsigned int>((std::max)(1.0, std::round(source.width * scale)));
+            preview.height = static_cast<unsigned int>((std::max)(1.0, std::round(source.height * scale)));
+            DirectX::ScratchImage resized;
+
+            if(FAILED(DirectX::Resize(source, preview.width, preview.height, DirectX::TEX_FILTER_DEFAULT, resized)))
             {
-                throw std::runtime_error("Cannot decompress DDS thumbnail.");
+                throw std::runtime_error("Cannot resize thumbnail.");
             }
 
-            source = *decoded.GetImage(0, 0, 0);
-        }
-        else if(extension == ".hdr")
-        {
-            HDRImageData hdr;
+            const auto* image = resized.GetImage(0, 0, 0);
+            pixels.width = preview.width;
+            pixels.height = preview.height;
+            pixels.pixels.resize(static_cast<size_t>(pixels.width) * pixels.height * 4);
 
-            if(!ImageLoader::LoadHDR(resolved.resolvedPath, hdr))
+            for(size_t row = 0; row < pixels.height; ++row)
             {
-                throw std::runtime_error("Cannot decode HDR thumbnail.");
+                memcpy(pixels.pixels.data() + row * pixels.width * 4,
+                    image->pixels + row * image->rowPitch, static_cast<size_t>(pixels.width) * 4);
             }
 
-            standard.width = hdr.width;
-            standard.height = hdr.height;
-            standard.pixels.resize(static_cast<size_t>(hdr.width) * hdr.height * 4);
-
-            for(size_t index = 0; index < standard.pixels.size(); ++index)
-            {
-                float value = hdr.pixels[index];
-                value = std::isfinite(value) ? (std::max)(0.0f, value) : 0.0f;
-                standard.pixels[index] = index % 4 == 3 ? 255 :
-                    static_cast<unsigned char>(255.0f * std::pow(value / (1.0f + value), 1.0f / 2.2f));
-            }
-        }
-        else if(!ImageLoader::Load(resolved.resolvedPath, standard))
-        {
-            throw std::runtime_error("Cannot decode image thumbnail.");
+            TextureThumbnailDiskCache::Store(diskSource, pixels);
         }
 
-        if(extension != ".dds")
-        {
-            source = {standard.width, standard.height, DXGI_FORMAT_R8G8B8A8_UNORM,
-                static_cast<size_t>(standard.width) * 4, standard.pixels.size(), standard.pixels.data()};
-        }
-
-        const double scale = (std::min)(1.0, 96.0 / static_cast<double>((std::max)(source.width, source.height)));
-        preview.width = static_cast<unsigned int>((std::max)(1.0, std::round(source.width * scale)));
-        preview.height = static_cast<unsigned int>((std::max)(1.0, std::round(source.height * scale)));
-        DirectX::ScratchImage resized;
-
-        if(FAILED(DirectX::Resize(source, preview.width, preview.height, DirectX::TEX_FILTER_DEFAULT, resized)))
-        {
-            throw std::runtime_error("Cannot resize thumbnail.");
-        }
-
-        const auto* image = resized.GetImage(0, 0, 0);
-        const TextureSubresourceData upload{image->pixels, image->rowPitch, image->slicePitch};
+        preview.width = pixels.width;
+        preview.height = pixels.height;
+        const TextureSubresourceData upload{pixels.pixels.data(), static_cast<size_t>(pixels.width) * 4, pixels.pixels.size()};
 
         if(!preview.texture.InitializeMipmapped(m_device, preview.width, preview.height, 1, DXGI_FORMAT_R8G8B8A8_UNORM) ||
            !m_uploader->UploadTexture(preview.texture.GetResource(), &upload, 1) ||
@@ -162,7 +264,7 @@ std::vector<Texture*> TextureThumbnailCache::GetTextures()
 
     for(auto& [key, preview] : m_previews)
     {
-        if(preview.texture.GetResource())
+        if(preview.awaitingSubmission && preview.texture.GetResource())
         {
             textures.push_back(&preview.texture);
         }
@@ -184,5 +286,6 @@ void TextureThumbnailCache::ClearAfterGPUDrain()
     }
 
     m_previews.clear();
-    m_retirementRequested = false;
+    m_useSerial = 0;
+    m_completedFence = 0;
 }

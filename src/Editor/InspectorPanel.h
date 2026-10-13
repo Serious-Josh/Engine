@@ -2,6 +2,7 @@
 
 #include "assets/AssetRecord.h"
 #include "assets/MaterialAssetData.h"
+#include "Renderer/Preview/MaterialPreviewRequest.h"
 
 #include <array>
 #include <optional>
@@ -15,10 +16,12 @@ class ProjectAssetRegistry;
 class InspectorPanel
 {
 public:
+    const std::optional<MaterialPreviewRequest>& GetPreviewRequest();
     void Draw(
         const EditorWorkspaceRect& rectangle,
         const ProjectPaths& paths,
         const ProjectAssetRegistry& registry,
+        const std::optional<MaterialPreviewImage>& preview,
         bool protectedAction = false);
 
     enum class LeaveDecision
@@ -33,12 +36,25 @@ public:
         const ProjectPaths& paths,
         const ProjectAssetRegistry& registry);
     bool TakeRefreshRequest();
+    std::optional<std::filesystem::path> TakeSavedMaterialSource();
     void LoadSelection(
         const std::filesystem::path& selection,
         const ProjectPaths& paths,
         const ProjectAssetRegistry& registry);
 
 private:
+    std::optional<std::filesystem::path> m_savedThumbnailSource;
+    std::optional<MaterialAssetData> m_previewDraft;
+    std::optional<MaterialPreviewRequest> m_previewRequest;
+    std::string m_previewIdentity;
+    std::filesystem::path m_previewProject;
+
+    std::uint64_t m_previewRevision = 0;
+
+    float m_previewYaw = 0.0f;
+    float m_previewPitch = 0.0f;
+    bool m_previewOrientationDirty = false;
+
     bool Save(
         const ProjectPaths& paths,
         const ProjectAssetRegistry& registry,
@@ -81,6 +97,7 @@ private:
 
     // Popup identity changes on every material load, including Refresh.
     unsigned int m_texturePickerGeneration = 0;
+    unsigned int m_previewTextureRefresh = 0;
     std::array<char, 128> m_textureSearch{};
     std::vector<AssetRecord> m_texturePickerRegistry;
     std::vector<AssetRecord> m_availableTextures;

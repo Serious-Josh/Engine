@@ -20,31 +20,11 @@ bool ResolveSceneObjects(
 
     for (const SceneObjectDocument& object : document.objects)
     {
-        if (object.meshReference.empty())
-        {
-            if (errorMessage)
-            {
-                *errorMessage =
-                    "Object '" + object.id + "' has no mesh reference.";
-            }
+        // Empty bindings are intentional document state. Nonempty references
+        // still pass through the resolver and retain their checked failure behavior.
+        Mesh* mesh = object.meshReference.empty() ? nullptr : resolver.ResolveMesh(object.meshReference);
 
-            return false;
-        }
-
-        if (object.materialReference.empty())
-        {
-            if (errorMessage)
-            {
-                *errorMessage =
-                    "Object '" + object.id + "' has no material reference.";
-            }
-
-            return false;
-        }
-
-        Mesh* mesh = resolver.ResolveMesh(object.meshReference);
-
-        if (!mesh)
+        if(!mesh && !object.meshReference.empty())
         {
             if (errorMessage)
             {
@@ -57,7 +37,7 @@ bool ResolveSceneObjects(
         }
 
         Material* material =
-            resolver.ResolveMaterial(object.materialReference);
+            resolver.ResolveMaterial(object.materialReference.empty() ? "builtin:default" : object.materialReference);
 
         if (!material)
         {
@@ -72,6 +52,7 @@ bool ResolveSceneObjects(
         }
 
         ResolvedSceneObject entry;
+        entry.meshBindingEmpty = object.meshReference.empty();
         entry.id = object.id;
         entry.name = object.name;
 

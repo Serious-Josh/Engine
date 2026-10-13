@@ -31,7 +31,8 @@ bool CommitPreparedScene(
 
     for (const ResolvedSceneObject& object : prepared.objects)
     {
-        if (!object.renderObject.mesh || !object.renderObject.material)
+        if(!object.renderObject.material ||
+            (object.renderObject.mesh == nullptr) != object.meshBindingEmpty)
         {
             return Fail(errorMessage, "Prepared object has an unresolved asset.");
         }

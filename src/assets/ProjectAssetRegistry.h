@@ -8,6 +8,10 @@
 class ProjectAssetRegistry
 {
     public:
+        // Windows project paths: lexical normalization and ordinal case-insensitive comparison.
+        static bool PathsEqual(const std::filesystem::path& left, const std::filesystem::path& right);
+        const AssetRecord* FindByPath(const std::filesystem::path& relativePath) const;
+
         bool Register(const AssetRecord& record);
 
         const AssetRecord* Find(const AssetID& id) const noexcept;

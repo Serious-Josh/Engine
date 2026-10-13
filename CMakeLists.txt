@@ -60,6 +60,10 @@ add_executable(Engine
     src/Renderer/Displacement/DisplacementUpdateState.cpp
     src/Renderer/Displacement/DisplacementUpdateCoordinator.cpp
     src/Renderer/Displacement/DisplacementCommandRecorder.cpp
+    src/Renderer/Preview/MaterialPreviewRenderer.cpp
+    src/Renderer/Preview/MaterialThumbnailDiskCache.cpp
+    src/Renderer/Preview/MaterialThumbnailValidation.cpp
+    src/Renderer/ProjectTextureLoader.cpp
     src/Renderer/Displacement/DisplacementRequestValidation.cpp
     src/Renderer/Diagnostics/FrameHitchDiagnostics.cpp
     src/Renderer/Displacement/DisplacementGeometryBinding.cpp
@@ -114,7 +118,12 @@ add_executable(Engine
     src/Editor/Editor.cpp
     src/Editor/EditorWorkspace.cpp
     src/Editor/InspectorPanel.cpp
+    src/assets/ProjectAssetDeletion.cpp
+    src/assets/ProjectAssetRename.cpp
+    src/assets/AssetReconciliationTransaction.cpp
+    src/assets/ProjectAssetReconciliation.cpp
     src/Editor/TextureThumbnailCache.cpp
+    src/Editor/TextureThumbnailDiskCache.cpp
     src/Editor/AssetBrowser.cpp
     src/Renderer/Passes/RayTracedReflectionPass.cpp
     src/Renderer/Passes/RayTracedReflectionDenoisePass.cpp

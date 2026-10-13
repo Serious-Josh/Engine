@@ -61,6 +61,12 @@ class CommandContext
     ID3D12GraphicsCommandList4* GetRayTracingCommandList() const;
 
     uint64_t GetCompletedFenceValue() const;
+    // Borrowed fence values are valid only within this context lifetime.
+    uint64_t GetLastSubmissionFenceValue() const
+    {
+        return m_lastSubmissionFence;
+    }
+
     uint64_t GetFrameFenceValue(unsigned int frameIndex) const;
 
     // Single-threaded, like submission. Capture immediately after successful

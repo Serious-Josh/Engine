@@ -13,6 +13,9 @@ struct ResolvedSceneObject
     std::string id;
     std::string name;
     RenderObject renderObject;
+
+    // Preparation provenance: null mesh is permitted only for an empty binding.
+    bool meshBindingEmpty = false;
 };
 
 // Resolves every document object before returning any results.

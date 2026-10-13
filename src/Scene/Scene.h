@@ -35,6 +35,8 @@ class Scene
     std::vector<RenderObject>& GetRenderObjects();
     const std::vector<RenderObject>& GetRenderObjects() const;
 
+    bool HasRenderableMeshes() const noexcept;
+
     Camera& GetCamera();
     const Camera& GetCamera() const;
 

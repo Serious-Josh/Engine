@@ -1,4 +1,5 @@
 #include "AssetBrowser.h"
+#include "Renderer/Renderer.h"
 #include "EditorWorkspace.h"
 
 #include "Project/ProjectLocator.h"
@@ -344,6 +345,7 @@ void AssetBrowser::Navigate(const std::filesystem::path& path)
     if (CanBrowse(path, m_error))
     {
         m_thumbnailResetRequested = true;
+        m_materialRequestsReset = true;
         m_directory = path;
         m_selection.clear();
     }
@@ -413,6 +415,7 @@ void AssetBrowser::DrawContents()
     const int columns = (std::max)(1, static_cast<int>(ImGui::GetContentRegionAvail().x / 112.0f));
     std::filesystem::path destination;
     bool tileHovered = false;
+    size_t visibleMaterialCount = 0;
 
     if (ImGui::BeginTable("Files", columns, ImGuiTableFlags_SizingStretchSame))
     {
@@ -425,16 +428,22 @@ void AssetBrowser::DrawContents()
             ImGui::BeginGroup();
             const auto registered = m_textureRecords.find(entry.path.lexically_normal());
             const bool isTexture = !entry.directory && registered != m_textureRecords.end();
+            const auto material = m_materialRecords.find(entry.path.lexically_normal());
+            const bool isMaterial = !entry.directory && material != m_materialRecords.end() &&
+                _wcsicmp(entry.path.extension().c_str(), L".material") == 0;
+            const bool hasThumbnail = isTexture || isMaterial;
             const auto tilePosition = ImGui::GetCursorScreenPos();
             constexpr float thumbnailSize = 96.0f;
-            const bool pressed = ImGui::Selectable(isTexture ? "##Texture" : entry.directory ? "[Folder]" : "[File]",
+            const bool pressed = ImGui::Selectable(isTexture ? "##Texture" : isMaterial ? "##Material" : entry.directory ? "[Folder]" : "[File]",
                 m_selection == entry.path, ImGuiSelectableFlags_AllowDoubleClick,
-                isTexture ? ImVec2(thumbnailSize, thumbnailSize) : ImVec2(0.0f, 48.0f));
+                hasThumbnail ? ImVec2(thumbnailSize, thumbnailSize) : ImVec2(0.0f, 48.0f));
             const TextureThumbnailCache::Preview* preview = nullptr;
 
-            if(isTexture && ImGui::IsItemVisible())
+            std::string materialError;
+
+            if(hasThumbnail && ImGui::IsItemVisible())
             {
-                if(!m_thumbnailResetRequested && m_thumbnailPaths && m_thumbnailRegistry)
+                if(isTexture && !m_thumbnailResetRequested && m_thumbnailPaths && m_thumbnailRegistry)
                 {
                     preview = m_thumbnails.FindOrCreate(*m_thumbnailPaths, *m_thumbnailRegistry, registered->second);
                 }
@@ -453,9 +462,31 @@ void AssetBrowser::DrawContents()
                     draw->AddImage(static_cast<ImTextureID>(m_thumbnails.GetHandle(*preview).ptr), position,
                         ImVec2(position.x + size.x, position.y + size.y));
                 }
+                else if(isMaterial && m_materialRenderer && m_thumbnailPaths && m_thumbnailRegistry)
+                {
+                    std::optional<MaterialPreviewImage> image;
+
+                    if(visibleMaterialCount++ < MaterialPreviewRenderer::kThumbnailCapacity)
+                    {
+                        m_materialRenderer->RequestSavedMaterialThumbnail(
+                            *m_thumbnailPaths, *m_thumbnailRegistry, material->second.id, materialError);
+                        // Lookup registers this exact image's current ImGui reference with Renderer.
+                        image = m_materialRenderer->GetSavedMaterialThumbnailImage(*m_thumbnailPaths, material->second.id);
+                    }
+
+                    if(image)
+                    {
+                        draw->AddImage(static_cast<ImTextureID>(image->srv.ptr), start, end);
+                    }
+                    else
+                    {
+                        draw->AddText(ImVec2(start.x + 5.0f, start.y + 5.0f), IM_COL32(190, 190, 190, 255), "Material");
+                    }
+                }
                 else
                 {
-                    draw->AddText(ImVec2(start.x + 5.0f, start.y + 5.0f), IM_COL32(190, 190, 190, 255), "Texture");
+                    draw->AddText(ImVec2(start.x + 5.0f, start.y + 5.0f), IM_COL32(190, 190, 190, 255),
+                        isMaterial ? "Material" : "Texture");
                 }
             }
             ImGui::PushTextWrapPos(0.0f);
@@ -480,7 +511,45 @@ void AssetBrowser::DrawContents()
             {
                 ImGui::SetTooltip("%s%s%s", entry.name.c_str(),
                     entry.directory && !entry.navigable ? " (directory link; browsing disabled)" : "",
-                    preview && !preview->error.empty() ? ("\n" + preview->error).c_str() : "");
+                    preview && !preview->error.empty() ? ("\n" + preview->error).c_str() :
+                    !materialError.empty() ? ("\n" + materialError).c_str() : "");
+            }
+
+            const DWORD attributes = GetFileAttributesW(entry.path.c_str());
+            const bool ordinaryFile = attributes != INVALID_FILE_ATTRIBUTES &&
+                (attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) == 0;
+
+            std::string deleteEligibility;
+            const bool eligible = ordinaryFile && m_thumbnailPaths &&
+                entry.path != m_thumbnailPaths->GetAssetRegistryPath() && CanBrowse(entry.path.parent_path(), deleteEligibility);
+
+            if(eligible && hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right))
+            {
+                ImGui::OpenPopup("FileContext");
+            }
+
+            if(eligible && ImGui::BeginPopup("FileContext"))
+            {
+                const bool canRequest = m_deleteTarget.empty() && !m_deleteRequest && m_renameTarget.empty();
+
+                if(ImGui::MenuItem("Rename", nullptr, false, canRequest))
+                {
+                    m_renameTarget = entry.path;
+                    const auto stem = entry.path.stem().u8string();
+                    m_renameStem.fill(0);
+                    memcpy(m_renameStem.data(), stem.data(), (std::min)(stem.size(), m_renameStem.size() - 1));
+                    m_renameError.clear();
+                    m_openRenameModal = true;
+                    m_focusRename = true;
+                }
+
+                if(ImGui::MenuItem("Delete", nullptr, false, canRequest))
+                {
+                    m_deleteTarget = entry.path;
+                    m_openDeleteModal = true;
+                }
+
+                ImGui::EndPopup();
             }
 
             ImGui::PopID();
@@ -533,6 +602,23 @@ void AssetBrowser::DrawContents()
 void AssetBrowser::Draw(const EditorWorkspaceRect& rectangle)
 {
     m_thumbnails.BeginFrame();
+
+    if(m_materialRenderer)
+    {
+        m_materialRenderer->BeginSavedMaterialThumbnailWorkingSet();
+
+        if(m_materialRequestsReset)
+        {
+            m_materialRenderer->DiscardSavedMaterialThumbnailRequests();
+            m_materialRequestsReset = false;
+        }
+
+        if(m_materialImagesInvalidated)
+        {
+            m_materialRenderer->InvalidateSavedMaterialThumbnailImages();
+            m_materialImagesInvalidated = false;
+        }
+    }
     m_dropTargets.clear();
     m_dropFrame = ImGui::GetFrameCount();
     if(rectangle.size.x <= 0.0f || rectangle.size.y <= 0.0f)
@@ -561,6 +647,8 @@ void AssetBrowser::Draw(const EditorWorkspaceRect& rectangle)
         {
             m_listings.clear();
             m_thumbnailResetRequested = true;
+            m_materialRequestsReset = true;
+            m_materialImagesInvalidated = true;
             m_selection.clear();
             m_error.clear();
         }
@@ -723,6 +811,7 @@ void AssetBrowser::ImportFileDrop(
     {
         // Refresh without clearing folder navigation, selection, or Inspector edits.
         m_listings.clear();
+        m_materialImagesInvalidated = true;
     }
 }
 
@@ -731,16 +820,40 @@ void AssetBrowser::SetThumbnailProject(const ProjectPaths& paths, const ProjectA
     if(!m_thumbnailProjectRoot.empty() && m_thumbnailProjectRoot != paths.GetRoot())
     {
         m_thumbnailResetRequested = true;
+        m_materialRequestsReset = true;
+        m_materialImagesInvalidated = true;
     }
 
     m_thumbnailProjectRoot = paths.GetRoot();
     m_thumbnailPaths = paths;
     m_thumbnailRegistry = &registry;
     m_textureRecords.clear();
+    m_materialRecords.clear();
 
     for(const auto& record : registry.GetAssets(AssetType::Texture))
     {
         m_textureRecords.emplace((paths.GetRoot() / record.relativePath).lexically_normal(), record);
+    }
+
+    for(const auto& record : registry.GetAssets(AssetType::Material))
+    {
+        m_materialRecords.emplace((paths.GetRoot() / record.relativePath).lexically_normal(), record);
+    }
+}
+
+void AssetBrowser::InvalidateMaterialSource(const std::filesystem::path& path)
+{
+    if(m_materialRenderer)
+    {
+        m_materialRenderer->InvalidateSavedMaterialThumbnailSource(path);
+    }
+}
+
+void AssetBrowser::PauseMaterialThumbnails()
+{
+    if(m_materialRenderer)
+    {
+        m_materialRenderer->DiscardSavedMaterialThumbnailRequests();
     }
 }
 
@@ -748,4 +861,167 @@ void AssetBrowser::ClearThumbnailsAfterGPUDrain()
 {
     m_thumbnails.ClearAfterGPUDrain();
     m_thumbnailResetRequested = false;
+}
+
+void AssetBrowser::DrawDeletionConfirmation(bool protectedEdits)
+{
+    if(m_openDeleteModal)
+    {
+        ImGui::OpenPopup("Delete project file");
+        m_openDeleteModal = false;
+    }
+
+    if(ImGui::BeginPopupModal("Delete project file", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
+    {
+        ImGui::TextWrapped("Delete '%s' permanently?", DisplayName(m_deleteTarget).c_str());
+        ImGui::TextUnformatted("This will remove the file from disk. This action cannot be undone.");
+
+        if(protectedEdits)
+        {
+            ImGui::TextWrapped("Save or discard pending Inspector edits before deleting files.");
+        }
+
+        ImGui::BeginDisabled(protectedEdits);
+
+        if(ImGui::Button("Delete"))
+        {
+            m_deleteRequest = m_deleteTarget;
+            m_deleteTarget.clear();
+            ImGui::CloseCurrentPopup();
+        }
+
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+
+        if(ImGui::Button("Cancel") || ImGui::IsKeyPressed(ImGuiKey_Escape, false))
+        {
+            m_deleteTarget.clear();
+            ImGui::CloseCurrentPopup();
+        }
+
+        ImGui::EndPopup();
+    }
+}
+
+std::optional<std::filesystem::path> AssetBrowser::TakeDeletionRequest()
+{
+    return std::exchange(m_deleteRequest, std::nullopt);
+}
+
+void AssetBrowser::OnDeletionCompleted(const std::filesystem::path& path, const std::string& error)
+{
+    m_error = error;
+    // Also refresh on failure: rollback errors must not leave a stale usable tile.
+    m_listings.erase(path.parent_path());
+
+    if(error.empty())
+    {
+        m_thumbnails.Invalidate(path);
+        m_textureRecords.erase(path.lexically_normal());
+        m_materialRecords.erase(path.lexically_normal());
+        m_materialImagesInvalidated = true;
+        m_materialRequestsReset = true;
+
+        if(m_selection == path)
+        {
+            m_selection.clear();
+        }
+    }
+}
+
+void AssetBrowser::DrawRenameModal(bool protectedEdits)
+{
+    if(m_openRenameModal)
+    {
+        ImGui::OpenPopup("Rename project file");
+        m_openRenameModal = false;
+    }
+
+    if(ImGui::BeginPopupModal("Rename project file", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
+    {
+        if(m_closeRenameModal)
+        {
+            m_closeRenameModal = false;
+            m_renameTarget.clear();
+            ImGui::CloseCurrentPopup();
+            ImGui::EndPopup();
+            return;
+        }
+
+        ImGui::TextWrapped("Rename '%s'", DisplayName(m_renameTarget).c_str());
+
+        if(m_focusRename)
+        {
+            ImGui::SetKeyboardFocusHere();
+            m_focusRename = false;
+        }
+
+        const bool enter = ImGui::InputText("Filename stem", m_renameStem.data(), m_renameStem.size(),
+            ImGuiInputTextFlags_AutoSelectAll | ImGuiInputTextFlags_EnterReturnsTrue);
+        ImGui::Text("Extension (preserved): %s", DisplayName(m_renameTarget.extension()).c_str());
+
+        if(!m_renameError.empty())
+        {
+            ImGui::TextWrapped("%s", m_renameError.c_str());
+        }
+
+        if(protectedEdits)
+        {
+            ImGui::TextWrapped("Save or discard pending Inspector edits before renaming files.");
+        }
+
+        const bool blocked = protectedEdits || m_renamePending;
+        ImGui::BeginDisabled(blocked);
+        const bool confirm = ImGui::Button("Rename");
+        ImGui::EndDisabled();
+
+        if(!blocked && (confirm || enter))
+        {
+            m_renameRequest = RenameRequest{m_renameTarget, m_renameStem.data()};
+            m_renamePending = true;
+        }
+
+        ImGui::SameLine();
+
+        if(!m_renamePending && (ImGui::Button("Cancel") || ImGui::IsKeyPressed(ImGuiKey_Escape, false)))
+        {
+            m_renameTarget.clear();
+            ImGui::CloseCurrentPopup();
+        }
+
+        ImGui::EndPopup();
+    }
+}
+
+std::optional<AssetBrowser::RenameRequest> AssetBrowser::TakeRenameRequest()
+{
+    return std::exchange(m_renameRequest, std::nullopt);
+}
+
+void AssetBrowser::OnRenameCompleted(
+    const std::filesystem::path& source,
+    const std::filesystem::path& destination,
+    const std::string& error)
+{
+    m_renamePending = false;
+    m_renameError = error;
+    m_listings.erase(source.parent_path());
+
+    if(error.empty())
+    {
+        m_closeRenameModal = true;
+        m_materialImagesInvalidated = true;
+        m_materialRequestsReset = true;
+
+        if(source != destination)
+        {
+            m_thumbnails.Invalidate(source);
+            m_textureRecords.erase(source.lexically_normal());
+        }
+
+        if(m_selection == source)
+        {
+            m_selection = destination;
+        }
+    }
 }

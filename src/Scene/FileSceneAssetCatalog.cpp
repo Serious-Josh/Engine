@@ -8,6 +8,7 @@
 #include "Renderer/Geometry/SphereGenerator.h"
 #include "Renderer/ImageLoader.h"
 #include "Renderer/DDSLoader.h"
+#include "Renderer/ProjectTextureLoader.h"
 #include "assets/ProjectAssetResolver.h"
 #include "assets/MaterialAssetSerializer.h"
 
@@ -398,18 +399,12 @@ Texture* FileSceneAssetCatalog::ResolveTexture(
         return fail("Texture loading requires an initialized file-scene asset catalog.");
     }
 
-    MipFilterMode filter;
-
+    // Preserve interpretation rejection before reference/registry validation.
     switch(interpretation)
     {
     case ProjectTextureInterpretation::SRGBColor:
-        filter = MipFilterMode::SRGBColor;
-        break;
     case ProjectTextureInterpretation::LinearData:
-        filter = MipFilterMode::LinearData;
-        break;
     case ProjectTextureInterpretation::NormalMap:
-        filter = MipFilterMode::NormalMap;
         break;
     default:
         return fail("Unsupported project texture sampling interpretation.");
@@ -468,92 +463,11 @@ Texture* FileSceneAssetCatalog::ResolveTexture(
             return &cached->second;
         }
 
-        std::string extension = resolved.resolvedPath.extension().string();
-        std::transform(extension.begin(), extension.end(), extension.begin(), [](unsigned char character)
+        if(!LoadProjectTexture(m_device, *m_uploader, *m_descriptorHeap,
+                resolved.resolvedPath, interpretation, texture, errorMessage))
         {
-            return static_cast<char>(std::tolower(character));
-        });
-
-        if(extension == ".dds")
-        {
-            // Preserve DDSLoader's format restrictions and authored mip chain.
-            if(!DDSLoader::LoadTexture(m_device, *m_uploader, *m_descriptorHeap,
-                                       resolved.resolvedPath, texture,
-                                       interpretation == ProjectTextureInterpretation::SRGBColor))
-            {
-                texture.Shutdown();
-                return fail("DDS texture load/upload failed: " + resolved.resolvedPath.string() +
-                            ". Supported formats are BC1, BC4, and BC5; only BC1 supports sRGB.");
-            }
-        }
-        else if(extension == ".hdr")
-        {
-            if(interpretation != ProjectTextureInterpretation::LinearData)
-            {
-                return fail("HDR textures require linear interpretation; sRGB and normal-map HDR loading are unsupported.");
-            }
-
-            HDRImageData image;
-
-            if(!ImageLoader::LoadHDR(resolved.resolvedPath, image))
-            {
-                return fail("Cannot decode HDR texture: " + resolved.resolvedPath.string());
-            }
-
-            // Existing HDR decoding is float RGBA and has no CPU float mip generator.
-            if(!texture.Initialize(m_device, image.pixels.data(), image.width, image.height,
-                                   DXGI_FORMAT_R32G32B32A32_FLOAT, sizeof(float) * 4) ||
-               !m_uploader->UploadTexture(texture.GetResource(), texture.GetInitialData(), texture.GetInitialDataSize()) ||
-               !texture.CreateSRV(m_device, *m_descriptorHeap))
-            {
-                texture.Shutdown();
-                return fail("Failed to create/upload HDR texture or allocate its SRV.");
-            }
-        }
-        else
-        {
-            const bool commonImage = extension == ".png" || extension == ".jpg" || extension == ".jpeg" || extension == ".tga";
-            const bool additionalImage = extension == ".bmp" || extension == ".psd" || extension == ".gif" || extension == ".pic";
-            const bool portableImage = extension == ".pnm" || extension == ".ppm" || extension == ".pgm";
-
-            if(!commonImage && !additionalImage && !portableImage)
-            {
-                return fail("Unsupported project texture extension: " + extension);
-            }
-
-            ImageData image;
-            ImageMipChain mipChain;
-
-            if(!ImageLoader::Load(resolved.resolvedPath, image) ||
-               !ImageLoader::GenerateMipChain(image, filter, mipChain))
-            {
-                return fail("Cannot decode texture or generate its mip chain: " + resolved.resolvedPath.string());
-            }
-
-            if(mipChain.levels.size() > (std::numeric_limits<unsigned int>::max)())
-            {
-                return fail("Texture mip count exceeds the supported limit.");
-            }
-
-            std::vector<TextureSubresourceData> subresources;
-            subresources.reserve(mipChain.levels.size());
-
-            for(const auto& level : mipChain.levels)
-            {
-                subresources.push_back({level.pixels.data(), static_cast<size_t>(level.width) * 4, level.pixels.size()});
-            }
-
-            const auto mipCount = static_cast<unsigned int>(subresources.size());
-            const DXGI_FORMAT srvFormat = interpretation == ProjectTextureInterpretation::SRGBColor
-                ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB : DXGI_FORMAT_R8G8B8A8_UNORM;
-
-            if(!texture.InitializeMipmapped(m_device, image.width, image.height, mipCount, DXGI_FORMAT_R8G8B8A8_UNORM) ||
-               !m_uploader->UploadTexture(texture.GetResource(), subresources.data(), mipCount) ||
-               !texture.CreateSRV(m_device, *m_descriptorHeap, srvFormat))
-            {
-                texture.Shutdown();
-                return fail("Failed to create/upload image texture or allocate its SRV.");
-            }
+            texture.Shutdown();
+            return nullptr;
         }
 
         // Upload success proves completion on the uploader queue. Publication does

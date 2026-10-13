@@ -1,6 +1,25 @@
 #include "assets/ProjectAssetRegistry.h"
 
 #include <algorithm>
+#include <Windows.h>
+
+bool ProjectAssetRegistry::PathsEqual(
+    const std::filesystem::path& left,
+    const std::filesystem::path& right)
+{
+    const auto a = left.lexically_normal().native();
+    const auto b = right.lexically_normal().native();
+    return CompareStringOrdinal(a.c_str(), -1, b.c_str(), -1, TRUE) == CSTR_EQUAL;
+}
+
+const AssetRecord* ProjectAssetRegistry::FindByPath(const std::filesystem::path& relativePath) const
+{
+    const auto found = std::find_if(m_records.begin(), m_records.end(), [&](const AssetRecord& record)
+    {
+        return PathsEqual(record.relativePath, relativePath);
+    });
+    return found == m_records.end() ? nullptr : &*found;
+}
 
 bool ProjectAssetRegistry::Register(const AssetRecord& record)
 {
@@ -10,7 +29,7 @@ bool ProjectAssetRegistry::Register(const AssetRecord& record)
 
     for(const AssetRecord& existing : m_records){
         if(existing.id == record.id ||
-           existing.relativePath == record.relativePath){
+           PathsEqual(existing.relativePath, record.relativePath)){
             return false;
            }
     }
@@ -66,7 +85,7 @@ bool ProjectAssetRegistry::UpdatePath(const AssetID& id, const std::filesystem::
     }
 
     for(const AssetRecord& existing : m_records){
-        if(existing.id != id && existing.relativePath == newRelativePath){
+        if(existing.id != id && PathsEqual(existing.relativePath, newRelativePath)){
             return false;
         }
     }

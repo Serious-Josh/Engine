@@ -7,6 +7,7 @@
 #include "Renderer/Pipeline.h"
 #include "Renderer/VertexLayout.h"
 #include "Renderer/Texture.h"
+#include "Renderer/ProjectTextureLoader.h"
 
 #include <filesystem>
 #include <map>
@@ -20,13 +21,6 @@ class DescriptorHeap;
 class Shader;
 class ProjectPaths;
 class ProjectAssetRegistry;
-
-enum class ProjectTextureInterpretation
-{
-    SRGBColor,
-    LinearData,
-    NormalMap
-};
 
 class FileSceneAssetCatalog final : public SceneAssetResolver
 {

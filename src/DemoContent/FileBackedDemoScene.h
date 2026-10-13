@@ -26,6 +26,11 @@ public:
 
     void SetProjectAssets(const std::filesystem::path& root, const ProjectAssetRegistry& registry);
 
+    const std::filesystem::path& GetScenePath() const noexcept
+    {
+        return m_scenePath;
+    }
+
     const std::string& GetDisplayName() const noexcept;
     bool Save(std::string* errorMessage = nullptr);
     bool CheckUnsavedChanges(bool& dirty, std::string* errorMessage = nullptr) const;

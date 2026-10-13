@@ -49,6 +49,9 @@ public:
     };
 
     // Normal user-close requests may be deferred until material edits are resolved.
+    void ProcessAssetRename(const ProjectPaths& paths, ProjectAssetRegistry& registry,
+        const std::filesystem::path& activeScenePath);
+    void ProcessAssetDeletion(const ProjectPaths& paths, ProjectAssetRegistry& registry);
     bool RequestApplicationClose();
     bool TakeApplicationCloseApproval();
 
@@ -66,6 +69,20 @@ public:
     {
         m_assetBrowser.ConfigureThumbnails(device, uploader, heap);
     }
+    void ConfigureMaterialThumbnails(Renderer& renderer)
+    {
+        m_assetBrowser.ConfigureMaterialThumbnails(renderer);
+    }
+    void SetThumbnailCompletedFence(std::uint64_t fence)
+    {
+        m_assetBrowser.SetThumbnailCompletedFence(fence);
+    }
+
+    void ConfirmThumbnailSubmission(std::uint64_t fence)
+    {
+        m_assetBrowser.ConfirmThumbnailSubmission(fence);
+    }
+
     bool NeedsThumbnailReset() const
     {
         return m_assetBrowser.NeedsThumbnailReset();
@@ -79,6 +96,11 @@ public:
     std::vector<Texture*> GetThumbnailTextures()
     {
         return m_assetBrowser.GetThumbnailTextures();
+    }
+
+    const std::optional<MaterialPreviewRequest>& GetMaterialPreviewRequest()
+    {
+        return m_inspectorPanel.GetPreviewRequest();
     }
 
     void SetSceneOperationPending(bool pending) noexcept;
@@ -113,7 +135,8 @@ public:
         unsigned int sceneHeight,
         float deltaTime,
         const ProjectPaths& projectPaths,
-        const ProjectAssetRegistry& assetRegistry);
+        const ProjectAssetRegistry& assetRegistry,
+        const std::optional<MaterialPreviewImage>& materialPreview);
 
     size_t GetSelectedObject() const
     {

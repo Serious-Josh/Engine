@@ -2,6 +2,7 @@
 #include "EditorWorkspace.h"
 #include "assets/ProjectAssetResolver.h"
 #include "assets/MaterialAssetSerializer.h"
+#include "Renderer/Material.h"
 
 #include <utility>
 #include <fstream>
@@ -78,10 +79,94 @@ namespace
     }
 }
 
+const std::optional<MaterialPreviewRequest>& InspectorPanel::GetPreviewRequest()
+{
+    if(!m_material || !m_record)
+    {
+        m_previewRequest.reset();
+        m_previewDraft.reset();
+        m_previewYaw = 0.0f;
+        m_previewPitch = 0.0f;
+        m_previewOrientationDirty = false;
+        return m_previewRequest;
+    }
+
+    const std::string identity = m_record->id.ToReference();
+
+    if(m_previewIdentity != identity || m_previewProject != m_projectRoot)
+    {
+        m_previewYaw = 0.0f;
+        m_previewPitch = 0.0f;
+        m_previewOrientationDirty = false;
+    }
+
+    if(m_previewDraft && m_previewIdentity == identity && m_previewProject == m_projectRoot &&
+       EqualMaterials(*m_previewDraft, *m_material))
+    {
+        if(m_previewRequest)
+        {
+            m_previewRequest->dependencyRevision = m_previewTextureRefresh;
+        }
+
+        if(m_previewRequest && m_previewOrientationDirty)
+        {
+            m_previewRequest->yaw = m_previewYaw;
+            m_previewRequest->pitch = m_previewPitch;
+            m_previewRequest->revision = ++m_previewRevision;
+            m_previewOrientationDirty = false;
+        }
+
+        return m_previewRequest;
+    }
+
+    m_previewDraft = m_material;
+    m_previewIdentity = identity;
+    m_previewProject = m_projectRoot;
+    m_previewRequest.reset();
+
+    // Validate the draft through the established serializer without writing it.
+    // Invalid edits remain editable/autosave-controlled, but are not sent to the GPU.
+    try
+    {
+        MaterialAssetSerializer::Serialize(*m_material);
+        Material material;
+        material.model = m_material->model;
+        material.roughness = m_material->roughness;
+        material.metallic = m_material->metallic;
+        material.ior = m_material->ior;
+        material.surfaceDetailMode = m_material->surfaceDetailMode;
+        material.heightScale = m_material->heightScale;
+        material.heightBias = m_material->heightBias;
+        material.preferARM = m_material->preferARM;
+
+        for(size_t index = 0; index < 3; ++index)
+        {
+            material.baseColor[index] = m_material->baseColor[index];
+            material.conductorN[index] = m_material->conductorN[index];
+            material.conductorK[index] = m_material->conductorK[index];
+        }
+
+        m_previewRequest = MaterialPreviewRequest{
+            m_projectRoot, identity, ++m_previewRevision, material.GetGPUData(), m_previewYaw, m_previewPitch};
+        m_previewRequest->textures = {m_material->baseColorTexture, m_material->normalTexture,
+            m_material->roughnessTexture, m_material->metallicTexture, m_material->armTexture,
+            m_material->aoTexture, m_material->heightTexture};
+        m_previewRequest->dependencyRevision = m_previewTextureRefresh;
+        m_previewOrientationDirty = false;
+    }
+    catch(const std::exception&)
+    {
+        // Safe idle state until a valid working copy is available again.
+    }
+
+    return m_previewRequest;
+}
+
 void InspectorPanel::Draw(
     const EditorWorkspaceRect& rectangle,
     const ProjectPaths& paths,
     const ProjectAssetRegistry& registry,
+    const std::optional<MaterialPreviewImage>& preview,
     bool protectedAction)
 {
     if(rectangle.size.x <= 0.0f || rectangle.size.y <= 0.0f)
@@ -98,6 +183,11 @@ void InspectorPanel::Draw(
         ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings |
         ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoFocusOnAppearing;
 
+    if(m_material)
+    {
+        flags |= ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse;
+    }
+
     // ImGui otherwise enforces title-bar height even when the assigned panel is smaller.
     if(rectangle.size.y < ImGui::GetFrameHeight())
     {
@@ -107,6 +197,20 @@ void InspectorPanel::Draw(
     if(ImGui::Begin("Inspector", nullptr, flags))
     {
         EditorWorkspace::KeepCurrentWindowBehindFloatingUI();
+        const bool materialLayout = m_material.has_value();
+        const ImVec2 available = ImGui::GetContentRegionAvail();
+        const float spacing = ImGui::GetStyle().ItemSpacing.y;
+        const float labelHeight = ImGui::GetTextLineHeightWithSpacing();
+        const float previewSize = (std::max)(0.0f, (std::min)(available.x,
+            available.y * 0.45f - labelHeight - spacing * 2.0f));
+
+        if(materialLayout)
+        {
+            const float propertiesHeight = (std::max)(1.0f,
+                available.y - previewSize - labelHeight - spacing * 2.0f - 1.0f);
+            ImGui::BeginChild("Material Properties", ImVec2(0.0f, propertiesHeight));
+        }
+
         if(ImGui::Button("Refresh"))
         {
             m_refreshRequested = true;
@@ -179,6 +283,71 @@ void InspectorPanel::Draw(
         {
             ImGui::TextWrapped("%s", m_status.c_str());
         }
+
+        if(materialLayout)
+        {
+            ImGui::EndChild();
+            ImGui::Separator();
+            ImGui::TextUnformatted("Material Preview");
+            const auto& request = GetPreviewRequest();
+            const ImVec2 remaining = ImGui::GetContentRegionAvail();
+            const float size = (std::max)(0.0f, (std::min)(previewSize,
+                (std::min)(remaining.x, remaining.y)));
+
+            if(size > 0.0f)
+            {
+                if(preview && request && preview->srv.ptr != 0 &&
+                   preview->projectRoot == request->projectRoot &&
+                   preview->materialIdentity == request->materialIdentity)
+                {
+                    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (remaining.x - size) * 0.5f);
+                    ImGui::PushID(request->materialIdentity.c_str());
+                    ImGui::InvisibleButton("Preview Rotation", ImVec2(size, size), ImGuiButtonFlags_MouseButtonLeft);
+                    ImGui::GetWindowDrawList()->AddImage(static_cast<ImTextureID>(preview->srv.ptr),
+                        ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+
+                    if(ImGui::IsItemHovered() || ImGui::IsItemActive())
+                    {
+                        ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeAll);
+                    }
+
+                    const float previousYaw = m_previewYaw;
+                    const float previousPitch = m_previewPitch;
+
+                    if(ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
+                    {
+                        m_previewYaw = 0.0f;
+                        m_previewPitch = 0.0f;
+                    }
+                    else if(ImGui::IsItemActive() && ImGui::IsMouseDown(ImGuiMouseButton_Left))
+                    {
+                        const ImVec2 delta = ImGui::GetIO().MouseDelta;
+
+                        if(std::isfinite(delta.x) && std::isfinite(delta.y))
+                        {
+                            // Radians per logical mouse pixel, independent of frame time.
+                            constexpr float sensitivity = 0.01f;
+                            constexpr float twoPi = 6.28318530718f;
+                            // With the fixed camera looking toward +Z, subtract mouse
+                            // deltas so the visible surface follows the screen-space drag.
+                            m_previewYaw = std::remainder(m_previewYaw - delta.x * sensitivity, twoPi);
+                            m_previewPitch = std::clamp(m_previewPitch - delta.y * sensitivity, -1.4f, 1.4f);
+                        }
+                    }
+
+                    if(previousYaw != m_previewYaw || previousPitch != m_previewPitch)
+                    {
+                        m_previewOrientationDirty = true;
+                    }
+
+                    ImGui::PopID();
+                }
+                else
+                {
+                    ImGui::TextWrapped("Preview unavailable or pending.");
+                }
+            }
+        }
     }
 
     ImGui::End();
@@ -223,6 +392,7 @@ void InspectorPanel::LoadSelection(
     const ProjectAssetRegistry& registry)
 {
     ++m_texturePickerGeneration;
+    ++m_previewTextureRefresh;
     m_textureSearch.fill(0);
     m_texturePickerRegistry.clear();
     m_availableTextures.clear();
@@ -338,30 +508,36 @@ void InspectorPanel::DrawMaterial(
     ImGui::SliderFloat("Roughness", &material.roughness, 0.0f, 1.0f, "%.4f", ImGuiSliderFlags_AlwaysClamp);
     ImGui::SliderFloat("Metallic", &material.metallic, 0.0f, 1.0f, "%.4f", ImGuiSliderFlags_AlwaysClamp);
 
-    ImGui::SeparatorText("Optical properties (all serialized values)");
-
-    if(ImGui::InputFloat("IOR (> 0)", &material.ior))
+    if(material.model == MaterialModel::Dielectric || material.model == MaterialModel::Conductor)
     {
-        material.ior = (std::max)(material.ior, (std::numeric_limits<float>::min)());
+        ImGui::SeparatorText("Optical properties");
     }
 
-    if(ImGui::InputFloat3("Conductor N (>= 0)", material.conductorN.data()))
+    if(material.model == MaterialModel::Dielectric)
     {
-        for(auto& value : material.conductorN)
+        if(ImGui::InputFloat("IOR (> 0)", &material.ior))
         {
-            value = (std::max)(value, 0.0f);
+            material.ior = (std::max)(material.ior, (std::numeric_limits<float>::min)());
         }
     }
-
-    if(ImGui::InputFloat3("Conductor K (>= 0)", material.conductorK.data()))
+    else if(material.model == MaterialModel::Conductor)
     {
-        for(auto& value : material.conductorK)
+        if(ImGui::InputFloat3("Conductor N (>= 0)", material.conductorN.data()))
         {
-            value = (std::max)(value, 0.0f);
+            for(auto& value : material.conductorN)
+            {
+                value = (std::max)(value, 0.0f);
+            }
+        }
+
+        if(ImGui::InputFloat3("Conductor K (>= 0)", material.conductorK.data()))
+        {
+            for(auto& value : material.conductorK)
+            {
+                value = (std::max)(value, 0.0f);
+            }
         }
     }
-
-    ImGui::TextWrapped("IOR applies to dielectric shading; N/K apply to conductor shading. All values are preserved when changing models.");
 
     ImGui::SeparatorText("Surface detail");
 
@@ -513,6 +689,7 @@ void InspectorPanel::DrawTextureReference(
 
             if(ImGui::SmallButton("Refresh textures"))
             {
+                ++m_previewTextureRefresh;
                 m_refreshTextureChoices = true;
             }
 
@@ -641,6 +818,11 @@ void InspectorPanel::Revert()
     m_persistenceState = PersistenceState::Saved;
 }
 
+std::optional<std::filesystem::path> InspectorPanel::TakeSavedMaterialSource()
+{
+    return std::exchange(m_savedThumbnailSource, std::nullopt);
+}
+
 bool InspectorPanel::Save(
     const ProjectPaths& paths,
     const ProjectAssetRegistry& registry,
@@ -704,12 +886,14 @@ bool InspectorPanel::WriteMaterial(
         // Precompute the exact serializer output before replacement; no fallible reread after publishing.
         std::string saved = MaterialAssetSerializer::Serialize(*m_material).dump(4) + '\n';
         MaterialAssetData baseline = *m_material;
+        auto thumbnailSource = resolved.resolvedPath;
 
         if(!MaterialAssetSerializer::SaveToFile(*m_material, resolved.resolvedPath, &m_status))
         {
             return false;
         }
 
+        m_savedThumbnailSource = std::move(thumbnailSource);
         m_savedMaterial = std::move(baseline);
         m_savedBytes = std::move(saved);
         m_externalConflict = false;
