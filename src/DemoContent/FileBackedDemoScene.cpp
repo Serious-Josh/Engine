@@ -182,6 +182,23 @@ const std::string& FileBackedDemoScene::GetDisplayName() const noexcept
     return m_runtime.GetFileScene().GetDocument().name;
 }
 
+std::optional<SceneObjectMetadata> FileBackedDemoScene::GetObjectMetadata(
+    RenderObjectID runtimeIndex,
+    std::string* errorMessage) const
+{
+    if(!m_initialized)
+    {
+        if(errorMessage)
+        {
+            *errorMessage = "File-backed scene metadata is unavailable before successful initialization or after shutdown.";
+        }
+
+        return std::nullopt;
+    }
+
+    return m_runtime.GetObjectMetadata(runtimeIndex, errorMessage);
+}
+
 bool FileBackedDemoScene::Save(std::string* errorMessage)
 {
     if (!m_initialized)
@@ -197,9 +214,180 @@ bool FileBackedDemoScene::Save(std::string* errorMessage)
     return m_runtime.Save(errorMessage);
 }
 
+std::optional<MaterialAssignmentToken> FileBackedDemoScene::PrepareMaterialAssignment(
+    const SceneObjectMetadata& selection, std::string materialReference, std::string* errorMessage)
+{
+    if(!m_initialized)
+    {
+        if(errorMessage)
+        {
+            *errorMessage = "Material assignment requires an initialized file-backed scene.";
+        }
+
+        return std::nullopt;
+    }
+
+    return m_runtime.PrepareMaterialAssignment(selection, std::move(materialReference), errorMessage);
+}
+
+Material* FileBackedDemoScene::ResolveAssignmentMaterial(std::string_view reference, std::string* errorMessage)
+{
+    if(errorMessage)
+    {
+        errorMessage->clear();
+    }
+
+    Material* material = m_initialized ? m_assets.ResolveFreshMaterial(reference) : nullptr;
+
+    if(!material && errorMessage)
+    {
+        *errorMessage = m_initialized ? m_assets.GetLastMaterialError() : "File-backed scene is not initialized.";
+    }
+
+    return material;
+}
+
+bool FileBackedDemoScene::CommitMaterialAssignment(
+    const MaterialAssignmentToken& token, Material& sceneOwnedMaterial, std::string* errorMessage)
+{
+    if(!m_initialized || !m_assets.OwnsMaterial(sceneOwnedMaterial))
+    {
+        if(errorMessage)
+        {
+            *errorMessage = "Assigned material must be retained by this initialized scene's asset catalog.";
+        }
+
+        return false;
+    }
+
+    return m_runtime.CommitMaterialAssignment(token, sceneOwnedMaterial, errorMessage);
+}
+
+bool FileBackedDemoScene::RollbackMaterialAssignment(const MaterialAssignmentToken& token, std::string* errorMessage)
+{
+    if(!m_initialized)
+    {
+        if(errorMessage)
+        {
+            *errorMessage = "Material assignment requires an initialized file-backed scene.";
+        }
+
+        return false;
+    }
+
+    return m_runtime.RollbackMaterialAssignment(token, errorMessage);
+}
+
+bool FileBackedDemoScene::FinishMaterialAssignment(const MaterialAssignmentToken& token, std::string* errorMessage)
+{
+    if(!m_initialized)
+    {
+        if(errorMessage)
+        {
+            *errorMessage = "Material assignment requires an initialized file-backed scene.";
+        }
+
+        return false;
+    }
+
+    return m_runtime.FinishMaterialAssignment(token, errorMessage);
+}
+
+bool FileBackedDemoScene::CancelMaterialAssignment(const MaterialAssignmentToken& token, std::string* errorMessage)
+{
+    if(!m_initialized)
+    {
+        if(errorMessage)
+        {
+            *errorMessage = "Material assignment requires an initialized file-backed scene.";
+        }
+
+        return false;
+    }
+
+    return m_runtime.CancelMaterialAssignment(token, errorMessage);
+}
+
 bool FileBackedDemoScene::CheckUnsavedChanges(
     bool& dirty,
     std::string* errorMessage) const
 {
     return m_runtime.CheckUnsavedChanges(dirty, errorMessage);
+}
+
+std::optional<RuntimeMaterialVersions> FileBackedDemoScene::GetMaterialVersions(
+    const std::filesystem::path& canonicalProject, const AssetID& id, std::string* errorMessage) const
+{
+    if(!m_initialized)
+    {
+        if(errorMessage)
+        {
+            *errorMessage = "Scene material identity requires an initialized file-backed scene.";
+        }
+
+        return std::nullopt;
+    }
+
+    auto result = m_assets.GetMaterialVersions(canonicalProject, id, errorMessage);
+
+    if(result)
+    {
+        result->runtimeIdentity = m_runtime.GetRuntimeIdentity();
+        result->structureRevision = m_runtime.GetScene().GetStructureRevision();
+    }
+
+    return result;
+}
+
+bool FileBackedDemoScene::PublishSavedMaterialParameters(const RuntimeMaterialVersions& expected,
+    const MaterialAssetData& data, std::vector<GPUMaterial> table,
+    const std::function<bool(const std::vector<GPUMaterial>&)>& publisher, std::string* errorMessage)
+{
+    const auto current = GetMaterialVersions(expected.projectIdentity, expected.assetID);
+
+    if(!current || !expected.Matches(*current) || m_runtime.HasMaterialAssignment())
+    {
+        if(errorMessage)
+        {
+            *errorMessage = "Saved material update rejected: scene identity, mapping, or assignment state changed.";
+        }
+
+        return false;
+    }
+
+    return m_assets.PublishSavedMaterialParameters(expected, data, std::move(table), publisher, errorMessage);
+}
+
+SavedMaterialRevisionResult FileBackedDemoScene::AdvanceSavedMaterialRevision(const RuntimeMaterialVersions& expected,
+    const MaterialAssetData& data, const std::string& sourceIdentity, Renderer& renderer,
+    const std::function<bool()>& sourceStillCurrent, std::string& error)
+{
+    const auto current = GetMaterialVersions(expected.projectIdentity, expected.assetID);
+
+    if(!current || !expected.Matches(*current) || m_runtime.HasMaterialAssignment())
+    {
+        CancelSavedMaterialRevision();
+        error = "Saved revision rejected: scene or material assignment identity changed.";
+        return SavedMaterialRevisionResult::Rejected;
+    }
+
+    return m_assets.AdvanceSavedMaterialRevision(expected, data, sourceIdentity, renderer, sourceStillCurrent, error);
+}
+
+void FileBackedDemoScene::CancelSavedMaterialRevision()
+{
+    m_assets.CancelSavedMaterialRevision();
+}
+
+bool FileBackedDemoScene::PublishWorkingMaterialParameters(const RuntimeMaterialVersions& expected,
+    const std::optional<MaterialAssetData>& parameters, Renderer& renderer, std::string& error)
+{
+    if(!m_initialized || expected.runtimeIdentity != m_runtime.GetRuntimeIdentity() ||
+       expected.structureRevision != m_runtime.GetScene().GetStructureRevision() || m_runtime.HasMaterialAssignment())
+    {
+        error = "Working material update rejected: scene or assignment identity changed.";
+        return false;
+    }
+
+    return m_assets.PublishWorkingMaterialParameters(expected, parameters, renderer, error);
 }

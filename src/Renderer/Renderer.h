@@ -6,6 +6,9 @@
 #include "Preview/MaterialPreviewRenderer.h"
 #include "UploadBuffer.h"
 #include "StructuredBuffer.h"
+#include "MaterialTablePublication.h"
+#include "MaterialDependencyRetention.h"
+#include "ProjectTextureLoader.h"
 #include "CommandContext.h"
 #include "DescriptorHeap.h"
 #include "GraphicsDevice.h"
@@ -287,10 +290,37 @@ class Renderer
     {
         return kEnableFrameHitchDiagnostics;
     }
+
     // Reversible logging-isolation experiment; independent of frame timing diagnostics.
     static constexpr bool kSuppressDisplacementLifecycleLoggingForDiagnostics = true;
 
     using FrameHitchRegion = RendererDiagnostics::FrameHitchRegion;
+
+    // Main-thread, between frames only. Identity must be reacquired after scene initialization.
+    // Fixed record order/count; texture descriptors cannot change in this checkpoint.
+    std::uint64_t GetMaterialTableIdentity() const noexcept
+    {
+        return m_sceneResourceLifetime;
+    }
+
+    std::uint64_t GetMaterialTableRevision() const noexcept
+    {
+        return m_materialPublication.revision;
+    }
+
+    bool CopyMaterialTableSnapshot(std::uint64_t identity, std::vector<GPUMaterial>& records,
+        std::string* errorMessage = nullptr) const;
+    bool SubmitMaterialTableSnapshot(std::uint64_t identity, const std::vector<GPUMaterial>& records,
+        std::string* errorMessage = nullptr);
+
+    // Complete table + owning leases. Every referenced texture descriptor must be covered.
+    bool SubmitMaterialTableRevision(std::uint64_t identity, const std::vector<GPUMaterial>& records,
+        std::vector<Texture::Dependency> dependencies, std::string* errorMessage = nullptr);
+    // Main-thread requests; no material bindings change. Caller cancels rejected/unused tickets.
+    bool QueuePreparedTextureUpload(const PreparedProjectTexture& prepared, std::uint64_t& ticket, std::string& error);
+    std::optional<PreparedTextureUpload::State> GetPreparedTextureUploadState(std::uint64_t ticket, std::string* error = nullptr) const;
+    bool TakeCompletedPreparedTextureUpload(std::uint64_t ticket, Texture& destination);
+    void CancelPreparedTextureUpload(std::uint64_t ticket);
 
     class FrameHitchProbe
     {
@@ -741,6 +771,7 @@ class Renderer
         SceneInitializationCommands commands = SceneInitializationCommands::None;
 
         std::uint64_t recordingGeneration = 0;
+
         bool failed = false;
         bool gpuCompletionProven = false;
     };
@@ -882,7 +913,29 @@ class Renderer
 
     UploadBuffer m_uploadBuffer;
 
-    StructuredBuffer m_materialBuffer;
+    std::array<StructuredBuffer, CommandContext::FrameCount> m_materialBuffers;
+
+    UploadBuffer m_materialUpload;
+
+    MaterialTablePublication<CommandContext::FrameCount> m_materialPublication;
+    // The existing resource heap has 256 descriptors; retain no more distinct dependencies.
+    MaterialDependencyRetention<Texture::Dependency, CommandContext::FrameCount, 256> m_materialDependencies;
+    struct TextureUploadEntry
+    {
+        std::uint64_t ticket = 0;
+
+        std::unique_ptr<PreparedTextureUpload> upload;
+
+        std::string error;
+    };
+    static constexpr size_t kTextureUploadCapacity = 8;
+    static constexpr size_t kTextureUploadByteCapacity = 64 * 1024 * 1024;
+    std::vector<TextureUploadEntry> m_preparedTextureUploads;
+    void PollPreparedTextureUploads();
+    void RecordPreparedTextureUploads(ID3D12GraphicsCommandList* commands);
+    StructuredBuffer& CurrentMaterialBuffer();
+    void ShutdownMaterialTables();
+    bool RecordMaterialTable(unsigned int slot, ID3D12GraphicsCommandList* commandList);
 
     static constexpr unsigned int kDisplacementLODFrameCount = 2;
 

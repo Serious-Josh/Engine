@@ -8,7 +8,7 @@
 #include <string>
 
 Texture::Texture(Texture&& other) noexcept
-    : m_resource(other.m_resource), m_width(other.m_width), m_height(other.m_height), m_srvIndex(other.m_srvIndex),
+    : m_retained(std::move(other.m_retained)), m_resource(other.m_resource), m_width(other.m_width), m_height(other.m_height), m_srvIndex(other.m_srvIndex),
       m_uavIndex(other.m_uavIndex), m_descriptorHeap(other.m_descriptorHeap),
       m_initialData(std::move(other.m_initialData)), m_format(other.m_format),
       m_subresourceStates(std::move(other.m_subresourceStates))
@@ -31,9 +31,11 @@ Texture& Texture::operator=(Texture&& other) noexcept
     {
         Shutdown();
 
+        m_retained = std::move(other.m_retained);
         m_resource = other.m_resource;
         m_width = other.m_width;
         m_height = other.m_height;
+
         m_initialData = std::move(other.m_initialData);
 
         m_srvIndex = other.m_srvIndex;
@@ -66,6 +68,11 @@ bool Texture::Initialize(
     DXGI_FORMAT format,
     size_t bytesPerPixel)
 {
+    if(m_retained)
+    {
+        return false; // Existing retained descriptors/allocation are immutable.
+    }
+
     if (!device || !data || width == 0 || height == 0)
     {
         return false;
@@ -123,6 +130,11 @@ bool Texture::Initialize(
     D3D12_RESOURCE_FLAGS flags,
     D3D12_RESOURCE_STATES initialState)
 {
+    if(m_retained)
+    {
+        return false; // Existing retained descriptors/allocation are immutable.
+    }
+
     if (!device ||
         width == 0 ||
         height == 0 ||
@@ -211,6 +223,11 @@ bool Texture::InitializeMipmapped(
     unsigned int mipLevels,
     DXGI_FORMAT format)
 {
+    if(m_retained)
+    {
+        return false; // Existing retained descriptors/allocation are immutable.
+    }
+
     if (!device || width == 0 || height == 0)
     {
         return false;
@@ -229,24 +246,34 @@ bool Texture::InitializeMipmapped(
 
 void Texture::Shutdown()
 {
-
-    if (m_descriptorHeap && m_srvIndex != UINT_MAX)
+    if(m_retained)
     {
-        m_descriptorHeap->Free(m_srvIndex);
+        // Aliases below are non-owning once Retain() has established the lease.
+        // Slot/desired leases keep both allocation and descriptors alive after catalog shutdown.
+        m_resource = nullptr;
         m_srvIndex = UINT_MAX;
-    }
-
-    if (m_descriptorHeap && m_uavIndex != UINT_MAX)
-    {
-        m_descriptorHeap->Free(m_uavIndex);
         m_uavIndex = UINT_MAX;
+        m_retained.reset();
     }
-
-    if (m_resource)
+    else
     {
-        m_resource->Release();
+        if(m_descriptorHeap && m_srvIndex != UINT_MAX)
+        {
+            m_descriptorHeap->Free(m_srvIndex);
+        }
+
+        if(m_descriptorHeap && m_uavIndex != UINT_MAX)
+        {
+            m_descriptorHeap->Free(m_uavIndex);
+        }
+
+        if(m_resource)
+        {
+            m_resource->Release();
+        }
 
         m_resource = nullptr;
+        m_uavIndex = UINT_MAX;
     }
 
     m_subresourceStates.clear();
@@ -315,6 +342,11 @@ bool Texture::CreateSRV(
     DescriptorHeap& descriptorHeap,
     DXGI_FORMAT format)
 {
+    if(m_retained)
+    {
+        return false; // Existing retained descriptors/allocation are immutable.
+    }
+
     if (!device || !m_resource)
     {
         return false;
@@ -348,6 +380,11 @@ bool Texture::CreateCubeSRV(
     ID3D12Device* device,
     DescriptorHeap& descriptorHeap)
 {
+    if(m_retained)
+    {
+        return false; // Existing retained descriptors/allocation are immutable.
+    }
+
     if (!device || !m_resource)
     {
         return false;
@@ -405,6 +442,11 @@ bool Texture::CreateUAV(
     ID3D12Device* device,
     DescriptorHeap& descriptorHeap)
 {
+    if(m_retained)
+    {
+        return false; // Existing retained descriptors/allocation are immutable.
+    }
+
     if (!device || !m_resource)
     {
         return false;
@@ -477,4 +519,43 @@ D3D12_RESOURCE_STATES Texture::GetSubresourceState(unsigned int subresource) con
     }
 
     return m_subresourceStates[subresource];
+}
+
+Texture::RetainedAllocation::~RetainedAllocation()
+{
+    if(m_heap && m_srvIndex != UINT_MAX)
+    {
+        m_heap->Free(m_srvIndex);
+    }
+
+    if(m_heap && m_uavIndex != UINT_MAX)
+    {
+        m_heap->Free(m_uavIndex);
+    }
+
+    if(m_resource)
+    {
+        m_resource->Release();
+    }
+}
+
+Texture::Dependency Texture::Retain()
+{
+    if(!m_resource || !m_descriptorHeap || m_srvIndex == UINT_MAX)
+    {
+        return {};
+    }
+
+    if(!m_retained)
+    {
+        auto retained = std::make_shared<RetainedAllocation>();
+        retained->m_resource = m_resource;
+        retained->m_heap = m_descriptorHeap;
+        retained->m_srvIndex = m_srvIndex;
+
+        retained->m_uavIndex = m_uavIndex;
+        m_retained = std::move(retained);
+    }
+
+    return m_retained;
 }

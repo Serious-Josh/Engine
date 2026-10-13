@@ -34,6 +34,8 @@ enum class ReservedSubmissionResult
 class CommandContext
 {
     public:
+    static constexpr unsigned int FrameCount = 2;
+
     CommandContext() = default;
 
     CommandContext(const CommandContext&) = delete;
@@ -131,7 +133,6 @@ class CommandContext
     }
 
     private:
-    static constexpr unsigned int FrameCount = 2;
 
     bool m_executeCpuTimingEnabled = false;
 

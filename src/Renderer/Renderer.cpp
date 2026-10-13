@@ -1,4 +1,5 @@
 #include "Core/Log.h"
+#include "Core/Assert.h"
 #include "Renderer.h"
 #include "DisplacementGPUIndexLayout.h"
 #include "Displacement/DisplacementUpdateCoordinator.h"
@@ -41,6 +42,7 @@ namespace
     {
         static std::atomic<std::uint64_t> next{1};
         std::uint64_t value = next.load(std::memory_order_relaxed);
+
         while (value != UINT64_MAX)
         {
             if (next.compare_exchange_weak(value, value + 1, std::memory_order_relaxed))
@@ -293,21 +295,25 @@ Renderer::DisplacementRequestResult Renderer::RequestDisplacementUpdate(
     m_displacementTerminalErrorLogged = false;
 
     m_displacementWallClock.accepted = CpuTiming::Clock::now();
+
     if constexpr (kEnableFrameHitchDiagnostics)
     {
         m_frameHitchDiagnostics.current.revision = requestRevision;
         m_frameHitchDiagnostics.current.accepted = true;
     }
+
     {
         FrameHitchProbe loggingProbe(
             *this,
             FrameHitchRegion::AcceptedPhaseLogging,
             !kSuppressDisplacementLifecycleLoggingForDiagnostics);
+
         if constexpr (!kSuppressDisplacementLifecycleLoggingForDiagnostics)
         {
             Log::Info("Async displacement accepted revision " + std::to_string(requestRevision) + ".");
         }
     }
+
     return DisplacementRequestResult::Accepted;
 }
 
@@ -500,7 +506,19 @@ bool Renderer::AbortTrackedRecording()
         }
     }
 
+    const auto materialSlot = m_activeRecordingSlot;
+    const auto uploadGeneration = m_activeRecordingGeneration;
     const bool discarded = m_commandContext.AbortRecording();
+
+    if(discarded)
+    {
+        m_materialDependencies.Discard(materialSlot);
+
+        for(auto& entry : m_preparedTextureUploads)
+        {
+            entry.upload->Discard(uploadGeneration);
+        }
+    }
 
     if (m_displacementCoverage.enabled)
     {
@@ -541,12 +559,14 @@ bool Renderer::ExecuteTrackedRecording(unsigned int frameSlot)
     {
         m_frameHitchDiagnostics.current.contextStart = CpuTiming::Clock::now();
     }
+
     const bool executed = m_commandContext.Execute(frameSlot);
 
     if constexpr (kEnableFrameHitchDiagnostics)
     {
         m_frameHitchDiagnostics.current.contextEnd = CpuTiming::Clock::now();
     }
+
     return executed;
 }
 
@@ -837,10 +857,12 @@ ReservedSubmissionResult Renderer::ExecuteCoveredDisplacementRecording(
     }
 
     SubmissionFenceToken submitted{};
+
     if constexpr (kEnableFrameHitchDiagnostics)
     {
         m_frameHitchDiagnostics.current.contextStart = CpuTiming::Clock::now();
     }
+
     const auto result = m_commandContext.ExecuteReserved(frameSlot, reservation, submitted);
 
     if constexpr (kEnableFrameHitchDiagnostics)
@@ -1286,21 +1308,25 @@ bool Renderer::ResolvePendingDisplacementSubmission(
         pending.reservation = {};
         pending.reservationOwnership = DisplacementReservationOwnership::None;
         pending.status = DisplacementUpdateStatus::Submitted;
+
         if constexpr (kEnableFrameHitchDiagnostics)
         {
             m_frameHitchDiagnostics.current.submitted = true;
         }
+
         {
             FrameHitchProbe loggingProbe(
                 *this,
                 FrameHitchRegion::SubmittedPhaseLogging,
                 !kSuppressDisplacementLifecycleLoggingForDiagnostics);
+
             if constexpr (!kSuppressDisplacementLifecycleLoggingForDiagnostics)
             {
                 Log::Info("Async displacement submitted revision " + std::to_string(pending.requestRevision) +
                           ", fence " + std::to_string(token.fenceValue) + ".");
             }
         }
+
         if (pending.frameRecovery.state == DisplacementFrameExitState::Uncertain)
         {
             // Ownership transfers only after exact token and TLAS association.
@@ -2013,10 +2039,12 @@ Renderer::FrameDisplacementRecordingResult Renderer::RecordPendingDisplacementFo
     commandList->SetDescriptorHeaps(1, heaps);
 
     CpuTiming::Clock::time_point diagnosticStageStart{};
+
     if constexpr (kEnableFrameHitchDiagnostics)
     {
         diagnosticStageStart = CpuTiming::Clock::now();
     }
+
     if (!RendererDisplacement::RecordPatchAndCompute(commandList, m_displacementGPUPatchBuffer, m_uploadBuffer,
                                                      m_displacementVerticesPass, m_displacementIndicesPass, mesh,
                                                      heightmap, layout, settings))
@@ -2043,10 +2071,12 @@ Renderer::FrameDisplacementRecordingResult Renderer::RecordPendingDisplacementFo
 
     pending.frameRecovery.asMutationStarted = true;
     ID3D12GraphicsCommandList4* buildList = m_commandContext.GetRayTracingCommandList();
+
     if constexpr (kEnableFrameHitchDiagnostics)
     {
         diagnosticStageStart = CpuTiming::Clock::now();
     }
+
     if (!m_rayTracingScene.RebuildMeshBLAS(m_graphicsDevice.GetRayTracingDevice(), buildList, &mesh,
                                            pending.targetCounts))
     {
@@ -2066,6 +2096,7 @@ Renderer::FrameDisplacementRecordingResult Renderer::RecordPendingDisplacementFo
     }
 
     const auto previousTLASRecording = m_rayTracingScene.GetTLASRecordingIdentity();
+
     if constexpr (kEnableFrameHitchDiagnostics)
     {
         diagnosticStageStart = CpuTiming::Clock::now();
@@ -2091,21 +2122,25 @@ Renderer::FrameDisplacementRecordingResult Renderer::RecordPendingDisplacementFo
 
     m_pendingGeometryTLASRefresh[frameSlot] = false;
     m_displacementWallClock.recordingEnd = CpuTiming::Clock::now();
+
     if constexpr (kEnableFrameHitchDiagnostics)
     {
         m_frameHitchDiagnostics.current.recorded = true;
     }
+
     {
         FrameHitchProbe loggingProbe(
             *this,
             FrameHitchRegion::RecordedPhaseLogging,
             !kSuppressDisplacementLifecycleLoggingForDiagnostics);
+
         if constexpr (!kSuppressDisplacementLifecycleLoggingForDiagnostics)
         {
             Log::Info("Async displacement recorded revision " + std::to_string(pending.requestRevision) +
                       ", frame slot " + std::to_string(frameSlot) + ".");
         }
     }
+
     return FrameDisplacementRecordingResult::Recorded;
 }
 
@@ -2189,6 +2224,7 @@ bool Renderer::FinalizePendingDisplacementUpdate(DisplacementCompletionResult& r
     Mesh& mesh = *pending.mesh; // Identity/lifetime validated before dereference.
     const size_t vertexCount = pending.targetCounts.vertexCount;
     const size_t indexCount = pending.targetCounts.indexCount;
+
     ID3D12Resource* vertices = mesh.GetVertexBufferResource();
     ID3D12Resource* indices = mesh.GetIndexBufferResource();
 
@@ -3259,19 +3295,25 @@ void Renderer::Draw(
 
     object.material->pipeline->Bind(commandList);
 
+    const auto materialIndex = object.material->gpuIndex;
+
+    if(materialIndex >= m_materialPublication.desired.size())
+    {
+        Log::Error("Render object references an invalid material-table index.");
+        return;
+    }
+
+    // Legacy raster root constants must agree with the table used by deferred/DXR passes.
+    // Snapshot changes are rejected during recording, so this is the recorded revision.
+    const auto& material = m_materialPublication.desired[materialIndex];
     MaterialConstants materialConstants{};
-    materialConstants.textureIndex = object.material->texture->GetDescriptorIndex();
+    materialConstants.textureIndex = material.textureIndex;
+    materialConstants.roughness = material.roughness;
+    materialConstants.materialIndex = materialIndex;
+    materialConstants.materialBufferIndex = CurrentMaterialBuffer().GetDescriptorIndex();
 
-    materialConstants.roughness = object.material->roughness;
-
-    materialConstants.materialIndex = object.material->gpuIndex;
-    materialConstants.materialBufferIndex = m_materialBuffer.GetDescriptorIndex();
-    materialConstants.roughnessTextureIndex =
-        object.material->roughnessTexture ? object.material->roughnessTexture->GetDescriptorIndex() : UINT_MAX;
-
-    materialConstants.baseColor[0] = object.material->baseColor[0];
-    materialConstants.baseColor[1] = object.material->baseColor[1];
-    materialConstants.baseColor[2] = object.material->baseColor[2];
+    materialConstants.roughnessTextureIndex = material.roughnessTextureIndex;
+    std::copy(std::begin(material.baseColor), std::end(material.baseColor), materialConstants.baseColor);
 
     commandList->SetGraphicsRoot32BitConstants(0, 8, &materialConstants, 0);
 
@@ -3615,12 +3657,56 @@ bool Renderer::InitializeMaterials(const std::vector<Material*>& materials)
         gpuMaterials.push_back(materials[i]->GetGPUData());
     }
 
-    if (!m_materialBuffer.Initialize(m_graphicsDevice.GetDevice(), m_resourceUploader, gpuMaterials.data(),
-                                     sizeof(GPUMaterial), static_cast<unsigned int>(gpuMaterials.size()),
-                                     m_resourceDescriptorHeap))
+    std::vector<Texture::Dependency> dependencies;
+
+    for(auto* material : materials)
     {
-        Log::Error("Failed to init material buffer.");
+        Texture* textures[] = {material->texture, material->normalTexture, material->roughnessTexture,
+            material->metallicTexture, material->armTexture, material->aoTexture, material->heightTexture};
+
+        for(auto* texture : textures)
+        {
+            if(!texture)
+            {
+                continue;
+            }
+
+            auto retained = texture->Retain();
+
+            if(!retained)
+            {
+                Log::Error("Cannot retain a material texture allocation and descriptor.");
+                return false;
+            }
+
+            dependencies.push_back(std::move(retained));
+        }
+    }
+
+    if(!m_materialDependencies.SetDesired(std::move(dependencies)))
+    {
+        Log::Error("Material texture dependency capacity exceeded.");
         return false;
+    }
+
+    m_materialPublication = {};
+
+    if(!m_materialPublication.SetSnapshot(gpuMaterials) ||
+       !m_materialUpload.Initialize(m_graphicsDevice.GetDevice(), gpuMaterials.size() * sizeof(GPUMaterial),
+           CommandContext::FrameCount))
+    {
+        Log::Error("Failed to prepare frame-slot material uploads.");
+        return false;
+    }
+
+    for(auto& buffer : m_materialBuffers)
+    {
+        if(!buffer.InitializeStorage(m_graphicsDevice.GetDevice(), sizeof(GPUMaterial),
+            static_cast<unsigned int>(gpuMaterials.size()), m_resourceDescriptorHeap))
+        {
+            Log::Error("Failed to allocate frame-slot material table.");
+            return false; // Retained until checked failed-initialization cleanup.
+        }
     }
 
     return true;
@@ -3736,7 +3822,7 @@ bool Renderer::CleanupFailedSceneInitialization(const Scene& candidate)
     InvalidateRecordingEligibility();
 
     m_rayTracingScene.Shutdown();
-    m_materialBuffer.Shutdown();
+    ShutdownMaterialTables();
     m_selectionMaskPass.Shutdown();
     ResetSceneHistory();
 
@@ -3770,10 +3856,17 @@ bool Renderer::ReleaseSceneResources()
         return false;
     }
 
+    if(!m_commandContext.DiscardCommandsAfterGPUDrain())
+    {
+        Log::Error("Scene resource release could not prove material dependency retirement safety.");
+        return false;
+    }
+
+    InvalidateRecordingEligibility();
     m_sceneResourceLifetime = 0;
     m_sceneResourceScene = nullptr;
     m_rayTracingScene.Shutdown();
-    m_materialBuffer.Shutdown();
+    ShutdownMaterialTables();
 
     m_selectionMaskPass.Shutdown();
 
@@ -3852,6 +3945,7 @@ const char* Renderer::GetDisplacementDiagnosticPhase() const
     case DisplacementUpdateStatus::FailedUncertain:
         return "uncertain";
     }
+
     return "invalid";
 }
 
@@ -3922,6 +4016,7 @@ void Renderer::RecordFrameHitchDiagnostics(
     {
         return;
     }
+
     const auto now = CpuTiming::Clock::now();
     auto& diagnostics = m_frameHitchDiagnostics;
 
@@ -3963,6 +4058,7 @@ void Renderer::LogDisplacementWallClockSummary(
         *this,
         FrameHitchRegion::CompletionPhaseLogging,
         !kSuppressDisplacementLifecycleLoggingForDiagnostics);
+
     if constexpr (kSuppressDisplacementLifecycleLoggingForDiagnostics)
     {
         return;
@@ -4020,6 +4116,7 @@ void Renderer::LogAsyncDisplacementError()
 Renderer::DisplacementCompletionStatus Renderer::ProcessDisplacementCompletion()
 {
     std::optional<HitchTimingScope> diagnosticCompletion;
+
     if constexpr (kEnableFrameHitchDiagnostics)
     {
         m_frameHitchDiagnostics.current.completionCalled = true;
@@ -4099,6 +4196,7 @@ Renderer::DisplacementCompletionStatus Renderer::ProcessDisplacementCompletion()
         m_frameHitchDiagnostics.current.revision = pending.requestRevision;
         m_frameHitchDiagnostics.current.completed = true;
     }
+
     if (!m_displacementCompletionObserved)
     {
         m_displacementWallClock.originalCompletionObserved = CpuTiming::Clock::now();
@@ -4108,6 +4206,7 @@ Renderer::DisplacementCompletionStatus Renderer::ProcessDisplacementCompletion()
                 *this,
                 FrameHitchRegion::CompletionPhaseLogging,
                 !kSuppressDisplacementLifecycleLoggingForDiagnostics);
+
             if constexpr (!kSuppressDisplacementLifecycleLoggingForDiagnostics)
             {
                 Log::Info("Async displacement original fence completed for revision " +
@@ -4129,6 +4228,7 @@ Renderer::DisplacementCompletionStatus Renderer::ProcessDisplacementCompletion()
     }
 
     m_displacementWallClock.finalized = CpuTiming::Clock::now();
+
     if constexpr (kEnableFrameHitchDiagnostics)
     {
         const auto& timing = m_displacementWallClock;
@@ -4142,6 +4242,7 @@ Renderer::DisplacementCompletionStatus Renderer::ProcessDisplacementCompletion()
                 .count(),
             std::chrono::duration<double, std::milli>(timing.finalized - timing.originalCompletionObserved).count());
     }
+
     completed.acceptedAt = m_displacementWallClock.accepted;
     m_completedDisplacementUpdate = completed;
 
@@ -4186,6 +4287,7 @@ Renderer::FrameRenderResult Renderer::Render(
     const Scene& scene,
     const RendererOptions& options)
 {
+    PollPreparedTextureUploads();
     // Retain the latest snapshot even if scene admission defers this frame.
     m_materialPreviewRenderer.SetRequest(options.materialPreview);
 
@@ -4205,6 +4307,7 @@ Renderer::FrameRenderResult Renderer::Render(
     {
         admissionProbe.emplace(*this, FrameHitchRegion::Admission);
     }
+
     if (kEnableFrameIntegratedDisplacement)
     {
         const auto completion = ProcessDisplacementCompletion();
@@ -4263,10 +4366,12 @@ bool Renderer::RecordRenderFrame(
     }
 
     std::optional<FrameHitchProbe> validationProbe;
+
     if constexpr (kEnableFrameHitchDiagnostics)
     {
         validationProbe.emplace(*this, FrameHitchRegion::InitialValidation);
     }
+
     RecordingEligibilityScope recordingEligibility{*this};
     const bool preparedDisplacement =
         kEnableFrameIntegratedDisplacement && m_pendingDisplacementUpdate.status == DisplacementUpdateStatus::Prepared;
@@ -4302,10 +4407,12 @@ bool Renderer::RecordRenderFrame(
 
     validationProbe.reset();
     std::optional<FrameHitchProbe> preBeginProbe;
+
     if constexpr (kEnableFrameHitchDiagnostics)
     {
         preBeginProbe.emplace(*this, FrameHitchRegion::PreBegin);
     }
+
     const bool hasPreviousExecute = m_hasPreviousRenderExecute;
 
     // Any early return breaks the sequence; only a completed frame re-arms it.
@@ -4321,6 +4428,7 @@ bool Renderer::RecordRenderFrame(
     {
         m_frameHitchDiagnostics.current.slot = frameIndex;
     }
+
     const ToneMapDebugView debugView = m_debugUI.GetToneMapDebugView();
 
     // An aborted/skipped frame must not leave CPU history state pointing at unsubmitted writes.
@@ -4382,10 +4490,12 @@ bool Renderer::RecordRenderFrame(
     const bool beganRecording = BeginTrackedRecording(frameIndex);
     m_cpuFrameTiming.begin = CpuTiming::MillisecondsSince(beginStart);
     m_cpuFrameTiming.fenceWaited = m_commandContext.DidBeginWaitForFence();
+
     m_cpuFrameTiming.fenceWait = m_commandContext.GetBeginFenceWaitMilliseconds();
     m_cpuFrameTiming.commandReset = m_commandContext.GetBeginResetMilliseconds();
 
     std::optional<FrameHitchProbe> postBeginProbe;
+
     if constexpr (kEnableFrameHitchDiagnostics)
     {
         postBeginProbe.emplace(*this, FrameHitchRegion::PostBegin);
@@ -4452,6 +4562,7 @@ bool Renderer::RecordRenderFrame(
     const auto recordingStart = CpuTiming::Clock::now();
 
     std::optional<FrameHitchProbe> profilerProbe;
+
     if constexpr (kEnableFrameHitchDiagnostics)
     {
         profilerProbe.emplace(*this, FrameHitchRegion::Profiler);
@@ -4487,11 +4598,28 @@ bool Renderer::RecordRenderFrame(
 
     profilerProbe.reset();
     std::optional<FrameHitchProbe> recordingSetupProbe;
+
     if constexpr (kEnableFrameHitchDiagnostics)
     {
         recordingSetupProbe.emplace(*this, FrameHitchRegion::RecordingSetup);
     }
+
     ID3D12GraphicsCommandList* commandList = m_commandContext.GetCommandList();
+    const auto textureUploadGeneration = m_activeRecordingGeneration;
+    RecordPreparedTextureUploads(commandList); // Copies/transitions precede every material consumer.
+    const auto materialRevision = m_materialPublication.revision;
+
+    if(!RecordMaterialTable(frameIndex, commandList))
+    {
+        Log::Error("Failed to record frame-slot material publication.");
+        return false;
+    }
+
+    if(materialRevision != m_materialPublication.lastSubmitted)
+    {
+        ResetSceneHistory();
+    }
+
     m_gpuTimestampProfiler.BeginFrame(commandList, frameIndex);
 
     m_currentFrameStatistics = {};
@@ -4548,6 +4676,7 @@ bool Renderer::RecordRenderFrame(
     {
         ordinaryProbe.emplace(*this, FrameHitchRegion::OrdinaryPasses);
     }
+
     const bool tlasNeedsUpdate = hasRenderableMeshes && !scene.GetChangedTransforms().empty();
 
     const bool displacementTLASRecorded = m_frameDisplacementPreparation.mergedTLASRecorded;
@@ -4747,7 +4876,7 @@ bool Renderer::RecordRenderFrame(
     reflectionConstants.geometricNormalIndex = m_gBuffer.GetGeometricNormal().GetSRVIndex();
     reflectionConstants.instanceDataIndex = m_rayTracingScene.GetInstanceDataDescriptorIndex();
 
-    reflectionConstants.materialBufferIndex = m_materialBuffer.GetDescriptorIndex();
+    reflectionConstants.materialBufferIndex = CurrentMaterialBuffer().GetDescriptorIndex();
     reflectionConstants.environmentIndex = m_environment.GetSourceTexture().GetDescriptorIndex();
     reflectionConstants.brdfIntegrationLUTIndex = m_brdfIntegrationLUT.GetDescriptorIndex();
 
@@ -5116,11 +5245,11 @@ bool Renderer::RecordRenderFrame(
             m_nrdReflectionPreparePass.ExecuteReflections(
                 commandList, m_gBuffer, *nrdInput, m_rayTracedReflectionPass.GetSpecularTrackingDistanceTexture(),
                 m_uploadBuffer, reconstructionConstants.inverseViewProjection, currentView,
-                m_materialBuffer.GetDescriptorIndex(), m_sceneWidth, m_sceneHeight, nrdDenoisingRange);
+                CurrentMaterialBuffer().GetDescriptorIndex(), m_sceneWidth, m_sceneHeight, nrdDenoisingRange);
 
             m_nrdGIPreparePass.ExecuteGI(commandList, m_gBuffer, *giNrdInput, m_rayTracedGIPass.GetHitDistanceTexture(),
                                          m_uploadBuffer, reconstructionConstants.inverseViewProjection, currentView,
-                                         m_materialBuffer.GetDescriptorIndex(), m_sceneWidth, m_sceneHeight, giWidth, giHeight,
+                                         CurrentMaterialBuffer().GetDescriptorIndex(), m_sceneWidth, m_sceneHeight, giWidth, giHeight,
                                          nrdDenoisingRange);
 
             m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::NrdPrepare);
@@ -5148,7 +5277,7 @@ bool Renderer::RecordRenderFrame(
 
             m_nrdReflectionResolvePass.Execute(commandList, m_gBuffer, m_nrdReflectionDenoiser.GetOutputTexture(),
                                                m_uploadBuffer, reconstructionConstants.inverseViewProjection, currentView,
-                                               m_materialBuffer.GetDescriptorIndex(), m_sceneWidth, m_sceneHeight);
+                                               CurrentMaterialBuffer().GetDescriptorIndex(), m_sceneWidth, m_sceneHeight);
 
             m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::NrdResolve);
 
@@ -5202,7 +5331,7 @@ bool Renderer::RecordRenderFrame(
         m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::DeferredLighting);
 
         m_deferredLightingPass.Execute(
-            commandList, m_gBuffer, m_materialBuffer, m_environment.GetSourceTexture(), m_environment.GetCubemap(),
+            commandList, m_gBuffer, CurrentMaterialBuffer(), m_environment.GetSourceTexture(), m_environment.GetCubemap(),
             m_environment.GetDiffuseIrradiance(), m_brdfIntegrationLUT, m_ggxAverageAlbedoLUT,
             m_environment.GetGGXMultiscatterIrradiance(), m_shadowDenoisePass.GetFilteredVisibilityTexture(),
             finalReflection, m_giSpatialDenoisePass.GetOutputTexture(), m_aoResolvePass.GetOutputTexture(),
@@ -5332,6 +5461,7 @@ bool Renderer::RecordRenderFrame(
         FrameHitchProbe uiProbe(
             *this,
             FrameHitchRegion::DebugUI);
+
         if constexpr (kEnableFrameHitchDiagnostics)
         {
             m_frameHitchDiagnostics.current.uiTextureObserved = true;
@@ -5342,6 +5472,7 @@ bool Renderer::RecordRenderFrame(
             m_debugUI.EndFrame(commandList);
         }
     }
+
     m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::DebugUI);
 
     barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
@@ -5395,8 +5526,10 @@ bool Renderer::RecordRenderFrame(
     {
         executed = ExecuteTrackedRecording(frameIndex);
     }
+
     const auto executeEnd = CpuTiming::Clock::now();
     m_cpuFrameTiming.execute = std::chrono::duration<double, std::milli>(executeEnd - executeStart).count();
+
     if constexpr (kEnableFrameHitchDiagnostics)
     {
         auto& snapshot = m_frameHitchDiagnostics.current;
@@ -5416,21 +5549,44 @@ bool Renderer::RecordRenderFrame(
                 std::chrono::duration<double, std::milli>(executeEnd - snapshot.contextEnd).count();
         }
     }
+
     if (!executed)
     {
+        m_materialDependencies.MarkUncertain(frameIndex);
+
+        for(auto& entry : m_preparedTextureUploads)
+        {
+            entry.upload->MarkUncertain(textureUploadGeneration);
+        }
+
         m_gpuTimestampProfiler.BreakFrameSequence();
 
         Log::Error("Failed to submit command list or signal its fence; GPU work may already be in flight.");
         return false;
     }
 
+    for(auto& entry : m_preparedTextureUploads)
+    {
+        entry.upload->ConfirmSubmission(textureUploadGeneration, m_commandContext.GetLastSubmissionFenceValue());
+    }
+
+    if(!m_materialDependencies.Confirm(frameIndex, m_commandContext.GetLastSubmissionFenceValue()))
+    {
+        m_materialDependencies.MarkUncertain(frameIndex);
+        Log::Error("Material dependency submission association failed; retaining allocations.");
+        return false;
+    }
+
+    m_materialPublication.ConfirmSubmission(frameIndex, materialRevision);
     m_materialPreviewRenderer.ConfirmSubmission(m_commandContext.GetLastSubmissionFenceValue());
 
     std::optional<FrameHitchProbe> postSubmissionProbe;
+
     if constexpr (kEnableFrameHitchDiagnostics)
     {
         postSubmissionProbe.emplace(*this, FrameHitchRegion::PostSubmission);
     }
+
     m_cpuFrameTiming.submitted = true;
     m_cpuFrameTiming.executeStart = executeStart;
 
@@ -5458,6 +5614,7 @@ bool Renderer::RecordRenderFrame(
     const bool presented = m_swapChain.Present();
     m_cpuFrameTiming.present = CpuTiming::MillisecondsSince(presentStart);
     m_cpuFrameTiming.presentReturn = CpuTiming::Clock::now();
+
     m_cpuFrameTiming.presentationReturned = true;
 
     if (!presented)
@@ -5528,7 +5685,14 @@ void Renderer::Shutdown()
         std::abort();
     }
 
+    if(!m_commandContext.DiscardCommandsAfterGPUDrain())
+    {
+        Log::Error("Renderer shutdown: unsubmitted commands could not be discarded.");
+        std::abort();
+    }
+
     Log::Info("Renderer shutdown: GPU finished.");
+    ShutdownMaterialTables();
 
     m_materialPreviewRenderer.Shutdown();
 
@@ -6361,4 +6525,345 @@ bool Renderer::PreprocessEnvironment(EnvironmentMap& environment)
 const RendererStatistics& Renderer::GetStatistics() const
 {
     return m_statistics;
+}
+
+StructuredBuffer& Renderer::CurrentMaterialBuffer()
+{
+    ENGINE_ASSERT(m_activeRecordingSlot < CommandContext::FrameCount);
+    return m_materialBuffers[m_activeRecordingSlot];
+}
+
+void Renderer::ShutdownMaterialTables()
+{
+    // Same checked completion/discard precondition as the former single scene table.
+    for(auto& buffer : m_materialBuffers)
+    {
+        buffer.Shutdown();
+    }
+
+    m_materialUpload.Shutdown();
+    m_materialPublication = {};
+    m_materialDependencies.ClearAfterGPUDrain();
+
+    for(auto& entry : m_preparedTextureUploads)
+    {
+        entry.upload->ClearAfterGPUDrain();
+    }
+
+    m_preparedTextureUploads.clear();
+}
+
+bool Renderer::SubmitMaterialTableSnapshot(std::uint64_t identity, const std::vector<GPUMaterial>& records,
+    std::string* errorMessage)
+{
+    if(errorMessage)
+    {
+        errorMessage->clear();
+    }
+
+    if(identity == 0 || identity != m_sceneResourceLifetime || !m_sceneResourceScene ||
+       m_sceneInitializationAttempt.candidate || m_activeRecordingGeneration != 0 ||
+       m_displacementExitScopeGeneration != 0 || m_resizeFailed)
+    {
+        if(errorMessage)
+        {
+            *errorMessage = "Material publication requires the current initialized scene and no active recording.";
+        }
+
+        return false;
+    }
+
+    if(!m_materialPublication.SetSnapshot(records))
+    {
+        if(errorMessage)
+        {
+            *errorMessage = "Invalid material count, parameters, revision, or changed texture bindings.";
+        }
+
+        return false;
+    }
+
+    return true;
+}
+
+bool Renderer::RecordMaterialTable(unsigned int slot, ID3D12GraphicsCommandList* commandList)
+{
+    if(!commandList || slot >= CommandContext::FrameCount || m_activeRecordingSlot != slot ||
+       m_activeRecordingGeneration == 0 || m_materialPublication.revision == 0)
+    {
+        return false;
+    }
+
+    if(!m_materialDependencies.Acquire(slot, m_commandContext.GetCompletedFenceValue(), m_materialPublication.revision))
+    {
+        return false;
+    }
+
+    if(m_materialPublication.published[slot] == m_materialPublication.revision)
+    {
+        return true;
+    }
+
+    m_materialUpload.Reset(slot); // BeginTrackedRecording has checked this slot's fence.
+    const auto bytes = m_materialPublication.desired.size() * sizeof(GPUMaterial);
+    const auto address = m_materialUpload.Allocate(m_materialPublication.desired.data(), bytes, 4);
+
+    if(address == 0)
+    {
+        return false;
+    }
+
+    auto* upload = m_materialUpload.GetResource();
+    auto* destination = m_materialBuffers[slot].GetResource();
+    // Default-heap BUFFER resources decay to COMMON at each ExecuteCommandLists boundary.
+    // A discarded recording never executes its transitions. COMMON implicitly promotes to
+    // COPY_DEST for the copy, then the explicit barrier orders all raster/compute/DXR reads.
+    commandList->CopyBufferRegion(destination, 0, upload, address - upload->GetGPUVirtualAddress(), bytes);
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = destination;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    commandList->ResourceBarrier(1, &barrier);
+    return true;
+}
+
+bool Renderer::CopyMaterialTableSnapshot(std::uint64_t identity, std::vector<GPUMaterial>& records,
+    std::string* errorMessage) const
+{
+    if(errorMessage)
+    {
+        errorMessage->clear();
+    }
+
+    if(identity == 0 || identity != m_sceneResourceLifetime || !m_sceneResourceScene ||
+       m_sceneInitializationAttempt.candidate || m_activeRecordingGeneration != 0 ||
+       m_displacementExitScopeGeneration != 0 || m_resizeFailed)
+    {
+        if(errorMessage)
+        {
+            *errorMessage = "Material snapshot requires the current initialized scene and no active recording.";
+        }
+
+        return false;
+    }
+
+    auto copy = m_materialPublication.desired;
+    records.swap(copy);
+    return true;
+}
+
+bool Renderer::QueuePreparedTextureUpload(const PreparedProjectTexture& prepared, std::uint64_t& ticket, std::string& error)
+{
+    error.clear();
+    ticket = 0;
+
+    if(!m_graphicsDevice.GetDevice() || m_sceneResourceLifetime == 0 || m_sceneInitializationAttempt.candidate ||
+       m_activeRecordingGeneration != 0 || m_displacementExitScopeGeneration != 0 ||
+       m_resizeFailed || !ValidatePreparedProjectTexture(prepared))
+    {
+        error = "Rejected: prepared texture data or Renderer lifecycle is invalid.";
+        return false;
+    }
+
+    if(prepared.pixels.size() > kTextureUploadByteCapacity)
+    {
+        error = "Rejected: prepared texture exceeds the 64 MiB CPU byte limit.";
+        return false;
+    }
+
+    PollPreparedTextureUploads();
+    size_t bytes = 0;
+
+    for(const auto& entry : m_preparedTextureUploads)
+    {
+        bytes += entry.upload->CPUBytes();
+    }
+
+    if(m_preparedTextureUploads.size() >= kTextureUploadCapacity ||
+       prepared.pixels.size() > kTextureUploadByteCapacity - bytes)
+    {
+        error = "Deferred: prepared texture request/CPU byte capacity unavailable.";
+        return false;
+    }
+
+    try
+    {
+        const auto identity = AllocateRendererIdentity();
+
+        if(identity == 0)
+        {
+            error = "Rejected: upload identities exhausted.";
+            return false;
+        }
+
+        auto upload = std::make_unique<PreparedTextureUpload>(prepared);
+        m_preparedTextureUploads.push_back({identity, std::move(upload), {}});
+        ticket = identity;
+        return true;
+    }
+    catch(const std::exception& exception)
+    {
+        error = std::string("Rejected: cannot retain prepared texture request: ") + exception.what();
+        return false;
+    }
+}
+
+std::optional<PreparedTextureUpload::State> Renderer::GetPreparedTextureUploadState(std::uint64_t ticket, std::string* error) const
+{
+    if(error)
+    {
+        error->clear();
+    }
+
+    for(const auto& entry : m_preparedTextureUploads)
+    {
+        if(entry.ticket == ticket)
+        {
+            if(error)
+            {
+                *error = entry.error;
+            }
+
+            return entry.upload->GetState();
+        }
+    }
+
+    return std::nullopt;
+}
+
+bool Renderer::TakeCompletedPreparedTextureUpload(std::uint64_t ticket, Texture& destination)
+{
+    if(m_activeRecordingGeneration != 0 || m_sceneInitializationAttempt.candidate)
+    {
+        return false;
+    }
+
+    PollPreparedTextureUploads();
+
+    for(auto& entry : m_preparedTextureUploads)
+    {
+        if(entry.ticket == ticket)
+        {
+            return entry.upload->Take(destination);
+        }
+    }
+
+    return false;
+}
+
+void Renderer::CancelPreparedTextureUpload(std::uint64_t ticket)
+{
+    for(auto& entry : m_preparedTextureUploads)
+    {
+        if(entry.ticket == ticket)
+        {
+            entry.upload->Cancel();
+        }
+    }
+}
+
+void Renderer::PollPreparedTextureUploads()
+{
+    const auto completed = m_commandContext.GetCompletedFenceValue();
+
+    for(auto& entry : m_preparedTextureUploads)
+    {
+        entry.upload->Poll(completed);
+    }
+
+    std::erase_if(m_preparedTextureUploads, [](const TextureUploadEntry& entry) { return entry.upload->CanRetire(); });
+}
+
+void Renderer::RecordPreparedTextureUploads(ID3D12GraphicsCommandList* commands)
+{
+    size_t staging = 0;
+
+    for(const auto& entry : m_preparedTextureUploads)
+    {
+        staging += entry.upload->StagingBytes();
+    }
+
+    for(auto& entry : m_preparedTextureUploads)
+    {
+        if(entry.upload->GetState() != PreparedTextureUpload::State::Queued)
+        {
+            continue;
+        }
+
+        const auto result = entry.upload->Record(m_graphicsDevice.GetDevice(), m_resourceDescriptorHeap, commands,
+            m_activeRecordingGeneration, m_activeRecordingSlot, kTextureUploadByteCapacity - staging, entry.error);
+
+        if(result == PreparedTextureUpload::RecordResult::Recorded)
+        {
+            break; // At most one new GPU upload recording per frame.
+        }
+    }
+}
+
+bool Renderer::SubmitMaterialTableRevision(std::uint64_t identity, const std::vector<GPUMaterial>& records,
+    std::vector<Texture::Dependency> dependencies, std::string* errorMessage)
+{
+    const auto fail = [&](const char* message)
+    {
+        if(errorMessage)
+        {
+            *errorMessage = message;
+        }
+
+        return false;
+    };
+
+    if(errorMessage)
+    {
+        errorMessage->clear();
+    }
+
+    if(identity == 0 || identity != m_sceneResourceLifetime || !m_sceneResourceScene ||
+       m_sceneInitializationAttempt.candidate || m_activeRecordingGeneration != 0 ||
+       m_displacementExitScopeGeneration != 0 || m_resizeFailed)
+    {
+        return fail("Material revision requires the current scene and no active recording.");
+    }
+
+    for(const auto& dependency : dependencies)
+    {
+        if(!dependency || !dependency->UsesDescriptorHeap(m_resourceDescriptorHeap))
+        {
+            return fail("Material revision contains an invalid dependency lease or descriptor heap.");
+        }
+    }
+
+    for(const auto& record : records)
+    {
+        const unsigned int descriptors[] = {record.textureIndex, record.normalTextureIndex, record.roughnessTextureIndex,
+            record.metallicTextureIndex, record.armTextureIndex, record.aoTextureIndex, record.heightTextureIndex};
+
+        for(auto descriptor : descriptors)
+        {
+            if(descriptor != UINT_MAX && std::none_of(dependencies.begin(), dependencies.end(),
+                [descriptor](const Texture::Dependency& lease) { return lease->GetDescriptorIndex() == descriptor; }))
+            {
+                return fail("Material revision references a texture without retained ownership.");
+            }
+        }
+    }
+
+    auto candidate = m_materialPublication;
+
+    if(!candidate.SetSnapshot(records, true))
+    {
+        return fail("Invalid material revision count or parameters.");
+    }
+
+    if(!m_materialDependencies.SetDesired(std::move(dependencies)))
+    {
+        return fail("Deferred: material dependency retention capacity unavailable.");
+    }
+
+    static_assert(std::is_nothrow_move_assignable_v<decltype(m_materialPublication)>);
+    m_materialPublication = std::move(candidate);
+    return true;
 }

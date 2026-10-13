@@ -22,6 +22,9 @@ class StructuredBuffer
         size_t elementSize,
         unsigned int elementCount,
         DescriptorHeap& descriptorHeap);
+    // Allocates COMMON-state storage only. Caller owns recording, upload and GPU lifetime.
+    bool InitializeStorage(ID3D12Device* device, size_t elementSize, unsigned int elementCount,
+        DescriptorHeap& descriptorHeap);
     void Shutdown();
 
     ID3D12Resource* GetResource() const;

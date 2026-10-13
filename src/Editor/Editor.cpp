@@ -1,5 +1,6 @@
 #include "assets/ProjectAssetRename.h"
 #include "assets/ProjectAssetDeletion.h"
+#include "assets/ProjectAssetResolver.h"
 #include "Core/Log.h"
 #include "Editor.h"
 #include "Debug/DebugUI.h"
@@ -484,6 +485,7 @@ void Editor::DrawSceneViewport(
     if(ImGui::Begin("Scene Viewport", nullptr, flags))
     {
         EditorWorkspace::KeepCurrentWindowBehindFloatingUI();
+
         if(sceneTextureHandle != 0 && sceneWidth != 0 && sceneHeight != 0)
         {
             const ImVec2 framebufferScale = ImGui::GetIO().DisplayFramebufferScale;
@@ -523,6 +525,108 @@ const EditorWorkspaceRect& Editor::PrepareWorkspace(
     return m_workspace.GetSceneViewport();
 }
 
+void Editor::ActivateObjectInspection(
+    IDemoScene& demoScene, const ProjectPaths& paths, const ProjectAssetRegistry& registry)
+{
+    m_objectInspectionIdentity.reset();
+    m_inspectorTarget = InspectorTarget::None;
+    m_inspectorPanel.LoadSelection({}, paths, registry);
+    const auto& scene = static_cast<const IDemoScene&>(demoScene).GetScene();
+
+    if(m_selectedObject >= scene.GetRenderObjects().size())
+    {
+        return;
+    }
+
+    ObjectInspectionIdentity identity{&scene, scene.GetStructureRevision()};
+
+    if(const auto* fileScene = dynamic_cast<const FileBackedDemoScene*>(&demoScene))
+    {
+        const auto metadata = fileScene->GetObjectMetadata(m_selectedObject);
+
+        if(!metadata)
+        {
+            return;
+        }
+
+        identity.runtimeIdentity = metadata->runtimeIdentity;
+        identity.objectID = metadata->objectID;
+        identity.sceneID = metadata->sceneID;
+    }
+
+    m_objectInspectionIdentity = std::move(identity);
+    m_inspectorTarget = InspectorTarget::SceneObject;
+}
+
+std::optional<SceneObjectInspectorView> Editor::ResolveObjectInspection(
+    const IDemoScene& demoScene, const ProjectPaths& paths, const ProjectAssetRegistry& registry) const
+{
+    const auto& scene = demoScene.GetScene();
+    const auto& objects = scene.GetRenderObjects();
+
+    if(!m_objectInspectionIdentity || m_objectInspectionIdentity->scene != &scene ||
+       m_objectInspectionIdentity->revision != scene.GetStructureRevision() || m_selectedObject >= objects.size())
+    {
+        return std::nullopt;
+    }
+
+    const auto& object = objects[m_selectedObject];
+    SceneObjectInspectorView view{"Object " + std::to_string(m_selectedObject), object.transform,
+        object.mesh ? "Runtime mesh (document reference unavailable)" : "No mesh",
+        "Runtime material (document reference unavailable)"};
+    const auto* fileScene = dynamic_cast<const FileBackedDemoScene*>(&demoScene);
+
+    if(!fileScene)
+    {
+        return view;
+    }
+
+    const auto metadata = fileScene->GetObjectMetadata(m_selectedObject);
+
+    if(!metadata || metadata->runtimeIdentity != m_objectInspectionIdentity->runtimeIdentity ||
+       metadata->structureRevision != m_objectInspectionIdentity->revision ||
+       metadata->objectID != m_objectInspectionIdentity->objectID || metadata->sceneID != m_objectInspectionIdentity->sceneID)
+    {
+        return std::nullopt;
+    }
+
+    const auto label = [&](const std::string& reference, AssetType type) -> std::string
+    {
+        if(reference.empty())
+        {
+            return type == AssetType::Mesh ? "No mesh" : "Default Material";
+        }
+
+        if(reference == "builtin:sphere" && type == AssetType::Mesh)
+        {
+            return "Sphere";
+        }
+
+        if(reference == "builtin:default" && type == AssetType::Material)
+        {
+            return "Default Material";
+        }
+
+        const auto id = AssetID::ParseReference(reference);
+        const auto* record = id ? registry.Find(*id) : nullptr;
+
+        if(!record || record->type != type)
+        {
+            return type == AssetType::Mesh ? "Unavailable mesh reference" : "Unavailable material reference";
+        }
+
+        const auto path = record->relativePath.generic_string();
+        return ProjectAssetResolver::Resolve(paths, registry, *id).status == AssetAvailability::Available ?
+            path : "Unavailable: " + path;
+    };
+
+    view.metadata = metadata;
+    view.name = metadata->name;
+    view.mesh = label(metadata->meshReference, AssetType::Mesh);
+    view.material = label(metadata->materialReference, AssetType::Material);
+    return view;
+}
+
 void Editor::Draw(
     IDemoScene& demoScene,
     DemoSceneManager& sceneManager,
@@ -535,6 +639,27 @@ void Editor::Draw(
     const ProjectAssetRegistry& assetRegistry,
     const std::optional<MaterialPreviewImage>& materialPreview)
 {
+
+    Scene& scene = demoScene.GetScene();
+    const std::string activeSceneName(sceneManager.GetActiveSceneName());
+    const uint64_t structureRevision = scene.GetStructureRevision();
+
+    if (m_selectionSceneName != activeSceneName || m_selectionStructureRevision != structureRevision)
+    {
+        ClearTransformUndoHistory();
+
+        m_selectedObject = InvalidObjectSelection;
+        m_selectionSceneName = activeSceneName;
+        m_selectionStructureRevision = structureRevision;
+    }
+
+    const Scene& constScene = scene;
+    const auto& objects = constScene.GetRenderObjects();
+
+    if (m_selectedObject >= objects.size())
+    {
+        m_selectedObject = InvalidObjectSelection;
+    }
 
     (void)debugUI;
     m_assetBrowser.SetThumbnailProject(projectPaths, assetRegistry);
@@ -551,8 +676,14 @@ void Editor::Draw(
 
     ImGui::EndDisabled();
 
-    if(m_materialLeaveAction == MaterialLeaveAction::None &&
-       m_assetBrowser.GetSelection() != m_inspectedAssetSelection)
+    const bool assetSelectionIntent = m_assetBrowser.TakeSelectionIntent();
+
+    const bool assetTargetChanged = m_inspectorTarget != InspectorTarget::Asset ||
+        m_assetBrowser.GetSelection() != m_inspectedAssetSelection;
+
+    if(m_materialLeaveAction == MaterialLeaveAction::None && assetTargetChanged &&
+       (assetSelectionIntent || (m_inspectorTarget == InspectorTarget::Asset &&
+        m_assetBrowser.GetSelection() != m_inspectedAssetSelection)))
     {
         if(m_inspectorPanel.HasUnsavedChanges())
         {
@@ -563,7 +694,44 @@ void Editor::Draw(
         {
             m_inspectedAssetSelection = m_assetBrowser.GetSelection();
             m_inspectorPanel.LoadSelection(m_inspectedAssetSelection, projectPaths, assetRegistry);
+            m_inspectorTarget = m_inspectedAssetSelection.empty() ? InspectorTarget::None : InspectorTarget::Asset;
+            m_objectInspectionIdentity.reset();
         }
+
+        m_objectInspectionRequested = false;
+    }
+
+    if(m_objectInspectionRequested && m_materialLeaveAction == MaterialLeaveAction::None)
+    {
+        m_objectInspectionRequested = false;
+
+        if(m_inspectorPanel.HasUnsavedChanges())
+        {
+            m_materialLeaveAction = MaterialLeaveAction::ObjectSelection;
+        }
+        else
+        {
+            ActivateObjectInspection(demoScene, projectPaths, assetRegistry);
+        }
+    }
+
+    const auto objectView = m_inspectorTarget == InspectorTarget::SceneObject ?
+        ResolveObjectInspection(demoScene, projectPaths, assetRegistry) : std::nullopt;
+
+    if(m_inspectorTarget == InspectorTarget::SceneObject && !objectView)
+    {
+        m_inspectorTarget = InspectorTarget::None;
+        m_objectInspectionIdentity.reset();
+    }
+
+    // A disappearing control may never receive IsItemDeactivatedAfterEdit. Finalize
+    // against its original object, never against the newly selected object.
+    if(m_transformFieldEditing && (m_transformFieldUndoObject != m_selectedObject ||
+       m_transformFieldScene != &scene || m_transformFieldRevision != scene.GetStructureRevision() ||
+       !objectView || !m_workspace.InspectorVisible() || m_materialLeaveAction != MaterialLeaveAction::None ||
+       m_sceneOperationPending))
+    {
+        FinishTransformFieldEdit(scene);
     }
 
     const bool disableInspector = m_materialLeaveAction != MaterialLeaveAction::None || m_sceneOperationPending;
@@ -575,12 +743,44 @@ void Editor::Draw(
         ImGui::BeginDisabled();
     }
 
+    if(m_materialAssignmentSelection && (!objectView || !objectView->metadata ||
+       objectView->metadata->runtimeIdentity != m_materialAssignmentSelection->runtimeIdentity ||
+       objectView->metadata->objectID != m_materialAssignmentSelection->objectID ||
+       objectView->metadata->structureRevision != m_materialAssignmentSelection->structureRevision))
+    {
+        m_materialAssignmentStatus.clear();
+    }
+
     if(m_workspace.InspectorVisible())
     {
-        m_inspectorPanel.Draw(
-            m_workspace.GetInspector(), projectPaths, assetRegistry,
-            materialPreview,
-            m_materialLeaveAction != MaterialLeaveAction::None);
+        if(objectView)
+        {
+            m_inspectorPanel.DrawSceneObject(m_workspace.GetInspector(), *objectView, [this, &demoScene]()
+            {
+                DrawSelectedObjectTransformControls(demoScene);
+            }, projectPaths, assetRegistry, m_materialAssignmentPending,
+                m_materialAssignmentStatus, [this, &objectView, &assetRegistry](std::string reference)
+            {
+                if(!m_materialAssignmentPending && objectView->metadata)
+                {
+                    m_materialAssignmentSelection = objectView->metadata;
+                    m_materialAssignmentRequest = MaterialAssignmentRequest{*objectView->metadata, std::move(reference)};
+                    m_materialAssignmentPending = true;
+                    const auto id = AssetID::ParseReference(m_materialAssignmentRequest->reference);
+
+                    const auto* record = id ? assetRegistry.Find(*id) : nullptr;
+                    m_materialAssignmentStatus = "Pending: " + (record ? record->relativePath.generic_string() :
+                        std::string("Default Material"));
+                }
+            });
+        }
+        else
+        {
+            m_inspectorPanel.Draw(
+                m_workspace.GetInspector(), projectPaths, assetRegistry,
+                materialPreview,
+                m_materialLeaveAction != MaterialLeaveAction::None);
+        }
     }
 
     if(disableInspector)
@@ -588,7 +788,8 @@ void Editor::Draw(
         ImGui::EndDisabled();
     }
 
-    if(m_inspectorPanel.TakeRefreshRequest() && m_materialLeaveAction == MaterialLeaveAction::None)
+    if(m_inspectorPanel.TakeRefreshRequest() && m_materialLeaveAction == MaterialLeaveAction::None &&
+       m_inspectorTarget == InspectorTarget::Asset)
     {
         if(m_inspectorPanel.HasUnsavedChanges())
         {
@@ -611,6 +812,11 @@ void Editor::Draw(
             case MaterialLeaveAction::Selection:
                 m_inspectedAssetSelection = m_pendingAssetSelection;
                 m_inspectorPanel.LoadSelection(m_inspectedAssetSelection, projectPaths, assetRegistry);
+                m_inspectorTarget = m_inspectedAssetSelection.empty() ? InspectorTarget::None : InspectorTarget::Asset;
+                m_objectInspectionIdentity.reset();
+                break;
+            case MaterialLeaveAction::ObjectSelection:
+                ActivateObjectInspection(demoScene, projectPaths, assetRegistry);
                 break;
             case MaterialLeaveAction::Refresh:
                 m_inspectorPanel.LoadSelection(m_inspectedAssetSelection, projectPaths, assetRegistry);
@@ -640,6 +846,35 @@ void Editor::Draw(
             }
 
             m_materialLeaveAction = MaterialLeaveAction::None;
+        }
+    }
+
+    for(auto& working : m_inspectorPanel.TakeWorkingMaterialRevisions(
+        m_workspace.InspectorVisible() && m_inspectorTarget == InspectorTarget::Asset))
+    {
+        const auto* fileScene = dynamic_cast<const FileBackedDemoScene*>(&demoScene);
+        const auto versions = fileScene ? fileScene->GetMaterialVersions(working.projectIdentity, working.assetID) : std::nullopt;
+
+        if(versions && !versions->versions.empty())
+        {
+            m_workingMaterialRevisions.push_back({std::move(working), *versions});
+        }
+    }
+
+    for(auto& saved : m_inspectorPanel.TakeSavedMaterialRevisions())
+    {
+        // Bind the owned receipt to this scene instance, never to an object selection.
+        const auto* fileScene = dynamic_cast<const FileBackedDemoScene*>(&demoScene);
+
+        if(fileScene)
+        {
+            const auto versions = fileScene->GetMaterialVersions(saved.projectIdentity, saved.assetID);
+
+            if(versions && !versions->versions.empty())
+            {
+                m_savedMaterialRevisions.push_back({std::move(saved), versions->catalogIdentity,
+                    fileScene->GetRuntimeIdentity(), scene.GetStructureRevision()});
+            }
         }
     }
 
@@ -683,27 +918,6 @@ void Editor::Draw(
         {
             m_gizmoMode = GizmoMode::Scale;
         }
-    }
-
-    Scene& scene = demoScene.GetScene();
-    const std::string activeSceneName(sceneManager.GetActiveSceneName());
-    const uint64_t structureRevision = scene.GetStructureRevision();
-
-    if (m_selectionSceneName != activeSceneName || m_selectionStructureRevision != structureRevision)
-    {
-        ClearTransformUndoHistory();
-
-        m_selectedObject = InvalidObjectSelection;
-        m_selectionSceneName = activeSceneName;
-        m_selectionStructureRevision = structureRevision;
-    }
-
-    const Scene& constScene = scene;
-    const auto& objects = constScene.GetRenderObjects();
-
-    if (m_selectedObject >= objects.size())
-    {
-        m_selectedObject = InvalidObjectSelection;
     }
 
     if (m_showEditorPanel)
@@ -890,6 +1104,7 @@ void Editor::DrawObjectControls(
         if (ImGui::Selectable("None", noneSelected))
         {
             m_selectedObject = InvalidObjectSelection;
+            m_objectInspectionRequested = true;
         }
 
         for (size_t i = 0; i < objects.size(); ++i)
@@ -901,6 +1116,7 @@ void Editor::DrawObjectControls(
             if (ImGui::Selectable(label.c_str(), selected))
             {
                 m_selectedObject = i;
+                m_objectInspectionRequested = true;
             }
 
             if (selected)
@@ -914,7 +1130,14 @@ void Editor::DrawObjectControls(
 
     ImGui::Text("Objects: %zu", objects.size());
 
-    if (m_selectedObject == InvalidObjectSelection)
+}
+
+void Editor::DrawSelectedObjectTransformControls(IDemoScene& demoScene)
+{
+    Scene& scene = demoScene.GetScene();
+    const auto& objects = static_cast<const Scene&>(scene).GetRenderObjects();
+
+    if(m_selectedObject >= objects.size())
     {
         return;
     }
@@ -929,7 +1152,9 @@ void Editor::DrawObjectControls(
 
     bool fieldDeactivated = false;
 
-    ImGui::Separator();
+    ImGui::TextUnformatted("Transform");
+    ImGui::PushID(&scene);
+    ImGui::PushID(static_cast<int>(m_selectedObject));
     ImGui::PushID("SelectedObjectTransform");
 
     transformChanged |= ImGui::DragFloat3("Position", &transform.position.x, 0.05f);
@@ -940,7 +1165,7 @@ void Editor::DrawObjectControls(
     float rotationDegrees[3] = {ToDegrees(transform.rotation.x), ToDegrees(transform.rotation.y),
                                 ToDegrees(transform.rotation.z)};
 
-    if (ImGui::DragFloat3("Rotation", rotationDegrees, 0.05))
+    if(ImGui::DragFloat3("Rotation", rotationDegrees, 0.05))
     {
         transform.rotation =
             Vector3{ToRadians(rotationDegrees[0]), ToRadians(rotationDegrees[1]), ToRadians(rotationDegrees[2])};
@@ -951,7 +1176,7 @@ void Editor::DrawObjectControls(
     fieldActivated |= ImGui::IsItemActivated();
     fieldDeactivated |= ImGui::IsItemDeactivatedAfterEdit();
 
-    if (ImGui::DragFloat3("Scale", &transform.scale.x, 0.01f, 0.01f, 100.0f))
+    if(ImGui::DragFloat3("Scale", &transform.scale.x, 0.01f, 0.01f, 100.0f))
     {
         transform.scale.x = (std::max)(0.01f, transform.scale.x);
         transform.scale.y = (std::max)(0.01f, transform.scale.y);
@@ -963,41 +1188,57 @@ void Editor::DrawObjectControls(
     fieldActivated |= ImGui::IsItemActivated();
     fieldDeactivated |= ImGui::IsItemDeactivatedAfterEdit();
 
-    if (fieldActivated && !m_transformFieldEditing)
+    if(fieldActivated && !m_transformFieldEditing)
     {
         m_transformFieldEditing = true;
         m_transformFieldUndoObject = m_selectedObject;
         m_transformFieldUndoStart = originalTransform;
+        m_transformFieldScene = &scene;
+
+        m_transformFieldRevision = scene.GetStructureRevision();
     }
 
     ImGui::PopID();
+    ImGui::PopID();
+    ImGui::PopID();
 
-    if (transformChanged)
+    const auto finite = [](const Vector3& value)
+    {
+        return std::isfinite(value.x) && std::isfinite(value.y) && std::isfinite(value.z);
+    };
+
+    if(transformChanged && finite(transform.position) && finite(transform.rotation) && finite(transform.scale))
     {
         scene.SetRenderObjectTransform(m_selectedObject, transform);
     }
 
-    if (fieldDeactivated && m_transformFieldEditing)
+    if(fieldDeactivated && m_transformFieldEditing)
+    {
+        FinishTransformFieldEdit(scene);
+    }
+}
+
+void Editor::FinishTransformFieldEdit(Scene& scene)
+{
+    if(m_transformFieldEditing)
     {
         const auto& currentObjects = static_cast<const Scene&>(scene).GetRenderObjects();
 
-        if (m_transformFieldUndoObject < currentObjects.size())
+        if(m_transformFieldScene == &scene && m_transformFieldRevision == scene.GetStructureRevision() &&
+           m_transformFieldUndoObject < currentObjects.size())
         {
             const Transform& current = currentObjects[m_transformFieldUndoObject].transform;
 
             const Transform& previous = m_transformFieldUndoStart;
 
             const bool changed =
-
                 current.position.x != previous.position.x || current.position.y != previous.position.y ||
-
                 current.position.z != previous.position.z || current.rotation.x != previous.rotation.x ||
-
                 current.rotation.y != previous.rotation.y || current.rotation.z != previous.rotation.z ||
                 current.scale.x != previous.scale.x || current.scale.y != previous.scale.y ||
                 current.scale.z != previous.scale.z;
 
-            if (changed)
+            if(changed)
             {
                 m_transformRedoHistory.clear();
                 m_transformUndoHistory.push_back({m_transformFieldUndoObject, previous});
@@ -1006,6 +1247,8 @@ void Editor::DrawObjectControls(
 
         m_transformFieldEditing = false;
         m_transformFieldUndoObject = InvalidObjectSelection;
+        m_transformFieldScene = nullptr;
+        m_transformFieldRevision = 0;
     }
 }
 
@@ -1201,6 +1444,7 @@ void Editor::HandleViewportSelection(
     const Scene& scene = demoScene.GetScene();
 
     m_selectedObject = PickObject(scene, mouse.x, mouse.y, viewportWidth, viewportHeight);
+    m_objectInspectionRequested = true;
 }
 
 void Editor::ClearTransformUndoHistory()
@@ -1213,6 +1457,8 @@ void Editor::ClearTransformUndoHistory()
 
     m_transformFieldEditing = false;
     m_transformFieldUndoObject = InvalidObjectSelection;
+    m_transformFieldScene = nullptr;
+    m_transformFieldRevision = 0;
 }
 
 void Editor::HandleTransformUndo(IDemoScene& demoScene)
@@ -1530,6 +1776,26 @@ void Editor::SuspendViewportInteraction()
 
 void Editor::OnSceneActivated()
 {
+    m_workingMaterialRevisions.clear();
+    m_inspectorPanel.ResetWorkingMaterialNotifications();
+    m_savedMaterialRevisions.clear();
+    m_materialAssignmentRequest.reset();
+    m_materialAssignmentSelection.reset();
+    m_materialAssignmentPending = false;
+    m_materialAssignmentStatus.clear();
+    m_objectInspectionRequested = false;
+    m_objectInspectionIdentity.reset();
+
+    if(m_inspectorTarget == InspectorTarget::SceneObject)
+    {
+        m_inspectorTarget = InspectorTarget::None;
+    }
+
+    if(m_materialLeaveAction == MaterialLeaveAction::ObjectSelection)
+    {
+        m_materialLeaveAction = MaterialLeaveAction::None;
+    }
+
     m_cameraLooking = false;
     m_viewportFocused = false;
 
@@ -1591,7 +1857,12 @@ void Editor::ProcessAssetDeletion(const ProjectPaths& paths, ProjectAssetRegistr
     {
         m_inspectedAssetSelection.clear();
         m_pendingAssetSelection.clear();
-        m_inspectorPanel.LoadSelection({}, paths, registry);
+
+        if(m_inspectorTarget == InspectorTarget::Asset)
+        {
+            m_inspectorPanel.LoadSelection({}, paths, registry);
+            m_inspectorTarget = InspectorTarget::None;
+        }
     }
 }
 
@@ -1639,7 +1910,39 @@ void Editor::ProcessAssetRename(
         {
             m_inspectedAssetSelection = destination;
             m_pendingAssetSelection.clear();
-            m_inspectorPanel.LoadSelection(destination, paths, registry);
+
+            if(m_inspectorTarget == InspectorTarget::Asset)
+            {
+                m_inspectorPanel.LoadSelection(destination, paths, registry);
+            }
         }
     }
+}
+
+std::optional<Editor::MaterialAssignmentRequest> Editor::TakeMaterialAssignmentRequest()
+{
+    auto request = std::move(m_materialAssignmentRequest);
+    m_materialAssignmentRequest.reset();
+    return request;
+}
+
+void Editor::OnMaterialAssignmentCompleted(const SceneObjectMetadata& selection, bool succeeded, std::string message)
+{
+    if(m_materialAssignmentSelection && m_materialAssignmentSelection->runtimeIdentity == selection.runtimeIdentity &&
+       m_materialAssignmentSelection->objectID == selection.objectID &&
+       m_materialAssignmentSelection->structureRevision == selection.structureRevision)
+    {
+        m_materialAssignmentPending = false;
+        m_materialAssignmentStatus = (succeeded ? "Assigned: " : "Not assigned: ") + std::move(message);
+    }
+}
+
+std::vector<Editor::SceneMaterialSavedRevision> Editor::TakeSavedMaterialRevisions()
+{
+    return std::exchange(m_savedMaterialRevisions, {});
+}
+
+std::vector<Editor::SceneMaterialWorkingRevision> Editor::TakeWorkingMaterialRevisions()
+{
+    return std::exchange(m_workingMaterialRevisions, {});
 }

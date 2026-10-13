@@ -4,6 +4,7 @@
 #include "AssetBrowser.h"
 #include "EditorWorkspace.h"
 #include "InspectorPanel.h"
+#include "Scene/FileSceneAssetCatalog.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -14,6 +15,7 @@
 #include <vector>
 
 class IDemoScene;
+class Scene;
 class SphereGridScene;
 class StressTestScene;
 class DemoSceneManager;
@@ -37,6 +39,7 @@ public:
         FileRequestType type;
 
         std::filesystem::path path;
+
         std::string sceneName;
     };
 
@@ -69,10 +72,18 @@ public:
     {
         m_assetBrowser.ConfigureThumbnails(device, uploader, heap);
     }
+
+    bool HasBlockingMaterialOperation() const
+    {
+        return m_materialLeaveAction != MaterialLeaveAction::None || m_sceneOperationPending ||
+            m_inspectorPanel.HasUnsavedChanges();
+    }
+
     void ConfigureMaterialThumbnails(Renderer& renderer)
     {
         m_assetBrowser.ConfigureMaterialThumbnails(renderer);
     }
+
     void SetThumbnailCompletedFence(std::uint64_t fence)
     {
         m_assetBrowser.SetThumbnailCompletedFence(fence);
@@ -105,12 +116,39 @@ public:
 
     void SetSceneOperationPending(bool pending) noexcept;
     void OnSceneActivated();
+    struct SceneMaterialSavedRevision
+    {
+        MaterialSavedRevision saved;
+
+        std::uint64_t catalogIdentity = 0;
+        std::uint64_t runtimeIdentity = 0;
+        std::uint64_t structureRevision = 0;
+    };
+    std::vector<SceneMaterialSavedRevision> TakeSavedMaterialRevisions();
+    struct SceneMaterialWorkingRevision
+    {
+        MaterialWorkingRevision working;
+
+        RuntimeMaterialVersions runtime;
+    };
+    std::vector<SceneMaterialWorkingRevision> TakeWorkingMaterialRevisions();
+
+    struct MaterialAssignmentRequest
+    {
+        SceneObjectMetadata selection;
+
+        std::string reference;
+    };
+    std::optional<MaterialAssignmentRequest> TakeMaterialAssignmentRequest();
+    void OnMaterialAssignmentCompleted(const SceneObjectMetadata& selection, bool succeeded, std::string message);
+
     void SuspendViewportInteraction();
 
     bool IsWorkspaceSplitterDragging() const
     {
         return m_workspace.IsSplitterDragging();
     }
+
     SceneChangeDecision DrawSceneChangeConfirmation(const std::string& error);
 
     // Taking a request clears it. Pending actions cannot be overwritten.
@@ -163,13 +201,46 @@ private:
     {
         None,
         Selection,
+        ObjectSelection,
         Refresh,
         Hide,
         Scene,
         Close
     };
 
+    enum class InspectorTarget { None, Asset, SceneObject };
+    InspectorTarget m_inspectorTarget = InspectorTarget::None;
+
+    bool m_objectInspectionRequested = false;
+    struct ObjectInspectionIdentity
+    {
+        const Scene* scene = nullptr; // Identity only; never dereferenced after scene replacement.
+        std::uint64_t revision = 0;
+        std::uint64_t runtimeIdentity = 0;
+
+        std::string objectID;
+        std::string sceneID;
+    };
+    std::optional<ObjectInspectionIdentity> m_objectInspectionIdentity;
+
+    std::vector<SceneMaterialSavedRevision> m_savedMaterialRevisions;
+
+    std::vector<SceneMaterialWorkingRevision> m_workingMaterialRevisions;
+
+    std::optional<MaterialAssignmentRequest> m_materialAssignmentRequest;
+
+    std::optional<SceneObjectMetadata> m_materialAssignmentSelection;
+
+    bool m_materialAssignmentPending = false;
+
+    std::string m_materialAssignmentStatus;
+
+    void ActivateObjectInspection(IDemoScene& demoScene, const ProjectPaths& paths, const ProjectAssetRegistry& registry);
+    std::optional<SceneObjectInspectorView> ResolveObjectInspection(
+        const IDemoScene& demoScene, const ProjectPaths& paths, const ProjectAssetRegistry& registry) const;
+
     MaterialLeaveAction m_materialLeaveAction = MaterialLeaveAction::None;
+
     std::filesystem::path m_inspectedAssetSelection;
     std::filesystem::path m_pendingAssetSelection;
 
@@ -181,7 +252,9 @@ private:
     bool m_showEditorPanel = false;
 
     AssetBrowser m_assetBrowser;
+
     EditorWorkspace m_workspace;
+
     InspectorPanel m_inspectorPanel;
 
     static constexpr size_t InvalidObjectSelection = (std::numeric_limits<size_t>::max)();
@@ -200,7 +273,6 @@ private:
     bool m_viewportFocused = false;
 
     EditorWorkspaceRect m_viewportImage;
-
 
     float m_cameraYaw = 0.0f;
     float m_cameraPitch = 0.0f;
@@ -226,6 +298,10 @@ private:
     size_t m_transformFieldUndoObject = InvalidObjectSelection;
 
     Transform m_transformFieldUndoStart;
+    const Scene* m_transformFieldScene = nullptr;
+    std::uint64_t m_transformFieldRevision = 0;
+    void DrawSelectedObjectTransformControls(IDemoScene& demoScene);
+    void FinishTransformFieldEdit(Scene& scene);
 
     void DrawTransformGizmo(
         IDemoScene& demoScene,

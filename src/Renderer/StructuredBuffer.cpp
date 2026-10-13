@@ -3,6 +3,7 @@
 #include "ResourceUploader.h"
 
 #include <climits>
+#include <limits>
 
 bool StructuredBuffer::Initialize(
     ID3D12Device* device,
@@ -12,7 +13,26 @@ bool StructuredBuffer::Initialize(
     unsigned int elementCount,
     DescriptorHeap& descriptorHeap)
 {
-    if (!device || !data || elementSize == 0 || elementCount == 0)
+    if(!data || !InitializeStorage(device, elementSize, elementCount, descriptorHeap))
+    {
+        return false;
+    }
+
+    if(!uploader.UploadBuffer(m_resource, data, elementSize * elementCount,
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE))
+    {
+        Shutdown();
+        return false;
+    }
+
+    return true;
+}
+
+bool StructuredBuffer::InitializeStorage(ID3D12Device* device, size_t elementSize,
+    unsigned int elementCount, DescriptorHeap& descriptorHeap)
+{
+    if(!device || m_resource || elementSize == 0 || elementSize > UINT_MAX || elementCount == 0 ||
+       elementSize > (std::numeric_limits<size_t>::max)() / elementCount)
     {
         return false;
     }
@@ -39,14 +59,6 @@ bool StructuredBuffer::Initialize(
 
     if (FAILED(result))
     {
-        return false;
-    }
-
-    if (!uploader.UploadBuffer(m_resource, data, bufferSize,
-                               D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
-                                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE))
-    {
-        Shutdown();
         return false;
     }
 

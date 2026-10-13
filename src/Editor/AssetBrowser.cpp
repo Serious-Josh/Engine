@@ -194,6 +194,7 @@ void AssetBrowser::DrawMaterialCreationModal()
         if (ImGui::Button("Create"))
         {
             m_materialError.clear();
+
             try
             {
                 std::filesystem::path filename;
@@ -319,6 +320,7 @@ const AssetBrowser::Listing& AssetBrowser::GetListing(const std::filesystem::pat
             listing.entries.push_back({entryPath, DisplayName(entryPath), directory,
                 directory && (attributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0});
         }
+
         iterator.increment(ec);
     }
 
@@ -333,6 +335,7 @@ const AssetBrowser::Listing& AssetBrowser::GetListing(const std::filesystem::pat
         {
             return left.directory;
         }
+
         return left.name < right.name;
     });
     return listing;
@@ -489,6 +492,7 @@ void AssetBrowser::DrawContents()
                         isMaterial ? "Material" : "Texture");
                 }
             }
+
             ImGui::PushTextWrapPos(0.0f);
             ImGui::TextUnformatted(entry.name.c_str());
             ImGui::PopTextWrapPos();
@@ -500,6 +504,7 @@ void AssetBrowser::DrawContents()
             if (pressed || (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)))
             {
                 m_selection = entry.path;
+                m_selectionIntent = true;
 
                 if (entry.directory && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
                 {
@@ -619,8 +624,10 @@ void AssetBrowser::Draw(const EditorWorkspaceRect& rectangle)
             m_materialImagesInvalidated = false;
         }
     }
+
     m_dropTargets.clear();
     m_dropFrame = ImGui::GetFrameCount();
+
     if(rectangle.size.x <= 0.0f || rectangle.size.y <= 0.0f)
     {
         return;
@@ -643,6 +650,7 @@ void AssetBrowser::Draw(const EditorWorkspaceRect& rectangle)
     if(ImGui::Begin("Asset Browser", nullptr, fixedFlags))
     {
         EditorWorkspace::KeepCurrentWindowBehindFloatingUI();
+
         if (ImGui::Button("Refresh"))
         {
             m_listings.clear();

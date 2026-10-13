@@ -1,5 +1,6 @@
 #include "InspectorPanel.h"
 #include "EditorWorkspace.h"
+#include "Math/Math.h"
 #include "assets/ProjectAssetResolver.h"
 #include "assets/MaterialAssetSerializer.h"
 #include "Renderer/Material.h"
@@ -134,6 +135,7 @@ const std::optional<MaterialPreviewRequest>& InspectorPanel::GetPreviewRequest()
         material.roughness = m_material->roughness;
         material.metallic = m_material->metallic;
         material.ior = m_material->ior;
+
         material.surfaceDetailMode = m_material->surfaceDetailMode;
         material.heightScale = m_material->heightScale;
         material.heightBias = m_material->heightBias;
@@ -160,6 +162,199 @@ const std::optional<MaterialPreviewRequest>& InspectorPanel::GetPreviewRequest()
     }
 
     return m_previewRequest;
+}
+
+void InspectorPanel::DrawSceneObject(const EditorWorkspaceRect& rectangle, const SceneObjectInspectorView& object,
+    const std::function<void()>& drawTransformControls,
+    const ProjectPaths& paths, const ProjectAssetRegistry& registry, bool assignmentPending,
+    const std::string& assignmentStatus, const std::function<void(std::string)>& requestAssignment)
+{
+    if(rectangle.size.x <= 0.0f || rectangle.size.y <= 0.0f)
+    {
+        return;
+    }
+
+    ImGui::SetNextWindowPos(rectangle.position, ImGuiCond_Always);
+    ImGui::SetNextWindowSize(rectangle.size, ImGuiCond_Always);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowMinSize, ImVec2(1.0f, 1.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+    ImGuiWindowFlags flags = ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize |
+        ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings |
+        ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoFocusOnAppearing;
+
+    if(rectangle.size.y < ImGui::GetFrameHeight())
+    {
+        flags |= ImGuiWindowFlags_NoTitleBar;
+    }
+
+    if(ImGui::Begin("Inspector", nullptr, flags))
+    {
+        EditorWorkspace::KeepCurrentWindowBehindFloatingUI();
+        ImGui::TextWrapped("Object: %s", object.name.c_str());
+        ImGui::Separator();
+        drawTransformControls();
+        ImGui::Separator();
+        ImGui::TextWrapped("Mesh: %s", object.mesh.c_str());
+        ImGui::TextWrapped("Material: %s", object.material.c_str());
+
+        if(!object.metadata)
+        {
+            ImGui::TextDisabled("Material assignment requires a file-backed scene.");
+        }
+        else
+        {
+            if(assignmentPending)
+            {
+                ImGui::BeginDisabled();
+            }
+
+            if(ImGui::SmallButton("Select Material..."))
+            {
+                m_materialSearch.fill(0);
+                m_materialPickerObject = object.metadata;
+                m_materialPickerProject = paths.GetRoot();
+                m_materialChoices = registry.GetAssets(AssetType::Material);
+                std::sort(m_materialChoices.begin(), m_materialChoices.end(),
+                    [](const AssetRecord& left, const AssetRecord& right)
+                    {
+                        return left.relativePath < right.relativePath;
+                    });
+                ImGui::OpenPopup("SceneMaterialPicker");
+            }
+
+            if(assignmentPending)
+            {
+                ImGui::EndDisabled();
+            }
+
+            DrawSceneMaterialPicker(object, paths, registry, assignmentPending, requestAssignment);
+        }
+
+        if(!assignmentStatus.empty())
+        {
+            ImGui::TextWrapped("%s", assignmentStatus.c_str());
+        }
+
+    }
+
+    ImGui::End();
+    ImGui::PopStyleVar(2);
+}
+
+void InspectorPanel::DrawSceneMaterialPicker(
+    const SceneObjectInspectorView& object,
+    const ProjectPaths& paths,
+    const ProjectAssetRegistry& registry,
+    bool assignmentPending,
+    const std::function<void(std::string)>& requestAssignment)
+{
+    ImGui::SetNextWindowSize(ImVec2(360.0f, 320.0f), ImGuiCond_Appearing);
+
+    if(ImGui::BeginPopup("SceneMaterialPicker"))
+    {
+        const auto& selection = *object.metadata;
+        const bool matches = m_materialPickerObject && m_materialPickerProject == paths.GetRoot() &&
+            m_materialPickerObject->runtimeIdentity == selection.runtimeIdentity &&
+            m_materialPickerObject->sceneID == selection.sceneID &&
+            m_materialPickerObject->objectID == selection.objectID &&
+            m_materialPickerObject->runtimeIndex == selection.runtimeIndex &&
+            m_materialPickerObject->structureRevision == selection.structureRevision;
+
+        if(!matches || assignmentPending || ImGui::IsKeyPressed(ImGuiKey_Escape))
+        {
+            ImGui::CloseCurrentPopup();
+        }
+        else
+        {
+            const float closeSize = ImGui::GetFrameHeight();
+            const float closeX = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - closeSize;
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextUnformatted("Select material");
+            ImGui::SameLine();
+            ImGui::SetCursorPosX((std::max)(ImGui::GetCursorPosX(), closeX));
+
+            if(ImGui::Button("X##CloseMaterialPicker", ImVec2(closeSize, closeSize)))
+            {
+                ImGui::CloseCurrentPopup();
+            }
+
+            ImGui::SetNextItemWidth(-1.0f);
+            ImGui::InputTextWithHint("##MaterialSearch", "Search materials...",
+                m_materialSearch.data(), m_materialSearch.size());
+            const auto lowercase = [](unsigned char character)
+            {
+                return static_cast<char>(std::tolower(character));
+            };
+            std::string search(m_materialSearch.data());
+            std::transform(search.begin(), search.end(), search.begin(), lowercase);
+
+            if(ImGui::BeginChild("MaterialChoices", ImVec2(0.0f, 0.0f)))
+            {
+                const bool defaultSelected = selection.materialReference.empty() ||
+                    selection.materialReference == "builtin:default";
+
+                if(ImGui::Selectable("Default Material", defaultSelected))
+                {
+                    if(!defaultSelected)
+                    {
+                        requestAssignment("builtin:default");
+                    }
+
+                    ImGui::CloseCurrentPopup();
+                }
+
+                size_t count = 0;
+
+                for(const auto& record : m_materialChoices)
+                {
+                    const auto* current = registry.Find(record.id);
+
+                    if(!current || current->type != AssetType::Material || current->relativePath != record.relativePath ||
+                       ProjectAssetResolver::Resolve(paths, registry, record.id).status != AssetAvailability::Available)
+                    {
+                        continue;
+                    }
+
+                    std::string label = record.relativePath.generic_string();
+                    std::string filtered = label;
+                    std::transform(filtered.begin(), filtered.end(), filtered.begin(), lowercase);
+                    std::string extension = record.relativePath.extension().string();
+                    std::transform(extension.begin(), extension.end(), extension.begin(), lowercase);
+
+                    if(extension != ".material" || filtered.find(search) == std::string::npos)
+                    {
+                        continue;
+                    }
+
+                    ++count;
+                    const auto reference = record.id.ToReference();
+                    const bool selected = selection.materialReference == reference;
+                    ImGui::PushID(reference.c_str());
+
+                    if(ImGui::Selectable(label.c_str(), selected))
+                    {
+                        if(!selected)
+                        {
+                            requestAssignment(reference);
+                        }
+
+                        ImGui::CloseCurrentPopup();
+                    }
+
+                    ImGui::PopID();
+                }
+
+                if(count == 0)
+                {
+                    ImGui::TextDisabled("No available matching materials.");
+                }
+            }
+
+            ImGui::EndChild();
+        }
+
+        ImGui::EndPopup();
+    }
 }
 
 void InspectorPanel::Draw(
@@ -222,7 +417,6 @@ void InspectorPanel::Draw(
             const auto path = m_record->relativePath.generic_string();
             ImGui::TextWrapped("Material: %s", name.c_str());
             ImGui::TextWrapped("Path: %s", path.c_str());
-            ImGui::TextWrapped("AssetID: %s", m_record->id.ToString().c_str());
         }
 
         if(m_material)
@@ -235,6 +429,7 @@ void InspectorPanel::Draw(
                 m_lastPropertyChangeTime = ImGui::GetTime();
                 m_saveScheduled = HasUnsavedChanges() && !m_externalConflict;
                 m_persistenceState = m_externalConflict ? PersistenceState::Failed : PersistenceState::Waiting;
+
                 if(!m_externalConflict)
                 {
                     m_status.clear();
@@ -391,6 +586,9 @@ void InspectorPanel::LoadSelection(
     const ProjectPaths& paths,
     const ProjectAssetRegistry& registry)
 {
+    EndWorkingMaterial();
+    m_lastWorkingDraft.reset();
+    m_lastWorkingBaseline.reset();
     ++m_texturePickerGeneration;
     ++m_previewTextureRefresh;
     m_textureSearch.fill(0);
@@ -404,6 +602,7 @@ void InspectorPanel::LoadSelection(
     m_showConflictConfirmation = false;
     m_saveScheduled = false;
     m_leaveFlushAttempted = false;
+
     m_persistenceState = PersistenceState::Saved;
     m_record.reset();
     m_material.reset();
@@ -591,14 +790,14 @@ void InspectorPanel::DrawTextureReference(
         const auto id = AssetID::ParseReference(*reference);
         const AssetRecord* record = id ? registry.Find(*id) : nullptr;
         missing = true;
-        description = *reference;
 
         if(record && record->type == AssetType::Texture)
         {
             display = record->relativePath.filename().string();
-            description = record->relativePath.generic_string() + "\n" + *reference;
+            description = record->relativePath.generic_string();
             const auto availability = ProjectAssetResolver::Resolve(paths, registry, record->id).status;
             missing = availability != AssetAvailability::Available;
+
             description += "\n";
             description += TextureAvailabilityReason(*record, availability);
 
@@ -610,7 +809,7 @@ void InspectorPanel::DrawTextureReference(
         else
         {
             display = id ? "Missing / invalid texture reference" : "Invalid texture reference";
-            description += !id ? "\nInvalid canonical AssetID." :
+            description += !id ? "Invalid texture reference." :
                 record ? "\nRegistry type mismatch: expected Texture." : "\nAsset is not registered.";
         }
     }
@@ -666,136 +865,144 @@ void InspectorPanel::DrawTextureReference(
         }
         else
         {
-            const float closeSize = ImGui::GetFrameHeight();
-            const float closePosition = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - closeSize;
-            ImGui::AlignTextToFramePadding();
-            ImGui::TextUnformatted("Select texture");
-            ImGui::SameLine();
-            ImGui::SetCursorPosX((std::max)(ImGui::GetCursorPosX(), closePosition));
-
-            if(ImGui::Button("X##CloseTexturePicker", ImVec2(closeSize, closeSize)))
-            {
-                ImGui::CloseCurrentPopup();
-            }
-
-            ImGui::SetNextItemWidth(-1.0f);
-            ImGui::InputTextWithHint("##Search", "Search filenames...", m_textureSearch.data(), m_textureSearch.size());
-            std::string search(m_textureSearch.data());
-            const auto lowercase = [](unsigned char character)
-            {
-                return static_cast<char>(std::tolower(character));
-            };
-            std::transform(search.begin(), search.end(), search.begin(), lowercase);
-
-            if(ImGui::SmallButton("Refresh textures"))
-            {
-                ++m_previewTextureRefresh;
-                m_refreshTextureChoices = true;
-            }
-
-            const auto textures = registry.GetAssets(AssetType::Texture);
-            const bool registryMatches = textures.size() == m_texturePickerRegistry.size() &&
-                std::equal(textures.begin(), textures.end(), m_texturePickerRegistry.begin(),
-                    [](const AssetRecord& left, const AssetRecord& right)
-                    {
-                        return left.id == right.id && left.type == right.type && left.relativePath == right.relativePath;
-                    });
-
-            // File availability is scanned on opening/Refresh or registry changes,
-            // rather than polling every registered path on every popup frame.
-            if(m_refreshTextureChoices || !registryMatches)
-            {
-                m_availableTextures.clear();
-
-                for(const auto& texture : textures)
-                {
-                    if(ProjectAssetResolver::Resolve(paths, registry, texture.id).status == AssetAvailability::Available)
-                    {
-                        m_availableTextures.push_back(texture);
-                    }
-                }
-
-                std::sort(m_availableTextures.begin(), m_availableTextures.end(),
-                    [](const AssetRecord& left, const AssetRecord& right)
-                    {
-                        return left.relativePath < right.relativePath;
-                    });
-                m_texturePickerRegistry = textures;
-                m_refreshTextureChoices = false;
-            }
-
-            if(ImGui::BeginChild("TextureList", ImVec2(0.0f, 0.0f)))
-            {
-                if(ImGui::Selectable("None", !reference))
-                {
-                    reference.reset();
-                    ImGui::CloseCurrentPopup();
-                }
-
-                size_t matches = 0;
-
-                for(const auto& texture : m_availableTextures)
-                {
-                    const auto filename = texture.relativePath.filename().string();
-                    std::string filtered = filename;
-                    std::transform(filtered.begin(), filtered.end(), filtered.begin(), lowercase);
-
-                    if(filtered.find(search) == std::string::npos)
-                    {
-                        continue;
-                    }
-
-                    ++matches;
-                    const auto canonicalReference = texture.id.ToReference();
-                    const bool selected = reference && *reference == canonicalReference;
-                    ImGui::PushID(canonicalReference.c_str());
-
-                    if(ImGui::Selectable(filename.c_str(), selected))
-                    {
-                        // A file may disappear after the popup snapshot was captured.
-                        // Never commit a stale or unsafe reference from that snapshot.
-                        const auto* current = registry.Find(texture.id);
-                        const bool identityMatches = current && current->type == AssetType::Texture &&
-                            current->relativePath == texture.relativePath;
-
-                        if(identityMatches && ProjectAssetResolver::Resolve(paths, registry, texture.id).status ==
-                            AssetAvailability::Available)
-                        {
-                            if(!selected)
-                            {
-                                reference = canonicalReference;
-                            }
-
-                            ImGui::CloseCurrentPopup();
-                        }
-                        else
-                        {
-                            m_refreshTextureChoices = true;
-                        }
-                    }
-
-                    if(ImGui::IsItemHovered())
-                    {
-                        const auto relativePath = texture.relativePath.generic_string();
-                        ImGui::SetTooltip("%s", relativePath.c_str());
-                    }
-
-                    ImGui::PopID();
-                }
-
-                if(matches == 0)
-                {
-                    ImGui::TextWrapped("No available registered textures match this search.");
-                }
-            }
-
-            ImGui::EndChild();
+            DrawTexturePickerContents(reference, paths, registry);
         }
 
         ImGui::EndPopup();
     }
 
     ImGui::PopID();
+}
+
+void InspectorPanel::DrawTexturePickerContents(
+    std::optional<std::string>& reference,
+    const ProjectPaths& paths,
+    const ProjectAssetRegistry& registry)
+{
+    const float closeSize = ImGui::GetFrameHeight();
+    const float closePosition = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - closeSize;
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted("Select texture");
+    ImGui::SameLine();
+    ImGui::SetCursorPosX((std::max)(ImGui::GetCursorPosX(), closePosition));
+
+    if(ImGui::Button("X##CloseTexturePicker", ImVec2(closeSize, closeSize)))
+    {
+        ImGui::CloseCurrentPopup();
+    }
+
+    ImGui::SetNextItemWidth(-1.0f);
+    ImGui::InputTextWithHint("##Search", "Search filenames...", m_textureSearch.data(), m_textureSearch.size());
+    std::string search(m_textureSearch.data());
+    const auto lowercase = [](unsigned char character)
+    {
+        return static_cast<char>(std::tolower(character));
+    };
+    std::transform(search.begin(), search.end(), search.begin(), lowercase);
+
+    if(ImGui::SmallButton("Refresh textures"))
+    {
+        ++m_previewTextureRefresh;
+        m_refreshTextureChoices = true;
+    }
+
+    const auto textures = registry.GetAssets(AssetType::Texture);
+    const bool registryMatches = textures.size() == m_texturePickerRegistry.size() &&
+        std::equal(textures.begin(), textures.end(), m_texturePickerRegistry.begin(),
+            [](const AssetRecord& left, const AssetRecord& right)
+            {
+                return left.id == right.id && left.type == right.type && left.relativePath == right.relativePath;
+            });
+
+    // File availability is scanned on opening/Refresh or registry changes,
+    // rather than polling every registered path on every popup frame.
+    if(m_refreshTextureChoices || !registryMatches)
+    {
+        m_availableTextures.clear();
+
+        for(const auto& texture : textures)
+        {
+            if(ProjectAssetResolver::Resolve(paths, registry, texture.id).status == AssetAvailability::Available)
+            {
+                m_availableTextures.push_back(texture);
+            }
+        }
+
+        std::sort(m_availableTextures.begin(), m_availableTextures.end(),
+            [](const AssetRecord& left, const AssetRecord& right)
+            {
+                return left.relativePath < right.relativePath;
+            });
+        m_texturePickerRegistry = textures;
+        m_refreshTextureChoices = false;
+    }
+
+    if(ImGui::BeginChild("TextureList", ImVec2(0.0f, 0.0f)))
+    {
+        if(ImGui::Selectable("None", !reference))
+        {
+            reference.reset();
+            ImGui::CloseCurrentPopup();
+        }
+
+        size_t matches = 0;
+
+        for(const auto& texture : m_availableTextures)
+        {
+            const auto filename = texture.relativePath.filename().string();
+            std::string filtered = filename;
+            std::transform(filtered.begin(), filtered.end(), filtered.begin(), lowercase);
+
+            if(filtered.find(search) == std::string::npos)
+            {
+                continue;
+            }
+
+            ++matches;
+            const auto canonicalReference = texture.id.ToReference();
+            const bool selected = reference && *reference == canonicalReference;
+            ImGui::PushID(canonicalReference.c_str());
+
+            if(ImGui::Selectable(filename.c_str(), selected))
+            {
+                // A file may disappear after the popup snapshot was captured.
+                // Never commit a stale or unsafe reference from that snapshot.
+                const auto* current = registry.Find(texture.id);
+                const bool identityMatches = current && current->type == AssetType::Texture &&
+                    current->relativePath == texture.relativePath;
+
+                if(identityMatches && ProjectAssetResolver::Resolve(paths, registry, texture.id).status ==
+                    AssetAvailability::Available)
+                {
+                    if(!selected)
+                    {
+                        reference = canonicalReference;
+                    }
+
+                    ImGui::CloseCurrentPopup();
+                }
+                else
+                {
+                    m_refreshTextureChoices = true;
+                }
+            }
+
+            if(ImGui::IsItemHovered())
+            {
+                const auto relativePath = texture.relativePath.generic_string();
+                ImGui::SetTooltip("%s", relativePath.c_str());
+            }
+
+            ImGui::PopID();
+        }
+
+        if(matches == 0)
+        {
+            ImGui::TextWrapped("No available registered textures match this search.");
+        }
+    }
+
+    ImGui::EndChild();
 }
 
 bool InspectorPanel::HasUnsavedChanges() const
@@ -887,16 +1094,23 @@ bool InspectorPanel::WriteMaterial(
         std::string saved = MaterialAssetSerializer::Serialize(*m_material).dump(4) + '\n';
         MaterialAssetData baseline = *m_material;
         auto thumbnailSource = resolved.resolvedPath;
+        MaterialSavedRevision revision{std::filesystem::canonical(paths.GetRoot()), record->id,
+            record->relativePath, saved, m_saveSequence + 1};
+        // Allocate notification storage before publishing the file replacement.
+        m_savedMaterialRevisions.reserve(m_savedMaterialRevisions.size() + 1);
 
         if(!MaterialAssetSerializer::SaveToFile(*m_material, resolved.resolvedPath, &m_status))
         {
             return false;
         }
 
+        ++m_saveSequence;
+        CoalesceMaterialSavedRevision(m_savedMaterialRevisions, std::move(revision));
         m_savedThumbnailSource = std::move(thumbnailSource);
         m_savedMaterial = std::move(baseline);
         m_savedBytes = std::move(saved);
         m_externalConflict = false;
+
         m_showConflictConfirmation = false;
         m_status = "Material saved. Runtime materials are unchanged.";
         return true;
@@ -993,4 +1207,102 @@ InspectorPanel::LeaveDecision InspectorPanel::DrawUnsavedConfirmation(
     }
 
     return decision;
+}
+
+std::vector<MaterialSavedRevision> InspectorPanel::TakeSavedMaterialRevisions()
+{
+    return std::exchange(m_savedMaterialRevisions, {});
+}
+
+void InspectorPanel::EndWorkingMaterial()
+{
+    if(m_workingWasActive && m_record)
+    {
+        std::error_code error;
+        const auto root = std::filesystem::canonical(m_projectRoot, error);
+
+        if(!error)
+        {
+            m_workingMaterialRevisions.push_back({root, m_record->id, m_record->relativePath,
+                ++m_workingSequence, m_saveSequence, MaterialWorkingRevision::Action::Leave, std::nullopt});
+        }
+    }
+
+    m_workingWasActive = false;
+}
+
+void InspectorPanel::ResetWorkingMaterialNotifications()
+{
+    m_workingMaterialRevisions.clear();
+    m_lastWorkingDraft.reset();
+    m_lastWorkingBaseline.reset();
+    m_workingWasActive = false;
+}
+
+std::vector<MaterialWorkingRevision> InspectorPanel::TakeWorkingMaterialRevisions(bool active)
+{
+    if(!active || !m_material || !m_record || !m_savedMaterial)
+    {
+        EndWorkingMaterial();
+        m_lastWorkingDraft.reset();
+        m_lastWorkingBaseline.reset();
+        return std::exchange(m_workingMaterialRevisions, {});
+    }
+
+    if(m_workingWasActive && m_lastWorkingDraft && m_lastWorkingBaseline &&
+       EqualMaterials(*m_lastWorkingDraft, *m_material) && EqualMaterials(*m_lastWorkingBaseline, *m_savedMaterial) &&
+       m_lastWorkingSaveSequence == m_saveSequence)
+    {
+        return std::exchange(m_workingMaterialRevisions, {});
+    }
+
+    std::error_code error;
+    const auto root = std::filesystem::canonical(m_projectRoot, error);
+
+    if(error)
+    {
+        return std::exchange(m_workingMaterialRevisions, {});
+    }
+
+    MaterialWorkingRevision revision{root, m_record->id, m_record->relativePath, ++m_workingSequence, m_saveSequence};
+
+    try
+    {
+        MaterialAssetSerializer::Serialize(*m_material); // Validate the entire draft before extracting parameters.
+        const auto parametersOnly = [](MaterialAssetData data)
+        {
+            data.baseColorTexture.reset();
+            data.normalTexture.reset();
+            data.roughnessTexture.reset();
+            data.metallicTexture.reset();
+            data.armTexture.reset();
+            data.aoTexture.reset();
+            data.heightTexture.reset();
+            return data;
+        };
+        revision.parameters = parametersOnly(*m_material);
+
+        if(m_lastWorkingDraft && m_lastWorkingSaveSequence != m_saveSequence &&
+           EqualMaterials(*m_material, *m_savedMaterial))
+        {
+            revision.action = MaterialWorkingRevision::Action::Saved;
+        }
+        else
+        {
+            revision.action = EqualMaterials(*revision.parameters, parametersOnly(*m_savedMaterial)) ?
+                MaterialWorkingRevision::Action::Restore : MaterialWorkingRevision::Action::Draft;
+        }
+    }
+    catch(const std::exception&)
+    {
+        revision.action = MaterialWorkingRevision::Action::Invalid;
+        revision.parameters.reset();
+    }
+
+    m_workingMaterialRevisions.push_back(std::move(revision));
+    m_lastWorkingDraft = m_material;
+    m_lastWorkingBaseline = m_savedMaterial;
+    m_lastWorkingSaveSequence = m_saveSequence;
+    m_workingWasActive = true;
+    return std::exchange(m_workingMaterialRevisions, {});
 }

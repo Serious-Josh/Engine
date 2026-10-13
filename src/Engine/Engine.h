@@ -13,6 +13,8 @@
 #include "Editor/Editor.h"
 
 #include "assets/ProjectAssetRegistry.h"
+#include "Scene/FileSceneRuntime.h"
+#include "Scene/FileSceneAssetCatalog.h"
 
 #include <cstdint>
 
@@ -29,12 +31,55 @@ class Engine
     bool Initialize();
     void Run();
     void Shutdown();
+    // Main-thread, non-UI seam. Queues copied identity; executes at the next safe frame boundary.
+    bool RequestMaterialAssignment(const SceneObjectMetadata& selection, std::string reference, std::string& error);
+    bool RequestMaterialAssignment(RenderObjectID index, std::string reference, std::string& error);
 
     private:
     void Frame();
     bool ActivateRequestedFileScene();
+    bool ExecuteMaterialAssignment();
+    struct MaterialAssignmentRequest
+    {
+        SceneObjectMetadata selection;
+
+        std::string reference;
+    };
+    std::optional<MaterialAssignmentRequest> m_pendingMaterialAssignment;
     void ProcessEditorSceneRequests(IDemoScene& activeScene);
     void ProcessEditorMaterialRequests();
+    void ProcessSavedMaterialRevisions();
+    void ProcessWorkingMaterialNotifications();
+    void PublishWorkingMaterialParameters();
+    struct WorkingMaterialOverride
+    {
+        Editor::SceneMaterialWorkingRevision selection;
+
+        std::optional<MaterialAssetData> parameters;
+        std::optional<MaterialAssetData> lastPublished;
+
+        std::uint64_t promotionSequence = 0;
+        std::uint64_t lastTableRevision = 0;
+    };
+    std::optional<WorkingMaterialOverride> m_workingMaterialOverride;
+
+    std::vector<Editor::SceneMaterialWorkingRevision> m_pendingWorkingMaterialRevisions;
+
+    std::vector<RuntimeMaterialVersions> m_workingMaterialRestores;
+
+    std::uint64_t m_lastWorkingMaterialSequence = 0;
+
+    std::vector<Editor::SceneMaterialSavedRevision> m_pendingSavedMaterialRevisions;
+    std::vector<Editor::SceneMaterialSavedRevision> m_savedMaterialRevisionQueue;
+    // Successfully propagated saved revisions, scoped to this runtime/catalog instance.
+    struct SavedMaterialObservation
+    {
+        MaterialSavedRevision saved;
+
+        RuntimeMaterialVersions runtime;
+    };
+    std::vector<SavedMaterialObservation> m_savedMaterialObservations;
+
     void QueueEditorSceneOperation();
 
     WindowProperties m_windowProperties;
@@ -59,6 +104,7 @@ class Engine
     Editor m_editor;
 
     std::optional<Editor::FileRequest> m_pendingEditorSceneOperation;
+
     std::string m_sceneOperationError;
 
     EngineState m_state = EngineState::Uninitialized;
