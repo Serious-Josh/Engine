@@ -24,7 +24,22 @@ public:
         const Shader* vertexShader,
         const Shader* pixelShader) override;
 
+    // Normal activation uses metadata preparation; the scheduler supplies geometry.
+    bool IsMetadataOnlyActivation() const noexcept { return m_metadataOnlyActivation; }
+
+    bool InitializeMetadataOnly(ID3D12Device* device, ResourceUploader& uploader, DescriptorHeap& descriptorHeap,
+        const Shader* vertexShader, const Shader* pixelShader);
+
+#ifdef _DEBUG
+    bool InitializeSynchronousDiagnostic(ID3D12Device* device, ResourceUploader& uploader, DescriptorHeap& descriptorHeap,
+        const Shader* vertexShader, const Shader* pixelShader);
+#endif
+
     void SetProjectAssets(const std::filesystem::path& root, const ProjectAssetRegistry& registry);
+    void SetMeshCPUCache(ProjectMeshCPUCache* cache) noexcept { m_meshCPUCache = cache; }
+    void SetTextureStreamingEnabled(bool enabled) noexcept { m_textureStreamingEnabled = enabled; }
+    void AdvanceTextureStreaming(ProjectTexturePreparationService& preparation, Renderer& renderer,
+        const std::function<bool(const AssetID&, const MaterialAssetData&)>& mayPublish);
 
     const std::filesystem::path& GetScenePath() const noexcept
     {
@@ -53,6 +68,13 @@ public:
     bool PublishWorkingMaterialParameters(const RuntimeMaterialVersions& expected,
         const std::optional<MaterialAssetData>& parameters, Renderer& renderer, std::string& error);
     const std::string& GetDisplayName() const noexcept;
+    bool BuildHierarchySnapshot(SceneHierarchySnapshot& snapshot, std::string* errorMessage = nullptr) const;
+    bool ReorderObjects(const SceneObjectOrderIdentity& identity,
+        const std::vector<std::string>& expectedOrder, const std::vector<std::string>& replacementOrder,
+        std::string* errorMessage = nullptr);
+    bool RenameObject(const SceneObjectMetadata& selection, std::string_view expectedName,
+        std::string name, std::string* errorMessage = nullptr,
+        SceneObjectNamePolicy policy = SceneObjectNamePolicy::TrimmedInput);
     bool Save(std::string* errorMessage = nullptr);
     std::uint64_t GetRuntimeIdentity() const noexcept
     {
@@ -77,6 +99,11 @@ public:
     Material* GetPreparedMaterialAssignmentMaterial(const MaterialAssignmentToken& token) const noexcept;
     // Load outside active recording; completed uploads remain owned by this scene.
     Material* ResolveAssignmentMaterial(std::string_view reference, std::string* errorMessage = nullptr);
+    Material* ResolvePendingAssignmentMaterial(std::string_view reference, std::string* errorMessage);
+    const MeshMetadata* GetPendingSlotMetadata(std::string_view reference) const
+    {
+        return m_assets.FindRetainedSlotMetadata(reference);
+    }
     // Engine must establish Renderer/GPU safety first and retain old/new catalog assets.
     bool CommitMaterialAssignment(const MaterialAssignmentToken& token, Material& sceneOwnedMaterial,
         std::string* errorMessage = nullptr);
@@ -103,6 +130,9 @@ public:
     void SetAspectRatio(float aspectRatio) override;
 
 private:
+    bool InitializeWithPolicy(ID3D12Device* device, ResourceUploader& uploader, DescriptorHeap& descriptorHeap,
+        const Shader* vertexShader, const Shader* pixelShader, bool metadataOnly);
+
     friend class Engine;
     // Engine retains both runtimes until checked candidate initialization/cleanup.
     std::unique_ptr<FileSceneRuntime> m_objectMutationCandidate;
@@ -113,7 +143,11 @@ private:
 
     FileSceneAssetCatalog m_assets;
 
+    ProjectMeshCPUCache* m_meshCPUCache = nullptr;
+
     std::unique_ptr<FileSceneRuntime> m_runtime = std::make_unique<FileSceneRuntime>();
 
     bool m_initialized = false;
+    bool m_metadataOnlyActivation = false;
+    bool m_textureStreamingEnabled = false;
 };

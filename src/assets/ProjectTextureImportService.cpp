@@ -1,6 +1,7 @@
 #include "assets/ProjectTextureImportService.h"
 #include "assets/AssetRegistrySerializer.h"
 #include "assets/ProjectAssetResolver.h"
+#include "assets/SupportedAssetImportFormats.h"
 #include "Renderer/ImageLoader.h"
 #include "Renderer/DDSLoader.h"
 
@@ -89,17 +90,10 @@ bool ProjectTextureImportService::Import(
 
     try
     {
-        std::string extension = source.extension().string();
-        std::transform(extension.begin(), extension.end(), extension.begin(), [](unsigned char character)
+        if(SupportedAssetImportFormats::Lookup(source) != AssetType::Texture)
         {
-            return static_cast<char>(std::tolower(character));
-        });
-        const std::array supported = {".png", ".jpg", ".jpeg", ".tga", ".bmp", ".psd", ".gif",
-            ".pic", ".pnm", ".ppm", ".pgm", ".hdr", ".dds"};
-
-        if(std::find(supported.begin(), supported.end(), extension) == supported.end())
-        {
-            throw std::runtime_error("Unsupported texture file extension.");
+            error = "Unsupported texture import format. Use .dds.";
+            return false;
         }
 
         const auto filename = source.filename().wstring();
@@ -187,7 +181,7 @@ bool ProjectTextureImportService::Import(
         // The source is still locked against writes/deletion. Decode these same
         // bytes through the existing file-based loaders, whose read-only sharing
         // is incompatible with a writable staging handle.
-        if(!Decode(sourcePath, extension))
+        if(!Decode(sourcePath, ".dds"))
         {
             throw std::runtime_error("Invalid image data or unsupported DDS layout/format.");
         }

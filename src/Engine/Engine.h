@@ -13,8 +13,11 @@
 #include "Editor/Editor.h"
 
 #include "assets/ProjectAssetRegistry.h"
+#include "assets/ProjectTexturePreparationService.h"
+#include "assets/ProjectMeshPreparationService.h"
 #include "Scene/FileSceneRuntime.h"
 #include "Scene/FileSceneAssetCatalog.h"
+#include "Scene/MeshResidencyPublication.h"
 
 #include <cstdint>
 
@@ -29,8 +32,26 @@ class Engine
 {
     public:
     bool Initialize();
+    // Explicit main-thread capability; publishes at the next ready pre-Render boundary.
+    bool PrepareMeshResidencyAcceptance(const MeshResidencyToken& token, std::string& error);
+    // Main-thread only; drops coordination ownership, preserving GPU manager pins.
+    void CancelMeshResidencyAcceptance() noexcept;
+    // Last boundary outcome, including whether publication completed.
+    const std::optional<MeshResidencyPublication::AcceptanceResult>& GetMeshResidencyAcceptance() const noexcept
+    {
+        return m_meshResidencyAcceptance;
+    }
+
     void Run();
     void Shutdown();
+    // Main-thread texture preparation integration.
+    ProjectTexturePreparationService& GetTexturePreparationService() noexcept
+    {
+        return m_texturePreparation;
+    }
+    // Main-thread mesh preparation and shared CPU cache integration.
+    ProjectMeshPreparationService& GetMeshPreparationService() noexcept { return m_meshPreparation; }
+    ProjectMeshCPUCache& GetMeshCPUCache() noexcept { return m_meshCPUCache; }
     // Main-thread, non-UI seam. Queues copied identity; executes at the next safe frame boundary.
     bool RequestMaterialAssignment(const SceneObjectMetadata& selection, std::string reference, std::string& error);
     bool RequestMaterialAssignment(RenderObjectID index, std::string reference, std::string& error);
@@ -108,6 +129,67 @@ class Engine
     }
 
     private:
+    void ProcessMeshResidencyDiagnostics();
+    void RequestDiagnosticMeshResidency();
+    void AdvanceDiagnosticMeshPreparation();
+    bool BeginMeshResidencyRequest(const SceneObjectMetadata& selection, bool automatic);
+    void StartAutomaticMeshResidency();
+    void OnFileSceneActivated(std::chrono::steady_clock::time_point started);
+    void ContinueAutomaticMeshResidencyAfterReplacement(std::uint64_t previousRuntimeIdentity) noexcept;
+    void AdvanceAutomaticMeshResidency();
+    void FinishAutomaticMeshResidency(MeshResidencyPublication::Status status);
+    void RejectMeshResidencyRequest(const std::string& message,
+        MeshResidencyPublication::Status status = MeshResidencyPublication::Status::Failed);
+    std::string GetMeshSourceIdentity(const SceneObjectMetadata& selection) const;
+
+    struct AutomaticMeshResidency
+    {
+        struct Failure
+        {
+            SceneObjectMetadata selection;
+            std::string sourceIdentity;
+        };
+
+        std::vector<Failure> failures; // At most one current failure per runtime object; max 4096.
+        std::uint64_t runtimeIdentity = 0;
+        std::uint64_t structureRevision = 0;
+        size_t cursor = 0;
+        size_t eligible = 0;
+        size_t published = 0;
+        size_t initiallyResident = 0;
+        size_t stale = 0;
+        bool enabled = false;
+        bool settled = false;
+        std::chrono::steady_clock::time_point activated;
+        std::chrono::steady_clock::time_point retryAfter;
+        std::string backpressure;
+    };
+
+    AutomaticMeshResidency m_automaticMeshResidency;
+    // Automatic scheduling intent is scoped to a successfully activated runtime,
+    // independent of its cursor, cooldowns and transient request handles.
+    std::uint64_t m_automaticResidencyIntent = 0;
+    std::optional<SceneObjectMetadata> m_residencyRequestSelection;
+    std::string m_residencyRequestSourceIdentity;
+    bool m_residencyRequestAutomatic = false;
+    struct DiagnosticMeshPreparation
+    {
+        SceneObjectMetadata selection;
+        std::uint64_t ticket = 0;
+        std::uint64_t generation = 0;
+        std::optional<ProjectMeshPreparationService::Completion> completion;
+    };
+
+    std::optional<DiagnosticMeshPreparation> m_diagnosticCPUPreparation;
+    void LogMeshResidencyDiagnostic(const MeshResidencyPublication::AcceptanceResult& result);
+
+    std::optional<MeshResidencyToken> m_diagnosticMeshToken;
+    std::optional<MeshResidencyPublication::AcceptanceResult> m_diagnosticMeshReadiness;
+    std::uint64_t m_diagnosticRendererLifetime = 0;
+
+    MeshResidencyPublication m_meshResidencyPublication;
+    std::optional<MeshResidencyPublication::AcceptanceResult> m_meshResidencyAcceptance;
+
     bool ExecuteSceneObjectCreation();
     bool ExecuteSceneObjectDeletion();
     bool ExecuteSceneObjectRestoration();
@@ -166,6 +248,7 @@ class Engine
     void ProcessEditorSceneRequests(IDemoScene& activeScene);
     void ProcessEditorMaterialRequests();
     void ProcessSavedMaterialRevisions();
+    void ProcessSceneTextureStreaming();
     void ProcessWorkingMaterialNotifications();
     void PublishWorkingMaterialParameters();
     struct WorkingMaterialOverride
@@ -211,6 +294,9 @@ class Engine
 
     std::optional<Renderer::FrameRenderResult> m_diagnosticRenderOutcome;
 
+    // Declared before scene owners so cache lifetime includes catalog teardown.
+    ProjectMeshCPUCache m_meshCPUCache;
+
     DemoSceneManager m_demoSceneManager;
 
     uint64_t m_renderedSceneStructureRevision = 0;
@@ -229,4 +315,7 @@ class Engine
     bool m_sceneResourcesReleasedForSwitch = false;
 
     ProjectAssetRegistry m_projectAssetRegistry;
+
+    ProjectTexturePreparationService m_texturePreparation;
+    ProjectMeshPreparationService m_meshPreparation;
 };

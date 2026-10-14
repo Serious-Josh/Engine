@@ -62,10 +62,12 @@ class Pipeline
     bool Initialize(
         ID3D12Device* device,
         const PipelineDescription& description);
+    void Swap(Pipeline& other) noexcept;
     void Shutdown();
     void Bind(ID3D12GraphicsCommandList* commandList) const;
 
     ID3D12RootSignature* GetRootSignature() const;
+    bool IsInitialized() const noexcept { return m_rootSignature && m_pipelineState; }
 
     private:
     ID3D12RootSignature* m_rootSignature = nullptr;

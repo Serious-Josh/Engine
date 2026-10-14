@@ -14,7 +14,8 @@ struct ResolvedSceneObject
     std::string name;
     RenderObject renderObject;
 
-    // Preparation provenance: null mesh is permitted only for an empty binding.
+    // Preparation provenance, not mutable runtime residency state. Full commit
+    // requires geometry; metadata commit crosschecks the authored document snapshot.
     bool meshBindingEmpty = false;
 };
 

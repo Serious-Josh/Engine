@@ -1,6 +1,7 @@
 #include "SelectionMaskPass.h"
 
 #include "Core/Log.h"
+#include <cassert>
 
 #include "Renderer/Shader/ShaderLibrary.h"
 
@@ -9,6 +10,23 @@ bool SelectionMaskPass::Initialize(
     ShaderLibrary& shaderLibrary,
     const VertexLayout& vertexLayout)
 {
+    if (IsInitialized() || !device)
+    {
+        return false;
+    }
+
+    std::vector<LayoutAttribute> layout;
+
+    for (const auto& attribute : vertexLayout.GetAttributes())
+    {
+        if (!attribute.semantic)
+        {
+            return false;
+        }
+
+        layout.push_back({attribute.semantic, attribute.semanticIndex, attribute.type, attribute.offset});
+    }
+
     ShaderDescription vertexDescription{};
     vertexDescription.path = "SelectionMask.hlsl";
     vertexDescription.entryPoint = "VSMain";
@@ -68,6 +86,8 @@ bool SelectionMaskPass::Initialize(
         return false;
     }
 
+    m_layout.swap(layout);
+    m_stride = vertexLayout.GetStride();
     return true;
 }
 
@@ -79,4 +99,36 @@ void SelectionMaskPass::Bind(ID3D12GraphicsCommandList* commandList) const
 void SelectionMaskPass::Shutdown()
 {
     m_pipeline.Shutdown();
+    m_layout.clear();
+    m_stride = 0;
+}
+
+bool SelectionMaskPass::IsCompatible(const VertexLayout& layout) const noexcept
+{
+    if (!IsInitialized() || m_stride != layout.GetStride() || m_layout.size() != layout.GetAttributes().size())
+    {
+        return false;
+    }
+
+    for (size_t i = 0; i < m_layout.size(); ++i)
+    {
+        const auto& expected = m_layout[i];
+        const auto& actual = layout.GetAttributes()[i];
+
+        if (!actual.semantic || expected.semantic != actual.semantic || expected.index != actual.semanticIndex ||
+            expected.type != actual.type || expected.offset != actual.offset)
+        {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+void SelectionMaskPass::AdoptPrepared(SelectionMaskPass& candidate) noexcept
+{
+    assert(!IsInitialized() && candidate.IsInitialized());
+    m_pipeline.Swap(candidate.m_pipeline);
+    m_layout.swap(candidate.m_layout);
+    std::swap(m_stride, candidate.m_stride);
 }

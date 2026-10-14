@@ -1,3 +1,5 @@
+#include <cassert>
+#include "Scene/SceneSwitchTiming.h"
 #include "Core/Log.h"
 #include "Core/Assert.h"
 #include "Renderer.h"
@@ -354,6 +356,7 @@ bool Renderer::BeginTrackedRecording(unsigned int frameSlot)
         }
     }
 
+    m_rayTracingScene.CollectRetiredMemberships(m_commandContext);
     InvalidateRecordingEligibility(); // Includes allocator/list reset attempts.
     const std::uint64_t generation = AllocateRendererIdentity();
 
@@ -366,6 +369,11 @@ bool Renderer::BeginTrackedRecording(unsigned int frameSlot)
     m_commandRecordingGeneration = generation;
     m_commandSubmissionAttempted = false;
     m_activeRecordingSlot = frameSlot;
+
+    if (!m_rayTracingScene.BeginMembershipRecording(generation))
+    {
+        return false;
+    }
 
     if(!m_materialPreviewRenderer.BeginRecording(generation))
     {
@@ -550,6 +558,7 @@ bool Renderer::AbortTrackedRecording()
     if(discarded)
     {
         m_textureThumbnails.Discarded(m_commandRecordingGeneration);
+        m_rayTracingScene.DiscardMembershipRecording(m_commandRecordingGeneration);
 
         if(!m_materialPreviewRenderer.DiscardRecording(m_commandRecordingGeneration))
         {
@@ -610,11 +619,22 @@ bool Renderer::ExecuteTrackedRecording(unsigned int frameSlot)
         m_frameHitchDiagnostics.current.contextStart = CpuTiming::Clock::now();
     }
 
+    if (!m_rayTracingScene.AttemptMembershipSubmission(m_commandRecordingGeneration))
+    {
+        return false;
+    }
+
     m_commandSubmissionAttempted = true;
     const bool executed = m_commandContext.Execute(frameSlot);
 
     if(executed)
     {
+        if (!m_rayTracingScene.ConfirmMembershipSubmission(m_commandRecordingGeneration, m_commandContext))
+        {
+            Log::Error("DXR membership submission association failed; retaining snapshot ownership.");
+            return false;
+        }
+
         m_textureThumbnails.Submitted(m_commandRecordingGeneration, m_commandContext.GetLastSubmissionFenceValue());
 
         if(!m_materialPreviewRenderer.ConfirmSubmission(m_commandRecordingGeneration,
@@ -946,11 +966,22 @@ ReservedSubmissionResult Renderer::ExecuteCoveredDisplacementRecording(
         m_frameHitchDiagnostics.current.contextStart = CpuTiming::Clock::now();
     }
 
+    if (!m_rayTracingScene.AttemptMembershipSubmission(m_commandRecordingGeneration))
+    {
+        return ReservedSubmissionResult::SubmissionUncertain;
+    }
+
     m_commandSubmissionAttempted = true;
     const auto result = m_commandContext.ExecuteReserved(frameSlot, reservation, submitted);
 
     if(result == ReservedSubmissionResult::Submitted)
     {
+        if (!m_rayTracingScene.ConfirmMembershipSubmission(m_commandRecordingGeneration, m_commandContext))
+        {
+            Log::Error("DXR membership reserved submission association failed; retaining snapshot ownership.");
+            return ReservedSubmissionResult::SubmissionUncertain;
+        }
+
         m_textureThumbnails.Submitted(m_commandRecordingGeneration, submitted.fenceValue);
 
         if(!m_materialPreviewRenderer.ConfirmSubmission(m_commandRecordingGeneration, submitted.fenceValue))
@@ -967,6 +998,7 @@ ReservedSubmissionResult Renderer::ExecuteCoveredDisplacementRecording(
     }
     else if(result == ReservedSubmissionResult::NotSubmitted)
     {
+        m_rayTracingScene.MembershipNotSubmitted(m_commandRecordingGeneration);
         m_commandSubmissionAttempted = false;
     }
     else
@@ -3727,6 +3759,8 @@ bool Renderer::InitializeSceneResources(
             return false;
         }
 
+        m_selectionMaskCandidate.reset();
+        m_selectionMaskCandidateLifetime = 0;
         m_selectionMaskPass.Shutdown();
 
         const RenderObject* firstRenderableObject = nullptr;
@@ -3798,6 +3832,8 @@ bool Renderer::InitializeMaterials(const std::vector<Material*>& materials)
     std::vector<GPUMaterial> gpuMaterials;
     gpuMaterials.reserve(materials.size());
 
+    m_publishedMaterialIdentities.assign(materials.begin(), materials.end());
+
     for (size_t i = 0; i < materials.size(); ++i)
     {
         if (!materials[i])
@@ -3867,6 +3903,7 @@ bool Renderer::InitializeMaterials(const std::vector<Material*>& materials)
 
 bool Renderer::InitializeRayTracingScene(const Scene& scene)
 {
+    SceneSwitchTiming::Measure asTiming(SceneSwitchTiming::Stage::AccelerationStructures);
     // No AS or instance buffer is needed when every object is intentionally meshless.
     // Scene-resource release still owns draining and destruction when switching scenes.
     if(!scene.HasRenderableMeshes())
@@ -3922,8 +3959,12 @@ bool Renderer::InitializeRayTracingScene(const Scene& scene)
     }
 
     // A failed submission fence signal does not mean the build was discarded.
+    const bool completed = SceneSwitchTiming::MeasureCall(SceneSwitchTiming::Stage::ASWait, [&]()
+    {
+        return m_commandContext.WaitForGPU();
+    });
 
-    if (!m_commandContext.WaitForGPU())
+    if (!completed)
     {
         Log::Error("Failed to confirm acceleration structure build completion.");
 
@@ -3981,6 +4022,8 @@ bool Renderer::CleanupFailedSceneInitialization(const Scene& candidate)
 
     m_rayTracingScene.Shutdown();
     ShutdownMaterialTables();
+    m_selectionMaskCandidate.reset();
+    m_selectionMaskCandidateLifetime = 0;
     m_selectionMaskPass.Shutdown();
     ResetSceneHistory();
 
@@ -4031,6 +4074,8 @@ bool Renderer::ReleaseSceneResources()
     m_rayTracingScene.Shutdown();
     ShutdownMaterialTables();
 
+    m_selectionMaskCandidate.reset();
+    m_selectionMaskCandidateLifetime = 0;
     m_selectionMaskPass.Shutdown();
 
     ResetSceneHistory();
@@ -5871,6 +5916,7 @@ void Renderer::Shutdown()
         std::abort();
     }
 
+    m_rayTracingScene.Shutdown();
     m_textureThumbnails.ClearAfterGPUDrain();
 
     Log::Info("Renderer shutdown: GPU finished.");
@@ -5918,6 +5964,8 @@ void Renderer::Shutdown()
     m_giSignedCorrectionPass.Shutdown();
     m_giSignedCorrectionInitialized = false;
     m_shadowDenoisePass.Shutdown();
+    m_selectionMaskCandidate.reset();
+    m_selectionMaskCandidateLifetime = 0;
     m_selectionMaskPass.Shutdown();
     m_displacementIndicesPass.Shutdown();
     m_displacementVerticesPass.Shutdown();
@@ -6719,6 +6767,7 @@ StructuredBuffer& Renderer::CurrentMaterialBuffer()
 
 void Renderer::ShutdownMaterialTables()
 {
+    m_publishedMaterialIdentities.clear();
     // Same checked completion/discard precondition as the former single scene table.
     for(auto& buffer : m_materialBuffers)
     {
@@ -7128,4 +7177,29 @@ bool Renderer::ResolvePreviewAfterGPUDrain()
     m_commandRecordingGeneration = 0;
     m_commandSubmissionAttempted = false;
     return true;
+}
+
+void Renderer::AdoptSelectionMaskCandidate() noexcept
+{
+    // Future coordinator only: freshly checked layout/source/lifetime, no
+    // intervening mutation or recording. Never replace an active pipeline.
+    assert(!m_commandRecordingGeneration && !m_activeRecordingGeneration);
+    assert(m_selectionMaskCandidateLifetime == m_sceneResourceLifetime);
+    assert(m_selectionMaskCandidate && !m_selectionMaskPass.IsInitialized());
+    m_selectionMaskPass.AdoptPrepared(*m_selectionMaskCandidate);
+}
+
+bool Renderer::HasPublishedMaterial(const Material& material) const noexcept
+{
+    return m_sceneResourceLifetime && material.gpuIndex < m_publishedMaterialIdentities.size() &&
+        material.gpuIndex < m_materialPublication.desired.size() &&
+        m_publishedMaterialIdentities[material.gpuIndex] == &material;
+}
+
+bool Renderer::CanEditPendingMaterialBindings(const Scene& scene) const noexcept
+{
+    return m_sceneResourceScene == &scene && m_sceneResourceLifetime && !m_commandRecordingGeneration &&
+        !m_activeRecordingGeneration && !m_commandSubmissionAttempted && !m_sceneInitializationAttempt.candidate &&
+        !m_sceneInitializationAttempt.failed && !m_resizeFailed && !m_geometryUpdateFailed &&
+        !m_displacementExitScopeGeneration && !HasUnresolvedDisplacementUpdate();
 }

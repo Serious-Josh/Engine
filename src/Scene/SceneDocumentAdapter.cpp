@@ -65,6 +65,8 @@ bool CaptureSceneDocument(
         return fail("Runtime scene object count or mapping does not match the document.");
     }
 
+    // Authored references and slot overrides survive absent resident geometry.
+    // Capture updates transforms/settings only; residency is not serialized.
     SceneDocument candidate = source;
     std::vector<bool> visited(objects.size(), false);
 
@@ -88,8 +90,7 @@ bool CaptureSceneDocument(
         const auto& runtime = objects[index];
         const auto& committed = mapping.committedObjects[index];
 
-        if (runtime.mesh != committed.mesh || runtime.material != committed.material ||
-            runtime.slotMaterials != committed.slotMaterials)
+        if(!MatchesCommittedSceneObjectBindings(object, runtime, committed))
         {
             return fail("Runtime asset replacement cannot be persisted as a transform edit.");
         }

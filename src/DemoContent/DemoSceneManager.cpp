@@ -21,6 +21,8 @@ void DemoSceneManager::ConfigureProjectAssets(IDemoScene& scene) const
     if(fileScene && m_registry)
     {
         fileScene->SetProjectAssets(m_projectRoot, *m_registry);
+        fileScene->SetTextureStreamingEnabled(m_textureStreamingEnabled);
+        fileScene->SetMeshCPUCache(m_meshCPUCache);
     }
 }
 
@@ -107,6 +109,20 @@ bool DemoSceneManager::RequestScene(std::string_view sceneName)
         m_hasPendingSceneChange = false;
 
         m_requestedSceneEntry = m_activeSceneEntry;
+        return true;
+    }
+
+    // Registered file scenes share the atomic file staging/renderer commit path.
+    auto requested = sceneEntry->create();
+
+    if (const auto* fileScene = dynamic_cast<const FileBackedDemoScene*>(requested.get()))
+    {
+        if (!RequestFileScene(fileScene->GetScenePath()))
+        {
+            return false;
+        }
+
+        m_requestedSceneEntry = sceneEntry;
         return true;
     }
 
@@ -278,6 +294,7 @@ bool DemoSceneManager::RequestFileScene(
     }
 
     m_requestedFilePath = path;
+    m_requestedMetadataOnly = true;
     m_requestedSceneEntry = nullptr;
 
     if (errorMessage)
@@ -287,6 +304,24 @@ bool DemoSceneManager::RequestFileScene(
 
     return true;
 }
+
+bool DemoSceneManager::RequestMetadataOnlyFileScene(const std::filesystem::path& path, std::string* errorMessage)
+{
+    return RequestFileScene(path, errorMessage);
+}
+
+#ifdef _DEBUG
+bool DemoSceneManager::RequestSynchronousFileSceneDiagnostic(const std::filesystem::path& path, std::string* errorMessage)
+{
+    if (!RequestFileScene(path, errorMessage))
+    {
+        return false;
+    }
+
+    m_requestedMetadataOnly = false;
+    return true;
+}
+#endif
 
 bool DemoSceneManager::StageRequestedFileScene(
     ID3D12Device* device,
@@ -309,7 +344,20 @@ bool DemoSceneManager::StageRequestedFileScene(
 
         ConfigureProjectAssets(*candidate);
 
-        if (!candidate->Initialize(device, uploader, descriptorHeap, vertexShader, pixelShader))
+        bool initialized = false;
+
+#ifdef _DEBUG
+        if (!m_requestedMetadataOnly)
+        {
+            initialized = candidate->InitializeSynchronousDiagnostic(device, uploader, descriptorHeap, vertexShader, pixelShader);
+        }
+        else
+#endif
+        {
+            initialized = candidate->Initialize(device, uploader, descriptorHeap, vertexShader, pixelShader);
+        }
+
+        if(!initialized)
         {
             candidate->Shutdown();
             return FailFileRequest(errorMessage, "Failed to initialize file scene candidate: " +
@@ -372,9 +420,10 @@ bool DemoSceneManager::CommitStagedFileScene(std::string* errorMessage)
 
     m_activeScene = std::move(m_stagedFileScene);
     m_activeFileName = std::move(m_stagedFileName);
-    m_activeSceneEntry = nullptr;
+    m_activeSceneEntry = m_requestedSceneEntry;
     m_requestedSceneEntry = nullptr;
     m_requestedFilePath.clear();
+    m_requestedMetadataOnly = false;
 
     if (errorMessage)
     {
@@ -394,4 +443,5 @@ void DemoSceneManager::CancelFileSceneRequest()
 
     m_stagedFileName.clear();
     m_requestedFilePath.clear();
+    m_requestedMetadataOnly = false;
 }

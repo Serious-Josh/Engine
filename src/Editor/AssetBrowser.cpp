@@ -8,6 +8,7 @@
 #include "imgui_internal.h"
 #include "assets/ProjectTextureImportService.h"
 #include "assets/ProjectMeshImportService.h"
+#include "assets/SupportedAssetImportFormats.h"
 #include "assets/ProjectAssetResolver.h"
 #include "Core/Log.h"
 
@@ -834,9 +835,18 @@ void AssetBrowser::ImportFileDrop(
 
     for(const auto& source : files)
     {
+        const auto category = SupportedAssetImportFormats::Lookup(source);
+
+        if(!category)
+        {
+            failures += "\n" + source.filename().string() + ": " + SupportedAssetImportFormats::UnsupportedMessage;
+            Log::Error("Asset import failed: " + source.string() + ": " + SupportedAssetImportFormats::UnsupportedMessage);
+            continue;
+        }
+
         std::filesystem::path imported;
         std::string error;
-        const bool isMesh = _wcsicmp(source.extension().c_str(), L".fbx") == 0;
+        const bool isMesh = *category == AssetType::Mesh;
         const bool succeeded = isMesh ?
             ProjectMeshImportService::Import(paths, registry, source, imported, error) :
             ProjectTextureImportService::Import(paths, registry, source, target->directory, imported, error);

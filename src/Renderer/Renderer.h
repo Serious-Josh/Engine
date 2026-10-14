@@ -66,6 +66,7 @@
 #include <vector>
 #include <array>
 #include <optional>
+#include <memory>
 #include <cstddef>
 #include <limits>
 #include <climits>
@@ -270,6 +271,17 @@ class Renderer
     ShaderLibrary& GetShaderLibrary();
     DebugUI& GetDebugUI();
 
+    // Preparation only. No scene mesh binding or active DXR snapshot publication.
+    std::optional<RayTracingSceneResources::ReplacementCandidate> PrepareDXRMembershipCandidate(
+        const FileSceneRuntime& runtime, FileSceneAssetCatalog& catalog,
+        const std::vector<RayTracingSceneResources::ResidencyProposal>& proposals,
+        unsigned int frameSlot, std::string& error);
+    RayTracingSceneResources::CandidateStatus PollDXRMembershipCandidate(
+        const RayTracingSceneResources::ReplacementCandidate& candidate, const FileSceneRuntime& runtime,
+        FileSceneAssetCatalog& catalog, std::string& error) const;
+    bool RefreshDXRMembershipCandidateTransforms(const RayTracingSceneResources::ReplacementCandidate& candidate,
+        const FileSceneRuntime& runtime, FileSceneAssetCatalog& catalog, unsigned int frameSlot, std::string& error);
+
     bool InitializeSceneResources(
         const Scene& scene,
         const std::vector<Material*>& materials);
@@ -347,6 +359,8 @@ class Renderer
         return m_materialPublication.revision;
     }
 
+    bool HasPublishedMaterial(const Material& material) const noexcept;
+    bool CanEditPendingMaterialBindings(const Scene& scene) const noexcept;
     bool CopyMaterialTableSnapshot(std::uint64_t identity, std::vector<GPUMaterial>& records,
         std::string* errorMessage = nullptr) const;
     bool SubmitMaterialTableSnapshot(std::uint64_t identity, const std::vector<GPUMaterial>& records,
@@ -397,6 +411,7 @@ class Renderer
     }
 
     private:
+    friend class MeshResidencyPublication;
     static constexpr bool kEnableFrameHitchDiagnostics = true;
     static constexpr double kCpuHitchThresholdMilliseconds = 25.0;
 
@@ -925,6 +940,16 @@ class Renderer
 
     ShadowDenoisePass m_shadowDenoisePass;
 
+    // Never recorded or bound until the future coordinator accepts it.
+    struct SelectionMaskPipelineCandidate final : SelectionMaskPass
+    {
+        ~SelectionMaskPipelineCandidate() { Shutdown(); }
+    };
+
+    std::unique_ptr<SelectionMaskPipelineCandidate> m_selectionMaskCandidate;
+    std::uint64_t m_selectionMaskCandidateLifetime = 0;
+    void AdoptSelectionMaskCandidate() noexcept;
+
     SelectionMaskPass m_selectionMaskPass;
 
     DisplacementVerticesPass m_displacementVerticesPass;
@@ -968,6 +993,7 @@ class Renderer
 
     UploadBuffer m_materialUpload;
 
+    std::vector<const Material*> m_publishedMaterialIdentities;
     MaterialTablePublication<CommandContext::FrameCount> m_materialPublication;
     // The existing resource heap has 256 descriptors; retain no more distinct dependencies.
     MaterialDependencyRetention<Texture::Dependency, CommandContext::FrameCount, 256> m_materialDependencies;

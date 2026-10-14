@@ -246,3 +246,9 @@ ID3D12RootSignature* Pipeline::GetRootSignature() const
 {
     return m_rootSignature;
 }
+
+void Pipeline::Swap(Pipeline& other) noexcept
+{
+    std::swap(m_rootSignature, other.m_rootSignature);
+    std::swap(m_pipelineState, other.m_pipelineState);
+}

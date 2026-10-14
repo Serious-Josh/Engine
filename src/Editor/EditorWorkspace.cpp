@@ -22,7 +22,8 @@ namespace
     EditorWorkspaceRect ExpandedHitRectangle(
         const EditorWorkspaceRect& rectangle,
         const EditorWorkspaceRect& center,
-        bool vertical)
+        bool vertical,
+        bool expandRight = false)
     {
         EditorWorkspaceRect hit = rectangle;
         const float extra = (std::max)(0.0f, SplitterHitSize - (vertical ? rectangle.size.x : rectangle.size.y));
@@ -31,7 +32,7 @@ namespace
         if(vertical)
         {
             const float padding = (std::min)(extra, center.size.x);
-            hit.position.x -= padding;
+            hit.position.x -= expandRight ? 0.0f : padding;
             hit.size.x += padding;
         }
         else
@@ -39,6 +40,7 @@ namespace
             const float padding = (std::min)(extra, center.size.y);
             hit.position.y -= padding;
             hit.size.y += padding;
+            hit.position.x = center.position.x;
             hit.size.x = center.size.x;
         }
 
@@ -154,16 +156,46 @@ void EditorWorkspace::Calculate()
         (std::clamp)(m_assetBrowserHeight, (std::min)(140.0f, browserMax), browserMax) : 0.0f;
     const float upperHeight = height - browserHeight - horizontalSize;
 
-    const float verticalSize = m_inspectorVisible ? (std::min)(SplitterSize, width * 0.05f) : 0.0f;
-    const float inspectorMax = (std::max)(0.0f, width - (std::min)(240.0f, width * 0.5f) - verticalSize);
-    const float inspectorWidth = m_inspectorVisible ?
-        (std::clamp)(m_inspectorWidth, (std::min)(200.0f, inspectorMax), inspectorMax) : 0.0f;
-    const float centerWidth = width - inspectorWidth - verticalSize;
-    const ImVec2 origin = m_workspace.position;
+    const float splitterSize = (std::min)(SplitterSize, width * 0.025f);
+    const float hierarchySplitterSize = m_hierarchyVisible ? splitterSize : 0.0f;
+    const float inspectorSplitterSize = m_inspectorVisible ? splitterSize : 0.0f;
+    const float viewportMinimum = (std::min)(240.0f, width * 0.5f);
+    const float sideBudget = (std::max)(0.0f,
+        width - viewportMinimum - hierarchySplitterSize - inspectorSplitterSize);
+    const float hierarchyMinimum = m_hierarchyVisible ? 160.0f : 0.0f;
+    const float inspectorMinimum = m_inspectorVisible ? 200.0f : 0.0f;
+    const float minimumSum = hierarchyMinimum + inspectorMinimum;
+    float hierarchyWidth = 0.0f;
+    float inspectorWidth = 0.0f;
 
-    m_sceneViewport = {origin, ImVec2(centerWidth, upperHeight)};
-    m_verticalSplitter = {ImVec2(origin.x + centerWidth, origin.y), ImVec2(verticalSize, upperHeight)};
-    m_inspector = {ImVec2(origin.x + centerWidth + verticalSize, origin.y), ImVec2(inspectorWidth, upperHeight)};
+    if(sideBudget < minimumSum)
+    {
+        // Shrink both side panels proportionally when their minima cannot fit.
+        const float scale = sideBudget / minimumSum;
+        hierarchyWidth = hierarchyMinimum * scale;
+        inspectorWidth = inspectorMinimum * scale;
+    }
+    else
+    {
+        inspectorWidth = m_inspectorVisible ?
+            (std::clamp)(m_inspectorWidth, inspectorMinimum, sideBudget - hierarchyMinimum) : 0.0f;
+        hierarchyWidth = m_hierarchyVisible ?
+            (std::clamp)(m_hierarchyWidth, hierarchyMinimum, sideBudget - inspectorWidth) : 0.0f;
+    }
+
+    const float centerWidth = width - hierarchyWidth - hierarchySplitterSize -
+        inspectorWidth - inspectorSplitterSize;
+    const ImVec2 origin = m_workspace.position;
+    const float centerX = origin.x + hierarchyWidth + hierarchySplitterSize;
+
+    m_hierarchy = {origin, ImVec2(hierarchyWidth, upperHeight)};
+    m_hierarchySplitter = {ImVec2(origin.x + hierarchyWidth, origin.y),
+        ImVec2(hierarchySplitterSize, upperHeight)};
+    m_sceneViewport = {ImVec2(centerX, origin.y), ImVec2(centerWidth, upperHeight)};
+
+    m_verticalSplitter = {ImVec2(centerX + centerWidth, origin.y), ImVec2(inspectorSplitterSize, upperHeight)};
+    m_inspector = {ImVec2(centerX + centerWidth + inspectorSplitterSize, origin.y),
+        ImVec2(inspectorWidth, upperHeight)};
     m_horizontalSplitter = {ImVec2(origin.x, origin.y + upperHeight), ImVec2(width, horizontalSize)};
     m_assetBrowser = {ImVec2(origin.x, origin.y + upperHeight + horizontalSize), ImVec2(width, browserHeight)};
 }
@@ -179,6 +211,8 @@ void EditorWorkspace::Update()
     SplitterInteraction horizontal;
     SplitterInteraction vertical;
     SplitterInteraction horizontalTail;
+    SplitterInteraction horizontalLeftTail;
+    SplitterInteraction hierarchy;
 
     // Resolve all input before panels consume their final rectangles.
     if(m_assetBrowserVisible)
@@ -187,12 +221,22 @@ void EditorWorkspace::Update()
             ExpandedHitRectangle(m_horizontalSplitter, m_sceneViewport, false), false);
         // Keep the original narrow handle beneath Inspector, without expanding into its controls.
         auto tail = m_horizontalSplitter;
-        tail.position.x += m_sceneViewport.size.x;
-        tail.size.x -= m_sceneViewport.size.x;
+        tail.position.x = m_sceneViewport.position.x + m_sceneViewport.size.x;
+        tail.size.x = m_workspace.position.x + m_workspace.size.x - tail.position.x;
         horizontalTail = ProcessSplitter("##WorkspaceHorizontalTail", tail, false);
+
         horizontal.hovered = horizontal.hovered || horizontalTail.hovered;
         horizontal.active = horizontal.active || horizontalTail.active;
-        m_assetBrowserHeight = m_assetBrowser.size.y - horizontal.delta - horizontalTail.delta;
+
+        auto leftTail = m_horizontalSplitter;
+        leftTail.size.x = m_sceneViewport.position.x - m_workspace.position.x;
+        horizontalLeftTail = ProcessSplitter("##WorkspaceHorizontalLeftTail", leftTail, false);
+
+        horizontal.hovered = horizontal.hovered || horizontalLeftTail.hovered;
+        horizontal.active = horizontal.active || horizontalLeftTail.active;
+
+        m_assetBrowserHeight = m_assetBrowser.size.y - horizontal.delta -
+            horizontalTail.delta - horizontalLeftTail.delta;
         Calculate();
     }
 
@@ -211,8 +255,22 @@ void EditorWorkspace::Update()
         Calculate();
     }
 
+    if(m_hierarchyVisible)
+    {
+        auto hit = ExpandedHitRectangle(m_hierarchySplitter, m_sceneViewport, true, true);
+
+        if(m_assetBrowserVisible)
+        {
+            hit.size.y = (std::max)(0.0f, hit.size.y - (SplitterHitSize - m_horizontalSplitter.size.y));
+        }
+
+        hierarchy = ProcessSplitter("##WorkspaceHierarchySplitter", hit, true);
+        m_hierarchyWidth = m_hierarchy.size.x + hierarchy.delta;
+        Calculate();
+    }
+
     // Recompute from this frame's live handles; hidden/released handles cannot leave a queued resize.
-    m_splitterDragging = (horizontal.active || vertical.active) &&
+    m_splitterDragging = (horizontal.active || vertical.active || hierarchy.active) &&
         ImGui::IsMouseDown(ImGuiMouseButton_Left) && !ImGui::GetIO().AppFocusLost;
 
     auto verticalHit = ExpandedHitRectangle(m_verticalSplitter, m_sceneViewport, true);
@@ -223,6 +281,15 @@ void EditorWorkspace::Update()
             verticalHit.size.y - (SplitterHitSize - m_horizontalSplitter.size.y));
     }
 
+    auto hierarchyHit = ExpandedHitRectangle(m_hierarchySplitter, m_sceneViewport, true, true);
+
+    if(m_assetBrowserVisible)
+    {
+        hierarchyHit.size.y = (std::max)(0.0f,
+            hierarchyHit.size.y - (SplitterHitSize - m_horizontalSplitter.size.y));
+    }
+
+    PositionSplitter("##WorkspaceHierarchySplitter", m_hierarchySplitter, hierarchyHit, true, hierarchy);
     PositionSplitter("##WorkspaceHorizontalSplitter", m_horizontalSplitter,
         ExpandedHitRectangle(m_horizontalSplitter, m_sceneViewport, false), false, horizontal);
     PositionSplitter("##WorkspaceVerticalSplitter", m_verticalSplitter, verticalHit, true, vertical);
@@ -230,10 +297,16 @@ void EditorWorkspace::Update()
     if(m_assetBrowserVisible)
     {
         auto tail = m_horizontalSplitter;
-        tail.position.x += m_sceneViewport.size.x;
-        tail.size.x -= m_sceneViewport.size.x;
+        tail.position.x = m_sceneViewport.position.x + m_sceneViewport.size.x;
+        tail.size.x = m_workspace.position.x + m_workspace.size.x - tail.position.x;
         horizontalTail.hovered = horizontal.hovered;
         horizontalTail.active = horizontal.active;
         PositionSplitter("##WorkspaceHorizontalTail", tail, tail, false, horizontalTail);
+
+        auto leftTail = m_horizontalSplitter;
+        leftTail.size.x = m_sceneViewport.position.x - m_workspace.position.x;
+        horizontalLeftTail.hovered = horizontal.hovered;
+        horizontalLeftTail.active = horizontal.active;
+        PositionSplitter("##WorkspaceHorizontalLeftTail", leftTail, leftTail, false, horizontalLeftTail);
     }
 }

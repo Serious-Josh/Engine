@@ -323,7 +323,8 @@ void InspectorPanel::DrawSceneAssetTiles(const SceneObjectInspectorView& object,
     const float extent = (std::max)(16.0f, (std::min)(128.0f, ImGui::GetContentRegionAvail().x));
     ImGui::TextUnformatted("Mesh");
     const auto meshID = AssetID::ParseReference(object.meshReference);
-    const char* meshPlaceholder = object.mesh == "No mesh" ? "No mesh" :
+    const char* meshPlaceholder = object.meshResidency == SceneMeshResidency::Pending ? "Pending / unavailable" :
+        object.mesh == "No mesh" ? "No mesh" :
         meshID ? "Pending / unavailable" : "Built-in / runtime mesh";
     DrawScenePreviewTile(extent, meshPlaceholder, [&]()
     {
@@ -332,6 +333,47 @@ void InspectorPanel::DrawSceneAssetTiles(const SceneObjectInspectorView& object,
     ImGui::TextWrapped("%s", object.mesh.c_str());
     ImGui::Spacing();
     ImGui::Separator();
+
+    if(object.meshResidency == SceneMeshResidency::Pending && !object.materialSlotMetadataAvailable)
+    {
+        ImGui::TextUnformatted("Materials");
+        ImGui::TextDisabled("Mesh metadata unavailable. Authored overrides are retained.");
+        ImGui::TextWrapped("Fallback: %s", object.material.c_str());
+
+        if(object.metadata)
+        {
+            for(const auto& [slotID, reference] : object.metadata->materialSlotBindings)
+            {
+                const auto id = AssetID::ParseReference(reference);
+                const auto* record = id ? registry.Find(*id) : nullptr;
+                const auto materialName = record && record->type == AssetType::Material ?
+                    record->relativePath.stem().generic_string() : "Unavailable: " + reference;
+                ImGui::TextWrapped("Override %s: %s", slotID.c_str(), materialName.c_str());
+            }
+        }
+
+        return;
+    }
+
+    if (object.meshResidency == SceneMeshResidency::Pending)
+    {
+        ImGui::TextDisabled("Geometry pending; using retained mesh-slot metadata.");
+
+        if (object.metadata)
+        {
+            for (const auto& [slotID, reference] : object.metadata->materialSlotBindings)
+            {
+                const bool known = std::any_of(object.materialSlots.begin(), object.materialSlots.end(),
+                    [&](const auto& slot) { return slot.id == slotID; });
+
+                if (!known)
+                {
+                    ImGui::TextWrapped("Unrecognized authored override %s: %s (retained; requires compatible mesh metadata)",
+                        slotID.c_str(), reference.c_str());
+                }
+            }
+        }
+    }
 
     if(object.materialSlots.size() > 1)
     {

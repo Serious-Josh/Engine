@@ -11,6 +11,7 @@
 
 class SphereGridScene;
 class ProjectAssetRegistry;
+class ProjectMeshCPUCache;
 
 class DemoSceneManager
 {
@@ -28,6 +29,8 @@ class DemoSceneManager
 
     // Engine owns the live registry; scene instances only borrow it.
     void SetProjectAssets(const std::filesystem::path& root, const ProjectAssetRegistry& registry);
+    void SetMeshCPUCache(ProjectMeshCPUCache* cache) noexcept { m_meshCPUCache = cache; }
+    void SetTextureStreamingEnabled(bool enabled) noexcept { m_textureStreamingEnabled = enabled; }
 
     bool RequestScene(std::string_view sceneName);
 
@@ -35,8 +38,15 @@ class DemoSceneManager
         const std::filesystem::path& path,
         std::string* errorMessage = nullptr);
 
-    // Call on the Engine thread outside Renderer command recording. Uploads complete
-    // through ResourceUploader before success; no active-scene resources are changed.
+    // Explicit reload uses the same metadata-first policy as ordinary file opening.
+    bool RequestMetadataOnlyFileScene(const std::filesystem::path& path, std::string* errorMessage = nullptr);
+
+#ifdef _DEBUG
+    bool RequestSynchronousFileSceneDiagnostic(const std::filesystem::path& path, std::string* errorMessage = nullptr);
+#endif
+
+    // Call on the Engine thread outside Renderer command recording. Ordinary
+    // staging prepares metadata; no active-scene resources are changed.
     bool StageRequestedFileScene(
         ID3D12Device* device,
         ResourceUploader& uploader,
@@ -85,6 +95,7 @@ class DemoSceneManager
 
     std::filesystem::path m_projectRoot;
     const ProjectAssetRegistry* m_registry = nullptr;
+    ProjectMeshCPUCache* m_meshCPUCache = nullptr;
 
     std::unique_ptr<IDemoScene> m_activeScene;
     std::unique_ptr<IDemoScene> m_stagedFileScene;
@@ -99,4 +110,6 @@ class DemoSceneManager
     float m_aspectRatio = 1.0f;
 
     bool m_hasPendingSceneChange = false;
+    bool m_textureStreamingEnabled = false;
+    bool m_requestedMetadataOnly = false;
 };

@@ -57,6 +57,26 @@ bool FileBackedDemoScene::Initialize(
     const Shader* vertexShader,
     const Shader* pixelShader)
 {
+    return InitializeMetadataOnly(device, uploader, descriptorHeap, vertexShader, pixelShader);
+}
+
+#ifdef _DEBUG
+bool FileBackedDemoScene::InitializeSynchronousDiagnostic(ID3D12Device* device, ResourceUploader& uploader,
+    DescriptorHeap& descriptorHeap, const Shader* vertexShader, const Shader* pixelShader)
+{
+    return InitializeWithPolicy(device, uploader, descriptorHeap, vertexShader, pixelShader, false);
+}
+#endif
+
+bool FileBackedDemoScene::InitializeMetadataOnly(ID3D12Device* device, ResourceUploader& uploader,
+    DescriptorHeap& descriptorHeap, const Shader* vertexShader, const Shader* pixelShader)
+{
+    return InitializeWithPolicy(device, uploader, descriptorHeap, vertexShader, pixelShader, true);
+}
+
+bool FileBackedDemoScene::InitializeWithPolicy(ID3D12Device* device, ResourceUploader& uploader,
+    DescriptorHeap& descriptorHeap, const Shader* vertexShader, const Shader* pixelShader, bool metadataOnly)
+{
     if (m_initialized)
     {
         return false;
@@ -66,6 +86,9 @@ bool FileBackedDemoScene::Initialize(
     // Engine remains responsible for GPU synchronization when
     // replacing a previously active scene.
     Shutdown();
+
+    Log::Info(std::string("Preparing file scene activation: mode=") +
+        (metadataOnly ? "metadata-first" : "synchronous-full Debug diagnostic") + ", path=" + m_scenePath.string());
 
     std::string error;
 
@@ -93,7 +116,12 @@ bool FileBackedDemoScene::Initialize(
         m_assets.SetProjectAssets(ProjectPaths(m_projectRoot), *m_registry);
     }
 
-    if (!m_runtime->Prepare(m_assets, &error))
+    m_assets.SetTextureStreamingEnabled(m_textureStreamingEnabled || metadataOnly);
+    m_assets.SetMeshCPUCache(m_meshCPUCache);
+
+    const bool prepared = metadataOnly ? m_runtime->PrepareMetadata(m_assets, &error) : m_runtime->Prepare(m_assets, &error);
+
+    if(!prepared)
     {
         Log::Error("Failed to prepare file-backed scene: " + error + " " +
             m_assets.GetLastMeshError() + " " + m_assets.GetLastMaterialError());
@@ -101,7 +129,9 @@ bool FileBackedDemoScene::Initialize(
         return false;
     }
 
-    if (!m_runtime->Commit(&error))
+    const bool committed = metadataOnly ? m_runtime->CommitMetadata(m_assets, &error) : m_runtime->Commit(&error);
+
+    if(!committed)
     {
         Log::Error("Failed to commit file-backed scene: " + error);
         Shutdown();
@@ -109,6 +139,7 @@ bool FileBackedDemoScene::Initialize(
     }
 
     m_initialized = true;
+    m_metadataOnlyActivation = metadataOnly;
     return true;
 }
 
@@ -117,6 +148,7 @@ void FileBackedDemoScene::Shutdown()
     // This must only run after Engine has safely released any
     // renderer resources referencing this scene.
     m_initialized = false;
+    m_metadataOnlyActivation = false;
 
     m_runtime->DiscardPreparedScene();
     m_runtime->GetScene().ClearRenderObjects();
@@ -129,6 +161,17 @@ void FileBackedDemoScene::Shutdown()
 void FileBackedDemoScene::Update(float deltaTime)
 {
     (void)deltaTime;
+}
+
+void FileBackedDemoScene::AdvanceTextureStreaming(ProjectTexturePreparationService& preparation, Renderer& renderer,
+    const std::function<bool(const AssetID&, const MaterialAssetData&)>& mayPublish)
+{
+    if(!m_initialized || m_objectMutationCandidate || m_runtime->HasMaterialAssignment())
+    {
+        return;
+    }
+
+    m_assets.AdvanceTextureStreaming(preparation, renderer, GetRuntimeIdentity(), GetScene(), mayPublish);
 }
 
 Scene& FileBackedDemoScene::GetScene()
@@ -185,6 +228,55 @@ void FileBackedDemoScene::SetAspectRatio(float aspectRatio)
 const std::string& FileBackedDemoScene::GetDisplayName() const noexcept
 {
     return m_runtime->GetFileScene().GetDocument().name;
+}
+
+bool FileBackedDemoScene::ReorderObjects(const SceneObjectOrderIdentity& identity,
+    const std::vector<std::string>& expectedOrder, const std::vector<std::string>& replacementOrder,
+    std::string* errorMessage)
+{
+    if(!m_initialized || m_objectMutationCandidate)
+    {
+        if(errorMessage)
+        {
+            *errorMessage = "Reordering requires an initialized scene without a pending structural candidate.";
+        }
+
+        return false;
+    }
+
+    return m_runtime->ReorderObjects(identity, expectedOrder, replacementOrder, errorMessage);
+}
+
+bool FileBackedDemoScene::RenameObject(const SceneObjectMetadata& selection, std::string_view expectedName,
+    std::string name, std::string* errorMessage, SceneObjectNamePolicy policy)
+{
+    if(!m_initialized || m_objectMutationCandidate)
+    {
+        if(errorMessage)
+        {
+            *errorMessage = "Renaming requires an initialized scene without a pending structural candidate.";
+        }
+
+        return false;
+    }
+
+    return m_runtime->RenameObject(selection, expectedName, std::move(name), errorMessage, policy);
+}
+
+bool FileBackedDemoScene::BuildHierarchySnapshot(
+    SceneHierarchySnapshot& snapshot, std::string* errorMessage) const
+{
+    if(!m_initialized)
+    {
+        if(errorMessage)
+        {
+            *errorMessage = "Scene hierarchy is unavailable before scene initialization.";
+        }
+
+        return false;
+    }
+
+    return m_runtime->BuildHierarchySnapshot(snapshot, errorMessage);
 }
 
 std::optional<SceneObjectMetadata> FileBackedDemoScene::GetObjectMetadata(
@@ -275,19 +367,22 @@ std::optional<MaterialAssignmentToken> FileBackedDemoScene::PrepareMaterialSlotA
     if(!metadata || metadata->runtimeIndex != selection.runtimeIndex || metadata->sceneID != selection.sceneID ||
         metadata->runtimeIdentity != selection.runtimeIdentity || metadata->structureRevision != selection.structureRevision ||
         metadata->meshReference != selection.meshReference || metadata->materialReference != selection.materialReference ||
-        metadata->materialSlotBindings != selection.materialSlotBindings)
+        metadata->materialSlotBindings != selection.materialSlotBindings || metadata->bindingRevision != selection.bindingRevision)
     {
         return fail("Material slot assignment requires the current persistent object, mesh, and binding snapshot.");
     }
 
     const auto& object = m_runtime->GetScene().GetRenderObjects()[metadata->runtimeIndex];
 
-    if(!object.mesh)
+    const auto* slotMetadata = object.mesh ? &object.mesh->GetMetadata() :
+        m_assets.FindRetainedSlotMetadata(metadata->meshReference);
+
+    if (!slotMetadata)
     {
-        return fail("Cannot assign a material slot to an object without a resolved mesh.");
+        return fail("Material slots await verified mesh metadata; authored overrides are retained.");
     }
 
-    const auto& slots = object.mesh->GetMetadata().materialSlots;
+    const auto& slots = slotMetadata->materialSlots;
 
     if(std::none_of(slots.begin(), slots.end(), [&](const auto& slot) { return slot.id == slotID; }))
     {
@@ -315,7 +410,8 @@ std::optional<MaterialAssignmentToken> FileBackedDemoScene::PrepareMaterialSlotA
         }
         else
         {
-            effective = ResolveAssignmentMaterial(materialID->ToReference(), errorMessage);
+            effective = object.mesh ? ResolveAssignmentMaterial(materialID->ToReference(), errorMessage) :
+                ResolvePendingAssignmentMaterial(materialID->ToReference(), errorMessage);
 
             if(!effective)
             {
@@ -329,7 +425,7 @@ std::optional<MaterialAssignmentToken> FileBackedDemoScene::PrepareMaterialSlotA
         return fail("The effective slot material is unavailable or not retained by this scene's catalog.");
     }
 
-    return m_runtime->PrepareMaterialSlotAssignment(selection, std::move(slotID), materialID, *effective, errorMessage);
+    return m_runtime->PrepareMaterialSlotAssignment(selection, std::move(slotID), materialID, *effective, errorMessage, &m_assets);
 }
 
 Material* FileBackedDemoScene::GetPreparedMaterialAssignmentMaterial(const MaterialAssignmentToken& token) const noexcept
@@ -503,4 +599,21 @@ std::unique_ptr<FileSceneRuntime> FileBackedDemoScene::PrepareObjectRestoration(
     const SceneObjectDocument& object, size_t insertionIndex, std::string* errorMessage)
 {
     return m_runtime->PrepareObjectRestoration(m_assets, object, insertionIndex, errorMessage);
+}
+
+Material* FileBackedDemoScene::ResolvePendingAssignmentMaterial(std::string_view reference, std::string* errorMessage)
+{
+    Material* material = m_assets.FindRetainedMaterial(reference);
+
+    if (!material || !m_assets.ValidateRetainedResidencyMaterial(reference, material, errorMessage))
+    {
+        if (errorMessage && errorMessage->empty())
+        {
+            *errorMessage = "Unsupported pending assignment: material is not retained; deferred material-table growth is required.";
+        }
+
+        return nullptr;
+    }
+
+    return material;
 }

@@ -52,6 +52,9 @@ FetchContent_MakeAvailable(nlohmann_json)
 add_executable(Engine
     src/main.cpp
     src/Engine/Engine.cpp
+    src/assets/ProjectTexturePreparationService.cpp
+    src/assets/ProjectMeshPreparationService.cpp
+    src/Scene/FileSceneTextureStreaming.cpp
     src/Platform/Windows/WindowsWindow.cpp
     src/Core/Time.cpp
     src/Core/Input.cpp
@@ -112,11 +115,14 @@ add_executable(Engine
     src/Renderer/RayTracing/RayTracingPipeline.cpp
     src/Renderer/RayTracing/ShaderTable.cpp
     src/Renderer/RayTracing/RayTracingSceneResources.cpp
+    src/Renderer/RayTracing/RayTracingMembershipCandidate.cpp
+    src/Renderer/RendererMembershipCandidate.cpp
     src/Renderer/Passes/RayTracedShadowPass.cpp
     src/Renderer/Passes/ShadowDenoisePass.cpp
     src/Renderer/ComputePipeline.cpp
     src/Editor/Editor.cpp
     src/Editor/EditorWorkspace.cpp
+    src/Editor/SceneHierarchyPanel.cpp
     src/Editor/InspectorPanel.cpp
     src/assets/ProjectAssetDeletion.cpp
     src/assets/ProjectAssetRename.cpp
@@ -166,6 +172,9 @@ add_executable(Engine
     src/Scene/SceneCommit.cpp
     src/Scene/FileSceneRuntime.cpp
     src/Scene/FileSceneAssetCatalog.cpp
+    src/Scene/SceneMetadataPreparation.cpp
+    src/Scene/MeshResidency.cpp
+    src/Scene/MeshResidencyPublication.cpp
     src/DemoContent/FileBackedDemoScene.cpp
     src/assets/AssetID.cpp
     src/assets/AssetRecord.cpp
@@ -175,6 +184,7 @@ add_executable(Engine
     src/assets/MaterialAssetSerializer.cpp
     src/assets/ProjectTextureImportService.cpp
     src/assets/ProjectMeshImportService.cpp
+    src/assets/ProjectMeshCPUCache.cpp
     src/assets/ProjectMaterialAssetService.cpp
 )
 

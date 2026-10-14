@@ -215,8 +215,16 @@ LRESULT CALLBACK WindowProc(
         return 0;
     }
 
+    case WM_SYSKEYDOWN:
     case WM_KEYDOWN:
     {
+        // F10 arrives as a system key even without Alt. Forward it through
+        // Engine input just like F9/F11; retain default handling for Alt keys.
+        if (uMsg == WM_SYSKEYDOWN && wParam != VK_F10)
+        {
+            return DefWindowProcW(hwnd, uMsg, wParam, lParam);
+        }
+
         Event event;
 
         event.type = EventType::KeyPressed;
@@ -230,8 +238,14 @@ LRESULT CALLBACK WindowProc(
         return 0;
     }
 
+    case WM_SYSKEYUP:
     case WM_KEYUP:
     {
+        if (uMsg == WM_SYSKEYUP && wParam != VK_F10)
+        {
+            return DefWindowProcW(hwnd, uMsg, wParam, lParam);
+        }
+
         Event event;
 
         event.type = EventType::KeyReleased;

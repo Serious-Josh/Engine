@@ -29,6 +29,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <exception>
 #include <limits>
 #include <utility>
 
@@ -648,6 +649,7 @@ void Editor::DrawMainMenu(
         }
 
         ImGui::EndDisabled();
+        ImGui::MenuItem("Hierarchy", nullptr, &m_workspace.HierarchyVisible());
         ImGui::MenuItem("Asset Browser", nullptr, &m_workspace.AssetBrowserVisible());
         ImGui::Separator();
 
@@ -778,6 +780,314 @@ const EditorWorkspaceRect& Editor::PrepareWorkspace(
     return m_workspace.GetSceneViewport();
 }
 
+bool Editor::RenameSessionMatches(const IDemoScene& scene, const SceneHistorySession& session) const
+{
+    return m_historySession && session.epoch == m_historySession->epoch &&
+        session.projectIdentity == m_historySession->projectIdentity &&
+        session.scenePath == m_historySession->scenePath && session.sceneIdentity == m_historySession->sceneIdentity &&
+        CanPreserveSceneHistory(scene, session.projectIdentity, session.epoch);
+}
+
+bool Editor::RenameIntentMatches(const IDemoScene& scene) const
+{
+    if(!m_renameIntent || !RenameSessionMatches(scene, m_renameIntent->session))
+    {
+        return false;
+    }
+
+    const auto* owner = dynamic_cast<const FileBackedDemoScene*>(&scene);
+    const auto& target = m_renameIntent->target;
+    const auto current = owner ? owner->GetObjectMetadata(target.objectID) : std::nullopt;
+
+    return current && current->runtimeIdentity == target.runtimeIdentity && current->sceneID == target.sceneID &&
+        current->structureRevision == target.structureRevision && current->runtimeIndex == target.runtimeIndex &&
+        current->name == target.name;
+}
+
+void Editor::CancelObjectRename()
+{
+    m_renameIntent.reset();
+    m_renameStatus.clear();
+    m_hierarchyPanel.CancelRename();
+}
+
+void Editor::QueueObjectRename(const IDemoScene& scene, const SceneObjectMetadata& target)
+{
+    if(!m_historySession || !SceneObjectDeletionMatches(scene, target) || m_materialAssignmentPending ||
+        !RenameSessionMatches(scene, *m_historySession))
+    {
+        return;
+    }
+
+    RenameIntent intent{*m_historySession, target};
+    m_hierarchyPanel.BeginRename(target.objectID, target.name);
+    m_renameIntent = std::move(intent);
+
+    m_renameStatus.clear();
+    m_workspace.HierarchyVisible() = true;
+}
+
+void Editor::CommitObjectRename(IDemoScene& scene, std::string name)
+{
+    if(!RenameIntentMatches(scene) || HasPendingSceneHistoryOperation())
+    {
+        m_renameStatus = "Rename target belongs to a stale scene or pending operation.";
+        return;
+    }
+
+    if(name == m_renameIntent->target.name)
+    {
+        m_renameStatus.clear();
+        return;
+    }
+
+    if(!NormalizeSceneObjectName(name, &m_renameStatus))
+    {
+        return;
+    }
+
+    const auto& intent = *m_renameIntent;
+
+    if(name == intent.target.name)
+    {
+        m_renameStatus.clear();
+        return;
+    }
+
+    try
+    {
+        auto rename = std::make_unique<RenameObject>(RenameObject{
+            intent.session, intent.target.objectID, intent.target.name, std::move(name)});
+        size_t payloadBytes = sizeof(SceneHistoryEntry) + sizeof(RenameObject);
+        payloadBytes += rename->objectID.capacity() + rename->before.capacity() + rename->after.capacity() + 3;
+        payloadBytes += rename->session.sceneIdentity.capacity() + 1;
+        payloadBytes += (rename->session.projectIdentity.native().capacity() +
+            rename->session.scenePath.native().capacity() + 2) * sizeof(std::filesystem::path::value_type);
+
+        if(payloadBytes > kSceneHistoryPayloadBytes)
+        {
+            m_renameStatus = "Rename exceeds the 4 MiB scene history payload limit.";
+            return;
+        }
+
+        SceneHistoryEntry entry{std::move(rename), intent.session.epoch, payloadBytes};
+        const auto& command = *std::get<std::unique_ptr<RenameObject>>(entry.command);
+        m_sceneHistory.reserve(kSceneHistoryCapacity);
+        auto* owner = dynamic_cast<FileBackedDemoScene*>(&scene);
+
+        if(!owner || !owner->RenameObject(intent.target, command.before, command.after, &m_renameStatus))
+        {
+            return;
+        }
+
+        // The document commit succeeded. Reserved, noexcept history publication follows.
+        AppendSceneHistoryEntry(std::move(entry));
+        m_renameStatus.clear();
+    }
+    catch(const std::exception& exception)
+    {
+        m_renameStatus = std::string("Rename could not be staged: ") + exception.what();
+    }
+}
+
+void Editor::CommitObjectReorder(IDemoScene& scene, const HierarchyReorderRequest& request)
+{
+    auto* owner = dynamic_cast<FileBackedDemoScene*>(&scene);
+
+    if(!owner || !m_historySession || !RenameSessionMatches(scene, *m_historySession) ||
+        request.identity.sessionEpoch != m_historySession->epoch ||
+        request.identity.runtimeIdentity != owner->GetRuntimeIdentity() ||
+        request.identity.structureRevision != scene.GetScene().GetStructureRevision() ||
+        HasPendingSceneHistoryOperation() || HasBlockingObjectCreation() || m_sceneOperationPending ||
+        m_fileRequest || m_sceneObjectDeletionPending || m_sceneObjectDeletionRequest ||
+        m_materialAssignmentRequest || m_meshCreationRequest || m_renameIntent || ImGui::GetIO().AppFocusLost)
+    {
+        m_reorderStatus = "Hierarchy drop rejected: scene identity or pending operations changed.";
+        return;
+    }
+
+    try
+    {
+        SceneHierarchySnapshot snapshot;
+
+        if(!owner->BuildHierarchySnapshot(snapshot, &m_reorderStatus))
+        {
+            return;
+        }
+
+        auto reorder = std::make_unique<ReorderObjects>();
+        reorder->session = *m_historySession;
+        reorder->before.reserve(snapshot.entries.size());
+
+        for(const auto& entry : snapshot.entries)
+        {
+            reorder->before.push_back(entry.objectID);
+        }
+
+        reorder->after = reorder->before;
+        const auto source = std::find(reorder->after.begin(), reorder->after.end(), request.sourceID);
+        const auto destination = std::find(reorder->after.begin(), reorder->after.end(), request.destinationID);
+
+        if(source == reorder->after.end() || destination == reorder->after.end())
+        {
+            m_reorderStatus = "Hierarchy drop target no longer exists.";
+            return;
+        }
+
+        if(source == destination)
+        {
+            m_reorderStatus.clear();
+            return;
+        }
+
+        reorder->after.erase(source);
+        const auto insertion = std::find(reorder->after.begin(), reorder->after.end(), request.destinationID);
+        reorder->after.insert(request.insertAfter ? insertion + 1 : insertion, request.sourceID);
+
+        if(reorder->before == reorder->after)
+        {
+            m_reorderStatus.clear();
+            return;
+        }
+
+        size_t payloadBytes = sizeof(SceneHistoryEntry) + sizeof(ReorderObjects);
+        payloadBytes += (reorder->before.capacity() + reorder->after.capacity()) * sizeof(std::string);
+
+        for(const auto* order : {&reorder->before, &reorder->after})
+        {
+            for(const auto& id : *order)
+            {
+                payloadBytes += id.capacity() + 1;
+            }
+        }
+
+        payloadBytes += reorder->session.sceneIdentity.capacity() + 1;
+        payloadBytes += (reorder->session.projectIdentity.native().capacity() +
+            reorder->session.scenePath.native().capacity() + 2) * sizeof(std::filesystem::path::value_type);
+
+        if(payloadBytes > kSceneHistoryPayloadBytes)
+        {
+            m_reorderStatus = "Hierarchy reorder exceeds the 4 MiB scene history payload limit.";
+            return;
+        }
+
+        SceneHistoryEntry entry{std::move(reorder), m_historySession->epoch, payloadBytes};
+        const auto& command = *std::get<std::unique_ptr<ReorderObjects>>(entry.command);
+        const SceneObjectOrderIdentity identity{std::string(owner->GetPersistentSceneID()),
+            owner->GetRuntimeIdentity(), scene.GetScene().GetStructureRevision()};
+        m_sceneHistory.reserve(kSceneHistoryCapacity);
+
+        if(!owner->ReorderObjects(identity, command.before, command.after, &m_reorderStatus))
+        {
+            return;
+        }
+
+        AppendSceneHistoryEntry(std::move(entry));
+        m_reorderStatus.clear();
+    }
+    catch(const std::exception& exception)
+    {
+        m_reorderStatus = std::string("Hierarchy reorder could not be staged: ") + exception.what();
+    }
+}
+
+void Editor::DrawHierarchy(IDemoScene& demoScene, const std::string& activeSceneName)
+{
+    if(!m_workspace.HierarchyVisible())
+    {
+        CancelObjectRename();
+        return;
+    }
+
+    const auto& scene = demoScene.GetScene();
+    SceneHierarchySnapshot snapshot;
+    snapshot.sceneName = activeSceneName;
+    std::string error;
+
+    if(const auto* owner = dynamic_cast<const FileBackedDemoScene*>(&demoScene))
+    {
+        owner->BuildHierarchySnapshot(snapshot, &error);
+    }
+    else
+    {
+        const auto& objects = scene.GetRenderObjects();
+        snapshot.entries.reserve(objects.size());
+
+        for(size_t index = 0; index < objects.size(); ++index)
+        {
+            snapshot.entries.push_back({{}, "Object " + std::to_string(index), index});
+        }
+    }
+
+    const std::optional<size_t> selected = m_selectedObject == InvalidObjectSelection ?
+        std::nullopt : std::optional<size_t>{m_selectedObject};
+    const bool blocked = m_sceneOperationPending || m_fileRequest || m_materialLeaveAction != MaterialLeaveAction::None ||
+        HasPendingSceneHistoryOperation() || m_sceneObjectDeletionPending || m_sceneObjectDeletionRequest ||
+        m_materialAssignmentPending || m_materialAssignmentRequest || m_gizmoWasUsing ||
+        m_workspace.IsSplitterDragging() || ImGuizmo::IsUsing() || m_transformFieldEditing;
+
+    if(m_renameIntent && (blocked || m_inspectorPanel.HasUnsavedChanges() || !RenameIntentMatches(demoScene)))
+    {
+        CancelObjectRename();
+    }
+
+    if(error.empty())
+    {
+        error = m_renameStatus.empty() ? m_reorderStatus : m_renameStatus;
+    }
+
+    const auto* fileScene = dynamic_cast<const FileBackedDemoScene*>(&demoScene);
+    const bool allowReorder = !blocked && fileScene && m_historySession &&
+        RenameSessionMatches(demoScene, *m_historySession) && !m_inspectorPanel.HasUnsavedChanges() &&
+        !m_renameIntent && !ImGui::GetIO().AppFocusLost &&
+        !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel);
+    const HierarchyDragIdentity dragIdentity{m_historyEpoch,
+        fileScene ? fileScene->GetRuntimeIdentity() : 0, scene.GetStructureRevision()};
+
+    ImGui::BeginDisabled(blocked);
+    const auto clicked = m_hierarchyPanel.Draw(m_workspace.GetHierarchy(), snapshot, selected, &scene, error,
+        dragIdentity, allowReorder);
+    ImGui::EndDisabled();
+
+    if(auto reorder = m_hierarchyPanel.TakeReorderRequest())
+    {
+        if(allowReorder)
+        {
+            CommitObjectReorder(demoScene, *reorder);
+        }
+    }
+
+    if(auto objectID = m_hierarchyPanel.TakeContextRequest())
+    {
+        const auto* owner = dynamic_cast<const FileBackedDemoScene*>(&demoScene);
+        const auto target = owner ? owner->GetObjectMetadata(*objectID) : std::nullopt;
+
+        if(!blocked && target)
+        {
+            OpenSceneObjectContext(demoScene, *target);
+        }
+    }
+
+    if(auto name = m_hierarchyPanel.TakeRenameCommit())
+    {
+        if(!blocked)
+        {
+            CommitObjectRename(demoScene, std::move(*name));
+        }
+    }
+
+    if(m_renameIntent && !m_hierarchyPanel.IsRenaming())
+    {
+        m_renameIntent.reset();
+    }
+
+    if(!blocked && clicked && *clicked < scene.GetRenderObjects().size())
+    {
+        m_selectedObject = *clicked;
+        m_objectInspectionRequested = true;
+    }
+}
+
 void Editor::ActivateObjectInspection(
     IDemoScene& demoScene, const ProjectPaths& paths, const ProjectAssetRegistry& registry)
 {
@@ -887,6 +1197,23 @@ std::optional<SceneObjectInspectorView> Editor::ResolveObjectInspection(
     view.mesh = label(metadata->meshReference, AssetType::Mesh);
     view.material = label(metadata->materialReference, AssetType::Material);
     view.meshReference = metadata->meshReference;
+    view.meshResidency = metadata->GetMeshResidency(object);
+    view.materialSlotMetadataAvailable = object.mesh != nullptr;
+
+    if (!object.mesh && !metadata->meshReference.empty())
+    {
+        if (const auto* slots = fileScene->GetPendingSlotMetadata(metadata->meshReference))
+        {
+            view.materialSlotMetadataAvailable = true;
+
+            for (const auto& slot : slots->materialSlots)
+            {
+                view.materialSlots.push_back({slot.id, slot.name, "Pending material", {}, false,
+                    object.GetSlotMaterial(slot.id) != nullptr});
+            }
+        }
+    }
+
 
     for(auto& slot : view.materialSlots)
     {
@@ -927,13 +1254,17 @@ void Editor::Draw(
 
     const uint64_t structureRevision = scene.GetStructureRevision();
 
-    if (m_selectionSceneName != activeSceneName || m_selectionStructureRevision != structureRevision)
+    if (m_selectionSceneName != activeSceneName || m_selectionStructureRevision != structureRevision ||
+        m_selectionScene != &scene || m_selectionRuntimeIdentity != dragRuntimeIdentity)
     {
         ResetTransformGestures();
 
         m_selectedObject = InvalidObjectSelection;
         m_selectionSceneName = activeSceneName;
         m_selectionStructureRevision = structureRevision;
+
+        m_selectionScene = &scene;
+        m_selectionRuntimeIdentity = dragRuntimeIdentity;
     }
 
     const Scene& constScene = scene;
@@ -943,6 +1274,8 @@ void Editor::Draw(
     {
         m_selectedObject = InvalidObjectSelection;
     }
+
+    DrawHierarchy(demoScene, activeSceneName);
 
     (void)debugUI;
     m_assetBrowser.SetThumbnailProject(projectPaths, assetRegistry);
@@ -2011,8 +2344,8 @@ void Editor::SuspendViewportInteraction()
 {
     m_viewportRightGesture = false;
     m_viewportRightObject.reset();
-    m_viewportContextObject.reset();
-    m_openViewportContext = false;
+    m_sceneContextObject.reset();
+    m_openSceneContext = false;
 
     m_cameraLooking = false;
     m_viewportFocused = false;
@@ -2029,10 +2362,11 @@ void Editor::OnSceneActivated()
 
 void Editor::ResetSceneInteractions()
 {
+    CancelObjectRename();
     m_viewportRightGesture = false;
     m_viewportRightObject.reset();
-    m_viewportContextObject.reset();
-    m_openViewportContext = false;
+    m_sceneContextObject.reset();
+    m_openSceneContext = false;
 
     m_sceneObjectDeletionRequest.reset();
     m_sceneObjectDeletionPending.reset();
@@ -2070,6 +2404,9 @@ void Editor::ResetSceneInteractions()
     ResetTransformGestures();
     m_selectedObject = InvalidObjectSelection;
     m_selectionSceneName.clear();
+
+    m_selectionScene = nullptr;
+    m_selectionRuntimeIdentity = 0;
     m_selectionStructureRevision = 0;
 }
 
@@ -2227,6 +2564,9 @@ void Editor::PublishCreatedObjectSelection(
     // renderer initialization; no allocation or fallible lookup follows publication.
     OnSceneActivated();
     m_selectedObject = metadata.runtimeIndex;
+    m_selectionScene = &scene;
+    m_selectionRuntimeIdentity = metadata.runtimeIdentity;
+
     m_selectionSceneName = std::move(activeSceneName);
     m_selectionStructureRevision = scene.GetStructureRevision();
 
@@ -2358,7 +2698,7 @@ bool Editor::SceneObjectDeletionMatches(const IDemoScene& scene, const SceneObje
     const auto* owner = dynamic_cast<const FileBackedDemoScene*>(&scene);
     const auto current = owner ? owner->GetObjectMetadata(selection.objectID) : std::nullopt;
 
-    return current && m_selectedObject == current->runtimeIndex &&
+    return current &&
         current->sceneID == selection.sceneID && current->runtimeIdentity == selection.runtimeIdentity &&
         current->structureRevision == selection.structureRevision && current->runtimeIndex == selection.runtimeIndex;
 }
@@ -2428,10 +2768,23 @@ void Editor::FinishViewportRightClick(const IDemoScene& scene)
         return;
     }
 
-    m_selectedObject = current->runtimeIndex;
+    OpenSceneObjectContext(scene, *current);
+}
+
+void Editor::OpenSceneObjectContext(const IDemoScene& scene, const SceneObjectMetadata& target)
+{
+    if(!m_historySession || !SceneObjectDeletionMatches(scene, target) ||
+        !RenameSessionMatches(scene, *m_historySession))
+    {
+        return;
+    }
+
+    m_sceneContextObject = target;
+    m_sceneContextEpoch = m_historySession->epoch;
+    m_openSceneContext = true;
+
+    m_selectedObject = target.runtimeIndex;
     m_objectInspectionRequested = true;
-    m_viewportContextObject = *current;
-    m_openViewportContext = true;
 }
 
 void Editor::QueueSceneObjectDeletion(const IDemoScene& scene, const SceneObjectMetadata& selection)
@@ -2466,7 +2819,7 @@ void Editor::DrawSceneObjectDeletionControls(IDemoScene& scene)
     FinishViewportRightClick(scene);
 
     const bool keyboardAllowed = m_viewportFocused && !SceneObjectDeletionBlocked() &&
-        !m_openViewportContext && !m_viewportRightGesture &&
+        !m_openSceneContext && !m_viewportRightGesture &&
         !io.WantTextInput && !io.WantCaptureKeyboard && !ImGui::IsAnyItemActive() &&
         !m_cameraLooking && !ImGuizmo::IsUsing() && !ImGui::IsMouseDown(ImGuiMouseButton_Right) &&
         m_viewportImage.size.x > 0.0f && m_viewportImage.size.y > 0.0f &&
@@ -2483,41 +2836,57 @@ void Editor::DrawSceneObjectDeletionControls(IDemoScene& scene)
         }
     }
 
-    // Use the viewport's stable popup ID even though its image window ignores mouse input.
+    DrawSceneObjectContextMenu(scene);
+}
+
+void Editor::DrawSceneObjectContextMenu(IDemoScene& scene)
+{
+    // Both entry points use this stable popup host and the same captured target.
     const ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
         ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoFocusOnAppearing;
     ImGui::Begin("Scene Viewport", nullptr, flags);
 
-    if(m_openViewportContext)
+    if(m_openSceneContext && m_materialLeaveAction == MaterialLeaveAction::None)
     {
         ImGui::OpenPopup("SceneObjectContext");
-        m_openViewportContext = false;
+        m_openSceneContext = false;
     }
 
     if(ImGui::BeginPopup("SceneObjectContext"))
     {
-        if(!m_viewportContextObject || SceneObjectDeletionBlocked() ||
-            !SceneObjectDeletionMatches(scene, *m_viewportContextObject))
+        if(!m_sceneContextObject || !m_historySession || m_sceneContextEpoch != m_historySession->epoch ||
+            !SceneObjectDeletionMatches(scene, *m_sceneContextObject))
         {
             ImGui::CloseCurrentPopup();
         }
         else
         {
-            ImGui::TextUnformatted(m_viewportContextObject->name.c_str());
+            const auto* owner = dynamic_cast<const FileBackedDemoScene*>(&scene);
+            const auto current = owner->GetObjectMetadata(m_sceneContextObject->objectID);
+            ImGui::TextUnformatted(current->name.c_str());
             ImGui::Separator();
+
+            ImGui::BeginDisabled(SceneObjectDeletionBlocked());
+
+            if(ImGui::MenuItem("Rename"))
+            {
+                QueueObjectRename(scene, *current);
+            }
 
             if(ImGui::MenuItem("Delete"))
             {
-                QueueSceneObjectDeletion(scene, *m_viewportContextObject);
+                QueueSceneObjectDeletion(scene, *current);
             }
+
+            ImGui::EndDisabled();
         }
 
         ImGui::EndPopup();
     }
 
-    if(!ImGui::IsPopupOpen("SceneObjectContext"))
+    if(!m_openSceneContext && !ImGui::IsPopupOpen("SceneObjectContext"))
     {
-        m_viewportContextObject.reset();
+        m_sceneContextObject.reset();
     }
 
     ImGui::End();
@@ -2569,6 +2938,8 @@ namespace
 
 void Editor::ClearSceneHistory()
 {
+    m_reorderStatus.clear();
+    CancelObjectRename();
     // Session invalidation explicitly cancels requests; late results carry the old epoch.
     m_pendingHistoryReplay.reset();
     m_historyReplayRequest.reset();
@@ -2803,7 +3174,7 @@ void Editor::AppendSceneHistoryEntry(SceneHistoryEntry entry) noexcept
 bool Editor::HistoryReplayBlocked() const
 {
     const auto& io = ImGui::GetIO();
-    return HasPendingSceneHistoryOperation() || io.WantTextInput || io.AppFocusLost || ImGui::IsAnyItemActive() ||
+    return m_renameIntent.has_value() || HasPendingSceneHistoryOperation() || io.WantTextInput || io.AppFocusLost || ImGui::IsAnyItemActive() ||
         ImGuizmo::IsUsing() || m_gizmoWasUsing || m_transformFieldEditing || m_cameraLooking ||
         ImGui::IsMouseDown(ImGuiMouseButton_Right) || m_viewportRightGesture ||
         m_sceneOperationPending || m_sceneObjectDeletionPending || m_sceneObjectDeletionRequest ||
@@ -2850,7 +3221,90 @@ void Editor::ReplaySceneHistory(IDemoScene& demoScene, bool redo)
         return;
     }
 
-    const auto& edit = std::get<TransformEdit>(entry.command);
+    const auto* ownedRename = std::get_if<std::unique_ptr<RenameObject>>(&entry.command);
+
+    if(ownedRename && *ownedRename)
+    {
+        const auto& rename = **ownedRename;
+        auto* owner = dynamic_cast<FileBackedDemoScene*>(&demoScene);
+
+        if(!owner || !RenameSessionMatches(demoScene, rename.session))
+        {
+            ReportSceneHistoryFailure("Rename replay belongs to a stale scene session; cursor preserved.");
+            return;
+        }
+
+        try
+        {
+            std::string error;
+            const auto current = owner->GetObjectMetadata(rename.objectID, &error);
+            const auto& expected = redo ? rename.before : rename.after;
+            const auto& replacement = redo ? rename.after : rename.before;
+
+            if(!current || !owner->RenameObject(*current, expected, replacement, &error,
+                SceneObjectNamePolicy::ExactHistory))
+            {
+                ReportSceneHistoryFailure(error);
+                return;
+            }
+        }
+        catch(const std::exception& exception)
+        {
+            ReportSceneHistoryFailure(std::string("Rename replay failed: ") + exception.what());
+            return;
+        }
+
+        m_historyCursor = redo ? m_historyCursor + 1 : m_historyCursor - 1;
+        m_sceneHistoryStatus.clear();
+        return;
+    }
+
+    const auto* ownedReorder = std::get_if<std::unique_ptr<ReorderObjects>>(&entry.command);
+
+    if(ownedReorder && *ownedReorder)
+    {
+        const auto& reorder = **ownedReorder;
+        auto* owner = dynamic_cast<FileBackedDemoScene*>(&demoScene);
+
+        if(!owner || !RenameSessionMatches(demoScene, reorder.session))
+        {
+            ReportSceneHistoryFailure("Hierarchy reorder belongs to a stale scene session; cursor preserved.");
+            return;
+        }
+
+        try
+        {
+            const SceneObjectOrderIdentity identity{std::string(owner->GetPersistentSceneID()),
+                owner->GetRuntimeIdentity(), demoScene.GetScene().GetStructureRevision()};
+            std::string error;
+
+            if(!owner->ReorderObjects(identity, redo ? reorder.before : reorder.after,
+                redo ? reorder.after : reorder.before, &error))
+            {
+                ReportSceneHistoryFailure(error);
+                return;
+            }
+        }
+        catch(const std::exception& exception)
+        {
+            ReportSceneHistoryFailure(std::string("Hierarchy reorder replay failed: ") + exception.what());
+            return;
+        }
+
+        m_historyCursor = redo ? m_historyCursor + 1 : m_historyCursor - 1;
+        m_sceneHistoryStatus.clear();
+        return;
+    }
+
+    const auto* transformEdit = std::get_if<TransformEdit>(&entry.command);
+
+    if(!transformEdit)
+    {
+        ReportSceneHistoryFailure("Unsupported scene history command; cursor preserved.");
+        return;
+    }
+
+    const auto& edit = *transformEdit;
     const auto index = ResolveHistoryTarget(demoScene, edit.target);
 
     if(!index)
@@ -2910,6 +3364,8 @@ void Editor::PublishRestoredObjectSelection(const FileBackedDemoScene& owner,
 
     m_selectionSceneName = std::move(activeSceneName);
     m_selectionStructureRevision = scene.GetStructureRevision();
+    m_selectionScene = &scene;
+    m_selectionRuntimeIdentity = owner.GetRuntimeIdentity();
 
     if(!selection)
     {

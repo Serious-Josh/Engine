@@ -1,12 +1,16 @@
 #include "Scene/FileSceneRuntime.h"
 
 #include "Scene/SceneAssetResolver.h"
+#include "Scene/FileSceneAssetCatalog.h"
 #include "Scene/SceneDocumentAdapter.h"
 
 #include <utility>
 #include <atomic>
 #include <type_traits>
 #include <algorithm>
+#include <cctype>
+#include <unordered_map>
+#include <limits>
 #include "assets/AssetID.h"
 #include "Renderer/Mesh.h"
 
@@ -18,6 +22,238 @@ namespace
 FileSceneRuntime::FileSceneRuntime()
     : m_instanceIdentity(nextRuntimeIdentity.fetch_add(1, std::memory_order_relaxed))
 {
+}
+
+bool NormalizeSceneObjectName(std::string& name, std::string* errorMessage)
+{
+    const auto whitespace = [](unsigned char character) { return std::isspace(character) != 0; };
+    const auto first = std::find_if_not(name.begin(), name.end(), whitespace);
+    const auto last = std::find_if_not(name.rbegin(), name.rend(), whitespace).base();
+
+    if(first >= last)
+    {
+        if(errorMessage)
+        {
+            *errorMessage = "Object name cannot be empty or whitespace-only.";
+        }
+
+        return false;
+    }
+
+    name = std::string(first, last);
+    return true;
+}
+
+bool FileSceneRuntime::ReorderObjects(const SceneObjectOrderIdentity& identity,
+    const std::vector<std::string>& expectedOrder, const std::vector<std::string>& replacementOrder,
+    std::string* errorMessage)
+{
+    const auto fail = [errorMessage](const char* message)
+    {
+        if(errorMessage)
+        {
+            *errorMessage = message;
+        }
+
+        return false;
+    };
+
+    if(HasPreparedScene() || m_materialAssignment)
+    {
+        return fail("Reordering is blocked by pending scene preparation or material assignment.");
+    }
+
+    SceneHierarchySnapshot snapshot;
+
+    if(!BuildHierarchySnapshot(snapshot, errorMessage))
+    {
+        return false;
+    }
+
+    if(identity.sceneID != m_fileScene.GetDocument().id || identity.runtimeIdentity != m_instanceIdentity ||
+        identity.structureRevision != m_scene.GetStructureRevision())
+    {
+        return fail("Hierarchy reorder belongs to a stale scene runtime.");
+    }
+
+    if(expectedOrder.size() != snapshot.entries.size() || replacementOrder.size() != expectedOrder.size())
+    {
+        return fail("Hierarchy reorder object count changed; scene state was preserved.");
+    }
+
+    std::unordered_map<std::string, size_t> indices;
+    indices.reserve(expectedOrder.size());
+
+    for(size_t index = 0; index < expectedOrder.size(); ++index)
+    {
+        if(expectedOrder[index] != snapshot.entries[index].objectID)
+        {
+            return fail("Hierarchy order changed outside this command; scene state was preserved.");
+        }
+
+        indices.emplace(expectedOrder[index], index);
+    }
+
+    const auto& objects = m_fileScene.GetDocument().objects;
+    std::vector<SceneObjectDocument> reordered;
+    reordered.reserve(objects.size());
+    std::vector<bool> visited(objects.size(), false);
+
+    for(const auto& id : replacementOrder)
+    {
+        const auto found = indices.find(id);
+
+        if(found == indices.end() || visited[found->second])
+        {
+            return fail("Hierarchy reorder must contain each persistent object ID exactly once.");
+        }
+
+        visited[found->second] = true;
+        reordered.push_back(objects[found->second]);
+    }
+
+    if(expectedOrder == replacementOrder)
+    {
+        return true;
+    }
+
+    // Only document order changes. Runtime objects, mappings, and revision stay intact.
+    m_fileScene.EditDocument().objects.swap(reordered);
+    return true;
+}
+
+bool FileSceneRuntime::RenameObject(const SceneObjectMetadata& selection, std::string_view expectedName,
+    std::string name, std::string* errorMessage, SceneObjectNamePolicy policy)
+{
+    const auto fail = [errorMessage](const char* message)
+    {
+        if(errorMessage)
+        {
+            *errorMessage = message;
+        }
+
+        return false;
+    };
+
+    if(errorMessage)
+    {
+        errorMessage->clear();
+    }
+
+    if(HasPreparedScene() || m_materialAssignment)
+    {
+        return fail("Finish or cancel pending scene preparation and material assignment before renaming.");
+    }
+
+    if(policy == SceneObjectNamePolicy::TrimmedInput && !NormalizeSceneObjectName(name, errorMessage))
+    {
+        return false;
+    }
+
+    const auto current = GetObjectMetadata(selection.objectID, errorMessage);
+
+    if(!current)
+    {
+        return false;
+    }
+
+    if(current->sceneID != selection.sceneID || current->runtimeIdentity != selection.runtimeIdentity ||
+        current->structureRevision != selection.structureRevision || current->runtimeIndex != selection.runtimeIndex ||
+        current->name != expectedName)
+    {
+        return fail("Rename target or expected name is stale; scene state was preserved.");
+    }
+
+    if(current->name == name)
+    {
+        return true;
+    }
+
+    const auto& objects = m_fileScene.GetDocument().objects;
+    const auto found = std::find_if(objects.begin(), objects.end(),
+        [&](const SceneObjectDocument& object) { return object.id == selection.objectID; });
+
+    if(found == objects.end())
+    {
+        return fail("Rename target is absent from the scene document.");
+    }
+
+    const size_t index = static_cast<size_t>(found - objects.begin());
+
+    // All validation and string allocation precede the dirty-marking commit point.
+    m_fileScene.EditDocument().objects[index].name.swap(name);
+    return true;
+}
+
+bool FileSceneRuntime::BuildHierarchySnapshot(
+    SceneHierarchySnapshot& snapshot, std::string* errorMessage) const
+{
+    const auto fail = [errorMessage](const char* message)
+    {
+        if(errorMessage)
+        {
+            *errorMessage = message;
+        }
+
+        return false;
+    };
+
+    if(errorMessage)
+    {
+        errorMessage->clear();
+    }
+
+    if(!m_fileScene.HasDocument())
+    {
+        return fail("No scene document is loaded.");
+    }
+
+    const auto& document = m_fileScene.GetDocument();
+    const auto& objects = m_scene.GetRenderObjects();
+    const auto& mapping = m_objectMapping;
+
+    if(!ValidateSceneDocument(document, errorMessage))
+    {
+        return false;
+    }
+
+    if(mapping.scene != &m_scene || mapping.structureRevision != m_scene.GetStructureRevision() ||
+        mapping.committedObjects.size() != objects.size() || mapping.idToRuntimeIndex.size() != objects.size() ||
+        mapping.bindingRevisions.size() != objects.size() ||
+        document.objects.size() != objects.size())
+    {
+        return fail("Scene hierarchy mapping is stale.");
+    }
+
+    SceneHierarchySnapshot candidate;
+    candidate.sceneName = document.name;
+    candidate.entries.reserve(document.objects.size());
+    std::vector<bool> visited(objects.size(), false);
+
+    for(const auto& object : document.objects)
+    {
+        const auto found = mapping.idToRuntimeIndex.find(object.id);
+
+        if(found == mapping.idToRuntimeIndex.end() || found->second >= objects.size() || visited[found->second])
+        {
+            return fail("Scene hierarchy object mapping is invalid.");
+        }
+
+        const auto index = found->second;
+        const auto& runtime = objects[index];
+        const auto& committed = mapping.committedObjects[index];
+
+        if(!MatchesCommittedSceneObjectBindings(object, runtime, committed))
+        {
+            return fail("Scene hierarchy asset bindings are stale.");
+        }
+
+        visited[index] = true;
+        candidate.entries.push_back({object.id, object.name, index});
+    }
+
+    snapshot = std::move(candidate);
+    return true;
 }
 
 std::optional<SceneObjectMetadata> FileSceneRuntime::GetObjectMetadata(
@@ -59,7 +295,7 @@ std::optional<SceneObjectMetadata> FileSceneRuntime::GetObjectMetadata(
     }
 
     if(document.objects.size() != objects.size() || mapping.idToRuntimeIndex.size() != objects.size() ||
-       mapping.committedObjects.size() != objects.size())
+       mapping.committedObjects.size() != objects.size() || mapping.bindingRevisions.size() != objects.size())
     {
         return fail("Scene object metadata count does not match the committed mapping.");
     }
@@ -84,9 +320,7 @@ std::optional<SceneObjectMetadata> FileSceneRuntime::GetObjectMetadata(
         const auto index = found->second;
         visited[index] = true;
 
-        if(objects[index].mesh != mapping.committedObjects[index].mesh ||
-           objects[index].material != mapping.committedObjects[index].material ||
-           objects[index].slotMaterials != mapping.committedObjects[index].slotMaterials)
+        if(!MatchesCommittedSceneObjectBindings(object, objects[index], mapping.committedObjects[index]))
         {
             return fail("Runtime asset bindings no longer match the committed scene objects.");
         }
@@ -104,7 +338,7 @@ std::optional<SceneObjectMetadata> FileSceneRuntime::GetObjectMetadata(
 
     return SceneObjectMetadata{selected->name, selected->meshReference, selected->materialReference,
         selected->id, document.id, runtimeIndex, m_instanceIdentity, mapping.structureRevision,
-        selected->materialSlotBindings};
+        selected->materialSlotBindings, mapping.bindingRevisions[runtimeIndex]};
 }
 
 namespace
@@ -140,27 +374,22 @@ namespace
     }
 
     bool MatchesSlotAssignment(const RenderObject& object, Mesh* mesh, Material* fallback,
-        const std::map<std::string, Material*>& originalSlots, const std::string& slotID, Material* effective)
+        const std::map<std::string, Material*>& expectedSlots, const std::string& slotID)
     {
-        if(!mesh || object.mesh != mesh || object.material != fallback || object.slotMaterials.size() != originalSlots.size())
+        if (object.mesh != mesh || object.material != fallback || object.slotMaterials != expectedSlots)
         {
             return false;
         }
 
-        for(const auto& [id, original] : originalSlots)
+        if (!mesh)
         {
-            const auto current = object.slotMaterials.find(id);
-            Material* expected = id == slotID ? effective : original;
-
-            if(current == object.slotMaterials.end() || current->second != expected)
-            {
-                return false;
-            }
+            return true; // Pending slots are separately validated against catalog evidence.
         }
 
         const auto& slots = mesh->GetMetadata().materialSlots;
         return std::any_of(slots.begin(), slots.end(), [&](const auto& slot) { return slot.id == slotID; });
     }
+
 }
 
 std::optional<SceneObjectMetadata> FileSceneRuntime::GetObjectMetadata(
@@ -185,7 +414,7 @@ std::optional<MaterialAssignmentToken> FileSceneRuntime::PrepareMaterialAssignme
         errorMessage->clear();
     }
 
-    if(m_materialAssignment || m_preparedScene || m_nextMaterialAssignment == 0)
+    if(m_materialAssignment || HasPreparedScene() || m_nextMaterialAssignment == 0)
     {
         AssignmentError(errorMessage, "Another scene preparation/assignment is pending, or transaction identities exhausted.");
         return std::nullopt;
@@ -194,7 +423,9 @@ std::optional<MaterialAssignmentToken> FileSceneRuntime::PrepareMaterialAssignme
     const auto metadata = GetObjectMetadata(selection.runtimeIndex, errorMessage);
 
     if(!metadata || metadata->sceneID != selection.sceneID || metadata->objectID != selection.objectID ||
-       metadata->runtimeIdentity != selection.runtimeIdentity || metadata->structureRevision != selection.structureRevision)
+       metadata->runtimeIdentity != selection.runtimeIdentity || metadata->structureRevision != selection.structureRevision ||
+       metadata->bindingRevision != selection.bindingRevision || metadata->meshReference != selection.meshReference ||
+       metadata->materialReference != selection.materialReference || metadata->materialSlotBindings != selection.materialSlotBindings)
     {
         AssignmentError(errorMessage, "Material assignment selection is stale or belongs to another scene object.");
         return std::nullopt;
@@ -256,14 +487,14 @@ std::optional<MaterialAssignmentToken> FileSceneRuntime::PrepareMaterialAssignme
 
 std::optional<MaterialAssignmentToken> FileSceneRuntime::PrepareMaterialSlotAssignment(
     const SceneObjectMetadata& selection, std::string slotID, const std::optional<AssetID>& materialID,
-    Material& effectiveMaterial, std::string* errorMessage)
+    Material& effectiveMaterial, std::string* errorMessage, FileSceneAssetCatalog* catalog)
 {
     if(errorMessage)
     {
         errorMessage->clear();
     }
 
-    if(m_materialAssignment || m_preparedScene || m_nextMaterialAssignment == 0)
+    if(m_materialAssignment || HasPreparedScene() || m_nextMaterialAssignment == 0)
     {
         AssignmentError(errorMessage, "Another scene preparation/assignment is pending, or transaction identities exhausted.");
         return std::nullopt;
@@ -274,7 +505,7 @@ std::optional<MaterialAssignmentToken> FileSceneRuntime::PrepareMaterialSlotAssi
     if(!metadata || metadata->runtimeIndex != selection.runtimeIndex || metadata->sceneID != selection.sceneID ||
         metadata->runtimeIdentity != selection.runtimeIdentity || metadata->structureRevision != selection.structureRevision ||
         metadata->meshReference != selection.meshReference || metadata->materialReference != selection.materialReference ||
-        metadata->materialSlotBindings != selection.materialSlotBindings)
+        metadata->materialSlotBindings != selection.materialSlotBindings || metadata->bindingRevision != selection.bindingRevision)
     {
         AssignmentError(errorMessage, "Material slot assignment object, mesh, or bindings are stale.");
         return std::nullopt;
@@ -283,20 +514,42 @@ std::optional<MaterialAssignmentToken> FileSceneRuntime::PrepareMaterialSlotAssi
     const auto& object = m_scene.GetRenderObjects()[metadata->runtimeIndex];
     std::string validation;
 
-    if(!object.mesh || !object.material ||
-        !ValidateMeshMetadata(object.mesh->GetMetadata(), object.mesh->GetIndexCount(), validation))
+    std::optional<MeshResidencyCandidate> pendingSource;
+
+    if (!object.mesh)
     {
-        AssignmentError(errorMessage, "Material slot assignment requires a mesh with valid material-slot metadata. " + validation);
+        Mesh* retained = catalog ? catalog->FindRetainedMesh(metadata->meshReference) : nullptr;
+
+        if (!retained)
+        {
+            AssignmentError(errorMessage, "Material slots await verified mesh metadata; authored overrides are retained.");
+            return std::nullopt;
+        }
+
+        pendingSource = catalog->DescribeMeshResidencyCandidate(metadata->meshReference, *retained, errorMessage);
+
+        if (!pendingSource)
+        {
+            return std::nullopt;
+        }
+    }
+
+    const Mesh* slotMesh = object.mesh ? object.mesh : pendingSource->mesh;
+
+    if (!object.material || !ValidateMeshMetadata(slotMesh->GetMetadata(), slotMesh->GetIndexCount(), validation))
+    {
+        AssignmentError(errorMessage, "Material slot assignment requires verified mesh-slot metadata. " + validation);
         return std::nullopt;
     }
 
-    const auto& slots = object.mesh->GetMetadata().materialSlots;
+    const auto& slots = slotMesh->GetMetadata().materialSlots;
     const auto slotExists = [&](const std::string& id)
     {
         return std::any_of(slots.begin(), slots.end(), [&](const auto& slot) { return slot.id == id; });
     };
 
-    if(!slotExists(slotID) || object.slotMaterials.size() != slots.size())
+    if(!slotExists(slotID) || (object.mesh && object.slotMaterials.size() != slots.size()) ||
+        (!object.mesh && object.slotMaterials.size() != metadata->materialSlotBindings.size()))
     {
         AssignmentError(errorMessage, "Unknown mesh slot or incomplete effective runtime material mapping: " + slotID);
         return std::nullopt;
@@ -304,6 +557,11 @@ std::optional<MaterialAssignmentToken> FileSceneRuntime::PrepareMaterialSlotAssi
 
     for(const auto& slot : slots)
     {
+        if (!object.mesh && !metadata->materialSlotBindings.contains(slot.id))
+        {
+            continue;
+        }
+
         const auto binding = object.slotMaterials.find(slot.id);
 
         if(binding == object.slotMaterials.end() || !binding->second)
@@ -350,8 +608,19 @@ std::optional<MaterialAssignmentToken> FileSceneRuntime::PrepareMaterialSlotAssi
 
     prepared.originalSlots = object.slotMaterials;
     prepared.stagedRuntimeSlots = object.slotMaterials;
-    prepared.stagedRuntimeSlots.at(*prepared.slotID) = &effectiveMaterial;
+    if (object.mesh || materialID)
+    {
+        prepared.stagedRuntimeSlots.insert_or_assign(*prepared.slotID, &effectiveMaterial);
+    }
+    else
+    {
+        prepared.stagedRuntimeSlots.erase(*prepared.slotID);
+    }
+
     prepared.stagedCommittedSlots = prepared.stagedRuntimeSlots;
+    prepared.expectedAppliedSlots = prepared.stagedRuntimeSlots;
+    prepared.pendingSlotSource = std::move(pendingSource);
+    prepared.pendingSlotCatalog = catalog;
 
     if(!CaptureSceneDocument(m_fileScene.GetDocument(), m_scene, m_objectMapping, prepared.liveBefore, errorMessage))
     {
@@ -418,6 +687,7 @@ bool FileSceneRuntime::CommitMaterialAssignment(
 
     if(!metadata || metadata->runtimeIdentity != token.runtimeIdentity || metadata->sceneID != assignment.selection.sceneID ||
        metadata->objectID != assignment.selection.objectID || metadata->structureRevision != assignment.selection.structureRevision ||
+       metadata->bindingRevision != assignment.selection.bindingRevision ||
        !SameFileState(m_fileScene, assignment.original) ||
        !CaptureSceneDocument(m_fileScene.GetDocument(), m_scene, m_objectMapping, live, errorMessage) ||
        !SceneDocumentsEqual(live, assignment.liveBefore))
@@ -430,9 +700,27 @@ bool FileSceneRuntime::CommitMaterialAssignment(
     if(assignment.slotID && (metadata->meshReference != assignment.selection.meshReference ||
         &retainedSceneMaterial != assignment.stagedMaterial ||
         !MatchesSlotAssignment(m_scene.GetRenderObjects()[index], assignment.expectedMesh, assignment.previousMaterial,
-            assignment.originalSlots, *assignment.slotID, assignment.originalSlots.at(*assignment.slotID))))
+            assignment.originalSlots, *assignment.slotID)))
     {
         return AssignmentError(errorMessage, "Prepared material slot, mesh identity, or retained material changed before commit.");
+    }
+
+    std::optional<MeshResidencySourceLock> slotSource;
+
+    if (assignment.pendingSlotSource)
+    {
+        if (!assignment.pendingSlotCatalog)
+        {
+            return AssignmentError(errorMessage, "Pending slot metadata catalog lifetime is unavailable.");
+        }
+
+        slotSource.emplace(assignment.pendingSlotCatalog->ValidateMeshResidencyCandidate(
+            *assignment.pendingSlotSource, metadata->meshReference, errorMessage));
+
+        if (!*slotSource)
+        {
+            return false;
+        }
     }
 
     if(token.noOp)
@@ -446,6 +734,12 @@ bool FileSceneRuntime::CommitMaterialAssignment(
     }
     else
     {
+        // Reserve an epoch for this edit and a possible rollback (ABA protection).
+        if(m_objectMapping.bindingRevisions[index] > (std::numeric_limits<std::uint64_t>::max)() - 2)
+        {
+            return AssignmentError(errorMessage, "Object binding revision identities are exhausted.");
+        }
+
         // Complete fallible copies before publication. FileScene moves preserve exact dirty/path state.
         FileScene candidate = assignment.candidate;
         static_assert(std::is_nothrow_move_assignable_v<FileScene>);
@@ -464,6 +758,8 @@ bool FileSceneRuntime::CommitMaterialAssignment(
             ApplyFallbackMaterial(m_scene.GetRenderObjects()[index], &retainedSceneMaterial, assignment.slotBindings);
             ApplyFallbackMaterial(m_objectMapping.committedObjects[index], &retainedSceneMaterial, assignment.slotBindings);
         }
+
+        ++m_objectMapping.bindingRevisions[index];
     }
 
     assignment.appliedMaterial = &retainedSceneMaterial;
@@ -503,9 +799,14 @@ bool FileSceneRuntime::RollbackMaterialAssignment(const MaterialAssignmentToken&
 
     if(assignment.slotID && (metadata->meshReference != assignment.selection.meshReference ||
         !MatchesSlotAssignment(m_scene.GetRenderObjects()[index], assignment.expectedMesh, assignment.previousMaterial,
-            assignment.originalSlots, *assignment.slotID, assignment.appliedMaterial)))
+            token.noOp ? assignment.originalSlots : assignment.expectedAppliedSlots, *assignment.slotID)))
     {
         return AssignmentError(errorMessage, "Rollback rejected: mesh or complete runtime slot mapping changed after assignment.");
+    }
+
+    if(!token.noOp && m_objectMapping.bindingRevisions[index] == (std::numeric_limits<std::uint64_t>::max)())
+    {
+        return AssignmentError(errorMessage, "Object binding revision identities are exhausted before rollback.");
     }
 
     m_fileScene = std::move(assignment.original);
@@ -519,6 +820,11 @@ bool FileSceneRuntime::RollbackMaterialAssignment(const MaterialAssignmentToken&
     {
         ApplyFallbackMaterial(m_scene.GetRenderObjects()[index], assignment.previousMaterial, assignment.slotBindings);
         ApplyFallbackMaterial(m_objectMapping.committedObjects[index], assignment.previousMaterial, assignment.slotBindings);
+    }
+
+    if(!token.noOp)
+    {
+        ++m_objectMapping.bindingRevisions[index];
     }
 
     m_materialAssignment.reset();
@@ -552,7 +858,7 @@ bool FileSceneRuntime::FinishMaterialAssignment(const MaterialAssignmentToken& t
     if(assignment.slotID && (metadata->meshReference != selection.meshReference ||
         !SameFileState(m_fileScene, assignment.candidate) ||
         !MatchesSlotAssignment(m_scene.GetRenderObjects()[selection.runtimeIndex], assignment.expectedMesh,
-            assignment.previousMaterial, assignment.originalSlots, *assignment.slotID, assignment.appliedMaterial)))
+            assignment.previousMaterial, token.noOp ? assignment.originalSlots : assignment.expectedAppliedSlots, *assignment.slotID)))
     {
         return AssignmentError(errorMessage, "Cannot finish after the committed document, mesh, or slot mapping changed.");
     }
@@ -607,6 +913,8 @@ bool FileSceneRuntime::Prepare(
         return false;
     }
 
+    m_preparedMetadata.reset();
+    CancelMeshResidency();
     m_preparedScene = std::move(prepared);
     return true;
 }
@@ -637,7 +945,66 @@ bool FileSceneRuntime::Commit(std::string* errorMessage)
         return false;
     }
 
+    DiscardPreparedScene();
+    return true;
+}
+
+bool FileSceneRuntime::PrepareMetadata(FileSceneAssetCatalog& catalog, std::string* error)
+{
+    if(m_materialAssignment || !m_fileScene.HasDocument())
+    {
+        return AssignmentError(error, "Metadata preparation requires an open document without a material assignment.");
+    }
+
+    PreparedMetadataScene prepared;
+
+    if(!PrepareSceneMetadata(m_fileScene.GetDocument(), catalog, prepared, error))
+    {
+        return false;
+    }
+
     m_preparedScene.reset();
+    CancelMeshResidency();
+    m_preparedMetadata = std::move(prepared);
+    return true;
+}
+
+bool FileSceneRuntime::CommitMetadata(FileSceneAssetCatalog& catalog, std::string* error)
+{
+    if(m_materialAssignment || !m_preparedMetadata || !m_fileScene.HasDocument())
+    {
+        return AssignmentError(error, "Metadata commit requires a prepared metadata scene without a material assignment.");
+    }
+
+    if(!SceneDocumentsEqual(m_fileScene.GetDocument(), m_preparedMetadata->document))
+    {
+        return AssignmentError(error, "Authored document changed after metadata preparation.");
+    }
+
+    // Resolve/validate current registry and containment again before any scene
+    // mutation. A changed material borrow cannot silently replace the prepared one.
+    PreparedMetadataScene verified;
+
+    if(!PrepareSceneMetadata(m_fileScene.GetDocument(), catalog, verified, error))
+    {
+        return false;
+    }
+
+    for(size_t index = 0; index < verified.objects.size(); ++index)
+    {
+        if(!MatchesCommittedSceneObjectBindings(verified.document.objects[index],
+            verified.objects[index].renderObject, m_preparedMetadata->objects[index].renderObject))
+        {
+            return AssignmentError(error, "Prepared metadata material bindings changed before commit.");
+        }
+    }
+
+    if(!CommitPreparedMetadataScene(verified, m_scene, m_objectMapping, error))
+    {
+        return false;
+    }
+
+    DiscardPreparedScene();
     return true;
 }
 
@@ -657,7 +1024,7 @@ bool FileSceneRuntime::New(
         return false;
     }
 
-    m_preparedScene.reset();
+    DiscardPreparedScene();
     m_objectMapping = {};
     return true;
 }
@@ -676,14 +1043,14 @@ bool FileSceneRuntime::Open(
         return false;
     }
 
-    m_preparedScene.reset();
+    DiscardPreparedScene();
     m_objectMapping = {};
     return true;
 }
 
 SceneDocument& FileSceneRuntime::EditDocument() noexcept
 {
-    m_preparedScene.reset();
+    DiscardPreparedScene();
     return m_fileScene.EditDocument();
 }
 
@@ -740,7 +1107,7 @@ std::unique_ptr<FileSceneRuntime> FileSceneRuntime::PrepareObjectCreation(
         errorMessage->clear();
     }
 
-    if(!m_fileScene.HasDocument() || m_materialAssignment || m_preparedScene)
+    if(!m_fileScene.HasDocument() || m_materialAssignment || HasPreparedScene())
     {
         AssignmentError(errorMessage, "Object creation requires a committed scene without pending preparation/assignment.");
         return nullptr;
@@ -804,7 +1171,18 @@ std::unique_ptr<FileSceneRuntime> FileSceneRuntime::PrepareObjectCreation(
     addition.objects = {added};
     std::vector<ResolvedSceneObject> resolved;
 
-    if(!ResolveSceneObjects(addition, resolver, resolved, errorMessage))
+    if (auto* catalog = dynamic_cast<FileSceneAssetCatalog*>(&resolver))
+    {
+        ResolvedSceneObject object;
+
+        if (!catalog->PrepareEditorObject(addition.objects.front(), object, errorMessage))
+        {
+            return nullptr;
+        }
+
+        resolved.push_back(std::move(object));
+    }
+    else if (!ResolveSceneObjects(addition, resolver, resolved, errorMessage))
     {
         return nullptr;
     }
@@ -826,7 +1204,14 @@ std::unique_ptr<FileSceneRuntime> FileSceneRuntime::PrepareObjectCreation(
     candidate->m_fileScene = m_fileScene;
     candidate->m_fileScene.EditDocument() = std::move(document);
 
-    if(!CommitPreparedScene(prepared, candidate->m_scene, candidate->m_objectMapping, errorMessage))
+    if (auto* owner = dynamic_cast<FileSceneAssetCatalog*>(&resolver); owner &&
+        !owner->ValidateEditorBindings(candidate->m_fileScene.GetDocument(), prepared, errorMessage))
+    {
+        return nullptr;
+    }
+
+    if(!CommitPreparedEditorScene(prepared, candidate->m_fileScene.GetDocument(),
+        candidate->m_scene, candidate->m_objectMapping, errorMessage))
     {
         return nullptr;
     }
@@ -839,14 +1224,14 @@ std::unique_ptr<FileSceneRuntime> FileSceneRuntime::PrepareObjectCreation(
 }
 
 std::unique_ptr<FileSceneRuntime> FileSceneRuntime::PrepareObjectDeletion(
-    std::string_view objectID, std::string* errorMessage) const
+    std::string_view objectID, std::string* errorMessage, FileSceneAssetCatalog* catalog) const
 {
     if(errorMessage)
     {
         errorMessage->clear();
     }
 
-    if(!m_fileScene.HasDocument() || m_materialAssignment || m_preparedScene)
+    if(!m_fileScene.HasDocument() || m_materialAssignment || HasPreparedScene())
     {
         AssignmentError(errorMessage, "Object deletion requires a committed scene without pending preparation/assignment.");
         return nullptr;
@@ -897,7 +1282,14 @@ std::unique_ptr<FileSceneRuntime> FileSceneRuntime::PrepareObjectDeletion(
     candidate->m_fileScene = m_fileScene;
     candidate->m_fileScene.EditDocument() = std::move(document);
 
-    if(!CommitPreparedScene(prepared, candidate->m_scene, candidate->m_objectMapping, errorMessage))
+    if (auto* owner = catalog; owner &&
+        !owner->ValidateEditorBindings(candidate->m_fileScene.GetDocument(), prepared, errorMessage))
+    {
+        return nullptr;
+    }
+
+    if(!CommitPreparedEditorScene(prepared, candidate->m_fileScene.GetDocument(),
+        candidate->m_scene, candidate->m_objectMapping, errorMessage))
     {
         return nullptr;
     }
@@ -914,7 +1306,7 @@ std::unique_ptr<FileSceneRuntime> FileSceneRuntime::PrepareObjectRestoration(Sce
         errorMessage->clear();
     }
 
-    if(!m_fileScene.HasDocument() || m_materialAssignment || m_preparedScene)
+    if(!m_fileScene.HasDocument() || m_materialAssignment || HasPreparedScene())
     {
         AssignmentError(errorMessage, "Object restoration requires a committed scene without pending preparation/assignment.");
         return nullptr;
@@ -952,7 +1344,18 @@ std::unique_ptr<FileSceneRuntime> FileSceneRuntime::PrepareObjectRestoration(Sce
     addition.objects = {restored};
     std::vector<ResolvedSceneObject> resolved;
 
-    if(!ResolveSceneObjects(addition, resolver, resolved, errorMessage))
+    if (auto* catalog = dynamic_cast<FileSceneAssetCatalog*>(&resolver))
+    {
+        ResolvedSceneObject object;
+
+        if (!catalog->PrepareEditorObject(addition.objects.front(), object, errorMessage))
+        {
+            return nullptr;
+        }
+
+        resolved.push_back(std::move(object));
+    }
+    else if (!ResolveSceneObjects(addition, resolver, resolved, errorMessage))
     {
         return nullptr;
     }
@@ -979,7 +1382,14 @@ std::unique_ptr<FileSceneRuntime> FileSceneRuntime::PrepareObjectRestoration(Sce
     candidate->m_fileScene = m_fileScene;
     candidate->m_fileScene.EditDocument() = std::move(document);
 
-    if(!CommitPreparedScene(prepared, candidate->m_scene, candidate->m_objectMapping, errorMessage))
+    if (auto* owner = dynamic_cast<FileSceneAssetCatalog*>(&resolver); owner &&
+        !owner->ValidateEditorBindings(candidate->m_fileScene.GetDocument(), prepared, errorMessage))
+    {
+        return nullptr;
+    }
+
+    if(!CommitPreparedEditorScene(prepared, candidate->m_fileScene.GetDocument(),
+        candidate->m_scene, candidate->m_objectMapping, errorMessage))
     {
         return nullptr;
     }

@@ -1,3 +1,4 @@
+#include "Scene/SceneSwitchTiming.h"
 #include "Engine/Engine.h"
 
 #include "Core/Log.h"
@@ -22,6 +23,7 @@
 #include "assets/AssetReconciliationTransaction.h"
 #include "assets/ProjectAssetReconciliation.h"
 #include "assets/ProjectAssetResolver.h"
+#include "Scene/MaterialParameterPropagation.h"
 #include "imgui.h"
 
 #include <filesystem>
@@ -273,6 +275,10 @@ bool Engine::ExecuteMaterialAssignment()
         return feedback.succeeded;
     }
 
+    const auto target = owner->GetObjectMetadata(request.selection.objectID, &error);
+    const bool pendingObject = target && target->GetMeshResidency(
+        owner->GetScene().GetRenderObjects()[target->runtimeIndex]) == SceneMeshResidency::Pending;
+
     feedback.message = "Saved material could not be loaded. See the log for details.";
     Material* replacement = nullptr;
     std::vector<Material*> materials;
@@ -280,9 +286,10 @@ bool Engine::ExecuteMaterialAssignment()
     try
     {
         replacement = request.slotID ? owner->GetPreparedMaterialAssignmentMaterial(*token) :
-            owner->ResolveAssignmentMaterial(request.reference, &error);
+            pendingObject ? owner->ResolvePendingAssignmentMaterial(request.reference, &error) :
+                owner->ResolveAssignmentMaterial(request.reference, &error);
 
-        if(replacement)
+        if(replacement && !pendingObject)
         {
             // Allocate the full table snapshot before releasing any Renderer resources.
             materials = owner->GetMaterials();
@@ -293,7 +300,7 @@ bool Engine::ExecuteMaterialAssignment()
         error = exception.what();
     }
 
-    if(!replacement || materials.empty())
+    if(!replacement || (!pendingObject && materials.empty()))
     {
         if(!error.empty())
         {
@@ -302,6 +309,73 @@ bool Engine::ExecuteMaterialAssignment()
 
         Log::Warning("Material assignment load failed; previous assignment retained: " + error);
         return cancel();
+    }
+
+    if (pendingObject)
+    {
+        if (!m_renderer.CanEditPendingMaterialBindings(owner->GetScene()))
+        {
+            feedback.message = "Pending material assignment requires a valid pre-recording renderer boundary; retry later.";
+            return cancel();
+        }
+
+        if (!m_renderer.HasPublishedMaterial(*replacement))
+        {
+            feedback.message = "Unsupported pending assignment: material requires deferred renderer material-table growth.";
+            Log::Warning(feedback.message);
+            return cancel();
+        }
+
+        bool committed = false;
+
+        try
+        {
+            committed = owner->CommitMaterialAssignment(*token, *replacement, &error);
+
+            if (committed && !owner->FinishMaterialAssignment(*token, &error))
+            {
+                if (!owner->RollbackMaterialAssignment(*token, &error))
+                {
+                    Log::Error("Pending material assignment rollback failed: " + error);
+                    return false;
+                }
+
+                committed = false;
+            }
+        }
+        catch (const std::exception& exception)
+        {
+            error = exception.what();
+
+            if (committed)
+            {
+                if (!owner->RollbackMaterialAssignment(*token, &error))
+                {
+                    return false;
+                }
+
+                committed = false;
+            }
+        }
+
+        if (!committed)
+        {
+            feedback.message = error;
+            Log::Warning("Pending material assignment rejected: " + error);
+
+            if (owner->m_runtime->HasMaterialAssignment())
+            {
+                return cancel();
+            }
+
+            return true;
+        }
+
+        m_editor.InvalidateSceneHistoryRedoAfterEdit();
+        feedback.succeeded = true;
+        feedback.message = "Authored pending material updated; save the scene to persist it.";
+        Log::Info("Pending object material assignment completed without geometry residency or renderer table mutation.");
+        return true;
     }
 
     feedback.message = "Renderer update failed. See the log for recovery details.";
@@ -458,6 +532,8 @@ bool Engine::ExecuteMaterialAssignment()
 
 bool Engine::ActivateRequestedFileScene()
 {
+    const auto started = std::chrono::steady_clock::now();
+    SceneSwitchTiming::Session timing(m_meshCPUCache);
     IDemoScene* previous = m_demoSceneManager.TryGetActiveScene();
 
     if (!previous)
@@ -467,6 +543,8 @@ bool Engine::ActivateRequestedFileScene()
     }
 
     std::string error;
+
+    SceneSwitchTiming::Measure stagingTiming(SceneSwitchTiming::Stage::Staging);
 
     if (!m_demoSceneManager.GetStagedFileScene() &&
         !m_demoSceneManager.StageRequestedFileScene(
@@ -478,6 +556,7 @@ bool Engine::ActivateRequestedFileScene()
         return true;
     }
 
+    stagingTiming.Stop();
     IDemoScene* candidate = m_demoSceneManager.GetStagedFileScene();
 
     if (!candidate)
@@ -485,6 +564,8 @@ bool Engine::ActivateRequestedFileScene()
         Log::Error("File scene staging did not produce a candidate.");
         return false;
     }
+
+    SceneSwitchTiming::Measure drainTiming(SceneSwitchTiming::Stage::DrainRelease);
 
     if (!DrainAndResolveSceneDisplacement(m_renderer, *previous))
     {
@@ -500,17 +581,31 @@ bool Engine::ActivateRequestedFileScene()
 
     m_sceneResourcesReleasedForSwitch = true;
 
-    if (m_renderer.InitializeSceneResources(candidate->GetScene(), candidate->GetMaterials()))
+    drainTiming.Stop();
+    const bool initialized = SceneSwitchTiming::MeasureCall(SceneSwitchTiming::Stage::Renderer, [&]()
     {
-        if (!m_demoSceneManager.CommitStagedFileScene(&error))
+        return m_renderer.InitializeSceneResources(candidate->GetScene(), candidate->GetMaterials());
+    });
+
+    if (initialized)
+    {
+        const bool published = SceneSwitchTiming::MeasureCall(SceneSwitchTiming::Stage::Publication, [&]()
+        {
+            return m_demoSceneManager.CommitStagedFileScene(&error);
+        });
+
+        if (!published)
         {
             Log::Error("File scene commit failed; retaining candidate Renderer ownership: " + error);
             return false;
         }
 
         m_sceneResourcesReleasedForSwitch = false;
+
+        OnFileSceneActivated(started);
         m_editor.OnSceneActivated();
         m_renderedSceneStructureRevision = m_demoSceneManager.GetActiveScene().GetScene().GetStructureRevision();
+        timing.outcome = "published";
         return true;
     }
 
@@ -762,6 +857,7 @@ void Engine::ProcessEditorSceneRequests(IDemoScene& activeScene)
 
 bool Engine::Initialize()
 {
+    const auto initializationStarted = std::chrono::steady_clock::now();
     ENGINE_ASSERT(m_state == EngineState::Uninitialized);
 
     // Initialize persistent project storage before GPU resources.
@@ -962,6 +1058,8 @@ bool Engine::Initialize()
     m_editor.ConfigureMaterialThumbnails(m_renderer);
 
     m_demoSceneManager.SetProjectAssets(ProjectLocator::GetDefaultProjectRoot(), m_projectAssetRegistry);
+    m_demoSceneManager.SetTextureStreamingEnabled(true);
+    m_demoSceneManager.SetMeshCPUCache(&m_meshCPUCache);
 
     if(!m_demoSceneManager.Initialize(
             "Sphere Grid", m_renderer.GetDevice(), m_renderer.GetResourceUploader(),
@@ -971,6 +1069,25 @@ bool Engine::Initialize()
         Log::Error("Failed to initialize demo scene manager.");
         return false;
     }
+
+    std::string texturePreparationError;
+
+    if(!m_texturePreparation.Start({}, texturePreparationError))
+    {
+        Log::Error("Cannot start texture preparation service: " + texturePreparationError);
+        return false;
+    }
+
+    std::string meshPreparationError;
+
+    if (!m_meshPreparation.Start({}, meshPreparationError))
+    {
+        Log::Error("Cannot start mesh preparation service: " + meshPreparationError);
+        return false;
+    }
+
+    Log::Info("Texture preparation limits: 16 requests, 4 completed jobs, 64 MiB source, "
+        "256 MiB active reservation, 512 MiB total retained reservations.");
 
     Log::Info("Demo scene initialization complete.");
 
@@ -1056,6 +1173,7 @@ bool Engine::Initialize()
         });
 
     m_state = EngineState::Running;
+    OnFileSceneActivated(initializationStarted);
     Log::Info("Engine initialized.");
     return true;
 }
@@ -1280,6 +1398,15 @@ void Engine::Frame()
 
     if (m_demoSceneManager.HasPendingSceneChange())
     {
+        const auto switchStarted = std::chrono::steady_clock::now();
+        if (m_diagnosticMeshToken || m_diagnosticCPUPreparation)
+        {
+            Log::Info("Mesh residency request canceled before scene switch.");
+        }
+
+        CancelMeshResidencyAcceptance();
+        m_texturePreparation.Invalidate();
+        m_meshPreparation.Invalidate();
         Renderer::FrameHitchProbe switchProbe(
             m_renderer,
             Renderer::FrameHitchRegion::EngineSwitch);
@@ -1294,6 +1421,9 @@ void Engine::Frame()
         }
         else
         {
+            m_automaticMeshResidency = {};
+            m_automaticResidencyIntent = 0;
+
             if (!DrainAndResolveSceneDisplacement(m_renderer, m_demoSceneManager.GetActiveScene()))
             {
                 Log::Error("GPU drain or displacement resolution failed before scene switch; requesting shutdown.");
@@ -1346,6 +1476,8 @@ void Engine::Frame()
 
             m_editor.OnSceneActivated();
             m_renderedSceneStructureRevision = switchedDemo.GetScene().GetStructureRevision();
+
+            OnFileSceneActivated(switchStarted);
         }
     }
 
@@ -1374,6 +1506,7 @@ void Engine::Frame()
     ProcessWorkingMaterialNotifications();
     ProcessSavedMaterialRevisions();
     PublishWorkingMaterialParameters();
+    ProcessSceneTextureStreaming();
 
     m_editor.SetThumbnailCompletedFence(m_renderer.GetEditorCompletedFence());
 
@@ -1706,6 +1839,48 @@ void Engine::Frame()
         renderProbe.emplace(m_renderer, Renderer::FrameHitchRegion::EngineRender);
     }
 
+    ProcessMeshResidencyDiagnostics();
+
+    // Coordinated publication boundary: all editor/assets, scene update/rebuild
+    // and thumbnail/preview preparation above are complete. Final validation
+    // and the noexcept ownership/binding transfer finish before Render records.
+    m_meshResidencyAcceptance.reset();
+
+    if (m_meshResidencyPublication.HasCandidate())
+    {
+        if (auto* fileScene = dynamic_cast<FileBackedDemoScene*>(&activeDemo))
+        {
+            m_meshResidencyAcceptance = m_meshResidencyPublication.PublishAtBoundary(
+                m_renderer, *fileScene->m_runtime, fileScene->m_assets);
+        }
+        else
+        {
+            m_meshResidencyPublication.Cancel();
+            m_meshResidencyAcceptance = MeshResidencyPublication::AcceptanceResult{
+                MeshResidencyPublication::Status::Stale, "Active scene is no longer the prepared file scene."};
+        }
+    }
+
+    if (m_diagnosticMeshToken && m_meshResidencyAcceptance)
+    {
+        LogMeshResidencyDiagnostic(*m_meshResidencyAcceptance);
+
+        if (m_meshResidencyAcceptance->published)
+        {
+            FinishAutomaticMeshResidency(MeshResidencyPublication::Status::Ready);
+            m_residencyRequestSelection.reset();
+            m_residencyRequestSourceIdentity.clear();
+            m_diagnosticMeshToken.reset();
+            m_diagnosticMeshReadiness.reset();
+            m_diagnosticRendererLifetime = 0;
+        }
+        else if (m_meshResidencyAcceptance->status != MeshResidencyPublication::Status::Retry)
+        {
+            FinishAutomaticMeshResidency(m_meshResidencyAcceptance->status);
+            CancelMeshResidencyAcceptance();
+        }
+    }
+
     const Renderer::FrameRenderResult renderResult = m_renderer.Render(activeScene, rendererOptions);
     renderProbe.reset();
 
@@ -1738,9 +1913,20 @@ void Engine::Frame()
 
 void Engine::Shutdown()
 {
+    if (m_diagnosticMeshToken || m_diagnosticCPUPreparation)
+    {
+        Log::Info("Mesh residency request canceled for Engine shutdown.");
+    }
+
+    CancelMeshResidencyAcceptance();
+    m_automaticMeshResidency = {};
+    m_automaticResidencyIntent = 0;
+
     ENGINE_ASSERT(m_state == EngineState::Running);
 
     Log::Info("Engine shutdown: starting.");
+    m_texturePreparation.Shutdown();
+    m_meshPreparation.Shutdown();
     m_pendingWorkingMaterialRevisions.clear();
     m_workingMaterialRestores.clear();
     m_workingMaterialOverride.reset();
@@ -1789,10 +1975,45 @@ void Engine::Shutdown()
 
     m_editor.ResetThumbnailRequests();
     m_demoSceneManager.Shutdown();
+    m_meshCPUCache.Clear();
     m_renderer.Shutdown();
     m_window.Shutdown();
 
     Log::Info("Engine shutdown: finished.");
+}
+
+void Engine::ProcessSceneTextureStreaming()
+{
+    auto* scene = dynamic_cast<FileBackedDemoScene*>(m_demoSceneManager.TryGetActiveScene());
+
+    if(!scene || m_demoSceneManager.HasPendingSceneChange())
+    {
+        return;
+    }
+
+    const auto mayPublish = [&](const AssetID& material, const MaterialAssetData& baseline)
+    {
+        const auto runtime = scene->GetRuntimeIdentity();
+
+        for(const auto& queued : m_savedMaterialRevisionQueue)
+        {
+            if(queued.runtimeIdentity == runtime && queued.saved.assetID == material)
+            {
+                return false;
+            }
+        }
+
+        if(m_workingMaterialOverride && m_workingMaterialOverride->parameters &&
+            m_workingMaterialOverride->selection.runtime.runtimeIdentity == runtime &&
+            m_workingMaterialOverride->selection.runtime.assetID == material)
+        {
+            return MaterialParameterPropagation::SameTextures(baseline, *m_workingMaterialOverride->parameters);
+        }
+
+        return true;
+    };
+
+    scene->AdvanceTextureStreaming(m_texturePreparation, m_renderer, mayPublish);
 }
 
 void Engine::ProcessSavedMaterialRevisions()
@@ -2242,6 +2463,15 @@ bool Engine::ExecuteSceneObjectCreation()
 
     // Both runtime addresses and all catalog assets remain owned throughout
     // initialization, cleanup, and restoration. No active CPU state changes yet.
+    // Capture intent identity before cancellation. Never transfer old request
+    // handles/epochs; restart discovery only after the checked runtime swap.
+    const auto previousRuntimeIdentity = owner->GetRuntimeIdentity();
+
+    // Invalidate old-session CPU subscribers and residency candidates before the
+    // checked renderer replacement. Manager pins survive until GPU-safe release.
+    CancelMeshResidencyAcceptance();
+    m_meshPreparation.Invalidate();
+
     if(!DrainAndResolveSceneDisplacement(m_renderer, *owner) || !m_renderer.ReleaseSceneResources())
     {
         result.error = "Object creation could not prove renderer release safety; retaining both runtimes and stopping.";
@@ -2285,6 +2515,7 @@ bool Engine::ExecuteSceneObjectCreation()
 
         m_editor.PublishCreatedObjectSelection(owner->GetScene(), std::move(*selection), std::move(activeName));
         Log::Info("Created scene object " + result.objectID + "; save the scene to persist it.");
+        ContinueAutomaticMeshResidencyAfterReplacement(previousRuntimeIdentity);
         return true;
     }
 
@@ -2310,6 +2541,7 @@ bool Engine::ExecuteSceneObjectCreation()
     m_sceneResourcesReleasedForSwitch = false;
     result.error = "Candidate renderer initialization failed; previous scene restored.";
     Log::Warning(result.error);
+    ContinueAutomaticMeshResidencyAfterReplacement(previousRuntimeIdentity);
     return true;
 }
 
@@ -2435,7 +2667,7 @@ bool Engine::ExecuteSceneObjectDeletion()
             return true;
         }
 
-        owner->m_objectMutationCandidate = owner->m_runtime->PrepareObjectDeletion(current->objectID, &result.error);
+        owner->m_objectMutationCandidate = owner->m_runtime->PrepareObjectDeletion(current->objectID, &result.error, &owner->m_assets);
 
         if(owner->m_objectMutationCandidate)
         {
@@ -2501,6 +2733,15 @@ bool Engine::ExecuteSceneObjectDeletion()
 
     // Original document, runtime mappings, selection and undo history remain untouched.
     // The catalog owns shared meshes/materials through candidate cleanup and restoration.
+    // Capture intent identity before cancellation. Never transfer old request
+    // handles/epochs; restart discovery only after the checked runtime swap.
+    const auto previousRuntimeIdentity = owner->GetRuntimeIdentity();
+
+    // Invalidate old-session CPU subscribers and residency candidates before the
+    // checked renderer replacement. Manager pins survive until GPU-safe release.
+    CancelMeshResidencyAcceptance();
+    m_meshPreparation.Invalidate();
+
     if(!DrainAndResolveSceneDisplacement(m_renderer, *owner) || !m_renderer.ReleaseSceneResources())
     {
         result.error = "Object deletion could not prove renderer release safety; retaining both runtimes and stopping.";
@@ -2541,6 +2782,7 @@ bool Engine::ExecuteSceneObjectDeletion()
 
         m_editor.PublishRestoredObjectSelection(*owner, std::move(survivingSelection), std::move(activeName));
         Log::Info("Deleted scene object " + result.objectID + "; save the scene to persist it.");
+        ContinueAutomaticMeshResidencyAfterReplacement(previousRuntimeIdentity);
         return true;
     }
 
@@ -2563,6 +2805,7 @@ bool Engine::ExecuteSceneObjectDeletion()
     m_sceneResourcesReleasedForSwitch = false;
     result.error = "Deletion renderer initialization failed; previous scene restored.";
     Log::Warning(result.error);
+    ContinueAutomaticMeshResidencyAfterReplacement(previousRuntimeIdentity);
     return true;
 }
 
@@ -2762,6 +3005,15 @@ bool Engine::ExecuteSceneObjectRestoration()
 
     // Catalog assets and both Scene addresses remain owned until checked cleanup.
     // No document, selection, or history publication has occurred at this point.
+    // Capture intent identity before cancellation. Never transfer old request
+    // handles/epochs; restart discovery only after the checked runtime swap.
+    const auto previousRuntimeIdentity = owner->GetRuntimeIdentity();
+
+    // Invalidate old-session CPU subscribers and residency candidates before the
+    // checked renderer replacement. Manager pins survive until GPU-safe release.
+    CancelMeshResidencyAcceptance();
+    m_meshPreparation.Invalidate();
+
     if(!DrainAndResolveSceneDisplacement(m_renderer, *owner) || !m_renderer.ReleaseSceneResources())
     {
         result.error = "Object restoration could not prove renderer release safety; retaining both runtimes and stopping.";
@@ -2812,6 +3064,7 @@ bool Engine::ExecuteSceneObjectRestoration()
         result.error.clear();
 
         Log::Info("Restored scene object " + result.objectID + "; save the scene to persist it.");
+        ContinueAutomaticMeshResidencyAfterReplacement(previousRuntimeIdentity);
         return true;
     }
 
@@ -2834,5 +3087,914 @@ bool Engine::ExecuteSceneObjectRestoration()
     m_sceneResourcesReleasedForSwitch = false;
     result.error = "Restored candidate renderer initialization failed; previous scene restored.";
     Log::Warning(result.error);
+    ContinueAutomaticMeshResidencyAfterReplacement(previousRuntimeIdentity);
     return true;
+}
+
+bool Engine::PrepareMeshResidencyAcceptance(const MeshResidencyToken& token, std::string& error)
+{
+    auto* scene = dynamic_cast<FileBackedDemoScene*>(m_demoSceneManager.TryGetActiveScene());
+
+    if (!scene || m_demoSceneManager.HasPendingSceneChange() || m_pendingEditorSceneOperation ||
+        m_pendingMaterialAssignment)
+    {
+        error = "Mesh acceptance preparation requires an active file scene without a pending scene/material operation.";
+        return false;
+    }
+
+    if (!m_meshResidencyPublication.Prepare(m_renderer, *scene->m_runtime, scene->m_assets, token, error))
+    {
+        return false;
+    }
+
+    m_meshResidencyAcceptance.reset();
+    return true;
+}
+
+void Engine::CancelMeshResidencyAcceptance() noexcept
+{
+    FinishAutomaticMeshResidency(MeshResidencyPublication::Status::Stale);
+    m_residencyRequestSelection.reset();
+    m_residencyRequestSourceIdentity.clear();
+    if (m_diagnosticCPUPreparation)
+    {
+        m_meshPreparation.Cancel(m_diagnosticCPUPreparation->ticket);
+        m_diagnosticCPUPreparation.reset();
+    }
+
+    m_meshResidencyPublication.Cancel();
+    m_meshResidencyAcceptance.reset();
+
+    auto* scene = dynamic_cast<FileBackedDemoScene*>(m_demoSceneManager.TryGetActiveScene());
+
+    if (m_diagnosticMeshToken && scene && scene->GetRuntimeIdentity() == m_diagnosticMeshToken->runtimeIdentity)
+    {
+        scene->m_runtime->CancelMeshResidency();
+    }
+
+    m_diagnosticMeshToken.reset();
+    m_diagnosticMeshReadiness.reset();
+    m_diagnosticRendererLifetime = 0;
+}
+
+void Engine::RequestDiagnosticMeshResidency()
+{
+    auto* scene = dynamic_cast<FileBackedDemoScene*>(m_demoSceneManager.TryGetActiveScene());
+    std::string error;
+
+    if (!scene || !scene->IsMetadataOnlyActivation())
+    {
+        Log::Warning("Mesh residency diagnostic blocked: active scene is not a metadata-only file scene.");
+        return;
+    }
+
+    if (m_diagnosticCPUPreparation || m_diagnosticMeshToken || m_meshResidencyPublication.HasCandidate())
+    {
+        if (m_residencyRequestAutomatic && m_residencyRequestSelection &&
+            m_residencyRequestSelection->runtimeIndex == m_editor.GetSelectedObject())
+        {
+            Log::Info("F10: selected object is already pending automatic residency; reusing the existing request.");
+        }
+        else
+        {
+            Log::Warning("F10 busy/retry: another manual or automatic residency request owns the single publication slot.");
+        }
+        return;
+    }
+
+    if (m_demoSceneManager.HasPendingSceneChange() || m_pendingEditorSceneOperation || m_pendingMaterialAssignment ||
+        m_editor.HasBlockingMaterialOperation() || m_editor.HasBlockingObjectCreation() ||
+        m_editor.HasPendingSceneHistoryOperation())
+    {
+        Log::Warning("Mesh residency diagnostic blocked: a scene, material, or editor operation is pending.");
+        return;
+    }
+
+    if (!MeshResidencyPublication::CanPrepareGeometry(m_renderer, *scene->m_runtime))
+    {
+        Log::Warning("Mesh residency diagnostic blocked: renderer scene/session or recording state is not ready.");
+        return;
+    }
+
+    try
+    {
+        const auto selectedIndex = m_editor.GetSelectedObject();
+        const auto& objects = scene->GetScene().GetRenderObjects();
+
+        if (selectedIndex >= objects.size())
+        {
+            Log::Warning("Mesh residency diagnostic rejected: no selected hierarchy object.");
+            return;
+        }
+
+        if (m_editor.GetSelectionStructureRevision() != scene->GetScene().GetStructureRevision())
+        {
+            Log::Warning("Mesh residency diagnostic rejected: hierarchy selection belongs to an obsolete scene revision.");
+            return;
+        }
+
+        const auto selection = scene->GetObjectMetadata(selectedIndex, &error);
+
+        if (!selection || selection->runtimeIdentity != scene->GetRuntimeIdentity())
+        {
+            Log::Warning("Mesh residency diagnostic selection validation failed: " + error);
+            return;
+        }
+
+        const auto& object = objects[selection->runtimeIndex];
+        const auto residency = selection->GetMeshResidency(object);
+
+        if (residency == SceneMeshResidency::Empty)
+        {
+            Log::Warning("Mesh residency diagnostic rejected: selected object has no authored mesh.");
+            return;
+        }
+
+        if (residency == SceneMeshResidency::Resident)
+        {
+            Log::Warning("Mesh residency diagnostic rejected: selected object is already resident.");
+            return;
+        }
+
+        if (residency != SceneMeshResidency::Pending)
+        {
+            Log::Warning("Mesh residency diagnostic rejected: selected object's authored/runtime bindings are inconsistent.");
+            return;
+        }
+
+        BeginMeshResidencyRequest(*selection, false);
+    }
+    catch (const std::exception& exception)
+    {
+        CancelMeshResidencyAcceptance();
+        Log::Warning("Mesh residency diagnostic preparation failed: " + std::string(exception.what()));
+    }
+}
+
+void Engine::ProcessMeshResidencyDiagnostics()
+{
+#ifdef _DEBUG
+    // Deliberate developer chords, ignored while typing into an editor field.
+    if (!ImGui::GetIO().WantTextInput && m_input.IsKeyDown(VK_CONTROL) && m_input.IsKeyDown(VK_SHIFT))
+    {
+        if (m_input.WasKeyPressed(VK_F11))
+        {
+            if (m_residencyRequestAutomatic)
+            {
+                Log::Info("F11: automatic mesh residency remains active; no manual request to cancel.");
+            }
+            else
+            {
+                Log::Info("Mesh residency manual diagnostic cancellation requested.");
+                CancelMeshResidencyAcceptance();
+            }
+        }
+        else if (m_input.WasKeyPressed(VK_F9) || m_input.WasKeyPressed(VK_F8))
+        {
+            const bool synchronous = m_input.WasKeyPressed(VK_F8);
+            auto* scene = dynamic_cast<FileBackedDemoScene*>(m_demoSceneManager.TryGetActiveScene());
+            bool dirty = true;
+            std::string error;
+
+            if (!scene || m_demoSceneManager.HasPendingSceneChange() || m_pendingEditorSceneOperation ||
+                m_pendingMaterialAssignment || m_editor.HasBlockingMaterialOperation() ||
+                m_editor.HasBlockingObjectCreation() || m_editor.HasPendingSceneHistoryOperation() ||
+                !scene->CheckUnsavedChanges(dirty, &error) || dirty)
+            {
+                Log::Warning("Diagnostic scene reload requires a saved file scene and no pending edits: " + error);
+            }
+            else
+            {
+                const auto path = scene->GetScenePath();
+                CancelMeshResidencyAcceptance();
+
+                const bool requested = synchronous ?
+                    m_demoSceneManager.RequestSynchronousFileSceneDiagnostic(path, &error) :
+                    m_demoSceneManager.RequestMetadataOnlyFileScene(path, &error);
+
+                if (!requested)
+                {
+                    Log::Warning("Diagnostic scene reload rejected: " + error);
+                }
+                else
+                {
+                    Log::Info(std::string(synchronous ? "Synchronous full-residency Debug reload requested: " :
+                        "Metadata-first diagnostic reload requested with automatic residency: ") + path.string());
+                }
+            }
+        }
+        else if (m_input.WasKeyPressed(VK_F10))
+        {
+            Log::Info("Mesh residency diagnostic: Ctrl+Shift+F10 detected.");
+            RequestDiagnosticMeshResidency();
+        }
+    }
+#endif
+
+    AdvanceAutomaticMeshResidency();
+    AdvanceDiagnosticMeshPreparation();
+
+    if (!m_diagnosticMeshToken || m_meshResidencyPublication.HasCandidate())
+    {
+        return;
+    }
+
+    auto* scene = dynamic_cast<FileBackedDemoScene*>(m_demoSceneManager.TryGetActiveScene());
+
+    if (!scene || scene->GetRuntimeIdentity() != m_diagnosticMeshToken->runtimeIdentity ||
+        m_renderer.GetMaterialTableIdentity() != m_diagnosticRendererLifetime || m_demoSceneManager.HasPendingSceneChange())
+    {
+        Log::Warning("Mesh residency request canceled: scene session or renderer lifetime changed.");
+        CancelMeshResidencyAcceptance();
+        return;
+    }
+
+    std::string error;
+
+    if (PrepareMeshResidencyAcceptance(*m_diagnosticMeshToken, error))
+    {
+        Log::Info("Mesh residency: renderer membership candidate created; awaiting final publication boundary.");
+        return;
+    }
+
+    if (error.starts_with("Deferred:"))
+    {
+        LogMeshResidencyDiagnostic({MeshResidencyPublication::Status::Retry, std::move(error)});
+        return;
+    }
+
+    RejectMeshResidencyRequest("Mesh residency renderer preparation rejected: " + error);
+}
+
+void Engine::LogMeshResidencyDiagnostic(const MeshResidencyPublication::AcceptanceResult& result)
+{
+    if (m_diagnosticMeshReadiness && m_diagnosticMeshReadiness->status == result.status &&
+        m_diagnosticMeshReadiness->message == result.message && m_diagnosticMeshReadiness->published == result.published)
+    {
+        return;
+    }
+
+    m_diagnosticMeshReadiness = result;
+    const char* status = "Failed";
+
+    switch (result.status)
+    {
+    case MeshResidencyPublication::Status::Ready: status = "Ready"; break;
+    case MeshResidencyPublication::Status::Retry: status = "Retry"; break;
+    case MeshResidencyPublication::Status::Stale: status = "Stale"; break;
+    case MeshResidencyPublication::Status::Unsupported: status = "Unsupported"; break;
+    case MeshResidencyPublication::Status::Failed: break;
+    }
+
+    if (result.published)
+    {
+        Log::Info("Mesh residency: residency published successfully.");
+        return;
+    }
+
+    Log::Info("Mesh residency readiness " + std::string(status) + ": " + result.message);
+}
+
+void Engine::AdvanceDiagnosticMeshPreparation()
+{
+    if (!m_diagnosticCPUPreparation)
+    {
+        return;
+    }
+
+    try
+    {
+        auto* scene = dynamic_cast<FileBackedDemoScene*>(m_demoSceneManager.TryGetActiveScene());
+        const auto& request = *m_diagnosticCPUPreparation;
+        const auto& saved = request.selection;
+        std::string error;
+
+        if (!scene || scene->GetRuntimeIdentity() != saved.runtimeIdentity ||
+            m_renderer.GetMaterialTableIdentity() != m_diagnosticRendererLifetime ||
+            m_demoSceneManager.HasPendingSceneChange() || request.generation != m_meshPreparation.Generation())
+        {
+            RejectMeshResidencyRequest("Asynchronous mesh preparation canceled: scene/subscriber or renderer lifetime is stale.",
+                MeshResidencyPublication::Status::Stale);
+            return;
+        }
+
+        const auto current = scene->GetObjectMetadata(saved.objectID, &error);
+
+        if (!current || current->runtimeIdentity != saved.runtimeIdentity || current->sceneID != saved.sceneID ||
+            current->runtimeIndex != saved.runtimeIndex || current->structureRevision != saved.structureRevision ||
+            current->meshReference != saved.meshReference || current->bindingRevision != saved.bindingRevision ||
+            current->materialReference != saved.materialReference || current->materialSlotBindings != saved.materialSlotBindings ||
+            current->GetMeshResidency(scene->GetScene().GetRenderObjects()[current->runtimeIndex]) != SceneMeshResidency::Pending)
+        {
+            RejectMeshResidencyRequest("Asynchronous mesh preparation canceled: object identity or authored bindings changed. " + error,
+                MeshResidencyPublication::Status::Stale);
+            return;
+        }
+
+        if (!request.completion)
+        {
+            auto completion = m_meshPreparation.Poll(request.ticket, ProjectPaths(scene->GetProjectRoot()),
+                m_projectAssetRegistry, m_meshCPUCache);
+
+            if (completion.status == ProjectMeshPreparationService::Status::Pending ||
+                completion.status == ProjectMeshPreparationService::Status::Retry)
+            {
+                if (!completion.error.empty())
+                {
+                    LogMeshResidencyDiagnostic({MeshResidencyPublication::Status::Retry, completion.error});
+                }
+
+                return;
+            }
+
+            if (completion.status != ProjectMeshPreparationService::Status::Available ||
+                !m_meshPreparation.IsCurrent(completion))
+            {
+                const char* outcome = completion.status == ProjectMeshPreparationService::Status::Canceled ? "canceled" :
+                    completion.status == ProjectMeshPreparationService::Status::Stale || !m_meshPreparation.IsCurrent(completion) ?
+                        "stale" : "failed";
+                RejectMeshResidencyRequest("Asynchronous mesh preparation " + std::string(outcome) + ": " + completion.error,
+                    completion.status == ProjectMeshPreparationService::Status::Stale ||
+                    completion.status == ProjectMeshPreparationService::Status::Canceled ?
+                        MeshResidencyPublication::Status::Stale : MeshResidencyPublication::Status::Failed);
+                return;
+            }
+
+            Log::Info(completion.cacheHit ? "Asynchronous mesh preparation: verified CPU cache hit." :
+                "Asynchronous mesh preparation: background FBX import completed.");
+            m_diagnosticCPUPreparation->completion.emplace(std::move(completion));
+        }
+
+        // Keep one immutable completion while the renderer boundary is busy;
+        // never poll an already-delivered ticket or upload the same result twice.
+        if (!MeshResidencyPublication::CanPrepareGeometry(m_renderer, *scene->m_runtime) ||
+            m_pendingMaterialAssignment || m_pendingEditorSceneOperation)
+        {
+            LogMeshResidencyDiagnostic({MeshResidencyPublication::Status::Retry,
+                "Prepared CPU geometry awaits a safe main-thread GPU preparation boundary."});
+            return;
+        }
+
+        auto& completion = *m_diagnosticCPUPreparation->completion;
+
+        if (!m_meshPreparation.IsCurrent(completion) ||
+            completion.identity.assetID != AssetID::ParseReference(saved.meshReference)->ToString())
+        {
+            RejectMeshResidencyRequest("Asynchronous mesh preparation completion became stale before consumption.",
+                MeshResidencyPublication::Status::Stale);
+            return;
+        }
+
+        if (!m_meshPreparation.IntegrateCache(completion, m_meshCPUCache, error))
+        {
+            RejectMeshResidencyRequest("Asynchronous mesh preparation cache integration failed: " + error);
+            return;
+        }
+
+        Log::Info("Active scene bindings match CPU completion; starting synchronous source validation/GPU geometry preparation.");
+        const auto uploadStart = std::chrono::steady_clock::now();
+        Mesh* mesh = scene->m_assets.ResolvePreparedMesh(saved.meshReference, completion, &error);
+
+        if (!mesh)
+        {
+            RejectMeshResidencyRequest("Prepared geometry source validation/GPU preparation failed: " + error);
+            return;
+        }
+
+        const auto milliseconds = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - uploadStart).count();
+        Log::Info("Synchronous GPU geometry preparation/source validation completed in " +
+            std::to_string(milliseconds) + " ms.");
+        const auto candidate = scene->m_assets.DescribeMeshResidencyCandidate(saved.meshReference, *mesh, &error);
+
+        if (!candidate)
+        {
+            RejectMeshResidencyRequest("Asynchronous residency geometry validation failed: " + error);
+            return;
+        }
+
+        m_diagnosticMeshToken = scene->m_runtime->PrepareMeshResidency(*current, scene->m_assets, *candidate, &error);
+
+        if (!m_diagnosticMeshToken)
+        {
+            RejectMeshResidencyRequest("Asynchronous residency scene preparation rejected: " + error);
+            return;
+        }
+
+        // Catalog/cache now retain geometry. CPU subscription no longer owns
+        // publication authority; the existing scene token/coordinator takes over.
+        m_meshPreparation.Cancel(request.ticket);
+        m_diagnosticCPUPreparation.reset();
+        m_diagnosticMeshReadiness.reset();
+        Log::Info("Prepared geometry accepted by active scene: residency token ready for existing renderer coordinator.");
+    }
+    catch (const std::exception& exception)
+    {
+        RejectMeshResidencyRequest("Asynchronous residency completion processing failed: " + std::string(exception.what()),
+            MeshResidencyPublication::Status::Retry);
+    }
+}
+
+bool Engine::BeginMeshResidencyRequest(const SceneObjectMetadata& selection, bool automatic)
+{
+    auto* scene = dynamic_cast<FileBackedDemoScene*>(m_demoSceneManager.TryGetActiveScene());
+
+    if (!scene || m_diagnosticCPUPreparation || m_diagnosticMeshToken || m_meshResidencyPublication.HasCandidate())
+    {
+        return false;
+    }
+
+    try
+    {
+        m_residencyRequestSelection = selection;
+        m_residencyRequestAutomatic = automatic;
+        m_residencyRequestSourceIdentity = GetMeshSourceIdentity(selection);
+
+        const auto kind = FileSceneAssetCatalog::ClassifyMeshReference(selection.meshReference);
+
+        if (kind == FileSceneAssetCatalog::MeshReferenceKind::UnknownBuiltin ||
+            kind == FileSceneAssetCatalog::MeshReferenceKind::Invalid)
+        {
+            RejectMeshResidencyRequest((kind == FileSceneAssetCatalog::MeshReferenceKind::UnknownBuiltin ?
+                "Unsupported primitive reference: " : "Invalid authored mesh reference: ") + selection.meshReference,
+                MeshResidencyPublication::Status::Unsupported);
+            return false;
+        }
+
+        if (kind == FileSceneAssetCatalog::MeshReferenceKind::Builtin)
+        {
+            if (!MeshResidencyPublication::CanPrepareGeometry(m_renderer, *scene->m_runtime))
+            {
+                RejectMeshResidencyRequest("Built-in geometry preparation requires an idle renderer boundary.",
+                    MeshResidencyPublication::Status::Retry);
+                return false;
+            }
+
+            Log::Info("Built-in primitive residency requested: " + selection.meshReference);
+            Mesh* mesh = scene->m_assets.ResolveMesh(selection.meshReference);
+            std::string error;
+            const auto candidate = mesh ? scene->m_assets.DescribeMeshResidencyCandidate(
+                selection.meshReference, *mesh, &error) : std::nullopt;
+
+            if (!candidate)
+            {
+                RejectMeshResidencyRequest("Built-in geometry validation failed: " + error);
+                return false;
+            }
+
+            Log::Info("Built-in geometry prepared: existing catalog primitive GPU geometry reused.");
+            m_diagnosticMeshToken = scene->m_runtime->PrepareMeshResidency(selection, scene->m_assets, *candidate, &error);
+
+            if (!m_diagnosticMeshToken)
+            {
+                RejectMeshResidencyRequest("Built-in scene residency preparation failed: " + error);
+                return false;
+            }
+
+            m_diagnosticRendererLifetime = m_renderer.GetMaterialTableIdentity();
+            m_diagnosticMeshReadiness.reset();
+            Log::Info("Built-in residency token accepted; handing off to existing renderer coordinator.");
+            return true;
+        }
+
+        const auto asset = AssetID::ParseReference(selection.meshReference);
+        m_diagnosticCPUPreparation.emplace();
+        m_diagnosticCPUPreparation->selection = selection;
+        m_diagnosticCPUPreparation->generation = m_meshPreparation.Generation();
+        m_diagnosticRendererLifetime = m_renderer.GetMaterialTableIdentity();
+        m_diagnosticMeshReadiness.reset();
+
+        const auto request = m_meshPreparation.Request(ProjectPaths(scene->GetProjectRoot()), m_projectAssetRegistry,
+            *asset, m_diagnosticCPUPreparation->generation);
+        m_diagnosticCPUPreparation->ticket = request.ticket;
+
+        if (request.status != ProjectMeshPreparationService::Status::Accepted &&
+            request.status != ProjectMeshPreparationService::Status::Available)
+        {
+            const auto status = request.status == ProjectMeshPreparationService::Status::Retry ||
+                request.error.find("Cannot pin") != std::string::npos ? MeshResidencyPublication::Status::Retry :
+                    MeshResidencyPublication::Status::Unsupported;
+            RejectMeshResidencyRequest("Asynchronous mesh preparation request rejected: " + request.error, status);
+            return false;
+        }
+
+        Log::Info("Asynchronous mesh preparation requested: object " + selection.objectID + ", mesh " +
+            selection.meshReference + "; worker source validation/cache lookup scheduled.");
+        return true;
+    }
+    catch (const std::exception& exception)
+    {
+        RejectMeshResidencyRequest("Mesh residency request allocation/preparation failed: " + std::string(exception.what()),
+            MeshResidencyPublication::Status::Retry);
+        return false;
+    }
+}
+
+std::string Engine::GetMeshSourceIdentity(const SceneObjectMetadata& selection) const
+{
+    const auto* scene = dynamic_cast<const FileBackedDemoScene*>(m_demoSceneManager.TryGetActiveScene());
+
+    if (!scene)
+    {
+        return {};
+    }
+
+    try
+    {
+        const auto asset = AssetID::ParseReference(selection.meshReference);
+
+        if (!asset)
+        {
+            return {};
+        }
+
+        const auto resolved = ProjectAssetResolver::Resolve(ProjectPaths(scene->GetProjectRoot()), m_projectAssetRegistry, *asset);
+
+        if (resolved.status != AssetAvailability::Available)
+        {
+            return {};
+        }
+
+        return ProjectMeshPreparationService::InspectSourceIdentity(resolved.resolvedPath);
+    }
+    catch (const std::exception&)
+    {
+        return {};
+    }
+}
+
+void Engine::OnFileSceneActivated(std::chrono::steady_clock::time_point started)
+{
+    auto* scene = dynamic_cast<FileBackedDemoScene*>(m_demoSceneManager.TryGetActiveScene());
+
+    if (!scene)
+    {
+        return;
+    }
+
+    if (m_automaticResidencyIntent)
+    {
+        Log::Info("Automatic mesh residency session " + std::to_string(m_automaticResidencyIntent) +
+            " superseded by scene activation; old requests canceled, session counters discarded.");
+    }
+
+    m_automaticMeshResidency = {};
+    m_automaticResidencyIntent = 0;
+    scene->m_assets.BeginTextureStreaming();
+
+    size_t authored = 0;
+
+    for (const auto& object : scene->m_runtime->GetFileScene().GetDocument().objects)
+    {
+        if (!object.meshReference.empty())
+        {
+            ++authored;
+        }
+    }
+
+    const auto& objects = scene->GetScene().GetRenderObjects();
+    const auto resident = static_cast<size_t>(std::count_if(objects.begin(), objects.end(), [](const auto& object)
+    {
+        return object.mesh != nullptr;
+    }));
+
+    const auto elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+    Log::Info(std::string("File scene activation: mode=") +
+        (scene->IsMetadataOnlyActivation() ? "metadata-first" : "synchronous-full Debug diagnostic") +
+        ", session=" + std::to_string(scene->GetRuntimeIdentity()) + ", activation elapsed=" +
+        std::to_string(elapsed) + " ms, authored mesh objects=" + std::to_string(authored) +
+        ", initially resident=" + std::to_string(resident) + ", pending=" + std::to_string(authored - resident) +
+        "; mesh and texture settlement reported separately.");
+
+    if (scene->IsMetadataOnlyActivation())
+    {
+        StartAutomaticMeshResidency();
+    }
+}
+
+void Engine::StartAutomaticMeshResidency()
+{
+    const auto* scene = dynamic_cast<const FileBackedDemoScene*>(m_demoSceneManager.TryGetActiveScene());
+
+    if (!scene || !scene->IsMetadataOnlyActivation())
+    {
+        return;
+    }
+
+    m_automaticMeshResidency = {};
+    auto& scheduler = m_automaticMeshResidency;
+    scheduler.enabled = true;
+    scheduler.runtimeIdentity = scene->GetRuntimeIdentity();
+    scheduler.structureRevision = scene->GetScene().GetStructureRevision();
+
+    scheduler.activated = std::chrono::steady_clock::now();
+    scheduler.retryAfter = scheduler.activated;
+    const auto& objects = scene->m_runtime->GetFileScene().GetDocument().objects;
+    const auto& mapping = scene->m_runtime->GetObjectMapping();
+    const auto& runtime = scene->GetScene().GetRenderObjects();
+
+    for (const auto& object : objects)
+    {
+        if (object.meshReference.empty())
+        {
+            continue;
+        }
+
+        const auto found = mapping.idToRuntimeIndex.find(object.id);
+
+        if (found == mapping.idToRuntimeIndex.end() || found->second >= runtime.size())
+        {
+            scheduler.enabled = false;
+            Log::Warning("Automatic mesh residency discovery rejected an inconsistent committed object mapping.");
+            return;
+        }
+
+        if (runtime[found->second].mesh)
+        {
+            ++scheduler.initiallyResident;
+        }
+        else
+        {
+            ++scheduler.eligible;
+        }
+    }
+
+    // Set intent only for this explicitly enabled and committed session.
+    m_automaticResidencyIntent = scheduler.runtimeIdentity;
+    Log::Info("Automatic mesh residency enabled: session=" + std::to_string(scheduler.runtimeIdentity) +
+        ", eligible pending=" + std::to_string(scheduler.eligible) + ", already resident=" +
+        std::to_string(scheduler.initiallyResident) + "; one outstanding CPU/publication request.");
+}
+
+void Engine::ContinueAutomaticMeshResidencyAfterReplacement(std::uint64_t previousRuntimeIdentity) noexcept
+{
+    if (!previousRuntimeIdentity || m_automaticResidencyIntent != previousRuntimeIdentity)
+    {
+        return; // A synchronous/manual scene never gains automatic intent from pending objects.
+    }
+
+    auto* scene = dynamic_cast<FileBackedDemoScene*>(m_demoSceneManager.TryGetActiveScene());
+
+    if (!scene || m_state != EngineState::Running || m_demoSceneManager.HasPendingSceneChange() ||
+        !scene->IsMetadataOnlyActivation() || !m_renderer.CanEditPendingMaterialBindings(scene->GetScene()))
+    {
+        return; // Never schedule against an uncommitted/failed renderer or during shutdown.
+    }
+
+    try
+    {
+        if (scene->GetRuntimeIdentity() == previousRuntimeIdentity)
+        {
+            Log::Info("Automatic mesh residency: editor replacement failed; old session " +
+                std::to_string(previousRuntimeIdentity) + " restored with fresh-request retry state retained.");
+            return;
+        }
+
+        Log::Info("Automatic mesh residency session " + std::to_string(previousRuntimeIdentity) +
+            " superseded by editor replacement; old requests canceled, counters/failure generations discarded.");
+        StartAutomaticMeshResidency();
+        // Rebuild bounded failure state rather than reconciling old epochs. A
+        // conservative cooldown prevents immediate repeated imports after edits.
+        m_automaticMeshResidency.retryAfter = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    }
+    catch (const std::exception&)
+    {
+        // Scheduler bookkeeping must not turn a committed editor transaction
+        // into a reported scene-replacement failure. The active scene stays valid.
+        m_automaticMeshResidency.enabled = false;
+        m_automaticResidencyIntent = scene->GetRuntimeIdentity();
+    }
+}
+
+void Engine::FinishAutomaticMeshResidency(MeshResidencyPublication::Status status)
+{
+    auto& scheduler = m_automaticMeshResidency;
+
+    if (status == MeshResidencyPublication::Status::Ready && scheduler.enabled && m_residencyRequestSelection &&
+        m_residencyRequestSelection->runtimeIdentity == scheduler.runtimeIdentity)
+    {
+        ++scheduler.published;
+        std::erase_if(scheduler.failures, [&](const auto& failure)
+        {
+            return failure.selection.objectID == m_residencyRequestSelection->objectID;
+        });
+        scheduler.backpressure.clear();
+        m_residencyRequestAutomatic = false;
+        return;
+    }
+
+    if (!m_residencyRequestAutomatic)
+    {
+        return;
+    }
+
+    m_residencyRequestAutomatic = false;
+
+    if (status == MeshResidencyPublication::Status::Ready)
+    {
+        return;
+    }
+
+    if (status == MeshResidencyPublication::Status::Failed || status == MeshResidencyPublication::Status::Unsupported)
+    {
+        if (m_residencyRequestSelection)
+        {
+            try
+            {
+                std::erase_if(scheduler.failures, [&](const auto& failure)
+                {
+                    return failure.selection.objectID == m_residencyRequestSelection->objectID;
+                });
+
+                if (scheduler.failures.size() < 4096)
+                {
+                    scheduler.failures.push_back({*m_residencyRequestSelection, m_residencyRequestSourceIdentity});
+                }
+                else
+                {
+                    scheduler.enabled = false;
+                }
+            }
+            catch (const std::exception&)
+            {
+                scheduler.enabled = false; // Cannot track failures safely; never spin/reimport.
+            }
+        }
+
+        return;
+    }
+
+    if (status == MeshResidencyPublication::Status::Stale)
+    {
+        ++scheduler.stale;
+    }
+
+    if (m_residencyRequestSelection)
+    {
+        scheduler.cursor = (std::min)(scheduler.cursor, m_residencyRequestSelection->runtimeIndex);
+    }
+
+    scheduler.retryAfter = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+}
+
+void Engine::RejectMeshResidencyRequest(const std::string& message, MeshResidencyPublication::Status status)
+{
+    // Existing low-level APIs report certain temporary failures through strings.
+    // Keep these retryable rather than poisoning this object's binding generation.
+    if (message.find("Cannot pin") != std::string::npos || message.find("Cannot lock") != std::string::npos ||
+        message.find("cannot lock") != std::string::npos || message.find("allocation") != std::string::npos ||
+        message.find("capacity") != std::string::npos || message.find("Deferred:") != std::string::npos ||
+        message.find("outstanding candidate") != std::string::npos)
+    {
+        status = MeshResidencyPublication::Status::Retry;
+    }
+
+    auto& scheduler = m_automaticMeshResidency;
+
+    if (!m_residencyRequestAutomatic || status != MeshResidencyPublication::Status::Retry || scheduler.backpressure != message)
+    {
+        Log::Warning((status == MeshResidencyPublication::Status::Retry ? "Mesh residency retryable backpressure: " :
+            status == MeshResidencyPublication::Status::Stale ? "Mesh residency stale invalidation: " :
+                "Mesh residency terminal failure: ") + message);
+    }
+
+    if (m_residencyRequestAutomatic && status == MeshResidencyPublication::Status::Retry)
+    {
+        scheduler.backpressure = message;
+    }
+
+    FinishAutomaticMeshResidency(status);
+    CancelMeshResidencyAcceptance();
+}
+
+void Engine::AdvanceAutomaticMeshResidency()
+{
+    auto& scheduler = m_automaticMeshResidency;
+
+    if (!scheduler.enabled)
+    {
+        return;
+    }
+
+    auto* scene = dynamic_cast<FileBackedDemoScene*>(m_demoSceneManager.TryGetActiveScene());
+
+    if (!scene || !scene->IsMetadataOnlyActivation() || scene->GetRuntimeIdentity() != scheduler.runtimeIdentity)
+    {
+        scheduler = {};
+        return;
+    }
+
+    if (m_diagnosticCPUPreparation || m_diagnosticMeshToken || m_meshResidencyPublication.HasCandidate() ||
+        m_pendingEditorSceneOperation || m_pendingMaterialAssignment || m_demoSceneManager.HasPendingSceneChange() ||
+        !MeshResidencyPublication::CanPrepareGeometry(m_renderer, *scene->m_runtime))
+    {
+        return;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+
+    if (now < scheduler.retryAfter)
+    {
+        return;
+    }
+
+    const auto& objects = scene->GetScene().GetRenderObjects();
+    const auto revision = scene->GetScene().GetStructureRevision();
+
+    if (revision != scheduler.structureRevision)
+    {
+        scheduler.cursor = 0;
+        scheduler.settled = false;
+        scheduler.structureRevision = revision;
+        scheduler.failures.clear();
+        const auto& authored = scene->m_runtime->GetFileScene().GetDocument().objects;
+        scheduler.eligible = std::count_if(authored.begin(), authored.end(), [](const auto& object)
+        {
+            return !object.meshReference.empty();
+        });
+    }
+
+    if (objects.size() > 4096)
+    {
+        Log::Warning("Automatic mesh residency stopped: scene exceeds the 4096-object candidate/scheduler bound.");
+        scheduler.enabled = false;
+        return;
+    }
+
+    // Scan cheap resident indices in bounded batches. At most one validated
+    // pending-object lookup/submission per frame; no repeated all-scene snapshot.
+    for (size_t scanned = 0; scanned < 32 && scheduler.cursor < objects.size(); ++scanned)
+    {
+        const auto index = scheduler.cursor++;
+
+        if (objects[index].mesh)
+        {
+            continue;
+        }
+
+        std::string error;
+        const auto selection = scene->GetObjectMetadata(index, &error);
+
+        if (!selection)
+        {
+            const auto message = "Automatic discovery metadata is unavailable: " + error;
+
+            if (scheduler.backpressure != message)
+            {
+                Log::Warning(message);
+                scheduler.backpressure = message;
+            }
+
+            scheduler.cursor = index;
+            scheduler.retryAfter = now + std::chrono::seconds(1);
+            return;
+        }
+
+        if (selection->meshReference.empty())
+        {
+            return; // Bound metadata validation to one object per frame.
+        }
+
+        const auto failure = std::find_if(scheduler.failures.begin(), scheduler.failures.end(), [&](const auto& saved)
+        {
+            const auto& binding = saved.selection;
+            return binding.objectID == selection->objectID && binding.runtimeIndex == selection->runtimeIndex &&
+                binding.bindingRevision == selection->bindingRevision && binding.meshReference == selection->meshReference &&
+                binding.materialReference == selection->materialReference && binding.materialSlotBindings == selection->materialSlotBindings;
+        });
+
+        if (failure != scheduler.failures.end() && failure->sourceIdentity == GetMeshSourceIdentity(*selection))
+        {
+            return; // Terminal for this source/binding; next frame advances the cursor.
+        }
+
+        std::erase_if(scheduler.failures, [&](const auto& saved)
+        {
+            return saved.selection.objectID == selection->objectID;
+        });
+        scheduler.settled = false;
+        BeginMeshResidencyRequest(*selection, true);
+        return;
+    }
+
+    if (scheduler.cursor < objects.size())
+    {
+        return;
+    }
+
+    if (!scheduler.settled)
+    {
+        const auto elapsed = std::chrono::duration<double, std::milli>(now - scheduler.activated).count();
+        Log::Info("Automatic mesh residency settled: session=" + std::to_string(scheduler.runtimeIdentity) +
+            ", eligible=" + std::to_string(scheduler.eligible) +
+            ", published=" + std::to_string(scheduler.published) + ", already-resident=" + std::to_string(scheduler.initiallyResident) +
+            ", terminal failures=" + std::to_string(scheduler.failures.size()) + ", canceled/stale=" +
+            std::to_string(scheduler.stale) + ", outstanding=0, elapsed=" + std::to_string(elapsed) + " ms.");
+        scheduler.settled = true;
+    }
+
+    // Low-frequency discovery resumes to notice binding/source changes after
+    // settlement. No import retry occurs for an unchanged recorded failure.
+    scheduler.cursor = 0;
+    scheduler.retryAfter = now + std::chrono::seconds(1);
 }

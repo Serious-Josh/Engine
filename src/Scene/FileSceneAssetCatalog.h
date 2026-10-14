@@ -1,10 +1,15 @@
 #pragma once
 
+#include "assets/ProjectMeshPreparationService.h"
+
 #include "Scene/SceneAssetResolver.h"
+#include "Scene/SceneObjectResolver.h"
 #include "assets/AssetID.h"
 #include "assets/MaterialAssetData.h"
 #include "assets/ImportedMesh.h"
 #include "assets/ModelImporter.h"
+#include "assets/ProjectMeshCPUCache.h"
+#include "Scene/MeshResidency.h"
 
 #include "Renderer/Material.h"
 #include "Renderer/Mesh.h"
@@ -12,6 +17,7 @@
 #include "Renderer/VertexLayout.h"
 #include "Renderer/Texture.h"
 #include "Renderer/ProjectTextureLoader.h"
+#include "assets/ProjectTexturePreparationService.h"
 
 #include <filesystem>
 #include <functional>
@@ -23,6 +29,10 @@
 #include <tuple>
 #include <string_view>
 #include <vector>
+#include <chrono>
+
+class Scene;
+struct PreparedScene;
 
 class ResourceUploader;
 class DescriptorHeap;
@@ -80,14 +90,54 @@ public:
 
     // Configure after Initialize; Engine owns the registry and outlives this catalog.
     void SetProjectAssets(const ProjectPaths& paths, const ProjectAssetRegistry& registry);
+    void SetMeshCPUCache(ProjectMeshCPUCache* cache) noexcept { m_meshCPUCache = cache; }
+    void SetTextureStreamingEnabled(bool enabled) noexcept { m_textureStreamingEnabled = enabled; }
+    void BeginTextureStreaming();
+    // Active scene only, on the Engine thread before command recording.
+    void AdvanceTextureStreaming(ProjectTexturePreparationService& preparation, Renderer& renderer,
+        std::uint64_t runtimeIdentity, const Scene& scene,
+        const std::function<bool(const AssetID&, const MaterialAssetData&)>& mayPublish);
+    void CancelTextureStreaming();
     const std::string& GetLastMaterialError() const noexcept
     {
         return m_materialError;
     }
 
+    enum class MeshReferenceKind { RegisteredAsset, Builtin, UnknownBuiltin, Invalid };
+    static MeshReferenceKind ClassifyMeshReference(std::string_view reference);
+
     // Synchronous loading outside active recording. Borrows remain stable until Shutdown.
     // Changed source content requires a scene reload; live geometry is never replaced.
     Mesh* ResolveMesh(std::string_view reference) override;
+    // Editor mutation only: reuses upload-complete catalog geometry, never imports.
+    bool PrepareEditorObject(const SceneObjectDocument& authored, ResolvedSceneObject& object,
+        std::string* errorMessage);
+    Mesh* FindRetainedMesh(std::string_view reference);
+    const MeshMetadata* FindRetainedSlotMetadata(std::string_view reference) const;
+    Material* FindRetainedMaterial(std::string_view reference);
+    bool ValidateEditorBindings(const SceneDocument& document, PreparedScene& prepared,
+        std::string* errorMessage);
+    // Main-thread only, outside renderer recording. Revalidates source then
+    // synchronously uploads immutable worker buffers; never imports FBX.
+    Mesh* ResolvePreparedMesh(std::string_view reference,
+        const ProjectMeshPreparationService::Completion& completion, std::string* errorMessage);
+    // Existing upload-complete project mesh only; never imports or uploads.
+    std::optional<MeshResidencyCandidate> DescribeMeshResidencyCandidate(std::string_view reference,
+        const Mesh& mesh, std::string* errorMessage = nullptr) const;
+    MeshResidencySourceLock ValidateMeshResidencyCandidate(const MeshResidencyCandidate& candidate,
+        std::string_view reference, std::string* errorMessage = nullptr) const;
+    // Validation only: never loads material files/textures or submits GPU work.
+    bool ValidateRetainedResidencyMaterial(std::string_view reference, const Material* material,
+        std::string* errorMessage = nullptr) const;
+    Material* ResolveResidencyMaterial(std::string_view reference, Material* retained,
+        std::string* errorMessage = nullptr);
+    // Reference/type/canonical containment checks only. Does not hash, import,
+    // consult the CPU mesh cache, or allocate a project GPU mesh.
+    bool ValidateMetadataMeshReference(std::string_view reference, std::string* errorMessage) const;
+    bool ValidateMetadataMaterialReference(std::string_view reference, std::string* errorMessage) const;
+    // Requires the existing fallback-texture policy, so metadata preparation cannot
+    // accidentally enter synchronous texture decode/upload through a direct caller.
+    Material* ResolveMetadataMaterial(std::string_view reference);
     const std::string& GetLastMeshError() const noexcept
     {
         return m_meshError;
@@ -140,9 +190,11 @@ public:
     }
 
 private:
+    Mesh* CreateProjectMesh(const ProjectMeshCPUCache::Key& key,
+        std::shared_ptr<const ImportedMesh> geometry);
     struct MeshAsset
     {
-        ImportedMesh geometry;
+        std::shared_ptr<const ImportedMesh> geometry;
 
         Mesh mesh;
 
@@ -151,9 +203,11 @@ private:
     };
 
     // Path is intentionally absent: a rename with unchanged bytes preserves the borrow.
-    using MeshCacheKey = std::tuple<std::filesystem::path, std::string, std::string, std::uint32_t>;
+    using MeshCacheKey = ProjectMeshCPUCache::Key;
     static constexpr std::uint32_t kMeshImportRevision = ModelImporter::kImportRevision;
     std::map<MeshCacheKey, std::unique_ptr<MeshAsset>> m_projectMeshes;
+
+    ProjectMeshCPUCache* m_meshCPUCache = nullptr; // Engine-owned; CPU-only, outlives catalogs.
 
     std::string m_meshError;
 
@@ -253,7 +307,74 @@ private:
 
     std::map<MaterialCacheKey, MaterialAssetData> m_materialSources;
 
+    // Ordinary material binding revisions change only on saved texture publication.
+    std::map<MaterialCacheKey, std::uint64_t> m_materialBindingRevisions;
+
     using TextureCacheKey = std::tuple<std::filesystem::path, std::string, ProjectTextureInterpretation>;
+
+    struct StreamingBinding
+    {
+        MaterialCacheKey material;
+        size_t slot = 0;
+        std::uint64_t revision = 0;
+    };
+    struct StreamingTexture
+    {
+        enum class Phase { Requested, Preparing, CPUReady, Uploading, Ready, Resident, Failed, Superseded };
+        Phase phase = Phase::Requested;
+
+        std::vector<StreamingBinding> bindings;
+
+        std::optional<ProjectTexturePreparationService::Completion> completion;
+
+        std::unique_ptr<LiveTexture> uploaded;
+
+        std::uint64_t cpuTicket = 0;
+        std::uint64_t gpuTicket = 0;
+
+        std::chrono::steady_clock::time_point retryAfter;
+    };
+    struct StreamingStatistics
+    {
+        size_t submitted = 0;
+        size_t deduplicated = 0;
+        size_t deferred = 0;
+        size_t cpuCompleted = 0;
+        size_t cpuFailed = 0;
+        size_t gpuCompleted = 0;
+        size_t failed = 0;
+        size_t publications = 0;
+        size_t diagnostics = 0;
+    };
+    static constexpr size_t kStreamingTextureCapacity = 256;
+    std::map<TextureCacheKey, StreamingTexture> m_streamingTextures;
+    StreamingStatistics m_streamingStatistics;
+
+    std::chrono::steady_clock::time_point m_streamingActivated;
+
+    ProjectTexturePreparationService* m_texturePreparation = nullptr;
+    Renderer* m_textureRenderer = nullptr;
+
+    std::uint64_t m_streamingRuntime = 0;
+    std::uint64_t m_streamingTable = 0;
+    std::uint64_t m_streamingGeneration = 0;
+
+    size_t m_streamingCursor = 0;
+
+    bool m_textureStreamingEnabled = false;
+    bool m_streamingReported = false;
+
+    void QueueMaterialTextures(const MaterialCacheKey& key, const MaterialAssetData& data);
+    bool IsCurrentStreamingBinding(const StreamingBinding& binding, const TextureCacheKey& texture,
+        const Scene& scene) const;
+    void ResetStreamingTexture(StreamingTexture& texture);
+    void FailStreamingTexture(StreamingTexture& texture, const std::string& error);
+    TextureSource ValidateStreamingSource(const TextureCacheKey& key, const StreamingTexture& texture) const;
+    void AdvanceStreamingTexture(const TextureCacheKey& key, StreamingTexture& texture, const Scene& scene,
+        const std::function<bool(const AssetID&, const MaterialAssetData&)>& mayPublish);
+    bool PublishStreamingTexture(const TextureCacheKey& key, StreamingTexture& texture, const Scene& scene,
+        const std::function<bool(const AssetID&, const MaterialAssetData&)>& mayPublish);
+    void ReportTextureStreaming();
 
     std::map<TextureCacheKey, Texture> m_projectTextures;
 

@@ -69,6 +69,10 @@ class CommandContext
         return m_lastSubmissionFence;
     }
 
+    // Provenance for borrowed fence values owned by scene-lifetime consumers.
+    // Such consumers must be cleared by checked teardown before context reset.
+    uint64_t GetSubmissionLifetime() const { return m_submissionLifetime; }
+
     uint64_t GetFrameFenceValue(unsigned int frameIndex) const;
 
     // Single-threaded, like submission. Capture immediately after successful

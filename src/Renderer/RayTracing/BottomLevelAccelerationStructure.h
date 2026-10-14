@@ -47,6 +47,8 @@ class BottomLevelAccelerationStructure
     void Shutdown();
 
     D3D12_GPU_VIRTUAL_ADDRESS GetGPUAddress() const;
+    // Borrow for independent candidate lifetime pinning; registry retains ownership.
+    ID3D12Resource* GetResource() const { return m_resource; }
 
     private:
     ID3D12Resource* m_resource = nullptr;

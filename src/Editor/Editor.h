@@ -4,6 +4,7 @@
 #include "AssetBrowser.h"
 #include "EditorWorkspace.h"
 #include "InspectorPanel.h"
+#include "SceneHierarchyPanel.h"
 #include "Scene/FileSceneAssetCatalog.h"
 
 #include <cstddef>
@@ -246,7 +247,10 @@ private:
     std::uint64_t m_meshDragRuntimeIdentity = 0;
     int m_meshDropDeliveryFrame = -1;
 
+    void DrawHierarchy(IDemoScene& scene, const std::string& activeSceneName);
     void DrawSceneObjectDeletionControls(IDemoScene& scene);
+    void DrawSceneObjectContextMenu(IDemoScene& scene);
+    void OpenSceneObjectContext(const IDemoScene& scene, const SceneObjectMetadata& target);
     void QueueSceneObjectDeletion(const IDemoScene& scene, const SceneObjectMetadata& selection);
     bool SceneObjectDeletionMatches(const IDemoScene& scene, const SceneObjectMetadata& selection) const;
     bool SceneObjectDeletionBlocked() const;
@@ -254,7 +258,8 @@ private:
     void FinishViewportRightClick(const IDemoScene& scene);
 
     std::optional<SceneObjectMetadata> m_viewportRightObject;
-    std::optional<SceneObjectMetadata> m_viewportContextObject;
+    std::optional<SceneObjectMetadata> m_sceneContextObject;
+    std::uint64_t m_sceneContextEpoch = 0;
     std::optional<SceneObjectMetadata> m_sceneObjectDeletionRequest;
     std::optional<SceneObjectMetadata> m_sceneObjectDeletionPending;
     std::optional<SceneObjectMetadata> m_sceneObjectDeletionStatusObject;
@@ -262,7 +267,7 @@ private:
 
     bool m_viewportRightGesture = false;
     bool m_viewportRightDragged = false;
-    bool m_openViewportContext = false;
+    bool m_openSceneContext = false;
 
     void DrawSceneViewport(
         std::uint64_t sceneTextureHandle,
@@ -332,6 +337,7 @@ private:
     AssetBrowser m_assetBrowser;
 
     EditorWorkspace m_workspace;
+    SceneHierarchyPanel m_hierarchyPanel;
 
     InspectorPanel m_inspectorPanel;
 
@@ -379,7 +385,36 @@ private:
         std::optional<std::string> selectionAfter;
         SceneHistorySession session;
     };
-    using SceneHistoryCommand = std::variant<TransformEdit, std::unique_ptr<ObjectDeletion>>;
+    struct RenameObject
+    {
+        SceneHistorySession session;
+        std::string objectID;
+        std::string before;
+        std::string after;
+    };
+    struct ReorderObjects
+    {
+        SceneHistorySession session;
+        std::vector<std::string> before;
+        std::vector<std::string> after;
+    };
+    void CommitObjectReorder(IDemoScene& scene, const HierarchyReorderRequest& request);
+    std::string m_reorderStatus;
+
+    struct RenameIntent
+    {
+        SceneHistorySession session;
+        SceneObjectMetadata target;
+    };
+    std::optional<RenameIntent> m_renameIntent;
+    std::string m_renameStatus;
+
+    void QueueObjectRename(const IDemoScene& scene, const SceneObjectMetadata& target);
+    void CancelObjectRename();
+    void CommitObjectRename(IDemoScene& scene, std::string name);
+    bool RenameIntentMatches(const IDemoScene& scene) const;
+    bool RenameSessionMatches(const IDemoScene& scene, const SceneHistorySession& session) const;
+    using SceneHistoryCommand = std::variant<TransformEdit, std::unique_ptr<ObjectDeletion>, std::unique_ptr<RenameObject>, std::unique_ptr<ReorderObjects>>;
     struct SceneHistoryEntry
     {
         SceneHistoryCommand command;
@@ -476,4 +511,6 @@ private:
     uint64_t m_selectionStructureRevision = 0;
 
     std::string m_selectionSceneName;
+    const Scene* m_selectionScene = nullptr;
+    std::uint64_t m_selectionRuntimeIdentity = 0;
 };

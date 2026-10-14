@@ -1,3 +1,4 @@
+#include "Scene/SceneSwitchTiming.h"
 #include "Renderer/ProjectTextureLoader.h"
 #include "Renderer/ResourceUploader.h"
 #include "Renderer/ImageLoader.h"
@@ -336,8 +337,13 @@ bool LoadProjectTexture(ID3D12Device* device, ResourceUploader& uploader, Descri
     Texture& texture, std::string* errorMessage)
 {
     PreparedProjectTexture prepared;
-    return PrepareProjectTexture(path, interpretation, prepared, errorMessage) &&
-        UploadPreparedProjectTexture(device, uploader, heap, prepared, texture, errorMessage);
+    return SceneSwitchTiming::MeasureCall(SceneSwitchTiming::Stage::TexturePreparation, [&]()
+    {
+        return PrepareProjectTexture(path, interpretation, prepared, errorMessage);
+    }) && SceneSwitchTiming::MeasureCall(SceneSwitchTiming::Stage::TextureUpload, [&]()
+    {
+        return UploadPreparedProjectTexture(device, uploader, heap, prepared, texture, errorMessage);
+    });
 }
 
 bool ValidatePreparedProjectTexture(const PreparedProjectTexture& prepared)

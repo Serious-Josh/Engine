@@ -23,6 +23,10 @@ class Scene
 
     void ClearRenderObjects();
 
+    // Inactive scenes only, after checked renderer release. Allocates dirty flags
+    // before mutation, then replaces CPU object storage without further allocation.
+    void ReplaceRenderObjects(std::vector<RenderObject> objects);
+
     void SetRenderObjectTransform(
         RenderObjectID id,
         const Transform& transform);

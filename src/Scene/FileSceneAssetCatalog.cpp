@@ -1,3 +1,5 @@
+#include "Scene/SceneSwitchTiming.h"
+#include "Scene/PreparedScene.h"
 #include "Scene/FileSceneAssetCatalog.h"
 #include "Scene/MaterialParameterPropagation.h"
 #include "Renderer/Renderer.h"
@@ -38,10 +40,12 @@ Mesh* FileSceneAssetCatalog::ResolveMesh(std::string_view reference)
         return fail("Mesh resolution requires an initialized catalog.");
     }
 
-    if (reference == "builtin:sphere")
+    if (ClassifyMeshReference(reference) == MeshReferenceKind::Builtin)
     {
         return &m_sphereMesh;
     }
+
+    SceneSwitchTiming::Measure validationTiming(SceneSwitchTiming::Stage::MeshValidation);
 
     if(!m_registry)
     {
@@ -113,12 +117,24 @@ Mesh* FileSceneAssetCatalog::ResolveMesh(std::string_view reference)
 
         MaterialThumbnailValidation validation;
         const auto digest = validation.Digest(resolved.resolvedPath);
+
+        if(SceneSwitchTiming::active)
+        {
+            ++SceneSwitchTiming::active->fullDigests;
+        }
+
         const auto projectIdentity = std::filesystem::canonical(paths.GetRoot());
-        const MeshCacheKey key{projectIdentity, id->ToString(), digest, kMeshImportRevision};
+        const MeshCacheKey key{projectIdentity, id->ToString(), digest, kMeshImportRevision, MeshUVOrientation::FlipV};
         const auto cached = m_projectMeshes.find(key);
+        validationTiming.Stop();
 
         if(cached != m_projectMeshes.end())
         {
+            if(SceneSwitchTiming::active)
+            {
+                ++SceneSwitchTiming::active->meshCacheHits;
+            }
+
             return &cached->second->mesh;
         }
 
@@ -131,40 +147,60 @@ Mesh* FileSceneAssetCatalog::ResolveMesh(std::string_view reference)
         }
 
         auto asset = std::make_unique<MeshAsset>();
-        asset->geometry = ModelImporter::LoadFlattened(resolved.resolvedPath, MeshUVOrientation::FlipV);
 
-        // Use a fresh hasher: equal size/timestamps must not conceal changed bytes.
-        MaterialThumbnailValidation verification;
-
-        if(verification.Digest(resolved.resolvedPath) != digest)
+        if(m_meshCPUCache)
         {
-            return fail("Mesh source changed during import; retry.");
+            asset->geometry = m_meshCPUCache->FindVerified(key);
+
+            if(SceneSwitchTiming::active)
+            {
+                if(asset->geometry)
+                {
+                    ++SceneSwitchTiming::active->cpuMeshCacheHits;
+                }
+                else
+                {
+                    ++SceneSwitchTiming::active->cpuMeshCacheMisses;
+                }
+            }
         }
 
-        const auto& geometry = asset->geometry;
-
-        if(!asset->mesh.Initialize(m_device, *m_uploader, *m_descriptorHeap,
-            geometry.vertices.data(), geometry.vertices.size(), m_vertexLayout,
-            geometry.indices.data(), geometry.indices.size()))
+        if(!asset->geometry)
         {
-            return fail("Failed to create mesh GPU buffers or descriptors for " + std::string(reference) + ".");
+            auto imported = SceneSwitchTiming::MeasureCall(SceneSwitchTiming::Stage::MeshImport, [&]()
+            {
+                return ModelImporter::LoadFlattened(resolved.resolvedPath, MeshUVOrientation::FlipV);
+            });
+
+            if(SceneSwitchTiming::active)
+            {
+                ++SceneSwitchTiming::active->imports;
+            }
+
+            // Fresh hasher: equal size/timestamps must not conceal changed bytes.
+            MaterialThumbnailValidation verification;
+            const auto verifiedDigest = SceneSwitchTiming::MeasureCall(SceneSwitchTiming::Stage::MeshValidation, [&]()
+            {
+                return verification.Digest(resolved.resolvedPath);
+            });
+
+            if(SceneSwitchTiming::active)
+            {
+                ++SceneSwitchTiming::active->fullDigests;
+            }
+
+            if(verifiedDigest != digest)
+            {
+                return fail("Mesh source changed during import; retry.");
+            }
+
+            // LoadFlattened validates metadata, indices and bounds before returning.
+            // The verified CPU output is reusable even if later GPU initialization fails.
+            asset->geometry = m_meshCPUCache ? m_meshCPUCache->StoreVerified(key, std::move(imported)) :
+                std::make_shared<const ImportedMesh>(std::move(imported));
         }
 
-        std::string metadataError;
-
-        if(!asset->mesh.SetMetadata(geometry.metadata, metadataError))
-        {
-            return fail("Imported mesh metadata is invalid: " + metadataError);
-        }
-
-        if(!asset->mesh.GetBounds().valid)
-        {
-            return fail("Uploaded mesh has invalid bounds.");
-        }
-
-        const auto inserted = m_projectMeshes.emplace(key, std::move(asset));
-        inserted.first->second->published = true;
-        return &inserted.first->second->mesh;
+        return CreateProjectMesh(key, std::move(asset->geometry));
     }
     catch(const std::exception& error)
     {
@@ -193,7 +229,7 @@ const ImportedMesh* FileSceneAssetCatalog::GetMeshGeometry(const Mesh& mesh) con
     {
         if(&asset->mesh == &mesh)
         {
-            return &asset->geometry;
+            return asset->geometry.get();
         }
     }
 
@@ -346,6 +382,25 @@ Material* FileSceneAssetCatalog::ResolveMaterialVersion(std::string_view referen
                 return true;
             }
 
+            if(m_textureStreamingEnabled && !fresh)
+            {
+                const auto textureID = AssetID::ParseReference(*textureReference);
+                const auto* textureRecord = textureID ? m_registry->Find(*textureID) : nullptr;
+                const auto resolution = textureID ? ProjectAssetResolver::Resolve(paths, *m_registry, *textureID) : AssetResolution{};
+
+                if(!textureRecord || textureRecord->type != AssetType::Texture ||
+                    resolution.status != AssetAvailability::Available)
+                {
+                    m_materialError = "Material texture reference is invalid, missing, inaccessible, or unsafe: " +
+                        *textureReference;
+                    return false;
+                }
+
+                // Keep white base color / absent optional maps. The authored references
+                // remain in MaterialAssetData, independent of these runtime bindings.
+                return true;
+            }
+
             Texture* texture = nullptr;
 
             if(version)
@@ -439,9 +494,17 @@ Material* FileSceneAssetCatalog::ResolveMaterialVersion(std::string_view referen
             return result;
         }
 
-        // Publish only after every dependency has a completed upload and valid SRV.
+        // Streaming catalogs publish stable material identity with valid fallbacks.
         m_materialSources.insert_or_assign(key, data);
-        return &m_projectMaterials.emplace(key, material).first->second;
+        auto* result = &m_projectMaterials.emplace(key, material).first->second;
+
+        if(m_textureStreamingEnabled)
+        {
+            m_materialBindingRevisions.try_emplace(key, 1);
+            QueueMaterialTextures(key, data);
+        }
+
+        return result;
     }
     catch(const std::exception& exception)
     {
@@ -658,6 +721,13 @@ bool FileSceneAssetCatalog::Initialize(
 
 void FileSceneAssetCatalog::Shutdown()
 {
+    CancelTextureStreaming();
+    m_streamingTextures.clear();
+    m_materialBindingRevisions.clear();
+    m_streamingStatistics = {};
+    m_streamingActivated = {};
+    m_streamingReported = false;
+
     CancelSavedMaterialRevision();
     m_initialized = false;
     m_catalogIdentity = 0;
@@ -669,6 +739,7 @@ void FileSceneAssetCatalog::Shutdown()
     }
 
     m_projectMeshes.clear();
+    m_meshCPUCache = nullptr;
     m_meshError.clear();
 
     m_defaultMaterial = Material{};
@@ -1393,6 +1464,13 @@ SavedMaterialRevisionResult FileSceneAssetCatalog::AdvanceSavedMaterialRevision(
             *candidate.baseline = std::move(candidate.source);
         }
 
+        const auto bindingRevision = m_materialBindingRevisions.find(key);
+
+        if(bindingRevision != m_materialBindingRevisions.end())
+        {
+            ++bindingRevision->second;
+        }
+
         for(auto& dependency : job.dependencies)
         {
             if(dependency.uploaded)
@@ -1485,4 +1563,388 @@ bool FileSceneAssetCatalog::PublishWorkingMaterialParameters(const RuntimeMateri
         error = exception.what();
         return false;
     }
+}
+
+Mesh* FileSceneAssetCatalog::CreateProjectMesh(const ProjectMeshCPUCache::Key& key,
+    std::shared_ptr<const ImportedMesh> prepared)
+{
+    auto asset = std::make_unique<MeshAsset>();
+    asset->geometry = std::move(prepared);
+    const auto& geometry = *asset->geometry;
+    const bool uploaded = SceneSwitchTiming::MeasureCall(SceneSwitchTiming::Stage::MeshUpload, [&]()
+    {
+        return asset->mesh.Initialize(m_device, *m_uploader, *m_descriptorHeap,
+            geometry.vertices.data(), geometry.vertices.size(), m_vertexLayout,
+            geometry.indices.data(), geometry.indices.size());
+    });
+
+    if (!uploaded)
+    {
+        m_meshError = "Failed to create mesh GPU buffers or descriptors for asset:" + std::get<1>(key) + ".";
+        return nullptr;
+    }
+
+    std::string metadataError;
+
+    if (!asset->mesh.SetMetadata(geometry.metadata, metadataError))
+    {
+        m_meshError = "Imported mesh metadata is invalid: " + metadataError;
+        return nullptr;
+    }
+
+    if (!asset->mesh.GetBounds().valid)
+    {
+        m_meshError = "Uploaded mesh has invalid bounds.";
+        return nullptr;
+    }
+
+    const auto inserted = m_projectMeshes.emplace(key, std::move(asset));
+    inserted.first->second->published = true;
+    return &inserted.first->second->mesh;
+}
+
+Mesh* FileSceneAssetCatalog::ResolvePreparedMesh(std::string_view reference,
+    const ProjectMeshPreparationService::Completion& completion, std::string* errorMessage)
+{
+    m_meshError.clear();
+    const auto fail = [&](const std::string& message) -> Mesh*
+    {
+        m_meshError = message;
+
+        if (errorMessage)
+        {
+            *errorMessage = message;
+        }
+
+        return nullptr;
+    };
+
+    try
+    {
+        const auto& identity = completion.identity;
+        const auto id = AssetID::ParseReference(reference);
+
+        if (!m_initialized || !m_registry || !m_device || !m_uploader || !m_descriptorHeap ||
+            completion.status != ProjectMeshPreparationService::Status::Available || !completion.geometry ||
+            !completion.current || !completion.current->load() || !id || id->ToReference() != reference ||
+            id->ToString() != identity.assetID || identity.digest.empty() ||
+            identity.importerRevision != ModelImporter::kImportRevision || identity.uvPolicy != MeshUVOrientation::FlipV)
+        {
+            return fail("Prepared mesh completion, authored asset or import policy is invalid.");
+        }
+
+        const auto project = std::filesystem::canonical(m_projectRoot);
+        const auto* record = m_registry->Find(*id);
+        const auto resolved = ProjectAssetResolver::Resolve(ProjectPaths(project), *m_registry, *id);
+
+        if (project != identity.project || !record || record->type != AssetType::Mesh ||
+            resolved.status != AssetAvailability::Available || resolved.resolvedPath != identity.path ||
+            _wcsicmp(resolved.resolvedPath.extension().c_str(), L".fbx") != 0)
+        {
+            return fail("Prepared mesh project, registration or contained source is stale.");
+        }
+
+        {
+            HANDLE handle = CreateFileW(identity.path.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+
+            if (handle == INVALID_HANDLE_VALUE)
+            {
+                return fail("Cannot pin prepared mesh source for consumption validation.");
+            }
+
+            MeshResidencySourceLock source(handle);
+            MaterialThumbnailValidation validation;
+
+            if (ProjectMeshPreparationService::InspectSourceIdentity(identity.path) != identity.sourceIdentity ||
+                validation.Digest(identity.path) != identity.digest)
+            {
+                return fail("Prepared mesh source changed before GPU consumption.");
+            }
+        } // No source pin spans synchronous GPU submission or waiting.
+
+        const auto key = identity.CacheKey();
+        const auto existing = m_projectMeshes.find(key);
+
+        if (existing != m_projectMeshes.end())
+        {
+            return &existing->second->mesh;
+        }
+
+        for (const auto& [existingKey, asset] : m_projectMeshes)
+        {
+            if (std::get<0>(existingKey) == project && std::get<1>(existingKey) == identity.assetID)
+            {
+                return fail("Registered mesh source changed; reload the scene to replace retained geometry.");
+            }
+        }
+
+        std::string metadataError;
+        const auto& geometry = *completion.geometry;
+
+        if (geometry.vertices.empty() || geometry.indices.empty() ||
+            !ValidateMeshMetadata(geometry.metadata, geometry.indices.size(), metadataError))
+        {
+            return fail("Prepared mesh geometry/metadata is invalid: " + metadataError);
+        }
+
+        Mesh* mesh = CreateProjectMesh(key, completion.geometry);
+
+        if (!mesh)
+        {
+            return fail(m_meshError);
+        }
+
+        return mesh;
+    }
+    catch (const std::exception& exception)
+    {
+        return fail("Prepared mesh consumption failed: " + std::string(exception.what()));
+    }
+}
+
+FileSceneAssetCatalog::MeshReferenceKind FileSceneAssetCatalog::ClassifyMeshReference(std::string_view reference)
+{
+    if (reference == "builtin:sphere")
+    {
+        return MeshReferenceKind::Builtin;
+    }
+
+    if (reference.starts_with("builtin:"))
+    {
+        return MeshReferenceKind::UnknownBuiltin;
+    }
+
+    const auto id = AssetID::ParseReference(reference);
+    return id && id->ToReference() == reference ? MeshReferenceKind::RegisteredAsset : MeshReferenceKind::Invalid;
+}
+
+Mesh* FileSceneAssetCatalog::FindRetainedMesh(std::string_view reference)
+{
+    if (!m_initialized)
+    {
+        return nullptr;
+    }
+
+    if (ClassifyMeshReference(reference) == MeshReferenceKind::Builtin)
+    {
+        return &m_sphereMesh;
+    }
+
+    const auto id = AssetID::ParseReference(reference);
+
+    if (!id || id->ToReference() != reference)
+    {
+        return nullptr;
+    }
+
+    for (const auto& [key, asset] : m_projectMeshes)
+    {
+        if (std::get<1>(key) == id->ToString() && asset->published && asset->geometry)
+        {
+            return &asset->mesh;
+        }
+    }
+
+    return nullptr;
+}
+
+bool FileSceneAssetCatalog::PrepareEditorObject(const SceneObjectDocument& authored,
+    ResolvedSceneObject& output, std::string* errorMessage)
+{
+    const auto fail = [&](const std::string& message)
+    {
+        if (errorMessage)
+        {
+            *errorMessage = message;
+        }
+
+        return false;
+    };
+
+    if (!ValidateMetadataMeshReference(authored.meshReference, errorMessage))
+    {
+        // Undo may restore an authored instance after its source file disappears.
+        // Missing is reported only after resolver containment checks succeed.
+        // Keep that instance pending (or reuse retained geometry), never import it.
+        const auto id = AssetID::ParseReference(authored.meshReference);
+        const auto* record = id && m_registry ? m_registry->Find(*id) : nullptr;
+        const auto resolved = id && m_registry ?
+            ProjectAssetResolver::Resolve(ProjectPaths(m_projectRoot), *m_registry, *id) : AssetResolution{};
+
+        if (!m_initialized || !id || id->ToReference() != authored.meshReference || !record ||
+            record->type != AssetType::Mesh || resolved.status != AssetAvailability::Missing ||
+            _wcsicmp(std::filesystem::path(record->relativePath).extension().c_str(), L".fbx") != 0)
+        {
+            return false;
+        }
+
+        if (errorMessage)
+        {
+            errorMessage->clear();
+        }
+    }
+
+    const auto reference = authored.materialReference.empty() ? "builtin:default" : authored.materialReference;
+    Material* material = ResolveMaterial(reference);
+
+    if (!material || !OwnsMaterial(*material))
+    {
+        return fail("Editor object material ownership/resolution failed: " + GetLastMaterialError());
+    }
+
+    ResolvedSceneObject object;
+    object.id = authored.id;
+    object.name = authored.name;
+    object.meshBindingEmpty = authored.meshReference.empty();
+
+    auto& runtime = object.renderObject;
+    runtime.mesh = FindRetainedMesh(authored.meshReference);
+    runtime.material = material;
+    runtime.transform = authored.transform;
+    runtime.previousTransform = authored.transform;
+
+    if (runtime.mesh)
+    {
+        for (const auto& slot : runtime.mesh->GetMetadata().materialSlots)
+        {
+            runtime.slotMaterials.emplace(slot.id, material);
+        }
+    }
+
+    for (const auto& [slot, overrideReference] : authored.materialSlotBindings)
+    {
+        if (runtime.mesh && !runtime.slotMaterials.contains(slot))
+        {
+            return fail("Editor object has an unknown resident material slot: " + slot);
+        }
+
+        Material* overrideMaterial = ResolveMaterial(overrideReference);
+
+        if (!overrideMaterial || !OwnsMaterial(*overrideMaterial))
+        {
+            return fail("Editor object override material ownership/resolution failed: " + GetLastMaterialError());
+        }
+
+        runtime.slotMaterials.insert_or_assign(slot, overrideMaterial);
+    }
+
+    output = std::move(object);
+    return true;
+}
+
+bool FileSceneAssetCatalog::ValidateEditorBindings(const SceneDocument& document, PreparedScene& prepared,
+    std::string* errorMessage)
+{
+    if (!m_initialized || document.objects.size() != prepared.objects.size())
+    {
+        if (errorMessage)
+        {
+            *errorMessage = "Editor replacement catalog ownership or authored object count is invalid.";
+        }
+
+        return false;
+    }
+
+    for (size_t index = 0; index < prepared.objects.size(); ++index)
+    {
+        auto& object = prepared.objects[index];
+        const auto& authored = document.objects[index];
+        auto& runtime = object.renderObject;
+
+        if (runtime.mesh && runtime.mesh != FindRetainedMesh(authored.meshReference))
+        {
+            // Never dereference/transfer an incompatible old mesh borrow. Resolve
+            // only this object's metadata; absence of retained geometry stays pending.
+            if (!PrepareEditorObject(authored, object, errorMessage))
+            {
+                return false;
+            }
+        }
+
+        if (!runtime.material || !OwnsMaterial(*runtime.material))
+        {
+            if (errorMessage)
+            {
+                *errorMessage = "Editor replacement base material is not retained by its catalog: " + authored.id;
+            }
+
+            return false;
+        }
+
+        for (const auto& [slot, material] : runtime.slotMaterials)
+        {
+            if (!material || !OwnsMaterial(*material))
+            {
+                if (errorMessage)
+                {
+                    *errorMessage = "Editor replacement slot material is not retained by its catalog: " + slot;
+                }
+
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
+const MeshMetadata* FileSceneAssetCatalog::FindRetainedSlotMetadata(std::string_view reference) const
+{
+    if (!m_initialized)
+    {
+        return nullptr;
+    }
+
+    if (ClassifyMeshReference(reference) == MeshReferenceKind::Builtin)
+    {
+        return &m_sphereGeometry.metadata;
+    }
+
+    const auto id = AssetID::ParseReference(reference);
+
+    if (!id)
+    {
+        return nullptr;
+    }
+
+    for (const auto& [key, asset] : m_projectMeshes)
+    {
+        if (std::get<1>(key) == id->ToString() && asset->published && asset->geometry)
+        {
+            return &asset->geometry->metadata;
+        }
+    }
+
+    return nullptr;
+}
+
+Material* FileSceneAssetCatalog::FindRetainedMaterial(std::string_view reference)
+{
+    if (!m_initialized)
+    {
+        return nullptr;
+    }
+
+    if (reference.empty() || reference == "builtin:default")
+    {
+        return &m_defaultMaterial;
+    }
+
+    const auto id = AssetID::ParseReference(reference);
+
+    if (!id)
+    {
+        return nullptr;
+    }
+
+    for (auto& [key, material] : m_projectMaterials)
+    {
+        if (std::get<1>(key) == id->ToString())
+        {
+            return &material;
+        }
+    }
+
+    return nullptr;
 }

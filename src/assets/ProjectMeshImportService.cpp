@@ -2,6 +2,7 @@
 #include "assets/AssetRegistrySerializer.h"
 #include "assets/ProjectAssetRegistry.h"
 #include "assets/ModelImporter.h"
+#include "assets/SupportedAssetImportFormats.h"
 #include "Project/ProjectPaths.h"
 
 #include <Windows.h>
@@ -118,15 +119,10 @@ bool ProjectMeshImportService::Import(
 
     try
     {
-        std::string extension = source.extension().string();
-        std::transform(extension.begin(), extension.end(), extension.begin(), [](unsigned char character)
+        if(SupportedAssetImportFormats::Lookup(source) != AssetType::Mesh)
         {
-            return static_cast<char>(std::tolower(character));
-        });
-
-        if(extension != ".fbx")
-        {
-            throw std::runtime_error("Unsupported mesh file extension; expected .fbx.");
+            error = "Unsupported mesh import format. Use .fbx.";
+            return false;
         }
 
         const auto filename = source.filename().wstring();

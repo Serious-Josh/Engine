@@ -4,6 +4,8 @@
 #include "Scene/Scene.h"
 #include "Scene/SceneCommit.h"
 #include "Scene/PreparedScene.h"
+#include "Scene/SceneHierarchySnapshot.h"
+#include "Scene/MeshResidency.h"
 
 #include <optional>
 #include <memory>
@@ -27,6 +29,25 @@ struct SceneObjectMetadata
 
     // Copied presentation metadata; never borrows scene-owned material state.
     std::map<std::string, std::string> materialSlotBindings;
+
+    std::uint64_t bindingRevision = 0;
+
+    // Derived from an already validated object mapping; no mutable residency field.
+    std::optional<SceneMeshResidency> GetMeshResidency(const RenderObject& runtime) const noexcept
+    {
+        return GetSceneMeshResidency(meshReference, runtime.mesh);
+    }
+};
+
+// History restores the exact saved value, including legacy untrimmed names.
+enum class SceneObjectNamePolicy { TrimmedInput, ExactHistory };
+bool NormalizeSceneObjectName(std::string& name, std::string* errorMessage = nullptr);
+
+struct SceneObjectOrderIdentity
+{
+    std::string sceneID;
+    std::uint64_t runtimeIdentity = 0;
+    std::uint64_t structureRevision = 0;
 };
 
 struct MaterialAssignmentToken
@@ -67,7 +88,7 @@ public:
     bool CaptureObjectDeletionSnapshot(std::string_view objectID, SceneObjectDocument& object,
         size_t& documentIndex, std::string* errorMessage = nullptr) const;
     std::unique_ptr<FileSceneRuntime> PrepareObjectDeletion(std::string_view objectID,
-        std::string* errorMessage = nullptr) const;
+        std::string* errorMessage = nullptr, FileSceneAssetCatalog* catalog = nullptr) const;
 
     std::unique_ptr<FileSceneRuntime> PrepareObjectRestoration(SceneAssetResolver& resolver,
         const SceneObjectDocument& restored, size_t insertionIndex, std::string* errorMessage = nullptr) const;
@@ -103,6 +124,16 @@ public:
     std::optional<SceneObjectMetadata> GetObjectMetadata(
         std::string_view objectID, std::string* errorMessage = nullptr) const;
 
+    bool ReorderObjects(const SceneObjectOrderIdentity& identity,
+        const std::vector<std::string>& expectedOrder, const std::vector<std::string>& replacementOrder,
+        std::string* errorMessage = nullptr);
+    bool RenameObject(const SceneObjectMetadata& selection, std::string_view expectedName,
+        std::string name, std::string* errorMessage = nullptr,
+        SceneObjectNamePolicy policy = SceneObjectNamePolicy::TrimmedInput);
+
+    // Ordered, copied metadata; validates the document and mapping once.
+    bool BuildHierarchySnapshot(SceneHierarchySnapshot& snapshot, std::string* errorMessage = nullptr) const;
+
     // CPU preparation only; one outstanding assignment per runtime.
     std::optional<MaterialAssignmentToken> PrepareMaterialAssignment(
         const SceneObjectMetadata& selection, std::string materialReference,
@@ -111,9 +142,11 @@ public:
     // No material ID clears the explicit override and must use the existing fallback pointer.
     std::optional<MaterialAssignmentToken> PrepareMaterialSlotAssignment(
         const SceneObjectMetadata& selection, std::string slotID, const std::optional<AssetID>& materialID,
-        Material& effectiveMaterial, std::string* errorMessage = nullptr);
+        Material& effectiveMaterial, std::string* errorMessage = nullptr, FileSceneAssetCatalog* catalog = nullptr);
     Material* GetPreparedMaterialAssignmentMaterial(const MaterialAssignmentToken& token) const noexcept;
-    // Caller must first release Renderer references and prove GPU/recording safety.
+    // Resident targets require checked renderer release. Pending targets may
+    // commit at the exclusive pre-recording boundary with already-published
+    // material identities; they never mutate shader-visible tables.
     // Caller owns and retains BOTH materials through cleanup, rollback and GPU completion.
     bool CommitMaterialAssignment(const MaterialAssignmentToken& token, Material& retainedSceneMaterial,
         std::string* errorMessage = nullptr);
@@ -129,14 +162,26 @@ public:
 
     bool Commit(std::string* errorMessage = nullptr);
 
+    // Explicit inactive-runtime path. Requires the catalog's fallback texture
+    // policy; FileBackedDemoScene configures it for this mode.
+    bool PrepareMetadata(FileSceneAssetCatalog& catalog, std::string* errorMessage = nullptr);
+    bool CommitMetadata(FileSceneAssetCatalog& catalog, std::string* errorMessage = nullptr);
+
+    std::optional<MeshResidencyToken> PrepareMeshResidency(const SceneObjectMetadata& selection,
+        FileSceneAssetCatalog& catalog, const MeshResidencyCandidate& candidate, std::string* errorMessage = nullptr);
+    void CancelMeshResidency() noexcept;
+    std::uint64_t GetResidencyRevision() const noexcept { return m_residencyRevision; }
+
     bool HasPreparedScene() const noexcept
     {
-        return m_preparedScene.has_value();
+        return m_preparedScene.has_value() || m_preparedMetadata.has_value();
     }
 
     void DiscardPreparedScene() noexcept
     {
+        CancelMeshResidency();
         m_preparedScene.reset();
+        m_preparedMetadata.reset();
     }
 
     bool New(
@@ -162,6 +207,37 @@ public:
         std::string* errorMessage = nullptr);
 
 private:
+    // No coordinator exists in S.5B. Only the future matching renderer/DXR
+    // transaction may call this at the main-thread pre-recording boundary.
+    friend class MeshResidencyPublication;
+    std::optional<SceneObjectMetadata> ValidatePreparedMeshResidencyIdentity(const MeshResidencyToken& token,
+        const FileSceneAssetCatalog& catalog, std::string* errorMessage) const;
+    MeshResidencySourceLock ValidatePreparedMeshResidency(const MeshResidencyToken& token,
+        FileSceneAssetCatalog& catalog, std::string* errorMessage) const;
+    // Accepted transaction only: caller retains the freshly validated source
+    // pin and proves matching renderer readiness, epochs and revision capacity.
+    void ApplyPreparedMeshResidency() noexcept;
+    bool CommitMeshResidency(const MeshResidencyToken& token, FileSceneAssetCatalog& catalog,
+        std::string* errorMessage = nullptr);
+
+    struct MeshResidencyPreparation
+    {
+        MeshResidencyToken token;
+        SceneObjectMetadata selection;
+        MeshResidencyCandidate candidate;
+
+        FileSceneAssetCatalog* catalog = nullptr;
+        Material* fallback = nullptr;
+
+        std::map<std::string, Material*> originalSlots;
+        std::map<std::string, Material*> runtimeSlots;
+        std::map<std::string, Material*> committedSlots;
+    };
+    std::optional<MeshResidencyPreparation> m_meshResidency;
+
+    std::uint64_t m_nextMeshResidency = 1;
+    std::uint64_t m_residencyRevision = 0;
+
     struct MaterialAssignment
     {
         MaterialAssignmentToken token;
@@ -177,6 +253,9 @@ private:
         std::map<std::string, Material*> originalSlots;
         std::map<std::string, Material*> stagedRuntimeSlots;
         std::map<std::string, Material*> stagedCommittedSlots;
+        std::map<std::string, Material*> expectedAppliedSlots;
+        std::optional<MeshResidencyCandidate> pendingSlotSource;
+        FileSceneAssetCatalog* pendingSlotCatalog = nullptr;
 
         std::optional<std::string> slotID;
         Mesh* expectedMesh = nullptr;
@@ -198,4 +277,5 @@ private:
     SceneObjectMapping m_objectMapping;
 
     std::optional<PreparedScene> m_preparedScene;
+    std::optional<PreparedMetadataScene> m_preparedMetadata;
 };

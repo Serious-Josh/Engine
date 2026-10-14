@@ -43,6 +43,10 @@ struct SceneObjectInspectorView
     std::optional<SceneObjectMetadata> metadata;
     std::string meshReference;
     std::vector<SceneMaterialSlotInspectorView> materialSlots;
+
+    // Derived presentation snapshot only; absent for demos without authored references.
+    std::optional<SceneMeshResidency> meshResidency;
+    bool materialSlotMetadataAvailable = false;
 };
 
 class InspectorPanel

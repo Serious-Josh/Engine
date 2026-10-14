@@ -196,7 +196,8 @@ namespace
         return result;
     }
 
-    std::vector<ImportedMesh> Import(const std::filesystem::path& path, MeshUVOrientation uvOrientation)
+    std::vector<ImportedMesh> Import(const std::filesystem::path& path, MeshUVOrientation uvOrientation,
+        size_t geometryByteLimit = (std::numeric_limits<size_t>::max)())
     {
         Require(uvOrientation == MeshUVOrientation::PreserveSource || uvOrientation == MeshUVOrientation::FlipV,
             "Unsupported mesh UV orientation policy.");
@@ -217,6 +218,7 @@ namespace
         std::vector<PendingNode> pending{{scene->mRootNode, aiMatrix4x4{}}};
         std::unordered_set<const aiNode*> visited;
         std::vector<ImportedMesh> meshes;
+        size_t geometryBytes = 0;
 
         while (!pending.empty())
         {
@@ -243,6 +245,15 @@ namespace
                     try
                     {
                         const aiMesh* source = scene->mMeshes[meshIndex];
+                        Require(source != nullptr, "Null source mesh.");
+                        // Include conservative per-occurrence metadata/name storage
+                        // before converting repeated node mesh references.
+                        const auto required = std::uint64_t(source->mNumVertices) * sizeof(Vertex) +
+                            std::uint64_t(source->mNumFaces) * 3 * sizeof(uint32_t) + 4096;
+                        Require(required <= geometryByteLimit - geometryBytes,
+                            "Mesh conversion exceeds the configured geometry budget.");
+                        geometryBytes += static_cast<size_t>(required);
+
                         ImportedMesh mesh = ConvertMesh(source, transform, uvOrientation);
                         Require(scene->mMaterials && source->mMaterialIndex < scene->mNumMaterials &&
                             scene->mMaterials[source->mMaterialIndex], "Mesh references an invalid source material.");
@@ -295,11 +306,12 @@ std::vector<ImportedMesh> ModelImporter::Load(const std::filesystem::path& path,
     }
 }
 
-ImportedMesh ModelImporter::LoadFlattened(const std::filesystem::path& path, MeshUVOrientation uvOrientation)
+ImportedMesh ModelImporter::LoadFlattened(const std::filesystem::path& path, MeshUVOrientation uvOrientation,
+    size_t geometryByteLimit)
 {
     try
     {
-        const auto meshes = Import(path, uvOrientation);
+        const auto meshes = Import(path, uvOrientation, geometryByteLimit);
         size_t vertexCount = 0;
         size_t indexCount = 0;
 

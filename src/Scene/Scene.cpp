@@ -25,6 +25,21 @@ void Scene::ClearRenderObjects()
     ++m_structureRevision;
 }
 
+void Scene::ReplaceRenderObjects(std::vector<RenderObject> objects)
+{
+    std::vector<bool> dirty(objects.size(), false);
+
+    for(auto& object : objects)
+    {
+        object.previousTransform = object.transform;
+    }
+
+    m_renderObjects.swap(objects);
+    m_transformDirty.swap(dirty);
+    m_changedTransforms.clear();
+    ++m_structureRevision;
+}
+
 void Scene::SetRenderObjectTransform(
     RenderObjectID id,
     const Transform& transform)
