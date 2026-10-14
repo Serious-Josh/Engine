@@ -1,4 +1,5 @@
 #include "Scene/SceneCommit.h"
+#include "Renderer/Mesh.h"
 
 #include <cmath>
 #include <utility>
@@ -35,6 +36,28 @@ bool CommitPreparedScene(
             (object.renderObject.mesh == nullptr) != object.meshBindingEmpty)
         {
             return Fail(errorMessage, "Prepared object has an unresolved asset.");
+        }
+
+        const auto& materials = object.renderObject.slotMaterials;
+        const auto* mesh = object.renderObject.mesh;
+
+        if((!mesh && !materials.empty()) ||
+            (mesh && materials.size() != mesh->GetMetadata().materialSlots.size()))
+        {
+            return Fail(errorMessage, "Prepared object material slots do not match its mesh.");
+        }
+
+        if(mesh)
+        {
+            for(const auto& slot : mesh->GetMetadata().materialSlots)
+            {
+                const auto material = materials.find(slot.id);
+
+                if(material == materials.end() || !material->second)
+                {
+                    return Fail(errorMessage, "Prepared object has an unresolved material slot: " + slot.id);
+                }
+            }
         }
 
         SceneObjectDocument entry;

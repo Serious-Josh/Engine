@@ -75,6 +75,15 @@ class DebugUI
         return static_cast<ToneMapDebugView>(m_toneMapDebugView);
     }
 
+    bool IsShadingNormalCorrectionEnabled() const
+    {
+#ifndef NDEBUG
+        return m_shadingNormalCorrectionEnabled;
+#else
+        return true;
+#endif
+    }
+
     bool IsRTGIEnabled() const
     {
         return m_rtgiEnabled;
@@ -134,6 +143,9 @@ class DebugUI
 
     int m_requestedEnvironmentIndex = -1;
 
+#ifndef NDEBUG
+    bool m_shadingNormalCorrectionEnabled = true;
+#endif
     bool m_rtgiEnabled = true;
 
     float m_rtgiContactAOStrength = 1.0f;

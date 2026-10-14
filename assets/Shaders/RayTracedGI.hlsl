@@ -62,18 +62,7 @@ struct GIVisibilityPayload
     uint visible;
 };
 
-struct RayTracingInstanceData
-{
-    uint vertexBufferIndex;
-    uint indexBufferIndex;
-    uint materialIndex;
-    uint vertexStride;
-
-    uint normalOffset;
-    uint uvOffset;
-    uint indexed;
-    uint tangentOffset;
-};
+#include "RayTracingInstanceData.hlsli"
 
 struct DirectionalLightConstants
 {
@@ -1237,6 +1226,8 @@ void GIClosestHit(
         instanceDataBuffer[
             InstanceID()
         ];
+
+    instanceData.materialIndex = ResolveHitMaterial(instanceData, PrimitiveIndex());
 
     ByteAddressBuffer vertexBuffer =
         ResourceDescriptorHeap[

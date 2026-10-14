@@ -1,4 +1,5 @@
 #include "DeferredLightingPass.h"
+#include "ToneMapPass.h"
 
 #include "Core/Log.h"
 #include "Renderer/GBuffer.h"
@@ -70,7 +71,7 @@ bool DeferredLightingPass::Initialize(
     referenceSampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     pipelineDescription.additionalSamplers.push_back(referenceSampler);
 
-    pipelineDescription.rootParameters.push_back({RootParameterType::Constants, 0, 17, D3D12_SHADER_VISIBILITY_PIXEL});
+    pipelineDescription.rootParameters.push_back({RootParameterType::Constants, 0, 18, D3D12_SHADER_VISIBILITY_PIXEL});
 
     pipelineDescription.rootParameters.push_back(
         {RootParameterType::ConstantBuffer, 1, 0, D3D12_SHADER_VISIBILITY_PIXEL});
@@ -106,7 +107,8 @@ void DeferredLightingPass::Execute(
     RenderTarget& sceneColor,
     D3D12_GPU_VIRTUAL_ADDRESS reconstructionConstantsAddress,
     D3D12_GPU_VIRTUAL_ADDRESS lightConstantsAddress,
-    unsigned int debugView)
+    unsigned int debugView,
+    bool enableShadingNormalCorrection)
 {
     gBuffer.GetMaterial().Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     gBuffer.GetSurface().Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
@@ -133,6 +135,16 @@ void DeferredLightingPass::Execute(
 
     m_pipeline.Bind(commandList);
 
+#ifdef NDEBUG
+    enableShadingNormalCorrection = true;
+
+    // This temporary diagnostic is selectable only in development builds.
+    if (debugView == static_cast<unsigned int>(ToneMapDebugView::ShadingNormalViewHorizon))
+    {
+        debugView = 0u;
+    }
+#endif
+
     unsigned int resourceIndices[] = {
         gBuffer.GetMaterial().GetSRVIndex(),      gBuffer.GetSurface().GetSRVIndex(),
         gBuffer.GetDepth().GetSRVIndex(),         materialBuffer.GetDescriptorIndex(),
@@ -146,6 +158,8 @@ void DeferredLightingPass::Execute(
     commandList->SetGraphicsRoot32BitConstants(0, 16, resourceIndices, 0);
 
     commandList->SetGraphicsRoot32BitConstants(0, 1, &rtgiContactAOStrength, 16);
+    const unsigned int correctionEnabled = enableShadingNormalCorrection ? 1u : 0u;
+    commandList->SetGraphicsRoot32BitConstants(0, 1, &correctionEnabled, 17);
     commandList->SetGraphicsRootConstantBufferView(1, reconstructionConstantsAddress);
     commandList->SetGraphicsRootConstantBufferView(2, lightConstantsAddress);
 

@@ -212,14 +212,14 @@ TextureThumbnailDiskCache::Source TextureThumbnailDiskCache::Describe(
 
         if(length == 0 || length >= local.size() || result.identity.size() > kMaximumIdentity)
         {
-            return {};
+            return result;
         }
 
         const std::filesystem::path root(local.data());
 
         if(!root.is_absolute() || !SafePath(root))
         {
-            return {};
+            return result;
         }
 
         result.directory = root / "Engine" / "TextureThumbnails" / Hash(projectIdentity);
@@ -227,7 +227,9 @@ TextureThumbnailDiskCache::Source TextureThumbnailDiskCache::Describe(
     }
     catch(...)
     {
-        return {};
+        // Source identity remains useful even when the optional cache bucket is unavailable.
+        result.directory.clear();
+        result.entry.clear();
     }
 
     return result;

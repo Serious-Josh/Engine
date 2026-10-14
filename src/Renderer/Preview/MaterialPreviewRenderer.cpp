@@ -18,6 +18,8 @@
 #include <cstring>
 #include <stdexcept>
 #include <nlohmann/json.hpp>
+#include <cmath>
+#include <limits>
 
 
 namespace
@@ -215,6 +217,34 @@ bool MaterialPreviewRenderer::Initialize(
 
 void MaterialPreviewRenderer::Shutdown()
 {
+    // Caller has drained GPU work and conclusively discarded remaining commands.
+    m_recording.reset();
+    m_quarantined = false;
+    m_meshPreparation.Shutdown();
+
+    if(m_meshWriter.valid())
+    {
+        try
+        {
+            m_meshWriter.get(); // Shutdown only; worker owns CPU data and no Renderer borrows.
+        }
+        catch(...)
+        {
+            // Optional disk-cache failures do not affect teardown.
+        }
+    }
+
+    for(auto& job : m_meshJobs)
+    {
+        job.color.Shutdown();
+    }
+
+    m_meshJobs.clear();
+    m_meshTickets.clear();
+    m_meshConsumers.clear();
+    m_meshCompletedFence = 0;
+    m_meshTurn = false;
+
     for(auto& [key, entry] : m_textureCache)
     {
         entry.texture.Shutdown();
@@ -340,10 +370,8 @@ bool MaterialPreviewRenderer::InitializePipelines(
 
 bool MaterialPreviewRenderer::Record(const RecordingContext& context)
 {
-    m_inspector.recorded = false;
-    m_thumbnail.recorded = false;
-
-    if(!m_initialized || !context.commandList)
+    if(!m_initialized || !context.commandList || m_quarantined || !m_recording ||
+        m_recording->generation != context.generation)
     {
         return false;
     }
@@ -361,8 +389,18 @@ bool MaterialPreviewRenderer::Record(const RecordingContext& context)
         return true;
     }
 
-    if(m_thumbnail.request && (m_thumbnail.diskHit || m_thumbnail.dependencies.ready) && !m_thumbnail.outputValid)
+    const bool materialWork = m_thumbnail.request &&
+        (m_thumbnail.diskHit || m_thumbnail.dependencies.ready) && !m_thumbnail.outputValid;
+
+    if(HasMeshWork() && (m_meshTurn || !materialWork))
     {
+        m_meshTurn = false;
+        return RecordMeshJob(context);
+    }
+
+    if(materialWork)
+    {
+        m_meshTurn = true;
         // Protect the destination even if recording fails before submission confirmation.
         if(!m_thumbnail.destination)
         {
@@ -425,6 +463,28 @@ bool MaterialPreviewRenderer::RecordJob(
     const std::array<Texture*, 7>& textures,
     RenderTarget& displayColor)
 {
+    // Preserve the material sphere's exact camera and rotation-only model.
+    PreviewFraming framing;
+    framing.eye = {2.6f, 1.7f, -3.2f};
+    framing.viewProjection = Matrix4::Perspective(0.65f, 1.0f, 0.1f, 20.0f) *
+        Matrix4::LookAt(framing.eye, Vector3{}, Vector3{0.0f, 1.0f, 0.0f});
+    const Matrix4 model = Matrix4::RotationY(yaw) * Matrix4::RotationX(pitch);
+    PreviewGeometry geometry;
+    std::string error;
+
+    if(!DescribeGeometry(m_sphere, model, geometry, error))
+    {
+        Log::Error("Material preview geometry rejected: " + error);
+        return false;
+    }
+
+    return RecordGeometryJob(context, material, textures, displayColor, geometry, framing);
+}
+
+bool MaterialPreviewRenderer::RecordGeometryJob(const RecordingContext& context, GPUMaterial material,
+    const std::array<Texture*, 7>& textures, RenderTarget& displayColor,
+    const PreviewGeometry& geometry, const PreviewFraming& framing)
+{
     ID3D12GraphicsCommandList* commandList = context.commandList;
     unsigned int* slots[] = {&material.textureIndex, &material.normalTextureIndex,
         &material.roughnessTextureIndex, &material.metallicTextureIndex, &material.armTextureIndex,
@@ -474,19 +534,20 @@ bool MaterialPreviewRenderer::RecordJob(
     commandList->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
     commandList->OMSetRenderTargets(4, rtvs, FALSE, &dsv);
     m_geometryPipeline.Bind(commandList);
-    const Vector3 eye{2.6f, 1.7f, -3.2f};
-    const Matrix4 viewProjection = Matrix4::Perspective(0.65f, 1.0f, 0.1f, 20.0f) *
-        Matrix4::LookAt(eye, Vector3{}, Vector3{0.0f, 1.0f, 0.0f});
-    // Yaw around fixed vertical, then local pitch. Pure rotation preserves normal scale.
-    const Matrix4 model = Matrix4::RotationY(yaw) * Matrix4::RotationX(pitch);
-    commandList->SetGraphicsRoot32BitConstants(0, 16, &viewProjection, 0);
-    commandList->SetGraphicsRoot32BitConstants(0, 16, &model, 16);
+    const Vector3& eye = framing.eye;
+    commandList->SetGraphicsRoot32BitConstants(0, 16, &framing.viewProjection, 0);
+    commandList->SetGraphicsRoot32BitConstants(0, 16, &geometry.model, 16);
     const float cameraPosition[4] = {eye.x, eye.y, eye.z, 1.0f};
     commandList->SetGraphicsRoot32BitConstants(0, 4, cameraPosition, 32);
     static_assert(sizeof(GPUMaterial) == 27 * sizeof(unsigned int));
     commandList->SetGraphicsRoot32BitConstants(1, 27, &material, 0);
-    m_sphere.Bind(commandList);
-    commandList->DrawIndexedInstanced(static_cast<UINT>(m_sphere.GetIndexCount()), 1, 0, 0, 0);
+    commandList->IASetVertexBuffers(0, 1, &geometry.vertices);
+    commandList->IASetIndexBuffer(&geometry.indices);
+
+    for(const auto& range : geometry.ranges)
+    {
+        commandList->DrawIndexedInstanced(range.indexCount, 1, range.firstIndex, 0, 0);
+    }
 
     for(RenderTarget* target : targets)
     {
@@ -526,6 +587,11 @@ bool MaterialPreviewRenderer::RecordJob(
 
 void MaterialPreviewRenderer::SetRequest(const std::optional<MaterialPreviewRequest>& request)
 {
+    if(m_recording || m_quarantined)
+    {
+        return;
+    }
+
     if(!request)
     {
         m_inspector.request.reset();
@@ -545,11 +611,17 @@ void MaterialPreviewRenderer::SetRequest(const std::optional<MaterialPreviewRequ
     m_inspector.recorded = false;
 }
 
-void MaterialPreviewRenderer::ConfirmSubmission(std::uint64_t submissionFence)
+bool MaterialPreviewRenderer::ConfirmSubmission(std::uint64_t generation, std::uint64_t submissionFence)
 {
-    if(submissionFence == 0 || submissionFence == UINT64_MAX)
+    if(!m_initialized && !m_recording)
     {
-        return;
+        return true;
+    }
+
+    if(!m_recording || m_recording->generation != generation || m_quarantined ||
+        submissionFence == 0 || submissionFence == UINT64_MAX)
+    {
+        return false;
     }
 
     for(auto& [key, entry] : m_textureCache)
@@ -591,6 +663,29 @@ void MaterialPreviewRenderer::ConfirmSubmission(std::uint64_t submissionFence)
             image.awaitingDisplaySubmission = false;
         }
     }
+
+    for(auto& job : m_meshJobs)
+    {
+        if(job.recorded)
+        {
+            job.fence = submissionFence;
+            job.copiedBytes += job.recordedBytes;
+            job.recordedBytes = 0;
+
+            job.recorded = false;
+            job.rendered = job.renderRecorded;
+            job.renderRecorded = false;
+        }
+
+        if(job.awaitingDisplaySubmission)
+        {
+            job.displayFence = submissionFence;
+            job.awaitingDisplaySubmission = false;
+        }
+    }
+
+    m_recording.reset();
+    return true;
 }
 
 bool MaterialPreviewRenderer::PrepareSavedThumbnail(
@@ -859,7 +954,7 @@ bool MaterialPreviewRenderer::IsThumbnailAdmitted(
 bool MaterialPreviewRenderer::CanAcquireThumbnailImage(
     std::uint64_t completedFence, const std::filesystem::path& root, const std::string& identity) const
 {
-    if(m_thumbnailImages.size() < kThumbnailCapacity)
+    if(m_thumbnailImages.size() < kThumbnailImageCapacity)
     {
         return true;
     }
@@ -901,7 +996,7 @@ MaterialPreviewRenderer::ThumbnailImage* MaterialPreviewRenderer::AcquireThumbna
         }
     }
 
-    if(m_thumbnailImages.size() < kThumbnailCapacity)
+    if(m_thumbnailImages.size() < kThumbnailImageCapacity)
     {
         m_thumbnailImages.emplace_back();
         victim = &m_thumbnailImages.back();
@@ -935,6 +1030,12 @@ bool MaterialPreviewRenderer::RequestSavedThumbnail(
     std::uint64_t completedFence,
     std::string& error)
 {
+    if(m_recording || m_quarantined)
+    {
+        error = "Preview resources are awaiting a recording outcome or checked recovery.";
+        return false;
+    }
+
     error.clear();
 
     try
@@ -970,7 +1071,7 @@ bool MaterialPreviewRenderer::RequestSavedThumbnail(
 
         if(m_thumbnailWorkingSetActive && !IsThumbnailAdmitted(root, identity))
         {
-            if(m_thumbnailWorkingSet.size() >= kThumbnailCapacity)
+            if(m_thumbnailWorkingSet.size() >= kThumbnailImageCapacity)
             {
                 error = "Material thumbnail is outside the visible working set.";
                 return false;
@@ -1026,18 +1127,33 @@ bool MaterialPreviewRenderer::RequestSavedThumbnail(
 
 void MaterialPreviewRenderer::BeginThumbnailWorkingSet()
 {
+    if(m_recording || m_quarantined)
+    {
+        return;
+    }
+
     m_thumbnailWorkingSetActive = true;
     m_thumbnailWorkingSet.clear();
 }
 
 void MaterialPreviewRenderer::DiscardThumbnailRequests()
 {
+    if(m_recording || m_quarantined)
+    {
+        return;
+    }
+
     m_thumbnailRequests.clear();
     m_thumbnailWorkingSet.clear();
 }
 
 void MaterialPreviewRenderer::InvalidateThumbnailImages()
 {
+    if(m_recording || m_quarantined)
+    {
+        return;
+    }
+
     m_thumbnailValidation.Clear();
     for(auto& image : m_thumbnailImages)
     {
@@ -1047,6 +1163,11 @@ void MaterialPreviewRenderer::InvalidateThumbnailImages()
 
 void MaterialPreviewRenderer::InvalidateThumbnailSource(const std::filesystem::path& path)
 {
+    if(m_recording || m_quarantined)
+    {
+        return;
+    }
+
     std::error_code error;
     const auto canonical = std::filesystem::weakly_canonical(path, error);
 
@@ -1134,13 +1255,24 @@ void MaterialPreviewRenderer::ProcessThumbnailRequest(std::uint64_t completedFen
 
 void MaterialPreviewRenderer::PollThumbnailCapture(std::uint64_t completedFence)
 {
+    if(m_recording || m_quarantined)
+    {
+        return;
+    }
+
     m_thumbnailValidation.Poll();
+    PollMeshGPUFences(completedFence);
     PollThumbnailReadback(completedFence);
     ProcessThumbnailRequest(completedFence);
 }
 
 std::optional<MaterialPreviewImage> MaterialPreviewRenderer::GetThumbnailImage(const DescriptorHeap& heap)
 {
+    if(m_recording || m_quarantined)
+    {
+        return std::nullopt;
+    }
+
     const auto id = AssetID::ParseReference(m_lastThumbnailIdentity);
 
     if(!id || m_thumbnailProject.empty())
@@ -1156,6 +1288,11 @@ std::optional<MaterialPreviewImage> MaterialPreviewRenderer::GetThumbnailImage(
     const ProjectPaths& paths,
     const AssetID& id)
 {
+    if(m_recording || m_quarantined)
+    {
+        return std::nullopt;
+    }
+
     if(!m_initialized)
     {
         return std::nullopt;
@@ -1178,6 +1315,11 @@ std::optional<MaterialPreviewImage> MaterialPreviewRenderer::GetThumbnailImage(
 
 std::optional<MaterialPreviewImage> MaterialPreviewRenderer::GetImage(const DescriptorHeap& heap) const
 {
+    if(m_recording || m_quarantined)
+    {
+        return std::nullopt;
+    }
+
     if(!m_initialized || !m_inspector.outputValid || !m_inspector.request)
     {
         return std::nullopt;
@@ -1191,6 +1333,11 @@ void MaterialPreviewRenderer::PrepareTextures(
     const std::optional<MaterialPreviewRequest>& request,
     const ProjectAssetRegistry& registry)
 {
+    if(m_recording || m_quarantined)
+    {
+        return;
+    }
+
     SetRequest(request);
 
     const auto preparation = PrepareJobTextures(request, registry, m_inspector.dependencies);
@@ -1346,4 +1493,923 @@ MaterialPreviewRenderer::TexturePreparation MaterialPreviewRenderer::PrepareJobT
     prepared.ready = true;
     dependencies = std::move(prepared);
     return changed ? TexturePreparation::Ready : TexturePreparation::Unchanged;
+}
+
+bool MaterialPreviewRenderer::DescribeGeometry(const Mesh& mesh, const Matrix4& model,
+    PreviewGeometry& geometry, std::string& error)
+{
+    error.clear();
+    const auto vertexCount = mesh.GetVertexCount();
+    const auto indexCount = mesh.GetIndexCount();
+    auto* vertices = mesh.GetVertexBufferResource();
+    auto* indices = mesh.GetIndexBufferResource();
+
+    if(!mesh.IsIndexed() || !vertices || !indices || vertexCount == 0 || indexCount == 0 ||
+        mesh.GetVertexStride() != sizeof(Vertex) || mesh.GetIndexFormat() != DXGI_FORMAT_R32_UINT ||
+        vertexCount > UINT_MAX / sizeof(Vertex) || indexCount > UINT_MAX / sizeof(uint32_t) ||
+        mesh.GetVertexBufferAddress() == 0 || mesh.GetIndexBufferAddress() == 0)
+    {
+        error = "Preview requires populated indexed geometry using the Engine Vertex layout and 32-bit indices.";
+        return false;
+    }
+
+    const auto expected = CreateVertexLayout();
+    const auto& attributes = mesh.GetVertexLayout().GetAttributes();
+    const auto& expectedAttributes = expected.GetAttributes();
+
+    if(attributes.size() != expectedAttributes.size())
+    {
+        error = "Preview vertex attributes do not match the preview pipeline.";
+        return false;
+    }
+
+    for(size_t i = 0; i < attributes.size(); ++i)
+    {
+        const auto& actual = attributes[i];
+        const auto& required = expectedAttributes[i];
+
+        if(!actual.semantic || std::strcmp(actual.semantic, required.semantic) != 0 ||
+            actual.semanticIndex != required.semanticIndex || actual.offset != required.offset || actual.type != required.type)
+        {
+            error = "Preview vertex attributes do not match the preview pipeline.";
+            return false;
+        }
+    }
+
+    if(vertices->GetDesc().Dimension != D3D12_RESOURCE_DIMENSION_BUFFER ||
+        indices->GetDesc().Dimension != D3D12_RESOURCE_DIMENSION_BUFFER ||
+        vertices->GetDesc().Width < vertexCount * sizeof(Vertex) ||
+        indices->GetDesc().Width < indexCount * sizeof(uint32_t) ||
+        !ValidateMeshMetadata(mesh.GetMetadata(), indexCount, error))
+    {
+        if(error.empty())
+        {
+            error = "Preview geometry exceeds its GPU buffer allocation.";
+        }
+
+        return false;
+    }
+
+    PreviewFraming checkedFraming;
+    Matrix4 checkedModel;
+
+    if(!FrameMeshBounds(mesh.GetBounds(), checkedFraming, checkedModel, error))
+    {
+        return false;
+    }
+
+    for(const auto& row : model.m)
+    {
+        for(float value : row)
+        {
+            if(!std::isfinite(value))
+            {
+                error = "Preview model transform must be finite.";
+                return false;
+            }
+        }
+    }
+
+    PreviewGeometry candidate;
+    candidate.vertices = {mesh.GetVertexBufferAddress(), static_cast<UINT>(vertexCount * sizeof(Vertex)), sizeof(Vertex)};
+    candidate.indices = {mesh.GetIndexBufferAddress(), static_cast<UINT>(indexCount * sizeof(uint32_t)), DXGI_FORMAT_R32_UINT};
+    candidate.indexCount = static_cast<unsigned int>(indexCount);
+
+    candidate.ranges = mesh.GetMetadata().submeshes;
+    candidate.bounds = mesh.GetBounds();
+    candidate.model = model;
+    geometry = candidate;
+    return true;
+}
+
+bool MaterialPreviewRenderer::FrameMeshBounds(const MeshBounds& bounds, PreviewFraming& framing,
+    Matrix4& model, std::string& error)
+{
+    error.clear();
+    const double minimum[] = {bounds.min.x, bounds.min.y, bounds.min.z};
+    const double maximum[] = {bounds.max.x, bounds.max.y, bounds.max.z};
+    double center[3]{};
+    double halfExtent[3]{};
+
+    if(!bounds.valid)
+    {
+        error = "Preview mesh bounds are unavailable.";
+        return false;
+    }
+
+    for(size_t axis = 0; axis < 3; ++axis)
+    {
+        if(!std::isfinite(minimum[axis]) || !std::isfinite(maximum[axis]) || maximum[axis] < minimum[axis])
+        {
+            error = "Preview mesh bounds must be finite and ordered.";
+            return false;
+        }
+
+        center[axis] = minimum[axis] * 0.5 + maximum[axis] * 0.5;
+        halfExtent[axis] = (maximum[axis] - minimum[axis]) * 0.5;
+    }
+
+    const double radius = std::hypot(halfExtent[0], halfExtent[1], halfExtent[2]);
+
+    if(!std::isfinite(radius) || radius <= 0)
+    {
+        error = "Preview mesh bounds have zero or invalid enclosing radius.";
+        return false;
+    }
+
+    const float scale = static_cast<float>(1.0 / radius);
+
+    // The unchanged preview shader transforms normals with the model matrix.
+    // Reject scales whose normal lengths would underflow/overflow float math.
+    if(!std::isfinite(scale) || scale < std::sqrt((std::numeric_limits<float>::min)()) ||
+        scale > std::sqrt((std::numeric_limits<float>::max)() / 4.0f))
+    {
+        error = "Preview bounds require a normalization scale outside the shader's safe float range.";
+        return false;
+    }
+
+    Matrix4 normalized = Matrix4::Scale(scale, scale, scale);
+
+    for(size_t axis = 0; axis < 3; ++axis)
+    {
+        // Combine scaling and centering in double before narrowing to float.
+        const double translation = -center[axis] * double(scale);
+
+        if(!std::isfinite(translation) || std::abs(translation) > (std::numeric_limits<float>::max)())
+        {
+            error = "Preview bounds center cannot be represented by a finite normalized transform.";
+            return false;
+        }
+
+        normalized.m[axis][3] = static_cast<float>(translation);
+    }
+
+    // Positive uniform scaling encloses every bounds corner in a unit sphere,
+    // including elongated models. Increase its projected radius by 30% while
+    // reserving 10% of the half-FOV as margin; material-sphere framing is separate.
+    PreviewFraming candidate;
+    const Vector3 originalEye{2.6f, 1.7f, -3.2f};
+    const double originalDistance = originalEye.Length();
+    constexpr double halfFov = 0.65 * 0.5;
+    constexpr double zoom = 1.30;
+    const double zoomDistance = std::sqrt(1.0 + (originalDistance * originalDistance - 1.0) / (zoom * zoom));
+    const double minimumDistance = 1.0 / std::sin(halfFov * 0.90);
+    const double distance = (std::max)(zoomDistance, minimumDistance);
+
+    candidate.eye = originalEye * static_cast<float>(distance / originalDistance);
+    candidate.viewProjection = Matrix4::Perspective(0.65f, 1.0f, 0.1f, 20.0f) *
+        Matrix4::LookAt(candidate.eye, Vector3{}, Vector3{0.0f, 1.0f, 0.0f});
+    framing = candidate;
+    model = normalized;
+    return true;
+}
+
+bool MaterialPreviewRenderer::RequestMeshThumbnail(const ProjectPaths& paths,
+    const ProjectAssetRegistry& registry, const AssetID& id, std::uint64_t& ticket, std::string& error,
+    MeshThumbnailConsumer consumer)
+{
+    if(!m_initialized || m_recording || m_quarantined)
+    {
+        ticket = 0;
+        error = "Mesh thumbnail preparation requires an initialized preview renderer.";
+        return false;
+    }
+
+    if(!m_meshPreparation.Request(paths, registry, id, ticket, error))
+    {
+        return false;
+    }
+
+    if(std::find(m_meshTickets.begin(), m_meshTickets.end(), ticket) == m_meshTickets.end())
+    {
+        m_meshTickets.push_back(ticket);
+    }
+
+    m_meshConsumers[ticket] |= static_cast<unsigned int>(consumer);
+
+    return true;
+}
+
+void MaterialPreviewRenderer::PollMeshThumbnailPreparation(const ProjectPaths& paths,
+    const ProjectAssetRegistry& registry)
+{
+    if(m_recording || m_quarantined || !m_initialized)
+    {
+        return;
+    }
+
+    m_meshPreparation.Poll(paths, registry);
+
+    if(m_meshWriter.valid() && m_meshWriter.wait_for(std::chrono::seconds(0)) == std::future_status::ready)
+    {
+        try
+        {
+            m_meshWriter.get();
+        }
+        catch(...)
+        {
+            // Optional cache writes are isolated from preview generation.
+        }
+    }
+
+    for(auto& job : m_meshJobs)
+    {
+        const auto* prepared = m_meshPreparation.Find(job.ticket);
+
+        if(!prepared || prepared->state == MeshThumbnailPreparation::State::Cancelled ||
+            prepared->state == MeshThumbnailPreparation::State::Failed)
+        {
+            job.stale = true;
+            job.ready = false;
+            continue;
+        }
+
+        if(!job.rendered || job.fence > m_meshCompletedFence || job.stale)
+        {
+            continue;
+        }
+
+        if(!job.validating && !job.ready)
+        {
+            const auto id = AssetID::ParseReference(job.identity.assetReference);
+            std::uint64_t ticket = 0;
+            std::string error;
+            job.validating = true;
+
+            if(!id || !m_meshPreparation.Request(paths, registry, *id, ticket, error) || ticket != job.ticket)
+            {
+                job.stale = true;
+                job.error = error.empty() ? "Mesh identity changed before thumbnail publication." : error;
+            }
+
+            continue;
+        }
+
+        if(job.validating && (prepared->state == MeshThumbnailPreparation::State::Prepared ||
+            prepared->state == MeshThumbnailPreparation::State::CacheHit))
+        {
+            job.ready = prepared->identity.sourceFingerprint == job.identity.sourceFingerprint;
+            job.stale = !job.ready;
+            job.validating = false;
+        }
+
+        if(job.ready && !job.stale)
+        {
+            PersistMeshImage(job);
+        }
+    }
+
+    for(const auto ticket : m_meshTickets)
+    {
+        PrepareMeshGPUJob(ticket);
+    }
+
+    std::erase_if(m_meshTickets, [this](std::uint64_t ticket)
+        { return m_meshPreparation.Find(ticket) == nullptr; });
+}
+
+const MeshThumbnailPreparation::Job* MaterialPreviewRenderer::GetMeshThumbnailPreparation(std::uint64_t ticket) const noexcept
+{
+    return m_meshPreparation.Find(ticket);
+}
+
+void MaterialPreviewRenderer::CancelMeshThumbnailPreparation(std::uint64_t ticket)
+{
+    m_meshPreparation.Cancel(ticket);
+
+    for(auto& job : m_meshJobs)
+    {
+        if(job.ticket == ticket)
+        {
+            job.stale = true;
+            job.ready = false;
+        }
+    }
+}
+
+void MaterialPreviewRenderer::DiscardMeshThumbnailPreparation(std::uint64_t ticket, MeshThumbnailConsumer consumer)
+{
+    const auto owners = m_meshConsumers.find(ticket);
+
+    if(owners != m_meshConsumers.end())
+    {
+        owners->second &= ~static_cast<unsigned int>(consumer);
+
+        if(owners->second != 0)
+        {
+            return;
+        }
+
+        m_meshConsumers.erase(owners);
+    }
+
+    CancelMeshThumbnailPreparation(ticket);
+    m_meshPreparation.Discard(ticket);
+    std::erase(m_meshTickets, ticket);
+}
+
+bool MaterialPreviewRenderer::BeginRecording(std::uint64_t generation)
+{
+    if(!m_initialized)
+    {
+        return true; // Renderer also records initialization work before previews exist.
+    }
+
+    if(generation == 0 || m_recording || m_quarantined)
+    {
+        return false;
+    }
+
+    RecordingSnapshot snapshot;
+    snapshot.generation = generation;
+    snapshot.inspectorValid = m_inspector.outputValid;
+    snapshot.thumbnailValid = m_thumbnail.outputValid;
+    snapshot.capturePending = m_thumbnail.capturePending;
+
+    snapshot.depthState = m_gBuffer.GetDepth().GetState();
+    RenderTarget* targets[] = {&m_gBuffer.GetMaterial(), &m_gBuffer.GetSurface(), &m_gBuffer.GetMotion(),
+        &m_gBuffer.GetGeometricNormal(), &m_hdrColor, &m_inspector.displayColor, &m_thumbnail.displayColor};
+
+    for(auto* target : targets)
+    {
+        snapshot.targets.push_back({target, target->GetState()});
+    }
+
+    for(auto& image : m_thumbnailImages)
+    {
+        snapshot.targets.push_back({&image.color, image.color.GetState()});
+        snapshot.images.push_back({&image, image.ready, image.recorded});
+    }
+
+    for(auto& job : m_meshJobs)
+    {
+        snapshot.targets.push_back({&job.color, job.color.GetState()});
+    }
+
+    for(auto& [key, texture] : m_textureCache)
+    {
+        snapshot.textures.push_back({&texture, texture.texture.GetSubresourceStates(), texture.awaitingSubmission});
+    }
+
+    m_recording = std::move(snapshot);
+    m_inspector.recorded = false;
+    m_thumbnail.recorded = false;
+    return true;
+}
+
+bool MaterialPreviewRenderer::DiscardRecording(std::uint64_t generation)
+{
+    if(!m_recording)
+    {
+        return !m_quarantined;
+    }
+
+    if(m_recording->generation != generation || m_quarantined)
+    {
+        return false;
+    }
+
+    for(const auto& target : m_recording->targets)
+    {
+        target.target->RestoreStateAfterAbort(target.state);
+    }
+
+    m_gBuffer.GetDepth().RestoreStateAfterAbort(m_recording->depthState);
+
+    for(auto& texture : m_recording->textures)
+    {
+        texture.entry->texture.RestoreStatesAfterAbort(texture.states);
+        texture.entry->awaitingSubmission = texture.awaitingSubmission;
+    }
+
+    for(const auto& image : m_recording->images)
+    {
+        image.image->ready = image.ready;
+        image.image->recorded = image.recorded;
+        image.image->awaitingDisplaySubmission = false;
+    }
+
+    m_inspector.outputValid = m_recording->inspectorValid;
+    m_thumbnail.outputValid = m_recording->thumbnailValid;
+    m_thumbnail.capturePending = m_recording->capturePending;
+
+    m_inspector.recorded = false;
+    m_thumbnail.recorded = false;
+
+    for(auto& job : m_meshJobs)
+    {
+        if(job.recorded)
+        {
+            job.staging.Reset();
+            job.recorded = false;
+            job.recordedBytes = 0;
+            job.renderRecorded = false;
+        }
+
+        job.awaitingDisplaySubmission = false;
+    }
+
+    m_recording.reset();
+    return true;
+}
+
+void MaterialPreviewRenderer::MarkSubmissionUncertain(std::uint64_t generation)
+{
+    if(m_recording && m_recording->generation == generation)
+    {
+        m_quarantined = true;
+    }
+}
+
+namespace
+{
+    bool CreatePreviewBuffer(ID3D12Device* device, size_t bytes, D3D12_HEAP_TYPE type,
+        Microsoft::WRL::ComPtr<ID3D12Resource>& resource)
+    {
+        D3D12_HEAP_PROPERTIES heap{};
+        heap.Type = type;
+        heap.CreationNodeMask = 1;
+        heap.VisibleNodeMask = 1;
+
+        D3D12_RESOURCE_DESC description{};
+        description.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        description.Width = bytes;
+        description.Height = 1;
+        description.DepthOrArraySize = 1;
+
+        description.MipLevels = 1;
+        description.SampleDesc.Count = 1;
+        description.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        const auto state = type == D3D12_HEAP_TYPE_UPLOAD ? D3D12_RESOURCE_STATE_GENERIC_READ :
+            type == D3D12_HEAP_TYPE_READBACK ? D3D12_RESOURCE_STATE_COPY_DEST : D3D12_RESOURCE_STATE_COMMON;
+
+        return SUCCEEDED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE,
+            &description, state, nullptr, IID_PPV_ARGS(resource.ReleaseAndGetAddressOf())));
+    }
+}
+
+void MaterialPreviewRenderer::PrepareMeshGPUJob(std::uint64_t ticket)
+{
+    if(std::any_of(m_meshJobs.begin(), m_meshJobs.end(), [ticket](const auto& job)
+        { return job.ticket == ticket; }))
+    {
+        return;
+    }
+
+    // Completed images own no geometry. At most one job retains source/destination buffers.
+    if(std::any_of(m_meshJobs.begin(), m_meshJobs.end(), [](const auto& job)
+        { return job.vertices || job.indices; }))
+    {
+        return;
+    }
+
+    const auto* prepared = m_meshPreparation.Find(ticket);
+
+    if(!prepared || (prepared->state != MeshThumbnailPreparation::State::Prepared &&
+        prepared->state != MeshThumbnailPreparation::State::CacheHit))
+    {
+        return;
+    }
+
+    if(m_meshJobs.size() >= kMeshImageCapacity)
+    {
+        const auto victim = std::find_if(m_meshJobs.begin(), m_meshJobs.end(), [this](const auto& job)
+        {
+            return !job.recorded && !job.awaitingDisplaySubmission &&
+                job.fence <= m_meshCompletedFence && job.displayFence <= m_meshCompletedFence;
+        });
+
+        if(victim == m_meshJobs.end())
+        {
+            return;
+        }
+
+        m_meshPreparation.Discard(victim->ticket);
+        m_meshConsumers.erase(victim->ticket);
+        // Remove expired ticket entries after the preparation enumeration completes.
+        victim->color.Shutdown();
+        m_meshJobs.erase(victim);
+    }
+
+    m_meshJobs.emplace_back();
+    auto& job = m_meshJobs.back();
+    job.ticket = ticket;
+    job.identity = prepared->identity;
+    job.diskSource = prepared->diskSource;
+    job.diskHit = prepared->state == MeshThumbnailPreparation::State::CacheHit;
+
+    if(job.diskHit)
+    {
+        if(!job.color.Initialize(m_device, kExtent, kExtent, DXGI_FORMAT_R8G8B8A8_UNORM,
+            *m_thumbnailRTVHeap, *m_heap) || !m_meshPreparation.TakeCachedPixels(ticket, job.cachedPixels))
+        {
+            job.error = "Could not prepare cached mesh thumbnail image.";
+            job.stale = true;
+            return;
+        }
+
+        const auto description = job.color.GetResource()->GetDesc();
+        m_device->GetCopyableFootprints(&description, 0, 1, 0, &job.footprint, nullptr, nullptr, &job.imageBytes);
+        return;
+    }
+
+    const auto& geometry = prepared->geometry;
+    const size_t vertexBytes = geometry.vertices.size() * sizeof(Vertex);
+    const size_t indexBytes = geometry.indices.size() * sizeof(std::uint32_t);
+    const MeshBounds bounds{geometry.boundsMin, geometry.boundsMax, true};
+
+    if(vertexBytes == 0 || indexBytes == 0 || vertexBytes > MeshThumbnailPreparation::kMaximumJobBytes ||
+        indexBytes > MeshThumbnailPreparation::kMaximumJobBytes - vertexBytes ||
+        geometry.metadata.submeshes.size() > 4096 ||
+        !ValidateMeshMetadata(geometry.metadata, geometry.indices.size(), job.error) ||
+        !FrameMeshBounds(bounds, job.framing, job.model, job.error))
+    {
+        job.error = "Mesh thumbnail geometry exceeds preview limits or has invalid ranges/bounds. " + job.error;
+        job.stale = true;
+        return;
+    }
+
+    if(!CreatePreviewBuffer(m_device, vertexBytes, D3D12_HEAP_TYPE_DEFAULT, job.vertices) ||
+        !CreatePreviewBuffer(m_device, indexBytes, D3D12_HEAP_TYPE_DEFAULT, job.indices) ||
+        !job.color.Initialize(m_device, kExtent, kExtent, DXGI_FORMAT_R8G8B8A8_UNORM,
+            *m_thumbnailRTVHeap, *m_heap))
+    {
+        job.error = "Could not allocate preview-owned mesh geometry or thumbnail target.";
+        job.vertices.Reset();
+        job.indices.Reset();
+        job.color.Shutdown();
+        job.stale = true;
+        return;
+    }
+
+    if(!m_meshPreparation.TakeGeometry(ticket, job.geometry))
+    {
+        job.error = "Prepared mesh geometry became unavailable before upload.";
+        job.stale = true;
+    }
+
+    const auto description = job.color.GetResource()->GetDesc();
+    m_device->GetCopyableFootprints(&description, 0, 1, 0, &job.footprint, nullptr, nullptr, &job.imageBytes);
+    // Readback is optional. Allocation failure never prevents rendering/display.
+    CreatePreviewBuffer(m_device, static_cast<size_t>(job.imageBytes), D3D12_HEAP_TYPE_READBACK, job.readback);
+}
+
+bool MaterialPreviewRenderer::HasMeshWork() const
+{
+    if(std::any_of(m_meshJobs.begin(), m_meshJobs.end(), [](const auto& job) { return bool(job.staging); }))
+    {
+        return false;
+    }
+
+    return std::any_of(m_meshJobs.begin(), m_meshJobs.end(), [this](const auto& job)
+    {
+        const auto* prepared = m_meshPreparation.Find(job.ticket);
+        return !job.stale && !job.rendered && !job.recorded && !job.staging &&
+            (job.vertices || job.diskHit) && job.fence <= m_meshCompletedFence && prepared &&
+            prepared->state != MeshThumbnailPreparation::State::Cancelled &&
+            prepared->state != MeshThumbnailPreparation::State::Failed;
+    });
+}
+
+bool MaterialPreviewRenderer::RecordMeshJob(const RecordingContext& context)
+{
+    for(auto& job : m_meshJobs)
+    {
+        if(job.stale || job.rendered || job.recorded || job.staging || (!job.vertices && !job.diskHit) ||
+            job.fence > m_meshCompletedFence)
+        {
+            continue;
+        }
+
+        if(job.diskHit)
+        {
+            return RecordCachedMeshImage(context, job);
+        }
+
+        const auto* prepared = m_meshPreparation.Find(job.ticket);
+
+        if(!prepared || prepared->state == MeshThumbnailPreparation::State::Cancelled ||
+            prepared->state == MeshThumbnailPreparation::State::Failed)
+        {
+            continue;
+        }
+
+        const size_t vertexBytes = job.geometry.vertices.size() * sizeof(Vertex);
+        const size_t indexBytes = job.geometry.indices.size() * sizeof(std::uint32_t);
+        const size_t end = (std::min)(vertexBytes + indexBytes, job.copiedBytes + kMeshUploadBytes);
+        const size_t bytes = end - job.copiedBytes;
+
+        if(bytes == 0 || !CreatePreviewBuffer(m_device, bytes, D3D12_HEAP_TYPE_UPLOAD, job.staging))
+        {
+            job.error = "Could not allocate bounded mesh thumbnail upload staging.";
+            job.stale = true;
+            return true;
+        }
+
+        void* mapped = nullptr;
+        const D3D12_RANGE noRead{0, 0};
+
+        if(FAILED(job.staging->Map(0, &noRead, &mapped)))
+        {
+            job.staging.Reset();
+            job.error = "Could not map mesh thumbnail staging buffer.";
+            job.stale = true;
+            return true;
+        }
+
+        const size_t vertexEnd = (std::min)(end, vertexBytes);
+        const size_t vertexStart = (std::min)(job.copiedBytes, vertexBytes);
+        const size_t vertexCopy = vertexEnd - vertexStart;
+        const size_t indexStart = job.copiedBytes > vertexBytes ? job.copiedBytes - vertexBytes : 0;
+        const size_t indexCopy = bytes - vertexCopy;
+
+        if(vertexCopy)
+        {
+            std::memcpy(mapped, reinterpret_cast<const std::byte*>(job.geometry.vertices.data()) + vertexStart,
+                vertexCopy);
+        }
+
+        if(indexCopy)
+        {
+            std::memcpy(static_cast<std::byte*>(mapped) + vertexCopy,
+                reinterpret_cast<const std::byte*>(job.geometry.indices.data()) + indexStart, indexCopy);
+        }
+
+        job.staging->Unmap(0, nullptr);
+        // Protect all referenced allocations before emitting any GPU commands.
+        job.recorded = true;
+        job.recordedBytes = bytes;
+
+        // Default-heap buffers start/decay to COMMON at ExecuteCommandLists boundaries.
+        // Each slice waits only by polling its fence; copy commands implicitly promote to COPY_DEST.
+        if(vertexCopy)
+        {
+            context.commandList->CopyBufferRegion(job.vertices.Get(), vertexStart, job.staging.Get(), 0, vertexCopy);
+        }
+
+        if(indexCopy)
+        {
+            context.commandList->CopyBufferRegion(job.indices.Get(), indexStart, job.staging.Get(), vertexCopy, indexCopy);
+        }
+
+        if(end != vertexBytes + indexBytes)
+        {
+            return true;
+        }
+
+        D3D12_RESOURCE_BARRIER barriers[2]{};
+        barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barriers[0].Transition = {job.vertices.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+            vertexCopy ? D3D12_RESOURCE_STATE_COPY_DEST : D3D12_RESOURCE_STATE_COMMON,
+            D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER};
+        barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barriers[1].Transition = {job.indices.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+            indexCopy ? D3D12_RESOURCE_STATE_COPY_DEST : D3D12_RESOURCE_STATE_COMMON,
+            D3D12_RESOURCE_STATE_INDEX_BUFFER};
+        context.commandList->ResourceBarrier(2, barriers);
+
+        PreviewGeometry geometry;
+        geometry.vertices = {job.vertices->GetGPUVirtualAddress(), static_cast<UINT>(vertexBytes), sizeof(Vertex)};
+        geometry.indices = {job.indices->GetGPUVirtualAddress(), static_cast<UINT>(indexBytes), DXGI_FORMAT_R32_UINT};
+        geometry.ranges = job.geometry.metadata.submeshes;
+        geometry.bounds = {job.geometry.boundsMin, job.geometry.boundsMax, true};
+
+        geometry.model = job.model;
+        geometry.indexCount = static_cast<unsigned int>(job.geometry.indices.size());
+        Material neutral;
+        std::fill(std::begin(neutral.baseColor), std::end(neutral.baseColor), 0.5f);
+
+        job.renderRecorded = RecordGeometryJob(context, neutral.GetGPUData(), {}, job.color, geometry, job.framing);
+
+        if(job.renderRecorded)
+        {
+            RecordMeshReadback(context, job);
+        }
+
+        return job.renderRecorded;
+    }
+
+    return true;
+}
+
+void MaterialPreviewRenderer::PollMeshGPUFences(std::uint64_t completedFence)
+{
+    if(completedFence == UINT64_MAX || m_recording || m_quarantined)
+    {
+        return;
+    }
+
+    m_meshCompletedFence = (std::max)(m_meshCompletedFence, completedFence);
+
+    for(auto& job : m_meshJobs)
+    {
+        if(job.recorded || job.fence > m_meshCompletedFence)
+        {
+            continue;
+        }
+
+        job.staging.Reset();
+
+        if(job.rendered || job.stale)
+        {
+            job.vertices.Reset();
+            job.indices.Reset();
+            job.geometry = {};
+            job.cachedPixels = {};
+        }
+
+        if(job.stale)
+        {
+            job.readback.Reset();
+        }
+    }
+}
+
+std::optional<MaterialPreviewRenderer::MeshThumbnailImage> MaterialPreviewRenderer::GetMeshThumbnailImage(
+    const DescriptorHeap& heap, std::uint64_t ticket)
+{
+    if(m_recording || m_quarantined)
+    {
+        return std::nullopt;
+    }
+
+    for(auto& job : m_meshJobs)
+    {
+        const auto* prepared = m_meshPreparation.Find(ticket);
+
+        if(job.ticket == ticket && job.ready && !job.stale && prepared &&
+            prepared->state != MeshThumbnailPreparation::State::Cancelled &&
+            prepared->state != MeshThumbnailPreparation::State::Failed)
+        {
+            job.awaitingDisplaySubmission = true;
+            return MeshThumbnailImage{heap.GetGPUHandle(job.color.GetSRVIndex()), job.identity};
+        }
+    }
+
+    return std::nullopt;
+}
+
+std::string MaterialPreviewRenderer::GetMeshThumbnailError(std::uint64_t ticket) const
+{
+    for(const auto& job : m_meshJobs)
+    {
+        if(job.ticket == ticket && !job.error.empty())
+        {
+            return job.error;
+        }
+    }
+
+    const auto* prepared = m_meshPreparation.Find(ticket);
+    return prepared ? prepared->error : "Mesh thumbnail request is no longer retained.";
+}
+
+bool MaterialPreviewRenderer::RecordCachedMeshImage(const RecordingContext& context, MeshGPUJob& job)
+{
+    if(job.cachedPixels.width != kExtent || job.cachedPixels.height != kExtent ||
+        job.cachedPixels.pixels.size() != kExtent * kExtent * 4 || job.imageBytes > kMeshUploadBytes ||
+        !CreatePreviewBuffer(m_device, static_cast<size_t>(job.imageBytes), D3D12_HEAP_TYPE_UPLOAD, job.staging))
+    {
+        job.error = "Cached mesh thumbnail pixels or upload allocation are invalid.";
+        job.stale = true;
+        return true;
+    }
+
+    void* mapped = nullptr;
+    const D3D12_RANGE noRead{0, 0};
+
+    if(FAILED(job.staging->Map(0, &noRead, &mapped)))
+    {
+        job.staging.Reset();
+        job.error = "Could not map cached mesh thumbnail upload.";
+        job.stale = true;
+        return true;
+    }
+
+    for(size_t row = 0; row < kExtent; ++row)
+    {
+        std::memcpy(static_cast<unsigned char*>(mapped) + job.footprint.Offset + row * job.footprint.Footprint.RowPitch,
+            job.cachedPixels.pixels.data() + row * kExtent * 4, kExtent * 4);
+    }
+
+    job.staging->Unmap(0, nullptr);
+    job.recorded = true;
+    job.renderRecorded = true;
+    job.color.Transition(context.commandList, D3D12_RESOURCE_STATE_COPY_DEST);
+
+    D3D12_TEXTURE_COPY_LOCATION source{};
+    source.pResource = job.staging.Get();
+    source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    source.PlacedFootprint = job.footprint;
+
+    D3D12_TEXTURE_COPY_LOCATION destination{};
+    destination.pResource = job.color.GetResource();
+    destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+
+    context.commandList->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
+    job.color.Transition(context.commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    return true;
+}
+
+void MaterialPreviewRenderer::RecordMeshReadback(const RecordingContext& context, MeshGPUJob& job)
+{
+    if(!job.readback)
+    {
+        return;
+    }
+
+    job.color.Transition(context.commandList, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    D3D12_TEXTURE_COPY_LOCATION source{};
+    source.pResource = job.color.GetResource();
+    source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+
+    D3D12_TEXTURE_COPY_LOCATION destination{};
+    destination.pResource = job.readback.Get();
+    destination.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    destination.PlacedFootprint = job.footprint;
+
+    context.commandList->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
+    job.color.Transition(context.commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+}
+
+void MaterialPreviewRenderer::PersistMeshImage(MeshGPUJob& job)
+{
+    if(job.diskHit || job.persistenceAttempted || !job.readback || m_meshWriter.valid() ||
+        !job.ready || job.stale || !job.rendered || job.fence > m_meshCompletedFence)
+    {
+        return;
+    }
+
+    void* mapped = nullptr;
+    const D3D12_RANGE readRange{0, static_cast<SIZE_T>(job.imageBytes)};
+
+    if(FAILED(job.readback->Map(0, &readRange, &mapped)))
+    {
+        job.persistenceAttempted = true;
+        job.readback.Reset();
+        return;
+    }
+
+    MaterialThumbnailDiskCache::Image pixels{kExtent, kExtent, {}};
+
+    try
+    {
+        pixels.pixels.resize(kExtent * kExtent * 4);
+
+        for(size_t row = 0; row < kExtent; ++row)
+        {
+            std::memcpy(pixels.pixels.data() + row * kExtent * 4,
+                static_cast<const unsigned char*>(mapped) + job.footprint.Offset + row * job.footprint.Footprint.RowPitch,
+                kExtent * 4);
+        }
+    }
+    catch(...)
+    {
+        const D3D12_RANGE noWrite{0, 0};
+        job.readback->Unmap(0, &noWrite);
+        job.readback.Reset();
+        job.persistenceAttempted = true;
+        return;
+    }
+
+    const D3D12_RANGE noWrite{0, 0};
+    job.readback->Unmap(0, &noWrite);
+    job.readback.Reset();
+    job.persistenceAttempted = true;
+
+    try
+    {
+        // Registry/project/source identity was checked by the current main-thread poll.
+        // Worker pins the source and rehashes before publishing; no Renderer/project borrows.
+        m_meshWriter = std::async(std::launch::async,
+            [source = job.diskSource, digest = job.identity.sourceFingerprint, pixels = std::move(pixels)]()
+        {
+            HANDLE input = CreateFileW(source.path.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+
+            if(input == INVALID_HANDLE_VALUE)
+            {
+                return;
+            }
+
+            const std::shared_ptr<void> sourceLock(input, [](void* handle) { CloseHandle(handle); });
+
+            try
+            {
+                MaterialThumbnailValidation validation;
+
+                if(validation.Digest(source.path) == digest)
+                {
+                    MaterialThumbnailDiskCache::Store(source, pixels);
+                }
+            }
+            catch(...)
+            {
+                // Optional disk I/O/hash failures do not invalidate a completed GPU image.
+            }
+        });
+    }
+    catch(...)
+    {
+        // A failed worker launch is a nonfatal cache miss on the next application run.
+    }
 }

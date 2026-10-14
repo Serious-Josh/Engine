@@ -7,6 +7,8 @@
 #include "imgui.h"
 #include "imgui_internal.h"
 #include "assets/ProjectTextureImportService.h"
+#include "assets/ProjectMeshImportService.h"
+#include "assets/ProjectAssetResolver.h"
 #include "Core/Log.h"
 
 #ifndef NOMINMAX
@@ -15,6 +17,7 @@
 #include <Windows.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <cwctype>
 #include <utility>
@@ -419,6 +422,7 @@ void AssetBrowser::DrawContents()
     std::filesystem::path destination;
     bool tileHovered = false;
     size_t visibleMaterialCount = 0;
+    size_t visibleMeshCount = 0;
 
     if (ImGui::BeginTable("Files", columns, ImGuiTableFlags_SizingStretchSame))
     {
@@ -434,21 +438,31 @@ void AssetBrowser::DrawContents()
             const auto material = m_materialRecords.find(entry.path.lexically_normal());
             const bool isMaterial = !entry.directory && material != m_materialRecords.end() &&
                 _wcsicmp(entry.path.extension().c_str(), L".material") == 0;
-            const bool hasThumbnail = isTexture || isMaterial;
+            const bool isMesh = !entry.directory && m_meshRecords.contains(entry.path.lexically_normal());
+            const bool hasThumbnail = isTexture || isMaterial || isMesh;
             const auto tilePosition = ImGui::GetCursorScreenPos();
             constexpr float thumbnailSize = 96.0f;
-            const bool pressed = ImGui::Selectable(isTexture ? "##Texture" : isMaterial ? "##Material" : entry.directory ? "[Folder]" : "[File]",
+            const char* tileLabel = isTexture ? "##Texture" : isMaterial ? "##Material" :
+                isMesh ? "##Mesh" : entry.directory ? "[Folder]" : "[File]";
+            const bool pressed = ImGui::Selectable(tileLabel,
                 m_selection == entry.path, ImGuiSelectableFlags_AllowDoubleClick,
                 hasThumbnail ? ImVec2(thumbnailSize, thumbnailSize) : ImVec2(0.0f, 48.0f));
+            const bool tileVisible = ImGui::IsItemVisible();
+
+            if(isMesh)
+            {
+                DrawMeshDragSource(entry.path, entry.name);
+            }
+
             const TextureThumbnailCache::Preview* preview = nullptr;
 
             std::string materialError;
 
-            if(hasThumbnail && ImGui::IsItemVisible())
+            if(hasThumbnail && tileVisible)
             {
                 if(isTexture && !m_thumbnailResetRequested && m_thumbnailPaths && m_thumbnailRegistry)
                 {
-                    preview = m_thumbnails.FindOrCreate(*m_thumbnailPaths, *m_thumbnailRegistry, registered->second);
+                    preview = m_thumbnails->FindOrCreate(*m_thumbnailPaths, *m_thumbnailRegistry, registered->second);
                 }
 
                 auto* draw = ImGui::GetWindowDrawList();
@@ -456,13 +470,13 @@ void AssetBrowser::DrawContents()
                 const ImVec2 end(tilePosition.x + thumbnailSize - 3.0f, tilePosition.y + thumbnailSize - 3.0f);
                 draw->AddRectFilled(start, end, IM_COL32(55, 55, 55, 255));
 
-                if(preview && preview->texture.GetResource())
+                if(preview && !preview->invalidated && preview->error.empty() && preview->texture.GetResource())
                 {
                     const float scale = (thumbnailSize - 6.0f) / static_cast<float>((std::max)(preview->width, preview->height));
                     const ImVec2 size(preview->width * scale, preview->height * scale);
                     const ImVec2 position(tilePosition.x + (thumbnailSize - size.x) * 0.5f,
                         tilePosition.y + (thumbnailSize - size.y) * 0.5f);
-                    draw->AddImage(static_cast<ImTextureID>(m_thumbnails.GetHandle(*preview).ptr), position,
+                    draw->AddImage(static_cast<ImTextureID>(m_thumbnails->GetHandle(*preview).ptr), position,
                         ImVec2(position.x + size.x, position.y + size.y));
                 }
                 else if(isMaterial && m_materialRenderer && m_thumbnailPaths && m_thumbnailRegistry)
@@ -486,10 +500,29 @@ void AssetBrowser::DrawContents()
                         draw->AddText(ImVec2(start.x + 5.0f, start.y + 5.0f), IM_COL32(190, 190, 190, 255), "Material");
                     }
                 }
+                else if(isMesh && m_materialRenderer && m_thumbnailPaths && m_thumbnailRegistry)
+                {
+                    std::optional<D3D12_GPU_DESCRIPTOR_HANDLE> image;
+
+                    if(visibleMeshCount++ < MaterialPreviewRenderer::kMeshThumbnailCapacity)
+                    {
+                        const auto& record = m_meshRecords.at(entry.path.lexically_normal());
+                        image = GetVisibleMeshThumbnail(record, materialError);
+                    }
+
+                    if(image)
+                    {
+                        draw->AddImage(static_cast<ImTextureID>(image->ptr), start, end);
+                    }
+                    else
+                    {
+                        draw->AddText(ImVec2(start.x + 5.0f, start.y + 5.0f), IM_COL32(190, 190, 190, 255), "Mesh");
+                    }
+                }
                 else
                 {
                     draw->AddText(ImVec2(start.x + 5.0f, start.y + 5.0f), IM_COL32(190, 190, 190, 255),
-                        isMaterial ? "Material" : "Texture");
+                        isMaterial ? "Material" : isMesh ? "Mesh" : "Texture");
                 }
             }
 
@@ -606,7 +639,12 @@ void AssetBrowser::DrawContents()
 
 void AssetBrowser::Draw(const EditorWorkspaceRect& rectangle)
 {
-    m_thumbnails.BeginFrame();
+    m_thumbnails->BeginFrame();
+
+    for(auto& [identity, request] : m_meshThumbnailRequests)
+    {
+        request.visible = false;
+    }
 
     if(m_materialRenderer)
     {
@@ -614,12 +652,14 @@ void AssetBrowser::Draw(const EditorWorkspaceRect& rectangle)
 
         if(m_materialRequestsReset)
         {
+            PruneMeshThumbnailRequests(true);
             m_materialRenderer->DiscardSavedMaterialThumbnailRequests();
             m_materialRequestsReset = false;
         }
 
         if(m_materialImagesInvalidated)
         {
+            PruneMeshThumbnailRequests(true);
             m_materialRenderer->InvalidateSavedMaterialThumbnailImages();
             m_materialImagesInvalidated = false;
         }
@@ -630,6 +670,7 @@ void AssetBrowser::Draw(const EditorWorkspaceRect& rectangle)
 
     if(rectangle.size.x <= 0.0f || rectangle.size.y <= 0.0f)
     {
+        PruneMeshThumbnailRequests(true);
         return;
     }
 
@@ -723,6 +764,7 @@ void AssetBrowser::Draw(const EditorWorkspaceRect& rectangle)
 
     ImGui::End();
     ImGui::PopStyleVar(2);
+    PruneMeshThumbnailRequests();
 }
 
 void AssetBrowser::CaptureDropTarget(const std::filesystem::path& directory, bool contentArea)
@@ -781,7 +823,7 @@ void AssetBrowser::ImportFileDrop(
 
     if(!target || target->directory.empty())
     {
-        m_importFeedback = "Drop rejected: use a visible texture folder or empty Asset Browser content area.";
+        m_importFeedback = "Drop rejected: use a visible folder or empty Asset Browser content area.";
         Log::Info(m_importFeedback);
         return;
     }
@@ -794,8 +836,12 @@ void AssetBrowser::ImportFileDrop(
     {
         std::filesystem::path imported;
         std::string error;
+        const bool isMesh = _wcsicmp(source.extension().c_str(), L".fbx") == 0;
+        const bool succeeded = isMesh ?
+            ProjectMeshImportService::Import(paths, registry, source, imported, error) :
+            ProjectTextureImportService::Import(paths, registry, source, target->directory, imported, error);
 
-        if(ProjectTextureImportService::Import(paths, registry, source, target->directory, imported, error))
+        if(succeeded)
         {
             ++successes;
 
@@ -804,27 +850,39 @@ void AssetBrowser::ImportFileDrop(
                 renamed += "\nCollision resolved: " + source.filename().string() + " -> " + imported.filename().string();
             }
 
-            Log::Info("Imported texture: " + imported.string());
+            Log::Info("Imported asset: " + imported.string());
         }
         else
         {
             failures += "\n" + source.filename().string() + ": " + error;
-            Log::Error("Texture import failed: " + source.string() + ": " + error);
+            Log::Error("Asset import failed: " + source.string() + ": " + error);
         }
     }
 
-    m_importFeedback = "Imported " + std::to_string(successes) + " of " + std::to_string(files.size()) + " textures." + renamed + failures;
+    m_importFeedback = "Imported " + std::to_string(successes) + " of " + std::to_string(files.size()) +
+        " assets. FBX meshes are stored in Meshes." + renamed + failures;
 
     if(successes != 0)
     {
         // Refresh without clearing folder navigation, selection, or Inspector edits.
         m_listings.clear();
         m_materialImagesInvalidated = true;
+        SetThumbnailProject(paths, registry);
     }
 }
 
 void AssetBrowser::SetThumbnailProject(const ProjectPaths& paths, const ProjectAssetRegistry& registry)
 {
+    std::error_code projectError;
+    const auto canonicalProject = std::filesystem::canonical(paths.GetRoot(), projectError);
+
+    if(projectError || canonicalProject != m_meshDragProject)
+    {
+        PruneMeshThumbnailRequests(true);
+        InvalidateMeshDragIdentity();
+        m_meshDragProject = projectError ? std::filesystem::path{} : canonicalProject;
+    }
+
     if(!m_thumbnailProjectRoot.empty() && m_thumbnailProjectRoot != paths.GetRoot())
     {
         m_thumbnailResetRequested = true;
@@ -837,6 +895,7 @@ void AssetBrowser::SetThumbnailProject(const ProjectPaths& paths, const ProjectA
     m_thumbnailRegistry = &registry;
     m_textureRecords.clear();
     m_materialRecords.clear();
+    m_meshRecords.clear();
 
     for(const auto& record : registry.GetAssets(AssetType::Texture))
     {
@@ -846,6 +905,11 @@ void AssetBrowser::SetThumbnailProject(const ProjectPaths& paths, const ProjectA
     for(const auto& record : registry.GetAssets(AssetType::Material))
     {
         m_materialRecords.emplace((paths.GetRoot() / record.relativePath).lexically_normal(), record);
+    }
+
+    for(const auto& record : registry.GetAssets(AssetType::Mesh))
+    {
+        m_meshRecords.emplace((paths.GetRoot() / record.relativePath).lexically_normal(), record);
     }
 }
 
@@ -859,15 +923,94 @@ void AssetBrowser::InvalidateMaterialSource(const std::filesystem::path& path)
 
 void AssetBrowser::PauseMaterialThumbnails()
 {
+    if(m_thumbnails)
+    {
+        m_thumbnails->ReleaseConsumer(TextureThumbnailCache::Consumer::AssetBrowser);
+    }
+
+    PruneMeshThumbnailRequests(true);
     if(m_materialRenderer)
     {
+        // The Scene Object Inspector may still admit visible slots with the browser hidden.
+        m_materialRenderer->BeginSavedMaterialThumbnailWorkingSet();
         m_materialRenderer->DiscardSavedMaterialThumbnailRequests();
     }
 }
 
-void AssetBrowser::ClearThumbnailsAfterGPUDrain()
+void AssetBrowser::PruneMeshThumbnailRequests(bool all)
 {
-    m_thumbnails.ClearAfterGPUDrain();
+    for(auto entry = m_meshThumbnailRequests.begin(); entry != m_meshThumbnailRequests.end();)
+    {
+        if(!all && entry->second.visible)
+        {
+            ++entry;
+            continue;
+        }
+
+        if(m_materialRenderer && entry->second.ticket)
+        {
+            m_materialRenderer->DiscardMeshThumbnail(entry->second.ticket);
+        }
+
+        entry = m_meshThumbnailRequests.erase(entry);
+    }
+}
+
+std::optional<D3D12_GPU_DESCRIPTOR_HANDLE> AssetBrowser::GetVisibleMeshThumbnail(
+    const AssetRecord& record, std::string& error)
+{
+    if(!m_materialRenderer || !m_thumbnailPaths || !m_thumbnailRegistry)
+    {
+        return std::nullopt;
+    }
+
+    const auto* registered = m_thumbnailRegistry->Find(record.id);
+    const auto resolved = ProjectAssetResolver::Resolve(*m_thumbnailPaths, *m_thumbnailRegistry, record.id);
+
+    if(!registered || registered->type != AssetType::Mesh || resolved.status != AssetAvailability::Available)
+    {
+        error = "Mesh thumbnail source is missing or no longer registered.";
+        const auto previous = m_meshThumbnailRequests.find(record.id.ToReference());
+
+        if(previous != m_meshThumbnailRequests.end())
+        {
+            m_materialRenderer->DiscardMeshThumbnail(previous->second.ticket);
+            m_meshThumbnailRequests.erase(previous);
+        }
+
+        return std::nullopt;
+    }
+
+    auto& request = m_meshThumbnailRequests[record.id.ToReference()];
+    request.visible = true;
+    const auto now = std::chrono::steady_clock::now();
+
+    if(now >= request.nextValidation)
+    {
+        if(request.ticket && !m_materialRenderer->IsMeshThumbnailRequestCurrent(request.ticket))
+        {
+            m_materialRenderer->DiscardMeshThumbnail(request.ticket);
+            request.ticket = 0;
+        }
+
+        m_materialRenderer->RequestMeshThumbnail(*m_thumbnailPaths, *m_thumbnailRegistry,
+            record.id, request.ticket, request.error);
+        request.nextValidation = now + std::chrono::milliseconds(request.ticket ? 2000 : 250);
+    }
+
+    error = request.error.empty() && request.ticket ?
+        m_materialRenderer->GetMeshThumbnailError(request.ticket) : request.error;
+    const auto image = m_materialRenderer->GetMeshThumbnailImage(request.ticket);
+    return image ? std::optional<D3D12_GPU_DESCRIPTOR_HANDLE>(image->srv) : std::nullopt;
+}
+
+void AssetBrowser::ResetThumbnailRequests()
+{
+    if(m_thumbnails)
+    {
+        m_thumbnails->ReleaseConsumer(TextureThumbnailCache::Consumer::AssetBrowser, true);
+    }
+
     m_thumbnailResetRequested = false;
 }
 
@@ -924,7 +1067,7 @@ void AssetBrowser::OnDeletionCompleted(const std::filesystem::path& path, const 
 
     if(error.empty())
     {
-        m_thumbnails.Invalidate(path);
+        m_thumbnails->Invalidate(path);
         m_textureRecords.erase(path.lexically_normal());
         m_materialRecords.erase(path.lexically_normal());
         m_materialImagesInvalidated = true;
@@ -1023,7 +1166,7 @@ void AssetBrowser::OnRenameCompleted(
 
         if(source != destination)
         {
-            m_thumbnails.Invalidate(source);
+            m_thumbnails->Invalidate(source);
             m_textureRecords.erase(source.lexically_normal());
         }
 
@@ -1032,4 +1175,82 @@ void AssetBrowser::OnRenameCompleted(
             m_selection = destination;
         }
     }
+}
+
+void AssetBrowser::InvalidateMeshDragIdentity() noexcept
+{
+    static std::atomic<std::uint64_t> nextIdentity{1};
+    m_meshDragIdentity = nextIdentity.fetch_add(1, std::memory_order_relaxed);
+}
+
+void AssetBrowser::DrawMeshDragSource(const std::filesystem::path& path, const std::string& name)
+{
+    const auto found = m_meshRecords.find(path.lexically_normal());
+
+    if(found == m_meshRecords.end() || m_meshDragProject.empty() || m_meshDragIdentity == 0)
+    {
+        return;
+    }
+
+    if(!ImGui::BeginDragDropSource())
+    {
+        return;
+    }
+
+    MeshDragPayload payload;
+    payload.projectIdentity = m_meshDragIdentity;
+    const auto reference = found->second.id.ToReference();
+    std::copy(reference.begin(), reference.end(), payload.meshReference.begin());
+    ImGui::SetDragDropPayload(MeshDragPayloadType, &payload, sizeof(payload), ImGuiCond_Once);
+    ImGui::Text("Mesh: %s", name.c_str());
+    ImGui::TextUnformatted("Drop into Scene Viewport to place at cursor");
+    ImGui::EndDragDropSource();
+}
+
+std::optional<AssetRecord> AssetBrowser::ValidateMeshDrag(const MeshDragPayload& payload,
+    const ProjectPaths& paths, const ProjectAssetRegistry& registry, std::string& error) const
+{
+    error.clear();
+    std::error_code pathError;
+    const auto project = std::filesystem::canonical(paths.GetRoot(), pathError);
+
+    if(payload.version != 1 || payload.reserved != 0 || payload.projectIdentity == 0 ||
+        payload.projectIdentity != m_meshDragIdentity || pathError || project != m_meshDragProject)
+    {
+        error = "Mesh drag is stale or belongs to another project. Start a new drag.";
+        return std::nullopt;
+    }
+
+    if(payload.meshReference.back() != '\0')
+    {
+        error = "Mesh drag has an invalid reference format.";
+        return std::nullopt;
+    }
+
+    const std::string_view reference(payload.meshReference.data(), payload.meshReference.size() - 1);
+    const auto id = AssetID::ParseReference(reference);
+    const auto* record = id ? registry.Find(*id) : nullptr;
+
+    if(!record || record->type != AssetType::Mesh)
+    {
+        error = "Dragged asset is no longer registered as a mesh.";
+        return std::nullopt;
+    }
+
+    const auto resolved = ProjectAssetResolver::Resolve(paths, registry, *id);
+
+    if(resolved.status != AssetAvailability::Available ||
+        _wcsicmp(resolved.resolvedPath.extension().c_str(), L".fbx") != 0)
+    {
+        error = "Dragged mesh source is missing, inaccessible, or is not a project FBX. Restore it before dragging.";
+        return std::nullopt;
+    }
+
+    return *record;
+}
+
+void AssetBrowser::ConfigureMaterialThumbnails(Renderer& renderer)
+{
+    m_materialRenderer = &renderer;
+    m_thumbnails = &renderer.GetTextureThumbnailCache();
 }

@@ -63,6 +63,18 @@ namespace
                 {"meshReference", object.meshReference},
                 {"materialReference", object.materialReference}
             });
+
+            if(!object.materialSlotBindings.empty())
+            {
+                Json bindings = Json::array();
+
+                for(const auto& [slotID, reference] : object.materialSlotBindings)
+                {
+                    bindings.push_back({{"slotID", slotID}, {"materialReference", reference}});
+                }
+
+                objects.back()["materialSlotBindings"] = std::move(bindings);
+            }
         }
 
         const auto& camera = document.camera;
@@ -133,6 +145,27 @@ namespace
                 item.at("meshReference").get<std::string>();
             object.materialReference =
                 item.at("materialReference").get<std::string>();
+
+            if(item.contains("materialSlotBindings"))
+            {
+                const auto& bindings = item.at("materialSlotBindings");
+
+                if(!bindings.is_array())
+                {
+                    throw std::runtime_error("Material-slot bindings must be an array.");
+                }
+
+                for(const auto& binding : bindings)
+                {
+                    const auto slotID = binding.at("slotID").get<std::string>();
+                    const auto reference = binding.at("materialReference").get<std::string>();
+
+                    if(!object.materialSlotBindings.emplace(slotID, reference).second)
+                    {
+                        throw std::runtime_error("Duplicate material-slot ID: " + slotID);
+                    }
+                }
+            }
 
             result.objects.push_back(std::move(object));
         }

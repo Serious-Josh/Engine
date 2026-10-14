@@ -14,24 +14,187 @@
 #include "Renderer/ProjectTextureLoader.h"
 #include "assets/ProjectAssetResolver.h"
 #include "assets/MaterialAssetSerializer.h"
+#include "assets/ModelImporter.h"
 
 #include <algorithm>
 #include <atomic>
 #include <cctype>
 #include <exception>
 #include <limits>
+#include <stdexcept>
 #include <utility>
 
 Mesh* FileSceneAssetCatalog::ResolveMesh(std::string_view reference)
 {
-    if (!m_initialized)
+    m_meshError.clear();
+    const auto fail = [&](const std::string& message) -> Mesh*
     {
+        m_meshError = message;
         return nullptr;
+    };
+
+    if(!m_initialized || !m_device || !m_uploader || !m_descriptorHeap)
+    {
+        return fail("Mesh resolution requires an initialized catalog.");
     }
 
     if (reference == "builtin:sphere")
     {
         return &m_sphereMesh;
+    }
+
+    if(!m_registry)
+    {
+        return fail("Project mesh resolution requires the live project registry.");
+    }
+
+    try
+    {
+        const auto id = AssetID::ParseReference(reference);
+
+        if(!id)
+        {
+            return fail("Mesh reference must be a canonical asset:<uuid> reference.");
+        }
+
+        const auto* record = m_registry->Find(*id);
+
+        if(!record || record->type != AssetType::Mesh)
+        {
+            return fail("Mesh reference is not registered as a Mesh asset.");
+        }
+
+        const ProjectPaths paths(m_projectRoot);
+        const auto resolved = ProjectAssetResolver::Resolve(paths, *m_registry, *id);
+
+        if(resolved.status != AssetAvailability::Available)
+        {
+            switch(resolved.status)
+            {
+            case AssetAvailability::Missing:
+                return fail("Registered mesh file is missing.");
+            case AssetAvailability::Unreadable:
+                return fail("Registered mesh path is inaccessible.");
+            case AssetAvailability::InvalidPath:
+                return fail("Registered mesh path is invalid or escapes the project's Meshes directory.");
+            default:
+                return fail("Mesh asset is no longer registered.");
+            }
+        }
+
+        if(_wcsicmp(resolved.resolvedPath.extension().c_str(), L".fbx") != 0)
+        {
+            return fail("Registered mesh source must have the .fbx extension.");
+        }
+
+        // Pin source bytes while hashing and importing. The checked uploader is
+        // synchronous, so an unpublished candidate can be destroyed on failure.
+        struct SourceLock
+        {
+            HANDLE handle = INVALID_HANDLE_VALUE;
+            ~SourceLock()
+            {
+                if(handle != INVALID_HANDLE_VALUE)
+                {
+                    CloseHandle(handle);
+                }
+            }
+        };
+
+        SourceLock source;
+        source.handle = CreateFileW(resolved.resolvedPath.c_str(), GENERIC_READ, FILE_SHARE_READ,
+            nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+
+        if(source.handle == INVALID_HANDLE_VALUE)
+        {
+            return fail("Cannot lock mesh source for reading (Windows error " +
+                std::to_string(GetLastError()) + ").");
+        }
+
+        MaterialThumbnailValidation validation;
+        const auto digest = validation.Digest(resolved.resolvedPath);
+        const auto projectIdentity = std::filesystem::canonical(paths.GetRoot());
+        const MeshCacheKey key{projectIdentity, id->ToString(), digest, kMeshImportRevision};
+        const auto cached = m_projectMeshes.find(key);
+
+        if(cached != m_projectMeshes.end())
+        {
+            return &cached->second->mesh;
+        }
+
+        for(const auto& [existingKey, asset] : m_projectMeshes)
+        {
+            if(std::get<0>(existingKey) == projectIdentity && std::get<1>(existingKey) == id->ToString())
+            {
+                return fail("Registered mesh source changed; reload the scene to use the new geometry.");
+            }
+        }
+
+        auto asset = std::make_unique<MeshAsset>();
+        asset->geometry = ModelImporter::LoadFlattened(resolved.resolvedPath, MeshUVOrientation::FlipV);
+
+        // Use a fresh hasher: equal size/timestamps must not conceal changed bytes.
+        MaterialThumbnailValidation verification;
+
+        if(verification.Digest(resolved.resolvedPath) != digest)
+        {
+            return fail("Mesh source changed during import; retry.");
+        }
+
+        const auto& geometry = asset->geometry;
+
+        if(!asset->mesh.Initialize(m_device, *m_uploader, *m_descriptorHeap,
+            geometry.vertices.data(), geometry.vertices.size(), m_vertexLayout,
+            geometry.indices.data(), geometry.indices.size()))
+        {
+            return fail("Failed to create mesh GPU buffers or descriptors for " + std::string(reference) + ".");
+        }
+
+        std::string metadataError;
+
+        if(!asset->mesh.SetMetadata(geometry.metadata, metadataError))
+        {
+            return fail("Imported mesh metadata is invalid: " + metadataError);
+        }
+
+        if(!asset->mesh.GetBounds().valid)
+        {
+            return fail("Uploaded mesh has invalid bounds.");
+        }
+
+        const auto inserted = m_projectMeshes.emplace(key, std::move(asset));
+        inserted.first->second->published = true;
+        return &inserted.first->second->mesh;
+    }
+    catch(const std::exception& error)
+    {
+        return fail("Project mesh " + std::string(reference) + " resolution failed: " + error.what());
+    }
+}
+
+FileSceneAssetCatalog::MeshAsset::~MeshAsset()
+{
+    // Published resources require explicit checked catalog Shutdown. Unexpected
+    // owner destruction must not release resources still referenced by GPU work.
+    if(!published)
+    {
+        mesh.Shutdown();
+    }
+}
+
+const ImportedMesh* FileSceneAssetCatalog::GetMeshGeometry(const Mesh& mesh) const noexcept
+{
+    if(m_initialized && &mesh == &m_sphereMesh)
+    {
+        return &m_sphereGeometry;
+    }
+
+    for(const auto& [key, asset] : m_projectMeshes)
+    {
+        if(&asset->mesh == &mesh)
+        {
+            return &asset->geometry;
+        }
     }
 
     return nullptr;
@@ -432,6 +595,12 @@ bool FileSceneAssetCatalog::Initialize(
 
     // Opaque white base texture. The material's baseColor
     // controls the final tint.
+    m_sphereGeometry.vertices = std::move(sphere.vertices);
+    m_sphereGeometry.indices = std::move(sphere.indices);
+    m_sphereGeometry.boundsMin = m_sphereMesh.GetBounds().min;
+    m_sphereGeometry.boundsMax = m_sphereMesh.GetBounds().max;
+    m_sphereGeometry.metadata = m_sphereMesh.GetMetadata();
+
     constexpr unsigned char whitePixel[4] = {
         255, 255, 255, 255
     };
@@ -493,6 +662,15 @@ void FileSceneAssetCatalog::Shutdown()
     m_initialized = false;
     m_catalogIdentity = 0;
 
+    // Renderer must have drained/discarded commands and released BLAS/TLAS first.
+    for(auto& [key, asset] : m_projectMeshes)
+    {
+        asset->mesh.Shutdown();
+    }
+
+    m_projectMeshes.clear();
+    m_meshError.clear();
+
     m_defaultMaterial = Material{};
     m_projectMaterials.clear();
     m_materialSources.clear();
@@ -524,6 +702,7 @@ void FileSceneAssetCatalog::Shutdown()
 
     m_whiteTexture.Shutdown();
     m_sphereMesh.Shutdown();
+    m_sphereGeometry = ImportedMesh{};
     m_pipeline.Shutdown();
 
     m_vertexLayout = VertexLayout{};

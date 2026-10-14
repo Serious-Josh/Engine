@@ -9,6 +9,7 @@
 #include "assets/AssetRecord.h"
 #include "MaterialThumbnailDiskCache.h"
 #include "MaterialThumbnailValidation.h"
+#include "MeshThumbnailPreparation.h"
 #include "assets/ProjectAssetRegistry.h"
 
 #include <optional>
@@ -17,6 +18,9 @@
 #include <vector>
 #include <deque>
 #include <chrono>
+#include <span>
+#include <future>
+#include <wrl/client.h>
 
 class DescriptorHeap;
 class ResourceUploader;
@@ -30,6 +34,8 @@ class MaterialPreviewRenderer
     public:
     static constexpr unsigned int kExtent = 256;
     static constexpr size_t kThumbnailCapacity = 16;
+    static constexpr size_t kMeshThumbnailCapacity = 8;
+    enum class MeshThumbnailConsumer : unsigned int { AssetBrowser = 1, SceneInspector = 2 };
 
     // Recording borrows this context for the duration of a call.
     // They must not begin, close, submit, wait for, or abort command recording.
@@ -39,6 +45,7 @@ class MaterialPreviewRenderer
         unsigned int frameSlot = 0;
         unsigned int brdfLUTIndex = 0;
         unsigned int averageAlbedoLUTIndex = 0;
+        std::uint64_t generation = 0;
     };
 
     MaterialPreviewRenderer() = default;
@@ -58,7 +65,14 @@ class MaterialPreviewRenderer
     void SetRequest(const std::optional<MaterialPreviewRequest>& request);
     // Called before Renderer recording. Only changed dependencies can upload.
     void PrepareTextures(const std::optional<MaterialPreviewRequest>& request, const ProjectAssetRegistry& registry);
-    void ConfirmSubmission(std::uint64_t submissionFence);
+    bool BeginRecording(std::uint64_t generation);
+    bool ConfirmSubmission(std::uint64_t generation, std::uint64_t submissionFence);
+    bool DiscardRecording(std::uint64_t generation);
+    void MarkSubmissionUncertain(std::uint64_t generation);
+    bool IsQuarantined() const noexcept
+    {
+        return m_quarantined;
+    }
     std::optional<MaterialPreviewImage> GetImage(const DescriptorHeap& heap) const;
 
     // Bounded asynchronous request acceptance. Preparation runs at the pre-recording poll.
@@ -68,13 +82,36 @@ class MaterialPreviewRenderer
         const AssetID& id,
         std::uint64_t completedFence,
         std::string& error);
+
+    // Main-thread mesh requests/polling, outside command recording.
+    bool RequestMeshThumbnail(const ProjectPaths& paths, const ProjectAssetRegistry& registry,
+        const AssetID& id, std::uint64_t& ticket, std::string& error,
+        MeshThumbnailConsumer consumer = MeshThumbnailConsumer::AssetBrowser);
+    void PollMeshThumbnailPreparation(const ProjectPaths& paths, const ProjectAssetRegistry& registry);
+    void PollMeshThumbnailGPUCompletion(std::uint64_t completedFence)
+    {
+        PollMeshGPUFences(completedFence);
+    }
+    // Main-thread borrow valid until the next poll, discard, or shutdown.
+    // Prepared geometry becomes empty after transfer to the preview-owned GPU job.
+    const MeshThumbnailPreparation::Job* GetMeshThumbnailPreparation(std::uint64_t ticket) const noexcept;
+    void CancelMeshThumbnailPreparation(std::uint64_t ticket);
+    void DiscardMeshThumbnailPreparation(std::uint64_t ticket,
+        MeshThumbnailConsumer consumer = MeshThumbnailConsumer::AssetBrowser);
+    struct MeshThumbnailImage
+    {
+        D3D12_GPU_DESCRIPTOR_HANDLE srv{};
+        MeshThumbnailPreparation::Identity identity;
+    };
+    std::optional<MeshThumbnailImage> GetMeshThumbnailImage(const DescriptorHeap& heap, std::uint64_t ticket);
+    std::string GetMeshThumbnailError(std::uint64_t ticket) const;
     // Calling this marks a current-frame display use; the descriptor remains Renderer-owned.
     std::optional<MaterialPreviewImage> GetThumbnailImage(const DescriptorHeap& heap);
     std::optional<MaterialPreviewImage> GetThumbnailImage(
         const DescriptorHeap& heap, const ProjectPaths& paths, const AssetID& id);
     // Stops queued work only. Recorded/submitted jobs and images retain lifetime protection.
     void DiscardThumbnailRequests();
-    // UI begins one enumeration; the first 16 distinct requests form the pinned working set.
+    // UI begins one enumeration; bounded Browser and Inspector requests share the pinned working set.
     void BeginThumbnailWorkingSet();
     // Explicit Refresh can invalidate immediately, without waiting for throttled revalidation.
     void InvalidateThumbnailImages();
@@ -86,6 +123,87 @@ class MaterialPreviewRenderer
     void Shutdown();
 
     private:
+    // Browser admits 16 entries; remaining bounded capacity serves visible Inspector slots.
+    static constexpr size_t kThumbnailImageCapacity = 32;
+    MeshThumbnailPreparation m_meshPreparation;
+    // Recording-only borrows. Caller retains buffers/ranges through submission
+    // and GPU completion; describing geometry never allocates GPU resources.
+    struct PreviewGeometry
+    {
+        D3D12_VERTEX_BUFFER_VIEW vertices{};
+        D3D12_INDEX_BUFFER_VIEW indices{};
+        std::span<const MeshSubmesh> ranges;
+
+        MeshBounds bounds;
+        Matrix4 model = Matrix4::Identity();
+
+        unsigned int indexCount = 0;
+    };
+
+    struct PreviewFraming
+    {
+        Matrix4 viewProjection = Matrix4::Identity();
+        Vector3 eye;
+    };
+
+    // One active geometry allocation (64 MiB), one staging slice (8 MiB), nine images.
+    static constexpr size_t kMeshImageCapacity = kMeshThumbnailCapacity + 1;
+    static constexpr size_t kMeshUploadBytes = 8 * 1024 * 1024;
+    struct MeshGPUJob
+    {
+        Microsoft::WRL::ComPtr<ID3D12Resource> vertices;
+        Microsoft::WRL::ComPtr<ID3D12Resource> indices;
+        Microsoft::WRL::ComPtr<ID3D12Resource> staging;
+        Microsoft::WRL::ComPtr<ID3D12Resource> readback;
+        ImportedMesh geometry;
+        MaterialThumbnailDiskCache::Image cachedPixels;
+        MaterialThumbnailDiskCache::Source diskSource;
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+        std::uint64_t imageBytes = 0;
+        RenderTarget color;
+        PreviewFraming framing;
+        Matrix4 model = Matrix4::Identity();
+        MeshThumbnailPreparation::Identity identity;
+        std::string error;
+
+        size_t copiedBytes = 0;
+        size_t recordedBytes = 0;
+        std::uint64_t ticket = 0;
+        std::uint64_t fence = 0;
+        std::uint64_t displayFence = 0;
+        bool recorded = false;
+        bool rendered = false;
+        bool renderRecorded = false;
+        bool ready = false;
+        bool stale = false;
+        bool validating = false;
+        bool awaitingDisplaySubmission = false;
+        bool diskHit = false;
+        bool persistenceAttempted = false;
+    };
+    std::deque<MeshGPUJob> m_meshJobs;
+    std::vector<std::uint64_t> m_meshTickets;
+    std::map<std::uint64_t, unsigned int> m_meshConsumers;
+    std::uint64_t m_meshCompletedFence = 0;
+    bool m_meshTurn = false;
+    std::future<void> m_meshWriter;
+
+    bool RecordMeshJob(const RecordingContext& context);
+    bool HasMeshWork() const;
+    void PollMeshGPUFences(std::uint64_t completedFence);
+    void PrepareMeshGPUJob(std::uint64_t ticket);
+    bool RecordCachedMeshImage(const RecordingContext& context, MeshGPUJob& job);
+    void RecordMeshReadback(const RecordingContext& context, MeshGPUJob& job);
+    void PersistMeshImage(MeshGPUJob& job);
+
+    static bool DescribeGeometry(const Mesh& mesh, const Matrix4& model,
+        PreviewGeometry& geometry, std::string& error);
+    static bool FrameMeshBounds(const MeshBounds& bounds, PreviewFraming& framing,
+        Matrix4& model, std::string& error);
+    bool RecordGeometryJob(const RecordingContext& context, GPUMaterial material,
+        const std::array<Texture*, 7>& textures, RenderTarget& displayColor,
+        const PreviewGeometry& geometry, const PreviewFraming& framing);
+
     bool InitializePipelines(ID3D12Device* device, ShaderLibrary& shaders);
 
     struct TextureDependencies
@@ -226,6 +344,39 @@ class MaterialPreviewRenderer
     };
     static constexpr size_t kTextureCapacity = 32;
     std::map<TextureKey, CachedTexture> m_textureCache;
+
+    struct TargetState
+    {
+        RenderTarget* target;
+        D3D12_RESOURCE_STATES state;
+    };
+    struct TextureState
+    {
+        CachedTexture* entry;
+        std::vector<D3D12_RESOURCE_STATES> states;
+        bool awaitingSubmission;
+    };
+    struct ImageState
+    {
+        ThumbnailImage* image;
+        bool ready;
+        bool recorded;
+    };
+    struct RecordingSnapshot
+    {
+        std::vector<TargetState> targets;
+        std::vector<TextureState> textures;
+        std::vector<ImageState> images;
+
+        D3D12_RESOURCE_STATES depthState = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+        std::uint64_t generation = 0;
+
+        bool inspectorValid = false;
+        bool thumbnailValid = false;
+        bool capturePending = false;
+    };
+    std::optional<RecordingSnapshot> m_recording;
+    bool m_quarantined = false;
     std::uint64_t m_completedTextureFence = 0;
     std::uint64_t m_textureUseSerial = 0;
 };

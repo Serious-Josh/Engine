@@ -1,12 +1,14 @@
 #pragma once
 
 #include "Editor/TextureThumbnailCache.h"
+#include "Editor/MeshDragPayload.h"
 #include <filesystem>
 #include <map>
 #include <optional>
 #include <array>
 #include <string>
 #include <vector>
+#include <chrono>
 
 struct EditorWorkspaceRect;
 class ProjectPaths;
@@ -35,22 +37,9 @@ public:
         m_selection = selection;
     }
 
-    void ConfigureThumbnails(
-        ID3D12Device* device,
-        ResourceUploader& uploader,
-        DescriptorHeap& heap)
-    {
-        m_thumbnails.Configure(device, uploader, heap);
-    }
-
     void SetThumbnailCompletedFence(std::uint64_t fence)
     {
-        m_thumbnails.SetCompletedFence(fence);
-    }
-
-    void ConfirmThumbnailSubmission(std::uint64_t fence)
-    {
-        m_thumbnails.ConfirmSubmission(fence);
+        m_thumbnails->SetCompletedFence(fence);
     }
 
     bool NeedsThumbnailReset() const
@@ -58,21 +47,16 @@ public:
         return m_thumbnailResetRequested;
     }
 
-    void ClearThumbnailsAfterGPUDrain();
-    std::vector<Texture*> GetThumbnailTextures()
-    {
-        return m_thumbnails.GetTextures();
-    }
-
+    void ResetThumbnailRequests();
     // Borrowed renderer service; Renderer owns all material thumbnail GPU resources.
-    void ConfigureMaterialThumbnails(Renderer& renderer)
-    {
-        m_materialRenderer = &renderer;
-    }
+    void ConfigureMaterialThumbnails(Renderer& renderer);
 
     void PauseMaterialThumbnails();
     void InvalidateMaterialSource(const std::filesystem::path& path);
     void SetThumbnailProject(const ProjectPaths& paths, const ProjectAssetRegistry& registry);
+    void InvalidateMeshDragIdentity() noexcept;
+    std::optional<AssetRecord> ValidateMeshDrag(const MeshDragPayload& payload,
+        const ProjectPaths& paths, const ProjectAssetRegistry& registry, std::string& error) const;
     void Draw(const EditorWorkspaceRect& rectangle);
     void ImportFileDrop(
         const std::vector<std::filesystem::path>& files,
@@ -108,6 +92,10 @@ public:
         const std::string& error);
 
 private:
+    void DrawMeshDragSource(const std::filesystem::path& path, const std::string& name);
+    std::filesystem::path m_meshDragProject;
+    std::uint64_t m_meshDragIdentity = 0;
+
     std::filesystem::path m_renameTarget;
 
     std::array<char, 1025> m_renameStem{};
@@ -127,7 +115,7 @@ private:
 
     bool m_openDeleteModal = false;
 
-    TextureThumbnailCache m_thumbnails;
+    TextureThumbnailCache* m_thumbnails = nullptr;
 
     std::optional<ProjectPaths> m_thumbnailPaths;
     const ProjectAssetRegistry* m_thumbnailRegistry = nullptr;
@@ -135,8 +123,20 @@ private:
 
     std::map<std::filesystem::path, AssetRecord> m_textureRecords;
     std::map<std::filesystem::path, AssetRecord> m_materialRecords;
+    std::map<std::filesystem::path, AssetRecord> m_meshRecords;
 
     Renderer* m_materialRenderer = nullptr;
+
+    struct MeshThumbnailRequest
+    {
+        std::uint64_t ticket = 0;
+        std::chrono::steady_clock::time_point nextValidation{};
+        std::string error;
+        bool visible = false;
+    };
+    std::map<std::string, MeshThumbnailRequest> m_meshThumbnailRequests;
+    void PruneMeshThumbnailRequests(bool all = false);
+    std::optional<D3D12_GPU_DESCRIPTOR_HANDLE> GetVisibleMeshThumbnail(const AssetRecord& record, std::string& error);
 
     bool m_materialRequestsReset = false;
     bool m_materialImagesInvalidated = false;

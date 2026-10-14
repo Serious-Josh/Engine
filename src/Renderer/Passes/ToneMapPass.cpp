@@ -105,6 +105,13 @@ void ToneMapPass::Execute(
         float outlineColor[3];
     };
 
+#ifdef NDEBUG
+    if (debugView == ToneMapDebugView::ShadingNormalViewHorizon)
+    {
+        debugView = ToneMapDebugView::None;
+    }
+#endif
+
     ToneMapConstants constants{};
     constants.sceneColorIndex = sceneColor.GetSRVIndex();
     constants.exposure = 1.0f;
@@ -121,7 +128,8 @@ void ToneMapPass::Execute(
         debugView == ToneMapDebugView::HDRIDiffuseAmbientMultiOrientation ||
         debugView == ToneMapDebugView::MultiOrientationMinusSingleOrientation ||
         debugView == ToneMapDebugView::HDRIDirectIntegralMip0 ||
-        debugView == ToneMapDebugView::HDRIDirectIntegralMip4 || debugView == ToneMapDebugView::HDRIDirectIntegralMip6;
+        debugView == ToneMapDebugView::HDRIDirectIntegralMip4 || debugView == ToneMapDebugView::HDRIDirectIntegralMip6 ||
+        debugView == ToneMapDebugView::ShadingNormalViewHorizon;
     constants.debugView =
         (debugTexture || debugRenderTarget || lightingDebug) ? static_cast<unsigned int>(debugView) : 0;
     constants.nrdDenoisingRange = nrdDenoisingRange;

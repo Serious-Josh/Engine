@@ -177,6 +177,11 @@ struct RayTracingInstanceData
     unsigned int uvOffset;
     unsigned int indexed;
     unsigned int tangentOffset;
+
+    unsigned int triangleSlotBufferIndex;
+    unsigned int triangleSlotOffset;
+    unsigned int slotMaterialBufferIndex;
+    unsigned int slotMaterialOffset;
 };
 
 static_assert(sizeof(MaterialConstants) == 32);
@@ -211,6 +216,8 @@ static_assert(offsetof(GPUMaterial, heightScale) == 100);
 static_assert(offsetof(GPUMaterial, heightBias) == 104);
 static_assert(sizeof(ShadowConstants) == 256);
 static_assert(sizeof(ReflectionConstants) == 160);
-static_assert(sizeof(RayTracingInstanceData) == 32);
+static_assert(sizeof(RayTracingInstanceData) == 48);
+static_assert(offsetof(RayTracingInstanceData, triangleSlotBufferIndex) == 32);
+static_assert(offsetof(RayTracingInstanceData, slotMaterialBufferIndex) == 40);
 static_assert(sizeof(GIConstants) == 112);
 static_assert(sizeof(AOConstants) == 96);

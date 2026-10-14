@@ -1,4 +1,5 @@
 #include "Scene/SceneDocument.h"
+#include "assets/AssetID.h"
 
 #include <cmath>
 #include <unordered_set>
@@ -104,6 +105,14 @@ bool ValidateSceneDocument(
             return Fail(
                 errorMessage,
                 "Invalid transform for object: " + object.id);
+        }
+
+        for(const auto& [slotID, reference] : object.materialSlotBindings)
+        {
+            if(slotID.empty() || !AssetID::ParseReference(reference))
+            {
+                return Fail(errorMessage, "Invalid material-slot binding for object: " + object.id);
+            }
         }
     }
 

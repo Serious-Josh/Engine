@@ -88,7 +88,8 @@ bool CaptureSceneDocument(
         const auto& runtime = objects[index];
         const auto& committed = mapping.committedObjects[index];
 
-        if (runtime.mesh != committed.mesh || runtime.material != committed.material)
+        if (runtime.mesh != committed.mesh || runtime.material != committed.material ||
+            runtime.slotMaterials != committed.slotMaterials)
         {
             return fail("Runtime asset replacement cannot be persisted as a transform edit.");
         }
@@ -159,7 +160,7 @@ bool SceneDocumentsEqual(
         const auto& b = right.objects[index];
 
         if (a.id != b.id || a.name != b.name || a.meshReference != b.meshReference ||
-            a.materialReference != b.materialReference)
+            a.materialReference != b.materialReference || a.materialSlotBindings != b.materialSlotBindings)
         {
             return false;
         }

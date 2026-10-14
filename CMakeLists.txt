@@ -136,6 +136,7 @@ add_executable(Engine
     src/DemoContent/MirrorTestScene.cpp
     src/Renderer/GpuTimestampProfiler.cpp
     src/assets/ModelImporter.cpp
+    src/Renderer/Preview/MeshThumbnailPreparation.cpp
     src/DemoContent/CornellBoxScene.cpp
     src/DemoContent/SceneRegistry.cpp
     src/DemoContent/StressTestScene.cpp
@@ -173,6 +174,7 @@ add_executable(Engine
     src/assets/ProjectAssetResolver.cpp
     src/assets/MaterialAssetSerializer.cpp
     src/assets/ProjectTextureImportService.cpp
+    src/assets/ProjectMeshImportService.cpp
     src/assets/ProjectMaterialAssetService.cpp
 )
 

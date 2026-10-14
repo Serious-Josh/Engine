@@ -9,10 +9,13 @@
 
 #include "Project/ProjectLocator.h"
 #include "Project/ProjectPaths.h"
+#include "assets/ProjectAssetResolver.h"
+#include "Renderer/Mesh.h"
 
 #include <memory>
 #include <string>
 #include <utility>
+#include <algorithm>
 
 namespace
 {
@@ -67,7 +70,7 @@ bool FileBackedDemoScene::Initialize(
     std::string error;
 
     // Validate the document before allocating GPU resources.
-    if (!m_runtime.Open(m_scenePath, &error))
+    if (!m_runtime->Open(m_scenePath, &error))
     {
         Log::Error("Failed to open file-backed scene: " + error);
         return false;
@@ -90,14 +93,15 @@ bool FileBackedDemoScene::Initialize(
         m_assets.SetProjectAssets(ProjectPaths(m_projectRoot), *m_registry);
     }
 
-    if (!m_runtime.Prepare(m_assets, &error))
+    if (!m_runtime->Prepare(m_assets, &error))
     {
-        Log::Error("Failed to prepare file-backed scene: " + error + " " + m_assets.GetLastMaterialError());
+        Log::Error("Failed to prepare file-backed scene: " + error + " " +
+            m_assets.GetLastMeshError() + " " + m_assets.GetLastMaterialError());
         Shutdown();
         return false;
     }
 
-    if (!m_runtime.Commit(&error))
+    if (!m_runtime->Commit(&error))
     {
         Log::Error("Failed to commit file-backed scene: " + error);
         Shutdown();
@@ -114,8 +118,9 @@ void FileBackedDemoScene::Shutdown()
     // renderer resources referencing this scene.
     m_initialized = false;
 
-    m_runtime.DiscardPreparedScene();
-    m_runtime.GetScene().ClearRenderObjects();
+    m_runtime->DiscardPreparedScene();
+    m_runtime->GetScene().ClearRenderObjects();
+    m_objectMutationCandidate.reset();
 
     // The catalog owns the objects referenced by RenderObject.
     m_assets.Shutdown();
@@ -128,12 +133,12 @@ void FileBackedDemoScene::Update(float deltaTime)
 
 Scene& FileBackedDemoScene::GetScene()
 {
-    return m_runtime.GetScene();
+    return m_runtime->GetScene();
 }
 
 const Scene& FileBackedDemoScene::GetScene() const
 {
-    return m_runtime.GetScene();
+    return m_runtime->GetScene();
 }
 
 std::vector<Material*> FileBackedDemoScene::GetMaterials()
@@ -143,15 +148,15 @@ std::vector<Material*> FileBackedDemoScene::GetMaterials()
 
 void FileBackedDemoScene::ResetCamera()
 {
-    if (!m_runtime.GetFileScene().HasDocument())
+    if (!m_runtime->GetFileScene().HasDocument())
     {
         return;
     }
 
     const SceneCameraDocument& source =
-        m_runtime.GetFileScene().GetDocument().camera;
+        m_runtime->GetFileScene().GetDocument().camera;
 
-    Camera& camera = m_runtime.GetScene().GetCamera();
+    Camera& camera = m_runtime->GetScene().GetCamera();
 
     camera.SetPosition(source.position);
     camera.SetTarget(source.target);
@@ -163,23 +168,23 @@ void FileBackedDemoScene::ResetCamera()
 
 void FileBackedDemoScene::ResetDirectionalLight()
 {
-    if (!m_runtime.GetFileScene().HasDocument())
+    if (!m_runtime->GetFileScene().HasDocument())
     {
         return;
     }
 
-    m_runtime.GetScene().GetDirectionalLight() =
-        m_runtime.GetFileScene().GetDocument().directionalLight;
+    m_runtime->GetScene().GetDirectionalLight() =
+        m_runtime->GetFileScene().GetDocument().directionalLight;
 }
 
 void FileBackedDemoScene::SetAspectRatio(float aspectRatio)
 {
-    m_runtime.GetScene().GetCamera().SetAspectRatio(aspectRatio);
+    m_runtime->GetScene().GetCamera().SetAspectRatio(aspectRatio);
 }
 
 const std::string& FileBackedDemoScene::GetDisplayName() const noexcept
 {
-    return m_runtime.GetFileScene().GetDocument().name;
+    return m_runtime->GetFileScene().GetDocument().name;
 }
 
 std::optional<SceneObjectMetadata> FileBackedDemoScene::GetObjectMetadata(
@@ -196,7 +201,7 @@ std::optional<SceneObjectMetadata> FileBackedDemoScene::GetObjectMetadata(
         return std::nullopt;
     }
 
-    return m_runtime.GetObjectMetadata(runtimeIndex, errorMessage);
+    return m_runtime->GetObjectMetadata(runtimeIndex, errorMessage);
 }
 
 bool FileBackedDemoScene::Save(std::string* errorMessage)
@@ -211,7 +216,23 @@ bool FileBackedDemoScene::Save(std::string* errorMessage)
         return false;
     }
 
-    return m_runtime.Save(errorMessage);
+    return m_runtime->Save(errorMessage);
+}
+
+std::optional<SceneObjectMetadata> FileBackedDemoScene::GetObjectMetadata(
+    std::string_view objectID, std::string* errorMessage) const
+{
+    if(!m_initialized)
+    {
+        if(errorMessage)
+        {
+            *errorMessage = "Persistent object lookup requires an initialized file-backed scene.";
+        }
+
+        return std::nullopt;
+    }
+
+    return m_runtime->GetObjectMetadata(objectID, errorMessage);
 }
 
 std::optional<MaterialAssignmentToken> FileBackedDemoScene::PrepareMaterialAssignment(
@@ -227,7 +248,93 @@ std::optional<MaterialAssignmentToken> FileBackedDemoScene::PrepareMaterialAssig
         return std::nullopt;
     }
 
-    return m_runtime.PrepareMaterialAssignment(selection, std::move(materialReference), errorMessage);
+    return m_runtime->PrepareMaterialAssignment(selection, std::move(materialReference), errorMessage);
+}
+
+std::optional<MaterialAssignmentToken> FileBackedDemoScene::PrepareMaterialSlotAssignment(
+    const SceneObjectMetadata& selection, std::string slotID, const std::optional<AssetID>& materialID,
+    std::string* errorMessage)
+{
+    const auto fail = [&](const std::string& message) -> std::optional<MaterialAssignmentToken>
+    {
+        if(errorMessage)
+        {
+            *errorMessage = message;
+        }
+
+        return std::nullopt;
+    };
+
+    if(!m_initialized || m_runtime->HasMaterialAssignment() || m_runtime->HasPreparedScene())
+    {
+        return fail("Material slot assignment requires an initialized scene with no pending preparation/assignment.");
+    }
+
+    const auto metadata = GetObjectMetadata(selection.objectID, errorMessage);
+
+    if(!metadata || metadata->runtimeIndex != selection.runtimeIndex || metadata->sceneID != selection.sceneID ||
+        metadata->runtimeIdentity != selection.runtimeIdentity || metadata->structureRevision != selection.structureRevision ||
+        metadata->meshReference != selection.meshReference || metadata->materialReference != selection.materialReference ||
+        metadata->materialSlotBindings != selection.materialSlotBindings)
+    {
+        return fail("Material slot assignment requires the current persistent object, mesh, and binding snapshot.");
+    }
+
+    const auto& object = m_runtime->GetScene().GetRenderObjects()[metadata->runtimeIndex];
+
+    if(!object.mesh)
+    {
+        return fail("Cannot assign a material slot to an object without a resolved mesh.");
+    }
+
+    const auto& slots = object.mesh->GetMetadata().materialSlots;
+
+    if(std::none_of(slots.begin(), slots.end(), [&](const auto& slot) { return slot.id == slotID; }))
+    {
+        return fail("Material slot does not exist on the object's current mesh: " + slotID);
+    }
+
+    Material* effective = object.material;
+
+    if(materialID)
+    {
+        const auto* record = m_registry ? m_registry->Find(*materialID) : nullptr;
+
+        if(!record || record->type != AssetType::Material ||
+            ProjectAssetResolver::Resolve(ProjectPaths(m_projectRoot), *m_registry, *materialID).status != AssetAvailability::Available)
+        {
+            return fail("Slot override requires an available registered material AssetID.");
+        }
+
+        const auto existing = metadata->materialSlotBindings.find(slotID);
+
+        if(existing != metadata->materialSlotBindings.end() && existing->second == materialID->ToReference())
+        {
+            // An unchanged binding reuses its resolved, retained material version.
+            effective = object.GetSlotMaterial(slotID);
+        }
+        else
+        {
+            effective = ResolveAssignmentMaterial(materialID->ToReference(), errorMessage);
+
+            if(!effective)
+            {
+                return std::nullopt;
+            }
+        }
+    }
+
+    if(!effective || !m_assets.OwnsMaterial(*effective))
+    {
+        return fail("The effective slot material is unavailable or not retained by this scene's catalog.");
+    }
+
+    return m_runtime->PrepareMaterialSlotAssignment(selection, std::move(slotID), materialID, *effective, errorMessage);
+}
+
+Material* FileBackedDemoScene::GetPreparedMaterialAssignmentMaterial(const MaterialAssignmentToken& token) const noexcept
+{
+    return m_initialized ? m_runtime->GetPreparedMaterialAssignmentMaterial(token) : nullptr;
 }
 
 Material* FileBackedDemoScene::ResolveAssignmentMaterial(std::string_view reference, std::string* errorMessage)
@@ -260,7 +367,7 @@ bool FileBackedDemoScene::CommitMaterialAssignment(
         return false;
     }
 
-    return m_runtime.CommitMaterialAssignment(token, sceneOwnedMaterial, errorMessage);
+    return m_runtime->CommitMaterialAssignment(token, sceneOwnedMaterial, errorMessage);
 }
 
 bool FileBackedDemoScene::RollbackMaterialAssignment(const MaterialAssignmentToken& token, std::string* errorMessage)
@@ -275,7 +382,7 @@ bool FileBackedDemoScene::RollbackMaterialAssignment(const MaterialAssignmentTok
         return false;
     }
 
-    return m_runtime.RollbackMaterialAssignment(token, errorMessage);
+    return m_runtime->RollbackMaterialAssignment(token, errorMessage);
 }
 
 bool FileBackedDemoScene::FinishMaterialAssignment(const MaterialAssignmentToken& token, std::string* errorMessage)
@@ -290,7 +397,7 @@ bool FileBackedDemoScene::FinishMaterialAssignment(const MaterialAssignmentToken
         return false;
     }
 
-    return m_runtime.FinishMaterialAssignment(token, errorMessage);
+    return m_runtime->FinishMaterialAssignment(token, errorMessage);
 }
 
 bool FileBackedDemoScene::CancelMaterialAssignment(const MaterialAssignmentToken& token, std::string* errorMessage)
@@ -305,14 +412,14 @@ bool FileBackedDemoScene::CancelMaterialAssignment(const MaterialAssignmentToken
         return false;
     }
 
-    return m_runtime.CancelMaterialAssignment(token, errorMessage);
+    return m_runtime->CancelMaterialAssignment(token, errorMessage);
 }
 
 bool FileBackedDemoScene::CheckUnsavedChanges(
     bool& dirty,
     std::string* errorMessage) const
 {
-    return m_runtime.CheckUnsavedChanges(dirty, errorMessage);
+    return m_runtime->CheckUnsavedChanges(dirty, errorMessage);
 }
 
 std::optional<RuntimeMaterialVersions> FileBackedDemoScene::GetMaterialVersions(
@@ -332,8 +439,8 @@ std::optional<RuntimeMaterialVersions> FileBackedDemoScene::GetMaterialVersions(
 
     if(result)
     {
-        result->runtimeIdentity = m_runtime.GetRuntimeIdentity();
-        result->structureRevision = m_runtime.GetScene().GetStructureRevision();
+        result->runtimeIdentity = m_runtime->GetRuntimeIdentity();
+        result->structureRevision = m_runtime->GetScene().GetStructureRevision();
     }
 
     return result;
@@ -345,7 +452,7 @@ bool FileBackedDemoScene::PublishSavedMaterialParameters(const RuntimeMaterialVe
 {
     const auto current = GetMaterialVersions(expected.projectIdentity, expected.assetID);
 
-    if(!current || !expected.Matches(*current) || m_runtime.HasMaterialAssignment())
+    if(!current || !expected.Matches(*current) || m_runtime->HasMaterialAssignment())
     {
         if(errorMessage)
         {
@@ -364,7 +471,7 @@ SavedMaterialRevisionResult FileBackedDemoScene::AdvanceSavedMaterialRevision(co
 {
     const auto current = GetMaterialVersions(expected.projectIdentity, expected.assetID);
 
-    if(!current || !expected.Matches(*current) || m_runtime.HasMaterialAssignment())
+    if(!current || !expected.Matches(*current) || m_runtime->HasMaterialAssignment())
     {
         CancelSavedMaterialRevision();
         error = "Saved revision rejected: scene or material assignment identity changed.";
@@ -382,12 +489,18 @@ void FileBackedDemoScene::CancelSavedMaterialRevision()
 bool FileBackedDemoScene::PublishWorkingMaterialParameters(const RuntimeMaterialVersions& expected,
     const std::optional<MaterialAssetData>& parameters, Renderer& renderer, std::string& error)
 {
-    if(!m_initialized || expected.runtimeIdentity != m_runtime.GetRuntimeIdentity() ||
-       expected.structureRevision != m_runtime.GetScene().GetStructureRevision() || m_runtime.HasMaterialAssignment())
+    if(!m_initialized || expected.runtimeIdentity != m_runtime->GetRuntimeIdentity() ||
+       expected.structureRevision != m_runtime->GetScene().GetStructureRevision() || m_runtime->HasMaterialAssignment())
     {
         error = "Working material update rejected: scene or assignment identity changed.";
         return false;
     }
 
     return m_assets.PublishWorkingMaterialParameters(expected, parameters, renderer, error);
+}
+
+std::unique_ptr<FileSceneRuntime> FileBackedDemoScene::PrepareObjectRestoration(
+    const SceneObjectDocument& object, size_t insertionIndex, std::string* errorMessage)
+{
+    return m_runtime->PrepareObjectRestoration(m_assets, object, insertionIndex, errorMessage);
 }

@@ -1,4 +1,5 @@
 #include "MaterialLighting.hlsli"
+#include "ShadingNormal.hlsli"
 
 static const float RT_REFLECTION_ROUGHNESS_FADE_START = 0.30f;
 static const float RT_REFLECTION_ROUGHNESS_FADE_END = 0.40f;
@@ -28,6 +29,7 @@ cbuffer GBufferConstants : register(b0)
     uint aoVisibilityIndex;
     uint lightingDebugView;
     float rtgiContactAOStrength;
+    uint enableShadingNormalCorrection;
 }
 
 cbuffer ReconstructionConstants : register(b1)
@@ -234,6 +236,11 @@ float4 PSMain(VSOutput input) : SV_Target0
         return float4(0.0f, 0.0f, 0.0f, 1.0f);
     }
 
+    if(lightingDebugView == 32u && (!isfinite(depth) || depth < 0.0f || depth >= 1.0f))
+    {
+        return float4(0.0f, 0.0f, 0.0f, 1.0f);
+    }
+
     if(depth >= 1.0f)
     {
         float3 worldDirection =
@@ -364,6 +371,43 @@ float4 PSMain(VSOutput input) : SV_Target0
             cameraPosition -
             worldPosition.xyz
         );
+
+    // Development-only mode 32 is gated by the CPU debug-view plumbing.
+    if(lightingDebugView == 32u)
+    {
+        Texture2D<float4> geometricNormalTexture = ResourceDescriptorHeap[geometricNormalIndex];
+        float3 geometricNormal = geometricNormalTexture.Load(int3(pixel, 0)).rgb;
+        float geometricNormalLengthSquared = dot(geometricNormal, geometricNormal);
+        float shadingNormalLengthSquared = dot(surfaceData.rgb, surfaceData.rgb);
+
+        if(!all(isfinite(geometricNormal)) || !isfinite(geometricNormalLengthSquared) ||
+           geometricNormalLengthSquared < 1.0e-8f || !all(isfinite(surfaceData.rgb)) ||
+           !isfinite(shadingNormalLengthSquared) || shadingNormalLengthSquared < 1.0e-8f ||
+           !all(isfinite(worldPosition)) || !all(isfinite(viewDirection)))
+        {
+            return float4(1.0f, 1.0f, 0.0f, 1.0f);
+        }
+
+        geometricNormal *= rsqrt(geometricNormalLengthSquared);
+        float geometricNormalDotView = dot(geometricNormal, viewDirection);
+        float shadingNormalDotView = dot(normal, viewDirection);
+        bool crossesViewHorizon = geometricNormalDotView > 0.0f && shadingNormalDotView <= 0.0f;
+
+        return float4(crossesViewHorizon ? float3(1.0f, 0.0f, 1.0f) : float3(0.0f, 0.0f, 0.0f), 1.0f);
+    }
+
+    if(enableShadingNormalCorrection != 0u)
+    {
+        Texture2D<float4> referenceNormalTexture = ResourceDescriptorHeap[geometricNormalIndex];
+        float3 referenceNormal = referenceNormalTexture.Load(int3(pixel, 0)).rgb;
+        float referenceLengthSquared = dot(referenceNormal, referenceNormal);
+
+        if(all(isfinite(referenceNormal)) && isfinite(referenceLengthSquared) && referenceLengthSquared > 1.0e-8f)
+        {
+            referenceNormal *= rsqrt(referenceLengthSquared);
+            normal = CorrectShadingNormalViewHorizon(normal, referenceNormal, viewDirection);
+        }
+    }
 
     float NdotL =
         saturate(

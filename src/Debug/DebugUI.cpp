@@ -752,7 +752,11 @@ void DebugUI::DrawPerformanceWindow(
                                    "HDRI Direct Integral Mip 0",
                                    "HDRI Direct Integral Mip 4",
                                    "HDRI Direct Integral Mip 6",
-                                   "GI Signed Reconstructed (Pre-NRD)"};
+                                   "GI Signed Reconstructed (Pre-NRD)",
+#ifndef NDEBUG
+                                   "Shading Normal View Horizon",
+#endif
+            };
             const char* denoisers[] = {"NRD", "Native"};
 
             ImGui::Combo("Reflection denoiser", &m_reflectionDenoiserMode, denoisers, IM_ARRAYSIZE(denoisers));
@@ -761,6 +765,16 @@ void DebugUI::DrawPerformanceWindow(
             ImGui::SliderFloat("RTGI Contact AO Strength", &m_rtgiContactAOStrength, 0.0f, 1.0f, "%.2f");
             ImGui::SliderFloat("RTGI Contact AO Radius", &m_rtgiContactAORadius, 0.05f, 5.0f, "%.2f");
             ImGui::Combo("Diagnostic view", &m_toneMapDebugView, views, IM_ARRAYSIZE(views));
+
+#ifndef NDEBUG
+            ImGui::Checkbox("Shading normal horizon correction", &m_shadingNormalCorrectionEnabled);
+
+            if (GetToneMapDebugView() == ToneMapDebugView::ShadingNormalViewHorizon)
+            {
+                ImGui::TextWrapped("Magenta: Ng dot V > 0 and Ns dot V <= 0. Black: no crossing. "
+                                   "Yellow: invalid input. Ng is the unperturbed interpolated vertex normal.");
+            }
+#endif
 
             if (GetToneMapDebugView() == ToneMapDebugView::GISignedReconstructed)
             {

@@ -22,10 +22,13 @@
 #include "Scene/Scene.h"
 
 #include "imgui.h"
+#include <type_traits>
+#include "imgui_internal.h"
 #include "ImGuizmo.h"
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <limits>
 #include <utility>
 
@@ -221,6 +224,233 @@ namespace
             localOrigin,
             localDirection,
             object.mesh->GetBounds(), ray.maxDistance, hitDistance);
+    }
+
+    bool IsFinitePosition(const Vector3& value)
+    {
+        return std::isfinite(value.x) && std::isfinite(value.y) && std::isfinite(value.z);
+    }
+
+    struct RaycastVector
+    {
+        double x, y, z;
+
+        explicit RaycastVector(const Vector3& value) : x(value.x), y(value.y), z(value.z) {}
+        RaycastVector(double xValue, double yValue, double zValue) : x(xValue), y(yValue), z(zValue) {}
+
+        RaycastVector operator-(const RaycastVector& other) const
+        {
+            return {x - other.x, y - other.y, z - other.z};
+        }
+
+        RaycastVector Cross(const RaycastVector& other) const
+        {
+            return {y * other.z - z * other.y, z * other.x - x * other.z, x * other.y - y * other.x};
+        }
+
+        double Dot(const RaycastVector& other) const
+        {
+            return x * other.x + y * other.y + z * other.z;
+        }
+    };
+
+    bool IntersectTriangle(const PickingRay& ray, const Vector3& a, const Vector3& b,
+        const Vector3& c, double& nearestDistance)
+    {
+        if(!IsFinitePosition(a) || !IsFinitePosition(b) || !IsFinitePosition(c))
+        {
+            return false;
+        }
+
+        // Two-sided Moller-Trumbore intersection in double precision. Work in
+        // world space so distance is comparable across nonuniform/mirrored scales.
+        const RaycastVector edge1 = RaycastVector(b) - RaycastVector(a);
+        const RaycastVector edge2 = RaycastVector(c) - RaycastVector(a);
+        const RaycastVector direction(ray.direction);
+        const auto cross = direction.Cross(edge2);
+        const double determinant = edge1.Dot(cross);
+        const double area = std::sqrt(edge1.Cross(edge2).Dot(edge1.Cross(edge2)));
+
+        if(!std::isfinite(area) || area == 0 || !std::isfinite(determinant) ||
+            std::abs(determinant) <= area * 1e-12)
+        {
+            return false;
+        }
+
+        const auto offset = RaycastVector(ray.origin) - RaycastVector(a);
+        const double u = offset.Dot(cross) / determinant;
+
+        if(!std::isfinite(u) || u < 0 || u > 1)
+        {
+            return false;
+        }
+
+        const auto offsetCross = offset.Cross(edge1);
+        const double v = direction.Dot(offsetCross) / determinant;
+        const double distance = edge2.Dot(offsetCross) / determinant;
+
+        if(!std::isfinite(v) || v < 0 || u + v > 1 || !std::isfinite(distance) ||
+            distance <= 0 || distance > nearestDistance)
+        {
+            return false;
+        }
+
+        nearestDistance = distance;
+        return true;
+    }
+
+    bool RaycastObject(const PickingRay& ray, const RenderObject& object,
+        const ImportedMesh& geometry, double& nearestDistance)
+    {
+        const Matrix4 model = object.transform.GetModelMatrix();
+
+        for(const auto& row : model.m)
+        {
+            for(float value : row)
+            {
+                if(!std::isfinite(value))
+                {
+                    return false;
+                }
+            }
+        }
+
+        if(!object.mesh || !object.mesh->GetBounds().valid)
+        {
+            return false;
+        }
+
+        const auto& localBounds = object.mesh->GetBounds();
+        MeshBounds worldBounds;
+
+        // Transform all corners instead of inverting the model: broad phase
+        // remains conservative for tiny, nonuniform, and mirrored scales.
+        for(unsigned int corner = 0; corner < 8; ++corner)
+        {
+            const Vector3 local{corner & 1 ? localBounds.max.x : localBounds.min.x,
+                corner & 2 ? localBounds.max.y : localBounds.min.y,
+                corner & 4 ? localBounds.max.z : localBounds.min.z};
+            const Vector3 world = TransformPoint(model, local);
+
+            if(!IsFinitePosition(world))
+            {
+                return false;
+            }
+
+            if(!worldBounds.valid)
+            {
+                worldBounds.min = world;
+                worldBounds.max = world;
+                worldBounds.valid = true;
+                continue;
+            }
+
+            worldBounds.min.x = (std::min)(worldBounds.min.x, world.x);
+            worldBounds.min.y = (std::min)(worldBounds.min.y, world.y);
+            worldBounds.min.z = (std::min)(worldBounds.min.z, world.z);
+
+            worldBounds.max.x = (std::max)(worldBounds.max.x, world.x);
+            worldBounds.max.y = (std::max)(worldBounds.max.y, world.y);
+            worldBounds.max.z = (std::max)(worldBounds.max.z, world.z);
+        }
+
+        float boundsDistance = 0;
+
+        if(!IntersectAABB(ray.origin, ray.direction, worldBounds, ray.maxDistance, boundsDistance) ||
+            !std::isfinite(boundsDistance) ||
+            boundsDistance > nearestDistance)
+        {
+            return false;
+        }
+
+        bool hit = false;
+
+        for(size_t i = 0; i + 2 < geometry.indices.size(); i += 3)
+        {
+            const auto a = geometry.indices[i];
+            const auto b = geometry.indices[i + 1];
+            const auto c = geometry.indices[i + 2];
+
+            if(a >= geometry.vertices.size() || b >= geometry.vertices.size() || c >= geometry.vertices.size())
+            {
+                continue;
+            }
+
+            const auto worldPosition = [&](uint32_t index)
+            {
+                const auto& position = geometry.vertices[index].position;
+                return TransformPoint(model, {position[0], position[1], position[2]});
+            };
+
+            if(IntersectTriangle(ray, worldPosition(a), worldPosition(b), worldPosition(c), nearestDistance))
+            {
+                hit = true;
+            }
+        }
+
+        return hit;
+    }
+
+    bool IntersectPlacementPlane(const PickingRay& ray, const Vector3& point, const Vector3& normal,
+        double& distance)
+    {
+        const double denominator = RaycastVector(normal).Dot(RaycastVector(ray.direction));
+
+        if(!std::isfinite(denominator) || std::abs(denominator) < 1e-8)
+        {
+            return false;
+        }
+
+        distance = (RaycastVector(point) - RaycastVector(ray.origin)).Dot(RaycastVector(normal)) / denominator;
+        return std::isfinite(distance) && distance > 0 && distance <= ray.maxDistance;
+    }
+
+    bool FindMeshDropPosition(const FileBackedDemoScene& owner, float mouseX, float mouseY,
+        float width, float height, Vector3& position)
+    {
+        const auto& scene = owner.GetScene();
+        const auto& camera = scene.GetCamera();
+        const Vector3 forward = (camera.GetTarget() - camera.GetPosition()).Normalized();
+
+        if(!IsFinitePosition(forward) || forward.Length() < 0.5f ||
+            Vector3::Cross({0, 1, 0}, forward).Length() < 1e-6f)
+        {
+            return false;
+        }
+
+        PickingRay ray;
+
+        if(!BuildPickingRay(camera, mouseX, mouseY, width, height, ray))
+        {
+            return false;
+        }
+
+        double distance = ray.maxDistance;
+        bool hit = false;
+
+        for(const auto& object : scene.GetRenderObjects())
+        {
+            const auto* geometry = object.mesh ? owner.GetMeshGeometry(*object.mesh) : nullptr;
+
+            if(geometry && RaycastObject(ray, object, *geometry, distance))
+            {
+                hit = true;
+            }
+        }
+
+        // Camera::GetViewMatrix establishes +Y up. Ground is the XZ plane at
+        // y=0. Last fallback is perpendicular to view, 10 engine units ahead.
+        if(!hit && !IntersectPlacementPlane(ray, {}, {0, 1, 0}, distance) &&
+            !IntersectPlacementPlane(ray, camera.GetPosition() + forward * 10.0f, forward, distance))
+        {
+            return false;
+        }
+
+        position = {static_cast<float>(ray.origin.x + double(ray.direction.x) * distance),
+            static_cast<float>(ray.origin.y + double(ray.direction.y) * distance),
+            static_cast<float>(ray.origin.z + double(ray.direction.z) * distance)};
+        return IsFinitePosition(position) &&
+            RaycastVector(position - camera.GetPosition()).Dot(RaycastVector(forward)) > 0;
     }
 
     size_t PickObject(
@@ -501,12 +731,35 @@ void Editor::DrawSceneViewport(
                 mouse.x < position.x + size.x && mouse.y < position.y + size.y;
             m_viewportHovered = inside && !m_workspace.IsSplitterDragging() &&
                 !ImGui::IsWindowHovered(ImGuiHoveredFlags_AnyWindow) &&
-                !ImGui::IsAnyItemActive() && !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId);
+                !ImGui::IsAnyItemActive() && !ImGui::GetDragDropPayload() &&
+                !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId);
 
             ImGui::GetWindowDrawList()->AddImage(
                 ImTextureRef(static_cast<ImTextureID>(sceneTextureHandle)),
                 position,
                 ImVec2(position.x + size.x, position.y + size.y));
+
+            if(!m_meshCreationStatus.empty())
+            {
+                ImGui::GetWindowDrawList()->AddText(ImVec2(position.x + 12.0f, position.y + 12.0f),
+                    IM_COL32(240, 220, 170, 255), m_meshCreationStatus.c_str());
+            }
+
+            if(!m_sceneObjectDeletionStatus.empty())
+            {
+                const float offset = m_meshCreationStatus.empty() ? 0.0f : ImGui::GetTextLineHeightWithSpacing();
+                ImGui::GetWindowDrawList()->AddText(ImVec2(position.x + 12.0f, position.y + 12.0f + offset),
+                    IM_COL32(240, 220, 170, 255), m_sceneObjectDeletionStatus.c_str());
+            }
+
+            if(!m_sceneHistoryStatus.empty())
+            {
+                const int lines = static_cast<int>(!m_meshCreationStatus.empty()) +
+                    static_cast<int>(!m_sceneObjectDeletionStatus.empty());
+                ImGui::GetWindowDrawList()->AddText(ImVec2(position.x + 12.0f,
+                    position.y + 12.0f + lines * ImGui::GetTextLineHeightWithSpacing()),
+                    IM_COL32(240, 220, 170, 255), m_sceneHistoryStatus.c_str());
+            }
         }
     }
 
@@ -576,6 +829,15 @@ std::optional<SceneObjectInspectorView> Editor::ResolveObjectInspection(
         "Runtime material (document reference unavailable)"};
     const auto* fileScene = dynamic_cast<const FileBackedDemoScene*>(&demoScene);
 
+    if(object.mesh)
+    {
+        for(const auto& slot : object.mesh->GetMetadata().materialSlots)
+        {
+            view.materialSlots.push_back({slot.id, slot.name, "Runtime material", {}, false,
+                object.GetSlotMaterial(slot.id) != nullptr});
+        }
+    }
+
     if(!fileScene)
     {
         return view;
@@ -617,13 +879,23 @@ std::optional<SceneObjectInspectorView> Editor::ResolveObjectInspection(
 
         const auto path = record->relativePath.generic_string();
         return ProjectAssetResolver::Resolve(paths, registry, *id).status == AssetAvailability::Available ?
-            path : "Unavailable: " + path;
+            record->relativePath.stem().generic_string() : "Unavailable: " + path;
     };
 
     view.metadata = metadata;
     view.name = metadata->name;
     view.mesh = label(metadata->meshReference, AssetType::Mesh);
     view.material = label(metadata->materialReference, AssetType::Material);
+    view.meshReference = metadata->meshReference;
+
+    for(auto& slot : view.materialSlots)
+    {
+        const auto binding = metadata->materialSlotBindings.find(slot.id);
+        slot.explicitBinding = binding != metadata->materialSlotBindings.end();
+        slot.materialReference = slot.explicitBinding ? binding->second : metadata->materialReference;
+        slot.materialName = label(slot.materialReference, AssetType::Material);
+    }
+
     return view;
 }
 
@@ -642,11 +914,22 @@ void Editor::Draw(
 
     Scene& scene = demoScene.GetScene();
     const std::string activeSceneName(sceneManager.GetActiveSceneName());
+    const auto* dragScene = dynamic_cast<const FileBackedDemoScene*>(&demoScene);
+    const auto dragRuntimeIdentity = dragScene ? dragScene->GetRuntimeIdentity() : 0;
+
+    if(dragRuntimeIdentity != m_meshDragRuntimeIdentity)
+    {
+        m_assetBrowser.InvalidateMeshDragIdentity();
+        m_meshDragRuntimeIdentity = dragRuntimeIdentity;
+    }
+
+    UpdateSceneHistorySession(demoScene, projectPaths, activeSceneName);
+
     const uint64_t structureRevision = scene.GetStructureRevision();
 
     if (m_selectionSceneName != activeSceneName || m_selectionStructureRevision != structureRevision)
     {
-        ClearTransformUndoHistory();
+        ResetTransformGestures();
 
         m_selectedObject = InvalidObjectSelection;
         m_selectionSceneName = activeSceneName;
@@ -731,7 +1014,7 @@ void Editor::Draw(
        !objectView || !m_workspace.InspectorVisible() || m_materialLeaveAction != MaterialLeaveAction::None ||
        m_sceneOperationPending))
     {
-        FinishTransformFieldEdit(scene);
+        FinishTransformFieldEdit(demoScene);
     }
 
     const bool disableInspector = m_materialLeaveAction != MaterialLeaveAction::None || m_sceneOperationPending;
@@ -751,6 +1034,11 @@ void Editor::Draw(
         m_materialAssignmentStatus.clear();
     }
 
+    if(objectView || !m_workspace.InspectorVisible() || disableInspector)
+    {
+        m_inspectorPanel.DismissTexturePicker();
+    }
+
     if(m_workspace.InspectorVisible())
     {
         if(objectView)
@@ -758,21 +1046,24 @@ void Editor::Draw(
             m_inspectorPanel.DrawSceneObject(m_workspace.GetInspector(), *objectView, [this, &demoScene]()
             {
                 DrawSelectedObjectTransformControls(demoScene);
-            }, projectPaths, assetRegistry, m_materialAssignmentPending,
-                m_materialAssignmentStatus, [this, &objectView, &assetRegistry](std::string reference)
-            {
-                if(!m_materialAssignmentPending && objectView->metadata)
-                {
-                    m_materialAssignmentSelection = objectView->metadata;
-                    m_materialAssignmentRequest = MaterialAssignmentRequest{*objectView->metadata, std::move(reference)};
-                    m_materialAssignmentPending = true;
-                    const auto id = AssetID::ParseReference(m_materialAssignmentRequest->reference);
+            }, projectPaths, assetRegistry, m_materialAssignmentPending, m_materialAssignmentStatus);
 
-                    const auto* record = id ? assetRegistry.Find(*id) : nullptr;
-                    m_materialAssignmentStatus = "Pending: " + (record ? record->relativePath.generic_string() :
-                        std::string("Default Material"));
-                }
-            });
+            if(!m_materialAssignmentPending && !m_inspectorPanel.GetSlotPickerStatus().empty())
+            {
+                m_materialAssignmentSelection = objectView->metadata;
+                m_materialAssignmentStatus = m_inspectorPanel.GetSlotPickerStatus();
+            }
+
+            if(auto request = m_inspectorPanel.TakeSlotAssignmentRequest())
+            {
+                m_materialAssignmentSelection = request->selection;
+                m_materialAssignmentSlotID = request->slotID;
+                m_materialAssignmentRequest = MaterialAssignmentRequest{
+                    request->selection, {}, request->slotID, request->materialID};
+
+                m_materialAssignmentPending = true;
+                m_materialAssignmentStatus = "Pending material-slot assignment.";
+            }
         }
         else
         {
@@ -786,6 +1077,12 @@ void Editor::Draw(
     if(disableInspector)
     {
         ImGui::EndDisabled();
+    }
+
+    if(!objectView || !m_workspace.InspectorVisible())
+    {
+        m_inspectorPanel.ReleaseSceneObjectPreview();
+        m_inspectorPanel.DismissSceneMaterialPicker();
     }
 
     if(m_inspectorPanel.TakeRefreshRequest() && m_materialLeaveAction == MaterialLeaveAction::None &&
@@ -890,6 +1187,7 @@ void Editor::Draw(
         m_materialLeaveAction != MaterialLeaveAction::None || m_sceneOperationPending);
 
     DrawSceneViewport(sceneTextureHandle, sceneWidth, sceneHeight);
+    DrawMeshDropTarget(demoScene, projectPaths, assetRegistry);
 
     const ImGuiIO& io = ImGui::GetIO();
 
@@ -975,6 +1273,7 @@ void Editor::Draw(
     UpdateCameraMovement(demoScene, deltaTime);
     DrawTransformGizmo(demoScene, m_viewportImage.size.x, m_viewportImage.size.y);
     HandleViewportSelection(demoScene, m_viewportImage.size.x, m_viewportImage.size.y);
+    DrawSceneObjectDeletionControls(demoScene);
 }
 
 void Editor::DrawSphereGridControls(SphereGridScene& demoScene)
@@ -1196,6 +1495,8 @@ void Editor::DrawSelectedObjectTransformControls(IDemoScene& demoScene)
         m_transformFieldScene = &scene;
 
         m_transformFieldRevision = scene.GetStructureRevision();
+        m_fieldHistoryTarget = CaptureHistoryTarget(demoScene, m_selectedObject);
+        m_fieldHistoryEpoch = m_historyEpoch;
     }
 
     ImGui::PopID();
@@ -1214,42 +1515,32 @@ void Editor::DrawSelectedObjectTransformControls(IDemoScene& demoScene)
 
     if(fieldDeactivated && m_transformFieldEditing)
     {
-        FinishTransformFieldEdit(scene);
+        FinishTransformFieldEdit(demoScene);
     }
 }
 
-void Editor::FinishTransformFieldEdit(Scene& scene)
+void Editor::FinishTransformFieldEdit(IDemoScene& demoScene)
 {
-    if(m_transformFieldEditing)
+    Scene& scene = demoScene.GetScene();
+
+    if(m_transformFieldEditing && m_fieldHistoryTarget && m_transformFieldScene == &scene &&
+        m_transformFieldRevision == scene.GetStructureRevision())
     {
-        const auto& currentObjects = static_cast<const Scene&>(scene).GetRenderObjects();
+        const auto index = ResolveHistoryTarget(demoScene, *m_fieldHistoryTarget);
 
-        if(m_transformFieldScene == &scene && m_transformFieldRevision == scene.GetStructureRevision() &&
-           m_transformFieldUndoObject < currentObjects.size())
+        if(index)
         {
-            const Transform& current = currentObjects[m_transformFieldUndoObject].transform;
-
-            const Transform& previous = m_transformFieldUndoStart;
-
-            const bool changed =
-                current.position.x != previous.position.x || current.position.y != previous.position.y ||
-                current.position.z != previous.position.z || current.rotation.x != previous.rotation.x ||
-                current.rotation.y != previous.rotation.y || current.rotation.z != previous.rotation.z ||
-                current.scale.x != previous.scale.x || current.scale.y != previous.scale.y ||
-                current.scale.z != previous.scale.z;
-
-            if(changed)
-            {
-                m_transformRedoHistory.clear();
-                m_transformUndoHistory.push_back({m_transformFieldUndoObject, previous});
-            }
+            RecordTransformEdit(*m_fieldHistoryTarget, m_fieldHistoryEpoch, m_transformFieldUndoStart,
+                static_cast<const Scene&>(scene).GetRenderObjects()[*index].transform);
         }
-
-        m_transformFieldEditing = false;
-        m_transformFieldUndoObject = InvalidObjectSelection;
-        m_transformFieldScene = nullptr;
-        m_transformFieldRevision = 0;
     }
+
+    m_transformFieldEditing = false;
+    m_transformFieldUndoObject = InvalidObjectSelection;
+    m_transformFieldScene = nullptr;
+    m_transformFieldRevision = 0;
+
+    m_fieldHistoryTarget.reset();
 }
 
 void Editor::DrawTransformGizmo(
@@ -1293,7 +1584,8 @@ void Editor::DrawTransformGizmo(
         ImVec2(m_viewportImage.position.x + viewportWidth, m_viewportImage.position.y + viewportHeight), true);
     ImGuizmo::SetRect(m_viewportImage.position.x, m_viewportImage.position.y, viewportWidth, viewportHeight);
     const bool allowGizmo = !ImGui::GetIO().AppFocusLost && !m_sceneOperationPending &&
-        !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId) && !m_cameraLooking;
+        !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId) && !m_cameraLooking &&
+        !ImGui::GetDragDropPayload();
     ImGuizmo::Enable(allowGizmo && !m_workspace.IsSplitterDragging() && (m_viewportHovered || ImGuizmo::IsUsing()));
 
     ImGuizmo::OPERATION operation = ImGuizmo::TRANSLATE;
@@ -1322,6 +1614,8 @@ void Editor::DrawTransformGizmo(
     {
         m_gizmoUndoObject = m_selectedObject;
         m_gizmoUndoStart = transform;
+        m_gizmoHistoryTarget = CaptureHistoryTarget(demoScene, m_selectedObject);
+        m_gizmoHistoryEpoch = m_historyEpoch;
     }
 
     if (gizmoUsing)
@@ -1377,35 +1671,18 @@ void Editor::DrawTransformGizmo(
         }
     }
 
-    if (!gizmoUsing && m_gizmoWasUsing && m_gizmoUndoObject != InvalidObjectSelection)
+    if(!gizmoUsing && m_gizmoWasUsing && m_gizmoHistoryTarget)
     {
-        const auto& currentObjects = static_cast<const Scene&>(scene).GetRenderObjects();
+        const auto index = ResolveHistoryTarget(demoScene, *m_gizmoHistoryTarget);
 
-        if (m_gizmoUndoObject < currentObjects.size())
+        if(index)
         {
-            const Transform& current = currentObjects[m_gizmoUndoObject].transform;
-
-            const Transform& previous = m_gizmoUndoStart;
-
-            const bool changed =
-                current.position.x != previous.position.x || current.position.y != previous.position.y ||
-
-                current.position.z != previous.position.z || current.rotation.x != previous.rotation.x ||
-
-                current.rotation.y != previous.rotation.y || current.rotation.z != previous.rotation.z ||
-
-                current.scale.x != previous.scale.x || current.scale.y != previous.scale.y ||
-
-                current.scale.z != previous.scale.z;
-
-            if (changed)
-            {
-                m_transformRedoHistory.clear();
-                m_transformUndoHistory.push_back({m_gizmoUndoObject, previous});
-            }
+            RecordTransformEdit(*m_gizmoHistoryTarget, m_gizmoHistoryEpoch, m_gizmoUndoStart,
+                static_cast<const Scene&>(scene).GetRenderObjects()[*index].transform);
         }
 
         m_gizmoUndoObject = InvalidObjectSelection;
+        m_gizmoHistoryTarget.reset();
     }
 
     m_gizmoWasUsing = gizmoUsing;
@@ -1447,90 +1724,40 @@ void Editor::HandleViewportSelection(
     m_objectInspectionRequested = true;
 }
 
-void Editor::ClearTransformUndoHistory()
+void Editor::ResetTransformGestures()
 {
-    m_transformUndoHistory.clear();
-    m_transformRedoHistory.clear();
-
     m_gizmoWasUsing = false;
     m_gizmoUndoObject = InvalidObjectSelection;
+    m_gizmoHistoryTarget.reset();
 
     m_transformFieldEditing = false;
     m_transformFieldUndoObject = InvalidObjectSelection;
     m_transformFieldScene = nullptr;
     m_transformFieldRevision = 0;
+
+    m_fieldHistoryTarget.reset();
 }
 
 void Editor::HandleTransformUndo(IDemoScene& demoScene)
 {
-    const ImGuiIO& io = ImGui::GetIO();
+    const auto& io = ImGui::GetIO();
 
-    if (!io.KeyCtrl || !ImGui::IsKeyPressed(ImGuiKey_Z, false) || io.KeyShift || io.WantTextInput ||
-        ImGui::IsAnyItemActive())
+    if(io.KeyCtrl && !io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_Z, false) && !HistoryReplayBlocked())
     {
-        return;
+        ReplaySceneHistory(demoScene, false);
     }
-
-    if (ImGuizmo::IsUsing() || m_cameraLooking || m_transformFieldEditing ||
-        m_transformUndoHistory.empty())
-    {
-        return;
-    }
-
-    Scene& scene = demoScene.GetScene();
-
-    const TransformUndoEntry entry = m_transformUndoHistory.back();
-    m_transformUndoHistory.pop_back();
-
-    if (entry.objectIndex >= scene.GetRenderObjects().size())
-    {
-        return;
-    }
-
-    const auto& objects = static_cast<const Scene&>(scene).GetRenderObjects();
-
-    const Transform currentTransform = objects[entry.objectIndex].transform;
-
-    m_transformRedoHistory.push_back({entry.objectIndex, currentTransform});
-
-    scene.SetRenderObjectTransform(entry.objectIndex, entry.previousTransform);
 }
 
 void Editor::HandleTransformRedo(IDemoScene& demoScene)
 {
-    const ImGuiIO& io = ImGui::GetIO();
+    const auto& io = ImGui::GetIO();
+    const bool pressed = io.KeyCtrl && (ImGui::IsKeyPressed(ImGuiKey_Y, false) ||
+        (io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_Z, false)));
 
-    const bool redoPressed = io.KeyCtrl && (ImGui::IsKeyPressed(ImGuiKey_Y, false) ||
-                                            (io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_Z, false)));
-
-    if (!redoPressed || io.WantTextInput || ImGui::IsAnyItemActive() || ImGuizmo::IsUsing())
+    if(pressed && !HistoryReplayBlocked())
     {
-        return;
+        ReplaySceneHistory(demoScene, true);
     }
-
-    if (m_cameraLooking ||
-        m_transformFieldEditing || m_transformRedoHistory.empty())
-    {
-        return;
-    }
-
-    Scene& scene = demoScene.GetScene();
-
-    const TransformUndoEntry entry = m_transformRedoHistory.back();
-    m_transformRedoHistory.pop_back();
-
-    const auto& objects = static_cast<const Scene&>(scene).GetRenderObjects();
-
-    if (entry.objectIndex >= objects.size())
-    {
-        return;
-    }
-
-    const Transform currentTransform = objects[entry.objectIndex].transform;
-
-    m_transformUndoHistory.push_back({entry.objectIndex, currentTransform});
-
-    scene.SetRenderObjectTransform(entry.objectIndex, entry.previousTransform);
 }
 
 void Editor::UpdateCameraLook(
@@ -1576,6 +1803,7 @@ void Editor::UpdateCameraLook(
 
         m_cameraPitch = std::atan2(direction.y, horizontalLength);
 
+        CaptureViewportRightClick(demoScene);
         m_cameraLooking = true;
 
         ImGui::SetMouseCursor(ImGuiMouseCursor_None);
@@ -1583,11 +1811,24 @@ void Editor::UpdateCameraLook(
 
     ImGui::SetMouseCursor(ImGuiMouseCursor_None);
 
+    ImVec2 delta = io.MouseDelta;
+
+    if(!m_viewportRightDragged)
+    {
+        if(!ImGui::IsMouseDragging(ImGuiMouseButton_Right))
+        {
+            return;
+        }
+
+        // Apply the accumulated motion once the gesture becomes camera navigation.
+        // Motion on the initial press can precede the click and must not rotate the camera.
+        delta = ImGui::GetMouseDragDelta(ImGuiMouseButton_Right, 0.0f);
+        m_viewportRightDragged = true;
+    }
+
     constexpr float sensitivity = 0.003f;
-
-    m_cameraYaw += io.MouseDelta.x * sensitivity;
-
-    m_cameraPitch -= io.MouseDelta.y * sensitivity;
+    m_cameraYaw += delta.x * sensitivity;
+    m_cameraPitch -= delta.y * sensitivity;
 
     m_cameraPitch = (std::clamp)(m_cameraPitch, -1.55334f, 1.55334f);
 
@@ -1656,6 +1897,7 @@ void Editor::UpdateCameraMovement(
         return;
     }
 
+    m_viewportRightDragged = true;
     movement = movement * (1.0f / length);
 
     constexpr float normalSpeed = 5.0f;
@@ -1767,6 +2009,11 @@ Editor::SceneChangeDecision Editor::DrawSceneChangeConfirmation(const std::strin
 
 void Editor::SuspendViewportInteraction()
 {
+    m_viewportRightGesture = false;
+    m_viewportRightObject.reset();
+    m_viewportContextObject.reset();
+    m_openViewportContext = false;
+
     m_cameraLooking = false;
     m_viewportFocused = false;
     m_viewportHovered = false;
@@ -1776,11 +2023,31 @@ void Editor::SuspendViewportInteraction()
 
 void Editor::OnSceneActivated()
 {
+    ClearSceneHistory();
+    ResetSceneInteractions();
+}
+
+void Editor::ResetSceneInteractions()
+{
+    m_viewportRightGesture = false;
+    m_viewportRightObject.reset();
+    m_viewportContextObject.reset();
+    m_openViewportContext = false;
+
+    m_sceneObjectDeletionRequest.reset();
+    m_sceneObjectDeletionPending.reset();
+    m_sceneObjectDeletionStatusObject.reset();
+    m_sceneObjectDeletionStatus.clear();
+
+    m_assetBrowser.InvalidateMeshDragIdentity();
+    m_meshCreationRequest.reset();
     m_workingMaterialRevisions.clear();
     m_inspectorPanel.ResetWorkingMaterialNotifications();
     m_savedMaterialRevisions.clear();
     m_materialAssignmentRequest.reset();
     m_materialAssignmentSelection.reset();
+    m_materialAssignmentSlotID.reset();
+    m_inspectorPanel.DismissSceneMaterialPicker();
     m_materialAssignmentPending = false;
     m_materialAssignmentStatus.clear();
     m_objectInspectionRequested = false;
@@ -1800,7 +2067,7 @@ void Editor::OnSceneActivated()
     m_viewportFocused = false;
 
     // Different files may share a display name and structure revision.
-    ClearTransformUndoHistory();
+    ResetTransformGestures();
     m_selectedObject = InvalidObjectSelection;
     m_selectionSceneName.clear();
     m_selectionStructureRevision = 0;
@@ -1934,6 +2201,12 @@ void Editor::OnMaterialAssignmentCompleted(const SceneObjectMetadata& selection,
     {
         m_materialAssignmentPending = false;
         m_materialAssignmentStatus = (succeeded ? "Assigned: " : "Not assigned: ") + std::move(message);
+
+        if(m_materialAssignmentSlotID)
+        {
+            m_inspectorPanel.OnSlotAssignmentCompleted(selection, *m_materialAssignmentSlotID,
+                succeeded, m_materialAssignmentStatus);
+        }
     }
 }
 
@@ -1945,4 +2218,879 @@ std::vector<Editor::SceneMaterialSavedRevision> Editor::TakeSavedMaterialRevisio
 std::vector<Editor::SceneMaterialWorkingRevision> Editor::TakeWorkingMaterialRevisions()
 {
     return std::exchange(m_workingMaterialRevisions, {});
+}
+
+void Editor::PublishCreatedObjectSelection(
+    const Scene& scene, SceneObjectMetadata metadata, std::string activeSceneName) noexcept
+{
+    // Metadata was resolved through the candidate's persistent-ID mapping before
+    // renderer initialization; no allocation or fallible lookup follows publication.
+    OnSceneActivated();
+    m_selectedObject = metadata.runtimeIndex;
+    m_selectionSceneName = std::move(activeSceneName);
+    m_selectionStructureRevision = scene.GetStructureRevision();
+
+    ObjectInspectionIdentity identity{&scene, scene.GetStructureRevision()};
+    identity.runtimeIdentity = metadata.runtimeIdentity;
+    identity.objectID = std::move(metadata.objectID);
+    identity.sceneID = std::move(metadata.sceneID);
+
+    m_objectInspectionIdentity = std::move(identity);
+    m_inspectorTarget = InspectorTarget::SceneObject;
+    m_objectInspectionRequested = true;
+}
+
+void Editor::DrawMeshDropTarget(const IDemoScene& scene, const ProjectPaths& paths,
+    const ProjectAssetRegistry& registry)
+{
+    const ImGuiPayload* dragging = ImGui::GetDragDropPayload();
+
+    if(!dragging || !dragging->IsDataType(MeshDragPayloadType) ||
+        m_viewportImage.size.x <= 0.0f || m_viewportImage.size.y <= 0.0f)
+    {
+        return;
+    }
+
+    if(ImGui::GetIO().AppFocusLost || m_workspace.IsSplitterDragging() || ImGuizmo::IsUsing() ||
+        m_gizmoWasUsing || m_cameraLooking || m_sceneOperationPending || m_fileRequest ||
+        HasBlockingObjectCreation() || HasPendingSceneHistoryOperation() || m_meshCreationRequest ||
+        ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel) ||
+        ImGui::IsWindowHovered(ImGuiHoveredFlags_AnyWindow | ImGuiHoveredFlags_AllowWhenBlockedByActiveItem))
+    {
+        return;
+    }
+
+    const ImRect image(m_viewportImage.position, ImVec2(
+        m_viewportImage.position.x + m_viewportImage.size.x,
+        m_viewportImage.position.y + m_viewportImage.size.y));
+    const ImVec2 mouse = ImGui::GetIO().MousePos;
+
+    if(!image.Contains(mouse))
+    {
+        return;
+    }
+
+    // The viewport intentionally has NoInputs. This ImGui target accepts a
+    // rectangle without requiring a hovered input window, preserving picking.
+    ImGui::Begin("Scene Viewport");
+
+    if(ImGui::BeginDragDropTargetViewport(ImGui::GetMainViewport(), &image))
+    {
+        const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(MeshDragPayloadType);
+
+        if(payload && payload->IsDelivery() && m_meshDropDeliveryFrame != ImGui::GetFrameCount())
+        {
+            m_meshDropDeliveryFrame = ImGui::GetFrameCount();
+            const auto* owner = dynamic_cast<const FileBackedDemoScene*>(&scene);
+            MeshDragPayload meshPayload;
+            std::string error;
+            std::optional<AssetRecord> record;
+
+            if(!owner)
+            {
+                error = "Mesh drops require an active file-backed scene.";
+            }
+            else if(payload->DataSize != sizeof(MeshDragPayload) || !payload->Data)
+            {
+                error = "Mesh drop has an invalid payload size.";
+            }
+            else
+            {
+                std::memcpy(&meshPayload, payload->Data, sizeof(meshPayload));
+                record = m_assetBrowser.ValidateMeshDrag(meshPayload, paths, registry, error);
+            }
+
+            Transform placement;
+
+            if(record && !FindMeshDropPosition(*owner, mouse.x - image.Min.x, mouse.y - image.Min.y,
+                image.GetWidth(), image.GetHeight(), placement.position))
+            {
+                record.reset();
+                error = "No finite forward placement is available at this cursor position.";
+            }
+
+            if(record)
+            {
+                m_meshCreationRequest = MeshCreationRequest{record->id.ToReference(),
+                    record->relativePath.stem().string(), placement, owner->GetRuntimeIdentity()};
+                m_meshCreationStatus = "Creating mesh at cursor...";
+            }
+            else
+            {
+                OnMeshCreationCompleted(false, error);
+            }
+        }
+
+        ImGui::EndDragDropTarget();
+    }
+
+    ImGui::End();
+}
+
+std::optional<Editor::MeshCreationRequest> Editor::TakeMeshCreationRequest()
+{
+    return std::exchange(m_meshCreationRequest, std::nullopt);
+}
+
+void Editor::OnMeshCreationCompleted(bool succeeded, const std::string& error)
+{
+    m_meshCreationStatus = succeeded ? "Mesh created at cursor. Save the scene to persist it." :
+        "Mesh drop rejected: " + error;
+
+    if(!succeeded)
+    {
+        Log::Warning(m_meshCreationStatus);
+    }
+}
+
+
+bool Editor::SceneObjectDeletionBlocked() const
+{
+    return HasPendingSceneHistoryOperation() || m_sceneOperationPending || m_sceneObjectDeletionPending || m_sceneObjectDeletionRequest ||
+        m_fileRequest || m_meshCreationRequest || m_materialAssignmentRequest ||
+        m_materialLeaveAction != MaterialLeaveAction::None || HasBlockingObjectCreation() ||
+        m_workspace.IsSplitterDragging() || ImGui::GetDragDropPayload() || ImGui::GetIO().AppFocusLost ||
+        m_viewportImage.size.x <= 0.0f || m_viewportImage.size.y <= 0.0f;
+}
+
+bool Editor::SceneObjectDeletionMatches(const IDemoScene& scene, const SceneObjectMetadata& selection) const
+{
+    const auto* owner = dynamic_cast<const FileBackedDemoScene*>(&scene);
+    const auto current = owner ? owner->GetObjectMetadata(selection.objectID) : std::nullopt;
+
+    return current && m_selectedObject == current->runtimeIndex &&
+        current->sceneID == selection.sceneID && current->runtimeIdentity == selection.runtimeIdentity &&
+        current->structureRevision == selection.structureRevision && current->runtimeIndex == selection.runtimeIndex;
+}
+
+void Editor::CaptureViewportRightClick(const IDemoScene& scene)
+{
+    m_viewportRightObject.reset();
+    m_viewportRightGesture = true;
+    m_viewportRightDragged = false;
+
+    if(SceneObjectDeletionBlocked() || ImGuizmo::IsOver() || ImGui::GetIO().WantTextInput)
+    {
+        return;
+    }
+
+    const auto* owner = dynamic_cast<const FileBackedDemoScene*>(&scene);
+
+    if(!owner)
+    {
+        return;
+    }
+
+    const auto mouse = ImGui::GetIO().MousePos;
+    const auto index = PickObject(scene.GetScene(), mouse.x - m_viewportImage.position.x,
+        mouse.y - m_viewportImage.position.y, m_viewportImage.size.x, m_viewportImage.size.y);
+
+    if(index != InvalidObjectSelection)
+    {
+        m_viewportRightObject = owner->GetObjectMetadata(index);
+    }
+}
+
+void Editor::FinishViewportRightClick(const IDemoScene& scene)
+{
+    if(!m_viewportRightGesture || !ImGui::IsMouseReleased(ImGuiMouseButton_Right))
+    {
+        return;
+    }
+
+    m_viewportRightGesture = false;
+    auto selected = std::exchange(m_viewportRightObject, std::nullopt);
+    const auto& io = ImGui::GetIO();
+    const bool dragged = m_viewportRightDragged ||
+        io.MouseDragMaxDistanceSqr[ImGuiMouseButton_Right] >= io.MouseDragThreshold * io.MouseDragThreshold;
+
+    if(!selected || dragged || !m_viewportHovered || SceneObjectDeletionBlocked() ||
+        ImGuizmo::IsUsing() || ImGuizmo::IsOver() || ImGui::IsAnyItemActive() || io.WantTextInput ||
+        ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel))
+    {
+        return;
+    }
+
+    const auto* owner = dynamic_cast<const FileBackedDemoScene*>(&scene);
+    const auto current = owner ? owner->GetObjectMetadata(selected->objectID) : std::nullopt;
+
+    if(!current || current->runtimeIdentity != selected->runtimeIdentity ||
+        current->sceneID != selected->sceneID || current->structureRevision != selected->structureRevision)
+    {
+        return;
+    }
+
+    const auto index = PickObject(scene.GetScene(), io.MousePos.x - m_viewportImage.position.x,
+        io.MousePos.y - m_viewportImage.position.y, m_viewportImage.size.x, m_viewportImage.size.y);
+
+    if(index != current->runtimeIndex)
+    {
+        return;
+    }
+
+    m_selectedObject = current->runtimeIndex;
+    m_objectInspectionRequested = true;
+    m_viewportContextObject = *current;
+    m_openViewportContext = true;
+}
+
+void Editor::QueueSceneObjectDeletion(const IDemoScene& scene, const SceneObjectMetadata& selection)
+{
+    if(SceneObjectDeletionBlocked() || !SceneObjectDeletionMatches(scene, selection))
+    {
+        return;
+    }
+
+    m_sceneObjectDeletionRequest = selection;
+    m_sceneObjectDeletionPending = selection;
+    m_sceneObjectDeletionStatusObject = selection;
+    m_sceneObjectDeletionStatus = "Deleting scene object...";
+}
+
+void Editor::DrawSceneObjectDeletionControls(IDemoScene& scene)
+{
+    if(m_sceneObjectDeletionStatusObject && !SceneObjectDeletionMatches(scene, *m_sceneObjectDeletionStatusObject))
+    {
+        m_sceneObjectDeletionStatusObject.reset();
+        m_sceneObjectDeletionStatus.clear();
+    }
+
+    const auto& io = ImGui::GetIO();
+
+    if(io.AppFocusLost || !m_viewportFocused || SceneObjectDeletionBlocked())
+    {
+        m_viewportRightGesture = false;
+        m_viewportRightObject.reset();
+    }
+
+    FinishViewportRightClick(scene);
+
+    const bool keyboardAllowed = m_viewportFocused && !SceneObjectDeletionBlocked() &&
+        !m_openViewportContext && !m_viewportRightGesture &&
+        !io.WantTextInput && !io.WantCaptureKeyboard && !ImGui::IsAnyItemActive() &&
+        !m_cameraLooking && !ImGuizmo::IsUsing() && !ImGui::IsMouseDown(ImGuiMouseButton_Right) &&
+        m_viewportImage.size.x > 0.0f && m_viewportImage.size.y > 0.0f &&
+        !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel);
+
+    if(keyboardAllowed && ImGui::IsKeyPressed(ImGuiKey_Delete, false))
+    {
+        const auto* owner = dynamic_cast<const FileBackedDemoScene*>(&scene);
+        const auto selected = owner ? owner->GetObjectMetadata(m_selectedObject) : std::nullopt;
+
+        if(selected && m_selectionStructureRevision == selected->structureRevision)
+        {
+            QueueSceneObjectDeletion(scene, *selected);
+        }
+    }
+
+    // Use the viewport's stable popup ID even though its image window ignores mouse input.
+    const ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+        ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoFocusOnAppearing;
+    ImGui::Begin("Scene Viewport", nullptr, flags);
+
+    if(m_openViewportContext)
+    {
+        ImGui::OpenPopup("SceneObjectContext");
+        m_openViewportContext = false;
+    }
+
+    if(ImGui::BeginPopup("SceneObjectContext"))
+    {
+        if(!m_viewportContextObject || SceneObjectDeletionBlocked() ||
+            !SceneObjectDeletionMatches(scene, *m_viewportContextObject))
+        {
+            ImGui::CloseCurrentPopup();
+        }
+        else
+        {
+            ImGui::TextUnformatted(m_viewportContextObject->name.c_str());
+            ImGui::Separator();
+
+            if(ImGui::MenuItem("Delete"))
+            {
+                QueueSceneObjectDeletion(scene, *m_viewportContextObject);
+            }
+        }
+
+        ImGui::EndPopup();
+    }
+
+    if(!ImGui::IsPopupOpen("SceneObjectContext"))
+    {
+        m_viewportContextObject.reset();
+    }
+
+    ImGui::End();
+}
+
+std::optional<SceneObjectMetadata> Editor::TakeSceneObjectDeletionRequest()
+{
+    return std::exchange(m_sceneObjectDeletionRequest, std::nullopt);
+}
+
+void Editor::OnSceneObjectDeletionCompleted(const IDemoScene& scene, const SceneObjectMetadata& selection,
+    bool succeeded, const std::string& error)
+{
+    if(!m_sceneObjectDeletionPending ||
+        m_sceneObjectDeletionPending->objectID != selection.objectID ||
+        m_sceneObjectDeletionPending->runtimeIdentity != selection.runtimeIdentity ||
+        m_sceneObjectDeletionPending->structureRevision != selection.structureRevision ||
+        m_sceneObjectDeletionPending->sceneID != selection.sceneID)
+    {
+        return;
+    }
+
+    m_sceneObjectDeletionPending.reset();
+
+    if(succeeded || !SceneObjectDeletionMatches(scene, selection))
+    {
+        m_sceneObjectDeletionStatusObject.reset();
+        m_sceneObjectDeletionStatus.clear();
+        return;
+    }
+
+    m_sceneObjectDeletionStatusObject = selection;
+    m_sceneObjectDeletionStatus = "Object deletion failed: " + error;
+    Log::Warning(m_sceneObjectDeletionStatus);
+}
+
+namespace
+{
+    bool SameHistoryTransform(const Transform& left, const Transform& right)
+    {
+        const auto same = [](const Vector3& a, const Vector3& b)
+        {
+            return a.x == b.x && a.y == b.y && a.z == b.z;
+        };
+        return same(left.position, right.position) && same(left.rotation, right.rotation) &&
+            same(left.scale, right.scale);
+    }
+}
+
+void Editor::ClearSceneHistory()
+{
+    // Session invalidation explicitly cancels requests; late results carry the old epoch.
+    m_pendingHistoryReplay.reset();
+    m_historyReplayRequest.reset();
+    m_stagedDeletionHistory.reset();
+
+    m_sceneHistory.clear();
+    m_historyCursor = 0;
+    m_historyPayloadBytes = 0;
+    m_historySession.reset();
+
+    ++m_historyEpoch;
+    m_historyObservedScene = nullptr;
+    m_historyRuntimeIdentity = 0;
+    m_historyStructureRevision = 0;
+
+    m_sceneHistoryStatus.clear();
+    ResetTransformGestures();
+}
+
+void Editor::ReportSceneHistoryFailure(const std::string& error)
+{
+    m_sceneHistoryStatus = "Scene history: " + error;
+    Log::Warning(m_sceneHistoryStatus);
+}
+
+bool Editor::UpdateSceneHistorySession(const IDemoScene& demoScene, const ProjectPaths& paths,
+    const std::string& name)
+{
+    std::error_code error;
+    const auto project = std::filesystem::canonical(paths.GetRoot(), error);
+    const auto* owner = dynamic_cast<const FileBackedDemoScene*>(&demoScene);
+
+    if(error || (owner && (owner->GetPersistentSceneID().empty() ||
+        std::filesystem::canonical(owner->GetProjectRoot(), error) != project || error)))
+    {
+        ClearSceneHistory();
+        ReportSceneHistoryFailure("Cannot establish the current project/scene identity; replay is disabled.");
+        return false;
+    }
+
+    const std::string identity = owner ? std::string(owner->GetPersistentSceneID()) : name;
+    const auto path = owner ? owner->GetScenePath().lexically_normal() : std::filesystem::path{};
+    const auto runtime = owner ? owner->GetRuntimeIdentity() : 0;
+    const auto& scene = demoScene.GetScene();
+    const auto revision = scene.GetStructureRevision();
+    const bool changed = m_historySession && (m_historySession->projectIdentity != project ||
+        m_historySession->sceneIdentity != identity || m_historySession->scenePath != path ||
+        m_historyObservedScene != &scene || m_historyRuntimeIdentity != runtime ||
+        m_historyStructureRevision != revision);
+
+    if(changed)
+    {
+        ClearSceneHistory();
+    }
+
+    if(!m_historySession)
+    {
+        if(m_historyEpoch == 0)
+        {
+            ++m_historyEpoch;
+        }
+
+        m_historySession = SceneHistorySession{project, path, identity, m_historyEpoch};
+        m_historyObservedScene = &scene;
+        m_historyRuntimeIdentity = runtime;
+        m_historyStructureRevision = revision;
+    }
+
+    return true;
+}
+
+bool Editor::RebindSceneHistoryAfterStructureChange(const IDemoScene& demoScene)
+{
+    // Precondition: a future supported structural command has completed its checked
+    // Renderer publication. Never use this to acknowledge arbitrary structural edits.
+    const auto* owner = dynamic_cast<const FileBackedDemoScene*>(&demoScene);
+    std::error_code error;
+    const auto project = owner ? std::filesystem::canonical(owner->GetProjectRoot(), error) :
+        std::filesystem::path{};
+
+    if(!owner || !m_historySession || error || project != m_historySession->projectIdentity ||
+        owner->GetPersistentSceneID() != m_historySession->sceneIdentity ||
+        owner->GetScenePath().lexically_normal() != m_historySession->scenePath)
+    {
+        ReportSceneHistoryFailure("Structural publication does not belong to the current editing session.");
+        return false;
+    }
+
+    m_historyObservedScene = &demoScene.GetScene();
+    m_historyRuntimeIdentity = owner->GetRuntimeIdentity();
+    m_historyStructureRevision = demoScene.GetScene().GetStructureRevision();
+    return true;
+}
+
+std::optional<Editor::HistoryTarget> Editor::CaptureHistoryTarget(const IDemoScene& demoScene, size_t index)
+{
+    const auto& scene = demoScene.GetScene();
+
+    if(!m_historySession || m_historyObservedScene != &scene ||
+        m_historyStructureRevision != scene.GetStructureRevision() || index >= scene.GetRenderObjects().size())
+    {
+        ReportSceneHistoryFailure("Cannot record a transform against stale scene mappings.");
+        return std::nullopt;
+    }
+
+    if(const auto* owner = dynamic_cast<const FileBackedDemoScene*>(&demoScene))
+    {
+        const auto metadata = owner->GetObjectMetadata(index);
+
+        if(!metadata || metadata->runtimeIdentity != m_historyRuntimeIdentity ||
+            metadata->sceneID != m_historySession->sceneIdentity)
+        {
+            ReportSceneHistoryFailure("Cannot identify the edited object's persistent ID.");
+            return std::nullopt;
+        }
+
+        return PersistentHistoryTarget{metadata->objectID};
+    }
+
+    return ProceduralHistoryTarget{index};
+}
+
+std::optional<size_t> Editor::ResolveHistoryTarget(const IDemoScene& demoScene, const HistoryTarget& target)
+{
+    const auto& scene = demoScene.GetScene();
+    const auto* owner = dynamic_cast<const FileBackedDemoScene*>(&demoScene);
+
+    if(!m_historySession || m_historySession->epoch != m_historyEpoch || m_historyObservedScene != &scene ||
+        m_historyStructureRevision != scene.GetStructureRevision() ||
+        (owner && m_historyRuntimeIdentity != owner->GetRuntimeIdentity()))
+    {
+        ReportSceneHistoryFailure("Scene bindings changed; the history cursor was preserved.");
+        return std::nullopt;
+    }
+
+    if(const auto* persistent = std::get_if<PersistentHistoryTarget>(&target))
+    {
+        const auto metadata = owner ? owner->GetObjectMetadata(persistent->objectID) : std::nullopt;
+
+        if(!metadata || metadata->sceneID != m_historySession->sceneIdentity)
+        {
+            ReportSceneHistoryFailure("Target object '" + persistent->objectID + "' cannot be resolved; cursor preserved.");
+            return std::nullopt;
+        }
+
+        return metadata->runtimeIndex;
+    }
+
+    const auto index = std::get<ProceduralHistoryTarget>(target).objectIndex;
+
+    if(owner || index >= scene.GetRenderObjects().size())
+    {
+        ReportSceneHistoryFailure("Procedural target cannot be resolved; the history cursor was preserved.");
+        return std::nullopt;
+    }
+
+    return index;
+}
+
+void Editor::TruncateHistoryRedo()
+{
+    for(size_t index = m_historyCursor; index < m_sceneHistory.size(); ++index)
+    {
+        m_historyPayloadBytes -= m_sceneHistory[index].payloadBytes;
+    }
+
+    m_sceneHistory.erase(m_sceneHistory.begin() + m_historyCursor, m_sceneHistory.end());
+}
+
+void Editor::RecordTransformEdit(HistoryTarget target, std::uint64_t epoch,
+    const Transform& before, const Transform& after)
+{
+    if(SameHistoryTransform(before, after))
+    {
+        return;
+    }
+
+    if(HasPendingSceneHistoryOperation())
+    {
+        ReportSceneHistoryFailure("A deferred history operation is pending; transform recording was rejected.");
+        return;
+    }
+
+    if(!m_historySession || epoch != m_historySession->epoch)
+    {
+        ReportSceneHistoryFailure("Completed transform belongs to a different editing session.");
+        return;
+    }
+
+    SceneHistoryEntry entry{TransformEdit{std::move(target), before, after}, epoch, sizeof(SceneHistoryEntry)};
+    const auto& edit = std::get<TransformEdit>(entry.command);
+
+    if(const auto* persistent = std::get_if<PersistentHistoryTarget>(&edit.target))
+    {
+        // Capacity accounts conservatively for retained string storage, including SSO.
+        entry.payloadBytes += persistent->objectID.capacity() + 1;
+    }
+
+    m_sceneHistory.reserve(kSceneHistoryCapacity);
+    TruncateHistoryRedo();
+
+    if(entry.payloadBytes > kSceneHistoryPayloadBytes)
+    {
+        ReportSceneHistoryFailure("Transform command exceeds the 4 MiB history payload limit.");
+        return;
+    }
+
+    AppendSceneHistoryEntry(std::move(entry));
+}
+
+void Editor::AppendSceneHistoryEntry(SceneHistoryEntry entry) noexcept
+{
+    static_assert(std::is_nothrow_move_constructible_v<SceneHistoryEntry>);
+    static_assert(std::is_nothrow_move_assignable_v<SceneHistoryEntry>);
+
+    TruncateHistoryRedo();
+
+    while(m_historyCursor > 0 && (m_sceneHistory.size() >= kSceneHistoryCapacity ||
+        m_historyPayloadBytes + entry.payloadBytes > kSceneHistoryPayloadBytes))
+    {
+        m_historyPayloadBytes -= m_sceneHistory.front().payloadBytes;
+        m_sceneHistory.erase(m_sceneHistory.begin());
+        --m_historyCursor;
+    }
+
+    m_historyPayloadBytes += entry.payloadBytes;
+    m_sceneHistory.push_back(std::move(entry));
+    m_historyCursor = m_sceneHistory.size();
+    m_sceneHistoryStatus.clear();
+}
+
+bool Editor::HistoryReplayBlocked() const
+{
+    const auto& io = ImGui::GetIO();
+    return HasPendingSceneHistoryOperation() || io.WantTextInput || io.AppFocusLost || ImGui::IsAnyItemActive() ||
+        ImGuizmo::IsUsing() || m_gizmoWasUsing || m_transformFieldEditing || m_cameraLooking ||
+        ImGui::IsMouseDown(ImGuiMouseButton_Right) || m_viewportRightGesture ||
+        m_sceneOperationPending || m_sceneObjectDeletionPending || m_sceneObjectDeletionRequest ||
+        m_materialAssignmentPending || m_materialAssignmentRequest || m_meshCreationRequest || m_fileRequest ||
+        m_materialLeaveAction != MaterialLeaveAction::None || m_workspace.IsSplitterDragging() ||
+        ImGui::GetDragDropPayload() ||
+        ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel);
+}
+
+void Editor::ReplaySceneHistory(IDemoScene& demoScene, bool redo)
+{
+    if((redo && m_historyCursor == m_sceneHistory.size()) || (!redo && m_historyCursor == 0))
+    {
+        return;
+    }
+
+    const auto& entry = m_sceneHistory[redo ? m_historyCursor : m_historyCursor - 1];
+
+    if(!m_historySession || entry.sessionEpoch != m_historySession->epoch)
+    {
+        ReportSceneHistoryFailure("Command belongs to another load session; cursor preserved.");
+        return;
+    }
+
+    const auto* ownedDeletion = std::get_if<std::unique_ptr<ObjectDeletion>>(&entry.command);
+
+    if(ownedDeletion && *ownedDeletion)
+    {
+        const auto* deletion = ownedDeletion->get();
+        const auto* owner = dynamic_cast<const FileBackedDemoScene*>(&demoScene);
+
+        if(!owner || !CanPreserveSceneHistory(*owner, deletion->session.projectIdentity, deletion->session.epoch))
+        {
+            ReportSceneHistoryFailure("Deletion replay does not belong to the current editing session.");
+            return;
+        }
+
+        HistoryReplayIdentity identity{AllocateSceneHistoryOperationID(), m_historyEpoch, redo,
+            redo ? deletion->selectionAfter : deletion->selectionBefore};
+        // Copy the outbound payload before locking the cursor. No command addresses escape.
+        HistoryReplayRequest request{identity, deletion->object, deletion->documentIndex};
+        m_historyReplayRequest = std::move(request);
+        m_pendingHistoryReplay = PendingHistoryReplay{std::move(identity), m_historyCursor};
+        return;
+    }
+
+    const auto& edit = std::get<TransformEdit>(entry.command);
+    const auto index = ResolveHistoryTarget(demoScene, edit.target);
+
+    if(!index)
+    {
+        return;
+    }
+
+    demoScene.GetScene().SetRenderObjectTransform(*index, redo ? edit.after : edit.before);
+
+    if(redo)
+    {
+        ++m_historyCursor;
+    }
+    else
+    {
+        --m_historyCursor;
+    }
+
+    m_sceneHistoryStatus.clear();
+}
+
+bool Editor::CanPreserveSceneHistory(const IDemoScene& demoScene,
+    const std::filesystem::path& canonicalProject, std::uint64_t epoch) const
+{
+    if(epoch != m_historyEpoch)
+    {
+        return false;
+    }
+
+    if(!m_historySession)
+    {
+        return m_sceneHistory.empty();
+    }
+
+    const auto* owner = dynamic_cast<const FileBackedDemoScene*>(&demoScene);
+    return owner && m_historySession->epoch == epoch &&
+        m_historySession->projectIdentity == canonicalProject &&
+        m_historySession->sceneIdentity == owner->GetPersistentSceneID() &&
+        m_historySession->scenePath == owner->GetScenePath().lexically_normal() &&
+        m_historyRuntimeIdentity == owner->GetRuntimeIdentity() &&
+        m_historyObservedScene == &owner->GetScene() &&
+        m_historyStructureRevision == owner->GetScene().GetStructureRevision();
+}
+
+void Editor::PublishRestoredObjectSelection(const FileBackedDemoScene& owner,
+    std::optional<SceneObjectMetadata> selection, std::string activeSceneName) noexcept
+{
+    const auto& scene = owner.GetScene();
+    m_historyObservedScene = &scene;
+    m_historyRuntimeIdentity = owner.GetRuntimeIdentity();
+    m_historyStructureRevision = scene.GetStructureRevision();
+
+    m_inspectorPanel.DismissTexturePicker();
+    m_inspectorPanel.ReleaseSceneObjectPreview();
+    SuspendViewportInteraction();
+    ResetSceneInteractions();
+
+    m_selectionSceneName = std::move(activeSceneName);
+    m_selectionStructureRevision = scene.GetStructureRevision();
+
+    if(!selection)
+    {
+        return;
+    }
+
+    m_selectedObject = selection->runtimeIndex;
+    ObjectInspectionIdentity identity{&scene, scene.GetStructureRevision()};
+    identity.runtimeIdentity = selection->runtimeIdentity;
+    identity.objectID = std::move(selection->objectID);
+    identity.sceneID = std::move(selection->sceneID);
+
+    m_objectInspectionIdentity = std::move(identity);
+    m_inspectorTarget = InspectorTarget::SceneObject;
+    m_objectInspectionRequested = true;
+}
+
+bool Editor::HasPendingSceneHistoryOperation() const noexcept
+{
+    return m_pendingHistoryReplay.has_value() || m_stagedDeletionHistory.has_value();
+}
+
+bool Editor::MatchesPendingHistoryReplay(const HistoryReplayIdentity& identity) const noexcept
+{
+    return m_pendingHistoryReplay && identity.epoch == m_historyEpoch &&
+        m_pendingHistoryReplay->identity.operationID == identity.operationID &&
+        m_pendingHistoryReplay->identity.epoch == identity.epoch &&
+        m_pendingHistoryReplay->identity.redo == identity.redo &&
+        m_pendingHistoryReplay->identity.selectionID == identity.selectionID &&
+        m_pendingHistoryReplay->cursor == m_historyCursor;
+}
+
+std::optional<Editor::HistoryReplayRequest> Editor::TakeSceneHistoryReplayRequest()
+{
+    return std::exchange(m_historyReplayRequest, std::nullopt);
+}
+
+size_t Editor::ObjectDeletionPayloadBytes(const ObjectDeletion& deletion)
+{
+    const auto bytes = [](const std::string& text) { return text.capacity() + 1; };
+    const auto& object = deletion.object;
+    size_t size = sizeof(SceneHistoryEntry) + sizeof(ObjectDeletion) + bytes(object.id) + bytes(object.name) +
+        bytes(object.meshReference) + bytes(object.materialReference);
+
+    for(const auto& [slot, reference] : object.materialSlotBindings)
+    {
+        size += sizeof(std::pair<const std::string, std::string>) + 4 * sizeof(void*) + bytes(slot) + bytes(reference);
+    }
+
+    size += bytes(deletion.session.sceneIdentity) +
+        (deletion.session.projectIdentity.native().capacity() + 1) * sizeof(std::filesystem::path::value_type) +
+        (deletion.session.scenePath.native().capacity() + 1) * sizeof(std::filesystem::path::value_type);
+
+    if(deletion.selectionBefore)
+    {
+        size += bytes(*deletion.selectionBefore);
+    }
+
+    if(deletion.selectionAfter)
+    {
+        size += bytes(*deletion.selectionAfter);
+    }
+
+    return size;
+}
+
+bool Editor::StageObjectDeletionHistory(SceneObjectDocument object, size_t documentIndex,
+    std::optional<std::string> selectionBefore, std::optional<std::string> selectionAfter,
+    std::uint64_t operationID, std::uint64_t epoch, bool replay, std::string& error)
+{
+    if(!m_historySession || epoch != m_historyEpoch || m_historySession->epoch != epoch)
+    {
+        error = "Deletion history cannot establish the current editing session.";
+        return false;
+    }
+
+    if(replay)
+    {
+        if(!m_pendingHistoryReplay || m_pendingHistoryReplay->identity.operationID != operationID ||
+            !m_pendingHistoryReplay->identity.redo || m_pendingHistoryReplay->identity.epoch != epoch ||
+            m_pendingHistoryReplay->cursor != m_historyCursor || m_historyCursor >= m_sceneHistory.size())
+        {
+            error = "Redo deletion operation identity is stale.";
+            return false;
+        }
+
+        const auto* owned = std::get_if<std::unique_ptr<ObjectDeletion>>(&m_sceneHistory[m_historyCursor].command);
+        const auto* deletion = owned ? owned->get() : nullptr;
+
+        if(!deletion || deletion->documentIndex != documentIndex || deletion->object.id != object.id ||
+            deletion->object.name != object.name || !SameHistoryTransform(deletion->object.transform, object.transform) ||
+            deletion->object.meshReference != object.meshReference ||
+            deletion->object.materialReference != object.materialReference ||
+            deletion->object.materialSlotBindings != object.materialSlotBindings)
+        {
+            error = "Redo deletion target changed outside its history command; cursor preserved.";
+            return false;
+        }
+
+        return true;
+    }
+
+    if(HasPendingSceneHistoryOperation())
+    {
+        error = "Another scene history operation is pending.";
+        return false;
+    }
+
+    ObjectDeletion deletion{std::move(object), documentIndex, std::move(selectionBefore),
+        std::move(selectionAfter), *m_historySession};
+    const auto bytes = ObjectDeletionPayloadBytes(deletion);
+
+    if(bytes > kSceneHistoryPayloadBytes)
+    {
+        error = "Deletion rejected: its undo snapshot exceeds the 4 MiB history payload limit.";
+        ReportSceneHistoryFailure(error);
+        return false;
+    }
+
+    m_sceneHistory.reserve(kSceneHistoryCapacity);
+    m_stagedDeletionHistory = StagedDeletionHistory{
+        SceneHistoryEntry{std::make_unique<ObjectDeletion>(std::move(deletion)), epoch, bytes}, operationID};
+    return true;
+}
+
+void Editor::CompleteObjectDeletionHistory(std::uint64_t operationID, std::uint64_t epoch,
+    bool succeeded, const std::string& error)
+{
+    if(m_pendingHistoryReplay && m_pendingHistoryReplay->identity.operationID == operationID &&
+        m_pendingHistoryReplay->identity.epoch == epoch)
+    {
+        // The identity borrow remains valid until CompleteSceneHistoryReplay resets
+        // pending state; it is not accessed afterward. No success-path allocation.
+        CompleteSceneHistoryReplay(m_pendingHistoryReplay->identity, succeeded, error);
+        return;
+    }
+
+    if(!m_stagedDeletionHistory || m_stagedDeletionHistory->operationID != operationID ||
+        m_stagedDeletionHistory->entry.sessionEpoch != epoch || epoch != m_historyEpoch)
+    {
+        return;
+    }
+
+    if(succeeded)
+    {
+        auto entry = std::move(m_stagedDeletionHistory->entry);
+        m_stagedDeletionHistory.reset();
+        AppendSceneHistoryEntry(std::move(entry));
+        return;
+    }
+
+    m_stagedDeletionHistory.reset();
+    ReportSceneHistoryFailure(error);
+}
+
+void Editor::CompleteSceneHistoryReplay(const HistoryReplayIdentity& identity,
+    bool succeeded, const std::string& error)
+{
+    if(!MatchesPendingHistoryReplay(identity))
+    {
+        return;
+    }
+
+    if(succeeded)
+    {
+        m_historyCursor = identity.redo ? m_historyCursor + 1 : m_historyCursor - 1;
+        m_sceneHistoryStatus.clear();
+    }
+    else
+    {
+        ReportSceneHistoryFailure("Deferred undo/redo failed: " + error);
+    }
+
+    m_pendingHistoryReplay.reset();
+    m_historyReplayRequest.reset();
+}
+
+void Editor::InvalidateSceneHistoryRedoAfterEdit() noexcept
+{
+    if(!HasPendingSceneHistoryOperation())
+    {
+        TruncateHistoryRedo();
+    }
 }

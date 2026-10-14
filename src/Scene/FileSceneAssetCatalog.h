@@ -3,6 +3,8 @@
 #include "Scene/SceneAssetResolver.h"
 #include "assets/AssetID.h"
 #include "assets/MaterialAssetData.h"
+#include "assets/ImportedMesh.h"
+#include "assets/ModelImporter.h"
 
 #include "Renderer/Material.h"
 #include "Renderer/Mesh.h"
@@ -73,6 +75,7 @@ public:
         const Shader* vertexShader,
         const Shader* pixelShader);
 
+    // Caller must release Renderer references and prove GPU/recording completion first.
     void Shutdown();
 
     // Configure after Initialize; Engine owns the registry and outlives this catalog.
@@ -82,7 +85,16 @@ public:
         return m_materialError;
     }
 
+    // Synchronous loading outside active recording. Borrows remain stable until Shutdown.
+    // Changed source content requires a scene reload; live geometry is never replaced.
     Mesh* ResolveMesh(std::string_view reference) override;
+    const std::string& GetLastMeshError() const noexcept
+    {
+        return m_meshError;
+    }
+
+    // Registered meshes and builtin:sphere. CPU geometry shares the catalog borrow lifetime.
+    const ImportedMesh* GetMeshGeometry(const Mesh& mesh) const noexcept;
     Material* ResolveMaterial(std::string_view reference) override;
     // Call outside active recording. Saved content and fresh dependency resources;
     // never changes existing Material objects. Uploads use the checked synchronous uploader.
@@ -128,6 +140,23 @@ public:
     }
 
 private:
+    struct MeshAsset
+    {
+        ImportedMesh geometry;
+
+        Mesh mesh;
+
+        bool published = false;
+        ~MeshAsset();
+    };
+
+    // Path is intentionally absent: a rename with unchanged bytes preserves the borrow.
+    using MeshCacheKey = std::tuple<std::filesystem::path, std::string, std::string, std::uint32_t>;
+    static constexpr std::uint32_t kMeshImportRevision = ModelImporter::kImportRevision;
+    std::map<MeshCacheKey, std::unique_ptr<MeshAsset>> m_projectMeshes;
+
+    std::string m_meshError;
+
     std::optional<RuntimeMaterialVersions> GetOwnedMaterialVersions(const std::filesystem::path& canonicalProject,
         const AssetID& id, bool requireRegistration, std::string* errorMessage) const;
     struct TextureSource
@@ -238,6 +267,7 @@ private:
     DescriptorHeap* m_descriptorHeap = nullptr;
 
     Mesh m_sphereMesh;
+    ImportedMesh m_sphereGeometry;
 
     Texture m_whiteTexture;
 

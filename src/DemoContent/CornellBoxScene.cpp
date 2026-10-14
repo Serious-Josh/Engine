@@ -199,7 +199,8 @@ bool CornellBoxScene::Initialize(
     m_tankMaterial.baseColor[1] = 1.0f;
     m_tankMaterial.baseColor[2] = 1.0f;
 
-    const auto tank = ModelImporter::Load("assets/Models/CornellBox/tank_sample.fbx");
+    // Match the PNG atlas convention through the centralized importer policy.
+    const auto tank = ModelImporter::Load("assets/Models/CornellBox/tank_sample.fbx", MeshUVOrientation::FlipV);
 
     if (tank.empty())
     {
@@ -212,21 +213,8 @@ bool CornellBoxScene::Initialize(
     {
         auto mesh = std::make_unique<Mesh>();
 
-        // The FBX atlas UVs use bottom-origin V; ImageLoader preserves PNG row order.
-        // Adjust the shared vertex data so rasterization and DXR sample the same atlas.
-        std::vector<Vertex> tankVertices = importedMesh.vertices;
-
-        std::vector<std::uint32_t> tankIndices = importedMesh.indices;
-
-        for (Vertex& vertex : tankVertices)
-        {
-            vertex.uv[1] = 1.0f - vertex.uv[1];
-        }
-
-        TangentGenerator::GenerateTangents(tankVertices, tankIndices);
-
-        if (!mesh->Initialize(device, uploader, descriptorHeap, tankVertices.data(), tankVertices.size(),
-                              m_vertexLayout, tankIndices.data(), tankIndices.size()))
+        if (!mesh->Initialize(device, uploader, descriptorHeap, importedMesh.vertices.data(), importedMesh.vertices.size(),
+                              m_vertexLayout, importedMesh.indices.data(), importedMesh.indices.size()))
         {
             throw std::runtime_error("Failed to create imported tank mesh.");
         }

@@ -335,7 +335,8 @@ float4 PSMain(VSOutput input) : SV_TARGET
     float3 hdrColor =
         sceneColor.Load(int3(pixel, 0)).rgb;
 
-    if(toneMapConstants.debugView == 24u || toneMapConstants.debugView == 25u || toneMapConstants.debugView == 27u)
+    if(toneMapConstants.debugView == 24u || toneMapConstants.debugView == 25u ||
+       toneMapConstants.debugView == 27u || toneMapConstants.debugView == 32u)
     {
         return float4(all(isfinite(hdrColor)) ? hdrColor : float3(1.0f, 0.0f, 1.0f), 1.0f);
     }

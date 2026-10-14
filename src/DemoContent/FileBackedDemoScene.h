@@ -31,6 +31,18 @@ public:
         return m_scenePath;
     }
 
+    const std::filesystem::path& GetProjectRoot() const noexcept { return m_projectRoot; }
+    std::string_view GetPersistentSceneID() const noexcept
+    {
+        return m_runtime->GetFileScene().HasDocument() ?
+            std::string_view(m_runtime->GetFileScene().GetDocument().id) : std::string_view{};
+    }
+
+    const ImportedMesh* GetMeshGeometry(const Mesh& mesh) const noexcept
+    {
+        return m_assets.GetMeshGeometry(mesh);
+    }
+
     bool PublishSavedMaterialParameters(const RuntimeMaterialVersions& expected, const MaterialAssetData& data,
         std::vector<GPUMaterial> table, const std::function<bool(const std::vector<GPUMaterial>&)>& publisher,
         std::string* errorMessage);
@@ -44,7 +56,7 @@ public:
     bool Save(std::string* errorMessage = nullptr);
     std::uint64_t GetRuntimeIdentity() const noexcept
     {
-        return m_runtime.GetRuntimeIdentity();
+        return m_runtime->GetRuntimeIdentity();
     }
 
     std::optional<RuntimeMaterialVersions> GetMaterialVersions(
@@ -54,9 +66,15 @@ public:
     std::optional<SceneObjectMetadata> GetObjectMetadata(
         RenderObjectID runtimeIndex,
         std::string* errorMessage = nullptr) const;
+    std::optional<SceneObjectMetadata> GetObjectMetadata(
+        std::string_view objectID, std::string* errorMessage = nullptr) const;
     std::optional<MaterialAssignmentToken> PrepareMaterialAssignment(
         const SceneObjectMetadata& selection, std::string materialReference,
         std::string* errorMessage = nullptr);
+    std::optional<MaterialAssignmentToken> PrepareMaterialSlotAssignment(
+        const SceneObjectMetadata& selection, std::string slotID, const std::optional<AssetID>& materialID,
+        std::string* errorMessage = nullptr);
+    Material* GetPreparedMaterialAssignmentMaterial(const MaterialAssignmentToken& token) const noexcept;
     // Load outside active recording; completed uploads remain owned by this scene.
     Material* ResolveAssignmentMaterial(std::string_view reference, std::string* errorMessage = nullptr);
     // Engine must establish Renderer/GPU safety first and retain old/new catalog assets.
@@ -65,6 +83,10 @@ public:
     bool RollbackMaterialAssignment(const MaterialAssignmentToken& token, std::string* errorMessage = nullptr);
     bool FinishMaterialAssignment(const MaterialAssignmentToken& token, std::string* errorMessage = nullptr);
     bool CancelMaterialAssignment(const MaterialAssignmentToken& token, std::string* errorMessage = nullptr);
+
+    // Engine retains the inactive candidate and this catalog through checked GPU cleanup.
+    std::unique_ptr<FileSceneRuntime> PrepareObjectRestoration(const SceneObjectDocument& object,
+        size_t insertionIndex, std::string* errorMessage = nullptr);
 
     bool CheckUnsavedChanges(bool& dirty, std::string* errorMessage = nullptr) const;
 
@@ -81,13 +103,17 @@ public:
     void SetAspectRatio(float aspectRatio) override;
 
 private:
+    friend class Engine;
+    // Engine retains both runtimes until checked candidate initialization/cleanup.
+    std::unique_ptr<FileSceneRuntime> m_objectMutationCandidate;
+
     std::filesystem::path m_scenePath;
     std::filesystem::path m_projectRoot;
     const ProjectAssetRegistry* m_registry = nullptr;
 
     FileSceneAssetCatalog m_assets;
 
-    FileSceneRuntime m_runtime;
+    std::unique_ptr<FileSceneRuntime> m_runtime = std::make_unique<FileSceneRuntime>();
 
     bool m_initialized = false;
 };

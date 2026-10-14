@@ -34,8 +34,121 @@ class Engine
     // Main-thread, non-UI seam. Queues copied identity; executes at the next safe frame boundary.
     bool RequestMaterialAssignment(const SceneObjectMetadata& selection, std::string reference, std::string& error);
     bool RequestMaterialAssignment(RenderObjectID index, std::string reference, std::string& error);
+    // Absent material removes only this slot's explicit override. Captures current object/mesh identity.
+    bool RequestMaterialSlotAssignment(std::string_view objectID, std::string slotID,
+        std::optional<AssetID> materialID, std::string& error);
+    bool RequestMaterialSlotAssignment(const SceneObjectMetadata& selection, std::string slotID,
+        std::optional<AssetID> materialID, std::string& error);
+
+    // Main-thread API; queues for the next pre-recording frame boundary.
+    // Default material is the catalog's builtin:default. Creation remains unsaved.
+    bool RequestSceneObjectCreation(std::string meshReference, const Transform& transform,
+        std::string& error, std::string materialReference = "builtin:default", std::string name = "Object");
+    struct SceneObjectCreationResult
+    {
+        std::string objectID;
+        std::string error;
+
+        bool succeeded = false;
+    };
+    const std::optional<SceneObjectCreationResult>& GetLastSceneObjectCreationResult() const noexcept
+    {
+        return m_lastSceneObjectCreation;
+    }
+
+    // Main-thread API; captures current scene identity and executes at a safe frame boundary.
+    // Deletes only an instance. Asset files/catalog allocations are never removed.
+    bool RequestSceneObjectDeletion(std::string_view objectID, std::string& error);
+    bool RequestSceneObjectDeletion(const SceneObjectMetadata& selection, std::string& error,
+        std::optional<Editor::HistoryReplayIdentity> replay = std::nullopt);
+    struct SceneObjectDeletionResult
+    {
+        std::uint64_t operationID = 0;
+        std::uint64_t historyEpoch = 0;
+        std::string objectID;
+        std::string error;
+
+        bool succeeded = false;
+    };
+    const std::optional<SceneObjectDeletionResult>& GetLastSceneObjectDeletionResult() const noexcept
+    {
+        return m_lastSceneObjectDeletion;
+    }
+
+    struct SceneObjectRestorationIdentity
+    {
+        std::filesystem::path projectIdentity;
+        std::filesystem::path scenePath;
+        std::string sceneID;
+
+        std::uint64_t runtimeIdentity = 0;
+        std::uint64_t structureRevision = 0;
+        std::uint64_t historyEpoch = 0;
+        bool operator==(const SceneObjectRestorationIdentity&) const = default;
+    };
+    // Capture at the call site; requests revalidate this identity at queue and execution time.
+    std::optional<SceneObjectRestorationIdentity> GetSceneObjectRestorationIdentity() const;
+    bool RequestSceneObjectRestoration(const SceneObjectDocument& object, size_t insertionIndex,
+        const SceneObjectRestorationIdentity& identity, std::string& error, bool selectRestored = false,
+        std::optional<Editor::HistoryReplayIdentity> replay = std::nullopt);
+    struct SceneObjectRestorationResult
+    {
+        std::optional<Editor::HistoryReplayIdentity> historyReplay;
+        std::string objectID;
+        std::string error;
+        std::optional<SceneObjectMetadata> restoredObject;
+        std::optional<SceneObjectRestorationIdentity> publishedIdentity;
+
+        size_t documentIndex = 0;
+        bool succeeded = false;
+    };
+    const std::optional<SceneObjectRestorationResult>& GetLastSceneObjectRestorationResult() const noexcept
+    {
+        return m_lastSceneObjectRestoration;
+    }
 
     private:
+    bool ExecuteSceneObjectCreation();
+    bool ExecuteSceneObjectDeletion();
+    bool ExecuteSceneObjectRestoration();
+    struct SceneObjectRestorationRequest
+    {
+        SceneObjectDocument object;
+        SceneObjectRestorationIdentity identity;
+        size_t insertionIndex = 0;
+        bool selectRestored = false;
+        std::optional<Editor::HistoryReplayIdentity> historyReplay;
+    };
+    std::optional<SceneObjectRestorationRequest> m_pendingSceneObjectRestoration;
+    std::optional<SceneObjectRestorationResult> m_lastSceneObjectRestoration;
+
+    struct SceneObjectDeletionRequest
+    {
+        std::filesystem::path projectIdentity;
+        SceneObjectMetadata selection;
+        std::uint64_t operationID = 0;
+        std::uint64_t historyEpoch = 0;
+        std::optional<Editor::HistoryReplayIdentity> historyReplay;
+    };
+    std::optional<SceneObjectDeletionRequest> m_pendingSceneObjectDeletion;
+    std::optional<SceneObjectDeletionResult> m_lastSceneObjectDeletion;
+
+    struct SceneObjectCreationRequest
+    {
+        std::filesystem::path projectIdentity;
+
+        std::string meshReference;
+        std::string materialReference;
+        std::string name;
+
+        Transform transform;
+
+        std::uint64_t runtimeIdentity = 0;
+        std::uint64_t structureRevision = 0;
+    };
+    std::optional<SceneObjectCreationRequest> m_pendingSceneObjectCreation;
+    std::optional<SceneObjectCreationResult> m_lastSceneObjectCreation;
+
     void Frame();
     bool ActivateRequestedFileScene();
     bool ExecuteMaterialAssignment();
@@ -44,7 +157,11 @@ class Engine
         SceneObjectMetadata selection;
 
         std::string reference;
+        std::optional<std::string> slotID;
+        std::optional<AssetID> slotMaterial;
+        bool requireEditorSelection = false;
     };
+    bool QueueMaterialAssignment(MaterialAssignmentRequest request, std::string& error);
     std::optional<MaterialAssignmentRequest> m_pendingMaterialAssignment;
     void ProcessEditorSceneRequests(IDemoScene& activeScene);
     void ProcessEditorMaterialRequests();

@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include <map>
 
 struct SceneCameraDocument
 {
@@ -28,6 +29,10 @@ struct SceneObjectDocument
     //persistant asset references
     std::string meshReference;
     std::string materialReference;
+
+    // Canonical material asset references keyed by stable mesh-local slot ID.
+    // Missing entries inherit materialReference (or builtin:default when empty).
+    std::map<std::string, std::string> materialSlotBindings;
 };
 
 struct SceneDocument

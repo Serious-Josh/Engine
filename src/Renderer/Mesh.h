@@ -4,6 +4,8 @@
 #include "Renderer/VertexLayout.h"
 
 #include "Math/Vector3.h"
+#include "assets/MeshMetadata.h"
+#include <optional>
 
 #include <d3d12.h>
 #include <cstddef>
@@ -125,7 +127,16 @@ class Mesh
 
     const MeshBounds& GetBounds() const;
 
+    // Metadata is shared with this Mesh, never owned by individual instances.
+    // Geometry changes restore the single full-range procedural default.
+    bool SetMetadata(MeshMetadata metadata, std::string& error);
+    const MeshMetadata& GetMetadata() const noexcept;
+
     private:
+    void ResetMetadata() noexcept;
+    MeshMetadata m_defaultMetadata = DefaultMeshMetadata(0);
+    std::optional<MeshMetadata> m_metadata;
+
     Buffer m_vertexBuffer;
     Buffer m_indexBuffer;
 

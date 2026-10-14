@@ -89,26 +89,67 @@ namespace
 bool Engine::RequestMaterialAssignment(
     const SceneObjectMetadata& selection, std::string reference, std::string& error)
 {
-    error.clear();
+    return QueueMaterialAssignment({selection, std::move(reference)}, error);
+}
 
-    if(m_state != EngineState::Running || m_pendingMaterialAssignment || m_pendingEditorSceneOperation ||
-       m_demoSceneManager.HasPendingSceneChange() || m_editor.HasBlockingMaterialOperation())
+bool Engine::QueueMaterialAssignment(MaterialAssignmentRequest request, std::string& error)
+{
+    error.clear();
+    const auto& selection = request.selection;
+
+    if(m_state != EngineState::Running || m_pendingSceneObjectCreation || m_pendingSceneObjectRestoration ||
+        m_pendingSceneObjectDeletion || m_pendingMaterialAssignment || m_pendingEditorSceneOperation ||
+        m_demoSceneManager.HasPendingSceneChange() || m_editor.HasBlockingMaterialOperation() ||
+        m_editor.HasPendingSceneHistoryOperation())
     {
         error = "Material assignment rejected: Engine is unavailable or an editor/scene operation is pending.";
         return false;
     }
 
     const auto* scene = dynamic_cast<const FileBackedDemoScene*>(m_demoSceneManager.TryGetActiveScene());
-    const auto current = scene ? scene->GetObjectMetadata(selection.runtimeIndex, &error) : std::nullopt;
+    const auto current = scene ? scene->GetObjectMetadata(selection.objectID, &error) : std::nullopt;
 
-    if(!current || current->sceneID != selection.sceneID || current->objectID != selection.objectID ||
+    if(!current || current->runtimeIndex != selection.runtimeIndex || current->sceneID != selection.sceneID ||
+       current->objectID != selection.objectID ||
        current->runtimeIdentity != selection.runtimeIdentity || current->structureRevision != selection.structureRevision)
     {
         error = "Material assignment requires a current file-backed scene-object selection.";
         return false;
     }
 
-    m_pendingMaterialAssignment = MaterialAssignmentRequest{selection, std::move(reference)};
+    if(request.slotID)
+    {
+        if(current->meshReference != selection.meshReference || current->materialReference != selection.materialReference ||
+            current->materialSlotBindings != selection.materialSlotBindings)
+        {
+            error = "Material slot assignment rejected: the object's mesh or bindings changed.";
+            return false;
+        }
+
+        const auto* mesh = scene->GetScene().GetRenderObjects()[current->runtimeIndex].mesh;
+
+        if(!mesh || std::none_of(mesh->GetMetadata().materialSlots.begin(), mesh->GetMetadata().materialSlots.end(),
+            [&](const auto& slot) { return slot.id == *request.slotID; }))
+        {
+            error = "Material slot assignment rejected: slot does not exist on the current mesh.";
+            return false;
+        }
+
+        if(request.slotMaterial)
+        {
+            const auto* material = m_projectAssetRegistry.Find(*request.slotMaterial);
+            const ProjectPaths paths(ProjectLocator::GetDefaultProjectRoot());
+
+            if(!material || material->type != AssetType::Material ||
+                ProjectAssetResolver::Resolve(paths, m_projectAssetRegistry, *request.slotMaterial).status != AssetAvailability::Available)
+            {
+                error = "Material slot assignment requires an available registered material AssetID.";
+                return false;
+            }
+        }
+    }
+
+    m_pendingMaterialAssignment = std::move(request);
     return true;
 }
 
@@ -124,6 +165,30 @@ bool Engine::RequestMaterialAssignment(RenderObjectID index, std::string referen
     }
 
     return RequestMaterialAssignment(*selection, std::move(reference), error);
+}
+
+bool Engine::RequestMaterialSlotAssignment(std::string_view objectID, std::string slotID,
+    std::optional<AssetID> materialID, std::string& error)
+{
+    const auto* scene = dynamic_cast<const FileBackedDemoScene*>(m_demoSceneManager.TryGetActiveScene());
+    const auto selection = scene ? scene->GetObjectMetadata(objectID, &error) : std::nullopt;
+
+    if(!selection)
+    {
+        error = "Material slot assignment requires a persistent object ID in the active file-backed scene.";
+        return false;
+    }
+
+    return RequestMaterialSlotAssignment(*selection, std::move(slotID), std::move(materialID), error);
+}
+
+bool Engine::RequestMaterialSlotAssignment(const SceneObjectMetadata& selection, std::string slotID,
+    std::optional<AssetID> materialID, std::string& error)
+{
+    MaterialAssignmentRequest request{selection, materialID ? materialID->ToReference() : std::string{}};
+    request.slotID = std::move(slotID);
+    request.slotMaterial = std::move(materialID);
+    return QueueMaterialAssignment(std::move(request), error);
 }
 
 bool Engine::ExecuteMaterialAssignment()
@@ -156,12 +221,35 @@ bool Engine::ExecuteMaterialAssignment()
         return true;
     }
 
+    if(request.requireEditorSelection && m_editor.GetSelectedObject() != request.selection.runtimeIndex)
+    {
+        feedback.message = "Material slot assignment cancelled because the selected scene object changed.";
+        Log::Warning(feedback.message);
+        return true;
+    }
+
     std::string error;
     feedback.message = "Selection or assignment validation failed. See the log for details.";
-    const auto token = owner->PrepareMaterialAssignment(request.selection, request.reference, &error);
+    std::optional<MaterialAssignmentToken> token;
+
+    try
+    {
+        token = request.slotID ?
+            owner->PrepareMaterialSlotAssignment(request.selection, *request.slotID, request.slotMaterial, &error) :
+            owner->PrepareMaterialAssignment(request.selection, request.reference, &error);
+    }
+    catch(const std::exception& exception)
+    {
+        error = exception.what();
+    }
+    catch(...)
+    {
+        error = "Unknown failure while preparing the material assignment; published scene retained.";
+    }
 
     if(!token)
     {
+        feedback.message = error;
         Log::Warning("Material assignment preparation rejected: " + error);
         return true;
     }
@@ -191,7 +279,8 @@ bool Engine::ExecuteMaterialAssignment()
 
     try
     {
-        replacement = owner->ResolveAssignmentMaterial(request.reference, &error);
+        replacement = request.slotID ? owner->GetPreparedMaterialAssignmentMaterial(*token) :
+            owner->ResolveAssignmentMaterial(request.reference, &error);
 
         if(replacement)
         {
@@ -206,6 +295,11 @@ bool Engine::ExecuteMaterialAssignment()
 
     if(!replacement || materials.empty())
     {
+        if(!error.empty())
+        {
+            feedback.message = error;
+        }
+
         Log::Warning("Material assignment load failed; previous assignment retained: " + error);
         return cancel();
     }
@@ -249,15 +343,35 @@ bool Engine::ExecuteMaterialAssignment()
 
     try
     {
-        committed = owner->CommitMaterialAssignment(*token, *replacement, &error);
+        bool materialAvailable = true;
+
+        if(request.slotID && request.slotMaterial)
+        {
+            const auto* record = m_projectAssetRegistry.Find(*request.slotMaterial);
+            const ProjectPaths paths(ProjectLocator::GetDefaultProjectRoot());
+            materialAvailable = record && record->type == AssetType::Material &&
+                ProjectAssetResolver::Resolve(paths, m_projectAssetRegistry, *request.slotMaterial).status == AssetAvailability::Available;
+
+            if(!materialAvailable)
+            {
+                error = "Slot material disappeared or is no longer registered before commit.";
+            }
+        }
+
+        committed = materialAvailable && owner->CommitMaterialAssignment(*token, *replacement, &error);
     }
     catch(const std::exception& exception)
     {
         error = exception.what();
     }
+    catch(...)
+    {
+        error = "Unknown material assignment commit failure; restoring the previous Renderer state.";
+    }
 
     if(!committed)
     {
+        feedback.message = error;
         Log::Warning("Material assignment CPU commit rejected after release: " + error);
 
         if(!cancel() || !initialize())
@@ -273,7 +387,22 @@ bool Engine::ExecuteMaterialAssignment()
 
     if(initialize())
     {
-        if(!owner->FinishMaterialAssignment(*token, &error))
+        bool finalized = false;
+
+        try
+        {
+            finalized = owner->FinishMaterialAssignment(*token, &error);
+        }
+        catch(const std::exception& exception)
+        {
+            error = exception.what();
+        }
+        catch(...)
+        {
+            error = "Unknown material assignment finalization failure.";
+        }
+
+        if(!finalized)
         {
             Log::Error("Material assignment finalization failed; retaining ownership and stopping: " + error);
             return false;
@@ -281,6 +410,7 @@ bool Engine::ExecuteMaterialAssignment()
 
         m_sceneResourcesReleasedForSwitch = false;
         m_renderedSceneStructureRevision = owner->GetScene().GetStructureRevision();
+        m_editor.InvalidateSceneHistoryRedoAfterEdit();
         feedback.succeeded = true;
         feedback.message = "Material updated; save the scene to persist it.";
         Log::Info("Scene object material assignment completed; scene remains unsaved.");
@@ -293,7 +423,22 @@ bool Engine::ExecuteMaterialAssignment()
         return false;
     }
 
-    if(!owner->RollbackMaterialAssignment(*token, &error))
+    bool restored = false;
+
+    try
+    {
+        restored = owner->RollbackMaterialAssignment(*token, &error);
+    }
+    catch(const std::exception& exception)
+    {
+        error = exception.what();
+    }
+    catch(...)
+    {
+        error = "Unknown material assignment rollback failure.";
+    }
+
+    if(!restored)
     {
         Log::Error("Material assignment CPU rollback rejected; retaining assets and stopping: " + error);
         return false;
@@ -486,7 +631,9 @@ void Engine::ProcessEditorSceneRequests(IDemoScene& activeScene)
 
     if (const auto request = m_editor.TakeFileRequest())
     {
-        if (m_pendingEditorSceneOperation || m_pendingMaterialAssignment || m_demoSceneManager.HasPendingSceneChange())
+        if(m_pendingSceneObjectCreation || m_pendingSceneObjectRestoration || m_pendingSceneObjectDeletion ||
+            m_pendingEditorSceneOperation || m_pendingMaterialAssignment || m_demoSceneManager.HasPendingSceneChange() ||
+            m_editor.HasPendingSceneHistoryOperation())
         {
             Log::Error("Scene operation rejected: another operation is pending.");
         }
@@ -812,8 +959,6 @@ bool Engine::Initialize()
 
     const float aspectRatio = static_cast<float>(m_window.GetWidth()) / static_cast<float>(m_window.GetHeight());
 
-    m_editor.ConfigureThumbnails(m_renderer.GetDevice(), m_renderer.GetResourceUploader(),
-        m_renderer.GetResourceDescriptorHeap());
     m_editor.ConfigureMaterialThumbnails(m_renderer);
 
     m_demoSceneManager.SetProjectAssets(ProjectLocator::GetDefaultProjectRoot(), m_projectAssetRegistry);
@@ -1084,7 +1229,39 @@ void Engine::Frame()
 
     try
     {
-        materialAssignmentSafe = ExecuteMaterialAssignment();
+        const bool meshDropPending = m_pendingSceneObjectCreation.has_value();
+        const bool restorationReplayPending = m_pendingSceneObjectRestoration &&
+            m_pendingSceneObjectRestoration->historyReplay.has_value();
+        const auto deletionSelection = m_pendingSceneObjectDeletion ?
+            std::optional<SceneObjectMetadata>{m_pendingSceneObjectDeletion->selection} : std::nullopt;
+        materialAssignmentSafe = ExecuteSceneObjectRestoration() && ExecuteSceneObjectDeletion() &&
+            ExecuteSceneObjectCreation() && ExecuteMaterialAssignment();
+
+        if(materialAssignmentSafe && restorationReplayPending && m_lastSceneObjectRestoration &&
+            m_lastSceneObjectRestoration->historyReplay)
+        {
+            const auto& result = *m_lastSceneObjectRestoration;
+            m_editor.CompleteSceneHistoryReplay(*result.historyReplay, result.succeeded, result.error);
+        }
+
+        if(materialAssignmentSafe && deletionSelection && GetLastSceneObjectDeletionResult())
+        {
+            const auto& completed = *GetLastSceneObjectDeletionResult();
+            m_editor.CompleteObjectDeletionHistory(completed.operationID, completed.historyEpoch,
+                completed.succeeded, completed.error);
+        }
+
+        if(deletionSelection && GetLastSceneObjectDeletionResult())
+        {
+            const auto& result = *GetLastSceneObjectDeletionResult();
+            m_editor.OnSceneObjectDeletionCompleted(m_demoSceneManager.GetActiveScene(),
+                *deletionSelection, result.succeeded, result.error);
+        }
+
+        if(meshDropPending && m_lastSceneObjectCreation)
+        {
+            m_editor.OnMeshCreationCompleted(m_lastSceneObjectCreation->succeeded, m_lastSceneObjectCreation->error);
+        }
     }
     catch(const std::exception& exception)
     {
@@ -1167,6 +1344,7 @@ void Engine::Frame()
                 }
             }
 
+            m_editor.OnSceneActivated();
             m_renderedSceneStructureRevision = switchedDemo.GetScene().GetStructureRevision();
         }
     }
@@ -1190,14 +1368,7 @@ void Engine::Frame()
 
     if(m_editor.NeedsThumbnailReset())
     {
-        if(!m_renderer.WaitForGPU())
-        {
-            Log::Error("Thumbnail retirement GPU drain failed; retaining resources and stopping.");
-            m_window.Close();
-            return;
-        }
-
-        m_editor.ClearThumbnailsAfterGPUDrain();
+        m_editor.ResetThumbnailRequests();
     }
 
     ProcessWorkingMaterialNotifications();
@@ -1210,7 +1381,9 @@ void Engine::Frame()
 
     IDemoScene& activeDemo = m_demoSceneManager.GetActiveScene();
 
-    m_editor.SetSceneOperationPending(m_pendingMaterialAssignment.has_value() || m_pendingEditorSceneOperation.has_value() ||
+    m_editor.SetSceneOperationPending(m_pendingSceneObjectCreation.has_value() ||
+                                      m_pendingSceneObjectRestoration.has_value() || m_pendingSceneObjectDeletion.has_value() ||
+                                      m_pendingMaterialAssignment.has_value() || m_pendingEditorSceneOperation.has_value() ||
                                       m_demoSceneManager.HasPendingSceneChange());
     const auto& viewportRectangle = m_editor.PrepareWorkspace(activeDemo, m_demoSceneManager, debugUI);
     const ImVec2 framebufferScale = ImGui::GetIO().DisplayFramebufferScale;
@@ -1290,15 +1463,99 @@ void Engine::Frame()
         return;
     }
 
+    if(auto request = m_editor.TakeSceneHistoryReplayRequest())
+    {
+        std::string error;
+        bool accepted = false;
+
+        if(request->identity.redo)
+        {
+            const auto* owner = dynamic_cast<const FileBackedDemoScene*>(&activeDemo);
+            const auto target = owner ? owner->GetObjectMetadata(request->object.id, &error) : std::nullopt;
+
+            if(target)
+            {
+                accepted = RequestSceneObjectDeletion(*target, error, request->identity);
+            }
+            else
+            {
+                error = "Redo deletion target no longer exists in the active scene.";
+            }
+        }
+        else
+        {
+            const auto identity = GetSceneObjectRestorationIdentity();
+
+            if(identity)
+            {
+                accepted = RequestSceneObjectRestoration(request->object, request->insertionIndex,
+                    *identity, error, false, request->identity);
+            }
+            else
+            {
+                error = "Undo restoration cannot establish the active scene/session identity.";
+            }
+        }
+
+        if(!accepted)
+        {
+            m_editor.CompleteSceneHistoryReplay(request->identity, false, error);
+        }
+    }
+
+    if(auto request = m_editor.TakeSceneObjectDeletionRequest())
+    {
+        std::string error;
+
+        if(!RequestSceneObjectDeletion(*request, error))
+        {
+            m_editor.OnSceneObjectDeletionCompleted(activeDemo, *request, false, error);
+        }
+    }
+
+    if(auto request = m_editor.TakeMeshCreationRequest())
+    {
+        const auto* owner = dynamic_cast<const FileBackedDemoScene*>(&activeDemo);
+        std::string error;
+
+        if(!owner || owner->GetRuntimeIdentity() != request->runtimeIdentity)
+        {
+            m_editor.OnMeshCreationCompleted(false, "Scene changed before the drop could be queued.");
+        }
+        else if(!RequestSceneObjectCreation(std::move(request->meshReference), request->transform, error,
+            "builtin:default", std::move(request->name)))
+        {
+            m_editor.OnMeshCreationCompleted(false, error);
+        }
+    }
+
     if(auto request = m_editor.TakeMaterialAssignmentRequest())
     {
         std::string error;
 
-        if(!RequestMaterialAssignment(request->selection, std::move(request->reference), error))
+        bool queued = false;
+
+        if(request->slotID && m_editor.GetSelectedObject() != request->selection.runtimeIndex)
+        {
+            error = "Material slot assignment cancelled because the selected scene object changed.";
+        }
+        else
+        {
+            queued = request->slotID ?
+                RequestMaterialSlotAssignment(request->selection, *request->slotID, request->slotMaterial, error) :
+                RequestMaterialAssignment(request->selection, std::move(request->reference), error);
+        }
+
+        if(queued && request->slotID)
+        {
+            m_pendingMaterialAssignment->requireEditorSelection = true;
+        }
+
+        if(!queued)
         {
             Log::Warning("Inspector material assignment rejected: " + error);
             m_editor.OnMaterialAssignmentCompleted(request->selection, false,
-                "Request rejected because the scene or editor is busy or the selection changed. See the log for details.");
+                error);
         }
     }
 
@@ -1423,9 +1680,11 @@ void Engine::Frame()
     }
 
     RendererOptions rendererOptions{};
-    rendererOptions.editorTextures = m_editor.GetThumbnailTextures();
     rendererOptions.materialPreview = m_editor.GetMaterialPreviewRequest();
     m_renderer.PrepareMaterialPreviewTextures(rendererOptions.materialPreview, m_projectAssetRegistry);
+    // Poll even with the browser hidden, so cancelled CPU work and completed GPU resources retire.
+    // This follows asset mutations and precedes frame recording.
+    m_renderer.PollMeshThumbnails(inspectorPaths, m_projectAssetRegistry);
 
     rendererOptions.enableRTGI = debugUI.IsRTGIEnabled();
     rendererOptions.rtgiContactAOStrength = debugUI.GetRTGIContactAOStrength();
@@ -1473,7 +1732,6 @@ void Engine::Frame()
         return;
     }
 
-    m_editor.ConfirmThumbnailSubmission(m_renderer.GetEditorSubmissionFence());
 
     activeScene.ClearChangedTransforms();
 }
@@ -1529,7 +1787,7 @@ void Engine::Shutdown()
         }
     }
 
-    m_editor.ClearThumbnailsAfterGPUDrain();
+    m_editor.ResetThumbnailRequests();
     m_demoSceneManager.Shutdown();
     m_renderer.Shutdown();
     m_window.Shutdown();
@@ -1882,4 +2140,699 @@ void Engine::PublishWorkingMaterialParameters()
         active.parameters = active.lastPublished;
         active.lastTableRevision = 0; // Retry the last valid appearance on the next safe boundary.
     }
+}
+
+bool Engine::RequestSceneObjectCreation(
+    std::string meshReference, const Transform& transform, std::string& error,
+    std::string materialReference, std::string name)
+{
+    error.clear();
+    auto* owner = dynamic_cast<FileBackedDemoScene*>(m_demoSceneManager.TryGetActiveScene());
+
+    if(m_state != EngineState::Running || !owner || m_pendingSceneObjectCreation ||
+        m_pendingSceneObjectRestoration || m_pendingSceneObjectDeletion ||
+        m_pendingMaterialAssignment || m_pendingEditorSceneOperation ||
+        m_demoSceneManager.HasPendingSceneChange() || m_editor.HasBlockingObjectCreation() || m_editor.HasPendingSceneHistoryOperation())
+    {
+        error = "Object creation requires an active file-backed scene without pending editor/scene operations.";
+        return false;
+    }
+
+    if(!AssetID::ParseReference(meshReference) ||
+        (materialReference != "builtin:default" && !AssetID::ParseReference(materialReference)))
+    {
+        error = "Object creation requires canonical mesh and material asset references (or builtin:default material).";
+        return false;
+    }
+
+    std::error_code pathError;
+    const auto project = std::filesystem::canonical(owner->m_projectRoot, pathError);
+
+    if(pathError)
+    {
+        error = "Object creation project identity is unavailable: " + pathError.message();
+        return false;
+    }
+
+    m_pendingSceneObjectCreation = SceneObjectCreationRequest{project, std::move(meshReference),
+        std::move(materialReference), std::move(name), transform, owner->GetRuntimeIdentity(),
+        owner->GetScene().GetStructureRevision()};
+    m_lastSceneObjectCreation.reset();
+    return true;
+}
+
+bool Engine::ExecuteSceneObjectCreation()
+{
+    if(!m_pendingSceneObjectCreation)
+    {
+        return true;
+    }
+
+    auto request = std::move(*m_pendingSceneObjectCreation);
+    m_pendingSceneObjectCreation.reset();
+    m_lastSceneObjectCreation.emplace();
+    auto& result = *m_lastSceneObjectCreation;
+    auto* owner = dynamic_cast<FileBackedDemoScene*>(m_demoSceneManager.TryGetActiveScene());
+    std::error_code pathError;
+    const auto project = owner ? std::filesystem::canonical(owner->m_projectRoot, pathError) :
+        std::filesystem::path{};
+
+    if(!owner || pathError || project != request.projectIdentity ||
+        owner->GetRuntimeIdentity() != request.runtimeIdentity ||
+        owner->GetScene().GetStructureRevision() != request.structureRevision ||
+        m_pendingMaterialAssignment || m_pendingEditorSceneOperation || m_demoSceneManager.HasPendingSceneChange() ||
+        m_editor.HasBlockingObjectCreation() || owner->m_objectMutationCandidate)
+    {
+        result.error = "Object creation cancelled: scene/project identity changed or another operation is active.";
+        Log::Warning(result.error);
+        return true;
+    }
+
+    std::vector<Material*> materials;
+    std::optional<SceneObjectMetadata> selection;
+    std::string activeName(m_demoSceneManager.GetActiveSceneName());
+
+    try
+    {
+        owner->m_objectMutationCandidate = owner->m_runtime->PrepareObjectCreation(owner->m_assets,
+            std::move(request.meshReference), request.transform, std::move(request.materialReference),
+            std::move(request.name), result.objectID, &result.error);
+
+        if(owner->m_objectMutationCandidate)
+        {
+            const auto& mapping = owner->m_objectMutationCandidate->GetObjectMapping();
+            const auto index = mapping.idToRuntimeIndex.at(result.objectID);
+            selection = owner->m_objectMutationCandidate->GetObjectMetadata(index, &result.error);
+            materials = owner->GetMaterials();
+        }
+    }
+    catch(const std::exception& error)
+    {
+        result.error = error.what();
+    }
+
+    if(!owner->m_objectMutationCandidate || !selection || materials.empty())
+    {
+        result.error += " " + owner->m_assets.GetLastMeshError() + " " + owner->m_assets.GetLastMaterialError();
+        owner->m_objectMutationCandidate.reset();
+        result.objectID.clear();
+        Log::Warning("Object creation preparation rejected: " + result.error);
+        return true;
+    }
+
+    // Both runtime addresses and all catalog assets remain owned throughout
+    // initialization, cleanup, and restoration. No active CPU state changes yet.
+    if(!DrainAndResolveSceneDisplacement(m_renderer, *owner) || !m_renderer.ReleaseSceneResources())
+    {
+        result.error = "Object creation could not prove renderer release safety; retaining both runtimes and stopping.";
+        Log::Error(result.error);
+        return false;
+    }
+
+    m_sceneResourcesReleasedForSwitch = true;
+    const auto initialize = [&](Scene& scene)
+    {
+        try
+        {
+            return m_renderer.InitializeSceneResources(scene, materials);
+        }
+        catch(const std::exception& error)
+        {
+            result.error = error.what();
+            return false;
+        }
+        catch(...)
+        {
+            result.error = "Unknown renderer initialization exception.";
+            return false;
+        }
+    };
+
+    Scene& candidateScene = owner->m_objectMutationCandidate->GetScene();
+
+    if(initialize(candidateScene))
+    {
+        // Swapping owners preserves the exact Scene address initialized by Renderer.
+        // The prior runtime contains only asset borrows and can now be discarded.
+        owner->m_runtime.swap(owner->m_objectMutationCandidate);
+        owner->m_objectMutationCandidate.reset();
+        owner->CancelSavedMaterialRevision();
+
+        m_renderedSceneStructureRevision = owner->GetScene().GetStructureRevision();
+        m_sceneResourcesReleasedForSwitch = false;
+        result.succeeded = true;
+        result.error.clear();
+
+        m_editor.PublishCreatedObjectSelection(owner->GetScene(), std::move(*selection), std::move(activeName));
+        Log::Info("Created scene object " + result.objectID + "; save the scene to persist it.");
+        return true;
+    }
+
+    if(!m_renderer.CleanupFailedSceneInitialization(candidateScene))
+    {
+        result.error = "Object creation cleanup could not prove GPU safety; retaining both runtimes and stopping.";
+        Log::Error(result.error);
+        return false;
+    }
+
+    // Original runtime/document/selection/history have never been changed.
+    owner->m_objectMutationCandidate.reset();
+    result.objectID.clear();
+
+    if(!initialize(owner->GetScene()))
+    {
+        // Retain the original runtime and all assets for checked shutdown.
+        result.error = "Object creation renderer restoration failed; retaining ownership and stopping.";
+        Log::Error(result.error);
+        return false;
+    }
+
+    m_sceneResourcesReleasedForSwitch = false;
+    result.error = "Candidate renderer initialization failed; previous scene restored.";
+    Log::Warning(result.error);
+    return true;
+}
+
+bool Engine::RequestSceneObjectDeletion(std::string_view objectID, std::string& error)
+{
+    error.clear();
+    const auto* owner = dynamic_cast<const FileBackedDemoScene*>(m_demoSceneManager.TryGetActiveScene());
+    const auto selection = owner ? owner->GetObjectMetadata(objectID, &error) : std::nullopt;
+
+    if(!selection)
+    {
+        error = "Object deletion requires an existing persistent object ID in the active file-backed scene.";
+        return false;
+    }
+
+    return RequestSceneObjectDeletion(*selection, error);
+}
+
+bool Engine::RequestSceneObjectDeletion(const SceneObjectMetadata& selection, std::string& error,
+    std::optional<Editor::HistoryReplayIdentity> replay)
+{
+    error.clear();
+    const auto* owner = dynamic_cast<const FileBackedDemoScene*>(m_demoSceneManager.TryGetActiveScene());
+
+    if(m_state != EngineState::Running || !owner || m_pendingSceneObjectDeletion ||
+        m_pendingSceneObjectCreation || m_pendingSceneObjectRestoration || m_pendingMaterialAssignment || m_pendingEditorSceneOperation ||
+        m_demoSceneManager.HasPendingSceneChange() || m_editor.HasBlockingObjectCreation())
+    {
+        error = "Object deletion requires an active file-backed scene without pending editor/scene operations.";
+        return false;
+    }
+
+    if((replay && (!replay->redo || !m_editor.MatchesPendingHistoryReplay(*replay))) ||
+        (!replay && m_editor.HasPendingSceneHistoryOperation()))
+    {
+        error = "Deletion rejected: a different history operation is pending.";
+        return false;
+    }
+
+    const auto current = owner->GetObjectMetadata(selection.objectID, &error);
+
+    if(!current || current->runtimeIdentity != selection.runtimeIdentity || current->sceneID != selection.sceneID ||
+        current->structureRevision != selection.structureRevision || current->runtimeIndex != selection.runtimeIndex)
+    {
+        error = "Object deletion rejected: the persistent object selection is missing or stale.";
+        return false;
+    }
+
+    std::error_code pathError;
+    const auto project = std::filesystem::canonical(owner->m_projectRoot, pathError);
+
+    if(pathError)
+    {
+        error = "Object deletion project identity is unavailable: " + pathError.message();
+        return false;
+    }
+
+    if(!m_editor.CanPreserveSceneHistory(*owner, project, m_editor.GetSceneHistoryEpoch()))
+    {
+        error = "Deletion rejected: scene history session bindings are stale.";
+        return false;
+    }
+
+    const auto operationID = replay ? replay->operationID : m_editor.AllocateSceneHistoryOperationID();
+    m_pendingSceneObjectDeletion = SceneObjectDeletionRequest{project, *current, operationID,
+        m_editor.GetSceneHistoryEpoch(), std::move(replay)};
+    m_lastSceneObjectDeletion.reset();
+    return true;
+}
+
+bool Engine::ExecuteSceneObjectDeletion()
+{
+    if(!m_pendingSceneObjectDeletion)
+    {
+        return true;
+    }
+
+    auto request = std::move(*m_pendingSceneObjectDeletion);
+    m_pendingSceneObjectDeletion.reset();
+    m_lastSceneObjectDeletion.emplace();
+    auto& result = *m_lastSceneObjectDeletion;
+    result.operationID = request.operationID;
+    result.historyEpoch = request.historyEpoch;
+    result.objectID = request.selection.objectID;
+    auto* owner = dynamic_cast<FileBackedDemoScene*>(m_demoSceneManager.TryGetActiveScene());
+    std::error_code pathError;
+    const auto project = owner ? std::filesystem::canonical(owner->m_projectRoot, pathError) :
+        std::filesystem::path{};
+    const auto current = owner ? owner->GetObjectMetadata(request.selection.objectID, &result.error) : std::nullopt;
+
+    if(!owner || pathError || project != request.projectIdentity || !current ||
+        current->runtimeIdentity != request.selection.runtimeIdentity || current->sceneID != request.selection.sceneID ||
+        current->structureRevision != request.selection.structureRevision ||
+        m_pendingSceneObjectCreation || m_pendingSceneObjectRestoration || m_pendingMaterialAssignment || m_pendingEditorSceneOperation ||
+        m_demoSceneManager.HasPendingSceneChange() || m_editor.HasBlockingObjectCreation() || owner->m_objectMutationCandidate)
+    {
+        result.error = "Object deletion cancelled: scene/project/object identity changed or another operation is active.";
+        Log::Warning(result.error);
+        return true;
+    }
+
+    if(request.historyEpoch != m_editor.GetSceneHistoryEpoch() ||
+        !m_editor.CanPreserveSceneHistory(*owner, project, request.historyEpoch) ||
+        (request.historyReplay && !m_editor.MatchesPendingHistoryReplay(*request.historyReplay)))
+    {
+        result.error = "Deletion cancelled: history operation/session identity changed.";
+        return true;
+    }
+
+    SceneObjectDocument deletedSnapshot;
+    size_t deletedDocumentIndex = 0;
+    std::optional<std::string> selectionBefore;
+
+    std::vector<Material*> materials;
+    std::optional<SceneObjectMetadata> survivingSelection;
+    std::string activeName(m_demoSceneManager.GetActiveSceneName());
+
+    try
+    {
+        if(!owner->m_runtime->CaptureObjectDeletionSnapshot(current->objectID,
+            deletedSnapshot, deletedDocumentIndex, &result.error))
+        {
+            return true;
+        }
+
+        owner->m_objectMutationCandidate = owner->m_runtime->PrepareObjectDeletion(current->objectID, &result.error);
+
+        if(owner->m_objectMutationCandidate)
+        {
+            const auto selectedIndex = m_editor.GetSelectedObject();
+
+            if(selectedIndex < owner->GetScene().GetRenderObjects().size() &&
+                m_editor.GetSelectionStructureRevision() == owner->GetScene().GetStructureRevision())
+            {
+                const auto selected = owner->GetObjectMetadata(selectedIndex, &result.error);
+
+                if(!selected)
+                {
+                    owner->m_objectMutationCandidate.reset();
+                    Log::Warning("Object deletion could not validate the editor selection: " + result.error);
+                    return true;
+                }
+
+                selectionBefore = selected->objectID;
+
+                if(selected->objectID != current->objectID)
+                {
+                    survivingSelection = owner->m_objectMutationCandidate->GetObjectMetadata(selected->objectID, &result.error);
+
+                    if(!survivingSelection)
+                    {
+                        owner->m_objectMutationCandidate.reset();
+                        Log::Warning("Object deletion could not remap the surviving selection: " + result.error);
+                        return true;
+                    }
+                }
+            }
+
+            materials = owner->GetMaterials();
+        }
+    }
+    catch(const std::exception& error)
+    {
+        result.error = error.what();
+    }
+
+    if(!owner->m_objectMutationCandidate || materials.empty())
+    {
+        owner->m_objectMutationCandidate.reset();
+        Log::Warning("Object deletion preparation rejected: " + result.error);
+        return true;
+    }
+
+    std::optional<std::string> selectionAfter;
+
+    if(survivingSelection)
+    {
+        selectionAfter = survivingSelection->objectID;
+    }
+
+    if(!m_editor.StageObjectDeletionHistory(std::move(deletedSnapshot), deletedDocumentIndex,
+        std::move(selectionBefore), std::move(selectionAfter), request.operationID,
+        request.historyEpoch, request.historyReplay.has_value(), result.error))
+    {
+        owner->m_objectMutationCandidate.reset();
+        Log::Warning(result.error);
+        return true;
+    }
+
+    // Original document, runtime mappings, selection and undo history remain untouched.
+    // The catalog owns shared meshes/materials through candidate cleanup and restoration.
+    if(!DrainAndResolveSceneDisplacement(m_renderer, *owner) || !m_renderer.ReleaseSceneResources())
+    {
+        result.error = "Object deletion could not prove renderer release safety; retaining both runtimes and stopping.";
+        Log::Error(result.error);
+        return false;
+    }
+
+    m_sceneResourcesReleasedForSwitch = true;
+    const auto initialize = [&](Scene& scene)
+    {
+        try
+        {
+            return m_renderer.InitializeSceneResources(scene, materials);
+        }
+        catch(const std::exception& error)
+        {
+            result.error = error.what();
+            return false;
+        }
+        catch(...)
+        {
+            result.error = "Unknown renderer initialization exception.";
+            return false;
+        }
+    };
+    Scene& candidateScene = owner->m_objectMutationCandidate->GetScene();
+
+    if(initialize(candidateScene))
+    {
+        owner->m_runtime.swap(owner->m_objectMutationCandidate);
+        owner->m_objectMutationCandidate.reset();
+        owner->CancelSavedMaterialRevision();
+
+        m_renderedSceneStructureRevision = owner->GetScene().GetStructureRevision();
+        m_sceneResourcesReleasedForSwitch = false;
+        result.succeeded = true;
+        result.error.clear();
+
+        m_editor.PublishRestoredObjectSelection(*owner, std::move(survivingSelection), std::move(activeName));
+        Log::Info("Deleted scene object " + result.objectID + "; save the scene to persist it.");
+        return true;
+    }
+
+    if(!m_renderer.CleanupFailedSceneInitialization(candidateScene))
+    {
+        result.error = "Object deletion cleanup could not prove GPU safety; retaining both runtimes and stopping.";
+        Log::Error(result.error);
+        return false;
+    }
+
+    owner->m_objectMutationCandidate.reset();
+
+    if(!initialize(owner->GetScene()))
+    {
+        result.error = "Object deletion renderer restoration failed; retaining ownership and stopping.";
+        Log::Error(result.error);
+        return false;
+    }
+
+    m_sceneResourcesReleasedForSwitch = false;
+    result.error = "Deletion renderer initialization failed; previous scene restored.";
+    Log::Warning(result.error);
+    return true;
+}
+
+std::optional<Engine::SceneObjectRestorationIdentity> Engine::GetSceneObjectRestorationIdentity() const
+{
+    const auto* owner = dynamic_cast<const FileBackedDemoScene*>(m_demoSceneManager.TryGetActiveScene());
+
+    if(m_state != EngineState::Running || !owner || owner->GetPersistentSceneID().empty() ||
+        m_editor.GetSceneHistoryEpoch() == 0)
+    {
+        return std::nullopt;
+    }
+
+    std::error_code error;
+    const auto project = std::filesystem::canonical(owner->GetProjectRoot(), error);
+
+    if(error)
+    {
+        return std::nullopt;
+    }
+
+    return SceneObjectRestorationIdentity{project, owner->GetScenePath().lexically_normal(),
+        std::string(owner->GetPersistentSceneID()), owner->GetRuntimeIdentity(),
+        owner->GetScene().GetStructureRevision(), m_editor.GetSceneHistoryEpoch()};
+}
+
+bool Engine::RequestSceneObjectRestoration(const SceneObjectDocument& object, size_t insertionIndex,
+    const SceneObjectRestorationIdentity& identity, std::string& error, bool selectRestored,
+    std::optional<Editor::HistoryReplayIdentity> replay)
+{
+    error.clear();
+    const auto* owner = dynamic_cast<const FileBackedDemoScene*>(m_demoSceneManager.TryGetActiveScene());
+    const auto current = GetSceneObjectRestorationIdentity();
+
+    if(!owner || !current || *current != identity || m_pendingSceneObjectRestoration ||
+        m_pendingSceneObjectCreation || m_pendingSceneObjectDeletion || m_pendingMaterialAssignment ||
+        m_pendingEditorSceneOperation || m_demoSceneManager.HasPendingSceneChange() ||
+        m_editor.HasBlockingObjectCreation() || owner->m_objectMutationCandidate)
+    {
+        error = "Object restoration rejected: scene/session identity is stale or another operation is active.";
+        return false;
+    }
+
+    if((replay && (replay->redo || !m_editor.MatchesPendingHistoryReplay(*replay))) ||
+        (!replay && m_editor.HasPendingSceneHistoryOperation()))
+    {
+        error = "Restoration rejected: a different history operation is pending.";
+        return false;
+    }
+
+    if(!m_editor.CanPreserveSceneHistory(*owner, identity.projectIdentity, identity.historyEpoch))
+    {
+        error = "Object restoration cannot preserve the current editing session history.";
+        return false;
+    }
+
+    if(insertionIndex > owner->GetScene().GetRenderObjects().size() ||
+        owner->m_runtime->GetObjectMapping().idToRuntimeIndex.contains(object.id))
+    {
+        error = "Object restoration requires an unused persistent ID and a valid document insertion index.";
+        return false;
+    }
+
+    SceneDocument validation = owner->m_runtime->GetFileScene().GetDocument();
+    validation.objects = {object};
+
+    if(!ValidateSceneDocument(validation, &error))
+    {
+        return false;
+    }
+
+    m_pendingSceneObjectRestoration = SceneObjectRestorationRequest{object, identity, insertionIndex, selectRestored, std::move(replay)};
+    m_lastSceneObjectRestoration.reset();
+    return true;
+}
+
+bool Engine::ExecuteSceneObjectRestoration()
+{
+    if(!m_pendingSceneObjectRestoration)
+    {
+        return true;
+    }
+
+    auto request = std::move(*m_pendingSceneObjectRestoration);
+    m_pendingSceneObjectRestoration.reset();
+    m_lastSceneObjectRestoration.emplace();
+    auto& result = *m_lastSceneObjectRestoration;
+    result.historyReplay = request.historyReplay;
+    result.objectID = request.object.id;
+    result.documentIndex = request.insertionIndex;
+
+    auto* owner = dynamic_cast<FileBackedDemoScene*>(m_demoSceneManager.TryGetActiveScene());
+    const auto identity = GetSceneObjectRestorationIdentity();
+
+    if(!owner || !identity || *identity != request.identity || m_pendingSceneObjectCreation ||
+        m_pendingSceneObjectDeletion || m_pendingMaterialAssignment || m_pendingEditorSceneOperation ||
+        m_demoSceneManager.HasPendingSceneChange() || m_editor.HasBlockingObjectCreation() ||
+        owner->m_objectMutationCandidate ||
+        !m_editor.CanPreserveSceneHistory(*owner, identity->projectIdentity, identity->historyEpoch))
+    {
+        result.error = "Object restoration cancelled: scene/session identity changed or another operation is active.";
+        Log::Warning(result.error);
+        return true;
+    }
+
+    if(request.historyReplay && !m_editor.MatchesPendingHistoryReplay(*request.historyReplay))
+    {
+        result.error = "Restoration cancelled: history replay identity changed.";
+        return true;
+    }
+
+    std::vector<Material*> materials;
+    std::optional<SceneObjectMetadata> restored;
+    std::optional<SceneObjectMetadata> selection;
+    auto publishedIdentity = request.identity;
+    std::string activeName(m_demoSceneManager.GetActiveSceneName());
+
+    const auto prepareSelection = [&]() -> bool
+    {
+        if(request.historyReplay)
+        {
+            if(!request.historyReplay->selectionID)
+            {
+                return true;
+            }
+
+            selection = owner->m_objectMutationCandidate->GetObjectMetadata(
+                *request.historyReplay->selectionID, &result.error);
+            return selection.has_value();
+        }
+
+        if(request.selectRestored)
+        {
+            selection = restored;
+            return true;
+        }
+
+        const auto index = m_editor.GetSelectedObject();
+
+        if(index >= owner->GetScene().GetRenderObjects().size())
+        {
+            return true;
+        }
+
+        if(m_editor.GetSelectionStructureRevision() != owner->GetScene().GetStructureRevision())
+        {
+            result.error = "Object restoration cannot validate the surviving editor selection.";
+            return false;
+        }
+
+        const auto selected = owner->GetObjectMetadata(index, &result.error);
+
+        if(!selected)
+        {
+            return false;
+        }
+
+        selection = owner->m_objectMutationCandidate->GetObjectMetadata(selected->objectID, &result.error);
+        return selection.has_value();
+    };
+
+    try
+    {
+        owner->m_objectMutationCandidate = owner->PrepareObjectRestoration(request.object,
+            request.insertionIndex, &result.error);
+
+        if(owner->m_objectMutationCandidate)
+        {
+            restored = owner->m_objectMutationCandidate->GetObjectMetadata(request.object.id, &result.error);
+
+            if(restored && prepareSelection())
+            {
+                materials = owner->GetMaterials();
+                publishedIdentity.runtimeIdentity = owner->m_objectMutationCandidate->GetRuntimeIdentity();
+                publishedIdentity.structureRevision = owner->m_objectMutationCandidate->GetScene().GetStructureRevision();
+            }
+        }
+    }
+    catch(const std::exception& error)
+    {
+        result.error = error.what();
+    }
+
+    if(!owner->m_objectMutationCandidate || !restored || materials.empty())
+    {
+        owner->m_objectMutationCandidate.reset();
+
+        if(result.error.empty())
+        {
+            result.error = "Restoration preparation failed or the scene material catalog is unavailable.";
+        }
+
+        result.error += " " + owner->m_assets.GetLastMeshError() + " " + owner->m_assets.GetLastMaterialError();
+        Log::Warning("Object restoration preparation rejected: " + result.error);
+        return true;
+    }
+
+    // Catalog assets and both Scene addresses remain owned until checked cleanup.
+    // No document, selection, or history publication has occurred at this point.
+    if(!DrainAndResolveSceneDisplacement(m_renderer, *owner) || !m_renderer.ReleaseSceneResources())
+    {
+        result.error = "Object restoration could not prove renderer release safety; retaining both runtimes and stopping.";
+        Log::Error(result.error);
+        return false;
+    }
+
+    m_sceneResourcesReleasedForSwitch = true;
+    const auto initialize = [&](Scene& scene)
+    {
+        try
+        {
+            return m_renderer.InitializeSceneResources(scene, materials);
+        }
+        catch(const std::exception& error)
+        {
+            result.error = error.what();
+            return false;
+        }
+        catch(...)
+        {
+            result.error = "Unknown renderer initialization exception.";
+            return false;
+        }
+    };
+    Scene& candidateScene = owner->m_objectMutationCandidate->GetScene();
+
+    if(initialize(candidateScene))
+    {
+        // All selection/result payloads were prepared before the Renderer transition.
+        // Publication preserves the initialized Scene address and performs no fallible lookup.
+        owner->m_runtime.swap(owner->m_objectMutationCandidate);
+        owner->m_objectMutationCandidate.reset();
+        owner->CancelSavedMaterialRevision();
+
+        m_renderedSceneStructureRevision = owner->GetScene().GetStructureRevision();
+        m_sceneResourcesReleasedForSwitch = false;
+        m_editor.PublishRestoredObjectSelection(*owner, std::move(selection), std::move(activeName));
+
+        if(!request.historyReplay)
+        {
+            m_editor.InvalidateSceneHistoryRedoAfterEdit();
+        }
+
+        result.restoredObject = std::move(restored);
+        result.publishedIdentity = std::move(publishedIdentity);
+        result.succeeded = true;
+        result.error.clear();
+
+        Log::Info("Restored scene object " + result.objectID + "; save the scene to persist it.");
+        return true;
+    }
+
+    if(!m_renderer.CleanupFailedSceneInitialization(candidateScene))
+    {
+        result.error = "Object restoration cleanup could not prove GPU safety; retaining both runtimes and stopping.";
+        Log::Error(result.error);
+        return false;
+    }
+
+    owner->m_objectMutationCandidate.reset();
+
+    if(!initialize(owner->GetScene()))
+    {
+        result.error = "Object restoration renderer rollback failed; retaining ownership and stopping.";
+        Log::Error(result.error);
+        return false;
+    }
+
+    m_sceneResourcesReleasedForSwitch = false;
+    result.error = "Restored candidate renderer initialization failed; previous scene restored.";
+    Log::Warning(result.error);
+    return true;
 }

@@ -11,6 +11,9 @@
 #include <unordered_map>
 #include <vector>
 #include <atomic>
+#include <algorithm>
+#include <limits>
+#include "Core/Log.h"
 
 namespace
 {
@@ -103,6 +106,11 @@ bool RayTracingSceneResources::Initialize(
 
     std::vector<RayTracingInstanceData> instanceData(renderObjects.size());
 
+    if(!InitializeMaterialSlots(device, uploader, descriptorHeap, scene, instanceData))
+    {
+        return false;
+    }
+
     for (unsigned int i = 0; i < renderObjects.size(); ++i)
     {
         const RenderObject& renderObject = renderObjects[i];
@@ -158,13 +166,12 @@ bool RayTracingSceneResources::Initialize(
             return false;
         }
 
-        RayTracingInstanceData gpuInstance{};
+        RayTracingInstanceData gpuInstance = instanceData[i];
 
         gpuInstance.vertexBufferIndex = renderObject.mesh->GetVertexBufferDescriptorIndex();
         gpuInstance.indexBufferIndex =
 
             renderObject.mesh->IsIndexed() ? renderObject.mesh->GetIndexBufferDescriptorIndex() : UINT_MAX;
-        gpuInstance.materialIndex = renderObject.material->gpuIndex;
         gpuInstance.vertexStride = renderObject.mesh->GetVertexStride();
         gpuInstance.normalOffset = normalOffset;
         gpuInstance.uvOffset = uvOffset;
@@ -592,6 +599,11 @@ void RayTracingSceneResources::Shutdown()
     }
 
     m_instanceDataBuffer.Shutdown();
+    m_triangleSlots.Shutdown();
+    m_slotMaterials.Shutdown();
+    m_slotGeometry.clear();
+    m_materialBindings.clear();
+    m_slotMaterialIndices.clear();
     m_instances.clear();
     m_renderObjectToInstance.clear();
 
@@ -614,4 +626,181 @@ std::size_t RayTracingSceneResources::GetInstanceCount() const
 {
 
     return m_instances.size();
+}
+
+bool RayTracingSceneResources::InitializeMaterialSlots(ID3D12Device5* device, ResourceUploader& uploader,
+    DescriptorHeap& heap, const Scene& scene, std::vector<RayTracingInstanceData>& instances)
+{
+    const auto& objects = scene.GetRenderObjects();
+    std::vector<unsigned int> triangles{0};
+    std::vector<unsigned int> materials;
+    std::unordered_map<const Mesh*, unsigned int> triangleOffsets;
+    m_materialBindings = objects;
+    m_slotMaterialIndices.resize(objects.size());
+
+    for(size_t i = 0; i < objects.size(); ++i)
+    {
+        const auto& object = objects[i];
+
+        if(!object.mesh)
+        {
+            continue;
+        }
+
+        const auto& metadata = object.mesh->GetMetadata();
+        const size_t indexCount = object.mesh->IsIndexed() ? object.mesh->GetIndexCount() : object.mesh->GetVertexCount();
+        std::string error;
+
+        if(!ValidateMeshMetadata(metadata, indexCount, error))
+        {
+            Log::Error("Invalid DXR mesh slot metadata: " + error);
+            return false;
+        }
+
+        if(metadata.materialSlots.size() > UINT_MAX - materials.size())
+        {
+            Log::Error("DXR material-slot table exceeds 32-bit addressing.");
+            return false;
+        }
+
+        auto& instance = instances[i];
+        instance.slotMaterialOffset = static_cast<unsigned int>(materials.size());
+        instance.triangleSlotBufferIndex = UINT_MAX;
+        m_slotGeometry.emplace(object.mesh, metadata);
+
+        for(const auto& slot : metadata.materialSlots)
+        {
+            const auto* material = object.GetSlotMaterial(slot.id);
+
+            if(!material || !material->pipeline || !material->texture)
+            {
+                Log::Error("DXR object has an unresolved material slot: " + slot.id);
+                return false;
+            }
+
+            materials.push_back(material->gpuIndex);
+            m_slotMaterialIndices[i].push_back(material->gpuIndex);
+        }
+
+        instance.materialIndex = materials[instance.slotMaterialOffset];
+
+        if(metadata.materialSlots.size() == 1)
+        {
+            continue; // Dynamic single-slot geometry needs no primitive lookup.
+        }
+
+        auto offset = triangleOffsets.find(object.mesh);
+
+        if(offset == triangleOffsets.end())
+        {
+            const size_t triangleCount = indexCount / 3;
+
+            if(triangleCount > UINT_MAX - triangles.size())
+            {
+                Log::Error("DXR triangle-slot table exceeds 32-bit addressing.");
+                return false;
+            }
+
+            const auto firstTriangle = static_cast<unsigned int>(triangles.size());
+            triangles.resize(triangles.size() + triangleCount);
+
+            for(const auto& submesh : metadata.submeshes)
+            {
+                const auto begin = triangles.begin() + firstTriangle + submesh.firstIndex / 3;
+                std::fill_n(begin, submesh.indexCount / 3, submesh.materialSlot);
+            }
+
+            offset = triangleOffsets.emplace(object.mesh, firstTriangle).first;
+        }
+
+        instance.triangleSlotOffset = offset->second;
+        instance.triangleSlotBufferIndex = 0; // Patched after successful GPU allocation.
+    }
+
+    if(materials.empty() ||
+        !m_triangleSlots.Initialize(device, uploader, triangles.data(), sizeof(unsigned int),
+            static_cast<unsigned int>(triangles.size()), heap) ||
+        !m_slotMaterials.Initialize(device, uploader, materials.data(), sizeof(unsigned int),
+            static_cast<unsigned int>(materials.size()), heap))
+    {
+        Log::Error("Failed to allocate DXR material-slot lookup buffers.");
+        return false;
+    }
+
+    for(auto& instance : instances)
+    {
+        instance.slotMaterialBufferIndex = m_slotMaterials.GetDescriptorIndex();
+
+        if(instance.triangleSlotBufferIndex != UINT_MAX)
+        {
+            instance.triangleSlotBufferIndex = m_triangleSlots.GetDescriptorIndex();
+        }
+    }
+
+    return true;
+}
+
+bool RayTracingSceneResources::ValidateMaterialBindings(const Scene& scene) const
+{
+    const auto& objects = scene.GetRenderObjects();
+
+    if(!scene.HasRenderableMeshes() && m_instances.empty())
+    {
+        return true;
+    }
+
+    if(objects.size() != m_materialBindings.size())
+    {
+        return false;
+    }
+
+    for(size_t i = 0; i < objects.size(); ++i)
+    {
+        const auto& object = objects[i];
+        const auto& previous = m_materialBindings[i];
+
+        if(object.mesh != previous.mesh || object.material != previous.material ||
+            object.slotMaterials != previous.slotMaterials)
+        {
+            return false;
+        }
+
+        if(!object.mesh)
+        {
+            continue;
+        }
+
+        const auto& current = object.mesh->GetMetadata();
+        const auto& original = m_slotGeometry.at(object.mesh);
+
+        if(current.materialSlots != original.materialSlots ||
+            (current.materialSlots.size() > 1 && current.submeshes != original.submeshes))
+        {
+            return false;
+        }
+
+        if(current.materialSlots.size() == 1)
+        {
+            const auto count = object.mesh->IsIndexed() ? object.mesh->GetIndexCount() : object.mesh->GetVertexCount();
+
+            if(current.submeshes.size() != 1 || current.submeshes.front().firstIndex != 0 ||
+                current.submeshes.front().materialSlot != 0 || current.submeshes.front().indexCount != count ||
+                count == 0 || count % 3 != 0)
+            {
+                return false;
+            }
+        }
+
+        for(size_t slot = 0; slot < current.materialSlots.size(); ++slot)
+        {
+            const auto* material = object.GetSlotMaterial(current.materialSlots[slot].id);
+
+            if(!material || material->gpuIndex != m_slotMaterialIndices[i][slot])
+            {
+                return false;
+            }
+        }
+    }
+
+    return true;
 }

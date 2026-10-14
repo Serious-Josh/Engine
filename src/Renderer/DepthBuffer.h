@@ -36,6 +36,16 @@ class DepthBuffer
 
     unsigned int GetWidth() const;
     unsigned int GetHeight() const;
+    D3D12_RESOURCE_STATES GetState() const noexcept
+    {
+        return m_state;
+    }
+
+    // CPU tracking only, after confirmed discard of this unchanged resource.
+    void RestoreStateAfterAbort(D3D12_RESOURCE_STATES state) noexcept
+    {
+        m_state = state;
+    }
 
     private:
     ID3D12Resource* m_resource = nullptr;

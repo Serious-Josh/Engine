@@ -326,6 +326,11 @@ void Renderer::InvalidateRecordingEligibility()
 
 bool Renderer::BeginTrackedRecording(unsigned int frameSlot)
 {
+    if(m_commandRecordingGeneration != 0)
+    {
+        return false; // Resolve the previous list before resetting its ownership.
+    }
+
     if (m_sceneInitializationAttempt.candidate &&
         (m_sceneInitializationAttempt.failed ||
          m_sceneInitializationAttempt.commands != SceneInitializationCommands::BeginAttempted))
@@ -358,8 +363,17 @@ bool Renderer::BeginTrackedRecording(unsigned int frameSlot)
     }
 
     m_activeRecordingGeneration = generation;
-
+    m_commandRecordingGeneration = generation;
+    m_commandSubmissionAttempted = false;
     m_activeRecordingSlot = frameSlot;
+
+    if(!m_materialPreviewRenderer.BeginRecording(generation))
+    {
+        return false;
+    }
+
+    m_textureThumbnails.BeginRecording(generation);
+
     m_frameDisplacementPreparation.generation = generation;
     m_frameDisplacementPreparation.slot = frameSlot;
 
@@ -462,6 +476,12 @@ bool Renderer::ValidateFrameDisplacementPreparation(unsigned int frameSlot) cons
 
 bool Renderer::EndTrackedRecording()
 {
+    if(m_commandRecordingGeneration == 0 || m_commandSubmissionAttempted ||
+        m_commandRecordingGeneration != m_activeRecordingGeneration)
+    {
+        return false;
+    }
+
     if (m_displacementCoverage.enabled && !ValidateCoveredDisplacementRecording())
     {
         m_displacementCoverage.failed = true;
@@ -496,6 +516,18 @@ bool Renderer::EndTrackedRecording()
 
 bool Renderer::AbortTrackedRecording()
 {
+    if(m_commandRecordingGeneration == 0)
+    {
+        return false;
+    }
+
+    if(m_commandSubmissionAttempted)
+    {
+        m_textureThumbnails.Uncertain(m_commandRecordingGeneration);
+        m_materialPreviewRenderer.MarkSubmissionUncertain(m_commandRecordingGeneration);
+        return false;
+    }
+
     if (m_displacementCoverage.enabled)
     {
         const auto outcome = m_displacementCoverage.current.outcome;
@@ -507,11 +539,24 @@ bool Renderer::AbortTrackedRecording()
     }
 
     const auto materialSlot = m_activeRecordingSlot;
-    const auto uploadGeneration = m_activeRecordingGeneration;
+    const auto uploadGeneration = m_commandRecordingGeneration;
     const bool discarded = m_commandContext.AbortRecording();
+
+    if(!discarded)
+    {
+        m_textureThumbnails.Uncertain(m_commandRecordingGeneration);
+    }
 
     if(discarded)
     {
+        m_textureThumbnails.Discarded(m_commandRecordingGeneration);
+
+        if(!m_materialPreviewRenderer.DiscardRecording(m_commandRecordingGeneration))
+        {
+            return false;
+        }
+
+        m_commandRecordingGeneration = 0;
         m_materialDependencies.Discard(materialSlot);
 
         for(auto& entry : m_preparedTextureUploads)
@@ -538,6 +583,11 @@ bool Renderer::AbortTrackedRecording()
 
 bool Renderer::ExecuteTrackedRecording(unsigned int frameSlot)
 {
+    if(m_commandRecordingGeneration == 0 || m_commandSubmissionAttempted)
+    {
+        return false;
+    }
+
     if (m_sceneInitializationAttempt.candidate &&
         (m_sceneInitializationAttempt.failed ||
          m_sceneInitializationAttempt.commands != SceneInitializationCommands::SubmissionAttempted))
@@ -560,7 +610,29 @@ bool Renderer::ExecuteTrackedRecording(unsigned int frameSlot)
         m_frameHitchDiagnostics.current.contextStart = CpuTiming::Clock::now();
     }
 
+    m_commandSubmissionAttempted = true;
     const bool executed = m_commandContext.Execute(frameSlot);
+
+    if(executed)
+    {
+        m_textureThumbnails.Submitted(m_commandRecordingGeneration, m_commandContext.GetLastSubmissionFenceValue());
+
+        if(!m_materialPreviewRenderer.ConfirmSubmission(m_commandRecordingGeneration,
+            m_commandContext.GetLastSubmissionFenceValue()))
+        {
+            m_textureThumbnails.Uncertain(m_commandRecordingGeneration);
+            m_materialPreviewRenderer.MarkSubmissionUncertain(m_commandRecordingGeneration);
+            return false;
+        }
+
+        m_commandRecordingGeneration = 0;
+        m_commandSubmissionAttempted = false;
+    }
+    else
+    {
+        m_textureThumbnails.Uncertain(m_commandRecordingGeneration);
+        m_materialPreviewRenderer.MarkSubmissionUncertain(m_commandRecordingGeneration);
+    }
 
     if constexpr (kEnableFrameHitchDiagnostics)
     {
@@ -802,6 +874,17 @@ ReservedSubmissionResult Renderer::ExecuteCoveredDisplacementRecording(
 
     const auto& frameRecovery = m_pendingDisplacementUpdate.frameRecovery;
 
+    if(m_commandSubmissionAttempted || receipt.outcome == DisplacementRecordingOutcome::Submitted ||
+        receipt.outcome == DisplacementRecordingOutcome::SubmissionUncertain)
+    {
+        return ReservedSubmissionResult::SubmissionUncertain;
+    }
+
+    if(m_commandRecordingGeneration == 0 || m_commandRecordingGeneration != receipt.generation)
+    {
+        return ReservedSubmissionResult::NotSubmitted;
+    }
+
     if (coverage.submittedCount == 0 && frameRecovery.state != DisplacementFrameExitState::Empty &&
         (frameRecovery.state != DisplacementFrameExitState::Ended || frameRecovery.generation != receipt.generation ||
          frameRecovery.frameSlot != frameSlot || frameRecovery.sceneLifetime != coverage.sceneLifetime))
@@ -863,7 +946,34 @@ ReservedSubmissionResult Renderer::ExecuteCoveredDisplacementRecording(
         m_frameHitchDiagnostics.current.contextStart = CpuTiming::Clock::now();
     }
 
+    m_commandSubmissionAttempted = true;
     const auto result = m_commandContext.ExecuteReserved(frameSlot, reservation, submitted);
+
+    if(result == ReservedSubmissionResult::Submitted)
+    {
+        m_textureThumbnails.Submitted(m_commandRecordingGeneration, submitted.fenceValue);
+
+        if(!m_materialPreviewRenderer.ConfirmSubmission(m_commandRecordingGeneration, submitted.fenceValue))
+        {
+            m_textureThumbnails.Uncertain(m_commandRecordingGeneration);
+            m_materialPreviewRenderer.MarkSubmissionUncertain(m_commandRecordingGeneration);
+            Log::Error("Preview submission association failed; retaining quarantine and submission provenance.");
+        }
+        else
+        {
+            m_commandRecordingGeneration = 0;
+            m_commandSubmissionAttempted = false;
+        }
+    }
+    else if(result == ReservedSubmissionResult::NotSubmitted)
+    {
+        m_commandSubmissionAttempted = false;
+    }
+    else
+    {
+        m_textureThumbnails.Uncertain(m_commandRecordingGeneration);
+        m_materialPreviewRenderer.MarkSubmissionUncertain(m_commandRecordingGeneration);
+    }
 
     if constexpr (kEnableFrameHitchDiagnostics)
     {
@@ -2885,6 +2995,8 @@ bool Renderer::Initialize(
         return false;
     }
 
+    m_textureThumbnails.Configure(device, m_resourceDescriptorHeap);
+
     m_resizeFailed = false;
     return true;
 }
@@ -3267,12 +3379,35 @@ void Renderer::BindDrawGeometry(
     }
 }
 
-void Renderer::Draw(
-    ID3D12GraphicsCommandList* commandList,
-    const RenderObject& object,
+void Renderer::Draw(ID3D12GraphicsCommandList* commandList, const RenderObject& object,
     D3D12_GPU_VIRTUAL_ADDRESS cameraConstantsAddress)
 {
-    if (!object.mesh || !object.material || !object.material->pipeline || !object.material->texture)
+    if(!object.mesh)
+    {
+        return;
+    }
+
+    const auto& metadata = object.mesh->GetMetadata();
+
+    for(const auto& submesh : metadata.submeshes)
+    {
+        const auto& slot = metadata.materialSlots[submesh.materialSlot];
+        Material* material = object.GetSlotMaterial(slot.id);
+        // Single-range procedural geometry may have provisional GPU counts this
+        // frame. Preserve the existing geometry-binding count in that case.
+        const auto count = metadata.submeshes.size() == 1 ? UINT_MAX : submesh.indexCount;
+        DrawMaterialRange(commandList, object, *material, submesh.firstIndex, count,
+            cameraConstantsAddress);
+    }
+}
+
+void Renderer::DrawMaterialRange(
+    ID3D12GraphicsCommandList* commandList,
+    const RenderObject& object,
+    Material& selectedMaterial, unsigned int firstIndex, unsigned int rangeCount,
+    D3D12_GPU_VIRTUAL_ADDRESS cameraConstantsAddress)
+{
+    if (!object.mesh || !selectedMaterial.pipeline || !selectedMaterial.texture)
     {
         return;
     }
@@ -3293,9 +3428,9 @@ void Renderer::Draw(
         return;
     }
 
-    object.material->pipeline->Bind(commandList);
+    selectedMaterial.pipeline->Bind(commandList);
 
-    const auto materialIndex = object.material->gpuIndex;
+    const auto materialIndex = selectedMaterial.gpuIndex;
 
     if(materialIndex >= m_materialPublication.desired.size())
     {
@@ -3338,65 +3473,78 @@ void Renderer::Draw(
         return;
     }
 
+    const auto availableCount = geometry.indexed ? geometry.indexCount : geometry.vertexCount;
+
+    if(rangeCount == UINT_MAX)
+    {
+        rangeCount = static_cast<unsigned int>(availableCount);
+    }
+
+    if(firstIndex > availableCount || rangeCount > availableCount - firstIndex)
+    {
+        Log::Error("Submesh draw range exceeds the active geometry binding.");
+        return;
+    }
+
     BindDrawGeometry(commandList, geometry);
 
-    object.material->texture->Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+    selectedMaterial.texture->Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
 
                                                           D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
-    if (object.material->normalTexture)
+    if (selectedMaterial.normalTexture)
     {
-        object.material->normalTexture->Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+        selectedMaterial.normalTexture->Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
 
                                                                     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     }
 
-    if (object.material->roughnessTexture)
+    if (selectedMaterial.roughnessTexture)
     {
-        object.material->roughnessTexture->Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+        selectedMaterial.roughnessTexture->Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
 
                                                                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     }
 
-    if (object.material->metallicTexture)
+    if (selectedMaterial.metallicTexture)
     {
-        object.material->metallicTexture->Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+        selectedMaterial.metallicTexture->Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
                                                                       D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     }
 
-    if (object.material->armTexture)
+    if (selectedMaterial.armTexture)
     {
-        object.material->armTexture->Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+        selectedMaterial.armTexture->Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
 
                                                                  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     }
 
-    if (object.material->aoTexture)
+    if (selectedMaterial.aoTexture)
     {
-        object.material->aoTexture->Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+        selectedMaterial.aoTexture->Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
                                                                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     }
 
-    if(object.material->heightTexture)
+    if(selectedMaterial.heightTexture)
     {
-        object.material->heightTexture->Transition(commandList,
+        selectedMaterial.heightTexture->Transition(commandList,
             D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     }
 
     if (geometry.indexed)
     {
-        const uint64_t indexCount = static_cast<uint64_t>(geometry.indexCount);
+        const uint64_t indexCount = static_cast<uint64_t>(rangeCount);
 
-        commandList->DrawIndexedInstanced(static_cast<UINT>(geometry.indexCount), 1, 0, 0, 0);
+        commandList->DrawIndexedInstanced(rangeCount, 1, firstIndex, 0, 0);
 
         ++m_currentFrameStatistics.geometryDrawCalls;
         m_currentFrameStatistics.submittedTriangles += indexCount / 3;
     }
     else
     {
-        const uint64_t vertexCount = static_cast<uint64_t>(geometry.vertexCount);
+        const uint64_t vertexCount = static_cast<uint64_t>(rangeCount);
 
-        commandList->DrawInstanced(static_cast<UINT>(geometry.vertexCount), 1, 0, 0);
+        commandList->DrawInstanced(rangeCount, 1, firstIndex, 0);
 
         ++m_currentFrameStatistics.geometryDrawCalls;
         m_currentFrameStatistics.submittedTriangles += vertexCount / 3;
@@ -3564,6 +3712,11 @@ bool Renderer::InitializeSceneResources(
         if (!InitializeMaterials(materials))
         {
             Log::Error("Failed to init scene materials.");
+            return false;
+        }
+
+        if(!ValidateSceneMaterialSlots(scene, materials))
+        {
             return false;
         }
 
@@ -3819,6 +3972,11 @@ bool Renderer::CleanupFailedSceneInitialization(const Scene& candidate)
 
     attempt.gpuCompletionProven = true;
     attempt.commands = SceneInitializationCommands::Abandoned;
+    if(!ResolvePreviewAfterGPUDrain())
+    {
+        return false;
+    }
+
     InvalidateRecordingEligibility();
 
     m_rayTracingScene.Shutdown();
@@ -3859,6 +4017,11 @@ bool Renderer::ReleaseSceneResources()
     if(!m_commandContext.DiscardCommandsAfterGPUDrain())
     {
         Log::Error("Scene resource release could not prove material dependency retirement safety.");
+        return false;
+    }
+
+    if(!ResolvePreviewAfterGPUDrain())
+    {
         return false;
     }
 
@@ -4288,11 +4451,23 @@ Renderer::FrameRenderResult Renderer::Render(
     const RendererOptions& options)
 {
     PollPreparedTextureUploads();
+    m_textureThumbnails.SetCompletedFence(m_commandContext.GetCompletedFenceValue());
+
+    if(m_materialPreviewRenderer.IsQuarantined())
+    {
+        return FrameRenderResult::Error;
+    }
     // Retain the latest snapshot even if scene admission defers this frame.
     m_materialPreviewRenderer.SetRequest(options.materialPreview);
 
     if(m_resizeFailed || m_applicationWidth == 0 || m_applicationHeight == 0)
     {
+        return FrameRenderResult::Error;
+    }
+
+    if(!m_rayTracingScene.ValidateMaterialBindings(scene))
+    {
+        Log::Error("Scene material-slot bindings changed without a checked scene-resource rebuild.");
         return FrameRenderResult::Error;
     }
 
@@ -5336,7 +5511,7 @@ bool Renderer::RecordRenderFrame(
             m_environment.GetGGXMultiscatterIrradiance(), m_shadowDenoisePass.GetFilteredVisibilityTexture(),
             finalReflection, m_giSpatialDenoisePass.GetOutputTexture(), m_aoResolvePass.GetOutputTexture(),
             options.enableRTGI, options.rtgiContactAOStrength, m_sceneColor, reconstructionConstantsAddress,
-            lightConstantsAddress, static_cast<unsigned int>(debugView));
+            lightConstantsAddress, static_cast<unsigned int>(debugView), m_debugUI.IsShadingNormalCorrectionEnabled());
 
         m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::DeferredLighting);
 
@@ -5435,7 +5610,13 @@ bool Renderer::RecordRenderFrame(
     commandList->SetDescriptorHeaps(1, &previewHeap);
 
     if(!m_materialPreviewRenderer.Record({commandList, frameIndex,
-            m_brdfIntegrationLUT.GetDescriptorIndex(), m_ggxAverageAlbedoLUT.GetDescriptorIndex()}))
+            m_brdfIntegrationLUT.GetDescriptorIndex(), m_ggxAverageAlbedoLUT.GetDescriptorIndex(),
+            m_activeRecordingGeneration}))
+    {
+        return false;
+    }
+
+    if(!m_textureThumbnails.Record(commandList, m_activeRecordingGeneration))
     {
         return false;
     }
@@ -5578,7 +5759,6 @@ bool Renderer::RecordRenderFrame(
     }
 
     m_materialPublication.ConfirmSubmission(frameIndex, materialRevision);
-    m_materialPreviewRenderer.ConfirmSubmission(m_commandContext.GetLastSubmissionFenceValue());
 
     std::optional<FrameHitchProbe> postSubmissionProbe;
 
@@ -5691,10 +5871,14 @@ void Renderer::Shutdown()
         std::abort();
     }
 
+    m_textureThumbnails.ClearAfterGPUDrain();
+
     Log::Info("Renderer shutdown: GPU finished.");
     ShutdownMaterialTables();
 
     m_materialPreviewRenderer.Shutdown();
+    m_commandRecordingGeneration = 0;
+    m_commandSubmissionAttempted = false;
 
     Log::Info("Renderer shutdown: shutting down DebugUI...");
     m_debugUI.Shutdown();
@@ -6865,5 +7049,83 @@ bool Renderer::SubmitMaterialTableRevision(std::uint64_t identity, const std::ve
 
     static_assert(std::is_nothrow_move_assignable_v<decltype(m_materialPublication)>);
     m_materialPublication = std::move(candidate);
+    return true;
+}
+
+bool Renderer::ValidateSceneMaterialSlots(const Scene& scene, const std::vector<Material*>& materials) const
+{
+    // Every slot must belong to the published table, which retains textures
+    // for all catalog materials, including overrides unused by the fallback.
+    for(const auto& object : scene.GetRenderObjects())
+    {
+        if(!object.mesh)
+        {
+            continue;
+        }
+
+        const auto& metadata = object.mesh->GetMetadata();
+        const auto count = object.mesh->IsIndexed() ? object.mesh->GetIndexCount() : object.mesh->GetVertexCount();
+        std::string error;
+
+        if(!ValidateMeshMetadata(metadata, count, error))
+        {
+            Log::Error("Invalid scene mesh metadata: " + error);
+            return false;
+        }
+
+        for(const auto& [slotID, material] : object.slotMaterials)
+        {
+            const auto slot = std::find_if(metadata.materialSlots.begin(), metadata.materialSlots.end(),
+                [&](const MeshMaterialSlot& entry) { return entry.id == slotID; });
+
+            if(slot == metadata.materialSlots.end() || !material)
+            {
+                Log::Error("Object contains an unknown or unresolved material slot.");
+                return false;
+            }
+        }
+
+        for(const auto& slot : metadata.materialSlots)
+        {
+            const auto* material = object.GetSlotMaterial(slot.id);
+
+            if(!material || !material->pipeline || !material->texture ||
+                std::find(materials.begin(), materials.end(), material) == materials.end() ||
+                material->gpuIndex >= m_materialPublication.desired.size())
+            {
+                Log::Error("Material slot is absent from the retained scene material table: " + slot.id);
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
+bool Renderer::ResolvePreviewAfterGPUDrain()
+{
+    m_textureThumbnails.ResolveAfterGPUDrain();
+    m_textureThumbnails.Discarded(m_commandRecordingGeneration);
+
+    // Call only after DiscardCommandsAfterGPUDrain succeeds. Unknown execution
+    // means actual attachment states are unknowable: recreate instead of rollback.
+    if(m_materialPreviewRenderer.IsQuarantined())
+    {
+        m_materialPreviewRenderer.Shutdown();
+
+        if(!m_materialPreviewRenderer.Initialize(m_graphicsDevice.GetDevice(), m_shaderLibrary,
+            m_resourceUploader, m_rtvDescriptorHeap, m_dsvDescriptorHeap, m_resourceDescriptorHeap))
+        {
+            Log::Error("Preview recovery failed after checked GPU drain; Renderer must stop.");
+            return false;
+        }
+    }
+    else if(!m_materialPreviewRenderer.DiscardRecording(m_commandRecordingGeneration))
+    {
+        return false;
+    }
+
+    m_commandRecordingGeneration = 0;
+    m_commandSubmissionAttempted = false;
     return true;
 }

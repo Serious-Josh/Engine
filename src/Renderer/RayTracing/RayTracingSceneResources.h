@@ -3,6 +3,8 @@
 #include "Renderer/RayTracing/BottomLevelAccelerationStructure.h"
 #include "Renderer/RayTracing/TopLevelAccelerationStructure.h"
 #include "Renderer/StructuredBuffer.h"
+#include "Renderer/RenderObject.h"
+#include "assets/MeshMetadata.h"
 
 #include <d3d12.h>
 #include <memory>
@@ -13,6 +15,7 @@
 class Mesh;
 class Scene;
 class ResourceUploader;
+struct RayTracingInstanceData;
 class DescriptorHeap;
 
 struct SceneBLASRetirementBatchIdentity
@@ -114,8 +117,18 @@ class RayTracingSceneResources
 
     unsigned int GetInstanceDataDescriptorIndex() const;
     std::size_t GetInstanceCount() const;
+    bool ValidateMaterialBindings(const Scene& scene) const;
 
     private:
+    bool InitializeMaterialSlots(ID3D12Device5* device, ResourceUploader& uploader,
+        DescriptorHeap& heap, const Scene& scene, std::vector<RayTracingInstanceData>& instances);
+    StructuredBuffer m_triangleSlots;
+    StructuredBuffer m_slotMaterials;
+
+    std::unordered_map<const Mesh*, MeshMetadata> m_slotGeometry;
+    std::vector<RenderObject> m_materialBindings;
+    std::vector<std::vector<unsigned int>> m_slotMaterialIndices;
+
     bool RebuildMeshBLASInternal(
       ID3D12Device5* device,
       ID3D12GraphicsCommandList4* commandList,

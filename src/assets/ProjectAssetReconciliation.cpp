@@ -229,6 +229,45 @@ bool ProjectAssetReconciliation::Run(
 
                 for(auto& object : objects)
                 {
+                    const bool meshRemoved = Matches(object.at("meshReference"), missing);
+
+                    if(object.contains("materialSlotBindings"))
+                    {
+                        auto& bindings = object.at("materialSlotBindings");
+                        std::set<std::string> slotIDs;
+
+                        if(!bindings.is_array())
+                        {
+                            throw std::runtime_error("Scene material-slot bindings must be an array.");
+                        }
+
+                        for(const auto& binding : bindings)
+                        {
+                            const auto slotID = binding.at("slotID").get<std::string>();
+                            const auto reference = binding.at("materialReference").get<std::string>();
+
+                            if(slotID.empty() || !slotIDs.insert(slotID).second || !AssetID::ParseReference(reference))
+                            {
+                                throw std::runtime_error("Invalid or duplicate scene material-slot binding.");
+                            }
+                        }
+
+                        // Explicit missing-reference reconciliation removes overrides
+                        // to restore fallback. Removing a mesh also removes its bindings.
+                        for(auto binding = bindings.begin(); binding != bindings.end();)
+                        {
+                            if(meshRemoved || Matches(binding->at("materialReference"), missing))
+                            {
+                                binding = bindings.erase(binding);
+                                ++changed;
+                            }
+                            else
+                            {
+                                ++binding;
+                            }
+                        }
+                    }
+
                     for(const char* binding : {"meshReference", "materialReference"})
                     {
                         auto& value = object.at(binding);

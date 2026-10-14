@@ -1,5 +1,6 @@
 #pragma once
 #include "Debug/CpuFrameTiming.h"
+#include "Editor/TextureThumbnailCache.h"
 #include "Diagnostics/FrameHitchDiagnostics.h"
 
 #include "GBuffer.h"
@@ -200,6 +201,44 @@ class Renderer
         m_materialPreviewRenderer.BeginThumbnailWorkingSet();
     }
 
+    // Mesh thumbnail integration points; callers poll between frames using the live project registry.
+    bool RequestMeshThumbnail(const ProjectPaths& paths, const ProjectAssetRegistry& registry,
+        const AssetID& id, std::uint64_t& ticket, std::string& error,
+        MaterialPreviewRenderer::MeshThumbnailConsumer consumer = MaterialPreviewRenderer::MeshThumbnailConsumer::AssetBrowser)
+    {
+        return m_materialPreviewRenderer.RequestMeshThumbnail(paths, registry, id, ticket, error, consumer);
+    }
+
+    void PollMeshThumbnails(const ProjectPaths& paths, const ProjectAssetRegistry& registry)
+    {
+        m_materialPreviewRenderer.PollMeshThumbnailGPUCompletion(m_commandContext.GetCompletedFenceValue());
+        m_materialPreviewRenderer.PollMeshThumbnailPreparation(paths, registry);
+    }
+
+    std::optional<MaterialPreviewRenderer::MeshThumbnailImage> GetMeshThumbnailImage(std::uint64_t ticket)
+    {
+        return m_materialPreviewRenderer.GetMeshThumbnailImage(m_resourceDescriptorHeap, ticket);
+    }
+
+    std::string GetMeshThumbnailError(std::uint64_t ticket) const
+    {
+        return m_materialPreviewRenderer.GetMeshThumbnailError(ticket);
+    }
+
+    bool IsMeshThumbnailRequestCurrent(std::uint64_t ticket) const
+    {
+        const auto* job = m_materialPreviewRenderer.GetMeshThumbnailPreparation(ticket);
+        return job && job->state != MeshThumbnailPreparation::State::Cancelled &&
+            job->state != MeshThumbnailPreparation::State::Failed &&
+            m_materialPreviewRenderer.GetMeshThumbnailError(ticket).empty();
+    }
+
+    void DiscardMeshThumbnail(std::uint64_t ticket,
+        MaterialPreviewRenderer::MeshThumbnailConsumer consumer = MaterialPreviewRenderer::MeshThumbnailConsumer::AssetBrowser)
+    {
+        m_materialPreviewRenderer.DiscardMeshThumbnailPreparation(ticket, consumer);
+    }
+
     void DiscardSavedMaterialThumbnailRequests()
     {
         m_materialPreviewRenderer.DiscardThumbnailRequests();
@@ -343,6 +382,9 @@ class Renderer
         FrameHitchRegion region,
         double milliseconds,
         std::uint64_t cameraRevision);
+    // Shared nonblocking texture service. Owned by Renderer and available to all editor consumers.
+    TextureThumbnailCache& GetTextureThumbnailCache() { return m_textureThumbnails; }
+
     void BeginFrameHitchDiagnostics(std::uint64_t engineFrameSerial);
     void RecordFrameHitchDiagnostics(
         CpuTiming::Clock::time_point frameStart,
@@ -499,6 +541,7 @@ class Renderer
     bool BeginTrackedRecording(unsigned int frameSlot);
     bool EndTrackedRecording();
     bool AbortTrackedRecording();
+    bool ResolvePreviewAfterGPUDrain();
     bool ExecuteTrackedRecording(unsigned int frameSlot);
 
     struct RecordingEligibilityScope
@@ -517,6 +560,9 @@ class Renderer
     };
 
     std::uint64_t m_activeRecordingGeneration = 0;
+    // Persists through Close; eligibility's active generation is cleared at End.
+    std::uint64_t m_commandRecordingGeneration = 0;
+    bool m_commandSubmissionAttempted = false;
     unsigned int m_activeRecordingSlot = UINT_MAX;
 
     using FrameDisplacementPreparation = RendererDisplacement::FrameDisplacementPreparation;
@@ -805,6 +851,10 @@ class Renderer
         ID3D12GraphicsCommandList* commandList,
         const RenderObject& object,
         D3D12_GPU_VIRTUAL_ADDRESS cameraConstantsAddress);
+    void DrawMaterialRange(ID3D12GraphicsCommandList* commandList, const RenderObject& object,
+        Material& material, unsigned int firstIndex, unsigned int indexCount,
+        D3D12_GPU_VIRTUAL_ADDRESS cameraConstantsAddress);
+    bool ValidateSceneMaterialSlots(const Scene& scene, const std::vector<Material*>& materials) const;
     void BeginGeometryPass(ID3D12GraphicsCommandList* commandList);
     void EndGeometryPass(ID3D12GraphicsCommandList* commandList);
     bool InitializeMaterials(const std::vector<Material*>& materials);
@@ -909,6 +959,7 @@ class Renderer
 
     GBuffer m_gBuffer;
 
+    TextureThumbnailCache m_textureThumbnails;
     MaterialPreviewRenderer m_materialPreviewRenderer;
 
     UploadBuffer m_uploadBuffer;

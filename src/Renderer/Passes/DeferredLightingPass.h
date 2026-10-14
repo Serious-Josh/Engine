@@ -35,7 +35,8 @@ class DeferredLightingPass
         RenderTarget& sceneColor,
         D3D12_GPU_VIRTUAL_ADDRESS reconstructionConstantsAddress,
         D3D12_GPU_VIRTUAL_ADDRESS lightConstantsAddress,
-        unsigned int debugView = 0);
+        unsigned int debugView = 0,
+        bool enableShadingNormalCorrection = true);
 
     void Shutdown();
 

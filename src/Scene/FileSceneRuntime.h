@@ -6,7 +6,10 @@
 #include "Scene/PreparedScene.h"
 
 #include <optional>
+#include <memory>
 #include <string>
+#include <map>
+#include "assets/AssetID.h"
 
 // Copied document metadata. Identity fields are internal selection checks, not UI labels.
 struct SceneObjectMetadata
@@ -21,6 +24,9 @@ struct SceneObjectMetadata
 
     std::uint64_t runtimeIdentity = 0;
     std::uint64_t structureRevision = 0;
+
+    // Copied presentation metadata; never borrows scene-owned material state.
+    std::map<std::string, std::string> materialSlotBindings;
 };
 
 struct MaterialAssignmentToken
@@ -48,6 +54,23 @@ public:
 
     FileSceneRuntime(const FileSceneRuntime&) = delete;
     FileSceneRuntime& operator=(const FileSceneRuntime&) = delete;
+
+    // Builds an inactive candidate without changing this runtime. Existing live
+    // asset borrows are preserved; caller retains their catalog through GPU cleanup.
+    std::unique_ptr<FileSceneRuntime> PrepareObjectCreation(
+        SceneAssetResolver& resolver, std::string meshReference, const Transform& transform,
+        std::string materialReference, std::string name, std::string& objectID,
+        std::string* errorMessage = nullptr) const;
+
+    // Removes one instance from an inactive captured document; surviving asset borrows
+    // and live transforms are copied without reloading or destroying catalog assets.
+    bool CaptureObjectDeletionSnapshot(std::string_view objectID, SceneObjectDocument& object,
+        size_t& documentIndex, std::string* errorMessage = nullptr) const;
+    std::unique_ptr<FileSceneRuntime> PrepareObjectDeletion(std::string_view objectID,
+        std::string* errorMessage = nullptr) const;
+
+    std::unique_ptr<FileSceneRuntime> PrepareObjectRestoration(SceneAssetResolver& resolver,
+        const SceneObjectDocument& restored, size_t insertionIndex, std::string* errorMessage = nullptr) const;
 
     const FileScene& GetFileScene() noexcept
     {
@@ -77,11 +100,19 @@ public:
     std::optional<SceneObjectMetadata> GetObjectMetadata(
         RenderObjectID runtimeIndex,
         std::string* errorMessage = nullptr) const;
+    std::optional<SceneObjectMetadata> GetObjectMetadata(
+        std::string_view objectID, std::string* errorMessage = nullptr) const;
 
     // CPU preparation only; one outstanding assignment per runtime.
     std::optional<MaterialAssignmentToken> PrepareMaterialAssignment(
         const SceneObjectMetadata& selection, std::string materialReference,
         std::string* errorMessage = nullptr);
+    // CPU staging only. Caller resolves/retains effectiveMaterial before preparing.
+    // No material ID clears the explicit override and must use the existing fallback pointer.
+    std::optional<MaterialAssignmentToken> PrepareMaterialSlotAssignment(
+        const SceneObjectMetadata& selection, std::string slotID, const std::optional<AssetID>& materialID,
+        Material& effectiveMaterial, std::string* errorMessage = nullptr);
+    Material* GetPreparedMaterialAssignmentMaterial(const MaterialAssignmentToken& token) const noexcept;
     // Caller must first release Renderer references and prove GPU/recording safety.
     // Caller owns and retains BOTH materials through cleanup, rollback and GPU completion.
     bool CommitMaterialAssignment(const MaterialAssignmentToken& token, Material& retainedSceneMaterial,
@@ -141,6 +172,15 @@ private:
         FileScene candidate;
 
         SceneDocument liveBefore;
+
+        std::map<std::string, std::string> slotBindings;
+        std::map<std::string, Material*> originalSlots;
+        std::map<std::string, Material*> stagedRuntimeSlots;
+        std::map<std::string, Material*> stagedCommittedSlots;
+
+        std::optional<std::string> slotID;
+        Mesh* expectedMesh = nullptr;
+        Material* stagedMaterial = nullptr;
 
         Material* previousMaterial = nullptr;
         Material* appliedMaterial = nullptr;

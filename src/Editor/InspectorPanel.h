@@ -9,13 +9,27 @@
 
 #include <array>
 #include <functional>
+#include <map>
 #include <optional>
 #include <string>
 #include <vector>
+#include <chrono>
 
 struct EditorWorkspaceRect;
 class ProjectPaths;
 class ProjectAssetRegistry;
+class Renderer;
+
+struct SceneMaterialSlotInspectorView
+{
+    std::string id;
+    std::string name;
+    std::string materialName;
+    std::string materialReference;
+
+    bool explicitBinding = false;
+    bool available = false;
+};
 
 struct SceneObjectInspectorView
 {
@@ -27,6 +41,8 @@ struct SceneObjectInspectorView
     std::string material;
 
     std::optional<SceneObjectMetadata> metadata;
+    std::string meshReference;
+    std::vector<SceneMaterialSlotInspectorView> materialSlots;
 };
 
 class InspectorPanel
@@ -42,8 +58,28 @@ public:
 
     void DrawSceneObject(const EditorWorkspaceRect& rectangle, const SceneObjectInspectorView& object,
         const std::function<void()>& drawTransformControls,
-        const ProjectPaths& paths, const ProjectAssetRegistry& registry, bool assignmentPending,
-        const std::string& assignmentStatus, const std::function<void(std::string)>& requestAssignment);
+        const ProjectPaths& paths, const ProjectAssetRegistry& registry,
+        bool assignmentPending, const std::string& assignmentStatus);
+    struct SlotAssignmentRequest
+    {
+        SceneObjectMetadata selection;
+        std::string slotID;
+        std::optional<AssetID> materialID;
+    };
+    std::optional<SlotAssignmentRequest> TakeSlotAssignmentRequest();
+    void OnSlotAssignmentCompleted(const SceneObjectMetadata& selection, const std::string& slotID,
+        bool succeeded, const std::string& message);
+    void DismissSceneMaterialPicker();
+    void DismissTexturePicker();
+    const std::string& GetSlotPickerStatus() const noexcept
+    {
+        return m_materialPickerStatus;
+    }
+    void ConfigureThumbnails(Renderer& renderer)
+    {
+        m_thumbnailRenderer = &renderer;
+    }
+    void ReleaseSceneObjectPreview();
 
     enum class LeaveDecision
     {
@@ -67,12 +103,29 @@ public:
         const ProjectAssetRegistry& registry);
 
 private:
+    Renderer* m_thumbnailRenderer = nullptr;
+    std::filesystem::path m_meshThumbnailProject;
+    std::string m_meshThumbnailReference;
+    std::uint64_t m_meshThumbnailTicket = 0;
+    std::chrono::steady_clock::time_point m_meshThumbnailValidation{};
+    std::optional<D3D12_GPU_DESCRIPTOR_HANDLE> GetSceneMeshThumbnail(
+        const ProjectPaths& paths, const ProjectAssetRegistry& registry, const std::string& reference);
+    void DrawSceneAssetTiles(const SceneObjectInspectorView& object,
+        const ProjectPaths& paths, const ProjectAssetRegistry& registry, bool assignmentPending);
+    std::optional<std::string> DrawCompactMaterialSlots(const SceneObjectInspectorView& object, bool interactive);
+    void OpenSceneMaterialPicker(const SceneObjectInspectorView& object, const ProjectPaths& paths,
+        const std::string& slotID);
+
     void DrawSceneMaterialPicker(
         const SceneObjectInspectorView& object,
         const ProjectPaths& paths,
         const ProjectAssetRegistry& registry,
-        bool assignmentPending,
-        const std::function<void(std::string)>& requestAssignment);
+        bool assignmentPending);
+    bool MaterialPickerMatches(const SceneObjectInspectorView& object, const ProjectPaths& paths) const;
+    void RequestSlotMaterial(const SceneObjectInspectorView& object, const ProjectPaths& paths,
+        const ProjectAssetRegistry& registry, const std::optional<AssetID>& materialID);
+    void DrawSlotMaterialGrid(const SceneObjectInspectorView& object, const SceneMaterialSlotInspectorView& slot,
+        const ProjectPaths& paths, const ProjectAssetRegistry& registry);
 
     std::array<char, 128> m_materialSearch{};
 
@@ -81,6 +134,11 @@ private:
     std::optional<SceneObjectMetadata> m_materialPickerObject;
 
     std::filesystem::path m_materialPickerProject;
+    std::string m_materialPickerSlot;
+    std::string m_materialPickerStatus;
+    std::optional<SlotAssignmentRequest> m_slotAssignmentRequest;
+    bool m_slotAssignmentPending = false;
+    bool m_closeSlotPicker = false;
 
     std::optional<std::filesystem::path> m_savedThumbnailSource;
 
@@ -122,17 +180,44 @@ private:
         const ProjectAssetRegistry& registry,
         bool overwriteConflict);
     void DrawMaterial(const ProjectPaths& paths, const ProjectAssetRegistry& registry);
+    enum class TextureSlot { BaseColor, Normal, Roughness, Metallic, ARM, AO, Height };
+    struct TexturePickerIdentity
+    {
+        AssetRecord material;
+        std::filesystem::path project;
+        TextureSlot slot;
+        unsigned int generation = 0;
+    };
+    struct TexturePickerRequest
+    {
+        std::uint64_t ticket = 0;
+        bool visible = false;
+    };
+
     void DrawTextureReference(
         const char* label,
+        TextureSlot slot,
         std::optional<std::string>& reference,
         const ProjectPaths& paths,
         const ProjectAssetRegistry& registry,
         bool selectionValid);
 
     void DrawTexturePickerContents(
-        std::optional<std::string>& reference,
+        TextureSlot slot,
         const ProjectPaths& paths,
         const ProjectAssetRegistry& registry);
+
+    bool TexturePickerMatches(TextureSlot slot, const ProjectPaths& paths,
+        const ProjectAssetRegistry& registry) const;
+    std::optional<std::string>* GetTextureSlot(TextureSlot slot);
+    bool ApplyTextureSelection(const AssetRecord* texture, const ProjectPaths& paths,
+        const ProjectAssetRegistry& registry);
+    void RefreshTextureChoices(const ProjectAssetRegistry& registry);
+    void PruneTexturePickerRequests(bool all = false);
+    void DrawTextureGrid(TextureSlot slot, const ProjectPaths& paths,
+        const ProjectAssetRegistry& registry);
+    bool DrawTextureTile(const AssetRecord& texture, float extent, bool selected,
+        const ProjectPaths& paths, const ProjectAssetRegistry& registry);
 
     void Revert();
 
@@ -166,9 +251,13 @@ private:
     std::array<char, 128> m_textureSearch{};
 
     std::vector<AssetRecord> m_texturePickerRegistry;
-    std::vector<AssetRecord> m_availableTextures;
+    std::vector<AssetRecord> m_textureChoices;
+    std::optional<TexturePickerIdentity> m_texturePicker;
+    std::map<std::string, TexturePickerRequest> m_texturePickerRequests;
+    std::string m_texturePickerError;
 
     bool m_refreshTextureChoices = true;
+    bool m_texturePickerDrawn = false;
 
     std::filesystem::path m_projectRoot;
 

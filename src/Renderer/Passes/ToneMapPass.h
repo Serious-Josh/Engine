@@ -44,7 +44,8 @@ enum class ToneMapDebugView : unsigned int
     HDRIDirectIntegralMip0 = 28,
     HDRIDirectIntegralMip4 = 29,
     HDRIDirectIntegralMip6 = 30,
-    GISignedReconstructed = 31
+    GISignedReconstructed = 31,
+    ShadingNormalViewHorizon = 32
 };
 
 class ToneMapPass

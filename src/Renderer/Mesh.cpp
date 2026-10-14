@@ -102,6 +102,7 @@ bool Mesh::Initialize(
 {
     m_layout = layout;
     m_vertexCount = vertexCount;
+    ResetMetadata();
 
     m_bounds = CalculateBounds(vertices, vertexCount, layout);
 
@@ -166,6 +167,7 @@ bool Mesh::Initialize(
     }
 
     m_indexCount = indexCount;
+    ResetMetadata();
 
     m_indexBufferView.BufferLocation = m_indexBuffer.GetGPUAddress();
     m_indexBufferView.SizeInBytes = static_cast<UINT>(indexCount * sizeof(unsigned int));
@@ -255,6 +257,7 @@ bool Mesh::InitializeGPUWritable(
     // No generated geometry exists yet.
     m_vertexCount = 0;
     m_indexCount = 0;
+    ResetMetadata();
 
     m_vertexBufferView = {};
     m_vertexBufferView.BufferLocation = m_vertexBuffer.GetGPUAddress();
@@ -421,6 +424,7 @@ bool Mesh::InitializeGPUWritableSeeded(
 
     m_vertexCount = vertexCount;
     m_indexCount = indexCount;
+    ResetMetadata();
     m_vertexBufferView = {};
     m_vertexBufferView.BufferLocation = m_vertexBuffer.GetGPUAddress();
 
@@ -459,6 +463,7 @@ bool Mesh::SetGPUGeneratedGeometryCounts(
 
     m_vertexCount = vertexCount;
     m_indexCount = indexCount;
+    ResetMetadata();
 
     m_vertexBufferView.SizeInBytes = static_cast<UINT>(vertexBytes);
     m_indexBufferView.SizeInBytes = static_cast<UINT>(indexBytes);
@@ -557,6 +562,7 @@ bool Mesh::ReplaceGeometry(
 
     m_vertexCount = vertexCount;
     m_indexCount = indexCount;
+    ResetMetadata();
     m_bounds = newBounds;
 
     m_vertexBufferView.BufferLocation = m_vertexBuffer.GetGPUAddress();
@@ -577,6 +583,7 @@ void Mesh::Shutdown()
     m_indexBuffer.Shutdown();
     m_vertexCount = 0;
     m_indexCount = 0;
+    ResetMetadata();
     m_bounds = {};
 
     m_vertexCapacity = 0;
@@ -705,4 +712,26 @@ D3D12_RESOURCE_STATES Mesh::GetVertexBufferState() const
 D3D12_RESOURCE_STATES Mesh::GetIndexBufferState() const
 {
     return m_indexBuffer.GetResourceState();
+}
+
+void Mesh::ResetMetadata() noexcept
+{
+    m_metadata.reset();
+    m_defaultMetadata.submeshes.front().indexCount = static_cast<uint32_t>(m_indexCount ? m_indexCount : m_vertexCount);
+}
+
+bool Mesh::SetMetadata(MeshMetadata metadata, std::string& error)
+{
+    if(!ValidateMeshMetadata(metadata, m_indexCount ? m_indexCount : m_vertexCount, error))
+    {
+        return false;
+    }
+
+    m_metadata = std::move(metadata);
+    return true;
+}
+
+const MeshMetadata& Mesh::GetMetadata() const noexcept
+{
+    return m_metadata ? *m_metadata : m_defaultMetadata;
 }

@@ -2,17 +2,29 @@
 
 #include "Renderer/Texture.h"
 #include "assets/ProjectAssetResolver.h"
+#include "TextureThumbnailDiskCache.h"
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
+#include <wrl/client.h>
 
-class ResourceUploader;
 class DescriptorHeap;
 
+// All public operations run on the editor/Renderer thread. The worker owns CPU data only.
 class TextureThumbnailCache
 {
 public:
+    enum class Consumer : unsigned int { AssetBrowser = 1, MaterialInspector = 2 };
+    using Ticket = std::uint64_t;
+    static constexpr size_t kCapacity = 64;
+    static constexpr size_t kQueueCapacity = 32;
+    static constexpr size_t kMaximumPixelBytes = (kCapacity + 2) * 96 * 96 * 4;
+    static constexpr size_t kUploadsPerFrame = 2;
+
     struct Preview
     {
         Texture texture;
@@ -27,25 +39,73 @@ public:
         std::filesystem::path sourcePath;
     };
 
-    void Configure(ID3D12Device* device, ResourceUploader& uploader, DescriptorHeap& heap);
+    TextureThumbnailCache();
+    ~TextureThumbnailCache();
+    TextureThumbnailCache(const TextureThumbnailCache&) = delete;
+    TextureThumbnailCache& operator=(const TextureThumbnailCache&) = delete;
+
+    void Configure(ID3D12Device* device, DescriptorHeap& heap);
     void BeginFrame();
     void Invalidate(const std::filesystem::path& path);
-    // Completion belongs to the Renderer command-context lifetime. Clear before reconfiguration.
     void SetCompletedFence(std::uint64_t completedFence);
-    void ConfirmSubmission(std::uint64_t submissionFence);
     const Preview* FindOrCreate(const ProjectPaths& paths, const ProjectAssetRegistry& registry, const AssetRecord& record);
-    std::vector<Texture*> GetTextures();
+    Ticket Request(const ProjectPaths& paths, const ProjectAssetRegistry& registry,
+        const AssetRecord& record, Consumer consumer);
+    // Borrow until the next cache call; a returned error has invalidated=true.
+    // Ready queries pin the descriptor through the next Renderer submission.
+    const Preview* Query(Ticket ticket);
+    void Release(Ticket ticket, Consumer consumer);
+    void ReleaseConsumer(Consumer consumer, bool invalidate = false);
     D3D12_GPU_DESCRIPTOR_HANDLE GetHandle(const Preview& preview) const;
-    // Caller has drained the render queue, before constructing any new ImGui commands.
+
+    void BeginRecording(std::uint64_t generation);
+    bool Record(ID3D12GraphicsCommandList* commandList, std::uint64_t generation);
+    void Submitted(std::uint64_t generation, std::uint64_t fence);
+    void Discarded(std::uint64_t generation);
+    void Uncertain(std::uint64_t generation);
+    void ResolveAfterGPUDrain();
     void ClearAfterGPUDrain();
 
 private:
-    ID3D12Device* m_device = nullptr;
-    ResourceUploader* m_uploader = nullptr;
-    DescriptorHeap* m_heap = nullptr;
+    struct Worker;
+    struct Entry
+    {
+        Entry(const ProjectPaths& paths, const AssetRecord& asset) : project(paths), record(asset) {}
 
-    std::map<std::pair<std::filesystem::path, std::string>, Preview> m_previews;
-    bool m_createdThisFrame = false;
+        Preview preview;
+        ProjectPaths project;
+        AssetRecord record;
+        TextureThumbnailDiskCache::Image pixels;
+        Microsoft::WRL::ComPtr<ID3D12Resource> staging;
+        std::vector<D3D12_RESOURCE_STATES> savedStates;
+        std::string identity;
+        std::shared_ptr<std::atomic_bool> cancelled;
+
+        Ticket ticket = 0;
+        std::uint64_t epoch = 0;
+        std::uint64_t uploadGeneration = 0;
+        std::uint64_t displayGeneration = 0;
+        std::uint64_t uploadFence = 0;
+        unsigned int consumers = 0;
+        bool browserUsed = false;
+        bool preparing = false;
+        bool ready = false;
+        bool needsValidation = false;
+        std::chrono::steady_clock::time_point nextValidation{};
+    };
+    using Key = std::pair<std::filesystem::path, std::string>;
+    bool Queue(Entry& entry);
+    void Poll();
+    bool Upload(ID3D12GraphicsCommandList* commandList, Entry& entry, std::uint64_t generation);
+    bool Retirable(const Entry& entry) const;
+
+    ID3D12Device* m_device = nullptr;
+    DescriptorHeap* m_heap = nullptr;
+    std::shared_ptr<Worker> m_worker;
+    std::map<Key, Entry> m_entries;
+
+    Ticket m_nextTicket = 0;
     std::uint64_t m_useSerial = 0;
     std::uint64_t m_completedFence = 0;
+    bool m_quarantined = false;
 };

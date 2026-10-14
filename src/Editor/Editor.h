@@ -13,8 +13,11 @@
 #include <optional>
 #include <string>
 #include <vector>
+#include <variant>
+#include <memory>
 
 class IDemoScene;
+class FileBackedDemoScene;
 class Scene;
 class SphereGridScene;
 class StressTestScene;
@@ -65,23 +68,23 @@ public:
         const ProjectPaths& paths,
         ProjectAssetRegistry& registry);
 
-    void ConfigureThumbnails(
-        ID3D12Device* device,
-        ResourceUploader& uploader,
-        DescriptorHeap& heap)
-    {
-        m_assetBrowser.ConfigureThumbnails(device, uploader, heap);
-    }
-
     bool HasBlockingMaterialOperation() const
     {
         return m_materialLeaveAction != MaterialLeaveAction::None || m_sceneOperationPending ||
             m_inspectorPanel.HasUnsavedChanges();
     }
 
+    // The queued creation's own scene-operation UI lock is not a conflict.
+    bool HasBlockingObjectCreation() const
+    {
+        return m_materialLeaveAction != MaterialLeaveAction::None || m_inspectorPanel.HasUnsavedChanges() ||
+            m_materialAssignmentPending || m_transformFieldEditing || m_gizmoWasUsing;
+    }
+
     void ConfigureMaterialThumbnails(Renderer& renderer)
     {
         m_assetBrowser.ConfigureMaterialThumbnails(renderer);
+        m_inspectorPanel.ConfigureThumbnails(renderer);
     }
 
     void SetThumbnailCompletedFence(std::uint64_t fence)
@@ -89,24 +92,14 @@ public:
         m_assetBrowser.SetThumbnailCompletedFence(fence);
     }
 
-    void ConfirmThumbnailSubmission(std::uint64_t fence)
-    {
-        m_assetBrowser.ConfirmThumbnailSubmission(fence);
-    }
-
     bool NeedsThumbnailReset() const
     {
         return m_assetBrowser.NeedsThumbnailReset();
     }
 
-    void ClearThumbnailsAfterGPUDrain()
+    void ResetThumbnailRequests()
     {
-        m_assetBrowser.ClearThumbnailsAfterGPUDrain();
-    }
-
-    std::vector<Texture*> GetThumbnailTextures()
-    {
-        return m_assetBrowser.GetThumbnailTextures();
+        m_assetBrowser.ResetThumbnailRequests();
     }
 
     const std::optional<MaterialPreviewRequest>& GetMaterialPreviewRequest()
@@ -116,6 +109,21 @@ public:
 
     void SetSceneOperationPending(bool pending) noexcept;
     void OnSceneActivated();
+    // Interaction cleanup alone does not change the history session or cursor.
+    void ResetSceneInteractions();
+    std::uint64_t GetSceneHistoryEpoch() const noexcept { return m_historyEpoch; }
+    bool CanPreserveSceneHistory(const IDemoScene& scene, const std::filesystem::path& canonicalProject,
+        std::uint64_t epoch) const;
+    // Caller has checked session compatibility before Renderer publication. No fallible lookup follows.
+    void PublishRestoredObjectSelection(const FileBackedDemoScene& scene,
+        std::optional<SceneObjectMetadata> selection, std::string activeSceneName) noexcept;
+    // Future checked structural publication may explicitly rebind the same editing session.
+    // Unsupported creation continues using OnSceneActivated().
+    bool RebindSceneHistoryAfterStructureChange(const IDemoScene& scene);
+    // Call only after the candidate runtime is published. Persistent identity is
+    // resolved before rebinding selection; structural edits clear index history.
+    void PublishCreatedObjectSelection(const Scene& scene, SceneObjectMetadata metadata,
+        std::string activeSceneName) noexcept;
     struct SceneMaterialSavedRevision
     {
         MaterialSavedRevision saved;
@@ -138,9 +146,52 @@ public:
         SceneObjectMetadata selection;
 
         std::string reference;
+        std::optional<std::string> slotID;
+        std::optional<AssetID> slotMaterial;
     };
     std::optional<MaterialAssignmentRequest> TakeMaterialAssignmentRequest();
     void OnMaterialAssignmentCompleted(const SceneObjectMetadata& selection, bool succeeded, std::string message);
+
+    struct MeshCreationRequest
+    {
+        std::string meshReference;
+        std::string name;
+
+        Transform transform;
+
+        std::uint64_t runtimeIdentity = 0;
+    };
+    std::optional<MeshCreationRequest> TakeMeshCreationRequest();
+    void OnMeshCreationCompleted(bool succeeded, const std::string& error);
+
+    struct HistoryReplayIdentity
+    {
+        std::uint64_t operationID = 0;
+        std::uint64_t epoch = 0;
+        bool redo = false;
+        std::optional<std::string> selectionID;
+    };
+    struct HistoryReplayRequest
+    {
+        HistoryReplayIdentity identity;
+        SceneObjectDocument object;
+        size_t insertionIndex = 0;
+    };
+    std::uint64_t AllocateSceneHistoryOperationID() noexcept { return ++m_historyOperationSerial; }
+    bool HasPendingSceneHistoryOperation() const noexcept;
+    bool MatchesPendingHistoryReplay(const HistoryReplayIdentity& identity) const noexcept;
+    std::optional<HistoryReplayRequest> TakeSceneHistoryReplayRequest();
+    void InvalidateSceneHistoryRedoAfterEdit() noexcept;
+    bool StageObjectDeletionHistory(SceneObjectDocument object, size_t documentIndex,
+        std::optional<std::string> selectionBefore, std::optional<std::string> selectionAfter,
+        std::uint64_t operationID, std::uint64_t epoch, bool replay, std::string& error);
+    void CompleteObjectDeletionHistory(std::uint64_t operationID, std::uint64_t epoch,
+        bool succeeded, const std::string& error);
+    void CompleteSceneHistoryReplay(const HistoryReplayIdentity& identity, bool succeeded, const std::string& error);
+
+    std::optional<SceneObjectMetadata> TakeSceneObjectDeletionRequest();
+    void OnSceneObjectDeletionCompleted(const IDemoScene& scene, const SceneObjectMetadata& selection,
+        bool succeeded, const std::string& error);
 
     void SuspendViewportInteraction();
 
@@ -187,6 +238,32 @@ public:
     }
 
 private:
+    void DrawMeshDropTarget(const IDemoScene& scene, const ProjectPaths& paths,
+        const ProjectAssetRegistry& registry);
+    std::optional<MeshCreationRequest> m_meshCreationRequest;
+    std::string m_meshCreationStatus;
+
+    std::uint64_t m_meshDragRuntimeIdentity = 0;
+    int m_meshDropDeliveryFrame = -1;
+
+    void DrawSceneObjectDeletionControls(IDemoScene& scene);
+    void QueueSceneObjectDeletion(const IDemoScene& scene, const SceneObjectMetadata& selection);
+    bool SceneObjectDeletionMatches(const IDemoScene& scene, const SceneObjectMetadata& selection) const;
+    bool SceneObjectDeletionBlocked() const;
+    void CaptureViewportRightClick(const IDemoScene& scene);
+    void FinishViewportRightClick(const IDemoScene& scene);
+
+    std::optional<SceneObjectMetadata> m_viewportRightObject;
+    std::optional<SceneObjectMetadata> m_viewportContextObject;
+    std::optional<SceneObjectMetadata> m_sceneObjectDeletionRequest;
+    std::optional<SceneObjectMetadata> m_sceneObjectDeletionPending;
+    std::optional<SceneObjectMetadata> m_sceneObjectDeletionStatusObject;
+    std::string m_sceneObjectDeletionStatus;
+
+    bool m_viewportRightGesture = false;
+    bool m_viewportRightDragged = false;
+    bool m_openViewportContext = false;
+
     void DrawSceneViewport(
         std::uint64_t sceneTextureHandle,
         unsigned int sceneWidth,
@@ -230,6 +307,7 @@ private:
     std::optional<MaterialAssignmentRequest> m_materialAssignmentRequest;
 
     std::optional<SceneObjectMetadata> m_materialAssignmentSelection;
+    std::optional<std::string> m_materialAssignmentSlotID;
 
     bool m_materialAssignmentPending = false;
 
@@ -277,15 +355,82 @@ private:
     float m_cameraYaw = 0.0f;
     float m_cameraPitch = 0.0f;
 
-    struct TransformUndoEntry
+    struct PersistentHistoryTarget { std::string objectID; };
+    struct ProceduralHistoryTarget { size_t objectIndex = InvalidObjectSelection; };
+    using HistoryTarget = std::variant<PersistentHistoryTarget, ProceduralHistoryTarget>;
+    struct TransformEdit
     {
-        size_t objectIndex;
-
-        Transform previousTransform;
+        HistoryTarget target;
+        Transform before;
+        Transform after;
     };
+    struct SceneHistorySession
+    {
+        std::filesystem::path projectIdentity;
+        std::filesystem::path scenePath;
+        std::string sceneIdentity;
+        std::uint64_t epoch = 0;
+    };
+    struct ObjectDeletion
+    {
+        SceneObjectDocument object;
+        size_t documentIndex = 0;
+        std::optional<std::string> selectionBefore;
+        std::optional<std::string> selectionAfter;
+        SceneHistorySession session;
+    };
+    using SceneHistoryCommand = std::variant<TransformEdit, std::unique_ptr<ObjectDeletion>>;
+    struct SceneHistoryEntry
+    {
+        SceneHistoryCommand command;
+        std::uint64_t sessionEpoch = 0;
+        size_t payloadBytes = 0;
+    };
+    struct PendingHistoryReplay
+    {
+        HistoryReplayIdentity identity;
+        size_t cursor = 0;
+    };
+    struct StagedDeletionHistory
+    {
+        SceneHistoryEntry entry;
+        std::uint64_t operationID = 0;
+    };
+    std::optional<PendingHistoryReplay> m_pendingHistoryReplay;
+    std::optional<HistoryReplayRequest> m_historyReplayRequest;
+    std::optional<StagedDeletionHistory> m_stagedDeletionHistory;
+    std::uint64_t m_historyOperationSerial = 0;
+    void AppendSceneHistoryEntry(SceneHistoryEntry entry) noexcept;
+    static size_t ObjectDeletionPayloadBytes(const ObjectDeletion& deletion);
 
-    std::vector<TransformUndoEntry> m_transformUndoHistory;
-    std::vector<TransformUndoEntry> m_transformRedoHistory;
+    static constexpr size_t kSceneHistoryCapacity = 256;
+    static constexpr size_t kSceneHistoryPayloadBytes = 4 * 1024 * 1024;
+    std::vector<SceneHistoryEntry> m_sceneHistory;
+    std::optional<SceneHistorySession> m_historySession;
+    std::optional<HistoryTarget> m_gizmoHistoryTarget;
+    std::optional<HistoryTarget> m_fieldHistoryTarget;
+    std::string m_sceneHistoryStatus;
+
+    size_t m_historyCursor = 0;
+    size_t m_historyPayloadBytes = 0;
+    std::uint64_t m_historyEpoch = 0;
+    std::uint64_t m_historyRuntimeIdentity = 0;
+    std::uint64_t m_historyStructureRevision = 0;
+    std::uint64_t m_gizmoHistoryEpoch = 0;
+    std::uint64_t m_fieldHistoryEpoch = 0;
+    // Identity-only borrow outside command entries; never dereferenced after scene replacement.
+    const Scene* m_historyObservedScene = nullptr;
+
+    bool UpdateSceneHistorySession(const IDemoScene& scene, const ProjectPaths& paths, const std::string& name);
+    std::optional<HistoryTarget> CaptureHistoryTarget(const IDemoScene& scene, size_t index);
+    std::optional<size_t> ResolveHistoryTarget(const IDemoScene& scene, const HistoryTarget& target);
+    void RecordTransformEdit(HistoryTarget target, std::uint64_t epoch, const Transform& before, const Transform& after);
+    void TruncateHistoryRedo();
+    void ReplaySceneHistory(IDemoScene& scene, bool redo);
+    bool HistoryReplayBlocked() const;
+    void ReportSceneHistoryFailure(const std::string& error);
+    void ResetTransformGestures();
+    void ClearSceneHistory();
 
     bool m_gizmoWasUsing = false;
 
@@ -301,7 +446,7 @@ private:
     const Scene* m_transformFieldScene = nullptr;
     std::uint64_t m_transformFieldRevision = 0;
     void DrawSelectedObjectTransformControls(IDemoScene& demoScene);
-    void FinishTransformFieldEdit(Scene& scene);
+    void FinishTransformFieldEdit(IDemoScene& demoScene);
 
     void DrawTransformGizmo(
         IDemoScene& demoScene,
@@ -313,7 +458,6 @@ private:
         float viewportHeight);
     void HandleTransformUndo(IDemoScene& demoScene);
     void HandleTransformRedo(IDemoScene& demoScene);
-    void ClearTransformUndoHistory();
     void UpdateCameraLook(
         IDemoScene& demoScene,
         float viewportWidth,
