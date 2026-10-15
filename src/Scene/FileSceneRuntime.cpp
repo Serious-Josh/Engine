@@ -1,3 +1,4 @@
+#include "assets/CookedScene.h"
 #include "Scene/FileSceneRuntime.h"
 
 #include "Scene/SceneAssetResolver.h"
@@ -209,6 +210,8 @@ bool FileSceneRuntime::BuildHierarchySnapshot(
     }
 
     const auto& document = m_fileScene.GetDocument();
+    if(m_archiveScene && !SceneDocumentsEqual(document,m_archiveScene->metadata.document))
+        return fail("Immutable packaged scene metadata changed; reload the archive scene.");
     const auto& objects = m_scene.GetRenderObjects();
     const auto& mapping = m_objectMapping;
 
@@ -281,6 +284,8 @@ std::optional<SceneObjectMetadata> FileSceneRuntime::GetObjectMetadata(
     }
 
     const auto& document = m_fileScene.GetDocument();
+    if(m_archiveScene && !SceneDocumentsEqual(document,m_archiveScene->metadata.document))
+        return fail("Immutable packaged scene metadata changed; reload the archive scene.");
     const auto& objects = m_scene.GetRenderObjects();
     const auto& mapping = m_objectMapping;
 
@@ -949,6 +954,14 @@ bool FileSceneRuntime::Commit(std::string* errorMessage)
     return true;
 }
 
+bool FileSceneRuntime::LoadArchive(std::shared_ptr<const CookedScene::ArchiveScene> source, std::string* error)
+{
+    if(m_objectMapping.scene || m_materialAssignment || !source || !source->ValidateReferences(error))
+        return AssignmentError(error,"Archive load requires an inactive runtime and a validated source.");
+    if(!m_fileScene.LoadDocument(source->metadata.document,error)) return false;
+    DiscardPreparedScene(); m_objectMapping = {}; m_archiveScene = std::move(source); return true;
+}
+
 bool FileSceneRuntime::PrepareMetadata(FileSceneAssetCatalog& catalog, std::string* error)
 {
     if(m_materialAssignment || !m_fileScene.HasDocument())
@@ -1012,7 +1025,7 @@ bool FileSceneRuntime::New(
     std::string sceneID,
     std::string sceneName)
 {
-    if(m_materialAssignment)
+    if(m_materialAssignment || m_archiveScene)
     {
         return false;
     }
@@ -1038,6 +1051,7 @@ bool FileSceneRuntime::Open(
         return AssignmentError(errorMessage, "Finish/cancel/rollback the material assignment before scene lifecycle operations.");
     }
 
+    if(m_archiveScene) return AssignmentError(errorMessage,"Archive runtime cannot open a loose scene.");
     if (!m_fileScene.Open(path, errorMessage))
     {
         return false;
@@ -1048,8 +1062,9 @@ bool FileSceneRuntime::Open(
     return true;
 }
 
-SceneDocument& FileSceneRuntime::EditDocument() noexcept
+SceneDocument& FileSceneRuntime::EditDocument()
 {
+    if(m_archiveScene) throw std::logic_error("Packaged scenes are immutable.");
     DiscardPreparedScene();
     return m_fileScene.EditDocument();
 }
@@ -1063,6 +1078,7 @@ bool FileSceneRuntime::SaveAs(
     const std::filesystem::path& path,
     std::string* errorMessage)
 {
+    if(m_archiveScene) return AssignmentError(errorMessage,"Archive scenes are read-only; no loose scene save path.");
     if(m_materialAssignment)
     {
         return AssignmentError(errorMessage, "Finish/cancel/rollback the material assignment before scene lifecycle operations.");
@@ -1188,6 +1204,7 @@ std::unique_ptr<FileSceneRuntime> FileSceneRuntime::PrepareObjectCreation(
     }
 
     PreparedScene prepared;
+    prepared.environmentReference = document.environmentReference;
     prepared.camera = document.camera;
     prepared.directionalLight = document.directionalLight;
     prepared.objects.reserve(document.objects.size());
@@ -1267,6 +1284,7 @@ std::unique_ptr<FileSceneRuntime> FileSceneRuntime::PrepareObjectDeletion(
     }
 
     PreparedScene prepared;
+    prepared.environmentReference = document.environmentReference;
     prepared.camera = document.camera;
     prepared.directionalLight = document.directionalLight;
     prepared.objects.reserve(document.objects.size());
@@ -1361,6 +1379,7 @@ std::unique_ptr<FileSceneRuntime> FileSceneRuntime::PrepareObjectRestoration(Sce
     }
 
     PreparedScene prepared;
+    prepared.environmentReference = document.environmentReference;
     prepared.camera = document.camera;
     prepared.directionalLight = document.directionalLight;
     prepared.objects.reserve(document.objects.size());

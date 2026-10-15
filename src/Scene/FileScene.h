@@ -16,6 +16,8 @@ public:
         const std::filesystem::path& path,
         std::string* errorMessage = nullptr);
 
+    // In-memory source: no disk read and no fabricated path.
+    bool LoadDocument(SceneDocument document, std::string* errorMessage = nullptr);
     bool Save(std::string* errorMessage = nullptr);
 
     // Publishes the candidate in memory only after transactional disk replacement.

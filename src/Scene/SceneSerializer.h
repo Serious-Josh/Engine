@@ -26,3 +26,6 @@ CreateSceneDocumentResult CreateSceneDocument(
     const SceneDocument& document,
     const std::filesystem::path& path,
     std::string* errorMessage = nullptr);
+
+// Strict, bounded authoring input: rejects unknown elements instead of dropping them.
+bool LoadSceneDocumentForCooking(const std::filesystem::path& path, SceneDocument& document, size_t maxBytes, std::string* errorMessage = nullptr);

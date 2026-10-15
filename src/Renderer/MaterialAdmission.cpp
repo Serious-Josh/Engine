@@ -1,3 +1,4 @@
+#include "assets/CookedScene.h"
 #include "Renderer/Renderer.h"
 #include "Scene/FileSceneAssetCatalog.h"
 #include "Scene/FileSceneRuntime.h"
@@ -28,10 +29,12 @@ struct MaterialAdmissionState
     std::array<int, 7> slots{-1, -1, -1, -1, -1, -1, -1};
     std::chrono::steady_clock::time_point retryAfter{};
 
-    bool Matches(Renderer& renderer, FileSceneAssetCatalog& assets, const ProjectAssetRegistry& liveRegistry,
+    bool Matches(Renderer& renderer, FileSceneAssetCatalog& assets, const ProjectAssetRegistry* liveRegistry,
         FileSceneRuntime& runtime) const
     {
-        return catalog == &assets && registry == &liveRegistry && assets.m_registry == registry &&
+        const bool source = candidate->archive ? (assets.m_archiveScene && assets.m_archiveScene->provider == candidate->archive && !liveRegistry && !assets.m_registry) :
+            (registry == liveRegistry && assets.m_registry == registry);
+        return source && catalog == &assets &&
             assets.m_initialized && assets.m_catalogIdentity == catalogIdentity && assets.m_projectRoot == catalogRoot &&
             assets.m_device == renderer.GetDevice() && assets.m_descriptorHeap == &renderer.m_resourceDescriptorHeap &&
             renderer.HasPublishedMaterial(assets.m_defaultMaterial) &&
@@ -42,7 +45,8 @@ struct MaterialAdmissionState
     {
         if(!catalog->m_initialized || catalog->m_registry != registry || catalog->m_catalogIdentity != catalogIdentity)
             return false;
-        if(!Matches(renderer, *catalog, *registry, *runtime) || !candidate->HasPinnedSources()) return false;
+        if(!Matches(renderer, *catalog, registry, *runtime) || !candidate->HasPinnedSources()) return false;
+        if(candidate->archive) return true;
         const ProjectPaths paths(candidate->project);
         const auto valid = [&](const std::string& identity, AssetType type, const std::filesystem::path& path)
         {
@@ -141,7 +145,7 @@ struct MaterialAdmissionState
         return true;
     }
     Result Publish(Renderer& renderer, ProjectMaterialPreparationService& preparation, FileSceneAssetCatalog& assets,
-        const ProjectPaths& paths, const ProjectAssetRegistry& liveRegistry, FileSceneRuntime& runtime)
+        const ProjectPaths* paths, const ProjectAssetRegistry* liveRegistry, FileSceneRuntime& runtime)
     {
         if(!ReusedTexturesCurrent(assets))
             return {Status::Stale, nullptr, "Reusable texture ownership changed."};
@@ -218,7 +222,8 @@ struct MaterialAdmissionState
             (!reuseMaterial && (assets.m_projectMaterials.contains(key) || assets.m_materialSources.contains(key) ||
                 assets.m_materialBindingRevisions.contains(key))) ||
             assets.m_admittedMaterialDigests.contains(candidate->assetID) ||
-            !preparation.Validate(*candidate, paths, liveRegistry, runtime.GetRuntimeIdentity(), error))
+            !(candidate->archive ? preparation.ValidateArchive(*candidate,runtime.GetRuntimeIdentity(),error) :
+                (paths && liveRegistry && preparation.Validate(*candidate,*paths,*liveRegistry,runtime.GetRuntimeIdentity(),error))))
             return {Status::Stale, nullptr, "Final admission evidence changed: " + error};
         if(!renderer.m_materialDependencies.SetDesired(std::move(retained)))
             return Retry("Material texture retention capacity unavailable.");
@@ -272,8 +277,16 @@ void Renderer::ValidateMaterialAdmissionLifecycle()
 }
 
 MaterialAdmissionResult Renderer::AdvanceMaterialAdmission(ProjectMaterialPreparationService& preparation,
+    std::shared_ptr<const ProjectMaterialPreparationService::Candidate> candidate,FileSceneAssetCatalog& catalog,
+    const ProjectPaths& paths,const ProjectAssetRegistry& registry,FileSceneRuntime& runtime)
+{ return AdvanceMaterialAdmissionInternal(preparation,std::move(candidate),catalog,&paths,&registry,runtime); }
+MaterialAdmissionResult Renderer::AdvanceArchiveMaterialAdmission(ProjectMaterialPreparationService& preparation,
+    std::shared_ptr<const ProjectMaterialPreparationService::Candidate> candidate,FileSceneAssetCatalog& catalog,FileSceneRuntime& runtime)
+{ return AdvanceMaterialAdmissionInternal(preparation,std::move(candidate),catalog,nullptr,nullptr,runtime); }
+
+MaterialAdmissionResult Renderer::AdvanceMaterialAdmissionInternal(ProjectMaterialPreparationService& preparation,
     std::shared_ptr<const ProjectMaterialPreparationService::Candidate> candidate, FileSceneAssetCatalog& catalog,
-    const ProjectPaths& paths, const ProjectAssetRegistry& registry, FileSceneRuntime& runtime)
+    const ProjectPaths* paths, const ProjectAssetRegistry* registry, FileSceneRuntime& runtime)
 {
     using Status = MaterialAdmissionStatus;
     if(candidate && m_invalidatedMaterialCandidate.lock() == candidate)
@@ -283,7 +296,8 @@ MaterialAdmissionResult Renderer::AdvanceMaterialAdmission(ProjectMaterialPrepar
     try
     {
         std::string error;
-        if(!candidate || !preparation.Validate(*candidate, paths, registry, runtime.GetRuntimeIdentity(), error))
+        if(!candidate || !(candidate->archive ? preparation.ValidateArchive(*candidate,runtime.GetRuntimeIdentity(),error) :
+            (paths && registry && preparation.Validate(*candidate,*paths,*registry,runtime.GetRuntimeIdentity(),error))))
             return reject(Status::Stale, "Invalid admission candidate: " + error);
         if(!m_sceneResourceLifetime || m_sceneResourceScene != &runtime.GetScene())
             return reject(Status::Stale, "Admission renderer/scene is no longer current.");
@@ -295,13 +309,13 @@ MaterialAdmissionResult Renderer::AdvanceMaterialAdmission(ProjectMaterialPrepar
         if(!m_materialAdmission)
         {
             auto state = std::make_shared<MaterialAdmissionState>();
-            state->candidate = std::move(candidate); state->catalog = &catalog; state->registry = &registry;
+            state->candidate = std::move(candidate); state->catalog = &catalog; state->registry = registry;
             state->runtime = &runtime;
             state->table = m_sceneResourceLifetime; state->revision = m_materialPublication.revision;
             state->catalogIdentity = catalog.m_catalogIdentity; state->session = runtime.GetRuntimeIdentity();
             state->catalogRoot = catalog.m_projectRoot;
             if(!state->Matches(*this, catalog, registry, runtime) ||
-                std::filesystem::canonical(catalog.m_projectRoot) != state->candidate->project)
+                (!state->candidate->archive && std::filesystem::canonical(catalog.m_projectRoot) != state->candidate->project))
                 return reject(Status::Stale, "Admission catalog identity changed.");
             const auto key = FileSceneAssetCatalog::MaterialCacheKey{state->candidate->project, state->candidate->assetID};
             if(auto* existing = catalog.FindPublishedMaterial("asset:" + state->candidate->assetID, *this))

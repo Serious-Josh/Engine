@@ -26,6 +26,7 @@ namespace
             objects.push_back(object.renderObject);
         }
 
+        std::string environment=prepared.environmentReference;
         // ReplaceRenderObjects allocates dirty flags before swapping storage.
         // No throwing operations follow its commit point.
         scene.ReplaceRenderObjects(std::move(objects));
@@ -38,6 +39,7 @@ namespace
         camera.SetNearPlane(prepared.camera.nearPlane);
         camera.SetFarPlane(prepared.camera.farPlane);
         scene.GetDirectionalLight() = prepared.directionalLight;
+        scene.SetEnvironmentReference(std::move(environment));
 
         newMapping.structureRevision = scene.GetStructureRevision();
         newMapping.scene = &scene;
@@ -67,6 +69,7 @@ bool CommitPreparedScene(
     // This also protects against modifications made after PrepareScene().
     SceneDocument validation;
     validation.id = "prepared-scene-validation";
+    validation.environmentReference=prepared.environmentReference;
     validation.camera = prepared.camera;
     validation.directionalLight = prepared.directionalLight;
 
@@ -127,6 +130,7 @@ bool CommitPreparedEditorScene(const PreparedScene& prepared, const SceneDocumen
     }
 
     SceneDocument validation = document;
+    validation.environmentReference=prepared.environmentReference;
     validation.camera = prepared.camera;
     validation.directionalLight = prepared.directionalLight;
 

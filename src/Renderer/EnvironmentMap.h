@@ -5,6 +5,7 @@
 
 #include <filesystem>
 
+struct HDRImageData;
 class ResourceUploader;
 class DescriptorHeap;
 
@@ -17,6 +18,7 @@ class EnvironmentMap
       ResourceUploader& uploader,
       DescriptorHeap& descriptorHeap);
 
+    bool Initialize(ID3D12Device*, const HDRImageData&, ResourceUploader&, DescriptorHeap&);
     void Shutdown();
 
     Texture& GetSourceTexture();

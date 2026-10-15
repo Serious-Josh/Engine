@@ -418,6 +418,7 @@ bool CommandContext::Execute(unsigned int frameIndex)
 
 bool CommandContext::WaitForGPU()
 {
+    ++m_gpuDrainCount;
     if (!m_commandQueue || !m_fence || !m_fenceEvent)
     {
         Log::Error("Cannot wait for GPU: command context is not initialized.");

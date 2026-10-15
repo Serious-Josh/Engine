@@ -77,6 +77,7 @@ struct EnvironmentAsset
     std::string displayName;
 
     std::filesystem::path relativePath;
+    std::string reference;
 };
 
 struct RendererOptions
@@ -113,7 +114,7 @@ class Renderer
         void* windowHandle,
         unsigned int width,
         unsigned int height,
-        const std::filesystem::path& assetRoot);
+        const std::filesystem::path& assetRoot, std::span<const std::byte> packagedShaders = {}, const HDRImageData* environment = nullptr, std::string environmentIdentity = {});
     using FrameRenderResult = RendererDiagnostics::FrameRenderResult;
 
     enum class DisplacementCompletionStatus
@@ -279,7 +280,7 @@ class Renderer
     std::optional<RayTracingSceneResources::ReplacementCandidate> PrepareDXRMembershipCandidate(
         const FileSceneRuntime& runtime, FileSceneAssetCatalog& catalog,
         const std::vector<RayTracingSceneResources::ResidencyProposal>& proposals,
-        unsigned int frameSlot, std::string& error);
+        unsigned int frameSlot, std::string& error, const FileSceneRuntime* membershipSource = nullptr);
     RayTracingSceneResources::CandidateStatus PollDXRMembershipCandidate(
         const RayTracingSceneResources::ReplacementCandidate& candidate, const FileSceneRuntime& runtime,
         FileSceneAssetCatalog& catalog, std::string& error) const;
@@ -332,6 +333,8 @@ class Renderer
     }
 
     bool SetEnvironment(size_t index);
+    bool SetEnvironmentImage(const HDRImageData*, std::string identity, std::string displayName, std::string reference = {});
+    const std::string& GetEnvironmentIdentity() const noexcept { return m_environmentIdentity; }
 
     const RendererStatistics& GetStatistics() const;
 
@@ -369,6 +372,9 @@ class Renderer
         std::shared_ptr<const ProjectMaterialPreparationService::Candidate> candidate,
         FileSceneAssetCatalog& catalog, const ProjectPaths& paths, const ProjectAssetRegistry& registry,
         FileSceneRuntime& runtime);
+    MaterialAdmissionResult AdvanceArchiveMaterialAdmission(ProjectMaterialPreparationService& preparation,
+        std::shared_ptr<const ProjectMaterialPreparationService::Candidate> candidate,
+        FileSceneAssetCatalog& catalog, FileSceneRuntime& runtime);
     void CancelMaterialAdmission();
     static constexpr size_t MaterialAdmissionLimit = 4096;
     bool CanEditPendingMaterialBindings(const Scene& scene) const noexcept;
@@ -423,9 +429,16 @@ class Renderer
 
     private:
     friend class MeshResidencyPublication;
+    friend class SceneMembershipPublication;
+    friend class SceneDuplicationVerification;
+    friend class SceneMembershipVerification;
     friend class SceneMaterialBindingPublication;
     friend class SceneMaterialBindingVerification;
     friend class MaterialAdmissionVerification;
+    friend class ArchiveSurfaceAdmission;
+    MaterialAdmissionResult AdvanceMaterialAdmissionInternal(ProjectMaterialPreparationService&,
+        std::shared_ptr<const ProjectMaterialPreparationService::Candidate>, FileSceneAssetCatalog&,
+        const ProjectPaths*, const ProjectAssetRegistry*, FileSceneRuntime&);
     friend class ViewportMaterialDropVerification;
     static constexpr bool kEnableFrameHitchDiagnostics = true;
     static constexpr double kCpuHitchThresholdMilliseconds = 25.0;
@@ -1040,6 +1053,7 @@ class Renderer
     unsigned int m_displacementLODDescriptorIndices[kDisplacementLODFrameCount] = {UINT_MAX, UINT_MAX};
 
     EnvironmentMap m_environment;
+    std::string m_environmentIdentity;
 
     RenderTarget m_sceneColor;
     RenderTarget m_finalSceneColor;
@@ -1073,6 +1087,9 @@ class Renderer
 
     bool m_hasPreviousGILight = false;
 
+    bool m_packagedRuntime = false;
+    bool m_debugUIInitialized = false;
+    bool m_commandContextInitialized = false;
     std::filesystem::path m_assetRoot;
 
     std::vector<EnvironmentAsset> m_availableEnvironments;

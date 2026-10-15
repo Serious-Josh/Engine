@@ -14,6 +14,9 @@ struct RenderObject
     Mesh* mesh = nullptr;
 
     Material* material = nullptr;
+    // Packaged references retained in the document; no substitute GPU material.
+    // Deferred objects must remain mesh-pending until packaged material admission.
+    bool materialsDeferred = false;
 
     Transform transform;
     Transform previousTransform;

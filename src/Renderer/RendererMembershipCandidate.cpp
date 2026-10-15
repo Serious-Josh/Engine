@@ -7,11 +7,11 @@
 std::optional<RayTracingSceneResources::ReplacementCandidate> Renderer::PrepareDXRMembershipCandidate(
     const FileSceneRuntime& runtime, FileSceneAssetCatalog& catalog,
     const std::vector<RayTracingSceneResources::ResidencyProposal>& proposals,
-    unsigned int frameSlot, std::string& error)
+    unsigned int frameSlot, std::string& error, const FileSceneRuntime* membershipSource)
 {
     error.clear();
 
-    if (m_sceneResourceScene != &runtime.GetScene() || !m_sceneResourceLifetime ||
+    if (m_sceneResourceScene != &(membershipSource ? membershipSource->GetScene() : runtime.GetScene()) || !m_sceneResourceLifetime ||
         m_sceneInitializationAttempt.candidate || m_commandRecordingGeneration || m_resizeFailed ||
         m_geometryUpdateFailed || m_displacementExitScopeGeneration || HasUnresolvedDisplacementUpdate() ||
         runtime.HasPreparedScene() || runtime.HasMaterialAssignment() || frameSlot >= CommandContext::FrameCount)
@@ -33,7 +33,7 @@ std::optional<RayTracingSceneResources::ReplacementCandidate> Renderer::PrepareD
     try
     {
         auto candidate = m_rayTracingScene.PrepareReplacementCandidate(m_graphicsDevice.GetRayTracingDevice(),
-            m_resourceDescriptorHeap, runtime, catalog, proposals, m_materialPublication.desired.size(), error);
+            m_resourceDescriptorHeap, runtime, catalog, proposals, m_materialPublication.desired.size(), error, membershipSource);
 
         if (!candidate)
         {

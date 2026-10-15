@@ -7,6 +7,8 @@
 #include <filesystem>
 #include <string>
 #include <unordered_map>
+#include <span>
+#include <map>
 
 struct ShaderKey
 {
@@ -42,6 +44,9 @@ class ShaderLibrary
 
     bool Initialize(const std::filesystem::path& shaderRoot);
     void Shutdown();
+    bool InitializePackaged(std::span<const std::byte> payload);
+    // Offline authoring only. Compiles the explicit engine shader manifest.
+    static std::vector<std::byte> CookBootstrap(const std::filesystem::path& root);
 
     Shader* Load(const ShaderDescription& description);
 
@@ -50,6 +55,8 @@ class ShaderLibrary
         ShaderLibraryCompileResult& output);
 
     private:
+    bool m_packaged = false;
+    std::map<std::string, std::vector<char>> m_packagedBytecode;
     ShaderCompiler m_compiler;
 
     std::filesystem::path m_shaderRoot;

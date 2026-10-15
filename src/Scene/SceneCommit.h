@@ -28,7 +28,7 @@ inline bool MatchesCommittedSceneObjectBindings(const SceneObjectDocument& autho
     const RenderObject& runtime, const RenderObject& committed)
 {
     if(runtime.mesh != committed.mesh || runtime.material != committed.material ||
-        runtime.slotMaterials != committed.slotMaterials)
+        runtime.slotMaterials != committed.slotMaterials || runtime.materialsDeferred != committed.materialsDeferred)
     {
         return false;
     }

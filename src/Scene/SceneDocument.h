@@ -43,6 +43,8 @@ struct SceneDocument
 
     std::string id;
     std::string name = "Untitled Scene";
+    // Empty selects neutral; otherwise a canonical project texture asset reference.
+    std::string environmentReference;
 
     std::vector<SceneObjectDocument> objects;
 

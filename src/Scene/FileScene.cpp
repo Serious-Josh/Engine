@@ -61,6 +61,13 @@ bool FileScene::Open(
     return true;
 }
 
+bool FileScene::LoadDocument(SceneDocument document, std::string* error)
+{
+    if(!ValidateSceneDocument(document,error)) return false;
+    m_document = std::move(document); m_path.clear(); m_hasDocument = true; m_dirty = false;
+    return true;
+}
+
 bool FileScene::Save(std::string* errorMessage)
 {
     if (!m_hasDocument)

@@ -26,6 +26,7 @@ bool ApplySceneDocumentSettings(
     camera.SetFarPlane(document.camera.farPlane);
 
     scene.GetDirectionalLight() = document.directionalLight;
+    scene.SetEnvironmentReference(document.environmentReference);
 
     return true;
 }
@@ -68,6 +69,7 @@ bool CaptureSceneDocument(
     // Authored references and slot overrides survive absent resident geometry.
     // Capture updates transforms/settings only; residency is not serialized.
     SceneDocument candidate = source;
+    candidate.environmentReference=scene.GetEnvironmentReference();
     std::vector<bool> visited(objects.size(), false);
 
     for (auto& object : candidate.objects)
@@ -125,7 +127,7 @@ bool SceneDocumentsEqual(
     };
 
     if (left.schemaVersion != right.schemaVersion || left.id != right.id ||
-        left.name != right.name || left.objects.size() != right.objects.size())
+        left.name != right.name || left.environmentReference!=right.environmentReference || left.objects.size() != right.objects.size())
     {
         return false;
     }

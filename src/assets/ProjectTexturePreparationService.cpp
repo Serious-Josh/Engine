@@ -1,3 +1,4 @@
+#include "assets/CookedSurface.h"
 #include "assets/ProjectTexturePreparationService.h"
 
 #include "Renderer/Preview/MaterialThumbnailValidation.h"
@@ -181,9 +182,11 @@ public:
     std::filesystem::file_time_type modified;
     BY_HANDLE_FILE_INFORMATION file{};
     std::atomic<HANDLE> handle{INVALID_HANDLE_VALUE};
+    std::atomic_bool valid{true};
     ~TextureSourceEvidence() { Revoke(); }
     void Revoke() noexcept
     {
+        valid = false;
         const auto pinned = handle.exchange(INVALID_HANDLE_VALUE);
         if(pinned != INVALID_HANDLE_VALUE) CloseHandle(pinned);
     }
@@ -328,6 +331,27 @@ struct ProjectTexturePreparationService::State
 
             try
             {
+                if(job->identity.archive)
+                {
+                    const auto& identity = job->identity;
+                    const auto id = *AssetID::Parse(identity.assetID);
+                    const auto* entry = identity.archive->ArchiveEntry(id);
+                    if(!entry || entry->storedBytes > limits.archiveBytes || entry->storedBytes > limits.preparationBytes / 2)
+                        throw std::runtime_error("Archive texture exceeds worker reservation.");
+                    reservation = static_cast<size_t>(entry->storedBytes) * 2;
+                    const auto previous = bytes->fetch_add(reservation);
+                    if(previous > limits.retainedBytes - reservation)
+                    { bytes->fetch_sub(reservation); reservation = 0; throw std::runtime_error("Deferred: retained texture memory exhausted."); }
+                    auto raw = identity.archive->ReadEntry(id,EngineAssetPak::Type::Texture,CookedSurface::Version,limits.archiveBytes);
+                    auto image = std::make_unique<PreparedProjectTexture>(CookedSurface::DecodeTexture(raw,id,identity.contentGeneration,identity.interpretation));
+                    ++decodes;
+                    const auto retained = reservation; auto accounting = bytes; reservation = 0;
+                    prepared = std::shared_ptr<const PreparedProjectTexture>(image.release(),[accounting,retained](const PreparedProjectTexture* p){ delete p; accounting->fetch_sub(retained); });
+                    evidence = std::make_shared<TextureSourceEvidence>(); evidence->identity = identity; evidence->bytes = entry->storedBytes;
+                    completedIdentity = identity;
+                }
+                else
+                {
                 SourceLock source(job->identity.path);
                 auto identity = job->identity;
                 evidence = std::make_shared<TextureSourceEvidence>();
@@ -391,6 +415,7 @@ struct ProjectTexturePreparationService::State
 #ifdef ENGINE_TEXTURE_PREPARATION_TESTS
                 Observe(TestStage::Prepared);
 #endif
+                }
             }
             catch(const std::exception& exception)
             {
@@ -422,7 +447,9 @@ struct ProjectTexturePreparationService::State
                     {
                         std::erase_if(cache, [](const auto& cached) { return cached.prepared.expired(); });
                         if(cache.size() >= limits.requests) cache.pop_front();
-                        cache.push_back({job->identity, prepared});
+                        // Archive jobs deduplicate while active; avoid a weak-data
+                        // cache entry retaining the source archive after consumers close.
+                        if(!job->identity.archive) cache.push_back({job->identity, prepared});
                     }
                     catch(const std::bad_alloc&) {}
                 }
@@ -507,7 +534,8 @@ bool ProjectTexturePreparationService::IsCurrent(const Completion& completion) c
     return m_state->accepting && completion.generation == Generation() &&
         completion.current && completion.current->load() && token != m_state->tokens.end() &&
         token->second.current.lock() == completion.current && token->second.source.lock() == completion.source &&
-        completion.source && completion.source->handle.load() != INVALID_HANDLE_VALUE;
+        completion.source && completion.source->valid.load() &&
+        (completion.identity.archive || completion.source->handle.load() != INVALID_HANDLE_VALUE);
 }
 
 ProjectTexturePreparationService::Statistics ProjectTexturePreparationService::GetStatistics() const
@@ -567,6 +595,7 @@ bool ProjectTexturePreparationService::Request(const ProjectPaths& paths, const 
     const AssetID& asset, ProjectTextureInterpretation interpretation, Options options,
     std::uint64_t generation, std::uint64_t& ticket, std::string& error)
 {
+    if(m_archiveOnly) { ticket=0; error="Loose texture access rejected by packaged policy."; return false; }
     ticket = 0;
     error.clear();
     auto& state = *m_state;
@@ -593,6 +622,21 @@ bool ProjectTexturePreparationService::Request(const ProjectPaths& paths, const 
 
         Identity identity{std::filesystem::canonical(paths.GetRoot()), resolved.resolvedPath,
             asset.ToString(), {}, interpretation, options};
+        return RequestIdentity(std::move(identity),generation,ticket,error);
+    }
+    catch(const std::exception& exception)
+    {
+        error = exception.what();
+        ticket = 0;
+        return false;
+    }
+}
+
+bool ProjectTexturePreparationService::RequestIdentity(Identity identity,std::uint64_t generation,std::uint64_t& ticket,std::string& error)
+{
+    auto& state = *m_state;
+    try
+    {
         std::lock_guard lock(state.mutex);
 
         state.PruneTokens();
@@ -609,9 +653,10 @@ bool ProjectTexturePreparationService::Request(const ProjectPaths& paths, const 
             const auto& existingIdentity = subscriber.job->identity;
             if(existingIdentity.project == identity.project && existingIdentity.path == identity.path &&
                 existingIdentity.assetID == identity.assetID && existingIdentity.interpretation == identity.interpretation &&
-                existingIdentity.options == identity.options && (!subscriber.job->done ||
+                existingIdentity.options == identity.options && existingIdentity.archive == identity.archive &&
+                existingIdentity.contentGeneration == identity.contentGeneration && (!subscriber.job->done ||
                     (subscriber.job->prepared && subscriber.job->source &&
-                        subscriber.job->source->MatchesPath(identity.path))))
+                        (identity.archive ? subscriber.job->source->valid.load() : subscriber.job->source->MatchesPath(identity.path)))))
             {
                 job = subscriber.job;
                 ++state.deduplicated;
@@ -639,16 +684,31 @@ bool ProjectTexturePreparationService::Request(const ProjectPaths& paths, const 
         state.wake.notify_one();
         return true;
     }
-    catch(const std::exception& exception)
-    {
-        error = exception.what();
-        ticket = 0;
-        return false;
-    }
+    catch(const std::exception& e) { ticket=0; error=e.what(); return false; }
 }
+bool ProjectTexturePreparationService::RequestArchive(std::shared_ptr<const CookedMeshSource::ArchiveProvider> archive,const AssetID& id,
+    ProjectTextureInterpretation interpretation,std::uint64_t generation,std::uint64_t& ticket,std::string& error)
+{
+    ticket=0;
+    try
+    {
+        const auto* entry = archive ? archive->ArchiveEntry(id) : nullptr;
+        if(!m_state->accepting || generation!=Generation() || !entry || entry->type!=EngineAssetPak::Type::Texture || entry->payloadVersion!=CookedSurface::Version ||
+            entry->storedBytes>m_state->limits.archiveBytes || interpretation<ProjectTextureInterpretation::SRGBColor || interpretation>ProjectTextureInterpretation::NormalMap)
+            throw std::runtime_error("Missing/unsupported archive texture or stale request generation.");
+        Identity identity; identity.assetID=id.ToString(); identity.digest=CookedSurface::Identity(*archive,id);
+        identity.interpretation=interpretation; identity.contentGeneration=entry->generation; identity.archive=std::move(archive);
+        return RequestIdentity(std::move(identity),generation,ticket,error);
+    }
+    catch(const std::exception& e) { error=e.what(); return false; }
+}
+std::optional<ProjectTexturePreparationService::Completion> ProjectTexturePreparationService::Poll(std::uint64_t ticket,const ProjectPaths& paths,const ProjectAssetRegistry& registry)
+{ return PollInternal(ticket,&paths,&registry); }
+std::optional<ProjectTexturePreparationService::Completion> ProjectTexturePreparationService::PollArchive(std::uint64_t ticket)
+{ return PollInternal(ticket,nullptr,nullptr); }
 
-std::optional<ProjectTexturePreparationService::Completion> ProjectTexturePreparationService::Poll(
-    std::uint64_t ticket, const ProjectPaths& paths, const ProjectAssetRegistry& registry)
+std::optional<ProjectTexturePreparationService::Completion> ProjectTexturePreparationService::PollInternal(
+    std::uint64_t ticket, const ProjectPaths* paths, const ProjectAssetRegistry* registry)
 {
     Completion completion;
 
@@ -674,7 +734,8 @@ std::optional<ProjectTexturePreparationService::Completion> ProjectTexturePrepar
 
     m_state->wake.notify_one();
 
-    if(completion.prepared && !ValidateSource(completion, paths, registry, completion.error))
+    if(completion.prepared && !(completion.identity.archive ? ValidateArchive(completion,completion.error) :
+        (paths && registry && ValidateSource(completion,*paths,*registry,completion.error))))
     {
         completion.prepared.reset();
         Cancel(ticket);
@@ -713,3 +774,19 @@ bool ProjectTexturePreparationService::ValidateSource(const Completion& completi
     }
     return true;
 }
+
+bool ProjectTexturePreparationService::ValidateArchive(const Completion& c,std::string& error) const
+{
+    try
+    {
+        const auto id=AssetID::Parse(c.identity.assetID);
+        if(!id || !IsCurrent(c) || !c.identity.archive || !c.identity.path.empty() || !c.identity.project.empty() ||
+            c.source->identity!=c.identity || !CookedSurface::Matches(*c.identity.archive,*id,EngineAssetPak::Type::Texture,c.identity.contentGeneration,c.identity.digest))
+            throw std::runtime_error("Archive texture snapshot/generation/ownership is stale.");
+        return true;
+    }
+    catch(const std::exception& e) { error=e.what(); return false; }
+}
+
+size_t ProjectTexturePreparationService::EstimateForCooking(const std::filesystem::path& path)
+{ return PreparationBytes(path,Limits{}.sourceBytes,Limits{}.preparationBytes); }

@@ -1,3 +1,4 @@
+#include "assets/DevelopmentCookedMeshProvider.h"
 #include "Engine/Engine.h"
 
 #ifndef NDEBUG
@@ -12,7 +13,8 @@
 #include <wrl/client.h>
 #include <vector>
 
-bool Engine::VerifyCookedMeshGPUPreparation(const std::filesystem::path& scenePath)
+bool Engine::VerifyCookedMeshGPUPreparation(const std::filesystem::path& scenePath,
+    std::shared_ptr<const CookedMeshSource::Provider> source)
 {
     using Status = ProjectMeshPreparationService::Status;
     const auto reject = [](const std::string& error)
@@ -38,19 +40,24 @@ bool Engine::VerifyCookedMeshGPUPreparation(const std::filesystem::path& scenePa
     // This synchronous diagnostic never runs Update or the automatic scheduler.
     m_automaticMeshResidency = {};
     m_automaticResidencyIntent = 0;
-    const auto opened = DevelopmentCookedMesh::Provider::Open(scene->GetProjectRoot(), {});
-    if(!opened.provider) { return reject(std::string(opened.message)); }
+    auto provider = source;
+    if(!provider)
+    {
+        const auto opened = DevelopmentCookedMesh::Provider::Open(scene->GetProjectRoot(), {});
+        if(!opened.provider) { return reject(std::string(opened.message)); }
+        provider = opened.provider;
+    }
 
     size_t verified = 0;
     for(const auto& record : m_projectAssetRegistry.GetAssets())
     {
         if(record.type != AssetType::Mesh) { continue; }
-        const auto lookup = opened.provider->Lookup(record.id);
+        const auto lookup = provider->Lookup(record.id);
         if(lookup.status == DevelopmentCookedMesh::Status::Missing) { continue; }
         if(lookup.status != DevelopmentCookedMesh::Status::Success) { return reject(std::string(lookup.message)); }
 
         const auto request = m_meshPreparation.RequestCooked(
-            {opened.provider, record.id, m_meshPreparation.Generation()}, m_meshCPUCache);
+            {provider, record.id, m_meshPreparation.Generation()}, m_meshCPUCache);
         if(request.status != Status::Accepted) { return reject(request.error); }
 
         auto completion = m_meshPreparation.PollCooked(request.ticket);
@@ -113,10 +120,11 @@ bool Engine::VerifyCookedMeshGPUPreparation(const std::filesystem::path& scenePa
     return true;
 }
 
-bool Engine::VerifyCookedMeshPublication(const std::filesystem::path& scenePath, bool visualReview)
+bool Engine::VerifyCookedMeshPublication(const std::filesystem::path& scenePath, bool visualReview,
+    std::shared_ptr<const CookedMeshSource::Provider> source)
 {
     // Repeat the preparation prerequisite in this process before opening any gate.
-    if(!VerifyCookedMeshGPUPreparation(scenePath)) { return false; }
+    if(!VerifyCookedMeshGPUPreparation(scenePath, source)) { return false; }
 
     const auto reject = [&](const std::string& error)
     {
@@ -124,7 +132,7 @@ bool Engine::VerifyCookedMeshPublication(const std::filesystem::path& scenePath,
         CancelMeshResidencyAcceptance();
         if(auto* active = dynamic_cast<FileBackedDemoScene*>(m_demoSceneManager.TryGetActiveScene()))
         {
-            active->m_runtime->m_cookedDiagnosticPublication = false;
+            active->m_runtime->m_cookedPublicationAuthorized = false;
         }
         return false;
     };
@@ -138,9 +146,14 @@ bool Engine::VerifyCookedMeshPublication(const std::filesystem::path& scenePath,
 
     m_automaticMeshResidency = {};
     m_automaticResidencyIntent = 0;
-    scene->m_runtime->m_cookedDiagnosticPublication = true;
-    const auto opened = DevelopmentCookedMesh::Provider::Open(scene->GetProjectRoot(), {});
-    if(!opened.provider) { return reject(std::string(opened.message)); }
+    scene->m_runtime->m_cookedPublicationAuthorized = true;
+    auto provider = source;
+    if(!provider)
+    {
+        const auto opened = DevelopmentCookedMesh::Provider::Open(scene->GetProjectRoot(), {});
+        if(!opened.provider) { return reject(std::string(opened.message)); }
+        provider = opened.provider;
+    }
 
     std::optional<SceneObjectMetadata> selection;
     const auto& objects = scene->GetScene().GetRenderObjects();
@@ -149,7 +162,7 @@ bool Engine::VerifyCookedMeshPublication(const std::filesystem::path& scenePath,
         auto metadata = scene->GetObjectMetadata(index, &error);
         const auto id = metadata ? AssetID::ParseReference(metadata->meshReference) : std::nullopt;
         if(id && metadata->GetMeshResidency(objects[index]) == SceneMeshResidency::Pending &&
-            opened.provider->Lookup(*id).status == DevelopmentCookedMesh::Status::Success)
+            provider->Lookup(*id).status == DevelopmentCookedMesh::Status::Success)
         {
             selection = std::move(metadata);
             break;
@@ -161,7 +174,7 @@ bool Engine::VerifyCookedMeshPublication(const std::filesystem::path& scenePath,
     {
         const auto id = AssetID::ParseReference(selection->meshReference);
         const auto cpu = m_meshPreparation.RequestCooked(
-            {opened.provider, *id, m_meshPreparation.Generation()}, m_meshCPUCache);
+            {provider, *id, m_meshPreparation.Generation()}, m_meshCPUCache);
         if(cpu.status != ProjectMeshPreparationService::Status::Accepted) { error = cpu.error; return false; }
 
         m_residencyRequestSelection = *selection;
@@ -213,7 +226,7 @@ bool Engine::VerifyCookedMeshPublication(const std::filesystem::path& scenePath,
 
     const auto resident = scene->GetObjectMetadata(selection->objectID, &error);
     const auto& object = scene->GetScene().GetRenderObjects()[selection->runtimeIndex];
-    const auto cookedMetadata = opened.provider->ReadMetadata(*AssetID::ParseReference(selection->meshReference));
+    const auto cookedMetadata = provider->ReadMetadata(*AssetID::ParseReference(selection->meshReference));
     if(!resident || resident->GetMeshResidency(object) != SceneMeshResidency::Resident ||
         resident->materialReference != selection->materialReference || resident->materialSlotBindings != selection->materialSlotBindings ||
         !object.mesh || !cookedMetadata.metadata || object.mesh->GetMetadata() != cookedMetadata.metadata->metadata)
@@ -268,6 +281,6 @@ bool Engine::VerifyCookedMeshPublication(const std::filesystem::path& scenePath,
     Log::Info("Cooked live publication verified: " + selection->meshReference +
         "; BLAS/membership adoption, authored slots, " + std::to_string(submittedFrames) +
         " submitted frames, cancellation, scene switch and D3D12 validation passed.");
-    return visualReview || VerifyCookedMeshLifecycle(scenePath);
+    return visualReview || bool(source) || VerifyCookedMeshLifecycle(scenePath);
 }
 #endif

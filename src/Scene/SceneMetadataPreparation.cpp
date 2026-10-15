@@ -1,3 +1,4 @@
+#include "assets/CookedScene.h"
 #include "Scene/PreparedScene.h"
 #include "Scene/SceneCommit.h"
 #include "Scene/SceneDocumentAdapter.h"
@@ -26,6 +27,11 @@ namespace
 
 bool FileSceneAssetCatalog::ValidateMetadataMeshReference(std::string_view reference, std::string* error) const
 {
+    if(m_archiveScene)
+    {
+        if(reference.empty()) return m_initialized && m_archiveScene->ValidateReferences(error);
+        return ValidateArchiveMesh(reference,nullptr,nullptr,error);
+    }
     if(!m_initialized || !m_registry)
     {
         return Fail(error, "Metadata mesh validation requires an initialized catalog.");
@@ -72,6 +78,11 @@ bool FileSceneAssetCatalog::ValidateMetadataMeshReference(std::string_view refer
 
 bool FileSceneAssetCatalog::ValidateMetadataMaterialReference(std::string_view reference, std::string* error) const
 {
+    if(m_archiveScene)
+    {
+        const auto id = AssetID::ParseReference(reference);
+        return m_initialized && (reference.empty() || reference == "builtin:default" || (id && id->ToReference() == reference));
+    }
     if(!m_initialized || !m_registry)
     {
         return Fail(error, "Metadata material validation requires an initialized project catalog.");
@@ -195,6 +206,23 @@ bool PrepareSceneMetadata(const SceneDocument& document, FileSceneAssetCatalog& 
             return false;
         }
 
+        const bool deferred = catalog.IsArchiveActivation() &&
+            (AssetID::ParseReference(reference).has_value() || !authored.materialSlotBindings.empty());
+        if(deferred)
+        {
+            ResolvedSceneObject object;
+            object.id = authored.id; object.name = authored.name; object.meshBindingEmpty = authored.meshReference.empty();
+            object.renderObject.materialsDeferred = true;
+            object.renderObject.transform = authored.transform; object.renderObject.previousTransform = authored.transform;
+            for(const auto& [slot, ref] : authored.materialSlotBindings)
+            {
+                if(!catalog.ValidateMetadataMaterialReference(ref,error)) return false;
+                object.renderObject.slotMaterials.emplace(slot,nullptr);
+            }
+            candidate.objects.push_back(std::move(object));
+            continue;
+        }
+
         Material* material = catalog.ResolveMetadataMaterial(reference);
 
         if(!material || !catalog.OwnsMaterial(*material))
@@ -272,7 +300,8 @@ bool CommitPreparedMetadataScene(const PreparedMetadataScene& prepared, Scene& s
         const auto& object = prepared.objects[index];
         const auto& runtime = object.renderObject;
 
-        if(object.id != authored.id || object.name != authored.name || runtime.mesh || !runtime.material ||
+        if(object.id != authored.id || object.name != authored.name || runtime.mesh || (!runtime.material && !runtime.materialsDeferred) ||
+            (runtime.materialsDeferred && runtime.material) ||
             object.meshBindingEmpty != authored.meshReference.empty() ||
             !MatchesCommittedSceneObjectBindings(authored, runtime, runtime))
         {
@@ -288,7 +317,7 @@ bool CommitPreparedMetadataScene(const PreparedMetadataScene& prepared, Scene& s
         {
             const auto retained = runtime.slotMaterials.find(slot);
 
-            if(retained == runtime.slotMaterials.end() || !retained->second)
+            if(retained == runtime.slotMaterials.end() || (runtime.materialsDeferred ? retained->second != nullptr : retained->second == nullptr))
             {
                 return Fail(error, "Prepared metadata has an unresolved slot override: " + slot);
             }
@@ -306,6 +335,7 @@ bool CommitPreparedMetadataScene(const PreparedMetadataScene& prepared, Scene& s
         return Fail(error, "Prepared metadata transforms differ from the authored document.");
     }
 
+    std::string environment=prepared.document.environmentReference;
     // ReplaceRenderObjects allocates all dirty flags before touching scene storage.
     // Everything following its commit point is assignment/swap of prepared state.
     scene.ReplaceRenderObjects(std::move(objects));
@@ -319,6 +349,7 @@ bool CommitPreparedMetadataScene(const PreparedMetadataScene& prepared, Scene& s
     camera.SetNearPlane(source.nearPlane);
     camera.SetFarPlane(source.farPlane);
     scene.GetDirectionalLight() = prepared.document.directionalLight;
+    scene.SetEnvironmentReference(std::move(environment));
 
     newMapping.structureRevision = scene.GetStructureRevision();
     newMapping.scene = &scene;

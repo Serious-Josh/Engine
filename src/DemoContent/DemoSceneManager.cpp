@@ -1,3 +1,4 @@
+#include "assets/CookedScene.h"
 #include "DemoSceneManager.h"
 
 #include "DemoContent/SphereGridScene.h"
@@ -18,7 +19,7 @@ void DemoSceneManager::ConfigureProjectAssets(IDemoScene& scene) const
 {
     auto* fileScene = dynamic_cast<FileBackedDemoScene*>(&scene);
 
-    if(fileScene && m_registry)
+    if(fileScene && !fileScene->IsArchiveActivation() && m_registry)
     {
         fileScene->SetProjectAssets(m_projectRoot, *m_registry);
         fileScene->SetTextureStreamingEnabled(m_textureStreamingEnabled);
@@ -90,7 +91,7 @@ void DemoSceneManager::Shutdown()
 
 bool DemoSceneManager::RequestScene(std::string_view sceneName)
 {
-    if (m_hasPendingSceneChange || !m_requestedFilePath.empty())
+    if (m_hasPendingSceneChange || HasPendingFileSceneRequest())
     {
         Log::Error("A scene change request is already pending.");
         return false;
@@ -134,7 +135,7 @@ bool DemoSceneManager::RequestScene(std::string_view sceneName)
 
 bool DemoSceneManager::HasPendingSceneChange() const
 {
-    return m_hasPendingSceneChange || !m_requestedFilePath.empty();
+    return m_hasPendingSceneChange || HasPendingFileSceneRequest();
 }
 
 bool DemoSceneManager::ApplyPendingSceneChange(
@@ -146,7 +147,7 @@ bool DemoSceneManager::ApplyPendingSceneChange(
 {
     // File candidates require the explicit staging/commit boundary. The existing
     // registry switching sequence must never consume a file request implicitly.
-    if (!m_requestedFilePath.empty())
+    if (HasPendingFileSceneRequest())
     {
         Log::Error("File scene activation requires explicit candidate commit.");
         return false;
@@ -275,7 +276,7 @@ bool DemoSceneManager::RequestFileScene(
     const std::filesystem::path& path,
     std::string* errorMessage)
 {
-    if (m_hasPendingSceneChange || !m_requestedFilePath.empty())
+    if (m_hasPendingSceneChange || HasPendingFileSceneRequest())
     {
         return FailFileRequest(errorMessage, "A scene change request is already pending.");
     }
@@ -305,6 +306,14 @@ bool DemoSceneManager::RequestFileScene(
     return true;
 }
 
+bool DemoSceneManager::RequestArchiveScene(std::shared_ptr<const CookedScene::ArchiveScene> source, std::string* error)
+{
+    if(m_hasPendingSceneChange || HasPendingFileSceneRequest() || m_stagedFileScene || !source || !source->ValidateReferences(error))
+        return FailFileRequest(error,"Archive activation requires a validated source and no pending scene switch.");
+    m_requestedArchive = std::move(source); m_requestedMetadataOnly = true; m_requestedSceneEntry = nullptr;
+    return true;
+}
+
 bool DemoSceneManager::RequestMetadataOnlyFileScene(const std::filesystem::path& path, std::string* errorMessage)
 {
     return RequestFileScene(path, errorMessage);
@@ -331,7 +340,7 @@ bool DemoSceneManager::StageRequestedFileScene(
     const Shader* pixelShader,
     std::string* errorMessage)
 {
-    if (m_requestedFilePath.empty() || m_hasPendingSceneChange || m_stagedFileScene)
+    if (!HasPendingFileSceneRequest() || m_hasPendingSceneChange || m_stagedFileScene)
     {
         return FailFileRequest(errorMessage, "An unstaged file scene request is required.");
     }
@@ -340,7 +349,7 @@ bool DemoSceneManager::StageRequestedFileScene(
 
     try
     {
-        candidate = std::make_unique<FileBackedDemoScene>(m_requestedFilePath);
+        candidate = m_requestedArchive ? std::make_unique<FileBackedDemoScene>(m_requestedArchive) : std::make_unique<FileBackedDemoScene>(m_requestedFilePath);
 
         ConfigureProjectAssets(*candidate);
 
@@ -408,7 +417,7 @@ const std::filesystem::path& DemoSceneManager::GetRequestedFileScenePath() const
 
 bool DemoSceneManager::CommitStagedFileScene(std::string* errorMessage)
 {
-    if (!m_stagedFileScene || m_requestedFilePath.empty() || m_hasPendingSceneChange)
+    if (!m_stagedFileScene || !HasPendingFileSceneRequest() || m_hasPendingSceneChange)
     {
         return FailFileRequest(errorMessage, "No staged file scene is available to commit.");
     }
@@ -423,6 +432,7 @@ bool DemoSceneManager::CommitStagedFileScene(std::string* errorMessage)
     m_activeSceneEntry = m_requestedSceneEntry;
     m_requestedSceneEntry = nullptr;
     m_requestedFilePath.clear();
+    m_requestedArchive.reset();
     m_requestedMetadataOnly = false;
 
     if (errorMessage)
@@ -443,5 +453,15 @@ void DemoSceneManager::CancelFileSceneRequest()
 
     m_stagedFileName.clear();
     m_requestedFilePath.clear();
+    m_requestedArchive.reset();
     m_requestedMetadataOnly = false;
+}
+
+bool DemoSceneManager::InitializeArchive(std::shared_ptr<const CookedScene::ArchiveScene> source, ID3D12Device* device,
+    ResourceUploader& uploader, DescriptorHeap& heap, const Shader* vertex, const Shader* pixel, float aspect)
+{
+    m_aspectRatio=aspect; m_registry=nullptr; m_projectRoot.clear(); m_hasPendingSceneChange=false;
+    m_activeScene=std::make_unique<FileBackedDemoScene>(std::move(source));
+    if(!m_activeScene->Initialize(device,uploader,heap,vertex,pixel)) return false;
+    m_activeScene->SetAspectRatio(aspect); return true;
 }

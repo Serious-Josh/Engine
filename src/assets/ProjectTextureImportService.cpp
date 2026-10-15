@@ -38,6 +38,11 @@ namespace
 
     bool Decode(const std::filesystem::path& path, const std::string& extension)
     {
+        if(extension == ".hdr")
+        {
+            if(std::filesystem::file_size(path)>64*1024*1024) return false;
+            HDRImageData image; return ImageLoader::LoadHDR(path,image);
+        }
         if(extension == ".dds")
         {
             DirectX::ScratchImage image;
@@ -56,12 +61,6 @@ namespace
             }
 
             return true;
-        }
-
-        if(extension == ".hdr")
-        {
-            HDRImageData image;
-            return ImageLoader::LoadHDR(path, image);
         }
 
         ImageData image;
@@ -92,7 +91,7 @@ bool ProjectTextureImportService::Import(
     {
         if(SupportedAssetImportFormats::Lookup(source) != AssetType::Texture)
         {
-            error = "Unsupported texture import format. Use .dds.";
+            error = "Unsupported texture import format. Use .dds or .hdr.";
             return false;
         }
 
@@ -181,9 +180,9 @@ bool ProjectTextureImportService::Import(
         // The source is still locked against writes/deletion. Decode these same
         // bytes through the existing file-based loaders, whose read-only sharing
         // is incompatible with a writable staging handle.
-        if(!Decode(sourcePath, ".dds"))
+        if(!Decode(sourcePath, _wcsicmp(sourcePath.extension().c_str(),L".hdr")==0 ? ".hdr" : ".dds"))
         {
-            throw std::runtime_error("Invalid image data or unsupported DDS layout/format.");
+            throw std::runtime_error("Invalid image data or unsupported texture/environment layout.");
         }
 
         CloseHandle(input);

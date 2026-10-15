@@ -7,6 +7,7 @@
 class SceneHierarchyPanel
 {
 public:
+    bool IsFocused() const noexcept { return m_focused; }
     void BeginRename(const std::string& objectID, const std::string& name);
     void CancelRename();
     bool IsRenaming() const
@@ -37,4 +38,5 @@ private:
     std::optional<std::string> m_contextRequest;
     std::optional<HierarchyReorderRequest> m_reorderRequest;
     bool m_focusRename = false;
+    bool m_focused = false;
 };

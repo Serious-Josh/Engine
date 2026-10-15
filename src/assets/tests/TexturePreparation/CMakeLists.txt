@@ -5,6 +5,13 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 get_filename_component(ENGINE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../../.." ABSOLUTE)
 add_executable(TexturePreparationTests TexturePreparationTests.cpp
     ${ENGINE_ROOT}/src/assets/ProjectTexturePreparationService.cpp
+    ${ENGINE_ROOT}/src/assets/CookedSurface.cpp
+    ${ENGINE_ROOT}/src/assets/CookedEnvironment.cpp
+    ${ENGINE_ROOT}/src/assets/CookedMesh.cpp
+    ${ENGINE_ROOT}/src/assets/CookedMeshProvider.cpp
+    ${ENGINE_ROOT}/src/assets/ArchiveCookedMeshProvider.cpp
+    ${ENGINE_ROOT}/src/assets/EngineAssetPak.cpp
+    ${ENGINE_ROOT}/src/Scene/SceneDocument.cpp
     ${ENGINE_ROOT}/src/assets/AssetID.cpp
     ${ENGINE_ROOT}/src/assets/AssetRecord.cpp
     ${ENGINE_ROOT}/src/assets/ProjectAssetRegistry.cpp

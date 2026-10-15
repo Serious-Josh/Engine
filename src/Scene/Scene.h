@@ -9,6 +9,7 @@
 #include <vector>
 #include <array>
 #include <span>
+#include <string>
 
 using RenderObjectID = std::size_t;
 
@@ -22,6 +23,8 @@ class Scene
 {
     public:
     Scene() = default;
+    const std::string& GetEnvironmentReference() const noexcept { return m_environmentReference; }
+    void SetEnvironmentReference(std::string value) { m_environmentReference=std::move(value); }
 
     Scene(const Scene&) = delete;
     Scene& operator=(const Scene&) = delete;
@@ -70,6 +73,7 @@ class Scene
     }
 
     private:
+    std::string m_environmentReference;
     std::vector<RenderObject> m_renderObjects;
 
     std::vector<RenderObjectID> m_changedTransforms;

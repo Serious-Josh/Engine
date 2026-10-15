@@ -1,3 +1,4 @@
+#include "assets/DevelopmentCookedMeshProvider.h"
 #include "assets/ProjectMeshPreparationService.h"
 #include "assets/AssetRegistrySerializer.h"
 #include "assets/MeshCookValidation.h"

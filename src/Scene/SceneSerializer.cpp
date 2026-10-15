@@ -4,6 +4,7 @@
 
 #include <Windows.h>
 
+#include <algorithm>
 #include <filesystem>
 #include <system_error>
 #include <fstream>
@@ -84,6 +85,7 @@ namespace
             {"schemaVersion", document.schemaVersion},
             {"id", document.id},
             {"name", document.name},
+            {"environmentReference",document.environmentReference},
             {"objects", std::move(objects)},
             {"camera", {
                 {"position", ToJson(camera.position)},
@@ -110,6 +112,7 @@ namespace
         result.schemaVersion = value.at("schemaVersion").get<std::uint32_t>();
         result.id = value.at("id").get<std::string>();
         result.name = value.at("name").get<std::string>();
+        result.environmentReference=value.value("environmentReference",std::string{});
 
         const Json& camera = value.at("camera");
         result.camera.position = ReadVector3(camera.at("position"));
@@ -371,4 +374,39 @@ bool LoadSceneDocument(
     {
         return Fail(errorMessage, exception.what());
     }
+}
+
+bool LoadSceneDocumentForCooking(const std::filesystem::path& path, SceneDocument& document, size_t maxBytes, std::string* error)
+{
+    try
+    {
+        const auto size = std::filesystem::file_size(path);
+        if(size > maxBytes || size > SIZE_MAX) throw std::runtime_error("Loose scene exceeds cooker admission.");
+        std::ifstream stream(path,std::ios::binary);
+        std::string bytes(static_cast<size_t>(size),'\0');
+        if(!stream.read(bytes.data(),static_cast<std::streamsize>(bytes.size())) || stream.peek()!=std::char_traits<char>::eof())
+            throw std::runtime_error("Cannot read stable bounded cooker input.");
+        const auto json = Json::parse(bytes);
+        const auto keys = [](const Json& value, std::initializer_list<std::string_view> allowed)
+        {
+            if(!value.is_object()) throw std::runtime_error("Expected scene object fields.");
+            for(auto i=value.begin();i!=value.end();++i)
+                if(std::find(allowed.begin(),allowed.end(),i.key())==allowed.end())
+                    throw std::runtime_error("Unsupported scene element: " + i.key());
+        };
+        keys(json,{"schemaVersion","id","name","camera","directionalLight","objects","environmentReference"});
+        keys(json.at("camera"),{"position","target","verticalFov","aspectRatio","nearPlane","farPlane"});
+        keys(json.at("directionalLight"),{"direction","color","intensity","ambientStrength","angularRadius"});
+        for(const auto& object:json.at("objects"))
+        {
+            keys(object,{"id","name","transform","meshReference","materialReference","materialSlotBindings"});
+            keys(object.at("transform"),{"position","rotation","scale"});
+            if(object.contains("materialSlotBindings"))
+                for(const auto& binding:object.at("materialSlotBindings")) keys(binding,{"slotID","materialReference"});
+        }
+        auto candidate = FromJson(json);
+        if(!ValidateSceneDocument(candidate,error)) return false;
+        document = std::move(candidate); return true;
+    }
+    catch(const std::exception& exception) { if(error) *error=exception.what(); return false; }
 }

@@ -45,6 +45,11 @@ bool ValidateSceneDocument(
         return Fail(errorMessage, "Unsupported scene schema version.");
     }
 
+    if(!document.environmentReference.empty())
+    {
+        const auto id=AssetID::ParseReference(document.environmentReference);
+        if(!id || id->ToReference()!=document.environmentReference) return Fail(errorMessage,"Invalid scene environment asset reference.");
+    }
     if(document.id.empty()){
         return Fail(errorMessage, "Scene ID cannot be empty.");
     }

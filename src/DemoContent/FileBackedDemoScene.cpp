@@ -1,3 +1,4 @@
+#include "assets/CookedScene.h"
 
 #include "DemoContent/FileBackedDemoScene.h"
 #include "DemoContent/SceneRegistry.h"
@@ -42,6 +43,9 @@ FileBackedDemoScene::FileBackedDemoScene(
     : m_scenePath(std::move(scenePath))
 {
 }
+
+FileBackedDemoScene::FileBackedDemoScene(std::shared_ptr<const CookedScene::ArchiveScene> source)
+    : m_archiveScene(std::move(source)) {}
 
 void FileBackedDemoScene::SetProjectAssets(
     const std::filesystem::path& root,
@@ -94,7 +98,7 @@ bool FileBackedDemoScene::InitializeWithPolicy(ID3D12Device* device, ResourceUpl
     std::string error;
 
     // Validate the document before allocating GPU resources.
-    if (!m_runtime->Open(m_scenePath, &error))
+    if (m_archiveScene ? !m_runtime->LoadArchive(m_archiveScene, &error) : !m_runtime->Open(m_scenePath, &error))
     {
         Log::Error("Failed to open file-backed scene: " + error);
         return false;
@@ -112,7 +116,11 @@ bool FileBackedDemoScene::InitializeWithPolicy(ID3D12Device* device, ResourceUpl
         return false;
     }
 
-    if(m_registry)
+    if(m_archiveScene)
+    {
+        m_assets.SetArchiveScene(m_archiveScene);
+    }
+    else if(m_registry)
     {
         m_assets.SetProjectAssets(ProjectPaths(m_projectRoot), *m_registry);
     }
@@ -167,7 +175,7 @@ void FileBackedDemoScene::Update(float deltaTime)
 void FileBackedDemoScene::AdvanceTextureStreaming(ProjectTexturePreparationService& preparation, Renderer& renderer,
     const std::function<bool(const AssetID&, const MaterialAssetData&)>& mayPublish)
 {
-    if(!m_initialized || m_objectMutationCandidate || m_runtime->HasMaterialAssignment())
+    if(m_archiveScene || !m_initialized || m_objectMutationCandidate || m_runtime->HasMaterialAssignment())
     {
         return;
     }

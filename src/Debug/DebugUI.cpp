@@ -703,6 +703,7 @@ void DebugUI::DrawPerformanceWindow(
             {
                 for (size_t i = 0; i < environmentNames.size(); ++i)
                 {
+                    ImGui::PushID(static_cast<int>(i));
                     const bool selected = i == currentEnvironmentIndex;
 
                     if (ImGui::Selectable(environmentNames[i].c_str(), selected))
@@ -714,6 +715,7 @@ void DebugUI::DrawPerformanceWindow(
                     {
                         ImGui::SetItemDefaultFocus();
                     }
+                    ImGui::PopID();
                 }
 
                 ImGui::EndCombo();

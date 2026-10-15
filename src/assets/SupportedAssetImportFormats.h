@@ -16,9 +16,9 @@ namespace SupportedAssetImportFormats
         AssetType category;
     };
 
-    inline constexpr std::array<Format, 2> Formats = {{{L".fbx", AssetType::Mesh}, {L".dds", AssetType::Texture}}};
+    inline constexpr std::array<Format, 3> Formats = {{{L".fbx", AssetType::Mesh}, {L".dds", AssetType::Texture}, {L".hdr", AssetType::Texture}}};
     inline constexpr const char* UnsupportedMessage =
-        "Unsupported import format. Use .fbx for meshes or .dds for textures.";
+        "Unsupported import format. Use .fbx for meshes or .dds/.hdr for textures/environments.";
 
     inline std::optional<AssetType> Lookup(const std::filesystem::path& source)
     {

@@ -15,9 +15,9 @@ namespace
 {
     using PreparationStatus = ProjectMeshPreparationService::Status;
 
-    PreparationStatus MapStatus(DevelopmentCookedMesh::Status status)
+    PreparationStatus MapStatus(CookedMeshSource::Status status)
     {
-        using S = DevelopmentCookedMesh::Status;
+        using S = CookedMeshSource::Status;
         using P = PreparationStatus;
 
         switch(status)
@@ -56,8 +56,8 @@ namespace
         return P::Failed;
     }
 
-    PreparationStatus CheckCooked(const DevelopmentCookedMesh::Provider& provider,
-        const DevelopmentCookedMesh::AssetEvidence& evidence, std::string& error)
+    PreparationStatus CheckCooked(const CookedMeshSource::Provider& provider,
+        const CookedMeshSource::AssetEvidence& evidence, std::string& error)
     {
         if(provider.Mapping() != evidence.mapping)
         {
@@ -67,15 +67,15 @@ namespace
 
         const auto current = provider.CheckCurrent();
 
-        if(current.status != DevelopmentCookedMesh::Status::Success)
+        if(current.status != CookedMeshSource::Status::Success)
         {
             error = current.message;
-            return current.status == DevelopmentCookedMesh::Status::Missing ? PreparationStatus::Stale : MapStatus(current.status);
+            return current.status == CookedMeshSource::Status::Missing ? PreparationStatus::Stale : MapStatus(current.status);
         }
 
         const auto lookup = provider.Lookup(evidence.assetID);
 
-        if(lookup.status != DevelopmentCookedMesh::Status::Success || *lookup.evidence != evidence)
+        if(lookup.status != CookedMeshSource::Status::Success || *lookup.evidence != evidence)
         {
             error = "Cooked AssetID, compatibility, payload or recipe mapping changed.";
             return PreparationStatus::Stale;
@@ -198,7 +198,7 @@ struct ProjectMeshPreparationService::State
         bool cacheHit = false;
         std::shared_ptr<const ImportedMesh> geometry;
         std::shared_ptr<const CookedMesh::MetadataSnapshot> metadata;
-        std::shared_ptr<const DevelopmentCookedMesh::Provider> provider;
+        std::shared_ptr<const CookedMeshSource::Provider> provider;
         std::shared_ptr<Reservation> reservation;
         std::string error;
     };
@@ -253,7 +253,7 @@ struct ProjectMeshPreparationService::State
     }
 
     RequestResult Submit(Identity identity, std::uint64_t generation,
-        std::shared_ptr<const DevelopmentCookedMesh::Provider> provider = {},
+        std::shared_ptr<const CookedMeshSource::Provider> provider = {},
         std::shared_ptr<const ImportedMesh> cached = {})
     {
         std::lock_guard lock(mutex);
@@ -345,7 +345,7 @@ struct ProjectMeshPreparationService::State
         policy.maxDecodedBytes = limits.geometryBytes;
         auto acquired = job->provider->Acquire(job->identity.cooked->assetID, policy);
 
-        if(acquired.status != DevelopmentCookedMesh::Status::Success)
+        if(acquired.status != CookedMeshSource::Status::Success)
         {
             status = MapStatus(acquired.status);
             error = acquired.message;
@@ -729,6 +729,7 @@ void ProjectMeshPreparationService::Cancel(std::uint64_t ticket)
 ProjectMeshPreparationService::RequestResult ProjectMeshPreparationService::Request(const ProjectPaths& paths,
     const ProjectAssetRegistry& registry, const AssetID& asset, std::uint64_t generation)
 {
+    if(m_archiveOnly) { return {Status::Invalid,0,"Loose mesh access rejected by packaged policy."}; }
     auto& state = *m_state;
 
     if (!state.OnOwner() || !state.accepting || generation != state.generation)
@@ -769,6 +770,8 @@ ProjectMeshPreparationService::RequestResult ProjectMeshPreparationService::Requ
 ProjectMeshPreparationService::RequestResult ProjectMeshPreparationService::RequestCooked(
     const CookedRequest& request, ProjectMeshCPUCache& cache)
 {
+    if(m_archiveOnly && (!request.provider || !request.provider->Mapping().projectNamespace.empty()))
+        return {Status::Invalid,0,"Development cooked providers rejected by packaged policy."};
     auto& state = *m_state;
 
     if(!state.OnOwner() || !state.accepting || request.generation != state.generation)
@@ -786,7 +789,7 @@ ProjectMeshPreparationService::RequestResult ProjectMeshPreparationService::Requ
     {
         const auto lookup = request.provider->Lookup(request.asset);
 
-        if(lookup.status != DevelopmentCookedMesh::Status::Success)
+        if(lookup.status != CookedMeshSource::Status::Success)
         {
             return {MapStatus(lookup.status), 0, std::string(lookup.message)};
         }

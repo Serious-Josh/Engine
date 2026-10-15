@@ -11,6 +11,7 @@ class FileSceneAssetCatalog;
 
 struct PreparedScene
 {
+    std::string environmentReference;
     SceneCameraDocument camera;
     DirectionalLight directionalLight;
     std::vector<ResolvedSceneObject> objects;

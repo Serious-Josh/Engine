@@ -1,3 +1,4 @@
+#include "assets/DevelopmentCookedMeshProvider.h"
 #include "Engine/Engine.h"
 
 #ifndef NDEBUG
@@ -145,7 +146,7 @@ bool Engine::VerifyCookedMeshLifecycle(const std::filesystem::path& scenePath)
         RequireLifecycle(scene && scene->GetProjectRoot() == fixture, "Isolated runtime did not activate.");
         m_automaticMeshResidency = {};
         m_automaticResidencyIntent = 0;
-        scene->m_runtime->m_cookedDiagnosticPublication = true;
+        scene->m_runtime->m_cookedPublicationAuthorized = true;
         provider = DevelopmentCookedMesh::Provider::Open(fixture, {}).provider;
         RequireLifecycle(bool(provider), "Replacement provider unavailable.");
         const auto metadata = scene->GetObjectMetadata(primary.id, &error);
@@ -323,7 +324,7 @@ bool Engine::VerifyCookedMeshLifecycle(const std::filesystem::path& scenePath)
     RequireLifecycle(m_demoSceneManager.RequestMetadataOnlyFileScene(scenePath, &error), error);
     if(!ActivateRequestedFileScene()) { std::abort(); }
     auto* ordinary = dynamic_cast<FileBackedDemoScene*>(m_demoSceneManager.TryGetActiveScene());
-    RequireLifecycle(ordinary && !ordinary->m_runtime->m_cookedDiagnosticPublication && m_automaticMeshResidency.enabled,
+    RequireLifecycle(ordinary && !ordinary->m_runtime->m_cookedPublicationAuthorized && m_automaticMeshResidency.enabled,
         "Diagnostic cooked selection/exclusion leaked into ordinary activation.");
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
     Mesh* ordinaryMesh = nullptr;

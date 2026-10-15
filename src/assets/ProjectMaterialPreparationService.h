@@ -2,6 +2,7 @@
 #include "assets/MaterialAssetData.h"
 #include "assets/ProjectTexturePreparationService.h"
 #include <array>
+#include "assets/CookedSurface.h"
 #ifdef ENGINE_TEXTURE_PREPARATION_TESTS
 #include <functional>
 #endif
@@ -13,6 +14,7 @@ class MaterialSourceLease;
 class ProjectMaterialPreparationService
 {
 public:
+    void RestrictToArchive() noexcept { m_archiveOnly=true; }
     enum class Status { Pending, Ready, Stale, Unsupported, Failed, Retry };
     struct Candidate
     {
@@ -20,6 +22,9 @@ public:
         std::filesystem::path project, path;
         std::string digest;
         std::uint64_t session = 0;
+        std::shared_ptr<const CookedMeshSource::ArchiveProvider> archive;
+        std::uint64_t contentGeneration = 0;
+        std::array<std::optional<CookedSurface::Dependency>,7> archiveDependencies;
         MaterialAssetData parameters;
         std::array<std::optional<ProjectTexturePreparationService::Completion>, 7> textures;
         // Revocation observation only; never substitutes for Validate/ownership.
@@ -40,6 +45,10 @@ public:
     ProjectMaterialPreparationService& operator=(const ProjectMaterialPreparationService&) = delete;
     Status Request(const ProjectPaths&, const ProjectAssetRegistry&, const AssetID&,
         std::uint64_t session, std::uint64_t& ticket, std::string& error);
+    Status RequestArchive(std::shared_ptr<const CookedMeshSource::ArchiveProvider>, const AssetID&,
+        std::uint64_t session, std::uint64_t& ticket, std::string& error);
+    Result PollArchive(std::uint64_t ticket,std::uint64_t session);
+    bool ValidateArchive(const Candidate&,std::uint64_t session,std::string& error) const;
     Result Poll(std::uint64_t ticket, const ProjectPaths&, const ProjectAssetRegistry&, std::uint64_t session);
     bool Validate(const Candidate&, const ProjectPaths&, const ProjectAssetRegistry&, std::uint64_t session,
         std::string& error) const;
@@ -52,6 +61,8 @@ public:
     static constexpr size_t Capacity = 4;
     static constexpr size_t MaterialByteLimit = 1024 * 1024;
 private:
+    bool m_archiveOnly = false;
+    Result PollInternal(std::uint64_t,const ProjectPaths*,const ProjectAssetRegistry*,std::uint64_t);
     struct State;
     std::unique_ptr<State> m_state;
 };

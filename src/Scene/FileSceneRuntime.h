@@ -59,6 +59,8 @@ struct MaterialAssignmentToken
     bool operator==(const MaterialAssignmentToken&) const = default;
 };
 
+namespace CookedScene { struct ArchiveScene; }
+
 class FileSceneRuntime
 {
 public:
@@ -164,6 +166,8 @@ public:
 
     // Explicit inactive-runtime path. Requires the catalog's fallback texture
     // policy; FileBackedDemoScene configures it for this mode.
+    bool LoadArchive(std::shared_ptr<const CookedScene::ArchiveScene> source, std::string* errorMessage = nullptr);
+    bool IsArchiveActivation() const noexcept { return bool(m_archiveScene); }
     bool PrepareMetadata(FileSceneAssetCatalog& catalog, std::string* errorMessage = nullptr);
     bool CommitMetadata(FileSceneAssetCatalog& catalog, std::string* errorMessage = nullptr);
 
@@ -192,7 +196,7 @@ public:
         const std::filesystem::path& path,
         std::string* errorMessage = nullptr);
 
-    SceneDocument& EditDocument() noexcept;
+    SceneDocument& EditDocument();
 
     // Returns false when live state cannot be represented safely.
     // On failure, dirty is unchanged.
@@ -207,14 +211,16 @@ public:
         std::string* errorMessage = nullptr);
 
 private:
+    std::shared_ptr<const CookedScene::ArchiveScene> m_archiveScene;
     // No coordinator exists in S.5B. Only the future matching renderer/DXR
     // transaction may call this at the main-thread pre-recording boundary.
+    friend class SceneMembershipPublication;
     friend class MeshResidencyPublication;
     friend class SceneMaterialBindingPublication;
     friend class SceneMaterialBindingVerification;
     friend class Engine;
-    // Only an explicit Debug diagnostic can open this runtime's gate.
-    bool m_cookedDiagnosticPublication = false;
+    // Only Engine archive bootstrap or an explicit diagnostic can open this runtime's gate.
+    bool m_cookedPublicationAuthorized = false;
     std::optional<SceneObjectMetadata> ValidatePreparedMeshResidencyIdentity(const MeshResidencyToken& token,
         const FileSceneAssetCatalog& catalog, std::string* errorMessage) const;
     MeshResidencySourceLock ValidatePreparedMeshResidency(const MeshResidencyToken& token,

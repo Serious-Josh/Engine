@@ -236,6 +236,7 @@ std::optional<std::size_t> SceneHierarchyPanel::Draw(const EditorWorkspaceRect& 
     const void* sceneIdentity, const std::string& error,
     const HierarchyDragIdentity& dragIdentity, bool allowReorder)
 {
+    m_focused=false;
     if(rectangle.size.x <= 0.0f || rectangle.size.y <= 0.0f)
     {
         return std::nullopt;
@@ -270,6 +271,7 @@ std::optional<std::size_t> SceneHierarchyPanel::Draw(const EditorWorkspaceRect& 
 
     if(ImGui::Begin("Hierarchy", nullptr, flags))
     {
+        m_focused=ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
         EditorWorkspace::KeepCurrentWindowBehindFloatingUI();
         ImGui::TextUnformatted(snapshot.sceneName.c_str());
         ImGui::Separator();

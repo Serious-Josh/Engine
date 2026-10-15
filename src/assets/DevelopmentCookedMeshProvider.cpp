@@ -6,7 +6,6 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
-#include <atomic>
 #include <expected>
 #include <limits>
 #include <map>
@@ -357,19 +356,6 @@ namespace DevelopmentCookedMesh
 
             return {Status::Unsupported, "Unknown cooked decoder outcome."};
         }
-
-        std::uint64_t NextMapping()
-        {
-            static std::atomic_uint64_t next{1};
-            auto value = next.load();
-
-            while(value != UINT64_MAX)
-            {
-                if(next.compare_exchange_weak(value, value + 1)) { return value; }
-            }
-
-            return 0;
-        }
     }
 
     struct Provider::State
@@ -424,7 +410,7 @@ namespace DevelopmentCookedMesh
             state->cooked = fs::canonical(cooked);
             state->policy = policy;
             state->activation = *activation;
-            state->mapping = {state->cooked.generic_string(), activation->generation, *digest, NextMapping()};
+            state->mapping = {state->cooked.generic_string(), activation->generation, *digest, CookedMeshSource::NextMappingGeneration(), fs::canonical(projectRoot).generic_string()};
 
             if(!state->mapping.mappingGeneration) { return {{Status::AdmissionLimit, "Provider mapping tokens exhausted."}}; }
             std::string previous;

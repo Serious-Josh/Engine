@@ -78,6 +78,8 @@ bool ImageLoader::LoadHDR(
     int height = 0;
     int channels = 0;
 
+    if(!stbi_info(path.string().c_str(),&width,&height,&channels) || width<=0 || height<=0 || width>8192 || height>8192 ||
+        static_cast<std::uint64_t>(width)*height>8*1024*1024) return false;
     float* pixels = stbi_loadf(path.string().c_str(), &width, &height, &channels, 4);
 
     if (!pixels)

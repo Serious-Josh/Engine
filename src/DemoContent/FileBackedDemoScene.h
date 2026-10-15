@@ -13,6 +13,9 @@ class FileBackedDemoScene final : public IDemoScene
 {
 public:
     explicit FileBackedDemoScene(std::filesystem::path scenePath);
+    explicit FileBackedDemoScene(std::shared_ptr<const CookedScene::ArchiveScene> source);
+    bool IsArchiveActivation() const noexcept { return bool(m_archiveScene); }
+    const std::shared_ptr<const CookedScene::ArchiveScene>& ArchiveSource() const noexcept { return m_archiveScene; }
 
     FileBackedDemoScene(const FileBackedDemoScene&) = delete;
     FileBackedDemoScene& operator=(const FileBackedDemoScene&) = delete;
@@ -135,12 +138,16 @@ private:
     bool InitializeWithPolicy(ID3D12Device* device, ResourceUploader& uploader, DescriptorHeap& descriptorHeap,
         const Shader* vertexShader, const Shader* pixelShader, bool metadataOnly);
 
+    friend class Editor;
     friend class Engine;
     friend class SceneMaterialBindingVerification;
+    friend class SceneDuplicationVerification;
+    friend class SceneMembershipVerification;
     friend class ViewportMaterialDropVerification;
     // Engine retains both runtimes until checked candidate initialization/cleanup.
     std::unique_ptr<FileSceneRuntime> m_objectMutationCandidate;
 
+    std::shared_ptr<const CookedScene::ArchiveScene> m_archiveScene;
     std::filesystem::path m_scenePath;
     std::filesystem::path m_projectRoot;
     const ProjectAssetRegistry* m_registry = nullptr;

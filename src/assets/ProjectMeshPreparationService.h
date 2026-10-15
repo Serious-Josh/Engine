@@ -3,7 +3,7 @@
 #include "assets/ProjectMeshCPUCache.h"
 #include "assets/ProjectAssetResolver.h"
 #include "assets/ModelImporter.h"
-#include "assets/DevelopmentCookedMeshProvider.h"
+#include "assets/CookedMeshProvider.h"
 
 #include <atomic>
 #include <memory>
@@ -14,6 +14,7 @@
 class ProjectMeshPreparationService
 {
 public:
+    void RestrictToArchive() noexcept { m_archiveOnly=true; }
     struct Limits
     {
         size_t requests = 16; // Includes delivered, consumer-held cancellation tokens.
@@ -36,7 +37,7 @@ public:
 
     struct CookedRequest
     {
-        std::shared_ptr<const DevelopmentCookedMesh::Provider> provider;
+        std::shared_ptr<const CookedMeshSource::Provider> provider;
         AssetID asset;
         std::uint64_t generation = 0;
         PreparationMode mode = PreparationMode::Geometry;
@@ -46,7 +47,7 @@ public:
     {
         MeshPreparationSourceKind sourceKind = MeshPreparationSourceKind::FBX;
         PreparationMode mode = PreparationMode::Geometry;
-        std::shared_ptr<const DevelopmentCookedMesh::AssetEvidence> cooked;
+        std::shared_ptr<const CookedMeshSource::AssetEvidence> cooked;
 
         std::filesystem::path project;
         std::filesystem::path path;
@@ -74,7 +75,7 @@ public:
         std::uint64_t generation = 0;
         std::shared_ptr<const ImportedMesh> geometry;
         std::shared_ptr<const CookedMesh::MetadataSnapshot> metadata;
-        std::shared_ptr<const DevelopmentCookedMesh::Provider> provider;
+        std::shared_ptr<const CookedMeshSource::Provider> provider;
         std::shared_ptr<const std::atomic_bool> current;
         std::string error;
         bool cacheHit = false;
@@ -113,6 +114,7 @@ public:
     static std::string InspectSourceIdentity(const std::filesystem::path& path);
 
 private:
+    bool m_archiveOnly = false;
     struct State;
     std::unique_ptr<State> m_state;
 };

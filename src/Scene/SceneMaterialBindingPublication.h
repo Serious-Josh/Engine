@@ -36,6 +36,9 @@ public:
     Result Prepare(Renderer& renderer, const FileSceneRuntime& runtime,
         FileSceneAssetCatalog& catalog, const SceneObjectMetadata& expected,
         const std::map<std::string, std::string>& overrides);
+    // Archive pending objects: publish the complete authored fallback/override
+    // borrows only after every material is admitted; no GPU lookup exists yet.
+    Result PrepareDeferred(Renderer&,const FileSceneRuntime&,FileSceneAssetCatalog&,const SceneObjectMetadata&);
     Result PrepareAllSlots(Renderer& renderer, const FileSceneRuntime& runtime,
         FileSceneAssetCatalog& catalog, const SceneObjectMetadata& expected, const AssetID& material);
     Result PublishAtBoundary(Renderer& renderer, FileSceneRuntime& runtime,

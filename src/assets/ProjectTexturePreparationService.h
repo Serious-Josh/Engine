@@ -11,11 +11,13 @@
 #endif
 
 class TextureSourceEvidence;
+namespace CookedMeshSource { class ArchiveProvider; }
 
 // Main-thread request/poll/cancel API. The single worker owns CPU inputs only.
 class ProjectTexturePreparationService
 {
 public:
+    void RestrictToArchive() noexcept { m_archiveOnly=true; }
     struct Limits
     {
         size_t requests = 16; // Includes subscribers, active and completed requests.
@@ -23,6 +25,7 @@ public:
         size_t sourceBytes = 64 * 1024 * 1024;
         size_t preparationBytes = 256 * 1024 * 1024;
         size_t retainedBytes = 512 * 1024 * 1024;
+        size_t archiveBytes = 128 * 1024 * 1024;
     };
 
     struct Options
@@ -39,6 +42,8 @@ public:
         std::string digest;
         ProjectTextureInterpretation interpretation = ProjectTextureInterpretation::LinearData;
         Options options;
+        std::shared_ptr<const CookedMeshSource::ArchiveProvider> archive;
+        std::uint64_t contentGeneration = 0;
         bool operator==(const Identity&) const = default;
     };
 
@@ -70,6 +75,10 @@ public:
     bool Request(const ProjectPaths& paths, const ProjectAssetRegistry& registry, const AssetID& asset,
         ProjectTextureInterpretation interpretation, Options options, std::uint64_t generation,
         std::uint64_t& ticket, std::string& error);
+    bool RequestArchive(std::shared_ptr<const CookedMeshSource::ArchiveProvider>, const AssetID&, ProjectTextureInterpretation,
+        std::uint64_t generation, std::uint64_t& ticket, std::string& error);
+    std::optional<Completion> PollArchive(std::uint64_t ticket);
+    bool ValidateArchive(const Completion&, std::string& error) const;
     std::optional<Completion> Poll(std::uint64_t ticket, const ProjectPaths& paths,
         const ProjectAssetRegistry& registry);
     // Must be checked again at future publication; a completion is never authorization by itself.
@@ -78,6 +87,7 @@ public:
     // path and file-ID checks only. Completion must live through acceptance.
     bool ValidateSource(const Completion& completion, const ProjectPaths& paths,
         const ProjectAssetRegistry& registry, std::string& error) const;
+    static size_t EstimateForCooking(const std::filesystem::path& path);
     size_t RetainedBytes() const; // Includes active reservations and consumer-held leases.
     struct Statistics
     {
@@ -93,6 +103,9 @@ public:
 #endif
 
 private:
+    bool m_archiveOnly = false;
+    bool RequestIdentity(Identity, std::uint64_t generation, std::uint64_t& ticket, std::string& error);
+    std::optional<Completion> PollInternal(std::uint64_t, const ProjectPaths*, const ProjectAssetRegistry*);
     struct State;
     std::unique_ptr<State> m_state;
 };

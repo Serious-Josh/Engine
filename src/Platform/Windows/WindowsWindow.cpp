@@ -1,4 +1,5 @@
 #include "WindowsWindow.h"
+#include "WindowsText.h"
 #include "Core/InputCodes.h"
 #include "Core/Assert.h"
 #include <Core/Log.h>
@@ -314,9 +315,7 @@ bool WindowsWindow::Initialize(const WindowProperties& properties)
 
     HINSTANCE instance = GetModuleHandle(nullptr);
 
-    std::wstring title(
-        properties.title.begin(),
-        properties.title.end());
+    const auto title=WindowsText::FromUTF8(properties.title);
 
     WNDCLASSW windowClass{};
 

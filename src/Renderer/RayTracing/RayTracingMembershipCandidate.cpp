@@ -203,15 +203,17 @@ struct RayTracingSceneResources::CandidateState
 
 std::optional<RayTracingSceneResources::ReplacementCandidate> RayTracingSceneResources::PrepareReplacementCandidate(
     ID3D12Device5* device, DescriptorHeap& heap, const FileSceneRuntime& runtime, FileSceneAssetCatalog& catalog,
-    const std::vector<ResidencyProposal>& proposals, std::size_t materialCount, std::string& error)
+    const std::vector<ResidencyProposal>& proposals, std::size_t materialCount, std::string& error,
+    const FileSceneRuntime* membershipSource)
 {
     error.clear();
     const auto& scene = runtime.GetScene();
     const auto& objects = scene.GetRenderObjects();
 
-    if (!device || m_candidate || proposals.empty() || proposals.size() > MaxCandidateProposals ||
-        objects.empty() || objects.size() > MaxCandidateObjects ||
-        m_blasRegistry.bottomLevels.size() > MaxCandidateObjects || !ValidateMaterialBindings(scene))
+    if (!device || m_candidate || (!membershipSource && proposals.empty()) ||
+        (membershipSource && !proposals.empty()) || proposals.size() > MaxCandidateProposals ||
+        (!membershipSource && objects.empty()) || objects.size() > MaxCandidateObjects ||
+        m_blasRegistry.bottomLevels.size() > MaxCandidateObjects || !ValidateMaterialBindings(membershipSource ? membershipSource->GetScene() : scene))
     {
         Fail(error, "Candidate admission failed: outstanding candidate, invalid membership or work limit.");
         return std::nullopt;
@@ -500,9 +502,9 @@ std::optional<RayTracingSceneResources::ReplacementCandidate> RayTracingSceneRes
     tlas.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE |
         D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE;
 
-    if (!residents || !ChargeAS(device, tlas, asBytes) ||
+    if ((!membershipSource && !residents) || (residents && (!ChargeAS(device, tlas, asBytes) ||
         !ChargeGPUAllocation(residents * sizeof(D3D12_RAYTRACING_INSTANCE_DESC), asBytes) ||
-        !ChargeGPUAllocation(residents * sizeof(D3D12_RAYTRACING_INSTANCE_DESC), asBytes))
+        !ChargeGPUAllocation(residents * sizeof(D3D12_RAYTRACING_INSTANCE_DESC), asBytes))))
     {
         Fail(error, "Candidate TLAS build exceeds its work budget.");
         return std::nullopt;
@@ -513,11 +515,13 @@ std::optional<RayTracingSceneResources::ReplacementCandidate> RayTracingSceneRes
     std::vector<unsigned int> materials;
     auto& snapshot = *state.snapshot;
 
-    if (!BuildMaterialSlotData(snapshot, effective, gpuInstances, triangles, materials) ||
+    const bool slotsBuilt=BuildMaterialSlotData(snapshot, effective, gpuInstances, triangles, materials);
+    if(membershipSource && !residents) materials.push_back(0);
+    if ((!slotsBuilt && !(membershipSource && !residents)) ||
         !BuildInstanceData(snapshot, effective, meshIndices, gpuInstances) ||
         !snapshot.triangleSlots.InitializeStorage(device, sizeof(unsigned int), static_cast<UINT>(triangles.size()), heap) ||
         !snapshot.slotMaterials.InitializeStorage(device, sizeof(unsigned int), static_cast<UINT>(materials.size()), heap) ||
-        !snapshot.instanceDataBuffer.InitializeStorage(device, sizeof(RayTracingInstanceData), static_cast<UINT>(objects.size()), heap))
+        !snapshot.instanceDataBuffer.InitializeStorage(device, sizeof(RayTracingInstanceData), static_cast<UINT>((std::max)(objects.size(),std::size_t{1})), heap))
     {
         Fail(error, "Candidate membership/table allocation failed.");
         return std::nullopt;
@@ -525,6 +529,7 @@ std::optional<RayTracingSceneResources::ReplacementCandidate> RayTracingSceneRes
 
     PatchTableDescriptors(snapshot, gpuInstances);
     snapshot.instanceRecords = gpuInstances;
+    if(gpuInstances.empty()) gpuInstances.resize(1);
     state.uploadBytes = {gpuInstances.size() * sizeof(RayTracingInstanceData),
         triangles.size() * sizeof(unsigned int), materials.size() * sizeof(unsigned int)};
 
@@ -595,7 +600,7 @@ bool RayTracingSceneResources::RecordReplacementCandidate(ID3D12Device5* device,
     description.instances = snapshot.instances;
     description.buildPreference = RayTracingAccelerationStructureBuildPreference::FastTrace;
 
-    if (!snapshot.topLevel.Initialize(device, commands, description, state.blasPointers))
+    if (!snapshot.instances.empty() && !snapshot.topLevel.Initialize(device, commands, description, state.blasPointers))
     {
         return Fail(error, "Candidate TLAS recording failed.");
     }
@@ -910,6 +915,19 @@ RayTracingSceneResources::AdoptionReadiness RayTracingSceneResources::PrepareCan
         return AdoptionReadiness::Stale;
     }
 
+    return PrepareRegistryAdoption(handle,evidence,error);
+}
+RayTracingSceneResources::AdoptionReadiness RayTracingSceneResources::PrepareRegistryAdoption(
+    const ReplacementCandidate& handle, AdoptionEvidence& evidence, std::string& error)
+{
+    if(!handle.m_state || handle.m_state!=m_candidate || !m_candidate->valid || m_candidate->failed ||
+        m_candidate->generation || m_candidate->uncertain || !m_candidate->fence ||
+        m_materialBindingEpoch==UINT64_MAX || !CanRetireActiveMembership())
+    {
+        Fail(error,"Candidate registry adoption is not ready.");
+        return AdoptionReadiness::Stale;
+    }
+    auto& state=*m_candidate;
     const auto base = state.stableBLASCount;
     const auto added = state.newBLAS.size();
     const auto needed = base + added;

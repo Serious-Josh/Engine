@@ -22,7 +22,7 @@ CmakeUserPresets.json
 
 # Test directories
 /Projects
-/docs
+/docs/*
 /tests
 
 # Development-only cooked generations and publication bookkeeping

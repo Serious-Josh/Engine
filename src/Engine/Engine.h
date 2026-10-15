@@ -18,6 +18,7 @@
 #include "Scene/FileSceneRuntime.h"
 #include "Scene/FileSceneAssetCatalog.h"
 #include "Scene/MeshResidencyPublication.h"
+#include "Scene/SceneMembershipPublication.h"
 #include "Scene/SceneMaterialBindingPublication.h"
 #include <chrono>
 
@@ -32,14 +33,38 @@ enum class EngineState
 
 class FileBackedDemoScene;
 
+struct EngineStartup
+{
+    enum class Mode { Editor, ArchiveDiagnostic, PackagedRuntime };
+    Mode mode = Mode::Editor;
+    std::filesystem::path toc, pak;
+    std::optional<AssetID> sceneID;
+    std::string gameTitle; // UTF-8; empty selects the diagnostic caption.
+    unsigned int width=1280, height=720;
+};
 class Engine
 {
     public:
-    bool Initialize();
+    // Archive diagnostics skip loose-project registry, reconciliation and scans.
+    bool Initialize(bool archiveDiagnostic = false);
+    bool Initialize(const EngineStartup& startup);
+    void VerifyPackagedBootstrap();
 #ifndef NDEBUG
     // Preparation checkpoint only. Never enters the publication coordinator.
-    bool VerifyCookedMeshGPUPreparation(const std::filesystem::path& scenePath);
-    bool VerifyCookedMeshPublication(const std::filesystem::path& scenePath, bool visualReview = false);
+    bool VerifyCookedMeshGPUPreparation(const std::filesystem::path& scenePath,
+        std::shared_ptr<const CookedMeshSource::Provider> source = {});
+    bool VerifyCookedMeshPublication(const std::filesystem::path& scenePath, bool visualReview = false,
+        std::shared_ptr<const CookedMeshSource::Provider> source = {});
+    bool VerifyMaterialLocate();
+    bool VerifyViewportPan();
+    bool VerifySceneDuplication(const std::filesystem::path& scene);
+    bool VerifySceneMembership(const std::filesystem::path& scene);
+    bool VerifySceneHDRI(const std::filesystem::path& scene, const std::filesystem::path& output);
+    bool VerifyBuildGame(const std::filesystem::path& scene, const std::filesystem::path& output);
+    bool VerifyArchiveMaterials(const std::filesystem::path& sourceScene);
+    bool VerifyCookedSceneArchive(const std::filesystem::path& sourceScene);
+    bool ActivateCookedSceneArchive(const std::filesystem::path& toc, const std::filesystem::path& pak, const AssetID& sceneID);
+    bool VerifyArchiveCookedMeshPublication(const std::filesystem::path& scenePath);
     bool VerifyMaterialBindingPublication();
 #endif
     // Explicit main-thread capability; publishes at the next ready pre-Render boundary.
@@ -139,6 +164,33 @@ class Engine
     }
 
     private:
+    friend class MaterialLocateVerification;
+    friend class ViewportPanVerification;
+    struct EditorMembershipOperation
+    {
+        Editor::HistoryReplayRequest request;
+        SceneObjectRestorationIdentity identity;
+        bool replay=false, prepared=false;
+        std::optional<SceneObjectMetadata> deletion;
+        std::optional<SceneObjectMetadata> selection;
+        std::string sceneName;
+    };
+    SceneMembershipPublication m_editorMembership;
+    std::optional<EditorMembershipOperation> m_pendingEditorMembership;
+    bool BeginEditorMembership(Editor::HistoryReplayRequest,bool replay,std::string& error,
+        std::optional<SceneObjectMetadata> deletion = {});
+    bool BeginEditorMembershipDeletion(const SceneObjectMetadata&,std::string&);
+    bool AdvanceEditorMembership();
+    void CancelEditorMembership(const std::string&);
+    void PopulateArchiveScene(std::shared_ptr<const CookedScene::ArchiveScene>);
+    bool ApplySceneEnvironment(std::string& error);
+    bool AssignSceneEnvironment(size_t index, std::string& error);
+    bool StartBuildGame(BuildGame::Settings, std::string&);
+    BuildGame::Service m_buildGame;
+    std::string m_buildGameLastMessage="Ready.";
+    EngineStartup m_startup;
+    bool m_rendererAttempted = false;
+    bool m_windowInitialized = false;
 #ifndef NDEBUG
     bool VerifyCookedMeshLifecycle(const std::filesystem::path& scenePath);
 #endif
@@ -307,6 +359,8 @@ class Engine
 
     Renderer m_renderer;
 
+    friend class SceneDuplicationVerification;
+    friend class SceneMembershipVerification;
     friend class ViewportMaterialDropVerification;
     struct PendingViewportMaterialBinding
     {

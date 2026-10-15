@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Scene/Transform.h"
+#include "Engine/BuildGame.h"
 #include "SceneSelection.h"
 #include "AssetBrowser.h"
 #include "EditorWorkspace.h"
@@ -17,6 +18,7 @@
 #include <vector>
 #include <variant>
 #include <memory>
+#include <utility>
 
 class IDemoScene;
 class FileBackedDemoScene;
@@ -120,7 +122,7 @@ public:
         std::uint64_t epoch) const;
     // Caller has checked session compatibility before Renderer publication. No fallible lookup follows.
     void PublishRestoredObjectSelection(const FileBackedDemoScene& scene,
-        std::optional<SceneObjectMetadata> selection, std::string activeSceneName) noexcept;
+        std::optional<SceneObjectMetadata> selection, std::string activeSceneName, bool retainGroup = true) noexcept;
     // Future checked structural publication may explicitly rebind the same editing session.
     // Unsupported creation continues using OnSceneActivated().
     bool RebindSceneHistoryAfterStructureChange(const IDemoScene& scene);
@@ -196,7 +198,13 @@ public:
         HistoryReplayIdentity identity;
         SceneObjectDocument object;
         size_t insertionIndex = 0;
+        std::optional<std::string> bindingSourceID;
+        bool membership = false;
+        bool remove = false;
     };
+    std::optional<HistoryReplayRequest> TakeSceneDuplicationRequest();
+    void HandleSceneObjectDuplication(IDemoScene&);
+    void ProcessMaterialLocateRequest(const ProjectPaths&,const ProjectAssetRegistry&);
     std::uint64_t AllocateSceneHistoryOperationID() noexcept { return ++m_historyOperationSerial; }
     bool HasPendingSceneHistoryOperation() const noexcept;
     bool MatchesPendingHistoryReplay(const HistoryReplayIdentity& identity) const noexcept;
@@ -204,7 +212,7 @@ public:
     void InvalidateSceneHistoryRedoAfterEdit() noexcept;
     bool StageObjectDeletionHistory(SceneObjectDocument object, size_t documentIndex,
         std::optional<std::string> selectionBefore, std::optional<std::string> selectionAfter,
-        std::uint64_t operationID, std::uint64_t epoch, bool replay, std::string& error);
+        std::uint64_t operationID, std::uint64_t epoch, bool replay, std::string& error, bool insertion = false);
     void CompleteObjectDeletionHistory(std::uint64_t operationID, std::uint64_t epoch,
         bool succeeded, const std::string& error);
     void CompleteSceneHistoryReplay(const HistoryReplayIdentity& identity, bool succeeded, const std::string& error);
@@ -223,6 +231,9 @@ public:
     SceneChangeDecision DrawSceneChangeConfirmation(const std::string& error);
 
     // Taking a request clears it. Pending actions cannot be overwritten.
+    std::optional<BuildGame::Settings> TakeBuildGameRequest() { return std::exchange(m_buildGameRequest,std::nullopt); }
+    bool TakeBuildGameCancel() { return std::exchange(m_buildGameCancel,false); }
+    void SetBuildGameStatus(BuildGame::Status status) { m_buildGameStatus=std::move(status); }
     std::optional<FileRequest> TakeFileRequest();
     bool HasFileRequest(FileRequestType type) const noexcept;
     std::optional<AssetBrowser::MaterialCreationRequest> TakeMaterialCreationRequest();
@@ -260,6 +271,9 @@ public:
     }
 
 private:
+    friend class MaterialLocateVerification;
+    friend class ViewportPanVerification;
+    friend class SceneDuplicationVerification;
     friend class ViewportMaterialDropVerification;
     void DrawMaterialDropTarget(IDemoScene& scene, const ProjectPaths& paths,
         const ProjectAssetRegistry& registry);
@@ -359,6 +373,12 @@ private:
 
     bool m_applicationCloseApproved = false;
 
+    bool m_showBuildGame=false, m_buildAdvanced=false, m_buildGameCancel=false;
+    char m_buildTitle[128]="MyGame";
+    char m_buildOutput[1024]="";
+    BuildGame::Status m_buildGameStatus;
+    std::optional<BuildGame::Settings> m_buildGameRequest;
+    void DrawBuildGame();
     std::optional<FileRequest> m_fileRequest;
 
     bool m_sceneOperationPending = false;
@@ -430,6 +450,7 @@ private:
         std::optional<std::string> selectionBefore;
         std::optional<std::string> selectionAfter;
         SceneHistorySession session;
+        bool insertion = false;
     };
     struct RenameObject
     {
@@ -500,6 +521,7 @@ private:
     };
     std::optional<PendingHistoryReplay> m_pendingHistoryReplay;
     std::optional<HistoryReplayRequest> m_historyReplayRequest;
+    std::optional<HistoryReplayRequest> m_duplicationRequest;
     std::optional<StagedDeletionHistory> m_stagedDeletionHistory;
     std::uint64_t m_historyOperationSerial = 0;
     void AppendSceneHistoryEntry(SceneHistoryEntry entry) noexcept;

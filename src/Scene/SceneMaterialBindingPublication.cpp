@@ -1,3 +1,4 @@
+#include "assets/CookedScene.h"
 #include "Scene/SceneMaterialBindingPublication.h"
 
 #include "Scene/FileSceneAssetCatalog.h"
@@ -50,6 +51,8 @@ struct SceneMaterialBindingPublication::Prepared
     const void* membership = nullptr;
     std::size_t materialCount = 0;
     bool noOp = false;
+    bool deferred = false;
+    std::shared_ptr<const CookedScene::ArchiveScene> archiveSource;
 
     ~Prepared() { instances.Shutdown(); slots.Shutdown(); }
 };
@@ -57,6 +60,32 @@ struct SceneMaterialBindingPublication::Prepared
 SceneMaterialBindingPublication::SceneMaterialBindingPublication() : m_thread(std::this_thread::get_id()) {}
 SceneMaterialBindingPublication::~SceneMaterialBindingPublication() = default;
 void SceneMaterialBindingPublication::Cancel() noexcept { m_prepared.reset(); }
+
+SceneMaterialBindingPublication::Result SceneMaterialBindingPublication::PrepareDeferred(Renderer& renderer,const FileSceneRuntime& runtime,
+    FileSceneAssetCatalog& catalog,const SceneObjectMetadata& expected)
+{
+    Cancel();
+    try
+    {
+        if(!catalog.IsArchiveActivation()) return {Status::Unsupported,"Deferred admission requires an archive catalog."};
+        auto current=runtime.GetObjectMetadata(expected.objectID);
+        if(!current || !SameIdentity(*current,expected)) return {Status::Stale,"Deferred target is stale."};
+        auto stage=std::make_unique<Prepared>(); stage->deferred=true; stage->archiveSource=catalog.ArchiveSource();
+        stage->selection=*current; stage->catalog=&catalog; stage->rendererLifetime=renderer.m_sceneResourceLifetime;
+        stage->fallback=catalog.FindPublishedMaterial(current->materialReference,renderer);
+        if(!stage->fallback) return {Status::Retry,"Authored fallback material is not admitted."};
+        for(const auto& [slot,ref]:current->materialSlotBindings)
+        {
+            auto* material=catalog.FindPublishedMaterial(ref,renderer);
+            if(!material) return {Status::Retry,"Authored slot material is not admitted."};
+            stage->runtimeSlots.emplace(slot,material);
+        }
+        stage->committedSlots=stage->runtimeSlots; m_prepared=std::move(stage);
+        auto result=Validate(renderer,runtime,catalog); if(result.status!=Status::Ready) Cancel(); return result;
+    }
+    catch(const std::bad_alloc&) { Cancel(); return {Status::Retry,"Deferred binding allocation unavailable."}; }
+    catch(const std::exception& e) { Cancel(); return {Status::Failed,e.what()}; }
+}
 
 SceneMaterialBindingPublication::Result SceneMaterialBindingPublication::PrepareAllSlots(
     Renderer& renderer, const FileSceneRuntime& runtime, FileSceneAssetCatalog& catalog,
@@ -90,6 +119,28 @@ SceneMaterialBindingPublication::Result SceneMaterialBindingPublication::Validat
     if(std::this_thread::get_id() != m_thread || !m_prepared)
         return {Stale, "No preparation on this Engine thread."};
     const auto& prepared = *m_prepared;
+    if(prepared.deferred)
+    {
+        const auto current=runtime.GetObjectMetadata(prepared.selection.objectID);
+        if(!current || !SameIdentity(*current,prepared.selection) || catalog.ArchiveSource()!=prepared.archiveSource ||
+            prepared.catalog!=&catalog || prepared.rendererLifetime!=renderer.m_sceneResourceLifetime || renderer.m_sceneResourceScene!=&runtime.GetScene())
+            return {Stale,"Deferred binding scene/archive/renderer identity changed."};
+        if(!renderer.CanEditPendingMaterialBindings(runtime.GetScene()) || runtime.HasPreparedScene() || runtime.HasMaterialAssignment() ||
+            runtime.m_meshResidency || renderer.m_rayTracingScene.m_candidate) return {Retry,"Deferred binding boundary unavailable."};
+        const auto& object=runtime.GetScene().GetRenderObjects()[current->runtimeIndex];
+        if(object.mesh || !object.materialsDeferred || object.material || current->bindingRevision==UINT64_MAX)
+            return {Stale,"Deferred object readiness changed."};
+        std::string error;
+        if(!catalog.ValidateRetainedResidencyMaterial(current->materialReference,prepared.fallback,&error) || !renderer.HasPublishedMaterial(*prepared.fallback))
+            return {Stale,"Deferred fallback ownership changed: "+error};
+        for(const auto& [slot,ref]:current->materialSlotBindings)
+        {
+            const auto found=prepared.runtimeSlots.find(slot);
+            if(found==prepared.runtimeSlots.end() || !found->second || !renderer.HasPublishedMaterial(*found->second) ||
+                !catalog.ValidateRetainedResidencyMaterial(ref,found->second,&error)) return {Stale,"Deferred slot admission changed: "+error};
+        }
+        return {Ready,{}};
+    }
     auto& resources = renderer.m_rayTracingScene;
     const auto& membership = *resources.m_membership;
     std::error_code projectError;
@@ -307,6 +358,15 @@ SceneMaterialBindingPublication::Result SceneMaterialBindingPublication::Publish
         const auto validation = Validate(renderer, runtime, catalog);
         if(validation.status != Ready) return validation;
         auto& stage = *m_prepared;
+        if(stage.deferred)
+        {
+            const auto index=runtime.m_objectMapping.idToRuntimeIndex.at(stage.selection.objectID);
+            auto& object=runtime.m_scene.GetRenderObjects()[index]; auto& committed=runtime.m_objectMapping.committedObjects[index];
+            object.material=stage.fallback; committed.material=stage.fallback;
+            object.slotMaterials.swap(stage.runtimeSlots); committed.slotMaterials.swap(stage.committedSlots);
+            object.materialsDeferred=false; committed.materialsDeferred=false;
+            ++runtime.m_objectMapping.bindingRevisions[index]; Cancel(); return {Ready,{},true};
+        }
         if(stage.noOp) { Cancel(); return {Ready, "Bindings are unchanged.", false}; }
         auto& resources = renderer.m_rayTracingScene;
         resources.CollectRetiredMemberships(renderer.m_commandContext);

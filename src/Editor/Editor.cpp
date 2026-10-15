@@ -352,6 +352,12 @@ void Editor::DrawMainMenu(
         ImGui::EndMenu();
     }
 
+    if(ImGui::BeginMenu("Build"))
+    {
+        if(ImGui::MenuItem("Build")) m_showBuildGame=true;
+        ImGui::EndMenu();
+    }
+
     if (ImGui::BeginMenu("Debug"))
     {
         debugUI.DrawMenu();
@@ -1118,6 +1124,8 @@ void Editor::Draw(
         m_inspectorPanel.DismissSceneMaterialPicker();
     }
 
+    ProcessMaterialLocateRequest(projectPaths,assetRegistry);
+
     if(m_inspectorPanel.TakeRefreshRequest() && m_materialLeaveAction == MaterialLeaveAction::None &&
        m_inspectorTarget == InspectorTarget::Asset)
     {
@@ -1219,6 +1227,7 @@ void Editor::Draw(
     m_assetBrowser.DrawDeletionConfirmation(m_inspectorPanel.HasUnsavedChanges() ||
         m_materialLeaveAction != MaterialLeaveAction::None || m_sceneOperationPending);
 
+    DrawBuildGame();
     DrawSceneViewport(sceneTextureHandle, sceneWidth, sceneHeight);
     DrawMeshDropTarget(demoScene, projectPaths, assetRegistry);
     DrawMaterialDropTarget(demoScene, projectPaths, assetRegistry);
@@ -1296,6 +1305,7 @@ void Editor::Draw(
     // Projection is driven by the actual render extent, including after Inspector controls.
     scene.GetCamera().SetAspectRatio(static_cast<float>(sceneWidth) / static_cast<float>(sceneHeight));
 
+    HandleSceneObjectDuplication(demoScene);
     HandleTransformUndo(demoScene);
     HandleTransformRedo(demoScene);
 
@@ -1765,6 +1775,7 @@ void Editor::DrawTransformGizmo(
     ImGuizmo::SetRect(m_viewportImage.position.x, m_viewportImage.position.y, viewportWidth, viewportHeight);
     const bool allowGizmo = !ImGui::GetIO().AppFocusLost && !m_sceneOperationPending && !HasPendingSceneHistoryOperation() &&
         !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId) && !m_cameraLooking && !m_panLeftHeld &&
+        !ImGui::GetIO().MouseDown[ImGuiMouseButton_Right] &&
         !ImGui::GetDragDropPayload();
     ImGuizmo::Enable(allowGizmo && !m_workspace.IsSplitterDragging() && (m_viewportHovered || ImGuizmo::IsUsing()));
 
@@ -1992,15 +2003,43 @@ void Editor::UpdateCameraLook(
 
     if (!m_cameraLooking)
     {
-        if(!m_viewportHovered || !ImGui::IsMouseClicked(ImGuiMouseButton_Right) || m_sceneOperationPending)
+        const bool panChord = leftDown && rightDown;
+        if(!m_viewportHovered || (!io.MouseClicked[ImGuiMouseButton_Right] && !panChord) || m_sceneOperationPending)
         {
             return;
         }
 
-        if (ImGuizmo::IsUsing() || m_gizmoWasUsing || ImGui::IsAnyItemActive() ||
+        if ((!panChord && (ImGuizmo::IsUsing() || m_gizmoWasUsing)) || ImGui::IsAnyItemActive() ||
             ImGui::GetDragDropPayload() || io.WantTextInput)
         {
             return;
+        }
+
+        if(panChord && (ImGuizmo::IsUsing() || m_gizmoWasUsing))
+        {
+            // A chord cancels the in-progress authored gesture, rather than
+            // publishing its last mouse delta or recording a partial undo edit.
+            if(m_gizmoHistoryEpoch == m_historyEpoch)
+            {
+                if(m_gizmoGroupEdit)
+                {
+                    std::vector<RenderObjectTransformUpdate> updates;
+                    for(const auto& edit : m_gizmoGroupEdit->edits)
+                        if(const auto index = ResolveHistoryTarget(demoScene, edit.target))
+                            updates.push_back({*index, edit.before});
+                    demoScene.GetScene().SetRenderObjectTransforms(updates);
+                }
+                else if(m_gizmoHistoryTarget)
+                {
+                    if(const auto index = ResolveHistoryTarget(demoScene, *m_gizmoHistoryTarget))
+                        demoScene.GetScene().SetRenderObjectTransform(*index, m_gizmoUndoStart);
+                }
+            }
+            ImGuizmo::Enable(false);
+            m_gizmoGroupEdit.reset();
+            m_gizmoHistoryTarget.reset();
+            m_gizmoUndoObject = InvalidObjectSelection;
+            m_gizmoWasUsing = false;
         }
 
         Camera& camera = demoScene.GetScene().GetCamera();
@@ -2957,6 +2996,7 @@ void Editor::ClearSceneHistory()
     // Session invalidation explicitly cancels requests; late results carry the old epoch.
     m_pendingHistoryReplay.reset();
     m_historyReplayRequest.reset();
+    m_duplicationRequest.reset();
     m_stagedDeletionHistory.reset();
 
     m_sceneHistory.clear();
@@ -3237,6 +3277,9 @@ void Editor::ReplaySceneHistory(IDemoScene& demoScene, bool redo)
             redo ? deletion->selectionAfter : deletion->selectionBefore};
         // Copy the outbound payload before locking the cursor. No command addresses escape.
         HistoryReplayRequest request{identity, deletion->object, deletion->documentIndex};
+        if(deletion->insertion) request.bindingSourceID=deletion->selectionBefore;
+        request.membership=true;
+        request.remove=deletion->insertion ? !redo : redo;
         m_historyReplayRequest = std::move(request);
         m_pendingHistoryReplay = PendingHistoryReplay{std::move(identity), m_historyCursor};
         return;
@@ -3395,7 +3438,7 @@ bool Editor::CanPreserveSceneHistory(const IDemoScene& demoScene,
 }
 
 void Editor::PublishRestoredObjectSelection(const FileBackedDemoScene& owner,
-    std::optional<SceneObjectMetadata> selection, std::string activeSceneName) noexcept
+    std::optional<SceneObjectMetadata> selection, std::string activeSceneName, bool retainGroup) noexcept
 {
     const auto& scene = owner.GetScene();
     m_historyObservedScene = &scene;
@@ -3407,7 +3450,7 @@ void Editor::PublishRestoredObjectSelection(const FileBackedDemoScene& owner,
     m_inspectorPanel.ReleaseSceneObjectPreview();
     SuspendViewportInteraction();
     ResetSceneInteractions();
-    if(retainedSelection.size() > 1) m_orderedSelection = std::move(retainedSelection);
+    if(retainGroup && retainedSelection.size() > 1) m_orderedSelection = std::move(retainedSelection);
 
     m_selectionSceneName = std::move(activeSceneName);
     m_selectionStructureRevision = scene.GetStructureRevision();
@@ -3481,7 +3524,7 @@ size_t Editor::ObjectDeletionPayloadBytes(const ObjectDeletion& deletion)
 
 bool Editor::StageObjectDeletionHistory(SceneObjectDocument object, size_t documentIndex,
     std::optional<std::string> selectionBefore, std::optional<std::string> selectionAfter,
-    std::uint64_t operationID, std::uint64_t epoch, bool replay, std::string& error)
+    std::uint64_t operationID, std::uint64_t epoch, bool replay, std::string& error, bool insertion)
 {
     if(!m_historySession || epoch != m_historyEpoch || m_historySession->epoch != epoch)
     {
@@ -3523,6 +3566,7 @@ bool Editor::StageObjectDeletionHistory(SceneObjectDocument object, size_t docum
 
     ObjectDeletion deletion{std::move(object), documentIndex, std::move(selectionBefore),
         std::move(selectionAfter), *m_historySession};
+    deletion.insertion=insertion;
     const auto bytes = ObjectDeletionPayloadBytes(deletion);
 
     if(bytes > kSceneHistoryPayloadBytes)

@@ -53,6 +53,8 @@ class InspectorPanel
 {
 public:
     const std::optional<MaterialPreviewRequest>& GetPreviewRequest();
+    std::optional<std::string> TakeMaterialLocateRequest();
+    void SetMaterialLocateStatus(std::string status) { m_materialLocateStatus=std::move(status); }
     void Draw(
         const EditorWorkspaceRect& rectangle,
         const ProjectPaths& paths,
@@ -107,6 +109,10 @@ public:
         const ProjectAssetRegistry& registry);
 
 private:
+    friend class MaterialLocateVerification;
+    void HandleMaterialLocateItem(std::string_view reference);
+    std::optional<std::string> m_materialLocateRequest;
+    std::string m_materialLocateStatus;
     Renderer* m_thumbnailRenderer = nullptr;
     std::filesystem::path m_meshThumbnailProject;
     std::string m_meshThumbnailReference;

@@ -12,6 +12,7 @@
 class SphereGridScene;
 class ProjectAssetRegistry;
 class ProjectMeshCPUCache;
+namespace CookedScene { struct ArchiveScene; }
 
 class DemoSceneManager
 {
@@ -25,6 +26,7 @@ class DemoSceneManager
       const Shader* pixelShader,
       float aspectRatio);
 
+    bool InitializeArchive(std::shared_ptr<const CookedScene::ArchiveScene>, ID3D12Device*, ResourceUploader&, DescriptorHeap&, const Shader*, const Shader*, float);
     void Shutdown();
 
     // Engine owns the live registry; scene instances only borrow it.
@@ -34,6 +36,9 @@ class DemoSceneManager
 
     bool RequestScene(std::string_view sceneName);
 
+    // Explicit packaged diagnostic source; no filesystem scene path.
+    bool RequestArchiveScene(std::shared_ptr<const CookedScene::ArchiveScene> source, std::string* errorMessage = nullptr);
+    bool HasPendingFileSceneRequest() const noexcept { return !m_requestedFilePath.empty() || bool(m_requestedArchive); }
     bool RequestFileScene(
         const std::filesystem::path& path,
         std::string* errorMessage = nullptr);
@@ -100,6 +105,7 @@ class DemoSceneManager
     std::unique_ptr<IDemoScene> m_activeScene;
     std::unique_ptr<IDemoScene> m_stagedFileScene;
 
+    std::shared_ptr<const CookedScene::ArchiveScene> m_requestedArchive;
     std::filesystem::path m_requestedFilePath;
     std::string m_stagedFileName;
     std::string m_activeFileName;

@@ -1,3 +1,4 @@
+#include "assets/CookedScene.h"
 #include "Scene/FileSceneAssetCatalog.h"
 #include "Scene/MeshResidencyPublication.h"
 #include "assets/MeshCookValidation.h"
@@ -42,10 +43,10 @@ bool ValidateCookedMeshResidencyEvidence(const CookedMeshResidencyEvidence& evid
     }
 
     const auto current = evidence.provider->CheckCurrent();
-    if(current.status != DevelopmentCookedMesh::Status::Success) { return reject(std::string(current.message)); }
+    if(current.status != CookedMeshSource::Status::Success) { return reject(std::string(current.message)); }
     const auto lookup = evidence.provider->Lookup(*id);
 
-    if(lookup.status != DevelopmentCookedMesh::Status::Success || *lookup.evidence != *evidence.asset)
+    if(lookup.status != CookedMeshSource::Status::Success || *lookup.evidence != *evidence.asset)
     {
         return reject("Cooked residency AssetID/payload mapping changed.");
     }
@@ -59,7 +60,7 @@ FileSceneAssetCatalog::CookedPreparationResult FileSceneAssetCatalog::RetainPrep
 {
     try
     {
-        if(!m_initialized || !m_registry)
+        if(!m_initialized || (!m_registry && !m_archiveScene))
         {
             return Fail(Status::Invalid, Failure::Binding, "Cooked metadata requires an initialized project catalog.");
         }
@@ -74,11 +75,12 @@ FileSceneAssetCatalog::CookedPreparationResult FileSceneAssetCatalog::RetainPrep
         if(validity != Status::Available) { return Fail(validity, Failure::Completion, std::move(error)); }
         const auto id = AssetID::ParseReference(reference);
         const auto& identity = completion.identity;
-        const auto* record = id ? m_registry->Find(*id) : nullptr;
+        const auto* record = id && m_registry ? m_registry->Find(*id) : nullptr;
 
-        if(!id || id->ToReference() != reference || *id != identity.cooked->assetID || !record || record->type != AssetType::Mesh ||
-            std::filesystem::canonical(std::filesystem::path(m_projectRoot) / "Cooked").generic_string() !=
-                identity.cooked->mapping.providerNamespace)
+        if(!id || id->ToReference() != reference || *id != identity.cooked->assetID ||
+            (m_archiveScene ? (completion.provider != m_archiveScene->provider ||
+                !ValidateArchiveMesh(reference, identity.cooked.get(), completion.metadata.get(), &error)) :
+                (!record || record->type != AssetType::Mesh || std::filesystem::canonical(m_projectRoot).generic_string() != identity.cooked->mapping.projectNamespace)))
         {
             return Fail(Status::Invalid, Failure::Binding, "Cooked completion belongs to a different project, AssetID or type.");
         }

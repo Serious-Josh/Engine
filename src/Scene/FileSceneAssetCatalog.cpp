@@ -28,6 +28,7 @@
 
 Mesh* FileSceneAssetCatalog::ResolveMesh(std::string_view reference)
 {
+    if(m_archiveScene) { m_meshError = "Archive geometry requires the explicit cooked preparation worker; no loose fallback."; return nullptr; }
     m_meshError.clear();
     const auto fail = [&](const std::string& message) -> Mesh*
     {
@@ -240,6 +241,7 @@ void FileSceneAssetCatalog::SetProjectAssets(
     const ProjectPaths& paths,
     const ProjectAssetRegistry& registry)
 {
+    m_archiveScene.reset();
     m_projectRoot = paths.GetRoot();
     m_registry = &registry;
 }
@@ -292,6 +294,12 @@ Material* FileSceneAssetCatalog::ResolveMaterialVersion(std::string_view referen
         return &m_defaultMaterial;
     }
 
+    if(m_archiveScene)
+    {
+        auto* material = FindRetainedMaterial(reference);
+        if(material) return material;
+        return fail("Packaged material is not admitted; no loose-file fallback.");
+    }
     if(!m_registry)
     {
         return fail("Project material resolution requires the live project registry.");
@@ -757,6 +765,7 @@ void FileSceneAssetCatalog::Shutdown()
     m_materialVersions.clear();
     m_liveTextures.clear();
     m_registry = nullptr;
+    m_archiveScene.reset();
     m_projectRoot.clear();
     m_materialError.clear();
 
@@ -797,6 +806,8 @@ Texture* FileSceneAssetCatalog::ResolveTexture(
 
         return nullptr;
     };
+
+    if(m_archiveScene) return fail("Packaged texture admission is deferred; no loose texture fallback.");
 
     if(errorMessage)
     {
@@ -1101,7 +1112,7 @@ bool FileSceneAssetCatalog::PublishSavedMaterialParameters(const RuntimeMaterial
 Texture* FileSceneAssetCatalog::FindReusableTexture(const std::string& id, ProjectTextureInterpretation interpretation,
     const TextureSource& source)
 {
-    const TextureCacheKey key{std::filesystem::canonical(m_projectRoot), id, interpretation};
+    const TextureCacheKey key{m_archiveScene ? std::filesystem::path{} : std::filesystem::canonical(m_projectRoot), id, interpretation};
     const auto evidence = m_projectTextureSources.find(key);
     const auto cached = m_projectTextures.find(key);
 
@@ -1929,6 +1940,7 @@ Material* FileSceneAssetCatalog::FindPublishedMaterial(std::string_view referenc
 {
     if(auto* retained = FindRetainedMaterial(reference); retained && renderer.HasPublishedMaterial(*retained))
         return retained;
+    if(m_archiveScene) return nullptr; // Archive lookup above never probes a project path.
     const auto id = AssetID::ParseReference(reference);
     std::error_code error;
     const auto project = std::filesystem::canonical(m_projectRoot, error);

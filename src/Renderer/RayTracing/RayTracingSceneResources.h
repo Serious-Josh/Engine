@@ -68,6 +68,7 @@ class RayTracingSceneResources
     private:
         friend class RayTracingSceneResources;
         friend class Renderer;
+        friend class SceneMembershipPublication;
         std::uint64_t m_rendererLifetime = 0;
         std::shared_ptr<CandidateState> m_state;
     };
@@ -161,6 +162,9 @@ class RayTracingSceneResources
     private:
     friend class Renderer;
     friend class MeshResidencyPublication;
+    friend class SceneMembershipPublication;
+    friend class SceneDuplicationVerification;
+    friend class SceneMembershipVerification;
     friend class SceneMaterialBindingPublication;
     friend class SceneMaterialBindingVerification;
     friend class MaterialAdmissionVerification;
@@ -176,7 +180,8 @@ class RayTracingSceneResources
 
     std::optional<ReplacementCandidate> PrepareReplacementCandidate(ID3D12Device5* device,
         DescriptorHeap& heap, const FileSceneRuntime& runtime, FileSceneAssetCatalog& catalog,
-        const std::vector<ResidencyProposal>& proposals, std::size_t materialCount, std::string& error);
+        const std::vector<ResidencyProposal>& proposals, std::size_t materialCount, std::string& error,
+        const FileSceneRuntime* membershipSource = nullptr);
     bool RecordReplacementCandidate(ID3D12Device5* device, ID3D12GraphicsCommandList4* commands,
         std::uint64_t generation, std::string& error);
     CandidateStatus PollReplacementCandidate(const ReplacementCandidate& candidate, const CommandContext& context,
@@ -206,6 +211,7 @@ class RayTracingSceneResources
 
     // Coordinator only, immediately after fresh readiness with a retained source
     // pin and no intervening mutation/recording. All storage is already reserved.
+    AdoptionReadiness PrepareRegistryAdoption(const ReplacementCandidate&, AdoptionEvidence&, std::string&);
     void AdoptPreparedCandidate(const ReplacementCandidate& candidate, const AdoptionEvidence& evidence) noexcept;
 
     bool InitializeMaterialSlots(ID3D12Device5* device, ResourceUploader& uploader,

@@ -2608,7 +2608,7 @@ bool Renderer::Initialize(
     void* windowHandle,
     unsigned int width,
     unsigned int height,
-    const std::filesystem::path& assetRoot)
+    const std::filesystem::path& assetRoot, std::span<const std::byte> packagedShaders, const HDRImageData* initialEnvironment, std::string environmentIdentity)
 {
     if (m_heightmapRegistration.owner)
     {
@@ -2624,6 +2624,7 @@ bool Renderer::Initialize(
         return false;
     }
 
+    m_packagedRuntime = !packagedShaders.empty();
     m_sceneResourceLifetime = 0;
     m_sceneResourceScene = nullptr;
 
@@ -2650,12 +2651,12 @@ bool Renderer::Initialize(
 
     const std::filesystem::path shaderRoot = m_assetRoot / "Shaders";
 
-    if (!DiscoverEnvironments())
+    if (!m_packagedRuntime && !DiscoverEnvironments())
     {
         return false;
     }
 
-    if (!m_shaderLibrary.Initialize(shaderRoot))
+    if (!(m_packagedRuntime ? m_shaderLibrary.InitializePackaged(packagedShaders) : m_shaderLibrary.Initialize(shaderRoot)))
     {
         Log::Error("Failed to initialize shader library.");
         return false;
@@ -2901,6 +2902,7 @@ bool Renderer::Initialize(
         return false;
     }
 
+    if(m_packagedRuntime) m_availableEnvironments = {{initialEnvironment?"Packaged scene HDRI":"Embedded neutral environment", {}}};
     if (m_availableEnvironments.empty())
     {
         Log::Error("No HDR environments were discovered.");
@@ -2911,9 +2913,11 @@ bool Renderer::Initialize(
 
     const EnvironmentAsset& defaultEnvironment = m_availableEnvironments[m_currentEnvironmentIndex];
 
-    const std::filesystem::path environmentPath = m_assetRoot / defaultEnvironment.relativePath;
+    const std::filesystem::path environmentPath = m_packagedRuntime ? std::filesystem::path{} : m_assetRoot / defaultEnvironment.relativePath;
 
-    if (!m_environment.Initialize(device, environmentPath, m_resourceUploader, m_resourceDescriptorHeap))
+    m_environmentIdentity = m_packagedRuntime ? (environmentIdentity.empty()?"neutral":environmentIdentity) : "bootstrap:"+defaultEnvironment.displayName;
+    if (!(initialEnvironment ? m_environment.Initialize(device,*initialEnvironment,m_resourceUploader,m_resourceDescriptorHeap) :
+        m_environment.Initialize(device, environmentPath, m_resourceUploader, m_resourceDescriptorHeap)))
     {
         Log::Error("Failed to initialize environment: " + defaultEnvironment.displayName);
 
@@ -2989,12 +2993,14 @@ bool Renderer::Initialize(
         return false;
     }
 
-    if (!m_debugUI.Initialize(static_cast<HWND>(windowHandle), device, m_commandContext.GetCommandQueue(),
+    if (!m_packagedRuntime && !m_debugUI.Initialize(static_cast<HWND>(windowHandle), device, m_commandContext.GetCommandQueue(),
                               m_resourceDescriptorHeap))
     {
         Log::Error("Failed to init debug UI.");
         return false;
     }
+
+    m_debugUIInitialized = !m_packagedRuntime;
 
     if (!m_gBuffer.Initialize(device, m_sceneWidth, m_sceneHeight, m_rtvDescriptorHeap, m_dsvDescriptorHeap,
                               m_resourceDescriptorHeap))
@@ -3015,7 +3021,7 @@ bool Renderer::Initialize(
         return false;
     }
 
-    if(!m_materialPreviewRenderer.Initialize(
+    if(!m_packagedRuntime && !m_materialPreviewRenderer.Initialize(
             device,
             m_shaderLibrary,
             m_resourceUploader,
@@ -3027,7 +3033,7 @@ bool Renderer::Initialize(
         return false;
     }
 
-    m_textureThumbnails.Configure(device, m_resourceDescriptorHeap);
+    if(!m_packagedRuntime) m_textureThumbnails.Configure(device, m_resourceDescriptorHeap);
 
     m_resizeFailed = false;
     return true;
@@ -3048,6 +3054,7 @@ bool Renderer::InitializeDevice()
         Log::Error("Failed to init command context");
         return false;
     }
+    m_commandContextInitialized=true;
 
     return true;
 }
@@ -5655,61 +5662,76 @@ bool Renderer::RecordRenderFrame(
 
     m_finalSceneColor.Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
-    // Preview updates share scene submission; unchanged valid outputs require no draws.
-    ID3D12DescriptorHeap* previewHeap = m_resourceDescriptorHeap.GetHeap();
-    commandList->SetDescriptorHeaps(1, &previewHeap);
-
-    if(!m_materialPreviewRenderer.Record({commandList, frameIndex,
-            m_brdfIntegrationLUT.GetDescriptorIndex(), m_ggxAverageAlbedoLUT.GetDescriptorIndex(),
-            m_activeRecordingGeneration}))
+    if(m_packagedRuntime)
     {
-        return false;
+        const D3D12_VIEWPORT viewport{0,0,static_cast<float>(m_applicationWidth),static_cast<float>(m_applicationHeight),0,1};
+        const D3D12_RECT scissor{0,0,static_cast<LONG>(m_applicationWidth),static_cast<LONG>(m_applicationHeight)};
+        commandList->RSSetViewports(1,&viewport); commandList->RSSetScissorRects(1,&scissor);
+        m_toneMapPass.Execute(commandList,m_sceneColor,rtvHandle,nullptr,ToneMapDebugView::None,nrdDenoisingRange,
+            nullptr,&m_selectionMask,options.selectionOutlineColor,0,m_gBuffer.GetDepth().GetSRVIndex());
+        barrier.Transition.StateBefore=D3D12_RESOURCE_STATE_RENDER_TARGET;
+        barrier.Transition.StateAfter=D3D12_RESOURCE_STATE_PRESENT;
+        commandList->ResourceBarrier(1,&barrier);
     }
-
-    if(!m_textureThumbnails.Record(commandList, m_activeRecordingGeneration))
+    else
     {
-        return false;
-    }
+        // Preview updates share scene submission; unchanged valid outputs require no draws.
+        ID3D12DescriptorHeap* previewHeap = m_resourceDescriptorHeap.GetHeap();
+        commandList->SetDescriptorHeaps(1, &previewHeap);
 
-    // Uploaded editor previews use the same tracked transitions as material textures.
-    for(Texture* texture : options.editorTextures)
-    {
-        texture->Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-    }
-
-    // UI composes the scene image onto a clean application-sized background.
-    const D3D12_VIEWPORT uiViewport{
-        0.0f, 0.0f, static_cast<float>(m_applicationWidth), static_cast<float>(m_applicationHeight), 0.0f, 1.0f};
-    const D3D12_RECT uiScissor{0, 0, static_cast<LONG>(m_applicationWidth), static_cast<LONG>(m_applicationHeight)};
-    commandList->RSSetViewports(1, &uiViewport);
-    commandList->RSSetScissorRects(1, &uiScissor);
-    commandList->ClearRenderTargetView(rtvHandle, clearColor, 0, nullptr);
-    commandList->OMSetRenderTargets(1, &rtvHandle, FALSE, nullptr);
-
-    ordinaryProbe.reset();
-    m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::DebugUI);
-    {
-        FrameHitchProbe uiProbe(
-            *this,
-            FrameHitchRegion::DebugUI);
-
-        if constexpr (kEnableFrameHitchDiagnostics)
+        if(!m_materialPreviewRenderer.Record({commandList, frameIndex,
+                m_brdfIntegrationLUT.GetDescriptorIndex(), m_ggxAverageAlbedoLUT.GetDescriptorIndex(),
+                m_activeRecordingGeneration}))
         {
-            m_frameHitchDiagnostics.current.uiTextureObserved = true;
-            m_debugUI.EndFrame(commandList, &m_frameHitchDiagnostics.current.uiTextureUploadRequested);
+            return false;
         }
-        else
+
+        if(!m_textureThumbnails.Record(commandList, m_activeRecordingGeneration))
         {
-            m_debugUI.EndFrame(commandList);
+            return false;
         }
+
+        // Uploaded editor previews use the same tracked transitions as material textures.
+        for(Texture* texture : options.editorTextures)
+        {
+            texture->Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        }
+
+        // UI composes the scene image onto a clean application-sized background.
+        const D3D12_VIEWPORT uiViewport{
+            0.0f, 0.0f, static_cast<float>(m_applicationWidth), static_cast<float>(m_applicationHeight), 0.0f, 1.0f};
+        const D3D12_RECT uiScissor{0, 0, static_cast<LONG>(m_applicationWidth), static_cast<LONG>(m_applicationHeight)};
+        commandList->RSSetViewports(1, &uiViewport);
+        commandList->RSSetScissorRects(1, &uiScissor);
+        commandList->ClearRenderTargetView(rtvHandle, clearColor, 0, nullptr);
+        commandList->OMSetRenderTargets(1, &rtvHandle, FALSE, nullptr);
+
+        ordinaryProbe.reset();
+        m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::DebugUI);
+        {
+            FrameHitchProbe uiProbe(
+                *this,
+                FrameHitchRegion::DebugUI);
+
+            if constexpr (kEnableFrameHitchDiagnostics)
+            {
+                m_frameHitchDiagnostics.current.uiTextureObserved = true;
+                m_debugUI.EndFrame(commandList, &m_frameHitchDiagnostics.current.uiTextureUploadRequested);
+            }
+            else
+            {
+                m_debugUI.EndFrame(commandList);
+            }
+        }
+
+        m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::DebugUI);
+
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+
+        commandList->ResourceBarrier(1, &barrier);
+
     }
-
-    m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::DebugUI);
-
-    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
-
-    commandList->ResourceBarrier(1, &barrier);
 
     m_gpuTimestampProfiler.EndFrameAndResolve(commandList, frameIndex);
 
@@ -5908,14 +5930,14 @@ void Renderer::Shutdown()
     m_sceneResourceScene = nullptr;
     Log::Info("Renderer shutdown: waiting for GPU...");
 
-    if (!m_commandContext.WaitForGPU())
+    if (m_commandContextInitialized && !m_commandContext.WaitForGPU())
     {
         Log::Error("Renderer shutdown: GPU completion is unconfirmed; aborting without resource teardown.");
 
         std::abort();
     }
 
-    if(!m_commandContext.DiscardCommandsAfterGPUDrain())
+    if(m_commandContextInitialized && !m_commandContext.DiscardCommandsAfterGPUDrain())
     {
         Log::Error("Renderer shutdown: unsubmitted commands could not be discarded.");
         std::abort();
@@ -5932,7 +5954,8 @@ void Renderer::Shutdown()
     m_commandSubmissionAttempted = false;
 
     Log::Info("Renderer shutdown: shutting down DebugUI...");
-    m_debugUI.Shutdown();
+    if(m_debugUIInitialized) m_debugUI.Shutdown();
+    m_debugUIInitialized=false;
     Log::Info("Renderer shutdown: DebugUI finished.");
 
     Log::Info("Renderer shutdown: releasing renderer resources...");
@@ -5940,6 +5963,7 @@ void Renderer::Shutdown()
     m_swapChain.Shutdown();
     m_gpuTimestampProfiler.Shutdown();
     m_commandContext.Shutdown();
+    m_commandContextInitialized=false;
     m_resourceUploader.Shutdown();
 
     m_gBuffer.Shutdown();
@@ -6528,6 +6552,7 @@ DebugUI& Renderer::GetDebugUI()
 
 bool Renderer::DiscoverEnvironments()
 {
+    if(m_packagedRuntime) { Log::Error("Loose environment discovery rejected in packaged mode."); return false; }
     m_availableEnvironments.clear();
 
     const std::filesystem::path environmentDirectory = m_assetRoot / "Textures" / "Environment";
@@ -6604,6 +6629,7 @@ bool Renderer::DiscoverEnvironments()
 
 bool Renderer::SetEnvironment(size_t index)
 {
+    if(m_packagedRuntime) { Log::Error("Loose environment selection rejected in packaged mode."); return false; }
     if (index >= m_availableEnvironments.size())
     {
         Log::Error("Invalid environment index.");
@@ -6625,6 +6651,7 @@ bool Renderer::SetEnvironment(size_t index)
 
     const EnvironmentAsset& asset = m_availableEnvironments[index];
 
+    if(m_packagedRuntime) { Log::Error("Loose environment loading rejected in packaged mode."); return false; }
     const std::filesystem::path environmentPath = m_assetRoot / asset.relativePath;
 
     if (!m_environment.Initialize(m_graphicsDevice.GetDevice(), environmentPath, m_resourceUploader,
@@ -6651,6 +6678,22 @@ bool Renderer::SetEnvironment(size_t index)
     Log::Info("Environment changed to: " + asset.displayName);
 
     return true;
+}
+
+bool Renderer::SetEnvironmentImage(const HDRImageData* image,std::string identity,std::string displayName,std::string reference)
+{
+    if(identity==m_environmentIdentity) return true;
+    if(m_activeRecordingGeneration || !m_commandContext.WaitForGPU() || !m_commandContext.DiscardCommandsAfterGPUDrain())
+    { Log::Error("Environment replacement requires a confirmed GPU drain outside recording."); return false; }
+    m_environment.Shutdown();
+    const bool loaded=image ? m_environment.Initialize(m_graphicsDevice.GetDevice(),*image,m_resourceUploader,m_resourceDescriptorHeap) :
+        m_environment.Initialize(m_graphicsDevice.GetDevice(),std::filesystem::path{},m_resourceUploader,m_resourceDescriptorHeap);
+    if(!loaded || !PreprocessEnvironment(m_environment)) { Log::Error("Required environment upload/conversion failed."); return false; }
+    m_environmentIdentity=std::move(identity);
+    auto entry=std::find_if(m_availableEnvironments.begin(),m_availableEnvironments.end(),[&](const auto& e){return e.relativePath.empty() && e.reference==reference && e.displayName==displayName;});
+    if(entry==m_availableEnvironments.end()) { m_availableEnvironments.push_back({std::move(displayName),{},std::move(reference)}); m_currentEnvironmentIndex=m_availableEnvironments.size()-1; }
+    else m_currentEnvironmentIndex=static_cast<size_t>(entry-m_availableEnvironments.begin());
+    ResetSceneHistory(); return true;
 }
 
 bool Renderer::PreprocessEnvironment(EnvironmentMap& environment)

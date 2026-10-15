@@ -41,6 +41,7 @@ class Shader;
 class Renderer;
 class ProjectPaths;
 class ProjectAssetRegistry;
+namespace CookedScene { struct ArchiveScene; }
 
 enum class SavedMaterialRevisionResult { Pending, Applied, Rejected };
 
@@ -90,6 +91,11 @@ public:
     void Shutdown();
 
     // Configure after Initialize; Engine owns the registry and outlives this catalog.
+    void SetArchiveScene(std::shared_ptr<const CookedScene::ArchiveScene> source);
+    bool ValidateArchiveMesh(std::string_view reference, const CookedMeshSource::AssetEvidence* evidence,
+        const CookedMesh::MetadataSnapshot* metadata, std::string* error) const;
+    bool IsArchiveActivation() const noexcept { return bool(m_archiveScene); }
+    const std::shared_ptr<const CookedScene::ArchiveScene>& ArchiveSource() const noexcept { return m_archiveScene; }
     void SetProjectAssets(const ProjectPaths& paths, const ProjectAssetRegistry& registry);
     void SetMeshCPUCache(ProjectMeshCPUCache* cache) noexcept { m_meshCPUCache = cache; }
     void SetTextureStreamingEnabled(bool enabled) noexcept { m_textureStreamingEnabled = enabled; }
@@ -325,6 +331,7 @@ private:
     static constexpr size_t kMaterialVersionCapacity = 64;
     std::vector<std::unique_ptr<MaterialVersion>> m_materialVersions;
     Material* ResolveMaterialVersion(std::string_view reference, bool fresh);
+    std::shared_ptr<const CookedScene::ArchiveScene> m_archiveScene;
     std::filesystem::path m_projectRoot;
     const ProjectAssetRegistry* m_registry = nullptr;
     std::string m_materialError;

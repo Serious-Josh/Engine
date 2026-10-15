@@ -15,10 +15,13 @@ class MaterialSourceLease
 {
 public:
     HANDLE handle = INVALID_HANDLE_VALUE;
+    std::shared_ptr<const CookedMeshSource::ArchiveProvider> archive;
+    bool valid = true;
     BY_HANDLE_FILE_INFORMATION identity{};
     ~MaterialSourceLease() { Revoke(); }
     void Revoke() noexcept
     {
+        valid = false;
         if(handle != INVALID_HANDLE_VALUE) CloseHandle(std::exchange(handle, INVALID_HANDLE_VALUE));
     }
     bool Matches(const std::filesystem::path& path) const
@@ -39,7 +42,7 @@ public:
 
 bool ProjectMaterialPreparationService::Candidate::HasPinnedSources() const noexcept
 {
-    if(!source || source->handle == INVALID_HANDLE_VALUE) return false;
+    if(!source || !source->valid || (!archive && source->handle == INVALID_HANDLE_VALUE)) return false;
     for(const auto& texture : textures)
         if(texture && (!texture->source || !texture->current || !texture->current->load())) return false;
     return true;
@@ -62,6 +65,15 @@ namespace
         const std::function<void()>& pinned)
     {
         auto pin = std::make_shared<MaterialSourceLease>();
+        if(candidate.archive)
+        {
+            const auto id = *AssetID::Parse(candidate.assetID);
+            auto raw = candidate.archive->ReadEntry(id,EngineAssetPak::Type::Material,CookedSurface::Version,CookedSurface::MaterialLimit);
+            auto decoded = CookedSurface::DecodeMaterial(raw);
+            if(decoded.id!=id || decoded.generation!=candidate.contentGeneration) throw std::runtime_error("Archive material identity/generation mismatch.");
+            candidate.parameters=std::move(decoded.parameters); candidate.archiveDependencies=std::move(decoded.dependencies);
+            pin->archive=candidate.archive; source=std::move(pin); return;
+        }
         pin->handle = CreateFileW(candidate.path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
             OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
         if(pin->handle == INVALID_HANDLE_VALUE || !GetFileInformationByHandle(pin->handle, &pin->identity) ||
@@ -158,6 +170,7 @@ ProjectMaterialPreparationService::Status ProjectMaterialPreparationService::Req
     const ProjectAssetRegistry& registry, const AssetID& id, std::uint64_t session,
     std::uint64_t& ticket, std::string& error)
 {
+    if(m_archiveOnly) { ticket=0; error="Loose material access rejected by packaged policy."; return Status::Unsupported; }
     ticket = 0; error.clear();
     auto& state = *m_state;
     if(state.stopping) { error = "Material preparation stopped."; return Status::Stale; }
@@ -194,8 +207,35 @@ ProjectMaterialPreparationService::Status ProjectMaterialPreparationService::Req
     catch(const std::exception& exception) { error = exception.what(); return Status::Failed; }
 }
 
-ProjectMaterialPreparationService::Result ProjectMaterialPreparationService::Poll(std::uint64_t ticket,
-    const ProjectPaths& paths, const ProjectAssetRegistry& registry, std::uint64_t session)
+ProjectMaterialPreparationService::Status ProjectMaterialPreparationService::RequestArchive(std::shared_ptr<const CookedMeshSource::ArchiveProvider> archive,
+    const AssetID& id,std::uint64_t session,std::uint64_t& ticket,std::string& error)
+{
+    ticket=0; auto& state=*m_state;
+    if(state.stopping) return Status::Stale;
+    if(state.jobs.size()>=Capacity || state.retained->load()>=Capacity || state.nextTicket==UINT64_MAX) return Status::Retry;
+    try
+    {
+        const auto* entry=archive ? archive->ArchiveEntry(id) : nullptr;
+        if(!entry || entry->type!=EngineAssetPak::Type::Material || entry->payloadVersion!=CookedSurface::Version || entry->storedBytes>MaterialByteLimit)
+            throw std::runtime_error("Missing/unsupported archive material.");
+        auto job=std::make_shared<State::Job>(); auto storage=std::make_unique<Candidate>(); auto retained=state.retained; ++*retained;
+        job->candidate=std::shared_ptr<Candidate>(storage.release(),[retained](Candidate* c){ delete c; --*retained; });
+        auto& candidate=*job->candidate; candidate.assetID=id.ToString(); candidate.session=session; candidate.contentGeneration=entry->generation;
+        candidate.digest=CookedSurface::Identity(*archive,id); candidate.archive=std::move(archive);
+        const auto proposed=state.nextTicket++; state.jobs.emplace(proposed,job);
+        try { std::lock_guard lock(state.mutex); std::erase_if(state.queue,[](const auto& j){return j->canceled.load();}); state.queue.push_back(job); }
+        catch(...) { state.jobs.erase(proposed); throw; }
+        ticket=proposed; state.wake.notify_one(); return Status::Pending;
+    }
+    catch(const std::exception& e) { error=e.what(); return Status::Failed; }
+}
+ProjectMaterialPreparationService::Result ProjectMaterialPreparationService::Poll(std::uint64_t ticket,const ProjectPaths& paths,const ProjectAssetRegistry& registry,std::uint64_t session)
+{ return PollInternal(ticket,&paths,&registry,session); }
+ProjectMaterialPreparationService::Result ProjectMaterialPreparationService::PollArchive(std::uint64_t ticket,std::uint64_t session)
+{ return PollInternal(ticket,nullptr,nullptr,session); }
+
+ProjectMaterialPreparationService::Result ProjectMaterialPreparationService::PollInternal(std::uint64_t ticket,
+    const ProjectPaths* paths, const ProjectAssetRegistry* registry, std::uint64_t session)
 {
     auto& state = *m_state;
     const auto found = state.jobs.find(ticket);
@@ -221,7 +261,7 @@ ProjectMaterialPreparationService::Result ProjectMaterialPreparationService::Pol
         job.result = {status, {}, std::move(message)};
         return job.result;
     };
-    if(!Validate(candidate, paths, registry, session, error)) return reject(Status::Stale, error);
+    if(!(candidate.archive ? ValidateArchive(candidate,session,error) : (paths && registry && Validate(candidate,*paths,*registry,session,error)))) return reject(Status::Stale, error);
     if(job.result.status == Status::Ready) return job.result;
     const auto references = References(candidate.parameters);
     for(size_t slot = 0; slot < references.size(); ++slot)
@@ -231,8 +271,8 @@ ProjectMaterialPreparationService::Result ProjectMaterialPreparationService::Pol
         if(!id) return reject(Status::Unsupported, "Texture dependency requires a registered AssetID.");
         if(!job.tickets[slot])
         {
-            if(!state.textures.Request(paths, registry, *id, Interpretation(slot), {}, state.textures.Generation(),
-                job.tickets[slot], error))
+            if(!(candidate.archive ? state.textures.RequestArchive(candidate.archive,*id,Interpretation(slot),state.textures.Generation(),job.tickets[slot],error) :
+                state.textures.Request(*paths,*registry,*id,Interpretation(slot),{},state.textures.Generation(),job.tickets[slot],error)))
             {
                 if(error.starts_with("Deferred:"))
                 {
@@ -247,14 +287,14 @@ ProjectMaterialPreparationService::Result ProjectMaterialPreparationService::Pol
                 return reject(Status::Failed, error);
             }
         }
-        auto completion = state.textures.Poll(job.tickets[slot], paths, registry);
+        auto completion = candidate.archive ? state.textures.PollArchive(job.tickets[slot]) : state.textures.Poll(job.tickets[slot],*paths,*registry);
         if(!completion) continue;
         if(!completion->prepared) return reject(Status::Failed, completion->error);
         candidate.textures[slot] = std::move(completion);
     }
     for(size_t slot = 0; slot < references.size(); ++slot)
         if(references[slot] && !candidate.textures[slot]) return {};
-    if(!Validate(candidate, paths, registry, session, error)) return reject(Status::Stale, error);
+    if(!(candidate.archive ? ValidateArchive(candidate,session,error) : (paths && registry && Validate(candidate,*paths,*registry,session,error)))) return reject(Status::Stale, error);
     job.result = {Status::Ready, job.candidate, {}};
     return job.result;
 }
@@ -308,4 +348,28 @@ void ProjectMaterialPreparationService::Shutdown()
     { std::lock_guard lock(m_state->mutex); m_state->stopping = true; m_state->queue.clear(); }
     m_state->wake.notify_one();
     m_state->worker.join();
+}
+
+bool ProjectMaterialPreparationService::ValidateArchive(const Candidate& c,std::uint64_t session,std::string& error) const
+{
+    try
+    {
+        bool owned=false; for(const auto& [ticket,job]:m_state->jobs) if(job->candidate.get()==&c && !job->canceled) { owned=true; break; }
+        auto id=AssetID::Parse(c.assetID);
+        if(!owned || !id || c.session!=session || !c.archive || !c.project.empty() || !c.path.empty() || !c.source || !c.source->valid || c.source->archive!=c.archive ||
+            !CookedSurface::Matches(*c.archive,*id,EngineAssetPak::Type::Material,c.contentGeneration,c.digest)) throw std::runtime_error("Archive material snapshot/session/ownership stale.");
+        const auto refs=CookedSurface::References(c.parameters);
+        for(size_t i=0;i<7;++i)
+        {
+            if(bool(refs[i])!=bool(c.archiveDependencies[i])) throw std::runtime_error("Incomplete archive material dependency evidence.");
+            if(!refs[i]) continue;
+            auto texture=AssetID::ParseReference(*refs[i]); auto* entry=texture ? c.archive->ArchiveEntry(*texture) : nullptr;
+            if(!entry || entry->type!=EngineAssetPak::Type::Texture || entry->payloadVersion!=CookedSurface::Version || entry->generation!=c.archiveDependencies[i]->generation ||
+                entry->sha256!=c.archiveDependencies[i]->sha256) throw std::runtime_error("Missing/stale archive texture dependency.");
+            if(c.textures[i] && (c.textures[i]->identity.archive!=c.archive || c.textures[i]->identity.assetID!=texture->ToString() ||
+                c.textures[i]->identity.interpretation!=CookedSurface::Interpretation(i) || !m_state->textures.ValidateArchive(*c.textures[i],error))) return false;
+        }
+        return true;
+    }
+    catch(const std::exception& e) { error=e.what(); return false; }
 }

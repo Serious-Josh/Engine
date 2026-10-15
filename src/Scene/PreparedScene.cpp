@@ -16,6 +16,7 @@ bool PrepareScene(
     }
 
     PreparedScene prepared;
+    prepared.environmentReference = document.environmentReference;
     prepared.camera = document.camera;
     prepared.directionalLight = document.directionalLight;
 

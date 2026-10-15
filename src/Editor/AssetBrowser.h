@@ -20,6 +20,8 @@ class AssetBrowser
 {
 public:
     AssetBrowser();
+    bool RevealMaterial(const AssetID&,const ProjectPaths&,const ProjectAssetRegistry&,std::string& error);
+    std::optional<AssetID> GetNavigationHighlight() const noexcept { return m_navigationHighlight; }
 
     const std::filesystem::path& GetSelection() const noexcept
     {
@@ -106,6 +108,7 @@ public:
         const std::string& error);
 
 private:
+    friend class MaterialLocateVerification;
     struct MovePayload
     {
         std::uint64_t projectIdentity = 0;
@@ -215,6 +218,8 @@ private:
     std::filesystem::path m_selection;
 
     bool m_selectionIntent = false;
+    std::optional<AssetID> m_navigationHighlight;
+    bool m_revealPending = false;
 
     std::map<std::filesystem::path, Listing> m_listings;
 

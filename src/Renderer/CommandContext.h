@@ -56,6 +56,7 @@ class CommandContext
     bool DiscardCommandsAfterGPUDrain();
 
     bool Execute(unsigned int frameIndex);
+    std::uint64_t GetGPUDrainCount() const noexcept { return m_gpuDrainCount; }
     bool WaitForGPU();
 
     ID3D12GraphicsCommandList* GetCommandList() const;
@@ -138,6 +139,7 @@ class CommandContext
 
     private:
 
+    std::uint64_t m_gpuDrainCount = 0;
     bool m_executeCpuTimingEnabled = false;
 
     ExecuteCpuTiming m_executeCpuTiming{};

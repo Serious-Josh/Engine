@@ -17,12 +17,21 @@ bool EnvironmentMap::Initialize(
 {
     HDRImageData image{};
 
-    if (!ImageLoader::LoadHDR(path, image))
+    if(path.empty())
+    {
+        image.width=16; image.height=8; image.channels=4; image.pixels.resize(16*8*4,0.18f);
+        for(size_t i=3;i<image.pixels.size();i+=4) image.pixels[i]=1.0f;
+    }
+    else if (!ImageLoader::LoadHDR(path, image))
     {
         Log::Error("Failed to load HDR environment.");
         return false;
     }
 
+    return Initialize(device,image,uploader,descriptorHeap);
+}
+bool EnvironmentMap::Initialize(ID3D12Device* device,const HDRImageData& image,ResourceUploader& uploader,DescriptorHeap& descriptorHeap)
+{
     Log::Info("HDR environment loaded: " + std::to_string(image.width) + "x" + std::to_string(image.height));
 
     std::vector<float> conditionalCDF(static_cast<size_t>(image.width) * static_cast<size_t>(image.height));

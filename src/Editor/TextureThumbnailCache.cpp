@@ -147,6 +147,7 @@ struct TextureThumbnailCache::Worker
     std::deque<Job> jobs;
     std::optional<Result> result;
     bool stop = false;
+    bool started = false;
 
     static bool Current(const TextureThumbnailDiskCache::Source& source)
     {
@@ -232,9 +233,7 @@ struct TextureThumbnailCache::Worker
 
 TextureThumbnailCache::TextureThumbnailCache() : m_worker(std::make_shared<Worker>())
 {
-    // Detached CPU ownership lets cancellation/clear return without waiting for disk or decode.
-    // The worker's shared state outlives the cache and contains no device or descriptor pointers.
-    std::thread([worker = m_worker] { worker->Run(); }).detach();
+    // Allocate inert state only. Packaged startup never configures this editor service.
 }
 
 TextureThumbnailCache::~TextureThumbnailCache()
@@ -247,6 +246,12 @@ TextureThumbnailCache::~TextureThumbnailCache()
 
 void TextureThumbnailCache::Configure(ID3D12Device* device, DescriptorHeap& heap)
 {
+    if(!m_worker->started)
+    {
+        // Detached CPU state contains no device/descriptor borrows and survives cancellation.
+        std::thread([worker=m_worker] { worker->Run(); }).detach();
+        m_worker->started=true;
+    }
     m_device = device;
     m_heap = &heap;
 }

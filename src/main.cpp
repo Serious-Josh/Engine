@@ -1,4 +1,5 @@
 #include "Engine/Engine.h"
+#include "Engine/PackagedBootstrap.h"
 #include "Core/Log.h"
 
 #include <cstdlib>
@@ -15,13 +16,94 @@ int VerifyCookedMeshPreparation(const std::filesystem::path& projectRoot);
 
 int main(int argc, char** argv)
 {
+    if(argc>=2 && std::string_view(argv[1])=="--package-bootstrap")
+    {
+        if(argc!=7) { Log::Error("Usage: --package-bootstrap <input.toc> <input.eap> <output.toc> <output.eap> <authoring-shader-root>"); return 1; }
+        try { PackagedBootstrap::Cook(argv[2],argv[3],argv[4],argv[5],argv[6]); return 0; }
+        catch(const std::exception& e) { Log::Error(std::string("Offline bootstrap cook: ")+e.what()); return 1; }
+    }
+    const bool packaged=argc>=2 && (std::string_view(argv[1])=="--packaged-runtime" || std::string_view(argv[1])=="--verify-packaged-bootstrap");
+    if(packaged)
+    {
+        if(argc!=5 || !AssetID::Parse(argv[4])) { Log::Error("Usage: --packaged-runtime|--verify-packaged-bootstrap <toc> <eap> <scene-uuid>"); return 1; }
+        auto packagedEngine=std::make_unique<Engine>();
+        auto& engine=*packagedEngine; EngineStartup startup; startup.mode=EngineStartup::Mode::PackagedRuntime;
+        startup.toc=argv[2]; startup.pak=argv[3]; startup.sceneID=AssetID::Parse(argv[4]);
+        bool success=false;
+        try
+        {
+            success=engine.Initialize(startup);
+            if(success) { if(std::string_view(argv[1])=="--verify-packaged-bootstrap") engine.VerifyPackagedBootstrap(); else engine.Run(); }
+        }
+        catch(const std::exception& e) { Log::Error(std::string("Packaged bootstrap: ")+e.what()); success=false; }
+        engine.Shutdown(); return success ? 0 : 1;
+    }
+#ifndef NDEBUG
+    if(argc>=2 && std::string_view(argv[1])=="--verify-scene-hdri")
+    {
+        if(argc!=4) { Log::Error("Usage: --verify-scene-hdri <private-scene-copy> <output-directory>"); return 1; }
+        auto owned=std::make_unique<Engine>(); bool success=false;
+        try { success=owned->Initialize(); if(success) success=owned->VerifySceneHDRI(std::filesystem::absolute(argv[2]),std::filesystem::absolute(argv[3])); }
+        catch(const std::exception& e) { Log::Error(std::string("Scene HDRI diagnostic: ")+e.what()); success=false; }
+        owned->Shutdown(); return success ? 0 : 1;
+    }
+    if(argc==2 && std::string_view(argv[1])=="--verify-viewport-pan")
+    {
+        auto engine=std::make_unique<Engine>(); bool success=false;
+        try { success=engine->Initialize(); if(success) success=engine->VerifyViewportPan(); }
+        catch(const std::exception& e) { Log::Error(std::string("Viewport pan diagnostic: ")+e.what()); success=false; }
+        engine->Shutdown(); return success ? 0 : 1;
+    }
+    if(argc==2 && std::string_view(argv[1])=="--verify-material-locate")
+    {
+        auto engine=std::make_unique<Engine>(); bool success=false;
+        try { success=engine->Initialize(); if(success) success=engine->VerifyMaterialLocate(); }
+        catch(const std::exception& e) { Log::Error(std::string("Material locate diagnostic: ")+e.what()); success=false; }
+        engine->Shutdown(); return success ? 0 : 1;
+    }
+    if(argc>=2 && std::string_view(argv[1])=="--verify-scene-duplication")
+    {
+        if(argc!=3) { Log::Error("Usage: --verify-scene-duplication <private-fixture.scene>"); return 1; }
+        auto engine=std::make_unique<Engine>(); bool success=false;
+        try { success=engine->Initialize(); if(success) success=engine->VerifySceneDuplication(argv[2]); }
+        catch(const std::exception& e) { Log::Error(std::string("Duplication diagnostic: ")+e.what()); success=false; }
+        engine->Shutdown(); return success ? 0 : 1;
+    }
+    if(argc>=2 && std::string_view(argv[1])=="--verify-scene-membership")
+    {
+        if(argc!=3) { Log::Error("Usage: --verify-scene-membership <private-fixture-scene>"); return 1; }
+        auto engine=std::make_unique<Engine>(); bool success=false;
+        try { success=engine->Initialize(); if(success) success=engine->VerifySceneMembership(argv[2]); }
+        catch(const std::exception& e) { Log::Error(std::string("Membership diagnostic: ")+e.what()); success=false; }
+        engine->Shutdown(); return success ? 0 : 1;
+    }
+    if(argc>=2 && std::string_view(argv[1])=="--verify-build-game")
+    {
+        if(argc!=4) { Log::Error("Usage: --verify-build-game <current-scene> <output-directory>"); return 1; }
+        auto diagnosticEngine=std::make_unique<Engine>();
+        auto& engine=*diagnosticEngine; bool success=false;
+        try { success=engine.Initialize(); if(success) success=engine.VerifyBuildGame(argv[2],std::filesystem::absolute(argv[3])); }
+        catch(const std::exception& e) { Log::Error(std::string("Build Game diagnostic: ")+e.what()); success=false; }
+        engine.Shutdown(); return success ? 0 : 1;
+    }
+#endif
+    const bool surfaces = argc >= 2 && std::string_view(argv[1]) == "--verify-archive-materials";
+    if(surfaces && argc!=3) { Log::Error("Usage: --verify-archive-materials <authoring-scene>"); return 1; }
+    const bool cookedScene = argc >= 2 && std::string_view(argv[1]) == "--verify-cooked-scene-archive";
+    const bool activateArchive = argc >= 2 && std::string_view(argv[1]) == "--activate-scene-archive";
+    if((cookedScene && argc != 3) || (activateArchive && (argc != 5 || !AssetID::Parse(argv[4]))))
+    {
+        Log::Error("Usage: --verify-cooked-scene-archive <authoring-scene> | --activate-scene-archive <toc> <eap> <scene-uuid>");
+        return 1;
+    }
+    const bool archiveGPU = argc >= 2 && std::string_view(argv[1]) == "--verify-archive-cooked-publication";
     const bool cookedGPU = argc >= 2 && (std::string_view(argv[1]) == "--verify-cooked-gpu-preparation" ||
-        std::string_view(argv[1]) == "--verify-cooked-publication");
+        std::string_view(argv[1]) == "--verify-cooked-publication" || archiveGPU);
     const bool visualReview = argc == 4 && std::string_view(argv[1]) == "--verify-cooked-publication" &&
         std::string_view(argv[3]) == "--visual";
     if(cookedGPU && argc != 3 && !visualReview)
     {
-        Log::Error("Usage: Engine.exe --verify-cooked-gpu-preparation|--verify-cooked-publication <absolute-scene-path> [--visual (publication only)]");
+        Log::Error("Usage: Engine.exe --verify-cooked-gpu-preparation|--verify-cooked-publication|--verify-archive-cooked-publication <absolute-scene-path> [--visual (publication only)]");
         return 1;
     }
 #ifndef NDEBUG
@@ -64,16 +146,17 @@ int main(int argc, char** argv)
     }
 #else
     if(argc >= 2 && (std::string_view(argv[1]) == "--cook-meshes" || std::string_view(argv[1]) == "--verify-cooked-provider" ||
-        std::string_view(argv[1]) == "--verify-cooked-preparation" || cookedGPU))
+        std::string_view(argv[1]) == "--verify-cooked-preparation" || cookedGPU || cookedScene || activateArchive || surfaces))
     {
         Log::Error("Mesh development diagnostics require the Debug executable.");
         return 1;
     }
 #endif
 
-    Engine engine;
+    auto editorEngine=std::make_unique<Engine>();
+    auto& engine=*editorEngine;
 
-    if (!engine.Initialize())
+    if (!engine.Initialize(cookedScene || activateArchive || surfaces))
     {
         Log::Error("Engine initialization failed; aborting without automatic resource teardown because GPU completion may be unconfirmed.");
         std::abort();
@@ -89,12 +172,24 @@ int main(int argc, char** argv)
         engine.Shutdown();
         return verified ? 0 : 1;
     }
+    if(cookedScene || activateArchive || surfaces)
+    {
+        bool verified = false;
+        try
+        {
+            verified = surfaces ? engine.VerifyArchiveMaterials(argv[2]) : cookedScene ? engine.VerifyCookedSceneArchive(argv[2]) :
+                engine.ActivateCookedSceneArchive(argv[2],argv[3],*AssetID::Parse(argv[4]));
+        }
+        catch(const std::exception& error) { Log::Error("Cooked scene archive diagnostic: " + std::string(error.what())); }
+        engine.Shutdown(); return verified ? 0 : 1;
+    }
     if(cookedGPU)
     {
         bool verified = false;
         try
         {
-            verified = std::string_view(argv[1]) == "--verify-cooked-gpu-preparation" ?
+            verified = archiveGPU ? engine.VerifyArchiveCookedMeshPublication(std::filesystem::path(argv[2])) :
+                std::string_view(argv[1]) == "--verify-cooked-gpu-preparation" ?
                 engine.VerifyCookedMeshGPUPreparation(std::filesystem::path(argv[2])) :
                 engine.VerifyCookedMeshPublication(std::filesystem::path(argv[2]), visualReview);
         }

@@ -1,7 +1,7 @@
 #pragma once
 
 #include "assets/ProjectMeshCPUCache.h"
-#include "assets/DevelopmentCookedMeshProvider.h"
+#include "assets/CookedMeshProvider.h"
 
 #include <cstdint>
 #include <utility>
@@ -13,8 +13,8 @@ class FileSceneAssetCatalog;
 // provider's currentness check cannot exclude a concurrent activation replacement.
 struct CookedMeshResidencyEvidence
 {
-    std::shared_ptr<const DevelopmentCookedMesh::Provider> provider;
-    std::shared_ptr<const DevelopmentCookedMesh::AssetEvidence> asset;
+    std::shared_ptr<const CookedMeshSource::Provider> provider;
+    std::shared_ptr<const CookedMeshSource::AssetEvidence> asset;
     std::shared_ptr<const CookedMesh::MetadataSnapshot> metadata;
     std::shared_ptr<const std::atomic_bool> current;
 };

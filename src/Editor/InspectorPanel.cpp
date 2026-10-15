@@ -165,6 +165,13 @@ const std::optional<MaterialPreviewRequest>& InspectorPanel::GetPreviewRequest()
     return m_previewRequest;
 }
 
+std::optional<std::string> InspectorPanel::TakeMaterialLocateRequest()
+{ return std::exchange(m_materialLocateRequest,std::nullopt); }
+void InspectorPanel::HandleMaterialLocateItem(std::string_view reference)
+{
+    if(ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled) && ImGui::IsMouseClicked(ImGuiMouseButton_Right))
+        m_materialLocateRequest=std::string(reference);
+}
 void InspectorPanel::DrawSceneObject(const EditorWorkspaceRect& rectangle, const SceneObjectInspectorView& object,
     const std::function<void()>& drawTransformControls,
     const ProjectPaths& paths, const ProjectAssetRegistry& registry,
@@ -197,6 +204,7 @@ void InspectorPanel::DrawSceneObject(const EditorWorkspaceRect& rectangle, const
         ImGui::Separator();
         DrawSceneAssetTiles(object, paths, registry, assignmentPending);
         DrawSceneMaterialPicker(object, paths, registry, assignmentPending);
+        if(!m_materialLocateStatus.empty()) ImGui::TextWrapped("%s",m_materialLocateStatus.c_str());
 
         if(!assignmentStatus.empty())
         {
@@ -339,6 +347,7 @@ void InspectorPanel::DrawSceneAssetTiles(const SceneObjectInspectorView& object,
         ImGui::TextUnformatted("Materials");
         ImGui::TextDisabled("Mesh metadata unavailable. Authored overrides are retained.");
         ImGui::TextWrapped("Fallback: %s", object.material.c_str());
+        if(object.metadata) HandleMaterialLocateItem(object.metadata->materialReference);
 
         if(object.metadata)
         {
@@ -349,6 +358,7 @@ void InspectorPanel::DrawSceneAssetTiles(const SceneObjectInspectorView& object,
                 const auto materialName = record && record->type == AssetType::Material ?
                     record->relativePath.stem().generic_string() : "Unavailable: " + reference;
                 ImGui::TextWrapped("Override %s: %s", slotID.c_str(), materialName.c_str());
+                HandleMaterialLocateItem(reference);
             }
         }
 
@@ -370,6 +380,7 @@ void InspectorPanel::DrawSceneAssetTiles(const SceneObjectInspectorView& object,
                 {
                     ImGui::TextWrapped("Unrecognized authored override %s: %s (retained; requires compatible mesh metadata)",
                         slotID.c_str(), reference.c_str());
+                    HandleMaterialLocateItem(reference);
                 }
             }
         }
@@ -421,12 +432,14 @@ void InspectorPanel::DrawSceneAssetTiles(const SceneObjectInspectorView& object,
             return image ? std::optional<D3D12_GPU_DESCRIPTOR_HANDLE>(image->srv) : std::nullopt;
         }, object.metadata.has_value() && !assignmentPending && !m_slotAssignmentPending);
 
+        HandleMaterialLocateItem(slot.materialReference);
         if(pressed)
         {
             selectedSlot = slot.id;
         }
 
         ImGui::TextWrapped("%s", slot.materialName.c_str());
+        HandleMaterialLocateItem(slot.materialReference);
         ImGui::TextDisabled("%s", slot.explicitBinding ? "Explicit slot override" : "Inherited fallback");
         ImGui::PopID();
     }
@@ -479,9 +492,10 @@ std::optional<std::string> InspectorPanel::DrawCompactMaterialSlots(
             selectedSlot = slot.id;
         }
 
+        HandleMaterialLocateItem(slot.materialReference);
         if(ImGui::IsItemHovered())
         {
-            ImGui::SetTooltip("%s\nClick to choose a material for this slot.", materialName.c_str());
+            ImGui::SetTooltip("%s\nClick to choose a material for this slot. Right-click to locate it in Asset Browser.", materialName.c_str());
         }
 
         if(!interactive)

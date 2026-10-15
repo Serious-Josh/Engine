@@ -1,3 +1,4 @@
+#include "assets/CookedSurface.h"
 #include "Scene/MeshResidency.h"
 #include "Scene/FileSceneRuntime.h"
 #include "Scene/FileSceneAssetCatalog.h"
@@ -103,6 +104,8 @@ MeshResidencySourceLock FileSceneAssetCatalog::ValidateMeshResidencyCandidate(
         return reject("Residency candidate catalog lifetime is stale.");
     }
 
+    if(m_archiveScene && candidate.sourceKind != MeshResidencyCandidate::SourceKind::Cooked)
+        return reject("Archive catalogs accept only verified cooked candidates; no loose or builtin mesh fallback.");
     // Prove catalog ownership before dereferencing any copied mesh borrow.
     const Mesh* ownedMesh = nullptr;
     const ImportedMesh* ownedGeometry = nullptr;
@@ -126,7 +129,7 @@ MeshResidencySourceLock FileSceneAssetCatalog::ValidateMeshResidencyCandidate(
         const auto owned = m_projectMeshes.find(candidate.key);
 
         if ((!cooked && candidate.sourceKind != MeshResidencyCandidate::SourceKind::ProjectAsset) ||
-            !candidate.builtinReference.empty() || !m_registry || owned == m_projectMeshes.end() ||
+            !candidate.builtinReference.empty() || (!m_registry && !m_archiveScene) || owned == m_projectMeshes.end() ||
             candidate.mesh != &owned->second->mesh || !owned->second->published || !owned->second->geometry)
         {
             return reject("Residency candidate is not retained and upload-complete in this catalog.");
@@ -196,9 +199,9 @@ MeshResidencySourceLock FileSceneAssetCatalog::ValidateMeshResidencyCandidate(
     {
         const auto& metadata = *candidate.cooked->metadata;
         const auto id = AssetID::ParseReference(reference);
-        const auto* record = m_registry->Find(*id);
+        const auto* record = m_registry ? m_registry->Find(*id) : nullptr;
 
-        if(!record || record->type != AssetType::Mesh || metadata.metadata != geometry.metadata ||
+        if((m_archiveScene ? !ValidateArchiveMesh(reference,candidate.cooked->asset.get(),&metadata,error) : (!record || record->type != AssetType::Mesh)) || metadata.metadata != geometry.metadata ||
             metadata.vertexCount != geometry.vertices.size() || metadata.indexCount != geometry.indices.size() ||
             metadata.boundsMin.x != geometry.boundsMin.x || metadata.boundsMin.y != geometry.boundsMin.y ||
             metadata.boundsMin.z != geometry.boundsMin.z || metadata.boundsMax.x != geometry.boundsMax.x ||
@@ -212,7 +215,7 @@ MeshResidencySourceLock FileSceneAssetCatalog::ValidateMeshResidencyCandidate(
         MeshResidencySourceLock source;
         source.m_cookedPreparation = candidate.cooked;
         const auto acceptance = candidate.cooked->provider->PinAcceptance(*candidate.cooked->asset);
-        if(acceptance.status != DevelopmentCookedMesh::Status::Success)
+        if(acceptance.status != CookedMeshSource::Status::Success)
         {
             return reject(std::string(acceptance.message));
         }
@@ -224,7 +227,7 @@ MeshResidencySourceLock FileSceneAssetCatalog::ValidateMeshResidencyCandidate(
     {
         const auto id = AssetID::ParseReference(reference);
         const auto project = std::filesystem::canonical(m_projectRoot);
-        const auto* record = m_registry->Find(*id);
+        const auto* record = m_registry ? m_registry->Find(*id) : nullptr;
         const auto resolved = ProjectAssetResolver::Resolve(ProjectPaths(project), *m_registry, *id);
 
         if(project != std::get<0>(candidate.key) || !record || record->type != AssetType::Mesh ||
@@ -318,6 +321,12 @@ std::optional<MeshResidencyToken> FileSceneRuntime::PrepareMeshResidency(const S
     }
 
     const auto& object = m_scene.GetRenderObjects()[current->runtimeIndex];
+
+    if(object.materialsDeferred)
+    {
+        Fail(error,"Packaged material references are deferred; mesh publication cannot substitute loose/default materials.");
+        return std::nullopt;
+    }
 
     if(current->GetMeshResidency(object) != SceneMeshResidency::Pending)
     {
@@ -447,9 +456,9 @@ MeshResidencySourceLock FileSceneRuntime::ValidatePreparedMeshResidency(const Me
     }
 
     const auto& prepared = *m_meshResidency;
-    if(prepared.candidate.sourceKind == MeshResidencyCandidate::SourceKind::Cooked && !m_cookedDiagnosticPublication)
+    if(prepared.candidate.sourceKind == MeshResidencyCandidate::SourceKind::Cooked && !m_cookedPublicationAuthorized)
     {
-        Fail(error, "Cooked residency publication requires an explicit Debug diagnostic action.");
+        Fail(error, "Cooked residency publication requires Engine archive bootstrap authorization.");
         return {};
     }
 
@@ -530,6 +539,17 @@ bool FileSceneAssetCatalog::ValidateRetainedResidencyMaterial(std::string_view r
     const Material* material, std::string* error) const
 {
     const auto effective = reference.empty() ? std::string_view("builtin:default") : reference;
+    if(m_archiveScene && effective != "builtin:default")
+    {
+        const auto id = AssetID::ParseReference(effective);
+        const auto* entry = id ? m_archiveScene->provider->ArchiveEntry(*id) : nullptr;
+        if(!entry || entry->type != EngineAssetPak::Type::Material || entry->payloadVersion != 1 || !material)
+            return Fail(error,"Packaged material identity/admission missing.");
+        const auto cached = m_projectMaterials.find({std::filesystem::path{},id->ToString()});
+        const auto digest = m_admittedMaterialDigests.find(id->ToString());
+        return (cached != m_projectMaterials.end() && &cached->second == material && digest != m_admittedMaterialDigests.end() &&
+            digest->second == CookedSurface::Identity(*m_archiveScene->provider,*id)) || Fail(error,"Packaged material snapshot or ownership stale.");
+    }
 
     if (!m_initialized || !material || !ValidateMetadataMaterialReference(effective, error))
     {

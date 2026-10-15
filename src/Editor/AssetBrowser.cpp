@@ -161,11 +161,7 @@ namespace
     }
 }
 
-AssetBrowser::AssetBrowser()
-    : m_root(ProjectLocator::GetDefaultProjectRoot().lexically_normal()),
-      m_directory(m_root)
-{
-}
+AssetBrowser::AssetBrowser() = default;
 
 std::optional<AssetBrowser::MaterialCreationRequest> AssetBrowser::TakeMaterialCreationRequest()
 {
@@ -445,6 +441,22 @@ const AssetBrowser::Listing& AssetBrowser::GetListing(const std::filesystem::pat
     return listing;
 }
 
+bool AssetBrowser::RevealMaterial(const AssetID& id,const ProjectPaths& paths,const ProjectAssetRegistry& registry,std::string& error)
+{
+    error.clear();
+    const auto* record=registry.Find(id);
+    if(!record || record->type!=AssetType::Material) { error="Assigned material is not registered as a project material."; return false; }
+    const auto resolved=ProjectAssetResolver::Resolve(paths,registry,id);
+    if(resolved.status!=AssetAvailability::Available) { error="Assigned material is missing or unavailable."; return false; }
+    auto directory=resolved.resolvedPath.parent_path();
+    if(!CanBrowse(directory,error)) return false;
+    // No selection/selection-intent writes, no renderer work, no focus transfer.
+    m_listings.erase(directory);
+    m_directory.swap(directory);
+    m_thumbnailResetRequested=true; m_materialRequestsReset=true;
+    m_navigationHighlight=id; m_revealPending=true;
+    return true;
+}
 void AssetBrowser::Navigate(const std::filesystem::path& path)
 {
     m_error.clear();
@@ -454,6 +466,7 @@ void AssetBrowser::Navigate(const std::filesystem::path& path)
         m_thumbnailResetRequested = true;
         m_materialRequestsReset = true;
         m_directory = path;
+        m_navigationHighlight.reset(); m_revealPending=false;
         m_selection.clear();
     }
 }
@@ -637,6 +650,14 @@ void AssetBrowser::DrawContents()
             ImGui::PopTextWrapPos();
             ImGui::EndGroup();
             CaptureDropTarget(entry.navigable ? entry.path : std::filesystem::path{});
+            const bool located=isMaterial && m_navigationHighlight && material->second.id==*m_navigationHighlight;
+            if(located)
+            {
+                if(m_revealPending) { ImGui::SetScrollHereY(0.5f); m_revealPending=false; }
+                const auto minimum=ImGui::GetItemRectMin(), maximum=ImGui::GetItemRectMax();
+                ImGui::GetWindowDrawList()->AddRect(ImVec2(minimum.x-2,minimum.y-2),ImVec2(maximum.x+2,maximum.y+2),
+                    IM_COL32(255,190,65,255),4.0f,0,3.0f);
+            }
             const bool hovered = ImGui::IsItemHovered();
             tileHovered = tileHovered || hovered;
             if(entry.navigable)
@@ -646,6 +667,7 @@ void AssetBrowser::DrawContents()
 
             if (pressed || (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)))
             {
+                m_navigationHighlight.reset(); m_revealPending=false;
                 m_selection = entry.path;
                 m_selectionIntent = true;
 
@@ -817,6 +839,7 @@ void AssetBrowser::Draw(const EditorWorkspaceRect& rectangle)
             m_materialRequestsReset = true;
             m_materialImagesInvalidated = true;
             m_selection.clear();
+            m_navigationHighlight.reset(); m_revealPending=false;
             m_error.clear();
         }
 
@@ -1018,6 +1041,13 @@ void AssetBrowser::SetThumbnailProject(const ProjectPaths& paths, const ProjectA
         m_materialImagesInvalidated = true;
     }
 
+    if(m_navigationHighlight)
+    {
+        const auto* located=registry.Find(*m_navigationHighlight);
+        if(m_thumbnailProjectRoot!=paths.GetRoot() || !located || located->type!=AssetType::Material ||
+            (paths.GetRoot()/located->relativePath).lexically_normal().parent_path()!=m_directory)
+        { m_navigationHighlight.reset(); m_revealPending=false; }
+    }
     m_thumbnailProjectRoot = paths.GetRoot();
     m_thumbnailPaths = paths;
     m_thumbnailRegistry = &registry;
@@ -1598,6 +1628,11 @@ std::optional<AssetRecord> AssetBrowser::ValidateMeshDrag(const MeshDragPayload&
 
 void AssetBrowser::ConfigureMaterialThumbnails(Renderer& renderer)
 {
+    if(m_root.empty())
+    {
+        m_root=ProjectLocator::GetDefaultProjectRoot().lexically_normal();
+        m_directory=m_root;
+    }
     m_materialRenderer = &renderer;
     m_thumbnails = &renderer.GetTextureThumbnailCache();
 }

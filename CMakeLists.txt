@@ -49,16 +49,33 @@ FetchContent_Declare(
 
 FetchContent_MakeAvailable(nlohmann_json)
 
-add_executable(Engine
-    src/main.cpp
+add_library(EngineCore OBJECT
     src/Engine/Engine.cpp
+    src/Engine/BuildGame.cpp
+    src/Engine/SceneEnvironment.cpp
+    src/assets/CookedEnvironment.cpp
+    $<$<CONFIG:Debug>:src/Engine/SceneEnvironmentVerification.cpp>
+    src/Editor/BuildGameWindow.cpp
+    $<$<CONFIG:Debug>:src/Engine/BuildGameVerification.cpp>
     src/Engine/CookedMeshGPUVerification.cpp
+    $<$<CONFIG:Debug>:src/Engine/ArchiveCookedMeshVerification.cpp>
+    $<$<CONFIG:Debug>:src/Engine/CookedSceneArchiveVerification.cpp>
+    src/Engine/ArchiveSurfaceAdmission.cpp
+    src/Engine/ArchiveSceneBootstrap.cpp
+    src/Engine/PackagedBootstrap.cpp
+    $<$<CONFIG:Debug>:src/Engine/PackagedSurfaceVerification.cpp>
     src/Engine/CookedMeshLifecycleVerification.cpp
     src/assets/ProjectTexturePreparationService.cpp
     src/assets/ProjectMaterialPreparationService.cpp
     src/Renderer/MaterialAdmission.cpp
     src/Engine/MaterialAdmissionVerification.cpp
     src/assets/ProjectMeshPreparationService.cpp
+    src/assets/CookedSurface.cpp
+    src/assets/CookedScene.cpp
+    src/Scene/ArchiveSceneActivation.cpp
+    src/assets/CookedMeshProvider.cpp
+    src/assets/ArchiveCookedMeshProvider.cpp
+    src/assets/EngineAssetPak.cpp
     src/assets/CookedMesh.cpp
     src/assets/DevelopmentCookedMeshProvider.cpp
     $<$<CONFIG:Debug>:src/assets/CookedMeshVerification.cpp>
@@ -187,6 +204,15 @@ add_executable(Engine
     src/Scene/SceneMetadataPreparation.cpp
     src/Scene/MeshResidency.cpp
     src/Scene/CookedMeshCatalogPreparation.cpp
+    src/Editor/MaterialLocate.cpp
+    src/Engine/MaterialLocateVerification.cpp
+    src/Engine/ViewportPanVerification.cpp
+    src/Editor/SceneObjectDuplication.cpp
+    src/Editor/SceneObjectDuplicationControls.cpp
+    src/Engine/EditorMembership.cpp
+    src/Engine/SceneDuplicationVerification.cpp
+    src/Scene/SceneMembershipPublication.cpp
+    src/Engine/SceneMembershipVerification.cpp
     src/Scene/MeshResidencyPublication.cpp
     src/Scene/SceneMaterialBindingPublication.cpp
     src/Engine/MaterialBindingVerification.cpp
@@ -205,8 +231,34 @@ add_executable(Engine
     src/assets/ProjectMaterialAssetService.cpp
 )
 
-target_compile_definitions(Engine PRIVATE
+target_compile_definitions(EngineCore PRIVATE
     ENGINE_SOURCE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}"
+)
+
+# Object sharing also retains static scene-registration units for editor startup.
+# Both executables use one implementation; only the entry point selects capabilities.
+add_executable(Engine src/main.cpp)
+target_link_libraries(Engine PRIVATE EngineCore)
+add_executable(EngineRuntime WIN32 src/runtime_main.cpp)
+target_link_libraries(EngineRuntime PRIVATE EngineCore shell32)
+add_dependencies(Engine EngineRuntime)
+target_compile_definitions(EngineCore PRIVATE ENGINE_RUNTIME_DEPLOY_DIR="$<TARGET_FILE_DIR:EngineRuntime>")
+set_target_properties(EngineRuntime PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/Game/$<CONFIG>"
+)
+
+# Runtime deployment contains binaries only. Archives are supplied by the offline cook.
+add_custom_command(TARGET EngineRuntime POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${DXC_RUNTIME_DIR}/dxcompiler.dll"
+        "${DXC_RUNTIME_DIR}/dxil.dll"
+        "${CMAKE_CURRENT_SOURCE_DIR}/external/NRD/Lib/$<CONFIG>/NRD.dll"
+        "${CMAKE_CURRENT_SOURCE_DIR}/external/NRI/Lib/$<CONFIG>/NRI.dll"
+        $<TARGET_FILE:assimp>
+        $<TARGET_FILE:DirectXTex>
+        $<TARGET_FILE_DIR:EngineRuntime>
+    COMMENT "Copying packaged runtime DLL dependencies (no development assets)"
+    VERBATIM
 )
 
 add_custom_command(
@@ -255,8 +307,8 @@ add_custom_command(
     COMMENT "Copying runtime assets and dependencies"
 )
 
-target_include_directories(Engine
-    PRIVATE
+target_include_directories(EngineCore
+    PUBLIC
         src
         external/imgui
         external/ImGuizmo
@@ -266,8 +318,8 @@ target_include_directories(Engine
         external/NRI/Include
 )
 
-target_link_libraries(Engine
-    PRIVATE
+target_link_libraries(EngineCore
+    PUBLIC
         shell32
         ole32
         dxgi

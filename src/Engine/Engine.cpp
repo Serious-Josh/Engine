@@ -1,5 +1,8 @@
 #include "Scene/SceneSwitchTiming.h"
 #include "Engine/Engine.h"
+#include "Engine/PackagedBootstrap.h"
+#include "assets/CookedScene.h"
+#include "assets/CookedEnvironment.h"
 
 #include "Core/Log.h"
 #include "Core/Assert.h"
@@ -856,11 +859,45 @@ void Engine::ProcessEditorSceneRequests(IDemoScene& activeScene)
     }
 }
 
-bool Engine::Initialize()
+bool Engine::Initialize(bool archiveDiagnostic)
 {
+    EngineStartup startup; startup.mode=archiveDiagnostic ? EngineStartup::Mode::ArchiveDiagnostic : EngineStartup::Mode::Editor;
+    return Initialize(startup);
+}
+bool Engine::Initialize(const EngineStartup& startup)
+{
+    m_startup=startup;
+    const bool packaged=startup.mode==EngineStartup::Mode::PackagedRuntime;
+    const bool archiveDiagnostic=startup.mode!=EngineStartup::Mode::Editor;
+    std::shared_ptr<const CookedScene::ArchiveScene> archive;
+    std::vector<std::byte> shaderBytes;
+    std::optional<HDRImageData> environmentImage;
+    std::string environmentIdentity;
+    if(packaged)
+    {
+        try
+        {
+            if(!startup.sceneID || startup.width==0 || startup.height==0 || startup.width>8192 || startup.height>8192)
+                throw std::runtime_error("Packaged startup requires a scene ID and dimensions in 1..8192.");
+            archive=CookedScene::OpenArchive(startup.toc,startup.pak,*startup.sceneID);
+            if(!archive->provider->ArchiveEntry(PackagedBootstrap::ShaderID())) throw std::runtime_error("Missing required packaged shader bootstrap entry 00000000-0000-0000-0000-000000000035.");
+            environmentImage=CookedEnvironment::ReadArchive(*archive);
+            environmentIdentity=CookedEnvironment::ArchiveIdentity(*archive);
+            shaderBytes=archive->provider->ReadEntry(PackagedBootstrap::ShaderID(),EngineAssetPak::Type::Shader,1,64*1024*1024);
+            ShaderLibrary validation;
+            if(!validation.InitializePackaged(shaderBytes)) throw std::runtime_error("Invalid packaged shader bootstrap.");
+            validation.Shutdown();
+        }
+        catch(const std::exception& e) { Log::Error(std::string("Packaged preflight failed: ")+e.what()); return false; }
+        m_windowProperties.width=startup.width; m_windowProperties.height=startup.height;
+        m_windowProperties.title=startup.gameTitle.empty() ? "Engine Packaged Runtime" : startup.gameTitle;
+        m_texturePreparation.RestrictToArchive(); m_meshPreparation.RestrictToArchive();
+    }
     const auto initializationStarted = std::chrono::steady_clock::now();
     ENGINE_ASSERT(m_state == EngineState::Uninitialized);
 
+    const auto initializeLooseProject = [&]() -> bool
+    {
     // Initialize persistent project storage before GPU resources.
     const ProjectPaths projectPaths( ProjectLocator::GetDefaultProjectRoot());
 
@@ -1004,25 +1041,34 @@ bool Engine::Initialize()
         std::to_string(invalidAssets) + " invalid, " +
         std::to_string(unreadableAssets) + " unreadable.");
 
+        return true;
+    };
+    if(archiveDiagnostic)
+        Log::Info(packaged ? "Packaged runtime startup: loose project registry, reconciliation and asset scans disabled." :
+            "Archive diagnostic startup: loose project registry, reconciliation and asset scans disabled.");
+    else if(!initializeLooseProject()) return false;
+
     if (!m_window.Initialize(m_windowProperties))
     {
         Log::Error("Failed to initialize window.");
         return false;
     }
 
+    m_windowInitialized=true;
     m_time.Initialize();
 
-    const std::filesystem::path executableDirectory = WindowsWindow::GetExecutableDirectory();
+    const std::filesystem::path executableDirectory = packaged ? std::filesystem::path{} : WindowsWindow::GetExecutableDirectory();
 
-    const std::filesystem::path assetRoot = executableDirectory / "assets";
+    const std::filesystem::path assetRoot = packaged ? std::filesystem::path{} : executableDirectory / "assets";
 
-    if (!m_renderer.Initialize(m_window.GetNativeHandle(), m_window.GetWidth(), m_window.GetHeight(), assetRoot))
+    m_rendererAttempted=true;
+    if (!m_renderer.Initialize(m_window.GetNativeHandle(), m_window.GetWidth(), m_window.GetHeight(), assetRoot, shaderBytes, environmentImage?&*environmentImage:nullptr, environmentIdentity))
     {
         Log::Error("Failed to initialize renderer.");
         return false;
     }
 
-    Log::Info("Initializing demo scene.");
+    Log::Info(packaged ? "Initializing archived scene." : "Initializing demo scene.");
 
     ShaderDescription vertexShaderDescription{};
 
@@ -1056,16 +1102,19 @@ bool Engine::Initialize()
 
     const float aspectRatio = static_cast<float>(m_window.GetWidth()) / static_cast<float>(m_window.GetHeight());
 
-    m_editor.ConfigureMaterialThumbnails(m_renderer);
+    if(!packaged) m_editor.ConfigureMaterialThumbnails(m_renderer);
 
-    m_demoSceneManager.SetProjectAssets(ProjectLocator::GetDefaultProjectRoot(), m_projectAssetRegistry);
+    if(!archiveDiagnostic) m_demoSceneManager.SetProjectAssets(ProjectLocator::GetDefaultProjectRoot(), m_projectAssetRegistry);
     m_demoSceneManager.SetTextureStreamingEnabled(true);
     m_demoSceneManager.SetMeshCPUCache(&m_meshCPUCache);
 
-    if(!m_demoSceneManager.Initialize(
+    const bool sceneInitialized = packaged ? m_demoSceneManager.InitializeArchive(archive,m_renderer.GetDevice(),
+        m_renderer.GetResourceUploader(),m_renderer.GetResourceDescriptorHeap(),m_demoVertexShader,m_demoPixelShader,aspectRatio) :
+        m_demoSceneManager.Initialize(
             "Sphere Grid", m_renderer.GetDevice(), m_renderer.GetResourceUploader(),
             m_renderer.GetResourceDescriptorHeap(), m_demoVertexShader, m_demoPixelShader,
-            aspectRatio))
+            aspectRatio);
+    if(!sceneInitialized)
     {
         Log::Error("Failed to initialize demo scene manager.");
         return false;
@@ -1097,6 +1146,7 @@ bool Engine::Initialize()
     if(!m_renderer.InitializeSceneResources(activeDemo.GetScene(), activeDemo.GetMaterials()))
     {
         Log::Error("Failed to initialize demo renderer resources.");
+        if(packaged && !m_renderer.CleanupFailedSceneInitialization(activeDemo.GetScene())) std::abort();
         return false;
     }
 
@@ -1135,7 +1185,9 @@ bool Engine::Initialize()
                                                       static_cast<float>(event.height));
                 }
 
-                if(!m_renderer.Resize(event.width, event.height))
+                if(!m_renderer.Resize(event.width, event.height) ||
+                    (m_startup.mode==EngineStartup::Mode::PackagedRuntime &&
+                        !m_renderer.ResizeScene(event.width, event.height)))
                 {
                     Log::Error("Renderer resize failed; requesting application shutdown.");
 
@@ -1145,7 +1197,7 @@ bool Engine::Initialize()
                 break;
             case EventType::WindowClose:
 
-                if(m_editor.RequestApplicationClose())
+                if(m_startup.mode==EngineStartup::Mode::PackagedRuntime || m_editor.RequestApplicationClose())
                 {
                     m_window.Close();
                 }
@@ -1175,6 +1227,11 @@ bool Engine::Initialize()
 
     m_state = EngineState::Running;
     OnFileSceneActivated(initializationStarted);
+    if(packaged)
+    {
+        try { PopulateArchiveScene(archive); }
+        catch(const std::exception& e) { Log::Error(std::string("Packaged scene activation failed: ")+e.what()); return false; }
+    }
     Log::Info("Engine initialized.");
     return true;
 }
@@ -1277,13 +1334,25 @@ void Engine::Frame()
 
     if(m_window.GetWidth() == 0 || m_window.GetHeight() == 0)
     {
-        m_editor.SuspendViewportInteraction();
+        if(m_startup.mode!=EngineStartup::Mode::PackagedRuntime) m_editor.SuspendViewportInteraction();
         m_window.WaitForMessage();
         // Exclude the suspended interval from the next simulation update.
         m_time.Update();
         return;
     }
 
+    if(m_startup.mode==EngineStartup::Mode::PackagedRuntime)
+    {
+        auto& demo=m_demoSceneManager.GetActiveScene(); demo.Update(m_time.GetDeltaTime());
+        const auto result=m_renderer.Render(demo.GetScene(),RendererOptions{});
+        if(result==Renderer::FrameRenderResult::Error)
+        {
+            Log::Error("Packaged renderer frame failed; requesting shutdown.");
+            m_window.Close();
+        }
+        if(result==Renderer::FrameRenderResult::Rendered) demo.GetScene().ClearChangedTransforms();
+        return;
+    }
     DebugUI& debugUI = m_renderer.GetDebugUI();
 
     bool displacementCompletionDelivered = false;
@@ -1336,14 +1405,16 @@ void Engine::Frame()
             Renderer::FrameHitchRegion::EngineEnvironment);
         const size_t environmentIndex = debugUI.ConsumeEnvironmentChangeRequest();
 
-        if (!m_renderer.SetEnvironment(environmentIndex))
+        std::string environmentError;
+        if (!AssignSceneEnvironment(environmentIndex,environmentError))
         {
-            Log::Error("Failed to switch environment.");
+            Log::Error("Failed to switch scene environment: "+environmentError);
             m_window.Close();
             return;
         }
     }
 
+    if(!AdvanceEditorMembership()) { m_window.Close(); return; }
     bool materialAssignmentSafe = false;
 
     try
@@ -1399,6 +1470,7 @@ void Engine::Frame()
 
     if (m_demoSceneManager.HasPendingSceneChange())
     {
+        CancelEditorMembership("Scene replacement canceled the pending membership edit.");
         const auto switchStarted = std::chrono::steady_clock::now();
         if (m_diagnosticMeshToken || m_diagnosticCPUPreparation)
         {
@@ -1413,7 +1485,7 @@ void Engine::Frame()
             m_renderer,
             Renderer::FrameHitchRegion::EngineSwitch);
 
-        if (!m_demoSceneManager.GetRequestedFileScenePath().empty())
+        if (m_demoSceneManager.HasPendingFileSceneRequest())
         {
             if (!ActivateRequestedFileScene())
             {
@@ -1516,7 +1588,7 @@ void Engine::Frame()
 
     IDemoScene& activeDemo = m_demoSceneManager.GetActiveScene();
 
-    m_editor.SetSceneOperationPending(m_pendingSceneObjectCreation.has_value() ||
+    m_editor.SetSceneOperationPending(m_pendingEditorMembership.has_value() || m_pendingSceneObjectCreation.has_value() ||
                                       m_pendingSceneObjectRestoration.has_value() || m_pendingSceneObjectDeletion.has_value() ||
                                       m_pendingMaterialAssignment.has_value() || m_pendingEditorSceneOperation.has_value() ||
                                       m_demoSceneManager.HasPendingSceneChange());
@@ -1604,7 +1676,14 @@ void Engine::Frame()
         std::string error;
         bool accepted = false;
 
-        if(request->identity.redo)
+        if(request->membership)
+        {
+            const auto operationID=request->identity.operationID, epoch=request->identity.epoch;
+            if(!BeginEditorMembership(std::move(*request),true,error))
+                m_editor.CompleteObjectDeletionHistory(operationID,epoch,false,error);
+            accepted=true; // Membership path completed its own failure callback.
+        }
+        else if(request->identity.redo)
         {
             const auto* owner = dynamic_cast<const FileBackedDemoScene*>(&activeDemo);
             const auto target = owner ? owner->GetObjectMetadata(request->object.id, &error) : std::nullopt;
@@ -1643,12 +1722,19 @@ void Engine::Frame()
     {
         std::string error;
 
-        if(!RequestSceneObjectDeletion(*request, error))
+        if(!BeginEditorMembershipDeletion(*request, error))
         {
             m_editor.OnSceneObjectDeletionCompleted(activeDemo, *request, false, error);
         }
     }
 
+    if(auto request=m_editor.TakeSceneDuplicationRequest())
+    {
+        std::string error;
+        const auto operationID=request->identity.operationID, epoch=request->identity.epoch;
+        if(!BeginEditorMembership(std::move(*request),false,error))
+            m_editor.CompleteObjectDeletionHistory(operationID,epoch,false,error);
+    }
     if(auto request = m_editor.TakeMeshCreationRequest())
     {
         const auto* owner = dynamic_cast<const FileBackedDemoScene*>(&activeDemo);
@@ -1695,6 +1781,16 @@ void Engine::Frame()
         }
     }
 
+    const auto buildStatus=m_buildGame.Poll();
+    if(buildStatus.message!=m_buildGameLastMessage)
+    { m_buildGameLastMessage=buildStatus.message; m_editor.SetBuildGameStatus(buildStatus); }
+    if(m_editor.TakeBuildGameCancel()) m_buildGame.Cancel();
+    if(const auto build=m_editor.TakeBuildGameRequest())
+    {
+        std::string error;
+        if(!StartBuildGame(*build,error)) m_editor.SetBuildGameStatus({false,false,0,error});
+        else m_editor.SetBuildGameStatus(m_buildGame.Poll());
+    }
     ProcessEditorSceneRequests(activeDemo);
     ProcessEditorMaterialRequests();
     m_pendingSavedMaterialRevisions = m_editor.TakeSavedMaterialRevisions();
@@ -1926,6 +2022,7 @@ void Engine::Frame()
 
 void Engine::Shutdown()
 {
+    CancelEditorMembership("Shutdown canceled the pending membership edit.");
     CancelViewportMaterialAssignment("Engine shutdown canceled the material assignment.");
     if (m_diagnosticMeshToken || m_diagnosticCPUPreparation)
     {
@@ -1936,8 +2033,8 @@ void Engine::Shutdown()
     m_automaticMeshResidency = {};
     m_automaticResidencyIntent = 0;
 
-    ENGINE_ASSERT(m_state == EngineState::Running);
-
+    const bool partial = m_state == EngineState::Uninitialized;
+    m_buildGame.Cancel();
     Log::Info("Engine shutdown: starting.");
     if(m_materialPreparation) m_materialPreparation->Shutdown();
     m_texturePreparation.Shutdown();
@@ -1957,7 +2054,7 @@ void Engine::Shutdown()
     {
         // Only the successfully released scene-switch path may
         // reach shutdown without an active scene owner.
-        if (!m_sceneResourcesReleasedForSwitch)
+        if (!partial && !m_sceneResourcesReleasedForSwitch)
         {
             Log::Error(
                 "Engine shutdown: no active scene without confirmed "
@@ -1965,9 +2062,8 @@ void Engine::Shutdown()
             std::abort();
         }
 
-        Log::Info(
-            "Engine shutdown: scene switch failed after prior "
-            "scene resources were released.");
+        Log::Info(partial ? "Engine shutdown: partial startup has no active scene." :
+            "Engine shutdown: scene switch failed after prior scene resources were released.");
     }
     else
     {
@@ -1991,8 +2087,8 @@ void Engine::Shutdown()
     m_editor.ResetThumbnailRequests();
     m_demoSceneManager.Shutdown();
     m_meshCPUCache.Clear();
-    m_renderer.Shutdown();
-    m_window.Shutdown();
+    if(m_rendererAttempted) m_renderer.Shutdown();
+    if(m_windowInitialized) m_window.Shutdown();
 
     Log::Info("Engine shutdown: finished.");
 }
@@ -3163,7 +3259,7 @@ void Engine::RequestDiagnosticMeshResidency()
     auto* scene = dynamic_cast<FileBackedDemoScene*>(m_demoSceneManager.TryGetActiveScene());
     std::string error;
 
-    if (!scene || !scene->IsMetadataOnlyActivation())
+    if (!scene || scene->IsArchiveActivation() || !scene->IsMetadataOnlyActivation())
     {
         Log::Warning("Mesh residency diagnostic blocked: active scene is not a metadata-only file scene.");
         return;
@@ -3254,6 +3350,7 @@ void Engine::RequestDiagnosticMeshResidency()
 
 void Engine::ProcessMeshResidencyDiagnostics()
 {
+    if(m_pendingEditorMembership) return;
 #ifdef _DEBUG
     // Deliberate developer chords, ignored while typing into an editor field.
     if (!ImGui::GetIO().WantTextInput && m_input.IsKeyDown(VK_CONTROL) && m_input.IsKeyDown(VK_SHIFT))
@@ -3665,6 +3762,8 @@ void Engine::OnFileSceneActivated(std::chrono::steady_clock::time_point started)
         return;
     }
 
+    std::string environmentError;
+    if(!ApplySceneEnvironment(environmentError)) { Log::Error("Scene environment restore failed: "+environmentError); m_window.Close(); return; }
     if (m_automaticResidencyIntent)
     {
         Log::Info("Automatic mesh residency session " + std::to_string(m_automaticResidencyIntent) +
@@ -3673,6 +3772,11 @@ void Engine::OnFileSceneActivated(std::chrono::steady_clock::time_point started)
 
     m_automaticMeshResidency = {};
     m_automaticResidencyIntent = 0;
+    if(scene->IsArchiveActivation())
+    {
+        Log::Info("Archive-only metadata scene activated; explicit cooked mesh requests only; packaged materials remain deferred.");
+        return;
+    }
     scene->m_assets.BeginTextureStreaming();
 
     size_t authored = 0;
@@ -3709,7 +3813,7 @@ void Engine::StartAutomaticMeshResidency()
 {
     const auto* scene = dynamic_cast<const FileBackedDemoScene*>(m_demoSceneManager.TryGetActiveScene());
 
-    if (!scene || !scene->IsMetadataOnlyActivation())
+    if (!scene || scene->IsArchiveActivation() || !scene->IsMetadataOnlyActivation())
     {
         return;
     }
@@ -3902,6 +4006,7 @@ void Engine::RejectMeshResidencyRequest(const std::string& message, MeshResidenc
 
 void Engine::AdvanceAutomaticMeshResidency()
 {
+    if(m_pendingEditorMembership) return;
     auto& scheduler = m_automaticMeshResidency;
 
     if (!scheduler.enabled)
@@ -4030,4 +4135,24 @@ void Engine::AdvanceAutomaticMeshResidency()
     // settlement. No import retry occurs for an unchanged recorded failure.
     scheduler.cursor = 0;
     scheduler.retryAfter = now + std::chrono::seconds(1);
+}
+
+bool Engine::StartBuildGame(BuildGame::Settings settings,std::string& error)
+{
+    if(m_startup.mode!=EngineStartup::Mode::Editor) { error="Build Game is an editor-only authoring operation."; return false; }
+    if(m_buildGame.Poll().busy) { error="A game build is already running."; return false; }
+    auto* scene=dynamic_cast<FileBackedDemoScene*>(m_demoSceneManager.TryGetActiveScene());
+    if(!scene || scene->IsArchiveActivation() || scene->GetScenePath().empty()) { error="Save a file-backed project scene before building. Procedural demos/unsaved scenes cannot be built."; return false; }
+    if(m_demoSceneManager.HasPendingSceneChange() || m_pendingMaterialAssignment || m_pendingSceneObjectCreation ||
+        m_pendingSceneObjectDeletion || m_pendingSceneObjectRestoration || m_pendingEditorSceneOperation ||
+        m_editor.HasBlockingMaterialOperation() || m_editor.HasBlockingObjectCreation() || m_editor.HasPendingSceneHistoryOperation())
+    { error="Finish pending scene operations and save/discard working material edits before building."; return false; }
+    if(!BuildGame::ValidateTitle(settings.title,error)) return false;
+    const auto& document=scene->m_runtime->GetFileScene().GetDocument();
+    if(document.id.empty()) { error="Current scene has no persistent identity."; return false; }
+    // CaptureSceneDocument in Save includes current camera/transforms, not an old disk revision.
+    if(!scene->Save(&error)) return false;
+    BuildGame::Request request{std::move(settings),scene->m_runtime->GetFileScene().GetDocument(),m_projectAssetRegistry,
+        scene->GetProjectRoot(),WindowsWindow::GetExecutableDirectory()/"assets"/"Shaders",std::filesystem::path(ENGINE_RUNTIME_DEPLOY_DIR)};
+    return m_buildGame.Start(std::move(request),error);
 }
