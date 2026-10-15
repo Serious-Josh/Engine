@@ -1648,7 +1648,8 @@ bool MaterialPreviewRenderer::FrameMeshBounds(const MeshBounds& bounds, PreviewF
     // including elongated models. Increase its projected radius by 30% while
     // reserving 10% of the half-FOV as margin; material-sphere framing is separate.
     PreviewFraming candidate;
-    const Vector3 originalEye{2.6f, 1.7f, -3.2f};
+    // Orbit the mesh thumbnail camera 180 degrees around Y to show model fronts.
+    const Vector3 originalEye{-2.6f, 1.7f, 3.2f};
     const double originalDistance = originalEye.Length();
     constexpr double halfFov = 0.65 * 0.5;
     constexpr double zoom = 1.30;

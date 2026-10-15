@@ -88,13 +88,15 @@ namespace
     }
 }
 
-bool ProjectAssetRename::RenameFile(
+static bool ChangeFileLocation(
     const ProjectPaths& paths,
     ProjectAssetRegistry& registry,
     const std::filesystem::path& target,
     std::string_view stem,
     std::filesystem::path& renamedPath,
-    std::string& error)
+    std::string& error,
+    const std::filesystem::path& moveDirectory = {},
+    const AssetID* expectedID = nullptr)
 {
     HANDLE file = INVALID_HANDLE_VALUE;
     std::vector<HANDLE> directories;
@@ -130,32 +132,57 @@ bool ProjectAssetRename::RenameFile(
             throw std::runtime_error("The project asset registry cannot be renamed here.");
         }
 
-        // Pin every ancestor: no junction traversal or rename races during the transaction.
-        std::filesystem::path prefix;
-
-        for(const auto& part : original.parent_path())
+        const bool moving = expectedID != nullptr;
+        const auto destination = moving ? std::filesystem::absolute(moveDirectory).lexically_normal() / original.filename() :
+            original.parent_path() / Filename(stem, original.extension());
+        const auto destinationRelative = destination.lexically_relative(root);
+        if(destinationRelative.empty() || destinationRelative.is_absolute() || destinationRelative == ".")
         {
-            prefix /= part;
-
-            if(!prefix.has_root_directory())
+            throw std::runtime_error("Destination is outside the project asset root.");
+        }
+        for(const auto& part : destinationRelative)
+        {
+            if(part == ".." || part.native().find(L':') != std::wstring::npos)
             {
-                continue;
+                throw std::runtime_error("Unsafe destination path.");
             }
+        }
+        if(moving && ProjectAssetRegistry::PathsEqual(original.parent_path(), destination.parent_path()))
+        {
+            throw std::runtime_error("Asset is already in this directory.");
+        }
+        const auto* sourceRecord = registry.FindByPath(relative);
+        if(moving && (!sourceRecord || sourceRecord->id != *expectedID ||
+            !ValidateAssetRecord(AssetRecord{*expectedID, sourceRecord->type, destinationRelative})))
+        {
+            throw std::runtime_error("Asset changed or destination is unsupported: materials must remain in Materials and meshes in Meshes.");
+        }
 
-            HANDLE directory = CreateFileW(prefix.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
-            BY_HANDLE_FILE_INFORMATION info{};
-
-            if(directory == INVALID_HANDLE_VALUE)
+        // Pin every ancestor: no junction traversal or rename races during the transaction.
+        const std::filesystem::path parents[] = {original.parent_path(), destination.parent_path()};
+        for(const auto& parent : parents)
+        {
+            std::filesystem::path prefix;
+            for(const auto& part : parent)
             {
-                throw Failure("Cannot lock project directory");
-            }
-
-            directories.push_back(directory);
-
-            if(!GetFileInformationByHandle(directory, &info) || (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT))
-            {
-                throw std::runtime_error("Directory links are not eligible for renaming.");
+                prefix /= part;
+                if(!prefix.has_root_directory())
+                {
+                    continue;
+                }
+                HANDLE directory = CreateFileW(prefix.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+                BY_HANDLE_FILE_INFORMATION info{};
+                if(directory == INVALID_HANDLE_VALUE)
+                {
+                    throw Failure("Cannot lock project directory");
+                }
+                directories.push_back(directory);
+                if(!GetFileInformationByHandle(directory, &info) || (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) ||
+                    !(info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+                {
+                    throw std::runtime_error("Directory links are not eligible for file relocation.");
+                }
             }
         }
 
@@ -165,16 +192,14 @@ bool ProjectAssetRename::RenameFile(
 
         if(file == INVALID_HANDLE_VALUE)
         {
-            throw Failure("Cannot open file for renaming; it may be locked or read-only");
+            throw Failure("Cannot open file for relocation; it may be in use by a worker or read-only. Retry when preparation finishes");
         }
 
         if(!GetFileInformationByHandle(file, &info) ||
-           (info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) || info.nNumberOfLinks != 1)
+           (info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_READONLY)) || info.nNumberOfLinks != 1)
         {
-            throw std::runtime_error("Only ordinary, non-linked project files can be renamed.");
+            throw std::runtime_error("Only ordinary, writable, non-linked project files can be relocated.");
         }
-
-        const auto destination = original.parent_path() / Filename(stem, original.extension());
 
         if(destination.native().size() >= MAX_PATH)
         {
@@ -183,11 +208,9 @@ bool ProjectAssetRename::RenameFile(
 
         // Allocate the returned path before any physical or registry mutation.
         renamedPath = destination;
-        const bool unchanged = original.filename() == destination.filename();
+        const bool unchanged = original == destination;
         const bool caseOnly = ProjectAssetRegistry::PathsEqual(original, destination);
 
-        const auto destinationRelative = destination.lexically_relative(root);
-        const auto* sourceRecord = registry.FindByPath(relative);
         const auto* conflict = registry.FindByPath(destinationRelative);
 
         // Compare stable identity before changing the candidate registry. The source's
@@ -281,4 +304,18 @@ bool ProjectAssetRename::RenameFile(
     }
 
     return error.empty();
+}
+
+bool ProjectAssetRename::RenameFile(const ProjectPaths& paths, ProjectAssetRegistry& registry,
+    const std::filesystem::path& source, std::string_view stem,
+    std::filesystem::path& renamedPath, std::string& error)
+{
+    return ChangeFileLocation(paths, registry, source, stem, renamedPath, error);
+}
+
+bool ProjectAssetRename::MoveAssetFile(const ProjectPaths& paths, ProjectAssetRegistry& registry, const AssetID& id,
+    const std::filesystem::path& source, const std::filesystem::path& directory,
+    std::filesystem::path& movedPath, std::string& error)
+{
+    return ChangeFileLocation(paths, registry, source, {}, movedPath, error, directory, &id);
 }

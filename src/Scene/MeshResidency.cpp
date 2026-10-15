@@ -65,6 +65,11 @@ std::optional<MeshResidencyCandidate> FileSceneAssetCatalog::DescribeMeshResiden
 
         MeshResidencyCandidate candidate{key, &asset->mesh, m_catalogIdentity,
             mesh.GetVertexBufferAddress(), mesh.GetIndexBufferAddress()};
+        if(asset->cooked)
+        {
+            candidate.sourceKind = MeshResidencyCandidate::SourceKind::Cooked;
+            candidate.cooked = asset->cooked;
+        }
         auto source = ValidateMeshResidencyCandidate(candidate, reference, error);
 
         if(!source)
@@ -102,12 +107,13 @@ MeshResidencySourceLock FileSceneAssetCatalog::ValidateMeshResidencyCandidate(
     const Mesh* ownedMesh = nullptr;
     const ImportedMesh* ownedGeometry = nullptr;
     const bool builtin = candidate.sourceKind == MeshResidencyCandidate::SourceKind::Builtin;
+    const bool cooked = candidate.sourceKind == MeshResidencyCandidate::SourceKind::Cooked;
 
     if (builtin)
     {
         if (ClassifyMeshReference(reference) != MeshReferenceKind::Builtin ||
             candidate.builtinReference != reference || candidate.mesh != &m_sphereMesh ||
-            candidate.key != ProjectMeshCPUCache::Key{})
+            candidate.key != ProjectMeshCPUCache::Key{} || candidate.cooked)
         {
             return reject("Built-in residency reference or catalog geometry identity changed.");
         }
@@ -119,7 +125,7 @@ MeshResidencySourceLock FileSceneAssetCatalog::ValidateMeshResidencyCandidate(
     {
         const auto owned = m_projectMeshes.find(candidate.key);
 
-        if (candidate.sourceKind != MeshResidencyCandidate::SourceKind::ProjectAsset ||
+        if ((!cooked && candidate.sourceKind != MeshResidencyCandidate::SourceKind::ProjectAsset) ||
             !candidate.builtinReference.empty() || !m_registry || owned == m_projectMeshes.end() ||
             candidate.mesh != &owned->second->mesh || !owned->second->published || !owned->second->geometry)
         {
@@ -128,11 +134,33 @@ MeshResidencySourceLock FileSceneAssetCatalog::ValidateMeshResidencyCandidate(
 
         const auto id = AssetID::ParseReference(reference);
 
-        if (!id || id->ToReference() != reference || id->ToString() != std::get<1>(candidate.key) ||
-            std::get<3>(candidate.key) != ModelImporter::kImportRevision ||
-            std::get<4>(candidate.key) != MeshUVOrientation::FlipV)
+        if (!id || id->ToReference() != reference || id->ToString() != std::get<1>(candidate.key))
         {
-            return reject("Residency candidate authored asset or import policy does not match.");
+            return reject("Residency candidate authored AssetID does not match.");
+        }
+
+        if(cooked)
+        {
+            if(!candidate.cooked || candidate.cooked != owned->second->cooked)
+            {
+                return reject("Cooked candidate evidence is not the catalog's retained preparation receipt.");
+            }
+
+            std::string validation;
+            if(!ValidateCookedMeshResidencyEvidence(*candidate.cooked, reference, &validation)) { return reject(validation); }
+            ProjectMeshPreparationService::Identity identity;
+            identity.sourceKind = MeshPreparationSourceKind::Cooked;
+            identity.cooked = candidate.cooked->asset;
+
+            if(candidate.key != identity.CacheKey())
+            {
+                return reject("Cooked candidate cache/payload compatibility identity differs.");
+            }
+        }
+        else if(candidate.cooked || owned->second->cooked || std::get<5>(candidate.key) != MeshPreparationSourceKind::FBX ||
+            std::get<3>(candidate.key) != ModelImporter::kImportRevision || std::get<4>(candidate.key) != MeshUVOrientation::FlipV)
+        {
+            return reject("FBX residency candidate import/source policy does not match.");
         }
 
         ownedMesh = &owned->second->mesh;
@@ -161,6 +189,34 @@ MeshResidencySourceLock FileSceneAssetCatalog::ValidateMeshResidencyCandidate(
         // are no source bytes to lock/hash, and no synthetic Windows handle.
         MeshResidencySourceLock source;
         source.m_builtinValidated = true;
+        return source;
+    }
+
+    if(cooked)
+    {
+        const auto& metadata = *candidate.cooked->metadata;
+        const auto id = AssetID::ParseReference(reference);
+        const auto* record = m_registry->Find(*id);
+
+        if(!record || record->type != AssetType::Mesh || metadata.metadata != geometry.metadata ||
+            metadata.vertexCount != geometry.vertices.size() || metadata.indexCount != geometry.indices.size() ||
+            metadata.boundsMin.x != geometry.boundsMin.x || metadata.boundsMin.y != geometry.boundsMin.y ||
+            metadata.boundsMin.z != geometry.boundsMin.z || metadata.boundsMax.x != geometry.boundsMax.x ||
+            metadata.boundsMax.y != geometry.boundsMax.y || metadata.boundsMax.z != geometry.boundsMax.z)
+        {
+            return reject("Cooked catalog geometry, registration or CPU metadata is inconsistent.");
+        }
+
+        // Repeat current mapping acceptance under write/delete exclusion. The
+        // coordinator holds this lease across its no-fail ownership transfer.
+        MeshResidencySourceLock source;
+        source.m_cookedPreparation = candidate.cooked;
+        const auto acceptance = candidate.cooked->provider->PinAcceptance(*candidate.cooked->asset);
+        if(acceptance.status != DevelopmentCookedMesh::Status::Success)
+        {
+            return reject(std::string(acceptance.message));
+        }
+        source.m_cookedAcceptance = acceptance.lease;
         return source;
     }
 
@@ -323,6 +379,13 @@ std::optional<MeshResidencyToken> FileSceneRuntime::PrepareMeshResidency(const S
 
     prepared.committedSlots = prepared.runtimeSlots;
     prepared.originalSlots = object.slotMaterials;
+    if(candidate.sourceKind == MeshResidencyCandidate::SourceKind::Cooked &&
+        !catalog.ValidateMeshResidencyCandidate(candidate, current->meshReference, error))
+    {
+        // Recheck after fallible material work; never substitute a new mapping.
+        return std::nullopt;
+    }
+
     prepared.token = {m_instanceIdentity, m_nextMeshResidency, current->bindingRevision};
     const auto token = prepared.token;
     // Map moves may allocate sentinel storage here, before any scene mutation.
@@ -384,6 +447,12 @@ MeshResidencySourceLock FileSceneRuntime::ValidatePreparedMeshResidency(const Me
     }
 
     const auto& prepared = *m_meshResidency;
+    if(prepared.candidate.sourceKind == MeshResidencyCandidate::SourceKind::Cooked && !m_cookedDiagnosticPublication)
+    {
+        Fail(error, "Cooked residency publication requires an explicit Debug diagnostic action.");
+        return {};
+    }
+
     auto source = catalog.ValidateMeshResidencyCandidate(prepared.candidate, current->meshReference, error);
 
     if(!source || !catalog.ValidateRetainedResidencyMaterial(current->materialReference, prepared.fallback, error))

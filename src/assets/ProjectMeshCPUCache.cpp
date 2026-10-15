@@ -37,15 +37,20 @@ size_t ProjectMeshCPUCache::GeometryBytes(const ImportedMesh& geometry)
     bytes += geometry.vertices.capacity() * sizeof(Vertex);
     bytes += geometry.indices.capacity() * sizeof(std::uint32_t);
 
-    bytes += geometry.metadata.submeshes.capacity() * sizeof(MeshSubmesh);
-    bytes += geometry.metadata.materialSlots.capacity() * sizeof(MeshMaterialSlot);
+    return bytes + MetadataBytes(geometry.metadata);
+}
 
-    for(const auto& submesh : geometry.metadata.submeshes)
+size_t ProjectMeshCPUCache::MetadataBytes(const MeshMetadata& metadata)
+{
+    size_t bytes = metadata.submeshes.capacity() * sizeof(MeshSubmesh);
+    bytes += metadata.materialSlots.capacity() * sizeof(MeshMaterialSlot);
+
+    for(const auto& submesh : metadata.submeshes)
     {
         bytes += submesh.name.capacity() + 1;
     }
 
-    for(const auto& slot : geometry.metadata.materialSlots)
+    for(const auto& slot : metadata.materialSlots)
     {
         bytes += slot.id.capacity() + 1;
         bytes += slot.name.capacity() + 1;

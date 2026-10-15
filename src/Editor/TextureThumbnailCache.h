@@ -19,6 +19,7 @@ class TextureThumbnailCache
 {
 public:
     enum class Consumer : unsigned int { AssetBrowser = 1, MaterialInspector = 2 };
+    enum class Failure { None, Preparation, DescriptorCapacity, TextureResource, UploadResource, UploadMap, DeviceLost };
     using Ticket = std::uint64_t;
     static constexpr size_t kCapacity = 64;
     static constexpr size_t kQueueCapacity = 32;
@@ -31,6 +32,8 @@ public:
         unsigned int width = 0;
         unsigned int height = 0;
         std::string error;
+        Failure failure = Failure::None;
+        bool retryable = false;
 
         std::uint64_t lastUse = 0;
         std::uint64_t lastSubmissionFence = 0;
@@ -66,6 +69,21 @@ public:
     void ResolveAfterGPUDrain();
     void ClearAfterGPUDrain();
 
+    struct Diagnostics
+    {
+        size_t entries = 0;
+        size_t resident = 0;
+        size_t pendingRetirement = 0;
+        size_t pixelBytes = 0;
+        size_t retryable = 0;
+        size_t terminal = 0;
+        std::uint64_t evictions = 0;
+        std::uint64_t uploadAttempts = 0;
+        std::uint64_t preparationJobs = 0;
+        std::uint64_t pixelPreparations = 0;
+    };
+    Diagnostics GetDiagnostics() const;
+
 private:
     struct Worker;
     struct Entry
@@ -92,12 +110,15 @@ private:
         bool ready = false;
         bool needsValidation = false;
         std::chrono::steady_clock::time_point nextValidation{};
+        std::chrono::steady_clock::time_point nextUploadAttempt{};
     };
     using Key = std::pair<std::filesystem::path, std::string>;
     bool Queue(Entry& entry);
     void Poll();
     bool Upload(ID3D12GraphicsCommandList* commandList, Entry& entry, std::uint64_t generation);
     bool Retirable(const Entry& entry) const;
+    bool EvictUnused(Entry* exclude, bool requireDescriptor);
+    bool FailUpload(Entry& entry, Failure failure, std::string error);
 
     ID3D12Device* m_device = nullptr;
     DescriptorHeap* m_heap = nullptr;
@@ -108,4 +129,8 @@ private:
     std::uint64_t m_useSerial = 0;
     std::uint64_t m_completedFence = 0;
     bool m_quarantined = false;
+    std::uint64_t m_evictions = 0;
+    std::uint64_t m_uploadAttempts = 0;
+    std::uint64_t m_preparationJobs = 0;
+    std::uint64_t m_pixelPreparations = 0;
 };

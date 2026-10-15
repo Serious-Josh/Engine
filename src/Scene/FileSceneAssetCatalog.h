@@ -33,6 +33,7 @@
 
 class Scene;
 struct PreparedScene;
+class FileSceneRuntime;
 
 class ResourceUploader;
 class DescriptorHeap;
@@ -115,12 +116,32 @@ public:
     Mesh* FindRetainedMesh(std::string_view reference);
     const MeshMetadata* FindRetainedSlotMetadata(std::string_view reference) const;
     Material* FindRetainedMaterial(std::string_view reference);
+    // Existing renderer identity only; includes retained Inspector assignment versions.
+    // Never resolves files, uploads resources, or admits a new table entry.
+    Material* FindPublishedMaterial(std::string_view reference, const Renderer& renderer);
     bool ValidateEditorBindings(const SceneDocument& document, PreparedScene& prepared,
         std::string* errorMessage);
     // Main-thread only, outside renderer recording. Revalidates source then
     // synchronously uploads immutable worker buffers; never imports FBX.
     Mesh* ResolvePreparedMesh(std::string_view reference,
         const ProjectMeshPreparationService::Completion& completion, std::string* errorMessage);
+    struct CookedPreparationResult
+    {
+        ProjectMeshPreparationService::Status status = ProjectMeshPreparationService::Status::Invalid;
+        enum class Failure { None, Completion, Metadata, Binding, GPU };
+        Failure failure = Failure::None;
+        std::string error;
+        Mesh* mesh = nullptr; // Catalog borrow, only on successful GPU preparation.
+        std::optional<MeshResidencyCandidate> candidate;
+        std::shared_ptr<const CookedMeshResidencyEvidence> evidence;
+    };
+    // Explicit development selection only; never called by ordinary mesh lookup.
+    // Owner thread, outside recording. Uses the existing synchronous uploader.
+    CookedPreparationResult ResolvePreparedCookedMesh(std::string_view reference,
+        const ProjectMeshPreparationService::Completion& completion, const ProjectMeshPreparationService& preparation,
+        const Renderer& renderer, const FileSceneRuntime& runtime);
+    CookedPreparationResult RetainPreparedCookedMetadata(std::string_view reference,
+        const ProjectMeshPreparationService::Completion& completion, const ProjectMeshPreparationService& preparation);
     // Existing upload-complete project mesh only; never imports or uploads.
     std::optional<MeshResidencyCandidate> DescribeMeshResidencyCandidate(std::string_view reference,
         const Mesh& mesh, std::string* errorMessage = nullptr) const;
@@ -190,11 +211,17 @@ public:
     }
 
 private:
+    friend class SceneMaterialBindingPublication;
+    friend struct MaterialAdmissionState;
+    friend class Renderer;
+    std::map<std::string, std::string> m_admittedMaterialDigests;
     Mesh* CreateProjectMesh(const ProjectMeshCPUCache::Key& key,
-        std::shared_ptr<const ImportedMesh> geometry);
+        std::shared_ptr<const ImportedMesh> geometry,
+        std::shared_ptr<const CookedMeshResidencyEvidence> cooked = {});
     struct MeshAsset
     {
         std::shared_ptr<const ImportedMesh> geometry;
+        std::shared_ptr<const CookedMeshResidencyEvidence> cooked;
 
         Mesh mesh;
 
@@ -206,6 +233,7 @@ private:
     using MeshCacheKey = ProjectMeshCPUCache::Key;
     static constexpr std::uint32_t kMeshImportRevision = ModelImporter::kImportRevision;
     std::map<MeshCacheKey, std::unique_ptr<MeshAsset>> m_projectMeshes;
+    std::map<MeshCacheKey, std::shared_ptr<const CookedMeshResidencyEvidence>> m_cookedMetadata;
 
     ProjectMeshCPUCache* m_meshCPUCache = nullptr; // Engine-owned; CPU-only, outlives catalogs.
 

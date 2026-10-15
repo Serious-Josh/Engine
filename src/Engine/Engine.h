@@ -18,6 +18,8 @@
 #include "Scene/FileSceneRuntime.h"
 #include "Scene/FileSceneAssetCatalog.h"
 #include "Scene/MeshResidencyPublication.h"
+#include "Scene/SceneMaterialBindingPublication.h"
+#include <chrono>
 
 #include <cstdint>
 
@@ -28,10 +30,18 @@ enum class EngineState
     Stopped
 };
 
+class FileBackedDemoScene;
+
 class Engine
 {
     public:
     bool Initialize();
+#ifndef NDEBUG
+    // Preparation checkpoint only. Never enters the publication coordinator.
+    bool VerifyCookedMeshGPUPreparation(const std::filesystem::path& scenePath);
+    bool VerifyCookedMeshPublication(const std::filesystem::path& scenePath, bool visualReview = false);
+    bool VerifyMaterialBindingPublication();
+#endif
     // Explicit main-thread capability; publishes at the next ready pre-Render boundary.
     bool PrepareMeshResidencyAcceptance(const MeshResidencyToken& token, std::string& error);
     // Main-thread only; drops coordination ownership, preserving GPU manager pins.
@@ -129,6 +139,9 @@ class Engine
     }
 
     private:
+#ifndef NDEBUG
+    bool VerifyCookedMeshLifecycle(const std::filesystem::path& scenePath);
+#endif
     void ProcessMeshResidencyDiagnostics();
     void RequestDiagnosticMeshResidency();
     void AdvanceDiagnosticMeshPreparation();
@@ -178,9 +191,11 @@ class Engine
         std::uint64_t ticket = 0;
         std::uint64_t generation = 0;
         std::optional<ProjectMeshPreparationService::Completion> completion;
+        bool cooked = false;
     };
 
     std::optional<DiagnosticMeshPreparation> m_diagnosticCPUPreparation;
+    std::uint64_t m_cookedPublicationTicket = 0;
     void LogMeshResidencyDiagnostic(const MeshResidencyPublication::AcceptanceResult& result);
 
     std::optional<MeshResidencyToken> m_diagnosticMeshToken;
@@ -292,6 +307,28 @@ class Engine
 
     Renderer m_renderer;
 
+    friend class ViewportMaterialDropVerification;
+    struct PendingViewportMaterialBinding
+    {
+        Editor::MaterialBindingRequest request;
+        std::chrono::steady_clock::time_point started;
+        bool prepared = false;
+        const ProjectAssetRegistry* registry = nullptr;
+        std::filesystem::path project;
+        std::uint64_t rendererIdentity = 0;
+        std::uint64_t preparationTicket = 0;
+        std::shared_ptr<const ProjectMaterialPreparationService::Candidate> candidate;
+        bool admissionStarted = false;
+        bool materialReady = false;
+        std::chrono::steady_clock::time_point retryAfter{}, progressAfter{};
+    };
+    SceneMaterialBindingPublication m_viewportMaterialPublication;
+    std::optional<PendingViewportMaterialBinding> m_pendingViewportMaterialBinding;
+    void ProcessViewportMaterialAssignment(IDemoScene& scene);
+    void CancelViewportMaterialAssignment(std::string_view reason) noexcept;
+    void ReleaseViewportMaterialPreparation() noexcept;
+    bool PrepareViewportDropMaterial(FileBackedDemoScene& owner);
+
     std::optional<Renderer::FrameRenderResult> m_diagnosticRenderOutcome;
 
     // Declared before scene owners so cache lifetime includes catalog teardown.
@@ -317,5 +354,6 @@ class Engine
     ProjectAssetRegistry m_projectAssetRegistry;
 
     ProjectTexturePreparationService m_texturePreparation;
+    std::unique_ptr<ProjectMaterialPreparationService> m_materialPreparation;
     ProjectMeshPreparationService m_meshPreparation;
 };

@@ -524,6 +524,7 @@ std::optional<RayTracingSceneResources::ReplacementCandidate> RayTracingSceneRes
     }
 
     PatchTableDescriptors(snapshot, gpuInstances);
+    snapshot.instanceRecords = gpuInstances;
     state.uploadBytes = {gpuInstances.size() * sizeof(RayTracingInstanceData),
         triangles.size() * sizeof(unsigned int), materials.size() * sizeof(unsigned int)};
 
@@ -876,6 +877,12 @@ RayTracingSceneResources::AdoptionReadiness RayTracingSceneResources::PrepareCan
 
     auto& state = *m_candidate;
 
+    if (m_materialBindingEpoch == UINT64_MAX)
+    {
+        Fail(error, "Renderer binding identities are exhausted.");
+        return AdoptionReadiness::Unsupported;
+    }
+
     if (state.proposals.size() != 1)
     {
         Fail(error, "Coordinated readiness currently requires exactly one scene-side residency transaction.");
@@ -886,6 +893,7 @@ RayTracingSceneResources::AdoptionReadiness RayTracingSceneResources::PrepareCan
 
     if (proposal.objectID != objectID || proposal.mesh.key != mesh.key || proposal.mesh.mesh != mesh.mesh ||
         proposal.mesh.sourceKind != mesh.sourceKind || proposal.mesh.builtinReference != mesh.builtinReference ||
+        proposal.mesh.cooked != mesh.cooked ||
         proposal.mesh.catalogIdentity != mesh.catalogIdentity || proposal.mesh.vertexAddress != mesh.vertexAddress ||
         proposal.mesh.indexAddress != mesh.indexAddress || objectIndex >= state.snapshot->materialBindings.size())
     {
@@ -1037,6 +1045,7 @@ void RayTracingSceneResources::AdoptPreparedCandidate(
     // descriptor destruction occurs here; normal checked collection retires it.
     m_retiredMemberships[evidence.retirementSlot] = std::move(m_membership);
     m_membership = std::move(state.snapshot);
+    ++m_materialBindingEpoch; // Invalidate prepared binding tables across membership replacement (including ABA).
 
     // Candidate copy/build completion was proved before commit. Upload buffers
     // are no longer GPU dependencies; geometry and BLAS pins remain retained.

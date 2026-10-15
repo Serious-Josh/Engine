@@ -1,16 +1,11 @@
 #pragma once
 
 #include "assets/ImportedMesh.h"
+#include "assets/MeshPreparationPolicy.h"
 
 #include <filesystem>
 #include <vector>
 #include <limits>
-
-enum class MeshUVOrientation
-{
-    PreserveSource,
-    FlipV
-};
 
 class ModelImporter
 {

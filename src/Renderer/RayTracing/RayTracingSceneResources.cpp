@@ -116,6 +116,7 @@ bool RayTracingSceneResources::Initialize(
     {
         return false;
     }
+    m_membership->instanceRecords = instanceData;
 
     if (!m_membership->instanceDataBuffer.Initialize(device, uploader, instanceData.data(), sizeof(RayTracingInstanceData),
         static_cast<unsigned int>(instanceData.size()), descriptorHeap))
@@ -524,6 +525,7 @@ void RayTracingSceneResources::MembershipSnapshot::Shutdown()
     slotGeometry.clear();
     materialBindings.clear();
     slotMaterialIndices.clear();
+    instanceRecords.clear();
 
     instances.clear();
     renderObjectToInstance.clear();
@@ -556,6 +558,8 @@ void RayTracingSceneResources::Shutdown()
     // No TLAS or membership descriptor may outlive its referenced BLAS/meshes.
     m_blasRegistry.retirementLifetime = 0;
     ShutdownReplacementCandidate();
+    for(auto& bindings : m_retiredMaterialBindings)
+        bindings.reset();
     m_membership->Shutdown();
 
     for (auto& snapshot : m_retiredMemberships)
@@ -801,6 +805,12 @@ void RayTracingSceneResources::CollectRetiredMemberships(const CommandContext& c
     if (!lifetime || !completed || completed == UINT64_MAX)
     {
         return; // Device loss and unavailable fences are never completion proof.
+    }
+
+    for(auto& bindings : m_retiredMaterialBindings)
+    {
+        if(bindings && bindings->lifetime == lifetime && completed >= bindings->fence)
+            bindings.reset();
     }
 
     for (auto& snapshot : m_retiredMemberships)

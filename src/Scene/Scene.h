@@ -8,8 +8,15 @@
 #include <cstdint>
 #include <vector>
 #include <array>
+#include <span>
 
 using RenderObjectID = std::size_t;
+
+struct RenderObjectTransformUpdate
+{
+    RenderObjectID id;
+    Transform transform;
+};
 
 class Scene
 {
@@ -30,6 +37,9 @@ class Scene
     void SetRenderObjectTransform(
         RenderObjectID id,
         const Transform& transform);
+
+    // Validate and allocate dirty-list capacity before changing any object.
+    bool SetRenderObjectTransforms(std::span<const RenderObjectTransformUpdate> updates);
 
     const std::vector<RenderObjectID>& GetChangedTransforms() const;
     void ClearChangedTransforms();

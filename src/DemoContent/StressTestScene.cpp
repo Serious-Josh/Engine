@@ -84,6 +84,9 @@ bool StressTestScene::Initialize(
         return false;
     }
 
+    RetainEditorGeometry(m_sphereMesh, std::move(sphere.vertices), std::move(sphere.indices));
+    RetainEditorGeometry(m_planeMesh, std::move(planeVertices), std::move(planeIndices));
+
     // Brick diffuse texture: BC1 with sRGB sampling.
 
     if (!DDSLoader::LoadTexture(device, uploader, descriptorHeap,
@@ -256,6 +259,7 @@ void StressTestScene::RebuildGrid()
 
 void StressTestScene::Shutdown()
 {
+    ClearEditorGeometry();
     m_scene.ClearRenderObjects();
 
     m_whiteTexture.Shutdown();

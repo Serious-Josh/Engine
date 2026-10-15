@@ -2,6 +2,8 @@
 
 #include "assets/ProjectMeshCPUCache.h"
 #include "assets/ProjectAssetResolver.h"
+#include "assets/ModelImporter.h"
+#include "assets/DevelopmentCookedMeshProvider.h"
 
 #include <atomic>
 #include <memory>
@@ -23,10 +25,29 @@ public:
         size_t retainedBytes = 1024 * 1024 * 1024;
     };
 
-    enum class Status { Accepted, Available, Pending, Retry, Invalid, Failed, Stale, Canceled };
+    enum class Status
+    {
+        Accepted, Available, Pending, Retry, Invalid, Failed, Stale, Canceled,
+        Missing, Unsupported, IncompatibleCook, Corrupt, IOFailure, AdmissionLimit,
+        AllocationFailure, IdentityFailure
+    };
+
+    enum class PreparationMode { Geometry, MetadataOnly };
+
+    struct CookedRequest
+    {
+        std::shared_ptr<const DevelopmentCookedMesh::Provider> provider;
+        AssetID asset;
+        std::uint64_t generation = 0;
+        PreparationMode mode = PreparationMode::Geometry;
+    };
 
     struct Identity
     {
+        MeshPreparationSourceKind sourceKind = MeshPreparationSourceKind::FBX;
+        PreparationMode mode = PreparationMode::Geometry;
+        std::shared_ptr<const DevelopmentCookedMesh::AssetEvidence> cooked;
+
         std::filesystem::path project;
         std::filesystem::path path;
         std::string assetID;
@@ -52,6 +73,8 @@ public:
         std::uint64_t ticket = 0;
         std::uint64_t generation = 0;
         std::shared_ptr<const ImportedMesh> geometry;
+        std::shared_ptr<const CookedMesh::MetadataSnapshot> metadata;
+        std::shared_ptr<const DevelopmentCookedMesh::Provider> provider;
         std::shared_ptr<const std::atomic_bool> current;
         std::string error;
         bool cacheHit = false;
@@ -69,6 +92,10 @@ public:
     void Cancel(std::uint64_t ticket);
     RequestResult Request(const ProjectPaths& paths, const ProjectAssetRegistry& registry,
         const AssetID& asset, std::uint64_t generation);
+    // Development/diagnostic selection only. Same worker/queues/cache; no FBX fallback.
+    RequestResult RequestCooked(const CookedRequest& request, ProjectMeshCPUCache& cache);
+    Completion PollCooked(std::uint64_t ticket);
+    Status ValidateCookedCompletion(const Completion& completion, std::string& error) const;
     // Also advances the hash -> owner-thread cache lookup -> import handoff.
     // No hashing, importing or GPU work occurs here. Poll Pending tickets again.
     Completion Poll(std::uint64_t ticket, const ProjectPaths& paths,
@@ -78,6 +105,11 @@ public:
     // Caller must still perform final source validation before any future GPU use.
     bool IntegrateCache(Completion& completion, ProjectMeshCPUCache& cache, std::string& error);
     size_t RetainedBytes() const;
+#ifndef NDEBUG
+    // Read-only phase observation for deterministic lifecycle diagnostics.
+    enum class DiagnosticStage { Missing, Queued, Running, Completed };
+    DiagnosticStage ObserveDiagnosticStage(std::uint64_t ticket) const;
+#endif
     static std::string InspectSourceIdentity(const std::filesystem::path& path);
 
 private:

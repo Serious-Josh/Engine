@@ -1,19 +1,39 @@
 #pragma once
 
-#include "assets/ModelImporter.h"
+#include "assets/ImportedMesh.h"
+#include "assets/MeshPreparationPolicy.h"
 
 #include <atomic>
 #include <list>
 #include <memory>
 #include <string>
 #include <tuple>
+#include <filesystem>
+#include <utility>
 
-// Engine-owned, main-thread CPU retention only. Callers must validate current
-// registry/type/containment and hash a locked source before using a verified key.
+// Engine-owned, main-thread CPU retention only. FBX callers validate registry,
+// containment and locked source hashes; cooked callers verify typed provider and
+// payload evidence. A cache lookup never grants source/session authorization.
 class ProjectMeshCPUCache
 {
 public:
-    using Key = std::tuple<std::filesystem::path, std::string, std::string, std::uint32_t, MeshUVOrientation>;
+    // First five fields retain FBX semantics. Cooked: provider namespace, AssetID,
+    // payload SHA-256, compatibility, unused PreserveSource. Final tag prevents
+    // collisions; publication/session tokens deliberately do not prevent reuse.
+    using KeyFields = std::tuple<std::filesystem::path, std::string, std::string, std::uint32_t,
+        MeshUVOrientation, MeshPreparationSourceKind>;
+
+    struct Key : KeyFields
+    {
+        Key() = default;
+        // Preserve existing five-field FBX construction and std::get access.
+        Key(std::filesystem::path project, std::string asset, std::string digest, std::uint32_t compatibility,
+            MeshUVOrientation uvPolicy, MeshPreparationSourceKind kind = MeshPreparationSourceKind::FBX)
+            : KeyFields(std::move(project), std::move(asset), std::move(digest), compatibility, uvPolicy, kind) {}
+
+        bool operator==(const Key&) const = default;
+        auto operator<=>(const Key&) const = default;
+    };
 
     struct Limits
     {
@@ -38,13 +58,14 @@ public:
     ProjectMeshCPUCache& operator=(const ProjectMeshCPUCache&) = delete;
 
     std::shared_ptr<const ImportedMesh> FindVerified(const Key& key);
-    // Complete importer output only, after post-import digest verification.
+    // Complete validated Engine geometry only, after source/payload verification.
     // Moves buffers; oversized entries return an uncached, accounted consumer lease.
     std::shared_ptr<const ImportedMesh> StoreVerified(const Key& key, ImportedMesh geometry);
     // Main-thread adoption of immutable worker output; no geometry copy.
     std::shared_ptr<const ImportedMesh> StorePreparedVerified(const Key& key,
         std::shared_ptr<const ImportedMesh> geometry);
     static size_t GeometryBytes(const ImportedMesh& geometry);
+    static size_t MetadataBytes(const MeshMetadata& metadata);
     Statistics GetStatistics() const;
     void Clear(); // Consumer leases remain valid, including after cache destruction.
 

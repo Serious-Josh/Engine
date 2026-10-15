@@ -6,6 +6,11 @@
 #include <atomic>
 #include <memory>
 #include <optional>
+#ifdef ENGINE_TEXTURE_PREPARATION_TESTS
+#include <functional>
+#endif
+
+class TextureSourceEvidence;
 
 // Main-thread request/poll/cancel API. The single worker owns CPU inputs only.
 class ProjectTexturePreparationService
@@ -45,6 +50,11 @@ public:
         std::shared_ptr<const PreparedProjectTexture> prepared;
         std::string error;
         std::shared_ptr<const std::atomic_bool> current;
+        // Worker-owned read/delete exclusion, retained through GPU acceptance.
+        // Opaque and revocable; callers must validate it, not inspect timestamps.
+        std::shared_ptr<TextureSourceEvidence> source;
+        std::uintmax_t sourceBytes = 0;
+        std::filesystem::file_time_type sourceModified;
     };
 
     ProjectTexturePreparationService();
@@ -64,7 +74,23 @@ public:
         const ProjectAssetRegistry& registry);
     // Must be checked again at future publication; a completion is never authorization by itself.
     bool IsCurrent(const Completion& completion) const;
+    // Main thread, immediately before consumption/publication. Bounded registry,
+    // path and file-ID checks only. Completion must live through acceptance.
+    bool ValidateSource(const Completion& completion, const ProjectPaths& paths,
+        const ProjectAssetRegistry& registry, std::string& error) const;
     size_t RetainedBytes() const; // Includes active reservations and consumer-held leases.
+    struct Statistics
+    {
+        std::uint64_t workerHashes = 0;
+        std::uint64_t decodes = 0;
+        std::uint64_t cacheHits = 0;
+        std::uint64_t deduplicated = 0;
+    };
+    Statistics GetStatistics() const;
+#ifdef ENGINE_TEXTURE_PREPARATION_TESTS
+    enum class TestStage { Pinned, Hashed, Prepared };
+    void SetTestHook(std::function<void(TestStage)> hook);
+#endif
 
 private:
     struct State;

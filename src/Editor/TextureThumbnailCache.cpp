@@ -13,9 +13,15 @@
 #include <optional>
 #include <stdexcept>
 #include <thread>
+#include <objbase.h>
 
 namespace
 {
+    struct WorkerCOM
+    {
+        HRESULT result = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        ~WorkerCOM() { if(SUCCEEDED(result)) CoUninitialize(); }
+    };
     // CPU-only helper, used exclusively by the bounded preparation worker.
     static TextureThumbnailDiskCache::Image PreparePixels(const TextureThumbnailDiskCache::Source& diskSource)
     {
@@ -133,6 +139,7 @@ struct TextureThumbnailCache::Worker
         std::string error;
         Ticket ticket = 0;
         std::uint64_t epoch = 0;
+        bool preparedPixels = false;
     };
 
     std::mutex mutex;
@@ -149,6 +156,8 @@ struct TextureThumbnailCache::Worker
 
     void Run()
     {
+        // DirectXTex's default resize filter may create a WIC factory on this thread.
+        WorkerCOM com;
         for(;;)
         {
             std::unique_lock lock(mutex);
@@ -174,6 +183,8 @@ struct TextureThumbnailCache::Worker
 
             try
             {
+                if(FAILED(com.result))
+                    throw std::runtime_error("Cannot initialize thumbnail image processing. HRESULT: " + std::to_string(com.result));
                 ProjectAssetRegistry registry;
                 registry.Register(job.record);
                 const auto resolved = ProjectAssetResolver::Resolve(job.paths, registry, job.record.id);
@@ -194,6 +205,7 @@ struct TextureThumbnailCache::Worker
 
                 if(prepared.identity != job.identity)
                 {
+                    prepared.preparedPixels = true;
                     prepared.pixels = PreparePixels(source);
                 }
 
@@ -269,6 +281,7 @@ void TextureThumbnailCache::Poll()
         }
 
         entry.preparing = false;
+        m_pixelPreparations += result->preparedPixels;
         entry.nextValidation = std::chrono::steady_clock::now() + std::chrono::seconds(1);
 
         if(!entry.consumers || m_quarantined)
@@ -278,7 +291,9 @@ void TextureThumbnailCache::Poll()
 
         if(!result->error.empty())
         {
-            entry.preview.error = std::move(result->error);
+            entry.preview.error = std::move(result->error) + " Refresh to retry this source.";
+            entry.preview.failure = Failure::Preparation;
+            entry.preview.retryable = false;
             entry.ready = false;
             entry.preview.invalidated = true;
             return;
@@ -301,6 +316,8 @@ void TextureThumbnailCache::Poll()
         entry.identity = std::move(result->identity);
         entry.pixels = std::move(result->pixels);
         entry.preview.error.clear();
+        entry.preview.failure = Failure::None;
+        entry.preview.retryable = false;
         return;
     }
 }
@@ -309,7 +326,8 @@ bool TextureThumbnailCache::Queue(Entry& entry)
 {
     std::lock_guard lock(m_worker->mutex);
 
-    if(entry.preparing || m_quarantined || m_worker->jobs.size() >= kQueueCapacity)
+    if(entry.preparing || m_quarantined || m_worker->jobs.size() >= kQueueCapacity ||
+        (entry.preview.failure != Failure::None && !entry.preview.retryable))
     {
         return false;
     }
@@ -321,6 +339,7 @@ bool TextureThumbnailCache::Queue(Entry& entry)
         entry.preview.invalidated ? std::string{} : entry.identity,
         entry.cancelled, entry.ticket, entry.epoch});
     entry.preparing = true;
+    ++m_preparationJobs;
     m_worker->wake.notify_one();
     return true;
 }
@@ -343,35 +362,9 @@ TextureThumbnailCache::Ticket TextureThumbnailCache::Request(const ProjectPaths&
 
     if(found == m_entries.end())
     {
-        if(m_entries.size() >= kCapacity)
+        if(m_entries.size() >= kCapacity && !EvictUnused(nullptr, false))
         {
-            auto victim = m_entries.end();
-
-            for(auto candidate = m_entries.begin(); candidate != m_entries.end(); ++candidate)
-            {
-                if(candidate->second.consumers || !Retirable(candidate->second))
-                {
-                    continue;
-                }
-
-                if(victim == m_entries.end() || candidate->second.preview.lastUse < victim->second.preview.lastUse)
-                {
-                    victim = candidate;
-                }
-            }
-
-            if(victim == m_entries.end())
-            {
-                return 0;
-            }
-
-            if(victim->second.cancelled)
-            {
-                victim->second.cancelled->store(true);
-            }
-
-            victim->second.preview.texture.Shutdown();
-            m_entries.erase(victim);
+            return 0;
         }
 
         found = m_entries.try_emplace(key, paths, record).first;
@@ -493,7 +486,11 @@ void TextureThumbnailCache::Invalidate(const std::filesystem::path& path)
         entry.preview.invalidated = true;
 
         entry.pixels = {};
+        entry.preview.error.clear();
+        entry.preview.failure = Failure::None;
+        entry.preview.retryable = false;
         entry.nextValidation = {};
+        entry.nextUploadAttempt = {};
     }
 }
 
@@ -508,6 +505,11 @@ void TextureThumbnailCache::SetCompletedFence(std::uint64_t fence)
         {
             entry.staging.Reset();
         }
+        if(entry.preview.failure != Failure::None && !entry.preview.retryable && Retirable(entry))
+        {
+            entry.preview.texture.Shutdown();
+            entry.staging.Reset();
+        }
 
         if(entry.consumers && !entry.preparing && !entry.uploadGeneration &&
             entry.uploadFence <= m_completedFence && entry.pixels.pixels.empty() &&
@@ -516,6 +518,66 @@ void TextureThumbnailCache::SetCompletedFence(std::uint64_t fence)
             Queue(entry);
         }
     }
+}
+
+bool TextureThumbnailCache::EvictUnused(Entry* exclude, bool requireDescriptor)
+{
+    auto victim = m_entries.end();
+    for(auto candidate = m_entries.begin(); candidate != m_entries.end(); ++candidate)
+    {
+        const auto& entry = candidate->second;
+        if(&entry == exclude || entry.consumers || !Retirable(entry) ||
+            (requireDescriptor && entry.preview.texture.GetDescriptorIndex() == UINT_MAX))
+        {
+            continue;
+        }
+        if(victim == m_entries.end() || entry.preview.lastUse < victim->second.preview.lastUse)
+            victim = candidate;
+    }
+    if(victim == m_entries.end()) return false;
+    if(victim->second.cancelled) victim->second.cancelled->store(true);
+    victim->second.preview.texture.Shutdown();
+    m_entries.erase(victim);
+    ++m_evictions;
+    return true;
+}
+
+TextureThumbnailCache::Diagnostics TextureThumbnailCache::GetDiagnostics() const
+{
+    Diagnostics result;
+    result.entries = m_entries.size();
+    result.evictions = m_evictions;
+    result.uploadAttempts = m_uploadAttempts;
+    result.preparationJobs = m_preparationJobs;
+    result.pixelPreparations = m_pixelPreparations;
+    for(const auto& [key, entry] : m_entries)
+    {
+        const bool resident = entry.preview.texture.GetResource() != nullptr;
+        result.resident += resident;
+        result.pendingRetirement += resident && !Retirable(entry);
+        result.pixelBytes += entry.pixels.pixels.size();
+        result.retryable += entry.preview.failure != Failure::None && entry.preview.retryable;
+        result.terminal += entry.preview.failure != Failure::None && !entry.preview.retryable;
+    }
+    return result;
+}
+
+bool TextureThumbnailCache::FailUpload(Entry& entry, Failure failure, std::string error)
+{
+    // No commands reference this attempt yet; Upload's Retirable gate protects
+    // the previous allocation. Keep bounded CPU pixels so recovery does not decode again.
+    entry.preview.texture.Shutdown();
+    entry.staging.Reset();
+    const auto removed = m_device->GetDeviceRemovedReason();
+    entry.preview.retryable = SUCCEEDED(removed);
+    entry.preview.failure = entry.preview.retryable ? failure : Failure::DeviceLost;
+    entry.preview.error = entry.preview.retryable ? std::move(error) :
+        "Thumbnail device lost. HRESULT: " + std::to_string(removed);
+    entry.preview.invalidated = true;
+    entry.ready = false;
+    entry.nextUploadAttempt = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    if(!entry.preview.retryable) entry.pixels = {};
+    return false;
 }
 
 D3D12_GPU_DESCRIPTOR_HANDLE TextureThumbnailCache::GetHandle(const Preview& preview) const
@@ -532,20 +594,31 @@ bool TextureThumbnailCache::Upload(ID3D12GraphicsCommandList* commandList, Entry
     }
 
     auto& preview = entry.preview;
+    ++m_uploadAttempts;
     preview.texture.Shutdown();
     entry.staging.Reset();
     entry.uploadFence = 0;
     preview.width = entry.pixels.width;
     preview.height = entry.pixels.height;
 
-    if(!preview.texture.Initialize(m_device, preview.width, preview.height, 1, 1,
-        DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST) ||
-        !preview.texture.CreateSRV(m_device, *m_heap))
+    // The cache's entry limit is independent of the shared heap's free slots.
+    // Reclaim idle descriptors even below kCapacity, but never active/in-flight ones.
+    if(m_heap->GetAvailableCount() == 0) EvictUnused(&entry, true);
+    if(m_heap->GetAvailableCount() == 0)
     {
-        preview.texture.Shutdown();
-        preview.error = "Cannot allocate texture thumbnail.";
-        entry.pixels = {};
-        return false;
+        return FailUpload(entry, Failure::DescriptorCapacity,
+            "Waiting for texture thumbnail SRV capacity (shared heap: " +
+            std::to_string(m_heap->GetCapacity()) + " descriptors). Retry scheduled.");
+    }
+    if(!preview.texture.Initialize(m_device, preview.width, preview.height, 1, 1,
+        DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST))
+    {
+        return FailUpload(entry, Failure::TextureResource,
+            "Cannot create thumbnail GPU texture; see resource HRESULT in the renderer log. Retry scheduled.");
+    }
+    if(!preview.texture.CreateSRV(m_device, *m_heap))
+    {
+        return FailUpload(entry, Failure::DescriptorCapacity, "Cannot allocate thumbnail SRV. Retry scheduled.");
     }
 
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
@@ -565,25 +638,22 @@ bool TextureThumbnailCache::Upload(ID3D12GraphicsCommandList* commandList, Entry
     buffer.SampleDesc.Count = 1;
     buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
 
-    if(FAILED(m_device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer,
-        D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&entry.staging))))
+    const auto stagingResult = m_device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer,
+        D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&entry.staging));
+    if(FAILED(stagingResult))
     {
-        preview.texture.Shutdown();
-        preview.error = "Cannot allocate thumbnail staging.";
-        entry.pixels = {};
-        return false;
+        return FailUpload(entry, Failure::UploadResource,
+            "Cannot allocate thumbnail upload staging. HRESULT: " + std::to_string(stagingResult) + ". Retry scheduled.");
     }
 
     void* mapped = nullptr;
     const D3D12_RANGE noReads{0, 0};
 
-    if(FAILED(entry.staging->Map(0, &noReads, &mapped)))
+    const auto mapResult = entry.staging->Map(0, &noReads, &mapped);
+    if(FAILED(mapResult))
     {
-        preview.texture.Shutdown();
-        entry.staging.Reset();
-        preview.error = "Cannot map thumbnail staging.";
-        entry.pixels = {};
-        return false;
+        return FailUpload(entry, Failure::UploadMap,
+            "Cannot map thumbnail upload staging. HRESULT: " + std::to_string(mapResult) + ". Retry scheduled.");
     }
 
     for(size_t row = 0; row < preview.height; ++row)
@@ -609,6 +679,10 @@ bool TextureThumbnailCache::Upload(ID3D12GraphicsCommandList* commandList, Entry
     entry.ready = false;
     entry.needsValidation = true;
     preview.invalidated = false;
+    preview.error.clear();
+    preview.failure = Failure::None;
+    preview.retryable = false;
+    entry.nextUploadAttempt = {};
 
     entry.pixels = {};
     return true;
@@ -636,7 +710,8 @@ bool TextureThumbnailCache::Record(ID3D12GraphicsCommandList* commandList, std::
 
     for(auto& [key, entry] : m_entries)
     {
-        if(entry.consumers && !entry.pixels.pixels.empty() && uploaded < kUploadsPerFrame && Retirable(entry))
+        if(entry.consumers && !entry.pixels.pixels.empty() && uploaded < kUploadsPerFrame && Retirable(entry) &&
+            std::chrono::steady_clock::now() >= entry.nextUploadAttempt)
         {
             ++uploaded;
             Upload(commandList, entry, generation);

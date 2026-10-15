@@ -9,6 +9,7 @@
 #include "StructuredBuffer.h"
 #include "MaterialTablePublication.h"
 #include "MaterialDependencyRetention.h"
+#include "MaterialAdmission.h"
 #include "ProjectTextureLoader.h"
 #include "CommandContext.h"
 #include "DescriptorHeap.h"
@@ -86,6 +87,7 @@ struct RendererOptions
     std::vector<Texture*> editorTextures;
 
     size_t selectedObject = (std::numeric_limits<size_t>::max)();
+    std::vector<size_t> selectedObjects;
 
     Vector3 selectionOutlineColor{1.0f, 0.72f, 0.0f};
     unsigned int selectionOutlineThickness = 2;
@@ -97,6 +99,8 @@ struct RendererOptions
 };
 
 class Scene;
+class FileSceneAssetCatalog;
+class FileSceneRuntime;
 class MirrorTestScene;
 struct Material;
 
@@ -360,6 +364,13 @@ class Renderer
     }
 
     bool HasPublishedMaterial(const Material& material) const noexcept;
+    // Engine thread, pre-Render. Repeated calls advance one bounded admission.
+    MaterialAdmissionResult AdvanceMaterialAdmission(ProjectMaterialPreparationService& preparation,
+        std::shared_ptr<const ProjectMaterialPreparationService::Candidate> candidate,
+        FileSceneAssetCatalog& catalog, const ProjectPaths& paths, const ProjectAssetRegistry& registry,
+        FileSceneRuntime& runtime);
+    void CancelMaterialAdmission();
+    static constexpr size_t MaterialAdmissionLimit = 4096;
     bool CanEditPendingMaterialBindings(const Scene& scene) const noexcept;
     bool CopyMaterialTableSnapshot(std::uint64_t identity, std::vector<GPUMaterial>& records,
         std::string* errorMessage = nullptr) const;
@@ -412,6 +423,10 @@ class Renderer
 
     private:
     friend class MeshResidencyPublication;
+    friend class SceneMaterialBindingPublication;
+    friend class SceneMaterialBindingVerification;
+    friend class MaterialAdmissionVerification;
+    friend class ViewportMaterialDropVerification;
     static constexpr bool kEnableFrameHitchDiagnostics = true;
     static constexpr double kCpuHitchThresholdMilliseconds = 25.0;
 
@@ -991,7 +1006,13 @@ class Renderer
 
     std::array<StructuredBuffer, CommandContext::FrameCount> m_materialBuffers;
 
-    UploadBuffer m_materialUpload;
+    std::array<UploadBuffer, CommandContext::FrameCount> m_materialUpload;
+    std::array<std::unique_ptr<MaterialTableReplacement>, CommandContext::FrameCount> m_materialReplacements;
+    std::shared_ptr<MaterialAdmissionState> m_materialAdmission;
+    std::weak_ptr<const ProjectMaterialPreparationService::Candidate> m_invalidatedMaterialCandidate;
+    void ValidateMaterialAdmissionLifecycle();
+    void InvalidateMaterialAdmission();
+    friend struct MaterialAdmissionState;
 
     std::vector<const Material*> m_publishedMaterialIdentities;
     MaterialTablePublication<CommandContext::FrameCount> m_materialPublication;

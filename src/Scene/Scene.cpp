@@ -1,6 +1,7 @@
 #include "Scene.h"
 
 #include <algorithm>
+#include <cmath>
 
 RenderObjectID Scene::AddRenderObject(const RenderObject& object)
 {
@@ -56,6 +57,33 @@ void Scene::SetRenderObjectTransform(
         m_transformDirty[id] = true;
         m_changedTransforms.push_back(id);
     }
+}
+
+bool Scene::SetRenderObjectTransforms(std::span<const RenderObjectTransformUpdate> updates)
+{
+    const auto finite = [](const Vector3& value)
+    {
+        return std::isfinite(value.x) && std::isfinite(value.y) && std::isfinite(value.z);
+    };
+    for(size_t index = 0; index < updates.size(); ++index)
+    {
+        const auto& update = updates[index];
+        if(update.id >= m_renderObjects.size() || !finite(update.transform.position) ||
+            !finite(update.transform.rotation) || !finite(update.transform.scale))
+        {
+            return false;
+        }
+        for(size_t previous = 0; previous < index; ++previous)
+        {
+            if(updates[previous].id == update.id) return false;
+        }
+    }
+    m_changedTransforms.reserve(m_changedTransforms.size() + updates.size());
+    for(const auto& update : updates)
+    {
+        SetRenderObjectTransform(update.id, update.transform);
+    }
+    return true;
 }
 
 const std::vector<RenderObjectID>& Scene::GetChangedTransforms() const

@@ -53,7 +53,7 @@ public:
             std::string_view(m_runtime->GetFileScene().GetDocument().id) : std::string_view{};
     }
 
-    const ImportedMesh* GetMeshGeometry(const Mesh& mesh) const noexcept
+    const ImportedMesh* GetMeshGeometry(const Mesh& mesh) const noexcept override
     {
         return m_assets.GetMeshGeometry(mesh);
     }
@@ -100,6 +100,8 @@ public:
     // Load outside active recording; completed uploads remain owned by this scene.
     Material* ResolveAssignmentMaterial(std::string_view reference, std::string* errorMessage = nullptr);
     Material* ResolvePendingAssignmentMaterial(std::string_view reference, std::string* errorMessage);
+    // Read-only admission query: never loads assets or grows renderer tables.
+    bool IsAssignmentMaterialAdmitted(std::string_view reference, const Renderer& renderer);
     const MeshMetadata* GetPendingSlotMetadata(std::string_view reference) const
     {
         return m_assets.FindRetainedSlotMetadata(reference);
@@ -134,6 +136,8 @@ private:
         const Shader* vertexShader, const Shader* pixelShader, bool metadataOnly);
 
     friend class Engine;
+    friend class SceneMaterialBindingVerification;
+    friend class ViewportMaterialDropVerification;
     // Engine retains both runtimes until checked candidate initialization/cleanup.
     std::unique_ptr<FileSceneRuntime> m_objectMutationCandidate;
 

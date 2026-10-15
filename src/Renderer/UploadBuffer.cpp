@@ -3,6 +3,17 @@
 
 #include <climits>
 #include <cstring>
+#include <utility>
+
+void UploadBuffer::Swap(UploadBuffer& other) noexcept
+{
+    std::swap(m_resource, other.m_resource);
+    std::swap(m_mappedData, other.m_mappedData);
+    std::swap(m_capacityPerFrame, other.m_capacityPerFrame);
+    std::swap(m_frameOffset, other.m_frameOffset);
+    std::swap(m_offset, other.m_offset);
+    std::swap(m_frameCount, other.m_frameCount);
+}
 
 static std::size_t AlignUp(
     std::size_t value,

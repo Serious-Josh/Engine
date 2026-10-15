@@ -739,11 +739,13 @@ void FileSceneAssetCatalog::Shutdown()
     }
 
     m_projectMeshes.clear();
+    m_cookedMetadata.clear();
     m_meshCPUCache = nullptr;
     m_meshError.clear();
 
     m_defaultMaterial = Material{};
     m_projectMaterials.clear();
+    m_admittedMaterialDigests.clear();
     m_materialSources.clear();
 
     // Same checked GPU completion precondition as every other scene-owned descriptor.
@@ -1566,10 +1568,11 @@ bool FileSceneAssetCatalog::PublishWorkingMaterialParameters(const RuntimeMateri
 }
 
 Mesh* FileSceneAssetCatalog::CreateProjectMesh(const ProjectMeshCPUCache::Key& key,
-    std::shared_ptr<const ImportedMesh> prepared)
+    std::shared_ptr<const ImportedMesh> prepared, std::shared_ptr<const CookedMeshResidencyEvidence> cooked)
 {
     auto asset = std::make_unique<MeshAsset>();
     asset->geometry = std::move(prepared);
+    asset->cooked = std::move(cooked);
     const auto& geometry = *asset->geometry;
     const bool uploaded = SceneSwitchTiming::MeasureCall(SceneSwitchTiming::Stage::MeshUpload, [&]()
     {
@@ -1625,6 +1628,7 @@ Mesh* FileSceneAssetCatalog::ResolvePreparedMesh(std::string_view reference,
         const auto id = AssetID::ParseReference(reference);
 
         if (!m_initialized || !m_registry || !m_device || !m_uploader || !m_descriptorHeap ||
+            identity.sourceKind != MeshPreparationSourceKind::FBX ||
             completion.status != ProjectMeshPreparationService::Status::Available || !completion.geometry ||
             !completion.current || !completion.current->load() || !id || id->ToReference() != reference ||
             id->ToString() != identity.assetID || identity.digest.empty() ||
@@ -1740,7 +1744,8 @@ Mesh* FileSceneAssetCatalog::FindRetainedMesh(std::string_view reference)
 
     for (const auto& [key, asset] : m_projectMeshes)
     {
-        if (std::get<1>(key) == id->ToString() && asset->published && asset->geometry)
+        if (std::get<5>(key) == MeshPreparationSourceKind::FBX &&
+            std::get<1>(key) == id->ToString() && asset->published && asset->geometry)
         {
             return &asset->mesh;
         }
@@ -1910,12 +1915,27 @@ const MeshMetadata* FileSceneAssetCatalog::FindRetainedSlotMetadata(std::string_
 
     for (const auto& [key, asset] : m_projectMeshes)
     {
-        if (std::get<1>(key) == id->ToString() && asset->published && asset->geometry)
+        if (std::get<5>(key) == MeshPreparationSourceKind::FBX &&
+            std::get<1>(key) == id->ToString() && asset->published && asset->geometry)
         {
             return &asset->geometry->metadata;
         }
     }
 
+    return nullptr;
+}
+
+Material* FileSceneAssetCatalog::FindPublishedMaterial(std::string_view reference, const Renderer& renderer)
+{
+    if(auto* retained = FindRetainedMaterial(reference); retained && renderer.HasPublishedMaterial(*retained))
+        return retained;
+    const auto id = AssetID::ParseReference(reference);
+    std::error_code error;
+    const auto project = std::filesystem::canonical(m_projectRoot, error);
+    if(!m_initialized || !id || error) return nullptr;
+    for(const auto& version : m_materialVersions)
+        if(version->assetID == id && version->projectIdentity == project && renderer.HasPublishedMaterial(version->material))
+            return &version->material;
     return nullptr;
 }
 

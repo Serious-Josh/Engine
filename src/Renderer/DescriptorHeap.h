@@ -24,6 +24,8 @@ class DescriptorHeap
 
     unsigned int Allocate();
     void Free(unsigned int index);
+    size_t GetAvailableCount() const noexcept { return m_freeIndices.size(); }
+    unsigned int GetCapacity() const noexcept { return m_capacity; }
 
     D3D12_CPU_DESCRIPTOR_HANDLE GetCPUHandle(unsigned int index) const;
     D3D12_GPU_DESCRIPTOR_HANDLE GetGPUHandle(unsigned int index) const;

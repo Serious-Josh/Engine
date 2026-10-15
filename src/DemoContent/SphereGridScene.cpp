@@ -81,6 +81,9 @@ bool SphereGridScene::Initialize(
         return false;
     }
 
+    RetainEditorGeometry(m_mesh, std::move(sphere.vertices), std::move(sphere.indices));
+    RetainEditorGeometry(m_planeMesh, std::move(planeVertices), std::move(planeIndices));
+
     // Brick diffuse texture: BC1 with sRGB sampling.
 
     if (!DDSLoader::LoadTexture(device, uploader, descriptorHeap,
@@ -346,6 +349,7 @@ void SphereGridScene::ResetDirectionalLight()
 
 void SphereGridScene::Shutdown()
 {
+    ClearEditorGeometry();
     m_scene.ClearRenderObjects();
 
     Log::Info("DemoScene shutdown: texture...");

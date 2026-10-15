@@ -4,6 +4,7 @@
 #include "Renderer/RayTracing/TopLevelAccelerationStructure.h"
 #include "Renderer/StructuredBuffer.h"
 #include "Renderer/RenderObject.h"
+#include "Renderer/ShaderData.h"
 #include "assets/MeshMetadata.h"
 #include "Scene/MeshResidency.h"
 
@@ -160,6 +161,9 @@ class RayTracingSceneResources
     private:
     friend class Renderer;
     friend class MeshResidencyPublication;
+    friend class SceneMaterialBindingPublication;
+    friend class SceneMaterialBindingVerification;
+    friend class MaterialAdmissionVerification;
 
     // Renderer-only observations cover every tracked list conservatively,
     // including builds and later rendering uses of an unchanged snapshot.
@@ -272,6 +276,8 @@ class RayTracingSceneResources
         std::unordered_map<const Mesh*, MeshMetadata> slotGeometry;
         std::vector<RenderObject> materialBindings;
         std::vector<std::vector<unsigned int>> slotMaterialIndices;
+        // CPU copy of immutable lookup metadata, independent of TLAS transforms.
+        std::vector<RayTracingInstanceData> instanceRecords;
     };
 
     static bool BuildMaterialSlotData(MembershipSnapshot& snapshot, const std::vector<RenderObject>& objects,
@@ -304,5 +310,17 @@ class RayTracingSceneResources
     bool CanRetireActiveMembership() const;
     bool RetireMembership(std::unique_ptr<MembershipSnapshot>& snapshot);
     std::array<std::unique_ptr<MembershipSnapshot>, MaxRetiredMemberships> m_retiredMemberships;
+
+    struct RetiredMaterialBindings
+    {
+        ~RetiredMaterialBindings() { instances.Shutdown(); slots.Shutdown(); }
+        StructuredBuffer instances;
+        StructuredBuffer slots;
+        std::uint64_t fence = 0;
+        std::uint64_t lifetime = 0;
+    };
+    // Separate from membership retirement: no TLAS, BLAS or geometry ownership changes.
+    std::array<std::unique_ptr<RetiredMaterialBindings>, 4> m_retiredMaterialBindings;
+    std::uint64_t m_materialBindingEpoch = 1;
 
 };

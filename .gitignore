@@ -20,5 +20,10 @@ CmakeUserPresets.json
 *.ilk
 *.exp
 
-# Test project directory
+# Test directories
 /Projects
+/docs
+/tests
+
+# Development-only cooked generations and publication bookkeeping
+**/Cooked/

@@ -3,6 +3,9 @@
 #include "assets/ProjectAssetResolver.h"
 #include "Core/Log.h"
 #include "Editor.h"
+#include "ViewportCameraInput.h"
+#include "GroupTransform.h"
+#include "ViewportPicking.h"
 #include "Debug/DebugUI.h"
 
 #include "Math/Math.h"
@@ -35,361 +38,36 @@
 
 namespace
 {
-    struct PickingRay
+    bool SameHistoryTransform(const Transform& left, const Transform& right);
+    float ViewportCameraSpeed()
     {
-        Vector3 origin;
-        Vector3 direction;
-
-        float maxDistance = 0.0f;
-    };
-
-    Vector3 TransformPoint(
-        const Matrix4& matrix,
-        const Vector3& point)
-    {
-        return {matrix.m[0][0] * point.x + matrix.m[0][1] * point.y + matrix.m[0][2] * point.z + matrix.m[0][3],
-                matrix.m[1][0] * point.x + matrix.m[1][1] * point.y + matrix.m[1][2] * point.z + matrix.m[1][3],
-                matrix.m[2][0] * point.x + matrix.m[2][1] * point.y + matrix.m[2][2] * point.z + matrix.m[2][3]};
+        const bool fast = ImGui::IsKeyDown(ImGuiKey_LeftShift) || ImGui::IsKeyDown(ImGuiKey_RightShift);
+        return fast ? 15.0f : 5.0f;
     }
 
-    Vector3 TransformDirection(
-        const Matrix4& matrix,
-        const Vector3& direction)
-    {
-        return {matrix.m[0][0] * direction.x + matrix.m[0][1] * direction.y + matrix.m[0][2] * direction.z,
-                matrix.m[1][0] * direction.x + matrix.m[1][1] * direction.y + matrix.m[1][2] * direction.z,
-                matrix.m[2][0] * direction.x + matrix.m[2][1] * direction.y + matrix.m[2][2] * direction.z};
-    }
+    using PickingRay = ViewportPicking::Ray;
 
-    bool UnprojectPoint(
-        const Matrix4& inverseViewProjection,
-        float x,
-        float y,
-        float z,
-        Vector3& result)
-    {
-        const float w = inverseViewProjection.m[3][0] * x + inverseViewProjection.m[3][1] * y +
-                        inverseViewProjection.m[3][2] * z + inverseViewProjection.m[3][3];
-
-        if (!std::isfinite(w) || std::abs(w) < 0.000001f)
-        {
-            return false;
-        }
-
-        const float inverseW = 1.0f / w;
-
-        result = {(inverseViewProjection.m[0][0] * x + inverseViewProjection.m[0][1] * y +
-                   inverseViewProjection.m[0][2] * z + inverseViewProjection.m[0][3]) *
-                      inverseW,
-                  (inverseViewProjection.m[1][0] * x + inverseViewProjection.m[1][1] * y +
-                   inverseViewProjection.m[1][2] * z + inverseViewProjection.m[1][3]) *
-                      inverseW,
-                  (inverseViewProjection.m[2][0] * x + inverseViewProjection.m[2][1] * y +
-                   inverseViewProjection.m[2][2] * z + inverseViewProjection.m[2][3]) *
-                      inverseW};
-
-        return std::isfinite(result.x) && std::isfinite(result.y) && std::isfinite(result.z);
-    }
-
-    bool BuildPickingRay(
-        const Camera& camera,
-        float mouseX,
-        float mouseY,
-        float viewportWidth,
-        float viewportHeight,
-        PickingRay& ray)
-    {
-        if (viewportWidth <= 0.0f || viewportHeight <= 0.0f || !std::isfinite(mouseX) || !std::isfinite(mouseY))
-        {
-            return false;
-        }
-
-        const float x = 2.0f * mouseX / viewportWidth - 1.0f;
-        const float y = 1.0f - 2.0f * mouseY / viewportHeight;
-
-        const Matrix4 viewProjection = camera.GetProjectionMatrix() * camera.GetViewMatrix();
-        const Matrix4 inverseViewProjection = viewProjection.Inverse();
-
-        Vector3 nearPoint;
-        Vector3 farPoint;
-
-        if (!UnprojectPoint(inverseViewProjection, x, y, 0.0f, nearPoint) ||
-            !UnprojectPoint(inverseViewProjection, x, y, 1.0f, farPoint))
-        {
-            return false;
-        }
-
-        const Vector3 difference = farPoint - nearPoint;
-        const float distance = difference.Length();
-
-        if (!std::isfinite(distance) || distance <= 0.000001f)
-        {
-            return false;
-        }
-
-        ray.origin = nearPoint;
-        ray.direction = difference * (1.0f / distance);
-        ray.maxDistance = distance;
-
-        return true;
-    }
-
-    bool IntersectAABB(
-        const Vector3& origin,
-        const Vector3& direction,
-        const MeshBounds& bounds,
-        float maxDistance,
-        float& hitDistance)
-    {
-        if (!bounds.valid)
-        {
-            return false;
-        }
-
-        float tMin = 0.0f;
-
-        float tMax = maxDistance;
-
-        const float origins[3] = {origin.x, origin.y, origin.z};
-
-        const float directions[3] = {direction.x, direction.y, direction.z};
-        const float minimums[3] = {bounds.min.x, bounds.min.y, bounds.min.z};
-        const float maximums[3] = {bounds.max.x, bounds.max.y, bounds.max.z};
-
-        for (int axis = 0; axis < 3; ++axis)
-        {
-            if (std::abs(directions[axis]) < 0.00000001f)
-            {
-                if (origins[axis] < minimums[axis] || origins[axis] > maximums[axis])
-                {
-                    return false;
-                }
-
-                continue;
-            }
-
-            const float inverseDirection = 1.0f / directions[axis];
-
-            float t1 = (minimums[axis] - origins[axis]) * inverseDirection;
-
-            float t2 = (maximums[axis] - origins[axis]) * inverseDirection;
-
-            if (t1 > t2)
-            {
-                (std::swap)(t1, t2);
-            }
-
-            tMin = (std::max)(tMin, t1);
-
-            tMax = (std::min)(tMax, t2);
-
-            if (tMin > tMax)
-            {
-                return false;
-            }
-        }
-
-        hitDistance = tMin;
-        return true;
-    }
-
-    bool IntersectObject(
-        const PickingRay& ray,
-        const RenderObject& object,
-        float& hitDistance)
-    {
-        if (!object.mesh || !object.mesh->GetBounds().valid)
-        {
-            return false;
-        }
-
-        // Reject singular transforms before calling Matrix4::Inverse(),
-        // which otherwise silently returns identity.
-        const Vector3& scale = object.transform.scale;
-
-        if (!std::isfinite(scale.x) || !std::isfinite(scale.y) || !std::isfinite(scale.z) ||
-            std::abs(scale.x * scale.y * scale.z) < 0.000001f)
-        {
-            return false;
-        }
-
-        const Matrix4 inverseModel = object.transform.GetModelMatrix().Inverse();
-
-        const Vector3 localOrigin = TransformPoint(inverseModel, ray.origin);
-
-        // Do not normalize: preserve the world-ray parameter t.
-
-        const Vector3 localDirection = TransformDirection(inverseModel, ray.direction);
-
-        return IntersectAABB(
-            localOrigin,
-            localDirection,
-            object.mesh->GetBounds(), ray.maxDistance, hitDistance);
-    }
+    using ViewportPicking::BuildPickingRay;
 
     bool IsFinitePosition(const Vector3& value)
     {
         return std::isfinite(value.x) && std::isfinite(value.y) && std::isfinite(value.z);
     }
 
-    struct RaycastVector
-    {
-        double x, y, z;
-
-        explicit RaycastVector(const Vector3& value) : x(value.x), y(value.y), z(value.z) {}
-        RaycastVector(double xValue, double yValue, double zValue) : x(xValue), y(yValue), z(zValue) {}
-
-        RaycastVector operator-(const RaycastVector& other) const
-        {
-            return {x - other.x, y - other.y, z - other.z};
-        }
-
-        RaycastVector Cross(const RaycastVector& other) const
-        {
-            return {y * other.z - z * other.y, z * other.x - x * other.z, x * other.y - y * other.x};
-        }
-
-        double Dot(const RaycastVector& other) const
-        {
-            return x * other.x + y * other.y + z * other.z;
-        }
-    };
-
-    bool IntersectTriangle(const PickingRay& ray, const Vector3& a, const Vector3& b,
-        const Vector3& c, double& nearestDistance)
-    {
-        if(!IsFinitePosition(a) || !IsFinitePosition(b) || !IsFinitePosition(c))
-        {
-            return false;
-        }
-
-        // Two-sided Moller-Trumbore intersection in double precision. Work in
-        // world space so distance is comparable across nonuniform/mirrored scales.
-        const RaycastVector edge1 = RaycastVector(b) - RaycastVector(a);
-        const RaycastVector edge2 = RaycastVector(c) - RaycastVector(a);
-        const RaycastVector direction(ray.direction);
-        const auto cross = direction.Cross(edge2);
-        const double determinant = edge1.Dot(cross);
-        const double area = std::sqrt(edge1.Cross(edge2).Dot(edge1.Cross(edge2)));
-
-        if(!std::isfinite(area) || area == 0 || !std::isfinite(determinant) ||
-            std::abs(determinant) <= area * 1e-12)
-        {
-            return false;
-        }
-
-        const auto offset = RaycastVector(ray.origin) - RaycastVector(a);
-        const double u = offset.Dot(cross) / determinant;
-
-        if(!std::isfinite(u) || u < 0 || u > 1)
-        {
-            return false;
-        }
-
-        const auto offsetCross = offset.Cross(edge1);
-        const double v = direction.Dot(offsetCross) / determinant;
-        const double distance = edge2.Dot(offsetCross) / determinant;
-
-        if(!std::isfinite(v) || v < 0 || u + v > 1 || !std::isfinite(distance) ||
-            distance <= 0 || distance > nearestDistance)
-        {
-            return false;
-        }
-
-        nearestDistance = distance;
-        return true;
-    }
+    using RaycastVector = ViewportPicking::DoubleVector;
 
     bool RaycastObject(const PickingRay& ray, const RenderObject& object,
         const ImportedMesh& geometry, double& nearestDistance)
     {
-        const Matrix4 model = object.transform.GetModelMatrix();
-
-        for(const auto& row : model.m)
-        {
-            for(float value : row)
-            {
-                if(!std::isfinite(value))
-                {
-                    return false;
-                }
-            }
-        }
-
-        if(!object.mesh || !object.mesh->GetBounds().valid)
+        // The scene owns immutable CPU arrays for this resident mesh. No pointer
+        // escapes this synchronous main-thread query or a scene mutation boundary.
+        if(!object.mesh || object.mesh->GetVertexCount() != geometry.vertices.size() ||
+            object.mesh->GetIndexCount() != geometry.indices.size())
         {
             return false;
         }
-
-        const auto& localBounds = object.mesh->GetBounds();
-        MeshBounds worldBounds;
-
-        // Transform all corners instead of inverting the model: broad phase
-        // remains conservative for tiny, nonuniform, and mirrored scales.
-        for(unsigned int corner = 0; corner < 8; ++corner)
-        {
-            const Vector3 local{corner & 1 ? localBounds.max.x : localBounds.min.x,
-                corner & 2 ? localBounds.max.y : localBounds.min.y,
-                corner & 4 ? localBounds.max.z : localBounds.min.z};
-            const Vector3 world = TransformPoint(model, local);
-
-            if(!IsFinitePosition(world))
-            {
-                return false;
-            }
-
-            if(!worldBounds.valid)
-            {
-                worldBounds.min = world;
-                worldBounds.max = world;
-                worldBounds.valid = true;
-                continue;
-            }
-
-            worldBounds.min.x = (std::min)(worldBounds.min.x, world.x);
-            worldBounds.min.y = (std::min)(worldBounds.min.y, world.y);
-            worldBounds.min.z = (std::min)(worldBounds.min.z, world.z);
-
-            worldBounds.max.x = (std::max)(worldBounds.max.x, world.x);
-            worldBounds.max.y = (std::max)(worldBounds.max.y, world.y);
-            worldBounds.max.z = (std::max)(worldBounds.max.z, world.z);
-        }
-
-        float boundsDistance = 0;
-
-        if(!IntersectAABB(ray.origin, ray.direction, worldBounds, ray.maxDistance, boundsDistance) ||
-            !std::isfinite(boundsDistance) ||
-            boundsDistance > nearestDistance)
-        {
-            return false;
-        }
-
-        bool hit = false;
-
-        for(size_t i = 0; i + 2 < geometry.indices.size(); i += 3)
-        {
-            const auto a = geometry.indices[i];
-            const auto b = geometry.indices[i + 1];
-            const auto c = geometry.indices[i + 2];
-
-            if(a >= geometry.vertices.size() || b >= geometry.vertices.size() || c >= geometry.vertices.size())
-            {
-                continue;
-            }
-
-            const auto worldPosition = [&](uint32_t index)
-            {
-                const auto& position = geometry.vertices[index].position;
-                return TransformPoint(model, {position[0], position[1], position[2]});
-            };
-
-            if(IntersectTriangle(ray, worldPosition(a), worldPosition(b), worldPosition(c), nearestDistance))
-            {
-                hit = true;
-            }
-        }
-
-        return hit;
+        return ViewportPicking::IntersectMesh(ray, object.transform.GetModelMatrix(), object.mesh->GetBounds(),
+            geometry, object.mesh->IsIndexed(), object.mesh->GetMetadata().submeshes, nearestDistance);
     }
 
     bool IntersectPlacementPlane(const PickingRay& ray, const Vector3& point, const Vector3& normal,
@@ -455,12 +133,13 @@ namespace
     }
 
     size_t PickObject(
-        const Scene& scene,
+        const IDemoScene& owner,
         float mouseX,
         float mouseY,
         float viewportWidth,
         float viewportHeight)
     {
+        const auto& scene = owner.GetScene();
         PickingRay ray{};
 
         if (!BuildPickingRay(scene.GetCamera(), mouseX, mouseY, viewportWidth, viewportHeight, ray))
@@ -470,22 +149,13 @@ namespace
 
         const auto& objects = scene.GetRenderObjects();
 
-        size_t closestObject = (std::numeric_limits<size_t>::max)();
-
-        float closestDistance = ray.maxDistance;
-
-        for (size_t i = 0; i < objects.size(); ++i)
+        return ViewportPicking::PickNearest(objects.size(), ray.maxDistance, [&](size_t index, double& nearest)
         {
-            float hitDistance = 0.0f;
-
-            if (IntersectObject(ray, objects[i], hitDistance) && hitDistance <= closestDistance)
-            {
-                closestDistance = hitDistance;
-                closestObject = i;
-            }
-        }
-
-        return closestObject;
+            const auto& object = objects[index];
+            const auto* geometry = object.mesh ? owner.GetMeshGeometry(*object.mesh) : nullptr;
+            // Pending/GPU-only geometry is skipped, never promoted from an AABB hit.
+            return geometry && RaycastObject(ray, object, *geometry, nearest);
+        });
     }
 }
 
@@ -762,6 +432,12 @@ void Editor::DrawSceneViewport(
                     position.y + 12.0f + lines * ImGui::GetTextLineHeightWithSpacing()),
                     IM_COL32(240, 220, 170, 255), m_sceneHistoryStatus.c_str());
             }
+            if(!m_materialDropStatus.empty())
+            {
+                ImGui::GetWindowDrawList()->AddText(ImVec2(position.x + 12.0f,
+                    position.y + size.y - ImGui::GetTextLineHeightWithSpacing() - 12.0f),
+                    IM_COL32(240, 220, 170, 255), m_materialDropStatus.c_str());
+            }
         }
     }
 
@@ -775,6 +451,7 @@ const EditorWorkspaceRect& Editor::PrepareWorkspace(
     DemoSceneManager& sceneManager,
     DebugUI& debugUI)
 {
+    ViewportCameraInput::ReserveLeftButton(m_cameraLooking, m_panLeftHeld);
     DrawMainMenu(demoScene, sceneManager, debugUI);
     m_workspace.Update();
     return m_workspace.GetSceneViewport();
@@ -1083,7 +760,7 @@ void Editor::DrawHierarchy(IDemoScene& demoScene, const std::string& activeScene
 
     if(!blocked && clicked && *clicked < scene.GetRenderObjects().size())
     {
-        m_selectedObject = *clicked;
+        SelectSceneObject(demoScene, *clicked);
         m_objectInspectionRequested = true;
     }
 }
@@ -1150,6 +827,8 @@ std::optional<SceneObjectInspectorView> Editor::ResolveObjectInspection(
 
     if(!fileScene)
     {
+        if(m_selectedObjects.size() > 1)
+            view.name += " (active; " + std::to_string(m_selectedObjects.size()) + " selected)";
         return view;
     }
 
@@ -1194,6 +873,10 @@ std::optional<SceneObjectInspectorView> Editor::ResolveObjectInspection(
 
     view.metadata = metadata;
     view.name = metadata->name;
+    if(m_selectedObjects.size() > 1)
+    {
+        view.name += " (active; " + std::to_string(m_selectedObjects.size()) + " selected)";
+    }
     view.mesh = label(metadata->meshReference, AssetType::Mesh);
     view.material = label(metadata->materialReference, AssetType::Material);
     view.meshReference = metadata->meshReference;
@@ -1259,7 +942,15 @@ void Editor::Draw(
     {
         ResetTransformGestures();
 
-        m_selectedObject = InvalidObjectSelection;
+        const bool preserveIDs = m_selectionScene == &scene && m_selectionSceneName == activeSceneName &&
+            m_selectionRuntimeIdentity == dragRuntimeIdentity && dragScene;
+        if(!preserveIDs)
+        {
+            m_orderedSelection.clear();
+            m_selectedObjects.clear();
+            m_selectedObject = InvalidObjectSelection;
+        }
+        m_objectInspectionRequested = true;
         m_selectionSceneName = activeSceneName;
         m_selectionStructureRevision = structureRevision;
 
@@ -1275,7 +966,15 @@ void Editor::Draw(
         m_selectedObject = InvalidObjectSelection;
     }
 
+    RefreshSceneSelection(demoScene);
     DrawHierarchy(demoScene, activeSceneName);
+    if(m_selectionStructureRevision != scene.GetStructureRevision())
+    {
+        ResetTransformGestures();
+        m_selectionStructureRevision = scene.GetStructureRevision();
+        RefreshSceneSelection(demoScene);
+        m_objectInspectionRequested = true;
+    }
 
     (void)debugUI;
     m_assetBrowser.SetThumbnailProject(projectPaths, assetRegistry);
@@ -1350,7 +1049,8 @@ void Editor::Draw(
         FinishTransformFieldEdit(demoScene);
     }
 
-    const bool disableInspector = m_materialLeaveAction != MaterialLeaveAction::None || m_sceneOperationPending;
+    const bool disableInspector = m_materialLeaveAction != MaterialLeaveAction::None || m_sceneOperationPending ||
+        m_pendingMaterialBinding.has_value();
 
     // This ImGui version's color picker restores alpha whenever a disabled scope exists,
     // including BeginDisabled(false), whose alpha backup may never have been initialized.
@@ -1521,18 +1221,15 @@ void Editor::Draw(
 
     DrawSceneViewport(sceneTextureHandle, sceneWidth, sceneHeight);
     DrawMeshDropTarget(demoScene, projectPaths, assetRegistry);
+    DrawMaterialDropTarget(demoScene, projectPaths, assetRegistry);
 
     const ImGuiIO& io = ImGui::GetIO();
 
-    if(ImGui::IsMouseClicked(ImGuiMouseButton_Left) || ImGui::IsMouseClicked(ImGuiMouseButton_Right))
-    {
-        m_viewportFocused = m_viewportHovered;
-    }
+    m_viewportFocused = ViewportCameraInput::UpdateFocus(m_viewportFocused, m_cameraLooking, m_viewportHovered);
 
     if(io.AppFocusLost || m_sceneOperationPending || m_viewportImage.size.x <= 0.0f || m_workspace.IsSplitterDragging())
     {
         m_viewportFocused = false;
-        m_cameraLooking = false;
     }
 
     if(m_viewportFocused && !io.WantTextInput && !ImGuizmo::IsUsing() && !ImGui::IsMouseDown(ImGuiMouseButton_Right))
@@ -1735,7 +1432,7 @@ void Editor::DrawObjectControls(
 
         if (ImGui::Selectable("None", noneSelected))
         {
-            m_selectedObject = InvalidObjectSelection;
+            SelectSceneObject(demoScene, InvalidObjectSelection);
             m_objectInspectionRequested = true;
         }
 
@@ -1747,7 +1444,7 @@ void Editor::DrawObjectControls(
 
             if (ImGui::Selectable(label.c_str(), selected))
             {
-                m_selectedObject = i;
+                SelectSceneObject(demoScene, i);
                 m_objectInspectionRequested = true;
             }
 
@@ -1876,6 +1573,156 @@ void Editor::FinishTransformFieldEdit(IDemoScene& demoScene)
     m_fieldHistoryTarget.reset();
 }
 
+void Editor::SelectSceneObject(const IDemoScene& demoScene, size_t index, bool toggle)
+{
+    if(ImGuizmo::IsUsing() || m_gizmoWasUsing) return;
+    std::optional<SelectedObjectIdentity> picked;
+    if(index < demoScene.GetScene().GetRenderObjects().size())
+    {
+        SelectedObjectIdentity identity;
+        if(const auto* owner = dynamic_cast<const FileBackedDemoScene*>(&demoScene))
+        {
+            const auto metadata = owner->GetObjectMetadata(index);
+            if(!metadata) return;
+            identity.objectID = metadata->objectID;
+        }
+        else
+        {
+            identity.proceduralIndex = index;
+        }
+        picked = std::move(identity);
+    }
+    SceneSelection::Select(m_orderedSelection, std::move(picked), toggle);
+    // An empty ordered list must not be repopulated from the old active index.
+    m_selectedObject = InvalidObjectSelection;
+    RefreshSceneSelection(demoScene);
+    m_objectInspectionRequested = true;
+}
+
+void Editor::RefreshSceneSelection(const IDemoScene& demoScene)
+{
+    const auto* owner = dynamic_cast<const FileBackedDemoScene*>(&demoScene);
+    const auto& objects = demoScene.GetScene().GetRenderObjects();
+    const auto previous = m_selectedObject;
+    // Compatibility with checked engine publication of a new single selection.
+    if(m_orderedSelection.empty() && m_selectedObject < objects.size())
+    {
+        if(owner)
+        {
+            if(const auto metadata = owner->GetObjectMetadata(m_selectedObject))
+                m_orderedSelection.push_back({metadata->objectID});
+        }
+        else m_orderedSelection.push_back({{}, m_selectedObject});
+    }
+    m_selectedObjects.clear();
+    m_selectedObjects.reserve(m_orderedSelection.size());
+    std::erase_if(m_orderedSelection, [&](const SelectedObjectIdentity& identity)
+    {
+        if(owner)
+        {
+            const auto metadata = owner->GetObjectMetadata(identity.objectID);
+            if(!metadata || metadata->runtimeIndex >= objects.size()) return true;
+            m_selectedObjects.push_back(metadata->runtimeIndex);
+        }
+        else
+        {
+            if(identity.objectID.size() || identity.proceduralIndex >= objects.size()) return true;
+            m_selectedObjects.push_back(identity.proceduralIndex);
+        }
+        return false;
+    });
+    m_selectedObject = m_selectedObjects.empty() ? InvalidObjectSelection : m_selectedObjects.back();
+    if(m_selectedObject != previous) m_objectInspectionRequested = true;
+}
+
+void Editor::UpdateGroupGizmo(IDemoScene& demoScene, bool usingGizmo, const Transform& anchorAfter)
+{
+    if(usingGizmo && !m_gizmoWasUsing)
+    {
+        try
+        {
+            auto command = std::make_unique<GroupTransformEdit>();
+            command->mode = m_gizmoMode;
+            command->edits.reserve(m_selectedObjects.size());
+            size_t bytes = sizeof(SceneHistoryEntry) + sizeof(GroupTransformEdit) +
+                m_selectedObjects.size() * sizeof(TransformEdit);
+            const auto& objects = static_cast<const Scene&>(demoScene.GetScene()).GetRenderObjects();
+            for(const auto index : m_selectedObjects)
+            {
+                auto target = CaptureHistoryTarget(demoScene, index);
+                if(!target) { m_gizmoWasUsing = true; return; }
+                if(const auto* persistent = std::get_if<PersistentHistoryTarget>(&*target))
+                    bytes += persistent->objectID.capacity() + 1;
+                command->edits.push_back({std::move(*target), objects[index].transform, objects[index].transform});
+            }
+            if(bytes > kSceneHistoryPayloadBytes || HasPendingSceneHistoryOperation())
+            {
+                ReportSceneHistoryFailure("Group transform exceeds history capacity or another operation is pending.");
+                m_gizmoWasUsing = true;
+                return;
+            }
+            m_sceneHistory.reserve(kSceneHistoryCapacity);
+            m_gizmoHistoryEpoch = m_historyEpoch;
+            m_gizmoGroupPayloadBytes = bytes;
+            m_gizmoGroupEdit = std::move(command);
+        }
+        catch(const std::exception& exception)
+        {
+            ReportSceneHistoryFailure(exception.what());
+            m_gizmoWasUsing = true;
+            return;
+        }
+    }
+
+    if(usingGizmo && m_gizmoGroupEdit)
+    {
+        try
+        {
+            std::vector<Transform> before, after;
+            std::vector<RenderObjectTransformUpdate> updates;
+            for(const auto& edit : m_gizmoGroupEdit->edits) before.push_back(edit.before);
+            const auto mode = m_gizmoGroupEdit->mode == GizmoMode::Translate ? GroupTransform::Mode::Translate :
+                m_gizmoGroupEdit->mode == GizmoMode::Rotate ? GroupTransform::Mode::Rotate : GroupTransform::Mode::Scale;
+            std::string error;
+            if(!GroupTransform::Calculate(mode, before.back(), anchorAfter, before, after, error))
+            {
+                if(m_sceneHistoryStatus != "Scene history: " + error) ReportSceneHistoryFailure(error);
+            }
+            else
+            {
+                for(size_t index = 0; index < after.size(); ++index)
+                {
+                    const auto resolved = ResolveHistoryTarget(demoScene, m_gizmoGroupEdit->edits[index].target);
+                    if(!resolved) { m_gizmoWasUsing = true; return; }
+                    updates.push_back({*resolved, after[index]});
+                }
+                if(!demoScene.GetScene().SetRenderObjectTransforms(updates))
+                    ReportSceneHistoryFailure("Invalid group transform; no objects were changed.");
+                else
+                {
+                    for(size_t index = 0; index < after.size(); ++index)
+                        m_gizmoGroupEdit->edits[index].after = after[index];
+                    m_sceneHistoryStatus.clear();
+                }
+            }
+        }
+        catch(const std::exception& exception) { ReportSceneHistoryFailure(exception.what()); }
+    }
+    if(!usingGizmo && m_gizmoWasUsing && m_gizmoGroupEdit)
+    {
+        const bool changed = std::any_of(m_gizmoGroupEdit->edits.begin(), m_gizmoGroupEdit->edits.end(),
+            [](const TransformEdit& edit) { return !SameHistoryTransform(edit.before, edit.after); });
+        if(changed && m_historySession && m_historySession->epoch == m_gizmoHistoryEpoch)
+        {
+            TruncateHistoryRedo();
+            AppendSceneHistoryEntry({std::move(m_gizmoGroupEdit), m_gizmoHistoryEpoch, m_gizmoGroupPayloadBytes});
+        }
+        m_gizmoGroupEdit.reset();
+    }
+    m_gizmoWasUsing = usingGizmo;
+    if(usingGizmo && !m_sceneHistoryStatus.empty()) ImGui::SetTooltip("%s", m_sceneHistoryStatus.c_str());
+}
+
 void Editor::DrawTransformGizmo(
     IDemoScene& demoScene,
     float viewportWidth,
@@ -1916,8 +1763,8 @@ void Editor::DrawTransformGizmo(
     ImGui::GetWindowDrawList()->PushClipRect(m_viewportImage.position,
         ImVec2(m_viewportImage.position.x + viewportWidth, m_viewportImage.position.y + viewportHeight), true);
     ImGuizmo::SetRect(m_viewportImage.position.x, m_viewportImage.position.y, viewportWidth, viewportHeight);
-    const bool allowGizmo = !ImGui::GetIO().AppFocusLost && !m_sceneOperationPending &&
-        !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId) && !m_cameraLooking &&
+    const bool allowGizmo = !ImGui::GetIO().AppFocusLost && !m_sceneOperationPending && !HasPendingSceneHistoryOperation() &&
+        !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId) && !m_cameraLooking && !m_panLeftHeld &&
         !ImGui::GetDragDropPayload();
     ImGuizmo::Enable(allowGizmo && !m_workspace.IsSplitterDragging() && (m_viewportHovered || ImGuizmo::IsUsing()));
 
@@ -1942,6 +1789,17 @@ void Editor::DrawTransformGizmo(
     ImGui::End();
 
     const bool gizmoUsing = ImGuizmo::IsUsing();
+
+    if(m_selectedObjects.size() > 1 || m_gizmoGroupEdit)
+    {
+        float position[3], rotation[3], scale[3];
+        ImGuizmo::DecomposeMatrixToComponents(&model.m[0][0], position, rotation, scale);
+        Transform anchorAfter{{position[0], position[1], position[2]},
+            {ToRadians(rotation[0]), ToRadians(rotation[1]), ToRadians(rotation[2])},
+            {(std::max)(0.01f, scale[0]), (std::max)(0.01f, scale[1]), (std::max)(0.01f, scale[2])}};
+        UpdateGroupGizmo(demoScene, gizmoUsing, anchorAfter);
+        return;
+    }
 
     if (gizmoUsing && !m_gizmoWasUsing)
     {
@@ -2033,7 +1891,8 @@ void Editor::HandleViewportSelection(
 
     const ImGuiIO& io = ImGui::GetIO();
 
-    if(!m_viewportHovered || m_sceneOperationPending || ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId) ||
+    if(!m_viewportHovered || m_sceneOperationPending || m_cameraLooking || m_panLeftHeld ||
+        ImGui::IsMouseDown(ImGuiMouseButton_Right) || ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId) ||
         ImGuizmo::IsUsing())
     {
         return;
@@ -2051,14 +1910,16 @@ void Editor::HandleViewportSelection(
         return;
     }
 
-    const Scene& scene = demoScene.GetScene();
-
-    m_selectedObject = PickObject(scene, mouse.x, mouse.y, viewportWidth, viewportHeight);
-    m_objectInspectionRequested = true;
+    const auto picked = PickObject(demoScene, mouse.x, mouse.y, viewportWidth, viewportHeight);
+    if(picked != InvalidObjectSelection || !io.KeyShift)
+    {
+        SelectSceneObject(demoScene, picked, io.KeyShift);
+    }
 }
 
 void Editor::ResetTransformGestures()
 {
+    m_gizmoGroupEdit.reset();
     m_gizmoWasUsing = false;
     m_gizmoUndoObject = InvalidObjectSelection;
     m_gizmoHistoryTarget.reset();
@@ -2103,8 +1964,15 @@ void Editor::UpdateCameraLook(
     (void)viewportWidth;
     (void)viewportHeight;
 
-    if(!ImGui::IsMouseDown(ImGuiMouseButton_Right) || io.AppFocusLost || !m_viewportFocused ||
-       ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId))
+    // Use the same ImGui button state even when LMB is reserved from other widgets.
+    const bool leftDown = io.MouseDown[ImGuiMouseButton_Left];
+    const bool rightDown = io.MouseDown[ImGuiMouseButton_Right];
+    m_panLeftHeld = m_panLeftHeld && leftDown;
+
+    const bool interrupted = io.AppFocusLost || (rightDown && !ViewportCameraInput::HasCapture()) ||
+       m_sceneOperationPending || m_workspace.IsSplitterDragging() ||
+       m_viewportImage.size.x <= 0.0f || ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId);
+    if(!rightDown || interrupted || (!m_cameraLooking && !m_viewportFocused))
     {
         if (m_cameraLooking)
         {
@@ -2112,6 +1980,13 @@ void Editor::UpdateCameraLook(
         }
 
         m_cameraLooking = false;
+        m_cameraPanning = false;
+        if(interrupted)
+        {
+            m_viewportFocused = false;
+            m_viewportRightGesture = false;
+            m_viewportRightObject.reset();
+        }
         return;
     }
 
@@ -2122,7 +1997,8 @@ void Editor::UpdateCameraLook(
             return;
         }
 
-        if (ImGuizmo::IsUsing())
+        if (ImGuizmo::IsUsing() || m_gizmoWasUsing || ImGui::IsAnyItemActive() ||
+            ImGui::GetDragDropPayload() || io.WantTextInput)
         {
             return;
         }
@@ -2143,6 +2019,35 @@ void Editor::UpdateCameraLook(
     }
 
     ImGui::SetMouseCursor(ImGuiMouseCursor_None);
+
+    if(leftDown != m_cameraPanning)
+    {
+        m_cameraPanning = leftDown;
+        m_panLeftHeld = leftDown;
+        // A two-button chord is navigation even without motion: suppress RMB menus.
+        // Discard this frame's delta, which may precede the second press/release.
+        m_viewportRightDragged = true;
+        m_viewportRightObject.reset();
+        return;
+    }
+
+    if(m_cameraPanning)
+    {
+        Camera& camera = demoScene.GetScene().GetCamera();
+        const Vector3 forward = (camera.GetTarget() - camera.GetPosition()).Normalized();
+        // Match LookAt's basis: world up establishes right, then derive local up.
+        const Vector3 right = Vector3::Cross(Vector3{0.0f, 1.0f, 0.0f}, forward).Normalized();
+        const Vector3 up = Vector3::Cross(forward, right);
+        // Mouse deltas are displacement, so do not multiply by frame time.
+        constexpr float panSensitivity = 0.002f;
+        const Vector3 offset = (right * io.MouseDelta.x - up * io.MouseDelta.y) *
+            (ViewportCameraSpeed() * panSensitivity);
+        const Vector3 position = camera.GetPosition();
+        const Vector3 target = camera.GetTarget();
+        camera.SetPosition(position + offset);
+        camera.SetTarget(target + offset);
+        return;
+    }
 
     ImVec2 delta = io.MouseDelta;
 
@@ -2177,7 +2082,7 @@ void Editor::UpdateCameraMovement(
     IDemoScene& demoScene,
     float deltaTime)
 {
-    if (!m_cameraLooking || deltaTime <= 0.0f)
+    if (!m_cameraLooking || m_cameraPanning || deltaTime <= 0.0f)
     {
         return;
     }
@@ -2233,12 +2138,7 @@ void Editor::UpdateCameraMovement(
     m_viewportRightDragged = true;
     movement = movement * (1.0f / length);
 
-    constexpr float normalSpeed = 5.0f;
-    constexpr float fastSpeed = 15.0f;
-
-    const bool shiftHelp = ImGui::IsKeyDown(ImGuiKey_LeftShift) || ImGui::IsKeyDown(ImGuiKey_RightShift);
-
-    const float speed = shiftHelp ? fastSpeed : normalSpeed;
+    const float speed = ViewportCameraSpeed();
 
     const Vector3 offset = movement * (speed * deltaTime);
 
@@ -2348,6 +2248,8 @@ void Editor::SuspendViewportInteraction()
     m_openSceneContext = false;
 
     m_cameraLooking = false;
+    m_cameraPanning = false;
+    m_panLeftHeld = false;
     m_viewportFocused = false;
     m_viewportHovered = false;
     m_viewportImage = {};
@@ -2362,6 +2264,12 @@ void Editor::OnSceneActivated()
 
 void Editor::ResetSceneInteractions()
 {
+    m_pendingMaterialBinding.reset();
+    m_viewportMaterialRequest.reset();
+    m_materialDropHover.reset();
+    m_materialDropStatus.clear();
+    m_orderedSelection.clear();
+    m_selectedObjects.clear();
     CancelObjectRename();
     m_viewportRightGesture = false;
     m_viewportRightObject.reset();
@@ -2398,6 +2306,8 @@ void Editor::ResetSceneInteractions()
     }
 
     m_cameraLooking = false;
+    m_cameraPanning = false;
+    m_panLeftHeld = false;
     m_viewportFocused = false;
 
     // Different files may share a display name and structure revision.
@@ -2523,6 +2433,41 @@ void Editor::ProcessAssetRename(
     }
 }
 
+void Editor::ProcessAssetMove(const ProjectPaths& paths, ProjectAssetRegistry& registry)
+{
+    const auto request = m_assetBrowser.TakeMoveRequest();
+    if(!request)
+    {
+        return;
+    }
+    std::string error;
+    std::filesystem::path destination;
+    if(m_inspectorPanel.HasUnsavedChanges() || m_materialLeaveAction != MaterialLeaveAction::None || m_sceneOperationPending)
+    {
+        error = "Move rejected while editor changes or a scene operation are pending.";
+    }
+    else
+    {
+        ProjectAssetRename::MoveAssetFile(paths, registry, request->asset.id, request->source,
+            request->directory, destination, error);
+    }
+    m_assetBrowser.OnMoveCompleted(*request, destination, error);
+    if(!error.empty())
+    {
+        Log::Error("Project asset move failed: " + error);
+        return;
+    }
+    if(m_inspectedAssetSelection == request->source)
+    {
+        m_inspectedAssetSelection = destination;
+        m_pendingAssetSelection.clear();
+        if(m_inspectorTarget == InspectorTarget::Asset)
+        {
+            m_inspectorPanel.LoadSelection(destination, paths, registry);
+        }
+    }
+}
+
 std::optional<Editor::MaterialAssignmentRequest> Editor::TakeMaterialAssignmentRequest()
 {
     auto request = std::move(m_materialAssignmentRequest);
@@ -2578,6 +2523,73 @@ void Editor::PublishCreatedObjectSelection(
     m_objectInspectionIdentity = std::move(identity);
     m_inspectorTarget = InspectorTarget::SceneObject;
     m_objectInspectionRequested = true;
+}
+
+void Editor::DrawMaterialDropTarget(IDemoScene& scene, const ProjectPaths& paths,
+    const ProjectAssetRegistry& registry)
+{
+    m_materialDropHover.reset();
+    const auto* dragging = ImGui::GetDragDropPayload();
+    if(!dragging || !dragging->IsDataType(MaterialDragPayloadType) ||
+        m_viewportImage.size.x <= 0.0f || m_viewportImage.size.y <= 0.0f)
+        return;
+    if(ImGui::GetIO().AppFocusLost || m_workspace.IsSplitterDragging() || ImGuizmo::IsUsing() ||
+        m_gizmoWasUsing || m_cameraLooking || m_sceneOperationPending || m_fileRequest ||
+        HasBlockingObjectCreation() || (HasPendingSceneHistoryOperation() && !m_pendingMaterialBinding) || m_meshCreationRequest ||
+        m_materialAssignmentRequest ||
+        ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel) ||
+        ImGui::IsWindowHovered(ImGuiHoveredFlags_AnyWindow | ImGuiHoveredFlags_AllowWhenBlockedByActiveItem))
+        return;
+    const ImRect image(m_viewportImage.position, ImVec2(m_viewportImage.position.x + m_viewportImage.size.x,
+        m_viewportImage.position.y + m_viewportImage.size.y));
+    const auto mouse = ImGui::GetIO().MousePos;
+    if(!image.Contains(mouse)) return;
+
+    ImGui::Begin("Scene Viewport");
+    if(ImGui::BeginDragDropTargetViewport(ImGui::GetMainViewport(), &image))
+    {
+        const auto* payload = ImGui::AcceptDragDropPayload(MaterialDragPayloadType,
+            ImGuiDragDropFlags_AcceptBeforeDelivery | ImGuiDragDropFlags_AcceptNoDrawDefaultRect);
+        if(payload)
+        {
+            std::string error;
+            auto* owner = dynamic_cast<FileBackedDemoScene*>(&scene);
+            std::optional<AssetRecord> material;
+            if(payload->Data && payload->DataSize == sizeof(MaterialDragPayload))
+            {
+                MaterialDragPayload value;
+                std::memcpy(&value, payload->Data, sizeof(value));
+                material = m_assetBrowser.ValidateMaterialDrag(value, paths, registry, error);
+            }
+            else error = "Invalid material drag payload.";
+            std::optional<SceneObjectMetadata> target;
+            if(material && owner)
+            {
+                const auto index = PickObject(scene, mouse.x - image.Min.x, mouse.y - image.Min.y,
+                    image.GetWidth(), image.GetHeight());
+                if(index != InvalidObjectSelection) target = owner->GetObjectMetadata(index);
+                if(!target) error = "No resident, triangle-pickable object under the cursor.";
+                else if(const auto* mesh = scene.GetScene().GetRenderObjects()[target->runtimeIndex].mesh;
+                    !mesh || !ValidateMeshMetadata(mesh->GetMetadata(), mesh->IsIndexed() ? mesh->GetIndexCount() : mesh->GetVertexCount(), error))
+                {
+                    target.reset();
+                    error = "Target has no compatible resident material-slot layout.";
+                }
+            }
+            else if(material) error = "Material drops require a file-backed scene.";
+            if(target) m_materialDropHover = target;
+            if(!error.empty()) ImGui::SetTooltip("%s", error.c_str());
+            if(payload->IsDelivery() && m_materialDropDeliveryFrame != ImGui::GetFrameCount())
+            {
+                m_materialDropDeliveryFrame = ImGui::GetFrameCount();
+                if(target && material) QueueViewportMaterialDrop(scene, *target, material->id);
+                else m_materialDropStatus = "Material drop rejected: " + error;
+                m_materialDropHover.reset();
+            }
+        }
+        ImGui::EndDragDropTarget();
+    }
+    ImGui::End();
 }
 
 void Editor::DrawMeshDropTarget(const IDemoScene& scene, const ProjectPaths& paths,
@@ -2722,7 +2734,7 @@ void Editor::CaptureViewportRightClick(const IDemoScene& scene)
     }
 
     const auto mouse = ImGui::GetIO().MousePos;
-    const auto index = PickObject(scene.GetScene(), mouse.x - m_viewportImage.position.x,
+    const auto index = PickObject(scene, mouse.x - m_viewportImage.position.x,
         mouse.y - m_viewportImage.position.y, m_viewportImage.size.x, m_viewportImage.size.y);
 
     if(index != InvalidObjectSelection)
@@ -2760,7 +2772,7 @@ void Editor::FinishViewportRightClick(const IDemoScene& scene)
         return;
     }
 
-    const auto index = PickObject(scene.GetScene(), io.MousePos.x - m_viewportImage.position.x,
+    const auto index = PickObject(scene, io.MousePos.x - m_viewportImage.position.x,
         io.MousePos.y - m_viewportImage.position.y, m_viewportImage.size.x, m_viewportImage.size.y);
 
     if(index != current->runtimeIndex)
@@ -2783,7 +2795,7 @@ void Editor::OpenSceneObjectContext(const IDemoScene& scene, const SceneObjectMe
     m_sceneContextEpoch = m_historySession->epoch;
     m_openSceneContext = true;
 
-    m_selectedObject = target.runtimeIndex;
+    SelectSceneObject(scene, target.runtimeIndex);
     m_objectInspectionRequested = true;
 }
 
@@ -2938,6 +2950,8 @@ namespace
 
 void Editor::ClearSceneHistory()
 {
+    m_pendingMaterialBinding.reset();
+    m_viewportMaterialRequest.reset();
     m_reorderStatus.clear();
     CancelObjectRename();
     // Session invalidation explicitly cancels requests; late results carry the old epoch.
@@ -3199,6 +3213,13 @@ void Editor::ReplaySceneHistory(IDemoScene& demoScene, bool redo)
         return;
     }
 
+    if(const auto* material = std::get_if<std::unique_ptr<MaterialBindingsEdit>>(&entry.command); material && *material)
+    {
+        try { QueueMaterialBindingReplay(demoScene, **material, redo); }
+        catch(const std::exception& exception) { ReportSceneHistoryFailure(exception.what()); }
+        return;
+    }
+
     const auto* ownedDeletion = std::get_if<std::unique_ptr<ObjectDeletion>>(&entry.command);
 
     if(ownedDeletion && *ownedDeletion)
@@ -3296,6 +3317,30 @@ void Editor::ReplaySceneHistory(IDemoScene& demoScene, bool redo)
         return;
     }
 
+    if(const auto* group = std::get_if<std::unique_ptr<GroupTransformEdit>>(&entry.command); group && *group)
+    {
+        try
+        {
+            std::vector<RenderObjectTransformUpdate> updates;
+            updates.reserve((*group)->edits.size());
+            for(const auto& edit : (*group)->edits)
+            {
+                const auto resolved = ResolveHistoryTarget(demoScene, edit.target);
+                if(!resolved) return;
+                updates.push_back({*resolved, redo ? edit.after : edit.before});
+            }
+            if(!demoScene.GetScene().SetRenderObjectTransforms(updates))
+            {
+                ReportSceneHistoryFailure("Group replay validation failed; no objects changed and cursor preserved.");
+                return;
+            }
+        }
+        catch(const std::exception& exception) { ReportSceneHistoryFailure(exception.what()); return; }
+        m_historyCursor = redo ? m_historyCursor + 1 : m_historyCursor - 1;
+        m_sceneHistoryStatus.clear();
+        return;
+    }
+
     const auto* transformEdit = std::get_if<TransformEdit>(&entry.command);
 
     if(!transformEdit)
@@ -3357,10 +3402,12 @@ void Editor::PublishRestoredObjectSelection(const FileBackedDemoScene& owner,
     m_historyRuntimeIdentity = owner.GetRuntimeIdentity();
     m_historyStructureRevision = scene.GetStructureRevision();
 
+    auto retainedSelection = std::move(m_orderedSelection);
     m_inspectorPanel.DismissTexturePicker();
     m_inspectorPanel.ReleaseSceneObjectPreview();
     SuspendViewportInteraction();
     ResetSceneInteractions();
+    if(retainedSelection.size() > 1) m_orderedSelection = std::move(retainedSelection);
 
     m_selectionSceneName = std::move(activeSceneName);
     m_selectionStructureRevision = scene.GetStructureRevision();
@@ -3385,7 +3432,7 @@ void Editor::PublishRestoredObjectSelection(const FileBackedDemoScene& owner,
 
 bool Editor::HasPendingSceneHistoryOperation() const noexcept
 {
-    return m_pendingHistoryReplay.has_value() || m_stagedDeletionHistory.has_value();
+    return m_pendingHistoryReplay.has_value() || m_stagedDeletionHistory.has_value() || m_pendingMaterialBinding.has_value();
 }
 
 bool Editor::MatchesPendingHistoryReplay(const HistoryReplayIdentity& identity) const noexcept

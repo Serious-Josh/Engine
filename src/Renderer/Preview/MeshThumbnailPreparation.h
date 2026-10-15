@@ -22,7 +22,7 @@ public:
         std::filesystem::path project;
         std::string assetReference;
         std::string sourceFingerprint;
-        std::string renderVersion = "mesh-v2-neutral-studio3-normalized-bounds-zoom1.30-margin0.90-agx-256";
+        std::string renderVersion = "mesh-v3-camera-yaw180-neutral-studio3-normalized-bounds-zoom1.30-margin0.90-agx-256";
         std::uint32_t importRevision = ModelImporter::kImportRevision;
         std::string uvPolicy = "FlipV";
     };

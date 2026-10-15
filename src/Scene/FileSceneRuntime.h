@@ -210,6 +210,11 @@ private:
     // No coordinator exists in S.5B. Only the future matching renderer/DXR
     // transaction may call this at the main-thread pre-recording boundary.
     friend class MeshResidencyPublication;
+    friend class SceneMaterialBindingPublication;
+    friend class SceneMaterialBindingVerification;
+    friend class Engine;
+    // Only an explicit Debug diagnostic can open this runtime's gate.
+    bool m_cookedDiagnosticPublication = false;
     std::optional<SceneObjectMetadata> ValidatePreparedMeshResidencyIdentity(const MeshResidencyToken& token,
         const FileSceneAssetCatalog& catalog, std::string* errorMessage) const;
     MeshResidencySourceLock ValidatePreparedMeshResidency(const MeshResidencyToken& token,

@@ -532,6 +532,7 @@ bool Engine::ExecuteMaterialAssignment()
 
 bool Engine::ActivateRequestedFileScene()
 {
+    CancelViewportMaterialAssignment("Scene activation canceled the material assignment.");
     const auto started = std::chrono::steady_clock::now();
     SceneSwitchTiming::Session timing(m_meshCPUCache);
     IDemoScene* previous = m_demoSceneManager.TryGetActiveScene();
@@ -1405,6 +1406,7 @@ void Engine::Frame()
         }
 
         CancelMeshResidencyAcceptance();
+        CancelViewportMaterialAssignment("Scene switch canceled the material assignment.");
         m_texturePreparation.Invalidate();
         m_meshPreparation.Invalidate();
         Renderer::FrameHitchProbe switchProbe(
@@ -1579,6 +1581,7 @@ void Engine::Frame()
     m_editor.ProcessAssetRename(inspectorPaths, m_projectAssetRegistry,
         activeFileScene ? activeFileScene->GetScenePath() : std::filesystem::path{});
     m_editor.ProcessAssetDeletion(inspectorPaths, m_projectAssetRegistry);
+    m_editor.ProcessAssetMove(inspectorPaths, m_projectAssetRegistry);
 
     for(const auto& drop : m_window.TakeFileDrops())
     {
@@ -1830,7 +1833,11 @@ void Engine::Frame()
         selectedObject < activeScene.GetRenderObjects().size())
     {
         rendererOptions.selectedObject = selectedObject;
+        rendererOptions.selectedObjects = m_editor.GetSelectedObjects();
     }
+    if(const auto hover = m_editor.GetMaterialDropHighlight(activeDemo); hover &&
+        std::find(rendererOptions.selectedObjects.begin(), rendererOptions.selectedObjects.end(), *hover) == rendererOptions.selectedObjects.end())
+        rendererOptions.selectedObjects.push_back(*hover);
 
     std::optional<Renderer::FrameHitchProbe> renderProbe;
 
@@ -1867,6 +1874,11 @@ void Engine::Frame()
 
         if (m_meshResidencyAcceptance->published)
         {
+            if(m_cookedPublicationTicket)
+            {
+                m_meshPreparation.Cancel(m_cookedPublicationTicket);
+                m_cookedPublicationTicket = 0;
+            }
             FinishAutomaticMeshResidency(MeshResidencyPublication::Status::Ready);
             m_residencyRequestSelection.reset();
             m_residencyRequestSourceIdentity.clear();
@@ -1881,6 +1893,7 @@ void Engine::Frame()
         }
     }
 
+    ProcessViewportMaterialAssignment(activeDemo);
     const Renderer::FrameRenderResult renderResult = m_renderer.Render(activeScene, rendererOptions);
     renderProbe.reset();
 
@@ -1913,6 +1926,7 @@ void Engine::Frame()
 
 void Engine::Shutdown()
 {
+    CancelViewportMaterialAssignment("Engine shutdown canceled the material assignment.");
     if (m_diagnosticMeshToken || m_diagnosticCPUPreparation)
     {
         Log::Info("Mesh residency request canceled for Engine shutdown.");
@@ -1925,6 +1939,7 @@ void Engine::Shutdown()
     ENGINE_ASSERT(m_state == EngineState::Running);
 
     Log::Info("Engine shutdown: starting.");
+    if(m_materialPreparation) m_materialPreparation->Shutdown();
     m_texturePreparation.Shutdown();
     m_meshPreparation.Shutdown();
     m_pendingWorkingMaterialRevisions.clear();
@@ -3122,6 +3137,12 @@ void Engine::CancelMeshResidencyAcceptance() noexcept
         m_diagnosticCPUPreparation.reset();
     }
 
+    if(m_cookedPublicationTicket)
+    {
+        m_meshPreparation.Cancel(m_cookedPublicationTicket);
+        m_cookedPublicationTicket = 0;
+    }
+
     m_meshResidencyPublication.Cancel();
     m_meshResidencyAcceptance.reset();
 
@@ -3393,8 +3414,9 @@ void Engine::AdvanceDiagnosticMeshPreparation()
 
         if (!request.completion)
         {
-            auto completion = m_meshPreparation.Poll(request.ticket, ProjectPaths(scene->GetProjectRoot()),
-                m_projectAssetRegistry, m_meshCPUCache);
+            auto completion = request.cooked ? m_meshPreparation.PollCooked(request.ticket) :
+                m_meshPreparation.Poll(request.ticket, ProjectPaths(scene->GetProjectRoot()),
+                    m_projectAssetRegistry, m_meshCPUCache);
 
             if (completion.status == ProjectMeshPreparationService::Status::Pending ||
                 completion.status == ProjectMeshPreparationService::Status::Retry)
@@ -3421,7 +3443,8 @@ void Engine::AdvanceDiagnosticMeshPreparation()
             }
 
             Log::Info(completion.cacheHit ? "Asynchronous mesh preparation: verified CPU cache hit." :
-                "Asynchronous mesh preparation: background FBX import completed.");
+                request.cooked ? "Asynchronous mesh preparation: cooked decode completed." :
+                    "Asynchronous mesh preparation: background FBX import completed.");
             m_diagnosticCPUPreparation->completion.emplace(std::move(completion));
         }
 
@@ -3453,7 +3476,16 @@ void Engine::AdvanceDiagnosticMeshPreparation()
 
         Log::Info("Active scene bindings match CPU completion; starting synchronous source validation/GPU geometry preparation.");
         const auto uploadStart = std::chrono::steady_clock::now();
-        Mesh* mesh = scene->m_assets.ResolvePreparedMesh(saved.meshReference, completion, &error);
+        Mesh* mesh = nullptr;
+        if(request.cooked)
+        {
+            auto prepared = scene->m_assets.ResolvePreparedCookedMesh(saved.meshReference, completion,
+                m_meshPreparation, m_renderer, *scene->m_runtime);
+            if(prepared.status == ProjectMeshPreparationService::Status::Retry) { return; }
+            mesh = prepared.mesh;
+            error = std::move(prepared.error);
+        }
+        else { mesh = scene->m_assets.ResolvePreparedMesh(saved.meshReference, completion, &error); }
 
         if (!mesh)
         {
@@ -3481,9 +3513,10 @@ void Engine::AdvanceDiagnosticMeshPreparation()
             return;
         }
 
-        // Catalog/cache now retain geometry. CPU subscription no longer owns
-        // publication authority; the existing scene token/coordinator takes over.
-        m_meshPreparation.Cancel(request.ticket);
+        // Catalog/cache retain geometry. Cooked cancellation evidence must stay
+        // live until the coordinator commits or cancels the existing scene token.
+        if(request.cooked) { m_cookedPublicationTicket = request.ticket; }
+        else { m_meshPreparation.Cancel(request.ticket); }
         m_diagnosticCPUPreparation.reset();
         m_diagnosticMeshReadiness.reset();
         Log::Info("Prepared geometry accepted by active scene: residency token ready for existing renderer coordinator.");

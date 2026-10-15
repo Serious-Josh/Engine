@@ -3880,9 +3880,7 @@ bool Renderer::InitializeMaterials(const std::vector<Material*>& materials)
 
     m_materialPublication = {};
 
-    if(!m_materialPublication.SetSnapshot(gpuMaterials) ||
-       !m_materialUpload.Initialize(m_graphicsDevice.GetDevice(), gpuMaterials.size() * sizeof(GPUMaterial),
-           CommandContext::FrameCount))
+    if(!m_materialPublication.SetSnapshot(gpuMaterials))
     {
         Log::Error("Failed to prepare frame-slot material uploads.");
         return false;
@@ -3897,6 +3895,10 @@ bool Renderer::InitializeMaterials(const std::vector<Material*>& materials)
             return false; // Retained until checked failed-initialization cleanup.
         }
     }
+
+    for(auto& upload : m_materialUpload)
+        if(!upload.Initialize(m_graphicsDevice.GetDevice(), gpuMaterials.size() * sizeof(GPUMaterial), 1))
+            return false;
 
     return true;
 }
@@ -5233,9 +5235,12 @@ bool Renderer::RecordRenderFrame(
 
     const auto& renderObjects = scene.GetRenderObjects();
 
-    if (options.selectedObject < renderObjects.size())
+    const size_t selectionCount = options.selectedObjects.empty() ? 1 : options.selectedObjects.size();
+    for(size_t selection = 0; selection < selectionCount; ++selection)
     {
-        const RenderObject& selectedObject = renderObjects[options.selectedObject];
+        const auto index = options.selectedObjects.empty() ? options.selectedObject : options.selectedObjects[selection];
+        if(index >= renderObjects.size()) continue;
+        const RenderObject& selectedObject = renderObjects[index];
 
         if (selectedObject.mesh)
         {
@@ -6767,6 +6772,8 @@ StructuredBuffer& Renderer::CurrentMaterialBuffer()
 
 void Renderer::ShutdownMaterialTables()
 {
+    InvalidateMaterialAdmission();
+    for(auto& replacement : m_materialReplacements) replacement.reset();
     m_publishedMaterialIdentities.clear();
     // Same checked completion/discard precondition as the former single scene table.
     for(auto& buffer : m_materialBuffers)
@@ -6774,7 +6781,7 @@ void Renderer::ShutdownMaterialTables()
         buffer.Shutdown();
     }
 
-    m_materialUpload.Shutdown();
+    for(auto& upload : m_materialUpload) upload.Shutdown();
     m_materialPublication = {};
     m_materialDependencies.ClearAfterGPUDrain();
 
@@ -6837,16 +6844,26 @@ bool Renderer::RecordMaterialTable(unsigned int slot, ID3D12GraphicsCommandList*
         return true;
     }
 
-    m_materialUpload.Reset(slot); // BeginTrackedRecording has checked this slot's fence.
+    if(auto& replacement = m_materialReplacements[slot])
+    {
+        // Acquire above proves this slot's last submitted use completed and no
+        // unresolved recording owns it. Other slots keep their old generation.
+        m_materialBuffers[slot].Swap(replacement->buffer);
+        m_materialUpload[slot].Swap(replacement->upload);
+        replacement.reset();
+    }
+
+    auto& materialUpload = m_materialUpload[slot];
+    materialUpload.Reset(0); // BeginTrackedRecording has checked this slot's fence.
     const auto bytes = m_materialPublication.desired.size() * sizeof(GPUMaterial);
-    const auto address = m_materialUpload.Allocate(m_materialPublication.desired.data(), bytes, 4);
+    const auto address = materialUpload.Allocate(m_materialPublication.desired.data(), bytes, 4);
 
     if(address == 0)
     {
         return false;
     }
 
-    auto* upload = m_materialUpload.GetResource();
+    auto* upload = materialUpload.GetResource();
     auto* destination = m_materialBuffers[slot].GetResource();
     // Default-heap BUFFER resources decay to COMMON at each ExecuteCommandLists boundary.
     // A discarded recording never executes its transitions. COMMON implicitly promotes to
@@ -7000,6 +7017,7 @@ void Renderer::CancelPreparedTextureUpload(std::uint64_t ticket)
 
 void Renderer::PollPreparedTextureUploads()
 {
+    ValidateMaterialAdmissionLifecycle();
     const auto completed = m_commandContext.GetCompletedFenceValue();
 
     for(auto& entry : m_preparedTextureUploads)

@@ -2,6 +2,7 @@
 
 #include "Editor/TextureThumbnailCache.h"
 #include "Editor/MeshDragPayload.h"
+#include "Editor/MaterialDragPayload.h"
 #include <filesystem>
 #include <map>
 #include <optional>
@@ -55,6 +56,9 @@ public:
     void InvalidateMaterialSource(const std::filesystem::path& path);
     void SetThumbnailProject(const ProjectPaths& paths, const ProjectAssetRegistry& registry);
     void InvalidateMeshDragIdentity() noexcept;
+    std::optional<MaterialDragPayload> MakeMaterialDragPayload(const AssetID& id) const;
+    std::optional<AssetRecord> ValidateMaterialDrag(const MaterialDragPayload& payload,
+        const ProjectPaths& paths, const ProjectAssetRegistry& registry, std::string& error) const;
     std::optional<AssetRecord> ValidateMeshDrag(const MeshDragPayload& payload,
         const ProjectPaths& paths, const ProjectAssetRegistry& registry, std::string& error) const;
     void Draw(const EditorWorkspaceRect& rectangle);
@@ -77,6 +81,16 @@ public:
     void OnRenameCompleted(const std::filesystem::path& source, const std::filesystem::path& destination,
         const std::string& error);
 
+    struct MoveRequest
+    {
+        AssetRecord asset;
+        std::filesystem::path source;
+        std::filesystem::path directory;
+    };
+    std::optional<MoveRequest> TakeMoveRequest();
+    void OnMoveCompleted(const MoveRequest& request, const std::filesystem::path& destination,
+        const std::string& error);
+
     void DrawDeletionConfirmation(bool protectedEdits);
     std::optional<std::filesystem::path> TakeDeletionRequest();
     void OnDeletionCompleted(const std::filesystem::path& path, const std::string& error);
@@ -92,6 +106,16 @@ public:
         const std::string& error);
 
 private:
+    struct MovePayload
+    {
+        std::uint64_t projectIdentity = 0;
+        std::array<char, 43> reference{};
+    };
+    void DrawAssetMoveSource(const std::filesystem::path& path, const std::string& name);
+    void DrawAssetMoveTarget(const std::filesystem::path& directory);
+    std::optional<MoveRequest> m_moveRequest;
+    std::filesystem::path m_moveSource;
+
     void DrawMeshDragSource(const std::filesystem::path& path, const std::string& name);
     std::filesystem::path m_meshDragProject;
     std::uint64_t m_meshDragIdentity = 0;
@@ -184,6 +208,7 @@ private:
     void DrawContents();
     bool CanCreateMaterial(std::string& error) const;
     void DrawMaterialCreationModal();
+    void DrawFolderCreationModal();
 
     std::filesystem::path m_root;
     std::filesystem::path m_directory;
@@ -205,4 +230,9 @@ private:
     std::array<char, 256> m_materialName{};
 
     std::string m_materialError;
+
+    bool m_openFolderModal = false;
+    std::filesystem::path m_folderDirectory;
+    std::array<char, 256> m_folderName{};
+    std::string m_folderError;
 };

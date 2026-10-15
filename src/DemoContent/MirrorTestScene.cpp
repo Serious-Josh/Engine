@@ -131,6 +131,11 @@ bool MirrorTestScene::Initialize(
         return false;
     }
 
+    RetainEditorGeometry(m_sphereMesh, std::move(sphere.vertices), std::move(sphere.indices));
+    RetainEditorGeometry(m_planeMesh, std::vector<Vertex>(std::begin(planeVertices), std::end(planeVertices)),
+        std::vector<uint32_t>(std::begin(planeIndices), std::end(planeIndices)));
+    // GPU-generated displacement has no authoritative CPU triangle snapshot.
+
     // Temporary CPU displacement heightmap validation.
     DirectX::ScratchImage displacementDDS;
 
@@ -560,6 +565,7 @@ void MirrorTestScene::Shutdown()
     m_requestedDisplacementRevision = 0;
 
     m_displacementGeometryUpdatePending = false;
+    ClearEditorGeometry();
     m_scene.ClearRenderObjects();
 
     m_sphereTexture.Shutdown();

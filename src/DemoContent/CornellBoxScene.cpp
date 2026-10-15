@@ -114,7 +114,7 @@ bool CornellBoxScene::Initialize(
 
     // Cornell box
 
-    const auto cornellBox = ModelImporter::Load("assets/Models/CornellBox/cornell_box.fbx");
+    auto cornellBox = ModelImporter::Load("assets/Models/CornellBox/cornell_box.fbx");
 
     if (cornellBox.empty())
     {
@@ -123,7 +123,7 @@ bool CornellBoxScene::Initialize(
 
     m_cornellMeshes.reserve(cornellBox.size());
 
-    for (const ImportedMesh& importedMesh : cornellBox)
+    for (ImportedMesh& importedMesh : cornellBox)
     {
         auto mesh = std::make_unique<Mesh>();
 
@@ -134,6 +134,7 @@ bool CornellBoxScene::Initialize(
             throw std::runtime_error("Failed to create imported Cornell box mesh.");
         }
 
+        RetainEditorGeometry(*mesh, std::move(importedMesh));
         m_cornellMeshes.push_back(std::move(mesh));
     }
 
@@ -200,7 +201,7 @@ bool CornellBoxScene::Initialize(
     m_tankMaterial.baseColor[2] = 1.0f;
 
     // Match the PNG atlas convention through the centralized importer policy.
-    const auto tank = ModelImporter::Load("assets/Models/CornellBox/tank_sample.fbx", MeshUVOrientation::FlipV);
+    auto tank = ModelImporter::Load("assets/Models/CornellBox/tank_sample.fbx", MeshUVOrientation::FlipV);
 
     if (tank.empty())
     {
@@ -209,7 +210,7 @@ bool CornellBoxScene::Initialize(
 
     m_tankMeshes.reserve(tank.size());
 
-    for (const ImportedMesh& importedMesh : tank)
+    for (ImportedMesh& importedMesh : tank)
     {
         auto mesh = std::make_unique<Mesh>();
 
@@ -219,6 +220,7 @@ bool CornellBoxScene::Initialize(
             throw std::runtime_error("Failed to create imported tank mesh.");
         }
 
+        RetainEditorGeometry(*mesh, std::move(importedMesh));
         m_tankMeshes.push_back(std::move(mesh));
     }
 
@@ -231,6 +233,8 @@ bool CornellBoxScene::Initialize(
     {
         return false;
     }
+
+    RetainEditorGeometry(m_brickSphereMesh, std::move(sphere.vertices), std::move(sphere.indices));
 
     if (!DDSLoader::LoadTexture(device, uploader, descriptorHeap,
                                 "assets/Textures/Materials/stacked_brick_wall_diff_4k.dds", m_brickDiffuseTexture,
@@ -342,6 +346,7 @@ bool CornellBoxScene::Initialize(
 
 void CornellBoxScene::Shutdown()
 {
+    ClearEditorGeometry();
     m_scene.ClearRenderObjects();
 
     for (const auto& mesh : m_tankMeshes)

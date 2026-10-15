@@ -25,6 +25,10 @@ class StructuredBuffer
     // Allocates COMMON-state storage only. Caller owns recording, upload and GPU lifetime.
     bool InitializeStorage(ID3D12Device* device, size_t elementSize, unsigned int elementCount,
         DescriptorHeap& descriptorHeap);
+    // Immutable small lookup table. No commands, upload submission or GPU wait.
+    bool InitializeReadOnlyUpload(ID3D12Device* device, const void* data, size_t elementSize,
+        unsigned int elementCount, DescriptorHeap& descriptorHeap);
+    void Swap(StructuredBuffer& other) noexcept;
     void Shutdown();
 
     ID3D12Resource* GetResource() const;

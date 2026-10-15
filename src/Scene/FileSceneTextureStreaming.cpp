@@ -217,14 +217,13 @@ FileSceneAssetCatalog::TextureSource FileSceneAssetCatalog::ValidateStreamingSou
         throw std::runtime_error("Texture registration or contained source path changed.");
     }
 
-    auto source = InspectTextureSource(resolved.resolvedPath);
-
-    if(source.digest != texture.completion->identity.digest)
+    std::string error;
+    if(!m_texturePreparation->ValidateSource(*texture.completion, ProjectPaths(std::get<0>(key)), *m_registry, error))
     {
-        throw std::runtime_error("Texture source changed before GPU admission or material publication.");
+        throw std::runtime_error("Texture source evidence became stale: " + error);
     }
-
-    return source;
+    return {texture.completion->identity.path, texture.completion->sourceBytes,
+        texture.completion->sourceModified, texture.completion->identity.digest};
 }
 
 void FileSceneAssetCatalog::AdvanceTextureStreaming(ProjectTexturePreparationService& preparation, Renderer& renderer,

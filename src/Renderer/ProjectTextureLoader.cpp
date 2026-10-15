@@ -1,5 +1,6 @@
 #include "Scene/SceneSwitchTiming.h"
 #include "Renderer/ProjectTextureLoader.h"
+#include "Renderer/DescriptorHeap.h"
 #include "Renderer/ResourceUploader.h"
 #include "Renderer/ImageLoader.h"
 #include "Renderer/DDSLoader.h"
@@ -386,6 +387,11 @@ PreparedTextureUpload::RecordResult PreparedTextureUpload::Record(ID3D12Device* 
     try
     {
         const auto count = static_cast<unsigned int>(m_prepared.subresources.size());
+        if(heap.GetAvailableCount() == 0)
+        {
+            error = "Deferred: texture descriptor capacity unavailable.";
+            return RecordResult::Deferred;
+        }
         D3D12_RESOURCE_DESC description{};
         description.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
         description.Width = m_prepared.width;

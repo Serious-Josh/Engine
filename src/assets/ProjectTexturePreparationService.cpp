@@ -5,8 +5,8 @@
 #include "stb_image.h"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
-#include <set>
 #include <atomic>
 #include <condition_variable>
 #include <deque>
@@ -14,6 +14,8 @@
 #include <mutex>
 #include <thread>
 #include <stdexcept>
+#include <utility>
+#include <type_traits>
 #include <Windows.h>
 
 namespace
@@ -31,7 +33,7 @@ namespace
         explicit SourceLock(const std::filesystem::path& path)
         {
             handle = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
-                OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+                OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
 
             if(handle == INVALID_HANDLE_VALUE)
             {
@@ -46,7 +48,21 @@ namespace
                 CloseHandle(handle);
             }
         }
+        SourceLock(const SourceLock&) = delete;
+        SourceLock& operator=(const SourceLock&) = delete;
+        HANDLE Release() noexcept { return std::exchange(handle, INVALID_HANDLE_VALUE); }
     };
+
+    bool PinnedPathMatches(HANDLE source, const std::filesystem::path& expected)
+    {
+        std::array<wchar_t, 32768> buffer{};
+        const auto length = GetFinalPathNameByHandleW(source, buffer.data(), static_cast<DWORD>(buffer.size()), FILE_NAME_NORMALIZED);
+        if(!length || length >= buffer.size()) return false;
+        std::wstring path(buffer.data(), length);
+        if(path.starts_with(L"\\\\?\\UNC\\")) path = L"\\\\" + path.substr(8);
+        else if(path.starts_with(L"\\\\?\\")) path.erase(0, 4);
+        return ProjectAssetRegistry::PathsEqual(path, expected);
+    }
 
     size_t DDSPreparationBytes(const std::filesystem::path& path, size_t sourceBytes, size_t limit)
     {
@@ -154,6 +170,39 @@ namespace
     }
 }
 
+// This is the existing worker SourceLock with an extended, revocable lifetime.
+// No source bytes are accessed after worker preparation. A denied-write/delete
+// handle plus file identity keeps the worker's content digest valid at acceptance.
+class TextureSourceEvidence
+{
+public:
+    ProjectTexturePreparationService::Identity identity;
+    std::uintmax_t bytes = 0;
+    std::filesystem::file_time_type modified;
+    BY_HANDLE_FILE_INFORMATION file{};
+    std::atomic<HANDLE> handle{INVALID_HANDLE_VALUE};
+    ~TextureSourceEvidence() { Revoke(); }
+    void Revoke() noexcept
+    {
+        const auto pinned = handle.exchange(INVALID_HANDLE_VALUE);
+        if(pinned != INVALID_HANDLE_VALUE) CloseHandle(pinned);
+    }
+    bool MatchesPath(const std::filesystem::path& path) const
+    {
+        if(handle.load() == INVALID_HANDLE_VALUE) return false;
+        const auto current = CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ,
+            nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+        if(current == INVALID_HANDLE_VALUE) return false;
+        BY_HANDLE_FILE_INFORMATION information{};
+        const bool same = GetFileInformationByHandle(current, &information) &&
+            !(information.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) &&
+            file.dwVolumeSerialNumber == information.dwVolumeSerialNumber &&
+            file.nFileIndexHigh == information.nFileIndexHigh && file.nFileIndexLow == information.nFileIndexLow;
+        CloseHandle(current);
+        return same;
+    }
+};
+
 struct ProjectTexturePreparationService::State
 {
     struct Job
@@ -161,6 +210,7 @@ struct ProjectTexturePreparationService::State
         Identity identity;
         bool done = false;
         std::shared_ptr<const PreparedProjectTexture> prepared;
+        std::shared_ptr<TextureSourceEvidence> source;
         std::string error;
     };
 
@@ -178,11 +228,57 @@ struct ProjectTexturePreparationService::State
     std::thread worker;
     std::deque<std::shared_ptr<Job>> queue;
     std::map<std::uint64_t, Subscriber> subscribers;
-    std::map<std::uint64_t, std::weak_ptr<std::atomic_bool>> tokens;
+    struct Token
+    {
+        std::weak_ptr<std::atomic_bool> current;
+        std::weak_ptr<TextureSourceEvidence> source;
+    };
+    std::map<std::uint64_t, Token> tokens;
+    struct CacheEntry
+    {
+        Identity identity;
+        std::weak_ptr<const PreparedProjectTexture> prepared;
+    };
+    std::deque<CacheEntry> cache; // Weak CPU cache, bounded by request capacity; never pins source files.
+    std::atomic_uint64_t hashes{0}, decodes{0}, cacheHits{0}, deduplicated{0};
+#ifdef ENGINE_TEXTURE_PREPARATION_TESTS
+    std::function<void(TestStage)> testHook;
+    void Observe(TestStage stage)
+    {
+        std::function<void(TestStage)> hook;
+        { std::lock_guard lock(mutex); hook = testHook; }
+        if(hook) hook(stage);
+    }
+#endif
     std::uint64_t generation = 1;
     std::uint64_t nextTicket = 1;
     bool accepting = false;
     bool stop = false;
+
+    void RevokeIfUnused(const std::shared_ptr<TextureSourceEvidence>& source)
+    {
+        if(!source) return;
+        const bool wanted = std::any_of(tokens.begin(), tokens.end(), [&](const auto& entry)
+        {
+            const auto token = entry.second.current.lock();
+            return token && token->load() && entry.second.source.lock() == source;
+        });
+        if(!wanted) source->Revoke();
+    }
+
+    void PruneTokens()
+    {
+        for(auto entry = tokens.begin(); entry != tokens.end();)
+        {
+            if(entry->second.current.expired())
+            {
+                const auto source = entry->second.source.lock();
+                entry = tokens.erase(entry);
+                RevokeIfUnused(source);
+            }
+            else ++entry;
+        }
+    }
 
     bool Wanted(const std::shared_ptr<Job>& job) const
     {
@@ -194,17 +290,13 @@ struct ProjectTexturePreparationService::State
 
     size_t Completed() const
     {
-        std::set<const Job*> completed;
-
-        for(const auto& [ticket, subscriber] : subscribers)
+        size_t completed = 0;
+        for(auto entry = subscribers.begin(); entry != subscribers.end(); ++entry)
         {
-            if(subscriber.job->done)
-            {
-                completed.insert(subscriber.job.get());
-            }
+            if(entry->second.job->done && std::none_of(subscribers.begin(), entry, [&](const auto& previous)
+                { return previous.second.job == entry->second.job; })) ++completed;
         }
-
-        return completed.size();
+        return completed;
     }
 
     void Run()
@@ -229,54 +321,82 @@ struct ProjectTexturePreparationService::State
 
             lock.unlock();
             std::shared_ptr<const PreparedProjectTexture> prepared;
+            std::shared_ptr<TextureSourceEvidence> evidence;
+            Identity completedIdentity;
             std::string error;
             size_t reservation = 0;
 
             try
             {
                 SourceLock source(job->identity.path);
-
-                if(Digest(job->identity.path) != job->identity.digest)
+                auto identity = job->identity;
+                evidence = std::make_shared<TextureSourceEvidence>();
+                if(!GetFileInformationByHandle(source.handle, &evidence->file) ||
+                    (evidence->file.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) ||
+                    !(evidence->file.nFileIndexHigh || evidence->file.nFileIndexLow) ||
+                    !PinnedPathMatches(source.handle, identity.path))
+                    throw std::runtime_error("Cannot identify a regular pinned texture source.");
+                evidence->bytes = std::filesystem::file_size(identity.path);
+                evidence->modified = std::filesystem::last_write_time(identity.path);
+                if(evidence->bytes > limits.sourceBytes)
+                    throw std::runtime_error("Texture source exceeds preparation budget.");
+#ifdef ENGINE_TEXTURE_PREPARATION_TESTS
+                Observe(TestStage::Pinned);
+#endif
+                ++hashes;
+                identity.digest = Digest(identity.path);
                 {
-                    throw std::runtime_error("Texture source changed before preparation.");
+                    std::lock_guard cacheLock(mutex);
+                    if(stop || !Wanted(job)) throw std::runtime_error("Texture preparation canceled.");
+                    for(const auto& cached : cache)
+                        if(cached.identity == identity && (prepared = cached.prepared.lock()))
+                        { ++cacheHits; break; }
                 }
-
-                reservation = PreparationBytes(job->identity.path, limits.sourceBytes, limits.preparationBytes);
-                const auto previous = bytes->fetch_add(reservation);
-
-                if(previous > limits.retainedBytes - reservation)
+#ifdef ENGINE_TEXTURE_PREPARATION_TESTS
+                Observe(TestStage::Hashed);
+#endif
+                if(!prepared)
                 {
-                    bytes->fetch_sub(reservation);
-                    reservation = 0;
-                    throw std::runtime_error("Deferred: consumer-held texture memory exhausts budget; retry later.");
-                }
-
-                auto image = std::make_unique<PreparedProjectTexture>();
-
-                if(!PrepareProjectTexture(job->identity.path, job->identity.interpretation, *image, &error))
-                {
-                    throw std::runtime_error(error);
-                }
-
-                if(Digest(job->identity.path) != job->identity.digest || image->pixels.capacity() > reservation)
-                {
-                    throw std::runtime_error("Texture source changed or prepared data exceeds reservation.");
-                }
-
-                const auto retained = reservation;
-                auto accounting = bytes;
-                reservation = 0; // The shared-pointer deleter owns accounting even if allocation throws.
-                prepared = std::shared_ptr<const PreparedProjectTexture>(image.release(),
-                    [accounting, retained](const PreparedProjectTexture* value)
+                    reservation = PreparationBytes(identity.path, limits.sourceBytes, limits.preparationBytes);
+                    const auto previous = bytes->fetch_add(reservation);
+                    if(previous > limits.retainedBytes - reservation)
                     {
-                        delete value;
-                        accounting->fetch_sub(retained);
-                    });
-                reservation = 0;
+                        bytes->fetch_sub(reservation);
+                        reservation = 0;
+                        throw std::runtime_error("Deferred: consumer-held texture memory exhausts budget; retry later.");
+                    }
+                    auto image = std::make_unique<PreparedProjectTexture>();
+                    ++decodes;
+                    if(!PrepareProjectTexture(job->identity.path, job->identity.interpretation, *image, &error))
+                        throw std::runtime_error(error);
+                    if(image->pixels.capacity() > reservation)
+                        throw std::runtime_error("Prepared data exceeds reservation.");
+                    const auto retained = reservation;
+                    auto accounting = bytes;
+                    reservation = 0; // The deleter owns accounting even if shared-pointer allocation throws.
+                    prepared = std::shared_ptr<const PreparedProjectTexture>(image.release(),
+                        [accounting, retained](const PreparedProjectTexture* value)
+                        {
+                            delete value;
+                            accounting->fetch_sub(retained);
+                        });
+                    reservation = 0;
+                }
+                ++hashes;
+                if(Digest(identity.path) != identity.digest)
+                    throw std::runtime_error("Texture content changed during preparation.");
+                evidence->identity = std::move(identity);
+                completedIdentity = evidence->identity; // Fallible copy before the completion critical section.
+                evidence->handle = source.Release();
+#ifdef ENGINE_TEXTURE_PREPARATION_TESTS
+                Observe(TestStage::Prepared);
+#endif
             }
             catch(const std::exception& exception)
             {
                 error = exception.what();
+                prepared.reset();
+                evidence.reset();
             }
 
             if(reservation)
@@ -290,6 +410,22 @@ struct ProjectTexturePreparationService::State
 
             if(!stop && Wanted(job))
             {
+                if(prepared && evidence)
+                {
+                    static_assert(std::is_nothrow_move_assignable_v<Identity>);
+                    job->identity = std::move(completedIdentity);
+                    job->source = std::move(evidence);
+                    for(const auto& [ticket, subscriber] : subscribers)
+                        if(subscriber.job == job) tokens.at(ticket).source = job->source;
+                    // Caching is optional; allocation failure cannot discard a valid completion.
+                    try
+                    {
+                        std::erase_if(cache, [](const auto& cached) { return cached.prepared.expired(); });
+                        if(cache.size() >= limits.requests) cache.pop_front();
+                        cache.push_back({job->identity, prepared});
+                    }
+                    catch(const std::bad_alloc&) {}
+                }
                 job->prepared = std::move(prepared);
                 job->error = std::move(error);
                 job->done = true;
@@ -339,17 +475,19 @@ void ProjectTexturePreparationService::Shutdown()
         state.accepting = false;
         state.stop = true;
         ++state.generation;
-        for(const auto& [ticket, weak] : state.tokens)
+        for(const auto& [ticket, token] : state.tokens)
         {
-            if(auto token = weak.lock())
+            if(auto current = token.current.lock())
             {
-                token->store(false);
+                current->store(false);
             }
+            if(auto source = token.source.lock()) source->Revoke();
         }
 
         state.tokens.clear();
         state.subscribers.clear();
         state.queue.clear();
+        state.cache.clear();
     }
 
     state.wake.notify_all();
@@ -364,20 +502,37 @@ std::uint64_t ProjectTexturePreparationService::Generation() const { return m_st
 size_t ProjectTexturePreparationService::RetainedBytes() const { return m_state->bytes->load(); }
 bool ProjectTexturePreparationService::IsCurrent(const Completion& completion) const
 {
+    std::lock_guard lock(m_state->mutex);
+    const auto token = m_state->tokens.find(completion.ticket);
     return m_state->accepting && completion.generation == Generation() &&
-        completion.current && completion.current->load();
+        completion.current && completion.current->load() && token != m_state->tokens.end() &&
+        token->second.current.lock() == completion.current && token->second.source.lock() == completion.source &&
+        completion.source && completion.source->handle.load() != INVALID_HANDLE_VALUE;
 }
+
+ProjectTexturePreparationService::Statistics ProjectTexturePreparationService::GetStatistics() const
+{
+    return {m_state->hashes.load(), m_state->decodes.load(), m_state->cacheHits.load(), m_state->deduplicated.load()};
+}
+#ifdef ENGINE_TEXTURE_PREPARATION_TESTS
+void ProjectTexturePreparationService::SetTestHook(std::function<void(TestStage)> hook)
+{
+    std::lock_guard lock(m_state->mutex);
+    m_state->testHook = std::move(hook);
+}
+#endif
 
 void ProjectTexturePreparationService::Invalidate()
 {
     std::lock_guard lock(m_state->mutex);
     ++m_state->generation;
-    for(const auto& [ticket, weak] : m_state->tokens)
+    for(const auto& [ticket, token] : m_state->tokens)
     {
-        if(auto token = weak.lock())
+        if(auto current = token.current.lock())
         {
-            token->store(false);
+            current->store(false);
         }
+        if(auto source = token.source.lock()) source->Revoke();
     }
 
     m_state->tokens.clear();
@@ -393,12 +548,14 @@ void ProjectTexturePreparationService::Cancel(std::uint64_t ticket)
 
     if(found != m_state->tokens.end())
     {
-        if(auto token = found->second.lock())
+        const auto source = found->second.source.lock();
+        if(auto token = found->second.current.lock())
         {
             token->store(false);
         }
 
         m_state->tokens.erase(found);
+        m_state->RevokeIfUnused(source);
     }
 
     m_state->subscribers.erase(ticket);
@@ -426,8 +583,6 @@ bool ProjectTexturePreparationService::Request(const ProjectPaths& paths, const 
             throw std::runtime_error("Invalid texture request, policy, subscriber generation or project source.");
         }
 
-        SourceLock source(resolved.resolvedPath);
-
         const auto sourceBytes = std::filesystem::file_size(resolved.resolvedPath);
 
         if(sourceBytes > state.limits.sourceBytes)
@@ -437,10 +592,10 @@ bool ProjectTexturePreparationService::Request(const ProjectPaths& paths, const 
         }
 
         Identity identity{std::filesystem::canonical(paths.GetRoot()), resolved.resolvedPath,
-            asset.ToString(), Digest(resolved.resolvedPath), interpretation, options};
+            asset.ToString(), {}, interpretation, options};
         std::lock_guard lock(state.mutex);
 
-        std::erase_if(state.tokens, [](const auto& entry) { return entry.second.expired(); });
+        state.PruneTokens();
 
         if(state.tokens.size() >= state.limits.requests || state.nextTicket == UINT64_MAX)
         {
@@ -451,9 +606,15 @@ bool ProjectTexturePreparationService::Request(const ProjectPaths& paths, const 
 
         for(const auto& [existing, subscriber] : state.subscribers)
         {
-            if(!subscriber.job->done && subscriber.job->identity == identity)
+            const auto& existingIdentity = subscriber.job->identity;
+            if(existingIdentity.project == identity.project && existingIdentity.path == identity.path &&
+                existingIdentity.assetID == identity.assetID && existingIdentity.interpretation == identity.interpretation &&
+                existingIdentity.options == identity.options && (!subscriber.job->done ||
+                    (subscriber.job->prepared && subscriber.job->source &&
+                        subscriber.job->source->MatchesPath(identity.path))))
             {
                 job = subscriber.job;
+                ++state.deduplicated;
                 break;
             }
         }
@@ -467,14 +628,21 @@ bool ProjectTexturePreparationService::Request(const ProjectPaths& paths, const 
 
         ticket = state.nextTicket++;
         auto current = std::make_shared<std::atomic_bool>(true);
-        state.subscribers.emplace(ticket, State::Subscriber{job, generation, current});
-        state.tokens.emplace(ticket, current);
+        state.tokens.emplace(ticket, State::Token{current, job->source});
+        try { state.subscribers.emplace(ticket, State::Subscriber{job, generation, current}); }
+        catch(...)
+        {
+            state.tokens.erase(ticket);
+            state.RevokeIfUnused(job->source);
+            throw;
+        }
         state.wake.notify_one();
         return true;
     }
     catch(const std::exception& exception)
     {
         error = exception.what();
+        ticket = 0;
         return false;
     }
 }
@@ -495,12 +663,29 @@ std::optional<ProjectTexturePreparationService::Completion> ProjectTexturePrepar
 
         const auto& subscriber = found->second;
         completion = {subscriber.job->identity, ticket, subscriber.generation,
-            subscriber.job->prepared, subscriber.job->error, subscriber.current};
+            subscriber.job->prepared, subscriber.job->error, subscriber.current, subscriber.job->source};
+        if(completion.source)
+        {
+            completion.sourceBytes = completion.source->bytes;
+            completion.sourceModified = completion.source->modified;
+        }
         m_state->subscribers.erase(found);
     }
 
     m_state->wake.notify_one();
 
+    if(completion.prepared && !ValidateSource(completion, paths, registry, completion.error))
+    {
+        completion.prepared.reset();
+        Cancel(ticket);
+    }
+    return completion;
+}
+
+bool ProjectTexturePreparationService::ValidateSource(const Completion& completion,
+    const ProjectPaths& paths, const ProjectAssetRegistry& registry, std::string& error) const
+{
+    error.clear();
     try
     {
         const auto asset = AssetID::Parse(completion.identity.assetID);
@@ -514,18 +699,17 @@ std::optional<ProjectTexturePreparationService::Completion> ProjectTexturePrepar
             throw std::runtime_error("Texture completion subscriber or safe project source is stale.");
         }
 
-        SourceLock source(resolved.resolvedPath);
-
-        if(Digest(resolved.resolvedPath) != completion.identity.digest)
+        if(!completion.source || completion.identity != completion.source->identity ||
+            completion.sourceBytes != completion.source->bytes || completion.sourceModified != completion.source->modified ||
+            !completion.source->MatchesPath(resolved.resolvedPath))
         {
             throw std::runtime_error("Texture completion source content is stale.");
         }
     }
     catch(const std::exception& exception)
     {
-        completion.prepared.reset();
-        completion.error = exception.what();
+        error = exception.what();
+        return false;
     }
-
-    return completion;
+    return true;
 }

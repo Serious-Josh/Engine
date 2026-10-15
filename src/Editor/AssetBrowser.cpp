@@ -21,6 +21,7 @@
 #include <atomic>
 #include <cstring>
 #include <cwctype>
+#include <memory>
 #include <utility>
 
 namespace
@@ -41,14 +42,16 @@ namespace
             utf8.size());
     }
 
-    bool MaterialFilename(
+    bool CreationFilename(
         const char* input,
         std::filesystem::path& filename,
-        std::string& error)
+        std::string& error,
+        bool material)
     {
         const std::string name(input);
 
-        if (name.empty() || name.find("..") != std::string::npos ||
+        if (name.empty() || name == "." || name == ".." ||
+            (material && name.find("..") != std::string::npos) ||
             name.find_first_of("<>:\"/\\|?*") != std::string::npos)
         {
             error = "Enter a filename without traversal, trailing dots/spaces, or invalid Windows characters.";
@@ -67,13 +70,13 @@ namespace
             name.size());
         filename = std::filesystem::path(utf8);
 
-        if (filename.has_extension() && filename.extension() != L".material")
+        if (material && filename.has_extension() && filename.extension() != L".material")
         {
             error = "The filename extension must be .material.";
             return false;
         }
 
-        if (!filename.has_extension())
+        if (material && !filename.has_extension())
         {
             filename += L".material";
         }
@@ -109,6 +112,51 @@ namespace
             return false;
         }
 
+        return true;
+    }
+
+    bool CreateBrowserFolder(const std::filesystem::path& directory,
+        const std::filesystem::path& filename, std::string& error)
+    {
+        // Pin every ancestor against replacement while validating and creating.
+        // OPEN_REPARSE_POINT inspects the directory itself rather than its target.
+        std::vector<std::shared_ptr<void>> locks;
+        auto current = directory.root_path();
+        for (const auto& component : directory.relative_path())
+        {
+            current /= component;
+            HANDLE handle = CreateFileW(current.c_str(), FILE_READ_ATTRIBUTES,
+                FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+            if (handle == INVALID_HANDLE_VALUE)
+            {
+                error = "Cannot access destination directory: " +
+                    std::system_category().message(GetLastError());
+                return false;
+            }
+            locks.emplace_back(handle, [](void* value) { CloseHandle(value); });
+            BY_HANDLE_FILE_INFORMATION info{};
+            if (!GetFileInformationByHandle(handle, &info))
+            {
+                error = "Cannot inspect destination directory: " +
+                    std::system_category().message(GetLastError());
+                return false;
+            }
+            if ((info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 ||
+                (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0)
+            {
+                error = "Destination must contain only ordinary directories, without links or junctions.";
+                return false;
+            }
+        }
+
+        std::error_code ec;
+        if (!std::filesystem::create_directory(directory / filename, ec))
+        {
+            error = ec ? "Cannot create folder: " + ec.message() :
+                "A file or folder with this name already exists.";
+            return false;
+        }
         return true;
     }
 }
@@ -203,7 +251,7 @@ void AssetBrowser::DrawMaterialCreationModal()
             {
                 std::filesystem::path filename;
 
-                if (MaterialFilename(m_materialName.data(), filename, m_materialError) &&
+                if (CreationFilename(m_materialName.data(), filename, m_materialError, true) &&
                     CanBrowse(m_materialDirectory, m_materialError))
                 {
                     const auto destination = m_materialDirectory / filename;
@@ -241,13 +289,65 @@ void AssetBrowser::DrawMaterialCreationModal()
     }
 }
 
+void AssetBrowser::DrawFolderCreationModal()
+{
+    if (m_openFolderModal)
+    {
+        ImGui::OpenPopup("Create Folder");
+        m_openFolderModal = false;
+    }
+
+    bool creationOpen = true;
+    if (ImGui::BeginPopupModal("Create Folder", &creationOpen, ImGuiWindowFlags_AlwaysAutoResize))
+    {
+        if (ImGui::IsWindowAppearing())
+        {
+            ImGui::SetKeyboardFocusHere();
+        }
+        const bool submitted = ImGui::InputText("Name", m_folderName.data(), m_folderName.size(),
+            ImGuiInputTextFlags_EnterReturnsTrue);
+        if (!m_folderError.empty())
+        {
+            ImGui::TextWrapped("%s", m_folderError.c_str());
+        }
+        const bool cancelled = ImGui::IsKeyPressed(ImGuiKey_Escape);
+        if ((ImGui::Button("Create") || submitted) && !cancelled)
+        {
+            m_folderError.clear();
+            try
+            {
+                std::filesystem::path filename;
+                if (CreationFilename(m_folderName.data(), filename, m_folderError, false) &&
+                    CanBrowse(m_folderDirectory, m_folderError) &&
+                    CreateBrowserFolder(m_folderDirectory, filename, m_folderError))
+                {
+                    m_listings.erase(m_folderDirectory);
+                    m_error.clear();
+                    ImGui::CloseCurrentPopup();
+                }
+            }
+            catch (const std::exception& exception)
+            {
+                m_folderError = exception.what();
+            }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel") || cancelled)
+        {
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+}
+
 bool AssetBrowser::CanBrowse(
     const std::filesystem::path& path,
     std::string& error) const
 {
     const auto relative = path.lexically_relative(m_root);
 
-    if (relative.empty() || *relative.begin() == "..")
+    if (relative.empty() || relative.is_absolute() ||
+        std::any_of(relative.begin(), relative.end(), [](const auto& component) { return component == ".."; }))
     {
         error = "Directory is outside the project root.";
         return false;
@@ -377,6 +477,7 @@ void AssetBrowser::DrawTree(
 
     const bool open = ImGui::TreeNodeEx("##Directory", flags, "%s", label.c_str());
     CaptureDropTarget(path);
+    DrawAssetMoveTarget(path);
 
     if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen())
     {
@@ -453,6 +554,10 @@ void AssetBrowser::DrawContents()
             if(isMesh)
             {
                 DrawMeshDragSource(entry.path, entry.name);
+            }
+            else if(isTexture || isMaterial)
+            {
+                DrawAssetMoveSource(entry.path, entry.name);
             }
 
             const TextureThumbnailCache::Preview* preview = nullptr;
@@ -534,6 +639,10 @@ void AssetBrowser::DrawContents()
             CaptureDropTarget(entry.navigable ? entry.path : std::filesystem::path{});
             const bool hovered = ImGui::IsItemHovered();
             tileHovered = tileHovered || hovered;
+            if(entry.navigable)
+            {
+                DrawAssetMoveTarget(entry.path);
+            }
 
             if (pressed || (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)))
             {
@@ -616,9 +725,17 @@ void AssetBrowser::DrawContents()
     {
         std::string error;
 
-        if (CanCreateMaterial(error) && ImGui::BeginMenu("Create", !m_materialCreationPending))
+        if (CanBrowse(m_directory, error) && ImGui::BeginMenu("Create"))
         {
-            if (ImGui::MenuItem("Material"))
+            if (ImGui::MenuItem("Folder"))
+            {
+                m_folderDirectory = m_directory;
+                std::strcpy(m_folderName.data(), "NewFolder");
+                m_folderError.clear();
+                m_openFolderModal = true;
+            }
+
+            if (CanCreateMaterial(error) && ImGui::MenuItem("Material", nullptr, false, !m_materialCreationPending))
             {
                 m_materialDirectory = m_directory;
                 std::strcpy(m_materialName.data(), "NewMaterial");
@@ -761,6 +878,7 @@ void AssetBrowser::Draw(const EditorWorkspaceRect& rectangle)
         }
 
         DrawMaterialCreationModal();
+        DrawFolderCreationModal();
     }
 
     ImGui::End();
@@ -1193,6 +1311,220 @@ void AssetBrowser::InvalidateMeshDragIdentity() noexcept
     m_meshDragIdentity = nextIdentity.fetch_add(1, std::memory_order_relaxed);
 }
 
+void AssetBrowser::DrawAssetMoveSource(const std::filesystem::path& path, const std::string& name)
+{
+    if(!m_thumbnailRegistry || !m_thumbnailPaths || !m_meshDragIdentity)
+    {
+        return;
+    }
+    const auto* record = m_thumbnailRegistry->FindByPath(path.lexically_relative(m_thumbnailPaths->GetRoot()));
+    if(!record || !ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceNoHoldToOpenOthers))
+    {
+        return;
+    }
+    const auto* current = ImGui::GetDragDropPayload();
+    if(!current || current->DataSize == 0)
+    {
+        m_moveSource = path;
+    }
+    MovePayload payload;
+    payload.projectIdentity = m_meshDragIdentity;
+    const auto reference = record->id.ToReference();
+    std::copy(reference.begin(), reference.end(), payload.reference.begin());
+    if(record->type == AssetType::Material)
+    {
+        const auto material = MakeMaterialDragPayload(record->id);
+        if(material)
+            ImGui::SetDragDropPayload(MaterialDragPayloadType, &*material, sizeof(*material), ImGuiCond_Once);
+        ImGui::Text("Material: %s", name.c_str());
+        ImGui::TextUnformatted("Drop onto a viewport object to replace all material slots");
+    }
+    else
+    {
+        ImGui::SetDragDropPayload("ENGINE_ASSET_MOVE", &payload, sizeof(payload), ImGuiCond_Once);
+        ImGui::Text("Move: %s", name.c_str());
+    }
+    ImGui::TextUnformatted("Drop onto an Asset Browser folder");
+    ImGui::EndDragDropSource();
+}
+
+void AssetBrowser::DrawAssetMoveTarget(const std::filesystem::path& directory)
+{
+    const auto* payload = ImGui::GetDragDropPayload();
+    if(!payload || !m_thumbnailPaths || !m_thumbnailRegistry ||
+        (!payload->IsDataType("ENGINE_ASSET_MOVE") && !payload->IsDataType(MeshDragPayloadType) &&
+            !payload->IsDataType(MaterialDragPayloadType)))
+    {
+        return;
+    }
+    if(!ImGui::BeginDragDropTarget())
+    {
+        return;
+    }
+
+    std::string error;
+    std::optional<AssetRecord> asset;
+    if(payload->IsDataType(MeshDragPayloadType) && payload->DataSize == sizeof(MeshDragPayload))
+    {
+        MeshDragPayload mesh;
+        memcpy(&mesh, payload->Data, sizeof(mesh));
+        asset = ValidateMeshDrag(mesh, *m_thumbnailPaths, *m_thumbnailRegistry, error);
+    }
+    else if(payload->IsDataType(MaterialDragPayloadType) && payload->DataSize == sizeof(MaterialDragPayload))
+    {
+        MaterialDragPayload material;
+        memcpy(&material, payload->Data, sizeof(material));
+        asset = ValidateMaterialDrag(material, *m_thumbnailPaths, *m_thumbnailRegistry, error);
+    }
+    else if(payload->IsDataType("ENGINE_ASSET_MOVE") && payload->DataSize == sizeof(MovePayload))
+    {
+        MovePayload move;
+        memcpy(&move, payload->Data, sizeof(move));
+        const auto id = move.reference.back() == '\0' ?
+            AssetID::ParseReference(std::string_view(move.reference.data(), move.reference.size() - 1)) : std::nullopt;
+        const auto* record = id ? m_thumbnailRegistry->Find(*id) : nullptr;
+        if(record && move.projectIdentity != 0 && move.projectIdentity == m_meshDragIdentity)
+        {
+            asset = *record;
+        }
+    }
+
+    const auto& paths = *m_thumbnailPaths;
+    if(!asset || m_moveSource.empty() || !ProjectAssetRegistry::PathsEqual(
+        paths.GetRoot() / asset->relativePath, m_moveSource))
+    {
+        error = "Asset drag is stale. Start a new drag.";
+    }
+    else if(!CanBrowse(directory, error) || !CanBrowse(m_moveSource.parent_path(), error))
+    {
+        // CanBrowse supplies the containment or directory-link error.
+    }
+    else if(ProjectAssetRegistry::PathsEqual(m_moveSource.parent_path(), directory))
+    {
+        error = "Asset is already in this directory.";
+    }
+    else
+    {
+        const auto destination = directory / m_moveSource.filename();
+        const auto relative = destination.lexically_relative(paths.GetRoot());
+        const DWORD attributes = GetFileAttributesW(m_moveSource.c_str());
+        std::error_code ec;
+        if(!ValidateAssetRecord(AssetRecord{asset->id, asset->type, relative}))
+        {
+            error = "Materials must remain in Materials; meshes must remain in Meshes.";
+        }
+        else if(destination.native().size() >= MAX_PATH)
+        {
+            error = "Destination exceeds the supported Windows path length.";
+        }
+        else if(attributes == INVALID_FILE_ATTRIBUTES ||
+            (attributes & (FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)))
+        {
+            error = "Source is missing, read-only, or linked.";
+        }
+        else if(m_thumbnailRegistry->FindByPath(relative) || std::filesystem::exists(destination, ec) || ec)
+        {
+            error = "Destination already exists, is registered, or cannot be inspected.";
+        }
+    }
+
+    if(error.empty())
+    {
+        HANDLE writable = CreateFileW(directory.c_str(), FILE_ADD_FILE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+        if(writable == INVALID_HANDLE_VALUE)
+        {
+            error = "Destination is not writable: " + std::system_category().message(GetLastError());
+        }
+        else
+        {
+            CloseHandle(writable);
+        }
+    }
+    if(error.empty() && asset)
+    {
+        if(const auto* accepted = ImGui::AcceptDragDropPayload(payload->DataType))
+        {
+            if(accepted->IsDelivery())
+            {
+                m_moveRequest = MoveRequest{*asset, m_moveSource, directory};
+            }
+        }
+        ImGui::SetTooltip("Move to %s", PathID(directory).c_str());
+    }
+    else
+    {
+        ImGui::SetTooltip("Cannot move: %s", error.c_str());
+        if(ImGui::IsMouseReleased(ImGuiMouseButton_Left))
+        {
+            m_error = error;
+        }
+    }
+    ImGui::EndDragDropTarget();
+}
+
+std::optional<AssetBrowser::MoveRequest> AssetBrowser::TakeMoveRequest()
+{
+    return std::exchange(m_moveRequest, std::nullopt);
+}
+
+void AssetBrowser::OnMoveCompleted(const MoveRequest& request, const std::filesystem::path& destination,
+    const std::string& error)
+{
+    m_error = error;
+    if(!error.empty())
+    {
+        return;
+    }
+    m_listings.erase(request.source.parent_path());
+    m_listings.erase(request.directory);
+    m_thumbnails->Invalidate(request.source);
+    InvalidateMaterialSource(request.source);
+    m_materialRequestsReset = true;
+    if(m_selection == request.source)
+    {
+        m_selection = destination;
+    }
+    SetThumbnailProject(*m_thumbnailPaths, *m_thumbnailRegistry);
+}
+
+std::optional<MaterialDragPayload> AssetBrowser::MakeMaterialDragPayload(const AssetID& id) const
+{
+    const auto* record = m_thumbnailRegistry ? m_thumbnailRegistry->Find(id) : nullptr;
+    if(!record || record->type != AssetType::Material || !m_meshDragIdentity || m_meshDragProject.empty())
+        return std::nullopt;
+    MaterialDragPayload payload;
+    payload.projectIdentity = m_meshDragIdentity;
+    const auto reference = id.ToReference();
+    std::copy(reference.begin(), reference.end(), payload.materialReference.begin());
+    return payload;
+}
+
+std::optional<AssetRecord> AssetBrowser::ValidateMaterialDrag(const MaterialDragPayload& payload,
+    const ProjectPaths& paths, const ProjectAssetRegistry& registry, std::string& error) const
+{
+    error.clear();
+    std::error_code pathError;
+    const auto project = std::filesystem::canonical(paths.GetRoot(), pathError);
+    if(payload.version != 1 || payload.reserved || !payload.projectIdentity ||
+        payload.projectIdentity != m_meshDragIdentity || pathError || project != m_meshDragProject)
+    {
+        error = "Material drag belongs to a stale project or scene. Start a new drag.";
+        return std::nullopt;
+    }
+    const auto id = payload.materialReference.back() == '\0' ? AssetID::ParseReference(
+        std::string_view(payload.materialReference.data(), payload.materialReference.size() - 1)) : std::nullopt;
+    const auto* record = id ? registry.Find(*id) : nullptr;
+    if(!record || record->type != AssetType::Material ||
+        ProjectAssetResolver::Resolve(paths, registry, *id).status != AssetAvailability::Available)
+    {
+        error = "Dragged material is no longer an available registered material.";
+        return std::nullopt;
+    }
+    return *record;
+}
+
 void AssetBrowser::DrawMeshDragSource(const std::filesystem::path& path, const std::string& name)
 {
     const auto found = m_meshRecords.find(path.lexically_normal());
@@ -1202,18 +1534,23 @@ void AssetBrowser::DrawMeshDragSource(const std::filesystem::path& path, const s
         return;
     }
 
-    if(!ImGui::BeginDragDropSource())
+    if(!ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceNoHoldToOpenOthers))
     {
         return;
     }
 
     MeshDragPayload payload;
+    if(!ImGui::GetDragDropPayload() || ImGui::GetDragDropPayload()->DataSize == 0)
+    {
+        m_moveSource = path;
+    }
     payload.projectIdentity = m_meshDragIdentity;
     const auto reference = found->second.id.ToReference();
     std::copy(reference.begin(), reference.end(), payload.meshReference.begin());
     ImGui::SetDragDropPayload(MeshDragPayloadType, &payload, sizeof(payload), ImGuiCond_Once);
     ImGui::Text("Mesh: %s", name.c_str());
     ImGui::TextUnformatted("Drop into Scene Viewport to place at cursor");
+    ImGui::TextUnformatted("Or drop onto an Asset Browser folder to move");
     ImGui::EndDragDropSource();
 }
 

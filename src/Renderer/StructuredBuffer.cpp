@@ -4,6 +4,62 @@
 
 #include <climits>
 #include <limits>
+#include <cstring>
+#include <utility>
+
+void StructuredBuffer::Swap(StructuredBuffer& other) noexcept
+{
+    std::swap(m_resource, other.m_resource);
+    std::swap(m_descriptorHeap, other.m_descriptorHeap);
+    std::swap(m_descriptorIndex, other.m_descriptorIndex);
+}
+
+bool StructuredBuffer::InitializeReadOnlyUpload(ID3D12Device* device, const void* data,
+    size_t elementSize, unsigned int elementCount, DescriptorHeap& descriptorHeap)
+{
+    if(!device || !data || m_resource || !elementSize || elementSize > D3D12_REQ_MULTI_ELEMENT_STRUCTURE_SIZE_IN_BYTES ||
+        elementSize % 4 != 0 || !elementCount ||
+        elementSize > (std::numeric_limits<size_t>::max)() / elementCount)
+        return false;
+
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = D3D12_HEAP_TYPE_UPLOAD;
+    D3D12_RESOURCE_DESC description{};
+    description.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    description.Width = elementSize * elementCount;
+    description.Height = 1;
+    description.DepthOrArraySize = 1;
+    description.MipLevels = 1;
+    description.SampleDesc.Count = 1;
+    description.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    if(FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &description,
+        D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&m_resource))))
+        return false;
+
+    void* mapped = nullptr;
+    const D3D12_RANGE readRange{0, 0};
+    if(FAILED(m_resource->Map(0, &readRange, &mapped)))
+    {
+        Shutdown();
+        return false;
+    }
+    std::memcpy(mapped, data, elementSize * elementCount);
+    m_resource->Unmap(0, nullptr);
+    m_descriptorIndex = descriptorHeap.Allocate();
+    if(m_descriptorIndex == UINT_MAX)
+    {
+        Shutdown();
+        return false;
+    }
+    m_descriptorHeap = &descriptorHeap;
+    D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+    view.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    view.Buffer.NumElements = elementCount;
+    view.Buffer.StructureByteStride = static_cast<UINT>(elementSize);
+    device->CreateShaderResourceView(m_resource, &view, descriptorHeap.GetCPUHandle(m_descriptorIndex));
+    return true;
+}
 
 bool StructuredBuffer::Initialize(
     ID3D12Device* device,

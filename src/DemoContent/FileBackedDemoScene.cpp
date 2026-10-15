@@ -11,6 +11,7 @@
 #include "Project/ProjectPaths.h"
 #include "assets/ProjectAssetResolver.h"
 #include "Renderer/Mesh.h"
+#include "Renderer/Renderer.h"
 
 #include <memory>
 #include <string>
@@ -599,6 +600,11 @@ std::unique_ptr<FileSceneRuntime> FileBackedDemoScene::PrepareObjectRestoration(
     const SceneObjectDocument& object, size_t insertionIndex, std::string* errorMessage)
 {
     return m_runtime->PrepareObjectRestoration(m_assets, object, insertionIndex, errorMessage);
+}
+
+bool FileBackedDemoScene::IsAssignmentMaterialAdmitted(std::string_view reference, const Renderer& renderer)
+{
+    return m_assets.FindPublishedMaterial(reference, renderer) != nullptr;
 }
 
 Material* FileBackedDemoScene::ResolvePendingAssignmentMaterial(std::string_view reference, std::string* errorMessage)

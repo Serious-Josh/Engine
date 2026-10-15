@@ -100,4 +100,15 @@ struct MaterialTablePublication
             lastSubmitted = recordedRevision;
         }
     }
+
+    // Admission is append-only; parameter/texture revisions keep their fixed-count API.
+    bool Append(const GPUMaterial& record, size_t limit)
+    {
+        if(desired.empty() || desired.size() >= limit || !Valid(record) || revision == UINT64_MAX) return false;
+        auto copy = desired;
+        copy.push_back(record);
+        desired.swap(copy);
+        ++revision;
+        return true;
+    }
 };

@@ -19,6 +19,7 @@ class UploadBuffer
         unsigned int frameCount);
 
     void Shutdown();
+    void Swap(UploadBuffer& other) noexcept;
 
     void Reset(unsigned int frameIndex);
 

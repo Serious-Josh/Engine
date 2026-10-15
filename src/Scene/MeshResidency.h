@@ -1,12 +1,26 @@
 #pragma once
 
 #include "assets/ProjectMeshCPUCache.h"
+#include "assets/DevelopmentCookedMeshProvider.h"
 
 #include <cstdint>
 #include <utility>
 
 class Mesh;
 class FileSceneAssetCatalog;
+
+// CPU/source lifetime evidence only. This is not a final publication pin: the
+// provider's currentness check cannot exclude a concurrent activation replacement.
+struct CookedMeshResidencyEvidence
+{
+    std::shared_ptr<const DevelopmentCookedMesh::Provider> provider;
+    std::shared_ptr<const DevelopmentCookedMesh::AssetEvidence> asset;
+    std::shared_ptr<const CookedMesh::MetadataSnapshot> metadata;
+    std::shared_ptr<const std::atomic_bool> current;
+};
+
+bool ValidateCookedMeshResidencyEvidence(const CookedMeshResidencyEvidence& evidence,
+    std::string_view reference, std::string* error = nullptr);
 
 // Copied evidence only. The catalog, not this receipt, owns the GPU mesh.
 struct MeshResidencyCandidate
@@ -18,9 +32,10 @@ struct MeshResidencyCandidate
     std::uint64_t vertexAddress = 0;
     std::uint64_t indexAddress = 0;
 
-    enum class SourceKind { ProjectAsset, Builtin };
+    enum class SourceKind { ProjectAsset, Builtin, Cooked };
     SourceKind sourceKind = SourceKind::ProjectAsset;
     std::string builtinReference; // Empty for external assets; never a CPU cache key.
+    std::shared_ptr<const CookedMeshResidencyEvidence> cooked;
 
 };
 
@@ -32,8 +47,9 @@ struct MeshResidencyToken
     bool operator==(const MeshResidencyToken&) const = default;
 };
 
-// Pins external source bytes against writes/deletion through acceptance. Built-in
-// evidence has no OS handle: catalog/session ownership is rechecked at acceptance.
+// Pins FBX bytes against writes/deletion through acceptance. Built-in evidence
+// has no OS handle. Cooked acceptance pins the current activation and manifest,
+// and retains the exact immutable mapping used to prepare catalog geometry.
 // Does not own GPU resources or authorize renderer publication.
 class MeshResidencySourceLock
 {
@@ -44,8 +60,13 @@ public:
     MeshResidencySourceLock& operator=(const MeshResidencySourceLock&) = delete;
     MeshResidencySourceLock(MeshResidencySourceLock&& other) noexcept
         : m_handle(std::exchange(other.m_handle, nullptr)),
-          m_builtinValidated(std::exchange(other.m_builtinValidated, false)) {}
-    explicit operator bool() const noexcept { return m_handle != nullptr || m_builtinValidated; }
+          m_builtinValidated(std::exchange(other.m_builtinValidated, false)),
+          m_cookedPreparation(std::move(other.m_cookedPreparation)),
+          m_cookedAcceptance(std::move(other.m_cookedAcceptance)) {}
+    explicit operator bool() const noexcept
+    {
+        return m_handle != nullptr || m_builtinValidated || (m_cookedPreparation && m_cookedAcceptance);
+    }
 
 private:
     friend class FileSceneAssetCatalog;
@@ -53,4 +74,6 @@ private:
 
     void* m_handle = nullptr;
     bool m_builtinValidated = false;
+    std::shared_ptr<const CookedMeshResidencyEvidence> m_cookedPreparation;
+    std::shared_ptr<const void> m_cookedAcceptance;
 };

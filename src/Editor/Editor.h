@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Scene/Transform.h"
+#include "SceneSelection.h"
 #include "AssetBrowser.h"
 #include "EditorWorkspace.h"
 #include "InspectorPanel.h"
@@ -59,6 +60,7 @@ public:
     void ProcessAssetRename(const ProjectPaths& paths, ProjectAssetRegistry& registry,
         const std::filesystem::path& activeScenePath);
     void ProcessAssetDeletion(const ProjectPaths& paths, ProjectAssetRegistry& registry);
+    void ProcessAssetMove(const ProjectPaths& paths, ProjectAssetRegistry& registry);
     bool RequestApplicationClose();
     bool TakeApplicationCloseApproval();
 
@@ -84,6 +86,7 @@ public:
 
     void ConfigureMaterialThumbnails(Renderer& renderer)
     {
+        m_materialDropRenderer = &renderer;
         m_assetBrowser.ConfigureMaterialThumbnails(renderer);
         m_inspectorPanel.ConfigureThumbnails(renderer);
     }
@@ -152,6 +155,22 @@ public:
     };
     std::optional<MaterialAssignmentRequest> TakeMaterialAssignmentRequest();
     void OnMaterialAssignmentCompleted(const SceneObjectMetadata& selection, bool succeeded, std::string message);
+
+    struct MaterialBindingRequest
+    {
+        SceneObjectMetadata selection;
+        std::optional<AssetID> allSlotsMaterial;
+        std::map<std::string, std::string> overrides;
+        MeshMetadata layout;
+        std::uint64_t operationID = 0;
+        std::uint64_t epoch = 0;
+    };
+    std::optional<MaterialBindingRequest> TakeViewportMaterialRequest();
+    bool IsViewportMaterialRequestCurrent(const MaterialBindingRequest& request) const noexcept;
+    void NotifyViewportMaterialRetry(const MaterialBindingRequest& request, std::string_view message);
+    void CompleteViewportMaterialRequest(const MaterialBindingRequest& request,
+        bool succeeded, bool published, std::string_view message) noexcept;
+    std::optional<size_t> GetMaterialDropHighlight(const IDemoScene& scene) const;
 
     struct MeshCreationRequest
     {
@@ -233,12 +252,23 @@ public:
         return m_selectedObject;
     }
 
+    const std::vector<size_t>& GetSelectedObjects() const noexcept { return m_selectedObjects; }
+
     uint64_t GetSelectionStructureRevision() const
     {
         return m_selectionStructureRevision;
     }
 
 private:
+    friend class ViewportMaterialDropVerification;
+    void DrawMaterialDropTarget(IDemoScene& scene, const ProjectPaths& paths,
+        const ProjectAssetRegistry& registry);
+    void QueueViewportMaterialDrop(const IDemoScene& scene, const SceneObjectMetadata& target, const AssetID& material);
+    Renderer* m_materialDropRenderer = nullptr;
+    std::optional<SceneObjectMetadata> m_materialDropHover;
+    std::string m_materialDropStatus;
+    int m_materialDropDeliveryFrame = -1;
+    std::optional<MaterialBindingRequest> m_viewportMaterialRequest;
     void DrawMeshDropTarget(const IDemoScene& scene, const ProjectPaths& paths,
         const ProjectAssetRegistry& registry);
     std::optional<MeshCreationRequest> m_meshCreationRequest;
@@ -353,6 +383,9 @@ private:
     GizmoMode m_gizmoMode = GizmoMode::Translate;
 
     bool m_cameraLooking = false;
+    bool m_cameraPanning = false;
+    // Keep a pan's held left button from becoming a gizmo gesture after RMB release.
+    bool m_panLeftHeld = false;
     bool m_viewportHovered = false;
     bool m_viewportFocused = false;
 
@@ -370,6 +403,19 @@ private:
         Transform before;
         Transform after;
     };
+    struct GroupTransformEdit
+    {
+        std::vector<TransformEdit> edits;
+        GizmoMode mode = GizmoMode::Translate;
+    };
+    using SelectedObjectIdentity = SceneSelection::Identity;
+    std::vector<SelectedObjectIdentity> m_orderedSelection;
+    std::vector<size_t> m_selectedObjects;
+    void SelectSceneObject(const IDemoScene& scene, size_t index, bool toggle = false);
+    void RefreshSceneSelection(const IDemoScene& scene);
+    void UpdateGroupGizmo(IDemoScene& scene, bool usingGizmo, const Transform& anchorAfter);
+    std::unique_ptr<GroupTransformEdit> m_gizmoGroupEdit;
+    size_t m_gizmoGroupPayloadBytes = 0;
     struct SceneHistorySession
     {
         std::filesystem::path projectIdentity;
@@ -398,6 +444,16 @@ private:
         std::vector<std::string> before;
         std::vector<std::string> after;
     };
+    struct MaterialBindingsEdit
+    {
+        SceneHistorySession session;
+        std::string objectID;
+        std::string meshReference;
+        std::string fallbackReference;
+        MeshMetadata layout;
+        std::map<std::string, std::string> before;
+        std::map<std::string, std::string> after;
+    };
     void CommitObjectReorder(IDemoScene& scene, const HierarchyReorderRequest& request);
     std::string m_reorderStatus;
 
@@ -414,7 +470,7 @@ private:
     void CommitObjectRename(IDemoScene& scene, std::string name);
     bool RenameIntentMatches(const IDemoScene& scene) const;
     bool RenameSessionMatches(const IDemoScene& scene, const SceneHistorySession& session) const;
-    using SceneHistoryCommand = std::variant<TransformEdit, std::unique_ptr<ObjectDeletion>, std::unique_ptr<RenameObject>, std::unique_ptr<ReorderObjects>>;
+    using SceneHistoryCommand = std::variant<TransformEdit, std::unique_ptr<GroupTransformEdit>, std::unique_ptr<ObjectDeletion>, std::unique_ptr<RenameObject>, std::unique_ptr<ReorderObjects>, std::unique_ptr<MaterialBindingsEdit>>;
     struct SceneHistoryEntry
     {
         SceneHistoryCommand command;
@@ -426,6 +482,17 @@ private:
         HistoryReplayIdentity identity;
         size_t cursor = 0;
     };
+    struct PendingMaterialBinding
+    {
+        std::uint64_t operationID = 0;
+        std::uint64_t epoch = 0;
+        size_t cursor = 0;
+        std::optional<bool> redo;
+        std::optional<SceneHistoryEntry> forward;
+    };
+    std::optional<PendingMaterialBinding> m_pendingMaterialBinding;
+    void QueueMaterialBindingReplay(IDemoScene& scene, const MaterialBindingsEdit& edit, bool redo);
+    static size_t MaterialBindingPayloadBytes(const MaterialBindingsEdit& edit);
     struct StagedDeletionHistory
     {
         SceneHistoryEntry entry;

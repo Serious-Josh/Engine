@@ -13,6 +13,91 @@
 
 namespace
 {
+    using PreparationStatus = ProjectMeshPreparationService::Status;
+
+    PreparationStatus MapStatus(DevelopmentCookedMesh::Status status)
+    {
+        using S = DevelopmentCookedMesh::Status;
+        using P = PreparationStatus;
+
+        switch(status)
+        {
+            case S::Success: return P::Available;
+            case S::Missing: return P::Missing;
+            case S::Stale: return P::Stale;
+            case S::Corrupt: return P::Corrupt;
+            case S::Unsupported: return P::Unsupported;
+            case S::IncompatibleCook: return P::IncompatibleCook;
+            case S::IOFailure: return P::IOFailure;
+            case S::AdmissionLimit: return P::AdmissionLimit;
+            case S::AllocationFailure: return P::AllocationFailure;
+            case S::IdentityFailure: return P::IdentityFailure;
+        }
+
+        return P::Failed;
+    }
+
+    PreparationStatus MapStatus(CookedMesh::Status status)
+    {
+        using S = CookedMesh::Status;
+        using P = PreparationStatus;
+
+        switch(status)
+        {
+            case S::Success: return P::Available;
+            case S::Corrupt: return P::Corrupt;
+            case S::Unsupported: return P::Unsupported;
+            case S::IncompatibleCook: return P::IncompatibleCook;
+            case S::AdmissionLimit: return P::AdmissionLimit;
+            case S::AllocationFailure: return P::AllocationFailure;
+            case S::IdentityFailure: return P::IdentityFailure;
+        }
+
+        return P::Failed;
+    }
+
+    PreparationStatus CheckCooked(const DevelopmentCookedMesh::Provider& provider,
+        const DevelopmentCookedMesh::AssetEvidence& evidence, std::string& error)
+    {
+        if(provider.Mapping() != evidence.mapping)
+        {
+            error = "Cooked completion belongs to a different provider mapping.";
+            return PreparationStatus::Stale;
+        }
+
+        const auto current = provider.CheckCurrent();
+
+        if(current.status != DevelopmentCookedMesh::Status::Success)
+        {
+            error = current.message;
+            return current.status == DevelopmentCookedMesh::Status::Missing ? PreparationStatus::Stale : MapStatus(current.status);
+        }
+
+        const auto lookup = provider.Lookup(evidence.assetID);
+
+        if(lookup.status != DevelopmentCookedMesh::Status::Success || *lookup.evidence != evidence)
+        {
+            error = "Cooked AssetID, compatibility, payload or recipe mapping changed.";
+            return PreparationStatus::Stale;
+        }
+
+        return PreparationStatus::Available;
+    }
+
+    std::string CookedDigest(const CookedMesh::Evidence& evidence)
+    {
+        std::string result;
+        constexpr char hex[] = "0123456789abcdef";
+
+        for(auto byte : evidence.payloadSHA256)
+        {
+            result += hex[byte >> 4];
+            result += hex[byte & 15];
+        }
+
+        return result;
+    }
+
     struct SourcePin
     {
         HANDLE handle = INVALID_HANDLE_VALUE;
@@ -87,11 +172,23 @@ namespace
         std::shared_ptr<const ImportedMesh> cached;
         ImportedMesh imported;
     };
+
+    struct CookedCPULease
+    {
+        std::shared_ptr<Reservation> reservation;
+        std::shared_ptr<const ImportedMesh> geometry;
+    };
+
+    struct CookedMetadataLease
+    {
+        std::shared_ptr<Reservation> reservation;
+        std::shared_ptr<const CookedMesh::MetadataSnapshot> metadata;
+    };
 }
 
 struct ProjectMeshPreparationService::State
 {
-    enum class Stage { Hash, HashReady, Import, Verify, Done };
+    enum class Stage { Hash, HashReady, Import, Verify, Cooked, Done };
 
     struct Job
     {
@@ -100,6 +197,8 @@ struct ProjectMeshPreparationService::State
         Status status = Status::Pending;
         bool cacheHit = false;
         std::shared_ptr<const ImportedMesh> geometry;
+        std::shared_ptr<const CookedMesh::MetadataSnapshot> metadata;
+        std::shared_ptr<const DevelopmentCookedMesh::Provider> provider;
         std::shared_ptr<Reservation> reservation;
         std::string error;
     };
@@ -153,6 +252,193 @@ struct ProjectMeshPreparationService::State
         return count;
     }
 
+    RequestResult Submit(Identity identity, std::uint64_t generation,
+        std::shared_ptr<const DevelopmentCookedMesh::Provider> provider = {},
+        std::shared_ptr<const ImportedMesh> cached = {})
+    {
+        std::lock_guard lock(mutex);
+        std::erase_if(tokens, [](const auto& entry) { return entry.second.expired(); });
+        std::erase_if(jobs, [](const auto& weak) { return weak.expired(); });
+
+        if (tokens.size() >= limits.requests || nextTicket == UINT64_MAX)
+        {
+            return {Status::Retry, 0, "Mesh subscriber capacity exhausted."};
+        }
+
+        std::shared_ptr<Job> job;
+        size_t pending = 0;
+
+        for (const auto& weak : jobs)
+        {
+            if (const auto existing = weak.lock())
+            {
+                if (existing->stage != Stage::Done)
+                {
+                    ++pending;
+                }
+
+                auto comparable = existing->identity;
+                comparable.digest.clear();
+
+                if (comparable == identity && Wanted(existing))
+                {
+                    job = existing;
+                }
+            }
+        }
+
+        bool created = false;
+
+        if (!job)
+        {
+            if (pending >= limits.pending || Completed() >= limits.completed ||
+                bytes->load() > limits.retainedBytes - limits.preparationBytes)
+            {
+                return {Status::Retry, 0, "Mesh pending/completed capacity or consumer-held memory budget exhausted."};
+            }
+
+            job = std::make_shared<Job>();
+            job->identity = std::move(identity);
+            job->provider = std::move(provider);
+            job->geometry = std::move(cached);
+            job->cacheHit = bool(job->geometry);
+            job->stage = job->provider ? Stage::Cooked : Stage::Hash;
+            job->reservation = std::make_shared<Reservation>();
+            job->reservation->accounting = bytes;
+            job->reservation->bytes = limits.preparationBytes;
+            bytes->fetch_add(limits.preparationBytes);
+            jobs.push_back(job);
+            created = true;
+        }
+
+        const auto ticket = nextTicket++;
+        auto current = std::make_shared<std::atomic_bool>(true);
+        tokens.emplace(ticket, current);
+
+        try
+        {
+            subscribers.emplace(ticket, Subscriber{job, current, generation});
+
+            if (created)
+            {
+                queue.push_back(job);
+            }
+        }
+        catch (...)
+        {
+            tokens.erase(ticket);
+            subscribers.erase(ticket);
+            throw;
+        }
+
+        wake.notify_one();
+        return {job->stage == Stage::Done && (job->geometry || job->metadata) ? Status::Available : Status::Accepted, ticket, {}};
+    }
+
+    void PrepareCooked(const std::shared_ptr<Job>& job, Status& status, std::string& error,
+        std::shared_ptr<const ImportedMesh>& geometry, std::shared_ptr<const CookedMesh::MetadataSnapshot>& metadata,
+        size_t& retained)
+    {
+        status = CheckCooked(*job->provider, *job->identity.cooked, error);
+        if(status != Status::Available) { return; }
+        CookedMesh::Policy policy;
+        policy.maxDecodedBytes = limits.geometryBytes;
+        auto acquired = job->provider->Acquire(job->identity.cooked->assetID, policy);
+
+        if(acquired.status != DevelopmentCookedMesh::Status::Success)
+        {
+            status = MapStatus(acquired.status);
+            error = acquired.message;
+            return;
+        }
+
+        if(acquired.lease->Evidence() != *job->identity.cooked)
+        {
+            status = Status::Stale;
+            error = "Acquired payload evidence differs from the requested cooked mapping.";
+            return;
+        }
+
+        auto lease = std::make_shared<CookedCPULease>();
+        lease->reservation = job->reservation;
+        const auto snapshot = acquired.lease->Metadata();
+
+        if(job->identity.mode == PreparationMode::Geometry)
+        {
+            if(job->cacheHit)
+            {
+                lease->geometry = job->geometry;
+            }
+            else
+            {
+                const auto decoded = CookedMesh::Decode(acquired.lease->Bytes(), policy);
+
+                if(decoded.status != CookedMesh::Status::Success)
+                {
+                    status = MapStatus(decoded.status);
+                    error = decoded.message;
+                    return;
+                }
+
+                if(decoded.evidence != job->identity.cooked->payload)
+                {
+                    status = Status::Corrupt;
+                    error = "Decoded cooked identity differs from requested payload evidence.";
+                    return;
+                }
+
+                lease->geometry = decoded.geometry;
+            }
+
+            if(lease->geometry->vertices.size() != snapshot->vertexCount || lease->geometry->indices.size() != snapshot->indexCount ||
+                lease->geometry->metadata != snapshot->metadata ||
+                lease->geometry->boundsMin.x != snapshot->boundsMin.x ||
+                lease->geometry->boundsMin.y != snapshot->boundsMin.y ||
+                lease->geometry->boundsMin.z != snapshot->boundsMin.z ||
+                lease->geometry->boundsMax.x != snapshot->boundsMax.x ||
+                lease->geometry->boundsMax.y != snapshot->boundsMax.y ||
+                lease->geometry->boundsMax.z != snapshot->boundsMax.z)
+            {
+                status = Status::Corrupt;
+                error = "Cached/decoded cooked geometry differs from exact payload metadata.";
+                return;
+            }
+        }
+
+        retained = sizeof(CookedCPULease) + sizeof(CookedMetadataLease) + sizeof(CookedMesh::MetadataSnapshot) + 256 +
+            ProjectMeshCPUCache::MetadataBytes(snapshot->metadata);
+
+        if(retained > limits.preparationBytes)
+        {
+            status = Status::AdmissionLimit;
+            error = "Cooked retained metadata exceeds service allocation limits.";
+            return;
+        }
+
+        if(lease->geometry)
+        {
+            const auto geometryBytes = ProjectMeshCPUCache::GeometryBytes(*lease->geometry);
+
+            if(geometryBytes > limits.geometryBytes || geometryBytes > limits.preparationBytes - retained)
+            {
+                status = Status::AdmissionLimit;
+                error = "Cooked retained geometry exceeds service allocation limits.";
+                return;
+            }
+
+            retained += geometryBytes;
+        }
+
+        acquired.lease.reset(); // Do not retain encoded bytes with completion/cache output.
+        status = CheckCooked(*job->provider, *job->identity.cooked, error);
+        if(status != Status::Available) { return; }
+        auto metadataLease = std::make_shared<CookedMetadataLease>();
+        metadataLease->reservation = job->reservation;
+        metadataLease->metadata = snapshot;
+        metadata = {metadataLease, snapshot.get()};
+        if(lease->geometry) { geometry = {lease, lease->geometry.get()}; }
+    }
+
     void Run()
     {
         for (;;)
@@ -179,67 +465,80 @@ struct ProjectMeshPreparationService::State
             std::string error;
             Status status = Status::Available;
             std::shared_ptr<const ImportedMesh> geometry;
+            std::shared_ptr<const CookedMesh::MetadataSnapshot> metadata;
             size_t retainedBytes = 0;
 
             try
             {
-                // Only copied, canonical source information reaches this worker.
-                // The live registry, cache, scene, and renderer are never accessed.
-                SourcePin source(job->identity.path);
-
-                if (std::filesystem::canonical(job->identity.path) != job->identity.path ||
-                    source.Identity(limits.sourceBytes) != job->identity.sourceIdentity)
+                if(job->identity.sourceKind == MeshPreparationSourceKind::Cooked)
                 {
-                    status = Status::Stale;
-                    throw std::runtime_error("Mesh source identity changed before preparation.");
+                    PrepareCooked(job, status, error, geometry, metadata, retainedBytes);
                 }
-
-                digest = Digest(job->identity.path);
-
-                if (stage == Stage::Verify)
+                else
                 {
-                    if (digest != job->identity.digest)
-                    {
-                        status = Status::Stale;
-                        throw std::runtime_error("Cached mesh source digest changed before completion.");
-                    }
+                    // Only copied, canonical source information reaches this worker.
+                    // The live registry, cache, scene, and renderer are never accessed.
+                    SourcePin source(job->identity.path);
 
-                    geometry = job->geometry;
-                }
-
-                if (stage == Stage::Import)
-                {
-                    if (digest != job->identity.digest)
-                    {
-                        status = Status::Stale;
-                        throw std::runtime_error("Mesh source digest changed before import.");
-                    }
-
-                    auto lease = std::make_shared<GeometryLease>();
-                    lease->reservation = job->reservation;
-                    // ModelImporter uses a separate Assimp::Importer per call;
-                    // it installs no global logger, IO handler, or shared scene.
-                    lease->imported = ModelImporter::LoadFlattened(job->identity.path, job->identity.uvPolicy, limits.geometryBytes);
-
-                    if (ProjectMeshCPUCache::GeometryBytes(lease->imported) > limits.geometryBytes)
-                    {
-                        throw std::runtime_error("Prepared mesh exceeds the configured geometry limit.");
-                    }
-
-                    if (Digest(job->identity.path) != digest ||
+                    if (std::filesystem::canonical(job->identity.path) != job->identity.path ||
                         source.Identity(limits.sourceBytes) != job->identity.sourceIdentity)
                     {
                         status = Status::Stale;
-                        throw std::runtime_error("Mesh source changed during import.");
+                        throw std::runtime_error("Mesh source identity changed before preparation.");
                     }
 
-                    geometry = std::shared_ptr<const ImportedMesh>(lease, &lease->imported);
-                }
+                    digest = Digest(job->identity.path);
 
-                if (geometry)
-                {
-                    retainedBytes = ProjectMeshCPUCache::GeometryBytes(*geometry);
+                    if (stage == Stage::Verify)
+                    {
+                        if (digest != job->identity.digest)
+                        {
+                            status = Status::Stale;
+                            throw std::runtime_error("Cached mesh source digest changed before completion.");
+                        }
+
+                        geometry = job->geometry;
+                    }
+
+                    if (stage == Stage::Import)
+                    {
+                        if (digest != job->identity.digest)
+                        {
+                            status = Status::Stale;
+                            throw std::runtime_error("Mesh source digest changed before import.");
+                        }
+
+                        auto lease = std::make_shared<GeometryLease>();
+                        lease->reservation = job->reservation;
+                        // ModelImporter uses a separate Assimp::Importer per call;
+                        // it installs no global logger, IO handler, or shared scene.
+                        lease->imported = ModelImporter::LoadFlattened(job->identity.path, job->identity.uvPolicy, limits.geometryBytes);
+
+                        if (ProjectMeshCPUCache::GeometryBytes(lease->imported) > limits.geometryBytes)
+                        {
+                            throw std::runtime_error("Prepared mesh exceeds the configured geometry limit.");
+                        }
+
+                        if (Digest(job->identity.path) != digest ||
+                            source.Identity(limits.sourceBytes) != job->identity.sourceIdentity)
+                        {
+                            status = Status::Stale;
+                            throw std::runtime_error("Mesh source changed during import.");
+                        }
+
+                        geometry = std::shared_ptr<const ImportedMesh>(lease, &lease->imported);
+                    }
+
+                    if (geometry)
+                    {
+                        retainedBytes = ProjectMeshCPUCache::GeometryBytes(*geometry);
+                    }
                 }
+            }
+            catch (const std::bad_alloc&)
+            {
+                status = job->identity.sourceKind == MeshPreparationSourceKind::Cooked ? Status::AllocationFailure : Status::Failed;
+                error = "Allocation"; // SSO diagnostic remains available on allocation failure.
             }
             catch (const std::exception& exception)
             {
@@ -273,12 +572,13 @@ struct ProjectMeshPreparationService::State
             }
             else
             {
-                if (geometry)
+                if (geometry || metadata)
                 {
                     job->reservation->Reduce(retainedBytes);
                 }
 
                 job->geometry = std::move(geometry);
+                job->metadata = std::move(metadata);
                 job->stage = Stage::Done;
             }
         }
@@ -287,6 +587,13 @@ struct ProjectMeshPreparationService::State
 
 ProjectMeshCPUCache::Key ProjectMeshPreparationService::Identity::CacheKey() const
 {
+    if(sourceKind == MeshPreparationSourceKind::Cooked)
+    {
+        if(!cooked) { throw std::invalid_argument("Cooked cache identity requires typed payload evidence."); }
+        return {std::filesystem::path(cooked->mapping.providerNamespace), cooked->assetID.ToString(), CookedDigest(cooked->payload),
+            cooked->payload.cookCompatibility, MeshUVOrientation::PreserveSource, MeshPreparationSourceKind::Cooked};
+    }
+
     return {project, assetID, digest, importerRevision, uvPolicy};
 }
 
@@ -447,79 +754,7 @@ ProjectMeshPreparationService::RequestResult ProjectMeshPreparationService::Requ
         identity.assetID = asset.ToString();
         identity.sourceIdentity = source.Identity(state.limits.sourceBytes);
 
-        std::lock_guard lock(state.mutex);
-        std::erase_if(state.tokens, [](const auto& entry) { return entry.second.expired(); });
-        std::erase_if(state.jobs, [](const auto& weak) { return weak.expired(); });
-
-        if (state.tokens.size() >= state.limits.requests || state.nextTicket == UINT64_MAX)
-        {
-            return {Status::Retry, 0, "Mesh subscriber capacity exhausted."};
-        }
-
-        std::shared_ptr<State::Job> job;
-        size_t pending = 0;
-
-        for (const auto& weak : state.jobs)
-        {
-            if (const auto existing = weak.lock())
-            {
-                if (existing->stage != State::Stage::Done)
-                {
-                    ++pending;
-                }
-
-                auto comparable = existing->identity;
-                comparable.digest.clear();
-
-                if (comparable == identity && state.Wanted(existing))
-                {
-                    job = existing;
-                }
-            }
-        }
-
-        bool created = false;
-
-        if (!job)
-        {
-            if (pending >= state.limits.pending || state.Completed() >= state.limits.completed ||
-                state.bytes->load() > state.limits.retainedBytes - state.limits.preparationBytes)
-            {
-                return {Status::Retry, 0, "Mesh pending/completed capacity or consumer-held memory budget exhausted."};
-            }
-
-            job = std::make_shared<State::Job>();
-            job->identity = std::move(identity);
-            job->reservation = std::make_shared<Reservation>();
-            job->reservation->accounting = state.bytes;
-            job->reservation->bytes = state.limits.preparationBytes;
-            state.bytes->fetch_add(state.limits.preparationBytes);
-            state.jobs.push_back(job);
-            created = true;
-        }
-
-        const auto ticket = state.nextTicket++;
-        auto current = std::make_shared<std::atomic_bool>(true);
-        state.tokens.emplace(ticket, current);
-
-        try
-        {
-            state.subscribers.emplace(ticket, State::Subscriber{job, current, generation});
-
-            if (created)
-            {
-                state.queue.push_back(job);
-            }
-        }
-        catch (...)
-        {
-            state.tokens.erase(ticket);
-            state.subscribers.erase(ticket);
-            throw;
-        }
-
-        state.wake.notify_one();
-        return {job->stage == State::Stage::Done && job->geometry ? Status::Available : Status::Accepted, ticket, {}};
+        return state.Submit(std::move(identity), generation);
     }
     catch (const std::bad_alloc&)
     {
@@ -529,6 +764,192 @@ ProjectMeshPreparationService::RequestResult ProjectMeshPreparationService::Requ
     {
         return {Status::Invalid, 0, exception.what()};
     }
+}
+
+ProjectMeshPreparationService::RequestResult ProjectMeshPreparationService::RequestCooked(
+    const CookedRequest& request, ProjectMeshCPUCache& cache)
+{
+    auto& state = *m_state;
+
+    if(!state.OnOwner() || !state.accepting || request.generation != state.generation)
+    {
+        return {Status::Stale, 0, "Cooked request owner or subscriber generation is stale."};
+    }
+
+    if(!request.provider) { return {Status::Invalid, 0, "Cooked preparation requires an explicit provider snapshot."}; }
+    if(request.mode != PreparationMode::Geometry && request.mode != PreparationMode::MetadataOnly)
+    {
+        return {Status::Invalid, 0, "Unsupported cooked preparation mode."};
+    }
+
+    try
+    {
+        const auto lookup = request.provider->Lookup(request.asset);
+
+        if(lookup.status != DevelopmentCookedMesh::Status::Success)
+        {
+            return {MapStatus(lookup.status), 0, std::string(lookup.message)};
+        }
+
+        // Reserve for provider metadata validation plus full decoding while its
+        // payload and metadata are still alive. Check by subtraction, not overflow-
+        // prone addition. Provider acquisition is tightened to the service policy.
+        const auto payloadBytes = lookup.evidence->payload.payloadBytes;
+        constexpr size_t overhead = 1024 * 1024;
+        const size_t copies = request.mode == PreparationMode::Geometry ? 2 : 1;
+
+        if(payloadBytes > state.limits.preparationBytes || overhead > state.limits.preparationBytes - payloadBytes ||
+            state.limits.geometryBytes > (state.limits.preparationBytes - payloadBytes - overhead) / copies)
+        {
+            return {Status::AdmissionLimit, 0, "Cooked payload/geometry/metadata peak exceeds service preparation budget."};
+        }
+
+        Identity identity;
+        identity.sourceKind = MeshPreparationSourceKind::Cooked;
+        identity.mode = request.mode;
+        identity.cooked = lookup.evidence;
+        identity.assetID = request.asset.ToString();
+
+        identity.importerRevision = 0;
+        identity.uvPolicy = MeshUVOrientation::PreserveSource;
+        std::shared_ptr<const ImportedMesh> cached;
+
+        if(request.mode == PreparationMode::Geometry)
+        {
+            cached = cache.FindVerified(identity.CacheKey());
+            if(cached && ProjectMeshCPUCache::GeometryBytes(*cached) > state.limits.geometryBytes) { cached.reset(); }
+        }
+
+        return state.Submit(std::move(identity), request.generation, request.provider, std::move(cached));
+    }
+    catch(const std::bad_alloc&) { return {Status::AllocationFailure, 0, "Allocation"}; }
+    catch(const std::exception& error) { return {Status::Invalid, 0, error.what()}; }
+}
+
+ProjectMeshPreparationService::Status ProjectMeshPreparationService::ValidateCookedCompletion(
+    const Completion& completion, std::string& error) const try
+{
+    error.clear();
+
+    if(!m_state->OnOwner() || !m_state->accepting || completion.generation != Generation())
+    {
+        error = "Cooked completion service/session generation is stale.";
+        return Status::Stale;
+    }
+
+    if(!completion.current || !completion.current->load())
+    {
+        error = "Cooked completion was canceled or invalidated.";
+        return Status::Canceled;
+    }
+
+    if(completion.identity.sourceKind != MeshPreparationSourceKind::Cooked || !completion.identity.cooked || !completion.provider ||
+        completion.identity.assetID != completion.identity.cooked->assetID.ToString() ||
+        (completion.metadata && completion.metadata->evidence != completion.identity.cooked->payload))
+    {
+        error = "Cooked completion source/mapping/metadata evidence is incomplete or inconsistent.";
+        return Status::Invalid;
+    }
+
+    return CheckCooked(*completion.provider, *completion.identity.cooked, error);
+}
+catch(const std::bad_alloc&)
+{
+    error.clear();
+    return Status::AllocationFailure;
+}
+
+#ifndef NDEBUG
+ProjectMeshPreparationService::DiagnosticStage ProjectMeshPreparationService::ObserveDiagnosticStage(std::uint64_t ticket) const
+{
+    auto& state = *m_state;
+    if(!state.OnOwner()) { return DiagnosticStage::Missing; }
+    std::lock_guard lock(state.mutex);
+    const auto found = state.subscribers.find(ticket);
+    if(found == state.subscribers.end()) { return DiagnosticStage::Missing; }
+    const auto& job = found->second.job;
+    if(job->stage == State::Stage::Done) { return DiagnosticStage::Completed; }
+    return std::find(state.queue.begin(), state.queue.end(), job) != state.queue.end() ?
+        DiagnosticStage::Queued : DiagnosticStage::Running;
+}
+#endif
+
+ProjectMeshPreparationService::Completion ProjectMeshPreparationService::PollCooked(std::uint64_t ticket) try
+{
+    auto& state = *m_state;
+    Completion result;
+    result.ticket = ticket;
+
+    if(!state.OnOwner())
+    {
+        result.status = Status::Invalid;
+        result.error = "Cooked polling requires the owner thread.";
+        return result;
+    }
+
+    std::shared_ptr<State::Job> job;
+
+    {
+        std::lock_guard lock(state.mutex);
+        const auto found = state.subscribers.find(ticket);
+
+        if(found == state.subscribers.end())
+        {
+            result.status = Status::Canceled;
+            result.error = "Cooked request canceled, invalidated or already delivered.";
+            return result;
+        }
+
+        job = found->second.job;
+
+        if(job->identity.sourceKind != MeshPreparationSourceKind::Cooked)
+        {
+            result.status = Status::Invalid;
+            result.error = "FBX requests require the existing Poll API.";
+            return result;
+        }
+
+        result.generation = found->second.generation;
+        result.current = found->second.current;
+
+        if(job->stage != State::Stage::Done) { return result; }
+        result.identity = job->identity;
+        result.provider = job->provider;
+        result.geometry = job->geometry;
+        result.metadata = job->metadata;
+
+        result.cacheHit = job->cacheHit;
+        result.status = job->status;
+        result.error = job->error;
+    }
+
+    if(result.status == Status::Available)
+    {
+        const auto validity = ValidateCookedCompletion(result, result.error);
+        if(validity != Status::Available) { result.status = validity; }
+    }
+
+    if(result.status != Status::Available)
+    {
+        result.geometry.reset();
+        result.metadata.reset();
+    }
+
+    {
+        std::lock_guard lock(state.mutex);
+        state.subscribers.erase(ticket);
+    }
+
+    state.wake.notify_one();
+    return result;
+}
+catch(const std::bad_alloc&)
+{
+    Cancel(ticket);
+    Completion failure;
+    failure.ticket = ticket;
+    failure.status = Status::AllocationFailure;
+    return failure;
 }
 
 ProjectMeshPreparationService::Completion ProjectMeshPreparationService::Poll(std::uint64_t ticket,
@@ -559,6 +980,12 @@ ProjectMeshPreparationService::Completion ProjectMeshPreparationService::Poll(st
         }
 
         job = found->second.job;
+        if(job->identity.sourceKind != MeshPreparationSourceKind::FBX)
+        {
+            result.status = Status::Invalid;
+            result.error = "Cooked requests require PollCooked.";
+            return result;
+        }
         result.generation = found->second.generation;
         result.current = found->second.current;
         result.cacheHit = job->cacheHit;
@@ -667,8 +1094,12 @@ ProjectMeshPreparationService::Completion ProjectMeshPreparationService::Poll(st
 
 bool ProjectMeshPreparationService::IsCurrent(const Completion& completion) const
 {
-    return m_state->OnOwner() && m_state->accepting && completion.generation == Generation() &&
+    const bool current = m_state->OnOwner() && m_state->accepting && completion.generation == Generation() &&
         completion.current && completion.current->load();
+
+    if(!current || completion.identity.sourceKind == MeshPreparationSourceKind::FBX) { return current; }
+    std::string error;
+    return ValidateCookedCompletion(completion, error) == Status::Available;
 }
 
 bool ProjectMeshPreparationService::IntegrateCache(Completion& completion, ProjectMeshCPUCache& cache,
@@ -677,7 +1108,7 @@ bool ProjectMeshPreparationService::IntegrateCache(Completion& completion, Proje
     error.clear();
 
     if (!IsCurrent(completion) || completion.status != Status::Available || !completion.geometry ||
-        completion.identity.digest.empty())
+        (completion.identity.sourceKind == MeshPreparationSourceKind::FBX && completion.identity.digest.empty()))
     {
         error = "Only a current, validated mesh completion can enter the CPU cache.";
         return false;

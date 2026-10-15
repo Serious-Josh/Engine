@@ -52,8 +52,19 @@ FetchContent_MakeAvailable(nlohmann_json)
 add_executable(Engine
     src/main.cpp
     src/Engine/Engine.cpp
+    src/Engine/CookedMeshGPUVerification.cpp
+    src/Engine/CookedMeshLifecycleVerification.cpp
     src/assets/ProjectTexturePreparationService.cpp
+    src/assets/ProjectMaterialPreparationService.cpp
+    src/Renderer/MaterialAdmission.cpp
+    src/Engine/MaterialAdmissionVerification.cpp
     src/assets/ProjectMeshPreparationService.cpp
+    src/assets/CookedMesh.cpp
+    src/assets/DevelopmentCookedMeshProvider.cpp
+    $<$<CONFIG:Debug>:src/assets/CookedMeshVerification.cpp>
+    $<$<CONFIG:Debug>:src/assets/OfflineMeshCooker.cpp>
+    $<$<CONFIG:Debug>:src/assets/DevelopmentCookedMeshProviderVerification.cpp>
+    $<$<CONFIG:Debug>:src/assets/CookedMeshPreparationVerification.cpp>
     src/Scene/FileSceneTextureStreaming.cpp
     src/Platform/Windows/WindowsWindow.cpp
     src/Core/Time.cpp
@@ -121,6 +132,7 @@ add_executable(Engine
     src/Renderer/Passes/ShadowDenoisePass.cpp
     src/Renderer/ComputePipeline.cpp
     src/Editor/Editor.cpp
+    src/Editor/ViewportMaterialDrop.cpp
     src/Editor/EditorWorkspace.cpp
     src/Editor/SceneHierarchyPanel.cpp
     src/Editor/InspectorPanel.cpp
@@ -174,7 +186,12 @@ add_executable(Engine
     src/Scene/FileSceneAssetCatalog.cpp
     src/Scene/SceneMetadataPreparation.cpp
     src/Scene/MeshResidency.cpp
+    src/Scene/CookedMeshCatalogPreparation.cpp
     src/Scene/MeshResidencyPublication.cpp
+    src/Scene/SceneMaterialBindingPublication.cpp
+    src/Engine/MaterialBindingVerification.cpp
+    src/Engine/ViewportMaterialAssignment.cpp
+    src/Engine/ViewportMaterialDropVerification.cpp
     src/DemoContent/FileBackedDemoScene.cpp
     src/assets/AssetID.cpp
     src/assets/AssetRecord.cpp
