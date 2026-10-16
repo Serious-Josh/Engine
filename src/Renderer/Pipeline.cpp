@@ -195,7 +195,7 @@ bool Pipeline::Initialize(
     pipelineDescription.DepthStencilState = depthStencilDescription;
     pipelineDescription.InputLayout.pInputElementDescs = inputElements.data();
     pipelineDescription.InputLayout.NumElements = static_cast<UINT>(inputElements.size());
-    pipelineDescription.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pipelineDescription.PrimitiveTopologyType = description.topologyType;
 
     pipelineDescription.NumRenderTargets = description.renderTargets.count;
 

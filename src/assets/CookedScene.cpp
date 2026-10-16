@@ -13,7 +13,8 @@ namespace CookedScene
 {
 namespace
 {
-    constexpr char Magic[] = "ENGSCN01";
+    constexpr char LegacyMagic[] = "ENGSCN01";
+    constexpr char Magic[] = "ENGSCN02";
     constexpr size_t Header = 32;
     void Require(bool ok, const char* message) { if(!ok) throw std::runtime_error(message); }
     bool MaterialReference(std::string_view s) { return s.empty() || s=="builtin:default" || (AssetID::ParseReference(s) && AssetID::ParseReference(s)->ToReference()==s); }
@@ -56,7 +57,10 @@ namespace
     void Validate(const Metadata& m,const Policy& p)
     {
         std::string error;
-        Require(ValidateSceneDocument(m.document,&error),"Invalid cooked scene document/settings/identity.");
+        if (!ValidateSceneDocument(m.document, &error))
+        {
+            throw std::runtime_error("Invalid cooked scene document: " + error);
+        }
         Require(m.document.objects.size()<=p.maxObjects && m.meshes.size()==m.document.objects.size(),"Invalid cooked scene object count.");
         for(size_t i=0;i<m.meshes.size();++i)
         {
@@ -75,6 +79,81 @@ namespace
             for(const auto& [slot,ref]:o.materialSlotBindings) Require(slots.contains(slot) && AssetID::ParseReference(ref) && AssetID::ParseReference(ref)->ToReference()==ref,"Unknown slot or invalid material assignment.");
         }
     }
+
+    void WritePhysicsComponent(Writer& writer, const std::optional<Physics::PhysicsComponent>& component)
+    {
+        writer.U(component.has_value() ? 1 : 0, 4);
+        if (!component)
+        {
+            return;
+        }
+
+        // Wire enum values are explicit and independent of C++ enum ordering.
+        switch (component->bodyType)
+        {
+        case Physics::BodyType::Static:
+            writer.U(0, 4);
+            break;
+        case Physics::BodyType::Dynamic:
+            writer.U(1, 4);
+            break;
+        case Physics::BodyType::Kinematic:
+            writer.U(2, 4);
+            break;
+        default:
+            throw std::runtime_error("Unsupported cooked physics body type.");
+        }
+        writer.U(0, 4); // ColliderType::Box; validation has already rejected other types.
+        writer.F(component->boxDimensions.width);
+        writer.F(component->boxDimensions.height);
+        writer.F(component->boxDimensions.depth);
+        writer.V(component->colliderLocalPositionOffset);
+        writer.F(component->density);
+        writer.F(component->friction);
+        writer.F(component->restitution);
+    }
+
+    std::optional<Physics::PhysicsComponent> ReadPhysicsComponent(Reader& reader)
+    {
+        const auto presence = reader.U(4);
+        Require(presence <= 1, "Invalid cooked physics presence flag.");
+        if (presence == 0)
+        {
+            return std::nullopt;
+        }
+
+        Physics::PhysicsComponent component;
+        switch (reader.U(4))
+        {
+        case 0:
+            component.bodyType = Physics::BodyType::Static;
+            break;
+        case 1:
+            component.bodyType = Physics::BodyType::Dynamic;
+            break;
+        case 2:
+            component.bodyType = Physics::BodyType::Kinematic;
+            break;
+        default:
+            throw std::runtime_error("Unsupported cooked physics body type.");
+        }
+        Require(reader.U(4) == 0, "Unsupported cooked physics collider type.");
+        component.boxDimensions.width = reader.F();
+        component.boxDimensions.height = reader.F();
+        component.boxDimensions.depth = reader.F();
+        component.colliderLocalPositionOffset = reader.V();
+        component.density = reader.F();
+        component.friction = reader.F();
+        component.restitution = reader.F();
+
+        std::string error;
+        if (!Physics::ValidatePhysicsComponent(component, &error))
+        {
+            throw std::runtime_error("Invalid cooked physics: " + error);
+        }
+        return component;
+    }
+
     std::vector<std::byte> Encode(const Metadata& m,const Policy& p)
     {
         Validate(m,p); Writer w{p,{}};
@@ -97,6 +176,7 @@ namespace
                 w.U(mesh->slots.size(),4);
                 for(const auto& slot:mesh->slots) { w.Text(slot.id); w.Text(slot.name); w.U(slot.sourceMaterialIndex,4); }
             }
+            WritePhysicsComponent(w, o.physics);
         }
         if(m.environment)
         { w.Text(d.environmentReference); w.U(m.environment->generation,8); for(auto b:m.environment->sha256) w.U(std::to_integer<unsigned>(b),1); }
@@ -152,10 +232,20 @@ std::vector<std::byte> CookFile(const std::filesystem::path& file,std::span<cons
 Metadata Decode(std::span<const std::byte> bytes,const Policy& p)
 {
     Require(bytes.size()>=Header && bytes.size()<=p.maxBytes,"Cooked scene byte limit or truncated header.");
-    Reader r{bytes,p}; for(size_t i=0;i<8;++i) Require(r.U(1)==static_cast<unsigned char>(Magic[i]),"Invalid cooked scene magic.");
-    Require(r.U(4)==Version,"Unsupported cooked scene version."); Require(r.U(4)==Header && r.U(8)==bytes.size(),"Invalid cooked scene header/size.");
+    Reader r{bytes,p};
+    std::string magic;
+    for (size_t index = 0; index < 8; ++index)
+    {
+        magic.push_back(static_cast<char>(r.U(1)));
+    }
+    const auto payloadVersion = static_cast<std::uint32_t>(r.U(4));
+    Require(IsSupportedVersion(payloadVersion), "Unsupported cooked scene version.");
+    Require(magic == (payloadVersion == LegacyVersion ? LegacyMagic : Magic), "Invalid cooked scene magic/version pair.");
+    Require(r.U(4)==Header && r.U(8)==bytes.size(),"Invalid cooked scene header/size.");
     const auto count=r.U(4); Require(count<=p.maxObjects && count<=(bytes.size()-Header)/64,"Invalid cooked scene count."); const auto flags=r.U(4); Require(flags<=1,"Unsupported cooked scene flags.");
-    Metadata m; auto& d=m.document; d.id=r.Text(); d.name=r.Text();
+    Metadata m;
+    m.payloadVersion = payloadVersion;
+    auto& d=m.document; d.id=r.Text(); d.name=r.Text();
     d.camera.position=r.V(); d.camera.target=r.V(); d.camera.verticalFov=r.F(); d.camera.aspectRatio=r.F(); d.camera.nearPlane=r.F(); d.camera.farPlane=r.F();
     d.directionalLight.direction=r.V(); d.directionalLight.color=r.V(); d.directionalLight.intensity=r.F(); d.directionalLight.ambientStrength=r.F(); d.directionalLight.angularRadius=r.F();
     d.objects.reserve(static_cast<size_t>(count)); m.meshes.reserve(static_cast<size_t>(count));
@@ -178,6 +268,11 @@ Metadata Decode(std::span<const std::byte> bytes,const Policy& p)
             mesh->slots.reserve(static_cast<size_t>(slots));
             for(size_t j=0;j<slots;++j) { MeshMaterialSlot slot; slot.id=r.Text(); slot.name=r.Text(); slot.sourceMaterialIndex=static_cast<std::uint32_t>(r.U(4)); mesh->slots.push_back(std::move(slot)); }
         }
+        // Version 1 has no physics bytes. Never consume v2 records from that layout.
+        if (payloadVersion == Version)
+        {
+            o.physics = ReadPhysicsComponent(r);
+        }
         d.objects.push_back(std::move(o)); m.meshes.push_back(std::move(mesh));
     }
     if(flags&1) { d.environmentReference=r.Text(); EnvironmentBinding env; env.generation=r.U(8); for(auto& b:env.sha256) b=std::byte(r.U(1)); Require(!d.environmentReference.empty() && env.generation,"Invalid environment binding."); m.environment=env; }
@@ -189,7 +284,8 @@ bool ArchiveScene::ValidateReferences(std::string* error) const
     if(metadata.meshes.size()!=metadata.document.objects.size()) return fail("Archive scene mesh/object count mismatch.");
     if(!provider || !generation) return fail("Archive scene ownership/generation missing.");
     const auto* scene=provider->ArchiveEntry(sceneAsset);
-    if(!scene || scene->type!=EngineAssetPak::Type::Scene || scene->payloadVersion!=Version || scene->generation!=generation)
+    if(!scene || scene->type!=EngineAssetPak::Type::Scene || !IsSupportedVersion(scene->payloadVersion) ||
+        scene->payloadVersion != metadata.payloadVersion || scene->generation!=generation)
         return fail("Stale archive scene entry/type/version/generation.");
     if(!metadata.document.environmentReference.empty())
     {
@@ -216,8 +312,8 @@ std::shared_ptr<const ArchiveScene> OpenArchive(const std::filesystem::path& toc
     const auto opened=CookedMeshSource::ArchiveProvider::OpenArchive(toc,pak);
     Require(bool(opened.provider),"Cannot open cooked scene archive pair.");
     const auto* entry=opened.provider->ArchiveEntry(id);
-    Require(entry && entry->type==EngineAssetPak::Type::Scene && entry->payloadVersion==Version,"Missing or unsupported cooked scene entry.");
-    auto bytes=opened.provider->ReadEntry(id,EngineAssetPak::Type::Scene,Version,p.maxBytes);
+    Require(entry && entry->type==EngineAssetPak::Type::Scene && IsSupportedVersion(entry->payloadVersion),"Missing or unsupported cooked scene entry.");
+    auto bytes=opened.provider->ReadEntry(id,EngineAssetPak::Type::Scene,entry->payloadVersion,p.maxBytes);
     auto result=std::shared_ptr<const ArchiveScene>(new ArchiveScene(id,entry->generation,opened.provider,Decode(bytes,p)));
     std::string error; if(!result->ValidateReferences(&error)) throw std::runtime_error("Cooked scene reference validation: "+error); return result;
 }

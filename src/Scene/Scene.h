@@ -47,6 +47,12 @@ class Scene
     const std::vector<RenderObjectID>& GetChangedTransforms() const;
     void ClearChangedTransforms();
 
+    bool HasPhysicsPresentation() const noexcept { return m_physicsPresentationActive; }
+    const std::vector<RenderObjectID>& GetChangedPresentationTransforms() const noexcept
+    {
+        return m_changedPresentationTransforms;
+    }
+
     uint64_t GetStructureRevision() const;
 
     std::vector<RenderObject>& GetRenderObjects();
@@ -73,6 +79,15 @@ class Scene
     }
 
     private:
+    friend class FileSceneRuntime;
+    friend class PresentationTransformVerification;
+    friend class ColliderVisualizationVerification;
+    friend class MarqueeSelectionVerification;
+    // Preparation allocates before acceptance; commit only copies value types.
+    void PreparePresentationCommit();
+    void CommitPresentation(std::span<const std::optional<Physics::Pose>> poses, bool active) noexcept;
+    std::vector<RenderObjectID> m_changedPresentationTransforms;
+    bool m_physicsPresentationActive = false;
     std::string m_environmentReference;
     std::vector<RenderObject> m_renderObjects;
 

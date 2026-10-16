@@ -3,6 +3,7 @@
 #include "assets/MaterialAssetSerializer.h"
 #include "assets/ProjectAssetResolver.h"
 #include "Project/ProjectPaths.h"
+#include "Scene/SceneDocument.h"
 
 #include <Windows.h>
 #include <set>
@@ -189,7 +190,10 @@ bool ProjectAssetReconciliation::Run(
                 throw std::runtime_error(entry.path().string() + ": " + exception.what());
             }
 
-            if(!document.is_object() || document.at("schemaVersion") != 1)
+            const auto& schemaVersion = document.at("schemaVersion");
+            const bool supportedSchema = schemaVersion.is_number_integer() &&
+                (schemaVersion == 1 || (!material && schemaVersion == SceneDocument::kSchemaVersion));
+            if(!document.is_object() || !supportedSchema)
             {
                 throw std::runtime_error("Unsupported document schema: " + entry.path().string());
             }

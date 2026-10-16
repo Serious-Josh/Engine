@@ -6,7 +6,13 @@
 
 namespace CookedScene
 {
-    inline constexpr std::uint32_t Version = 1;
+    inline constexpr std::uint32_t LegacyVersion = 1;
+    inline constexpr std::uint32_t Version = 2;
+
+    constexpr bool IsSupportedVersion(std::uint32_t version)
+    {
+        return version == LegacyVersion || version == Version;
+    }
     struct Policy
     {
         size_t maxBytes = 16 * 1024 * 1024, maxObjects = 8192, maxStringBytes = 4096, maxSlots = 4096;
@@ -32,6 +38,8 @@ namespace CookedScene
         std::optional<EnvironmentBinding> environment;
         // Same order/count as document objects; no mesh means nullopt.
         std::vector<std::optional<MeshBinding>> meshes;
+        // Retained to verify archive entry metadata against the decoded payload header.
+        std::uint32_t payloadVersion = Version;
     };
     struct ArchiveScene
     {

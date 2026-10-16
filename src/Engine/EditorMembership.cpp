@@ -1,4 +1,6 @@
 #include "Engine/Engine.h"
+#include "Editor/ScenePrimitiveCreation.h"
+#include "Project/ProjectPaths.h"
 #include "DemoContent/FileBackedDemoScene.h"
 #include "Core/Log.h"
 #include "Scene/SceneDocumentAdapter.h"
@@ -8,6 +10,12 @@
 bool Engine::BeginEditorMembership(Editor::HistoryReplayRequest request,bool replay,std::string& error,
     std::optional<SceneObjectMetadata> deletion)
 {
+    if (PhysicsBlocksSceneEdits())
+    {
+        error = "Stop physics before changing scene membership or replaying history.";
+        return false;
+    }
+
     try
     {
     const auto identity=GetSceneObjectRestorationIdentity();
@@ -115,4 +123,61 @@ bool Engine::AdvanceEditorMembership()
     }
     catch(const std::bad_alloc&) { CancelEditorMembership("Membership allocation failed; scene unchanged."); return true; }
     catch(const std::exception& e) { CancelEditorMembership(e.what()); return false; }
+}
+
+
+bool Engine::BeginPrimitiveCreation(const Editor::PrimitiveCreationRequest& intent, std::string& error)
+{
+    error.clear();
+    try
+    {
+        auto* owner = dynamic_cast<FileBackedDemoScene*>(m_demoSceneManager.TryGetActiveScene());
+        if(PhysicsBlocksSceneEdits() || m_editor.IsPhysicsEditingLocked() || m_state != EngineState::Running ||
+            !owner || owner->IsArchiveActivation() || owner->GetRuntimeIdentity() != intent.runtimeIdentity ||
+            intent.historyEpoch != m_editor.GetSceneHistoryEpoch() || m_pendingEditorMembership ||
+            m_pendingSceneObjectCreation || m_pendingSceneObjectDeletion || m_pendingSceneObjectRestoration ||
+            m_pendingMaterialAssignment || m_pendingEditorSceneOperation || m_demoSceneManager.HasPendingSceneChange() ||
+            m_editor.HasBlockingObjectCreation() || m_editor.HasBlockingMaterialOperation() ||
+            m_editor.HasPendingSceneHistoryOperation() || owner->m_objectMutationCandidate ||
+            owner->m_runtime->HasPreparedScene() || owner->m_runtime->HasMaterialAssignment())
+        {
+            error = "Primitive creation requires a stopped editable scene without pending operations or transform gestures.";
+            return false;
+        }
+        const auto project = std::filesystem::canonical(owner->m_projectRoot);
+        if(!m_editor.CanPreserveSceneHistory(*owner, project, intent.historyEpoch))
+        {
+            error = "Primitive creation belongs to a stale scene history session.";
+            return false;
+        }
+        std::string reference;
+        if(!PrimitiveMeshAssets::Ensure(ProjectPaths(project), m_projectAssetRegistry, intent.primitive, reference, error))
+            return false;
+        SceneDocument document;
+        if(!CaptureSceneDocument(owner->m_runtime->GetFileScene().GetDocument(), owner->GetScene(),
+            owner->m_runtime->GetObjectMapping(), document, &error)) return false;
+
+        Editor::HistoryReplayRequest request;
+        request.object = PreparePrimitiveObject(document, intent.primitive, reference);
+        request.insertionIndex = document.objects.size();
+        request.membership = true;
+        request.identity = {m_editor.AllocateSceneHistoryOperationID(), intent.historyEpoch, false, request.object.id};
+        const auto previous = owner->GetObjectMetadata(m_editor.GetSelectedObject());
+        const auto selectionBefore = previous ? std::optional<std::string>{previous->objectID} : std::nullopt;
+        if(!m_editor.StageObjectDeletionHistory(request.object, request.insertionIndex, selectionBefore, request.object.id,
+            request.identity.operationID, intent.historyEpoch, false, error, true)) return false;
+        const auto operationID = request.identity.operationID;
+        if(!BeginEditorMembership(std::move(request), false, error))
+        {
+            m_editor.CompleteObjectDeletionHistory(operationID, intent.historyEpoch, false, error);
+            return false;
+        }
+        m_editor.SetSceneOperationPending(true);
+        return true;
+    }
+    catch(const std::exception& exception)
+    {
+        error = exception.what();
+        return false;
+    }
 }

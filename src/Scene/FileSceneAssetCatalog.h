@@ -218,6 +218,7 @@ public:
 
 private:
     friend class SceneMaterialBindingPublication;
+    friend class PrimitiveCreationVerification;
     friend struct MaterialAdmissionState;
     friend class Renderer;
     std::map<std::string, std::string> m_admittedMaterialDigests;

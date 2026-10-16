@@ -426,6 +426,7 @@ void MeshResidencyPublication::ApplyPreparedPublication(Renderer& renderer, File
     }
 
     runtime.ApplyPreparedMeshResidency();
+    runtime.RevalidatePhysicsPresentationBindings(renderer);
 
     // The prepared pass is either empty after adoption or was never recorded.
     renderer.m_selectionMaskCandidate.reset();

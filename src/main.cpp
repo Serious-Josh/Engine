@@ -9,6 +9,14 @@
 
 #ifndef NDEBUG
 int VerifyCookedMesh();
+int VerifyScenePhysicsData();
+int VerifyPrimitiveCreation();
+int VerifyColliderVisualization();
+int VerifyViewportMarquee();
+int VerifyScenePhysicsPersistence();
+int VerifyPresentationTransforms();
+int VerifyPhysicsSimulationController();
+int VerifyEditorPhysicsIntegration();
 int CookProjectMeshes(const std::filesystem::path& projectRoot);
 int VerifyDevelopmentCookedMeshProvider(const std::filesystem::path& projectRoot);
 int VerifyCookedMeshPreparation(const std::filesystem::path& projectRoot);
@@ -16,6 +24,41 @@ int VerifyCookedMeshPreparation(const std::filesystem::path& projectRoot);
 
 int main(int argc, char** argv)
 {
+#ifndef NDEBUG
+    if (argc == 2 && std::string_view(argv[1]) == "--verify-viewport-marquee")
+    {
+        return VerifyViewportMarquee();
+    }
+    if (argc == 2 && std::string_view(argv[1]) == "--verify-collider-visualization")
+    {
+        return VerifyColliderVisualization();
+    }
+    if (argc == 2 && std::string_view(argv[1]) == "--verify-primitive-creation")
+    {
+        return VerifyPrimitiveCreation();
+    }
+    if (argc == 2 && std::string_view(argv[1]) == "--verify-editor-physics")
+    {
+        return VerifyEditorPhysicsIntegration();
+    }
+    if (argc == 2 && std::string_view(argv[1]) == "--verify-physics-simulation")
+    {
+        return VerifyPhysicsSimulationController();
+    }
+    if (argc == 2 && std::string_view(argv[1]) == "--verify-presentation-transforms")
+    {
+        return VerifyPresentationTransforms();
+    }
+    if (argc == 2 && std::string_view(argv[1]) == "--verify-scene-physics-persistence")
+    {
+        return VerifyScenePhysicsPersistence();
+    }
+    if (argc == 2 && std::string_view(argv[1]) == "--verify-scene-physics-data")
+    {
+        return VerifyScenePhysicsData();
+    }
+#endif
+
     if(argc>=2 && std::string_view(argv[1])=="--package-bootstrap")
     {
         if(argc!=7) { Log::Error("Usage: --package-bootstrap <input.toc> <input.eap> <output.toc> <output.eap> <authoring-shader-root>"); return 1; }

@@ -234,7 +234,7 @@ void SceneHierarchyPanel::DrawRenameInput()
 std::optional<std::size_t> SceneHierarchyPanel::Draw(const EditorWorkspaceRect& rectangle,
     const SceneHierarchySnapshot& snapshot, std::optional<std::size_t> selectedObject,
     const void* sceneIdentity, const std::string& error,
-    const HierarchyDragIdentity& dragIdentity, bool allowReorder)
+    const HierarchyDragIdentity& dragIdentity, bool allowReorder, bool allowCreation, std::span<const std::size_t> selectedObjects)
 {
     m_focused=false;
     if(rectangle.size.x <= 0.0f || rectangle.size.y <= 0.0f)
@@ -273,7 +273,29 @@ std::optional<std::size_t> SceneHierarchyPanel::Draw(const EditorWorkspaceRect& 
     {
         m_focused=ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
         EditorWorkspace::KeepCurrentWindowBehindFloatingUI();
+        // Keep the button on the right of the content header; title bar, scrolling and row menus stay standard ImGui.
+        const float buttonWidth=ImGui::GetFrameHeight();
+        const auto headerStart=ImGui::GetCursorPos();
+        const float available=ImGui::GetContentRegionAvail().x;
+        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + (std::max)(1.0f,available-buttonWidth-ImGui::GetStyle().ItemSpacing.x));
         ImGui::TextUnformatted(snapshot.sceneName.c_str());
+        ImGui::PopTextWrapPos();
+        const float afterTitle=ImGui::GetCursorPosY();
+        ImGui::SetCursorPos(ImVec2(headerStart.x+(std::max)(0.0f,available-buttonWidth),headerStart.y));
+        if(!allowCreation) ImGui::BeginDisabled();
+        if(ImGui::Button("+",ImVec2(buttonWidth,buttonWidth))) ImGui::OpenPopup("HierarchyCreate");
+        if(ImGui::BeginPopup("HierarchyCreate"))
+        {
+            if(ImGui::BeginMenu("Create Primitive"))
+            {
+                if(ImGui::MenuItem("Cube")) m_primitiveRequest=ScenePrimitive::Cube;
+                if(ImGui::MenuItem("Sphere")) m_primitiveRequest=ScenePrimitive::Sphere;
+                ImGui::EndMenu();
+            }
+            ImGui::EndPopup();
+        }
+        if(!allowCreation) ImGui::EndDisabled();
+        ImGui::SetCursorPosY((std::max)(afterTitle,headerStart.y+buttonWidth+ImGui::GetStyle().ItemSpacing.y));
         ImGui::Separator();
 
         if(!error.empty())
@@ -316,7 +338,9 @@ std::optional<std::size_t> SceneHierarchyPanel::Draw(const EditorWorkspaceRect& 
                     ImGui::PushID(entry.objectID.c_str());
                 }
 
-                const bool selected = entry.objectID.empty() ?
+                const bool selected = entry.runtimeIndex &&
+                    std::find(selectedObjects.begin(), selectedObjects.end(), *entry.runtimeIndex) != selectedObjects.end();
+                const bool primarySelected = entry.objectID.empty() ?
                     entry.runtimeIndex && selectedObject == entry.runtimeIndex : entry.objectID == selectedPersistentID;
                 ImGui::BeginDisabled(!entry.runtimeIndex);
                 const ImVec2 rowPosition = ImGui::GetCursorScreenPos();
@@ -329,7 +353,7 @@ std::optional<std::size_t> SceneHierarchyPanel::Draw(const EditorWorkspaceRect& 
                     continue;
                 }
 
-                if(ImGui::Selectable("##Object", selected, ImGuiSelectableFlags_None,
+                if(ImGui::Selectable("##Object", selected || primarySelected, ImGuiSelectableFlags_None,
                     ImVec2(0.0f, ImGui::GetFrameHeight())))
                 {
                     clickedObject = entry.runtimeIndex;
@@ -379,4 +403,9 @@ std::optional<std::size_t> SceneHierarchyPanel::Draw(const EditorWorkspaceRect& 
     ImGui::End();
     ImGui::PopStyleVar(2);
     return clickedObject;
+}
+
+std::optional<ScenePrimitive> SceneHierarchyPanel::TakePrimitiveRequest()
+{
+    return std::exchange(m_primitiveRequest,std::nullopt);
 }

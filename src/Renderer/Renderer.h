@@ -1,4 +1,5 @@
 #pragma once
+#include "Renderer/Passes/EditorColliderPass.h"
 #include "Debug/CpuFrameTiming.h"
 #include "Editor/TextureThumbnailCache.h"
 #include "Diagnostics/FrameHitchDiagnostics.h"
@@ -82,6 +83,8 @@ struct EnvironmentAsset
 
 struct RendererOptions
 {
+    const EditorColliderOverlay* editorColliderOverlay = nullptr; // Borrowed for this Render call only.
+
     std::optional<MaterialPreviewRequest> materialPreview;
 
     // Borrowed only for this Render call; Editor retains resources through GPU completion.
@@ -378,6 +381,16 @@ class Renderer
     void CancelMaterialAdmission();
     static constexpr size_t MaterialAdmissionLimit = 4096;
     bool CanEditPendingMaterialBindings(const Scene& scene) const noexcept;
+    struct SelectionPublicationIdentity
+    {
+        std::uint64_t rendererLifetime = 0;
+        std::uint64_t bindingEpoch = 0;
+    };
+    SelectionPublicationIdentity GetSelectionPublicationIdentity(const Scene& scene) const noexcept;
+    bool IsCommandRecordingActive() const noexcept
+    {
+        return m_activeRecordingGeneration != 0 || m_displacementExitScopeGeneration != 0;
+    }
     bool CopyMaterialTableSnapshot(std::uint64_t identity, std::vector<GPUMaterial>& records,
         std::string* errorMessage = nullptr) const;
     bool SubmitMaterialTableSnapshot(std::uint64_t identity, const std::vector<GPUMaterial>& records,
@@ -429,6 +442,8 @@ class Renderer
 
     private:
     friend class MeshResidencyPublication;
+    friend class FileSceneRuntime;
+    friend class PresentationTransformVerification;
     friend class SceneMembershipPublication;
     friend class SceneDuplicationVerification;
     friend class SceneMembershipVerification;
@@ -924,6 +939,7 @@ class Renderer
     DeferredLightingPass m_deferredLightingPass;
 
     ToneMapPass m_toneMapPass;
+    EditorColliderPass m_editorColliderPass;
 
     BRDFIntegrationPass m_brdfIntegrationPass;
 

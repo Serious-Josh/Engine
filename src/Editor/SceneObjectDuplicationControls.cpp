@@ -6,6 +6,11 @@
 #include <exception>
 void Editor::HandleSceneObjectDuplication(IDemoScene& scene)
 {
+    if (IsPhysicsEditingLocked())
+    {
+        return;
+    }
+
     const auto& io=ImGui::GetIO();
     const bool focused=(m_viewportFocused && !io.WantCaptureKeyboard) || m_hierarchyPanel.IsFocused();
     if(!io.KeyCtrl || io.KeyShift || io.KeyAlt || !ImGui::IsKeyPressed(ImGuiKey_D,false) ||

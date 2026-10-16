@@ -163,7 +163,8 @@ bool SceneDocumentsEqual(
         const auto& b = right.objects[index];
 
         if (a.id != b.id || a.name != b.name || a.meshReference != b.meshReference ||
-            a.materialReference != b.materialReference || a.materialSlotBindings != b.materialSlotBindings)
+            a.materialReference != b.materialReference || a.materialSlotBindings != b.materialSlotBindings ||
+            a.physics != b.physics)
         {
             return false;
         }

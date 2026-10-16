@@ -75,10 +75,22 @@ public:
     bool ReorderObjects(const SceneObjectOrderIdentity& identity,
         const std::vector<std::string>& expectedOrder, const std::vector<std::string>& replacementOrder,
         std::string* errorMessage = nullptr);
+    bool CapturePhysicsInspection(std::string_view objectID, SceneObjectDocument& object) const
+    {
+        size_t index = 0;
+        return m_runtime->CaptureObjectDeletionSnapshot(objectID, object, index);
+    }
+    bool SetObjectPhysics(const SceneObjectMetadata& selection,
+        const std::optional<Physics::PhysicsComponent>& expected,
+        const std::optional<Physics::PhysicsComponent>& replacement, std::string* errorMessage = nullptr);
     bool RenameObject(const SceneObjectMetadata& selection, std::string_view expectedName,
         std::string name, std::string* errorMessage = nullptr,
         SceneObjectNamePolicy policy = SceneObjectNamePolicy::TrimmedInput);
     bool Save(std::string* errorMessage = nullptr);
+    bool ClearPhysicsPresentation(Renderer& renderer, std::string& error)
+    {
+        return m_runtime->ClearPhysicsPresentation(renderer, error);
+    }
     std::uint64_t GetRuntimeIdentity() const noexcept
     {
         return m_runtime->GetRuntimeIdentity();
@@ -142,6 +154,9 @@ private:
     friend class Engine;
     friend class SceneMaterialBindingVerification;
     friend class SceneDuplicationVerification;
+    friend class ScenePhysicsDataVerification;
+    friend class PrimitiveCreationVerification;
+    friend class MarqueeSelectionVerification;
     friend class SceneMembershipVerification;
     friend class ViewportMaterialDropVerification;
     // Engine retains both runtimes until checked candidate initialization/cleanup.

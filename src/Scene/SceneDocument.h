@@ -2,11 +2,13 @@
 
 #include "Scene/Transform.h"
 #include "Scene/DirectionalLight.h"
+#include "Physics/PhysicsComponent.h"
 
 #include <cstdint>
 #include <string>
 #include <vector>
 #include <map>
+#include <optional>
 
 struct SceneCameraDocument
 {
@@ -33,11 +35,15 @@ struct SceneObjectDocument
     // Canonical material asset references keyed by stable mesh-local slot ID.
     // Missing entries inherit materialReference (or builtin:default when empty).
     std::map<std::string, std::string> materialSlotBindings;
+
+    // Optional authored configuration; no runtime body or transform ownership.
+    std::optional<Physics::PhysicsComponent> physics;
 };
 
 struct SceneDocument
 {
-    static constexpr std::uint32_t kSchemaVersion = 1;
+    static constexpr std::uint32_t kLegacySchemaVersion = 1;
+    static constexpr std::uint32_t kSchemaVersion = 2;
 
     std::uint32_t schemaVersion = kSchemaVersion;
 

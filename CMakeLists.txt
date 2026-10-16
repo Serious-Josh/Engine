@@ -49,6 +49,9 @@ FetchContent_Declare(
 
 FetchContent_MakeAvailable(nlohmann_json)
 
+include(cmake/Box3D.cmake)
+add_subdirectory(src/Physics)
+
 add_library(EngineCore OBJECT
     src/Engine/Engine.cpp
     src/Engine/BuildGame.cpp
@@ -151,6 +154,8 @@ add_library(EngineCore OBJECT
     src/Editor/Editor.cpp
     src/Editor/ViewportMaterialDrop.cpp
     src/Editor/EditorWorkspace.cpp
+    src/Editor/ViewportMarquee.cpp
+    src/Editor/ViewportMarqueeControls.cpp
     src/Editor/SceneHierarchyPanel.cpp
     src/Editor/InspectorPanel.cpp
     src/assets/ProjectAssetDeletion.cpp
@@ -175,6 +180,8 @@ add_library(EngineCore OBJECT
     src/DemoContent/CornellBoxScene.cpp
     src/DemoContent/SceneRegistry.cpp
     src/DemoContent/StressTestScene.cpp
+    src/Renderer/EditorColliderOverlay.cpp
+    src/Renderer/Passes/EditorColliderPass.cpp
     src/Renderer/Passes/SelectionMaskPass.cpp
     src/Renderer/Passes/RayTracedGIPass.cpp
     src/Renderer/Passes/NrdDiffuseResolvePass.cpp
@@ -200,6 +207,10 @@ add_library(EngineCore OBJECT
     src/Scene/PreparedScene.cpp
     src/Scene/SceneCommit.cpp
     src/Scene/FileSceneRuntime.cpp
+    src/Scene/PhysicsPresentation.cpp
+    src/Engine/PhysicsSimulationController.cpp
+    src/Engine/EditorPhysicsSimulation.cpp
+    src/Editor/PhysicsSimulationControls.cpp
     src/Scene/FileSceneAssetCatalog.cpp
     src/Scene/SceneMetadataPreparation.cpp
     src/Scene/MeshResidency.cpp
@@ -211,6 +222,12 @@ add_library(EngineCore OBJECT
     src/Editor/SceneObjectDuplicationControls.cpp
     src/Engine/EditorMembership.cpp
     src/Engine/SceneDuplicationVerification.cpp
+    $<$<CONFIG:Debug>:src/Engine/ScenePhysicsDataVerification.cpp>
+    $<$<CONFIG:Debug>:src/Engine/PrimitiveCreationVerification.cpp>
+    $<$<CONFIG:Debug>:src/Engine/ColliderVisualizationVerification.cpp>
+    $<$<CONFIG:Debug>:src/Engine/MarqueeSelectionVerification.cpp>
+    $<$<CONFIG:Debug>:src/Engine/ScenePhysicsPersistenceVerification.cpp>
+    $<$<CONFIG:Debug>:src/Engine/PresentationTransformVerification.cpp>
     src/Scene/SceneMembershipPublication.cpp
     src/Engine/SceneMembershipVerification.cpp
     src/Scene/MeshResidencyPublication.cpp
@@ -226,6 +243,8 @@ add_library(EngineCore OBJECT
     src/assets/ProjectAssetResolver.cpp
     src/assets/MaterialAssetSerializer.cpp
     src/assets/ProjectTextureImportService.cpp
+    src/assets/PrimitiveMeshAssets.cpp
+    src/Editor/ScenePrimitiveCreation.cpp
     src/assets/ProjectMeshImportService.cpp
     src/assets/ProjectMeshCPUCache.cpp
     src/assets/ProjectMaterialAssetService.cpp
@@ -320,6 +339,7 @@ target_include_directories(EngineCore
 
 target_link_libraries(EngineCore
     PUBLIC
+        EnginePhysics
         shell32
         ole32
         dxgi

@@ -159,7 +159,12 @@ bool Service::Start(Request request,std::string& error)
             append({PackagedBootstrap::ShaderID(),EngineAssetPak::Type::Shader,1,std::move(shaders)});
             std::uint64_t total=0; for(const auto& a:assets) { total+=a.bytes.size(); Require(total<=512ull*1024*1024,"Build payloads exceed 512 MiB batch limit."); }
             progress(.75f,"Writing and validating matching game archives...");
-            std::vector<EngineAssetPak::PreparedAsset> prepared; for(const auto& a:assets) prepared.push_back({a.id,a.type,1,a.generation,a.bytes,16});
+            std::vector<EngineAssetPak::PreparedAsset> prepared;
+            for (const auto& asset : assets)
+            {
+                const auto payloadVersion = asset.type == EngineAssetPak::Type::Scene ? CookedScene::Version : 1;
+                prepared.push_back({asset.id, asset.type, payloadVersion, asset.generation, asset.bytes, 16});
+            }
             EngineAssetPak::Write(stage/"Game.toc",stage/"Game.eap",prepared);
             { auto reader=EngineAssetPak::Reader::Open(stage/"Game.toc",stage/"Game.eap"); for(const auto& entry:reader.Entries()) reader.Read(entry.id); }
             { auto verified=CookedScene::OpenArchive(stage/"Game.toc",stage/"Game.eap",sceneID); Require(verified->metadata.document.id==request.document.id,"Packaged startup scene identity differs."); }

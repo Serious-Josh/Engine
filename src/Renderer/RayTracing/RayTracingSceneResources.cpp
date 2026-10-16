@@ -157,7 +157,12 @@ bool RayTracingSceneResources::Update(
 
     const std::vector<RenderObject>& renderObjects = scene.GetRenderObjects();
 
-    const std::vector<RenderObjectID>& changedTransforms = scene.GetChangedTransforms();
+    // Merge independent physics dirtiness without changing authored transform history.
+    std::vector<RenderObjectID> changedTransforms = scene.GetChangedTransforms();
+    const auto& changedPresentation = scene.GetChangedPresentationTransforms();
+    changedTransforms.insert(changedTransforms.end(), changedPresentation.begin(), changedPresentation.end());
+    std::sort(changedTransforms.begin(), changedTransforms.end());
+    changedTransforms.erase(std::unique(changedTransforms.begin(), changedTransforms.end()), changedTransforms.end());
 
     if (renderObjects.size() != m_membership->renderObjectToInstance.size())
     {
@@ -186,7 +191,7 @@ bool RayTracingSceneResources::Update(
             return false;
         }
 
-        m_membership->instances[instanceIndex].transform = renderObjects[renderObjectID].transform.GetModelMatrix();
+        m_membership->instances[instanceIndex].transform = renderObjects[renderObjectID].GetPresentationTransform().currentModel;
 
         changedInstanceIndices.push_back(instanceIndex);
     }
@@ -266,7 +271,7 @@ bool RayTracingSceneResources::UpdateTransformsAndRefreshTLASReferences(
             return false;
         }
 
-        instances[instanceIndex].transform = object.transform.GetModelMatrix();
+        instances[instanceIndex].transform = object.GetPresentationTransform().currentModel;
         allInstanceIndices.push_back(instanceIndex);
     }
 
@@ -1009,7 +1014,7 @@ bool RayTracingSceneResources::BuildInstanceData(MembershipSnapshot& snapshot,
         instances[i] = gpuInstance;
 
         RayTracingInstanceDescription instanceDescription{};
-        instanceDescription.transform = renderObject.transform.GetModelMatrix();
+        instanceDescription.transform = renderObject.GetPresentationTransform().currentModel;
         instanceDescription.instanceID = i;
         instanceDescription.mask = 0xFF;
 

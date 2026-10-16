@@ -3,6 +3,7 @@
 #include "Scene/Transform.h"
 #include "Engine/BuildGame.h"
 #include "SceneSelection.h"
+#include "ViewportMarquee.h"
 #include "AssetBrowser.h"
 #include "EditorWorkspace.h"
 #include "InspectorPanel.h"
@@ -83,7 +84,7 @@ public:
     bool HasBlockingObjectCreation() const
     {
         return m_materialLeaveAction != MaterialLeaveAction::None || m_inspectorPanel.HasUnsavedChanges() ||
-            m_materialAssignmentPending || m_transformFieldEditing || m_gizmoWasUsing;
+            m_materialAssignmentPending || m_transformFieldEditing || m_gizmoWasUsing || m_marqueeGesture.has_value();
     }
 
     void ConfigureMaterialThumbnails(Renderer& renderer)
@@ -114,6 +115,13 @@ public:
     }
 
     void SetSceneOperationPending(bool pending) noexcept;
+    enum class PhysicsState { Stopped, Playing, Stopping };
+    enum class PhysicsRequest { Play, Stop };
+    void SetPhysicsStatus(PhysicsState state, bool canPlay, std::string message);
+    std::optional<PhysicsRequest> TakePhysicsRequest();
+    bool CanStartPhysics() const;
+    bool ArePhysicsCollidersVisible() const noexcept { return m_showPhysicsColliders; }
+    bool IsPhysicsEditingLocked() const noexcept { return m_physicsState != PhysicsState::Stopped; }
     void OnSceneActivated();
     // Interaction cleanup alone does not change the history session or cursor.
     void ResetSceneInteractions();
@@ -174,6 +182,13 @@ public:
         bool succeeded, bool published, std::string_view message) noexcept;
     std::optional<size_t> GetMaterialDropHighlight(const IDemoScene& scene) const;
 
+    struct PrimitiveCreationRequest
+    {
+        ScenePrimitive primitive;
+        std::uint64_t runtimeIdentity = 0;
+        std::uint64_t historyEpoch = 0;
+    };
+    std::optional<PrimitiveCreationRequest> TakePrimitiveCreationRequest();
     struct MeshCreationRequest
     {
         std::string meshReference;
@@ -263,6 +278,9 @@ public:
         return m_selectedObject;
     }
 
+    void SetViewportPublicationIdentity(std::uint64_t rendererLifetime, std::uint64_t bindingEpoch);
+    void RefreshViewportMarqueePreview(const IDemoScene& scene);
+    const std::vector<std::size_t>* GetViewportMarqueePreview(const IDemoScene& scene) const;
     const std::vector<size_t>& GetSelectedObjects() const noexcept { return m_selectedObjects; }
 
     uint64_t GetSelectionStructureRevision() const
@@ -271,9 +289,18 @@ public:
     }
 
 private:
+    friend class PresentationTransformVerification;
+    PhysicsState m_physicsState = PhysicsState::Stopped;
+    bool m_canPlayPhysics = false;
+    std::string m_physicsMessage;
+    std::optional<PhysicsRequest> m_physicsRequest;
+    void DrawPhysicsControls();
     friend class MaterialLocateVerification;
     friend class ViewportPanVerification;
     friend class SceneDuplicationVerification;
+    friend class ScenePhysicsDataVerification;
+    friend class PrimitiveCreationVerification;
+    friend class MarqueeSelectionVerification;
     friend class ViewportMaterialDropVerification;
     void DrawMaterialDropTarget(IDemoScene& scene, const ProjectPaths& paths,
         const ProjectAssetRegistry& registry);
@@ -286,6 +313,7 @@ private:
     void DrawMeshDropTarget(const IDemoScene& scene, const ProjectPaths& paths,
         const ProjectAssetRegistry& registry);
     std::optional<MeshCreationRequest> m_meshCreationRequest;
+    std::optional<PrimitiveCreationRequest> m_primitiveCreationRequest;
     std::string m_meshCreationStatus;
 
     std::uint64_t m_meshDragRuntimeIdentity = 0;
@@ -406,6 +434,10 @@ private:
     bool m_cameraPanning = false;
     // Keep a pan's held left button from becoming a gizmo gesture after RMB release.
     bool m_panLeftHeld = false;
+    // Session display preference: never reset with scene interactions or authored history.
+    bool m_showPhysicsColliders = true;
+    EditorWorkspaceRect m_viewportContentRegion;
+    void DrawSceneViewportToolbar(const EditorWorkspaceRect& toolbarRectangle);
     bool m_viewportHovered = false;
     bool m_viewportFocused = false;
 
@@ -429,6 +461,14 @@ private:
         GizmoMode mode = GizmoMode::Translate;
     };
     using SelectedObjectIdentity = SceneSelection::Identity;
+    std::optional<ViewportMarquee::Gesture> m_marqueeGesture;
+    std::uint64_t m_viewportRendererLifetime = 0;
+    std::uint64_t m_viewportBindingEpoch = 0;
+    void CancelViewportMarquee();
+    bool ViewportMarqueeMatches(const IDemoScene& scene) const;
+    void StartViewportMarquee(const IDemoScene& scene, ImVec2 imageMouse);
+    bool UpdateViewportMarquee(IDemoScene& scene);
+    void DrawViewportMarquee() const;
     std::vector<SelectedObjectIdentity> m_orderedSelection;
     std::vector<size_t> m_selectedObjects;
     void SelectSceneObject(const IDemoScene& scene, size_t index, bool toggle = false);
@@ -452,6 +492,23 @@ private:
         SceneHistorySession session;
         bool insertion = false;
     };
+    struct PhysicsComponentEdit
+    {
+        SceneHistorySession session;
+        std::string objectID;
+        std::optional<Physics::PhysicsComponent> before;
+        std::optional<Physics::PhysicsComponent> after;
+    };
+    static bool ParsePhysicsNumber(const char* text, float& value);
+    void DrawObjectPhysicsControls(IDemoScene& scene);
+    bool CommitObjectPhysics(IDemoScene& scene, const SceneObjectMetadata& selection,
+        const std::optional<Physics::PhysicsComponent>& before,
+        const std::optional<Physics::PhysicsComponent>& after);
+    std::optional<SceneObjectMetadata> m_physicsInspection;
+    std::optional<Physics::PhysicsComponent> m_physicsInspectedValue;
+    std::uint64_t m_physicsInspectionEpoch = 0;
+    std::array<std::array<char, 64>, 9> m_physicsNumericText{};
+    std::string m_physicsEditStatus;
     struct RenameObject
     {
         SceneHistorySession session;
@@ -491,7 +548,7 @@ private:
     void CommitObjectRename(IDemoScene& scene, std::string name);
     bool RenameIntentMatches(const IDemoScene& scene) const;
     bool RenameSessionMatches(const IDemoScene& scene, const SceneHistorySession& session) const;
-    using SceneHistoryCommand = std::variant<TransformEdit, std::unique_ptr<GroupTransformEdit>, std::unique_ptr<ObjectDeletion>, std::unique_ptr<RenameObject>, std::unique_ptr<ReorderObjects>, std::unique_ptr<MaterialBindingsEdit>>;
+    using SceneHistoryCommand = std::variant<std::unique_ptr<PhysicsComponentEdit>, TransformEdit, std::unique_ptr<GroupTransformEdit>, std::unique_ptr<ObjectDeletion>, std::unique_ptr<RenameObject>, std::unique_ptr<ReorderObjects>, std::unique_ptr<MaterialBindingsEdit>>;
     struct SceneHistoryEntry
     {
         SceneHistoryCommand command;

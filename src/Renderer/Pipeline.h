@@ -42,6 +42,7 @@ struct PipelineDescription
 
     std::vector<RootParameterDescription> rootParameters;
 
+    D3D12_PRIMITIVE_TOPOLOGY_TYPE topologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     bool depthEnabled = false;
 
     DXGI_FORMAT depthFormat = DXGI_FORMAT_UNKNOWN;

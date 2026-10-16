@@ -54,7 +54,7 @@ bool Engine::VerifyArchiveMaterials(const std::filesystem::path& authoringScene)
     auto again=CookedSurface::CookDependencies(scene,paths,registry,19);
     check(cooked.size()==3 && cooked.size()==again.size(),"Shared texture was duplicated or a dependency was omitted.");
     for(size_t i=0;i<cooked.size();++i) check(cooked[i].id==again[i].id && cooked[i].bytes==again[i].bytes,"Nondeterministic cooked surface output.");
-    std::vector<EngineAssetPak::PreparedAsset> entries{{meshID,EngineAssetPak::Type::Mesh,1,11,mesh.payload,16},{sceneID,EngineAssetPak::Type::Scene,1,13,sceneBytes,16}};
+    std::vector<EngineAssetPak::PreparedAsset> entries{{meshID,EngineAssetPak::Type::Mesh,1,11,mesh.payload,16},{sceneID,EngineAssetPak::Type::Scene,CookedScene::Version,13,sceneBytes,16}};
     for(const auto& asset:cooked) entries.push_back({asset.id,asset.type,CookedSurface::Version,asset.generation,asset.bytes,16});
     const auto toc=fixture/"archive-only/game.toc",pak=fixture/"archive-only/game.eap"; EngineAssetPak::Write(toc,pak,entries);
     if(!m_materialPreparation) m_materialPreparation=std::make_unique<ProjectMaterialPreparationService>(m_texturePreparation);

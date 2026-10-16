@@ -161,6 +161,7 @@ class RayTracingSceneResources
 
     private:
     friend class Renderer;
+    friend class FileSceneRuntime;
     friend class MeshResidencyPublication;
     friend class SceneMembershipPublication;
     friend class SceneDuplicationVerification;

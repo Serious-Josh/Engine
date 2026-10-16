@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Scene/FileScene.h"
+#include "Renderer/EditorColliderOverlay.h"
 #include "Scene/Scene.h"
 #include "Scene/SceneCommit.h"
 #include "Scene/PreparedScene.h"
@@ -11,6 +12,7 @@
 #include <memory>
 #include <string>
 #include <map>
+#include <thread>
 #include "assets/AssetID.h"
 
 // Copied document metadata. Identity fields are internal selection checks, not UI labels.
@@ -60,11 +62,51 @@ struct MaterialAssignmentToken
 };
 
 namespace CookedScene { struct ArchiveScene; }
+class Renderer;
+
+enum class PhysicsPresentationReadiness { Ready, Retry, Stale, Failed };
+
+// Identifies one accepted presentation, rather than just a compatible scene.
+// Replacements issue a new revision, so an old owner cannot clear newer poses.
+class PhysicsPresentationLease
+{
+    friend class FileSceneRuntime;
+    std::uint64_t runtimeIdentity = 0;
+    std::uint64_t rendererLifetime = 0;
+    std::uint64_t revision = 0;
+};
+
+// Opaque, value-owned registration evidence. Capture with the exact document
+// used to create a session; matching stable-ID strings alone are insufficient.
+class PhysicsPresentationAssociation
+{
+    friend class FileSceneRuntime;
+    friend class PresentationTransformVerification;
+    std::uint64_t runtimeIdentity = 0;
+    std::uint64_t structureRevision = 0;
+    std::uint64_t rendererLifetime = 0;
+    std::uint64_t materialBindingEpoch = 0;
+    std::uint64_t materialTableRevision = 0;
+    std::vector<SceneObjectMetadata> objects;
+    std::vector<std::optional<Physics::PhysicsComponent>> components;
+};
 
 class FileSceneRuntime
 {
 public:
     FileSceneRuntime();
+    std::optional<PhysicsPresentationAssociation> AssociatePhysicsPresentation(
+        Renderer& renderer, const SceneDocument& registeredDocument, std::string& error) const;
+    // Synchronous prepare/accept at the owning main-thread idle boundary.
+    // Repeated apply replaces the complete snapshot. Failure preserves active state.
+    bool ApplyPhysicsPresentation(Renderer& renderer, const PhysicsPresentationAssociation& association,
+        const Physics::RuntimePoseSnapshot& snapshot, std::string& error,
+        PhysicsPresentationLease* acceptedLease = nullptr);
+    bool ClearPhysicsPresentation(Renderer& renderer, std::string& error);
+    PhysicsPresentationReadiness CheckPhysicsPresentation(Renderer& renderer,
+        const PhysicsPresentationAssociation& association, const PhysicsPresentationLease& lease, std::string& error) const;
+    PhysicsPresentationReadiness ClearOwnedPhysicsPresentation(Renderer& renderer,
+        const PhysicsPresentationLease& lease, std::string& error);
     bool HasMaterialAssignment() const noexcept
     {
         return m_materialAssignment.has_value();
@@ -87,6 +129,7 @@ public:
 
     // Removes one instance from an inactive captured document; surviving asset borrows
     // and live transforms are copied without reloading or destroying catalog assets.
+    bool CaptureEditorColliderOverlay(const Renderer&, EditorColliderOverlay&, std::string& error) const;
     bool CaptureObjectDeletionSnapshot(std::string_view objectID, SceneObjectDocument& object,
         size_t& documentIndex, std::string* errorMessage = nullptr) const;
     std::unique_ptr<FileSceneRuntime> PrepareObjectDeletion(std::string_view objectID,
@@ -126,9 +169,17 @@ public:
     std::optional<SceneObjectMetadata> GetObjectMetadata(
         std::string_view objectID, std::string* errorMessage = nullptr) const;
 
+    // Stable-ID presentation read using the existing selection/binding identity.
+    // Rejects stale reload, membership, index, and binding associations.
+    std::optional<PresentationTransform> GetObjectPresentation(const SceneObjectMetadata& identity,
+        std::string* errorMessage = nullptr) const;
+
     bool ReorderObjects(const SceneObjectOrderIdentity& identity,
         const std::vector<std::string>& expectedOrder, const std::vector<std::string>& replacementOrder,
         std::string* errorMessage = nullptr);
+    bool SetObjectPhysics(const SceneObjectMetadata& selection,
+        const std::optional<Physics::PhysicsComponent>& expected,
+        const std::optional<Physics::PhysicsComponent>& replacement, std::string* errorMessage = nullptr);
     bool RenameObject(const SceneObjectMetadata& selection, std::string_view expectedName,
         std::string name, std::string* errorMessage = nullptr,
         SceneObjectNamePolicy policy = SceneObjectNamePolicy::TrimmedInput);
@@ -211,6 +262,20 @@ public:
         std::string* errorMessage = nullptr);
 
 private:
+    bool OwnsPhysicsPresentation(const Renderer& renderer, const PhysicsPresentationLease& lease) const noexcept;
+    bool ValidatePhysicsPresentationAssociation(const Renderer& renderer,
+        const PhysicsPresentationAssociation& association, std::string& error) const;
+    PhysicsPresentationReadiness GetPhysicsPresentationBoundaryReadiness(const Renderer& renderer,
+        std::string& error, bool clearing) const;
+    std::uint64_t m_physicsPresentationRevision = 0;
+    bool ValidatePhysicsPresentationBoundary(const Renderer& renderer, std::string& error, bool clearing = false) const;
+    bool PreparePhysicsPresentation(const Physics::RuntimePoseSnapshot& snapshot, std::vector<std::optional<Physics::Pose>>& poses,
+        std::string& error) const;
+    const std::thread::id m_ownerThread = std::this_thread::get_id();
+    std::optional<PhysicsPresentationAssociation> m_activePresentationAssociation;
+    // Checked binding-only commits preserve stable object ownership and matrices.
+    // Refresh internal evidence; previously issued external associations stay stale.
+    void RevalidatePhysicsPresentationBindings(const Renderer& renderer) noexcept;
     std::shared_ptr<const CookedScene::ArchiveScene> m_archiveScene;
     // No coordinator exists in S.5B. Only the future matching renderer/DXR
     // transaction may call this at the main-thread pre-recording boundary.
@@ -219,6 +284,10 @@ private:
     friend class SceneMaterialBindingPublication;
     friend class SceneMaterialBindingVerification;
     friend class Engine;
+    friend class ScenePhysicsDataVerification;
+    friend class PrimitiveCreationVerification;
+    friend class MarqueeSelectionVerification;
+    friend class PresentationTransformVerification;
     // Only Engine archive bootstrap or an explicit diagnostic can open this runtime's gate.
     bool m_cookedPublicationAuthorized = false;
     std::optional<SceneObjectMetadata> ValidatePreparedMeshResidencyIdentity(const MeshResidencyToken& token,

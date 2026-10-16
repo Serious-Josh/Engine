@@ -112,6 +112,15 @@ bool ValidateSceneDocument(
                 "Invalid transform for object: " + object.id);
         }
 
+        if (object.physics)
+        {
+            std::string physicsError;
+            if (!Physics::ValidatePhysicsComponent(*object.physics, &physicsError))
+            {
+                return Fail(errorMessage, "Invalid physics for object " + object.id + ": " + physicsError);
+            }
+        }
+
         for(const auto& [slotID, reference] : object.materialSlotBindings)
         {
             if(slotID.empty() || !AssetID::ParseReference(reference))

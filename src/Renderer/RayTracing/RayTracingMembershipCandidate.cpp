@@ -736,7 +736,7 @@ RayTracingSceneResources::CandidateStatus RayTracingSceneResources::PollReplacem
 
     for (const auto& instance : state.snapshot->instances)
     {
-        const auto current = runtime.GetScene().GetRenderObjects()[instance.instanceID].transform.GetModelMatrix();
+        const auto current = runtime.GetScene().GetRenderObjects()[instance.instanceID].GetPresentationTransform().currentModel;
 
         if (std::memcmp(current.m, instance.transform.m, sizeof(current.m)) != 0)
         {
@@ -765,7 +765,7 @@ bool RayTracingSceneResources::RefreshReplacementTransforms(const ReplacementCan
     for (std::size_t index = 0; index < snapshot.instances.size(); ++index)
     {
         auto& instance = snapshot.instances[index];
-        instance.transform = runtime.GetScene().GetRenderObjects()[instance.instanceID].transform.GetModelMatrix();
+        instance.transform = runtime.GetScene().GetRenderObjects()[instance.instanceID].GetPresentationTransform().currentModel;
         allIndices.push_back(index);
     }
 

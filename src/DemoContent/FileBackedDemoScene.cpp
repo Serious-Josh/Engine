@@ -256,6 +256,18 @@ bool FileBackedDemoScene::ReorderObjects(const SceneObjectOrderIdentity& identit
     return m_runtime->ReorderObjects(identity, expectedOrder, replacementOrder, errorMessage);
 }
 
+bool FileBackedDemoScene::SetObjectPhysics(const SceneObjectMetadata& selection,
+    const std::optional<Physics::PhysicsComponent>& expected,
+    const std::optional<Physics::PhysicsComponent>& replacement, std::string* errorMessage)
+{
+    if(!m_initialized || m_objectMutationCandidate)
+    {
+        if(errorMessage) *errorMessage = "Physics editing requires an initialized scene without pending structure changes.";
+        return false;
+    }
+    return m_runtime->SetObjectPhysics(selection, expected, replacement, errorMessage);
+}
+
 bool FileBackedDemoScene::RenameObject(const SceneObjectMetadata& selection, std::string_view expectedName,
     std::string name, std::string* errorMessage, SceneObjectNamePolicy policy)
 {

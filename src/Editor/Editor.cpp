@@ -4,6 +4,7 @@
 #include "Core/Log.h"
 #include "Editor.h"
 #include "ViewportCameraInput.h"
+#include "SceneViewportLayout.h"
 #include "GroupTransform.h"
 #include "ViewportPicking.h"
 #include "Debug/DebugUI.h"
@@ -30,6 +31,9 @@
 #include "ImGuizmo.h"
 
 #include <algorithm>
+#include <cerrno>
+#include <cstdio>
+#include <cstdlib>
 #include <cmath>
 #include <cstring>
 #include <exception>
@@ -66,7 +70,7 @@ namespace
         {
             return false;
         }
-        return ViewportPicking::IntersectMesh(ray, object.transform.GetModelMatrix(), object.mesh->GetBounds(),
+        return ViewportPicking::IntersectMesh(ray, object.GetPresentationTransform().currentModel, object.mesh->GetBounds(),
             geometry, object.mesh->IsIndexed(), object.mesh->GetMetadata().submeshes, nearestDistance);
     }
 
@@ -364,7 +368,42 @@ void Editor::DrawMainMenu(
         ImGui::EndMenu();
     }
 
+    DrawPhysicsControls();
     ImGui::EndMainMenuBar();
+}
+
+void Editor::DrawSceneViewportToolbar(const EditorWorkspaceRect& toolbarRectangle)
+{
+    if(toolbarRectangle.size.x <= 0.0f || toolbarRectangle.size.y <= 0.0f)
+    {
+        return;
+    }
+
+    ImGui::SetNextWindowPos(toolbarRectangle.position, ImGuiCond_Always);
+    ImGui::SetNextWindowSize(toolbarRectangle.size, ImGuiCond_Always);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowMinSize, ImVec2(1.0f, 1.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+    const ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+        ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoScrollWithMouse;
+    if(ImGui::Begin("Scene Viewport Toolbar", nullptr, flags))
+    {
+        EditorWorkspace::KeepCurrentWindowBehindFloatingUI();
+        const char* overlaysLabel = "Overlays";
+        const float buttonWidth = ImGui::CalcTextSize(overlaysLabel).x + ImGui::GetFrameHeight() +
+            ImGui::GetStyle().FramePadding.x * 2.0f;
+        ImGui::SetCursorPosX((std::max)(0.0f, toolbarRectangle.size.x - buttonWidth));
+        ImGui::SetNextItemWidth(buttonWidth);
+        if(ImGui::BeginCombo("##SceneOverlays", overlaysLabel))
+        {
+            // This display preference stays editable while authored physics mutations are locked.
+            ImGui::Checkbox("Physics Colliders", &m_showPhysicsColliders);
+            ImGui::EndCombo();
+        }
+    }
+    ImGui::End();
+    ImGui::PopStyleVar(4);
 }
 
 void Editor::DrawSceneViewport(
@@ -399,11 +438,11 @@ void Editor::DrawSceneViewport(
             const ImVec2 framebufferScale = ImGui::GetIO().DisplayFramebufferScale;
             const ImVec2 logicalSize(static_cast<float>(sceneWidth) / framebufferScale.x,
                                      static_cast<float>(sceneHeight) / framebufferScale.y);
-            const float scale = (std::min)(rectangle.size.x / logicalSize.x, rectangle.size.y / logicalSize.y);
-            const ImVec2 size(logicalSize.x * scale, logicalSize.y * scale);
-            const ImVec2 position(rectangle.position.x + (rectangle.size.x - size.x) * 0.5f,
-                                  rectangle.position.y + (rectangle.size.y - size.y) * 0.5f);
-            m_viewportImage = {position, size};
+            m_viewportImage = FitSceneViewportImage(m_viewportContentRegion, logicalSize);
+            const ImVec2 position = m_viewportImage.position;
+            const ImVec2 size = m_viewportImage.size;
+            // Toolbar pixels are outside this authoritative image rectangle. Popups and
+            // other windows still block scene input through the existing hover policy.
             const ImVec2 mouse = ImGui::GetIO().MousePos;
             const bool inside = mouse.x >= position.x && mouse.y >= position.y &&
                 mouse.x < position.x + size.x && mouse.y < position.y + size.y;
@@ -460,7 +499,10 @@ const EditorWorkspaceRect& Editor::PrepareWorkspace(
     ViewportCameraInput::ReserveLeftButton(m_cameraLooking, m_panLeftHeld);
     DrawMainMenu(demoScene, sceneManager, debugUI);
     m_workspace.Update();
-    return m_workspace.GetSceneViewport();
+    const auto regions = CalculateSceneViewportRegions(m_workspace.GetSceneViewport(), ImGui::GetFrameHeight());
+    m_viewportContentRegion = regions.imageArea;
+    DrawSceneViewportToolbar(regions.toolbar);
+    return m_viewportContentRegion;
 }
 
 bool Editor::RenameSessionMatches(const IDemoScene& scene, const SceneHistorySession& session) const
@@ -496,6 +538,11 @@ void Editor::CancelObjectRename()
 
 void Editor::QueueObjectRename(const IDemoScene& scene, const SceneObjectMetadata& target)
 {
+    if (IsPhysicsEditingLocked())
+    {
+        return;
+    }
+
     if(!m_historySession || !SceneObjectDeletionMatches(scene, target) || m_materialAssignmentPending ||
         !RenameSessionMatches(scene, *m_historySession))
     {
@@ -512,6 +559,11 @@ void Editor::QueueObjectRename(const IDemoScene& scene, const SceneObjectMetadat
 
 void Editor::CommitObjectRename(IDemoScene& scene, std::string name)
 {
+    if (IsPhysicsEditingLocked())
+    {
+        return;
+    }
+
     if(!RenameIntentMatches(scene) || HasPendingSceneHistoryOperation())
     {
         m_renameStatus = "Rename target belongs to a stale scene or pending operation.";
@@ -575,6 +627,11 @@ void Editor::CommitObjectRename(IDemoScene& scene, std::string name)
 
 void Editor::CommitObjectReorder(IDemoScene& scene, const HierarchyReorderRequest& request)
 {
+    if (IsPhysicsEditingLocked())
+    {
+        return;
+    }
+
     auto* owner = dynamic_cast<FileBackedDemoScene*>(&scene);
 
     if(!owner || !m_historySession || !RenameSessionMatches(scene, *m_historySession) ||
@@ -709,7 +766,7 @@ void Editor::DrawHierarchy(IDemoScene& demoScene, const std::string& activeScene
         m_materialAssignmentPending || m_materialAssignmentRequest || m_gizmoWasUsing ||
         m_workspace.IsSplitterDragging() || ImGuizmo::IsUsing() || m_transformFieldEditing;
 
-    if(m_renameIntent && (blocked || m_inspectorPanel.HasUnsavedChanges() || !RenameIntentMatches(demoScene)))
+    if(m_renameIntent && (IsPhysicsEditingLocked() || blocked || m_inspectorPanel.HasUnsavedChanges() || !RenameIntentMatches(demoScene)))
     {
         CancelObjectRename();
     }
@@ -720,7 +777,7 @@ void Editor::DrawHierarchy(IDemoScene& demoScene, const std::string& activeScene
     }
 
     const auto* fileScene = dynamic_cast<const FileBackedDemoScene*>(&demoScene);
-    const bool allowReorder = !blocked && fileScene && m_historySession &&
+    const bool allowReorder = !IsPhysicsEditingLocked() && !blocked && fileScene && m_historySession &&
         RenameSessionMatches(demoScene, *m_historySession) && !m_inspectorPanel.HasUnsavedChanges() &&
         !m_renameIntent && !ImGui::GetIO().AppFocusLost &&
         !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel);
@@ -729,8 +786,18 @@ void Editor::DrawHierarchy(IDemoScene& demoScene, const std::string& activeScene
 
     ImGui::BeginDisabled(blocked);
     const auto clicked = m_hierarchyPanel.Draw(m_workspace.GetHierarchy(), snapshot, selected, &scene, error,
-        dragIdentity, allowReorder);
+        dragIdentity, allowReorder,
+        !IsPhysicsEditingLocked() && !blocked && fileScene && !fileScene->IsArchiveActivation() &&
+        m_historySession && RenameSessionMatches(demoScene,*m_historySession) &&
+        !m_inspectorPanel.HasUnsavedChanges() && !m_renameIntent, m_selectedObjects);
     ImGui::EndDisabled();
+
+    if(auto primitive=m_hierarchyPanel.TakePrimitiveRequest())
+    {
+        if(!IsPhysicsEditingLocked() && !blocked && fileScene && !fileScene->IsArchiveActivation() &&
+            m_historySession && RenameSessionMatches(demoScene,*m_historySession) && !HasBlockingObjectCreation())
+            m_primitiveCreationRequest=PrimitiveCreationRequest{*primitive,fileScene->GetRuntimeIdentity(),m_historyEpoch};
+    }
 
     if(auto reorder = m_hierarchyPanel.TakeReorderRequest())
     {
@@ -745,7 +812,7 @@ void Editor::DrawHierarchy(IDemoScene& demoScene, const std::string& activeScene
         const auto* owner = dynamic_cast<const FileBackedDemoScene*>(&demoScene);
         const auto target = owner ? owner->GetObjectMetadata(*objectID) : std::nullopt;
 
-        if(!blocked && target)
+        if(!IsPhysicsEditingLocked() && !blocked && target)
         {
             OpenSceneObjectContext(demoScene, *target);
         }
@@ -753,7 +820,7 @@ void Editor::DrawHierarchy(IDemoScene& demoScene, const std::string& activeScene
 
     if(auto name = m_hierarchyPanel.TakeRenameCommit())
     {
-        if(!blocked)
+        if(!IsPhysicsEditingLocked() && !blocked)
         {
             CommitObjectRename(demoScene, std::move(*name));
         }
@@ -766,7 +833,9 @@ void Editor::DrawHierarchy(IDemoScene& demoScene, const std::string& activeScene
 
     if(!blocked && clicked && *clicked < scene.GetRenderObjects().size())
     {
-        SelectSceneObject(demoScene, *clicked);
+        const auto& io = ImGui::GetIO();
+        const bool toggleSelectionMembership = io.KeyShift || io.KeyCtrl;
+        SelectSceneObject(demoScene, *clicked, toggleSelectionMembership);
         m_objectInspectionRequested = true;
     }
 }
@@ -775,6 +844,7 @@ void Editor::ActivateObjectInspection(
     IDemoScene& demoScene, const ProjectPaths& paths, const ProjectAssetRegistry& registry)
 {
     m_objectInspectionIdentity.reset();
+    m_physicsInspection.reset();
     m_inspectorTarget = InspectorTarget::None;
     m_inspectorPanel.LoadSelection({}, paths, registry);
     const auto& scene = static_cast<const IDemoScene&>(demoScene).GetScene();
@@ -984,7 +1054,7 @@ void Editor::Draw(
 
     (void)debugUI;
     m_assetBrowser.SetThumbnailProject(projectPaths, assetRegistry);
-    ImGui::BeginDisabled(m_materialLeaveAction != MaterialLeaveAction::None || m_sceneOperationPending);
+    ImGui::BeginDisabled(IsPhysicsEditingLocked() || m_materialLeaveAction != MaterialLeaveAction::None || m_sceneOperationPending);
 
     if(m_workspace.AssetBrowserVisible())
     {
@@ -1055,7 +1125,7 @@ void Editor::Draw(
         FinishTransformFieldEdit(demoScene);
     }
 
-    const bool disableInspector = m_materialLeaveAction != MaterialLeaveAction::None || m_sceneOperationPending ||
+    const bool disableInspector = IsPhysicsEditingLocked() || m_materialLeaveAction != MaterialLeaveAction::None || m_sceneOperationPending ||
         m_pendingMaterialBinding.has_value();
 
     // This ImGui version's color picker restores alpha whenever a disabled scope exists,
@@ -1085,6 +1155,7 @@ void Editor::Draw(
             m_inspectorPanel.DrawSceneObject(m_workspace.GetInspector(), *objectView, [this, &demoScene]()
             {
                 DrawSelectedObjectTransformControls(demoScene);
+                DrawObjectPhysicsControls(demoScene);
             }, projectPaths, assetRegistry, m_materialAssignmentPending, m_materialAssignmentStatus);
 
             if(!m_materialAssignmentPending && !m_inspectorPanel.GetSlotPickerStatus().empty())
@@ -1120,6 +1191,7 @@ void Editor::Draw(
 
     if(!objectView || !m_workspace.InspectorVisible())
     {
+        m_physicsInspection.reset();
         m_inspectorPanel.ReleaseSceneObjectPreview();
         m_inspectorPanel.DismissSceneMaterialPicker();
     }
@@ -1221,10 +1293,10 @@ void Editor::Draw(
         m_assetBrowser.InvalidateMaterialSource(*savedSource);
     }
 
-    m_assetBrowser.DrawRenameModal(m_inspectorPanel.HasUnsavedChanges() ||
+    m_assetBrowser.DrawRenameModal(IsPhysicsEditingLocked() || m_inspectorPanel.HasUnsavedChanges() ||
         m_materialLeaveAction != MaterialLeaveAction::None || m_sceneOperationPending);
 
-    m_assetBrowser.DrawDeletionConfirmation(m_inspectorPanel.HasUnsavedChanges() ||
+    m_assetBrowser.DrawDeletionConfirmation(IsPhysicsEditingLocked() || m_inspectorPanel.HasUnsavedChanges() ||
         m_materialLeaveAction != MaterialLeaveAction::None || m_sceneOperationPending);
 
     DrawBuildGame();
@@ -1481,6 +1553,7 @@ void Editor::DrawSelectedObjectTransformControls(IDemoScene& demoScene)
         return;
     }
 
+    ImGui::BeginDisabled(IsPhysicsEditingLocked());
     Transform transform = objects[m_selectedObject].transform;
 
     bool transformChanged = false;
@@ -1548,7 +1621,7 @@ void Editor::DrawSelectedObjectTransformControls(IDemoScene& demoScene)
         return std::isfinite(value.x) && std::isfinite(value.y) && std::isfinite(value.z);
     };
 
-    if(transformChanged && finite(transform.position) && finite(transform.rotation) && finite(transform.scale))
+    if(!IsPhysicsEditingLocked() && transformChanged && finite(transform.position) && finite(transform.rotation) && finite(transform.scale))
     {
         scene.SetRenderObjectTransform(m_selectedObject, transform);
     }
@@ -1557,6 +1630,7 @@ void Editor::DrawSelectedObjectTransformControls(IDemoScene& demoScene)
     {
         FinishTransformFieldEdit(demoScene);
     }
+    ImGui::EndDisabled();
 }
 
 void Editor::FinishTransformFieldEdit(IDemoScene& demoScene)
@@ -1745,6 +1819,18 @@ void Editor::DrawTransformGizmo(
 
     Scene& scene = demoScene.GetScene();
 
+    if (IsPhysicsEditingLocked() || scene.HasPhysicsPresentation())
+    {
+        // Block the whole selection, including mixed groups and existing drags.
+        // Never decompose a simulated model into an authored history entry.
+        ImGuizmo::Enable(false);
+        m_gizmoGroupEdit.reset();
+        m_gizmoWasUsing = false;
+        m_gizmoUndoObject = InvalidObjectSelection;
+        m_gizmoHistoryTarget.reset();
+        return;
+    }
+
     const Scene& constScene = scene;
     const auto& objects = constScene.GetRenderObjects();
 
@@ -1760,7 +1846,8 @@ void Editor::DrawTransformGizmo(
     Matrix4 view = camera.GetViewMatrix().Transpose();
 
     Matrix4 projection = camera.GetProjectionMatrix().Transpose();
-    Matrix4 model = transform.GetModelMatrix().Transpose();
+    // Placement reads presentation; manipulation/history below still edit authored Transform.
+    Matrix4 model = objects[m_selectedObject].GetPresentationTransform().currentModel.Transpose();
 
     // Append to the image's window: separate root windows have independent display ordering.
     // The first Begin in DrawSceneViewport owns placement, sizing and style for this frame.
@@ -1773,7 +1860,7 @@ void Editor::DrawTransformGizmo(
     ImGui::GetWindowDrawList()->PushClipRect(m_viewportImage.position,
         ImVec2(m_viewportImage.position.x + viewportWidth, m_viewportImage.position.y + viewportHeight), true);
     ImGuizmo::SetRect(m_viewportImage.position.x, m_viewportImage.position.y, viewportWidth, viewportHeight);
-    const bool allowGizmo = !ImGui::GetIO().AppFocusLost && !m_sceneOperationPending && !HasPendingSceneHistoryOperation() &&
+    const bool allowGizmo = !m_marqueeGesture && !ImGui::GetIO().AppFocusLost && !m_sceneOperationPending && !HasPendingSceneHistoryOperation() &&
         !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId) && !m_cameraLooking && !m_panLeftHeld &&
         !ImGui::GetIO().MouseDown[ImGuiMouseButton_Right] &&
         !ImGui::GetDragDropPayload();
@@ -1895,6 +1982,10 @@ void Editor::HandleViewportSelection(
     float viewportWidth,
     float viewportHeight)
 {
+    if(UpdateViewportMarquee(demoScene))
+    {
+        return;
+    }
     if (!ImGui::IsMouseClicked(ImGuiMouseButton_Left))
     {
         return;
@@ -1903,7 +1994,7 @@ void Editor::HandleViewportSelection(
     const ImGuiIO& io = ImGui::GetIO();
 
     if(!m_viewportHovered || m_sceneOperationPending || m_cameraLooking || m_panLeftHeld ||
-        ImGui::IsMouseDown(ImGuiMouseButton_Right) || ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId) ||
+        ImGui::IsMouseDown(ImGuiMouseButton_Right) || ImGui::IsMouseDown(ImGuiMouseButton_Middle) || ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId) ||
         ImGuizmo::IsUsing())
     {
         return;
@@ -1922,14 +2013,20 @@ void Editor::HandleViewportSelection(
     }
 
     const auto picked = PickObject(demoScene, mouse.x, mouse.y, viewportWidth, viewportHeight);
-    if(picked != InvalidObjectSelection || !io.KeyShift)
+    if(picked != InvalidObjectSelection)
     {
-        SelectSceneObject(demoScene, picked, io.KeyShift);
+        const bool toggleSelectionMembership = io.KeyShift || io.KeyCtrl;
+        SelectSceneObject(demoScene, picked, toggleSelectionMembership);
+    }
+    else if(m_viewportRendererLifetime != 0 && !ImGui::IsMouseDown(ImGuiMouseButton_Middle))
+    {
+        StartViewportMarquee(demoScene, mouse);
     }
 }
 
 void Editor::ResetTransformGestures()
 {
+    CancelViewportMarquee();
     m_gizmoGroupEdit.reset();
     m_gizmoWasUsing = false;
     m_gizmoUndoObject = InvalidObjectSelection;
@@ -2281,6 +2378,7 @@ Editor::SceneChangeDecision Editor::DrawSceneChangeConfirmation(const std::strin
 
 void Editor::SuspendViewportInteraction()
 {
+    CancelViewportMarquee();
     m_viewportRightGesture = false;
     m_viewportRightObject.reset();
     m_sceneContextObject.reset();
@@ -2366,6 +2464,11 @@ void Editor::ImportFileDrop(
     const ProjectPaths& paths,
     ProjectAssetRegistry& registry)
 {
+    if (IsPhysicsEditingLocked())
+    {
+        return;
+    }
+
     if(m_sceneOperationPending || m_materialLeaveAction != MaterialLeaveAction::None)
     {
         Log::Info("Texture drop rejected while an editor operation is pending.");
@@ -2377,6 +2480,11 @@ void Editor::ImportFileDrop(
 
 void Editor::ProcessAssetDeletion(const ProjectPaths& paths, ProjectAssetRegistry& registry)
 {
+    if (IsPhysicsEditingLocked())
+    {
+        return;
+    }
+
     const auto request = m_assetBrowser.TakeDeletionRequest();
 
     if(!request)
@@ -2424,6 +2532,11 @@ void Editor::ProcessAssetRename(
     ProjectAssetRegistry& registry,
     const std::filesystem::path& activeScenePath)
 {
+    if (IsPhysicsEditingLocked())
+    {
+        return;
+    }
+
     const auto request = m_assetBrowser.TakeRenameRequest();
 
     if(!request)
@@ -2474,6 +2587,11 @@ void Editor::ProcessAssetRename(
 
 void Editor::ProcessAssetMove(const ProjectPaths& paths, ProjectAssetRegistry& registry)
 {
+    if (IsPhysicsEditingLocked())
+    {
+        return;
+    }
+
     const auto request = m_assetBrowser.TakeMoveRequest();
     if(!request)
     {
@@ -2567,6 +2685,11 @@ void Editor::PublishCreatedObjectSelection(
 void Editor::DrawMaterialDropTarget(IDemoScene& scene, const ProjectPaths& paths,
     const ProjectAssetRegistry& registry)
 {
+    if (IsPhysicsEditingLocked())
+    {
+        return;
+    }
+
     m_materialDropHover.reset();
     const auto* dragging = ImGui::GetDragDropPayload();
     if(!dragging || !dragging->IsDataType(MaterialDragPayloadType) ||
@@ -2634,6 +2757,11 @@ void Editor::DrawMaterialDropTarget(IDemoScene& scene, const ProjectPaths& paths
 void Editor::DrawMeshDropTarget(const IDemoScene& scene, const ProjectPaths& paths,
     const ProjectAssetRegistry& registry)
 {
+    if (IsPhysicsEditingLocked())
+    {
+        return;
+    }
+
     const ImGuiPayload* dragging = ImGui::GetDragDropPayload();
 
     if(!dragging || !dragging->IsDataType(MeshDragPayloadType) ||
@@ -2737,6 +2865,11 @@ void Editor::OnMeshCreationCompleted(bool succeeded, const std::string& error)
 
 bool Editor::SceneObjectDeletionBlocked() const
 {
+    if (IsPhysicsEditingLocked())
+    {
+        return true;
+    }
+
     return HasPendingSceneHistoryOperation() || m_sceneOperationPending || m_sceneObjectDeletionPending || m_sceneObjectDeletionRequest ||
         m_fileRequest || m_meshCreationRequest || m_materialAssignmentRequest ||
         m_materialLeaveAction != MaterialLeaveAction::None || HasBlockingObjectCreation() ||
@@ -3227,8 +3360,13 @@ void Editor::AppendSceneHistoryEntry(SceneHistoryEntry entry) noexcept
 
 bool Editor::HistoryReplayBlocked() const
 {
+    if (IsPhysicsEditingLocked())
+    {
+        return true;
+    }
+
     const auto& io = ImGui::GetIO();
-    return m_renameIntent.has_value() || HasPendingSceneHistoryOperation() || io.WantTextInput || io.AppFocusLost || ImGui::IsAnyItemActive() ||
+    return m_marqueeGesture.has_value() || m_renameIntent.has_value() || HasPendingSceneHistoryOperation() || io.WantTextInput || io.AppFocusLost || ImGui::IsAnyItemActive() ||
         ImGuizmo::IsUsing() || m_gizmoWasUsing || m_transformFieldEditing || m_cameraLooking ||
         ImGui::IsMouseDown(ImGuiMouseButton_Right) || m_viewportRightGesture ||
         m_sceneOperationPending || m_sceneObjectDeletionPending || m_sceneObjectDeletionRequest ||
@@ -3240,6 +3378,11 @@ bool Editor::HistoryReplayBlocked() const
 
 void Editor::ReplaySceneHistory(IDemoScene& demoScene, bool redo)
 {
+    if (IsPhysicsEditingLocked())
+    {
+        return;
+    }
+
     if((redo && m_historyCursor == m_sceneHistory.size()) || (!redo && m_historyCursor == 0))
     {
         return;
@@ -3257,6 +3400,28 @@ void Editor::ReplaySceneHistory(IDemoScene& demoScene, bool redo)
     {
         try { QueueMaterialBindingReplay(demoScene, **material, redo); }
         catch(const std::exception& exception) { ReportSceneHistoryFailure(exception.what()); }
+        return;
+    }
+
+    if(const auto* physics = std::get_if<std::unique_ptr<PhysicsComponentEdit>>(&entry.command); physics && *physics)
+    {
+        const auto& edit = **physics;
+        auto* owner = dynamic_cast<FileBackedDemoScene*>(&demoScene);
+        if(!owner || !RenameSessionMatches(demoScene, edit.session))
+        {
+            ReportSceneHistoryFailure("Physics replay belongs to a stale scene session.");
+            return;
+        }
+        const auto selection = owner->GetObjectMetadata(edit.objectID);
+        std::string error;
+        if(!selection || !owner->SetObjectPhysics(*selection, redo ? edit.before : edit.after,
+            redo ? edit.after : edit.before, &error))
+        {
+            ReportSceneHistoryFailure(error);
+            return;
+        }
+        if(redo) ++m_historyCursor; else --m_historyCursor;
+        m_sceneHistoryStatus.clear();
         return;
     }
 
@@ -3549,7 +3714,8 @@ bool Editor::StageObjectDeletionHistory(SceneObjectDocument object, size_t docum
             deletion->object.name != object.name || !SameHistoryTransform(deletion->object.transform, object.transform) ||
             deletion->object.meshReference != object.meshReference ||
             deletion->object.materialReference != object.materialReference ||
-            deletion->object.materialSlotBindings != object.materialSlotBindings)
+            deletion->object.materialSlotBindings != object.materialSlotBindings ||
+            deletion->object.physics != object.physics)
         {
             error = "Redo deletion target changed outside its history command; cursor preserved.";
             return false;
@@ -3640,4 +3806,143 @@ void Editor::InvalidateSceneHistoryRedoAfterEdit() noexcept
     {
         TruncateHistoryRedo();
     }
+}
+
+bool Editor::CommitObjectPhysics(IDemoScene& scene, const SceneObjectMetadata& selection,
+    const std::optional<Physics::PhysicsComponent>& before,
+    const std::optional<Physics::PhysicsComponent>& after)
+{
+    auto* owner = dynamic_cast<FileBackedDemoScene*>(&scene);
+    if(IsPhysicsEditingLocked() || !owner || !m_historySession ||
+        !RenameSessionMatches(scene, *m_historySession) || HasPendingSceneHistoryOperation() ||
+        m_sceneOperationPending || HasBlockingObjectCreation())
+    {
+        m_physicsEditStatus = "Physics authoring requires a stopped scene without pending edits.";
+        return false;
+    }
+    if(after && !Physics::ValidatePhysicsComponent(*after, &m_physicsEditStatus)) return false;
+    if(before == after) return true;
+    try
+    {
+        auto command = std::make_unique<PhysicsComponentEdit>(PhysicsComponentEdit{
+            *m_historySession, selection.objectID, before, after});
+        const size_t bytes = sizeof(SceneHistoryEntry) + sizeof(PhysicsComponentEdit) +
+            command->objectID.size() + command->session.sceneIdentity.size() +
+            command->session.projectIdentity.native().size() * sizeof(std::filesystem::path::value_type) +
+            command->session.scenePath.native().size() * sizeof(std::filesystem::path::value_type);
+        if(bytes > kSceneHistoryPayloadBytes) return false;
+        SceneHistoryEntry entry{std::move(command), m_historyEpoch, bytes};
+        // Allocate history storage before mutating authored data; append is then noexcept.
+        m_sceneHistory.reserve(kSceneHistoryCapacity);
+        if(!owner->SetObjectPhysics(selection, before, after, &m_physicsEditStatus)) return false;
+        AppendSceneHistoryEntry(std::move(entry));
+        m_physicsEditStatus.clear();
+        return true;
+    }
+    catch(const std::exception& exception)
+    {
+        m_physicsEditStatus = exception.what();
+        return false;
+    }
+}
+
+void Editor::DrawObjectPhysicsControls(IDemoScene& scene)
+{
+    auto* owner = dynamic_cast<FileBackedDemoScene*>(&scene);
+    if(!owner) return;
+    const auto selection = owner->GetObjectMetadata(m_selectedObject);
+    SceneObjectDocument object;
+    if(!selection || !owner->CapturePhysicsInspection(selection->objectID, object)) return;
+    const bool changedTarget = !m_physicsInspection || m_physicsInspectionEpoch != m_historyEpoch ||
+        m_physicsInspection->objectID != selection->objectID ||
+        m_physicsInspection->runtimeIdentity != selection->runtimeIdentity ||
+        m_physicsInspection->structureRevision != selection->structureRevision;
+    const bool changedValue = m_physicsInspectedValue != object.physics;
+    const auto fields = [](Physics::PhysicsComponent& component)
+    {
+        return std::array<float*, 9>{&component.boxDimensions.width, &component.boxDimensions.height,
+            &component.boxDimensions.depth, &component.colliderLocalPositionOffset.x,
+            &component.colliderLocalPositionOffset.y, &component.colliderLocalPositionOffset.z,
+            &component.density, &component.friction, &component.restitution};
+    };
+    if(changedTarget || changedValue || IsPhysicsEditingLocked())
+    {
+        m_physicsInspection = selection;
+        m_physicsInspectionEpoch = m_historyEpoch;
+        m_physicsInspectedValue = object.physics;
+        if(changedTarget) m_physicsEditStatus.clear();
+        if(object.physics)
+        {
+            auto values = fields(*object.physics);
+            for(size_t index = 0; index < values.size(); ++index)
+                std::snprintf(m_physicsNumericText[index].data(), m_physicsNumericText[index].size(),
+                    "%.9g", *values[index]);
+        }
+    }
+    // Widget IDs include the load epoch and stable object identity: text cannot migrate on selection.
+    ImGui::PushID(static_cast<int>(m_historyEpoch));
+    ImGui::PushID(selection->objectID.c_str());
+    ImGui::Separator();
+    ImGui::BeginDisabled(IsPhysicsEditingLocked() || HasPendingSceneHistoryOperation());
+    bool enabled = object.physics.has_value();
+    if(ImGui::Checkbox("Physics", &enabled))
+        CommitObjectPhysics(scene, *selection, object.physics,
+            enabled ? std::optional<Physics::PhysicsComponent>{Physics::PhysicsComponent{}} : std::nullopt);
+    if(object.physics)
+    {
+        auto candidate = *object.physics;
+        int bodyType = static_cast<int>(candidate.bodyType);
+        if(ImGui::Combo("Body Type", &bodyType, "Static\0Dynamic\0Kinematic\0"))
+        {
+            candidate.bodyType = static_cast<Physics::BodyType>(bodyType);
+            CommitObjectPhysics(scene, *selection, object.physics, candidate);
+        }
+        ImGui::TextUnformatted("Collider Type: Box");
+        ImGui::TextWrapped("Full dimensions and local offset in meters; independent of visual scale.");
+        constexpr std::array<const char*, 9> labels{"Width (X, m)", "Height (Y, m)", "Depth (Z, m)",
+            "Local Offset X (m)", "Local Offset Y (m)", "Local Offset Z (m)",
+            "Density (kg/m3)", "Friction (>= 0)", "Restitution (Bounciness, 0..1)"};
+        for(size_t index = 0; index < labels.size(); ++index)
+        {
+            auto& text = m_physicsNumericText[index];
+            ImGui::InputText(labels[index], text.data(), text.size());
+            if(ImGui::IsItemDeactivatedAfterEdit())
+            {
+                float value = 0.0f;
+                if(!ParsePhysicsNumber(text.data(), value))
+                    m_physicsEditStatus = "Enter a complete finite number; authored value was preserved.";
+                else
+                {
+                    auto edited = *object.physics;
+                    *fields(edited)[index] = value;
+                    CommitObjectPhysics(scene, *selection, object.physics, edited);
+                }
+                // Invalid drafts are discarded on commit/focus loss, never written into the scene.
+                auto current = *object.physics;
+                std::snprintf(text.data(), text.size(), "%.9g", *fields(current)[index]);
+            }
+        }
+    }
+    if(!m_physicsEditStatus.empty()) ImGui::TextWrapped("%s", m_physicsEditStatus.c_str());
+    ImGui::EndDisabled();
+    ImGui::PopID();
+    ImGui::PopID();
+}
+
+
+bool Editor::ParsePhysicsNumber(const char* text, float& value)
+{
+    char* end = nullptr;
+    errno = 0;
+    const float parsed = std::strtof(text, &end);
+    if(end == text || errno == ERANGE || !std::isfinite(parsed)) return false;
+    while(*end == ' ' || *end == '\t') ++end;
+    if(*end != '\0') return false;
+    value = parsed;
+    return true;
+}
+
+std::optional<Editor::PrimitiveCreationRequest> Editor::TakePrimitiveCreationRequest()
+{
+    return std::exchange(m_primitiveCreationRequest,std::nullopt);
 }

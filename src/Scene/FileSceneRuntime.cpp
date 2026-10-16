@@ -123,6 +123,36 @@ bool FileSceneRuntime::ReorderObjects(const SceneObjectOrderIdentity& identity,
     return true;
 }
 
+bool FileSceneRuntime::SetObjectPhysics(const SceneObjectMetadata& selection,
+    const std::optional<Physics::PhysicsComponent>& expected,
+    const std::optional<Physics::PhysicsComponent>& replacement, std::string* errorMessage)
+{
+    const auto fail = [&](const char* message)
+    {
+        if(errorMessage) *errorMessage = message;
+        return false;
+    };
+    if(errorMessage) errorMessage->clear();
+    if(m_archiveScene || HasPreparedScene() || m_materialAssignment || m_activePresentationAssociation)
+        return fail("Physics authoring requires an idle editable scene.");
+    if(replacement && !Physics::ValidatePhysicsComponent(*replacement, errorMessage)) return false;
+    const auto current = GetObjectMetadata(selection.objectID, errorMessage);
+    if(!current) return false;
+    if(current->sceneID != selection.sceneID || current->runtimeIdentity != selection.runtimeIdentity ||
+        current->structureRevision != selection.structureRevision || current->runtimeIndex != selection.runtimeIndex)
+        return fail("Physics target belongs to a stale scene selection.");
+    const auto& objects = m_fileScene.GetDocument().objects;
+    const auto found = std::find_if(objects.begin(), objects.end(),
+        [&](const SceneObjectDocument& object) { return object.id == selection.objectID; });
+    if(found == objects.end() || found->physics != expected)
+        return fail("Physics component changed since inspection; edit rejected.");
+    if(expected == replacement) return true;
+    const size_t index = static_cast<size_t>(found - objects.begin());
+    // Validation precedes the dirty-marking commit. No runtime or presentation fields are touched.
+    m_fileScene.EditDocument().objects[index].physics = replacement;
+    return true;
+}
+
 bool FileSceneRuntime::RenameObject(const SceneObjectMetadata& selection, std::string_view expectedName,
     std::string name, std::string* errorMessage, SceneObjectNamePolicy policy)
 {
@@ -676,6 +706,8 @@ Material* FileSceneRuntime::GetPreparedMaterialAssignmentMaterial(const Material
 bool FileSceneRuntime::CommitMaterialAssignment(
     const MaterialAssignmentToken& token, Material& retainedSceneMaterial, std::string* errorMessage)
 {
+    if (m_scene.HasPhysicsPresentation())
+        return AssignmentError(errorMessage, "Clear physics presentation before legacy material assignment; use coordinated publication to retain overrides.");
     if(errorMessage)
     {
         errorMessage->clear();
@@ -1039,6 +1071,8 @@ bool FileSceneRuntime::New(
 
     DiscardPreparedScene();
     m_objectMapping = {};
+    if (m_scene.HasPhysicsPresentation()) m_scene.CommitPresentation({}, false);
+    m_activePresentationAssociation.reset();
     return true;
 }
 
@@ -1059,6 +1093,8 @@ bool FileSceneRuntime::Open(
 
     DiscardPreparedScene();
     m_objectMapping = {};
+    if (m_scene.HasPhysicsPresentation()) m_scene.CommitPresentation({}, false);
+    m_activePresentationAssociation.reset();
     return true;
 }
 
@@ -1440,4 +1476,26 @@ bool FileSceneRuntime::CaptureObjectDeletionSnapshot(std::string_view objectID,
     documentIndex = static_cast<size_t>(found - captured.objects.begin());
     object = *found;
     return true;
+}
+
+std::optional<PresentationTransform> FileSceneRuntime::GetObjectPresentation(
+    const SceneObjectMetadata& identity, std::string* errorMessage) const
+{
+    const auto current = GetObjectMetadata(identity.objectID, errorMessage);
+    if (!current)
+    {
+        return std::nullopt;
+    }
+    if (current->sceneID != identity.sceneID || current->runtimeIdentity != identity.runtimeIdentity ||
+        current->structureRevision != identity.structureRevision || current->runtimeIndex != identity.runtimeIndex ||
+        current->bindingRevision != identity.bindingRevision)
+    {
+        if (errorMessage)
+        {
+            *errorMessage = "Presentation read belongs to a stale scene object or binding.";
+        }
+        return std::nullopt;
+    }
+
+    return m_scene.GetRenderObjects()[current->runtimeIndex].GetPresentationTransform();
 }

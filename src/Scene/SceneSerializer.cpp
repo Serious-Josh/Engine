@@ -5,18 +5,77 @@
 #include <Windows.h>
 
 #include <algorithm>
+#include <cmath>
 #include <filesystem>
 #include <system_error>
 #include <fstream>
 #include <stdexcept>
+#include <set>
+#include <utility>
 
 namespace
 {
     using Json = nlohmann::json;
 
+    void ValidateFields(const Json& object, std::initializer_list<std::string_view> allowedFields)
+    {
+        if (!object.is_object())
+        {
+            throw std::runtime_error("Expected scene object fields.");
+        }
+
+        for (auto field = object.begin(); field != object.end(); ++field)
+        {
+            if (std::find(allowedFields.begin(), allowedFields.end(), field.key()) == allowedFields.end())
+            {
+                throw std::runtime_error("Unsupported scene field: " + field.key());
+            }
+        }
+    }
+
+    template <typename Input>
+    Json ParseSceneJson(Input&& input)
+    {
+        std::vector<std::set<std::string>> objectFields;
+        return Json::parse(std::forward<Input>(input), [&](int, Json::parse_event_t event, Json& value)
+        {
+            if (event == Json::parse_event_t::object_start)
+            {
+                objectFields.emplace_back();
+            }
+            else if (event == Json::parse_event_t::key)
+            {
+                if (!objectFields.back().insert(value.get<std::string>()).second)
+                {
+                    throw std::runtime_error("Duplicate scene field: " + value.get<std::string>());
+                }
+            }
+            else if (event == Json::parse_event_t::object_end)
+            {
+                objectFields.pop_back();
+            }
+            return true;
+        });
+    }
+
     Json ToJson(const Vector3& value)
     {
         return Json::array({value.x, value.y, value.z});
+    }
+
+    float ReadNumber(const Json& value, const char* fieldName)
+    {
+        if (!value.is_number())
+        {
+            throw std::runtime_error(std::string(fieldName) + " must be a number.");
+        }
+
+        const float result = value.get<float>();
+        if (!std::isfinite(result))
+        {
+            throw std::runtime_error(std::string(fieldName) + " must be finite and representable as a float.");
+        }
+        return result;
     }
 
     Vector3 ReadVector3(const Json& value)
@@ -27,9 +86,9 @@ namespace
         }
 
         return {
-            value.at(0).get<float>(),
-            value.at(1).get<float>(),
-            value.at(2).get<float>()
+            ReadNumber(value.at(0), "Vector x"),
+            ReadNumber(value.at(1), "Vector y"),
+            ReadNumber(value.at(2), "Vector z")
         };
     }
 
@@ -44,11 +103,92 @@ namespace
 
     Transform ReadTransform(const Json& value)
     {
+        ValidateFields(value, {"position", "rotation", "scale"});
         Transform result;
         result.position = ReadVector3(value.at("position"));
         result.rotation = ReadVector3(value.at("rotation"));
         result.scale = ReadVector3(value.at("scale"));
         return result;
+    }
+
+    Json ToJson(const Physics::PhysicsComponent& component)
+    {
+        const char* bodyType = nullptr;
+        switch (component.bodyType)
+        {
+        case Physics::BodyType::Static:
+            bodyType = "Static";
+            break;
+        case Physics::BodyType::Dynamic:
+            bodyType = "Dynamic";
+            break;
+        case Physics::BodyType::Kinematic:
+            bodyType = "Kinematic";
+            break;
+        default:
+            throw std::runtime_error("Unsupported physics body type.");
+        }
+
+        return {
+            {"bodyType", bodyType},
+            {"colliderType", "Box"},
+            {"boxDimensions", {
+                {"width", component.boxDimensions.width},
+                {"height", component.boxDimensions.height},
+                {"depth", component.boxDimensions.depth}
+            }},
+            {"colliderLocalPositionOffset", ToJson(component.colliderLocalPositionOffset)},
+            {"density", component.density},
+            {"friction", component.friction},
+            {"restitution", component.restitution}
+        };
+    }
+
+    Physics::PhysicsComponent ReadPhysicsComponent(const Json& value)
+    {
+        ValidateFields(value, {"bodyType", "colliderType", "boxDimensions", "colliderLocalPositionOffset",
+            "density", "friction", "restitution"});
+
+        Physics::PhysicsComponent component;
+        const auto bodyType = value.at("bodyType").get<std::string>();
+        if (bodyType == "Static")
+        {
+            component.bodyType = Physics::BodyType::Static;
+        }
+        else if (bodyType == "Dynamic")
+        {
+            component.bodyType = Physics::BodyType::Dynamic;
+        }
+        else if (bodyType == "Kinematic")
+        {
+            component.bodyType = Physics::BodyType::Kinematic;
+        }
+        else
+        {
+            throw std::runtime_error("Unsupported physics body type: " + bodyType);
+        }
+
+        if (value.at("colliderType").get<std::string>() != "Box")
+        {
+            throw std::runtime_error("Unsupported physics collider type.");
+        }
+
+        const auto& dimensions = value.at("boxDimensions");
+        ValidateFields(dimensions, {"width", "height", "depth"});
+        component.boxDimensions.width = ReadNumber(dimensions.at("width"), "Physics box width");
+        component.boxDimensions.height = ReadNumber(dimensions.at("height"), "Physics box height");
+        component.boxDimensions.depth = ReadNumber(dimensions.at("depth"), "Physics box depth");
+        component.colliderLocalPositionOffset = ReadVector3(value.at("colliderLocalPositionOffset"));
+        component.density = ReadNumber(value.at("density"), "Physics density");
+        component.friction = ReadNumber(value.at("friction"), "Physics friction");
+        component.restitution = ReadNumber(value.at("restitution"), "Physics restitution");
+
+        std::string error;
+        if (!Physics::ValidatePhysicsComponent(component, &error))
+        {
+            throw std::runtime_error(error);
+        }
+        return component;
     }
 
     Json ToJson(const SceneDocument& document)
@@ -75,6 +215,11 @@ namespace
                 }
 
                 objects.back()["materialSlotBindings"] = std::move(bindings);
+            }
+
+            if (object.physics)
+            {
+                objects.back()["physics"] = ToJson(*object.physics);
             }
         }
 
@@ -107,29 +252,39 @@ namespace
 
     SceneDocument FromJson(const Json& value)
     {
+        ValidateFields(value, {"schemaVersion", "id", "name", "camera", "directionalLight", "objects", "environmentReference"});
+        const auto& schemaVersion = value.at("schemaVersion");
+        if (!schemaVersion.is_number_integer() ||
+            (schemaVersion != SceneDocument::kLegacySchemaVersion && schemaVersion != SceneDocument::kSchemaVersion))
+        {
+            throw std::runtime_error("Unsupported scene schema version.");
+        }
+        const bool legacySchema = schemaVersion == SceneDocument::kLegacySchemaVersion;
         SceneDocument result;
 
-        result.schemaVersion = value.at("schemaVersion").get<std::uint32_t>();
+        // Loaded v1 documents migrate in memory. All subsequent saves write v2.
         result.id = value.at("id").get<std::string>();
         result.name = value.at("name").get<std::string>();
         result.environmentReference=value.value("environmentReference",std::string{});
 
         const Json& camera = value.at("camera");
+        ValidateFields(camera, {"position", "target", "verticalFov", "aspectRatio", "nearPlane", "farPlane"});
         result.camera.position = ReadVector3(camera.at("position"));
         result.camera.target = ReadVector3(camera.at("target"));
-        result.camera.verticalFov = camera.at("verticalFov").get<float>();
-        result.camera.aspectRatio = camera.at("aspectRatio").get<float>();
-        result.camera.nearPlane = camera.at("nearPlane").get<float>();
-        result.camera.farPlane = camera.at("farPlane").get<float>();
+        result.camera.verticalFov = ReadNumber(camera.at("verticalFov"), "Camera vertical FOV");
+        result.camera.aspectRatio = ReadNumber(camera.at("aspectRatio"), "Camera aspect ratio");
+        result.camera.nearPlane = ReadNumber(camera.at("nearPlane"), "Camera near plane");
+        result.camera.farPlane = ReadNumber(camera.at("farPlane"), "Camera far plane");
 
         const Json& light = value.at("directionalLight");
+        ValidateFields(light, {"direction", "color", "intensity", "ambientStrength", "angularRadius"});
         result.directionalLight.direction = ReadVector3(light.at("direction"));
         result.directionalLight.color = ReadVector3(light.at("color"));
-        result.directionalLight.intensity = light.at("intensity").get<float>();
+        result.directionalLight.intensity = ReadNumber(light.at("intensity"), "Light intensity");
         result.directionalLight.ambientStrength =
-            light.at("ambientStrength").get<float>();
+            ReadNumber(light.at("ambientStrength"), "Light ambient strength");
         result.directionalLight.angularRadius =
-            light.at("angularRadius").get<float>();
+            ReadNumber(light.at("angularRadius"), "Light angular radius");
 
         const Json& objects = value.at("objects");
 
@@ -140,6 +295,12 @@ namespace
 
         for (const Json& item : objects)
         {
+            ValidateFields(item, {"id", "name", "transform", "meshReference", "materialReference", "materialSlotBindings", "physics"});
+            if (legacySchema && item.contains("physics"))
+            {
+                throw std::runtime_error("Physics fields require scene schema version 2.");
+            }
+
             SceneObjectDocument object;
             object.id = item.at("id").get<std::string>();
             object.name = item.at("name").get<std::string>();
@@ -160,6 +321,7 @@ namespace
 
                 for(const auto& binding : bindings)
                 {
+                    ValidateFields(binding, {"slotID", "materialReference"});
                     const auto slotID = binding.at("slotID").get<std::string>();
                     const auto reference = binding.at("materialReference").get<std::string>();
 
@@ -167,6 +329,18 @@ namespace
                     {
                         throw std::runtime_error("Duplicate material-slot ID: " + slotID);
                     }
+                }
+            }
+
+            if (item.contains("physics"))
+            {
+                try
+                {
+                    object.physics = ReadPhysicsComponent(item.at("physics"));
+                }
+                catch (const std::exception& exception)
+                {
+                    throw std::runtime_error("Invalid physics for object " + object.id + ": " + exception.what());
                 }
             }
 
@@ -350,7 +524,7 @@ bool LoadSceneDocument(
             return Fail(errorMessage, "Failed to open scene file.");
         }
 
-        Json json = Json::parse(file);
+        Json json = ParseSceneJson(file);
 
         SceneDocument loaded = FromJson(json);
 
@@ -386,24 +560,7 @@ bool LoadSceneDocumentForCooking(const std::filesystem::path& path, SceneDocumen
         std::string bytes(static_cast<size_t>(size),'\0');
         if(!stream.read(bytes.data(),static_cast<std::streamsize>(bytes.size())) || stream.peek()!=std::char_traits<char>::eof())
             throw std::runtime_error("Cannot read stable bounded cooker input.");
-        const auto json = Json::parse(bytes);
-        const auto keys = [](const Json& value, std::initializer_list<std::string_view> allowed)
-        {
-            if(!value.is_object()) throw std::runtime_error("Expected scene object fields.");
-            for(auto i=value.begin();i!=value.end();++i)
-                if(std::find(allowed.begin(),allowed.end(),i.key())==allowed.end())
-                    throw std::runtime_error("Unsupported scene element: " + i.key());
-        };
-        keys(json,{"schemaVersion","id","name","camera","directionalLight","objects","environmentReference"});
-        keys(json.at("camera"),{"position","target","verticalFov","aspectRatio","nearPlane","farPlane"});
-        keys(json.at("directionalLight"),{"direction","color","intensity","ambientStrength","angularRadius"});
-        for(const auto& object:json.at("objects"))
-        {
-            keys(object,{"id","name","transform","meshReference","materialReference","materialSlotBindings"});
-            keys(object.at("transform"),{"position","rotation","scale"});
-            if(object.contains("materialSlotBindings"))
-                for(const auto& binding:object.at("materialSlotBindings")) keys(binding,{"slotID","materialReference"});
-        }
+        const auto json = ParseSceneJson(bytes);
         auto candidate = FromJson(json);
         if(!ValidateSceneDocument(candidate,error)) return false;
         document = std::move(candidate); return true;

@@ -32,6 +32,11 @@ size_t Editor::MaterialBindingPayloadBytes(const MaterialBindingsEdit& edit)
 void Editor::QueueViewportMaterialDrop(const IDemoScene& scene,
     const SceneObjectMetadata& target, const AssetID& material)
 {
+    if (IsPhysicsEditingLocked())
+    {
+        return;
+    }
+
     const auto* owner = dynamic_cast<const FileBackedDemoScene*>(&scene);
     if(!owner || !m_historySession || !RenameSessionMatches(scene, *m_historySession) ||
         (HasPendingSceneHistoryOperation() && !m_pendingMaterialBinding) || HasBlockingObjectCreation() || m_fileRequest ||

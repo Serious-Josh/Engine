@@ -2689,6 +2689,11 @@ bool Renderer::Initialize(
         return false;
     }
 
+    if(!m_packagedRuntime && !m_editorColliderPass.Initialize(device, m_shaderLibrary))
+    {
+        Log::Error("Failed to initialize editor collider line pass.");
+        return false;
+    }
     if (!m_resourceUploader.Initialize(device))
     {
         Log::Error("Failed to init resource uploader.");
@@ -3451,10 +3456,11 @@ void Renderer::DrawMaterialRange(
         return;
     }
 
+    const PresentationTransform presentation = object.GetPresentationTransform();
     ObjectConstants objectConstants{};
-    objectConstants.model = object.transform.GetModelMatrix();
+    objectConstants.model = presentation.currentModel;
 
-    objectConstants.previousModel = object.previousTransform.GetModelMatrix();
+    objectConstants.previousModel = presentation.previousModel;
 
     objectConstants.normalMatrix = objectConstants.model.Inverse().Transpose();
 
@@ -3600,10 +3606,11 @@ void Renderer::DrawSelectionMask(
         return;
     }
 
+    const PresentationTransform presentation = object.GetPresentationTransform();
     ObjectConstants objectConstants{};
-    objectConstants.model = object.transform.GetModelMatrix();
+    objectConstants.model = presentation.currentModel;
 
-    objectConstants.previousModel = object.previousTransform.GetModelMatrix();
+    objectConstants.previousModel = presentation.previousModel;
     objectConstants.normalMatrix = objectConstants.model.Inverse().Transpose();
 
     const D3D12_GPU_VIRTUAL_ADDRESS objectConstantsAddress = m_uploadBuffer.Allocate(
@@ -3710,6 +3717,11 @@ bool Renderer::InitializeSceneResources(
     const Scene& scene,
     const std::vector<Material*>& materials)
 {
+    if (scene.HasPhysicsPresentation())
+    {
+        Log::Error("Clear physics presentation before initializing another renderer scene lifetime.");
+        return false;
+    }
     if (m_sceneInitializationAttempt.candidate || m_sceneResourceScene || m_activeRecordingGeneration != 0 ||
         m_displacementExitScopeGeneration != 0)
     {
@@ -4042,6 +4054,11 @@ bool Renderer::CleanupFailedSceneInitialization(const Scene& candidate)
 
 bool Renderer::ReleaseSceneResources()
 {
+    if (m_sceneResourceScene && m_sceneResourceScene->HasPhysicsPresentation())
+    {
+        Log::Error("Clear physics presentation at the idle boundary before releasing scene resources.");
+        return false;
+    }
     if (m_sceneInitializationAttempt.candidate)
     {
         Log::Error("Partial scene initialization requires checked failed-attempt cleanup.");
@@ -4906,7 +4923,8 @@ bool Renderer::RecordRenderFrame(
         ordinaryProbe.emplace(*this, FrameHitchRegion::OrdinaryPasses);
     }
 
-    const bool tlasNeedsUpdate = hasRenderableMeshes && !scene.GetChangedTransforms().empty();
+    const bool tlasNeedsUpdate = hasRenderableMeshes &&
+        (!scene.GetChangedTransforms().empty() || !scene.GetChangedPresentationTransforms().empty());
 
     const bool displacementTLASRecorded = m_frameDisplacementPreparation.mergedTLASRecorded;
 
@@ -5660,6 +5678,16 @@ bool Renderer::RecordRenderFrame(
 
     m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::ToneMap);
 
+    // Draw only into the final editor image: temporal history and lighting must never see these lines.
+    const EditorColliderOverlay* colliderOverlay = options.editorColliderOverlay;
+    if(!m_packagedRuntime && colliderOverlay)
+    {
+        if(colliderOverlay->Matches(scene, m_sceneResourceLifetime))
+        {
+            m_editorColliderPass.Execute(commandList, m_finalSceneColor, m_gBuffer.GetDepth(),
+                currentViewProjection, colliderOverlay->colliderWorldTransforms);
+        }
+    }
     m_finalSceneColor.Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
     if(m_packagedRuntime)
@@ -5970,6 +5998,7 @@ void Renderer::Shutdown()
 
     m_deferredLightingPass.Shutdown();
     m_toneMapPass.Shutdown();
+    m_editorColliderPass.Shutdown();
     m_brdfIntegrationPass.Shutdown();
     m_ggxAverageAlbedoPass.Shutdown();
     m_rayTracedShadowPass.Shutdown();
@@ -7263,4 +7292,11 @@ bool Renderer::CanEditPendingMaterialBindings(const Scene& scene) const noexcept
         !m_activeRecordingGeneration && !m_commandSubmissionAttempted && !m_sceneInitializationAttempt.candidate &&
         !m_sceneInitializationAttempt.failed && !m_resizeFailed && !m_geometryUpdateFailed &&
         !m_displacementExitScopeGeneration && !HasUnresolvedDisplacementUpdate();
+}
+
+
+Renderer::SelectionPublicationIdentity Renderer::GetSelectionPublicationIdentity(const Scene& scene) const noexcept
+{
+    if(m_sceneResourceScene != &scene || m_sceneResourceLifetime == 0) return {};
+    return {m_sceneResourceLifetime, m_rayTracingScene.m_materialBindingEpoch};
 }

@@ -1,6 +1,9 @@
 #pragma once
 
 #include "Scene/Transform.h"
+#include "Scene/PresentationTransform.h"
+#include "Physics/RuntimePoseSnapshot.h"
+#include <optional>
 #include <map>
 #include <string>
 
@@ -21,6 +24,19 @@ struct RenderObject
     Transform transform;
     Transform previousTransform;
 
+    // Copied read of the pose already accepted by Scene; never exposes a body/session.
+    std::optional<Physics::Pose> GetPhysicsPresentationPose() const noexcept
+    {
+        return presentationPose;
+    }
+    PresentationTransform GetPresentationTransform() const
+    {
+        const Matrix4 current = presentationPose
+            ? Physics::ComposeRuntimeModelMatrix(*presentationPose, transform.scale)
+            : transform.GetModelMatrix();
+        return {current, previousPresentedModel.value_or(previousTransform.GetModelMatrix())};
+    }
+
     // Effective runtime borrows, not authored overrides. The document retains
     // overrides independently of geometry/metadata availability.
     // Pending objects may retain explicit overrides only, not a complete slot table.
@@ -32,4 +48,11 @@ struct RenderObject
         const auto found = slotMaterials.find(slotID);
         return found == slotMaterials.end() ? material : found->second;
     }
+
+private:
+    friend class Scene;
+    // Scene owns these copied values. Candidates may copy them, but never own bodies.
+    std::optional<Physics::Pose> presentationPose;
+    std::optional<Matrix4> previousPresentedModel;
+    bool presentationDirty = false;
 };

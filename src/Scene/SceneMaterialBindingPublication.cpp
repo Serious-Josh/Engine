@@ -365,7 +365,9 @@ SceneMaterialBindingPublication::Result SceneMaterialBindingPublication::Publish
             object.material=stage.fallback; committed.material=stage.fallback;
             object.slotMaterials.swap(stage.runtimeSlots); committed.slotMaterials.swap(stage.committedSlots);
             object.materialsDeferred=false; committed.materialsDeferred=false;
-            ++runtime.m_objectMapping.bindingRevisions[index]; Cancel(); return {Ready,{},true};
+            ++runtime.m_objectMapping.bindingRevisions[index];
+            runtime.RevalidatePhysicsPresentationBindings(renderer);
+            Cancel(); return {Ready,{},true};
         }
         if(stage.noOp) { Cancel(); return {Ready, "Bindings are unchanged.", false}; }
         auto& resources = renderer.m_rayTracingScene;
@@ -397,6 +399,7 @@ SceneMaterialBindingPublication::Result SceneMaterialBindingPublication::Publish
         resources.m_membership->slotMaterialIndices.swap(stage.indices);
         resources.m_membership->instanceRecords.swap(stage.records);
         ++resources.m_materialBindingEpoch;
+        runtime.RevalidatePhysicsPresentationBindings(renderer);
         *retired = std::move(stage.retirement);
         Cancel();
         return {Ready, {}, true};

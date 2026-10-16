@@ -20,6 +20,7 @@
 #include "Scene/MeshResidencyPublication.h"
 #include "Scene/SceneMembershipPublication.h"
 #include "Scene/SceneMaterialBindingPublication.h"
+#include "Engine/PhysicsSimulationController.h"
 #include <chrono>
 
 #include <cstdint>
@@ -164,6 +165,15 @@ class Engine
     }
 
     private:
+    friend class PresentationTransformVerification;
+    PhysicsSimulationController m_physicsSimulation;
+    std::string m_physicsMessage;
+    bool CanStartEditorPhysics() const;
+    void RefreshEditorPhysicsStatus(bool compatibleScene);
+    void ProcessEditorPhysicsSimulation(FileSceneRuntime* runtime, double elapsedSeconds, bool compatibleScene);
+    bool StopEditorPhysicsSimulation(FileSceneRuntime& runtime);
+    bool DrainAndResolveEditorScene(IDemoScene& scene);
+    bool PhysicsBlocksSceneEdits() const noexcept;
     friend class MaterialLocateVerification;
     friend class ViewportPanVerification;
     struct EditorMembershipOperation
@@ -177,6 +187,8 @@ class Engine
     };
     SceneMembershipPublication m_editorMembership;
     std::optional<EditorMembershipOperation> m_pendingEditorMembership;
+    std::optional<EditorColliderOverlay> CaptureEditorColliderOverlayForFrame(const FileSceneRuntime*, bool editableScene) const;
+    bool BeginPrimitiveCreation(const Editor::PrimitiveCreationRequest&, std::string& error);
     bool BeginEditorMembership(Editor::HistoryReplayRequest,bool replay,std::string& error,
         std::optional<SceneObjectMetadata> deletion = {});
     bool BeginEditorMembershipDeletion(const SceneObjectMetadata&,std::string&);

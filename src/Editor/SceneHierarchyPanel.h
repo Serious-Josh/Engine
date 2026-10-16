@@ -1,12 +1,15 @@
 #pragma once
 
 #include "EditorWorkspace.h"
+#include <span>
+#include "assets/PrimitiveMeshAssets.h"
 #include "HierarchyDragPayload.h"
 #include "Scene/SceneHierarchySnapshot.h"
 
 class SceneHierarchyPanel
 {
 public:
+    std::optional<ScenePrimitive> TakePrimitiveRequest();
     bool IsFocused() const noexcept { return m_focused; }
     void BeginRename(const std::string& objectID, const std::string& name);
     void CancelRename();
@@ -23,7 +26,7 @@ public:
     std::optional<std::size_t> Draw(const EditorWorkspaceRect& rectangle,
         const SceneHierarchySnapshot& snapshot, std::optional<std::size_t> selectedObject,
         const void* sceneIdentity, const std::string& error,
-        const HierarchyDragIdentity& dragIdentity, bool allowReorder);
+        const HierarchyDragIdentity& dragIdentity, bool allowReorder, bool allowCreation = false, std::span<const std::size_t> selectedObjects = {});
 
 private:
     void DrawRenameInput();
@@ -39,4 +42,5 @@ private:
     std::optional<HierarchyReorderRequest> m_reorderRequest;
     bool m_focusRename = false;
     bool m_focused = false;
+    std::optional<ScenePrimitive> m_primitiveRequest;
 };

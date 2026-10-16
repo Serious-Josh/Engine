@@ -72,6 +72,19 @@ namespace
             return false;
         }
 
+        // The existing release/switch/shutdown boundary also invalidates temporary
+        // presentation. Clearing only copies CPU values; it adds no GPU wait.
+        if (activeDemo.GetScene().HasPhysicsPresentation())
+        {
+            auto* fileScene = dynamic_cast<FileBackedDemoScene*>(&activeDemo);
+            std::string error;
+            if (!fileScene || !fileScene->ClearPhysicsPresentation(renderer, error))
+            {
+                Log::Error("Cannot clear physics presentation before scene release: " + error);
+                return false;
+            }
+        }
+
         if (completed.requestRevision == 0)
         {
             return true; // No submission finalized, including canceled prepared requests.
@@ -91,6 +104,30 @@ namespace
     }
 }
 
+bool Engine::DrainAndResolveEditorScene(IDemoScene& scene)
+{
+    auto* fileScene = dynamic_cast<FileBackedDemoScene*>(&scene);
+    if (PhysicsBlocksSceneEdits() && fileScene)
+    {
+        // Stop advancement before teardown. If cleanup is pending, the existing
+        // checked teardown below explicitly invalidates copied presentation.
+        StopEditorPhysicsSimulation(*fileScene->m_runtime);
+    }
+    if (!DrainAndResolveSceneDisplacement(m_renderer, scene))
+    {
+        return false;
+    }
+    if (PhysicsBlocksSceneEdits())
+    {
+        if (!fileScene || !StopEditorPhysicsSimulation(*fileScene->m_runtime))
+        {
+            return false;
+        }
+    }
+    RefreshEditorPhysicsStatus(false);
+    return true;
+}
+
 bool Engine::RequestMaterialAssignment(
     const SceneObjectMetadata& selection, std::string reference, std::string& error)
 {
@@ -99,6 +136,12 @@ bool Engine::RequestMaterialAssignment(
 
 bool Engine::QueueMaterialAssignment(MaterialAssignmentRequest request, std::string& error)
 {
+    if (PhysicsBlocksSceneEdits())
+    {
+        error = "Stop physics before editing scene objects or bindings.";
+        return false;
+    }
+
     error.clear();
     const auto& selection = request.selection;
 
@@ -383,7 +426,7 @@ bool Engine::ExecuteMaterialAssignment()
 
     feedback.message = "Renderer update failed. See the log for recovery details.";
 
-    if(!DrainAndResolveSceneDisplacement(m_renderer, *owner))
+    if(!DrainAndResolveEditorScene(*owner))
     {
         Log::Error("Material assignment drain failed; retaining assets and stopping.");
         cancel();
@@ -571,7 +614,7 @@ bool Engine::ActivateRequestedFileScene()
 
     SceneSwitchTiming::Measure drainTiming(SceneSwitchTiming::Stage::DrainRelease);
 
-    if (!DrainAndResolveSceneDisplacement(m_renderer, *previous))
+    if (!DrainAndResolveEditorScene(*previous))
     {
         Log::Error("Displacement drain failed before file scene activation; retaining both scene owners.");
         return false;
@@ -704,6 +747,11 @@ void Engine::QueueEditorSceneOperation()
 
 void Engine::ProcessEditorMaterialRequests()
 {
+    if (PhysicsBlocksSceneEdits())
+    {
+        return;
+    }
+
     if(const auto request = m_editor.TakeMaterialCreationRequest())
     {
         const ProjectPaths projectPaths(ProjectLocator::GetDefaultProjectRoot());
@@ -1414,6 +1462,16 @@ void Engine::Frame()
         }
     }
 
+    if (PhysicsBlocksSceneEdits() && (m_demoSceneManager.HasPendingSceneChange() || m_pendingEditorMembership))
+    {
+        auto* owner = dynamic_cast<FileBackedDemoScene*>(m_demoSceneManager.TryGetActiveScene());
+        if (!owner || !StopEditorPhysicsSimulation(*owner->m_runtime))
+        {
+            RefreshEditorPhysicsStatus(owner && !owner->IsArchiveActivation());
+            return; // Defer the incompatible publication; retain its original owner.
+        }
+    }
+
     if(!AdvanceEditorMembership()) { m_window.Close(); return; }
     bool materialAssignmentSafe = false;
 
@@ -1498,7 +1556,7 @@ void Engine::Frame()
             m_automaticMeshResidency = {};
             m_automaticResidencyIntent = 0;
 
-            if (!DrainAndResolveSceneDisplacement(m_renderer, m_demoSceneManager.GetActiveScene()))
+            if (!DrainAndResolveEditorScene(m_demoSceneManager.GetActiveScene()))
             {
                 Log::Error("GPU drain or displacement resolution failed before scene switch; requesting shutdown.");
 
@@ -1592,11 +1650,18 @@ void Engine::Frame()
                                       m_pendingSceneObjectRestoration.has_value() || m_pendingSceneObjectDeletion.has_value() ||
                                       m_pendingMaterialAssignment.has_value() || m_pendingEditorSceneOperation.has_value() ||
                                       m_demoSceneManager.HasPendingSceneChange());
+    const auto* physicsOwner = dynamic_cast<const FileBackedDemoScene*>(&activeDemo);
+    RefreshEditorPhysicsStatus(physicsOwner && !physicsOwner->IsArchiveActivation());
     const auto& viewportRectangle = m_editor.PrepareWorkspace(activeDemo, m_demoSceneManager, debugUI);
     const ImVec2 framebufferScale = ImGui::GetIO().DisplayFramebufferScale;
 
     if(viewportRectangle.size.x <= 0.0f || viewportRectangle.size.y <= 0.0f)
     {
+        // The menu remains usable with a hidden/empty viewport. Honor Stop and
+        // cleanup retries without advancing time or successful-frame history.
+        auto* owner = dynamic_cast<FileBackedDemoScene*>(&activeDemo);
+        ProcessEditorPhysicsSimulation(owner ? owner->m_runtime.get() : nullptr, 0.0,
+            owner && !owner->IsArchiveActivation());
         m_editor.SuspendViewportInteraction();
         ImGui::EndFrame();
         return;
@@ -1642,6 +1707,8 @@ void Engine::Frame()
                                     static_cast<float>(finalSceneImage.height));
 
     const ProjectPaths inspectorPaths(ProjectLocator::GetDefaultProjectRoot());
+    auto viewportPublication = m_renderer.GetSelectionPublicationIdentity(activeDemo.GetScene());
+    m_editor.SetViewportPublicationIdentity(viewportPublication.rendererLifetime, viewportPublication.bindingEpoch);
     m_editor.Draw(activeDemo, m_demoSceneManager, debugUI, finalSceneImage.srv.ptr,
                   finalSceneImage.width, finalSceneImage.height, m_time.GetDeltaTime(),
                   inspectorPaths, m_projectAssetRegistry, m_renderer.GetMaterialPreviewImage());
@@ -1735,6 +1802,11 @@ void Engine::Frame()
         if(!BeginEditorMembership(std::move(*request),false,error))
             m_editor.CompleteObjectDeletionHistory(operationID,epoch,false,error);
     }
+    if(auto request=m_editor.TakePrimitiveCreationRequest())
+    {
+        std::string error;
+        if(!BeginPrimitiveCreation(*request,error)) m_editor.OnMeshCreationCompleted(false,error);
+    }
     if(auto request = m_editor.TakeMeshCreationRequest())
     {
         const auto* owner = dynamic_cast<const FileBackedDemoScene*>(&activeDemo);
@@ -1820,7 +1892,7 @@ void Engine::Frame()
             m_renderer,
             Renderer::FrameHitchRegion::EngineRebuild);
 
-        if (!DrainAndResolveSceneDisplacement(m_renderer, activeDemo))
+        if (!DrainAndResolveEditorScene(activeDemo))
         {
             Log::Error("GPU drain or displacement resolution failed before scene rebuild; requesting shutdown.");
 
@@ -1990,6 +2062,26 @@ void Engine::Frame()
     }
 
     ProcessViewportMaterialAssignment(activeDemo);
+    auto* physicsScene = dynamic_cast<FileBackedDemoScene*>(&activeDemo);
+    ProcessEditorPhysicsSimulation(physicsScene ? physicsScene->m_runtime.get() : nullptr,
+        m_time.GetDeltaTime(), physicsScene && !physicsScene->IsArchiveActivation());
+    // Capture after physics publication so mesh and collider use the same accepted pose.
+    // This stack-owned payload outlives the synchronous Render call; Renderer retains none of it.
+    const auto colliderOverlay = CaptureEditorColliderOverlayForFrame(
+        physicsScene ? physicsScene->m_runtime.get() : nullptr, physicsScene && !physicsScene->IsArchiveActivation());
+    if(colliderOverlay)
+    {
+        rendererOptions.editorColliderOverlay = &*colliderOverlay;
+    }
+    // Re-evaluate preview after accepted physics publication, at the normal selection submission seam.
+    viewportPublication = m_renderer.GetSelectionPublicationIdentity(activeScene);
+    m_editor.SetViewportPublicationIdentity(viewportPublication.rendererLifetime, viewportPublication.bindingEpoch);
+    m_editor.RefreshViewportMarqueePreview(activeDemo);
+    if(const auto* marqueePreview = m_editor.GetViewportMarqueePreview(activeDemo))
+    {
+        rendererOptions.selectedObject = (std::numeric_limits<std::size_t>::max)();
+        rendererOptions.selectedObjects = *marqueePreview;
+    }
     const Renderer::FrameRenderResult renderResult = m_renderer.Render(activeScene, rendererOptions);
     renderProbe.reset();
 
@@ -2067,7 +2159,7 @@ void Engine::Shutdown()
     }
     else
     {
-        if (!DrainAndResolveSceneDisplacement(m_renderer, *activeDemo))
+        if (!DrainAndResolveEditorScene(*activeDemo))
         {
             Log::Error(
                 "Engine shutdown: GPU drain or displacement "
@@ -2478,6 +2570,12 @@ bool Engine::RequestSceneObjectCreation(
     std::string meshReference, const Transform& transform, std::string& error,
     std::string materialReference, std::string name)
 {
+    if (PhysicsBlocksSceneEdits())
+    {
+        error = "Stop physics before editing scene objects or bindings.";
+        return false;
+    }
+
     error.clear();
     auto* owner = dynamic_cast<FileBackedDemoScene*>(m_demoSceneManager.TryGetActiveScene());
 
@@ -2583,7 +2681,7 @@ bool Engine::ExecuteSceneObjectCreation()
     CancelMeshResidencyAcceptance();
     m_meshPreparation.Invalidate();
 
-    if(!DrainAndResolveSceneDisplacement(m_renderer, *owner) || !m_renderer.ReleaseSceneResources())
+    if(!DrainAndResolveEditorScene(*owner) || !m_renderer.ReleaseSceneResources())
     {
         result.error = "Object creation could not prove renderer release safety; retaining both runtimes and stopping.";
         Log::Error(result.error);
@@ -2674,6 +2772,12 @@ bool Engine::RequestSceneObjectDeletion(std::string_view objectID, std::string& 
 bool Engine::RequestSceneObjectDeletion(const SceneObjectMetadata& selection, std::string& error,
     std::optional<Editor::HistoryReplayIdentity> replay)
 {
+    if (PhysicsBlocksSceneEdits())
+    {
+        error = "Stop physics before editing scene objects or bindings.";
+        return false;
+    }
+
     error.clear();
     const auto* owner = dynamic_cast<const FileBackedDemoScene*>(m_demoSceneManager.TryGetActiveScene());
 
@@ -2853,7 +2957,7 @@ bool Engine::ExecuteSceneObjectDeletion()
     CancelMeshResidencyAcceptance();
     m_meshPreparation.Invalidate();
 
-    if(!DrainAndResolveSceneDisplacement(m_renderer, *owner) || !m_renderer.ReleaseSceneResources())
+    if(!DrainAndResolveEditorScene(*owner) || !m_renderer.ReleaseSceneResources())
     {
         result.error = "Object deletion could not prove renderer release safety; retaining both runtimes and stopping.";
         Log::Error(result.error);
@@ -2947,6 +3051,12 @@ bool Engine::RequestSceneObjectRestoration(const SceneObjectDocument& object, si
     const SceneObjectRestorationIdentity& identity, std::string& error, bool selectRestored,
     std::optional<Editor::HistoryReplayIdentity> replay)
 {
+    if (PhysicsBlocksSceneEdits())
+    {
+        error = "Stop physics before editing scene objects or bindings.";
+        return false;
+    }
+
     error.clear();
     const auto* owner = dynamic_cast<const FileBackedDemoScene*>(m_demoSceneManager.TryGetActiveScene());
     const auto current = GetSceneObjectRestorationIdentity();
@@ -3125,7 +3235,7 @@ bool Engine::ExecuteSceneObjectRestoration()
     CancelMeshResidencyAcceptance();
     m_meshPreparation.Invalidate();
 
-    if(!DrainAndResolveSceneDisplacement(m_renderer, *owner) || !m_renderer.ReleaseSceneResources())
+    if(!DrainAndResolveEditorScene(*owner) || !m_renderer.ReleaseSceneResources())
     {
         result.error = "Object restoration could not prove renderer release safety; retaining both runtimes and stopping.";
         Log::Error(result.error);
@@ -4155,4 +4265,21 @@ bool Engine::StartBuildGame(BuildGame::Settings settings,std::string& error)
     BuildGame::Request request{std::move(settings),scene->m_runtime->GetFileScene().GetDocument(),m_projectAssetRegistry,
         scene->GetProjectRoot(),WindowsWindow::GetExecutableDirectory()/"assets"/"Shaders",std::filesystem::path(ENGINE_RUNTIME_DEPLOY_DIR)};
     return m_buildGame.Start(std::move(request),error);
+}
+
+
+std::optional<EditorColliderOverlay> Engine::CaptureEditorColliderOverlayForFrame(const FileSceneRuntime* runtime, bool editableScene) const
+{
+    // Skip construction and capture entirely when hidden. Simulation/presentation still run normally.
+    if(!m_editor.ArePhysicsCollidersVisible() || !runtime || !editableScene)
+    {
+        return std::nullopt;
+    }
+    EditorColliderOverlay capturedOverlay;
+    std::string captureError;
+    if(!runtime->CaptureEditorColliderOverlay(m_renderer, capturedOverlay, captureError))
+    {
+        return std::nullopt;
+    }
+    return capturedOverlay;
 }

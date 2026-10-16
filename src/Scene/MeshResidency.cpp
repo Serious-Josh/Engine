@@ -498,6 +498,8 @@ MeshResidencySourceLock FileSceneRuntime::ValidatePreparedMeshResidency(const Me
 
 bool FileSceneRuntime::CommitMeshResidency(const MeshResidencyToken& token, FileSceneAssetCatalog& catalog, std::string* error)
 {
+    if (m_scene.HasPhysicsPresentation())
+        return Fail(error, "Active physics presentation requires coordinated renderer residency publication.");
     auto source = ValidatePreparedMeshResidency(token, catalog, error);
 
     if (!source)
