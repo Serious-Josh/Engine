@@ -36,6 +36,7 @@
 #include <chrono>
 #include <atomic>
 #include <optional>
+#include <stdexcept>
 
 namespace
 {
@@ -660,6 +661,60 @@ bool Renderer::ExecuteTrackedRecording(unsigned int frameSlot)
     }
 
     return executed;
+}
+
+void Renderer::SubmitArchiveMaterialProgress(unsigned int frameSlot)
+{
+    const auto requireProgress = [](bool condition, const std::string& message)
+    {
+        if (!condition)
+        {
+            throw std::runtime_error(message);
+        }
+    };
+
+    requireProgress(BeginTrackedRecording(frameSlot), "Archive admission cannot begin tracked frame.");
+
+    // Capture both identities before uploads; End invalidates active recording eligibility.
+    const auto recordingGeneration = m_activeRecordingGeneration;
+    const auto recordedMaterialRevision = m_materialPublication.revision;
+    auto* commandList = m_commandContext.GetCommandList();
+    RecordPreparedTextureUploads(commandList);
+
+    // Preserve short circuit and the archive failure policy: a false Execute may follow
+    // queue execution. Neither failed recording nor uncertain submission permits cleanup here.
+    requireProgress(RecordMaterialTable(frameSlot, commandList) && EndTrackedRecording() &&
+                        ExecuteTrackedRecording(frameSlot),
+                    "Archive material frame submission failed.");
+
+    const auto submissionFence = m_commandContext.GetLastSubmissionFenceValue();
+    const bool confirmed = ConfirmRecordedMaterialSubmission(
+        frameSlot, recordingGeneration, recordedMaterialRevision, submissionFence);
+    requireProgress(confirmed, "Archive texture dependency submission failed.");
+}
+
+bool Renderer::ConfirmRecordedMaterialSubmission(
+    unsigned int frameSlot,
+    std::uint64_t recordingGeneration,
+    std::uint64_t recordedRevision,
+    std::uint64_t submissionFence)
+{
+    // Uploads acquire the exact generation/fence before the slot's dependencies do.
+    // A dependency failure can therefore leave uploads associated; do not roll them back.
+    for (auto& entry : m_preparedTextureUploads)
+    {
+        entry.upload->ConfirmSubmission(recordingGeneration, submissionFence);
+    }
+
+    if (!m_materialDependencies.Confirm(frameSlot, submissionFence))
+    {
+        return false;
+    }
+
+    // Publish the submitted table revision only after dependency association succeeds.
+    // Uncertainty, logging and exceptions remain each caller's responsibility.
+    m_materialPublication.ConfirmSubmission(frameSlot, recordedRevision);
+    return true;
 }
 
 bool Renderer::BeginPendingDisplacementCoverage()
@@ -4598,14 +4653,124 @@ Renderer::FrameRenderResult Renderer::Render(
     return FrameRenderResult::Rendered;
 }
 
-bool Renderer::RecordRenderFrame(
+CameraConstants Renderer::BuildFrameCameraConstants(
+    const Matrix4& currentView,
+    const Matrix4& currentViewProjection,
+    const Matrix4& previousView,
+    const Matrix4& previousViewProjection,
+    bool hasPreviousViewProjection)
+{
+    CameraConstants cameraConstants{};
+    cameraConstants.viewProjection = currentViewProjection;
+    cameraConstants.previousViewProjection =
+        hasPreviousViewProjection ? previousViewProjection : currentViewProjection;
+    cameraConstants.view = currentView;
+    cameraConstants.previousView = hasPreviousViewProjection ? previousView : currentView;
+    return cameraConstants;
+}
 
+void Renderer::RecordSceneSelectionMask(
+    ID3D12GraphicsCommandList* commandList,
+    const Scene& scene,
+    const RendererOptions& options,
+    D3D12_GPU_VIRTUAL_ADDRESS cameraConstantsAddress)
+{
+    // BeginTrackedRecording acquired this slot; End has not invalidated it yet.
+    const unsigned int frameSlot = m_activeRecordingSlot;
+
+    m_gpuTimestampProfiler.BeginRegion(commandList, frameSlot, GpuTimestampProfiler::Region::SelectionMask);
+
+    m_selectionMask.Transition(commandList, D3D12_RESOURCE_STATE_RENDER_TARGET);
+
+    const float maskClearColor[] = {0.0f, 0.0f, 0.0f, 1.0f};
+    commandList->ClearRenderTargetView(m_selectionMask.GetRTV(), maskClearColor, 0, nullptr);
+
+    const auto& renderObjects = scene.GetRenderObjects();
+
+    const size_t selectionCount = options.selectedObjects.empty() ? 1 : options.selectedObjects.size();
+    for (size_t selection = 0; selection < selectionCount; ++selection)
+    {
+        const auto index = options.selectedObjects.empty() ? options.selectedObject : options.selectedObjects[selection];
+        if (index >= renderObjects.size())
+        {
+            continue;
+        }
+        const RenderObject& selectedObject = renderObjects[index];
+
+        if (selectedObject.mesh)
+        {
+            DepthBuffer& depth = m_gBuffer.GetDepth();
+
+            depth.Transition(commandList, D3D12_RESOURCE_STATE_DEPTH_READ);
+
+            const D3D12_CPU_DESCRIPTOR_HANDLE maskRTV = m_selectionMask.GetRTV();
+            const D3D12_CPU_DESCRIPTOR_HANDLE depthDSV = depth.GetReadOnlyDSV();
+
+            commandList->OMSetRenderTargets(1, &maskRTV, FALSE, &depthDSV);
+
+            DrawSelectionMask(commandList, selectedObject, cameraConstantsAddress);
+        }
+    }
+
+    m_selectionMask.Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+
+    m_gpuTimestampProfiler.EndRegion(commandList, frameSlot, GpuTimestampProfiler::Region::SelectionMask);
+}
+
+bool Renderer::RecordAmbientOcclusionPasses(
+    ID3D12GraphicsCommandList* commandList,
+    unsigned int frameSlot,
+    const AOConstants& constants,
+    const ShadowConstants& shadowConstants,
+    unsigned int width,
+    unsigned int height)
+{
+    // Preserve upload failure before any AO history reset or radius mutation.
+    const D3D12_GPU_VIRTUAL_ADDRESS aoConstantsAddress =
+        m_uploadBuffer.Allocate(&constants, sizeof(AOConstants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
+
+    if (aoConstantsAddress == 0)
+    {
+        Log::Error("Failed to allocate ray traced AO constants.");
+        return false;
+    }
+
+    if (!m_aoExecutedLastFrame || m_previousAORadius != constants.maxDistance)
+    {
+        m_aoTemporalPass.ResetHistory();
+    }
+
+    m_previousAORadius = constants.maxDistance;
+
+    m_gpuTimestampProfiler.BeginRegion(commandList, frameSlot, GpuTimestampProfiler::Region::RayTracedAO);
+    m_rayTracedAOPass.Execute(m_commandContext.GetRayTracingCommandList(), m_resourceDescriptorHeap,
+                              m_rayTracingScene, aoConstantsAddress, width, height);
+    m_gpuTimestampProfiler.EndRegion(commandList, frameSlot, GpuTimestampProfiler::Region::RayTracedAO);
+
+    m_gpuTimestampProfiler.BeginRegion(commandList, frameSlot, GpuTimestampProfiler::Region::AOTemporal);
+    m_aoTemporalPass.Execute(commandList, m_rayTracedAOPass.GetRawAOTexture(), m_gBuffer, m_uploadBuffer,
+                             constants.inverseViewProjection, shadowConstants.previousViewProjection,
+                             shadowConstants.previousInverseViewProjection, width, height);
+    m_gpuTimestampProfiler.EndRegion(commandList, frameSlot, GpuTimestampProfiler::Region::AOTemporal);
+
+    m_gpuTimestampProfiler.BeginRegion(commandList, frameSlot, GpuTimestampProfiler::Region::AODenoise);
+    m_aoDenoisePass.Execute(commandList, m_aoTemporalPass.GetAccumulatedAOTexture(), m_gBuffer, m_uploadBuffer,
+                            constants.inverseViewProjection, width, height);
+    m_gpuTimestampProfiler.EndRegion(commandList, frameSlot, GpuTimestampProfiler::Region::AODenoise);
+
+    m_aoResolvePass.Execute(commandList, m_aoDenoisePass.GetFilteredAOTexture(), m_gBuffer.GetDepth(),
+                            m_gBuffer.GetSurface(), m_uploadBuffer, m_sceneWidth, m_sceneHeight);
+
+    return true;
+}
+
+bool Renderer::RecordRenderFrame(
     const Scene& scene,
     const RendererOptions& options)
 {
     FinalSceneImage finalImage{};
 
-    if(!TryGetFinalSceneImage(finalImage) || !m_swapChain.GetCurrentBackBuffer())
+    if (!TryGetFinalSceneImage(finalImage) || !m_swapChain.GetCurrentBackBuffer())
     {
         Log::Error("Scene presentation requires a valid final texture and application backbuffer.");
         return false;
@@ -4618,6 +4783,7 @@ bool Renderer::RecordRenderFrame(
         validationProbe.emplace(*this, FrameHitchRegion::InitialValidation);
     }
 
+    // Eligibility is scoped to recording; invalidation does not discard commands or release owners.
     RecordingEligibilityScope recordingEligibility{*this};
     const bool preparedDisplacement =
         kEnableFrameIntegratedDisplacement && m_pendingDisplacementUpdate.status == DisplacementUpdateStatus::Prepared;
@@ -4659,6 +4825,7 @@ bool Renderer::RecordRenderFrame(
         preBeginProbe.emplace(*this, FrameHitchRegion::PreBegin);
     }
 
+    // Preserve cadence and feature setup before acquiring the selected allocator/upload slot.
     const bool hasPreviousExecute = m_hasPreviousRenderExecute;
 
     // Any early return breaks the sequence; only a completed frame re-arms it.
@@ -4688,7 +4855,6 @@ bool Renderer::RecordRenderFrame(
         {
             if (!completed)
             {
-
                 pass.ResetHistory();
             }
         }
@@ -4733,6 +4899,7 @@ bool Renderer::RecordRenderFrame(
 
     preBeginProbe.reset();
     const auto beginStart = CpuTiming::Clock::now();
+    // Begin performs the existing slot-fence wait/reset before any per-slot upload writes.
     const bool beganRecording = BeginTrackedRecording(frameIndex);
     m_cpuFrameTiming.begin = CpuTiming::MillisecondsSince(beginStart);
     m_cpuFrameTiming.fenceWaited = m_commandContext.DidBeginWaitForFence();
@@ -4785,6 +4952,7 @@ bool Renderer::RecordRenderFrame(
         return false;
     }
 
+    // Recovery must cover every later exit, including execution and Present failure.
     std::optional<DisplacementFrameExitScope> displacementExit;
 
     if (displacementFrame)
@@ -4851,17 +5019,18 @@ bool Renderer::RecordRenderFrame(
     }
 
     ID3D12GraphicsCommandList* commandList = m_commandContext.GetCommandList();
+    // Keep generation/revision evidence through End, which invalidates active eligibility.
     const auto textureUploadGeneration = m_activeRecordingGeneration;
     RecordPreparedTextureUploads(commandList); // Copies/transitions precede every material consumer.
     const auto materialRevision = m_materialPublication.revision;
 
-    if(!RecordMaterialTable(frameIndex, commandList))
+    if (!RecordMaterialTable(frameIndex, commandList))
     {
         Log::Error("Failed to record frame-slot material publication.");
         return false;
     }
 
-    if(materialRevision != m_materialPublication.lastSubmitted)
+    if (materialRevision != m_materialPublication.lastSubmitted)
     {
         ResetSceneHistory();
     }
@@ -4873,6 +5042,7 @@ bool Renderer::RecordRenderFrame(
     m_currentFrameStatistics.renderObjectCount = static_cast<uint64_t>(scene.GetRenderObjects().size());
     m_currentFrameStatistics.tlasInstanceCount = static_cast<uint64_t>(m_rayTracingScene.GetInstanceCount());
 
+    // Acquired-slot reset and diagnostic binding are also displacement eligibility evidence.
     m_uploadBuffer.Reset(frameIndex);
     ObserveFrameUploadReset(frameIndex);
 
@@ -4923,6 +5093,7 @@ bool Renderer::RecordRenderFrame(
         ordinaryProbe.emplace(*this, FrameHitchRegion::OrdinaryPasses);
     }
 
+    // Accepted authored/physics presentation updates TLAS; displacement may already have recorded it.
     const bool tlasNeedsUpdate = hasRenderableMeshes &&
         (!scene.GetChangedTransforms().empty() || !scene.GetChangedPresentationTransforms().empty());
 
@@ -4931,7 +5102,7 @@ bool Renderer::RecordRenderFrame(
     m_debugUI.SetTLASUpdated(hasRenderableMeshes &&
         (displacementTLASRecorded || tlasNeedsUpdate || m_pendingGeometryTLASRefresh[frameIndex]));
 
-    if(hasRenderableMeshes && !displacementTLASRecorded && (tlasNeedsUpdate || m_pendingGeometryTLASRefresh[frameIndex]))
+    if (hasRenderableMeshes && !displacementTLASRecorded && (tlasNeedsUpdate || m_pendingGeometryTLASRefresh[frameIndex]))
     {
         const auto previousTLASRecording = m_rayTracingScene.GetTLASRecordingIdentity();
 
@@ -4969,6 +5140,7 @@ bool Renderer::RecordRenderFrame(
         }
     }
 
+    // Assemble/upload constants in place; later camera/light/sample writes remain stateful.
     const Camera& camera = scene.GetCamera();
     const DirectionalLight& light = scene.GetDirectionalLight();
 
@@ -4976,19 +5148,14 @@ bool Renderer::RecordRenderFrame(
     const Matrix4 currentProjection = camera.GetProjectionMatrix();
     const Matrix4 currentViewProjection = currentProjection * currentView;
 
-    CameraConstants cameraConstants{};
-    cameraConstants.viewProjection = currentViewProjection;
-    cameraConstants.previousViewProjection =
-        m_hasPreviousViewProjection ? m_previousViewProjection : currentViewProjection;
-    cameraConstants.view = currentView;
-    cameraConstants.previousView = m_hasPreviousViewProjection ? m_previousView : currentView;
+    CameraConstants cameraConstants = BuildFrameCameraConstants(
+        currentView, currentViewProjection, m_previousView, m_previousViewProjection, m_hasPreviousViewProjection);
 
     const Matrix4 previousNrdView = m_hasPreviousNrdCamera ? m_previousNrdView : currentView;
 
     const Matrix4 previousNrdProjection = m_hasPreviousNrdCamera ? m_previousNrdProjection : currentProjection;
 
     D3D12_GPU_VIRTUAL_ADDRESS cameraConstantsAddress = m_uploadBuffer.Allocate(
-
         &cameraConstants, sizeof(CameraConstants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
 
     if (cameraConstantsAddress == 0)
@@ -5043,6 +5210,7 @@ bool Renderer::RecordRenderFrame(
         return false;
     }
 
+    // These history resets/writes intentionally precede later uploads and recording failures.
     const Vector3 currentLightDirection = light.direction.Normalized();
 
     if (m_hasPreviousShadowLightDirection)
@@ -5151,7 +5319,6 @@ bool Renderer::RecordRenderFrame(
     m_hasPreviousViewProjection = true;
 
     D3D12_GPU_VIRTUAL_ADDRESS shadowConstantsAddress = m_uploadBuffer.Allocate(
-
         &shadowConstants, sizeof(ShadowConstants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
 
     if (shadowConstantsAddress == 0)
@@ -5243,6 +5410,7 @@ bool Renderer::RecordRenderFrame(
 
     m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::Geometry);
 
+    // Selection uses geometry depth before EndGeometryPass transitions the G-buffer for consumers.
     BeginGeometryPass(commandList);
 
     for (const RenderObject& object : scene.GetRenderObjects())
@@ -5251,40 +5419,7 @@ bool Renderer::RecordRenderFrame(
     }
 
     m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::Geometry);
-    m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::SelectionMask);
-
-    m_selectionMask.Transition(commandList, D3D12_RESOURCE_STATE_RENDER_TARGET);
-
-    const float maskClearColor[] = {0.0f, 0.0f, 0.0f, 1.0f};
-    commandList->ClearRenderTargetView(m_selectionMask.GetRTV(), maskClearColor, 0, nullptr);
-
-    const auto& renderObjects = scene.GetRenderObjects();
-
-    const size_t selectionCount = options.selectedObjects.empty() ? 1 : options.selectedObjects.size();
-    for(size_t selection = 0; selection < selectionCount; ++selection)
-    {
-        const auto index = options.selectedObjects.empty() ? options.selectedObject : options.selectedObjects[selection];
-        if(index >= renderObjects.size()) continue;
-        const RenderObject& selectedObject = renderObjects[index];
-
-        if (selectedObject.mesh)
-        {
-            DepthBuffer& depth = m_gBuffer.GetDepth();
-
-            depth.Transition(commandList, D3D12_RESOURCE_STATE_DEPTH_READ);
-
-            const D3D12_CPU_DESCRIPTOR_HANDLE maskRTV = m_selectionMask.GetRTV();
-            const D3D12_CPU_DESCRIPTOR_HANDLE depthDSV = depth.GetReadOnlyDSV();
-
-            commandList->OMSetRenderTargets(1, &maskRTV, FALSE, &depthDSV);
-
-            DrawSelectionMask(commandList, selectedObject, cameraConstantsAddress);
-        }
-    }
-
-    m_selectionMask.Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-
-    m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::SelectionMask);
+    RecordSceneSelectionMask(commandList, scene, options, cameraConstantsAddress);
 
     EndGeometryPass(commandList);
 
@@ -5296,7 +5431,8 @@ bool Renderer::RecordRenderFrame(
     Texture* debugTexture = nullptr;
     RenderTarget* debugRenderTarget = nullptr;
 
-    if(hasRenderableMeshes)
+    // Preserve the fixed AO -> shadows -> reflections -> GI -> denoise -> lighting order.
+    if (hasRenderableMeshes)
     {
         const uint32_t aoWidth = (m_sceneWidth + 1u) / 2u;
         const uint32_t aoHeight = (m_sceneHeight + 1u) / 2u;
@@ -5315,41 +5451,10 @@ bool Renderer::RecordRenderFrame(
             aoConstants.originBias = 0.01f;
             aoConstants.rayTMin = 0.001f;
 
-            const D3D12_GPU_VIRTUAL_ADDRESS aoConstantsAddress =
-                m_uploadBuffer.Allocate(&aoConstants, sizeof(AOConstants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
-
-            if (aoConstantsAddress == 0)
+            if (!RecordAmbientOcclusionPasses(commandList, frameIndex, aoConstants, shadowConstants, aoWidth, aoHeight))
             {
-                Log::Error("Failed to allocate ray traced AO constants.");
                 return false;
             }
-
-            if (!m_aoExecutedLastFrame || m_previousAORadius != aoRadius)
-            {
-
-                m_aoTemporalPass.ResetHistory();
-            }
-
-            m_previousAORadius = aoRadius;
-
-            m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::RayTracedAO);
-            m_rayTracedAOPass.Execute(m_commandContext.GetRayTracingCommandList(), m_resourceDescriptorHeap,
-                                      m_rayTracingScene, aoConstantsAddress, aoWidth, aoHeight);
-            m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::RayTracedAO);
-
-            m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::AOTemporal);
-            m_aoTemporalPass.Execute(commandList, m_rayTracedAOPass.GetRawAOTexture(), m_gBuffer, m_uploadBuffer,
-                                     reconstructionConstants.inverseViewProjection, shadowConstants.previousViewProjection,
-                                     shadowConstants.previousInverseViewProjection, aoWidth, aoHeight);
-            m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::AOTemporal);
-
-            m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::AODenoise);
-            m_aoDenoisePass.Execute(commandList, m_aoTemporalPass.GetAccumulatedAOTexture(), m_gBuffer, m_uploadBuffer,
-                                    reconstructionConstants.inverseViewProjection, aoWidth, aoHeight);
-            m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::AODenoise);
-
-            m_aoResolvePass.Execute(commandList, m_aoDenoisePass.GetFilteredAOTexture(), m_gBuffer.GetDepth(),
-                                    m_gBuffer.GetSurface(), m_uploadBuffer, m_sceneWidth, m_sceneHeight);
         }
 
         m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::RayTracedShadows);
@@ -5402,7 +5507,6 @@ bool Renderer::RecordRenderFrame(
         if (runSignedCorrection)
         {
             m_giSignedCorrectionPass.GetSignedCorrectionTexture().Transition(
-
                 commandList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
             if (!m_giSignedCorrectionPass.Execute(commandList, m_uploadBuffer, m_gBuffer, currentView, currentProjection))
@@ -5443,6 +5547,7 @@ bool Renderer::RecordRenderFrame(
             break;
         }
 
+        // Native mode can coexist with NRD forced by RTGI or debug output.
         runNrd = runNrd || options.enableRTGI;
         runNative = reflectionMode == ReflectionDenoiserMode::Native;
 
@@ -5667,6 +5772,7 @@ bool Renderer::RecordRenderFrame(
         commandList->ClearRenderTargetView(m_sceneColor.GetRTV(), emptyColor, 0, nullptr);
     }
 
+    // Final composition precedes collider lines and the distinct Editor/packaged presentation paths.
     m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::ToneMap);
 
     m_finalSceneColor.Transition(commandList, D3D12_RESOURCE_STATE_RENDER_TARGET);
@@ -5680,26 +5786,28 @@ bool Renderer::RecordRenderFrame(
 
     // Draw only into the final editor image: temporal history and lighting must never see these lines.
     const EditorColliderOverlay* colliderOverlay = options.editorColliderOverlay;
-    if(!m_packagedRuntime && colliderOverlay)
+    if (!m_packagedRuntime && colliderOverlay)
     {
-        if(colliderOverlay->Matches(scene, m_sceneResourceLifetime))
+        if (colliderOverlay->Matches(scene, m_sceneResourceLifetime))
         {
             m_editorColliderPass.Execute(commandList, m_finalSceneColor, m_gBuffer.GetDepth(),
-                currentViewProjection, colliderOverlay->colliderWorldTransforms);
+                currentViewProjection, colliderOverlay->boxColliderWorldTransforms,
+                colliderOverlay->sphereColliderWorldTransforms, colliderOverlay->capsuleColliders);
         }
     }
     m_finalSceneColor.Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
-    if(m_packagedRuntime)
+    if (m_packagedRuntime)
     {
-        const D3D12_VIEWPORT viewport{0,0,static_cast<float>(m_applicationWidth),static_cast<float>(m_applicationHeight),0,1};
-        const D3D12_RECT scissor{0,0,static_cast<LONG>(m_applicationWidth),static_cast<LONG>(m_applicationHeight)};
-        commandList->RSSetViewports(1,&viewport); commandList->RSSetScissorRects(1,&scissor);
-        m_toneMapPass.Execute(commandList,m_sceneColor,rtvHandle,nullptr,ToneMapDebugView::None,nrdDenoisingRange,
-            nullptr,&m_selectionMask,options.selectionOutlineColor,0,m_gBuffer.GetDepth().GetSRVIndex());
-        barrier.Transition.StateBefore=D3D12_RESOURCE_STATE_RENDER_TARGET;
-        barrier.Transition.StateAfter=D3D12_RESOURCE_STATE_PRESENT;
-        commandList->ResourceBarrier(1,&barrier);
+        const D3D12_VIEWPORT viewport{0, 0, static_cast<float>(m_applicationWidth), static_cast<float>(m_applicationHeight), 0, 1};
+        const D3D12_RECT scissor{0, 0, static_cast<LONG>(m_applicationWidth), static_cast<LONG>(m_applicationHeight)};
+        commandList->RSSetViewports(1, &viewport);
+        commandList->RSSetScissorRects(1, &scissor);
+        m_toneMapPass.Execute(commandList, m_sceneColor, rtvHandle, nullptr, ToneMapDebugView::None, nrdDenoisingRange,
+            nullptr, &m_selectionMask, options.selectionOutlineColor, 0, m_gBuffer.GetDepth().GetSRVIndex());
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+        commandList->ResourceBarrier(1, &barrier);
     }
     else
     {
@@ -5707,20 +5815,20 @@ bool Renderer::RecordRenderFrame(
         ID3D12DescriptorHeap* previewHeap = m_resourceDescriptorHeap.GetHeap();
         commandList->SetDescriptorHeaps(1, &previewHeap);
 
-        if(!m_materialPreviewRenderer.Record({commandList, frameIndex,
+        if (!m_materialPreviewRenderer.Record({commandList, frameIndex,
                 m_brdfIntegrationLUT.GetDescriptorIndex(), m_ggxAverageAlbedoLUT.GetDescriptorIndex(),
                 m_activeRecordingGeneration}))
         {
             return false;
         }
 
-        if(!m_textureThumbnails.Record(commandList, m_activeRecordingGeneration))
+        if (!m_textureThumbnails.Record(commandList, m_activeRecordingGeneration))
         {
             return false;
         }
 
         // Uploaded editor previews use the same tracked transitions as material textures.
-        for(Texture* texture : options.editorTextures)
+        for (Texture* texture : options.editorTextures)
         {
             texture->Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         }
@@ -5764,6 +5872,7 @@ bool Renderer::RecordRenderFrame(
     m_gpuTimestampProfiler.EndFrameAndResolve(commandList, frameIndex);
 
     m_cpuFrameTiming.recording = CpuTiming::MillisecondsSince(recordingStart);
+    // Close before ordinary/covered execution; keep their failure and provenance policies separate.
     const auto endStart = CpuTiming::Clock::now();
     const bool endedRecording = EndTrackedRecording();
     m_cpuFrameTiming.end = CpuTiming::MillisecondsSince(endStart);
@@ -5835,7 +5944,7 @@ bool Renderer::RecordRenderFrame(
     {
         m_materialDependencies.MarkUncertain(frameIndex);
 
-        for(auto& entry : m_preparedTextureUploads)
+        for (auto& entry : m_preparedTextureUploads)
         {
             entry.upload->MarkUncertain(textureUploadGeneration);
         }
@@ -5846,19 +5955,15 @@ bool Renderer::RecordRenderFrame(
         return false;
     }
 
-    for(auto& entry : m_preparedTextureUploads)
-    {
-        entry.upload->ConfirmSubmission(textureUploadGeneration, m_commandContext.GetLastSubmissionFenceValue());
-    }
-
-    if(!m_materialDependencies.Confirm(frameIndex, m_commandContext.GetLastSubmissionFenceValue()))
+    // Capture the successful submission fence now; confirmation retains owners, not completion proof.
+    const auto materialSubmissionFence = m_commandContext.GetLastSubmissionFenceValue();
+    if (!ConfirmRecordedMaterialSubmission(
+            frameIndex, textureUploadGeneration, materialRevision, materialSubmissionFence))
     {
         m_materialDependencies.MarkUncertain(frameIndex);
         Log::Error("Material dependency submission association failed; retaining allocations.");
         return false;
     }
-
-    m_materialPublication.ConfirmSubmission(frameIndex, materialRevision);
 
     std::optional<FrameHitchProbe> postSubmissionProbe;
 
@@ -5867,6 +5972,7 @@ bool Renderer::RecordRenderFrame(
         postSubmissionProbe.emplace(*this, FrameHitchRegion::PostSubmission);
     }
 
+    // Submitted facts survive a later Present failure; do not move them into successful history.
     m_cpuFrameTiming.submitted = true;
     m_cpuFrameTiming.executeStart = executeStart;
 
@@ -5903,6 +6009,7 @@ bool Renderer::RecordRenderFrame(
         return false;
     }
 
+    // Only this tail follows successful Present; earlier recording-time histories remain separate.
     FrameHitchProbe postPresentProbe(
         *this,
         FrameHitchRegion::PostPresent);

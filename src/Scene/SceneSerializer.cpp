@@ -111,6 +111,24 @@ namespace
         return result;
     }
 
+    const char* ColliderTypeName(Physics::ColliderType colliderType)
+    {
+        switch(colliderType)
+        {
+        case Physics::ColliderType::Box:
+            return "Box";
+
+        case Physics::ColliderType::Sphere:
+            return "Sphere";
+
+        case Physics::ColliderType::Capsule:
+            return "Capsule";
+
+        default:
+            throw std::runtime_error("Unsupported physics collider type.");
+        }
+    }
+
     Json ToJson(const Physics::PhysicsComponent& component)
     {
         const char* bodyType = nullptr;
@@ -131,7 +149,12 @@ namespace
 
         return {
             {"bodyType", bodyType},
-            {"colliderType", "Box"},
+            {"colliderType", ColliderTypeName(component.colliderType)},
+            {"sphereRadius", component.sphereRadius},
+            {"capsuleRadius", component.capsuleRadius},
+            {"capsuleCylinderHeight", component.capsuleCylinderHeight},
+            {"capsuleLocalRotation", ToJson(component.capsuleLocalRotation)},
+            {"generateContactEvents", component.generateContactEvents},
             {"boxDimensions", {
                 {"width", component.boxDimensions.width},
                 {"height", component.boxDimensions.height},
@@ -144,10 +167,43 @@ namespace
         };
     }
 
-    Physics::PhysicsComponent ReadPhysicsComponent(const Json& value)
+    // Each schema has an exact physics field set: v2 is Box-only, v3 adds Sphere, v4 adds
+    // Capsule, v5 adds Capsule local rotation and v6 adds generateContactEvents. Older
+    // schemas never accept newer fields or collider types.
+    Physics::PhysicsComponent ReadPhysicsComponent(const Json& value, std::uint32_t schemaVersion)
     {
-        ValidateFields(value, {"bodyType", "colliderType", "boxDimensions", "colliderLocalPositionOffset",
-            "density", "friction", "restitution"});
+        const bool sphereSchema = schemaVersion >= SceneDocument::kSphereSchemaVersion;
+        const bool capsuleSchema = schemaVersion >= SceneDocument::kCapsuleSchemaVersion;
+        const bool capsuleRotationSchema = schemaVersion >= SceneDocument::kCapsuleRotationSchemaVersion;
+        const bool contactEventsSchema = schemaVersion >= SceneDocument::kContactEventsSchemaVersion;
+
+        if(contactEventsSchema)
+        {
+            ValidateFields(value, {"bodyType", "colliderType", "boxDimensions", "sphereRadius", "capsuleRadius",
+                "capsuleCylinderHeight", "capsuleLocalRotation", "colliderLocalPositionOffset", "density", "friction",
+                "restitution", "generateContactEvents"});
+        }
+        else if(capsuleRotationSchema)
+        {
+            ValidateFields(value, {"bodyType", "colliderType", "boxDimensions", "sphereRadius", "capsuleRadius",
+                "capsuleCylinderHeight", "capsuleLocalRotation", "colliderLocalPositionOffset", "density", "friction",
+                "restitution"});
+        }
+        else if(capsuleSchema)
+        {
+            ValidateFields(value, {"bodyType", "colliderType", "boxDimensions", "sphereRadius", "capsuleRadius",
+                "capsuleCylinderHeight", "colliderLocalPositionOffset", "density", "friction", "restitution"});
+        }
+        else if(sphereSchema)
+        {
+            ValidateFields(value, {"bodyType", "colliderType", "boxDimensions", "sphereRadius", "colliderLocalPositionOffset",
+                "density", "friction", "restitution"});
+        }
+        else
+        {
+            ValidateFields(value, {"bodyType", "colliderType", "boxDimensions", "colliderLocalPositionOffset",
+                "density", "friction", "restitution"});
+        }
 
         Physics::PhysicsComponent component;
         const auto bodyType = value.at("bodyType").get<std::string>();
@@ -168,9 +224,51 @@ namespace
             throw std::runtime_error("Unsupported physics body type: " + bodyType);
         }
 
-        if (value.at("colliderType").get<std::string>() != "Box")
+        const auto colliderType = value.at("colliderType").get<std::string>();
+
+        if(sphereSchema && colliderType == "Sphere")
+        {
+            component.colliderType = Physics::ColliderType::Sphere;
+        }
+        else if(capsuleSchema && colliderType == "Capsule")
+        {
+            component.colliderType = Physics::ColliderType::Capsule;
+        }
+        else if(colliderType != "Box")
         {
             throw std::runtime_error("Unsupported physics collider type.");
+        }
+
+        // Older schemas keep the in-memory defaults for shapes they cannot store.
+        if(sphereSchema)
+        {
+            component.sphereRadius = ReadNumber(value.at("sphereRadius"), "Physics sphere radius");
+        }
+
+        if(capsuleSchema)
+        {
+            component.capsuleRadius = ReadNumber(value.at("capsuleRadius"), "Physics capsule radius");
+            component.capsuleCylinderHeight = ReadNumber(value.at("capsuleCylinderHeight"),
+                "Physics capsule cylinder height");
+        }
+
+        // v1-v4 keep the default zero Capsule rotation.
+        if(capsuleRotationSchema)
+        {
+            component.capsuleLocalRotation = ReadVector3(value.at("capsuleLocalRotation"));
+        }
+
+        // v1-v5 keep the default false; v6 requires a JSON boolean (no numeric coercion).
+        if(contactEventsSchema)
+        {
+            const Json& generateContactEvents = value.at("generateContactEvents");
+
+            if(!generateContactEvents.is_boolean())
+            {
+                throw std::runtime_error("Physics generateContactEvents must be a boolean.");
+            }
+
+            component.generateContactEvents = generateContactEvents.get<bool>();
         }
 
         const auto& dimensions = value.at("boxDimensions");
@@ -255,14 +353,19 @@ namespace
         ValidateFields(value, {"schemaVersion", "id", "name", "camera", "directionalLight", "objects", "environmentReference"});
         const auto& schemaVersion = value.at("schemaVersion");
         if (!schemaVersion.is_number_integer() ||
-            (schemaVersion != SceneDocument::kLegacySchemaVersion && schemaVersion != SceneDocument::kSchemaVersion))
+            (schemaVersion != SceneDocument::kLegacySchemaVersion &&
+             schemaVersion != SceneDocument::kBoxPhysicsSchemaVersion &&
+             schemaVersion != SceneDocument::kSphereSchemaVersion &&
+             schemaVersion != SceneDocument::kCapsuleSchemaVersion &&
+             schemaVersion != SceneDocument::kCapsuleRotationSchemaVersion &&
+             schemaVersion != SceneDocument::kSchemaVersion))
         {
             throw std::runtime_error("Unsupported scene schema version.");
         }
         const bool legacySchema = schemaVersion == SceneDocument::kLegacySchemaVersion;
         SceneDocument result;
 
-        // Loaded v1 documents migrate in memory. All subsequent saves write v2.
+        // Loaded v1-v5 documents migrate in memory. All subsequent saves write v6.
         result.id = value.at("id").get<std::string>();
         result.name = value.at("name").get<std::string>();
         result.environmentReference=value.value("environmentReference",std::string{});
@@ -336,7 +439,7 @@ namespace
             {
                 try
                 {
-                    object.physics = ReadPhysicsComponent(item.at("physics"));
+                    object.physics = ReadPhysicsComponent(item.at("physics"), schemaVersion.get<std::uint32_t>());
                 }
                 catch (const std::exception& exception)
                 {

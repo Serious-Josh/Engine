@@ -1360,52 +1360,11 @@ void Engine::Run()
     Log::Info("Engine loop ended.");
 }
 
-void Engine::Frame()
+bool Engine::DeliverFrameDisplacementCompletion(bool& completionDelivered)
 {
-    std::optional<Renderer::FrameHitchProbe> inputProbe;
+    completionDelivered = false;
 
-    if constexpr (Renderer::IsFrameHitchDiagnosticsEnabled())
-    {
-        inputProbe.emplace(m_renderer, Renderer::FrameHitchRegion::EngineInput);
-    }
-
-    m_time.Update();
-
-    m_input.Update();
-    m_window.ProcessMessages();
-    inputProbe.reset();
-
-    if(m_window.ShouldClose())
-    {
-        return;
-    }
-
-    if(m_window.GetWidth() == 0 || m_window.GetHeight() == 0)
-    {
-        if(m_startup.mode!=EngineStartup::Mode::PackagedRuntime) m_editor.SuspendViewportInteraction();
-        m_window.WaitForMessage();
-        // Exclude the suspended interval from the next simulation update.
-        m_time.Update();
-        return;
-    }
-
-    if(m_startup.mode==EngineStartup::Mode::PackagedRuntime)
-    {
-        auto& demo=m_demoSceneManager.GetActiveScene(); demo.Update(m_time.GetDeltaTime());
-        const auto result=m_renderer.Render(demo.GetScene(),RendererOptions{});
-        if(result==Renderer::FrameRenderResult::Error)
-        {
-            Log::Error("Packaged renderer frame failed; requesting shutdown.");
-            m_window.Close();
-        }
-        if(result==Renderer::FrameRenderResult::Rendered) demo.GetScene().ClearChangedTransforms();
-        return;
-    }
-    DebugUI& debugUI = m_renderer.GetDebugUI();
-
-    bool displacementCompletionDelivered = false;
-
-    if(Renderer::IsAsyncDisplacementEnabled())
+    if (Renderer::IsAsyncDisplacementEnabled())
     {
         Renderer::FrameHitchProbe completionProbe(
             m_renderer,
@@ -1416,34 +1375,194 @@ void Engine::Frame()
         // until this owner-aware delivery on the next update.
         const auto completion = m_renderer.ProcessDisplacementCompletion();
 
-        if(completion == Renderer::DisplacementCompletionStatus::Error)
+        if (completion == Renderer::DisplacementCompletionStatus::Error)
         {
             Log::Error("Asynchronous displacement completion failed; requesting shutdown.");
             m_window.Close();
-            return;
+            return false;
         }
 
-        if(completion == Renderer::DisplacementCompletionStatus::Finalized)
+        if (completion == Renderer::DisplacementCompletionStatus::Finalized)
         {
             auto* mirrorScene = dynamic_cast<MirrorTestScene*>(&m_demoSceneManager.GetActiveScene());
 
             Renderer::DisplacementCompletionResult completed{};
 
             if (!mirrorScene || !m_renderer.TakeDisplacementCompletion(*mirrorScene, completed) ||
-
                 completed.scene != &mirrorScene->GetScene())
             {
                 Log::Error("Displacement completion does not match the active scene lifetime; requesting shutdown.");
                 m_window.Close();
 
-                return;
+                return false;
             }
 
             // Renderer validated the resource lifetime before taking the payload.
             // The scene only clears pending when this exact revision is current.
             AcknowledgeDisplacementCompletion(m_renderer, *mirrorScene, completed);
-            displacementCompletionDelivered = true;
+            completionDelivered = true;
         }
+    }
+
+    return true;
+}
+
+bool Engine::ExecutePendingEditorMutations()
+{
+    bool pendingMutationsSafe = false;
+
+    try
+    {
+        const bool meshDropPending = m_pendingSceneObjectCreation.has_value();
+        const bool restorationReplayPending = m_pendingSceneObjectRestoration &&
+            m_pendingSceneObjectRestoration->historyReplay.has_value();
+        const auto deletionSelection = m_pendingSceneObjectDeletion ?
+            std::optional<SceneObjectMetadata>{m_pendingSceneObjectDeletion->selection} : std::nullopt;
+        pendingMutationsSafe = ExecuteSceneObjectRestoration() && ExecuteSceneObjectDeletion() &&
+            ExecuteSceneObjectCreation() && ExecuteMaterialAssignment();
+
+        if (pendingMutationsSafe && restorationReplayPending && m_lastSceneObjectRestoration &&
+            m_lastSceneObjectRestoration->historyReplay)
+        {
+            const auto& result = *m_lastSceneObjectRestoration;
+            m_editor.CompleteSceneHistoryReplay(*result.historyReplay, result.succeeded, result.error);
+        }
+
+        if (pendingMutationsSafe && deletionSelection && GetLastSceneObjectDeletionResult())
+        {
+            const auto& completed = *GetLastSceneObjectDeletionResult();
+            m_editor.CompleteObjectDeletionHistory(completed.operationID, completed.historyEpoch,
+                completed.succeeded, completed.error);
+        }
+
+        if (deletionSelection && GetLastSceneObjectDeletionResult())
+        {
+            const auto& result = *GetLastSceneObjectDeletionResult();
+            m_editor.OnSceneObjectDeletionCompleted(m_demoSceneManager.GetActiveScene(),
+                *deletionSelection, result.succeeded, result.error);
+        }
+
+        if (meshDropPending && m_lastSceneObjectCreation)
+        {
+            m_editor.OnMeshCreationCompleted(m_lastSceneObjectCreation->succeeded, m_lastSceneObjectCreation->error);
+        }
+    }
+    catch (const std::exception& exception)
+    {
+        Log::Error(std::string("Material assignment execution failed; retaining ownership: ") + exception.what());
+    }
+    catch (...)
+    {
+        Log::Error("Material assignment execution failed unexpectedly; retaining ownership.");
+    }
+
+    return pendingMutationsSafe;
+}
+
+void Engine::AcceptPreparedMeshResidencyForFrame(IDemoScene& activeDemo)
+{
+    m_meshResidencyAcceptance.reset();
+
+    if (m_meshResidencyPublication.HasCandidate())
+    {
+        if (auto* fileScene = dynamic_cast<FileBackedDemoScene*>(&activeDemo))
+        {
+            m_meshResidencyAcceptance = m_meshResidencyPublication.PublishAtBoundary(
+                m_renderer, *fileScene->m_runtime, fileScene->m_assets);
+        }
+        else
+        {
+            m_meshResidencyPublication.Cancel();
+            m_meshResidencyAcceptance = MeshResidencyPublication::AcceptanceResult{
+                MeshResidencyPublication::Status::Stale, "Active scene is no longer the prepared file scene."};
+        }
+    }
+
+    if (m_diagnosticMeshToken && m_meshResidencyAcceptance)
+    {
+        LogMeshResidencyDiagnostic(*m_meshResidencyAcceptance);
+
+        if (m_meshResidencyAcceptance->published)
+        {
+            if (m_cookedPublicationTicket)
+            {
+                m_meshPreparation.Cancel(m_cookedPublicationTicket);
+                m_cookedPublicationTicket = 0;
+            }
+            FinishAutomaticMeshResidency(MeshResidencyPublication::Status::Ready);
+            m_residencyRequestSelection.reset();
+            m_residencyRequestSourceIdentity.clear();
+            m_diagnosticMeshToken.reset();
+            m_diagnosticMeshReadiness.reset();
+            m_diagnosticRendererLifetime = 0;
+        }
+        else if (m_meshResidencyAcceptance->status != MeshResidencyPublication::Status::Retry)
+        {
+            FinishAutomaticMeshResidency(m_meshResidencyAcceptance->status);
+            CancelMeshResidencyAcceptance();
+        }
+    }
+}
+
+void Engine::Frame()
+{
+    std::optional<Renderer::FrameHitchProbe> inputProbe;
+
+    if constexpr (Renderer::IsFrameHitchDiagnosticsEnabled())
+    {
+        inputProbe.emplace(m_renderer, Renderer::FrameHitchRegion::EngineInput);
+    }
+
+    // Snapshot input before message dispatch so this frame retains input edges.
+    m_time.Update();
+
+    m_input.Update();
+    m_window.ProcessMessages();
+    inputProbe.reset();
+
+    if (m_window.ShouldClose())
+    {
+        return;
+    }
+
+    if (m_window.GetWidth() == 0 || m_window.GetHeight() == 0)
+    {
+        if (m_startup.mode != EngineStartup::Mode::PackagedRuntime)
+        {
+            m_editor.SuspendViewportInteraction();
+        }
+        m_window.WaitForMessage();
+        // Exclude the suspended interval from the next simulation update.
+        m_time.Update();
+        return;
+    }
+
+    // Packaged frames bypass all Editor mutation, residency and physics seams below.
+    if (m_startup.mode == EngineStartup::Mode::PackagedRuntime)
+    {
+        auto& demo = m_demoSceneManager.GetActiveScene();
+        demo.Update(m_time.GetDeltaTime());
+        const auto result = m_renderer.Render(demo.GetScene(), RendererOptions{});
+        if (result == Renderer::FrameRenderResult::Error)
+        {
+            Log::Error("Packaged renderer frame failed; requesting shutdown.");
+            m_window.Close();
+        }
+        if (result == Renderer::FrameRenderResult::Rendered)
+        {
+            demo.GetScene().ClearChangedTransforms();
+        }
+        return;
+    }
+
+    DebugUI& debugUI = m_renderer.GetDebugUI();
+
+    // Deliver completed work while its original scene owner is still active.
+    bool displacementCompletionDelivered;
+
+    if (!DeliverFrameDisplacementCompletion(displacementCompletionDelivered))
+    {
+        return;
     }
 
     if (debugUI.HasEnvironmentChangeRequest())
@@ -1454,14 +1573,15 @@ void Engine::Frame()
         const size_t environmentIndex = debugUI.ConsumeEnvironmentChangeRequest();
 
         std::string environmentError;
-        if (!AssignSceneEnvironment(environmentIndex,environmentError))
+        if (!AssignSceneEnvironment(environmentIndex, environmentError))
         {
-            Log::Error("Failed to switch scene environment: "+environmentError);
+            Log::Error("Failed to switch scene environment: " + environmentError);
             m_window.Close();
             return;
         }
     }
 
+    // Pending Stop must keep its original runtime alive before incompatible publication.
     if (PhysicsBlocksSceneEdits() && (m_demoSceneManager.HasPendingSceneChange() || m_pendingEditorMembership))
     {
         auto* owner = dynamic_cast<FileBackedDemoScene*>(m_demoSceneManager.TryGetActiveScene());
@@ -1472,55 +1592,14 @@ void Engine::Frame()
         }
     }
 
-    if(!AdvanceEditorMembership()) { m_window.Close(); return; }
-    bool materialAssignmentSafe = false;
-
-    try
+    // Resolve queued mutations before scene replacement and before borrowing activeDemo.
+    if (!AdvanceEditorMembership())
     {
-        const bool meshDropPending = m_pendingSceneObjectCreation.has_value();
-        const bool restorationReplayPending = m_pendingSceneObjectRestoration &&
-            m_pendingSceneObjectRestoration->historyReplay.has_value();
-        const auto deletionSelection = m_pendingSceneObjectDeletion ?
-            std::optional<SceneObjectMetadata>{m_pendingSceneObjectDeletion->selection} : std::nullopt;
-        materialAssignmentSafe = ExecuteSceneObjectRestoration() && ExecuteSceneObjectDeletion() &&
-            ExecuteSceneObjectCreation() && ExecuteMaterialAssignment();
-
-        if(materialAssignmentSafe && restorationReplayPending && m_lastSceneObjectRestoration &&
-            m_lastSceneObjectRestoration->historyReplay)
-        {
-            const auto& result = *m_lastSceneObjectRestoration;
-            m_editor.CompleteSceneHistoryReplay(*result.historyReplay, result.succeeded, result.error);
-        }
-
-        if(materialAssignmentSafe && deletionSelection && GetLastSceneObjectDeletionResult())
-        {
-            const auto& completed = *GetLastSceneObjectDeletionResult();
-            m_editor.CompleteObjectDeletionHistory(completed.operationID, completed.historyEpoch,
-                completed.succeeded, completed.error);
-        }
-
-        if(deletionSelection && GetLastSceneObjectDeletionResult())
-        {
-            const auto& result = *GetLastSceneObjectDeletionResult();
-            m_editor.OnSceneObjectDeletionCompleted(m_demoSceneManager.GetActiveScene(),
-                *deletionSelection, result.succeeded, result.error);
-        }
-
-        if(meshDropPending && m_lastSceneObjectCreation)
-        {
-            m_editor.OnMeshCreationCompleted(m_lastSceneObjectCreation->succeeded, m_lastSceneObjectCreation->error);
-        }
-    }
-    catch(const std::exception& exception)
-    {
-        Log::Error(std::string("Material assignment execution failed; retaining ownership: ") + exception.what());
-    }
-    catch(...)
-    {
-        Log::Error("Material assignment execution failed unexpectedly; retaining ownership.");
+        m_window.Close();
+        return;
     }
 
-    if(!materialAssignmentSafe)
+    if (!ExecutePendingEditorMutations())
     {
         m_window.Close();
         return;
@@ -1630,11 +1709,12 @@ void Engine::Frame()
         environmentNames.push_back(environment.displayName);
     }
 
-    if(m_editor.NeedsThumbnailReset())
+    if (m_editor.NeedsThumbnailReset())
     {
         m_editor.ResetThumbnailRequests();
     }
 
+    // Integrate prior-frame revisions before streaming; current UI revisions are collected later.
     ProcessWorkingMaterialNotifications();
     ProcessSavedMaterialRevisions();
     PublishWorkingMaterialParameters();
@@ -1642,6 +1722,7 @@ void Engine::Frame()
 
     m_editor.SetThumbnailCompletedFence(m_renderer.GetEditorCompletedFence());
 
+    // Workspace layout defines the image extent before resize and viewport input.
     debugUI.BeginFrame();
 
     IDemoScene& activeDemo = m_demoSceneManager.GetActiveScene();
@@ -1655,7 +1736,7 @@ void Engine::Frame()
     const auto& viewportRectangle = m_editor.PrepareWorkspace(activeDemo, m_demoSceneManager, debugUI);
     const ImVec2 framebufferScale = ImGui::GetIO().DisplayFramebufferScale;
 
-    if(viewportRectangle.size.x <= 0.0f || viewportRectangle.size.y <= 0.0f)
+    if (viewportRectangle.size.x <= 0.0f || viewportRectangle.size.y <= 0.0f)
     {
         // The menu remains usable with a hidden/empty viewport. Honor Stop and
         // cleanup retries without advancing time or successful-frame history.
@@ -1671,7 +1752,7 @@ void Engine::Frame()
     {
         const double pixels = static_cast<double>(logical) * static_cast<double>(scale);
 
-        if(!std::isfinite(pixels) || pixels <= 0.0)
+        if (!std::isfinite(pixels) || pixels <= 0.0)
         {
             return 0;
         }
@@ -1685,7 +1766,7 @@ void Engine::Frame()
     // The release frame always uses the latest finalized layout.
     const bool resizeScene = !m_editor.IsWorkspaceSplitterDragging();
 
-    if(sceneWidth == 0 || sceneHeight == 0 || (resizeScene && !m_renderer.ResizeScene(sceneWidth, sceneHeight)))
+    if (sceneWidth == 0 || sceneHeight == 0 || (resizeScene && !m_renderer.ResizeScene(sceneWidth, sceneHeight)))
     {
         Log::Error("Scene viewport resize failed; requesting application shutdown.");
         ImGui::EndFrame();
@@ -1695,7 +1776,7 @@ void Engine::Frame()
 
     Renderer::FinalSceneImage finalSceneImage{};
 
-    if(!m_renderer.TryGetFinalSceneImage(finalSceneImage))
+    if (!m_renderer.TryGetFinalSceneImage(finalSceneImage))
     {
         Log::Error("Final scene image is unavailable; requesting application shutdown.");
         m_window.Close();
@@ -1722,7 +1803,7 @@ void Engine::Frame()
     m_editor.ProcessAssetDeletion(inspectorPaths, m_projectAssetRegistry);
     m_editor.ProcessAssetMove(inspectorPaths, m_projectAssetRegistry);
 
-    for(const auto& drop : m_window.TakeFileDrops())
+    for (const auto& drop : m_window.TakeFileDrops())
     {
         // Win32 drops are client-relative. ImGui's main viewport uses client
         // coordinates in this non-platform-viewport backend, not desktop pixels.
@@ -1731,31 +1812,34 @@ void Engine::Frame()
             origin.y + static_cast<float>(drop.y), inspectorPaths, m_projectAssetRegistry);
     }
 
-    if(m_editor.TakeApplicationCloseApproval())
+    if (m_editor.TakeApplicationCloseApproval())
     {
         ImGui::EndFrame();
         m_window.Close();
         return;
     }
 
-    if(auto request = m_editor.TakeSceneHistoryReplayRequest())
+    // Queue current Editor intents; their mutation executors run at the next frame boundary.
+    if (auto request = m_editor.TakeSceneHistoryReplayRequest())
     {
         std::string error;
         bool accepted = false;
 
-        if(request->membership)
+        if (request->membership)
         {
-            const auto operationID=request->identity.operationID, epoch=request->identity.epoch;
-            if(!BeginEditorMembership(std::move(*request),true,error))
-                m_editor.CompleteObjectDeletionHistory(operationID,epoch,false,error);
-            accepted=true; // Membership path completed its own failure callback.
+            const auto operationID = request->identity.operationID, epoch = request->identity.epoch;
+            if (!BeginEditorMembership(std::move(*request), true, error))
+            {
+                m_editor.CompleteObjectDeletionHistory(operationID, epoch, false, error);
+            }
+            accepted = true; // Membership path completed its own failure callback.
         }
-        else if(request->identity.redo)
+        else if (request->identity.redo)
         {
             const auto* owner = dynamic_cast<const FileBackedDemoScene*>(&activeDemo);
             const auto target = owner ? owner->GetObjectMetadata(request->object.id, &error) : std::nullopt;
 
-            if(target)
+            if (target)
             {
                 accepted = RequestSceneObjectDeletion(*target, error, request->identity);
             }
@@ -1768,7 +1852,7 @@ void Engine::Frame()
         {
             const auto identity = GetSceneObjectRestorationIdentity();
 
-            if(identity)
+            if (identity)
             {
                 accepted = RequestSceneObjectRestoration(request->object, request->insertionIndex,
                     *identity, error, false, request->identity);
@@ -1779,57 +1863,74 @@ void Engine::Frame()
             }
         }
 
-        if(!accepted)
+        if (!accepted)
         {
             m_editor.CompleteSceneHistoryReplay(request->identity, false, error);
         }
     }
 
-    if(auto request = m_editor.TakeSceneObjectDeletionRequest())
+    if (auto request = m_editor.TakeSceneObjectDeletionRequest())
     {
         std::string error;
 
-        if(!BeginEditorMembershipDeletion(*request, error))
+        if (!BeginEditorMembershipDeletion(*request, error))
         {
             m_editor.OnSceneObjectDeletionCompleted(activeDemo, *request, false, error);
         }
     }
 
-    if(auto request=m_editor.TakeSceneDuplicationRequest())
+    if (auto request = m_editor.TakeSceneDuplicationRequest())
     {
         std::string error;
-        const auto operationID=request->identity.operationID, epoch=request->identity.epoch;
-        if(!BeginEditorMembership(std::move(*request),false,error))
-            m_editor.CompleteObjectDeletionHistory(operationID,epoch,false,error);
+        const auto operationID = request->identity.operationID, epoch = request->identity.epoch;
+        if (!BeginEditorMembership(std::move(*request), false, error))
+        {
+            m_editor.CompleteObjectDeletionHistory(operationID, epoch, false, error);
+        }
     }
-    if(auto request=m_editor.TakePrimitiveCreationRequest())
+
+    if (auto request = m_editor.TakePrimitiveCreationRequest())
     {
         std::string error;
-        if(!BeginPrimitiveCreation(*request,error)) m_editor.OnMeshCreationCompleted(false,error);
+        if (!BeginPrimitiveCreation(*request, error))
+        {
+            m_editor.OnMeshCreationCompleted(false, error);
+        }
     }
-    if(auto request = m_editor.TakeMeshCreationRequest())
+
+    if(auto request = m_editor.TakeEmptyObjectCreationRequest())
+    {
+        std::string error;
+
+        if(!BeginEmptyObjectCreation(*request, error))
+        {
+            m_editor.OnEmptyObjectCreationFailed(error);
+        }
+    }
+
+    if (auto request = m_editor.TakeMeshCreationRequest())
     {
         const auto* owner = dynamic_cast<const FileBackedDemoScene*>(&activeDemo);
         std::string error;
 
-        if(!owner || owner->GetRuntimeIdentity() != request->runtimeIdentity)
+        if (!owner || owner->GetRuntimeIdentity() != request->runtimeIdentity)
         {
             m_editor.OnMeshCreationCompleted(false, "Scene changed before the drop could be queued.");
         }
-        else if(!RequestSceneObjectCreation(std::move(request->meshReference), request->transform, error,
+        else if (!RequestSceneObjectCreation(std::move(request->meshReference), request->transform, error,
             "builtin:default", std::move(request->name)))
         {
             m_editor.OnMeshCreationCompleted(false, error);
         }
     }
 
-    if(auto request = m_editor.TakeMaterialAssignmentRequest())
+    if (auto request = m_editor.TakeMaterialAssignmentRequest())
     {
         std::string error;
 
         bool queued = false;
 
-        if(request->slotID && m_editor.GetSelectedObject() != request->selection.runtimeIndex)
+        if (request->slotID && m_editor.GetSelectedObject() != request->selection.runtimeIndex)
         {
             error = "Material slot assignment cancelled because the selected scene object changed.";
         }
@@ -1840,12 +1941,12 @@ void Engine::Frame()
                 RequestMaterialAssignment(request->selection, std::move(request->reference), error);
         }
 
-        if(queued && request->slotID)
+        if (queued && request->slotID)
         {
             m_pendingMaterialAssignment->requireEditorSelection = true;
         }
 
-        if(!queued)
+        if (!queued)
         {
             Log::Warning("Inspector material assignment rejected: " + error);
             m_editor.OnMaterialAssignmentCompleted(request->selection, false,
@@ -1853,21 +1954,35 @@ void Engine::Frame()
         }
     }
 
-    const auto buildStatus=m_buildGame.Poll();
-    if(buildStatus.message!=m_buildGameLastMessage)
-    { m_buildGameLastMessage=buildStatus.message; m_editor.SetBuildGameStatus(buildStatus); }
-    if(m_editor.TakeBuildGameCancel()) m_buildGame.Cancel();
-    if(const auto build=m_editor.TakeBuildGameRequest())
+    const auto buildStatus = m_buildGame.Poll();
+    if (buildStatus.message != m_buildGameLastMessage)
+    {
+        m_buildGameLastMessage = buildStatus.message;
+        m_editor.SetBuildGameStatus(buildStatus);
+    }
+    if (m_editor.TakeBuildGameCancel())
+    {
+        m_buildGame.Cancel();
+    }
+    if (const auto build = m_editor.TakeBuildGameRequest())
     {
         std::string error;
-        if(!StartBuildGame(*build,error)) m_editor.SetBuildGameStatus({false,false,0,error});
-        else m_editor.SetBuildGameStatus(m_buildGame.Poll());
+        if (!StartBuildGame(*build, error))
+        {
+            m_editor.SetBuildGameStatus({false, false, 0, error});
+        }
+        else
+        {
+            m_editor.SetBuildGameStatus(m_buildGame.Poll());
+        }
     }
+
     ProcessEditorSceneRequests(activeDemo);
     ProcessEditorMaterialRequests();
     m_pendingSavedMaterialRevisions = m_editor.TakeSavedMaterialRevisions();
     m_pendingWorkingMaterialRevisions = m_editor.TakeWorkingMaterialRevisions();
 
+    // Demo changes precede the structural fallback rebuild and displacement request.
     activeDemo.Update(m_time.GetDeltaTime());
 
     if constexpr (Renderer::IsFrameHitchDiagnosticsEnabled())
@@ -1919,8 +2034,7 @@ void Engine::Frame()
         if (auto* mirrorScene = dynamic_cast<MirrorTestScene*>(&activeDemo))
         {
             if (!m_renderer.RegisterDisplacementHeightmap(*mirrorScene) ||
-
-                !m_renderer.GenerateDisplacementMeshGPU(*mirrorScene, mirrorScene->GetSeedDisplacementSettings()))
+                    !m_renderer.GenerateDisplacementMeshGPU(*mirrorScene, mirrorScene->GetSeedDisplacementSettings()))
             {
                 Log::Error("Failed to generate Mirror Test GPU displacement geometry after scene rebuild.");
                 m_window.Close();
@@ -1997,15 +2111,17 @@ void Engine::Frame()
     const size_t selectedObject = m_editor.GetSelectedObject();
 
     if (m_editor.GetSelectionStructureRevision() == activeScene.GetStructureRevision() &&
-
         selectedObject < activeScene.GetRenderObjects().size())
     {
         rendererOptions.selectedObject = selectedObject;
         rendererOptions.selectedObjects = m_editor.GetSelectedObjects();
     }
-    if(const auto hover = m_editor.GetMaterialDropHighlight(activeDemo); hover &&
-        std::find(rendererOptions.selectedObjects.begin(), rendererOptions.selectedObjects.end(), *hover) == rendererOptions.selectedObjects.end())
+    if (const auto hover = m_editor.GetMaterialDropHighlight(activeDemo); hover &&
+        std::find(rendererOptions.selectedObjects.begin(), rendererOptions.selectedObjects.end(), *hover) ==
+            rendererOptions.selectedObjects.end())
+    {
         rendererOptions.selectedObjects.push_back(*hover);
+    }
 
     std::optional<Renderer::FrameHitchProbe> renderProbe;
 
@@ -2019,48 +2135,9 @@ void Engine::Frame()
     // Coordinated publication boundary: all editor/assets, scene update/rebuild
     // and thumbnail/preview preparation above are complete. Final validation
     // and the noexcept ownership/binding transfer finish before Render records.
-    m_meshResidencyAcceptance.reset();
+    AcceptPreparedMeshResidencyForFrame(activeDemo);
 
-    if (m_meshResidencyPublication.HasCandidate())
-    {
-        if (auto* fileScene = dynamic_cast<FileBackedDemoScene*>(&activeDemo))
-        {
-            m_meshResidencyAcceptance = m_meshResidencyPublication.PublishAtBoundary(
-                m_renderer, *fileScene->m_runtime, fileScene->m_assets);
-        }
-        else
-        {
-            m_meshResidencyPublication.Cancel();
-            m_meshResidencyAcceptance = MeshResidencyPublication::AcceptanceResult{
-                MeshResidencyPublication::Status::Stale, "Active scene is no longer the prepared file scene."};
-        }
-    }
-
-    if (m_diagnosticMeshToken && m_meshResidencyAcceptance)
-    {
-        LogMeshResidencyDiagnostic(*m_meshResidencyAcceptance);
-
-        if (m_meshResidencyAcceptance->published)
-        {
-            if(m_cookedPublicationTicket)
-            {
-                m_meshPreparation.Cancel(m_cookedPublicationTicket);
-                m_cookedPublicationTicket = 0;
-            }
-            FinishAutomaticMeshResidency(MeshResidencyPublication::Status::Ready);
-            m_residencyRequestSelection.reset();
-            m_residencyRequestSourceIdentity.clear();
-            m_diagnosticMeshToken.reset();
-            m_diagnosticMeshReadiness.reset();
-            m_diagnosticRendererLifetime = 0;
-        }
-        else if (m_meshResidencyAcceptance->status != MeshResidencyPublication::Status::Retry)
-        {
-            FinishAutomaticMeshResidency(m_meshResidencyAcceptance->status);
-            CancelMeshResidencyAcceptance();
-        }
-    }
-
+    // Accept bindings before physics validates and publishes the current presentation.
     ProcessViewportMaterialAssignment(activeDemo);
     auto* physicsScene = dynamic_cast<FileBackedDemoScene*>(&activeDemo);
     ProcessEditorPhysicsSimulation(physicsScene ? physicsScene->m_runtime.get() : nullptr,
@@ -2069,7 +2146,7 @@ void Engine::Frame()
     // This stack-owned payload outlives the synchronous Render call; Renderer retains none of it.
     const auto colliderOverlay = CaptureEditorColliderOverlayForFrame(
         physicsScene ? physicsScene->m_runtime.get() : nullptr, physicsScene && !physicsScene->IsArchiveActivation());
-    if(colliderOverlay)
+    if (colliderOverlay)
     {
         rendererOptions.editorColliderOverlay = &*colliderOverlay;
     }
@@ -2077,7 +2154,7 @@ void Engine::Frame()
     viewportPublication = m_renderer.GetSelectionPublicationIdentity(activeScene);
     m_editor.SetViewportPublicationIdentity(viewportPublication.rendererLifetime, viewportPublication.bindingEpoch);
     m_editor.RefreshViewportMarqueePreview(activeDemo);
-    if(const auto* marqueePreview = m_editor.GetViewportMarqueePreview(activeDemo))
+    if (const auto* marqueePreview = m_editor.GetViewportMarqueePreview(activeDemo))
     {
         rendererOptions.selectedObject = (std::numeric_limits<std::size_t>::max)();
         rendererOptions.selectedObjects = *marqueePreview;
@@ -2108,7 +2185,7 @@ void Engine::Frame()
         return;
     }
 
-
+    // Only a successfully rendered frame advances authored/presentation history.
     activeScene.ClearChangedTransforms();
 }
 

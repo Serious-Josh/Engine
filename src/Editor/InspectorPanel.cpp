@@ -1,4 +1,5 @@
 #include "InspectorPanel.h"
+#include "InspectorNumericDrag.h"
 #include "EditorWorkspace.h"
 #include "Math/Math.h"
 #include "assets/ProjectAssetResolver.h"
@@ -1119,8 +1120,13 @@ void InspectorPanel::DrawMaterial(
     }
 
     ImGui::ColorEdit3("Base color", material.baseColor.data());
-    ImGui::SliderFloat("Roughness", &material.roughness, 0.0f, 1.0f, "%.4f", ImGuiSliderFlags_AlwaysClamp);
-    ImGui::SliderFloat("Metallic", &material.metallic, 0.0f, 1.0f, "%.4f", ImGuiSliderFlags_AlwaysClamp);
+
+    // Transform-style drag controls edit the unsaved material draft directly; Save and
+    // Revert keep their existing meaning. Ranges and clamps match the previous controls:
+    // roughness and metallic were always clamped to [0, 1], including typed values.
+    constexpr InspectorDragSpec unitIntervalDrag{0.005f, 0.0f, 1.0f, true, "%.4f"};
+    InspectorDragFloats("Roughness", &material.roughness, 1, unitIntervalDrag);
+    InspectorDragFloats("Metallic", &material.metallic, 1, unitIntervalDrag);
 
     if(material.model == MaterialModel::Dielectric || material.model == MaterialModel::Conductor)
     {
@@ -1129,14 +1135,18 @@ void InspectorPanel::DrawMaterial(
 
     if(material.model == MaterialModel::Dielectric)
     {
-        if(ImGui::InputFloat("IOR (> 0)", &material.ior))
+        constexpr InspectorDragSpec iorDrag{0.005f};
+
+        if(InspectorDragFloats("IOR (> 0)", &material.ior, 1, iorDrag) != InspectorDragResult::Idle)
         {
             material.ior = (std::max)(material.ior, (std::numeric_limits<float>::min)());
         }
     }
     else if(material.model == MaterialModel::Conductor)
     {
-        if(ImGui::InputFloat3("Conductor N (>= 0)", material.conductorN.data()))
+        constexpr InspectorDragSpec conductorDrag{0.01f};
+
+        if(InspectorDragFloats("Conductor N (>= 0)", material.conductorN.data(), 3, conductorDrag) != InspectorDragResult::Idle)
         {
             for(auto& value : material.conductorN)
             {
@@ -1144,7 +1154,7 @@ void InspectorPanel::DrawMaterial(
             }
         }
 
-        if(ImGui::InputFloat3("Conductor K (>= 0)", material.conductorK.data()))
+        if(InspectorDragFloats("Conductor K (>= 0)", material.conductorK.data(), 3, conductorDrag) != InspectorDragResult::Idle)
         {
             for(auto& value : material.conductorK)
             {
@@ -1160,8 +1170,9 @@ void InspectorPanel::DrawMaterial(
         material.surfaceDetailMode = static_cast<SurfaceDetailMode>(detail);
     }
 
-    ImGui::InputFloat("Height scale", &material.heightScale);
-    ImGui::InputFloat("Height bias", &material.heightBias);
+    constexpr InspectorDragSpec heightDrag{0.001f};
+    InspectorDragFloats("Height scale", &material.heightScale, 1, heightDrag);
+    InspectorDragFloats("Height bias", &material.heightBias, 1, heightDrag);
     ImGui::Checkbox("Prefer ARM", &material.preferARM);
 
     ImGui::SeparatorText("Texture references");

@@ -43,7 +43,12 @@ struct SceneObjectDocument
 struct SceneDocument
 {
     static constexpr std::uint32_t kLegacySchemaVersion = 1;
-    static constexpr std::uint32_t kSchemaVersion = 2;
+    static constexpr std::uint32_t kBoxPhysicsSchemaVersion = 2;
+    static constexpr std::uint32_t kSphereSchemaVersion = 3;
+    static constexpr std::uint32_t kCapsuleSchemaVersion = 4;
+    static constexpr std::uint32_t kCapsuleRotationSchemaVersion = 5;
+    static constexpr std::uint32_t kContactEventsSchemaVersion = 6;
+    static constexpr std::uint32_t kSchemaVersion = kContactEventsSchemaVersion;
 
     std::uint32_t schemaVersion = kSchemaVersion;
 

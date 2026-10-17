@@ -286,6 +286,12 @@ std::optional<std::size_t> SceneHierarchyPanel::Draw(const EditorWorkspaceRect& 
         if(ImGui::Button("+",ImVec2(buttonWidth,buttonWidth))) ImGui::OpenPopup("HierarchyCreate");
         if(ImGui::BeginPopup("HierarchyCreate"))
         {
+            // Top level, not a primitive: a Transform-only object with no mesh or material.
+            if(ImGui::MenuItem("Empty Object"))
+            {
+                m_emptyObjectRequest = true;
+            }
+
             if(ImGui::BeginMenu("Create Primitive"))
             {
                 if(ImGui::MenuItem("Cube")) m_primitiveRequest=ScenePrimitive::Cube;
@@ -408,4 +414,9 @@ std::optional<std::size_t> SceneHierarchyPanel::Draw(const EditorWorkspaceRect& 
 std::optional<ScenePrimitive> SceneHierarchyPanel::TakePrimitiveRequest()
 {
     return std::exchange(m_primitiveRequest,std::nullopt);
+}
+
+bool SceneHierarchyPanel::TakeEmptyObjectRequest()
+{
+    return std::exchange(m_emptyObjectRequest, false);
 }

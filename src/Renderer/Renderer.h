@@ -602,6 +602,18 @@ class Renderer
     bool ResolvePreviewAfterGPUDrain();
     bool ExecuteTrackedRecording(unsigned int frameSlot);
 
+    // Archive startup progress only; caller owns slot rotation, cancellation and polling.
+    // Failure retains existing recording/submission ownership for checked teardown.
+    void SubmitArchiveMaterialProgress(unsigned int frameSlot);
+
+    // Associate a successfully executed recording, not GPU completion. The caller supplies
+    // the captured fence and retains its own dependency-confirmation failure policy.
+    bool ConfirmRecordedMaterialSubmission(
+        unsigned int frameSlot,
+        std::uint64_t recordingGeneration,
+        std::uint64_t recordedRevision,
+        std::uint64_t submissionFence);
+
     struct RecordingEligibilityScope
     {
         Renderer& renderer;
@@ -777,6 +789,27 @@ class Renderer
         std::uint64_t revision,
         size_t laterSubmissions);
     void LogAsyncDisplacementError();
+    // Pure value assembly only; upload and history mutation remain in RecordRenderFrame.
+    static CameraConstants BuildFrameCameraConstants(
+        const Matrix4& currentView,
+        const Matrix4& currentViewProjection,
+        const Matrix4& previousView,
+        const Matrix4& previousViewProjection,
+        bool hasPreviousViewProjection);
+    // Record against the acquired slot, between geometry drawing and EndGeometryPass.
+    void RecordSceneSelectionMask(
+        ID3D12GraphicsCommandList* commandList,
+        const Scene& scene,
+        const RendererOptions& options,
+        D3D12_GPU_VIRTUAL_ADDRESS cameraConstantsAddress);
+    // Upload failure is the only propagated AO error; pass-local skips remain local.
+    bool RecordAmbientOcclusionPasses(
+        ID3D12GraphicsCommandList* commandList,
+        unsigned int frameSlot,
+        const AOConstants& constants,
+        const ShadowConstants& shadowConstants,
+        unsigned int width,
+        unsigned int height);
     bool RecordRenderFrame(
         const Scene& scene,
         const RendererOptions& options);

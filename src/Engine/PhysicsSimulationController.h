@@ -44,6 +44,23 @@ public:
     double GetAccumulatedSeconds() const noexcept { return m_accumulatedTicks / 60.0; }
     const Physics::RuntimePoseSnapshot* GetLatestSnapshot() const noexcept;
 
+    // Contact events from the fixed steps run by the most recent Update, in
+    // ContactEventPrecedes order with per-event step numbers. Empty after an Update that
+    // ran no step, and after Start, Stop or failure. Owned by the controller; the
+    // reference is valid until the next Start, Update or Stop.
+    const std::vector<Physics::ContactEvent>& GetLastUpdateContactEvents() const noexcept
+    {
+        return m_lastUpdateContactEvents;
+    }
+
+    // Gameplay-facing subset of GetLastUpdateContactEvents: events in which at least one
+    // participant has generateContactEvents, with per-participant opt-in flags. Same
+    // order, step numbers, clearing and lifetime as the raw events.
+    const std::vector<Physics::ContactNotification>& GetLastUpdateContactNotifications() const noexcept
+    {
+        return m_lastUpdateContactNotifications;
+    }
+
     static constexpr double FixedStepSeconds = 1.0 / 60.0;
     // Inputs/debt beyond one day are rejected, never silently truncated.
     static constexpr double MaximumAccumulatedSeconds = 86400.0;
@@ -66,4 +83,6 @@ private:
     double m_accumulatedTicks = 0.0;
     std::uint64_t m_totalSteps = 0;
     std::size_t m_lastUpdateSteps = 0;
+    std::vector<Physics::ContactEvent> m_lastUpdateContactEvents;
+    std::vector<Physics::ContactNotification> m_lastUpdateContactNotifications;
 };

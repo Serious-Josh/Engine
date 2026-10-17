@@ -325,19 +325,35 @@ bool FileSceneRuntime::CaptureEditorColliderOverlay(const Renderer& renderer, Ed
     }
 
     const auto& authoredObjects = m_fileScene.GetDocument().objects;
+    // Every physics object is one collider of the shared capacity, whatever its shape
+    // or wireframe vertex count.
     std::size_t colliderCount = 0;
+    std::size_t sphereColliderCount = 0;
+    std::size_t capsuleColliderCount = 0;
     for(const auto& authoredObject : authoredObjects)
     {
-        if(authoredObject.physics)
+        if(!authoredObject.physics)
         {
-            ++colliderCount;
+            continue;
+        }
+
+        ++colliderCount;
+
+        if(authoredObject.physics->colliderType == Physics::ColliderType::Sphere)
+        {
+            ++sphereColliderCount;
+        }
+        else if(authoredObject.physics->colliderType == Physics::ColliderType::Capsule)
+        {
+            ++capsuleColliderCount;
         }
     }
     if(colliderCount == 0)
     {
         return true;
     }
-    if(colliderCount > EditorColliderOverlay::MaxBoxes)
+    // Box, Sphere and Capsule colliders share one overlay capacity.
+    if(colliderCount > EditorColliderOverlay::MaxColliders)
     {
         error = "Editor collider overlay capacity exceeded.";
         return false;
@@ -370,27 +386,79 @@ bool FileSceneRuntime::CaptureEditorColliderOverlay(const Renderer& renderer, Ed
         capturedOverlay.scene = &m_scene;
         capturedOverlay.structureRevision = m_scene.GetStructureRevision();
         capturedOverlay.rendererLifetime = renderer.m_sceneResourceLifetime;
-        capturedOverlay.colliderWorldTransforms.reserve(colliderCount);
+        capturedOverlay.boxColliderWorldTransforms.reserve(colliderCount - sphereColliderCount - capsuleColliderCount);
+        capturedOverlay.sphereColliderWorldTransforms.reserve(sphereColliderCount);
+        capturedOverlay.capsuleColliders.reserve(capsuleColliderCount);
+
         for(const auto& authoredObject : currentDocument.objects)
         {
             if(!authoredObject.physics)
             {
                 continue;
             }
+
             const auto objectMetadata = GetObjectMetadata(authoredObject.id, &error);
+
             if(!objectMetadata)
             {
                 return false;
             }
 
+            // Each builder accepts only its own collider type, so a shape can never be
+            // drawn with another shape's geometry.
+            const Physics::PhysicsComponent& component = *authoredObject.physics;
             const RenderObject& renderObject = m_scene.GetRenderObjects()[objectMetadata->runtimeIndex];
-            Matrix4 colliderWorldTransform;
-            if(!BuildColliderBoxMatrix(*authoredObject.physics, renderObject, presentationActive, colliderWorldTransform))
+            bool placementValid = false;
+
+            switch(component.colliderType)
+            {
+            case Physics::ColliderType::Sphere:
+            {
+                Matrix4 colliderWorldTransform;
+                placementValid = BuildColliderSphereMatrix(component, renderObject, presentationActive,
+                    colliderWorldTransform);
+
+                if(placementValid)
+                {
+                    capturedOverlay.sphereColliderWorldTransforms.push_back(colliderWorldTransform);
+                }
+
+                break;
+            }
+
+            case Physics::ColliderType::Capsule:
+            {
+                CapsuleColliderOverlay capsuleCollider;
+                placementValid = BuildColliderCapsule(component, renderObject, presentationActive, capsuleCollider);
+
+                if(placementValid)
+                {
+                    capturedOverlay.capsuleColliders.push_back(capsuleCollider);
+                }
+
+                break;
+            }
+
+            default:
+            {
+                Matrix4 colliderWorldTransform;
+                placementValid = BuildColliderBoxMatrix(component, renderObject, presentationActive,
+                    colliderWorldTransform);
+
+                if(placementValid)
+                {
+                    capturedOverlay.boxColliderWorldTransforms.push_back(colliderWorldTransform);
+                }
+
+                break;
+            }
+            }
+
+            if(!placementValid)
             {
                 error = "Collider placement is invalid or its accepted presentation pose is unavailable: " + authoredObject.id;
                 return false;
             }
-            capturedOverlay.colliderWorldTransforms.push_back(colliderWorldTransform);
         }
 
         // Publish the owned matrix copies only after every collider passed validation.

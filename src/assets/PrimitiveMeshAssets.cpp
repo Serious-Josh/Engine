@@ -36,6 +36,7 @@ ImportedMesh Generate(ScenePrimitive primitive)
         value.uv[0]=u; value.uv[1]=v;
         geometry.vertices.push_back(value);
     };
+    
     if(primitive == ScenePrimitive::Cube)
     {
         // Each face has its own normals and UV island; cross(u,v) points outward.

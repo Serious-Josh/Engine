@@ -189,6 +189,16 @@ public:
         std::uint64_t historyEpoch = 0;
     };
     std::optional<PrimitiveCreationRequest> TakePrimitiveCreationRequest();
+
+    // Hierarchy "Empty Object": a meshless, materialless object created through the same
+    // checked membership and history path as primitives.
+    struct EmptyObjectCreationRequest
+    {
+        std::uint64_t runtimeIdentity = 0;
+        std::uint64_t historyEpoch = 0;
+    };
+    std::optional<EmptyObjectCreationRequest> TakeEmptyObjectCreationRequest();
+    void OnEmptyObjectCreationFailed(const std::string& error);
     struct MeshCreationRequest
     {
         std::string meshReference;
@@ -314,6 +324,7 @@ private:
         const ProjectAssetRegistry& registry);
     std::optional<MeshCreationRequest> m_meshCreationRequest;
     std::optional<PrimitiveCreationRequest> m_primitiveCreationRequest;
+    std::optional<EmptyObjectCreationRequest> m_emptyObjectCreationRequest;
     std::string m_meshCreationStatus;
 
     std::uint64_t m_meshDragRuntimeIdentity = 0;
@@ -499,7 +510,6 @@ private:
         std::optional<Physics::PhysicsComponent> before;
         std::optional<Physics::PhysicsComponent> after;
     };
-    static bool ParsePhysicsNumber(const char* text, float& value);
     void DrawObjectPhysicsControls(IDemoScene& scene);
     bool CommitObjectPhysics(IDemoScene& scene, const SceneObjectMetadata& selection,
         const std::optional<Physics::PhysicsComponent>& before,
@@ -507,7 +517,9 @@ private:
     std::optional<SceneObjectMetadata> m_physicsInspection;
     std::optional<Physics::PhysicsComponent> m_physicsInspectedValue;
     std::uint64_t m_physicsInspectionEpoch = 0;
-    std::array<std::array<char, 64>, 9> m_physicsNumericText{};
+    // One drag draft per numeric physics field, in DrawObjectPhysicsControls' field order.
+    // Drafts hold displayed units (degrees for rotation) and reach the scene only on commit.
+    std::array<float, 15> m_physicsDragDrafts{};
     std::string m_physicsEditStatus;
     struct RenameObject
     {

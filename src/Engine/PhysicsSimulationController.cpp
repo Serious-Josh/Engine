@@ -80,6 +80,8 @@ PhysicsSimulationController::Result PhysicsSimulationController::Start(FileScene
         m_accumulatedTicks = 0.0;
         m_totalSteps = 0;
         m_lastUpdateSteps = 0;
+        m_lastUpdateContactEvents.clear();
+        m_lastUpdateContactNotifications.clear();
         m_pendingPresentation = false;
         m_state = State::Active;
         return {Status::Started};
@@ -142,6 +144,9 @@ PhysicsSimulationController::Result PhysicsSimulationController::Update(
             return FailAndStop(runtime, renderer, error);
         }
         m_lastUpdateSteps = 0;
+        m_lastUpdateContactEvents.clear();
+        m_lastUpdateContactNotifications.clear();
+
         if (elapsedSeconds == 0.0)
         {
             return {Status::Updated};
@@ -165,6 +170,10 @@ PhysicsSimulationController::Result PhysicsSimulationController::Update(
         }
         if (m_lastUpdateSteps != 0)
         {
+            // Every step's events, each tagged with its own fixed step, after all steps finished.
+            m_lastUpdateContactEvents = m_session->TakeContactEvents();
+            m_lastUpdateContactNotifications = m_session->SelectContactNotifications(m_lastUpdateContactEvents);
+
             auto snapshot = m_session->CapturePoses(&error);
             if (!snapshot)
             {
@@ -225,6 +234,8 @@ void PhysicsSimulationController::ReleaseSimulation() noexcept
 {
     m_session.reset();
     m_snapshot.reset();
+    m_lastUpdateContactEvents.clear();
+    m_lastUpdateContactNotifications.clear();
     m_registeredDocument.reset();
     m_association.reset();
     m_pendingPresentation = false;

@@ -127,6 +127,11 @@ namespace
     }
 }
 
+// These fields record separate facts, not one exclusive phase. Preparation owns
+// private resources; recording sets generation, an attempted submission arms
+// uncertain, and confirmation records fence/lifetime and clears generation.
+// A nonzero fence alone does not prove completion. Failed/uncertain candidates
+// retain the manager pin until checked collection or drained teardown.
 struct RayTracingSceneResources::CandidateState
 {
     struct GeometryDependency
@@ -868,13 +873,20 @@ void RayTracingSceneResources::ShutdownReplacementCandidate()
     }
 }
 
+bool RayTracingSceneResources::HasMatchingCandidateSubmissionState(const ReplacementCandidate& handle) const noexcept
+{
+    // Submission bookkeeping only: callers must separately prove fence completion,
+    // current bindings/source ownership and storage prerequisites before adoption.
+    return handle.m_state && handle.m_state == m_candidate && m_candidate->valid && !m_candidate->failed &&
+        !m_candidate->generation && !m_candidate->uncertain && m_candidate->fence;
+}
+
 RayTracingSceneResources::AdoptionReadiness RayTracingSceneResources::PrepareCandidateAdoption(
     const ReplacementCandidate& handle, std::string_view objectID, std::size_t objectIndex,
     const MeshResidencyCandidate& mesh, Material* fallback, const std::map<std::string, Material*>& slots,
     std::size_t materialCount, AdoptionEvidence& evidence, std::string& error)
 {
-    if (!handle.m_state || handle.m_state != m_candidate || !m_candidate->valid || m_candidate->failed ||
-        m_candidate->generation || m_candidate->uncertain || !m_candidate->fence)
+    if (!HasMatchingCandidateSubmissionState(handle))
     {
         Fail(error, "Candidate GPU preparation is not ready for adoption validation.");
         return AdoptionReadiness::Stale;
@@ -915,19 +927,22 @@ RayTracingSceneResources::AdoptionReadiness RayTracingSceneResources::PrepareCan
         return AdoptionReadiness::Stale;
     }
 
-    return PrepareRegistryAdoption(handle,evidence,error);
+    return PrepareRegistryAdoption(handle, evidence, error);
 }
+
 RayTracingSceneResources::AdoptionReadiness RayTracingSceneResources::PrepareRegistryAdoption(
     const ReplacementCandidate& handle, AdoptionEvidence& evidence, std::string& error)
 {
-    if(!handle.m_state || handle.m_state!=m_candidate || !m_candidate->valid || m_candidate->failed ||
-        m_candidate->generation || m_candidate->uncertain || !m_candidate->fence ||
-        m_materialBindingEpoch==UINT64_MAX || !CanRetireActiveMembership())
+    // Keep epoch exhaustion and retirement availability local: this gate reports
+    // Stale, whereas the scene-side adoption gate reports epoch exhaustion as Unsupported.
+    if (!HasMatchingCandidateSubmissionState(handle) ||
+        m_materialBindingEpoch == UINT64_MAX || !CanRetireActiveMembership())
     {
-        Fail(error,"Candidate registry adoption is not ready.");
+        Fail(error, "Candidate registry adoption is not ready.");
         return AdoptionReadiness::Stale;
     }
-    auto& state=*m_candidate;
+
+    auto& state = *m_candidate;
     const auto base = state.stableBLASCount;
     const auto added = state.newBLAS.size();
     const auto needed = base + added;
@@ -957,6 +972,7 @@ RayTracingSceneResources::AdoptionReadiness RayTracingSceneResources::PrepareReg
         }
     }
 
+    // Stage the prospective registry without changing existing BLAS ownership.
     auto indices = m_blasRegistry.meshToBottomLevel;
     indices.reserve(needed);
 

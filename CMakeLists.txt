@@ -57,21 +57,13 @@ add_library(EngineCore OBJECT
     src/Engine/BuildGame.cpp
     src/Engine/SceneEnvironment.cpp
     src/assets/CookedEnvironment.cpp
-    $<$<CONFIG:Debug>:src/Engine/SceneEnvironmentVerification.cpp>
     src/Editor/BuildGameWindow.cpp
-    $<$<CONFIG:Debug>:src/Engine/BuildGameVerification.cpp>
-    src/Engine/CookedMeshGPUVerification.cpp
-    $<$<CONFIG:Debug>:src/Engine/ArchiveCookedMeshVerification.cpp>
-    $<$<CONFIG:Debug>:src/Engine/CookedSceneArchiveVerification.cpp>
     src/Engine/ArchiveSurfaceAdmission.cpp
     src/Engine/ArchiveSceneBootstrap.cpp
     src/Engine/PackagedBootstrap.cpp
-    $<$<CONFIG:Debug>:src/Engine/PackagedSurfaceVerification.cpp>
-    src/Engine/CookedMeshLifecycleVerification.cpp
     src/assets/ProjectTexturePreparationService.cpp
     src/assets/ProjectMaterialPreparationService.cpp
     src/Renderer/MaterialAdmission.cpp
-    src/Engine/MaterialAdmissionVerification.cpp
     src/assets/ProjectMeshPreparationService.cpp
     src/assets/CookedSurface.cpp
     src/assets/CookedScene.cpp
@@ -81,10 +73,7 @@ add_library(EngineCore OBJECT
     src/assets/EngineAssetPak.cpp
     src/assets/CookedMesh.cpp
     src/assets/DevelopmentCookedMeshProvider.cpp
-    $<$<CONFIG:Debug>:src/assets/CookedMeshVerification.cpp>
     $<$<CONFIG:Debug>:src/assets/OfflineMeshCooker.cpp>
-    $<$<CONFIG:Debug>:src/assets/DevelopmentCookedMeshProviderVerification.cpp>
-    $<$<CONFIG:Debug>:src/assets/CookedMeshPreparationVerification.cpp>
     src/Scene/FileSceneTextureStreaming.cpp
     src/Platform/Windows/WindowsWindow.cpp
     src/Core/Time.cpp
@@ -158,6 +147,7 @@ add_library(EngineCore OBJECT
     src/Editor/ViewportMarqueeControls.cpp
     src/Editor/SceneHierarchyPanel.cpp
     src/Editor/InspectorPanel.cpp
+    src/Editor/InspectorNumericDrag.cpp
     src/assets/ProjectAssetDeletion.cpp
     src/assets/ProjectAssetRename.cpp
     src/assets/AssetReconciliationTransaction.cpp
@@ -216,25 +206,13 @@ add_library(EngineCore OBJECT
     src/Scene/MeshResidency.cpp
     src/Scene/CookedMeshCatalogPreparation.cpp
     src/Editor/MaterialLocate.cpp
-    src/Engine/MaterialLocateVerification.cpp
-    src/Engine/ViewportPanVerification.cpp
     src/Editor/SceneObjectDuplication.cpp
     src/Editor/SceneObjectDuplicationControls.cpp
     src/Engine/EditorMembership.cpp
-    src/Engine/SceneDuplicationVerification.cpp
-    $<$<CONFIG:Debug>:src/Engine/ScenePhysicsDataVerification.cpp>
-    $<$<CONFIG:Debug>:src/Engine/PrimitiveCreationVerification.cpp>
-    $<$<CONFIG:Debug>:src/Engine/ColliderVisualizationVerification.cpp>
-    $<$<CONFIG:Debug>:src/Engine/MarqueeSelectionVerification.cpp>
-    $<$<CONFIG:Debug>:src/Engine/ScenePhysicsPersistenceVerification.cpp>
-    $<$<CONFIG:Debug>:src/Engine/PresentationTransformVerification.cpp>
     src/Scene/SceneMembershipPublication.cpp
-    src/Engine/SceneMembershipVerification.cpp
     src/Scene/MeshResidencyPublication.cpp
     src/Scene/SceneMaterialBindingPublication.cpp
-    src/Engine/MaterialBindingVerification.cpp
     src/Engine/ViewportMaterialAssignment.cpp
-    src/Engine/ViewportMaterialDropVerification.cpp
     src/DemoContent/FileBackedDemoScene.cpp
     src/assets/AssetID.cpp
     src/assets/AssetRecord.cpp
@@ -253,11 +231,47 @@ add_library(EngineCore OBJECT
 target_compile_definitions(EngineCore PRIVATE
     ENGINE_SOURCE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}"
 )
+# Verification diagnostics (--verify-* flags) are local-only, Git-ignored test code.
+# A clone without them builds Engine normally; the flags then report that they are unavailable.
+set(ENGINE_VERIFICATION_AVAILABLE OFF)
+
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Engine/tests" AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/assets/tests/CookedMeshVerification.cpp")
+    set(ENGINE_VERIFICATION_AVAILABLE ON)
+    target_sources(EngineCore PRIVATE
+        $<$<CONFIG:Debug>:src/Engine/tests/SceneEnvironmentVerification.cpp>
+        $<$<CONFIG:Debug>:src/Engine/tests/BuildGameVerification.cpp>
+        src/Engine/tests/CookedMeshGPUVerification.cpp
+        $<$<CONFIG:Debug>:src/Engine/tests/ArchiveCookedMeshVerification.cpp>
+        $<$<CONFIG:Debug>:src/Engine/tests/CookedSceneArchiveVerification.cpp>
+        $<$<CONFIG:Debug>:src/Engine/tests/PackagedSurfaceVerification.cpp>
+        src/Engine/tests/CookedMeshLifecycleVerification.cpp
+        src/Engine/tests/MaterialAdmissionVerification.cpp
+        $<$<CONFIG:Debug>:src/assets/tests/CookedMeshVerification.cpp>
+        $<$<CONFIG:Debug>:src/assets/tests/DevelopmentCookedMeshProviderVerification.cpp>
+        $<$<CONFIG:Debug>:src/assets/tests/CookedMeshPreparationVerification.cpp>
+        src/Engine/tests/MaterialLocateVerification.cpp
+        src/Engine/tests/ViewportPanVerification.cpp
+        src/Engine/tests/SceneDuplicationVerification.cpp
+        $<$<CONFIG:Debug>:src/Engine/tests/ScenePhysicsDataVerification.cpp>
+        $<$<CONFIG:Debug>:src/Engine/tests/PrimitiveCreationVerification.cpp>
+        $<$<CONFIG:Debug>:src/Engine/tests/ColliderVisualizationVerification.cpp>
+        $<$<CONFIG:Debug>:src/Engine/tests/MarqueeSelectionVerification.cpp>
+        $<$<CONFIG:Debug>:src/Engine/tests/ScenePhysicsPersistenceVerification.cpp>
+        $<$<CONFIG:Debug>:src/Engine/tests/PresentationTransformVerification.cpp>
+        src/Engine/tests/SceneMembershipVerification.cpp
+        src/Engine/tests/MaterialBindingVerification.cpp
+        src/Engine/tests/ViewportMaterialDropVerification.cpp
+    )
+endif()
 
 # Object sharing also retains static scene-registration units for editor startup.
 # Both executables use one implementation; only the entry point selects capabilities.
 add_executable(Engine src/main.cpp)
 target_link_libraries(Engine PRIVATE EngineCore)
+
+if(ENGINE_VERIFICATION_AVAILABLE)
+    target_compile_definitions(Engine PRIVATE ENGINE_HAS_VERIFICATION=1)
+endif()
 add_executable(EngineRuntime WIN32 src/runtime_main.cpp)
 target_link_libraries(EngineRuntime PRIVATE EngineCore shell32)
 add_dependencies(Engine EngineRuntime)

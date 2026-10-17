@@ -23,7 +23,12 @@ CmakeUserPresets.json
 # Test directories
 /Projects
 /docs/*
-/tests
+**/[Tt]est/
+**/[Tt]ests/
+**/*-tests/
+# Test and verification sources outside a tests folder (local-only; see CMakeLists.txt)
+**/*Verification.cpp
+**/*Tests.cpp
 
 # Development-only cooked generations and publication bookkeeping
 **/Cooked/

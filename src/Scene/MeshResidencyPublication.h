@@ -61,7 +61,8 @@ public:
         FileSceneAssetCatalog& catalog, const MeshResidencyToken& sceneToken, std::string& error);
     static void CancelSelectionMask(Renderer& renderer) noexcept;
 
-    // Ready applies only to this observation. No source lock escapes the call.
+    // Engine-thread observation, not a pure/read-only predicate: it may reserve
+    // adoption storage. Ready applies only now; no source lock escapes this call.
     // Transform refresh, when needed, submits candidate-only work and returns
     // Retry. A future commit must repeat all checks after GPU completion.
     static Readiness Check(Renderer& renderer, const FileSceneRuntime& runtime,
@@ -75,6 +76,8 @@ private:
     AcceptanceResult PublishAtBoundary(Renderer& renderer, FileSceneRuntime& runtime,
         FileSceneAssetCatalog& catalog);
 
+    // Shared sequence, deliberately rerun at final acceptance. Optional outputs
+    // retain the source pin and staged evidence only for the immediate commit.
     static Readiness CheckPrepared(Renderer& renderer, const FileSceneRuntime& runtime,
         FileSceneAssetCatalog& catalog, const MeshResidencyToken& sceneToken,
         const RayTracingSceneResources::ReplacementCandidate& candidate, unsigned int frameSlot,

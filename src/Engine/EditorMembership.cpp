@@ -128,48 +128,88 @@ bool Engine::AdvanceEditorMembership()
 
 bool Engine::BeginPrimitiveCreation(const Editor::PrimitiveCreationRequest& intent, std::string& error)
 {
+    const auto preparePrimitive = [&](const std::filesystem::path& project, const SceneDocument& document,
+        SceneObjectDocument& object, std::string& prepareError)
+    {
+        std::string reference;
+
+        if(!PrimitiveMeshAssets::Ensure(ProjectPaths(project), m_projectAssetRegistry, intent.primitive, reference, prepareError))
+        {
+            return false;
+        }
+
+        object = PreparePrimitiveObject(document, intent.primitive, reference);
+        return true;
+    };
+
+    return BeginObjectCreation(intent.runtimeIdentity, intent.historyEpoch, "Primitive", preparePrimitive, error);
+}
+
+bool Engine::BeginEmptyObjectCreation(const Editor::EmptyObjectCreationRequest& intent, std::string& error)
+{
+    // No asset work: an Empty Object references no mesh or material.
+    const auto prepareEmpty = [](const std::filesystem::path&, const SceneDocument& document,
+        SceneObjectDocument& object, std::string&)
+    {
+        object = PrepareEmptyObject(document);
+        return true;
+    };
+
+    return BeginObjectCreation(intent.runtimeIdentity, intent.historyEpoch, "Empty Object", prepareEmpty, error);
+}
+
+bool Engine::BeginObjectCreation(std::uint64_t runtimeIdentity, std::uint64_t historyEpoch, const char* operationName,
+    const PrepareCreatedObject& prepareObject, std::string& error)
+{
     error.clear();
     try
     {
         auto* owner = dynamic_cast<FileBackedDemoScene*>(m_demoSceneManager.TryGetActiveScene());
         if(PhysicsBlocksSceneEdits() || m_editor.IsPhysicsEditingLocked() || m_state != EngineState::Running ||
-            !owner || owner->IsArchiveActivation() || owner->GetRuntimeIdentity() != intent.runtimeIdentity ||
-            intent.historyEpoch != m_editor.GetSceneHistoryEpoch() || m_pendingEditorMembership ||
+            !owner || owner->IsArchiveActivation() || owner->GetRuntimeIdentity() != runtimeIdentity ||
+            historyEpoch != m_editor.GetSceneHistoryEpoch() || m_pendingEditorMembership ||
             m_pendingSceneObjectCreation || m_pendingSceneObjectDeletion || m_pendingSceneObjectRestoration ||
             m_pendingMaterialAssignment || m_pendingEditorSceneOperation || m_demoSceneManager.HasPendingSceneChange() ||
             m_editor.HasBlockingObjectCreation() || m_editor.HasBlockingMaterialOperation() ||
             m_editor.HasPendingSceneHistoryOperation() || owner->m_objectMutationCandidate ||
             owner->m_runtime->HasPreparedScene() || owner->m_runtime->HasMaterialAssignment())
         {
-            error = "Primitive creation requires a stopped editable scene without pending operations or transform gestures.";
+            error = std::string(operationName) +
+                " creation requires a stopped editable scene without pending operations or transform gestures.";
             return false;
         }
         const auto project = std::filesystem::canonical(owner->m_projectRoot);
-        if(!m_editor.CanPreserveSceneHistory(*owner, project, intent.historyEpoch))
+        if(!m_editor.CanPreserveSceneHistory(*owner, project, historyEpoch))
         {
-            error = "Primitive creation belongs to a stale scene history session.";
+            error = std::string(operationName) + " creation belongs to a stale scene history session.";
             return false;
         }
-        std::string reference;
-        if(!PrimitiveMeshAssets::Ensure(ProjectPaths(project), m_projectAssetRegistry, intent.primitive, reference, error))
-            return false;
         SceneDocument document;
         if(!CaptureSceneDocument(owner->m_runtime->GetFileScene().GetDocument(), owner->GetScene(),
             owner->m_runtime->GetObjectMapping(), document, &error)) return false;
 
+        // The new object is appended, so existing scene and render-object indices are unchanged.
         Editor::HistoryReplayRequest request;
-        request.object = PreparePrimitiveObject(document, intent.primitive, reference);
+
+        if(!prepareObject(project, document, request.object, error))
+        {
+            return false;
+        }
+
         request.insertionIndex = document.objects.size();
         request.membership = true;
-        request.identity = {m_editor.AllocateSceneHistoryOperationID(), intent.historyEpoch, false, request.object.id};
+        request.identity = {m_editor.AllocateSceneHistoryOperationID(), historyEpoch, false, request.object.id};
         const auto previous = owner->GetObjectMetadata(m_editor.GetSelectedObject());
         const auto selectionBefore = previous ? std::optional<std::string>{previous->objectID} : std::nullopt;
+
+        // History is staged first and completed (or cancelled) by membership publication,
+        // so a failed publication leaves no scene object and no history entry.
         if(!m_editor.StageObjectDeletionHistory(request.object, request.insertionIndex, selectionBefore, request.object.id,
-            request.identity.operationID, intent.historyEpoch, false, error, true)) return false;
+            request.identity.operationID, historyEpoch, false, error, true)) return false;
         const auto operationID = request.identity.operationID;
         if(!BeginEditorMembership(std::move(request), false, error))
         {
-            m_editor.CompleteObjectDeletionHistory(operationID, intent.historyEpoch, false, error);
+            m_editor.CompleteObjectDeletionHistory(operationID, historyEpoch, false, error);
             return false;
         }
         m_editor.SetSceneOperationPending(true);

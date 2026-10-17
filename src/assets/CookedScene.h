@@ -7,11 +7,21 @@
 namespace CookedScene
 {
     inline constexpr std::uint32_t LegacyVersion = 1;
-    inline constexpr std::uint32_t Version = 2;
+    inline constexpr std::uint32_t BoxPhysicsVersion = 2;
+    inline constexpr std::uint32_t SpherePhysicsVersion = 3;
+    inline constexpr std::uint32_t CapsulePhysicsVersion = 4;
+    inline constexpr std::uint32_t CapsuleRotationVersion = 5;
+    inline constexpr std::uint32_t ContactEventsVersion = 6;
+    inline constexpr std::uint32_t Version = ContactEventsVersion;
 
     constexpr bool IsSupportedVersion(std::uint32_t version)
     {
-        return version == LegacyVersion || version == Version;
+        return version == LegacyVersion ||
+            version == BoxPhysicsVersion ||
+            version == SpherePhysicsVersion ||
+            version == CapsulePhysicsVersion ||
+            version == CapsuleRotationVersion ||
+            version == ContactEventsVersion;
     }
     struct Policy
     {

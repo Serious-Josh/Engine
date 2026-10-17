@@ -24,6 +24,8 @@
 #include <chrono>
 
 #include <cstdint>
+#include <filesystem>
+#include <functional>
 
 enum class EngineState
 {
@@ -189,6 +191,14 @@ class Engine
     std::optional<EditorMembershipOperation> m_pendingEditorMembership;
     std::optional<EditorColliderOverlay> CaptureEditorColliderOverlayForFrame(const FileSceneRuntime*, bool editableScene) const;
     bool BeginPrimitiveCreation(const Editor::PrimitiveCreationRequest&, std::string& error);
+    bool BeginEmptyObjectCreation(const Editor::EmptyObjectCreationRequest&, std::string& error);
+
+    // Checked insertion of one new authored object at the end of the scene, selected after
+    // creation, as one history entry. prepareObject builds it from the captured document.
+    using PrepareCreatedObject = std::function<bool(const std::filesystem::path& project, const SceneDocument& document,
+        SceneObjectDocument& object, std::string& error)>;
+    bool BeginObjectCreation(std::uint64_t runtimeIdentity, std::uint64_t historyEpoch, const char* operationName,
+        const PrepareCreatedObject& prepareObject, std::string& error);
     bool BeginEditorMembership(Editor::HistoryReplayRequest,bool replay,std::string& error,
         std::optional<SceneObjectMetadata> deletion = {});
     bool BeginEditorMembershipDeletion(const SceneObjectMetadata&,std::string&);
@@ -311,6 +321,11 @@ class Engine
     std::optional<SceneObjectCreationResult> m_lastSceneObjectCreation;
 
     void Frame();
+    // Continuation gates preserve the existing fatal-return boundaries in Frame.
+    bool DeliverFrameDisplacementCompletion(bool& completionDelivered);
+    bool ExecutePendingEditorMutations();
+    // Immediate pre-recording acceptance; request outcomes do not decide frame continuation.
+    void AcceptPreparedMeshResidencyForFrame(IDemoScene& activeDemo);
     bool ActivateRequestedFileScene();
     bool ExecuteMaterialAssignment();
     struct MaterialAssignmentRequest

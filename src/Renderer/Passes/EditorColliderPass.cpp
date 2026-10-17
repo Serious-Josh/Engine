@@ -5,40 +5,114 @@
 #include "Renderer/RenderTarget.h"
 
 #include <cmath>
+#include <cstdint>
 
 namespace
 {
-bool HasFiniteClipCoordinates(const Matrix4& viewProjection, std::span<const Matrix4> colliderWorldTransforms)
+// CPU image of the HLSL ColliderConstants cbuffer, copied as root constants per draw.
+struct ColliderDrawConstants
 {
-    for(const Matrix4& colliderWorldTransform : colliderWorldTransforms)
-    {
-        const Matrix4 clipFromBox = viewProjection * colliderWorldTransform;
-        for(const auto& matrixRow : clipFromBox.m)
-        {
-            for(float matrixElement : matrixRow)
-            {
-                if(!std::isfinite(matrixElement))
-                {
-                    return false;
-                }
-            }
-        }
+    Matrix4 clipFromCollider;
+    std::uint32_t colliderShape = 0;
+    float capsuleHalfCylinderHeight = 0.0f;
+};
 
-        for(unsigned int vertexIndex = 0; vertexIndex < EditorColliderOverlay::VerticesPerBox; ++vertexIndex)
+static_assert(sizeof(ColliderDrawConstants) == EditorColliderPass::ColliderConstantCount * sizeof(float));
+
+// One collider to validate or draw: its world matrix plus the capsule parameter (zero
+// for Box and Sphere).
+struct ColliderDraw
+{
+    const Matrix4& colliderWorldTransform;
+    float capsuleHalfCylinderHeight;
+};
+
+bool HasFiniteClipCoordinates(const Matrix4& viewProjection, const ColliderDraw& collider, ColliderOverlayShape shape)
+{
+    const Matrix4 clipFromCollider = viewProjection * collider.colliderWorldTransform;
+
+    for(const auto& matrixRow : clipFromCollider.m)
+    {
+        for(float matrixElement : matrixRow)
         {
-            const Vector3 localPosition = ColliderBoxVertex(vertexIndex);
-            for(unsigned int coordinate = 0; coordinate < 4; ++coordinate)
+            if(!std::isfinite(matrixElement))
             {
-                const float clipCoordinate = clipFromBox[coordinate][0] * localPosition.x +
-                    clipFromBox[coordinate][1] * localPosition.y +
-                    clipFromBox[coordinate][2] * localPosition.z + clipFromBox[coordinate][3];
-                if(!std::isfinite(clipCoordinate))
-                {
-                    return false;
-                }
+                return false;
             }
         }
     }
+
+    const unsigned int vertexCount = ColliderVertexCount(shape);
+
+    for(unsigned int vertexIndex = 0; vertexIndex < vertexCount; ++vertexIndex)
+    {
+        const Vector3 localPosition = ColliderShapeVertex(shape, vertexIndex, collider.capsuleHalfCylinderHeight);
+
+        for(unsigned int coordinate = 0; coordinate < 4; ++coordinate)
+        {
+            const float clipCoordinate = clipFromCollider[coordinate][0] * localPosition.x +
+                clipFromCollider[coordinate][1] * localPosition.y +
+                clipFromCollider[coordinate][2] * localPosition.z + clipFromCollider[coordinate][3];
+
+            if(!std::isfinite(clipCoordinate))
+            {
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
+void DrawCollider(ID3D12GraphicsCommandList* commandList, const Matrix4& viewProjection, const ColliderDraw& collider,
+    ColliderOverlayShape shape)
+{
+    // The shape constant and vertex count are chosen together here, so one shape can
+    // never generate another shape's endpoints.
+    ColliderDrawConstants drawConstants;
+    drawConstants.clipFromCollider = viewProjection * collider.colliderWorldTransform;
+    drawConstants.colliderShape = static_cast<std::uint32_t>(shape);
+    drawConstants.capsuleHalfCylinderHeight = collider.capsuleHalfCylinderHeight;
+
+    // Root constants are copied into the command stream per draw. No frame can
+    // overwrite another frame's upload storage, and changing counts needs no retirement.
+    commandList->SetGraphicsRoot32BitConstants(0, EditorColliderPass::ColliderConstantCount, &drawConstants, 0);
+    commandList->DrawInstanced(ColliderVertexCount(shape), 1, 0, 0);
+}
+
+// Applies one operation to every collider of all three shapes, in the fixed draw order
+// Box, Sphere, Capsule. Returns false as soon as the operation does.
+template <typename Operation>
+bool ForEachCollider(std::span<const Matrix4> boxColliderWorldTransforms,
+    std::span<const Matrix4> sphereColliderWorldTransforms, std::span<const CapsuleColliderOverlay> capsuleColliders,
+    Operation operation)
+{
+    for(const Matrix4& colliderWorldTransform : boxColliderWorldTransforms)
+    {
+        if(!operation(ColliderDraw{colliderWorldTransform, 0.0f}, ColliderOverlayShape::Box))
+        {
+            return false;
+        }
+    }
+
+    for(const Matrix4& colliderWorldTransform : sphereColliderWorldTransforms)
+    {
+        if(!operation(ColliderDraw{colliderWorldTransform, 0.0f}, ColliderOverlayShape::Sphere))
+        {
+            return false;
+        }
+    }
+
+    for(const CapsuleColliderOverlay& capsuleCollider : capsuleColliders)
+    {
+        const ColliderDraw collider{capsuleCollider.colliderWorldTransform, capsuleCollider.halfCylinderHeightInRadii};
+
+        if(!operation(collider, ColliderOverlayShape::Capsule))
+        {
+            return false;
+        }
+    }
+
     return true;
 }
 }
@@ -47,6 +121,7 @@ bool EditorColliderPass::Initialize(ID3D12Device* device, ShaderLibrary& shaderL
 {
     const Shader* vertexShader = shaderLibrary.Load({"EditorCollider.hlsl", "VSMain", ShaderStage::Vertex});
     const Shader* pixelShader = shaderLibrary.Load({"EditorCollider.hlsl", "PSMain", ShaderStage::Pixel});
+
     if(!vertexShader || !pixelShader)
     {
         return false;
@@ -65,7 +140,8 @@ bool EditorColliderPass::Initialize(ID3D12Device* device, ShaderLibrary& shaderL
     pipelineDescription.depthComparison = D3D12_COMPARISON_FUNC_LESS_EQUAL;
     pipelineDescription.depthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
     pipelineDescription.rootParameters.push_back(
-        {RootParameterType::Constants, 0, TransformConstantCount, D3D12_SHADER_VISIBILITY_VERTEX});
+        {RootParameterType::Constants, 0, ColliderConstantCount, D3D12_SHADER_VISIBILITY_VERTEX});
+
     return m_pipeline.Initialize(device, pipelineDescription);
 }
 
@@ -75,46 +151,60 @@ void EditorColliderPass::Shutdown()
 }
 
 void EditorColliderPass::Execute(ID3D12GraphicsCommandList* commandList, RenderTarget& viewportColor,
-    DepthBuffer& viewportDepth, const Matrix4& viewProjection, std::span<const Matrix4> colliderWorldTransforms) const
+    DepthBuffer& viewportDepth, const Matrix4& viewProjection, std::span<const Matrix4> boxColliderWorldTransforms,
+    std::span<const Matrix4> sphereColliderWorldTransforms,
+    std::span<const CapsuleColliderOverlay> capsuleColliders) const
 {
-    if(colliderWorldTransforms.empty() || colliderWorldTransforms.size() > EditorColliderOverlay::MaxBoxes)
+    // All shapes share one capacity bound; an empty batch records no GPU work.
+    const std::size_t colliderCount =
+        boxColliderWorldTransforms.size() + sphereColliderWorldTransforms.size() + capsuleColliders.size();
+
+    if(colliderCount == 0 || colliderCount > EditorColliderOverlay::MaxColliders)
     {
         return;
     }
+
     if(!m_pipeline.IsInitialized())
     {
         return;
     }
+
     const bool matchingTargetDimensions = viewportColor.GetWidth() == viewportDepth.GetWidth() &&
         viewportColor.GetHeight() == viewportDepth.GetHeight();
+
     if(!matchingTargetDimensions)
     {
         return;
     }
 
-    // Validate the whole batch before changing state or recording any partial visualization.
-    if(!HasFiniteClipCoordinates(viewProjection, colliderWorldTransforms))
+    // Validate the whole batch, every shape, before changing state or recording any
+    // partial visualization.
+    const bool finiteBatch = ForEachCollider(boxColliderWorldTransforms, sphereColliderWorldTransforms, capsuleColliders,
+        [&](const ColliderDraw& collider, ColliderOverlayShape shape)
+        {
+            return HasFiniteClipCoordinates(viewProjection, collider, shape);
+        });
+
+    if(!finiteBatch)
     {
         return;
     }
 
     const D3D12_RESOURCE_STATES previousDepthState = viewportDepth.GetState();
     viewportDepth.Transition(commandList, D3D12_RESOURCE_STATE_DEPTH_READ);
+
     const D3D12_CPU_DESCRIPTOR_HANDLE colorTarget = viewportColor.GetRTV();
     const D3D12_CPU_DESCRIPTOR_HANDLE readOnlyDepth = viewportDepth.GetReadOnlyDSV();
     commandList->OMSetRenderTargets(1, &colorTarget, FALSE, &readOnlyDepth);
     m_pipeline.Bind(commandList);
     commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_LINELIST);
 
-    // Root constants are copied into the command stream per draw. No frame can
-    // overwrite another frame's upload storage, and changing counts needs no retirement.
-    static_assert(sizeof(Matrix4) == TransformConstantCount * sizeof(float));
-    for(const Matrix4& colliderWorldTransform : colliderWorldTransforms)
-    {
-        const Matrix4 clipFromBox = viewProjection * colliderWorldTransform;
-        commandList->SetGraphicsRoot32BitConstants(0, TransformConstantCount, &clipFromBox, 0);
-        commandList->DrawInstanced(EditorColliderOverlay::VerticesPerBox, 1, 0, 0);
-    }
+    ForEachCollider(boxColliderWorldTransforms, sphereColliderWorldTransforms, capsuleColliders,
+        [&](const ColliderDraw& collider, ColliderOverlayShape shape)
+        {
+            DrawCollider(commandList, viewProjection, collider, shape);
+            return true;
+        });
 
     // Unbind the read-only DSV before restoring the tracked state for later consumers.
     commandList->OMSetRenderTargets(1, &colorTarget, FALSE, nullptr);

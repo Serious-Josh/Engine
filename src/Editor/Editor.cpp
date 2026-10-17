@@ -7,6 +7,7 @@
 #include "SceneViewportLayout.h"
 #include "GroupTransform.h"
 #include "ViewportPicking.h"
+#include "InspectorNumericDrag.h"
 #include "Debug/DebugUI.h"
 
 #include "Math/Math.h"
@@ -797,6 +798,18 @@ void Editor::DrawHierarchy(IDemoScene& demoScene, const std::string& activeScene
         if(!IsPhysicsEditingLocked() && !blocked && fileScene && !fileScene->IsArchiveActivation() &&
             m_historySession && RenameSessionMatches(demoScene,*m_historySession) && !HasBlockingObjectCreation())
             m_primitiveCreationRequest=PrimitiveCreationRequest{*primitive,fileScene->GetRuntimeIdentity(),m_historyEpoch};
+    }
+
+    // Same eligibility as primitive creation; Engine re-checks everything before staging.
+    if(m_hierarchyPanel.TakeEmptyObjectRequest())
+    {
+        const bool canCreate = !IsPhysicsEditingLocked() && !blocked && fileScene && !fileScene->IsArchiveActivation() &&
+            m_historySession && RenameSessionMatches(demoScene, *m_historySession) && !HasBlockingObjectCreation();
+
+        if(canCreate)
+        {
+            m_emptyObjectCreationRequest = EmptyObjectCreationRequest{fileScene->GetRuntimeIdentity(), m_historyEpoch};
+        }
     }
 
     if(auto reorder = m_hierarchyPanel.TakeReorderRequest())
@@ -3849,100 +3862,279 @@ bool Editor::CommitObjectPhysics(IDemoScene& scene, const SceneObjectMetadata& s
 void Editor::DrawObjectPhysicsControls(IDemoScene& scene)
 {
     auto* owner = dynamic_cast<FileBackedDemoScene*>(&scene);
-    if(!owner) return;
+
+    if(!owner)
+    {
+        return;
+    }
+
     const auto selection = owner->GetObjectMetadata(m_selectedObject);
     SceneObjectDocument object;
-    if(!selection || !owner->CapturePhysicsInspection(selection->objectID, object)) return;
+
+    if(!selection || !owner->CapturePhysicsInspection(selection->objectID, object))
+    {
+        return;
+    }
+
+    using Physics::BoxDimensions;
+    using Physics::PhysicsComponent;
+
+    // Numeric fields in draft-buffer order. Every shape's stored values persist while
+    // inactive, so switching collider type never discards or derives dimensions.
+    enum class PhysicsFieldShape
+    {
+        Box,
+        Sphere,
+        Capsule,
+        Shared
+    };
+
+    struct PhysicsNumericField
+    {
+        const char* label;
+        PhysicsFieldShape shape;
+        InspectorDragSpec drag;
+        float PhysicsComponent::* componentMember = nullptr;
+        float BoxDimensions::* boxMember = nullptr;
+        float Vector3::* offsetMember = nullptr;
+
+        // Capsule local rotation is stored in radians (Transform convention) but edited
+        // in degrees, like the object Rotation control.
+        float Vector3::* rotationMember = nullptr;
+    };
+
+    // Drag sensitivities per pixel and drag-only limits. Limits stop a drag at the edge of
+    // the valid range; typed values are not clamped, so ValidatePhysicsComponent still
+    // rejects them with its existing message (for example a typed radius of 0).
+    constexpr float largestFloat = (std::numeric_limits<float>::max)();
+    static constexpr InspectorDragSpec lengthDrag{0.01f, 0.0f, largestFloat};
+    static constexpr InspectorDragSpec offsetDrag{0.01f};
+    static constexpr InspectorDragSpec angleDrag{0.25f};
+    static constexpr InspectorDragSpec densityDrag{5.0f, 0.0f, largestFloat};
+    static constexpr InspectorDragSpec frictionDrag{0.005f, 0.0f, largestFloat};
+    static constexpr InspectorDragSpec restitutionDrag{0.005f, 0.0f, 1.0f};
+
+    static constexpr std::array<PhysicsNumericField, 15> numericFields{{
+        {"Width (X, m)", PhysicsFieldShape::Box, lengthDrag, nullptr, &BoxDimensions::width},
+        {"Height (Y, m)", PhysicsFieldShape::Box, lengthDrag, nullptr, &BoxDimensions::height},
+        {"Depth (Z, m)", PhysicsFieldShape::Box, lengthDrag, nullptr, &BoxDimensions::depth},
+        {"Radius (m)##Sphere", PhysicsFieldShape::Sphere, lengthDrag, &PhysicsComponent::sphereRadius},
+        {"Radius (m)##Capsule", PhysicsFieldShape::Capsule, lengthDrag, &PhysicsComponent::capsuleRadius},
+        {"Cylinder Height (Y, m)", PhysicsFieldShape::Capsule, lengthDrag, &PhysicsComponent::capsuleCylinderHeight},
+        {"Local Offset X (m)", PhysicsFieldShape::Shared, offsetDrag, nullptr, nullptr, &Vector3::x},
+        {"Local Offset Y (m)", PhysicsFieldShape::Shared, offsetDrag, nullptr, nullptr, &Vector3::y},
+        {"Local Offset Z (m)", PhysicsFieldShape::Shared, offsetDrag, nullptr, nullptr, &Vector3::z},
+        {"Local Rotation X (deg)", PhysicsFieldShape::Capsule, angleDrag, nullptr, nullptr, nullptr, &Vector3::x},
+        {"Local Rotation Y (deg)", PhysicsFieldShape::Capsule, angleDrag, nullptr, nullptr, nullptr, &Vector3::y},
+        {"Local Rotation Z (deg)", PhysicsFieldShape::Capsule, angleDrag, nullptr, nullptr, nullptr, &Vector3::z},
+        {"Density (kg/m3)", PhysicsFieldShape::Shared, densityDrag, &PhysicsComponent::density},
+        {"Friction (>= 0)", PhysicsFieldShape::Shared, frictionDrag, &PhysicsComponent::friction},
+        {"Restitution (Bounciness, 0..1)", PhysicsFieldShape::Shared, restitutionDrag, &PhysicsComponent::restitution}
+    }};
+    static_assert(numericFields.size() == std::tuple_size_v<decltype(m_physicsDragDrafts)>);
+
+    const auto fieldValue = [](PhysicsComponent& component, const PhysicsNumericField& field) -> float&
+    {
+        if(field.boxMember)
+        {
+            return component.boxDimensions.*field.boxMember;
+        }
+
+        if(field.offsetMember)
+        {
+            return component.colliderLocalPositionOffset.*field.offsetMember;
+        }
+
+        if(field.rotationMember)
+        {
+            return component.capsuleLocalRotation.*field.rotationMember;
+        }
+
+        return component.*field.componentMember;
+    };
+
+    // Drafts show degrees for rotation fields and the stored value otherwise.
+    const auto displayedValue = [&](PhysicsComponent component, const PhysicsNumericField& field)
+    {
+        const float storedValue = fieldValue(component, field);
+
+        if(field.rotationMember)
+        {
+            return ToDegrees(storedValue);
+        }
+
+        return storedValue;
+    };
+
+    const auto storeDisplayedValue = [&](PhysicsComponent& component, const PhysicsNumericField& field, float value)
+    {
+        if(field.rotationMember)
+        {
+            fieldValue(component, field) = ToRadians(value);
+            return;
+        }
+
+        fieldValue(component, field) = value;
+    };
+
+    const auto isFieldVisible = [](PhysicsFieldShape shape, Physics::ColliderType colliderType)
+    {
+        switch(shape)
+        {
+        case PhysicsFieldShape::Box:
+            return colliderType == Physics::ColliderType::Box;
+
+        case PhysicsFieldShape::Sphere:
+            return colliderType == Physics::ColliderType::Sphere;
+
+        case PhysicsFieldShape::Capsule:
+            return colliderType == Physics::ColliderType::Capsule;
+
+        default:
+            return true;
+        }
+    };
+
+    // Refresh drafts when the inspected object, history epoch or authored value changes.
     const bool changedTarget = !m_physicsInspection || m_physicsInspectionEpoch != m_historyEpoch ||
         m_physicsInspection->objectID != selection->objectID ||
         m_physicsInspection->runtimeIdentity != selection->runtimeIdentity ||
         m_physicsInspection->structureRevision != selection->structureRevision;
     const bool changedValue = m_physicsInspectedValue != object.physics;
-    const auto fields = [](Physics::PhysicsComponent& component)
-    {
-        return std::array<float*, 9>{&component.boxDimensions.width, &component.boxDimensions.height,
-            &component.boxDimensions.depth, &component.colliderLocalPositionOffset.x,
-            &component.colliderLocalPositionOffset.y, &component.colliderLocalPositionOffset.z,
-            &component.density, &component.friction, &component.restitution};
-    };
+
     if(changedTarget || changedValue || IsPhysicsEditingLocked())
     {
         m_physicsInspection = selection;
         m_physicsInspectionEpoch = m_historyEpoch;
         m_physicsInspectedValue = object.physics;
-        if(changedTarget) m_physicsEditStatus.clear();
+
+        if(changedTarget)
+        {
+            m_physicsEditStatus.clear();
+        }
+
         if(object.physics)
         {
-            auto values = fields(*object.physics);
-            for(size_t index = 0; index < values.size(); ++index)
-                std::snprintf(m_physicsNumericText[index].data(), m_physicsNumericText[index].size(),
-                    "%.9g", *values[index]);
+            for(size_t index = 0; index < numericFields.size(); ++index)
+            {
+                m_physicsDragDrafts[index] = displayedValue(*object.physics, numericFields[index]);
+            }
         }
     }
-    // Widget IDs include the load epoch and stable object identity: text cannot migrate on selection.
+
+    // Widget IDs include the load epoch and stable object identity: drafts cannot migrate on selection.
     ImGui::PushID(static_cast<int>(m_historyEpoch));
     ImGui::PushID(selection->objectID.c_str());
     ImGui::Separator();
     ImGui::BeginDisabled(IsPhysicsEditingLocked() || HasPendingSceneHistoryOperation());
+
     bool enabled = object.physics.has_value();
+
     if(ImGui::Checkbox("Physics", &enabled))
+    {
         CommitObjectPhysics(scene, *selection, object.physics,
-            enabled ? std::optional<Physics::PhysicsComponent>{Physics::PhysicsComponent{}} : std::nullopt);
+            enabled ? std::optional<PhysicsComponent>{PhysicsComponent{}} : std::nullopt);
+    }
+
     if(object.physics)
     {
         auto candidate = *object.physics;
         int bodyType = static_cast<int>(candidate.bodyType);
+
         if(ImGui::Combo("Body Type", &bodyType, "Static\0Dynamic\0Kinematic\0"))
         {
             candidate.bodyType = static_cast<Physics::BodyType>(bodyType);
             CommitObjectPhysics(scene, *selection, object.physics, candidate);
         }
-        ImGui::TextUnformatted("Collider Type: Box");
-        ImGui::TextWrapped("Full dimensions and local offset in meters; independent of visual scale.");
-        constexpr std::array<const char*, 9> labels{"Width (X, m)", "Height (Y, m)", "Depth (Z, m)",
-            "Local Offset X (m)", "Local Offset Y (m)", "Local Offset Z (m)",
-            "Density (kg/m3)", "Friction (>= 0)", "Restitution (Bounciness, 0..1)"};
-        for(size_t index = 0; index < labels.size(); ++index)
+
+        // Combo indices equal the ColliderType values: Box 0, Sphere 1, Capsule 2.
+        int colliderType = static_cast<int>(object.physics->colliderType);
+
+        if(ImGui::Combo("Collider Type", &colliderType, "Box\0Sphere\0Capsule\0"))
         {
-            auto& text = m_physicsNumericText[index];
-            ImGui::InputText(labels[index], text.data(), text.size());
-            if(ImGui::IsItemDeactivatedAfterEdit())
+            auto edited = *object.physics;
+            edited.colliderType = static_cast<Physics::ColliderType>(colliderType);
+            CommitObjectPhysics(scene, *selection, object.physics, edited);
+        }
+
+        ImGui::TextWrapped("Full dimensions and local offset in meters; independent of visual scale.");
+
+        if(object.physics->colliderType == Physics::ColliderType::Capsule)
+        {
+            ImGui::TextWrapped("Capsule axis is local +Y. Cylinder height excludes the rounded ends.");
+        }
+
+        for(size_t index = 0; index < numericFields.size(); ++index)
+        {
+            const PhysicsNumericField& field = numericFields[index];
+
+            if(!isFieldVisible(field.shape, object.physics->colliderType))
             {
-                float value = 0.0f;
-                if(!ParsePhysicsNumber(text.data(), value))
+                continue;
+            }
+
+            // Dragging and typing change only the draft. A completed drag or typed entry is
+            // committed once, so it creates one history entry; Escape restores the draft.
+            float& draft = m_physicsDragDrafts[index];
+            const InspectorDragResult result = InspectorDragFloatTransformWidth(field.label, draft, field.drag);
+
+            if(result == InspectorDragResult::Committed)
+            {
+                if(!std::isfinite(draft))
+                {
                     m_physicsEditStatus = "Enter a complete finite number; authored value was preserved.";
+                }
                 else
                 {
                     auto edited = *object.physics;
-                    *fields(edited)[index] = value;
+                    storeDisplayedValue(edited, field, draft);
                     CommitObjectPhysics(scene, *selection, object.physics, edited);
                 }
-                // Invalid drafts are discarded on commit/focus loss, never written into the scene.
-                auto current = *object.physics;
-                std::snprintf(text.data(), text.size(), "%.9g", *fields(current)[index]);
+            }
+
+            // Rejected and cancelled drafts are discarded, never written into the scene. A
+            // successful commit refreshes every draft on the next frame.
+            if(result == InspectorDragResult::Committed || result == InspectorDragResult::Cancelled)
+            {
+                draft = displayedValue(*object.physics, field);
             }
         }
+
+        // Notification opt-in only: the collider stays solid either way.
+        bool generateContactEvents = object.physics->generateContactEvents;
+
+        if(ImGui::Checkbox("Generate Contact Events", &generateContactEvents))
+        {
+            auto edited = *object.physics;
+            edited.generateContactEvents = generateContactEvents;
+            CommitObjectPhysics(scene, *selection, object.physics, edited);
+        }
     }
-    if(!m_physicsEditStatus.empty()) ImGui::TextWrapped("%s", m_physicsEditStatus.c_str());
+
+    if(!m_physicsEditStatus.empty())
+    {
+        ImGui::TextWrapped("%s", m_physicsEditStatus.c_str());
+    }
+
     ImGui::EndDisabled();
     ImGui::PopID();
     ImGui::PopID();
 }
 
 
-bool Editor::ParsePhysicsNumber(const char* text, float& value)
-{
-    char* end = nullptr;
-    errno = 0;
-    const float parsed = std::strtof(text, &end);
-    if(end == text || errno == ERANGE || !std::isfinite(parsed)) return false;
-    while(*end == ' ' || *end == '\t') ++end;
-    if(*end != '\0') return false;
-    value = parsed;
-    return true;
-}
-
 std::optional<Editor::PrimitiveCreationRequest> Editor::TakePrimitiveCreationRequest()
 {
     return std::exchange(m_primitiveCreationRequest,std::nullopt);
+}
+
+std::optional<Editor::EmptyObjectCreationRequest> Editor::TakeEmptyObjectCreationRequest()
+{
+    return std::exchange(m_emptyObjectCreationRequest, std::nullopt);
+}
+
+void Editor::OnEmptyObjectCreationFailed(const std::string& error)
+{
+    // Shares the viewport creation status line with mesh and primitive creation.
+    m_meshCreationStatus = "Empty Object creation rejected: " + error;
+    Log::Warning(m_meshCreationStatus);
 }

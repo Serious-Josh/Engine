@@ -30,6 +30,8 @@ MeshResidencyPublication::Readiness MeshResidencyPublication::CheckPrepared(Rend
         return readiness;
     };
 
+    // Establish the active transaction and renderer association before any GPU
+    // polling, source validation or fallible adoption staging.
     if (!runtime.m_meshResidency || runtime.m_meshResidency->token != sceneToken ||
         sceneToken.runtimeIdentity != runtime.GetRuntimeIdentity() || !renderer.m_sceneResourceLifetime ||
         renderer.m_sceneResourceScene != &runtime.GetScene())
@@ -42,6 +44,7 @@ MeshResidencyPublication::Readiness MeshResidencyPublication::CheckPrepared(Rend
         return result(Status::Unsupported, "Publication readiness requires a valid renderer frame slot.");
     }
 
+    // Preserve failure/retry precedence at the exclusive publication boundary.
     if (renderer.m_commandSubmissionAttempted || renderer.m_resizeFailed ||
         renderer.m_sceneInitializationAttempt.failed)
     {
@@ -83,24 +86,25 @@ MeshResidencyPublication::Readiness MeshResidencyPublication::CheckPrepared(Rend
             return result(Status::Stale, std::move(error));
         }
 
-        const auto status = renderer.PollDXRMembershipCandidate(candidate, runtime, catalog, error);
+        // Poll proves completion/provenance, then current bindings and transforms.
+        const auto candidateStatus = renderer.PollDXRMembershipCandidate(candidate, runtime, catalog, error);
 
-        if (status == RayTracingSceneResources::CandidateStatus::Pending)
+        if (candidateStatus == RayTracingSceneResources::CandidateStatus::Pending)
         {
             return result(Status::Retry, "Await candidate GPU completion before publication validation.");
         }
 
-        if (status == RayTracingSceneResources::CandidateStatus::Stale)
+        if (candidateStatus == RayTracingSceneResources::CandidateStatus::Stale)
         {
             return result(Status::Stale, std::move(error));
         }
 
-        if (status == RayTracingSceneResources::CandidateStatus::Failed)
+        if (candidateStatus == RayTracingSceneResources::CandidateStatus::Failed)
         {
             return result(Status::Failed, std::move(error));
         }
 
-        if (status == RayTracingSceneResources::CandidateStatus::NeedsTransformRefresh)
+        if (candidateStatus == RayTracingSceneResources::CandidateStatus::NeedsTransformRefresh)
         {
             // Poll has released every source lock. Never carry one across this
             // submission or the frames spent waiting for its completion.
@@ -125,7 +129,8 @@ MeshResidencyPublication::Readiness MeshResidencyPublication::CheckPrepared(Rend
         }
 
         // All GPU work is complete. Validation may allocate/hash, but cannot
-        // load material resources or submit work. This pin dies on every exit.
+        // load material resources or submit work. Advisory Check releases this pin;
+        // final acceptance moves it to its caller and holds it through commit.
         auto source = runtime.ValidatePreparedMeshResidency(sceneToken, catalog, &error);
 
         if (!source)
@@ -133,6 +138,8 @@ MeshResidencyPublication::Readiness MeshResidencyPublication::CheckPrepared(Rend
             return result(Status::Stale, std::move(error));
         }
 
+        // Match the scene transaction and stage registry/retirement capacity while
+        // the source remains pinned. This may allocate; it transfers no ownership.
         const auto& prepared = *runtime.m_meshResidency;
         RayTracingSceneResources::AdoptionEvidence evidence;
         const auto adoption = resources.PrepareCandidateAdoption(candidate, prepared.selection.objectID,
@@ -149,6 +156,8 @@ MeshResidencyPublication::Readiness MeshResidencyPublication::CheckPrepared(Rend
             return result(Status::Stale, std::move(error));
         }
 
+        // Selection compatibility follows adoption staging; even a Retry here
+        // leaves the active registry and scene bindings unchanged.
         const auto& layout = prepared.candidate.mesh->GetVertexLayout();
 
         if (renderer.m_selectionMaskPass.IsInitialized())
@@ -375,7 +384,8 @@ MeshResidencyPublication::AcceptanceResult MeshResidencyPublication::PublishAtBo
         return {Status::Stale, "Coordinated candidate belongs to an obsolete scene or renderer lifetime."};
     }
 
-    // Check repeats identity, GPU provenance/completion, every effective binding,
+    // Intentionally repeat advisory validation after intervening editor/asset changes.
+    // CheckPrepared repeats identity, GPU provenance/completion, every effective binding,
     // current transforms, selection layout and ownership/retirement prerequisites.
     // Transform refresh may submit candidate-only work and necessarily returns Retry.
     std::optional<MeshResidencySourceLock> sourcePin;

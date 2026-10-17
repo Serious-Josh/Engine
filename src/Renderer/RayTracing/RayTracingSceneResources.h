@@ -296,6 +296,7 @@ class RayTracingSceneResources
     static void PatchTableDescriptors(const MembershipSnapshot& snapshot, std::vector<RayTracingInstanceData>& instances);
     bool ValidateCandidateBindings(const CandidateState& candidate, const FileSceneRuntime& runtime,
         FileSceneAssetCatalog& catalog, std::string& error) const;
+    bool HasMatchingCandidateSubmissionState(const ReplacementCandidate& handle) const noexcept;
     void ShutdownReplacementCandidate();
 
     // One independently owned candidate; manager pin prevents destruction on
@@ -307,11 +308,11 @@ class RayTracingSceneResources
     StableBLASRegistry m_blasRegistry;
     std::unique_ptr<MembershipSnapshot> m_membership = std::make_unique<MembershipSnapshot>();
 
-    // Future coordinator transfers an OLD snapshot here without shutting it
-    // down. No active detach/publication or replacement builder exists yet.
-    // Failure leaves the caller's ownership intact. Never evict to make room.
+    // Adoption moves the OLD snapshot here with its own last-use fence intact.
+    // Checked collection releases its TLAS/tables/descriptors; the stable BLAS
+    // registry remains owned by this scene resource set. Never evict to make room.
     static constexpr std::size_t MaxRetiredMemberships = 4;
-    // Future publication must check this at its pre-recording boundary, after
+    // Publication checks this at its exclusive pre-recording boundary, after
     // resolving the previous list. Single-threaded: no recording/submission
     // may intervene between this check and the ownership transfer.
     bool CanRetireActiveMembership() const;

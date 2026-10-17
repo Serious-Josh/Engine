@@ -10,6 +10,9 @@ class SceneHierarchyPanel
 {
 public:
     std::optional<ScenePrimitive> TakePrimitiveRequest();
+
+    // True once after the top-level "Empty Object" menu entry was chosen.
+    bool TakeEmptyObjectRequest();
     bool IsFocused() const noexcept { return m_focused; }
     void BeginRename(const std::string& objectID, const std::string& name);
     void CancelRename();
@@ -43,4 +46,5 @@ private:
     bool m_focusRename = false;
     bool m_focused = false;
     std::optional<ScenePrimitive> m_primitiveRequest;
+    bool m_emptyObjectRequest = false;
 };

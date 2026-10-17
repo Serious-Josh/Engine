@@ -7,7 +7,20 @@
 #include <filesystem>
 #include <exception>
 
+// Verification diagnostics live in Git-ignored tests folders. CMake defines
+// ENGINE_HAS_VERIFICATION only when they are present; Debug builds alone still
+// do not imply that the --verify-* entry points exist.
+#if !defined(NDEBUG) && defined(ENGINE_HAS_VERIFICATION)
+#define ENGINE_VERIFICATION_ENABLED 1
+#else
+#define ENGINE_VERIFICATION_ENABLED 0
+#endif
+
 #ifndef NDEBUG
+int CookProjectMeshes(const std::filesystem::path& projectRoot);
+#endif
+
+#if ENGINE_VERIFICATION_ENABLED
 int VerifyCookedMesh();
 int VerifyScenePhysicsData();
 int VerifyPrimitiveCreation();
@@ -17,14 +30,13 @@ int VerifyScenePhysicsPersistence();
 int VerifyPresentationTransforms();
 int VerifyPhysicsSimulationController();
 int VerifyEditorPhysicsIntegration();
-int CookProjectMeshes(const std::filesystem::path& projectRoot);
 int VerifyDevelopmentCookedMeshProvider(const std::filesystem::path& projectRoot);
 int VerifyCookedMeshPreparation(const std::filesystem::path& projectRoot);
 #endif
 
 int main(int argc, char** argv)
 {
-#ifndef NDEBUG
+#if ENGINE_VERIFICATION_ENABLED
     if (argc == 2 && std::string_view(argv[1]) == "--verify-viewport-marquee")
     {
         return VerifyViewportMarquee();
@@ -81,7 +93,7 @@ int main(int argc, char** argv)
         catch(const std::exception& e) { Log::Error(std::string("Packaged bootstrap: ")+e.what()); success=false; }
         engine.Shutdown(); return success ? 0 : 1;
     }
-#ifndef NDEBUG
+#if ENGINE_VERIFICATION_ENABLED
     if(argc>=2 && std::string_view(argv[1])=="--verify-scene-hdri")
     {
         if(argc!=4) { Log::Error("Usage: --verify-scene-hdri <private-scene-copy> <output-directory>"); return 1; }
@@ -149,7 +161,7 @@ int main(int argc, char** argv)
         Log::Error("Usage: Engine.exe --verify-cooked-gpu-preparation|--verify-cooked-publication|--verify-archive-cooked-publication <absolute-scene-path> [--visual (publication only)]");
         return 1;
     }
-#ifndef NDEBUG
+#if ENGINE_VERIFICATION_ENABLED
     if(argc >= 2 && std::string_view(argv[1]) == "--verify-cooked-preparation")
     {
         if(argc > 3)
@@ -172,6 +184,24 @@ int main(int argc, char** argv)
         return VerifyDevelopmentCookedMeshProvider(argc == 3 ? std::filesystem::path(argv[2]) : std::filesystem::path{});
     }
 
+    if(argc == 2 && std::string_view(argv[1]) == "--verify-cooked-mesh")
+    {
+        return VerifyCookedMesh();
+    }
+#else
+    // Without the local verification sources, never let a diagnostic flag fall
+    // through and launch the interactive editor instead.
+    const bool diagnosticRequested = argc >= 2 &&
+        (std::string_view(argv[1]).starts_with("--verify-") || activateArchive);
+
+    if(diagnosticRequested)
+    {
+        Log::Error("Verification diagnostics require a Debug build with the local test sources present.");
+        return 1;
+    }
+#endif
+
+#ifndef NDEBUG
     if(argc >= 2 && std::string_view(argv[1]) == "--cook-meshes")
     {
         if(argc > 3)
@@ -182,14 +212,8 @@ int main(int argc, char** argv)
 
         return CookProjectMeshes(argc == 3 ? std::filesystem::path(argv[2]) : std::filesystem::path{});
     }
-
-    if(argc == 2 && std::string_view(argv[1]) == "--verify-cooked-mesh")
-    {
-        return VerifyCookedMesh();
-    }
 #else
-    if(argc >= 2 && (std::string_view(argv[1]) == "--cook-meshes" || std::string_view(argv[1]) == "--verify-cooked-provider" ||
-        std::string_view(argv[1]) == "--verify-cooked-preparation" || cookedGPU || cookedScene || activateArchive || surfaces))
+    if(argc >= 2 && std::string_view(argv[1]) == "--cook-meshes")
     {
         Log::Error("Mesh development diagnostics require the Debug executable.");
         return 1;
@@ -205,7 +229,7 @@ int main(int argc, char** argv)
         std::abort();
     }
 
-#ifndef NDEBUG
+#if ENGINE_VERIFICATION_ENABLED
     if(argc == 2 && (std::string_view(argv[1]) == "--verify-material-bindings" ||
         std::string_view(argv[1]) == "--verify-viewport-material-drops"))
     {
