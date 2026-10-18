@@ -2749,6 +2749,13 @@ bool Renderer::Initialize(
         Log::Error("Failed to initialize editor collider line pass.");
         return false;
     }
+
+    if(!m_packagedRuntime && !m_editorGridPass.Initialize(device, m_shaderLibrary))
+    {
+        Log::Error("Failed to initialize editor viewport grid pass.");
+        return false;
+    }
+
     if (!m_resourceUploader.Initialize(device))
     {
         Log::Error("Failed to init resource uploader.");
@@ -5785,6 +5792,13 @@ bool Renderer::RecordRenderFrame(
     m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::ToneMap);
 
     // Draw only into the final editor image: temporal history and lighting must never see these lines.
+    // The grid goes first so collider lines stay on top of it.
+    if (!m_packagedRuntime && options.editorGrid)
+    {
+        m_editorGridPass.Execute(commandList, m_finalSceneColor, m_gBuffer.GetDepth(), currentView,
+            currentProjection, camera.GetPosition(), *options.editorGrid);
+    }
+
     const EditorColliderOverlay* colliderOverlay = options.editorColliderOverlay;
     if (!m_packagedRuntime && colliderOverlay)
     {
@@ -6105,6 +6119,7 @@ void Renderer::Shutdown()
     m_deferredLightingPass.Shutdown();
     m_toneMapPass.Shutdown();
     m_editorColliderPass.Shutdown();
+    m_editorGridPass.Shutdown();
     m_brdfIntegrationPass.Shutdown();
     m_ggxAverageAlbedoPass.Shutdown();
     m_rayTracedShadowPass.Shutdown();

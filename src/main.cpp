@@ -194,6 +194,20 @@ int main(int argc, char** argv)
         catch(const std::exception& e) { Log::Error(std::string("Viewport pan diagnostic: ")+e.what()); success=false; }
         engine->Shutdown(); return success ? 0 : 1;
     }
+    if(argc==2 && std::string_view(argv[1])=="--verify-editor-grid")
+    {
+        auto engine=std::make_unique<Engine>(); bool success=false;
+        try { success=engine->Initialize(); if(success) success=engine->VerifyEditorGrid(); }
+        catch(const std::exception& e) { Log::Error(std::string("Editor grid diagnostic: ")+e.what()); success=false; }
+        engine->Shutdown(); return success ? 0 : 1;
+    }
+    if(argc==2 && std::string_view(argv[1])=="--verify-viewport-grid-snap")
+    {
+        auto engine=std::make_unique<Engine>(); bool success=false;
+        try { success=engine->Initialize(); if(success) success=engine->VerifyViewportGridSnap(); }
+        catch(const std::exception& e) { Log::Error(std::string("Viewport grid snap diagnostic: ")+e.what()); success=false; }
+        engine->Shutdown(); return success ? 0 : 1;
+    }
     if(argc==2 && std::string_view(argv[1])=="--verify-material-locate")
     {
         auto engine=std::make_unique<Engine>(); bool success=false;

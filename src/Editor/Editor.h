@@ -11,6 +11,7 @@
 #include "EditorWorkspace.h"
 #include "InspectorPanel.h"
 #include "SceneHierarchyPanel.h"
+#include "ViewportGridSnap.h"
 #include "Scene/FileSceneAssetCatalog.h"
 
 #include <cstddef>
@@ -124,6 +125,9 @@ public:
     std::optional<PhysicsRequest> TakePhysicsRequest();
     bool CanStartPhysics() const;
     bool ArePhysicsCollidersVisible() const noexcept { return m_showPhysicsColliders; }
+    // G.3 viewport grid spacing for this frame: the applied translation snap interval, or empty
+    // when the Grid overlay is off or Play mode has locked authored editing.
+    std::optional<float> GetViewportGridSpacing() const;
     // CM.9 diagnostics. Engine supplies the published controller diagnostics after each
     // physics frame (null when no session is active), and takes the diagnostic drive intent
     // immediately before the next Update; it acknowledges a jump once it is submitted.
@@ -345,6 +349,8 @@ private:
 #if defined(ENGINE_HAS_VERIFICATION)
     friend class MaterialLocateVerification;
     friend class ViewportPanVerification;
+    friend class ViewportGridSnapVerification;
+    friend class EditorGridVerification;
     friend class SceneDuplicationVerification;
     friend class ScenePhysicsDataVerification;
     friend class PrimitiveCreationVerification;
@@ -488,8 +494,38 @@ private:
     bool m_panLeftHeld = false;
     // Session display preference: never reset with scene interactions or authored history.
     bool m_showPhysicsColliders = true;
+    // Session display preference, independent of Snap; default visible.
+    bool m_showViewportGrid = true;
+    // Session-local gizmo snapping (G.1 translation, G.2 rotation). One master toggle drives
+    // both modes; each has its own interval. The Editor has no preference store, so these reset
+    // on restart and are never written to scenes, cooked payloads or history.
+    bool m_snapEnabled = false;
+    float m_translationSnapInterval = ViewportGridSnap::kDefaultInterval;
+    float m_rotationSnapIntervalDegrees = ViewportGridSnap::kDefaultRotationIntervalDegrees;
+    // Text-entry values; only a finite positive draft replaces the applied interval.
+    float m_translationSnapIntervalDraft = ViewportGridSnap::kDefaultInterval;
+    float m_rotationSnapIntervalDraft = ViewportGridSnap::kDefaultRotationIntervalDegrees;
     EditorWorkspaceRect m_viewportContentRegion;
     void DrawSceneViewportToolbar(const EditorWorkspaceRect& toolbarRectangle);
+    void DrawGridSnapControls(float rightEdge);
+    Vector3 SnapGizmoTranslation(const Vector3& dragStart, const Vector3& continuousPosition) const;
+    bool IsRotationSnapActive() const;
+    void UpdateGizmoRotationDrag(bool gizmoUsing, const Matrix4& gizmoModel, const Vector3& authoredRotation);
+
+    // Transient state of one gizmo rotation drag. ImGuizmo rotates incrementally from the
+    // matrix it receives, so during a drag it is fed continuousModel (its own previous output,
+    // ImGuizmo layout) rather than the snapped authored rotation. Cleared whenever the gesture
+    // ends or is reset; startRotation is the authored drag-start rotation of the active object.
+    struct GizmoRotationDrag
+    {
+        Matrix4 continuousModel;
+        Vector3 startRotation;
+        ViewportGridSnap::RotationDrag tracker;
+    };
+    std::optional<GizmoRotationDrag> m_gizmoRotationDrag;
+    // Euler rotation for the active object this frame: snapped when snapping is on, otherwise
+    // the existing decomposition of the continuous gizmo output.
+    Vector3 ResolveGizmoRotation(const Vector3& continuousRotationRadians) const;
     bool m_viewportHovered = false;
     bool m_viewportFocused = false;
 

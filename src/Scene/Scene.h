@@ -118,6 +118,7 @@ class Scene
     friend class ColliderVisualizationVerification;
     friend class MarqueeSelectionVerification;
     friend class SceneHierarchyVerification;
+    friend class ViewportGridSnapVerification;
 #endif
     // Preparation allocates before acceptance and, for hierarchy scenes, proves that every
     // descendant world under these poses is valid. Commit only copies value types.

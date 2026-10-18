@@ -61,6 +61,8 @@ class Engine
         std::shared_ptr<const CookedMeshSource::Provider> source = {});
     bool VerifyMaterialLocate();
     bool VerifyViewportPan();
+    bool VerifyViewportGridSnap();
+    bool VerifyEditorGrid();
     bool VerifySceneDuplication(const std::filesystem::path& scene);
     bool VerifySceneMembership(const std::filesystem::path& scene);
     // H.4 real-device hierarchy rendering diagnostic over a schema-9 project scene.
@@ -204,6 +206,8 @@ class Engine
 #if defined(ENGINE_HAS_VERIFICATION)
     friend class MaterialLocateVerification;
     friend class ViewportPanVerification;
+    friend class ViewportGridSnapVerification;
+    friend class EditorGridVerification;
 #endif
     struct EditorMembershipOperation
     {

@@ -1,5 +1,6 @@
 #pragma once
 #include "Renderer/Passes/EditorColliderPass.h"
+#include "Renderer/Passes/EditorGridPass.h"
 #include "Debug/CpuFrameTiming.h"
 #include "Editor/TextureThumbnailCache.h"
 #include "Diagnostics/FrameHitchDiagnostics.h"
@@ -84,6 +85,8 @@ struct EnvironmentAsset
 struct RendererOptions
 {
     const EditorColliderOverlay* editorColliderOverlay = nullptr; // Borrowed for this Render call only.
+    // Editor viewport grid for this frame; absent in Play mode, with the Overlay off and in runtime.
+    std::optional<EditorGridRequest> editorGrid;
 
     std::optional<MaterialPreviewRequest> materialPreview;
 
@@ -477,6 +480,7 @@ class Renderer
     friend class DescriptorRecoveryVerification;
     friend class ThumbnailSchedulingVerification;
     friend class NormalMapVerification;
+    friend class EditorGridVerification;
 #endif
     friend class SceneMembershipPublication;
 #if defined(ENGINE_HAS_VERIFICATION)
@@ -1013,6 +1017,7 @@ class Renderer
 
     ToneMapPass m_toneMapPass;
     EditorColliderPass m_editorColliderPass;
+    EditorGridPass m_editorGridPass;
 
     BRDFIntegrationPass m_brdfIntegrationPass;
 

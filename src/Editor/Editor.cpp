@@ -395,17 +395,171 @@ void Editor::DrawSceneViewportToolbar(const EditorWorkspaceRect& toolbarRectangl
         const char* overlaysLabel = "Overlays";
         const float buttonWidth = ImGui::CalcTextSize(overlaysLabel).x + ImGui::GetFrameHeight() +
             ImGui::GetStyle().FramePadding.x * 2.0f;
-        ImGui::SetCursorPosX((std::max)(0.0f, toolbarRectangle.size.x - buttonWidth));
+        const float overlaysPositionX = (std::max)(0.0f, toolbarRectangle.size.x - buttonWidth);
+
+        DrawGridSnapControls(overlaysPositionX - ImGui::GetStyle().ItemSpacing.x);
+
+        ImGui::SameLine();
+        ImGui::SetCursorPosX(overlaysPositionX);
         ImGui::SetNextItemWidth(buttonWidth);
         if(ImGui::BeginCombo("##SceneOverlays", overlaysLabel))
         {
             // This display preference stays editable while authored physics mutations are locked.
             ImGui::Checkbox("Physics Colliders", &m_showPhysicsColliders);
+            ImGui::Checkbox("Grid", &m_showViewportGrid);
             ImGui::EndCombo();
         }
     }
     ImGui::End();
     ImGui::PopStyleVar(4);
+}
+
+namespace
+{
+    // Numeric snap-interval entry. Each valid keystroke applies immediately; an invalid draft
+    // is reported while editing and reverted afterwards, so the applied value is never corrupted.
+    void DrawSnapIntervalInput(const char* label, const char* inputID, float& draft, float& applied)
+    {
+        ImGui::TextUnformatted(label);
+        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 7.0f);
+        ImGui::InputFloat(inputID, &draft, 0.0f, 0.0f, "%.4g");
+        const bool inputActive = ImGui::IsItemActive();
+
+        if(ViewportGridSnap::IsValidInterval(draft))
+        {
+            applied = draft;
+        }
+        else if(inputActive)
+        {
+            ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.35f, 1.0f), "Interval must be finite and greater than zero.");
+        }
+        else
+        {
+            draft = applied;
+        }
+    }
+}
+
+void Editor::DrawGridSnapControls(float rightEdge)
+{
+    const ImGuiStyle& style = ImGui::GetStyle();
+    const char* toggleLabel = "Snap##ViewportSnapToggle";
+    const float toggleWidth = ImGui::CalcTextSize(toggleLabel, nullptr, true).x + style.FramePadding.x * 2.0f;
+    const float dropdownWidth = ImGui::GetFrameHeight();
+    ImGui::SetCursorPosX((std::max)(0.0f, rightEdge - toggleWidth - dropdownWidth));
+
+    // One master toggle drives translation and rotation snapping. It borrows the theme's
+    // pressed colours so the enabled state reads as held down.
+    const bool snapWasEnabled = m_snapEnabled;
+
+    if(snapWasEnabled)
+    {
+        ImGui::PushStyleColor(ImGuiCol_Button, style.Colors[ImGuiCol_ButtonActive]);
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, style.Colors[ImGuiCol_ButtonActive]);
+    }
+
+    if(ImGui::Button(toggleLabel))
+    {
+        m_snapEnabled = !m_snapEnabled;
+    }
+
+    if(snapWasEnabled)
+    {
+        ImGui::PopStyleColor(2);
+    }
+
+    if(ImGui::IsItemHovered())
+    {
+        ImGui::SetTooltip("Gizmo snapping %s (move %.4g map units, rotate %.4g degrees)",
+            m_snapEnabled ? "on" : "off", m_translationSnapInterval, m_rotationSnapIntervalDegrees);
+    }
+
+    ImGui::SameLine(0.0f, 0.0f);
+    ImGui::SetNextItemWidth(dropdownWidth);
+
+    // Editing either interval never changes the master enabled state.
+    if(ImGui::BeginCombo("##ViewportSnapSettings", nullptr, ImGuiComboFlags_NoPreview))
+    {
+        DrawSnapIntervalInput("Translation interval (map units)", "##TranslationSnapInterval",
+            m_translationSnapIntervalDraft, m_translationSnapInterval);
+        DrawSnapIntervalInput("Rotation interval (degrees)", "##RotationSnapInterval",
+            m_rotationSnapIntervalDraft, m_rotationSnapIntervalDegrees);
+
+        ImGui::Separator();
+        ImGui::TextDisabled("Snap is %s. Applies to viewport gizmo drags only.", m_snapEnabled ? "on" : "off");
+        ImGui::EndCombo();
+    }
+}
+
+Vector3 Editor::SnapGizmoTranslation(const Vector3& dragStart, const Vector3& continuousPosition) const
+{
+    if(!m_snapEnabled || !ViewportGridSnap::IsValidInterval(m_translationSnapInterval))
+    {
+        return continuousPosition;
+    }
+
+    return ViewportGridSnap::SnapTranslation(dragStart, continuousPosition, m_translationSnapInterval);
+}
+
+void Editor::UpdateGizmoRotationDrag(bool gizmoUsing, const Matrix4& gizmoModel, const Vector3& authoredRotation)
+{
+    if(!gizmoUsing || m_gizmoMode != GizmoMode::Rotate)
+    {
+        m_gizmoRotationDrag.reset();
+        return;
+    }
+
+    // gizmoModel is in ImGuizmo's transposed layout; the tracker uses Engine's convention.
+    const Matrix4 continuousRotation = ViewportGridSnap::RotationFromModel(gizmoModel.Transpose());
+
+    if(!m_gizmoWasUsing || !m_gizmoRotationDrag)
+    {
+        // authoredRotation is still the drag-start value on the gesture's first frame.
+        m_gizmoRotationDrag.emplace();
+        m_gizmoRotationDrag->startRotation = authoredRotation;
+        m_gizmoRotationDrag->tracker.Begin(Matrix4::Rotation(authoredRotation), continuousRotation);
+    }
+    else
+    {
+        m_gizmoRotationDrag->tracker.Update(continuousRotation);
+    }
+
+    m_gizmoRotationDrag->continuousModel = gizmoModel;
+}
+
+std::optional<float> Editor::GetViewportGridSpacing() const
+{
+    // The grid is an editing aid: hidden while Play/Pause simulates, restored on Stop. The
+    // translation interval only ever holds a validated value, so invalid drafts keep the grid.
+    if(!m_showViewportGrid || IsPhysicsEditingLocked())
+    {
+        return std::nullopt;
+    }
+
+    return m_translationSnapInterval;
+}
+
+bool Editor::IsRotationSnapActive() const
+{
+    return m_snapEnabled && ViewportGridSnap::IsValidInterval(m_rotationSnapIntervalDegrees);
+}
+
+Vector3 Editor::ResolveGizmoRotation(const Vector3& continuousRotationRadians) const
+{
+    if(!m_gizmoRotationDrag || !IsRotationSnapActive())
+    {
+        return continuousRotationRadians;
+    }
+
+    const auto& tracker = m_gizmoRotationDrag->tracker;
+
+    // No snapped step yet: keep the authored start exactly rather than a re-decomposed copy.
+    if(tracker.SnappedDeltaDegrees(m_rotationSnapIntervalDegrees) == 0.0)
+    {
+        return m_gizmoRotationDrag->startRotation;
+    }
+
+    return GroupTransform::Euler(tracker.SnappedRotation(m_rotationSnapIntervalDegrees));
 }
 
 void Editor::DrawSceneViewport(
@@ -1888,6 +2042,7 @@ void Editor::DrawTransformGizmo(
         m_gizmoWasUsing = false;
         m_gizmoUndoObject = InvalidObjectSelection;
         m_gizmoHistoryTarget.reset();
+        m_gizmoRotationDrag.reset();
         return;
     }
 
@@ -1915,6 +2070,7 @@ void Editor::DrawTransformGizmo(
         m_gizmoWasUsing = false;
         m_gizmoUndoObject = InvalidObjectSelection;
         m_gizmoHistoryTarget.reset();
+        m_gizmoRotationDrag.reset();
         return;
     }
 
@@ -1960,12 +2116,21 @@ void Editor::DrawTransformGizmo(
         break;
     }
 
+    // ImGuizmo rotates incrementally from the matrix it is given. While a rotation drag is in
+    // progress give it its own previous continuous output, never the snapped authored rotation,
+    // so quantized results cannot feed back into the drag.
+    if(m_gizmoRotationDrag && m_gizmoWasUsing && m_gizmoMode == GizmoMode::Rotate)
+    {
+        model = m_gizmoRotationDrag->continuousModel;
+    }
+
     ImGuizmo::Manipulate(&view.m[0][0], &projection.m[0][0], operation, ImGuizmo::WORLD, &model.m[0][0]);
     ImGui::GetWindowDrawList()->PopClipRect();
 
     ImGui::End();
 
     const bool gizmoUsing = ImGuizmo::IsUsing();
+    UpdateGizmoRotationDrag(gizmoUsing, model, transform.rotation);
 
     if(m_selectedObjects.size() > 1 || m_gizmoGroupEdit)
     {
@@ -1974,6 +2139,23 @@ void Editor::DrawTransformGizmo(
         Transform anchorAfter{{position[0], position[1], position[2]},
             {ToRadians(rotation[0]), ToRadians(rotation[1]), ToRadians(rotation[2])},
             {(std::max)(0.01f, scale[0]), (std::max)(0.01f, scale[1]), (std::max)(0.01f, scale[2])}};
+
+        if(gizmoUsing && m_gizmoMode == GizmoMode::Translate)
+        {
+            // Only the active (anchor) object lands on the grid; the group keeps its relative
+            // offsets. Before the first group frame the anchor's authored value is the start.
+            const Vector3 anchorDragStart = m_gizmoGroupEdit ?
+                m_gizmoGroupEdit->edits.back().before.position :
+                transform.position;
+            anchorAfter.position = SnapGizmoTranslation(anchorDragStart, anchorAfter.position);
+        }
+        else if(gizmoUsing && m_gizmoMode == GizmoMode::Rotate)
+        {
+            // The anchor's twist snaps; GroupTransform then applies the same world rotation to
+            // every member around the anchor, preserving the existing pivot and spacing.
+            anchorAfter.rotation = ResolveGizmoRotation(anchorAfter.rotation);
+        }
+
         UpdateGroupGizmo(demoScene, gizmoUsing, anchorAfter);
         return;
     }
@@ -2000,7 +2182,10 @@ void Editor::DrawTransformGizmo(
         {
         case GizmoMode::Translate:
         {
-            const Vector3 newPosition{translation[0], translation[1], translation[2]};
+            // ImGuizmo reports a continuous drag position derived from the cursor, not from the
+            // snapped value fed back each frame, so snapping from the drag start cannot drift.
+            const Vector3 continuousPosition{translation[0], translation[1], translation[2]};
+            const Vector3 newPosition = SnapGizmoTranslation(m_gizmoUndoStart.position, continuousPosition);
 
             if (newPosition.x != transform.position.x || newPosition.y != transform.position.y ||
                 newPosition.z != transform.position.z)
@@ -2018,7 +2203,7 @@ void Editor::DrawTransformGizmo(
             const Vector3 newRotation{ToRadians(rotationDegrees[0]), ToRadians(rotationDegrees[1]),
                                       ToRadians(rotationDegrees[2])};
 
-            transform.rotation = newRotation;
+            transform.rotation = ResolveGizmoRotation(newRotation);
             changed = true;
             break;
         }
@@ -2124,6 +2309,7 @@ void Editor::ResetTransformGestures()
     m_gizmoWasUsing = false;
     m_gizmoUndoObject = InvalidObjectSelection;
     m_gizmoHistoryTarget.reset();
+    m_gizmoRotationDrag.reset();
 
     m_transformFieldEditing = false;
     m_transformFieldUndoObject = InvalidObjectSelection;
@@ -2229,6 +2415,7 @@ void Editor::UpdateCameraLook(
             m_gizmoGroupEdit.reset();
             m_gizmoHistoryTarget.reset();
             m_gizmoUndoObject = InvalidObjectSelection;
+            m_gizmoRotationDrag.reset();
             m_gizmoWasUsing = false;
         }
 

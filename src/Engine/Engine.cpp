@@ -2218,6 +2218,11 @@ void Engine::Frame()
     {
         rendererOptions.editorColliderOverlay = &*colliderOverlay;
     }
+
+    if (const auto gridSpacing = m_editor.GetViewportGridSpacing())
+    {
+        rendererOptions.editorGrid = EditorGridRequest{*gridSpacing};
+    }
     // Re-evaluate preview after accepted physics publication, at the normal selection submission seam.
     viewportPublication = m_renderer.GetSelectionPublicationIdentity(activeScene);
     m_editor.SetViewportPublicationIdentity(viewportPublication.rendererLifetime, viewportPublication.bindingEpoch);

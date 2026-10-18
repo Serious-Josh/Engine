@@ -168,6 +168,18 @@ bool Pipeline::Initialize(
         blendDescription.RenderTarget[i].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
     }
 
+    if(description.alphaBlend)
+    {
+        for(unsigned int i = 0; i < description.renderTargets.count; ++i)
+        {
+            blendDescription.RenderTarget[i].BlendEnable = TRUE;
+            blendDescription.RenderTarget[i].SrcBlend = D3D12_BLEND_SRC_ALPHA;
+            blendDescription.RenderTarget[i].DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+            blendDescription.RenderTarget[i].SrcBlendAlpha = D3D12_BLEND_ZERO;
+            blendDescription.RenderTarget[i].DestBlendAlpha = D3D12_BLEND_ONE;
+        }
+    }
+
     D3D12_DEPTH_STENCIL_DESC depthStencilDescription{};
 
     depthStencilDescription.DepthEnable = description.depthEnabled;

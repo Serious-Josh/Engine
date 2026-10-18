@@ -50,6 +50,10 @@ struct PipelineDescription
     D3D12_COMPARISON_FUNC depthComparison = D3D12_COMPARISON_FUNC_LESS;
 
     D3D12_DEPTH_WRITE_MASK depthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+
+    // Straight-alpha "over" blending of color; destination alpha is preserved. Off by default so
+    // existing pipelines keep their opaque writes.
+    bool alphaBlend = false;
 };
 
 class Pipeline
