@@ -176,7 +176,8 @@ void InspectorPanel::HandleMaterialLocateItem(std::string_view reference)
 void InspectorPanel::DrawSceneObject(const EditorWorkspaceRect& rectangle, const SceneObjectInspectorView& object,
     const std::function<void()>& drawTransformControls,
     const ProjectPaths& paths, const ProjectAssetRegistry& registry,
-    bool assignmentPending, const std::string& assignmentStatus)
+    bool assignmentPending, const std::string& assignmentStatus,
+    const std::function<void()>& drawComponentControls)
 {
     if(rectangle.size.x <= 0.0f || rectangle.size.y <= 0.0f)
     {
@@ -202,14 +203,32 @@ void InspectorPanel::DrawSceneObject(const EditorWorkspaceRect& rectangle, const
         ImGui::TextWrapped("Object: %s", object.name.c_str());
         ImGui::Separator();
         drawTransformControls();
-        ImGui::Separator();
-        DrawSceneAssetTiles(object, paths, registry, assignmentPending);
-        DrawSceneMaterialPicker(object, paths, registry, assignmentPending);
-        if(!m_materialLocateStatus.empty()) ImGui::TextWrapped("%s",m_materialLocateStatus.c_str());
 
-        if(!assignmentStatus.empty())
+        // Demo scenes have no authored references; retain their runtime asset display.
+        if(!object.metadata || !object.meshReference.empty())
         {
-            ImGui::TextWrapped("%s", assignmentStatus.c_str());
+            ImGui::Separator();
+            DrawSceneAssetTiles(object, paths, registry, assignmentPending);
+            DrawSceneMaterialPicker(object, paths, registry, assignmentPending);
+
+            if(!m_materialLocateStatus.empty())
+            {
+                ImGui::TextWrapped("%s", m_materialLocateStatus.c_str());
+            }
+
+            if(!assignmentStatus.empty())
+            {
+                ImGui::TextWrapped("%s", assignmentStatus.c_str());
+            }
+        }
+        else
+        {
+            DismissSceneMaterialPicker();
+        }
+
+        if(drawComponentControls)
+        {
+            drawComponentControls();
         }
     }
 

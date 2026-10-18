@@ -171,7 +171,7 @@ bool PrepareSceneMetadata(const SceneDocument& document, FileSceneAssetCatalog& 
         error->clear();
     }
 
-    if(!ValidateSceneDocument(document, error))
+    if(!ValidateSceneDocumentPersistence(document, error))
     {
         return false;
     }
@@ -274,9 +274,9 @@ bool PrepareSceneMetadata(const SceneDocument& document, FileSceneAssetCatalog& 
 }
 
 bool CommitPreparedMetadataScene(const PreparedMetadataScene& prepared, Scene& scene,
-    SceneObjectMapping& mapping, std::string* error)
+    SceneObjectMapping& mapping, std::string* error, SceneHierarchyTopology hierarchy)
 {
-    if(!ValidateSceneDocument(prepared.document, error))
+    if(!ValidateSceneDocumentPersistence(prepared.document, error))
     {
         return false;
     }
@@ -336,9 +336,13 @@ bool CommitPreparedMetadataScene(const PreparedMetadataScene& prepared, Scene& s
     }
 
     std::string environment=prepared.document.environmentReference;
-    // ReplaceRenderObjects allocates all dirty flags before touching scene storage.
-    // Everything following its commit point is assignment/swap of prepared state.
-    scene.ReplaceRenderObjects(std::move(objects));
+    // ReplaceRenderObjects allocates all dirty flags and evaluates the hierarchy before touching
+    // scene storage. Everything following its commit point is assignment/swap of prepared state.
+    if(!scene.ReplaceRenderObjects(std::move(objects), std::move(hierarchy), error))
+    {
+        return false;
+    }
+
     Camera& camera = scene.GetCamera();
     const auto& source = prepared.document.camera;
     camera.SetPosition(source.position);

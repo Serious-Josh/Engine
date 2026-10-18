@@ -9,9 +9,25 @@
 #include <vector>
 #include <string_view>
 
+#if !defined(NDEBUG) && defined(ENGINE_HAS_VERIFICATION)
+void VerifyPackagedPhysicsApplication(Engine& engine);
+#endif
+
 int RunRuntime(int argc, const std::vector<std::string>& argv)
 {
-    const bool verify=argc>1 && std::string_view(argv[1])=="--verify-bootstrap";
+#if !defined(NDEBUG) && defined(ENGINE_HAS_VERIFICATION)
+    const bool verifyPhysics = argc > 1 && argv[1] == "--verify-physics";
+#endif
+    bool verify = false;
+#if !defined(NDEBUG) && defined(ENGINE_HAS_VERIFICATION)
+    verify = verifyPhysics || (argc > 1 && std::string_view(argv[1]) == "--verify-bootstrap");
+#else
+    if(argc > 1 && std::string_view(argv[1]).starts_with("--verify-"))
+    {
+        Log::Error("Verification requires a Debug build with ENGINE_BUILD_DIAGNOSTICS=ON and local test sources.");
+        return 1;
+    }
+#endif
     if(verify)
     {
         if(GetConsoleWindow()!=nullptr) throw std::runtime_error("Packaged runtime unexpectedly has a console window.");
@@ -49,8 +65,20 @@ int RunRuntime(int argc, const std::vector<std::string>& argv)
         success=engine.Initialize(startup);
         if(success)
         {
-            if(verify) engine.VerifyPackagedBootstrap();
-            else engine.Run();
+#if !defined(NDEBUG) && defined(ENGINE_HAS_VERIFICATION)
+            if(verifyPhysics)
+            {
+                VerifyPackagedPhysicsApplication(engine);
+            }
+            if(verify)
+            {
+                engine.VerifyPackagedBootstrap();
+            }
+            else
+#endif
+            {
+                engine.Run();
+            }
         }
     }
     catch(const std::exception& error)

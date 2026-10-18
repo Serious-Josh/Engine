@@ -1,6 +1,8 @@
 #include "Scene/SceneSwitchTiming.h"
 #include "Engine/Engine.h"
+#include "assets/ProjectMeshImportService.h"
 #include "Engine/PackagedBootstrap.h"
+#include "Platform/Windows/EditorDistributionPaths.h"
 #include "assets/CookedScene.h"
 #include "assets/CookedEnvironment.h"
 
@@ -124,7 +126,10 @@ bool Engine::DrainAndResolveEditorScene(IDemoScene& scene)
             return false;
         }
     }
-    RefreshEditorPhysicsStatus(false);
+    if(m_startup.mode != EngineStartup::Mode::PackagedRuntime)
+    {
+        RefreshEditorPhysicsStatus(false);
+    }
     return true;
 }
 
@@ -745,6 +750,35 @@ void Engine::QueueEditorSceneOperation()
     }
 }
 
+bool Engine::ChangeMeshImportUnits(const ProjectPaths& paths, const AssetBrowser::MeshImportUnitsRequest& request,
+    const FileBackedDemoScene* activeScene, std::string& error)
+{
+    bool referenced = false;
+
+    if(activeScene)
+    {
+        for(const auto& object : activeScene->m_runtime->GetFileScene().GetDocument().objects)
+        {
+            referenced = referenced || object.meshReference == request.expected.id.ToReference();
+        }
+    }
+
+    const bool pending = m_pendingSceneObjectCreation || m_pendingSceneObjectRestoration ||
+        m_pendingSceneObjectDeletion || m_pendingEditorSceneOperation || m_pendingMaterialAssignment ||
+        m_pendingEditorMembership || m_demoSceneManager.HasPendingSceneChange() ||
+        m_editor.HasPendingSceneHistoryOperation() || m_buildGame.Poll().busy;
+
+    if(PhysicsBlocksSceneEdits() || pending || referenced ||
+        request.project.lexically_normal() != paths.GetRoot().lexically_normal())
+    {
+        error = "Import-unit change rejected: the asset is referenced by the active scene, "
+            "the project changed, or another Editor operation is pending. Open an unreferencing scene first.";
+        return false;
+    }
+
+    return ProjectMeshImportService::ChangeImportUnits(paths, m_projectAssetRegistry, request.expected, request.units, error);
+}
+
 void Engine::ProcessEditorMaterialRequests()
 {
     if (PhysicsBlocksSceneEdits())
@@ -1116,6 +1150,12 @@ bool Engine::Initialize(const EngineStartup& startup)
         return false;
     }
 
+    // One-time descriptor budget baseline: renderer passes, targets, LUTs, environment and UI,
+    // before any scene, mesh or thumbnail allocation.
+    const auto descriptors = m_renderer.GetResourceDescriptorStatistics();
+    Log::Info("Descriptor heap baseline after renderer initialization: " + std::to_string(descriptors.allocated) +
+        " of " + std::to_string(descriptors.capacity) + " CBV/SRV/UAV descriptors in use.");
+
     Log::Info(packaged ? "Initializing archived scene." : "Initializing demo scene.");
 
     ShaderDescription vertexShaderDescription{};
@@ -1277,7 +1317,20 @@ bool Engine::Initialize(const EngineStartup& startup)
     OnFileSceneActivated(initializationStarted);
     if(packaged)
     {
-        try { PopulateArchiveScene(archive); }
+        try
+        {
+            PopulateArchiveScene(archive);
+            auto* owner = dynamic_cast<FileBackedDemoScene*>(m_demoSceneManager.TryGetActiveScene());
+            std::string error;
+
+            if(!owner || !StartPackagedPhysics(*owner->m_runtime, error))
+            {
+                throw std::runtime_error("Packaged physics initialization failed: " + error);
+            }
+
+            // Archive cooking/upload/admission time is not simulated elapsed time.
+            m_time.Update();
+        }
         catch(const std::exception& e) { Log::Error(std::string("Packaged scene activation failed: ")+e.what()); return false; }
     }
     Log::Info("Engine initialized.");
@@ -1537,11 +1590,19 @@ void Engine::Frame()
         return;
     }
 
-    // Packaged frames bypass all Editor mutation, residency and physics seams below.
+    // Packaged frames share physics orchestration without entering Editor UI/input.
     if (m_startup.mode == EngineStartup::Mode::PackagedRuntime)
     {
         auto& demo = m_demoSceneManager.GetActiveScene();
         demo.Update(m_time.GetDeltaTime());
+        auto* owner = dynamic_cast<FileBackedDemoScene*>(&demo);
+        std::string physicsError;
+
+        if(!owner || !AdvancePackagedPhysics(*owner->m_runtime, m_time.GetDeltaTime(), physicsError))
+        {
+            throw std::runtime_error("Packaged physics frame failed: " + physicsError);
+        }
+
         const auto result = m_renderer.Render(demo.GetScene(), RendererOptions{});
         if (result == Renderer::FrameRenderResult::Error)
         {
@@ -1798,6 +1859,13 @@ void Engine::Frame()
                                   m_renderer.GetStatistics());
 
     const auto* activeFileScene = dynamic_cast<const FileBackedDemoScene*>(&activeDemo);
+    if(const auto request = m_editor.TakeMeshImportUnitsRequest())
+    {
+        std::string error;
+        ChangeMeshImportUnits(inspectorPaths, *request, activeFileScene, error);
+        m_editor.OnMeshImportUnitsCompleted(error);
+    }
+
     m_editor.ProcessAssetRename(inspectorPaths, m_projectAssetRegistry,
         activeFileScene ? activeFileScene->GetScenePath() : std::filesystem::path{});
     m_editor.ProcessAssetDeletion(inspectorPaths, m_projectAssetRegistry);
@@ -4340,7 +4408,7 @@ bool Engine::StartBuildGame(BuildGame::Settings settings,std::string& error)
     // CaptureSceneDocument in Save includes current camera/transforms, not an old disk revision.
     if(!scene->Save(&error)) return false;
     BuildGame::Request request{std::move(settings),scene->m_runtime->GetFileScene().GetDocument(),m_projectAssetRegistry,
-        scene->GetProjectRoot(),WindowsWindow::GetExecutableDirectory()/"assets"/"Shaders",std::filesystem::path(ENGINE_RUNTIME_DEPLOY_DIR)};
+        scene->GetProjectRoot(),WindowsWindow::GetExecutableDirectory()/"assets"/"Shaders",EditorDistributionPaths::RuntimeDirectory()};
     return m_buildGame.Start(std::move(request),error);
 }
 
@@ -4354,7 +4422,14 @@ std::optional<EditorColliderOverlay> Engine::CaptureEditorColliderOverlayForFram
     }
     EditorColliderOverlay capturedOverlay;
     std::string captureError;
-    if(!runtime->CaptureEditorColliderOverlay(m_renderer, capturedOverlay, captureError))
+    // Controller markers use only diagnostics published with the presented poses.
+    const auto* characterDiagnostics = m_physicsSimulation.GetPublishedCharacterDiagnostics();
+    std::span<const Physics::CharacterControllerDiagnostics> controllers;
+    if(characterDiagnostics)
+    {
+        controllers = characterDiagnostics->controllers;
+    }
+    if(!runtime->CaptureEditorColliderOverlay(m_renderer, capturedOverlay, captureError, controllers))
     {
         return std::nullopt;
     }

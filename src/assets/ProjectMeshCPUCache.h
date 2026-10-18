@@ -2,6 +2,7 @@
 
 #include "assets/ImportedMesh.h"
 #include "assets/MeshPreparationPolicy.h"
+#include "assets/MeshImportUnits.h"
 
 #include <atomic>
 #include <list>
@@ -21,15 +22,18 @@ public:
     // payload SHA-256, compatibility, unused PreserveSource. Final tag prevents
     // collisions; publication/session tokens deliberately do not prevent reuse.
     using KeyFields = std::tuple<std::filesystem::path, std::string, std::string, std::uint32_t,
-        MeshUVOrientation, MeshPreparationSourceKind>;
+        MeshUVOrientation, MeshPreparationSourceKind, MeshImportUnits>;
 
     struct Key : KeyFields
     {
         Key() = default;
         // Preserve existing five-field FBX construction and std::get access.
         Key(std::filesystem::path project, std::string asset, std::string digest, std::uint32_t compatibility,
-            MeshUVOrientation uvPolicy, MeshPreparationSourceKind kind = MeshPreparationSourceKind::FBX)
-            : KeyFields(std::move(project), std::move(asset), std::move(digest), compatibility, uvPolicy, kind) {}
+            MeshUVOrientation uvPolicy, MeshPreparationSourceKind kind = MeshPreparationSourceKind::FBX,
+            MeshImportUnits units = {})
+            : KeyFields(std::move(project), std::move(asset), std::move(digest), compatibility, uvPolicy, kind, units)
+        {
+        }
 
         bool operator==(const Key&) const = default;
         auto operator<=>(const Key&) const = default;

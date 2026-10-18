@@ -6,10 +6,12 @@
 #include "Scene/SceneCommit.h"
 #include "Scene/PreparedScene.h"
 #include "Scene/SceneHierarchySnapshot.h"
+#include "Scene/SceneHierarchy.h"
 #include "Scene/MeshResidency.h"
 
 #include <optional>
 #include <memory>
+#include <span>
 #include <string>
 #include <map>
 #include <thread>
@@ -81,7 +83,9 @@ class PhysicsPresentationLease
 class PhysicsPresentationAssociation
 {
     friend class FileSceneRuntime;
+#if defined(ENGINE_HAS_VERIFICATION)
     friend class PresentationTransformVerification;
+#endif
     std::uint64_t runtimeIdentity = 0;
     std::uint64_t structureRevision = 0;
     std::uint64_t rendererLifetime = 0;
@@ -89,6 +93,8 @@ class PhysicsPresentationAssociation
     std::uint64_t materialTableRevision = 0;
     std::vector<SceneObjectMetadata> objects;
     std::vector<std::optional<Physics::PhysicsComponent>> components;
+    std::vector<std::optional<Physics::TriggerColliderComponent>> triggerComponents;
+    std::vector<std::optional<Physics::CharacterControllerComponent>> controllerComponents;
 };
 
 class FileSceneRuntime
@@ -117,6 +123,16 @@ public:
         return m_instanceIdentity;
     }
 
+    std::uint64_t GetHierarchyRevision() const noexcept
+    {
+        return m_hierarchy.GetRevision();
+    }
+
+    // Graph-dependent consumers call this before publishing hierarchy worlds. Fails when the
+    // Scene's installed topology no longer matches this runtime's validated hierarchy state or
+    // the current document's IDs/parents (for example after a raw EditDocument change).
+    bool ValidateHierarchyAssociation(std::string* errorMessage = nullptr) const;
+
     FileSceneRuntime(const FileSceneRuntime&) = delete;
     FileSceneRuntime& operator=(const FileSceneRuntime&) = delete;
 
@@ -129,7 +145,10 @@ public:
 
     // Removes one instance from an inactive captured document; surviving asset borrows
     // and live transforms are copied without reloading or destroying catalog assets.
-    bool CaptureEditorColliderOverlay(const Renderer&, EditorColliderOverlay&, std::string& error) const;
+    // Character Controller diagnostics (CM.9) add ground/contact markers only when a snapshot
+    // describes exactly the pose currently presented for that object; otherwise only capsules.
+    bool CaptureEditorColliderOverlay(const Renderer&, EditorColliderOverlay&, std::string& error,
+        std::span<const Physics::CharacterControllerDiagnostics> controllerDiagnostics = {}) const;
     bool CaptureObjectDeletionSnapshot(std::string_view objectID, SceneObjectDocument& object,
         size_t& documentIndex, std::string* errorMessage = nullptr) const;
     std::unique_ptr<FileSceneRuntime> PrepareObjectDeletion(std::string_view objectID,
@@ -174,12 +193,21 @@ public:
     std::optional<PresentationTransform> GetObjectPresentation(const SceneObjectMetadata& identity,
         std::string* errorMessage = nullptr) const;
 
+    // Authored topology/order/local-only commit: preserves all runtime slots and GPU bindings.
+    bool CommitHierarchyEdit(const SceneDocument& expected, SceneDocument replacement,
+        std::string* errorMessage);
     bool ReorderObjects(const SceneObjectOrderIdentity& identity,
         const std::vector<std::string>& expectedOrder, const std::vector<std::string>& replacementOrder,
         std::string* errorMessage = nullptr);
     bool SetObjectPhysics(const SceneObjectMetadata& selection,
         const std::optional<Physics::PhysicsComponent>& expected,
         const std::optional<Physics::PhysicsComponent>& replacement, std::string* errorMessage = nullptr);
+    bool SetObjectCharacterController(const SceneObjectMetadata& selection,
+        const std::optional<Physics::CharacterControllerComponent>& expected,
+        const std::optional<Physics::CharacterControllerComponent>& replacement, std::string* errorMessage = nullptr);
+    bool SetObjectTriggerCollider(const SceneObjectMetadata& selection,
+        const std::optional<Physics::TriggerColliderComponent>& expected,
+        const std::optional<Physics::TriggerColliderComponent>& replacement, std::string* errorMessage = nullptr);
     bool RenameObject(const SceneObjectMetadata& selection, std::string_view expectedName,
         std::string name, std::string* errorMessage = nullptr,
         SceneObjectNamePolicy policy = SceneObjectNamePolicy::TrimmedInput);
@@ -282,12 +310,31 @@ private:
     friend class SceneMembershipPublication;
     friend class MeshResidencyPublication;
     friend class SceneMaterialBindingPublication;
+#if defined(ENGINE_HAS_VERIFICATION)
     friend class SceneMaterialBindingVerification;
+#endif
     friend class Engine;
+#if defined(ENGINE_HAS_VERIFICATION)
     friend class ScenePhysicsDataVerification;
     friend class PrimitiveCreationVerification;
     friend class MarqueeSelectionVerification;
     friend class PresentationTransformVerification;
+    friend class SceneHierarchyVerification;
+
+    // H.3 internal seam only. Production admission keeps rejecting nonempty parents until H.4.
+    // Validates the candidate edges, evaluates every world, then commits document parents,
+    // hierarchy state and Scene topology together, or changes nothing.
+    bool CommitHierarchyForVerification(std::span<const std::string> parentIDs, std::string* errorMessage);
+#endif
+    // Advances `state` to `objects` and maps the forest onto commit-time slots, where slot i will
+    // hold slotObjectIDs[i]. A flat forest yields an empty topology. Changes only its outputs.
+    static bool PrepareCommitHierarchy(SceneHierarchy::State& state, std::span<const SceneObjectDocument> objects,
+        std::span<const std::string_view> slotObjectIDs, SceneHierarchyTopology& topology, std::string* errorMessage);
+
+    // Maps a validated forest onto runtime slots through the object-ID mapping.
+    bool BuildHierarchyTopology(const SceneHierarchy::State& state, std::span<const SceneObjectDocument> objects,
+        SceneHierarchyTopology& topology, std::string* errorMessage) const;
+
     // Only Engine archive bootstrap or an explicit diagnostic can open this runtime's gate.
     bool m_cookedPublicationAuthorized = false;
     std::optional<SceneObjectMetadata> ValidatePreparedMeshResidencyIdentity(const MeshResidencyToken& token,
@@ -351,6 +398,7 @@ private:
     std::uint64_t m_nextMaterialAssignment = 1;
     const std::uint64_t m_instanceIdentity;
     FileScene m_fileScene;
+    SceneHierarchy::State m_hierarchy;
 
     Scene m_scene;
 

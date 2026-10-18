@@ -45,20 +45,24 @@ inline bool MatchesCommittedSceneObjectBindings(const SceneObjectDocument& autho
 
 // Replaces the runtime scene contents with prepared data.
 // Call only when the scene is not actively being used by the renderer.
+// `hierarchy` addresses the new runtime slots (slot i = prepared.objects[i]); empty = flat.
+// It is evaluated before the scene changes, so a rejected hierarchy leaves the scene intact.
 bool CommitPreparedScene(
     const PreparedScene& prepared,
     Scene& scene,
     SceneObjectMapping& mapping,
-    std::string* errorMessage = nullptr);
+    std::string* errorMessage = nullptr,
+    SceneHierarchyTopology hierarchy = {});
 
 // Separate pending-only transaction. Same inactive scene / checked GPU-safety
 // precondition as full commit. Use FileSceneRuntime::CommitMetadata for catalog
 // revalidation. No geometry upload or renderer publication occurs here.
 bool CommitPreparedMetadataScene(const PreparedMetadataScene& prepared, Scene& scene,
-    SceneObjectMapping& mapping, std::string* errorMessage = nullptr);
+    SceneObjectMapping& mapping, std::string* errorMessage = nullptr, SceneHierarchyTopology hierarchy = {});
 
 // Editor-only replacement: validates each prepared binding against the authored
 // document. Resident borrows must come from retained catalog geometry; pending
 // slots contain exactly authored overrides. Same inactive/GPU-safe precondition.
 bool CommitPreparedEditorScene(const PreparedScene& prepared, const SceneDocument& document,
-    Scene& scene, SceneObjectMapping& mapping, std::string* errorMessage = nullptr);
+    Scene& scene, SceneObjectMapping& mapping, std::string* errorMessage = nullptr,
+    SceneHierarchyTopology hierarchy = {});

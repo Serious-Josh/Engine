@@ -3,6 +3,7 @@
 #include "Renderer/Renderer.h"
 
 #include <exception>
+#include <array>
 #include <unordered_set>
 #include <type_traits>
 #include <utility>
@@ -124,6 +125,8 @@ std::optional<PhysicsPresentationAssociation> FileSceneRuntime::AssociatePhysics
             }
             association.objects.push_back(std::move(*identity));
             association.components.push_back(object.physics);
+            association.triggerComponents.push_back(object.triggerCollider);
+            association.controllerComponents.push_back(object.characterController);
         }
         return association;
     }
@@ -145,10 +148,12 @@ bool FileSceneRuntime::ValidatePhysicsPresentationAssociation(const Renderer& re
         return false;
     }
     const auto& document = m_fileScene.GetDocument();
-    if (association.runtimeIdentity != m_instanceIdentity ||
+    if(association.runtimeIdentity != m_instanceIdentity ||
         association.structureRevision != m_scene.GetStructureRevision() ||
         association.objects.size() != document.objects.size() ||
-        association.components.size() != document.objects.size())
+        association.components.size() != document.objects.size() ||
+        association.triggerComponents.size() != document.objects.size() ||
+        association.controllerComponents.size() != document.objects.size())
     {
         error = "Physics presentation association belongs to an obsolete runtime or scene membership.";
         return false;
@@ -161,7 +166,9 @@ bool FileSceneRuntime::ValidatePhysicsPresentationAssociation(const Renderer& re
             return false;
         }
         const auto& object = document.objects[index];
-        if (object.id != identity.objectID || object.physics != association.components[index])
+        if(object.id != identity.objectID || object.physics != association.components[index] ||
+            object.triggerCollider != association.triggerComponents[index] ||
+            object.characterController != association.controllerComponents[index])
         {
             error = "Authored physics configuration changed; register a new session and association.";
             return false;
@@ -178,11 +185,12 @@ bool FileSceneRuntime::PreparePhysicsPresentation(const Physics::RuntimePoseSnap
     std::unordered_set<std::string> expectedIDs;
     for (const auto& component : m_fileScene.GetDocument().objects)
     {
-        if (component.physics) expectedIDs.insert(component.id);
+        // Each runtime pose has one owner: Physics and Character Controller are exclusive.
+        if (component.physics || component.characterController) expectedIDs.insert(component.id);
     }
     if (snapshot.GetEntries().size() != expectedIDs.size())
     {
-        error = "Physics presentation requires exactly one pose for every registered physics object.";
+        error = "Physics presentation requires exactly one pose for every registered physics or controller object.";
         return false;
     }
     for (const auto& entry : snapshot.GetEntries())
@@ -240,8 +248,20 @@ bool FileSceneRuntime::ApplyPhysicsPresentation(Renderer& renderer,
         {
             object.GetPresentationTransform();
         }
+        // Hierarchy descendants are evaluated against exactly these accepted poses.
+        if (!ValidateHierarchyAssociation(&error))
+        {
+            return false;
+        }
+
         std::optional<PhysicsPresentationAssociation> acceptedAssociation(association);
-        m_scene.PreparePresentationCommit();
+
+        if (!m_scene.PreparePresentationCommit(poses))
+        {
+            error = "Accepted physics poses produce an invalid hierarchy descendant world.";
+            return false;
+        }
+
         m_scene.CommitPresentation(poses, true);
         static_assert(std::is_nothrow_swappable_v<decltype(m_activePresentationAssociation)>);
         m_activePresentationAssociation.swap(acceptedAssociation);
@@ -276,7 +296,13 @@ bool FileSceneRuntime::ClearPhysicsPresentation(Renderer& renderer, std::string&
         {
             object.GetPresentationTransform();
         }
-        m_scene.PreparePresentationCommit();
+        // Authored descendant worlds are validated on every edit, so restoring them cannot fail.
+        if (!m_scene.PreparePresentationCommit())
+        {
+            error = "Authored hierarchy worlds are invalid; physics presentation was retained.";
+            return false;
+        }
+
         m_scene.CommitPresentation({}, false);
         m_activePresentationAssociation.reset();
         return true;
@@ -304,7 +330,7 @@ void FileSceneRuntime::RevalidatePhysicsPresentationBindings(const Renderer& ren
 }
 
 bool FileSceneRuntime::CaptureEditorColliderOverlay(const Renderer& renderer, EditorColliderOverlay& output,
-    std::string& error) const
+    std::string& error, std::span<const Physics::CharacterControllerDiagnostics> controllerDiagnostics) const
 {
     // Failure must leave no old frame payload for a caller to accidentally reuse.
     output = {};
@@ -325,40 +351,51 @@ bool FileSceneRuntime::CaptureEditorColliderOverlay(const Renderer& renderer, Ed
     }
 
     const auto& authoredObjects = m_fileScene.GetDocument().objects;
-    // Every physics object is one collider of the shared capacity, whatever its shape
-    // or wireframe vertex count.
+    // Both optional components count independently, across all six shape/role batches.
     std::size_t colliderCount = 0;
-    std::size_t sphereColliderCount = 0;
-    std::size_t capsuleColliderCount = 0;
+    std::size_t characterCount = 0;
+    std::array<std::array<std::size_t, 3>, 2> counts{};
     for(const auto& authoredObject : authoredObjects)
     {
-        if(!authoredObject.physics)
+        const auto countComponent = [&](const auto& component, std::size_t role)
         {
-            continue;
+            if(!component)
+            {
+                return true;
+            }
+
+            const auto shape = static_cast<std::size_t>(component->colliderType);
+
+            if(shape >= counts[role].size() || colliderCount == EditorColliderOverlay::MaxColliders)
+            {
+                return false;
+            }
+
+            ++colliderCount;
+            ++counts[role][shape];
+            return true;
+        };
+
+        if(!countComponent(authoredObject.physics, 0) || !countComponent(authoredObject.triggerCollider, 1))
+        {
+            error = "Editor collider overlay capacity exceeded or shape is invalid.";
+            return false;
         }
 
-        ++colliderCount;
-
-        if(authoredObject.physics->colliderType == Physics::ColliderType::Sphere)
-        {
-            ++sphereColliderCount;
-        }
-        else if(authoredObject.physics->colliderType == Physics::ColliderType::Capsule)
-        {
-            ++capsuleColliderCount;
-        }
+        characterCount += authoredObject.characterController ? 1 : 0;
     }
-    if(colliderCount == 0)
+    // Every controller may add a capsule plus a bounded set of diagnostic markers.
+    const std::size_t remainingCapacity = EditorColliderOverlay::MaxColliders - colliderCount;
+
+    if(characterCount > remainingCapacity / EditorColliderOverlay::MaxMarkersPerCharacter)
+    {
+        error = "Editor collider overlay capacity exceeded by Character Controller diagnostics.";
+        return false;
+    }
+    if(colliderCount == 0 && characterCount == 0)
     {
         return true;
     }
-    // Box, Sphere and Capsule colliders share one overlay capacity.
-    if(colliderCount > EditorColliderOverlay::MaxColliders)
-    {
-        error = "Editor collider overlay capacity exceeded.";
-        return false;
-    }
-
     try
     {
         SceneDocument currentDocument;
@@ -386,13 +423,17 @@ bool FileSceneRuntime::CaptureEditorColliderOverlay(const Renderer& renderer, Ed
         capturedOverlay.scene = &m_scene;
         capturedOverlay.structureRevision = m_scene.GetStructureRevision();
         capturedOverlay.rendererLifetime = renderer.m_sceneResourceLifetime;
-        capturedOverlay.boxColliderWorldTransforms.reserve(colliderCount - sphereColliderCount - capsuleColliderCount);
-        capturedOverlay.sphereColliderWorldTransforms.reserve(sphereColliderCount);
-        capturedOverlay.capsuleColliders.reserve(capsuleColliderCount);
+        capturedOverlay.boxColliderWorldTransforms.reserve(counts[0][0]);
+        capturedOverlay.sphereColliderWorldTransforms.reserve(counts[0][1]);
+        capturedOverlay.capsuleColliders.reserve(counts[0][2]);
+        capturedOverlay.triggerBoxWorldTransforms.reserve(counts[1][0]);
+        capturedOverlay.triggerSphereWorldTransforms.reserve(counts[1][1]);
+        capturedOverlay.triggerCapsules.reserve(counts[1][2]);
+        capturedOverlay.characterMarkers.reserve(characterCount * EditorColliderOverlay::MaxMarkersPerCharacter);
 
         for(const auto& authoredObject : currentDocument.objects)
         {
-            if(!authoredObject.physics)
+            if(!authoredObject.physics && !authoredObject.triggerCollider && !authoredObject.characterController)
             {
                 continue;
             }
@@ -406,55 +447,123 @@ bool FileSceneRuntime::CaptureEditorColliderOverlay(const Renderer& renderer, Ed
 
             // Each builder accepts only its own collider type, so a shape can never be
             // drawn with another shape's geometry.
-            const Physics::PhysicsComponent& component = *authoredObject.physics;
             const RenderObject& renderObject = m_scene.GetRenderObjects()[objectMetadata->runtimeIndex];
-            bool placementValid = false;
-
-            switch(component.colliderType)
+            const auto appendComponent = [&](const auto& component, bool trigger, bool usePresentation)
             {
-            case Physics::ColliderType::Sphere:
-            {
-                Matrix4 colliderWorldTransform;
-                placementValid = BuildColliderSphereMatrix(component, renderObject, presentationActive,
-                    colliderWorldTransform);
+                auto& boxes = trigger ? capturedOverlay.triggerBoxWorldTransforms :
+                    capturedOverlay.boxColliderWorldTransforms;
+                auto& spheres = trigger ? capturedOverlay.triggerSphereWorldTransforms :
+                    capturedOverlay.sphereColliderWorldTransforms;
+                auto& capsules = trigger ? capturedOverlay.triggerCapsules : capturedOverlay.capsuleColliders;
+                bool placementValid = false;
 
-                if(placementValid)
+                switch(component.colliderType)
                 {
-                    capturedOverlay.sphereColliderWorldTransforms.push_back(colliderWorldTransform);
+                case Physics::ColliderType::Sphere:
+                {
+                    Matrix4 colliderWorldTransform;
+                    placementValid = BuildColliderSphereMatrix(component, renderObject, usePresentation,
+                        colliderWorldTransform);
+
+                    if(placementValid)
+                    {
+                        spheres.push_back(colliderWorldTransform);
+                    }
+
+                    break;
                 }
 
-                break;
-            }
-
-            case Physics::ColliderType::Capsule:
-            {
-                CapsuleColliderOverlay capsuleCollider;
-                placementValid = BuildColliderCapsule(component, renderObject, presentationActive, capsuleCollider);
-
-                if(placementValid)
+                case Physics::ColliderType::Capsule:
                 {
-                    capturedOverlay.capsuleColliders.push_back(capsuleCollider);
+                    CapsuleColliderOverlay capsuleCollider;
+                    placementValid = BuildColliderCapsule(component, renderObject, usePresentation, capsuleCollider);
+
+                    if(placementValid)
+                    {
+                        capsules.push_back(capsuleCollider);
+                    }
+
+                    break;
                 }
 
-                break;
-            }
-
-            default:
-            {
-                Matrix4 colliderWorldTransform;
-                placementValid = BuildColliderBoxMatrix(component, renderObject, presentationActive,
-                    colliderWorldTransform);
-
-                if(placementValid)
+                default:
                 {
-                    capturedOverlay.boxColliderWorldTransforms.push_back(colliderWorldTransform);
+                    Matrix4 colliderWorldTransform;
+                    placementValid = BuildColliderBoxMatrix(component, renderObject, usePresentation,
+                        colliderWorldTransform);
+
+                    if(placementValid)
+                    {
+                        boxes.push_back(colliderWorldTransform);
+                    }
+
+                    break;
+                }
                 }
 
-                break;
-            }
+                return placementValid;
+            };
+
+            const bool solidValid = !authoredObject.physics || appendComponent(*authoredObject.physics, false, presentationActive);
+
+            // Internal Static sensor hosts retain the locked authored pose, while triggers on a
+            // presented body or a controller's Kinematic host use only the accepted
+            // presentation, never a newer solver snapshot.
+            const bool triggerFollowsPresentation = presentationActive &&
+                (authoredObject.physics.has_value() || authoredObject.characterController.has_value());
+            const bool triggerValid = !authoredObject.triggerCollider || appendComponent(*authoredObject.triggerCollider, true,
+                triggerFollowsPresentation);
+            bool characterValid = true;
+
+            if(authoredObject.characterController)
+            {
+                CapsuleColliderOverlay capsule;
+                characterValid = BuildCharacterControllerCapsule(*authoredObject.characterController, renderObject,
+                    presentationActive, capsule);
+
+                // Diagnostics are drawn only when they describe exactly the presented pose.
+                const Physics::CharacterControllerDiagnostics* diagnostics = nullptr;
+
+                const auto presentedPose = renderObject.GetPhysicsPresentationPose();
+
+                if(characterValid && presentationActive && presentedPose)
+                {
+                    const auto& presented = *presentedPose;
+
+                    for(const auto& candidate : controllerDiagnostics)
+                    {
+                        const auto& pose = candidate.pose;
+                        const bool samePose = pose.position.x == presented.position.x &&
+                            pose.position.y == presented.position.y && pose.position.z == presented.position.z &&
+                            pose.orientation.x == presented.orientation.x && pose.orientation.y == presented.orientation.y &&
+                            pose.orientation.z == presented.orientation.z && pose.orientation.w == presented.orientation.w;
+
+                        if(candidate.objectID == authoredObject.id && samePose)
+                        {
+                            diagnostics = &candidate;
+                            break;
+                        }
+                    }
+                }
+
+                const bool alert = diagnostics && (diagnostics->recovery == Physics::CharacterRecovery::Unresolved ||
+                    diagnostics->lastStatus == Physics::CharacterMoveStatus::PenetrationRejected ||
+                    diagnostics->lastStatus == Physics::CharacterMoveStatus::QueryCapacityExceeded);
+
+                if(characterValid)
+                {
+                    capturedOverlay.characterMarkers.push_back({capsule.colliderWorldTransform, ColliderOverlayShape::Capsule,
+                        alert ? ColliderOverlayRole::CharacterAlert : ColliderOverlayRole::CharacterController,
+                        capsule.halfCylinderHeightInRadii});
+                }
+
+                if(diagnostics)
+                {
+                    AppendCharacterDiagnosticMarkers(*diagnostics, capturedOverlay.characterMarkers);
+                }
             }
 
-            if(!placementValid)
+            if(!solidValid || !triggerValid || !characterValid)
             {
                 error = "Collider placement is invalid or its accepted presentation pose is unavailable: " + authoredObject.id;
                 return false;

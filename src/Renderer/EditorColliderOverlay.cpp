@@ -2,7 +2,9 @@
 
 #include "Scene/Scene.h"
 
+#include <algorithm>
 #include <cmath>
+#include <array>
 #include <numbers>
 #include <stdexcept>
 
@@ -78,7 +80,7 @@ bool HasFiniteWorldCoordinates(const Matrix4& colliderWorldTransform, ColliderOv
 // The offset is applied once, in body-local meters, so it rotates with the body but not
 // with shapeRotation (identity except for Capsule). Authored visual scale is never part of
 // this transform; shapeRotation and shapeScale come only from collider data.
-bool BuildColliderMatrix(const Physics::PhysicsComponent& component, const RenderObject& object,
+bool BuildColliderMatrix(Vector3 localPositionOffset, const RenderObject& object,
     bool presentationActive, const Matrix4& shapeRotation, Vector3 shapeScale, ColliderOverlayShape shape,
     float halfCylinderHeightInRadii, Matrix4& colliderWorldTransform)
 {
@@ -91,7 +93,7 @@ bool BuildColliderMatrix(const Physics::PhysicsComponent& component, const Rende
             return false;
         }
 
-        const Matrix4 colliderLocalOffset = Matrix4::Translation(component.colliderLocalPositionOffset);
+        const Matrix4 colliderLocalOffset = Matrix4::Translation(localPositionOffset);
         const Matrix4 colliderShapeScale = Matrix4::Scale(shapeScale);
         const Matrix4 candidateTransform = bodyRigidTransform * colliderLocalOffset * shapeRotation * colliderShapeScale;
 
@@ -109,6 +111,41 @@ bool BuildColliderMatrix(const Physics::PhysicsComponent& component, const Rende
     }
 }
 
+template <typename Component>
+bool BuildCapsulePlacement(const Component& component, const RenderObject& object,
+    bool presentationActive, CapsuleColliderOverlay& capsuleCollider)
+{
+    // The matrix scales the radius-1 wireframe uniformly by the authored radius, so the
+    // caps stay hemispherical whatever the visual scale. The cylinder half-height is
+    // expressed in radius units, matching Box3D's centers at offset + (0, -/+ h/2, 0).
+    const float radius = component.capsuleRadius;
+    const float halfCylinderHeightInRadii = component.capsuleCylinderHeight * 0.5f / radius;
+
+    if(!std::isfinite(halfCylinderHeightInRadii))
+    {
+        return false;
+    }
+
+    // The capsule local rotation uses the Transform convention (Rz * Ry * Rx, radians),
+    // matching the quaternion ScenePhysicsSession gives Box3D.
+    const Matrix4 capsuleLocalRotation = Matrix4::Rotation(component.capsuleLocalRotation);
+    const Vector3 uniformRadiusScale{radius, radius, radius};
+    Matrix4 colliderWorldTransform;
+
+    const bool placementValid = BuildColliderMatrix(component.colliderLocalPositionOffset, object, presentationActive,
+        capsuleLocalRotation, uniformRadiusScale, ColliderOverlayShape::Capsule, halfCylinderHeightInRadii, colliderWorldTransform);
+
+    if(!placementValid)
+    {
+        return false;
+    }
+
+    capsuleCollider.colliderWorldTransform = colliderWorldTransform;
+    capsuleCollider.halfCylinderHeightInRadii = halfCylinderHeightInRadii;
+
+    return true;
+}
+
 // Unit-radius point on a circle in the local XZ plane at the given ring point index.
 // Rings, longitudinal lines and arc endpoints all use this so shared points coincide.
 Vector3 CapsuleRingPoint(unsigned int pointIndex, float height)
@@ -122,7 +159,22 @@ Vector3 CapsuleRingPoint(unsigned int pointIndex, float height)
 
 std::size_t EditorColliderOverlay::GetColliderCount() const noexcept
 {
-    return boxColliderWorldTransforms.size() + sphereColliderWorldTransforms.size() + capsuleColliders.size();
+    const std::array counts{boxColliderWorldTransforms.size(), sphereColliderWorldTransforms.size(), capsuleColliders.size(),
+        triggerBoxWorldTransforms.size(), triggerSphereWorldTransforms.size(), triggerCapsules.size(),
+        characterMarkers.size()};
+    std::size_t count = 0;
+
+    for(const auto size : counts)
+    {
+        if(size > MaxColliders - count)
+        {
+            return MaxColliders + 1;
+        }
+
+        count += size;
+    }
+
+    return count;
 }
 
 bool EditorColliderOverlay::Matches(const Scene& currentScene, std::uint64_t currentRendererLifetime) const noexcept
@@ -311,8 +363,8 @@ bool BuildColliderBoxMatrix(const Physics::PhysicsComponent& component, const Re
         component.boxDimensions.depth
     };
 
-    return BuildColliderMatrix(component, object, presentationActive, Matrix4::Identity(), colliderDimensions,
-        ColliderOverlayShape::Box, 0.0f, colliderWorldTransform);
+    return BuildColliderMatrix(component.colliderLocalPositionOffset, object, presentationActive,
+        Matrix4::Identity(), colliderDimensions, ColliderOverlayShape::Box, 0.0f, colliderWorldTransform);
 }
 
 bool BuildColliderSphereMatrix(const Physics::PhysicsComponent& component, const RenderObject& object,
@@ -329,8 +381,8 @@ bool BuildColliderSphereMatrix(const Physics::PhysicsComponent& component, const
     const float radius = component.sphereRadius;
     const Vector3 uniformRadiusScale{radius, radius, radius};
 
-    return BuildColliderMatrix(component, object, presentationActive, Matrix4::Identity(), uniformRadiusScale,
-        ColliderOverlayShape::Sphere, 0.0f, colliderWorldTransform);
+    return BuildColliderMatrix(component.colliderLocalPositionOffset, object, presentationActive,
+        Matrix4::Identity(), uniformRadiusScale, ColliderOverlayShape::Sphere, 0.0f, colliderWorldTransform);
 }
 
 bool BuildColliderCapsule(const Physics::PhysicsComponent& component, const RenderObject& object,
@@ -342,33 +394,122 @@ bool BuildColliderCapsule(const Physics::PhysicsComponent& component, const Rend
         return false;
     }
 
-    // The matrix scales the radius-1 wireframe uniformly by the authored radius, so the
-    // caps stay hemispherical whatever the visual scale. The cylinder half-height is
-    // expressed in radius units, matching Box3D's centers at offset + (0, -/+ h/2, 0).
-    const float radius = component.capsuleRadius;
-    const float halfCylinderHeightInRadii = component.capsuleCylinderHeight * 0.5f / radius;
+    return BuildCapsulePlacement(component, object, presentationActive, capsuleCollider);
+}
 
-    if(!std::isfinite(halfCylinderHeightInRadii))
+bool BuildColliderBoxMatrix(const Physics::TriggerColliderComponent& component, const RenderObject& object,
+    bool presentationActive, Matrix4& colliderWorldTransform)
+{
+    if(component.colliderType != Physics::ColliderType::Box || !Physics::ValidateTriggerColliderComponent(component))
     {
         return false;
     }
 
-    // The capsule local rotation uses the Transform convention (Rz * Ry * Rx, radians),
-    // matching the quaternion ScenePhysicsSession gives Box3D.
-    const Matrix4 capsuleLocalRotation = Matrix4::Rotation(component.capsuleLocalRotation);
-    const Vector3 uniformRadiusScale{radius, radius, radius};
-    Matrix4 colliderWorldTransform;
+    const Vector3 dimensions{component.boxDimensions.width, component.boxDimensions.height, component.boxDimensions.depth};
+    return BuildColliderMatrix(component.colliderLocalPositionOffset, object, presentationActive, Matrix4::Identity(),
+        dimensions, ColliderOverlayShape::Box, 0.0f, colliderWorldTransform);
+}
 
-    const bool placementValid = BuildColliderMatrix(component, object, presentationActive, capsuleLocalRotation,
-        uniformRadiusScale, ColliderOverlayShape::Capsule, halfCylinderHeightInRadii, colliderWorldTransform);
-
-    if(!placementValid)
+bool BuildColliderSphereMatrix(const Physics::TriggerColliderComponent& component, const RenderObject& object,
+    bool presentationActive, Matrix4& colliderWorldTransform)
+{
+    if(component.colliderType != Physics::ColliderType::Sphere || !Physics::ValidateTriggerColliderComponent(component))
     {
         return false;
     }
 
-    capsuleCollider.colliderWorldTransform = colliderWorldTransform;
-    capsuleCollider.halfCylinderHeightInRadii = halfCylinderHeightInRadii;
+    const float radius = component.sphereRadius;
+    return BuildColliderMatrix(component.colliderLocalPositionOffset, object, presentationActive, Matrix4::Identity(),
+        {radius, radius, radius}, ColliderOverlayShape::Sphere, 0.0f, colliderWorldTransform);
+}
 
-    return true;
+bool BuildColliderCapsule(const Physics::TriggerColliderComponent& component, const RenderObject& object,
+    bool presentationActive, CapsuleColliderOverlay& capsuleCollider)
+{
+    if(component.colliderType != Physics::ColliderType::Capsule || !Physics::ValidateTriggerColliderComponent(component))
+    {
+        return false;
+    }
+
+    return BuildCapsulePlacement(component, object, presentationActive, capsuleCollider);
+}
+
+bool BuildCharacterControllerCapsule(const Physics::CharacterControllerComponent& component, const RenderObject& object,
+    bool presentationActive, CapsuleColliderOverlay& capsuleCollider)
+{
+    if(!Physics::ValidateCharacterControllerComponent(component))
+    {
+        return false;
+    }
+
+    // Same upright capsule, offset and frame as the runtime observer (no local rotation).
+    Physics::TriggerColliderComponent capsule;
+    capsule.colliderType = Physics::ColliderType::Capsule;
+    capsule.capsuleRadius = component.capsuleRadius;
+    capsule.capsuleCylinderHeight = component.capsuleCylinderHeight;
+    capsule.colliderLocalPositionOffset = component.localOffset;
+    return BuildCapsulePlacement(capsule, object, presentationActive, capsuleCollider);
+}
+
+namespace
+{
+// Debug marker sizes in meters (display only).
+constexpr float GroundPointRadius = 0.05f;
+constexpr float GroundNormalLength = 0.4f;
+constexpr float ContactPointRadius = 0.03f;
+constexpr float ContactNormalLength = 0.25f;
+constexpr float NormalBarWidth = 0.01f;
+
+ColliderOverlayMarker MakePointMarker(const Vector3& point, float radius, ColliderOverlayRole role)
+{
+    const Matrix4 transform = Matrix4::Translation(point) * Matrix4::Scale(Vector3{radius, radius, radius});
+    return {transform, ColliderOverlayShape::Sphere, role};
+}
+
+// A thin unit box whose long axis runs from point along the unit normal.
+ColliderOverlayMarker MakeNormalMarker(const Vector3& point, const Vector3& normal, float length, ColliderOverlayRole role)
+{
+    const Vector3 helper = std::abs(normal.y) < 0.9f ? Vector3{0.0f, 1.0f, 0.0f} : Vector3{1.0f, 0.0f, 0.0f};
+    Vector3 tangent = Vector3::Cross(helper, normal);
+    tangent = tangent * (1.0f / std::sqrt(tangent.x * tangent.x + tangent.y * tangent.y + tangent.z * tangent.z));
+    const Vector3 bitangent = Vector3::Cross(normal, tangent);
+    const Vector3 center = point + normal * (length * 0.5f);
+
+    // Column-vector basis: columns are the scaled tangent, normal and bitangent.
+    Matrix4 transform = Matrix4::Identity();
+    const Vector3 columns[] = {tangent * NormalBarWidth, normal * length, bitangent * NormalBarWidth};
+
+    for(int column = 0; column < 3; ++column)
+    {
+        transform.m[0][column] = columns[column].x;
+        transform.m[1][column] = columns[column].y;
+        transform.m[2][column] = columns[column].z;
+    }
+
+    transform.m[0][3] = center.x;
+    transform.m[1][3] = center.y;
+    transform.m[2][3] = center.z;
+    return {transform, ColliderOverlayShape::Box, role};
+}
+}
+
+void AppendCharacterDiagnosticMarkers(const Physics::CharacterControllerDiagnostics& diagnostics,
+    std::vector<ColliderOverlayMarker>& markers)
+{
+    if(diagnostics.ground.grounded)
+    {
+        markers.push_back(MakePointMarker(diagnostics.ground.point, GroundPointRadius, ColliderOverlayRole::GroundSupport));
+        markers.push_back(MakeNormalMarker(diagnostics.ground.point, diagnostics.ground.normal, GroundNormalLength,
+            ColliderOverlayRole::GroundSupport));
+    }
+
+    const std::size_t contactCount = (std::min)(diagnostics.contacts.size(), Physics::MaximumCharacterDiagnosticContacts);
+
+    for(std::size_t index = 0; index < contactCount; ++index)
+    {
+        const auto& contact = diagnostics.contacts[index];
+        markers.push_back(MakePointMarker(contact.point, ContactPointRadius, ColliderOverlayRole::CharacterContact));
+        markers.push_back(MakeNormalMarker(contact.point, contact.normal, ContactNormalLength,
+            ColliderOverlayRole::CharacterContact));
+    }
 }

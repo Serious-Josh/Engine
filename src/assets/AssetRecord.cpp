@@ -2,6 +2,12 @@
 
 bool ValidateAssetRecord(const AssetRecord& record)
 {
+    if(!record.meshImportUnits.IsValid() ||
+        (record.type != AssetType::Mesh && record.meshImportUnits != MeshImportUnits{}))
+    {
+        return false;
+    }
+
     std::filesystem::path expectedDirectory;
 
     switch(record.type){

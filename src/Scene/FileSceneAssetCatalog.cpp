@@ -125,7 +125,8 @@ Mesh* FileSceneAssetCatalog::ResolveMesh(std::string_view reference)
         }
 
         const auto projectIdentity = std::filesystem::canonical(paths.GetRoot());
-        const MeshCacheKey key{projectIdentity, id->ToString(), digest, kMeshImportRevision, MeshUVOrientation::FlipV};
+        const MeshCacheKey key{projectIdentity, id->ToString(), digest, kMeshImportRevision,
+            MeshUVOrientation::FlipV, MeshPreparationSourceKind::FBX, record->meshImportUnits};
         const auto cached = m_projectMeshes.find(key);
         validationTiming.Stop();
 
@@ -170,7 +171,8 @@ Mesh* FileSceneAssetCatalog::ResolveMesh(std::string_view reference)
         {
             auto imported = SceneSwitchTiming::MeasureCall(SceneSwitchTiming::Stage::MeshImport, [&]()
             {
-                return ModelImporter::LoadFlattened(resolved.resolvedPath, MeshUVOrientation::FlipV);
+                return ModelImporter::LoadFlattened(resolved.resolvedPath, MeshUVOrientation::FlipV,
+                    (std::numeric_limits<size_t>::max)(), record->meshImportUnits);
             });
 
             if(SceneSwitchTiming::active)
@@ -1653,6 +1655,7 @@ Mesh* FileSceneAssetCatalog::ResolvePreparedMesh(std::string_view reference,
         const auto resolved = ProjectAssetResolver::Resolve(ProjectPaths(project), *m_registry, *id);
 
         if (project != identity.project || !record || record->type != AssetType::Mesh ||
+            record->meshImportUnits != identity.units ||
             resolved.status != AssetAvailability::Available || resolved.resolvedPath != identity.path ||
             _wcsicmp(resolved.resolvedPath.extension().c_str(), L".fbx") != 0)
         {

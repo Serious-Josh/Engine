@@ -1,3 +1,4 @@
+#include "Platform/Windows/WindowsWindow.h"
 #include "DemoContent/StressTestScene.h"
 #include "DemoContent/SceneRegistry.h"
 
@@ -90,7 +91,7 @@ bool StressTestScene::Initialize(
     // Brick diffuse texture: BC1 with sRGB sampling.
 
     if (!DDSLoader::LoadTexture(device, uploader, descriptorHeap,
-                                "assets/Textures/Materials/stacked_brick_wall_diff_4k.dds", m_whiteTexture, true))
+                                (WindowsWindow::GetExecutableDirectory() / "assets/Textures/Materials/stacked_brick_wall_diff_4k.dds"), m_whiteTexture, true))
     {
         return false;
     }
@@ -98,7 +99,7 @@ bool StressTestScene::Initialize(
     // Brick normal map: BC5 with linear sampling and the existing DirectX convention.
 
     if (!DDSLoader::LoadTexture(device, uploader, descriptorHeap,
-                                "assets/Textures/Materials/stacked_brick_wall_nor_dx_4k.dds", m_normalTexture, false))
+                                (WindowsWindow::GetExecutableDirectory() / "assets/Textures/Materials/stacked_brick_wall_nor_dx_4k.dds"), m_normalTexture, false))
     {
         return false;
     }
@@ -106,7 +107,7 @@ bool StressTestScene::Initialize(
     // Brick roughness map: BC4 with linear sampling, shared by sphere materials.
 
     if (!DDSLoader::LoadTexture(device, uploader, descriptorHeap,
-                                "assets/Textures/Materials/stacked_brick_wall_rough_4k.dds", m_roughnessTexture, false))
+                                (WindowsWindow::GetExecutableDirectory() / "assets/Textures/Materials/stacked_brick_wall_rough_4k.dds"), m_roughnessTexture, false))
     {
         return false;
     }

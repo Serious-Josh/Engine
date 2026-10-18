@@ -80,7 +80,8 @@ FileSceneAssetCatalog::CookedPreparationResult FileSceneAssetCatalog::RetainPrep
         if(!id || id->ToReference() != reference || *id != identity.cooked->assetID ||
             (m_archiveScene ? (completion.provider != m_archiveScene->provider ||
                 !ValidateArchiveMesh(reference, identity.cooked.get(), completion.metadata.get(), &error)) :
-                (!record || record->type != AssetType::Mesh || std::filesystem::canonical(m_projectRoot).generic_string() != identity.cooked->mapping.projectNamespace)))
+                (!record || record->type != AssetType::Mesh || record->meshImportUnits != identity.cooked->units ||
+                    std::filesystem::canonical(m_projectRoot).generic_string() != identity.cooked->mapping.projectNamespace)))
         {
             return Fail(Status::Invalid, Failure::Binding, "Cooked completion belongs to a different project, AssetID or type.");
         }

@@ -3,6 +3,7 @@
 #include "Editor/TextureThumbnailCache.h"
 #include "Editor/MeshDragPayload.h"
 #include "Editor/MaterialDragPayload.h"
+#include "Editor/ThumbnailAdmission.h"
 #include <filesystem>
 #include <map>
 #include <optional>
@@ -107,8 +108,21 @@ public:
         const std::filesystem::path& relativePath,
         const std::string& error);
 
+    struct MeshImportUnitsRequest
+    {
+        std::filesystem::path project;
+        AssetRecord expected;
+        MeshImportUnits units;
+    };
+
+    std::optional<MeshImportUnitsRequest> TakeMeshImportUnitsRequest();
+    void OnMeshImportUnitsCompleted(const std::string& error);
+
 private:
+#if defined(ENGINE_HAS_VERIFICATION)
     friend class MaterialLocateVerification;
+    friend class ThumbnailSchedulingVerification;
+#endif
     struct MovePayload
     {
         std::uint64_t projectIdentity = 0;
@@ -163,7 +177,32 @@ private:
     };
     std::map<std::string, MeshThumbnailRequest> m_meshThumbnailRequests;
     void PruneMeshThumbnailRequests(bool all = false);
-    std::optional<D3D12_GPU_DESCRIPTOR_HANDLE> GetVisibleMeshThumbnail(const AssetRecord& record, std::string& error);
+
+    // `terminal` reports an unreadable or unsupported source rather than a temporary failure.
+    std::optional<D3D12_GPU_DESCRIPTOR_HANDLE> GetVisibleMeshThumbnail(const AssetRecord& record, std::string& error,
+        bool& terminal);
+
+    // B.2 fair admission of visible thumbnail tiles, keyed by asset reference. Runs after each
+    // Draw: releases tiles that left the view or yielded, then admits the oldest waiting tiles.
+    ThumbnailAdmission m_meshAdmission;
+    ThumbnailAdmission m_materialAdmission;
+    void ScheduleThumbnails();
+
+    // Last failure per asset, shown as a tile tooltip instead of being logged every frame.
+    struct ThumbnailFailure
+    {
+        std::string message;
+        bool terminal = false;
+    };
+    std::map<std::string, ThumbnailFailure> m_thumbnailFailures;
+    std::string FindThumbnailFailure(const std::string& key) const;
+    void DrawMeshImportUnits();
+    std::optional<AssetRecord> m_unitsAsset;
+    MeshImportUnits m_unitsDraft;
+    float m_unitsManualScale = 1.0f;
+    std::string m_unitsSourceInfo;
+    bool m_openUnits = false;
+    std::optional<MeshImportUnitsRequest> m_unitsRequest;
 
     bool m_materialRequestsReset = false;
     bool m_materialImagesInvalidated = false;

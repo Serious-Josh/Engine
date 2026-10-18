@@ -43,7 +43,7 @@ namespace
             {"material", request.materialIdentity}, {"path", material.resolvedPath.generic_string()},
             {"content", validation.Digest(material.resolvedPath)},
             // Bump whenever preview shaders, BRDFs, tone mapping, geometry or studio setup change.
-            {"renderVersion", "v1-unit-sphere32x64-camera2.6,1.7,-3.2-fov.65-yaw0-pitch0-studio3-POM-AgX"},
+            {"renderVersion", "v2-full-normal-unit-sphere32x64-camera2.6,1.7,-3.2-fov.65-yaw0-pitch0-studio3-POM-AgX"},
             {"extent", 256}, {"format", "R8G8B8A8_UNORM-display-encoded"}, {"textures", nlohmann::json::array()}
         };
 
@@ -1749,7 +1749,8 @@ void MaterialPreviewRenderer::PollMeshThumbnailPreparation(const ProjectPaths& p
         if(job.validating && (prepared->state == MeshThumbnailPreparation::State::Prepared ||
             prepared->state == MeshThumbnailPreparation::State::CacheHit))
         {
-            job.ready = prepared->identity.sourceFingerprint == job.identity.sourceFingerprint;
+            job.ready = prepared->identity.sourceFingerprint == job.identity.sourceFingerprint &&
+                prepared->identity.units == job.identity.units;
             job.stale = !job.ready;
             job.validating = false;
         }
@@ -2224,6 +2225,38 @@ void MaterialPreviewRenderer::PollMeshGPUFences(std::uint64_t completedFence)
             job.readback.Reset();
         }
     }
+}
+
+size_t MaterialPreviewRenderer::ReleaseIdleMeshThumbnailImages()
+{
+    if(m_recording || m_quarantined)
+    {
+        return 0;
+    }
+
+    size_t released = 0;
+
+    for(auto job = m_meshJobs.begin(); job != m_meshJobs.end();)
+    {
+        const bool idle = !job->recorded && !job->awaitingDisplaySubmission &&
+            job->fence <= m_meshCompletedFence && job->displayFence <= m_meshCompletedFence &&
+            !job->vertices && !job->indices;
+
+        if(!idle)
+        {
+            ++job;
+            continue;
+        }
+
+        // Same ticket cleanup as capacity eviction in the mesh job admission path.
+        m_meshPreparation.Discard(job->ticket);
+        m_meshConsumers.erase(job->ticket);
+        job->color.Shutdown();
+        job = m_meshJobs.erase(job);
+        ++released;
+    }
+
+    return released;
 }
 
 std::optional<MaterialPreviewRenderer::MeshThumbnailImage> MaterialPreviewRenderer::GetMeshThumbnailImage(

@@ -162,9 +162,9 @@ bool SceneDocumentsEqual(
         const auto& a = left.objects[index];
         const auto& b = right.objects[index];
 
-        if (a.id != b.id || a.name != b.name || a.meshReference != b.meshReference ||
+        if (a.id != b.id || a.parentID != b.parentID || a.name != b.name || a.meshReference != b.meshReference ||
             a.materialReference != b.materialReference || a.materialSlotBindings != b.materialSlotBindings ||
-            a.physics != b.physics)
+            a.physics != b.physics || a.triggerCollider != b.triggerCollider || a.characterController != b.characterController)
         {
             return false;
         }

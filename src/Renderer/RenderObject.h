@@ -29,12 +29,20 @@ struct RenderObject
     {
         return presentationPose;
     }
+    // Committed rendered world. Parented objects read the Scene-evaluated hierarchy world;
+    // roots keep the original local or accepted-pose composition unchanged.
     PresentationTransform GetPresentationTransform() const
     {
+        if (hierarchyWorld)
+        {
+            return {*hierarchyWorld, previousHierarchyWorld.value_or(*hierarchyWorld)};
+        }
+
         const Matrix4 current = presentationPose
             ? Physics::ComposeRuntimeModelMatrix(*presentationPose, transform.scale)
             : transform.GetModelMatrix();
-        return {current, previousPresentedModel.value_or(previousTransform.GetModelMatrix())};
+        return {current, previousHierarchyWorld.value_or(
+            previousPresentedModel.value_or(previousTransform.GetModelMatrix()))};
     }
 
     // Effective runtime borrows, not authored overrides. The document retains
@@ -55,4 +63,10 @@ private:
     std::optional<Physics::Pose> presentationPose;
     std::optional<Matrix4> previousPresentedModel;
     bool presentationDirty = false;
+
+    // H.3 derived values, written only by Scene's hierarchy commit. Present only for
+    // objects with a parent. Previous advances only in Scene::ClearChangedTransforms.
+    // A previous value may outlive its current one for one render after detachment.
+    std::optional<Matrix4> hierarchyWorld;
+    std::optional<Matrix4> previousHierarchyWorld;
 };

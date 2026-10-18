@@ -3,6 +3,8 @@
 #include "Scene/Transform.h"
 #include "Scene/DirectionalLight.h"
 #include "Physics/PhysicsComponent.h"
+#include "Physics/TriggerColliderComponent.h"
+#include "Physics/CharacterControllerComponent.h"
 
 #include <cstdint>
 #include <string>
@@ -26,6 +28,7 @@ struct SceneObjectDocument
     std::string id;
     std::string name = "Object";
 
+
     Transform transform;
 
     //persistant asset references
@@ -38,6 +41,16 @@ struct SceneObjectDocument
 
     // Optional authored configuration; no runtime body or transform ownership.
     std::optional<Physics::PhysicsComponent> physics;
+
+    // Optional authored trigger geometry; owns no sensor resources.
+    std::optional<Physics::TriggerColliderComponent> triggerCollider;
+
+    // Generic Optional authored configuration; exclusive with PhysicsComponent.
+    std::optional<Physics::CharacterControllerComponent> characterController;
+
+    // Empty means root; otherwise the exact ID of another object in this scene. Persisted from
+    // schema 9 / cooked payload 9; historical versions load every object as a root.
+    std::string parentID;
 };
 
 struct SceneDocument
@@ -48,7 +61,10 @@ struct SceneDocument
     static constexpr std::uint32_t kCapsuleSchemaVersion = 4;
     static constexpr std::uint32_t kCapsuleRotationSchemaVersion = 5;
     static constexpr std::uint32_t kContactEventsSchemaVersion = 6;
-    static constexpr std::uint32_t kSchemaVersion = kContactEventsSchemaVersion;
+    static constexpr std::uint32_t kTriggerColliderSchemaVersion = 7;
+    static constexpr std::uint32_t kCharacterControllerSchemaVersion = 8;
+    static constexpr std::uint32_t kHierarchySchemaVersion = 9;
+    static constexpr std::uint32_t kSchemaVersion = kHierarchySchemaVersion;
 
     std::uint32_t schemaVersion = kSchemaVersion;
 
@@ -66,3 +82,8 @@ struct SceneDocument
 bool ValidateSceneDocument(
     const SceneDocument& document,
     std::string* errorMessage = nullptr);
+
+// Shared authoritative component/coexistence validation for proposed object values.
+bool ValidateSceneObjectComponents(const SceneObjectDocument& object, std::string* errorMessage = nullptr);
+// Shared output admission; all current codecs preserve the complete authored document.
+bool ValidateSceneDocumentPersistence(const SceneDocument& document, std::string* errorMessage = nullptr);

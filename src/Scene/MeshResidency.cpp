@@ -161,6 +161,7 @@ MeshResidencySourceLock FileSceneAssetCatalog::ValidateMeshResidencyCandidate(
             }
         }
         else if(candidate.cooked || owned->second->cooked || std::get<5>(candidate.key) != MeshPreparationSourceKind::FBX ||
+            !m_registry->Find(*id) || m_registry->Find(*id)->meshImportUnits != std::get<6>(candidate.key) ||
             std::get<3>(candidate.key) != ModelImporter::kImportRevision || std::get<4>(candidate.key) != MeshUVOrientation::FlipV)
         {
             return reject("FBX residency candidate import/source policy does not match.");
@@ -201,7 +202,9 @@ MeshResidencySourceLock FileSceneAssetCatalog::ValidateMeshResidencyCandidate(
         const auto id = AssetID::ParseReference(reference);
         const auto* record = m_registry ? m_registry->Find(*id) : nullptr;
 
-        if((m_archiveScene ? !ValidateArchiveMesh(reference,candidate.cooked->asset.get(),&metadata,error) : (!record || record->type != AssetType::Mesh)) || metadata.metadata != geometry.metadata ||
+        if((m_archiveScene ? !ValidateArchiveMesh(reference,candidate.cooked->asset.get(),&metadata,error) :
+            (!record || record->type != AssetType::Mesh || record->meshImportUnits != candidate.cooked->asset->units)) ||
+            metadata.metadata != geometry.metadata ||
             metadata.vertexCount != geometry.vertices.size() || metadata.indexCount != geometry.indices.size() ||
             metadata.boundsMin.x != geometry.boundsMin.x || metadata.boundsMin.y != geometry.boundsMin.y ||
             metadata.boundsMin.z != geometry.boundsMin.z || metadata.boundsMax.x != geometry.boundsMax.x ||

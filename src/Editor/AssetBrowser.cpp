@@ -9,6 +9,8 @@
 #include "assets/ProjectTextureImportService.h"
 #include "assets/ProjectMeshImportService.h"
 #include "assets/SupportedAssetImportFormats.h"
+#include "assets/ModelImporter.h"
+#include "Editor/InspectorNumericDrag.h"
 #include "assets/ProjectAssetResolver.h"
 #include "Core/Log.h"
 
@@ -23,6 +25,17 @@
 #include <cwctype>
 #include <memory>
 #include <utility>
+#include <format>
+
+namespace
+{
+    // Placeholder for a tile without a ready thumbnail: the asset kind and why it is waiting.
+    void DrawThumbnailStatus(ImDrawList* draw, const ImVec2& start, const char* kind, const char* status)
+    {
+        draw->AddText(ImVec2(start.x + 5.0f, start.y + 5.0f), IM_COL32(190, 190, 190, 255), kind);
+        draw->AddText(ImVec2(start.x + 5.0f, start.y + 22.0f), IM_COL32(140, 140, 140, 255), status);
+    }
+}
 
 namespace
 {
@@ -536,8 +549,7 @@ void AssetBrowser::DrawContents()
     const int columns = (std::max)(1, static_cast<int>(ImGui::GetContentRegionAvail().x / 112.0f));
     std::filesystem::path destination;
     bool tileHovered = false;
-    size_t visibleMaterialCount = 0;
-    size_t visibleMeshCount = 0;
+    const auto now = ThumbnailAdmission::Clock::now();
 
     if (ImGui::BeginTable("Files", columns, ImGuiTableFlags_SizingStretchSame))
     {
@@ -576,6 +588,7 @@ void AssetBrowser::DrawContents()
             const TextureThumbnailCache::Preview* preview = nullptr;
 
             std::string materialError;
+            std::string tileFailure;
 
             if(hasThumbnail && tileVisible)
             {
@@ -600,14 +613,31 @@ void AssetBrowser::DrawContents()
                 }
                 else if(isMaterial && m_materialRenderer && m_thumbnailPaths && m_thumbnailRegistry)
                 {
+                    // Only admitted tiles join the renderer's per-frame working set (B.2 rotation).
+                    const auto key = material->second.id.ToReference();
+                    const auto admission = m_materialAdmission.MarkVisible(key, now);
                     std::optional<MaterialPreviewImage> image;
+                    const char* status = admission == ThumbnailAdmission::TileState::CoolingDown ? "Unavailable" : "Queued";
 
-                    if(visibleMaterialCount++ < MaterialPreviewRenderer::kThumbnailCapacity)
+                    if(admission == ThumbnailAdmission::TileState::Admitted)
                     {
                         m_materialRenderer->RequestSavedMaterialThumbnail(
                             *m_thumbnailPaths, *m_thumbnailRegistry, material->second.id, materialError);
                         // Lookup registers this exact image's current ImGui reference with Renderer.
                         image = m_materialRenderer->GetSavedMaterialThumbnailImage(*m_thumbnailPaths, material->second.id);
+                        status = "Generating";
+
+                        if(image)
+                        {
+                            m_materialAdmission.MarkShown(key, now);
+                            m_thumbnailFailures.erase(key);
+                        }
+                        else if(!materialError.empty())
+                        {
+                            m_materialAdmission.MarkFailed(key, now);
+                            m_thumbnailFailures[key] = {materialError, false};
+                            status = "Unavailable";
+                        }
                     }
 
                     if(image)
@@ -616,17 +646,38 @@ void AssetBrowser::DrawContents()
                     }
                     else
                     {
-                        draw->AddText(ImVec2(start.x + 5.0f, start.y + 5.0f), IM_COL32(190, 190, 190, 255), "Material");
+                        DrawThumbnailStatus(draw, start, "Material", status);
+                        tileFailure = FindThumbnailFailure(key);
                     }
                 }
                 else if(isMesh && m_materialRenderer && m_thumbnailPaths && m_thumbnailRegistry)
                 {
+                    const auto& record = m_meshRecords.at(entry.path.lexically_normal());
+                    const auto key = record.id.ToReference();
+                    const auto admission = m_meshAdmission.MarkVisible(key, now);
                     std::optional<D3D12_GPU_DESCRIPTOR_HANDLE> image;
+                    const auto failure = m_thumbnailFailures.find(key);
+                    const bool terminalFailure = failure != m_thumbnailFailures.end() && failure->second.terminal;
+                    const char* status = admission != ThumbnailAdmission::TileState::CoolingDown ? "Queued" :
+                        terminalFailure ? "No preview" : "Retrying soon";
 
-                    if(visibleMeshCount++ < MaterialPreviewRenderer::kMeshThumbnailCapacity)
+                    if(admission == ThumbnailAdmission::TileState::Admitted)
                     {
-                        const auto& record = m_meshRecords.at(entry.path.lexically_normal());
-                        image = GetVisibleMeshThumbnail(record, materialError);
+                        bool terminal = false;
+                        image = GetVisibleMeshThumbnail(record, materialError, terminal);
+                        status = "Generating";
+
+                        if(image)
+                        {
+                            m_meshAdmission.MarkShown(key, now);
+                            m_thumbnailFailures.erase(key);
+                        }
+                        else if(!materialError.empty())
+                        {
+                            m_meshAdmission.MarkFailed(key, now);
+                            m_thumbnailFailures[key] = {materialError, terminal};
+                            status = terminal ? "No preview" : "Retrying soon";
+                        }
                     }
 
                     if(image)
@@ -635,7 +686,8 @@ void AssetBrowser::DrawContents()
                     }
                     else
                     {
-                        draw->AddText(ImVec2(start.x + 5.0f, start.y + 5.0f), IM_COL32(190, 190, 190, 255), "Mesh");
+                        DrawThumbnailStatus(draw, start, "Mesh", status);
+                        tileFailure = FindThumbnailFailure(key);
                     }
                 }
                 else
@@ -660,6 +712,12 @@ void AssetBrowser::DrawContents()
             }
             const bool hovered = ImGui::IsItemHovered();
             tileHovered = tileHovered || hovered;
+
+            // Failure detail on demand only; scheduling never logs per tile.
+            if(hovered && !tileFailure.empty())
+            {
+                ImGui::SetTooltip("%s", tileFailure.c_str());
+            }
             if(entry.navigable)
             {
                 DrawAssetMoveTarget(entry.path);
@@ -701,6 +759,24 @@ void AssetBrowser::DrawContents()
             if(eligible && ImGui::BeginPopup("FileContext"))
             {
                 const bool canRequest = m_deleteTarget.empty() && !m_deleteRequest && m_renameTarget.empty();
+
+                if(isMesh && ImGui::MenuItem("Import Units...", nullptr, false, canRequest && !m_unitsRequest))
+                {
+                    m_unitsAsset = m_meshRecords.at(entry.path.lexically_normal());
+                    m_unitsDraft = m_unitsAsset->meshImportUnits;
+                    m_unitsManualScale = static_cast<float>(m_unitsDraft.scale);
+                    m_openUnits = true;
+
+                    try
+                    {
+                        const double metres = ModelImporter::InspectFBXUnitScale(entry.path);
+                        m_unitsSourceInfo = std::format("Effective FBX metres per source unit: {:.9g}", metres);
+                    }
+                    catch(const std::exception& error)
+                    {
+                        m_unitsSourceInfo = error.what();
+                    }
+                }
 
                 if(ImGui::MenuItem("Rename", nullptr, false, canRequest))
                 {
@@ -785,6 +861,9 @@ void AssetBrowser::Draw(const EditorWorkspaceRect& rectangle)
     {
         request.visible = false;
     }
+
+    m_meshAdmission.BeginFrame();
+    m_materialAdmission.BeginFrame();
 
     if(m_materialRenderer)
     {
@@ -902,11 +981,50 @@ void AssetBrowser::Draw(const EditorWorkspaceRect& rectangle)
 
         DrawMaterialCreationModal();
         DrawFolderCreationModal();
+        DrawMeshImportUnits();
     }
 
     ImGui::End();
     ImGui::PopStyleVar(2);
     PruneMeshThumbnailRequests();
+    ScheduleThumbnails();
+}
+
+void AssetBrowser::ScheduleThumbnails()
+{
+    // Browser budgets leave the remaining renderer capacity to the Scene Object Inspector.
+    const auto now = ThumbnailAdmission::Clock::now();
+    std::vector<std::string> released;
+    m_meshAdmission.Schedule(MaterialPreviewRenderer::kMeshThumbnailCapacity, now, released);
+
+    // A released mesh tile stops requesting and displaying. The renderer retires its image only
+    // after every fence and display pin clears, so an in-flight draw is never invalidated.
+    for(const auto& key : released)
+    {
+        const auto request = m_meshThumbnailRequests.find(key);
+
+        if(request == m_meshThumbnailRequests.end())
+        {
+            continue;
+        }
+
+        if(m_materialRenderer && request->second.ticket)
+        {
+            m_materialRenderer->DiscardMeshThumbnail(request->second.ticket);
+        }
+
+        m_meshThumbnailRequests.erase(request);
+    }
+
+    // Released material tiles simply leave the next frame's renderer working set.
+    released.clear();
+    m_materialAdmission.Schedule(MaterialPreviewRenderer::kThumbnailCapacity, now, released);
+}
+
+std::string AssetBrowser::FindThumbnailFailure(const std::string& key) const
+{
+    const auto failure = m_thumbnailFailures.find(key);
+    return failure == m_thumbnailFailures.end() ? std::string{} : failure->second.message;
 }
 
 void AssetBrowser::CaptureDropTarget(const std::filesystem::path& directory, bool contentArea)
@@ -1029,6 +1147,9 @@ void AssetBrowser::SetThumbnailProject(const ProjectPaths& paths, const ProjectA
 
     if(projectError || canonicalProject != m_meshDragProject)
     {
+        m_unitsAsset.reset();
+        m_unitsRequest.reset();
+        m_openUnits = false;
         PruneMeshThumbnailRequests(true);
         InvalidateMeshDragIdentity();
         m_meshDragProject = projectError ? std::filesystem::path{} : canonicalProject;
@@ -1071,6 +1192,81 @@ void AssetBrowser::SetThumbnailProject(const ProjectPaths& paths, const ProjectA
     }
 }
 
+void AssetBrowser::DrawMeshImportUnits()
+{
+    if(m_openUnits)
+    {
+        ImGui::OpenPopup("Mesh Import Units");
+        m_openUnits = false;
+    }
+
+    if(!ImGui::BeginPopupModal("Mesh Import Units", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
+    {
+        return;
+    }
+
+    if(!m_unitsAsset || !m_thumbnailPaths)
+    {
+        ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+        return;
+    }
+
+    ImGui::TextUnformatted(m_unitsAsset->relativePath.generic_string().c_str());
+    const auto savedMode = m_unitsAsset->meshImportUnits.mode;
+    const char* savedName = savedMode == MeshImportUnitMode::Legacy ? "Legacy" :
+        savedMode == MeshImportUnitMode::FileUnits ? "File Units" : "Manual Scale";
+    ImGui::Text("Current saved policy: %s", savedName);
+    ImGui::TextWrapped("%s", m_unitsSourceInfo.c_str());
+    ImGui::TextWrapped("FBX defaults to centimetres when unit metadata is omitted.");
+    int mode = static_cast<int>(m_unitsDraft.mode);
+
+    if(ImGui::Combo("Import policy", &mode, "Legacy\0File Units\0Manual Scale\0"))
+    {
+        m_unitsDraft.mode = static_cast<MeshImportUnitMode>(mode);
+    }
+
+    if(m_unitsDraft.mode == MeshImportUnitMode::Manual)
+    {
+        InspectorDragFloats("Metres multiplier", &m_unitsManualScale, 1, InspectorDragSpec{});
+    }
+
+    ImGui::TextWrapped("Changing this asset changes imported geometry, bounds and previews. "
+        "Scene-object transforms stay unchanged. Open a scene that does not reference this mesh first; "
+        "reload the scene before using the updated asset.");
+
+    if(ImGui::Button("Validate and Apply"))
+    {
+        m_unitsDraft.scale = m_unitsDraft.mode == MeshImportUnitMode::Manual ? double(m_unitsManualScale) : 1.0;
+        m_unitsRequest = MeshImportUnitsRequest{m_thumbnailPaths->GetRoot(), *m_unitsAsset, m_unitsDraft};
+        ImGui::CloseCurrentPopup();
+    }
+
+    ImGui::SameLine();
+
+    if(ImGui::Button("Cancel"))
+    {
+        ImGui::CloseCurrentPopup();
+    }
+
+    ImGui::EndPopup();
+}
+
+std::optional<AssetBrowser::MeshImportUnitsRequest> AssetBrowser::TakeMeshImportUnitsRequest()
+{
+    return std::exchange(m_unitsRequest, std::nullopt);
+}
+
+void AssetBrowser::OnMeshImportUnitsCompleted(const std::string& error)
+{
+    m_importFeedback = error.empty() ? "Mesh import units saved. Reload the scene before using this asset." : error;
+
+    if(error.empty())
+    {
+        PruneMeshThumbnailRequests(true);
+    }
+}
+
 void AssetBrowser::InvalidateMaterialSource(const std::filesystem::path& path)
 {
     if(m_materialRenderer)
@@ -1097,6 +1293,14 @@ void AssetBrowser::PauseMaterialThumbnails()
 
 void AssetBrowser::PruneMeshThumbnailRequests(bool all)
 {
+    // A full prune (project, folder-root or thumbnail reset) also forgets admission state.
+    if(all)
+    {
+        m_meshAdmission.Clear();
+        m_materialAdmission.Clear();
+        m_thumbnailFailures.clear();
+    }
+
     for(auto entry = m_meshThumbnailRequests.begin(); entry != m_meshThumbnailRequests.end();)
     {
         if(!all && entry->second.visible)
@@ -1115,8 +1319,10 @@ void AssetBrowser::PruneMeshThumbnailRequests(bool all)
 }
 
 std::optional<D3D12_GPU_DESCRIPTOR_HANDLE> AssetBrowser::GetVisibleMeshThumbnail(
-    const AssetRecord& record, std::string& error)
+    const AssetRecord& record, std::string& error, bool& terminal)
 {
+    terminal = false;
+
     if(!m_materialRenderer || !m_thumbnailPaths || !m_thumbnailRegistry)
     {
         return std::nullopt;
@@ -1128,6 +1334,7 @@ std::optional<D3D12_GPU_DESCRIPTOR_HANDLE> AssetBrowser::GetVisibleMeshThumbnail
     if(!registered || registered->type != AssetType::Mesh || resolved.status != AssetAvailability::Available)
     {
         error = "Mesh thumbnail source is missing or no longer registered.";
+        terminal = true;
         const auto previous = m_meshThumbnailRequests.find(record.id.ToReference());
 
         if(previous != m_meshThumbnailRequests.end())
@@ -1158,6 +1365,17 @@ std::optional<D3D12_GPU_DESCRIPTOR_HANDLE> AssetBrowser::GetVisibleMeshThumbnail
 
     error = request.error.empty() && request.ticket ?
         m_materialRenderer->GetMeshThumbnailError(request.ticket) : request.error;
+
+    // Preparation failure means the source itself is unreadable or unsupported.
+    if(request.ticket && m_materialRenderer->HasMeshThumbnailPreparationFailed(request.ticket))
+    {
+        terminal = true;
+
+        if(error.empty())
+        {
+            error = "Mesh preview could not be prepared from this source.";
+        }
+    }
     const auto image = m_materialRenderer->GetMeshThumbnailImage(request.ticket);
     return image ? std::optional<D3D12_GPU_DESCRIPTOR_HANDLE>(image->srv) : std::nullopt;
 }

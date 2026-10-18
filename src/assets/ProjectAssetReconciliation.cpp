@@ -192,11 +192,10 @@ bool ProjectAssetReconciliation::Run(
 
             const auto& schemaVersion = document.at("schemaVersion");
             const bool supportedSchema = schemaVersion.is_number_integer() &&
-                (schemaVersion == 1 || (!material && (schemaVersion == SceneDocument::kBoxPhysicsSchemaVersion ||
-                    schemaVersion == SceneDocument::kSphereSchemaVersion ||
-                    schemaVersion == SceneDocument::kCapsuleSchemaVersion ||
-                    schemaVersion == SceneDocument::kCapsuleRotationSchemaVersion ||
-                    schemaVersion == SceneDocument::kSchemaVersion)));
+                (material ? schemaVersion == 1 :
+                    schemaVersion >= SceneDocument::kLegacySchemaVersion &&
+                    schemaVersion <= SceneDocument::kSchemaVersion);
+
             if(!document.is_object() || !supportedSchema)
             {
                 throw std::runtime_error("Unsupported document schema: " + entry.path().string());

@@ -2244,9 +2244,8 @@ void ClosestHit(
             LoadVertexTangent(vertexBuffer, vertexIndex0, instanceData.vertexStride, instanceData.tangentOffset) * barycentric0 +
             LoadVertexTangent(vertexBuffer, vertexIndex1, instanceData.vertexStride, instanceData.tangentOffset) * barycentric1 +
             LoadVertexTangent(vertexBuffer, vertexIndex2, instanceData.vertexStride, instanceData.tangentOffset) * barycentric2;
-        // Row-vector multiplication by world-to-object equals the raster
-        // inverse-transpose normalMatrix convention.
-        float3 tangent = mul(objectTangent.xyz, (float3x3)WorldToObject3x4());
+        // Surface directions follow object-to-world; normals above use its inverse transpose.
+        float3 tangent = mul((float3x3)ObjectToWorld3x4(), objectTangent.xyz);
         tangent -= worldNormal * dot(worldNormal, tangent);
         float tangentLengthSquared = dot(tangent, tangent);
         // A reflected instance reverses the cross-product frame orientation.

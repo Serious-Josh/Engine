@@ -94,7 +94,7 @@ namespace
     }
 
     ImportedMesh ConvertMesh(const aiMesh* source, const aiMatrix4x4& transform,
-        MeshUVOrientation uvOrientation)
+        MeshUVOrientation uvOrientation, double unitScale)
     {
         Require(source != nullptr, "Mesh pointer is null.");
         Require(source->mVertices && source->mNumVertices > 0, "Mesh has no vertices.");
@@ -112,7 +112,12 @@ namespace
         for (unsigned int i = 0; i < source->mNumVertices; ++i)
         {
             Require(Finite(source->mVertices[i]), "Vertex " + std::to_string(i) + " has a nonfinite position.");
-            const aiVector3D position = transform * source->mVertices[i];
+            aiVector3D position = transform * source->mVertices[i];
+            // Convert after the full node transform: translations and nested occurrences
+            // use the same source units. Positive uniform conversion leaves normals intact.
+            position.x = static_cast<ai_real>(double(position.x) * unitScale);
+            position.y = static_cast<ai_real>(double(position.y) * unitScale);
+            position.z = static_cast<ai_real>(double(position.z) * unitScale);
             Require(Finite(position), "Transformed vertex " + std::to_string(i) + " is nonfinite.");
 
             Vertex vertex{};
@@ -196,11 +201,36 @@ namespace
         return result;
     }
 
+    double FileUnitScale(const std::filesystem::path& path, const aiScene& scene)
+    {
+        double centimetres = 0.0;
+        float floatCentimetres = 0.0f;
+        Require(_wcsicmp(path.extension().c_str(), L".fbx") == 0,
+            "File Units are supported only for FBX sources.");
+        bool hasUnits = scene.mMetaData && scene.mMetaData->Get("UnitScaleFactor", centimetres);
+
+        // Assimp 6.0.2 publishes FBX's float property as AI_FLOAT, despite the FBX
+        // property's "double" spelling. Metadata Get deliberately performs no conversion.
+        if(!hasUnits && scene.mMetaData && scene.mMetaData->Get("UnitScaleFactor", floatCentimetres))
+        {
+            centimetres = floatCentimetres;
+            hasUnits = true;
+        }
+
+        Require(hasUnits &&
+            std::isfinite(centimetres) && centimetres > 0.0,
+            "FBX source unit metadata is missing, nonfinite or nonpositive; use an explicit Manual scale or Legacy.");
+        const double scale = centimetres * 0.01;
+        Require(std::isfinite(scale) && scale > 0.0, "FBX metre conversion is unrepresentable.");
+        return scale;
+    }
+
     std::vector<ImportedMesh> Import(const std::filesystem::path& path, MeshUVOrientation uvOrientation,
-        size_t geometryByteLimit = (std::numeric_limits<size_t>::max)())
+        size_t geometryByteLimit, const MeshImportUnits& units)
     {
         Require(uvOrientation == MeshUVOrientation::PreserveSource || uvOrientation == MeshUVOrientation::FlipV,
             "Unsupported mesh UV orientation policy.");
+        Require(units.IsValid(), "Invalid mesh import-unit policy.");
 
         Assimp::Importer importer;
         const aiScene* scene = importer.ReadFile(path.string(),
@@ -208,6 +238,7 @@ namespace
         Require(scene != nullptr, std::string("Assimp: ") + importer.GetErrorString());
         Require(scene->mRootNode && scene->mMeshes && scene->mNumMeshes > 0 &&
             !(scene->mFlags & AI_SCENE_FLAGS_INCOMPLETE), "Scene has no complete mesh hierarchy.");
+        const double unitScale = units.mode == MeshImportUnitMode::FileUnits ? FileUnitScale(path, *scene) : units.scale;
 
         struct PendingNode
         {
@@ -254,7 +285,7 @@ namespace
                             "Mesh conversion exceeds the configured geometry budget.");
                         geometryBytes += static_cast<size_t>(required);
 
-                        ImportedMesh mesh = ConvertMesh(source, transform, uvOrientation);
+                        ImportedMesh mesh = ConvertMesh(source, transform, uvOrientation, unitScale);
                         Require(scene->mMaterials && source->mMaterialIndex < scene->mNumMaterials &&
                             scene->mMaterials[source->mMaterialIndex], "Mesh references an invalid source material.");
 
@@ -294,11 +325,12 @@ namespace
     }
 }
 
-std::vector<ImportedMesh> ModelImporter::Load(const std::filesystem::path& path, MeshUVOrientation uvOrientation)
+std::vector<ImportedMesh> ModelImporter::Load(const std::filesystem::path& path, MeshUVOrientation uvOrientation,
+    MeshImportUnits units)
 {
     try
     {
-        return Import(path, uvOrientation);
+        return Import(path, uvOrientation, (std::numeric_limits<size_t>::max)(), units);
     }
     catch (const std::exception& error)
     {
@@ -307,11 +339,11 @@ std::vector<ImportedMesh> ModelImporter::Load(const std::filesystem::path& path,
 }
 
 ImportedMesh ModelImporter::LoadFlattened(const std::filesystem::path& path, MeshUVOrientation uvOrientation,
-    size_t geometryByteLimit)
+    size_t geometryByteLimit, MeshImportUnits units)
 {
     try
     {
-        const auto meshes = Import(path, uvOrientation, geometryByteLimit);
+        const auto meshes = Import(path, uvOrientation, geometryByteLimit, units);
         size_t vertexCount = 0;
         size_t indexCount = 0;
 
@@ -373,4 +405,12 @@ ImportedMesh ModelImporter::LoadFlattened(const std::filesystem::path& path, Mes
     {
         throw std::runtime_error("Failed to flatten model '" + path.string() + "': " + error.what());
     }
+}
+
+double ModelImporter::InspectFBXUnitScale(const std::filesystem::path& path)
+{
+    Assimp::Importer importer;
+    const auto* scene = importer.ReadFile(path.string(), aiProcess_ValidateDataStructure);
+    Require(scene != nullptr, std::string("Assimp: ") + importer.GetErrorString());
+    return FileUnitScale(path, *scene);
 }

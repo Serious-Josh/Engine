@@ -51,8 +51,9 @@ class Engine
     // Archive diagnostics skip loose-project registry, reconciliation and scans.
     bool Initialize(bool archiveDiagnostic = false);
     bool Initialize(const EngineStartup& startup);
+#if !defined(NDEBUG) && defined(ENGINE_HAS_VERIFICATION)
+    friend class PortableEditorVerification;
     void VerifyPackagedBootstrap();
-#ifndef NDEBUG
     // Preparation checkpoint only. Never enters the publication coordinator.
     bool VerifyCookedMeshGPUPreparation(const std::filesystem::path& scenePath,
         std::shared_ptr<const CookedMeshSource::Provider> source = {});
@@ -62,6 +63,14 @@ class Engine
     bool VerifyViewportPan();
     bool VerifySceneDuplication(const std::filesystem::path& scene);
     bool VerifySceneMembership(const std::filesystem::path& scene);
+    // H.4 real-device hierarchy rendering diagnostic over a schema-9 project scene.
+    bool VerifySceneHierarchyGPU(const std::filesystem::path& scene);
+    // B.1 real-device descriptor exhaustion, reclaim, cancellation and recovery diagnostic.
+    bool VerifyDescriptorRecovery(const std::filesystem::path& project);
+    // B.2 real-device Asset Browser thumbnail scheduling, invalidation and pressure diagnostic.
+    bool VerifyThumbnailScheduling(const std::filesystem::path& project);
+    bool VerifyMeshImportUnitsGPU(const std::filesystem::path& scene);
+    bool VerifyNormalMaps();
     bool VerifySceneHDRI(const std::filesystem::path& scene, const std::filesystem::path& output);
     bool VerifyBuildGame(const std::filesystem::path& scene, const std::filesystem::path& output);
     bool VerifyArchiveMaterials(const std::filesystem::path& sourceScene);
@@ -82,6 +91,17 @@ class Engine
 
     void Run();
     void Shutdown();
+    // Main-thread runtime command seam. Callers name the current session and exact
+    // fixed step; input bindings and gameplay policy are outside Engine scheduling.
+    const PhysicsSimulationController& GetPhysicsSimulation() const noexcept
+    {
+        return m_physicsSimulation;
+    }
+
+    bool SubmitCharacterMovement(std::uint64_t sessionGeneration, std::string_view objectID,
+        std::uint64_t fixedStep, Vector3 velocity, std::string& error);
+    bool SubmitCharacterJump(std::uint64_t sessionGeneration, std::string_view objectID,
+        std::uint64_t fixedStep, std::string& error);
     // Main-thread texture preparation integration.
     ProjectTexturePreparationService& GetTexturePreparationService() noexcept
     {
@@ -167,8 +187,13 @@ class Engine
     }
 
     private:
+#if defined(ENGINE_HAS_VERIFICATION)
     friend class PresentationTransformVerification;
+#endif
     PhysicsSimulationController m_physicsSimulation;
+    std::uint64_t m_packagedPhysicsRuntimeIdentity = 0;
+    bool StartPackagedPhysics(FileSceneRuntime& runtime, std::string& error);
+    bool AdvancePackagedPhysics(FileSceneRuntime& runtime, double elapsedSeconds, std::string& error);
     std::string m_physicsMessage;
     bool CanStartEditorPhysics() const;
     void RefreshEditorPhysicsStatus(bool compatibleScene);
@@ -176,8 +201,10 @@ class Engine
     bool StopEditorPhysicsSimulation(FileSceneRuntime& runtime);
     bool DrainAndResolveEditorScene(IDemoScene& scene);
     bool PhysicsBlocksSceneEdits() const noexcept;
+#if defined(ENGINE_HAS_VERIFICATION)
     friend class MaterialLocateVerification;
     friend class ViewportPanVerification;
+#endif
     struct EditorMembershipOperation
     {
         Editor::HistoryReplayRequest request;
@@ -186,6 +213,9 @@ class Engine
         std::optional<SceneObjectMetadata> deletion;
         std::optional<SceneObjectMetadata> selection;
         std::string sceneName;
+
+        // Descriptor exhaustion gets one reclaim-and-retry per operation, then cancels.
+        bool descriptorReclaimAttempted = false;
     };
     SceneMembershipPublication m_editorMembership;
     std::optional<EditorMembershipOperation> m_pendingEditorMembership;
@@ -213,7 +243,7 @@ class Engine
     EngineStartup m_startup;
     bool m_rendererAttempted = false;
     bool m_windowInitialized = false;
-#ifndef NDEBUG
+#if !defined(NDEBUG) && defined(ENGINE_HAS_VERIFICATION)
     bool VerifyCookedMeshLifecycle(const std::filesystem::path& scenePath);
 #endif
     void ProcessMeshResidencyDiagnostics();
@@ -341,6 +371,8 @@ class Engine
     std::optional<MaterialAssignmentRequest> m_pendingMaterialAssignment;
     void ProcessEditorSceneRequests(IDemoScene& activeScene);
     void ProcessEditorMaterialRequests();
+    bool ChangeMeshImportUnits(const ProjectPaths& paths, const AssetBrowser::MeshImportUnitsRequest& request,
+        const FileBackedDemoScene* activeScene, std::string& error);
     void ProcessSavedMaterialRevisions();
     void ProcessSceneTextureStreaming();
     void ProcessWorkingMaterialNotifications();
@@ -386,9 +418,14 @@ class Engine
 
     Renderer m_renderer;
 
+#if defined(ENGINE_HAS_VERIFICATION)
     friend class SceneDuplicationVerification;
     friend class SceneMembershipVerification;
+    friend class SceneHierarchyVerification;
+    friend class DescriptorRecoveryVerification;
+    friend class ThumbnailSchedulingVerification;
     friend class ViewportMaterialDropVerification;
+#endif
     struct PendingViewportMaterialBinding
     {
         Editor::MaterialBindingRequest request;

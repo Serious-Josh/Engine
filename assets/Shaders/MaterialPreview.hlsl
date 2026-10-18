@@ -507,7 +507,7 @@ GBufferOutput SpherePS(SphereOutput input)
     if(previewMaterial.normalTextureIndex != 0xFFFFFFFFu)
     {
         Texture2D<float4> texture = ResourceDescriptorHeap[previewMaterial.normalTextureIndex];
-        float2 xy = (texture.Sample(sampler0, resolvedMaterialUV).rg * 2.0f - 1.0f) * 0.5f;
+        float2 xy = texture.Sample(sampler0, resolvedMaterialUV).rg * 2.0f - 1.0f;
         float3 sampledNormal = float3(xy, sqrt(saturate(1.0f - dot(xy, xy))));
         float3 tangent = input.tangent.xyz - N * dot(N, input.tangent.xyz);
         float tangentLength = dot(tangent, tangent);

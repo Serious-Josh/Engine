@@ -20,6 +20,7 @@ class ProjectAssetRegistry
         std::vector<AssetRecord> GetAssets(AssetType type) const;
 
         bool UpdatePath(const AssetID& id, const std::filesystem::path& newRelativePath);
+        bool UpdateMeshImportUnits(const AssetID& id, const MeshImportUnits& units);
         bool Unregister(const AssetID& id);
 
         void Clear() noexcept;

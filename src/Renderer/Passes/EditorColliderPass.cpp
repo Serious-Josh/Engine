@@ -15,6 +15,7 @@ struct ColliderDrawConstants
     Matrix4 clipFromCollider;
     std::uint32_t colliderShape = 0;
     float capsuleHalfCylinderHeight = 0.0f;
+    std::uint32_t colliderRole = 0;
 };
 
 static_assert(sizeof(ColliderDrawConstants) == EditorColliderPass::ColliderConstantCount * sizeof(float));
@@ -65,7 +66,7 @@ bool HasFiniteClipCoordinates(const Matrix4& viewProjection, const ColliderDraw&
 }
 
 void DrawCollider(ID3D12GraphicsCommandList* commandList, const Matrix4& viewProjection, const ColliderDraw& collider,
-    ColliderOverlayShape shape)
+    ColliderOverlayShape shape, ColliderOverlayRole role)
 {
     // The shape constant and vertex count are chosen together here, so one shape can
     // never generate another shape's endpoints.
@@ -73,6 +74,7 @@ void DrawCollider(ID3D12GraphicsCommandList* commandList, const Matrix4& viewPro
     drawConstants.clipFromCollider = viewProjection * collider.colliderWorldTransform;
     drawConstants.colliderShape = static_cast<std::uint32_t>(shape);
     drawConstants.capsuleHalfCylinderHeight = collider.capsuleHalfCylinderHeight;
+    drawConstants.colliderRole = static_cast<std::uint32_t>(role);
 
     // Root constants are copied into the command stream per draw. No frame can
     // overwrite another frame's upload storage, and changing counts needs no retirement.
@@ -85,11 +87,11 @@ void DrawCollider(ID3D12GraphicsCommandList* commandList, const Matrix4& viewPro
 template <typename Operation>
 bool ForEachCollider(std::span<const Matrix4> boxColliderWorldTransforms,
     std::span<const Matrix4> sphereColliderWorldTransforms, std::span<const CapsuleColliderOverlay> capsuleColliders,
-    Operation operation)
+    ColliderOverlayRole role, Operation operation)
 {
     for(const Matrix4& colliderWorldTransform : boxColliderWorldTransforms)
     {
-        if(!operation(ColliderDraw{colliderWorldTransform, 0.0f}, ColliderOverlayShape::Box))
+        if(!operation(ColliderDraw{colliderWorldTransform, 0.0f}, ColliderOverlayShape::Box, role))
         {
             return false;
         }
@@ -97,7 +99,7 @@ bool ForEachCollider(std::span<const Matrix4> boxColliderWorldTransforms,
 
     for(const Matrix4& colliderWorldTransform : sphereColliderWorldTransforms)
     {
-        if(!operation(ColliderDraw{colliderWorldTransform, 0.0f}, ColliderOverlayShape::Sphere))
+        if(!operation(ColliderDraw{colliderWorldTransform, 0.0f}, ColliderOverlayShape::Sphere, role))
         {
             return false;
         }
@@ -107,7 +109,34 @@ bool ForEachCollider(std::span<const Matrix4> boxColliderWorldTransforms,
     {
         const ColliderDraw collider{capsuleCollider.colliderWorldTransform, capsuleCollider.halfCylinderHeightInRadii};
 
-        if(!operation(collider, ColliderOverlayShape::Capsule))
+        if(!operation(collider, ColliderOverlayShape::Capsule, role))
+        {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+template <typename Operation>
+bool ForEachCollider(const EditorColliderOverlay& overlay, Operation operation)
+{
+    // Preserve the established solid draw order, then draw triggers through the same pipeline.
+    const bool collidersDrawn = ForEachCollider(overlay.boxColliderWorldTransforms, overlay.sphereColliderWorldTransforms,
+        overlay.capsuleColliders, ColliderOverlayRole::Solid, operation) &&
+        ForEachCollider(overlay.triggerBoxWorldTransforms, overlay.triggerSphereWorldTransforms,
+            overlay.triggerCapsules, ColliderOverlayRole::Trigger, operation);
+
+    if(!collidersDrawn)
+    {
+        return false;
+    }
+
+    // Character Controller capsules and diagnostic markers carry their own shape and role.
+    for(const ColliderOverlayMarker& marker : overlay.characterMarkers)
+    {
+        if(!operation(ColliderDraw{marker.colliderWorldTransform, marker.halfCylinderHeightInRadii}, marker.shape,
+            marker.role))
         {
             return false;
         }
@@ -151,13 +180,10 @@ void EditorColliderPass::Shutdown()
 }
 
 void EditorColliderPass::Execute(ID3D12GraphicsCommandList* commandList, RenderTarget& viewportColor,
-    DepthBuffer& viewportDepth, const Matrix4& viewProjection, std::span<const Matrix4> boxColliderWorldTransforms,
-    std::span<const Matrix4> sphereColliderWorldTransforms,
-    std::span<const CapsuleColliderOverlay> capsuleColliders) const
+    DepthBuffer& viewportDepth, const Matrix4& viewProjection, const EditorColliderOverlay& overlay) const
 {
     // All shapes share one capacity bound; an empty batch records no GPU work.
-    const std::size_t colliderCount =
-        boxColliderWorldTransforms.size() + sphereColliderWorldTransforms.size() + capsuleColliders.size();
+    const std::size_t colliderCount = overlay.GetColliderCount();
 
     if(colliderCount == 0 || colliderCount > EditorColliderOverlay::MaxColliders)
     {
@@ -179,8 +205,8 @@ void EditorColliderPass::Execute(ID3D12GraphicsCommandList* commandList, RenderT
 
     // Validate the whole batch, every shape, before changing state or recording any
     // partial visualization.
-    const bool finiteBatch = ForEachCollider(boxColliderWorldTransforms, sphereColliderWorldTransforms, capsuleColliders,
-        [&](const ColliderDraw& collider, ColliderOverlayShape shape)
+    const bool finiteBatch = ForEachCollider(overlay,
+        [&](const ColliderDraw& collider, ColliderOverlayShape shape, ColliderOverlayRole)
         {
             return HasFiniteClipCoordinates(viewProjection, collider, shape);
         });
@@ -199,10 +225,10 @@ void EditorColliderPass::Execute(ID3D12GraphicsCommandList* commandList, RenderT
     m_pipeline.Bind(commandList);
     commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_LINELIST);
 
-    ForEachCollider(boxColliderWorldTransforms, sphereColliderWorldTransforms, capsuleColliders,
-        [&](const ColliderDraw& collider, ColliderOverlayShape shape)
+    ForEachCollider(overlay,
+        [&](const ColliderDraw& collider, ColliderOverlayShape shape, ColliderOverlayRole role)
         {
-            DrawCollider(commandList, viewProjection, collider, shape);
+            DrawCollider(commandList, viewProjection, collider, shape, role);
             return true;
         });
 

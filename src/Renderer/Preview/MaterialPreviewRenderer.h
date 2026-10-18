@@ -104,6 +104,12 @@ class MaterialPreviewRenderer
         MeshThumbnailPreparation::Identity identity;
     };
     std::optional<MeshThumbnailImage> GetMeshThumbnailImage(const DescriptorHeap& heap, std::uint64_t ticket);
+
+    // Descriptor-pressure reclaim hook. Releases the image SRV/RTV of mesh thumbnail jobs that
+    // are idle under the same rule as capacity eviction: not recorded, not awaiting display
+    // submission, both fences retired and no geometry in flight. Requesters re-request later.
+    // Main thread, outside preview recording. Returns the number of jobs released.
+    size_t ReleaseIdleMeshThumbnailImages();
     std::string GetMeshThumbnailError(std::uint64_t ticket) const;
     // Calling this marks a current-frame display use; the descriptor remains Renderer-owned.
     std::optional<MaterialPreviewImage> GetThumbnailImage(const DescriptorHeap& heap);

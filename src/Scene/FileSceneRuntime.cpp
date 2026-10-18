@@ -18,6 +18,7 @@
 namespace
 {
     std::atomic<std::uint64_t> nextRuntimeIdentity{1};
+    static_assert(std::is_nothrow_move_assignable_v<SceneHierarchy::State>);
 }
 
 FileSceneRuntime::FileSceneRuntime()
@@ -59,14 +60,14 @@ bool FileSceneRuntime::ReorderObjects(const SceneObjectOrderIdentity& identity,
         return false;
     };
 
-    if(HasPreparedScene() || m_materialAssignment)
+    if(HasPreparedScene() || m_materialAssignment || m_scene.HasPhysicsPresentation())
     {
         return fail("Reordering is blocked by pending scene preparation or material assignment.");
     }
 
     SceneHierarchySnapshot snapshot;
 
-    if(!BuildHierarchySnapshot(snapshot, errorMessage))
+    if(!ValidateHierarchyAssociation(errorMessage) || !BuildHierarchySnapshot(snapshot, errorMessage))
     {
         return false;
     }
@@ -118,8 +119,25 @@ bool FileSceneRuntime::ReorderObjects(const SceneObjectOrderIdentity& identity,
         return true;
     }
 
-    // Only document order changes. Runtime objects, mappings, and revision stay intact.
+    auto hierarchy = m_hierarchy;
+    SceneHierarchyTopology topology;
+
+    if(!hierarchy.Update(reordered, errorMessage) ||
+        !BuildHierarchyTopology(hierarchy, reordered, topology, errorMessage))
+    {
+        return false;
+    }
+
+    // Sibling order changes the evaluation order and revision, never the edges or slots. The
+    // install is the last fallible step; worlds are unchanged, so no history is touched.
+    if(!m_scene.InstallHierarchy(std::move(topology), false, errorMessage))
+    {
+        return false;
+    }
+
+    // Hierarchy revision changes; runtime slots and Scene structure revision do not.
     m_fileScene.EditDocument().objects.swap(reordered);
+    m_hierarchy = std::move(hierarchy);
     return true;
 }
 
@@ -129,24 +147,59 @@ bool FileSceneRuntime::SetObjectPhysics(const SceneObjectMetadata& selection,
 {
     const auto fail = [&](const char* message)
     {
-        if(errorMessage) *errorMessage = message;
+        if(errorMessage)
+        {
+            *errorMessage = message;
+        }
+
         return false;
     };
-    if(errorMessage) errorMessage->clear();
+
+    if(errorMessage)
+    {
+        errorMessage->clear();
+    }
+
     if(m_archiveScene || HasPreparedScene() || m_materialAssignment || m_activePresentationAssociation)
+    {
         return fail("Physics authoring requires an idle editable scene.");
-    if(replacement && !Physics::ValidatePhysicsComponent(*replacement, errorMessage)) return false;
+    }
+
     const auto current = GetObjectMetadata(selection.objectID, errorMessage);
-    if(!current) return false;
+
+    if(!current)
+    {
+        return false;
+    }
+
     if(current->sceneID != selection.sceneID || current->runtimeIdentity != selection.runtimeIdentity ||
         current->structureRevision != selection.structureRevision || current->runtimeIndex != selection.runtimeIndex)
+    {
         return fail("Physics target belongs to a stale scene selection.");
+    }
+
     const auto& objects = m_fileScene.GetDocument().objects;
     const auto found = std::find_if(objects.begin(), objects.end(),
         [&](const SceneObjectDocument& object) { return object.id == selection.objectID; });
+
     if(found == objects.end() || found->physics != expected)
+    {
         return fail("Physics component changed since inspection; edit rejected.");
-    if(expected == replacement) return true;
+    }
+
+    SceneObjectDocument candidate = *found;
+    candidate.physics = replacement;
+
+    if(!ValidateSceneObjectComponents(candidate, errorMessage))
+    {
+        return false;
+    }
+
+    if(expected == replacement)
+    {
+        return true;
+    }
+
     const size_t index = static_cast<size_t>(found - objects.begin());
     // Validation precedes the dirty-marking commit. No runtime or presentation fields are touched.
     m_fileScene.EditDocument().objects[index].physics = replacement;
@@ -282,7 +335,7 @@ bool FileSceneRuntime::BuildHierarchySnapshot(
         }
 
         visited[index] = true;
-        candidate.entries.push_back({object.id, object.name, index});
+        candidate.entries.push_back({object.id, object.name, index, object.parentID});
     }
 
     snapshot = std::move(candidate);
@@ -973,15 +1026,33 @@ bool FileSceneRuntime::Commit(std::string* errorMessage)
         return false;
     }
 
-    if (!CommitPreparedScene(
-            *m_preparedScene,
-            m_scene,
-            m_objectMapping,
-            errorMessage))
+    // The validated forest becomes the committed topology in the same replacement.
+    auto hierarchy = m_hierarchy;
+    SceneHierarchyTopology topology;
+    std::vector<std::string_view> slotIDs;
+    slotIDs.reserve(m_preparedScene->objects.size());
+
+    for(const auto& object : m_preparedScene->objects)
+    {
+        slotIDs.push_back(object.id);
+    }
+
+    if(!PrepareCommitHierarchy(hierarchy, m_fileScene.GetDocument().objects, slotIDs, topology, errorMessage))
     {
         return false;
     }
 
+    if (!CommitPreparedScene(
+            *m_preparedScene,
+            m_scene,
+            m_objectMapping,
+            errorMessage,
+            std::move(topology)))
+    {
+        return false;
+    }
+
+    m_hierarchy = std::move(hierarchy);
     DiscardPreparedScene();
     return true;
 }
@@ -991,7 +1062,11 @@ bool FileSceneRuntime::LoadArchive(std::shared_ptr<const CookedScene::ArchiveSce
     if(m_objectMapping.scene || m_materialAssignment || !source || !source->ValidateReferences(error))
         return AssignmentError(error,"Archive load requires an inactive runtime and a validated source.");
     if(!m_fileScene.LoadDocument(source->metadata.document,error)) return false;
-    DiscardPreparedScene(); m_objectMapping = {}; m_archiveScene = std::move(source); return true;
+    DiscardPreparedScene();
+    m_objectMapping = {};
+    m_hierarchy.Reset();
+    m_archiveScene = std::move(source);
+    return true;
 }
 
 bool FileSceneRuntime::PrepareMetadata(FileSceneAssetCatalog& catalog, std::string* error)
@@ -1044,11 +1119,28 @@ bool FileSceneRuntime::CommitMetadata(FileSceneAssetCatalog& catalog, std::strin
         }
     }
 
-    if(!CommitPreparedMetadataScene(verified, m_scene, m_objectMapping, error))
+    // Archive and loose metadata commits install the same validated forest atomically.
+    auto hierarchy = m_hierarchy;
+    SceneHierarchyTopology topology;
+    std::vector<std::string_view> slotIDs;
+    slotIDs.reserve(verified.objects.size());
+
+    for(const auto& object : verified.objects)
+    {
+        slotIDs.push_back(object.id);
+    }
+
+    if(!PrepareCommitHierarchy(hierarchy, verified.document.objects, slotIDs, topology, error))
     {
         return false;
     }
 
+    if(!CommitPreparedMetadataScene(verified, m_scene, m_objectMapping, error, std::move(topology)))
+    {
+        return false;
+    }
+
+    m_hierarchy = std::move(hierarchy);
     DiscardPreparedScene();
     return true;
 }
@@ -1071,6 +1163,7 @@ bool FileSceneRuntime::New(
 
     DiscardPreparedScene();
     m_objectMapping = {};
+    m_hierarchy.Reset();
     if (m_scene.HasPhysicsPresentation()) m_scene.CommitPresentation({}, false);
     m_activePresentationAssociation.reset();
     return true;
@@ -1093,6 +1186,7 @@ bool FileSceneRuntime::Open(
 
     DiscardPreparedScene();
     m_objectMapping = {};
+    m_hierarchy.Reset();
     if (m_scene.HasPhysicsPresentation()) m_scene.CommitPresentation({}, false);
     m_activePresentationAssociation.reset();
     return true;
@@ -1118,6 +1212,12 @@ bool FileSceneRuntime::SaveAs(
     if(m_materialAssignment)
     {
         return AssignmentError(errorMessage, "Finish/cancel/rollback the material assignment before scene lifecycle operations.");
+    }
+
+    // A raw EditDocument parent change must not reach disk as if it were the presented graph.
+    if(!ValidateHierarchyAssociation(errorMessage))
+    {
+        return false;
     }
 
     SceneDocument candidate;
@@ -1221,6 +1321,10 @@ std::unique_ptr<FileSceneRuntime> FileSceneRuntime::PrepareObjectCreation(
     // discard assigned material versions or live working parameter changes.
     SceneDocument addition = document;
     addition.objects = {added};
+
+    // Asset resolution sees this object alone, so its parent edge would dangle here. The full
+    // document, edge included, was validated above and is validated again at commit.
+    addition.objects.front().parentID.clear();
     std::vector<ResolvedSceneObject> resolved;
 
     if (auto* catalog = dynamic_cast<FileSceneAssetCatalog*>(&resolver))
@@ -1263,8 +1367,26 @@ std::unique_ptr<FileSceneRuntime> FileSceneRuntime::PrepareObjectCreation(
         return nullptr;
     }
 
+    // Continue this runtime's revision sequence so the adopted candidate reports the changed
+    // membership, and install its forest in the same replacement as its new slots.
+    candidate->m_hierarchy = m_hierarchy;
+    SceneHierarchyTopology topology;
+    std::vector<std::string_view> slotIDs;
+    slotIDs.reserve(prepared.objects.size());
+
+    for(const auto& object : prepared.objects)
+    {
+        slotIDs.push_back(object.id);
+    }
+
+    if(!PrepareCommitHierarchy(candidate->m_hierarchy, candidate->m_fileScene.GetDocument().objects, slotIDs,
+        topology, errorMessage))
+    {
+        return nullptr;
+    }
+
     if(!CommitPreparedEditorScene(prepared, candidate->m_fileScene.GetDocument(),
-        candidate->m_scene, candidate->m_objectMapping, errorMessage))
+        candidate->m_scene, candidate->m_objectMapping, errorMessage, std::move(topology)))
     {
         return nullptr;
     }
@@ -1342,8 +1464,26 @@ std::unique_ptr<FileSceneRuntime> FileSceneRuntime::PrepareObjectDeletion(
         return nullptr;
     }
 
+    // Continue this runtime's revision sequence so the adopted candidate reports the changed
+    // membership, and install its forest in the same replacement as its new slots.
+    candidate->m_hierarchy = m_hierarchy;
+    SceneHierarchyTopology topology;
+    std::vector<std::string_view> slotIDs;
+    slotIDs.reserve(prepared.objects.size());
+
+    for(const auto& object : prepared.objects)
+    {
+        slotIDs.push_back(object.id);
+    }
+
+    if(!PrepareCommitHierarchy(candidate->m_hierarchy, candidate->m_fileScene.GetDocument().objects, slotIDs,
+        topology, errorMessage))
+    {
+        return nullptr;
+    }
+
     if(!CommitPreparedEditorScene(prepared, candidate->m_fileScene.GetDocument(),
-        candidate->m_scene, candidate->m_objectMapping, errorMessage))
+        candidate->m_scene, candidate->m_objectMapping, errorMessage, std::move(topology)))
     {
         return nullptr;
     }
@@ -1396,6 +1536,10 @@ std::unique_ptr<FileSceneRuntime> FileSceneRuntime::PrepareObjectRestoration(Sce
     // catalog borrows, including previously assigned material versions and overrides.
     SceneDocument addition = document;
     addition.objects = {restored};
+
+    // Asset resolution sees this object alone, so its parent edge would dangle here. The full
+    // document, edge included, was validated above and is validated again at commit.
+    addition.objects.front().parentID.clear();
     std::vector<ResolvedSceneObject> resolved;
 
     if (auto* catalog = dynamic_cast<FileSceneAssetCatalog*>(&resolver))
@@ -1443,8 +1587,26 @@ std::unique_ptr<FileSceneRuntime> FileSceneRuntime::PrepareObjectRestoration(Sce
         return nullptr;
     }
 
+    // Continue this runtime's revision sequence so the adopted candidate reports the changed
+    // membership, and install its forest in the same replacement as its new slots.
+    candidate->m_hierarchy = m_hierarchy;
+    SceneHierarchyTopology topology;
+    std::vector<std::string_view> slotIDs;
+    slotIDs.reserve(prepared.objects.size());
+
+    for(const auto& object : prepared.objects)
+    {
+        slotIDs.push_back(object.id);
+    }
+
+    if(!PrepareCommitHierarchy(candidate->m_hierarchy, candidate->m_fileScene.GetDocument().objects, slotIDs,
+        topology, errorMessage))
+    {
+        return nullptr;
+    }
+
     if(!CommitPreparedEditorScene(prepared, candidate->m_fileScene.GetDocument(),
-        candidate->m_scene, candidate->m_objectMapping, errorMessage))
+        candidate->m_scene, candidate->m_objectMapping, errorMessage, std::move(topology)))
     {
         return nullptr;
     }

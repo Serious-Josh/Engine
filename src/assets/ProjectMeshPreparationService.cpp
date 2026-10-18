@@ -512,7 +512,8 @@ struct ProjectMeshPreparationService::State
                         lease->reservation = job->reservation;
                         // ModelImporter uses a separate Assimp::Importer per call;
                         // it installs no global logger, IO handler, or shared scene.
-                        lease->imported = ModelImporter::LoadFlattened(job->identity.path, job->identity.uvPolicy, limits.geometryBytes);
+                        lease->imported = ModelImporter::LoadFlattened(job->identity.path, job->identity.uvPolicy,
+                            limits.geometryBytes, job->identity.units);
 
                         if (ProjectMeshCPUCache::GeometryBytes(lease->imported) > limits.geometryBytes)
                         {
@@ -594,7 +595,7 @@ ProjectMeshCPUCache::Key ProjectMeshPreparationService::Identity::CacheKey() con
             cooked->payload.cookCompatibility, MeshUVOrientation::PreserveSource, MeshPreparationSourceKind::Cooked};
     }
 
-    return {project, assetID, digest, importerRevision, uvPolicy};
+    return {project, assetID, digest, importerRevision, uvPolicy, MeshPreparationSourceKind::FBX, units};
 }
 
 ProjectMeshPreparationService::ProjectMeshPreparationService() : m_state(std::make_unique<State>()) {}
@@ -754,6 +755,7 @@ ProjectMeshPreparationService::RequestResult ProjectMeshPreparationService::Requ
         identity.path = std::filesystem::canonical(resolved.resolvedPath);
         identity.assetID = asset.ToString();
         identity.sourceIdentity = source.Identity(state.limits.sourceBytes);
+        identity.units = record->meshImportUnits;
 
         return state.Submit(std::move(identity), generation);
     }
@@ -1012,6 +1014,7 @@ ProjectMeshPreparationService::Completion ProjectMeshPreparationService::Poll(st
         const auto resolved = asset ? ProjectAssetResolver::Resolve(paths, registry, *asset) : AssetResolution{};
 
         if (!IsCurrent(result) || !record || record->type != AssetType::Mesh ||
+            record->meshImportUnits != result.identity.units ||
             std::filesystem::canonical(paths.GetRoot()) != result.identity.project ||
             resolved.status != AssetAvailability::Available || resolved.resolvedPath != result.identity.path)
         {

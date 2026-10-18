@@ -8,7 +8,7 @@
 #include <exception>
 
 // Verification diagnostics live in Git-ignored tests folders. CMake defines
-// ENGINE_HAS_VERIFICATION only when they are present; Debug builds alone still
+// ENGINE_HAS_VERIFICATION only with explicit diagnostics opt-in; Debug builds alone still
 // do not imply that the --verify-* entry points exist.
 #if !defined(NDEBUG) && defined(ENGINE_HAS_VERIFICATION)
 #define ENGINE_VERIFICATION_ENABLED 1
@@ -21,6 +21,9 @@ int CookProjectMeshes(const std::filesystem::path& projectRoot);
 #endif
 
 #if ENGINE_VERIFICATION_ENABLED
+int VerifySceneHierarchy();
+int VerifyMeshImportUnits(const std::filesystem::path& root);
+int VerifyPortableEditor(const std::filesystem::path& output);
 int VerifyCookedMesh();
 int VerifyScenePhysicsData();
 int VerifyPrimitiveCreation();
@@ -30,6 +33,8 @@ int VerifyScenePhysicsPersistence();
 int VerifyPresentationTransforms();
 int VerifyPhysicsSimulationController();
 int VerifyEditorPhysicsIntegration();
+int VerifyPackagedPhysicsScheduling();
+int VerifyPackagedPhysicsStartupFailure(const std::filesystem::path& game);
 int VerifyDevelopmentCookedMeshProvider(const std::filesystem::path& projectRoot);
 int VerifyCookedMeshPreparation(const std::filesystem::path& projectRoot);
 #endif
@@ -37,6 +42,74 @@ int VerifyCookedMeshPreparation(const std::filesystem::path& projectRoot);
 int main(int argc, char** argv)
 {
 #if ENGINE_VERIFICATION_ENABLED
+    if(argc == 2 && std::string_view(argv[1]) == "--verify-normal-maps")
+    {
+        auto engine = std::make_unique<Engine>();
+        bool success = false;
+
+        try
+        {
+            success = engine->Initialize() && engine->VerifyNormalMaps();
+        }
+        catch(const std::exception& error)
+        {
+            Log::Error(std::string("B.4 normal diagnostic: ") + error.what());
+        }
+
+        engine->Shutdown();
+        return success ? 0 : 1;
+    }
+
+    if(argc == 3 && std::string_view(argv[1]) == "--verify-mesh-import-units")
+    {
+        return VerifyMeshImportUnits(std::filesystem::absolute(argv[2]));
+    }
+
+    if(argc == 3 && std::string_view(argv[1]) == "--verify-mesh-import-units-gpu")
+    {
+        auto engine = std::make_unique<Engine>();
+        bool success = false;
+
+        try
+        {
+            success = engine->Initialize() && engine->VerifyMeshImportUnitsGPU(argv[2]);
+        }
+        catch(const std::exception& error)
+        {
+            Log::Error(std::string("B.3 GPU diagnostic: ") + error.what());
+        }
+
+        engine->Shutdown();
+        return success ? 0 : 1;
+    }
+
+    if(argc == 2 && std::string_view(argv[1]) == "--verify-scene-hierarchy")
+    {
+        return VerifySceneHierarchy();
+    }
+
+    if(argc == 3 && std::string_view(argv[1]) == "--verify-portable-editor")
+    {
+        return VerifyPortableEditor(std::filesystem::absolute(argv[2]));
+    }
+#endif
+#if !ENGINE_VERIFICATION_ENABLED
+    if(argc >= 2 && (std::string_view(argv[1]).starts_with("--verify-") ||
+        std::string_view(argv[1]) == "--activate-scene-archive"))
+    {
+        Log::Error("Verification requires a Debug build with ENGINE_BUILD_DIAGNOSTICS=ON and local test sources.");
+        return 1;
+    }
+#endif
+#if ENGINE_VERIFICATION_ENABLED
+    if(argc == 3 && std::string_view(argv[1]) == "--verify-packaged-physics-startup-failure")
+    {
+        return VerifyPackagedPhysicsStartupFailure(std::filesystem::absolute(argv[2]));
+    }
+    if(argc == 2 && std::string_view(argv[1]) == "--verify-packaged-physics")
+    {
+        return VerifyPackagedPhysicsScheduling();
+    }
     if (argc == 2 && std::string_view(argv[1]) == "--verify-viewport-marquee")
     {
         return VerifyViewportMarquee();
@@ -88,7 +161,19 @@ int main(int argc, char** argv)
         try
         {
             success=engine.Initialize(startup);
-            if(success) { if(std::string_view(argv[1])=="--verify-packaged-bootstrap") engine.VerifyPackagedBootstrap(); else engine.Run(); }
+            if(success)
+            {
+#if ENGINE_VERIFICATION_ENABLED
+                if(std::string_view(argv[1]) == "--verify-packaged-bootstrap")
+                {
+                    engine.VerifyPackagedBootstrap();
+                }
+                else
+#endif
+                {
+                    engine.Run();
+                }
+            }
         }
         catch(const std::exception& e) { Log::Error(std::string("Packaged bootstrap: ")+e.what()); success=false; }
         engine.Shutdown(); return success ? 0 : 1;
@@ -131,6 +216,78 @@ int main(int argc, char** argv)
         try { success=engine->Initialize(); if(success) success=engine->VerifySceneMembership(argv[2]); }
         catch(const std::exception& e) { Log::Error(std::string("Membership diagnostic: ")+e.what()); success=false; }
         engine->Shutdown(); return success ? 0 : 1;
+    }
+    if(argc >= 2 && std::string_view(argv[1]) == "--verify-thumbnail-scheduling")
+    {
+        if(argc != 3)
+        {
+            Log::Error("Usage: --verify-thumbnail-scheduling <isolated-fixture-project>");
+            return 1;
+        }
+
+        auto engine = std::make_unique<Engine>();
+        bool success = false;
+
+        try
+        {
+            success = engine->Initialize() && engine->VerifyThumbnailScheduling(argv[2]);
+        }
+        catch(const std::exception& exception)
+        {
+            Log::Error(std::string("Thumbnail scheduling diagnostic: ") + exception.what());
+            success = false;
+        }
+
+        engine->Shutdown();
+        return success ? 0 : 1;
+    }
+    if(argc >= 2 && std::string_view(argv[1]) == "--verify-descriptor-recovery")
+    {
+        if(argc != 3)
+        {
+            Log::Error("Usage: --verify-descriptor-recovery <isolated-fixture-project>");
+            return 1;
+        }
+
+        auto engine = std::make_unique<Engine>();
+        bool success = false;
+
+        try
+        {
+            success = engine->Initialize() && engine->VerifyDescriptorRecovery(argv[2]);
+        }
+        catch(const std::exception& exception)
+        {
+            Log::Error(std::string("Descriptor recovery diagnostic: ") + exception.what());
+            success = false;
+        }
+
+        engine->Shutdown();
+        return success ? 0 : 1;
+    }
+    if(argc >= 2 && std::string_view(argv[1]) == "--verify-scene-hierarchy-gpu")
+    {
+        if(argc != 3)
+        {
+            Log::Error("Usage: --verify-scene-hierarchy-gpu <schema-9-project-scene>");
+            return 1;
+        }
+
+        auto engine = std::make_unique<Engine>();
+        bool success = false;
+
+        try
+        {
+            success = engine->Initialize() && engine->VerifySceneHierarchyGPU(argv[2]);
+        }
+        catch(const std::exception& exception)
+        {
+            Log::Error(std::string("Scene hierarchy GPU diagnostic: ") + exception.what());
+            success = false;
+        }
+
+        engine->Shutdown();
+        return success ? 0 : 1;
     }
     if(argc>=2 && std::string_view(argv[1])=="--verify-build-game")
     {
@@ -187,17 +344,6 @@ int main(int argc, char** argv)
     if(argc == 2 && std::string_view(argv[1]) == "--verify-cooked-mesh")
     {
         return VerifyCookedMesh();
-    }
-#else
-    // Without the local verification sources, never let a diagnostic flag fall
-    // through and launch the interactive editor instead.
-    const bool diagnosticRequested = argc >= 2 &&
-        (std::string_view(argv[1]).starts_with("--verify-") || activateArchive);
-
-    if(diagnosticRequested)
-    {
-        Log::Error("Verification diagnostics require a Debug build with the local test sources present.");
-        return 1;
     }
 #endif
 

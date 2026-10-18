@@ -65,7 +65,8 @@ public:
     void DrawSceneObject(const EditorWorkspaceRect& rectangle, const SceneObjectInspectorView& object,
         const std::function<void()>& drawTransformControls,
         const ProjectPaths& paths, const ProjectAssetRegistry& registry,
-        bool assignmentPending, const std::string& assignmentStatus);
+        bool assignmentPending, const std::string& assignmentStatus,
+        const std::function<void()>& drawComponentControls = {});
     struct SlotAssignmentRequest
     {
         SceneObjectMetadata selection;
@@ -109,7 +110,9 @@ public:
         const ProjectAssetRegistry& registry);
 
 private:
+#if defined(ENGINE_HAS_VERIFICATION)
     friend class MaterialLocateVerification;
+#endif
     void HandleMaterialLocateItem(std::string_view reference);
     std::optional<std::string> m_materialLocateRequest;
     std::string m_materialLocateStatus;

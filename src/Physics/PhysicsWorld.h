@@ -2,6 +2,7 @@
 
 #include "Math/Vector3.h"
 #include "Physics/PhysicsComponent.h"
+#include "Physics/TriggerColliderComponent.h"
 
 #include <cstdint>
 #include <memory>
@@ -112,6 +113,63 @@ struct ContactTouchEvent
 
 struct WorldState;
 
+// Internal, copied native observations with never-reused World shape keys, not native IDs.
+// Sensor-to-sensor observations are normalized to both directions before aggregation.
+struct SensorTouchEvent
+{
+    bool began = false;
+    std::uint64_t sensorShapeKey = 0;
+    std::uint64_t visitorShapeKey = 0;
+};
+
+// Capsule for Engine-owned geometric movers. Hemisphere centers are relative to the
+// query origin; all lengths are unscaled meters. Movers are never native bodies.
+struct MoverCapsule
+{
+    Vector3 lowerCenter;
+    Vector3 upperCenter;
+    float radius = 0.0f;
+};
+
+// One solid constraint copied from a mover collide query, relative to the query origin.
+// A positive offset is penetration depth along the outward normal. shapeKey is the
+// World's never-reused key (0 if the shape was never registered by this World).
+struct MoverPlane
+{
+    std::uint64_t shapeKey = 0;
+    Vector3 normal;
+    float offset = 0.0f;
+    Vector3 point;
+};
+
+struct MoverPlaneQuery
+{
+    std::vector<MoverPlane> planes;
+    // Planes beyond the requested capacity; callers must treat nonzero as a failed query.
+    std::size_t overflowCount = 0;
+};
+
+// Owns only the attached sensor shape; never prolongs its body or world's lifetime.
+class Sensor
+{
+public:
+    Sensor();
+    ~Sensor();
+    Sensor(Sensor&&) noexcept;
+    Sensor& operator=(Sensor&&) noexcept;
+    Sensor(const Sensor&) = delete;
+    Sensor& operator=(const Sensor&) = delete;
+    bool IsValid() const;
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> m_impl;
+    explicit Sensor(std::unique_ptr<Impl> implementation);
+    std::uint64_t GetShapeKey() const;
+    friend class World;
+    friend class ScenePhysicsSession;
+};
+
 // Owns a body while its world exists. World destruction invalidates the wrapper.
 class Body
 {
@@ -129,12 +187,15 @@ public:
     bool IsAwake() const;
     bool HasContact() const;
     BodyType GetType() const;
-    // Each shape query throws logic_error when the body holds a different collider type.
+    // Each shape query throws logic_error for a different collider type or shape-free host.
     BoxProperties GetBoxProperties() const;
     SphereProperties GetSphereProperties() const;
     CapsuleProperties GetCapsuleProperties() const;
     float GetMass() const;
     Vector3 GetWorldCenterOfMass() const;
+    // Teleports a Kinematic body (zero velocity is preserved). Intended for shape-free
+    // controller hosts between steps; throws for other body types or invalid poses.
+    void SetKinematicPose(const Pose& pose);
 
 private:
     struct Impl;
@@ -145,6 +206,7 @@ private:
 
     // The World-assigned contact key (see ContactTouchEvent). Throws for an invalid body.
     std::uint64_t GetContactKey() const;
+    std::uint64_t GetShapeKey() const;
 
     friend class World;
     friend class ScenePhysicsSession;
@@ -166,6 +228,10 @@ public:
     Body CreateBox(const BoxDefinition& definition);
     Body CreateSphere(const SphereDefinition& definition);
     Body CreateCapsule(const CapsuleDefinition& definition);
+    // Shape-free host. It is not a registered solid/contact participant. Static hosts carry
+    // authored triggers of non-controller objects; Kinematic hosts follow a controller.
+    Body CreateSensorBody(const Pose& pose, BodyType bodyType = BodyType::Static);
+    Sensor AttachSensor(Body& body, const TriggerColliderComponent& component);
     void SetGravity(Vector3 gravity);
 
     // Exactly one fixed tick; caller owns scheduling. No accumulator or time loss.
@@ -176,6 +242,20 @@ public:
     // Events naming a shape this World never registered (or has since destroyed) are
     // dropped rather than guessed.
     std::vector<ContactTouchEvent> CollectContactTouchEvents() const;
+    std::vector<SensorTouchEvent> CollectSensorTouchEvents() const;
+    bool IsShapeKeyValid(std::uint64_t shapeKey) const;
+
+    // Solid-only mover queries. Every native sensor shape is excluded; all Static,
+    // Kinematic and Dynamic solid shapes are obstacles at their current transforms.
+    // Exact overlap count; firstShapeKey (optional) receives the lowest overlapping key.
+    std::size_t CountSolidOverlaps(Vector3 origin, const MoverCapsule& capsule,
+        std::uint64_t* firstShapeKey = nullptr) const;
+    // Sorted, deduplicated World shape keys of every overlapping solid shape.
+    std::vector<std::uint64_t> CollectSolidOverlapKeys(Vector3 origin, const MoverCapsule& capsule) const;
+    // Planes sorted by shape key, then normal and offset, independent of native traversal.
+    MoverPlaneQuery CollideSolidMover(Vector3 origin, const MoverCapsule& capsule, std::size_t capacity) const;
+    // Fraction in [0, 1] of translation that is free. Initial overlap is not reported.
+    float CastSolidMover(Vector3 origin, const MoverCapsule& capsule, Vector3 translation) const;
 
 private:
     // Creates the body only; the caller attaches its single shape. RAII releases the

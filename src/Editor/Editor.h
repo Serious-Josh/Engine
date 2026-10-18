@@ -1,7 +1,10 @@
 #pragma once
+#include "Scene/SceneHierarchyEdits.h"
 
 #include "Scene/Transform.h"
 #include "Engine/BuildGame.h"
+#include "Engine/CharacterDriveScheduling.h"
+#include "Physics/CharacterControllerDiagnostics.h"
 #include "SceneSelection.h"
 #include "ViewportMarquee.h"
 #include "AssetBrowser.h"
@@ -121,6 +124,12 @@ public:
     std::optional<PhysicsRequest> TakePhysicsRequest();
     bool CanStartPhysics() const;
     bool ArePhysicsCollidersVisible() const noexcept { return m_showPhysicsColliders; }
+    // CM.9 diagnostics. Engine supplies the published controller diagnostics after each
+    // physics frame (null when no session is active), and takes the diagnostic drive intent
+    // immediately before the next Update; it acknowledges a jump once it is submitted.
+    void SetCharacterDiagnostics(const Physics::CharacterDiagnosticsFrame* frame);
+    std::optional<CharacterDriveIntent> TakeCharacterDriveIntent() const;
+    void AcknowledgeCharacterDriveJump();
     bool IsPhysicsEditingLocked() const noexcept { return m_physicsState != PhysicsState::Stopped; }
     void OnSceneActivated();
     // Interaction cleanup alone does not change the history session or cursor.
@@ -226,9 +235,15 @@ public:
         std::optional<std::string> bindingSourceID;
         bool membership = false;
         bool remove = false;
+        std::optional<SceneHierarchyEdit> hierarchy;
     };
     std::optional<HistoryReplayRequest> TakeSceneDuplicationRequest();
     void HandleSceneObjectDuplication(IDemoScene&);
+    bool QueueSceneObjectDuplication(IDemoScene& scene, const SceneObjectMetadata& target, std::string& error);
+    bool PrepareHierarchyDrop(IDemoScene& scene, const HierarchyDropRequest& request,
+        SceneHierarchyEdit& edit, std::string& error);
+    bool SubmitHierarchyDrop(IDemoScene& scene, const HierarchyDropRequest& request, std::string& error);
+    bool QueueHierarchyEmpty(IDemoScene& scene, std::string_view parentID, std::string& error);
     void ProcessMaterialLocateRequest(const ProjectPaths&,const ProjectAssetRegistry&);
     std::uint64_t AllocateSceneHistoryOperationID() noexcept { return ++m_historyOperationSerial; }
     bool HasPendingSceneHistoryOperation() const noexcept;
@@ -238,6 +253,16 @@ public:
     bool StageObjectDeletionHistory(SceneObjectDocument object, size_t documentIndex,
         std::optional<std::string> selectionBefore, std::optional<std::string> selectionAfter,
         std::uint64_t operationID, std::uint64_t epoch, bool replay, std::string& error, bool insertion = false);
+    bool StageHierarchyHistory(const SceneHierarchyEdit& edit,
+        std::optional<std::string> selectionBefore, std::optional<std::string> selectionAfter,
+        std::uint64_t operationID, std::string& error);
+    // H.5 backend seam; tree UI delivery belongs to H.6.
+    bool QueueHierarchyReparent(IDemoScene& scene, std::string_view objectID, std::string_view parentID,
+        bool keepWorld, std::string_view beforeSibling, std::string& error);
+    bool QueueHierarchyCreation(IDemoScene& scene, SceneObjectDocument object, std::string_view parentID,
+        std::string& error);
+    bool QueueHierarchyEdit(IDemoScene& scene, SceneHierarchyEdit edit,
+        std::optional<std::string> selectionAfter, std::string& error);
     void CompleteObjectDeletionHistory(std::uint64_t operationID, std::uint64_t epoch,
         bool succeeded, const std::string& error);
     void CompleteSceneHistoryReplay(const HistoryReplayIdentity& identity, bool succeeded, const std::string& error);
@@ -262,6 +287,15 @@ public:
     std::optional<FileRequest> TakeFileRequest();
     bool HasFileRequest(FileRequestType type) const noexcept;
     std::optional<AssetBrowser::MaterialCreationRequest> TakeMaterialCreationRequest();
+    std::optional<AssetBrowser::MeshImportUnitsRequest> TakeMeshImportUnitsRequest()
+    {
+        return m_assetBrowser.TakeMeshImportUnitsRequest();
+    }
+
+    void OnMeshImportUnitsCompleted(const std::string& error)
+    {
+        m_assetBrowser.OnMeshImportUnitsCompleted(error);
+    }
     void OnMaterialCreationCompleted(
         const std::filesystem::path& relativePath,
         const std::string& error);
@@ -299,12 +333,16 @@ public:
     }
 
 private:
+#if defined(ENGINE_HAS_VERIFICATION)
+    friend class PortableEditorVerification;
     friend class PresentationTransformVerification;
+#endif
     PhysicsState m_physicsState = PhysicsState::Stopped;
     bool m_canPlayPhysics = false;
     std::string m_physicsMessage;
     std::optional<PhysicsRequest> m_physicsRequest;
     void DrawPhysicsControls();
+#if defined(ENGINE_HAS_VERIFICATION)
     friend class MaterialLocateVerification;
     friend class ViewportPanVerification;
     friend class SceneDuplicationVerification;
@@ -312,6 +350,9 @@ private:
     friend class PrimitiveCreationVerification;
     friend class MarqueeSelectionVerification;
     friend class ViewportMaterialDropVerification;
+    friend class DescriptorRecoveryVerification;
+    friend class SceneHierarchyVerification;
+#endif
     void DrawMaterialDropTarget(IDemoScene& scene, const ProjectPaths& paths,
         const ProjectAssetRegistry& registry);
     void QueueViewportMaterialDrop(const IDemoScene& scene, const SceneObjectMetadata& target, const AssetID& material);
@@ -502,6 +543,7 @@ private:
         std::optional<std::string> selectionAfter;
         SceneHistorySession session;
         bool insertion = false;
+        std::optional<SceneHierarchyEdit> hierarchy;
     };
     struct PhysicsComponentEdit
     {
@@ -521,6 +563,97 @@ private:
     // Drafts hold displayed units (degrees for rotation) and reach the scene only on commit.
     std::array<float, 15> m_physicsDragDrafts{};
     std::string m_physicsEditStatus;
+    struct TriggerColliderEdit
+    {
+        SceneHistorySession session;
+        std::string objectID;
+        std::optional<Physics::TriggerColliderComponent> before;
+        std::optional<Physics::TriggerColliderComponent> after;
+    };
+    void DrawObjectTriggerColliderControls(IDemoScene& scene);
+    bool CommitObjectTriggerCollider(IDemoScene& scene, const SceneObjectMetadata& selection,
+        const std::optional<Physics::TriggerColliderComponent>& before,
+        const std::optional<Physics::TriggerColliderComponent>& after);
+    std::optional<SceneObjectMetadata> m_triggerInspection;
+    std::optional<Physics::TriggerColliderComponent> m_triggerInspectedValue;
+    std::uint64_t m_triggerInspectionEpoch = 0;
+    // Displayed units, committed only when the existing numeric edit transaction completes.
+    std::array<float, 12> m_triggerDragDrafts{};
+    std::string m_triggerEditStatus;
+    std::uint64_t m_triggerControlsRevision = 0;
+    struct CharacterControllerEdit
+    {
+        SceneHistorySession session;
+        std::string objectID;
+        std::optional<Physics::CharacterControllerComponent> before;
+        std::optional<Physics::CharacterControllerComponent> after;
+    };
+    void DrawObjectCharacterControllerControls(IDemoScene& scene);
+    bool CommitObjectCharacterController(IDemoScene& scene, const SceneObjectMetadata& selection,
+        const std::optional<Physics::CharacterControllerComponent>& before,
+        const std::optional<Physics::CharacterControllerComponent>& after);
+    std::optional<SceneObjectMetadata> m_controllerInspection;
+    std::optional<Physics::CharacterControllerComponent> m_controllerInspectedValue;
+    std::uint64_t m_controllerInspectionEpoch = 0;
+    // Displayed units, committed only when the existing numeric edit transaction completes.
+    std::array<float, 11> m_controllerDragDrafts{};
+    std::string m_controllerEditStatus;
+    std::uint64_t m_controllerControlsRevision = 0;
+    // CM.9: read-only runtime diagnostics and the explicitly activated diagnostic drive.
+    bool ViewportOwnsKeyboard() const;
+    void DisableCharacterDrive(std::string reason);
+    void UpdateCharacterDriveInput(const IDemoScene& scene);
+    void DrawCharacterDriveToggle();
+    void DrawCharacterControllerDiagnostics(const SceneObjectMetadata& selection,
+        const Physics::CharacterControllerComponent& component);
+    struct CharacterDriveCandidate
+    {
+        std::string objectID;
+        float maximumSpeed = 0.0f;
+    };
+    struct CharacterDrive
+    {
+        std::string objectID;
+        std::uint64_t sessionGeneration = 0;
+        float maximumSpeed = 0.0f;
+        bool jumpPending = false;
+        Vector3 velocity;
+    };
+    // Copy of the latest published frame; never a reference into the simulation.
+    std::optional<Physics::CharacterDiagnosticsFrame> m_characterDiagnostics;
+    // Controller shown by the Inspector this frame; the Play-bar toggle reads it next frame.
+    std::optional<CharacterDriveCandidate> m_characterDriveCandidate;
+    std::optional<CharacterDrive> m_characterDrive;
+    std::string m_characterDriveStatus;
+    struct ComponentPopupTarget
+    {
+        SceneHistorySession session;
+        SceneObjectMetadata selection;
+        std::uint64_t inspectionEpoch = 0;
+        ImGuiID popupID = 0;
+    };
+    static void CloseComponentPopup(ImGuiID popupID);
+    // Top-left screen position for the Add Component popup: centered on the content area,
+    // directly below the button when it fits in the work area, otherwise directly above it.
+    static ImVec2 CalculateAddComponentPopupPosition(ImVec2 buttonMinimum, ImVec2 buttonMaximum,
+        float contentCenterX, ImVec2 popupSize, ImVec2 workMinimum, ImVec2 workMaximum, float gap);
+    void DrawAddComponentControls(IDemoScene& scene);
+    std::optional<SceneObjectMetadata> ResolveComponentEditTarget(IDemoScene& scene);
+    void ValidateAddComponentPopup(IDemoScene& scene);
+    void DismissAddComponentPopup();
+    bool ComponentPopupMatches(IDemoScene& scene, const ComponentPopupTarget& target);
+    void ValidateTriggerManagementPopup(IDemoScene& scene);
+    void DismissTriggerManagementPopup();
+    void ValidateControllerManagementPopup(IDemoScene& scene);
+    void DismissControllerManagementPopup();
+    bool ApplyObjectTransformEdit(IDemoScene& scene, RenderObjectID index, const Transform& transform);
+    bool ApplyObjectTransformEdits(IDemoScene& scene, std::span<const RenderObjectTransformUpdate> updates);
+    std::string m_transformEditStatus;
+    std::optional<ComponentPopupTarget> m_addComponentPopup;
+    std::optional<ComponentPopupTarget> m_triggerManagementPopup;
+    std::optional<ComponentPopupTarget> m_controllerManagementPopup;
+    std::array<char, 128> m_componentSearch{};
+    bool m_focusComponentSearch = false;
     struct RenameObject
     {
         SceneHistorySession session;
@@ -560,7 +693,10 @@ private:
     void CommitObjectRename(IDemoScene& scene, std::string name);
     bool RenameIntentMatches(const IDemoScene& scene) const;
     bool RenameSessionMatches(const IDemoScene& scene, const SceneHistorySession& session) const;
-    using SceneHistoryCommand = std::variant<std::unique_ptr<PhysicsComponentEdit>, TransformEdit, std::unique_ptr<GroupTransformEdit>, std::unique_ptr<ObjectDeletion>, std::unique_ptr<RenameObject>, std::unique_ptr<ReorderObjects>, std::unique_ptr<MaterialBindingsEdit>>;
+    using SceneHistoryCommand = std::variant<std::unique_ptr<PhysicsComponentEdit>,
+        std::unique_ptr<TriggerColliderEdit>, std::unique_ptr<CharacterControllerEdit>, TransformEdit, std::unique_ptr<GroupTransformEdit>,
+        std::unique_ptr<ObjectDeletion>, std::unique_ptr<RenameObject>, std::unique_ptr<ReorderObjects>,
+        std::unique_ptr<MaterialBindingsEdit>>;
     struct SceneHistoryEntry
     {
         SceneHistoryCommand command;
@@ -648,7 +784,8 @@ private:
     void HandleViewportSelection(
         IDemoScene& demoScene,
         float viewportWidth,
-        float viewportHeight);
+        float viewportHeight,
+        bool viewportWasFocused = true);
     void HandleTransformUndo(IDemoScene& demoScene);
     void HandleTransformRedo(IDemoScene& demoScene);
     void UpdateCameraLook(

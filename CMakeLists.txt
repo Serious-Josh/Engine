@@ -7,11 +7,14 @@ project(Engine
 
 set(DXC_RUNTIME_DIR
     "C:/Program Files (x86)/Windows Kits/10/bin/10.0.26100.0/x64"
+    CACHE PATH "DXC DLL directory for normal development target deployment"
 )
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+
+option(ENGINE_BUILD_DIAGNOSTICS "Build local regression diagnostics (Debug only)" OFF)
 
 include(FetchContent)
 
@@ -76,6 +79,7 @@ add_library(EngineCore OBJECT
     $<$<CONFIG:Debug>:src/assets/OfflineMeshCooker.cpp>
     src/Scene/FileSceneTextureStreaming.cpp
     src/Platform/Windows/WindowsWindow.cpp
+    src/Platform/Windows/EditorDistributionPaths.cpp
     src/Core/Time.cpp
     src/Core/Input.cpp
     src/Core/Log.cpp
@@ -117,6 +121,8 @@ add_library(EngineCore OBJECT
     external/ImGuizmo/ImGuizmo.cpp
     src/Debug/DebugUI.cpp
     src/Scene/Scene.cpp
+    src/Scene/SceneHierarchyTransforms.cpp
+    src/Scene/SceneHierarchyPublication.cpp
     src/Renderer/Geometry/SphereGenerator.cpp
     src/Renderer/Geometry/DisplacementMeshGenerator.cpp
     src/Renderer/StructuredBuffer.cpp
@@ -141,6 +147,9 @@ add_library(EngineCore OBJECT
     src/Renderer/Passes/ShadowDenoisePass.cpp
     src/Renderer/ComputePipeline.cpp
     src/Editor/Editor.cpp
+    src/Editor/TriggerColliderControls.cpp
+    src/Editor/CharacterControllerControls.cpp
+    src/Editor/CharacterControllerDiagnosticsControls.cpp
     src/Editor/ViewportMaterialDrop.cpp
     src/Editor/EditorWorkspace.cpp
     src/Editor/ViewportMarquee.cpp
@@ -155,6 +164,7 @@ add_library(EngineCore OBJECT
     src/Editor/TextureThumbnailCache.cpp
     src/Editor/TextureThumbnailDiskCache.cpp
     src/Editor/AssetBrowser.cpp
+    src/Editor/ThumbnailAdmission.cpp
     src/Renderer/Passes/RayTracedReflectionPass.cpp
     src/Renderer/Passes/RayTracedReflectionDenoisePass.cpp
     src/Renderer/Passes/RayTracedReflectionTemporalPass.cpp
@@ -197,9 +207,13 @@ add_library(EngineCore OBJECT
     src/Scene/PreparedScene.cpp
     src/Scene/SceneCommit.cpp
     src/Scene/FileSceneRuntime.cpp
+    src/Scene/TriggerColliderEditing.cpp
+    src/Scene/CharacterControllerEditing.cpp
     src/Scene/PhysicsPresentation.cpp
     src/Engine/PhysicsSimulationController.cpp
     src/Engine/EditorPhysicsSimulation.cpp
+    src/Engine/PackagedPhysicsSimulation.cpp
+    src/Engine/CharacterDriveScheduling.cpp
     src/Editor/PhysicsSimulationControls.cpp
     src/Scene/FileSceneAssetCatalog.cpp
     src/Scene/SceneMetadataPreparation.cpp
@@ -231,36 +245,54 @@ add_library(EngineCore OBJECT
 target_compile_definitions(EngineCore PRIVATE
     ENGINE_SOURCE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}"
 )
-# Verification diagnostics (--verify-* flags) are local-only, Git-ignored test code.
-# A clone without them builds Engine normally; the flags then report that they are unavailable.
+# Local regression code stays outside the production object library and is opt-in.
 set(ENGINE_VERIFICATION_AVAILABLE OFF)
+if(ENGINE_BUILD_DIAGNOSTICS)
+    if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Engine/tests/PackagedBootstrapVerification.cpp" OR
+       NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/assets/tests/CookedMeshVerification.cpp")
+        message(FATAL_ERROR "ENGINE_BUILD_DIAGNOSTICS requires the local Git-ignored test sources.")
+    endif()
 
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Engine/tests" AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/assets/tests/CookedMeshVerification.cpp")
     set(ENGINE_VERIFICATION_AVAILABLE ON)
-    target_sources(EngineCore PRIVATE
+    # A consistent definition across core, tests and entry points guards test-only access.
+    target_compile_definitions(EngineCore PUBLIC $<$<CONFIG:Debug>:ENGINE_HAS_VERIFICATION=1>)
+    add_library(EngineVerification OBJECT)
+    target_link_libraries(EngineVerification PRIVATE EngineCore)
+    target_compile_definitions(EngineVerification PRIVATE
+        ENGINE_SOURCE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}"
+        ENGINE_RUNTIME_DEPLOY_DIR="$<TARGET_FILE_DIR:EngineRuntime>"
+    )
+    target_sources(EngineVerification PRIVATE
         $<$<CONFIG:Debug>:src/Engine/tests/SceneEnvironmentVerification.cpp>
         $<$<CONFIG:Debug>:src/Engine/tests/BuildGameVerification.cpp>
-        src/Engine/tests/CookedMeshGPUVerification.cpp
+        $<$<CONFIG:Debug>:src/Engine/tests/CookedMeshGPUVerification.cpp>
         $<$<CONFIG:Debug>:src/Engine/tests/ArchiveCookedMeshVerification.cpp>
         $<$<CONFIG:Debug>:src/Engine/tests/CookedSceneArchiveVerification.cpp>
         $<$<CONFIG:Debug>:src/Engine/tests/PackagedSurfaceVerification.cpp>
-        src/Engine/tests/CookedMeshLifecycleVerification.cpp
-        src/Engine/tests/MaterialAdmissionVerification.cpp
+        $<$<CONFIG:Debug>:src/Engine/tests/CookedMeshLifecycleVerification.cpp>
+        $<$<CONFIG:Debug>:src/Engine/tests/MaterialAdmissionVerification.cpp>
         $<$<CONFIG:Debug>:src/assets/tests/CookedMeshVerification.cpp>
         $<$<CONFIG:Debug>:src/assets/tests/DevelopmentCookedMeshProviderVerification.cpp>
         $<$<CONFIG:Debug>:src/assets/tests/CookedMeshPreparationVerification.cpp>
-        src/Engine/tests/MaterialLocateVerification.cpp
-        src/Engine/tests/ViewportPanVerification.cpp
-        src/Engine/tests/SceneDuplicationVerification.cpp
+        $<$<CONFIG:Debug>:src/Engine/tests/MaterialLocateVerification.cpp>
+        $<$<CONFIG:Debug>:src/Engine/tests/ViewportPanVerification.cpp>
+        $<$<CONFIG:Debug>:src/Engine/tests/SceneDuplicationVerification.cpp>
         $<$<CONFIG:Debug>:src/Engine/tests/ScenePhysicsDataVerification.cpp>
         $<$<CONFIG:Debug>:src/Engine/tests/PrimitiveCreationVerification.cpp>
         $<$<CONFIG:Debug>:src/Engine/tests/ColliderVisualizationVerification.cpp>
         $<$<CONFIG:Debug>:src/Engine/tests/MarqueeSelectionVerification.cpp>
         $<$<CONFIG:Debug>:src/Engine/tests/ScenePhysicsPersistenceVerification.cpp>
         $<$<CONFIG:Debug>:src/Engine/tests/PresentationTransformVerification.cpp>
-        src/Engine/tests/SceneMembershipVerification.cpp
-        src/Engine/tests/MaterialBindingVerification.cpp
-        src/Engine/tests/ViewportMaterialDropVerification.cpp
+        $<$<CONFIG:Debug>:src/Engine/tests/SceneMembershipVerification.cpp>
+        $<$<CONFIG:Debug>:src/Engine/tests/MaterialBindingVerification.cpp>
+        $<$<CONFIG:Debug>:src/Engine/tests/ViewportMaterialDropVerification.cpp>
+        $<$<CONFIG:Debug>:src/Engine/tests/PackagedBootstrapVerification.cpp>
+        $<$<CONFIG:Debug>:src/Engine/tests/PortableEditorVerification.cpp>
+        $<$<CONFIG:Debug>:src/Engine/tests/SceneHierarchyVerification.cpp>
+        $<$<CONFIG:Debug>:src/Engine/tests/DescriptorRecoveryVerification.cpp>
+        $<$<CONFIG:Debug>:src/Engine/tests/ThumbnailSchedulingVerification.cpp>
+        $<$<CONFIG:Debug>:src/Engine/tests/MeshImportUnitsVerification.cpp>
+        $<$<CONFIG:Debug>:src/Engine/tests/NormalMapVerification.cpp>
     )
 endif()
 
@@ -270,10 +302,13 @@ add_executable(Engine src/main.cpp)
 target_link_libraries(Engine PRIVATE EngineCore)
 
 if(ENGINE_VERIFICATION_AVAILABLE)
-    target_compile_definitions(Engine PRIVATE ENGINE_HAS_VERIFICATION=1)
+    target_link_libraries(Engine PRIVATE $<$<CONFIG:Debug>:EngineVerification>)
 endif()
 add_executable(EngineRuntime WIN32 src/runtime_main.cpp)
 target_link_libraries(EngineRuntime PRIVATE EngineCore shell32)
+if(ENGINE_VERIFICATION_AVAILABLE)
+    target_link_libraries(EngineRuntime PRIVATE $<$<CONFIG:Debug>:EngineVerification>)
+endif()
 add_dependencies(Engine EngineRuntime)
 target_compile_definitions(EngineCore PRIVATE ENGINE_RUNTIME_DEPLOY_DIR="$<TARGET_FILE_DIR:EngineRuntime>")
 set_target_properties(EngineRuntime PROPERTIES
@@ -370,3 +405,5 @@ target_link_libraries(EngineCore
         DirectXTex
         nlohmann_json
 )
+
+include(cmake/EnginePortable.cmake)

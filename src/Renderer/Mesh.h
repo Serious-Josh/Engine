@@ -133,7 +133,9 @@ class Mesh
     const MeshMetadata& GetMetadata() const noexcept;
 
     private:
+#if defined(ENGINE_HAS_VERIFICATION)
     friend class MarqueeSelectionVerification;
+#endif
     void ResetMetadata() noexcept;
     MeshMetadata m_defaultMetadata = DefaultMeshMetadata(0);
     std::optional<MeshMetadata> m_metadata;

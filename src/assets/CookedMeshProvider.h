@@ -49,6 +49,7 @@ namespace CookedMeshSource
         std::string sourceSHA256; // Provenance only; never payload or runtime identity.
         std::string sourcePath; // Provenance only; never resolved/read by this provider.
         std::uint64_t contentGeneration = 0; // Archive entry generation; zero for development manifests (mapping identity carries their generation).
+        MeshImportUnits units; // Development provenance; archive payload already contains converted geometry.
 
         bool operator==(const AssetEvidence&) const = default;
     };

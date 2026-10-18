@@ -1,4 +1,6 @@
 #include "Scene/SceneDocument.h"
+#include "Scene/SceneHierarchy.h"
+#include "Scene/SceneHierarchyTransforms.h"
 #include "assets/AssetID.h"
 
 #include <cmath>
@@ -112,13 +114,9 @@ bool ValidateSceneDocument(
                 "Invalid transform for object: " + object.id);
         }
 
-        if (object.physics)
+        if(!ValidateSceneObjectComponents(object, errorMessage))
         {
-            std::string physicsError;
-            if (!Physics::ValidatePhysicsComponent(*object.physics, &physicsError))
-            {
-                return Fail(errorMessage, "Invalid physics for object " + object.id + ": " + physicsError);
-            }
+            return false;
         }
 
         for(const auto& [slotID, reference] : object.materialSlotBindings)
@@ -130,5 +128,61 @@ bool ValidateSceneDocument(
         }
     }
 
+    // Existing flat validation above already checks identities/components. Avoid
+    // graph allocation on ordinary frame-time captures and preserve loose count policy.
+    if(std::all_of(document.objects.begin(), document.objects.end(),
+        [](const SceneObjectDocument& object) { return object.parentID.empty(); }))
+    {
+        return true;
+    }
+
+    // Connected branches must also satisfy the H.3 transform rules, so an admitted document
+    // always installs and renders; no path flattens or repairs it later.
+    SceneHierarchy::Forest hierarchy;
+    return SceneHierarchy::Build(document.objects, hierarchy, errorMessage) &&
+        SceneHierarchy::ValidateConnectedTransforms(document.objects, hierarchy, errorMessage);
+}
+
+bool ValidateSceneObjectComponents(const SceneObjectDocument& object, std::string* errorMessage)
+{
+    if(errorMessage)
+    {
+        errorMessage->clear();
+    }
+
+    if(object.characterController && object.physics)
+    {
+        return Fail(errorMessage, "Physics and Character Controller are mutually exclusive for object: " + object.id);
+    }
+
+    if(!object.parentID.empty() && (object.physics || object.triggerCollider || object.characterController))
+    {
+        return Fail(errorMessage, "Physics, Trigger Collider and Character Controller require a root object: " + object.id);
+    }
+
+    std::string componentError;
+
+    if(object.physics && !Physics::ValidatePhysicsComponent(*object.physics, &componentError))
+    {
+        return Fail(errorMessage, "Invalid physics for object " + object.id + ": " + componentError);
+    }
+
+    if(object.triggerCollider && !Physics::ValidateTriggerColliderComponent(*object.triggerCollider, &componentError))
+    {
+        return Fail(errorMessage, "Invalid trigger collider for object " + object.id + ": " + componentError);
+    }
+
+    if(object.characterController &&
+        !Physics::ValidateCharacterControllerTransform(*object.characterController, object.transform, &componentError))
+    {
+        return Fail(errorMessage, "Invalid Character Controller for object " + object.id + ": " + componentError);
+    }
+
     return true;
+}
+
+bool ValidateSceneDocumentPersistence(const SceneDocument& document, std::string* errorMessage)
+{
+    // Schema 9 and cooked payload 9 persist parent relationships, so no output flattening guard remains.
+    return ValidateSceneDocument(document, errorMessage);
 }

@@ -19,7 +19,7 @@ namespace
         HierarchyDragPayload header;
         std::memcpy(&header, payload->Data, sizeof(header));
 
-        if(header.version != 1 || header.identity != identity || identity.sessionEpoch == 0 ||
+        if(header.version != 2 || header.identity != identity || identity.sessionEpoch == 0 ||
             header.objectIDBytes < 2 || sizeof(header) + header.objectIDBytes != static_cast<size_t>(payload->DataSize))
         {
             return false;
@@ -62,25 +62,142 @@ std::optional<HierarchyReorderRequest> SceneHierarchyPanel::TakeReorderRequest()
     return std::exchange(m_reorderRequest, std::nullopt);
 }
 
-void SceneHierarchyPanel::DrawReorderInteraction(const SceneHierarchyEntry& entry,
-    const SceneHierarchySnapshot& snapshot, const HierarchyDragIdentity& identity)
+std::optional<HierarchyDropRequest> SceneHierarchyPanel::TakeDropRequest()
+{
+    return std::exchange(m_dropRequest, std::nullopt);
+}
+
+void SceneHierarchyPanel::UpdateTree(const SceneHierarchySnapshot& snapshot, std::uint64_t epoch, const void* sceneIdentity)
+{
+    if(epoch != m_expansionEpoch || (epoch == 0 && sceneIdentity != m_expansionScene))
+    {
+        m_collapsed.clear();
+        m_observedSelectionID.clear();
+        m_pendingRevealID.clear();
+        m_treeSnapshot.entries.clear();
+        m_expansionEpoch = epoch;
+        m_expansionScene = sceneIdentity;
+        m_dropStatus.clear();
+        m_rowsDirty = true;
+    }
+
+    const bool sameTopology = snapshot.entries.size() == m_treeSnapshot.entries.size() &&
+        std::equal(snapshot.entries.begin(), snapshot.entries.end(), m_treeSnapshot.entries.begin(),
+            [](const auto& left, const auto& right)
+            {
+                return left.objectID == right.objectID && left.parentID == right.parentID;
+            });
+
+    if(!sameTopology || m_tree.objectIDs.size() != snapshot.entries.size())
+    {
+        std::string error;
+
+        if(!BuildHierarchyTree(snapshot, m_tree, error))
+        {
+            m_rows.clear();
+            m_tree = {};
+            m_pendingRevealID.clear();
+            m_dropStatus = error;
+            return;
+        }
+
+        m_treeSnapshot = snapshot;
+        std::unordered_set<std::string> present(m_tree.objectIDs.begin(), m_tree.objectIDs.end());
+        std::erase_if(m_collapsed, [&](const auto& id) { return !present.contains(id); });
+        m_rowsDirty = true;
+    }
+
+    if(m_rowsDirty)
+    {
+        m_rows = VisibleHierarchyRows(m_tree, m_collapsed);
+        m_rowsDirty = false;
+    }
+}
+
+void SceneHierarchyPanel::ObserveSelection(const SceneHierarchySnapshot& snapshot,
+    std::optional<size_t> selectedObject, std::uint64_t epoch, const void* sceneIdentity)
+{
+    UpdateTree(snapshot, epoch, sceneIdentity);
+    std::string selectedID;
+
+    if(selectedObject)
+    {
+        for(const auto& entry : snapshot.entries)
+        {
+            if(entry.runtimeIndex == selectedObject)
+            {
+                selectedID = entry.objectID;
+                break;
+            }
+        }
+    }
+
+    if(selectedID != m_observedSelectionID)
+    {
+        m_observedSelectionID = selectedID;
+        m_pendingRevealID = std::move(selectedID);
+    }
+}
+
+void SceneHierarchyPanel::ExpandPendingSelection()
+{
+    if(m_pendingRevealID.empty())
+    {
+        return;
+    }
+
+    const auto selected = std::find(m_tree.objectIDs.begin(), m_tree.objectIDs.end(), m_pendingRevealID);
+
+    if(selected == m_tree.objectIDs.end())
+    {
+        m_pendingRevealID.clear();
+        return;
+    }
+
+    size_t index = static_cast<size_t>(selected - m_tree.objectIDs.begin());
+
+    // Forests are validated; retain a bound and index checks for unexpected stale data.
+    for(size_t visited = 0; visited < m_tree.parents.size(); ++visited)
+    {
+        if(index >= m_tree.parents.size() || !m_tree.parents[index])
+        {
+            break;
+        }
+
+        index = *m_tree.parents[index];
+
+        if(index >= m_tree.objectIDs.size())
+        {
+            m_pendingRevealID.clear();
+            return;
+        }
+
+        m_collapsed.erase(m_tree.objectIDs[index]);
+    }
+
+    m_rows = VisibleHierarchyRows(m_tree, m_collapsed);
+    m_rowsDirty = false;
+}
+
+void SceneHierarchyPanel::DrawDropInteraction(const SceneHierarchyEntry* entry,
+    const HierarchyDragIdentity& identity, const DropValidator& validateDrop)
 {
     const ImVec2 rowMin = ImGui::GetItemRectMin();
     const ImVec2 rowMax = ImGui::GetItemRectMax();
 
-    if(ImGui::BeginDragDropSource())
+    if(entry && ImGui::BeginDragDropSource())
     {
-        if(entry.objectID.size() < static_cast<size_t>((std::numeric_limits<int>::max)()) -
-            sizeof(HierarchyDragPayload) - 1)
+        if(entry->objectID.size() < static_cast<size_t>((std::numeric_limits<int>::max)()) - sizeof(HierarchyDragPayload) - 1)
         {
             HierarchyDragPayload header;
             header.identity = identity;
-            header.objectIDBytes = static_cast<std::uint32_t>(entry.objectID.size() + 1);
-            std::vector<char> bytes(sizeof(header) + header.objectIDBytes);
-            std::memcpy(bytes.data(), &header, sizeof(header));
-            std::memcpy(bytes.data() + sizeof(header), entry.objectID.c_str(), header.objectIDBytes);
-            ImGui::SetDragDropPayload(HierarchyDragPayloadType, bytes.data(), bytes.size(), ImGuiCond_Once);
-            ImGui::TextUnformatted(entry.name.c_str());
+            header.objectIDBytes = static_cast<std::uint32_t>(entry->objectID.size() + 1);
+            m_dragBytes.resize(sizeof(header) + header.objectIDBytes);
+            std::memcpy(m_dragBytes.data(), &header, sizeof(header));
+            std::memcpy(m_dragBytes.data() + sizeof(header), entry->objectID.c_str(), header.objectIDBytes);
+            ImGui::SetDragDropPayload(HierarchyDragPayloadType, m_dragBytes.data(), m_dragBytes.size(), ImGuiCond_Once);
+            ImGui::TextUnformatted(entry->name.c_str());
+            ImGui::TextUnformatted(ImGui::GetIO().KeyAlt ? "Keep Local" : "Keep World (Alt: Keep Local)");
         }
 
         ImGui::EndDragDropSource();
@@ -99,28 +216,47 @@ void SceneHierarchyPanel::DrawReorderInteraction(const SceneHierarchyEntry& entr
         return;
     }
 
-    const auto source = std::find_if(snapshot.entries.begin(), snapshot.entries.end(),
-        [&](const SceneHierarchyEntry& candidate) { return candidate.objectID == sourceID; });
+    HierarchyDropRequest request{identity, std::move(sourceID), entry ? entry->objectID : std::string{},
+        entry ? HierarchyDropZone::Parent : HierarchyDropZone::Root, !ImGui::GetIO().KeyAlt};
 
-    if(source == snapshot.entries.end())
+    if(entry)
     {
-        ImGui::EndDragDropTarget();
-        return;
+        const float fraction = (ImGui::GetIO().MousePos.y - rowMin.y) / (rowMax.y - rowMin.y);
+        request.zone = fraction < 0.25f ? HierarchyDropZone::Before :
+            fraction > 0.75f ? HierarchyDropZone::After : HierarchyDropZone::Parent;
     }
 
+    std::string error;
+    const bool valid = validateDrop && validateDrop(request, error);
     const auto* payload = ImGui::AcceptDragDropPayload(HierarchyDragPayloadType,
         ImGuiDragDropFlags_AcceptBeforeDelivery | ImGuiDragDropFlags_AcceptNoDrawDefaultRect);
 
     if(payload)
     {
-        const bool insertAfter = ImGui::GetIO().MousePos.y >= (rowMin.y + rowMax.y) * 0.5f;
-        const float indicatorY = insertAfter ? rowMax.y : rowMin.y;
-        ImGui::GetWindowDrawList()->AddLine(ImVec2(rowMin.x, indicatorY), ImVec2(rowMax.x, indicatorY),
-            ImGui::GetColorU32(ImGuiCol_DragDropTarget), 2.0f);
+        const ImU32 color = valid ? ImGui::GetColorU32(ImGuiCol_DragDropTarget) : IM_COL32(235, 85, 75, 255);
+        auto* draw = ImGui::GetWindowDrawList();
+
+        if(request.zone == HierarchyDropZone::Before || request.zone == HierarchyDropZone::After)
+        {
+            const float y = request.zone == HierarchyDropZone::Before ? rowMin.y : rowMax.y;
+            draw->AddLine(ImVec2(rowMin.x, y), ImVec2(rowMax.x, y), color, 3.0f);
+        }
+        else
+        {
+            draw->AddRect(rowMin, rowMax, color, 2.0f, 0, 2.0f);
+        }
+
+        ImGui::SetTooltip("%s%s", valid ? (request.keepWorld ? "Keep World" : "Keep Local") : error.c_str(),
+            valid ? " - row center: parent; edges: order; Alt: Keep Local" : "");
 
         if(payload->IsDelivery())
         {
-            m_reorderRequest = HierarchyReorderRequest{identity, std::move(sourceID), entry.objectID, insertAfter};
+            m_dropStatus = valid ? std::string{} : error;
+
+            if(valid)
+            {
+                m_dropRequest = std::move(request);
+            }
         }
     }
 
@@ -234,9 +370,14 @@ void SceneHierarchyPanel::DrawRenameInput()
 std::optional<std::size_t> SceneHierarchyPanel::Draw(const EditorWorkspaceRect& rectangle,
     const SceneHierarchySnapshot& snapshot, std::optional<std::size_t> selectedObject,
     const void* sceneIdentity, const std::string& error,
-    const HierarchyDragIdentity& dragIdentity, bool allowReorder, bool allowCreation, std::span<const std::size_t> selectedObjects)
+    const HierarchyDragIdentity& dragIdentity, bool allowReorder, bool allowCreation, std::span<const std::size_t> selectedObjects,
+    const DropValidator& validateDrop)
 {
-    m_focused=false;
+    ObserveSelection(snapshot, selectedObject, dragIdentity.sessionEpoch, sceneIdentity);
+    m_focused = false;
+#if defined(ENGINE_HAS_VERIFICATION)
+    m_verificationRows.clear();
+#endif
     if(rectangle.size.x <= 0.0f || rectangle.size.y <= 0.0f)
     {
         return std::nullopt;
@@ -256,34 +397,26 @@ std::optional<std::size_t> SceneHierarchyPanel::Draw(const EditorWorkspaceRect& 
     }
 
     std::optional<std::size_t> clickedObject;
-    std::string selectedPersistentID;
-
-    if(selectedObject)
-    {
-        const auto selected = std::find_if(snapshot.entries.begin(), snapshot.entries.end(),
-            [&](const SceneHierarchyEntry& entry) { return entry.runtimeIndex == selectedObject; });
-
-        if(selected != snapshot.entries.end())
-        {
-            selectedPersistentID = selected->objectID;
-        }
-    }
-
     if(ImGui::Begin("Hierarchy", nullptr, flags))
     {
-        m_focused=ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
+        m_focused = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
         EditorWorkspace::KeepCurrentWindowBehindFloatingUI();
         // Keep the button on the right of the content header; title bar, scrolling and row menus stay standard ImGui.
-        const float buttonWidth=ImGui::GetFrameHeight();
-        const auto headerStart=ImGui::GetCursorPos();
-        const float available=ImGui::GetContentRegionAvail().x;
-        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + (std::max)(1.0f,available-buttonWidth-ImGui::GetStyle().ItemSpacing.x));
+        const float buttonWidth = ImGui::GetFrameHeight();
+        const auto headerStart = ImGui::GetCursorPos();
+        const float available = ImGui::GetContentRegionAvail().x;
+        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + (std::max)(1.0f, available - buttonWidth - ImGui::GetStyle().ItemSpacing.x));
         ImGui::TextUnformatted(snapshot.sceneName.c_str());
         ImGui::PopTextWrapPos();
-        const float afterTitle=ImGui::GetCursorPosY();
-        ImGui::SetCursorPos(ImVec2(headerStart.x+(std::max)(0.0f,available-buttonWidth),headerStart.y));
-        if(!allowCreation) ImGui::BeginDisabled();
-        if(ImGui::Button("+",ImVec2(buttonWidth,buttonWidth))) ImGui::OpenPopup("HierarchyCreate");
+        const float afterTitle = ImGui::GetCursorPosY();
+        ImGui::SetCursorPos(ImVec2(headerStart.x + (std::max)(0.0f, available - buttonWidth), headerStart.y));
+        ImGui::BeginDisabled(!allowCreation);
+
+        if(ImGui::Button("+", ImVec2(buttonWidth, buttonWidth)))
+        {
+            ImGui::OpenPopup("HierarchyCreate");
+        }
+
         if(ImGui::BeginPopup("HierarchyCreate"))
         {
             // Top level, not a primitive: a Transform-only object with no mesh or material.
@@ -294,14 +427,24 @@ std::optional<std::size_t> SceneHierarchyPanel::Draw(const EditorWorkspaceRect& 
 
             if(ImGui::BeginMenu("Create Primitive"))
             {
-                if(ImGui::MenuItem("Cube")) m_primitiveRequest=ScenePrimitive::Cube;
-                if(ImGui::MenuItem("Sphere")) m_primitiveRequest=ScenePrimitive::Sphere;
+                if(ImGui::MenuItem("Cube"))
+                {
+                    m_primitiveRequest = ScenePrimitive::Cube;
+                }
+
+                if(ImGui::MenuItem("Sphere"))
+                {
+                    m_primitiveRequest = ScenePrimitive::Sphere;
+                }
+
                 ImGui::EndMenu();
             }
+
             ImGui::EndPopup();
         }
-        if(!allowCreation) ImGui::EndDisabled();
-        ImGui::SetCursorPosY((std::max)(afterTitle,headerStart.y+buttonWidth+ImGui::GetStyle().ItemSpacing.y));
+
+        ImGui::EndDisabled();
+        ImGui::SetCursorPosY((std::max)(afterTitle, headerStart.y + buttonWidth + ImGui::GetStyle().ItemSpacing.y));
         ImGui::Separator();
 
         if(!error.empty())
@@ -309,23 +452,70 @@ std::optional<std::size_t> SceneHierarchyPanel::Draw(const EditorWorkspaceRect& 
             ImGui::TextWrapped("%s", error.c_str());
         }
 
+        if(!m_dropStatus.empty())
+        {
+            ImGui::TextWrapped("%s", m_dropStatus.c_str());
+        }
+
         const float listTop = ImGui::GetCursorScreenPos().y;
+        ExpandPendingSelection();
         ImGui::PushID(sceneIdentity);
+        ImGui::Selectable("Scene Root (drop to unparent)", false, ImGuiSelectableFlags_None,
+            ImVec2(0, ImGui::GetFrameHeight()));
+
+#if defined(ENGINE_HAS_VERIFICATION)
+        m_verificationRoot = {ImGui::GetItemRectMin(), ImGui::GetItemRectMax()};
+#endif
+        if(allowReorder)
+        {
+            DrawDropInteraction(nullptr, dragIdentity, validateDrop);
+        }
+
+        if(allowCreation && ImGui::BeginPopupContextItem("HierarchyRootContext"))
+        {
+            if(ImGui::MenuItem("Create Empty Object"))
+            {
+                m_emptyObjectRequest = true;
+            }
+
+            ImGui::EndPopup();
+        }
+
         ImGuiListClipper clipper;
-        clipper.Begin(static_cast<int>(snapshot.entries.size()), ImGui::GetFrameHeightWithSpacing());
+        clipper.Begin(static_cast<int>(m_rows.size()), ImGui::GetFrameHeightWithSpacing());
+
+        if(!m_pendingRevealID.empty())
+        {
+            const auto row = std::find_if(m_rows.begin(), m_rows.end(), [&](const auto& candidate)
+            {
+                return snapshot.entries[candidate.documentIndex].objectID == m_pendingRevealID;
+            });
+
+            if(row != m_rows.end())
+            {
+                // Submit the row even outside the clip range before asking ImGui to scroll.
+                clipper.IncludeItemByIndex(static_cast<int>(row - m_rows.begin()));
+            }
+            else
+            {
+                m_pendingRevealID.clear();
+            }
+        }
 
         if(IsRenaming())
         {
-            const auto target = std::find_if(snapshot.entries.begin(), snapshot.entries.end(),
-                [&](const SceneHierarchyEntry& entry) { return entry.objectID == m_renameObjectID; });
+            const auto row = std::find_if(m_rows.begin(), m_rows.end(), [&](const auto& candidate)
+            {
+                return snapshot.entries[candidate.documentIndex].objectID == m_renameObjectID;
+            });
 
-            if(target == snapshot.entries.end())
+            if(row == m_rows.end())
             {
                 CancelRename();
             }
             else
             {
-                clipper.IncludeItemByIndex(static_cast<int>(target - snapshot.entries.begin()));
+                clipper.IncludeItemByIndex(static_cast<int>(row - m_rows.begin()));
             }
         }
 
@@ -333,66 +523,118 @@ std::optional<std::size_t> SceneHierarchyPanel::Draw(const EditorWorkspaceRect& 
         {
             for(int index = clipper.DisplayStart; index < clipper.DisplayEnd; ++index)
             {
-                const auto& entry = snapshot.entries[index];
-
-                if(entry.objectID.empty())
-                {
-                    ImGui::PushID(index);
-                }
-                else
-                {
-                    ImGui::PushID(entry.objectID.c_str());
-                }
-
-                const bool selected = entry.runtimeIndex &&
-                    std::find(selectedObjects.begin(), selectedObjects.end(), *entry.runtimeIndex) != selectedObjects.end();
-                const bool primarySelected = entry.objectID.empty() ?
-                    entry.runtimeIndex && selectedObject == entry.runtimeIndex : entry.objectID == selectedPersistentID;
+                const auto row = m_rows[index];
+                const auto& entry = snapshot.entries[row.documentIndex];
+                ImGui::PushID(entry.objectID.empty() ? std::to_string(row.documentIndex).c_str() : entry.objectID.c_str());
+                const auto rowPosition = ImGui::GetCursorScreenPos();
+                const float desiredIndent = static_cast<float>((std::min)(row.depth, size_t{32})) * ImGui::GetStyle().IndentSpacing;
+                const float indent = (std::min)(desiredIndent, (std::max)(0.0f, ImGui::GetContentRegionAvail().x - 140.0f));
+                const bool hasChildren = !m_tree.children[row.documentIndex].empty();
+                const bool collapsed = m_collapsed.contains(m_tree.objectIDs[row.documentIndex]);
+                const float arrowWidth = ImGui::GetFrameHeight();
+                const bool selected = entry.runtimeIndex && (entry.runtimeIndex == selectedObject ||
+                    std::find(selectedObjects.begin(), selectedObjects.end(), *entry.runtimeIndex) != selectedObjects.end());
                 ImGui::BeginDisabled(!entry.runtimeIndex);
-                const ImVec2 rowPosition = ImGui::GetCursorScreenPos();
 
                 if(entry.objectID == m_renameObjectID && IsRenaming())
                 {
+                    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + indent + arrowWidth);
                     DrawRenameInput();
-                    ImGui::EndDisabled();
-                    ImGui::PopID();
-                    continue;
                 }
-
-                if(ImGui::Selectable("##Object", selected || primarySelected, ImGuiSelectableFlags_None,
-                    ImVec2(0.0f, ImGui::GetFrameHeight())))
+                else
                 {
-                    clickedObject = entry.runtimeIndex;
-                }
-
-                const auto& io = ImGui::GetIO();
-
-                if(ImGui::IsItemHovered() &&
-                    ImGui::IsMouseReleased(ImGuiMouseButton_Right) &&
-                    io.MouseDragMaxDistanceSqr[ImGuiMouseButton_Right] < io.MouseDragThreshold * io.MouseDragThreshold)
-                {
-                    clickedObject = entry.runtimeIndex;
-
-                    if(!entry.objectID.empty())
+                    if(ImGui::Selectable("##Object", selected, ImGuiSelectableFlags_None,
+                        ImVec2(0, ImGui::GetFrameHeight())))
                     {
-                        m_contextRequest = entry.objectID;
+                        if(hasChildren && ImGui::GetIO().MousePos.x >= rowPosition.x + indent &&
+                            ImGui::GetIO().MousePos.x < rowPosition.x + indent + arrowWidth)
+                        {
+                            if(collapsed)
+                            {
+                                m_collapsed.erase(entry.objectID);
+                            }
+                            else
+                            {
+                                m_collapsed.insert(entry.objectID);
+                            }
+
+                            m_rowsDirty = true;
+                        }
+                        else
+                        {
+                            clickedObject = entry.runtimeIndex;
+                        }
                     }
+
+#if defined(ENGINE_HAS_VERIFICATION)
+                    m_verificationRows[entry.objectID] = {ImGui::GetItemRectMin(), ImGui::GetItemRectMax()};
+#endif
+                    const auto& io = ImGui::GetIO();
+
+                    if(ImGui::IsItemHovered() && ImGui::IsMouseReleased(ImGuiMouseButton_Right) &&
+                        io.MouseDragMaxDistanceSqr[ImGuiMouseButton_Right] < io.MouseDragThreshold * io.MouseDragThreshold)
+                    {
+                        clickedObject = entry.runtimeIndex;
+
+                        if(!entry.objectID.empty())
+                        {
+                            m_contextRequest = entry.objectID;
+                        }
+                    }
+
+                    if(ImGui::IsItemHovered() && !ImGui::GetDragDropPayload())
+                    {
+                        ImGui::SetTooltip("%s\nDepth: %zu\n%s", entry.name.c_str(), row.depth, entry.objectID.c_str());
+                    }
+
+                    if(allowReorder && !IsRenaming() && !entry.objectID.empty())
+                    {
+                        DrawDropInteraction(&entry, dragIdentity, validateDrop);
+                    }
+
+                    auto* draw = ImGui::GetWindowDrawList();
+                    const auto color = ImGui::GetColorU32(ImGuiCol_Text);
+
+                    if(hasChildren)
+                    {
+                        const float x = rowPosition.x + indent + arrowWidth * 0.3f;
+                        const float y = rowPosition.y + arrowWidth * 0.35f;
+                        const float size = arrowWidth * 0.3f;
+
+                        if(collapsed)
+                        {
+                            draw->AddTriangleFilled(ImVec2(x, y), ImVec2(x, y + size), ImVec2(x + size, y + size * 0.5f), color);
+                        }
+                        else
+                        {
+                            draw->AddTriangleFilled(ImVec2(x, y), ImVec2(x + size, y), ImVec2(x + size * 0.5f, y + size), color);
+                        }
+                    }
+
+                    const float iconSize = ImGui::GetFontSize() * 0.65f;
+                    DrawObjectIcon(*draw, ImVec2(rowPosition.x + indent + arrowWidth, rowPosition.y + 3), iconSize);
+                    draw->AddText(ImVec2(rowPosition.x + indent + arrowWidth + iconSize + 8, rowPosition.y), color,
+                        entry.name.empty() ? "(Unnamed Object)" : entry.name.c_str());
                 }
 
-                if(allowReorder && !IsRenaming() && !entry.objectID.empty())
+                if(entry.objectID == m_pendingRevealID && !m_pendingRevealID.empty())
                 {
-                    DrawReorderInteraction(entry, snapshot, dragIdentity);
+                    const auto* draw = ImGui::GetWindowDrawList();
+                    const float top = ImGui::GetItemRectMin().y;
+                    const float bottom = ImGui::GetItemRectMax().y;
+
+                    if(top < draw->GetClipRectMin().y)
+                    {
+                        ImGui::SetScrollHereY(0.0f);
+                    }
+                    else if(bottom > draw->GetClipRectMax().y)
+                    {
+                        ImGui::SetScrollHereY(1.0f);
+                    }
+
+                    m_pendingRevealID.clear();
                 }
 
-                // Draw a small wire cube without relying on an icon font.
-                const float iconSize = ImGui::GetFontSize() * 0.65f;
-                const ImVec2 iconStart(rowPosition.x + 2.0f, rowPosition.y + 3.0f);
-                auto* draw = ImGui::GetWindowDrawList();
-                DrawObjectIcon(*draw, iconStart, iconSize);
-
-                const char* name = entry.name.empty() ? "(Unnamed Object)" : entry.name.c_str();
-                draw->AddText(ImVec2(rowPosition.x + iconSize + 10.0f, rowPosition.y),
-                    ImGui::GetColorU32(ImGuiCol_Text), name);
                 ImGui::EndDisabled();
                 ImGui::PopID();
             }
@@ -413,7 +655,7 @@ std::optional<std::size_t> SceneHierarchyPanel::Draw(const EditorWorkspaceRect& 
 
 std::optional<ScenePrimitive> SceneHierarchyPanel::TakePrimitiveRequest()
 {
-    return std::exchange(m_primitiveRequest,std::nullopt);
+    return std::exchange(m_primitiveRequest, std::nullopt);
 }
 
 bool SceneHierarchyPanel::TakeEmptyObjectRequest()

@@ -2,12 +2,14 @@
 #include "Core/Log.h"
 
 #include <climits>
+#include <string>
 #include <utility>
 
 DescriptorHeap::DescriptorHeap(DescriptorHeap&& other) noexcept
     : m_heap(other.m_heap), m_type(other.m_type), m_descriptorSize(other.m_descriptorSize),
       m_capacity(other.m_capacity), m_shaderVisible(other.m_shaderVisible),
-      m_freeIndices(std::move(other.m_freeIndices))
+      m_freeIndices(std::move(other.m_freeIndices)), m_peakAllocated(other.m_peakAllocated),
+      m_failedAllocations(other.m_failedAllocations), m_exhaustionReported(other.m_exhaustionReported)
 {
     other.m_heap = nullptr;
     other.m_descriptorSize = 0;
@@ -27,6 +29,9 @@ DescriptorHeap& DescriptorHeap::operator=(DescriptorHeap&& other) noexcept
 
         m_shaderVisible = other.m_shaderVisible;
         m_freeIndices = std::move(other.m_freeIndices);
+        m_peakAllocated = other.m_peakAllocated;
+        m_failedAllocations = other.m_failedAllocations;
+        m_exhaustionReported = other.m_exhaustionReported;
 
         other.m_heap = nullptr;
         other.m_descriptorSize = 0;
@@ -64,6 +69,9 @@ bool DescriptorHeap::Initialize(
 
     m_freeIndices.clear();
     m_freeIndices.reserve(m_capacity);
+    m_peakAllocated = 0;
+    m_failedAllocations = 0;
+    m_exhaustionReported = false;
 
     for (unsigned int i = m_capacity; i > 0; --i)
     {
@@ -91,13 +99,29 @@ unsigned int DescriptorHeap::Allocate()
 
     if (m_freeIndices.empty())
     {
-        Log::Error("Descriptor heap is full.");
+        ++m_failedAllocations;
+
+        // Callers own retry policy. Report the episode once rather than on every
+        // retried allocation, so a persistent shortage cannot flood the log.
+        if (!m_exhaustionReported)
+        {
+            m_exhaustionReported = true;
+            Log::Error("Descriptor heap is full (capacity " + std::to_string(m_capacity) +
+                "). Further failures are counted but not logged until a descriptor is released.");
+        }
 
         return UINT_MAX;
     }
 
     unsigned int index = m_freeIndices.back();
     m_freeIndices.pop_back();
+
+    const size_t allocated = m_capacity - m_freeIndices.size();
+
+    if (allocated > m_peakAllocated)
+    {
+        m_peakAllocated = allocated;
+    }
 
     return index;
 }
@@ -110,6 +134,18 @@ void DescriptorHeap::Free(unsigned int index)
     }
 
     m_freeIndices.push_back(index);
+    m_exhaustionReported = false;
+}
+
+DescriptorHeap::Statistics DescriptorHeap::GetStatistics() const noexcept
+{
+    Statistics statistics;
+    statistics.capacity = m_capacity;
+    statistics.available = m_freeIndices.size();
+    statistics.allocated = m_capacity - m_freeIndices.size();
+    statistics.peakAllocated = m_peakAllocated;
+    statistics.failedAllocations = m_failedAllocations;
+    return statistics;
 }
 
 D3D12_CPU_DESCRIPTOR_HANDLE DescriptorHeap::GetCPUHandle(unsigned int index) const

@@ -56,6 +56,7 @@ public:
         std::string digest; // Filled on the worker, never hashed on the owner thread.
         std::uint32_t importerRevision = ModelImporter::kImportRevision;
         MeshUVOrientation uvPolicy = MeshUVOrientation::FlipV;
+        MeshImportUnits units;
         bool operator==(const Identity&) const = default;
         ProjectMeshCPUCache::Key CacheKey() const;
     };

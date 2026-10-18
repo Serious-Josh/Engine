@@ -2,6 +2,7 @@
 #include "RayTracingSceneResources.h"
 
 #include "Renderer/CommandContext.h"
+#include "Renderer/DescriptorHeap.h"
 #include "Renderer/Material.h"
 #include "Renderer/Mesh.h"
 #include "Renderer/ShaderData.h"
@@ -10,6 +11,7 @@
 
 #include <wrl/client.h>
 #include <algorithm>
+#include <string>
 #include <cstring>
 #include <set>
 #include <type_traits>
@@ -209,9 +211,16 @@ struct RayTracingSceneResources::CandidateState
 std::optional<RayTracingSceneResources::ReplacementCandidate> RayTracingSceneResources::PrepareReplacementCandidate(
     ID3D12Device5* device, DescriptorHeap& heap, const FileSceneRuntime& runtime, FileSceneAssetCatalog& catalog,
     const std::vector<ResidencyProposal>& proposals, std::size_t materialCount, std::string& error,
-    const FileSceneRuntime* membershipSource)
+    const FileSceneRuntime* membershipSource, CandidateFailure* failure)
 {
     error.clear();
+
+    // Every early return below is an ordinary failure unless marked as exhaustion.
+    if (failure)
+    {
+        *failure = CandidateFailure::Other;
+    }
+
     const auto& scene = runtime.GetScene();
     const auto& objects = scene.GetRenderObjects();
 
@@ -261,6 +270,21 @@ std::optional<RayTracingSceneResources::ReplacementCandidate> RayTracingSceneRes
                 return std::nullopt;
             }
         }
+    }
+
+    // Check descriptor capacity before pinning or allocating anything, so exhaustion is
+    // reported without a partial candidate and without a failed-allocation log per attempt.
+    if (!heap.CanAllocate(CandidateDescriptorCount))
+    {
+        if (failure)
+        {
+            *failure = CandidateFailure::DescriptorExhausted;
+        }
+
+        error = "Descriptor heap exhausted: the membership candidate needs " +
+            std::to_string(CandidateDescriptorCount) + " SRVs, " + std::to_string(heap.GetAvailableCount()) +
+            " available of " + std::to_string(heap.GetCapacity()) + ".";
+        return std::nullopt;
     }
 
     // Establish the manager pin before fallible allocation. Even a later failure
@@ -528,6 +552,13 @@ std::optional<RayTracingSceneResources::ReplacementCandidate> RayTracingSceneRes
         !snapshot.slotMaterials.InitializeStorage(device, sizeof(unsigned int), static_cast<UINT>(materials.size()), heap) ||
         !snapshot.instanceDataBuffer.InitializeStorage(device, sizeof(RayTracingInstanceData), static_cast<UINT>((std::max)(objects.size(),std::size_t{1})), heap))
     {
+        // The capacity check above makes this unlikely, but a storage failure with an
+        // empty heap is still exhaustion. The pinned candidate releases what it allocated.
+        if (failure && heap.GetAvailableCount() == 0)
+        {
+            *failure = CandidateFailure::DescriptorExhausted;
+        }
+
         Fail(error, "Candidate membership/table allocation failed.");
         return std::nullopt;
     }
@@ -548,6 +579,12 @@ std::optional<RayTracingSceneResources::ReplacementCandidate> RayTracingSceneRes
 
     state.proposals = proposals;
     state.failed = false;
+
+    if (failure)
+    {
+        *failure = CandidateFailure::None;
+    }
+
     ReplacementCandidate result;
     result.m_state = m_candidate;
     return result;

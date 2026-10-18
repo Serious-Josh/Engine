@@ -83,6 +83,23 @@ public:
     bool SetObjectPhysics(const SceneObjectMetadata& selection,
         const std::optional<Physics::PhysicsComponent>& expected,
         const std::optional<Physics::PhysicsComponent>& replacement, std::string* errorMessage = nullptr);
+    bool CaptureTriggerColliderInspection(std::string_view objectID, SceneObjectDocument& object) const
+    {
+        size_t index = 0;
+        return m_runtime->CaptureObjectDeletionSnapshot(objectID, object, index);
+    }
+    bool SetObjectTriggerCollider(const SceneObjectMetadata& selection,
+        const std::optional<Physics::TriggerColliderComponent>& expected,
+        const std::optional<Physics::TriggerColliderComponent>& replacement, std::string* errorMessage = nullptr);
+    bool CaptureCharacterControllerInspection(std::string_view objectID, SceneObjectDocument& object) const
+    {
+        size_t index = 0;
+        return m_runtime->CaptureObjectDeletionSnapshot(objectID, object, index);
+    }
+    bool SetObjectCharacterController(const SceneObjectMetadata& selection,
+        const std::optional<Physics::CharacterControllerComponent>& expected,
+        const std::optional<Physics::CharacterControllerComponent>& replacement, std::string* errorMessage = nullptr);
+    bool ValidateObjectTransform(RenderObjectID index, const Transform& transform, std::string& error) const;
     bool RenameObject(const SceneObjectMetadata& selection, std::string_view expectedName,
         std::string name, std::string* errorMessage = nullptr,
         SceneObjectNamePolicy policy = SceneObjectNamePolicy::TrimmedInput);
@@ -152,13 +169,18 @@ private:
 
     friend class Editor;
     friend class Engine;
+#if defined(ENGINE_HAS_VERIFICATION)
+    friend class PortableEditorVerification;
     friend class SceneMaterialBindingVerification;
     friend class SceneDuplicationVerification;
     friend class ScenePhysicsDataVerification;
     friend class PrimitiveCreationVerification;
     friend class MarqueeSelectionVerification;
     friend class SceneMembershipVerification;
+    friend class SceneHierarchyVerification;
+    friend class DescriptorRecoveryVerification;
     friend class ViewportMaterialDropVerification;
+#endif
     // Engine retains both runtimes until checked candidate initialization/cleanup.
     std::unique_ptr<FileSceneRuntime> m_objectMutationCandidate;
 

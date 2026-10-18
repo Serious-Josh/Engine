@@ -242,6 +242,14 @@ class Renderer
             m_materialPreviewRenderer.GetMeshThumbnailError(ticket).empty();
     }
 
+    // True when preparation itself failed (unreadable, unsupported or invalid source), as opposed
+    // to a temporary GPU-side failure reported through GetMeshThumbnailError.
+    bool HasMeshThumbnailPreparationFailed(std::uint64_t ticket) const
+    {
+        const auto* job = m_materialPreviewRenderer.GetMeshThumbnailPreparation(ticket);
+        return job && job->state == MeshThumbnailPreparation::State::Failed;
+    }
+
     void DiscardMeshThumbnail(std::uint64_t ticket,
         MaterialPreviewRenderer::MeshThumbnailConsumer consumer = MaterialPreviewRenderer::MeshThumbnailConsumer::AssetBrowser)
     {
@@ -279,11 +287,23 @@ class Renderer
     ShaderLibrary& GetShaderLibrary();
     DebugUI& GetDebugUI();
 
+    // Shared shader-visible CBV/SRV/UAV heap accounting for diagnostics; never logs.
+    DescriptorHeap::Statistics GetResourceDescriptorStatistics() const noexcept
+    {
+        return m_resourceDescriptorHeap.GetStatistics();
+    }
+
+    // Main-thread reclaim boundary for descriptor exhaustion. Outside any recording, asks the
+    // Editor texture-thumbnail and mesh-thumbnail caches to release idle, fence-retired SRVs.
+    // Scene, DXR, material and in-flight descriptors are never touched. Returns the count freed.
+    size_t ReclaimIdleEditorDescriptors();
+
     // Preparation only. No scene mesh binding or active DXR snapshot publication.
     std::optional<RayTracingSceneResources::ReplacementCandidate> PrepareDXRMembershipCandidate(
         const FileSceneRuntime& runtime, FileSceneAssetCatalog& catalog,
         const std::vector<RayTracingSceneResources::ResidencyProposal>& proposals,
-        unsigned int frameSlot, std::string& error, const FileSceneRuntime* membershipSource = nullptr);
+        unsigned int frameSlot, std::string& error, const FileSceneRuntime* membershipSource = nullptr,
+        RayTracingSceneResources::CandidateFailure* failure = nullptr);
     RayTracingSceneResources::CandidateStatus PollDXRMembershipCandidate(
         const RayTracingSceneResources::ReplacementCandidate& candidate, const FileSceneRuntime& runtime,
         FileSceneAssetCatalog& catalog, std::string& error) const;
@@ -380,6 +400,13 @@ class Renderer
         FileSceneAssetCatalog& catalog, FileSceneRuntime& runtime);
     void CancelMaterialAdmission();
     static constexpr size_t MaterialAdmissionLimit = 4096;
+
+    // Shared shader-visible CBV/SRV/UAV heap. Measured in B.1: 119 descriptors after renderer
+    // initialization; Editor preview caches can hold up to ~137 more (64 texture thumbnails,
+    // 9 mesh thumbnail jobs, 32 material images, 32 preview textures); each unique resident mesh
+    // needs 2 and each texture 1. The previous 256 could be exhausted by the Editor alone.
+    // 4096 matches MaterialAdmissionLimit and costs ~128 KiB. Exhaustion still recovers (B.1).
+    static constexpr unsigned int ResourceDescriptorCapacity = 4096;
     bool CanEditPendingMaterialBindings(const Scene& scene) const noexcept;
     struct SelectionPublicationIdentity
     {
@@ -443,18 +470,31 @@ class Renderer
     private:
     friend class MeshResidencyPublication;
     friend class FileSceneRuntime;
+#if defined(ENGINE_HAS_VERIFICATION)
     friend class PresentationTransformVerification;
+    friend class ScenePhysicsDataVerification;
+    friend class SceneHierarchyVerification;
+    friend class DescriptorRecoveryVerification;
+    friend class ThumbnailSchedulingVerification;
+    friend class NormalMapVerification;
+#endif
     friend class SceneMembershipPublication;
+#if defined(ENGINE_HAS_VERIFICATION)
     friend class SceneDuplicationVerification;
     friend class SceneMembershipVerification;
+#endif
     friend class SceneMaterialBindingPublication;
+#if defined(ENGINE_HAS_VERIFICATION)
     friend class SceneMaterialBindingVerification;
     friend class MaterialAdmissionVerification;
+#endif
     friend class ArchiveSurfaceAdmission;
     MaterialAdmissionResult AdvanceMaterialAdmissionInternal(ProjectMaterialPreparationService&,
         std::shared_ptr<const ProjectMaterialPreparationService::Candidate>, FileSceneAssetCatalog&,
         const ProjectPaths*, const ProjectAssetRegistry*, FileSceneRuntime&);
+#if defined(ENGINE_HAS_VERIFICATION)
     friend class ViewportMaterialDropVerification;
+#endif
     static constexpr bool kEnableFrameHitchDiagnostics = true;
     static constexpr double kCpuHitchThresholdMilliseconds = 25.0;
 
@@ -1078,8 +1118,9 @@ class Renderer
 
     std::vector<const Material*> m_publishedMaterialIdentities;
     MaterialTablePublication<CommandContext::FrameCount> m_materialPublication;
-    // The existing resource heap has 256 descriptors; retain no more distinct dependencies.
-    MaterialDependencyRetention<Texture::Dependency, CommandContext::FrameCount, 256> m_materialDependencies;
+    // Retain no more distinct dependencies than the resource heap can describe.
+    MaterialDependencyRetention<Texture::Dependency, CommandContext::FrameCount, ResourceDescriptorCapacity>
+        m_materialDependencies;
     struct TextureUploadEntry
     {
         std::uint64_t ticket = 0;

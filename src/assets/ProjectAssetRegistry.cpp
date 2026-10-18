@@ -106,6 +106,25 @@ bool ProjectAssetRegistry::Unregister(const AssetID& id)
     return m_records.size() != oldSize;
 }
 
+bool ProjectAssetRegistry::UpdateMeshImportUnits(const AssetID& id, const MeshImportUnits& units)
+{
+    if(!units.IsValid())
+    {
+        return false;
+    }
+
+    for(auto& record : m_records)
+    {
+        if(record.id == id && record.type == AssetType::Mesh)
+        {
+            record.meshImportUnits = units;
+            return true;
+        }
+    }
+
+    return false;
+}
+
 void ProjectAssetRegistry::Clear() noexcept
 {
     m_records.clear();

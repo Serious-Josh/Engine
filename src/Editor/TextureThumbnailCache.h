@@ -58,6 +58,11 @@ public:
     // Ready queries pin the descriptor through the next Renderer submission.
     const Preview* Query(Ticket ticket);
     void Release(Ticket ticket, Consumer consumer);
+
+    // Descriptor-pressure reclaim hook. Releases SRVs held by idle entries only: no consumer
+    // pin, no upload or display generation, nothing awaiting submission, and every fence
+    // retired. Visible tiles re-request their previews later. Returns the number released.
+    size_t ReleaseIdleDescriptors();
     void ReleaseConsumer(Consumer consumer, bool invalidate = false);
     D3D12_GPU_DESCRIPTOR_HANDLE GetHandle(const Preview& preview) const;
 

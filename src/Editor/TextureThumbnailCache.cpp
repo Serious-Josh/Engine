@@ -547,6 +547,24 @@ bool TextureThumbnailCache::EvictUnused(Entry* exclude, bool requireDescriptor)
     return true;
 }
 
+size_t TextureThumbnailCache::ReleaseIdleDescriptors()
+{
+    if(!m_heap)
+    {
+        return 0;
+    }
+
+    // EvictUnused applies the same consumer and fence-retirement checks as normal eviction.
+    size_t released = 0;
+
+    while(EvictUnused(nullptr, true))
+    {
+        ++released;
+    }
+
+    return released;
+}
+
 TextureThumbnailCache::Diagnostics TextureThumbnailCache::GetDiagnostics() const
 {
     Diagnostics result;

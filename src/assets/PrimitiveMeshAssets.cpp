@@ -154,7 +154,11 @@ bool Ensure(const ProjectPaths& paths, ProjectAssetRegistry& registry, ScenePrim
         const auto cooked=CookedMesh::Encode(imported,{});
         if(cooked.status!=CookedMesh::Status::Success) throw std::runtime_error(std::string(cooked.message));
         std::filesystem::path importedPath;
-        if(!ProjectMeshImportService::Import(paths,registry,cleanup.source,importedPath,error)) return false;
+        if(!ProjectMeshImportService::Import(paths, registry, cleanup.source, importedPath, error, MeshImportUnits{}))
+        {
+            return false;
+        }
+
         const auto* record=registry.FindByPath(importedPath.lexically_relative(paths.GetRoot()));
         if(!record) throw std::runtime_error("Imported primitive registration is absent.");
         reference=record->id.ToReference();

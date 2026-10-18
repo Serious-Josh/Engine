@@ -6,6 +6,7 @@
 #include "ViewportCameraInput.h"
 #include "SceneViewportLayout.h"
 #include "GroupTransform.h"
+#include "ScenePrimitiveCreation.h"
 #include "ViewportPicking.h"
 #include "InspectorNumericDrag.h"
 #include "Debug/DebugUI.h"
@@ -734,12 +735,6 @@ void Editor::CommitObjectReorder(IDemoScene& scene, const HierarchyReorderReques
 
 void Editor::DrawHierarchy(IDemoScene& demoScene, const std::string& activeSceneName)
 {
-    if(!m_workspace.HierarchyVisible())
-    {
-        CancelObjectRename();
-        return;
-    }
-
     const auto& scene = demoScene.GetScene();
     SceneHierarchySnapshot snapshot;
     snapshot.sceneName = activeSceneName;
@@ -762,6 +757,14 @@ void Editor::DrawHierarchy(IDemoScene& demoScene, const std::string& activeScene
 
     const std::optional<size_t> selected = m_selectedObject == InvalidObjectSelection ?
         std::nullopt : std::optional<size_t>{m_selectedObject};
+    m_hierarchyPanel.ObserveSelection(snapshot, selected, m_historyEpoch, &scene);
+
+    if(!m_workspace.HierarchyVisible())
+    {
+        CancelObjectRename();
+        return;
+    }
+
     const bool blocked = m_sceneOperationPending || m_fileRequest || m_materialLeaveAction != MaterialLeaveAction::None ||
         HasPendingSceneHistoryOperation() || m_sceneObjectDeletionPending || m_sceneObjectDeletionRequest ||
         m_materialAssignmentPending || m_materialAssignmentRequest || m_gizmoWasUsing ||
@@ -783,14 +786,20 @@ void Editor::DrawHierarchy(IDemoScene& demoScene, const std::string& activeScene
         !m_renameIntent && !ImGui::GetIO().AppFocusLost &&
         !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel);
     const HierarchyDragIdentity dragIdentity{m_historyEpoch,
-        fileScene ? fileScene->GetRuntimeIdentity() : 0, scene.GetStructureRevision()};
+        fileScene ? fileScene->GetRuntimeIdentity() : 0, scene.GetStructureRevision(),
+        fileScene ? fileScene->m_runtime->GetHierarchyRevision() : 0};
 
     ImGui::BeginDisabled(blocked);
     const auto clicked = m_hierarchyPanel.Draw(m_workspace.GetHierarchy(), snapshot, selected, &scene, error,
         dragIdentity, allowReorder,
         !IsPhysicsEditingLocked() && !blocked && fileScene && !fileScene->IsArchiveActivation() &&
         m_historySession && RenameSessionMatches(demoScene,*m_historySession) &&
-        !m_inspectorPanel.HasUnsavedChanges() && !m_renameIntent, m_selectedObjects);
+        !m_inspectorPanel.HasUnsavedChanges() && !m_renameIntent, m_selectedObjects,
+        [&](const HierarchyDropRequest& request, std::string& reason)
+        {
+            SceneHierarchyEdit preview;
+            return PrepareHierarchyDrop(demoScene, request, preview, reason);
+        });
     ImGui::EndDisabled();
 
     if(auto primitive=m_hierarchyPanel.TakePrimitiveRequest())
@@ -812,11 +821,21 @@ void Editor::DrawHierarchy(IDemoScene& demoScene, const std::string& activeScene
         }
     }
 
-    if(auto reorder = m_hierarchyPanel.TakeReorderRequest())
+    if(auto drop = m_hierarchyPanel.TakeDropRequest())
     {
         if(allowReorder)
         {
-            CommitObjectReorder(demoScene, *reorder);
+            try
+            {
+                if(SubmitHierarchyDrop(demoScene, *drop, m_reorderStatus))
+                {
+                    m_reorderStatus.clear();
+                }
+            }
+            catch(const std::exception& exception)
+            {
+                m_reorderStatus = exception.what();
+            }
         }
     }
 
@@ -856,8 +875,14 @@ void Editor::DrawHierarchy(IDemoScene& demoScene, const std::string& activeScene
 void Editor::ActivateObjectInspection(
     IDemoScene& demoScene, const ProjectPaths& paths, const ProjectAssetRegistry& registry)
 {
+    DismissAddComponentPopup();
+    DismissTriggerManagementPopup();
+    DismissControllerManagementPopup();
     m_objectInspectionIdentity.reset();
+    m_transformEditStatus.clear();
     m_physicsInspection.reset();
+    m_triggerInspection.reset();
+    m_controllerInspection.reset();
     m_inspectorTarget = InspectorTarget::None;
     m_inspectorPanel.LoadSelection({}, paths, registry);
     const auto& scene = static_cast<const IDemoScene&>(demoScene).GetScene();
@@ -1141,6 +1166,10 @@ void Editor::Draw(
     const bool disableInspector = IsPhysicsEditingLocked() || m_materialLeaveAction != MaterialLeaveAction::None || m_sceneOperationPending ||
         m_pendingMaterialBinding.has_value();
 
+    ValidateAddComponentPopup(demoScene);
+    ValidateTriggerManagementPopup(demoScene);
+    ValidateControllerManagementPopup(demoScene);
+
     // This ImGui version's color picker restores alpha whenever a disabled scope exists,
     // including BeginDisabled(false), whose alpha backup may never have been initialized.
     if(disableInspector)
@@ -1165,11 +1194,19 @@ void Editor::Draw(
     {
         if(objectView)
         {
+            // The controller section re-offers its object to the drive toggle every frame.
+            m_characterDriveCandidate.reset();
             m_inspectorPanel.DrawSceneObject(m_workspace.GetInspector(), *objectView, [this, &demoScene]()
             {
                 DrawSelectedObjectTransformControls(demoScene);
+            }, projectPaths, assetRegistry, m_materialAssignmentPending, m_materialAssignmentStatus,
+            [this, &demoScene]()
+            {
                 DrawObjectPhysicsControls(demoScene);
-            }, projectPaths, assetRegistry, m_materialAssignmentPending, m_materialAssignmentStatus);
+                DrawObjectTriggerColliderControls(demoScene);
+                DrawObjectCharacterControllerControls(demoScene);
+                DrawAddComponentControls(demoScene);
+            });
 
             if(!m_materialAssignmentPending && !m_inspectorPanel.GetSlotPickerStatus().empty())
             {
@@ -1205,6 +1242,8 @@ void Editor::Draw(
     if(!objectView || !m_workspace.InspectorVisible())
     {
         m_physicsInspection.reset();
+        m_triggerInspection.reset();
+        m_controllerInspection.reset();
         m_inspectorPanel.ReleaseSceneObjectPreview();
         m_inspectorPanel.DismissSceneMaterialPicker();
     }
@@ -1319,6 +1358,7 @@ void Editor::Draw(
 
     const ImGuiIO& io = ImGui::GetIO();
 
+    const bool viewportWasFocused = m_viewportFocused;
     m_viewportFocused = ViewportCameraInput::UpdateFocus(m_viewportFocused, m_cameraLooking, m_viewportHovered);
 
     if(io.AppFocusLost || m_sceneOperationPending || m_viewportImage.size.x <= 0.0f || m_workspace.IsSplitterDragging())
@@ -1397,8 +1437,9 @@ void Editor::Draw(
     UpdateCameraLook(demoScene, m_viewportImage.size.x, m_viewportImage.size.y);
     UpdateCameraMovement(demoScene, deltaTime);
     DrawTransformGizmo(demoScene, m_viewportImage.size.x, m_viewportImage.size.y);
-    HandleViewportSelection(demoScene, m_viewportImage.size.x, m_viewportImage.size.y);
+    HandleViewportSelection(demoScene, m_viewportImage.size.x, m_viewportImage.size.y, viewportWasFocused);
     DrawSceneObjectDeletionControls(demoScene);
+    UpdateCharacterDriveInput(demoScene);
 }
 
 void Editor::DrawSphereGridControls(SphereGridScene& demoScene)
@@ -1634,15 +1675,21 @@ void Editor::DrawSelectedObjectTransformControls(IDemoScene& demoScene)
         return std::isfinite(value.x) && std::isfinite(value.y) && std::isfinite(value.z);
     };
 
-    if(!IsPhysicsEditingLocked() && transformChanged && finite(transform.position) && finite(transform.rotation) && finite(transform.scale))
+    if(!IsPhysicsEditingLocked() && m_fieldHistoryTarget && transformChanged && finite(transform.position) && finite(transform.rotation) && finite(transform.scale))
     {
-        scene.SetRenderObjectTransform(m_selectedObject, transform);
+        ApplyObjectTransformEdit(demoScene, m_selectedObject, transform);
     }
 
     if(fieldDeactivated && m_transformFieldEditing)
     {
         FinishTransformFieldEdit(demoScene);
     }
+
+    if(!m_transformEditStatus.empty())
+    {
+        ImGui::TextWrapped("%s", m_transformEditStatus.c_str());
+    }
+
     ImGui::EndDisabled();
 }
 
@@ -1657,7 +1704,7 @@ void Editor::FinishTransformFieldEdit(IDemoScene& demoScene)
 
         if(index)
         {
-            RecordTransformEdit(*m_fieldHistoryTarget, m_fieldHistoryEpoch, m_transformFieldUndoStart,
+            RecordTransformEdit(std::move(*m_fieldHistoryTarget), m_fieldHistoryEpoch, m_transformFieldUndoStart,
                 static_cast<const Scene&>(scene).GetRenderObjects()[*index].transform);
         }
     }
@@ -1793,7 +1840,7 @@ void Editor::UpdateGroupGizmo(IDemoScene& demoScene, bool usingGizmo, const Tran
                     if(!resolved) { m_gizmoWasUsing = true; return; }
                     updates.push_back({*resolved, after[index]});
                 }
-                if(!demoScene.GetScene().SetRenderObjectTransforms(updates))
+                if(!ApplyObjectTransformEdits(demoScene, updates))
                     ReportSceneHistoryFailure("Invalid group transform; no objects were changed.");
                 else
                 {
@@ -1849,6 +1896,25 @@ void Editor::DrawTransformGizmo(
 
     if (m_selectedObject >= objects.size())
     {
+        return;
+    }
+
+    // Parented scenes load from schema 9, but a world-space gizmo edit of a child needs the
+    // H.5 world-to-local conversion; writing a decomposed world matrix as its local TRS would
+    // move it. Block the whole gesture as for physics locks; Inspector local edits remain.
+    const bool selectionHasParent = constScene.HasHierarchyParent(m_selectedObject) ||
+        std::any_of(m_selectedObjects.begin(), m_selectedObjects.end(), [&](size_t selected)
+        {
+            return constScene.HasHierarchyParent(selected);
+        });
+
+    if (selectionHasParent)
+    {
+        ImGuizmo::Enable(false);
+        m_gizmoGroupEdit.reset();
+        m_gizmoWasUsing = false;
+        m_gizmoUndoObject = InvalidObjectSelection;
+        m_gizmoHistoryTarget.reset();
         return;
     }
 
@@ -1920,7 +1986,7 @@ void Editor::DrawTransformGizmo(
         m_gizmoHistoryEpoch = m_historyEpoch;
     }
 
-    if (gizmoUsing)
+    if(gizmoUsing && m_gizmoHistoryTarget)
     {
         float translation[3];
         float rotationDegrees[3];
@@ -1969,8 +2035,13 @@ void Editor::DrawTransformGizmo(
 
         if (changed)
         {
-            scene.SetRenderObjectTransform(m_selectedObject, transform);
+            ApplyObjectTransformEdit(demoScene, m_selectedObject, transform);
         }
+    }
+
+    if(gizmoUsing && !m_transformEditStatus.empty())
+    {
+        ImGui::SetTooltip("%s", m_transformEditStatus.c_str());
     }
 
     if(!gizmoUsing && m_gizmoWasUsing && m_gizmoHistoryTarget)
@@ -1979,7 +2050,7 @@ void Editor::DrawTransformGizmo(
 
         if(index)
         {
-            RecordTransformEdit(*m_gizmoHistoryTarget, m_gizmoHistoryEpoch, m_gizmoUndoStart,
+            RecordTransformEdit(std::move(*m_gizmoHistoryTarget), m_gizmoHistoryEpoch, m_gizmoUndoStart,
                 static_cast<const Scene&>(scene).GetRenderObjects()[*index].transform);
         }
 
@@ -1993,7 +2064,8 @@ void Editor::DrawTransformGizmo(
 void Editor::HandleViewportSelection(
     IDemoScene& demoScene,
     float viewportWidth,
-    float viewportHeight)
+    float viewportHeight,
+    bool viewportWasFocused)
 {
     if(UpdateViewportMarquee(demoScene))
     {
@@ -2021,6 +2093,14 @@ void Editor::HandleViewportSelection(
     const ImVec2 mouse(io.MousePos.x - m_viewportImage.position.x, io.MousePos.y - m_viewportImage.position.y);
 
     if (mouse.x < 0.0f || mouse.y < 0.0f || mouse.x >= viewportWidth || mouse.y >= viewportHeight)
+    {
+        return;
+    }
+
+    // While driving, an unmodified click that acquires keyboard focus must not also
+    // replace the controller selection. Once focused, picking and marquee work normally.
+    if(m_characterDrive && m_physicsState == PhysicsState::Playing && !viewportWasFocused &&
+        m_viewportFocused && !io.KeyShift && !io.KeyCtrl && !io.KeyAlt)
     {
         return;
     }
@@ -2137,12 +2217,12 @@ void Editor::UpdateCameraLook(
                     for(const auto& edit : m_gizmoGroupEdit->edits)
                         if(const auto index = ResolveHistoryTarget(demoScene, edit.target))
                             updates.push_back({*index, edit.before});
-                    demoScene.GetScene().SetRenderObjectTransforms(updates);
+                    ApplyObjectTransformEdits(demoScene, updates);
                 }
                 else if(m_gizmoHistoryTarget)
                 {
                     if(const auto index = ResolveHistoryTarget(demoScene, *m_gizmoHistoryTarget))
-                        demoScene.GetScene().SetRenderObjectTransform(*index, m_gizmoUndoStart);
+                        ApplyObjectTransformEdit(demoScene, *index, m_gizmoUndoStart);
                 }
             }
             ImGuizmo::Enable(false);
@@ -2414,6 +2494,14 @@ void Editor::OnSceneActivated()
 
 void Editor::ResetSceneInteractions()
 {
+    DismissAddComponentPopup();
+    DismissTriggerManagementPopup();
+    DismissControllerManagementPopup();
+    m_triggerInspection.reset();
+    m_controllerInspection.reset();
+    m_triggerEditStatus.clear();
+    m_controllerEditStatus.clear();
+    m_transformEditStatus.clear();
     m_pendingMaterialBinding.reset();
     m_viewportMaterialRequest.reset();
     m_materialDropHover.reset();
@@ -3015,12 +3103,16 @@ void Editor::DrawSceneObjectDeletionControls(IDemoScene& scene)
 
     FinishViewportRightClick(scene);
 
-    const bool keyboardAllowed = m_viewportFocused && !SceneObjectDeletionBlocked() &&
-        !m_openSceneContext && !m_viewportRightGesture &&
-        !io.WantTextInput && !io.WantCaptureKeyboard && !ImGui::IsAnyItemActive() &&
-        !m_cameraLooking && !ImGuizmo::IsUsing() && !ImGui::IsMouseDown(ImGuiMouseButton_Right) &&
-        m_viewportImage.size.x > 0.0f && m_viewportImage.size.y > 0.0f &&
-        !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel);
+    // Hierarchy keyboard navigation normally sets WantCaptureKeyboard itself.
+    // Its focused window may own Delete, but active edits, gestures and popups may not.
+    const ImGuiWindow* keyboardWindow = ImGui::GetCurrentContext()->NavWindow;
+    const bool hierarchyHasKeyboardFocus = keyboardWindow &&
+        keyboardWindow->RootWindow == ImGui::FindWindowByName("Hierarchy");
+    const bool hierarchyKeyboardAllowed = m_workspace.HierarchyVisible() && m_hierarchyPanel.IsFocused() &&
+        hierarchyHasKeyboardFocus && ImGui::TestKeyOwner(ImGuiKey_Delete, ImGuiKeyOwner_NoOwner) &&
+        !m_hierarchyPanel.IsRenaming() && !m_openSceneContext && !HistoryReplayBlocked();
+    const bool keyboardAllowed = (ViewportOwnsKeyboard() || hierarchyKeyboardAllowed) &&
+        !SceneObjectDeletionBlocked();
 
     if(keyboardAllowed && ImGui::IsKeyPressed(ImGuiKey_Delete, false))
     {
@@ -3070,7 +3162,41 @@ void Editor::DrawSceneObjectContextMenu(IDemoScene& scene)
                 QueueObjectRename(scene, *current);
             }
 
-            if(ImGui::MenuItem("Delete"))
+            if(ImGui::MenuItem("Create Empty Object"))
+            {
+                QueueHierarchyEmpty(scene, {}, m_reorderStatus);
+            }
+
+            if(ImGui::MenuItem("Create Child Empty Object"))
+            {
+                QueueHierarchyEmpty(scene, current->objectID, m_reorderStatus);
+            }
+
+            if(ImGui::MenuItem("Duplicate Object / Subtree"))
+            {
+                QueueSceneObjectDuplication(scene, *current, m_reorderStatus);
+            }
+
+            const auto& document = owner->m_runtime->GetFileScene().GetDocument();
+            const auto authored = std::find_if(document.objects.begin(), document.objects.end(),
+                [&](const auto& object) { return object.id == current->objectID; });
+
+            if(authored != document.objects.end() && !authored->parentID.empty() && ImGui::BeginMenu("Move to Root"))
+            {
+                if(ImGui::MenuItem("Keep World"))
+                {
+                    QueueHierarchyReparent(scene, current->objectID, {}, true, {}, m_reorderStatus);
+                }
+
+                if(ImGui::MenuItem("Keep Local"))
+                {
+                    QueueHierarchyReparent(scene, current->objectID, {}, false, {}, m_reorderStatus);
+                }
+
+                ImGui::EndMenu();
+            }
+
+            if(ImGui::MenuItem("Delete Object / Subtree"))
             {
                 QueueSceneObjectDeletion(scene, *current);
             }
@@ -3236,30 +3362,41 @@ bool Editor::RebindSceneHistoryAfterStructureChange(const IDemoScene& demoScene)
 
 std::optional<Editor::HistoryTarget> Editor::CaptureHistoryTarget(const IDemoScene& demoScene, size_t index)
 {
-    const auto& scene = demoScene.GetScene();
-
-    if(!m_historySession || m_historyObservedScene != &scene ||
-        m_historyStructureRevision != scene.GetStructureRevision() || index >= scene.GetRenderObjects().size())
+    try
     {
-        ReportSceneHistoryFailure("Cannot record a transform against stale scene mappings.");
-        return std::nullopt;
-    }
+        const auto& scene = demoScene.GetScene();
 
-    if(const auto* owner = dynamic_cast<const FileBackedDemoScene*>(&demoScene))
-    {
-        const auto metadata = owner->GetObjectMetadata(index);
-
-        if(!metadata || metadata->runtimeIdentity != m_historyRuntimeIdentity ||
-            metadata->sceneID != m_historySession->sceneIdentity)
+        if(!m_historySession || m_historyObservedScene != &scene ||
+            m_historyStructureRevision != scene.GetStructureRevision() || index >= scene.GetRenderObjects().size())
         {
-            ReportSceneHistoryFailure("Cannot identify the edited object's persistent ID.");
+            ReportSceneHistoryFailure("Cannot record a transform against stale scene mappings.");
             return std::nullopt;
         }
 
-        return PersistentHistoryTarget{metadata->objectID};
-    }
+        // Reserve before the first live change; completion moves the captured target.
+        m_sceneHistory.reserve(kSceneHistoryCapacity);
 
-    return ProceduralHistoryTarget{index};
+        if(const auto* owner = dynamic_cast<const FileBackedDemoScene*>(&demoScene))
+        {
+            const auto metadata = owner->GetObjectMetadata(index);
+
+            if(!metadata || metadata->runtimeIdentity != m_historyRuntimeIdentity ||
+                metadata->sceneID != m_historySession->sceneIdentity ||
+                metadata->objectID.capacity() + sizeof(SceneHistoryEntry) + 1 > kSceneHistoryPayloadBytes)
+            {
+                ReportSceneHistoryFailure("Cannot prepare the edited object's persistent history target.");
+                return std::nullopt;
+            }
+
+            return PersistentHistoryTarget{metadata->objectID};
+        }
+
+        return ProceduralHistoryTarget{index};
+    }
+    catch(const std::bad_alloc&)
+    {
+        return std::nullopt;
+    }
 }
 
 std::optional<size_t> Editor::ResolveHistoryTarget(const IDemoScene& demoScene, const HistoryTarget& target)
@@ -3438,6 +3575,62 @@ void Editor::ReplaySceneHistory(IDemoScene& demoScene, bool redo)
         return;
     }
 
+    if(const auto* trigger = std::get_if<std::unique_ptr<TriggerColliderEdit>>(&entry.command); trigger && *trigger)
+    {
+        const auto& edit = **trigger;
+        auto* owner = dynamic_cast<FileBackedDemoScene*>(&demoScene);
+
+        if(!owner || !RenameSessionMatches(demoScene, edit.session))
+        {
+            ReportSceneHistoryFailure("Trigger Collider replay belongs to a stale scene session.");
+            return;
+        }
+
+        const auto selection = owner->GetObjectMetadata(edit.objectID);
+        std::string error;
+
+        if(!selection || !owner->SetObjectTriggerCollider(*selection, redo ? edit.before : edit.after,
+            redo ? edit.after : edit.before, &error))
+        {
+            ReportSceneHistoryFailure(error);
+            return;
+        }
+
+        m_historyCursor = redo ? m_historyCursor + 1 : m_historyCursor - 1;
+        m_triggerInspection.reset();
+        ++m_triggerControlsRevision;
+        m_sceneHistoryStatus.clear();
+        return;
+    }
+
+    if(const auto* controller = std::get_if<std::unique_ptr<CharacterControllerEdit>>(&entry.command); controller && *controller)
+    {
+        const auto& edit = **controller;
+        auto* owner = dynamic_cast<FileBackedDemoScene*>(&demoScene);
+
+        if(!owner || !RenameSessionMatches(demoScene, edit.session))
+        {
+            ReportSceneHistoryFailure("Character Controller replay belongs to a stale scene session.");
+            return;
+        }
+
+        const auto selection = owner->GetObjectMetadata(edit.objectID);
+        std::string error;
+
+        if(!selection || !owner->SetObjectCharacterController(*selection, redo ? edit.before : edit.after,
+            redo ? edit.after : edit.before, &error))
+        {
+            ReportSceneHistoryFailure(error);
+            return;
+        }
+
+        m_historyCursor = redo ? m_historyCursor + 1 : m_historyCursor - 1;
+        m_controllerInspection.reset();
+        ++m_controllerControlsRevision;
+        m_sceneHistoryStatus.clear();
+        return;
+    }
+
     const auto* ownedDeletion = std::get_if<std::unique_ptr<ObjectDeletion>>(&entry.command);
 
     if(ownedDeletion && *ownedDeletion)
@@ -3451,15 +3644,33 @@ void Editor::ReplaySceneHistory(IDemoScene& demoScene, bool redo)
             return;
         }
 
-        HistoryReplayIdentity identity{AllocateSceneHistoryOperationID(), m_historyEpoch, redo,
-            redo ? deletion->selectionAfter : deletion->selectionBefore};
-        // Copy the outbound payload before locking the cursor. No command addresses escape.
-        HistoryReplayRequest request{identity, deletion->object, deletion->documentIndex};
-        if(deletion->insertion) request.bindingSourceID=deletion->selectionBefore;
-        request.membership=true;
-        request.remove=deletion->insertion ? !redo : redo;
-        m_historyReplayRequest = std::move(request);
-        m_pendingHistoryReplay = PendingHistoryReplay{std::move(identity), m_historyCursor};
+        try
+        {
+            HistoryReplayIdentity identity{AllocateSceneHistoryOperationID(), m_historyEpoch, redo,
+                redo ? deletion->selectionAfter : deletion->selectionBefore};
+            // Copy the outbound payload before locking the cursor. No command addresses escape.
+            HistoryReplayRequest request{identity, deletion->object, deletion->documentIndex};
+            if(deletion->insertion)
+            {
+                request.bindingSourceID = deletion->selectionBefore;
+            }
+            request.membership = true;
+            request.remove = deletion->insertion ? !redo : redo;
+
+            if(deletion->hierarchy)
+            {
+                request.hierarchy = redo ? *deletion->hierarchy :
+                    SceneHierarchyEdit{deletion->hierarchy->after, deletion->hierarchy->before};
+                request.bindingSourceID.reset();
+            }
+            m_historyReplayRequest = std::move(request);
+            m_pendingHistoryReplay = PendingHistoryReplay{std::move(identity), m_historyCursor};
+        }
+        catch(const std::exception& exception)
+        {
+            ReportSceneHistoryFailure(exception.what());
+        }
+
         return;
     }
 
@@ -3547,10 +3758,20 @@ void Editor::ReplaySceneHistory(IDemoScene& demoScene, bool redo)
             for(const auto& edit : (*group)->edits)
             {
                 const auto resolved = ResolveHistoryTarget(demoScene, edit.target);
-                if(!resolved) return;
+                if(!resolved)
+                {
+                    return;
+                }
+
+                if(!SameHistoryTransform(demoScene.GetScene().GetRenderObjects()[*resolved].transform, redo ? edit.before : edit.after))
+                {
+                    ReportSceneHistoryFailure("Transform replay expected state changed; cursor preserved.");
+                    return;
+                }
+
                 updates.push_back({*resolved, redo ? edit.after : edit.before});
             }
-            if(!demoScene.GetScene().SetRenderObjectTransforms(updates))
+            if(!ApplyObjectTransformEdits(demoScene, updates))
             {
                 ReportSceneHistoryFailure("Group replay validation failed; no objects changed and cursor preserved.");
                 return;
@@ -3578,7 +3799,17 @@ void Editor::ReplaySceneHistory(IDemoScene& demoScene, bool redo)
         return;
     }
 
-    demoScene.GetScene().SetRenderObjectTransform(*index, redo ? edit.after : edit.before);
+    if(!SameHistoryTransform(demoScene.GetScene().GetRenderObjects()[*index].transform, redo ? edit.before : edit.after))
+    {
+        ReportSceneHistoryFailure("Transform replay expected state changed; cursor preserved.");
+        return;
+    }
+
+    if(!ApplyObjectTransformEdit(demoScene, *index, redo ? edit.after : edit.before))
+    {
+        ReportSceneHistoryFailure(m_transformEditStatus);
+        return;
+    }
 
     if(redo)
     {
@@ -3724,11 +3955,13 @@ bool Editor::StageObjectDeletionHistory(SceneObjectDocument object, size_t docum
         const auto* deletion = owned ? owned->get() : nullptr;
 
         if(!deletion || deletion->documentIndex != documentIndex || deletion->object.id != object.id ||
-            deletion->object.name != object.name || !SameHistoryTransform(deletion->object.transform, object.transform) ||
+            deletion->object.name != object.name || deletion->object.parentID != object.parentID || !SameHistoryTransform(deletion->object.transform, object.transform) ||
             deletion->object.meshReference != object.meshReference ||
             deletion->object.materialReference != object.materialReference ||
             deletion->object.materialSlotBindings != object.materialSlotBindings ||
-            deletion->object.physics != object.physics)
+            deletion->object.physics != object.physics ||
+            deletion->object.triggerCollider != object.triggerCollider ||
+            deletion->object.characterController != object.characterController)
         {
             error = "Redo deletion target changed outside its history command; cursor preserved.";
             return false;
@@ -3872,6 +4105,12 @@ void Editor::DrawObjectPhysicsControls(IDemoScene& scene)
     SceneObjectDocument object;
 
     if(!selection || !owner->CapturePhysicsInspection(selection->objectID, object))
+    {
+        return;
+    }
+
+    // Meshless legacy objects keep access to their existing PhysicsComponent.
+    if(object.meshReference.empty() && !object.physics)
     {
         return;
     }
@@ -4030,10 +4269,20 @@ void Editor::DrawObjectPhysicsControls(IDemoScene& scene)
 
     bool enabled = object.physics.has_value();
 
+    const bool controllerConflict = object.characterController.has_value() && !object.physics;
+    ImGui::BeginDisabled(controllerConflict);
+
     if(ImGui::Checkbox("Physics", &enabled))
     {
         CommitObjectPhysics(scene, *selection, object.physics,
             enabled ? std::optional<PhysicsComponent>{PhysicsComponent{}} : std::nullopt);
+    }
+
+    ImGui::EndDisabled();
+
+    if(controllerConflict)
+    {
+        ImGui::TextWrapped("Physics is unavailable while Character Controller is attached.");
     }
 
     if(object.physics)
@@ -4069,6 +4318,12 @@ void Editor::DrawObjectPhysicsControls(IDemoScene& scene)
             const PhysicsNumericField& field = numericFields[index];
 
             if(!isFieldVisible(field.shape, object.physics->colliderType))
+            {
+                continue;
+            }
+
+            if(field.componentMember == &PhysicsComponent::density &&
+                object.physics->bodyType != Physics::BodyType::Dynamic)
             {
                 continue;
             }
@@ -4137,4 +4392,202 @@ void Editor::OnEmptyObjectCreationFailed(const std::string& error)
     // Shares the viewport creation status line with mesh and primitive creation.
     m_meshCreationStatus = "Empty Object creation rejected: " + error;
     Log::Warning(m_meshCreationStatus);
+}
+
+bool Editor::StageHierarchyHistory(const SceneHierarchyEdit& edit,
+    std::optional<std::string> selectionBefore, std::optional<std::string> selectionAfter,
+    std::uint64_t operationID, std::string& error)
+{
+    if(!m_historySession || m_historySession->epoch != m_historyEpoch || HasPendingSceneHistoryOperation() ||
+        !ValidateSceneDocument(edit.before, &error) || !ValidateSceneDocument(edit.after, &error) ||
+        edit.before.id != edit.after.id || SceneHierarchy::SameObjects(edit.before, edit.after))
+    {
+        error = "Hierarchy history requires a changed valid scene and an idle history session.";
+        return false;
+    }
+
+    auto command = std::make_unique<ObjectDeletion>();
+    command->session = *m_historySession;
+    command->selectionBefore = std::move(selectionBefore);
+    command->selectionAfter = std::move(selectionAfter);
+    command->hierarchy = edit;
+    size_t bytes = ObjectDeletionPayloadBytes(*command) + sizeof(SceneHierarchyEdit);
+
+    for(const auto* document : {&command->hierarchy->before, &command->hierarchy->after})
+    {
+        bytes += sizeof(SceneDocument) + document->objects.capacity() * sizeof(SceneObjectDocument);
+        bytes += document->id.capacity() + document->name.capacity() + document->environmentReference.capacity() + 3;
+
+        for(const auto& object : document->objects)
+        {
+            bytes += object.id.capacity() + object.parentID.capacity() + object.name.capacity() +
+                object.meshReference.capacity() + object.materialReference.capacity() + 5;
+
+            for(const auto& [slot, reference] : object.materialSlotBindings)
+            {
+                bytes += sizeof(std::pair<const std::string, std::string>) + 4 * sizeof(void*) +
+                    slot.capacity() + reference.capacity() + 2;
+            }
+        }
+    }
+
+    for(const auto& [duplicate, source] : command->hierarchy->bindingSources)
+    {
+        bytes += sizeof(std::pair<const std::string, std::string>) + 4 * sizeof(void*) +
+            duplicate.capacity() + source.capacity() + 2;
+    }
+
+    if(bytes > kSceneHistoryPayloadBytes)
+    {
+        error = "Hierarchy edit exceeds the 4 MiB undo payload limit; scene unchanged.";
+        return false;
+    }
+
+    m_sceneHistory.reserve(kSceneHistoryCapacity);
+    m_stagedDeletionHistory = StagedDeletionHistory{
+        SceneHistoryEntry{std::move(command), m_historyEpoch, bytes}, operationID};
+    return true;
+}
+
+bool Editor::QueueHierarchyEdit(IDemoScene& scene, SceneHierarchyEdit edit,
+    std::optional<std::string> selectionAfter, std::string& error)
+{
+    const auto* owner = dynamic_cast<const FileBackedDemoScene*>(&scene);
+
+    if(IsPhysicsEditingLocked() || !owner || !m_historySession ||
+        !CanPreserveSceneHistory(scene, m_historySession->projectIdentity, m_historyEpoch) ||
+        HasPendingSceneHistoryOperation() || m_sceneOperationPending || HasBlockingObjectCreation() ||
+        HasBlockingMaterialOperation() || m_transformFieldEditing || m_gizmoWasUsing)
+    {
+        error = "Hierarchy edit requires a stopped scene without pending operations or gestures.";
+        return false;
+    }
+
+    if(SceneHierarchy::SameObjects(edit.before, edit.after))
+    {
+        return true;
+    }
+
+    const auto selected = owner->GetObjectMetadata(m_selectedObject);
+    HistoryReplayRequest request;
+    request.identity = {AllocateSceneHistoryOperationID(), m_historyEpoch, false, selectionAfter};
+    request.membership = true;
+    request.hierarchy = std::move(edit);
+
+    if(!StageHierarchyHistory(*request.hierarchy, selected ? std::optional<std::string>(selected->objectID) : std::nullopt,
+        selectionAfter, request.identity.operationID, error))
+    {
+        return false;
+    }
+
+    m_duplicationRequest = std::move(request);
+    return true;
+}
+
+bool Editor::QueueHierarchyReparent(IDemoScene& scene, std::string_view objectID, std::string_view parentID,
+    bool keepWorld, std::string_view beforeSibling, std::string& error)
+{
+    const auto* owner = dynamic_cast<const FileBackedDemoScene*>(&scene);
+    SceneHierarchyEdit edit;
+
+    if(!owner || !CaptureSceneDocument(owner->m_runtime->GetFileScene().GetDocument(), owner->GetScene(),
+        owner->m_runtime->GetObjectMapping(), edit.before, &error) ||
+        !SceneHierarchy::Reparent(edit.before, objectID, parentID, keepWorld, beforeSibling, edit.after, error))
+    {
+        return false;
+    }
+
+    const auto selected = owner->GetObjectMetadata(m_selectedObject);
+    return QueueHierarchyEdit(scene, std::move(edit),
+        selected ? std::optional<std::string>(selected->objectID) : std::nullopt, error);
+}
+
+bool Editor::QueueHierarchyCreation(IDemoScene& scene, SceneObjectDocument object, std::string_view parentID,
+    std::string& error)
+{
+    const auto* owner = dynamic_cast<const FileBackedDemoScene*>(&scene);
+    SceneHierarchyEdit edit;
+
+    if(!owner || !CaptureSceneDocument(owner->m_runtime->GetFileScene().GetDocument(), owner->GetScene(),
+        owner->m_runtime->GetObjectMapping(), edit.before, &error))
+    {
+        return false;
+    }
+
+    object.parentID = parentID;
+    edit.after = edit.before;
+    auto selection = object.id;
+    edit.after.objects.push_back(std::move(object));
+    return QueueHierarchyEdit(scene, std::move(edit), std::move(selection), error);
+}
+
+bool Editor::PrepareHierarchyDrop(IDemoScene& scene, const HierarchyDropRequest& request,
+    SceneHierarchyEdit& edit, std::string& error)
+{
+    const auto* owner = dynamic_cast<const FileBackedDemoScene*>(&scene);
+
+    if(!owner || owner->IsArchiveActivation() || IsPhysicsEditingLocked() || !m_historySession ||
+        !CanPreserveSceneHistory(scene, m_historySession->projectIdentity, m_historyEpoch) ||
+        request.identity != HierarchyDragIdentity{m_historyEpoch, owner->GetRuntimeIdentity(),
+            scene.GetScene().GetStructureRevision(), owner->m_runtime->GetHierarchyRevision()} ||
+        HasPendingSceneHistoryOperation() || m_sceneOperationPending || HasBlockingObjectCreation() ||
+        m_fileRequest || m_sceneObjectDeletionPending || m_sceneObjectDeletionRequest ||
+        m_materialAssignmentRequest || m_meshCreationRequest || m_renameIntent ||
+        m_workspace.IsSplitterDragging() || ImGuizmo::IsUsing() || ImGui::GetIO().AppFocusLost)
+    {
+        error = "Drag belongs to a stale or busy scene.";
+        return false;
+    }
+
+    SceneHierarchySnapshot snapshot;
+    std::string parentID;
+    std::string beforeSibling;
+
+    if(!owner->BuildHierarchySnapshot(snapshot, &error) ||
+        !ResolveHierarchyDrop(snapshot, request, parentID, beforeSibling, error) ||
+        !CaptureSceneDocument(owner->m_runtime->GetFileScene().GetDocument(), owner->GetScene(),
+            owner->m_runtime->GetObjectMapping(), edit.before, &error))
+    {
+        return false;
+    }
+
+    return SceneHierarchy::Reparent(edit.before, request.sourceID, parentID, request.keepWorld,
+        beforeSibling, edit.after, error);
+}
+
+bool Editor::SubmitHierarchyDrop(IDemoScene& scene, const HierarchyDropRequest& request, std::string& error)
+{
+    SceneHierarchyEdit edit;
+
+    if(!PrepareHierarchyDrop(scene, request, edit, error))
+    {
+        return false;
+    }
+
+    const auto* owner = dynamic_cast<const FileBackedDemoScene*>(&scene);
+    const auto selected = owner->GetObjectMetadata(m_selectedObject);
+    return QueueHierarchyEdit(scene, std::move(edit),
+        selected ? std::optional<std::string>(selected->objectID) : std::nullopt, error);
+}
+
+bool Editor::QueueHierarchyEmpty(IDemoScene& scene, std::string_view parentID, std::string& error)
+{
+    try
+    {
+        const auto* owner = dynamic_cast<const FileBackedDemoScene*>(&scene);
+        SceneDocument document;
+
+        if(!owner || !CaptureSceneDocument(owner->m_runtime->GetFileScene().GetDocument(), owner->GetScene(),
+            owner->m_runtime->GetObjectMapping(), document, &error))
+        {
+            return false;
+        }
+
+        return QueueHierarchyCreation(scene, PrepareEmptyObject(document), parentID, error);
+    }
+    catch(const std::exception& exception)
+    {
+        error = exception.what();
+        return false;
+    }
 }

@@ -42,6 +42,7 @@ void Editor::DrawPhysicsControls()
     const char* state = m_physicsState == PhysicsState::Playing ? "Playing" :
         m_physicsState == PhysicsState::Stopping ? "Stopping..." : "Stopped";
     ImGui::TextUnformatted(state);
+    DrawCharacterDriveToggle();
     if (!m_physicsMessage.empty())
     {
         ImGui::SameLine();

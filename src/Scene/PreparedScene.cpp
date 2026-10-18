@@ -10,7 +10,7 @@ bool PrepareScene(
     PreparedScene& output,
     std::string* errorMessage)
 {
-    if (!ValidateSceneDocument(document, errorMessage))
+    if (!ValidateSceneDocumentPersistence(document, errorMessage))
     {
         return false;
     }

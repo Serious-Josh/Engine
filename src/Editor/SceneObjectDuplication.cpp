@@ -1,26 +1,12 @@
 #include "SceneObjectDuplication.h"
+#include "Scene/SceneHierarchyEdits.h"
 #include "Scene/FileSceneRuntime.h"
 #include "assets/AssetID.h"
 #include <algorithm>
 #include <unordered_set>
 std::string UniqueDuplicateObjectName(std::string_view name,const SceneDocument& scene)
 {
-    std::string base(name);
-    const auto open=base.rfind('(');
-    if(open!=std::string::npos && base.back()==')' && open+2<base.size() &&
-        std::all_of(base.begin()+open+1,base.end()-1,[](char c) { return c>='0' && c<='9'; }))
-    {
-        base.resize(open);
-        if(!base.empty() && base.back()==' ') base.pop_back();
-        if(base.empty()) base="Object";
-    }
-    std::unordered_set<std::string> names;
-    for(const auto& object:scene.objects) names.insert(object.name);
-    for(std::size_t suffix=2;;++suffix)
-    {
-        auto candidate=base+" ("+std::to_string(suffix)+")";
-        if(!names.contains(candidate)) return candidate;
-    }
+    return SceneHierarchy::DuplicateName(name, scene);
 }
 bool PrepareSceneObjectDuplicate(const FileSceneRuntime& scene,std::string_view objectID,
     SceneObjectDocument& duplicate,std::size_t& insertionIndex,std::string& error)

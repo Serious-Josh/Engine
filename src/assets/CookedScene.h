@@ -12,7 +12,10 @@ namespace CookedScene
     inline constexpr std::uint32_t CapsulePhysicsVersion = 4;
     inline constexpr std::uint32_t CapsuleRotationVersion = 5;
     inline constexpr std::uint32_t ContactEventsVersion = 6;
-    inline constexpr std::uint32_t Version = ContactEventsVersion;
+    inline constexpr std::uint32_t TriggerColliderVersion = 7;
+    inline constexpr std::uint32_t CharacterControllerVersion = 8;
+    inline constexpr std::uint32_t HierarchyVersion = 9;
+    inline constexpr std::uint32_t Version = HierarchyVersion;
 
     constexpr bool IsSupportedVersion(std::uint32_t version)
     {
@@ -21,7 +24,10 @@ namespace CookedScene
             version == SpherePhysicsVersion ||
             version == CapsulePhysicsVersion ||
             version == CapsuleRotationVersion ||
-            version == ContactEventsVersion;
+            version == ContactEventsVersion ||
+            version == TriggerColliderVersion ||
+            version == CharacterControllerVersion ||
+            version == HierarchyVersion;
     }
     struct Policy
     {

@@ -1,11 +1,13 @@
-// Eighteen root constants; CPU Matrix4 and HLSL both use row-major storage, column vectors.
+// Nineteen root constants; CPU Matrix4 and HLSL both use row-major storage, column vectors.
 // colliderShape selects the generated unit wireframe and matches ColliderOverlayShape on CPU.
 // capsuleHalfCylinderHeight is the capsule's (h / 2) / r; Box and Sphere ignore it.
+// colliderRole matches ColliderOverlayRole: Solid=0 (green), Trigger=1 (cyan).
 cbuffer ColliderConstants : register(b0)
 {
     row_major float4x4 clipFromCollider;
     uint colliderShape;
     float capsuleHalfCylinderHeight;
+    uint colliderRole;
 };
 
 static const uint ColliderShapeBox = 0;
@@ -125,7 +127,33 @@ float3 CapsuleEndpoint(uint vertexIndex, float halfHeight)
     }
 }
 
-float4 VSMain(uint vertexIndex : SV_VertexID) : SV_POSITION
+// Matches ColliderOverlayRole in EditorColliderOverlay.h.
+float4 ColliderRoleColor(uint role)
+{
+    switch(role)
+    {
+    case 1:
+        return float4(55.0 / 255.0, 197.0 / 255.0, 229.0 / 255.0, 1.0); // Trigger: cyan.
+    case 2:
+        return float4(1.0, 0.55, 0.0, 1.0);                             // Character Controller: amber.
+    case 3:
+        return float4(1.0, 0.15, 0.15, 1.0);                            // Controller alert: red.
+    case 4:
+        return float4(1.0, 0.95, 0.2, 1.0);                             // Ground support: yellow.
+    case 5:
+        return float4(0.95, 0.3, 0.85, 1.0);                            // Contacts: magenta.
+    default:
+        return float4(0.1, 1.0, 0.35, 1.0);                             // Solid: green.
+    }
+}
+
+struct ColliderVertexOutput
+{
+    float4 position : SV_POSITION;
+    nointerpolation float4 color : COLOR0;
+};
+
+ColliderVertexOutput VSMain(uint vertexIndex : SV_VertexID)
 {
     float3 localPosition;
 
@@ -142,10 +170,13 @@ float4 VSMain(uint vertexIndex : SV_VertexID) : SV_POSITION
         localPosition = BoxEdgeEndpoint(vertexIndex);
     }
 
-    return mul(clipFromCollider, float4(localPosition, 1));
+    ColliderVertexOutput output;
+    output.position = mul(clipFromCollider, float4(localPosition, 1));
+    output.color = ColliderRoleColor(colliderRole);
+    return output;
 }
 
-float4 PSMain() : SV_TARGET
+float4 PSMain(ColliderVertexOutput input) : SV_TARGET
 {
-    return float4(0.1, 1.0, 0.35, 1.0);
+    return input.color;
 }

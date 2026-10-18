@@ -1,4 +1,5 @@
 #include "assets/AssetRegistrySerializer.h"
+#include "assets/MeshImportUnitsJson.h"
 
 #include <Windows.h>
 
@@ -12,7 +13,7 @@
 
 namespace
 {
-    constexpr int kSchemaVersion = 1;
+    constexpr int kSchemaVersion = 2;
 
     const char* AssetTypeToString(AssetType type)
     {
@@ -69,14 +70,16 @@ namespace
 nlohmann::json AssetRegistrySerializer::Serialize(const ProjectAssetRegistry& registry)
 {
     nlohmann::json document = {
-        {"schemaVersion", kSchemaVersion},
+        {"schemaVersion", 1},
         {"assets", nlohmann::json::array()}
     };
 
-    for(const AssetRecord& record : registry.GetAssets()){
+    for(const AssetRecord& record : registry.GetAssets())
+    {
         const char* typeName = AssetTypeToString(record.type);
 
-        if(!typeName || !ValidateAssetRecord(record)){
+        if(!typeName || !ValidateAssetRecord(record))
+        {
             throw std::runtime_error("Registry contains an invalid asset record.");
         }
 
@@ -85,6 +88,14 @@ nlohmann::json AssetRegistrySerializer::Serialize(const ProjectAssetRegistry& re
             {"type", typeName},
             {"path", record.relativePath.generic_string()}
         });
+
+        if(record.type == AssetType::Mesh && record.meshImportUnits != MeshImportUnits{})
+        {
+            // Older executables must reject policy-bearing registries rather than silently
+            // ignoring units. All-Legacy projects retain their historical schema-1 output.
+            document["schemaVersion"] = kSchemaVersion;
+            document["assets"].back()["importUnits"] = SerializeMeshImportUnits(record.meshImportUnits);
+        }
     }
 
     return document;
@@ -105,7 +116,7 @@ bool AssetRegistrySerializer::Deserialize(
         if (!document.is_object() ||
             !document.contains("schemaVersion") ||
             !document["schemaVersion"].is_number_integer() ||
-            document["schemaVersion"].get<int>() != kSchemaVersion)
+            document["schemaVersion"].get<int>() < 1 || document["schemaVersion"].get<int>() > kSchemaVersion)
         {
             return Fail(errorMessage, "Unsupported or missing asset registry schema version.");
         }
@@ -157,6 +168,16 @@ bool AssetRegistrySerializer::Deserialize(
             }
 
             AssetRecord record{*id, type, std::filesystem::path(pathText)};
+
+            if(entry.contains("importUnits"))
+            {
+                if(type != AssetType::Mesh || document["schemaVersion"].get<int>() != kSchemaVersion)
+                {
+                    return Fail(errorMessage, "Import units require a mesh asset and registry schema 2.");
+                }
+
+                record.meshImportUnits = DeserializeMeshImportUnits(entry.at("importUnits"));
+            }
 
             if (!ValidateAssetRecord(record))
             {

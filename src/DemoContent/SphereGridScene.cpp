@@ -1,3 +1,4 @@
+#include "Platform/Windows/WindowsWindow.h"
 #include "SphereGridScene.h"
 #include "Renderer/ResourceUploader.h"
 #include "Renderer/DescriptorHeap.h"
@@ -87,7 +88,7 @@ bool SphereGridScene::Initialize(
     // Brick diffuse texture: BC1 with sRGB sampling.
 
     if (!DDSLoader::LoadTexture(device, uploader, descriptorHeap,
-                                "assets/Textures/Materials/stacked_brick_wall_diff_4k.dds", m_texture, true))
+                                (WindowsWindow::GetExecutableDirectory() / "assets/Textures/Materials/stacked_brick_wall_diff_4k.dds"), m_texture, true))
     {
         return false;
     }
@@ -95,7 +96,7 @@ bool SphereGridScene::Initialize(
     // Brick normal map: BC5 with linear sampling and the existing DirectX convention.
 
     if (!DDSLoader::LoadTexture(device, uploader, descriptorHeap,
-                                "assets/Textures/Materials/stacked_brick_wall_nor_dx_4k.dds", m_normalTexture, false))
+                                (WindowsWindow::GetExecutableDirectory() / "assets/Textures/Materials/stacked_brick_wall_nor_dx_4k.dds"), m_normalTexture, false))
     {
         return false;
     }
@@ -103,7 +104,7 @@ bool SphereGridScene::Initialize(
     // Brick roughness map: BC4 with linear sampling.
 
     if (!DDSLoader::LoadTexture(device, uploader, descriptorHeap,
-                                "assets/Textures/Materials/stacked_brick_wall_rough_4k.dds", m_roughnessTexture, false))
+                                (WindowsWindow::GetExecutableDirectory() / "assets/Textures/Materials/stacked_brick_wall_rough_4k.dds"), m_roughnessTexture, false))
     {
         return false;
     }

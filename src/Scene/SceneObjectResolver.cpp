@@ -14,7 +14,7 @@ bool ResolveSceneObjects(
     std::vector<ResolvedSceneObject>& output,
     std::string* errorMessage)
 {
-    if (!ValidateSceneDocument(document, errorMessage))
+    if (!ValidateSceneDocumentPersistence(document, errorMessage))
     {
         return false;
     }

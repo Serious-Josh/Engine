@@ -31,7 +31,9 @@ public:
 private:
     std::vector<RuntimePoseEntry> m_entries;
     friend class ScenePhysicsSession;
+#if defined(ENGINE_HAS_VERIFICATION)
     friend class ::PresentationTransformVerification;
+#endif
 };
 
 // Shared pure validation also permits malformed-data tests without mutating live bodies.

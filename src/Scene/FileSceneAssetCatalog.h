@@ -218,7 +218,10 @@ public:
 
 private:
     friend class SceneMaterialBindingPublication;
+#if defined(ENGINE_HAS_VERIFICATION)
     friend class PrimitiveCreationVerification;
+    friend class SceneHierarchyVerification;
+#endif
     friend struct MaterialAdmissionState;
     friend class Renderer;
     std::map<std::string, std::string> m_admittedMaterialDigests;

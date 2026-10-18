@@ -289,14 +289,114 @@ namespace
         return component;
     }
 
+    Json ToJson(const Physics::TriggerColliderComponent& component)
+    {
+        return {
+            {"colliderType", ColliderTypeName(component.colliderType)},
+            {"boxDimensions", {{"width", component.boxDimensions.width},
+                {"height", component.boxDimensions.height}, {"depth", component.boxDimensions.depth}}},
+            {"sphereRadius", component.sphereRadius},
+            {"capsuleRadius", component.capsuleRadius},
+            {"capsuleCylinderHeight", component.capsuleCylinderHeight},
+            {"colliderLocalPositionOffset", ToJson(component.colliderLocalPositionOffset)},
+            {"capsuleLocalRotation", ToJson(component.capsuleLocalRotation)}
+        };
+    }
+
+    Physics::TriggerColliderComponent ReadTriggerCollider(const Json& value)
+    {
+        ValidateFields(value, {"colliderType", "boxDimensions", "sphereRadius", "capsuleRadius",
+            "capsuleCylinderHeight", "colliderLocalPositionOffset", "capsuleLocalRotation"});
+        Physics::TriggerColliderComponent component;
+        const auto type = value.at("colliderType").get<std::string>();
+
+        if(type == "Box")
+        {
+            component.colliderType = Physics::ColliderType::Box;
+        }
+        else if(type == "Sphere")
+        {
+            component.colliderType = Physics::ColliderType::Sphere;
+        }
+        else if(type == "Capsule")
+        {
+            component.colliderType = Physics::ColliderType::Capsule;
+        }
+        else
+        {
+            throw std::runtime_error("Unsupported trigger collider type: " + type);
+        }
+
+        const auto& dimensions = value.at("boxDimensions");
+        ValidateFields(dimensions, {"width", "height", "depth"});
+        component.boxDimensions.width = ReadNumber(dimensions.at("width"), "Trigger box width");
+        component.boxDimensions.height = ReadNumber(dimensions.at("height"), "Trigger box height");
+        component.boxDimensions.depth = ReadNumber(dimensions.at("depth"), "Trigger box depth");
+        component.sphereRadius = ReadNumber(value.at("sphereRadius"), "Trigger sphere radius");
+        component.capsuleRadius = ReadNumber(value.at("capsuleRadius"), "Trigger capsule radius");
+        component.capsuleCylinderHeight = ReadNumber(value.at("capsuleCylinderHeight"), "Trigger capsule cylinder height");
+        component.colliderLocalPositionOffset = ReadVector3(value.at("colliderLocalPositionOffset"));
+        component.capsuleLocalRotation = ReadVector3(value.at("capsuleLocalRotation"));
+        std::string error;
+
+        if(!Physics::ValidateTriggerColliderComponent(component, &error))
+        {
+            throw std::runtime_error(error);
+        }
+
+        return component;
+    }
+
+    Json ToJson(const Physics::CharacterControllerComponent& component)
+    {
+        return {
+            {"capsuleRadius", component.capsuleRadius},
+            {"capsuleCylinderHeight", component.capsuleCylinderHeight},
+            {"localOffset", ToJson(component.localOffset)},
+            {"maximumHorizontalSpeed", component.maximumHorizontalSpeed},
+            {"gravityScale", component.gravityScale},
+            {"jumpSpeed", component.jumpSpeed},
+            {"maximumWalkableSlope", component.maximumWalkableSlope},
+            {"groundSnapDistance", component.groundSnapDistance},
+            {"collisionClearance", component.collisionClearance}
+        };
+    }
+
+    Physics::CharacterControllerComponent ReadCharacterController(const Json& value)
+    {
+        ValidateFields(value, {"capsuleRadius", "capsuleCylinderHeight", "localOffset", "maximumHorizontalSpeed",
+            "gravityScale", "jumpSpeed", "maximumWalkableSlope", "groundSnapDistance", "collisionClearance"});
+        Physics::CharacterControllerComponent component;
+        component.capsuleRadius = ReadNumber(value.at("capsuleRadius"), "Controller capsule radius");
+        component.capsuleCylinderHeight = ReadNumber(value.at("capsuleCylinderHeight"), "Controller cylinder height");
+        component.localOffset = ReadVector3(value.at("localOffset"));
+        component.maximumHorizontalSpeed = ReadNumber(value.at("maximumHorizontalSpeed"), "Controller horizontal speed");
+        component.gravityScale = ReadNumber(value.at("gravityScale"), "Controller gravity scale");
+        component.jumpSpeed = ReadNumber(value.at("jumpSpeed"), "Controller jump speed");
+        component.maximumWalkableSlope = ReadNumber(value.at("maximumWalkableSlope"), "Controller walkable slope");
+        component.groundSnapDistance = ReadNumber(value.at("groundSnapDistance"), "Controller snap distance");
+        component.collisionClearance = ReadNumber(value.at("collisionClearance"), "Controller clearance");
+        std::string error;
+
+        if(!Physics::ValidateCharacterControllerComponent(component, &error))
+        {
+            throw std::runtime_error(error);
+        }
+
+        return component;
+    }
+
     Json ToJson(const SceneDocument& document)
     {
         Json objects = Json::array();
 
         for (const SceneObjectDocument& object : document.objects)
         {
+            // Schema 9 writes parentID on every object: "" is a root. Only authored local TRS
+            // is persisted; derived world matrices are never written.
             objects.push_back({
                 {"id", object.id},
+                {"parentID", object.parentID},
                 {"name", object.name},
                 {"transform", ToJson(object.transform)},
                 {"meshReference", object.meshReference},
@@ -319,13 +419,23 @@ namespace
             {
                 objects.back()["physics"] = ToJson(*object.physics);
             }
+
+            if(object.triggerCollider)
+            {
+                objects.back()["triggerCollider"] = ToJson(*object.triggerCollider);
+            }
+
+            if(object.characterController)
+            {
+                objects.back()["characterController"] = ToJson(*object.characterController);
+            }
         }
 
         const auto& camera = document.camera;
         const auto& light = document.directionalLight;
 
         return {
-            {"schemaVersion", document.schemaVersion},
+            {"schemaVersion", SceneDocument::kSchemaVersion},
             {"id", document.id},
             {"name", document.name},
             {"environmentReference",document.environmentReference},
@@ -358,14 +468,18 @@ namespace
              schemaVersion != SceneDocument::kSphereSchemaVersion &&
              schemaVersion != SceneDocument::kCapsuleSchemaVersion &&
              schemaVersion != SceneDocument::kCapsuleRotationSchemaVersion &&
-             schemaVersion != SceneDocument::kSchemaVersion))
+             schemaVersion != SceneDocument::kContactEventsSchemaVersion &&
+             schemaVersion != SceneDocument::kTriggerColliderSchemaVersion &&
+             schemaVersion != SceneDocument::kCharacterControllerSchemaVersion &&
+             schemaVersion != SceneDocument::kHierarchySchemaVersion))
         {
             throw std::runtime_error("Unsupported scene schema version.");
         }
         const bool legacySchema = schemaVersion == SceneDocument::kLegacySchemaVersion;
+        const bool hierarchySchema = schemaVersion.get<std::uint32_t>() >= SceneDocument::kHierarchySchemaVersion;
         SceneDocument result;
 
-        // Loaded v1-v5 documents migrate in memory. All subsequent saves write v6.
+        // Older supported documents migrate in memory. Subsequent saves write v9.
         result.id = value.at("id").get<std::string>();
         result.name = value.at("name").get<std::string>();
         result.environmentReference=value.value("environmentReference",std::string{});
@@ -398,7 +512,8 @@ namespace
 
         for (const Json& item : objects)
         {
-            ValidateFields(item, {"id", "name", "transform", "meshReference", "materialReference", "materialSlotBindings", "physics"});
+            ValidateFields(item, {"id", "parentID", "name", "transform", "meshReference", "materialReference",
+                "materialSlotBindings", "physics", "triggerCollider", "characterController"});
             if (legacySchema && item.contains("physics"))
             {
                 throw std::runtime_error("Physics fields require scene schema version 2.");
@@ -406,6 +521,26 @@ namespace
 
             SceneObjectDocument object;
             object.id = item.at("id").get<std::string>();
+
+            // Versions 1-8 have no parent field and load every object as a root. Version 9
+            // requires an explicit string on every object; the whole forest is validated after
+            // migration and is never flattened or repaired.
+            if(hierarchySchema)
+            {
+                const auto& parent = item.at("parentID");
+
+                if(!parent.is_string())
+                {
+                    throw std::runtime_error("parentID must be a string for object: " + object.id);
+                }
+
+                object.parentID = parent.get<std::string>();
+            }
+            else if(item.contains("parentID"))
+            {
+                throw std::runtime_error("parentID requires scene schema version 9.");
+            }
+
             object.name = item.at("name").get<std::string>();
             object.transform = ReadTransform(item.at("transform"));
             object.meshReference =
@@ -447,6 +582,40 @@ namespace
                 }
             }
 
+            if(item.contains("triggerCollider"))
+            {
+                try
+                {
+                    if(schemaVersion.get<std::uint32_t>() < SceneDocument::kTriggerColliderSchemaVersion)
+                    {
+                        throw std::runtime_error("Trigger Collider fields require scene schema version 7.");
+                    }
+
+                    object.triggerCollider = ReadTriggerCollider(item.at("triggerCollider"));
+                }
+                catch(const std::exception& exception)
+                {
+                    throw std::runtime_error("Invalid trigger collider for object " + object.id + ": " + exception.what());
+                }
+            }
+
+            if(item.contains("characterController"))
+            {
+                if(schemaVersion.get<std::uint32_t>() < SceneDocument::kCharacterControllerSchemaVersion)
+                {
+                    throw std::runtime_error("Character Controller fields require scene schema version 8.");
+                }
+
+                try
+                {
+                    object.characterController = ReadCharacterController(item.at("characterController"));
+                }
+                catch(const std::exception& exception)
+                {
+                    throw std::runtime_error("Invalid Character Controller for object " + object.id + ": " + exception.what());
+                }
+            }
+
             result.objects.push_back(std::move(object));
         }
 
@@ -474,7 +643,7 @@ static CreateSceneDocumentResult WriteSceneDocument(
 {
     std::string validationError;
 
-    if (!ValidateSceneDocument(document, &validationError))
+    if (!ValidateSceneDocumentPersistence(document, &validationError))
     {
         Fail(errorMessage, validationError);
         return CreateSceneDocumentResult::Error;

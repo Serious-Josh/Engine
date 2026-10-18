@@ -1,7 +1,10 @@
 #pragma once
 
 #include "Math/Matrix4.h"
+#include "Physics/CharacterControllerComponent.h"
+#include "Physics/CharacterControllerDiagnostics.h"
 #include "Physics/PhysicsComponent.h"
+#include "Physics/TriggerColliderComponent.h"
 #include "Renderer/RenderObject.h"
 
 #include <cstdint>
@@ -18,6 +21,17 @@ enum class ColliderOverlayShape : std::uint32_t
     Capsule = 2
 };
 
+// Also selects the wireframe color in EditorCollider.hlsl; keep the values identical.
+enum class ColliderOverlayRole : std::uint32_t
+{
+    Solid = 0,               // Green: PhysicsComponent colliders.
+    Trigger = 1,             // Cyan: Trigger Colliders.
+    CharacterController = 2, // Amber: Character Controller capsule (authored, or accepted runtime pose in Play).
+    CharacterAlert = 3,      // Red: capsule whose last step was rejected or left a moving-body overlap Unresolved.
+    GroundSupport = 4,       // Yellow: ground support point and normal.
+    CharacterContact = 5     // Magenta: solid contact points and normals.
+};
+
 // A Capsule needs one value beyond its matrix. The matrix scales uniformly by the radius,
 // so the wireframe is generated in radius units: hemisphere centers sit at
 // (0, -/+ halfCylinderHeightInRadii, 0), where halfCylinderHeightInRadii = (h / 2) / r.
@@ -27,12 +41,22 @@ struct CapsuleColliderOverlay
     float halfCylinderHeightInRadii = 0.0f;
 };
 
+// One Character Controller diagnostic wireframe: its capsule, or a marker drawn with the
+// existing unit sphere (points) or a thin unit box (normals).
+struct ColliderOverlayMarker
+{
+    Matrix4 colliderWorldTransform;
+    ColliderOverlayShape shape = ColliderOverlayShape::Box;
+    ColliderOverlayRole role = ColliderOverlayRole::CharacterController;
+    float halfCylinderHeightInRadii = 0.0f;
+};
+
 // Engine owns this capture on the frame's stack. Renderer consumes it synchronously
 // during Render and retains neither the matrices nor the borrowed scene identity.
 struct EditorColliderOverlay
 {
-    // Boxes, Spheres and Capsules share one bound: their combined count may not exceed it.
-    static constexpr std::size_t MaxColliders = 8192;
+    // All six solid/trigger shape batches share one bound.
+    static constexpr std::size_t MaxColliders = 16384; // Two optional colliders per 8192 scene objects.
 
     // A unit box: twelve edges, two line-list endpoints each.
     static constexpr unsigned int VerticesPerBox = 24;
@@ -61,7 +85,15 @@ struct EditorColliderOverlay
     std::vector<Matrix4> boxColliderWorldTransforms;
     std::vector<Matrix4> sphereColliderWorldTransforms;
     std::vector<CapsuleColliderOverlay> capsuleColliders;
+    std::vector<Matrix4> triggerBoxWorldTransforms;
+    std::vector<Matrix4> triggerSphereWorldTransforms;
+    std::vector<CapsuleColliderOverlay> triggerCapsules;
+    // Controller capsules and diagnostic markers, bounded per controller.
+    std::vector<ColliderOverlayMarker> characterMarkers;
+    // Capsule, ground point and normal, and a point and normal per copied contact.
+    static constexpr std::size_t MaxMarkersPerCharacter = 3 + 2 * Physics::MaximumCharacterDiagnosticContacts;
 
+    // Exact for valid batches; saturates at MaxColliders + 1 for safe capacity rejection.
     std::size_t GetColliderCount() const noexcept;
     bool Matches(const Scene& currentScene, std::uint64_t currentRendererLifetime) const noexcept;
 };
@@ -83,3 +115,22 @@ bool BuildColliderSphereMatrix(const Physics::PhysicsComponent& component, const
     bool presentationActive, Matrix4& colliderWorldTransform);
 bool BuildColliderCapsule(const Physics::PhysicsComponent& component, const RenderObject& object,
     bool presentationActive, CapsuleColliderOverlay& capsuleCollider);
+
+// Trigger geometry uses its own validation and the same placement/wireframe conventions.
+// presentationActive is true only for a trigger sharing a presented PhysicsComponent body.
+bool BuildColliderBoxMatrix(const Physics::TriggerColliderComponent& component, const RenderObject& object,
+    bool presentationActive, Matrix4& colliderWorldTransform);
+bool BuildColliderSphereMatrix(const Physics::TriggerColliderComponent& component, const RenderObject& object,
+    bool presentationActive, Matrix4& colliderWorldTransform);
+bool BuildColliderCapsule(const Physics::TriggerColliderComponent& component, const RenderObject& object,
+    bool presentationActive, CapsuleColliderOverlay& capsuleCollider);
+
+// Character Controller capsule: authored radius, cylinder height and local offset in the
+// object's yaw-only frame (accepted presentation pose in Play), without visual scale.
+bool BuildCharacterControllerCapsule(const Physics::CharacterControllerComponent& component, const RenderObject& object,
+    bool presentationActive, CapsuleColliderOverlay& capsuleCollider);
+
+// Ground support and contact markers (at most MaxMarkersPerCharacter - 1) from a diagnostics
+// snapshot whose positions are already world space. Debug drawing only.
+void AppendCharacterDiagnosticMarkers(const Physics::CharacterControllerDiagnostics& diagnostics,
+    std::vector<ColliderOverlayMarker>& markers);

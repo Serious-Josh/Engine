@@ -18,7 +18,15 @@ constexpr char BoxPhysicsMagic[] = "ENGSCN02";
 constexpr char SpherePhysicsMagic[] = "ENGSCN03";
 constexpr char CapsulePhysicsMagic[] = "ENGSCN04";
 constexpr char CapsuleRotationMagic[] = "ENGSCN05";
-constexpr char Magic[] = "ENGSCN06";
+constexpr char ContactEventsMagic[] = "ENGSCN06";
+constexpr char TriggerColliderMagic[] = "ENGSCN07";
+constexpr char CharacterControllerMagic[] = "ENGSCN08";
+constexpr char Magic[] = "ENGSCN09";
+
+// Per-object hierarchy marker. Every version writes it first; only payload 9 may carry a parent,
+// whose exact object ID follows the object name. Runtime slots are never encoded.
+constexpr std::uint64_t RootMarker = UINT32_MAX;
+constexpr std::uint64_t ParentMarker = 1;
 constexpr size_t HeaderBytes = 32;
 constexpr size_t PayloadBytesOffset = 16;
 
@@ -299,8 +307,146 @@ std::optional<Physics::PhysicsComponent> ReadPhysicsComponent(Reader& reader, st
     return component;
 }
 
+void WriteTriggerCollider(Writer& writer, const std::optional<Physics::TriggerColliderComponent>& component)
+{
+    writer.WriteUnsigned(component.has_value() ? 1 : 0, 4);
+
+    if(!component)
+    {
+        return;
+    }
+
+    switch(component->colliderType)
+    {
+    case Physics::ColliderType::Box:
+        writer.WriteUnsigned(0, 4);
+        break;
+    case Physics::ColliderType::Sphere:
+        writer.WriteUnsigned(1, 4);
+        break;
+    case Physics::ColliderType::Capsule:
+        writer.WriteUnsigned(2, 4);
+        break;
+    default:
+        throw std::runtime_error("Unsupported cooked trigger collider type.");
+    }
+
+    writer.WriteFloat(component->boxDimensions.width);
+    writer.WriteFloat(component->boxDimensions.height);
+    writer.WriteFloat(component->boxDimensions.depth);
+    writer.WriteFloat(component->sphereRadius);
+    writer.WriteFloat(component->capsuleRadius);
+    writer.WriteFloat(component->capsuleCylinderHeight);
+    writer.WriteVector(component->capsuleLocalRotation);
+    writer.WriteVector(component->colliderLocalPositionOffset);
+}
+
+std::optional<Physics::TriggerColliderComponent> ReadTriggerCollider(Reader& reader)
+{
+    const auto presence = reader.ReadUnsigned(4);
+    Require(presence <= 1, "Invalid cooked trigger presence flag.");
+
+    if(presence == 0)
+    {
+        return std::nullopt;
+    }
+
+    Physics::TriggerColliderComponent component;
+
+    switch(reader.ReadUnsigned(4))
+    {
+    case 0:
+        component.colliderType = Physics::ColliderType::Box;
+        break;
+    case 1:
+        component.colliderType = Physics::ColliderType::Sphere;
+        break;
+    case 2:
+        component.colliderType = Physics::ColliderType::Capsule;
+        break;
+    default:
+        throw std::runtime_error("Unsupported cooked trigger collider type.");
+    }
+
+    component.boxDimensions.width = reader.ReadFloat();
+    component.boxDimensions.height = reader.ReadFloat();
+    component.boxDimensions.depth = reader.ReadFloat();
+    component.sphereRadius = reader.ReadFloat();
+    component.capsuleRadius = reader.ReadFloat();
+    component.capsuleCylinderHeight = reader.ReadFloat();
+    component.capsuleLocalRotation = reader.ReadVector();
+    component.colliderLocalPositionOffset = reader.ReadVector();
+    std::string error;
+
+    if(!Physics::ValidateTriggerColliderComponent(component, &error))
+    {
+        throw std::runtime_error("Invalid cooked trigger collider: " + error);
+    }
+
+    return component;
+}
+
+// V8: u32 presence followed by eleven explicit float32 scalars when present.
+// No native struct bytes/padding. Absent = 4 bytes; present = 4 + 44 = 48 bytes.
+void WriteCharacterController(Writer& writer, const std::optional<Physics::CharacterControllerComponent>& component)
+{
+    writer.WriteUnsigned(component.has_value() ? 1 : 0, 4);
+
+    if(!component)
+    {
+        return;
+    }
+
+    writer.WriteFloat(component->capsuleRadius);
+    writer.WriteFloat(component->capsuleCylinderHeight);
+    writer.WriteVector(component->localOffset);
+    writer.WriteFloat(component->maximumHorizontalSpeed);
+    writer.WriteFloat(component->gravityScale);
+    writer.WriteFloat(component->jumpSpeed);
+    writer.WriteFloat(component->maximumWalkableSlope);
+    writer.WriteFloat(component->groundSnapDistance);
+    writer.WriteFloat(component->collisionClearance);
+}
+
+std::optional<Physics::CharacterControllerComponent> ReadCharacterController(Reader& reader)
+{
+    const auto presence = reader.ReadUnsigned(4);
+    Require(presence <= 1, "Invalid cooked Character Controller presence flag.");
+
+    if(presence == 0)
+    {
+        return std::nullopt;
+    }
+
+    Physics::CharacterControllerComponent component;
+    component.capsuleRadius = reader.ReadFloat();
+    component.capsuleCylinderHeight = reader.ReadFloat();
+    component.localOffset = reader.ReadVector();
+    component.maximumHorizontalSpeed = reader.ReadFloat();
+    component.gravityScale = reader.ReadFloat();
+    component.jumpSpeed = reader.ReadFloat();
+    component.maximumWalkableSlope = reader.ReadFloat();
+    component.groundSnapDistance = reader.ReadFloat();
+    component.collisionClearance = reader.ReadFloat();
+    std::string error;
+
+    if(!Physics::ValidateCharacterControllerComponent(component, &error))
+    {
+        throw std::runtime_error("Invalid cooked Character Controller: " + error);
+    }
+
+    return component;
+}
+
 std::vector<std::byte> Encode(const Metadata& sceneMetadata, const Policy& policy)
 {
+    std::string persistenceError;
+
+    if(!ValidateSceneDocumentPersistence(sceneMetadata.document, &persistenceError))
+    {
+        throw std::runtime_error(persistenceError);
+    }
+
     ValidateMetadata(sceneMetadata, policy);
 
     Writer writer{policy, {}};
@@ -334,10 +480,16 @@ std::vector<std::byte> Encode(const Metadata& sceneMetadata, const Policy& polic
     for (size_t index = 0; index < document.objects.size(); ++index)
     {
         const auto& object = document.objects[index];
-        // Existing semantics: every object is a root with a world-space transform.
-        writer.WriteUnsigned(UINT32_MAX, 4);
+        // Transforms are authored local TRS; a root's local is its world transform.
+        writer.WriteUnsigned(object.parentID.empty() ? RootMarker : ParentMarker, 4);
         writer.WriteString(object.id);
         writer.WriteString(object.name);
+
+        if(!object.parentID.empty())
+        {
+            writer.WriteString(object.parentID);
+        }
+
         writer.WriteVector(object.transform.position);
         writer.WriteVector(object.transform.rotation);
         writer.WriteVector(object.transform.scale);
@@ -372,6 +524,8 @@ std::vector<std::byte> Encode(const Metadata& sceneMetadata, const Policy& polic
         }
 
         WritePhysicsComponent(writer, object.physics);
+        WriteTriggerCollider(writer, object.triggerCollider);
+        WriteCharacterController(writer, object.characterController);
     }
 
     if (sceneMetadata.environment)
@@ -397,6 +551,13 @@ std::vector<std::byte> Cook(const SceneDocument& document, std::span<const MeshI
                             const ProjectAssetRegistry& registry, const Policy& policy,
                             const EnvironmentInput* environment)
 {
+    std::string persistenceError;
+
+    if(!ValidateSceneDocumentPersistence(document, &persistenceError))
+    {
+        throw std::runtime_error(persistenceError);
+    }
+
     Require(meshes.size() <= policy.maxObjects && document.objects.size() <= policy.maxObjects &&
                 document.objects.size() <= UINT32_MAX,
             "Scene/input object count exceeds admission.");
@@ -514,6 +675,18 @@ Metadata Decode(std::span<const std::byte> bytes, const Policy& policy)
     {
         expectedMagic = CapsuleRotationMagic;
     }
+    else if(payloadVersion == ContactEventsVersion)
+    {
+        expectedMagic = ContactEventsMagic;
+    }
+    else if(payloadVersion == TriggerColliderVersion)
+    {
+        expectedMagic = TriggerColliderMagic;
+    }
+    else if(payloadVersion == CharacterControllerVersion)
+    {
+        expectedMagic = CharacterControllerMagic;
+    }
 
     Require(magic == expectedMagic, "Invalid cooked scene magic/version pair.");
     // Keep this short-circuit read: a bad header size does not consume the length.
@@ -546,11 +719,21 @@ Metadata Decode(std::span<const std::byte> bytes, const Policy& policy)
     sceneMetadata.meshes.reserve(static_cast<size_t>(count));
     for (size_t index = 0; index < count; ++index)
     {
-        Require(reader.ReadUnsigned(4) == UINT32_MAX,
-                "Unsupported non-root hierarchy; current runtime uses flat world transforms.");
+        const auto hierarchyMarker = reader.ReadUnsigned(4);
+        const bool hasParent = hierarchyMarker == ParentMarker;
+        Require(hierarchyMarker == RootMarker || (hasParent && payloadVersion >= HierarchyVersion),
+                "Invalid cooked hierarchy marker for this payload version.");
         SceneObjectDocument object;
         object.id = reader.ReadString();
         object.name = reader.ReadString();
+
+        if(hasParent)
+        {
+            // An empty parent string would be an ambiguous second root encoding.
+            object.parentID = reader.ReadString();
+            Require(!object.parentID.empty(), "Cooked parent marker requires a nonempty parent ID.");
+        }
+
         object.transform.position = reader.ReadVector();
         object.transform.rotation = reader.ReadVector();
         object.transform.scale = reader.ReadVector();
@@ -605,6 +788,31 @@ Metadata Decode(std::span<const std::byte> bytes, const Policy& policy)
         {
             object.physics = ReadPhysicsComponent(reader, payloadVersion);
         }
+
+        if(payloadVersion >= TriggerColliderVersion)
+        {
+            try
+            {
+                object.triggerCollider = ReadTriggerCollider(reader);
+            }
+            catch(const std::exception& exception)
+            {
+                throw std::runtime_error("Invalid cooked trigger for object " + object.id + ": " + exception.what());
+            }
+        }
+
+        if(payloadVersion >= CharacterControllerVersion)
+        {
+            try
+            {
+                object.characterController = ReadCharacterController(reader);
+            }
+            catch(const std::exception& exception)
+            {
+                throw std::runtime_error("Invalid cooked controller for object " + object.id + ": " + exception.what());
+            }
+        }
+
         document.objects.push_back(std::move(object));
         sceneMetadata.meshes.push_back(std::move(mesh));
     }

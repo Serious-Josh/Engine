@@ -3,6 +3,7 @@
 #include "assets/ProjectAssetRegistry.h"
 #include "assets/ModelImporter.h"
 #include "assets/SupportedAssetImportFormats.h"
+#include "assets/ProjectAssetResolver.h"
 #include "Project/ProjectPaths.h"
 
 #include <Windows.h>
@@ -107,7 +108,8 @@ bool ProjectMeshImportService::Import(
     ProjectAssetRegistry& registry,
     const std::filesystem::path& source,
     std::filesystem::path& importedPath,
-    std::string& error)
+    std::string& error,
+    MeshImportUnits units)
 {
     namespace fs = std::filesystem;
     HANDLE input = INVALID_HANDLE_VALUE;
@@ -119,6 +121,11 @@ bool ProjectMeshImportService::Import(
 
     try
     {
+        if(!units.IsValid())
+        {
+            throw std::runtime_error("Invalid mesh import-unit policy.");
+        }
+
         if(SupportedAssetImportFormats::Lookup(source) != AssetType::Mesh)
         {
             error = "Unsupported mesh import format. Use .fbx.";
@@ -213,7 +220,8 @@ bool ProjectMeshImportService::Import(
 
         // The source handle excludes writes/deletion. Assimp validates the same
         // bytes just copied while the writable staging handle stays protected.
-        ModelImporter::LoadFlattened(sourcePath);
+        ModelImporter::LoadFlattened(sourcePath, MeshUVOrientation::PreserveSource,
+            128 * 1024 * 1024, units);
 
         CloseHandle(input);
         input = INVALID_HANDLE_VALUE;
@@ -236,7 +244,7 @@ bool ProjectMeshImportService::Import(
             const auto name = suffix == 0 ? source.filename() :
                 fs::path(source.stem().wstring() + L" (" + std::to_wstring(suffix) + L")" + source.extension().wstring());
             finalPath = destination / name;
-            const AssetRecord record{*id, AssetType::Mesh, finalPath.lexically_relative(root)};
+            const AssetRecord record{*id, AssetType::Mesh, finalPath.lexically_relative(root), units};
             staged = registry;
 
             if(!ValidateAssetRecord(record))
@@ -308,6 +316,74 @@ bool ProjectMeshImportService::Import(
             CloseHandle(output);
         }
 
+        return false;
+    }
+}
+
+bool ProjectMeshImportService::ChangeImportUnits(const ProjectPaths& paths, ProjectAssetRegistry& registry,
+    const AssetRecord& expected, MeshImportUnits units, std::string& error)
+{
+    HANDLE source = INVALID_HANDLE_VALUE;
+    error.clear();
+
+    try
+    {
+        const auto* current = registry.Find(expected.id);
+
+        if(!units.IsValid() || !current || current->type != AssetType::Mesh ||
+            current->relativePath != expected.relativePath || current->meshImportUnits != expected.meshImportUnits)
+        {
+            throw std::runtime_error("Mesh registration or import policy changed; reopen Import Units.");
+        }
+
+        DirectoryLocks directories;
+        directories.Pin(std::filesystem::absolute(paths.GetRoot()).lexically_normal());
+        const auto resolved = ProjectAssetResolver::Resolve(paths, registry, expected.id);
+
+        if(resolved.status != AssetAvailability::Available ||
+            _wcsicmp(resolved.resolvedPath.extension().c_str(), L".fbx") != 0 ||
+            std::filesystem::file_size(resolved.resolvedPath) > 64 * 1024 * 1024)
+        {
+            throw std::runtime_error("Import-unit changes require an available FBX source no larger than 64 MiB.");
+        }
+
+        directories.Pin(resolved.resolvedPath.parent_path());
+        source = CreateFileW(resolved.resolvedPath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+            OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+
+        if(source == INVALID_HANDLE_VALUE)
+        {
+            throw WindowsFailure("Cannot pin mesh source for policy validation.");
+        }
+
+        LARGE_INTEGER sourceBytes{};
+
+        if(!GetFileSizeEx(source, &sourceBytes) || sourceBytes.QuadPart <= 0 || sourceBytes.QuadPart > 64 * 1024 * 1024)
+        {
+            throw std::runtime_error("Pinned mesh source is empty or exceeds the 64 MiB policy-change limit.");
+        }
+
+        ModelImporter::LoadFlattened(resolved.resolvedPath, MeshUVOrientation::FlipV, 128 * 1024 * 1024, units);
+        auto staged = registry;
+
+        if(!staged.UpdateMeshImportUnits(expected.id, units) ||
+            !AssetRegistrySerializer::SaveToFile(staged, paths.GetAssetRegistryPath(), &error))
+        {
+            throw std::runtime_error("Cannot persist mesh import units: " + error);
+        }
+
+        registry = std::move(staged);
+        CloseHandle(source);
+        return true;
+    }
+    catch(const std::exception& exception)
+    {
+        if(source != INVALID_HANDLE_VALUE)
+        {
+            CloseHandle(source);
+        }
+
+        error = exception.what();
         return false;
     }
 }

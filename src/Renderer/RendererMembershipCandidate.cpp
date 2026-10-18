@@ -4,12 +4,38 @@
 
 #include <exception>
 
+size_t Renderer::ReclaimIdleEditorDescriptors()
+{
+    // Never during recording: recorded but unsubmitted work may still reference an SRV.
+    if (m_commandRecordingGeneration || m_activeRecordingGeneration)
+    {
+        return 0;
+    }
+
+    // Refresh both caches' view of completed GPU work so retirement checks use the latest fence.
+    const auto completed = m_commandContext.GetCompletedFenceValue();
+    m_textureThumbnails.SetCompletedFence(completed);
+    m_materialPreviewRenderer.PollMeshThumbnailGPUCompletion(completed);
+
+    const size_t textureThumbnails = m_textureThumbnails.ReleaseIdleDescriptors();
+    const size_t meshThumbnails = m_materialPreviewRenderer.ReleaseIdleMeshThumbnailImages();
+    return textureThumbnails + meshThumbnails;
+}
+
 std::optional<RayTracingSceneResources::ReplacementCandidate> Renderer::PrepareDXRMembershipCandidate(
     const FileSceneRuntime& runtime, FileSceneAssetCatalog& catalog,
     const std::vector<RayTracingSceneResources::ResidencyProposal>& proposals,
-    unsigned int frameSlot, std::string& error, const FileSceneRuntime* membershipSource)
+    unsigned int frameSlot, std::string& error, const FileSceneRuntime* membershipSource,
+    RayTracingSceneResources::CandidateFailure* failure)
 {
     error.clear();
+
+    // Deferrals and rejections below are ordinary failures; only the candidate itself
+    // classifies descriptor exhaustion.
+    if (failure)
+    {
+        *failure = RayTracingSceneResources::CandidateFailure::Other;
+    }
 
     if (m_sceneResourceScene != &(membershipSource ? membershipSource->GetScene() : runtime.GetScene()) || !m_sceneResourceLifetime ||
         m_sceneInitializationAttempt.candidate || m_commandRecordingGeneration || m_resizeFailed ||
@@ -33,7 +59,8 @@ std::optional<RayTracingSceneResources::ReplacementCandidate> Renderer::PrepareD
     try
     {
         auto candidate = m_rayTracingScene.PrepareReplacementCandidate(m_graphicsDevice.GetRayTracingDevice(),
-            m_resourceDescriptorHeap, runtime, catalog, proposals, m_materialPublication.desired.size(), error, membershipSource);
+            m_resourceDescriptorHeap, runtime, catalog, proposals, m_materialPublication.desired.size(), error, membershipSource,
+            failure);
 
         if (!candidate)
         {

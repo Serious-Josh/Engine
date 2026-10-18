@@ -209,7 +209,7 @@ void CookMeshAssets(const Request& request, BuildAssets& build, const BuildProgr
             "Mesh source exceeds 64 MiB build limit.");
         build.sourcePins.push_back(std::make_unique<Pin>(resolvedAsset.resolvedPath));
         auto decodedGeometry = ModelImporter::LoadFlattened(resolvedAsset.resolvedPath,
-            MeshUVOrientation::FlipV, CookedMesh::Policy{}.maxDecodedBytes);
+            MeshUVOrientation::FlipV, CookedMesh::Policy{}.maxDecodedBytes, assetRecord->meshImportUnits);
         auto encodedMesh = CookedMesh::Encode(decodedGeometry, CookedMesh::Policy{});
         Require(encodedMesh.status == CookedMesh::Status::Success, std::string(encodedMesh.message));
         build.Append({assetID, EngineAssetPak::Type::Mesh, 1, std::move(encodedMesh.payload)});
@@ -332,6 +332,21 @@ void DeployRuntimeFiles(const Request& request, const AssetID& sceneAssetID,
     Require(deploymentFiles.size() == 10 && requiredDLLs.empty() &&
         assimpDLLCount == 1 && textureDLLCount == 1,
         "Runtime directory is missing required DLLs or has ambiguous dependency versions; build EngineRuntime first.");
+
+    // App-local Release redistributables and notices accompany portable runtime inputs.
+    // Keep this list explicit: arbitrary DLLs/files in a runtime directory are never deployed.
+    for(const auto* fileName : {
+        "msvcp140.dll", "msvcp140_1.dll", "msvcp140_2.dll", "msvcp140_atomic_wait.dll",
+        "msvcp140_codecvt_ids.dll", "vcruntime140.dll", "vcruntime140_1.dll", "concrt140.dll", "vcomp140.dll",
+        "RuntimeNotices.txt", "sdk_license.rtf", "sdk_third_party_notices.rtf"})
+    {
+        if(fs::exists(request.runtimeDirectory / fileName))
+        {
+            copyRuntimeFile(request.runtimeDirectory / fileName, fileName);
+            deploymentFiles.emplace_back(fileName);
+        }
+    }
+
     PackagedBootstrap::WriteStartup(stagingDirectory / "Game.startup", sceneAssetID, request.settings.title);
     const auto startupConfiguration = PackagedBootstrap::ReadStartupConfiguration(
         stagingDirectory / "Game.startup");
@@ -514,7 +529,7 @@ bool Service::Start(Request request, std::string& error)
             {
                 progress.Report(.02f, "Validating output and current scene snapshot...");
                 std::string validationError;
-                Require(ValidateSceneDocument(request.document, &validationError), validationError);
+                Require(ValidateSceneDocumentPersistence(request.document, &validationError), validationError);
                 const auto sceneAssetID = SceneIdentity(request.document.id);
                 const auto outputDirectory = PrepareOutputDirectory(request);
 

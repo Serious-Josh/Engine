@@ -2761,7 +2761,7 @@ bool Renderer::Initialize(
         return false;
     }
 
-    if (!m_resourceDescriptorHeap.Initialize(device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 256, true))
+    if (!m_resourceDescriptorHeap.Initialize(device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, ResourceDescriptorCapacity, true))
     {
         Log::Error("Failed to init resource descriptor heap.");
 
@@ -5791,8 +5791,7 @@ bool Renderer::RecordRenderFrame(
         if (colliderOverlay->Matches(scene, m_sceneResourceLifetime))
         {
             m_editorColliderPass.Execute(commandList, m_finalSceneColor, m_gBuffer.GetDepth(),
-                currentViewProjection, colliderOverlay->boxColliderWorldTransforms,
-                colliderOverlay->sphereColliderWorldTransforms, colliderOverlay->capsuleColliders);
+                currentViewProjection, *colliderOverlay);
         }
     }
     m_finalSceneColor.Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);

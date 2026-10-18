@@ -8,7 +8,8 @@
 
 namespace
 {
-    bool CommitValidatedObjects(const PreparedScene& prepared, Scene& scene, SceneObjectMapping& mapping)
+    bool CommitValidatedObjects(const PreparedScene& prepared, Scene& scene, SceneObjectMapping& mapping,
+        SceneHierarchyTopology hierarchy, std::string* errorMessage)
     {
         SceneObjectMapping newMapping;
         std::vector<RenderObject> objects;
@@ -27,9 +28,13 @@ namespace
         }
 
         std::string environment=prepared.environmentReference;
-        // ReplaceRenderObjects allocates dirty flags before swapping storage.
-        // No throwing operations follow its commit point.
-        scene.ReplaceRenderObjects(std::move(objects));
+        // ReplaceRenderObjects allocates dirty flags and evaluates the hierarchy before swapping
+        // storage; a rejection returns before any change. No throwing operations follow it.
+        if (!scene.ReplaceRenderObjects(std::move(objects), std::move(hierarchy), errorMessage))
+        {
+            return false;
+        }
+
         Camera& camera = scene.GetCamera();
         camera.SetPosition(prepared.camera.position);
         camera.SetTarget(prepared.camera.target);
@@ -63,7 +68,8 @@ bool CommitPreparedScene(
     const PreparedScene& prepared,
     Scene& scene,
     SceneObjectMapping& mapping,
-    std::string* errorMessage)
+    std::string* errorMessage,
+    SceneHierarchyTopology hierarchy)
 {
     // Validate the prepared snapshot before changing the runtime scene.
     // This also protects against modifications made after PrepareScene().
@@ -113,18 +119,18 @@ bool CommitPreparedScene(
         validation.objects.push_back(std::move(entry));
     }
 
-    if (!ValidateSceneDocument(validation, errorMessage))
+    if (!ValidateSceneDocumentPersistence(validation, errorMessage))
     {
         return false;
     }
 
-    return CommitValidatedObjects(prepared, scene, mapping);
+    return CommitValidatedObjects(prepared, scene, mapping, std::move(hierarchy), errorMessage);
 }
 
 bool CommitPreparedEditorScene(const PreparedScene& prepared, const SceneDocument& document,
-    Scene& scene, SceneObjectMapping& mapping, std::string* errorMessage)
+    Scene& scene, SceneObjectMapping& mapping, std::string* errorMessage, SceneHierarchyTopology hierarchy)
 {
-    if (!ValidateSceneDocument(document, errorMessage) || prepared.objects.size() != document.objects.size())
+    if (!ValidateSceneDocumentPersistence(document, errorMessage) || prepared.objects.size() != document.objects.size())
     {
         return Fail(errorMessage, "Editor replacement authored document or object count is invalid.");
     }
@@ -209,5 +215,5 @@ bool CommitPreparedEditorScene(const PreparedScene& prepared, const SceneDocumen
         return Fail(errorMessage, "Editor replacement transforms or scene settings differ from the authored snapshot.");
     }
 
-    return CommitValidatedObjects(prepared, scene, mapping);
+    return CommitValidatedObjects(prepared, scene, mapping, std::move(hierarchy), errorMessage);
 }

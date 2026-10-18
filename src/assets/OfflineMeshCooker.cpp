@@ -3,6 +3,7 @@
 #include "assets/DevelopmentMeshCookRecipe.h"
 #include "assets/MeshCookValidation.h"
 #include "assets/ModelImporter.h"
+#include "assets/MeshImportUnitsJson.h"
 #include "assets/ProjectAssetResolver.h"
 #include "assets/ProjectMeshPreparationService.h"
 #include "Project/ProjectLocator.h"
@@ -169,7 +170,9 @@ namespace
     void Revalidate(const Source& source, const ProjectPaths& paths, const ProjectAssetRegistry& registry)
     {
         const auto resolved = ProjectAssetResolver::Resolve(paths, registry, source.record.id);
-        Require(resolved.status == AssetAvailability::Available && resolved.resolvedPath == source.path,
+        const auto* current = registry.Find(source.record.id);
+        Require(current && current->meshImportUnits == source.record.meshImportUnits &&
+            resolved.status == AssetAvailability::Available && resolved.resolvedPath == source.path,
             "[freshness] Registered source resolution changed: " + source.record.id.ToString());
         Require(ProjectMeshPreparationService::InspectSourceIdentity(source.path) == source.identity &&
             Digest(source.path) == source.digest, "[freshness] Source changed while cooking: " + source.record.id.ToString());
@@ -182,7 +185,8 @@ namespace
 
         try
         {
-            geometry = ModelImporter::LoadFlattened(source.path, MeshUVOrientation::FlipV, policy.maxDecodedBytes);
+            geometry = ModelImporter::LoadFlattened(source.path, MeshUVOrientation::FlipV,
+                policy.maxDecodedBytes, source.record.meshImportUnits);
         }
         catch(const std::exception& error)
         {
@@ -208,11 +212,18 @@ namespace
         const auto digest = Hex(encoded.evidence);
         Require(Digest(output) == digest, "[verification] Persisted payload digest differs.");
 
-        return {{"assetID", source.record.id.ToString()}, {"assetType", "mesh"},
+        Json entry{{"assetID", source.record.id.ToString()}, {"assetType", "mesh"},
             {"sourcePath", source.record.relativePath.generic_string()}, {"sourceSHA256", source.digest},
             {"recipeIdentity", recipe.dump()}, {"payloadSHA256", digest}, {"payloadBytes", encoded.payload.size()},
             {"payloadPath", relative.generic_string()}, {"formatVersion", CookedMesh::V1::Version},
             {"cookCompatibility", CookedMesh::V1::CookCompatibility}, {"vertexLayout", CookedMesh::V1::VertexLayout}};
+
+        if(source.record.meshImportUnits != MeshImportUnits{})
+        {
+            entry["importUnits"] = SerializeMeshImportUnits(source.record.meshImportUnits);
+        }
+
+        return entry;
     }
 
     std::pair<fs::path, std::string> CreateStage(const fs::path& generations)

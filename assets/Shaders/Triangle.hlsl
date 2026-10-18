@@ -452,9 +452,11 @@ VSOutput VSMain(VSInput input)
     );
 
     output.worldNormal = mul((float3x3)normalMatrix, input.normal);
+    // Tangents are surface directions; only normals use the inverse transpose.
+    float modelOrientation = determinant((float3x3)model) < 0.0f ? -1.0f : 1.0f;
     output.worldTangent = float4(
-        normalize(mul((float3x3)normalMatrix, input.tangent.xyz)),
-        input.tangent.w
+        mul((float3x3)model, input.tangent.xyz),
+        input.tangent.w * modelOrientation
     );
 
     output.uv =
@@ -578,7 +580,6 @@ PSOutput PSMain(VSOutput input)
     {
         Texture2D<float4> normalTexture = ResourceDescriptorHeap[normalTextureIndex];
         float2 normalXY = normalTexture.Sample(sampler0, resolvedMaterialUV).rg * 2.0f - 1.0f;
-        normalXY *= 0.5f;
         float normalZ = sqrt(saturate(1.0f - dot(normalXY, normalXY)));
         float3 sampledNormal = float3(normalXY, normalZ);
         float3 tangent = input.worldTangent.xyz - N * dot(N, input.worldTangent.xyz);

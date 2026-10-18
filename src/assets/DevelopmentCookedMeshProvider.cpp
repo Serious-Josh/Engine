@@ -1,4 +1,5 @@
 #include "assets/DevelopmentCookedMeshProvider.h"
+#include "assets/MeshImportUnitsJson.h"
 #include "assets/DevelopmentMeshCookRecipe.h"
 #include "Renderer/Preview/MaterialThumbnailValidation.h"
 
@@ -417,7 +418,24 @@ namespace DevelopmentCookedMesh
 
             for(const auto& entry : manifest->at("assets"))
             {
-                if(!Fields(entry, {"assetID", "assetType", "sourcePath", "sourceSHA256", "recipeIdentity", "payloadSHA256",
+                auto compatibilityEntry = entry;
+                MeshImportUnits units;
+
+                if(entry.contains("importUnits"))
+                {
+                    try
+                    {
+                        units = DeserializeMeshImportUnits(entry.at("importUnits"));
+                    }
+                    catch(const std::exception&)
+                    {
+                        return {{Status::Corrupt, "Invalid mesh import units in development manifest."}};
+                    }
+
+                    compatibilityEntry.erase("importUnits");
+                }
+
+                if(!Fields(compatibilityEntry, {"assetID", "assetType", "sourcePath", "sourceSHA256", "recipeIdentity", "payloadSHA256",
                     "payloadBytes", "payloadPath", "formatVersion", "cookCompatibility", "vertexLayout"}) ||
                     !Text(entry, "assetID") || !Text(entry, "assetType") || !Text(entry, "sourcePath") || !Text(entry, "sourceSHA256") ||
                     !Text(entry, "recipeIdentity") || !Text(entry, "payloadSHA256") || !Text(entry, "payloadPath") ||
@@ -460,7 +478,7 @@ namespace DevelopmentCookedMesh
 
                 const CookedMesh::Evidence evidence{DigestBytes(payloadHash), length, CookedMesh::V1::CookCompatibility, CookedMesh::V1::Version};
                 state->assets.emplace(id->ToString(), std::make_shared<const AssetEvidence>(AssetEvidence{
-                    *id, AssetType::Mesh, evidence, state->mapping, recipe, sourceHash, sourcePath}));
+                    *id, AssetType::Mesh, evidence, state->mapping, recipe, sourceHash, sourcePath, 0, units}));
             }
 
             auto current = ReadActivation(cooked, policy);

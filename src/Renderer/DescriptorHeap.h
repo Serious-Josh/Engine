@@ -1,11 +1,23 @@
 #pragma once
 
 #include <d3d12.h>
+#include <cstddef>
+#include <cstdint>
 #include <vector>
 
 class DescriptorHeap
 {
     public:
+    // Low-overhead accounting; reading it never logs or allocates.
+    struct Statistics
+    {
+        unsigned int capacity = 0;
+        size_t allocated = 0;
+        size_t available = 0;
+        size_t peakAllocated = 0;
+        std::uint64_t failedAllocations = 0;
+    };
+
     DescriptorHeap() = default;
 
     DescriptorHeap(const DescriptorHeap&) = delete;
@@ -27,6 +39,12 @@ class DescriptorHeap
     size_t GetAvailableCount() const noexcept { return m_freeIndices.size(); }
     unsigned int GetCapacity() const noexcept { return m_capacity; }
 
+    // True when `count` descriptors can be allocated now. Lets transactions check capacity
+    // before allocating anything, so exhaustion is detected without a partial allocation.
+    bool CanAllocate(size_t count) const noexcept { return m_freeIndices.size() >= count; }
+
+    Statistics GetStatistics() const noexcept;
+
     D3D12_CPU_DESCRIPTOR_HANDLE GetCPUHandle(unsigned int index) const;
     D3D12_GPU_DESCRIPTOR_HANDLE GetGPUHandle(unsigned int index) const;
 
@@ -44,4 +62,10 @@ class DescriptorHeap
     std::vector<unsigned int> m_freeIndices;
 
     bool m_shaderVisible = false;
+
+    size_t m_peakAllocated = 0;
+    std::uint64_t m_failedAllocations = 0;
+
+    // Exhaustion is logged once per episode; a Free ends the episode.
+    bool m_exhaustionReported = false;
 };

@@ -1,3 +1,4 @@
+#include "Platform/Windows/WindowsWindow.h"
 #include "CornellBoxScene.h"
 
 #include "Renderer/ResourceUploader.h"
@@ -114,7 +115,7 @@ bool CornellBoxScene::Initialize(
 
     // Cornell box
 
-    auto cornellBox = ModelImporter::Load("assets/Models/CornellBox/cornell_box.fbx");
+    auto cornellBox = ModelImporter::Load((WindowsWindow::GetExecutableDirectory() / "assets/Models/CornellBox/cornell_box.fbx"));
 
     if (cornellBox.empty())
     {
@@ -142,7 +143,7 @@ bool CornellBoxScene::Initialize(
 
     ImageData tankAlbedo;
 
-    if (!ImageLoader::Load("assets/Textures/Materials/tank_sample_alb.png", tankAlbedo))
+    if (!ImageLoader::Load((WindowsWindow::GetExecutableDirectory() / "assets/Textures/Materials/tank_sample_alb.png"), tankAlbedo))
     {
         throw std::runtime_error("Failed to load tank albedo atlas.");
     }
@@ -168,7 +169,7 @@ bool CornellBoxScene::Initialize(
     // Store and sample as linear data, never sRGB.
     ImageData tankNormal;
 
-    if (!ImageLoader::Load("assets/Textures/Materials/tank_sample_n.png", tankNormal))
+    if (!ImageLoader::Load((WindowsWindow::GetExecutableDirectory() / "assets/Textures/Materials/tank_sample_n.png"), tankNormal))
     {
         throw std::runtime_error("Failed to load tank normal map.");
     }
@@ -201,7 +202,7 @@ bool CornellBoxScene::Initialize(
     m_tankMaterial.baseColor[2] = 1.0f;
 
     // Match the PNG atlas convention through the centralized importer policy.
-    auto tank = ModelImporter::Load("assets/Models/CornellBox/tank_sample.fbx", MeshUVOrientation::FlipV);
+    auto tank = ModelImporter::Load((WindowsWindow::GetExecutableDirectory() / "assets/Models/CornellBox/tank_sample.fbx"), MeshUVOrientation::FlipV);
 
     if (tank.empty())
     {
@@ -237,28 +238,28 @@ bool CornellBoxScene::Initialize(
     RetainEditorGeometry(m_brickSphereMesh, std::move(sphere.vertices), std::move(sphere.indices));
 
     if (!DDSLoader::LoadTexture(device, uploader, descriptorHeap,
-                                "assets/Textures/Materials/stacked_brick_wall_diff_4k.dds", m_brickDiffuseTexture,
+                                (WindowsWindow::GetExecutableDirectory() / "assets/Textures/Materials/stacked_brick_wall_diff_4k.dds"), m_brickDiffuseTexture,
                                 true))
     {
         return false;
     }
 
     if (!DDSLoader::LoadTexture(device, uploader, descriptorHeap,
-                                "assets/Textures/Materials/stacked_brick_wall_nor_dx_4k.dds", m_brickNormalTexture,
+                                (WindowsWindow::GetExecutableDirectory() / "assets/Textures/Materials/stacked_brick_wall_nor_dx_4k.dds"), m_brickNormalTexture,
                                 false))
     {
         return false;
     }
 
     if (!DDSLoader::LoadTexture(device, uploader, descriptorHeap,
-                                "assets/Textures/Materials/stacked_brick_wall_rough_4k.dds", m_brickRoughnessTexture,
+                                (WindowsWindow::GetExecutableDirectory() / "assets/Textures/Materials/stacked_brick_wall_rough_4k.dds"), m_brickRoughnessTexture,
                                 false))
     {
         return false;
     }
 
     if (!DDSLoader::LoadTexture(device, uploader, descriptorHeap,
-                                "assets/Textures/Materials/stacked_brick_wall_arm_4k.dds", m_brickARMTexture, false))
+                                (WindowsWindow::GetExecutableDirectory() / "assets/Textures/Materials/stacked_brick_wall_arm_4k.dds"), m_brickARMTexture, false))
     {
         return false;
     }

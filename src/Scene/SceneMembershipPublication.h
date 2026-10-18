@@ -14,7 +14,9 @@ struct SceneObjectMetadata;
 class SceneMembershipPublication
 {
 public:
-    enum class Status { Ready, Retry, Stale, Unsupported, Failed };
+    // ResourceExhausted: descriptor capacity is unavailable. It is not a transient deferral;
+    // the caller may reclaim capacity and retry once, then must cancel.
+    enum class Status { Ready, Retry, Stale, Unsupported, Failed, ResourceExhausted };
     struct Result { Status status; std::string message; };
     SceneMembershipPublication();
     ~SceneMembershipPublication();
@@ -24,6 +26,8 @@ public:
         const SceneObjectDocument&,std::size_t index,unsigned int frameSlot, std::string_view bindingSourceID = {});
     Result PrepareRemoval(Renderer&,const FileSceneRuntime&,FileSceneAssetCatalog&,
         std::string_view objectID,unsigned int frameSlot);
+    Result PrepareDocument(Renderer&, const FileSceneRuntime&, FileSceneAssetCatalog&,
+        const SceneDocument&, unsigned int frameSlot, const std::map<std::string, std::string>& bindingSources = {});
     // Swaps authoritative runtime and GPU membership together. A retained stable
     // selection ID maps through the new runtime; a removed selection becomes empty.
     Result PublishAtBoundary(Renderer&,std::unique_ptr<FileSceneRuntime>&,
@@ -36,5 +40,5 @@ private:
     std::unique_ptr<Prepared> m_prepared;
     std::thread::id m_thread;
     Result Prepare(Renderer&,const FileSceneRuntime&,FileSceneAssetCatalog&,
-        const SceneObjectDocument* insertion,std::string_view removal,std::size_t index,unsigned int frameSlot,std::string_view bindingSourceID = {});
+        const SceneObjectDocument* insertion,std::string_view removal,std::size_t index,unsigned int frameSlot,std::string_view bindingSourceID = {}, const SceneDocument* document = nullptr, const std::map<std::string, std::string>* bindingSources = nullptr);
 };

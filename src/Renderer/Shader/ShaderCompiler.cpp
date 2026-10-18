@@ -71,6 +71,8 @@ bool ShaderCompiler::Compile(
 
     if (FAILED(result))
     {
+        Log::Error("Cannot read required shader source: " + std::filesystem::path(description.path).string() +
+            " (HRESULT " + std::to_string(result) + "). Keep the bundled assets/Shaders directory beside Engine.exe.");
         return false;
     }
 
@@ -190,6 +192,8 @@ bool ShaderCompiler::CompileLibrary(
 
     if (FAILED(result))
     {
+        Log::Error("Cannot read required shader source: " + std::filesystem::path(description.path).string() +
+            " (HRESULT " + std::to_string(result) + "). Keep the bundled assets/Shaders directory beside Engine.exe.");
         return false;
     }
 

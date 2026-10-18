@@ -25,6 +25,7 @@ public:
         std::string renderVersion = "mesh-v3-camera-yaw180-neutral-studio3-normalized-bounds-zoom1.30-margin0.90-agx-256";
         std::uint32_t importRevision = ModelImporter::kImportRevision;
         std::string uvPolicy = "FlipV";
+        MeshImportUnits units;
     };
     struct Job
     {

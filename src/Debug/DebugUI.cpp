@@ -1,4 +1,5 @@
 #include "DebugUI.h"
+#include "Platform/Windows/EditorDistributionPaths.h"
 
 #include "Renderer/DescriptorHeap.h"
 
@@ -482,6 +483,17 @@ bool DebugUI::Initialize(
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
+
+    // ImGui keeps this pointer until context destruction. Development layouts remain unchanged.
+    static std::string portableSettings;
+
+    if(EditorDistributionPaths::IsPortable())
+    {
+        const auto settings = (EditorDistributionPaths::UserDirectory() / "imgui.ini").u8string();
+        portableSettings.assign(settings.begin(), settings.end());
+        ImGui::GetIO().IniFilename = portableSettings.c_str();
+        ImGui::GetIO().LogFilename = nullptr;
+    }
 
     ImGui::StyleColorsDark();
 

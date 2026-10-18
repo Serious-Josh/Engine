@@ -268,6 +268,23 @@ bool FileBackedDemoScene::SetObjectPhysics(const SceneObjectMetadata& selection,
     return m_runtime->SetObjectPhysics(selection, expected, replacement, errorMessage);
 }
 
+bool FileBackedDemoScene::SetObjectTriggerCollider(const SceneObjectMetadata& selection,
+    const std::optional<Physics::TriggerColliderComponent>& expected,
+    const std::optional<Physics::TriggerColliderComponent>& replacement, std::string* errorMessage)
+{
+    if(!m_initialized || m_objectMutationCandidate)
+    {
+        if(errorMessage)
+        {
+            *errorMessage = "Trigger Collider editing requires an initialized scene without pending structure changes.";
+        }
+
+        return false;
+    }
+
+    return m_runtime->SetObjectTriggerCollider(selection, expected, replacement, errorMessage);
+}
+
 bool FileBackedDemoScene::RenameObject(const SceneObjectMetadata& selection, std::string_view expectedName,
     std::string name, std::string* errorMessage, SceneObjectNamePolicy policy)
 {
@@ -642,4 +659,43 @@ Material* FileBackedDemoScene::ResolvePendingAssignmentMaterial(std::string_view
     }
 
     return material;
+}
+
+bool FileBackedDemoScene::SetObjectCharacterController(const SceneObjectMetadata& selection,
+    const std::optional<Physics::CharacterControllerComponent>& expected,
+    const std::optional<Physics::CharacterControllerComponent>& replacement, std::string* errorMessage)
+{
+    if(!m_initialized || m_objectMutationCandidate)
+    {
+        if(errorMessage)
+        {
+            *errorMessage = "Character Controller editing requires an initialized scene without pending structure changes.";
+        }
+
+        return false;
+    }
+
+    return m_runtime->SetObjectCharacterController(selection, expected, replacement, errorMessage);
+}
+
+bool FileBackedDemoScene::ValidateObjectTransform(RenderObjectID index, const Transform& transform, std::string& error) const
+{
+    const auto identity = m_runtime->GetObjectMetadata(index, &error);
+
+    if(!identity)
+    {
+        return false;
+    }
+
+    for(const auto& object : m_runtime->GetFileScene().GetDocument().objects)
+    {
+        if(object.id == identity->objectID)
+        {
+            return !object.characterController ||
+                Physics::ValidateCharacterControllerTransform(*object.characterController, transform, &error);
+        }
+    }
+
+    error = "Transform target is absent from the authored scene.";
+    return false;
 }

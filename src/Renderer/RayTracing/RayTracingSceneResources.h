@@ -164,11 +164,18 @@ class RayTracingSceneResources
     friend class FileSceneRuntime;
     friend class MeshResidencyPublication;
     friend class SceneMembershipPublication;
+#if defined(ENGINE_HAS_VERIFICATION)
     friend class SceneDuplicationVerification;
+    friend class PresentationTransformVerification;
     friend class SceneMembershipVerification;
+    friend class SceneHierarchyVerification;
+    friend class DescriptorRecoveryVerification;
+#endif
     friend class SceneMaterialBindingPublication;
+#if defined(ENGINE_HAS_VERIFICATION)
     friend class SceneMaterialBindingVerification;
     friend class MaterialAdmissionVerification;
+#endif
 
     // Renderer-only observations cover every tracked list conservatively,
     // including builds and later rendering uses of an unchanged snapshot.
@@ -179,10 +186,23 @@ class RayTracingSceneResources
     void DiscardMembershipRecording(std::uint64_t generation);
     void CollectRetiredMemberships(const CommandContext& context);
 
+    // Why a candidate could not be prepared. Callers must not treat exhaustion as a
+    // transient synchronization deferral: retrying it unchanged cannot succeed.
+    enum class CandidateFailure
+    {
+        None,
+        DescriptorExhausted,
+        Other
+    };
+
+    // A candidate owns its triangle-slot, slot-material and instance-data SRVs while the
+    // active membership keeps its own until fence retirement.
+    static constexpr std::size_t CandidateDescriptorCount = 3;
+
     std::optional<ReplacementCandidate> PrepareReplacementCandidate(ID3D12Device5* device,
         DescriptorHeap& heap, const FileSceneRuntime& runtime, FileSceneAssetCatalog& catalog,
         const std::vector<ResidencyProposal>& proposals, std::size_t materialCount, std::string& error,
-        const FileSceneRuntime* membershipSource = nullptr);
+        const FileSceneRuntime* membershipSource = nullptr, CandidateFailure* failure = nullptr);
     bool RecordReplacementCandidate(ID3D12Device5* device, ID3D12GraphicsCommandList4* commands,
         std::uint64_t generation, std::string& error);
     CandidateStatus PollReplacementCandidate(const ReplacementCandidate& candidate, const CommandContext& context,

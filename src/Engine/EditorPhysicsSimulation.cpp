@@ -1,6 +1,7 @@
 #include "Engine/Engine.h"
 #include "DemoContent/FileBackedDemoScene.h"
 #include "Core/Log.h"
+#include "Engine/CharacterDriveScheduling.h"
 
 bool Engine::PhysicsBlocksSceneEdits() const noexcept
 {
@@ -50,6 +51,7 @@ void Engine::ProcessEditorPhysicsSimulation(FileSceneRuntime* runtime, double el
             Log::Error(m_physicsMessage);
             m_window.Close();
         }
+        m_editor.SetCharacterDiagnostics(nullptr);
         RefreshEditorPhysicsStatus(false);
         return;
     }
@@ -91,8 +93,22 @@ void Engine::ProcessEditorPhysicsSimulation(FileSceneRuntime* runtime, double el
         {
             m_physicsMessage = "Physics stopped: the renderer is still recording commands.";
             StopEditorPhysicsSimulation(*runtime);
+            m_editor.SetCharacterDiagnostics(nullptr);
             RefreshEditorPhysicsStatus(compatibleScene);
             return;
+        }
+        // CM.9 diagnostic drive: commands address exactly the steps this Update will run.
+        if (const auto intent = m_editor.TakeCharacterDriveIntent())
+        {
+            const auto submission = SubmitCharacterDriveCommands(m_physicsSimulation, *intent, elapsedSeconds);
+            if (submission.jumpSubmitted)
+            {
+                m_editor.AcknowledgeCharacterDriveJump();
+            }
+            if (!submission.error.empty())
+            {
+                m_physicsMessage = "Diagnostic drive: " + submission.error;
+            }
         }
         // This seam is called once per editor frame, outside all command recording.
         // A publication retry never reuses this frame's elapsed time.
@@ -118,5 +134,7 @@ void Engine::ProcessEditorPhysicsSimulation(FileSceneRuntime* runtime, double el
             // by the existing successful-render path in Engine::Frame.
         }
     }
+    // Only diagnostics that describe the currently presented poses (null when inactive).
+    m_editor.SetCharacterDiagnostics(m_physicsSimulation.GetPublishedCharacterDiagnostics());
     RefreshEditorPhysicsStatus(compatibleScene);
 }

@@ -19,7 +19,7 @@ A fundamental principle for Engine is 'what you see is what you get' (WYSIWYG). 
     - RTGI
     - RTAO
 - GPU-Driven Adaptive Displacement w/ DXR Support (WIP)
-- Box3D Physics Integration (WIP)
+- Box3D Physics Integration
 
 Future goals listed here:
 

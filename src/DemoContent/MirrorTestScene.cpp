@@ -1,3 +1,4 @@
+#include "Platform/Windows/WindowsWindow.h"
 #include "DemoContent/MirrorTestScene.h"
 #include "DemoContent/SceneRegistry.h"
 
@@ -139,7 +140,7 @@ bool MirrorTestScene::Initialize(
     // Temporary CPU displacement heightmap validation.
     DirectX::ScratchImage displacementDDS;
 
-    if (!DDSLoader::Load("assets/Textures/Materials/stacked_brick_wall_disp_4k.dds", displacementDDS))
+    if (!DDSLoader::Load((WindowsWindow::GetExecutableDirectory() / "assets/Textures/Materials/stacked_brick_wall_disp_4k.dds"), displacementDDS))
     {
         return false;
     }
@@ -364,7 +365,7 @@ bool MirrorTestScene::Initialize(
     // Brick diffuse texture — BC1 with sRGB sampling.
 
     if (!DDSLoader::LoadTexture(device, uploader, descriptorHeap,
-                                "assets/Textures/Materials/stacked_brick_wall_diff_4k.dds", m_sphereTexture, true))
+                                (WindowsWindow::GetExecutableDirectory() / "assets/Textures/Materials/stacked_brick_wall_diff_4k.dds"), m_sphereTexture, true))
     {
         return false;
     }
@@ -392,7 +393,7 @@ bool MirrorTestScene::Initialize(
     // Brick normal map — BC5 with linear sampling.
 
     if (!DDSLoader::LoadTexture(device, uploader, descriptorHeap,
-                                "assets/Textures/Materials/stacked_brick_wall_nor_dx_4k.dds", m_normalTexture, false))
+                                (WindowsWindow::GetExecutableDirectory() / "assets/Textures/Materials/stacked_brick_wall_nor_dx_4k.dds"), m_normalTexture, false))
     {
         return false;
     }
@@ -400,7 +401,7 @@ bool MirrorTestScene::Initialize(
     // Brick roughness map — BC4 with linear sampling.
 
     if (!DDSLoader::LoadTexture(device, uploader, descriptorHeap,
-                                "assets/Textures/Materials/stacked_brick_wall_rough_4k.dds", m_roughnessTexture, false))
+                                (WindowsWindow::GetExecutableDirectory() / "assets/Textures/Materials/stacked_brick_wall_rough_4k.dds"), m_roughnessTexture, false))
     {
         return false;
     }
@@ -408,7 +409,7 @@ bool MirrorTestScene::Initialize(
     // Brick ARM map — BC1 with linear sampling.
 
     if (!DDSLoader::LoadTexture(device, uploader, descriptorHeap,
-                                "assets/Textures/Materials/stacked_brick_wall_arm_4k.dds", m_armTexture, false))
+                                (WindowsWindow::GetExecutableDirectory() / "assets/Textures/Materials/stacked_brick_wall_arm_4k.dds"), m_armTexture, false))
     {
         return false;
     }

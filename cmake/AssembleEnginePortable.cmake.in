@@ -1,0 +1,85 @@
+if(NOT "$<CONFIG>" STREQUAL "Release")
+    message(FATAL_ERROR "EnginePortable requires --config Release. Debug distributions are not supported.")
+endif()
+
+set(source "@CMAKE_CURRENT_SOURCE_DIR@")
+set(destination "@CMAKE_CURRENT_BINARY_DIR@/Portable/Release")
+set(stage "@CMAKE_CURRENT_BINARY_DIR@/Portable/Release.staging")
+set(crt_files "@CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS@")
+set(dxc "@ENGINE_PORTABLE_DXC_DIR@")
+set(sdk_license "@ENGINE_PORTABLE_SDK_LICENSE_DIR@")
+
+if(NOT crt_files)
+    message(FATAL_ERROR "Cannot locate Release MSVC redistributable libraries; install the MSVC Redist build components.")
+endif()
+
+foreach(required IN ITEMS "${dxc}/dxcompiler.dll" "${dxc}/dxil.dll"
+    "${sdk_license}/sdk_license.rtf" "${sdk_license}/sdk_third_party_notices.rtf")
+    if(NOT EXISTS "${required}")
+        message(FATAL_ERROR "Missing portable redistribution input: ${required}. Check ENGINE_PORTABLE_DXC_DIR/ENGINE_PORTABLE_SDK_LICENSE_DIR.")
+    endif()
+endforeach()
+
+# Only fixed, build-owned assembly directories are replaced. Never clean a user-selected project.
+file(REMOVE_RECURSE "${stage}")
+file(MAKE_DIRECTORY "${stage}/Game" "${stage}/assets/Shaders/NRD")
+file(COPY "$<TARGET_FILE:Engine>" DESTINATION "${stage}")
+file(COPY "$<TARGET_FILE:EngineRuntime>" DESTINATION "${stage}/Game")
+
+set(dependencies "$<TARGET_FILE:assimp>" "$<TARGET_FILE:DirectXTex>"
+    "${source}/external/NRD/Lib/Release/NRD.dll"
+    "${source}/external/NRI/Lib/Release/NRI.dll"
+    "${dxc}/dxcompiler.dll" "${dxc}/dxil.dll" ${crt_files})
+file(COPY ${dependencies} DESTINATION "${stage}")
+file(COPY ${dependencies} DESTINATION "${stage}/Game")
+
+file(COPY "${source}/assets/Shaders/" DESTINATION "${stage}/assets/Shaders"
+    FILES_MATCHING PATTERN "*.hlsl" PATTERN "*.hlsli")
+file(COPY "${source}/external/NRD/Shaders/NRD.hlsli"
+    "${source}/external/NRD/Shaders/NRDConfig.hlsli" DESTINATION "${stage}/assets/Shaders/NRD")
+file(COPY "${source}/assets/Models/" DESTINATION "${stage}/assets/Models"
+    FILES_MATCHING PATTERN "*.fbx")
+file(COPY "${source}/assets/Textures/Environment/" DESTINATION "${stage}/assets/Textures/Environment"
+    FILES_MATCHING PATTERN "*.hdr")
+file(COPY "${source}/assets/Textures/Materials/" DESTINATION "${stage}/assets/Textures/Materials"
+    FILES_MATCHING PATTERN "*.dds" PATTERN "tank_sample_*.png")
+
+set(notices "Third-party components retain their respective licenses below.\nThis software contains source code provided by NVIDIA Corporation.\nWindows SDK and MSVC redistributable components are subject to Microsoft's distribution terms.\n\n")
+foreach(license IN ITEMS
+    "${source}/external/NRD/LICENSE.txt" "${source}/external/NRI/LICENSE.txt"
+    "@assimp_SOURCE_DIR@/LICENSE" "@directxtex_SOURCE_DIR@/LICENSE"
+    "@nlohmann_json_SOURCE_DIR@/LICENSE.MIT" "@box3d_SOURCE_DIR@/LICENSE"
+    "${source}/cmake/PortableImGuiLicense.txt")
+    file(READ "${license}" text)
+    get_filename_component(component "${license}" DIRECTORY)
+    get_filename_component(component "${component}" NAME)
+    string(APPEND notices "===== ${component} =====\n${text}\n\n")
+endforeach()
+file(GLOB_RECURSE assimp_notices LIST_DIRECTORIES FALSE
+    "@assimp_SOURCE_DIR@/contrib/LICENSE*" "@assimp_SOURCE_DIR@/contrib/COPYING*")
+foreach(license IN LISTS assimp_notices)
+    file(READ "${license}" text)
+    file(RELATIVE_PATH component "@assimp_SOURCE_DIR@" "${license}")
+    string(APPEND notices "===== Assimp ${component} =====\n${text}\n\n")
+endforeach()
+file(STRINGS "${source}/external/ImGuizmo/ImGuizmo.h" imguizmo LIMIT_COUNT 24)
+string(REPLACE ";" "\n" imguizmo "${imguizmo}")
+string(APPEND notices "===== ImGuizmo =====\n${imguizmo}\n\n")
+file(READ "${source}/external/stb/stb_image.h" stb)
+string(FIND "${stb}" "ALTERNATIVE A - MIT License" license_offset)
+if(license_offset LESS 0)
+    message(FATAL_ERROR "Cannot locate stb_image license notice.")
+endif()
+string(SUBSTRING "${stb}" ${license_offset} -1 stb_license)
+string(APPEND notices "===== stb_image =====\n${stb_license}")
+file(WRITE "${stage}/RuntimeNotices.txt" "${notices}")
+file(COPY "${stage}/RuntimeNotices.txt" "${sdk_license}/sdk_license.rtf"
+    "${sdk_license}/sdk_third_party_notices.rtf" DESTINATION "${stage}/Game")
+file(COPY "${sdk_license}/sdk_license.rtf" "${sdk_license}/sdk_third_party_notices.rtf" DESTINATION "${stage}")
+file(WRITE "${stage}/EnginePortable.marker" "ENGINE_PORTABLE_EDITOR 1\n")
+file(WRITE "${stage}/README.txt"
+    "Engine portable Editor - Release x64\nRun Engine.exe directly, from any working directory.\nRequires Windows 10/11 x64, DirectX 12/DXR-capable hardware and a current GPU driver.\nWritable settings and the default project: %LOCALAPPDATA%/Engine/PortableEditor.\nApplication files may be read-only. Do not put projects or game output inside this folder.\nBuild Game uses bundled Game/EngineRuntime.exe; no build toolchain is required at runtime.\nKeep all bundled files together. Third-party terms: RuntimeNotices.txt and sdk_*.rtf.\n")
+
+file(REMOVE_RECURSE "${destination}")
+file(RENAME "${stage}" "${destination}")
+message(STATUS "Portable Editor: ${destination}")

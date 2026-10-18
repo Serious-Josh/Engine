@@ -1,4 +1,5 @@
 #include "Renderer/Preview/MeshThumbnailPreparation.h"
+#include "assets/MeshImportUnitsJson.h"
 
 #include "Renderer/Preview/MaterialThumbnailValidation.h"
 #include "assets/ModelImporter.h"
@@ -107,6 +108,7 @@ MeshThumbnailPreparation::Completion MeshThumbnailPreparation::Prepare(Source so
     Completion result{Job{}, std::move(source)};
     result.job.identity.project = result.source.project;
     result.job.identity.assetReference = result.source.record.id.ToReference();
+    result.job.identity.units = result.source.record.meshImportUnits;
 
     try
     {
@@ -134,7 +136,8 @@ MeshThumbnailPreparation::Completion MeshThumbnailPreparation::Prepare(Source so
         }
 
         const std::string fingerprint = identity.assetReference + "\n" + identity.sourceFingerprint + "\n" +
-            std::to_string(identity.importRevision) + "\n" + identity.uvPolicy + "\n" + identity.renderVersion;
+            std::to_string(identity.importRevision) + "\n" + identity.uvPolicy + "\n" + identity.renderVersion +
+            "\n" + SerializeMeshImportUnits(identity.units).dump();
         result.job.diskSource = DescribeMeshCache(ProjectPaths(result.source.project), result.source.record,
             result.source.path, fingerprint);
 
@@ -147,7 +150,8 @@ MeshThumbnailPreparation::Completion MeshThumbnailPreparation::Prepare(Source so
         }
 
         result.job.cachedPixels = {};
-        result.job.geometry = ModelImporter::LoadFlattened(result.source.path, MeshUVOrientation::FlipV);
+        result.job.geometry = ModelImporter::LoadFlattened(result.source.path, MeshUVOrientation::FlipV,
+            kMaximumJobBytes, result.source.record.meshImportUnits);
         ValidatePreparedGeometry(result.job.geometry);
         result.bytes = GeometryBytes(result.job.geometry);
 
@@ -199,6 +203,7 @@ bool MeshThumbnailPreparation::Request(const ProjectPaths& paths, const ProjectA
         for(auto& [existingTicket, entry] : m_jobs)
         {
             if(entry.source.project != project || entry.source.record.id != id ||
+                entry.source.record.meshImportUnits != record->meshImportUnits ||
                 entry.job.state == State::Failed || entry.job.state == State::Cancelled)
             {
                 continue;
@@ -228,6 +233,7 @@ bool MeshThumbnailPreparation::Request(const ProjectPaths& paths, const ProjectA
         Entry entry{Job{}, source};
         entry.job.identity.project = project;
         entry.job.identity.assetReference = id.ToReference();
+        entry.job.identity.units = record->meshImportUnits;
         m_jobs.emplace(next, std::move(entry));
 
         try
@@ -304,7 +310,8 @@ void MeshThumbnailPreparation::Poll(const ProjectPaths& paths, const ProjectAsse
         const auto* record = registry.Find(entry.source.record.id);
         const auto resolved = ProjectAssetResolver::Resolve(paths, registry, entry.source.record.id);
         bool current = !projectError && activeProject == entry.source.project && record &&
-            record->type == AssetType::Mesh && record->relativePath == entry.source.record.relativePath;
+            record->type == AssetType::Mesh && record->relativePath == entry.source.record.relativePath &&
+            record->meshImportUnits == entry.source.record.meshImportUnits;
 
         current = current && resolved.status == AssetAvailability::Available && resolved.resolvedPath == entry.source.path;
 
@@ -361,6 +368,7 @@ void MeshThumbnailPreparation::Poll(const ProjectPaths& paths, const ProjectAsse
             const auto resolved = ProjectAssetResolver::Resolve(paths, registry, completed.source.record.id);
             const bool current = !error && project == completed.source.project && record &&
                 record->type == AssetType::Mesh && record->relativePath == completed.source.record.relativePath &&
+                record->meshImportUnits == completed.source.record.meshImportUnits &&
                 resolved.status == AssetAvailability::Available && resolved.resolvedPath == completed.source.path;
 
             if(!current)
