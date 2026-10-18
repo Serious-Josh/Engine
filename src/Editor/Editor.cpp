@@ -19,7 +19,7 @@
 #include "DemoContent/DemoSceneManager.h"
 #include "DemoContent/FileBackedDemoScene.h"
 
-#include "Project/ProjectLocator.h"
+#include "Project/ProjectContext.h"
 #include "Project/ProjectPaths.h"
 
 #include "Renderer/Mesh.h"
@@ -256,12 +256,18 @@ void Editor::DrawMainMenu(
 
         if (ImGui::BeginMenu("Load"))
         {
-            const ProjectPaths paths(ProjectLocator::GetDefaultProjectRoot());
             std::vector<std::filesystem::path> scenes;
-            std::error_code error;
-            std::filesystem::directory_iterator iterator(
-                paths.GetScenesDirectory(),
-                error);
+            std::error_code error = std::make_error_code(std::errc::no_such_file_or_directory);
+            std::filesystem::directory_iterator iterator;
+
+            if (m_activeProject)
+            {
+                error.clear();
+                iterator = std::filesystem::directory_iterator(
+                    m_activeProject->GetPaths().GetScenesDirectory(),
+                    error);
+            }
+
             const std::filesystem::directory_iterator end;
 
             while (!error && iterator != end)

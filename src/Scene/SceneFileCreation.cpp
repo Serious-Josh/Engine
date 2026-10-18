@@ -1,6 +1,5 @@
 #include "Scene/SceneFileCreation.h"
 
-#include "Project/ProjectLocator.h"
 #include "Project/ProjectPaths.h"
 #include "Scene/SceneSerializer.h"
 
@@ -96,14 +95,4 @@ bool CreateNewSceneFile(
     {
         return Fail(errorMessage, exception.what());
     }
-}
-
-bool CreateNewSceneFile(
-    std::filesystem::path& createdPath,
-    std::string* errorMessage)
-{
-    return CreateNewSceneFile(
-        ProjectPaths(ProjectLocator::GetDefaultProjectRoot()),
-        createdPath,
-        errorMessage);
 }

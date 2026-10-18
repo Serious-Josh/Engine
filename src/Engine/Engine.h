@@ -21,6 +21,8 @@
 #include "Scene/SceneMembershipPublication.h"
 #include "Scene/SceneMaterialBindingPublication.h"
 #include "Engine/PhysicsSimulationController.h"
+#include "Project/ProjectContext.h"
+#include "Project/ProjectLoader.h"
 #include <chrono>
 
 #include <cstdint>
@@ -51,6 +53,14 @@ class Engine
     // Archive diagnostics skip loose-project registry, reconciliation and scans.
     bool Initialize(bool archiveDiagnostic = false);
     bool Initialize(const EngineStartup& startup);
+
+    // The authoritative project for Editor and archive-diagnostic modes. Packaged runtime has
+    // no loose project; calling this there is a logic error.
+    const ProjectContext& GetActiveProject() const;
+
+    // Editor mode only, before Initialize: work in this validated, locked project instead of
+    // the default project. Engine owns the lock until Shutdown or destruction.
+    void SetStartupProject(OpenedProject project);
 #if !defined(NDEBUG) && defined(ENGINE_HAS_VERIFICATION)
     friend class PortableEditorVerification;
     void VerifyPackagedBootstrap();
@@ -472,6 +482,13 @@ class Engine
     EngineState m_state = EngineState::Uninitialized;
 
     bool m_sceneResourcesReleasedForSwitch = false;
+
+    // Set once during Initialize and never replaced: Editor and scene owners keep references to
+    // it, and project switching is not supported yet. Empty in packaged runtime.
+    std::optional<ProjectContext> m_activeProject;
+
+    // Held for explicitly opened projects; empty for the legacy DefaultProject (see PR.3 report).
+    ProjectLock m_projectLock;
 
     ProjectAssetRegistry m_projectAssetRegistry;
 

@@ -80,6 +80,7 @@ add_library(EngineCore OBJECT
     src/Scene/FileSceneTextureStreaming.cpp
     src/Platform/Windows/WindowsWindow.cpp
     src/Platform/Windows/EditorDistributionPaths.cpp
+    src/Platform/Windows/CommandLineArguments.cpp
     src/Core/Time.cpp
     src/Core/Input.cpp
     src/Core/Log.cpp
@@ -201,6 +202,11 @@ add_library(EngineCore OBJECT
     src/Scene/SceneFileCreation.cpp
     src/Project/ProjectPaths.cpp
     src/Project/ProjectLocator.cpp
+    src/Project/ProjectContext.cpp
+    src/Project/ProjectManifest.cpp
+    src/Project/ProjectLock.cpp
+    src/Project/ProjectLoader.cpp
+    src/Project/EditorCommandLine.cpp
     src/Scene/FileScene.cpp
     src/Scene/SceneDocumentAdapter.cpp
     src/Scene/SceneObjectResolver.cpp

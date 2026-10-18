@@ -191,7 +191,7 @@ bool Engine::QueueMaterialAssignment(MaterialAssignmentRequest request, std::str
         if(request.slotMaterial)
         {
             const auto* material = m_projectAssetRegistry.Find(*request.slotMaterial);
-            const ProjectPaths paths(ProjectLocator::GetDefaultProjectRoot());
+            const ProjectPaths& paths = GetActiveProject().GetPaths();
 
             if(!material || material->type != AssetType::Material ||
                 ProjectAssetResolver::Resolve(paths, m_projectAssetRegistry, *request.slotMaterial).status != AssetAvailability::Available)
@@ -473,7 +473,7 @@ bool Engine::ExecuteMaterialAssignment()
         if(request.slotID && request.slotMaterial)
         {
             const auto* record = m_projectAssetRegistry.Find(*request.slotMaterial);
-            const ProjectPaths paths(ProjectLocator::GetDefaultProjectRoot());
+            const ProjectPaths& paths = GetActiveProject().GetPaths();
             materialAvailable = record && record->type == AssetType::Material &&
                 ProjectAssetResolver::Resolve(paths, m_projectAssetRegistry, *request.slotMaterial).status == AssetAvailability::Available;
 
@@ -735,7 +735,7 @@ void Engine::QueueEditorSceneOperation()
 
     if (request.type == Editor::FileRequestType::New)
     {
-        if (!CreateNewSceneFile(path, &error))
+        if (!CreateNewSceneFile(GetActiveProject().GetPaths(), path, &error))
         {
             Log::Error("Failed to create scene: " + error);
             return;
@@ -788,7 +788,7 @@ void Engine::ProcessEditorMaterialRequests()
 
     if(const auto request = m_editor.TakeMaterialCreationRequest())
     {
-        const ProjectPaths projectPaths(ProjectLocator::GetDefaultProjectRoot());
+        const ProjectPaths& projectPaths = GetActiveProject().GetPaths();
         auto createdID = AssetID::Generate();
         std::string error;
 
@@ -845,7 +845,7 @@ void Engine::ProcessEditorSceneRequests(IDemoScene& activeScene)
                 // Resolve symlinks/junctions before checking component containment.
                 // Save the resolved path so staging does not reuse the menu's alias.
                 std::error_code error;
-                const ProjectPaths project(ProjectLocator::GetDefaultProjectRoot());
+                const ProjectPaths& project = GetActiveProject().GetPaths();
                 const auto directory = std::filesystem::canonical(project.GetScenesDirectory(), error);
 
                 if (error || !operation.path.is_absolute() || operation.path.extension() != ".scene")
@@ -941,6 +941,25 @@ void Engine::ProcessEditorSceneRequests(IDemoScene& activeScene)
     }
 }
 
+void Engine::SetStartupProject(OpenedProject project)
+{
+    ENGINE_ASSERT(m_state == EngineState::Uninitialized);
+    ENGINE_ASSERT(!m_activeProject);
+
+    m_activeProject.emplace(std::move(project.context));
+    m_projectLock = std::move(project.lock);
+}
+
+const ProjectContext& Engine::GetActiveProject() const
+{
+    if(!m_activeProject)
+    {
+        throw std::logic_error("No active project: packaged runtime has no loose project.");
+    }
+
+    return *m_activeProject;
+}
+
 bool Engine::Initialize(bool archiveDiagnostic)
 {
     EngineStartup startup; startup.mode=archiveDiagnostic ? EngineStartup::Mode::ArchiveDiagnostic : EngineStartup::Mode::Editor;
@@ -978,10 +997,33 @@ bool Engine::Initialize(const EngineStartup& startup)
     const auto initializationStarted = std::chrono::steady_clock::now();
     ENGINE_ASSERT(m_state == EngineState::Uninitialized);
 
+    // An explicitly opened project arrives validated and locked through SetStartupProject.
+    // Otherwise this is the single place the running Engine asks ProjectLocator for a root.
+    // Every later project path comes from m_activeProject. Resolving the root performs no
+    // project directory writes; archive diagnostics still skip the loose-project initialization.
+    if(packaged && m_activeProject)
+    {
+        Log::Error("Packaged runtime cannot open a loose project.");
+        return false;
+    }
+
+    if(!packaged && !m_activeProject)
+    {
+        try
+        {
+            m_activeProject.emplace(ProjectLocator::GetDefaultProjectRoot());
+        }
+        catch(const std::exception& error)
+        {
+            Log::Error(std::string("Failed to resolve the default project root: ") + error.what());
+            return false;
+        }
+    }
+
     const auto initializeLooseProject = [&]() -> bool
     {
     // Initialize persistent project storage before GPU resources.
-    const ProjectPaths projectPaths( ProjectLocator::GetDefaultProjectRoot());
+    const ProjectPaths& projectPaths = GetActiveProject().GetPaths();
 
     std::string projectError;
 
@@ -992,7 +1034,16 @@ bool Engine::Initialize(const EngineStartup& startup)
         return false;
     }
 
-    Log::Info("Default project directory: " + projectPaths.GetRoot().string());
+    if(const auto* manifest = GetActiveProject().GetManifest())
+    {
+        const auto root = projectPaths.GetRoot().u8string();
+        Log::Info("Opened project \"" + manifest->GetDisplayName() + "\" (" + manifest->GetProjectID().ToString() +
+            ") from: " + std::string(root.begin(), root.end()));
+    }
+    else
+    {
+        Log::Info("Default project directory: " + projectPaths.GetRoot().string());
+    }
 
     // Initialize the project asset registry before runtime resources.
     if(!AssetReconciliationTransaction::Recover(projectPaths, projectError))
@@ -1190,9 +1241,9 @@ bool Engine::Initialize(const EngineStartup& startup)
 
     const float aspectRatio = static_cast<float>(m_window.GetWidth()) / static_cast<float>(m_window.GetHeight());
 
-    if(!packaged) m_editor.ConfigureMaterialThumbnails(m_renderer);
+    if(!packaged) m_editor.ConfigureMaterialThumbnails(m_renderer, GetActiveProject());
 
-    if(!archiveDiagnostic) m_demoSceneManager.SetProjectAssets(ProjectLocator::GetDefaultProjectRoot(), m_projectAssetRegistry);
+    if(!archiveDiagnostic) m_demoSceneManager.SetProjectAssets(GetActiveProject().GetRoot(), m_projectAssetRegistry);
     m_demoSceneManager.SetTextureStreamingEnabled(true);
     m_demoSceneManager.SetMeshCPUCache(&m_meshCPUCache);
 
@@ -1848,7 +1899,7 @@ void Engine::Frame()
     m_demoSceneManager.SetAspectRatio(static_cast<float>(finalSceneImage.width) /
                                     static_cast<float>(finalSceneImage.height));
 
-    const ProjectPaths inspectorPaths(ProjectLocator::GetDefaultProjectRoot());
+    const ProjectPaths& inspectorPaths = GetActiveProject().GetPaths();
     auto viewportPublication = m_renderer.GetSelectionPublicationIdentity(activeDemo.GetScene());
     m_editor.SetViewportPublicationIdentity(viewportPublication.rendererLifetime, viewportPublication.bindingEpoch);
     m_editor.Draw(activeDemo, m_demoSceneManager, debugUI, finalSceneImage.srv.ptr,
@@ -2332,6 +2383,9 @@ void Engine::Shutdown()
     if(m_rendererAttempted) m_renderer.Shutdown();
     if(m_windowInitialized) m_window.Shutdown();
 
+    // Released last: every project write (registry, scenes, materials) has finished above.
+    m_projectLock.Release();
+
     Log::Info("Engine shutdown: finished.");
 }
 
@@ -2375,7 +2429,7 @@ void Engine::ProcessSavedMaterialRevisions()
     m_pendingSavedMaterialRevisions.clear();
     auto* scene = dynamic_cast<FileBackedDemoScene*>(m_demoSceneManager.TryGetActiveScene());
     std::error_code pathError;
-    const auto project = std::filesystem::canonical(ProjectLocator::GetDefaultProjectRoot(), pathError);
+    const auto project = GetActiveProject().ResolveCanonicalRoot(pathError);
 
     if(!scene || pathError)
     {
@@ -2559,7 +2613,7 @@ void Engine::ProcessWorkingMaterialNotifications()
     m_pendingWorkingMaterialRevisions.clear();
     auto* scene = dynamic_cast<FileBackedDemoScene*>(m_demoSceneManager.TryGetActiveScene());
     std::error_code error;
-    const auto root = std::filesystem::canonical(ProjectLocator::GetDefaultProjectRoot(), error);
+    const auto root = GetActiveProject().ResolveCanonicalRoot(error);
 
     if(!scene || error)
     {

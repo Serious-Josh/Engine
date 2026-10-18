@@ -8,7 +8,6 @@
 #include "assets/AssetRegistrySerializer.h"
 #include "assets/CookedScene.h"
 #include "Core/Log.h"
-#include "Project/ProjectLocator.h"
 namespace
 {
 bool LoadProjectEnvironment(Renderer& renderer,const std::filesystem::path& root,const ProjectAssetRegistry& registry,const std::string& reference)
@@ -57,7 +56,7 @@ bool Engine::AssignSceneEnvironment(size_t index,std::string& error)
             const auto selected=entries[index];
             if(!selected.relativePath.empty()) return m_renderer.SetEnvironment(index);
             if(selected.reference.empty()) return m_renderer.SetEnvironmentImage(nullptr,"neutral","Neutral");
-            return LoadProjectEnvironment(m_renderer,ProjectLocator::GetDefaultProjectRoot(),m_projectAssetRegistry,selected.reference);
+            return LoadProjectEnvironment(m_renderer,GetActiveProject().GetRoot(),m_projectAssetRegistry,selected.reference);
         }
         catch(const std::exception& e) { error=e.what(); return false; }
     }

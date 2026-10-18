@@ -10,7 +10,3 @@ bool CreateNewSceneFile(
     const ProjectPaths& project,
     std::filesystem::path& createdPath,
     std::string* errorMessage = nullptr);
-
-bool CreateNewSceneFile(
-    std::filesystem::path& createdPath,
-    std::string* errorMessage = nullptr);

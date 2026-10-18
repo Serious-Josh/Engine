@@ -8,7 +8,6 @@
 
 #include "Core/Log.h"
 
-#include "Project/ProjectLocator.h"
 #include "Project/ProjectPaths.h"
 #include "assets/ProjectAssetResolver.h"
 #include "Renderer/Mesh.h"
@@ -21,15 +20,14 @@
 
 namespace
 {
+    // Registered during static initialization, before any project exists, so the path stays
+    // project-relative until SetProjectAssets anchors it to the active project root.
     std::unique_ptr<IDemoScene> CreateFileBackedTestScene()
     {
-        const ProjectPaths paths(
-            ProjectLocator::GetDefaultProjectRoot());
+        const std::filesystem::path relativeScenePath =
+            std::filesystem::path("Scenes") / "FirstFileBackedScene.scene";
 
-        const std::filesystem::path scenePath =
-            paths.GetScenesDirectory() / "FirstFileBackedScene.scene";
-
-        return std::make_unique<FileBackedDemoScene>(scenePath);
+        return std::make_unique<FileBackedDemoScene>(relativeScenePath);
     }
 
     const bool g_fileBackedTestRegistered =
@@ -53,6 +51,11 @@ void FileBackedDemoScene::SetProjectAssets(
 {
     m_projectRoot = root;
     m_registry = &registry;
+
+    if(!m_scenePath.empty() && m_scenePath.is_relative())
+    {
+        m_scenePath = m_projectRoot / m_scenePath;
+    }
 }
 
 bool FileBackedDemoScene::Initialize(

@@ -116,6 +116,9 @@ bool DemoSceneManager::RequestScene(std::string_view sceneName)
     // Registered file scenes share the atomic file staging/renderer commit path.
     auto requested = sceneEntry->create();
 
+    // Anchors project-relative registered scene paths before the path is read.
+    ConfigureProjectAssets(*requested);
+
     if (const auto* fileScene = dynamic_cast<const FileBackedDemoScene*>(requested.get()))
     {
         if (!RequestFileScene(fileScene->GetScenePath()))

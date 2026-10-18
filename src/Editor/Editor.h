@@ -13,6 +13,7 @@
 #include "SceneHierarchyPanel.h"
 #include "ViewportGridSnap.h"
 #include "Scene/FileSceneAssetCatalog.h"
+#include "Project/ProjectContext.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -91,10 +92,12 @@ public:
             m_materialAssignmentPending || m_transformFieldEditing || m_gizmoWasUsing || m_marqueeGesture.has_value();
     }
 
-    void ConfigureMaterialThumbnails(Renderer& renderer)
+    // Also binds the Engine-owned active project, which outlives the Editor's use of it.
+    void ConfigureMaterialThumbnails(Renderer& renderer, const ProjectContext& activeProject)
     {
+        m_activeProject = &activeProject;
         m_materialDropRenderer = &renderer;
-        m_assetBrowser.ConfigureMaterialThumbnails(renderer);
+        m_assetBrowser.ConfigureMaterialThumbnails(renderer, activeProject.GetPaths());
         m_inspectorPanel.ConfigureThumbnails(renderer);
     }
 
@@ -363,6 +366,9 @@ private:
         const ProjectAssetRegistry& registry);
     void QueueViewportMaterialDrop(const IDemoScene& scene, const SceneObjectMetadata& target, const AssetID& material);
     Renderer* m_materialDropRenderer = nullptr;
+
+    // Borrowed from Engine; null until ConfigureMaterialThumbnails binds it.
+    const ProjectContext* m_activeProject = nullptr;
     std::optional<SceneObjectMetadata> m_materialDropHover;
     std::string m_materialDropStatus;
     int m_materialDropDeliveryFrame = -1;

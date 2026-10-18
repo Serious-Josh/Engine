@@ -53,7 +53,8 @@ public:
 
     void ResetThumbnailRequests();
     // Borrowed renderer service; Renderer owns all material thumbnail GPU resources.
-    void ConfigureMaterialThumbnails(Renderer& renderer);
+    // The first call fixes the browsing root to the active project's root.
+    void ConfigureMaterialThumbnails(Renderer& renderer, const ProjectPaths& projectPaths);
 
     void PauseMaterialThumbnails();
     void InvalidateMaterialSource(const std::filesystem::path& path);

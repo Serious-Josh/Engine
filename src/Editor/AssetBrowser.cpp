@@ -2,7 +2,6 @@
 #include "Renderer/Renderer.h"
 #include "EditorWorkspace.h"
 
-#include "Project/ProjectLocator.h"
 #include "Project/ProjectPaths.h"
 #include "imgui.h"
 #include "imgui_internal.h"
@@ -1844,11 +1843,11 @@ std::optional<AssetRecord> AssetBrowser::ValidateMeshDrag(const MeshDragPayload&
     return *record;
 }
 
-void AssetBrowser::ConfigureMaterialThumbnails(Renderer& renderer)
+void AssetBrowser::ConfigureMaterialThumbnails(Renderer& renderer, const ProjectPaths& projectPaths)
 {
     if(m_root.empty())
     {
-        m_root=ProjectLocator::GetDefaultProjectRoot().lexically_normal();
+        m_root=projectPaths.GetRoot().lexically_normal();
         m_directory=m_root;
     }
     m_materialRenderer = &renderer;

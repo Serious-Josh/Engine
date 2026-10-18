@@ -1,6 +1,12 @@
 #include "Engine/Engine.h"
 #include "Engine/PackagedBootstrap.h"
 #include "Core/Log.h"
+#include "Platform/Windows/CommandLineArguments.h"
+#include "Platform/Windows/WindowsText.h"
+#include "Project/EditorCommandLine.h"
+#include "Project/ProjectLoader.h"
+
+#include <Windows.h>
 
 #include <cstdlib>
 #include <string_view>
@@ -39,8 +45,70 @@ int VerifyDevelopmentCookedMeshProvider(const std::filesystem::path& projectRoot
 int VerifyCookedMeshPreparation(const std::filesystem::path& projectRoot);
 #endif
 
+namespace
+{
+    // Startup failures go to the log (console). When Explorer launched the Editor, the console
+    // is owned by this process alone and vanishes on exit, so the error is also shown in a
+    // message box. A shell launch shares its console and gets only the log line.
+    void ReportStartupFailure(const std::string& message)
+    {
+        Log::Error(message);
+
+        DWORD consoleProcesses[2]{};
+        const DWORD attachedProcesses = GetConsoleProcessList(consoleProcesses, 2);
+
+        if(attachedProcesses != 1)
+        {
+            return;
+        }
+
+        std::wstring text;
+
+        try
+        {
+            text = WindowsText::FromUTF8(message);
+        }
+        catch(...)
+        {
+            text = L"The Engine Editor could not open the requested project. See the console log for details.";
+        }
+
+        MessageBoxW(nullptr, text.c_str(), L"Engine Editor", MB_OK | MB_ICONERROR | MB_TASKMODAL);
+    }
+
+    // Classified from UTF-16 before any option dispatch. Developer options keep using the
+    // narrow argv below exactly as before; only a project path needs the UTF-16 form.
+    bool ReadEditorCommandLine(EditorCommandLine& commandLine)
+    {
+        try
+        {
+            commandLine = EditorCommandLine::Parse(CommandLineArguments::Read());
+        }
+        catch(const std::exception& error)
+        {
+            ReportStartupFailure(error.what());
+            return false;
+        }
+
+        if(commandLine.kind == EditorCommandLine::Kind::Invalid)
+        {
+            ReportStartupFailure(commandLine.errorMessage);
+            return false;
+        }
+
+        return true;
+    }
+}
+
 int main(int argc, char** argv)
 {
+    EditorCommandLine commandLine;
+
+    if(!ReadEditorCommandLine(commandLine))
+    {
+        return 1;
+    }
+
 #if ENGINE_VERIFICATION_ENABLED
     if(argc == 2 && std::string_view(argv[1]) == "--verify-normal-maps")
     {
@@ -380,8 +448,30 @@ int main(int argc, char** argv)
     }
 #endif
 
+    // An explicit project is validated and locked before the Engine exists, so a failure creates
+    // no window, GPU or project state and never falls back to the default project.
+    std::optional<OpenedProject> explicitProject;
+
+    if(commandLine.kind == EditorCommandLine::Kind::ExplicitProject)
+    {
+        std::string projectError;
+        explicitProject = ProjectLoader::Open(commandLine.projectManifest, projectError);
+
+        if(!explicitProject)
+        {
+            ReportStartupFailure("Cannot open project: " + projectError);
+            return 1;
+        }
+    }
+
     auto editorEngine=std::make_unique<Engine>();
     auto& engine=*editorEngine;
+
+    if(explicitProject)
+    {
+        engine.SetStartupProject(std::move(*explicitProject));
+        explicitProject.reset();
+    }
 
     if (!engine.Initialize(cookedScene || activateArchive || surfaces))
     {
