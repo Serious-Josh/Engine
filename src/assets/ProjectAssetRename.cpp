@@ -112,6 +112,13 @@ static bool ChangeFileLocation(
     {
         const auto root = std::filesystem::canonical(paths.GetRoot());
         original = std::filesystem::absolute(requested).lexically_normal();
+        const auto* script = registry.FindByPath(original.lexically_relative(root));
+
+        if(_wcsicmp(original.extension().c_str(), L".as") == 0 || (script && script->type == AssetType::Script))
+        {
+            throw std::runtime_error("Script rename/move is deferred until dependency-aware file management.");
+        }
+
         const auto relative = original.lexically_relative(root);
 
         if(relative.empty() || relative.is_absolute() || relative == ".")

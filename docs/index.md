@@ -95,7 +95,6 @@ Documentation is organized around the engine's major systems and will be continu
 
 The folowing areas are planned or currently under development:
 
-- **Project Systems** - Project creation, .engineproj manifests, project browsing, persistent settings, scene management workflows
 - **AngelScript integration** - Gameplay scripting and engine API exposure
 - **Editor Workflow Improvmeents** - Continued improvements to usability, configuration, and content creation
 - **Rendering and Runtime Improvements** - Further optimization, testing, and expansion of rendering and runtime systems

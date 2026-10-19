@@ -306,6 +306,7 @@ void DeployRuntimeFiles(const Request& request, const AssetID& sceneAssetID,
         fs::copy_file(source, stagingDirectory / fs::u8path(fileName));
     };
     copyRuntimeFile(request.runtimeDirectory / "EngineRuntime.exe", request.settings.title + ".exe");
+    copyRuntimeFile(request.runtimeDirectory / "AngelScriptNotices.txt", "AngelScriptNotices.txt");
     std::set<std::string> requiredDLLs{"NRD.dll", "NRI.dll", "dxcompiler.dll", "dxil.dll"};
     unsigned int assimpDLLCount = 0;
     unsigned int textureDLLCount = 0;
@@ -332,6 +333,8 @@ void DeployRuntimeFiles(const Request& request, const AssetID& sceneAssetID,
     Require(deploymentFiles.size() == 10 && requiredDLLs.empty() &&
         assimpDLLCount == 1 && textureDLLCount == 1,
         "Runtime directory is missing required DLLs or has ambiguous dependency versions; build EngineRuntime first.");
+
+    deploymentFiles.emplace_back("AngelScriptNotices.txt");
 
     // App-local Release redistributables and notices accompany portable runtime inputs.
     // Keep this list explicit: arbitrary DLLs/files in a runtime directory are never deployed.

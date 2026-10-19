@@ -25,6 +25,8 @@ file(REMOVE_RECURSE "${stage}")
 file(MAKE_DIRECTORY "${stage}/Game" "${stage}/assets/Shaders/NRD")
 file(COPY "$<TARGET_FILE:Engine>" DESTINATION "${stage}")
 file(COPY "$<TARGET_FILE:EngineRuntime>" DESTINATION "${stage}/Game")
+file(COPY "@CMAKE_BINARY_DIR@/AngelScriptNotices.txt" DESTINATION "${stage}")
+file(COPY "@CMAKE_BINARY_DIR@/AngelScriptNotices.txt" DESTINATION "${stage}/Game")
 
 set(dependencies "$<TARGET_FILE:assimp>" "$<TARGET_FILE:DirectXTex>"
     "${source}/external/NRD/Lib/Release/NRD.dll"

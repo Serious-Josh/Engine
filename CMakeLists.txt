@@ -54,6 +54,30 @@ FetchContent_MakeAvailable(nlohmann_json)
 
 include(cmake/Box3D.cmake)
 add_subdirectory(src/Physics)
+include(cmake/AngelScript.cmake)
+
+add_library(EngineScripting STATIC src/Scripting/ScriptHost.cpp src/Scripting/ScriptSources.cpp)
+target_include_directories(EngineScripting PUBLIC src)
+target_link_libraries(EngineScripting PRIVATE EngineScriptString EngineScriptBuilder bcrypt)
+
+add_library(EngineScriptAssets STATIC src/assets/ProjectScriptAssets.cpp)
+target_include_directories(EngineScriptAssets PUBLIC src)
+target_link_libraries(EngineScriptAssets PUBLIC EngineScripting PRIVATE nlohmann_json)
+
+if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Engine/tests/ScriptHostTests.cpp")
+    add_executable(ScriptHostTests src/Engine/tests/ScriptHostTests.cpp src/Core/Log.cpp)
+    target_link_libraries(ScriptHostTests PRIVATE EngineScripting EngineScriptString)
+endif()
+
+if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/assets/tests/ScriptAssetTests.cpp")
+    add_executable(ScriptAssetTests src/assets/tests/ScriptAssetTests.cpp
+        src/Project/ProjectPaths.cpp src/assets/AssetID.cpp src/assets/AssetRecord.cpp
+        src/assets/ProjectAssetRegistry.cpp src/assets/AssetRegistrySerializer.cpp
+        src/assets/ProjectAssetResolver.cpp src/assets/ProjectAssetReconciliation.cpp
+        src/assets/AssetReconciliationTransaction.cpp src/assets/ProjectAssetRename.cpp
+        src/assets/ProjectAssetDeletion.cpp src/assets/MaterialAssetSerializer.cpp src/Core/Log.cpp)
+    target_link_libraries(ScriptAssetTests PRIVATE EngineScriptAssets nlohmann_json ole32)
+endif()
 
 add_library(EngineCore OBJECT
     src/Engine/Engine.cpp
@@ -328,6 +352,14 @@ if(ENGINE_VERIFICATION_AVAILABLE)
     target_link_libraries(EngineRuntime PRIVATE $<$<CONFIG:Debug>:EngineVerification>)
 endif()
 add_dependencies(Engine EngineRuntime)
+
+if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Engine/tests/AS2ApplicationSmokeTests.cpp")
+    add_executable(AS2ApplicationSmokeTests src/Engine/tests/AS2ApplicationSmokeTests.cpp)
+    target_link_libraries(AS2ApplicationSmokeTests PRIVATE EngineCore)
+    if(ENGINE_VERIFICATION_AVAILABLE)
+        target_link_libraries(AS2ApplicationSmokeTests PRIVATE $<$<CONFIG:Debug>:EngineVerification>)
+    endif()
+endif()
 target_compile_definitions(EngineCore PRIVATE ENGINE_RUNTIME_DEPLOY_DIR="$<TARGET_FILE_DIR:EngineRuntime>")
 set_target_properties(EngineRuntime PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/Game/$<CONFIG>"
@@ -407,6 +439,8 @@ target_include_directories(EngineCore
 target_link_libraries(EngineCore
     PUBLIC
         EnginePhysics
+        EngineScripting
+        EngineScriptAssets
         shell32
         ole32
         dxgi
@@ -425,3 +459,11 @@ target_link_libraries(EngineCore
 )
 
 include(cmake/EnginePortable.cmake)
+
+foreach(application IN ITEMS Engine EngineRuntime)
+    add_custom_command(TARGET ${application} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_BINARY_DIR}/AngelScriptNotices.txt" "$<TARGET_FILE_DIR:${application}>/AngelScriptNotices.txt"
+        VERBATIM
+    )
+endforeach()

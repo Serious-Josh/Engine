@@ -1,5 +1,6 @@
 #include "Scene/SceneSwitchTiming.h"
 #include "Engine/Engine.h"
+#include "assets/ProjectScriptAssets.h"
 #include "assets/ProjectMeshImportService.h"
 #include "Engine/PackagedBootstrap.h"
 #include "Platform/Windows/EditorDistributionPaths.h"
@@ -1366,6 +1367,12 @@ bool Engine::InitializeProject()
         }
     }
 
+    if(!ProjectScriptAssets::Reconcile(projectPaths, m_projectAssetRegistry, projectError))
+    {
+        // Script admission can be repaired independently of the authored scene.
+        Log::Warning("Script discovery skipped; registry retained: " + projectError);
+    }
+
     // Inspect the reconciled registry without modifying it further.
     std::size_t availableAssets = 0;
     std::size_t missingAssets = 0;
@@ -1382,7 +1389,7 @@ bool Engine::InitializeProject()
 
         const std::string assetDescription =
             record.id.ToReference() + " (" +
-            record.relativePath.generic_string() + ")";
+            ProjectPathText(record.relativePath) + ")";
 
         switch (resolution.status){
             case AssetAvailability::Available:
@@ -2034,6 +2041,16 @@ void Engine::Frame()
     for (const EnvironmentAsset& environment : environments)
     {
         environmentNames.push_back(environment.displayName);
+    }
+
+    if(m_editor.TakeScriptRefreshRequest() && !m_projectOwnershipLost && !PhysicsBlocksSceneEdits())
+    {
+        std::string scriptError;
+
+        if(!ProjectScriptAssets::Reconcile(GetActiveProject().GetPaths(), m_projectAssetRegistry, scriptError))
+        {
+            Log::Warning("Script discovery: " + scriptError);
+        }
     }
 
     if (m_editor.NeedsThumbnailReset())

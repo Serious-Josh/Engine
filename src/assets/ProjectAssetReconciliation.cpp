@@ -117,6 +117,17 @@ bool ProjectAssetReconciliation::Run(
         for(const auto& record : registry.GetAssets())
         {
             const auto resolution = ProjectAssetResolver::Resolve(paths, registry, record.id);
+            // Missing scripts retain identity for repair/reappearance. No reference pruning.
+            if(record.type == AssetType::Script)
+            {
+                if(resolution.status != AssetAvailability::Available)
+                {
+                    report.skipped.push_back(record.id.ToReference() + ": script registration retained for repair.");
+                }
+
+                continue;
+            }
+
             const bool safe = SafeRegisteredPath(paths, record.relativePath);
 
             if(safe && resolution.status == AssetAvailability::Missing)

@@ -37,6 +37,8 @@ namespace
 
             case AssetType::Mesh:
                 return paths.GetMeshesDirectory();
+            case AssetType::Script:
+                return paths.GetScriptsDirectory();
 
             case AssetType::Texture:
                 // Textures may live anywhere below the project's asset root.

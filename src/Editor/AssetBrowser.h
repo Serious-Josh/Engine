@@ -11,6 +11,7 @@
 #include <string>
 #include <vector>
 #include <chrono>
+#include <utility>
 #include "imgui.h"
 
 struct EditorWorkspaceRect;
@@ -23,6 +24,10 @@ class FileBackedDemoScene;
 class AssetBrowser
 {
 public:
+    bool TakeScriptRefreshRequest()
+    {
+        return std::exchange(m_scriptRefreshRequested, false);
+    }
     AssetBrowser();
     bool RevealMaterial(const AssetID&,const ProjectPaths&,const ProjectAssetRegistry&,std::string& error);
     std::optional<AssetID> GetNavigationHighlight() const noexcept { return m_navigationHighlight; }
@@ -169,6 +174,7 @@ private:
 
     std::optional<ProjectPaths> m_thumbnailPaths;
     const ProjectAssetRegistry* m_thumbnailRegistry = nullptr;
+    bool m_scriptRefreshRequested = false;
     std::filesystem::path m_thumbnailProjectRoot;
 
     std::map<std::filesystem::path, AssetRecord> m_textureRecords;

@@ -647,6 +647,10 @@ void AssetBrowser::DrawContents(const ProjectContext* project, const FileBackedD
             // includes both items in the tile's hover and click bounds.
             ImGui::BeginGroup();
             const bool sceneDocument = !entry.directory && ProjectAssetRegistry::PathsEqual(entry.path.extension(), ".scene");
+            const bool scriptDocument = !entry.directory && ProjectAssetRegistry::PathsEqual(entry.path.extension(), ".as");
+            const auto* scriptRecord = project && m_thumbnailRegistry ?
+                m_thumbnailRegistry->FindByPath(entry.path.lexically_relative(project->GetRoot())) : nullptr;
+            const bool isScript = scriptDocument && scriptRecord && scriptRecord->type == AssetType::Script;
             const auto registered = m_textureRecords.find(entry.path.lexically_normal());
             const bool isTexture = !entry.directory && !sceneDocument && registered != m_textureRecords.end();
             const auto material = m_materialRecords.find(entry.path.lexically_normal());
@@ -659,7 +663,7 @@ void AssetBrowser::DrawContents(const ProjectContext* project, const FileBackedD
             const auto tilePosition = ImGui::GetCursorScreenPos();
             constexpr float thumbnailSize = 96.0f;
             const char* tileLabel = isTexture ? "##Texture" : isMaterial ? "##Material" :
-                isMesh ? "##Mesh" : isScene ? "[Scene]" : entry.directory ? "[Folder]" : "[File]";
+                isMesh ? "##Mesh" : isScene ? "[Scene]" : isScript ? "[Script]" : entry.directory ? "[Folder]" : "[File]";
             const bool pressed = ImGui::Selectable(tileLabel,
                 m_selection == entry.path, ImGuiSelectableFlags_AllowDoubleClick,
                 hasThumbnail ? ImVec2(thumbnailSize, thumbnailSize) : ImVec2(0.0f, 48.0f));
@@ -865,7 +869,7 @@ void AssetBrowser::DrawContents(const ProjectContext* project, const FileBackedD
                 }
 
                 // Scene file operations need lifecycle/workspace coordination in a later milestone.
-                const bool canModify = canRequest && !sceneDocument;
+                const bool canModify = canRequest && !sceneDocument && !scriptDocument;
 
                 if(isMesh && ImGui::MenuItem("Import Units...", nullptr, false, canRequest && !m_unitsRequest))
                 {
@@ -1021,6 +1025,7 @@ void AssetBrowser::Draw(const EditorWorkspaceRect& rectangle, const ProjectConte
 
         if (ImGui::Button("Refresh"))
         {
+            m_scriptRefreshRequested = true;
             m_listings.clear();
             m_thumbnailResetRequested = true;
             m_materialRequestsReset = true;
@@ -1044,6 +1049,13 @@ void AssetBrowser::Draw(const EditorWorkspaceRect& rectangle, const ProjectConte
             if(ImGui::SmallButton("Scenes"))
             {
                 Navigate(project->GetPaths().GetScenesDirectory());
+            }
+
+            ImGui::SameLine();
+
+            if(ImGui::SmallButton("Scripts"))
+            {
+                Navigate(project->GetPaths().GetScriptsDirectory());
             }
         }
 
@@ -1687,7 +1699,8 @@ void AssetBrowser::DrawAssetMoveSource(const std::filesystem::path& path, const 
         return;
     }
     const auto* record = m_thumbnailRegistry->FindByPath(path.lexically_relative(m_thumbnailPaths->GetRoot()));
-    if(!record || !ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceNoHoldToOpenOthers))
+    if(!record || record->type == AssetType::Script ||
+        !ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceNoHoldToOpenOthers))
     {
         return;
     }

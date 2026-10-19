@@ -118,6 +118,11 @@ public:
         return m_assetBrowser.NeedsThumbnailReset();
     }
 
+    bool TakeScriptRefreshRequest()
+    {
+        return m_assetBrowser.TakeScriptRefreshRequest();
+    }
+
     void ResetThumbnailRequests()
     {
         m_assetBrowser.ResetThumbnailRequests();

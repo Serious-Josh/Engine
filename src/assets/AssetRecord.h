@@ -10,7 +10,8 @@ enum class AssetType : std::uint8_t
 {
     Material,
     Mesh,
-    Texture
+    Texture,
+    Script
 };
 
 struct AssetRecord

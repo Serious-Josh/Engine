@@ -10,10 +10,11 @@
 #include <filesystem>
 #include <string>
 #include <utility>
+#include <algorithm>
 
 namespace
 {
-    constexpr int kSchemaVersion = 2;
+    constexpr int kSchemaVersion = 3;
 
     const char* AssetTypeToString(AssetType type)
     {
@@ -24,6 +25,8 @@ namespace
                 return "mesh";
             case AssetType::Texture:
                 return "texture";
+            case AssetType::Script:
+                return "script";
             default:
                 return nullptr;
         }
@@ -48,6 +51,12 @@ namespace
         if (value == "texture")
         {
             type = AssetType::Texture;
+            return true;
+        }
+
+        if(value == "script")
+        {
+            type = AssetType::Script;
             return true;
         }
 
@@ -83,18 +92,24 @@ nlohmann::json AssetRegistrySerializer::Serialize(const ProjectAssetRegistry& re
             throw std::runtime_error("Registry contains an invalid asset record.");
         }
 
+        const auto utf8Path = record.relativePath.generic_u8string();
         document["assets"].push_back({
             {"id", record.id.ToString()},
             {"type", typeName},
-            {"path", record.relativePath.generic_string()}
+            {"path", std::string(utf8Path.begin(), utf8Path.end())}
         });
 
         if(record.type == AssetType::Mesh && record.meshImportUnits != MeshImportUnits{})
         {
             // Older executables must reject policy-bearing registries rather than silently
             // ignoring units. All-Legacy projects retain their historical schema-1 output.
-            document["schemaVersion"] = kSchemaVersion;
+            document["schemaVersion"] = (std::max)(document["schemaVersion"].get<int>(), 2);
             document["assets"].back()["importUnits"] = SerializeMeshImportUnits(record.meshImportUnits);
+        }
+
+        if(record.type == AssetType::Script)
+        {
+            document["schemaVersion"] = kSchemaVersion;
         }
     }
 
@@ -167,11 +182,23 @@ bool AssetRegistrySerializer::Deserialize(
                 return Fail(errorMessage, "Asset registry paths must use forward slashes.");
             }
 
-            AssetRecord record{*id, type, std::filesystem::path(pathText)};
+            AssetRecord record{*id, type, std::filesystem::u8path(pathText)};
+
+            if(type == AssetType::Script && document["schemaVersion"].get<int>() < 3)
+            {
+                return Fail(errorMessage, "Script assets require registry schema 3.");
+            }
+
+            const auto canonicalPath = record.relativePath.generic_u8string();
+
+            if(type == AssetType::Script && pathText != std::string(canonicalPath.begin(), canonicalPath.end()))
+            {
+                return Fail(errorMessage, "Script registry paths must use canonical spelling.");
+            }
 
             if(entry.contains("importUnits"))
             {
-                if(type != AssetType::Mesh || document["schemaVersion"].get<int>() != kSchemaVersion)
+                if(type != AssetType::Mesh || document["schemaVersion"].get<int>() < 2)
                 {
                     return Fail(errorMessage, "Import units require a mesh asset and registry schema 2.");
                 }

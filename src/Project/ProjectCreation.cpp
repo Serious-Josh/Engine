@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cwctype>
 #include <vector>
+#include <memory>
 
 #if defined(ENGINE_PROJECT_CREATION_TESTING)
 // Standalone local CPU fault injection. Production builds contain no callback or test dependency.
@@ -13,6 +14,14 @@ void VerifyProjectCreationStage(const std::filesystem::path& staging);
 
 namespace
 {
+    struct DirectoryPinCloser
+    {
+        void operator()(void* handle) const noexcept
+        {
+            CloseHandle(handle);
+        }
+    };
+
     // Remove only exact entries created by this attempt, in reverse order. In particular,
     // never recursively remove a tree that another process may have added files to.
     struct CreationArtifacts
@@ -192,7 +201,7 @@ std::optional<OpenedProject> ProjectCreation::Create(
 
         artifacts.paths.push_back(staging);
 
-        for(const auto* directory : {L"Scenes", L"Materials", L"Meshes", L"Textures"})
+        for(const auto* directory : {L"Scenes", L"Materials", L"Meshes", L"Textures", L"Content"})
         {
             const auto path = staging / directory;
 
@@ -203,6 +212,30 @@ std::optional<OpenedProject> ProjectCreation::Create(
             }
 
             artifacts.paths.push_back(path);
+
+            if(std::wstring_view(directory) == L"Content")
+            {
+                const auto handle = CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+
+                if(handle == INVALID_HANDLE_VALUE)
+                {
+                    error = "Cannot pin the new script content directory.";
+                    return std::nullopt;
+                }
+
+                std::unique_ptr<void, DirectoryPinCloser> pin(handle);
+                BY_HANDLE_FILE_INFORMATION info{};
+
+                if(!GetFileInformationByHandle(handle, &info) || (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) ||
+                    !std::filesystem::create_directory(path / "Scripts"))
+                {
+                    error = "Cannot exclusively create the ordinary script directory.";
+                    return std::nullopt;
+                }
+
+                artifacts.paths.push_back(path / "Scripts");
+            }
         }
 
         nlohmann::json document = {
