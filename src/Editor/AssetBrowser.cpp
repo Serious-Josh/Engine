@@ -3,6 +3,8 @@
 #include "EditorWorkspace.h"
 
 #include "Project/ProjectPaths.h"
+#include "Project/ProjectContext.h"
+#include "DemoContent/FileBackedDemoScene.h"
 #include "imgui.h"
 #include "imgui_internal.h"
 #include "assets/ProjectTextureImportService.h"
@@ -174,6 +176,85 @@ namespace
 }
 
 AssetBrowser::AssetBrowser() = default;
+
+void AssetBrowser::InvalidateFileListings()
+{
+    m_listings.clear();
+}
+
+std::optional<std::filesystem::path> AssetBrowser::TakeSceneOpenRequest()
+{
+    return std::exchange(m_sceneOpenRequest, std::nullopt);
+}
+
+bool AssetBrowser::IsSceneEntry(const std::filesystem::path& path, const ProjectContext& project) const
+{
+    if(!ProjectAssetRegistry::PathsEqual(path.extension(), ".scene"))
+    {
+        return false;
+    }
+
+    std::string error;
+    std::error_code filesystemError;
+    const auto root = project.ResolveCanonicalRoot(filesystemError);
+
+    if(filesystemError || !CanBrowse(path.parent_path(), error))
+    {
+        return false;
+    }
+
+    const auto resolved = std::filesystem::canonical(path, filesystemError);
+    const DWORD attributes = GetFileAttributesW(path.c_str());
+    return !filesystemError && IsPathWithin(resolved, root) &&
+        attributes != INVALID_FILE_ATTRIBUTES &&
+        (attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) == 0;
+}
+
+bool AssetBrowser::IsActiveSceneEntry(const std::filesystem::path& path, const ProjectContext& project,
+    const FileBackedDemoScene* activeScene) const
+{
+    if(!activeScene || activeScene->IsUnsaved() || activeScene->IsArchiveActivation())
+    {
+        return false;
+    }
+
+    std::error_code error;
+    const auto projectRoot = project.ResolveCanonicalRoot(error);
+
+    if(error)
+    {
+        return false;
+    }
+
+    const auto ownerRoot = std::filesystem::canonical(activeScene->GetProjectRoot(), error);
+
+    if(error || !ProjectAssetRegistry::PathsEqual(ownerRoot, projectRoot))
+    {
+        return false;
+    }
+
+    const auto activePath = std::filesystem::canonical(activeScene->GetScenePath(), error);
+
+    if(error || !IsPathWithin(activePath, projectRoot))
+    {
+        return false;
+    }
+
+    const auto entryPath = std::filesystem::canonical(path, error);
+    return !error && ProjectAssetRegistry::PathsEqual(activePath, entryPath);
+}
+
+bool AssetBrowser::RequestSceneOpen(const std::filesystem::path& path, const ProjectContext& project)
+{
+    if(m_sceneOpenRequest || !IsSceneEntry(path, project))
+    {
+        return false;
+    }
+
+    // No scene document or renderer ownership crosses this request boundary.
+    m_sceneOpenRequest = path;
+    return true;
+}
 
 std::optional<AssetBrowser::MaterialCreationRequest> AssetBrowser::TakeMaterialCreationRequest()
 {
@@ -478,6 +559,7 @@ void AssetBrowser::Navigate(const std::filesystem::path& path)
         m_thumbnailResetRequested = true;
         m_materialRequestsReset = true;
         m_directory = path;
+        m_listings.erase(path);
         m_navigationHighlight.reset(); m_revealPending=false;
         m_selection.clear();
     }
@@ -536,7 +618,7 @@ void AssetBrowser::DrawTree(
     ImGui::PopID();
 }
 
-void AssetBrowser::DrawContents()
+void AssetBrowser::DrawContents(const ProjectContext* project, const FileBackedDemoScene* activeScene)
 {
     const auto& listing = GetListing(m_directory);
 
@@ -554,22 +636,30 @@ void AssetBrowser::DrawContents()
     {
         for (const auto& entry : listing.entries)
         {
+            if(!m_filter.PassFilter(entry.name.c_str()))
+            {
+                continue;
+            }
+
             ImGui::TableNextColumn();
             ImGui::PushID(PathID(entry.path).c_str());
             // Submit the icon and filename in normal layout order. The group
             // includes both items in the tile's hover and click bounds.
             ImGui::BeginGroup();
+            const bool sceneDocument = !entry.directory && ProjectAssetRegistry::PathsEqual(entry.path.extension(), ".scene");
             const auto registered = m_textureRecords.find(entry.path.lexically_normal());
-            const bool isTexture = !entry.directory && registered != m_textureRecords.end();
+            const bool isTexture = !entry.directory && !sceneDocument && registered != m_textureRecords.end();
             const auto material = m_materialRecords.find(entry.path.lexically_normal());
             const bool isMaterial = !entry.directory && material != m_materialRecords.end() &&
                 _wcsicmp(entry.path.extension().c_str(), L".material") == 0;
-            const bool isMesh = !entry.directory && m_meshRecords.contains(entry.path.lexically_normal());
+            const bool isMesh = !entry.directory && !sceneDocument && m_meshRecords.contains(entry.path.lexically_normal());
+            const bool isScene = sceneDocument && project && IsSceneEntry(entry.path, *project);
+            const bool active = isScene && IsActiveSceneEntry(entry.path, *project, activeScene);
             const bool hasThumbnail = isTexture || isMaterial || isMesh;
             const auto tilePosition = ImGui::GetCursorScreenPos();
             constexpr float thumbnailSize = 96.0f;
             const char* tileLabel = isTexture ? "##Texture" : isMaterial ? "##Material" :
-                isMesh ? "##Mesh" : entry.directory ? "[Folder]" : "[File]";
+                isMesh ? "##Mesh" : isScene ? "[Scene]" : entry.directory ? "[Folder]" : "[File]";
             const bool pressed = ImGui::Selectable(tileLabel,
                 m_selection == entry.path, ImGuiSelectableFlags_AllowDoubleClick,
                 hasThumbnail ? ImVec2(thumbnailSize, thumbnailSize) : ImVec2(0.0f, 48.0f));
@@ -698,6 +788,12 @@ void AssetBrowser::DrawContents()
 
             ImGui::PushTextWrapPos(0.0f);
             ImGui::TextUnformatted(entry.name.c_str());
+
+            if(active)
+            {
+                ImGui::TextDisabled("Active");
+            }
+
             ImGui::PopTextWrapPos();
             ImGui::EndGroup();
             CaptureDropTarget(entry.navigable ? entry.path : std::filesystem::path{});
@@ -732,6 +828,10 @@ void AssetBrowser::DrawContents()
                 {
                     destination = entry.path;
                 }
+                else if(isScene && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
+                {
+                    RequestSceneOpen(entry.path, *project);
+                }
             }
 
             if (hovered)
@@ -759,6 +859,14 @@ void AssetBrowser::DrawContents()
             {
                 const bool canRequest = m_deleteTarget.empty() && !m_deleteRequest && m_renameTarget.empty();
 
+                if(isScene && ImGui::MenuItem("Open Scene", nullptr, false, !m_sceneOpenRequest))
+                {
+                    RequestSceneOpen(entry.path, *project);
+                }
+
+                // Scene file operations need lifecycle/workspace coordination in a later milestone.
+                const bool canModify = canRequest && !sceneDocument;
+
                 if(isMesh && ImGui::MenuItem("Import Units...", nullptr, false, canRequest && !m_unitsRequest))
                 {
                     m_unitsAsset = m_meshRecords.at(entry.path.lexically_normal());
@@ -777,7 +885,7 @@ void AssetBrowser::DrawContents()
                     }
                 }
 
-                if(ImGui::MenuItem("Rename", nullptr, false, canRequest))
+                if(ImGui::MenuItem("Rename", nullptr, false, canModify))
                 {
                     m_renameTarget = entry.path;
                     const auto stem = entry.path.stem().u8string();
@@ -788,7 +896,7 @@ void AssetBrowser::DrawContents()
                     m_focusRename = true;
                 }
 
-                if(ImGui::MenuItem("Delete", nullptr, false, canRequest))
+                if(ImGui::MenuItem("Delete", nullptr, false, canModify))
                 {
                     m_deleteTarget = entry.path;
                     m_openDeleteModal = true;
@@ -852,7 +960,8 @@ void AssetBrowser::DrawContents()
     }
 }
 
-void AssetBrowser::Draw(const EditorWorkspaceRect& rectangle)
+void AssetBrowser::Draw(const EditorWorkspaceRect& rectangle, const ProjectContext* project,
+    const FileBackedDemoScene* activeScene)
 {
     m_thumbnails->BeginFrame();
 
@@ -928,6 +1037,19 @@ void AssetBrowser::Draw(const EditorWorkspaceRect& rectangle)
             Navigate(m_root);
         }
 
+        if(project)
+        {
+            ImGui::SameLine();
+
+            if(ImGui::SmallButton("Scenes"))
+            {
+                Navigate(project->GetPaths().GetScenesDirectory());
+            }
+        }
+
+        ImGui::SameLine();
+        m_filter.Draw("Filter", 150.0f);
+
         auto breadcrumb = m_root;
         const auto relative = m_directory.lexically_relative(m_root);
 
@@ -973,7 +1095,7 @@ void AssetBrowser::Draw(const EditorWorkspaceRect& rectangle)
             ImGui::TableNextColumn();
             ImGui::BeginChild("ContentGrid");
             CaptureDropTarget(m_directory, true);
-            DrawContents();
+            DrawContents(project, activeScene);
             ImGui::EndChild();
             ImGui::EndTable();
         }

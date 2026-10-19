@@ -6,6 +6,7 @@
 #include "DemoContent/DemoSceneManager.h"
 
 #include "Platform/Windows/WindowsWindow.h"
+#include "Platform/Windows/EditorFileDialogs.h"
 #include "Platform/WindowProperties.h"
 
 #include "Renderer/Renderer.h"
@@ -23,16 +24,23 @@
 #include "Engine/PhysicsSimulationController.h"
 #include "Project/ProjectContext.h"
 #include "Project/ProjectLoader.h"
+#include "Project/ProjectWorkspace.h"
+#include "Editor/EditorPreferences.h"
+#include "Editor/ProjectBrowser.h"
 #include <chrono>
 
 #include <cstdint>
 #include <filesystem>
 #include <functional>
 
+// Uninitialized -> ProjectIndependent -> ProjectReady -> Running -> Stopped.
+// Packaged runtime goes from ProjectIndependent straight to Running with its archive scene.
 enum class EngineState
 {
     Uninitialized,
-    Running,
+    ProjectIndependent, // Window, renderer and UI exist; no project or scene.
+    ProjectReady,       // Active project initialized; no scene yet.
+    Running,            // A scene owns Renderer scene resources; the frame loop may run.
     Stopped
 };
 
@@ -46,23 +54,78 @@ struct EngineStartup
     std::optional<AssetID> sceneID;
     std::string gameTitle; // UTF-8; empty selects the diagnostic caption.
     unsigned int width=1280, height=720;
+
+    // Ordinary interactive Editor launches only: load/save global preferences, the per-project
+    // workspace and the relocated ImGui layout. Diagnostics leave it off so user settings never
+    // change their behavior and they never write personal state.
+    bool persistPersonalSettings = false;
+    // Interactive startup only. Diagnostic callers retain the legacy DefaultProject/demo path.
+    bool projectBrowserWorkflow = false;
+
+    // Overrides the Editor settings directory (tests); empty selects EditorSettingsDirectory().
+    std::filesystem::path personalSettingsDirectory;
 };
 class Engine
 {
     public:
     // Archive diagnostics skip loose-project registry, reconciliation and scans.
     bool Initialize(bool archiveDiagnostic = false);
+
+    // Interactive Editor: browser or explicit project + workspace scene. Diagnostic callers
+    // retain the DefaultProject/Sphere Grid path. Packaged runtime: archive scene only.
     bool Initialize(const EngineStartup& startup);
+
+    enum class InitialScene
+    {
+        SphereGridDemo,
+        CleanUnsaved
+    };
+
+    // Individual phases, in order. Each returns false on failure; as with Initialize, the
+    // caller then runs Shutdown. Packaged runtime uses only Initialize.
+    bool InitializeProjectIndependent(const EngineStartup& startup);
+    bool InitializeProject();
+    bool InitializeInitialScene(InitialScene scene);
+
+    EngineState GetState() const noexcept
+    {
+        return m_state;
+    }
+
+    bool HasActiveProject() const noexcept
+    {
+        return m_activeProject.has_value();
+    }
+
+    // No-project/no-scene message dispatch; interactive startup also draws the browser.
+    void ProcessProjectIndependentFrame();
+
+    // Replaces the active scene with a clean, never-saved scene through the normal scene
+    // switch on a later frame. Rejected while operations are pending, physics is playing or
+    // the active scene has unsaved changes (no prompt exists yet). Writes nothing.
+    bool RequestCleanScene(std::string& errorMessage);
+
+    // Recorded last edited scene of the active project, if it still exists inside the project.
+    std::optional<std::filesystem::path> ResolveLastEditedScene(std::string& errorMessage) const;
 
     // The authoritative project for Editor and archive-diagnostic modes. Packaged runtime has
     // no loose project; calling this there is a logic error.
     const ProjectContext& GetActiveProject() const;
 
-    // Editor mode only, before Initialize: work in this validated, locked project instead of
-    // the default project. Engine owns the lock until Shutdown or destruction.
+    // Editor mode only, before InitializeProject (before Initialize, or in the no-project
+    // state): work in this validated, locked project instead of the default project. Engine
+    // owns the lock until Shutdown or destruction.
     void SetStartupProject(OpenedProject project);
 #if !defined(NDEBUG) && defined(ENGINE_HAS_VERIFICATION)
     friend class PortableEditorVerification;
+    friend class ProjectIndependentStartupVerification;
+    friend class EditorPreferencesVerification;
+    friend class ProjectBrowserVerification;
+    friend class SceneLifecycleVerification;
+    friend class AssetBrowserSceneVerification;
+    friend class StartupSceneVerification;
+    friend class ProjectSystemWorkflowVerification;
+    friend class ProjectRelaunchVerification;
     void VerifyPackagedBootstrap();
     // Preparation checkpoint only. Never enters the publication coordinator.
     bool VerifyCookedMeshGPUPreparation(const std::filesystem::path& scenePath,
@@ -251,10 +314,84 @@ class Engine
     void PopulateArchiveScene(std::shared_ptr<const CookedScene::ArchiveScene>);
     bool ApplySceneEnvironment(std::string& error);
     bool AssignSceneEnvironment(size_t index, std::string& error);
-    bool StartBuildGame(BuildGame::Settings, std::string&);
+    // Builds the game startup scene from its saved file (see ResolveBuildStartupScene). A dirty
+    // active startup scene is refused, setting *startupSceneUnsaved, unless saveStartupScene asks
+    // to save it first through the File > Save service; unsaved edits are never packaged.
+    bool StartBuildGame(BuildGame::Settings, std::string&, bool saveStartupScene = false,
+        bool* startupSceneUnsaved = nullptr);
+
+    // The scene Build Game packages: the manifest's settings.startupScene when configured (an
+    // invalid configured scene fails; there is no fallback), otherwise the active saved scene.
+    struct BuildStartupScene
+    {
+        std::filesystem::path path;
+        bool configured = false;
+
+        // Set when the startup scene is the active editable scene, whose edits may be unsaved.
+        FileBackedDemoScene* activeOwner = nullptr;
+    };
+
+    bool ResolveBuildStartupScene(BuildStartupScene& startup, std::string& error);
+
+    // Validates scene as the active project's game startup scene (an empty path clears the
+    // setting) and persists it to the locked manifest; the context changes only after success.
+    bool SetProjectStartupScene(const std::filesystem::path& scene, std::string& message);
+
+    // Fail-closed state after full manifest ownership (lock + verified pin) could not be confirmed.
+    // Project writes, scene lifecycle, builds and file-drop imports are refused; the Editor shows a
+    // blocking prompt offering only Retry (re-verify ownership) or Close (controlled shutdown that
+    // skips project writes). Other Editors stay excluded by the byte-range lock throughout.
+    bool m_projectOwnershipLost = false;
+    void FailClosedProjectOwnership(const std::string& reason);
+    void ProcessProjectOwnership();
+
+    // Project containment and existence rules shared with File > Open/Save Scene.
+    bool ResolveEditorSceneLocation(const std::filesystem::path& requested, bool mustExist,
+        std::filesystem::path& resolved, std::string& error) const;
     BuildGame::Service m_buildGame;
     std::string m_buildGameLastMessage="Ready.";
     EngineStartup m_startup;
+
+    enum class SceneSource
+    {
+        Archive,
+        SphereGridDemo,
+        CleanUnsaved,
+        SavedFile
+    };
+
+    bool InitializeScene(SceneSource source);
+    bool InitializeProjectScene();
+    void ProcessProjectBrowserRequest(const ProjectBrowser::Request& request);
+    ProjectBrowser m_projectBrowser;
+    std::filesystem::path m_initialScenePath;
+    std::string m_projectNotice;
+
+    // PR.5 personal state. Inactive unless m_startup.persistPersonalSettings. The *Saved strings
+    // hold the last loaded or written serialization so unchanged state is never rewritten.
+    void LoadEditorPreferences();
+    void ConfigureImGuiSettingsLocation();
+    void LoadProjectWorkspace();
+    void RecordRecentProject();
+    void RecordLastEditedScene();
+    void SaveEditorPreferences();
+    void SaveProjectWorkspace();
+
+    bool m_personalSettingsActive = false;
+    std::filesystem::path m_personalSettingsDirectory;
+    EditorPreferences m_editorPreferences;
+    PersonalSettingsFile::Status m_editorPreferencesStatus = PersonalSettingsFile::Status::Missing;
+    std::string m_editorPreferencesSaved;
+    std::optional<ProjectWorkspace> m_projectWorkspace;
+    PersonalSettingsFile::Status m_projectWorkspaceStatus = PersonalSettingsFile::Status::Missing;
+    std::string m_projectWorkspaceSaved;
+
+    // ImGui keeps this pointer until its context is destroyed in Renderer shutdown.
+    std::string m_imguiSettingsPath;
+
+    // Startup data carried between phases. The archive is released once its scene is active.
+    std::chrono::steady_clock::time_point m_initializationStarted;
+    std::shared_ptr<const CookedScene::ArchiveScene> m_startupArchive;
     bool m_rendererAttempted = false;
     bool m_windowInitialized = false;
 #if !defined(NDEBUG) && defined(ENGINE_HAS_VERIFICATION)
@@ -478,6 +615,37 @@ class Engine
     std::optional<Editor::FileRequest> m_pendingEditorSceneOperation;
 
     std::string m_sceneOperationError;
+    bool m_sceneDecisionPending = false;
+    bool m_projectCreationPending = false;
+    bool m_editorRelaunchStarted = false;
+    bool CanPerformSceneLifecycle(std::string& error) const;
+    enum class SceneSaveResult { Saved, Canceled, Failed };
+    SceneSaveResult SaveEditorScene(FileBackedDemoScene& scene, bool saveAs,
+        const std::filesystem::path& selectedPath = {}, bool overwriteConfirmed = false);
+    void ResolveSceneChangeDecision(Editor::SceneChangeDecision decision);
+    void ContinueEditorSceneOperation();
+    void RelaunchEditorProject(const std::filesystem::path& manifest, bool created = false);
+
+    // A replacement Editor that was created but has not yet shown that it opened its project. This
+    // Editor stays open (lifecycle commands refused) until the child shows its window (then this
+    // Editor closes), exits (failure reported, this Editor stays usable) or the wait times out.
+    struct PendingRelaunch
+    {
+        EditorFileDialogs::ChildEditor child;
+        std::string prefix;
+        std::chrono::steady_clock::time_point started;
+    };
+
+    std::optional<PendingRelaunch> m_pendingRelaunch;
+    void ProcessPendingRelaunch();
+    void CompleteRelaunch();
+#if defined(ENGINE_HAS_VERIFICATION)
+    std::function<std::optional<std::filesystem::path>(bool)> m_sceneDialogForVerification;
+    std::function<bool(const std::filesystem::path&)> m_overwriteForVerification;
+    std::function<bool(const std::filesystem::path&, std::string&)> m_relaunchForVerification;
+    // Runs after the target preflight lock is released and before the real or injected launch.
+    std::function<void(const std::filesystem::path&)> m_beforeRelaunchForVerification;
+#endif
 
     EngineState m_state = EngineState::Uninitialized;
 

@@ -155,6 +155,21 @@ namespace
         return true;
     }
 
+    bool ReadStartupScene(
+        const std::filesystem::path& path,
+        std::filesystem::path& startupScene,
+        std::string& errorMessage)
+    {
+        if(!IsContainedRelativePath(path) || !ProjectAssetRegistry::PathsEqual(path.extension(), ".scene"))
+        {
+            errorMessage = "settings.startupScene must be a project-relative .scene path inside the project.";
+            return false;
+        }
+
+        startupScene = NormalizeRelativePath(path);
+        return true;
+    }
+
     bool ReadSettings(
         const nlohmann::json& document,
         std::filesystem::path& startupScene,
@@ -186,16 +201,7 @@ namespace
             return false;
         }
 
-        const auto path = PathFromUTF8(scene->get<std::string>());
-
-        if(!IsContainedRelativePath(path) || !ProjectAssetRegistry::PathsEqual(path.extension(), ".scene"))
-        {
-            errorMessage = "settings.startupScene must be a project-relative .scene path inside the project.";
-            return false;
-        }
-
-        startupScene = NormalizeRelativePath(path);
-        return true;
+        return ReadStartupScene(PathFromUTF8(scene->get<std::string>()), startupScene, errorMessage);
     }
 }
 
@@ -385,6 +391,43 @@ nlohmann::json ProjectManifest::Serialize() const
     }
 
     return document;
+}
+
+std::optional<ProjectManifest> ProjectManifest::WithStartupScene(
+    const std::filesystem::path& startupScene,
+    std::string& errorMessage) const
+{
+    errorMessage.clear();
+    ProjectManifest updated = *this;
+    updated.m_startupScene.clear();
+
+    if(!startupScene.empty() && !ReadStartupScene(startupScene, updated.m_startupScene, errorMessage))
+    {
+        return std::nullopt;
+    }
+
+    auto& settings = updated.m_document["settings"];
+
+    if(!settings.is_object())
+    {
+        settings = nlohmann::json::object();
+    }
+
+    if(updated.m_startupScene.empty())
+    {
+        settings["startupScene"] = nullptr;
+    }
+    else
+    {
+        settings["startupScene"] = PathToUTF8(updated.m_startupScene);
+    }
+
+    return updated;
+}
+
+std::string ProjectManifest::ToUpdateText() const
+{
+    return m_document.dump(4) + "\n";
 }
 
 const AssetID& ProjectManifest::GetProjectID() const noexcept

@@ -28,6 +28,15 @@ int CookProjectMeshes(const std::filesystem::path& projectRoot);
 
 #if ENGINE_VERIFICATION_ENABLED
 int VerifySceneHierarchy();
+int VerifyProjectIndependentStartup();
+int VerifyEditorPreferences();
+int VerifyProjectBrowser();
+int VerifySceneLifecycle();
+int VerifyAssetBrowserScenes();
+int VerifyStartupScene(const std::filesystem::path& outputRoot);
+int VerifyProjectSystemWorkflow(const std::string& stage, const std::filesystem::path& workRoot);
+int VerifyProjectRelaunch(const std::filesystem::path& source, const std::filesystem::path& target, const std::string& mode);
+int VerifyProjectWorkflowRegressions();
 int VerifyMeshImportUnits(const std::filesystem::path& root);
 int VerifyPortableEditor(const std::filesystem::path& output);
 int VerifyCookedMesh();
@@ -262,6 +271,43 @@ int main(int argc, char** argv)
         catch(const std::exception& e) { Log::Error(std::string("Viewport pan diagnostic: ")+e.what()); success=false; }
         engine->Shutdown(); return success ? 0 : 1;
     }
+    if(argc==2 && std::string_view(argv[1])=="--verify-editor-preferences")
+    {
+        return VerifyEditorPreferences();
+    }
+    if(argc == 2 && std::string_view(argv[1]) == "--verify-project-browser")
+    {
+        return VerifyProjectBrowser();
+    }
+    if(argc == 2 && std::string_view(argv[1]) == "--verify-scene-lifecycle")
+    {
+        return VerifySceneLifecycle();
+    }
+    if(argc == 2 && std::string_view(argv[1]) == "--verify-asset-browser-scenes")
+    {
+        return VerifyAssetBrowserScenes();
+    }
+    if(argc == 4 && std::string_view(argv[1]) == "--verify-project-system-workflow")
+    {
+        return VerifyProjectSystemWorkflow(argv[2], CommandLineArguments::Read()[3]);
+    }
+    if(argc == 5 && std::string_view(argv[1]) == "--verify-project-relaunch")
+    {
+        const auto arguments = CommandLineArguments::Read();
+        return VerifyProjectRelaunch(arguments[2], arguments[3], argv[4]);
+    }
+    if(argc == 3 && std::string_view(argv[1]) == "--verify-startup-scene")
+    {
+        return VerifyStartupScene(std::filesystem::absolute(argv[2]));
+    }
+    if(argc == 2 && std::string_view(argv[1]) == "--verify-project-workflow-regressions")
+    {
+        return VerifyProjectWorkflowRegressions();
+    }
+    if(argc==2 && std::string_view(argv[1])=="--verify-project-independent-startup")
+    {
+        return VerifyProjectIndependentStartup();
+    }
     if(argc==2 && std::string_view(argv[1])=="--verify-editor-grid")
     {
         auto engine=std::make_unique<Engine>(); bool success=false;
@@ -473,7 +519,16 @@ int main(int argc, char** argv)
         explicitProject.reset();
     }
 
-    if (!engine.Initialize(cookedScene || activateArchive || surfaces))
+    // Only the ordinary interactive Editor reads and writes personal settings; the archive
+    // diagnostics that share this path do not.
+    const bool archiveDiagnostic = cookedScene || activateArchive || surfaces;
+    EngineStartup startup;
+    startup.mode = archiveDiagnostic ? EngineStartup::Mode::ArchiveDiagnostic : EngineStartup::Mode::Editor;
+    startup.persistPersonalSettings = !archiveDiagnostic;
+    startup.projectBrowserWorkflow = !archiveDiagnostic &&
+        commandLine.kind != EditorCommandLine::Kind::DeveloperOption;
+
+    if (!engine.Initialize(startup))
     {
         Log::Error("Engine initialization failed; aborting without automatic resource teardown because GPU completion may be unconfirmed.");
         std::abort();

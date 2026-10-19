@@ -11,11 +11,14 @@
 #include <string>
 #include <vector>
 #include <chrono>
+#include "imgui.h"
 
 struct EditorWorkspaceRect;
 class ProjectPaths;
 class ProjectAssetRegistry;
 class Renderer;
+class ProjectContext;
+class FileBackedDemoScene;
 
 class AssetBrowser
 {
@@ -65,7 +68,11 @@ public:
         const ProjectPaths& paths, const ProjectAssetRegistry& registry, std::string& error) const;
     std::optional<AssetRecord> ValidateMeshDrag(const MeshDragPayload& payload,
         const ProjectPaths& paths, const ProjectAssetRegistry& registry, std::string& error) const;
-    void Draw(const EditorWorkspaceRect& rectangle);
+    void Draw(const EditorWorkspaceRect& rectangle, const ProjectContext* project = nullptr,
+        const FileBackedDemoScene* activeScene = nullptr);
+    std::optional<std::filesystem::path> TakeSceneOpenRequest();
+    // File listings only: scene saves/activation must not invalidate GPU thumbnails or selection.
+    void InvalidateFileListings();
     void ImportFileDrop(
         const std::vector<std::filesystem::path>& files,
         float screenX,
@@ -123,6 +130,7 @@ private:
 #if defined(ENGINE_HAS_VERIFICATION)
     friend class MaterialLocateVerification;
     friend class ThumbnailSchedulingVerification;
+    friend class AssetBrowserSceneVerification;
 #endif
     struct MovePayload
     {
@@ -248,7 +256,13 @@ private:
         const std::filesystem::path& path,
         const std::string& label);
     void Navigate(const std::filesystem::path& path);
-    void DrawContents();
+    void DrawContents(const ProjectContext* project, const FileBackedDemoScene* activeScene);
+    bool IsSceneEntry(const std::filesystem::path& path, const ProjectContext& project) const;
+    bool IsActiveSceneEntry(const std::filesystem::path& path, const ProjectContext& project,
+        const FileBackedDemoScene* activeScene) const;
+    bool RequestSceneOpen(const std::filesystem::path& path, const ProjectContext& project);
+    std::optional<std::filesystem::path> m_sceneOpenRequest;
+    ImGuiTextFilter m_filter;
     bool CanCreateMaterial(std::string& error) const;
     void DrawMaterialCreationModal();
     void DrawFolderCreationModal();

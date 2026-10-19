@@ -2663,7 +2663,8 @@ bool Renderer::Initialize(
     void* windowHandle,
     unsigned int width,
     unsigned int height,
-    const std::filesystem::path& assetRoot, std::span<const std::byte> packagedShaders, const HDRImageData* initialEnvironment, std::string environmentIdentity)
+    const std::filesystem::path& assetRoot, std::span<const std::byte> packagedShaders,
+    const HDRImageData* initialEnvironment, std::string environmentIdentity, bool deferEditorResources)
 {
     if (m_heightmapRegistration.owner)
     {
@@ -3088,8 +3089,29 @@ bool Renderer::Initialize(
         return false;
     }
 
-    if(!m_packagedRuntime && !m_materialPreviewRenderer.Initialize(
-            device,
+    if(!m_packagedRuntime && !deferEditorResources && !InitializeEditorResources())
+    {
+        return false;
+    }
+
+    m_resizeFailed = false;
+    return true;
+}
+
+bool Renderer::InitializeEditorResources()
+{
+    if(m_editorResourcesInitialized)
+    {
+        return true;
+    }
+
+    if(m_packagedRuntime || !m_graphicsDevice.GetDevice() || m_commandRecordingGeneration != 0)
+    {
+        return false;
+    }
+
+    if(!m_materialPreviewRenderer.Initialize(
+            m_graphicsDevice.GetDevice(),
             m_shaderLibrary,
             m_resourceUploader,
             m_rtvDescriptorHeap,
@@ -3100,9 +3122,9 @@ bool Renderer::Initialize(
         return false;
     }
 
-    if(!m_packagedRuntime) m_textureThumbnails.Configure(device, m_resourceDescriptorHeap);
-
-    m_resizeFailed = false;
+    m_textureThumbnails.Configure(m_graphicsDevice.GetDevice(), m_resourceDescriptorHeap);
+    m_editorResourcesInitialized = true;
+    Log::Info("Editor preview resources initialized.");
     return true;
 }
 
@@ -4577,6 +4599,60 @@ bool Renderer::TakeDisplacementCompletion(
 
     m_completedDisplacementUpdate = {};
     return true;
+}
+
+bool Renderer::RenderUIOnly()
+{
+    if(m_packagedRuntime || m_resizeFailed || m_applicationWidth == 0 || m_applicationHeight == 0 ||
+        m_sceneInitializationAttempt.candidate || !m_swapChain.GetCurrentBackBuffer())
+    {
+        return false;
+    }
+
+    // Same allocator/fence and submission association as scene frames. No scene histories,
+    // upload regions, thumbnail requests or material publications are touched here.
+    RecordingEligibilityScope recordingEligibility{*this};
+    const auto slot = m_swapChain.GetCurrentBackBufferIndex();
+
+    if(!BeginTrackedRecording(slot))
+    {
+        return false;
+    }
+
+    auto* commands = m_commandContext.GetCommandList();
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = m_swapChain.GetCurrentBackBuffer();
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    commands->ResourceBarrier(1, &barrier);
+
+    const auto target = m_swapChain.GetCurrentRTV();
+    constexpr float background[]{0.035f, 0.04f, 0.05f, 1.0f};
+    commands->ClearRenderTargetView(target, background, 0, nullptr);
+    commands->OMSetRenderTargets(1, &target, FALSE, nullptr);
+    const D3D12_VIEWPORT viewport{0, 0, static_cast<float>(m_applicationWidth),
+        static_cast<float>(m_applicationHeight), 0, 1};
+    const D3D12_RECT scissor{0, 0, static_cast<LONG>(m_applicationWidth), static_cast<LONG>(m_applicationHeight)};
+    commands->RSSetViewports(1, &viewport);
+    commands->RSSetScissorRects(1, &scissor);
+    ID3D12DescriptorHeap* heaps[]{m_resourceDescriptorHeap.GetHeap()};
+    commands->SetDescriptorHeaps(1, heaps);
+    m_debugUI.EndFrame(commands);
+
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+    commands->ResourceBarrier(1, &barrier);
+
+    // Submission failure may follow execution. Keep all owners alive and let the caller
+    // fail closed; never retry/reset on an assumed unsubmitted list.
+    if(!EndTrackedRecording() || !ExecuteTrackedRecording(slot))
+    {
+        return false;
+    }
+
+    return m_swapChain.Present();
 }
 
 Renderer::FrameRenderResult Renderer::Render(
@@ -6098,6 +6174,7 @@ void Renderer::Shutdown()
     ShutdownMaterialTables();
 
     m_materialPreviewRenderer.Shutdown();
+    m_editorResourcesInitialized = false;
     m_commandRecordingGeneration = 0;
     m_commandSubmissionAttempted = false;
 

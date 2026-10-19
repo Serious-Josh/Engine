@@ -92,6 +92,40 @@ namespace
 
         return true;
     }
+
+    // Ownership is a lock on one manifest file, so a second manifest in the same directory would
+    // let another Editor own the same project files through it. Such a directory is refused.
+    bool ValidateSingleManifest(
+        const std::filesystem::path& canonicalRoot,
+        const std::filesystem::path& manifestFileName,
+        std::string& errorMessage)
+    {
+        std::error_code error;
+        std::filesystem::directory_iterator entries(canonicalRoot, error);
+
+        if(error)
+        {
+            errorMessage = "Cannot list the project directory " + PathText(canonicalRoot) + ": " + error.message();
+            return false;
+        }
+
+        for(const auto& entry : entries)
+        {
+            const auto fileName = entry.path().filename();
+
+            if(!ProjectAssetRegistry::PathsEqual(fileName.extension(), ProjectManifest::kFileExtension) ||
+                ProjectAssetRegistry::PathsEqual(fileName, manifestFileName))
+            {
+                continue;
+            }
+
+            errorMessage = "The project directory contains another project manifest, " + PathText(fileName) +
+                ". Keep exactly one .engineproj file per project directory so that only one Editor can own it.";
+            return false;
+        }
+
+        return true;
+    }
 }
 
 namespace ProjectLoader
@@ -153,6 +187,11 @@ namespace ProjectLoader
             return std::nullopt;
         }
 
+        if(!ValidateSingleManifest(canonicalRoot, absoluteManifest.filename(), errorMessage))
+        {
+            return std::nullopt;
+        }
+
         const auto& contentPaths = manifest->GetContentPaths();
         const std::array requiredDirectories = {
             contentPaths.scenes,
@@ -169,7 +208,7 @@ namespace ProjectLoader
             }
         }
 
-        ProjectContext context(canonicalRoot, std::move(*manifest));
+        ProjectContext context(canonicalRoot, std::move(*manifest), absoluteManifest.filename());
 
         if(!ValidateRegistryFile(canonicalRoot, context.GetPaths(), errorMessage))
         {

@@ -24,7 +24,8 @@ public:
     bool SaveCaptured(
         SceneDocument candidate,
         const std::filesystem::path& path,
-        std::string* errorMessage = nullptr);
+        std::string* errorMessage = nullptr,
+        bool replaceExisting = true);
 
     bool SaveAs(
         const std::filesystem::path& path,

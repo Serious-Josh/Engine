@@ -14,7 +14,15 @@ class FileBackedDemoScene final : public IDemoScene
 public:
     explicit FileBackedDemoScene(std::filesystem::path scenePath);
     explicit FileBackedDemoScene(std::shared_ptr<const CookedScene::ArchiveScene> source);
+
+    // Never-saved scene: the document is loaded from memory and the scene has no path until
+    // SaveAs. Uses the same metadata-first preparation as a file scene.
+    explicit FileBackedDemoScene(SceneDocument unsavedDocument);
+
     bool IsArchiveActivation() const noexcept { return bool(m_archiveScene); }
+
+    // True for an editable scene that has never been written to a file.
+    bool IsUnsaved() const noexcept { return !m_archiveScene && m_scenePath.empty(); }
     const std::shared_ptr<const CookedScene::ArchiveScene>& ArchiveSource() const noexcept { return m_archiveScene; }
 
     FileBackedDemoScene(const FileBackedDemoScene&) = delete;
@@ -104,6 +112,10 @@ public:
         std::string name, std::string* errorMessage = nullptr,
         SceneObjectNamePolicy policy = SceneObjectNamePolicy::TrimmedInput);
     bool Save(std::string* errorMessage = nullptr);
+
+    // Writes the presented scene to path and adopts it as the scene's file. Internal support
+    // for saving an unsaved scene; no Save As UI exists yet.
+    bool SaveAs(const std::filesystem::path& path, std::string* errorMessage = nullptr, bool replaceExisting = true);
     bool ClearPhysicsPresentation(Renderer& renderer, std::string& error)
     {
         return m_runtime->ClearPhysicsPresentation(renderer, error);
@@ -171,6 +183,11 @@ private:
     friend class Engine;
 #if defined(ENGINE_HAS_VERIFICATION)
     friend class PortableEditorVerification;
+    friend class ProjectIndependentStartupVerification;
+    friend class SceneLifecycleVerification;
+    friend class AssetBrowserSceneVerification;
+    friend class StartupSceneVerification;
+    friend class ProjectSystemWorkflowVerification;
     friend class SceneMaterialBindingVerification;
     friend class SceneDuplicationVerification;
     friend class ScenePhysicsDataVerification;
@@ -186,6 +203,9 @@ private:
 
     std::shared_ptr<const CookedScene::ArchiveScene> m_archiveScene;
     std::filesystem::path m_scenePath;
+
+    // Source document of a never-saved scene; cleared once SaveAs adopts a file.
+    std::optional<SceneDocument> m_unsavedDocument;
     std::filesystem::path m_projectRoot;
     const ProjectAssetRegistry* m_registry = nullptr;
 

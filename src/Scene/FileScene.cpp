@@ -139,7 +139,8 @@ bool FileScene::IsDirty() const noexcept
 bool FileScene::SaveCaptured(
     SceneDocument candidate,
     const std::filesystem::path& path,
-    std::string* errorMessage)
+    std::string* errorMessage,
+    bool replaceExisting)
 {
     if (!m_hasDocument || path.empty())
     {
@@ -149,7 +150,10 @@ bool FileScene::SaveCaptured(
     // Allocate the new path before replacing the file.
     std::filesystem::path savedPath = path;
 
-    if (!SaveSceneDocument(candidate, savedPath, errorMessage))
+    const bool written = replaceExisting ? SaveSceneDocument(candidate, savedPath, errorMessage) :
+        CreateSceneDocument(candidate, savedPath, errorMessage) == CreateSceneDocumentResult::Created;
+
+    if(!written)
     {
         return false;
     }

@@ -275,6 +275,12 @@ public:
         const std::filesystem::path& path,
         std::string* errorMessage = nullptr);
 
+    // Loose, editable document that has never been saved: no disk read and no path. Save
+    // fails until SaveAs supplies a path; SaveAs then makes it an ordinary file scene.
+    bool LoadUnsavedDocument(
+        SceneDocument document,
+        std::string* errorMessage = nullptr);
+
     SceneDocument& EditDocument();
 
     // Returns false when live state cannot be represented safely.
@@ -287,7 +293,8 @@ public:
 
     bool SaveAs(
         const std::filesystem::path& path,
-        std::string* errorMessage = nullptr);
+        std::string* errorMessage = nullptr,
+        bool replaceExisting = true);
 
 private:
     bool OwnsPhysicsPresentation(const Renderer& renderer, const PhysicsPresentationLease& lease) const noexcept;

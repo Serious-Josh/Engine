@@ -3,6 +3,7 @@
 #include "Core/Events/Event.h"
 #include "Platform/WindowProperties.h"
 
+#include <chrono>
 #include <functional>
 #include <filesystem>
 #include <vector>
@@ -51,6 +52,10 @@ class WindowsWindow
     void* m_windowHandle = nullptr;
 
     bool m_shouldClose = false;
+
+    // Stall detector: Windows shows "Not Responding" after about 5 s without message processing.
+    // A gap longer than kMessageStallThreshold between pump passes is logged with its length.
+    std::chrono::steady_clock::time_point m_lastMessagePump{};
 
     EventCallback m_eventCallback;
 

@@ -1192,6 +1192,39 @@ bool FileSceneRuntime::Open(
     return true;
 }
 
+bool FileSceneRuntime::LoadUnsavedDocument(
+    SceneDocument document,
+    std::string* errorMessage)
+{
+    if(m_materialAssignment)
+    {
+        return AssignmentError(errorMessage, "Finish/cancel/rollback the material assignment before scene lifecycle operations.");
+    }
+
+    if(m_archiveScene)
+    {
+        return AssignmentError(errorMessage, "Archive runtime cannot load a loose scene document.");
+    }
+
+    if(!m_fileScene.LoadDocument(std::move(document), errorMessage))
+    {
+        return false;
+    }
+
+    // Same reset as Open: nothing from a previous document survives.
+    DiscardPreparedScene();
+    m_objectMapping = {};
+    m_hierarchy.Reset();
+
+    if(m_scene.HasPhysicsPresentation())
+    {
+        m_scene.CommitPresentation({}, false);
+    }
+
+    m_activePresentationAssociation.reset();
+    return true;
+}
+
 SceneDocument& FileSceneRuntime::EditDocument()
 {
     if(m_archiveScene) throw std::logic_error("Packaged scenes are immutable.");
@@ -1206,7 +1239,8 @@ bool FileSceneRuntime::Save(std::string* errorMessage)
 
 bool FileSceneRuntime::SaveAs(
     const std::filesystem::path& path,
-    std::string* errorMessage)
+    std::string* errorMessage,
+    bool replaceExisting)
 {
     if(m_archiveScene) return AssignmentError(errorMessage,"Archive scenes are read-only; no loose scene save path.");
     if(m_materialAssignment)
@@ -1228,7 +1262,7 @@ bool FileSceneRuntime::SaveAs(
         return false;
     }
 
-    return m_fileScene.SaveCaptured(std::move(candidate), path, errorMessage);
+    return m_fileScene.SaveCaptured(std::move(candidate), path, errorMessage, replaceExisting);
 }
 
 bool FileSceneRuntime::CheckUnsavedChanges(

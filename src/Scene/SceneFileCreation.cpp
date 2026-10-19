@@ -22,6 +22,49 @@ namespace
 
         return false;
     }
+
+    // Encodes all UUID bytes; no clock or process-local counter is used as identity.
+    bool GenerateSceneID(
+        std::string& sceneID,
+        std::string* errorMessage)
+    {
+        GUID id{};
+
+        if (FAILED(CoCreateGuid(&id)))
+        {
+            return Fail(errorMessage, "Failed to generate a new scene ID.");
+        }
+
+        const auto* bytes = reinterpret_cast<const unsigned char*>(&id);
+        constexpr char hex[] = "0123456789abcdef";
+        sceneID = "scene-";
+
+        for (std::size_t index = 0; index < sizeof(id); ++index)
+        {
+            sceneID += hex[bytes[index] >> 4];
+            sceneID += hex[bytes[index] & 15];
+        }
+
+        return true;
+    }
+}
+
+bool CreateCleanSceneDocument(
+    SceneDocument& document,
+    std::string* errorMessage)
+{
+    SceneDocument candidate;
+
+    if (!GenerateSceneID(candidate.id, errorMessage))
+    {
+        return false;
+    }
+
+    // Camera, light, environment and schema version keep SceneDocument's defaults, the same
+    // values every new scene file starts from. No objects, so no starter sphere.
+    candidate.name = "Untitled Scene";
+    document = std::move(candidate);
+    return true;
 }
 
 bool CreateNewSceneFile(
@@ -36,23 +79,11 @@ bool CreateNewSceneFile(
             return false;
         }
 
-        GUID id{};
-
-        if (FAILED(CoCreateGuid(&id)))
-        {
-            return Fail(errorMessage, "Failed to generate a new scene ID.");
-        }
-
-        // Encode all UUID bytes; no clock or process-local counter is used as identity.
-        const auto* bytes = reinterpret_cast<const unsigned char*>(&id);
-        constexpr char hex[] = "0123456789abcdef";
         SceneDocument document;
-        document.id = "scene-";
 
-        for (std::size_t index = 0; index < sizeof(id); ++index)
+        if (!GenerateSceneID(document.id, errorMessage))
         {
-            document.id += hex[bytes[index] >> 4];
-            document.id += hex[bytes[index] & 15];
+            return false;
         }
 
         SceneObjectDocument sphere;

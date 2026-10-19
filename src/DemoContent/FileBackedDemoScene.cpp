@@ -10,6 +10,7 @@
 
 #include "Project/ProjectPaths.h"
 #include "assets/ProjectAssetResolver.h"
+#include "assets/ProjectAssetRegistry.h"
 #include "Renderer/Mesh.h"
 #include "Renderer/Renderer.h"
 
@@ -20,6 +21,12 @@
 
 namespace
 {
+    std::string ProjectPathText(const std::filesystem::path& path)
+    {
+        const auto text = path.u8string();
+        return {text.begin(), text.end()};
+    }
+
     // Registered during static initialization, before any project exists, so the path stays
     // project-relative until SetProjectAssets anchors it to the active project root.
     std::unique_ptr<IDemoScene> CreateFileBackedTestScene()
@@ -44,6 +51,11 @@ FileBackedDemoScene::FileBackedDemoScene(
 
 FileBackedDemoScene::FileBackedDemoScene(std::shared_ptr<const CookedScene::ArchiveScene> source)
     : m_archiveScene(std::move(source)) {}
+
+FileBackedDemoScene::FileBackedDemoScene(SceneDocument unsavedDocument)
+    : m_unsavedDocument(std::move(unsavedDocument))
+{
+}
 
 void FileBackedDemoScene::SetProjectAssets(
     const std::filesystem::path& root,
@@ -96,12 +108,27 @@ bool FileBackedDemoScene::InitializeWithPolicy(ID3D12Device* device, ResourceUpl
     Shutdown();
 
     Log::Info(std::string("Preparing file scene activation: mode=") +
-        (metadataOnly ? "metadata-first" : "synchronous-full Debug diagnostic") + ", path=" + m_scenePath.string());
+        (metadataOnly ? "metadata-first" : "synchronous-full Debug diagnostic") + ", path=" + ProjectPathText(m_scenePath));
 
     std::string error;
 
     // Validate the document before allocating GPU resources.
-    if (m_archiveScene ? !m_runtime->LoadArchive(m_archiveScene, &error) : !m_runtime->Open(m_scenePath, &error))
+    bool opened = false;
+
+    if (m_archiveScene)
+    {
+        opened = m_runtime->LoadArchive(m_archiveScene, &error);
+    }
+    else if (m_unsavedDocument)
+    {
+        opened = m_runtime->LoadUnsavedDocument(*m_unsavedDocument, &error);
+    }
+    else
+    {
+        opened = m_runtime->Open(m_scenePath, &error);
+    }
+
+    if (!opened)
     {
         Log::Error("Failed to open file-backed scene: " + error);
         return false;
@@ -349,7 +376,53 @@ bool FileBackedDemoScene::Save(std::string* errorMessage)
         return false;
     }
 
+    if (IsUnsaved())
+    {
+        if (errorMessage)
+        {
+            *errorMessage = "This scene has never been saved; a file path is required.";
+        }
+
+        return false;
+    }
+
     return m_runtime->Save(errorMessage);
+}
+
+bool FileBackedDemoScene::SaveAs(const std::filesystem::path& path, std::string* errorMessage, bool replaceExisting)
+{
+    if (!m_initialized || m_archiveScene)
+    {
+        if (errorMessage)
+        {
+            *errorMessage = "Save As requires an initialized, editable file-backed scene.";
+        }
+
+        return false;
+    }
+
+    if(path.empty() || !path.is_absolute() || !ProjectAssetRegistry::PathsEqual(path.extension(), ".scene"))
+    {
+        if (errorMessage)
+        {
+            *errorMessage = "Save As requires an absolute .scene file path.";
+        }
+
+        return false;
+    }
+
+    // Allocate the wrapper's adopted path before persistence, as FileScene does internally.
+    std::filesystem::path savedPath = path;
+
+    if(!m_runtime->SaveAs(savedPath, errorMessage, replaceExisting))
+    {
+        return false;
+    }
+
+    // The runtime adopted the path only after the transactional write succeeded.
+    m_scenePath = std::move(savedPath);
+    m_unsavedDocument.reset();
+    return true;
 }
 
 std::optional<SceneObjectMetadata> FileBackedDemoScene::GetObjectMetadata(

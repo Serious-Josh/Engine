@@ -4,6 +4,7 @@
 #include "DemoContent/SphereGridScene.h"
 #include "DemoContent/FileBackedDemoScene.h"
 #include "Core/Log.h"
+#include "assets/ProjectAssetRegistry.h"
 
 #include <utility>
 
@@ -262,6 +263,13 @@ std::string_view DemoSceneManager::GetActiveSceneName() const
 
 namespace
 {
+    std::string ProjectPathText(const std::filesystem::path& path)
+    {
+        const auto text = path.u8string();
+        return {text.begin(), text.end()};
+    }
+
+
     bool FailFileRequest(
         std::string* errorMessage,
         const std::string& message)
@@ -284,7 +292,7 @@ bool DemoSceneManager::RequestFileScene(
         return FailFileRequest(errorMessage, "A scene change request is already pending.");
     }
 
-    if (path.empty() || !path.is_absolute() || path.extension() != ".scene")
+    if(path.empty() || !path.is_absolute() || !ProjectAssetRegistry::PathsEqual(path.extension(), ".scene"))
     {
         return FailFileRequest(errorMessage, "An absolute .scene file path is required.");
     }
@@ -294,10 +302,34 @@ bool DemoSceneManager::RequestFileScene(
     if (!std::filesystem::is_regular_file(path, error))
     {
         return FailFileRequest(errorMessage, "Scene path is not an accessible regular file: " +
-            path.string() + (error ? " (" + error.message() + ")" : ""));
+            ProjectPathText(path) + (error ? " (" + error.message() + ")" : ""));
     }
 
     m_requestedFilePath = path;
+    m_requestedMetadataOnly = true;
+    m_requestedSceneEntry = nullptr;
+
+    if (errorMessage)
+    {
+        errorMessage->clear();
+    }
+
+    return true;
+}
+
+bool DemoSceneManager::RequestUnsavedScene(SceneDocument document, std::string* errorMessage)
+{
+    if (m_hasPendingSceneChange || HasPendingFileSceneRequest() || m_stagedFileScene)
+    {
+        return FailFileRequest(errorMessage, "A scene change request is already pending.");
+    }
+
+    if (!m_registry)
+    {
+        return FailFileRequest(errorMessage, "An unsaved scene requires an active project.");
+    }
+
+    m_requestedUnsavedDocument = std::move(document);
     m_requestedMetadataOnly = true;
     m_requestedSceneEntry = nullptr;
 
@@ -352,7 +384,18 @@ bool DemoSceneManager::StageRequestedFileScene(
 
     try
     {
-        candidate = m_requestedArchive ? std::make_unique<FileBackedDemoScene>(m_requestedArchive) : std::make_unique<FileBackedDemoScene>(m_requestedFilePath);
+        if (m_requestedArchive)
+        {
+            candidate = std::make_unique<FileBackedDemoScene>(m_requestedArchive);
+        }
+        else if (m_requestedUnsavedDocument)
+        {
+            candidate = std::make_unique<FileBackedDemoScene>(*m_requestedUnsavedDocument);
+        }
+        else
+        {
+            candidate = std::make_unique<FileBackedDemoScene>(m_requestedFilePath);
+        }
 
         ConfigureProjectAssets(*candidate);
 
@@ -373,7 +416,7 @@ bool DemoSceneManager::StageRequestedFileScene(
         {
             candidate->Shutdown();
             return FailFileRequest(errorMessage, "Failed to initialize file scene candidate: " +
-                m_requestedFilePath.string() + ". See initialization diagnostics.");
+                ProjectPathText(m_requestedFilePath) + ". See initialization diagnostics.");
         }
 
         candidate->SetAspectRatio(m_aspectRatio);
@@ -436,6 +479,7 @@ bool DemoSceneManager::CommitStagedFileScene(std::string* errorMessage)
     m_requestedSceneEntry = nullptr;
     m_requestedFilePath.clear();
     m_requestedArchive.reset();
+    m_requestedUnsavedDocument.reset();
     m_requestedMetadataOnly = false;
 
     if (errorMessage)
@@ -457,7 +501,44 @@ void DemoSceneManager::CancelFileSceneRequest()
     m_stagedFileName.clear();
     m_requestedFilePath.clear();
     m_requestedArchive.reset();
+    m_requestedUnsavedDocument.reset();
     m_requestedMetadataOnly = false;
+}
+
+bool DemoSceneManager::InitializeUnsaved(
+    SceneDocument document,
+    ID3D12Device* device,
+    ResourceUploader& uploader,
+    DescriptorHeap& descriptorHeap,
+    const Shader* vertexShader,
+    const Shader* pixelShader,
+    float aspectRatio)
+{
+    if (!m_registry || m_activeScene)
+    {
+        Log::Error("An unsaved initial scene requires project assets and no active scene.");
+        return false;
+    }
+
+    m_aspectRatio = aspectRatio;
+    m_hasPendingSceneChange = false;
+    m_activeSceneEntry = nullptr;
+    m_requestedSceneEntry = nullptr;
+
+    auto scene = std::make_unique<FileBackedDemoScene>(std::move(document));
+    ConfigureProjectAssets(*scene);
+
+    if (!scene->Initialize(device, uploader, descriptorHeap, vertexShader, pixelShader))
+    {
+        Log::Error("Failed to initialize the unsaved scene.");
+        scene->Shutdown();
+        return false;
+    }
+
+    scene->SetAspectRatio(aspectRatio);
+    m_activeFileName = scene->GetDisplayName();
+    m_activeScene = std::move(scene);
+    return true;
 }
 
 bool DemoSceneManager::InitializeArchive(std::shared_ptr<const CookedScene::ArchiveScene> source, ID3D12Device* device,

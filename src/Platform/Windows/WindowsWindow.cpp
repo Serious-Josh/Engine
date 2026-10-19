@@ -277,9 +277,26 @@ LRESULT CALLBACK WindowProc(
         return DefWindowProcW(hwnd, uMsg, wParam, lParam);
     }
 
+    case WM_SYSCOMMAND:
+    {
+        // Title-bar X, Alt+F4, the system menu and the taskbar's Close window arrive here first;
+        // DefWindowProc then sends WM_CLOSE. Logged to tell user/shell closes from posted ones.
+        if ((wParam & 0xFFF0) == SC_CLOSE)
+        {
+            Log::Info("Close requested through the window system command (title bar, Alt+F4 or taskbar).");
+        }
+
+        return DefWindowProcW(hwnd, uMsg, wParam, lParam);
+    }
+
     case WM_CLOSE:
     {
-        Log::Info("WM_CLOSE received.");
+        // Sent from another thread/process, or posted/sent by this thread (including after SC_CLOSE).
+        const DWORD sendState = InSendMessageEx(nullptr);
+        const bool sentByOther = (sendState & (ISMEX_SEND | ISMEX_NOTIFY)) != 0;
+        Log::Info(sentByOther ?
+            "WM_CLOSE received (sent by another thread or process)." :
+            "WM_CLOSE received (posted, or sent by this thread).");
 
         Event event;
         event.type = EventType::WindowClose;
@@ -368,8 +385,23 @@ std::vector<WindowsWindow::FileDrop> WindowsWindow::TakeFileDrops()
     return std::exchange(m_fileDrops, {});
 }
 
+namespace
+{
+    constexpr auto kMessageStallThreshold = std::chrono::seconds(2);
+}
+
 void WindowsWindow::ProcessMessages()
 {
+    const auto now = std::chrono::steady_clock::now();
+
+    if(m_lastMessagePump != std::chrono::steady_clock::time_point{} && now - m_lastMessagePump > kMessageStallThreshold)
+    {
+        const auto stalled = std::chrono::duration_cast<std::chrono::milliseconds>(now - m_lastMessagePump).count();
+        Log::Warning("Window message processing stalled for " + std::to_string(stalled) +
+            " ms (the window may have shown Not Responding).");
+    }
+
+    m_lastMessagePump = now;
     MSG message{};
 
     while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE))
@@ -387,7 +419,9 @@ void WindowsWindow::ProcessMessages()
 
 void WindowsWindow::WaitForMessage()
 {
+    // An idle wait still answers the system, so it is not a stall.
     WaitMessage();
+    m_lastMessagePump = std::chrono::steady_clock::now();
 }
 
 bool WindowsWindow::ShouldClose() const

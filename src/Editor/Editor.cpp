@@ -167,18 +167,26 @@ namespace
 
 bool Editor::RequestApplicationClose()
 {
-    if(m_materialLeaveAction != MaterialLeaveAction::None || m_sceneOperationPending || m_fileRequest)
+    QueueFileRequest(FileRequest{FileRequestType::Exit, {}});
+    return false;
+}
+
+bool Editor::QueueFileRequest(FileRequest request)
+{
+    if(m_sceneOperationPending || m_fileRequest || m_materialLeaveAction != MaterialLeaveAction::None ||
+        IsPhysicsEditingLocked())
     {
+        ReportLifecycleMessage("Finish the pending operation and stop physics before leaving the scene.");
         return false;
     }
 
-    if(!m_inspectorPanel.HasUnsavedChanges())
-    {
-        return true;
-    }
+    m_fileRequest = std::move(request);
+    return true;
+}
 
-    m_materialLeaveAction = MaterialLeaveAction::Close;
-    return false;
+void Editor::ReportLifecycleMessage(std::string message)
+{
+    m_lifecycleMessage = std::move(message);
 }
 
 bool Editor::TakeApplicationCloseApproval()
@@ -188,7 +196,8 @@ bool Editor::TakeApplicationCloseApproval()
 
 std::optional<Editor::FileRequest> Editor::TakeFileRequest()
 {
-    if(m_fileRequest && m_fileRequest->type != FileRequestType::Save && m_inspectorPanel.HasUnsavedChanges())
+    if(m_fileRequest && (m_fileRequest->type != FileRequestType::Save && m_fileRequest->type != FileRequestType::SaveAs) &&
+        m_inspectorPanel.HasUnsavedChanges())
     {
         if(m_materialLeaveAction == MaterialLeaveAction::None)
         {
@@ -225,6 +234,38 @@ bool Editor::HasFileRequest(FileRequestType type) const noexcept
     return m_fileRequest && m_fileRequest->type == type;
 }
 
+void Editor::DrawLifecycleWindows(const IDemoScene& demoScene)
+{
+    DrawProjectSettings(demoScene);
+    DrawFileAssociation();
+    DrawProjectOwnershipLost();
+
+    if(!m_lifecycleMessage.empty())
+    {
+        bool visible = true;
+        ImGui::SetNextWindowSize(ImVec2(520, 0), ImGuiCond_FirstUseEver);
+
+        if(ImGui::Begin("Scene and project status", &visible, ImGuiWindowFlags_AlwaysAutoResize))
+        {
+            ImGui::PushTextWrapPos(490);
+            ImGui::TextUnformatted(m_lifecycleMessage.c_str());
+            ImGui::PopTextWrapPos();
+
+            if(ImGui::Button("Dismiss"))
+            {
+                visible = false;
+            }
+        }
+
+        ImGui::End();
+
+        if(!visible)
+        {
+            m_lifecycleMessage.clear();
+        }
+    }
+}
+
 void Editor::DrawMainMenu(
     const IDemoScene& demoScene,
     DemoSceneManager& sceneManager,
@@ -235,78 +276,58 @@ void Editor::DrawMainMenu(
         return;
     }
 
-    if (ImGui::BeginMenu("File"))
+    if(ImGui::BeginMenu("File"))
     {
-        ImGui::BeginDisabled(m_sceneOperationPending || m_fileRequest.has_value() || m_materialLeaveAction != MaterialLeaveAction::None);
+        ImGui::BeginDisabled(m_sceneOperationPending || m_fileRequest.has_value() ||
+            m_materialLeaveAction != MaterialLeaveAction::None || IsPhysicsEditingLocked());
 
-        if (ImGui::MenuItem("New"))
+        if(ImGui::MenuItem("New Scene"))
         {
-            m_fileRequest = FileRequest{FileRequestType::New, {}};
+            QueueFileRequest(FileRequest{FileRequestType::New, {}});
         }
 
-        const bool fileBacked = dynamic_cast<const FileBackedDemoScene*>(&demoScene) != nullptr;
-        ImGui::BeginDisabled(!fileBacked);
-
-        if (ImGui::MenuItem("Save", "Ctrl+S"))
+        if(ImGui::MenuItem("Open Scene..."))
         {
-            m_fileRequest = FileRequest{FileRequestType::Save, {}};
+            QueueFileRequest(FileRequest{FileRequestType::Load, {}});
+        }
+
+        const auto* owner = dynamic_cast<const FileBackedDemoScene*>(&demoScene);
+        ImGui::BeginDisabled(!owner || owner->IsArchiveActivation());
+
+        if(ImGui::MenuItem("Save Scene", "Ctrl+S"))
+        {
+            QueueFileRequest(FileRequest{FileRequestType::Save, {}});
+        }
+
+        if(ImGui::MenuItem("Save Scene As..."))
+        {
+            QueueFileRequest(FileRequest{FileRequestType::SaveAs, {}});
         }
 
         ImGui::EndDisabled();
+        ImGui::Separator();
 
-        if (ImGui::BeginMenu("Load"))
+        if(ImGui::MenuItem("New Project..."))
         {
-            std::vector<std::filesystem::path> scenes;
-            std::error_code error = std::make_error_code(std::errc::no_such_file_or_directory);
-            std::filesystem::directory_iterator iterator;
+            QueueFileRequest(FileRequest{FileRequestType::NewProject, {}});
+        }
 
-            if (m_activeProject)
-            {
-                error.clear();
-                iterator = std::filesystem::directory_iterator(
-                    m_activeProject->GetPaths().GetScenesDirectory(),
-                    error);
-            }
+        if(ImGui::MenuItem("Open Project..."))
+        {
+            QueueFileRequest(FileRequest{FileRequestType::OpenProject, {}});
+        }
 
-            const std::filesystem::directory_iterator end;
+        if(ImGui::MenuItem("Project Settings"))
+        {
+            m_showProjectSettings = true;
+            m_startupSceneCandidatesListed = false;
+        }
 
-            while (!error && iterator != end)
-            {
-                std::error_code entryError;
+        ImGui::Separator();
 
-                if (iterator->is_regular_file(entryError) && !entryError && iterator->path().extension() == ".scene")
-                {
-                    scenes.push_back(iterator->path());
-                }
-
-                iterator.increment(error);
-            }
-
-            std::sort(scenes.begin(), scenes.end(), [](const auto& left, const auto& right)
-            {
-                return left.filename().native() < right.filename().native();
-            });
-
-            for (const auto& scene : scenes)
-            {
-                const std::string filename = scene.filename().string();
-
-                if (ImGui::MenuItem(filename.c_str()))
-                {
-                    m_fileRequest = FileRequest{FileRequestType::Load, scene};
-                }
-            }
-
-            if (error)
-            {
-                ImGui::TextDisabled("Scenes directory unavailable or incomplete");
-            }
-            else if (scenes.empty())
-            {
-                ImGui::TextDisabled("No scene files found");
-            }
-
-            ImGui::EndMenu();
+        if(ImGui::MenuItem("Exit"))
+        {
+            RequestApplicationClose();
         }
 
         ImGui::EndDisabled();
@@ -335,6 +356,14 @@ void Editor::DrawMainMenu(
         ImGui::MenuItem("Asset Browser", nullptr, &m_workspace.AssetBrowserVisible());
         ImGui::Separator();
 
+        if(ImGui::MenuItem("Windows File Association..."))
+        {
+            m_showFileAssociation = true;
+            m_fileAssociationStatusRead = false;
+        }
+
+        ImGui::Separator();
+
         const std::string_view activeSceneName = sceneManager.GetActiveSceneName();
 
         ImGui::BeginDisabled(m_sceneOperationPending || m_fileRequest.has_value() || m_materialLeaveAction != MaterialLeaveAction::None);
@@ -347,7 +376,7 @@ void Editor::DrawMainMenu(
 
                 if (ImGui::Selectable(entry.name.c_str(), isSelected))
                 {
-                    m_fileRequest = FileRequest{FileRequestType::Demo, {}, entry.name};
+                    QueueFileRequest(FileRequest{FileRequestType::Demo, {}, entry.name});
                 }
 
                 if (isSelected)
@@ -533,6 +562,35 @@ void Editor::UpdateGizmoRotationDrag(bool gizmoUsing, const Matrix4& gizmoModel,
     m_gizmoRotationDrag->continuousModel = gizmoModel;
 }
 
+ViewportPreferences Editor::GetViewportPreferences() const
+{
+    ViewportPreferences preferences;
+    preferences.snapEnabled = m_snapEnabled;
+    preferences.translationSnapInterval = m_translationSnapInterval;
+    preferences.rotationSnapIntervalDegrees = m_rotationSnapIntervalDegrees;
+    preferences.gridVisible = m_showViewportGrid;
+    return preferences;
+}
+
+void Editor::ApplyViewportPreferences(const ViewportPreferences& preferences)
+{
+    m_snapEnabled = preferences.snapEnabled;
+    m_showViewportGrid = preferences.gridVisible;
+
+    if(ViewportGridSnap::IsValidInterval(preferences.translationSnapInterval))
+    {
+        m_translationSnapInterval = preferences.translationSnapInterval;
+    }
+
+    if(ViewportGridSnap::IsValidInterval(preferences.rotationSnapIntervalDegrees))
+    {
+        m_rotationSnapIntervalDegrees = preferences.rotationSnapIntervalDegrees;
+    }
+
+    m_translationSnapIntervalDraft = m_translationSnapInterval;
+    m_rotationSnapIntervalDraft = m_rotationSnapIntervalDegrees;
+}
+
 std::optional<float> Editor::GetViewportGridSpacing() const
 {
     // The grid is an editing aid: hidden while Play/Pause simulates, restored on Stop. The
@@ -660,6 +718,16 @@ const EditorWorkspaceRect& Editor::PrepareWorkspace(
 {
     ViewportCameraInput::ReserveLeftButton(m_cameraLooking, m_panLeftHeld);
     DrawMainMenu(demoScene, sceneManager, debugUI);
+    DrawLifecycleWindows(demoScene);
+
+    // Save is application-wide even when an input owns keyboard focus. The Engine applies
+    // the same eligibility and persistence path as File -> Save Scene.
+    if(ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_S, false) &&
+        dynamic_cast<const FileBackedDemoScene*>(&demoScene))
+    {
+        QueueFileRequest(FileRequest{FileRequestType::Save, {}});
+    }
+
     m_workspace.Update();
     const auto regions = CalculateSceneViewportRegions(m_workspace.GetSceneViewport(), ImGui::GetFrameHeight());
     m_viewportContentRegion = regions.imageArea;
@@ -1256,7 +1324,8 @@ void Editor::Draw(
 
     if(m_workspace.AssetBrowserVisible())
     {
-        m_assetBrowser.Draw(m_workspace.GetAssetBrowser());
+        m_assetBrowser.Draw(m_workspace.GetAssetBrowser(), m_activeProject,
+            dynamic_cast<const FileBackedDemoScene*>(&demoScene));
     }
     else
     {
@@ -1265,12 +1334,17 @@ void Editor::Draw(
 
     ImGui::EndDisabled();
 
+    if(const auto scenePath = m_assetBrowser.TakeSceneOpenRequest())
+    {
+        QueueFileRequest(FileRequest{FileRequestType::Load, *scenePath});
+    }
+
     const bool assetSelectionIntent = m_assetBrowser.TakeSelectionIntent();
 
     const bool assetTargetChanged = m_inspectorTarget != InspectorTarget::Asset ||
         m_assetBrowser.GetSelection() != m_inspectedAssetSelection;
 
-    if(m_materialLeaveAction == MaterialLeaveAction::None && assetTargetChanged &&
+    if(!m_fileRequest && !m_sceneOperationPending && m_materialLeaveAction == MaterialLeaveAction::None && assetTargetChanged &&
        (assetSelectionIntent || (m_inspectorTarget == InspectorTarget::Asset &&
         m_assetBrowser.GetSelection() != m_inspectedAssetSelection)))
     {
@@ -1423,53 +1497,7 @@ void Editor::Draw(
         }
     }
 
-    if(m_materialLeaveAction != MaterialLeaveAction::None)
-    {
-        const auto decision = m_inspectorPanel.DrawUnsavedConfirmation(projectPaths, assetRegistry);
-
-        if(decision == InspectorPanel::LeaveDecision::Proceed)
-        {
-            switch(m_materialLeaveAction)
-            {
-            case MaterialLeaveAction::Selection:
-                m_inspectedAssetSelection = m_pendingAssetSelection;
-                m_inspectorPanel.LoadSelection(m_inspectedAssetSelection, projectPaths, assetRegistry);
-                m_inspectorTarget = m_inspectedAssetSelection.empty() ? InspectorTarget::None : InspectorTarget::Asset;
-                m_objectInspectionIdentity.reset();
-                break;
-            case MaterialLeaveAction::ObjectSelection:
-                ActivateObjectInspection(demoScene, projectPaths, assetRegistry);
-                break;
-            case MaterialLeaveAction::Refresh:
-                m_inspectorPanel.LoadSelection(m_inspectedAssetSelection, projectPaths, assetRegistry);
-                break;
-            case MaterialLeaveAction::Hide:
-                m_workspace.InspectorVisible() = false;
-                break;
-            case MaterialLeaveAction::Close:
-                m_applicationCloseApproved = true;
-                break;
-            default:
-                break;
-            }
-
-            m_materialLeaveAction = MaterialLeaveAction::None;
-        }
-        else if(decision == InspectorPanel::LeaveDecision::Cancel)
-        {
-            if(m_materialLeaveAction == MaterialLeaveAction::Selection)
-            {
-                m_assetBrowser.RestoreSelection(m_inspectedAssetSelection);
-            }
-
-            if(m_materialLeaveAction == MaterialLeaveAction::Scene)
-            {
-                m_fileRequest.reset();
-            }
-
-            m_materialLeaveAction = MaterialLeaveAction::None;
-        }
-    }
+    DrawMaterialLeaveConfirmation(demoScene, projectPaths, assetRegistry);
 
     for(auto& working : m_inspectorPanel.TakeWorkingMaterialRevisions(
         m_workspace.InspectorVisible() && m_inspectorTarget == InspectorTarget::Asset))
@@ -1511,7 +1539,7 @@ void Editor::Draw(
     m_assetBrowser.DrawDeletionConfirmation(IsPhysicsEditingLocked() || m_inspectorPanel.HasUnsavedChanges() ||
         m_materialLeaveAction != MaterialLeaveAction::None || m_sceneOperationPending);
 
-    DrawBuildGame();
+    DrawBuildGame(demoScene);
     DrawSceneViewport(sceneTextureHandle, sceneWidth, sceneHeight);
     DrawMeshDropTarget(demoScene, projectPaths, assetRegistry);
     DrawMaterialDropTarget(demoScene, projectPaths, assetRegistry);
@@ -1573,18 +1601,6 @@ void Editor::Draw(
         }
 
         ImGui::End();
-    }
-
-    // Save is an application shortcut even when a property input owns keyboard
-    // focus. Do not gate it on WantCaptureKeyboard or consume text-edit input.
-
-    if (!m_sceneOperationPending && !m_fileRequest && m_materialLeaveAction == MaterialLeaveAction::None &&
-        dynamic_cast<const FileBackedDemoScene*>(&demoScene))
-    {
-        if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_S, false))
-        {
-            m_fileRequest = FileRequest{FileRequestType::Save, {}};
-        }
     }
 
     // Projection is driven by the actual render extent, including after Inspector controls.
@@ -2598,6 +2614,59 @@ void Editor::DrawCamera(IDemoScene& demoScene)
     }
 }
 
+void Editor::DrawMaterialLeaveConfirmation(IDemoScene& demoScene, const ProjectPaths& projectPaths,
+    const ProjectAssetRegistry& assetRegistry)
+{
+    if(m_materialLeaveAction != MaterialLeaveAction::None)
+    {
+        const auto decision = m_inspectorPanel.DrawUnsavedConfirmation(projectPaths, assetRegistry);
+
+        if(decision == InspectorPanel::LeaveDecision::Proceed)
+        {
+            switch(m_materialLeaveAction)
+            {
+            case MaterialLeaveAction::Selection:
+                m_inspectedAssetSelection = m_pendingAssetSelection;
+                m_inspectorPanel.LoadSelection(m_inspectedAssetSelection, projectPaths, assetRegistry);
+                m_inspectorTarget = m_inspectedAssetSelection.empty() ? InspectorTarget::None : InspectorTarget::Asset;
+                m_objectInspectionIdentity.reset();
+                break;
+            case MaterialLeaveAction::ObjectSelection:
+                ActivateObjectInspection(demoScene, projectPaths, assetRegistry);
+                break;
+            case MaterialLeaveAction::Refresh:
+                m_inspectorPanel.LoadSelection(m_inspectedAssetSelection, projectPaths, assetRegistry);
+                break;
+            case MaterialLeaveAction::Hide:
+                m_workspace.InspectorVisible() = false;
+                break;
+            case MaterialLeaveAction::Close:
+                m_applicationCloseApproved = true;
+                break;
+            default:
+                break;
+            }
+
+            m_materialLeaveAction = MaterialLeaveAction::None;
+        }
+        else if(decision == InspectorPanel::LeaveDecision::Cancel)
+        {
+            if(m_materialLeaveAction == MaterialLeaveAction::Selection)
+            {
+                m_assetBrowser.RestoreSelection(m_inspectedAssetSelection);
+            }
+
+            if(m_materialLeaveAction == MaterialLeaveAction::Scene)
+            {
+                m_fileRequest.reset();
+            }
+
+            m_materialLeaveAction = MaterialLeaveAction::None;
+        }
+    }
+
+}
+
 void Editor::SetSceneOperationPending(bool pending) noexcept
 {
     m_sceneOperationPending = pending;
@@ -2632,7 +2701,7 @@ Editor::SceneChangeDecision Editor::DrawSceneChangeConfirmation(const std::strin
 
         ImGui::SameLine();
 
-        if (ImGui::Button("Discard"))
+        if(ImGui::Button("Don't Save"))
         {
             decision = SceneChangeDecision::Discard;
         }
@@ -2681,6 +2750,7 @@ void Editor::SuspendViewportInteraction()
 
 void Editor::OnSceneActivated()
 {
+    InvalidateSceneFiles();
     ClearSceneHistory();
     ResetSceneInteractions();
 }
@@ -2792,6 +2862,10 @@ void Editor::ProcessAssetDeletion(const ProjectPaths& paths, ProjectAssetRegistr
     {
         error = "Deletion rejected while editor changes or a scene operation are pending.";
     }
+    else if(ProjectAssetRegistry::PathsEqual(request->extension(), ".scene"))
+    {
+        error = "Scene deletion requires a coordinated lifecycle workflow and is not available in the Asset Browser.";
+    }
     else
     {
         ProjectAssetDeletion::RemoveFile(paths, registry, *request, error);
@@ -2845,6 +2919,10 @@ void Editor::ProcessAssetRename(
     {
         error = "Rename rejected while editor changes or a scene operation are pending.";
     }
+    else if(ProjectAssetRegistry::PathsEqual(request->source.extension(), ".scene"))
+    {
+        error = "Scene renaming requires a coordinated lifecycle workflow and is not available in the Asset Browser.";
+    }
     else if(!activeScenePath.empty() &&
         _wcsicmp(std::filesystem::absolute(request->source).lexically_normal().c_str(),
             std::filesystem::absolute(activeScenePath).lexically_normal().c_str()) == 0)
@@ -2896,6 +2974,10 @@ void Editor::ProcessAssetMove(const ProjectPaths& paths, ProjectAssetRegistry& r
     if(m_inspectorPanel.HasUnsavedChanges() || m_materialLeaveAction != MaterialLeaveAction::None || m_sceneOperationPending)
     {
         error = "Move rejected while editor changes or a scene operation are pending.";
+    }
+    else if(ProjectAssetRegistry::PathsEqual(request->source.extension(), ".scene"))
+    {
+        error = "Scene moving requires a coordinated lifecycle workflow and is not available in the Asset Browser.";
     }
     else
     {
@@ -3468,6 +3550,7 @@ void Editor::ClearSceneHistory()
     m_historyCursor = 0;
     m_historyPayloadBytes = 0;
     m_historySession.reset();
+    m_historyCurrentScenePath.clear();
 
     ++m_historyEpoch;
     m_historyObservedScene = nullptr;
@@ -3505,7 +3588,7 @@ bool Editor::UpdateSceneHistorySession(const IDemoScene& demoScene, const Projec
     const auto& scene = demoScene.GetScene();
     const auto revision = scene.GetStructureRevision();
     const bool changed = m_historySession && (m_historySession->projectIdentity != project ||
-        m_historySession->sceneIdentity != identity || m_historySession->scenePath != path ||
+        m_historySession->sceneIdentity != identity || m_historyCurrentScenePath != path ||
         m_historyObservedScene != &scene || m_historyRuntimeIdentity != runtime ||
         m_historyStructureRevision != revision);
 
@@ -3522,11 +3605,36 @@ bool Editor::UpdateSceneHistorySession(const IDemoScene& demoScene, const Projec
         }
 
         m_historySession = SceneHistorySession{project, path, identity, m_historyEpoch};
+        m_historyCurrentScenePath = path;
         m_historyObservedScene = &scene;
         m_historyRuntimeIdentity = runtime;
         m_historyStructureRevision = revision;
     }
 
+    return true;
+}
+
+bool Editor::RebindSceneHistoryAfterSaveAs(const FileBackedDemoScene& scene, const std::filesystem::path& previousPath)
+{
+    if(!m_historySession)
+    {
+        return m_sceneHistory.empty();
+    }
+
+    std::error_code error;
+    const auto project = std::filesystem::canonical(scene.GetProjectRoot(), error);
+
+    if(error || project != m_historySession->projectIdentity ||
+        previousPath.lexically_normal() != m_historyCurrentScenePath ||
+        m_historySession->sceneIdentity != scene.GetPersistentSceneID() ||
+        m_historyRuntimeIdentity != scene.GetRuntimeIdentity() || m_historyObservedScene != &scene.GetScene() ||
+        m_historyStructureRevision != scene.GetScene().GetStructureRevision())
+    {
+        ReportSceneHistoryFailure("Save As did not match the current history session.");
+        return false;
+    }
+
+    m_historyCurrentScenePath = scene.GetScenePath().lexically_normal();
     return true;
 }
 
@@ -3541,7 +3649,7 @@ bool Editor::RebindSceneHistoryAfterStructureChange(const IDemoScene& demoScene)
 
     if(!owner || !m_historySession || error || project != m_historySession->projectIdentity ||
         owner->GetPersistentSceneID() != m_historySession->sceneIdentity ||
-        owner->GetScenePath().lexically_normal() != m_historySession->scenePath)
+        owner->GetScenePath().lexically_normal() != m_historyCurrentScenePath)
     {
         ReportSceneHistoryFailure("Structural publication does not belong to the current editing session.");
         return false;
@@ -4033,7 +4141,7 @@ bool Editor::CanPreserveSceneHistory(const IDemoScene& demoScene,
     return owner && m_historySession->epoch == epoch &&
         m_historySession->projectIdentity == canonicalProject &&
         m_historySession->sceneIdentity == owner->GetPersistentSceneID() &&
-        m_historySession->scenePath == owner->GetScenePath().lexically_normal() &&
+        m_historyCurrentScenePath == owner->GetScenePath().lexically_normal() &&
         m_historyRuntimeIdentity == owner->GetRuntimeIdentity() &&
         m_historyObservedScene == &owner->GetScene() &&
         m_historyStructureRevision == owner->GetScene().GetStructureRevision();

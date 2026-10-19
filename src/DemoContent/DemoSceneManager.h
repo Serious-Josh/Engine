@@ -2,10 +2,12 @@
 
 #include "DemoContent/IDemoScene.h"
 #include "DemoContent/SceneRegistry.h"
+#include "Scene/SceneDocument.h"
 
 #include <filesystem>
 #include <string>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string_view>
 
@@ -27,6 +29,17 @@ class DemoSceneManager
       float aspectRatio);
 
     bool InitializeArchive(std::shared_ptr<const CookedScene::ArchiveScene>, ID3D12Device*, ResourceUploader&, DescriptorHeap&, const Shader*, const Shader*, float);
+
+    // Initial scene for a project: a never-saved document with no file. Requires project assets.
+    bool InitializeUnsaved(
+        SceneDocument document,
+        ID3D12Device* device,
+        ResourceUploader& uploader,
+        DescriptorHeap& descriptorHeap,
+        const Shader* vertexShader,
+        const Shader* pixelShader,
+        float aspectRatio);
+
     void Shutdown();
 
     // Engine owns the live registry; scene instances only borrow it.
@@ -38,7 +51,14 @@ class DemoSceneManager
 
     // Explicit packaged diagnostic source; no filesystem scene path.
     bool RequestArchiveScene(std::shared_ptr<const CookedScene::ArchiveScene> source, std::string* errorMessage = nullptr);
-    bool HasPendingFileSceneRequest() const noexcept { return !m_requestedFilePath.empty() || bool(m_requestedArchive); }
+    bool HasPendingFileSceneRequest() const noexcept
+    {
+        return !m_requestedFilePath.empty() || bool(m_requestedArchive) || m_requestedUnsavedDocument.has_value();
+    }
+
+    // Replaces the active scene with a never-saved document through the same staging, GPU
+    // drain/release and commit path as opening a file. Writes nothing.
+    bool RequestUnsavedScene(SceneDocument document, std::string* errorMessage = nullptr);
     bool RequestFileScene(
         const std::filesystem::path& path,
         std::string* errorMessage = nullptr);
@@ -107,6 +127,7 @@ class DemoSceneManager
 
     std::shared_ptr<const CookedScene::ArchiveScene> m_requestedArchive;
     std::filesystem::path m_requestedFilePath;
+    std::optional<SceneDocument> m_requestedUnsavedDocument;
     std::string m_stagedFileName;
     std::string m_activeFileName;
 

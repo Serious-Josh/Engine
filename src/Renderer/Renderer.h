@@ -120,7 +120,12 @@ class Renderer
         void* windowHandle,
         unsigned int width,
         unsigned int height,
-        const std::filesystem::path& assetRoot, std::span<const std::byte> packagedShaders = {}, const HDRImageData* environment = nullptr, std::string environmentIdentity = {});
+        const std::filesystem::path& assetRoot, std::span<const std::byte> packagedShaders = {},
+        const HDRImageData* environment = nullptr, std::string environmentIdentity = {},
+        bool deferEditorResources = false);
+    // First project selection only for interactive startup; legacy initialization calls this
+    // eagerly. Idempotent, with no project asset requests or scene recording.
+    bool InitializeEditorResources();
     using FrameRenderResult = RendererDiagnostics::FrameRenderResult;
 
     enum class DisplacementCompletionStatus
@@ -156,6 +161,8 @@ class Renderer
     };
 
     [[nodiscard]] FrameRenderResult Render(const Scene& scene, const RendererOptions& options);
+    // Project Browser only: no scene, previews, asset uploads or compute recording.
+    [[nodiscard]] bool RenderUIOnly();
     // Nonblocking and outside any frame recording/exit scope. Finalized stays
     // observable until its exact payload is explicitly taken; no acknowledgment.
     [[nodiscard]] DisplacementCompletionStatus ProcessDisplacementCompletion();
@@ -481,6 +488,7 @@ class Renderer
     friend class ThumbnailSchedulingVerification;
     friend class NormalMapVerification;
     friend class EditorGridVerification;
+    friend class ProjectBrowserVerification;
 #endif
     friend class SceneMembershipPublication;
 #if defined(ENGINE_HAS_VERIFICATION)
@@ -1108,6 +1116,7 @@ class Renderer
 
     TextureThumbnailCache m_textureThumbnails;
     MaterialPreviewRenderer m_materialPreviewRenderer;
+    bool m_editorResourcesInitialized = false;
 
     UploadBuffer m_uploadBuffer;
 

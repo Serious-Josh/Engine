@@ -3,6 +3,7 @@
 
 #include "Scene/Transform.h"
 #include "Engine/BuildGame.h"
+#include "Platform/Windows/ProjectFileAssociation.h"
 #include "Engine/CharacterDriveScheduling.h"
 #include "Physics/CharacterControllerDiagnostics.h"
 #include "SceneSelection.h"
@@ -12,6 +13,7 @@
 #include "InspectorPanel.h"
 #include "SceneHierarchyPanel.h"
 #include "ViewportGridSnap.h"
+#include "EditorPreferences.h"
 #include "Scene/FileSceneAssetCatalog.h"
 #include "Project/ProjectContext.h"
 
@@ -44,7 +46,12 @@ public:
         New,
         Save,
         Load,
-        Demo
+        Demo,
+        SaveAs,
+        NewProject,
+        OpenProject,
+        ProjectSettings,
+        Exit
     };
 
     struct FileRequest
@@ -131,6 +138,11 @@ public:
     // G.3 viewport grid spacing for this frame: the applied translation snap interval, or empty
     // when the Grid overlay is off or Play mode has locked authored editing.
     std::optional<float> GetViewportGridSpacing() const;
+
+    // Snap and grid values persisted in global Editor preferences (PR.5). Apply accepts only
+    // valid intervals (invalid ones keep the current value) and also resets the text drafts.
+    ViewportPreferences GetViewportPreferences() const;
+    void ApplyViewportPreferences(const ViewportPreferences& preferences);
     // CM.9 diagnostics. Engine supplies the published controller diagnostics after each
     // physics frame (null when no session is active), and takes the diagnostic drive intent
     // immediately before the next Update; it acknowledges a jump once it is submitted.
@@ -287,12 +299,66 @@ public:
 
     SceneChangeDecision DrawSceneChangeConfirmation(const std::string& error);
 
+    struct BuildGameRequest
+    {
+        BuildGame::Settings settings;
+
+        // Explicit "Save Scene and Build": save the active startup scene through File > Save first.
+        bool saveStartupScene = false;
+    };
+
     // Taking a request clears it. Pending actions cannot be overwritten.
-    std::optional<BuildGame::Settings> TakeBuildGameRequest() { return std::exchange(m_buildGameRequest,std::nullopt); }
+    std::optional<BuildGameRequest> TakeBuildGameRequest()
+    {
+        return std::exchange(m_buildGameRequest, std::nullopt);
+    }
+
     bool TakeBuildGameCancel() { return std::exchange(m_buildGameCancel,false); }
     void SetBuildGameStatus(BuildGame::Status status) { m_buildGameStatus=std::move(status); }
+
+    // Offers "Save Scene and Build" after a build was refused for an unsaved active startup scene.
+    void SetBuildStartupSceneUnsaved(bool unsaved)
+    {
+        m_buildStartupSceneUnsaved = unsaved;
+    }
+
+    // Project Settings request for the shared game startup scene: an absolute scene path, or an
+    // empty path to clear the setting. Engine validates and persists it, then reports the result.
+    std::optional<std::filesystem::path> TakeStartupSceneRequest()
+    {
+        return std::exchange(m_startupSceneRequest, std::nullopt);
+    }
+
+    void OnStartupSceneChanged(bool succeeded, std::string message);
+
+    // Blocking prompt while project manifest ownership cannot be verified (Engine fail-closed state).
+    enum class OwnershipAction
+    {
+        None,
+        Retry,
+        Close
+    };
+
+    void SetProjectOwnershipLost(std::string message)
+    {
+        m_projectOwnershipMessage = std::move(message);
+    }
+
+    OwnershipAction TakeOwnershipAction()
+    {
+        return std::exchange(m_ownershipAction, OwnershipAction::None);
+    }
     std::optional<FileRequest> TakeFileRequest();
     bool HasFileRequest(FileRequestType type) const noexcept;
+    bool QueueFileRequest(FileRequest request);
+    void InvalidateSceneFiles()
+    {
+        m_assetBrowser.InvalidateFileListings();
+    }
+    void ReportLifecycleMessage(std::string message);
+    bool RebindSceneHistoryAfterSaveAs(const FileBackedDemoScene& scene, const std::filesystem::path& previousPath);
+    void DrawMaterialLeaveConfirmation(IDemoScene& scene, const ProjectPaths& projectPaths,
+        const ProjectAssetRegistry& assetRegistry);
     std::optional<AssetBrowser::MaterialCreationRequest> TakeMaterialCreationRequest();
     std::optional<AssetBrowser::MeshImportUnitsRequest> TakeMeshImportUnitsRequest()
     {
@@ -354,6 +420,12 @@ private:
     friend class ViewportPanVerification;
     friend class ViewportGridSnapVerification;
     friend class EditorGridVerification;
+    friend class ProjectIndependentStartupVerification;
+    friend class SceneLifecycleVerification;
+    friend class AssetBrowserSceneVerification;
+    friend class StartupSceneVerification;
+    friend class ProjectSystemWorkflowVerification;
+    friend class ProjectRelaunchVerification;
     friend class SceneDuplicationVerification;
     friend class ScenePhysicsDataVerification;
     friend class PrimitiveCreationVerification;
@@ -469,11 +541,45 @@ private:
     char m_buildTitle[128]="MyGame";
     char m_buildOutput[1024]="";
     BuildGame::Status m_buildGameStatus;
-    std::optional<BuildGame::Settings> m_buildGameRequest;
-    void DrawBuildGame();
+    std::optional<BuildGameRequest> m_buildGameRequest;
+    bool m_buildStartupSceneUnsaved = false;
+    void DrawBuildGame(const IDemoScene& demoScene);
     std::optional<FileRequest> m_fileRequest;
 
     bool m_sceneOperationPending = false;
+    bool m_showProjectSettings = false;
+    std::string m_lifecycleMessage;
+    void DrawLifecycleWindows(const IDemoScene& demoScene);
+
+    // Project Settings: shared game startup scene. Candidates are listed from the Scenes directory
+    // when the window opens or on Refresh, never per frame and without reading scene documents.
+    std::optional<std::filesystem::path> m_startupSceneRequest;
+    std::vector<std::filesystem::path> m_startupSceneCandidates;
+    bool m_startupSceneCandidatesListed = false;
+    std::string m_projectSettingsMessage;
+    bool m_projectSettingsMessageIsError = false;
+    void DrawProjectSettings(const IDemoScene& demoScene);
+    void ListStartupSceneCandidates();
+
+    // Windows .engineproj association: a personal Windows preference, separate from the project.
+    bool m_showFileAssociation = false;
+    bool m_fileAssociationStatusRead = false;
+    bool m_fileAssociationConfirmReplace = false;
+    bool m_fileAssociationPortableAcknowledged = false;
+    ProjectFileAssociation::Status m_fileAssociationStatus;
+    std::filesystem::path m_fileAssociationEffectiveExecutable;
+    std::string m_fileAssociationMessage;
+    void DrawFileAssociation();
+    void RefreshFileAssociationStatus();
+
+    std::string m_projectOwnershipMessage;
+    OwnershipAction m_ownershipAction = OwnershipAction::None;
+    void DrawProjectOwnershipLost();
+    ProjectFileAssociation::RegistryLocation FileAssociationLocation() const;
+#if defined(ENGINE_HAS_VERIFICATION)
+    // Diagnostics drive the real window against an isolated registry key, never the user's classes.
+    std::optional<ProjectFileAssociation::RegistryLocation> m_fileAssociationLocationForVerification;
+#endif
     bool m_showEditorPanel = false;
 
     AssetBrowser m_assetBrowser;
@@ -500,11 +606,11 @@ private:
     bool m_panLeftHeld = false;
     // Session display preference: never reset with scene interactions or authored history.
     bool m_showPhysicsColliders = true;
-    // Session display preference, independent of Snap; default visible.
+    // Display preference, independent of Snap; default visible. Persisted in Editor preferences.
     bool m_showViewportGrid = true;
-    // Session-local gizmo snapping (G.1 translation, G.2 rotation). One master toggle drives
-    // both modes; each has its own interval. The Editor has no preference store, so these reset
-    // on restart and are never written to scenes, cooked payloads or history.
+    // Gizmo snapping (G.1 translation, G.2 rotation). One master toggle drives both modes; each
+    // has its own interval. Persisted only in global Editor preferences (PR.5), never in scenes,
+    // cooked payloads or history.
     bool m_snapEnabled = false;
     float m_translationSnapInterval = ViewportGridSnap::kDefaultInterval;
     float m_rotationSnapIntervalDegrees = ViewportGridSnap::kDefaultRotationIntervalDegrees;
@@ -778,6 +884,9 @@ private:
     static constexpr size_t kSceneHistoryPayloadBytes = 4 * 1024 * 1024;
     std::vector<SceneHistoryEntry> m_sceneHistory;
     std::optional<SceneHistorySession> m_historySession;
+    // History entries keep their original path token; only this authorized current location
+    // follows a successful Save As. Arbitrary path changes still invalidate the session.
+    std::filesystem::path m_historyCurrentScenePath;
     std::optional<HistoryTarget> m_gizmoHistoryTarget;
     std::optional<HistoryTarget> m_fieldHistoryTarget;
     std::string m_sceneHistoryStatus;

@@ -43,6 +43,17 @@ public:
     // Known fields written over the retained document, so unknown members survive.
     nlohmann::json Serialize() const;
 
+    // A copy that differs only in settings.startupScene (an empty path clears it to null). Every
+    // other member of the retained document, including known fields, keeps the value it was read
+    // with. Fails for a path that is not a project-relative .scene path inside the project.
+    std::optional<ProjectManifest> WithStartupScene(
+        const std::filesystem::path& startupScene,
+        std::string& errorMessage) const;
+
+    // Text written for a targeted update: the retained document, indented like new manifests.
+    // Member order and whitespace of the original file are not preserved; values are.
+    std::string ToUpdateText() const;
+
     const AssetID& GetProjectID() const noexcept;
     const std::string& GetDisplayName() const noexcept;
     const ProjectContentPaths& GetContentPaths() const noexcept;

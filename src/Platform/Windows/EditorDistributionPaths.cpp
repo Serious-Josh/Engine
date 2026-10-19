@@ -13,21 +13,39 @@ namespace EditorDistributionPaths
             WindowsWindow::GetExecutableDirectory() / "EnginePortable.marker");
     }
 
+    namespace
+    {
+        std::filesystem::path LocalAppDataDirectory(const char* leafDirectory)
+        {
+            PWSTR localDirectory = nullptr;
+            const HRESULT result = SHGetKnownFolderPath(
+                FOLDERID_LocalAppData, KF_FLAG_CREATE, nullptr, &localDirectory);
+
+            if(FAILED(result))
+            {
+                throw std::runtime_error("Cannot locate writable Local AppData for the Editor.");
+            }
+
+            const auto directory = std::filesystem::path(localDirectory) / "Engine" / leafDirectory;
+            CoTaskMemFree(localDirectory);
+            std::filesystem::create_directories(directory);
+            return directory;
+        }
+    }
+
     std::filesystem::path UserDirectory()
     {
-        PWSTR localDirectory = nullptr;
-        const HRESULT result = SHGetKnownFolderPath(
-            FOLDERID_LocalAppData, KF_FLAG_CREATE, nullptr, &localDirectory);
+        return LocalAppDataDirectory("PortableEditor");
+    }
 
-        if(FAILED(result))
+    std::filesystem::path EditorSettingsDirectory()
+    {
+        if(IsPortable())
         {
-            throw std::runtime_error("Cannot locate writable Local AppData for the portable Editor.");
+            return UserDirectory();
         }
 
-        const auto directory = std::filesystem::path(localDirectory) / "Engine" / "PortableEditor";
-        CoTaskMemFree(localDirectory);
-        std::filesystem::create_directories(directory);
-        return directory;
+        return LocalAppDataDirectory("Editor");
     }
 
     std::filesystem::path RuntimeDirectory()

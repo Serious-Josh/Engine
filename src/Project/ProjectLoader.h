@@ -20,8 +20,8 @@ namespace ProjectLoader
     // Opens an explicitly requested .engineproj for writable Editor use.
     //
     // Order: lock the manifest file, read it through the locked handle, parse it strictly,
-    // then validate the project directory and every content path against the canonical
-    // project root. Nothing is created or written. On failure no lock is retained and
+    // then validate the project directory (which must hold no other .engineproj file) and every
+    // content path against the canonical project root. Nothing is created or written. On failure no lock is retained and
     // errorMessage explains the problem; the caller must not fall back to another project.
     std::optional<OpenedProject> Open(
         const std::filesystem::path& manifestPath,

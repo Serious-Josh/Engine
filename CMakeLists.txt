@@ -81,6 +81,8 @@ add_library(EngineCore OBJECT
     src/Platform/Windows/WindowsWindow.cpp
     src/Platform/Windows/EditorDistributionPaths.cpp
     src/Platform/Windows/CommandLineArguments.cpp
+    src/Platform/Windows/AtomicFileWrite.cpp
+    src/Platform/Windows/ProjectFileAssociation.cpp
     src/Core/Time.cpp
     src/Core/Input.cpp
     src/Core/Log.cpp
@@ -148,6 +150,9 @@ add_library(EngineCore OBJECT
     src/Renderer/Passes/ShadowDenoisePass.cpp
     src/Renderer/ComputePipeline.cpp
     src/Editor/Editor.cpp
+    src/Editor/EditorPreferences.cpp
+    src/Editor/ProjectBrowser.cpp
+    src/Editor/ProjectSettingsWindow.cpp
     src/Editor/TriggerColliderControls.cpp
     src/Editor/CharacterControllerControls.cpp
     src/Editor/CharacterControllerDiagnosticsControls.cpp
@@ -204,9 +209,12 @@ add_library(EngineCore OBJECT
     src/Project/ProjectLocator.cpp
     src/Project/ProjectContext.cpp
     src/Project/ProjectManifest.cpp
+    src/Project/ProjectCreation.cpp
     src/Project/ProjectLock.cpp
     src/Project/ProjectLoader.cpp
     src/Project/EditorCommandLine.cpp
+    src/Project/PersonalSettingsFile.cpp
+    src/Project/ProjectWorkspace.cpp
     src/Scene/FileScene.cpp
     src/Scene/SceneDocumentAdapter.cpp
     src/Scene/SceneObjectResolver.cpp
@@ -229,6 +237,10 @@ add_library(EngineCore OBJECT
     src/Editor/SceneObjectDuplication.cpp
     src/Editor/SceneObjectDuplicationControls.cpp
     src/Engine/EditorMembership.cpp
+    src/Engine/EditorPersonalSettings.cpp
+    src/Engine/EditorSceneLifecycle.cpp
+    src/Engine/EditorProjectSettings.cpp
+    src/Platform/Windows/EditorFileDialogs.cpp
     src/Scene/SceneMembershipPublication.cpp
     src/Scene/MeshResidencyPublication.cpp
     src/Scene/SceneMaterialBindingPublication.cpp

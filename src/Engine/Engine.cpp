@@ -14,6 +14,8 @@
 
 #include "Scene/Scene.h"
 #include "Scene/SceneFileCreation.h"
+#include "Scene/SceneSerializer.h"
+#include "Project/ProjectCreation.h"
 
 #include "Project/ProjectLocator.h"
 #include "Project/ProjectPaths.h"
@@ -41,6 +43,13 @@
 
 namespace
 {
+    std::string ProjectPathText(const std::filesystem::path& path)
+    {
+        const auto text = path.u8string();
+        return {text.begin(), text.end()};
+    }
+
+
     void AcknowledgeDisplacementCompletion(
         Renderer& renderer,
         MirrorTestScene& owner,
@@ -604,6 +613,7 @@ bool Engine::ActivateRequestedFileScene()
             m_demoVertexShader, m_demoPixelShader, &error))
     {
         Log::Error("File scene staging failed; keeping the current scene: " + error);
+        m_editor.ReportLifecycleMessage("Cannot open scene; current scene preserved. " + error);
         m_demoSceneManager.CancelFileSceneRequest();
         return true;
     }
@@ -656,13 +666,14 @@ bool Engine::ActivateRequestedFileScene()
 
         OnFileSceneActivated(started);
         m_editor.OnSceneActivated();
+        RecordLastEditedScene();
         m_renderedSceneStructureRevision = m_demoSceneManager.GetActiveScene().GetScene().GetStructureRevision();
         timing.outcome = "published";
         return true;
     }
 
     Log::Error("Candidate Renderer initialization failed for " +
-               m_demoSceneManager.GetRequestedFileScenePath().string() +
+               ProjectPathText(m_demoSceneManager.GetRequestedFileScenePath()) +
                "; file preserved; attempting checked cleanup.");
 
     if (!m_renderer.CleanupFailedSceneInitialization(candidate->GetScene()))
@@ -707,47 +718,6 @@ bool Engine::ActivateRequestedFileScene()
     m_sceneResourcesReleasedForSwitch = false;
     Log::Info("Previous scene Renderer resources restored after failed file scene activation.");
     return true;
-}
-
-void Engine::QueueEditorSceneOperation()
-{
-    if (!m_pendingEditorSceneOperation)
-    {
-        return;
-    }
-
-    const auto request = std::move(*m_pendingEditorSceneOperation);
-    m_pendingEditorSceneOperation.reset();
-    m_sceneOperationError.clear();
-    std::string error;
-
-    if (request.type == Editor::FileRequestType::Demo)
-    {
-        if (!m_demoSceneManager.RequestScene(request.sceneName))
-        {
-            Log::Error("Failed to request demo scene: " + request.sceneName);
-        }
-
-        return;
-    }
-
-    std::filesystem::path path = request.path;
-
-    if (request.type == Editor::FileRequestType::New)
-    {
-        if (!CreateNewSceneFile(GetActiveProject().GetPaths(), path, &error))
-        {
-            Log::Error("Failed to create scene: " + error);
-            return;
-        }
-
-        Log::Info("Created scene file: " + path.string());
-    }
-
-    if (!m_demoSceneManager.RequestFileScene(path, &error))
-    {
-        Log::Error("Failed to request file scene; any newly created file is preserved: " + error);
-    }
 }
 
 bool Engine::ChangeMeshImportUnits(const ProjectPaths& paths, const AssetBrowser::MeshImportUnitsRequest& request,
@@ -806,144 +776,11 @@ void Engine::ProcessEditorMaterialRequests()
     }
 }
 
-void Engine::ProcessEditorSceneRequests(IDemoScene& activeScene)
-{
-    auto* fileScene = dynamic_cast<FileBackedDemoScene*>(&activeScene);
-
-    if (const auto request = m_editor.TakeFileRequest())
-    {
-        if(m_pendingSceneObjectCreation || m_pendingSceneObjectRestoration || m_pendingSceneObjectDeletion ||
-            m_pendingEditorSceneOperation || m_pendingMaterialAssignment || m_demoSceneManager.HasPendingSceneChange() ||
-            m_editor.HasPendingSceneHistoryOperation())
-        {
-            Log::Error("Scene operation rejected: another operation is pending.");
-        }
-        else if (request->type == Editor::FileRequestType::Save)
-        {
-            std::string error;
-
-            if (!fileScene)
-            {
-                Log::Error("Save rejected: the active scene is not file-backed.");
-            }
-            else if (!fileScene->Save(&error))
-            {
-                Log::Error("Failed to save scene: " + error);
-            }
-            else
-            {
-                Log::Info("Saved file-backed scene: " + fileScene->GetDisplayName());
-            }
-        }
-        else
-        {
-            auto operation = *request;
-            bool valid = true;
-
-            if (operation.type == Editor::FileRequestType::Load)
-            {
-                // Resolve symlinks/junctions before checking component containment.
-                // Save the resolved path so staging does not reuse the menu's alias.
-                std::error_code error;
-                const ProjectPaths& project = GetActiveProject().GetPaths();
-                const auto directory = std::filesystem::canonical(project.GetScenesDirectory(), error);
-
-                if (error || !operation.path.is_absolute() || operation.path.extension() != ".scene")
-                {
-                    valid = false;
-                }
-                else
-                {
-                    const auto path = std::filesystem::canonical(operation.path, error);
-
-                    if (error || path.extension() != ".scene" ||
-                        !std::filesystem::is_regular_file(path, error) || error)
-                    {
-                        valid = false;
-                    }
-                    else
-                    {
-                        const auto relative = path.lexically_relative(directory);
-                        valid = !relative.empty() && !relative.is_absolute();
-
-                        for (const auto& component : relative)
-                        {
-                            if (component == "..")
-                            {
-                                valid = false;
-                            }
-                        }
-
-                        operation.path = path;
-                    }
-                }
-
-                if (!valid)
-                {
-                    Log::Error("Load rejected: select a regular .scene file inside the project's Scenes directory.");
-                }
-            }
-
-            bool dirty = false;
-            std::string error;
-
-            if (valid && fileScene && !fileScene->CheckUnsavedChanges(dirty, &error))
-            {
-                Log::Error("Cannot safely check unsaved scene changes: " + error);
-                valid = false;
-            }
-
-            if (valid)
-            {
-                m_pendingEditorSceneOperation = std::move(operation);
-                m_sceneOperationError.clear();
-
-                if (!dirty)
-                {
-                    QueueEditorSceneOperation();
-                }
-            }
-        }
-    }
-
-    if (!m_pendingEditorSceneOperation)
-    {
-        return;
-    }
-
-    const auto decision = m_editor.DrawSceneChangeConfirmation(m_sceneOperationError);
-
-    if (decision == Editor::SceneChangeDecision::Cancel)
-    {
-        m_pendingEditorSceneOperation.reset();
-        m_sceneOperationError.clear();
-    }
-    else if (decision == Editor::SceneChangeDecision::Discard)
-    {
-        QueueEditorSceneOperation();
-    }
-    else if (decision == Editor::SceneChangeDecision::Save)
-    {
-        if (!fileScene || !fileScene->Save(&m_sceneOperationError))
-        {
-            if (!fileScene)
-            {
-                m_sceneOperationError = "Active scene is no longer file-backed.";
-            }
-
-            Log::Error("Scene switch paused: Save failed: " + m_sceneOperationError);
-        }
-        else
-        {
-            Log::Info("Saved file-backed scene: " + fileScene->GetDisplayName());
-            QueueEditorSceneOperation();
-        }
-    }
-}
-
 void Engine::SetStartupProject(OpenedProject project)
 {
-    ENGINE_ASSERT(m_state == EngineState::Uninitialized);
+    // Before InitializeProject only: from the command line before startup, or in the
+    // no-project state. The context is never replaced once installed.
+    ENGINE_ASSERT(m_state == EngineState::Uninitialized || m_state == EngineState::ProjectIndependent);
     ENGINE_ASSERT(!m_activeProject);
 
     m_activeProject.emplace(std::move(project.context));
@@ -965,12 +802,278 @@ bool Engine::Initialize(bool archiveDiagnostic)
     EngineStartup startup; startup.mode=archiveDiagnostic ? EngineStartup::Mode::ArchiveDiagnostic : EngineStartup::Mode::Editor;
     return Initialize(startup);
 }
+// Startup runs as three phases so each owner is initialized at exactly one boundary:
+// project-independent platform/GPU infrastructure, then the active project, then the scene.
 bool Engine::Initialize(const EngineStartup& startup)
 {
+    if(!InitializeProjectIndependent(startup))
+    {
+        return false;
+    }
+
+    if(startup.mode == EngineStartup::Mode::PackagedRuntime)
+    {
+        Log::Info("Packaged runtime startup: loose project registry, reconciliation and asset scans disabled.");
+        return InitializeScene(SceneSource::Archive);
+    }
+
+    if(startup.projectBrowserWorkflow && !m_activeProject)
+    {
+        return true;
+    }
+
+    if(!InitializeProject())
+    {
+        return false;
+    }
+
+    return startup.projectBrowserWorkflow ? InitializeProjectScene() : InitializeScene(SceneSource::SphereGridDemo);
+}
+
+void Engine::ProcessProjectIndependentFrame()
+{
+    ENGINE_ASSERT(m_state == EngineState::ProjectIndependent || m_state == EngineState::ProjectReady);
+
+    m_time.Update();
+    m_input.Update();
+    m_window.ProcessMessages();
+
+    if(!m_startup.projectBrowserWorkflow || m_window.ShouldClose())
+    {
+        return;
+    }
+
+    if(m_window.GetWidth() == 0 || m_window.GetHeight() == 0)
+    {
+        m_window.WaitForMessage();
+        return;
+    }
+
+    m_renderer.GetDebugUI().BeginFrame();
+    const auto request = m_projectBrowser.Draw(m_editorPreferences, m_window.GetNativeHandle());
+
+    if(!m_renderer.RenderUIOnly())
+    {
+        Log::Error("Project Browser rendering failed; GPU completion may be uncertain.");
+        std::abort();
+    }
+
+    // Initialization runs between submissions, never inside ImGui or renderer recording.
+    if(request)
+    {
+        ProcessProjectBrowserRequest(*request);
+    }
+}
+
+void Engine::ProcessProjectBrowserRequest(const ProjectBrowser::Request& request)
+{
+    if(m_state == EngineState::Running && m_projectCreationPending)
+    {
+        if(request.action == ProjectBrowser::Action::Cancel)
+        {
+            m_projectCreationPending = false;
+            m_pendingEditorSceneOperation.reset();
+        }
+        else if(request.action == ProjectBrowser::Action::Create)
+        {
+            if(!CanPerformSceneLifecycle(m_projectBrowser.message))
+            {
+                return;
+            }
+
+            auto created = ProjectCreation::Create(request.name, request.path, m_projectBrowser.message);
+
+            if(created)
+            {
+                const auto manifest = created->context.GetManifestPath();
+                created.reset(); // The child acquires destination ownership; current ownership stays held.
+                m_projectCreationPending = false;
+                m_pendingEditorSceneOperation.reset();
+                RelaunchEditorProject(manifest, true);
+            }
+        }
+
+        return;
+    }
+
+    if(m_state != EngineState::ProjectIndependent || m_activeProject)
+    {
+        return;
+    }
+
+    if(request.action == ProjectBrowser::Action::Remove)
+    {
+        m_editorPreferences.RemoveRecentProject(request.path);
+        SaveEditorPreferences();
+        return;
+    }
+
+    std::string error;
+    auto opened = request.action == ProjectBrowser::Action::Create ?
+        ProjectCreation::Create(request.name, request.path, error) : ProjectLoader::Open(request.path, error);
+
+    if(!opened)
+    {
+        m_projectBrowser.message = error;
+        return;
+    }
+
+    if(!request.expectedProjectID.empty() &&
+        opened->context.GetManifest()->GetProjectID().ToString() != request.expectedProjectID)
+    {
+        m_projectBrowser.message = "This manifest belongs to a different project. Use Open Project to open it separately.";
+        return;
+    }
+
+    if(request.action == ProjectBrowser::Action::Locate)
+    {
+        // Locate repairs the reference without claiming the project was successfully opened.
+        auto recents = m_editorPreferences.GetRecentProjects();
+
+        for(auto recent : recents)
+        {
+            if(EditorPreferences::SameManifest(recent.manifestPath, request.previousPath))
+            {
+                m_editorPreferences.RemoveRecentProject(request.previousPath);
+                recent.manifestPath = opened->context.GetManifestPath();
+                recent.displayName = opened->context.GetManifest()->GetDisplayName();
+                m_editorPreferences.RecordRecentProject(std::move(recent));
+                SaveEditorPreferences();
+                m_projectBrowser.message = "Project location updated.";
+                break;
+            }
+        }
+
+        return;
+    }
+
+    SetStartupProject(std::move(*opened));
+
+    try
+    {
+        if(InitializeProject() && InitializeProjectScene())
+        {
+            return;
+        }
+    }
+    catch(const std::exception& exception)
+    {
+        Log::Error(std::string("Project initialization failed: ") + exception.what());
+    }
+
+    // Phase 2/3 mutate services that have no verified reset protocol. Fail closed and run
+    // normal checked shutdown; never draw a partially initialized project or offer retry.
+    Log::Error("Project initialization failed after validation. Closing the Editor; see the log for details.");
+    MessageBoxW(static_cast<HWND>(m_window.GetNativeHandle()),
+        L"Project initialization failed after validation. The Editor will close safely. See the log for details.",
+        L"Cannot initialize project", MB_OK | MB_ICONERROR);
+    m_window.Close();
+}
+
+bool Engine::InitializeProjectScene()
+{
+    SceneSource source = SceneSource::CleanUnsaved;
+
+    if(m_projectWorkspace && !m_projectWorkspace->GetLastScene().empty())
+    {
+        std::string error;
+        const auto scenePath = ResolveLastEditedScene(error);
+        SceneDocument document;
+
+        if(scenePath && LoadSceneDocument(*scenePath, document, &error))
+        {
+            m_initialScenePath = *scenePath;
+            source = SceneSource::SavedFile;
+        }
+        else
+        {
+            m_projectNotice = "The last edited scene could not be restored. Opened a clean unsaved scene. " + error;
+            Log::Warning(m_projectNotice);
+        }
+    }
+
+    // Once validated scene data starts allocating resources, failure is fatal to this open;
+    // it must not be disguised as a missing-file fallback.
+    return InitializeScene(source);
+}
+
+bool Engine::RequestCleanScene(std::string& errorMessage)
+{
+    errorMessage.clear();
+
+    if(m_state != EngineState::Running || m_startup.mode != EngineStartup::Mode::Editor || !m_activeProject)
+    {
+        errorMessage = "A clean scene requires a running Editor with an active project.";
+        return false;
+    }
+
+    const bool operationPending = m_pendingSceneObjectCreation || m_pendingSceneObjectRestoration ||
+        m_pendingSceneObjectDeletion || m_pendingEditorSceneOperation || m_pendingMaterialAssignment ||
+        m_pendingEditorMembership || m_demoSceneManager.HasPendingSceneChange() ||
+        m_editor.HasPendingSceneHistoryOperation() || m_editor.HasBlockingMaterialOperation();
+
+    if(operationPending || PhysicsBlocksSceneEdits())
+    {
+        errorMessage = "Finish pending scene operations and stop physics before creating a clean scene.";
+        return false;
+    }
+
+    // There is no Save / Don't Save prompt yet, so unsaved work is never discarded silently.
+    if(const auto* fileScene = dynamic_cast<const FileBackedDemoScene*>(m_demoSceneManager.TryGetActiveScene()))
+    {
+        bool dirty = false;
+
+        if(!fileScene->CheckUnsavedChanges(dirty, &errorMessage))
+        {
+            errorMessage = "Cannot check the active scene for unsaved changes: " + errorMessage;
+            return false;
+        }
+
+        if(dirty)
+        {
+            errorMessage = "The active scene has unsaved changes; save it before creating a clean scene.";
+            return false;
+        }
+    }
+
+    SceneDocument document;
+
+    if(!CreateCleanSceneDocument(document, &errorMessage))
+    {
+        return false;
+    }
+
+    return m_demoSceneManager.RequestUnsavedScene(std::move(document), &errorMessage);
+}
+
+bool Engine::InitializeInitialScene(InitialScene scene)
+{
+    if(m_startup.mode == EngineStartup::Mode::PackagedRuntime)
+    {
+        Log::Error("Packaged runtime selects its scene from the archive.");
+        return false;
+    }
+
+    const SceneSource source = scene == InitialScene::CleanUnsaved ? SceneSource::CleanUnsaved : SceneSource::SphereGridDemo;
+    return InitializeScene(source);
+}
+
+// Phase 1: window, timing, renderer, shader library, demo shaders and window events. Nothing
+// here reads a project, registry or scene; packaged preflight validates its archive first.
+// On success the Engine is in the no-project, no-scene state.
+bool Engine::InitializeProjectIndependent(const EngineStartup& startup)
+{
+    ENGINE_ASSERT(m_state == EngineState::Uninitialized);
+
+    if(m_state != EngineState::Uninitialized)
+    {
+        Log::Error("Project-independent initialization requires an uninitialized Engine.");
+        return false;
+    }
+
+    m_initializationStarted = std::chrono::steady_clock::now();
     m_startup=startup;
     const bool packaged=startup.mode==EngineStartup::Mode::PackagedRuntime;
-    const bool archiveDiagnostic=startup.mode!=EngineStartup::Mode::Editor;
-    std::shared_ptr<const CookedScene::ArchiveScene> archive;
     std::vector<std::byte> shaderBytes;
     std::optional<HDRImageData> environmentImage;
     std::string environmentIdentity;
@@ -980,11 +1083,11 @@ bool Engine::Initialize(const EngineStartup& startup)
         {
             if(!startup.sceneID || startup.width==0 || startup.height==0 || startup.width>8192 || startup.height>8192)
                 throw std::runtime_error("Packaged startup requires a scene ID and dimensions in 1..8192.");
-            archive=CookedScene::OpenArchive(startup.toc,startup.pak,*startup.sceneID);
-            if(!archive->provider->ArchiveEntry(PackagedBootstrap::ShaderID())) throw std::runtime_error("Missing required packaged shader bootstrap entry 00000000-0000-0000-0000-000000000035.");
-            environmentImage=CookedEnvironment::ReadArchive(*archive);
-            environmentIdentity=CookedEnvironment::ArchiveIdentity(*archive);
-            shaderBytes=archive->provider->ReadEntry(PackagedBootstrap::ShaderID(),EngineAssetPak::Type::Shader,1,64*1024*1024);
+            m_startupArchive=CookedScene::OpenArchive(startup.toc,startup.pak,*startup.sceneID);
+            if(!m_startupArchive->provider->ArchiveEntry(PackagedBootstrap::ShaderID())) throw std::runtime_error("Missing required packaged shader bootstrap entry 00000000-0000-0000-0000-000000000035.");
+            environmentImage=CookedEnvironment::ReadArchive(*m_startupArchive);
+            environmentIdentity=CookedEnvironment::ArchiveIdentity(*m_startupArchive);
+            shaderBytes=m_startupArchive->provider->ReadEntry(PackagedBootstrap::ShaderID(),EngineAssetPak::Type::Shader,1,64*1024*1024);
             ShaderLibrary validation;
             if(!validation.InitializePackaged(shaderBytes)) throw std::runtime_error("Invalid packaged shader bootstrap.");
             validation.Shutdown();
@@ -994,20 +1097,160 @@ bool Engine::Initialize(const EngineStartup& startup)
         m_windowProperties.title=startup.gameTitle.empty() ? "Engine Packaged Runtime" : startup.gameTitle;
         m_texturePreparation.RestrictToArchive(); m_meshPreparation.RestrictToArchive();
     }
-    const auto initializationStarted = std::chrono::steady_clock::now();
-    ENGINE_ASSERT(m_state == EngineState::Uninitialized);
 
-    // An explicitly opened project arrives validated and locked through SetStartupProject.
-    // Otherwise this is the single place the running Engine asks ProjectLocator for a root.
-    // Every later project path comes from m_activeProject. Resolving the root performs no
-    // project directory writes; archive diagnostics still skip the loose-project initialization.
     if(packaged && m_activeProject)
     {
         Log::Error("Packaged runtime cannot open a loose project.");
         return false;
     }
 
-    if(!packaged && !m_activeProject)
+    if (!m_window.Initialize(m_windowProperties))
+    {
+        Log::Error("Failed to initialize window.");
+        return false;
+    }
+
+    m_windowInitialized=true;
+    m_time.Initialize();
+
+    const std::filesystem::path executableDirectory = packaged ? std::filesystem::path{} : WindowsWindow::GetExecutableDirectory();
+
+    const std::filesystem::path assetRoot = packaged ? std::filesystem::path{} : executableDirectory / "assets";
+
+    m_rendererAttempted=true;
+    if(!m_renderer.Initialize(m_window.GetNativeHandle(), m_window.GetWidth(), m_window.GetHeight(),
+        assetRoot, shaderBytes, environmentImage ? &*environmentImage : nullptr, environmentIdentity,
+        startup.projectBrowserWorkflow))
+    {
+        Log::Error("Failed to initialize renderer.");
+        return false;
+    }
+
+    // One-time descriptor budget baseline: renderer passes, targets, LUTs, environment and UI,
+    // before any scene, mesh or thumbnail allocation.
+    const auto descriptors = m_renderer.GetResourceDescriptorStatistics();
+    Log::Info("Descriptor heap baseline after renderer initialization: " + std::to_string(descriptors.allocated) +
+        " of " + std::to_string(descriptors.capacity) + " CBV/SRV/UAV descriptors in use.");
+
+    Log::Info(packaged ? "Initializing archived scene." : "Project-independent Editor services initialized.");
+
+    ShaderDescription vertexShaderDescription{};
+
+    vertexShaderDescription.path = "Triangle.hlsl";
+    vertexShaderDescription.entryPoint = "VSMain";
+    vertexShaderDescription.stage = ShaderStage::Vertex;
+
+    m_demoVertexShader = m_renderer.GetShaderLibrary().Load(vertexShaderDescription);
+
+    if (!m_demoVertexShader)
+    {
+        Log::Error("Failed to load demo vertex shader.");
+
+        return false;
+    }
+
+    ShaderDescription pixelShaderDescription{};
+    pixelShaderDescription.path = "Triangle.hlsl";
+
+    pixelShaderDescription.entryPoint = "PSMain";
+    pixelShaderDescription.stage = ShaderStage::Pixel;
+
+    m_demoPixelShader = m_renderer.GetShaderLibrary().Load(pixelShaderDescription);
+
+    if(!m_demoPixelShader)
+    {
+        Log::Error("Failed to load demo pixel shader.");
+
+        return false;
+    }
+
+    m_window.SetEventCallback(
+        [this](const Event& event)
+        {
+            if(m_window.ShouldClose())
+            {
+                return;
+            }
+
+            switch(event.type)
+            {
+            case EventType::WindowResized:
+                m_window.SetSize(event.width, event.height);
+
+                if(event.width > 0 && event.height > 0)
+                {
+                    m_demoSceneManager.SetAspectRatio(static_cast<float>(event.width) /
+
+                                                      static_cast<float>(event.height));
+                }
+
+                if(!m_renderer.Resize(event.width, event.height) ||
+                    (m_startup.mode==EngineStartup::Mode::PackagedRuntime &&
+                        !m_renderer.ResizeScene(event.width, event.height)))
+                {
+                    Log::Error("Renderer resize failed; requesting application shutdown.");
+
+                    m_window.Close();
+                }
+
+                break;
+            case EventType::WindowClose:
+
+                // Unverified ownership: close without the save gate, since no project write is allowed.
+                if(m_state != EngineState::Running || m_startup.mode == EngineStartup::Mode::PackagedRuntime ||
+                    m_projectOwnershipLost || m_editor.RequestApplicationClose())
+                {
+                    m_window.Close();
+                }
+
+                break;
+            case EventType::KeyPressed:
+                m_input.SetKeyState(event.code, true);
+
+                break;
+            case EventType::KeyReleased:
+                m_input.SetKeyState(event.code, false);
+                break;
+            case EventType::MouseButtonPressed:
+                m_input.SetMouseButtonState(event.code, true);
+                break;
+            case EventType::MouseButtonReleased:
+                m_input.SetMouseButtonState(event.code, false);
+                break;
+            case EventType::MouseMoved:
+                m_input.SetMousePosition(event.mouseX, event.mouseY);
+                break;
+            case EventType::MouseScrolled:
+                m_input.SetScroll(event.scrollX, event.scrollY);
+                break;
+            }
+        });
+
+    // Global personal preferences need no project, so they apply before one is chosen.
+    LoadEditorPreferences();
+    ConfigureImGuiSettingsLocation();
+
+    m_state = EngineState::ProjectIndependent;
+    return true;
+}
+
+// Phase 2: the authoritative project context, loose-project storage (recovery, registry,
+// reconciliation) and project-bound Editor/scene-manager configuration. No scene exists yet.
+bool Engine::InitializeProject()
+{
+    if(m_state != EngineState::ProjectIndependent || m_startup.mode == EngineStartup::Mode::PackagedRuntime)
+    {
+        Log::Error("Project initialization requires the project-independent Editor state.");
+        return false;
+    }
+
+    const bool archiveDiagnostic = m_startup.mode != EngineStartup::Mode::Editor;
+
+    // An explicitly opened project arrives validated and locked through SetStartupProject.
+    // Otherwise this is the single place the running Engine asks ProjectLocator for a root.
+    // Every later project path comes from m_activeProject. Resolving the root performs no
+    // project directory writes; archive diagnostics still skip the loose-project initialization.
+    if(!m_activeProject)
     {
         try
         {
@@ -1022,7 +1265,8 @@ bool Engine::Initialize(const EngineStartup& startup)
 
     const auto initializeLooseProject = [&]() -> bool
     {
-    // Initialize persistent project storage before GPU resources.
+    // Recover and load persistent project storage before any scene exists. Window and Renderer
+    // are already initialized but hold no project or scene resources.
     const ProjectPaths& projectPaths = GetActiveProject().GetPaths();
 
     std::string projectError;
@@ -1042,7 +1286,7 @@ bool Engine::Initialize(const EngineStartup& startup)
     }
     else
     {
-        Log::Info("Default project directory: " + projectPaths.GetRoot().string());
+        Log::Info("Default project directory: " + ProjectPathText(projectPaths.GetRoot()));
     }
 
     // Initialize the project asset registry before runtime resources.
@@ -1075,7 +1319,7 @@ bool Engine::Initialize(const EngineStartup& startup)
             return false;
         }
 
-        Log::Info("Loaded project asset registry: " + registryPath.string());
+        Log::Info("Loaded project asset registry: " + ProjectPathText(registryPath));
     }
     else
     {
@@ -1092,7 +1336,7 @@ bool Engine::Initialize(const EngineStartup& startup)
 
         m_projectAssetRegistry = std::move(emptyRegistry);
 
-        Log::Info("Created empty project asset registry: " + registryPath.string());
+        Log::Info("Created empty project asset registry: " + ProjectPathText(registryPath));
     }
 
     ProjectAssetReconciliation::Report reconciliation;
@@ -1177,82 +1421,103 @@ bool Engine::Initialize(const EngineStartup& startup)
         return true;
     };
     if(archiveDiagnostic)
-        Log::Info(packaged ? "Packaged runtime startup: loose project registry, reconciliation and asset scans disabled." :
-            "Archive diagnostic startup: loose project registry, reconciliation and asset scans disabled.");
-    else if(!initializeLooseProject()) return false;
-
-    if (!m_window.Initialize(m_windowProperties))
     {
-        Log::Error("Failed to initialize window.");
+        Log::Info("Archive diagnostic startup: loose project registry, reconciliation and asset scans disabled.");
+    }
+    else if(!initializeLooseProject())
+    {
         return false;
     }
 
-    m_windowInitialized=true;
-    m_time.Initialize();
-
-    const std::filesystem::path executableDirectory = packaged ? std::filesystem::path{} : WindowsWindow::GetExecutableDirectory();
-
-    const std::filesystem::path assetRoot = packaged ? std::filesystem::path{} : executableDirectory / "assets";
-
-    m_rendererAttempted=true;
-    if (!m_renderer.Initialize(m_window.GetNativeHandle(), m_window.GetWidth(), m_window.GetHeight(), assetRoot, shaderBytes, environmentImage?&*environmentImage:nullptr, environmentIdentity))
+    if(!m_renderer.InitializeEditorResources())
     {
-        Log::Error("Failed to initialize renderer.");
+        Log::Error("Failed to initialize project Editor preview resources.");
         return false;
     }
 
-    // One-time descriptor budget baseline: renderer passes, targets, LUTs, environment and UI,
-    // before any scene, mesh or thumbnail allocation.
-    const auto descriptors = m_renderer.GetResourceDescriptorStatistics();
-    Log::Info("Descriptor heap baseline after renderer initialization: " + std::to_string(descriptors.allocated) +
-        " of " + std::to_string(descriptors.capacity) + " CBV/SRV/UAV descriptors in use.");
+    m_editor.ConfigureMaterialThumbnails(m_renderer, GetActiveProject());
 
-    Log::Info(packaged ? "Initializing archived scene." : "Initializing demo scene.");
+    if(!archiveDiagnostic) m_demoSceneManager.SetProjectAssets(GetActiveProject().GetRoot(), m_projectAssetRegistry);
 
-    ShaderDescription vertexShaderDescription{};
+    // Personal workspace state only after the project context is validated and installed.
+    LoadProjectWorkspace();
 
-    vertexShaderDescription.path = "Triangle.hlsl";
-    vertexShaderDescription.entryPoint = "VSMain";
-    vertexShaderDescription.stage = ShaderStage::Vertex;
+    m_state = EngineState::ProjectReady;
+    return true;
+}
 
-    m_demoVertexShader = m_renderer.GetShaderLibrary().Load(vertexShaderDescription);
+// Phase 3: the initial scene, preparation workers, Renderer scene resources and the Running
+// state. Packaged runtime enters from the project-independent state with its archive scene.
+bool Engine::InitializeScene(SceneSource source)
+{
+    const bool packaged = source == SceneSource::Archive;
+    const EngineState requiredState = packaged ? EngineState::ProjectIndependent : EngineState::ProjectReady;
 
-    if (!m_demoVertexShader)
+    if(m_state != requiredState || m_demoSceneManager.TryGetActiveScene())
     {
-        Log::Error("Failed to load demo vertex shader.");
-
-        return false;
-    }
-
-    ShaderDescription pixelShaderDescription{};
-    pixelShaderDescription.path = "Triangle.hlsl";
-
-    pixelShaderDescription.entryPoint = "PSMain";
-    pixelShaderDescription.stage = ShaderStage::Pixel;
-
-    m_demoPixelShader = m_renderer.GetShaderLibrary().Load(pixelShaderDescription);
-
-    if(!m_demoPixelShader)
-    {
-        Log::Error("Failed to load demo pixel shader.");
-
+        Log::Error("Scene initialization requires an initialized project (or packaged archive) and no active scene.");
         return false;
     }
 
     const float aspectRatio = static_cast<float>(m_window.GetWidth()) / static_cast<float>(m_window.GetHeight());
 
-    if(!packaged) m_editor.ConfigureMaterialThumbnails(m_renderer, GetActiveProject());
-
-    if(!archiveDiagnostic) m_demoSceneManager.SetProjectAssets(GetActiveProject().GetRoot(), m_projectAssetRegistry);
     m_demoSceneManager.SetTextureStreamingEnabled(true);
     m_demoSceneManager.SetMeshCPUCache(&m_meshCPUCache);
 
-    const bool sceneInitialized = packaged ? m_demoSceneManager.InitializeArchive(archive,m_renderer.GetDevice(),
-        m_renderer.GetResourceUploader(),m_renderer.GetResourceDescriptorHeap(),m_demoVertexShader,m_demoPixelShader,aspectRatio) :
-        m_demoSceneManager.Initialize(
+    bool sceneInitialized = false;
+
+    switch(source)
+    {
+    case SceneSource::SavedFile:
+    {
+        std::string error;
+        sceneInitialized = m_demoSceneManager.RequestFileScene(m_initialScenePath, &error) &&
+            m_demoSceneManager.StageRequestedFileScene(m_renderer.GetDevice(), m_renderer.GetResourceUploader(),
+                m_renderer.GetResourceDescriptorHeap(), m_demoVertexShader, m_demoPixelShader, &error) &&
+            m_demoSceneManager.CommitStagedFileScene(&error);
+
+        if(!sceneInitialized)
+        {
+            Log::Error("Failed to initialize restored scene: " + error);
+        }
+        else
+        {
+            m_demoSceneManager.SetAspectRatio(aspectRatio);
+        }
+
+        break;
+    }
+    case SceneSource::Archive:
+        sceneInitialized = m_demoSceneManager.InitializeArchive(m_startupArchive, m_renderer.GetDevice(),
+            m_renderer.GetResourceUploader(), m_renderer.GetResourceDescriptorHeap(), m_demoVertexShader,
+            m_demoPixelShader, aspectRatio);
+        break;
+
+    case SceneSource::SphereGridDemo:
+        sceneInitialized = m_demoSceneManager.Initialize(
             "Sphere Grid", m_renderer.GetDevice(), m_renderer.GetResourceUploader(),
             m_renderer.GetResourceDescriptorHeap(), m_demoVertexShader, m_demoPixelShader,
             aspectRatio);
+        break;
+
+    case SceneSource::CleanUnsaved:
+    {
+        SceneDocument document;
+        std::string documentError;
+
+        if(!CreateCleanSceneDocument(document, &documentError))
+        {
+            Log::Error("Failed to create a clean scene document: " + documentError);
+            return false;
+        }
+
+        sceneInitialized = m_demoSceneManager.InitializeUnsaved(std::move(document), m_renderer.GetDevice(),
+            m_renderer.GetResourceUploader(), m_renderer.GetResourceDescriptorHeap(), m_demoVertexShader,
+            m_demoPixelShader, aspectRatio);
+        break;
+    }
+    }
+
     if(!sceneInitialized)
     {
         Log::Error("Failed to initialize demo scene manager.");
@@ -1304,73 +1569,13 @@ bool Engine::Initialize(const EngineStartup& startup)
 
     m_renderedSceneStructureRevision = activeDemo.GetScene().GetStructureRevision();
 
-    m_window.SetEventCallback(
-        [this](const Event& event)
-        {
-            if(m_window.ShouldClose())
-            {
-                return;
-            }
-
-            switch(event.type)
-            {
-            case EventType::WindowResized:
-                m_window.SetSize(event.width, event.height);
-
-                if(event.width > 0 && event.height > 0)
-                {
-                    m_demoSceneManager.SetAspectRatio(static_cast<float>(event.width) /
-
-                                                      static_cast<float>(event.height));
-                }
-
-                if(!m_renderer.Resize(event.width, event.height) ||
-                    (m_startup.mode==EngineStartup::Mode::PackagedRuntime &&
-                        !m_renderer.ResizeScene(event.width, event.height)))
-                {
-                    Log::Error("Renderer resize failed; requesting application shutdown.");
-
-                    m_window.Close();
-                }
-
-                break;
-            case EventType::WindowClose:
-
-                if(m_startup.mode==EngineStartup::Mode::PackagedRuntime || m_editor.RequestApplicationClose())
-                {
-                    m_window.Close();
-                }
-
-                break;
-            case EventType::KeyPressed:
-                m_input.SetKeyState(event.code, true);
-
-                break;
-            case EventType::KeyReleased:
-                m_input.SetKeyState(event.code, false);
-                break;
-            case EventType::MouseButtonPressed:
-                m_input.SetMouseButtonState(event.code, true);
-                break;
-            case EventType::MouseButtonReleased:
-                m_input.SetMouseButtonState(event.code, false);
-                break;
-            case EventType::MouseMoved:
-                m_input.SetMousePosition(event.mouseX, event.mouseY);
-                break;
-            case EventType::MouseScrolled:
-                m_input.SetScroll(event.scrollX, event.scrollY);
-                break;
-            }
-        });
-
     m_state = EngineState::Running;
-    OnFileSceneActivated(initializationStarted);
+    OnFileSceneActivated(m_initializationStarted);
     if(packaged)
     {
         try
         {
-            PopulateArchiveScene(archive);
+            PopulateArchiveScene(m_startupArchive);
             auto* owner = dynamic_cast<FileBackedDemoScene*>(m_demoSceneManager.TryGetActiveScene());
             std::string error;
 
@@ -1384,13 +1589,17 @@ bool Engine::Initialize(const EngineStartup& startup)
         }
         catch(const std::exception& e) { Log::Error(std::string("Packaged scene activation failed: ")+e.what()); return false; }
     }
+    // The active scene owns the archive from here; the startup handle is no longer needed.
+    m_startupArchive.reset();
     Log::Info("Engine initialized.");
+    RecordRecentProject();
     return true;
 }
 
 void Engine::Run()
 {
-    ENGINE_ASSERT(m_state == EngineState::Running);
+    ENGINE_ASSERT(m_state == EngineState::Running ||
+        (m_state == EngineState::ProjectIndependent && m_startup.projectBrowserWorkflow));
 
     CpuTiming::Clock::time_point previousFrameStart;
 
@@ -1408,6 +1617,12 @@ void Engine::Run()
 
     while(!m_window.ShouldClose())
     {
+        if(m_state == EngineState::ProjectIndependent)
+        {
+            ProcessProjectIndependentFrame();
+            continue;
+        }
+
         const auto frameStart = CpuTiming::Clock::now();
         const double frameInterval =
             hasPreviousFrameStart ? std::chrono::duration<double, std::milli>(frameStart - previousFrameStart).count()
@@ -1856,6 +2071,8 @@ void Engine::Frame()
         ProcessEditorPhysicsSimulation(owner ? owner->m_runtime.get() : nullptr, 0.0,
             owner && !owner->IsArchiveActivation());
         m_editor.SuspendViewportInteraction();
+        m_editor.DrawMaterialLeaveConfirmation(activeDemo, GetActiveProject().GetPaths(), m_projectAssetRegistry);
+        ProcessEditorSceneRequests(activeDemo);
         ImGui::EndFrame();
         return;
     }
@@ -1906,6 +2123,23 @@ void Engine::Frame()
                   finalSceneImage.width, finalSceneImage.height, m_time.GetDeltaTime(),
                   inspectorPaths, m_projectAssetRegistry, m_renderer.GetMaterialPreviewImage());
 
+    if(!m_projectNotice.empty())
+    {
+        ImGui::SetNextWindowSize(ImVec2(520, 0), ImGuiCond_FirstUseEver);
+        bool visible = true;
+        ImGui::Begin("Project notification", &visible, ImGuiWindowFlags_AlwaysAutoResize);
+        ImGui::PushTextWrapPos(500);
+        ImGui::TextUnformatted(m_projectNotice.c_str());
+        ImGui::PopTextWrapPos();
+
+        if(ImGui::Button("Dismiss") || !visible)
+        {
+            m_projectNotice.clear();
+        }
+
+        ImGui::End();
+    }
+
     debugUI.DrawPerformanceWindow(environmentNames, m_renderer.GetCurrentEnvironmentIndex(),
                                   m_renderer.GetStatistics());
 
@@ -1924,6 +2158,11 @@ void Engine::Frame()
 
     for (const auto& drop : m_window.TakeFileDrops())
     {
+        if (m_projectOwnershipLost)
+        {
+            continue; // Fail closed: no imports into a project whose ownership is unverified.
+        }
+
         // Win32 drops are client-relative. ImGui's main viewport uses client
         // coordinates in this non-platform-viewport backend, not desktop pixels.
         const ImVec2 origin = ImGui::GetMainViewport()->Pos;
@@ -1931,11 +2170,9 @@ void Engine::Frame()
             origin.y + static_cast<float>(drop.y), inspectorPaths, m_projectAssetRegistry);
     }
 
-    if (m_editor.TakeApplicationCloseApproval())
+    if(m_editor.TakeApplicationCloseApproval())
     {
-        ImGui::EndFrame();
-        m_window.Close();
-        return;
+        m_editor.RequestApplicationClose();
     }
 
     // Queue current Editor intents; their mutation executors run at the next frame boundary.
@@ -2086,7 +2323,9 @@ void Engine::Frame()
     if (const auto build = m_editor.TakeBuildGameRequest())
     {
         std::string error;
-        if (!StartBuildGame(*build, error))
+        bool startupSceneUnsaved = false;
+
+        if (!StartBuildGame(build->settings, error, build->saveStartupScene, &startupSceneUnsaved))
         {
             m_editor.SetBuildGameStatus({false, false, 0, error});
         }
@@ -2094,9 +2333,28 @@ void Engine::Frame()
         {
             m_editor.SetBuildGameStatus(m_buildGame.Poll());
         }
+
+        m_editor.SetBuildStartupSceneUnsaved(startupSceneUnsaved);
+    }
+
+    ProcessProjectOwnership();
+    ProcessPendingRelaunch();
+
+    if (const auto startupScene = m_editor.TakeStartupSceneRequest())
+    {
+        std::string message;
+        const bool changed = SetProjectStartupScene(*startupScene, message);
+        m_editor.OnStartupSceneChanged(changed, std::move(message));
     }
 
     ProcessEditorSceneRequests(activeDemo);
+
+    if(m_window.ShouldClose())
+    {
+        ImGui::EndFrame();
+        return;
+    }
+
     ProcessEditorMaterialRequests();
     m_pendingSavedMaterialRevisions = m_editor.TakeSavedMaterialRevisions();
     m_pendingWorkingMaterialRevisions = m_editor.TakeWorkingMaterialRevisions();
@@ -2326,7 +2584,9 @@ void Engine::Shutdown()
     m_automaticMeshResidency = {};
     m_automaticResidencyIntent = 0;
 
-    const bool partial = m_state == EngineState::Uninitialized;
+    // Before Running no scene was ever published to the Renderer (failed startup, or the
+    // no-project/project-ready states), so there is no scene to drain.
+    const bool partial = m_state != EngineState::Running;
     m_buildGame.Cancel();
     Log::Info("Engine shutdown: starting.");
     if(m_materialPreparation) m_materialPreparation->Shutdown();
@@ -2377,11 +2637,30 @@ void Engine::Shutdown()
         }
     }
 
+    // Personal state is written once here (and at its own change points), never per frame. Safe
+    // after partial startup: each save is a no-op unless its state was loaded.
+    if(!m_editorRelaunchStarted)
+    {
+        SaveEditorPreferences();
+
+        // The workspace lives inside the project; skip it when ownership could not be verified.
+        if(!m_projectOwnershipLost)
+        {
+            SaveProjectWorkspace();
+        }
+    }
+
     m_editor.ResetThumbnailRequests();
     m_demoSceneManager.Shutdown();
     m_meshCPUCache.Clear();
     if(m_rendererAttempted) m_renderer.Shutdown();
     if(m_windowInitialized) m_window.Shutdown();
+
+    if(m_pendingRelaunch)
+    {
+        EditorFileDialogs::CloseChild(m_pendingRelaunch->child); // The child keeps running on its own.
+        m_pendingRelaunch.reset();
+    }
 
     // Released last: every project write (registry, scenes, materials) has finished above.
     m_projectLock.Release();
@@ -4451,24 +4730,111 @@ void Engine::AdvanceAutomaticMeshResidency()
     scheduler.retryAfter = now + std::chrono::seconds(1);
 }
 
-bool Engine::StartBuildGame(BuildGame::Settings settings,std::string& error)
+bool Engine::StartBuildGame(BuildGame::Settings settings, std::string& error, bool saveStartupScene,
+    bool* startupSceneUnsaved)
 {
-    if(m_startup.mode!=EngineStartup::Mode::Editor) { error="Build Game is an editor-only authoring operation."; return false; }
-    if(m_buildGame.Poll().busy) { error="A game build is already running."; return false; }
-    auto* scene=dynamic_cast<FileBackedDemoScene*>(m_demoSceneManager.TryGetActiveScene());
-    if(!scene || scene->IsArchiveActivation() || scene->GetScenePath().empty()) { error="Save a file-backed project scene before building. Procedural demos/unsaved scenes cannot be built."; return false; }
-    if(m_demoSceneManager.HasPendingSceneChange() || m_pendingMaterialAssignment || m_pendingSceneObjectCreation ||
-        m_pendingSceneObjectDeletion || m_pendingSceneObjectRestoration || m_pendingEditorSceneOperation ||
-        m_editor.HasBlockingMaterialOperation() || m_editor.HasBlockingObjectCreation() || m_editor.HasPendingSceneHistoryOperation())
-    { error="Finish pending scene operations and save/discard working material edits before building."; return false; }
-    if(!BuildGame::ValidateTitle(settings.title,error)) return false;
-    const auto& document=scene->m_runtime->GetFileScene().GetDocument();
-    if(document.id.empty()) { error="Current scene has no persistent identity."; return false; }
-    // CaptureSceneDocument in Save includes current camera/transforms, not an old disk revision.
-    if(!scene->Save(&error)) return false;
-    BuildGame::Request request{std::move(settings),scene->m_runtime->GetFileScene().GetDocument(),m_projectAssetRegistry,
-        scene->GetProjectRoot(),WindowsWindow::GetExecutableDirectory()/"assets"/"Shaders",EditorDistributionPaths::RuntimeDirectory()};
-    return m_buildGame.Start(std::move(request),error);
+    if(startupSceneUnsaved)
+    {
+        *startupSceneUnsaved = false;
+    }
+
+    if(m_startup.mode != EngineStartup::Mode::Editor || !m_activeProject)
+    {
+        error = "Build Game is an editor-only authoring operation.";
+        return false;
+    }
+
+    if(m_buildGame.Poll().busy)
+    {
+        error = "A game build is already running.";
+        return false;
+    }
+
+    if(m_projectOwnershipLost)
+    {
+        error = "Project ownership could not be verified; Build Game is disabled. Retry or close the Editor.";
+        return false;
+    }
+
+    const bool sceneOperationPending = m_demoSceneManager.HasPendingSceneChange() || m_pendingMaterialAssignment ||
+        m_pendingSceneObjectCreation || m_pendingSceneObjectDeletion || m_pendingSceneObjectRestoration ||
+        m_pendingEditorSceneOperation || m_editor.HasBlockingMaterialOperation() ||
+        m_editor.HasBlockingObjectCreation() || m_editor.HasPendingSceneHistoryOperation();
+
+    if(sceneOperationPending)
+    {
+        error = "Finish pending scene operations and save/discard working material edits before building.";
+        return false;
+    }
+
+    if(!BuildGame::ValidateTitle(settings.title, error))
+    {
+        return false;
+    }
+
+    BuildStartupScene startup;
+
+    if(!ResolveBuildStartupScene(startup, error))
+    {
+        return false;
+    }
+
+    const auto startupText = startup.path.u8string();
+    const std::string startupName(startupText.begin(), startupText.end());
+
+    // The build reads the saved file. Unsaved edits of the active startup scene are refused unless
+    // the user chose to save them first; an unrelated active scene's dirty state does not matter.
+    if(startup.activeOwner)
+    {
+        bool dirty = false;
+
+        if(!startup.activeOwner->CheckUnsavedChanges(dirty, &error))
+        {
+            return false;
+        }
+
+        if(dirty && !saveStartupScene)
+        {
+            if(startupSceneUnsaved)
+            {
+                *startupSceneUnsaved = true;
+            }
+
+            error = "The startup scene " + startupName + " has unsaved changes. Save it, or choose Save Scene and "
+                "Build; unsaved edits are never packaged.";
+            return false;
+        }
+
+        if(dirty && SaveEditorScene(*startup.activeOwner, false) != SceneSaveResult::Saved)
+        {
+            error = m_sceneOperationError.empty() ?
+                "Saving the startup scene was canceled; the build did not start." :
+                "Saving the startup scene failed; the build did not start: " + m_sceneOperationError;
+            return false;
+        }
+    }
+
+    SceneDocument document;
+
+    if(!LoadSceneDocument(startup.path, document, &error))
+    {
+        error = "Cannot read the startup scene " + startupName + ": " + error;
+        return false;
+    }
+
+    if(document.id.empty())
+    {
+        error = "The startup scene " + startupName + " has no persistent identity.";
+        return false;
+    }
+
+    Log::Info("Build Game startup scene: " + startupName +
+        (startup.configured ? " (configured in the project manifest)." : " (active saved scene fallback)."));
+
+    BuildGame::Request request{std::move(settings), std::move(document), m_projectAssetRegistry,
+        GetActiveProject().GetRoot(), WindowsWindow::GetExecutableDirectory() / "assets" / "Shaders",
+        EditorDistributionPaths::RuntimeDirectory()};
+    return m_buildGame.Start(std::move(request), error);
 }
 
 
