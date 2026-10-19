@@ -94,6 +94,8 @@ bool ValidateSceneDocument(
     }
 
     std::unordered_set<std::string> objectIDs;
+    const SceneObjectDocument* mainCamera = nullptr;
+    std::uint32_t lightCount = 0;
 
     for (const SceneObjectDocument& object : document.objects)
     {
@@ -117,6 +119,24 @@ bool ValidateSceneDocument(
         if(!ValidateSceneObjectComponents(object, errorMessage))
         {
             return false;
+        }
+
+        if(object.camera && object.camera->main)
+        {
+            if(mainCamera)
+            {
+                return Fail(errorMessage, "Multiple Main Cameras: " + mainCamera->id + " and " + object.id);
+            }
+
+            // Disabled cameras retain their designation and count toward uniqueness.
+            mainCamera = &object;
+        }
+
+        // Disabled Lights count too: the bound is the renderer's fixed per-frame light capacity.
+        if(object.light && ++lightCount > MaximumSceneLights)
+        {
+            return Fail(errorMessage, "The scene has more than " + std::to_string(MaximumSceneLights) +
+                " Light components.");
         }
 
         for(const auto& [slotID, reference] : object.materialSlotBindings)
@@ -162,6 +182,16 @@ bool ValidateSceneObjectComponents(const SceneObjectDocument& object, std::strin
 
     std::string componentError;
 
+    if(object.camera && !ValidateCameraComponent(*object.camera, &componentError))
+    {
+        return Fail(errorMessage, "Invalid Camera for object " + object.id + ": " + componentError);
+    }
+
+    if(object.light && !ValidateLightComponent(*object.light, &componentError))
+    {
+        return Fail(errorMessage, "Invalid Light for object " + object.id + ": " + componentError);
+    }
+
     if(object.physics && !Physics::ValidatePhysicsComponent(*object.physics, &componentError))
     {
         return Fail(errorMessage, "Invalid physics for object " + object.id + ": " + componentError);
@@ -183,6 +213,6 @@ bool ValidateSceneObjectComponents(const SceneObjectDocument& object, std::strin
 
 bool ValidateSceneDocumentPersistence(const SceneDocument& document, std::string* errorMessage)
 {
-    // Schema 9 and cooked payload 9 persist parent relationships, so no output flattening guard remains.
+    // Current codecs preserve authored hierarchy and all optional component values.
     return ValidateSceneDocument(document, errorMessage);
 }

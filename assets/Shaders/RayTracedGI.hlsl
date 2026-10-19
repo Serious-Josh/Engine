@@ -1,4 +1,5 @@
 #include "MaterialLighting.hlsli"
+#include "SceneLights.hlsli"
 #include "DiffuseHDRIConfig.hlsli"
 
 #include "GIModeConfig.hlsli"
@@ -74,6 +75,13 @@ struct DirectionalLightConstants
 };
 
 ConstantBuffer<DirectionalLightConstants> lightConstants : register(b1);
+
+cbuffer SceneLightConstants : register(b2)
+{
+    uint sceneLightCount;
+    uint3 sceneLightPadding;
+    GPULight sceneLights[SCENE_LIGHT_CAPACITY];
+};
 
 SamplerState materialSampler : register(s0);
 SamplerState environmentSampler : register(s1);
@@ -396,7 +404,69 @@ float3 ShadeGISecondarySurface(GIPayload surface, float3 secondaryPosition, uint
         environmentRadiance = 0.0f;
     }
 
-    // Invalid or back-facing directional lighting must not suppress environment diffuse.
+    // Local lights use the same packed values and attenuation as deferred direct lighting.
+    // Reject zero contributions before tracing; never truncate the accepted 64-light table.
+    float normalBiasLengthSquared = dot(surface.worldNormal, surface.worldNormal);
+
+    if(!all(isfinite(surface.worldNormal)) || !isfinite(normalBiasLengthSquared) ||
+        normalBiasLengthSquared < 1.0e-8f)
+    {
+        return environmentRadiance;
+    }
+
+    float3 biasNormal = normalize(surface.worldNormal);
+    float3 localRadiance = 0.0f;
+
+    for(uint lightIndex = 0u; lightIndex < min(sceneLightCount, SCENE_LIGHT_CAPACITY); ++lightIndex)
+    {
+        GPULight localLight = sceneLights[lightIndex];
+
+        // The owner is exclusively in b1; non-owner Directionals remain direct-only.
+        if(localLight.type != SCENE_LIGHT_POINT && localLight.type != SCENE_LIGHT_SPOT)
+        {
+            continue;
+        }
+
+        if(!any(localLight.radiance > 0.0f))
+        {
+            continue;
+        }
+
+        float3 directionToLocalLight;
+        float3 incidence = EvaluateSceneLightIncidence(localLight, secondaryPosition, directionToLocalLight);
+        float cosine = saturate(dot(normal, directionToLocalLight));
+
+        if(!all(isfinite(incidence)) || !any(incidence > 0.0f) || cosine <= 0.0f ||
+            dot(biasNormal, directionToLocalLight) <= 0.0f)
+        {
+            continue;
+        }
+
+        // Recompute the segment from the biased origin so its endpoint is the light,
+        // not a parallel ray that can overshoot it or miss a nearby blocker.
+        RayDesc localRay;
+        localRay.Origin = secondaryPosition + biasNormal * 0.001f;
+        float3 segment = localLight.position - localRay.Origin;
+        float segmentLength = length(segment);
+
+        if(!isfinite(segmentLength) || segmentLength <= 0.002f)
+        {
+            continue;
+        }
+
+        localRay.Direction = segment / segmentLength;
+        localRay.TMin = 0.001f;
+        localRay.TMax = segmentLength - 0.001f;
+        GIVisibilityPayload localVisibility;
+        localVisibility.visible = 0u;
+        TraceRay(scene, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER,
+            0xFF, 0, 1, 1, localRay, localVisibility);
+        localRadiance += (diffuseColor / PI) * incidence * cosine * float(localVisibility.visible);
+    }
+
+    environmentRadiance += localRadiance;
+
+    // Invalid or back-facing directional lighting must not suppress environment/local diffuse.
     float lightLengthSquared = dot(lightConstants.lightDirection, lightConstants.lightDirection);
 
     if(!all(isfinite(lightConstants.lightDirection)) || !isfinite(lightLengthSquared) || lightLengthSquared < 1.0e-8f ||

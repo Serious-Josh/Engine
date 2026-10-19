@@ -18,7 +18,9 @@ enum class ColliderOverlayShape : std::uint32_t
 {
     Box = 0,
     Sphere = 1,
-    Capsule = 2
+    Capsule = 2,
+    Cone = 3,  // LIGHT.1 Spot Light: apex at the origin, unit ring at z = 1.
+    Arrows = 4 // LIGHT.1 Directional Light: parallel unit arrows along +Z.
 };
 
 // Also selects the wireframe color in EditorCollider.hlsl; keep the values identical.
@@ -29,7 +31,13 @@ enum class ColliderOverlayRole : std::uint32_t
     CharacterController = 2, // Amber: Character Controller capsule (authored, or accepted runtime pose in Play).
     CharacterAlert = 3,      // Red: capsule whose last step was rejected or left a moving-body overlap Unresolved.
     GroundSupport = 4,       // Yellow: ground support point and normal.
-    CharacterContact = 5     // Magenta: solid contact points and normals.
+    CharacterContact = 5,    // Magenta: solid contact points and normals.
+    CameraFrustum = 6,       // Light grey: CAM.5 Camera frustum schematic.
+    CameraFrustumSelected = 7, // Selection orange: frustum of a selected Camera.
+    CameraFrustumDisabled = 8, // Dim grey: frustum of a disabled Camera, selected or not.
+    Light = 9,                 // Pale yellow: LIGHT.1 Light wireframe.
+    LightSelected = 10,        // Selection orange: wireframe of a selected Light.
+    LightDisabled = 11         // Dim olive grey: wireframe of a disabled Light, selected or not.
 };
 
 // A Capsule needs one value beyond its matrix. The matrix scales uniformly by the radius,
@@ -79,6 +87,18 @@ struct EditorColliderOverlay
         CapsuleRingLineCount + CapsuleLongitudinalLineCount + CapsuleArcLineCount;
     static constexpr unsigned int VerticesPerCapsule = CapsuleLineCount * 2;
 
+    // A unit cone along +Z: a closed ring of radius 1 at z = 1, plus four radial lines from the
+    // apex at the origin to the ring at +X, +Y, -X and -Y.
+    static constexpr unsigned int ConeRingSegments = 64;
+    static constexpr unsigned int ConeRadialLineCount = 4;
+    static constexpr unsigned int VerticesPerCone = (ConeRingSegments + ConeRadialLineCount) * 2;
+
+    // Five parallel arrows along +Z from z = 0 to z = 1 (center and four offsets), each a shaft
+    // plus four head lines.
+    static constexpr unsigned int ArrowCount = 5;
+    static constexpr unsigned int LinesPerArrow = 5;
+    static constexpr unsigned int VerticesPerArrows = ArrowCount * LinesPerArrow * 2;
+
     const Scene* scene = nullptr; // Identity comparison only; not an owning pointer.
     std::uint64_t structureRevision = 0;
     std::uint64_t rendererLifetime = 0;
@@ -90,6 +110,10 @@ struct EditorColliderOverlay
     std::vector<CapsuleColliderOverlay> triggerCapsules;
     // Controller capsules and diagnostic markers, bounded per controller.
     std::vector<ColliderOverlayMarker> characterMarkers;
+    // CAM.5 Camera frusta: unit boxes under projective frustum models (Box shape only).
+    std::vector<ColliderOverlayMarker> cameraFrusta;
+    // LIGHT.1 Light wireframes (Sphere, Cone or Arrows), selected Lights last.
+    std::vector<ColliderOverlayMarker> lightWireframes;
     // Capsule, ground point and normal, and a point and normal per copied contact.
     static constexpr std::size_t MaxMarkersPerCharacter = 3 + 2 * Physics::MaximumCharacterDiagnosticContacts;
 
@@ -104,6 +128,8 @@ struct EditorColliderOverlay
 Vector3 ColliderBoxVertex(unsigned int vertexIndex);
 Vector3 ColliderSphereVertex(unsigned int vertexIndex);
 Vector3 ColliderCapsuleVertex(unsigned int vertexIndex, float halfCylinderHeightInRadii);
+Vector3 ColliderConeVertex(unsigned int vertexIndex);
+Vector3 ColliderArrowsVertex(unsigned int vertexIndex);
 unsigned int ColliderVertexCount(ColliderOverlayShape shape);
 Vector3 ColliderShapeVertex(ColliderOverlayShape shape, unsigned int vertexIndex, float halfCylinderHeightInRadii = 0.0f);
 

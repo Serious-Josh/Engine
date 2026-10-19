@@ -161,7 +161,7 @@ std::size_t EditorColliderOverlay::GetColliderCount() const noexcept
 {
     const std::array counts{boxColliderWorldTransforms.size(), sphereColliderWorldTransforms.size(), capsuleColliders.size(),
         triggerBoxWorldTransforms.size(), triggerSphereWorldTransforms.size(), triggerCapsules.size(),
-        characterMarkers.size()};
+        characterMarkers.size(), cameraFrusta.size(), lightWireframes.size()};
     std::size_t count = 0;
 
     for(const auto size : counts)
@@ -311,6 +311,78 @@ Vector3 ColliderCapsuleVertex(unsigned int vertexIndex, float halfCylinderHeight
     }
 }
 
+Vector3 ColliderConeVertex(unsigned int vertexIndex)
+{
+    if(vertexIndex >= EditorColliderOverlay::VerticesPerCone)
+    {
+        throw std::out_of_range("Collider cone vertex ID");
+    }
+
+    // Ring segments first (the last wraps to point zero), then the radial lines from the apex.
+    // Keep this order and arithmetic identical to ConeEndpoint in HLSL.
+    constexpr unsigned int segmentCount = EditorColliderOverlay::ConeRingSegments;
+    constexpr unsigned int quarterTurnPoints = segmentCount / 4;
+    const unsigned int lineIndex = vertexIndex / 2;
+    const unsigned int endpoint = vertexIndex % 2;
+    unsigned int pointIndex = 0;
+
+    if(lineIndex < segmentCount)
+    {
+        pointIndex = (lineIndex + endpoint) % segmentCount;
+    }
+    else
+    {
+        if(endpoint == 0)
+        {
+            return {0.0f, 0.0f, 0.0f};
+        }
+
+        pointIndex = (lineIndex - segmentCount) * quarterTurnPoints;
+    }
+
+    const float angle = static_cast<float>(pointIndex) * (2.0f * std::numbers::pi_v<float> / segmentCount);
+
+    return {std::cos(angle), std::sin(angle), 1.0f};
+}
+
+Vector3 ColliderArrowsVertex(unsigned int vertexIndex)
+{
+    if(vertexIndex >= EditorColliderOverlay::VerticesPerArrows)
+    {
+        throw std::out_of_range("Collider arrows vertex ID");
+    }
+
+    // Arrow 0 is on the axis; arrows 1-4 are offset to +X, -X, +Y and -Y. Each arrow's lines:
+    // the shaft (tail to tip), then head lines from the tip back towards +X, -X, +Y and -Y.
+    // Keep this order and arithmetic identical to ArrowsEndpoint in HLSL.
+    constexpr float arrowOffset = 0.3f;
+    constexpr float headLength = 0.2f;
+    constexpr float headHalfWidth = 0.08f;
+    const float offsetsX[EditorColliderOverlay::ArrowCount] = {0.0f, arrowOffset, -arrowOffset, 0.0f, 0.0f};
+    const float offsetsY[EditorColliderOverlay::ArrowCount] = {0.0f, 0.0f, 0.0f, arrowOffset, -arrowOffset};
+    const unsigned int lineIndex = vertexIndex / 2;
+    const unsigned int endpoint = vertexIndex % 2;
+    const unsigned int arrowIndex = lineIndex / EditorColliderOverlay::LinesPerArrow;
+    const unsigned int lineInArrow = lineIndex % EditorColliderOverlay::LinesPerArrow;
+    const Vector3 tip{offsetsX[arrowIndex], offsetsY[arrowIndex], 1.0f};
+
+    if(lineInArrow == 0)
+    {
+        return endpoint == 0 ? Vector3{tip.x, tip.y, 0.0f} : tip;
+    }
+
+    if(endpoint == 0)
+    {
+        return tip;
+    }
+
+    const float headX[4] = {headHalfWidth, -headHalfWidth, 0.0f, 0.0f};
+    const float headY[4] = {0.0f, 0.0f, headHalfWidth, -headHalfWidth};
+    const unsigned int headIndex = lineInArrow - 1;
+
+    return {tip.x + headX[headIndex], tip.y + headY[headIndex], 1.0f - headLength};
+}
+
 unsigned int ColliderVertexCount(ColliderOverlayShape shape)
 {
     switch(shape)
@@ -323,6 +395,12 @@ unsigned int ColliderVertexCount(ColliderOverlayShape shape)
 
     case ColliderOverlayShape::Capsule:
         return EditorColliderOverlay::VerticesPerCapsule;
+
+    case ColliderOverlayShape::Cone:
+        return EditorColliderOverlay::VerticesPerCone;
+
+    case ColliderOverlayShape::Arrows:
+        return EditorColliderOverlay::VerticesPerArrows;
 
     default:
         throw std::invalid_argument("Unsupported collider overlay shape");
@@ -341,6 +419,12 @@ Vector3 ColliderShapeVertex(ColliderOverlayShape shape, unsigned int vertexIndex
 
     case ColliderOverlayShape::Capsule:
         return ColliderCapsuleVertex(vertexIndex, halfCylinderHeightInRadii);
+
+    case ColliderOverlayShape::Cone:
+        return ColliderConeVertex(vertexIndex);
+
+    case ColliderOverlayShape::Arrows:
+        return ColliderArrowsVertex(vertexIndex);
 
     default:
         throw std::invalid_argument("Unsupported collider overlay shape");

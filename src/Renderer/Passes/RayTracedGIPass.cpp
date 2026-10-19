@@ -42,7 +42,8 @@ bool RayTracedGIPass::Initialize(
                                           {RootParameterType::DescriptorTable, 1, 0, D3D12_SHADER_VISIBILITY_ALL,
                                            DescriptorRangeType::UnorderedAccess, 1},
                                           {RootParameterType::ConstantBuffer, 0},
-                                          {RootParameterType::ConstantBuffer, 1}};
+                                          {RootParameterType::ConstantBuffer, 1},
+                                          {RootParameterType::ConstantBuffer, 2}};
 
     pipelineDescription.maxPayloadSize = 40; // Hit distance, world normal, UV, material index.
     pipelineDescription.maxAttributeSize = 8;
@@ -145,6 +146,7 @@ void RayTracedGIPass::Execute(
     const RayTracingSceneResources& rayTracingScene,
     D3D12_GPU_VIRTUAL_ADDRESS giConstantsAddress,
     D3D12_GPU_VIRTUAL_ADDRESS lightConstantsAddress,
+    D3D12_GPU_VIRTUAL_ADDRESS sceneLightConstantsAddress,
     unsigned int width,
     unsigned int height)
 {
@@ -163,6 +165,7 @@ void RayTracedGIPass::Execute(
     commandList->SetComputeRootDescriptorTable(2, descriptorHeap.GetGPUHandle(m_hitDistanceTexture.GetUAVIndex()));
     commandList->SetComputeRootConstantBufferView(3, giConstantsAddress);
     commandList->SetComputeRootConstantBufferView(4, lightConstantsAddress);
+    commandList->SetComputeRootConstantBufferView(5, sceneLightConstantsAddress);
 
     m_pipeline.Dispatch(commandList, width, height);
 

@@ -1,6 +1,7 @@
 #include "Engine/BuildGame.h"
 #include "Engine/PackagedBootstrap.h"
 #include "assets/CookedScene.h"
+#include "Scene/RenderView.h"
 #include "assets/CookedEnvironment.h"
 #include "assets/CookedSurface.h"
 #include "assets/ModelImporter.h"
@@ -499,6 +500,13 @@ bool Service::Start(Request request, std::string& error)
     if (request.settings.output.empty())
     {
         error = "Select an output directory.";
+        return false;
+    }
+    // CAM.4 readiness: a new game renders from one enabled, valid Main Camera. Checked before
+    // any staging, so a camera-free scene leaves existing outputs untouched.
+    if (std::string cameraError; !ValidateGameplayMainCamera(request.document, &cameraError))
+    {
+        error = "Build Game requires a Main Camera: " + cameraError;
         return false;
     }
     {

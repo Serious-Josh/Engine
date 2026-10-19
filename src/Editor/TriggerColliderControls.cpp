@@ -254,9 +254,14 @@ void Editor::DrawAddComponentControls(IDemoScene& scene)
         }
 
         const bool controllerAvailable = controllerAbsent && controllerReason.empty();
+        const bool cameraAvailable = !object.camera;
+        const bool cameraMatches = cameraAvailable && std::string_view("camera").find(query) != std::string_view::npos;
+        const bool lightAvailable = !object.light;
+        const bool lightMatches = lightAvailable && std::string_view("light").find(query) != std::string_view::npos;
         const bool triggerMatches = triggerAvailable && std::string_view("trigger collider").find(query) != std::string_view::npos;
         const bool controllerMatches = controllerAbsent && std::string_view("character controller").find(query) != std::string_view::npos;
-        const int eligibleMatches = static_cast<int>(triggerMatches) + static_cast<int>(controllerMatches && controllerAvailable);
+        const int eligibleMatches = static_cast<int>(triggerMatches) + static_cast<int>(controllerMatches && controllerAvailable) +
+            static_cast<int>(cameraMatches) + static_cast<int>(lightMatches);
         ImGui::Separator();
         ImGui::PushItemFlag(ImGuiItemFlags_AutoClosePopups, false);
         const bool triggerSelected = triggerMatches && ImGui::MenuItem("Trigger Collider");
@@ -272,7 +277,10 @@ void Editor::DrawAddComponentControls(IDemoScene& scene)
             }
         }
 
-        if(!triggerAvailable && !controllerAvailable)
+        const bool cameraSelected = cameraMatches && ImGui::MenuItem("Camera");
+        const bool lightSelected = lightMatches && ImGui::MenuItem("Light");
+
+        if(!triggerAvailable && !controllerAvailable && !cameraAvailable && !lightAvailable)
         {
             ImGui::TextDisabled("No components available.");
         }
@@ -285,13 +293,16 @@ void Editor::DrawAddComponentControls(IDemoScene& scene)
         const bool addController = controllerAvailable && controllerMatches &&
             (controllerSelected || (searchEnter && eligibleMatches == 1));
 
+        const bool addCamera = cameraMatches && (cameraSelected || (searchEnter && eligibleMatches == 1));
+        const bool addLight = lightMatches && (lightSelected || (searchEnter && eligibleMatches == 1));
+
         // Enter deactivates the search field; keep it focused when the query selects nothing.
-        if(searchEnter && !addTrigger && !addController)
+        if(searchEnter && !addTrigger && !addController && !addCamera && !addLight)
         {
             m_focusComponentSearch = true;
         }
 
-        if(m_addComponentPopup && (addTrigger || addController))
+        if(m_addComponentPopup && (addTrigger || addController || addCamera || addLight))
         {
             ValidateAddComponentPopup(scene);
             const auto current = ResolveComponentEditTarget(scene);
@@ -308,6 +319,16 @@ void Editor::DrawAddComponentControls(IDemoScene& scene)
                 else if(addController && !latest.characterController && !latest.physics)
                 {
                     committed = CommitObjectCharacterController(scene, *current, std::nullopt, Physics::CharacterControllerComponent{});
+                }
+                else if(addCamera && !latest.camera)
+                {
+                    // Generic Add Component never designates Main; CAM.2 defaults have main=false.
+                    committed = CommitObjectCamera(scene, *current, std::nullopt, CameraComponent{});
+                }
+                else if(addLight && !latest.light)
+                {
+                    // Add Component defaults to a Point Light; the Inspector switches type.
+                    committed = CommitObjectLight(scene, *current, std::nullopt, LightComponent{});
                 }
 
                 if(committed)

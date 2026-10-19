@@ -2,6 +2,8 @@
 
 #include "Scene/Transform.h"
 #include "Scene/DirectionalLight.h"
+#include "Scene/CameraComponent.h"
+#include "Scene/LightComponent.h"
 #include "Physics/PhysicsComponent.h"
 #include "Physics/TriggerColliderComponent.h"
 #include "Physics/CharacterControllerComponent.h"
@@ -48,6 +50,12 @@ struct SceneObjectDocument
     // Generic Optional authored configuration; exclusive with PhysicsComponent.
     std::optional<Physics::CharacterControllerComponent> characterController;
 
+    // Optional authored lens; owns no pose, render target or GPU resources.
+    std::optional<CameraComponent> camera;
+
+    // Optional authored light; owns no GPU resource. Persisted from schema 11 / cooked payload 11.
+    std::optional<LightComponent> light;
+
     // Empty means root; otherwise the exact ID of another object in this scene. Persisted from
     // schema 9 / cooked payload 9; historical versions load every object as a root.
     std::string parentID;
@@ -64,7 +72,9 @@ struct SceneDocument
     static constexpr std::uint32_t kTriggerColliderSchemaVersion = 7;
     static constexpr std::uint32_t kCharacterControllerSchemaVersion = 8;
     static constexpr std::uint32_t kHierarchySchemaVersion = 9;
-    static constexpr std::uint32_t kSchemaVersion = kHierarchySchemaVersion;
+    static constexpr std::uint32_t kCameraSchemaVersion = 10;
+    static constexpr std::uint32_t kLightSchemaVersion = 11;
+    static constexpr std::uint32_t kSchemaVersion = kLightSchemaVersion;
 
     std::uint32_t schemaVersion = kSchemaVersion;
 

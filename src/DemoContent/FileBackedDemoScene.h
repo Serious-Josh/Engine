@@ -107,6 +107,19 @@ public:
     bool SetObjectCharacterController(const SceneObjectMetadata& selection,
         const std::optional<Physics::CharacterControllerComponent>& expected,
         const std::optional<Physics::CharacterControllerComponent>& replacement, std::string* errorMessage = nullptr);
+    bool CaptureCameraInspection(std::string_view objectID, SceneObjectDocument& object) const
+    {
+        size_t index = 0;
+        return m_runtime->CaptureObjectDeletionSnapshot(objectID, object, index);
+    }
+    bool SetObjectCameras(std::span<const SceneCameraChange> changes, std::string* errorMessage = nullptr);
+    bool CaptureLightInspection(std::string_view objectID, SceneObjectDocument& object) const
+    {
+        size_t index = 0;
+        return m_runtime->CaptureObjectDeletionSnapshot(objectID, object, index);
+    }
+    bool SetObjectLight(const SceneObjectMetadata& selection, const std::optional<LightComponent>& expected,
+        const std::optional<LightComponent>& replacement, std::string* errorMessage = nullptr);
     bool ValidateObjectTransform(RenderObjectID index, const Transform& transform, std::string& error) const;
     bool RenameObject(const SceneObjectMetadata& selection, std::string_view expectedName,
         std::string name, std::string* errorMessage = nullptr,

@@ -51,8 +51,64 @@ cbuffer DirectionalLightConstants : register(b2)
     float ambientStrength;
 }
 
+#include "SceneLights.hlsli"
+
+cbuffer SceneLightConstants : register(b3)
+{
+    uint sceneLightCount;
+    uint3 sceneLightPadding;
+
+    GPULight sceneLights[SCENE_LIGHT_CAPACITY];
+}
+
 SamplerState sampler0 : register(s0);
 SamplerState diagnosticEnvironmentSampler : register(s1);
+
+// The material's direct BRDF for one light direction, using exactly the sun path's LUT inputs and
+// per-model evaluation, so table Lights and the sun shade identically.
+float3 EvaluateMaterialDirectBRDF(
+    GPUMaterial gpuMaterial,
+    float3 baseColor,
+    float3 normal,
+    float3 directionToLight,
+    float3 viewDirection,
+    float roughness,
+    float NdotV,
+    Texture2D<float2> brdfIntegrationLUT,
+    Texture2D<float> ggxAverageAlbedoLUT)
+{
+    float NdotL = saturate(dot(normal, directionToLight));
+    float directionalAlbedoLight = 0.0f;
+    float directionalAlbedoView = 0.0f;
+    float averageAlbedo = 0.0f;
+
+    if(NdotL > 0.0f && NdotV > 0.0f)
+    {
+        float2 lightData = brdfIntegrationLUT.SampleLevel(sampler0, float2(NdotL, roughness), 0.0f).rg;
+        float2 viewData = brdfIntegrationLUT.SampleLevel(sampler0, float2(NdotV, roughness), 0.0f).rg;
+        directionalAlbedoLight = lightData.x + lightData.y;
+        directionalAlbedoView = viewData.x + viewData.y;
+        averageAlbedo = ggxAverageAlbedoLUT.SampleLevel(sampler0, float2(roughness, 0.5f), 0.0f).r;
+    }
+
+    if(gpuMaterial.model == 0u)
+    {
+        return EvaluateMetallicRoughnessDirectBRDF(gpuMaterial, baseColor, normal, directionToLight, viewDirection,
+            directionalAlbedoLight, directionalAlbedoView, averageAlbedo);
+    }
+    else if(gpuMaterial.model == 1u)
+    {
+        return EvaluateDielectricDirectBRDF(gpuMaterial, baseColor, normal, directionToLight, viewDirection,
+            directionalAlbedoLight, directionalAlbedoView, averageAlbedo);
+    }
+    else if(gpuMaterial.model == 2u)
+    {
+        return EvaluateConductorDirectBRDF(gpuMaterial, normal, directionToLight, viewDirection,
+            directionalAlbedoLight, directionalAlbedoView, averageAlbedo);
+    }
+
+    return float3(0.0f, 0.0f, 0.0f);
+}
 
 float3 IntegrateDiagnosticHDRIFrame(float3 normal, float3 tangent, float3 bitangent, uint sampleCount, float sourceMip = 0.0f)
 {
@@ -1207,6 +1263,31 @@ float4 PSMain(VSOutput input) : SV_Target0
         lightIntensity *
         NdotL *
         shadowVisibility;
+
+    // LIGHT.1 table Lights: unshadowed direct light only. They are not RTGI inputs, so nothing
+    // here is also counted as indirect light, and material AO stays indirect-only as for the sun.
+    float3 sceneLightDirect = float3(0.0f, 0.0f, 0.0f);
+    uint boundedLightCount = min(sceneLightCount, SCENE_LIGHT_CAPACITY);
+
+    [loop]
+    for(uint lightIndex = 0u; lightIndex < boundedLightCount; ++lightIndex)
+    {
+        GPULight sceneLight = sceneLights[lightIndex];
+        float3 directionToSceneLight;
+        float3 incidentRadiance = EvaluateSceneLightIncidence(sceneLight, worldPosition.xyz, directionToSceneLight);
+        float sceneLightNdotL = saturate(dot(normal, directionToSceneLight));
+
+        if(sceneLightNdotL <= 0.0f || all(incidentRadiance <= 0.0f))
+        {
+            continue;
+        }
+
+        float3 sceneLightBRDF = EvaluateMaterialDirectBRDF(gpuMaterial, baseColor, normal, directionToSceneLight,
+            viewDirection, roughness, NdotV, brdfIntegrationLUT, ggxAverageAlbedoLUT);
+        sceneLightDirect += sceneLightBRDF * incidentRadiance * sceneLightNdotL;
+    }
+
+    directional += sceneLightDirect;
 
     float3 lighting =
         directional +

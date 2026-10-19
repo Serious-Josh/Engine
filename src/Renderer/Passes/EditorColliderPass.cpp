@@ -132,13 +132,17 @@ bool ForEachCollider(const EditorColliderOverlay& overlay, Operation operation)
         return false;
     }
 
-    // Character Controller capsules and diagnostic markers carry their own shape and role.
-    for(const ColliderOverlayMarker& marker : overlay.characterMarkers)
+    // Controller capsules, diagnostic markers, Camera frusta and Light wireframes carry their own
+    // shape and role. Lights draw last, with selected Lights already ordered after the others.
+    for(const auto* markers : {&overlay.characterMarkers, &overlay.cameraFrusta, &overlay.lightWireframes})
     {
-        if(!operation(ColliderDraw{marker.colliderWorldTransform, marker.halfCylinderHeightInRadii}, marker.shape,
-            marker.role))
+        for(const ColliderOverlayMarker& marker : *markers)
         {
-            return false;
+            if(!operation(ColliderDraw{marker.colliderWorldTransform, marker.halfCylinderHeightInRadii}, marker.shape,
+                marker.role))
+            {
+                return false;
+            }
         }
     }
 

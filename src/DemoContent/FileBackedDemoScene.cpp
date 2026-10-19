@@ -754,6 +754,38 @@ bool FileBackedDemoScene::SetObjectCharacterController(const SceneObjectMetadata
     return m_runtime->SetObjectCharacterController(selection, expected, replacement, errorMessage);
 }
 
+bool FileBackedDemoScene::SetObjectCameras(std::span<const SceneCameraChange> changes, std::string* errorMessage)
+{
+    if(!m_initialized || m_objectMutationCandidate)
+    {
+        if(errorMessage)
+        {
+            *errorMessage = "Camera editing requires an initialized scene without pending structure changes.";
+        }
+
+        return false;
+    }
+
+    return m_runtime->SetObjectCameras(changes, errorMessage);
+}
+
+bool FileBackedDemoScene::SetObjectLight(const SceneObjectMetadata& selection,
+    const std::optional<LightComponent>& expected, const std::optional<LightComponent>& replacement,
+    std::string* errorMessage)
+{
+    if(!m_initialized || m_objectMutationCandidate)
+    {
+        if(errorMessage)
+        {
+            *errorMessage = "Light editing requires an initialized scene without pending structure changes.";
+        }
+
+        return false;
+    }
+
+    return m_runtime->SetObjectLight(selection, expected, replacement, errorMessage);
+}
+
 bool FileBackedDemoScene::ValidateObjectTransform(RenderObjectID index, const Transform& transform, std::string& error) const
 {
     const auto identity = m_runtime->GetObjectMetadata(index, &error);

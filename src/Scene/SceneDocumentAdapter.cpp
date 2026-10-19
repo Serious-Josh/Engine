@@ -68,6 +68,8 @@ bool CaptureSceneDocument(
 
     // Authored references and slot overrides survive absent resident geometry.
     // Capture updates transforms/settings only; residency is not serialized.
+    // Optional Camera values remain authored document data, independent of the
+    // fly camera, evaluated physics poses and any future gameplay view override.
     SceneDocument candidate = source;
     candidate.environmentReference=scene.GetEnvironmentReference();
     std::vector<bool> visited(objects.size(), false);
@@ -164,7 +166,8 @@ bool SceneDocumentsEqual(
 
         if (a.id != b.id || a.parentID != b.parentID || a.name != b.name || a.meshReference != b.meshReference ||
             a.materialReference != b.materialReference || a.materialSlotBindings != b.materialSlotBindings ||
-            a.physics != b.physics || a.triggerCollider != b.triggerCollider || a.characterController != b.characterController)
+            a.physics != b.physics || a.triggerCollider != b.triggerCollider ||
+            a.characterController != b.characterController || a.camera != b.camera || a.light != b.light)
         {
             return false;
         }

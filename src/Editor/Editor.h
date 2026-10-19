@@ -140,6 +140,8 @@ public:
     std::optional<PhysicsRequest> TakePhysicsRequest();
     bool CanStartPhysics() const;
     bool ArePhysicsCollidersVisible() const noexcept { return m_showPhysicsColliders; }
+    bool AreCameraFrustaVisible() const noexcept { return m_showCameraFrusta; }
+    bool AreLightWireframesVisible() const noexcept { return m_showLightWireframes; }
     // G.3 viewport grid spacing for this frame: the applied translation snap interval, or empty
     // when the Grid overlay is off or Play mode has locked authored editing.
     std::optional<float> GetViewportGridSpacing() const;
@@ -232,6 +234,20 @@ public:
     };
     std::optional<EmptyObjectCreationRequest> TakeEmptyObjectCreationRequest();
     void OnEmptyObjectCreationFailed(const std::string& error);
+    // Hierarchy "Camera": same eligibility and identity as Empty Object creation. Engine reads
+    // the fly view when it begins creation, so the pose is current and never stored here.
+    using CameraObjectCreationRequest = EmptyObjectCreationRequest;
+    std::optional<CameraObjectCreationRequest> TakeCameraObjectCreationRequest();
+    void OnCameraObjectCreationFailed(const std::string& error);
+    // Hierarchy "Light" entries: same eligibility and identity as Camera creation, plus the type.
+    struct LightObjectCreationRequest
+    {
+        LightType type = LightType::Point;
+        std::uint64_t runtimeIdentity = 0;
+        std::uint64_t historyEpoch = 0;
+    };
+    std::optional<LightObjectCreationRequest> TakeLightObjectCreationRequest();
+    void OnLightObjectCreationFailed(const std::string& error);
     struct MeshCreationRequest
     {
         std::string meshReference;
@@ -455,6 +471,8 @@ private:
     std::optional<MeshCreationRequest> m_meshCreationRequest;
     std::optional<PrimitiveCreationRequest> m_primitiveCreationRequest;
     std::optional<EmptyObjectCreationRequest> m_emptyObjectCreationRequest;
+    std::optional<CameraObjectCreationRequest> m_cameraObjectCreationRequest;
+    std::optional<LightObjectCreationRequest> m_lightObjectCreationRequest;
     std::string m_meshCreationStatus;
 
     std::uint64_t m_meshDragRuntimeIdentity = 0;
@@ -611,6 +629,10 @@ private:
     bool m_panLeftHeld = false;
     // Session display preference: never reset with scene interactions or authored history.
     bool m_showPhysicsColliders = true;
+    // CAM.5 Scene viewport Camera gizmos; session display preference like the collider overlay.
+    bool m_showCameraFrusta = true;
+    // Session-only display preference like Camera Frusta; never authored or persisted.
+    bool m_showLightWireframes = true;
     // Display preference, independent of Snap; default visible. Persisted in Editor preferences.
     bool m_showViewportGrid = true;
     // Gizmo snapping (G.1 translation, G.2 rotation). One master toggle drives both modes; each
@@ -752,6 +774,60 @@ private:
     std::array<float, 11> m_controllerDragDrafts{};
     std::string m_controllerEditStatus;
     std::uint64_t m_controllerControlsRevision = 0;
+    // One logical Camera action. Make Main carries both the previous and new Main, so undo and
+    // redo restore every affected value through one atomic, expected-value-checked runtime edit.
+    struct CameraChange
+    {
+        std::string objectID;
+        std::optional<CameraComponent> before;
+        std::optional<CameraComponent> after;
+    };
+    struct CameraEdit
+    {
+        SceneHistorySession session;
+        std::vector<CameraChange> changes;
+    };
+    void DrawObjectCameraControls(IDemoScene& scene);
+    // Each change's selection is resolved by the caller this frame; nothing is retained.
+    bool CommitObjectCameras(IDemoScene& scene, std::span<const SceneCameraChange> changes);
+    bool CommitObjectCamera(IDemoScene& scene, const SceneObjectMetadata& selection,
+        const std::optional<CameraComponent>& before, const std::optional<CameraComponent>& after);
+    // Designates the selected Camera Main (clearing any other Main) or clears its designation.
+    bool CommitCameraMainDesignation(IDemoScene& scene, const SceneObjectMetadata& selection, bool main);
+    static size_t CameraEditPayloadBytes(const CameraEdit& edit);
+    void ValidateCameraManagementPopup(IDemoScene& scene);
+    void DismissCameraManagementPopup();
+    std::optional<SceneObjectMetadata> m_cameraInspection;
+    std::optional<CameraComponent> m_cameraInspectedValue;
+    std::uint64_t m_cameraInspectionEpoch = 0;
+    // Displayed units (FOV in degrees), committed only when a numeric edit transaction completes.
+    std::array<float, 3> m_cameraDragDrafts{};
+    std::string m_cameraEditStatus;
+    std::uint64_t m_cameraControlsRevision = 0;
+    // LIGHT.1: one complete Light replacement (add, edit, type switch or remove) per entry.
+    struct LightEdit
+    {
+        SceneHistorySession session;
+        std::string objectID;
+        std::optional<LightComponent> before;
+        std::optional<LightComponent> after;
+    };
+    void DrawObjectLightControls(IDemoScene& scene);
+    bool CommitObjectLight(IDemoScene& scene, const SceneObjectMetadata& selection,
+        const std::optional<LightComponent>& before, const std::optional<LightComponent>& after);
+    static size_t LightEditPayloadBytes(const LightEdit& edit);
+    void ValidateLightManagementPopup(IDemoScene& scene);
+    void DismissLightManagementPopup();
+    std::optional<SceneObjectMetadata> m_lightInspection;
+    std::optional<LightComponent> m_lightInspectedValue;
+    std::uint64_t m_lightInspectionEpoch = 0;
+    // Displayed units (angles in degrees): intensity, range, inner and outer cone angle.
+    std::array<float, 4> m_lightDragDrafts{};
+    // Color gesture draft: edited live in the widget, committed once when the gesture ends.
+    Vector3 m_lightColorDraft{1.0f, 1.0f, 1.0f};
+    bool m_lightColorGestureActive = false;
+    std::string m_lightEditStatus;
+    std::uint64_t m_lightControlsRevision = 0;
     // CM.9: read-only runtime diagnostics and the explicitly activated diagnostic drive.
     bool ViewportOwnsKeyboard() const;
     void DisableCharacterDrive(std::string reason);
@@ -805,6 +881,8 @@ private:
     std::optional<ComponentPopupTarget> m_addComponentPopup;
     std::optional<ComponentPopupTarget> m_triggerManagementPopup;
     std::optional<ComponentPopupTarget> m_controllerManagementPopup;
+    std::optional<ComponentPopupTarget> m_cameraManagementPopup;
+    std::optional<ComponentPopupTarget> m_lightManagementPopup;
     std::array<char, 128> m_componentSearch{};
     bool m_focusComponentSearch = false;
     struct RenameObject
@@ -849,7 +927,7 @@ private:
     using SceneHistoryCommand = std::variant<std::unique_ptr<PhysicsComponentEdit>,
         std::unique_ptr<TriggerColliderEdit>, std::unique_ptr<CharacterControllerEdit>, TransformEdit, std::unique_ptr<GroupTransformEdit>,
         std::unique_ptr<ObjectDeletion>, std::unique_ptr<RenameObject>, std::unique_ptr<ReorderObjects>,
-        std::unique_ptr<MaterialBindingsEdit>>;
+        std::unique_ptr<MaterialBindingsEdit>, std::unique_ptr<CameraEdit>, std::unique_ptr<LightEdit>>;
     struct SceneHistoryEntry
     {
         SceneHistoryCommand command;

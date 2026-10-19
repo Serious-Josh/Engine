@@ -21,9 +21,11 @@ constexpr char CapsuleRotationMagic[] = "ENGSCN05";
 constexpr char ContactEventsMagic[] = "ENGSCN06";
 constexpr char TriggerColliderMagic[] = "ENGSCN07";
 constexpr char CharacterControllerMagic[] = "ENGSCN08";
-constexpr char Magic[] = "ENGSCN09";
+constexpr char HierarchyMagic[] = "ENGSCN09";
+constexpr char CameraMagic[] = "ENGSCN10";
+constexpr char Magic[] = "ENGSCN11";
 
-// Per-object hierarchy marker. Every version writes it first; only payload 9 may carry a parent,
+// Per-object hierarchy marker. Every version writes it first; payloads 9+ may carry a parent,
 // whose exact object ID follows the object name. Runtime slots are never encoded.
 constexpr std::uint64_t RootMarker = UINT32_MAX;
 constexpr std::uint64_t ParentMarker = 1;
@@ -438,6 +440,117 @@ std::optional<Physics::CharacterControllerComponent> ReadCharacterController(Rea
     return component;
 }
 
+// V10 Camera: u32 presence; when present, u32 record length (24), then
+// u32 enabled, u32 projection, float32 FOV/near/far, u32 main. No native padding.
+void WriteCameraComponent(Writer& writer, const std::optional<CameraComponent>& camera)
+{
+    writer.WriteUnsigned(camera.has_value() ? 1 : 0, 4);
+
+    if(!camera)
+    {
+        return;
+    }
+
+    writer.WriteUnsigned(24, 4);
+    writer.WriteUnsigned(camera->enabled ? 1 : 0, 4);
+    writer.WriteUnsigned(static_cast<std::uint32_t>(camera->projection), 4);
+    writer.WriteFloat(camera->verticalFov);
+    writer.WriteFloat(camera->nearPlane);
+    writer.WriteFloat(camera->farPlane);
+    writer.WriteUnsigned(camera->main ? 1 : 0, 4);
+}
+
+std::optional<CameraComponent> ReadCameraComponent(Reader& reader)
+{
+    const auto presence = reader.ReadUnsigned(4);
+    Require(presence <= 1, "Invalid cooked Camera presence flag.");
+
+    if(presence == 0)
+    {
+        return std::nullopt;
+    }
+
+    Require(reader.ReadUnsigned(4) == 24, "Invalid cooked Camera record length.");
+    const auto enabled = reader.ReadUnsigned(4);
+    const auto projection = reader.ReadUnsigned(4);
+    Require(enabled <= 1, "Invalid cooked Camera enabled flag.");
+    Require(projection == static_cast<std::uint32_t>(CameraProjection::Perspective),
+        "Unsupported cooked Camera projection.");
+
+    CameraComponent camera;
+    camera.enabled = enabled != 0;
+    camera.projection = CameraProjection::Perspective;
+    camera.verticalFov = reader.ReadFloat();
+    camera.nearPlane = reader.ReadFloat();
+    camera.farPlane = reader.ReadFloat();
+    const auto main = reader.ReadUnsigned(4);
+    Require(main <= 1, "Invalid cooked Camera Main flag.");
+    camera.main = main != 0;
+    std::string error;
+
+    if(!ValidateCameraComponent(camera, &error))
+    {
+        throw std::runtime_error("Invalid cooked Camera: " + error);
+    }
+
+    return camera;
+}
+
+// V11 Light: u32 presence; when present, u32 record length (36), then u32 enabled, u32 type,
+// float32 color RGB, intensity, range, inner and outer cone half-angles. No native padding.
+void WriteLightComponent(Writer& writer, const std::optional<LightComponent>& light)
+{
+    writer.WriteUnsigned(light.has_value() ? 1 : 0, 4);
+
+    if(!light)
+    {
+        return;
+    }
+
+    writer.WriteUnsigned(36, 4);
+    writer.WriteUnsigned(light->enabled ? 1 : 0, 4);
+    writer.WriteUnsigned(static_cast<std::uint32_t>(light->type), 4);
+    writer.WriteVector(light->color);
+    writer.WriteFloat(light->intensity);
+    writer.WriteFloat(light->range);
+    writer.WriteFloat(light->innerConeAngle);
+    writer.WriteFloat(light->outerConeAngle);
+}
+
+std::optional<LightComponent> ReadLightComponent(Reader& reader)
+{
+    const auto presence = reader.ReadUnsigned(4);
+    Require(presence <= 1, "Invalid cooked Light presence flag.");
+
+    if(presence == 0)
+    {
+        return std::nullopt;
+    }
+
+    Require(reader.ReadUnsigned(4) == 36, "Invalid cooked Light record length.");
+    const auto enabled = reader.ReadUnsigned(4);
+    const auto type = reader.ReadUnsigned(4);
+    Require(enabled <= 1, "Invalid cooked Light enabled flag.");
+    Require(type <= static_cast<std::uint32_t>(LightType::Directional), "Unsupported cooked Light type.");
+
+    LightComponent light;
+    light.enabled = enabled != 0;
+    light.type = static_cast<LightType>(type);
+    light.color = reader.ReadVector();
+    light.intensity = reader.ReadFloat();
+    light.range = reader.ReadFloat();
+    light.innerConeAngle = reader.ReadFloat();
+    light.outerConeAngle = reader.ReadFloat();
+    std::string error;
+
+    if(!ValidateLightComponent(light, &error))
+    {
+        throw std::runtime_error("Invalid cooked Light: " + error);
+    }
+
+    return light;
+}
+
 std::vector<std::byte> Encode(const Metadata& sceneMetadata, const Policy& policy)
 {
     std::string persistenceError;
@@ -526,6 +639,8 @@ std::vector<std::byte> Encode(const Metadata& sceneMetadata, const Policy& polic
         WritePhysicsComponent(writer, object.physics);
         WriteTriggerCollider(writer, object.triggerCollider);
         WriteCharacterController(writer, object.characterController);
+        WriteCameraComponent(writer, object.camera);
+        WriteLightComponent(writer, object.light);
     }
 
     if (sceneMetadata.environment)
@@ -687,6 +802,14 @@ Metadata Decode(std::span<const std::byte> bytes, const Policy& policy)
     {
         expectedMagic = CharacterControllerMagic;
     }
+    else if(payloadVersion == HierarchyVersion)
+    {
+        expectedMagic = HierarchyMagic;
+    }
+    else if(payloadVersion == CameraVersion)
+    {
+        expectedMagic = CameraMagic;
+    }
 
     Require(magic == expectedMagic, "Invalid cooked scene magic/version pair.");
     // Keep this short-circuit read: a bad header size does not consume the length.
@@ -810,6 +933,30 @@ Metadata Decode(std::span<const std::byte> bytes, const Policy& policy)
             catch(const std::exception& exception)
             {
                 throw std::runtime_error("Invalid cooked controller for object " + object.id + ": " + exception.what());
+            }
+        }
+
+        if(payloadVersion >= CameraVersion)
+        {
+            try
+            {
+                object.camera = ReadCameraComponent(reader);
+            }
+            catch(const std::exception& exception)
+            {
+                throw std::runtime_error("Invalid cooked Camera for object " + object.id + ": " + exception.what());
+            }
+        }
+
+        if(payloadVersion >= LightVersion)
+        {
+            try
+            {
+                object.light = ReadLightComponent(reader);
+            }
+            catch(const std::exception& exception)
+            {
+                throw std::runtime_error("Invalid cooked Light for object " + object.id + ": " + exception.what());
             }
         }
 

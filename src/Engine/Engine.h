@@ -297,8 +297,25 @@ class Engine
     SceneMembershipPublication m_editorMembership;
     std::optional<EditorMembershipOperation> m_pendingEditorMembership;
     std::optional<EditorColliderOverlay> CaptureEditorColliderOverlayForFrame(const FileSceneRuntime*, bool editableScene) const;
+    void ReportCameraFrustumOmissions(const std::vector<std::string>& rejected) const;
+    // Last logged set of omitted Camera frusta; display bookkeeping only.
+    mutable std::string m_cameraFrustumOmissions;
+    // LIGHT.1: this frame's lighting snapshot for any file-backed scene (Editor or packaged).
+    // A failed capture yields a dark, component-free snapshot rather than the legacy sun.
+    SceneLightingSnapshot CaptureSceneLightingForFrame(const FileSceneRuntime& runtime) const;
+    // Bounded diagnostics, logged only when the named set changes, never once per frame.
+    void ReportLightOmissions(const std::vector<std::string>& rejected, const char* context,
+        std::string& lastReported) const;
+    mutable std::string m_lightingOmissions;
+    mutable std::string m_lightWireframeOmissions;
+    mutable std::string m_lightingCaptureError;
     bool BeginPrimitiveCreation(const Editor::PrimitiveCreationRequest&, std::string& error);
     bool BeginEmptyObjectCreation(const Editor::EmptyObjectCreationRequest&, std::string& error);
+    bool BeginCameraObjectCreation(const Editor::CameraObjectCreationRequest&, std::string& error);
+    bool BeginLightObjectCreation(const Editor::LightObjectCreationRequest&, std::string& error);
+    // CAM.4 packaged admission; sets m_packagedMainCamera for the frame loop.
+    bool AdmitPackagedMainCamera(const FileSceneRuntime& runtime, std::uint32_t payloadVersion, std::string& error);
+    bool m_packagedMainCamera = false;
 
     // Checked insertion of one new authored object at the end of the scene, selected after
     // creation, as one history entry. prepareObject builds it from the captured document.

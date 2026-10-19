@@ -13,12 +13,16 @@ cbuffer ColliderConstants : register(b0)
 static const uint ColliderShapeBox = 0;
 static const uint ColliderShapeSphere = 1;
 static const uint ColliderShapeCapsule = 2;
+static const uint ColliderShapeCone = 3;
+static const uint ColliderShapeArrows = 4;
 
 static const uint SphereSegmentsPerCircle = 64;
 static const uint CapsuleRingSegments = 64;
 static const uint CapsuleArcSegments = CapsuleRingSegments / 2;
 static const uint CapsuleRingLineCount = 2 * CapsuleRingSegments;
 static const uint CapsuleLongitudinalLineCount = 4;
+static const uint ConeRingSegments = 64;
+static const uint LinesPerArrow = 5;
 static const float Pi = 3.14159265358979323846;
 static const float TwoPi = 6.28318530717958647692;
 
@@ -127,6 +131,63 @@ float3 CapsuleEndpoint(uint vertexIndex, float halfHeight)
     }
 }
 
+float3 ConeEndpoint(uint vertexIndex)
+{
+    // Unit cone along +Z: ring segments at z = 1 (the last wraps to point zero), then four
+    // radial lines from the apex. Matches ColliderConeVertex on CPU.
+    uint lineIndex = vertexIndex / 2;
+    uint endpoint = vertexIndex % 2;
+    uint pointIndex = 0;
+
+    if(lineIndex < ConeRingSegments)
+    {
+        pointIndex = (lineIndex + endpoint) % ConeRingSegments;
+    }
+    else
+    {
+        if(endpoint == 0)
+        {
+            return float3(0.0, 0.0, 0.0);
+        }
+
+        pointIndex = (lineIndex - ConeRingSegments) * (ConeRingSegments / 4);
+    }
+
+    float angle = float(pointIndex) * (TwoPi / ConeRingSegments);
+
+    return float3(cos(angle), sin(angle), 1.0);
+}
+
+float3 ArrowsEndpoint(uint vertexIndex)
+{
+    // Five parallel arrows along +Z (axis, then +X, -X, +Y, -Y offsets): a shaft, then four
+    // head lines from the tip. Matches ColliderArrowsVertex on CPU.
+    const float arrowOffset = 0.3;
+    const float headLength = 0.2;
+    const float headHalfWidth = 0.08;
+    const float2 offsets[5] = {float2(0.0, 0.0), float2(arrowOffset, 0.0), float2(-arrowOffset, 0.0),
+        float2(0.0, arrowOffset), float2(0.0, -arrowOffset)};
+    const float2 headDirections[4] = {float2(1.0, 0.0), float2(-1.0, 0.0), float2(0.0, 1.0), float2(0.0, -1.0)};
+
+    uint lineIndex = vertexIndex / 2;
+    uint endpoint = vertexIndex % 2;
+    uint arrowIndex = lineIndex / LinesPerArrow;
+    uint lineInArrow = lineIndex % LinesPerArrow;
+    float3 tip = float3(offsets[arrowIndex], 1.0);
+
+    if(lineInArrow == 0)
+    {
+        return endpoint == 0 ? float3(tip.xy, 0.0) : tip;
+    }
+
+    if(endpoint == 0)
+    {
+        return tip;
+    }
+
+    return float3(tip.xy + headDirections[lineInArrow - 1] * headHalfWidth, 1.0 - headLength);
+}
+
 // Matches ColliderOverlayRole in EditorColliderOverlay.h.
 float4 ColliderRoleColor(uint role)
 {
@@ -142,6 +203,18 @@ float4 ColliderRoleColor(uint role)
         return float4(1.0, 0.95, 0.2, 1.0);                             // Ground support: yellow.
     case 5:
         return float4(0.95, 0.3, 0.85, 1.0);                            // Contacts: magenta.
+    case 6:
+        return float4(0.82, 0.84, 0.88, 1.0);                           // Camera frustum: light grey.
+    case 7:
+        return float4(1.0, 0.72, 0.0, 1.0);                             // Selected Camera: selection orange.
+    case 8:
+        return float4(0.38, 0.39, 0.42, 1.0);                           // Disabled Camera: dim grey.
+    case 9:
+        return float4(0.95, 0.88, 0.55, 1.0);                           // Light: pale yellow.
+    case 10:
+        return float4(1.0, 0.72, 0.0, 1.0);                             // Selected Light: selection orange.
+    case 11:
+        return float4(0.40, 0.39, 0.33, 1.0);                           // Disabled Light: dim olive grey.
     default:
         return float4(0.1, 1.0, 0.35, 1.0);                             // Solid: green.
     }
@@ -160,6 +233,14 @@ ColliderVertexOutput VSMain(uint vertexIndex : SV_VertexID)
     if(colliderShape == ColliderShapeCapsule)
     {
         localPosition = CapsuleEndpoint(vertexIndex, capsuleHalfCylinderHeight);
+    }
+    else if(colliderShape == ColliderShapeCone)
+    {
+        localPosition = ConeEndpoint(vertexIndex);
+    }
+    else if(colliderShape == ColliderShapeArrows)
+    {
+        localPosition = ArrowsEndpoint(vertexIndex);
     }
     else if(colliderShape == ColliderShapeSphere)
     {

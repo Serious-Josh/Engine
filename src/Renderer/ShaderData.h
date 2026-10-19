@@ -138,6 +138,38 @@ struct DirectionalLightConstants
     float ambientStrength;
 };
 
+// LIGHT.1 deferred light record; identical layout to GPULight in DeferredLighting.hlsl.
+// type: 0 Point, 1 Spot, 2 Directional (LightType). direction is the direction light travels.
+// radiance is color * intensity. Cone cosines are used by Spot only.
+struct GPULight
+{
+    float position[3];
+    std::uint32_t type;
+
+    float direction[3];
+    float range;
+
+    float radiance[3];
+    float cosOuterCone;
+
+    float cosInnerCone;
+    float padding[3];
+
+    bool operator==(const GPULight&) const = default;
+};
+
+// Root constant buffer b3 of deferred lighting and b2 of RTGI. Only lightCount records are
+// read; the table is never partially filled with stale values.
+struct SceneLightConstants
+{
+    static constexpr std::uint32_t Capacity = 64;
+
+    std::uint32_t lightCount;
+    std::uint32_t padding[3];
+
+    GPULight lights[Capacity];
+};
+
 struct GPUMaterial
 {
     unsigned int model;
@@ -215,6 +247,12 @@ static_assert(offsetof(GPUMaterial, heightTextureIndex) == 96);
 static_assert(offsetof(GPUMaterial, heightScale) == 100);
 static_assert(offsetof(GPUMaterial, heightBias) == 104);
 static_assert(sizeof(ShadowConstants) == 256);
+static_assert(sizeof(GPULight) == 64);
+static_assert(offsetof(GPULight, direction) == 16);
+static_assert(offsetof(GPULight, radiance) == 32);
+static_assert(offsetof(GPULight, cosInnerCone) == 48);
+static_assert(sizeof(SceneLightConstants) == 16 + 64 * SceneLightConstants::Capacity);
+static_assert(offsetof(SceneLightConstants, lights) == 16);
 static_assert(sizeof(ReflectionConstants) == 160);
 static_assert(sizeof(RayTracingInstanceData) == 48);
 static_assert(offsetof(RayTracingInstanceData, triangleSlotBufferIndex) == 32);

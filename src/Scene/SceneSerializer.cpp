@@ -386,6 +386,113 @@ namespace
         return component;
     }
 
+    // Schema 11 Light: exactly these fields, every field for every type. Type is a name so the
+    // file stays readable; angles are radians like the Camera FOV.
+    Json ToJson(const LightComponent& light)
+    {
+        return {
+            {"enabled", light.enabled},
+            {"type", LightTypeName(light.type)},
+            {"color", ToJson(light.color)},
+            {"intensity", light.intensity},
+            {"range", light.range},
+            {"innerConeAngle", light.innerConeAngle},
+            {"outerConeAngle", light.outerConeAngle}
+        };
+    }
+
+    LightComponent ReadLightComponent(const Json& value)
+    {
+        ValidateFields(value, {"enabled", "type", "color", "intensity", "range", "innerConeAngle", "outerConeAngle"});
+
+        if(!value.at("enabled").is_boolean())
+        {
+            throw std::runtime_error("Light enabled must be a boolean.");
+        }
+
+        if(!value.at("type").is_string())
+        {
+            throw std::runtime_error("Light type must be Point, Spot or Directional.");
+        }
+
+        LightComponent light;
+        const std::string typeName = value.at("type").get<std::string>();
+
+        if(typeName == "Point")
+        {
+            light.type = LightType::Point;
+        }
+        else if(typeName == "Spot")
+        {
+            light.type = LightType::Spot;
+        }
+        else if(typeName == "Directional")
+        {
+            light.type = LightType::Directional;
+        }
+        else
+        {
+            throw std::runtime_error("Light type must be Point, Spot or Directional.");
+        }
+
+        light.enabled = value.at("enabled").get<bool>();
+        light.color = ReadVector3(value.at("color"));
+        light.intensity = ReadNumber(value.at("intensity"), "Light intensity");
+        light.range = ReadNumber(value.at("range"), "Light range");
+        light.innerConeAngle = ReadNumber(value.at("innerConeAngle"), "Light inner cone angle");
+        light.outerConeAngle = ReadNumber(value.at("outerConeAngle"), "Light outer cone angle");
+        std::string error;
+
+        if(!ValidateLightComponent(light, &error))
+        {
+            throw std::runtime_error(error);
+        }
+
+        return light;
+    }
+
+    Json ToJson(const CameraComponent& camera)
+    {
+        return {
+            {"enabled", camera.enabled},
+            {"projection", "Perspective"},
+            {"verticalFov", camera.verticalFov},
+            {"nearPlane", camera.nearPlane},
+            {"farPlane", camera.farPlane},
+            {"main", camera.main}
+        };
+    }
+
+    CameraComponent ReadCameraComponent(const Json& value)
+    {
+        ValidateFields(value, {"enabled", "projection", "verticalFov", "nearPlane", "farPlane", "main"});
+
+        if(!value.at("enabled").is_boolean() || !value.at("main").is_boolean())
+        {
+            throw std::runtime_error("Camera enabled and main must be booleans.");
+        }
+
+        if(!value.at("projection").is_string() || value.at("projection") != "Perspective")
+        {
+            throw std::runtime_error("Camera projection must be Perspective.");
+        }
+
+        CameraComponent camera;
+        camera.enabled = value.at("enabled").get<bool>();
+        camera.main = value.at("main").get<bool>();
+        camera.verticalFov = ReadNumber(value.at("verticalFov"), "Camera vertical FOV");
+        camera.nearPlane = ReadNumber(value.at("nearPlane"), "Camera near plane");
+        camera.farPlane = ReadNumber(value.at("farPlane"), "Camera far plane");
+        std::string error;
+
+        if(!ValidateCameraComponent(camera, &error))
+        {
+            throw std::runtime_error(error);
+        }
+
+        return camera;
+    }
+
     Json ToJson(const SceneDocument& document)
     {
         Json objects = Json::array();
@@ -429,6 +536,16 @@ namespace
             {
                 objects.back()["characterController"] = ToJson(*object.characterController);
             }
+
+            if(object.camera)
+            {
+                objects.back()["camera"] = ToJson(*object.camera);
+            }
+
+            if(object.light)
+            {
+                objects.back()["light"] = ToJson(*object.light);
+            }
         }
 
         const auto& camera = document.camera;
@@ -471,7 +588,9 @@ namespace
              schemaVersion != SceneDocument::kContactEventsSchemaVersion &&
              schemaVersion != SceneDocument::kTriggerColliderSchemaVersion &&
              schemaVersion != SceneDocument::kCharacterControllerSchemaVersion &&
-             schemaVersion != SceneDocument::kHierarchySchemaVersion))
+             schemaVersion != SceneDocument::kHierarchySchemaVersion &&
+             schemaVersion != SceneDocument::kCameraSchemaVersion &&
+             schemaVersion != SceneDocument::kLightSchemaVersion))
         {
             throw std::runtime_error("Unsupported scene schema version.");
         }
@@ -479,7 +598,8 @@ namespace
         const bool hierarchySchema = schemaVersion.get<std::uint32_t>() >= SceneDocument::kHierarchySchemaVersion;
         SceneDocument result;
 
-        // Older supported documents migrate in memory. Subsequent saves write v9.
+        // Transitional readers preserve protected project content. New saves write v11;
+        // no migration is written to disk merely by loading a historical document.
         result.id = value.at("id").get<std::string>();
         result.name = value.at("name").get<std::string>();
         result.environmentReference=value.value("environmentReference",std::string{});
@@ -513,7 +633,7 @@ namespace
         for (const Json& item : objects)
         {
             ValidateFields(item, {"id", "parentID", "name", "transform", "meshReference", "materialReference",
-                "materialSlotBindings", "physics", "triggerCollider", "characterController"});
+                "materialSlotBindings", "physics", "triggerCollider", "characterController", "camera", "light"});
             if (legacySchema && item.contains("physics"))
             {
                 throw std::runtime_error("Physics fields require scene schema version 2.");
@@ -613,6 +733,40 @@ namespace
                 catch(const std::exception& exception)
                 {
                     throw std::runtime_error("Invalid Character Controller for object " + object.id + ": " + exception.what());
+                }
+            }
+
+            if(item.contains("camera"))
+            {
+                if(schemaVersion.get<std::uint32_t>() < SceneDocument::kCameraSchemaVersion)
+                {
+                    throw std::runtime_error("Camera component fields require scene schema version 10.");
+                }
+
+                try
+                {
+                    object.camera = ReadCameraComponent(item.at("camera"));
+                }
+                catch(const std::exception& exception)
+                {
+                    throw std::runtime_error("Invalid Camera for object " + object.id + ": " + exception.what());
+                }
+            }
+
+            if(item.contains("light"))
+            {
+                if(schemaVersion.get<std::uint32_t>() < SceneDocument::kLightSchemaVersion)
+                {
+                    throw std::runtime_error("Light component fields require scene schema version 11.");
+                }
+
+                try
+                {
+                    object.light = ReadLightComponent(item.at("light"));
+                }
+                catch(const std::exception& exception)
+                {
+                    throw std::runtime_error("Invalid Light for object " + object.id + ": " + exception.what());
                 }
             }
 

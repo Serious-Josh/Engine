@@ -8,6 +8,7 @@
 #include "Scene/SceneHierarchySnapshot.h"
 #include "Scene/SceneHierarchy.h"
 #include "Scene/MeshResidency.h"
+#include "Scene/SceneLighting.h"
 
 #include <optional>
 #include <memory>
@@ -41,6 +42,14 @@ struct SceneObjectMetadata
     {
         return GetSceneMeshResidency(meshReference, runtime.mesh);
     }
+};
+
+// One object's checked Camera replacement inside an atomic multi-object Camera edit.
+struct SceneCameraChange
+{
+    SceneObjectMetadata selection;
+    std::optional<CameraComponent> expected;
+    std::optional<CameraComponent> replacement;
 };
 
 // History restores the exact saved value, including legacy untrimmed names.
@@ -149,6 +158,23 @@ public:
     // describes exactly the pose currently presented for that object; otherwise only capsules.
     bool CaptureEditorColliderOverlay(const Renderer&, EditorColliderOverlay&, std::string& error,
         std::span<const Physics::CharacterControllerDiagnostics> controllerDiagnostics = {}) const;
+    // CAM.5: appends one frustum per Camera object, from this frame's accepted presentation worlds,
+    // to an overlay that is empty or already captured for this scene and renderer. Selected runtime
+    // indices get the selected style; disabled Cameras the subdued one. A Camera whose world cannot
+    // form a view basis is omitted and named in `rejected`; others still draw.
+    bool CaptureEditorCameraFrusta(const Renderer&, EditorColliderOverlay&, std::uint32_t viewportWidth,
+        std::uint32_t viewportHeight, std::span<const size_t> selectedRuntimeIndices,
+        std::vector<std::string>& rejected, std::string& error) const;
+    // LIGHT.1: the whole lighting snapshot of the committed scene (editable or archive), from its
+    // document and this frame's accepted presentation worlds, resolved by stable object ID. Owner
+    // thread only. Nothing is retained; the snapshot holds values only.
+    bool CaptureSceneLighting(SceneLightingSnapshot& snapshot, std::string& error) const;
+    // LIGHT.1: appends one wireframe set per Light (selected Lights last) to an overlay that is
+    // empty or already captured for this scene and renderer, like CaptureEditorCameraFrusta.
+    // Editable scenes only. A Light whose world is invalid is omitted and named in `rejected`.
+    bool CaptureEditorLightWireframes(const Renderer&, EditorColliderOverlay&,
+        std::span<const size_t> selectedRuntimeIndices, std::vector<std::string>& rejected,
+        std::string& error) const;
     bool CaptureObjectDeletionSnapshot(std::string_view objectID, SceneObjectDocument& object,
         size_t& documentIndex, std::string* errorMessage = nullptr) const;
     std::unique_ptr<FileSceneRuntime> PrepareObjectDeletion(std::string_view objectID,
@@ -202,6 +228,20 @@ public:
     bool SetObjectPhysics(const SceneObjectMetadata& selection,
         const std::optional<Physics::PhysicsComponent>& expected,
         const std::optional<Physics::PhysicsComponent>& replacement, std::string* errorMessage = nullptr);
+    // Authored value edit only; full-scene validation enforces Main uniqueness.
+    bool SetObjectCamera(const SceneObjectMetadata& selection,
+        const std::optional<CameraComponent>& expected,
+        const std::optional<CameraComponent>& replacement, std::string* errorMessage = nullptr);
+    // All changes are checked against current identities and expected values, applied to one
+    // candidate and validated as a whole scene before any is published. A Main transfer is
+    // therefore never observable as a two-Main or partially applied state.
+    bool SetObjectCameras(std::span<const SceneCameraChange> changes, std::string* errorMessage = nullptr);
+    // Authored Light value edit (add, replace or remove) on one object. Checks the selection
+    // identity and expected value, validates the whole candidate scene (including the scene Light
+    // bound) and only then writes. A no-op never dirties; no renderer or physics state changes.
+    bool SetObjectLight(const SceneObjectMetadata& selection,
+        const std::optional<LightComponent>& expected,
+        const std::optional<LightComponent>& replacement, std::string* errorMessage = nullptr);
     bool SetObjectCharacterController(const SceneObjectMetadata& selection,
         const std::optional<Physics::CharacterControllerComponent>& expected,
         const std::optional<Physics::CharacterControllerComponent>& replacement, std::string* errorMessage = nullptr);

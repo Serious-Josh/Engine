@@ -31,6 +31,7 @@ class RayTracedGIPass
         const RayTracingSceneResources& rayTracingScene,
         D3D12_GPU_VIRTUAL_ADDRESS giConstantsAddress,
         D3D12_GPU_VIRTUAL_ADDRESS lightConstantsAddress,
+        D3D12_GPU_VIRTUAL_ADDRESS sceneLightConstantsAddress,
         unsigned int width,
         unsigned int height);
 

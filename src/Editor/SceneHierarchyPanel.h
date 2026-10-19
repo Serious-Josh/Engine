@@ -6,6 +6,7 @@
 #include <span>
 #include "assets/PrimitiveMeshAssets.h"
 #include "HierarchyDragPayload.h"
+#include "Scene/LightComponent.h"
 #include "Scene/SceneHierarchySnapshot.h"
 
 class SceneHierarchyPanel
@@ -15,6 +16,10 @@ public:
 
     // True once after the top-level "Empty Object" menu entry was chosen.
     bool TakeEmptyObjectRequest();
+    // True once after the top-level "Camera" menu entry was chosen.
+    bool TakeCameraObjectRequest();
+    // The Light type once after a "Light" submenu entry was chosen.
+    std::optional<LightType> TakeLightObjectRequest();
     bool IsFocused() const noexcept { return m_focused; }
     void BeginRename(const std::string& objectID, const std::string& name);
     void CancelRename();
@@ -57,6 +62,8 @@ private:
     bool m_focused = false;
     std::optional<ScenePrimitive> m_primitiveRequest;
     bool m_emptyObjectRequest = false;
+    bool m_cameraObjectRequest = false;
+    std::optional<LightType> m_lightObjectRequest;
     std::optional<HierarchyDropRequest> m_dropRequest;
     SceneHierarchySnapshot m_treeSnapshot;
     SceneHierarchy::Forest m_tree;

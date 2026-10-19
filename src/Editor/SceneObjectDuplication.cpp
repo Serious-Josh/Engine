@@ -13,6 +13,11 @@ bool PrepareSceneObjectDuplicate(const FileSceneRuntime& scene,std::string_view 
 {
     SceneObjectDocument snapshot; std::size_t index=0;
     if(!scene.CaptureObjectDeletionSnapshot(objectID,snapshot,index,&error)) return false;
+    if(snapshot.camera)
+    {
+        snapshot.camera->main = false;
+    }
+
     const auto& document=scene.GetFileScene().GetDocument();
     snapshot.name=UniqueDuplicateObjectName(snapshot.name,document);
     do

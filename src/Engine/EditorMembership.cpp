@@ -329,6 +329,35 @@ bool Engine::BeginEmptyObjectCreation(const Editor::EmptyObjectCreationRequest& 
     return BeginObjectCreation(intent.runtimeIdentity, intent.historyEpoch, "Empty Object", prepareEmpty, error);
 }
 
+bool Engine::BeginCameraObjectCreation(const Editor::CameraObjectCreationRequest& intent, std::string& error)
+{
+    // The fly view is read only here, after BeginObjectCreation's eligibility checks pass, and is
+    // never written: creation copies its pose into authored data.
+    const auto prepareCamera = [this](const std::filesystem::path&, const SceneDocument& document,
+        SceneObjectDocument& object, std::string&)
+    {
+        const auto& view = m_demoSceneManager.TryGetActiveScene()->GetScene().GetCamera();
+        object = PrepareCameraObject(document, view.GetPosition(), view.GetTarget());
+        return true;
+    };
+
+    return BeginObjectCreation(intent.runtimeIdentity, intent.historyEpoch, "Camera", prepareCamera, error);
+}
+
+bool Engine::BeginLightObjectCreation(const Editor::LightObjectCreationRequest& intent, std::string& error)
+{
+    // As for Cameras, the fly view is read only after the eligibility checks and never written.
+    const auto prepareLight = [this, type = intent.type](const std::filesystem::path&, const SceneDocument& document,
+        SceneObjectDocument& object, std::string&)
+    {
+        const auto& view = m_demoSceneManager.TryGetActiveScene()->GetScene().GetCamera();
+        object = PrepareLightObject(document, type, view.GetPosition(), view.GetTarget());
+        return true;
+    };
+
+    return BeginObjectCreation(intent.runtimeIdentity, intent.historyEpoch, "Light", prepareLight, error);
+}
+
 bool Engine::BeginObjectCreation(std::uint64_t runtimeIdentity, std::uint64_t historyEpoch, const char* operationName,
     const PrepareCreatedObject& prepareObject, std::string& error)
 {

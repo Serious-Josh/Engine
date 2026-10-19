@@ -425,6 +425,33 @@ std::optional<std::size_t> SceneHierarchyPanel::Draw(const EditorWorkspaceRect& 
                 m_emptyObjectRequest = true;
             }
 
+            // Top level: a meshless object carrying only a Camera component.
+            if(ImGui::MenuItem("Camera"))
+            {
+                m_cameraObjectRequest = true;
+            }
+
+            // Top level: meshless objects carrying only a Light component of the chosen type.
+            if(ImGui::BeginMenu("Light"))
+            {
+                if(ImGui::MenuItem("Point Light"))
+                {
+                    m_lightObjectRequest = LightType::Point;
+                }
+
+                if(ImGui::MenuItem("Spot Light"))
+                {
+                    m_lightObjectRequest = LightType::Spot;
+                }
+
+                if(ImGui::MenuItem("Directional Light"))
+                {
+                    m_lightObjectRequest = LightType::Directional;
+                }
+
+                ImGui::EndMenu();
+            }
+
             if(ImGui::BeginMenu("Create Primitive"))
             {
                 if(ImGui::MenuItem("Cube"))
@@ -661,4 +688,14 @@ std::optional<ScenePrimitive> SceneHierarchyPanel::TakePrimitiveRequest()
 bool SceneHierarchyPanel::TakeEmptyObjectRequest()
 {
     return std::exchange(m_emptyObjectRequest, false);
+}
+
+bool SceneHierarchyPanel::TakeCameraObjectRequest()
+{
+    return std::exchange(m_cameraObjectRequest, false);
+}
+
+std::optional<LightType> SceneHierarchyPanel::TakeLightObjectRequest()
+{
+    return std::exchange(m_lightObjectRequest, std::nullopt);
 }

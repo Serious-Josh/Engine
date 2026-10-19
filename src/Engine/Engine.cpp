@@ -1047,6 +1047,31 @@ bool Engine::RequestCleanScene(std::string& errorMessage)
     return m_demoSceneManager.RequestUnsavedScene(std::move(document), &errorMessage);
 }
 
+bool Engine::AdmitPackagedMainCamera(const FileSceneRuntime& runtime, std::uint32_t payloadVersion, std::string& error)
+{
+    // Payloads before Camera components cannot designate a Main Camera. They keep their saved
+    // view only so historical archives still decode and boot; current payloads must have Main.
+    m_packagedMainCamera = payloadVersion >= CookedScene::CameraVersion;
+
+    if(!m_packagedMainCamera)
+    {
+        Log::Warning("Cooked scene payload " + std::to_string(payloadVersion) +
+            " predates Camera components; rendering its saved view for compatibility.");
+        return true;
+    }
+
+    RenderView view;
+
+    if(!ResolveMainCameraView(runtime, m_window.GetWidth(), m_window.GetHeight(), view, &error))
+    {
+        error = "Packaged game has no usable Main Camera: " + error;
+        return false;
+    }
+
+    Log::Info("Packaged runtime renders Main Camera " + view.identity.objectID + ".");
+    return true;
+}
+
 bool Engine::InitializeInitialScene(InitialScene scene)
 {
     if(m_startup.mode == EngineStartup::Mode::PackagedRuntime)
@@ -1586,7 +1611,12 @@ bool Engine::InitializeScene(SceneSource source)
             auto* owner = dynamic_cast<FileBackedDemoScene*>(m_demoSceneManager.TryGetActiveScene());
             std::string error;
 
-            if(!owner || !StartPackagedPhysics(*owner->m_runtime, error))
+            if(!owner || !AdmitPackagedMainCamera(*owner->m_runtime, m_startupArchive->metadata.payloadVersion, error))
+            {
+                throw std::runtime_error(error);
+            }
+
+            if(!StartPackagedPhysics(*owner->m_runtime, error))
             {
                 throw std::runtime_error("Packaged physics initialization failed: " + error);
             }
@@ -1876,7 +1906,29 @@ void Engine::Frame()
             throw std::runtime_error("Packaged physics frame failed: " + physicsError);
         }
 
-        const auto result = m_renderer.Render(demo.GetScene(), RendererOptions{});
+        RendererOptions options{};
+
+        if(m_packagedMainCamera)
+        {
+            // Resolved every frame from the committed scene and accepted poses; nothing is retained.
+            RenderView view;
+            std::string cameraError;
+
+            if(!ResolveMainCameraView(*owner->m_runtime, m_window.GetWidth(), m_window.GetHeight(), view, &cameraError))
+            {
+                Log::Error("Packaged Main Camera became unusable; requesting shutdown: " + cameraError);
+                m_window.Close();
+                return;
+            }
+
+            options.view = std::move(view);
+        }
+
+        // Archive-only lighting from the cooked document; payloads before 11 carry no Lights, so
+        // they render with their legacy sun exactly as before.
+        options.lighting = CaptureSceneLightingForFrame(*owner->m_runtime);
+
+        const auto result = m_renderer.Render(demo.GetScene(), options);
         if (result == Renderer::FrameRenderResult::Error)
         {
             Log::Error("Packaged renderer frame failed; requesting shutdown.");
@@ -2281,6 +2333,26 @@ void Engine::Frame()
         }
     }
 
+    if(auto request = m_editor.TakeCameraObjectCreationRequest())
+    {
+        std::string error;
+
+        if(!BeginCameraObjectCreation(*request, error))
+        {
+            m_editor.OnCameraObjectCreationFailed(error);
+        }
+    }
+
+    if(auto request = m_editor.TakeLightObjectCreationRequest())
+    {
+        std::string error;
+
+        if(!BeginLightObjectCreation(*request, error))
+        {
+            m_editor.OnLightObjectCreationFailed(error);
+        }
+    }
+
     if (auto request = m_editor.TakeMeshCreationRequest())
     {
         const auto* owner = dynamic_cast<const FileBackedDemoScene*>(&activeDemo);
@@ -2543,6 +2615,12 @@ void Engine::Frame()
     if (colliderOverlay)
     {
         rendererOptions.editorColliderOverlay = &*colliderOverlay;
+    }
+
+    // Lighting uses the same accepted presentation as the meshes and overlays of this frame.
+    if (physicsScene)
+    {
+        rendererOptions.lighting = CaptureSceneLightingForFrame(*physicsScene->m_runtime);
     }
 
     if (const auto gridSpacing = m_editor.GetViewportGridSpacing())
@@ -4858,22 +4936,137 @@ bool Engine::StartBuildGame(BuildGame::Settings settings, std::string& error, bo
 std::optional<EditorColliderOverlay> Engine::CaptureEditorColliderOverlayForFrame(const FileSceneRuntime* runtime, bool editableScene) const
 {
     // Skip construction and capture entirely when hidden. Simulation/presentation still run normally.
-    if(!m_editor.ArePhysicsCollidersVisible() || !runtime || !editableScene)
+    // Only the Editor frame of an editable scene captures; packaged and archive frames never do.
+    const bool collidersVisible = m_editor.ArePhysicsCollidersVisible();
+    const bool frustaVisible = m_editor.AreCameraFrustaVisible();
+    const bool lightWireframesVisible = m_editor.AreLightWireframesVisible();
+
+    if((!collidersVisible && !frustaVisible && !lightWireframesVisible) || !runtime || !editableScene)
     {
         return std::nullopt;
     }
     EditorColliderOverlay capturedOverlay;
     std::string captureError;
-    // Controller markers use only diagnostics published with the presented poses.
-    const auto* characterDiagnostics = m_physicsSimulation.GetPublishedCharacterDiagnostics();
-    std::span<const Physics::CharacterControllerDiagnostics> controllers;
-    if(characterDiagnostics)
+
+    if(collidersVisible)
     {
-        controllers = characterDiagnostics->controllers;
+        // Controller markers use only diagnostics published with the presented poses.
+        const auto* characterDiagnostics = m_physicsSimulation.GetPublishedCharacterDiagnostics();
+        std::span<const Physics::CharacterControllerDiagnostics> controllers;
+        if(characterDiagnostics)
+        {
+            controllers = characterDiagnostics->controllers;
+        }
+        if(!runtime->CaptureEditorColliderOverlay(m_renderer, capturedOverlay, captureError, controllers))
+        {
+            // Colliders and frusta are independent: a collider failure never hides valid frusta.
+            capturedOverlay = {};
+        }
     }
-    if(!runtime->CaptureEditorColliderOverlay(m_renderer, capturedOverlay, captureError, controllers))
+
+    if(frustaVisible)
+    {
+        Renderer::FinalSceneImage image{};
+        const auto& selected = m_editor.GetSelectedObjects();
+        const bool selectionCurrent = m_editor.GetSelectionStructureRevision() == runtime->GetScene().GetStructureRevision();
+        std::vector<std::string> rejected;
+
+        if(m_renderer.TryGetFinalSceneImage(image) &&
+            runtime->CaptureEditorCameraFrusta(m_renderer, capturedOverlay, image.width, image.height,
+                selectionCurrent ? std::span<const size_t>(selected) : std::span<const size_t>{}, rejected, captureError))
+        {
+            ReportCameraFrustumOmissions(rejected);
+        }
+    }
+
+    if(lightWireframesVisible)
+    {
+        const auto& selected = m_editor.GetSelectedObjects();
+        const bool selectionCurrent = m_editor.GetSelectionStructureRevision() == runtime->GetScene().GetStructureRevision();
+        std::vector<std::string> rejected;
+
+        // Independent of colliders and frusta: a failure here never hides them.
+        if(runtime->CaptureEditorLightWireframes(m_renderer, capturedOverlay,
+            selectionCurrent ? std::span<const size_t>(selected) : std::span<const size_t>{}, rejected, captureError))
+        {
+            ReportLightOmissions(rejected, "Light wireframe omitted", m_lightWireframeOmissions);
+        }
+    }
+
+    if(capturedOverlay.scene == nullptr)
     {
         return std::nullopt;
     }
+
     return capturedOverlay;
+}
+
+SceneLightingSnapshot Engine::CaptureSceneLightingForFrame(const FileSceneRuntime& runtime) const
+{
+    SceneLightingSnapshot snapshot;
+    std::string error;
+
+    if(!runtime.CaptureSceneLighting(snapshot, error))
+    {
+        // No partial list: publish no component Lights and no legacy sun, so a rejected capture
+        // can never double-illuminate or silently fall back.
+        snapshot = {};
+        snapshot.suppressLegacyDirectional = true;
+
+        if(error != m_lightingCaptureError)
+        {
+            Log::Error("Scene lighting capture failed; rendering without scene lights: " + error);
+        }
+    }
+
+    m_lightingCaptureError = error;
+    ReportLightOmissions(snapshot.rejectedNames, "Light skipped (transform cannot place or orient it)",
+        m_lightingOmissions);
+    return snapshot;
+}
+
+void Engine::ReportLightOmissions(const std::vector<std::string>& rejected, const char* context,
+    std::string& lastReported) const
+{
+    std::string message;
+
+    for(const auto& name : rejected)
+    {
+        message += (message.empty() ? "" : ", ") + name;
+    }
+
+    if(message == lastReported)
+    {
+        return;
+    }
+
+    lastReported = message;
+
+    if(!message.empty())
+    {
+        Log::Warning(std::string(context) + ": " + message);
+    }
+}
+
+void Engine::ReportCameraFrustumOmissions(const std::vector<std::string>& rejected) const
+{
+    // Bounded: logged only when the omitted set changes, never once per frame.
+    std::string message;
+
+    for(const auto& name : rejected)
+    {
+        message += (message.empty() ? "" : ", ") + name;
+    }
+
+    if(message == m_cameraFrustumOmissions)
+    {
+        return;
+    }
+
+    m_cameraFrustumOmissions = message;
+
+    if(!message.empty())
+    {
+        Log::Warning("Camera frustum omitted (transform cannot form a camera view basis): " + message);
+    }
 }

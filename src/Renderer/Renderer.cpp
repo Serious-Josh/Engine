@@ -18,6 +18,7 @@
 #include "Scene/Camera.h"
 #include "ShaderData.h"
 #include "Scene/DirectionalLight.h"
+#include "Renderer/FrameLighting.h"
 #include "Scene/Scene.h"
 #include "DemoContent/MirrorTestScene.h"
 
@@ -4218,6 +4219,7 @@ void Renderer::ResetSceneHistory()
     m_hasPreviousViewProjection = false;
     m_hasPreviousShadowLightDirection = false;
     m_hasPreviousGILight = false;
+    m_hasPreviousGILocalLights = false;
     m_hasPreviousNrdCamera = false;
 
     m_nrdExecutedLastFrame = false;
@@ -4736,6 +4738,20 @@ Renderer::FrameRenderResult Renderer::Render(
     return FrameRenderResult::Rendered;
 }
 
+RenderView Renderer::DefaultFlyRenderView(const Camera& camera)
+{
+    RenderView view;
+    view.identity = {RenderViewSource::EditorFly};
+    view.view = camera.GetViewMatrix();
+    view.projection = camera.GetProjectionMatrix();
+    view.position = camera.GetPosition();
+    view.verticalFov = camera.GetVerticalFov();
+    view.nearPlane = camera.GetNearPlane();
+    view.farPlane = camera.GetFarPlane();
+    view.aspectRatio = camera.GetAspectRatio();
+    return view;
+}
+
 CameraConstants Renderer::BuildFrameCameraConstants(
     const Matrix4& currentView,
     const Matrix4& currentViewProjection,
@@ -5224,11 +5240,47 @@ bool Renderer::RecordRenderFrame(
     }
 
     // Assemble/upload constants in place; later camera/light/sample writes remain stateful.
-    const Camera& camera = scene.GetCamera();
-    const DirectionalLight& light = scene.GetDirectionalLight();
+    // One coherent view feeds every view-dependent consumer below. Without an explicit view the
+    // Editor fly camera is used exactly as before CAM.4 (same matrices, no new admission).
+    const RenderView frameView = options.view ? *options.view : DefaultFlyRenderView(scene.GetCamera());
 
-    const Matrix4 currentView = camera.GetViewMatrix();
-    const Matrix4 currentProjection = camera.GetProjectionMatrix();
+    // One coherent lighting source per frame: the legacy sun or the component shadow owner, never
+    // both, plus the unshadowed Light table. A rejected snapshot publishes no component Lights.
+    FrameLighting frameLighting;
+    std::string lightingError;
+
+    if(!BuildFrameLighting(scene.GetDirectionalLight(), options.lighting ? &*options.lighting : nullptr,
+        frameLighting, &lightingError))
+    {
+        Log::Error("Scene lighting rejected for this frame: " + lightingError);
+        frameLighting = FrameLighting{};
+        frameLighting.sun = scene.GetDirectionalLight();
+
+        if(options.lighting && options.lighting->suppressLegacyDirectional)
+        {
+            frameLighting.sun.intensity = 0.0f;
+            frameLighting.sun.color = {0.0f, 0.0f, 0.0f};
+        }
+    }
+
+    const DirectionalLight& light = frameLighting.sun;
+    m_recordedSun = frameLighting.sun;
+    m_recordedAdditionalLightCount = frameLighting.table.lightCount;
+
+    // A new view identity is a camera cut. Deferred frames return before recording, so a pending
+    // cut is consumed only here, with the existing stateful history policy of this recording.
+    if(m_renderedViewIdentity && *m_renderedViewIdentity != frameView.identity)
+    {
+        ResetSceneHistory();
+        ++m_cameraCutCount;
+    }
+
+    m_renderedViewIdentity = frameView.identity;
+    m_recordedView = frameView.view;
+    m_recordedProjection = frameView.projection;
+
+    const Matrix4 currentView = frameView.view;
+    const Matrix4 currentProjection = frameView.projection;
     const Matrix4 currentViewProjection = currentProjection * currentView;
 
     CameraConstants cameraConstants = BuildFrameCameraConstants(
@@ -5250,7 +5302,7 @@ bool Renderer::RecordRenderFrame(
     ReconstructionConstants reconstructionConstants{};
     reconstructionConstants.inverseViewProjection = cameraConstants.viewProjection.Inverse();
 
-    const Vector3& cameraPosition = camera.GetPosition();
+    const Vector3& cameraPosition = frameView.position;
 
     reconstructionConstants.cameraPosition[0] = cameraPosition.x;
     reconstructionConstants.cameraPosition[1] = cameraPosition.y;
@@ -5293,8 +5345,29 @@ bool Renderer::RecordRenderFrame(
         return false;
     }
 
+    // The whole table (about 4 KB) is uploaded so the bound buffer always covers the declared
+    // cbuffer; unused records are zero and the shader reads no further than lightCount.
+    const D3D12_GPU_VIRTUAL_ADDRESS sceneLightConstantsAddress = m_uploadBuffer.Allocate(
+        &frameLighting.table, sizeof(SceneLightConstants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
+
+    if (sceneLightConstantsAddress == 0)
+    {
+        Log::Error("Failed to allocate scene light constants.");
+        return false;
+    }
+
     // These history resets/writes intentionally precede later uploads and recording failures.
     const Vector3 currentLightDirection = light.direction.Normalized();
+    bool giLightingChanged = m_hasPreviousGILocalLights &&
+        !SameLocalLightInputs(m_previousGILocalLights, frameLighting.table);
+
+    if(giLightingChanged)
+    {
+        m_giSignedCorrectionPass.ResetHistory();
+    }
+
+    m_previousGILocalLights = frameLighting.table;
+    m_hasPreviousGILocalLights = true;
 
     if (m_hasPreviousShadowLightDirection)
     {
@@ -5304,6 +5377,7 @@ bool Renderer::RecordRenderFrame(
         {
             m_rayTracedShadowPass.ResetHistory();
             m_giSignedCorrectionPass.ResetHistory();
+            giLightingChanged = true;
         }
     }
 
@@ -5322,6 +5396,7 @@ bool Renderer::RecordRenderFrame(
         if (intensityChanged || colorChanged)
         {
             m_giSignedCorrectionPass.ResetHistory();
+            giLightingChanged = true;
         }
     }
 
@@ -5579,7 +5654,7 @@ bool Renderer::RecordRenderFrame(
         }
 
         m_rayTracedGIPass.Execute(m_commandContext.GetRayTracingCommandList(), m_resourceDescriptorHeap, m_rayTracingScene,
-                                  giConstantsAddress, lightConstantsAddress, giWidth, giHeight);
+                                  giConstantsAddress, lightConstantsAddress, sceneLightConstantsAddress, giWidth, giHeight);
 
         m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::RayTracedGI);
 
@@ -5637,7 +5712,8 @@ bool Renderer::RecordRenderFrame(
         const bool resetNrdHistory =
             !m_hasPreviousNrdCamera || !m_nrdExecutedLastFrame || limiterEnabled != m_previousContributionLimiterEnabled;
         // Restart diffuse NRD history when signed production GI resumes after being inactive.
-        const bool resetGIHistory = resetNrdHistory || runSignedCorrection != m_signedCorrectionExecutedLastFrame;
+        const bool resetGIHistory = resetNrdHistory || giLightingChanged ||
+            runSignedCorrection != m_signedCorrectionExecutedLastFrame;
 
         if (runNrd)
         {
@@ -5774,7 +5850,8 @@ bool Renderer::RecordRenderFrame(
             m_environment.GetGGXMultiscatterIrradiance(), m_shadowDenoisePass.GetFilteredVisibilityTexture(),
             finalReflection, m_giSpatialDenoisePass.GetOutputTexture(), m_aoResolvePass.GetOutputTexture(),
             options.enableRTGI, options.rtgiContactAOStrength, m_sceneColor, reconstructionConstantsAddress,
-            lightConstantsAddress, static_cast<unsigned int>(debugView), m_debugUI.IsShadingNormalCorrectionEnabled());
+            lightConstantsAddress, sceneLightConstantsAddress, static_cast<unsigned int>(debugView),
+            m_debugUI.IsShadingNormalCorrectionEnabled());
 
         m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::DeferredLighting);
 
@@ -5869,14 +5946,17 @@ bool Renderer::RecordRenderFrame(
 
     // Draw only into the final editor image: temporal history and lighting must never see these lines.
     // The grid goes first so collider lines stay on top of it.
-    if (!m_packagedRuntime && options.editorGrid)
+    // Editor overlays are composed only into the Editor fly view; a Game Camera frame never shows them.
+    const bool editorOverlayFrame = !m_packagedRuntime && frameView.identity.source == RenderViewSource::EditorFly;
+
+    if (editorOverlayFrame && options.editorGrid)
     {
         m_editorGridPass.Execute(commandList, m_finalSceneColor, m_gBuffer.GetDepth(), currentView,
-            currentProjection, camera.GetPosition(), *options.editorGrid);
+            currentProjection, frameView.position, *options.editorGrid);
     }
 
     const EditorColliderOverlay* colliderOverlay = options.editorColliderOverlay;
-    if (!m_packagedRuntime && colliderOverlay)
+    if (editorOverlayFrame && colliderOverlay)
     {
         if (colliderOverlay->Matches(scene, m_sceneResourceLifetime))
         {

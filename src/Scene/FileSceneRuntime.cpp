@@ -141,6 +141,189 @@ bool FileSceneRuntime::ReorderObjects(const SceneObjectOrderIdentity& identity,
     return true;
 }
 
+bool FileSceneRuntime::SetObjectCamera(const SceneObjectMetadata& selection,
+    const std::optional<CameraComponent>& expected,
+    const std::optional<CameraComponent>& replacement, std::string* errorMessage)
+{
+    const SceneCameraChange change{selection, expected, replacement};
+    return SetObjectCameras({&change, 1}, errorMessage);
+}
+
+bool FileSceneRuntime::SetObjectCameras(std::span<const SceneCameraChange> changes, std::string* errorMessage)
+{
+    const auto fail = [&](const char* message)
+    {
+        if(errorMessage)
+        {
+            *errorMessage = message;
+        }
+
+        return false;
+    };
+
+    if(errorMessage)
+    {
+        errorMessage->clear();
+    }
+
+    if(m_archiveScene || HasPreparedScene() || m_materialAssignment || m_activePresentationAssociation)
+    {
+        return fail("Camera authoring requires an idle editable scene.");
+    }
+
+    if(changes.empty())
+    {
+        return fail("Camera edit names no objects.");
+    }
+
+    const auto& objects = m_fileScene.GetDocument().objects;
+    std::vector<size_t> indices;
+    indices.reserve(changes.size());
+    bool changed = false;
+
+    for(const auto& change : changes)
+    {
+        const auto& selection = change.selection;
+        const auto current = GetObjectMetadata(selection.objectID, errorMessage);
+
+        if(!current)
+        {
+            return false;
+        }
+
+        if(current->sceneID != selection.sceneID || current->runtimeIdentity != selection.runtimeIdentity ||
+            current->structureRevision != selection.structureRevision || current->runtimeIndex != selection.runtimeIndex)
+        {
+            return fail("Camera target belongs to a stale scene selection.");
+        }
+
+        const auto found = std::find_if(objects.begin(), objects.end(),
+            [&](const SceneObjectDocument& object) { return object.id == selection.objectID; });
+
+        if(found == objects.end() || found->camera != change.expected)
+        {
+            return fail("Camera changed since inspection; edit rejected.");
+        }
+
+        const size_t index = static_cast<size_t>(found - objects.begin());
+
+        if(std::find(indices.begin(), indices.end(), index) != indices.end())
+        {
+            return fail("Camera edit names the same object twice.");
+        }
+
+        indices.push_back(index);
+        changed = changed || change.expected != change.replacement;
+    }
+
+    SceneDocument candidate;
+
+    if(!CaptureSceneDocument(m_fileScene.GetDocument(), m_scene, m_objectMapping, candidate, errorMessage))
+    {
+        return false;
+    }
+
+    for(size_t change = 0; change < changes.size(); ++change)
+    {
+        candidate.objects[indices[change]].camera = changes[change].replacement;
+    }
+
+    if(!ValidateSceneDocument(candidate, errorMessage))
+    {
+        return false;
+    }
+
+    if(!changed)
+    {
+        return true;
+    }
+
+    // All allocation, identity and scene-wide uniqueness checks precede dirty marking.
+    // Optional assignment of a trivially copyable value cannot fail, so the set is applied
+    // whole. No renderer, fly-camera or physics state is published.
+    auto& edited = m_fileScene.EditDocument().objects;
+
+    for(size_t change = 0; change < changes.size(); ++change)
+    {
+        edited[indices[change]].camera = changes[change].replacement;
+    }
+
+    return true;
+}
+
+bool FileSceneRuntime::SetObjectLight(const SceneObjectMetadata& selection,
+    const std::optional<LightComponent>& expected,
+    const std::optional<LightComponent>& replacement, std::string* errorMessage)
+{
+    const auto fail = [&](const char* message)
+    {
+        if(errorMessage)
+        {
+            *errorMessage = message;
+        }
+
+        return false;
+    };
+
+    if(errorMessage)
+    {
+        errorMessage->clear();
+    }
+
+    if(m_archiveScene || HasPreparedScene() || m_materialAssignment || m_activePresentationAssociation)
+    {
+        return fail("Light authoring requires an idle editable scene.");
+    }
+
+    const auto current = GetObjectMetadata(selection.objectID, errorMessage);
+
+    if(!current)
+    {
+        return false;
+    }
+
+    if(current->sceneID != selection.sceneID || current->runtimeIdentity != selection.runtimeIdentity ||
+        current->structureRevision != selection.structureRevision || current->runtimeIndex != selection.runtimeIndex)
+    {
+        return fail("Light target belongs to a stale scene selection.");
+    }
+
+    const auto& objects = m_fileScene.GetDocument().objects;
+    const auto found = std::find_if(objects.begin(), objects.end(),
+        [&](const SceneObjectDocument& object) { return object.id == selection.objectID; });
+
+    if(found == objects.end() || found->light != expected)
+    {
+        return fail("Light changed since inspection; edit rejected.");
+    }
+
+    const size_t index = static_cast<size_t>(found - objects.begin());
+    SceneDocument candidate;
+
+    if(!CaptureSceneDocument(m_fileScene.GetDocument(), m_scene, m_objectMapping, candidate, errorMessage))
+    {
+        return false;
+    }
+
+    candidate.objects[index].light = replacement;
+
+    if(!ValidateSceneDocument(candidate, errorMessage))
+    {
+        return false;
+    }
+
+    if(expected == replacement)
+    {
+        return true;
+    }
+
+    // Identity, expected-value and whole-scene checks all precede dirty marking. Assigning a
+    // trivially copyable optional cannot fail. Lighting is re-read from the document each frame,
+    // so no renderer, mesh, BLAS/TLAS or physics state is republished.
+    m_fileScene.EditDocument().objects[index].light = replacement;
+    return true;
+}
+
 bool FileSceneRuntime::SetObjectPhysics(const SceneObjectMetadata& selection,
     const std::optional<Physics::PhysicsComponent>& expected,
     const std::optional<Physics::PhysicsComponent>& replacement, std::string* errorMessage)
@@ -1023,6 +1206,13 @@ bool FileSceneRuntime::Commit(std::string* errorMessage)
             *errorMessage = "No prepared scene is available.";
         }
 
+        return false;
+    }
+
+    // Raw document edits may occur after preparation. Recheck authored components,
+    // including scene-wide Main uniqueness, before publishing any runtime objects.
+    if(!ValidateSceneDocument(m_fileScene.GetDocument(), errorMessage))
+    {
         return false;
     }
 

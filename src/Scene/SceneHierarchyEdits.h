@@ -182,6 +182,11 @@ namespace SceneHierarchy
             }
 
             auto copy = object;
+            if(copy.camera)
+            {
+                copy.camera->main = false;
+            }
+
             copy.id = remap.at(object.id);
             copy.name = DuplicateName(copy.name, naming);
             naming.objects.push_back(copy);

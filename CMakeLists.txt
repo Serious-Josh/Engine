@@ -179,6 +179,8 @@ add_library(EngineCore OBJECT
     src/Editor/ProjectSettingsWindow.cpp
     src/Editor/TriggerColliderControls.cpp
     src/Editor/CharacterControllerControls.cpp
+    src/Editor/CameraControls.cpp
+    src/Editor/LightControls.cpp
     src/Editor/CharacterControllerDiagnosticsControls.cpp
     src/Editor/ViewportMaterialDrop.cpp
     src/Editor/EditorWorkspace.cpp
@@ -211,6 +213,7 @@ add_library(EngineCore OBJECT
     src/DemoContent/SceneRegistry.cpp
     src/DemoContent/StressTestScene.cpp
     src/Renderer/EditorColliderOverlay.cpp
+    src/Renderer/FrameLighting.cpp
     src/Renderer/Passes/EditorColliderPass.cpp
     src/Renderer/Passes/SelectionMaskPass.cpp
     src/Renderer/Passes/RayTracedGIPass.cpp
@@ -227,6 +230,8 @@ add_library(EngineCore OBJECT
     src/Renderer//DisplacementGPUIndexLayout.cpp
     src/Renderer/DisplacementGPUPatchBuffer.cpp
     src/Scene/SceneDocument.cpp
+    src/Scene/RenderView.cpp
+    src/Scene/SceneLighting.cpp
     src/Scene/SceneSerializer.cpp
     src/Scene/SceneFileCreation.cpp
     src/Project/ProjectPaths.cpp
@@ -248,6 +253,8 @@ add_library(EngineCore OBJECT
     src/Scene/TriggerColliderEditing.cpp
     src/Scene/CharacterControllerEditing.cpp
     src/Scene/PhysicsPresentation.cpp
+    src/Scene/CameraFrustumOverlay.cpp
+    src/Scene/SceneLightCapture.cpp
     src/Engine/PhysicsSimulationController.cpp
     src/Engine/EditorPhysicsSimulation.cpp
     src/Engine/PackagedPhysicsSimulation.cpp
@@ -361,6 +368,26 @@ if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Engine/t
     endif()
 endif()
 target_compile_definitions(EngineCore PRIVATE ENGINE_RUNTIME_DEPLOY_DIR="$<TARGET_FILE_DIR:EngineRuntime>")
+
+# Local-only Camera data/persistence regression; clean clones do not need test sources.
+if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Engine/tests/CameraDataTests.cpp")
+    add_executable(CameraDataTests src/Engine/tests/CameraDataTests.cpp)
+    target_link_libraries(CameraDataTests PRIVATE EngineCore)
+
+    if(ENGINE_VERIFICATION_AVAILABLE)
+        target_link_libraries(CameraDataTests PRIVATE $<$<CONFIG:Debug>:EngineVerification>)
+    endif()
+endif()
+
+# Local-only LIGHT.1 data/persistence/lighting/wireframe regression, same guard as CameraDataTests.
+if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Engine/tests/LightDataTests.cpp")
+    add_executable(LightDataTests src/Engine/tests/LightDataTests.cpp)
+    target_link_libraries(LightDataTests PRIVATE EngineCore)
+
+    if(ENGINE_VERIFICATION_AVAILABLE)
+        target_link_libraries(LightDataTests PRIVATE $<$<CONFIG:Debug>:EngineVerification>)
+    endif()
+endif()
 set_target_properties(EngineRuntime PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/Game/$<CONFIG>"
 )

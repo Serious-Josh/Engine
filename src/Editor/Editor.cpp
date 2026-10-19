@@ -441,6 +441,8 @@ void Editor::DrawSceneViewportToolbar(const EditorWorkspaceRect& toolbarRectangl
         {
             // This display preference stays editable while authored physics mutations are locked.
             ImGui::Checkbox("Physics Colliders", &m_showPhysicsColliders);
+            ImGui::Checkbox("Camera Frusta", &m_showCameraFrusta);
+            ImGui::Checkbox("Light Wireframes", &m_showLightWireframes);
             ImGui::Checkbox("Grid", &m_showViewportGrid);
             ImGui::EndCombo();
         }
@@ -1049,6 +1051,29 @@ void Editor::DrawHierarchy(IDemoScene& demoScene, const std::string& activeScene
         }
     }
 
+    if(m_hierarchyPanel.TakeCameraObjectRequest())
+    {
+        const bool canCreate = !IsPhysicsEditingLocked() && !blocked && fileScene && !fileScene->IsArchiveActivation() &&
+            m_historySession && RenameSessionMatches(demoScene, *m_historySession) && !HasBlockingObjectCreation();
+
+        if(canCreate)
+        {
+            m_cameraObjectCreationRequest = CameraObjectCreationRequest{fileScene->GetRuntimeIdentity(), m_historyEpoch};
+        }
+    }
+
+    if(const auto lightType = m_hierarchyPanel.TakeLightObjectRequest())
+    {
+        const bool canCreate = !IsPhysicsEditingLocked() && !blocked && fileScene && !fileScene->IsArchiveActivation() &&
+            m_historySession && RenameSessionMatches(demoScene, *m_historySession) && !HasBlockingObjectCreation();
+
+        if(canCreate)
+        {
+            m_lightObjectCreationRequest =
+                LightObjectCreationRequest{*lightType, fileScene->GetRuntimeIdentity(), m_historyEpoch};
+        }
+    }
+
     if(auto drop = m_hierarchyPanel.TakeDropRequest())
     {
         if(allowReorder)
@@ -1106,11 +1131,15 @@ void Editor::ActivateObjectInspection(
     DismissAddComponentPopup();
     DismissTriggerManagementPopup();
     DismissControllerManagementPopup();
+    DismissCameraManagementPopup();
+    DismissLightManagementPopup();
     m_objectInspectionIdentity.reset();
     m_transformEditStatus.clear();
     m_physicsInspection.reset();
     m_triggerInspection.reset();
     m_controllerInspection.reset();
+    m_cameraInspection.reset();
+    m_lightInspection.reset();
     m_inspectorTarget = InspectorTarget::None;
     m_inspectorPanel.LoadSelection({}, paths, registry);
     const auto& scene = static_cast<const IDemoScene&>(demoScene).GetScene();
@@ -1439,6 +1468,8 @@ void Editor::Draw(
                 DrawObjectPhysicsControls(demoScene);
                 DrawObjectTriggerColliderControls(demoScene);
                 DrawObjectCharacterControllerControls(demoScene);
+                DrawObjectCameraControls(demoScene);
+                DrawObjectLightControls(demoScene);
                 DrawAddComponentControls(demoScene);
             });
 
@@ -1478,6 +1509,8 @@ void Editor::Draw(
         m_physicsInspection.reset();
         m_triggerInspection.reset();
         m_controllerInspection.reset();
+        m_cameraInspection.reset();
+        m_lightInspection.reset();
         m_inspectorPanel.ReleaseSceneObjectPreview();
         m_inspectorPanel.DismissSceneMaterialPicker();
     }
@@ -1703,6 +1736,23 @@ void Editor::DrawDirectionalLight(IDemoScene& demoScene)
     }
 
     DirectionalLight& light = demoScene.GetScene().GetDirectionalLight();
+
+    // LIGHT.1 migration: Directional Light components replace this legacy scene sun entirely.
+    const auto* fileScene = dynamic_cast<const FileBackedDemoScene*>(&demoScene);
+
+    if(fileScene && fileScene->m_runtime->GetFileScene().HasDocument())
+    {
+        const auto& objects = fileScene->m_runtime->GetFileScene().GetDocument().objects;
+        const bool overridden = std::any_of(objects.begin(), objects.end(), [](const SceneObjectDocument& object)
+        {
+            return object.light && object.light->type == LightType::Directional;
+        });
+
+        if(overridden)
+        {
+            ImGui::TextDisabled("Inactive: this scene's Directional Light components replace the legacy sun.");
+        }
+    }
 
     ImGui::DragFloat3("Direction", &light.direction.x, 0.01f, -1.0f, 1.0f);
 
@@ -2760,10 +2810,17 @@ void Editor::ResetSceneInteractions()
     DismissAddComponentPopup();
     DismissTriggerManagementPopup();
     DismissControllerManagementPopup();
+    DismissCameraManagementPopup();
+    DismissLightManagementPopup();
     m_triggerInspection.reset();
     m_controllerInspection.reset();
+    m_cameraInspection.reset();
+    m_lightInspection.reset();
+    m_lightColorGestureActive = false;
     m_triggerEditStatus.clear();
     m_controllerEditStatus.clear();
+    m_cameraEditStatus.clear();
+    m_lightEditStatus.clear();
     m_transformEditStatus.clear();
     m_pendingMaterialBinding.reset();
     m_viewportMaterialRequest.reset();
@@ -3932,6 +3989,86 @@ void Editor::ReplaySceneHistory(IDemoScene& demoScene, bool redo)
         return;
     }
 
+    if(const auto* camera = std::get_if<std::unique_ptr<CameraEdit>>(&entry.command); camera && *camera)
+    {
+        const auto& edit = **camera;
+        auto* owner = dynamic_cast<FileBackedDemoScene*>(&demoScene);
+
+        if(!owner || !RenameSessionMatches(demoScene, edit.session))
+        {
+            ReportSceneHistoryFailure("Camera replay belongs to a stale scene session.");
+            return;
+        }
+
+        std::string error;
+
+        try
+        {
+            // Every affected Camera is restored by one expected-value-checked runtime edit.
+            std::vector<SceneCameraChange> changes;
+            changes.reserve(edit.changes.size());
+
+            for(const auto& change : edit.changes)
+            {
+                const auto selection = owner->GetObjectMetadata(change.objectID, &error);
+
+                if(!selection)
+                {
+                    ReportSceneHistoryFailure(error);
+                    return;
+                }
+
+                changes.push_back({*selection, redo ? change.before : change.after, redo ? change.after : change.before});
+            }
+
+            if(!owner->SetObjectCameras(changes, &error))
+            {
+                ReportSceneHistoryFailure(error);
+                return;
+            }
+        }
+        catch(const std::exception& exception)
+        {
+            ReportSceneHistoryFailure(exception.what());
+            return;
+        }
+
+        m_historyCursor = redo ? m_historyCursor + 1 : m_historyCursor - 1;
+        m_cameraInspection.reset();
+        ++m_cameraControlsRevision;
+        m_sceneHistoryStatus.clear();
+        return;
+    }
+
+    if(const auto* light = std::get_if<std::unique_ptr<LightEdit>>(&entry.command); light && *light)
+    {
+        const auto& edit = **light;
+        auto* owner = dynamic_cast<FileBackedDemoScene*>(&demoScene);
+
+        if(!owner || !RenameSessionMatches(demoScene, edit.session))
+        {
+            ReportSceneHistoryFailure("Light replay belongs to a stale scene session.");
+            return;
+        }
+
+        std::string error;
+        // Resolved by stable ID now; the runtime checks the expected value before restoring.
+        const auto selection = owner->GetObjectMetadata(edit.objectID, &error);
+
+        if(!selection || !owner->SetObjectLight(*selection, redo ? edit.before : edit.after,
+            redo ? edit.after : edit.before, &error))
+        {
+            ReportSceneHistoryFailure(error);
+            return;
+        }
+
+        m_historyCursor = redo ? m_historyCursor + 1 : m_historyCursor - 1;
+        m_lightInspection.reset();
+        ++m_lightControlsRevision;
+        m_sceneHistoryStatus.clear();
+        return;
+    }
+
     const auto* ownedDeletion = std::get_if<std::unique_ptr<ObjectDeletion>>(&entry.command);
 
     if(ownedDeletion && *ownedDeletion)
@@ -4205,6 +4342,7 @@ std::optional<Editor::HistoryReplayRequest> Editor::TakeSceneHistoryReplayReques
 
 size_t Editor::ObjectDeletionPayloadBytes(const ObjectDeletion& deletion)
 {
+    // Inline optional values (including Camera) are covered by sizeof(ObjectDeletion).
     const auto bytes = [](const std::string& text) { return text.capacity() + 1; };
     const auto& object = deletion.object;
     size_t size = sizeof(SceneHistoryEntry) + sizeof(ObjectDeletion) + bytes(object.id) + bytes(object.name) +
@@ -4262,7 +4400,9 @@ bool Editor::StageObjectDeletionHistory(SceneObjectDocument object, size_t docum
             deletion->object.materialSlotBindings != object.materialSlotBindings ||
             deletion->object.physics != object.physics ||
             deletion->object.triggerCollider != object.triggerCollider ||
-            deletion->object.characterController != object.characterController)
+            deletion->object.characterController != object.characterController ||
+            deletion->object.camera != object.camera ||
+            deletion->object.light != object.light)
         {
             error = "Redo deletion target changed outside its history command; cursor preserved.";
             return false;
@@ -4688,6 +4828,28 @@ std::optional<Editor::EmptyObjectCreationRequest> Editor::TakeEmptyObjectCreatio
     return std::exchange(m_emptyObjectCreationRequest, std::nullopt);
 }
 
+std::optional<Editor::CameraObjectCreationRequest> Editor::TakeCameraObjectCreationRequest()
+{
+    return std::exchange(m_cameraObjectCreationRequest, std::nullopt);
+}
+
+void Editor::OnCameraObjectCreationFailed(const std::string& error)
+{
+    m_meshCreationStatus = "Camera creation rejected: " + error;
+    Log::Warning(m_meshCreationStatus);
+}
+
+std::optional<Editor::LightObjectCreationRequest> Editor::TakeLightObjectCreationRequest()
+{
+    return std::exchange(m_lightObjectCreationRequest, std::nullopt);
+}
+
+void Editor::OnLightObjectCreationFailed(const std::string& error)
+{
+    m_meshCreationStatus = "Light creation rejected: " + error;
+    Log::Warning(m_meshCreationStatus);
+}
+
 void Editor::OnEmptyObjectCreationFailed(const std::string& error)
 {
     // Shares the viewport creation status line with mesh and primitive creation.
@@ -4716,6 +4878,8 @@ bool Editor::StageHierarchyHistory(const SceneHierarchyEdit& edit,
 
     for(const auto* document : {&command->hierarchy->before, &command->hierarchy->after})
     {
+        // SceneObjectDocument includes inline Camera/physics optionals; only strings/maps
+        // need separate dynamic-storage accounting below.
         bytes += sizeof(SceneDocument) + document->objects.capacity() * sizeof(SceneObjectDocument);
         bytes += document->id.capacity() + document->name.capacity() + document->environmentReference.capacity() + 3;
 

@@ -79,6 +79,10 @@ bool DeferredLightingPass::Initialize(
     pipelineDescription.rootParameters.push_back(
         {RootParameterType::ConstantBuffer, 2, 0, D3D12_SHADER_VISIBILITY_PIXEL});
 
+    // LIGHT.1 unshadowed Point/Spot/additional Directional Light table (SceneLightConstants).
+    pipelineDescription.rootParameters.push_back(
+        {RootParameterType::ConstantBuffer, 3, 0, D3D12_SHADER_VISIBILITY_PIXEL});
+
     if (!m_pipeline.Initialize(device, pipelineDescription))
     {
         Log::Error("Failed to initialize deferred lighting pipeline.");
@@ -107,6 +111,7 @@ void DeferredLightingPass::Execute(
     RenderTarget& sceneColor,
     D3D12_GPU_VIRTUAL_ADDRESS reconstructionConstantsAddress,
     D3D12_GPU_VIRTUAL_ADDRESS lightConstantsAddress,
+    D3D12_GPU_VIRTUAL_ADDRESS sceneLightConstantsAddress,
     unsigned int debugView,
     bool enableShadingNormalCorrection)
 {
@@ -162,6 +167,7 @@ void DeferredLightingPass::Execute(
     commandList->SetGraphicsRoot32BitConstants(0, 1, &correctionEnabled, 17);
     commandList->SetGraphicsRootConstantBufferView(1, reconstructionConstantsAddress);
     commandList->SetGraphicsRootConstantBufferView(2, lightConstantsAddress);
+    commandList->SetGraphicsRootConstantBufferView(3, sceneLightConstantsAddress);
 
     commandList->DrawInstanced(3, 1, 0, 0);
 }

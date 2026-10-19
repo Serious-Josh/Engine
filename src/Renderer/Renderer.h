@@ -31,6 +31,8 @@
 
 #include "Math/Vector3.h"
 #include "Math/Matrix4.h"
+#include "Scene/RenderView.h"
+#include "Scene/SceneLighting.h"
 
 #include "Shader/ShaderLibrary.h"
 
@@ -103,6 +105,14 @@ struct RendererOptions
 
     float rtgiContactAOStrength = 1.0f;
     float rtgiContactAORadius = 2.5f;
+
+    // Checked view for this frame (BuildFlyRenderView/ResolveMainCameraView). Absent: the scene's
+    // Editor fly camera, unchanged. Copied by value; the renderer retains only its identity.
+    std::optional<RenderView> view;
+
+    // LIGHT.1 scene lighting captured for this frame (FileSceneRuntime::CaptureSceneLighting).
+    // Absent: the scene's legacy DirectionalLight only, exactly as before LIGHT.1. Copied by value.
+    std::optional<SceneLightingSnapshot> lighting;
 };
 
 class Scene;
@@ -187,6 +197,16 @@ class Renderer
 
     // Borrowed descriptor: valid until checked renderer resize or shutdown, never owned by ImGui.
     [[nodiscard]] bool TryGetFinalSceneImage(FinalSceneImage& image) const;
+
+    // Copied evidence of the most recently recorded frame view (identity and matrices) and the
+    // number of camera cuts applied. Read-only; selection stays with the caller's RendererOptions.
+    const std::optional<RenderViewIdentity>& GetRecordedViewIdentity() const noexcept { return m_renderedViewIdentity; }
+    const Matrix4& GetRecordedView() const noexcept { return m_recordedView; }
+    const Matrix4& GetRecordedProjection() const noexcept { return m_recordedProjection; }
+    std::uint64_t GetCameraCutCount() const noexcept { return m_cameraCutCount; }
+    // LIGHT.1 evidence: the sun and the deferred light count of the last recorded frame.
+    const DirectionalLight& GetRecordedSun() const noexcept { return m_recordedSun; }
+    std::uint32_t GetRecordedAdditionalLightCount() const noexcept { return m_recordedAdditionalLightCount; }
 
     std::optional<MaterialPreviewImage> GetMaterialPreviewImage() const
     {
@@ -842,6 +862,16 @@ class Renderer
         size_t laterSubmissions);
     void LogAsyncDisplacementError();
     // Pure value assembly only; upload and history mutation remain in RecordRenderFrame.
+    // Pre-CAM.4 fly-camera matrices for frames without an explicit view.
+    static RenderView DefaultFlyRenderView(const Camera& camera);
+    // Identity of the last recorded view; a different identity on the next recording is a cut.
+    std::optional<RenderViewIdentity> m_renderedViewIdentity;
+    std::uint64_t m_cameraCutCount = 0;
+    DirectionalLight m_recordedSun;
+    std::uint32_t m_recordedAdditionalLightCount = 0;
+    // Last recorded view and projection, reported through GetRecordedView/Projection.
+    Matrix4 m_recordedView;
+    Matrix4 m_recordedProjection;
     static CameraConstants BuildFrameCameraConstants(
         const Matrix4& currentView,
         const Matrix4& currentViewProjection,
@@ -1190,6 +1220,9 @@ class Renderer
     float m_previousGILightIntensity = 0.0f;
 
     bool m_hasPreviousGILight = false;
+
+    SceneLightConstants m_previousGILocalLights{};
+    bool m_hasPreviousGILocalLights = false;
 
     bool m_packagedRuntime = false;
     bool m_debugUIInitialized = false;
