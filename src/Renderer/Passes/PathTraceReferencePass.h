@@ -4,9 +4,12 @@
 
 #include "Renderer/RayTracing/RayTracingPipeline.h"
 #include "Renderer/RendererLightingMode.h"
+#include "Renderer/Shader/ShaderCompiler.h"
 
 #include <cstdint>
+#include <filesystem>
 #include <string>
+#include <vector>
 
 class DescriptorHeap;
 class GraphicsDevice;
@@ -15,7 +18,7 @@ class ShaderLibrary;
 class RayTracingSceneResources;
 
 // RTXPT.1 progressive reference path tracer. Owns one DXR pipeline per primary constructor (the same
-// library, a different ray-generation export) and three renderer-lifetime resources: the RGBA32F running
+// library, compiled once, a different ray-generation export) and three renderer-lifetime resources: the RGBA32F running
 // mean, an RGBA16F copy of it for presentation, and an R32_UINT statistics row. Every primary shares the
 // resources. The Renderer owns scheduling, accumulation counts, resets and submission.
 class PathTraceReferencePass
@@ -57,6 +60,8 @@ class PathTraceReferencePass
     }
 
     // Records nothing unless the primary's pipeline exists (Initialize, or EnsurePrimaryPipeline).
+    // rtxdiConstantsAddress (root b2) is bound only for PathTracePrimary::RasterReSTIRDI, whose pipeline alone
+    // has that parameter; it must then be non-zero.
     void Execute(
         PathTracePrimary primary,
         ID3D12GraphicsCommandList4* commandList,
@@ -65,7 +70,8 @@ class PathTraceReferencePass
         D3D12_GPU_VIRTUAL_ADDRESS constantsAddress,
         D3D12_GPU_VIRTUAL_ADDRESS sceneLightConstantsAddress,
         unsigned int width,
-        unsigned int height);
+        unsigned int height,
+        D3D12_GPU_VIRTUAL_ADDRESS rtxdiConstantsAddress = 0);
 
     // Copies the presentation image into the HDR scene colour consumed by tone mapping. Both are
     // RGBA16F at the scene extent; the caller checks that before recording.
@@ -96,15 +102,30 @@ class PathTraceReferencePass
         unsigned int width,
         unsigned int height);
 
+    // The compiled library at path, compiled on first request and reused while its sources are unchanged;
+    // null when it does not compile.
+    const ShaderLibraryCompileResult* AcquireLibrary(ShaderLibrary& shaderLibrary, const std::filesystem::path& path);
+
+    struct CompiledLibrary
+    {
+        std::filesystem::path path;
+        ShaderLibraryCompileResult library;
+    };
+
+    // Every primary shares PathTraceReference.hlsl except ReSTIR DI, so this holds at most two libraries
+    // until Shutdown. Pipelines keep their own copies inside their state objects.
+    std::vector<CompiledLibrary> m_libraries;
+
     Texture m_accumulationTexture;
     Texture m_outputTexture;
     Texture m_statisticsTexture;
 
-    static constexpr size_t PrimaryCount = 3;
+    static constexpr size_t PrimaryCount = 4;
 
     RayTracingPipeline m_pipelines[PrimaryCount];
     bool m_pipelineReady[PrimaryCount]{};
     bool m_pipelineFailed[PrimaryCount]{};
+    std::string m_pipelineFailure[PrimaryCount];
 
     unsigned int m_width = 0;
     unsigned int m_height = 0;

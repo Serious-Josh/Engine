@@ -26,6 +26,9 @@ struct ResolvedSceneLight
     float range = 0.0f;
     float innerConeAngle = 0.0f;
     float outerConeAngle = 0.0f;
+
+    // The owning scene object's stable ID. Identity only: no lighting path reads it (RTXPT.3 RTXDI only).
+    std::string objectID;
 };
 
 // Frame-local lighting of one committed scene, captured from a coherent document and its accepted

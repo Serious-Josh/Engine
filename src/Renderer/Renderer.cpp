@@ -20,6 +20,7 @@
 #include "ShaderData.h"
 #include "Scene/DirectionalLight.h"
 #include "Renderer/FrameLighting.h"
+#include "Renderer/Rtxdi/RtxdiShaderData.h"
 #include "Scene/Scene.h"
 #include "DemoContent/MirrorTestScene.h"
 
@@ -3431,6 +3432,26 @@ bool Renderer::ResizeSceneResources(
 
     m_pathTraceStatus.resourceBytes = m_pathTraceReferencePass.GetResourceBytes();
 
+    // Recreated only if a PT mode already allocated it; a new extent also clears an earlier failure.
+    InvalidatePreviousGBufferHistory();
+    m_previousGBufferReadSlot = 0;
+    m_previousGBufferHistoryFailed = false;
+
+    if(!m_previousGBufferHistory.Resize(m_graphicsDevice.GetDevice(), m_resourceDescriptorHeap, width, height))
+    {
+        m_previousGBufferHistoryFailed = true;
+        Log::Error("Previous-frame G-buffer history could not be resized; path tracing continues without it.");
+    }
+
+    m_rtxdiResources.InvalidateHistory();
+    m_rtxdiResourcesFailed = false;
+
+    if(!m_rtxdiResources.Resize(m_graphicsDevice.GetDevice(), m_resourceDescriptorHeap, width, height))
+    {
+        m_rtxdiResourcesFailed = true;
+        Log::Error("RTXDI resources could not be resized.");
+    }
+
     m_pathTraceResetPending = true;
 
     m_sceneWidth = width;
@@ -4250,6 +4271,8 @@ void Renderer::ResetSceneHistory()
     m_nrdFrameIndex = 0;
 
     m_pathTraceResetPending = true;
+    InvalidatePreviousGBufferHistory();
+    m_rtxdiResources.InvalidateHistory();
 }
 
 void Renderer::LoadMaterialTables(std::span<const std::byte> packagedMaterialTables)
@@ -4329,6 +4352,113 @@ bool Renderer::EnsurePathTraceReference()
     return true;
 }
 
+void Renderer::EnsurePreviousGBufferHistory()
+{
+    if(m_previousGBufferHistory.IsInitialized() || m_previousGBufferHistoryFailed)
+    {
+        return;
+    }
+
+    // Creation only: no GPU work is recorded, so allocating during recording is safe. A failure leaves the
+    // path-traced modes rendering without history.
+    if(!m_previousGBufferHistory.Initialize(m_graphicsDevice.GetDevice(), m_resourceDescriptorHeap, m_sceneWidth,
+        m_sceneHeight))
+    {
+        m_previousGBufferHistoryFailed = true;
+        Log::Error("Previous-frame G-buffer history unavailable; path tracing continues without it.");
+        return;
+    }
+
+    Log::Info("Previous-frame G-buffer history allocated (" +
+        std::to_string(m_previousGBufferHistory.GetResourceBytes()) + " bytes).");
+}
+
+void Renderer::EnsureRtxdiResources()
+{
+    if(m_rtxdiResources.IsInitialized() || m_rtxdiResourcesFailed)
+    {
+        return;
+    }
+
+    // Creation only: no GPU work is recorded, so allocating during recording is safe.
+    if(!m_rtxdiResources.Initialize(m_graphicsDevice.GetDevice(), m_resourceDescriptorHeap, m_sceneWidth,
+        m_sceneHeight))
+    {
+        m_rtxdiResourcesFailed = true;
+        Log::Error("RTXDI resources unavailable.");
+        return;
+    }
+
+    Log::Info("RTXDI resources allocated (" + std::to_string(m_rtxdiResources.GetResourceBytes()) + " bytes).");
+}
+
+// RTXPT.2: unprojection relative to the camera (the view without its translation), so positions far from
+// the world origin keep their precision; callers then place results at the camera position.
+static Matrix4 CameraRelativeInverseViewProjection(const Matrix4& view, const Matrix4& projection)
+{
+    Matrix4 rotationOnlyView = view;
+    rotationOnlyView.m[0][3] = 0.0f;
+    rotationOnlyView.m[1][3] = 0.0f;
+    rotationOnlyView.m[2][3] = 0.0f;
+    return (projection * rotationOnlyView).Inverse();
+}
+
+void Renderer::InvalidatePreviousGBufferHistory()
+{
+    m_previousGBufferValid = false;
+    m_pendingPreviousGBufferCopy.reset();
+}
+
+void Renderer::RecordPreviousGBufferCopy(ID3D12GraphicsCommandList* commandList, const PreviousGBufferCamera& camera)
+{
+    if(!m_previousGBufferHistory.IsInitialized())
+    {
+        return;
+    }
+
+    // Never the read slot: this frame's consumers may still read it earlier in the same command list.
+    const unsigned int writeSlot = 1u - m_previousGBufferReadSlot;
+
+    if(!m_previousGBufferHistory.RecordCopy(commandList, m_gBuffer, writeSlot))
+    {
+        return;
+    }
+
+    m_pendingPreviousGBufferCopy = PendingPreviousGBufferCopy{writeSlot, camera};
+    ++m_previousGBufferCopiesRecorded;
+}
+
+void Renderer::CommitPreviousGBufferCopy()
+{
+    if(!m_pendingPreviousGBufferCopy)
+    {
+        return;
+    }
+
+    const PendingPreviousGBufferCopy& pending = *m_pendingPreviousGBufferCopy;
+    m_previousGBufferReadSlot = pending.slot;
+    m_previousGBufferCameras[pending.slot] = pending.camera;
+    m_previousGBufferValid = true;
+    ++m_previousGBufferCopiesSubmitted;
+    m_pendingPreviousGBufferCopy.reset();
+}
+
+bool Renderer::TryGetPreviousGBuffer(PreviousGBufferView& view) const
+{
+    if(!m_previousGBufferValid || !m_previousGBufferHistory.IsInitialized())
+    {
+        return false;
+    }
+
+    const PreviousGBufferHistory::Slot& slot = m_previousGBufferHistory.GetSlot(m_previousGBufferReadSlot);
+    view.depthIndex = slot.depth.GetDescriptorIndex();
+    view.surfaceIndex = slot.surface.GetDescriptorIndex();
+    view.geometricNormalIndex = slot.geometricNormal.GetDescriptorIndex();
+    view.materialIndex = slot.material.GetDescriptorIndex();
+    view.camera = m_previousGBufferCameras[m_previousGBufferReadSlot];
+    return true;
+}
+
 void Renderer::EvaluatePathTraceRasterPrimary()
 {
     const PathTraceRasterPrimaryStatus previous = m_rasterPrimaryStatus;
@@ -4382,6 +4512,148 @@ void Renderer::EvaluatePathTraceRasterPrimary()
             Log::Info("Raster-primary path tracing mode unavailable, rendering Legacy: " + m_rasterPrimaryStatus.reason);
         }
     }
+}
+
+void Renderer::EvaluatePathTraceReSTIRDI()
+{
+    const PathTraceRasterPrimaryStatus previous = m_restirDIStatus;
+
+    // The ReSTIR DI variant is the raster-primary mode plus RTXDI, so every raster-primary prerequisite applies.
+    EvaluatePathTraceRasterPrimary();
+    std::string pipelineFailure;
+
+    if(m_rasterPrimaryStatus.availability != PathTraceRasterPrimaryAvailability::Available)
+    {
+        m_restirDIStatus = {PathTraceRasterPrimaryAvailability::Unavailable,
+            "Raster primary unavailable: " + m_rasterPrimaryStatus.reason};
+    }
+    else if(!m_pathTraceReferencePass.EnsurePrimaryPipeline(m_graphicsDevice, m_shaderLibrary,
+        PathTracePrimary::RasterReSTIRDI, pipelineFailure))
+    {
+        m_restirDIStatus = {PathTraceRasterPrimaryAvailability::Unavailable, pipelineFailure};
+    }
+    else
+    {
+        EnsureRtxdiResources();
+
+        if(m_rtxdiResources.IsInitialized())
+        {
+            m_restirDIStatus = {PathTraceRasterPrimaryAvailability::Available, std::string()};
+        }
+        else
+        {
+            m_restirDIStatus = {PathTraceRasterPrimaryAvailability::Unavailable,
+                "RTXDI reservoir resources could not be allocated."};
+        }
+    }
+
+    if(m_restirDIStatus.availability != previous.availability || m_restirDIStatus.reason != previous.reason)
+    {
+        if(m_restirDIStatus.availability == PathTraceRasterPrimaryAvailability::Available)
+        {
+            Log::Info("Raster-primary ReSTIR DI path tracing mode available.");
+        }
+        else
+        {
+            Log::Info("Raster-primary ReSTIR DI path tracing mode unavailable, rendering Legacy: " +
+                m_restirDIStatus.reason);
+        }
+    }
+}
+
+bool Renderer::PrepareRtxdiFrame(ID3D12GraphicsCommandList* commandList, const FrameLighting& frameLighting,
+    const PathTraceReferenceConstants& constants, const Matrix4& view,
+    D3D12_GPU_VIRTUAL_ADDRESS& rtxdiConstantsAddress)
+{
+    // The same HDRI distribution the path tracer binds this frame.
+    RtxdiEnvironmentSource environment;
+    environment.textureIndex = constants.environmentTextureIndex;
+    environment.conditionalCDFIndex = constants.environmentConditionalCDFIndex;
+    environment.marginalCDFIndex = constants.environmentMarginalCDFIndex;
+    environment.width = constants.environmentWidth;
+    environment.height = constants.environmentHeight;
+    environment.totalWeight = constants.environmentTotalWeight;
+
+    // RTXPT.3 R3.5: previous reservoirs are reusable only against identical visibility geometry and materials
+    // (the renderer's accumulation-reset identities) and with the previous frame's surfaces (R4 history).
+    RtxdiHistorySignature signature;
+    signature.sceneResourceLifetime = m_sceneResourceLifetime;
+    signature.topLevelAddress = m_rayTracingScene.GetTopLevel().GetGPUAddress();
+    signature.topLevelRecording = m_rayTracingScene.GetTLASRecordingIdentity();
+    signature.materialRevision = m_materialPublication.revision;
+
+    PreviousGBufferView previousGBuffer;
+    const bool previousSurfacesAvailable = TryGetPreviousGBuffer(previousGBuffer);
+
+    RtxdiLightSet lights;
+    RtxdiFrame frame;
+
+    if(!BuildRtxdiLightSet(frameLighting, environment, lights) ||
+        !m_rtxdiResources.BeginFrame(lights, signature, previousSurfacesAvailable, frame))
+    {
+        Log::Error("Failed to prepare the RTXDI frame.");
+        return false;
+    }
+
+    PathTraceRtxdiConstants rtxdiConstants{};
+    rtxdiConstants.lightBuffer = frame.lightBufferParameters;
+    rtxdiConstants.reservoirBuffer = frame.reservoirBufferParameters;
+    rtxdiConstants.bufferIndices = frame.bufferIndices;
+    rtxdiConstants.reservoirBufferIndex = m_rtxdiResources.GetReservoirUAVIndex();
+    rtxdiConstants.localLightSamples = RtxdiInitialLocalLightSamples;
+    rtxdiConstants.infiniteLightSamples = RtxdiInitialInfiniteLightSamples;
+
+    for(std::size_t index = 0; index < frame.lightRecords.size(); ++index)
+    {
+        rtxdiConstants.lightRecords[index * 2] = frame.lightRecords[index].kind;
+        rtxdiConstants.lightRecords[index * 2 + 1] = frame.lightRecords[index].sourceIndex;
+    }
+
+    rtxdiConstants.runtime = frame.runtimeParameters;
+    rtxdiConstants.spatioTemporal = frame.spatioTemporalParameters;
+    rtxdiConstants.historyValid = frame.historyValid ? 1u : 0u;
+    rtxdiConstants.neighborOffsetsIndex = m_rtxdiResources.GetNeighborOffsetsSRVIndex();
+    rtxdiConstants.motionIndex = m_gBuffer.GetMotion().GetSRVIndex();
+    rtxdiConstants.currentLightCount = static_cast<std::uint32_t>(frame.lightRecords.size());
+    rtxdiConstants.previousLightCount = frame.previousLightCount;
+
+    for(std::size_t index = 0; index < frame.lightTranslation.size(); ++index)
+    {
+        rtxdiConstants.lightTranslation[index] = frame.lightTranslation[index];
+    }
+
+    // Linear depth along each camera's forward axis (row 2 of a left-handed view, as Matrix4::LookAt builds it).
+    rtxdiConstants.cameraForward[0] = view.m[2][0];
+    rtxdiConstants.cameraForward[1] = view.m[2][1];
+    rtxdiConstants.cameraForward[2] = view.m[2][2];
+
+    if(frame.historyValid)
+    {
+        rtxdiConstants.previousDepthIndex = previousGBuffer.depthIndex;
+        rtxdiConstants.previousSurfaceIndex = previousGBuffer.surfaceIndex;
+        rtxdiConstants.previousGeometricNormalIndex = previousGBuffer.geometricNormalIndex;
+        rtxdiConstants.previousMaterialIndex = previousGBuffer.materialIndex;
+        rtxdiConstants.previousCameraPosition[0] = previousGBuffer.camera.position.x;
+        rtxdiConstants.previousCameraPosition[1] = previousGBuffer.camera.position.y;
+        rtxdiConstants.previousCameraPosition[2] = previousGBuffer.camera.position.z;
+        rtxdiConstants.previousCameraForward[0] = previousGBuffer.camera.view.m[2][0];
+        rtxdiConstants.previousCameraForward[1] = previousGBuffer.camera.view.m[2][1];
+        rtxdiConstants.previousCameraForward[2] = previousGBuffer.camera.view.m[2][2];
+        rtxdiConstants.previousInverseCameraRelativeViewProjection =
+            previousGBuffer.camera.inverseCameraRelativeViewProjection;
+    }
+
+    rtxdiConstantsAddress = m_uploadBuffer.Allocate(&rtxdiConstants, sizeof(PathTraceRtxdiConstants),
+        D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
+
+    if(rtxdiConstantsAddress == 0)
+    {
+        Log::Error("Failed to allocate RTXDI constants.");
+        return false;
+    }
+
+    m_rtxdiResources.GetReservoirBuffer().Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    return true;
 }
 
 bool Renderer::SamePathTraceAccumulationKey(const PathTraceAccumulationKey& left, const PathTraceAccumulationKey& right)
@@ -4455,6 +4727,13 @@ bool Renderer::RecordPathTraceReference(
         settings.maxAccumulatedSamples - accumulated : 0u;
     const std::uint32_t frameSamples = (std::min)(settings.samplesPerFrame, remaining);
 
+    // RTXPT.3 R3.5: a ReSTIR DI frame that traces nothing writes no reservoirs, so the committed ones would no
+    // longer belong to the immediately preceding frame. They are dropped.
+    if(primary == PathTracePrimary::RasterReSTIRDI && frameSamples == 0)
+    {
+        m_rtxdiResources.InvalidateHistory();
+    }
+
     // Stage 2: one progressive iteration. A converged image is held without tracing.
     if(frameSamples > 0)
     {
@@ -4498,13 +4777,7 @@ bool Renderer::RecordPathTraceReference(
         constants.sunIrradiance[2] = sunIrradiance.z;
         constants.randomSeed = m_pathTraceRandomSeed;
 
-        // RTXPT.2 raster primary: unprojection relative to the camera (the view without its translation),
-        // so positions far from the world origin keep their precision; then placed at the camera position.
-        Matrix4 rotationOnlyView = view;
-        rotationOnlyView.m[0][3] = 0.0f;
-        rotationOnlyView.m[1][3] = 0.0f;
-        rotationOnlyView.m[2][3] = 0.0f;
-        constants.inverseCameraRelativeViewProjection = (projection * rotationOnlyView).Inverse();
+        constants.inverseCameraRelativeViewProjection = CameraRelativeInverseViewProjection(view, projection);
         constants.cameraPosition[0] = cameraPosition.x;
         constants.cameraPosition[1] = cameraPosition.y;
         constants.cameraPosition[2] = cameraPosition.z;
@@ -4515,7 +4788,7 @@ bool Renderer::RecordPathTraceReference(
 
         // EndGeometryPass already left the G-buffer readable; restating it keeps the raster primary's
         // reads independent of that ordering.
-        if(primary == PathTracePrimary::Raster)
+        if(primary == PathTracePrimary::Raster || primary == PathTracePrimary::RasterReSTIRDI)
         {
             m_gBuffer.GetDepth().Transition(commandList, shaderReadState);
             m_gBuffer.GetMaterial().Transition(commandList, shaderReadState);
@@ -4532,10 +4805,35 @@ bool Renderer::RecordPathTraceReference(
             return false;
         }
 
+        // RTXPT.3: the ReSTIR DI variant's RTXDI constants and reservoir buffer.
+        D3D12_GPU_VIRTUAL_ADDRESS rtxdiConstantsAddress = 0;
+        const bool usesRtxdi = primary == PathTracePrimary::RasterReSTIRDI;
+
+        if(usesRtxdi && !PrepareRtxdiFrame(commandList, frameLighting, constants, view, rtxdiConstantsAddress))
+        {
+            return false;
+        }
+
+        // The motion vectors are read by the ReSTIR DI variant's reprojection.
+        if(usesRtxdi)
+        {
+            m_gBuffer.GetMotion().Transition(commandList, shaderReadState);
+        }
+
         m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::PathTraceReference);
         m_pathTraceReferencePass.Execute(primary, m_commandContext.GetRayTracingCommandList(), m_resourceDescriptorHeap,
-            m_rayTracingScene, constantsAddress, sceneLightConstantsAddress, m_sceneWidth, m_sceneHeight);
+            m_rayTracingScene, constantsAddress, sceneLightConstantsAddress, m_sceneWidth, m_sceneHeight,
+            rtxdiConstantsAddress);
         m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::PathTraceReference);
+
+        if(usesRtxdi)
+        {
+            // Orders this frame's reservoir writes before any later access to the buffer.
+            D3D12_RESOURCE_BARRIER reservoirBarrier{};
+            reservoirBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+            reservoirBarrier.UAV.pResource = m_rtxdiResources.GetReservoirBuffer().GetResource();
+            commandList->ResourceBarrier(1, &reservoirBarrier);
+        }
     }
 
     m_pathTracePendingSamples = frameSamples;
@@ -5048,6 +5346,8 @@ Renderer::FrameRenderResult Renderer::Render(
         // iteration may or may not have been written.
         m_pathTraceResetPending = true;
         m_pathTracePendingSamples = 0;
+        InvalidatePreviousGBufferHistory();
+        m_rtxdiResources.InvalidateHistory();
         LogAsyncDisplacementError();
         return FrameRenderResult::Error;
     }
@@ -5607,6 +5907,8 @@ bool Renderer::RecordRenderFrame(
     // from this frame's G-buffer; it shares the settings, accumulation and resets.
     const bool referenceRequested = options.lightingMode == RendererLightingMode::PathTracedReference;
     const bool rasterPrimaryRequested = options.lightingMode == RendererLightingMode::PathTracedRasterPrimary;
+    // RTXPT.3: the raster-primary mode with RTXDI direct light at its first vertex; same settings and resets.
+    const bool restirDIRequested = options.lightingMode == RendererLightingMode::PathTracedRasterPrimaryReSTIRDI;
     const bool pathTraceSettingsValid = hasRenderableMeshes && IsValidPathTraceReferenceSettings(options.pathTraceReference);
 
     if(rasterPrimaryRequested)
@@ -5614,10 +5916,25 @@ bool Renderer::RecordRenderFrame(
         EvaluatePathTraceRasterPrimary();
     }
 
+    if(restirDIRequested)
+    {
+        EvaluatePathTraceReSTIRDI();
+    }
+
     const bool rasterPrimaryAvailable =
         m_rasterPrimaryStatus.availability == PathTraceRasterPrimaryAvailability::Available;
-    const PathTracePrimary pathTracePrimary = rasterPrimaryRequested ? PathTracePrimary::Raster :
-        m_pathTraceReferencePrimary;
+    const bool restirDIAvailable = m_restirDIStatus.availability == PathTraceRasterPrimaryAvailability::Available;
+    PathTracePrimary pathTracePrimary = m_pathTraceReferencePrimary;
+
+    if(rasterPrimaryRequested)
+    {
+        pathTracePrimary = PathTracePrimary::Raster;
+    }
+    else if(restirDIRequested)
+    {
+        pathTracePrimary = PathTracePrimary::RasterReSTIRDI;
+    }
+
     const auto referenceRunnable = [&]()
     {
         std::string ignoredFailure;
@@ -5626,7 +5943,8 @@ bool Renderer::RecordRenderFrame(
                 ignoredFailure));
     };
     const bool runPathTrace = pathTraceSettingsValid &&
-        ((referenceRequested && referenceRunnable()) || (rasterPrimaryRequested && rasterPrimaryAvailable));
+        ((referenceRequested && referenceRunnable()) || (rasterPrimaryRequested && rasterPrimaryAvailable) ||
+        (restirDIRequested && restirDIAvailable));
 
     if(m_pathTraceRenderedLastFrame && !runPathTrace)
     {
@@ -5641,6 +5959,26 @@ bool Renderer::RecordRenderFrame(
     if(pathTraceEnteredThisFrame)
     {
         m_pathTraceResetPending = true;
+    }
+
+    // A copy left from an earlier, unsubmitted recording never carries over.
+    m_pendingPreviousGBufferCopy.reset();
+    m_previousGBufferAvailableThisFrame = false;
+    m_rtxdiResources.AbandonFrame();
+
+    const bool pathTracePrimaryChanged = runPathTrace && m_previousGBufferPrimary &&
+        *m_previousGBufferPrimary != pathTracePrimary;
+
+    if(pathTraceEnteredThisFrame || pathTracePrimaryChanged)
+    {
+        InvalidatePreviousGBufferHistory();
+        m_rtxdiResources.InvalidateHistory();
+    }
+
+    if(runPathTrace)
+    {
+        m_previousGBufferPrimary = pathTracePrimary;
+        EnsurePreviousGBufferHistory();
     }
 
     const Matrix4 currentView = frameView.view;
@@ -5969,6 +6307,13 @@ bool Renderer::RecordRenderFrame(
         {
             return false;
         }
+
+        // The G-buffer is final here; the copy precedes tone mapping and the Editor overlays and restores
+        // every G-buffer state it changes.
+        const PreviousGBufferCamera copiedCamera{currentView, currentProjection,
+            CameraRelativeInverseViewProjection(currentView, currentProjection), frameView.position};
+        m_previousGBufferAvailableThisFrame = m_previousGBufferValid;
+        RecordPreviousGBufferCopy(commandList, copiedCamera);
     }
     // Preserve the fixed AO -> shadows -> reflections -> GI -> denoise -> lighting order.
     else if (hasRenderableMeshes)
@@ -6508,6 +6853,10 @@ bool Renderer::RecordRenderFrame(
         return false;
     }
 
+    // The copy is now ordered on the queue ahead of every later frame; it becomes the previous frame.
+    CommitPreviousGBufferCopy();
+    m_rtxdiResources.CommitFrame();
+
     // Capture the successful submission fence now; confirmation retains owners, not completion proof.
     const auto materialSubmissionFence = m_commandContext.GetLastSubmissionFenceValue();
     if (!ConfirmRecordedMaterialSubmission(
@@ -6685,7 +7034,15 @@ void Renderer::Shutdown()
     m_giSignedCorrectionInitialized = false;
     m_pathTraceReferencePass.Shutdown();
     m_pathTraceStatus = {};
+    InvalidatePreviousGBufferHistory();
+    m_previousGBufferHistory.Shutdown();
+    m_previousGBufferHistoryFailed = false;
+    m_previousGBufferReadSlot = 0;
+    m_previousGBufferPrimary.reset();
+    m_rtxdiResources.Shutdown();
+    m_rtxdiResourcesFailed = false;
     m_rasterPrimaryStatus = {};
+    m_restirDIStatus = {};
     m_materialTables.Shutdown();
     m_materialTableUnavailableReason.clear();
     m_pathTraceAccumulationKey.reset();

@@ -290,6 +290,21 @@ public:
     bool PrepareMetadata(FileSceneAssetCatalog& catalog, std::string* errorMessage = nullptr);
     bool CommitMetadata(FileSceneAssetCatalog& catalog, std::string* errorMessage = nullptr);
 
+    struct MeshResidencyRequest
+    {
+        SceneObjectMetadata selection;
+        MeshResidencyCandidate candidate;
+    };
+
+    // Matches RayTracingSceneResources::MaxCandidateProposals; one renderer
+    // candidate carries every entry of a batch.
+    static constexpr size_t MaxMeshResidencyBatch = 32;
+
+    // All-or-nothing: stages every request as one transaction, or none. On
+    // failure, failedObjectID names the request responsible.
+    std::optional<MeshResidencyToken> PrepareMeshResidencyBatch(std::span<const MeshResidencyRequest> requests,
+        FileSceneAssetCatalog& catalog, std::string* errorMessage = nullptr, std::string* failedObjectID = nullptr);
+    // One-entry batch.
     std::optional<MeshResidencyToken> PrepareMeshResidency(const SceneObjectMetadata& selection,
         FileSceneAssetCatalog& catalog, const MeshResidencyCandidate& candidate, std::string* errorMessage = nullptr);
     void CancelMeshResidency() noexcept;
@@ -367,6 +382,7 @@ private:
     friend class MarqueeSelectionVerification;
     friend class PresentationTransformVerification;
     friend class SceneHierarchyVerification;
+    friend class ResidencyBatchVerification;
 
     // H.3 internal seam only. Production admission keeps rejecting nonempty parents until H.4.
     // Validates the candidate edges, evaluates every world, then commits document parents,
@@ -384,28 +400,46 @@ private:
 
     // Only Engine archive bootstrap or an explicit diagnostic can open this runtime's gate.
     bool m_cookedPublicationAuthorized = false;
-    std::optional<SceneObjectMetadata> ValidatePreparedMeshResidencyIdentity(const MeshResidencyToken& token,
+    struct MeshResidencyEntry;
+    struct MeshResidencyPreparation;
+    std::optional<MeshResidencyEntry> PrepareMeshResidencyEntry(const MeshResidencyRequest& request,
+        FileSceneAssetCatalog& catalog, std::span<const MeshResidencyEntry> staged, std::string* errorMessage) const;
+    bool ValidatePreparedMeshResidencyTransaction(const MeshResidencyToken& token,
         const FileSceneAssetCatalog& catalog, std::string* errorMessage) const;
-    MeshResidencySourceLock ValidatePreparedMeshResidency(const MeshResidencyToken& token,
-        FileSceneAssetCatalog& catalog, std::string* errorMessage) const;
+    std::optional<SceneObjectMetadata> ValidatePreparedMeshResidencyEntry(const MeshResidencyEntry& prepared,
+        const FileSceneAssetCatalog& catalog, std::string* errorMessage) const;
+    MeshResidencySourceLock ValidatePreparedMeshResidencySources(const MeshResidencyEntry& prepared,
+        const SceneObjectMetadata& current, FileSceneAssetCatalog& catalog, std::string* errorMessage) const;
+    // Identity of every entry; failedObjectID names the first stale entry.
+    bool ValidatePreparedMeshResidencyIdentity(const MeshResidencyToken& token,
+        const FileSceneAssetCatalog& catalog, std::string* errorMessage, std::string* failedObjectID = nullptr) const;
+    // Identity, sources and staged bindings of every entry, returning one pin per
+    // unique source mesh. Empty pins mean failure; failedObjectID names the entry.
+    MeshResidencySourcePins ValidatePreparedMeshResidency(const MeshResidencyToken& token,
+        FileSceneAssetCatalog& catalog, std::string* errorMessage, std::string* failedObjectID = nullptr) const;
     // Accepted transaction only: caller retains the freshly validated source
-    // pin and proves matching renderer readiness, epochs and revision capacity.
+    // pins and proves matching renderer readiness, epochs and revision capacity.
     void ApplyPreparedMeshResidency() noexcept;
     bool CommitMeshResidency(const MeshResidencyToken& token, FileSceneAssetCatalog& catalog,
         std::string* errorMessage = nullptr);
 
-    struct MeshResidencyPreparation
+    struct MeshResidencyEntry
     {
-        MeshResidencyToken token;
         SceneObjectMetadata selection;
         MeshResidencyCandidate candidate;
-
-        FileSceneAssetCatalog* catalog = nullptr;
         Material* fallback = nullptr;
 
         std::map<std::string, Material*> originalSlots;
         std::map<std::string, Material*> runtimeSlots;
         std::map<std::string, Material*> committedSlots;
+    };
+
+    // Entries are fully built before staging; the commit only iterates them.
+    struct MeshResidencyPreparation
+    {
+        MeshResidencyToken token;
+        FileSceneAssetCatalog* catalog = nullptr;
+        std::vector<MeshResidencyEntry> entries;
     };
     std::optional<MeshResidencyPreparation> m_meshResidency;
 

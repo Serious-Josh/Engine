@@ -4,6 +4,7 @@
 #include "Scene/DirectionalLight.h"
 #include "Scene/SceneLighting.h"
 
+#include <array>
 #include <string>
 
 static_assert(SceneLightConstants::Capacity == SceneLightingSnapshot::MaximumAdditionalLights,
@@ -18,6 +19,11 @@ struct FrameLighting
 
     // Deferred direct lights (b3), also bound unchanged for local secondary-hit RTGI (b2).
     SceneLightConstants table{};
+
+    // RTXPT.3: stable scene object IDs, used only by the RTXDI light bridge. tableLightIDs parallels the
+    // first table.lightCount records; sunObjectID names the shadow owner and is empty for the legacy sun.
+    std::array<std::string, SceneLightConstants::Capacity> tableLightIDs;
+    std::string sunObjectID;
 };
 
 // Selects the sun and fills the light table in one step, so a frame never mixes sources.

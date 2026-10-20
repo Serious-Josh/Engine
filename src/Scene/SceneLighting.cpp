@@ -196,6 +196,7 @@ bool BuildSceneLightingSnapshot(const SceneDocument& document,
         resolved.range = light.range;
         resolved.innerConeAngle = light.innerConeAngle;
         resolved.outerConeAngle = light.outerConeAngle;
+        resolved.objectID = object.id;
 
         if(&object == shadowOwner)
         {

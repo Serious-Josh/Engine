@@ -1,0 +1,61 @@
+warning: in the working copy of 'CMakeLists.txt', LF will be replaced by CRLF the next time Git touches it
+[1mdiff --git a/CMakeLists.txt b/CMakeLists.txt[m
+[1mindex b418b68..fee8eaf 100644[m
+[1m--- a/CMakeLists.txt[m
+[1m+++ b/CMakeLists.txt[m
+[36m@@ -16,6 +16,26 @@[m [mset(CMAKE_CXX_EXTENSIONS OFF)[m
+ [m
+ option(ENGINE_BUILD_DIAGNOSTICS "Build local regression diagnostics (Debug only)" OFF)[m
+ [m
+[32m+[m[32m# NVIDIA RTXDI - required rendering dependency.[m
+[32m+[m[32m# Kept outside the Engine repository under NVIDIA's own license.[m
+[32m+[m[32mset(ENGINE_RTXDI_ROOT[m
+[32m+[m[32m    "${CMAKE_CURRENT_SOURCE_DIR}/../RTXDI-Library"[m
+[32m+[m[32m    CACHE PATH "Path to NVIDIA RTXDI-Library"[m
+[32m+[m[32m)[m
+[32m+[m
+[32m+[m[32mif(NOT EXISTS "${ENGINE_RTXDI_ROOT}/CMakeLists.txt"[m
+[32m+[m[32m   OR NOT EXISTS "${ENGINE_RTXDI_ROOT}/Include/Rtxdi/DI/ReSTIRDI.h")[m
+[32m+[m[32m    message(FATAL_ERROR[m
+[32m+[m[32m        "RTXDI-Library not found at '${ENGINE_RTXDI_ROOT}'. "[m
+[32m+[m[32m        "Set ENGINE_RTXDI_ROOT to your RTXDI-Library checkout."[m
+[32m+[m[32m    )[m
+[32m+[m[32mendif()[m
+[32m+[m
+[32m+[m[32madd_subdirectory([m
+[32m+[m[32m    "${ENGINE_RTXDI_ROOT}"[m
+[32m+[m[32m    "${CMAKE_CURRENT_BINARY_DIR}/RTXDI"[m
+[32m+[m[32m)[m
+[32m+[m
+ include(FetchContent)[m
+ [m
+ # Assimp[m
+[36m@@ -195,6 +215,7 @@[m [madd_library(EngineCore OBJECT[m
+     src/Renderer/RendererMembershipCandidate.cpp[m
+     src/Renderer/Passes/RayTracedShadowPass.cpp[m
+     src/Renderer/Passes/PathTraceReferencePass.cpp[m
+[32m+[m[32m    src/Renderer/PreviousGBufferHistory.cpp[m
+     src/Renderer/MaterialTables/MaterialTableFile.cpp[m
+     src/Renderer/MaterialTables/MaterialTableResources.cpp[m
+     src/Renderer/Passes/ShadowDenoisePass.cpp[m
+[36m@@ -467,6 +488,12 @@[m [madd_custom_command([m
+         "${CMAKE_CURRENT_SOURCE_DIR}/external/NRD/Shaders/NRDConfig.hlsli"[m
+         "$<TARGET_FILE_DIR:Engine>/assets/Shaders/NRD"[m
+ [m
+[32m+[m[32m    # Deploy NVIDIA RTXDI shader headers for runtime DXC compilation.[m
+[32m+[m[32m    # The SDK remains outside the Engine source repository.[m
+[32m+[m[32m    COMMAND ${CMAKE_COMMAND} -E copy_directory[m
+[32m+[m[32m        "${ENGINE_RTXDI_ROOT}/Include/Rtxdi"[m
+[32m+[m[32m        "$<TARGET_FILE_DIR:Engine>/assets/Shaders/Rtxdi"[m
+[32m+[m
+     COMMAND ${CMAKE_COMMAND} -E copy_if_different[m
+         $<TARGET_FILE:assimp>[m
+         $<TARGET_FILE_DIR:Engine>[m
+[36m@@ -494,6 +521,7 @@[m [mtarget_link_libraries(EngineCore[m
+         EnginePhysics[m
+         EngineScripting[m
+         EngineScriptAssets[m
+[32m+[m[32m        Rtxdi[m
+         shell32[m
+         ole32[m
+         bcrypt[m

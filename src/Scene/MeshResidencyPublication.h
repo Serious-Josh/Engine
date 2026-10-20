@@ -31,6 +31,9 @@ public:
 
         std::uint64_t candidateFence = 0;
         std::uint64_t fenceLifetime = 0;
+
+        // Batch entry responsible for a Stale/Unsupported/Failed result, when one is.
+        std::string failedObjectID;
     };
 
     struct AcceptanceResult
@@ -38,6 +41,7 @@ public:
         Status status = Status::Retry;
         std::string message;
         bool published = false;
+        std::string failedObjectID;
     };
 
     MeshResidencyPublication() = default;
@@ -71,6 +75,9 @@ public:
 
 private:
     friend class Engine;
+#if defined(ENGINE_HAS_VERIFICATION)
+    friend class ResidencyBatchVerification;
+#endif
     // Engine's immediate pre-Render boundary only. Validates and commits with a
     // local source pin; no retained receipt authorizes later-frame publication.
     AcceptanceResult PublishAtBoundary(Renderer& renderer, FileSceneRuntime& runtime,
@@ -81,7 +88,7 @@ private:
     static Readiness CheckPrepared(Renderer& renderer, const FileSceneRuntime& runtime,
         FileSceneAssetCatalog& catalog, const MeshResidencyToken& sceneToken,
         const RayTracingSceneResources::ReplacementCandidate& candidate, unsigned int frameSlot,
-        std::optional<MeshResidencySourceLock>* sourcePin,
+        std::optional<MeshResidencySourcePins>* sourcePins,
         RayTracingSceneResources::AdoptionEvidence* adoptionEvidence);
     void ApplyPreparedPublication(Renderer& renderer, FileSceneRuntime& runtime,
         const RayTracingSceneResources::AdoptionEvidence& evidence) noexcept;

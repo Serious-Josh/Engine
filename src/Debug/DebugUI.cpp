@@ -988,11 +988,18 @@ void DebugUI::SetPathTraceRasterPrimaryStatus(PathTraceRasterPrimaryAvailability
     m_rasterPrimaryReason = reason;
 }
 
+void DebugUI::SetPathTraceReSTIRDIStatus(PathTraceRasterPrimaryAvailability availability, const std::string& reason)
+{
+    m_restirDIAvailability = availability;
+    m_restirDIReason = reason;
+}
+
 void DebugUI::DrawPathTraceReferenceSettings()
 {
     ImGui::TextUnformatted("Lighting mode (experimental, not saved)");
 
-    const char* modes[] = {"Legacy", "Path Traced Reference", "Path Traced Raster Primary"};
+    const char* modes[] = {"Legacy", "Path Traced Reference", "Path Traced Raster Primary",
+        "Path Traced Raster Primary + ReSTIR DI"};
     ImGui::Combo("Lighting mode", &m_lightingMode, modes, IM_ARRAYSIZE(modes));
 
     if (m_lightingMode == 0)
@@ -1018,12 +1025,17 @@ void DebugUI::DrawPathTraceReferenceSettings()
     }
 
     const bool rasterPrimary = m_lightingMode == 2;
+    const bool restirDI = m_lightingMode == 3;
 
     if (rasterPrimary && m_rasterPrimaryAvailability == PathTraceRasterPrimaryAvailability::Unavailable)
     {
         ImGui::TextWrapped("Unavailable, rendering Legacy: %s", m_rasterPrimaryReason.c_str());
     }
-    else if (!rasterPrimary && m_pathTraceAvailability == PathTraceReferenceAvailability::Unavailable)
+    else if (restirDI && m_restirDIAvailability == PathTraceRasterPrimaryAvailability::Unavailable)
+    {
+        ImGui::TextWrapped("Unavailable, rendering Legacy: %s", m_restirDIReason.c_str());
+    }
+    else if (!rasterPrimary && !restirDI && m_pathTraceAvailability == PathTraceReferenceAvailability::Unavailable)
     {
         ImGui::TextWrapped("Unavailable, rendering Legacy: %s", m_pathTraceUnavailableReason.c_str());
     }

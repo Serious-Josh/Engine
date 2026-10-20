@@ -22,7 +22,11 @@ endforeach()
 
 # Only fixed, build-owned assembly directories are replaced. Never clean a user-selected project.
 file(REMOVE_RECURSE "${stage}")
-file(MAKE_DIRECTORY "${stage}/Game" "${stage}/assets/Shaders/NRD")
+file(MAKE_DIRECTORY
+    "${stage}/Game"
+    "${stage}/assets/Shaders/NRD"
+    "${stage}/assets/Shaders/Rtxdi"
+)
 file(COPY "$<TARGET_FILE:Engine>" DESTINATION "${stage}")
 file(COPY "$<TARGET_FILE:EngineRuntime>" DESTINATION "${stage}/Game")
 file(COPY "@CMAKE_BINARY_DIR@/AngelScriptNotices.txt" DESTINATION "${stage}")
@@ -39,6 +43,10 @@ file(COPY "${source}/assets/Shaders/" DESTINATION "${stage}/assets/Shaders"
     FILES_MATCHING PATTERN "*.hlsl" PATTERN "*.hlsli")
 file(COPY "${source}/external/NRD/Shaders/NRD.hlsli"
     "${source}/external/NRD/Shaders/NRDConfig.hlsli" DESTINATION "${stage}/assets/Shaders/NRD")
+# RTXDI shader headers for portable Editor runtime compilation.
+file(COPY "@ENGINE_RTXDI_ROOT@/Include/Rtxdi/"
+    DESTINATION "${stage}/assets/Shaders/Rtxdi"
+    FILES_MATCHING PATTERN "*.h" PATTERN "*.hlsli")
 # RTXPT.1A.2 path-tracing material tables with their SHA-256 sidecar (the runtime verifies the pin itself).
 file(COPY "${source}/assets/MaterialTables/" DESTINATION "${stage}/assets/MaterialTables"
     FILES_MATCHING PATTERN "*.emt" PATTERN "*.emt.sha256")
@@ -52,6 +60,7 @@ file(COPY "${source}/assets/Textures/Materials/" DESTINATION "${stage}/assets/Te
 set(notices "Third-party components retain their respective licenses below.\nThis software contains source code provided by NVIDIA Corporation.\nWindows SDK and MSVC redistributable components are subject to Microsoft's distribution terms.\n\n")
 foreach(license IN ITEMS
     "${source}/external/NRD/LICENSE.txt" "${source}/external/NRI/LICENSE.txt"
+    "@ENGINE_RTXDI_ROOT@/LICENSE.txt"
     "@assimp_SOURCE_DIR@/LICENSE" "@directxtex_SOURCE_DIR@/LICENSE"
     "@nlohmann_json_SOURCE_DIR@/LICENSE.MIT" "@box3d_SOURCE_DIR@/LICENSE"
     "${source}/cmake/PortableImGuiLicense.txt")

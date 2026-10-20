@@ -88,6 +88,7 @@ bool BuildFrameLighting(const DirectionalLight& legacySun, const SceneLightingSn
             candidate.sun.direction = owner.direction;
             candidate.sun.color = owner.color;
             candidate.sun.intensity = owner.intensity;
+            candidate.sunObjectID = owner.objectID;
         }
     }
 
@@ -98,6 +99,7 @@ bool BuildFrameLighting(const DirectionalLight& legacySun, const SceneLightingSn
             return Fail(error, "A scene Light is not finite; lighting was not published.");
         }
 
+        candidate.tableLightIDs[candidate.table.lightCount] = light.objectID;
         ++candidate.table.lightCount;
     }
 

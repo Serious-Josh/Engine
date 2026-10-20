@@ -5,6 +5,8 @@
 
 #include <d3d12.h>
 
+#include <vector>
+
 class ShaderLibrary;
 
 class RayTracingPipeline
@@ -17,6 +19,12 @@ class RayTracingPipeline
     bool Initialize(
         ID3D12Device5* device,
         ShaderLibrary& shaderLibrary,
+        const RayTracingPipelineDescription& description);
+    // Builds the pipeline from an already compiled description.shaderPath library, which the caller keeps
+    // or discards; the state object holds its own copy.
+    bool Initialize(
+        ID3D12Device5* device,
+        const std::vector<char>& library,
         const RayTracingPipelineDescription& description);
     void Shutdown();
 

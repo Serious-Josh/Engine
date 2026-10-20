@@ -202,23 +202,12 @@ void CommandContext::Shutdown()
     }
 }
 
-bool CommandContext::Begin(unsigned int frameIndex)
+// Blocks until the GPU has finished the last submission that used this frame
+// slot's allocator. Shared by Begin and by callers that record on that allocator
+// before the frame does; failures and device removal are reported here.
+bool CommandContext::WaitForFrameFence(unsigned int frameIndex)
 {
-    for (ReservationState state : m_reservationStates)
-    {
-        if (state == ReservationState::SubmissionUncertain)
-        {
-            Log::Error("Cannot reset command recording after uncertain reserved submission.");
-
-            return false;
-        }
-    }
-
-    m_beginWaitedForFence = false;
-    m_beginFenceWaitMilliseconds = 0.0;
-    m_beginResetMilliseconds = 0.0;
-
-    if (frameIndex >= FrameCount)
+    if (!m_fence || frameIndex >= FrameCount)
     {
         return false;
     }
@@ -298,6 +287,35 @@ bool CommandContext::Begin(unsigned int frameIndex)
                        "; completed: " + std::to_string(completedValue));
             return false;
         }
+    }
+
+    return true;
+}
+
+bool CommandContext::Begin(unsigned int frameIndex)
+{
+    for (ReservationState state : m_reservationStates)
+    {
+        if (state == ReservationState::SubmissionUncertain)
+        {
+            Log::Error("Cannot reset command recording after uncertain reserved submission.");
+
+            return false;
+        }
+    }
+
+    m_beginWaitedForFence = false;
+    m_beginFenceWaitMilliseconds = 0.0;
+    m_beginResetMilliseconds = 0.0;
+
+    if (frameIndex >= FrameCount)
+    {
+        return false;
+    }
+
+    if (!WaitForFrameFence(frameIndex))
+    {
+        return false;
     }
 
     ID3D12CommandAllocator* commandAllocator = m_commandAllocators[frameIndex];

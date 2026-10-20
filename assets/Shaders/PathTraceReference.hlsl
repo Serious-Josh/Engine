@@ -13,6 +13,18 @@
 #include "PathTracePrimarySurface.hlsli"
 #include "RayTracingInstanceData.hlsli"
 
+// RTXPT.3: PathTraceReSTIRDI.hlsl compiles this file with PATH_TRACE_RESTIR_DI_LIBRARY defined, for the
+// raster-primary ReSTIR DI pipeline alone. Every RTXDI addition below is inside that specialization, so this
+// library (the reference, raster-primary and pixel-centre pipelines) compiles exactly as before and does not
+// depend on the RTXDI SDK headers.
+#ifdef PATH_TRACE_RESTIR_DI_LIBRARY
+// RTXDI types for constants b2 and the application bridge. RTXDI presampling is not used.
+#define RTXDI_ENABLE_PRESAMPLING 0
+#include "RtxdiLights.hlsli"
+#include "Rtxdi/RtxdiParameters.h"
+#include "Rtxdi/DI/ReSTIRDIParameters.h"
+#endif
+
 struct PathTracePayload
 {
     float hitDistance; // Negative on a miss.
@@ -77,6 +89,57 @@ cbuffer SceneLightConstants : register(b1)
     uint3 sceneLightPadding;
     GPULight sceneLights[SCENE_LIGHT_CAPACITY];
 };
+
+#ifdef PATH_TRACE_RESTIR_DI_LIBRARY
+// RTXDI light records, two per register: RtxdiLightSet::Capacity / 2.
+#define RTXDI_LIGHT_RECORD_REGISTERS 33
+
+// RTXPT.3, read only by PathTraceRasterPrimaryReSTIRDIRayGeneration, whose pipeline alone binds b2.
+// Identical layout to PathTraceRtxdiConstants (RtxdiShaderData.h).
+cbuffer RtxdiConstants : register(b2)
+{
+    RTXDI_LightBufferParameters rtxdiLightBuffer;
+    RTXDI_ReservoirBufferParameters rtxdiReservoirBuffer;
+    RTXDI_DIBufferIndices rtxdiBufferIndices;
+
+    uint rtxdiReservoirBufferIndex;
+    uint rtxdiLocalLightSamples;
+    uint rtxdiInfiniteLightSamples;
+    uint rtxdiPadding;
+
+    uint4 rtxdiLightRecords[RTXDI_LIGHT_RECORD_REGISTERS];
+
+    // R3.5/R3.6 fused spatiotemporal reuse.
+    RTXDI_RuntimeParameters rtxdiRuntime;
+    RTXDI_DISpatioTemporalResamplingParameters rtxdiSpatioTemporal;
+
+    // 1 when previous reservoirs, previous surfaces and the translation below may be read.
+    uint rtxdiHistoryValid;
+    uint rtxdiNeighborOffsetsIndex;
+    uint rtxdiMotionIndex;
+    uint rtxdiCurrentLightCount;
+
+    uint rtxdiPreviousLightCount;
+    uint rtxdiPreviousDepthIndex;
+    uint rtxdiPreviousSurfaceIndex;
+    uint rtxdiPreviousGeometricNormalIndex;
+
+    uint rtxdiPreviousMaterialIndex;
+    uint3 rtxdiPadding2;
+
+    float3 rtxdiPreviousCameraPosition;
+    float rtxdiPadding3;
+    float3 rtxdiCameraForward;
+    float rtxdiPadding4;
+    float3 rtxdiPreviousCameraForward;
+    float rtxdiPadding5;
+
+    row_major float4x4 rtxdiPreviousInverseCameraRelativeViewProjection;
+
+    // Current-to-previous entries (rtxdiCurrentLightCount), then previous-to-current (rtxdiPreviousLightCount).
+    int4 rtxdiLightTranslation[RTXDI_LIGHT_RECORD_REGISTERS];
+};
+#endif
 
 SamplerState materialSampler : register(s0);
 SamplerState environmentSampler : register(s1);
@@ -169,6 +232,62 @@ PathTraceSun PathTraceFrameSun()
     sun.irradiance = sunIrradiance;
     return sun;
 }
+
+#ifdef PATH_TRACE_RESTIR_DI_LIBRARY
+// -----------------------------------------------------------------------------
+// RTXPT.3 RTXDI application bridge inputs (ReSTIR DI variant only): the frame's own lights and HDRI.
+// -----------------------------------------------------------------------------
+
+RtxdiLightRecord RtxdiBridgeLoadLightRecord(uint lightIndex)
+{
+    uint4 pair = rtxdiLightRecords[lightIndex >> 1u];
+    bool second = (lightIndex & 1u) != 0u;
+
+    RtxdiLightRecord record;
+    record.kind = second ? pair.z : pair.x;
+    record.sourceIndex = second ? pair.w : pair.y;
+    return record;
+}
+
+GPULight RtxdiBridgeLoadTableLight(uint sourceIndex)
+{
+    return sceneLights[sourceIndex];
+}
+
+PathTraceSun RtxdiBridgeSun()
+{
+    return PathTraceFrameSun();
+}
+
+PathTraceEnvironment RtxdiBridgeEnvironment()
+{
+    return PathTraceFrameEnvironment();
+}
+
+RWStructuredBuffer<RTXDI_PackedDIReservoir> RtxdiReservoirs()
+{
+    return ResourceDescriptorHeap[rtxdiReservoirBufferIndex];
+}
+
+// R3.2 strict translation: -1 when a light has no counterpart whose whole identity is unchanged.
+int RtxdiBridgeTranslateLightIndex(int lightIndex, bool currentToPrevious)
+{
+    uint count = currentToPrevious ? rtxdiCurrentLightCount : rtxdiPreviousLightCount;
+
+    if(rtxdiHistoryValid == 0u || lightIndex < 0 || uint(lightIndex) >= count)
+    {
+        return -1;
+    }
+
+    uint entry = currentToPrevious ? uint(lightIndex) : rtxdiCurrentLightCount + uint(lightIndex);
+    return rtxdiLightTranslation[entry >> 2u][entry & 3u];
+}
+
+#define RTXDI_BRIDGE_ENVIRONMENT_SAMPLER environmentSampler
+#define RTXDI_LIGHT_RESERVOIR_BUFFER RtxdiReservoirs()
+#define RTXDI_BRIDGE_PREVIOUS_TO_CURRENT_LIGHT(index) RtxdiBridgeTranslateLightIndex(int(index), false)
+#include "RtxdiApplicationBridge.hlsli"
+#endif
 
 // Ray Tracing Gems, chapter 6 (Waechter and Binder): scale-independent self-intersection offset.
 float3 PathTraceOffsetRayOrigin(float3 position, float3 normal)
@@ -406,6 +525,173 @@ void PathTraceCameraRay(uint2 pixel, float2 jitter, out float3 origin, out float
 static const uint PATH_TRACE_PRIMARY_CAMERA = 0u;
 static const uint PATH_TRACE_PRIMARY_PIXEL_CENTER = 1u;
 static const uint PATH_TRACE_PRIMARY_RASTER = 2u;
+// RTXPT.3: the raster primary with vertex-0 direct light from RTXDI initial sampling.
+static const uint PATH_TRACE_PRIMARY_RASTER_RESTIR_DI = 3u;
+
+#ifdef PATH_TRACE_RESTIR_DI_LIBRARY
+// RTXPT.3 ReSTIR DI variant: per-path-sample RTXDI inputs, set by its ray generation before each sample.
+static uint2 g_rtxdiPixel;
+static uint g_rtxdiSampleSeed;
+// Sample 0 stores its final reservoir in the SDK's output array for this frame (shadingInputBufferIndex, which
+// fused mode makes equal to initialSamplingOutputBufferIndex); the next frame reads it as history. It is also the
+// only sample that reuses that history (split history, PathTraceRtxdiDirectLighting).
+static bool g_rtxdiStoreReservoir;
+static bool g_rtxdiReservoirStored;
+// Visibility rays traced by RTXDI's bias correction, added to the pixel's ray count after reuse.
+static uint g_rtxdiReuseRays;
+
+// -----------------------------------------------------------------------------
+// RTXPT.3 R3.5/R3.6 reuse inputs: previous surfaces from the R4 G-buffer history, visibility through the
+// current TLAS (equal to the previous one whenever history is valid).
+// -----------------------------------------------------------------------------
+
+RAB_Surface RtxdiBridgeLoadSurface(int2 pixel, bool previousFrame)
+{
+    RAB_Surface bridgeSurface = RAB_EmptySurface();
+
+    if(any(pixel < 0) || any(pixel >= int2(resolution)))
+    {
+        return bridgeSurface;
+    }
+
+    Texture2D<float> depthTexture = ResourceDescriptorHeap[previousFrame ? rtxdiPreviousDepthIndex : gBufferDepthIndex];
+    Texture2D<float4> materialTexture = ResourceDescriptorHeap[previousFrame ? rtxdiPreviousMaterialIndex :
+        gBufferMaterialIndex];
+    Texture2D<float4> surfaceTexture = ResourceDescriptorHeap[previousFrame ? rtxdiPreviousSurfaceIndex :
+        gBufferSurfaceIndex];
+    Texture2D<float4> geometricNormalTexture = ResourceDescriptorHeap[previousFrame ?
+        rtxdiPreviousGeometricNormalIndex : gBufferGeometricNormalIndex];
+    PathTraceGBufferSample gBuffer = PathTraceLoadGBuffer(uint2(pixel), depthTexture, materialTexture, surfaceTexture,
+        geometricNormalTexture);
+
+    // Background pixels have no surface.
+    if(gBuffer.depth >= 1.0f)
+    {
+        return bridgeSurface;
+    }
+
+    PathTracePrimaryCamera camera;
+    camera.inverseCameraRelativeViewProjection = previousFrame ? rtxdiPreviousInverseCameraRelativeViewProjection :
+        inverseCameraRelativeViewProjection;
+    camera.cameraPosition = previousFrame ? rtxdiPreviousCameraPosition : cameraPosition;
+    camera.resolution = resolution;
+
+    StructuredBuffer<GPUMaterial> materials = ResourceDescriptorHeap[materialBufferIndex];
+    PathTracePrimaryVertex vertex;
+
+    if(!PathTraceReconstructPrimaryVertex(uint2(pixel), gBuffer, camera, materials, materialTableIndex,
+        materialAverageTableIndex, materialTableCosineMapping, vertex))
+    {
+        return bridgeSurface;
+    }
+
+    float3 forward = previousFrame ? rtxdiPreviousCameraForward : rtxdiCameraForward;
+    bridgeSurface.position = vertex.position;
+    bridgeSurface.surface = vertex.surface;
+    bridgeSurface.valid = true;
+    bridgeSurface.linearDepth = dot(forward, vertex.position - camera.cameraPosition);
+    return bridgeSurface;
+}
+
+bool RtxdiBridgeVisible(RAB_Surface bridgeSurface, RAB_LightSample lightSample)
+{
+    return PathTraceVisible(bridgeSurface.position, bridgeSurface.surface.geometricNormal,
+        lightSample.sample.direction, lightSample.sample.distance, g_rtxdiReuseRays);
+}
+
+int2 RtxdiBridgeViewSize()
+{
+    return int2(resolution);
+}
+
+Buffer<float2> RtxdiNeighborOffsets()
+{
+    return ResourceDescriptorHeap[rtxdiNeighborOffsetsIndex];
+}
+
+#define RTXDI_NEIGHBOR_OFFSETS_BUFFER RtxdiNeighborOffsets()
+#include "RtxdiReuseBridge.hlsli"
+
+// RTXPT.3 Gate 1: vertex-0 direct light from one RTXDI reservoir, with MIS weight 1: a fresh initial reservoir,
+// then (R3.5/R3.6) fused spatiotemporal reuse of the previous frame's reservoirs when history is valid. The
+// estimate is F(y) * V(y) * W (RtxdiApplicationBridge.hlsli); the continuation's non-delta misses then add no
+// sun or HDRI radiance. The six randoms PathTraceDirectLighting would draw are drawn and discarded, so every
+// later random number of the path matches the raster-primary mode's.
+float3 PathTraceRtxdiDirectLighting(PathTraceSurface surface, float3 position, inout PathTraceRandom random,
+    inout uint rayCount)
+{
+    PathTraceNextFloat2(random);
+    PathTraceNextFloat4(random);
+
+    RAB_Surface bridgeSurface;
+    bridgeSurface.position = position;
+    bridgeSurface.surface = surface;
+    bridgeSurface.valid = true;
+    bridgeSurface.linearDepth = dot(rtxdiCameraForward, position - cameraPosition);
+
+    RAB_LightSample selectedSample;
+    RTXDI_DIReservoir reservoir = RtxdiBridgeSampleInitialReservoir(bridgeSurface, g_rtxdiPixel, g_rtxdiSampleSeed,
+        RtxdiBridgeInitialSamplingParameters(rtxdiLocalLightSamples, rtxdiInfiniteLightSamples), rtxdiLightBuffer,
+        selectedSample);
+
+    // Split history: only sample 0, the sample that publishes the pixel's reservoir, reuses the previous frame. Every
+    // later sample of the frame keeps its fresh initial reservoir, so it is independent of that shared history
+    // (reusing it from every sample made a frame's samples strongly correlated). Invalid history: no reuse at all;
+    // the initial reservoir keeps its own normalization.
+    bool reuseHistory = rtxdiHistoryValid != 0u && g_rtxdiStoreReservoir;
+
+    if(reuseHistory)
+    {
+        // G-buffer motion is current UV - previous UV and the view-depth change; RTXDI wants the previous pixel
+        // offset and the expected depth change.
+        Texture2D<float4> motionTexture = ResourceDescriptorHeap[rtxdiMotionIndex];
+        float4 motion = motionTexture.Load(int3(g_rtxdiPixel, 0));
+        float3 screenSpaceMotion = float3(-motion.xy * float2(resolution), motion.z);
+
+        RTXDI_RandomSamplerState reuseRng = RTXDI_InitRandomSampler(g_rtxdiPixel, g_rtxdiSampleSeed,
+            RTXDI_DI_TEMPORAL_RESAMPLING_RANDOM_SEED);
+        int2 temporalSamplePixel;
+        g_rtxdiReuseRays = 0u;
+        reservoir = RTXDI_DISpatioTemporalResampling(g_rtxdiPixel, bridgeSurface, reservoir, reuseRng,
+            screenSpaceMotion, rtxdiBufferIndices.temporalResamplingInputBufferIndex, rtxdiRuntime,
+            rtxdiReservoirBuffer, rtxdiSpatioTemporal, temporalSamplePixel, selectedSample);
+        rayCount += g_rtxdiReuseRays;
+    }
+
+    float3 contribution = float3(0.0f, 0.0f, 0.0f);
+    bool visible = false;
+
+    if(RTXDI_IsValidDIReservoir(reservoir))
+    {
+        float weight = RTXDI_GetDIReservoirInvPdf(reservoir);
+        float3 unshadowed = RtxdiBridgeSampleContribution(selectedSample, bridgeSurface);
+
+        if(weight > 0.0f && isfinite(weight) && any(unshadowed > 0.0f))
+        {
+            visible = PathTraceVisible(position, surface.geometricNormal, selectedSample.sample.direction,
+                selectedSample.sample.distance, rayCount);
+            contribution = visible ? unshadowed * weight : float3(0.0f, 0.0f, 0.0f);
+        }
+    }
+
+    // Ray-traced bias correction treats stored reservoirs as visibility-filtered: an occluded sample is removed
+    // (its M kept) before the reservoir becomes history.
+    if(g_rtxdiStoreReservoir)
+    {
+        if(RTXDI_IsValidDIReservoir(reservoir))
+        {
+            RTXDI_StoreVisibilityInDIReservoir(reservoir, visible ? float3(1.0f, 1.0f, 1.0f) : float3(0.0f, 0.0f, 0.0f),
+                true);
+        }
+
+        RTXDI_StoreDIReservoir(reservoir, rtxdiReservoirBuffer, g_rtxdiPixel, rtxdiBufferIndices.shadingInputBufferIndex);
+        g_rtxdiStoreReservoir = false;
+        g_rtxdiReservoirStored = true;
+    }
+
+    return contribution;
+}
+#endif
 
 // RTXPT.2 raster primary: this pixel's first vertex, decoded once per pixel before the sample loop (it is the
 // same for every sample; only the random numbers differ). state: 1 surface, 0 background, -1 unusable sample.
@@ -488,7 +774,7 @@ float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex 
         float3 position;
         PathTraceSurface surface;
 
-        if(primary == PATH_TRACE_PRIMARY_RASTER)
+        if(primary == PATH_TRACE_PRIMARY_RASTER || primary == PATH_TRACE_PRIMARY_RASTER_RESTIR_DI)
         {
             // RTXPT.2 R3-F: every lane executes this one TraceRay call at every vertex. Lanes of a warp run
             // different samples at different vertices; a call skipped by some of them (the G-buffer vertex)
@@ -528,7 +814,17 @@ float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex 
 
                 if(payload.hitDistance < 0.0f)
                 {
-                    radiance += throughput * PathTraceMissRadiance(ray.Direction, previousDelta, previousPdf);
+                    // RTXPT.3 Gate 1: after a ReSTIR DI vertex 0, RTXDI alone estimated the sun and HDRI through
+                    // the non-delta lobes, so a non-delta continuation that misses adds nothing. A delta-lobe
+                    // continuation keeps its full radiance, as no light sample can produce it.
+                    bool directFromRtxdi = primary == PATH_TRACE_PRIMARY_RASTER_RESTIR_DI && vertex == 1u &&
+                        !previousDelta;
+
+                    if(!directFromRtxdi)
+                    {
+                        radiance += throughput * PathTraceMissRadiance(ray.Direction, previousDelta, previousPdf);
+                    }
+
                     break;
                 }
 
@@ -579,7 +875,18 @@ float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex 
 
         if(hasNonDeltaLobe)
         {
+#ifdef PATH_TRACE_RESTIR_DI_LIBRARY
+            if(primary == PATH_TRACE_PRIMARY_RASTER_RESTIR_DI && vertex == 0u)
+            {
+                radiance += throughput * PathTraceRtxdiDirectLighting(surface, position, random, rayCount);
+            }
+            else
+            {
+                radiance += throughput * PathTraceDirectLighting(surface, position, random, rayCount);
+            }
+#else
             radiance += throughput * PathTraceDirectLighting(surface, position, random, rayCount);
+#endif
         }
 
         PathTraceBSDFSample bsdfSample = PathTraceSampleBSDF(surface, PathTraceNextFloat3(random));
@@ -665,6 +972,22 @@ float3 PathTraceRasterPrimaryRadiance(PathTraceRasterFirstVertex rasterFirstVert
     return PathTraceTracePath(emptyRay, PATH_TRACE_PRIMARY_RASTER, rasterFirstVertex, random, rayCount);
 }
 
+#ifdef PATH_TRACE_RESTIR_DI_LIBRARY
+// RTXPT.3: the raster primary above, with vertex-0 direct light from RTXDI.
+float3 PathTraceRasterReSTIRDIRadiance(PathTraceRasterFirstVertex rasterFirstVertex, inout PathTraceRandom random,
+    inout uint rayCount)
+{
+    PathTraceNextFloat2(random);
+
+    RayDesc emptyRay;
+    emptyRay.Origin = float3(0.0f, 0.0f, 0.0f);
+    emptyRay.Direction = float3(0.0f, 0.0f, 1.0f);
+    emptyRay.TMin = 0.0f;
+    emptyRay.TMax = 0.0f;
+    return PathTraceTracePath(emptyRay, PATH_TRACE_PRIMARY_RASTER_RESTIR_DI, rasterFirstVertex, random, rayCount);
+}
+#endif
+
 void PathTraceAddStatistic64(uint lowIndex, uint value)
 {
     uint previous;
@@ -679,6 +1002,13 @@ void PathTraceAddStatistic64(uint lowIndex, uint value)
 float3 PathTracePrimaryRadiance(uint primary, uint2 pixel, PathTraceRasterFirstVertex rasterFirstVertex,
     inout PathTraceRandom random, inout uint rayCount)
 {
+#ifdef PATH_TRACE_RESTIR_DI_LIBRARY
+    if(primary == PATH_TRACE_PRIMARY_RASTER_RESTIR_DI)
+    {
+        return PathTraceRasterReSTIRDIRadiance(rasterFirstVertex, random, rayCount);
+    }
+#endif
+
     if(primary == PATH_TRACE_PRIMARY_RASTER)
     {
         return PathTraceRasterPrimaryRadiance(rasterFirstVertex, random, rayCount);
@@ -707,14 +1037,34 @@ void PathTraceRunRayGeneration(uint primary)
         // The raster primary's first vertex is decoded once for all of this pixel's samples.
         PathTraceRasterFirstVertex rasterFirstVertex = (PathTraceRasterFirstVertex)0;
 
-        if(primary == PATH_TRACE_PRIMARY_RASTER)
+        if(primary == PATH_TRACE_PRIMARY_RASTER || primary == PATH_TRACE_PRIMARY_RASTER_RESTIR_DI)
         {
             rasterFirstVertex = PathTraceDecodeRasterFirstVertex(pixel);
         }
 
+#ifdef PATH_TRACE_RESTIR_DI_LIBRARY
+        if(primary == PATH_TRACE_PRIMARY_RASTER_RESTIR_DI)
+        {
+            g_rtxdiPixel = pixel;
+            g_rtxdiReservoirStored = false;
+        }
+#endif
+
         for(uint sampleOffset = 0u; sampleOffset < samplesPerFrame; ++sampleOffset)
         {
             PathTraceRandom random = PathTraceCreateRandom(pixel, accumulatedSamples + sampleOffset);
+
+#ifdef PATH_TRACE_RESTIR_DI_LIBRARY
+            // RTXPT.3: an independent RTXDI random sequence per path sample (the progressive mean averages
+            // independent estimates).
+            if(primary == PATH_TRACE_PRIMARY_RASTER_RESTIR_DI)
+            {
+                g_rtxdiSampleSeed = PathTraceHash((accumulatedSamples + sampleOffset) ^ PathTraceHash(randomSeed ^
+                    0x52545844u));
+                g_rtxdiStoreReservoir = sampleOffset == 0u;
+            }
+#endif
+
             float3 sampleRadiance = PathTracePrimaryRadiance(primary, pixel, rasterFirstVertex, random, rayCount);
 
             // A non-finite estimate is a defect, never silently averaged; it is counted and dropped.
@@ -727,6 +1077,16 @@ void PathTraceRunRayGeneration(uint primary)
             sampleSum += sampleRadiance;
             ++completedSamples;
         }
+
+#ifdef PATH_TRACE_RESTIR_DI_LIBRARY
+        // RTXPT.3: every active pixel writes its initial-sampling reservoir each dispatch; a pixel whose sample 0
+        // ran no RTXDI sampling (background, unusable sample, pure delta mirror) writes an empty one.
+        if(primary == PATH_TRACE_PRIMARY_RASTER_RESTIR_DI && !g_rtxdiReservoirStored)
+        {
+            RTXDI_StoreDIReservoir(RTXDI_EmptyDIReservoir(), rtxdiReservoirBuffer, pixel,
+                rtxdiBufferIndices.shadingInputBufferIndex);
+        }
+#endif
 
         float previousCount = float(accumulatedSamples);
         float totalCount = float(accumulatedSamples + samplesPerFrame);
@@ -771,6 +1131,15 @@ void PathTraceRasterPrimaryRayGeneration()
 {
     PathTraceRunRayGeneration(PATH_TRACE_PRIMARY_RASTER);
 }
+
+#ifdef PATH_TRACE_RESTIR_DI_LIBRARY
+// RTXPT.3 raster-primary ReSTIR DI mode (PathTraceReSTIRDI.hlsl only).
+[shader("raygeneration")]
+void PathTraceRasterPrimaryReSTIRDIRayGeneration()
+{
+    PathTraceRunRayGeneration(PATH_TRACE_PRIMARY_RASTER_RESTIR_DI);
+}
+#endif
 
 // RTXPT.2 diagnostic: unjittered camera rays, for raster-primary agreement measurements.
 [shader("raygeneration")]

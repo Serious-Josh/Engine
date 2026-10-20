@@ -11,7 +11,10 @@ enum class RendererLightingMode
     PathTracedReference,
     // RTXPT.2: progressive path tracing whose first vertex comes from the raster G-buffer. Shares the
     // reference mode's loop, settings, accumulation and resets; renders Legacy when unavailable.
-    PathTracedRasterPrimary
+    PathTracedRasterPrimary,
+    // RTXPT.3: the raster-primary mode with RTXDI initial sampling for direct light at the first vertex
+    // (secondary vertices keep exhaustive next-event estimation). Renders Legacy when unavailable.
+    PathTracedRasterPrimaryReSTIRDI
 };
 
 // How the path tracer forms the first path vertex.
@@ -23,7 +26,9 @@ enum class PathTracePrimary
     // the RT counterpart of the raster G-buffer sample for agreement measurements.
     PixelCenter,
     // The raster-primary mode: the G-buffer sample at the pixel centre.
-    Raster
+    Raster,
+    // RTXPT.3: Raster, with vertex-0 direct light from one RTXDI initial reservoir per path sample.
+    RasterReSTIRDI
 };
 
 // Settings of the progressive reference path tracer. Any change restarts accumulation.
@@ -35,7 +40,7 @@ struct PathTraceReferenceSettings
     std::uint32_t samplesPerFrame = 1;
 
     // Surface interactions per path. 1 is direct lighting only (including the HDRI as a distant light).
-    std::uint32_t maxPathDepth = 8;
+    std::uint32_t maxPathDepth = 3;
 
     // First vertex index whose continuation is subject to Russian roulette. Larger than maxPathDepth
     // disables roulette entirely.

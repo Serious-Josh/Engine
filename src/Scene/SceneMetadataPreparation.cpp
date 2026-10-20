@@ -78,6 +78,35 @@ bool FileSceneAssetCatalog::ValidateMetadataMeshReference(std::string_view refer
 
 bool FileSceneAssetCatalog::ValidateMetadataMaterialReference(std::string_view reference, std::string* error) const
 {
+    auto* pass = ActiveValidationPass();
+
+    if(!pass || m_archiveScene || reference.empty() || reference == "builtin:default")
+    {
+        return ValidateMetadataMaterialReferenceOnDisk(reference, error);
+    }
+
+    // The result is a function of the exact reference, this catalog and the disk.
+    // Within one pass the catalog is unchanged, so equal references share it.
+    const std::string key(reference);
+    auto found = pass->materials.find(key);
+
+    if(found == pass->materials.end())
+    {
+        ValidationPassState::MaterialResult result;
+        result.valid = ValidateMetadataMaterialReferenceOnDisk(reference, &result.error);
+        found = pass->materials.emplace(key, std::move(result)).first;
+    }
+
+    if(!found->second.valid)
+    {
+        return Fail(error, found->second.error);
+    }
+
+    return true;
+}
+
+bool FileSceneAssetCatalog::ValidateMetadataMaterialReferenceOnDisk(std::string_view reference, std::string* error) const
+{
     if(m_archiveScene)
     {
         const auto id = AssetID::ParseReference(reference);

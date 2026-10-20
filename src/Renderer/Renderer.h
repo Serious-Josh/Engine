@@ -59,6 +59,8 @@
 #include "Passes/AOResolvePass.h"
 #include "Passes/NrdDiffuseResolvePass.h"
 #include "Passes/PathTraceReferencePass.h"
+#include "PreviousGBufferHistory.h"
+#include "Rtxdi/RtxdiResources.h"
 #include "MaterialTables/MaterialTableResources.h"
 #include "RendererLightingMode.h"
 #include "Passes/GISpatialDenoisePass.h"
@@ -134,6 +136,28 @@ struct PathTraceReferenceStatus
     std::uint32_t accumulatedSamples = 0;
     std::uint64_t accumulationResets = 0;
     std::uint64_t resourceBytes = 0;
+};
+
+// RTXPT.2 R4: the camera of the frame a previous G-buffer slot was copied from. The inverse is the
+// camera-relative one the raster primary uses (the view without its translation), so reconstruction
+// stays precise far from the world origin; world position = cameraPosition + reconstructed offset.
+struct PreviousGBufferCamera
+{
+    Matrix4 view;
+    Matrix4 projection;
+    Matrix4 inverseCameraRelativeViewProjection;
+    Vector3 position;
+};
+
+// RTXPT.2 R4: the previous frame's G-buffer as path-traced consumers may read it. Only handed out while
+// valid; the SRVs are in the resource descriptor heap and in PIXEL|NON_PIXEL_SHADER_RESOURCE state.
+struct PreviousGBufferView
+{
+    unsigned int depthIndex = 0;
+    unsigned int surfaceIndex = 0;
+    unsigned int geometricNormalIndex = 0;
+    unsigned int materialIndex = 0;
+    PreviousGBufferCamera camera;
 };
 
 // Evidence of the RTXPT.2 raster-primary mode for the Editor and diagnostics. Values only.
@@ -241,6 +265,11 @@ class Renderer
     std::uint32_t GetRecordedAdditionalLightCount() const noexcept { return m_recordedAdditionalLightCount; }
     const PathTraceReferenceStatus& GetPathTraceReferenceStatus() const noexcept { return m_pathTraceStatus; }
     const PathTraceRasterPrimaryStatus& GetPathTraceRasterPrimaryStatus() const noexcept { return m_rasterPrimaryStatus; }
+    const PathTraceRasterPrimaryStatus& GetPathTraceReSTIRDIStatus() const noexcept { return m_restirDIStatus; }
+
+    // RTXPT.2 R4: false, leaving the view untouched, unless the previous PT frame's copy was submitted and
+    // no invalidation has happened since.
+    bool TryGetPreviousGBuffer(PreviousGBufferView& view) const;
 
     std::optional<MaterialPreviewImage> GetMaterialPreviewImage() const
     {
@@ -548,6 +577,7 @@ class Renderer
 #if defined(ENGINE_HAS_VERIFICATION)
     friend class SceneDuplicationVerification;
     friend class SceneMembershipVerification;
+    friend class ResidencyBatchVerification;
 #endif
     friend class SceneMaterialBindingPublication;
 #if defined(ENGINE_HAS_VERIFICATION)
@@ -1127,6 +1157,47 @@ class Renderer
     PathTraceReferencePass m_pathTraceReferencePass;
     PathTraceReferenceStatus m_pathTraceStatus;
 
+    // RTXPT.2 R4 previous-frame G-buffer, PT modes only (D4). Allocated on the first frame that renders
+    // either PT mode, kept across mode switches and Legacy frames, resized with the scene and released at
+    // shutdown, both after the existing WaitForGPU. A failed allocation is non-fatal and is not retried
+    // until the next scene resize.
+    PreviousGBufferHistory m_previousGBufferHistory;
+    bool m_previousGBufferHistoryFailed = false;
+    void EnsurePreviousGBufferHistory();
+
+    // Each PT frame records a copy of its final G-buffer into the slot that is not being read. The copy
+    // becomes the read slot only after the frame's command list was submitted; a frame that fails before
+    // that, or a later Render failure, invalidates instead. The single queue orders the next frame's
+    // overwrite of a slot after every earlier frame's reads of it.
+    unsigned int m_previousGBufferReadSlot = 0;
+    bool m_previousGBufferValid = false;
+    PreviousGBufferCamera m_previousGBufferCameras[PreviousGBufferHistory::SlotCount];
+    std::optional<PathTracePrimary> m_previousGBufferPrimary;
+
+    struct PendingPreviousGBufferCopy
+    {
+        unsigned int slot = 0;
+        PreviousGBufferCamera camera;
+    };
+
+    std::optional<PendingPreviousGBufferCopy> m_pendingPreviousGBufferCopy;
+    std::uint64_t m_previousGBufferCopiesRecorded = 0;
+    std::uint64_t m_previousGBufferCopiesSubmitted = 0;
+    // Whether this recording's PT consumers could read history (after its own invalidations). Evidence only.
+    bool m_previousGBufferAvailableThisFrame = false;
+    void InvalidatePreviousGBufferHistory();
+    void RecordPreviousGBufferCopy(ID3D12GraphicsCommandList* commandList, const PreviousGBufferCamera& camera);
+    void CommitPreviousGBufferCopy();
+
+    // RTXPT.3 R3.3 ReSTIR DI resources, raster-primary ReSTIR DI variant only. Same lifetime as the R4 history:
+    // allocated lazily by that variant's first frame (EnsureRtxdiResources), resized with the scene and
+    // released at shutdown after the existing WaitForGPU; a failed allocation is not retried until the next
+    // scene resize. Reservoir history is invalidated at the same boundaries as the R4 history and is
+    // committed only after a successful submission. No frame uses it yet.
+    RtxdiResources m_rtxdiResources;
+    bool m_rtxdiResourcesFailed = false;
+    void EnsureRtxdiResources();
+
     // RTXPT.1A.2 bundled GGX single-scatter complement tables, required by the path tracer only. Loaded and
     // published once during Initialize; immutable afterwards; released in Shutdown after the final drain.
     MaterialTableResources m_materialTables;
@@ -1170,6 +1241,18 @@ class Renderer
     // It owns no resources beyond its pipeline in the reference pass.
     PathTraceRasterPrimaryStatus m_rasterPrimaryStatus;
     void EvaluatePathTraceRasterPrimary();
+
+    // RTXPT.3 raster-primary ReSTIR DI mode: every raster-primary prerequisite, its own pipeline and the RTXDI
+    // resources (allocated here on first request). Evaluated on frames that request it.
+    PathTraceRasterPrimaryStatus m_restirDIStatus;
+    void EvaluatePathTraceReSTIRDI();
+
+    // Prepares this recording's RTXDI frame (light set, SDK buffer indices, reuse inputs, constants b2) and
+    // leaves the reservoir buffer in UNORDERED_ACCESS. The frame stays pending until CommitFrame after
+    // submission. view is this frame's camera view.
+    bool PrepareRtxdiFrame(ID3D12GraphicsCommandList* commandList, const FrameLighting& frameLighting,
+        const PathTraceReferenceConstants& constants, const Matrix4& view,
+        D3D12_GPU_VIRTUAL_ADDRESS& rtxdiConstantsAddress);
 
     // Primary of the reference mode. Camera always, except in diagnostics that measure raster-primary
     // agreement against unjittered PixelCenter rays; the Editor never changes it.

@@ -46,11 +46,11 @@ std::optional<RayTracingSceneResources::ReplacementCandidate> Renderer::PrepareD
         return std::nullopt;
     }
 
-    const auto completed = m_commandContext.GetCompletedFenceValue();
-
-    if (!completed || completed == UINT64_MAX || completed < m_commandContext.GetFrameFenceValue(frameSlot))
+    // The frame would wait on this slot fence in Begin moments later. Waiting here
+    // instead of deferring keeps GPU-bound frames from never observing it complete.
+    if (!m_commandContext.WaitForFrameFence(frameSlot))
     {
-        error = "Deferred: candidate command allocator is still in flight or its fence is unavailable.";
+        error = "Candidate allocator fence wait failed; renderer requires checked recovery.";
         return std::nullopt;
     }
 
@@ -152,11 +152,9 @@ bool Renderer::RefreshDXRMembershipCandidateTransforms(const RayTracingSceneReso
         return false;
     }
 
-    const auto completed = m_commandContext.GetCompletedFenceValue();
-
-    if (!completed || completed == UINT64_MAX || completed < m_commandContext.GetFrameFenceValue(frameSlot))
+    if (!m_commandContext.WaitForFrameFence(frameSlot))
     {
-        error = "Deferred: candidate transform allocator is still in flight.";
+        error = "Candidate transform allocator fence wait failed; renderer requires checked recovery.";
         return false;
     }
 

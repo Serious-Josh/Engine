@@ -45,6 +45,9 @@ class CommandContext
     void Shutdown();
 
     bool Begin(unsigned int frameIndex);
+    // Blocking wait for this slot's last submission, as Begin performs. Lets a
+    // pre-frame submission reuse the slot allocator rather than defer indefinitely.
+    bool WaitForFrameFence(unsigned int frameIndex);
     bool End();
     bool AbortRecording();
 

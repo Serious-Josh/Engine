@@ -26,6 +26,7 @@ TEST_SOURCES = [
     'src/Engine/tests/MaterialModelInvestigation.inl',
     'src/Engine/tests/shaders/PathTraceBSDFValidation.hlsl',
     'src/Engine/tests/shaders/PathTraceRasterPrimaryValidation.hlsl',
+    'src/Engine/tests/shaders/PreviousGBufferReprojection.hlsl',
     'src/Engine/tests/shaders/PathTraceBSDFRTXPT1.hlsli',
     'src/Engine/tests/shaders/PathTraceBSDFCandidate.hlsli',
     'src/Engine/tests/shaders/MaterialInvestigationBody.hlsli',

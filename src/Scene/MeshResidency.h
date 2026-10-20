@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <utility>
+#include <vector>
 
 class Mesh;
 class FileSceneAssetCatalog;
@@ -39,11 +40,13 @@ struct MeshResidencyCandidate
 
 };
 
+// Identifies one staged batch transaction. Per-object binding revisions are
+// held and revalidated by each staged entry, not by the token.
 struct MeshResidencyToken
 {
     std::uint64_t runtimeIdentity = 0;
     std::uint64_t transaction = 0;
-    std::uint64_t bindingRevision = 0;
+    std::uint64_t entryCount = 0;
     bool operator==(const MeshResidencyToken&) const = default;
 };
 
@@ -76,4 +79,16 @@ private:
     bool m_builtinValidated = false;
     std::shared_ptr<const CookedMeshResidencyEvidence> m_cookedPreparation;
     std::shared_ptr<const void> m_cookedAcceptance;
+};
+
+// Final-acceptance pins for a batch: one per unique source mesh, each acquired
+// during validation and held by the coordinator until its commit returns.
+struct MeshResidencySourcePins
+{
+    std::vector<MeshResidencySourceLock> locks;
+
+    explicit operator bool() const noexcept
+    {
+        return !locks.empty();
+    }
 };

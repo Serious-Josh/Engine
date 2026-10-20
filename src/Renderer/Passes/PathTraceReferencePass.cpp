@@ -33,7 +33,8 @@ namespace
             std::search(bytecode.begin(), bytecode.end(), name.begin(), name.end()) != bytecode.end();
     }
 
-    // One shared library; each primary constructor is its own ray-generation export.
+    // One shared library; each primary constructor is its own ray-generation export. The RTXPT.3 ReSTIR DI
+    // primary uses the RTXDI-specialized compilation of that library.
     RayTracingPipelineDescription BuildPathTracePipelineDescription(PathTracePrimary primary)
     {
         RayTracingPipelineDescription pipelineDescription{};
@@ -50,6 +51,11 @@ namespace
         case PathTracePrimary::Raster:
             pipelineDescription.rayGenerationShader = L"PathTraceRasterPrimaryRayGeneration";
             break;
+        case PathTracePrimary::RasterReSTIRDI:
+            // RTXPT.3: the RTXDI-specialized compilation of the same source (PathTraceReSTIRDI.hlsl).
+            pipelineDescription.shaderPath = "PathTraceReSTIRDI.hlsl";
+            pipelineDescription.rayGenerationShader = L"PathTraceRasterPrimaryReSTIRDIRayGeneration";
+            break;
         }
 
         pipelineDescription.missShaders = {L"PathTraceMiss", L"PathTraceVisibilityMiss"};
@@ -64,6 +70,13 @@ namespace
                                                DescriptorRangeType::UnorderedAccess, 1},
                                               {RootParameterType::ConstantBuffer, 0},
                                               {RootParameterType::ConstantBuffer, 1}};
+
+        // RTXPT.3: RTXDI constants (b2), in the ReSTIR DI variant's own pipeline only; the other pipelines'
+        // root signatures are unchanged.
+        if(primary == PathTracePrimary::RasterReSTIRDI)
+        {
+            pipelineDescription.rootParameters.push_back({RootParameterType::ConstantBuffer, 2});
+        }
 
         // Hit distance, geometric normal, shading normal, UV, material index.
         pipelineDescription.maxPayloadSize = 40;
@@ -98,9 +111,11 @@ bool PathTraceReferencePass::Initialize(
 
     // A missing shader (for example a historical cooked bundle without this library) fails here.
     auto& referencePipeline = m_pipelines[static_cast<size_t>(PathTracePrimary::Camera)];
+    const RayTracingPipelineDescription description = BuildPathTracePipelineDescription(PathTracePrimary::Camera);
+    const ShaderLibraryCompileResult* library = AcquireLibrary(shaderLibrary, description.shaderPath);
 
-    if(!referencePipeline.Initialize(graphicsDevice.GetRayTracingDevice(), shaderLibrary,
-        BuildPathTracePipelineDescription(PathTracePrimary::Camera)))
+    if(!library ||
+        !referencePipeline.Initialize(graphicsDevice.GetRayTracingDevice(), library->bytecode, description))
     {
         failureReason = "The PathTraceReference DXR library is unavailable or failed to compile.";
         Shutdown();
@@ -139,23 +154,76 @@ bool PathTraceReferencePass::EnsurePrimaryPipeline(
         return true;
     }
 
+    if(m_pipelineFailed[index])
+    {
+        failureReason = m_pipelineFailure[index];
+        return false;
+    }
+
     // A library cooked before RTXPT.2 R3 lacks this export, and a state object naming a missing export is a
     // D3D12 error. The export's name must therefore appear in the library's DXIL function table first.
     const RayTracingPipelineDescription description = BuildPathTracePipelineDescription(primary);
-    ShaderLibraryCompileResult library{};
-    const bool hasExport = !m_pipelineFailed[index] && shaderLibrary.CompileLibrary(description.shaderPath, library) &&
-        LibraryNamesExport(library.bytecode, description.rayGenerationShader);
+    const std::string libraryName = description.shaderPath.generic_string();
+    const ShaderLibraryCompileResult* library = AcquireLibrary(shaderLibrary, description.shaderPath);
 
-    if(hasExport && m_pipelines[index].Initialize(graphicsDevice.GetRayTracingDevice(), shaderLibrary, description))
+    if(!library)
+    {
+        m_pipelineFailure[index] = "The " + libraryName + " DXR library is unavailable or failed to compile.";
+    }
+    else if(!LibraryNamesExport(library->bytecode, description.rayGenerationShader))
+    {
+        m_pipelineFailure[index] = "The " + libraryName + " DXR library has no entry point for this primary "
+            "(a shader bundle from before RTXPT.2 R3).";
+    }
+    else if(!m_pipelines[index].Initialize(graphicsDevice.GetRayTracingDevice(), library->bytecode, description))
+    {
+        m_pipelineFailure[index] = "The " + libraryName + " DXR pipeline could not be created for this primary.";
+    }
+    else
     {
         m_pipelineReady[index] = true;
         return true;
     }
 
     m_pipelineFailed[index] = true;
-    failureReason = "The PathTraceReference DXR library has no entry point for this primary "
-        "(a shader bundle from before RTXPT.2 R3).";
+    failureReason = m_pipelineFailure[index];
     return false;
+}
+
+const ShaderLibraryCompileResult* PathTraceReferencePass::AcquireLibrary(
+    ShaderLibrary& shaderLibrary,
+    const std::filesystem::path& path)
+{
+    CompiledLibrary* entry = nullptr;
+
+    for(CompiledLibrary& compiled : m_libraries)
+    {
+        if(compiled.path == path)
+        {
+            entry = &compiled;
+            break;
+        }
+    }
+
+    // Reused only while every source the compilation read is unchanged; otherwise it compiles again, exactly
+    // as each pipeline used to.
+    if(entry && shaderLibrary.IsLibraryCurrent(entry->library))
+    {
+        return &entry->library;
+    }
+
+    if(!entry)
+    {
+        entry = &m_libraries.emplace_back(CompiledLibrary{path, {}});
+    }
+
+    if(!shaderLibrary.CompileLibrary(path, entry->library))
+    {
+        entry->library = {};
+        return nullptr;
+    }
+
+    return &entry->library;
 }
 
 bool PathTraceReferencePass::CreateTextures(
@@ -244,12 +312,14 @@ void PathTraceReferencePass::Execute(
     D3D12_GPU_VIRTUAL_ADDRESS constantsAddress,
     D3D12_GPU_VIRTUAL_ADDRESS sceneLightConstantsAddress,
     unsigned int width,
-    unsigned int height)
+    unsigned int height,
+    D3D12_GPU_VIRTUAL_ADDRESS rtxdiConstantsAddress)
 {
     RayTracingPipeline& pipeline = m_pipelines[static_cast<size_t>(primary)];
+    const bool usesRtxdi = primary == PathTracePrimary::RasterReSTIRDI;
 
     if(!m_initialized || !commandList || width != m_width || height != m_height ||
-        !m_pipelineReady[static_cast<size_t>(primary)])
+        !m_pipelineReady[static_cast<size_t>(primary)] || (usesRtxdi && rtxdiConstantsAddress == 0))
     {
         return;
     }
@@ -266,6 +336,11 @@ void PathTraceReferencePass::Execute(
     commandList->SetComputeRootDescriptorTable(3, descriptorHeap.GetGPUHandle(m_statisticsTexture.GetUAVIndex()));
     commandList->SetComputeRootConstantBufferView(4, constantsAddress);
     commandList->SetComputeRootConstantBufferView(5, sceneLightConstantsAddress);
+
+    if(usesRtxdi)
+    {
+        commandList->SetComputeRootConstantBufferView(6, rtxdiConstantsAddress);
+    }
 
     pipeline.Dispatch(commandList, width, height);
 
@@ -316,7 +391,10 @@ void PathTraceReferencePass::Shutdown()
         m_pipelines[index].Shutdown();
         m_pipelineReady[index] = false;
         m_pipelineFailed[index] = false;
+        m_pipelineFailure[index].clear();
     }
+
+    m_libraries.clear();
 
     m_width = 0;
     m_height = 0;

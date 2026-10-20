@@ -1836,6 +1836,7 @@ void Engine::AcceptPreparedMeshResidencyForFrame(IDemoScene& activeDemo)
         {
             m_meshResidencyAcceptance = m_meshResidencyPublication.PublishAtBoundary(
                 m_renderer, *fileScene->m_runtime, fileScene->m_assets);
+            CountAutomaticPublicationAttempt(*m_meshResidencyAcceptance);
         }
         else
         {
@@ -1858,6 +1859,7 @@ void Engine::AcceptPreparedMeshResidencyForFrame(IDemoScene& activeDemo)
             }
             FinishAutomaticMeshResidency(MeshResidencyPublication::Status::Ready);
             m_residencyRequestSelection.reset();
+            m_residencyRequestBatch.clear();
             m_residencyRequestSourceIdentity.clear();
             m_diagnosticMeshToken.reset();
             m_diagnosticMeshReadiness.reset();
@@ -1865,7 +1867,7 @@ void Engine::AcceptPreparedMeshResidencyForFrame(IDemoScene& activeDemo)
         }
         else if (m_meshResidencyAcceptance->status != MeshResidencyPublication::Status::Retry)
         {
-            FinishAutomaticMeshResidency(m_meshResidencyAcceptance->status);
+            FinishAutomaticMeshResidency(m_meshResidencyAcceptance->status, m_meshResidencyAcceptance->failedObjectID);
             CancelMeshResidencyAcceptance();
         }
     }
@@ -2225,6 +2227,8 @@ void Engine::Frame()
         pathTraceStatus.activeLastFrame, pathTraceStatus.accumulatedSamples, pathTraceStatus.resourceBytes);
     const PathTraceRasterPrimaryStatus& rasterPrimaryStatus = m_renderer.GetPathTraceRasterPrimaryStatus();
     debugUI.SetPathTraceRasterPrimaryStatus(rasterPrimaryStatus.availability, rasterPrimaryStatus.reason);
+    const PathTraceRasterPrimaryStatus& restirDIStatus = m_renderer.GetPathTraceReSTIRDIStatus();
+    debugUI.SetPathTraceReSTIRDIStatus(restirDIStatus.availability, restirDIStatus.reason);
     debugUI.DrawPerformanceWindow(environmentNames, m_renderer.GetCurrentEnvironmentIndex(),
                                   m_renderer.GetStatistics());
 
@@ -3932,6 +3936,7 @@ void Engine::CancelMeshResidencyAcceptance() noexcept
 {
     FinishAutomaticMeshResidency(MeshResidencyPublication::Status::Stale);
     m_residencyRequestSelection.reset();
+    m_residencyRequestBatch.clear();
     m_residencyRequestSourceIdentity.clear();
     if (m_diagnosticCPUPreparation)
     {
@@ -4143,6 +4148,7 @@ void Engine::ProcessMeshResidencyDiagnostics()
 
     if (error.starts_with("Deferred:"))
     {
+        CountAutomaticRetry("candidate preparation: " + error);
         LogMeshResidencyDiagnostic({MeshResidencyPublication::Status::Retry, std::move(error)});
         return;
     }
@@ -4224,6 +4230,11 @@ void Engine::AdvanceDiagnosticMeshPreparation()
             if (completion.status == ProjectMeshPreparationService::Status::Pending ||
                 completion.status == ProjectMeshPreparationService::Status::Retry)
             {
+                if (m_residencyRequestAutomatic && !m_automaticMeshResidency.settled)
+                {
+                    ++m_automaticMeshResidency.workerPendingFrames;
+                }
+
                 if (!completion.error.empty())
                 {
                     LogMeshResidencyDiagnostic({MeshResidencyPublication::Status::Retry, completion.error});
@@ -4343,6 +4354,7 @@ bool Engine::BeginMeshResidencyRequest(const SceneObjectMetadata& selection, boo
     try
     {
         m_residencyRequestSelection = selection;
+        m_residencyRequestBatch.clear();
         m_residencyRequestAutomatic = automatic;
         m_residencyRequestSourceIdentity = GetMeshSourceIdentity(selection);
 
@@ -4393,6 +4405,11 @@ bool Engine::BeginMeshResidencyRequest(const SceneObjectMetadata& selection, boo
             return true;
         }
 
+        if (TryPrepareRetainedMeshResidency(*scene, selection))
+        {
+            return true;
+        }
+
         const auto asset = AssetID::ParseReference(selection.meshReference);
         m_diagnosticCPUPreparation.emplace();
         m_diagnosticCPUPreparation->selection = selection;
@@ -4424,6 +4441,42 @@ bool Engine::BeginMeshResidencyRequest(const SceneObjectMetadata& selection, boo
             MeshResidencyPublication::Status::Retry);
         return false;
     }
+}
+
+bool Engine::TryPrepareRetainedMeshResidency(FileBackedDemoScene& scene, const SceneObjectMetadata& selection)
+{
+    // Shared-asset preparation: once one instance has imported and uploaded a
+    // mesh, later instances reuse the catalog's geometry instead of a worker
+    // round trip. Describe re-verifies the source digest under a pin, and final
+    // acceptance verifies it again. Any failure falls back to the worker path,
+    // which reports exactly as before.
+    Mesh* retained = scene.m_assets.FindRetainedMesh(selection.meshReference);
+
+    if (!retained || !MeshResidencyPublication::CanPrepareGeometry(m_renderer, *scene.m_runtime))
+    {
+        return false;
+    }
+
+    const FileSceneAssetCatalog::ValidationPass validationPass(scene.m_assets);
+    std::string error;
+    const auto candidate = scene.m_assets.DescribeMeshResidencyCandidate(selection.meshReference, *retained, &error);
+
+    if (!candidate)
+    {
+        return false;
+    }
+
+    m_diagnosticMeshToken = scene.m_runtime->PrepareMeshResidency(selection, scene.m_assets, *candidate, &error);
+
+    if (!m_diagnosticMeshToken)
+    {
+        return false;
+    }
+
+    m_diagnosticRendererLifetime = m_renderer.GetMaterialTableIdentity();
+    m_diagnosticMeshReadiness.reset();
+    Log::Info("Retained mesh geometry reused for object " + selection.objectID + "; source digest verified under pin.");
+    return true;
 }
 
 std::string Engine::GetMeshSourceIdentity(const SceneObjectMetadata& selection) const
@@ -4609,19 +4662,35 @@ void Engine::ContinueAutomaticMeshResidencyAfterReplacement(std::uint64_t previo
     }
 }
 
-void Engine::FinishAutomaticMeshResidency(MeshResidencyPublication::Status status)
+void Engine::FinishAutomaticMeshResidency(MeshResidencyPublication::Status status, std::string_view failedObjectID)
 {
     auto& scheduler = m_automaticMeshResidency;
 
-    if (status == MeshResidencyPublication::Status::Ready && scheduler.enabled && m_residencyRequestSelection &&
-        m_residencyRequestSelection->runtimeIdentity == scheduler.runtimeIdentity)
+    // The outstanding request's entries: the gathered batch, or the single selection.
+    std::span<const SceneObjectMetadata> entries = m_residencyRequestBatch;
+
+    if (entries.empty() && m_residencyRequestSelection)
     {
-        ++scheduler.published;
-        std::erase_if(scheduler.failures, [&](const auto& failure)
+        entries = std::span<const SceneObjectMetadata>(&*m_residencyRequestSelection, 1);
+    }
+
+    if (status == MeshResidencyPublication::Status::Ready && scheduler.enabled && !entries.empty() &&
+        entries.front().runtimeIdentity == scheduler.runtimeIdentity)
+    {
+        scheduler.published += entries.size();
+        ++scheduler.batchesPublished;
+        scheduler.lastPublished = std::chrono::steady_clock::now();
+
+        for (const auto& entry : entries)
         {
-            return failure.selection.objectID == m_residencyRequestSelection->objectID;
-        });
+            std::erase_if(scheduler.failures, [&](const auto& failure)
+            {
+                return failure.selection.objectID == entry.objectID;
+            });
+        }
+
         scheduler.backpressure.clear();
+        scheduler.batchLimit = FileSceneRuntime::MaxMeshResidencyBatch;
         m_residencyRequestAutomatic = false;
         return;
     }
@@ -4638,30 +4707,57 @@ void Engine::FinishAutomaticMeshResidency(MeshResidencyPublication::Status statu
         return;
     }
 
+    // Unaffected entries return to the scan; terminal state belongs only to the
+    // responsible entry, or to the request itself when it holds one object.
+    const SceneObjectMetadata* responsible = nullptr;
+
+    for (const auto& entry : entries)
+    {
+        scheduler.cursor = (std::min)(scheduler.cursor, entry.runtimeIndex);
+
+        if (!failedObjectID.empty() && entry.objectID == failedObjectID)
+        {
+            responsible = &entry;
+        }
+    }
+
+    if (!responsible && entries.size() == 1)
+    {
+        responsible = &entries.front();
+    }
+
     if (status == MeshResidencyPublication::Status::Failed || status == MeshResidencyPublication::Status::Unsupported)
     {
-        if (m_residencyRequestSelection)
+        if (!responsible)
         {
-            try
-            {
-                std::erase_if(scheduler.failures, [&](const auto& failure)
-                {
-                    return failure.selection.objectID == m_residencyRequestSelection->objectID;
-                });
+            // An unattributed batch failure is retried in halves: each step
+            // publishes the unaffected half and narrows the cause until a
+            // single-object request attributes it.
+            scheduler.batchLimit = (std::max)(std::size_t{1}, entries.size() / 2);
+            return;
+        }
 
-                if (scheduler.failures.size() < 4096)
-                {
-                    scheduler.failures.push_back({*m_residencyRequestSelection, m_residencyRequestSourceIdentity});
-                }
-                else
-                {
-                    scheduler.enabled = false;
-                }
-            }
-            catch (const std::exception&)
+        try
+        {
+            const auto sourceIdentity = m_residencyRequestBatch.empty() ? m_residencyRequestSourceIdentity :
+                GetMeshSourceIdentity(*responsible);
+            std::erase_if(scheduler.failures, [&](const auto& failure)
             {
-                scheduler.enabled = false; // Cannot track failures safely; never spin/reimport.
+                return failure.selection.objectID == responsible->objectID;
+            });
+
+            if (scheduler.failures.size() < 4096)
+            {
+                scheduler.failures.push_back({*responsible, sourceIdentity});
             }
+            else
+            {
+                scheduler.enabled = false;
+            }
+        }
+        catch (const std::exception&)
+        {
+            scheduler.enabled = false; // Cannot track failures safely; never spin/reimport.
         }
 
         return;
@@ -4672,15 +4768,16 @@ void Engine::FinishAutomaticMeshResidency(MeshResidencyPublication::Status statu
         ++scheduler.stale;
     }
 
-    if (m_residencyRequestSelection)
+    if (responsible && entries.size() > 1)
     {
-        scheduler.cursor = (std::min)(scheduler.cursor, m_residencyRequestSelection->runtimeIndex);
+        scheduler.isolate = responsible->objectID;
     }
 
     scheduler.retryAfter = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
 }
 
-void Engine::RejectMeshResidencyRequest(const std::string& message, MeshResidencyPublication::Status status)
+void Engine::RejectMeshResidencyRequest(const std::string& message, MeshResidencyPublication::Status status,
+    std::string_view failedObjectID)
 {
     // Existing low-level APIs report certain temporary failures through strings.
     // Keep these retryable rather than poisoning this object's binding generation.
@@ -4706,8 +4803,202 @@ void Engine::RejectMeshResidencyRequest(const std::string& message, MeshResidenc
         scheduler.backpressure = message;
     }
 
-    FinishAutomaticMeshResidency(status);
+    FinishAutomaticMeshResidency(status, failedObjectID);
     CancelMeshResidencyAcceptance();
+}
+
+bool Engine::IsTerminalAutomaticFailure(const SceneObjectMetadata& selection) const
+{
+    const auto& failures = m_automaticMeshResidency.failures;
+    const auto failure = std::find_if(failures.begin(), failures.end(), [&](const auto& saved)
+    {
+        const auto& binding = saved.selection;
+        return binding.objectID == selection.objectID && binding.runtimeIndex == selection.runtimeIndex &&
+            binding.bindingRevision == selection.bindingRevision && binding.meshReference == selection.meshReference &&
+            binding.materialReference == selection.materialReference && binding.materialSlotBindings == selection.materialSlotBindings;
+    });
+
+    // Terminal only while the recorded source is unchanged.
+    return failure != failures.end() && failure->sourceIdentity == GetMeshSourceIdentity(selection);
+}
+
+std::optional<MeshResidencyCandidate> Engine::DescribeSynchronousMeshCandidate(FileBackedDemoScene& scene,
+    const SceneObjectMetadata& selection)
+{
+    // Built-in or catalog-retained geometry only; never imports or uploads.
+    // Describe validates catalog ownership and, for FBX, the source digest under a pin.
+    const auto kind = FileSceneAssetCatalog::ClassifyMeshReference(selection.meshReference);
+    Mesh* mesh = nullptr;
+
+    if (kind == FileSceneAssetCatalog::MeshReferenceKind::Builtin)
+    {
+        mesh = scene.m_assets.ResolveMesh(selection.meshReference);
+    }
+    else if (kind == FileSceneAssetCatalog::MeshReferenceKind::RegisteredAsset)
+    {
+        mesh = scene.m_assets.FindRetainedMesh(selection.meshReference);
+    }
+
+    if (!mesh)
+    {
+        return std::nullopt;
+    }
+
+    std::string error;
+    return scene.m_assets.DescribeMeshResidencyCandidate(selection.meshReference, *mesh, &error);
+}
+
+void Engine::SubmitAutomaticResidencyBatch(FileBackedDemoScene& scene,
+    const std::vector<FileSceneRuntime::MeshResidencyRequest>& batch)
+{
+    try
+    {
+        m_residencyRequestBatch.clear();
+        m_residencyRequestBatch.reserve(batch.size());
+
+        for (const auto& request : batch)
+        {
+            m_residencyRequestBatch.push_back(request.selection);
+        }
+
+        m_residencyRequestSelection = batch.front().selection;
+        m_residencyRequestSourceIdentity.clear();
+        m_residencyRequestAutomatic = true;
+
+        std::string error;
+        std::string failedObjectID;
+        m_diagnosticMeshToken = scene.m_runtime->PrepareMeshResidencyBatch(batch, scene.m_assets, &error, &failedObjectID);
+
+        if (!m_diagnosticMeshToken)
+        {
+            RejectMeshResidencyRequest("Automatic residency batch preparation rejected: " + error,
+                MeshResidencyPublication::Status::Failed, failedObjectID);
+            return;
+        }
+
+        m_diagnosticRendererLifetime = m_renderer.GetMaterialTableIdentity();
+        m_diagnosticMeshReadiness.reset();
+        Log::Info("Automatic residency batch staged: " + std::to_string(batch.size()) + " objects.");
+    }
+    catch (const std::exception& exception)
+    {
+        RejectMeshResidencyRequest("Automatic residency batch allocation failed: " + std::string(exception.what()),
+            MeshResidencyPublication::Status::Retry);
+    }
+}
+
+void Engine::CountAutomaticPublicationAttempt(const MeshResidencyPublication::AcceptanceResult& result)
+{
+    auto& scheduler = m_automaticMeshResidency;
+
+    if (!m_residencyRequestAutomatic || !scheduler.enabled || scheduler.settled)
+    {
+        return;
+    }
+
+    ++scheduler.publicationAttempts;
+
+    if (result.status == MeshResidencyPublication::Status::Retry)
+    {
+        CountAutomaticRetry("publication: " + result.message);
+    }
+}
+
+void Engine::CountAutomaticRetry(const std::string& reason)
+{
+    auto& scheduler = m_automaticMeshResidency;
+
+    if (!m_residencyRequestAutomatic || !scheduler.enabled || scheduler.settled)
+    {
+        return;
+    }
+
+    const auto found = std::find_if(scheduler.retries.begin(), scheduler.retries.end(),
+        [&](const auto& entry) { return entry.first == reason; });
+
+    if (found != scheduler.retries.end())
+    {
+        ++found->second;
+    }
+    else if (scheduler.retries.size() < 32)
+    {
+        scheduler.retries.emplace_back(reason, 1);
+    }
+}
+
+// Diagnostic only: names the first scheduler gate that would return early, in
+// the same order AdvanceAutomaticMeshResidency checks them.
+const char* Engine::GetAutomaticResidencyGate(const FileSceneRuntime& runtime) const
+{
+    if (m_diagnosticCPUPreparation)
+    {
+        return "CPU mesh preparation outstanding";
+    }
+
+    if (m_meshResidencyPublication.HasCandidate())
+    {
+        return "renderer candidate awaiting publication";
+    }
+
+    if (m_diagnosticMeshToken)
+    {
+        return "scene token awaiting renderer candidate preparation";
+    }
+
+    if (m_pendingEditorSceneOperation)
+    {
+        return "pending editor scene operation";
+    }
+
+    if (m_pendingMaterialAssignment)
+    {
+        return "pending material assignment";
+    }
+
+    if (m_demoSceneManager.HasPendingSceneChange())
+    {
+        return "pending scene change";
+    }
+
+    if (!MeshResidencyPublication::CanPrepareGeometry(m_renderer, runtime))
+    {
+        return "renderer geometry boundary unavailable (CanPrepareGeometry)";
+    }
+
+    return nullptr;
+}
+
+void Engine::ReportAutomaticResidencyGate(const char* reason)
+{
+    // Diagnostic only. Per-object gates clear within frames; report a reason
+    // once it persists, and again when it clears, never every frame.
+    auto& scheduler = m_automaticMeshResidency;
+    const auto now = std::chrono::steady_clock::now();
+
+    if (reason != scheduler.blockedReason)
+    {
+        if (scheduler.blockedReported)
+        {
+            Log::Info("Automatic mesh residency gate cleared after " + std::to_string(
+                std::chrono::duration<double, std::milli>(now - scheduler.blockedSince).count()) + " ms, " +
+                std::to_string(scheduler.frames - scheduler.blockedSinceFrame) + " frames: " + scheduler.blockedReason);
+        }
+
+        scheduler.blockedReason = reason;
+        scheduler.blockedSince = now;
+        scheduler.blockedSinceFrame = scheduler.frames;
+        scheduler.blockedReported = false;
+        return;
+    }
+
+    if (reason && !scheduler.blockedReported && now - scheduler.blockedSince > std::chrono::seconds(2))
+    {
+        scheduler.blockedReported = true;
+        const auto& last = m_diagnosticMeshReadiness;
+        Log::Warning("Automatic mesh residency blocked > 2 s (" + std::to_string(scheduler.frames -
+            scheduler.blockedSinceFrame) + " frames) at gate: " + reason +
+            (last ? "; last readiness: " + last->message : std::string{}));
+    }
 }
 
 void Engine::AdvanceAutomaticMeshResidency()
@@ -4727,6 +5018,21 @@ void Engine::AdvanceAutomaticMeshResidency()
         scheduler = {};
         return;
     }
+
+    const bool outstanding = m_diagnosticCPUPreparation || m_diagnosticMeshToken ||
+        m_meshResidencyPublication.HasCandidate();
+
+    if (!scheduler.settled)
+    {
+        ++scheduler.frames;
+
+        if (!outstanding)
+        {
+            ++scheduler.idleFrames;
+        }
+    }
+
+    ReportAutomaticResidencyGate(scheduler.settled ? nullptr : GetAutomaticResidencyGate(*scene->m_runtime));
 
     if (m_diagnosticCPUPreparation || m_diagnosticMeshToken || m_meshResidencyPublication.HasCandidate() ||
         m_pendingEditorSceneOperation || m_pendingMaterialAssignment || m_demoSceneManager.HasPendingSceneChange() ||
@@ -4765,14 +5071,24 @@ void Engine::AdvanceAutomaticMeshResidency()
         return;
     }
 
-    // Scan cheap resident indices in bounded batches. At most one validated
-    // pending-object lookup/submission per frame; no repeated all-scene snapshot.
-    for (size_t scanned = 0; scanned < 32 && scheduler.cursor < objects.size(); ++scanned)
+    // Scan cheap resident indices in bounded batches, gathering pending objects
+    // whose geometry is built-in or already catalog-retained (verified under a
+    // pin). The first object that needs a worker import is requested alone
+    // through the existing path; once imported, its later instances batch.
+    const size_t limit = (std::min)(scheduler.batchLimit, FileSceneRuntime::MaxMeshResidencyBatch);
+    // Bounded per-frame scan, wide enough that resident objects interleaved in
+    // the scene do not cut a full batch short.
+    const size_t scanBudget = (std::max)(std::size_t{32}, 4 * FileSceneRuntime::MaxMeshResidencyBatch);
+    std::vector<FileSceneRuntime::MeshResidencyRequest> batch;
+    const FileSceneAssetCatalog::ValidationPass validationPass(scene->m_assets);
+
+    for (size_t scanned = 0; scanned < scanBudget && scheduler.cursor < objects.size() && batch.size() < limit; ++scanned)
     {
-        const auto index = scheduler.cursor++;
+        const auto index = scheduler.cursor;
 
         if (objects[index].mesh)
         {
+            ++scheduler.cursor;
             continue;
         }
 
@@ -4781,6 +5097,11 @@ void Engine::AdvanceAutomaticMeshResidency()
 
         if (!selection)
         {
+            if (!batch.empty())
+            {
+                break; // Submit what was gathered; this object is rescanned next.
+            }
+
             const auto message = "Automatic discovery metadata is unavailable: " + error;
 
             if (scheduler.backpressure != message)
@@ -4789,35 +5110,65 @@ void Engine::AdvanceAutomaticMeshResidency()
                 scheduler.backpressure = message;
             }
 
-            scheduler.cursor = index;
             scheduler.retryAfter = now + std::chrono::seconds(1);
             return;
         }
 
-        if (selection->meshReference.empty())
+        if (selection->meshReference.empty() || IsTerminalAutomaticFailure(*selection))
         {
-            return; // Bound metadata validation to one object per frame.
+            ++scheduler.cursor;
+            continue;
         }
 
-        const auto failure = std::find_if(scheduler.failures.begin(), scheduler.failures.end(), [&](const auto& saved)
-        {
-            const auto& binding = saved.selection;
-            return binding.objectID == selection->objectID && binding.runtimeIndex == selection->runtimeIndex &&
-                binding.bindingRevision == selection->bindingRevision && binding.meshReference == selection->meshReference &&
-                binding.materialReference == selection->materialReference && binding.materialSlotBindings == selection->materialSlotBindings;
-        });
+        // An object attributed in a rejected batch is retried alone, so the
+        // objects gathered with it are not held back by it again.
+        const bool isolated = selection->objectID == scheduler.isolate;
 
-        if (failure != scheduler.failures.end() && failure->sourceIdentity == GetMeshSourceIdentity(*selection))
+        if (isolated && !batch.empty())
         {
-            return; // Terminal for this source/binding; next frame advances the cursor.
+            break;
+        }
+
+        const auto candidate = DescribeSynchronousMeshCandidate(*scene, *selection);
+
+        if (!candidate)
+        {
+            if (!batch.empty())
+            {
+                break;
+            }
+
+            ++scheduler.cursor;
+            scheduler.isolate.clear();
+            std::erase_if(scheduler.failures, [&](const auto& saved)
+            {
+                return saved.selection.objectID == selection->objectID;
+            });
+            scheduler.settled = false;
+            ++scheduler.requests;
+            BeginMeshResidencyRequest(*selection, true);
+            return;
         }
 
         std::erase_if(scheduler.failures, [&](const auto& saved)
         {
             return saved.selection.objectID == selection->objectID;
         });
+        batch.push_back({*selection, *candidate});
+        ++scheduler.cursor;
+
+        if (isolated)
+        {
+            scheduler.isolate.clear();
+            break;
+        }
+    }
+
+    if (!batch.empty())
+    {
         scheduler.settled = false;
-        BeginMeshResidencyRequest(*selection, true);
+        ++scheduler.requests;
+        SubmitAutomaticResidencyBatch(*scene, batch);
         return;
     }
 
@@ -4834,6 +5185,25 @@ void Engine::AdvanceAutomaticMeshResidency()
             ", published=" + std::to_string(scheduler.published) + ", already-resident=" + std::to_string(scheduler.initiallyResident) +
             ", terminal failures=" + std::to_string(scheduler.failures.size()) + ", canceled/stale=" +
             std::to_string(scheduler.stale) + ", outstanding=0, elapsed=" + std::to_string(elapsed) + " ms.");
+
+        const auto toLast = scheduler.published ? std::chrono::duration<double, std::milli>(
+            scheduler.lastPublished - scheduler.activated).count() : 0.0;
+        const auto perObject = scheduler.published ?
+            static_cast<double>(scheduler.frames) / static_cast<double>(scheduler.published) : 0.0;
+        const auto frameTime = scheduler.frames ? elapsed / static_cast<double>(scheduler.frames) : 0.0;
+        Log::Info("Automatic mesh residency streaming stats: frames=" + std::to_string(scheduler.frames) +
+            ", idle frames=" + std::to_string(scheduler.idleFrames) + ", requests=" + std::to_string(scheduler.requests) +
+            ", worker-pending frames=" + std::to_string(scheduler.workerPendingFrames) +
+            ", publication attempts=" + std::to_string(scheduler.publicationAttempts) +
+            ", batches published=" + std::to_string(scheduler.batchesPublished) +
+            ", frames/published=" + std::to_string(perObject) + ", mean frame=" + std::to_string(frameTime) +
+            " ms, last publication at=" + std::to_string(toLast) + " ms.");
+
+        for (const auto& [reason, count] : scheduler.retries)
+        {
+            Log::Info("  publication retry x" + std::to_string(count) + ": " + reason);
+        }
+
         scheduler.settled = true;
     }
 

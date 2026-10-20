@@ -30,6 +30,8 @@
 #include <string_view>
 #include <vector>
 #include <chrono>
+#include <thread>
+#include <unordered_map>
 
 class Scene;
 struct PreparedScene;
@@ -162,6 +164,24 @@ public:
     // consult the CPU mesh cache, or allocate a project GPU mesh.
     bool ValidateMetadataMeshReference(std::string_view reference, std::string* errorMessage) const;
     bool ValidateMetadataMaterialReference(std::string_view reference, std::string* errorMessage) const;
+
+    // One synchronous validation pass on the constructing thread. While open, equal
+    // material references are validated once and an FBX source digest is computed
+    // once per resolved path; the pass holds a share-read pin on that path, taken
+    // before the digest, so the file cannot change while its digest is reused.
+    // Nothing survives the scope: the next pass validates against disk again.
+    class ValidationPass
+    {
+    public:
+        explicit ValidationPass(const FileSceneAssetCatalog& catalog);
+        ~ValidationPass();
+        ValidationPass(const ValidationPass&) = delete;
+        ValidationPass& operator=(const ValidationPass&) = delete;
+
+    private:
+        const FileSceneAssetCatalog& m_catalog;
+        bool m_outermost = false;
+    };
     // Requires the existing fallback-texture policy, so metadata preparation cannot
     // accidentally enter synchronous texture decode/upload through a direct caller.
     Material* ResolveMetadataMaterial(std::string_view reference);
@@ -345,6 +365,29 @@ private:
     std::map<MaterialCacheKey, Material> m_projectMaterials;
 
     std::map<MaterialCacheKey, MaterialAssetData> m_materialSources;
+
+    struct ValidationPassState
+    {
+        struct MaterialResult
+        {
+            bool valid = false;
+            std::string error;
+        };
+
+        struct PinnedSource
+        {
+            MeshResidencySourceLock pin; // Acquired before the digest was computed.
+            std::string digest;
+        };
+
+        std::thread::id owner;
+        std::unordered_map<std::string, MaterialResult> materials; // Exact authored reference.
+        std::map<std::filesystem::path, PinnedSource> sources; // Resolved FBX path.
+    };
+
+    mutable std::optional<ValidationPassState> m_validationPass;
+    ValidationPassState* ActiveValidationPass() const noexcept;
+    bool ValidateMetadataMaterialReferenceOnDisk(std::string_view reference, std::string* errorMessage) const;
 
     // Ordinary material binding revisions change only on saved texture publication.
     std::map<MaterialCacheKey, std::uint64_t> m_materialBindingRevisions;

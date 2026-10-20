@@ -108,6 +108,8 @@ class DebugUI
             return RendererLightingMode::PathTracedReference;
         case 2:
             return RendererLightingMode::PathTracedRasterPrimary;
+        case 3:
+            return RendererLightingMode::PathTracedRasterPrimaryReSTIRDI;
         default:
             return RendererLightingMode::Legacy;
         }
@@ -124,6 +126,7 @@ class DebugUI
         std::uint64_t resourceBytes);
 
     void SetPathTraceRasterPrimaryStatus(PathTraceRasterPrimaryAvailability availability, const std::string& reason);
+    void SetPathTraceReSTIRDIStatus(PathTraceRasterPrimaryAvailability availability, const std::string& reason);
 
     bool HasEnvironmentChangeRequest() const
     {
@@ -182,7 +185,7 @@ class DebugUI
 
     int m_lightingMode = 0;
     int m_pathTraceSamplesPerFrame = 1;
-    int m_pathTraceMaxPathDepth = 8;
+    int m_pathTraceMaxPathDepth = 3;
     int m_pathTraceRussianRouletteDepth = 3;
     int m_pathTraceMaxAccumulatedSamples = 1 << 16;
 
@@ -194,4 +197,6 @@ class DebugUI
 
     PathTraceRasterPrimaryAvailability m_rasterPrimaryAvailability = PathTraceRasterPrimaryAvailability::NotRequested;
     std::string m_rasterPrimaryReason;
+    PathTraceRasterPrimaryAvailability m_restirDIAvailability = PathTraceRasterPrimaryAvailability::NotRequested;
+    std::string m_restirDIReason;
 };

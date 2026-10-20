@@ -2,7 +2,88 @@
 #include "ShaderCompiler.h"
 
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <string>
+
+namespace
+{
+    std::filesystem::path DependencyPath(const wchar_t* path)
+    {
+        std::error_code error;
+        const std::filesystem::path absolute = std::filesystem::absolute(path, error);
+        return (error ? std::filesystem::path(path) : absolute).lexically_normal();
+    }
+
+    void RecordDependency(std::vector<ShaderSourceDependency>& dependencies, const wchar_t* path, IDxcBlob* source)
+    {
+        ShaderSourceDependency dependency{};
+        dependency.path = DependencyPath(path);
+
+        for(const ShaderSourceDependency& existing : dependencies)
+        {
+            if(existing.path == dependency.path)
+            {
+                return;
+            }
+        }
+
+        dependency.exists = source != nullptr;
+
+        if(source)
+        {
+            const char* begin = static_cast<const char*>(source->GetBufferPointer());
+            dependency.contents.assign(begin, begin + source->GetBufferSize());
+        }
+
+        dependencies.push_back(std::move(dependency));
+    }
+
+    // Forwards to the default handler and records every lookup, including the misses: a file appearing
+    // earlier in the search order would change which source an include resolves to. Lives on the stack
+    // for one Compile call, which releases every reference it takes before returning.
+    class RecordingIncludeHandler final : public IDxcIncludeHandler
+    {
+        public:
+        RecordingIncludeHandler(IDxcIncludeHandler* inner, std::vector<ShaderSourceDependency>& dependencies) :
+            m_inner(inner), m_dependencies(dependencies)
+        {
+        }
+
+        HRESULT STDMETHODCALLTYPE LoadSource(LPCWSTR filename, IDxcBlob** includeSource) override
+        {
+            const HRESULT result = m_inner->LoadSource(filename, includeSource);
+            RecordDependency(m_dependencies, filename, SUCCEEDED(result) ? *includeSource : nullptr);
+            return result;
+        }
+
+        HRESULT STDMETHODCALLTYPE QueryInterface(REFIID id, void** object) override
+        {
+            if(id == __uuidof(IDxcIncludeHandler) || id == __uuidof(IUnknown))
+            {
+                *object = static_cast<IDxcIncludeHandler*>(this);
+                return S_OK;
+            }
+
+            *object = nullptr;
+            return E_NOINTERFACE;
+        }
+
+        ULONG STDMETHODCALLTYPE AddRef() override
+        {
+            return 1;
+        }
+
+        ULONG STDMETHODCALLTYPE Release() override
+        {
+            return 1;
+        }
+
+        private:
+        IDxcIncludeHandler* m_inner = nullptr;
+        std::vector<ShaderSourceDependency>& m_dependencies;
+    };
+}
 
 bool ShaderCompiler::Initialize()
 {
@@ -175,6 +256,7 @@ bool ShaderCompiler::CompileLibrary(
     ShaderLibraryCompileResult& output)
 {
     output.bytecode.clear();
+    output.dependencies.clear();
 
     if (!m_utils || !m_compiler)
     {
@@ -220,10 +302,12 @@ bool ShaderCompiler::CompileLibrary(
     const wchar_t* arguments[] = {description.path, L"-T", L"lib_6_6", L"-HV", L"2021", L"-I", shaderDirectory.c_str()};
 
     IDxcResult* compileResult = nullptr;
+    RecordDependency(output.dependencies, description.path, source);
+    RecordingIncludeHandler recordingIncludeHandler(includeHandler, output.dependencies);
 
     result =
         m_compiler->Compile(&sourceBuffer, arguments, static_cast<UINT32>(sizeof(arguments) / sizeof(arguments[0])),
-                            includeHandler, IID_PPV_ARGS(&compileResult));
+                            &recordingIncludeHandler, IID_PPV_ARGS(&compileResult));
 
     includeHandler->Release();
 
@@ -289,6 +373,27 @@ bool ShaderCompiler::CompileLibrary(
     compileResult->Release();
 
     source->Release();
+
+    return true;
+}
+
+bool ShaderCompiler::DependenciesUnchanged(const std::vector<ShaderSourceDependency>& dependencies)
+{
+    for(const ShaderSourceDependency& dependency : dependencies)
+    {
+        std::ifstream file(dependency.path, std::ios::binary);
+
+        if(file.is_open() != dependency.exists)
+        {
+            return false;
+        }
+
+        if(dependency.exists &&
+            std::string(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()) != dependency.contents)
+        {
+            return false;
+        }
+    }
 
     return true;
 }

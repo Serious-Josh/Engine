@@ -345,6 +345,24 @@ int main(int argc, char** argv)
         catch(const std::exception& e) { Log::Error(std::string("Membership diagnostic: ")+e.what()); success=false; }
         engine->Shutdown(); return success ? 0 : 1;
     }
+    if(argc == 2 && std::string_view(argv[1]) == "--verify-residency-batches")
+    {
+        auto engine = std::make_unique<Engine>();
+        bool success = false;
+
+        try
+        {
+            success = engine->Initialize() && engine->VerifyResidencyBatches();
+        }
+        catch(const std::exception& exception)
+        {
+            Log::Error(std::string("Residency batch diagnostic: ") + exception.what());
+            success = false;
+        }
+
+        engine->Shutdown();
+        return success ? 0 : 1;
+    }
     if(argc >= 2 && std::string_view(argv[1]) == "--verify-thumbnail-scheduling")
     {
         if(argc != 3)

@@ -16,6 +16,26 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(ENGINE_BUILD_DIAGNOSTICS "Build local regression diagnostics (Debug only)" OFF)
 
+# NVIDIA RTXDI - required rendering dependency.
+# Kept outside the Engine repository under NVIDIA's own license.
+set(ENGINE_RTXDI_ROOT
+    "${CMAKE_CURRENT_SOURCE_DIR}/../RTXDI-Library"
+    CACHE PATH "Path to NVIDIA RTXDI-Library"
+)
+
+if(NOT EXISTS "${ENGINE_RTXDI_ROOT}/CMakeLists.txt"
+   OR NOT EXISTS "${ENGINE_RTXDI_ROOT}/Include/Rtxdi/DI/ReSTIRDI.h")
+    message(FATAL_ERROR
+        "RTXDI-Library not found at '${ENGINE_RTXDI_ROOT}'. "
+        "Set ENGINE_RTXDI_ROOT to your RTXDI-Library checkout."
+    )
+endif()
+
+add_subdirectory(
+    "${ENGINE_RTXDI_ROOT}"
+    "${CMAKE_CURRENT_BINARY_DIR}/RTXDI"
+)
+
 include(FetchContent)
 
 # Assimp
@@ -195,6 +215,9 @@ add_library(EngineCore OBJECT
     src/Renderer/RendererMembershipCandidate.cpp
     src/Renderer/Passes/RayTracedShadowPass.cpp
     src/Renderer/Passes/PathTraceReferencePass.cpp
+    src/Renderer/PreviousGBufferHistory.cpp
+    src/Renderer/Rtxdi/RtxdiLightBridge.cpp
+    src/Renderer/Rtxdi/RtxdiResources.cpp
     src/Renderer/MaterialTables/MaterialTableFile.cpp
     src/Renderer/MaterialTables/MaterialTableResources.cpp
     src/Renderer/Passes/ShadowDenoisePass.cpp
@@ -337,6 +360,10 @@ if(ENGINE_BUILD_DIAGNOSTICS)
         ENGINE_SOURCE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}"
         ENGINE_RUNTIME_DEPLOY_DIR="$<TARGET_FILE_DIR:EngineRuntime>"
     )
+    # The scene-hierarchy verification unit exceeds the default COFF section limit (C1128).
+    if(MSVC)
+        target_compile_options(EngineVerification PRIVATE /bigobj)
+    endif()
     target_sources(EngineVerification PRIVATE
         $<$<CONFIG:Debug>:src/Engine/tests/SceneEnvironmentVerification.cpp>
         $<$<CONFIG:Debug>:src/Engine/tests/BuildGameVerification.cpp>
@@ -359,6 +386,7 @@ if(ENGINE_BUILD_DIAGNOSTICS)
         $<$<CONFIG:Debug>:src/Engine/tests/ScenePhysicsPersistenceVerification.cpp>
         $<$<CONFIG:Debug>:src/Engine/tests/PresentationTransformVerification.cpp>
         $<$<CONFIG:Debug>:src/Engine/tests/SceneMembershipVerification.cpp>
+        $<$<CONFIG:Debug>:src/Engine/tests/ResidencyBatchVerification.cpp>
         $<$<CONFIG:Debug>:src/Engine/tests/MaterialBindingVerification.cpp>
         $<$<CONFIG:Debug>:src/Engine/tests/ViewportMaterialDropVerification.cpp>
         $<$<CONFIG:Debug>:src/Engine/tests/PackagedBootstrapVerification.cpp>
@@ -414,6 +442,29 @@ if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Engine/t
         target_link_libraries(LightDataTests PRIVATE $<$<CONFIG:Debug>:EngineVerification>)
     endif()
 endif()
+# Local-only RTXPT.3 Batch 1 RTXDI foundation verification (headless D3D12), same guard as LightDataTests.
+if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Renderer/tests/RtxdiFoundationTests.cpp")
+    add_executable(RtxdiFoundationTests src/Renderer/tests/RtxdiFoundationTests.cpp)
+    target_link_libraries(RtxdiFoundationTests PRIVATE EngineCore)
+    target_compile_definitions(RtxdiFoundationTests PRIVATE ENGINE_SOURCE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}"
+        ENGINE_RTXDI_INCLUDE="${ENGINE_RTXDI_ROOT}/Include")
+endif()
+# Local-only path-trace DXR library reuse regression (headless D3D12), same guard.
+if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Renderer/tests/PathTraceLibraryReuseTests.cpp")
+    add_executable(PathTraceLibraryReuseTests src/Renderer/tests/PathTraceLibraryReuseTests.cpp)
+    target_link_libraries(PathTraceLibraryReuseTests PRIVATE EngineCore)
+endif()
+# Local-only Phase 0 residency candidate allocator-wait regression (headless D3D12), same guard.
+if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Renderer/tests/CommandContextFrameFenceTests.cpp")
+    add_executable(CommandContextFrameFenceTests src/Renderer/tests/CommandContextFrameFenceTests.cpp)
+    target_link_libraries(CommandContextFrameFenceTests PRIVATE EngineCore)
+endif()
+# Local-only Phase 1 shared residency validation regression (headless D3D12), same guard.
+if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Scene/tests/ResidencyValidationPassTests.cpp")
+    add_executable(ResidencyValidationPassTests src/Scene/tests/ResidencyValidationPassTests.cpp)
+    target_link_libraries(ResidencyValidationPassTests PRIVATE EngineCore)
+    target_compile_definitions(ResidencyValidationPassTests PRIVATE ENGINE_SOURCE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}")
+endif()
 set_target_properties(EngineRuntime PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/Game/$<CONFIG>"
 )
@@ -467,6 +518,12 @@ add_custom_command(
         "${CMAKE_CURRENT_SOURCE_DIR}/external/NRD/Shaders/NRDConfig.hlsli"
         "$<TARGET_FILE_DIR:Engine>/assets/Shaders/NRD"
 
+    # Deploy NVIDIA RTXDI shader headers for runtime DXC compilation.
+    # The SDK remains outside the Engine source repository.
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+        "${ENGINE_RTXDI_ROOT}/Include/Rtxdi"
+        "$<TARGET_FILE_DIR:Engine>/assets/Shaders/Rtxdi"
+
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         $<TARGET_FILE:assimp>
         $<TARGET_FILE_DIR:Engine>
@@ -494,6 +551,7 @@ target_link_libraries(EngineCore
         EnginePhysics
         EngineScripting
         EngineScriptAssets
+        Rtxdi
         shell32
         ole32
         bcrypt

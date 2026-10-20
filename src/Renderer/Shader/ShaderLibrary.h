@@ -54,7 +54,18 @@ class ShaderLibrary
         const std::filesystem::path& path,
         ShaderLibraryCompileResult& output);
 
+    // True when compiling the library again would read identical inputs, so its bytecode can be reused.
+    // Packaged bytecode is immutable for the session.
+    bool IsLibraryCurrent(const ShaderLibraryCompileResult& library) const;
+
+    // DXC library compilations this session (packaged lookups excluded).
+    unsigned int GetLibraryCompileCount() const
+    {
+        return m_libraryCompileCount;
+    }
+
     private:
+    unsigned int m_libraryCompileCount = 0;
     bool m_packaged = false;
     std::map<std::string, std::vector<char>> m_packagedBytecode;
     ShaderCompiler m_compiler;

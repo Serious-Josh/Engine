@@ -104,7 +104,13 @@ bool ShaderLibrary::CompileLibrary(
     ShaderLibraryCompileDescription description{};
     description.path = shaderPathString.c_str();
 
+    ++m_libraryCompileCount;
     return m_compiler.CompileLibrary(description, output);
+}
+
+bool ShaderLibrary::IsLibraryCurrent(const ShaderLibraryCompileResult& library) const
+{
+    return !library.bytecode.empty() && (m_packaged || ShaderCompiler::DependenciesUnchanged(library.dependencies));
 }
 
 namespace

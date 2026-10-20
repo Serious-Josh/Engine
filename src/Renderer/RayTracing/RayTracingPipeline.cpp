@@ -20,6 +20,50 @@ namespace
 
         return result;
     }
+
+    bool IsValidDescription(ID3D12Device5* device, const RayTracingPipelineDescription& description)
+    {
+        if (!device ||
+            description.shaderPath.empty() ||
+            description.rayGenerationShader.empty() ||
+            description.missShaders.empty())
+        {
+            return false;
+        }
+
+        if (description.hitGroups.empty() ||
+            description.rootParameters.empty() ||
+            description.maxPayloadSize == 0 ||
+            description.maxAttributeSize == 0)
+        {
+            return false;
+        }
+
+        if (description.maxRecursionDepth == 0)
+        {
+            return false;
+        }
+
+        for (const std::wstring& missShader : description.missShaders)
+        {
+
+            if (missShader.empty())
+            {
+                return false;
+            }
+        }
+
+        for (const RayTracingHitGroupDescription& hitGroup : description.hitGroups)
+        {
+
+            if (hitGroup.name.empty() || hitGroup.closestHitShader.empty())
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
 }
 
 bool RayTracingPipeline::Initialize(
@@ -27,50 +71,27 @@ bool RayTracingPipeline::Initialize(
     ShaderLibrary& shaderLibrary,
     const RayTracingPipelineDescription& description)
 {
-    const std::filesystem::path& shaderPath = description.shaderPath;
-
-    if (!device ||
-        description.shaderPath.empty() ||
-        description.rayGenerationShader.empty() ||
-        description.missShaders.empty())
+    if (!IsValidDescription(device, description))
     {
         return false;
-    }
-
-    if (description.hitGroups.empty() ||
-        description.rootParameters.empty() ||
-        description.maxPayloadSize == 0 ||
-        description.maxAttributeSize == 0)
-    {
-        return false;
-    }
-
-    if (description.maxRecursionDepth == 0)
-    {
-        return false;
-    }
-
-    for (const std::wstring& missShader : description.missShaders)
-    {
-
-        if (missShader.empty())
-        {
-            return false;
-        }
-    }
-
-    for (const RayTracingHitGroupDescription& hitGroup : description.hitGroups)
-    {
-
-        if (hitGroup.name.empty() || hitGroup.closestHitShader.empty())
-        {
-            return false;
-        }
     }
 
     ShaderLibraryCompileResult compileResult{};
 
-    if (!shaderLibrary.CompileLibrary(shaderPath, compileResult))
+    if (!shaderLibrary.CompileLibrary(description.shaderPath, compileResult))
+    {
+        return false;
+    }
+
+    return Initialize(device, compileResult.bytecode, description);
+}
+
+bool RayTracingPipeline::Initialize(
+    ID3D12Device5* device,
+    const std::vector<char>& library,
+    const RayTracingPipelineDescription& description)
+{
+    if (!IsValidDescription(device, description) || library.empty())
     {
         return false;
     }
@@ -118,8 +139,8 @@ bool RayTracingPipeline::Initialize(
 
     D3D12_SHADER_BYTECODE libraryBytecode{};
 
-    libraryBytecode.pShaderBytecode = compileResult.bytecode.data();
-    libraryBytecode.BytecodeLength = compileResult.bytecode.size();
+    libraryBytecode.pShaderBytecode = library.data();
+    libraryBytecode.BytecodeLength = library.size();
 
     libraryDescription.DXILLibrary = libraryBytecode;
     libraryDescription.NumExports = static_cast<UINT>(exports.size());

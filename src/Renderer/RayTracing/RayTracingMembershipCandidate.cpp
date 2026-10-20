@@ -215,6 +215,10 @@ std::optional<RayTracingSceneResources::ReplacementCandidate> RayTracingSceneRes
 {
     error.clear();
 
+    // CPU-only preparation: recording and submission happen after this returns,
+    // so the pass's source pins never span GPU work.
+    const FileSceneAssetCatalog::ValidationPass validationPass(catalog);
+
     // Every early return below is an ordinary failure unless marked as exhaustion.
     if (failure)
     {
@@ -654,6 +658,8 @@ bool RayTracingSceneResources::RecordReplacementCandidate(ID3D12Device5* device,
 bool RayTracingSceneResources::ValidateCandidateBindings(const CandidateState& state, const FileSceneRuntime& runtime,
     FileSceneAssetCatalog& catalog, std::string& error) const
 {
+    // Whole-scene revalidation: shared materials and sources are checked once per call.
+    const FileSceneAssetCatalog::ValidationPass validationPass(catalog);
     const auto& objects = runtime.GetScene().GetRenderObjects();
 
     if (!state.valid || state.scene != &runtime.GetScene() || state.catalog != &catalog ||
@@ -919,9 +925,8 @@ bool RayTracingSceneResources::HasMatchingCandidateSubmissionState(const Replace
 }
 
 RayTracingSceneResources::AdoptionReadiness RayTracingSceneResources::PrepareCandidateAdoption(
-    const ReplacementCandidate& handle, std::string_view objectID, std::size_t objectIndex,
-    const MeshResidencyCandidate& mesh, Material* fallback, const std::map<std::string, Material*>& slots,
-    std::size_t materialCount, AdoptionEvidence& evidence, std::string& error)
+    const ReplacementCandidate& handle, std::span<const AdoptionEntry> entries, std::size_t materialCount,
+    AdoptionEvidence& evidence, std::string& error, std::string* failedObjectID)
 {
     if (!HasMatchingCandidateSubmissionState(handle))
     {
@@ -937,31 +942,52 @@ RayTracingSceneResources::AdoptionReadiness RayTracingSceneResources::PrepareCan
         return AdoptionReadiness::Unsupported;
     }
 
-    if (state.proposals.size() != 1)
-    {
-        Fail(error, "Coordinated readiness currently requires exactly one scene-side residency transaction.");
-        return AdoptionReadiness::Unsupported;
-    }
-
-    const auto& proposal = state.proposals.front();
-
-    if (proposal.objectID != objectID || proposal.mesh.key != mesh.key || proposal.mesh.mesh != mesh.mesh ||
-        proposal.mesh.sourceKind != mesh.sourceKind || proposal.mesh.builtinReference != mesh.builtinReference ||
-        proposal.mesh.cooked != mesh.cooked ||
-        proposal.mesh.catalogIdentity != mesh.catalogIdentity || proposal.mesh.vertexAddress != mesh.vertexAddress ||
-        proposal.mesh.indexAddress != mesh.indexAddress || objectIndex >= state.snapshot->materialBindings.size())
+    if (entries.empty() || state.proposals.size() != entries.size())
     {
         Fail(error, "Scene transaction and DXR candidate propose different object/mesh identities.");
         return AdoptionReadiness::Stale;
     }
 
-    const auto& binding = state.snapshot->materialBindings[objectIndex];
-
-    if (binding.mesh != mesh.mesh || binding.material != fallback || binding.slotMaterials != slots ||
-        materialCount != state.materialCount)
+    if (materialCount != state.materialCount)
     {
         Fail(error, "Scene staged bindings or material-table index layout differs from the DXR candidate.");
         return AdoptionReadiness::Stale;
+    }
+
+    // Every entry must match the proposal recorded at the same position; one
+    // mismatch rejects the whole batch before any registry staging.
+    for (std::size_t index = 0; index < entries.size(); ++index)
+    {
+        const auto& proposal = state.proposals[index];
+        const auto& entry = entries[index];
+        const auto& mesh = *entry.mesh;
+        const auto reject = [&](const char* message)
+        {
+            Fail(error, message);
+
+            if (failedObjectID)
+            {
+                *failedObjectID = std::string(entry.objectID);
+            }
+
+            return AdoptionReadiness::Stale;
+        };
+
+        if (proposal.objectID != entry.objectID || proposal.mesh.key != mesh.key || proposal.mesh.mesh != mesh.mesh ||
+            proposal.mesh.sourceKind != mesh.sourceKind || proposal.mesh.builtinReference != mesh.builtinReference ||
+            proposal.mesh.cooked != mesh.cooked ||
+            proposal.mesh.catalogIdentity != mesh.catalogIdentity || proposal.mesh.vertexAddress != mesh.vertexAddress ||
+            proposal.mesh.indexAddress != mesh.indexAddress || entry.objectIndex >= state.snapshot->materialBindings.size())
+        {
+            return reject("Scene transaction and DXR candidate propose different object/mesh identities.");
+        }
+
+        const auto& binding = state.snapshot->materialBindings[entry.objectIndex];
+
+        if (binding.mesh != mesh.mesh || binding.material != entry.fallback || binding.slotMaterials != *entry.slots)
+        {
+            return reject("Scene staged bindings or material-table index layout differs from the DXR candidate.");
+        }
     }
 
     return PrepareRegistryAdoption(handle, evidence, error);

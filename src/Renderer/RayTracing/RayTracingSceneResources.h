@@ -12,6 +12,8 @@
 #include <array>
 #include <memory>
 #include <optional>
+#include <span>
+#include <string_view>
 #include <vector>
 #include <unordered_map>
 
@@ -74,7 +76,10 @@ class RayTracingSceneResources
     };
 
     enum class CandidateStatus { Pending, Ready, NeedsTransformRefresh, Stale, Failed };
-    static constexpr std::size_t MaxCandidateProposals = 4;
+    // Bounded batch target, not an architectural constant: every proposal is
+    // charged against the metadata/table/AS budgets below, and a candidate
+    // retires one membership whatever its size.
+    static constexpr std::size_t MaxCandidateProposals = 32;
     static constexpr std::size_t MaxCandidateObjects = 4096;
     static constexpr std::size_t MaxCandidateMetadataBytes = 16 * 1024 * 1024;
     static constexpr std::size_t MaxCandidateTableBytes = 16 * 1024 * 1024;
@@ -170,6 +175,7 @@ class RayTracingSceneResources
     friend class SceneMembershipVerification;
     friend class SceneHierarchyVerification;
     friend class DescriptorRecoveryVerification;
+    friend class ResidencyBatchVerification;
 #endif
     friend class SceneMaterialBindingPublication;
 #if defined(ENGINE_HAS_VERIFICATION)
@@ -225,10 +231,19 @@ class RayTracingSceneResources
         std::size_t retirementSlot = 0;
     };
     std::uint64_t ReserveBLASRegistryLifetime() const;
+    // One staged scene-side batch entry, matched against the candidate proposal
+    // at the same position.
+    struct AdoptionEntry
+    {
+        std::string_view objectID;
+        std::size_t objectIndex = 0;
+        const MeshResidencyCandidate* mesh = nullptr;
+        Material* fallback = nullptr;
+        const std::map<std::string, Material*>* slots = nullptr;
+    };
     AdoptionReadiness PrepareCandidateAdoption(const ReplacementCandidate& candidate,
-        std::string_view objectID, std::size_t objectIndex, const MeshResidencyCandidate& mesh,
-        Material* fallback, const std::map<std::string, Material*>& slots, std::size_t materialCount,
-        AdoptionEvidence& evidence, std::string& error);
+        std::span<const AdoptionEntry> entries, std::size_t materialCount, AdoptionEvidence& evidence,
+        std::string& error, std::string* failedObjectID = nullptr);
 
     // Coordinator only, immediately after fresh readiness with a retained source
     // pin and no intervening mutation/recording. All storage is already reserved.

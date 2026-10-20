@@ -138,6 +138,8 @@ class Engine
     bool VerifyEditorGrid();
     bool VerifySceneDuplication(const std::filesystem::path& scene);
     bool VerifySceneMembership(const std::filesystem::path& scene);
+    // Phase 2 multi-object residency transactions over a self-created fixture project.
+    bool VerifyResidencyBatches();
     // H.4 real-device hierarchy rendering diagnostic over a schema-9 project scene.
     bool VerifySceneHierarchyGPU(const std::filesystem::path& scene);
     // B.1 real-device descriptor exhaustion, reclaim, cancellation and recovery diagnostic.
@@ -422,9 +424,16 @@ class Engine
     void OnFileSceneActivated(std::chrono::steady_clock::time_point started);
     void ContinueAutomaticMeshResidencyAfterReplacement(std::uint64_t previousRuntimeIdentity) noexcept;
     void AdvanceAutomaticMeshResidency();
-    void FinishAutomaticMeshResidency(MeshResidencyPublication::Status status);
+    // failedObjectID names the batch entry responsible for a rejection, when known.
+    void FinishAutomaticMeshResidency(MeshResidencyPublication::Status status, std::string_view failedObjectID = {});
     void RejectMeshResidencyRequest(const std::string& message,
-        MeshResidencyPublication::Status status = MeshResidencyPublication::Status::Failed);
+        MeshResidencyPublication::Status status = MeshResidencyPublication::Status::Failed,
+        std::string_view failedObjectID = {});
+    std::optional<MeshResidencyCandidate> DescribeSynchronousMeshCandidate(FileBackedDemoScene& scene,
+        const SceneObjectMetadata& selection);
+    void SubmitAutomaticResidencyBatch(FileBackedDemoScene& scene,
+        const std::vector<FileSceneRuntime::MeshResidencyRequest>& batch);
+    bool IsTerminalAutomaticFailure(const SceneObjectMetadata& selection) const;
     std::string GetMeshSourceIdentity(const SceneObjectMetadata& selection) const;
 
     struct AutomaticMeshResidency
@@ -448,13 +457,39 @@ class Engine
         std::chrono::steady_clock::time_point activated;
         std::chrono::steady_clock::time_point retryAfter;
         std::string backpressure;
+
+        // Bounded batching. An unattributed multi-object failure halves the limit
+        // until a publication succeeds; an attributed object is retried alone.
+        size_t batchLimit = FileSceneRuntime::MaxMeshResidencyBatch;
+        std::string isolate;
+        size_t batchesPublished = 0;
+
+        // Observation-only streaming counters, reported once at settlement.
+        size_t frames = 0;
+        size_t idleFrames = 0; // No request outstanding; scanning or cooling down.
+        size_t requests = 0;
+        size_t workerPendingFrames = 0;
+        size_t publicationAttempts = 0;
+        std::vector<std::pair<std::string, size_t>> retries; // By readiness message.
+        std::chrono::steady_clock::time_point lastPublished;
+        const char* blockedReason = nullptr; // Current scheduler gate; reported only once persistent.
+        std::chrono::steady_clock::time_point blockedSince;
+        size_t blockedSinceFrame = 0;
+        bool blockedReported = false;
     };
 
     AutomaticMeshResidency m_automaticMeshResidency;
+    void CountAutomaticPublicationAttempt(const MeshResidencyPublication::AcceptanceResult& result);
+    void CountAutomaticRetry(const std::string& reason);
+    const char* GetAutomaticResidencyGate(const FileSceneRuntime& runtime) const;
+    bool TryPrepareRetainedMeshResidency(FileBackedDemoScene& scene, const SceneObjectMetadata& selection);
+    void ReportAutomaticResidencyGate(const char* reason);
     // Automatic scheduling intent is scoped to a successfully activated runtime,
     // independent of its cursor, cooldowns and transient request handles.
     std::uint64_t m_automaticResidencyIntent = 0;
     std::optional<SceneObjectMetadata> m_residencyRequestSelection;
+    // Every entry of an outstanding automatic batch; empty for single-object requests.
+    std::vector<SceneObjectMetadata> m_residencyRequestBatch;
     std::string m_residencyRequestSourceIdentity;
     bool m_residencyRequestAutomatic = false;
     struct DiagnosticMeshPreparation
@@ -589,6 +624,7 @@ class Engine
 #if defined(ENGINE_HAS_VERIFICATION)
     friend class SceneDuplicationVerification;
     friend class SceneMembershipVerification;
+    friend class ResidencyBatchVerification;
     friend class SceneHierarchyVerification;
     friend class DescriptorRecoveryVerification;
     friend class ThumbnailSchedulingVerification;

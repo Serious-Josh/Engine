@@ -85,6 +85,35 @@ std::optional<MeshResidencyCandidate> FileSceneAssetCatalog::DescribeMeshResiden
     return std::nullopt;
 }
 
+FileSceneAssetCatalog::ValidationPass::ValidationPass(const FileSceneAssetCatalog& catalog)
+    : m_catalog(catalog)
+{
+    if(!catalog.m_validationPass)
+    {
+        catalog.m_validationPass.emplace();
+        catalog.m_validationPass->owner = std::this_thread::get_id();
+        m_outermost = true;
+    }
+}
+
+FileSceneAssetCatalog::ValidationPass::~ValidationPass()
+{
+    if(m_outermost)
+    {
+        m_catalog.m_validationPass.reset(); // Releases every pass-held source pin.
+    }
+}
+
+FileSceneAssetCatalog::ValidationPassState* FileSceneAssetCatalog::ActiveValidationPass() const noexcept
+{
+    if(!m_validationPass || m_validationPass->owner != std::this_thread::get_id())
+    {
+        return nullptr;
+    }
+
+    return &*m_validationPass;
+}
+
 MeshResidencySourceLock FileSceneAssetCatalog::ValidateMeshResidencyCandidate(
     const MeshResidencyCandidate& candidate, std::string_view reference, std::string* error) const
 {
@@ -249,9 +278,42 @@ MeshResidencySourceLock FileSceneAssetCatalog::ValidateMeshResidencyCandidate(
         }
 
         MeshResidencySourceLock source(handle);
-        MaterialThumbnailValidation validation;
+        auto* pass = ActiveValidationPass();
+        const ValidationPassState::PinnedSource* pinned = nullptr;
 
-        if(validation.Digest(resolved.resolvedPath) != std::get<2>(candidate.key))
+        if(pass)
+        {
+            const auto found = pass->sources.find(resolved.resolvedPath);
+            pinned = found == pass->sources.end() ? nullptr : &found->second;
+        }
+
+        std::string digest;
+
+        if(pinned)
+        {
+            digest = pinned->digest; // The pass pin has excluded writers since this digest.
+        }
+        else
+        {
+            MaterialThumbnailValidation validation;
+            digest = validation.Digest(resolved.resolvedPath);
+
+            // Open the pass pin while `source` still excludes writers, so exclusion
+            // is continuous from before the digest until the pass ends.
+            if(pass)
+            {
+                HANDLE passHandle = CreateFileW(resolved.resolvedPath.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                    nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+
+                if(passHandle != INVALID_HANDLE_VALUE)
+                {
+                    pass->sources.emplace(resolved.resolvedPath,
+                        ValidationPassState::PinnedSource{MeshResidencySourceLock(passHandle), digest});
+                }
+            }
+        }
+
+        if(digest != std::get<2>(candidate.key))
         {
             return reject("Residency candidate source content changed; prepare a new candidate.");
         }
@@ -297,12 +359,18 @@ Material* FileSceneAssetCatalog::ResolveResidencyMaterial(std::string_view refer
     return nullptr;
 }
 
-std::optional<MeshResidencyToken> FileSceneRuntime::PrepareMeshResidency(const SceneObjectMetadata& selection,
-    FileSceneAssetCatalog& catalog, const MeshResidencyCandidate& candidate, std::string* error)
+std::optional<MeshResidencyToken> FileSceneRuntime::PrepareMeshResidencyBatch(
+    std::span<const MeshResidencyRequest> requests, FileSceneAssetCatalog& catalog, std::string* error,
+    std::string* failedObjectID)
 {
     if(error)
     {
         error->clear();
+    }
+
+    if(failedObjectID)
+    {
+        failedObjectID->clear();
     }
 
     if(m_meshResidency || m_materialAssignment || HasPreparedScene() ||
@@ -312,6 +380,55 @@ std::optional<MeshResidencyToken> FileSceneRuntime::PrepareMeshResidency(const S
         return std::nullopt;
     }
 
+    if(requests.empty() || requests.size() > MaxMeshResidencyBatch)
+    {
+        Fail(error, "Residency batch must contain between 1 and " + std::to_string(MaxMeshResidencyBatch) + " requests.");
+        return std::nullopt;
+    }
+
+    // Every entry is validated and fully built before anything is staged, so a
+    // failure leaves the runtime exactly as it was.
+    MeshResidencyPreparation prepared;
+    prepared.catalog = &catalog;
+    prepared.entries.reserve(requests.size());
+
+    for(const auto& request : requests)
+    {
+        auto entry = PrepareMeshResidencyEntry(request, catalog, prepared.entries, error);
+
+        if(!entry)
+        {
+            if(failedObjectID)
+            {
+                *failedObjectID = request.selection.objectID;
+            }
+
+            return std::nullopt;
+        }
+
+        prepared.entries.push_back(std::move(*entry));
+    }
+
+    prepared.token = {m_instanceIdentity, m_nextMeshResidency, prepared.entries.size()};
+    const auto token = prepared.token;
+    m_meshResidency.emplace(std::move(prepared));
+    ++m_nextMeshResidency;
+    return token;
+}
+
+std::optional<MeshResidencyToken> FileSceneRuntime::PrepareMeshResidency(const SceneObjectMetadata& selection,
+    FileSceneAssetCatalog& catalog, const MeshResidencyCandidate& candidate, std::string* error)
+{
+    const MeshResidencyRequest request{selection, candidate};
+    return PrepareMeshResidencyBatch(std::span(&request, 1), catalog, error);
+}
+
+std::optional<FileSceneRuntime::MeshResidencyEntry> FileSceneRuntime::PrepareMeshResidencyEntry(
+    const MeshResidencyRequest& request, FileSceneAssetCatalog& catalog, std::span<const MeshResidencyEntry> staged,
+    std::string* error) const
+{
+    const auto& selection = request.selection;
+    const auto& candidate = request.candidate;
     const auto current = GetObjectMetadata(selection.objectID, error);
 
     if(!current || current->runtimeIdentity != selection.runtimeIdentity || current->sceneID != selection.sceneID ||
@@ -320,6 +437,17 @@ std::optional<MeshResidencyToken> FileSceneRuntime::PrepareMeshResidency(const S
         current->materialReference != selection.materialReference || current->materialSlotBindings != selection.materialSlotBindings)
     {
         Fail(error, "Residency object session, authored assignment or binding revision is stale.");
+        return std::nullopt;
+    }
+
+    const bool repeated = std::any_of(staged.begin(), staged.end(), [&](const MeshResidencyEntry& entry)
+    {
+        return entry.selection.runtimeIndex == current->runtimeIndex;
+    });
+
+    if(repeated)
+    {
+        Fail(error, "Residency batch names the same object more than once: " + current->objectID);
         return std::nullopt;
     }
 
@@ -357,10 +485,9 @@ std::optional<MeshResidencyToken> FileSceneRuntime::PrepareMeshResidency(const S
         }
     }
 
-    MeshResidencyPreparation prepared;
+    MeshResidencyEntry prepared;
     prepared.selection = *current;
     prepared.candidate = candidate;
-    prepared.catalog = &catalog;
 
     prepared.fallback = catalog.ResolveResidencyMaterial(current->materialReference, object.material, error);
 
@@ -398,15 +525,11 @@ std::optional<MeshResidencyToken> FileSceneRuntime::PrepareMeshResidency(const S
         return std::nullopt;
     }
 
-    prepared.token = {m_instanceIdentity, m_nextMeshResidency, current->bindingRevision};
-    const auto token = prepared.token;
-    // Map moves may allocate sentinel storage here, before any scene mutation.
-    m_meshResidency.emplace(std::move(prepared));
-    ++m_nextMeshResidency;
-    return token;
+    return prepared;
 }
 
-std::optional<SceneObjectMetadata> FileSceneRuntime::ValidatePreparedMeshResidencyIdentity(const MeshResidencyToken& token, const FileSceneAssetCatalog& catalog, std::string* error) const
+bool FileSceneRuntime::ValidatePreparedMeshResidencyTransaction(const MeshResidencyToken& token,
+    const FileSceneAssetCatalog& catalog, std::string* error) const
 {
     if(error)
     {
@@ -414,18 +537,35 @@ std::optional<SceneObjectMetadata> FileSceneRuntime::ValidatePreparedMeshResiden
     }
 
     if(!m_meshResidency || m_meshResidency->token != token || token.runtimeIdentity != m_instanceIdentity ||
-        m_materialAssignment || HasPreparedScene())
+        token.entryCount != m_meshResidency->entries.size() || m_materialAssignment || HasPreparedScene())
     {
-        Fail(error, "Residency commit token is stale or another scene transaction is outstanding.");
-        return {};
+        return Fail(error, "Residency commit token is stale or another scene transaction is outstanding.");
     }
 
-    const auto& prepared = *m_meshResidency;
+    if(m_meshResidency->catalog != &catalog)
+    {
+        return Fail(error, "Residency object, catalog, authored reference or binding revision changed before publication.");
+    }
+
+    // One increment per batch: a single exhaustion check covers the commit.
+    if(m_residencyRevision == (std::numeric_limits<std::uint64_t>::max)())
+    {
+        return Fail(error, "Residency pending bindings changed or revision identities are exhausted.");
+    }
+
+    return true;
+}
+
+std::optional<SceneObjectMetadata> FileSceneRuntime::ValidatePreparedMeshResidencyEntry(
+    const MeshResidencyEntry& prepared, const FileSceneAssetCatalog& catalog, std::string* error) const
+{
     const auto current = GetObjectMetadata(prepared.selection.objectID, error);
 
-    if(!current || prepared.catalog != &catalog || current->sceneID != prepared.selection.sceneID ||
-        current->runtimeIdentity != token.runtimeIdentity || current->structureRevision != prepared.selection.structureRevision ||
-        current->runtimeIndex != prepared.selection.runtimeIndex || current->bindingRevision != token.bindingRevision ||
+    if(!current || m_meshResidency->catalog != &catalog || current->sceneID != prepared.selection.sceneID ||
+        current->runtimeIdentity != prepared.selection.runtimeIdentity ||
+        current->structureRevision != prepared.selection.structureRevision ||
+        current->runtimeIndex != prepared.selection.runtimeIndex ||
+        current->bindingRevision != prepared.selection.bindingRevision ||
         current->meshReference != prepared.selection.meshReference ||
         current->materialReference != prepared.selection.materialReference ||
         current->materialSlotBindings != prepared.selection.materialSlotBindings)
@@ -438,8 +578,7 @@ std::optional<SceneObjectMetadata> FileSceneRuntime::ValidatePreparedMeshResiden
 
     if(current->GetMeshResidency(object) != SceneMeshResidency::Pending || object.material != prepared.fallback ||
         object.slotMaterials != prepared.originalSlots ||
-        current->bindingRevision == (std::numeric_limits<std::uint64_t>::max)() ||
-        m_residencyRevision == (std::numeric_limits<std::uint64_t>::max)())
+        current->bindingRevision == (std::numeric_limits<std::uint64_t>::max)())
     {
         Fail(error, "Residency pending bindings changed or revision identities are exhausted.");
         return {};
@@ -448,26 +587,42 @@ std::optional<SceneObjectMetadata> FileSceneRuntime::ValidatePreparedMeshResiden
     return current;
 }
 
-MeshResidencySourceLock FileSceneRuntime::ValidatePreparedMeshResidency(const MeshResidencyToken& token,
-    FileSceneAssetCatalog& catalog, std::string* error) const
+bool FileSceneRuntime::ValidatePreparedMeshResidencyIdentity(const MeshResidencyToken& token,
+    const FileSceneAssetCatalog& catalog, std::string* error, std::string* failedObjectID) const
 {
-    const auto current = ValidatePreparedMeshResidencyIdentity(token, catalog, error);
-
-    if (!current)
+    if(!ValidatePreparedMeshResidencyTransaction(token, catalog, error))
     {
-        return {};
+        return false;
     }
 
-    const auto& prepared = *m_meshResidency;
+    for(const auto& prepared : m_meshResidency->entries)
+    {
+        if(!ValidatePreparedMeshResidencyEntry(prepared, catalog, error))
+        {
+            if(failedObjectID)
+            {
+                *failedObjectID = prepared.selection.objectID;
+            }
+
+            return false;
+        }
+    }
+
+    return true;
+}
+
+MeshResidencySourceLock FileSceneRuntime::ValidatePreparedMeshResidencySources(const MeshResidencyEntry& prepared,
+    const SceneObjectMetadata& current, FileSceneAssetCatalog& catalog, std::string* error) const
+{
     if(prepared.candidate.sourceKind == MeshResidencyCandidate::SourceKind::Cooked && !m_cookedPublicationAuthorized)
     {
         Fail(error, "Cooked residency publication requires Engine archive bootstrap authorization.");
         return {};
     }
 
-    auto source = catalog.ValidateMeshResidencyCandidate(prepared.candidate, current->meshReference, error);
+    auto source = catalog.ValidateMeshResidencyCandidate(prepared.candidate, current.meshReference, error);
 
-    if(!source || !catalog.ValidateRetainedResidencyMaterial(current->materialReference, prepared.fallback, error))
+    if(!source || !catalog.ValidateRetainedResidencyMaterial(current.materialReference, prepared.fallback, error))
     {
         return {};
     }
@@ -483,13 +638,13 @@ MeshResidencySourceLock FileSceneRuntime::ValidatePreparedMeshResidency(const Me
     for (const auto& slot : slots)
     {
         const auto staged = prepared.runtimeSlots.find(slot.id);
-        const auto authored = current->materialSlotBindings.find(slot.id);
-        const auto reference = authored == current->materialSlotBindings.end() ?
-            std::string_view(current->materialReference) : std::string_view(authored->second);
+        const auto authored = current.materialSlotBindings.find(slot.id);
+        const auto reference = authored == current.materialSlotBindings.end() ?
+            std::string_view(current.materialReference) : std::string_view(authored->second);
 
         if (staged == prepared.runtimeSlots.end() ||
             !catalog.ValidateRetainedResidencyMaterial(reference, staged->second, error) ||
-            (authored == current->materialSlotBindings.end() && staged->second != prepared.fallback))
+            (authored == current.materialSlotBindings.end() && staged->second != prepared.fallback))
         {
             Fail(error, "Residency effective slot binding is stale: " + slot.id);
             return {};
@@ -499,13 +654,55 @@ MeshResidencySourceLock FileSceneRuntime::ValidatePreparedMeshResidency(const Me
     return source;
 }
 
+MeshResidencySourcePins FileSceneRuntime::ValidatePreparedMeshResidency(const MeshResidencyToken& token,
+    FileSceneAssetCatalog& catalog, std::string* error, std::string* failedObjectID) const
+{
+    if(!ValidatePreparedMeshResidencyTransaction(token, catalog, error))
+    {
+        return {};
+    }
+
+    const auto& entries = m_meshResidency->entries;
+    MeshResidencySourcePins pins;
+    std::vector<const Mesh*> pinnedMeshes;
+    pins.locks.reserve(entries.size());
+    pinnedMeshes.reserve(entries.size());
+
+    for(const auto& prepared : entries)
+    {
+        const auto current = ValidatePreparedMeshResidencyEntry(prepared, catalog, error);
+        auto source = current ? ValidatePreparedMeshResidencySources(prepared, *current, catalog, error) :
+            MeshResidencySourceLock{};
+
+        if(!source)
+        {
+            if(failedObjectID)
+            {
+                *failedObjectID = prepared.selection.objectID;
+            }
+
+            return {};
+        }
+
+        // Entries sharing a source mesh keep the first pin; it was acquired
+        // before the later entries were validated, so exclusion is continuous.
+        if(std::find(pinnedMeshes.begin(), pinnedMeshes.end(), prepared.candidate.mesh) == pinnedMeshes.end())
+        {
+            pinnedMeshes.push_back(prepared.candidate.mesh);
+            pins.locks.push_back(std::move(source));
+        }
+    }
+
+    return pins;
+}
+
 bool FileSceneRuntime::CommitMeshResidency(const MeshResidencyToken& token, FileSceneAssetCatalog& catalog, std::string* error)
 {
     if (m_scene.HasPhysicsPresentation())
         return Fail(error, "Active physics presentation requires coordinated renderer residency publication.");
-    auto source = ValidatePreparedMeshResidency(token, catalog, error);
+    auto sources = ValidatePreparedMeshResidency(token, catalog, error);
 
-    if (!source)
+    if (!sources)
     {
         return false;
     }
@@ -516,21 +713,27 @@ bool FileSceneRuntime::CommitMeshResidency(const MeshResidencyToken& token, File
 
 void FileSceneRuntime::ApplyPreparedMeshResidency() noexcept
 {
-    auto& prepared = *m_meshResidency;
-    const auto index = prepared.selection.runtimeIndex;
-    auto& object = m_scene.GetRenderObjects()[index];
-
     // FINAL ACCEPTANCE: the coordinator has established matching renderer/DXR
-    // readiness, outside recording. Source stays pinned. Only no-throw swaps, pointer
-    // assignments and counters follow; current transforms/names/order are untouched.
+    // readiness for every entry, outside recording, with every source pinned.
+    // Only no-throw swaps, pointer assignments and counters follow; the entries
+    // vector is iterated, never resized. Transforms, names and order are untouched.
     static_assert(std::is_nothrow_swappable_v<std::map<std::string, Material*>>);
-    auto& committed = m_objectMapping.committedObjects[index];
-    object.slotMaterials.swap(prepared.runtimeSlots);
-    committed.slotMaterials.swap(prepared.committedSlots);
-    object.mesh = prepared.candidate.mesh;
-    committed.mesh = prepared.candidate.mesh;
 
-    ++m_objectMapping.bindingRevisions[index];
+    for(auto& prepared : m_meshResidency->entries)
+    {
+        const auto index = prepared.selection.runtimeIndex;
+        auto& object = m_scene.GetRenderObjects()[index];
+        auto& committed = m_objectMapping.committedObjects[index];
+
+        object.slotMaterials.swap(prepared.runtimeSlots);
+        committed.slotMaterials.swap(prepared.committedSlots);
+        object.mesh = prepared.candidate.mesh;
+        committed.mesh = prepared.candidate.mesh;
+        ++m_objectMapping.bindingRevisions[index];
+    }
+
+    // Consumers compare this revision for change, so one increment per batch
+    // invalidates every outstanding snapshot.
     ++m_residencyRevision;
     m_meshResidency.reset();
 }

@@ -6,8 +6,12 @@
 
 #include <exception>
 #include <cassert>
+#include <vector>
 #include <new>
 #include <string_view>
+
+static_assert(FileSceneRuntime::MaxMeshResidencyBatch == RayTracingSceneResources::MaxCandidateProposals,
+    "One renderer candidate must be able to carry every entry of a residency batch.");
 
 MeshResidencyPublication::Readiness MeshResidencyPublication::Check(Renderer& renderer,
     const FileSceneRuntime& runtime, FileSceneAssetCatalog& catalog, const MeshResidencyToken& sceneToken,
@@ -19,14 +23,15 @@ MeshResidencyPublication::Readiness MeshResidencyPublication::Check(Renderer& re
 MeshResidencyPublication::Readiness MeshResidencyPublication::CheckPrepared(Renderer& renderer,
     const FileSceneRuntime& runtime, FileSceneAssetCatalog& catalog, const MeshResidencyToken& sceneToken,
     const RayTracingSceneResources::ReplacementCandidate& candidate, unsigned int frameSlot,
-    std::optional<MeshResidencySourceLock>* sourcePin,
+    std::optional<MeshResidencySourcePins>* sourcePins,
     RayTracingSceneResources::AdoptionEvidence* adoptionEvidence)
 {
-    const auto result = [](Status status, std::string message)
+    const auto result = [](Status status, std::string message, std::string failedObjectID = {})
     {
         Readiness readiness;
         readiness.status = status;
         readiness.message = std::move(message);
+        readiness.failedObjectID = std::move(failedObjectID);
         return readiness;
     };
 
@@ -76,14 +81,15 @@ MeshResidencyPublication::Readiness MeshResidencyPublication::CheckPrepared(Rend
     }
 
     std::string error;
+    std::string failedObjectID;
 
     try
     {
         // Reject a superseded scene binding even while GPU preparation is pending.
         // This identity check acquires no source lock and performs no GPU work.
-        if (!runtime.ValidatePreparedMeshResidencyIdentity(sceneToken, catalog, &error))
+        if (!runtime.ValidatePreparedMeshResidencyIdentity(sceneToken, catalog, &error, &failedObjectID))
         {
-            return result(Status::Stale, std::move(error));
+            return result(Status::Stale, std::move(error), std::move(failedObjectID));
         }
 
         // Poll proves completion/provenance, then current bindings and transforms.
@@ -129,49 +135,64 @@ MeshResidencyPublication::Readiness MeshResidencyPublication::CheckPrepared(Rend
         }
 
         // All GPU work is complete. Validation may allocate/hash, but cannot
-        // load material resources or submit work. Advisory Check releases this pin;
-        // final acceptance moves it to its caller and holds it through commit.
-        auto source = runtime.ValidatePreparedMeshResidency(sceneToken, catalog, &error);
+        // load material resources or submit work. Advisory Check releases these
+        // pins; final acceptance moves them to its caller and holds them through
+        // commit. The pass ends with this function, before any later recording.
+        const FileSceneAssetCatalog::ValidationPass validationPass(catalog);
+        auto sources = runtime.ValidatePreparedMeshResidency(sceneToken, catalog, &error, &failedObjectID);
 
-        if (!source)
+        if (!sources)
         {
-            return result(Status::Stale, std::move(error));
+            return result(Status::Stale, std::move(error), std::move(failedObjectID));
         }
 
-        // Match the scene transaction and stage registry/retirement capacity while
-        // the source remains pinned. This may allocate; it transfers no ownership.
-        const auto& prepared = *runtime.m_meshResidency;
+        // Match every staged entry to its proposal and stage registry/retirement
+        // capacity while the sources remain pinned. This may allocate; it
+        // transfers no ownership.
+        const auto& entries = runtime.m_meshResidency->entries;
+        std::vector<RayTracingSceneResources::AdoptionEntry> adoptionEntries;
+        adoptionEntries.reserve(entries.size());
+
+        for (const auto& entry : entries)
+        {
+            adoptionEntries.push_back({entry.selection.objectID, entry.selection.runtimeIndex, &entry.candidate,
+                entry.fallback, &entry.runtimeSlots});
+        }
+
         RayTracingSceneResources::AdoptionEvidence evidence;
-        const auto adoption = resources.PrepareCandidateAdoption(candidate, prepared.selection.objectID,
-            prepared.selection.runtimeIndex, prepared.candidate, prepared.fallback, prepared.runtimeSlots,
-            renderer.m_materialPublication.desired.size(), evidence, error);
+        const auto adoption = resources.PrepareCandidateAdoption(candidate, adoptionEntries,
+            renderer.m_materialPublication.desired.size(), evidence, error, &failedObjectID);
 
         if (adoption == RayTracingSceneResources::AdoptionReadiness::Unsupported)
         {
-            return result(Status::Unsupported, std::move(error));
+            return result(Status::Unsupported, std::move(error), std::move(failedObjectID));
         }
 
         if (adoption != RayTracingSceneResources::AdoptionReadiness::Ready)
         {
-            return result(Status::Stale, std::move(error));
+            return result(Status::Stale, std::move(error), std::move(failedObjectID));
         }
 
         // Selection compatibility follows adoption staging; even a Retry here
         // leaves the active registry and scene bindings unchanged.
-        const auto& layout = prepared.candidate.mesh->GetVertexLayout();
+        for (const auto& entry : entries)
+        {
+            const auto& layout = entry.candidate.mesh->GetVertexLayout();
 
-        if (renderer.m_selectionMaskPass.IsInitialized())
-        {
-            if (!renderer.m_selectionMaskPass.IsCompatible(layout))
+            if (renderer.m_selectionMaskPass.IsInitialized())
             {
-                return result(Status::Unsupported, "Arriving mesh is incompatible with the active selection-mask pipeline.");
+                if (!renderer.m_selectionMaskPass.IsCompatible(layout))
+                {
+                    return result(Status::Unsupported, "Arriving mesh is incompatible with the active selection-mask pipeline.",
+                        entry.selection.objectID);
+                }
             }
-        }
-        else if (!renderer.m_selectionMaskCandidate ||
-            renderer.m_selectionMaskCandidateLifetime != renderer.m_sceneResourceLifetime ||
-            !renderer.m_selectionMaskCandidate->IsCompatible(layout))
-        {
-            return result(Status::Retry, "Prepare a compatible selection-mask pipeline for this renderer lifetime.");
+            else if (!renderer.m_selectionMaskCandidate ||
+                renderer.m_selectionMaskCandidateLifetime != renderer.m_sceneResourceLifetime ||
+                !renderer.m_selectionMaskCandidate->IsCompatible(layout))
+            {
+                return result(Status::Retry, "Prepare a compatible selection-mask pipeline for this renderer lifetime.");
+            }
         }
 
         // Material parameter/texture revisions preserve the index layout and
@@ -187,9 +208,9 @@ MeshResidencyPublication::Readiness MeshResidencyPublication::CheckPrepared(Rend
         readiness.candidateFence = evidence.fence;
         readiness.fenceLifetime = evidence.fenceLifetime;
 
-        if (sourcePin)
+        if (sourcePins)
         {
-            sourcePin->emplace(std::move(source));
+            sourcePins->emplace(std::move(sources));
         }
 
         if (adoptionEvidence)
@@ -232,14 +253,52 @@ bool MeshResidencyPublication::PrepareSelectionMask(Renderer& renderer, const Fi
 
     try
     {
-        auto source = runtime.ValidatePreparedMeshResidency(sceneToken, catalog, &error);
+        auto sources = runtime.ValidatePreparedMeshResidency(sceneToken, catalog, &error);
 
-        if (!source)
+        if (!sources)
         {
             return false;
         }
 
-        const auto& layout = runtime.m_meshResidency->candidate.mesh->GetVertexLayout();
+        // One selection-mask pipeline serves the whole batch, so every entry must
+        // share the first entry's layout.
+        const auto& entries = runtime.m_meshResidency->entries;
+        const auto& layout = entries.front().candidate.mesh->GetVertexLayout();
+
+        const auto sameLayout = [&](const VertexLayout& other)
+        {
+            const auto& expected = layout.GetAttributes();
+            const auto& actual = other.GetAttributes();
+
+            if (other.GetStride() != layout.GetStride() || actual.size() != expected.size())
+            {
+                return false;
+            }
+
+            for (std::size_t index = 0; index < expected.size(); ++index)
+            {
+                const bool sameSemantic = expected[index].semantic && actual[index].semantic &&
+                    std::string_view(expected[index].semantic) == actual[index].semantic;
+
+                if (!sameSemantic || expected[index].semanticIndex != actual[index].semanticIndex ||
+                    expected[index].type != actual[index].type || expected[index].offset != actual[index].offset)
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        };
+
+        for (const auto& entry : entries)
+        {
+            if (!sameLayout(entry.candidate.mesh->GetVertexLayout()))
+            {
+                error = "Residency batch entries use different vertex layouts: " + entry.selection.objectID;
+                return false;
+            }
+        }
+
         bool position = false;
 
         for (const auto& attribute : layout.GetAttributes())
@@ -322,26 +381,34 @@ bool MeshResidencyPublication::Prepare(Renderer& renderer, const FileSceneRuntim
         return false;
     }
 
-    if (!PrepareSelectionMask(renderer, runtime, catalog, sceneToken, error))
-    {
-        return false;
-    }
-
     try
     {
         std::vector<RayTracingSceneResources::ResidencyProposal> proposals;
 
         {
-            auto source = runtime.ValidatePreparedMeshResidency(sceneToken, catalog, &error);
+            // Closes before candidate recording; no pass pin spans GPU work.
+            const FileSceneAssetCatalog::ValidationPass validationPass(catalog);
 
-            if (!source)
+            if (!PrepareSelectionMask(renderer, runtime, catalog, sceneToken, error))
             {
                 return false;
             }
 
-            const auto& prepared = *runtime.m_meshResidency;
-            proposals.push_back({prepared.selection.objectID, prepared.candidate});
-        } // Release source pin before command recording/submission.
+            auto sources = runtime.ValidatePreparedMeshResidency(sceneToken, catalog, &error);
+
+            if (!sources)
+            {
+                return false;
+            }
+
+            const auto& entries = runtime.m_meshResidency->entries;
+            proposals.reserve(entries.size());
+
+            for (const auto& entry : entries)
+            {
+                proposals.push_back({entry.selection.objectID, entry.candidate});
+            }
+        } // Release source pins before command recording/submission.
 
         auto candidate = renderer.PrepareDXRMembershipCandidate(runtime, catalog, proposals,
             renderer.m_swapChain.GetCurrentBackBufferIndex(), error);
@@ -388,11 +455,12 @@ MeshResidencyPublication::AcceptanceResult MeshResidencyPublication::PublishAtBo
     // CheckPrepared repeats identity, GPU provenance/completion, every effective binding,
     // current transforms, selection layout and ownership/retirement prerequisites.
     // Transform refresh may submit candidate-only work and necessarily returns Retry.
-    std::optional<MeshResidencySourceLock> sourcePin;
+    std::optional<MeshResidencySourcePins> sourcePins;
     RayTracingSceneResources::AdoptionEvidence evidence;
     auto readiness = CheckPrepared(renderer, runtime, catalog, m_sceneToken, *m_candidate,
-        renderer.m_swapChain.GetCurrentBackBufferIndex(), &sourcePin, &evidence);
+        renderer.m_swapChain.GetCurrentBackBufferIndex(), &sourcePins, &evidence);
     AcceptanceResult result{readiness.status, std::move(readiness.message)};
+    result.failedObjectID = std::move(readiness.failedObjectID);
 
     if (result.status == Status::Stale || result.status == Status::Unsupported || result.status == Status::Failed)
     {
@@ -404,9 +472,9 @@ MeshResidencyPublication::AcceptanceResult MeshResidencyPublication::PublishAtBo
         return result;
     }
 
-    // Everything fallible is complete. Keep the source pinned across the entire
-    // noexcept commit. Even the result string has already been constructed.
-    assert(sourcePin && static_cast<bool>(*sourcePin));
+    // Everything fallible is complete. Keep every unique source pinned across the
+    // entire noexcept commit. Even the result strings have already been constructed.
+    assert(sourcePins && static_cast<bool>(*sourcePins));
     result.published = true;
     ApplyPreparedPublication(renderer, runtime, evidence);
     return result;
