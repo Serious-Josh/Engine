@@ -112,7 +112,67 @@ struct GIConstants
     unsigned int geometricNormalIndex = 0;
     unsigned int fullResolution[2];
     unsigned int signedCorrectionIndex = 0xFFFFFFFFu;
+
+    // Appended fields preserve the historical cooked GI constant-buffer prefix.
+    unsigned int importanceConditionalCDFIndex = 0xFFFFFFFFu;
+    unsigned int importanceMarginalCDFIndex = 0xFFFFFFFFu;
+    unsigned int importanceWidth = 0;
+    unsigned int importanceHeight = 0;
+    float importanceTotalWeight = 0.0f;
+    unsigned int importancePadding[3]{};
 };
+
+// RTXPT.1 reference path tracer, root CBV b0 of PathTraceReference.hlsl. Layout matches the
+// PathTraceConstants cbuffer field for field (16-byte rows).
+struct PathTraceReferenceConstants
+{
+    Matrix4 inverseViewProjection;
+
+    std::uint32_t resolution[2]{};
+    std::uint32_t accumulatedSamples = 0;
+    std::uint32_t samplesPerFrame = 1;
+
+    std::uint32_t maxPathDepth = 1;
+    std::uint32_t russianRouletteDepth = 1;
+    std::uint32_t instanceDataIndex = 0;
+    std::uint32_t materialBufferIndex = 0;
+
+    std::uint32_t environmentTextureIndex = 0;
+    std::uint32_t environmentConditionalCDFIndex = 0xFFFFFFFFu;
+    std::uint32_t environmentMarginalCDFIndex = 0xFFFFFFFFu;
+    std::uint32_t environmentWidth = 0;
+
+    std::uint32_t environmentHeight = 0;
+    float environmentTotalWeight = 0.0f;
+    // RTXPT.1A.2 bundled GGX single-scatter complement tables (MaterialTableResources SRVs).
+    std::uint32_t materialTableIndex = 0;
+    std::uint32_t materialAverageTableIndex = 0;
+
+    float sunDirectionToLight[3]{0.0f, 1.0f, 0.0f};
+    float sunCosAngularRadius = 1.0f;
+
+    float sunIrradiance[3]{};
+    std::uint32_t randomSeed = 0;
+
+    std::uint32_t materialTableCosineMapping = 0;
+    std::uint32_t padding[3]{};
+
+    // RTXPT.2 R3, appended after the RTXPT.1 layout: the raster-primary G-buffer reconstruction
+    // (PathTracePrimarySurface.hlsli). The reference entry point does not read them.
+    Matrix4 inverseCameraRelativeViewProjection;
+
+    float cameraPosition[3]{};
+    std::uint32_t gBufferDepthIndex = 0;
+
+    std::uint32_t gBufferMaterialIndex = 0;
+    std::uint32_t gBufferSurfaceIndex = 0;
+    std::uint32_t gBufferGeometricNormalIndex = 0;
+    std::uint32_t rasterPrimaryPadding = 0;
+};
+
+static_assert(sizeof(PathTraceReferenceConstants) == 64 + 7 * 16 + 64 + 2 * 16);
+static_assert(offsetof(PathTraceReferenceConstants, sunDirectionToLight) == 64 + 4 * 16);
+static_assert(offsetof(PathTraceReferenceConstants, inverseCameraRelativeViewProjection) == 64 + 7 * 16);
 
 struct AOConstants
 {
@@ -257,5 +317,6 @@ static_assert(sizeof(ReflectionConstants) == 160);
 static_assert(sizeof(RayTracingInstanceData) == 48);
 static_assert(offsetof(RayTracingInstanceData, triangleSlotBufferIndex) == 32);
 static_assert(offsetof(RayTracingInstanceData, slotMaterialBufferIndex) == 40);
-static_assert(sizeof(GIConstants) == 112);
+static_assert(offsetof(GIConstants, importanceConditionalCDFIndex) == 112);
+static_assert(sizeof(GIConstants) == 144);
 static_assert(sizeof(AOConstants) == 96);

@@ -3,6 +3,7 @@
 #include "assets/ProjectScriptAssets.h"
 #include "assets/ProjectMeshImportService.h"
 #include "Engine/PackagedBootstrap.h"
+#include "Renderer/MaterialTables/MaterialTableFile.h"
 #include "Platform/Windows/EditorDistributionPaths.h"
 #include "assets/CookedScene.h"
 #include "assets/CookedEnvironment.h"
@@ -1101,6 +1102,7 @@ bool Engine::InitializeProjectIndependent(const EngineStartup& startup)
     m_startup=startup;
     const bool packaged=startup.mode==EngineStartup::Mode::PackagedRuntime;
     std::vector<std::byte> shaderBytes;
+    std::vector<std::byte> materialTableBytes;
     std::optional<HDRImageData> environmentImage;
     std::string environmentIdentity;
     if(packaged)
@@ -1117,6 +1119,15 @@ bool Engine::InitializeProjectIndependent(const EngineStartup& startup)
             ShaderLibrary validation;
             if(!validation.InitializePackaged(shaderBytes)) throw std::runtime_error("Invalid packaged shader bootstrap.");
             validation.Shutdown();
+
+            // Optional: archives built before RTXPT.1A.2 have no material tables; the renderer then keeps
+            // path tracing unavailable. A present entry is read strictly and validated by the renderer.
+            if(m_startupArchive->provider->ArchiveEntry(PackagedBootstrap::MaterialTablesID()))
+            {
+                materialTableBytes = m_startupArchive->provider->ReadEntry(PackagedBootstrap::MaterialTablesID(),
+                    EngineAssetPak::Type::Resource, PackagedBootstrap::MaterialTablesPayloadVersion,
+                    MaterialTables::MaximumFileBytes);
+            }
         }
         catch(const std::exception& e) { Log::Error(std::string("Packaged preflight failed: ")+e.what()); return false; }
         m_windowProperties.width=startup.width; m_windowProperties.height=startup.height;
@@ -1146,7 +1157,7 @@ bool Engine::InitializeProjectIndependent(const EngineStartup& startup)
     m_rendererAttempted=true;
     if(!m_renderer.Initialize(m_window.GetNativeHandle(), m_window.GetWidth(), m_window.GetHeight(),
         assetRoot, shaderBytes, environmentImage ? &*environmentImage : nullptr, environmentIdentity,
-        startup.projectBrowserWorkflow))
+        startup.projectBrowserWorkflow, materialTableBytes))
     {
         Log::Error("Failed to initialize renderer.");
         return false;
@@ -2209,6 +2220,11 @@ void Engine::Frame()
         ImGui::End();
     }
 
+    const PathTraceReferenceStatus& pathTraceStatus = m_renderer.GetPathTraceReferenceStatus();
+    debugUI.SetPathTraceReferenceStatus(pathTraceStatus.availability, pathTraceStatus.unavailableReason,
+        pathTraceStatus.activeLastFrame, pathTraceStatus.accumulatedSamples, pathTraceStatus.resourceBytes);
+    const PathTraceRasterPrimaryStatus& rasterPrimaryStatus = m_renderer.GetPathTraceRasterPrimaryStatus();
+    debugUI.SetPathTraceRasterPrimaryStatus(rasterPrimaryStatus.availability, rasterPrimaryStatus.reason);
     debugUI.DrawPerformanceWindow(environmentNames, m_renderer.GetCurrentEnvironmentIndex(),
                                   m_renderer.GetStatistics());
 
@@ -2573,6 +2589,8 @@ void Engine::Frame()
     rendererOptions.enableRTGI = debugUI.IsRTGIEnabled();
     rendererOptions.rtgiContactAOStrength = debugUI.GetRTGIContactAOStrength();
     rendererOptions.rtgiContactAORadius = debugUI.GetRTGIContactAORadius();
+    rendererOptions.lightingMode = debugUI.GetLightingMode();
+    rendererOptions.pathTraceReference = debugUI.GetPathTraceReferenceSettings();
 
     const size_t selectedObject = m_editor.GetSelectedObject();
 

@@ -46,6 +46,7 @@ struct GISignedReconstructConstants
 };
 static_assert(sizeof(GISignedReconstructConstants) == 48);
 
+// Legacy name and bindings support old cooked bundles; new shaders accumulate absolute irradiance.
 class GISignedCorrectionPass
 {
     public:

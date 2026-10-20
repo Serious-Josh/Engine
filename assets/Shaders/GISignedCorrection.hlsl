@@ -1,3 +1,5 @@
+// Legacy signal name: new matched shader bundles average absolute irradiance here.
+// Reprojection, geometry rejection, history length and resource ownership are unchanged.
 struct GISignedCorrectionConstants
 {
     row_major float4x4 inverseViewProjection;

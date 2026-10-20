@@ -39,6 +39,9 @@ file(COPY "${source}/assets/Shaders/" DESTINATION "${stage}/assets/Shaders"
     FILES_MATCHING PATTERN "*.hlsl" PATTERN "*.hlsli")
 file(COPY "${source}/external/NRD/Shaders/NRD.hlsli"
     "${source}/external/NRD/Shaders/NRDConfig.hlsli" DESTINATION "${stage}/assets/Shaders/NRD")
+# RTXPT.1A.2 path-tracing material tables with their SHA-256 sidecar (the runtime verifies the pin itself).
+file(COPY "${source}/assets/MaterialTables/" DESTINATION "${stage}/assets/MaterialTables"
+    FILES_MATCHING PATTERN "*.emt" PATTERN "*.emt.sha256")
 file(COPY "${source}/assets/Models/" DESTINATION "${stage}/assets/Models"
     FILES_MATCHING PATTERN "*.fbx")
 file(COPY "${source}/assets/Textures/Environment/" DESTINATION "${stage}/assets/Textures/Environment"

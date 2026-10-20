@@ -58,6 +58,9 @@
 #include "Passes/AODenoisePass.h"
 #include "Passes/AOResolvePass.h"
 #include "Passes/NrdDiffuseResolvePass.h"
+#include "Passes/PathTraceReferencePass.h"
+#include "MaterialTables/MaterialTableResources.h"
+#include "RendererLightingMode.h"
 #include "Passes/GISpatialDenoisePass.h"
 #include "Passes/GISignedCorrectionPass.h"
 #include "Passes/DisplacementVerticesPass.h"
@@ -113,9 +116,35 @@ struct RendererOptions
     // LIGHT.1 scene lighting captured for this frame (FileSceneRuntime::CaptureSceneLighting).
     // Absent: the scene's legacy DirectionalLight only, exactly as before LIGHT.1. Copied by value.
     std::optional<SceneLightingSnapshot> lighting;
+
+    // RTXPT.1 experimental lighting mode for this frame only. Legacy is the default; the selection is
+    // never persisted. An unavailable reference mode renders Legacy and reports why.
+    RendererLightingMode lightingMode = RendererLightingMode::Legacy;
+    PathTraceReferenceSettings pathTraceReference;
+};
+
+// Evidence of the reference path tracer for the Editor and diagnostics. Values only.
+struct PathTraceReferenceStatus
+{
+    PathTraceReferenceAvailability availability = PathTraceReferenceAvailability::NotRequested;
+    std::string unavailableReason;
+
+    // True when the most recent recorded frame rendered with the reference mode.
+    bool activeLastFrame = false;
+    std::uint32_t accumulatedSamples = 0;
+    std::uint64_t accumulationResets = 0;
+    std::uint64_t resourceBytes = 0;
+};
+
+// Evidence of the RTXPT.2 raster-primary mode for the Editor and diagnostics. Values only.
+struct PathTraceRasterPrimaryStatus
+{
+    PathTraceRasterPrimaryAvailability availability = PathTraceRasterPrimaryAvailability::NotRequested;
+    std::string reason;
 };
 
 class Scene;
+struct FrameLighting;
 class FileSceneAssetCatalog;
 class FileSceneRuntime;
 class MirrorTestScene;
@@ -132,7 +161,10 @@ class Renderer
         unsigned int height,
         const std::filesystem::path& assetRoot, std::span<const std::byte> packagedShaders = {},
         const HDRImageData* environment = nullptr, std::string environmentIdentity = {},
-        bool deferEditorResources = false);
+        bool deferEditorResources = false,
+        // Packaged runtime only: the archive's material table bootstrap entry (empty for archives that predate
+        // it). Development loads assets/MaterialTables instead. Absence never fails initialization.
+        std::span<const std::byte> packagedMaterialTables = {});
     // First project selection only for interactive startup; legacy initialization calls this
     // eagerly. Idempotent, with no project asset requests or scene recording.
     bool InitializeEditorResources();
@@ -207,6 +239,8 @@ class Renderer
     // LIGHT.1 evidence: the sun and the deferred light count of the last recorded frame.
     const DirectionalLight& GetRecordedSun() const noexcept { return m_recordedSun; }
     std::uint32_t GetRecordedAdditionalLightCount() const noexcept { return m_recordedAdditionalLightCount; }
+    const PathTraceReferenceStatus& GetPathTraceReferenceStatus() const noexcept { return m_pathTraceStatus; }
+    const PathTraceRasterPrimaryStatus& GetPathTraceRasterPrimaryStatus() const noexcept { return m_rasterPrimaryStatus; }
 
     std::optional<MaterialPreviewImage> GetMaterialPreviewImage() const
     {
@@ -1087,6 +1121,72 @@ class Renderer
     GISpatialDenoisePass m_giSpatialDenoisePass;
 
     GISignedCorrectionPass m_giSignedCorrectionPass;
+
+    // RTXPT.1 reference path tracer. Created lazily on the first frame that requests it, so Legacy
+    // frames and packaged runtimes never allocate it; resized with the scene; released at shutdown.
+    PathTraceReferencePass m_pathTraceReferencePass;
+    PathTraceReferenceStatus m_pathTraceStatus;
+
+    // RTXPT.1A.2 bundled GGX single-scatter complement tables, required by the path tracer only. Loaded and
+    // published once during Initialize; immutable afterwards; released in Shutdown after the final drain.
+    MaterialTableResources m_materialTables;
+    std::string m_materialTableUnavailableReason;
+    void LoadMaterialTables(std::span<const std::byte> packagedMaterialTables);
+    // Set by ResetSceneHistory (scene activation, material revision, HDRI, camera cut, generation).
+    bool m_pathTraceResetPending = true;
+    bool m_pathTraceRenderedLastFrame = false;
+
+    // Everything the converged image depends on. Any difference restarts accumulation.
+    struct PathTraceAccumulationKey
+    {
+        // Switching between the reference and raster-primary modes restarts accumulation.
+        PathTracePrimary primary = PathTracePrimary::Camera;
+        Matrix4 view;
+        Matrix4 projection;
+        std::uint32_t width = 0;
+        std::uint32_t height = 0;
+        PathTraceReferenceSettings settings;
+        DirectionalLight sun;
+        SceneLightConstants lights{};
+        D3D12_GPU_VIRTUAL_ADDRESS topLevelAddress = 0;
+        std::uint64_t topLevelRecording = 0;
+        std::uint64_t materialRevision = 0;
+        std::uint64_t sceneResourceLifetime = 0;
+        unsigned int environmentTextureIndex = UINT_MAX;
+        unsigned int environmentConditionalCDFIndex = UINT_MAX;
+        float environmentTotalWeight = 0.0f;
+    };
+
+    std::optional<PathTraceAccumulationKey> m_pathTraceAccumulationKey;
+    std::uint32_t m_pathTraceRandomSeed = 0;
+    // Samples recorded by the current frame; added to the accumulated count only after the frame
+    // records and submits successfully (Render's Rendered path).
+    std::uint32_t m_pathTracePendingSamples = 0;
+
+    // Returns true when the reference pass exists or was created now; records the failure otherwise.
+    bool EnsurePathTraceReference();
+
+    // RTXPT.2 raster-primary mode: whether its prerequisites hold, evaluated on frames that request it.
+    // It owns no resources beyond its pipeline in the reference pass.
+    PathTraceRasterPrimaryStatus m_rasterPrimaryStatus;
+    void EvaluatePathTraceRasterPrimary();
+
+    // Primary of the reference mode. Camera always, except in diagnostics that measure raster-primary
+    // agreement against unjittered PixelCenter rays; the Editor never changes it.
+    PathTracePrimary m_pathTraceReferencePrimary = PathTracePrimary::Camera;
+    // Records one progressive iteration (or holds a converged image) and presents it as scene colour.
+    bool RecordPathTraceReference(
+        ID3D12GraphicsCommandList* commandList,
+        unsigned int frameIndex,
+        PathTracePrimary primary,
+        const Matrix4& view,
+        const Matrix4& projection,
+        const Matrix4& inverseViewProjection,
+        const Vector3& cameraPosition,
+        const FrameLighting& frameLighting,
+        D3D12_GPU_VIRTUAL_ADDRESS sceneLightConstantsAddress,
+        const PathTraceReferenceSettings& settings);
+    static bool SamePathTraceAccumulationKey(const PathTraceAccumulationKey& left, const PathTraceAccumulationKey& right);
 
     bool m_giSignedCorrectionInitialized = false;
     bool m_signedCorrectionExecutedLastFrame = false;

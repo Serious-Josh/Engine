@@ -100,6 +100,12 @@ cbuffer GIConstants : register(b0)
     uint geometricNormalIndex;
     uint2 fullResolution;
     uint signedCorrectionIndex;
+    uint importanceConditionalCDFIndex;
+    uint importanceMarginalCDFIndex;
+    uint importanceWidth;
+    uint importanceHeight;
+    float importanceTotalWeight;
+    uint3 importancePadding;
 };
 
 RaytracingAccelerationStructure scene : register(t0);
@@ -294,7 +300,10 @@ float3 ShadeGISecondaryEnvironmentOnly(GIPayload surface, float3 secondaryPositi
     {
         float effectiveMetallic = GISecondarySurfaceMetallic(material, surface.uv);
         if(!isfinite(effectiveMetallic))
+        {
             return 0.0f;
+        }
+
         diffuseColor *= 1.0f - effectiveMetallic;
     }
 
@@ -316,6 +325,8 @@ float3 ShadeGISecondaryEnvironmentOnly(GIPayload surface, float3 secondaryPositi
 }
 
 float3 SampleGICosineHemisphere(float3 normal, uint2 pixel, uint sampleIndex);
+
+float3 SampleGIImportanceHemisphere(float3 normal, uint2 pixel, uint sample, out float irradianceWeight);
 
 float3 ShadeGISecondarySurface(GIPayload surface, float3 secondaryPosition, uint2 pixel, uint sampleIndex, float sourceMip = 0.0f)
 {
@@ -361,7 +372,10 @@ float3 ShadeGISecondarySurface(GIPayload surface, float3 secondaryPosition, uint
     {
         float effectiveMetallic = GISecondarySurfaceMetallic(material, surface.uv);
         if(!isfinite(effectiveMetallic))
+        {
             return 0.0f;
+        }
+
         diffuseColor *= 1.0f - effectiveMetallic;
     }
 
@@ -376,7 +390,12 @@ float3 ShadeGISecondarySurface(GIPayload surface, float3 secondaryPosition, uint
     for(uint environmentSample = 0u; environmentSample < 4u; ++environmentSample)
     {
         uint environmentSampleIndex = sampleIndex ^ 0xD1B54A35u ^ (environmentSample * 0x9E3779B9u);
+        float environmentWeight = PI;
+#if GI_DIAGNOSTIC_MODE == GI_MODE_BASELINE_CORRECTION
+        float3 environmentDirection = SampleGIImportanceHemisphere(normal, pixel, environmentSampleIndex, environmentWeight);
+#else
         float3 environmentDirection = SampleGICosineHemisphere(normal, pixel, environmentSampleIndex);
+#endif
         RayDesc environmentRay;
         environmentRay.Origin = secondaryPosition + normalize(surface.worldNormal) * 0.001f;
         environmentRay.Direction = environmentDirection;
@@ -391,8 +410,8 @@ float3 ShadeGISecondarySurface(GIPayload surface, float3 secondaryPosition, uint
                 0xFF, 0, 1, 1, environmentRay, environmentPayload);
             if(environmentPayload.visible != 0u)
             {
-                // Lambertian BRDF * cosine / cosine-weighted PDF cancels PI.
-                environmentRadiance += diffuseColor * SampleGIEnvironment(environmentDirection, sourceMip);
+                // Lambertian BRDF times the sampler's cosine/PDF irradiance weight.
+                environmentRadiance += (diffuseColor / PI) * environmentWeight * SampleGIEnvironment(environmentDirection, sourceMip);
             }
         }
     }
@@ -535,6 +554,8 @@ float3 SampleGICosineHemisphere(float3 normal, uint2 pixel, uint sampleIndex)
     return normalize(tangent * localDirection.x + bitangent * localDirection.y +
         normal * localDirection.z);
 }
+
+#include "GIImportanceSampling.hlsli"
 
 float CalculateGIReferenceSourceMip(
     Texture2D<float4> sourceTexture,
@@ -697,7 +718,7 @@ void GIRayGeneration()
     if(signedCorrectionIndex != 0xFFFFFFFFu)
     {
         RWTexture2D<float4> signedCorrectionTexture = ResourceDescriptorHeap[signedCorrectionIndex];
-        signedCorrectionTexture[pixel] = 0.0f; // Invalid/background: no signed sample.
+        signedCorrectionTexture[pixel] = 0.0f; // Invalid/background: no irradiance sample.
     }
 #endif
 
@@ -1120,7 +1141,12 @@ void GIRayGeneration()
 #else
     RayDesc ray;
     ray.Origin = worldPosition.xyz + geometricNormal * 0.001f;
+#if GI_DIAGNOSTIC_MODE == GI_MODE_BASELINE_CORRECTION
+    float irradianceWeight;
+    ray.Direction = SampleGIImportanceHemisphere(normal, pixel, frameIndex, irradianceWeight);
+#else
     ray.Direction = SampleGICosineHemisphere(normal, pixel, frameIndex);
+#endif
     ray.TMin = 0.001f;
 #if GI_DIAGNOSTIC_MODE == GI_MODE_BASELINE_CORRECTION
     ray.TMax = 60.0f;
@@ -1141,12 +1167,8 @@ void GIRayGeneration()
     GI_DIAGNOSTIC_MODE == GI_MODE_PRECLAMP_NEGATIVE_DEBUG
     TextureCube<float4> diffuseIrradiance = ResourceDescriptorHeap[diffuseIrradianceIndex];
     float3 baselineIrradiance = diffuseIrradiance.SampleLevel(materialSampler, normal, 0.0f).rgb;
-#if GI_DIAGNOSTIC_MODE == GI_MODE_BASELINE_CORRECTION
-    const float diffuseSourceMip = float(DIFFUSE_HDRI_SOURCE_MIP);
-#else
-    // Preserve diagnostic radiance sampling conventions (mip 0).
+    // Trace unblurred source radiance; the CDF uses this same HDRI.
     const float diffuseSourceMip = 0.0f;
-#endif
     float3 environmentRadiance = SampleGIEnvironment(ray.Direction, diffuseSourceMip);
     float3 tracedRadiance = 0.0f;
     if(payload.hitDistance > 0.0f)
@@ -1156,7 +1178,7 @@ void GIRayGeneration()
     }
     else if(payload.hitDistance == -1.0f)
     {
-        tracedRadiance = environmentRadiance; // Identical finite values give exactly zero correction.
+        tracedRadiance = environmentRadiance;
     }
 
 #if GI_DIAGNOSTIC_MODE == GI_MODE_PRIMARY_BASELINE_ONLY
@@ -1177,18 +1199,22 @@ void GIRayGeneration()
     giTexture[pixel] = float4(encodedCorrection, 1.0f);
     return;
 #else
-    // Keep the correction signed until it has been added to the irradiance baseline.
+#if GI_DIAGNOSTIC_MODE == GI_MODE_BASELINE_CORRECTION
+    // Accumulate absolute irradiance, avoiding stochastic baseline cancellation and its clamp bias.
+    float3 irradiance = irradianceWeight * tracedRadiance;
+#else
+    // Retain the historical signed-estimator diagnostics with their cosine sampling convention.
     float3 irradiance = baselineIrradiance + PI * (tracedRadiance - environmentRadiance);
+#endif
 #if GI_DIAGNOSTIC_MODE == GI_MODE_BASELINE_CORRECTION
     if(signedCorrectionIndex != 0xFFFFFFFFu)
     {
-        float3 signedCorrection = PI * (tracedRadiance - environmentRadiance);
+        float3 irradianceSample = irradiance;
         if((payload.hitDistance > 0.0f || payload.hitDistance == -1.0f) &&
-           all(isfinite(baselineIrradiance)) && all(isfinite(environmentRadiance)) &&
-           all(isfinite(tracedRadiance)) && all(isfinite(irradiance)) && all(isfinite(signedCorrection)))
+           all(isfinite(tracedRadiance)) && all(isfinite(irradianceSample)))
         {
             RWTexture2D<float4> signedCorrectionTexture = ResourceDescriptorHeap[signedCorrectionIndex];
-            signedCorrectionTexture[pixel] = float4(signedCorrection, 1.0f);
+            signedCorrectionTexture[pixel] = float4(irradianceSample, 1.0f);
         }
     }
 #endif

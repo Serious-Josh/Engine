@@ -79,6 +79,29 @@ if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/assets/t
     target_link_libraries(ScriptAssetTests PRIVATE EngineScriptAssets nlohmann_json ole32)
 endif()
 
+# RTXPT.1A.1 offline generator for the bundled GGX single-scatter complement tables
+# (assets/MaterialTables). Off by default: normal builds neither need nor run it.
+option(ENGINE_BUILD_MATERIAL_TABLE_GENERATOR "Build the offline material table generator" OFF)
+
+if(ENGINE_BUILD_MATERIAL_TABLE_GENERATOR)
+    add_executable(MaterialTableGenerator
+        src/Tools/MaterialTableGenerator/main.cpp
+        src/Tools/MaterialTableGenerator/MaterialTableGeneration.cpp
+        src/Renderer/MaterialTables/MaterialTableFile.cpp)
+    target_include_directories(MaterialTableGenerator PRIVATE src)
+    target_link_libraries(MaterialTableGenerator PRIVATE bcrypt)
+endif()
+
+if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Tools/MaterialTableGenerator/tests/MaterialTableTests.cpp")
+    add_executable(MaterialTableTests
+        src/Tools/MaterialTableGenerator/tests/MaterialTableTests.cpp
+        src/Tools/MaterialTableGenerator/MaterialTableGeneration.cpp
+        src/Renderer/MaterialTables/MaterialTableFile.cpp)
+    target_include_directories(MaterialTableTests PRIVATE src)
+    target_link_libraries(MaterialTableTests PRIVATE bcrypt)
+    target_compile_definitions(MaterialTableTests PRIVATE ENGINE_SOURCE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}")
+endif()
+
 add_library(EngineCore OBJECT
     src/Engine/Engine.cpp
     src/Engine/BuildGame.cpp
@@ -171,6 +194,9 @@ add_library(EngineCore OBJECT
     src/Renderer/RayTracing/RayTracingMembershipCandidate.cpp
     src/Renderer/RendererMembershipCandidate.cpp
     src/Renderer/Passes/RayTracedShadowPass.cpp
+    src/Renderer/Passes/PathTraceReferencePass.cpp
+    src/Renderer/MaterialTables/MaterialTableFile.cpp
+    src/Renderer/MaterialTables/MaterialTableResources.cpp
     src/Renderer/Passes/ShadowDenoisePass.cpp
     src/Renderer/ComputePipeline.cpp
     src/Editor/Editor.cpp
@@ -470,6 +496,7 @@ target_link_libraries(EngineCore
         EngineScriptAssets
         shell32
         ole32
+        bcrypt
         dxgi
         d3d12
         dxcompiler

@@ -153,7 +153,7 @@ void CSMain(uint3 dispatchThreadID : SV_DispatchThreadID)
         return; // Invalid GI leaves the diffuse no-data default; shared guides stay unchanged.
     }
 
-    // Complete irradiance already includes the baseline and excludes primary albedo.
+    // Complete irradiance excludes primary albedo; historical bundles also include their baseline.
     float3 diffuseRadiance = rawGI.Load(int3(giPixel, 0)).rgb / PI;
     diffuseOutput[giPixel] = REBLUR_FrontEnd_PackRadianceAndNormHitDist(diffuseRadiance, diffuseNormalizedDistance, true);
 }

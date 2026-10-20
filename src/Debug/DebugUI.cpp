@@ -671,6 +671,9 @@ void DebugUI::DrawPerformanceWindow(
 
             drawGpuTiming("  NRD reflection resolve", GpuTimestampProfiler::Region::NrdResolve);
 
+            ImGui::TextUnformatted("Path traced reference");
+            drawGpuTiming("  Path trace iteration", GpuTimestampProfiler::Region::PathTraceReference);
+
             ImGui::TextUnformatted("Global illumination");
             drawGpuTiming("  Ray-Traced GI", GpuTimestampProfiler::Region::RayTracedGI);
             drawGpuTiming("  NRD diffuse resolve", GpuTimestampProfiler::Region::NrdDiffuseResolve);
@@ -704,6 +707,8 @@ void DebugUI::DrawPerformanceWindow(
 
 
             DrawGpuTimingMonitor(gpu);
+
+            DrawPathTraceReferenceSettings();
 
             ImGui::TextUnformatted("Environment");
 
@@ -766,7 +771,7 @@ void DebugUI::DrawPerformanceWindow(
                                    "HDRI Direct Integral Mip 0",
                                    "HDRI Direct Integral Mip 4",
                                    "HDRI Direct Integral Mip 6",
-                                   "GI Signed Reconstructed (Pre-NRD)",
+                                   "GI Temporal Irradiance",
 #ifndef NDEBUG
                                    "Shading Normal View Horizon",
 #endif
@@ -792,7 +797,7 @@ void DebugUI::DrawPerformanceWindow(
 
             if (GetToneMapDebugView() == ToneMapDebugView::GISignedReconstructed)
             {
-                ImGui::TextWrapped("Signed reconstructed irradiance before NRD. Requires active signed GI; otherwise displays normal rendering.");
+                ImGui::TextWrapped("Temporal diffuse irradiance before spatial reconstruction. Historical cooked bundles show their original reconstructed signal.");
             }
 
             if (GetToneMapDebugView() == ToneMapDebugView::HDRIDirectIntegralMip0 ||
@@ -951,6 +956,90 @@ void DebugUI::SetTLASUpdated(bool updated)
     {
         ++m_totalTLASUpdates;
     }
+}
+
+PathTraceReferenceSettings DebugUI::GetPathTraceReferenceSettings() const
+{
+    PathTraceReferenceSettings settings;
+    settings.samplesPerFrame = static_cast<std::uint32_t>(m_pathTraceSamplesPerFrame);
+    settings.maxPathDepth = static_cast<std::uint32_t>(m_pathTraceMaxPathDepth);
+    settings.russianRouletteDepth = static_cast<std::uint32_t>(m_pathTraceRussianRouletteDepth);
+    settings.maxAccumulatedSamples = static_cast<std::uint32_t>(m_pathTraceMaxAccumulatedSamples);
+    return settings;
+}
+
+void DebugUI::SetPathTraceReferenceStatus(
+    PathTraceReferenceAvailability availability,
+    const std::string& unavailableReason,
+    bool activeLastFrame,
+    std::uint32_t accumulatedSamples,
+    std::uint64_t resourceBytes)
+{
+    m_pathTraceAvailability = availability;
+    m_pathTraceUnavailableReason = unavailableReason;
+    m_pathTraceActiveLastFrame = activeLastFrame;
+    m_pathTraceAccumulatedSamples = accumulatedSamples;
+    m_pathTraceResourceBytes = resourceBytes;
+}
+
+void DebugUI::SetPathTraceRasterPrimaryStatus(PathTraceRasterPrimaryAvailability availability, const std::string& reason)
+{
+    m_rasterPrimaryAvailability = availability;
+    m_rasterPrimaryReason = reason;
+}
+
+void DebugUI::DrawPathTraceReferenceSettings()
+{
+    ImGui::TextUnformatted("Lighting mode (experimental, not saved)");
+
+    const char* modes[] = {"Legacy", "Path Traced Reference", "Path Traced Raster Primary"};
+    ImGui::Combo("Lighting mode", &m_lightingMode, modes, IM_ARRAYSIZE(modes));
+
+    if (m_lightingMode == 0)
+    {
+        ImGui::Separator();
+        return;
+    }
+
+    // Both path-traced modes share these settings; ranges match IsValidPathTraceReferenceSettings and every
+    // change restarts accumulation.
+    ImGui::SliderInt("PT samples per frame", &m_pathTraceSamplesPerFrame, 1,
+                     static_cast<int>(PathTraceReferenceSettings::MaximumSamplesPerFrame));
+    ImGui::SliderInt("PT max path depth", &m_pathTraceMaxPathDepth, 1,
+                     static_cast<int>(PathTraceReferenceSettings::MaximumPathDepth));
+    ImGui::SliderInt("PT roulette from depth", &m_pathTraceRussianRouletteDepth, 1,
+                     static_cast<int>(PathTraceReferenceSettings::MaximumPathDepth) + 1);
+    ImGui::SliderInt("PT sample target", &m_pathTraceMaxAccumulatedSamples, 1, 1 << 16, "%d",
+                     ImGuiSliderFlags_Logarithmic);
+
+    if (m_pathTraceMaxAccumulatedSamples < m_pathTraceSamplesPerFrame)
+    {
+        m_pathTraceMaxAccumulatedSamples = m_pathTraceSamplesPerFrame;
+    }
+
+    const bool rasterPrimary = m_lightingMode == 2;
+
+    if (rasterPrimary && m_rasterPrimaryAvailability == PathTraceRasterPrimaryAvailability::Unavailable)
+    {
+        ImGui::TextWrapped("Unavailable, rendering Legacy: %s", m_rasterPrimaryReason.c_str());
+    }
+    else if (!rasterPrimary && m_pathTraceAvailability == PathTraceReferenceAvailability::Unavailable)
+    {
+        ImGui::TextWrapped("Unavailable, rendering Legacy: %s", m_pathTraceUnavailableReason.c_str());
+    }
+    else if (m_pathTraceActiveLastFrame)
+    {
+        ImGui::Text("Accumulated %u / %d samples per pixel", m_pathTraceAccumulatedSamples,
+                    m_pathTraceMaxAccumulatedSamples);
+        ImGui::Text("Accumulation memory: %.2f MiB",
+                    static_cast<double>(m_pathTraceResourceBytes) / (1024.0 * 1024.0));
+    }
+    else
+    {
+        ImGui::TextUnformatted("Waiting for a scene with ray-traced geometry.");
+    }
+
+    ImGui::Separator();
 }
 
 void DebugUI::DrawMenu()

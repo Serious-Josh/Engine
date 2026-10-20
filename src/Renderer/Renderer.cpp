@@ -1,4 +1,5 @@
 #include <cassert>
+#include <cstring>
 #include "Scene/SceneSwitchTiming.h"
 #include "Core/Log.h"
 #include "Core/Assert.h"
@@ -2665,7 +2666,8 @@ bool Renderer::Initialize(
     unsigned int width,
     unsigned int height,
     const std::filesystem::path& assetRoot, std::span<const std::byte> packagedShaders,
-    const HDRImageData* initialEnvironment, std::string environmentIdentity, bool deferEditorResources)
+    const HDRImageData* initialEnvironment, std::string environmentIdentity, bool deferEditorResources,
+    std::span<const std::byte> packagedMaterialTables)
 {
     if (m_heightmapRegistration.owner)
     {
@@ -2825,6 +2827,9 @@ bool Renderer::Initialize(
 
         return false;
     }
+
+    // Optional for Legacy: unavailable tables only disable the path-traced reference mode.
+    LoadMaterialTables(packagedMaterialTables);
 
     if (!m_rayTracedShadowPass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap, m_sceneWidth,
                                           m_sceneHeight))
@@ -3414,6 +3419,19 @@ bool Renderer::ResizeSceneResources(
         Log::Error("Failed to resize final scene color.");
         return false;
     }
+
+    // The reference path tracer is optional: a failed resize disables it but never fails Legacy.
+    if(m_pathTraceReferencePass.IsInitialized() &&
+        !m_pathTraceReferencePass.Resize(m_graphicsDevice.GetDevice(), m_resourceDescriptorHeap, width, height))
+    {
+        m_pathTraceStatus.availability = PathTraceReferenceAvailability::Unavailable;
+        m_pathTraceStatus.unavailableReason = "Path tracing resources could not be resized.";
+        Log::Error(m_pathTraceStatus.unavailableReason);
+    }
+
+    m_pathTraceStatus.resourceBytes = m_pathTraceReferencePass.GetResourceBytes();
+
+    m_pathTraceResetPending = true;
 
     m_sceneWidth = width;
     m_sceneHeight = height;
@@ -4230,6 +4248,301 @@ void Renderer::ResetSceneHistory()
 
     m_reflectionSampleIndex = 0;
     m_nrdFrameIndex = 0;
+
+    m_pathTraceResetPending = true;
+}
+
+void Renderer::LoadMaterialTables(std::span<const std::byte> packagedMaterialTables)
+{
+    std::vector<std::byte> developmentBytes;
+    std::span<const std::byte> bytes = packagedMaterialTables;
+    std::string failureReason;
+
+    if(!m_packagedRuntime)
+    {
+        const std::filesystem::path path = m_assetRoot / MaterialTables::BundledTableRelativePath;
+
+        if(!MaterialTables::ReadMaterialTableBytes(path, developmentBytes, &failureReason))
+        {
+            m_materialTableUnavailableReason = failureReason;
+            Log::Warning("Path-tracing material tables unavailable: " + failureReason);
+            return;
+        }
+
+        bytes = developmentBytes;
+    }
+    else if(bytes.empty())
+    {
+        m_materialTableUnavailableReason = "This packaged archive predates the bundled material tables.";
+        Log::Info("Path-tracing material tables unavailable: " + m_materialTableUnavailableReason);
+        return;
+    }
+
+    if(!m_materialTables.Initialize(m_graphicsDevice.GetDevice(), m_resourceUploader, m_resourceDescriptorHeap,
+        bytes, failureReason))
+    {
+        m_materialTableUnavailableReason = failureReason;
+        Log::Warning("Path-tracing material tables unavailable: " + failureReason);
+        return;
+    }
+
+    m_materialTableUnavailableReason.clear();
+    Log::Info("Path-tracing material tables published (SHA-256 " + std::string(MaterialTables::BundledTableSha256) + ").");
+}
+
+bool Renderer::EnsurePathTraceReference()
+{
+    if(m_pathTraceReferencePass.IsInitialized())
+    {
+        return true;
+    }
+
+    // A failure is sticky for this renderer lifetime so a missing shader is not retried every frame.
+    if(m_pathTraceStatus.availability == PathTraceReferenceAvailability::Unavailable)
+    {
+        return false;
+    }
+
+    std::string failureReason;
+
+    if(!m_materialTables.IsAvailable())
+    {
+        m_pathTraceStatus.availability = PathTraceReferenceAvailability::Unavailable;
+        m_pathTraceStatus.unavailableReason = "Material tables unavailable: " + m_materialTableUnavailableReason;
+        Log::Error("Path traced reference mode unavailable: " + m_pathTraceStatus.unavailableReason);
+        return false;
+    }
+
+    if(!m_pathTraceReferencePass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap,
+        m_sceneWidth, m_sceneHeight, failureReason))
+    {
+        m_pathTraceStatus.availability = PathTraceReferenceAvailability::Unavailable;
+        m_pathTraceStatus.unavailableReason = failureReason;
+        Log::Error("Path traced reference mode unavailable: " + failureReason);
+        return false;
+    }
+
+    m_pathTraceStatus.availability = PathTraceReferenceAvailability::Available;
+    m_pathTraceStatus.unavailableReason.clear();
+    m_pathTraceStatus.resourceBytes = m_pathTraceReferencePass.GetResourceBytes();
+    m_pathTraceResetPending = true;
+    return true;
+}
+
+void Renderer::EvaluatePathTraceRasterPrimary()
+{
+    const PathTraceRasterPrimaryStatus previous = m_rasterPrimaryStatus;
+
+    if(!m_graphicsDevice.SupportsRayTracing())
+    {
+        m_rasterPrimaryStatus = {PathTraceRasterPrimaryAvailability::Unavailable, "Ray tracing is not supported."};
+    }
+    else if(m_gBuffer.GetDepth().GetResource() == nullptr || m_gBuffer.GetSurface().GetResource() == nullptr ||
+        m_gBuffer.GetMaterial().GetResource() == nullptr || m_gBuffer.GetGeometricNormal().GetResource() == nullptr)
+    {
+        m_rasterPrimaryStatus = {PathTraceRasterPrimaryAvailability::Unavailable, "The G-buffer is not available."};
+    }
+    else if(m_materialPublication.desired.size() > PathTraceRasterPrimaryMaximumMaterials)
+    {
+        m_rasterPrimaryStatus = {PathTraceRasterPrimaryAvailability::Unavailable,
+            std::to_string(m_materialPublication.desired.size()) + " materials exceed the " +
+            std::to_string(PathTraceRasterPrimaryMaximumMaterials) + " indices the G-buffer stores exactly."};
+    }
+    // The reference mode's own gate: material tables, the DXR library (absent from historical cooked
+    // bundles) and its resources. Its failure is sticky, so this does not retry every frame.
+    else if(!EnsurePathTraceReference())
+    {
+        m_rasterPrimaryStatus = {PathTraceRasterPrimaryAvailability::Unavailable,
+            "Reference path tracer unavailable: " + m_pathTraceStatus.unavailableReason};
+    }
+    else
+    {
+        // Its own ray-generation entry; a shader bundle from before RTXPT.2 R3 lacks it (sticky failure).
+        std::string pipelineFailure;
+
+        if(m_pathTraceReferencePass.EnsurePrimaryPipeline(m_graphicsDevice, m_shaderLibrary, PathTracePrimary::Raster,
+            pipelineFailure))
+        {
+            m_rasterPrimaryStatus = {PathTraceRasterPrimaryAvailability::Available, std::string()};
+        }
+        else
+        {
+            m_rasterPrimaryStatus = {PathTraceRasterPrimaryAvailability::Unavailable, pipelineFailure};
+        }
+    }
+
+    if(m_rasterPrimaryStatus.availability != previous.availability || m_rasterPrimaryStatus.reason != previous.reason)
+    {
+        if(m_rasterPrimaryStatus.availability == PathTraceRasterPrimaryAvailability::Available)
+        {
+            Log::Info("Raster-primary path tracing mode available.");
+        }
+        else
+        {
+            Log::Info("Raster-primary path tracing mode unavailable, rendering Legacy: " + m_rasterPrimaryStatus.reason);
+        }
+    }
+}
+
+bool Renderer::SamePathTraceAccumulationKey(const PathTraceAccumulationKey& left, const PathTraceAccumulationKey& right)
+{
+    // Bitwise comparison: any representable change, however small, restarts accumulation.
+    const bool sameMatrices = std::memcmp(&left.view, &right.view, sizeof(Matrix4)) == 0 &&
+        std::memcmp(&left.projection, &right.projection, sizeof(Matrix4)) == 0;
+    const bool sameSun = std::memcmp(&left.sun.direction, &right.sun.direction, sizeof(Vector3)) == 0 &&
+        std::memcmp(&left.sun.color, &right.sun.color, sizeof(Vector3)) == 0 &&
+        left.sun.intensity == right.sun.intensity && left.sun.angularRadius == right.sun.angularRadius;
+    bool sameLights = left.lights.lightCount == right.lights.lightCount;
+
+    for(std::uint32_t index = 0; sameLights && index < left.lights.lightCount; ++index)
+    {
+        sameLights = left.lights.lights[index] == right.lights.lights[index];
+    }
+
+    return left.primary == right.primary && sameMatrices && sameSun && sameLights && left.width == right.width &&
+        left.height == right.height &&
+        left.settings == right.settings && left.topLevelAddress == right.topLevelAddress &&
+        left.topLevelRecording == right.topLevelRecording && left.materialRevision == right.materialRevision &&
+        left.sceneResourceLifetime == right.sceneResourceLifetime &&
+        left.environmentTextureIndex == right.environmentTextureIndex &&
+        left.environmentConditionalCDFIndex == right.environmentConditionalCDFIndex &&
+        left.environmentTotalWeight == right.environmentTotalWeight;
+}
+
+bool Renderer::RecordPathTraceReference(
+    ID3D12GraphicsCommandList* commandList,
+    unsigned int frameIndex,
+    PathTracePrimary primary,
+    const Matrix4& view,
+    const Matrix4& projection,
+    const Matrix4& inverseViewProjection,
+    const Vector3& cameraPosition,
+    const FrameLighting& frameLighting,
+    D3D12_GPU_VIRTUAL_ADDRESS sceneLightConstantsAddress,
+    const PathTraceReferenceSettings& settings)
+{
+    // Stage 1: decide whether the running mean is still valid for this frame's inputs.
+    PathTraceAccumulationKey key{};
+    key.primary = primary;
+    key.view = view;
+    key.projection = projection;
+    key.width = m_sceneWidth;
+    key.height = m_sceneHeight;
+    key.settings = settings;
+    key.sun = frameLighting.sun;
+    key.lights = frameLighting.table;
+    key.topLevelAddress = m_rayTracingScene.GetTopLevel().GetGPUAddress();
+    key.topLevelRecording = m_rayTracingScene.GetTLASRecordingIdentity();
+    key.materialRevision = m_materialPublication.revision;
+    key.sceneResourceLifetime = m_sceneResourceLifetime;
+    key.environmentTextureIndex = m_environment.GetSourceTexture().GetDescriptorIndex();
+    key.environmentConditionalCDFIndex = m_environment.GetImportanceConditionalCDF().GetDescriptorIndex();
+    key.environmentTotalWeight = m_environment.GetImportanceTotalWeight();
+
+    const bool keyChanged = !m_pathTraceAccumulationKey || !SamePathTraceAccumulationKey(*m_pathTraceAccumulationKey, key);
+
+    if(m_pathTraceResetPending || keyChanged)
+    {
+        m_pathTraceStatus.accumulatedSamples = 0;
+        ++m_pathTraceStatus.accumulationResets;
+        m_pathTraceResetPending = false;
+    }
+
+    m_pathTraceAccumulationKey = key;
+
+    const std::uint32_t accumulated = m_pathTraceStatus.accumulatedSamples;
+    const std::uint32_t remaining = settings.maxAccumulatedSamples > accumulated ?
+        settings.maxAccumulatedSamples - accumulated : 0u;
+    const std::uint32_t frameSamples = (std::min)(settings.samplesPerFrame, remaining);
+
+    // Stage 2: one progressive iteration. A converged image is held without tracing.
+    if(frameSamples > 0)
+    {
+        constexpr D3D12_RESOURCE_STATES shaderReadState =
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+
+        m_environment.GetSourceTexture().Transition(commandList, shaderReadState);
+        m_materialTables.GetMissingEnergyTexture().Transition(commandList, shaderReadState);
+        m_materialTables.GetAverageTexture().Transition(commandList, shaderReadState);
+
+        PathTraceReferenceConstants constants{};
+        constants.inverseViewProjection = inverseViewProjection;
+        constants.resolution[0] = m_sceneWidth;
+        constants.resolution[1] = m_sceneHeight;
+        constants.accumulatedSamples = accumulated;
+        constants.samplesPerFrame = frameSamples;
+        constants.maxPathDepth = settings.maxPathDepth;
+        constants.russianRouletteDepth = settings.russianRouletteDepth;
+        constants.instanceDataIndex = m_rayTracingScene.GetInstanceDataDescriptorIndex();
+        constants.materialBufferIndex = CurrentMaterialBuffer().GetDescriptorIndex();
+        constants.environmentTextureIndex = key.environmentTextureIndex;
+        constants.environmentConditionalCDFIndex = key.environmentConditionalCDFIndex;
+        constants.environmentMarginalCDFIndex = m_environment.GetImportanceMarginalCDF().GetDescriptorIndex();
+        constants.environmentWidth = m_environment.GetImportanceWidth();
+        constants.environmentHeight = m_environment.GetImportanceHeight();
+        constants.environmentTotalWeight = key.environmentTotalWeight;
+        constants.materialTableIndex = m_materialTables.GetMissingEnergyTexture().GetDescriptorIndex();
+        constants.materialAverageTableIndex = m_materialTables.GetAverageTexture().GetDescriptorIndex();
+        constants.materialTableCosineMapping = static_cast<std::uint32_t>(m_materialTables.GetCosineMapping());
+
+        // DirectionalLight::direction is the direction light travels.
+        const DirectionalLight& sun = frameLighting.sun;
+        const Vector3 directionToSun = sun.direction.Normalized() * -1.0f;
+        const Vector3 sunIrradiance = sun.color * sun.intensity;
+        constants.sunDirectionToLight[0] = directionToSun.x;
+        constants.sunDirectionToLight[1] = directionToSun.y;
+        constants.sunDirectionToLight[2] = directionToSun.z;
+        constants.sunCosAngularRadius = sun.angularRadius > 0.0f ? std::cos(sun.angularRadius) : 1.0f;
+        constants.sunIrradiance[0] = sunIrradiance.x;
+        constants.sunIrradiance[1] = sunIrradiance.y;
+        constants.sunIrradiance[2] = sunIrradiance.z;
+        constants.randomSeed = m_pathTraceRandomSeed;
+
+        // RTXPT.2 raster primary: unprojection relative to the camera (the view without its translation),
+        // so positions far from the world origin keep their precision; then placed at the camera position.
+        Matrix4 rotationOnlyView = view;
+        rotationOnlyView.m[0][3] = 0.0f;
+        rotationOnlyView.m[1][3] = 0.0f;
+        rotationOnlyView.m[2][3] = 0.0f;
+        constants.inverseCameraRelativeViewProjection = (projection * rotationOnlyView).Inverse();
+        constants.cameraPosition[0] = cameraPosition.x;
+        constants.cameraPosition[1] = cameraPosition.y;
+        constants.cameraPosition[2] = cameraPosition.z;
+        constants.gBufferDepthIndex = m_gBuffer.GetDepth().GetSRVIndex();
+        constants.gBufferMaterialIndex = m_gBuffer.GetMaterial().GetSRVIndex();
+        constants.gBufferSurfaceIndex = m_gBuffer.GetSurface().GetSRVIndex();
+        constants.gBufferGeometricNormalIndex = m_gBuffer.GetGeometricNormal().GetSRVIndex();
+
+        // EndGeometryPass already left the G-buffer readable; restating it keeps the raster primary's
+        // reads independent of that ordering.
+        if(primary == PathTracePrimary::Raster)
+        {
+            m_gBuffer.GetDepth().Transition(commandList, shaderReadState);
+            m_gBuffer.GetMaterial().Transition(commandList, shaderReadState);
+            m_gBuffer.GetSurface().Transition(commandList, shaderReadState);
+            m_gBuffer.GetGeometricNormal().Transition(commandList, shaderReadState);
+        }
+
+        const D3D12_GPU_VIRTUAL_ADDRESS constantsAddress = m_uploadBuffer.Allocate(
+            &constants, sizeof(PathTraceReferenceConstants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
+
+        if(constantsAddress == 0)
+        {
+            Log::Error("Failed to allocate path tracing constants.");
+            return false;
+        }
+
+        m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::PathTraceReference);
+        m_pathTraceReferencePass.Execute(primary, m_commandContext.GetRayTracingCommandList(), m_resourceDescriptorHeap,
+            m_rayTracingScene, constantsAddress, sceneLightConstantsAddress, m_sceneWidth, m_sceneHeight);
+        m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::PathTraceReference);
+    }
+
+    m_pathTracePendingSamples = frameSamples;
+
+    // Stage 3: present the running mean through the unchanged tone-map and overlay path.
+    m_pathTraceReferencePass.CopyToSceneColor(commandList, m_sceneColor);
+    return true;
 }
 
 // --------------
@@ -4731,9 +5044,17 @@ Renderer::FrameRenderResult Renderer::Render(
 
     if (!RecordRenderFrame(scene, options))
     {
+        // A failed result can follow GPU execution: never continue a running mean whose last
+        // iteration may or may not have been written.
+        m_pathTraceResetPending = true;
+        m_pathTracePendingSamples = 0;
         LogAsyncDisplacementError();
         return FrameRenderResult::Error;
     }
+
+    m_pathTraceStatus.accumulatedSamples += m_pathTracePendingSamples;
+    m_pathTracePendingSamples = 0;
+    m_pathTraceStatus.activeLastFrame = m_pathTraceRenderedLastFrame;
 
     return FrameRenderResult::Rendered;
 }
@@ -5279,6 +5600,49 @@ bool Renderer::RecordRenderFrame(
     m_recordedView = frameView.view;
     m_recordedProjection = frameView.projection;
 
+    // RTXPT.1 mode selection for this recording. An unavailable or invalid request renders Legacy.
+    // Legacy temporal histories do not advance while the path tracer renders, so leaving the
+    // reference mode invalidates them at this same stateful boundary as a camera cut.
+    // RTXPT.2: the raster-primary mode is the same progressive path tracer with its first vertex taken
+    // from this frame's G-buffer; it shares the settings, accumulation and resets.
+    const bool referenceRequested = options.lightingMode == RendererLightingMode::PathTracedReference;
+    const bool rasterPrimaryRequested = options.lightingMode == RendererLightingMode::PathTracedRasterPrimary;
+    const bool pathTraceSettingsValid = hasRenderableMeshes && IsValidPathTraceReferenceSettings(options.pathTraceReference);
+
+    if(rasterPrimaryRequested)
+    {
+        EvaluatePathTraceRasterPrimary();
+    }
+
+    const bool rasterPrimaryAvailable =
+        m_rasterPrimaryStatus.availability == PathTraceRasterPrimaryAvailability::Available;
+    const PathTracePrimary pathTracePrimary = rasterPrimaryRequested ? PathTracePrimary::Raster :
+        m_pathTraceReferencePrimary;
+    const auto referenceRunnable = [&]()
+    {
+        std::string ignoredFailure;
+        return EnsurePathTraceReference() && (pathTracePrimary == PathTracePrimary::Camera ||
+            m_pathTraceReferencePass.EnsurePrimaryPipeline(m_graphicsDevice, m_shaderLibrary, pathTracePrimary,
+                ignoredFailure));
+    };
+    const bool runPathTrace = pathTraceSettingsValid &&
+        ((referenceRequested && referenceRunnable()) || (rasterPrimaryRequested && rasterPrimaryAvailable));
+
+    if(m_pathTraceRenderedLastFrame && !runPathTrace)
+    {
+        ResetSceneHistory();
+    }
+
+    // Set before recording: a failure later in this frame keeps both invalidations conservative.
+    const bool pathTraceEnteredThisFrame = runPathTrace && !m_pathTraceRenderedLastFrame;
+    m_pathTraceRenderedLastFrame = runPathTrace;
+    m_pathTracePendingSamples = 0;
+
+    if(pathTraceEnteredThisFrame)
+    {
+        m_pathTraceResetPending = true;
+    }
+
     const Matrix4 currentView = frameView.view;
     const Matrix4 currentProjection = frameView.projection;
     const Matrix4 currentViewProjection = currentProjection * currentView;
@@ -5510,6 +5874,11 @@ bool Renderer::RecordRenderFrame(
     giConstants.diffuseIrradianceIndex = m_environment.GetDiffuseIrradiance().GetDescriptorIndex();
 
     giConstants.diffuseIrradianceArrayIndex = m_environment.GetDiffuseIrradianceArrayIndex();
+    giConstants.importanceConditionalCDFIndex = m_environment.GetImportanceConditionalCDF().GetDescriptorIndex();
+    giConstants.importanceMarginalCDFIndex = m_environment.GetImportanceMarginalCDF().GetDescriptorIndex();
+    giConstants.importanceWidth = m_environment.GetImportanceWidth();
+    giConstants.importanceHeight = m_environment.GetImportanceHeight();
+    giConstants.importanceTotalWeight = m_environment.GetImportanceTotalWeight();
 
     if (runSignedCorrection)
     {
@@ -5589,8 +5958,20 @@ bool Renderer::RecordRenderFrame(
     Texture* debugTexture = nullptr;
     RenderTarget* debugRenderTarget = nullptr;
 
+    if(runPathTrace)
+    {
+        // The path tracer replaces lighting only; the G-buffer above still feeds selection outlines and
+        // overlay depth testing, and is the raster primary's first vertex (EndGeometryPass left it readable).
+        // No legacy lighting pass is recorded; legacy histories reset when the mode is left.
+        if(!RecordPathTraceReference(commandList, frameIndex, pathTracePrimary, currentView, currentProjection,
+            reconstructionConstants.inverseViewProjection, frameView.position, frameLighting,
+            sceneLightConstantsAddress, options.pathTraceReference))
+        {
+            return false;
+        }
+    }
     // Preserve the fixed AO -> shadows -> reflections -> GI -> denoise -> lighting order.
-    if (hasRenderableMeshes)
+    else if (hasRenderableMeshes)
     {
         const uint32_t aoWidth = (m_sceneWidth + 1u) / 2u;
         const uint32_t aoHeight = (m_sceneHeight + 1u) / 2u;
@@ -5797,7 +6178,7 @@ bool Renderer::RecordRenderFrame(
 
             m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::NrdDiffuseResolve);
             m_nrdDiffuseResolvePass.Execute(commandList, m_gBuffer, m_nrdGIDenoiser.GetDiffuseOutputTexture(),
-                                            m_nrdGIPreparePass.GetViewZTexture(), m_uploadBuffer, m_sceneWidth, m_sceneHeight,
+                                            m_nrdGIPreparePass.GetViewZTexture(), *giNrdInput, m_uploadBuffer, m_sceneWidth, m_sceneHeight,
                                             nrdDenoisingRange);
 
             m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::NrdDiffuseResolve);
@@ -5935,11 +6316,14 @@ bool Renderer::RecordRenderFrame(
     // Final composition precedes collider lines and the distinct Editor/packaged presentation paths.
     m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::ToneMap);
 
+    // Legacy diagnostic views describe legacy passes; the reference image is always shown as is.
+    const ToneMapDebugView presentedDebugView = runPathTrace ? ToneMapDebugView::None : debugView;
+
     m_finalSceneColor.Transition(commandList, D3D12_RESOURCE_STATE_RENDER_TARGET);
     m_toneMapPass.Execute(commandList, m_sceneColor, m_finalSceneColor.GetRTV(), debugTexture,
-                          hasRenderableMeshes ? debugView : ToneMapDebugView::None, nrdDenoisingRange,
+                          hasRenderableMeshes ? presentedDebugView : ToneMapDebugView::None, nrdDenoisingRange,
                           debugRenderTarget, &m_selectionMask, options.selectionOutlineColor,
-                          debugView == ToneMapDebugView::None ? options.selectionOutlineThickness : 0,
+                          presentedDebugView == ToneMapDebugView::None ? options.selectionOutlineThickness : 0,
                           m_gBuffer.GetDepth().GetSRVIndex());
 
     m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::ToneMap);
@@ -6299,6 +6683,13 @@ void Renderer::Shutdown()
     m_giSpatialDenoisePass.Shutdown();
     m_giSignedCorrectionPass.Shutdown();
     m_giSignedCorrectionInitialized = false;
+    m_pathTraceReferencePass.Shutdown();
+    m_pathTraceStatus = {};
+    m_rasterPrimaryStatus = {};
+    m_materialTables.Shutdown();
+    m_materialTableUnavailableReason.clear();
+    m_pathTraceAccumulationKey.reset();
+    m_pathTraceResetPending = true;
     m_shadowDenoisePass.Shutdown();
     m_selectionMaskCandidate.reset();
     m_selectionMaskCandidateLifetime = 0;

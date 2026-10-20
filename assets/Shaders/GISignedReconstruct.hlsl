@@ -66,16 +66,11 @@ void CSMain(uint3 dispatchThreadID : SV_DispatchThreadID)
         return;
     }
 
-    TextureCube<float4> diffuseIrradiance = ResourceDescriptorHeap[constants.baselineIndex];
+    // Legacy pass/CBV names remain stable for cooked bundles. New bundles store absolute
+    // irradiance in the history; historical bundles retain their matched reconstruction shader.
+    float3 irradiance = history.rgb;
 
-    // Identical current shading normal, cubemap and mip-0 baseline lookup to production GI.
-    float3 baseline = diffuseIrradiance.SampleLevel(
-        materialSampler,
-        normalize(normal),
-        0.0f).rgb;
-    float3 irradiance = baseline + history.rgb;
-
-    if(all(isfinite(baseline)) && all(isfinite(irradiance)))
+    if(all(isfinite(irradiance)))
     {
         outputGI[pixel] = float4(clamp(irradiance, 0.0f, 65504.0f), original.a);
     }

@@ -19,9 +19,13 @@ struct NrdDiffuseResolveConstants
     float denoisingRange;
     unsigned int depthIndex;
     unsigned int normalIndex;
+
+    // Optional irradiance input; historical cooked shaders read only the 32-byte prefix.
+    unsigned int irradianceIndex;
+    unsigned int padding[3]{};
 };
 
-static_assert(sizeof(NrdDiffuseResolveConstants) == 32);
+static_assert(sizeof(NrdDiffuseResolveConstants) == 48);
 
 class GBuffer;
 
@@ -46,6 +50,7 @@ class NrdDiffuseResolvePass
         GBuffer& gBuffer,
         Texture& nrdOutput,
         Texture& viewZ,
+        Texture& irradiance,
         UploadBuffer& uploadBuffer,
         unsigned int width,
         unsigned int height,

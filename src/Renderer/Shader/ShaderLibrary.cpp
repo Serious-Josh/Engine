@@ -112,7 +112,7 @@ namespace
     // Names are logical keys, never runtime file paths. Update this manifest when adding a pass.
     constexpr const char* raster[] = {"BRDFIntegration", "DeferredLighting", "DiffuseIrradiance", "EnvironmentMip", "EquirectangularToCubemap", "GGXAverageAlbedo", "GGXMultiscatterIrradiance", "SelectionMask", "ToneMap", "Triangle"};
     constexpr const char* compute[] = {"AODenoise", "AOResolve", "AOTemporal", "DisplacementIndices", "DisplacementVertices", "GISignedCorrection", "GISignedReconstruct", "GISpatialDenoise", "NrdDiffuseResolve", "NrdGIPrepare", "NrdReflectionPrepare", "NrdReflectionResolve", "RayTracedReflectionsDenoise", "RayTracedReflectionTemporal", "ReflectionContributionLimit", "ShadowDenoise"};
-    constexpr const char* libraries[] = {"RayTracedAO", "RayTracedGI", "RayTracedReflection", "RayTracedShadow"};
+    constexpr const char* libraries[] = {"PathTraceReference", "RayTracedAO", "RayTracedGI", "RayTracedReflection", "RayTracedShadow"};
     void Put(std::vector<std::byte>& out, std::uint32_t value) { for(int i=0;i<4;++i) out.push_back(std::byte(value>>(8*i))); }
 }
 std::vector<std::byte> ShaderLibrary::CookBootstrap(const std::filesystem::path& root)

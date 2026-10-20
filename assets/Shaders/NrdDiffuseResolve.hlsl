@@ -1,5 +1,6 @@
 #include "Common.hlsli"
-#include "NRD/NRD.hlsli"
+// The existing resolve stage now upsamples temporal irradiance directly. Its historical
+// NRD input remains bound so old cooked shader bundles retain their original behavior.
 
 cbuffer ResolveConstants : register(b0)
 {
@@ -12,6 +13,8 @@ cbuffer ResolveConstants : register(b0)
     float denoisingRange;
     uint depthIndex;
     uint normalIndex;
+    uint irradianceIndex;
+    uint3 padding;
 };
 
 // Camera.h uses near=0.1 and far=1000; Matrix4::Perspective stores
@@ -62,7 +65,7 @@ void CSMain(uint3 dispatchThreadID : SV_DispatchThreadID)
     int2 basePixel = int2(floor(halfPosition));
     float2 fraction = frac(halfPosition);
     Texture2D<float> viewZTexture = ResourceDescriptorHeap[viewZIndex];
-    Texture2D<float4> nrdOutput = ResourceDescriptorHeap[nrdOutputIndex];
+    Texture2D<float4> irradianceInput = ResourceDescriptorHeap[irradianceIndex];
     float3 accumulated = 0.0f;
     float totalWeight = 0.0f;
     float3 fallback = 0.0f;
@@ -88,14 +91,14 @@ void CSMain(uint3 dispatchThreadID : SV_DispatchThreadID)
                 continue;
             }
 
-            float4 decoded = REBLUR_BackEnd_UnpackRadianceAndNormHitDist(nrdOutput.Load(int3(halfPixel, 0)));
+            float4 decoded = irradianceInput.Load(int3(halfPixel, 0));
 
             if(!all(isfinite(decoded.rgb)))
             {
                 continue;
             }
 
-            float3 irradiance = min(max(decoded.rgb * PI, 0.0f), 65504.0f);
+            float3 irradiance = min(max(decoded.rgb, 0.0f), 65504.0f);
 
             if(!all(isfinite(irradiance)))
             {

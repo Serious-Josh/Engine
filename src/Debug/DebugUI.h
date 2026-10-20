@@ -2,6 +2,7 @@
 
 #include "Renderer/RendererStatistics.h"
 #include "Renderer/Passes/ToneMapPass.h"
+#include "Renderer/RendererLightingMode.h"
 #include "GpuTimingMonitor.h"
 #include "GpuTimingGraph.h"
 #include "CpuFrameTiming.h"
@@ -97,6 +98,33 @@ class DebugUI
         return m_rtgiContactAORadius;
     }
 
+    // RTXPT.1 experimental lighting mode. Session-only Editor state: never saved to preferences,
+    // scenes or projects, and Legacy whenever the Editor starts.
+    RendererLightingMode GetLightingMode() const
+    {
+        switch (m_lightingMode)
+        {
+        case 1:
+            return RendererLightingMode::PathTracedReference;
+        case 2:
+            return RendererLightingMode::PathTracedRasterPrimary;
+        default:
+            return RendererLightingMode::Legacy;
+        }
+    }
+
+    PathTraceReferenceSettings GetPathTraceReferenceSettings() const;
+
+    // Renderer evidence shown next to the mode selector (availability, reason, sample count).
+    void SetPathTraceReferenceStatus(
+        PathTraceReferenceAvailability availability,
+        const std::string& unavailableReason,
+        bool activeLastFrame,
+        std::uint32_t accumulatedSamples,
+        std::uint64_t resourceBytes);
+
+    void SetPathTraceRasterPrimaryStatus(PathTraceRasterPrimaryAvailability availability, const std::string& reason);
+
     bool HasEnvironmentChangeRequest() const
     {
         return m_requestedEnvironmentIndex >= 0;
@@ -116,6 +144,7 @@ class DebugUI
     bool m_showPassTimings = false;
 
     void DrawFramePacingSpikes();
+    void DrawPathTraceReferenceSettings();
     FramePacingMonitor m_framePacingMonitor;
 
     std::array<FramePacingMonitor::Event, 16> m_pausedFramePacingEvents{};
@@ -150,4 +179,19 @@ class DebugUI
 
     float m_rtgiContactAOStrength = 1.0f;
     float m_rtgiContactAORadius = 2.5f;
+
+    int m_lightingMode = 0;
+    int m_pathTraceSamplesPerFrame = 1;
+    int m_pathTraceMaxPathDepth = 8;
+    int m_pathTraceRussianRouletteDepth = 3;
+    int m_pathTraceMaxAccumulatedSamples = 1 << 16;
+
+    PathTraceReferenceAvailability m_pathTraceAvailability = PathTraceReferenceAvailability::NotRequested;
+    std::string m_pathTraceUnavailableReason;
+    bool m_pathTraceActiveLastFrame = false;
+    std::uint32_t m_pathTraceAccumulatedSamples = 0;
+    std::uint64_t m_pathTraceResourceBytes = 0;
+
+    PathTraceRasterPrimaryAvailability m_rasterPrimaryAvailability = PathTraceRasterPrimaryAvailability::NotRequested;
+    std::string m_rasterPrimaryReason;
 };

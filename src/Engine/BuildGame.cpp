@@ -259,6 +259,11 @@ void CompilePackagedShaders(const Request& request, BuildAssets& build, const Bu
     Require(shaderPayload.size() <= 64ull * 1024 * 1024,
         "Shader bootstrap exceeds the runtime 64 MiB limit.");
     build.Append({PackagedBootstrap::ShaderID(), EngineAssetPak::Type::Shader, 1, std::move(shaderPayload)});
+
+    // The path tracer's material tables travel verbatim; their SHA-256 pin is checked here and again at startup.
+    auto materialTables = PackagedBootstrap::ReadBundledMaterialTables(request.shaderRoot);
+    build.Append({PackagedBootstrap::MaterialTablesID(), EngineAssetPak::Type::Resource,
+        PackagedBootstrap::MaterialTablesPayloadVersion, std::move(materialTables)});
     std::uint64_t totalPayloadBytes = 0;
     for (const auto& asset : build.cookedAssets)
     {

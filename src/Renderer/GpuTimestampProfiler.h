@@ -33,6 +33,7 @@ class GpuTimestampProfiler
         DebugUI,
         GISpatialDenoise,
         NrdReblurDiffuse,
+        PathTraceReference,
         Count
     };
 
