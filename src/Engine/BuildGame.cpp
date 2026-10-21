@@ -38,6 +38,32 @@ void Require(bool condition, const std::string& error)
     }
 }
 
+// The Agility SDK runtime is the only deployment content outside the top level: D3D12SDKPath names
+// this one fixed directory, and only these files are ever owned inside it.
+constexpr std::string_view agilityRuntimeDirectory = "D3D12";
+constexpr std::string_view agilityRuntimeFiles[] = {"D3D12Core.dll"};
+
+std::string AgilityRuntimeEntry(std::string_view fileName)
+{
+    return std::string(agilityRuntimeDirectory) + "/" + std::string(fileName);
+}
+
+bool IsAgilityRuntimeEntry(std::string_view manifestEntry)
+{
+    return std::ranges::any_of(agilityRuntimeFiles,
+        [&](std::string_view fileName)
+        {
+            return manifestEntry == AgilityRuntimeEntry(fileName);
+        });
+}
+
+// Symlinks, junctions and other reparse points are never owned deployment content.
+bool IsReparsePoint(const fs::path& path)
+{
+    const DWORD attributes = GetFileAttributesW(path.c_str());
+    return attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+}
+
 struct Pin
 {
     HANDLE handle = INVALID_HANDLE_VALUE;
@@ -99,19 +125,44 @@ void CheckDestination(const fs::path& outputDirectory)
     std::ifstream manifest(manifestPath);
     std::string fileName;
     std::set<std::string> ownedFiles{"BuildGame.files"};
+    std::set<std::string> ownedRuntimeFiles;
     while (std::getline(manifest, fileName))
     {
+        if (IsAgilityRuntimeEntry(fileName))
+        {
+            ownedRuntimeFiles.insert(fileName);
+            continue;
+        }
+
         Require(fs::u8path(fileName).filename() == fs::u8path(fileName) && !fileName.empty(),
             "Invalid deployment ownership list.");
         ownedFiles.insert(fileName);
     }
 
+    const auto unrelatedContent = "Output contains unrelated files; choose a new directory. Nothing was overwritten.";
+
     for (const auto& entry : fs::directory_iterator(outputDirectory))
     {
+        // The owned Agility runtime directory holds only owned, ordinary allowlisted files.
+        if (!ownedRuntimeFiles.empty() && entry.path().filename() == fs::u8path(agilityRuntimeDirectory))
+        {
+            Require(entry.is_directory() && !IsReparsePoint(entry.path()), unrelatedContent);
+
+            for (const auto& runtimeEntry : fs::directory_iterator(entry.path()))
+            {
+                Require(runtimeEntry.is_regular_file() && !runtimeEntry.is_symlink() &&
+                    !IsReparsePoint(runtimeEntry.path()) &&
+                    ownedRuntimeFiles.contains(AgilityRuntimeEntry(UTF8Path(runtimeEntry.path().filename()))),
+                    unrelatedContent);
+            }
+
+            continue;
+        }
+
         // Keep filename conversion behind the existing ordinary-file checks.
         Require(entry.is_regular_file() && !entry.is_symlink() &&
             ownedFiles.contains(UTF8Path(entry.path().filename())),
-            "Output contains unrelated files; choose a new directory. Nothing was overwritten.");
+            unrelatedContent);
     }
 
     for (const auto& name : ownedFiles)
@@ -340,14 +391,44 @@ void DeployRuntimeFiles(const Request& request, const AssetID& sceneAssetID,
         assimpDLLCount == 1 && textureDLLCount == 1,
         "Runtime directory is missing required DLLs or has ambiguous dependency versions; build EngineRuntime first.");
 
+    // dxcompiler.dll and dxil.dll never ship without the license texts of the DXC package they came from.
+    for(const auto* fileName : {"DXC-LICENSE-MS.txt", "DXC-LICENSE-MIT.txt", "DXC-LICENSE-LLVM.txt"})
+    {
+        Require(fs::is_regular_file(request.runtimeDirectory / fileName),
+            std::string("Runtime directory is missing the DirectX Shader Compiler notice ") + fileName +
+            "; build EngineRuntime first.");
+
+        copyRuntimeFile(request.runtimeDirectory / fileName, fileName);
+        deploymentFiles.emplace_back(fileName);
+    }
+
+    // The executable's D3D12SDKPath requires the Agility runtime in D3D12/ beside it. Only the
+    // allowlisted redistributable is deployed; debug layers and SDK tools are never shipped.
+    const fs::path runtimeSourceDirectory = request.runtimeDirectory / fs::u8path(agilityRuntimeDirectory);
+    Require(fs::is_directory(runtimeSourceDirectory) && !IsReparsePoint(runtimeSourceDirectory),
+        "Runtime directory is missing the D3D12 Agility SDK runtime folder; build EngineRuntime first.");
+    Require(fs::create_directory(stagingDirectory / fs::u8path(agilityRuntimeDirectory)),
+        "Cannot create the staged D3D12 runtime folder.");
+
+    for (const std::string_view runtimeFile : agilityRuntimeFiles)
+    {
+        const fs::path runtimeSource = runtimeSourceDirectory / fs::u8path(runtimeFile);
+        Require(fs::is_regular_file(runtimeSource),
+            "Runtime directory is missing D3D12/" + std::string(runtimeFile) + "; build EngineRuntime first.");
+
+        const std::string runtimeEntry = AgilityRuntimeEntry(runtimeFile);
+        copyRuntimeFile(runtimeSource, runtimeEntry);
+        deploymentFiles.push_back(runtimeEntry);
+    }
+
     deploymentFiles.emplace_back("AngelScriptNotices.txt");
 
-    // App-local Release redistributables and notices accompany portable runtime inputs.
+    // EngineRuntime's build writes RuntimeNotices.txt, plus the app-local MSVC redistributables for Release.
     // Keep this list explicit: arbitrary DLLs/files in a runtime directory are never deployed.
     for(const auto* fileName : {
         "msvcp140.dll", "msvcp140_1.dll", "msvcp140_2.dll", "msvcp140_atomic_wait.dll",
         "msvcp140_codecvt_ids.dll", "vcruntime140.dll", "vcruntime140_1.dll", "concrt140.dll", "vcomp140.dll",
-        "RuntimeNotices.txt", "sdk_license.rtf", "sdk_third_party_notices.rtf"})
+        "RuntimeNotices.txt"})
     {
         if(fs::exists(request.runtimeDirectory / fileName))
         {

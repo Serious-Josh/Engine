@@ -1,11 +1,144 @@
 #include "GraphicsDevice.h"
 #include "Core/Log.h"
 
+#include <Windows.h>
 #include <dxgi1_6.h>
 #include <d3d12.h>
 #include <d3d12sdklayers.h>
+#include <filesystem>
 #include <format>
 #include <string>
+#include <vector>
+
+#pragma comment(lib, "version.lib")
+
+namespace
+{
+    // The executable exports D3D12SDKVersion/D3D12SDKPath (AgilitySDKExports.cpp); cmake/AgilitySDK.cmake
+    // deploys the matching runtime into D3D12/ beside it. A missing or rejected runtime is a deployment
+    // error: device creation is never retried on the OS runtime.
+    const std::string agilityRuntimeName = std::format("DirectX 12 Agility SDK {} (D3D12SDKVersion {})",
+        ENGINE_AGILITY_SDK_PACKAGE_VERSION, ENGINE_AGILITY_SDK_VERSION);
+
+    std::string UTF8Path(const std::filesystem::path& path)
+    {
+        const auto utf8Path = path.u8string();
+        return {utf8Path.begin(), utf8Path.end()};
+    }
+
+    std::filesystem::path ModulePath(HMODULE module)
+    {
+        std::vector<wchar_t> buffer(MAX_PATH);
+
+        while (true)
+        {
+            const DWORD length = GetModuleFileNameW(module, buffer.data(), static_cast<DWORD>(buffer.size()));
+
+            if (length == 0)
+            {
+                return {};
+            }
+
+            if (length < buffer.size())
+            {
+                return std::filesystem::path(buffer.data(), buffer.data() + length);
+            }
+
+            buffer.resize(buffer.size() * 2);
+        }
+    }
+
+    std::filesystem::path AgilityRuntimeDirectory()
+    {
+        return ModulePath(nullptr).parent_path() / "D3D12";
+    }
+
+    std::string FileVersion(const std::filesystem::path& path)
+    {
+        DWORD handle = 0;
+        const DWORD size = GetFileVersionInfoSizeW(path.c_str(), &handle);
+
+        if (size == 0)
+        {
+            return "unknown version";
+        }
+
+        std::vector<std::byte> data(size);
+        VS_FIXEDFILEINFO* info = nullptr;
+        UINT infoLength = 0;
+
+        if (!GetFileVersionInfoW(path.c_str(), 0, size, data.data()) ||
+            !VerQueryValueW(data.data(), L"\\", reinterpret_cast<void**>(&info), &infoLength) || !info)
+        {
+            return "unknown version";
+        }
+
+        return std::format("{}.{}.{}.{}", HIWORD(info->dwFileVersionMS), LOWORD(info->dwFileVersionMS),
+            HIWORD(info->dwFileVersionLS), LOWORD(info->dwFileVersionLS));
+    }
+
+    // Checked before any D3D12 call, so the error names the missing file instead of a later HRESULT.
+    bool ValidateAgilityRuntimeDeployment()
+    {
+        const std::filesystem::path runtimePath = AgilityRuntimeDirectory() / "D3D12Core.dll";
+        std::error_code error;
+
+        if (!std::filesystem::is_regular_file(runtimePath, error))
+        {
+            Log::Error("Missing D3D12 runtime component D3D12Core.dll. " + agilityRuntimeName +
+                       " is required at: " + UTF8Path(runtimePath) +
+                       ". Rebuild or redeploy so the D3D12 folder ships beside the executable.");
+            return false;
+        }
+
+        return true;
+    }
+
+#ifdef _DEBUG
+    // Without the matching SDK layers the debug layer is unavailable; the device itself still uses
+    // the Agility runtime, so this keeps the existing non-fatal debug-layer failure handling.
+    void ValidateAgilityDebugLayerDeployment()
+    {
+        const std::filesystem::path layersPath = AgilityRuntimeDirectory() / "d3d12SDKLayers.dll";
+        std::error_code error;
+
+        if (!std::filesystem::is_regular_file(layersPath, error))
+        {
+            Log::Warning("Missing D3D12 debug-layer component d3d12SDKLayers.dll from " + agilityRuntimeName +
+                         " at: " + UTF8Path(layersPath) + ". The D3D12 debug layer will be unavailable.");
+        }
+    }
+#endif
+
+    // Windows may load a newer compatible D3D12Core.dll than the deployed one (documented loader
+    // behavior), so the loaded module is reported rather than required to be the app-local copy.
+    void LogLoadedAgilityRuntime()
+    {
+        const HMODULE runtimeModule = GetModuleHandleW(L"D3D12Core.dll");
+
+        if (!runtimeModule)
+        {
+            Log::Warning("D3D12 device created, but D3D12Core.dll is not loaded; cannot report the D3D12 runtime.");
+            return;
+        }
+
+        const std::filesystem::path loadedPath = ModulePath(runtimeModule);
+        const std::filesystem::path deployedPath = AgilityRuntimeDirectory() / "D3D12Core.dll";
+        std::error_code error;
+        const bool deployedRuntimeLoaded = std::filesystem::equivalent(loadedPath, deployedPath, error);
+
+        if (deployedRuntimeLoaded)
+        {
+            Log::Info("D3D12 runtime: deployed " + agilityRuntimeName + " at " + UTF8Path(loadedPath) + " (" +
+                      FileVersion(loadedPath) + ").");
+        }
+        else
+        {
+            Log::Info("D3D12 runtime: Windows loaded " + UTF8Path(loadedPath) + " (" + FileVersion(loadedPath) +
+                      ") in place of the deployed " + agilityRuntimeName + " at " + UTF8Path(deployedPath) + ".");
+        }
+    }
+}
 
 #ifdef _DEBUG
 void GraphicsDevice::ReportDeviceRemovedData(
@@ -187,7 +320,14 @@ void GraphicsDevice::ReportDeviceRemovedData(
 
 bool GraphicsDevice::Initialize()
 {
+    if (!ValidateAgilityRuntimeDeployment())
+    {
+        return false;
+    }
+
 #ifdef _DEBUG
+    ValidateAgilityDebugLayerDeployment();
+
     constexpr bool enableGpuBasedValidation = false;
     ID3D12Debug* debugController = nullptr;
 
@@ -267,6 +407,19 @@ bool GraphicsDevice::Initialize()
 
         result = D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&m_device));
 
+        // The runtime itself was rejected; every other adapter would load the same runtime files.
+        if (result == D3D12_ERROR_INVALID_REDIST)
+        {
+            Log::Error(std::format("D3D12CreateDevice rejected the D3D12 runtime deployment (D3D12_ERROR_INVALID_REDIST, "
+                                   "HRESULT 0x{:x}). {} in {} is missing, invalid or mismatched with the executable "
+                                   "or its debug layer. Rebuild or redeploy the D3D12 folder.",
+                                   static_cast<unsigned long>(result), agilityRuntimeName,
+                                   UTF8Path(AgilityRuntimeDirectory())));
+            adapter->Release();
+            adapter = nullptr;
+            break;
+        }
+
         if (SUCCEEDED(result))
         {
 #ifdef _DEBUG
@@ -321,6 +474,8 @@ bool GraphicsDevice::Initialize()
     {
         return false;
     }
+
+    LogLoadedAgilityRuntime();
 
     D3D12_FEATURE_DATA_D3D12_OPTIONS5 options5{};
 

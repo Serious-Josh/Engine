@@ -5,6 +5,7 @@
 #include <fstream>
 #include <iterator>
 #include <string>
+#include <string_view>
 
 namespace
 {
@@ -37,6 +38,24 @@ namespace
         }
 
         dependencies.push_back(std::move(dependency));
+    }
+
+    // Synchronous callers log as they always have; a worker collects the text instead, because it must
+    // never call into Engine logging.
+    void ReportLibraryError(std::string* diagnostics, std::string_view message)
+    {
+        if(!diagnostics)
+        {
+            Log::Error(message);
+            return;
+        }
+
+        if(!diagnostics->empty())
+        {
+            diagnostics->push_back('\n');
+        }
+
+        diagnostics->append(message);
     }
 
     // Forwards to the default handler and records every lookup, including the misses: a file appearing
@@ -85,12 +104,86 @@ namespace
     };
 }
 
+namespace
+{
+    // dxcompiler.dll is found by name, so whichever copy the loader resolved is checked against the pinned
+    // release (cmake/DXC.cmake): major.minor, commit count, commit hash and release string, which together
+    // identify one build. Returns an empty string when the loaded compiler is the pinned one.
+    std::string DescribeCompilerIdentityMismatch(IDxcCompiler3* compiler)
+    {
+        const std::string expected = std::string("expected DXC ") + ENGINE_DXC_VERSION + " (commit " +
+            std::to_string(ENGINE_DXC_COMMIT_COUNT) + "-" + ENGINE_DXC_COMMIT_HASH + ")";
+
+        IDxcVersionInfo3* versionInfo = nullptr;
+
+        if(FAILED(compiler->QueryInterface(IID_PPV_ARGS(&versionInfo))))
+        {
+            return "The loaded dxcompiler.dll does not report version information; " + expected + ".";
+        }
+
+        IDxcVersionInfo2* commitInfo = nullptr;
+
+        if(FAILED(versionInfo->QueryInterface(IID_PPV_ARGS(&commitInfo))))
+        {
+            versionInfo->Release();
+            return "The loaded dxcompiler.dll does not report commit information; " + expected + ".";
+        }
+
+        UINT32 major = 0;
+        UINT32 minor = 0;
+        UINT32 commitCount = 0;
+        char* commitHash = nullptr;
+        char* releaseVersion = nullptr;
+        const bool queried = SUCCEEDED(commitInfo->GetVersion(&major, &minor)) &&
+            SUCCEEDED(commitInfo->GetCommitInfo(&commitCount, &commitHash)) &&
+            SUCCEEDED(versionInfo->GetCustomVersionString(&releaseVersion));
+
+        const std::string detectedHash = commitHash ? commitHash : "";
+        const std::string detectedRelease = releaseVersion ? releaseVersion : "";
+        CoTaskMemFree(commitHash);
+        CoTaskMemFree(releaseVersion);
+        commitInfo->Release();
+        versionInfo->Release();
+
+        if(!queried)
+        {
+            return "The loaded dxcompiler.dll failed to report its version; " + expected + ".";
+        }
+
+        const bool pinned = major == ENGINE_DXC_VERSION_MAJOR && minor == ENGINE_DXC_VERSION_MINOR &&
+            commitCount == ENGINE_DXC_COMMIT_COUNT && detectedHash == ENGINE_DXC_COMMIT_HASH &&
+            detectedRelease == ENGINE_DXC_VERSION;
+
+        if(pinned)
+        {
+            return {};
+        }
+
+        return "Wrong DirectX Shader Compiler: the loaded dxcompiler.dll reports " +
+            (detectedRelease.empty() ? std::to_string(major) + "." + std::to_string(minor) : detectedRelease) +
+            " (commit " + std::to_string(commitCount) + "-" + detectedHash + "); " + expected +
+            ". Rebuild Engine to redeploy the pinned dxcompiler.dll and dxil.dll beside the executable.";
+    }
+}
+
 bool ShaderCompiler::Initialize()
+{
+    return Initialize(nullptr);
+}
+
+bool ShaderCompiler::Initialize(std::string& diagnostics)
+{
+    return Initialize(&diagnostics);
+}
+
+bool ShaderCompiler::Initialize(std::string* diagnostics)
 {
     HRESULT result = DxcCreateInstance(CLSID_DxcUtils, IID_PPV_ARGS(&m_utils));
 
     if (FAILED(result))
     {
+        ReportLibraryError(diagnostics, "Cannot create the DXC utilities (DxcCreateInstance). HRESULT: " +
+            std::to_string(result));
         return false;
     }
 
@@ -101,6 +194,18 @@ bool ShaderCompiler::Initialize()
         m_utils->Release();
         m_utils = nullptr;
 
+        ReportLibraryError(diagnostics, "Cannot create the DXC compiler (DxcCreateInstance). HRESULT: " +
+            std::to_string(result));
+        return false;
+    }
+
+    // Never compile with an unpinned compiler: there is no fallback, so a mismatch leaves no compiler.
+    const std::string mismatch = DescribeCompilerIdentityMismatch(m_compiler);
+
+    if(!mismatch.empty())
+    {
+        Shutdown();
+        ReportLibraryError(diagnostics, mismatch);
         return false;
     }
 
@@ -255,6 +360,23 @@ bool ShaderCompiler::CompileLibrary(
     const ShaderLibraryCompileDescription& description,
     ShaderLibraryCompileResult& output)
 {
+    return CompileLibrary(description, output, nullptr);
+}
+
+bool ShaderCompiler::CompileLibrary(
+    const ShaderLibraryCompileDescription& description,
+    ShaderLibraryCompileResult& output,
+    std::string& diagnostics)
+{
+    diagnostics.clear();
+    return CompileLibrary(description, output, &diagnostics);
+}
+
+bool ShaderCompiler::CompileLibrary(
+    const ShaderLibraryCompileDescription& description,
+    ShaderLibraryCompileResult& output,
+    std::string* diagnostics)
+{
     output.bytecode.clear();
     output.dependencies.clear();
 
@@ -274,8 +396,9 @@ bool ShaderCompiler::CompileLibrary(
 
     if (FAILED(result))
     {
-        Log::Error("Cannot read required shader source: " + std::filesystem::path(description.path).string() +
-            " (HRESULT " + std::to_string(result) + "). Keep the bundled assets/Shaders directory beside Engine.exe.");
+        ReportLibraryError(diagnostics, "Cannot read required shader source: " +
+            std::filesystem::path(description.path).string() + " (HRESULT " + std::to_string(result) +
+            "). Keep the bundled assets/Shaders directory beside Engine.exe.");
         return false;
     }
 
@@ -322,9 +445,8 @@ bool ShaderCompiler::CompileLibrary(
 
     if (FAILED(result))
     {
-        Log::Error("Failed to retrieve DXC shader-library compilation status (GetStatus). HRESULT: " +
-
-                   std::to_string(result));
+        ReportLibraryError(diagnostics,
+            "Failed to retrieve DXC shader-library compilation status (GetStatus). HRESULT: " + std::to_string(result));
         compileResult->Release();
 
         source->Release();
@@ -337,7 +459,7 @@ bool ShaderCompiler::CompileLibrary(
 
     if (SUCCEEDED(result) && errors && errors->GetStringLength() > 0)
     {
-        Log::Error(errors->GetStringPointer());
+        ReportLibraryError(diagnostics, errors->GetStringPointer());
     }
 
     if (errors)

@@ -3,6 +3,7 @@
 #include "Renderer/RendererStatistics.h"
 #include "Renderer/Passes/ToneMapPass.h"
 #include "Renderer/RendererLightingMode.h"
+#include "Renderer/LightingModeTransition.h"
 #include "GpuTimingMonitor.h"
 #include "GpuTimingGraph.h"
 #include "CpuFrameTiming.h"
@@ -128,6 +129,14 @@ class DebugUI
     void SetPathTraceRasterPrimaryStatus(PathTraceRasterPrimaryAvailability availability, const std::string& reason);
     void SetPathTraceReSTIRDIStatus(PathTraceRasterPrimaryAvailability availability, const std::string& reason);
 
+    // Async DXR preparation: the Renderer's transition snapshot from the last recording. Set before the
+    // rendering settings are drawn, so the selector and the indicator agree within a UI frame.
+    void SetLightingModeTransitionStatus(const LightingModeTransitionStatus& status);
+
+    // The bottom-right preparation indicator, or a dismissible failure notice, inside the scene viewport.
+    void DrawLightingModeTransitionIndicator(float viewportX, float viewportY, float viewportWidth,
+        float viewportHeight);
+
     bool HasEnvironmentChangeRequest() const
     {
         return m_requestedEnvironmentIndex >= 0;
@@ -199,4 +208,11 @@ class DebugUI
     std::string m_rasterPrimaryReason;
     PathTraceRasterPrimaryAvailability m_restirDIAvailability = PathTraceRasterPrimaryAvailability::NotRequested;
     std::string m_restirDIReason;
+
+    LightingModeTransitionStatus m_lightingTransition;
+    // UI time at which the indicator first observed the current preparation; negative when none.
+    double m_lightingPreparationStartTime = -1.0;
+    RendererLightingMode m_lightingPreparationMode = RendererLightingMode::Legacy;
+    // The failure the user dismissed; its notice stays closed until a different failure or a new attempt.
+    std::string m_dismissedLightingFailure;
 };

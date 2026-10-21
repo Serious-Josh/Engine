@@ -428,7 +428,6 @@ public:
 
 private:
 #if defined(ENGINE_HAS_VERIFICATION)
-    friend class PortableEditorVerification;
     friend class PresentationTransformVerification;
 #endif
     PhysicsState m_physicsState = PhysicsState::Stopped;
@@ -588,7 +587,6 @@ private:
     bool m_showFileAssociation = false;
     bool m_fileAssociationStatusRead = false;
     bool m_fileAssociationConfirmReplace = false;
-    bool m_fileAssociationPortableAcknowledged = false;
     ProjectFileAssociation::Status m_fileAssociationStatus;
     std::filesystem::path m_fileAssociationEffectiveExecutable;
     std::string m_fileAssociationMessage;

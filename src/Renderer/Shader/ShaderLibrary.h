@@ -2,6 +2,7 @@
 
 #include "Shader.h"
 #include "ShaderCompiler.h"
+#include "ShaderLibraryCompileWorker.h"
 
 #include <memory>
 #include <filesystem>
@@ -53,6 +54,12 @@ class ShaderLibrary
     bool CompileLibrary(
         const std::filesystem::path& path,
         ShaderLibraryCompileResult& output);
+
+    // Resolves a library for the async compile worker and counts it as a DXC library compilation. False
+    // for packaged bytecode, which never compiles.
+    bool CreateLibraryCompileRequest(
+        const std::filesystem::path& path,
+        ShaderLibraryCompileRequest& request);
 
     // True when compiling the library again would read identical inputs, so its bytecode can be reused.
     // Packaged bytecode is immutable for the session.

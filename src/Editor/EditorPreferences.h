@@ -33,8 +33,8 @@ struct RecentProject
     bool operator==(const RecentProject&) const = default;
 };
 
-// Global personal Editor preferences: %LOCALAPPDATA%/Engine/Editor/Preferences.json, or the
-// portable Editor's user directory. Never project configuration, never written to a manifest.
+// Global personal Editor preferences: %LOCALAPPDATA%/Engine/Editor/Preferences.json.
+// Never project configuration, never written to a manifest.
 class EditorPreferences
 {
 public:

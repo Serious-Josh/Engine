@@ -108,6 +108,21 @@ bool ShaderLibrary::CompileLibrary(
     return m_compiler.CompileLibrary(description, output);
 }
 
+bool ShaderLibrary::CreateLibraryCompileRequest(
+    const std::filesystem::path& path,
+    ShaderLibraryCompileRequest& request)
+{
+    if(m_packaged)
+    {
+        return false;
+    }
+
+    request.libraryPath = path;
+    request.sourcePath = m_shaderRoot / path;
+    ++m_libraryCompileCount;
+    return true;
+}
+
 bool ShaderLibrary::IsLibraryCurrent(const ShaderLibraryCompileResult& library) const
 {
     return !library.bytecode.empty() && (m_packaged || ShaderCompiler::DependenciesUnchanged(library.dependencies));

@@ -38,7 +38,6 @@ int VerifyProjectSystemWorkflow(const std::string& stage, const std::filesystem:
 int VerifyProjectRelaunch(const std::filesystem::path& source, const std::filesystem::path& target, const std::string& mode);
 int VerifyProjectWorkflowRegressions();
 int VerifyMeshImportUnits(const std::filesystem::path& root);
-int VerifyPortableEditor(const std::filesystem::path& output);
 int VerifyCookedMesh();
 int VerifyScenePhysicsData();
 int VerifyPrimitiveCreation();
@@ -163,11 +162,6 @@ int main(int argc, char** argv)
     if(argc == 2 && std::string_view(argv[1]) == "--verify-scene-hierarchy")
     {
         return VerifySceneHierarchy();
-    }
-
-    if(argc == 3 && std::string_view(argv[1]) == "--verify-portable-editor")
-    {
-        return VerifyPortableEditor(std::filesystem::absolute(argv[2]));
     }
 #endif
 #if !ENGINE_VERIFICATION_ENABLED

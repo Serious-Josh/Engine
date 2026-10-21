@@ -89,17 +89,9 @@ void Engine::LoadEditorPreferences()
 // The development Editor used to keep its layout in the working directory's imgui.ini. Personal
 // layout now lives in the Editor settings directory. The first time, an existing working-
 // directory imgui.ini is read once as the starting layout; it is never modified or deleted.
-// The portable Editor already stores its layout in its user directory (DebugUI).
 void Engine::ConfigureImGuiSettingsLocation()
 {
     if(!m_personalSettingsActive)
-    {
-        return;
-    }
-
-    const bool usePortableLocation = EditorDistributionPaths::IsPortable() && m_startup.personalSettingsDirectory.empty();
-
-    if(usePortableLocation)
     {
         return;
     }

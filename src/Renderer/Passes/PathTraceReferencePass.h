@@ -5,6 +5,7 @@
 #include "Renderer/RayTracing/RayTracingPipeline.h"
 #include "Renderer/RendererLightingMode.h"
 #include "Renderer/Shader/ShaderCompiler.h"
+#include "Renderer/Shader/ShaderLibraryCompileWorker.h"
 
 #include <cstdint>
 #include <filesystem>
@@ -54,9 +55,24 @@ class PathTraceReferencePass
         PathTracePrimary primary,
         std::string& failureReason);
 
+    // Async DXR preparation (Gate 2): polls the worker for the library a primary needs, without blocking.
+    // A completed compilation is accepted only while every source it read is unchanged; a stale result is
+    // resubmitted. Accepting a new revision clears the sticky pipeline failures of the primaries built from
+    // it, so a fixed shader can be retried. A failure stays until its sources change. Initialize and
+    // EnsurePrimaryPipeline then find the accepted library current and do not compile.
+    ShaderLibraryPreparation PrepareLibrary(
+        ShaderLibrary& shaderLibrary,
+        ShaderLibraryCompileWorker& worker,
+        PathTracePrimary primary);
+
     bool IsInitialized() const
     {
         return m_initialized;
+    }
+
+    bool IsPrimaryReady(PathTracePrimary primary) const
+    {
+        return m_initialized && m_pipelineReady[static_cast<size_t>(primary)];
     }
 
     // Records nothing unless the primary's pipeline exists (Initialize, or EnsurePrimaryPipeline).
@@ -112,9 +128,26 @@ class PathTraceReferencePass
         ShaderLibraryCompileResult library;
     };
 
+    // The current failed worker compilation of a library, kept so it is not resubmitted until its
+    // sources change.
+    struct FailedLibrary
+    {
+        std::filesystem::path path;
+        ShaderLibraryCompileOutcome outcome;
+    };
+
+    // Shutdown without discarding compiled or failed libraries, which outlive a failed Initialize.
+    void ReleaseResources();
+
+    ShaderLibraryPreparation SubmitLibrary(
+        ShaderLibrary& shaderLibrary,
+        ShaderLibraryCompileWorker& worker,
+        const std::filesystem::path& path);
+
     // Every primary shares PathTraceReference.hlsl except ReSTIR DI, so this holds at most two libraries
     // until Shutdown. Pipelines keep their own copies inside their state objects.
     std::vector<CompiledLibrary> m_libraries;
+    std::vector<FailedLibrary> m_failedLibraries;
 
     Texture m_accumulationTexture;
     Texture m_outputTexture;

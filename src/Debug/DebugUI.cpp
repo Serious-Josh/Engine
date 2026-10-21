@@ -1,5 +1,5 @@
 #include "DebugUI.h"
-#include "Platform/Windows/EditorDistributionPaths.h"
+#include "LightingModeTransitionPresentation.h"
 
 #include "Renderer/DescriptorHeap.h"
 
@@ -483,17 +483,6 @@ bool DebugUI::Initialize(
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
-
-    // ImGui keeps this pointer until context destruction. Development layouts remain unchanged.
-    static std::string portableSettings;
-
-    if(EditorDistributionPaths::IsPortable())
-    {
-        const auto settings = (EditorDistributionPaths::UserDirectory() / "imgui.ini").u8string();
-        portableSettings.assign(settings.begin(), settings.end());
-        ImGui::GetIO().IniFilename = portableSettings.c_str();
-        ImGui::GetIO().LogFilename = nullptr;
-    }
 
     ImGui::StyleColorsDark();
 
@@ -994,13 +983,121 @@ void DebugUI::SetPathTraceReSTIRDIStatus(PathTraceRasterPrimaryAvailability avai
     m_restirDIReason = reason;
 }
 
+void DebugUI::SetLightingModeTransitionStatus(const LightingModeTransitionStatus& status)
+{
+    m_lightingTransition = status;
+}
+
+void DebugUI::DrawLightingModeTransitionIndicator(
+    float viewportX,
+    float viewportY,
+    float viewportWidth,
+    float viewportHeight)
+{
+    constexpr float Margin = 12.0f;
+    const bool preparing = IsLightingModePreparing(m_lightingTransition.stage);
+    const bool failed = m_lightingTransition.stage == LightingModeTransitionStage::Failed;
+
+    if(!preparing)
+    {
+        m_lightingPreparationStartTime = -1.0;
+    }
+
+    if(!failed)
+    {
+        // Idle forgets the dismissal; a new attempt may fail again and is then shown again.
+        m_dismissedLightingFailure.clear();
+    }
+
+    if(viewportWidth <= 0.0f || viewportHeight <= 0.0f)
+    {
+        return;
+    }
+
+    const bool showFailure = failed && GetLightingModeFailureKey(m_lightingTransition) != m_dismissedLightingFailure;
+
+    if(!preparing && !showFailure)
+    {
+        return;
+    }
+
+    ImGui::SetNextWindowPos(ImVec2(viewportX + viewportWidth - Margin, viewportY + viewportHeight - Margin),
+        ImGuiCond_Always, ImVec2(1.0f, 1.0f));
+    ImGui::SetNextWindowBgAlpha(0.9f);
+    ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+        ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav |
+        ImGuiWindowFlags_NoMove;
+
+    if(preparing)
+    {
+        // Elapsed time as this UI observed it, from the first snapshot of this preparation.
+        if(m_lightingPreparationStartTime < 0.0 || m_lightingPreparationMode != m_lightingTransition.requested)
+        {
+            m_lightingPreparationStartTime = ImGui::GetTime();
+            m_lightingPreparationMode = m_lightingTransition.requested;
+        }
+
+        const int elapsedSeconds = static_cast<int>(ImGui::GetTime() - m_lightingPreparationStartTime);
+
+        // Display only: clicks pass through to the viewport underneath.
+        if(ImGui::Begin("##LightingModePreparation", nullptr, flags | ImGuiWindowFlags_NoInputs))
+        {
+            ImGui::Text("Preparing %s", GetLightingModeDisplayName(m_lightingTransition.requested));
+            ImGui::TextDisabled("%s, %d s. Rendering %s.", GetLightingModeStageLabel(m_lightingTransition.stage),
+                elapsedSeconds, GetLightingModeDisplayName(m_lightingTransition.active));
+            // A negative fraction is ImGui's indeterminate animation: DXC reports no progress.
+            ImGui::ProgressBar(-1.0f * static_cast<float>(ImGui::GetTime()), ImVec2(260.0f, 0.0f), "");
+        }
+
+        ImGui::End();
+        return;
+    }
+
+    if(ImGui::Begin("##LightingModeFailure", nullptr, flags))
+    {
+        ImGui::PushTextWrapPos(ImGui::GetFontSize() * 26.0f);
+        ImGui::Text("%s could not be activated.", GetLightingModeDisplayName(m_lightingTransition.requested));
+        ImGui::TextDisabled("Rendering %s. Saving a fix to the shader retries automatically.",
+            GetLightingModeDisplayName(m_lightingTransition.active));
+        ImGui::TextUnformatted(SummarizeLightingModeDiagnostic(m_lightingTransition.diagnostic, 3).c_str());
+        ImGui::PopTextWrapPos();
+
+        if(ImGui::SmallButton("Dismiss"))
+        {
+            m_dismissedLightingFailure = GetLightingModeFailureKey(m_lightingTransition);
+        }
+    }
+
+    ImGui::End();
+}
+
 void DebugUI::DrawPathTraceReferenceSettings()
 {
     ImGui::TextUnformatted("Lighting mode (experimental, not saved)");
 
     const char* modes[] = {"Legacy", "Path Traced Reference", "Path Traced Raster Primary",
         "Path Traced Raster Primary + ReSTIR DI"};
+    // While the Renderer prepares the requested mode, the selector shows it and accepts no other request.
+    const bool preparing = IsLightingModePreparing(m_lightingTransition.stage);
+    ImGui::BeginDisabled(preparing);
     ImGui::Combo("Lighting mode", &m_lightingMode, modes, IM_ARRAYSIZE(modes));
+    ImGui::EndDisabled();
+
+    const bool transitionFailed = m_lightingTransition.stage == LightingModeTransitionStage::Failed &&
+        m_lightingTransition.requested == GetLightingMode();
+
+    if(preparing)
+    {
+        ImGui::TextDisabled("Preparing %s (%s); %s keeps rendering.",
+            GetLightingModeDisplayName(m_lightingTransition.requested),
+            GetLightingModeStageLabel(m_lightingTransition.stage),
+            GetLightingModeDisplayName(m_lightingTransition.active));
+    }
+    else if(transitionFailed)
+    {
+        ImGui::TextWrapped("Unavailable, rendering %s: %s", GetLightingModeDisplayName(m_lightingTransition.active),
+            SummarizeLightingModeDiagnostic(m_lightingTransition.diagnostic, 3).c_str());
+    }
 
     if (m_lightingMode == 0)
     {
@@ -1027,7 +1124,11 @@ void DebugUI::DrawPathTraceReferenceSettings()
     const bool rasterPrimary = m_lightingMode == 2;
     const bool restirDI = m_lightingMode == 3;
 
-    if (rasterPrimary && m_rasterPrimaryAvailability == PathTraceRasterPrimaryAvailability::Unavailable)
+    if (preparing || transitionFailed)
+    {
+        // Explained above, next to the selector.
+    }
+    else if (rasterPrimary && m_rasterPrimaryAvailability == PathTraceRasterPrimaryAvailability::Unavailable)
     {
         ImGui::TextWrapped("Unavailable, rendering Legacy: %s", m_rasterPrimaryReason.c_str());
     }

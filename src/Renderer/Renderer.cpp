@@ -2722,6 +2722,22 @@ bool Renderer::Initialize(
         return false;
     }
 
+    // Packaged bytecode never compiles, so only the Editor prepares DXR libraries asynchronously. Without
+    // the worker, lighting modes keep their synchronous first-use compilation.
+    m_lightingModeTransition.Reset();
+    m_shaderCompileWorkerRunning = false;
+
+    if(!m_packagedRuntime)
+    {
+        m_shaderCompileWorker = std::make_unique<ShaderLibraryCompileWorker>();
+        m_shaderCompileWorkerRunning = m_shaderCompileWorker->Start();
+
+        if(!m_shaderCompileWorkerRunning)
+        {
+            Log::Warning("DXR shader compile worker unavailable; lighting modes compile synchronously.");
+        }
+    }
+
     if (!m_displacementVerticesPass.Initialize(m_graphicsDevice, m_shaderLibrary))
     {
 
@@ -4392,6 +4408,113 @@ void Renderer::EnsureRtxdiResources()
     Log::Info("RTXDI resources allocated (" + std::to_string(m_rtxdiResources.GetResourceBytes()) + " bytes).");
 }
 
+// The primary constructor whose pipeline a DXR lighting mode records with.
+PathTracePrimary Renderer::GetLightingModePrimary(RendererLightingMode mode) const
+{
+    switch(mode)
+    {
+    case RendererLightingMode::PathTracedRasterPrimary:
+        return PathTracePrimary::Raster;
+    case RendererLightingMode::PathTracedRasterPrimaryReSTIRDI:
+        return PathTracePrimary::RasterReSTIRDI;
+    case RendererLightingMode::PathTracedReference:
+    case RendererLightingMode::Legacy:
+        break;
+    }
+
+    return m_pathTraceReferencePrimary;
+}
+
+bool Renderer::IsLightingModeReady(RendererLightingMode mode) const
+{
+    if(!m_pathTraceReferencePass.IsPrimaryReady(GetLightingModePrimary(mode)))
+    {
+        return false;
+    }
+
+    return mode != RendererLightingMode::PathTracedRasterPrimaryReSTIRDI || m_rtxdiResources.IsInitialized();
+}
+
+// Polls the worker for every DXR library the mode needs, never blocking. The reference library comes first:
+// every mode's reference gate needs it, and Raster Primary reuses it.
+ShaderLibraryPreparation Renderer::PrepareLightingModeLibraries(RendererLightingMode mode)
+{
+    std::vector<PathTracePrimary> primaries = {PathTracePrimary::Camera};
+    const PathTracePrimary modePrimary = GetLightingModePrimary(mode);
+
+    if(modePrimary == PathTracePrimary::RasterReSTIRDI)
+    {
+        primaries.push_back(modePrimary);
+    }
+
+    // Failed outranks Compiling, which outranks Queued, which outranks Ready.
+    const auto readinessRank = [](ShaderLibraryPreparationState state)
+    {
+        switch(state)
+        {
+        case ShaderLibraryPreparationState::Ready:
+            return 0;
+        case ShaderLibraryPreparationState::Queued:
+            return 1;
+        case ShaderLibraryPreparationState::Compiling:
+            return 2;
+        case ShaderLibraryPreparationState::Failed:
+            return 3;
+        }
+
+        return 3;
+    };
+
+    ShaderLibraryPreparation combined{};
+    combined.state = ShaderLibraryPreparationState::Ready;
+
+    for(const PathTracePrimary primary : primaries)
+    {
+        const ShaderLibraryPreparation preparation =
+            m_pathTraceReferencePass.PrepareLibrary(m_shaderLibrary, *m_shaderCompileWorker, primary);
+
+        // A new reference library revision may fix a sticky reference failure; the next gate retries it.
+        if(preparation.acceptedNewRevision && primary == PathTracePrimary::Camera &&
+            !m_pathTraceReferencePass.IsInitialized() &&
+            m_pathTraceStatus.availability == PathTraceReferenceAvailability::Unavailable)
+        {
+            m_pathTraceStatus.availability = PathTraceReferenceAvailability::NotRequested;
+            m_pathTraceStatus.unavailableReason.clear();
+        }
+
+        // Every library is polled so they compile back to back; the least ready one decides.
+        if(readinessRank(preparation.state) > readinessRank(combined.state))
+        {
+            combined = preparation;
+        }
+    }
+
+    return combined;
+}
+
+// The render-thread half of an activation, after the libraries were accepted: the same idempotent creation
+// the mode gates perform, ordered so the transition status names each stage. Failures are reported by the
+// gates that follow.
+void Renderer::CreateLightingModeResources(RendererLightingMode mode)
+{
+    const PathTracePrimary primary = GetLightingModePrimary(mode);
+
+    if(EnsurePathTraceReference() && primary != PathTracePrimary::Camera)
+    {
+        std::string ignoredFailure;
+        m_pathTraceReferencePass.EnsurePrimaryPipeline(m_graphicsDevice, m_shaderLibrary, primary, ignoredFailure);
+    }
+
+    m_lightingModeTransition.SetActivationStage(LightingModeTransitionStage::InitializingResources);
+
+    if(primary == PathTracePrimary::RasterReSTIRDI && m_pathTraceReferencePass.IsPrimaryReady(primary))
+    {
+        EnsureRtxdiResources();
+    }
+
+    m_lightingModeTransition.SetActivationStage(LightingModeTransitionStage::ReadyToActivate);
+}
+
 // RTXPT.2: unprojection relative to the camera (the view without its translation), so positions far from
 // the world origin keep their precision; callers then place results at the camera position.
 static Matrix4 CameraRelativeInverseViewProjection(const Matrix4& view, const Matrix4& projection)
@@ -5905,46 +6028,122 @@ bool Renderer::RecordRenderFrame(
     // reference mode invalidates them at this same stateful boundary as a camera cut.
     // RTXPT.2: the raster-primary mode is the same progressive path tracer with its first vertex taken
     // from this frame's G-buffer; it shares the settings, accumulation and resets.
-    const bool referenceRequested = options.lightingMode == RendererLightingMode::PathTracedReference;
-    const bool rasterPrimaryRequested = options.lightingMode == RendererLightingMode::PathTracedRasterPrimary;
     // RTXPT.3: the raster-primary mode with RTXDI direct light at its first vertex; same settings and resets.
-    const bool restirDIRequested = options.lightingMode == RendererLightingMode::PathTracedRasterPrimaryReSTIRDI;
     const bool pathTraceSettingsValid = hasRenderableMeshes && IsValidPathTraceReferenceSettings(options.pathTraceReference);
 
-    if(rasterPrimaryRequested)
+    // Evaluates one mode's gates for this recording, creating what it needs on first use. Returns whether
+    // it can run, its primary constructor and, when it cannot, why.
+    const auto evaluateLightingMode = [&](RendererLightingMode mode, PathTracePrimary& primary, std::string& failure)
     {
-        EvaluatePathTraceRasterPrimary();
+        const bool referenceRequested = mode == RendererLightingMode::PathTracedReference;
+        const bool rasterPrimaryRequested = mode == RendererLightingMode::PathTracedRasterPrimary;
+        const bool restirDIRequested = mode == RendererLightingMode::PathTracedRasterPrimaryReSTIRDI;
+
+        if(rasterPrimaryRequested)
+        {
+            EvaluatePathTraceRasterPrimary();
+        }
+
+        if(restirDIRequested)
+        {
+            EvaluatePathTraceReSTIRDI();
+        }
+
+        const bool rasterPrimaryAvailable =
+            m_rasterPrimaryStatus.availability == PathTraceRasterPrimaryAvailability::Available;
+        const bool restirDIAvailable = m_restirDIStatus.availability == PathTraceRasterPrimaryAvailability::Available;
+        primary = m_pathTraceReferencePrimary;
+
+        if(rasterPrimaryRequested)
+        {
+            primary = PathTracePrimary::Raster;
+        }
+        else if(restirDIRequested)
+        {
+            primary = PathTracePrimary::RasterReSTIRDI;
+        }
+
+        std::string referenceFailure;
+        const auto referenceRunnable = [&]()
+        {
+            return EnsurePathTraceReference() && (primary == PathTracePrimary::Camera ||
+                m_pathTraceReferencePass.EnsurePrimaryPipeline(m_graphicsDevice, m_shaderLibrary, primary,
+                    referenceFailure));
+        };
+        const bool runnable = pathTraceSettingsValid &&
+            ((referenceRequested && referenceRunnable()) || (rasterPrimaryRequested && rasterPrimaryAvailable) ||
+            (restirDIRequested && restirDIAvailable));
+
+        if(runnable || mode == RendererLightingMode::Legacy)
+        {
+            failure.clear();
+        }
+        else if(!pathTraceSettingsValid)
+        {
+            failure = "The scene has no renderable meshes or the path tracing settings are invalid.";
+        }
+        else if(referenceRequested)
+        {
+            failure = !m_pathTraceStatus.unavailableReason.empty() ? m_pathTraceStatus.unavailableReason :
+                referenceFailure;
+        }
+        else if(rasterPrimaryRequested)
+        {
+            failure = m_rasterPrimaryStatus.reason;
+        }
+        else
+        {
+            failure = m_restirDIStatus.reason;
+        }
+
+        return runnable;
+    };
+
+    // Async DXR preparation (Gate 2): options.lightingMode is the requested mode. While its DXR libraries
+    // compile on the worker, the active mode keeps rendering; the requested one is attempted only once they
+    // are accepted, and its pipelines and resources are then created here on the render thread.
+    const LightingModeTransition::Clock::time_point transitionTime = LightingModeTransition::Clock::now();
+    const RendererLightingMode candidateMode = m_lightingModeTransition.SelectCandidate(
+        options.lightingMode,
+        m_shaderCompileWorkerRunning,
+        transitionTime,
+        [&]()
+        {
+            return IsLightingModeReady(options.lightingMode);
+        },
+        [&]()
+        {
+            return PrepareLightingModeLibraries(options.lightingMode);
+        });
+
+    if(m_lightingModeTransition.GetStatus().stage == LightingModeTransitionStage::CreatingPipeline)
+    {
+        CreateLightingModeResources(candidateMode);
     }
 
-    if(restirDIRequested)
-    {
-        EvaluatePathTraceReSTIRDI();
-    }
-
-    const bool rasterPrimaryAvailable =
-        m_rasterPrimaryStatus.availability == PathTraceRasterPrimaryAvailability::Available;
-    const bool restirDIAvailable = m_restirDIStatus.availability == PathTraceRasterPrimaryAvailability::Available;
     PathTracePrimary pathTracePrimary = m_pathTraceReferencePrimary;
+    std::string candidateFailure;
+    bool runPathTrace = evaluateLightingMode(candidateMode, pathTracePrimary, candidateFailure);
+    const RendererLightingMode recordedMode = m_lightingModeTransition.Resolve(
+        candidateMode,
+        candidateMode == RendererLightingMode::Legacy || runPathTrace,
+        candidateFailure,
+        transitionTime,
+        [&](RendererLightingMode mode)
+        {
+            PathTracePrimary ignoredPrimary = m_pathTraceReferencePrimary;
+            std::string ignoredFailure;
+            return evaluateLightingMode(mode, ignoredPrimary, ignoredFailure);
+        });
 
-    if(rasterPrimaryRequested)
-    {
-        pathTracePrimary = PathTracePrimary::Raster;
-    }
-    else if(restirDIRequested)
-    {
-        pathTracePrimary = PathTracePrimary::RasterReSTIRDI;
-    }
-
-    const auto referenceRunnable = [&]()
+    // A failed activation falls back to the previous active mode (or Legacy) in this same recording.
+    if(recordedMode != candidateMode)
     {
         std::string ignoredFailure;
-        return EnsurePathTraceReference() && (pathTracePrimary == PathTracePrimary::Camera ||
-            m_pathTraceReferencePass.EnsurePrimaryPipeline(m_graphicsDevice, m_shaderLibrary, pathTracePrimary,
-                ignoredFailure));
-    };
-    const bool runPathTrace = pathTraceSettingsValid &&
-        ((referenceRequested && referenceRunnable()) || (rasterPrimaryRequested && rasterPrimaryAvailable) ||
-        (restirDIRequested && restirDIAvailable));
+        runPathTrace = evaluateLightingMode(recordedMode, pathTracePrimary, ignoredFailure);
+    }
+
+    m_lightingModeTransition.CommitRendered(runPathTrace ? recordedMode : RendererLightingMode::Legacy);
 
     if(m_pathTraceRenderedLastFrame && !runPathTrace)
     {
@@ -7032,6 +7231,15 @@ void Renderer::Shutdown()
     m_giSpatialDenoisePass.Shutdown();
     m_giSignedCorrectionPass.Shutdown();
     m_giSignedCorrectionInitialized = false;
+    // Joined first: no compilation result may outlive the pass and library it was prepared for.
+    if(m_shaderCompileWorker)
+    {
+        m_shaderCompileWorker->Shutdown();
+        m_shaderCompileWorker.reset();
+    }
+
+    m_shaderCompileWorkerRunning = false;
+    m_lightingModeTransition.Reset();
     m_pathTraceReferencePass.Shutdown();
     m_pathTraceStatus = {};
     InvalidatePreviousGBufferHistory();

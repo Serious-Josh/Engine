@@ -1,5 +1,4 @@
 #include "EditorDistributionPaths.h"
-#include "Platform/Windows/WindowsWindow.h"
 
 #include <Windows.h>
 #include <ShlObj.h>
@@ -7,12 +6,6 @@
 
 namespace EditorDistributionPaths
 {
-    bool IsPortable()
-    {
-        return std::filesystem::is_regular_file(
-            WindowsWindow::GetExecutableDirectory() / "EnginePortable.marker");
-    }
-
     namespace
     {
         std::filesystem::path LocalAppDataDirectory(const char* leafDirectory)
@@ -33,28 +26,13 @@ namespace EditorDistributionPaths
         }
     }
 
-    std::filesystem::path UserDirectory()
-    {
-        return LocalAppDataDirectory("PortableEditor");
-    }
-
     std::filesystem::path EditorSettingsDirectory()
     {
-        if(IsPortable())
-        {
-            return UserDirectory();
-        }
-
         return LocalAppDataDirectory("Editor");
     }
 
     std::filesystem::path RuntimeDirectory()
     {
-        if(IsPortable())
-        {
-            return WindowsWindow::GetExecutableDirectory() / "Game";
-        }
-
         return std::filesystem::path(ENGINE_RUNTIME_DEPLOY_DIR);
     }
 }

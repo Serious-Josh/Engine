@@ -48,7 +48,10 @@ class ShaderCompiler
     ShaderCompiler(const ShaderCompiler&) = delete;
     ShaderCompiler& operator=(const ShaderCompiler&) = delete;
 
+    // Creates the compiler and requires the loaded dxcompiler.dll to be the pinned DXC release. A failure is
+    // logged; the second form returns it in diagnostics instead, for a worker thread.
     bool Initialize();
+    bool Initialize(std::string& diagnostics);
     void Shutdown();
 
     bool Compile(
@@ -57,11 +60,26 @@ class ShaderCompiler
     bool CompileLibrary(
         const ShaderLibraryCompileDescription& description,
         ShaderLibraryCompileResult& output);
+    // Identical compilation and bytecode, but every error message is returned in diagnostics instead of
+    // logged, so a worker thread can compile without touching Engine logging.
+    bool CompileLibrary(
+        const ShaderLibraryCompileDescription& description,
+        ShaderLibraryCompileResult& output,
+        std::string& diagnostics);
 
     // True when every recorded dependency still has the recorded contents (or is still absent).
     static bool DependenciesUnchanged(const std::vector<ShaderSourceDependency>& dependencies);
 
     private:
+    // Logs through Engine when diagnostics is null; otherwise appends to it.
+    bool Initialize(std::string* diagnostics);
+
+    // Logs through Engine when diagnostics is null; otherwise appends to it.
+    bool CompileLibrary(
+        const ShaderLibraryCompileDescription& description,
+        ShaderLibraryCompileResult& output,
+        std::string* diagnostics);
+
     const wchar_t* GetShaderProfile(ShaderStage stage) const;
 
     IDxcUtils* m_utils = nullptr;

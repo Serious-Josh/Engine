@@ -1,0 +1,76 @@
+# Writes RuntimeNotices.txt, the third-party license texts that accompany EngineRuntime and every packaged game,
+# and for Release copies the app-local MSVC redistributables. Run in script mode with -DRUNTIME_DIR=<directory>
+# and -DCONFIG=<configuration>; configured by cmake/RuntimeNotices.cmake.
+if(NOT RUNTIME_DIR OR NOT CONFIG)
+    message(FATAL_ERROR "GenerateRuntimeNotices requires -DRUNTIME_DIR=<directory> and -DCONFIG=<configuration>.")
+endif()
+
+set(source "@CMAKE_CURRENT_SOURCE_DIR@")
+set(agility_license "@ENGINE_AGILITY_SDK_LICENSE@")
+set(dxc_licenses "@ENGINE_DXC_LICENSE_FILES@")
+
+set(notices "Third-party components retain their respective licenses below.\nThis software contains source code provided by NVIDIA Corporation.\nMSVC redistributable components are subject to Microsoft's distribution terms.\n\n")
+
+foreach(license IN ITEMS
+    "${source}/external/NRD/LICENSE.txt" "${source}/external/NRI/LICENSE.txt"
+    "@ENGINE_RTXDI_ROOT@/LICENSE.txt"
+    "@assimp_SOURCE_DIR@/LICENSE" "@directxtex_SOURCE_DIR@/LICENSE"
+    "@nlohmann_json_SOURCE_DIR@/LICENSE.MIT" "@box3d_SOURCE_DIR@/LICENSE")
+    file(READ "${license}" text)
+    get_filename_component(component "${license}" DIRECTORY)
+    get_filename_component(component "${component}" NAME)
+    string(APPEND notices "===== ${component} =====\n${text}\n\n")
+endforeach()
+
+# Dear ImGui ships no license file in external/imgui; Engine keeps its MIT text beside these scripts.
+file(READ "${source}/cmake/ImGuiLicense.txt" text)
+string(APPEND notices "===== Dear ImGui =====\n${text}\n\n")
+
+file(READ "${agility_license}" text)
+string(APPEND notices "===== DirectX 12 Agility SDK @ENGINE_AGILITY_SDK_PACKAGE_VERSION@ =====\n${text}\n\n")
+
+# dxcompiler.dll and dxil.dll: every license text shipped in the DXC package, also deployed as DXC-*.txt.
+foreach(license IN LISTS dxc_licenses)
+    file(READ "${license}" text)
+    get_filename_component(license_name "${license}" NAME)
+    string(APPEND notices "===== DirectX Shader Compiler @ENGINE_DXC_VERSION@ ${license_name} =====\n${text}\n\n")
+endforeach()
+
+file(GLOB_RECURSE assimp_notices LIST_DIRECTORIES FALSE
+    "@assimp_SOURCE_DIR@/contrib/LICENSE*" "@assimp_SOURCE_DIR@/contrib/COPYING*")
+
+foreach(license IN LISTS assimp_notices)
+    file(READ "${license}" text)
+    file(RELATIVE_PATH component "@assimp_SOURCE_DIR@" "${license}")
+    string(APPEND notices "===== Assimp ${component} =====\n${text}\n\n")
+endforeach()
+
+file(STRINGS "${source}/external/ImGuizmo/ImGuizmo.h" imguizmo LIMIT_COUNT 24)
+string(REPLACE ";" "\n" imguizmo "${imguizmo}")
+string(APPEND notices "===== ImGuizmo =====\n${imguizmo}\n\n")
+
+file(READ "${source}/external/stb/stb_image.h" stb)
+string(FIND "${stb}" "ALTERNATIVE A - MIT License" license_offset)
+
+if(license_offset LESS 0)
+    message(FATAL_ERROR "Cannot locate stb_image license notice.")
+endif()
+
+string(SUBSTRING "${stb}" ${license_offset} -1 stb_license)
+string(APPEND notices "===== stb_image =====\n${stb_license}")
+
+# Replaced only when the text changes, so an unchanged build does not touch the deployed file.
+set(staged_notices "${RUNTIME_DIR}/RuntimeNotices.txt.staging")
+file(WRITE "${staged_notices}" "${notices}")
+file(COPY_FILE "${staged_notices}" "${RUNTIME_DIR}/RuntimeNotices.txt" ONLY_IF_DIFFERENT)
+file(REMOVE "${staged_notices}")
+
+# Build Game deploys exactly these Release names; Debug runtimes are never redistributed.
+set(runtime_libraries "@CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS@")
+
+if(CONFIG STREQUAL "Release")
+    foreach(runtime_library IN LISTS runtime_libraries)
+        get_filename_component(runtime_name "${runtime_library}" NAME)
+        file(COPY_FILE "${runtime_library}" "${RUNTIME_DIR}/${runtime_name}" ONLY_IF_DIFFERENT)
+    endforeach()
+endif()

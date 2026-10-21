@@ -13,9 +13,6 @@ BUILD = ROOT / 'build'
 DIAGNOSTICS_BUILD = BUILD / 'diagnostics-on'
 EDITOR = DIAGNOSTICS_BUILD / 'Debug/Engine.exe'
 DEBUG_RUNTIME = DIAGNOSTICS_BUILD / 'Game/Debug/EngineRuntime.exe'
-# The assembled EnginePortable runtime (AssembleEnginePortable writes <portable build>/Portable/Release). Not
-# build/Portable/Release, which Windows resolves to the portable build tree's own, unassembled Release output.
-PORTABLE_RUNTIME = BUILD / 'portable/Portable/Release/Game/EngineRuntime.exe'
 GPU_PROJECT = BUILD / 'h7/gpu-project'
 MISSING_INPUT_EXIT = 2
 

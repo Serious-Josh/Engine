@@ -2229,8 +2229,12 @@ void Engine::Frame()
     debugUI.SetPathTraceRasterPrimaryStatus(rasterPrimaryStatus.availability, rasterPrimaryStatus.reason);
     const PathTraceRasterPrimaryStatus& restirDIStatus = m_renderer.GetPathTraceReSTIRDIStatus();
     debugUI.SetPathTraceReSTIRDIStatus(restirDIStatus.availability, restirDIStatus.reason);
+    // The snapshot of the last recording; this frame's request reaches the Renderer after the UI is drawn.
+    debugUI.SetLightingModeTransitionStatus(m_renderer.GetLightingModeTransitionStatus());
     debugUI.DrawPerformanceWindow(environmentNames, m_renderer.GetCurrentEnvironmentIndex(),
                                   m_renderer.GetStatistics());
+    debugUI.DrawLightingModeTransitionIndicator(viewportRectangle.position.x, viewportRectangle.position.y,
+        viewportRectangle.size.x, viewportRectangle.size.y);
 
     const auto* activeFileScene = dynamic_cast<const FileBackedDemoScene*>(&activeDemo);
     if(const auto request = m_editor.TakeMeshImportUnitsRequest())

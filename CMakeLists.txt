@@ -5,11 +5,6 @@ project(Engine
     LANGUAGES CXX
 )
 
-set(DXC_RUNTIME_DIR
-    "C:/Program Files (x86)/Windows Kits/10/bin/10.0.26100.0/x64"
-    CACHE PATH "DXC DLL directory for normal development target deployment"
-)
-
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -71,6 +66,9 @@ FetchContent_Declare(
 )
 
 FetchContent_MakeAvailable(nlohmann_json)
+
+include(cmake/AgilitySDK.cmake)
+include(cmake/DXC.cmake)
 
 include(cmake/Box3D.cmake)
 add_subdirectory(src/Physics)
@@ -182,6 +180,8 @@ add_library(EngineCore OBJECT
     src/Renderer/UploadBuffer.cpp
     src/Renderer/Shader/ShaderCompiler.cpp
     src/Renderer/Shader/ShaderLibrary.cpp
+    src/Renderer/Shader/ShaderLibraryCompileWorker.cpp
+    src/Renderer/LightingModeTransition.cpp
     external/imgui/imgui.cpp
     external/imgui/imgui_draw.cpp
     external/imgui/imgui_tables.cpp
@@ -390,7 +390,6 @@ if(ENGINE_BUILD_DIAGNOSTICS)
         $<$<CONFIG:Debug>:src/Engine/tests/MaterialBindingVerification.cpp>
         $<$<CONFIG:Debug>:src/Engine/tests/ViewportMaterialDropVerification.cpp>
         $<$<CONFIG:Debug>:src/Engine/tests/PackagedBootstrapVerification.cpp>
-        $<$<CONFIG:Debug>:src/Engine/tests/PortableEditorVerification.cpp>
         $<$<CONFIG:Debug>:src/Engine/tests/SceneHierarchyVerification.cpp>
         $<$<CONFIG:Debug>:src/Engine/tests/DescriptorRecoveryVerification.cpp>
         $<$<CONFIG:Debug>:src/Engine/tests/ThumbnailSchedulingVerification.cpp>
@@ -403,12 +402,14 @@ endif()
 # Both executables use one implementation; only the entry point selects capabilities.
 add_executable(Engine src/main.cpp)
 target_link_libraries(Engine PRIVATE EngineCore)
+engine_use_agility(Engine)
 
 if(ENGINE_VERIFICATION_AVAILABLE)
     target_link_libraries(Engine PRIVATE $<$<CONFIG:Debug>:EngineVerification>)
 endif()
 add_executable(EngineRuntime WIN32 src/runtime_main.cpp)
 target_link_libraries(EngineRuntime PRIVATE EngineCore shell32)
+engine_use_agility(EngineRuntime)
 if(ENGINE_VERIFICATION_AVAILABLE)
     target_link_libraries(EngineRuntime PRIVATE $<$<CONFIG:Debug>:EngineVerification>)
 endif()
@@ -417,6 +418,7 @@ add_dependencies(Engine EngineRuntime)
 if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Engine/tests/AS2ApplicationSmokeTests.cpp")
     add_executable(AS2ApplicationSmokeTests src/Engine/tests/AS2ApplicationSmokeTests.cpp)
     target_link_libraries(AS2ApplicationSmokeTests PRIVATE EngineCore)
+    engine_use_agility(AS2ApplicationSmokeTests)
     if(ENGINE_VERIFICATION_AVAILABLE)
         target_link_libraries(AS2ApplicationSmokeTests PRIVATE $<$<CONFIG:Debug>:EngineVerification>)
     endif()
@@ -446,6 +448,7 @@ endif()
 if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Renderer/tests/RtxdiFoundationTests.cpp")
     add_executable(RtxdiFoundationTests src/Renderer/tests/RtxdiFoundationTests.cpp)
     target_link_libraries(RtxdiFoundationTests PRIVATE EngineCore)
+    engine_use_agility(RtxdiFoundationTests)
     target_compile_definitions(RtxdiFoundationTests PRIVATE ENGINE_SOURCE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}"
         ENGINE_RTXDI_INCLUDE="${ENGINE_RTXDI_ROOT}/Include")
 endif()
@@ -453,17 +456,49 @@ endif()
 if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Renderer/tests/PathTraceLibraryReuseTests.cpp")
     add_executable(PathTraceLibraryReuseTests src/Renderer/tests/PathTraceLibraryReuseTests.cpp)
     target_link_libraries(PathTraceLibraryReuseTests PRIVATE EngineCore)
+    engine_use_agility(PathTraceLibraryReuseTests)
+endif()
+# Local-only async DXR preparation Gate 1 compile-worker regression (headless DXC), same guard.
+if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Renderer/tests/ShaderLibraryCompileWorkerTests.cpp")
+    add_executable(ShaderLibraryCompileWorkerTests src/Renderer/tests/ShaderLibraryCompileWorkerTests.cpp)
+    target_link_libraries(ShaderLibraryCompileWorkerTests PRIVATE EngineCore)
+    engine_use_agility(ShaderLibraryCompileWorkerTests)
+endif()
+# Local-only async DXR preparation Gate 2 regressions: transition logic (pure) and pass preparation
+# (headless D3D12), same guard.
+if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Renderer/tests/LightingModeTransitionTests.cpp")
+    add_executable(LightingModeTransitionTests src/Renderer/tests/LightingModeTransitionTests.cpp)
+    target_link_libraries(LightingModeTransitionTests PRIVATE EngineCore)
+    engine_use_agility(LightingModeTransitionTests)
+endif()
+if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Renderer/tests/PathTraceAsyncPreparationTests.cpp")
+    add_executable(PathTraceAsyncPreparationTests src/Renderer/tests/PathTraceAsyncPreparationTests.cpp)
+    target_link_libraries(PathTraceAsyncPreparationTests PRIVATE EngineCore)
+    engine_use_agility(PathTraceAsyncPreparationTests)
+endif()
+# Local-only async DXR preparation Gate 3 Editor presentation regression (pure logic), same guard.
+if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Debug/tests/LightingModeTransitionPresentationTests.cpp")
+    add_executable(LightingModeTransitionPresentationTests src/Debug/tests/LightingModeTransitionPresentationTests.cpp)
+    target_link_libraries(LightingModeTransitionPresentationTests PRIVATE EngineCore)
+    engine_use_agility(LightingModeTransitionPresentationTests)
 endif()
 # Local-only Phase 0 residency candidate allocator-wait regression (headless D3D12), same guard.
 if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Renderer/tests/CommandContextFrameFenceTests.cpp")
     add_executable(CommandContextFrameFenceTests src/Renderer/tests/CommandContextFrameFenceTests.cpp)
     target_link_libraries(CommandContextFrameFenceTests PRIVATE EngineCore)
+    engine_use_agility(CommandContextFrameFenceTests)
 endif()
 # Local-only Phase 1 shared residency validation regression (headless D3D12), same guard.
 if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Scene/tests/ResidencyValidationPassTests.cpp")
     add_executable(ResidencyValidationPassTests src/Scene/tests/ResidencyValidationPassTests.cpp)
     target_link_libraries(ResidencyValidationPassTests PRIVATE EngineCore)
+    engine_use_agility(ResidencyValidationPassTests)
     target_compile_definitions(ResidencyValidationPassTests PRIVATE ENGINE_SOURCE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}")
+endif()
+# Local-only headless Build Game Agility deployment and ownership regression, same guard.
+if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Engine/tests/BuildGameDeploymentTests.cpp")
+    add_executable(BuildGameDeploymentTests src/Engine/tests/BuildGameDeploymentTests.cpp)
+    target_link_libraries(BuildGameDeploymentTests PRIVATE EngineCore)
 endif()
 set_target_properties(EngineRuntime PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/Game/$<CONFIG>"
@@ -472,8 +507,6 @@ set_target_properties(EngineRuntime PROPERTIES
 # Runtime deployment contains binaries only. Archives are supplied by the offline cook.
 add_custom_command(TARGET EngineRuntime POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${DXC_RUNTIME_DIR}/dxcompiler.dll"
-        "${DXC_RUNTIME_DIR}/dxil.dll"
         "${CMAKE_CURRENT_SOURCE_DIR}/external/NRD/Lib/$<CONFIG>/NRD.dll"
         "${CMAKE_CURRENT_SOURCE_DIR}/external/NRI/Lib/$<CONFIG>/NRI.dll"
         $<TARGET_FILE:assimp>
@@ -482,6 +515,7 @@ add_custom_command(TARGET EngineRuntime POST_BUILD
     COMMENT "Copying packaged runtime DLL dependencies (no development assets)"
     VERBATIM
 )
+engine_deploy_dxc(EngineRuntime)
 
 add_custom_command(
     TARGET Engine
@@ -493,14 +527,6 @@ add_custom_command(
     COMMAND ${CMAKE_COMMAND} -E copy_directory
         "${CMAKE_CURRENT_SOURCE_DIR}/assets"
         "$<TARGET_FILE_DIR:Engine>/assets"
-
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${DXC_RUNTIME_DIR}/dxcompiler.dll"
-        "$<TARGET_FILE_DIR:Engine>/dxcompiler.dll"
-
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${DXC_RUNTIME_DIR}/dxil.dll"
-        "$<TARGET_FILE_DIR:Engine>/dxil.dll"
 
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_CURRENT_SOURCE_DIR}/external/NRD/Lib/$<CONFIG>/NRD.dll"
@@ -534,6 +560,12 @@ add_custom_command(
 
     COMMENT "Copying runtime assets and dependencies"
 )
+engine_deploy_dxc(Engine)
+
+# Agility SDK D3D12 headers take precedence over the Windows SDK copies.
+target_include_directories(EngineCore BEFORE PUBLIC "${ENGINE_AGILITY_SDK_INCLUDE_DIR}")
+target_compile_definitions(EngineCore PRIVATE ENGINE_AGILITY_SDK_VERSION=${ENGINE_AGILITY_SDK_VERSION}
+    ENGINE_AGILITY_SDK_PACKAGE_VERSION="${ENGINE_AGILITY_SDK_PACKAGE_VERSION}")
 
 target_include_directories(EngineCore
     PUBLIC
@@ -557,7 +589,7 @@ target_link_libraries(EngineCore
         bcrypt
         dxgi
         d3d12
-        dxcompiler
+        EngineDXC
 
         "$<$<CONFIG:Debug>:${CMAKE_CURRENT_SOURCE_DIR}/external/NRD/Lib/Debug/NRD.lib>"
         "$<$<CONFIG:Release>:${CMAKE_CURRENT_SOURCE_DIR}/external/NRD/Lib/Release/NRD.lib>"
@@ -570,7 +602,7 @@ target_link_libraries(EngineCore
         nlohmann_json
 )
 
-include(cmake/EnginePortable.cmake)
+include(cmake/RuntimeNotices.cmake)
 
 foreach(application IN ITEMS Engine EngineRuntime)
     add_custom_command(TARGET ${application} POST_BUILD
@@ -578,4 +610,23 @@ foreach(application IN ITEMS Engine EngineRuntime)
             "${CMAKE_BINARY_DIR}/AngelScriptNotices.txt" "$<TARGET_FILE_DIR:${application}>/AngelScriptNotices.txt"
         VERBATIM
     )
+endforeach()
+
+# MSVC compiles the C++ sources of each Engine-owned target in parallel (/MP12; MSBuild -m still runs
+# targets side by side). Only targets defined in Engine's own directories are changed: FetchContent
+# dependencies and RTXDI live in their own directories, and the AngelScript add-on targets compile
+# third-party sources. /MP changes scheduling only, never generated code.
+set(engine_serial_compile_targets EngineScriptString EngineScriptBuilder)
+
+foreach(engine_directory IN ITEMS "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/src/Physics")
+    get_property(engine_directory_targets DIRECTORY "${engine_directory}" PROPERTY BUILDSYSTEM_TARGETS)
+
+    foreach(engine_target IN LISTS engine_directory_targets)
+        get_target_property(engine_target_type ${engine_target} TYPE)
+        set(engine_compiled_types EXECUTABLE STATIC_LIBRARY SHARED_LIBRARY MODULE_LIBRARY OBJECT_LIBRARY)
+
+        if(engine_target_type IN_LIST engine_compiled_types AND NOT engine_target IN_LIST engine_serial_compile_targets)
+            target_compile_options(${engine_target} PRIVATE $<$<COMPILE_LANG_AND_ID:CXX,MSVC>:/MP12>)
+        endif()
+    endforeach()
 endforeach()

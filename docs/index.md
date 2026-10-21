@@ -47,7 +47,6 @@ Its architecture spearates the editor from the packaged runtime, allowing author
 - Asset registry and import workflows
 - Mesh and texture processing
 - Standalone packaged runtime
-- Portable editor distribution support
 
 ## Editor and Runtime Architecture
 

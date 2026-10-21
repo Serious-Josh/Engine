@@ -63,6 +63,7 @@
 #include "Rtxdi/RtxdiResources.h"
 #include "MaterialTables/MaterialTableResources.h"
 #include "RendererLightingMode.h"
+#include "LightingModeTransition.h"
 #include "Passes/GISpatialDenoisePass.h"
 #include "Passes/GISignedCorrectionPass.h"
 #include "Passes/DisplacementVerticesPass.h"
@@ -266,6 +267,11 @@ class Renderer
     const PathTraceReferenceStatus& GetPathTraceReferenceStatus() const noexcept { return m_pathTraceStatus; }
     const PathTraceRasterPrimaryStatus& GetPathTraceRasterPrimaryStatus() const noexcept { return m_rasterPrimaryStatus; }
     const PathTraceRasterPrimaryStatus& GetPathTraceReSTIRDIStatus() const noexcept { return m_restirDIStatus; }
+    // Async DXR preparation: requested versus active lighting mode and the real preparation stage.
+    const LightingModeTransitionStatus& GetLightingModeTransitionStatus() const noexcept
+    {
+        return m_lightingModeTransition.GetStatus();
+    }
 
     // RTXPT.2 R4: false, leaving the view untouched, unless the previous PT frame's copy was submitted and
     // no invalidation has happened since.
@@ -1237,6 +1243,12 @@ class Renderer
     // Returns true when the reference pass exists or was created now; records the failure otherwise.
     bool EnsurePathTraceReference();
 
+    // Async DXR preparation (Gate 2), render thread only.
+    PathTracePrimary GetLightingModePrimary(RendererLightingMode mode) const;
+    bool IsLightingModeReady(RendererLightingMode mode) const;
+    ShaderLibraryPreparation PrepareLightingModeLibraries(RendererLightingMode mode);
+    void CreateLightingModeResources(RendererLightingMode mode);
+
     // RTXPT.2 raster-primary mode: whether its prerequisites hold, evaluated on frames that request it.
     // It owns no resources beyond its pipeline in the reference pass.
     PathTraceRasterPrimaryStatus m_rasterPrimaryStatus;
@@ -1257,6 +1269,11 @@ class Renderer
     // Primary of the reference mode. Camera always, except in diagnostics that measure raster-primary
     // agreement against unjittered PixelCenter rays; the Editor never changes it.
     PathTracePrimary m_pathTraceReferencePrimary = PathTracePrimary::Camera;
+    // Async DXR preparation (Gate 2). The worker compiles DXIL only; it is joined in Shutdown before the
+    // pass that accepts its results.
+    std::unique_ptr<ShaderLibraryCompileWorker> m_shaderCompileWorker;
+    bool m_shaderCompileWorkerRunning = false;
+    LightingModeTransition m_lightingModeTransition;
     // Records one progressive iteration (or holds a converged image) and presents it as scene colour.
     bool RecordPathTraceReference(
         ID3D12GraphicsCommandList* commandList,

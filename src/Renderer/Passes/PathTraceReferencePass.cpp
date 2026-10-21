@@ -12,6 +12,7 @@
 #include "Renderer/RayTracing/RayTracingSceneResources.h"
 
 #include <algorithm>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -95,7 +96,7 @@ bool PathTraceReferencePass::Initialize(
     unsigned int height,
     std::string& failureReason)
 {
-    Shutdown();
+    ReleaseResources();
 
     if(!graphicsDevice.SupportsRayTracing() || !graphicsDevice.GetRayTracingDevice())
     {
@@ -109,7 +110,9 @@ bool PathTraceReferencePass::Initialize(
         return false;
     }
 
-    // A missing shader (for example a historical cooked bundle without this library) fails here.
+    // Compiled libraries survive, including those accepted from the async worker, so a later Initialize
+    // never recompiles an unchanged library. A missing shader (for example a historical cooked bundle
+    // without this library) fails here.
     auto& referencePipeline = m_pipelines[static_cast<size_t>(PathTracePrimary::Camera)];
     const RayTracingPipelineDescription description = BuildPathTracePipelineDescription(PathTracePrimary::Camera);
     const ShaderLibraryCompileResult* library = AcquireLibrary(shaderLibrary, description.shaderPath);
@@ -118,7 +121,7 @@ bool PathTraceReferencePass::Initialize(
         !referencePipeline.Initialize(graphicsDevice.GetRayTracingDevice(), library->bytecode, description))
     {
         failureReason = "The PathTraceReference DXR library is unavailable or failed to compile.";
-        Shutdown();
+        ReleaseResources();
         return false;
     }
 
@@ -127,7 +130,7 @@ bool PathTraceReferencePass::Initialize(
     if(!CreateTextures(graphicsDevice.GetDevice(), descriptorHeap, width, height))
     {
         failureReason = "Path tracing accumulation resources or descriptors could not be allocated.";
-        Shutdown();
+        ReleaseResources();
         return false;
     }
 
@@ -188,6 +191,148 @@ bool PathTraceReferencePass::EnsurePrimaryPipeline(
     m_pipelineFailed[index] = true;
     failureReason = m_pipelineFailure[index];
     return false;
+}
+
+ShaderLibraryPreparation PathTraceReferencePass::PrepareLibrary(
+    ShaderLibrary& shaderLibrary,
+    ShaderLibraryCompileWorker& worker,
+    PathTracePrimary primary)
+{
+    const std::filesystem::path path = BuildPathTracePipelineDescription(primary).shaderPath;
+    const std::string libraryName = path.generic_string();
+    ShaderLibraryPreparation preparation{};
+
+    switch(worker.GetState(path))
+    {
+    case ShaderLibraryCompileState::Queued:
+        preparation.state = ShaderLibraryPreparationState::Queued;
+        return preparation;
+    case ShaderLibraryCompileState::Compiling:
+        preparation.state = ShaderLibraryPreparationState::Compiling;
+        return preparation;
+    case ShaderLibraryCompileState::Completed:
+    case ShaderLibraryCompileState::None:
+        break;
+    }
+
+    std::optional<ShaderLibraryCompileOutcome> completed = worker.TakeCompleted(path);
+    const auto failed = std::find_if(m_failedLibraries.begin(), m_failedLibraries.end(),
+        [&](const FailedLibrary& failedLibrary)
+        {
+            return failedLibrary.path == path;
+        });
+
+    // A result is advisory until accepted here: one compiled from sources that have since changed, whether
+    // it succeeded or failed, is discarded and compiled again.
+    if(completed && !ShaderLibraryCompileWorker::IsCurrent(*completed))
+    {
+        Log::Info("Discarded a stale " + libraryName + " compilation; its sources changed.");
+        return SubmitLibrary(shaderLibrary, worker, path);
+    }
+
+    if(completed && !completed->succeeded)
+    {
+        Log::Error("The " + libraryName + " DXR library failed to compile:\n" + completed->diagnostics);
+
+        if(failed != m_failedLibraries.end())
+        {
+            m_failedLibraries.erase(failed);
+        }
+
+        preparation.state = ShaderLibraryPreparationState::Failed;
+        preparation.diagnostic = "The " + libraryName + " DXR library failed to compile:\n" + completed->diagnostics;
+        m_failedLibraries.push_back(FailedLibrary{path, std::move(*completed)});
+        return preparation;
+    }
+
+    if(completed)
+    {
+        if(failed != m_failedLibraries.end())
+        {
+            m_failedLibraries.erase(failed);
+        }
+
+        CompiledLibrary* entry = nullptr;
+
+        for(CompiledLibrary& compiled : m_libraries)
+        {
+            if(compiled.path == path)
+            {
+                entry = &compiled;
+                break;
+            }
+        }
+
+        if(!entry)
+        {
+            entry = &m_libraries.emplace_back(CompiledLibrary{path, {}});
+        }
+
+        entry->library = std::move(completed->library);
+
+        // A new revision may fix what made a pipeline fail. Pipelines already created keep their state
+        // objects, as they do under synchronous reuse.
+        for(size_t index = 0; index < PrimaryCount; ++index)
+        {
+            const PathTracePrimary builtPrimary = static_cast<PathTracePrimary>(index);
+
+            if(BuildPathTracePipelineDescription(builtPrimary).shaderPath == path)
+            {
+                m_pipelineFailed[index] = false;
+                m_pipelineFailure[index].clear();
+            }
+        }
+
+        Log::Info("Accepted the asynchronously compiled " + libraryName + " DXR library.");
+        preparation.state = ShaderLibraryPreparationState::Ready;
+        preparation.acceptedNewRevision = true;
+        return preparation;
+    }
+
+    // An unchanged failure is reported again without recompiling; a changed one is retried.
+    if(failed != m_failedLibraries.end())
+    {
+        if(ShaderLibraryCompileWorker::IsCurrent(failed->outcome))
+        {
+            preparation.state = ShaderLibraryPreparationState::Failed;
+            preparation.diagnostic = "The " + libraryName + " DXR library failed to compile:\n" +
+                failed->outcome.diagnostics;
+            return preparation;
+        }
+
+        m_failedLibraries.erase(failed);
+        return SubmitLibrary(shaderLibrary, worker, path);
+    }
+
+    for(const CompiledLibrary& compiled : m_libraries)
+    {
+        if(compiled.path == path && shaderLibrary.IsLibraryCurrent(compiled.library))
+        {
+            preparation.state = ShaderLibraryPreparationState::Ready;
+            return preparation;
+        }
+    }
+
+    return SubmitLibrary(shaderLibrary, worker, path);
+}
+
+ShaderLibraryPreparation PathTraceReferencePass::SubmitLibrary(
+    ShaderLibrary& shaderLibrary,
+    ShaderLibraryCompileWorker& worker,
+    const std::filesystem::path& path)
+{
+    ShaderLibraryPreparation preparation{};
+    ShaderLibraryCompileRequest request{};
+
+    if(!shaderLibrary.CreateLibraryCompileRequest(path, request) || !worker.Submit(request))
+    {
+        preparation.state = ShaderLibraryPreparationState::Failed;
+        preparation.diagnostic = "The " + path.generic_string() + " DXR library could not be queued for compilation.";
+        return preparation;
+    }
+
+    preparation.state = ShaderLibraryPreparationState::Queued;
+    return preparation;
 }
 
 const ShaderLibraryCompileResult* PathTraceReferencePass::AcquireLibrary(
@@ -383,6 +528,13 @@ std::uint64_t PathTraceReferencePass::GetResourceBytes() const
 
 void PathTraceReferencePass::Shutdown()
 {
+    ReleaseResources();
+    m_libraries.clear();
+    m_failedLibraries.clear();
+}
+
+void PathTraceReferencePass::ReleaseResources()
+{
     m_accumulationTexture.Shutdown();
     m_outputTexture.Shutdown();
     m_statisticsTexture.Shutdown();
@@ -393,8 +545,6 @@ void PathTraceReferencePass::Shutdown()
         m_pipelineFailed[index] = false;
         m_pipelineFailure[index].clear();
     }
-
-    m_libraries.clear();
 
     m_width = 0;
     m_height = 0;

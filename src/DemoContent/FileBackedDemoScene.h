@@ -195,7 +195,6 @@ private:
     friend class Editor;
     friend class Engine;
 #if defined(ENGINE_HAS_VERIFICATION)
-    friend class PortableEditorVerification;
     friend class ProjectIndependentStartupVerification;
     friend class SceneLifecycleVerification;
     friend class AssetBrowserSceneVerification;

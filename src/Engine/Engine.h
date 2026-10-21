@@ -117,7 +117,6 @@ class Engine
     // owns the lock until Shutdown or destruction.
     void SetStartupProject(OpenedProject project);
 #if !defined(NDEBUG) && defined(ENGINE_HAS_VERIFICATION)
-    friend class PortableEditorVerification;
     friend class ProjectIndependentStartupVerification;
     friend class EditorPreferencesVerification;
     friend class ProjectBrowserVerification;

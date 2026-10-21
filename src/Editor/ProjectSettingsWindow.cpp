@@ -1,6 +1,5 @@
 #include "Editor/Editor.h"
 #include "DemoContent/FileBackedDemoScene.h"
-#include "Platform/Windows/EditorDistributionPaths.h"
 #include "imgui.h"
 
 #include <algorithm>
@@ -233,7 +232,6 @@ void Editor::DrawFileAssociation()
     }
 
     const auto executable = ProjectFileAssociation::CurrentExecutable();
-    const bool portable = EditorDistributionPaths::IsPortable();
 
     ImGui::TextDisabled("Personal Windows preference for this user; not stored in any project");
     ImGui::TextWrapped("Status: %s", ProjectFileAssociation::Describe(m_fileAssociationStatus).c_str());
@@ -244,18 +242,8 @@ void Editor::DrawFileAssociation()
     ImGui::TextWrapped("Windows currently opens .engineproj files with: %s", effective.c_str());
     ImGui::TextWrapped("This Editor: %s", PathText(executable).c_str());
 
-    if(portable)
-    {
-        ImGui::Separator();
-        ImGui::TextWrapped("This is a portable Editor. If this folder is moved or deleted, double-clicking "
-            "project files will stop working until you register again from the new location.");
-        ImGui::Checkbox("Register this portable Editor location anyway", &m_fileAssociationPortableAcknowledged);
-    }
-
     ImGui::Separator();
-
-    const bool registerAllowed = !portable || m_fileAssociationPortableAcknowledged;
-    ImGui::BeginDisabled(!registerAllowed || m_fileAssociationConfirmReplace);
+    ImGui::BeginDisabled(m_fileAssociationConfirmReplace);
 
     if(ImGui::Button("Register .engineproj with this Editor"))
     {
