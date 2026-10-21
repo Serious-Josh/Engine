@@ -1078,6 +1078,10 @@ class Renderer
     bool InitializeDevice();
     bool InitializeSwapChain(void* windowHandle);
 
+    // SER S6B: chooses the path tracer's DXR library variant once, before any library is prepared
+    // (SelectPathTraceLibraryVariant: ENGINE_PATH_TRACE_LIBRARIES and the device capabilities), and logs it.
+    void SelectPathTraceLibraries();
+
     // Private resize stages: called only after Resize() confirms the queue is idle.
     bool ResizeApplicationResources(
         unsigned int width,

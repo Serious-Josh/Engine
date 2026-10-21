@@ -96,13 +96,17 @@ bool ShaderLibrary::CompileLibrary(
     {
         const auto found = m_packagedBytecode.find(path.generic_string() + ":library");
         if(found == m_packagedBytecode.end()) { Log::Error("Missing packaged DXR library: " + path.generic_string()); return false; }
-        output.bytecode = found->second; return true;
+        output.bytecode = found->second;
+        // Cooked with the same mapping (CookBootstrap), so the record's key decides its profile.
+        output.profile = ShaderCompiler::GetLibraryProfile(path);
+        return true;
     }
     const std::filesystem::path shaderPath = m_shaderRoot / path;
     const std::wstring shaderPathString = shaderPath.wstring();
 
     ShaderLibraryCompileDescription description{};
     description.path = shaderPathString.c_str();
+    description.profile = ShaderCompiler::GetLibraryProfile(path);
 
     ++m_libraryCompileCount;
     return m_compiler.CompileLibrary(description, output);
@@ -123,9 +127,16 @@ bool ShaderLibrary::CreateLibraryCompileRequest(
     return true;
 }
 
-bool ShaderLibrary::IsLibraryCurrent(const ShaderLibraryCompileResult& library) const
+bool ShaderLibrary::IsLibraryCurrent(
+    const std::filesystem::path& path,
+    const ShaderLibraryCompileResult& library) const
 {
-    return !library.bytecode.empty() && (m_packaged || ShaderCompiler::DependenciesUnchanged(library.dependencies));
+    if(library.bytecode.empty() || library.profile != ShaderCompiler::GetLibraryProfile(path))
+    {
+        return false;
+    }
+
+    return m_packaged || ShaderCompiler::DependenciesUnchanged(library.dependencies);
 }
 
 namespace
@@ -156,7 +167,13 @@ std::vector<std::byte> ShaderLibrary::CookBootstrap(const std::filesystem::path&
     for(auto name:libraries)
     {
         const std::string file=std::string(name)+".hlsl"; const auto path=(root/file).wstring(); ShaderLibraryCompileResult result;
-        if(!compiler.CompileLibrary({path.c_str()},result)) throw std::runtime_error("Offline DXR compilation failed: "+file);
+        const ShaderLibraryCompileDescription description{path.c_str(), ShaderCompiler::GetLibraryProfile(file)};
+
+        if(!compiler.CompileLibrary(description, result))
+        {
+            throw std::runtime_error("Offline DXR compilation failed: " + file);
+        }
+
         entries.emplace(file+":library",std::move(result.bytecode));
     }
     std::vector<std::byte> out; Put(out,0x31424853); Put(out,1); Put(out,static_cast<std::uint32_t>(entries.size()));

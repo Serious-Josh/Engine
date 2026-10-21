@@ -163,7 +163,8 @@ std::optional<ShaderLibraryCompileOutcome> ShaderLibraryCompileWorker::TakeCompl
 
 bool ShaderLibraryCompileWorker::IsCurrent(const ShaderLibraryCompileOutcome& outcome)
 {
-    return ShaderCompiler::DependenciesUnchanged(outcome.library.dependencies);
+    return outcome.library.profile == ShaderCompiler::GetLibraryProfile(outcome.libraryPath) &&
+        ShaderCompiler::DependenciesUnchanged(outcome.library.dependencies);
 }
 
 void ShaderLibraryCompileWorker::Run()
@@ -203,6 +204,7 @@ void ShaderLibraryCompileWorker::Run()
         {
             ShaderLibraryCompileDescription description{};
             description.path = sourcePath.c_str();
+            description.profile = ShaderCompiler::GetLibraryProfile(libraryPath);
             outcome.succeeded = compiler.CompileLibrary(description, outcome.library, outcome.diagnostics);
         }
         else

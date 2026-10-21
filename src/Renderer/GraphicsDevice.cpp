@@ -530,7 +530,44 @@ bool GraphicsDevice::Initialize()
         break;
     }
 
+    QueryShaderCapabilities();
+
     return true;
+}
+
+void GraphicsDevice::QueryShaderCapabilities()
+{
+    // The runtime reports the highest model it and the driver both support, capped at the requested one.
+    D3D12_FEATURE_DATA_SHADER_MODEL shaderModel{D3D_HIGHEST_SHADER_MODEL};
+    HRESULT result = m_device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &shaderModel, sizeof(shaderModel));
+
+    if (FAILED(result))
+    {
+        Log::Error(std::format("Shader model feature query failed. HRESULT: 0x{:x}",
+                               static_cast<unsigned long>(result)));
+    }
+    else
+    {
+        m_highestShaderModel = shaderModel.HighestShaderModel;
+        const unsigned int model = static_cast<unsigned int>(m_highestShaderModel);
+        Log::Info(std::format("Highest supported shader model: {}.{}", model >> 4, model & 0xF));
+    }
+
+    // OPTIONS22 is unknown to runtimes older than the pinned Agility SDK; a failure only means "no".
+    D3D12_FEATURE_DATA_D3D12_OPTIONS22 options22{};
+    result = m_device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS22, &options22, sizeof(options22));
+
+    if (FAILED(result))
+    {
+        Log::Info(std::format("D3D12_OPTIONS22 feature query unavailable. HRESULT: 0x{:x}",
+                              static_cast<unsigned long>(result)));
+    }
+    else
+    {
+        m_serActuallyReorders = options22.ShaderExecutionReorderingActuallyReorders != FALSE;
+    }
+
+    Log::Info(std::string("Shader execution reordering actually reorders: ") + (m_serActuallyReorders ? "yes" : "no"));
 }
 
 void GraphicsDevice::Shutdown()
@@ -572,4 +609,19 @@ bool GraphicsDevice::SupportsRayTracing() const
 ID3D12Device5* GraphicsDevice::GetRayTracingDevice() const
 {
     return m_rayTracingDevice;
+}
+
+D3D12_RAYTRACING_TIER GraphicsDevice::GetRayTracingTier() const
+{
+    return m_rayTracingTier;
+}
+
+D3D_SHADER_MODEL GraphicsDevice::GetHighestShaderModel() const
+{
+    return m_highestShaderModel;
+}
+
+bool GraphicsDevice::ShaderExecutionReorderingActuallyReorders() const
+{
+    return m_serActuallyReorders;
 }

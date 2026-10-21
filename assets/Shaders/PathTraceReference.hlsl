@@ -25,18 +25,30 @@
 #include "Rtxdi/DI/ReSTIRDIParameters.h"
 #endif
 
-struct PathTracePayload
+// SER S1: SM 6.7+ libraries (the SM69 wrappers) require payload access qualifiers. Both macros expand to
+// nothing below SM 6.7, so the lib_6_6 bytecode is unchanged. Every field stays caller-written and caller-read,
+// so the caller's initial values survive a miss exactly as they do without qualifiers.
+#if __SHADER_TARGET_MAJOR > 6 || (__SHADER_TARGET_MAJOR == 6 && __SHADER_TARGET_MINOR >= 7)
+#define PATH_TRACE_RAY_PAYLOAD [raypayload]
+#define PATH_TRACE_PAYLOAD_ACCESS(access) : access
+#else
+#define PATH_TRACE_RAY_PAYLOAD
+#define PATH_TRACE_PAYLOAD_ACCESS(access)
+#endif
+
+struct PATH_TRACE_RAY_PAYLOAD PathTracePayload
 {
-    float hitDistance; // Negative on a miss.
-    float3 geometricNormal;
-    float3 shadingNormal;
-    float2 uv;
-    uint materialIndex;
+    // Negative on a miss.
+    float hitDistance PATH_TRACE_PAYLOAD_ACCESS(write(caller, closesthit, miss) : read(caller));
+    float3 geometricNormal PATH_TRACE_PAYLOAD_ACCESS(write(caller, closesthit) : read(caller));
+    float3 shadingNormal PATH_TRACE_PAYLOAD_ACCESS(write(caller, closesthit) : read(caller));
+    float2 uv PATH_TRACE_PAYLOAD_ACCESS(write(caller, closesthit) : read(caller));
+    uint materialIndex PATH_TRACE_PAYLOAD_ACCESS(write(caller, closesthit) : read(caller));
 };
 
-struct PathTraceVisibilityPayload
+struct PATH_TRACE_RAY_PAYLOAD PathTraceVisibilityPayload
 {
-    uint visible;
+    uint visible PATH_TRACE_PAYLOAD_ACCESS(write(caller, miss) : read(caller));
 };
 
 cbuffer PathTraceConstants : register(b0)
@@ -519,6 +531,32 @@ void PathTraceCameraRay(uint2 pixel, float2 jitter, out float3 origin, out float
     direction = segment / max(maximumDistance, 1.0e-20f);
 }
 
+#ifdef PATH_TRACE_SER
+// SER S3A/S5A (the SER wrappers only, lib_6_9): a radiance ray traced as a HitObject, then executed by
+// Invoke, which runs the same closest-hit or miss shader with the same payload as TraceRay would. Only reorder
+// moves the thread: per-pixel state (RNG, throughput, radiance, ray counts) is thread-local and the path tracer
+// writes its UAVs at the pixel's own address after the loop, so reordering changes no result (the wave sums of
+// the statistics still count every thread once, in whichever wave it ends). The hint is the hit instance's
+// InstanceID (its RayTracingInstanceData index), truncated to the hint bits; misses use the top hint value. A
+// collision only costs coherence. Visibility rays never come here.
+static const uint PATH_TRACE_SER_MISS_HINT = 0xFFFFu;
+static const uint PATH_TRACE_SER_HINT_BITS = 16u;
+
+void PathTraceTraceRadianceReordered(RayDesc ray, uint instanceMask, bool reorder, inout PathTracePayload payload)
+{
+    dx::HitObject hit = dx::HitObject::TraceRay(scene, RAY_FLAG_NONE, instanceMask, 0, 1, PATH_TRACE_MISS_RADIANCE,
+        ray, payload);
+
+    if(reorder)
+    {
+        uint hint = hit.IsHit() ? (hit.GetInstanceID() & PATH_TRACE_SER_MISS_HINT) : PATH_TRACE_SER_MISS_HINT;
+        dx::MaybeReorderThread(hit, hint, PATH_TRACE_SER_HINT_BITS);
+    }
+
+    dx::HitObject::Invoke(hit, payload);
+}
+#endif
+
 // How the path loop forms its first vertex. Every ray-generation entry passes one of these as a literal,
 // so the compiler specialises the loop per entry and folds the other cases away: the reference entry's loop
 // is exactly the RTXPT.1 loop (RTXPT.2 R2 and R3 verify its accumulation bit for bit).
@@ -788,7 +826,13 @@ float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex 
             payload.shadingNormal = float3(0.0f, 0.0f, 1.0f);
             payload.uv = float2(0.0f, 0.0f);
             payload.materialIndex = 0u;
+#ifdef PATH_TRACE_SER
+            // SER S5A: the same single call site, as a HitObject. The empty vertex-0 ray keeps mask 0 and is never
+            // reordered (it misses without traversal, exactly as before); continuation rays reorder.
+            PathTraceTraceRadianceReordered(ray, gBufferVertex ? 0x00 : 0xFF, !gBufferVertex, payload);
+#else
             TraceRay(scene, RAY_FLAG_NONE, gBufferVertex ? 0x00 : 0xFF, 0, 1, PATH_TRACE_MISS_RADIANCE, ray, payload);
+#endif
 
             if(gBufferVertex)
             {
@@ -849,7 +893,21 @@ float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex 
             payload.shadingNormal = float3(0.0f, 0.0f, 1.0f);
             payload.uv = float2(0.0f, 0.0f);
             payload.materialIndex = 0u;
+#ifdef PATH_TRACE_SER
+            // SER S3A: of the camera primaries, Reference only (Pixel Centre keeps TraceRay). Its camera ray
+            // (vertex 0) is already coherent in launch order, so only the continuation rays reorder; every vertex
+            // still uses this one call site, as all lanes reach it.
+            if(primary == PATH_TRACE_PRIMARY_CAMERA)
+            {
+                PathTraceTraceRadianceReordered(ray, 0xFF, vertex > 0u, payload);
+            }
+            else
+            {
+                TraceRay(scene, RAY_FLAG_NONE, 0xFF, 0, 1, PATH_TRACE_MISS_RADIANCE, ray, payload);
+            }
+#else
             TraceRay(scene, RAY_FLAG_NONE, 0xFF, 0, 1, PATH_TRACE_MISS_RADIANCE, ray, payload);
+#endif
             ++rayCount;
 
             if(payload.hitDistance < 0.0f)

@@ -379,6 +379,7 @@ bool ShaderCompiler::CompileLibrary(
 {
     output.bytecode.clear();
     output.dependencies.clear();
+    output.profile = description.profile;
 
     if (!m_utils || !m_compiler)
     {
@@ -422,7 +423,8 @@ bool ShaderCompiler::CompileLibrary(
 
     std::wstring shaderDirectory = shaderPath.parent_path().wstring();
 
-    const wchar_t* arguments[] = {description.path, L"-T", L"lib_6_6", L"-HV", L"2021", L"-I", shaderDirectory.c_str()};
+    const wchar_t* profile = description.profile == ShaderLibraryProfile::Library69 ? L"lib_6_9" : L"lib_6_6";
+    const wchar_t* arguments[] = {description.path, L"-T", profile, L"-HV", L"2021", L"-I", shaderDirectory.c_str()};
 
     IDxcResult* compileResult = nullptr;
     RecordDependency(output.dependencies, description.path, source);
@@ -497,6 +499,19 @@ bool ShaderCompiler::CompileLibrary(
     source->Release();
 
     return true;
+}
+
+ShaderLibraryProfile ShaderCompiler::GetLibraryProfile(const std::filesystem::path& libraryPath)
+{
+    const std::filesystem::path fileName = libraryPath.filename();
+
+    if(fileName == "PathTraceReferenceSM69.hlsl" || fileName == "PathTraceReSTIRDISM69.hlsl" ||
+        fileName == "PathTraceReferenceSERSM69.hlsl" || fileName == "PathTraceReSTIRDISERSM69.hlsl")
+    {
+        return ShaderLibraryProfile::Library69;
+    }
+
+    return ShaderLibraryProfile::Library66;
 }
 
 bool ShaderCompiler::DependenciesUnchanged(const std::vector<ShaderSourceDependency>& dependencies)

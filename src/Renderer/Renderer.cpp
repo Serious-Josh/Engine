@@ -2722,6 +2722,8 @@ bool Renderer::Initialize(
         return false;
     }
 
+    SelectPathTraceLibraries();
+
     // Packaged bytecode never compiles, so only the Editor prepares DXR libraries asynchronously. Without
     // the worker, lighting modes keep their synchronous first-use compilation.
     m_lightingModeTransition.Reset();
@@ -3149,6 +3151,53 @@ bool Renderer::InitializeEditorResources()
     m_editorResourcesInitialized = true;
     Log::Info("Editor preview resources initialized.");
     return true;
+}
+
+void Renderer::SelectPathTraceLibraries()
+{
+    char overrideBuffer[32]{};
+    const DWORD overrideLength = GetEnvironmentVariableA("ENGINE_PATH_TRACE_LIBRARIES", overrideBuffer,
+        sizeof(overrideBuffer));
+    std::string libraryOverride;
+
+    // A value too long for the buffer is not copied; no valid value is that long, so it is reported as invalid.
+    if(overrideLength >= sizeof(overrideBuffer))
+    {
+        libraryOverride = "(value too long)";
+    }
+    else
+    {
+        libraryOverride.assign(overrideBuffer, overrideLength);
+    }
+
+    PathTraceLibraryCapabilities capabilities{};
+    capabilities.rayTracing = m_graphicsDevice.SupportsRayTracing() && m_graphicsDevice.GetRayTracingDevice();
+    capabilities.shaderModel69 = m_graphicsDevice.GetHighestShaderModel() >= D3D_SHADER_MODEL_6_9;
+    capabilities.rayTracingTier12 = m_graphicsDevice.GetRayTracingTier() >= D3D12_RAYTRACING_TIER_1_2;
+    capabilities.serActuallyReorders = m_graphicsDevice.ShaderExecutionReorderingActuallyReorders();
+    capabilities.packagedRuntime = m_packagedRuntime;
+
+    const PathTraceLibrarySelection selection = SelectPathTraceLibraryVariant(libraryOverride, capabilities);
+
+    if(!m_pathTraceReferencePass.SelectLibraryVariant(selection.variant))
+    {
+        Log::Warning(std::string("Path-tracing library variant ") + PathTraceLibraryVariantName(selection.variant) +
+            " selected after path-tracing libraries were prepared; keeping " +
+            PathTraceLibraryVariantName(m_pathTraceReferencePass.GetLibraryVariant()) + ".");
+        return;
+    }
+
+    const std::string message = std::string("Path-tracing libraries: ") +
+        PathTraceLibraryVariantName(selection.variant) + " (" + selection.reason + ").";
+
+    if(selection.warning)
+    {
+        Log::Warning(message);
+    }
+    else
+    {
+        Log::Info(message);
+    }
 }
 
 bool Renderer::InitializeDevice()
@@ -4436,13 +4485,14 @@ bool Renderer::IsLightingModeReady(RendererLightingMode mode) const
 }
 
 // Polls the worker for every DXR library the mode needs, never blocking. The reference library comes first:
-// every mode's reference gate needs it, and Raster Primary reuses it.
+// every mode's reference gate needs it. The mode's own primary follows; Raster Primary reuses the reference
+// library in every current configuration (an immediate Ready), which this keeps correct if they ever differ.
 ShaderLibraryPreparation Renderer::PrepareLightingModeLibraries(RendererLightingMode mode)
 {
     std::vector<PathTracePrimary> primaries = {PathTracePrimary::Camera};
     const PathTracePrimary modePrimary = GetLightingModePrimary(mode);
 
-    if(modePrimary == PathTracePrimary::RasterReSTIRDI)
+    if(modePrimary != PathTracePrimary::Camera)
     {
         primaries.push_back(modePrimary);
     }

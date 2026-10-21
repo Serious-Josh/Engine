@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <string>
+#include <string_view>
 #include <vector>
 
 class DescriptorHeap;
@@ -17,6 +18,49 @@ class GraphicsDevice;
 class RenderTarget;
 class ShaderLibrary;
 class RayTracingSceneResources;
+
+// SER S6B: the DXR library set every path-tracing primary uses, chosen once at startup.
+//   SM66    PathTraceReference.hlsl and PathTraceReSTIRDI.hlsl (lib_6_6): the conventional path.
+//   SM69    PathTraceReferenceSM69.hlsl and PathTraceReSTIRDISM69.hlsl: diagnostic only, the bit-exact non-SER
+//           baseline of SM69SER.
+//   SM69SER PathTraceReferenceSERSM69.hlsl and PathTraceReSTIRDISERSM69.hlsl: shader execution reordering on the
+//           continuation rays of Reference, Raster Primary and ReSTIR DI; Pixel Centre traces conventionally.
+enum class PathTraceLibraryVariant
+{
+    SM66,
+    SM69,
+    SM69SER
+};
+
+const char* PathTraceLibraryVariantName(PathTraceLibraryVariant variant);
+
+// What the library selection needs to know about the device and process.
+struct PathTraceLibraryCapabilities
+{
+    bool rayTracing = false;
+    bool shaderModel69 = false;
+    bool rayTracingTier12 = false;
+    bool serActuallyReorders = false;
+    // Packaged runtimes cook only the SM 6.6 libraries, so they always use SM66.
+    bool packagedRuntime = false;
+};
+
+struct PathTraceLibrarySelection
+{
+    PathTraceLibraryVariant variant = PathTraceLibraryVariant::SM66;
+    // Why this variant was chosen, for the startup log.
+    std::string reason;
+    // True when the override could not be honoured as written; the reason says why.
+    bool warning = false;
+};
+
+// Pure selection rule. libraryOverride is ENGINE_PATH_TRACE_LIBRARIES (auto, sm66, sm69 or ser; empty when unset;
+// case-insensitive). auto selects SM69SER when every SER capability is present, otherwise SM66. sm69 and ser are
+// honoured only on capable devices and otherwise fall back to SM66 with a warning; an invalid value warns and
+// means auto. No override bypasses a capability check, and packaged runtimes always get SM66.
+PathTraceLibrarySelection SelectPathTraceLibraryVariant(
+    std::string_view libraryOverride,
+    const PathTraceLibraryCapabilities& capabilities);
 
 // RTXPT.1 progressive reference path tracer. Owns one DXR pipeline per primary constructor (the same
 // library, compiled once, a different ray-generation export) and three renderer-lifetime resources: the RGBA32F running
@@ -45,6 +89,15 @@ class PathTraceReferencePass
         unsigned int width,
         unsigned int height);
     void Shutdown();
+
+    // Selects the library set for every primary (SelectPathTraceLibraryVariant decides it). The caller checks
+    // device support. False, with the variant unchanged, once any library or pipeline exists.
+    bool SelectLibraryVariant(PathTraceLibraryVariant variant);
+
+    PathTraceLibraryVariant GetLibraryVariant() const
+    {
+        return m_libraryVariant;
+    }
 
     // Creates the pipeline of a non-reference primary on first use (Initialize creates the reference
     // pipeline). A failure, for example a cooked library from before RTXPT.2 R3 without the export, is
@@ -112,6 +165,12 @@ class PathTraceReferencePass
     std::uint64_t GetResourceBytes() const;
 
     private:
+    // True once any library or pipeline exists, after which the library selection cannot change.
+    bool LibrarySelectionFixed() const;
+
+    // Appended to library and pipeline failures outside SM66: names the variant and the sm66 override.
+    std::string TroubleshootingHint() const;
+
     bool CreateTextures(
         ID3D12Device* device,
         DescriptorHeap& descriptorHeap,
@@ -163,4 +222,5 @@ class PathTraceReferencePass
     unsigned int m_width = 0;
     unsigned int m_height = 0;
     bool m_initialized = false;
+    PathTraceLibraryVariant m_libraryVariant = PathTraceLibraryVariant::SM66;
 };

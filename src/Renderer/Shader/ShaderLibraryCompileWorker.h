@@ -88,8 +88,9 @@ class ShaderLibraryCompileWorker
     // Moves a completed result out; the library then has no job and may be submitted again.
     std::optional<ShaderLibraryCompileOutcome> TakeCompleted(const std::filesystem::path& libraryPath);
 
-    // True when every source and include lookup the compilation read is unchanged. A stale outcome,
-    // successful or failed, is discarded by the caller and the library resubmitted.
+    // True when the outcome was compiled for the library's mapped profile and every source and include
+    // lookup the compilation read is unchanged. A stale outcome, successful or failed, is discarded by the
+    // caller and the library resubmitted.
     static bool IsCurrent(const ShaderLibraryCompileOutcome& outcome);
 
     private:

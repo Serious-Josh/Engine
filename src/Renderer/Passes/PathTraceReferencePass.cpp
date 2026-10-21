@@ -12,6 +12,7 @@
 #include "Renderer/RayTracing/RayTracingSceneResources.h"
 
 #include <algorithm>
+#include <iterator>
 #include <optional>
 #include <string>
 #include <vector>
@@ -34,12 +35,45 @@ namespace
             std::search(bytecode.begin(), bytecode.end(), name.begin(), name.end()) != bytecode.end();
     }
 
+    const char* ReferenceLibraryPath(PathTraceLibraryVariant variant)
+    {
+        switch(variant)
+        {
+        case PathTraceLibraryVariant::SM69:
+            return "PathTraceReferenceSM69.hlsl";
+        case PathTraceLibraryVariant::SM69SER:
+            return "PathTraceReferenceSERSM69.hlsl";
+        case PathTraceLibraryVariant::SM66:
+            break;
+        }
+
+        return "PathTraceReference.hlsl";
+    }
+
+    const char* ReSTIRDILibraryPath(PathTraceLibraryVariant variant)
+    {
+        switch(variant)
+        {
+        case PathTraceLibraryVariant::SM69:
+            return "PathTraceReSTIRDISM69.hlsl";
+        case PathTraceLibraryVariant::SM69SER:
+            return "PathTraceReSTIRDISERSM69.hlsl";
+        case PathTraceLibraryVariant::SM66:
+            break;
+        }
+
+        return "PathTraceReSTIRDI.hlsl";
+    }
+
     // One shared library; each primary constructor is its own ray-generation export. The RTXPT.3 ReSTIR DI
-    // primary uses the RTXDI-specialized compilation of that library.
-    RayTracingPipelineDescription BuildPathTracePipelineDescription(PathTracePrimary primary)
+    // primary uses the RTXDI-specialized compilation of that library. The library variant (SER S6B) picks the
+    // wrappers of both libraries; exports, bindings and root signatures are identical in every variant.
+    RayTracingPipelineDescription BuildPathTracePipelineDescription(
+        PathTracePrimary primary,
+        PathTraceLibraryVariant variant)
     {
         RayTracingPipelineDescription pipelineDescription{};
-        pipelineDescription.shaderPath = "PathTraceReference.hlsl";
+        pipelineDescription.shaderPath = ReferenceLibraryPath(variant);
 
         switch(primary)
         {
@@ -54,7 +88,8 @@ namespace
             break;
         case PathTracePrimary::RasterReSTIRDI:
             // RTXPT.3: the RTXDI-specialized compilation of the same source (PathTraceReSTIRDI.hlsl).
-            pipelineDescription.shaderPath = "PathTraceReSTIRDI.hlsl";
+            pipelineDescription.shaderPath = ReSTIRDILibraryPath(variant);
+
             pipelineDescription.rayGenerationShader = L"PathTraceRasterPrimaryReSTIRDIRayGeneration";
             break;
         }
@@ -88,6 +123,43 @@ namespace
     }
 }
 
+bool PathTraceReferencePass::LibrarySelectionFixed() const
+{
+    // Libraries and pipelines are keyed by primary, not by variant, so the choice is fixed once anything has
+    // been compiled, submitted or created from it.
+    const bool anyPipeline = std::find(std::begin(m_pipelineReady), std::end(m_pipelineReady), true) !=
+        std::end(m_pipelineReady);
+
+    return m_initialized || anyPipeline || !m_libraries.empty() || !m_failedLibraries.empty();
+}
+
+bool PathTraceReferencePass::SelectLibraryVariant(PathTraceLibraryVariant variant)
+{
+    if(variant == m_libraryVariant)
+    {
+        return true;
+    }
+
+    if(LibrarySelectionFixed())
+    {
+        return false;
+    }
+
+    m_libraryVariant = variant;
+    return true;
+}
+
+std::string PathTraceReferencePass::TroubleshootingHint() const
+{
+    if(m_libraryVariant == PathTraceLibraryVariant::SM66)
+    {
+        return {};
+    }
+
+    return std::string(" (library variant ") + PathTraceLibraryVariantName(m_libraryVariant) +
+        "; set ENGINE_PATH_TRACE_LIBRARIES=sm66 to use the conventional SM 6.6 libraries)";
+}
+
 bool PathTraceReferencePass::Initialize(
     GraphicsDevice& graphicsDevice,
     ShaderLibrary& shaderLibrary,
@@ -114,13 +186,15 @@ bool PathTraceReferencePass::Initialize(
     // never recompiles an unchanged library. A missing shader (for example a historical cooked bundle
     // without this library) fails here.
     auto& referencePipeline = m_pipelines[static_cast<size_t>(PathTracePrimary::Camera)];
-    const RayTracingPipelineDescription description = BuildPathTracePipelineDescription(PathTracePrimary::Camera);
+    const RayTracingPipelineDescription description =
+        BuildPathTracePipelineDescription(PathTracePrimary::Camera, m_libraryVariant);
     const ShaderLibraryCompileResult* library = AcquireLibrary(shaderLibrary, description.shaderPath);
 
     if(!library ||
         !referencePipeline.Initialize(graphicsDevice.GetRayTracingDevice(), library->bytecode, description))
     {
-        failureReason = "The PathTraceReference DXR library is unavailable or failed to compile.";
+        failureReason = "The PathTraceReference DXR library is unavailable or failed to compile" +
+            TroubleshootingHint() + ".";
         ReleaseResources();
         return false;
     }
@@ -165,13 +239,15 @@ bool PathTraceReferencePass::EnsurePrimaryPipeline(
 
     // A library cooked before RTXPT.2 R3 lacks this export, and a state object naming a missing export is a
     // D3D12 error. The export's name must therefore appear in the library's DXIL function table first.
-    const RayTracingPipelineDescription description = BuildPathTracePipelineDescription(primary);
+    const RayTracingPipelineDescription description =
+        BuildPathTracePipelineDescription(primary, m_libraryVariant);
     const std::string libraryName = description.shaderPath.generic_string();
     const ShaderLibraryCompileResult* library = AcquireLibrary(shaderLibrary, description.shaderPath);
 
     if(!library)
     {
-        m_pipelineFailure[index] = "The " + libraryName + " DXR library is unavailable or failed to compile.";
+        m_pipelineFailure[index] = "The " + libraryName + " DXR library is unavailable or failed to compile" +
+            TroubleshootingHint() + ".";
     }
     else if(!LibraryNamesExport(library->bytecode, description.rayGenerationShader))
     {
@@ -180,7 +256,8 @@ bool PathTraceReferencePass::EnsurePrimaryPipeline(
     }
     else if(!m_pipelines[index].Initialize(graphicsDevice.GetRayTracingDevice(), library->bytecode, description))
     {
-        m_pipelineFailure[index] = "The " + libraryName + " DXR pipeline could not be created for this primary.";
+        m_pipelineFailure[index] = "The " + libraryName + " DXR pipeline could not be created for this primary" +
+            TroubleshootingHint() + ".";
     }
     else
     {
@@ -198,7 +275,8 @@ ShaderLibraryPreparation PathTraceReferencePass::PrepareLibrary(
     ShaderLibraryCompileWorker& worker,
     PathTracePrimary primary)
 {
-    const std::filesystem::path path = BuildPathTracePipelineDescription(primary).shaderPath;
+    const std::filesystem::path path =
+        BuildPathTracePipelineDescription(primary, m_libraryVariant).shaderPath;
     const std::string libraryName = path.generic_string();
     ShaderLibraryPreparation preparation{};
 
@@ -232,7 +310,8 @@ ShaderLibraryPreparation PathTraceReferencePass::PrepareLibrary(
 
     if(completed && !completed->succeeded)
     {
-        Log::Error("The " + libraryName + " DXR library failed to compile:\n" + completed->diagnostics);
+        Log::Error("The " + libraryName + " DXR library failed to compile" + TroubleshootingHint() + ":\n" +
+            completed->diagnostics);
 
         if(failed != m_failedLibraries.end())
         {
@@ -240,7 +319,8 @@ ShaderLibraryPreparation PathTraceReferencePass::PrepareLibrary(
         }
 
         preparation.state = ShaderLibraryPreparationState::Failed;
-        preparation.diagnostic = "The " + libraryName + " DXR library failed to compile:\n" + completed->diagnostics;
+        preparation.diagnostic = "The " + libraryName + " DXR library failed to compile" + TroubleshootingHint() +
+            ":\n" + completed->diagnostics;
         m_failedLibraries.push_back(FailedLibrary{path, std::move(*completed)});
         return preparation;
     }
@@ -276,7 +356,7 @@ ShaderLibraryPreparation PathTraceReferencePass::PrepareLibrary(
         {
             const PathTracePrimary builtPrimary = static_cast<PathTracePrimary>(index);
 
-            if(BuildPathTracePipelineDescription(builtPrimary).shaderPath == path)
+            if(BuildPathTracePipelineDescription(builtPrimary, m_libraryVariant).shaderPath == path)
             {
                 m_pipelineFailed[index] = false;
                 m_pipelineFailure[index].clear();
@@ -295,8 +375,8 @@ ShaderLibraryPreparation PathTraceReferencePass::PrepareLibrary(
         if(ShaderLibraryCompileWorker::IsCurrent(failed->outcome))
         {
             preparation.state = ShaderLibraryPreparationState::Failed;
-            preparation.diagnostic = "The " + libraryName + " DXR library failed to compile:\n" +
-                failed->outcome.diagnostics;
+            preparation.diagnostic = "The " + libraryName + " DXR library failed to compile" + TroubleshootingHint() +
+                ":\n" + failed->outcome.diagnostics;
             return preparation;
         }
 
@@ -306,7 +386,7 @@ ShaderLibraryPreparation PathTraceReferencePass::PrepareLibrary(
 
     for(const CompiledLibrary& compiled : m_libraries)
     {
-        if(compiled.path == path && shaderLibrary.IsLibraryCurrent(compiled.library))
+        if(compiled.path == path && shaderLibrary.IsLibraryCurrent(path, compiled.library))
         {
             preparation.state = ShaderLibraryPreparationState::Ready;
             return preparation;
@@ -352,7 +432,7 @@ const ShaderLibraryCompileResult* PathTraceReferencePass::AcquireLibrary(
 
     // Reused only while every source the compilation read is unchanged; otherwise it compiles again, exactly
     // as each pipeline used to.
-    if(entry && shaderLibrary.IsLibraryCurrent(entry->library))
+    if(entry && shaderLibrary.IsLibraryCurrent(path, entry->library))
     {
         return &entry->library;
     }
@@ -549,4 +629,152 @@ void PathTraceReferencePass::ReleaseResources()
     m_width = 0;
     m_height = 0;
     m_initialized = false;
+}
+
+const char* PathTraceLibraryVariantName(PathTraceLibraryVariant variant)
+{
+    switch(variant)
+    {
+    case PathTraceLibraryVariant::SM69:
+        return "SM 6.9";
+    case PathTraceLibraryVariant::SM69SER:
+        return "SM 6.9 + SER";
+    case PathTraceLibraryVariant::SM66:
+        break;
+    }
+
+    return "SM 6.6";
+}
+
+namespace
+{
+    std::string LowerCase(std::string_view text)
+    {
+        std::string lower(text);
+
+        for(char& character : lower)
+        {
+            if(character >= 'A' && character <= 'Z')
+            {
+                character = static_cast<char>(character - 'A' + 'a');
+            }
+        }
+
+        return lower;
+    }
+
+    // The first SM 6.9 capability the device lacks, or null when it has them all.
+    const char* MissingShaderModel69Capability(const PathTraceLibraryCapabilities& capabilities)
+    {
+        if(!capabilities.rayTracing)
+        {
+            return "DXR unavailable";
+        }
+
+        if(!capabilities.shaderModel69)
+        {
+            return "Shader Model 6.9 unsupported";
+        }
+
+        return nullptr;
+    }
+
+    // The first SER capability the device lacks, or null when it has them all.
+    const char* MissingSERCapability(const PathTraceLibraryCapabilities& capabilities)
+    {
+        if(const char* missing = MissingShaderModel69Capability(capabilities))
+        {
+            return missing;
+        }
+
+        if(!capabilities.rayTracingTier12)
+        {
+            return "DXR tier 1.2 unsupported";
+        }
+
+        if(!capabilities.serActuallyReorders)
+        {
+            return "shader execution reordering does not actually reorder on this device";
+        }
+
+        return nullptr;
+    }
+}
+
+PathTraceLibrarySelection SelectPathTraceLibraryVariant(
+    std::string_view libraryOverride,
+    const PathTraceLibraryCapabilities& capabilities)
+{
+    std::string requested = LowerCase(libraryOverride);
+    PathTraceLibrarySelection selection{};
+
+    if(capabilities.packagedRuntime)
+    {
+        selection.reason = "packaged runtime (only the SM 6.6 libraries are cooked)";
+        selection.warning = !requested.empty() && requested != "auto" && requested != "sm66";
+
+        if(selection.warning)
+        {
+            selection.reason += "; ENGINE_PATH_TRACE_LIBRARIES=" + std::string(libraryOverride) + " ignored";
+        }
+
+        return selection;
+    }
+
+    std::string prefix;
+
+    if(!requested.empty() && requested != "auto" && requested != "sm66" && requested != "sm69" && requested != "ser")
+    {
+        prefix = "invalid ENGINE_PATH_TRACE_LIBRARIES value '" + std::string(libraryOverride) + "', using auto; ";
+        selection.warning = true;
+        requested = "auto";
+    }
+
+    if(requested == "sm66")
+    {
+        selection.reason = prefix + "ENGINE_PATH_TRACE_LIBRARIES=sm66";
+        return selection;
+    }
+
+    if(requested == "sm69")
+    {
+        if(const char* missing = MissingShaderModel69Capability(capabilities))
+        {
+            selection.reason = prefix + "ENGINE_PATH_TRACE_LIBRARIES=sm69 unavailable (" + missing +
+                "); falling back to SM 6.6";
+            selection.warning = true;
+            return selection;
+        }
+
+        selection.variant = PathTraceLibraryVariant::SM69;
+        selection.reason = prefix + "ENGINE_PATH_TRACE_LIBRARIES=sm69 (diagnostic, no SER)";
+        return selection;
+    }
+
+    const char* missingSER = MissingSERCapability(capabilities);
+
+    if(requested == "ser")
+    {
+        if(missingSER)
+        {
+            selection.reason = prefix + "ENGINE_PATH_TRACE_LIBRARIES=ser unavailable (" + missingSER +
+                "); falling back to SM 6.6";
+            selection.warning = true;
+            return selection;
+        }
+
+        selection.variant = PathTraceLibraryVariant::SM69SER;
+        selection.reason = prefix + "ENGINE_PATH_TRACE_LIBRARIES=ser";
+        return selection;
+    }
+
+    if(missingSER)
+    {
+        selection.reason = prefix + "automatic: SER unavailable (" + missingSER + ")";
+        return selection;
+    }
+
+    selection.variant = PathTraceLibraryVariant::SM69SER;
+    selection.reason = prefix + "automatic: Shader Model 6.9, DXR tier 1.2 and reordering supported";
+    return selection;
 }
