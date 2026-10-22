@@ -13,10 +13,10 @@
 #include "PathTracePrimarySurface.hlsli"
 #include "RayTracingInstanceData.hlsli"
 
-// RTXPT.3: PathTraceReSTIRDI.hlsl compiles this file with PATH_TRACE_RESTIR_DI_LIBRARY defined, for the
-// raster-primary ReSTIR DI pipeline alone. Every RTXDI addition below is inside that specialization, so this
-// library (the reference, raster-primary and pixel-centre pipelines) compiles exactly as before and does not
-// depend on the RTXDI SDK headers.
+// RTXPT.3: PathTraceReSTIRDI.hlsl compiles this file with PATH_TRACE_RESTIR_DI_LIBRARY defined, for the ReSTIR DI
+// direct pass. Every RTXDI addition below is inside that specialization, so this library (the reference,
+// raster-primary, pixel-centre and ReSTIR DI indirect pipelines) contains no RTXDI code and does not depend on the
+// RTXDI SDK headers.
 #ifdef PATH_TRACE_RESTIR_DI_LIBRARY
 // RTXDI types for constants b2 and the application bridge. RTXDI presampling is not used.
 #define RTXDI_ENABLE_PRESAMPLING 0
@@ -92,7 +92,9 @@ cbuffer PathTraceConstants : register(b0)
     uint gBufferMaterialIndex;
     uint gBufferSurfaceIndex;
     uint gBufferGeometricNormalIndex;
-    uint rasterPrimaryPadding;
+    // RTXPT.3 ReSTIR DI: the raw UAV of the per-sample vertex-0 direct radiance, written by
+    // PathTraceReSTIRDISplitDirectRayGeneration and read by PathTraceReSTIRDISplitIndirectRayGeneration.
+    uint splitDirectRadianceIndex;
 };
 
 cbuffer SceneLightConstants : register(b1)
@@ -106,7 +108,7 @@ cbuffer SceneLightConstants : register(b1)
 // RTXDI light records, two per register: RtxdiLightSet::Capacity / 2.
 #define RTXDI_LIGHT_RECORD_REGISTERS 33
 
-// RTXPT.3, read only by PathTraceRasterPrimaryReSTIRDIRayGeneration, whose pipeline alone binds b2.
+// RTXPT.3, read only by PathTraceReSTIRDISplitDirectRayGeneration, whose pipeline alone binds b2.
 // Identical layout to PathTraceRtxdiConstants (RtxdiShaderData.h).
 cbuffer RtxdiConstants : register(b2)
 {
@@ -563,11 +565,37 @@ void PathTraceTraceRadianceReordered(RayDesc ray, uint instanceMask, bool reorde
 static const uint PATH_TRACE_PRIMARY_CAMERA = 0u;
 static const uint PATH_TRACE_PRIMARY_PIXEL_CENTER = 1u;
 static const uint PATH_TRACE_PRIMARY_RASTER = 2u;
-// RTXPT.3: the raster primary with vertex-0 direct light from RTXDI initial sampling.
-static const uint PATH_TRACE_PRIMARY_RASTER_RESTIR_DI = 3u;
+// RTXPT.3 ReSTIR DI indirect pass: the raster primary whose vertex-0 direct light is the RTXDI estimate the ReSTIR
+// DI direct pass stored for this pixel and sample. (3 was the retired fused ReSTIR DI primary.)
+static const uint PATH_TRACE_PRIMARY_RASTER_SPLIT_INDIRECT = 4u;
+
+// -----------------------------------------------------------------------------
+// RTXPT.3 ReSTIR DI: per-sample vertex-0 direct radiance, three floats per pixel and sample, sample-major. The
+// direct pass writes every active pixel's slots before the indirect pass reads them.
+// -----------------------------------------------------------------------------
+
+static uint2 g_splitPixel;
+static uint g_splitSampleOffset;
+
+uint PathTraceSplitDirectRadianceAddress(uint2 pixel, uint sampleOffset)
+{
+    uint element = (sampleOffset * resolution.y + pixel.y) * resolution.x + pixel.x;
+    return element * 12u;
+}
+
+// The indirect pass's vertex-0 direct light. The six randoms PathTraceDirectLighting would draw are drawn and
+// discarded, so every later random number of the path matches the raster-primary mode's.
+float3 PathTraceSplitDirectLighting(inout PathTraceRandom random)
+{
+    PathTraceNextFloat2(random);
+    PathTraceNextFloat4(random);
+
+    RWByteAddressBuffer directRadiance = ResourceDescriptorHeap[splitDirectRadianceIndex];
+    return asfloat(directRadiance.Load3(PathTraceSplitDirectRadianceAddress(g_splitPixel, g_splitSampleOffset)));
+}
 
 #ifdef PATH_TRACE_RESTIR_DI_LIBRARY
-// RTXPT.3 ReSTIR DI variant: per-path-sample RTXDI inputs, set by its ray generation before each sample.
+// RTXPT.3 ReSTIR DI direct pass: per-path-sample RTXDI inputs, set by its ray generation before each sample.
 static uint2 g_rtxdiPixel;
 static uint g_rtxdiSampleSeed;
 // Sample 0 stores its final reservoir in the SDK's output array for this frame (shadingInputBufferIndex, which
@@ -652,9 +680,9 @@ Buffer<float2> RtxdiNeighborOffsets()
 
 // RTXPT.3 Gate 1: vertex-0 direct light from one RTXDI reservoir, with MIS weight 1: a fresh initial reservoir,
 // then (R3.5/R3.6) fused spatiotemporal reuse of the previous frame's reservoirs when history is valid. The
-// estimate is F(y) * V(y) * W (RtxdiApplicationBridge.hlsli); the continuation's non-delta misses then add no
-// sun or HDRI radiance. The six randoms PathTraceDirectLighting would draw are drawn and discarded, so every
-// later random number of the path matches the raster-primary mode's.
+// estimate is F(y) * V(y) * W (RtxdiApplicationBridge.hlsli); the indirect pass's non-delta continuation misses
+// then add no sun or HDRI radiance. The six randoms PathTraceDirectLighting would draw are drawn and discarded,
+// matching PathTraceSplitDirectLighting.
 float3 PathTraceRtxdiDirectLighting(PathTraceSurface surface, float3 position, inout PathTraceRandom random,
     inout uint rayCount)
 {
@@ -812,7 +840,7 @@ float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex 
         float3 position;
         PathTraceSurface surface;
 
-        if(primary == PATH_TRACE_PRIMARY_RASTER || primary == PATH_TRACE_PRIMARY_RASTER_RESTIR_DI)
+        if(primary == PATH_TRACE_PRIMARY_RASTER || primary == PATH_TRACE_PRIMARY_RASTER_SPLIT_INDIRECT)
         {
             // RTXPT.2 R3-F: every lane executes this one TraceRay call at every vertex. Lanes of a warp run
             // different samples at different vertices; a call skipped by some of them (the G-buffer vertex)
@@ -860,8 +888,9 @@ float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex 
                 {
                     // RTXPT.3 Gate 1: after a ReSTIR DI vertex 0, RTXDI alone estimated the sun and HDRI through
                     // the non-delta lobes, so a non-delta continuation that misses adds nothing. A delta-lobe
-                    // continuation keeps its full radiance, as no light sample can produce it.
-                    bool directFromRtxdi = primary == PATH_TRACE_PRIMARY_RASTER_RESTIR_DI && vertex == 1u &&
+                    // continuation keeps its full radiance, as no light sample can produce it. The indirect pass's
+                    // vertex 0 is that RTXDI estimate, made by the direct pass.
+                    bool directFromRtxdi = primary == PATH_TRACE_PRIMARY_RASTER_SPLIT_INDIRECT && vertex == 1u &&
                         !previousDelta;
 
                     if(!directFromRtxdi)
@@ -933,18 +962,14 @@ float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex 
 
         if(hasNonDeltaLobe)
         {
-#ifdef PATH_TRACE_RESTIR_DI_LIBRARY
-            if(primary == PATH_TRACE_PRIMARY_RASTER_RESTIR_DI && vertex == 0u)
+            if(primary == PATH_TRACE_PRIMARY_RASTER_SPLIT_INDIRECT && vertex == 0u)
             {
-                radiance += throughput * PathTraceRtxdiDirectLighting(surface, position, random, rayCount);
+                radiance += throughput * PathTraceSplitDirectLighting(random);
             }
             else
             {
                 radiance += throughput * PathTraceDirectLighting(surface, position, random, rayCount);
             }
-#else
-            radiance += throughput * PathTraceDirectLighting(surface, position, random, rayCount);
-#endif
         }
 
         PathTraceBSDFSample bsdfSample = PathTraceSampleBSDF(surface, PathTraceNextFloat3(random));
@@ -1030,9 +1055,8 @@ float3 PathTraceRasterPrimaryRadiance(PathTraceRasterFirstVertex rasterFirstVert
     return PathTraceTracePath(emptyRay, PATH_TRACE_PRIMARY_RASTER, rasterFirstVertex, random, rayCount);
 }
 
-#ifdef PATH_TRACE_RESTIR_DI_LIBRARY
-// RTXPT.3: the raster primary above, with vertex-0 direct light from RTXDI.
-float3 PathTraceRasterReSTIRDIRadiance(PathTraceRasterFirstVertex rasterFirstVertex, inout PathTraceRandom random,
+// RTXPT.3 ReSTIR DI indirect pass: the raster primary above, with vertex-0 direct light read from the direct pass.
+float3 PathTraceRasterSplitIndirectRadiance(PathTraceRasterFirstVertex rasterFirstVertex, inout PathTraceRandom random,
     inout uint rayCount)
 {
     PathTraceNextFloat2(random);
@@ -1042,9 +1066,8 @@ float3 PathTraceRasterReSTIRDIRadiance(PathTraceRasterFirstVertex rasterFirstVer
     emptyRay.Direction = float3(0.0f, 0.0f, 1.0f);
     emptyRay.TMin = 0.0f;
     emptyRay.TMax = 0.0f;
-    return PathTraceTracePath(emptyRay, PATH_TRACE_PRIMARY_RASTER_RESTIR_DI, rasterFirstVertex, random, rayCount);
+    return PathTraceTracePath(emptyRay, PATH_TRACE_PRIMARY_RASTER_SPLIT_INDIRECT, rasterFirstVertex, random, rayCount);
 }
-#endif
 
 void PathTraceAddStatistic64(uint lowIndex, uint value)
 {
@@ -1060,12 +1083,10 @@ void PathTraceAddStatistic64(uint lowIndex, uint value)
 float3 PathTracePrimaryRadiance(uint primary, uint2 pixel, PathTraceRasterFirstVertex rasterFirstVertex,
     inout PathTraceRandom random, inout uint rayCount)
 {
-#ifdef PATH_TRACE_RESTIR_DI_LIBRARY
-    if(primary == PATH_TRACE_PRIMARY_RASTER_RESTIR_DI)
+    if(primary == PATH_TRACE_PRIMARY_RASTER_SPLIT_INDIRECT)
     {
-        return PathTraceRasterReSTIRDIRadiance(rasterFirstVertex, random, rayCount);
+        return PathTraceRasterSplitIndirectRadiance(rasterFirstVertex, random, rayCount);
     }
-#endif
 
     if(primary == PATH_TRACE_PRIMARY_RASTER)
     {
@@ -1095,33 +1116,24 @@ void PathTraceRunRayGeneration(uint primary)
         // The raster primary's first vertex is decoded once for all of this pixel's samples.
         PathTraceRasterFirstVertex rasterFirstVertex = (PathTraceRasterFirstVertex)0;
 
-        if(primary == PATH_TRACE_PRIMARY_RASTER || primary == PATH_TRACE_PRIMARY_RASTER_RESTIR_DI)
+        if(primary == PATH_TRACE_PRIMARY_RASTER || primary == PATH_TRACE_PRIMARY_RASTER_SPLIT_INDIRECT)
         {
             rasterFirstVertex = PathTraceDecodeRasterFirstVertex(pixel);
         }
 
-#ifdef PATH_TRACE_RESTIR_DI_LIBRARY
-        if(primary == PATH_TRACE_PRIMARY_RASTER_RESTIR_DI)
+        if(primary == PATH_TRACE_PRIMARY_RASTER_SPLIT_INDIRECT)
         {
-            g_rtxdiPixel = pixel;
-            g_rtxdiReservoirStored = false;
+            g_splitPixel = pixel;
         }
-#endif
 
         for(uint sampleOffset = 0u; sampleOffset < samplesPerFrame; ++sampleOffset)
         {
             PathTraceRandom random = PathTraceCreateRandom(pixel, accumulatedSamples + sampleOffset);
 
-#ifdef PATH_TRACE_RESTIR_DI_LIBRARY
-            // RTXPT.3: an independent RTXDI random sequence per path sample (the progressive mean averages
-            // independent estimates).
-            if(primary == PATH_TRACE_PRIMARY_RASTER_RESTIR_DI)
+            if(primary == PATH_TRACE_PRIMARY_RASTER_SPLIT_INDIRECT)
             {
-                g_rtxdiSampleSeed = PathTraceHash((accumulatedSamples + sampleOffset) ^ PathTraceHash(randomSeed ^
-                    0x52545844u));
-                g_rtxdiStoreReservoir = sampleOffset == 0u;
+                g_splitSampleOffset = sampleOffset;
             }
-#endif
 
             float3 sampleRadiance = PathTracePrimaryRadiance(primary, pixel, rasterFirstVertex, random, rayCount);
 
@@ -1135,16 +1147,6 @@ void PathTraceRunRayGeneration(uint primary)
             sampleSum += sampleRadiance;
             ++completedSamples;
         }
-
-#ifdef PATH_TRACE_RESTIR_DI_LIBRARY
-        // RTXPT.3: every active pixel writes its initial-sampling reservoir each dispatch; a pixel whose sample 0
-        // ran no RTXDI sampling (background, unusable sample, pure delta mirror) writes an empty one.
-        if(primary == PATH_TRACE_PRIMARY_RASTER_RESTIR_DI && !g_rtxdiReservoirStored)
-        {
-            RTXDI_StoreDIReservoir(RTXDI_EmptyDIReservoir(), rtxdiReservoirBuffer, pixel,
-                rtxdiBufferIndices.shadingInputBufferIndex);
-        }
-#endif
 
         float previousCount = float(accumulatedSamples);
         float totalCount = float(accumulatedSamples + samplesPerFrame);
@@ -1191,11 +1193,74 @@ void PathTraceRasterPrimaryRayGeneration()
 }
 
 #ifdef PATH_TRACE_RESTIR_DI_LIBRARY
-// RTXPT.3 raster-primary ReSTIR DI mode (PathTraceReSTIRDI.hlsl only).
+// RTXPT.3 ReSTIR DI direct pass (PathTraceReSTIRDI.hlsl only): the RTXDI work of vertex 0 for every sample of this
+// dispatch, initial sampling, sample 0's spatiotemporal reuse, visibility and reservoir publication, with no path
+// continuation. Each sample's estimate is stored for the indirect pass; samples whose path never reaches vertex-0
+// direct lighting store zero, and the indirect pass never reads them. Every active pixel writes its reservoir each
+// dispatch; a pixel whose sample 0 ran no RTXDI sampling (background, unusable sample, pure delta mirror) writes
+// an empty one. Only rays are counted here; the indirect pass counts samples.
 [shader("raygeneration")]
-void PathTraceRasterPrimaryReSTIRDIRayGeneration()
+void PathTraceReSTIRDISplitDirectRayGeneration()
 {
-    PathTraceRunRayGeneration(PATH_TRACE_PRIMARY_RASTER_RESTIR_DI);
+    uint2 pixel = DispatchRaysIndex().xy;
+    bool active = all(pixel < resolution);
+    uint rayCount = 0u;
+
+    if(active)
+    {
+        PathTraceRasterFirstVertex rasterFirstVertex = PathTraceDecodeRasterFirstVertex(pixel);
+
+        // The conditions under which PathTraceTracePath calls PathTraceRtxdiDirectLighting at vertex 0: a G-buffer
+        // surface, a path that continues past vertex 0, and a non-delta lobe.
+        bool hasNonDeltaLobe = !rasterFirstVertex.surface.deltaSpecular ||
+            rasterFirstVertex.surface.specularProbability < 1.0f;
+        bool directLighting = rasterFirstVertex.state > 0 && maxPathDepth > 0u && hasNonDeltaLobe;
+
+        g_rtxdiPixel = pixel;
+        g_rtxdiReservoirStored = false;
+        RWByteAddressBuffer directRadiance = ResourceDescriptorHeap[splitDirectRadianceIndex];
+
+        for(uint sampleOffset = 0u; sampleOffset < samplesPerFrame; ++sampleOffset)
+        {
+            g_rtxdiSampleSeed = PathTraceHash((accumulatedSamples + sampleOffset) ^ PathTraceHash(randomSeed ^
+                0x52545844u));
+            g_rtxdiStoreReservoir = sampleOffset == 0u;
+            float3 sampleDirect = float3(0.0f, 0.0f, 0.0f);
+
+            if(directLighting)
+            {
+                // RTXDI draws from its own sequence; the path randoms it discards are the indirect pass's.
+                PathTraceRandom discardedRandom = (PathTraceRandom)0;
+                sampleDirect = PathTraceRtxdiDirectLighting(rasterFirstVertex.surface, rasterFirstVertex.position,
+                    discardedRandom, rayCount);
+            }
+
+            directRadiance.Store3(PathTraceSplitDirectRadianceAddress(pixel, sampleOffset), asuint(sampleDirect));
+        }
+
+        if(!g_rtxdiReservoirStored)
+        {
+            RTXDI_StoreDIReservoir(RTXDI_EmptyDIReservoir(), rtxdiReservoirBuffer, pixel,
+                rtxdiBufferIndices.shadingInputBufferIndex);
+        }
+    }
+
+    uint waveRays = WaveActiveSum(rayCount);
+
+    if(WaveIsFirstLane())
+    {
+        PathTraceAddStatistic64(0u, waveRays);
+    }
+}
+#endif
+
+#ifndef PATH_TRACE_RESTIR_DI_LIBRARY
+// RTXPT.3 ReSTIR DI indirect pass (PathTraceReference.hlsl only, so its compiled code contains no RTXDI sampling or
+// reuse): the ReSTIR DI path after the direct pass. It accumulates and counts samples.
+[shader("raygeneration")]
+void PathTraceReSTIRDISplitIndirectRayGeneration()
+{
+    PathTraceRunRayGeneration(PATH_TRACE_PRIMARY_RASTER_SPLIT_INDIRECT);
 }
 #endif
 

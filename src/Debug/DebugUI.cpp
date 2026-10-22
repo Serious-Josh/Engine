@@ -662,6 +662,8 @@ void DebugUI::DrawPerformanceWindow(
 
             ImGui::TextUnformatted("Path traced reference");
             drawGpuTiming("  Path trace iteration", GpuTimestampProfiler::Region::PathTraceReference);
+            drawGpuTiming("    Split ReSTIR DI direct", GpuTimestampProfiler::Region::PathTraceSplitDirect);
+            drawGpuTiming("    Split ReSTIR DI indirect", GpuTimestampProfiler::Region::PathTraceSplitIndirect);
 
             ImGui::TextUnformatted("Global illumination");
             drawGpuTiming("  Ray-Traced GI", GpuTimestampProfiler::Region::RayTracedGI);

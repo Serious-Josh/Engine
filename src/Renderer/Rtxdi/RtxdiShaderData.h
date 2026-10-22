@@ -13,7 +13,7 @@
 inline constexpr std::uint32_t RtxdiInitialLocalLightSamples = 8;
 inline constexpr std::uint32_t RtxdiInitialInfiniteLightSamples = 4;
 
-// Root constant buffer b2 of PathTraceRasterPrimaryReSTIRDIRayGeneration only; identical layout to
+// Root constant buffer b2 of PathTraceReSTIRDISplitDirectRayGeneration only; identical layout to
 // RtxdiConstants in PathTraceReference.hlsl. Light records are packed two per uint4; the light translation
 // (current-to-previous entries, then previous-to-current entries) four per uint4.
 struct PathTraceRtxdiConstants

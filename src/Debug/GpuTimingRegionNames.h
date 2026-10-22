@@ -26,5 +26,7 @@ inline constexpr const char* GpuTimingRegionNames[] = {"GPU frame",
                                                        "DebugUI rendering",
                                                        "GI spatial denoise",
                                                        "NRD REBLUR Diffuse",
-                                                       "Path trace reference"};
+                                                       "Path trace reference",
+                                                       "Path trace split direct",
+                                                       "Path trace split indirect"};
 static_assert(sizeof(GpuTimingRegionNames) / sizeof(GpuTimingRegionNames[0]) == GpuTimingMonitor::RegionCount);

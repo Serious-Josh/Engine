@@ -34,6 +34,10 @@ class GpuTimestampProfiler
         GISpatialDenoise,
         NrdReblurDiffuse,
         PathTraceReference,
+        // RTXPT.3 ReSTIR DI: each split dispatch, nested inside PathTraceReference, which
+        // also spans the barrier between them.
+        PathTraceSplitDirect,
+        PathTraceSplitIndirect,
         Count
     };
 

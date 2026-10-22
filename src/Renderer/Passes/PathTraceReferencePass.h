@@ -1,5 +1,7 @@
 #pragma once
 
+#include "Renderer/Buffer.h"
+#include "Renderer/GpuTimestampProfiler.h"
 #include "Renderer/Texture.h"
 
 #include "Renderer/RayTracing/RayTracingPipeline.h"
@@ -65,7 +67,8 @@ PathTraceLibrarySelection SelectPathTraceLibraryVariant(
 // RTXPT.1 progressive reference path tracer. Owns one DXR pipeline per primary constructor (the same
 // library, compiled once, a different ray-generation export) and three renderer-lifetime resources: the RGBA32F running
 // mean, an RGBA16F copy of it for presentation, and an R32_UINT statistics row. Every primary shares the
-// resources. The Renderer owns scheduling, accumulation counts, resets and submission.
+// resources. RTXPT.3 ReSTIR DI adds the split direct and indirect pipelines and their direct radiance buffer,
+// created on first use. The Renderer owns scheduling, accumulation counts, resets and submission.
 class PathTraceReferencePass
 {
     public:
@@ -123,14 +126,19 @@ class PathTraceReferencePass
         return m_initialized;
     }
 
+    // RTXPT.3: for PathTracePrimary::RasterReSTIRDI, the split pipeline pair (EnsurePrimaryPipeline creates it).
     bool IsPrimaryReady(PathTracePrimary primary) const
     {
+        if(primary == PathTracePrimary::RasterReSTIRDI)
+        {
+            return IsReSTIRDISplitReady();
+        }
+
         return m_initialized && m_pipelineReady[static_cast<size_t>(primary)];
     }
 
-    // Records nothing unless the primary's pipeline exists (Initialize, or EnsurePrimaryPipeline).
-    // rtxdiConstantsAddress (root b2) is bound only for PathTracePrimary::RasterReSTIRDI, whose pipeline alone
-    // has that parameter; it must then be non-zero.
+    // Records nothing unless the primary's pipeline exists (Initialize, or EnsurePrimaryPipeline), and never for
+    // PathTracePrimary::RasterReSTIRDI, which records through ExecuteReSTIRDISplit.
     void Execute(
         PathTracePrimary primary,
         ID3D12GraphicsCommandList4* commandList,
@@ -139,8 +147,49 @@ class PathTraceReferencePass
         D3D12_GPU_VIRTUAL_ADDRESS constantsAddress,
         D3D12_GPU_VIRTUAL_ADDRESS sceneLightConstantsAddress,
         unsigned int width,
+        unsigned int height);
+
+    // RTXPT.3 split ReSTIR DI: the direct-pass pipeline (from the ReSTIR DI library) and the indirect-pass
+    // pipeline (from the reference library), together PathTracePrimary::RasterReSTIRDI. Created on first use; a
+    // failure stays until a new revision of either library is accepted.
+    bool EnsureReSTIRDISplitPipelines(
+        GraphicsDevice& graphicsDevice,
+        ShaderLibrary& shaderLibrary,
+        std::string& failureReason);
+
+    bool IsReSTIRDISplitReady() const
+    {
+        return m_initialized && m_splitPipelinesReady;
+    }
+
+    // The per-sample vertex-0 direct radiance the split passes exchange, holding samplesPerFrame samples per pixel.
+    // Allocated on first use and replaced only when samplesPerFrame changes. A replaced buffer and its descriptor are
+    // retired, not released: they stay alive until completedFence reaches lastSubmissionFence (the last submission
+    // that may read them; the current recording does not). Returns the raw UAV index, or UINT_MAX when the buffer
+    // cannot be allocated or addressed (the shader addresses it with 32-bit byte offsets). Creation only: no GPU
+    // work is recorded, so allocating during recording is safe.
+    unsigned int EnsureSplitDirectRadiance(
+        ID3D12Device* device,
+        DescriptorHeap& descriptorHeap,
+        std::uint32_t samplesPerFrame,
+        std::uint64_t lastSubmissionFence,
+        std::uint64_t completedFence);
+
+    // Records the split ReSTIR DI frame: the direct pass, a UAV barrier on the direct radiance, then the indirect
+    // pass. Records nothing unless both split pipelines and the direct radiance exist. The bindings are those of
+    // Execute, plus the RTXDI constants (root b2) for the direct pass; constantsAddress must name the direct
+    // radiance UAV. Each dispatch is timed in its own profiler region (PathTraceSplitDirect, PathTraceSplitIndirect).
+    void ExecuteReSTIRDISplit(
+        ID3D12GraphicsCommandList4* commandList,
+        GpuTimestampProfiler& profiler,
+        unsigned int frameIndex,
+        DescriptorHeap& descriptorHeap,
+        const RayTracingSceneResources& rayTracingScene,
+        D3D12_GPU_VIRTUAL_ADDRESS constantsAddress,
+        D3D12_GPU_VIRTUAL_ADDRESS sceneLightConstantsAddress,
+        unsigned int width,
         unsigned int height,
-        D3D12_GPU_VIRTUAL_ADDRESS rtxdiConstantsAddress = 0);
+        D3D12_GPU_VIRTUAL_ADDRESS rtxdiConstantsAddress);
 
     // Copies the presentation image into the HDR scene colour consumed by tone mapping. Both are
     // RGBA16F at the scene extent; the caller checks that before recording.
@@ -218,6 +267,28 @@ class PathTraceReferencePass
     bool m_pipelineReady[PrimaryCount]{};
     bool m_pipelineFailed[PrimaryCount]{};
     std::string m_pipelineFailure[PrimaryCount];
+
+    // RTXPT.3 split ReSTIR DI.
+    RayTracingPipeline m_splitDirectPipeline;
+    RayTracingPipeline m_splitIndirectPipeline;
+    bool m_splitPipelinesReady = false;
+    bool m_splitPipelinesFailed = false;
+    std::string m_splitPipelineFailure;
+    Buffer m_splitDirectRadiance;
+    std::uint32_t m_splitDirectRadianceSamples = 0;
+    std::uint32_t m_splitDirectRadianceFailedSamples = 0;
+
+    // Replaced direct radiance buffers, kept until the GPU completes submissionFence.
+    struct RetiredBuffer
+    {
+        Buffer buffer;
+        std::uint64_t submissionFence = 0;
+    };
+
+    std::vector<RetiredBuffer> m_retiredSplitDirectRadiance;
+
+    // Releases the direct radiance buffer and every retired one. Caller guarantees the queue is idle.
+    void ReleaseSplitDirectRadiance();
 
     unsigned int m_width = 0;
     unsigned int m_height = 0;

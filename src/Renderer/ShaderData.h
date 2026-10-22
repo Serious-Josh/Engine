@@ -167,7 +167,9 @@ struct PathTraceReferenceConstants
     std::uint32_t gBufferMaterialIndex = 0;
     std::uint32_t gBufferSurfaceIndex = 0;
     std::uint32_t gBufferGeometricNormalIndex = 0;
-    std::uint32_t rasterPrimaryPadding = 0;
+    // RTXPT.3 ReSTIR DI: the per-sample vertex-0 direct radiance raw UAV. Read only by the
+    // split direct and indirect entry points.
+    std::uint32_t splitDirectRadianceIndex = 0;
 };
 
 static_assert(sizeof(PathTraceReferenceConstants) == 64 + 7 * 16 + 64 + 2 * 16);

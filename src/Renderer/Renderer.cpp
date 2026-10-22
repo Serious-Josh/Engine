@@ -4969,6 +4969,22 @@ bool Renderer::RecordPathTraceReference(
             m_gBuffer.GetGeometricNormal().Transition(commandList, shaderReadState);
         }
 
+        // RTXPT.3: the per-sample direct radiance the ReSTIR DI passes exchange, sized for the configured samples
+        // per frame (every frame of a configuration records at most that many). Nothing is recorded without it.
+        const bool splitReSTIRDI = primary == PathTracePrimary::RasterReSTIRDI;
+
+        if(splitReSTIRDI)
+        {
+            constants.splitDirectRadianceIndex = m_pathTraceReferencePass.EnsureSplitDirectRadiance(
+                m_graphicsDevice.GetDevice(), m_resourceDescriptorHeap, settings.samplesPerFrame,
+                m_commandContext.GetLastSubmissionFenceValue(), m_commandContext.GetCompletedFenceValue());
+
+            if(constants.splitDirectRadianceIndex == UINT_MAX)
+            {
+                return false;
+            }
+        }
+
         const D3D12_GPU_VIRTUAL_ADDRESS constantsAddress = m_uploadBuffer.Allocate(
             &constants, sizeof(PathTraceReferenceConstants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
 
@@ -4994,9 +5010,20 @@ bool Renderer::RecordPathTraceReference(
         }
 
         m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::PathTraceReference);
-        m_pathTraceReferencePass.Execute(primary, m_commandContext.GetRayTracingCommandList(), m_resourceDescriptorHeap,
-            m_rayTracingScene, constantsAddress, sceneLightConstantsAddress, m_sceneWidth, m_sceneHeight,
-            rtxdiConstantsAddress);
+
+        if(splitReSTIRDI)
+        {
+            m_pathTraceReferencePass.ExecuteReSTIRDISplit(m_commandContext.GetRayTracingCommandList(),
+                m_gpuTimestampProfiler, frameIndex, m_resourceDescriptorHeap, m_rayTracingScene, constantsAddress,
+                sceneLightConstantsAddress, m_sceneWidth, m_sceneHeight, rtxdiConstantsAddress);
+        }
+        else
+        {
+            m_pathTraceReferencePass.Execute(primary, m_commandContext.GetRayTracingCommandList(),
+                m_resourceDescriptorHeap, m_rayTracingScene, constantsAddress, sceneLightConstantsAddress, m_sceneWidth,
+                m_sceneHeight);
+        }
+
         m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::PathTraceReference);
 
         if(usesRtxdi)
