@@ -3497,6 +3497,10 @@ bool Renderer::ResizeSceneResources(
 
     m_pathTraceStatus.resourceBytes = m_pathTraceReferencePass.GetResourceBytes();
 
+    // RTXPT D.2B temporal history is sized for the old extent; the next temporal frame creates it again.
+    m_pathTraceTemporalPass.ReleaseHistory();
+    m_pathTraceSpatialPass.ReleaseIntermediate();
+
     // Recreated only if a PT mode already allocated it; a new extent also clears an earlier failure.
     InvalidatePreviousGBufferHistory();
     m_previousGBufferReadSlot = 0;
@@ -4336,6 +4340,7 @@ void Renderer::ResetSceneHistory()
     m_nrdFrameIndex = 0;
 
     m_pathTraceResetPending = true;
+    m_pathTraceSequenceOrigin = m_gpuProfilerFrameSerial;
     InvalidatePreviousGBufferHistory();
     m_rtxdiResources.InvalidateHistory();
 }
@@ -4580,6 +4585,10 @@ void Renderer::InvalidatePreviousGBufferHistory()
 {
     m_previousGBufferValid = false;
     m_pendingPreviousGBufferCopy.reset();
+
+    // RTXPT D.2B: temporal history is validated against the previous G-buffer, so it never outlives it (scene
+    // history resets, camera cuts, resize, failed frames, path-tracing entry and primary changes).
+    m_pathTraceTemporalPass.InvalidateHistory();
 }
 
 void Renderer::RecordPreviousGBufferCopy(ID3D12GraphicsCommandList* commandList, const PreviousGBufferCamera& camera)
@@ -4891,6 +4900,17 @@ bool Renderer::RecordPathTraceReference(
         m_pathTraceStatus.accumulatedSamples = 0;
         ++m_pathTraceStatus.accumulationResets;
         m_pathTraceResetPending = false;
+
+        // RTXPT D.1A: each run draws its own sequence. The serial advances only once a frame is submitted, so a
+        // recording that fails and is retried latches the same seed again.
+        if(m_pathTraceRandomSeed)
+        {
+            m_pathTraceRunSeed = *m_pathTraceRandomSeed;
+        }
+        else
+        {
+            m_pathTraceRunSeed = PathTraceSequenceSeed(m_gpuProfilerFrameSerial - m_pathTraceSequenceOrigin);
+        }
     }
 
     m_pathTraceAccumulationKey = key;
@@ -4906,6 +4926,13 @@ bool Renderer::RecordPathTraceReference(
     {
         m_rtxdiResources.InvalidateHistory();
     }
+
+    m_pathTraceExtractedLastFrame = false;
+    m_pathTraceTemporalRanLastFrame = false;
+    m_pathTraceSpatialRanLastFrame = false;
+    m_pathTraceSpatialRequested = false;
+    m_pathTraceScalarViewLastFrame = false;
+    m_pathTraceSpatialIterationsLastFrame = 0;
 
     // Stage 2: one progressive iteration. A converged image is held without tracing.
     if(frameSamples > 0)
@@ -4948,7 +4975,7 @@ bool Renderer::RecordPathTraceReference(
         constants.sunIrradiance[0] = sunIrradiance.x;
         constants.sunIrradiance[1] = sunIrradiance.y;
         constants.sunIrradiance[2] = sunIrradiance.z;
-        constants.randomSeed = m_pathTraceRandomSeed;
+        constants.randomSeed = m_pathTraceRunSeed;
 
         constants.inverseCameraRelativeViewProjection = CameraRelativeInverseViewProjection(view, projection);
         constants.cameraPosition[0] = cameraPosition.x;
@@ -4985,6 +5012,39 @@ bool Renderer::RecordPathTraceReference(
             }
         }
 
+        // RTXPT D.1B.2: diagnostics-requested signal extraction records the extraction exports, which accumulate
+        // exactly as the production ones. Anything it cannot create leaves the frame on the production exports.
+        bool extract = false;
+
+        if(m_pathTraceSignalExtraction &&
+            (primary == PathTracePrimary::Raster || primary == PathTracePrimary::RasterReSTIRDI))
+        {
+            std::string extractionFailure;
+            extract = m_pathTraceReferencePass.EnsureSignalExtraction(m_graphicsDevice, m_shaderLibrary,
+                m_resourceDescriptorHeap, primary, extractionFailure);
+
+            if(extract && splitReSTIRDI)
+            {
+                constants.splitDirectDiffuseIndex = m_pathTraceReferencePass.EnsureSplitDirectDiffuse(
+                    m_graphicsDevice.GetDevice(), m_resourceDescriptorHeap, settings.samplesPerFrame,
+                    m_commandContext.GetLastSubmissionFenceValue(), m_commandContext.GetCompletedFenceValue());
+                extract = constants.splitDirectDiffuseIndex != UINT_MAX;
+                extractionFailure = extract ? "" : "The split direct diffuse radiance could not be allocated.";
+            }
+
+            if(extract)
+            {
+                constants.diffuseOutputIndex = m_pathTraceReferencePass.GetDiffuseTexture().GetUAVIndex();
+                constants.specularOutputIndex = m_pathTraceReferencePass.GetSpecularTexture().GetUAVIndex();
+            }
+            else
+            {
+                Log::Error("Path tracing signal extraction is unavailable: " + extractionFailure);
+            }
+        }
+
+        m_pathTraceExtractedLastFrame = extract;
+
         const D3D12_GPU_VIRTUAL_ADDRESS constantsAddress = m_uploadBuffer.Allocate(
             &constants, sizeof(PathTraceReferenceConstants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
 
@@ -5015,16 +5075,40 @@ bool Renderer::RecordPathTraceReference(
         {
             m_pathTraceReferencePass.ExecuteReSTIRDISplit(m_commandContext.GetRayTracingCommandList(),
                 m_gpuTimestampProfiler, frameIndex, m_resourceDescriptorHeap, m_rayTracingScene, constantsAddress,
-                sceneLightConstantsAddress, m_sceneWidth, m_sceneHeight, rtxdiConstantsAddress);
+                sceneLightConstantsAddress, m_sceneWidth, m_sceneHeight, rtxdiConstantsAddress, extract);
         }
         else
         {
             m_pathTraceReferencePass.Execute(primary, m_commandContext.GetRayTracingCommandList(),
                 m_resourceDescriptorHeap, m_rayTracingScene, constantsAddress, sceneLightConstantsAddress, m_sceneWidth,
-                m_sceneHeight);
+                m_sceneHeight, extract);
+        }
+
+        // RTXPT D.2B: temporal reconstruction consumes this frame's extraction outputs, so it runs only on frames
+        // that extracted, before the presentation copy below. It is timed inside the path-tracing region, which
+        // therefore includes it in temporal frames (diagnostics only; without it the region is unchanged).
+        if(m_pathTraceTemporal && m_pathTraceExtractedLastFrame)
+        {
+            // RTXPT D.3B: decided first, because the spatial pass replaces the temporal pass's own presentation. A
+            // D.3B.0 diagnostic view also runs it, for display only.
+            m_pathTraceVisualization = m_debugUI.GetPathTraceDenoiserVisualization();
+            const bool diagnosticView = m_pathTraceVisualization.view != PathTraceDenoiserView::Normal;
+            m_pathTraceSpatialRequested = (m_pathTraceSpatial || diagnosticView) &&
+                m_pathTraceSpatialPass.Initialize(m_graphicsDevice, m_shaderLibrary);
+            m_pathTraceTemporalRanLastFrame = RecordPathTraceTemporal(commandList, primary, view, projection,
+                cameraPosition, frameLighting, settings);
         }
 
         m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::PathTraceReference);
+
+        if(m_pathTraceSpatialRequested && m_pathTraceTemporalRanLastFrame)
+        {
+            m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::PathTraceSpatial);
+            RecordPathTraceSpatial(commandList, view, projection, m_pathTraceVisualization);
+            m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::PathTraceSpatial);
+            m_pathTraceSpatialRanLastFrame = true;
+            m_pathTraceScalarViewLastFrame = IsScalarPathTraceDenoiserView(m_pathTraceVisualization.view);
+        }
 
         if(usesRtxdi)
         {
@@ -5036,11 +5120,200 @@ bool Renderer::RecordPathTraceReference(
         }
     }
 
+    // A path-tracing frame without temporal processing (disabled, no extraction, a held converged image or a
+    // failure above) breaks the chain of reprojected frames: the next temporal frame starts again.
+    if(!m_pathTraceTemporalRanLastFrame)
+    {
+        m_pathTraceTemporalPass.InvalidateHistory();
+    }
+
     m_pathTracePendingSamples = frameSamples;
 
     // Stage 3: present the running mean through the unchanged tone-map and overlay path.
     m_pathTraceReferencePass.CopyToSceneColor(commandList, m_sceneColor);
     return true;
+}
+
+bool Renderer::RecordPathTraceTemporal(
+    ID3D12GraphicsCommandList* commandList,
+    PathTracePrimary primary,
+    const Matrix4& view,
+    const Matrix4& projection,
+    const Vector3& cameraPosition,
+    const FrameLighting& frameLighting,
+    const PathTraceReferenceSettings& settings)
+{
+    if(!m_pathTraceTemporalPass.Initialize(m_graphicsDevice, m_shaderLibrary) ||
+        !m_pathTraceTemporalPass.EnsureHistory(m_graphicsDevice.GetDevice(), m_resourceDescriptorHeap, m_sceneWidth,
+            m_sceneHeight))
+    {
+        return false;
+    }
+
+    // History built under other settings or lighting is not this frame's signal.
+    PathTraceTemporalKey key;
+    key.primary = primary;
+    key.samplesPerFrame = settings.samplesPerFrame;
+    key.maxPathDepth = settings.maxPathDepth;
+    key.russianRouletteDepth = settings.russianRouletteDepth;
+    key.sun = frameLighting.sun;
+    key.lights = frameLighting.table;
+
+    if(m_pathTraceTemporalKey)
+    {
+        const PathTraceTemporalKey& previous = *m_pathTraceTemporalKey;
+        bool sameLights = previous.lights.lightCount == key.lights.lightCount;
+
+        for(std::uint32_t index = 0; sameLights && index < key.lights.lightCount; ++index)
+        {
+            sameLights = previous.lights.lights[index] == key.lights.lights[index];
+        }
+
+        const bool sameSun = std::memcmp(&previous.sun.direction, &key.sun.direction, sizeof(Vector3)) == 0 &&
+            std::memcmp(&previous.sun.color, &key.sun.color, sizeof(Vector3)) == 0 &&
+            previous.sun.intensity == key.sun.intensity && previous.sun.angularRadius == key.sun.angularRadius;
+        const bool sameKey = previous.primary == key.primary && previous.samplesPerFrame == key.samplesPerFrame &&
+            previous.maxPathDepth == key.maxPathDepth && previous.russianRouletteDepth == key.russianRouletteDepth &&
+            sameSun && sameLights;
+
+        if(!sameKey)
+        {
+            m_pathTraceTemporalPass.InvalidateHistory();
+        }
+    }
+
+    m_pathTraceTemporalKey = key;
+
+    // Without the previous frame's surfaces no tap can be validated: this frame starts new history.
+    PreviousGBufferView previous;
+
+    if(!TryGetPreviousGBuffer(previous))
+    {
+        m_pathTraceTemporalPass.InvalidateHistory();
+    }
+
+    constexpr D3D12_RESOURCE_STATES shaderRead =
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    Texture& diffuse = m_pathTraceReferencePass.GetDiffuseTexture();
+    Texture& specular = m_pathTraceReferencePass.GetSpecularTexture();
+    diffuse.Transition(commandList, shaderRead);
+    specular.Transition(commandList, shaderRead);
+    m_gBuffer.GetDepth().Transition(commandList, shaderRead);
+    m_gBuffer.GetSurface().Transition(commandList, shaderRead);
+    m_gBuffer.GetGeometricNormal().Transition(commandList, shaderRead);
+    m_gBuffer.GetMaterial().Transition(commandList, shaderRead);
+    m_gBuffer.GetMotion().Transition(commandList, shaderRead);
+    m_pathTraceReferencePass.GetOutputTexture().Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+    PathTraceTemporalConstants constants{};
+    constants.inverseCameraRelativeViewProjection = CameraRelativeInverseViewProjection(view, projection);
+    // Linear depth along each camera's forward axis (row 2 of a left-handed view, as Matrix4::LookAt builds it).
+    constants.cameraForward[0] = view.m[2][0];
+    constants.cameraForward[1] = view.m[2][1];
+    constants.cameraForward[2] = view.m[2][2];
+    constants.currentDiffuseIndex = diffuse.GetDescriptorIndex();
+    constants.currentSpecularIndex = specular.GetDescriptorIndex();
+    constants.depthIndex = m_gBuffer.GetDepth().GetSRVIndex();
+    constants.surfaceIndex = m_gBuffer.GetSurface().GetSRVIndex();
+    constants.geometricNormalIndex = m_gBuffer.GetGeometricNormal().GetSRVIndex();
+    constants.materialIndex = m_gBuffer.GetMaterial().GetSRVIndex();
+    constants.motionIndex = m_gBuffer.GetMotion().GetSRVIndex();
+    constants.presentationIndex = m_pathTraceReferencePass.GetOutputTexture().GetUAVIndex();
+    constants.present = m_pathTraceTemporalPresentation && !m_pathTraceSpatialRequested ? 1u : 0u;
+
+    // With invalid history these are never read; the current frame's own G-buffer stands in.
+    const bool havePrevious = m_pathTraceTemporalPass.HasHistory();
+    const PreviousGBufferCamera previousCamera = havePrevious ? previous.camera :
+        PreviousGBufferCamera{view, projection, constants.inverseCameraRelativeViewProjection, cameraPosition};
+    constants.previousInverseCameraRelativeViewProjection = previousCamera.inverseCameraRelativeViewProjection;
+    constants.previousCameraForward[0] = previousCamera.view.m[2][0];
+    constants.previousCameraForward[1] = previousCamera.view.m[2][1];
+    constants.previousCameraForward[2] = previousCamera.view.m[2][2];
+    constants.previousCameraOffset[0] = previousCamera.position.x - cameraPosition.x;
+    constants.previousCameraOffset[1] = previousCamera.position.y - cameraPosition.y;
+    constants.previousCameraOffset[2] = previousCamera.position.z - cameraPosition.z;
+    constants.previousDepthIndex = havePrevious ? previous.depthIndex : m_gBuffer.GetDepth().GetSRVIndex();
+    constants.previousSurfaceIndex = havePrevious ? previous.surfaceIndex : m_gBuffer.GetSurface().GetSRVIndex();
+    constants.previousGeometricNormalIndex = havePrevious ? previous.geometricNormalIndex :
+        m_gBuffer.GetGeometricNormal().GetSRVIndex();
+
+    m_pathTraceTemporalPass.Execute(commandList, m_uploadBuffer, constants, m_sceneWidth, m_sceneHeight);
+    return true;
+}
+
+void Renderer::RecordPathTraceSpatial(ID3D12GraphicsCommandList* commandList, const Matrix4& view,
+    const Matrix4& projection, const PathTraceDenoiserVisualization& visualization)
+{
+    // RecordPathTraceTemporal left the G-buffer shader-readable and the presentation an unordered-access view, and
+    // the temporal pass left its outputs shader-readable; the transitions below are no-ops that state the contract.
+    constexpr D3D12_RESOURCE_STATES shaderRead =
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    Texture& diffuse = m_pathTraceTemporalPass.GetDiffuseOutput();
+    Texture& specular = m_pathTraceTemporalPass.GetSpecularOutput();
+    Texture& moments = m_pathTraceTemporalPass.GetMomentsOutput();
+    Texture& presentation = m_pathTraceReferencePass.GetOutputTexture();
+    Texture& rawDiffuse = m_pathTraceReferencePass.GetDiffuseTexture();
+    Texture& rawSpecular = m_pathTraceReferencePass.GetSpecularTexture();
+    diffuse.Transition(commandList, shaderRead);
+    rawDiffuse.Transition(commandList, shaderRead);
+    rawSpecular.Transition(commandList, shaderRead);
+    specular.Transition(commandList, shaderRead);
+    moments.Transition(commandList, shaderRead);
+    m_gBuffer.GetDepth().Transition(commandList, shaderRead);
+    m_gBuffer.GetSurface().Transition(commandList, shaderRead);
+    m_gBuffer.GetGeometricNormal().Transition(commandList, shaderRead);
+    m_gBuffer.GetMaterial().Transition(commandList, shaderRead);
+    presentation.Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+    // The path tracer wrote this frame's running mean to the presentation texture; order that write first.
+    D3D12_RESOURCE_BARRIER presentationBarrier{};
+    presentationBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    presentationBarrier.UAV.pResource = presentation.GetResource();
+    commandList->ResourceBarrier(1, &presentationBarrier);
+
+    PathTraceSpatialConstants constants{};
+    constants.inverseCameraRelativeViewProjection = CameraRelativeInverseViewProjection(view, projection);
+    constants.cameraForward[0] = view.m[2][0];
+    constants.cameraForward[1] = view.m[2][1];
+    constants.cameraForward[2] = view.m[2][2];
+    constants.diffuseIndex = diffuse.GetDescriptorIndex();
+    constants.specularIndex = specular.GetDescriptorIndex();
+    constants.momentsIndex = moments.GetDescriptorIndex();
+    constants.depthIndex = m_gBuffer.GetDepth().GetSRVIndex();
+    constants.surfaceIndex = m_gBuffer.GetSurface().GetSRVIndex();
+    constants.geometricNormalIndex = m_gBuffer.GetGeometricNormal().GetSRVIndex();
+    constants.materialIndex = m_gBuffer.GetMaterial().GetSRVIndex();
+    constants.outputIndex = presentation.GetUAVIndex();
+    constants.visualizationMode = static_cast<std::uint32_t>(visualization.view);
+    constants.visualizationSignal = visualization.signal;
+    constants.exposureScale = std::exp2(visualization.exposureStops);
+    constants.differenceScale = visualization.differenceAmplification;
+    constants.uncertaintyFloorLog10 = visualization.uncertaintyFloorLog10;
+    constants.rawDiffuseIndex = rawDiffuse.GetDescriptorIndex();
+    constants.rawSpecularIndex = rawSpecular.GetDescriptorIndex();
+
+    // RTXPT D.3C.2: the a-trous iterations, for the normal presentation and for the views of the final spatial value
+    // (2 and 3); every other view reads temporal inputs only and keeps the 5x5 pass's diagnostic entry point. Without
+    // the pipelines or (two iterations) the intermediate, the 5x5 pass runs instead.
+    const std::uint32_t iterations = (std::min)(m_pathTraceSpatialIterations, 2u);
+    const bool atrousView = visualization.view == PathTraceDenoiserView::Normal ||
+        visualization.view == PathTraceDenoiserView::SpatialRadiance ||
+        visualization.view == PathTraceDenoiserView::Difference;
+    const bool atrous = iterations > 0u && atrousView &&
+        m_pathTraceSpatialPass.InitializeAtrous(m_graphicsDevice, m_shaderLibrary) &&
+        (iterations < 2u || m_pathTraceSpatialPass.EnsureIntermediate(m_graphicsDevice.GetDevice(),
+            m_resourceDescriptorHeap, m_sceneWidth, m_sceneHeight));
+
+    if(atrous)
+    {
+        m_pathTraceSpatialPass.ExecuteAtrous(commandList, m_uploadBuffer, constants, iterations, m_sceneWidth,
+            m_sceneHeight);
+        m_pathTraceSpatialIterationsLastFrame = iterations;
+        return;
+    }
+
+    m_pathTraceSpatialPass.Execute(commandList, m_uploadBuffer, constants, m_sceneWidth, m_sceneHeight);
+    m_pathTraceSpatialIterationsLastFrame = 0;
 }
 
 // --------------
@@ -6237,8 +6510,9 @@ bool Renderer::RecordRenderFrame(
         m_pathTraceResetPending = true;
     }
 
-    // A copy left from an earlier, unsubmitted recording never carries over.
+    // A copy left from an earlier, unsubmitted recording never carries over, nor does its temporal history write.
     m_pendingPreviousGBufferCopy.reset();
+    m_pathTraceTemporalPass.AbandonPendingHistory();
     m_previousGBufferAvailableThisFrame = false;
     m_rtxdiResources.AbandonFrame();
 
@@ -6937,8 +7211,11 @@ bool Renderer::RecordRenderFrame(
     // Final composition precedes collider lines and the distinct Editor/packaged presentation paths.
     m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::ToneMap);
 
-    // Legacy diagnostic views describe legacy passes; the reference image is always shown as is.
-    const ToneMapDebugView presentedDebugView = runPathTrace ? ToneMapDebugView::None : debugView;
+    // Legacy diagnostic views describe legacy passes; the reference image is always shown as is, except a D.3B.0 scalar
+    // denoiser view, whose colours are already display-encoded.
+    const ToneMapDebugView pathTraceDebugView = m_pathTraceScalarViewLastFrame ?
+        ToneMapDebugView::PathTraceDenoiserScalar : ToneMapDebugView::None;
+    const ToneMapDebugView presentedDebugView = runPathTrace ? pathTraceDebugView : debugView;
 
     m_finalSceneColor.Transition(commandList, D3D12_RESOURCE_STATE_RENDER_TARGET);
     m_toneMapPass.Execute(commandList, m_sceneColor, m_finalSceneColor.GetRTV(), debugTexture,
@@ -7129,8 +7406,10 @@ bool Renderer::RecordRenderFrame(
         return false;
     }
 
-    // The copy is now ordered on the queue ahead of every later frame; it becomes the previous frame.
+    // The copy is now ordered on the queue ahead of every later frame; it becomes the previous frame. So does the
+    // temporal history written by this frame (RTXPT D.2B), which is validated against that copy.
     CommitPreviousGBufferCopy();
+    m_pathTraceTemporalPass.CommitHistory();
     m_rtxdiResources.CommitFrame();
 
     // Capture the successful submission fence now; confirmation retains owners, not completion proof.
@@ -7318,6 +7597,8 @@ void Renderer::Shutdown()
     m_shaderCompileWorkerRunning = false;
     m_lightingModeTransition.Reset();
     m_pathTraceReferencePass.Shutdown();
+    m_pathTraceTemporalPass.Shutdown();
+    m_pathTraceSpatialPass.Shutdown();
     m_pathTraceStatus = {};
     InvalidatePreviousGBufferHistory();
     m_previousGBufferHistory.Shutdown();

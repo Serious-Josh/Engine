@@ -129,7 +129,8 @@ void ToneMapPass::Execute(
         debugView == ToneMapDebugView::MultiOrientationMinusSingleOrientation ||
         debugView == ToneMapDebugView::HDRIDirectIntegralMip0 ||
         debugView == ToneMapDebugView::HDRIDirectIntegralMip4 || debugView == ToneMapDebugView::HDRIDirectIntegralMip6 ||
-        debugView == ToneMapDebugView::ShadingNormalViewHorizon;
+        debugView == ToneMapDebugView::ShadingNormalViewHorizon ||
+        debugView == ToneMapDebugView::PathTraceDenoiserScalar;
     constants.debugView =
         (debugTexture || debugRenderTarget || lightingDebug) ? static_cast<unsigned int>(debugView) : 0;
     constants.nrdDenoisingRange = nrdDenoisingRange;

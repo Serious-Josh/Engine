@@ -319,9 +319,15 @@ float3 PathTraceEvaluateGGXSingleScatter(PathTraceSurface surface, float3 direct
     return distribution * geometry * fresnel / max(4.0f * normalDotLight * normalDotView, 1.0e-6f);
 }
 
-// Non-delta BSDF value f(l, v), without the cosine. Zero outside both hemispheres.
-float3 PathTraceEvaluateBSDF(PathTraceSurface surface, float3 direction)
+// Non-delta BSDF value f(l, v), without the cosine, and its diffuse lobe, the energy-compensated EON term. The rest
+// (GGX single scatter and multiple scatter) is the specular lobe. The total is the unchanged expression of
+// PathTraceEvaluateBSDF, so callers that discard diffuseValue compile exactly as before. A caller that uses it
+// gives the optimizer another use of the lobe's product, which can change how the total's multiply-adds are fused
+// (RTXPT D.1B.2 measured a few ulp in the extraction ray generations). Zero outside both hemispheres.
+float3 PathTraceEvaluateBSDFLobes(PathTraceSurface surface, float3 direction, out float3 diffuseValue)
 {
+    diffuseValue = float3(0.0f, 0.0f, 0.0f);
+
     if(!PathTraceDirectionAboveSurface(surface, direction))
     {
         return float3(0.0f, 0.0f, 0.0f);
@@ -342,7 +348,14 @@ float3 PathTraceEvaluateBSDF(PathTraceSurface surface, float3 direction)
     float3 diffuse = EvaluateEONDiffuse(PathTraceDiffuseAlbedo(surface), surface.material.roughness,
         surface.normal, direction, surface.view);
     float3 diffuseWeight = PathTraceDiffuseWeight(surface, normalDotLight);
+    diffuseValue = diffuseWeight * diffuse;
     return diffuseWeight * diffuse + singleScatter + multipleScatter;
+}
+
+float3 PathTraceEvaluateBSDF(PathTraceSurface surface, float3 direction)
+{
+    float3 diffuseValue;
+    return PathTraceEvaluateBSDFLobes(surface, direction, diffuseValue);
 }
 
 void PathTraceBuildFrame(float3 normal, out float3 tangent, out float3 bitangent)
@@ -440,8 +453,11 @@ float3 PathTraceSampleCosine(PathTraceSurface surface, float2 random)
     return normalize(local.x * tangent + local.y * bitangent + local.z * surface.normal);
 }
 
-// random.x selects the strategy; random.yz drive the chosen strategy.
-PathTraceBSDFSample PathTraceSampleBSDF(PathTraceSurface surface, float3 random)
+// random.x selects the strategy; random.yz drive the chosen strategy. Also returns, for signal extraction, the
+// diffuse share of the sample's weight (f_diffuse / f per channel, 0 where f is 0 and for a delta event, which is
+// wholly specular) and whether the specular strategy was selected.
+PathTraceBSDFSample PathTraceSampleBSDFLobes(PathTraceSurface surface, float3 random, out float3 diffuseShare,
+    out bool specularStrategy)
 {
     PathTraceBSDFSample result;
     result.valid = false;
@@ -449,8 +465,10 @@ PathTraceBSDFSample PathTraceSampleBSDF(PathTraceSurface surface, float3 random)
     result.direction = surface.normal;
     result.weight = float3(0.0f, 0.0f, 0.0f);
     result.pdf = 0.0f;
+    diffuseShare = float3(0.0f, 0.0f, 0.0f);
 
     bool chooseSpecular = random.x < surface.specularProbability;
+    specularStrategy = chooseSpecular;
 
     if(surface.deltaSpecular && chooseSpecular)
     {
@@ -490,10 +508,19 @@ PathTraceBSDFSample PathTraceSampleBSDF(PathTraceSurface surface, float3 random)
         return result;
     }
 
-    float3 value = PathTraceEvaluateBSDF(surface, result.direction);
+    float3 diffuseValue;
+    float3 value = PathTraceEvaluateBSDFLobes(surface, result.direction, diffuseValue);
     result.weight = value * dot(surface.normal, result.direction) / result.pdf;
     result.valid = all(isfinite(result.weight));
+    diffuseShare = select(value > 0.0f, saturate(diffuseValue / max(value, 1.0e-30f)), 0.0f);
     return result;
+}
+
+PathTraceBSDFSample PathTraceSampleBSDF(PathTraceSurface surface, float3 random)
+{
+    float3 diffuseShare;
+    bool specularStrategy;
+    return PathTraceSampleBSDFLobes(surface, random, diffuseShare, specularStrategy);
 }
 
 #endif

@@ -59,6 +59,8 @@
 #include "Passes/AOResolvePass.h"
 #include "Passes/NrdDiffuseResolvePass.h"
 #include "Passes/PathTraceReferencePass.h"
+#include "Passes/PathTraceSpatialPass.h"
+#include "Passes/PathTraceTemporalPass.h"
 #include "PreviousGBufferHistory.h"
 #include "Rtxdi/RtxdiResources.h"
 #include "MaterialTables/MaterialTableResources.h"
@@ -1165,6 +1167,10 @@ class Renderer
     // RTXPT.1 reference path tracer. Created lazily on the first frame that requests it, so Legacy
     // frames and packaged runtimes never allocate it; resized with the scene; released at shutdown.
     PathTraceReferencePass m_pathTraceReferencePass;
+    // RTXPT D.2B temporal reconstruction of the extracted signals (diagnostics only, created on first use).
+    PathTraceTemporalPass m_pathTraceTemporalPass;
+    // RTXPT D.3B spatial filtering of the temporal outputs (diagnostics only, created on first use; no textures).
+    PathTraceSpatialPass m_pathTraceSpatialPass;
     PathTraceReferenceStatus m_pathTraceStatus;
 
     // RTXPT.2 R4 previous-frame G-buffer, PT modes only (D4). Allocated on the first frame that renders
@@ -1239,7 +1245,62 @@ class Renderer
     };
 
     std::optional<PathTraceAccumulationKey> m_pathTraceAccumulationKey;
-    std::uint32_t m_pathTraceRandomSeed = 0;
+    // RTXPT D.1A: a fixed seed for every accumulation run (diagnostics only). Empty in production, where each run
+    // takes PathTraceSequenceSeed of its first frame's serial relative to m_pathTraceSequenceOrigin, so a moving
+    // camera, which restarts accumulation every frame, no longer repeats one random sequence.
+    std::optional<std::uint32_t> m_pathTraceRandomSeed;
+    // The seed of the current accumulation run, latched when accumulation restarts.
+    std::uint32_t m_pathTraceRunSeed = 0;
+    // m_gpuProfilerFrameSerial at the last ResetSceneHistory: the first run after a reset uses seed 0.
+    std::uint64_t m_pathTraceSequenceOrigin = 0;
+    // RTXPT D.1B.2 diffuse/specular signal extraction: requested by diagnostics only (never by default or by any
+    // setting). Raster Primary and split ReSTIR DI frames then record the extraction exports, which accumulate
+    // exactly as the production ones and also fill the pass's diffuse and specular outputs.
+    bool m_pathTraceSignalExtraction = false;
+    // Whether the last recorded path-tracing frame ran the extraction exports.
+    bool m_pathTraceExtractedLastFrame = false;
+    // RTXPT D.2B temporal reconstruction, requested by diagnostics only and only effective with extraction: each
+    // extraction frame then reprojects and accumulates the diffuse and specular signals into temporal history.
+    // m_pathTraceTemporalPresentation additionally presents that history (diffuse + specular on surface pixels) in
+    // place of the progressive mean; the accumulation itself is never touched.
+    bool m_pathTraceTemporal = false;
+    bool m_pathTraceTemporalPresentation = false;
+    // Whether the last recorded path-tracing frame ran the temporal pass.
+    bool m_pathTraceTemporalRanLastFrame = false;
+    // RTXPT D.3B spatial filtering, requested by diagnostics only and only effective on frames that ran the temporal
+    // pass: it filters this frame's temporal outputs and presents the result (remodulated diffuse + specular on
+    // surface pixels) instead of the temporal presentation. Without temporal reconstruction it does nothing. It never
+    // writes temporal history.
+    bool m_pathTraceSpatial = false;
+    // Whether the current recording intends to run the spatial pass (decided before the temporal pass, whose own
+    // presentation it replaces), and whether the last recorded path-tracing frame ran it.
+    bool m_pathTraceSpatialRequested = false;
+    bool m_pathTraceSpatialRanLastFrame = false;
+    // RTXPT D.3B.0 diagnostic view of the frame being recorded (from the debug UI), and whether the last recorded
+    // path-tracing frame presented a scalar view (shown without tone mapping). A view other than Normal runs the
+    // spatial dispatch for display only, on frames that ran the temporal pass; it changes no history.
+    PathTraceDenoiserVisualization m_pathTraceVisualization{};
+    bool m_pathTraceScalarViewLastFrame = false;
+    // RTXPT D.3C.2 diagnostic: the spatial filter's a-trous iterations (0: the D.3B.2 5x5 pass; 1 or 2: 3x3
+    // iterations at steps 1 and 2). It only matters while the spatial pass runs; without the a-trous pipelines or
+    // intermediate the 5x5 pass is used. The count that ran on the last spatial frame (0 for the 5x5 pass) is kept
+    // for diagnostics.
+    std::uint32_t m_pathTraceSpatialIterations = 2;
+    std::uint32_t m_pathTraceSpatialIterationsLastFrame = 0;
+
+    // What temporal history depends on beyond geometry: a change of any of it invalidates the history. Lighting is
+    // compared exactly; a continuous change cannot be told from an abrupt one here, so both invalidate.
+    struct PathTraceTemporalKey
+    {
+        PathTracePrimary primary = PathTracePrimary::Raster;
+        std::uint32_t samplesPerFrame = 0;
+        std::uint32_t maxPathDepth = 0;
+        std::uint32_t russianRouletteDepth = 0;
+        DirectionalLight sun;
+        SceneLightConstants lights{};
+    };
+
+    std::optional<PathTraceTemporalKey> m_pathTraceTemporalKey;
     // Samples recorded by the current frame; added to the accumulated count only after the frame
     // records and submits successfully (Render's Rendered path).
     std::uint32_t m_pathTracePendingSamples = 0;
@@ -1291,6 +1352,19 @@ class Renderer
         D3D12_GPU_VIRTUAL_ADDRESS sceneLightConstantsAddress,
         const PathTraceReferenceSettings& settings);
     static bool SamePathTraceAccumulationKey(const PathTraceAccumulationKey& left, const PathTraceAccumulationKey& right);
+    // RTXPT D.2B: records the temporal pass after an extraction frame; false when it could not run (the caller then
+    // invalidates temporal history).
+    bool RecordPathTraceTemporal(
+        ID3D12GraphicsCommandList* commandList,
+        PathTracePrimary primary,
+        const Matrix4& view,
+        const Matrix4& projection,
+        const Vector3& cameraPosition,
+        const FrameLighting& frameLighting,
+        const PathTraceReferenceSettings& settings);
+    // RTXPT D.3B: records the spatial pass over the temporal outputs the temporal pass recorded this frame.
+    void RecordPathTraceSpatial(ID3D12GraphicsCommandList* commandList, const Matrix4& view, const Matrix4& projection,
+        const PathTraceDenoiserVisualization& visualization);
 
     bool m_giSignedCorrectionInitialized = false;
     bool m_signedCorrectionExecutedLastFrame = false;

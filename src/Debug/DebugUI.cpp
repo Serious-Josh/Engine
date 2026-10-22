@@ -776,6 +776,42 @@ void DebugUI::DrawPerformanceWindow(
             ImGui::SliderFloat("RTGI Contact AO Radius", &m_rtgiContactAORadius, 0.05f, 5.0f, "%.2f");
             ImGui::Combo("Diagnostic view", &m_toneMapDebugView, views, IM_ARRAYSIZE(views));
 
+            // RTXPT D.3B.0: path-trace denoiser views. They need the diagnostic extraction and temporal passes
+            // (Renderer flags); otherwise the presentation is unchanged.
+            {
+                const char* denoiserViews[] = {"Normal", "Temporal (demodulated)", "Spatial (demodulated)",
+                    "Spatial - temporal difference", "Estimated uncertainty", "History length", "Raw extraction"};
+                const char* signals[] = {"Diffuse lighting", "Specular"};
+                int denoiserView = static_cast<int>(m_pathTraceDenoiserVisualization.view);
+                int signal = static_cast<int>(m_pathTraceDenoiserVisualization.signal);
+                ImGui::Combo("PT denoiser view", &denoiserView, denoiserViews, IM_ARRAYSIZE(denoiserViews));
+                ImGui::Combo("PT denoiser signal", &signal, signals, IM_ARRAYSIZE(signals));
+                ImGui::SliderFloat("PT view exposure (stops)", &m_pathTraceDenoiserVisualization.exposureStops, -8.0f, 16.0f,
+                    "%.1f");
+                ImGui::SliderFloat("PT difference amplification", &m_pathTraceDenoiserVisualization.differenceAmplification,
+                    1.0f, 1024.0f, "%.0f", ImGuiSliderFlags_Logarithmic);
+                ImGui::SliderFloat("PT uncertainty floor (log10)", &m_pathTraceDenoiserVisualization.uncertaintyFloorLog10,
+                    -6.0f, -1.0f, "%.1f");
+                m_pathTraceDenoiserVisualization.view = static_cast<PathTraceDenoiserView>(denoiserView);
+                m_pathTraceDenoiserVisualization.signal = static_cast<std::uint32_t>(signal);
+
+                if(denoiserView == 3)
+                {
+                    ImGui::TextWrapped("Grey: |spatial - temporal| luminance x 2^stops x amplification. What filtering "
+                        "changed, not error.");
+                }
+                else if(denoiserView == 4)
+                {
+                    ImGui::TextWrapped("sigma / Y of the spatial filter's estimate, log scale: blue = floor, green, red = "
+                        "100%. Magenta: history 1 (unknown). Cyan: no estimate. Stripes: history 2-7. Not error.");
+                }
+                else if(denoiserView == 5)
+                {
+                    ImGui::TextWrapped("Red: history 1 (new or rejected). Orange to yellow: 2-7. Yellow-green to green: "
+                        "8 to 32.");
+                }
+            }
+
 #ifndef NDEBUG
             ImGui::Checkbox("Shading normal horizon correction", &m_shadingNormalCorrectionEnabled);
 

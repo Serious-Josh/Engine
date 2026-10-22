@@ -27,6 +27,8 @@ class RayTracingSceneResources;
 //           baseline of SM69SER.
 //   SM69SER PathTraceReferenceSERSM69.hlsl and PathTraceReSTIRDISERSM69.hlsl: shader execution reordering on the
 //           continuation rays of Reference, Raster Primary and ReSTIR DI; Pixel Centre traces conventionally.
+// RTXPT D.1B.2 signal extraction (diagnostics only) adds, per variant, PathTraceReSTIRDIExtract[SM69|SERSM69].hlsl:
+// the extraction direct pass, which never shares a library with the production direct pass.
 enum class PathTraceLibraryVariant
 {
     SM66,
@@ -63,6 +65,11 @@ struct PathTraceLibrarySelection
 PathTraceLibrarySelection SelectPathTraceLibraryVariant(
     std::string_view libraryOverride,
     const PathTraceLibraryCapabilities& capabilities);
+
+// RTXPT D.1A: the path tracer's randomSeed for an accumulation run whose first frame is sequenceFrame frames after
+// the last history reset. The MurmurHash3 32-bit finalizer of the folded frame number: a bijection on 32 bits that
+// maps 0 to 0, so the first run after a reset keeps the historical seed-0 sequence.
+std::uint32_t PathTraceSequenceSeed(std::uint64_t sequenceFrame);
 
 // RTXPT.1 progressive reference path tracer. Owns one DXR pipeline per primary constructor (the same
 // library, compiled once, a different ray-generation export) and three renderer-lifetime resources: the RGBA32F running
@@ -138,7 +145,8 @@ class PathTraceReferencePass
     }
 
     // Records nothing unless the primary's pipeline exists (Initialize, or EnsurePrimaryPipeline), and never for
-    // PathTracePrimary::RasterReSTIRDI, which records through ExecuteReSTIRDISplit.
+    // PathTracePrimary::RasterReSTIRDI, which records through ExecuteReSTIRDISplit. extract records the Raster
+    // Primary extraction pipeline instead (EnsureSignalExtraction), and nothing for any other primary.
     void Execute(
         PathTracePrimary primary,
         ID3D12GraphicsCommandList4* commandList,
@@ -147,7 +155,8 @@ class PathTraceReferencePass
         D3D12_GPU_VIRTUAL_ADDRESS constantsAddress,
         D3D12_GPU_VIRTUAL_ADDRESS sceneLightConstantsAddress,
         unsigned int width,
-        unsigned int height);
+        unsigned int height,
+        bool extract);
 
     // RTXPT.3 split ReSTIR DI: the direct-pass pipeline (from the ReSTIR DI library) and the indirect-pass
     // pipeline (from the reference library), together PathTracePrimary::RasterReSTIRDI. Created on first use; a
@@ -175,10 +184,22 @@ class PathTraceReferencePass
         std::uint64_t lastSubmissionFence,
         std::uint64_t completedFence);
 
+    // RTXPT D.1B.2: the split direct pass's per-sample vertex-0 diffuse radiance, written by the extraction direct
+    // pass and read by the extraction indirect pass. Same layout, lifetime and return value as
+    // EnsureSplitDirectRadiance.
+    unsigned int EnsureSplitDirectDiffuse(
+        ID3D12Device* device,
+        DescriptorHeap& descriptorHeap,
+        std::uint32_t samplesPerFrame,
+        std::uint64_t lastSubmissionFence,
+        std::uint64_t completedFence);
+
     // Records the split ReSTIR DI frame: the direct pass, a UAV barrier on the direct radiance, then the indirect
     // pass. Records nothing unless both split pipelines and the direct radiance exist. The bindings are those of
     // Execute, plus the RTXDI constants (root b2) for the direct pass; constantsAddress must name the direct
     // radiance UAV. Each dispatch is timed in its own profiler region (PathTraceSplitDirect, PathTraceSplitIndirect).
+    // extract records the extraction passes instead, which also need the direct diffuse buffer and the outputs
+    // (constantsAddress names their UAVs too); without them nothing is recorded.
     void ExecuteReSTIRDISplit(
         ID3D12GraphicsCommandList4* commandList,
         GpuTimestampProfiler& profiler,
@@ -189,7 +210,30 @@ class PathTraceReferencePass
         D3D12_GPU_VIRTUAL_ADDRESS sceneLightConstantsAddress,
         unsigned int width,
         unsigned int height,
-        D3D12_GPU_VIRTUAL_ADDRESS rtxdiConstantsAddress);
+        D3D12_GPU_VIRTUAL_ADDRESS rtxdiConstantsAddress,
+        bool extract);
+
+    // RTXPT D.1B.2 diffuse/specular signal extraction (diagnostics only, never enabled by default). Creates, on first
+    // use, the extraction pipelines of Raster Primary or split ReSTIR DI (the extraction exports of the libraries
+    // the production pipelines use) and the two RGBA16F outputs at the current extent. A failure is sticky until a
+    // new revision of the libraries is accepted. Creation only: no GPU work is recorded.
+    bool EnsureSignalExtraction(
+        GraphicsDevice& graphicsDevice,
+        ShaderLibrary& shaderLibrary,
+        DescriptorHeap& descriptorHeap,
+        PathTracePrimary primary,
+        std::string& failureReason);
+
+    // The extraction outputs: diffuse RGB; specular RGB and the primary specular hit distance in alpha.
+    Texture& GetDiffuseTexture()
+    {
+        return m_diffuseTexture;
+    }
+
+    Texture& GetSpecularTexture()
+    {
+        return m_specularTexture;
+    }
 
     // Copies the presentation image into the HDR scene colour consumed by tone mapping. Both are
     // RGBA16F at the scene extent; the caller checks that before recording.
@@ -274,21 +318,60 @@ class PathTraceReferencePass
     bool m_splitPipelinesReady = false;
     bool m_splitPipelinesFailed = false;
     std::string m_splitPipelineFailure;
-    Buffer m_splitDirectRadiance;
-    std::uint32_t m_splitDirectRadianceSamples = 0;
-    std::uint32_t m_splitDirectRadianceFailedSamples = 0;
 
-    // Replaced direct radiance buffers, kept until the GPU completes submissionFence.
+    // Replaced per-sample buffers, kept until the GPU completes submissionFence.
     struct RetiredBuffer
     {
         Buffer buffer;
         std::uint64_t submissionFence = 0;
     };
 
-    std::vector<RetiredBuffer> m_retiredSplitDirectRadiance;
+    // A float3 per pixel and sample, sized for samplesPerFrame and replaced only when that changes.
+    struct SplitSampleBuffer
+    {
+        Buffer buffer;
+        std::uint32_t samples = 0;
+        std::uint32_t failedSamples = 0;
+        std::vector<RetiredBuffer> retired;
+    };
 
-    // Releases the direct radiance buffer and every retired one. Caller guarantees the queue is idle.
+    SplitSampleBuffer m_splitDirectRadiance;
+    // RTXPT D.1B.2: the diffuse part of m_splitDirectRadiance (signal extraction only).
+    SplitSampleBuffer m_splitDirectDiffuse;
+
+    unsigned int EnsureSplitSampleBuffer(
+        SplitSampleBuffer& target,
+        const wchar_t* name,
+        ID3D12Device* device,
+        DescriptorHeap& descriptorHeap,
+        std::uint32_t samplesPerFrame,
+        std::uint64_t lastSubmissionFence,
+        std::uint64_t completedFence);
+
+    // Releases a per-sample buffer and every retired one. Caller guarantees the queue is idle.
+    static void ReleaseSplitSampleBuffer(SplitSampleBuffer& target);
+
+    // Releases the direct radiance buffers and every retired one. Caller guarantees the queue is idle.
     void ReleaseSplitDirectRadiance();
+
+    // RTXPT D.1B.2 signal extraction, created on first use (EnsureSignalExtraction).
+    RayTracingPipeline m_extractRasterPipeline;
+    RayTracingPipeline m_extractSplitDirectPipeline;
+    RayTracingPipeline m_extractSplitIndirectPipeline;
+    bool m_extractRasterReady = false;
+    bool m_extractRasterFailed = false;
+    bool m_extractSplitReady = false;
+    bool m_extractSplitFailed = false;
+    std::string m_extractRasterFailure;
+    std::string m_extractSplitFailure;
+    Texture m_diffuseTexture;
+    Texture m_specularTexture;
+
+    // Creates the extraction outputs at the current extent when they do not exist.
+    bool CreateExtractionTextures(ID3D12Device* device, DescriptorHeap& descriptorHeap);
+
+    // The UAV barriers after a frame's last dispatch: accumulation and statistics, plus the extraction outputs.
+    void RecordOutputBarriers(ID3D12GraphicsCommandList* commandList, bool extract);
 
     unsigned int m_width = 0;
     unsigned int m_height = 0;

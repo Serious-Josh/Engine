@@ -215,6 +215,8 @@ add_library(EngineCore OBJECT
     src/Renderer/RendererMembershipCandidate.cpp
     src/Renderer/Passes/RayTracedShadowPass.cpp
     src/Renderer/Passes/PathTraceReferencePass.cpp
+    src/Renderer/Passes/PathTraceSpatialPass.cpp
+    src/Renderer/Passes/PathTraceTemporalPass.cpp
     src/Renderer/PreviousGBufferHistory.cpp
     src/Renderer/Rtxdi/RtxdiLightBridge.cpp
     src/Renderer/Rtxdi/RtxdiResources.cpp

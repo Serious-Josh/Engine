@@ -506,7 +506,8 @@ ShaderLibraryProfile ShaderCompiler::GetLibraryProfile(const std::filesystem::pa
     const std::filesystem::path fileName = libraryPath.filename();
 
     if(fileName == "PathTraceReferenceSM69.hlsl" || fileName == "PathTraceReSTIRDISM69.hlsl" ||
-        fileName == "PathTraceReferenceSERSM69.hlsl" || fileName == "PathTraceReSTIRDISERSM69.hlsl")
+        fileName == "PathTraceReferenceSERSM69.hlsl" || fileName == "PathTraceReSTIRDISERSM69.hlsl" ||
+        fileName == "PathTraceReSTIRDIExtractSM69.hlsl" || fileName == "PathTraceReSTIRDIExtractSERSM69.hlsl")
     {
         return ShaderLibraryProfile::Library69;
     }

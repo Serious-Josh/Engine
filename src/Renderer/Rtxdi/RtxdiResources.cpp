@@ -12,6 +12,10 @@ RTXDI_DISpatioTemporalResamplingParameters RtxdiResources::SpatioTemporalParamet
     RTXDI_DISpatioTemporalResamplingParameters parameters = rtxdi::GetDefaultReSTIRDISpatioTemporalResamplingParams();
     parameters.biasCorrectionMode = ReSTIRDI_SpatioTemporalBiasCorrectionMode::Raytraced;
     parameters.discountNaiveSamples = 0;
+    // RTXPT D.2C.2R: a reservoir history cap of 4 (SDK default 20). Long-lived high-weight reservoirs near steep
+    // target gradients (a spot light's cone edge) persisted and propagated as bright sparkles; cap 4 removes most
+    // of them with no measured bias or cost.
+    parameters.maxHistoryLength = 4;
     return parameters;
 }
 

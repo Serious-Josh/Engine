@@ -65,6 +65,23 @@ namespace
         return "PathTraceReSTIRDI.hlsl";
     }
 
+    // RTXPT D.1B.2: the library of the extraction direct pass. It never shares a library with the production direct
+    // pass (PathTraceReSTIRDIExtract.hlsl), so the production ReSTIR DI library is unchanged.
+    const char* ReSTIRDIExtractionLibraryPath(PathTraceLibraryVariant variant)
+    {
+        switch(variant)
+        {
+        case PathTraceLibraryVariant::SM69:
+            return "PathTraceReSTIRDIExtractSM69.hlsl";
+        case PathTraceLibraryVariant::SM69SER:
+            return "PathTraceReSTIRDIExtractSERSM69.hlsl";
+        case PathTraceLibraryVariant::SM66:
+            break;
+        }
+
+        return "PathTraceReSTIRDIExtract.hlsl";
+    }
+
     // The library a primary's pipelines come from. RTXPT.3 ReSTIR DI also needs the reference library (its indirect
     // pass), which every mode prepares first.
     std::filesystem::path PathTraceLibraryPath(PathTracePrimary primary, PathTraceLibraryVariant variant)
@@ -146,6 +163,35 @@ namespace
 
         RayTracingPipelineDescription description = BuildPathTracePipelineDescription(PathTracePrimary::Raster, variant);
         description.rayGenerationShader = L"PathTraceReSTIRDISplitIndirectRayGeneration";
+        return description;
+    }
+
+    // RTXPT D.1B.2: each extraction pipeline is its production counterpart with the extraction ray generation; the
+    // direct pass's comes from its own library (ReSTIRDIExtractionLibraryPath). They bind nothing more: the outputs
+    // are reached through the descriptor heap.
+    RayTracingPipelineDescription BuildRasterExtractionPipelineDescription(PathTraceLibraryVariant variant)
+    {
+        RayTracingPipelineDescription description = BuildPathTracePipelineDescription(PathTracePrimary::Raster, variant);
+        description.rayGenerationShader = L"PathTraceRasterPrimaryExtractRayGeneration";
+        return description;
+    }
+
+    RayTracingPipelineDescription BuildReSTIRDISplitExtractionPipelineDescription(
+        bool directPass,
+        PathTraceLibraryVariant variant)
+    {
+        RayTracingPipelineDescription description = BuildReSTIRDISplitPipelineDescription(directPass, variant);
+
+        if(directPass)
+        {
+            description.shaderPath = ReSTIRDIExtractionLibraryPath(variant);
+            description.rayGenerationShader = L"PathTraceReSTIRDISplitDirectExtractRayGeneration";
+        }
+        else
+        {
+            description.rayGenerationShader = L"PathTraceReSTIRDISplitIndirectExtractRayGeneration";
+        }
+
         return description;
     }
 }
@@ -399,6 +445,12 @@ ShaderLibraryPreparation PathTraceReferencePass::PrepareLibrary(
         m_splitPipelinesFailed = false;
         m_splitPipelineFailure.clear();
 
+        // RTXPT D.1B.2: the extraction pipelines come from the same libraries.
+        m_extractRasterFailed = false;
+        m_extractRasterFailure.clear();
+        m_extractSplitFailed = false;
+        m_extractSplitFailure.clear();
+
         Log::Info("Accepted the asynchronously compiled " + libraryName + " DXR library.");
         preparation.state = ShaderLibraryPreparationState::Ready;
         preparation.acceptedNewRevision = true;
@@ -556,8 +608,10 @@ bool PathTraceReferencePass::Resize(
     m_accumulationTexture.Shutdown();
     m_outputTexture.Shutdown();
 
-    // Sized for the old extent; the next split frame allocates it again.
+    // Sized for the old extent; the next split frame, or extraction frame, allocates them again.
     ReleaseSplitDirectRadiance();
+    m_diffuseTexture.Shutdown();
+    m_specularTexture.Shutdown();
 
     if(!CreateTextures(device, descriptorHeap, width, height))
     {
@@ -576,13 +630,17 @@ void PathTraceReferencePass::Execute(
     D3D12_GPU_VIRTUAL_ADDRESS constantsAddress,
     D3D12_GPU_VIRTUAL_ADDRESS sceneLightConstantsAddress,
     unsigned int width,
-    unsigned int height)
+    unsigned int height,
+    bool extract)
 {
-    RayTracingPipeline& pipeline = m_pipelines[static_cast<size_t>(primary)];
+    RayTracingPipeline& pipeline = extract ? m_extractRasterPipeline : m_pipelines[static_cast<size_t>(primary)];
+    const bool ready = extract ?
+        primary == PathTracePrimary::Raster && m_extractRasterReady && m_diffuseTexture.GetResource() :
+        m_pipelineReady[static_cast<size_t>(primary)];
 
     // ReSTIR DI records through ExecuteReSTIRDISplit; its own pipeline slot is never created.
     if(!m_initialized || !commandList || width != m_width || height != m_height ||
-        primary == PathTracePrimary::RasterReSTIRDI || !m_pipelineReady[static_cast<size_t>(primary)])
+        primary == PathTracePrimary::RasterReSTIRDI || !ready)
     {
         return;
     }
@@ -590,6 +648,12 @@ void PathTraceReferencePass::Execute(
     m_accumulationTexture.Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     m_outputTexture.Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     m_statisticsTexture.Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+    if(extract)
+    {
+        m_diffuseTexture.Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        m_specularTexture.Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    }
 
     pipeline.Bind(commandList);
 
@@ -600,14 +664,33 @@ void PathTraceReferencePass::Execute(
     commandList->SetComputeRootConstantBufferView(4, constantsAddress);
     commandList->SetComputeRootConstantBufferView(5, sceneLightConstantsAddress);
     pipeline.Dispatch(commandList, width, height);
+    RecordOutputBarriers(commandList, extract);
+}
 
-    // The next frame reads this frame's running mean; order the UAV accesses explicitly.
-    D3D12_RESOURCE_BARRIER barriers[2]{};
-    barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-    barriers[0].UAV.pResource = m_accumulationTexture.GetResource();
-    barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-    barriers[1].UAV.pResource = m_statisticsTexture.GetResource();
-    commandList->ResourceBarrier(2, barriers);
+void PathTraceReferencePass::RecordOutputBarriers(ID3D12GraphicsCommandList* commandList, bool extract)
+{
+    // The next frame reads this frame's running mean; order the UAV accesses explicitly. The extraction outputs
+    // are rewritten every extraction frame, so their writes are ordered too.
+    D3D12_RESOURCE_BARRIER barriers[4]{};
+    UINT barrierCount = 0;
+
+    const auto addBarrier = [&](ID3D12Resource* resource)
+    {
+        barriers[barrierCount].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        barriers[barrierCount].UAV.pResource = resource;
+        ++barrierCount;
+    };
+
+    addBarrier(m_accumulationTexture.GetResource());
+    addBarrier(m_statisticsTexture.GetResource());
+
+    if(extract)
+    {
+        addBarrier(m_diffuseTexture.GetResource());
+        addBarrier(m_specularTexture.GetResource());
+    }
+
+    commandList->ResourceBarrier(barrierCount, barriers);
 }
 
 bool PathTraceReferencePass::EnsureReSTIRDISplitPipelines(
@@ -672,7 +755,154 @@ bool PathTraceReferencePass::EnsureReSTIRDISplitPipelines(
     return true;
 }
 
+bool PathTraceReferencePass::EnsureSignalExtraction(
+    GraphicsDevice& graphicsDevice,
+    ShaderLibrary& shaderLibrary,
+    DescriptorHeap& descriptorHeap,
+    PathTracePrimary primary,
+    std::string& failureReason)
+{
+    if(!m_initialized)
+    {
+        failureReason = "The path tracer is not initialized.";
+        return false;
+    }
+
+    const bool split = primary == PathTracePrimary::RasterReSTIRDI;
+
+    if(!split && primary != PathTracePrimary::Raster)
+    {
+        failureReason = "Signal extraction supports Raster Primary and split ReSTIR DI only.";
+        return false;
+    }
+
+    bool& ready = split ? m_extractSplitReady : m_extractRasterReady;
+    bool& failed = split ? m_extractSplitFailed : m_extractRasterFailed;
+    std::string& failure = split ? m_extractSplitFailure : m_extractRasterFailure;
+
+    if(!ready && failed)
+    {
+        failureReason = failure;
+        return false;
+    }
+
+    if(!ready)
+    {
+        std::vector<std::pair<RayTracingPipeline*, RayTracingPipelineDescription>> pipelines;
+
+        if(split)
+        {
+            pipelines.emplace_back(&m_extractSplitDirectPipeline,
+                BuildReSTIRDISplitExtractionPipelineDescription(true, m_libraryVariant));
+            pipelines.emplace_back(&m_extractSplitIndirectPipeline,
+                BuildReSTIRDISplitExtractionPipelineDescription(false, m_libraryVariant));
+        }
+        else
+        {
+            pipelines.emplace_back(&m_extractRasterPipeline, BuildRasterExtractionPipelineDescription(m_libraryVariant));
+        }
+
+        for(auto& [pipeline, description] : pipelines)
+        {
+            const std::string libraryName = description.shaderPath.generic_string();
+            const ShaderLibraryCompileResult* library = AcquireLibrary(shaderLibrary, description.shaderPath);
+
+            if(!library)
+            {
+                failure = "The " + libraryName + " DXR library is unavailable or failed to compile" +
+                    TroubleshootingHint() + ".";
+            }
+            else if(!LibraryNamesExport(library->bytecode, description.rayGenerationShader))
+            {
+                failure = "The " + libraryName + " DXR library has no signal extraction entry point.";
+            }
+            else if(!pipeline->Initialize(graphicsDevice.GetRayTracingDevice(), library->bytecode, description))
+            {
+                failure = "The " + libraryName + " signal extraction DXR pipeline could not be created" +
+                    TroubleshootingHint() + ".";
+            }
+
+            if(!failure.empty())
+            {
+                for(auto& created : pipelines)
+                {
+                    created.first->Shutdown();
+                }
+
+                failed = true;
+                failureReason = failure;
+                return false;
+            }
+        }
+
+        ready = true;
+    }
+
+    if(!CreateExtractionTextures(graphicsDevice.GetDevice(), descriptorHeap))
+    {
+        failureReason = "The signal extraction outputs or their descriptors could not be allocated.";
+        return false;
+    }
+
+    return true;
+}
+
+bool PathTraceReferencePass::CreateExtractionTextures(ID3D12Device* device, DescriptorHeap& descriptorHeap)
+{
+    if(m_diffuseTexture.GetResource() && m_specularTexture.GetResource())
+    {
+        return true;
+    }
+
+    constexpr D3D12_RESOURCE_FLAGS unorderedAccess = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    constexpr D3D12_RESOURCE_STATES initialState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    Texture* outputs[2] = {&m_diffuseTexture, &m_specularTexture};
+    const wchar_t* names[2] = {L"Path Trace Diffuse", L"Path Trace Specular"};
+
+    for(int index = 0; index < 2; ++index)
+    {
+        Texture& output = *outputs[index];
+
+        if(!output.Initialize(device, m_width, m_height, 1, 1, DXGI_FORMAT_R16G16B16A16_FLOAT, unorderedAccess,
+            initialState) || !output.CreateSRV(device, descriptorHeap) || !output.CreateUAV(device, descriptorHeap))
+        {
+            Log::Error("Failed to create the path tracing signal extraction outputs.");
+            m_diffuseTexture.Shutdown();
+            m_specularTexture.Shutdown();
+            return false;
+        }
+
+        output.GetResource()->SetName(names[index]);
+    }
+
+    return true;
+}
+
 unsigned int PathTraceReferencePass::EnsureSplitDirectRadiance(
+    ID3D12Device* device,
+    DescriptorHeap& descriptorHeap,
+    std::uint32_t samplesPerFrame,
+    std::uint64_t lastSubmissionFence,
+    std::uint64_t completedFence)
+{
+    return EnsureSplitSampleBuffer(m_splitDirectRadiance, L"Path Trace Split Direct Radiance", device, descriptorHeap,
+        samplesPerFrame, lastSubmissionFence, completedFence);
+}
+
+unsigned int PathTraceReferencePass::EnsureSplitDirectDiffuse(
+    ID3D12Device* device,
+    DescriptorHeap& descriptorHeap,
+    std::uint32_t samplesPerFrame,
+    std::uint64_t lastSubmissionFence,
+    std::uint64_t completedFence)
+{
+    return EnsureSplitSampleBuffer(m_splitDirectDiffuse, L"Path Trace Split Direct Diffuse", device, descriptorHeap,
+        samplesPerFrame, lastSubmissionFence, completedFence);
+}
+
+unsigned int PathTraceReferencePass::EnsureSplitSampleBuffer(
+    SplitSampleBuffer& target,
+    const wchar_t* name,
     ID3D12Device* device,
     DescriptorHeap& descriptorHeap,
     std::uint32_t samplesPerFrame,
@@ -685,7 +915,7 @@ unsigned int PathTraceReferencePass::EnsureSplitDirectRadiance(
     }
 
     // Retired buffers whose last possible reader has completed.
-    std::erase_if(m_retiredSplitDirectRadiance,
+    std::erase_if(target.retired,
         [&](RetiredBuffer& retired)
         {
             if(retired.submissionFence > completedFence)
@@ -697,22 +927,22 @@ unsigned int PathTraceReferencePass::EnsureSplitDirectRadiance(
             return true;
         });
 
-    if(m_splitDirectRadiance.GetResource() && m_splitDirectRadianceSamples == samplesPerFrame)
+    if(target.buffer.GetResource() && target.samples == samplesPerFrame)
     {
-        return m_splitDirectRadiance.GetUAVDescriptorIndex();
+        return target.buffer.GetUAVDescriptorIndex();
     }
 
     // A failed size is not retried every frame; a new size, or a resize, tries again.
-    if(m_splitDirectRadianceFailedSamples == samplesPerFrame)
+    if(target.failedSamples == samplesPerFrame)
     {
         return UINT_MAX;
     }
 
     // Submitted frames may still read the current buffer through its descriptor, so neither is released yet.
-    if(m_splitDirectRadiance.GetResource())
+    if(target.buffer.GetResource())
     {
-        m_retiredSplitDirectRadiance.push_back(RetiredBuffer{std::move(m_splitDirectRadiance), lastSubmissionFence});
-        m_splitDirectRadianceSamples = 0;
+        target.retired.push_back(RetiredBuffer{std::move(target.buffer), lastSubmissionFence});
+        target.samples = 0;
     }
 
     const std::uint64_t bytes = static_cast<std::uint64_t>(m_width) * m_height * samplesPerFrame *
@@ -720,39 +950,46 @@ unsigned int PathTraceReferencePass::EnsureSplitDirectRadiance(
 
     if(bytes > UINT_MAX)
     {
-        m_splitDirectRadianceFailedSamples = samplesPerFrame;
-        Log::Error("Split ReSTIR DI direct radiance for " + std::to_string(samplesPerFrame) + " samples per frame at " +
-            std::to_string(m_width) + "x" + std::to_string(m_height) + " exceeds 32-bit shader addressing.");
+        target.failedSamples = samplesPerFrame;
+        Log::Error("Split ReSTIR DI per-sample radiance for " + std::to_string(samplesPerFrame) +
+            " samples per frame at " + std::to_string(m_width) + "x" + std::to_string(m_height) +
+            " exceeds 32-bit shader addressing.");
         return UINT_MAX;
     }
 
-    if(!m_splitDirectRadiance.InitializeGPUWritable(device, static_cast<size_t>(bytes)) ||
-        !m_splitDirectRadiance.CreateRawUAV(device, descriptorHeap))
+    if(!target.buffer.InitializeGPUWritable(device, static_cast<size_t>(bytes)) ||
+        !target.buffer.CreateRawUAV(device, descriptorHeap))
     {
-        m_splitDirectRadiance.Shutdown();
-        m_splitDirectRadianceFailedSamples = samplesPerFrame;
-        Log::Error("Failed to create the split ReSTIR DI direct radiance buffer (" + std::to_string(bytes) +
+        target.buffer.Shutdown();
+        target.failedSamples = samplesPerFrame;
+        Log::Error("Failed to create a split ReSTIR DI per-sample radiance buffer (" + std::to_string(bytes) +
             " bytes).");
         return UINT_MAX;
     }
 
-    m_splitDirectRadiance.GetResource()->SetName(L"Path Trace Split Direct Radiance");
-    m_splitDirectRadianceSamples = samplesPerFrame;
-    m_splitDirectRadianceFailedSamples = 0;
-    return m_splitDirectRadiance.GetUAVDescriptorIndex();
+    target.buffer.GetResource()->SetName(name);
+    target.samples = samplesPerFrame;
+    target.failedSamples = 0;
+    return target.buffer.GetUAVDescriptorIndex();
 }
 
-void PathTraceReferencePass::ReleaseSplitDirectRadiance()
+void PathTraceReferencePass::ReleaseSplitSampleBuffer(SplitSampleBuffer& target)
 {
-    for(RetiredBuffer& retired : m_retiredSplitDirectRadiance)
+    for(RetiredBuffer& retired : target.retired)
     {
         retired.buffer.Shutdown();
     }
 
-    m_retiredSplitDirectRadiance.clear();
-    m_splitDirectRadiance.Shutdown();
-    m_splitDirectRadianceSamples = 0;
-    m_splitDirectRadianceFailedSamples = 0;
+    target.retired.clear();
+    target.buffer.Shutdown();
+    target.samples = 0;
+    target.failedSamples = 0;
+}
+
+void PathTraceReferencePass::ReleaseSplitDirectRadiance()
+{
+    ReleaseSplitSampleBuffer(m_splitDirectRadiance);
+    ReleaseSplitSampleBuffer(m_splitDirectDiffuse);
 }
 
 void PathTraceReferencePass::ExecuteReSTIRDISplit(
@@ -765,18 +1002,33 @@ void PathTraceReferencePass::ExecuteReSTIRDISplit(
     D3D12_GPU_VIRTUAL_ADDRESS sceneLightConstantsAddress,
     unsigned int width,
     unsigned int height,
-    D3D12_GPU_VIRTUAL_ADDRESS rtxdiConstantsAddress)
+    D3D12_GPU_VIRTUAL_ADDRESS rtxdiConstantsAddress,
+    bool extract)
 {
-    if(!m_initialized || !commandList || width != m_width || height != m_height || !m_splitPipelinesReady ||
-        !m_splitDirectRadiance.GetResource() || rtxdiConstantsAddress == 0)
+    const bool ready = extract ?
+        m_extractSplitReady && m_splitDirectDiffuse.buffer.GetResource() && m_diffuseTexture.GetResource() :
+        m_splitPipelinesReady;
+
+    if(!m_initialized || !commandList || width != m_width || height != m_height || !ready ||
+        !m_splitDirectRadiance.buffer.GetResource() || rtxdiConstantsAddress == 0)
     {
         return;
     }
 
+    RayTracingPipeline& directPipeline = extract ? m_extractSplitDirectPipeline : m_splitDirectPipeline;
+    RayTracingPipeline& indirectPipeline = extract ? m_extractSplitIndirectPipeline : m_splitIndirectPipeline;
+
     m_accumulationTexture.Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     m_outputTexture.Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     m_statisticsTexture.Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    m_splitDirectRadiance.Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    m_splitDirectRadiance.buffer.Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+    if(extract)
+    {
+        m_splitDirectDiffuse.buffer.Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        m_diffuseTexture.Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        m_specularTexture.Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    }
 
     // Both root signatures begin with Execute's six parameters; binding a pipeline may change the root
     // signature, which discards earlier root arguments, so each pass binds its own.
@@ -792,33 +1044,29 @@ void PathTraceReferencePass::ExecuteReSTIRDISplit(
 
     // Direct pass: RTXDI sampling, reuse, visibility and reservoir publication; writes the direct radiance.
     profiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::PathTraceSplitDirect);
-    m_splitDirectPipeline.Bind(commandList);
+    directPipeline.Bind(commandList);
     bindSharedRootParameters();
     commandList->SetComputeRootConstantBufferView(6, rtxdiConstantsAddress);
-    m_splitDirectPipeline.Dispatch(commandList, width, height);
+    directPipeline.Dispatch(commandList, width, height);
     profiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::PathTraceSplitDirect);
 
-    // The indirect pass reads every direct radiance slot the direct pass wrote. Both passes only add to the
-    // statistics row atomically, so it needs no ordering between them.
-    D3D12_RESOURCE_BARRIER directRadianceBarrier{};
-    directRadianceBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-    directRadianceBarrier.UAV.pResource = m_splitDirectRadiance.GetResource();
-    commandList->ResourceBarrier(1, &directRadianceBarrier);
+    // The indirect pass reads every direct radiance slot the direct pass wrote, and with extraction every direct
+    // diffuse slot. Both passes only add to the statistics row atomically, so it needs no ordering between them.
+    D3D12_RESOURCE_BARRIER directBarriers[2]{};
+    directBarriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    directBarriers[0].UAV.pResource = m_splitDirectRadiance.buffer.GetResource();
+    directBarriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    directBarriers[1].UAV.pResource = m_splitDirectDiffuse.buffer.GetResource();
+    commandList->ResourceBarrier(extract ? 2 : 1, directBarriers);
 
     // Indirect pass: the path from vertex 0 onwards; accumulates and counts samples.
     profiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::PathTraceSplitIndirect);
-    m_splitIndirectPipeline.Bind(commandList);
+    indirectPipeline.Bind(commandList);
     bindSharedRootParameters();
-    m_splitIndirectPipeline.Dispatch(commandList, width, height);
+    indirectPipeline.Dispatch(commandList, width, height);
     profiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::PathTraceSplitIndirect);
 
-    // The next frame reads this frame's running mean; order the UAV accesses explicitly, as Execute does.
-    D3D12_RESOURCE_BARRIER barriers[2]{};
-    barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-    barriers[0].UAV.pResource = m_accumulationTexture.GetResource();
-    barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-    barriers[1].UAV.pResource = m_statisticsTexture.GetResource();
-    commandList->ResourceBarrier(2, barriers);
+    RecordOutputBarriers(commandList, extract);
 }
 
 void PathTraceReferencePass::CopyToSceneColor(ID3D12GraphicsCommandList* commandList, RenderTarget& sceneColor)
@@ -848,9 +1096,20 @@ std::uint64_t PathTraceReferencePass::GetResourceBytes() const
     const std::uint64_t pixels = static_cast<std::uint64_t>(m_width) * m_height;
     std::uint64_t bytes = pixels * (16 + 8) + StatisticsWidth * 4;
 
-    if(m_splitDirectRadiance.GetResource())
+    if(m_splitDirectRadiance.buffer.GetResource())
     {
-        bytes += pixels * m_splitDirectRadianceSamples * SplitDirectRadianceStride;
+        bytes += pixels * m_splitDirectRadiance.samples * SplitDirectRadianceStride;
+    }
+
+    // RTXPT D.1B.2 extraction: the per-sample direct diffuse radiance and two RGBA16F outputs.
+    if(m_splitDirectDiffuse.buffer.GetResource())
+    {
+        bytes += pixels * m_splitDirectDiffuse.samples * SplitDirectRadianceStride;
+    }
+
+    if(m_diffuseTexture.GetResource())
+    {
+        bytes += pixels * (8 + 8);
     }
 
     return bytes;
@@ -883,9 +1142,32 @@ void PathTraceReferencePass::ReleaseResources()
     m_splitPipelineFailure.clear();
     ReleaseSplitDirectRadiance();
 
+    m_extractRasterPipeline.Shutdown();
+    m_extractSplitDirectPipeline.Shutdown();
+    m_extractSplitIndirectPipeline.Shutdown();
+    m_extractRasterReady = false;
+    m_extractRasterFailed = false;
+    m_extractSplitReady = false;
+    m_extractSplitFailed = false;
+    m_extractRasterFailure.clear();
+    m_extractSplitFailure.clear();
+    m_diffuseTexture.Shutdown();
+    m_specularTexture.Shutdown();
+
     m_width = 0;
     m_height = 0;
     m_initialized = false;
+}
+
+std::uint32_t PathTraceSequenceSeed(std::uint64_t sequenceFrame)
+{
+    std::uint32_t value = static_cast<std::uint32_t>(sequenceFrame ^ (sequenceFrame >> 32));
+    value ^= value >> 16;
+    value *= 0x85EBCA6Bu;
+    value ^= value >> 13;
+    value *= 0xC2B2AE35u;
+    value ^= value >> 16;
+    return value;
 }
 
 const char* PathTraceLibraryVariantName(PathTraceLibraryVariant variant)

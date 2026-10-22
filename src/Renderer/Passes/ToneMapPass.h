@@ -45,7 +45,9 @@ enum class ToneMapDebugView : unsigned int
     HDRIDirectIntegralMip4 = 29,
     HDRIDirectIntegralMip6 = 30,
     GISignedReconstructed = 31,
-    ShadingNormalViewHorizon = 32
+    ShadingNormalViewHorizon = 32,
+    // RTXPT D.3B.0: path-trace denoiser scalar views, display-encoded in scene colour (selected by the renderer).
+    PathTraceDenoiserScalar = 33
 };
 
 class ToneMapPass

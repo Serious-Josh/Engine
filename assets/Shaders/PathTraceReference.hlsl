@@ -81,7 +81,12 @@ cbuffer PathTraceConstants : register(b0)
     uint randomSeed;
 
     uint materialTableCosineMapping;
-    uint3 padding;
+    // RTXPT D.1B.2 signal extraction, read only by the *Extract* ray generations: the raw UAVs of the diffuse and
+    // specular RGBA16F outputs, and of the per-sample vertex-0 diffuse direct radiance of split ReSTIR DI (laid out
+    // like splitDirectRadianceIndex).
+    uint diffuseOutputIndex;
+    uint specularOutputIndex;
+    uint splitDirectDiffuseIndex;
 
     // RTXPT.2 R3, appended: read only by PathTraceRasterPrimaryRayGeneration.
     row_major float4x4 inverseCameraRelativeViewProjection;
@@ -452,16 +457,22 @@ float3 PathTraceMissRadiance(float3 direction, bool previousDelta, float previou
     return environmentRadiance * environmentWeight + sunRadiance * sunWeight;
 }
 
-// Adds one light sample: f * cos * Li * visibility * MIS / pdf. Delta lights (pdf 0) use weight 1.
-float3 PathTraceShadeLightSample(PathTraceSurface surface, float3 position, PathTraceLightSample lightSample,
-    inout uint rayCount)
+// Adds one light sample: f * cos * Li * visibility * MIS / pdf. Delta lights (pdf 0) use weight 1. diffuseRadiance
+// is the same expression with the BSDF's diffuse lobe in place of f (signal extraction only): the MIS weight and
+// the densities are those of the full estimator, so the two lobes' parts of a sample are split exactly.
+float3 PathTraceShadeLightSampleLobes(PathTraceSurface surface, float3 position, PathTraceLightSample lightSample,
+    inout uint rayCount, out float3 diffuseRadiance)
 {
+    diffuseRadiance = float3(0.0f, 0.0f, 0.0f);
+
     if(!lightSample.valid || !PathTraceDirectionAboveSurface(surface, lightSample.direction))
     {
         return float3(0.0f, 0.0f, 0.0f);
     }
 
-    float3 value = PathTraceEvaluateBSDF(surface, lightSample.direction) * dot(surface.normal, lightSample.direction) *
+    float3 diffuseValue;
+    float cosine = dot(surface.normal, lightSample.direction);
+    float3 value = PathTraceEvaluateBSDFLobes(surface, lightSample.direction, diffuseValue) * cosine *
         lightSample.radiance;
 
     if(!any(value > 0.0f))
@@ -481,13 +492,23 @@ float3 PathTraceShadeLightSample(PathTraceSurface surface, float3 position, Path
         return float3(0.0f, 0.0f, 0.0f);
     }
 
+    diffuseRadiance = diffuseValue * cosine * lightSample.radiance * weight;
     return value * weight;
 }
 
-float3 PathTraceDirectLighting(PathTraceSurface surface, float3 position, inout PathTraceRandom random,
+float3 PathTraceShadeLightSample(PathTraceSurface surface, float3 position, PathTraceLightSample lightSample,
     inout uint rayCount)
 {
+    float3 diffuseRadiance;
+    return PathTraceShadeLightSampleLobes(surface, position, lightSample, rayCount, diffuseRadiance);
+}
+
+float3 PathTraceDirectLightingLobes(PathTraceSurface surface, float3 position, inout PathTraceRandom random,
+    inout uint rayCount, out float3 diffuseRadiance)
+{
     float3 radiance = float3(0.0f, 0.0f, 0.0f);
+    diffuseRadiance = float3(0.0f, 0.0f, 0.0f);
+    float3 sampleDiffuse;
 
     // Random numbers are consumed unconditionally so sample streams stay aligned across scenes.
     float2 sunRandom = PathTraceNextFloat2(random);
@@ -497,7 +518,9 @@ float3 PathTraceDirectLighting(PathTraceSurface surface, float3 position, inout 
 
     if(PathTraceSunHasEnergy(sun))
     {
-        radiance += PathTraceShadeLightSample(surface, position, PathTraceSampleSun(sun, sunRandom), rayCount);
+        radiance += PathTraceShadeLightSampleLobes(surface, position, PathTraceSampleSun(sun, sunRandom), rayCount,
+            sampleDiffuse);
+        diffuseRadiance += sampleDiffuse;
     }
 
     uint lightCount = min(sceneLightCount, SCENE_LIGHT_CAPACITY);
@@ -505,7 +528,8 @@ float3 PathTraceDirectLighting(PathTraceSurface surface, float3 position, inout 
     for(uint lightIndex = 0u; lightIndex < lightCount; ++lightIndex)
     {
         PathTraceLightSample lightSample = PathTraceSampleTableLight(sceneLights[lightIndex], position);
-        radiance += PathTraceShadeLightSample(surface, position, lightSample, rayCount);
+        radiance += PathTraceShadeLightSampleLobes(surface, position, lightSample, rayCount, sampleDiffuse);
+        diffuseRadiance += sampleDiffuse;
     }
 
     PathTraceEnvironment environment = PathTraceFrameEnvironment();
@@ -514,10 +538,18 @@ float3 PathTraceDirectLighting(PathTraceSurface surface, float3 position, inout 
     {
         PathTraceLightSample environmentSample = PathTraceSampleEnvironment(environment, environmentSampler,
             environmentRandom);
-        radiance += PathTraceShadeLightSample(surface, position, environmentSample, rayCount);
+        radiance += PathTraceShadeLightSampleLobes(surface, position, environmentSample, rayCount, sampleDiffuse);
+        diffuseRadiance += sampleDiffuse;
     }
 
     return radiance;
+}
+
+float3 PathTraceDirectLighting(PathTraceSurface surface, float3 position, inout PathTraceRandom random,
+    inout uint rayCount)
+{
+    float3 diffuseRadiance;
+    return PathTraceDirectLightingLobes(surface, position, random, rayCount, diffuseRadiance);
 }
 
 void PathTraceCameraRay(uint2 pixel, float2 jitter, out float3 origin, out float3 direction, out float maximumDistance)
@@ -592,6 +624,14 @@ float3 PathTraceSplitDirectLighting(inout PathTraceRandom random)
 
     RWByteAddressBuffer directRadiance = ResourceDescriptorHeap[splitDirectRadianceIndex];
     return asfloat(directRadiance.Load3(PathTraceSplitDirectRadianceAddress(g_splitPixel, g_splitSampleOffset)));
+}
+
+// RTXPT D.1B.2: the diffuse part of the same sample's vertex-0 direct radiance, written by the direct pass's
+// extraction ray generation.
+float3 PathTraceSplitDirectDiffuse()
+{
+    RWByteAddressBuffer directDiffuse = ResourceDescriptorHeap[splitDirectDiffuseIndex];
+    return asfloat(directDiffuse.Load3(PathTraceSplitDirectRadianceAddress(g_splitPixel, g_splitSampleOffset)));
 }
 
 #ifdef PATH_TRACE_RESTIR_DI_LIBRARY
@@ -683,9 +723,12 @@ Buffer<float2> RtxdiNeighborOffsets()
 // estimate is F(y) * V(y) * W (RtxdiApplicationBridge.hlsli); the indirect pass's non-delta continuation misses
 // then add no sun or HDRI radiance. The six randoms PathTraceDirectLighting would draw are drawn and discarded,
 // matching PathTraceSplitDirectLighting.
+// RTXPT D.1B.2: diffuseContribution is the diffuse-lobe part of the returned estimate, F_diffuse(y) V(y) W with the
+// same selected sample and reservoir weight (signal extraction only).
 float3 PathTraceRtxdiDirectLighting(PathTraceSurface surface, float3 position, inout PathTraceRandom random,
-    inout uint rayCount)
+    inout uint rayCount, out float3 diffuseContribution)
 {
+    diffuseContribution = float3(0.0f, 0.0f, 0.0f);
     PathTraceNextFloat2(random);
     PathTraceNextFloat4(random);
 
@@ -730,13 +773,15 @@ float3 PathTraceRtxdiDirectLighting(PathTraceSurface surface, float3 position, i
     if(RTXDI_IsValidDIReservoir(reservoir))
     {
         float weight = RTXDI_GetDIReservoirInvPdf(reservoir);
-        float3 unshadowed = RtxdiBridgeSampleContribution(selectedSample, bridgeSurface);
+        float3 unshadowedDiffuse;
+        float3 unshadowed = RtxdiBridgeSampleContributionLobes(selectedSample, bridgeSurface, unshadowedDiffuse);
 
         if(weight > 0.0f && isfinite(weight) && any(unshadowed > 0.0f))
         {
             visible = PathTraceVisible(position, surface.geometricNormal, selectedSample.sample.direction,
                 selectedSample.sample.distance, rayCount);
             contribution = visible ? unshadowed * weight : float3(0.0f, 0.0f, 0.0f);
+            diffuseContribution = visible ? unshadowedDiffuse * weight : float3(0.0f, 0.0f, 0.0f);
         }
     }
 
@@ -822,11 +867,41 @@ PathTraceRasterFirstVertex PathTraceDecodeRasterFirstVertex(uint2 pixel)
     return firstVertex;
 }
 
+// RTXPT D.1B.2 signal extraction for the raster primaries. A sample's radiance splits exactly into the parts its
+// vertex-0 BSDF lobes carry: vertex-0 direct light is evaluated per lobe with the full estimator's MIS weights and
+// densities, and everything after vertex 0 is scaled by the diffuse share f_diffuse / f of the vertex-0 BSDF
+// sample (carried as a diffuse throughput), never classified by the sampled lobe. The specular part is the rest.
+static const float PATH_TRACE_EXTRACTION_NO_SPECULAR = -1.0f;
+static const float PATH_TRACE_EXTRACTION_SPECULAR_PENDING = -2.0f;
+
+struct PathTraceExtraction
+{
+    // The diffuse part of the sample's radiance.
+    float3 diffuse;
+    // The diffuse part of the path throughput: f_diffuse / f of the vertex-0 BSDF sample times the throughput,
+    // carried beside it with the same BSDF weights and roulette.
+    float3 diffuseThroughput;
+    // Primary specular hit distance: the length of the vertex-0 continuation ray when the specular strategy was
+    // selected there (delta mirrors included), PATH_TRACE_HALF_MAXIMUM when that ray missed, and negative when the
+    // sample made no specular continuation.
+    float hitDistance;
+};
+
+PathTraceExtraction PathTraceEmptyExtraction()
+{
+    PathTraceExtraction extraction;
+    extraction.diffuse = float3(0.0f, 0.0f, 0.0f);
+    extraction.diffuseThroughput = float3(0.0f, 0.0f, 0.0f);
+    extraction.hitDistance = PATH_TRACE_EXTRACTION_NO_SPECULAR;
+    return extraction;
+}
+
 // The path loop shared by every primary constructor. The raster primary takes vertex 0 from its decoded
 // G-buffer sample where the camera primaries trace and build their first hit; everything after it (sampling,
-// BSDF, MIS, bounces, roulette) is the same code.
+// BSDF, MIS, bounces, roulette) is the same code. extract is a literal at every call site; without it the
+// extraction state is never read, and the loop is the production loop.
 float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex rasterFirstVertex,
-    inout PathTraceRandom random, inout uint rayCount)
+    inout PathTraceRandom random, inout uint rayCount, bool extract, inout PathTraceExtraction extraction)
 {
     float3 radiance = float3(0.0f, 0.0f, 0.0f);
     float3 throughput = float3(1.0f, 1.0f, 1.0f);
@@ -884,6 +959,11 @@ float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex 
                 // The camera primaries' hit handling, unchanged.
                 ++rayCount;
 
+                if(extract && vertex == 1u && extraction.hitDistance == PATH_TRACE_EXTRACTION_SPECULAR_PENDING)
+                {
+                    extraction.hitDistance = payload.hitDistance < 0.0f ? PATH_TRACE_HALF_MAXIMUM : payload.hitDistance;
+                }
+
                 if(payload.hitDistance < 0.0f)
                 {
                     // RTXPT.3 Gate 1: after a ReSTIR DI vertex 0, RTXDI alone estimated the sun and HDRI through
@@ -895,7 +975,13 @@ float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex 
 
                     if(!directFromRtxdi)
                     {
-                        radiance += throughput * PathTraceMissRadiance(ray.Direction, previousDelta, previousPdf);
+                        float3 missRadiance = PathTraceMissRadiance(ray.Direction, previousDelta, previousPdf);
+                        radiance += throughput * missRadiance;
+
+                        if(extract)
+                        {
+                            extraction.diffuse += extraction.diffuseThroughput * missRadiance;
+                        }
                     }
 
                     break;
@@ -962,21 +1048,55 @@ float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex 
 
         if(hasNonDeltaLobe)
         {
+            float3 direct;
+            float3 directDiffuse = float3(0.0f, 0.0f, 0.0f);
+
             if(primary == PATH_TRACE_PRIMARY_RASTER_SPLIT_INDIRECT && vertex == 0u)
             {
-                radiance += throughput * PathTraceSplitDirectLighting(random);
+                direct = PathTraceSplitDirectLighting(random);
+
+                if(extract)
+                {
+                    directDiffuse = PathTraceSplitDirectDiffuse();
+                }
             }
             else
             {
-                radiance += throughput * PathTraceDirectLighting(surface, position, random, rayCount);
+                direct = PathTraceDirectLightingLobes(surface, position, random, rayCount, directDiffuse);
+            }
+
+            radiance += throughput * direct;
+
+            // Vertex 0's direct light is split per lobe; later vertices' is carried by the diffuse throughput.
+            if(extract)
+            {
+                extraction.diffuse += vertex == 0u ? throughput * directDiffuse : extraction.diffuseThroughput * direct;
             }
         }
 
-        PathTraceBSDFSample bsdfSample = PathTraceSampleBSDF(surface, PathTraceNextFloat3(random));
+        float3 diffuseShare;
+        bool specularStrategy;
+        PathTraceBSDFSample bsdfSample = PathTraceSampleBSDFLobes(surface, PathTraceNextFloat3(random), diffuseShare,
+            specularStrategy);
 
         if(!bsdfSample.valid)
         {
             break;
+        }
+
+        if(extract)
+        {
+            if(vertex == 0u)
+            {
+                // The throughput before vertex 0's sample is 1.
+                extraction.diffuseThroughput = diffuseShare * bsdfSample.weight;
+                extraction.hitDistance = specularStrategy ? PATH_TRACE_EXTRACTION_SPECULAR_PENDING :
+                    PATH_TRACE_EXTRACTION_NO_SPECULAR;
+            }
+            else
+            {
+                extraction.diffuseThroughput *= bsdfSample.weight;
+            }
         }
 
         throughput *= bsdfSample.weight;
@@ -996,6 +1116,11 @@ float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex 
             }
 
             throughput /= survival;
+
+            if(extract)
+            {
+                extraction.diffuseThroughput /= survival;
+            }
         }
 
         if(!all(isfinite(throughput)) || !any(throughput > 0.0f))
@@ -1021,7 +1146,9 @@ float3 PathTraceRadiance(uint2 pixel, inout PathTraceRandom random, inout uint r
     ray.TMin = 0.0f;
     ray.TMax = maximumDistance;
 
-    return PathTraceTracePath(ray, PATH_TRACE_PRIMARY_CAMERA, (PathTraceRasterFirstVertex)0, random, rayCount);
+    PathTraceExtraction unusedExtraction = PathTraceEmptyExtraction();
+    return PathTraceTracePath(ray, PATH_TRACE_PRIMARY_CAMERA, (PathTraceRasterFirstVertex)0, random, rayCount, false,
+        unusedExtraction);
 }
 
 // RTXPT.2 R3 diagnostic primary: an unjittered camera ray through the pixel centre, the RT counterpart of
@@ -1037,13 +1164,15 @@ float3 PathTracePixelCenterRadiance(uint2 pixel, inout PathTraceRandom random, i
     ray.TMin = 0.0f;
     ray.TMax = maximumDistance;
 
-    return PathTraceTracePath(ray, PATH_TRACE_PRIMARY_PIXEL_CENTER, (PathTraceRasterFirstVertex)0, random, rayCount);
+    PathTraceExtraction unusedExtraction = PathTraceEmptyExtraction();
+    return PathTraceTracePath(ray, PATH_TRACE_PRIMARY_PIXEL_CENTER, (PathTraceRasterFirstVertex)0, random, rayCount,
+        false, unusedExtraction);
 }
 
 // RTXPT.2 R3 raster primary: no camera ray; vertex 0 is the pixel's decoded G-buffer sample. The vertex-0
 // TraceRay of the loop uses this well-formed, empty ray (and instance mask 0).
 float3 PathTraceRasterPrimaryRadiance(PathTraceRasterFirstVertex rasterFirstVertex, inout PathTraceRandom random,
-    inout uint rayCount)
+    inout uint rayCount, bool extract, inout PathTraceExtraction extraction)
 {
     PathTraceNextFloat2(random);
 
@@ -1052,12 +1181,13 @@ float3 PathTraceRasterPrimaryRadiance(PathTraceRasterFirstVertex rasterFirstVert
     emptyRay.Direction = float3(0.0f, 0.0f, 1.0f);
     emptyRay.TMin = 0.0f;
     emptyRay.TMax = 0.0f;
-    return PathTraceTracePath(emptyRay, PATH_TRACE_PRIMARY_RASTER, rasterFirstVertex, random, rayCount);
+    return PathTraceTracePath(emptyRay, PATH_TRACE_PRIMARY_RASTER, rasterFirstVertex, random, rayCount, extract,
+        extraction);
 }
 
 // RTXPT.3 ReSTIR DI indirect pass: the raster primary above, with vertex-0 direct light read from the direct pass.
 float3 PathTraceRasterSplitIndirectRadiance(PathTraceRasterFirstVertex rasterFirstVertex, inout PathTraceRandom random,
-    inout uint rayCount)
+    inout uint rayCount, bool extract, inout PathTraceExtraction extraction)
 {
     PathTraceNextFloat2(random);
 
@@ -1066,7 +1196,8 @@ float3 PathTraceRasterSplitIndirectRadiance(PathTraceRasterFirstVertex rasterFir
     emptyRay.Direction = float3(0.0f, 0.0f, 1.0f);
     emptyRay.TMin = 0.0f;
     emptyRay.TMax = 0.0f;
-    return PathTraceTracePath(emptyRay, PATH_TRACE_PRIMARY_RASTER_SPLIT_INDIRECT, rasterFirstVertex, random, rayCount);
+    return PathTraceTracePath(emptyRay, PATH_TRACE_PRIMARY_RASTER_SPLIT_INDIRECT, rasterFirstVertex, random, rayCount,
+        extract, extraction);
 }
 
 void PathTraceAddStatistic64(uint lowIndex, uint value)
@@ -1081,16 +1212,16 @@ void PathTraceAddStatistic64(uint lowIndex, uint value)
 }
 
 float3 PathTracePrimaryRadiance(uint primary, uint2 pixel, PathTraceRasterFirstVertex rasterFirstVertex,
-    inout PathTraceRandom random, inout uint rayCount)
+    inout PathTraceRandom random, inout uint rayCount, bool extract, inout PathTraceExtraction extraction)
 {
     if(primary == PATH_TRACE_PRIMARY_RASTER_SPLIT_INDIRECT)
     {
-        return PathTraceRasterSplitIndirectRadiance(rasterFirstVertex, random, rayCount);
+        return PathTraceRasterSplitIndirectRadiance(rasterFirstVertex, random, rayCount, extract, extraction);
     }
 
     if(primary == PATH_TRACE_PRIMARY_RASTER)
     {
-        return PathTraceRasterPrimaryRadiance(rasterFirstVertex, random, rayCount);
+        return PathTraceRasterPrimaryRadiance(rasterFirstVertex, random, rayCount, extract, extraction);
     }
 
     if(primary == PATH_TRACE_PRIMARY_PIXEL_CENTER)
@@ -1101,7 +1232,11 @@ float3 PathTracePrimaryRadiance(uint primary, uint2 pixel, PathTraceRasterFirstV
     return PathTraceRadiance(pixel, random, rayCount);
 }
 
-void PathTraceRunRayGeneration(uint primary)
+// extract (a literal, as primary): RTXPT D.1B.2 signal extraction, raster primaries only. The accumulation is
+// written exactly as without it; in addition the frame's own diffuse and specular means go to the extraction
+// outputs (the specular mean being the frame mean minus the diffuse one), with the primary specular hit
+// distance in the specular alpha. Pixels without a vertex-0 surface write zero radiance and no hit distance.
+void PathTraceRunRayGeneration(uint primary, bool extract)
 {
     uint2 pixel = DispatchRaysIndex().xy;
     bool active = all(pixel < resolution);
@@ -1112,6 +1247,10 @@ void PathTraceRunRayGeneration(uint primary)
     if(active)
     {
         float3 sampleSum = float3(0.0f, 0.0f, 0.0f);
+        float3 diffuseSum = float3(0.0f, 0.0f, 0.0f);
+        float hitDistanceSum = 0.0f;
+        uint hitSamples = 0u;
+        uint missSamples = 0u;
 
         // The raster primary's first vertex is decoded once for all of this pixel's samples.
         PathTraceRasterFirstVertex rasterFirstVertex = (PathTraceRasterFirstVertex)0;
@@ -1135,17 +1274,35 @@ void PathTraceRunRayGeneration(uint primary)
                 g_splitSampleOffset = sampleOffset;
             }
 
-            float3 sampleRadiance = PathTracePrimaryRadiance(primary, pixel, rasterFirstVertex, random, rayCount);
+            PathTraceExtraction extraction = PathTraceEmptyExtraction();
+            float3 sampleRadiance = PathTracePrimaryRadiance(primary, pixel, rasterFirstVertex, random, rayCount, extract,
+                extraction);
 
             // A non-finite estimate is a defect, never silently averaged; it is counted and dropped.
             if(!all(isfinite(sampleRadiance)) || any(sampleRadiance < 0.0f))
             {
                 sampleRadiance = float3(0.0f, 0.0f, 0.0f);
+                extraction.diffuse = float3(0.0f, 0.0f, 0.0f);
                 ++rejectedSamples;
             }
 
             sampleSum += sampleRadiance;
             ++completedSamples;
+
+            if(extract)
+            {
+                diffuseSum += all(isfinite(extraction.diffuse)) ? extraction.diffuse : float3(0.0f, 0.0f, 0.0f);
+
+                if(extraction.hitDistance == PATH_TRACE_HALF_MAXIMUM)
+                {
+                    ++missSamples;
+                }
+                else if(extraction.hitDistance >= 0.0f)
+                {
+                    hitDistanceSum += extraction.hitDistance;
+                    ++hitSamples;
+                }
+            }
         }
 
         float previousCount = float(accumulatedSamples);
@@ -1159,6 +1316,36 @@ void PathTraceRunRayGeneration(uint primary)
 
         accumulationTexture[pixel] = float4(mean, 1.0f);
         outputTexture[pixel] = float4(min(mean, PATH_TRACE_HALF_MAXIMUM), 1.0f);
+
+        if(extract)
+        {
+            float3 diffuseMean = float3(0.0f, 0.0f, 0.0f);
+            float3 specularMean = float3(0.0f, 0.0f, 0.0f);
+            float hitDistance = PATH_TRACE_EXTRACTION_NO_SPECULAR;
+
+            if(rasterFirstVertex.state > 0)
+            {
+                float frameSamples = float(samplesPerFrame);
+                diffuseMean = diffuseSum / frameSamples;
+                specularMean = (sampleSum - diffuseSum) / frameSamples;
+
+                // The mean over the samples whose specular continuation hit; all-miss is "at infinity".
+                if(hitSamples > 0u)
+                {
+                    hitDistance = hitDistanceSum / float(hitSamples);
+                }
+                else if(missSamples > 0u)
+                {
+                    hitDistance = PATH_TRACE_HALF_MAXIMUM;
+                }
+            }
+
+            RWTexture2D<float4> diffuseOutput = ResourceDescriptorHeap[diffuseOutputIndex];
+            RWTexture2D<float4> specularOutput = ResourceDescriptorHeap[specularOutputIndex];
+            diffuseOutput[pixel] = float4(clamp(diffuseMean, -PATH_TRACE_HALF_MAXIMUM, PATH_TRACE_HALF_MAXIMUM), 0.0f);
+            specularOutput[pixel] = float4(clamp(specularMean, -PATH_TRACE_HALF_MAXIMUM, PATH_TRACE_HALF_MAXIMUM),
+                min(hitDistance, PATH_TRACE_HALF_MAXIMUM));
+        }
     }
 
     // One atomic per wave keeps instrumentation cheap relative to the traced work.
@@ -1182,14 +1369,14 @@ void PathTraceRunRayGeneration(uint primary)
 [shader("raygeneration")]
 void PathTraceRayGeneration()
 {
-    PathTraceRunRayGeneration(PATH_TRACE_PRIMARY_CAMERA);
+    PathTraceRunRayGeneration(PATH_TRACE_PRIMARY_CAMERA, false);
 }
 
 // RTXPT.2 raster-primary mode.
 [shader("raygeneration")]
 void PathTraceRasterPrimaryRayGeneration()
 {
-    PathTraceRunRayGeneration(PATH_TRACE_PRIMARY_RASTER);
+    PathTraceRunRayGeneration(PATH_TRACE_PRIMARY_RASTER, false);
 }
 
 #ifdef PATH_TRACE_RESTIR_DI_LIBRARY
@@ -1198,9 +1385,9 @@ void PathTraceRasterPrimaryRayGeneration()
 // continuation. Each sample's estimate is stored for the indirect pass; samples whose path never reaches vertex-0
 // direct lighting store zero, and the indirect pass never reads them. Every active pixel writes its reservoir each
 // dispatch; a pixel whose sample 0 ran no RTXDI sampling (background, unusable sample, pure delta mirror) writes
-// an empty one. Only rays are counted here; the indirect pass counts samples.
-[shader("raygeneration")]
-void PathTraceReSTIRDISplitDirectRayGeneration()
+// an empty one. Only rays are counted here; the indirect pass counts samples. extract (a literal) also stores each
+// sample's diffuse-lobe part, at the same address in the splitDirectDiffuseIndex buffer (RTXPT D.1B.2).
+void PathTraceRunReSTIRDISplitDirect(bool extract)
 {
     uint2 pixel = DispatchRaysIndex().xy;
     bool active = all(pixel < resolution);
@@ -1226,16 +1413,23 @@ void PathTraceReSTIRDISplitDirectRayGeneration()
                 0x52545844u));
             g_rtxdiStoreReservoir = sampleOffset == 0u;
             float3 sampleDirect = float3(0.0f, 0.0f, 0.0f);
+            float3 sampleDirectDiffuse = float3(0.0f, 0.0f, 0.0f);
 
             if(directLighting)
             {
                 // RTXDI draws from its own sequence; the path randoms it discards are the indirect pass's.
                 PathTraceRandom discardedRandom = (PathTraceRandom)0;
                 sampleDirect = PathTraceRtxdiDirectLighting(rasterFirstVertex.surface, rasterFirstVertex.position,
-                    discardedRandom, rayCount);
+                    discardedRandom, rayCount, sampleDirectDiffuse);
             }
 
             directRadiance.Store3(PathTraceSplitDirectRadianceAddress(pixel, sampleOffset), asuint(sampleDirect));
+
+            if(extract)
+            {
+                RWByteAddressBuffer directDiffuse = ResourceDescriptorHeap[splitDirectDiffuseIndex];
+                directDiffuse.Store3(PathTraceSplitDirectRadianceAddress(pixel, sampleOffset), asuint(sampleDirectDiffuse));
+            }
         }
 
         if(!g_rtxdiReservoirStored)
@@ -1252,6 +1446,25 @@ void PathTraceReSTIRDISplitDirectRayGeneration()
         PathTraceAddStatistic64(0u, waveRays);
     }
 }
+
+// A DXR library holds one of the two direct passes, never both: with a second RTXDI direct-pass ray generation in
+// the same library (even an exact duplicate of the production one), the production direct pass rendered different,
+// darker images at runtime (RTXPT D.1B.2 bisection; the compiled DXIL of the production export was unchanged).
+// PathTraceReSTIRDIExtract*.hlsl define PATH_TRACE_RESTIR_DI_EXTRACTION_LIBRARY for the extraction one.
+#ifndef PATH_TRACE_RESTIR_DI_EXTRACTION_LIBRARY
+[shader("raygeneration")]
+void PathTraceReSTIRDISplitDirectRayGeneration()
+{
+    PathTraceRunReSTIRDISplitDirect(false);
+}
+#else
+// RTXPT D.1B.2: the direct pass with signal extraction.
+[shader("raygeneration")]
+void PathTraceReSTIRDISplitDirectExtractRayGeneration()
+{
+    PathTraceRunReSTIRDISplitDirect(true);
+}
+#endif
 #endif
 
 #ifndef PATH_TRACE_RESTIR_DI_LIBRARY
@@ -1260,7 +1473,21 @@ void PathTraceReSTIRDISplitDirectRayGeneration()
 [shader("raygeneration")]
 void PathTraceReSTIRDISplitIndirectRayGeneration()
 {
-    PathTraceRunRayGeneration(PATH_TRACE_PRIMARY_RASTER_SPLIT_INDIRECT);
+    PathTraceRunRayGeneration(PATH_TRACE_PRIMARY_RASTER_SPLIT_INDIRECT, false);
+}
+
+// RTXPT D.1B.2 signal extraction: the ReSTIR DI indirect pass and the raster primary, each also writing the
+// diffuse and specular outputs. Reference library only, like the indirect pass.
+[shader("raygeneration")]
+void PathTraceReSTIRDISplitIndirectExtractRayGeneration()
+{
+    PathTraceRunRayGeneration(PATH_TRACE_PRIMARY_RASTER_SPLIT_INDIRECT, true);
+}
+
+[shader("raygeneration")]
+void PathTraceRasterPrimaryExtractRayGeneration()
+{
+    PathTraceRunRayGeneration(PATH_TRACE_PRIMARY_RASTER, true);
 }
 #endif
 
@@ -1268,7 +1495,7 @@ void PathTraceReSTIRDISplitIndirectRayGeneration()
 [shader("raygeneration")]
 void PathTracePixelCenterRayGeneration()
 {
-    PathTraceRunRayGeneration(PATH_TRACE_PRIMARY_PIXEL_CENTER);
+    PathTraceRunRayGeneration(PATH_TRACE_PRIMARY_PIXEL_CENTER, false);
 }
 
 [shader("miss")]

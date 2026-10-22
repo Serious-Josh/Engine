@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Renderer/RendererStatistics.h"
+#include "Renderer/Passes/PathTraceSpatialPass.h"
 #include "Renderer/Passes/ToneMapPass.h"
 #include "Renderer/RendererLightingMode.h"
 #include "Renderer/LightingModeTransition.h"
@@ -75,6 +76,17 @@ class DebugUI
     ToneMapDebugView GetToneMapDebugView() const
     {
         return static_cast<ToneMapDebugView>(m_toneMapDebugView);
+    }
+
+    // RTXPT D.3B.0 path-trace denoiser diagnostic view (the setter serves automated diagnostics).
+    PathTraceDenoiserVisualization GetPathTraceDenoiserVisualization() const
+    {
+        return m_pathTraceDenoiserVisualization;
+    }
+
+    void SetPathTraceDenoiserVisualization(const PathTraceDenoiserVisualization& visualization)
+    {
+        m_pathTraceDenoiserVisualization = visualization;
     }
 
     bool IsShadingNormalCorrectionEnabled() const
@@ -176,6 +188,7 @@ class DebugUI
     bool m_tlasUpdated = false;
 
     int m_toneMapDebugView = 0;
+    PathTraceDenoiserVisualization m_pathTraceDenoiserVisualization{};
     int m_reflectionDenoiserMode = static_cast<int>(ReflectionDenoiserMode::Nrd);
 
     bool m_contributionLimiterEnabled = true;

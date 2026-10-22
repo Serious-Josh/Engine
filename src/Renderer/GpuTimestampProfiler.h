@@ -38,6 +38,8 @@ class GpuTimestampProfiler
         // also spans the barrier between them.
         PathTraceSplitDirect,
         PathTraceSplitIndirect,
+        // RTXPT D.3B spatial filter, after (not inside) PathTraceReference.
+        PathTraceSpatial,
         Count
     };
 

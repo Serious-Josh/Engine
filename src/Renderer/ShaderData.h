@@ -155,7 +155,10 @@ struct PathTraceReferenceConstants
     std::uint32_t randomSeed = 0;
 
     std::uint32_t materialTableCosineMapping = 0;
-    std::uint32_t padding[3]{};
+    // RTXPT D.1B.2 signal extraction (former padding): raw UAV indices read only by the extraction ray generations.
+    std::uint32_t diffuseOutputIndex = 0;
+    std::uint32_t specularOutputIndex = 0;
+    std::uint32_t splitDirectDiffuseIndex = 0;
 
     // RTXPT.2 R3, appended after the RTXPT.1 layout: the raster-primary G-buffer reconstruction
     // (PathTracePrimarySurface.hlsli). The reference entry point does not read them.

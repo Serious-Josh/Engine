@@ -112,25 +112,44 @@ RAB_LightSample RAB_SamplePolymorphicLight(RAB_LightInfo lightInfo, RAB_Surface 
     return lightSample;
 }
 
-// F(y) above, unshadowed. Zero for an invalid sample, a direction below the surface or an invalid surface.
-float3 RtxdiBridgeSampleContribution(RAB_LightSample lightSample, RAB_Surface surface)
+// F(y) above, unshadowed, and the part of it from the BSDF's diffuse lobe (signal extraction only). Zero for an
+// invalid sample, a direction below the surface or an invalid surface.
+float3 RtxdiBridgeSampleContributionLobes(RAB_LightSample lightSample, RAB_Surface surface, out float3 diffuseContribution)
 {
+    diffuseContribution = float3(0.0f, 0.0f, 0.0f);
+
     if(!surface.valid || !lightSample.sample.valid ||
         !PathTraceDirectionAboveSurface(surface.surface, lightSample.sample.direction))
     {
         return float3(0.0f, 0.0f, 0.0f);
     }
 
-    float3 value = PathTraceEvaluateBSDF(surface.surface, lightSample.sample.direction) *
-        dot(surface.surface.normal, lightSample.sample.direction) * lightSample.sample.radiance;
+    float3 diffuseValue;
+    float cosine = dot(surface.surface.normal, lightSample.sample.direction);
+    float3 value = PathTraceEvaluateBSDFLobes(surface.surface, lightSample.sample.direction, diffuseValue) * cosine *
+        lightSample.sample.radiance;
+    float3 diffuse = diffuseValue * cosine * lightSample.sample.radiance;
 
     // Delta lights carry pdf 0 and their irradiance; the sun cone and HDRI divide by the uv Jacobian.
     if(lightSample.sample.pdf > 0.0f)
     {
         value /= lightSample.sample.pdf;
+        diffuse /= lightSample.sample.pdf;
     }
 
-    return all(isfinite(value)) ? max(value, 0.0f) : float3(0.0f, 0.0f, 0.0f);
+    if(!all(isfinite(value)))
+    {
+        return float3(0.0f, 0.0f, 0.0f);
+    }
+
+    diffuseContribution = all(isfinite(diffuse)) ? max(diffuse, 0.0f) : float3(0.0f, 0.0f, 0.0f);
+    return max(value, 0.0f);
+}
+
+float3 RtxdiBridgeSampleContribution(RAB_LightSample lightSample, RAB_Surface surface)
+{
+    float3 diffuseContribution;
+    return RtxdiBridgeSampleContributionLobes(lightSample, surface, diffuseContribution);
 }
 
 float RAB_GetLightSampleTargetPdfForSurface(RAB_LightSample lightSample, RAB_Surface surface)

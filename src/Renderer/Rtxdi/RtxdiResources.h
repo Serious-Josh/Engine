@@ -70,7 +70,7 @@ class RtxdiResources
 
     // RTXPT.3 R3.5/R3.6 fixed fused spatiotemporal configuration (approved Gates 2 and 4): the SDK defaults with
     // ray-traced bias correction and naive-sample discounting off (it is inconsistent with that correction's
-    // normalization in the pinned SDK). The boiling filter is never applied.
+    // normalization in the pinned SDK), and (RTXPT D.2C.2R) maxHistoryLength 4. The boiling filter is never applied.
     static RTXDI_DISpatioTemporalResamplingParameters SpatioTemporalParameters();
 
     RtxdiResources() = default;
