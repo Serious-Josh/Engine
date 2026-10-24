@@ -2177,6 +2177,12 @@ void Engine::Frame()
     // The release frame always uses the latest finalized layout.
     const bool resizeScene = !m_editor.IsWorkspaceSplitterDragging();
 
+    // UPSCALING.2C: applied by the ResizeScene below (and so also deferred while a splitter drags).
+    // The combo entries follow Renderer::RenderScale's order (DebugUI::GetPathTraceRenderScaleIndex).
+    const int renderScaleIndex = (std::clamp)(debugUI.GetPathTraceRenderScaleIndex(), 0,
+        static_cast<int>(Renderer::RenderScale::DlssPerformance));
+    m_renderer.SetRenderScale(static_cast<Renderer::RenderScale>(renderScaleIndex));
+
     if (sceneWidth == 0 || sceneHeight == 0 || (resizeScene && !m_renderer.ResizeScene(sceneWidth, sceneHeight)))
     {
         Log::Error("Scene viewport resize failed; requesting application shutdown.");
@@ -2201,6 +2207,11 @@ void Engine::Frame()
     const ProjectPaths& inspectorPaths = GetActiveProject().GetPaths();
     auto viewportPublication = m_renderer.GetSelectionPublicationIdentity(activeDemo.GetScene());
     m_editor.SetViewportPublicationIdentity(viewportPublication.rendererLifetime, viewportPublication.bindingEpoch);
+
+    // UPSCALING.3B: the extents the renderer actually holds (after the ResizeScene above).
+    const Renderer::SceneResolution resolution = m_renderer.GetSceneResolution();
+    m_editor.SetViewportResolutionInfo({resolution.outputWidth, resolution.outputHeight, resolution.renderWidth,
+        resolution.renderHeight, m_renderer.GetPresentationModeName()});
     m_editor.Draw(activeDemo, m_demoSceneManager, debugUI, finalSceneImage.srv.ptr,
                   finalSceneImage.width, finalSceneImage.height, m_time.GetDeltaTime(),
                   inspectorPaths, m_projectAssetRegistry, m_renderer.GetMaterialPreviewImage());
@@ -2603,6 +2614,8 @@ void Engine::Frame()
     rendererOptions.sharc = debugUI.GetSharcSettings();
     rendererOptions.pathTraceDenoiser = debugUI.IsPathTraceDenoiserEnabled();
     rendererOptions.pathTraceDenoiserStages = debugUI.GetPathTraceDenoiserStages();
+    rendererOptions.pathTraceCameraJitter = debugUI.IsPathTraceCameraJitterEnabled();
+    rendererOptions.dlssInputPreparation = debugUI.IsDlssInputPreparationEnabled();
 
     const size_t selectedObject = m_editor.GetSelectedObject();
 

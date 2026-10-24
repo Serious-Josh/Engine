@@ -86,6 +86,17 @@ bool SelectionMaskPass::Initialize(
         return false;
     }
 
+    // The overlay depth prepass variant: nearest surface wins and is written.
+    description.depthComparison = D3D12_COMPARISON_FUNC_LESS;
+    description.depthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+
+    if (!m_depthPrepassPipeline.Initialize(device, description))
+    {
+        Log::Error("Failed to initialize the Editor overlay depth prepass pipeline.");
+        m_pipeline.Shutdown();
+        return false;
+    }
+
     m_layout.swap(layout);
     m_stride = vertexLayout.GetStride();
     return true;
@@ -96,9 +107,15 @@ void SelectionMaskPass::Bind(ID3D12GraphicsCommandList* commandList) const
     m_pipeline.Bind(commandList);
 }
 
+void SelectionMaskPass::BindDepthPrepass(ID3D12GraphicsCommandList* commandList) const
+{
+    m_depthPrepassPipeline.Bind(commandList);
+}
+
 void SelectionMaskPass::Shutdown()
 {
     m_pipeline.Shutdown();
+    m_depthPrepassPipeline.Shutdown();
     m_layout.clear();
     m_stride = 0;
 }
@@ -129,6 +146,7 @@ void SelectionMaskPass::AdoptPrepared(SelectionMaskPass& candidate) noexcept
 {
     assert(!IsInitialized() && candidate.IsInitialized());
     m_pipeline.Swap(candidate.m_pipeline);
+    m_depthPrepassPipeline.Swap(candidate.m_depthPrepassPipeline);
     m_layout.swap(candidate.m_layout);
     std::swap(m_stride, candidate.m_stride);
 }

@@ -17,10 +17,16 @@ struct MaterialConstants
 
 struct CameraConstants
 {
+    // Rasterization: jittered while UPSCALING.2B camera jitter is active, otherwise unjittered.
     Matrix4 viewProjection;
+    // Motion vectors: always unjittered (previous and current).
     Matrix4 previousViewProjection;
     Matrix4 view;
     Matrix4 previousView;
+    Matrix4 unjitteredViewProjection;
+    // UPSCALING.3D: material texture mip bias (Triangle.hlsl); non-zero only on DLSS frames.
+    float textureMipBias = 0.0f;
+    float cameraPadding[3] = {};
 };
 
 struct ObjectConstants
@@ -283,7 +289,7 @@ struct RayTracingInstanceData
 
 static_assert(sizeof(MaterialConstants) == 32);
 static_assert(sizeof(Matrix4) == 64);
-static_assert(sizeof(CameraConstants) == 256);
+static_assert(sizeof(CameraConstants) == 336);
 static_assert(sizeof(ObjectConstants) == 192);
 static_assert(sizeof(ReconstructionConstants) == 96);
 static_assert(offsetof(ReconstructionConstants, inverseViewProjection) == 0);

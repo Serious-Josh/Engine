@@ -15,6 +15,9 @@ class SelectionMaskPass
       ShaderLibrary& shaderLibrary,
       const VertexLayout& vertexLayout);
     void Bind(ID3D12GraphicsCommandList* commandList) const;
+    // UPSCALING.3C.4: the same shaders and bindings with depth written (LESS) for the Editor overlay depth prepass; its
+    // mask output is cleared by the caller afterwards.
+    void BindDepthPrepass(ID3D12GraphicsCommandList* commandList) const;
     void Shutdown();
     bool IsInitialized() const noexcept { return m_pipeline.IsInitialized(); }
 
@@ -34,4 +37,5 @@ class SelectionMaskPass
     std::vector<LayoutAttribute> m_layout;
     unsigned int m_stride = 0;
     Pipeline m_pipeline;
+    Pipeline m_depthPrepassPipeline;
 };

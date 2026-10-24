@@ -197,7 +197,7 @@ struct GpuTimingMonitor
             History& history = histories[region];
 
             const double current = result.milliseconds[region];
-            const bool regionAvailable = (result.validRegions & (1u << region)) != 0;
+            const bool regionAvailable = (result.validRegions & (1ull << region)) != 0;
             history.currentValid = regionAvailable && std::isfinite(current) && current > 0.0;
 
             if (!history.currentValid)

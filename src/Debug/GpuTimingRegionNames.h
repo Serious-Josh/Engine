@@ -33,5 +33,9 @@ inline constexpr const char* GpuTimingRegionNames[] = {"GPU frame",
                                                        "Radiance cache generation",
                                                        "Radiance cache resolve",
                                                        "Radiance cache insertion",
-                                                       "Radiance cache training"};
+                                                       "Radiance cache training",
+                                                       "Presentation resolve (diagnostic)",
+                                                       "DLSS input preparation (diagnostic)",
+                                                       "DLSS evaluate",
+                                                       "Editor overlay prepass"};
 static_assert(sizeof(GpuTimingRegionNames) / sizeof(GpuTimingRegionNames[0]) == GpuTimingMonitor::RegionCount);

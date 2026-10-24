@@ -152,7 +152,7 @@ void GpuTimestampProfiler::EndRegion(
 
     commandList->EndQuery(m_queryHeap, D3D12_QUERY_TYPE_TIMESTAMP, GetEndQueryIndex(frameIndex, region));
 
-    m_frameSlots[frameIndex].recordedRegions |= (1u << regionIndex);
+    m_frameSlots[frameIndex].recordedRegions |= (1ull << regionIndex);
 }
 
 void GpuTimestampProfiler::EndFrameAndResolve(
@@ -166,11 +166,11 @@ void GpuTimestampProfiler::EndFrameAndResolve(
 
     EndRegion(commandList, frameIndex, Region::TotalFrame);
 
-    const uint32_t recordedRegions = m_frameSlots[frameIndex].recordedRegions;
+    const uint64_t recordedRegions = m_frameSlots[frameIndex].recordedRegions;
 
     for (unsigned int regionIndex = 0; regionIndex < RegionCount; ++regionIndex)
     {
-        const uint32_t regionBit = 1u << regionIndex;
+        const uint64_t regionBit = 1ull << regionIndex;
 
         if ((recordedRegions & regionBit) == 0)
         {
@@ -312,7 +312,7 @@ bool GpuTimestampProfiler::CollectCompleted(uint64_t completedFenceValue)
 
     for (unsigned int regionIndex = 0; regionIndex < RegionCount; ++regionIndex)
     {
-        const uint32_t regionBit = 1u << regionIndex;
+        const uint64_t regionBit = 1ull << regionIndex;
 
         if ((collected.validRegions & regionBit) == 0)
         {
@@ -379,7 +379,7 @@ void GpuTimestampProfiler::CollectInterFrameGap(
     const unsigned int boundaryIndex = static_cast<unsigned int>(Region::TotalFrame) * QueriesPerRegion;
     const uint64_t begin = timestamps[boundaryIndex];
     const uint64_t end = timestamps[boundaryIndex + 1u];
-    const uint32_t boundaryBit = 1u << static_cast<unsigned int>(Region::TotalFrame);
+    const uint64_t boundaryBit = 1ull << static_cast<unsigned int>(Region::TotalFrame);
     const bool boundaryValid = (slot.recordedRegions & boundaryBit) != 0 && end >= begin && m_timestampFrequency != 0;
     const bool consecutive = m_previousBoundaryValid && slot.sequence == m_previousBoundarySequence &&
                              slot.frameSerial > m_previousBoundarySerial &&

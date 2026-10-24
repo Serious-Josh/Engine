@@ -13,6 +13,7 @@
 #include <climits>
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 struct ID3D12Device;
@@ -32,6 +33,9 @@ enum class ReflectionDenoiserMode
 
 class DebugUI
 {
+    // Local diagnostics drive the Editor's render settings directly (UPSCALING.3C.2).
+    friend class SceneHierarchyVerification;
+
     public:
     DebugUI() = default;
 
@@ -149,6 +153,55 @@ class DebugUI
         return m_pathTraceDenoiserStages;
     }
 
+    // UPSCALING.2B: experimental camera jitter in the raster-primary path-traced modes (off by default, not saved).
+    bool IsPathTraceCameraJitterEnabled() const
+    {
+        return m_pathTraceCameraJitter && (m_lightingMode == 2 || m_lightingMode == 3);
+    }
+
+    // UPSCALING.2C: the experimental 75% render scale in the raster-primary path-traced modes (off by default, not
+    // saved). Other modes always render at the output extent.
+    bool IsPathTraceReducedRenderScale() const
+    {
+        return m_pathTraceRenderScale != 0 && (m_lightingMode == 2 || m_lightingMode == 3);
+    }
+
+    // UPSCALING.3C/3D: whether the reduced scale is a DLSS mode (the diagnostic 75% one or a preset).
+    bool IsPathTraceDlssSelected() const
+    {
+        return m_pathTraceRenderScale >= 2 && (m_lightingMode == 2 || m_lightingMode == 3);
+    }
+
+    // UPSCALING.3D: the selected render-scale entry in the raster-primary path-traced modes (0 otherwise): 0 Native,
+    // 1 bilinear 75%, 2 DLSS 75% (diagnostic), 3 DLSS Quality, 4 DLSS Balanced, 5 DLSS Performance.
+    int GetPathTraceRenderScaleIndex() const
+    {
+        return m_lightingMode == 2 || m_lightingMode == 3 ? m_pathTraceRenderScale : 0;
+    }
+
+    // UPSCALING.3B: diagnostic DLSS input preparation (off by default, not saved). It never evaluates DLSS.
+    bool IsDlssInputPreparationEnabled() const
+    {
+        return m_dlssInputPreparation;
+    }
+
+    // UPSCALING.3A: the DLSS Super Resolution backend's state, set once at renderer initialization (informational).
+    void SetDlssReadout(std::string state, std::string detail)
+    {
+        m_dlssState = std::move(state);
+        m_dlssDetail = std::move(detail);
+    }
+
+    // The renderer's jitter of the last recorded frame (render pixels), shown under the control.
+    void SetPathTraceCameraJitterReadout(bool active, std::uint32_t phase, std::uint32_t phaseCount, float x, float y)
+    {
+        m_pathTraceCameraJitterActive = active;
+        m_pathTraceCameraJitterPhase = phase;
+        m_pathTraceCameraJitterPhaseCount = phaseCount;
+        m_pathTraceCameraJitterX = x;
+        m_pathTraceCameraJitterY = y;
+    }
+
     // Renderer evidence shown next to the mode selector (availability, reason, sample count).
     void SetPathTraceReferenceStatus(
         PathTraceReferenceAvailability availability,
@@ -244,6 +297,17 @@ class DebugUI
     // SHARC.4E.1: the path-tracing denoiser in the raster-primary path-traced modes (on by default in the Editor).
     bool m_pathTraceDenoiser = true;
     PathTraceDenoiserStages m_pathTraceDenoiserStages{};
+    bool m_pathTraceCameraJitter = false;
+    std::string m_dlssState = "Not initialized";
+    bool m_dlssInputPreparation = false;
+    std::string m_dlssDetail;
+    // UPSCALING.2C/3C: 0 = 100% (Native), 1 = 75% (diagnostic resolve), 2 = 75% DLSS (experimental).
+    int m_pathTraceRenderScale = 0;
+    bool m_pathTraceCameraJitterActive = false;
+    std::uint32_t m_pathTraceCameraJitterPhase = 0;
+    std::uint32_t m_pathTraceCameraJitterPhaseCount = 0;
+    float m_pathTraceCameraJitterX = 0.0f;
+    float m_pathTraceCameraJitterY = 0.0f;
 
     PathTraceReferenceAvailability m_pathTraceAvailability = PathTraceReferenceAvailability::NotRequested;
     std::string m_pathTraceUnavailableReason;

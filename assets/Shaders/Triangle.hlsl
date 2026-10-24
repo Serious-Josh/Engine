@@ -44,10 +44,25 @@ cbuffer MaterialConstants : register(b0)
 
 cbuffer CameraConstants : register(b1)
 {
+    // Rasterization (jittered while UPSCALING.2B camera jitter is active).
     row_major float4x4 viewProjection;
     row_major float4x4 previousViewProjection;
     row_major float4x4 view;
     row_major float4x4 previousView;
+    // Motion vectors exclude jitter: the current clip position uses this, never viewProjection.
+    row_major float4x4 unjitteredViewProjection;
+    // UPSCALING.3D: material texture mip bias, non-zero only while DLSS reconstructs the frame (0 keeps Sample).
+    float textureMipBias;
+}
+
+float4 SampleMaterialTexture(Texture2D<float4> materialTexture, SamplerState materialSampler, float2 uv)
+{
+    if(textureMipBias != 0.0f)
+    {
+        return materialTexture.SampleBias(materialSampler, uv, textureMipBias);
+    }
+
+    return materialTexture.Sample(materialSampler, uv);
 }
 
 cbuffer ObjectConstants : register(b2)
@@ -432,7 +447,11 @@ VSOutput VSMain(VSInput input)
         );
 
     output.worldPosition = worldPosition.xyz;
-    output.currentClipPosition = output.position;
+    output.currentClipPosition =
+        mul(
+            unjitteredViewProjection,
+            worldPosition
+        );
 
     float4 previousWorldPosition =
         mul(
@@ -528,7 +547,8 @@ PSOutput PSMain(VSOutput input)
         ];
 
     float3 sampledBaseColor =
-        baseColorTexture.Sample(
+        SampleMaterialTexture(
+            baseColorTexture,
             sampler0,
             resolvedMaterialUV
         ).rgb;
@@ -544,7 +564,7 @@ PSOutput PSMain(VSOutput input)
     {
         Texture2D<float4> armTexture = ResourceDescriptorHeap[
             NonUniformResourceIndex(material.armTextureIndex)];
-        float3 sampledARM = armTexture.Sample(sampler0, resolvedMaterialUV).rgb;
+        float3 sampledARM = SampleMaterialTexture(armTexture, sampler0, resolvedMaterialUV).rgb;
         armRoughnessMetallic = sampledARM.gb;
         materialAO = saturate(sampledARM.r);
     }
@@ -552,7 +572,7 @@ PSOutput PSMain(VSOutput input)
     {
         Texture2D<float4> aoTexture = ResourceDescriptorHeap[
             NonUniformResourceIndex(material.aoTextureIndex)];
-        materialAO = saturate(aoTexture.Sample(sampler0, resolvedMaterialUV).r);
+        materialAO = saturate(SampleMaterialTexture(aoTexture, sampler0, resolvedMaterialUV).r);
     }
 
     float finalRoughness = roughness;
@@ -563,7 +583,7 @@ PSOutput PSMain(VSOutput input)
     else if(roughnessTextureIndex != 0xFFFFFFFFu)
     {
         Texture2D<float4> roughnessTexture = ResourceDescriptorHeap[roughnessTextureIndex];
-        float sampledRoughness = roughnessTexture.Sample(sampler0, resolvedMaterialUV).r;
+        float sampledRoughness = SampleMaterialTexture(roughnessTexture, sampler0, resolvedMaterialUV).r;
         finalRoughness = saturate(roughness * sampledRoughness);
     }
 
@@ -579,7 +599,7 @@ PSOutput PSMain(VSOutput input)
     if(normalTextureIndex != 0xFFFFFFFFu)
     {
         Texture2D<float4> normalTexture = ResourceDescriptorHeap[normalTextureIndex];
-        float2 normalXY = normalTexture.Sample(sampler0, resolvedMaterialUV).rg * 2.0f - 1.0f;
+        float2 normalXY = SampleMaterialTexture(normalTexture, sampler0, resolvedMaterialUV).rg * 2.0f - 1.0f;
         float normalZ = sqrt(saturate(1.0f - dot(normalXY, normalXY)));
         float3 sampledNormal = float3(normalXY, normalZ);
         float3 tangent = input.worldTangent.xyz - N * dot(N, input.worldTangent.xyz);
@@ -618,7 +638,7 @@ PSOutput PSMain(VSOutput input)
         {
             Texture2D<float4> metallicTexture = ResourceDescriptorHeap[
                 NonUniformResourceIndex(material.metallicTextureIndex)];
-            float sampledMetallic = metallicTexture.Sample(sampler0, resolvedMaterialUV).r;
+            float sampledMetallic = SampleMaterialTexture(metallicTexture, sampler0, resolvedMaterialUV).r;
             effectiveMetallic = saturate(effectiveMetallic * sampledMetallic);
         }
     }

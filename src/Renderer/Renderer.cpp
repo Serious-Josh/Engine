@@ -59,6 +59,40 @@ namespace
 
         return 0; // Never wrap and accept a stale lifetime.
     }
+
+    // UPSCALING.2B: the radical inverse of index in base (Halton sequence), in [0, 1).
+    float Halton(std::uint32_t index, std::uint32_t base)
+    {
+        float result = 0.0f;
+        float fraction = 1.0f;
+
+        while(index > 0)
+        {
+            fraction /= static_cast<float>(base);
+            result += fraction * static_cast<float>(index % base);
+            index /= base;
+        }
+
+        return result;
+    }
+
+    // UPSCALING.2B: projection whose pixel centres sample the unjittered image at centre + (x, y) render pixels (x right,
+    // y down). NDC y points up, so a sample further down needs the image shifted up. Adding the offset times the w row
+    // moves every clip position by the same NDC amount.
+    Matrix4 JitterProjection(const Matrix4& projection, float x, float y, unsigned int width, unsigned int height)
+    {
+        const float clipX = -2.0f * x / static_cast<float>(width);
+        const float clipY = 2.0f * y / static_cast<float>(height);
+        Matrix4 jittered = projection;
+
+        for(int column = 0; column < 4; ++column)
+        {
+            jittered.m[0][column] += clipX * projection.m[3][column];
+            jittered.m[1][column] += clipY * projection.m[3][column];
+        }
+
+        return jittered;
+    }
 } // namespace
 
 // --------------
@@ -2692,12 +2726,24 @@ bool Renderer::Initialize(
 
     m_applicationWidth = width;
     m_applicationHeight = height;
-    m_sceneWidth = width;
-    m_sceneHeight = height;
+
+    bool initialPresetSupported = true;
+    const SceneResolution initialResolution = ResolveSceneResolution(width, height, m_renderScale,
+        initialPresetSupported);
+    m_sceneWidth = initialResolution.renderWidth;
+    m_sceneHeight = initialResolution.renderHeight;
+    m_outputWidth = initialResolution.outputWidth;
+    m_outputHeight = initialResolution.outputHeight;
 
     if (!InitializeDevice())
     {
         return false;
+    }
+
+    // UPSCALING.3A: capability only; any DLSS failure is reported, never fatal. The packaged runtime does not use DLSS.
+    if(!m_packagedRuntime)
+    {
+        m_dlssBackend.Initialize(m_graphicsDevice.GetDevice());
     }
 
     if (!m_gpuTimestampProfiler.Initialize(m_graphicsDevice.GetDevice(), m_commandContext.GetCommandQueue()))
@@ -3074,7 +3120,7 @@ bool Renderer::Initialize(
         return false;
     }
 
-    if(!m_finalSceneColor.Initialize(device, m_sceneWidth, m_sceneHeight, DXGI_FORMAT_R8G8B8A8_UNORM,
+    if(!m_finalSceneColor.Initialize(device, m_outputWidth, m_outputHeight, DXGI_FORMAT_R8G8B8A8_UNORM,
                                     m_rtvDescriptorHeap, m_resourceDescriptorHeap))
     {
         Log::Error("Failed to initialize final scene color.");
@@ -3096,6 +3142,12 @@ bool Renderer::Initialize(
     }
 
     m_debugUIInitialized = !m_packagedRuntime;
+
+    if(m_debugUIInitialized)
+    {
+        const DlssStatus& dlss = m_dlssBackend.GetStatus();
+        m_debugUI.SetDlssReadout(DlssAvailabilityName(dlss.availability), dlss.detail);
+    }
 
     if (!m_gBuffer.Initialize(device, m_sceneWidth, m_sceneHeight, m_rtvDescriptorHeap, m_dsvDescriptorHeap,
                               m_resourceDescriptorHeap))
@@ -3272,7 +3324,10 @@ bool Renderer::ResizeScene(unsigned int width, unsigned int height)
         return false;
     }
 
-    if(width == 0 || height == 0 || (width == m_sceneWidth && height == m_sceneHeight))
+    // width x height is the requested output extent; a pending render-scale change also resizes (UPSCALING.2C).
+    const bool unchanged = width == m_outputWidth && height == m_outputHeight && m_requestedRenderScale == m_renderScale;
+
+    if(width == 0 || height == 0 || unchanged)
     {
         return true;
     }
@@ -3287,13 +3342,71 @@ bool Renderer::ResizeScene(unsigned int width, unsigned int height)
         return false;
     }
 
-    if(!ResizeSceneResources(width, height))
+    bool presetSupported = true;
+    const SceneResolution resolution = ResolveSceneResolution(width, height, m_requestedRenderScale, presetSupported);
+
+    if(!ResizeSceneResources(resolution))
     {
         return false;
     }
 
+    m_renderScale = m_requestedRenderScale;
+    m_dlssPresetUnsupported = !presetSupported;
     m_resizeFailed = false;
     return true;
+}
+
+std::optional<DlssQualityPreset> Renderer::GetDlssPreset(RenderScale scale) noexcept
+{
+    switch(scale)
+    {
+    case RenderScale::DlssQuality:
+        return DlssQualityPreset::Quality;
+    case RenderScale::DlssBalanced:
+        return DlssQualityPreset::Balanced;
+    case RenderScale::DlssPerformance:
+        return DlssQualityPreset::Performance;
+    default:
+        return std::nullopt;
+    }
+}
+
+Renderer::SceneResolution Renderer::ResolveSceneResolution(unsigned int outputWidth, unsigned int outputHeight,
+    RenderScale scale, bool& presetSupported)
+{
+    presetSupported = true;
+
+    if(scale == RenderScale::Native)
+    {
+        return {outputWidth, outputHeight, outputWidth, outputHeight};
+    }
+
+    // UPSCALING.3D: a preset renders at NGX's optimal extent for this output extent.
+    const std::optional<DlssQualityPreset> preset = GetDlssPreset(scale);
+
+    if(preset)
+    {
+        unsigned int renderWidth = 0;
+        unsigned int renderHeight = 0;
+        presetSupported = m_dlssBackend.QueryOptimalRenderExtent(*preset, outputWidth, outputHeight, renderWidth,
+            renderHeight);
+
+        if(presetSupported)
+        {
+            return {renderWidth, renderHeight, outputWidth, outputHeight};
+        }
+
+        Log::Warning(std::string("DLSS ") + DlssQualityPresetName(*preset) + " reports no render extent for " +
+            std::to_string(outputWidth) + "x" + std::to_string(outputHeight) + "; rendering at 75% without DLSS.");
+    }
+
+    // round(0.75 * extent), half up, in integers.
+    const auto scaled = [](unsigned int extent)
+    {
+        return (std::max)(1u, (extent * 3u + 2u) / 4u);
+    };
+
+    return {scaled(outputWidth), scaled(outputHeight), outputWidth, outputHeight};
 }
 
 bool Renderer::ResizeApplicationResources(
@@ -3315,13 +3428,17 @@ bool Renderer::ResizeApplicationResources(
     return true;
 }
 
-bool Renderer::ResizeSceneResources(
-    unsigned int width,
-    unsigned int height)
+bool Renderer::ResizeSceneResources(const SceneResolution& resolution)
 {
     // No coherent scene extent is published while resources are partially recreated.
     m_sceneWidth = 0;
     m_sceneHeight = 0;
+    m_outputWidth = 0;
+    m_outputHeight = 0;
+
+    // Everything below except the final scene image is sized from the render extent.
+    const unsigned int width = resolution.renderWidth;
+    const unsigned int height = resolution.renderHeight;
 
     if(!m_gBuffer.Resize(m_graphicsDevice.GetDevice(), width, height, m_rtvDescriptorHeap, m_dsvDescriptorHeap,
                           m_resourceDescriptorHeap))
@@ -3481,11 +3598,38 @@ bool Renderer::ResizeSceneResources(
 
     m_finalSceneColor.Shutdown();
 
-    if(!m_finalSceneColor.Initialize(m_graphicsDevice.GetDevice(), width, height, DXGI_FORMAT_R8G8B8A8_UNORM,
-                                    m_rtvDescriptorHeap, m_resourceDescriptorHeap))
+    if(!m_finalSceneColor.Initialize(m_graphicsDevice.GetDevice(), resolution.outputWidth, resolution.outputHeight,
+                                    DXGI_FORMAT_R8G8B8A8_UNORM, m_rtvDescriptorHeap, m_resourceDescriptorHeap))
     {
         Log::Error("Failed to resize final scene color.");
         return false;
+    }
+
+    // UPSCALING.2C: the presentation resolve's output-extent targets exist only while the extents differ.
+    m_presentationColor.Shutdown();
+    m_presentationSelectionMask.Shutdown();
+    m_presentationDepth.Shutdown();
+
+    const bool presentationResolve = width != resolution.outputWidth || height != resolution.outputHeight;
+
+    if(presentationResolve)
+    {
+        ID3D12Device* const device = m_graphicsDevice.GetDevice();
+        const bool allocated =
+            m_presentationColor.Initialize(device, resolution.outputWidth, resolution.outputHeight,
+                DXGI_FORMAT_R16G16B16A16_FLOAT, m_rtvDescriptorHeap, m_resourceDescriptorHeap, {0.0f, 0.0f, 0.0f, 1.0f},
+                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) &&
+            m_presentationSelectionMask.Initialize(device, resolution.outputWidth, resolution.outputHeight,
+                DXGI_FORMAT_R8_UNORM, m_rtvDescriptorHeap, m_resourceDescriptorHeap) &&
+            m_presentationDepth.Initialize(device, resolution.outputWidth, resolution.outputHeight, m_dsvDescriptorHeap,
+                m_resourceDescriptorHeap) &&
+            m_presentationResolvePass.Initialize(device, m_shaderLibrary);
+
+        if(!allocated)
+        {
+            Log::Error("Failed to create the presentation resolve's output targets.");
+            return false;
+        }
     }
 
     // The reference path tracer is optional: a failed resize disables it but never fails Legacy.
@@ -3524,9 +3668,21 @@ bool Renderer::ResizeSceneResources(
     }
 
     m_pathTraceResetPending = true;
+    m_cameraJitterPhase = 0;
+    m_upscalerHistoryResetPending = true;
+    // UPSCALING.3B: sized for the old render extent; the next prepared frame creates them again.
+    m_dlssInputPreparationPass.ReleaseTextures();
+    // UPSCALING.3C: the GPU is idle here (ResizeScene drained it); the next DLSS frame creates the feature again.
+    m_dlssBackend.ReleaseFeature();
+    // UPSCALING.3C.4: output-extent overlay targets; the next jittered Editor frame creates them again.
+    m_overlayDepth.Shutdown();
+    m_overlaySelectionMask.Shutdown();
+    m_dlssEvaluatedLastFrame = false;
 
     m_sceneWidth = width;
     m_sceneHeight = height;
+    m_outputWidth = resolution.outputWidth;
+    m_outputHeight = resolution.outputHeight;
     return true;
 }
 
@@ -3794,7 +3950,8 @@ void Renderer::DrawMaterialRange(
 void Renderer::DrawSelectionMask(
     ID3D12GraphicsCommandList* commandList,
     const RenderObject& object,
-    D3D12_GPU_VIRTUAL_ADDRESS cameraConstantsAddress)
+    D3D12_GPU_VIRTUAL_ADDRESS cameraConstantsAddress,
+    bool depthPrepass)
 {
     if (!object.mesh)
     {
@@ -3818,7 +3975,14 @@ void Renderer::DrawSelectionMask(
         return;
     }
 
-    m_selectionMaskPass.Bind(commandList);
+    if(depthPrepass)
+    {
+        m_selectionMaskPass.BindDepthPrepass(commandList);
+    }
+    else
+    {
+        m_selectionMaskPass.Bind(commandList);
+    }
 
     commandList->SetGraphicsRootConstantBufferView(0, cameraConstantsAddress);
     commandList->SetGraphicsRootConstantBufferView(1, objectConstantsAddress);
@@ -4346,6 +4510,8 @@ void Renderer::ResetSceneHistory()
 
     m_pathTraceResetPending = true;
     m_pathTraceSequenceOrigin = m_gpuProfilerFrameSerial;
+    m_cameraJitterPhase = 0;
+    m_upscalerHistoryResetPending = true;
     InvalidatePreviousGBufferHistory();
     m_rtxdiResources.InvalidateHistory();
 }
@@ -5085,6 +5251,261 @@ void Renderer::ApplyPathTraceDenoiser(bool requested, bool rasterPrimary)
     m_pathTraceSpatial = denoise;
 }
 
+void Renderer::ApplyCameraJitter(bool requested)
+{
+    if(requested == m_cameraJitterOption)
+    {
+        return;
+    }
+
+    // Histories recorded with the other sampling pattern are not reused.
+    m_cameraJitterOption = requested;
+    m_cameraJitterPhase = 0;
+    m_upscalerHistoryResetPending = true;
+    m_pathTraceResetPending = true;
+    m_pathTraceTemporalPass.InvalidateHistory();
+    InvalidatePreviousGBufferHistory();
+    m_rtxdiResources.InvalidateHistory();
+}
+
+std::uint32_t Renderer::DlssJitterPhaseCount(unsigned int renderWidth, unsigned int renderHeight,
+    unsigned int outputWidth, unsigned int outputHeight) noexcept
+{
+    if(renderWidth == 0 || renderHeight == 0)
+    {
+        return 16u;
+    }
+
+    // The pixel-area ratio: the guide scales the base count by it (8, 18, 24, 32, 72 for 1, 1.5, 1.724, 2, 3 per axis).
+    // Rounded to the nearest count, so an odd render extent (853 x 480 for 1280 x 720 Quality) keeps the table's 18.
+    const double areaRatio = (static_cast<double>(outputWidth) * outputHeight) /
+        (static_cast<double>(renderWidth) * renderHeight);
+    const auto scaled = static_cast<std::uint32_t>(std::lround(8.0 * areaRatio));
+    return (std::max)(16u, scaled);
+}
+
+void Renderer::PublishDlssReadout()
+{
+    const DlssFeatureStatus& feature = m_dlssBackend.GetFeatureStatus();
+    const bool changed = m_dlssReadoutReason != m_dlssInactiveReason || m_dlssReadoutActive != m_dlssActiveLastFrame ||
+        m_dlssReadoutCreateResult != feature.createResult;
+
+    if(!changed || !m_debugUIInitialized)
+    {
+        return;
+    }
+
+    m_dlssReadoutReason = m_dlssInactiveReason;
+    m_dlssReadoutActive = m_dlssActiveLastFrame;
+    m_dlssReadoutCreateResult = feature.createResult;
+    std::string state = DlssAvailabilityName(m_dlssBackend.GetStatus().availability);
+    std::string detail = m_dlssBackend.GetStatus().detail;
+
+    if(IsDlssRenderScale(m_renderScale))
+    {
+        state = m_dlssActiveLastFrame ? std::string("Active (") + feature.perfQualityName + " range)" :
+            std::string("Requested, inactive: ") + m_dlssInactiveReason;
+        detail = feature.detail + (feature.supportedRanges.empty() ? "" : " Supported: " + feature.supportedRanges);
+    }
+
+    m_debugUI.SetDlssReadout(std::move(state), std::move(detail));
+}
+
+bool Renderer::RecordEditorOverlayPrepass(ID3D12GraphicsCommandList* commandList, const Scene& scene,
+    const RendererOptions& options, D3D12_GPU_VIRTUAL_ADDRESS unjitteredCameraConstantsAddress)
+{
+    // Stage 1: output-extent targets, created on first use and after each resize.
+    ID3D12Device* const device = m_graphicsDevice.GetDevice();
+
+    if(!m_overlayDepth.GetResource())
+    {
+        const bool created = m_overlayDepth.Initialize(device, m_outputWidth, m_outputHeight, m_dsvDescriptorHeap,
+            m_resourceDescriptorHeap) && m_overlaySelectionMask.Initialize(device, m_outputWidth, m_outputHeight,
+            DXGI_FORMAT_R8_UNORM, m_rtvDescriptorHeap, m_resourceDescriptorHeap);
+
+        if(!created)
+        {
+            m_overlayDepth.Shutdown();
+            m_overlaySelectionMask.Shutdown();
+            return false;
+        }
+    }
+
+    const D3D12_VIEWPORT viewport{0.0f, 0.0f, static_cast<float>(m_outputWidth), static_cast<float>(m_outputHeight),
+        0.0f, 1.0f};
+    const D3D12_RECT scissor{0, 0, static_cast<LONG>(m_outputWidth), static_cast<LONG>(m_outputHeight)};
+    commandList->RSSetViewports(1, &viewport);
+    commandList->RSSetScissorRects(1, &scissor);
+    commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+
+    // Stage 2: depth of every mesh object with the unjittered camera (the mask target takes the pipeline's colour
+    // writes and is cleared afterwards).
+    m_overlayDepth.Transition(commandList, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    m_overlaySelectionMask.Transition(commandList, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    commandList->ClearDepthStencilView(m_overlayDepth.GetDSV(), D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+    const D3D12_CPU_DESCRIPTOR_HANDLE maskRTV = m_overlaySelectionMask.GetRTV();
+    const D3D12_CPU_DESCRIPTOR_HANDLE depthDSV = m_overlayDepth.GetDSV();
+    commandList->OMSetRenderTargets(1, &maskRTV, FALSE, &depthDSV);
+
+    for(const RenderObject& object : scene.GetRenderObjects())
+    {
+        DrawSelectionMask(commandList, object, unjitteredCameraConstantsAddress, true);
+    }
+
+    // Stage 3: the selected objects into the mask, depth-tested (LESS_EQUAL, read-only) as the geometry pass's mask.
+    const float maskClearColor[] = {0.0f, 0.0f, 0.0f, 1.0f};
+    commandList->ClearRenderTargetView(maskRTV, maskClearColor, 0, nullptr);
+    m_overlayDepth.Transition(commandList, D3D12_RESOURCE_STATE_DEPTH_READ);
+    const D3D12_CPU_DESCRIPTOR_HANDLE readOnlyDSV = m_overlayDepth.GetReadOnlyDSV();
+    commandList->OMSetRenderTargets(1, &maskRTV, FALSE, &readOnlyDSV);
+    const auto& renderObjects = scene.GetRenderObjects();
+    const size_t selectionCount = options.selectedObjects.empty() ? 1 : options.selectedObjects.size();
+
+    for(size_t selection = 0; selection < selectionCount; ++selection)
+    {
+        const size_t index = options.selectedObjects.empty() ? options.selectedObject : options.selectedObjects[selection];
+
+        if(index < renderObjects.size())
+        {
+            DrawSelectionMask(commandList, renderObjects[index], unjitteredCameraConstantsAddress);
+        }
+    }
+
+    // The tone map reads both; the overlays test the depth (they transition it themselves).
+    m_overlaySelectionMask.Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    m_overlayDepth.Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    return true;
+}
+
+bool Renderer::RecordDlssEvaluation(ID3D12GraphicsCommandList* commandList, unsigned int frameIndex)
+{
+    const UpscalerFrameInputs& inputs = m_upscalerInputs;
+
+    // Stage 1: DLSS needs this frame's denoised, changing image and the prepared inputs.
+    if(m_dlssEvaluationFailureForTesting)
+    {
+        m_dlssInactiveReason = "DLSS evaluation failed (diagnostic)";
+        return false;
+    }
+
+    if(!inputs.prepared)
+    {
+        m_dlssInactiveReason = "inputs not prepared";
+        return false;
+    }
+
+    if(!inputs.colorIsPerFrameDenoised && !m_dlssColorOverrideForTesting)
+    {
+        m_dlssInactiveReason = "the path-tracing denoiser is off (no per-frame denoised colour)";
+        return false;
+    }
+
+    if(!m_dlssBackend.EnsureFeature(commandList, inputs.renderWidth, inputs.renderHeight, inputs.outputWidth,
+        inputs.outputHeight, GetDlssPreset(m_renderScale)))
+    {
+        m_dlssInactiveReason = m_dlssBackend.GetStatus().availability != DlssAvailability::Available ?
+            "DLSS unavailable" : "DLSS feature creation failed";
+        return false;
+    }
+
+    // Stage 2: the states DLSS requires (Programming Guide 3.4); it returns the resources to them.
+    RenderTarget& color = m_dlssColorOverrideForTesting ? *m_dlssColorOverrideForTesting : *inputs.color;
+    constexpr D3D12_RESOURCE_STATES input = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    color.Transition(commandList, input);
+    inputs.depth->Transition(commandList, input);
+    inputs.dlssMotionVectors->Transition(commandList, input);
+    inputs.exposure->Transition(commandList, input);
+    m_presentationColor.Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+    // Stage 3: the evaluation. Jitter converts from Engine's convention (sample = pixel centre + offset) to NGX's.
+    const float signX = m_dlssJitterSignForTesting ? (*m_dlssJitterSignForTesting)[0] : DlssJitterSignX;
+    const float signY = m_dlssJitterSignForTesting ? (*m_dlssJitterSignForTesting)[1] : DlssJitterSignY;
+    DlssEvaluation evaluation{};
+    evaluation.color = color.GetResource();
+    evaluation.output = m_presentationColor.GetResource();
+    evaluation.depth = inputs.depth->GetResource();
+    evaluation.motionVectors = inputs.dlssMotionVectors->GetResource();
+    evaluation.exposure = inputs.exposure->GetResource();
+    evaluation.jitterOffsetX = signX * inputs.jitterX;
+    evaluation.jitterOffsetY = signY * inputs.jitterY;
+    evaluation.renderWidth = inputs.renderWidth;
+    evaluation.renderHeight = inputs.renderHeight;
+    // A history discontinuity, a fresh feature or a gap in DLSS frames starts DLSS history again.
+    evaluation.reset = inputs.reset || !m_dlssEvaluatedLastFrame || m_dlssBackend.GetFeatureStatus().evaluations == 0;
+
+    m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::DlssEvaluate);
+    const bool evaluated = m_dlssBackend.Evaluate(commandList, evaluation);
+    m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::DlssEvaluate);
+
+    if(!evaluated)
+    {
+        // The frame presents the resolve's colour already in the output [assumption: a failed evaluation writes
+        // nothing]; the result code is in the feature status.
+        m_dlssInactiveReason = "DLSS evaluation failed";
+        return false;
+    }
+
+    m_dlssInactiveReason = "";
+    return true;
+}
+
+void Renderer::ApplyDlssInputPreparation(bool requested)
+{
+    if(requested == m_dlssInputPreparation)
+    {
+        return;
+    }
+
+    m_dlssInputPreparation = requested;
+    m_upscalerHistoryResetPending = true;
+    m_upscalerInputs = {};
+
+    if(!requested)
+    {
+        // Only the textures; the pipeline stays for the next time. No frame in flight reads them after the
+        // recording that stopped preparing, and Texture::Shutdown defers nothing, so wait for the GPU first.
+        if(m_dlssInputPreparationPass.GetMotionVectors().GetResource() && m_commandContext.WaitForGPU())
+        {
+            m_dlssInputPreparationPass.ReleaseTextures();
+        }
+    }
+}
+
+CameraJitterStatus Renderer::NextCameraJitter(bool applies, std::uint32_t phaseCount)
+{
+    CameraJitterStatus jitter{};
+
+    if(!applies)
+    {
+        return jitter;
+    }
+
+    if(phaseCount != m_cameraJitterPhaseCount)
+    {
+        m_cameraJitterPhaseCount = phaseCount;
+        m_cameraJitterPhase = 0;
+    }
+
+    jitter.active = true;
+    jitter.phase = m_cameraJitterPhase;
+    jitter.phaseCount = phaseCount;
+
+    if(m_cameraJitterForTesting)
+    {
+        jitter.x = (*m_cameraJitterForTesting)[0];
+        jitter.y = (*m_cameraJitterForTesting)[1];
+    }
+    else
+    {
+        // Indices 1..8: index 0 would be the pixel's corner in both bases.
+        jitter.x = Halton(jitter.phase + 1u, 2u) - 0.5f;
+        jitter.y = Halton(jitter.phase + 1u, 3u) - 0.5f;
+    }
+
+    m_cameraJitterPhase = (m_cameraJitterPhase + 1u) % phaseCount;
+    return jitter;
+}
+
 void Renderer::ApplyPathTraceDenoiserStages(const PathTraceDenoiserStages& stages)
 {
     const PathTraceDenoiserStages previous = m_pathTraceDenoiserStages;
@@ -5192,17 +5613,19 @@ bool Renderer::RecordPathTraceReference(
     PathTracePrimary primary,
     const Matrix4& view,
     const Matrix4& projection,
+    const Matrix4& cameraProjection,
     const Matrix4& inverseViewProjection,
     const Vector3& cameraPosition,
     const FrameLighting& frameLighting,
     D3D12_GPU_VIRTUAL_ADDRESS sceneLightConstantsAddress,
     const PathTraceReferenceSettings& settings)
 {
-    // Stage 1: decide whether the running mean is still valid for this frame's inputs.
+    // Stage 1: decide whether the running mean is still valid for this frame's inputs. The camera is identified by its
+    // unjittered projection, so jitter alone never restarts accumulation (UPSCALING.2B).
     PathTraceAccumulationKey key{};
     key.primary = primary;
     key.view = view;
-    key.projection = projection;
+    key.projection = cameraProjection;
     key.width = m_sceneWidth;
     key.height = m_sceneHeight;
     key.settings = settings;
@@ -5254,7 +5677,9 @@ bool Renderer::RecordPathTraceReference(
     const std::uint32_t accumulated = m_pathTraceStatus.accumulatedSamples;
     const std::uint32_t remaining = settings.maxAccumulatedSamples > accumulated ?
         settings.maxAccumulatedSamples - accumulated : 0u;
-    const std::uint32_t frameSamples = (std::min)(settings.samplesPerFrame, remaining);
+    // UPSCALING.3C: DLSS mode never holds a converged image; it traces every frame.
+    const std::uint32_t frameSamples = m_dlssModeThisFrame ? settings.samplesPerFrame :
+        (std::min)(settings.samplesPerFrame, remaining);
 
     // RTXPT.3 R3.5: a ReSTIR DI frame that traces nothing writes no reservoirs, so the committed ones would no
     // longer belong to the immediately preceding frame. They are dropped.
@@ -5668,7 +6093,8 @@ bool Renderer::RecordPathTraceTemporal(
     // (accumulation not restarted, temporal history valid, the same valid scene-lighting epoch, the previous frame
     // updated it); it is used only after PathTraceExtendedStableFrames such frames.
     m_pathTraceExtendedUsed = false;
-    const bool extended = m_pathTraceExtendedDiffuse &&
+    // UPSCALING.3C: DLSS keeps its own history; the extended accumulator is left out in DLSS mode.
+    const bool extended = m_pathTraceExtendedDiffuse && !m_dlssModeThisFrame &&
         m_pathTraceTemporalPass.EnsureExtended(m_graphicsDevice.GetDevice(), m_resourceDescriptorHeap);
 
     if(extended)
@@ -6682,6 +7108,8 @@ bool Renderer::RecordRenderFrame(
     ApplySharcSettings(options.sharc, rasterPrimaryMode);
     ApplyPathTraceDenoiser(options.pathTraceDenoiser, rasterPrimaryMode);
     ApplyPathTraceDenoiserStages(options.pathTraceDenoiserStages);
+    ApplyCameraJitter(options.pathTraceCameraJitter);
+    ApplyDlssInputPreparation(options.dlssInputPreparation);
     UpdateRadianceCacheD6(options.experimentalD6RadianceCache || m_sharcSettings.enabled);
     // Keep generation/revision evidence through End, which invalidates active eligibility.
     const auto textureUploadGeneration = m_activeRecordingGeneration;
@@ -7007,8 +7435,66 @@ bool Renderer::RecordRenderFrame(
     const Matrix4 currentProjection = frameView.projection;
     const Matrix4 currentViewProjection = currentProjection * currentView;
 
+    // UPSCALING.2B: the unjittered matrices above identify the camera (accumulation key, motion vectors, overlays,
+    // previous-frame state); the render matrices rasterize the G-buffer and reconstruct positions from it.
+    const bool jitterApplies = runPathTrace &&
+        (pathTracePrimary == PathTracePrimary::Raster || pathTracePrimary == PathTracePrimary::RasterReSTIRDI);
+    // UPSCALING.3C: DLSS mode jitters and uses the DLSS phase policy. UPSCALING.3C.4: only while DLSS can evaluate
+    // (available, and its feature not failed for these extents); otherwise the frame is the plain diagnostic resolve,
+    // unjittered unless the experimental jitter option asks for it.
+    const DlssFeatureStatus& dlssFeature = m_dlssBackend.GetFeatureStatus();
+    const bool dlssFeatureFailed = dlssFeature.createResult != 0 && !dlssFeature.active &&
+        dlssFeature.renderWidth == m_sceneWidth && dlssFeature.renderHeight == m_sceneHeight &&
+        dlssFeature.outputWidth == m_outputWidth && dlssFeature.outputHeight == m_outputHeight;
+    const bool dlssAvailable = m_dlssBackend.GetStatus().availability == DlssAvailability::Available &&
+        !m_dlssBackend.availabilityOverrideForTesting;
+    const bool dlssDenoisedColor = m_pathTraceTemporal || m_dlssColorOverrideForTesting;
+    m_dlssFallbackReason = "";
+
+    if(!dlssAvailable)
+    {
+        m_dlssFallbackReason = "DLSS unavailable";
+    }
+    else if(m_dlssPresetUnsupported)
+    {
+        m_dlssFallbackReason = "the preset is not supported at this output resolution";
+    }
+    else if(dlssFeatureFailed)
+    {
+        m_dlssFallbackReason = "DLSS feature creation failed";
+    }
+    else if(!dlssDenoisedColor)
+    {
+        m_dlssFallbackReason = "the path-tracing denoiser is off (no per-frame denoised colour)";
+    }
+
+    m_dlssModeThisFrame = jitterApplies && IsDlssRenderScale(m_renderScale) && m_dlssFallbackReason[0] == '\0';
+    const bool dlssPhases = m_dlssInputPreparation || m_dlssModeThisFrame;
+    const std::uint32_t jitterPhaseCount = dlssPhases ?
+        DlssJitterPhaseCount(m_sceneWidth, m_sceneHeight, m_outputWidth, m_outputHeight) : CameraJitterPhaseCount;
+    m_cameraJitterStatus = NextCameraJitter(jitterApplies && (m_cameraJitterOption || m_dlssModeThisFrame),
+        jitterPhaseCount);
+    m_debugUI.SetPathTraceCameraJitterReadout(m_cameraJitterStatus.active, m_cameraJitterStatus.phase,
+        m_cameraJitterStatus.phaseCount, m_cameraJitterStatus.x, m_cameraJitterStatus.y);
+    const Matrix4 renderProjection = m_cameraJitterStatus.active ?
+        JitterProjection(currentProjection, m_cameraJitterStatus.x, m_cameraJitterStatus.y, m_sceneWidth, m_sceneHeight) :
+        currentProjection;
+    const Matrix4 renderViewProjection = m_cameraJitterStatus.active ? renderProjection * currentView :
+        currentViewProjection;
+
     CameraConstants cameraConstants = BuildFrameCameraConstants(
         currentView, currentViewProjection, m_previousView, m_previousViewProjection, m_hasPreviousViewProjection);
+    cameraConstants.unjitteredViewProjection = currentViewProjection;
+    cameraConstants.viewProjection = renderViewProjection;
+    // UPSCALING.3D: DLSS reconstructs output-resolution texture detail from biased render samples.
+    cameraConstants.textureMipBias = 0.0f;
+
+    if(m_dlssModeThisFrame)
+    {
+        const float offset = m_dlssMipBiasOffsetForTesting ? *m_dlssMipBiasOffsetForTesting : DlssTextureMipBiasOffset;
+        cameraConstants.textureMipBias = std::isnan(offset) ? 0.0f :
+            std::log2(static_cast<float>(m_sceneWidth) / static_cast<float>(m_outputWidth)) + offset;
+    }
 
     const Matrix4 previousNrdView = m_hasPreviousNrdCamera ? m_previousNrdView : currentView;
 
@@ -7196,7 +7682,8 @@ bool Renderer::RecordRenderFrame(
     reflectionConstants.importanceHeight = m_environment.GetImportanceHeight();
     reflectionConstants.importanceTotalWeight = m_environment.GetImportanceTotalWeight();
 
-    m_previousViewProjection = cameraConstants.viewProjection;
+    // Unjittered: the next frame's motion vectors exclude jitter.
+    m_previousViewProjection = currentViewProjection;
     m_previousView = cameraConstants.view;
     m_hasPreviousViewProjection = true;
 
@@ -7323,17 +7810,18 @@ bool Renderer::RecordRenderFrame(
         // The path tracer replaces lighting only; the G-buffer above still feeds selection outlines and
         // overlay depth testing, and is the raster primary's first vertex (EndGeometryPass left it readable).
         // No legacy lighting pass is recorded; legacy histories reset when the mode is left.
-        if(!RecordPathTraceReference(commandList, frameIndex, pathTracePrimary, currentView, currentProjection,
-            reconstructionConstants.inverseViewProjection, frameView.position, frameLighting,
+        // reconstructionConstants.inverseViewProjection inverts the render (rasterization) view-projection.
+        if(!RecordPathTraceReference(commandList, frameIndex, pathTracePrimary, currentView, renderProjection,
+            currentProjection, reconstructionConstants.inverseViewProjection, frameView.position, frameLighting,
             sceneLightConstantsAddress, options.pathTraceReference))
         {
             return false;
         }
 
         // The G-buffer is final here; the copy precedes tone mapping and the Editor overlays and restores
-        // every G-buffer state it changes.
-        const PreviousGBufferCamera copiedCamera{currentView, currentProjection,
-            CameraRelativeInverseViewProjection(currentView, currentProjection), frameView.position};
+        // every G-buffer state it changes. Its camera reconstructs positions from it, so it is the render projection.
+        const PreviousGBufferCamera copiedCamera{currentView, renderProjection,
+            CameraRelativeInverseViewProjection(currentView, renderProjection), frameView.position};
         m_previousGBufferAvailableThisFrame = m_previousGBufferValid;
         RecordPreviousGBufferCopy(commandList, copiedCamera);
     }
@@ -7680,6 +8168,163 @@ bool Renderer::RecordRenderFrame(
         commandList->ClearRenderTargetView(m_sceneColor.GetRTV(), emptyColor, 0, nullptr);
     }
 
+    // UPSCALING.3B: DLSS inputs from the final G-buffer and scene colour, only while preparation is on. Nothing reads
+    // them yet (UPSCALING.3C evaluates DLSS here, in place of the diagnostic resolve's colour).
+    m_upscalerInputs.prepared = false;
+
+    if(m_dlssInputPreparation || m_dlssModeThisFrame)
+    {
+        if(!m_dlssInputPreparationPass.Ensure(m_graphicsDevice.GetDevice(), m_shaderLibrary, m_resourceDescriptorHeap,
+            m_sceneWidth, m_sceneHeight))
+        {
+            return false;
+        }
+
+        DlssInputPreparationPass::Matrices matrices{};
+        matrices.inverseCameraRelativeRenderViewProjection = CameraRelativeInverseViewProjection(currentView, renderProjection);
+        matrices.viewProjection = cameraConstants.unjitteredViewProjection;
+        matrices.previousViewProjection = cameraConstants.previousViewProjection;
+        // The tone mapper's fixed exposure (ToneMapPass); DLSS reads the same value from the 1x1 texture.
+        constexpr float toneMapExposure = 1.0f;
+
+        m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::DlssInputPreparation);
+        const bool prepared = m_dlssInputPreparationPass.Record(commandList, m_uploadBuffer, m_gBuffer.GetMotion(),
+            m_gBuffer.GetDepth(), matrices, toneMapExposure);
+        m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::DlssInputPreparation);
+
+        if(!prepared)
+        {
+            return false;
+        }
+
+        UpscalerFrameInputs& inputs = m_upscalerInputs;
+        inputs.prepared = true;
+        inputs.renderWidth = m_sceneWidth;
+        inputs.renderHeight = m_sceneHeight;
+        inputs.outputWidth = m_outputWidth;
+        inputs.outputHeight = m_outputHeight;
+        inputs.color = &m_sceneColor;
+        inputs.colorIsPerFrameDenoised = runPathTrace && m_pathTracePendingSamples > 0 && m_pathTraceTemporalRanLastFrame &&
+            (m_pathTraceSpatialRanLastFrame || m_pathTraceTemporalPresentation);
+        inputs.depth = &m_gBuffer.GetDepth();
+        inputs.engineMotion = &m_gBuffer.GetMotion();
+        inputs.dlssMotionVectors = &m_dlssInputPreparationPass.GetMotionVectors();
+        inputs.exposure = &m_dlssInputPreparationPass.GetExposure();
+        inputs.exposureValue = toneMapExposure;
+        inputs.jitterX = m_cameraJitterStatus.x;
+        inputs.jitterY = m_cameraJitterStatus.y;
+        inputs.jitterPhaseCount = m_cameraJitterStatus.phaseCount;
+        inputs.reset = m_upscalerHistoryResetPending;
+        m_upscalerHistoryResetPending = false;
+    }
+
+    if(!PresentationResolveActive() || !m_dlssModeThisFrame)
+    {
+        m_dlssActiveLastFrame = false;
+        m_dlssEvaluatedLastFrame = false;
+        m_dlssInactiveReason = "";
+
+        if(IsDlssRenderScale(m_renderScale))
+        {
+            m_dlssInactiveReason = jitterApplies ? m_dlssFallbackReason : "not a raster-primary path-traced frame";
+        }
+    }
+
+    // UPSCALING.2C: at a reduced render extent the diagnostic resolve first brings scene colour, selection mask and
+    // depth to the output extent, and everything from tone mapping on runs there as in Native. Debug views that read
+    // render-extent textures are not shown then. Native records none of this and keeps its viewport.
+    RenderTarget* presentedColor = &m_sceneColor;
+    RenderTarget* presentedSelectionMask = &m_selectionMask;
+    DepthBuffer* presentedDepth = &m_gBuffer.GetDepth();
+    Texture* presentedDebugTexture = debugTexture;
+    RenderTarget* presentedDebugRenderTarget = debugRenderTarget;
+
+    if(PresentationResolveActive())
+    {
+        const D3D12_VIEWPORT outputViewport{0.0f, 0.0f, static_cast<float>(m_outputWidth),
+            static_cast<float>(m_outputHeight), 0.0f, 1.0f};
+        const D3D12_RECT outputScissor{0, 0, static_cast<LONG>(m_outputWidth), static_cast<LONG>(m_outputHeight)};
+        commandList->RSSetViewports(1, &outputViewport);
+        commandList->RSSetScissorRects(1, &outputScissor);
+
+        // UPSCALING.3D: when the Editor overlay prepass supplies depth and mask (every jittered Editor frame, so every
+        // Editor DLSS frame), DLSS is evaluated first and the resolve, whose colour DLSS would overwrite and whose
+        // depth and mask nothing would read, runs only if DLSS did not evaluate. Otherwise (the packaged runtime) the
+        // resolve runs first for its depth and mask and DLSS replaces its colour. Either way the output is written.
+        const bool overlayPrepass = !m_packagedRuntime && m_cameraJitterStatus.active;
+        const auto recordResolve = [&]()
+        {
+            m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex,
+                GpuTimestampProfiler::Region::PresentationResolve);
+            // The G-buffer and mask were rasterized with this frame's jitter; the overlays drawn after use the
+            // unjittered camera (UPSCALING.3C.3).
+            m_presentationResolvePass.Execute(commandList, m_sceneColor, m_gBuffer.GetDepth(), m_selectionMask,
+                m_presentationColor, m_presentationSelectionMask, m_presentationDepth, m_cameraJitterStatus.x,
+                m_cameraJitterStatus.y);
+            m_gpuTimestampProfiler.EndRegion(commandList, frameIndex,
+                GpuTimestampProfiler::Region::PresentationResolve);
+        };
+        const bool dlssFirst = m_dlssModeThisFrame && overlayPrepass;
+
+        if(!dlssFirst)
+        {
+            recordResolve();
+        }
+
+        // UPSCALING.3C: NGX leaves the command list's state undefined, so everything the following passes rely on is
+        // set again.
+        const bool dlssEvaluated = m_dlssModeThisFrame && RecordDlssEvaluation(commandList, frameIndex);
+        m_dlssActiveLastFrame = dlssEvaluated;
+        m_dlssEvaluatedLastFrame = dlssEvaluated;
+        m_presentationResolveSkippedLastFrame = dlssFirst && dlssEvaluated;
+
+        PublishDlssReadout();
+
+        if(dlssEvaluated)
+        {
+            ID3D12DescriptorHeap* heaps[] = {m_resourceDescriptorHeap.GetHeap()};
+            commandList->SetDescriptorHeaps(1, heaps);
+            commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            commandList->RSSetViewports(1, &outputViewport);
+            commandList->RSSetScissorRects(1, &outputScissor);
+        }
+
+        // DLSS did not evaluate (creation or evaluation failed, or inputs missing): the resolve's colour is presented.
+        if(dlssFirst && !dlssEvaluated)
+        {
+            recordResolve();
+        }
+
+        presentedColor = &m_presentationColor;
+        presentedSelectionMask = &m_presentationSelectionMask;
+        presentedDepth = &m_presentationDepth;
+        presentedDebugTexture = nullptr;
+        presentedDebugRenderTarget = nullptr;
+    }
+
+    // UPSCALING.3C.4: a jittered Editor frame gets unjittered overlay depth and selection mask at the output extent.
+    if(!m_packagedRuntime && m_cameraJitterStatus.active)
+    {
+        CameraConstants overlayCamera = cameraConstants;
+        overlayCamera.viewProjection = overlayCamera.unjitteredViewProjection;
+        const D3D12_GPU_VIRTUAL_ADDRESS overlayCameraAddress = m_uploadBuffer.Allocate(&overlayCamera,
+            sizeof(CameraConstants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
+
+        m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::EditorOverlayPrepass);
+        const bool prepassed = overlayCameraAddress != 0 &&
+            RecordEditorOverlayPrepass(commandList, scene, options, overlayCameraAddress);
+        m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::EditorOverlayPrepass);
+
+        if(!prepassed)
+        {
+            Log::Error("Editor overlay prepass failed.");
+            return false;
+        }
+
+        presentedSelectionMask = &m_overlaySelectionMask;
+        presentedDepth = &m_overlayDepth;
+    }
+
     // Final composition precedes collider lines and the distinct Editor/packaged presentation paths.
     m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::ToneMap);
 
@@ -7690,13 +8335,24 @@ bool Renderer::RecordRenderFrame(
     const ToneMapDebugView presentedDebugView = runPathTrace ? pathTraceDebugView : debugView;
 
     m_finalSceneColor.Transition(commandList, D3D12_RESOURCE_STATE_RENDER_TARGET);
-    m_toneMapPass.Execute(commandList, m_sceneColor, m_finalSceneColor.GetRTV(), debugTexture,
+    m_toneMapPass.Execute(commandList, *presentedColor, m_finalSceneColor.GetRTV(), presentedDebugTexture,
                           hasRenderableMeshes ? presentedDebugView : ToneMapDebugView::None, nrdDenoisingRange,
-                          debugRenderTarget, &m_selectionMask, options.selectionOutlineColor,
+                          presentedDebugRenderTarget, presentedSelectionMask, options.selectionOutlineColor,
                           presentedDebugView == ToneMapDebugView::None ? options.selectionOutlineThickness : 0,
-                          m_gBuffer.GetDepth().GetSRVIndex());
+                          presentedDepth->GetSRVIndex());
 
     m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::ToneMap);
+
+    // Diagnostics only: the image before the overlays, for overlay-contribution measurements.
+    if(m_preOverlayCopyForTesting && m_preOverlayCopyForTesting->GetWidth() == m_finalSceneColor.GetWidth() &&
+        m_preOverlayCopyForTesting->GetHeight() == m_finalSceneColor.GetHeight())
+    {
+        m_finalSceneColor.Transition(commandList, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        m_preOverlayCopyForTesting->Transition(commandList, D3D12_RESOURCE_STATE_COPY_DEST);
+        commandList->CopyResource(m_preOverlayCopyForTesting->GetResource(), m_finalSceneColor.GetResource());
+        m_preOverlayCopyForTesting->Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        m_finalSceneColor.Transition(commandList, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    }
 
     // Draw only into the final editor image: temporal history and lighting must never see these lines.
     // The grid goes first so collider lines stay on top of it.
@@ -7705,7 +8361,7 @@ bool Renderer::RecordRenderFrame(
 
     if (editorOverlayFrame && options.editorGrid)
     {
-        m_editorGridPass.Execute(commandList, m_finalSceneColor, m_gBuffer.GetDepth(), currentView,
+        m_editorGridPass.Execute(commandList, m_finalSceneColor, *presentedDepth, currentView,
             currentProjection, frameView.position, *options.editorGrid);
     }
 
@@ -7714,7 +8370,7 @@ bool Renderer::RecordRenderFrame(
     {
         if (colliderOverlay->Matches(scene, m_sceneResourceLifetime))
         {
-            m_editorColliderPass.Execute(commandList, m_finalSceneColor, m_gBuffer.GetDepth(),
+            m_editorColliderPass.Execute(commandList, m_finalSceneColor, *presentedDepth,
                 currentViewProjection, *colliderOverlay);
         }
     }
@@ -7726,8 +8382,9 @@ bool Renderer::RecordRenderFrame(
         const D3D12_RECT scissor{0, 0, static_cast<LONG>(m_applicationWidth), static_cast<LONG>(m_applicationHeight)};
         commandList->RSSetViewports(1, &viewport);
         commandList->RSSetScissorRects(1, &scissor);
-        m_toneMapPass.Execute(commandList, m_sceneColor, rtvHandle, nullptr, ToneMapDebugView::None, nrdDenoisingRange,
-            nullptr, &m_selectionMask, options.selectionOutlineColor, 0, m_gBuffer.GetDepth().GetSRVIndex());
+        m_toneMapPass.Execute(commandList, *presentedColor, rtvHandle, nullptr, ToneMapDebugView::None,
+            nrdDenoisingRange, nullptr, presentedSelectionMask, options.selectionOutlineColor, 0,
+            presentedDepth->GetSRVIndex());
         barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
         barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
         commandList->ResourceBarrier(1, &barrier);
@@ -8012,6 +8669,10 @@ void Renderer::Shutdown()
     m_rayTracingScene.Shutdown();
     m_textureThumbnails.ClearAfterGPUDrain();
 
+    // No DLSS work can be in flight after the drain; NGX must be released before the device.
+    m_dlssBackend.Shutdown();
+    m_dlssInputPreparationPass.Shutdown();
+
     Log::Info("Renderer shutdown: GPU finished.");
     ShutdownMaterialTables();
 
@@ -8116,6 +8777,12 @@ void Renderer::Shutdown()
     m_sceneColor.Shutdown();
     m_finalSceneColor.Shutdown();
     m_selectionMask.Shutdown();
+    m_presentationColor.Shutdown();
+    m_presentationSelectionMask.Shutdown();
+    m_presentationDepth.Shutdown();
+    m_presentationResolvePass.Shutdown();
+    m_overlayDepth.Shutdown();
+    m_overlaySelectionMask.Shutdown();
 
     m_brdfIntegrationLUT.Shutdown();
     m_ggxAverageAlbedoLUT.Shutdown();
@@ -8614,15 +9281,16 @@ bool Renderer::TryGetFinalSceneImage(FinalSceneImage& image) const
         return false;
     }
 
-    if(m_sceneWidth == 0 || m_sceneHeight == 0 ||
-       m_finalSceneColor.GetWidth() != m_sceneWidth || m_finalSceneColor.GetHeight() != m_sceneHeight)
+    // The scene behind the image needs a coherent render extent too.
+    if(m_sceneWidth == 0 || m_sceneHeight == 0 || m_outputWidth == 0 || m_outputHeight == 0 ||
+       m_finalSceneColor.GetWidth() != m_outputWidth || m_finalSceneColor.GetHeight() != m_outputHeight)
     {
         return false;
     }
 
     image.srv = m_resourceDescriptorHeap.GetGPUHandle(m_finalSceneColor.GetSRVIndex());
-    image.width = m_sceneWidth;
-    image.height = m_sceneHeight;
+    image.width = m_outputWidth;
+    image.height = m_outputHeight;
     return true;
 }
 

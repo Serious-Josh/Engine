@@ -18,9 +18,11 @@ class RenderTarget
     RenderTarget(RenderTarget&& other) noexcept;
     RenderTarget& operator=(RenderTarget&& other) noexcept;
 
+    // extraFlags is added to ALLOW_RENDER_TARGET (UPSCALING.3C: ALLOW_UNORDERED_ACCESS for the DLSS output).
     bool Initialize(ID3D12Device* device, unsigned int width, unsigned int height, DXGI_FORMAT format,
                     DescriptorHeap& rtvHeap, DescriptorHeap& resourceHeap,
-                    const std::array<float, 4>& optimizedClearColor = {0.0f, 0.0f, 0.0f, 1.0f});
+                    const std::array<float, 4>& optimizedClearColor = {0.0f, 0.0f, 0.0f, 1.0f},
+                    D3D12_RESOURCE_FLAGS extraFlags = D3D12_RESOURCE_FLAG_NONE);
 
     void Shutdown();
 

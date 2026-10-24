@@ -48,6 +48,14 @@ class GpuTimestampProfiler
         RadianceCacheInsertion,
         // SHARC.4D-R sparse training dispatch, after PathTraceReference and before the insertion.
         RadianceCacheTraining,
+        // UPSCALING.2C diagnostic presentation resolve (reduced render scale only), before ToneMap.
+        PresentationResolve,
+        // UPSCALING.3B DLSS input preparation (diagnostic only), before PresentationResolve.
+        DlssInputPreparation,
+        // UPSCALING.3C NGX DLSS Super Resolution evaluation, after PresentationResolve.
+        DlssEvaluate,
+        // UPSCALING.3C.4 Editor overlay depth/mask prepass (jittered Editor frames only), before ToneMap.
+        EditorOverlayPrepass,
         Count
     };
 
@@ -66,7 +74,7 @@ class GpuTimestampProfiler
         FrameGap resolvedGaps[FrameCount]{};
         unsigned int resolvedGapCount = 0;
         double milliseconds[static_cast<unsigned int>(Region::Count)]{};
-        uint32_t validRegions = 0;
+        uint64_t validRegions = 0;
 
         bool interFrameGapValid = false;
         bool interFrameGapOutOfOrder = false;
@@ -118,7 +126,7 @@ class GpuTimestampProfiler
         Region region);
 
     static constexpr unsigned int RegionCount = static_cast<unsigned int>(Region::Count);
-    static_assert(RegionCount <= 32, "GPU region validity masks use 32 bits.");
+    static_assert(RegionCount <= 64, "GPU region validity masks use 64 bits.");
 
     static constexpr unsigned int QueriesPerRegion = 2;
     static constexpr unsigned int QueriesPerFrame = RegionCount * QueriesPerRegion;
@@ -138,7 +146,7 @@ class GpuTimestampProfiler
         uint64_t submissionFence = 0;
         uint64_t frameSerial = 0;
 
-        uint32_t recordedRegions = 0;
+        uint64_t recordedRegions = 0;
 
         bool pending = false;
 

@@ -64,7 +64,8 @@ bool RenderTarget::Initialize(
     DXGI_FORMAT format,
     DescriptorHeap& rtvHeap,
     DescriptorHeap& resourceHeap,
-    const std::array<float, 4>& optimizedClearColor)
+    const std::array<float, 4>& optimizedClearColor,
+    D3D12_RESOURCE_FLAGS extraFlags)
 {
     if (!device || width == 0 || height == 0)
     {
@@ -82,7 +83,7 @@ bool RenderTarget::Initialize(
     description.Format = format;
     description.SampleDesc.Count = 1;
     description.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-    description.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    description.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | extraFlags;
 
     D3D12_HEAP_PROPERTIES heapProperties{};
     heapProperties.Type = D3D12_HEAP_TYPE_DEFAULT;

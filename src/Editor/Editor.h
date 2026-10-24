@@ -417,6 +417,19 @@ public:
     }
 
     void SetViewportPublicationIdentity(std::uint64_t rendererLifetime, std::uint64_t bindingEpoch);
+
+    // UPSCALING.3B Resolution Info overlay: the renderer's actual extents and presentation mode for this frame.
+    struct ViewportResolutionInfo
+    {
+        unsigned int outputWidth = 0;
+        unsigned int outputHeight = 0;
+        unsigned int renderWidth = 0;
+        unsigned int renderHeight = 0;
+        // Renderer::GetPresentationModeName(); static storage.
+        const char* mode = "";
+    };
+
+    void SetViewportResolutionInfo(const ViewportResolutionInfo& info) noexcept { m_viewportResolutionInfo = info; }
     void RefreshViewportMarqueePreview(const IDemoScene& scene);
     const std::vector<std::size_t>* GetViewportMarqueePreview(const IDemoScene& scene) const;
     const std::vector<size_t>& GetSelectedObjects() const noexcept { return m_selectedObjects; }
@@ -633,6 +646,9 @@ private:
     bool m_showLightWireframes = true;
     // Display preference, independent of Snap; default visible. Persisted in Editor preferences.
     bool m_showViewportGrid = true;
+    // UPSCALING.3B Resolution Info overlay: session-only, hidden by default, never persisted.
+    bool m_showResolutionInfo = false;
+    ViewportResolutionInfo m_viewportResolutionInfo;
     // Gizmo snapping (G.1 translation, G.2 rotation). One master toggle drives both modes; each
     // has its own interval. Persisted only in global Editor preferences (PR.5), never in scenes,
     // cooked payloads or history.
@@ -643,6 +659,7 @@ private:
     float m_translationSnapIntervalDraft = ViewportGridSnap::kDefaultInterval;
     float m_rotationSnapIntervalDraft = ViewportGridSnap::kDefaultRotationIntervalDegrees;
     EditorWorkspaceRect m_viewportContentRegion;
+    void DrawResolutionInfo(const ImVec2& position) const;
     void DrawSceneViewportToolbar(const EditorWorkspaceRect& toolbarRectangle);
     void DrawGridSnapControls(float rightEdge);
     Vector3 SnapGizmoTranslation(const Vector3& dragStart, const Vector3& continuousPosition) const;

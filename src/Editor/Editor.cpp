@@ -409,6 +409,53 @@ void Editor::DrawMainMenu(
     ImGui::EndMainMenuBar();
 }
 
+void Editor::DrawResolutionInfo(const ImVec2& position) const
+{
+    const ViewportResolutionInfo& info = m_viewportResolutionInfo;
+
+    if(info.outputWidth == 0 || info.outputHeight == 0)
+    {
+        return;
+    }
+
+    // The effective scale is reported per axis as the renderer chose the extents; equal axes print once.
+    const double scaleX = 100.0 * info.renderWidth / info.outputWidth;
+    const double scaleY = 100.0 * info.renderHeight / info.outputHeight;
+    char lines[4][96]{};
+    std::snprintf(lines[0], sizeof(lines[0]), "Output   %u x %u", info.outputWidth, info.outputHeight);
+    std::snprintf(lines[1], sizeof(lines[1]), "Render   %u x %u", info.renderWidth, info.renderHeight);
+
+    if(std::abs(scaleX - scaleY) < 0.05)
+    {
+        std::snprintf(lines[2], sizeof(lines[2]), "Scale    %.1f%%", scaleX);
+    }
+    else
+    {
+        std::snprintf(lines[2], sizeof(lines[2]), "Scale    %.1f%% x %.1f%%", scaleX, scaleY);
+    }
+
+    std::snprintf(lines[3], sizeof(lines[3]), "Mode     %s", info.mode);
+
+    float width = 0.0f;
+
+    for(const char* line : lines)
+    {
+        width = (std::max)(width, ImGui::CalcTextSize(line).x);
+    }
+
+    const float padding = 6.0f;
+    const float lineHeight = ImGui::GetTextLineHeightWithSpacing();
+    ImDrawList* drawList = ImGui::GetWindowDrawList();
+    drawList->AddRectFilled(position, ImVec2(position.x + width + 2.0f * padding,
+        position.y + 4.0f * lineHeight + 2.0f * padding - ImGui::GetStyle().ItemSpacing.y), IM_COL32(0, 0, 0, 150), 4.0f);
+
+    for(int line = 0; line < 4; ++line)
+    {
+        drawList->AddText(ImVec2(position.x + padding, position.y + padding + line * lineHeight),
+            IM_COL32(230, 230, 230, 255), lines[line]);
+    }
+}
+
 void Editor::DrawSceneViewportToolbar(const EditorWorkspaceRect& toolbarRectangle)
 {
     if(toolbarRectangle.size.x <= 0.0f || toolbarRectangle.size.y <= 0.0f)
@@ -444,6 +491,7 @@ void Editor::DrawSceneViewportToolbar(const EditorWorkspaceRect& toolbarRectangl
             ImGui::Checkbox("Camera Frusta", &m_showCameraFrusta);
             ImGui::Checkbox("Light Wireframes", &m_showLightWireframes);
             ImGui::Checkbox("Grid", &m_showViewportGrid);
+            ImGui::Checkbox("Resolution Info", &m_showResolutionInfo);
             ImGui::EndCombo();
         }
     }
@@ -704,6 +752,15 @@ void Editor::DrawSceneViewport(
                 ImGui::GetWindowDrawList()->AddText(ImVec2(position.x + 12.0f,
                     position.y + size.y - ImGui::GetTextLineHeightWithSpacing() - 12.0f),
                     IM_COL32(240, 220, 170, 255), m_materialDropStatus.c_str());
+            }
+
+            if(m_showResolutionInfo)
+            {
+                // Below any status lines at the top-left; drawn into this input-less window, so it never takes input.
+                const int statusLines = static_cast<int>(!m_meshCreationStatus.empty()) +
+                    static_cast<int>(!m_sceneObjectDeletionStatus.empty()) + static_cast<int>(!m_sceneHistoryStatus.empty());
+                DrawResolutionInfo(ImVec2(position.x + 8.0f,
+                    position.y + 8.0f + statusLines * ImGui::GetTextLineHeightWithSpacing()));
             }
         }
     }

@@ -69,6 +69,7 @@ FetchContent_MakeAvailable(nlohmann_json)
 
 include(cmake/AgilitySDK.cmake)
 include(cmake/DXC.cmake)
+include(cmake/DLSS.cmake)
 
 include(cmake/Box3D.cmake)
 add_subdirectory(src/Physics)
@@ -152,6 +153,7 @@ add_library(EngineCore OBJECT
     src/Core/Input.cpp
     src/Core/Log.cpp
     src/Renderer/Renderer.cpp
+    src/Renderer/Upscaling/DlssBackend.cpp
     src/Renderer/Displacement/DisplacementUpdateState.cpp
     src/Renderer/Displacement/DisplacementUpdateCoordinator.cpp
     src/Renderer/Displacement/DisplacementCommandRecorder.cpp
@@ -564,9 +566,12 @@ add_custom_command(
     COMMENT "Copying runtime assets and dependencies"
 )
 engine_deploy_dxc(Engine)
+# The Editor initializes DLSS; the packaged runtime does not yet, so it gets no DLSS runtime.
+engine_deploy_dlss(Engine)
 
 # Agility SDK D3D12 headers take precedence over the Windows SDK copies.
 target_include_directories(EngineCore BEFORE PUBLIC "${ENGINE_AGILITY_SDK_INCLUDE_DIR}")
+engine_configure_dlss(EngineCore)
 target_compile_definitions(EngineCore PRIVATE ENGINE_AGILITY_SDK_VERSION=${ENGINE_AGILITY_SDK_VERSION}
     ENGINE_AGILITY_SDK_PACKAGE_VERSION="${ENGINE_AGILITY_SDK_PACKAGE_VERSION}")
 

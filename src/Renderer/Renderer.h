@@ -41,6 +41,9 @@
 #include "RayTracing/RayTracingSceneResources.h"
 
 #include "Passes/ToneMapPass.h"
+#include "Passes/PresentationResolvePass.h"
+#include "Passes/DlssInputPreparationPass.h"
+#include "Upscaling/DlssBackend.h"
 #include "Passes/DeferredLightingPass.h"
 #include "Passes/BRDFIntegrationPass.h"
 #include "Passes/GGXAverageAlbedoPass.h"
@@ -144,6 +147,61 @@ struct RendererOptions
     bool pathTraceDenoiser = false;
     // DENOISE.1 diagnostics: which denoiser stages run (defaults: the production pipeline). Applied when it changes.
     PathTraceDenoiserStages pathTraceDenoiserStages;
+    // UPSCALING.2B diagnostics: sub-pixel camera jitter on Path Traced Raster Primary frames (with ReSTIR DI too). Off
+    // by default: the unjittered path, unchanged. Not saved.
+    bool pathTraceCameraJitter = false;
+    // UPSCALING.3B diagnostics: prepare the DLSS inputs (DLSS motion vectors with sky motion, exposure texture, the
+    // DLSS jitter phase count, the per-frame upscaler input contract) without evaluating DLSS. Off by default: no pass,
+    // no allocation, unchanged rendering. Not saved.
+    bool dlssInputPreparation = false;
+};
+
+// UPSCALING.3B: Engine's per-frame upscaler input contract, filled on frames that prepare DLSS inputs. Everything a
+// temporal upscaler (DLSS now, Engine's own later) consumes at the render extent. The resources are borrowed from the
+// renderer and valid until the next scene resize or shutdown; nothing here is DLSS-specific except dlssMotionVectors
+// and exposure, which DlssInputPreparationPass derives.
+struct UpscalerFrameInputs
+{
+    // Whether this frame recorded the preparation (all fields below describe that frame).
+    bool prepared = false;
+    unsigned int renderWidth = 0;
+    unsigned int renderHeight = 0;
+    unsigned int outputWidth = 0;
+    unsigned int outputHeight = 0;
+    // Linear HDR scene colour at the render extent (RGBA16F, before tone mapping; alpha unused).
+    RenderTarget* color = nullptr;
+    // Whether color is this frame's per-frame denoised path-traced image (temporal + spatial denoiser ran, samples were
+    // traced this frame), the source the vendor upscaler must use. False for held, undenoised or Legacy frames.
+    bool colorIsPerFrameDenoised = false;
+    // Raster depth at the render extent (D32, near 0 / far 1, sky 1; jittered like the G-buffer).
+    DepthBuffer* depth = nullptr;
+    // Engine's motion (RGBA16F: xy currentUV - previousUV, unjittered; z view-depth change; w material AO).
+    RenderTarget* engineMotion = nullptr;
+    // DLSS motion (RG16F: previous - current pixel position, render pixels, unjittered, sky included).
+    Texture* dlssMotionVectors = nullptr;
+    // 1x1 R16F holding exposure (the tone mapper's fixed 1.0).
+    Texture* exposure = nullptr;
+    float exposureValue = 1.0f;
+    // This frame's jitter (render pixels; CameraJitterStatus convention).
+    float jitterX = 0.0f;
+    float jitterY = 0.0f;
+    std::uint32_t jitterPhaseCount = 0;
+    // A history discontinuity since the previous prepared frame (scene activation, material revision, HDRI change,
+    // camera cut, resize, mode or option change): DLSS InReset. Camera motion alone never sets it.
+    bool reset = false;
+};
+
+// UPSCALING.2B: the camera jitter of the most recently recorded frame. The offset is where the frame sampled the scene
+// relative to each pixel centre, in render pixels (x right, y down), each component in [-0.5, 0.5).
+struct CameraJitterStatus
+{
+    bool active = false;
+    // Index into the Halton(2, 3) sequence, in [0, phaseCount).
+    std::uint32_t phase = 0;
+    // Renderer::CameraJitterPhaseCount, or the DLSS phase count while DLSS input preparation is on (UPSCALING.3B).
+    std::uint32_t phaseCount = 0;
+    float x = 0.0f;
+    float y = 0.0f;
 };
 
 // Evidence of the reference path tracer for the Editor and diagnostics. Values only.
@@ -273,7 +331,102 @@ class Renderer
     };
 
     // Borrowed descriptor: valid until checked renderer resize or shutdown, never owned by ImGui.
+    // Its extent is the output extent.
     [[nodiscard]] bool TryGetFinalSceneImage(FinalSceneImage& image) const;
+
+    // UPSCALING.2A: the scene's two extents. Output is the extent ResizeScene requests and the final scene image has;
+    // render is the extent every scene pass, history and dispatch is sized from. They are equal until an upscaler
+    // exists. All zero before initialization and while a scene resize is incomplete or failed.
+    struct SceneResolution
+    {
+        unsigned int renderWidth = 0;
+        unsigned int renderHeight = 0;
+        unsigned int outputWidth = 0;
+        unsigned int outputHeight = 0;
+    };
+
+    SceneResolution GetSceneResolution() const noexcept
+    {
+        return {m_sceneWidth, m_sceneHeight, m_outputWidth, m_outputHeight};
+    }
+
+    // UPSCALING.2C experimental render scale. Diagnostic75 renders the scene at 75% of the output extent per axis and
+    // presents it through the diagnostic bilinear resolve (not an upscaler). UPSCALING.3C Dlss75: the same extents,
+    // reconstructed by DLSS Super Resolution on raster-primary path-traced frames whenever DLSS can run (otherwise the
+    // diagnostic resolve, reported as inactive). UPSCALING.3D DlssQuality/Balanced/Performance: the same, at the render
+    // extent NGX reports optimal for that preset and the output extent (75% when NGX reports none; DLSS then inactive).
+    enum class RenderScale
+    {
+        Native,
+        Diagnostic75,
+        Dlss75,
+        DlssQuality,
+        DlssBalanced,
+        DlssPerformance
+    };
+
+    static constexpr bool IsDlssRenderScale(RenderScale scale) noexcept
+    {
+        return scale == RenderScale::Dlss75 || scale == RenderScale::DlssQuality || scale == RenderScale::DlssBalanced ||
+            scale == RenderScale::DlssPerformance;
+    }
+
+    // UPSCALING.3D: the NGX preset of a preset scale (none for the diagnostic Dlss75 and the non-DLSS scales).
+    static std::optional<DlssQualityPreset> GetDlssPreset(RenderScale scale) noexcept;
+
+    // Takes effect at the next ResizeScene, which recreates the extent-sized resources only when the render extent
+    // changes. Set it before ResizeScene, outside any frame recording.
+    void SetRenderScale(RenderScale scale) noexcept { m_requestedRenderScale = scale; }
+    RenderScale GetRenderScale() const noexcept { return m_renderScale; }
+
+    // UPSCALING.2B: length of the camera jitter sequence (Halton(2, 3), indices 1..8).
+    static constexpr std::uint32_t CameraJitterPhaseCount = 8;
+
+    // UPSCALING.3B: the DLSS jitter phase count for a render/output extent pair: max(16, round(8 * output pixels /
+    // render pixels)) (DLSS Programming Guide 3.7.1.1 formula and table; 2.2 asks for at least 16).
+    static std::uint32_t DlssJitterPhaseCount(unsigned int renderWidth, unsigned int renderHeight,
+        unsigned int outputWidth, unsigned int outputHeight) noexcept;
+
+    // UPSCALING.3B: the last prepared frame's upscaler inputs (prepared = false unless preparation is on).
+    const UpscalerFrameInputs& GetUpscalerInputs() const noexcept { return m_upscalerInputs; }
+
+    // UPSCALING.3B/3C: how the last frame was presented.
+    const char* GetPresentationModeName() const noexcept
+    {
+        if(!PresentationResolveActive())
+        {
+            return "Native";
+        }
+
+        switch(m_renderScale)
+        {
+        case RenderScale::Dlss75:
+            return m_dlssActiveLastFrame ? "DLSS 75% (diagnostic)" : "Diagnostic Bilinear (DLSS inactive)";
+        case RenderScale::DlssQuality:
+            return m_dlssActiveLastFrame ? "DLSS Quality" : "Diagnostic Bilinear (DLSS Quality inactive)";
+        case RenderScale::DlssBalanced:
+            return m_dlssActiveLastFrame ? "DLSS Balanced" : "Diagnostic Bilinear (DLSS Balanced inactive)";
+        case RenderScale::DlssPerformance:
+            return m_dlssActiveLastFrame ? "DLSS Performance" : "Diagnostic Bilinear (DLSS Performance inactive)";
+        default:
+            return "Diagnostic Bilinear";
+        }
+    }
+
+    // UPSCALING.3C: whether the last frame was reconstructed by DLSS, and why not when DLSS was requested.
+    bool IsDlssActiveLastFrame() const noexcept { return m_dlssActiveLastFrame; }
+    const char* GetDlssInactiveReason() const noexcept { return m_dlssInactiveReason; }
+    const DlssFeatureStatus& GetDlssFeatureStatus() const noexcept { return m_dlssBackend.GetFeatureStatus(); }
+
+    // UPSCALING.3C: NGX InJitterOffset = DlssJitterSign * CameraJitterStatus (per axis). Verified by the jitter-sign
+    // test (build/upscaling-3c/REPORT.md section 4).
+    static constexpr float DlssJitterSignX = -1.0f;
+    static constexpr float DlssJitterSignY = -1.0f;
+
+    const CameraJitterStatus& GetCameraJitterStatus() const noexcept { return m_cameraJitterStatus; }
+
+    // UPSCALING.3A: what the DLSS Super Resolution backend found at initialization (Editor only; informational).
+    const DlssStatus& GetDlssStatus() const noexcept { return m_dlssBackend.GetStatus(); }
 
     // Copied evidence of the most recently recorded frame view (identity and matrices) and the
     // number of camera cuts applied. Read-only; selection stays with the caller's RendererOptions.
@@ -1109,22 +1262,28 @@ class Renderer
     // (SelectPathTraceLibraryVariant: ENGINE_PATH_TRACE_LIBRARIES and the device capabilities), and logs it.
     void SelectPathTraceLibraries();
 
+    // UPSCALING.2A/2C: the render extent for a requested output extent. Native: the output extent itself. Diagnostic75
+    // and Dlss75: each axis round(0.75 * output) (half up), at least 1. UPSCALING.3D presets: the NGX optimal extent;
+    // presetSupported is false (and the extent 75%) when NGX reports none.
+    SceneResolution ResolveSceneResolution(unsigned int outputWidth, unsigned int outputHeight, RenderScale scale,
+        bool& presetSupported);
+
     // Private resize stages: called only after Resize() confirms the queue is idle.
     bool ResizeApplicationResources(
         unsigned int width,
         unsigned int height);
-    bool ResizeSceneResources(
-        unsigned int width,
-        unsigned int height);
+    bool ResizeSceneResources(const SceneResolution& resolution);
 
     void Draw(
         ID3D12GraphicsCommandList* commandList,
         const RenderObject& object,
         D3D12_GPU_VIRTUAL_ADDRESS cameraConstantsAddress);
+    // depthPrepass: the Editor overlay depth prepass variant (UPSCALING.3C.4) instead of the selection mask pipeline.
     void DrawSelectionMask(
         ID3D12GraphicsCommandList* commandList,
         const RenderObject& object,
-        D3D12_GPU_VIRTUAL_ADDRESS cameraConstantsAddress);
+        D3D12_GPU_VIRTUAL_ADDRESS cameraConstantsAddress,
+        bool depthPrepass = false);
     void DrawMaterialRange(ID3D12GraphicsCommandList* commandList, const RenderObject& object,
         Material& material, unsigned int firstIndex, unsigned int indexCount,
         D3D12_GPU_VIRTUAL_ADDRESS cameraConstantsAddress);
@@ -1314,6 +1473,21 @@ class Renderer
     // only) changes, so diagnostics that drive the flags directly are left alone while the option is unchanged.
     void ApplyPathTraceDenoiser(bool requested, bool rasterPrimary);
     bool m_pathTraceDenoiserOption = false;
+
+    // UPSCALING.2B camera jitter (RendererOptions::pathTraceCameraJitter). Applies only to raster-primary path-traced
+    // frames. The phase advances once per jittered recording and wraps; switching the option, a scene resize and
+    // ResetSceneHistory return it to 0. Switching the option also discards every path-tracing history.
+    void ApplyCameraJitter(bool requested);
+    // This recording's jitter (0, 0 and inactive unless jitter applies) for a sequence of phaseCount phases; advances
+    // the phase. A different phaseCount than the previous jittered frame's restarts the sequence at phase 0.
+    CameraJitterStatus NextCameraJitter(bool applies, std::uint32_t phaseCount);
+    std::uint32_t m_cameraJitterPhaseCount = CameraJitterPhaseCount;
+    bool m_cameraJitterOption = false;
+    std::uint32_t m_cameraJitterPhase = 0;
+    CameraJitterStatus m_cameraJitterStatus;
+    // Diagnostics only: this offset (render pixels) on every jittered frame in place of the sequence.
+    std::optional<std::array<float, 2>> m_cameraJitterForTesting;
+
     void UpdateSharcStatus(unsigned int frameSlot);
     // The query-side library the frame's settings select (Query, QueryTermination or Render).
     PathTraceRadianceCacheLibrary RadianceCacheQueryLibrary(bool extract, bool splitReSTIRDI) const;
@@ -1460,12 +1634,15 @@ class Renderer
     bool m_shaderCompileWorkerRunning = false;
     LightingModeTransition m_lightingModeTransition;
     // Records one progressive iteration (or holds a converged image) and presents it as scene colour.
+    // projection is the frame's rendering projection (jittered when UPSCALING.2B jitter is active): every G-buffer
+    // reconstruction uses it. cameraProjection is the unjittered one and identifies the camera in the accumulation key.
     bool RecordPathTraceReference(
         ID3D12GraphicsCommandList* commandList,
         unsigned int frameIndex,
         PathTracePrimary primary,
         const Matrix4& view,
         const Matrix4& projection,
+        const Matrix4& cameraProjection,
         const Matrix4& inverseViewProjection,
         const Vector3& cameraPosition,
         const FrameLighting& frameLighting,
@@ -1531,8 +1708,91 @@ class Renderer
     unsigned int m_applicationHeight = 0;
 
     // Zero denotes an invalid/incomplete scene resource extent after resize failure.
+    // Render extent (UPSCALING.2A): every scene pass, history and dispatch.
     unsigned int m_sceneWidth = 0;
     unsigned int m_sceneHeight = 0;
+    // Output extent (UPSCALING.2A): m_finalSceneColor and the extent ResizeScene requests.
+    unsigned int m_outputWidth = 0;
+    unsigned int m_outputHeight = 0;
+
+    // UPSCALING.2C: the requested scale (SetRenderScale) and the one the current extents were built with.
+    RenderScale m_requestedRenderScale = RenderScale::Native;
+    RenderScale m_renderScale = RenderScale::Native;
+
+    // UPSCALING.2C output-extent targets of the diagnostic presentation resolve: HDR colour (tone mapping's input),
+    // selection mask (the outline's) and depth (the outline's and the Editor overlays'). Allocated only while the render
+    // extent differs from the output extent, released otherwise; Native never has them.
+    RenderTarget m_presentationColor;
+    RenderTarget m_presentationSelectionMask;
+    DepthBuffer m_presentationDepth;
+    PresentationResolvePass m_presentationResolvePass;
+
+    // UPSCALING.3A: the NGX instance of m_graphicsDevice (Editor only). Initialized after the device, shut down after the
+    // final GPU drain and before the device is released. It creates no DLSS feature yet.
+    DlssBackend m_dlssBackend;
+
+    // UPSCALING.3B DLSS input preparation (RendererOptions::dlssInputPreparation). Switching it releases or creates
+    // nothing else and requests an upscaler history reset; the pass's textures follow the render extent.
+    void ApplyDlssInputPreparation(bool requested);
+    bool m_dlssInputPreparation = false;
+    DlssInputPreparationPass m_dlssInputPreparationPass;
+    UpscalerFrameInputs m_upscalerInputs;
+    // Set by every history discontinuity (ResetSceneHistory, scene resize, option changes); consumed by the next
+    // prepared frame as UpscalerFrameInputs::reset.
+    bool m_upscalerHistoryResetPending = true;
+
+    // UPSCALING.3C DLSS mode: the applied scale is Dlss75 and the frame is a raster-primary path-traced one. Such a frame
+    // jitters with the DLSS phase policy, prepares the DLSS inputs, keeps tracing past the sample target (DLSS needs a
+    // changing image) and leaves the extended diffuse history out; Native and Diagnostic75 are unaffected.
+    bool m_dlssModeThisFrame = false;
+    bool m_dlssActiveLastFrame = false;
+    // Whether the previous frame evaluated DLSS (a gap resets DLSS history).
+    bool m_dlssEvaluatedLastFrame = false;
+    const char* m_dlssInactiveReason = "";
+    // UPSCALING.3C.4: why DLSS mode falls back to the diagnostic resolve this frame (no jitter forced); "" when it runs.
+    const char* m_dlssFallbackReason = "";
+    // UPSCALING.3D: NGX reported no render extent for the applied preset at this output extent (set by ResizeScene).
+    bool m_dlssPresetUnsupported = false;
+    // UPSCALING.3D: the last frame presented DLSS without recording the diagnostic resolve.
+    bool m_presentationResolveSkippedLastFrame = false;
+    // DLSS frames' material texture mip bias is log2(render / output width) plus this (Programming Guide 3.5); every
+    // other frame samples with bias 0. 0, not the guide's -1: on Engine's textured scenes -1 doubled the error against
+    // Native and added 35-50% still shimmer, while log2(render / output) halved the error of no bias (UPSCALING.3D).
+    static constexpr float DlssTextureMipBiasOffset = 0.0f;
+
+    // The readout last sent to the Debug UI (sent again only on a change).
+    const char* m_dlssReadoutReason = nullptr;
+    bool m_dlssReadoutActive = false;
+    std::uint32_t m_dlssReadoutCreateResult = 0;
+    // Diagnostics only: per-axis multipliers in place of DlssJitterSignX/Y, and a colour input in place of the scene
+    // colour (a noise-free G-buffer target for the jitter-sign test).
+    std::optional<std::array<float, 2>> m_dlssJitterSignForTesting;
+    RenderTarget* m_dlssColorOverrideForTesting = nullptr;
+    // Diagnostics only (UPSCALING.3D): when set, DLSS frames use this offset in place of DlssTextureMipBiasOffset
+    // (NaN: bias 0).
+    std::optional<float> m_dlssMipBiasOffsetForTesting;
+    // Diagnostics only (UPSCALING.3D): DLSS evaluation reports failure before recording anything (exercises the
+    // fallback resolve of a frame that skipped it).
+    bool m_dlssEvaluationFailureForTesting = false;
+    // UPSCALING.3C.4 Editor overlay prepass: on jittered Editor frames, scene depth and the selection mask are rasterized
+    // again with the UNJITTERED camera at the output extent, so the grid, collider / light / frustum wireframes and the
+    // selection outline test exactly what an unjittered frame would show. Never read by DLSS, the denoiser or any
+    // history. Created on the first such frame and released with every scene resize; unjittered frames record nothing.
+    DepthBuffer m_overlayDepth;
+    RenderTarget m_overlaySelectionMask;
+    bool RecordEditorOverlayPrepass(ID3D12GraphicsCommandList* commandList, const Scene& scene,
+        const RendererOptions& options, D3D12_GPU_VIRTUAL_ADDRESS unjitteredCameraConstantsAddress);
+
+    // Diagnostics only (UPSCALING.3C.2): when set, each frame copies the final scene image as it is before the Editor
+    // overlays (grid, colliders) into this target of the same extent and format. Null in production: no commands.
+    RenderTarget* m_preOverlayCopyForTesting = nullptr;
+    // Records the DLSS evaluation of a prepared Dlss75 frame into m_presentationColor; false leaves the resolve's colour.
+    bool RecordDlssEvaluation(ID3D12GraphicsCommandList* commandList, unsigned int frameIndex);
+    void PublishDlssReadout();
+    bool PresentationResolveActive() const noexcept
+    {
+        return m_sceneWidth != m_outputWidth || m_sceneHeight != m_outputHeight;
+    }
 
     bool m_resizeFailed = false;
 

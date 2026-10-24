@@ -582,7 +582,7 @@ void DebugUI::DrawPerformanceWindow(
             {
                 const unsigned int index = static_cast<unsigned int>(region);
 
-                const uint32_t mask = 1u << index;
+                const uint64_t mask = 1ull << index;
 
                 if ((gpu.validRegions & mask) != 0)
                 {
@@ -647,7 +647,7 @@ void DebugUI::DrawPerformanceWindow(
 
             const unsigned int specularIndex = static_cast<unsigned int>(GpuTimestampProfiler::Region::NrdReblurSpecular);
             const unsigned int diffuseIndex = static_cast<unsigned int>(GpuTimestampProfiler::Region::NrdReblurDiffuse);
-            const uint32_t reblurMask = (1u << specularIndex) | (1u << diffuseIndex);
+            const uint64_t reblurMask = (1ull << specularIndex) | (1ull << diffuseIndex);
 
             if ((gpu.validRegions & reblurMask) == reblurMask)
             {
@@ -1233,9 +1233,36 @@ void DebugUI::DrawPathTraceReferenceSettings()
     const bool rasterPrimary = m_lightingMode == 2;
     const bool restirDI = m_lightingMode == 3;
 
+    // UPSCALING.3A: informational only; there is no DLSS mode yet.
+    ImGui::Text("DLSS Super Resolution: %s", m_dlssState.c_str());
+
+    if (!m_dlssDetail.empty() && ImGui::IsItemHovered())
+    {
+        ImGui::SetTooltip("%s", m_dlssDetail.c_str());
+    }
+
+    // UPSCALING.3B: prepares DLSS inputs (motion vectors, exposure, DLSS jitter phases); DLSS itself never runs.
+    ImGui::Checkbox("DLSS input preparation (diagnostic)", &m_dlssInputPreparation);
+
     // SHARC.4E.1 / 5B: the denoiser and SHARC serve both raster-primary modes.
     if (rasterPrimary || restirDI)
     {
+        // UPSCALING.2C (experimental, 100% by default): a reduced internal resolution, presented through a bilinear
+        // diagnostic resolve. This is not DLSS and not an upscaler.
+        const char* renderScales[] = {"100% (Native)", "75% (diagnostic bilinear resolve, not DLSS)",
+                                      "75% DLSS Super Resolution (diagnostic)", "DLSS Quality", "DLSS Balanced",
+                                      "DLSS Performance"};
+        ImGui::Combo("PT render scale (experimental)", &m_pathTraceRenderScale, renderScales, IM_ARRAYSIZE(renderScales));
+
+        // UPSCALING.2B (experimental, off by default): diagnostics for future temporal upscaling.
+        ImGui::Checkbox("PT camera jitter (experimental)", &m_pathTraceCameraJitter);
+
+        if (m_pathTraceCameraJitterActive)
+        {
+            ImGui::Text("Jitter phase %u/%u: (%+.3f, %+.3f) px", m_pathTraceCameraJitterPhase,
+                        m_pathTraceCameraJitterPhaseCount, m_pathTraceCameraJitterX, m_pathTraceCameraJitterY);
+        }
+
         ImGui::Checkbox("PT denoiser", &m_pathTraceDenoiser);
 
         // DENOISE.1: stage isolation for diagnosing the denoiser; the defaults are the production pipeline.
