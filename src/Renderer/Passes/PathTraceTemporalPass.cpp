@@ -34,6 +34,13 @@ bool PathTraceTemporalPass::Initialize(GraphicsDevice& graphicsDevice, ShaderLib
     constants.visibility = D3D12_SHADER_VISIBILITY_ALL;
     pipelineDescription.rootParameters.push_back(constants);
 
+    // SHARC.6A: the frame's SHARC query binding for the history prior (b1).
+    RootParameterDescription priorCache{};
+    priorCache.type = RootParameterType::ConstantBuffer;
+    priorCache.shaderRegister = 1;
+    priorCache.visibility = D3D12_SHADER_VISIBILITY_ALL;
+    pipelineDescription.rootParameters.push_back(priorCache);
+
     if(!computeShader || !m_pipeline.Initialize(graphicsDevice.GetDevice(), pipelineDescription))
     {
         Log::Error("The path tracing temporal pass could not be created.");
@@ -87,6 +94,26 @@ bool PathTraceTemporalPass::EnsureHistory(
     return true;
 }
 
+bool PathTraceTemporalPass::EnsureExtended(ID3D12Device* device, DescriptorHeap& descriptorHeap)
+{
+    if(m_extended.GetResource())
+    {
+        return true;
+    }
+
+    if(!m_diffuse[0].GetResource() || !m_extended.Initialize(device, m_width, m_height, 1, 1,
+        DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS) ||
+        !m_extended.CreateSRV(device, descriptorHeap) || !m_extended.CreateUAV(device, descriptorHeap))
+    {
+        Log::Error("The path tracing extended diffuse history could not be created.");
+        m_extended.Shutdown();
+        return false;
+    }
+
+    m_extended.GetResource()->SetName(L"Path Trace Extended Diffuse History");
+    return true;
+}
+
 void PathTraceTemporalPass::ReleaseHistory()
 {
     for(int slot = 0; slot < 2; ++slot)
@@ -95,6 +122,8 @@ void PathTraceTemporalPass::ReleaseHistory()
         m_specular[slot].Shutdown();
         m_moments[slot].Shutdown();
     }
+
+    m_extended.Shutdown();
 
     m_width = 0;
     m_height = 0;
@@ -120,7 +149,9 @@ void PathTraceTemporalPass::Execute(
     UploadBuffer& uploadBuffer,
     PathTraceTemporalConstants constants,
     unsigned int width,
-    unsigned int height)
+    unsigned int height,
+    D3D12_GPU_VIRTUAL_ADDRESS priorCacheBinding,
+    bool extended)
 {
     if(!m_initialized || !commandList || !m_diffuse[0].GetResource() || width != m_width || height != m_height)
     {
@@ -149,6 +180,13 @@ void PathTraceTemporalPass::Execute(
     constants.outputMomentsIndex = m_moments[writeSlot].GetUAVIndex();
     constants.resolution[0] = width;
     constants.resolution[1] = height;
+    extended = extended && m_extended.GetResource();
+    constants.extendedIndex = extended ? m_extended.GetUAVIndex() : 0u;
+
+    if(extended)
+    {
+        m_extended.Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    }
 
     const D3D12_GPU_VIRTUAL_ADDRESS constantsAddress = uploadBuffer.Allocate(&constants,
         sizeof(PathTraceTemporalConstants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
@@ -161,11 +199,20 @@ void PathTraceTemporalPass::Execute(
 
     m_pipeline.Bind(commandList);
     commandList->SetComputeRootConstantBufferView(0, constantsAddress);
+    // Without a prior the shader never reads b1; the constants stand in for it.
+    commandList->SetComputeRootConstantBufferView(1,
+        constants.priorIndex != 0 && priorCacheBinding != 0 ? priorCacheBinding : constantsAddress);
     commandList->Dispatch((width + 7u) / 8u, (height + 7u) / 8u, 1);
 
     m_diffuse[writeSlot].Transition(commandList, shaderRead);
     m_specular[writeSlot].Transition(commandList, shaderRead);
     m_moments[writeSlot].Transition(commandList, shaderRead);
+
+    if(extended)
+    {
+        m_extended.Transition(commandList, shaderRead);
+    }
+
     m_pendingSlot = writeSlot;
     m_lastWrittenSlot = writeSlot;
 }
@@ -189,5 +236,6 @@ void PathTraceTemporalPass::AbandonPendingHistory()
 
 std::uint64_t PathTraceTemporalPass::GetResourceBytes() const
 {
-    return m_diffuse[0].GetResource() ? static_cast<std::uint64_t>(m_width) * m_height * BytesPerPixel : 0;
+    const std::uint64_t pixels = static_cast<std::uint64_t>(m_width) * m_height;
+    return m_diffuse[0].GetResource() ? pixels * BytesPerPixel + (m_extended.GetResource() ? pixels * 8u : 0u) : 0;
 }

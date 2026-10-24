@@ -60,10 +60,19 @@ struct PathTraceTemporalConstants
     // RTXPT D.2C.3 luminance second moments (RG32F: diffuse lighting, specular radiance).
     std::uint32_t historyMomentsIndex = 0;
     std::uint32_t outputMomentsIndex = 0;
-    std::uint32_t padding[2]{};
+    // SHARC.6A history prior (PathTraceTemporal.hlsl step 6) and its counters; 0 = off.
+    std::uint32_t priorIndex = 0;
+    std::uint32_t priorCountersIndex = 0;
+
+    // DENOISE.3B extended diffuse history (PathTraceTemporal.hlsl step 7): its UAV (0 = off), a restart, its length cap
+    // and whether the presentation uses it. The UAV index is filled in by Execute.
+    std::uint32_t extendedIndex = 0;
+    std::uint32_t extendedRestart = 0;
+    float extendedMaximum = 256.0f;
+    std::uint32_t extendedPresent = 0;
 };
 
-static_assert(sizeof(PathTraceTemporalConstants) == 2 * 64 + 10 * 16);
+static_assert(sizeof(PathTraceTemporalConstants) == 2 * 64 + 11 * 16);
 
 // RTXPT D.2B temporal reprojection and accumulation of the path tracer's extracted diffuse and specular radiance
 // (diagnostics only; PathTraceTemporal.hlsl has the equations). Owns two RGBA16F ping-pong pairs, radiance in RGB and
@@ -98,15 +107,23 @@ class PathTraceTemporalPass
     // Forgets the committed history and any pending write: the next frame starts with history length one.
     void InvalidateHistory();
 
+    // DENOISE.3B: creates the extended diffuse history (one RGBA16F texture at the histories' extent) when missing.
+    // Creation only; it is released with the histories. Its contents are meaningful only after a restart.
+    bool EnsureExtended(ID3D12Device* device, DescriptorHeap& descriptorHeap);
+
     // Records one frame. constants carries the inputs, cameras and flags; the history indices and validity are
     // filled in here. Afterwards the outputs are in shader-resource state. The written slot is pending until
-    // CommitHistory.
+    // CommitHistory. priorCacheBinding (SHARC.6A): the frame's SHARC query binding when constants.priorIndex is set.
+    // extended (DENOISE.3B): also update the extended diffuse history (EnsureExtended first), which is then in
+    // shader-resource state too.
     void Execute(
         ID3D12GraphicsCommandList* commandList,
         UploadBuffer& uploadBuffer,
         PathTraceTemporalConstants constants,
         unsigned int width,
-        unsigned int height);
+        unsigned int height,
+        D3D12_GPU_VIRTUAL_ADDRESS priorCacheBinding = 0,
+        bool extended = false);
 
     // The frame recorded by Execute was submitted: its output becomes the history.
     void CommitHistory();
@@ -143,6 +160,12 @@ class PathTraceTemporalPass
         return m_moments[m_lastWrittenSlot];
     }
 
+    // DENOISE.3B extended diffuse history: demodulated diffuse lighting mean in RGB, its length in alpha.
+    Texture& GetExtendedDiffuse()
+    {
+        return m_extended;
+    }
+
     std::uint64_t GetResourceBytes() const;
 
     private:
@@ -153,6 +176,7 @@ class PathTraceTemporalPass
     Texture m_diffuse[2];
     Texture m_specular[2];
     Texture m_moments[2];
+    Texture m_extended;
     unsigned int m_width = 0;
     unsigned int m_height = 0;
 

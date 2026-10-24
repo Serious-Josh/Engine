@@ -36,6 +36,30 @@ struct PathTraceDenoiserVisualization
     float uncertaintyFloorLog10 = -3.0f;
 };
 
+// DENOISE.1 diagnostic stage isolation (PT denoiser settings). The defaults are the production pipeline: temporal
+// accumulation with history, then two a-trous iterations.
+enum class PathTraceSpatialFilter : std::uint32_t
+{
+    // The temporal pass presents its own output.
+    Off = 0,
+    // The D.3B.2 5x5 pass (the zero-iteration path).
+    Single5x5 = 1,
+    Atrous1 = 2,
+    Atrous2 = 3
+};
+
+struct PathTraceDenoiserStages
+{
+    // Off: every frame starts new history (length 1), so the spatial pass filters one frame's samples guided by its
+    // young-history variance (the 3x3 spatial estimate); with the spatial filter off too, this frame's raw signal.
+    bool temporalHistory = true;
+    PathTraceSpatialFilter spatialFilter = PathTraceSpatialFilter::Atrous2;
+    // A change discards the temporal history once.
+    std::uint32_t historyResetRequest = 0;
+    // DENOISE.3B (experimental): extended diffuse history while the scene and view stay unchanged.
+    bool extendedDiffuseHistory = false;
+};
+
 // Views shown as display-encoded colours without tone mapping.
 inline bool IsScalarPathTraceDenoiserView(PathTraceDenoiserView view)
 {

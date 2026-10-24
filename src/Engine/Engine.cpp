@@ -2227,6 +2227,7 @@ void Engine::Frame()
         pathTraceStatus.activeLastFrame, pathTraceStatus.accumulatedSamples, pathTraceStatus.resourceBytes);
     const PathTraceRasterPrimaryStatus& rasterPrimaryStatus = m_renderer.GetPathTraceRasterPrimaryStatus();
     debugUI.SetPathTraceRasterPrimaryStatus(rasterPrimaryStatus.availability, rasterPrimaryStatus.reason);
+    debugUI.SetSharcStatus(m_renderer.GetSharcStatus());
     const PathTraceRasterPrimaryStatus& restirDIStatus = m_renderer.GetPathTraceReSTIRDIStatus();
     debugUI.SetPathTraceReSTIRDIStatus(restirDIStatus.availability, restirDIStatus.reason);
     // The snapshot of the last recording; this frame's request reaches the Renderer after the UI is drawn.
@@ -2599,6 +2600,9 @@ void Engine::Frame()
     rendererOptions.rtgiContactAORadius = debugUI.GetRTGIContactAORadius();
     rendererOptions.lightingMode = debugUI.GetLightingMode();
     rendererOptions.pathTraceReference = debugUI.GetPathTraceReferenceSettings();
+    rendererOptions.sharc = debugUI.GetSharcSettings();
+    rendererOptions.pathTraceDenoiser = debugUI.IsPathTraceDenoiserEnabled();
+    rendererOptions.pathTraceDenoiserStages = debugUI.GetPathTraceDenoiserStages();
 
     const size_t selectedObject = m_editor.GetSelectedObject();
 

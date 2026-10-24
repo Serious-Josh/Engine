@@ -38,6 +38,32 @@ enum class PathTraceLibraryVariant
 
 const char* PathTraceLibraryVariantName(PathTraceLibraryVariant variant);
 
+// SHARC.4D/4D-Q learning libraries of each variant (experimental, default off). Inline inserts at the end of each path
+// (PathTraceReferenceRadianceCache*.hlsl); Deferred stores a training record per path for a later compute insertion
+// (PathTraceReferenceRadianceCacheDeferred*.hlsl); DeferredLate is Deferred with the whole record stored at the end of
+// the path (diagnostics, the SHARC.4D-Q shader-floor comparison). SHARC.4D-R (diagnostics): Query renders with query-only
+// hooks (PathTraceReferenceRadianceCacheQuery*.hlsl); Training is the Deferred library's training-only ray generation
+// (PathTraceReferenceRadianceCacheTraining*.hlsl), dispatched by ExecuteRadianceCacheTraining. SHARC.4D-S
+// (diagnostics): QueryTermination is Query with vertex-1 path termination (a timing probe; its images are wrong).
+// SHARC.4E (experimental): Render completes eligible vertex-1 paths with cached radiance
+// (PathTraceReferenceRadianceCacheRender*.hlsl); SHARC.4E.1: RenderExtraction is the same library's signal-extraction
+// ray generation, for frames the path-tracing denoiser filters. SHARC.5B: RenderSplitIndirect[Extraction] are the same
+// library's ReSTIR DI indirect-pass exports (normal, and with signal extraction), for ExecuteReSTIRDISplit.
+enum class PathTraceRadianceCacheLibrary
+{
+    Inline,
+    Deferred,
+    DeferredLate,
+    Query,
+    Training,
+    QueryTermination,
+    Render,
+    RenderExtraction,
+    RenderSplitIndirect,
+    RenderSplitIndirectExtraction,
+    Count
+};
+
 // What the library selection needs to know about the device and process.
 struct PathTraceLibraryCapabilities
 {
@@ -156,7 +182,47 @@ class PathTraceReferencePass
         D3D12_GPU_VIRTUAL_ADDRESS sceneLightConstantsAddress,
         unsigned int width,
         unsigned int height,
-        bool extract);
+        bool extract,
+        D3D12_GPU_VIRTUAL_ADDRESS radianceCacheConstants = 0,
+        PathTraceRadianceCacheLibrary radianceCacheLibrary = PathTraceRadianceCacheLibrary::Inline);
+
+    // SHARC.4D learning (experimental, default off): creates, on first use, the Raster Primary pipeline of a cache
+    // library (PathTraceRadianceCacheLibrary, with the cache binding at b3). It traces and renders exactly as the
+    // production pipeline and also inserts or records D6 training samples. A failure is sticky until a new revision of
+    // the libraries is accepted. Creation only.
+    bool EnsureRadianceCacheLearning(
+        GraphicsDevice& graphicsDevice,
+        ShaderLibrary& shaderLibrary,
+        std::string& failureReason,
+        PathTraceRadianceCacheLibrary library = PathTraceRadianceCacheLibrary::Inline);
+
+    // SHARC.4D-R sparse training (diagnostics): after Execute in the same list, the training library's ray generation
+    // over `threads` training threads (one per pixel tile), with the frame's path-trace constants and the training
+    // binding (b3). It writes training records only. The Training pipeline must be ready.
+    void ExecuteRadianceCacheTraining(
+        ID3D12GraphicsCommandList4* commandList,
+        DescriptorHeap& descriptorHeap,
+        const RayTracingSceneResources& rayTracingScene,
+        D3D12_GPU_VIRTUAL_ADDRESS constantsAddress,
+        D3D12_GPU_VIRTUAL_ADDRESS sceneLightConstantsAddress,
+        D3D12_GPU_VIRTUAL_ADDRESS trainingConstants,
+        std::uint32_t threads);
+
+    bool IsRadianceCacheLearningReady(PathTraceRadianceCacheLibrary library = PathTraceRadianceCacheLibrary::Inline) const
+    {
+        return m_radianceCache[static_cast<size_t>(library)].ready;
+    }
+
+    // Diagnostics (SHARC.4D-P/4D-Q): the driver's stack size of the Raster Primary ray generation, in the production
+    // or a learning pipeline (0 if that pipeline does not exist).
+    std::uint64_t GetRasterRayGenerationStackSize(bool learning,
+        PathTraceRadianceCacheLibrary library = PathTraceRadianceCacheLibrary::Inline) const
+    {
+        const RayTracingPipeline& pipeline = learning ? m_radianceCache[static_cast<size_t>(library)].pipeline :
+            m_pipelines[static_cast<size_t>(PathTracePrimary::Raster)];
+        return pipeline.GetShaderStackSize(learning && library == PathTraceRadianceCacheLibrary::Training ?
+            L"PathTraceRadianceCacheTrainingRayGeneration" : L"PathTraceRasterPrimaryRayGeneration");
+    }
 
     // RTXPT.3 split ReSTIR DI: the direct-pass pipeline (from the ReSTIR DI library) and the indirect-pass
     // pipeline (from the reference library), together PathTracePrimary::RasterReSTIRDI. Created on first use; a
@@ -211,7 +277,9 @@ class PathTraceReferencePass
         unsigned int width,
         unsigned int height,
         D3D12_GPU_VIRTUAL_ADDRESS rtxdiConstantsAddress,
-        bool extract);
+        bool extract,
+        D3D12_GPU_VIRTUAL_ADDRESS radianceCacheConstants = 0,
+        PathTraceRadianceCacheLibrary radianceCacheLibrary = PathTraceRadianceCacheLibrary::RenderSplitIndirect);
 
     // RTXPT D.1B.2 diffuse/specular signal extraction (diagnostics only, never enabled by default). Creates, on first
     // use, the extraction pipelines of Raster Primary or split ReSTIR DI (the extraction exports of the libraries
@@ -233,6 +301,15 @@ class PathTraceReferencePass
     Texture& GetSpecularTexture()
     {
         return m_specularTexture;
+    }
+
+    // SHARC.6A (experimental): the history prior the SHARC render library's extraction frames write (RGB the prior
+    // in the diffuse signal's units, alpha its weight or negated absence code), created on first use at the extent.
+    Texture* EnsureHistoryPriorTexture(ID3D12Device* device, DescriptorHeap& descriptorHeap);
+
+    Texture& GetHistoryPriorTexture()
+    {
+        return m_historyPriorTexture;
     }
 
     // Copies the presentation image into the HDR scene colour consumed by tone mapping. Both are
@@ -366,9 +443,22 @@ class PathTraceReferencePass
     std::string m_extractSplitFailure;
     Texture m_diffuseTexture;
     Texture m_specularTexture;
+    Texture m_historyPriorTexture;
 
     // Creates the extraction outputs at the current extent when they do not exist.
     bool CreateExtractionTextures(ID3D12Device* device, DescriptorHeap& descriptorHeap);
+
+    // SHARC.4D learning pipelines by PathTraceRadianceCacheLibrary, each created on first use
+    // (EnsureRadianceCacheLearning).
+    struct RadianceCacheLearningPipeline
+    {
+        RayTracingPipeline pipeline;
+        bool ready = false;
+        bool failed = false;
+        std::string failure;
+    };
+
+    RadianceCacheLearningPipeline m_radianceCache[static_cast<size_t>(PathTraceRadianceCacheLibrary::Count)];
 
     // The UAV barriers after a frame's last dispatch: accumulation and statistics, plus the extraction outputs.
     void RecordOutputBarriers(ID3D12GraphicsCommandList* commandList, bool extract);

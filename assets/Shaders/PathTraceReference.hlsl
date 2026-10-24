@@ -900,6 +900,15 @@ PathTraceExtraction PathTraceEmptyExtraction()
 // G-buffer sample where the camera primaries trace and build their first hit; everything after it (sampling,
 // BSDF, MIS, bounces, roulette) is the same code. extract is a literal at every call site; without it the
 // extraction state is never read, and the loop is the production loop.
+// SHARC.4D: learning hooks of the cache library only (PathTraceRadianceCacheHarvest.hlsli). In every other library
+// PATH_TRACE_RADIANCE_CACHE_HARVEST expands to nothing, leaving an empty statement.
+#ifdef PATH_TRACE_RADIANCE_CACHE_LIBRARY
+#include "PathTraceRadianceCacheHarvest.hlsli"
+#define PATH_TRACE_RADIANCE_CACHE_HARVEST(statement) statement
+#else
+#define PATH_TRACE_RADIANCE_CACHE_HARVEST(statement)
+#endif
+
 float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex rasterFirstVertex,
     inout PathTraceRandom random, inout uint rayCount, bool extract, inout PathTraceExtraction extraction)
 {
@@ -907,6 +916,7 @@ float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex 
     float3 throughput = float3(1.0f, 1.0f, 1.0f);
     bool previousDelta = true;
     float previousPdf = 0.0f;
+    PATH_TRACE_RADIANCE_CACHE_HARVEST(PathTraceRadianceCacheHarvest harvest = PathTraceRadianceCacheHarvestBegin());
 
     // vertex counts surface interactions. The ray traced after the last allowed vertex is still
     // traced so distant lights reached by BSDF sampling pair with that vertex's light samples.
@@ -977,6 +987,7 @@ float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex 
                     {
                         float3 missRadiance = PathTraceMissRadiance(ray.Direction, previousDelta, previousPdf);
                         radiance += throughput * missRadiance;
+                        PATH_TRACE_RADIANCE_CACHE_HARVEST(PathTraceRadianceCacheHarvestMiss(harvest, vertex, missRadiance));
 
                         if(extract)
                         {
@@ -1044,6 +1055,7 @@ float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex 
             }
         }
 
+        PATH_TRACE_RADIANCE_CACHE_HARVEST(PathTraceRadianceCacheHarvestVertex(harvest, primary, vertex, position, surface));
         bool hasNonDeltaLobe = !surface.deltaSpecular || surface.specularProbability < 1.0f;
 
         if(hasNonDeltaLobe)
@@ -1066,6 +1078,7 @@ float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex 
             }
 
             radiance += throughput * direct;
+            PATH_TRACE_RADIANCE_CACHE_HARVEST(PathTraceRadianceCacheHarvestDirect(harvest, vertex, direct));
 
             // Vertex 0's direct light is split per lobe; later vertices' is carried by the diffuse throughput.
             if(extract)
@@ -1100,6 +1113,7 @@ float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex 
         }
 
         throughput *= bsdfSample.weight;
+        PATH_TRACE_RADIANCE_CACHE_HARVEST(PathTraceRadianceCacheHarvestContinue(harvest, vertex, bsdfSample));
         previousDelta = bsdfSample.delta;
         previousPdf = bsdfSample.pdf;
 
@@ -1116,6 +1130,7 @@ float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex 
             }
 
             throughput /= survival;
+            PATH_TRACE_RADIANCE_CACHE_HARVEST(PathTraceRadianceCacheHarvestSurvive(harvest, vertex, survival));
 
             if(extract)
             {
@@ -1134,6 +1149,7 @@ float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex 
         ray.TMax = PATH_TRACE_DISTANT_LIGHT_DISTANCE;
     }
 
+    PATH_TRACE_RADIANCE_CACHE_HARVEST(PathTraceRadianceCacheHarvestEnd(harvest));
     return radiance;
 }
 

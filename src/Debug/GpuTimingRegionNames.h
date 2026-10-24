@@ -29,5 +29,9 @@ inline constexpr const char* GpuTimingRegionNames[] = {"GPU frame",
                                                        "Path trace reference",
                                                        "Path trace split direct",
                                                        "Path trace split indirect",
-                                                       "Path trace spatial"};
+                                                       "Path trace spatial",
+                                                       "Radiance cache generation",
+                                                       "Radiance cache resolve",
+                                                       "Radiance cache insertion",
+                                                       "Radiance cache training"};
 static_assert(sizeof(GpuTimingRegionNames) / sizeof(GpuTimingRegionNames[0]) == GpuTimingMonitor::RegionCount);

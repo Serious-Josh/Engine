@@ -1794,6 +1794,7 @@ bool Renderer::PreparePendingDisplacementForFrame(unsigned int frameSlot)
 
     if (pending.historyPreparation == DisplacementHistoryPreparation::Requested)
     {
+        InvalidateSceneLighting(SceneLightingInvalidation::Displacement);
         ResetSceneHistory();
         pending.historyPreparation = DisplacementHistoryPreparation::Performed;
     }
@@ -2469,6 +2470,7 @@ bool Renderer::FinalizePendingDisplacementUpdate(DisplacementCompletionResult& r
     }
 
     m_rayTracingScene.ReleaseRetiredBLASResources();
+    InvalidateSceneLighting(SceneLightingInvalidation::Displacement);
     ResetSceneHistory();
     m_pendingGeometryTLASRefresh[0] = true;
     m_pendingGeometryTLASRefresh[1] = true;
@@ -3996,6 +3998,7 @@ bool Renderer::InitializeSceneResources(
             }
         }
 
+        InvalidateSceneLighting(SceneLightingInvalidation::SceneLifetime);
         ResetSceneHistory();
         m_sceneResourceLifetime = lifetime;
         m_sceneResourceScene = &scene;
@@ -4239,6 +4242,7 @@ bool Renderer::CleanupFailedSceneInitialization(const Scene& candidate)
     m_selectionMaskCandidate.reset();
     m_selectionMaskCandidateLifetime = 0;
     m_selectionMaskPass.Shutdown();
+    InvalidateSceneLighting(SceneLightingInvalidation::SceneRelease);
     ResetSceneHistory();
 
     m_sceneInitializationAttempt = {};
@@ -4297,6 +4301,7 @@ bool Renderer::ReleaseSceneResources()
     m_selectionMaskCandidateLifetime = 0;
     m_selectionMaskPass.Shutdown();
 
+    InvalidateSceneLighting(SceneLightingInvalidation::SceneRelease);
     ResetSceneHistory();
 
     if (m_heightmapRegistration.owner)
@@ -4782,8 +4787,10 @@ bool Renderer::PrepareRtxdiFrame(ID3D12GraphicsCommandList* commandList, const F
     rtxdiConstants.reservoirBuffer = frame.reservoirBufferParameters;
     rtxdiConstants.bufferIndices = frame.bufferIndices;
     rtxdiConstants.reservoirBufferIndex = m_rtxdiResources.GetReservoirUAVIndex();
-    rtxdiConstants.localLightSamples = RtxdiInitialLocalLightSamples;
-    rtxdiConstants.infiniteLightSamples = RtxdiInitialInfiniteLightSamples;
+    rtxdiConstants.localLightSamples = m_rtxdiLocalLightSamplesForTesting != 0 ? m_rtxdiLocalLightSamplesForTesting :
+        RtxdiInitialLocalLightSamples;
+    rtxdiConstants.infiniteLightSamples = m_rtxdiInfiniteLightSamplesForTesting != 0 ?
+        m_rtxdiInfiniteLightSamplesForTesting : RtxdiInitialInfiniteLightSamples;
 
     for(std::size_t index = 0; index < frame.lightRecords.size(); ++index)
     {
@@ -4863,6 +4870,322 @@ bool Renderer::SamePathTraceAccumulationKey(const PathTraceAccumulationKey& left
         left.environmentTotalWeight == right.environmentTotalWeight;
 }
 
+Renderer::SceneLightingInputs Renderer::MakeSceneLightingInputs(const PathTraceAccumulationKey& key,
+    std::uint64_t materialBindingEpoch, PathTraceLibraryVariant libraryVariant,
+    const RadianceCacheConfigurationIdentity& cache)
+{
+    SceneLightingInputs inputs{};
+    inputs.key = key;
+    // World-space radiance does not depend on the camera, the image size or how many samples a pixel accumulates.
+    inputs.key.view = Matrix4{};
+    inputs.key.projection = Matrix4{};
+    inputs.key.width = 0;
+    inputs.key.height = 0;
+    inputs.key.settings.samplesPerFrame = 0;
+    inputs.key.settings.maxAccumulatedSamples = 0;
+    inputs.materialBindingEpoch = materialBindingEpoch;
+    inputs.libraryVariant = libraryVariant;
+    inputs.cache = cache;
+    return inputs;
+}
+
+bool Renderer::SameSceneLightingInputs(const SceneLightingInputs& left, const SceneLightingInputs& right)
+{
+    return SamePathTraceAccumulationKey(left.key, right.key) && left.materialBindingEpoch == right.materialBindingEpoch &&
+        left.libraryVariant == right.libraryVariant && left.cache == right.cache;
+}
+
+void Renderer::LatchSceneLighting(const PathTraceAccumulationKey& key)
+{
+    const SceneLightingInputs inputs = MakeSceneLightingInputs(key, m_rayTracingScene.m_materialBindingEpoch,
+        m_pathTraceReferencePass.GetLibraryVariant(), m_radianceCacheConfiguration);
+    const bool changed = !m_sceneLightingInputs || !SameSceneLightingInputs(*m_sceneLightingInputs, inputs);
+    const bool usable = key.sceneResourceLifetime != 0 && m_sceneResourceScene != nullptr;
+    m_sceneLightingEpoch.Latch(changed, usable);
+    m_sceneLightingInputs = inputs;
+}
+
+void Renderer::InvalidateSceneLighting(SceneLightingInvalidation reason) noexcept
+{
+    m_sceneLightingEpoch.Invalidate(reason);
+}
+
+const SceneLightingEpoch::Status& Renderer::GetSceneLightingEpoch() const noexcept
+{
+    return m_sceneLightingEpoch.GetStatus();
+}
+
+void Renderer::UpdateRadianceCacheD6(bool enabled)
+{
+    // A generation recorded by an earlier, unsubmitted recording never ran.
+    m_radianceCacheD6.BeginRecording();
+    m_radianceCacheD6.ReleaseRetired(m_commandContext.GetCompletedFenceValue());
+    const std::uint64_t lastSubmissionFence = m_commandContext.GetLastSubmissionFenceValue();
+
+    if(!enabled || m_packagedRuntime)
+    {
+        m_radianceCacheD6.Retire(lastSubmissionFence);
+        m_radianceCacheD6Failed = false;
+    }
+    else if(!m_radianceCacheD6Failed)
+    {
+        const bool failForTesting = std::exchange(m_radianceCacheD6FailAllocationForTesting, false);
+
+        if(!m_radianceCacheD6.EnsureResources(m_graphicsDevice.GetDevice(), m_resourceUploader, m_shaderLibrary,
+            m_resourceDescriptorHeap, m_radianceCacheD6Settings, lastSubmissionFence, failForTesting))
+        {
+            m_radianceCacheD6Failed = true;
+        }
+    }
+
+    // A change of identity (allocation, reconfiguration, release) is a scene-lighting input change.
+    m_radianceCacheConfiguration = m_radianceCacheD6.GetIdentity();
+}
+
+D3D12_GPU_VIRTUAL_ADDRESS Renderer::PrepareRadianceCacheLearning(ID3D12GraphicsCommandList* commandList,
+    std::uint32_t samplesPerFrame)
+{
+    std::string failure;
+    const RadianceCacheD6::Insertion insertion = m_radianceCacheD6.GetInsertion();
+    const bool sparse = insertion == RadianceCacheD6::Insertion::Sparse;
+    const bool deferred = insertion != RadianceCacheD6::Insertion::Inline;
+    m_radianceCacheLearningLibrary = sparse ? PathTraceRadianceCacheLibrary::Training :
+        (deferred ? m_radianceCacheDeferredLibrary : PathTraceRadianceCacheLibrary::Inline);
+
+    // SHARC.4D-R: sparse training with no tile size trains nothing this frame.
+    if(sparse && m_radianceCacheD6.GetTrainingTile() == 0)
+    {
+        return 0;
+    }
+
+    if(!m_pathTraceReferencePass.EnsureRadianceCacheLearning(m_graphicsDevice, m_shaderLibrary, failure,
+        m_radianceCacheLearningLibrary))
+    {
+        if(!m_radianceCacheLearningFailureLogged)
+        {
+            Log::Error("D6 radiance cache learning is unavailable; the reference path tracer is unaffected: " + failure);
+            m_radianceCacheLearningFailureLogged = true;
+        }
+
+        return 0;
+    }
+
+    // SHARC.4D-Q: one record per path of the dispatch. Without room for them the frame renders without learning.
+    // SHARC.4D-R: a sparse training dispatch's paths are its threads' (one per tile).
+    const std::uint64_t paths = sparse ? m_radianceCacheD6.TrainingThreads(m_sceneWidth, m_sceneHeight) :
+        static_cast<std::uint64_t>(m_sceneWidth) * m_sceneHeight;
+    // SHARC.6A: with the history prior, each training path also stores a primary-class record after the x1 records.
+    const bool primaryRecords = sparse && m_radianceCacheD6.UsesHistoryPrior();
+    const std::uint64_t recordCount = paths * samplesPerFrame * (primaryRecords ? 2u : 1u);
+    m_radianceCacheD6.SetPrimaryRecordOffset(primaryRecords ? static_cast<std::uint32_t>(paths * samplesPerFrame) : 0u);
+
+    if(deferred && !m_radianceCacheD6.EnsureRecords(m_graphicsDevice.GetDevice(), m_shaderLibrary,
+        m_resourceDescriptorHeap, recordCount, m_commandContext.GetLastSubmissionFenceValue(),
+        std::exchange(m_radianceCacheRecordsFailAllocationForTesting, false)))
+    {
+        return 0;
+    }
+
+    return m_radianceCacheD6.RecordLearningBegin(commandList, m_uploadBuffer, m_sceneLightingEpoch.GetStatus(),
+        deferred ? recordCount : 0, sparse ? m_radianceCacheD6.TrainingTilesX(m_sceneWidth) : 0);
+}
+
+PathTraceRadianceCacheLibrary Renderer::RadianceCacheQueryLibrary(bool extract, bool splitReSTIRDI) const
+{
+    if(m_radianceCacheD6.UsesQueryRenderLibrary())
+    {
+        if(splitReSTIRDI)
+        {
+            return extract ? PathTraceRadianceCacheLibrary::RenderSplitIndirectExtraction :
+                PathTraceRadianceCacheLibrary::RenderSplitIndirect;
+        }
+
+        return extract ? PathTraceRadianceCacheLibrary::RenderExtraction : PathTraceRadianceCacheLibrary::Render;
+    }
+
+    return m_radianceCacheD6.UsesQueryTerminationLibrary() ? PathTraceRadianceCacheLibrary::QueryTermination :
+        PathTraceRadianceCacheLibrary::Query;
+}
+
+void Renderer::ApplySharcSettings(const SharcSettings& requested, bool rasterPrimary)
+{
+    SharcSettings settings = requested;
+    settings.enabled = requested.enabled && rasterPrimary;
+    settings.trainingTile = requested.trainingTile == 8 ? 8u : 5u;
+    const SharcSettings previous = std::exchange(m_sharcSettings, settings);
+
+    // A different estimator (on/off, threshold) or a reset cache restarts accumulation; density, freezing and the
+    // statistics do not change what a path estimates.
+    const bool estimatorChanged = settings.minimumSamples != previous.minimumSamples ||
+        settings.resetRequest != previous.resetRequest || settings.adaptiveResolution != previous.adaptiveResolution ||
+        settings.historyPrior != previous.historyPrior;
+
+    // SHARC.5F: the mapping is part of the cache's settings and identity, so a switch reallocates and clears it and no
+    // entry is read under the other mapping. Only SHARC selects it: a cache kept without SHARC (diagnostics) keeps its
+    // mapping, so leaving SHARC does not rebuild it, and diagnostics that never enable SHARC keep the uniform grid.
+    if(settings.enabled)
+    {
+        m_radianceCacheD6Settings.adaptive = settings.adaptiveResolution;
+    }
+
+    if(settings.enabled != previous.enabled || (settings.enabled && estimatorChanged))
+    {
+        // The denoiser's temporal history is kept across accumulation restarts (camera motion); a different estimator
+        // must not be blended with it.
+        m_pathTraceResetPending = true;
+        m_pathTraceTemporalPass.InvalidateHistory();
+    }
+
+    RadianceCacheD6& cache = m_radianceCacheD6;
+
+    if(!settings.enabled)
+    {
+        // Diagnostics drive the cache directly; only leaving SHARC restores the defaults.
+        if(previous.enabled)
+        {
+            cache.SetQueryRender(false, 0.0f, false);
+            cache.SetQuery(false, 0);
+            cache.SetTrainingTile(5);
+            cache.SetInsertion(RadianceCacheD6::Insertion::Inline);
+            cache.SetHistoryPrior(false);
+        }
+
+        m_sharcStatus = {};
+        return;
+    }
+
+    // Sparse training (none while frozen), and the render library substituting at the threshold.
+    cache.SetInsertion(RadianceCacheD6::Insertion::Sparse);
+    cache.SetTrainingTile(settings.freezeTraining ? 0u : settings.trainingTile);
+    cache.SetQuery(true, m_sharcDiagnosticQueryMode != 0 ? m_sharcDiagnosticQueryMode : 1u);
+    cache.SetQueryRender(true, static_cast<float>(settings.minimumSamples), settings.statistics);
+    cache.SetHistoryPrior(settings.historyPrior);
+
+    if(settings.resetRequest != previous.resetRequest)
+    {
+        cache.RequestClear();
+    }
+}
+
+void Renderer::ApplyPathTraceDenoiser(bool requested, bool rasterPrimary)
+{
+    const bool denoise = requested && rasterPrimary;
+
+    if(denoise == m_pathTraceDenoiserOption)
+    {
+        return;
+    }
+
+    // Extraction feeds the temporal pass, whose history the spatial pass filters and presents. Each stage's own
+    // history rules apply: a frame without the temporal pass breaks its chain, so turning it back on starts afresh.
+    m_pathTraceDenoiserOption = denoise;
+    m_pathTraceSignalExtraction = denoise;
+    m_pathTraceTemporal = denoise;
+    m_pathTraceTemporalPresentation = denoise;
+    m_pathTraceSpatial = denoise;
+}
+
+void Renderer::ApplyPathTraceDenoiserStages(const PathTraceDenoiserStages& stages)
+{
+    const PathTraceDenoiserStages previous = m_pathTraceDenoiserStages;
+    m_pathTraceDenoiserStages = stages;
+
+    // Only a change applies, so diagnostics that set the members directly keep their values.
+    if(stages.spatialFilter != previous.spatialFilter)
+    {
+        m_pathTraceSpatialBypass = stages.spatialFilter == PathTraceSpatialFilter::Off;
+
+        if(!m_pathTraceSpatialBypass)
+        {
+            m_pathTraceSpatialIterations = stages.spatialFilter == PathTraceSpatialFilter::Atrous1 ? 1u :
+                stages.spatialFilter == PathTraceSpatialFilter::Atrous2 ? 2u : 0u;
+        }
+    }
+
+    if(stages.extendedDiffuseHistory != previous.extendedDiffuseHistory)
+    {
+        m_pathTraceExtendedDiffuse = stages.extendedDiffuseHistory;
+        m_pathTraceExtendedFrames = 0;
+    }
+
+    // The spatial pass never writes history, so only the temporal choice and a reset discard it.
+    if(stages.temporalHistory != previous.temporalHistory || stages.historyResetRequest != previous.historyResetRequest)
+    {
+        m_pathTraceTemporalHistoryDisabled = !stages.temporalHistory;
+        m_pathTraceTemporalPass.InvalidateHistory();
+    }
+}
+
+void Renderer::UpdateSharcStatus(unsigned int frameSlot)
+{
+    m_sharcStatus.active = m_sharcSettings.enabled && m_radianceCacheD6.HasResources() && m_sharcRenderedLastFrame;
+    m_sharcStatus.trainedFrames = m_radianceCacheD6.GetTrainedFrames();
+    m_sharcStatus.cacheBytes = 0;
+
+    if(m_radianceCacheD6.HasResources())
+    {
+        m_sharcStatus.cacheBytes = RadianceCacheD6::ResourceBytes(m_radianceCacheD6Settings) +
+            m_radianceCacheD6.GetRecordBufferBytes();
+    }
+
+    std::uint32_t words[RadianceCacheD6::ReadbackWords]{};
+    m_sharcStatus.statisticsValid = m_sharcStatus.active && m_sharcSettings.statistics &&
+        m_radianceCacheD6.ReadStatistics(frameSlot, words);
+
+    if(m_sharcStatus.statisticsValid)
+    {
+        m_sharcStatus.eligibleQueries = words[RadianceCacheD6::QueryEligible];
+        m_sharcStatus.lookupHits = words[RadianceCacheD6::QueryFound];
+        m_sharcStatus.substitutions = words[RadianceCacheD6::QueryTerminated];
+        m_sharcStatus.occupiedEntries = words[RadianceCacheD6::QueryWords + RadianceCacheD6::StatisticOccupied];
+    }
+}
+
+D3D12_GPU_VIRTUAL_ADDRESS Renderer::PrepareRadianceCacheQuery(ID3D12GraphicsCommandList* commandList, bool extract,
+    bool splitReSTIRDI)
+{
+    std::string failure;
+
+    if(!m_radianceCacheD6.UsesQueryLibrary() || !m_pathTraceReferencePass.EnsureRadianceCacheLearning(m_graphicsDevice,
+        m_shaderLibrary, failure, RadianceCacheQueryLibrary(extract, splitReSTIRDI)))
+    {
+        return 0;
+    }
+
+    if(m_radianceCacheD6.QueryCounts() &&
+        !m_radianceCacheD6.EnsureQueryStatistics(m_graphicsDevice.GetDevice(), m_resourceDescriptorHeap))
+    {
+        return 0;
+    }
+
+    // SHARC.6A: extraction frames with the history prior write it for the temporal pass.
+    Texture* prior = nullptr;
+
+    if(extract && m_pathTraceTemporal && m_radianceCacheD6.UsesHistoryPrior())
+    {
+        prior = m_pathTraceReferencePass.EnsureHistoryPriorTexture(m_graphicsDevice.GetDevice(),
+            m_resourceDescriptorHeap);
+    }
+
+    if(prior && m_radianceCacheD6.QueryCounts())
+    {
+        m_radianceCacheD6.EnsurePriorCounters(m_graphicsDevice.GetDevice(), m_resourceDescriptorHeap);
+    }
+
+    if(prior)
+    {
+        prior->Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    }
+
+    m_radianceCacheD6.SetHistoryPriorOutput(prior ? prior->GetUAVIndex() : 0u);
+    const D3D12_GPU_VIRTUAL_ADDRESS address =
+        m_radianceCacheD6.RecordQueryBegin(commandList, m_uploadBuffer, m_sceneLightingEpoch.GetStatus());
+    m_sharcHistoryPriorWritten = prior && address != 0;
+    m_sharcHistoryPriorBinding = m_sharcHistoryPriorWritten ? address : 0;
+    m_radianceCacheD6.SetHistoryPriorOutput(0u);
+    return address;
+}
+
 bool Renderer::RecordPathTraceReference(
     ID3D12GraphicsCommandList* commandList,
     unsigned int frameIndex,
@@ -4892,6 +5215,19 @@ bool Renderer::RecordPathTraceReference(
     key.environmentTextureIndex = m_environment.GetSourceTexture().GetDescriptorIndex();
     key.environmentConditionalCDFIndex = m_environment.GetImportanceConditionalCDF().GetDescriptorIndex();
     key.environmentTotalWeight = m_environment.GetImportanceTotalWeight();
+
+    // SHARC.4B: this frame's material table, TLAS update and environment are recorded by now.
+    LatchSceneLighting(key);
+
+    // SHARC.4C: the D6 cache's generation for the latched epoch, ahead of any cache access in this list.
+    m_radianceCacheLearnedLastFrame = false;
+
+    if(m_radianceCacheD6.HasResources())
+    {
+        m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::RadianceCacheGeneration);
+        m_radianceCacheD6.RecordGeneration(commandList, m_uploadBuffer, m_sceneLightingEpoch.GetStatus());
+        m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::RadianceCacheGeneration);
+    }
 
     const bool keyChanged = !m_pathTraceAccumulationKey || !SamePathTraceAccumulationKey(*m_pathTraceAccumulationKey, key);
 
@@ -5069,19 +5405,53 @@ bool Renderer::RecordPathTraceReference(
             m_gBuffer.GetMotion().Transition(commandList, shaderReadState);
         }
 
+        // SHARC.4D learning: a usable cache's Raster Primary frames without extraction trace through the cache
+        // library, which renders the same image and inserts D6 training samples. Every other frame is unchanged.
+        // SHARC.4D-R (diagnostics): with sparse training the image renders with the reference library, or the query
+        // library, and a separate training dispatch follows it. SHARC.4E.1: sparse training does not touch the image's
+        // dispatch, so it also runs on the denoiser's extraction frames (the render library's extraction export).
+        D3D12_GPU_VIRTUAL_ADDRESS radianceCacheAddress = 0;
+        D3D12_GPU_VIRTUAL_ADDRESS renderCacheAddress = 0;
+        m_sharcHistoryPriorWritten = false;
+        PathTraceRadianceCacheLibrary renderCacheLibrary = PathTraceRadianceCacheLibrary::Inline;
+        const bool sparseTraining = m_radianceCacheD6.GetInsertion() == RadianceCacheD6::Insertion::Sparse;
+
+        // SHARC.5B: sparse SHARC also serves ReSTIR DI frames, through the indirect pass (the direct pass is unchanged).
+        const bool cachePrimary = primary == PathTracePrimary::Raster ||
+            (sparseTraining && primary == PathTracePrimary::RasterReSTIRDI);
+
+        if(m_radianceCacheD6.IsUsable() && cachePrimary && (!extract || sparseTraining))
+        {
+            m_radianceCacheD6.SetSpatialAnchor(cameraPosition.x, cameraPosition.y, cameraPosition.z);
+            radianceCacheAddress = PrepareRadianceCacheLearning(commandList, settings.samplesPerFrame);
+
+            if(!sparseTraining)
+            {
+                renderCacheAddress = radianceCacheAddress;
+                renderCacheLibrary = m_radianceCacheLearningLibrary;
+            }
+            else
+            {
+                // Without a query binding (0) the reference pipeline renders.
+                renderCacheAddress = PrepareRadianceCacheQuery(commandList, extract, splitReSTIRDI);
+                renderCacheLibrary = RadianceCacheQueryLibrary(extract, splitReSTIRDI);
+            }
+        }
+
         m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::PathTraceReference);
 
         if(splitReSTIRDI)
         {
             m_pathTraceReferencePass.ExecuteReSTIRDISplit(m_commandContext.GetRayTracingCommandList(),
                 m_gpuTimestampProfiler, frameIndex, m_resourceDescriptorHeap, m_rayTracingScene, constantsAddress,
-                sceneLightConstantsAddress, m_sceneWidth, m_sceneHeight, rtxdiConstantsAddress, extract);
+                sceneLightConstantsAddress, m_sceneWidth, m_sceneHeight, rtxdiConstantsAddress, extract,
+                renderCacheAddress, renderCacheLibrary);
         }
         else
         {
             m_pathTraceReferencePass.Execute(primary, m_commandContext.GetRayTracingCommandList(),
                 m_resourceDescriptorHeap, m_rayTracingScene, constantsAddress, sceneLightConstantsAddress, m_sceneWidth,
-                m_sceneHeight, extract);
+                m_sceneHeight, extract, renderCacheAddress, renderCacheLibrary);
         }
 
         // RTXPT D.2B: temporal reconstruction consumes this frame's extraction outputs, so it runs only on frames
@@ -5093,13 +5463,56 @@ bool Renderer::RecordPathTraceReference(
             // D.3B.0 diagnostic view also runs it, for display only.
             m_pathTraceVisualization = m_debugUI.GetPathTraceDenoiserVisualization();
             const bool diagnosticView = m_pathTraceVisualization.view != PathTraceDenoiserView::Normal;
-            m_pathTraceSpatialRequested = (m_pathTraceSpatial || diagnosticView) &&
+            m_pathTraceSpatialRequested = ((m_pathTraceSpatial && !m_pathTraceSpatialBypass) || diagnosticView) &&
                 m_pathTraceSpatialPass.Initialize(m_graphicsDevice, m_shaderLibrary);
             m_pathTraceTemporalRanLastFrame = RecordPathTraceTemporal(commandList, primary, view, projection,
                 cameraPosition, frameLighting, settings);
         }
 
         m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::PathTraceReference);
+
+        // SHARC.4D: the frame's samples become cache history after the dispatch that inserted them. SHARC.4D-Q: a
+        // deferred learning frame inserts its records first.
+        if(radianceCacheAddress != 0)
+        {
+            if(sparseTraining)
+            {
+                m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex,
+                    GpuTimestampProfiler::Region::RadianceCacheTraining);
+                m_pathTraceReferencePass.ExecuteRadianceCacheTraining(m_commandContext.GetRayTracingCommandList(),
+                    m_resourceDescriptorHeap, m_rayTracingScene, constantsAddress, sceneLightConstantsAddress,
+                    radianceCacheAddress,
+                    static_cast<std::uint32_t>(m_radianceCacheD6.TrainingThreads(m_sceneWidth, m_sceneHeight)));
+                m_gpuTimestampProfiler.EndRegion(commandList, frameIndex,
+                    GpuTimestampProfiler::Region::RadianceCacheTraining);
+            }
+
+            if(m_radianceCacheD6.GetLearningBinding().deferred != 0)
+            {
+                m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex,
+                    GpuTimestampProfiler::Region::RadianceCacheInsertion);
+                m_radianceCacheD6.RecordDeferredInsertion(commandList, m_uploadBuffer);
+                m_gpuTimestampProfiler.EndRegion(commandList, frameIndex,
+                    GpuTimestampProfiler::Region::RadianceCacheInsertion);
+            }
+
+            m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::RadianceCacheResolve);
+            m_radianceCacheLearnedLastFrame = m_radianceCacheD6.RecordResolve(commandList, m_uploadBuffer,
+                m_sceneLightingEpoch.GetStatus());
+            m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::RadianceCacheResolve);
+        }
+
+        m_sharcRenderedLastFrame = renderCacheAddress != 0 &&
+            (renderCacheLibrary == PathTraceRadianceCacheLibrary::Render ||
+            renderCacheLibrary == PathTraceRadianceCacheLibrary::RenderExtraction ||
+            renderCacheLibrary == PathTraceRadianceCacheLibrary::RenderSplitIndirect ||
+            renderCacheLibrary == PathTraceRadianceCacheLibrary::RenderSplitIndirectExtraction);
+
+        // SHARC.4E statistics: this frame's counters, read back when its slot comes round again.
+        if(m_sharcSettings.enabled && m_sharcSettings.statistics && renderCacheAddress != 0)
+        {
+            m_radianceCacheD6.RecordStatisticsReadback(m_graphicsDevice.GetDevice(), commandList, frameIndex);
+        }
 
         if(m_pathTraceSpatialRequested && m_pathTraceTemporalRanLastFrame)
         {
@@ -5187,7 +5600,8 @@ bool Renderer::RecordPathTraceTemporal(
     // Without the previous frame's surfaces no tap can be validated: this frame starts new history.
     PreviousGBufferView previous;
 
-    if(!TryGetPreviousGBuffer(previous))
+    // DENOISE.1: without temporal history (diagnostics) every frame starts new history.
+    if(!TryGetPreviousGBuffer(previous) || m_pathTraceTemporalHistoryDisabled)
     {
         m_pathTraceTemporalPass.InvalidateHistory();
     }
@@ -5237,7 +5651,45 @@ bool Renderer::RecordPathTraceTemporal(
     constants.previousGeometricNormalIndex = havePrevious ? previous.geometricNormalIndex :
         m_gBuffer.GetGeometricNormal().GetSRVIndex();
 
-    m_pathTraceTemporalPass.Execute(commandList, m_uploadBuffer, constants, m_sceneWidth, m_sceneHeight);
+    // SHARC.6A: this frame's history prior, when its render dispatch wrote one (the transition orders the writes).
+    if(m_sharcHistoryPriorWritten)
+    {
+        Texture& prior = m_pathTraceReferencePass.GetHistoryPriorTexture();
+        prior.Transition(commandList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        constants.priorIndex = prior.GetDescriptorIndex();
+
+        if(m_radianceCacheD6.PriorCountedThisFrame())
+        {
+            constants.priorCountersIndex = m_radianceCacheD6.GetPriorCounters().GetUAVDescriptorIndex();
+        }
+    }
+
+    // DENOISE.3B: the extended diffuse history restarts unless this frame continues an unchanged scene and view
+    // (accumulation not restarted, temporal history valid, the same valid scene-lighting epoch, the previous frame
+    // updated it); it is used only after PathTraceExtendedStableFrames such frames.
+    m_pathTraceExtendedUsed = false;
+    const bool extended = m_pathTraceExtendedDiffuse &&
+        m_pathTraceTemporalPass.EnsureExtended(m_graphicsDevice.GetDevice(), m_resourceDescriptorHeap);
+
+    if(extended)
+    {
+        const SceneLightingEpoch::Status& epoch = m_sceneLightingEpoch.GetStatus();
+        const bool restart = m_pathTraceExtendedFrames == 0 || m_pathTraceStatus.accumulatedSamples == 0 ||
+            !m_pathTraceTemporalPass.HasHistory() || !epoch.valid || epoch.epoch != m_pathTraceExtendedEpoch;
+        m_pathTraceExtendedFrames = restart ? 1u : m_pathTraceExtendedFrames + 1u;
+        m_pathTraceExtendedEpoch = epoch.epoch;
+        m_pathTraceExtendedUsed = m_pathTraceExtendedFrames > PathTraceExtendedStableFrames;
+        constants.extendedRestart = restart ? 1u : 0u;
+        constants.extendedMaximum = PathTraceExtendedMaximum;
+        constants.extendedPresent = m_pathTraceExtendedUsed ? 1u : 0u;
+    }
+    else
+    {
+        m_pathTraceExtendedFrames = 0;
+    }
+
+    m_pathTraceTemporalPass.Execute(commandList, m_uploadBuffer, constants, m_sceneWidth, m_sceneHeight,
+        constants.priorIndex != 0 ? m_sharcHistoryPriorBinding : 0, extended);
     return true;
 }
 
@@ -5279,6 +5731,16 @@ void Renderer::RecordPathTraceSpatial(ID3D12GraphicsCommandList* commandList, co
     constants.diffuseIndex = diffuse.GetDescriptorIndex();
     constants.specularIndex = specular.GetDescriptorIndex();
     constants.momentsIndex = moments.GetDescriptorIndex();
+
+    // DENOISE.3B: a stable frame filters the extended diffuse history; its length is a plain mean's sample count up to
+    // the cap, so the effective count follows it (the moments stay the history's).
+    if(m_pathTraceExtendedUsed)
+    {
+        Texture& extended = m_pathTraceTemporalPass.GetExtendedDiffuse();
+        extended.Transition(commandList, shaderRead);
+        constants.diffuseIndex = extended.GetDescriptorIndex();
+        constants.diffuseMaximumHistory = PathTraceExtendedMaximum;
+    }
     constants.depthIndex = m_gBuffer.GetDepth().GetSRVIndex();
     constants.surfaceIndex = m_gBuffer.GetSurface().GetSRVIndex();
     constants.geometricNormalIndex = m_gBuffer.GetGeometricNormal().GetSRVIndex();
@@ -6095,6 +6557,7 @@ bool Renderer::RecordRenderFrame(
     // Begin performs the existing slot-fence wait/reset before any per-slot upload writes.
     const bool beganRecording = BeginTrackedRecording(frameIndex);
     m_cpuFrameTiming.begin = CpuTiming::MillisecondsSince(beginStart);
+    UpdateSharcStatus(frameIndex);
     m_cpuFrameTiming.fenceWaited = m_commandContext.DidBeginWaitForFence();
 
     m_cpuFrameTiming.fenceWait = m_commandContext.GetBeginFenceWaitMilliseconds();
@@ -6212,6 +6675,14 @@ bool Renderer::RecordRenderFrame(
     }
 
     ID3D12GraphicsCommandList* commandList = m_commandContext.GetCommandList();
+    // SHARC.4C: before the material table and the scene-lighting latch, whose inputs include the cache identity.
+    // SHARC and the denoiser option cover both raster-primary path-traced modes (SHARC.5B adds ReSTIR DI).
+    const bool rasterPrimaryMode = options.lightingMode == RendererLightingMode::PathTracedRasterPrimary ||
+        options.lightingMode == RendererLightingMode::PathTracedRasterPrimaryReSTIRDI;
+    ApplySharcSettings(options.sharc, rasterPrimaryMode);
+    ApplyPathTraceDenoiser(options.pathTraceDenoiser, rasterPrimaryMode);
+    ApplyPathTraceDenoiserStages(options.pathTraceDenoiserStages);
+    UpdateRadianceCacheD6(options.experimentalD6RadianceCache || m_sharcSettings.enabled);
     // Keep generation/revision evidence through End, which invalidates active eligibility.
     const auto textureUploadGeneration = m_activeRecordingGeneration;
     RecordPreparedTextureUploads(commandList); // Copies/transitions precede every material consumer.
@@ -6225,6 +6696,7 @@ bool Renderer::RecordRenderFrame(
 
     if (materialRevision != m_materialPublication.lastSubmitted)
     {
+        InvalidateSceneLighting(SceneLightingInvalidation::Material);
         ResetSceneHistory();
     }
 
@@ -7394,6 +7866,7 @@ bool Renderer::RecordRenderFrame(
     if (!executed)
     {
         m_materialDependencies.MarkUncertain(frameIndex);
+        m_radianceCacheD6.MarkSubmissionUncertain();
 
         for (auto& entry : m_preparedTextureUploads)
         {
@@ -7411,6 +7884,7 @@ bool Renderer::RecordRenderFrame(
     CommitPreviousGBufferCopy();
     m_pathTraceTemporalPass.CommitHistory();
     m_rtxdiResources.CommitFrame();
+    m_radianceCacheD6.CommitSubmission();
 
     // Capture the successful submission fence now; confirmation retains owners, not completion proof.
     const auto materialSubmissionFence = m_commandContext.GetLastSubmissionFenceValue();
@@ -7613,6 +8087,12 @@ void Renderer::Shutdown()
     m_materialTableUnavailableReason.clear();
     m_pathTraceAccumulationKey.reset();
     m_pathTraceResetPending = true;
+    m_sceneLightingEpoch.Restart();
+    m_sceneLightingInputs.reset();
+    // After the drain above: nothing can still use the cache or its retired resources.
+    m_radianceCacheD6.Shutdown();
+    m_radianceCacheD6Failed = false;
+    m_radianceCacheConfiguration = {};
     m_shadowDenoisePass.Shutdown();
     m_selectionMaskCandidate.reset();
     m_selectionMaskCandidateLifetime = 0;
@@ -7744,6 +8224,7 @@ bool Renderer::ReplaceMeshGeometry(
 
     m_rayTracingScene.ReleaseRetiredBLASResources();
 
+    InvalidateSceneLighting(SceneLightingInvalidation::Geometry);
     ResetSceneHistory();
 
     m_pendingGeometryTLASRefresh[0] = true;
@@ -7995,6 +8476,7 @@ bool Renderer::GenerateDisplacementMeshGPU(
     m_rayTracingScene.ReleaseRetiredBLASResources();
 
     // Geometry changed, so temporal rendering history is no longer valid.
+    InvalidateSceneLighting(SceneLightingInvalidation::Geometry);
     ResetSceneHistory();
 
     // Ensure both frame slots refresh their TLAS state.
@@ -8294,6 +8776,7 @@ bool Renderer::SetEnvironment(size_t index)
 
     m_currentEnvironmentIndex = index;
 
+    InvalidateSceneLighting(SceneLightingInvalidation::Environment);
     ResetSceneHistory();
 
     Log::Info("Environment changed to: " + asset.displayName);
@@ -8314,6 +8797,7 @@ bool Renderer::SetEnvironmentImage(const HDRImageData* image,std::string identit
     auto entry=std::find_if(m_availableEnvironments.begin(),m_availableEnvironments.end(),[&](const auto& e){return e.relativePath.empty() && e.reference==reference && e.displayName==displayName;});
     if(entry==m_availableEnvironments.end()) { m_availableEnvironments.push_back({std::move(displayName),{},std::move(reference)}); m_currentEnvironmentIndex=m_availableEnvironments.size()-1; }
     else m_currentEnvironmentIndex=static_cast<size_t>(entry-m_availableEnvironments.begin());
+    InvalidateSceneLighting(SceneLightingInvalidation::Environment);
     ResetSceneHistory(); return true;
 }
 

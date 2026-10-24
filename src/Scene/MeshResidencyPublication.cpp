@@ -497,6 +497,8 @@ void MeshResidencyPublication::ApplyPreparedPublication(Renderer& renderer, File
     assert(std::this_thread::get_id() == m_thread);
     assert(!renderer.m_commandRecordingGeneration && !renderer.m_activeRecordingGeneration);
     renderer.m_rayTracingScene.AdoptPreparedCandidate(*m_candidate, evidence);
+    // SHARC.4B: new residency changes the traced geometry; history is not reset here, but radiance is invalid.
+    renderer.InvalidateSceneLighting(SceneLightingInvalidation::Membership);
 
     if (!renderer.m_selectionMaskPass.IsInitialized())
     {

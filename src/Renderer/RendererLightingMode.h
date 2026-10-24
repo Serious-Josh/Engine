@@ -52,6 +52,42 @@ struct PathTraceReferenceSettings
     bool operator==(const PathTraceReferenceSettings&) const = default;
 };
 
+// SHARC.4E experimental cached-radiance rendering (Path Traced Raster Primary, and with ReSTIR DI since SHARC.5B;
+// off by default, not saved).
+struct SharcSettings
+{
+    bool enabled = false;
+    // One sparse training path per trainingTile x trainingTile pixels per frame (5 or 8).
+    std::uint32_t trainingTile = 5;
+    // A cache entry completes a path only with at least this many samples.
+    std::uint32_t minimumSamples = 64;
+    // No training, insertion or resolve; the existing cache keeps being queried.
+    bool freezeTraining = false;
+    // Lookup and termination counters for the statistics display (a small per-frame readback).
+    bool statistics = false;
+    // Incremented to request a cache reset.
+    std::uint32_t resetRequest = 0;
+    // SHARC.5F: distance-adaptive cell sizes (the default since SHARC.5F.1); false keeps the uniform 0.1 m grid.
+    bool adaptiveResolution = true;
+    // SHARC.6A (experimental): SHARC-assisted initialization of rejected diffuse denoiser history. Needs the denoiser.
+    bool historyPrior = false;
+
+    bool operator==(const SharcSettings&) const = default;
+};
+
+// A short GPU-side summary of the cache for the statistics display, two frames old.
+struct SharcStatus
+{
+    bool active = false;
+    bool statisticsValid = false;
+    std::uint32_t eligibleQueries = 0;
+    std::uint32_t lookupHits = 0;
+    std::uint32_t substitutions = 0;
+    std::uint32_t occupiedEntries = 0;
+    std::uint64_t trainedFrames = 0;
+    std::uint64_t cacheBytes = 0;
+};
+
 inline bool IsValidPathTraceReferenceSettings(const PathTraceReferenceSettings& settings)
 {
     return settings.samplesPerFrame >= 1 && settings.samplesPerFrame <= PathTraceReferenceSettings::MaximumSamplesPerFrame &&

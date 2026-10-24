@@ -5,6 +5,7 @@
 
 #include <d3d12.h>
 
+#include <cstdint>
 #include <vector>
 
 class ShaderLibrary;
@@ -29,6 +30,8 @@ class RayTracingPipeline
     void Shutdown();
 
     void Bind(ID3D12GraphicsCommandList4* commandList) const;
+    // Diagnostics: the stack size the driver reports for one export of the state object (0 when unavailable).
+    std::uint64_t GetShaderStackSize(const wchar_t* exportName) const;
     void Dispatch(
         ID3D12GraphicsCommandList4* commandList,
         unsigned int width,

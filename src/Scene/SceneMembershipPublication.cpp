@@ -297,6 +297,7 @@ SceneMembershipPublication::Result SceneMembershipPublication::PublishAtBoundary
         active.swap(p.target);
         r.m_sceneResourceScene=&active->GetScene();
         selectionIndex=mapped;
+        r.InvalidateSceneLighting(SceneLightingInvalidation::Membership);
         r.ResetSceneHistory();
         m_prepared.reset();
         return success;

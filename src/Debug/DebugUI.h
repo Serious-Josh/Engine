@@ -130,6 +130,25 @@ class DebugUI
 
     PathTraceReferenceSettings GetPathTraceReferenceSettings() const;
 
+    // SHARC.4E experimental cached-radiance rendering (the raster-primary path-traced modes), and its last statistics.
+    SharcSettings GetSharcSettings() const;
+    void SetSharcStatus(const SharcStatus& status)
+    {
+        m_sharcStatus = status;
+    }
+
+    // SHARC.4E.1: the path-tracing denoiser (Path Traced Raster Primary, and with ReSTIR DI since SHARC.5B).
+    bool IsPathTraceDenoiserEnabled() const
+    {
+        return m_pathTraceDenoiser && (m_lightingMode == 2 || m_lightingMode == 3);
+    }
+
+    // DENOISE.1: the denoiser stages to run (diagnostics; the defaults are the production pipeline).
+    PathTraceDenoiserStages GetPathTraceDenoiserStages() const
+    {
+        return m_pathTraceDenoiserStages;
+    }
+
     // Renderer evidence shown next to the mode selector (availability, reason, sample count).
     void SetPathTraceReferenceStatus(
         PathTraceReferenceAvailability availability,
@@ -210,6 +229,21 @@ class DebugUI
     int m_pathTraceMaxPathDepth = 3;
     int m_pathTraceRussianRouletteDepth = 3;
     int m_pathTraceMaxAccumulatedSamples = 1 << 16;
+
+    // SHARC.4E: indices into the density (5x5, 8x8) and minimum-sample (8, 16, 32, 64, 256) choices.
+    bool m_sharcEnabled = false;
+    int m_sharcDensity = 0;
+    int m_sharcMinimumSamples = 3;
+    bool m_sharcFreezeTraining = false;
+    bool m_sharcStatistics = false;
+    std::uint32_t m_sharcResetRequest = 0;
+    int m_sharcSpatialResolution = 1;
+    bool m_sharcHistoryPrior = false;
+    SharcStatus m_sharcStatus;
+    void DrawSharcSettings();
+    // SHARC.4E.1: the path-tracing denoiser in the raster-primary path-traced modes (on by default in the Editor).
+    bool m_pathTraceDenoiser = true;
+    PathTraceDenoiserStages m_pathTraceDenoiserStages{};
 
     PathTraceReferenceAvailability m_pathTraceAvailability = PathTraceReferenceAvailability::NotRequested;
     std::string m_pathTraceUnavailableReason;

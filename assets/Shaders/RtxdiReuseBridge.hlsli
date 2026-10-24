@@ -62,9 +62,15 @@ float3 RAB_GetSurfaceNormal(RAB_Surface surface)
     return surface.surface.normal;
 }
 
+// RTXDI.2A: an out-of-view neighbor position is returned unchanged, so RAB_GetGBufferSurface reports it invalid and
+// the SDK skips that neighbor before reading its reservoir: the first resampling pass checks the surface first, and the
+// bias-correction pass revisits only neighbors the first pass accepted (both map positions through this function, so
+// it must be deterministic). Clamping into the view instead sent every out-of-view disocclusion-boost neighbor of a
+// pixel entering the view to the same border pixels, whose shared reservoirs then streaked inward with camera motion
+// (build/rtxdi-2a/REPORT.md).
 int2 RAB_ClampSamplePositionIntoView(int2 pixelPosition, bool previousFrame)
 {
-    return clamp(pixelPosition, int2(0, 0), RtxdiBridgeViewSize() - 1);
+    return pixelPosition;
 }
 
 int RAB_TranslateLightIndex(uint lightIndex, bool currentToPrevious)

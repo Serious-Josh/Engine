@@ -40,6 +40,14 @@ class GpuTimestampProfiler
         PathTraceSplitIndirect,
         // RTXPT D.3B spatial filter, after (not inside) PathTraceReference.
         PathTraceSpatial,
+        // SHARC.4D experimental D6 radiance cache: the generation clear (before PathTraceReference) and the resolve
+        // (after it). Its sample insertion runs inside PathTraceReference.
+        RadianceCacheGeneration,
+        RadianceCacheResolve,
+        // SHARC.4D-Q deferred insertion (CSInsertRecords), after PathTraceReference and before the resolve.
+        RadianceCacheInsertion,
+        // SHARC.4D-R sparse training dispatch, after PathTraceReference and before the insertion.
+        RadianceCacheTraining,
         Count
     };
 

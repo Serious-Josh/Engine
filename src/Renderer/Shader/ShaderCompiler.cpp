@@ -507,7 +507,20 @@ ShaderLibraryProfile ShaderCompiler::GetLibraryProfile(const std::filesystem::pa
 
     if(fileName == "PathTraceReferenceSM69.hlsl" || fileName == "PathTraceReSTIRDISM69.hlsl" ||
         fileName == "PathTraceReferenceSERSM69.hlsl" || fileName == "PathTraceReSTIRDISERSM69.hlsl" ||
-        fileName == "PathTraceReSTIRDIExtractSM69.hlsl" || fileName == "PathTraceReSTIRDIExtractSERSM69.hlsl")
+        fileName == "PathTraceReSTIRDIExtractSM69.hlsl" || fileName == "PathTraceReSTIRDIExtractSERSM69.hlsl" ||
+        fileName == "PathTraceReferenceRadianceCacheSM69.hlsl" || fileName == "PathTraceReferenceRadianceCacheSERSM69.hlsl" ||
+        fileName == "PathTraceReferenceRadianceCacheDeferredSM69.hlsl" ||
+        fileName == "PathTraceReferenceRadianceCacheDeferredSERSM69.hlsl" ||
+        fileName == "PathTraceReferenceRadianceCacheDeferredLateSM69.hlsl" ||
+        fileName == "PathTraceReferenceRadianceCacheDeferredLateSERSM69.hlsl" ||
+        fileName == "PathTraceReferenceRadianceCacheQuerySM69.hlsl" ||
+        fileName == "PathTraceReferenceRadianceCacheQuerySERSM69.hlsl" ||
+        fileName == "PathTraceReferenceRadianceCacheTrainingSM69.hlsl" ||
+        fileName == "PathTraceReferenceRadianceCacheTrainingSERSM69.hlsl" ||
+        fileName == "PathTraceReferenceRadianceCacheQueryTerminationSM69.hlsl" ||
+        fileName == "PathTraceReferenceRadianceCacheQueryTerminationSERSM69.hlsl" ||
+        fileName == "PathTraceReferenceRadianceCacheRenderSM69.hlsl" ||
+        fileName == "PathTraceReferenceRadianceCacheRenderSERSM69.hlsl")
     {
         return ShaderLibraryProfile::Library69;
     }

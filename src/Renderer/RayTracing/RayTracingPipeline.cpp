@@ -464,6 +464,25 @@ void RayTracingPipeline::Shutdown()
     }
 }
 
+std::uint64_t RayTracingPipeline::GetShaderStackSize(const wchar_t* exportName) const
+{
+    if (!m_stateObject)
+    {
+        return 0;
+    }
+
+    ID3D12StateObjectProperties* stateObjectProperties = nullptr;
+
+    if (FAILED(m_stateObject->QueryInterface(IID_PPV_ARGS(&stateObjectProperties))))
+    {
+        return 0;
+    }
+
+    const std::uint64_t stackSize = stateObjectProperties->GetShaderStackSize(exportName);
+    stateObjectProperties->Release();
+    return stackSize;
+}
+
 void RayTracingPipeline::Bind(ID3D12GraphicsCommandList4* commandList) const
 {
     if (!commandList)

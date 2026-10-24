@@ -995,6 +995,77 @@ PathTraceReferenceSettings DebugUI::GetPathTraceReferenceSettings() const
     return settings;
 }
 
+namespace
+{
+    constexpr std::uint32_t SharcTrainingTiles[] = {5, 8};
+    constexpr std::uint32_t SharcMinimumSamples[] = {8, 16, 32, 64, 256};
+}
+
+SharcSettings DebugUI::GetSharcSettings() const
+{
+    SharcSettings settings;
+    settings.enabled = m_sharcEnabled;
+    settings.trainingTile = SharcTrainingTiles[m_sharcDensity];
+    settings.minimumSamples = SharcMinimumSamples[m_sharcMinimumSamples];
+    settings.freezeTraining = m_sharcFreezeTraining;
+    settings.statistics = m_sharcStatistics;
+    settings.resetRequest = m_sharcResetRequest;
+    settings.adaptiveResolution = m_sharcSpatialResolution == 1;
+    settings.historyPrior = m_sharcHistoryPrior && m_pathTraceDenoiser;
+    return settings;
+}
+
+void DebugUI::DrawSharcSettings()
+{
+    ImGui::TextUnformatted("SHARC radiance cache (experimental, not saved)");
+    ImGui::Checkbox("Enable SHARC", &m_sharcEnabled);
+
+    if (!m_sharcEnabled)
+    {
+        return;
+    }
+
+    const char* densities[] = {"5x5 (1/25)", "8x8 (1/64)"};
+    ImGui::Combo("Training density", &m_sharcDensity, densities, IM_ARRAYSIZE(densities));
+    const char* minimumSamples[] = {"8", "16", "32", "64", "256"};
+    ImGui::Combo("Minimum cache samples", &m_sharcMinimumSamples, minimumSamples, IM_ARRAYSIZE(minimumSamples));
+    // Switching rebuilds the cache.
+    const char* spatialResolutions[] = {"Uniform 10 cm", "Adaptive (default)"};
+    ImGui::Combo("Spatial resolution", &m_sharcSpatialResolution, spatialResolutions, IM_ARRAYSIZE(spatialResolutions));
+    // Initializes rejected denoiser history from the cache, so it needs the PT denoiser.
+    ImGui::BeginDisabled(!m_pathTraceDenoiser);
+    ImGui::Checkbox("SHARC-assisted history initialization (experimental)", &m_sharcHistoryPrior);
+    ImGui::EndDisabled();
+    ImGui::Checkbox("Freeze training", &m_sharcFreezeTraining);
+    ImGui::SameLine();
+
+    if (ImGui::Button("Reset cache"))
+    {
+        ++m_sharcResetRequest;
+    }
+
+    ImGui::Checkbox("SHARC statistics", &m_sharcStatistics);
+
+    if (!m_sharcStatus.active)
+    {
+        ImGui::TextDisabled("Inactive: waiting for a scene with ray-traced geometry.");
+        return;
+    }
+
+    ImGui::Text("Trained frames: %llu%s", static_cast<unsigned long long>(m_sharcStatus.trainedFrames),
+                m_sharcFreezeTraining ? " (frozen)" : "");
+    ImGui::Text("Cache memory: %.1f MiB", static_cast<double>(m_sharcStatus.cacheBytes) / (1024.0 * 1024.0));
+
+    if (m_sharcStatistics && m_sharcStatus.statisticsValid)
+    {
+        const double eligible = m_sharcStatus.eligibleQueries > 0 ? m_sharcStatus.eligibleQueries : 1.0;
+        ImGui::Text("Lookup hits: %.1f%%, cached paths: %.1f%% of %u eligible",
+                    100.0 * m_sharcStatus.lookupHits / eligible, 100.0 * m_sharcStatus.substitutions / eligible,
+                    m_sharcStatus.eligibleQueries);
+        ImGui::Text("Occupied entries: %u", m_sharcStatus.occupiedEntries);
+    }
+}
+
 void DebugUI::SetPathTraceReferenceStatus(
     PathTraceReferenceAvailability availability,
     const std::string& unavailableReason,
@@ -1161,6 +1232,39 @@ void DebugUI::DrawPathTraceReferenceSettings()
 
     const bool rasterPrimary = m_lightingMode == 2;
     const bool restirDI = m_lightingMode == 3;
+
+    // SHARC.4E.1 / 5B: the denoiser and SHARC serve both raster-primary modes.
+    if (rasterPrimary || restirDI)
+    {
+        ImGui::Checkbox("PT denoiser", &m_pathTraceDenoiser);
+
+        // DENOISE.1: stage isolation for diagnosing the denoiser; the defaults are the production pipeline.
+        if (m_pathTraceDenoiser)
+        {
+            const char* spatialFilters[] = {"Off", "5x5 single pass", "A-trous, 1 iteration",
+                                            "A-trous, 2 iterations (default)"};
+            int spatialFilter = static_cast<int>(m_pathTraceDenoiserStages.spatialFilter);
+            ImGui::Checkbox("PT temporal history", &m_pathTraceDenoiserStages.temporalHistory);
+            ImGui::Combo("PT spatial filter", &spatialFilter, spatialFilters, IM_ARRAYSIZE(spatialFilters));
+            m_pathTraceDenoiserStages.spatialFilter = static_cast<PathTraceSpatialFilter>(spatialFilter);
+
+            if (ImGui::Button("Reset PT denoiser history"))
+            {
+                ++m_pathTraceDenoiserStages.historyResetRequest;
+            }
+
+            // DENOISE.3B (experimental, off by default).
+            ImGui::Checkbox("PT extended diffuse history (experimental)", &m_pathTraceDenoiserStages.extendedDiffuseHistory);
+
+            if (!m_pathTraceDenoiserStages.temporalHistory)
+            {
+                ImGui::TextWrapped(spatialFilter == 0 ? "Raw: this frame's samples, no denoising."
+                                                      : "Spatial only: this frame's samples, spatially filtered.");
+            }
+        }
+
+        DrawSharcSettings();
+    }
 
     if (preparing || transitionFailed)
     {

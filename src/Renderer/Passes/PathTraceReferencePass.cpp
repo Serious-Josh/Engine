@@ -67,6 +67,49 @@ namespace
 
     // RTXPT D.1B.2: the library of the extraction direct pass. It never shares a library with the production direct
     // pass (PathTraceReSTIRDIExtract.hlsl), so the production ReSTIR DI library is unchanged.
+    // SHARC.4D: the learning libraries of each variant (the reference library with PATH_TRACE_RADIANCE_CACHE_LIBRARY).
+    const char* RadianceCacheLibraryPath(PathTraceLibraryVariant variant, PathTraceRadianceCacheLibrary library)
+    {
+        static constexpr const char* paths[][3] = {
+            {"PathTraceReferenceRadianceCache.hlsl", "PathTraceReferenceRadianceCacheSM69.hlsl",
+                "PathTraceReferenceRadianceCacheSERSM69.hlsl"},
+            {"PathTraceReferenceRadianceCacheDeferred.hlsl", "PathTraceReferenceRadianceCacheDeferredSM69.hlsl",
+                "PathTraceReferenceRadianceCacheDeferredSERSM69.hlsl"},
+            {"PathTraceReferenceRadianceCacheDeferredLate.hlsl", "PathTraceReferenceRadianceCacheDeferredLateSM69.hlsl",
+                "PathTraceReferenceRadianceCacheDeferredLateSERSM69.hlsl"},
+            {"PathTraceReferenceRadianceCacheQuery.hlsl", "PathTraceReferenceRadianceCacheQuerySM69.hlsl",
+                "PathTraceReferenceRadianceCacheQuerySERSM69.hlsl"},
+            {"PathTraceReferenceRadianceCacheTraining.hlsl", "PathTraceReferenceRadianceCacheTrainingSM69.hlsl",
+                "PathTraceReferenceRadianceCacheTrainingSERSM69.hlsl"},
+            {"PathTraceReferenceRadianceCacheQueryTermination.hlsl",
+                "PathTraceReferenceRadianceCacheQueryTerminationSM69.hlsl",
+                "PathTraceReferenceRadianceCacheQueryTerminationSERSM69.hlsl"},
+            {"PathTraceReferenceRadianceCacheRender.hlsl", "PathTraceReferenceRadianceCacheRenderSM69.hlsl",
+                "PathTraceReferenceRadianceCacheRenderSERSM69.hlsl"},
+            {"PathTraceReferenceRadianceCacheRender.hlsl", "PathTraceReferenceRadianceCacheRenderSM69.hlsl",
+                "PathTraceReferenceRadianceCacheRenderSERSM69.hlsl"},
+            {"PathTraceReferenceRadianceCacheRender.hlsl", "PathTraceReferenceRadianceCacheRenderSM69.hlsl",
+                "PathTraceReferenceRadianceCacheRenderSERSM69.hlsl"},
+            {"PathTraceReferenceRadianceCacheRender.hlsl", "PathTraceReferenceRadianceCacheRenderSM69.hlsl",
+                "PathTraceReferenceRadianceCacheRenderSERSM69.hlsl"}};
+        static_assert(std::size(paths) == static_cast<size_t>(PathTraceRadianceCacheLibrary::Count));
+        size_t column = 0;
+
+        switch(variant)
+        {
+        case PathTraceLibraryVariant::SM69:
+            column = 1;
+            break;
+        case PathTraceLibraryVariant::SM69SER:
+            column = 2;
+            break;
+        case PathTraceLibraryVariant::SM66:
+            break;
+        }
+
+        return paths[static_cast<size_t>(library)][column];
+    }
+
     const char* ReSTIRDIExtractionLibraryPath(PathTraceLibraryVariant variant)
     {
         switch(variant)
@@ -163,6 +206,34 @@ namespace
 
         RayTracingPipelineDescription description = BuildPathTracePipelineDescription(PathTracePrimary::Raster, variant);
         description.rayGenerationShader = L"PathTraceReSTIRDISplitIndirectRayGeneration";
+        return description;
+    }
+
+    // SHARC.4D: the Raster Primary pipeline with a learning library and the cache binding (b3) appended.
+    RayTracingPipelineDescription BuildRadianceCachePipelineDescription(PathTraceLibraryVariant variant,
+        PathTraceRadianceCacheLibrary library)
+    {
+        RayTracingPipelineDescription description = BuildPathTracePipelineDescription(PathTracePrimary::Raster, variant);
+        description.shaderPath = RadianceCacheLibraryPath(variant, library);
+
+        if(library == PathTraceRadianceCacheLibrary::Training)
+        {
+            description.rayGenerationShader = L"PathTraceRadianceCacheTrainingRayGeneration";
+        }
+        else if(library == PathTraceRadianceCacheLibrary::RenderExtraction)
+        {
+            description.rayGenerationShader = L"PathTraceRasterPrimaryExtractRayGeneration";
+        }
+        else if(library == PathTraceRadianceCacheLibrary::RenderSplitIndirect)
+        {
+            description.rayGenerationShader = L"PathTraceReSTIRDISplitIndirectRayGeneration";
+        }
+        else if(library == PathTraceRadianceCacheLibrary::RenderSplitIndirectExtraction)
+        {
+            description.rayGenerationShader = L"PathTraceReSTIRDISplitIndirectExtractRayGeneration";
+        }
+
+        description.rootParameters.push_back({RootParameterType::ConstantBuffer, 3});
         return description;
     }
 
@@ -451,6 +522,13 @@ ShaderLibraryPreparation PathTraceReferencePass::PrepareLibrary(
         m_extractSplitFailed = false;
         m_extractSplitFailure.clear();
 
+        // SHARC.4D: the learning libraries include the reference library.
+        for(RadianceCacheLearningPipeline& learning : m_radianceCache)
+        {
+            learning.failed = false;
+            learning.failure.clear();
+        }
+
         Log::Info("Accepted the asynchronously compiled " + libraryName + " DXR library.");
         preparation.state = ShaderLibraryPreparationState::Ready;
         preparation.acceptedNewRevision = true;
@@ -612,6 +690,7 @@ bool PathTraceReferencePass::Resize(
     ReleaseSplitDirectRadiance();
     m_diffuseTexture.Shutdown();
     m_specularTexture.Shutdown();
+    m_historyPriorTexture.Shutdown();
 
     if(!CreateTextures(device, descriptorHeap, width, height))
     {
@@ -631,12 +710,21 @@ void PathTraceReferencePass::Execute(
     D3D12_GPU_VIRTUAL_ADDRESS sceneLightConstantsAddress,
     unsigned int width,
     unsigned int height,
-    bool extract)
+    bool extract,
+    D3D12_GPU_VIRTUAL_ADDRESS radianceCacheConstants,
+    PathTraceRadianceCacheLibrary radianceCacheLibrary)
 {
-    RayTracingPipeline& pipeline = extract ? m_extractRasterPipeline : m_pipelines[static_cast<size_t>(primary)];
-    const bool ready = extract ?
+    // SHARC.4D: a learning pipeline only for Raster Primary; otherwise the production one.
+    RadianceCacheLearningPipeline& radianceCache = m_radianceCache[static_cast<size_t>(radianceCacheLibrary)];
+    // SHARC.4E.1: an extraction frame uses a cache library only through its extraction ray generation.
+    const bool extractingLibrary = radianceCacheLibrary == PathTraceRadianceCacheLibrary::RenderExtraction;
+    const bool learning = radianceCacheConstants != 0 && primary == PathTracePrimary::Raster &&
+        extract == extractingLibrary && radianceCache.ready && (!extract || m_diffuseTexture.GetResource());
+    RayTracingPipeline& pipeline = learning ? radianceCache.pipeline :
+        (extract ? m_extractRasterPipeline : m_pipelines[static_cast<size_t>(primary)]);
+    const bool ready = learning || (extract ?
         primary == PathTracePrimary::Raster && m_extractRasterReady && m_diffuseTexture.GetResource() :
-        m_pipelineReady[static_cast<size_t>(primary)];
+        m_pipelineReady[static_cast<size_t>(primary)]);
 
     // ReSTIR DI records through ExecuteReSTIRDISplit; its own pipeline slot is never created.
     if(!m_initialized || !commandList || width != m_width || height != m_height ||
@@ -663,8 +751,99 @@ void PathTraceReferencePass::Execute(
     commandList->SetComputeRootDescriptorTable(3, descriptorHeap.GetGPUHandle(m_statisticsTexture.GetUAVIndex()));
     commandList->SetComputeRootConstantBufferView(4, constantsAddress);
     commandList->SetComputeRootConstantBufferView(5, sceneLightConstantsAddress);
+
+    if(learning)
+    {
+        commandList->SetComputeRootConstantBufferView(6, radianceCacheConstants);
+    }
+
     pipeline.Dispatch(commandList, width, height);
     RecordOutputBarriers(commandList, extract);
+}
+
+void PathTraceReferencePass::ExecuteRadianceCacheTraining(
+    ID3D12GraphicsCommandList4* commandList,
+    DescriptorHeap& descriptorHeap,
+    const RayTracingSceneResources& rayTracingScene,
+    D3D12_GPU_VIRTUAL_ADDRESS constantsAddress,
+    D3D12_GPU_VIRTUAL_ADDRESS sceneLightConstantsAddress,
+    D3D12_GPU_VIRTUAL_ADDRESS trainingConstants,
+    std::uint32_t threads)
+{
+    RadianceCacheLearningPipeline& training =
+        m_radianceCache[static_cast<size_t>(PathTraceRadianceCacheLibrary::Training)];
+
+    if(!m_initialized || !commandList || !training.ready || trainingConstants == 0 || threads == 0)
+    {
+        return;
+    }
+
+    // The Raster Primary root signature: the image tables are bound but the training ray generation writes none of them.
+    training.pipeline.Bind(commandList);
+    commandList->SetComputeRootShaderResourceView(0, rayTracingScene.GetTopLevel().GetGPUAddress());
+    commandList->SetComputeRootDescriptorTable(1, descriptorHeap.GetGPUHandle(m_accumulationTexture.GetUAVIndex()));
+    commandList->SetComputeRootDescriptorTable(2, descriptorHeap.GetGPUHandle(m_outputTexture.GetUAVIndex()));
+    commandList->SetComputeRootDescriptorTable(3, descriptorHeap.GetGPUHandle(m_statisticsTexture.GetUAVIndex()));
+    commandList->SetComputeRootConstantBufferView(4, constantsAddress);
+    commandList->SetComputeRootConstantBufferView(5, sceneLightConstantsAddress);
+    commandList->SetComputeRootConstantBufferView(6, trainingConstants);
+    training.pipeline.Dispatch(commandList, threads, 1);
+}
+
+bool PathTraceReferencePass::EnsureRadianceCacheLearning(
+    GraphicsDevice& graphicsDevice,
+    ShaderLibrary& shaderLibrary,
+    std::string& failureReason,
+    PathTraceRadianceCacheLibrary library)
+{
+    if(!m_initialized)
+    {
+        failureReason = "The path tracer is not initialized.";
+        return false;
+    }
+
+    RadianceCacheLearningPipeline& learning = m_radianceCache[static_cast<size_t>(library)];
+
+    if(learning.ready)
+    {
+        return true;
+    }
+
+    if(learning.failed)
+    {
+        failureReason = learning.failure;
+        return false;
+    }
+
+    const RayTracingPipelineDescription description = BuildRadianceCachePipelineDescription(m_libraryVariant, library);
+    const std::string libraryName = description.shaderPath.generic_string();
+    const ShaderLibraryCompileResult* compiled = AcquireLibrary(shaderLibrary, description.shaderPath);
+
+    if(!compiled)
+    {
+        learning.failure = "The " + libraryName + " DXR library is unavailable or failed to compile" +
+            TroubleshootingHint() + ".";
+    }
+    else if(!LibraryNamesExport(compiled->bytecode, description.rayGenerationShader))
+    {
+        learning.failure = "The " + libraryName + " DXR library has no Raster Primary entry point.";
+    }
+    else if(!learning.pipeline.Initialize(graphicsDevice.GetRayTracingDevice(), compiled->bytecode, description))
+    {
+        learning.failure = "The " + libraryName + " learning DXR pipeline could not be created" +
+            TroubleshootingHint() + ".";
+    }
+
+    if(!learning.failure.empty())
+    {
+        learning.pipeline.Shutdown();
+        learning.failed = true;
+        failureReason = learning.failure;
+        return false;
+    }
+
+    learning.ready = true;
+    return true;
 }
 
 void PathTraceReferencePass::RecordOutputBarriers(ID3D12GraphicsCommandList* commandList, bool extract)
@@ -878,6 +1057,27 @@ bool PathTraceReferencePass::CreateExtractionTextures(ID3D12Device* device, Desc
     return true;
 }
 
+Texture* PathTraceReferencePass::EnsureHistoryPriorTexture(ID3D12Device* device, DescriptorHeap& descriptorHeap)
+{
+    if(m_historyPriorTexture.GetResource())
+    {
+        return &m_historyPriorTexture;
+    }
+
+    if(m_width == 0 || m_height == 0 || !m_historyPriorTexture.Initialize(device, m_width, m_height, 1, 1,
+        DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS) || !m_historyPriorTexture.CreateSRV(device, descriptorHeap) ||
+        !m_historyPriorTexture.CreateUAV(device, descriptorHeap))
+    {
+        Log::Error("Failed to create the SHARC history prior texture; history initialization is skipped.");
+        m_historyPriorTexture.Shutdown();
+        return nullptr;
+    }
+
+    m_historyPriorTexture.GetResource()->SetName(L"SHARC History Prior");
+    return &m_historyPriorTexture;
+}
+
 unsigned int PathTraceReferencePass::EnsureSplitDirectRadiance(
     ID3D12Device* device,
     DescriptorHeap& descriptorHeap,
@@ -1003,7 +1203,9 @@ void PathTraceReferencePass::ExecuteReSTIRDISplit(
     unsigned int width,
     unsigned int height,
     D3D12_GPU_VIRTUAL_ADDRESS rtxdiConstantsAddress,
-    bool extract)
+    bool extract,
+    D3D12_GPU_VIRTUAL_ADDRESS radianceCacheConstants,
+    PathTraceRadianceCacheLibrary radianceCacheLibrary)
 {
     const bool ready = extract ?
         m_extractSplitReady && m_splitDirectDiffuse.buffer.GetResource() && m_diffuseTexture.GetResource() :
@@ -1015,8 +1217,17 @@ void PathTraceReferencePass::ExecuteReSTIRDISplit(
         return;
     }
 
+    // SHARC.5B: the indirect pass may come from the cached-radiance library (its split-indirect export matching the
+    // frame's extraction); the direct pass never does.
+    const RadianceCacheLearningPipeline& radianceCache = m_radianceCache[static_cast<size_t>(radianceCacheLibrary)];
+    const PathTraceRadianceCacheLibrary expectedLibrary = extract ?
+        PathTraceRadianceCacheLibrary::RenderSplitIndirectExtraction : PathTraceRadianceCacheLibrary::RenderSplitIndirect;
+    const bool cachedIndirect = radianceCacheConstants != 0 && radianceCacheLibrary == expectedLibrary &&
+        radianceCache.ready;
     RayTracingPipeline& directPipeline = extract ? m_extractSplitDirectPipeline : m_splitDirectPipeline;
-    RayTracingPipeline& indirectPipeline = extract ? m_extractSplitIndirectPipeline : m_splitIndirectPipeline;
+    RayTracingPipeline& indirectPipeline = cachedIndirect ?
+        m_radianceCache[static_cast<size_t>(radianceCacheLibrary)].pipeline :
+        (extract ? m_extractSplitIndirectPipeline : m_splitIndirectPipeline);
 
     m_accumulationTexture.Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     m_outputTexture.Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -1063,6 +1274,12 @@ void PathTraceReferencePass::ExecuteReSTIRDISplit(
     profiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::PathTraceSplitIndirect);
     indirectPipeline.Bind(commandList);
     bindSharedRootParameters();
+
+    if(cachedIndirect)
+    {
+        commandList->SetComputeRootConstantBufferView(6, radianceCacheConstants);
+    }
+
     indirectPipeline.Dispatch(commandList, width, height);
     profiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::PathTraceSplitIndirect);
 
@@ -1112,6 +1329,11 @@ std::uint64_t PathTraceReferencePass::GetResourceBytes() const
         bytes += pixels * (8 + 8);
     }
 
+    if(m_historyPriorTexture.GetResource())
+    {
+        bytes += pixels * 8;
+    }
+
     return bytes;
 }
 
@@ -1153,6 +1375,15 @@ void PathTraceReferencePass::ReleaseResources()
     m_extractSplitFailure.clear();
     m_diffuseTexture.Shutdown();
     m_specularTexture.Shutdown();
+    m_historyPriorTexture.Shutdown();
+
+    for(RadianceCacheLearningPipeline& learning : m_radianceCache)
+    {
+        learning.pipeline.Shutdown();
+        learning.ready = false;
+        learning.failed = false;
+        learning.failure.clear();
+    }
 
     m_width = 0;
     m_height = 0;

@@ -19,6 +19,8 @@
 #include "GpuTimestampProfiler.h"
 #include "RenderObject.h"
 #include "RendererStatistics.h"
+#include "SceneLightingEpoch.h"
+#include "RadianceCache/RadianceCacheD6.h"
 #include "ResourceUploader.h"
 #include "SwapChain.h"
 #include "EnvironmentMap.h"
@@ -126,6 +128,22 @@ struct RendererOptions
     // never persisted. An unavailable reference mode renders Legacy and reports why.
     RendererLightingMode lightingMode = RendererLightingMode::Legacy;
     PathTraceReferenceSettings pathTraceReference;
+
+    // SHARC.4C experimental D6 radiance cache, default off. On: its GPU resources exist and their generation follows
+    // the scene-lighting epoch on path-traced frames. No rendering stage reads or writes the cache yet, so the image is
+    // unchanged. Off: no allocation and no dispatch. Unsupported in the packaged runtime.
+    bool experimentalD6RadianceCache = false;
+
+    // SHARC.4E experimental cached-radiance rendering, default off (it also enables the D6 cache). Off: the reference
+    // pipeline, with no SHARC dispatch, lookup or allocation.
+    SharcSettings sharc;
+
+    // SHARC.4E.1: the path-tracing denoiser (RTXPT D.1B signal extraction, D.2B temporal reconstruction, D.3B spatial
+    // filtering) on Path Traced Raster Primary frames (with ReSTIR DI too since SHARC.5B), with or without SHARC. The denoised result is presented in place
+    // of the progressive mean; the accumulation itself is unchanged. Off here; the Editor turns it on by default.
+    bool pathTraceDenoiser = false;
+    // DENOISE.1 diagnostics: which denoiser stages run (defaults: the production pipeline). Applied when it changes.
+    PathTraceDenoiserStages pathTraceDenoiserStages;
 };
 
 // Evidence of the reference path tracer for the Editor and diagnostics. Values only.
@@ -267,6 +285,8 @@ class Renderer
     const DirectionalLight& GetRecordedSun() const noexcept { return m_recordedSun; }
     std::uint32_t GetRecordedAdditionalLightCount() const noexcept { return m_recordedAdditionalLightCount; }
     const PathTraceReferenceStatus& GetPathTraceReferenceStatus() const noexcept { return m_pathTraceStatus; }
+    // SHARC.4E: the cache's statistics for the Editor (two frames old; valid only with SharcSettings::statistics).
+    const SharcStatus& GetSharcStatus() const noexcept { return m_sharcStatus; }
     const PathTraceRasterPrimaryStatus& GetPathTraceRasterPrimaryStatus() const noexcept { return m_rasterPrimaryStatus; }
     const PathTraceRasterPrimaryStatus& GetPathTraceReSTIRDIStatus() const noexcept { return m_restirDIStatus; }
     // Async DXR preparation: requested versus active lighting mode and the real preparation stage.
@@ -425,6 +445,11 @@ class Renderer
     // Output is empty when nothing finalized; no scene acknowledgment here.
     [[nodiscard]] bool DrainAndResolveSceneDisplacement(const Scene& scene, DisplacementCompletionResult& result);
     void ResetSceneHistory();
+    // SHARC.4B: records a radiance-affecting change for the next scene-lighting latch. History-only resets
+    // (camera cuts, leaving path tracing) must not call this.
+    void InvalidateSceneLighting(SceneLightingInvalidation reason) noexcept;
+    // The scene-lighting epoch of the latest path-traced frame recording (SceneLightingEpoch.h).
+    const SceneLightingEpoch::Status& GetSceneLightingEpoch() const noexcept;
 
     // Nonblocking editor resource retirement; valid only within this Renderer lifetime.
     std::uint64_t GetEditorCompletedFence() const;
@@ -1245,6 +1270,81 @@ class Renderer
     };
 
     std::optional<PathTraceAccumulationKey> m_pathTraceAccumulationKey;
+
+    // SHARC.4B: the radiance-affecting inputs of a path-traced frame. The accumulation key with its camera-only
+    // terms neutralized (view, projection, size, samples per frame, maximum accumulated samples), plus what the key
+    // lacks: ray-tracing membership and per-object material bindings, the library variant and the cache's identity.
+    struct SceneLightingInputs
+    {
+        PathTraceAccumulationKey key;
+        std::uint64_t materialBindingEpoch = 0;
+        PathTraceLibraryVariant libraryVariant = PathTraceLibraryVariant::SM66;
+        RadianceCacheConfigurationIdentity cache;
+    };
+
+    static SceneLightingInputs MakeSceneLightingInputs(const PathTraceAccumulationKey& key,
+        std::uint64_t materialBindingEpoch, PathTraceLibraryVariant libraryVariant,
+        const RadianceCacheConfigurationIdentity& cache);
+    static bool SameSceneLightingInputs(const SceneLightingInputs& left, const SceneLightingInputs& right);
+    // Latches the frame's epoch from its key. Called once per path-traced recording, in RecordPathTraceReference,
+    // after the frame's material table, TLAS update and environment are recorded.
+    void LatchSceneLighting(const PathTraceAccumulationKey& key);
+    SceneLightingEpoch m_sceneLightingEpoch;
+    std::optional<SceneLightingInputs> m_sceneLightingInputs;
+    // The D6 cache's identity while it has resources, otherwise all zero (UpdateRadianceCacheD6).
+    RadianceCacheConfigurationIdentity m_radianceCacheConfiguration;
+
+    // SHARC.4C experimental D6 radiance cache (RendererOptions::experimentalD6RadianceCache): resources and generation
+    // lifecycle only. UpdateRadianceCacheD6 runs at the start of each scene-frame recording, before the latch.
+    RadianceCacheD6 m_radianceCacheD6;
+    RadianceCacheD6::Settings m_radianceCacheD6Settings;
+    // A failed allocation is not retried every frame; turning the option off clears it.
+    bool m_radianceCacheD6Failed = false;
+    // Diagnostics fault injection: the next allocation fails.
+    bool m_radianceCacheD6FailAllocationForTesting = false;
+    void UpdateRadianceCacheD6(bool enabled);
+    // SHARC.4D learning: the cache library's pipeline and the frame's insertion binding (0: this frame does not learn).
+    // SHARC.4D-Q: deferred insertion also needs a record per path (pixels x samplesPerFrame).
+    D3D12_GPU_VIRTUAL_ADDRESS PrepareRadianceCacheLearning(ID3D12GraphicsCommandList* commandList,
+        std::uint32_t samplesPerFrame);
+    // SHARC.4E: applies the frame's SharcSettings to the cache (before UpdateRadianceCacheD6's generation work);
+    // estimator-changing settings restart accumulation. m_sharcStatus is read from the frame slot's readback.
+    void ApplySharcSettings(const SharcSettings& requested, bool rasterPrimary);
+    // SHARC.4E.1: sets the denoiser's stage flags when RendererOptions::pathTraceDenoiser (the raster-primary modes
+    // only) changes, so diagnostics that drive the flags directly are left alone while the option is unchanged.
+    void ApplyPathTraceDenoiser(bool requested, bool rasterPrimary);
+    bool m_pathTraceDenoiserOption = false;
+    void UpdateSharcStatus(unsigned int frameSlot);
+    // The query-side library the frame's settings select (Query, QueryTermination or Render).
+    PathTraceRadianceCacheLibrary RadianceCacheQueryLibrary(bool extract, bool splitReSTIRDI) const;
+    SharcSettings m_sharcSettings;
+    SharcStatus m_sharcStatus;
+    // Diagnostics only (SHARC.5B): the render library's queryMode in place of 1 (2: the cached part zeroed, 3: also the
+    // miss term, 4: the cached part unclamped), to compare a terminated path's terms one by one. 0 in production.
+    std::uint32_t m_sharcDiagnosticQueryMode = 0;
+    // RTXDI.1 diagnostics: initial RTXDI candidate counts in place of RtxdiInitialLocalLightSamples and
+    // RtxdiInitialInfiniteLightSamples (0 = the production constant).
+    std::uint32_t m_rtxdiLocalLightSamplesForTesting = 0;
+    std::uint32_t m_rtxdiInfiniteLightSamplesForTesting = 0;
+    // Whether the last path-traced frame rendered with the cached-radiance library.
+    bool m_sharcRenderedLastFrame = false;
+    // SHARC.6A: this frame's render dispatch writes the history prior the temporal pass reads.
+    bool m_sharcHistoryPriorWritten = false;
+    // Its query binding's constants, which the temporal pass reads to look the prior up.
+    D3D12_GPU_VIRTUAL_ADDRESS m_sharcHistoryPriorBinding = 0;
+    // SHARC.4D-R (diagnostics): the query library's binding for the frame (0: render with the reference library).
+    D3D12_GPU_VIRTUAL_ADDRESS PrepareRadianceCacheQuery(ID3D12GraphicsCommandList* commandList, bool extract,
+        bool splitReSTIRDI);
+    // The learning library of the frame PrepareRadianceCacheLearning prepared.
+    PathTraceRadianceCacheLibrary m_radianceCacheLearningLibrary = PathTraceRadianceCacheLibrary::Inline;
+    // Diagnostics (SHARC.4D-Q): the library deferred frames learn with. Inline stores records from the inline library
+    // (the binding's deferred flag), which renders exactly as inline learning does.
+    PathTraceRadianceCacheLibrary m_radianceCacheDeferredLibrary = PathTraceRadianceCacheLibrary::Deferred;
+    // Diagnostics fault injection: the next record-buffer allocation fails.
+    bool m_radianceCacheRecordsFailAllocationForTesting = false;
+    // Whether the last path-traced frame recorded learning (the cache library and a resolve).
+    bool m_radianceCacheLearnedLastFrame = false;
+    bool m_radianceCacheLearningFailureLogged = false;
     // RTXPT D.1A: a fixed seed for every accumulation run (diagnostics only). Empty in production, where each run
     // takes PathTraceSequenceSeed of its first frame's serial relative to m_pathTraceSequenceOrigin, so a moving
     // camera, which restarts accumulation every frame, no longer repeats one random sequence.
@@ -1287,6 +1387,26 @@ class Renderer
     // for diagnostics.
     std::uint32_t m_pathTraceSpatialIterations = 2;
     std::uint32_t m_pathTraceSpatialIterationsLastFrame = 0;
+    // DENOISE.1 stage isolation, applied when RendererOptions::pathTraceDenoiserStages changes: the spatial filter
+    // sets m_pathTraceSpatialIterations or, when off, m_pathTraceSpatialBypass (the temporal pass presents);
+    // m_pathTraceTemporalHistoryDisabled starts new history every frame. Switching either, or a reset request,
+    // discards the history.
+    void ApplyPathTraceDenoiserStages(const PathTraceDenoiserStages& stages);
+    PathTraceDenoiserStages m_pathTraceDenoiserStages{};
+    bool m_pathTraceSpatialBypass = false;
+    bool m_pathTraceTemporalHistoryDisabled = false;
+    // DENOISE.3B extended diffuse history (experimental, PathTraceDenoiserStages::extendedDiffuseHistory): the temporal
+    // pass keeps a second diffuse running mean (up to PathTraceExtendedMaximum frames) that restarts whenever the scene
+    // or view may have changed, i.e. on an accumulation restart, invalid temporal history or a scene-lighting epoch
+    // change. After more than PathTraceExtendedStableFrames frames without a restart it replaces the diffuse history as
+    // the presentation's and the spatial pass's input. m_pathTraceExtendedFrames: frames since the last restart (0: not
+    // running); m_pathTraceExtendedUsed: whether the frame being recorded uses it.
+    static constexpr std::uint32_t PathTraceExtendedStableFrames = 32;
+    static constexpr float PathTraceExtendedMaximum = 256.0f;
+    bool m_pathTraceExtendedDiffuse = false;
+    std::uint32_t m_pathTraceExtendedFrames = 0;
+    std::uint64_t m_pathTraceExtendedEpoch = 0;
+    bool m_pathTraceExtendedUsed = false;
 
     // What temporal history depends on beyond geometry: a change of any of it invalidates the history. Lighting is
     // compared exactly; a continuous change cannot be told from an abrupt one here, so both invalidate.
