@@ -54,6 +54,10 @@ struct PipelineDescription
     // Straight-alpha "over" blending of color; destination alpha is preserved. Off by default so
     // existing pipelines keep their opaque writes.
     bool alphaBlend = false;
+
+    // Also creates the counterclockwise-front variant that Bind selects for mirrored (negative-determinant)
+    // object transforms. Only pipelines that draw scene objects need it.
+    bool mirroredWindingVariant = false;
 };
 
 class Pipeline
@@ -69,7 +73,8 @@ class Pipeline
         const PipelineDescription& description);
     void Swap(Pipeline& other) noexcept;
     void Shutdown();
-    void Bind(ID3D12GraphicsCommandList* commandList) const;
+    // mirroredWinding selects the counterclockwise-front variant when the pipeline has one.
+    void Bind(ID3D12GraphicsCommandList* commandList, bool mirroredWinding = false) const;
 
     ID3D12RootSignature* GetRootSignature() const;
     bool IsInitialized() const noexcept { return m_rootSignature && m_pipelineState; }
@@ -78,4 +83,6 @@ class Pipeline
     ID3D12RootSignature* m_rootSignature = nullptr;
 
     ID3D12PipelineState* m_pipelineState = nullptr;
+
+    ID3D12PipelineState* m_mirroredPipelineState = nullptr;
 };

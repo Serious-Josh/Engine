@@ -21,6 +21,48 @@ namespace
         const Matrix4 transposed = matrix.Transpose();
         std::memcpy(destination, &transposed, sizeof(float) * 16);
     }
+
+    // The radiance denoisers this wrapper supports (no SH, occlusion or SIGMA variants yet).
+    bool IsSupportedDenoiser(nrd::Denoiser denoiser)
+    {
+        switch(denoiser)
+        {
+        case nrd::Denoiser::REBLUR_DIFFUSE:
+        case nrd::Denoiser::REBLUR_SPECULAR:
+        case nrd::Denoiser::REBLUR_DIFFUSE_SPECULAR:
+        case nrd::Denoiser::RELAX_DIFFUSE:
+        case nrd::Denoiser::RELAX_SPECULAR:
+        case nrd::Denoiser::RELAX_DIFFUSE_SPECULAR:
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    bool HasDiffuseSignal(nrd::Denoiser denoiser)
+    {
+        return denoiser == nrd::Denoiser::REBLUR_DIFFUSE || denoiser == nrd::Denoiser::REBLUR_DIFFUSE_SPECULAR ||
+            denoiser == nrd::Denoiser::RELAX_DIFFUSE || denoiser == nrd::Denoiser::RELAX_DIFFUSE_SPECULAR;
+    }
+
+    bool HasSpecularSignal(nrd::Denoiser denoiser)
+    {
+        return denoiser == nrd::Denoiser::REBLUR_SPECULAR || denoiser == nrd::Denoiser::REBLUR_DIFFUSE_SPECULAR ||
+            denoiser == nrd::Denoiser::RELAX_SPECULAR || denoiser == nrd::Denoiser::RELAX_DIFFUSE_SPECULAR;
+    }
+
+    bool CreateOutput(
+        ID3D12Device* device,
+        DescriptorHeap& descriptorHeap,
+        Texture& output,
+        uint32_t width,
+        uint32_t height)
+    {
+        return output.Initialize(device, width, height, 1, 1, DXGI_FORMAT_R16G16B16A16_FLOAT,
+                                 D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS) &&
+            output.CreateSRV(device, descriptorHeap) &&
+            output.CreateUAV(device, descriptorHeap);
+    }
 }
 
 bool NrdDenoiser::Initialize(
@@ -29,8 +71,7 @@ bool NrdDenoiser::Initialize(
     DescriptorHeap& descriptorHeap,
     uint32_t width,
     uint32_t height,
-    uint32_t queuedFrameCount,
-    Signal signal)
+    const Description& description)
 {
     if (!device ||
         !graphicsQueue ||
@@ -40,22 +81,34 @@ bool NrdDenoiser::Initialize(
         return false;
     }
 
-    if (queuedFrameCount == 0)
+    if (description.queuedFrameCount == 0 ||
+        description.denoisers.empty() ||
+        description.denoisers.size() > MaximumDenoisers)
     {
         return false;
     }
 
+    for (const DenoiserDescription& denoiser : description.denoisers)
+    {
+        if (!IsSupportedDenoiser(denoiser.denoiser))
+        {
+            Log::Error("NRD instance '" + description.name + "' requests an unsupported denoiser.");
+            return false;
+        }
+    }
+
     m_device = device;
     m_graphicsQueue = graphicsQueue;
+    m_description = description;
 
-    m_queuedFrameCount = queuedFrameCount;
-    m_signal = signal;
+    for (size_t index = 0; index < description.denoisers.size(); ++index)
+    {
+        m_denoisers[index].description = description.denoisers[index];
+    }
 
     if (!Recreate(descriptorHeap, width, height))
     {
-        m_device = nullptr;
-        m_graphicsQueue = nullptr;
-        m_queuedFrameCount = 0;
+        Shutdown();
         return false;
     }
 
@@ -63,7 +116,6 @@ bool NrdDenoiser::Initialize(
 }
 
 bool NrdDenoiser::Resize(
-
     DescriptorHeap& descriptorHeap,
     uint32_t width,
     uint32_t height)
@@ -73,17 +125,30 @@ bool NrdDenoiser::Resize(
 
 void NrdDenoiser::Shutdown()
 {
-    m_outputTexture.Shutdown();
-    m_diffuseOutputTexture.Shutdown();
-    m_Integration.Destroy();
+    // Destroy waits for the GPU (autoWaitForIdle) before the outputs it may still be writing are released.
+    m_integration.Destroy();
+    ReleaseOutputs();
 
+    for (Denoiser& denoiser : m_denoisers)
+    {
+        denoiser.description = {};
+    }
+
+    m_description = {};
     m_device = nullptr;
     m_graphicsQueue = nullptr;
-    m_queuedFrameCount = 0;
-    m_signal = Signal::Combined;
 
     m_width = 0;
     m_height = 0;
+}
+
+void NrdDenoiser::ReleaseOutputs()
+{
+    for (Denoiser& denoiser : m_denoisers)
+    {
+        denoiser.diffuseOutput.Shutdown();
+        denoiser.specularOutput.Shutdown();
+    }
 }
 
 bool NrdDenoiser::Recreate(
@@ -99,56 +164,35 @@ bool NrdDenoiser::Recreate(
         return false;
     }
 
-    if (m_queuedFrameCount == 0)
-    {
-        return false;
-    }
-
-    m_outputTexture.Shutdown();
-    m_diffuseOutputTexture.Shutdown();
+    // Callers have drained the GPU (resize), or nothing has used the outputs yet (initialization).
+    ReleaseOutputs();
+    m_width = 0;
+    m_height = 0;
 
     nrd::IntegrationCreationDesc integrationDesc{};
 
-    std::strncpy(integrationDesc.name, "ReflectionREBLUR", sizeof(integrationDesc.name) - 1);
+    std::strncpy(integrationDesc.name, m_description.name.c_str(), sizeof(integrationDesc.name) - 1);
 
     integrationDesc.residencyPriority = 0.0f;
     integrationDesc.resourceWidth = static_cast<uint16_t>(width);
     integrationDesc.resourceHeight = static_cast<uint16_t>(height);
-    integrationDesc.queuedFrameNum = static_cast<uint8_t>(m_queuedFrameCount);
+    integrationDesc.queuedFrameNum = static_cast<uint8_t>(m_description.queuedFrameCount);
 
     integrationDesc.enableWholeLifetimeDescriptorCaching = false;
     integrationDesc.autoWaitForIdle = true;
     integrationDesc.demoteFloat32to16 = false;
-    integrationDesc.promoteFloat16to32 = false;
+    integrationDesc.promoteFloat16to32 = m_description.promoteFloat16to32;
 
-    constexpr nrd::Identifier kSpecularDenoiserIdentifier = 0;
-    constexpr nrd::Identifier kDiffuseDenoiserIdentifier = 1;
+    std::vector<nrd::DenoiserDesc> denoiserDescs;
 
-    nrd::DenoiserDesc denoiserDescs[2]{};
-
-    denoiserDescs[0].identifier = kSpecularDenoiserIdentifier;
-    denoiserDescs[0].denoiser = nrd::Denoiser::REBLUR_SPECULAR;
-
-    denoiserDescs[1].identifier = kDiffuseDenoiserIdentifier;
-    denoiserDescs[1].denoiser = nrd::Denoiser::REBLUR_DIFFUSE;
+    for (const DenoiserDescription& denoiser : m_description.denoisers)
+    {
+        denoiserDescs.push_back({denoiser.identifier, denoiser.denoiser});
+    }
 
     nrd::InstanceCreationDesc instanceDesc{};
-
-    switch (m_signal)
-    {
-    case Signal::Specular:
-        instanceDesc.denoisers = &denoiserDescs[0];
-        instanceDesc.denoisersNum = 1;
-        break;
-    case Signal::Diffuse:
-        instanceDesc.denoisers = &denoiserDescs[1];
-        instanceDesc.denoisersNum = 1;
-        break;
-    case Signal::Combined:
-        instanceDesc.denoisers = denoiserDescs;
-        instanceDesc.denoisersNum = 2;
-        break;
-    }
+    instanceDesc.denoisers = denoiserDescs.data();
+    instanceDesc.denoisersNum = static_cast<uint32_t>(denoiserDescs.size());
 
     nri::QueueFamilyD3D12Desc queueFamily{};
     queueFamily.d3d12Queues = &m_graphicsQueue;
@@ -163,57 +207,31 @@ bool NrdDenoiser::Recreate(
     deviceDesc.disableD3D12EnhancedBarriers = true;
     deviceDesc.disableNVAPIInitialization = true;
 
-    const nrd::Result result = m_Integration.RecreateD3D12(integrationDesc, instanceDesc, deviceDesc);
+    const nrd::Result result = m_integration.RecreateD3D12(integrationDesc, instanceDesc, deviceDesc);
 
     if (result != nrd::Result::SUCCESS)
     {
-        Log::Error("Failed to recreate NRD reflection denoiser. nrd::Result: " +
-
+        Log::Error("Failed to recreate NRD instance '" + m_description.name + "'. nrd::Result: " +
                    std::to_string(static_cast<uint32_t>(result)));
         return false;
     }
 
-    if (m_signal != Signal::Diffuse)
+    // Specular before diffuse, per denoiser: the descriptor order the reflection and GI instances always had.
+    for (size_t index = 0; index < m_description.denoisers.size(); ++index)
     {
+        Denoiser& denoiser = m_denoisers[index];
 
-        if (!m_outputTexture.Initialize(m_device, width, height, 1, 1, DXGI_FORMAT_R16G16B16A16_FLOAT,
-                                        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-                                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
+        if (HasSpecularSignal(denoiser.description.denoiser) &&
+            !CreateOutput(m_device, descriptorHeap, denoiser.specularOutput, width, height))
         {
+            Log::Error("Failed to create the specular output of NRD instance '" + m_description.name + "'.");
             return false;
         }
 
-        if (!m_outputTexture.CreateSRV(m_device, descriptorHeap))
+        if (HasDiffuseSignal(denoiser.description.denoiser) &&
+            !CreateOutput(m_device, descriptorHeap, denoiser.diffuseOutput, width, height))
         {
-            return false;
-        }
-
-        if (!m_outputTexture.CreateUAV(m_device, descriptorHeap))
-        {
-            return false;
-        }
-    }
-
-    if (m_signal != Signal::Specular)
-    {
-
-        if (!m_diffuseOutputTexture.Initialize(m_device, width, height, 1, 1, DXGI_FORMAT_R16G16B16A16_FLOAT,
-                                               D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-                                               D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
-        {
-            Log::Error("Failed to create NRD diffuse output texture.");
-            return false;
-        }
-
-        if (!m_diffuseOutputTexture.CreateSRV(m_device, descriptorHeap))
-        {
-            Log::Error("Failed to create NRD diffuse output SRV.");
-            return false;
-        }
-
-        if (!m_diffuseOutputTexture.CreateUAV(m_device, descriptorHeap))
-        {
-            Log::Error("Failed to create NRD diffuse output UAV.");
+            Log::Error("Failed to create the diffuse output of NRD instance '" + m_description.name + "'.");
             return false;
         }
     }
@@ -224,27 +242,19 @@ bool NrdDenoiser::Recreate(
     return true;
 }
 
-bool NrdDenoiser::SetFrameSettings(
-    const Matrix4& view,
-    const Matrix4& projection,
-    const Matrix4& previousView,
-    const Matrix4& previousProjection,
-    uint32_t frameIndex,
-    float denoisingRange,
-    bool resetHistory)
+bool NrdDenoiser::SetCommonSettings(const FrameSettings& settings)
 {
-    if (m_width == 0 || m_height == 0 || denoisingRange <= 0.0f)
+    if (m_width == 0 || m_height == 0 || settings.denoisingRange <= 0.0f)
     {
         return false;
     }
 
     nrd::CommonSettings commonSettings{};
 
-    StoreNrdMatrix(commonSettings.worldToViewMatrix, view);
-    StoreNrdMatrix(commonSettings.worldToViewMatrixPrev, previousView);
-    StoreNrdMatrix(commonSettings.viewToClipMatrix, projection);
-
-    StoreNrdMatrix(commonSettings.viewToClipMatrixPrev, previousProjection);
+    StoreNrdMatrix(commonSettings.worldToViewMatrix, settings.view);
+    StoreNrdMatrix(commonSettings.worldToViewMatrixPrev, settings.previousView);
+    StoreNrdMatrix(commonSettings.viewToClipMatrix, settings.projection);
+    StoreNrdMatrix(commonSettings.viewToClipMatrixPrev, settings.previousProjection);
 
     commonSettings.resourceSize[0] = static_cast<uint16_t>(m_width);
     commonSettings.resourceSize[1] = static_cast<uint16_t>(m_height);
@@ -258,123 +268,91 @@ bool NrdDenoiser::SetFrameSettings(
     commonSettings.rectSizePrev[0] = static_cast<uint16_t>(m_width);
     commonSettings.rectSizePrev[1] = static_cast<uint16_t>(m_height);
 
-    commonSettings.motionVectorScale[0] = 1.0f;
-    commonSettings.motionVectorScale[1] = 1.0f;
-    commonSettings.motionVectorScale[2] = 1.0f;
+    commonSettings.motionVectorScale[0] = settings.motionVectorScale[0];
+    commonSettings.motionVectorScale[1] = settings.motionVectorScale[1];
+    commonSettings.motionVectorScale[2] = settings.motionVectorScale[2];
 
     commonSettings.isMotionVectorInWorldSpace = false;
 
-    commonSettings.cameraJitter[0] = 0.0f;
-    commonSettings.cameraJitter[1] = 0.0f;
-    commonSettings.cameraJitterPrev[0] = 0.0f;
-    commonSettings.cameraJitterPrev[1] = 0.0f;
+    commonSettings.cameraJitter[0] = settings.jitter[0];
+    commonSettings.cameraJitter[1] = settings.jitter[1];
+    commonSettings.cameraJitterPrev[0] = settings.previousJitter[0];
+    commonSettings.cameraJitterPrev[1] = settings.previousJitter[1];
 
     commonSettings.viewZScale = 1.0f;
-    commonSettings.denoisingRange = denoisingRange;
-    commonSettings.frameIndex = frameIndex;
+    commonSettings.denoisingRange = settings.denoisingRange;
+    commonSettings.frameIndex = settings.frameIndex;
+    commonSettings.accumulationMode = settings.accumulationMode;
+    commonSettings.enableValidation = settings.enableValidation;
 
-    commonSettings.accumulationMode =
-        resetHistory ? nrd::AccumulationMode::CLEAR_AND_RESTART : nrd::AccumulationMode::CONTINUE;
+    return m_integration.SetCommonSettings(commonSettings) == nrd::Result::SUCCESS;
+}
 
-    const nrd::Result commonResult = m_Integration.SetCommonSettings(commonSettings);
+bool NrdDenoiser::SetDenoiserSettings(nrd::Identifier identifier, const nrd::ReblurSettings& settings)
+{
+    const Denoiser* denoiser = FindDenoiser(identifier);
 
-    if (commonResult != nrd::Result::SUCCESS)
+    if (!denoiser)
     {
         return false;
     }
 
-    nrd::ReblurSettings reblurSettings{};
+    const nrd::Denoiser type = denoiser->description.denoiser;
+    const bool reblur = type == nrd::Denoiser::REBLUR_DIFFUSE || type == nrd::Denoiser::REBLUR_SPECULAR ||
+        type == nrd::Denoiser::REBLUR_DIFFUSE_SPECULAR;
 
-    reblurSettings.hitDistanceParameters.A = 3.0f;
-    reblurSettings.hitDistanceParameters.B = 0.1f;
+    return reblur && m_integration.SetDenoiserSettings(identifier, &settings) == nrd::Result::SUCCESS;
+}
 
-    reblurSettings.hitDistanceParameters.C = 20.0f;
-    reblurSettings.maxAccumulatedFrameNum = 8;
+bool NrdDenoiser::SetDenoiserSettings(nrd::Identifier identifier, const nrd::RelaxSettings& settings)
+{
+    const Denoiser* denoiser = FindDenoiser(identifier);
 
-    reblurSettings.checkerboardMode = nrd::CheckerboardMode::OFF;
-    reblurSettings.hitDistanceReconstructionMode = nrd::HitDistanceReconstructionMode::OFF;
-
-    constexpr nrd::Identifier kSpecularDenoiserIdentifier = 0;
-    constexpr nrd::Identifier kDiffuseDenoiserIdentifier = 1;
-
-    if (m_signal != Signal::Diffuse)
+    if (!denoiser)
     {
-        // Temporary A/B test: skip specular reconstruction after history rejection.
-        // NRD permits zero reconstructed frames; keep the remaining History Fix work.
-
-        constexpr bool kDisableSpecularHistoryReconstruction = true;
-
-        if (kDisableSpecularHistoryReconstruction)
-        {
-            reblurSettings.historyFixFrameNum = 0;
-        }
-
-        const nrd::Result specularResult =
-            m_Integration.SetDenoiserSettings(kSpecularDenoiserIdentifier, &reblurSettings);
-
-        if (specularResult != nrd::Result::SUCCESS)
-        {
-            Log::Error("Failed to configure NRD specular REBLUR settings.");
-
-            return false;
-        }
+        return false;
     }
 
-    // Start diffuse with the same hit-distance normalization parameters
-    // used by NrdReflectionPrepare.hlsl.
-    nrd::ReblurSettings diffuseSettings{};
+    const nrd::Denoiser type = denoiser->description.denoiser;
+    const bool relax = type == nrd::Denoiser::RELAX_DIFFUSE || type == nrd::Denoiser::RELAX_SPECULAR ||
+        type == nrd::Denoiser::RELAX_DIFFUSE_SPECULAR;
 
-    diffuseSettings.hitDistanceParameters.A = 3.0f;
-    diffuseSettings.hitDistanceParameters.B = 0.1f;
-    diffuseSettings.hitDistanceParameters.C = 20.0f;
-
-    diffuseSettings.maxAccumulatedFrameNum = 30;
-    diffuseSettings.diffusePrepassBlurRadius = 30.0f;
-    diffuseSettings.checkerboardMode = nrd::CheckerboardMode::OFF;
-    diffuseSettings.hitDistanceReconstructionMode = nrd::HitDistanceReconstructionMode::OFF;
-
-    if (m_signal != Signal::Specular)
-    {
-        const nrd::Result diffuseResult =
-            m_Integration.SetDenoiserSettings(kDiffuseDenoiserIdentifier, &diffuseSettings);
-
-        if (diffuseResult != nrd::Result::SUCCESS)
-        {
-            Log::Error("Failed to configure NRD diffuse REBLUR settings.");
-            return false;
-        }
-    }
-
-    return true;
+    return relax && m_integration.SetDenoiserSettings(identifier, &settings) == nrd::Result::SUCCESS;
 }
 
 void NrdDenoiser::NewFrame()
 {
-    m_Integration.NewFrame();
+    m_integration.NewFrame();
 }
 
 void NrdDenoiser::Denoise(
-
     ID3D12GraphicsCommandList* commandList,
-    Texture& motion,
-    Texture& normalRoughness,
-    Texture& viewZ,
-    Texture& radianceHitDist,
-    Signal signal)
+    nrd::Identifier identifier,
+    const Inputs& inputs)
 {
-    if (!commandList || (m_signal != Signal::Combined && signal != m_signal))
+    Denoiser* denoiser = FindDenoiser(identifier);
+
+    if (!commandList || !denoiser || !inputs.motion || !inputs.normalRoughness || !inputs.viewZ)
     {
         return;
     }
 
-    if (signal != Signal::Diffuse)
+    const bool diffuse = HasDiffuseSignal(denoiser->description.denoiser);
+    const bool specular = HasSpecularSignal(denoiser->description.denoiser);
+
+    if ((diffuse && !inputs.diffuseRadianceHitDistance) || (specular && !inputs.specularRadianceHitDistance))
     {
-        m_outputTexture.Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        return;
     }
 
-    if (signal != Signal::Specular)
+    if (specular)
     {
-        m_diffuseOutputTexture.Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        denoiser->specularOutput.Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    }
+
+    if (diffuse)
+    {
+        denoiser->diffuseOutput.Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     }
 
     nrd::ResourceSnapshot snapshot{};
@@ -400,84 +378,85 @@ void NrdDenoiser::Denoise(
         snapshot.SetResource(slot, resource);
     };
 
-    setResource(nrd::ResourceType::IN_MV, motion, DXGI_FORMAT_R16G16B16A16_FLOAT, readState);
+    nrd::Resource motion{};
+    motion.d3d12.resource = inputs.motion;
+    motion.d3d12.format = static_cast<DXGIFormat>(DXGI_FORMAT_R16G16B16A16_FLOAT);
+    motion.state = readState;
+    snapshot.SetResource(nrd::ResourceType::IN_MV, motion);
 
-    setResource(nrd::ResourceType::IN_NORMAL_ROUGHNESS, normalRoughness, DXGI_FORMAT_R10G10B10A2_UNORM, readState);
+    setResource(nrd::ResourceType::IN_NORMAL_ROUGHNESS, *inputs.normalRoughness, DXGI_FORMAT_R10G10B10A2_UNORM,
+                readState);
 
-    setResource(nrd::ResourceType::IN_VIEWZ, viewZ, DXGI_FORMAT_R32_FLOAT, readState);
+    setResource(nrd::ResourceType::IN_VIEWZ, *inputs.viewZ, DXGI_FORMAT_R32_FLOAT, readState);
 
-    if (signal != Signal::Diffuse)
+    if (specular)
     {
-        setResource(nrd::ResourceType::IN_SPEC_RADIANCE_HITDIST, radianceHitDist, DXGI_FORMAT_R16G16B16A16_FLOAT,
-                    readState);
+        setResource(nrd::ResourceType::IN_SPEC_RADIANCE_HITDIST, *inputs.specularRadianceHitDistance,
+                    DXGI_FORMAT_R16G16B16A16_FLOAT, readState);
 
-        setResource(nrd::ResourceType::OUT_SPEC_RADIANCE_HITDIST, m_outputTexture, DXGI_FORMAT_R16G16B16A16_FLOAT,
-                    writeState);
+        setResource(nrd::ResourceType::OUT_SPEC_RADIANCE_HITDIST, denoiser->specularOutput,
+                    DXGI_FORMAT_R16G16B16A16_FLOAT, writeState);
     }
 
-    if (signal != Signal::Specular)
+    if (diffuse)
     {
-        setResource(nrd::ResourceType::IN_DIFF_RADIANCE_HITDIST, radianceHitDist, DXGI_FORMAT_R16G16B16A16_FLOAT,
-                    readState);
+        setResource(nrd::ResourceType::IN_DIFF_RADIANCE_HITDIST, *inputs.diffuseRadianceHitDistance,
+                    DXGI_FORMAT_R16G16B16A16_FLOAT, readState);
 
-        setResource(nrd::ResourceType::OUT_DIFF_RADIANCE_HITDIST, m_diffuseOutputTexture,
+        setResource(nrd::ResourceType::OUT_DIFF_RADIANCE_HITDIST, denoiser->diffuseOutput,
                     DXGI_FORMAT_R16G16B16A16_FLOAT, writeState);
+    }
+
+    if (inputs.validation)
+    {
+        inputs.validation->Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        setResource(nrd::ResourceType::OUT_VALIDATION, *inputs.validation, DXGI_FORMAT_R16G16B16A16_FLOAT, writeState);
     }
 
     nri::CommandBufferD3D12Desc commandBuffer{};
 
     commandBuffer.d3d12CommandList = commandList;
 
-    constexpr nrd::Identifier kCombinedIdentifiers[] = {0, 1};
-    constexpr nrd::Identifier kSpecularIdentifier[] = {0};
-    constexpr nrd::Identifier kDiffuseIdentifier[] = {1};
+    // NRD binds its own descriptor heap and root signature; the caller restores Engine's heap afterwards.
+    m_integration.DenoiseD3D12(&identifier, 1, commandBuffer, snapshot);
+}
 
-    switch (signal)
+NrdDenoiser::Denoiser* NrdDenoiser::FindDenoiser(nrd::Identifier identifier)
+{
+    for (size_t index = 0; index < m_description.denoisers.size(); ++index)
     {
-    case Signal::Specular:
-        m_Integration.DenoiseD3D12(kSpecularIdentifier, 1, commandBuffer, snapshot);
-
-        break;
-    case Signal::Diffuse:
-        m_Integration.DenoiseD3D12(kDiffuseIdentifier, 1, commandBuffer, snapshot);
-        break;
-    case Signal::Combined:
-        m_Integration.DenoiseD3D12(kCombinedIdentifiers, 2, commandBuffer, snapshot);
-        break;
+        if (m_denoisers[index].description.identifier == identifier)
+        {
+            return &m_denoisers[index];
+        }
     }
+
+    return nullptr;
 }
 
-Texture& NrdDenoiser::GetOutputTexture()
+Texture& NrdDenoiser::GetDiffuseOutput(nrd::Identifier identifier)
 {
-    return m_outputTexture;
+    Denoiser* denoiser = FindDenoiser(identifier);
+    return denoiser ? denoiser->diffuseOutput : m_emptyOutput;
 }
 
-const Texture& NrdDenoiser::GetOutputTexture() const
+Texture& NrdDenoiser::GetSpecularOutput(nrd::Identifier identifier)
 {
-    return m_outputTexture;
+    Denoiser* denoiser = FindDenoiser(identifier);
+    return denoiser ? denoiser->specularOutput : m_emptyOutput;
 }
 
 double NrdDenoiser::GetTotalMemoryUsageInMb() const
 {
-    return m_Integration.GetTotalMemoryUsageInMb();
+    return m_integration.GetTotalMemoryUsageInMb();
 }
 
 double NrdDenoiser::GetPersistentMemoryUsageInMb() const
 {
-    return m_Integration.GetPersistentMemoryUsageInMb();
+    return m_integration.GetPersistentMemoryUsageInMb();
 }
 
 double NrdDenoiser::GetAliasableMemoryUsageInMb() const
 {
-    return m_Integration.GetAliasableMemoryUsageInMb();
-}
-
-Texture& NrdDenoiser::GetDiffuseOutputTexture()
-{
-    return m_diffuseOutputTexture;
-}
-
-const Texture& NrdDenoiser::GetDiffuseOutputTexture() const
-{
-    return m_diffuseOutputTexture;
+    return m_integration.GetAliasableMemoryUsageInMb();
 }

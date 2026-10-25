@@ -52,6 +52,24 @@ struct PathTraceReferenceSettings
     bool operator==(const PathTraceReferenceSettings&) const = default;
 };
 
+// NRD.2: the denoiser of the raster-primary path-traced modes. Off presents the progressive mean; Engine is the RTXPT
+// D.2/D.3 temporal and spatial denoiser. The NRD modes are reserved for later milestones: no Editor control offers them
+// and the renderer presents them as Engine (Renderer::ApplyPathTraceDenoiser).
+enum class PathTraceDenoiserMode
+{
+    Off,
+    Engine,
+    NrdReblur,
+    NrdRelax,
+    NrdHybrid
+};
+
+inline bool IsNrdPathTraceDenoiserMode(PathTraceDenoiserMode mode)
+{
+    return mode == PathTraceDenoiserMode::NrdReblur || mode == PathTraceDenoiserMode::NrdRelax ||
+        mode == PathTraceDenoiserMode::NrdHybrid;
+}
+
 // SHARC.4E experimental cached-radiance rendering (Path Traced Raster Primary, and with ReSTIR DI since SHARC.5B;
 // off by default, not saved).
 struct SharcSettings

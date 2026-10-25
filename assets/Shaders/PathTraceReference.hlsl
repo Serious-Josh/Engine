@@ -873,6 +873,15 @@ PathTraceRasterFirstVertex PathTraceDecodeRasterFirstVertex(uint2 pixel)
 // sample (carried as a diffuse throughput), never classified by the sampled lobe. The specular part is the rest.
 static const float PATH_TRACE_EXTRACTION_NO_SPECULAR = -1.0f;
 static const float PATH_TRACE_EXTRACTION_SPECULAR_PENDING = -2.0f;
+static const float PATH_TRACE_EXTRACTION_NO_DIFFUSE = -1.0f;
+static const float PATH_TRACE_EXTRACTION_DIFFUSE_PENDING = -2.0f;
+// NRD.4A: the diffuse output's alpha is REBLUR's normalized hit distance (NRD.hlsli REBLUR_FrontEnd_GetNormHitDist),
+// with the nrd::ReblurHitDistanceParameters defaults A and B; a REBLUR instance consuming it must be given them. For the
+// diffuse lobe (roughness 1) the normalization distance is A + B |viewZ| (_NRD_GetSpecMagicCurve(1) = 1, so C drops out).
+static const float PATH_TRACE_EXTRACTION_HIT_DISTANCE_A = 3.0f;
+static const float PATH_TRACE_EXTRACTION_HIT_DISTANCE_B = 0.1f;
+// NRD_EPS: a taken lobe never normalizes to 0, which means "no data".
+static const float PATH_TRACE_EXTRACTION_MINIMUM_NORMALIZED_DISTANCE = 1.0e-6f;
 
 struct PathTraceExtraction
 {
@@ -885,7 +894,32 @@ struct PathTraceExtraction
     // selected there (delta mirrors included), PATH_TRACE_HALF_MAXIMUM when that ray missed, and negative when the
     // sample made no specular continuation.
     float hitDistance;
+    // NRD.3 primary diffuse hit distance: the same for the diffuse (cosine) strategy. Negative when the sample made no
+    // diffuse continuation.
+    float diffuseHitDistance;
 };
+
+// NRD.4A: REBLUR's diffuse normalization distance at a raster-primary vertex 0. View Z is the distance along the camera's
+// forward axis (the RTXDI bridge's linear depth), the axis taken from the camera-relative inverse view-projection.
+float PathTraceExtractionDiffuseNormalization(float3 position)
+{
+    float4 nearPoint = mul(inverseCameraRelativeViewProjection, float4(0.0f, 0.0f, 0.0f, 1.0f));
+    float4 farPoint = mul(inverseCameraRelativeViewProjection, float4(0.0f, 0.0f, 1.0f, 1.0f));
+    float3 forward = normalize(farPoint.xyz / farPoint.w - nearPoint.xyz / nearPoint.w);
+    float viewZ = abs(dot(forward, position - cameraPosition));
+    return PATH_TRACE_EXTRACTION_HIT_DISTANCE_A + viewZ * PATH_TRACE_EXTRACTION_HIT_DISTANCE_B;
+}
+
+// NRD.4A: one sample's normalized distance; a missed continuation counts as 1, as in NRD's reference integration.
+float PathTraceExtractionNormalizedHitDistance(float hitDistance, float normalization)
+{
+    if(hitDistance >= PATH_TRACE_HALF_MAXIMUM)
+    {
+        return 1.0f;
+    }
+
+    return max(saturate(hitDistance / normalization), PATH_TRACE_EXTRACTION_MINIMUM_NORMALIZED_DISTANCE);
+}
 
 PathTraceExtraction PathTraceEmptyExtraction()
 {
@@ -893,6 +927,7 @@ PathTraceExtraction PathTraceEmptyExtraction()
     extraction.diffuse = float3(0.0f, 0.0f, 0.0f);
     extraction.diffuseThroughput = float3(0.0f, 0.0f, 0.0f);
     extraction.hitDistance = PATH_TRACE_EXTRACTION_NO_SPECULAR;
+    extraction.diffuseHitDistance = PATH_TRACE_EXTRACTION_NO_DIFFUSE;
     return extraction;
 }
 
@@ -972,6 +1007,12 @@ float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex 
                 if(extract && vertex == 1u && extraction.hitDistance == PATH_TRACE_EXTRACTION_SPECULAR_PENDING)
                 {
                     extraction.hitDistance = payload.hitDistance < 0.0f ? PATH_TRACE_HALF_MAXIMUM : payload.hitDistance;
+                }
+
+                if(extract && vertex == 1u && extraction.diffuseHitDistance == PATH_TRACE_EXTRACTION_DIFFUSE_PENDING)
+                {
+                    extraction.diffuseHitDistance = payload.hitDistance < 0.0f ? PATH_TRACE_HALF_MAXIMUM :
+                        payload.hitDistance;
                 }
 
                 if(payload.hitDistance < 0.0f)
@@ -1105,6 +1146,8 @@ float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex 
                 extraction.diffuseThroughput = diffuseShare * bsdfSample.weight;
                 extraction.hitDistance = specularStrategy ? PATH_TRACE_EXTRACTION_SPECULAR_PENDING :
                     PATH_TRACE_EXTRACTION_NO_SPECULAR;
+                extraction.diffuseHitDistance = specularStrategy ? PATH_TRACE_EXTRACTION_NO_DIFFUSE :
+                    PATH_TRACE_EXTRACTION_DIFFUSE_PENDING;
             }
             else
             {
@@ -1251,7 +1294,9 @@ float3 PathTracePrimaryRadiance(uint primary, uint2 pixel, PathTraceRasterFirstV
 // extract (a literal, as primary): RTXPT D.1B.2 signal extraction, raster primaries only. The accumulation is
 // written exactly as without it; in addition the frame's own diffuse and specular means go to the extraction
 // outputs (the specular mean being the frame mean minus the diffuse one), with the primary specular hit
-// distance in the specular alpha. Pixels without a vertex-0 surface write zero radiance and no hit distance.
+// distance in the specular alpha and (NRD.4A) the primary diffuse hit distance in the diffuse alpha, normalized for
+// REBLUR (PathTraceExtractionNormalizedHitDistance). Pixels without a vertex-0 surface write zero radiance and no hit
+// distance.
 void PathTraceRunRayGeneration(uint primary, bool extract)
 {
     uint2 pixel = DispatchRaysIndex().xy;
@@ -1264,9 +1309,12 @@ void PathTraceRunRayGeneration(uint primary, bool extract)
     {
         float3 sampleSum = float3(0.0f, 0.0f, 0.0f);
         float3 diffuseSum = float3(0.0f, 0.0f, 0.0f);
-        float hitDistanceSum = 0.0f;
+        // FOUNDATION.7: NRD_FrontEnd_SpecHitDistAveraging - the nearest specular hit of the frame's samples.
+        float hitDistanceMinimum = PATH_TRACE_HALF_MAXIMUM;
         uint hitSamples = 0u;
         uint missSamples = 0u;
+        float normalizedDiffuseHitDistanceSum = 0.0f;
+        uint diffuseHitDistanceSamples = 0u;
 
         // The raster primary's first vertex is decoded once for all of this pixel's samples.
         PathTraceRasterFirstVertex rasterFirstVertex = (PathTraceRasterFirstVertex)0;
@@ -1279,6 +1327,13 @@ void PathTraceRunRayGeneration(uint primary, bool extract)
         if(primary == PATH_TRACE_PRIMARY_RASTER_SPLIT_INDIRECT)
         {
             g_splitPixel = pixel;
+        }
+
+        float diffuseNormalization = 1.0f;
+
+        if(extract && rasterFirstVertex.state > 0)
+        {
+            diffuseNormalization = PathTraceExtractionDiffuseNormalization(rasterFirstVertex.position);
         }
 
         for(uint sampleOffset = 0u; sampleOffset < samplesPerFrame; ++sampleOffset)
@@ -1315,8 +1370,15 @@ void PathTraceRunRayGeneration(uint primary, bool extract)
                 }
                 else if(extraction.hitDistance >= 0.0f)
                 {
-                    hitDistanceSum += extraction.hitDistance;
+                    hitDistanceMinimum = min(hitDistanceMinimum, extraction.hitDistance);
                     ++hitSamples;
+                }
+
+                if(extraction.diffuseHitDistance >= 0.0f)
+                {
+                    normalizedDiffuseHitDistanceSum += PathTraceExtractionNormalizedHitDistance(
+                        extraction.diffuseHitDistance, diffuseNormalization);
+                    ++diffuseHitDistanceSamples;
                 }
             }
         }
@@ -1338,6 +1400,7 @@ void PathTraceRunRayGeneration(uint primary, bool extract)
             float3 diffuseMean = float3(0.0f, 0.0f, 0.0f);
             float3 specularMean = float3(0.0f, 0.0f, 0.0f);
             float hitDistance = PATH_TRACE_EXTRACTION_NO_SPECULAR;
+            float diffuseHitDistance = PATH_TRACE_EXTRACTION_NO_DIFFUSE;
 
             if(rasterFirstVertex.state > 0)
             {
@@ -1345,20 +1408,29 @@ void PathTraceRunRayGeneration(uint primary, bool extract)
                 diffuseMean = diffuseSum / frameSamples;
                 specularMean = (sampleSum - diffuseSum) / frameSamples;
 
-                // The mean over the samples whose specular continuation hit; all-miss is "at infinity".
+                // NRD 4.17.3: the minimum over the samples whose specular continuation hit (misses normalize to 1, so
+                // they never win while a hit exists); all-miss is "at infinity".
                 if(hitSamples > 0u)
                 {
-                    hitDistance = hitDistanceSum / float(hitSamples);
+                    hitDistance = hitDistanceMinimum;
                 }
                 else if(missSamples > 0u)
                 {
                     hitDistance = PATH_TRACE_HALF_MAXIMUM;
                 }
+
+                // NRD.4A: NRD's reference estimator, the mean of the diffuse-strategy samples' normalized distances
+                // (misses as 1); no such sample stays "none".
+                if(diffuseHitDistanceSamples > 0u)
+                {
+                    diffuseHitDistance = normalizedDiffuseHitDistanceSum / float(diffuseHitDistanceSamples);
+                }
             }
 
             RWTexture2D<float4> diffuseOutput = ResourceDescriptorHeap[diffuseOutputIndex];
             RWTexture2D<float4> specularOutput = ResourceDescriptorHeap[specularOutputIndex];
-            diffuseOutput[pixel] = float4(clamp(diffuseMean, -PATH_TRACE_HALF_MAXIMUM, PATH_TRACE_HALF_MAXIMUM), 0.0f);
+            diffuseOutput[pixel] = float4(clamp(diffuseMean, -PATH_TRACE_HALF_MAXIMUM, PATH_TRACE_HALF_MAXIMUM),
+                min(diffuseHitDistance, PATH_TRACE_HALF_MAXIMUM));
             specularOutput[pixel] = float4(clamp(specularMean, -PATH_TRACE_HALF_MAXIMUM, PATH_TRACE_HALF_MAXIMUM),
                 min(hitDistance, PATH_TRACE_HALF_MAXIMUM));
         }

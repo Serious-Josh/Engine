@@ -342,7 +342,7 @@ bool MaterialPreviewRenderer::InitializePipelines(
     geometry.pixelShader = geometryPS;
     geometry.vertexLayout = &layout;
     geometry.renderTargets.count = 4;
-    geometry.renderTargets.formats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    geometry.renderTargets.formats[0] = GBuffer::MaterialFormat;
     geometry.renderTargets.formats[1] = DXGI_FORMAT_R16G16B16A16_FLOAT;
     geometry.renderTargets.formats[2] = DXGI_FORMAT_R16G16B16A16_FLOAT;
     geometry.renderTargets.formats[3] = DXGI_FORMAT_R16G16B16A16_FLOAT;

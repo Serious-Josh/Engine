@@ -141,10 +141,11 @@ class DebugUI
         m_sharcStatus = status;
     }
 
-    // SHARC.4E.1: the path-tracing denoiser (Path Traced Raster Primary, and with ReSTIR DI since SHARC.5B).
-    bool IsPathTraceDenoiserEnabled() const
+    // SHARC.4E.1: the path-tracing denoiser (Path Traced Raster Primary, and with ReSTIR DI since SHARC.5B). NRD.2: a
+    // mode; Off outside those lighting modes.
+    PathTraceDenoiserMode GetPathTraceDenoiserMode() const
     {
-        return m_pathTraceDenoiser && (m_lightingMode == 2 || m_lightingMode == 3);
+        return m_lightingMode == 2 || m_lightingMode == 3 ? m_pathTraceDenoiserMode : PathTraceDenoiserMode::Off;
     }
 
     // DENOISE.1: the denoiser stages to run (diagnostics; the defaults are the production pipeline).
@@ -193,6 +194,12 @@ class DebugUI
     }
 
     // The renderer's jitter of the last recorded frame (render pixels), shown under the control.
+    // NRD.4B: why REBLUR fell back to the Engine denoiser (empty while it denoises).
+    void SetPathTraceNrdStatus(const std::string& status)
+    {
+        m_pathTraceNrdStatus = status;
+    }
+
     void SetPathTraceCameraJitterReadout(bool active, std::uint32_t phase, std::uint32_t phaseCount, float x, float y)
     {
         m_pathTraceCameraJitterActive = active;
@@ -294,8 +301,10 @@ class DebugUI
     bool m_sharcHistoryPrior = false;
     SharcStatus m_sharcStatus;
     void DrawSharcSettings();
-    // SHARC.4E.1: the path-tracing denoiser in the raster-primary path-traced modes (on by default in the Editor).
-    bool m_pathTraceDenoiser = true;
+    // SHARC.4E.1: the path-tracing denoiser in the raster-primary path-traced modes (Engine by default in the Editor).
+    // NRD.2: the selector offers Off and Engine only.
+    PathTraceDenoiserMode m_pathTraceDenoiserMode = PathTraceDenoiserMode::Engine;
+    std::string m_pathTraceNrdStatus;
     PathTraceDenoiserStages m_pathTraceDenoiserStages{};
     bool m_pathTraceCameraJitter = false;
     std::string m_dlssState = "Not initialized";

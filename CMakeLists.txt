@@ -256,6 +256,7 @@ add_library(EngineCore OBJECT
     src/Renderer/Passes/RayTracedReflectionTemporalPass.cpp
     src/Renderer/Passes/NrdDenoiser.cpp
     src/Renderer/Passes/NrdPreparePass.cpp
+    src/Renderer/Passes/NrdPathTracePreparePass.cpp
     src/Renderer/Passes/ReflectionContributionLimitPass.cpp
     src/Renderer/Passes/NrdReflectionResolvePass.cpp
     src/DemoContent/DemoSceneManager.cpp

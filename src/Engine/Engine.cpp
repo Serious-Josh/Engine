@@ -2612,7 +2612,7 @@ void Engine::Frame()
     rendererOptions.lightingMode = debugUI.GetLightingMode();
     rendererOptions.pathTraceReference = debugUI.GetPathTraceReferenceSettings();
     rendererOptions.sharc = debugUI.GetSharcSettings();
-    rendererOptions.pathTraceDenoiser = debugUI.IsPathTraceDenoiserEnabled();
+    rendererOptions.pathTraceDenoiserMode = debugUI.GetPathTraceDenoiserMode();
     rendererOptions.pathTraceDenoiserStages = debugUI.GetPathTraceDenoiserStages();
     rendererOptions.pathTraceCameraJitter = debugUI.IsPathTraceCameraJitterEnabled();
     rendererOptions.dlssInputPreparation = debugUI.IsDlssInputPreparationEnabled();

@@ -116,8 +116,10 @@ void CSMain(uint3 dispatchThreadID : SV_DispatchThreadID)
 
     GPUMaterial material = materials[(uint)materialID];
     float3 normal = normalize(surface.xyz);
-    // Preserve the tracer's true mirror branch; do not square perceptual roughness.
-    float roughness = material.roughness <= 0.001f ? 0.0f : max(saturate(materialData.a), 0.045f);
+    // Preserve the tracer's true mirror branch (RayTracedReflection.hlsl: effective G-buffer roughness <= 0.001); do not
+    // square perceptual roughness.
+    float effectiveRoughness = saturate(materialData.a);
+    float roughness = effectiveRoughness <= 0.001f ? 0.0f : max(effectiveRoughness, 0.045f);
 
     if(material.model > 2u)
     {

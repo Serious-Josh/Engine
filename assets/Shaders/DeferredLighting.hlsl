@@ -413,6 +413,10 @@ float4 PSMain(VSOutput input) : SV_Target0
         gpuMaterial.metallic = saturate(geometricNormalTexture.Load(int3(pixel, 0)).a);
     }
 
+    // The G-buffer holds the effective roughness (the constant times the roughness or ARM texture, Triangle.hlsl), as
+    // every other consumer reads it; the BRDF helpers read gpuMaterial.roughness, so it is replaced there.
+    gpuMaterial.roughness = saturate(materialData.a);
+
     float roughness =
         gpuMaterial.roughness;
 

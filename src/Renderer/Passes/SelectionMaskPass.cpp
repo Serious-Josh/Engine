@@ -64,6 +64,7 @@ bool SelectionMaskPass::Initialize(
     description.renderTargets.formats[0] = DXGI_FORMAT_R8_UNORM;
 
     description.depthEnabled = true;
+    description.mirroredWindingVariant = true;
     description.depthFormat = DXGI_FORMAT_D32_FLOAT;
     description.depthComparison = D3D12_COMPARISON_FUNC_LESS_EQUAL;
     description.depthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
@@ -102,14 +103,14 @@ bool SelectionMaskPass::Initialize(
     return true;
 }
 
-void SelectionMaskPass::Bind(ID3D12GraphicsCommandList* commandList) const
+void SelectionMaskPass::Bind(ID3D12GraphicsCommandList* commandList, bool mirroredWinding) const
 {
-    m_pipeline.Bind(commandList);
+    m_pipeline.Bind(commandList, mirroredWinding);
 }
 
-void SelectionMaskPass::BindDepthPrepass(ID3D12GraphicsCommandList* commandList) const
+void SelectionMaskPass::BindDepthPrepass(ID3D12GraphicsCommandList* commandList, bool mirroredWinding) const
 {
-    m_depthPrepassPipeline.Bind(commandList);
+    m_depthPrepassPipeline.Bind(commandList, mirroredWinding);
 }
 
 void SelectionMaskPass::Shutdown()

@@ -1011,7 +1011,7 @@ SharcSettings DebugUI::GetSharcSettings() const
     settings.statistics = m_sharcStatistics;
     settings.resetRequest = m_sharcResetRequest;
     settings.adaptiveResolution = m_sharcSpatialResolution == 1;
-    settings.historyPrior = m_sharcHistoryPrior && m_pathTraceDenoiser;
+    settings.historyPrior = m_sharcHistoryPrior && m_pathTraceDenoiserMode == PathTraceDenoiserMode::Engine;
     return settings;
 }
 
@@ -1032,8 +1032,8 @@ void DebugUI::DrawSharcSettings()
     // Switching rebuilds the cache.
     const char* spatialResolutions[] = {"Uniform 10 cm", "Adaptive (default)"};
     ImGui::Combo("Spatial resolution", &m_sharcSpatialResolution, spatialResolutions, IM_ARRAYSIZE(spatialResolutions));
-    // Initializes rejected denoiser history from the cache, so it needs the PT denoiser.
-    ImGui::BeginDisabled(!m_pathTraceDenoiser);
+    // Initializes rejected denoiser history from the cache, so it needs the Engine PT denoiser.
+    ImGui::BeginDisabled(m_pathTraceDenoiserMode != PathTraceDenoiserMode::Engine);
     ImGui::Checkbox("SHARC-assisted history initialization (experimental)", &m_sharcHistoryPrior);
     ImGui::EndDisabled();
     ImGui::Checkbox("Freeze training", &m_sharcFreezeTraining);
@@ -1263,10 +1263,31 @@ void DebugUI::DrawPathTraceReferenceSettings()
                         m_pathTraceCameraJitterPhaseCount, m_pathTraceCameraJitterX, m_pathTraceCameraJitterY);
         }
 
-        ImGui::Checkbox("PT denoiser", &m_pathTraceDenoiser);
+        // NRD.2: only the implemented modes are offered; the combo index is the PathTraceDenoiserMode value. NRD.4B: REBLUR
+        // (experimental); RELAX and Hybrid are not offered.
+        const char* denoiserModes[] = {"Off", "Engine", "NRD REBLUR (experimental)"};
+        int denoiserMode = static_cast<int>(m_pathTraceDenoiserMode);
+
+        if (ImGui::Combo("PT denoiser", &denoiserMode, denoiserModes, IM_ARRAYSIZE(denoiserModes)))
+        {
+            m_pathTraceDenoiserMode = static_cast<PathTraceDenoiserMode>(denoiserMode);
+        }
+
+        if (m_pathTraceDenoiserMode == PathTraceDenoiserMode::NrdReblur)
+        {
+            if (!m_pathTraceNrdStatus.empty())
+            {
+                ImGui::TextWrapped("%s", m_pathTraceNrdStatus.c_str());
+            }
+
+            if (ImGui::Button("Reset PT denoiser history"))
+            {
+                ++m_pathTraceDenoiserStages.historyResetRequest;
+            }
+        }
 
         // DENOISE.1: stage isolation for diagnosing the denoiser; the defaults are the production pipeline.
-        if (m_pathTraceDenoiser)
+        if (m_pathTraceDenoiserMode == PathTraceDenoiserMode::Engine)
         {
             const char* spatialFilters[] = {"Off", "5x5 single pass", "A-trous, 1 iteration",
                                             "A-trous, 2 iterations (default)"};

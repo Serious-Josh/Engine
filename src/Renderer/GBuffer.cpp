@@ -9,7 +9,7 @@ bool GBuffer::Initialize(
     DescriptorHeap& dsvHeap,
     DescriptorHeap& resourceHeap)
 {
-    if (!m_material.Initialize(device, width, height, DXGI_FORMAT_R8G8B8A8_UNORM, rtvHeap, resourceHeap,
+    if (!m_material.Initialize(device, width, height, MaterialFormat, rtvHeap, resourceHeap,
                                {1.0f, 0.0f, 1.0f, 1.0f}))
     {
         return false;

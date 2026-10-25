@@ -150,7 +150,7 @@ bool PreviousGBufferHistory::CreateSlot(
             firstSlot ? L"Previous GBuffer Surface 0" : L"Previous GBuffer Surface 1"},
         {slot.geometricNormal, DXGI_FORMAT_R16G16B16A16_FLOAT,
             firstSlot ? L"Previous GBuffer Geometric Normal 0" : L"Previous GBuffer Geometric Normal 1"},
-        {slot.material, DXGI_FORMAT_R8G8B8A8_UNORM,
+        {slot.material, GBuffer::MaterialFormat,
             firstSlot ? L"Previous GBuffer Material 0" : L"Previous GBuffer Material 1"},
     };
 

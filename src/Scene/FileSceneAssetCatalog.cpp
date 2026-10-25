@@ -607,7 +607,7 @@ bool FileSceneAssetCatalog::Initialize(
 
     description.renderTargets.count = 4;
     description.renderTargets.formats[0] =
-        DXGI_FORMAT_R8G8B8A8_UNORM;
+        GBuffer::MaterialFormat;
     description.renderTargets.formats[1] =
         DXGI_FORMAT_R16G16B16A16_FLOAT;
     description.renderTargets.formats[2] =
@@ -637,6 +637,7 @@ bool FileSceneAssetCatalog::Initialize(
     });
 
     description.depthEnabled = true;
+    description.mirroredWindingVariant = true;
     description.depthFormat = DXGI_FORMAT_D32_FLOAT;
 
     if (!m_pipeline.Initialize(device, description))

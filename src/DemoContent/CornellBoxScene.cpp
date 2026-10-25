@@ -3,6 +3,7 @@
 
 #include "Renderer/ResourceUploader.h"
 #include "Renderer/DescriptorHeap.h"
+#include "Renderer/GBuffer.h"
 #include "Renderer/RenderObject.h"
 #include "Renderer/Vertex.h"
 #include "Renderer/ImageLoader.h"
@@ -46,7 +47,7 @@ bool CornellBoxScene::Initialize(
     pipelineDescription.vertexLayout = &m_vertexLayout;
 
     pipelineDescription.renderTargets.count = 4;
-    pipelineDescription.renderTargets.formats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    pipelineDescription.renderTargets.formats[0] = GBuffer::MaterialFormat;
     pipelineDescription.renderTargets.formats[1] = DXGI_FORMAT_R16G16B16A16_FLOAT;
     pipelineDescription.renderTargets.formats[2] = DXGI_FORMAT_R16G16B16A16_FLOAT;
 
@@ -61,6 +62,7 @@ bool CornellBoxScene::Initialize(
         {RootParameterType::ConstantBuffer, 2, 0, D3D12_SHADER_VISIBILITY_VERTEX});
 
     pipelineDescription.depthEnabled = true;
+    pipelineDescription.mirroredWindingVariant = true;
     pipelineDescription.depthFormat = DXGI_FORMAT_D32_FLOAT;
 
     if (!m_pipeline.Initialize(device, pipelineDescription))

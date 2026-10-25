@@ -227,11 +227,31 @@ bool Pipeline::Initialize(
         return false;
     }
 
+    // A negative-determinant model matrix reverses screen-space winding, so its outward faces arrive
+    // counterclockwise. The variant differs only in the front-face winding.
+    if (description.mirroredWindingVariant)
+    {
+        pipelineDescription.RasterizerState.FrontCounterClockwise = TRUE;
+        result = device->CreateGraphicsPipelineState(&pipelineDescription, IID_PPV_ARGS(&m_mirroredPipelineState));
+
+        if (FAILED(result))
+        {
+            return false;
+        }
+    }
+
     return true;
 }
 
 void Pipeline::Shutdown()
 {
+    if (m_mirroredPipelineState)
+    {
+        m_mirroredPipelineState->Release();
+
+        m_mirroredPipelineState = nullptr;
+    }
+
     if (m_pipelineState)
     {
         m_pipelineState->Release();
@@ -247,9 +267,9 @@ void Pipeline::Shutdown()
     }
 }
 
-void Pipeline::Bind(ID3D12GraphicsCommandList* commandList) const
+void Pipeline::Bind(ID3D12GraphicsCommandList* commandList, bool mirroredWinding) const
 {
-    commandList->SetPipelineState(m_pipelineState);
+    commandList->SetPipelineState(mirroredWinding && m_mirroredPipelineState ? m_mirroredPipelineState : m_pipelineState);
 
     commandList->SetGraphicsRootSignature(m_rootSignature);
 }
@@ -263,4 +283,5 @@ void Pipeline::Swap(Pipeline& other) noexcept
 {
     std::swap(m_rootSignature, other.m_rootSignature);
     std::swap(m_pipelineState, other.m_pipelineState);
+    std::swap(m_mirroredPipelineState, other.m_mirroredPipelineState);
 }

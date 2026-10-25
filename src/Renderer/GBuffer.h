@@ -8,6 +8,12 @@ class DescriptorHeap;
 class GBuffer
 {
     public:
+    // The material target (and its previous-frame history copies): linear base colour in RGB, stored sRGB-encoded by the
+    // hardware on write and decoded on every SRV read (8-bit sRGB keeps the precision of the sRGB8 base-colour textures);
+    // alpha is the perceptual roughness, which sRGB formats store as linear UNORM. Every pipeline writing the G-buffer
+    // declares this format for render target 0 (FOUNDATION.4).
+    static constexpr DXGI_FORMAT MaterialFormat = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+
     GBuffer() = default;
 
     GBuffer(const GBuffer&) = delete;

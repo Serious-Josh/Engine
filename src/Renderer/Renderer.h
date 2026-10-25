@@ -55,6 +55,7 @@
 #include "Passes/ReflectionContributionLimitPass.h"
 #include "Passes/NrdDenoiser.h"
 #include "Passes/NrdPreparePass.h"
+#include "Passes/NrdPathTracePreparePass.h"
 #include "Passes/NrdReflectionResolvePass.h"
 #include "Passes/SelectionMaskPass.h"
 #include "Passes/RayTracedGIPass.h"
@@ -143,8 +144,9 @@ struct RendererOptions
 
     // SHARC.4E.1: the path-tracing denoiser (RTXPT D.1B signal extraction, D.2B temporal reconstruction, D.3B spatial
     // filtering) on Path Traced Raster Primary frames (with ReSTIR DI too since SHARC.5B), with or without SHARC. The denoised result is presented in place
-    // of the progressive mean; the accumulation itself is unchanged. Off here; the Editor turns it on by default.
-    bool pathTraceDenoiser = false;
+    // of the progressive mean; the accumulation itself is unchanged. Off here; the Editor selects Engine by default.
+    // NRD.2: a mode; only Off and Engine are implemented (PathTraceDenoiserMode).
+    PathTraceDenoiserMode pathTraceDenoiserMode = PathTraceDenoiserMode::Off;
     // DENOISE.1 diagnostics: which denoiser stages run (defaults: the production pipeline). Applied when it changes.
     PathTraceDenoiserStages pathTraceDenoiserStages;
     // UPSCALING.2B diagnostics: sub-pixel camera jitter on Path Traced Raster Primary frames (with ReSTIR DI too). Off
@@ -1341,8 +1343,18 @@ class Renderer
 
     ReflectionContributionLimitPass m_reflectionContributionLimitPass;
 
+    // The hybrid lighting mode's REBLUR instances (reflections, half-resolution GI). NRD.2: created on the first frame
+    // that denoises with them, released on the first path-traced frame (the only modes that never use them).
     NrdDenoiser m_nrdReflectionDenoiser;
     NrdDenoiser m_nrdGIDenoiser;
+    // A creation failure is not retried until the next resize or renderer restart.
+    bool m_hybridNrdCreationFailed = false;
+
+    // Creates both hybrid instances at the scene extent when missing. Creation only; the SDK waits for the GPU while
+    // building its pipelines.
+    bool EnsureHybridNrdDenoisers();
+    // Waits for the GPU, then releases both hybrid instances when they exist. Their next use starts new history.
+    void ReleaseHybridNrdDenoisers();
 
     GISpatialDenoisePass m_giSpatialDenoisePass;
 
@@ -1355,6 +1367,10 @@ class Renderer
     PathTraceTemporalPass m_pathTraceTemporalPass;
     // RTXPT D.3B spatial filtering of the temporal outputs (diagnostics only, created on first use; no textures).
     PathTraceSpatialPass m_pathTraceSpatialPass;
+    // NRD.3 path-traced NRD signal preparation and bypass reconstruction (diagnostics only). Its textures exist only
+    // while m_nrdPathTraceDiagnostic is set: created on its first extraction frame, released when it is cleared
+    // (after a GPU wait), on resize and at shutdown.
+    NrdPathTracePreparePass m_nrdPathTracePreparePass;
     PathTraceReferenceStatus m_pathTraceStatus;
 
     // RTXPT.2 R4 previous-frame G-buffer, PT modes only (D4). Allocated on the first frame that renders
@@ -1469,10 +1485,15 @@ class Renderer
     // SHARC.4E: applies the frame's SharcSettings to the cache (before UpdateRadianceCacheD6's generation work);
     // estimator-changing settings restart accumulation. m_sharcStatus is read from the frame slot's readback.
     void ApplySharcSettings(const SharcSettings& requested, bool rasterPrimary);
-    // SHARC.4E.1: sets the denoiser's stage flags when RendererOptions::pathTraceDenoiser (the raster-primary modes
-    // only) changes, so diagnostics that drive the flags directly are left alone while the option is unchanged.
-    void ApplyPathTraceDenoiser(bool requested, bool rasterPrimary);
+    // SHARC.4E.1: sets the denoiser's stage flags when the effective denoiser (RendererOptions::pathTraceDenoiserMode, the
+    // raster-primary modes only) changes, so diagnostics that drive the flags directly are left alone while it is
+    // unchanged. NRD.4B: REBLUR keeps the Engine stage flags (its fallback); RELAX and Hybrid are presented as Engine.
+    void ApplyPathTraceDenoiser(PathTraceDenoiserMode requested, bool rasterPrimary);
     bool m_pathTraceDenoiserOption = false;
+    // NRD.2: the mode this frame denoises with (Off outside the raster-primary modes), and the requested NRD mode that
+    // was presented as Engine instead (Off when none). Neither changes any rendering.
+    PathTraceDenoiserMode m_pathTraceDenoiserMode = PathTraceDenoiserMode::Off;
+    PathTraceDenoiserMode m_pathTraceDenoiserUnavailableMode = PathTraceDenoiserMode::Off;
 
     // UPSCALING.2B camera jitter (RendererOptions::pathTraceCameraJitter). Applies only to raster-primary path-traced
     // frames. The phase advances once per jittered recording and wraps; switching the option, a scene resize and
@@ -1533,6 +1554,16 @@ class Renderer
     bool m_pathTraceSignalExtraction = false;
     // Whether the last recorded path-tracing frame ran the extraction exports.
     bool m_pathTraceExtractedLastFrame = false;
+    // NRD.3: requested by diagnostics only (never by default, any setting or the Editor). Each extraction frame then
+    // also prepares REBLUR's inputs from the raw extraction and reconstructs the raw signals through an NRD bypass. It
+    // reads the frame's signals and writes only its own textures: the image is unchanged. Frames without extraction
+    // (denoiser Off) do not run it, since turning extraction on would itself change the accumulation's rounding.
+    bool m_nrdPathTraceDiagnostic = false;
+    // Whether the last recorded path-tracing frame ran it.
+    bool m_nrdPathTraceDiagnosticRanLastFrame = false;
+    // NRD.4A: the diagnostic's fixed radiance scale (NrdPathTracePrepareConstants::radianceScale). Diagnostics only; a
+    // denoiser history would need a restart whenever it changed.
+    float m_nrdPathTraceRadianceScale = 64.0f;
     // RTXPT D.2B temporal reconstruction, requested by diagnostics only and only effective with extraction: each
     // extraction frame then reprojects and accumulates the diffuse and specular signals into temporal history.
     // m_pathTraceTemporalPresentation additionally presents that history (diffuse + specular on surface pixels) in
@@ -1595,6 +1626,82 @@ class Renderer
     };
 
     std::optional<PathTraceTemporalKey> m_pathTraceTemporalKey;
+    // The temporal key of a frame and whether two keys describe the same signal (shared by the Engine temporal pass and
+    // NRD.4B REBLUR, so both restart on the same changes).
+    static PathTraceTemporalKey MakePathTraceTemporalKey(
+        PathTracePrimary primary,
+        const FrameLighting& frameLighting,
+        const PathTraceReferenceSettings& settings);
+    static bool SamePathTraceTemporalKey(const PathTraceTemporalKey& previous, const PathTraceTemporalKey& key);
+
+    // NRD.4B path-traced REBLUR (PathTraceDenoiserMode::NrdReblur): one REBLUR_DIFFUSE_SPECULAR instance at the render
+    // extent, created on the first REBLUR frame, released (one GPU wait) on the first frame of any other mode, and on
+    // resize (recreated with CLEAR_AND_RESTART by the next REBLUR frame). A creation failure is sticky until the next
+    // resize or mode change; REBLUR frames then fall back to the Engine denoiser, frame by frame.
+    NrdDenoiser m_nrdPathTraceDenoiser;
+    bool m_nrdPathTraceCreationFailed = false;
+    std::uint64_t m_nrdPathTraceCreations = 0;
+    // The reason REBLUR last could not denoise (empty while it can); warned once per distinct reason.
+    std::string m_nrdPathTraceFailure;
+    // History: valid until any reset source clears it (the Engine temporal pass's sources, a mode change, a frame gap);
+    // the instance is new after creation (CLEAR_AND_RESTART). Previous camera and jitter are those of the last submitted
+    // REBLUR frame: the pending values are committed with the frame's submission and dropped with an abandoned one.
+    bool m_nrdPathTraceHistoryValid = false;
+    bool m_nrdPathTraceInstanceNew = false;
+    bool m_nrdPathTraceDispatchedThisFrame = false;
+    bool m_nrdPathTraceExecutedLastFrame = false;
+    std::optional<PathTraceTemporalKey> m_nrdPathTraceKey;
+    Matrix4 m_nrdPathTracePreviousView{};
+    Matrix4 m_nrdPathTracePreviousProjection{};
+    float m_nrdPathTracePreviousJitter[2] = {0.0f, 0.0f};
+    Matrix4 m_nrdPathTracePendingView{};
+    Matrix4 m_nrdPathTracePendingProjection{};
+    float m_nrdPathTracePendingJitter[2] = {0.0f, 0.0f};
+    std::uint32_t m_nrdPathTraceFrameIndex = 0;
+    nrd::AccumulationMode m_nrdPathTraceAccumulationMode = nrd::AccumulationMode::CLEAR_AND_RESTART;
+    // Whether the last recorded frame presented REBLUR's output (false after a frame of any other mode).
+    bool m_nrdPathTracePresentedLastFrame = false;
+    // NRD.4C diagnostics, unset/0 in production: REBLUR settings used in place of PathTraceNrdSettings (the caller
+    // restarts history when it changes them), and the denoised resolve's components (NrdPathTracePrepareConstants::
+    // resolveComponents: 0 both, 1 diffuse only, 2 specular only).
+    std::optional<nrd::ReblurSettings> m_nrdPathTraceSettingsOverride;
+    std::uint32_t m_nrdPathTraceResolveComponents = 0;
+    // NRD.4C diagnostics: create the instance with fp32 internal textures (takes effect at its next creation).
+    bool m_nrdPathTracePromoteFloat16To32 = false;
+    // NRD.4D diagnostics: NrdPathTracePrepareConstants::specularHitDistanceMode (0 in production).
+    std::uint32_t m_nrdPathTraceSpecularHitDistanceMode = 0;
+    // Diagnostics: NRD's validation overlay (CommonSettings::enableValidation) into this RGBA16F texture.
+    bool m_nrdPathTraceValidation = false;
+    Texture m_nrdPathTraceValidationTexture;
+
+    // The production REBLUR settings (diagnostics compare overrides against them).
+    static nrd::ReblurSettings PathTraceNrdProductionSettings();
+    bool EnsurePathTraceNrdDenoiser();
+    // Waits for the GPU, then releases the instance and the validation texture when they exist.
+    void ReleasePathTraceNrdDenoiser();
+    void ReportPathTraceNrdUnavailable(const std::string& reason);
+    // Everything that can fail before recording: the instance, the preparation textures and the frame's NRD settings.
+    // False: this frame falls back to the Engine denoiser.
+    bool BeginPathTraceNrdFrame(
+        PathTracePrimary primary,
+        const Matrix4& view,
+        const Matrix4& cameraProjection,
+        const FrameLighting& frameLighting,
+        const PathTraceReferenceSettings& settings);
+    // Records preparation, REBLUR and the production resolve into the presentation, after BeginPathTraceNrdFrame.
+    void RecordPathTraceNrd(
+        ID3D12GraphicsCommandList* commandList,
+        unsigned int frameIndex,
+        const Matrix4& view,
+        const Matrix4& inverseViewProjection,
+        const Vector3& cameraPosition);
+    // The preparation constants shared by REBLUR and the NRD.3 diagnostic; also makes the G-buffer and raw extraction
+    // shader-readable.
+    NrdPathTracePrepareConstants MakeNrdPathTracePrepareConstants(
+        ID3D12GraphicsCommandList* commandList,
+        const Matrix4& view,
+        const Matrix4& inverseViewProjection,
+        const Vector3& cameraPosition);
     // Samples recorded by the current frame; added to the accumulated count only after the frame
     // records and submits successfully (Render's Rendered path).
     std::uint32_t m_pathTracePendingSamples = 0;
@@ -1659,6 +1766,16 @@ class Renderer
         const Vector3& cameraPosition,
         const FrameLighting& frameLighting,
         const PathTraceReferenceSettings& settings);
+    // NRD.3: records the path-traced NRD preparation and bypass reconstruction after an extraction frame. view and
+    // inverseViewProjection are the G-buffer's (render, jittered) camera. False when it could not run.
+    bool RecordNrdPathTraceDiagnostic(
+        ID3D12GraphicsCommandList* commandList,
+        unsigned int frameIndex,
+        const Matrix4& view,
+        const Matrix4& inverseViewProjection,
+        const Vector3& cameraPosition);
+    // NRD.3: waits for the GPU, then releases the diagnostic's textures when they exist.
+    void ReleaseNrdPathTraceDiagnostic();
     // RTXPT D.3B: records the spatial pass over the temporal outputs the temporal pass recorded this frame.
     void RecordPathTraceSpatial(ID3D12GraphicsCommandList* commandList, const Matrix4& view, const Matrix4& projection,
         const PathTraceDenoiserVisualization& visualization);

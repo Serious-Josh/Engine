@@ -56,6 +56,14 @@ class GpuTimestampProfiler
         DlssEvaluate,
         // UPSCALING.3C.4 Editor overlay depth/mask prepass (jittered Editor frames only), before ToneMap.
         EditorOverlayPrepass,
+        // NRD.3 path-traced NRD preparation and bypass reconstruction (diagnostic only), after PathTraceSpatial.
+        NrdPathTracePrepare,
+        NrdPathTraceResolve,
+        // NRD.4B path-traced REBLUR dispatch, between NrdPathTracePrepare and NrdPathTraceResolve.
+        NrdPathTraceDenoise,
+        // NRD.4B: the Engine denoiser's temporal pass, nested inside PathTraceReference (its spatial pass is
+        // PathTraceSpatial).
+        PathTraceTemporal,
         Count
     };
 
