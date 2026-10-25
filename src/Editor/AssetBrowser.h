@@ -20,10 +20,15 @@ class ProjectAssetRegistry;
 class Renderer;
 class ProjectContext;
 class FileBackedDemoScene;
+class EditorIcons;
 
 class AssetBrowser
 {
 public:
+    void SetIcons(const EditorIcons& icons)
+    {
+        m_icons = &icons;
+    }
     bool TakeScriptRefreshRequest()
     {
         return std::exchange(m_scriptRefreshRequested, false);
@@ -132,6 +137,7 @@ public:
     void OnMeshImportUnitsCompleted(const std::string& error);
 
 private:
+    const EditorIcons* m_icons = nullptr;
 #if defined(ENGINE_HAS_VERIFICATION)
     friend class MaterialLocateVerification;
     friend class ThumbnailSchedulingVerification;

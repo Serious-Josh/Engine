@@ -5,6 +5,12 @@ project(Engine
     LANGUAGES CXX
 )
 
+# Editor SVG decoding uses ID2D1DeviceContext5 (Windows 10 Creators Update).
+if(CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION AND
+   CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION VERSION_LESS "10.0.15063.0")
+    message(FATAL_ERROR "Editor SVG icons require Windows SDK 10.0.15063.0 or newer.")
+endif()
+
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -241,6 +247,9 @@ add_library(EngineCore OBJECT
     src/Editor/ViewportMarquee.cpp
     src/Editor/ViewportMarqueeControls.cpp
     src/Editor/SceneHierarchyPanel.cpp
+    src/Editor/EditorIcons.cpp
+    src/Editor/EditorViewportIcons.cpp
+    src/Editor/SvgIconRasterizer.cpp
     src/Editor/InspectorPanel.cpp
     src/Editor/InspectorNumericDrag.cpp
     src/assets/ProjectAssetDeletion.cpp
@@ -598,6 +607,8 @@ target_link_libraries(EngineCore
         bcrypt
         dxgi
         d3d12
+        d2d1
+        windowscodecs
         EngineDXC
 
         "$<$<CONFIG:Debug>:${CMAKE_CURRENT_SOURCE_DIR}/external/NRD/Lib/Debug/NRD.lib>"

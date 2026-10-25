@@ -2,6 +2,7 @@
 #include "LightingModeTransitionPresentation.h"
 
 #include "Renderer/DescriptorHeap.h"
+#include "Platform/Windows/WindowsWindow.h"
 
 #include "imgui.h"
 #include "imgui_impl_win32.h"
@@ -518,11 +519,13 @@ bool DebugUI::Initialize(
         return false;
     }
 
+    m_editorIcons.Initialize(device, descriptorHeap, WindowsWindow::GetExecutableDirectory() / "assets/Editor/Icons");
     return true;
 }
 
 void DebugUI::Shutdown()
 {
+    m_editorIcons.Shutdown();
     ImGui_ImplDX12_Shutdown();
     ImGui_ImplWin32_Shutdown();
 
@@ -950,6 +953,7 @@ void DebugUI::EndFrame(
     ID3D12GraphicsCommandList* commandList,
     bool* textureUploadRequested)
 {
+    m_editorIcons.Prepare(commandList);
     m_gpuTimingGraph.Draw(m_gpuTimingMonitor);
 
     ImGui::Render();

@@ -9,6 +9,7 @@
 #include "GpuTimingGraph.h"
 #include "CpuFrameTiming.h"
 #include "FramePacingMonitor.h"
+#include "Editor/EditorIcons.h"
 
 #include <climits>
 #include <cstdint>
@@ -48,6 +49,10 @@ class DebugUI
         ID3D12CommandQueue* commandQueue,
         DescriptorHeap& descriptorHeap);
     void Shutdown();
+    const EditorIcons& GetEditorIcons() const
+    {
+        return m_editorIcons;
+    }
 
     void BeginFrame();
     void DrawMenu();
@@ -263,6 +268,7 @@ class DebugUI
     GpuTimingGraph m_gpuTimingGraph;
 
     DescriptorHeap* m_descriptorHeap = nullptr;
+    EditorIcons m_editorIcons;
 
     bool m_tlasUpdated = false;
 

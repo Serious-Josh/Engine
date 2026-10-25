@@ -1,4 +1,5 @@
 #include "AssetBrowser.h"
+#include "EditorIcons.h"
 #include "Renderer/Renderer.h"
 #include "EditorWorkspace.h"
 
@@ -582,7 +583,22 @@ void AssetBrowser::DrawTree(
         flags |= ImGuiTreeNodeFlags_Selected;
     }
 
-    const bool open = ImGui::TreeNodeEx("##Directory", flags, "%s", label.c_str());
+    const float iconSize = ImGui::GetFontSize();
+    // Reserve label space inside the original tree item; decoration adds no input target.
+    const float spaceWidth = (std::max)(1.0f, ImGui::CalcTextSize(" ").x);
+    const size_t paddingSpaces = m_icons ?
+        static_cast<size_t>((iconSize + ImGui::GetStyle().ItemInnerSpacing.x) / spaceWidth) + 1 : 0;
+    const std::string padding(paddingSpaces, ' ');
+    const bool open = ImGui::TreeNodeEx("##Directory", flags, "%s%s", padding.c_str(), label.c_str());
+
+    if(m_icons)
+    {
+        const auto start = ImGui::GetItemRectMin();
+        m_icons->Draw(*ImGui::GetWindowDrawList(), EditorIcon::Folder,
+            ImVec2(start.x + ImGui::GetTreeNodeToLabelSpacing(), start.y), ImVec2(iconSize, iconSize),
+            ImGui::GetColorU32(ImGuiCol_Text));
+    }
+
     CaptureDropTarget(path);
     DrawAssetMoveTarget(path);
 
@@ -627,13 +643,33 @@ void AssetBrowser::DrawContents(const ProjectContext* project, const FileBackedD
         ImGui::TextWrapped("%s", listing.error.c_str());
     }
 
-    const int columns = (std::max)(1, static_cast<int>(ImGui::GetContentRegionAvail().x / 112.0f));
+    const auto& style = ImGui::GetStyle();
+    const float compactIconSize = ImGui::GetFontSize() * 2.0f;
+    const float compactTileWidth = ImGui::GetFontSize() * 6.0f + style.FramePadding.x * 2.0f;
+    const float compactTileHeight = compactIconSize + style.ItemInnerSpacing.y +
+        ImGui::GetTextLineHeight() + style.FramePadding.y * 2.0f;
+    const bool hasPreviewTiles = std::any_of(listing.entries.begin(), listing.entries.end(), [&](const Entry& entry)
+    {
+        const auto path = entry.path.lexically_normal();
+        return !entry.directory && m_filter.PassFilter(entry.name.c_str()) &&
+            (m_textureRecords.contains(path) || m_materialRecords.contains(path) || m_meshRecords.contains(path));
+    });
+    // Fixed columns prevent sparse listings from stretching small icons across the panel.
+    // Keep enough room for the existing 96px previews in mixed listings.
+    const float columnWidth = hasPreviewTiles ? (std::max)(96.0f, compactTileWidth) : compactTileWidth;
+    const float columnPitch = columnWidth + style.CellPadding.x * 2.0f + style.ItemSpacing.x;
+    const int columns = (std::max)(1, static_cast<int>(ImGui::GetContentRegionAvail().x / columnPitch));
     std::filesystem::path destination;
     bool tileHovered = false;
     const auto now = ThumbnailAdmission::Clock::now();
 
-    if (ImGui::BeginTable("Files", columns, ImGuiTableFlags_SizingStretchSame))
+    if (ImGui::BeginTable("Files", columns, ImGuiTableFlags_SizingFixedSame))
     {
+        for(int column = 0; column < columns; ++column)
+        {
+            ImGui::TableSetupColumn(nullptr, ImGuiTableColumnFlags_WidthFixed, columnWidth + style.ItemSpacing.x);
+        }
+
         for (const auto& entry : listing.entries)
         {
             if(!m_filter.PassFilter(entry.name.c_str()))
@@ -643,8 +679,8 @@ void AssetBrowser::DrawContents(const ProjectContext* project, const FileBackedD
 
             ImGui::TableNextColumn();
             ImGui::PushID(PathID(entry.path).c_str());
-            // Submit the icon and filename in normal layout order. The group
-            // includes both items in the tile's hover and click bounds.
+            // Compact tiles submit one item containing both icon and filename.
+            // Thumbnail tiles keep their existing preview and wrapped-label layout.
             ImGui::BeginGroup();
             const bool sceneDocument = !entry.directory && ProjectAssetRegistry::PathsEqual(entry.path.extension(), ".scene");
             const bool scriptDocument = !entry.directory && ProjectAssetRegistry::PathsEqual(entry.path.extension(), ".as");
@@ -660,14 +696,46 @@ void AssetBrowser::DrawContents(const ProjectContext* project, const FileBackedD
             const bool isScene = sceneDocument && project && IsSceneEntry(entry.path, *project);
             const bool active = isScene && IsActiveSceneEntry(entry.path, *project, activeScene);
             const bool hasThumbnail = isTexture || isMaterial || isMesh;
+            const bool compactTile = !hasThumbnail && !isScene && !isScript;
             const auto tilePosition = ImGui::GetCursorScreenPos();
             constexpr float thumbnailSize = 96.0f;
             const char* tileLabel = isTexture ? "##Texture" : isMaterial ? "##Material" :
-                isMesh ? "##Mesh" : isScene ? "[Scene]" : isScript ? "[Script]" : entry.directory ? "[Folder]" : "[File]";
+                isMesh ? "##Mesh" : isScene ? "[Scene]" : isScript ? "[Script]" :
+                compactTile ? "##Entry" : entry.directory ? "[Folder]" : "[File]";
+            const ImVec2 tileSize = compactTile ? ImVec2(compactTileWidth, compactTileHeight) :
+                hasThumbnail ? ImVec2(thumbnailSize, thumbnailSize) : ImVec2(0.0f, 48.0f);
+            const ImGuiSelectableFlags tileFlags = ImGuiSelectableFlags_AllowDoubleClick |
+                (compactTile ? ImGuiSelectableFlags_NoPadWithHalfSpacing : ImGuiSelectableFlags_None);
             const bool pressed = ImGui::Selectable(tileLabel,
-                m_selection == entry.path, ImGuiSelectableFlags_AllowDoubleClick,
-                hasThumbnail ? ImVec2(thumbnailSize, thumbnailSize) : ImVec2(0.0f, 48.0f));
+                m_selection == entry.path, tileFlags, tileSize);
             const bool tileVisible = ImGui::IsItemVisible();
+
+            if(compactTile && tileVisible)
+            {
+                auto* draw = ImGui::GetWindowDrawList();
+                const ImVec2 iconPosition(tilePosition.x + (tileSize.x - compactIconSize) * 0.5f,
+                    tilePosition.y + style.FramePadding.y);
+
+                if(m_icons)
+                {
+                    m_icons->Draw(*draw, entry.directory ? EditorIcon::Folder : EditorIcon::File,
+                        iconPosition, ImVec2(compactIconSize, compactIconSize), ImGui::GetColorU32(ImGuiCol_Text));
+                }
+                else
+                {
+                    draw->AddRect(iconPosition, ImVec2(iconPosition.x + compactIconSize,
+                        iconPosition.y + compactIconSize), ImGui::GetColorU32(ImGuiCol_Text));
+                }
+
+                const float labelWidth = tileSize.x - style.FramePadding.x * 2.0f;
+                const auto textSize = ImGui::CalcTextSize(entry.name.c_str());
+                const ImVec2 labelPosition(tilePosition.x + (tileSize.x - (std::min)(textSize.x, labelWidth)) * 0.5f,
+                    iconPosition.y + compactIconSize + style.ItemInnerSpacing.y);
+                const ImVec2 labelEnd(tilePosition.x + tileSize.x - style.FramePadding.x,
+                    labelPosition.y + ImGui::GetTextLineHeight());
+                ImGui::RenderTextEllipsis(draw, labelPosition, labelEnd, labelEnd.x,
+                    entry.name.c_str(), nullptr, &textSize);
+            }
 
             if(isMesh)
             {
@@ -790,15 +858,18 @@ void AssetBrowser::DrawContents(const ProjectContext* project, const FileBackedD
                 }
             }
 
-            ImGui::PushTextWrapPos(0.0f);
-            ImGui::TextUnformatted(entry.name.c_str());
-
-            if(active)
+            if(!compactTile)
             {
-                ImGui::TextDisabled("Active");
-            }
+                ImGui::PushTextWrapPos(0.0f);
+                ImGui::TextUnformatted(entry.name.c_str());
 
-            ImGui::PopTextWrapPos();
+                if(active)
+                {
+                    ImGui::TextDisabled("Active");
+                }
+
+                ImGui::PopTextWrapPos();
+            }
             ImGui::EndGroup();
             CaptureDropTarget(entry.navigable ? entry.path : std::filesystem::path{});
             const bool located=isMaterial && m_navigationHighlight && material->second.id==*m_navigationHighlight;

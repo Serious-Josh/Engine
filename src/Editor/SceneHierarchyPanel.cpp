@@ -371,7 +371,7 @@ std::optional<std::size_t> SceneHierarchyPanel::Draw(const EditorWorkspaceRect& 
     const SceneHierarchySnapshot& snapshot, std::optional<std::size_t> selectedObject,
     const void* sceneIdentity, const std::string& error,
     const HierarchyDragIdentity& dragIdentity, bool allowReorder, bool allowCreation, std::span<const std::size_t> selectedObjects,
-    const DropValidator& validateDrop)
+    const DropValidator& validateDrop, const std::function<EditorIcon(std::string_view)>& iconForObject)
 {
     ObserveSelection(snapshot, selectedObject, dragIdentity.sessionEpoch, sceneIdentity);
     m_focused = false;
@@ -508,6 +508,11 @@ std::optional<std::size_t> SceneHierarchyPanel::Draw(const EditorWorkspaceRect& 
             ImGui::EndPopup();
         }
 
+        const auto& style = ImGui::GetStyle();
+        const auto& background = style.Colors[ImGuiCol_WindowBg];
+        const float luminance = background.x * 0.2126f + background.y * 0.7152f + background.z * 0.0722f;
+        const float stripeTone = luminance > 0.5f ? 0.0f : 1.0f;
+        const ImU32 stripeColor = ImGui::GetColorU32(ImVec4(stripeTone, stripeTone, stripeTone, 0.09f));
         ImGuiListClipper clipper;
         clipper.Begin(static_cast<int>(m_rows.size()), ImGui::GetFrameHeightWithSpacing());
 
@@ -561,6 +566,18 @@ std::optional<std::size_t> SceneHierarchyPanel::Draw(const EditorWorkspaceRect& 
                 const float arrowWidth = ImGui::GetFrameHeight();
                 const bool selected = entry.runtimeIndex && (entry.runtimeIndex == selectedObject ||
                     std::find(selectedObjects.begin(), selectedObjects.end(), *entry.runtimeIndex) != selectedObjects.end());
+
+                // m_rows is the flattened expanded tree: collapsed children consume no
+                // indices, and clipper skips do not reset parity. Draw beneath all widgets.
+                if((index & 1) != 0 && !selected)
+                {
+                    const ImVec2 minimum(rowPosition.x - style.ItemSpacing.x * 0.5f,
+                        rowPosition.y - style.ItemSpacing.y * 0.5f);
+                    const ImVec2 maximum(rowPosition.x + ImGui::GetContentRegionAvail().x + style.ItemSpacing.x * 0.5f,
+                        minimum.y + ImGui::GetFrameHeightWithSpacing());
+                    ImGui::GetWindowDrawList()->AddRectFilled(minimum, maximum, stripeColor);
+                }
+
                 ImGui::BeginDisabled(!entry.runtimeIndex);
 
                 if(entry.objectID == m_renameObjectID && IsRenaming())
@@ -638,9 +655,20 @@ std::optional<std::size_t> SceneHierarchyPanel::Draw(const EditorWorkspaceRect& 
                         }
                     }
 
-                    const float iconSize = ImGui::GetFontSize() * 0.65f;
-                    DrawObjectIcon(*draw, ImVec2(rowPosition.x + indent + arrowWidth, rowPosition.y + 3), iconSize);
-                    draw->AddText(ImVec2(rowPosition.x + indent + arrowWidth + iconSize + 8, rowPosition.y), color,
+                    const float iconSize = ImGui::GetFontSize();
+                    const ImVec2 iconOrigin(rowPosition.x + indent + arrowWidth,
+                        rowPosition.y + (ImGui::GetFrameHeight() - iconSize) * 0.5f);
+                    if(m_icons)
+                    {
+                        m_icons->Draw(*draw, iconForObject ? iconForObject(entry.objectID) : EditorIcon::Box,
+                            iconOrigin, ImVec2(iconSize, iconSize), color);
+                    }
+                    else
+                    {
+                        DrawObjectIcon(*draw, iconOrigin, iconSize);
+                    }
+
+                    draw->AddText(ImVec2(rowPosition.x + indent + arrowWidth + iconSize + ImGui::GetStyle().ItemInnerSpacing.x, rowPosition.y), color,
                         entry.name.empty() ? "(Unnamed Object)" : entry.name.c_str());
                 }
 

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "EditorWorkspace.h"
+#include "EditorIcons.h"
 #include "HierarchyTreePlanning.h"
 #include <functional>
 #include <span>
@@ -12,6 +13,10 @@
 class SceneHierarchyPanel
 {
 public:
+    void SetIcons(const EditorIcons& icons)
+    {
+        m_icons = &icons;
+    }
     std::optional<ScenePrimitive> TakePrimitiveRequest();
 
     // True once after the top-level "Empty Object" menu entry was chosen.
@@ -42,9 +47,11 @@ public:
     std::optional<std::size_t> Draw(const EditorWorkspaceRect& rectangle,
         const SceneHierarchySnapshot& snapshot, std::optional<std::size_t> selectedObject,
         const void* sceneIdentity, const std::string& error,
-        const HierarchyDragIdentity& dragIdentity, bool allowReorder, bool allowCreation = false, std::span<const std::size_t> selectedObjects = {}, const DropValidator& validateDrop = {});
+        const HierarchyDragIdentity& dragIdentity, bool allowReorder, bool allowCreation = false, std::span<const std::size_t> selectedObjects = {}, const DropValidator& validateDrop = {},
+        const std::function<EditorIcon(std::string_view)>& iconForObject = {});
 
 private:
+    const EditorIcons* m_icons = nullptr;
     void DrawRenameInput();
     void DrawDropInteraction(const SceneHierarchyEntry* entry, const HierarchyDragIdentity& identity,
         const DropValidator& validateDrop);

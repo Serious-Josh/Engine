@@ -14,6 +14,7 @@
 #include "SceneHierarchyPanel.h"
 #include "ViewportGridSnap.h"
 #include "EditorPreferences.h"
+#include "ViewportIcons.h"
 #include "Scene/FileSceneAssetCatalog.h"
 #include "Project/ProjectContext.h"
 
@@ -644,6 +645,17 @@ private:
     bool m_showCameraFrusta = true;
     // Session-only display preference like Camera Frusta; never authored or persisted.
     bool m_showLightWireframes = true;
+    bool m_showLightIcons = true;
+    bool m_showCameraIcons = true;
+    std::vector<ViewportIcons::Icon> m_viewportIcons;
+    ImDrawListSplitter m_viewportIconLayers;
+    const Scene* m_viewportIconScene = nullptr;
+    std::uint64_t m_viewportIconRuntime = 0;
+    std::uint64_t m_viewportIconRevision = 0;
+    int m_viewportIconFrame = -1;
+    void BuildViewportIcons(const IDemoScene& scene, const EditorIcons& icons);
+    std::optional<size_t> PickViewportIcon(const IDemoScene& scene, ImVec2 mouse) const;
+    void DrawViewportTools(IDemoScene& scene, const EditorIcons& icons, bool viewportWasFocused);
     // Display preference, independent of Snap; default visible. Persisted in Editor preferences.
     bool m_showViewportGrid = true;
     // UPSCALING.3B Resolution Info overlay: session-only, hidden by default, never persisted.
@@ -1011,6 +1023,8 @@ private:
     void ClearSceneHistory();
 
     bool m_gizmoWasUsing = false;
+    // ImGuizmo retains hover geometry even when no enabled gizmo was drawn this frame.
+    bool m_viewportGizmoInteractive = false;
 
     size_t m_gizmoUndoObject = InvalidObjectSelection;
 

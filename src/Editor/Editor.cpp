@@ -41,6 +41,7 @@
 #include <exception>
 #include <limits>
 #include <utility>
+#include <unordered_map>
 
 namespace
 {
@@ -490,6 +491,8 @@ void Editor::DrawSceneViewportToolbar(const EditorWorkspaceRect& toolbarRectangl
             ImGui::Checkbox("Physics Colliders", &m_showPhysicsColliders);
             ImGui::Checkbox("Camera Frusta", &m_showCameraFrusta);
             ImGui::Checkbox("Light Wireframes", &m_showLightWireframes);
+            ImGui::Checkbox("Camera Icons", &m_showCameraIcons);
+            ImGui::Checkbox("Light Icons", &m_showLightIcons);
             ImGui::Checkbox("Grid", &m_showViewportGrid);
             ImGui::Checkbox("Resolution Info", &m_showResolutionInfo);
             ImGui::EndCombo();
@@ -1077,6 +1080,19 @@ void Editor::DrawHierarchy(IDemoScene& demoScene, const std::string& activeScene
         fileScene ? fileScene->m_runtime->GetHierarchyRevision() : 0};
 
     ImGui::BeginDisabled(blocked);
+    std::unordered_map<std::string_view, EditorIcon> objectIcons;
+
+    if(fileScene && fileScene->m_runtime->GetFileScene().HasDocument())
+    {
+        const auto& objects = fileScene->m_runtime->GetFileScene().GetDocument().objects;
+        objectIcons.reserve(objects.size());
+
+        for(const auto& object : objects)
+        {
+            objectIcons.emplace(object.id, SceneObjectIcon(object.camera.has_value(), object.light ? &*object.light : nullptr));
+        }
+    }
+
     const auto clicked = m_hierarchyPanel.Draw(m_workspace.GetHierarchy(), snapshot, selected, &scene, error,
         dragIdentity, allowReorder,
         !IsPhysicsEditingLocked() && !blocked && fileScene && !fileScene->IsArchiveActivation() &&
@@ -1086,6 +1102,10 @@ void Editor::DrawHierarchy(IDemoScene& demoScene, const std::string& activeScene
         {
             SceneHierarchyEdit preview;
             return PrepareHierarchyDrop(demoScene, request, preview, reason);
+        }, [&](std::string_view id)
+        {
+            const auto found = objectIcons.find(id);
+            return found == objectIcons.end() ? EditorIcon::Box : found->second;
         });
     ImGui::EndDisabled();
 
@@ -1350,6 +1370,8 @@ void Editor::Draw(
     const std::optional<MaterialPreviewImage>& materialPreview)
 {
 
+    m_hierarchyPanel.SetIcons(debugUI.GetEditorIcons());
+    m_assetBrowser.SetIcons(debugUI.GetEditorIcons());
     Scene& scene = demoScene.GetScene();
     const std::string activeSceneName(sceneManager.GetActiveSceneName());
     const auto* dragScene = dynamic_cast<const FileBackedDemoScene*>(&demoScene);
@@ -1702,8 +1724,7 @@ void Editor::Draw(
 
     UpdateCameraLook(demoScene, m_viewportImage.size.x, m_viewportImage.size.y);
     UpdateCameraMovement(demoScene, deltaTime);
-    DrawTransformGizmo(demoScene, m_viewportImage.size.x, m_viewportImage.size.y);
-    HandleViewportSelection(demoScene, m_viewportImage.size.x, m_viewportImage.size.y, viewportWasFocused);
+    DrawViewportTools(demoScene, debugUI.GetEditorIcons(), viewportWasFocused);
     DrawSceneObjectDeletionControls(demoScene);
     UpdateCharacterDriveInput(demoScene);
 }
@@ -2155,6 +2176,8 @@ void Editor::DrawTransformGizmo(
     float viewportWidth,
     float viewportHeight)
 {
+    m_viewportGizmoInteractive = false;
+
     if (m_selectedObject == InvalidObjectSelection || viewportWidth <= 0.0f || viewportHeight <= 0.0f)
     {
         return;
@@ -2228,7 +2251,9 @@ void Editor::DrawTransformGizmo(
         !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId) && !m_cameraLooking && !m_panLeftHeld &&
         !ImGui::GetIO().MouseDown[ImGuiMouseButton_Right] &&
         !ImGui::GetDragDropPayload();
-    ImGuizmo::Enable(allowGizmo && !m_workspace.IsSplitterDragging() && (m_viewportHovered || ImGuizmo::IsUsing()));
+    m_viewportGizmoInteractive = allowGizmo && !m_workspace.IsSplitterDragging() &&
+        (m_viewportHovered || ImGuizmo::IsUsing());
+    ImGuizmo::Enable(m_viewportGizmoInteractive);
 
     ImGuizmo::OPERATION operation = ImGuizmo::TRANSLATE;
 
@@ -2399,7 +2424,7 @@ void Editor::HandleViewportSelection(
         return;
     }
 
-    if (m_selectedObject != InvalidObjectSelection && ImGuizmo::IsOver())
+    if (m_viewportGizmoInteractive && m_selectedObject != InvalidObjectSelection && ImGuizmo::IsOver())
     {
         return;
     }
@@ -2419,7 +2444,8 @@ void Editor::HandleViewportSelection(
         return;
     }
 
-    const auto picked = PickObject(demoScene, mouse.x, mouse.y, viewportWidth, viewportHeight);
+    const auto icon = PickViewportIcon(demoScene, io.MousePos);
+    const auto picked = icon ? *icon : PickObject(demoScene, mouse.x, mouse.y, viewportWidth, viewportHeight);
     if(picked != InvalidObjectSelection)
     {
         const bool toggleSelectionMembership = io.KeyShift || io.KeyCtrl;
