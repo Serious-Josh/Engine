@@ -367,6 +367,9 @@ bool RayTracingPipeline::Initialize(
         return false;
     }
 
+    const std::wstring debugName = description.shaderPath.wstring() + L":" + description.rayGenerationShader;
+    m_stateObject->SetName(debugName.c_str());
+
     ID3D12StateObjectProperties* stateObjectProperties = nullptr;
 
     result = m_stateObject->QueryInterface(IID_PPV_ARGS(&stateObjectProperties));

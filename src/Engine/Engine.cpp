@@ -2234,6 +2234,9 @@ void Engine::Frame()
     }
 
     const PathTraceReferenceStatus& pathTraceStatus = m_renderer.GetPathTraceReferenceStatus();
+    debugUI.SetSecondaryShadowVisibilityStatus(pathTraceStatus.secondaryShadowRayQueryReady,
+        pathTraceStatus.secondaryShadowRayQueryActive,
+        pathTraceStatus.visibilityTimingEpoch + m_renderer.GetShaderLibrary().GetLibraryCompileCount());
     debugUI.SetPathTraceReferenceStatus(pathTraceStatus.availability, pathTraceStatus.unavailableReason,
         pathTraceStatus.activeLastFrame, pathTraceStatus.accumulatedSamples, pathTraceStatus.resourceBytes);
     const PathTraceRasterPrimaryStatus& rasterPrimaryStatus = m_renderer.GetPathTraceRasterPrimaryStatus();

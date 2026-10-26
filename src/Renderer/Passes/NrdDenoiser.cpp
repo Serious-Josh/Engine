@@ -10,6 +10,7 @@
 #include <NRDIntegration.hpp>
 
 #include <cstring>
+#include <limits>
 #include <string>
 
 namespace
@@ -65,6 +66,11 @@ namespace
     }
 }
 
+NrdDenoiser::~NrdDenoiser()
+{
+    Shutdown();
+}
+
 bool NrdDenoiser::Initialize(
     ID3D12Device* device,
     ID3D12CommandQueue* graphicsQueue,
@@ -73,27 +79,44 @@ bool NrdDenoiser::Initialize(
     uint32_t height,
     const Description& description)
 {
-    if (!device ||
+    if (m_device ||
+        !device ||
         !graphicsQueue ||
         width == 0 ||
-        height == 0)
+        height == 0 ||
+        width > (std::numeric_limits<uint16_t>::max)() ||
+        height > (std::numeric_limits<uint16_t>::max)())
     {
         return false;
     }
 
     if (description.queuedFrameCount == 0 ||
+        description.queuedFrameCount > (std::numeric_limits<uint8_t>::max)() ||
         description.denoisers.empty() ||
         description.denoisers.size() > MaximumDenoisers)
     {
         return false;
     }
 
-    for (const DenoiserDescription& denoiser : description.denoisers)
+    for(size_t index = 0; index < description.denoisers.size(); ++index)
     {
+        const DenoiserDescription& denoiser = description.denoisers[index];
+
         if (!IsSupportedDenoiser(denoiser.denoiser))
         {
             Log::Error("NRD instance '" + description.name + "' requests an unsupported denoiser.");
             return false;
+        }
+
+        // Reject before entering SDK creation: the native Integration failure cleanup is not safe for an
+        // instance rejected for non-unique identifiers. No resources or existing owner have changed here.
+        for(size_t previousIndex = 0; previousIndex < index; ++previousIndex)
+        {
+            if(description.denoisers[previousIndex].identifier == denoiser.identifier)
+            {
+                Log::Error("NRD instance '" + description.name + "' requests non-unique denoiser identifiers.");
+                return false;
+            }
         }
     }
 
@@ -159,12 +182,16 @@ bool NrdDenoiser::Recreate(
     if (!m_device ||
         !m_graphicsQueue ||
         width == 0 ||
-        height == 0)
+        height == 0 ||
+        width > (std::numeric_limits<uint16_t>::max)() ||
+        height > (std::numeric_limits<uint16_t>::max)())
     {
         return false;
     }
 
-    // Callers have drained the GPU (resize), or nothing has used the outputs yet (initialization).
+    // Destroy drains submitted work before its external outputs are released. Callers must also discard any
+    // unsubmitted recording that referenced the old instance. The following SDK Recreate starts from empty state.
+    m_integration.Destroy();
     ReleaseOutputs();
     m_width = 0;
     m_height = 0;
@@ -213,6 +240,7 @@ bool NrdDenoiser::Recreate(
     {
         Log::Error("Failed to recreate NRD instance '" + m_description.name + "'. nrd::Result: " +
                    std::to_string(static_cast<uint32_t>(result)));
+        Shutdown();
         return false;
     }
 
@@ -225,6 +253,7 @@ bool NrdDenoiser::Recreate(
             !CreateOutput(m_device, descriptorHeap, denoiser.specularOutput, width, height))
         {
             Log::Error("Failed to create the specular output of NRD instance '" + m_description.name + "'.");
+            Shutdown();
             return false;
         }
 
@@ -232,6 +261,7 @@ bool NrdDenoiser::Recreate(
             !CreateOutput(m_device, descriptorHeap, denoiser.diffuseOutput, width, height))
         {
             Log::Error("Failed to create the diffuse output of NRD instance '" + m_description.name + "'.");
+            Shutdown();
             return false;
         }
     }
@@ -325,7 +355,7 @@ void NrdDenoiser::NewFrame()
     m_integration.NewFrame();
 }
 
-void NrdDenoiser::Denoise(
+bool NrdDenoiser::Denoise(
     ID3D12GraphicsCommandList* commandList,
     nrd::Identifier identifier,
     const Inputs& inputs)
@@ -334,7 +364,7 @@ void NrdDenoiser::Denoise(
 
     if (!commandList || !denoiser || !inputs.motion || !inputs.normalRoughness || !inputs.viewZ)
     {
-        return;
+        return false;
     }
 
     const bool diffuse = HasDiffuseSignal(denoiser->description.denoiser);
@@ -342,7 +372,7 @@ void NrdDenoiser::Denoise(
 
     if ((diffuse && !inputs.diffuseRadianceHitDistance) || (specular && !inputs.specularRadianceHitDistance))
     {
-        return;
+        return false;
     }
 
     if (specular)
@@ -419,6 +449,7 @@ void NrdDenoiser::Denoise(
 
     // NRD binds its own descriptor heap and root signature; the caller restores Engine's heap afterwards.
     m_integration.DenoiseD3D12(&identifier, 1, commandBuffer, snapshot);
+    return true;
 }
 
 NrdDenoiser::Denoiser* NrdDenoiser::FindDenoiser(nrd::Identifier identifier)

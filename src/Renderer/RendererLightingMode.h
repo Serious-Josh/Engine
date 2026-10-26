@@ -49,12 +49,16 @@ struct PathTraceReferenceSettings
     // Accumulation stops once this many samples per pixel are reached; the image is then held.
     std::uint32_t maxAccumulatedSamples = 1u << 16;
 
+    // Runtime-only selection: RayQuery by default; TraceRay retained for diagnostic comparison.
+    bool secondaryShadowRayQuery = true;
+
     bool operator==(const PathTraceReferenceSettings&) const = default;
 };
 
 // NRD.2: the denoiser of the raster-primary path-traced modes. Off presents the progressive mean; Engine is the RTXPT
-// D.2/D.3 temporal and spatial denoiser. The NRD modes are reserved for later milestones: no Editor control offers them
-// and the renderer presents them as Engine (Renderer::ApplyPathTraceDenoiser).
+// D.2/D.3 temporal and spatial denoiser. NrdReblur (NRD.4B) and NrdRelax (NRD.RELAX.4) are standalone NRD denoisers;
+// NrdHybrid (HYBRID.5) is RELAX diffuse plus REBLUR specular from one NRD instance. All three are experimental. The values
+// are stable.
 enum class PathTraceDenoiserMode
 {
     Off,

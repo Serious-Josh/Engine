@@ -145,7 +145,7 @@ struct RendererOptions
     // SHARC.4E.1: the path-tracing denoiser (RTXPT D.1B signal extraction, D.2B temporal reconstruction, D.3B spatial
     // filtering) on Path Traced Raster Primary frames (with ReSTIR DI too since SHARC.5B), with or without SHARC. The denoised result is presented in place
     // of the progressive mean; the accumulation itself is unchanged. Off here; the Editor selects Engine by default.
-    // NRD.2: a mode; only Off and Engine are implemented (PathTraceDenoiserMode).
+    // NRD.2: a mode (PathTraceDenoiserMode); every value is implemented since HYBRID.5.
     PathTraceDenoiserMode pathTraceDenoiserMode = PathTraceDenoiserMode::Off;
     // DENOISE.1 diagnostics: which denoiser stages run (defaults: the production pipeline). Applied when it changes.
     PathTraceDenoiserStages pathTraceDenoiserStages;
@@ -214,6 +214,9 @@ struct PathTraceReferenceStatus
 
     // True when the most recent recorded frame rendered with the reference mode.
     bool activeLastFrame = false;
+    bool secondaryShadowRayQueryReady = false;
+    bool secondaryShadowRayQueryActive = false;
+    std::uint64_t visibilityTimingEpoch = 0;
     std::uint32_t accumulatedSamples = 0;
     std::uint64_t accumulationResets = 0;
     std::uint64_t resourceBytes = 0;
@@ -1371,6 +1374,11 @@ class Renderer
     // while m_nrdPathTraceDiagnostic is set: created on its first extraction frame, released when it is cleared
     // (after a GPU wait), on resize and at shutdown.
     NrdPathTracePreparePass m_nrdPathTracePreparePass;
+    // NRD.RELAX.2 RELAX signal preparation and bypass reconstruction (diagnostics only; RELAX is never dispatched). Its
+    // pipelines and textures, and the extraction's raw diffuse hit distance, exist only while m_nrdRelaxPrepareDiagnostic
+    // is set: created on its first extraction frame, released when it is cleared (after a GPU wait), on resize and at
+    // shutdown. Separate from REBLUR's instance, whose textures and history it never touches.
+    NrdPathTracePreparePass m_nrdRelaxPreparePass;
     PathTraceReferenceStatus m_pathTraceStatus;
 
     // RTXPT.2 R4 previous-frame G-buffer, PT modes only (D4). Allocated on the first frame that renders
@@ -1490,10 +1498,8 @@ class Renderer
     // unchanged. NRD.4B: REBLUR keeps the Engine stage flags (its fallback); RELAX and Hybrid are presented as Engine.
     void ApplyPathTraceDenoiser(PathTraceDenoiserMode requested, bool rasterPrimary);
     bool m_pathTraceDenoiserOption = false;
-    // NRD.2: the mode this frame denoises with (Off outside the raster-primary modes), and the requested NRD mode that
-    // was presented as Engine instead (Off when none). Neither changes any rendering.
+    // NRD.2: the mode this frame denoises with (Off outside the raster-primary modes).
     PathTraceDenoiserMode m_pathTraceDenoiserMode = PathTraceDenoiserMode::Off;
-    PathTraceDenoiserMode m_pathTraceDenoiserUnavailableMode = PathTraceDenoiserMode::Off;
 
     // UPSCALING.2B camera jitter (RendererOptions::pathTraceCameraJitter). Applies only to raster-primary path-traced
     // frames. The phase advances once per jittered recording and wraps; switching the option, a scene resize and
@@ -1510,8 +1516,10 @@ class Renderer
     std::optional<std::array<float, 2>> m_cameraJitterForTesting;
 
     void UpdateSharcStatus(unsigned int frameSlot);
-    // The query-side library the frame's settings select (Query, QueryTermination or Render).
-    PathTraceRadianceCacheLibrary RadianceCacheQueryLibrary(bool extract, bool splitReSTIRDI) const;
+    // The query-side library the frame's settings select (Query, QueryTermination or Render). NRD.RELAX.2B:
+    // rawDiffuseHitDistance selects the render library's raw-distance build for an extraction frame.
+    PathTraceRadianceCacheLibrary RadianceCacheQueryLibrary(bool extract, bool splitReSTIRDI,
+        bool rawDiffuseHitDistance = false) const;
     SharcSettings m_sharcSettings;
     SharcStatus m_sharcStatus;
     // Diagnostics only (SHARC.5B): the render library's queryMode in place of 1 (2: the cached part zeroed, 3: also the
@@ -1529,7 +1537,7 @@ class Renderer
     D3D12_GPU_VIRTUAL_ADDRESS m_sharcHistoryPriorBinding = 0;
     // SHARC.4D-R (diagnostics): the query library's binding for the frame (0: render with the reference library).
     D3D12_GPU_VIRTUAL_ADDRESS PrepareRadianceCacheQuery(ID3D12GraphicsCommandList* commandList, bool extract,
-        bool splitReSTIRDI);
+        bool splitReSTIRDI, bool rawDiffuseHitDistance = false);
     // The learning library of the frame PrepareRadianceCacheLearning prepared.
     PathTraceRadianceCacheLibrary m_radianceCacheLearningLibrary = PathTraceRadianceCacheLibrary::Inline;
     // Diagnostics (SHARC.4D-Q): the library deferred frames learn with. Inline stores records from the inline library
@@ -1561,6 +1569,17 @@ class Renderer
     bool m_nrdPathTraceDiagnostic = false;
     // Whether the last recorded path-tracing frame ran it.
     bool m_nrdPathTraceDiagnosticRanLastFrame = false;
+    // NRD.RELAX.2: requested by diagnostics only, like m_nrdPathTraceDiagnostic. Each extraction frame then also writes the
+    // raw diffuse hit distance and prepares RELAX's inputs from it and the raw extraction, with their bypass
+    // reconstruction. Reads the frame's signals and writes only its own textures: the image and REBLUR are unchanged.
+    bool m_nrdRelaxPrepareDiagnostic = false;
+    // Whether the last recorded path-tracing frame wrote the raw diffuse hit distance (NRD.RELAX.2B: through a
+    // raw-distance extraction pipeline, PathTraceReferencePass::WroteRawDiffuseHitDistance), and ran the RELAX
+    // preparation.
+    bool m_pathTraceRawDiffuseHitDistanceLastFrame = false;
+    // NRD.RELAX.4: the last reported raw-distance extraction failure (logged once per distinct reason).
+    std::string m_rawDiffuseHitDistanceFailure;
+    bool m_nrdRelaxPrepareDiagnosticRanLastFrame = false;
     // NRD.4A: the diagnostic's fixed radiance scale (NrdPathTracePrepareConstants::radianceScale). Diagnostics only; a
     // denoiser history would need a restart whenever it changed.
     float m_nrdPathTraceRadianceScale = 64.0f;
@@ -1674,6 +1693,113 @@ class Renderer
     bool m_nrdPathTraceValidation = false;
     Texture m_nrdPathTraceValidationTexture;
 
+    // NRD.RELAX.3: requested by diagnostics only (never by default, a setting or the Editor). Each extraction frame that
+    // wrote the raw diffuse hit distance then also dispatches RELAX_DIFFUSE_SPECULAR on the RELAX preparation and
+    // resolves its output into m_nrdRelaxResolvedTexture. Nothing of it is presented: the image, REBLUR and the Engine
+    // denoiser are unchanged. The instance exists only while requested (created on its first frame, released with a GPU
+    // wait when cleared, on resize and at shutdown) and shares nothing with REBLUR's.
+    // HYBRID.3 private opt-in, non-presenting diagnostic. HYBRID.5: PathTraceDenoiserMode::NrdHybrid presents the same
+    // instance and preparation (owned while either is requested); the diagnostic never runs as well as the selected mode.
+    bool m_nrdHybridDispatchDiagnostic = false;
+    NrdDenoiser m_nrdHybridDenoiser;
+    // A creation failure is sticky until the request is cleared, a mode change, a resize or shutdown.
+    bool m_nrdHybridCreationFailed = false;
+    std::uint64_t m_nrdHybridCreations = 0;
+    // Submitted hybrid frames since startup.
+    std::uint64_t m_nrdHybridSubmittedDispatches = 0;
+    // HYBRID.5: whether the last recorded frame presented the hybrid's output (PathTraceDenoiserMode::NrdHybrid).
+    bool m_nrdHybridPresentedLastFrame = false;
+    // The reason the hybrid last could not run (empty while it can); logged once per distinct reason.
+    std::string m_nrdHybridFailure;
+    // History, as REBLUR's (m_nrdPathTraceHistoryValid): valid until a reset source clears it; the instance is new after
+    // creation (CLEAR_AND_RESTART). Previous camera and jitter are those of the last submitted hybrid frame; the pending
+    // values are committed with the frame's submission and dropped with an abandoned one.
+    bool m_nrdHybridHistoryValid = false;
+    bool m_nrdHybridInstanceNew = false;
+    bool m_nrdHybridDispatchedThisFrame = false;
+    bool m_nrdHybridExecutedLastFrame = false;
+    std::optional<PathTraceTemporalKey> m_nrdHybridKey;
+    Matrix4 m_nrdHybridPreviousView{};
+    Matrix4 m_nrdHybridPreviousProjection{};
+    float m_nrdHybridPreviousJitter[2] = {0.0f, 0.0f};
+    Matrix4 m_nrdHybridPendingView{};
+    Matrix4 m_nrdHybridPendingProjection{};
+    float m_nrdHybridPendingJitter[2] = {0.0f, 0.0f};
+    std::uint32_t m_nrdHybridFrameIndex = 0;
+    nrd::AccumulationMode m_nrdHybridAccumulationMode = nrd::AccumulationMode::CLEAR_AND_RESTART;
+    // Diagnostics only: the next creation fails as if the SDK had rejected it (the creation-failure path).
+    bool m_nrdHybridFailCreationForTesting = false;
+    // A diagnostic gap without destroying the owner; never a production setting.
+    bool m_nrdHybridSkipFrame = false;
+    bool m_nrdHybridFailSpecularForTesting = false;
+    NrdPathTracePreparePass m_nrdHybridPreparePass;
+
+    bool EnsureNrdHybridDenoiser();
+    void ReleaseNrdHybridDenoiser();
+    void ReportNrdHybridUnavailable(const std::string& reason);
+    // As RELAX's (NRD.RELAX.4): Begin does everything fallible before anything is recorded; Record records preparation,
+    // both filters and, with presentation, the production resolve. Only a complete pair resolves or commits.
+    bool BeginNrdHybridFrame(
+        PathTracePrimary primary,
+        const Matrix4& view,
+        const Matrix4& cameraProjection,
+        const FrameLighting& frameLighting,
+        const PathTraceReferenceSettings& settings);
+    bool RecordNrdHybrid(
+        ID3D12GraphicsCommandList* commandList,
+        unsigned int frameIndex,
+        const Matrix4& view,
+        const Matrix4& inverseViewProjection,
+        const Vector3& cameraPosition,
+        Texture* presentation);
+    bool RecordNrdHybridDiagnostic(
+        ID3D12GraphicsCommandList* commandList,
+        unsigned int frameIndex,
+        PathTracePrimary primary,
+        const Matrix4& view,
+        const Matrix4& cameraProjection,
+        const Matrix4& inverseViewProjection,
+        const Vector3& cameraPosition,
+        const FrameLighting& frameLighting,
+        const PathTraceReferenceSettings& settings);
+
+    bool m_nrdRelaxDispatchDiagnostic = false;
+    NrdDenoiser m_nrdRelaxDenoiser;
+    // RGBA16F at the scene extent: remodulated RELAX radiance on surface pixels (alpha 1), zero elsewhere.
+    Texture m_nrdRelaxResolvedTexture;
+    // A creation failure is sticky until the request is cleared, a resize or shutdown.
+    bool m_nrdRelaxCreationFailed = false;
+    std::uint64_t m_nrdRelaxCreations = 0;
+    // Submitted RELAX frames since startup.
+    std::uint64_t m_nrdRelaxSubmittedDispatches = 0;
+    // The reason RELAX last could not run (empty while it can); logged once per distinct reason.
+    std::string m_nrdRelaxFailure;
+    // History, as REBLUR's (m_nrdPathTraceHistoryValid): valid until a reset source clears it; the instance is new after
+    // creation (CLEAR_AND_RESTART). Previous camera and jitter are those of the last submitted RELAX frame; the pending
+    // values are committed with the frame's submission and dropped with an abandoned one.
+    bool m_nrdRelaxHistoryValid = false;
+    bool m_nrdRelaxInstanceNew = false;
+    bool m_nrdRelaxDispatchedThisFrame = false;
+    bool m_nrdRelaxExecutedLastFrame = false;
+    std::optional<PathTraceTemporalKey> m_nrdRelaxKey;
+    Matrix4 m_nrdRelaxPreviousView{};
+    Matrix4 m_nrdRelaxPreviousProjection{};
+    float m_nrdRelaxPreviousJitter[2] = {0.0f, 0.0f};
+    Matrix4 m_nrdRelaxPendingView{};
+    Matrix4 m_nrdRelaxPendingProjection{};
+    float m_nrdRelaxPendingJitter[2] = {0.0f, 0.0f};
+    std::uint32_t m_nrdRelaxFrameIndex = 0;
+    nrd::AccumulationMode m_nrdRelaxAccumulationMode = nrd::AccumulationMode::CLEAR_AND_RESTART;
+    // Diagnostics only: the next creation fails as if the SDK had rejected it (the creation-failure path).
+    bool m_nrdRelaxFailCreationForTesting = false;
+    // NRD.RELAX.4: whether the last recorded frame presented RELAX's output (PathTraceDenoiserMode::NrdRelax).
+    bool m_nrdRelaxPresentedLastFrame = false;
+    // NRD.RELAX.4 diagnostics, unset in production: RELAX settings used in place of PathTraceRelaxSettings (the caller
+    // restarts history when it changes them).
+    std::optional<nrd::RelaxSettings> m_nrdRelaxSettingsOverride;
+    // NRD.RELAX.4 diagnostics: create the RELAX instance with fp32 internal textures (takes effect at its next creation).
+    bool m_nrdRelaxPromoteFloat16To32 = false;
+
     // The production REBLUR settings (diagnostics compare overrides against them).
     static nrd::ReblurSettings PathTraceNrdProductionSettings();
     bool EnsurePathTraceNrdDenoiser();
@@ -1776,6 +1902,50 @@ class Renderer
         const Vector3& cameraPosition);
     // NRD.3: waits for the GPU, then releases the diagnostic's textures when they exist.
     void ReleaseNrdPathTraceDiagnostic();
+    // NRD.RELAX.2: records the RELAX preparation and bypass reconstruction after an extraction frame that wrote the raw
+    // diffuse hit distance, with RecordNrdPathTraceDiagnostic's camera. False when it could not run.
+    bool RecordNrdRelaxPrepareDiagnostic(
+        ID3D12GraphicsCommandList* commandList,
+        const Matrix4& view,
+        const Matrix4& inverseViewProjection,
+        const Vector3& cameraPosition);
+    // NRD.RELAX.2: waits for the GPU, then releases the RELAX preparation and the raw diffuse hit distance when they exist.
+    void ReleaseNrdRelaxPrepareDiagnostic();
+    // NRD.RELAX.3 diagnostic RELAX dispatch. Ensure creates the instance on first use; Release waits for the GPU, then
+    // releases it, its resolved texture and its history. Record does everything fallible first (instance, inputs,
+    // settings) and records nothing when any of it fails; only a recorded dispatch is committed at submission.
+    bool EnsureNrdRelaxDenoiser();
+    void ReleaseNrdRelaxDenoiser();
+    // Waits for the GPU, then releases the diagnostic resolved texture alone (the selected RELAX keeps its instance).
+    void ReleaseNrdRelaxDiagnosticTexture();
+    void ReportNrdRelaxUnavailable(const std::string& reason);
+    // NRD.RELAX.4 (PathTraceDenoiserMode::NrdRelax, and the RELAX.3 diagnostic): Begin does everything fallible before
+    // recording (instance, inputs, settings); false means this frame falls back. Record records preparation, RELAX and
+    // the resolves: into presentation's surface pixels when given, and into the diagnostic texture while the dispatch
+    // diagnostic is requested. Only a recorded dispatch is committed at submission.
+    bool BeginNrdRelaxFrame(
+        PathTracePrimary primary,
+        const Matrix4& view,
+        const Matrix4& cameraProjection,
+        const FrameLighting& frameLighting,
+        const PathTraceReferenceSettings& settings);
+    bool RecordNrdRelax(
+        ID3D12GraphicsCommandList* commandList,
+        unsigned int frameIndex,
+        const Matrix4& view,
+        const Matrix4& inverseViewProjection,
+        const Vector3& cameraPosition,
+        Texture* presentation);
+    bool RecordNrdRelaxDispatchDiagnostic(
+        ID3D12GraphicsCommandList* commandList,
+        unsigned int frameIndex,
+        PathTracePrimary primary,
+        const Matrix4& view,
+        const Matrix4& cameraProjection,
+        const Matrix4& inverseViewProjection,
+        const Vector3& cameraPosition,
+        const FrameLighting& frameLighting,
+        const PathTraceReferenceSettings& settings);
     // RTXPT D.3B: records the spatial pass over the temporal outputs the temporal pass recorded this frame.
     void RecordPathTraceSpatial(ID3D12GraphicsCommandList* commandList, const Matrix4& view, const Matrix4& projection,
         const PathTraceDenoiserVisualization& visualization);

@@ -31,21 +31,39 @@ namespace
     }
 }
 
-bool NrdPathTracePreparePass::Initialize(GraphicsDevice& graphicsDevice, ShaderLibrary& shaderLibrary)
+bool NrdPathTracePreparePass::Initialize(GraphicsDevice& graphicsDevice, ShaderLibrary& shaderLibrary, Encoding encoding)
 {
-    if(m_initialized)
+    if(m_initialized || m_initializationFailed)
     {
-        return true;
+        return m_initialized && m_encoding == encoding;
     }
 
-    if(m_initializationFailed)
+    m_encoding = encoding;
+
+    // HYBRID.5: the hybrid has its production resolve, but no bypass resolve.
+    if(encoding == Encoding::Hybrid)
     {
-        return false;
+        m_initialized = CreatePipeline(graphicsDevice, shaderLibrary, "CSPrepareHybrid", m_preparePipeline) &&
+            CreatePipeline(graphicsDevice, shaderLibrary, "CSResolveDenoisedHybrid", m_denoisedResolvePipeline);
+        m_initializationFailed = !m_initialized;
+
+        if(!m_initialized)
+        {
+            Log::Error("The path-traced NRD hybrid preparation pass could not be created.");
+            m_preparePipeline.Shutdown();
+            m_denoisedResolvePipeline.Shutdown();
+        }
+
+        return m_initialized;
     }
 
-    if(!CreatePipeline(graphicsDevice, shaderLibrary, "CSPrepare", m_preparePipeline) ||
-        !CreatePipeline(graphicsDevice, shaderLibrary, "CSResolve", m_resolvePipeline) ||
-        !CreatePipeline(graphicsDevice, shaderLibrary, "CSResolveDenoised", m_denoisedResolvePipeline))
+    const bool relax = encoding == Encoding::Relax;
+
+    // NRD.RELAX.3: RELAX's denoised resolve is the diagnostic CSResolveDenoisedRelax, never a presentation.
+    if(!CreatePipeline(graphicsDevice, shaderLibrary, relax ? "CSPrepareRelax" : "CSPrepare", m_preparePipeline) ||
+        !CreatePipeline(graphicsDevice, shaderLibrary, relax ? "CSResolveRelax" : "CSResolve", m_resolvePipeline) ||
+        !CreatePipeline(graphicsDevice, shaderLibrary, relax ? "CSResolveDenoisedRelax" : "CSResolveDenoised",
+            m_denoisedResolvePipeline))
     {
         Log::Error("The path-traced NRD preparation pass could not be created.");
         m_preparePipeline.Shutdown();
@@ -141,6 +159,7 @@ void NrdPathTracePreparePass::Shutdown()
     m_denoisedResolvePipeline.Shutdown();
     m_initialized = false;
     m_initializationFailed = false;
+    m_encoding = Encoding::Reblur;
 }
 
 void NrdPathTracePreparePass::ExecutePrepare(

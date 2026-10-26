@@ -100,6 +100,15 @@ cbuffer PathTraceConstants : register(b0)
     // RTXPT.3 ReSTIR DI: the raw UAV of the per-sample vertex-0 direct radiance, written by
     // PathTraceReSTIRDISplitDirectRayGeneration and read by PathTraceReSTIRDISplitIndirectRayGeneration.
     uint splitDirectRadianceIndex;
+
+#ifdef PATH_TRACE_RAW_DIFFUSE_HIT_DISTANCE_LIBRARY
+    // NRD.RELAX.2, appended: the raw UAV of the R32F raw primary diffuse hit distance, written only by the extraction ray
+    // generations; PATH_TRACE_NO_RAW_DIFFUSE_HIT_DISTANCE (the default) writes nothing. NRD.RELAX.2B: declared only in the
+    // raw-distance libraries (PathTraceReference*RawDiffuseHitDistance*.hlsl); every other library keeps the original
+    // layout, which the trailing bytes of PathTraceReferenceConstants extend.
+    uint rawDiffuseHitDistanceIndex;
+    uint3 rawDiffuseHitDistancePadding;
+#endif
 };
 
 cbuffer SceneLightConstants : register(b1)
@@ -330,12 +339,26 @@ bool PathTraceVisible(float3 position, float3 geometricNormal, float3 direction,
     ray.TMax = distance >= PATH_TRACE_DISTANT_LIGHT_DISTANCE ? PATH_TRACE_DISTANT_LIGHT_DISTANCE :
         distance * (1.0f - 1.0e-4f);
 
+#if defined(PATH_TRACE_SECONDARY_SHADOW_RAY_QUERY) && !defined(PATH_TRACE_RESTIR_DI_LIBRARY) && !defined(PATH_TRACE_RADIANCE_CACHE_TRAINING)
+    RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> query;
+    query.TraceRayInline(scene, RAY_FLAG_NONE, 0xFF, ray);
+    while(query.Proceed())
+    {
+        if(query.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE)
+        {
+            query.CommitNonOpaqueTriangleHit();
+        }
+    }
+    ++rayCount;
+    return query.CommittedStatus() == COMMITTED_NOTHING;
+#else
     PathTraceVisibilityPayload payload;
     payload.visible = 0u;
     TraceRay(scene, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER, 0xFF, 0, 1,
         PATH_TRACE_MISS_VISIBILITY, ray, payload);
     ++rayCount;
     return payload.visible != 0u;
+#endif
 }
 
 float PathTraceResolveMetallic(GPUMaterial material, float2 uv, bool useARM, float sampledARMMetallic)
@@ -882,6 +905,10 @@ static const float PATH_TRACE_EXTRACTION_HIT_DISTANCE_A = 3.0f;
 static const float PATH_TRACE_EXTRACTION_HIT_DISTANCE_B = 0.1f;
 // NRD_EPS: a taken lobe never normalizes to 0, which means "no data".
 static const float PATH_TRACE_EXTRACTION_MINIMUM_NORMALIZED_DISTANCE = 1.0e-6f;
+#ifdef PATH_TRACE_RAW_DIFFUSE_HIT_DISTANCE_LIBRARY
+// NRD.RELAX.2: rawDiffuseHitDistanceIndex when no raw diffuse hit distance is requested.
+static const uint PATH_TRACE_NO_RAW_DIFFUSE_HIT_DISTANCE = 0xFFFFFFFFu;
+#endif
 
 struct PathTraceExtraction
 {
@@ -1297,6 +1324,12 @@ float3 PathTracePrimaryRadiance(uint primary, uint2 pixel, PathTraceRasterFirstV
 // distance in the specular alpha and (NRD.4A) the primary diffuse hit distance in the diffuse alpha, normalized for
 // REBLUR (PathTraceExtractionNormalizedHitDistance). Pixels without a vertex-0 surface write zero radiance and no hit
 // distance.
+// NRD.RELAX.2: when requested, the same samples' raw diffuse hit distances also go to rawDiffuseHitDistanceIndex, for
+// RELAX: the mean of the diffuse-strategy samples' first continuation lengths (misses as PATH_TRACE_HALF_MAXIMUM), NRD's
+// reference estimator before REBLUR normalization; -1 where no sample took the diffuse strategy or there is no surface.
+// NRD.RELAX.2B: compiled only into the raw-distance libraries (PATH_TRACE_RAW_DIFFUSE_HIT_DISTANCE_LIBRARY). Every other
+// library preprocesses to the pre-RELAX.2 function: the extra loop-carried sum alone changed the driver's rounding of the
+// existing extraction arithmetic (NRDRelax2.md section 10).
 void PathTraceRunRayGeneration(uint primary, bool extract)
 {
     uint2 pixel = DispatchRaysIndex().xy;
@@ -1314,6 +1347,9 @@ void PathTraceRunRayGeneration(uint primary, bool extract)
         uint hitSamples = 0u;
         uint missSamples = 0u;
         float normalizedDiffuseHitDistanceSum = 0.0f;
+#ifdef PATH_TRACE_RAW_DIFFUSE_HIT_DISTANCE_LIBRARY
+        float rawDiffuseHitDistanceSum = 0.0f;
+#endif
         uint diffuseHitDistanceSamples = 0u;
 
         // The raster primary's first vertex is decoded once for all of this pixel's samples.
@@ -1378,6 +1414,9 @@ void PathTraceRunRayGeneration(uint primary, bool extract)
                 {
                     normalizedDiffuseHitDistanceSum += PathTraceExtractionNormalizedHitDistance(
                         extraction.diffuseHitDistance, diffuseNormalization);
+#ifdef PATH_TRACE_RAW_DIFFUSE_HIT_DISTANCE_LIBRARY
+                    rawDiffuseHitDistanceSum += extraction.diffuseHitDistance;
+#endif
                     ++diffuseHitDistanceSamples;
                 }
             }
@@ -1401,6 +1440,9 @@ void PathTraceRunRayGeneration(uint primary, bool extract)
             float3 specularMean = float3(0.0f, 0.0f, 0.0f);
             float hitDistance = PATH_TRACE_EXTRACTION_NO_SPECULAR;
             float diffuseHitDistance = PATH_TRACE_EXTRACTION_NO_DIFFUSE;
+#ifdef PATH_TRACE_RAW_DIFFUSE_HIT_DISTANCE_LIBRARY
+            float rawDiffuseHitDistance = PATH_TRACE_EXTRACTION_NO_DIFFUSE;
+#endif
 
             if(rasterFirstVertex.state > 0)
             {
@@ -1424,8 +1466,19 @@ void PathTraceRunRayGeneration(uint primary, bool extract)
                 if(diffuseHitDistanceSamples > 0u)
                 {
                     diffuseHitDistance = normalizedDiffuseHitDistanceSum / float(diffuseHitDistanceSamples);
+#ifdef PATH_TRACE_RAW_DIFFUSE_HIT_DISTANCE_LIBRARY
+                    rawDiffuseHitDistance = rawDiffuseHitDistanceSum / float(diffuseHitDistanceSamples);
+#endif
                 }
             }
+
+#ifdef PATH_TRACE_RAW_DIFFUSE_HIT_DISTANCE_LIBRARY
+            if(rawDiffuseHitDistanceIndex != PATH_TRACE_NO_RAW_DIFFUSE_HIT_DISTANCE)
+            {
+                RWTexture2D<float> rawDiffuseHitDistanceOutput = ResourceDescriptorHeap[rawDiffuseHitDistanceIndex];
+                rawDiffuseHitDistanceOutput[pixel] = min(rawDiffuseHitDistance, PATH_TRACE_HALF_MAXIMUM);
+            }
+#endif
 
             RWTexture2D<float4> diffuseOutput = ResourceDescriptorHeap[diffuseOutputIndex];
             RWTexture2D<float4> specularOutput = ResourceDescriptorHeap[specularOutputIndex];

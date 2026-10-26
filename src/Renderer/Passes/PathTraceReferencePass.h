@@ -14,6 +14,8 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include <map>
+#include <memory>
 
 class DescriptorHeap;
 class GraphicsDevice;
@@ -48,7 +50,9 @@ const char* PathTraceLibraryVariantName(PathTraceLibraryVariant variant);
 // SHARC.4E (experimental): Render completes eligible vertex-1 paths with cached radiance
 // (PathTraceReferenceRadianceCacheRender*.hlsl); SHARC.4E.1: RenderExtraction is the same library's signal-extraction
 // ray generation, for frames the path-tracing denoiser filters. SHARC.5B: RenderSplitIndirect[Extraction] are the same
-// library's ReSTIR DI indirect-pass exports (normal, and with signal extraction), for ExecuteReSTIRDISplit.
+// library's ReSTIR DI indirect-pass exports (normal, and with signal extraction), for ExecuteReSTIRDISplit. NRD.RELAX.2B:
+// the *RawDiffuseHitDistance entries are those two extraction exports from the render library's raw-distance build
+// (PathTraceReferenceRadianceCacheRenderRawDiffuseHitDistance*.hlsl), for frames that also write the raw diffuse hit distance.
 enum class PathTraceRadianceCacheLibrary
 {
     Inline,
@@ -61,6 +65,8 @@ enum class PathTraceRadianceCacheLibrary
     RenderExtraction,
     RenderSplitIndirect,
     RenderSplitIndirectExtraction,
+    RenderExtractionRawDiffuseHitDistance,
+    RenderSplitIndirectExtractionRawDiffuseHitDistance,
     Count
 };
 
@@ -173,6 +179,9 @@ class PathTraceReferencePass
     // Records nothing unless the primary's pipeline exists (Initialize, or EnsurePrimaryPipeline), and never for
     // PathTracePrimary::RasterReSTIRDI, which records through ExecuteReSTIRDISplit. extract records the Raster
     // Primary extraction pipeline instead (EnsureSignalExtraction), and nothing for any other primary.
+    // NRD.RELAX.2B: rawDiffuseHitDistance (with extract) selects the raw-distance extraction pipeline, or the matching raw
+    // SHARC library, when it and the raw diffuse hit distance texture exist; otherwise the legacy extraction records,
+    // writing no raw distance. WroteRawDiffuseHitDistance reports which.
     void Execute(
         PathTracePrimary primary,
         ID3D12GraphicsCommandList4* commandList,
@@ -184,7 +193,8 @@ class PathTraceReferencePass
         unsigned int height,
         bool extract,
         D3D12_GPU_VIRTUAL_ADDRESS radianceCacheConstants = 0,
-        PathTraceRadianceCacheLibrary radianceCacheLibrary = PathTraceRadianceCacheLibrary::Inline);
+        PathTraceRadianceCacheLibrary radianceCacheLibrary = PathTraceRadianceCacheLibrary::Inline,
+        bool rawDiffuseHitDistance = false);
 
     // SHARC.4D learning (experimental, default off): creates, on first use, the Raster Primary pipeline of a cache
     // library (PathTraceRadianceCacheLibrary, with the cache binding at b3). It traces and renders exactly as the
@@ -265,7 +275,8 @@ class PathTraceReferencePass
     // Execute, plus the RTXDI constants (root b2) for the direct pass; constantsAddress must name the direct
     // radiance UAV. Each dispatch is timed in its own profiler region (PathTraceSplitDirect, PathTraceSplitIndirect).
     // extract records the extraction passes instead, which also need the direct diffuse buffer and the outputs
-    // (constantsAddress names their UAVs too); without them nothing is recorded.
+    // (constantsAddress names their UAVs too); without them nothing is recorded. NRD.RELAX.2B: rawDiffuseHitDistance
+    // selects the raw-distance indirect pass as Execute does; the direct pass has no continuation and is unchanged.
     void ExecuteReSTIRDISplit(
         ID3D12GraphicsCommandList4* commandList,
         GpuTimestampProfiler& profiler,
@@ -279,18 +290,30 @@ class PathTraceReferencePass
         D3D12_GPU_VIRTUAL_ADDRESS rtxdiConstantsAddress,
         bool extract,
         D3D12_GPU_VIRTUAL_ADDRESS radianceCacheConstants = 0,
-        PathTraceRadianceCacheLibrary radianceCacheLibrary = PathTraceRadianceCacheLibrary::RenderSplitIndirect);
+        PathTraceRadianceCacheLibrary radianceCacheLibrary = PathTraceRadianceCacheLibrary::RenderSplitIndirect,
+        bool rawDiffuseHitDistance = false);
+
+    // NRD.RELAX.2B: whether the last Execute or ExecuteReSTIRDISplit recorded a raw-distance extraction, which wrote the
+    // raw diffuse hit distance texture. Only then may that frame's texture be read.
+    bool WroteRawDiffuseHitDistance() const
+    {
+        return m_rawDiffuseHitDistanceWritten;
+    }
 
     // RTXPT D.1B.2 diffuse/specular signal extraction (diagnostics only, never enabled by default). Creates, on first
     // use, the extraction pipelines of Raster Primary or split ReSTIR DI (the extraction exports of the libraries
     // the production pipelines use) and the two RGBA16F outputs at the current extent. A failure is sticky until a
     // new revision of the libraries is accepted. Creation only: no GPU work is recorded.
+    // NRD.RELAX.2B: rawDiffuseHitDistance additionally creates the raw-distance extraction pipeline of the primary (the
+    // same export from PathTraceReferenceRawDiffuseHitDistance*.hlsl; split ReSTIR DI keeps the legacy extraction direct
+    // pass). The legacy extraction pipelines are created first and stay valid if it fails.
     bool EnsureSignalExtraction(
         GraphicsDevice& graphicsDevice,
         ShaderLibrary& shaderLibrary,
         DescriptorHeap& descriptorHeap,
         PathTracePrimary primary,
-        std::string& failureReason);
+        std::string& failureReason,
+        bool rawDiffuseHitDistance = false);
 
     // The extraction outputs: diffuse RGB; specular RGB and the primary specular hit distance in alpha.
     Texture& GetDiffuseTexture()
@@ -311,6 +334,23 @@ class PathTraceReferencePass
     {
         return m_historyPriorTexture;
     }
+
+    // NRD.RELAX.2 (diagnostics only): the R32F raw primary diffuse hit distance an extraction frame writes when its
+    // constants carry this texture's UAV (PathTraceReferenceConstants::rawDiffuseHitDistanceIndex), created on first use
+    // at the extent and released with the extraction outputs. The caller transitions it around the extraction.
+    Texture* EnsureRawDiffuseHitDistanceTexture(ID3D12Device* device, DescriptorHeap& descriptorHeap);
+
+    Texture& GetRawDiffuseHitDistanceTexture()
+    {
+        return m_rawDiffuseHitDistanceTexture;
+    }
+
+    // NRD.RELAX.2B: whether the texture, a raw-distance extraction pipeline or a raw SHARC render pipeline exists.
+    bool HasRawDiffuseHitDistanceResources() const;
+
+    // Releases the texture and every raw-distance pipeline (NRD.RELAX.2B), clearing their failures; the next request
+    // creates them again from the cached libraries. Caller guarantees the queue is idle.
+    void ReleaseRawDiffuseHitDistanceResources();
 
     // Copies the presentation image into the HDR scene colour consumed by tone mapping. Both are
     // RGBA16F at the scene extent; the caller checks that before recording.
@@ -334,7 +374,19 @@ class PathTraceReferencePass
     // Bytes of GPU memory owned by the size-dependent and statistics textures.
     std::uint64_t GetResourceBytes() const;
 
+    bool IsSecondaryShadowRayQueryReady() const;
+    void SelectSecondaryShadowRayQuery(bool enabled);
+
     private:
+    bool InitializeVisibilityPipelines(GraphicsDevice& device, ShaderLibrary& shaders,
+        RayTracingPipeline& original, const std::vector<char>& bytecode,
+        const RayTracingPipelineDescription& description);
+    RayTracingPipeline& VisibilityPipeline(RayTracingPipeline& original);
+
+    // Retained alongside the originals until the caller's existing idle teardown boundary.
+    std::map<RayTracingPipeline*, std::unique_ptr<RayTracingPipeline>> m_rayQueryPipelines;
+    bool m_secondaryShadowRayQuery = false;
+
     // True once any library or pipeline exists, after which the library selection cannot change.
     bool LibrarySelectionFixed() const;
 
@@ -441,12 +493,32 @@ class PathTraceReferencePass
     bool m_extractSplitFailed = false;
     std::string m_extractRasterFailure;
     std::string m_extractSplitFailure;
+    // NRD.RELAX.2B raw-distance extraction pipelines, created only when requested (EnsureSignalExtraction).
+    RayTracingPipeline m_extractRasterRawPipeline;
+    RayTracingPipeline m_extractSplitIndirectRawPipeline;
+    bool m_extractRasterRawReady = false;
+    bool m_extractRasterRawFailed = false;
+    bool m_extractSplitRawReady = false;
+    bool m_extractSplitRawFailed = false;
+    std::string m_extractRasterRawFailure;
+    std::string m_extractSplitRawFailure;
+    bool m_rawDiffuseHitDistanceWritten = false;
     Texture m_diffuseTexture;
     Texture m_specularTexture;
     Texture m_historyPriorTexture;
+    Texture m_rawDiffuseHitDistanceTexture;
 
     // Creates the extraction outputs at the current extent when they do not exist.
     bool CreateExtractionTextures(ID3D12Device* device, DescriptorHeap& descriptorHeap);
+
+    // Creates the legacy or (NRD.RELAX.2B) raw-distance extraction pipelines of Raster Primary or split ReSTIR DI when
+    // missing. A failure releases every pipeline of that set and is sticky until a new library revision is accepted.
+    bool EnsureExtractionPipelines(
+        GraphicsDevice& graphicsDevice,
+        ShaderLibrary& shaderLibrary,
+        bool split,
+        bool rawDiffuseHitDistance,
+        std::string& failureReason);
 
     // SHARC.4D learning pipelines by PathTraceRadianceCacheLibrary, each created on first use
     // (EnsureRadianceCacheLearning).

@@ -59,7 +59,12 @@ struct NrdPathTracePrepareConstants
     // NRD.4D diagnostics: CSPrepare's specular hit-distance alpha (0 production; 1 every surface pixel 1; 2 every
     // surface pixel 0.1; 3 production with "no data" (0) replaced by 1). Radiance is unchanged in every mode.
     std::uint32_t specularHitDistanceMode = 0;
-    std::uint32_t padding[2]{};
+    // NRD.RELAX.2: the extraction's raw diffuse hit distance SRV (PathTraceReferencePass), read only by the RELAX
+    // preparation.
+    std::uint32_t rawDiffuseHitDistanceIndex = 0;
+    // NRD.RELAX.4: CSResolveDenoisedRelax's target semantics (0 the presentation, as CSResolveDenoised; 1 the RELAX.3
+    // diagnostic texture, every pixel).
+    std::uint32_t relaxDiagnosticResolve = 0;
 };
 
 static_assert(sizeof(NrdPathTracePrepareConstants) == 2 * 64 + 8 * 16);
@@ -73,16 +78,40 @@ static_assert(sizeof(NrdPathTracePrepareConstants) == 2 * 64 + 8 * 16);
 // Owns five NRD-format textures (R10G10B10A2, R32F, 3 x RGBA16F; the motion copy since NRD.4B) and, for the bypass diagnostic only, two RGBA32F
 // reconstructions at the scene extent, created on first use and kept until released. Nothing here holds history: every
 // frame rewrites every texel. NRD.4B: ExecuteDenoisedResolve writes REBLUR's remodulated outputs into the presentation.
+//
+// NRD.RELAX.2: an instance initialized with Encoding::Relax prepares and bypasses RELAX's inputs instead (CSPrepareRelax,
+// CSResolveRelax): the same guides and demodulation, linear RGB with raw hit distances, and the diffuse distance from the
+// extraction's raw diffuse hit distance texture. NRD.RELAX.3: its denoised resolve is diagnostic only. Each encoding is its own instance, so
+// REBLUR's textures never hold RELAX-encoded data.
 class NrdPathTracePreparePass
 {
     public:
+    enum class Encoding
+    {
+        Reblur,
+        Relax,
+        // HYBRID.3/5: RELAX diffuse and REBLUR specular inputs and the hybrid's production resolve; no bypass resolve.
+        Hybrid
+    };
+
     // The NRD inputs, and the bypass diagnostic's reconstructions on top.
     static constexpr std::uint64_t InputBytesPerPixel = 4 + 4 + 3 * 8;
     static constexpr std::uint64_t ReconstructionBytesPerPixel = 2 * 16;
     static constexpr std::uint64_t BytesPerPixel = InputBytesPerPixel + ReconstructionBytesPerPixel;
 
-    // The resolution-independent part: the three compute pipelines. Created on first use; a failure is sticky.
-    bool Initialize(GraphicsDevice& graphicsDevice, ShaderLibrary& shaderLibrary);
+    // The resolution-independent part: the encoding's three compute pipelines. Created on first use; a
+    // failure is sticky. Initializing again with another encoding fails until Shutdown.
+    bool Initialize(GraphicsDevice& graphicsDevice, ShaderLibrary& shaderLibrary, Encoding encoding = Encoding::Reblur);
+
+    Encoding GetEncoding() const
+    {
+        return m_encoding;
+    }
+
+    bool IsInitialized() const
+    {
+        return m_initialized;
+    }
 
     // Creates the textures at the given extent when they are missing, of another extent, or (reconstructions) without the
     // bypass diagnostic's reconstructions it now needs. Creation only: no GPU work is recorded.
@@ -114,7 +143,9 @@ class NrdPathTracePreparePass
 
     // NRD.4B: remodulates REBLUR's outputs (unordered-access state after NRD) into presentation's surface pixels, with
     // the constants of this frame's ExecutePrepare. Afterwards the outputs are shader-readable and presentation is in
-    // unordered-access state.
+    // unordered-access state. NRD.RELAX.3/4: for the RELAX encoding, constants.relaxDiagnosticResolve selects the
+    // presentation's semantics (0) or the diagnostic texture's (1, every pixel, background as zero). HYBRID.5: for the
+    // Hybrid encoding, the hybrid's outputs into the presentation (CSResolveDenoisedHybrid).
     void ExecuteDenoisedResolve(
         ID3D12GraphicsCommandList* commandList,
         UploadBuffer& uploadBuffer,
@@ -140,7 +171,8 @@ class NrdPathTracePreparePass
         return m_viewZ;
     }
 
-    // Packed REBLUR inputs: YCoCg demodulated radiance, normalized hit distance in alpha.
+    // Packed inputs. REBLUR: YCoCg demodulated radiance, normalized hit distance in alpha. RELAX: linear demodulated
+    // radiance, raw hit distance in alpha.
     Texture& GetDiffuse()
     {
         return m_diffuse;
@@ -192,6 +224,7 @@ class NrdPathTracePreparePass
     ComputePipeline m_denoisedResolvePipeline;
     bool m_initialized = false;
     bool m_initializationFailed = false;
+    Encoding m_encoding = Encoding::Reblur;
 
     Texture m_normalRoughness;
     Texture m_viewZ;

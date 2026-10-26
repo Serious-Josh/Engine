@@ -520,7 +520,11 @@ ShaderLibraryProfile ShaderCompiler::GetLibraryProfile(const std::filesystem::pa
         fileName == "PathTraceReferenceRadianceCacheQueryTerminationSM69.hlsl" ||
         fileName == "PathTraceReferenceRadianceCacheQueryTerminationSERSM69.hlsl" ||
         fileName == "PathTraceReferenceRadianceCacheRenderSM69.hlsl" ||
-        fileName == "PathTraceReferenceRadianceCacheRenderSERSM69.hlsl")
+        fileName == "PathTraceReferenceRadianceCacheRenderSERSM69.hlsl" ||
+        fileName == "PathTraceReferenceRawDiffuseHitDistanceSM69.hlsl" ||
+        fileName == "PathTraceReferenceRawDiffuseHitDistanceSERSM69.hlsl" ||
+        fileName == "PathTraceReferenceRadianceCacheRenderRawDiffuseHitDistanceSM69.hlsl" ||
+        fileName == "PathTraceReferenceRadianceCacheRenderRawDiffuseHitDistanceSERSM69.hlsl")
     {
         return ShaderLibraryProfile::Library69;
     }

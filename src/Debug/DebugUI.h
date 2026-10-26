@@ -222,6 +222,13 @@ class DebugUI
         std::uint32_t accumulatedSamples,
         std::uint64_t resourceBytes);
 
+    void SetSecondaryShadowVisibilityStatus(bool ready, bool active, std::uint64_t epoch)
+    {
+        m_secondaryShadowReady = ready;
+        m_secondaryShadowActive = active;
+        m_visibilityTimingEpoch = epoch;
+    }
+
     void SetPathTraceRasterPrimaryStatus(PathTraceRasterPrimaryAvailability availability, const std::string& reason);
     void SetPathTraceReSTIRDIStatus(PathTraceRasterPrimaryAvailability availability, const std::string& reason);
 
@@ -264,6 +271,20 @@ class DebugUI
     unsigned int m_nextCpuFrameSample = 0;
     void DrawGpuTimingMonitor(const GpuTimestampProfiler::Results& results);
     GpuTimingMonitor m_gpuTimingMonitor;
+    GpuTimingMonitor m_visibilityTimings;
+    int m_secondaryShadowVisibility = PathTraceReferenceSettings{}.secondaryShadowRayQuery ? 1 : 0;
+    bool m_secondaryShadowReady = false;
+    bool m_secondaryShadowActive = false;
+    std::uint64_t m_visibilityTimingEpoch = 0;
+    std::uint64_t m_sampledVisibilityEpoch = UINT64_MAX;
+    std::uint64_t m_visibilityWarmupUntil = 0;
+    PathTraceReferenceSettings m_visibilityTimingSettings;
+    SharcSettings m_visibilityTimingSharc;
+    PathTraceDenoiserMode m_visibilityTimingDenoiser = PathTraceDenoiserMode::Off;
+    PathTraceDenoiserStages m_visibilityTimingStages{};
+    int m_visibilityTimingScale = -1;
+    int m_visibilityTimingLighting = -1;
+
 
     GpuTimingGraph m_gpuTimingGraph;
 

@@ -696,11 +696,11 @@ void AssetBrowser::DrawContents(const ProjectContext* project, const FileBackedD
             const bool isScene = sceneDocument && project && IsSceneEntry(entry.path, *project);
             const bool active = isScene && IsActiveSceneEntry(entry.path, *project, activeScene);
             const bool hasThumbnail = isTexture || isMaterial || isMesh;
-            const bool compactTile = !hasThumbnail && !isScene && !isScript;
+            const bool compactTile = !hasThumbnail && !isScript;
             const auto tilePosition = ImGui::GetCursorScreenPos();
             constexpr float thumbnailSize = 96.0f;
             const char* tileLabel = isTexture ? "##Texture" : isMaterial ? "##Material" :
-                isMesh ? "##Mesh" : isScene ? "[Scene]" : isScript ? "[Script]" :
+                isMesh ? "##Mesh" : isScene ? "##Scene" : isScript ? "[Script]" :
                 compactTile ? "##Entry" : entry.directory ? "[Folder]" : "[File]";
             const ImVec2 tileSize = compactTile ? ImVec2(compactTileWidth, compactTileHeight) :
                 hasThumbnail ? ImVec2(thumbnailSize, thumbnailSize) : ImVec2(0.0f, 48.0f);
@@ -718,7 +718,8 @@ void AssetBrowser::DrawContents(const ProjectContext* project, const FileBackedD
 
                 if(m_icons)
                 {
-                    m_icons->Draw(*draw, entry.directory ? EditorIcon::Folder : EditorIcon::File,
+                    m_icons->Draw(*draw, entry.directory ? EditorIcon::Folder :
+                        sceneDocument ? EditorIcon::Box : EditorIcon::File,
                         iconPosition, ImVec2(compactIconSize, compactIconSize), ImGui::GetColorU32(ImGuiCol_Text));
                 }
                 else
@@ -863,12 +864,11 @@ void AssetBrowser::DrawContents(const ProjectContext* project, const FileBackedD
                 ImGui::PushTextWrapPos(0.0f);
                 ImGui::TextUnformatted(entry.name.c_str());
 
-                if(active)
-                {
-                    ImGui::TextDisabled("Active");
-                }
-
                 ImGui::PopTextWrapPos();
+            }
+            if(active)
+            {
+                ImGui::TextDisabled("Active");
             }
             ImGui::EndGroup();
             CaptureDropTarget(entry.navigable ? entry.path : std::filesystem::path{});

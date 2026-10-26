@@ -1372,6 +1372,7 @@ void Editor::Draw(
 
     m_hierarchyPanel.SetIcons(debugUI.GetEditorIcons());
     m_assetBrowser.SetIcons(debugUI.GetEditorIcons());
+    m_inspectorPanel.SetIcons(debugUI.GetEditorIcons());
     Scene& scene = demoScene.GetScene();
     const std::string activeSceneName(sceneManager.GetActiveSceneName());
     const auto* dragScene = dynamic_cast<const FileBackedDemoScene*>(&demoScene);

@@ -19,6 +19,7 @@ struct EditorWorkspaceRect;
 class ProjectPaths;
 class ProjectAssetRegistry;
 class Renderer;
+class EditorIcons;
 
 struct SceneMaterialSlotInspectorView
 {
@@ -52,6 +53,7 @@ struct SceneObjectInspectorView
 class InspectorPanel
 {
 public:
+    void SetIcons(const EditorIcons& icons) { m_icons = &icons; }
     const std::optional<MaterialPreviewRequest>& GetPreviewRequest();
     std::optional<std::string> TakeMaterialLocateRequest();
     void SetMaterialLocateStatus(std::string status) { m_materialLocateStatus=std::move(status); }
@@ -268,6 +270,8 @@ private:
     std::optional<TexturePickerIdentity> m_texturePicker;
     std::map<std::string, TexturePickerRequest> m_texturePickerRequests;
     std::string m_texturePickerError;
+    std::filesystem::path m_texturePickerFolder;
+    const EditorIcons* m_icons = nullptr;
 
     bool m_refreshTextureChoices = true;
     bool m_texturePickerDrawn = false;

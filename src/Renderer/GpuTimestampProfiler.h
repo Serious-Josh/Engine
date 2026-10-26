@@ -64,6 +64,16 @@ class GpuTimestampProfiler
         // NRD.4B: the Engine denoiser's temporal pass, nested inside PathTraceReference (its spatial pass is
         // PathTraceSpatial).
         PathTraceTemporal,
+        // NRD.RELAX.3 diagnostic RELAX dispatch (never presented): preparation, RELAX and the diagnostic resolve, after
+        // the path-tracing work of the frame.
+        NrdRelaxPrepare,
+        NrdRelaxDenoise,
+        NrdRelaxResolve,
+        NrdHybridPrepare,
+        NrdHybridDiffuse,
+        NrdHybridSpecular,
+        // HYBRID.5: the selected hybrid's production resolve.
+        NrdHybridResolve,
         Count
     };
 

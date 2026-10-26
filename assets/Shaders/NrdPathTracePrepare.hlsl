@@ -33,6 +33,15 @@
 // CSResolve is the NRD bypass: it unpacks CSPrepare's own outputs as if NRD had returned them unchanged
 // (REBLUR_BackEnd_UnpackRadianceAndNormHitDist), remodulates, and writes the reconstructed raw signals in the extraction
 // layout (radiance, hit distance) at RGBA32F, so their comparison with the extraction measures only the NRD formats.
+//
+// NRD.RELAX.2: CSPrepareRelax and CSResolveRelax are the same preparation and bypass for RELAX (diagnostics only; no RELAX
+// denoiser runs). The guides, surface and demodulation are CSPrepare's; only the radiance signals differ:
+//   IN_DIFF/SPEC_RADIANCE_HITDIST
+//                        RELAX_FrontEnd_PackRadianceAndHitDist(L / (factor * scale), raw hit distance): linear RGB, not
+//                        YCoCg, and distances in world units, never normalized.
+// Diffuse distance: the extraction's raw diffuse hit distance texture (rawDiffuseHitDistanceIndex, PathTraceReference.hlsl),
+// never the REBLUR-normalized diffuse alpha. Both distances: -1 (no sample took that lobe) packs as 0, "no data"; a miss
+// stays PATH_TRACE_HALF_MAXIMUM (NRD_FP16_MAX), and a hit is its length. The specular diagnostics modes do not apply.
 
 #include "MaterialLighting.hlsli"
 #include "ShadingNormal.hlsli"
@@ -86,7 +95,10 @@ struct NrdPathTracePrepareConstants
     uint resolveComponents;
     // NRD.4D diagnostics: the specular hit-distance alpha (NrdPathTracePreparePass.h); 0 in production.
     uint specularHitDistanceMode;
-    uint2 padding;
+    // NRD.RELAX.2: the extraction's raw diffuse hit distance (SRV), read only by CSPrepareRelax.
+    uint rawDiffuseHitDistanceIndex;
+    // NRD.RELAX.4: CSResolveDenoisedRelax's target (0 the presentation, 1 the RELAX.3 diagnostic texture).
+    uint relaxDiagnosticResolve;
 };
 
 ConstantBuffer<NrdPathTracePrepareConstants> constants : register(b0);
@@ -414,3 +426,224 @@ void CSResolveDenoised(uint3 dispatchThreadID : SV_DispatchThreadID)
         presentation[pixel] = float4(min(max(radiance, 0.0f), NRD_PATH_TRACE_HALF_MAXIMUM), 1.0f);
     }
 }
+
+// NRD.RELAX.2: the extraction's hit distance (-1 none, PATH_TRACE_HALF_MAXIMUM missed, else a length) as RELAX's raw one.
+float NrdPathTraceRelaxHitDistance(float hitDistance)
+{
+    return hitDistance >= 0.0f ? hitDistance : 0.0f;
+}
+
+[numthreads(8, 8, 1)]
+void CSPrepareRelax(uint3 dispatchThreadID : SV_DispatchThreadID)
+{
+    uint2 pixel = dispatchThreadID.xy;
+
+    if(any(pixel >= constants.resolution))
+    {
+        return;
+    }
+
+    RWTexture2D<float4> normalRoughnessOutput = ResourceDescriptorHeap[constants.normalRoughnessIndex];
+    RWTexture2D<float> viewZOutput = ResourceDescriptorHeap[constants.viewZIndex];
+    RWTexture2D<float4> diffuseOutput = ResourceDescriptorHeap[constants.diffuseIndex];
+    RWTexture2D<float4> specularOutput = ResourceDescriptorHeap[constants.specularIndex];
+    Texture2D<float4> motion = ResourceDescriptorHeap[constants.motionIndex];
+    RWTexture2D<float4> motionOutput = ResourceDescriptorHeap[constants.motionOutputIndex];
+    motionOutput[pixel] = motion.Load(int3(pixel, 0));
+    NrdPathTraceSurface surface = NrdPathTraceLoadSurface(pixel);
+
+    // As CSPrepare: outside the denoising range, no radiance, no hit distance.
+    if(!surface.valid)
+    {
+        normalRoughnessOutput[pixel] = NRD_FrontEnd_PackNormalAndRoughness(float3(0.0f, 0.0f, 1.0f), 1.0f, 0.0f);
+        viewZOutput[pixel] = max(constants.denoisingRange, 0.0f) * 2.0f + 1.0f;
+        diffuseOutput[pixel] = float4(0.0f, 0.0f, 0.0f, 0.0f);
+        specularOutput[pixel] = float4(0.0f, 0.0f, 0.0f, 0.0f);
+        return;
+    }
+
+    Texture2D<float4> rawDiffuse = ResourceDescriptorHeap[constants.rawDiffuseIndex];
+    Texture2D<float4> rawSpecular = ResourceDescriptorHeap[constants.rawSpecularIndex];
+    Texture2D<float> rawDiffuseHitDistance = ResourceDescriptorHeap[constants.rawDiffuseHitDistanceIndex];
+    float3 diffuse = rawDiffuse.Load(int3(pixel, 0)).rgb;
+    float4 specular = rawSpecular.Load(int3(pixel, 0));
+    float diffuseHitDistance = NrdPathTraceRelaxHitDistance(rawDiffuseHitDistance.Load(int3(pixel, 0)));
+
+    normalRoughnessOutput[pixel] = NRD_FrontEnd_PackNormalAndRoughness(surface.normal, surface.roughness,
+        surface.materialID);
+    viewZOutput[pixel] = surface.viewZ;
+    diffuseOutput[pixel] = NrdPathTraceRoundToHalf(RELAX_FrontEnd_PackRadianceAndHitDist(
+        diffuse / (surface.diffuseFactor * constants.radianceScale), diffuseHitDistance, true));
+    specularOutput[pixel] = NrdPathTraceRoundToHalf(RELAX_FrontEnd_PackRadianceAndHitDist(
+        specular.rgb / (surface.specularFactor * constants.radianceScale), NrdPathTraceRelaxHitDistance(specular.a),
+        true));
+}
+
+// The RELAX bypass: CSPrepareRelax's outputs unpacked as if RELAX had returned them unchanged, remodulated, in the
+// extraction's layout with raw distances (0, "no data", back to -1), so they compare with the raw extraction directly.
+[numthreads(8, 8, 1)]
+void CSResolveRelax(uint3 dispatchThreadID : SV_DispatchThreadID)
+{
+    uint2 pixel = dispatchThreadID.xy;
+
+    if(any(pixel >= constants.resolution))
+    {
+        return;
+    }
+
+    RWTexture2D<float4> reconstructedDiffuse = ResourceDescriptorHeap[constants.reconstructedDiffuseIndex];
+    RWTexture2D<float4> reconstructedSpecular = ResourceDescriptorHeap[constants.reconstructedSpecularIndex];
+    NrdPathTraceSurface surface = NrdPathTraceLoadSurface(pixel);
+
+    if(!surface.valid)
+    {
+        reconstructedDiffuse[pixel] = float4(0.0f, 0.0f, 0.0f, -1.0f);
+        reconstructedSpecular[pixel] = float4(0.0f, 0.0f, 0.0f, -1.0f);
+        return;
+    }
+
+    Texture2D<float4> diffuseInput = ResourceDescriptorHeap[constants.diffuseIndex];
+    Texture2D<float4> specularInput = ResourceDescriptorHeap[constants.specularIndex];
+    float4 diffuse = RELAX_BackEnd_UnpackRadiance(diffuseInput.Load(int3(pixel, 0)));
+    float4 specular = RELAX_BackEnd_UnpackRadiance(specularInput.Load(int3(pixel, 0)));
+
+    reconstructedDiffuse[pixel] = float4(diffuse.rgb * (surface.diffuseFactor * constants.radianceScale),
+        diffuse.a > 0.0f ? diffuse.a : -1.0f);
+    reconstructedSpecular[pixel] = float4(specular.rgb * (surface.specularFactor * constants.radianceScale),
+        specular.a > 0.0f ? specular.a : -1.0f);
+}
+
+// NRD.RELAX.3/4 resolve of RELAX's outputs: unpacked (RELAX_BackEnd_UnpackRadiance, linear RGB), remodulated with
+// CSPrepareRelax's factors and scale and summed, into presentationIndex. relaxDiagnosticResolve selects the target:
+//   0 (NRD.RELAX.4 production) the path-traced presentation, exactly as CSResolveDenoised does for REBLUR: surface pixels
+//     only (the background keeps the path tracer's value), clamped to [0, fp16 max], and a non-finite result never
+//     reaches the image (the path tracer's value stays);
+//   1 (NRD.RELAX.3 diagnostics) the renderer's diagnostic texture, every pixel: background (0, 0, 0, 0), alpha 1 on a
+//     surface, a non-finite result kept non-finite so that diagnostics see it.
+[numthreads(8, 8, 1)]
+void CSResolveDenoisedRelax(uint3 dispatchThreadID : SV_DispatchThreadID)
+{
+    uint2 pixel = dispatchThreadID.xy;
+
+    if(any(pixel >= constants.resolution))
+    {
+        return;
+    }
+
+    RWTexture2D<float4> output = ResourceDescriptorHeap[constants.presentationIndex];
+    NrdPathTraceSurface surface = NrdPathTraceLoadSurface(pixel);
+
+    const bool diagnostic = constants.relaxDiagnosticResolve != 0u;
+
+    if(!surface.valid)
+    {
+        if(diagnostic)
+        {
+            output[pixel] = float4(0.0f, 0.0f, 0.0f, 0.0f);
+        }
+
+        return;
+    }
+
+    Texture2D<float4> denoisedDiffuse = ResourceDescriptorHeap[constants.denoisedDiffuseIndex];
+    Texture2D<float4> denoisedSpecular = ResourceDescriptorHeap[constants.denoisedSpecularIndex];
+    float3 diffuse = RELAX_BackEnd_UnpackRadiance(denoisedDiffuse.Load(int3(pixel, 0))).rgb;
+    float3 specular = RELAX_BackEnd_UnpackRadiance(denoisedSpecular.Load(int3(pixel, 0))).rgb;
+    float diffuseWeight = constants.resolveComponents == 2 ? 0.0f : 1.0f;
+    float specularWeight = constants.resolveComponents == 1 ? 0.0f : 1.0f;
+    float3 radiance = (diffuse * surface.diffuseFactor * diffuseWeight + specular * surface.specularFactor *
+        specularWeight) * constants.radianceScale;
+
+    if(diagnostic)
+    {
+        output[pixel] = float4(radiance, 1.0f);
+    }
+    else if(all(isfinite(radiance)))
+    {
+        output[pixel] = float4(min(max(radiance, 0.0f), NRD_PATH_TRACE_HALF_MAXIMUM), 1.0f);
+    }
+}
+
+// HYBRID.3 diagnostic only: complete RELAX diffuse and REBLUR specular, shared guides.
+[numthreads(8, 8, 1)]
+void CSPrepareHybrid(uint3 dispatchThreadID : SV_DispatchThreadID)
+{
+    uint2 pixel = dispatchThreadID.xy;
+
+    if(any(pixel >= constants.resolution))
+    {
+        return;
+    }
+
+    RWTexture2D<float4> normalRoughnessOutput = ResourceDescriptorHeap[constants.normalRoughnessIndex];
+    RWTexture2D<float> viewZOutput = ResourceDescriptorHeap[constants.viewZIndex];
+    RWTexture2D<float4> diffuseOutput = ResourceDescriptorHeap[constants.diffuseIndex];
+    RWTexture2D<float4> specularOutput = ResourceDescriptorHeap[constants.specularIndex];
+    Texture2D<float4> motion = ResourceDescriptorHeap[constants.motionIndex];
+    RWTexture2D<float4> motionOutput = ResourceDescriptorHeap[constants.motionOutputIndex];
+    motionOutput[pixel] = motion.Load(int3(pixel, 0));
+    NrdPathTraceSurface surface = NrdPathTraceLoadSurface(pixel);
+
+    // As CSPrepare: outside the denoising range, no radiance, no hit distance.
+    if(!surface.valid)
+    {
+        normalRoughnessOutput[pixel] = NRD_FrontEnd_PackNormalAndRoughness(float3(0.0f, 0.0f, 1.0f), 1.0f, 0.0f);
+        viewZOutput[pixel] = max(constants.denoisingRange, 0.0f) * 2.0f + 1.0f;
+        diffuseOutput[pixel] = float4(0.0f, 0.0f, 0.0f, 0.0f);
+        specularOutput[pixel] = float4(0.0f, 0.0f, 0.0f, 0.0f);
+        return;
+    }
+
+    Texture2D<float4> rawDiffuse = ResourceDescriptorHeap[constants.rawDiffuseIndex];
+    Texture2D<float4> rawSpecular = ResourceDescriptorHeap[constants.rawSpecularIndex];
+    Texture2D<float> rawDiffuseHitDistance = ResourceDescriptorHeap[constants.rawDiffuseHitDistanceIndex];
+    float3 diffuse = rawDiffuse.Load(int3(pixel, 0)).rgb;
+    float4 specular = rawSpecular.Load(int3(pixel, 0));
+    float diffuseHitDistance = NrdPathTraceRelaxHitDistance(rawDiffuseHitDistance.Load(int3(pixel, 0)));
+
+    normalRoughnessOutput[pixel] = NRD_FrontEnd_PackNormalAndRoughness(surface.normal, surface.roughness,
+        surface.materialID);
+    viewZOutput[pixel] = surface.viewZ;
+    diffuseOutput[pixel] = NrdPathTraceRoundToHalf(RELAX_FrontEnd_PackRadianceAndHitDist(
+        diffuse / (surface.diffuseFactor * constants.radianceScale), diffuseHitDistance, true));
+    specularOutput[pixel] = NrdPathTraceRoundToHalf(REBLUR_FrontEnd_PackRadianceAndNormHitDist(
+        specular.rgb / (surface.specularFactor * constants.radianceScale),
+        NrdPathTraceNormalizedHitDistance(specular.a, surface.viewZ, surface.roughness), true));
+}
+
+// HYBRID.5 production resolve of the hybrid's outputs, exactly as CSResolveDenoised does for REBLUR (surface pixels only,
+// the background keeps the path tracer's value, clamped to [0, fp16 max], a non-finite result never reaches the image),
+// with the diffuse output unpacked as RELAX's (HYBRID.1): 64 * (k_d * RELAX diffuse + k_s * REBLUR specular).
+[numthreads(8, 8, 1)]
+void CSResolveDenoisedHybrid(uint3 dispatchThreadID : SV_DispatchThreadID)
+{
+    uint2 pixel = dispatchThreadID.xy;
+
+    if(any(pixel >= constants.resolution))
+    {
+        return;
+    }
+
+    NrdPathTraceSurface surface = NrdPathTraceLoadSurface(pixel);
+
+    if(!surface.valid)
+    {
+        return;
+    }
+
+    Texture2D<float4> denoisedDiffuse = ResourceDescriptorHeap[constants.denoisedDiffuseIndex];
+    Texture2D<float4> denoisedSpecular = ResourceDescriptorHeap[constants.denoisedSpecularIndex];
+    RWTexture2D<float4> presentation = ResourceDescriptorHeap[constants.presentationIndex];
+    float3 diffuse = RELAX_BackEnd_UnpackRadiance(denoisedDiffuse.Load(int3(pixel, 0))).rgb;
+    float3 specular = REBLUR_BackEnd_UnpackRadianceAndNormHitDist(denoisedSpecular.Load(int3(pixel, 0))).rgb;
+    float diffuseWeight = constants.resolveComponents == 2 ? 0.0f : 1.0f;
+    float specularWeight = constants.resolveComponents == 1 ? 0.0f : 1.0f;
+    float3 radiance = (diffuse * surface.diffuseFactor * diffuseWeight + specular * surface.specularFactor *
+        specularWeight) * constants.radianceScale;
+
+    if(all(isfinite(radiance)))
+    {
+        presentation[pixel] = float4(min(max(radiance, 0.0f), NRD_PATH_TRACE_HALF_MAXIMUM), 1.0f);
+    }
+}
+

@@ -91,7 +91,13 @@ namespace
             {"PathTraceReferenceRadianceCacheRender.hlsl", "PathTraceReferenceRadianceCacheRenderSM69.hlsl",
                 "PathTraceReferenceRadianceCacheRenderSERSM69.hlsl"},
             {"PathTraceReferenceRadianceCacheRender.hlsl", "PathTraceReferenceRadianceCacheRenderSM69.hlsl",
-                "PathTraceReferenceRadianceCacheRenderSERSM69.hlsl"}};
+                "PathTraceReferenceRadianceCacheRenderSERSM69.hlsl"},
+            {"PathTraceReferenceRadianceCacheRenderRawDiffuseHitDistance.hlsl",
+                "PathTraceReferenceRadianceCacheRenderRawDiffuseHitDistanceSM69.hlsl",
+                "PathTraceReferenceRadianceCacheRenderRawDiffuseHitDistanceSERSM69.hlsl"},
+            {"PathTraceReferenceRadianceCacheRenderRawDiffuseHitDistance.hlsl",
+                "PathTraceReferenceRadianceCacheRenderRawDiffuseHitDistanceSM69.hlsl",
+                "PathTraceReferenceRadianceCacheRenderRawDiffuseHitDistanceSERSM69.hlsl"}};
         static_assert(std::size(paths) == static_cast<size_t>(PathTraceRadianceCacheLibrary::Count));
         size_t column = 0;
 
@@ -108,6 +114,29 @@ namespace
         }
 
         return paths[static_cast<size_t>(library)][column];
+    }
+
+    // NRD.RELAX.2B: the reference library built with PATH_TRACE_RAW_DIFFUSE_HIT_DISTANCE_LIBRARY. Only its extraction
+    // exports are used; the production and legacy extraction pipelines never come from it.
+    const char* RawDiffuseHitDistanceLibraryPath(PathTraceLibraryVariant variant)
+    {
+        switch(variant)
+        {
+        case PathTraceLibraryVariant::SM69:
+            return "PathTraceReferenceRawDiffuseHitDistanceSM69.hlsl";
+        case PathTraceLibraryVariant::SM69SER:
+            return "PathTraceReferenceRawDiffuseHitDistanceSERSM69.hlsl";
+        case PathTraceLibraryVariant::SM66:
+            break;
+        }
+
+        return "PathTraceReferenceRawDiffuseHitDistance.hlsl";
+    }
+
+    bool IsRawDiffuseHitDistanceLibrary(PathTraceRadianceCacheLibrary library)
+    {
+        return library == PathTraceRadianceCacheLibrary::RenderExtractionRawDiffuseHitDistance ||
+            library == PathTraceRadianceCacheLibrary::RenderSplitIndirectExtractionRawDiffuseHitDistance;
     }
 
     const char* ReSTIRDIExtractionLibraryPath(PathTraceLibraryVariant variant)
@@ -220,7 +249,8 @@ namespace
         {
             description.rayGenerationShader = L"PathTraceRadianceCacheTrainingRayGeneration";
         }
-        else if(library == PathTraceRadianceCacheLibrary::RenderExtraction)
+        else if(library == PathTraceRadianceCacheLibrary::RenderExtraction ||
+            library == PathTraceRadianceCacheLibrary::RenderExtractionRawDiffuseHitDistance)
         {
             description.rayGenerationShader = L"PathTraceRasterPrimaryExtractRayGeneration";
         }
@@ -228,7 +258,8 @@ namespace
         {
             description.rayGenerationShader = L"PathTraceReSTIRDISplitIndirectRayGeneration";
         }
-        else if(library == PathTraceRadianceCacheLibrary::RenderSplitIndirectExtraction)
+        else if(library == PathTraceRadianceCacheLibrary::RenderSplitIndirectExtraction ||
+            library == PathTraceRadianceCacheLibrary::RenderSplitIndirectExtractionRawDiffuseHitDistance)
         {
             description.rayGenerationShader = L"PathTraceReSTIRDISplitIndirectExtractRayGeneration";
         }
@@ -335,7 +366,7 @@ bool PathTraceReferencePass::Initialize(
     const ShaderLibraryCompileResult* library = AcquireLibrary(shaderLibrary, description.shaderPath);
 
     if(!library ||
-        !referencePipeline.Initialize(graphicsDevice.GetRayTracingDevice(), library->bytecode, description))
+        !InitializeVisibilityPipelines(graphicsDevice, shaderLibrary, referencePipeline, library->bytecode, description))
     {
         failureReason = "The PathTraceReference DXR library is unavailable or failed to compile" +
             TroubleshootingHint() + ".";
@@ -404,7 +435,7 @@ bool PathTraceReferencePass::EnsurePrimaryPipeline(
         m_pipelineFailure[index] = "The " + libraryName + " DXR library has no entry point for this primary "
             "(a shader bundle from before RTXPT.2 R3).";
     }
-    else if(!m_pipelines[index].Initialize(graphicsDevice.GetRayTracingDevice(), library->bytecode, description))
+    else if(!InitializeVisibilityPipelines(graphicsDevice, shaderLibrary, m_pipelines[index], library->bytecode, description))
     {
         m_pipelineFailure[index] = "The " + libraryName + " DXR pipeline could not be created for this primary" +
             TroubleshootingHint() + ".";
@@ -521,6 +552,10 @@ ShaderLibraryPreparation PathTraceReferencePass::PrepareLibrary(
         m_extractRasterFailure.clear();
         m_extractSplitFailed = false;
         m_extractSplitFailure.clear();
+        m_extractRasterRawFailed = false;
+        m_extractRasterRawFailure.clear();
+        m_extractSplitRawFailed = false;
+        m_extractSplitRawFailure.clear();
 
         // SHARC.4D: the learning libraries include the reference library.
         for(RadianceCacheLearningPipeline& learning : m_radianceCache)
@@ -691,6 +726,7 @@ bool PathTraceReferencePass::Resize(
     m_diffuseTexture.Shutdown();
     m_specularTexture.Shutdown();
     m_historyPriorTexture.Shutdown();
+    m_rawDiffuseHitDistanceTexture.Shutdown();
 
     if(!CreateTextures(device, descriptorHeap, width, height))
     {
@@ -712,18 +748,31 @@ void PathTraceReferencePass::Execute(
     unsigned int height,
     bool extract,
     D3D12_GPU_VIRTUAL_ADDRESS radianceCacheConstants,
-    PathTraceRadianceCacheLibrary radianceCacheLibrary)
+    PathTraceRadianceCacheLibrary radianceCacheLibrary,
+    bool rawDiffuseHitDistance)
 {
+    m_rawDiffuseHitDistanceWritten = false;
+
+    // NRD.RELAX.2B: raw-distance extraction only with its output; otherwise the legacy extraction, which writes none.
+    const bool raw = extract && rawDiffuseHitDistance && m_rawDiffuseHitDistanceTexture.GetResource();
+
     // SHARC.4D: a learning pipeline only for Raster Primary; otherwise the production one.
     RadianceCacheLearningPipeline& radianceCache = m_radianceCache[static_cast<size_t>(radianceCacheLibrary)];
-    // SHARC.4E.1: an extraction frame uses a cache library only through its extraction ray generation.
-    const bool extractingLibrary = radianceCacheLibrary == PathTraceRadianceCacheLibrary::RenderExtraction;
+    // SHARC.4E.1: an extraction frame uses a cache library only through its extraction ray generation, and
+    // (NRD.RELAX.2B) only the build matching the frame's raw-distance request.
+    const PathTraceRadianceCacheLibrary extractionLibrary = raw ?
+        PathTraceRadianceCacheLibrary::RenderExtractionRawDiffuseHitDistance : PathTraceRadianceCacheLibrary::RenderExtraction;
+    const bool extractingLibrary = radianceCacheLibrary == PathTraceRadianceCacheLibrary::RenderExtraction ||
+        radianceCacheLibrary == PathTraceRadianceCacheLibrary::RenderExtractionRawDiffuseHitDistance;
     const bool learning = radianceCacheConstants != 0 && primary == PathTracePrimary::Raster &&
-        extract == extractingLibrary && radianceCache.ready && (!extract || m_diffuseTexture.GetResource());
-    RayTracingPipeline& pipeline = learning ? radianceCache.pipeline :
-        (extract ? m_extractRasterPipeline : m_pipelines[static_cast<size_t>(primary)]);
+        extract == extractingLibrary && (!extract || radianceCacheLibrary == extractionLibrary) && radianceCache.ready &&
+        (!extract || m_diffuseTexture.GetResource());
+    const bool rawPipeline = raw && !learning && m_extractRasterRawReady;
+    RayTracingPipeline& pipeline = VisibilityPipeline(learning ? radianceCache.pipeline :
+        (extract ? (rawPipeline ? m_extractRasterRawPipeline : m_extractRasterPipeline) :
+        m_pipelines[static_cast<size_t>(primary)]));
     const bool ready = learning || (extract ?
-        primary == PathTracePrimary::Raster && m_extractRasterReady && m_diffuseTexture.GetResource() :
+        primary == PathTracePrimary::Raster && (rawPipeline || m_extractRasterReady) && m_diffuseTexture.GetResource() :
         m_pipelineReady[static_cast<size_t>(primary)]);
 
     // ReSTIR DI records through ExecuteReSTIRDISplit; its own pipeline slot is never created.
@@ -758,6 +807,7 @@ void PathTraceReferencePass::Execute(
     }
 
     pipeline.Dispatch(commandList, width, height);
+    m_rawDiffuseHitDistanceWritten = learning ? IsRawDiffuseHitDistanceLibrary(radianceCacheLibrary) : rawPipeline;
     RecordOutputBarriers(commandList, extract);
 }
 
@@ -828,7 +878,7 @@ bool PathTraceReferencePass::EnsureRadianceCacheLearning(
     {
         learning.failure = "The " + libraryName + " DXR library has no Raster Primary entry point.";
     }
-    else if(!learning.pipeline.Initialize(graphicsDevice.GetRayTracingDevice(), compiled->bytecode, description))
+    else if(!InitializeVisibilityPipelines(graphicsDevice, shaderLibrary, learning.pipeline, compiled->bytecode, description))
     {
         learning.failure = "The " + libraryName + " learning DXR pipeline could not be created" +
             TroubleshootingHint() + ".";
@@ -914,7 +964,7 @@ bool PathTraceReferencePass::EnsureReSTIRDISplitPipelines(
             m_splitPipelineFailure = "The " + libraryName + " DXR library has no split ReSTIR DI " +
                 (directPass ? "direct" : "indirect") + " entry point.";
         }
-        else if(!pipelines[pass]->Initialize(graphicsDevice.GetRayTracingDevice(), library->bytecode, description))
+        else if(!InitializeVisibilityPipelines(graphicsDevice, shaderLibrary, *pipelines[pass], library->bytecode, description))
         {
             m_splitPipelineFailure = "The " + libraryName + " split ReSTIR DI DXR pipeline could not be created" +
                 TroubleshootingHint() + ".";
@@ -939,7 +989,8 @@ bool PathTraceReferencePass::EnsureSignalExtraction(
     ShaderLibrary& shaderLibrary,
     DescriptorHeap& descriptorHeap,
     PathTracePrimary primary,
-    std::string& failureReason)
+    std::string& failureReason,
+    bool rawDiffuseHitDistance)
 {
     if(!m_initialized)
     {
@@ -955,9 +1006,42 @@ bool PathTraceReferencePass::EnsureSignalExtraction(
         return false;
     }
 
-    bool& ready = split ? m_extractSplitReady : m_extractRasterReady;
-    bool& failed = split ? m_extractSplitFailed : m_extractRasterFailed;
-    std::string& failure = split ? m_extractSplitFailure : m_extractRasterFailure;
+    if(!EnsureExtractionPipelines(graphicsDevice, shaderLibrary, split, false, failureReason) ||
+        (rawDiffuseHitDistance && !EnsureExtractionPipelines(graphicsDevice, shaderLibrary, split, true, failureReason)))
+    {
+        return false;
+    }
+
+    if(!CreateExtractionTextures(graphicsDevice.GetDevice(), descriptorHeap))
+    {
+        failureReason = "The signal extraction outputs or their descriptors could not be allocated.";
+        return false;
+    }
+
+    return true;
+}
+
+bool PathTraceReferencePass::EnsureExtractionPipelines(
+    GraphicsDevice& graphicsDevice,
+    ShaderLibrary& shaderLibrary,
+    bool split,
+    bool rawDiffuseHitDistance,
+    std::string& failureReason)
+{
+    bool* readyState = split ? &m_extractSplitReady : &m_extractRasterReady;
+    bool* failedState = split ? &m_extractSplitFailed : &m_extractRasterFailed;
+    std::string* failureState = split ? &m_extractSplitFailure : &m_extractRasterFailure;
+
+    if(rawDiffuseHitDistance)
+    {
+        readyState = split ? &m_extractSplitRawReady : &m_extractRasterRawReady;
+        failedState = split ? &m_extractSplitRawFailed : &m_extractRasterRawFailed;
+        failureState = split ? &m_extractSplitRawFailure : &m_extractRasterRawFailure;
+    }
+
+    bool& ready = *readyState;
+    bool& failed = *failedState;
+    std::string& failure = *failureState;
 
     if(!ready && failed)
     {
@@ -969,7 +1053,18 @@ bool PathTraceReferencePass::EnsureSignalExtraction(
     {
         std::vector<std::pair<RayTracingPipeline*, RayTracingPipelineDescription>> pipelines;
 
-        if(split)
+        if(rawDiffuseHitDistance)
+        {
+            // The legacy extraction's description with the raw-distance build of the reference library: the same
+            // export, root signature and bindings. Split ReSTIR DI needs only its indirect pass.
+            RayTracingPipelineDescription description = split ?
+                BuildReSTIRDISplitExtractionPipelineDescription(false, m_libraryVariant) :
+                BuildRasterExtractionPipelineDescription(m_libraryVariant);
+            description.shaderPath = RawDiffuseHitDistanceLibraryPath(m_libraryVariant);
+            pipelines.emplace_back(split ? &m_extractSplitIndirectRawPipeline : &m_extractRasterRawPipeline,
+                description);
+        }
+        else if(split)
         {
             pipelines.emplace_back(&m_extractSplitDirectPipeline,
                 BuildReSTIRDISplitExtractionPipelineDescription(true, m_libraryVariant));
@@ -995,7 +1090,7 @@ bool PathTraceReferencePass::EnsureSignalExtraction(
             {
                 failure = "The " + libraryName + " DXR library has no signal extraction entry point.";
             }
-            else if(!pipeline->Initialize(graphicsDevice.GetRayTracingDevice(), library->bytecode, description))
+            else if(!InitializeVisibilityPipelines(graphicsDevice, shaderLibrary, *pipeline, library->bytecode, description))
             {
                 failure = "The " + libraryName + " signal extraction DXR pipeline could not be created" +
                     TroubleshootingHint() + ".";
@@ -1015,12 +1110,6 @@ bool PathTraceReferencePass::EnsureSignalExtraction(
         }
 
         ready = true;
-    }
-
-    if(!CreateExtractionTextures(graphicsDevice.GetDevice(), descriptorHeap))
-    {
-        failureReason = "The signal extraction outputs or their descriptors could not be allocated.";
-        return false;
     }
 
     return true;
@@ -1076,6 +1165,64 @@ Texture* PathTraceReferencePass::EnsureHistoryPriorTexture(ID3D12Device* device,
 
     m_historyPriorTexture.GetResource()->SetName(L"SHARC History Prior");
     return &m_historyPriorTexture;
+}
+
+Texture* PathTraceReferencePass::EnsureRawDiffuseHitDistanceTexture(ID3D12Device* device, DescriptorHeap& descriptorHeap)
+{
+    if(m_rawDiffuseHitDistanceTexture.GetResource())
+    {
+        return &m_rawDiffuseHitDistanceTexture;
+    }
+
+    if(m_width == 0 || m_height == 0 || !m_rawDiffuseHitDistanceTexture.Initialize(device, m_width, m_height, 1, 1,
+        DXGI_FORMAT_R32_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS) ||
+        !m_rawDiffuseHitDistanceTexture.CreateSRV(device, descriptorHeap) ||
+        !m_rawDiffuseHitDistanceTexture.CreateUAV(device, descriptorHeap))
+    {
+        Log::Error("Failed to create the raw diffuse hit distance texture.");
+        m_rawDiffuseHitDistanceTexture.Shutdown();
+        return nullptr;
+    }
+
+    m_rawDiffuseHitDistanceTexture.GetResource()->SetName(L"Path Trace Raw Diffuse Hit Distance");
+    return &m_rawDiffuseHitDistanceTexture;
+}
+
+bool PathTraceReferencePass::HasRawDiffuseHitDistanceResources() const
+{
+    const auto& renderExtraction =
+        m_radianceCache[static_cast<size_t>(PathTraceRadianceCacheLibrary::RenderExtractionRawDiffuseHitDistance)];
+    const auto& renderSplitExtraction = m_radianceCache[static_cast<size_t>(
+        PathTraceRadianceCacheLibrary::RenderSplitIndirectExtractionRawDiffuseHitDistance)];
+
+    return m_rawDiffuseHitDistanceTexture.GetResource() || m_extractRasterRawReady || m_extractSplitRawReady ||
+        m_extractRasterRawFailed || m_extractSplitRawFailed || renderExtraction.ready || renderSplitExtraction.ready ||
+        renderExtraction.failed || renderSplitExtraction.failed;
+}
+
+void PathTraceReferencePass::ReleaseRawDiffuseHitDistanceResources()
+{
+    m_rawDiffuseHitDistanceTexture.Shutdown();
+    m_rawDiffuseHitDistanceWritten = false;
+
+    m_extractRasterRawPipeline.Shutdown();
+    m_extractSplitIndirectRawPipeline.Shutdown();
+    m_extractRasterRawReady = false;
+    m_extractRasterRawFailed = false;
+    m_extractSplitRawReady = false;
+    m_extractSplitRawFailed = false;
+    m_extractRasterRawFailure.clear();
+    m_extractSplitRawFailure.clear();
+
+    for(const PathTraceRadianceCacheLibrary library : {PathTraceRadianceCacheLibrary::RenderExtractionRawDiffuseHitDistance,
+        PathTraceRadianceCacheLibrary::RenderSplitIndirectExtractionRawDiffuseHitDistance})
+    {
+        RadianceCacheLearningPipeline& pipeline = m_radianceCache[static_cast<size_t>(library)];
+        pipeline.pipeline.Shutdown();
+        pipeline.ready = false;
+        pipeline.failed = false;
+        pipeline.failure.clear();
+    }
 }
 
 unsigned int PathTraceReferencePass::EnsureSplitDirectRadiance(
@@ -1205,8 +1352,10 @@ void PathTraceReferencePass::ExecuteReSTIRDISplit(
     D3D12_GPU_VIRTUAL_ADDRESS rtxdiConstantsAddress,
     bool extract,
     D3D12_GPU_VIRTUAL_ADDRESS radianceCacheConstants,
-    PathTraceRadianceCacheLibrary radianceCacheLibrary)
+    PathTraceRadianceCacheLibrary radianceCacheLibrary,
+    bool rawDiffuseHitDistance)
 {
+    m_rawDiffuseHitDistanceWritten = false;
     const bool ready = extract ?
         m_extractSplitReady && m_splitDirectDiffuse.buffer.GetResource() && m_diffuseTexture.GetResource() :
         m_splitPipelinesReady;
@@ -1220,14 +1369,21 @@ void PathTraceReferencePass::ExecuteReSTIRDISplit(
     // SHARC.5B: the indirect pass may come from the cached-radiance library (its split-indirect export matching the
     // frame's extraction); the direct pass never does.
     const RadianceCacheLearningPipeline& radianceCache = m_radianceCache[static_cast<size_t>(radianceCacheLibrary)];
-    const PathTraceRadianceCacheLibrary expectedLibrary = extract ?
-        PathTraceRadianceCacheLibrary::RenderSplitIndirectExtraction : PathTraceRadianceCacheLibrary::RenderSplitIndirect;
+    // NRD.RELAX.2B: as in Execute, raw-distance extraction only with its output.
+    const bool raw = extract && rawDiffuseHitDistance && m_rawDiffuseHitDistanceTexture.GetResource();
+    const PathTraceRadianceCacheLibrary extractionLibrary = raw ?
+        PathTraceRadianceCacheLibrary::RenderSplitIndirectExtractionRawDiffuseHitDistance :
+        PathTraceRadianceCacheLibrary::RenderSplitIndirectExtraction;
+    const PathTraceRadianceCacheLibrary expectedLibrary = extract ? extractionLibrary :
+        PathTraceRadianceCacheLibrary::RenderSplitIndirect;
     const bool cachedIndirect = radianceCacheConstants != 0 && radianceCacheLibrary == expectedLibrary &&
         radianceCache.ready;
+    const bool rawPipeline = raw && !cachedIndirect && m_extractSplitRawReady;
     RayTracingPipeline& directPipeline = extract ? m_extractSplitDirectPipeline : m_splitDirectPipeline;
-    RayTracingPipeline& indirectPipeline = cachedIndirect ?
+    RayTracingPipeline& indirectPipeline = VisibilityPipeline(cachedIndirect ?
         m_radianceCache[static_cast<size_t>(radianceCacheLibrary)].pipeline :
-        (extract ? m_extractSplitIndirectPipeline : m_splitIndirectPipeline);
+        (extract ? (rawPipeline ? m_extractSplitIndirectRawPipeline : m_extractSplitIndirectPipeline) :
+        m_splitIndirectPipeline));
 
     m_accumulationTexture.Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     m_outputTexture.Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -1282,6 +1438,7 @@ void PathTraceReferencePass::ExecuteReSTIRDISplit(
 
     indirectPipeline.Dispatch(commandList, width, height);
     profiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::PathTraceSplitIndirect);
+    m_rawDiffuseHitDistanceWritten = cachedIndirect ? IsRawDiffuseHitDistanceLibrary(radianceCacheLibrary) : rawPipeline;
 
     RecordOutputBarriers(commandList, extract);
 }
@@ -1334,6 +1491,11 @@ std::uint64_t PathTraceReferencePass::GetResourceBytes() const
         bytes += pixels * 8;
     }
 
+    if(m_rawDiffuseHitDistanceTexture.GetResource())
+    {
+        bytes += pixels * 4;
+    }
+
     return bytes;
 }
 
@@ -1346,6 +1508,18 @@ void PathTraceReferencePass::Shutdown()
 
 void PathTraceReferencePass::ReleaseResources()
 {
+    // Same idle-device contract as the original pipeline teardown below.
+    for(auto& [original, alternate] : m_rayQueryPipelines)
+    {
+        if(alternate)
+        {
+            alternate->Shutdown();
+        }
+    }
+
+    m_rayQueryPipelines.clear();
+    m_secondaryShadowRayQuery = false;
+
     m_accumulationTexture.Shutdown();
     m_outputTexture.Shutdown();
     m_statisticsTexture.Shutdown();
@@ -1373,9 +1547,19 @@ void PathTraceReferencePass::ReleaseResources()
     m_extractSplitFailed = false;
     m_extractRasterFailure.clear();
     m_extractSplitFailure.clear();
+    m_extractRasterRawPipeline.Shutdown();
+    m_extractSplitIndirectRawPipeline.Shutdown();
+    m_extractRasterRawReady = false;
+    m_extractRasterRawFailed = false;
+    m_extractSplitRawReady = false;
+    m_extractSplitRawFailed = false;
+    m_extractRasterRawFailure.clear();
+    m_extractSplitRawFailure.clear();
+    m_rawDiffuseHitDistanceWritten = false;
     m_diffuseTexture.Shutdown();
     m_specularTexture.Shutdown();
     m_historyPriorTexture.Shutdown();
+    m_rawDiffuseHitDistanceTexture.Shutdown();
 
     for(RadianceCacheLearningPipeline& learning : m_radianceCache)
     {
@@ -1547,4 +1731,70 @@ PathTraceLibrarySelection SelectPathTraceLibraryVariant(
     selection.variant = PathTraceLibraryVariant::SM69SER;
     selection.reason = prefix + "automatic: Shader Model 6.9, DXR tier 1.2 and reordering supported";
     return selection;
+}
+
+bool PathTraceReferencePass::InitializeVisibilityPipelines(
+    GraphicsDevice& device, ShaderLibrary& shaders, RayTracingPipeline& original,
+    const std::vector<char>& bytecode, const RayTracingPipelineDescription& description)
+{
+    if(!original.Initialize(device.GetRayTracingDevice(), bytecode, description))
+    {
+        return false;
+    }
+
+    const std::string name = description.shaderPath.filename().string();
+
+    // Primary RTXDI and SHARC training deliberately retain the original library.
+    if(!name.starts_with("PathTraceReference") || name.find("Training") != std::string::npos)
+    {
+        return true;
+    }
+
+    auto& alternate = m_rayQueryPipelines[&original];
+
+    if(alternate)
+    {
+        alternate->Shutdown();
+    }
+
+    alternate = std::make_unique<RayTracingPipeline>();
+    RayTracingPipelineDescription queryDescription = description;
+    queryDescription.shaderPath = std::filesystem::path("GI6") / description.shaderPath;
+    const ShaderLibraryCompileResult* library = AcquireLibrary(shaders, queryDescription.shaderPath);
+
+    if(!library || !alternate->Initialize(device.GetRayTracingDevice(), library->bytecode, queryDescription))
+    {
+        alternate->Shutdown();
+        alternate.reset();
+        Log::Warning("GI.6 RayQuery unavailable; original TraceRay retained: " + queryDescription.shaderPath.string());
+    }
+
+    return true;
+}
+
+bool PathTraceReferencePass::IsSecondaryShadowRayQueryReady() const
+{
+    return m_initialized && !m_rayQueryPipelines.empty() &&
+        std::all_of(m_rayQueryPipelines.begin(), m_rayQueryPipelines.end(),
+            [](const auto& entry)
+            {
+                return entry.second != nullptr;
+            });
+}
+
+void PathTraceReferencePass::SelectSecondaryShadowRayQuery(bool enabled)
+{
+    m_secondaryShadowRayQuery = enabled && IsSecondaryShadowRayQueryReady();
+}
+
+RayTracingPipeline& PathTraceReferencePass::VisibilityPipeline(RayTracingPipeline& original)
+{
+    const auto found = m_rayQueryPipelines.find(&original);
+
+    if(m_secondaryShadowRayQuery && found != m_rayQueryPipelines.end() && found->second)
+    {
+        return *found->second;
+    }
+
+    return original;
 }

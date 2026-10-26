@@ -554,6 +554,37 @@ void DebugUI::DrawPerformanceWindow(
     // Sample completed results independently of timing-window visibility.
     m_gpuTimingMonitor.Update(gpu);
 
+    const auto visibilitySettings = GetPathTraceReferenceSettings();
+
+    if(m_sampledVisibilityEpoch != m_visibilityTimingEpoch ||
+        !(visibilitySettings == m_visibilityTimingSettings) ||
+        !(GetSharcSettings() == m_visibilityTimingSharc) ||
+        GetPathTraceDenoiserMode() != m_visibilityTimingDenoiser ||
+        m_pathTraceDenoiserStages.temporalHistory != m_visibilityTimingStages.temporalHistory ||
+        m_pathTraceDenoiserStages.spatialFilter != m_visibilityTimingStages.spatialFilter ||
+        m_pathTraceDenoiserStages.historyResetRequest != m_visibilityTimingStages.historyResetRequest ||
+        m_pathTraceDenoiserStages.extendedDiffuseHistory != m_visibilityTimingStages.extendedDiffuseHistory ||
+        m_pathTraceRenderScale != m_visibilityTimingScale || m_lightingMode != m_visibilityTimingLighting ||
+        !m_pathTraceActiveLastFrame)
+    {
+        m_visibilityTimings.Clear();
+        m_sampledVisibilityEpoch = m_visibilityTimingEpoch;
+        m_visibilityTimingSettings = visibilitySettings;
+        m_visibilityTimingSharc = GetSharcSettings();
+        m_visibilityTimingDenoiser = GetPathTraceDenoiserMode();
+        m_visibilityTimingStages = GetPathTraceDenoiserStages();
+        m_visibilityTimingScale = m_pathTraceRenderScale;
+        m_visibilityTimingLighting = m_lightingMode;
+        // Completed timestamps lag recording. Discard buffered/reset frames and 60 warm-up frames.
+        m_visibilityWarmupUntil = gpu.frameSerial + 62;
+    }
+
+    if(gpu.frameSerial > m_visibilityWarmupUntil)
+    {
+        m_visibilityTimings.Update(gpu);
+    }
+
+
     if(m_showPassTimings)
     {
         ImGui::SetNextWindowPos(ImVec2(20.0f, 40.0f), ImGuiCond_FirstUseEver);
@@ -662,6 +693,35 @@ void DebugUI::DrawPerformanceWindow(
             }
 
             drawGpuTiming("  NRD reflection resolve", GpuTimestampProfiler::Region::NrdResolve);
+
+            ImGui::Text("Secondary shadows: %s | rolling GPU median (last 30 samples)",
+                m_secondaryShadowActive ? "RayQuery (GI.6)" : "TraceRay (Original)");
+            if(ImGui::Button("Restart GPU comparison warm-up"))
+            {
+                m_visibilityTimings.Clear();
+                m_visibilityWarmupUntil = gpu.frameSerial + 62;
+            }
+
+            const auto drawVisibilityMedian = [this](const char* label, GpuTimestampProfiler::Region region)
+            {
+                const auto& history = m_visibilityTimings.histories[static_cast<unsigned int>(region)];
+
+                if(history.count >= GpuTimingMonitor::MinimumBaselineSamples && history.currentValid)
+                {
+                    ImGui::Text("  %s: %.3f ms", label, GpuTimingMonitor::CalculateBaseline(history));
+                }
+                else
+                {
+                    ImGui::Text("  %s: -- (warming up / inactive)", label);
+                }
+            };
+            drawVisibilityMedian("Total GPU frame", GpuTimestampProfiler::Region::TotalFrame);
+            drawVisibilityMedian("Split indirect", GpuTimestampProfiler::Region::PathTraceSplitIndirect);
+            drawVisibilityMedian("Split direct", GpuTimestampProfiler::Region::PathTraceSplitDirect);
+            drawVisibilityMedian("SHARC training", GpuTimestampProfiler::Region::RadianceCacheTraining);
+            drawVisibilityMedian("NRD denoising", GpuTimestampProfiler::Region::NrdPathTraceDenoise);
+            drawVisibilityMedian("Hybrid diffuse", GpuTimestampProfiler::Region::NrdHybridDiffuse);
+            drawVisibilityMedian("Hybrid specular", GpuTimestampProfiler::Region::NrdHybridSpecular);
 
             ImGui::TextUnformatted("Path traced reference");
             drawGpuTiming("  Path trace iteration", GpuTimestampProfiler::Region::PathTraceReference);
@@ -992,6 +1052,7 @@ void DebugUI::SetTLASUpdated(bool updated)
 PathTraceReferenceSettings DebugUI::GetPathTraceReferenceSettings() const
 {
     PathTraceReferenceSettings settings;
+    settings.secondaryShadowRayQuery = m_secondaryShadowVisibility == 1;
     settings.samplesPerFrame = static_cast<std::uint32_t>(m_pathTraceSamplesPerFrame);
     settings.maxPathDepth = static_cast<std::uint32_t>(m_pathTraceMaxPathDepth);
     settings.russianRouletteDepth = static_cast<std::uint32_t>(m_pathTraceRussianRouletteDepth);
@@ -1218,6 +1279,18 @@ void DebugUI::DrawPathTraceReferenceSettings()
         return;
     }
 
+    const char* visibilityModes[] = {"TraceRay (Original)", "RayQuery (GI.6)"};
+    ImGui::BeginDisabled(!m_secondaryShadowReady || preparing);
+    ImGui::Combo("Secondary Shadow Visibility", &m_secondaryShadowVisibility,
+        visibilityModes, IM_ARRAYSIZE(visibilityModes));
+    ImGui::EndDisabled();
+    ImGui::Text("Active secondary shadows: %s", visibilityModes[m_secondaryShadowActive ? 1 : 0]);
+
+    if(!m_secondaryShadowReady)
+    {
+        ImGui::TextDisabled("GI.6 unavailable or pipelines still preparing; original retained.");
+    }
+
     // Both path-traced modes share these settings; ranges match IsValidPathTraceReferenceSettings and every
     // change restarts accumulation.
     ImGui::SliderInt("PT samples per frame", &m_pathTraceSamplesPerFrame, 1,
@@ -1268,8 +1341,9 @@ void DebugUI::DrawPathTraceReferenceSettings()
         }
 
         // NRD.2: only the implemented modes are offered; the combo index is the PathTraceDenoiserMode value. NRD.4B: REBLUR
-        // (experimental); RELAX and Hybrid are not offered.
-        const char* denoiserModes[] = {"Off", "Engine", "NRD REBLUR (experimental)"};
+        // (experimental); NRD.RELAX.4: RELAX (experimental); HYBRID.5: the hybrid (experimental).
+        const char* denoiserModes[] = {"Off", "Engine", "NRD REBLUR (experimental)", "NRD RELAX (experimental)",
+                                       "NRD Hybrid (experimental)"};
         int denoiserMode = static_cast<int>(m_pathTraceDenoiserMode);
 
         if (ImGui::Combo("PT denoiser", &denoiserMode, denoiserModes, IM_ARRAYSIZE(denoiserModes)))
@@ -1277,7 +1351,7 @@ void DebugUI::DrawPathTraceReferenceSettings()
             m_pathTraceDenoiserMode = static_cast<PathTraceDenoiserMode>(denoiserMode);
         }
 
-        if (m_pathTraceDenoiserMode == PathTraceDenoiserMode::NrdReblur)
+        if (IsNrdPathTraceDenoiserMode(m_pathTraceDenoiserMode))
         {
             if (!m_pathTraceNrdStatus.empty())
             {

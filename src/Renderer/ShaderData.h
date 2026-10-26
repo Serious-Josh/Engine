@@ -179,9 +179,14 @@ struct PathTraceReferenceConstants
     // RTXPT.3 ReSTIR DI: the per-sample vertex-0 direct radiance raw UAV. Read only by the
     // split direct and indirect entry points.
     std::uint32_t splitDirectRadianceIndex = 0;
+
+    // NRD.RELAX.2, appended: the raw UAV of the R32F raw primary diffuse hit distance the extraction ray generations
+    // write when requested (PathTraceReferencePass::EnsureRawDiffuseHitDistance); UINT32_MAX writes nothing.
+    std::uint32_t rawDiffuseHitDistanceIndex = 0xFFFFFFFFu;
+    std::uint32_t rawDiffuseHitDistancePadding[3]{};
 };
 
-static_assert(sizeof(PathTraceReferenceConstants) == 64 + 7 * 16 + 64 + 2 * 16);
+static_assert(sizeof(PathTraceReferenceConstants) == 64 + 7 * 16 + 64 + 3 * 16);
 static_assert(offsetof(PathTraceReferenceConstants, sunDirectionToLight) == 64 + 4 * 16);
 static_assert(offsetof(PathTraceReferenceConstants, inverseCameraRelativeViewProjection) == 64 + 7 * 16);
 

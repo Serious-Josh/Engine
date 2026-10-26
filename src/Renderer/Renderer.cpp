@@ -130,6 +130,53 @@ namespace
         return settings;
     }
 
+    // NRD.RELAX.3 diagnostic RELAX: one RELAX_DIFFUSE_SPECULAR instance of its own. SDK defaults (nrd::RelaxSettings{})
+    // except:
+    //   - hit-distance reconstruction AREA_3X3: Engine's vertex-0 lobe selection is probabilistic, so a pixel can lack
+    //     one lobe's sample ("hitT = 0 for the skipped lobe"); NRDSettings.h requires reconstruction then, and the default
+    //     non-zero pre-pass radii it also requires stay on. Engine's selection does not meet the [1/4, 3/4] + Bayer
+    //     condition that guarantees a 3x3 sample (NRDRelax0.md section 9), so this is the conservative setting, not a
+    //     guarantee.
+    //   - antilag off (accelerationAmount 0, resetAmount 0): the SDK README's instruction for an initial integration.
+    //   - NRD.RELAX.5D: 5 A-trous iterations, set explicitly. NRD.RELAX.5C's 4 measured better and cost about 10 % less
+    //     (NRDRelax5B.md, NRDRelax5C.md), but showed low-frequency noise across surfaces during and just after camera
+    //     movement in the Editor (NRDRelax5D.md).
+    // Nothing else is tuned; REBLUR's settings are not reused.
+    constexpr nrd::Identifier PathTraceRelaxIdentifier = 0;
+
+    NrdDenoiser::Description PathTraceRelaxDescription()
+    {
+        NrdDenoiser::Description description;
+        description.name = "PathTraceRELAX";
+        description.denoisers.push_back({PathTraceRelaxIdentifier, nrd::Denoiser::RELAX_DIFFUSE_SPECULAR});
+        description.queuedFrameCount = HybridNrdQueuedFrames;
+        return description;
+    }
+
+    nrd::RelaxSettings PathTraceRelaxSettings()
+    {
+        nrd::RelaxSettings settings;
+        settings.hitDistanceReconstructionMode = nrd::HitDistanceReconstructionMode::AREA_3X3;
+        settings.antilagSettings.accelerationAmount = 0.0f;
+        settings.antilagSettings.resetAmount = 0.0f;
+        settings.atrousIterationNum = 5;
+        return settings;
+    }
+
+    constexpr nrd::Identifier PathTraceHybridDiffuseIdentifier = 17;
+    constexpr nrd::Identifier PathTraceHybridSpecularIdentifier = 29;
+
+    NrdDenoiser::Description PathTraceHybridDescription()
+    {
+        NrdDenoiser::Description description;
+        description.name = "PathTraceHybridDiagnostic";
+        description.denoisers = {
+            {PathTraceHybridDiffuseIdentifier, nrd::Denoiser::RELAX_DIFFUSE},
+            {PathTraceHybridSpecularIdentifier, nrd::Denoiser::REBLUR_SPECULAR}};
+        description.queuedFrameCount = HybridNrdQueuedFrames;
+        return description;
+    }
+
     NrdDenoiser::Description HybridNrdReflectionDescription()
     {
         return {"ReflectionREBLUR", {{HybridNrdReflectionIdentifier, nrd::Denoiser::REBLUR_SPECULAR}},
@@ -3721,8 +3768,10 @@ bool Renderer::ResizeSceneResources(const SceneResolution& resolution)
     // RTXPT D.2B temporal history is sized for the old extent; the next temporal frame creates it again.
     m_pathTraceTemporalPass.ReleaseHistory();
     m_pathTraceSpatialPass.ReleaseIntermediate();
-    // NRD.3: sized for the old extent; the next diagnostic frame creates them again.
+    // NRD.3: sized for the old extent; the next diagnostic frame creates them again. NRD.RELAX.2: the RELAX preparation too
+    // (the raw diffuse hit distance went with the path tracer's resize).
     m_nrdPathTracePreparePass.ReleaseTextures();
+    m_nrdRelaxPreparePass.ReleaseTextures();
     // NRD.4B: the GPU is idle here; the next REBLUR frame creates the instance again (CLEAR_AND_RESTART). A new extent
     // also retries a failed creation.
     m_nrdPathTraceDenoiser.Shutdown();
@@ -3730,6 +3779,19 @@ bool Renderer::ResizeSceneResources(const SceneResolution& resolution)
     m_nrdPathTraceCreationFailed = false;
     m_nrdPathTraceHistoryValid = false;
     m_nrdPathTraceExecutedLastFrame = false;
+    // NRD.RELAX.3: the same for the diagnostic RELAX instance (recreated with CLEAR_AND_RESTART by its next frame).
+    m_nrdRelaxDenoiser.Shutdown();
+    m_nrdRelaxResolvedTexture.Shutdown();
+    m_nrdRelaxCreationFailed = false;
+    m_nrdRelaxHistoryValid = false;
+    m_nrdRelaxExecutedLastFrame = false;
+    // HYBRID.3: the same for the hybrid diagnostic instance and its inputs.
+    m_nrdHybridDenoiser.Shutdown();
+    m_nrdHybridPreparePass.ReleaseTextures();
+    m_nrdHybridCreationFailed = false;
+    m_nrdHybridHistoryValid = false;
+    m_nrdHybridExecutedLastFrame = false;
+    m_nrdHybridDispatchedThisFrame = false;
 
     // Recreated only if a PT mode already allocated it; a new extent also clears an earlier failure.
     InvalidatePreviousGBufferHistory();
@@ -4568,6 +4630,7 @@ bool Renderer::ReleaseSceneResources()
 
 void Renderer::ResetSceneHistory()
 {
+    ++m_pathTraceStatus.visibilityTimingEpoch;
     m_gpuTimestampProfiler.BreakFrameSequence();
     ResetCpuSubmissionCadence();
     m_giSignedCorrectionPass.ResetHistory();
@@ -4782,6 +4845,35 @@ void Renderer::ReleaseNrdPathTraceDiagnostic()
     m_nrdPathTracePreparePass.ReleaseTextures();
 }
 
+void Renderer::ReleaseNrdRelaxPrepareDiagnostic()
+{
+    const bool releaseRawDistance = !m_nrdHybridDispatchDiagnostic &&
+        m_pathTraceDenoiserMode != PathTraceDenoiserMode::NrdHybrid &&
+        m_pathTraceReferencePass.HasRawDiffuseHitDistanceResources();
+
+    if(!m_nrdRelaxPreparePass.IsInitialized() && !m_nrdRelaxPreparePass.HasTextures() &&
+        !releaseRawDistance)
+    {
+        return;
+    }
+
+    // Submitted frames may still use the pipelines or textures.
+    if(!m_commandContext.WaitForGPU())
+    {
+        Log::Error("Failed to wait for the GPU before releasing the RELAX preparation; it is kept.");
+        return;
+    }
+
+    // NRD.RELAX.2B: the raw-distance extraction pipelines go with it, so ordinary rendering holds none.
+    m_nrdRelaxPreparePass.Shutdown();
+    // HYBRID.3 (diagnostic) and HYBRID.5 (selected) consume the same optional raw-distance producer independently of
+    // standalone RELAX.
+    if(releaseRawDistance)
+    {
+        m_pathTraceReferencePass.ReleaseRawDiffuseHitDistanceResources();
+    }
+}
+
 void Renderer::EnsureRtxdiResources()
 {
     if(m_rtxdiResources.IsInitialized() || m_rtxdiResourcesFailed)
@@ -4927,9 +5019,11 @@ void Renderer::InvalidatePreviousGBufferHistory()
 
     // RTXPT D.2B: temporal history is validated against the previous G-buffer, so it never outlives it (scene
     // history resets, camera cuts, resize, failed frames, path-tracing entry and primary changes). NRD.4B: neither does
-    // REBLUR's.
+    // REBLUR's. NRD.RELAX.3: nor RELAX's.
     m_pathTraceTemporalPass.InvalidateHistory();
     m_nrdPathTraceHistoryValid = false;
+    m_nrdRelaxHistoryValid = false;
+    m_nrdHybridHistoryValid = false;
 }
 
 void Renderer::RecordPreviousGBufferCopy(ID3D12GraphicsCommandList* commandList, const PreviousGBufferCamera& camera)
@@ -5326,14 +5420,27 @@ D3D12_GPU_VIRTUAL_ADDRESS Renderer::PrepareRadianceCacheLearning(ID3D12GraphicsC
         deferred ? recordCount : 0, sparse ? m_radianceCacheD6.TrainingTilesX(m_sceneWidth) : 0);
 }
 
-PathTraceRadianceCacheLibrary Renderer::RadianceCacheQueryLibrary(bool extract, bool splitReSTIRDI) const
+PathTraceRadianceCacheLibrary Renderer::RadianceCacheQueryLibrary(bool extract, bool splitReSTIRDI,
+    bool rawDiffuseHitDistance) const
 {
     if(m_radianceCacheD6.UsesQueryRenderLibrary())
     {
+        const bool raw = extract && rawDiffuseHitDistance;
+
         if(splitReSTIRDI)
         {
+            if(raw)
+            {
+                return PathTraceRadianceCacheLibrary::RenderSplitIndirectExtractionRawDiffuseHitDistance;
+            }
+
             return extract ? PathTraceRadianceCacheLibrary::RenderSplitIndirectExtraction :
                 PathTraceRadianceCacheLibrary::RenderSplitIndirect;
+        }
+
+        if(raw)
+        {
+            return PathTraceRadianceCacheLibrary::RenderExtractionRawDiffuseHitDistance;
         }
 
         return extract ? PathTraceRadianceCacheLibrary::RenderExtraction : PathTraceRadianceCacheLibrary::Render;
@@ -5371,6 +5478,8 @@ void Renderer::ApplySharcSettings(const SharcSettings& requested, bool rasterPri
         m_pathTraceResetPending = true;
         m_pathTraceTemporalPass.InvalidateHistory();
         m_nrdPathTraceHistoryValid = false;
+        m_nrdRelaxHistoryValid = false;
+        m_nrdHybridHistoryValid = false;
     }
 
     RadianceCacheD6& cache = m_radianceCacheD6;
@@ -5406,35 +5515,26 @@ void Renderer::ApplySharcSettings(const SharcSettings& requested, bool rasterPri
 
 void Renderer::ApplyPathTraceDenoiser(PathTraceDenoiserMode requested, bool rasterPrimary)
 {
-    PathTraceDenoiserMode mode = rasterPrimary ? requested : PathTraceDenoiserMode::Off;
-    // NRD.4B: REBLUR is implemented; RELAX and Hybrid are still presented as Engine.
-    const bool unimplemented = mode == PathTraceDenoiserMode::NrdRelax || mode == PathTraceDenoiserMode::NrdHybrid;
-    const PathTraceDenoiserMode unavailable = unimplemented ? mode : PathTraceDenoiserMode::Off;
+    // NRD.4B: REBLUR is implemented; NRD.RELAX.4: so is RELAX; HYBRID.5: so is the hybrid.
+    const PathTraceDenoiserMode mode = rasterPrimary ? requested : PathTraceDenoiserMode::Off;
 
-    if(unavailable != m_pathTraceDenoiserUnavailableMode && unavailable != PathTraceDenoiserMode::Off)
-    {
-        Log::Warning("The NRD RELAX and Hybrid path-tracing denoiser modes are not implemented yet; the Engine denoiser is "
-            "used.");
-    }
-
-    m_pathTraceDenoiserUnavailableMode = unavailable;
-
-    if(unavailable != PathTraceDenoiserMode::Off)
-    {
-        mode = PathTraceDenoiserMode::Engine;
-    }
-
-    // NRD.4B: histories never cross modes; entering or leaving REBLUR restarts its history.
+    // NRD.4B: histories never cross modes; entering or leaving REBLUR restarts its history. NRD.RELAX.4: RELAX's too, and a
+    // mode change retries a failed RELAX creation. HYBRID.5: the same for the hybrid.
     if(mode != m_pathTraceDenoiserMode)
     {
         m_nrdPathTraceHistoryValid = false;
         m_nrdPathTraceCreationFailed = false;
+        m_nrdRelaxHistoryValid = false;
+        m_nrdHybridHistoryValid = false;
+        m_nrdRelaxCreationFailed = false;
+        m_nrdHybridCreationFailed = false;
     }
 
     m_pathTraceDenoiserMode = mode;
-    // REBLUR keeps the Engine stages enabled: a frame REBLUR cannot denoise falls back to them (RecordPathTraceReference
-    // skips them on frames REBLUR presents).
-    const bool denoise = mode == PathTraceDenoiserMode::Engine || mode == PathTraceDenoiserMode::NrdReblur;
+    // REBLUR, (NRD.RELAX.4) RELAX and (HYBRID.5) the hybrid keep the Engine stages enabled: a frame they cannot denoise
+    // falls back to them (RecordPathTraceReference skips them on frames an NRD mode presents).
+    const bool denoise = mode == PathTraceDenoiserMode::Engine || mode == PathTraceDenoiserMode::NrdReblur ||
+        mode == PathTraceDenoiserMode::NrdRelax || mode == PathTraceDenoiserMode::NrdHybrid;
 
     if(denoise == m_pathTraceDenoiserOption)
     {
@@ -5733,8 +5833,10 @@ void Renderer::ApplyPathTraceDenoiserStages(const PathTraceDenoiserStages& stage
     {
         m_pathTraceTemporalHistoryDisabled = !stages.temporalHistory;
         m_pathTraceTemporalPass.InvalidateHistory();
-        // NRD.4B: the explicit history reset (historyResetRequest) restarts REBLUR too.
+        // NRD.4B: the explicit history reset (historyResetRequest) restarts REBLUR too, and (NRD.RELAX.3) RELAX.
         m_nrdPathTraceHistoryValid = false;
+        m_nrdRelaxHistoryValid = false;
+        m_nrdHybridHistoryValid = false;
     }
 }
 
@@ -5764,12 +5866,12 @@ void Renderer::UpdateSharcStatus(unsigned int frameSlot)
 }
 
 D3D12_GPU_VIRTUAL_ADDRESS Renderer::PrepareRadianceCacheQuery(ID3D12GraphicsCommandList* commandList, bool extract,
-    bool splitReSTIRDI)
+    bool splitReSTIRDI, bool rawDiffuseHitDistance)
 {
     std::string failure;
 
     if(!m_radianceCacheD6.UsesQueryLibrary() || !m_pathTraceReferencePass.EnsureRadianceCacheLearning(m_graphicsDevice,
-        m_shaderLibrary, failure, RadianceCacheQueryLibrary(extract, splitReSTIRDI)))
+        m_shaderLibrary, failure, RadianceCacheQueryLibrary(extract, splitReSTIRDI, rawDiffuseHitDistance)))
     {
         return 0;
     }
@@ -5822,6 +5924,8 @@ bool Renderer::RecordPathTraceReference(
     const PathTraceReferenceSettings& settings)
 {
     m_nrdPathTraceDiagnosticRanLastFrame = false;
+    m_pathTraceRawDiffuseHitDistanceLastFrame = false;
+    m_nrdRelaxPrepareDiagnosticRanLastFrame = false;
 
     // Stage 1: decide whether the running mean is still valid for this frame's inputs. The camera is identified by its
     // unjittered projection, so jitter alone never restarts accumulation (UPSCALING.2B).
@@ -5882,7 +5986,11 @@ bool Renderer::RecordPathTraceReference(
         settings.maxAccumulatedSamples - accumulated : 0u;
     // UPSCALING.3C: DLSS mode never holds a converged image; it traces every frame. NRD.4B: neither does NRD REBLUR,
     // which needs a fresh sample every frame (a held frame would break its history).
-    const bool traceEveryFrame = m_dlssModeThisFrame || m_pathTraceDenoiserMode == PathTraceDenoiserMode::NrdReblur;
+    // NRD.RELAX.4: RELAX, like REBLUR, needs fresh samples every frame (its history, not the progressive mean, converges).
+    // HYBRID.5: so does the hybrid.
+    const bool traceEveryFrame = m_dlssModeThisFrame || m_pathTraceDenoiserMode == PathTraceDenoiserMode::NrdReblur ||
+        m_pathTraceDenoiserMode == PathTraceDenoiserMode::NrdRelax ||
+        m_pathTraceDenoiserMode == PathTraceDenoiserMode::NrdHybrid;
     const std::uint32_t frameSamples = traceEveryFrame ? settings.samplesPerFrame :
         (std::min)(settings.samplesPerFrame, remaining);
 
@@ -5896,6 +6004,8 @@ bool Renderer::RecordPathTraceReference(
     m_pathTraceExtractedLastFrame = false;
     m_pathTraceTemporalRanLastFrame = false;
     m_nrdPathTracePresentedLastFrame = false;
+    m_nrdRelaxPresentedLastFrame = false;
+    m_nrdHybridPresentedLastFrame = false;
     m_pathTraceSpatialRanLastFrame = false;
     m_pathTraceSpatialRequested = false;
     m_pathTraceScalarViewLastFrame = false;
@@ -5982,6 +6092,8 @@ bool Renderer::RecordPathTraceReference(
         // RTXPT D.1B.2: diagnostics-requested signal extraction records the extraction exports, which accumulate
         // exactly as the production ones. Anything it cannot create leaves the frame on the production exports.
         bool extract = false;
+        // NRD.RELAX.2B: whether this frame records the raw-distance extraction pipelines.
+        bool rawExtraction = false;
 
         if(m_pathTraceSignalExtraction &&
             (primary == PathTracePrimary::Raster || primary == PathTracePrimary::RasterReSTIRDI))
@@ -6003,6 +6115,39 @@ bool Renderer::RecordPathTraceReference(
             {
                 constants.diffuseOutputIndex = m_pathTraceReferencePass.GetDiffuseTexture().GetUAVIndex();
                 constants.specularOutputIndex = m_pathTraceReferencePass.GetSpecularTexture().GetUAVIndex();
+
+                // NRD.RELAX.2: the raw diffuse hit distance, beside the unchanged extraction outputs. NRD.RELAX.2B: it
+                // comes from the raw-distance extraction pipelines (their own libraries), created here on first use.
+                // Without them or the texture the frame records the legacy extraction and the RELAX preparation does
+                // not run.
+                if(m_nrdHybridDispatchDiagnostic || m_nrdRelaxPrepareDiagnostic || m_nrdRelaxDispatchDiagnostic ||
+                    m_pathTraceDenoiserMode == PathTraceDenoiserMode::NrdRelax ||
+                    m_pathTraceDenoiserMode == PathTraceDenoiserMode::NrdHybrid)
+                {
+                    std::string rawFailure;
+                    Texture* rawDiffuseHitDistance = nullptr;
+
+                    if(m_pathTraceReferencePass.EnsureSignalExtraction(m_graphicsDevice, m_shaderLibrary,
+                        m_resourceDescriptorHeap, primary, rawFailure, true))
+                    {
+                        rawDiffuseHitDistance = m_pathTraceReferencePass.EnsureRawDiffuseHitDistanceTexture(
+                            m_graphicsDevice.GetDevice(), m_resourceDescriptorHeap);
+                    }
+                    else if(rawFailure != m_rawDiffuseHitDistanceFailure)
+                    {
+                        // NRD.RELAX.4: a sticky failure is reported once per distinct reason, not every frame.
+                        Log::Error("Raw diffuse hit distance extraction is unavailable: " + rawFailure);
+                        m_rawDiffuseHitDistanceFailure = rawFailure;
+                    }
+
+                    if(rawDiffuseHitDistance)
+                    {
+                        m_rawDiffuseHitDistanceFailure.clear();
+                        rawDiffuseHitDistance->Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                        constants.rawDiffuseHitDistanceIndex = rawDiffuseHitDistance->GetUAVIndex();
+                        rawExtraction = true;
+                    }
+                }
             }
             else
             {
@@ -6064,8 +6209,8 @@ bool Renderer::RecordPathTraceReference(
             else
             {
                 // Without a query binding (0) the reference pipeline renders.
-                renderCacheAddress = PrepareRadianceCacheQuery(commandList, extract, splitReSTIRDI);
-                renderCacheLibrary = RadianceCacheQueryLibrary(extract, splitReSTIRDI);
+                renderCacheAddress = PrepareRadianceCacheQuery(commandList, extract, splitReSTIRDI, rawExtraction);
+                renderCacheLibrary = RadianceCacheQueryLibrary(extract, splitReSTIRDI, rawExtraction);
             }
         }
 
@@ -6076,24 +6221,58 @@ bool Renderer::RecordPathTraceReference(
             m_pathTraceReferencePass.ExecuteReSTIRDISplit(m_commandContext.GetRayTracingCommandList(),
                 m_gpuTimestampProfiler, frameIndex, m_resourceDescriptorHeap, m_rayTracingScene, constantsAddress,
                 sceneLightConstantsAddress, m_sceneWidth, m_sceneHeight, rtxdiConstantsAddress, extract,
-                renderCacheAddress, renderCacheLibrary);
+                renderCacheAddress, renderCacheLibrary, rawExtraction);
         }
         else
         {
             m_pathTraceReferencePass.Execute(primary, m_commandContext.GetRayTracingCommandList(),
                 m_resourceDescriptorHeap, m_rayTracingScene, constantsAddress, sceneLightConstantsAddress, m_sceneWidth,
-                m_sceneHeight, extract, renderCacheAddress, renderCacheLibrary);
+                m_sceneHeight, extract, renderCacheAddress, renderCacheLibrary, rawExtraction);
         }
+
+        // NRD.RELAX.2B: only a dispatch that actually wrote the raw distance lets this frame read it.
+        m_pathTraceRawDiffuseHitDistanceLastFrame = m_pathTraceReferencePass.WroteRawDiffuseHitDistance();
 
         // NRD.4B: REBLUR denoises this frame's extraction in place of the Engine stages. Everything that can fail is
         // done here, before anything is recorded; a frame it cannot denoise falls back to the Engine stages below.
         const bool nrdFrame = m_pathTraceDenoiserMode == PathTraceDenoiserMode::NrdReblur &&
             m_pathTraceExtractedLastFrame && BeginPathTraceNrdFrame(primary, view, cameraProjection, frameLighting, settings);
 
+        // NRD.RELAX.4: the same for RELAX, which also needs this frame's raw diffuse hit distance. Without it, or when
+        // anything fallible fails, the Engine stages present this frame.
+        bool relaxFrame = false;
+
+        if(m_pathTraceDenoiserMode == PathTraceDenoiserMode::NrdRelax && m_pathTraceExtractedLastFrame)
+        {
+            if(!m_pathTraceRawDiffuseHitDistanceLastFrame)
+            {
+                ReportNrdRelaxUnavailable("the raw diffuse hit distance was not produced");
+            }
+            else
+            {
+                relaxFrame = BeginNrdRelaxFrame(primary, view, cameraProjection, frameLighting, settings);
+            }
+        }
+
+        // HYBRID.5: the same for the hybrid (RELAX diffuse and REBLUR specular from one instance).
+        bool hybridFrame = false;
+
+        if(m_pathTraceDenoiserMode == PathTraceDenoiserMode::NrdHybrid && m_pathTraceExtractedLastFrame)
+        {
+            if(!m_pathTraceRawDiffuseHitDistanceLastFrame)
+            {
+                ReportNrdHybridUnavailable("the raw diffuse hit distance was not produced");
+            }
+            else
+            {
+                hybridFrame = BeginNrdHybridFrame(primary, view, cameraProjection, frameLighting, settings);
+            }
+        }
+
         // RTXPT D.2B: temporal reconstruction consumes this frame's extraction outputs, so it runs only on frames
         // that extracted, before the presentation copy below. It is timed inside the path-tracing region, which
         // therefore includes it in temporal frames (diagnostics only; without it the region is unchanged).
-        if(m_pathTraceTemporal && m_pathTraceExtractedLastFrame && !nrdFrame)
+        if(m_pathTraceTemporal && m_pathTraceExtractedLastFrame && !nrdFrame && !relaxFrame && !hybridFrame)
         {
             // RTXPT D.3B: decided first, because the spatial pass replaces the temporal pass's own presentation. A
             // D.3B.0 diagnostic view also runs it, for display only.
@@ -6144,7 +6323,9 @@ bool Renderer::RecordPathTraceReference(
             (renderCacheLibrary == PathTraceRadianceCacheLibrary::Render ||
             renderCacheLibrary == PathTraceRadianceCacheLibrary::RenderExtraction ||
             renderCacheLibrary == PathTraceRadianceCacheLibrary::RenderSplitIndirect ||
-            renderCacheLibrary == PathTraceRadianceCacheLibrary::RenderSplitIndirectExtraction);
+            renderCacheLibrary == PathTraceRadianceCacheLibrary::RenderSplitIndirectExtraction ||
+            renderCacheLibrary == PathTraceRadianceCacheLibrary::RenderExtractionRawDiffuseHitDistance ||
+            renderCacheLibrary == PathTraceRadianceCacheLibrary::RenderSplitIndirectExtractionRawDiffuseHitDistance);
 
         // SHARC.4E statistics: this frame's counters, read back when its slot comes round again.
         if(m_sharcSettings.enabled && m_sharcSettings.statistics && renderCacheAddress != 0)
@@ -6169,11 +6350,53 @@ bool Renderer::RecordPathTraceReference(
             m_nrdPathTracePresentedLastFrame = true;
         }
 
+        // NRD.RELAX.4: RELAX's denoised radiance replaces the presentation's surface pixels, as REBLUR's does. A dispatch
+        // that is not recorded leaves the path tracer's own frame mean presented (never an earlier RELAX output) and
+        // commits no history.
+        if(relaxFrame)
+        {
+            m_nrdRelaxPresentedLastFrame = RecordNrdRelax(commandList, frameIndex, view, inverseViewProjection,
+                cameraPosition, &m_pathTraceReferencePass.GetOutputTexture());
+        }
+
+        // HYBRID.5: the hybrid's denoised radiance replaces the presentation's surface pixels, as RELAX's does. Only a
+        // complete pair is resolved; otherwise the path tracer's own frame mean stays presented and no history commits.
+        if(hybridFrame)
+        {
+            m_nrdHybridPresentedLastFrame = RecordNrdHybrid(commandList, frameIndex, view, inverseViewProjection,
+                cameraPosition, &m_pathTraceReferencePass.GetOutputTexture());
+        }
+
         // NRD.3 diagnostics: reads this frame's raw extraction and G-buffer and writes only its own textures.
         if(m_nrdPathTraceDiagnostic && m_pathTraceExtractedLastFrame)
         {
             m_nrdPathTraceDiagnosticRanLastFrame = RecordNrdPathTraceDiagnostic(commandList, frameIndex, view,
                 inverseViewProjection, cameraPosition);
+        }
+
+        // NRD.RELAX.2 diagnostics: the same reads, its own textures; nothing is dispatched to RELAX.
+        if(m_nrdRelaxPrepareDiagnostic && m_pathTraceExtractedLastFrame && m_pathTraceRawDiffuseHitDistanceLastFrame)
+        {
+            m_nrdRelaxPrepareDiagnosticRanLastFrame = RecordNrdRelaxPrepareDiagnostic(commandList, view,
+                inverseViewProjection, cameraPosition);
+        }
+
+        // NRD.RELAX.3 diagnostics: RELAX on this frame's RELAX inputs, into its own textures only. A frame without a
+        // fresh raw diffuse hit distance records nothing, which is a gap for RELAX's history.
+        // NRD.RELAX.4: never as well as the selected RELAX, which already resolves into the diagnostic texture.
+        if(m_nrdRelaxDispatchDiagnostic && m_pathTraceExtractedLastFrame && m_pathTraceRawDiffuseHitDistanceLastFrame &&
+            m_pathTraceDenoiserMode != PathTraceDenoiserMode::NrdRelax)
+        {
+            RecordNrdRelaxDispatchDiagnostic(commandList, frameIndex, primary, view, cameraProjection,
+                inverseViewProjection, cameraPosition, frameLighting, settings);
+        }
+
+        // HYBRID.5: never as well as the selected hybrid, which owns the same instance (one NewFrame per frame).
+        if(m_nrdHybridDispatchDiagnostic && !m_nrdHybridSkipFrame && m_pathTraceExtractedLastFrame &&
+            m_pathTraceRawDiffuseHitDistanceLastFrame && m_pathTraceDenoiserMode != PathTraceDenoiserMode::NrdHybrid)
+        {
+            RecordNrdHybridDiagnostic(commandList, frameIndex, primary, view, cameraProjection,
+                inverseViewProjection, cameraPosition, frameLighting, settings);
         }
 
         if(usesRtxdi)
@@ -6418,6 +6641,550 @@ bool Renderer::RecordNrdPathTraceDiagnostic(
     m_nrdPathTracePreparePass.ExecuteResolve(commandList, m_uploadBuffer, constants, m_sceneWidth, m_sceneHeight);
     m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::NrdPathTraceResolve);
     return true;
+}
+
+bool Renderer::RecordNrdRelaxPrepareDiagnostic(
+    ID3D12GraphicsCommandList* commandList,
+    const Matrix4& view,
+    const Matrix4& inverseViewProjection,
+    const Vector3& cameraPosition)
+{
+    if(!m_nrdRelaxPreparePass.Initialize(m_graphicsDevice, m_shaderLibrary, NrdPathTracePreparePass::Encoding::Relax) ||
+        !m_nrdRelaxPreparePass.EnsureTextures(m_graphicsDevice.GetDevice(), m_resourceDescriptorHeap, m_sceneWidth,
+            m_sceneHeight, true))
+    {
+        return false;
+    }
+
+    NrdPathTracePrepareConstants constants = MakeNrdPathTracePrepareConstants(commandList, view, inverseViewProjection,
+        cameraPosition);
+    Texture& rawDiffuseHitDistance = m_pathTraceReferencePass.GetRawDiffuseHitDistanceTexture();
+    rawDiffuseHitDistance.Transition(commandList,
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    constants.rawDiffuseHitDistanceIndex = rawDiffuseHitDistance.GetDescriptorIndex();
+
+    m_nrdRelaxPreparePass.ExecutePrepare(commandList, m_uploadBuffer, constants, m_sceneWidth, m_sceneHeight);
+    m_nrdRelaxPreparePass.ExecuteResolve(commandList, m_uploadBuffer, constants, m_sceneWidth, m_sceneHeight);
+    return true;
+}
+
+bool Renderer::EnsureNrdHybridDenoiser()
+{
+    if(m_nrdHybridDenoiser.IsInitialized())
+    {
+        return true;
+    }
+
+    if(m_nrdHybridCreationFailed)
+    {
+        return false;
+    }
+
+    NrdDenoiser::Description description = PathTraceHybridDescription();
+
+    if(std::exchange(m_nrdHybridFailCreationForTesting, false) ||
+        !m_nrdHybridDenoiser.Initialize(m_graphicsDevice.GetDevice(), m_commandContext.GetCommandQueue(),
+            m_resourceDescriptorHeap, m_sceneWidth, m_sceneHeight, description))
+    {
+        // NrdDenoiser::Initialize leaves nothing behind on failure (NRD.RELAX.1).
+        m_nrdHybridCreationFailed = true;
+        return false;
+    }
+
+    ++m_nrdHybridCreations;
+    m_nrdHybridInstanceNew = true;
+    Log::Info("NRD hybrid diagnostic initialized at " + std::to_string(m_sceneWidth) + "x" +
+        std::to_string(m_sceneHeight) + ": persistent " + std::to_string(m_nrdHybridDenoiser.GetPersistentMemoryUsageInMb()) +
+        " MiB, transient " + std::to_string(m_nrdHybridDenoiser.GetAliasableMemoryUsageInMb()) + " MiB.");
+    return true;
+}
+
+void Renderer::ReleaseNrdHybridDenoiser()
+{
+    if(!m_nrdHybridDenoiser.IsInitialized() && !m_nrdHybridPreparePass.IsInitialized() && !m_nrdHybridCreationFailed)
+    {
+        return;
+    }
+
+    // Lifecycle-only drain. There is no wait between filters or on steady frames.
+    if(!m_commandContext.WaitForGPU())
+    {
+        Log::Error("Failed to wait before releasing the NRD hybrid denoiser; resources retained.");
+        return;
+    }
+
+    m_nrdHybridDenoiser.Shutdown();
+    m_nrdHybridPreparePass.Shutdown();
+    m_nrdHybridCreationFailed = false;
+    m_nrdHybridHistoryValid = false;
+    m_nrdHybridExecutedLastFrame = false;
+    m_nrdHybridDispatchedThisFrame = false;
+    m_nrdHybridKey.reset();
+}
+
+void Renderer::ReportNrdHybridUnavailable(const std::string& reason)
+{
+    // HYBRID.5, as RELAX's (NRD.RELAX.4): as the selected denoiser the Engine stages present instead; as the diagnostic
+    // nothing is presented. Either way the frame is a gap in the hybrid's history.
+    const bool selected = m_pathTraceDenoiserMode == PathTraceDenoiserMode::NrdHybrid;
+    m_nrdHybridHistoryValid = false;
+
+    if(reason != m_nrdHybridFailure)
+    {
+        Log::Warning(selected ? "NRD Hybrid could not denoise this frame (" + reason + "); the Engine denoiser is used." :
+            "NRD hybrid diagnostic could not run this frame (" + reason + ").");
+    }
+
+    m_nrdHybridFailure = reason;
+
+    if(selected)
+    {
+        m_debugUI.SetPathTraceNrdStatus("NRD Hybrid unavailable (" + reason + "); using Engine.");
+    }
+}
+
+bool Renderer::BeginNrdHybridFrame(
+    PathTracePrimary primary,
+    const Matrix4& view,
+    const Matrix4& cameraProjection,
+    const FrameLighting& frameLighting,
+    const PathTraceReferenceSettings& settings)
+{
+    if(!EnsureNrdHybridDenoiser())
+    {
+        ReportNrdHybridUnavailable("the hybrid instance could not be created");
+        return false;
+    }
+
+    // The NRD inputs only; the hybrid has no bypass reconstructions.
+    if(!m_nrdHybridPreparePass.Initialize(m_graphicsDevice, m_shaderLibrary, NrdPathTracePreparePass::Encoding::Hybrid) ||
+        !m_nrdHybridPreparePass.EnsureTextures(m_graphicsDevice.GetDevice(), m_resourceDescriptorHeap, m_sceneWidth,
+            m_sceneHeight, false))
+    {
+        ReportNrdHybridUnavailable("the hybrid input textures could not be created");
+        return false;
+    }
+
+    // RESTART sources as REBLUR's: the temporal key and a frame gap; the shared invalidations clear the flag directly.
+    const PathTraceTemporalKey key = MakePathTraceTemporalKey(primary, frameLighting, settings);
+
+    if(!m_nrdHybridKey || !SamePathTraceTemporalKey(*m_nrdHybridKey, key) || !m_nrdHybridExecutedLastFrame)
+    {
+        m_nrdHybridHistoryValid = false;
+    }
+
+    m_nrdHybridKey = key;
+    m_nrdHybridAccumulationMode = m_nrdHybridInstanceNew ? nrd::AccumulationMode::CLEAR_AND_RESTART :
+        m_nrdHybridHistoryValid ? nrd::AccumulationMode::CONTINUE : nrd::AccumulationMode::RESTART;
+    const bool continuing = m_nrdHybridAccumulationMode == nrd::AccumulationMode::CONTINUE;
+    const float jitter[2] = {m_cameraJitterStatus.active ? m_cameraJitterStatus.x : 0.0f,
+        m_cameraJitterStatus.active ? m_cameraJitterStatus.y : 0.0f};
+
+    // REBLUR's validated conventions (NRD.3 section 8, NRDRelax2.md section 7): unjittered matrices, jitter separately,
+    // G-buffer motion scaled by (-1, -1, 1), the preparation's denoising range. Without history the previous frame is
+    // this one.
+    NrdDenoiser::FrameSettings frameSettings;
+    frameSettings.view = view;
+    frameSettings.projection = cameraProjection;
+    frameSettings.previousView = continuing ? m_nrdHybridPreviousView : view;
+    frameSettings.previousProjection = continuing ? m_nrdHybridPreviousProjection : cameraProjection;
+    frameSettings.jitter[0] = jitter[0];
+    frameSettings.jitter[1] = jitter[1];
+    frameSettings.previousJitter[0] = continuing ? m_nrdHybridPreviousJitter[0] : jitter[0];
+    frameSettings.previousJitter[1] = continuing ? m_nrdHybridPreviousJitter[1] : jitter[1];
+    frameSettings.motionVectorScale[0] = -1.0f;
+    frameSettings.motionVectorScale[1] = -1.0f;
+    frameSettings.motionVectorScale[2] = 1.0f;
+    frameSettings.frameIndex = m_nrdHybridFrameIndex;
+    frameSettings.denoisingRange = PathTraceNrdDenoisingRange;
+    frameSettings.accumulationMode = m_nrdHybridAccumulationMode;
+
+    m_nrdHybridDenoiser.NewFrame();
+
+    if(!m_nrdHybridDenoiser.SetCommonSettings(frameSettings) ||
+        !m_nrdHybridDenoiser.SetDenoiserSettings(PathTraceHybridDiffuseIdentifier, PathTraceRelaxSettings()) ||
+        !m_nrdHybridDenoiser.SetDenoiserSettings(PathTraceHybridSpecularIdentifier, PathTraceNrdSettings()))
+    {
+        ReportNrdHybridUnavailable("NRD rejected the hybrid frame settings");
+        return false;
+    }
+
+    // Committed only if RecordNrdHybrid records a complete pair and the frame is submitted.
+    m_nrdHybridPendingView = view;
+    m_nrdHybridPendingProjection = cameraProjection;
+    m_nrdHybridPendingJitter[0] = jitter[0];
+    m_nrdHybridPendingJitter[1] = jitter[1];
+    return true;
+}
+
+bool Renderer::RecordNrdHybridDiagnostic(
+    ID3D12GraphicsCommandList* commandList,
+    unsigned int frameIndex,
+    PathTracePrimary primary,
+    const Matrix4& view,
+    const Matrix4& cameraProjection,
+    const Matrix4& inverseViewProjection,
+    const Vector3& cameraPosition,
+    const FrameLighting& frameLighting,
+    const PathTraceReferenceSettings& settings)
+{
+    // Everything that can fail, before anything is recorded; then preparation and both filters, never presented.
+    return BeginNrdHybridFrame(primary, view, cameraProjection, frameLighting, settings) &&
+        RecordNrdHybrid(commandList, frameIndex, view, inverseViewProjection, cameraPosition, nullptr);
+}
+
+bool Renderer::RecordNrdHybrid(
+    ID3D12GraphicsCommandList* commandList,
+    unsigned int frameIndex,
+    const Matrix4& view,
+    const Matrix4& inverseViewProjection,
+    const Vector3& cameraPosition,
+    Texture* presentation)
+{
+    // HYBRID.1's validated packing: radiance scale 64 and the raw (not normalized) diffuse hit distance.
+    auto constants = MakeNrdPathTracePrepareConstants(commandList, view, inverseViewProjection, cameraPosition);
+    constants.radianceScale = 64.0f;
+    constants.specularHitDistanceMode = 0;
+    auto& rawDistance = m_pathTraceReferencePass.GetRawDiffuseHitDistanceTexture();
+    rawDistance.Transition(commandList,
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    constants.rawDiffuseHitDistanceIndex = rawDistance.GetDescriptorIndex();
+
+    m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::NrdHybridPrepare);
+    m_nrdHybridPreparePass.ExecutePrepare(commandList, m_uploadBuffer, constants, m_sceneWidth, m_sceneHeight);
+    m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::NrdHybridPrepare);
+
+    NrdDenoiser::Inputs inputs;
+    inputs.motion = m_nrdHybridPreparePass.GetMotion().GetResource();
+    inputs.normalRoughness = &m_nrdHybridPreparePass.GetNormalRoughness();
+    inputs.viewZ = &m_nrdHybridPreparePass.GetViewZ();
+    inputs.diffuseRadianceHitDistance = &m_nrdHybridPreparePass.GetDiffuse();
+    inputs.specularRadianceHitDistance = &m_nrdHybridPreparePass.GetSpecular();
+
+    // Each Denoise call constructs a fresh SDK snapshot. Shared scratch is ordered on this command list.
+    m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::NrdHybridDiffuse);
+    const bool diffuseRecorded = m_nrdHybridDenoiser.Denoise(commandList, PathTraceHybridDiffuseIdentifier, inputs);
+    m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::NrdHybridDiffuse);
+
+    m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::NrdHybridSpecular);
+    const bool specularRecorded = diffuseRecorded && !std::exchange(m_nrdHybridFailSpecularForTesting, false) &&
+        m_nrdHybridDenoiser.Denoise(commandList, PathTraceHybridSpecularIdentifier, inputs);
+    m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::NrdHybridSpecular);
+
+    // NRD binds its own descriptor heap and root signature.
+    ID3D12DescriptorHeap* heaps[] = {m_resourceDescriptorHeap.GetHeap()};
+    commandList->SetDescriptorHeaps(1, heaps);
+    m_nrdHybridDispatchedThisFrame = diffuseRecorded && specularRecorded;
+
+    if(!m_nrdHybridDispatchedThisFrame)
+    {
+        // Even a recorded diffuse half is neither presented nor committed (camera and history stay as they were).
+        ReportNrdHybridUnavailable("the hybrid did not record a complete pair");
+        return false;
+    }
+
+    // HYBRID.5 production resolve: surface pixels of the presentation, as RELAX's and REBLUR's. The path tracer wrote the
+    // presentation earlier in this list, so that write is ordered first.
+    if(presentation)
+    {
+        m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::NrdHybridResolve);
+        presentation->Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        D3D12_RESOURCE_BARRIER presentationBarrier{};
+        presentationBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        presentationBarrier.UAV.pResource = presentation->GetResource();
+        commandList->ResourceBarrier(1, &presentationBarrier);
+        m_nrdHybridPreparePass.ExecuteDenoisedResolve(commandList, m_uploadBuffer, constants,
+            m_nrdHybridDenoiser.GetDiffuseOutput(PathTraceHybridDiffuseIdentifier),
+            m_nrdHybridDenoiser.GetSpecularOutput(PathTraceHybridSpecularIdentifier), *presentation, m_sceneWidth,
+            m_sceneHeight);
+        m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::NrdHybridResolve);
+        m_debugUI.SetPathTraceNrdStatus("");
+    }
+
+    m_nrdHybridFailure.clear();
+    return true;
+}
+
+bool Renderer::EnsureNrdRelaxDenoiser()
+{
+    if(m_nrdRelaxDenoiser.IsInitialized())
+    {
+        return true;
+    }
+
+    if(m_nrdRelaxCreationFailed)
+    {
+        return false;
+    }
+
+    NrdDenoiser::Description description = PathTraceRelaxDescription();
+    description.promoteFloat16to32 = m_nrdRelaxPromoteFloat16To32;
+
+    if(std::exchange(m_nrdRelaxFailCreationForTesting, false) ||
+        !m_nrdRelaxDenoiser.Initialize(m_graphicsDevice.GetDevice(), m_commandContext.GetCommandQueue(),
+            m_resourceDescriptorHeap, m_sceneWidth, m_sceneHeight, description))
+    {
+        // NrdDenoiser::Initialize leaves nothing behind on failure (NRD.RELAX.1).
+        m_nrdRelaxCreationFailed = true;
+        return false;
+    }
+
+    ++m_nrdRelaxCreations;
+    m_nrdRelaxInstanceNew = true;
+    Log::Info("NRD RELAX diagnostic initialized at " + std::to_string(m_sceneWidth) + "x" +
+        std::to_string(m_sceneHeight) + ": persistent " + std::to_string(m_nrdRelaxDenoiser.GetPersistentMemoryUsageInMb()) +
+        " MiB, transient " + std::to_string(m_nrdRelaxDenoiser.GetAliasableMemoryUsageInMb()) + " MiB.");
+    return true;
+}
+
+void Renderer::ReleaseNrdRelaxDenoiser()
+{
+    if(!m_nrdRelaxDenoiser.IsInitialized() && !m_nrdRelaxResolvedTexture.GetResource() && !m_nrdRelaxCreationFailed)
+    {
+        return;
+    }
+
+    // Submitted frames may still read or write the instance's resources.
+    if(!m_commandContext.WaitForGPU())
+    {
+        Log::Error("Failed to wait for the GPU before releasing the NRD RELAX diagnostic; it is kept.");
+        return;
+    }
+
+    m_nrdRelaxDenoiser.Shutdown();
+    m_nrdRelaxResolvedTexture.Shutdown();
+    m_nrdRelaxCreationFailed = false;
+    m_nrdRelaxHistoryValid = false;
+    m_nrdRelaxExecutedLastFrame = false;
+    m_nrdRelaxFailure.clear();
+    Log::Info("NRD RELAX diagnostic released.");
+}
+
+void Renderer::ReleaseNrdRelaxDiagnosticTexture()
+{
+    if(!m_nrdRelaxResolvedTexture.GetResource())
+    {
+        return;
+    }
+
+    // Submitted frames may still write it.
+    if(!m_commandContext.WaitForGPU())
+    {
+        Log::Error("Failed to wait for the GPU before releasing the NRD RELAX diagnostic texture; it is kept.");
+        return;
+    }
+
+    m_nrdRelaxResolvedTexture.Shutdown();
+}
+
+void Renderer::ReportNrdRelaxUnavailable(const std::string& reason)
+{
+    // NRD.RELAX.4: as the selected denoiser the Engine stages present instead; as the diagnostic nothing is recorded.
+    const bool selected = m_pathTraceDenoiserMode == PathTraceDenoiserMode::NrdRelax;
+
+    if(reason != m_nrdRelaxFailure)
+    {
+        Log::Warning(selected ? "NRD RELAX could not denoise this frame (" + reason + "); the Engine denoiser is used." :
+            "NRD RELAX diagnostic could not run this frame (" + reason + "); nothing was recorded.");
+    }
+
+    m_nrdRelaxFailure = reason;
+
+    if(selected)
+    {
+        m_debugUI.SetPathTraceNrdStatus("NRD RELAX unavailable (" + reason + "); using Engine.");
+    }
+}
+
+bool Renderer::BeginNrdRelaxFrame(
+    PathTracePrimary primary,
+    const Matrix4& view,
+    const Matrix4& cameraProjection,
+    const FrameLighting& frameLighting,
+    const PathTraceReferenceSettings& settings)
+{
+    if(!EnsureNrdRelaxDenoiser())
+    {
+        ReportNrdRelaxUnavailable("the RELAX instance could not be created");
+        return false;
+    }
+
+    // The RELAX.2 bypass reconstructions only while that diagnostic runs.
+    if(!m_nrdRelaxPreparePass.Initialize(m_graphicsDevice, m_shaderLibrary, NrdPathTracePreparePass::Encoding::Relax) ||
+        !m_nrdRelaxPreparePass.EnsureTextures(m_graphicsDevice.GetDevice(), m_resourceDescriptorHeap, m_sceneWidth,
+            m_sceneHeight, m_nrdRelaxPrepareDiagnostic))
+    {
+        ReportNrdRelaxUnavailable("the RELAX input textures could not be created");
+        return false;
+    }
+
+    // NRD.RELAX.3: the diagnostic resolved texture only while the dispatch diagnostic is requested.
+    if(m_nrdRelaxDispatchDiagnostic && !m_nrdRelaxResolvedTexture.GetResource())
+    {
+        ID3D12Device* device = m_graphicsDevice.GetDevice();
+
+        if(!m_nrdRelaxResolvedTexture.Initialize(device, m_sceneWidth, m_sceneHeight, 1, 1, DXGI_FORMAT_R16G16B16A16_FLOAT,
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS) ||
+            !m_nrdRelaxResolvedTexture.CreateSRV(device, m_resourceDescriptorHeap) ||
+            !m_nrdRelaxResolvedTexture.CreateUAV(device, m_resourceDescriptorHeap))
+        {
+            m_nrdRelaxResolvedTexture.Shutdown();
+            ReportNrdRelaxUnavailable("the RELAX resolved texture could not be created");
+            return false;
+        }
+
+        m_nrdRelaxResolvedTexture.GetResource()->SetName(L"NRD RELAX Resolved (diagnostic)");
+    }
+
+    // RESTART sources as REBLUR's: the temporal key and a frame gap; the shared invalidations clear the flag directly.
+    const PathTraceTemporalKey key = MakePathTraceTemporalKey(primary, frameLighting, settings);
+
+    if(!m_nrdRelaxKey || !SamePathTraceTemporalKey(*m_nrdRelaxKey, key) || !m_nrdRelaxExecutedLastFrame)
+    {
+        m_nrdRelaxHistoryValid = false;
+    }
+
+    m_nrdRelaxKey = key;
+    m_nrdRelaxAccumulationMode = m_nrdRelaxInstanceNew ? nrd::AccumulationMode::CLEAR_AND_RESTART :
+        m_nrdRelaxHistoryValid ? nrd::AccumulationMode::CONTINUE : nrd::AccumulationMode::RESTART;
+    const bool continuing = m_nrdRelaxAccumulationMode == nrd::AccumulationMode::CONTINUE;
+    const float jitter[2] = {m_cameraJitterStatus.active ? m_cameraJitterStatus.x : 0.0f,
+        m_cameraJitterStatus.active ? m_cameraJitterStatus.y : 0.0f};
+
+    // REBLUR's validated conventions (NRD.3 section 8, NRDRelax2.md section 7): unjittered matrices, jitter separately,
+    // G-buffer motion scaled by (-1, -1, 1), the preparation's denoising range. Without history the previous frame is
+    // this one.
+    NrdDenoiser::FrameSettings frameSettings;
+    frameSettings.view = view;
+    frameSettings.projection = cameraProjection;
+    frameSettings.previousView = continuing ? m_nrdRelaxPreviousView : view;
+    frameSettings.previousProjection = continuing ? m_nrdRelaxPreviousProjection : cameraProjection;
+    frameSettings.jitter[0] = jitter[0];
+    frameSettings.jitter[1] = jitter[1];
+    frameSettings.previousJitter[0] = continuing ? m_nrdRelaxPreviousJitter[0] : jitter[0];
+    frameSettings.previousJitter[1] = continuing ? m_nrdRelaxPreviousJitter[1] : jitter[1];
+    frameSettings.motionVectorScale[0] = -1.0f;
+    frameSettings.motionVectorScale[1] = -1.0f;
+    frameSettings.motionVectorScale[2] = 1.0f;
+    frameSettings.frameIndex = m_nrdRelaxFrameIndex;
+    frameSettings.denoisingRange = PathTraceNrdDenoisingRange;
+    frameSettings.accumulationMode = m_nrdRelaxAccumulationMode;
+
+    m_nrdRelaxDenoiser.NewFrame();
+
+    if(!m_nrdRelaxDenoiser.SetCommonSettings(frameSettings) ||
+        !m_nrdRelaxDenoiser.SetDenoiserSettings(PathTraceRelaxIdentifier,
+            m_nrdRelaxSettingsOverride ? *m_nrdRelaxSettingsOverride : PathTraceRelaxSettings()))
+    {
+        ReportNrdRelaxUnavailable("NRD rejected the RELAX frame settings");
+        return false;
+    }
+
+    // Committed only if RecordNrdRelax records the dispatch and the frame is submitted.
+    m_nrdRelaxPendingView = view;
+    m_nrdRelaxPendingProjection = cameraProjection;
+    m_nrdRelaxPendingJitter[0] = jitter[0];
+    m_nrdRelaxPendingJitter[1] = jitter[1];
+    return true;
+}
+
+bool Renderer::RecordNrdRelax(
+    ID3D12GraphicsCommandList* commandList,
+    unsigned int frameIndex,
+    const Matrix4& view,
+    const Matrix4& inverseViewProjection,
+    const Vector3& cameraPosition,
+    Texture* presentation)
+{
+    const NrdPathTracePrepareConstants constants = MakeNrdPathTracePrepareConstants(commandList, view,
+        inverseViewProjection, cameraPosition);
+    NrdPathTracePrepareConstants relaxConstants = constants;
+    Texture& rawDiffuseHitDistance = m_pathTraceReferencePass.GetRawDiffuseHitDistanceTexture();
+    rawDiffuseHitDistance.Transition(commandList,
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    relaxConstants.rawDiffuseHitDistanceIndex = rawDiffuseHitDistance.GetDescriptorIndex();
+
+    m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::NrdRelaxPrepare);
+    m_nrdRelaxPreparePass.ExecutePrepare(commandList, m_uploadBuffer, relaxConstants, m_sceneWidth, m_sceneHeight);
+    m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::NrdRelaxPrepare);
+
+    NrdDenoiser::Inputs inputs;
+    inputs.motion = m_nrdRelaxPreparePass.GetMotion().GetResource();
+    inputs.normalRoughness = &m_nrdRelaxPreparePass.GetNormalRoughness();
+    inputs.viewZ = &m_nrdRelaxPreparePass.GetViewZ();
+    inputs.diffuseRadianceHitDistance = &m_nrdRelaxPreparePass.GetDiffuse();
+    inputs.specularRadianceHitDistance = &m_nrdRelaxPreparePass.GetSpecular();
+
+    m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::NrdRelaxDenoise);
+    const bool recorded = m_nrdRelaxDenoiser.Denoise(commandList, PathTraceRelaxIdentifier, inputs);
+    m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::NrdRelaxDenoise);
+
+    // NRD binds its own descriptor heap and root signature.
+    ID3D12DescriptorHeap* descriptorHeaps[] = {m_resourceDescriptorHeap.GetHeap()};
+    commandList->SetDescriptorHeaps(1, descriptorHeaps);
+
+    if(!recorded)
+    {
+        ReportNrdRelaxUnavailable("the RELAX dispatch was not recorded");
+        return false;
+    }
+
+    m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::NrdRelaxResolve);
+    Texture& diffuseOutput = m_nrdRelaxDenoiser.GetDiffuseOutput(PathTraceRelaxIdentifier);
+    Texture& specularOutput = m_nrdRelaxDenoiser.GetSpecularOutput(PathTraceRelaxIdentifier);
+
+    // NRD.RELAX.4 production resolve: surface pixels of the presentation, as REBLUR's. The path tracer wrote the
+    // presentation earlier in this list, so that write is ordered first.
+    if(presentation)
+    {
+        presentation->Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        D3D12_RESOURCE_BARRIER presentationBarrier{};
+        presentationBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        presentationBarrier.UAV.pResource = presentation->GetResource();
+        commandList->ResourceBarrier(1, &presentationBarrier);
+
+        NrdPathTracePrepareConstants presentConstants = relaxConstants;
+        presentConstants.relaxDiagnosticResolve = 0;
+        m_nrdRelaxPreparePass.ExecuteDenoisedResolve(commandList, m_uploadBuffer, presentConstants, diffuseOutput,
+            specularOutput, *presentation, m_sceneWidth, m_sceneHeight);
+    }
+
+    // NRD.RELAX.3 diagnostic resolve (every pixel, never presented), also on production frames while requested.
+    if(m_nrdRelaxDispatchDiagnostic && m_nrdRelaxResolvedTexture.GetResource())
+    {
+        NrdPathTracePrepareConstants diagnosticConstants = relaxConstants;
+        diagnosticConstants.relaxDiagnosticResolve = 1;
+        m_nrdRelaxPreparePass.ExecuteDenoisedResolve(commandList, m_uploadBuffer, diagnosticConstants, diffuseOutput,
+            specularOutput, m_nrdRelaxResolvedTexture, m_sceneWidth, m_sceneHeight);
+    }
+
+    m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::NrdRelaxResolve);
+
+    m_nrdRelaxFailure.clear();
+    m_nrdRelaxDispatchedThisFrame = true;
+
+    if(presentation)
+    {
+        m_debugUI.SetPathTraceNrdStatus("");
+    }
+
+    return true;
+}
+
+bool Renderer::RecordNrdRelaxDispatchDiagnostic(
+    ID3D12GraphicsCommandList* commandList,
+    unsigned int frameIndex,
+    PathTracePrimary primary,
+    const Matrix4& view,
+    const Matrix4& cameraProjection,
+    const Matrix4& inverseViewProjection,
+    const Vector3& cameraPosition,
+    const FrameLighting& frameLighting,
+    const PathTraceReferenceSettings& settings)
+{
+    // Everything that can fail, before anything is recorded; then preparation, RELAX and the diagnostic resolve only.
+    return BeginNrdRelaxFrame(primary, view, cameraProjection, frameLighting, settings) &&
+        RecordNrdRelax(commandList, frameIndex, view, inverseViewProjection, cameraPosition, nullptr);
 }
 
 nrd::ReblurSettings Renderer::PathTraceNrdProductionSettings()
@@ -7609,6 +8376,20 @@ bool Renderer::RecordRenderFrame(
     ApplySharcSettings(options.sharc, rasterPrimaryMode);
     ApplyPathTraceDenoiser(options.pathTraceDenoiserMode, rasterPrimaryMode);
     ApplyPathTraceDenoiserStages(options.pathTraceDenoiserStages);
+    const bool queryReady = m_pathTraceReferencePass.IsSecondaryShadowRayQueryReady();
+    const bool queryActive = options.pathTraceReference.secondaryShadowRayQuery && queryReady;
+    m_pathTraceStatus.secondaryShadowRayQueryReady = queryReady;
+
+    if(queryActive != m_pathTraceStatus.secondaryShadowRayQueryActive)
+    {
+        // CPU selection only: both state objects and tables stay alive across in-flight submissions.
+        // Reset before jitter, G-buffer reuse, NRD and DLSS consume this frame's history flags.
+        ResetSceneHistory();
+        m_pathTraceStatus.secondaryShadowRayQueryActive = queryActive;
+    }
+
+    m_pathTraceReferencePass.SelectSecondaryShadowRayQuery(queryActive);
+
     ApplyCameraJitter(options.pathTraceCameraJitter);
     ApplyDlssInputPreparation(options.dlssInputPreparation);
     UpdateRadianceCacheD6(options.experimentalD6RadianceCache || m_sharcSettings.enabled);
@@ -7915,6 +8696,13 @@ bool Renderer::RecordRenderFrame(
     m_pendingPreviousGBufferCopy.reset();
     m_pathTraceTemporalPass.AbandonPendingHistory();
     m_nrdPathTraceDispatchedThisFrame = false;
+    if(m_nrdHybridDispatchedThisFrame)
+    {
+        m_nrdHybridHistoryValid = false;
+    }
+
+    m_nrdHybridDispatchedThisFrame = false;
+    m_nrdRelaxDispatchedThisFrame = false;
     m_previousGBufferAvailableThisFrame = false;
     m_rtxdiResources.AbandonFrame();
 
@@ -8313,6 +9101,44 @@ bool Renderer::RecordRenderFrame(
     if(!m_nrdPathTraceDiagnostic && m_pathTraceDenoiserMode != PathTraceDenoiserMode::NrdReblur)
     {
         ReleaseNrdPathTraceDiagnostic();
+    }
+
+    // HYBRID.3: the same for the hybrid diagnostic's instance and preparation. HYBRID.5: the selected hybrid holds them as
+    // well.
+    const bool hybridSelected = m_pathTraceDenoiserMode == PathTraceDenoiserMode::NrdHybrid;
+
+    if(!hybridSelected)
+    {
+        m_nrdHybridPresentedLastFrame = false;
+    }
+
+    if(!m_nrdHybridDispatchDiagnostic && !hybridSelected)
+    {
+        ReleaseNrdHybridDenoiser();
+    }
+
+    // NRD.RELAX.2: the same for the RELAX preparation diagnostic. NRD.RELAX.3: the RELAX dispatch diagnostic uses the same
+    // preparation and raw distance, and holds its own instance.
+    // NRD.RELAX.4: the selected RELAX holds the instance and the preparation as well.
+    const bool relaxSelected = m_pathTraceDenoiserMode == PathTraceDenoiserMode::NrdRelax;
+
+    if(!relaxSelected)
+    {
+        m_nrdRelaxPresentedLastFrame = false;
+    }
+
+    if(!m_nrdRelaxDispatchDiagnostic && !relaxSelected)
+    {
+        ReleaseNrdRelaxDenoiser();
+    }
+    else if(!m_nrdRelaxDispatchDiagnostic)
+    {
+        ReleaseNrdRelaxDiagnosticTexture();
+    }
+
+    if(!m_nrdRelaxPrepareDiagnostic && !m_nrdRelaxDispatchDiagnostic && !relaxSelected)
+    {
+        ReleaseNrdRelaxPrepareDiagnostic();
     }
 
     // NRD.4B: path-traced REBLUR's instance exists only while that mode renders (one GPU wait on leaving it).
@@ -8759,9 +9585,11 @@ bool Renderer::RecordRenderFrame(
         inputs.outputWidth = m_outputWidth;
         inputs.outputHeight = m_outputHeight;
         inputs.color = &m_sceneColor;
-        // NRD.4B: REBLUR's presentation is per-frame denoised colour, as the Engine denoiser's is.
+        // NRD.4B: REBLUR's presentation is per-frame denoised colour, as the Engine denoiser's is; NRD.RELAX.4: RELAX's too;
+        // HYBRID.5: the hybrid's too.
         inputs.colorIsPerFrameDenoised = runPathTrace && m_pathTracePendingSamples > 0 && ((m_pathTraceTemporalRanLastFrame &&
-            (m_pathTraceSpatialRanLastFrame || m_pathTraceTemporalPresentation)) || m_nrdPathTracePresentedLastFrame);
+            (m_pathTraceSpatialRanLastFrame || m_pathTraceTemporalPresentation)) || m_nrdPathTracePresentedLastFrame ||
+            m_nrdRelaxPresentedLastFrame || m_nrdHybridPresentedLastFrame);
         inputs.depth = &m_gBuffer.GetDepth();
         inputs.engineMotion = &m_gBuffer.GetMotion();
         inputs.dlssMotionVectors = &m_dlssInputPreparationPass.GetMotionVectors();
@@ -9111,6 +9939,37 @@ bool Renderer::RecordRenderFrame(
 
     m_nrdPathTraceExecutedLastFrame = m_nrdPathTraceDispatchedThisFrame;
     m_nrdPathTraceDispatchedThisFrame = false;
+
+    // NRD.RELAX.3: the same for the diagnostic RELAX instance.
+    if(m_nrdRelaxDispatchedThisFrame)
+    {
+        m_nrdRelaxPreviousView = m_nrdRelaxPendingView;
+        m_nrdRelaxPreviousProjection = m_nrdRelaxPendingProjection;
+        m_nrdRelaxPreviousJitter[0] = m_nrdRelaxPendingJitter[0];
+        m_nrdRelaxPreviousJitter[1] = m_nrdRelaxPendingJitter[1];
+        m_nrdRelaxHistoryValid = true;
+        m_nrdRelaxInstanceNew = false;
+        ++m_nrdRelaxFrameIndex;
+        ++m_nrdRelaxSubmittedDispatches;
+    }
+
+    m_nrdRelaxExecutedLastFrame = m_nrdRelaxDispatchedThisFrame;
+    m_nrdRelaxDispatchedThisFrame = false;
+    // HYBRID.3: the complete pair commits as one observation after submission.
+    if(m_nrdHybridDispatchedThisFrame)
+    {
+        m_nrdHybridPreviousView = m_nrdHybridPendingView;
+        m_nrdHybridPreviousProjection = m_nrdHybridPendingProjection;
+        m_nrdHybridPreviousJitter[0] = m_nrdHybridPendingJitter[0];
+        m_nrdHybridPreviousJitter[1] = m_nrdHybridPendingJitter[1];
+        m_nrdHybridHistoryValid = true;
+        m_nrdHybridInstanceNew = false;
+        ++m_nrdHybridFrameIndex;
+        ++m_nrdHybridSubmittedDispatches;
+    }
+
+    m_nrdHybridExecutedLastFrame = m_nrdHybridDispatchedThisFrame;
+    m_nrdHybridDispatchedThisFrame = false;
     m_rtxdiResources.CommitFrame();
     m_radianceCacheD6.CommitSubmission();
 
@@ -9306,6 +10165,11 @@ void Renderer::Shutdown()
     m_pathTraceTemporalPass.Shutdown();
     m_pathTraceSpatialPass.Shutdown();
     m_nrdPathTracePreparePass.Shutdown();
+    m_nrdRelaxPreparePass.Shutdown();
+    m_nrdHybridDenoiser.Shutdown();
+    m_nrdHybridPreparePass.Shutdown();
+    m_nrdRelaxDenoiser.Shutdown();
+    m_nrdRelaxResolvedTexture.Shutdown();
     m_nrdPathTraceDenoiser.Shutdown();
     m_nrdPathTraceValidationTexture.Shutdown();
     m_pathTraceStatus = {};

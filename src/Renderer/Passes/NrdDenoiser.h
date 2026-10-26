@@ -28,12 +28,19 @@ class DescriptorHeap;
 // denoisers, future path-traced modes) owns its own instance and its own configuration; instances share nothing.
 //
 // Lifetime: Initialize creates the instance at a fixed extent, Resize recreates it (NRD has no resize), Shutdown
-// releases it. All three wait for the GPU to idle inside the SDK (IntegrationCreationDesc::autoWaitForIdle), so no
-// recorded work can still reference what they release. Settings are per frame: NewFrame, SetCommonSettings, then
+// releases it. Shutdown and recreation wait for submitted GPU work inside the SDK before releasing outputs. The
+// renderer must discard any unsubmitted commands referencing these resources and keep the device, queue and output
+// descriptor heap alive through Shutdown (or destruction). Settings are per frame: NewFrame, SetCommonSettings, then
 // SetDenoiserSettings for each denoiser that will run, then Denoise.
 class NrdDenoiser
 {
     public:
+    NrdDenoiser() = default;
+    ~NrdDenoiser();
+
+    NrdDenoiser(const NrdDenoiser&) = delete;
+    NrdDenoiser& operator=(const NrdDenoiser&) = delete;
+
     // A denoiser of the instance. Its outputs follow from its type: a diffuse output for the diffuse denoisers, a
     // specular output for the specular ones, both for the combined ones.
     struct DenoiserDescription
@@ -97,6 +104,7 @@ class NrdDenoiser
         Texture* validation = nullptr;
     };
 
+    // A live owner must be shut down before Initialize is called again. Invalid requests leave it intact.
     bool Initialize(
         ID3D12Device* device,
         ID3D12CommandQueue* graphicsQueue,
@@ -120,8 +128,9 @@ class NrdDenoiser
     bool SetDenoiserSettings(nrd::Identifier identifier, const nrd::ReblurSettings& settings);
     bool SetDenoiserSettings(nrd::Identifier identifier, const nrd::RelaxSettings& settings);
 
-    // Records one denoiser. Its outputs are left in unordered-access state.
-    void Denoise(
+    // Records one denoiser. Its outputs are left in unordered-access state. NRD.RELAX.3: false when nothing was recorded
+    // (unknown identifier, missing command list or input); the caller must then not treat the frame as denoised.
+    bool Denoise(
         ID3D12GraphicsCommandList* commandList,
         nrd::Identifier identifier,
         const Inputs& inputs);

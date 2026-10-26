@@ -123,7 +123,8 @@ bool MaterialPreviewRenderer::Initialize(
         // changing the production G-buffer defaults.
         RenderTarget* targets[] = {&m_gBuffer.GetMaterial(), &m_gBuffer.GetSurface(),
                                   &m_gBuffer.GetMotion(), &m_gBuffer.GetGeometricNormal()};
-        constexpr DXGI_FORMAT formats[] = {DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT,
+        // Match the geometry PSO: encode linear base color on write and decode on SRV reads.
+        constexpr DXGI_FORMAT formats[] = {GBuffer::MaterialFormat, DXGI_FORMAT_R16G16B16A16_FLOAT,
                                           DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R16G16B16A16_FLOAT};
 
         for(unsigned int index = 0; index < 4; ++index)

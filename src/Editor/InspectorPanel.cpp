@@ -1,6 +1,8 @@
 #include "InspectorPanel.h"
 #include "InspectorNumericDrag.h"
 #include "EditorWorkspace.h"
+#include "EditorIcons.h"
+#include "Project/ProjectManifest.h"
 #include "Math/Math.h"
 #include "assets/ProjectAssetResolver.h"
 #include "assets/MaterialAssetSerializer.h"
@@ -1333,6 +1335,7 @@ void InspectorPanel::DrawTextureReference(
 
 void InspectorPanel::DismissTexturePicker()
 {
+    m_texturePickerFolder.clear();
     PruneTexturePickerRequests(true);
     m_texturePicker.reset();
     m_texturePickerError.clear();
@@ -1581,6 +1584,68 @@ bool InspectorPanel::DrawTextureTile(const AssetRecord& texture, float extent, b
 void InspectorPanel::DrawTextureGrid(TextureSlot slot, const ProjectPaths& paths,
     const ProjectAssetRegistry& registry)
 {
+    // Only enumerate the current directory; canonical checks also exclude escaping junctions.
+    std::error_code error;
+    const auto root = std::filesystem::canonical(paths.GetTexturesDirectory(), error);
+    if(error)
+    {
+        ImGui::TextDisabled("Textures folder is unavailable.");
+        return;
+    }
+    auto folder = root / m_texturePickerFolder;
+    const auto resolvedFolder = std::filesystem::canonical(folder, error);
+    if(error || !IsPathWithin(resolvedFolder, root))
+    {
+        m_texturePickerFolder.clear();
+        folder = root;
+    }
+    ImGui::TextUnformatted((std::filesystem::path("Textures") / m_texturePickerFolder).generic_string().c_str());
+    if(!m_texturePickerFolder.empty() && ImGui::SmallButton("Up to parent folder"))
+    {
+        m_texturePickerFolder = m_texturePickerFolder.parent_path();
+        return;
+    }
+    std::vector<std::filesystem::path> folders;
+    std::filesystem::directory_iterator entry(folder, error), end;
+    for(; !error && entry != end; entry.increment(error))
+    {
+        std::error_code childError;
+        const auto resolved = std::filesystem::canonical(entry->path(), childError);
+        if(childError || !IsPathWithin(resolved, root))
+        {
+            continue;
+        }
+        if(entry->is_directory(childError) && !childError)
+        {
+            folders.push_back(entry->path().filename());
+        }
+    }
+    std::sort(folders.begin(), folders.end());
+    for(const auto& child : folders)
+    {
+        const auto position = ImGui::GetCursorScreenPos();
+        const float iconSize = ImGui::GetFontSize();
+        const float spacing = iconSize + ImGui::GetStyle().ItemInnerSpacing.x;
+        const auto label = m_icons ? "##Folder" + child.string() : "[Folder] " + child.string();
+        if(ImGui::Selectable(label.c_str(), false, ImGuiSelectableFlags_DontClosePopups))
+        {
+            m_texturePickerFolder /= child;
+            return;
+        }
+        if(m_icons)
+        {
+            auto* draw = ImGui::GetWindowDrawList();
+            m_icons->Draw(*draw, EditorIcon::Folder, position, ImVec2(iconSize, iconSize),
+                ImGui::GetColorU32(ImGuiCol_Text));
+            draw->AddText(ImVec2(position.x + spacing, position.y),
+                ImGui::GetColorU32(ImGuiCol_Text), child.string().c_str());
+        }
+    }
+    if(error)
+    {
+        ImGui::TextDisabled("Unable to read this folder.");
+    }
+
     const auto* reference = GetTextureSlot(slot);
 
     if(!reference || !ImGui::BeginTable("TextureGrid", 2, ImGuiTableFlags_SizingStretchSame))
@@ -1595,6 +1660,18 @@ void InspectorPanel::DrawTextureGrid(TextureSlot slot, const ProjectPaths& paths
 
     for(const auto& texture : m_textureChoices)
     {
+        if(!ProjectAssetRegistry::PathsEqual(
+                (paths.GetRoot() / texture.relativePath).lexically_normal().parent_path(),
+                (paths.GetTexturesDirectory() / m_texturePickerFolder).lexically_normal()))
+        {
+            continue;
+        }
+        std::error_code textureError;
+        const auto resolved = std::filesystem::canonical(paths.GetRoot() / texture.relativePath, textureError);
+        if(textureError || !IsPathWithin(resolved, root))
+        {
+            continue;
+        }
         auto filtered = texture.relativePath.filename().string();
         std::transform(filtered.begin(), filtered.end(), filtered.begin(), lowercase);
 
