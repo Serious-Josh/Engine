@@ -2,6 +2,7 @@
 
 #include "Scene/Camera.h"
 #include "Scene/DirectionalLight.h"
+#include "Scene/SceneLightingSettings.h"
 #include "Renderer/RenderObject.h"
 
 #include <cstddef>
@@ -96,6 +97,14 @@ class Scene
     Camera& GetCamera();
     const Camera& GetCamera() const;
 
+    bool UsesObjectLighting() const noexcept { return !m_directionalLight.has_value(); }
+    const SceneLightingSettings& GetLightingSettings() const noexcept { return m_lightingSettings; }
+    void SetLightingSettings(SceneLightingSettings settings) noexcept
+    {
+        m_lightingSettings = settings;
+        m_directionalLight.reset();
+    }
+    // Procedural-demo compatibility only; file scenes discard this storage on commit.
     DirectionalLight& GetDirectionalLight();
     const DirectionalLight& GetDirectionalLight() const;
 
@@ -177,7 +186,8 @@ class Scene
 
     Camera m_camera;
 
-    DirectionalLight m_directionalLight;
+    std::optional<DirectionalLight> m_directionalLight{DirectionalLight{}};
+    SceneLightingSettings m_lightingSettings;
 
     // Temporary camera-selected displacement LOD diagnostic.
     std::array<std::uint32_t, kDisplacementPatchCount> m_displacementPatchLODs{};

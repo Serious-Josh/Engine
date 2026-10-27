@@ -69,9 +69,16 @@ bool BuildFrameLighting(const DirectionalLight& legacySun, const SceneLightingSn
         return Fail(error, "Scene lighting exceeds the GPU light table capacity.");
     }
 
+    if(!std::isfinite(snapshot->lightingSettings.ambientStrength) || snapshot->lightingSettings.ambientStrength < 0.0f)
+        return Fail(error, "Scene ambient strength must be finite and nonnegative.");
+
+    // Captured file scenes are authoritative even when empty. Only explicit procedural-demo
+    // callers may opt into their compatibility source; file Scene storage is already discarded.
     if(snapshot->suppressLegacyDirectional)
     {
-        // Never both: once Directional Light components exist the legacy sun contributes nothing.
+        // A captured scene never uses the procedural-demo compatibility source.
+        candidate.sun.ambientStrength = snapshot->lightingSettings.ambientStrength;
+        candidate.sun.angularRadius = 0.0f;
         candidate.sun.color = {0.0f, 0.0f, 0.0f};
         candidate.sun.intensity = 0.0f;
         candidate.sun.direction = {0.0f, -1.0f, 0.0f};
@@ -80,7 +87,8 @@ bool BuildFrameLighting(const DirectionalLight& legacySun, const SceneLightingSn
         {
             const ResolvedSceneLight& owner = *snapshot->sunDirectional;
 
-            if(!IsFinite(owner.direction) || !IsFinite(owner.color) || !std::isfinite(owner.intensity))
+            if(!IsFinite(owner.direction) || !IsFinite(owner.color) || !std::isfinite(owner.intensity) || owner.intensity < 0.0f ||
+                !std::isfinite(owner.angularRadius) || owner.angularRadius < 0.0f)
             {
                 return Fail(error, "The shadow-owner Directional Light is not finite.");
             }
@@ -88,6 +96,7 @@ bool BuildFrameLighting(const DirectionalLight& legacySun, const SceneLightingSn
             candidate.sun.direction = owner.direction;
             candidate.sun.color = owner.color;
             candidate.sun.intensity = owner.intensity;
+            candidate.sun.angularRadius = owner.angularRadius;
             candidate.sunObjectID = owner.objectID;
         }
     }

@@ -128,10 +128,12 @@ SceneObjectDocument PrepareLightObject(const SceneDocument& document, LightType 
         [](const SceneObjectDocument& existing) { return existing.light.has_value(); });
 
     // Checked before any identity is allocated; commit revalidates the whole scene as well.
-    if(existingLights >= static_cast<std::ptrdiff_t>(MaximumSceneLights))
+    const bool hasDirectional = type == LightType::Directional || std::any_of(document.objects.begin(), document.objects.end(),
+        [](const auto& object) { return object.light && object.light->type == LightType::Directional; });
+    if(existingLights >= static_cast<std::ptrdiff_t>(MaximumSceneLights + (hasDirectional ? 1u : 0u)))
     {
-        throw std::runtime_error("The scene already has the maximum of " + std::to_string(MaximumSceneLights) +
-            " Light components.");
+        throw std::runtime_error("The scene already has the maximum of " + std::to_string(MaximumSceneLights + (hasDirectional ? 1u : 0u)) +
+            " Light components for this light set.");
     }
 
     SceneObjectDocument object;

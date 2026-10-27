@@ -1,11 +1,14 @@
 #include "Core/Log.h"
 #include "ShaderCompiler.h"
+#include "DxilLibraryCache.h"
 
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace
 {
@@ -21,14 +24,6 @@ namespace
         ShaderSourceDependency dependency{};
         dependency.path = DependencyPath(path);
 
-        for(const ShaderSourceDependency& existing : dependencies)
-        {
-            if(existing.path == dependency.path)
-            {
-                return;
-            }
-        }
-
         dependency.exists = source != nullptr;
 
         if(source)
@@ -37,6 +32,17 @@ namespace
             dependency.contents.assign(begin, begin + source->GetBufferSize());
         }
 
+        for(const ShaderSourceDependency& existing : dependencies)
+        {
+            if(existing.path == dependency.path && existing.exists == dependency.exists &&
+                existing.contents == dependency.contents)
+            {
+                return;
+            }
+        }
+
+        // Preserve conflicting observations of a path. No current filesystem state can satisfy both,
+        // so freshness checks and persistent publication reject a compilation with mixed inputs.
         dependencies.push_back(std::move(dependency));
     }
 
@@ -380,6 +386,12 @@ bool ShaderCompiler::CompileLibrary(
     output.bytecode.clear();
     output.dependencies.clear();
     output.profile = description.profile;
+    output.cacheStatus = ShaderLibraryCompileResult::CacheStatus::Disabled;
+    output.cacheWritten = false;
+    output.dxcInvoked = false;
+    output.cacheReadMilliseconds = 0.0;
+    output.dxcMilliseconds = 0.0;
+    output.cacheWriteMilliseconds = 0.0;
 
     if (!m_utils || !m_compiler)
     {
@@ -389,6 +401,35 @@ bool ShaderCompiler::CompileLibrary(
     if (!description.path)
     {
         return false;
+    }
+
+    const auto cacheStart = std::chrono::steady_clock::now();
+    std::filesystem::path shaderPath = description.path;
+    std::wstring shaderDirectory = shaderPath.parent_path().wstring();
+    const wchar_t* profile = description.profile == ShaderLibraryProfile::Library69 ? L"lib_6_9" : L"lib_6_6";
+    std::vector<const wchar_t*> arguments = {description.path, L"-T", profile, L"-HV", L"2021", L"-I",
+        shaderDirectory.c_str()};
+    std::error_code sameDirectoryError;
+
+    // Root-level libraries keep exactly their original arguments.
+    if(description.includeDirectory &&
+        !std::filesystem::equivalent(shaderDirectory, description.includeDirectory, sameDirectoryError))
+    {
+        arguments.push_back(L"-I");
+        arguments.push_back(description.includeDirectory);
+    }
+
+    DxilLibraryCache cache(description, arguments);
+    const bool cacheHit = cache.Load(m_utils, output);
+    output.cacheReadMilliseconds = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - cacheStart).count();
+    output.cacheStatus = cache.Enabled() ? ShaderLibraryCompileResult::CacheStatus::Miss :
+        ShaderLibraryCompileResult::CacheStatus::Disabled;
+
+    if(cacheHit)
+    {
+        output.cacheStatus = ShaderLibraryCompileResult::CacheStatus::Hit;
+        return true;
     }
 
     IDxcBlobEncoding* source = nullptr;
@@ -419,20 +460,17 @@ bool ShaderCompiler::CompileLibrary(
         return false;
     }
 
-    std::filesystem::path shaderPath = description.path;
-
-    std::wstring shaderDirectory = shaderPath.parent_path().wstring();
-
-    const wchar_t* profile = description.profile == ShaderLibraryProfile::Library69 ? L"lib_6_9" : L"lib_6_6";
-    const wchar_t* arguments[] = {description.path, L"-T", profile, L"-HV", L"2021", L"-I", shaderDirectory.c_str()};
-
     IDxcResult* compileResult = nullptr;
     RecordDependency(output.dependencies, description.path, source);
     RecordingIncludeHandler recordingIncludeHandler(includeHandler, output.dependencies);
 
+    const auto compileStart = std::chrono::steady_clock::now();
+    output.dxcInvoked = true;
     result =
-        m_compiler->Compile(&sourceBuffer, arguments, static_cast<UINT32>(sizeof(arguments) / sizeof(arguments[0])),
+        m_compiler->Compile(&sourceBuffer, arguments.data(), static_cast<UINT32>(arguments.size()),
                             &recordingIncludeHandler, IID_PPV_ARGS(&compileResult));
+    output.dxcMilliseconds = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - compileStart).count();
 
     includeHandler->Release();
 
@@ -497,6 +535,11 @@ bool ShaderCompiler::CompileLibrary(
     compileResult->Release();
 
     source->Release();
+
+    const auto writeStart = std::chrono::steady_clock::now();
+    output.cacheWritten = cache.Store(output);
+    output.cacheWriteMilliseconds = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - writeStart).count();
 
     return true;
 }

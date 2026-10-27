@@ -32,6 +32,13 @@ bool EnvironmentMap::Initialize(
 }
 bool EnvironmentMap::Initialize(ID3D12Device* device,const HDRImageData& image,ResourceUploader& uploader,DescriptorHeap& descriptorHeap)
 {
+    if(image.width == 0 || image.height == 0 || image.channels != 4 ||
+        image.pixels.size() != static_cast<size_t>(image.width) * image.height * 4)
+    {
+        Log::Error("Invalid environment image dimensions or pixel storage.");
+        return false;
+    }
+
     Log::Info("HDR environment loaded: " + std::to_string(image.width) + "x" + std::to_string(image.height));
 
     std::vector<float> conditionalCDF(static_cast<size_t>(image.width) * static_cast<size_t>(image.height));
@@ -107,13 +114,6 @@ bool EnvironmentMap::Initialize(ID3D12Device* device,const HDRImageData& image,R
         }
     }
 
-    if (totalWeight <= 0.0)
-    {
-        Log::Error("Failed to build environment importance distribution.");
-
-        return false;
-    }
-
     m_importanceTotalWeight = static_cast<float>(totalWeight);
 
     double accumulatedMarginalWeight = 0.0;
@@ -122,7 +122,10 @@ bool EnvironmentMap::Initialize(ID3D12Device* device,const HDRImageData& image,R
     {
         accumulatedMarginalWeight += rowWeights[y];
 
-        marginalCDF[y] = static_cast<float>(accumulatedMarginalWeight / totalWeight);
+        // A black environment still owns valid CDF descriptors. Zero total weight disables
+        // importance sampling in the path tracer, RTGI and RTXDI; never invent energy.
+        marginalCDF[y] = totalWeight > 0.0 ? static_cast<float>(accumulatedMarginalWeight / totalWeight) :
+            (static_cast<float>(y) + 1.0f) / static_cast<float>(image.height);
     }
 
     // Force the final entries to exactly 1.0f.

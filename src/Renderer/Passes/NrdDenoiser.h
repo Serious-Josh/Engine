@@ -62,6 +62,10 @@ class NrdDenoiser
         // NRD.4C diagnostics: IntegrationCreationDesc::promoteFloat16to32 (fp32 internal textures; the SDK calls it
         // "overkill, kills performance"). False for every production instance.
         bool promoteFloat16to32 = false;
+        // ER.1 Phase 3.1: IntegrationCreationDesc::autoWaitForIdle = false. NRD then never waits for the GPU itself;
+        // every Shutdown, Resize and recreation requires that no submitted work can still reference the instance (a
+        // drained queue, or a completed last-use fence). False keeps NRD's own idle wait.
+        bool externallySynchronized = false;
     };
 
     // Engine's per-frame camera and history state, converted into nrd::CommonSettings by SetCommonSettings.
@@ -86,6 +90,9 @@ class NrdDenoiser
         nrd::AccumulationMode accumulationMode = nrd::AccumulationMode::CONTINUE;
         // NRD.4B: NRD's debug overlay into Inputs::validation (CommonSettings::enableValidation).
         bool enableValidation = false;
+        // R.9A diagnostics: CommonSettings::isHistoryConfidenceAvailable. When set, Inputs::diffuseConfidence and (for a
+        // denoiser with a specular signal) Inputs::specularConfidence must be provided.
+        bool historyConfidence = false;
     };
 
     // One Denoise call's inputs. Guides are always required; each radiance input only when the denoiser has that signal.
@@ -102,6 +109,10 @@ class NrdDenoiser
         Texture* specularRadianceHitDistance = nullptr;
         // Optional OUT_VALIDATION target (RGBA16F, unordered-access capable), written when enableValidation is set.
         Texture* validation = nullptr;
+        // R.9A diagnostics: IN_DIFF_CONFIDENCE and IN_SPEC_CONFIDENCE (R16F, any extent: NRD samples them bilinearly by
+        // previous-frame UV), bound only while FrameSettings::historyConfidence is set.
+        ID3D12Resource* diffuseConfidence = nullptr;
+        ID3D12Resource* specularConfidence = nullptr;
     };
 
     // A live owner must be shut down before Initialize is called again. Invalid requests leave it intact.
@@ -121,6 +132,11 @@ class NrdDenoiser
     bool IsInitialized() const
     {
         return m_width != 0;
+    }
+
+    bool IsExternallySynchronized() const
+    {
+        return m_description.externallySynchronized;
     }
 
     void NewFrame();
@@ -159,6 +175,8 @@ class NrdDenoiser
     void ReleaseOutputs();
 
     nrd::Integration m_integration;
+    // R.9A: the last SetCommonSettings' FrameSettings::historyConfidence, which Denoise's confidence bindings follow.
+    bool m_historyConfidence = false;
     Description m_description;
     std::array<Denoiser, MaximumDenoisers> m_denoisers;
     // Returned for an identifier the instance does not have; never initialized.

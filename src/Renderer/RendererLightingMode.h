@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 
 // RTXPT.1 renderer lighting mode. Selected per frame through RendererOptions; never serialized into
 // scenes, projects or cooked archives. Legacy is the default everywhere.
@@ -51,6 +52,9 @@ struct PathTraceReferenceSettings
 
     // Runtime-only selection: RayQuery by default; TraceRay retained for diagnostic comparison.
     bool secondaryShadowRayQuery = true;
+
+    // Independent runtime-only selection: DI.1 RayQuery by default; TraceRay retained for comparison and fallback.
+    bool primaryDiShadowRayQuery = true;
 
     bool operator==(const PathTraceReferenceSettings&) const = default;
 };
@@ -108,6 +112,8 @@ struct SharcStatus
     std::uint32_t occupiedEntries = 0;
     std::uint64_t trainedFrames = 0;
     std::uint64_t cacheBytes = 0;
+    // ER.1 Phase 2: why a requested SHARC is not active yet (its libraries are compiling or failed); empty otherwise.
+    std::string preparation;
 };
 
 inline bool IsValidPathTraceReferenceSettings(const PathTraceReferenceSettings& settings)

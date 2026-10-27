@@ -119,7 +119,7 @@ SceneMembershipPublication::Result SceneMembershipPublication::Prepare(Renderer&
 
         PreparedScene prepared;
         prepared.environmentReference=proposed.environmentReference;
-        prepared.camera=proposed.camera; prepared.directionalLight=proposed.directionalLight;
+        prepared.camera=proposed.camera; prepared.lightingSettings=proposed.lightingSettings;
         prepared.objects.reserve(proposed.objects.size());
         for(const auto& authored:proposed.objects)
         {
@@ -268,7 +268,7 @@ SceneMembershipPublication::Result SceneMembershipPublication::PublishAtBoundary
         if(!CaptureSceneDocument(active->GetFileScene().GetDocument(),active->GetScene(),active->GetObjectMapping(),current,&error))
             return {Status::Stale,error};
         // Camera/light motion does not alter membership. Copy their live state at commit.
-        current.camera=p.document.camera; current.directionalLight=p.document.directionalLight;
+        current.camera=p.document.camera; current.lightingSettings=p.document.lightingSettings;
         if(!SceneDocumentsEqual(current,p.document)) return {Status::Stale,"Authoritative object ordering, references or transforms changed."};
         const auto& objects=active->GetScene().GetRenderObjects();
         if(objects.size()!=p.objects.size()) return {Status::Stale,"Object count changed."};
@@ -290,7 +290,7 @@ SceneMembershipPublication::Result SceneMembershipPublication::PublishAtBoundary
             if(found!=p.target->GetObjectMapping().idToRuntimeIndex.end()) mapped=found->second;
         }
         p.target->GetScene().GetCamera()=active->GetScene().GetCamera();
-        p.target->GetScene().GetDirectionalLight()=active->GetScene().GetDirectionalLight();
+        p.target->GetScene().SetLightingSettings(active->GetScene().GetLightingSettings());
         Result success{Status::Ready,"Membership published."};
         // Allocation-free exclusive commit: no frame observes mixed CPU/GPU order.
         r.m_rayTracingScene.AdoptPreparedCandidate(p.gpu,evidence);

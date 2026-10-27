@@ -648,12 +648,14 @@ void AssetBrowser::DrawContents(const ProjectContext* project, const FileBackedD
     const float compactTileWidth = ImGui::GetFontSize() * 6.0f + style.FramePadding.x * 2.0f;
     const float compactTileHeight = compactIconSize + style.ItemInnerSpacing.y +
         ImGui::GetTextLineHeight() + style.FramePadding.y * 2.0f;
+    EditorPhaseTiming::Scope previewLookupPhase(m_phaseTiming, EditorPhaseTiming::Phase::AssetBrowserContentsLookup);
     const bool hasPreviewTiles = std::any_of(listing.entries.begin(), listing.entries.end(), [&](const Entry& entry)
     {
         const auto path = entry.path.lexically_normal();
         return !entry.directory && m_filter.PassFilter(entry.name.c_str()) &&
             (m_textureRecords.contains(path) || m_materialRecords.contains(path) || m_meshRecords.contains(path));
     });
+    previewLookupPhase.End();
     // Fixed columns prevent sparse listings from stretching small icons across the panel.
     // Keep enough room for the existing 96px previews in mixed listings.
     const float columnWidth = hasPreviewTiles ? (std::max)(96.0f, compactTileWidth) : compactTileWidth;
@@ -682,9 +684,12 @@ void AssetBrowser::DrawContents(const ProjectContext* project, const FileBackedD
             // Compact tiles submit one item containing both icon and filename.
             // Thumbnail tiles keep their existing preview and wrapped-label layout.
             ImGui::BeginGroup();
+            // Per-entry scopes add to one per-frame sample for their phase.
+            EditorPhaseTiming::Scope lookupPhase(m_phaseTiming, EditorPhaseTiming::Phase::AssetBrowserContentsLookup);
             const bool sceneDocument = !entry.directory && ProjectAssetRegistry::PathsEqual(entry.path.extension(), ".scene");
             const bool scriptDocument = !entry.directory && ProjectAssetRegistry::PathsEqual(entry.path.extension(), ".as");
-            const auto* scriptRecord = project && m_thumbnailRegistry ?
+            // Only a .as entry can be a script, so other entries skip the registry scan.
+            const auto* scriptRecord = scriptDocument && project && m_thumbnailRegistry ?
                 m_thumbnailRegistry->FindByPath(entry.path.lexically_relative(project->GetRoot())) : nullptr;
             const bool isScript = scriptDocument && scriptRecord && scriptRecord->type == AssetType::Script;
             const auto registered = m_textureRecords.find(entry.path.lexically_normal());
@@ -693,8 +698,12 @@ void AssetBrowser::DrawContents(const ProjectContext* project, const FileBackedD
             const bool isMaterial = !entry.directory && material != m_materialRecords.end() &&
                 _wcsicmp(entry.path.extension().c_str(), L".material") == 0;
             const bool isMesh = !entry.directory && !sceneDocument && m_meshRecords.contains(entry.path.lexically_normal());
+            lookupPhase.End();
+            EditorPhaseTiming::Scope sceneCheckPhase(m_phaseTiming,
+                EditorPhaseTiming::Phase::AssetBrowserContentsFilesystem);
             const bool isScene = sceneDocument && project && IsSceneEntry(entry.path, *project);
             const bool active = isScene && IsActiveSceneEntry(entry.path, *project, activeScene);
+            sceneCheckPhase.End();
             const bool hasThumbnail = isTexture || isMaterial || isMesh;
             const bool compactTile = !hasThumbnail && !isScript;
             const auto tilePosition = ImGui::GetCursorScreenPos();
@@ -917,6 +926,8 @@ void AssetBrowser::DrawContents(const ProjectContext* project, const FileBackedD
                     !materialError.empty() ? ("\n" + materialError).c_str() : "");
             }
 
+            EditorPhaseTiming::Scope eligibilityPhase(m_phaseTiming,
+                EditorPhaseTiming::Phase::AssetBrowserContentsFilesystem);
             const DWORD attributes = GetFileAttributesW(entry.path.c_str());
             const bool ordinaryFile = attributes != INVALID_FILE_ATTRIBUTES &&
                 (attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) == 0;
@@ -924,6 +935,7 @@ void AssetBrowser::DrawContents(const ProjectContext* project, const FileBackedD
             std::string deleteEligibility;
             const bool eligible = ordinaryFile && m_thumbnailPaths &&
                 entry.path != m_thumbnailPaths->GetAssetRegistryPath() && CanBrowse(entry.path.parent_path(), deleteEligibility);
+            eligibilityPhase.End();
 
             if(eligible && hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right))
             {
@@ -1038,6 +1050,7 @@ void AssetBrowser::DrawContents(const ProjectContext* project, const FileBackedD
 void AssetBrowser::Draw(const EditorWorkspaceRect& rectangle, const ProjectContext* project,
     const FileBackedDemoScene* activeScene)
 {
+    EditorPhaseTiming::Scope setupPhase(m_phaseTiming, EditorPhaseTiming::Phase::AssetBrowserSetup);
     m_thumbnails->BeginFrame();
 
     for(auto& [identity, request] : m_meshThumbnailRequests)
@@ -1178,7 +1191,11 @@ void AssetBrowser::Draw(const EditorWorkspaceRect& rectangle, const ProjectConte
             ImGui::TableNextColumn();
             ImGui::BeginChild("ContentGrid");
             CaptureDropTarget(m_directory, true);
-            DrawContents(project, activeScene);
+            setupPhase.End();
+            {
+                EditorPhaseTiming::Scope contentsPhase(m_phaseTiming, EditorPhaseTiming::Phase::AssetBrowserContents);
+                DrawContents(project, activeScene);
+            }
             ImGui::EndChild();
             ImGui::EndTable();
         }
@@ -1188,8 +1205,10 @@ void AssetBrowser::Draw(const EditorWorkspaceRect& rectangle, const ProjectConte
         DrawMeshImportUnits();
     }
 
+    setupPhase.End();
     ImGui::End();
     ImGui::PopStyleVar(2);
+    EditorPhaseTiming::Scope thumbnailPhase(m_phaseTiming, EditorPhaseTiming::Phase::AssetBrowserThumbnails);
     PruneMeshThumbnailRequests();
     ScheduleThumbnails();
 }

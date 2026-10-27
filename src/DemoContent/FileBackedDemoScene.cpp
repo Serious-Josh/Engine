@@ -255,8 +255,8 @@ void FileBackedDemoScene::ResetDirectionalLight()
         return;
     }
 
-    m_runtime->GetScene().GetDirectionalLight() =
-        m_runtime->GetFileScene().GetDocument().directionalLight;
+    // Directional defaults belong to object components; this compatibility hook resets ambient only.
+    m_runtime->GetScene().SetLightingSettings(m_runtime->GetFileScene().GetDocument().lightingSettings);
 }
 
 void FileBackedDemoScene::SetAspectRatio(float aspectRatio)

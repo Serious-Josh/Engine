@@ -564,6 +564,131 @@ void CSResolveDenoisedRelax(uint3 dispatchThreadID : SV_DispatchThreadID)
     }
 }
 
+// NRD RELAX R.4 diagnostic only: one diffuse signal into presentationIndex's surface pixels, in place of
+// CSResolveDenoisedRelax. Its own constant buffer (b1), so b0 and every other entry point compile unchanged. All three
+// signals are material-modulated diffuse radiance, as the production resolve's diffuse term:
+//   1 A: the split direct pass's diffuse direct light (RTXDI after reuse and final visibility), the mean of the frame's
+//     samples; already modulated, so it is written as stored.
+//   2 B: RELAX's packed diffuse input (direct + indirect), unpacked, * diffuseFactor * radianceScale.
+//   3 C: RELAX's denoised diffuse output, unpacked, * diffuseFactor * radianceScale.
+// R.9B confidence probes (NrdHistoryConfidence.hlsli), unmodulated and shown as displayed values, not radiance:
+//   4 the raw visibility change T dV / T of the probe at this pixel's previous-frame position: black none, white full;
+//     dark red where that probe holds no valid measurement.
+//   5 the filtered diffuse history confidence there (R.9F: strengthened when enabled); nearest texel, before tone
+//     mapping, not NRD's bilinear sample. Values range from the 0.1 floor to neutral 1.
+//   6 (R.9B.2) that probe's state before filtering (NrdHistoryConfidence.hlsli NRD_CONFIDENCE_STATE_*): red invalid,
+//     dark grey unchanged table light (point, spot, directional), dark yellow unchanged sun, dark cyan unchanged
+//     environment, magenta visible -> occluded, green occluded -> visible.
+//   Both probe textures are in the previous frame's pixel space (as NRD reads IN_DIFF_CONFIDENCE): each pixel is mapped
+//   by its G-buffer motion (current UV - previous UV); dark blue where the previous position is off screen.
+// The caller sets diffuseIndex (B's SRV) and denoisedDiffuseIndex (C's SRV), and motionIndex (4, 5) in b0.
+struct NrdRelaxSignalViewConstants
+{
+    uint mode;
+    // RWByteAddressBuffer UAV: float3 per pixel and sample (PathTraceSplitDirectRadianceAddress).
+    uint splitDirectDiffuseIndex;
+    uint samplesPerFrame;
+    // Modes 4, 5 and 6: the probe signal (RG32F), confidence (R16F) or state (R8_UINT) SRV.
+    uint probeTextureIndex;
+};
+
+ConstantBuffer<NrdRelaxSignalViewConstants> signalViewConstants : register(b1);
+
+[numthreads(8, 8, 1)]
+void CSResolveRelaxSignalView(uint3 dispatchThreadID : SV_DispatchThreadID)
+{
+    uint2 pixel = dispatchThreadID.xy;
+
+    if(any(pixel >= constants.resolution))
+    {
+        return;
+    }
+
+    NrdPathTraceSurface surface = NrdPathTraceLoadSurface(pixel);
+
+    if(!surface.valid)
+    {
+        return;
+    }
+
+    float3 radiance = float3(0.0f, 0.0f, 0.0f);
+
+    if(signalViewConstants.mode == 1u)
+    {
+        RWByteAddressBuffer directDiffuse = ResourceDescriptorHeap[signalViewConstants.splitDirectDiffuseIndex];
+        uint samples = max(signalViewConstants.samplesPerFrame, 1u);
+
+        for(uint sampleOffset = 0u; sampleOffset < samples; ++sampleOffset)
+        {
+            // PathTraceReference.hlsl PathTraceSplitDirectRadianceAddress.
+            uint element = (sampleOffset * constants.resolution.y + pixel.y) * constants.resolution.x + pixel.x;
+            radiance += asfloat(directDiffuse.Load3(element * 12u));
+        }
+
+        radiance /= float(samples);
+    }
+    else if(signalViewConstants.mode == 2u)
+    {
+        Texture2D<float4> diffuseInput = ResourceDescriptorHeap[constants.diffuseIndex];
+        radiance = RELAX_BackEnd_UnpackRadiance(diffuseInput.Load(int3(pixel, 0))).rgb * surface.diffuseFactor *
+            constants.radianceScale;
+    }
+    else if(signalViewConstants.mode == 3u)
+    {
+        Texture2D<float4> denoisedDiffuse = ResourceDescriptorHeap[constants.denoisedDiffuseIndex];
+        radiance = RELAX_BackEnd_UnpackRadiance(denoisedDiffuse.Load(int3(pixel, 0))).rgb * surface.diffuseFactor *
+            constants.radianceScale;
+    }
+    else
+    {
+        Texture2D<float4> motionTexture = ResourceDescriptorHeap[constants.motionIndex];
+        float2 previousUv = (float2(pixel) + 0.5f) / float2(constants.resolution) - motionTexture.Load(int3(pixel, 0)).xy;
+
+        if(!all(isfinite(previousUv)) || any(previousUv < 0.0f) || any(previousUv >= 1.0f))
+        {
+            radiance = float3(0.0f, 0.0f, 0.15f);
+        }
+        else if(signalViewConstants.mode == 4u)
+        {
+            Texture2D<float2> probeSignal = ResourceDescriptorHeap[signalViewConstants.probeTextureIndex];
+            uint2 probeSize;
+            probeSignal.GetDimensions(probeSize.x, probeSize.y);
+            float2 change = probeSignal.Load(int3(min(uint2(previousUv * float2(probeSize)), probeSize - 1u), 0));
+            radiance = change.y > 0.0f ? saturate(change.x / change.y).xxx : float3(0.15f, 0.0f, 0.0f);
+        }
+        else if(signalViewConstants.mode == 6u)
+        {
+            Texture2D<uint> probeState = ResourceDescriptorHeap[signalViewConstants.probeTextureIndex];
+            uint2 probeSize;
+            probeState.GetDimensions(probeSize.x, probeSize.y);
+            uint state = probeState.Load(int3(min(uint2(previousUv * float2(probeSize)), probeSize - 1u), 0));
+            const float3 stateColors[6] = {
+                float3(0.8f, 0.0f, 0.0f),       // invalid
+                float3(0.12f, 0.12f, 0.12f),    // unchanged table light
+                float3(0.3f, 0.26f, 0.0f),      // unchanged sun
+                float3(0.0f, 0.22f, 0.26f),     // unchanged environment
+                float3(1.0f, 0.0f, 1.0f),       // visible -> occluded
+                float3(0.0f, 1.0f, 0.0f)};      // occluded -> visible
+            radiance = stateColors[min(state, 5u)];
+        }
+        else
+        {
+            Texture2D<float> probeConfidence = ResourceDescriptorHeap[signalViewConstants.probeTextureIndex];
+            uint2 probeSize;
+            probeConfidence.GetDimensions(probeSize.x, probeSize.y);
+            radiance = saturate(probeConfidence.Load(int3(min(uint2(previousUv * float2(probeSize)), probeSize - 1u),
+                0))).xxx;
+        }
+    }
+
+    // As the production resolve: a non-finite value never reaches the image; the path tracer's value stays.
+    if(all(isfinite(radiance)))
+    {
+        RWTexture2D<float4> presentation = ResourceDescriptorHeap[constants.presentationIndex];
+        presentation[pixel] = float4(min(max(radiance, 0.0f), NRD_PATH_TRACE_HALF_MAXIMUM), 1.0f);
+    }
+}
+
 // HYBRID.3 diagnostic only: complete RELAX diffuse and REBLUR specular, shared guides.
 [numthreads(8, 8, 1)]
 void CSPrepareHybrid(uint3 dispatchThreadID : SV_DispatchThreadID)

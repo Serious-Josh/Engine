@@ -13,7 +13,7 @@ struct PreparedScene
 {
     std::string environmentReference;
     SceneCameraDocument camera;
-    DirectionalLight directionalLight;
+    SceneLightingSettings lightingSettings;
     std::vector<ResolvedSceneObject> objects;
 };
 

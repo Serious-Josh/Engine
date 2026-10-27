@@ -1,4 +1,5 @@
 #include "ComputePipeline.h"
+#include "Debug/TransitionTiming.h"
 
 bool ComputePipeline::Initialize(
     ID3D12Device* device,
@@ -31,6 +32,14 @@ bool ComputePipeline::Initialize(
         case RootParameterType::ConstantBuffer:
         {
             parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+            parameter.Descriptor.ShaderRegister = parameterDescription.shaderRegister;
+            parameter.Descriptor.RegisterSpace = 0;
+            break;
+        }
+        // A root SRV (a buffer or acceleration structure address).
+        case RootParameterType::ShaderResource:
+        {
+            parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
             parameter.Descriptor.ShaderRegister = parameterDescription.shaderRegister;
             parameter.Descriptor.RegisterSpace = 0;
             break;
@@ -88,6 +97,7 @@ bool ComputePipeline::Initialize(
     pipelineDescription.CS.pShaderBytecode = description.computeShader->GetByteCode();
     pipelineDescription.CS.BytecodeLength = description.computeShader->GetBytecodeSize();
 
+    TransitionTiming::Scope er1Scope("CreateComputePipelineState");
     result = device->CreateComputePipelineState(&pipelineDescription, IID_PPV_ARGS(&m_pipelineState));
 
     if (FAILED(result))

@@ -1,4 +1,5 @@
 #include "CommandContext.h"
+#include "Debug/TransitionTiming.h"
 #include "Debug/CpuFrameTiming.h"
 #include "Core/Log.h"
 #ifdef _DEBUG
@@ -207,6 +208,7 @@ void CommandContext::Shutdown()
 // before the frame does; failures and device removal are reported here.
 bool CommandContext::WaitForFrameFence(unsigned int frameIndex)
 {
+    TransitionTiming::Scope er1Scope("GPU WaitForFrameFence", 1.0);
     if (!m_fence || frameIndex >= FrameCount)
     {
         return false;
@@ -436,6 +438,7 @@ bool CommandContext::Execute(unsigned int frameIndex)
 
 bool CommandContext::WaitForGPU()
 {
+    TransitionTiming::Scope er1Scope("GPU WaitForGPU (idle)", 0.0);
     ++m_gpuDrainCount;
     if (!m_commandQueue || !m_fence || !m_fenceEvent)
     {

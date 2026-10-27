@@ -187,8 +187,10 @@ add_library(EngineCore OBJECT
     src/Renderer/DepthBuffer.cpp
     src/Renderer/UploadBuffer.cpp
     src/Renderer/Shader/ShaderCompiler.cpp
+    src/Renderer/Shader/DxilLibraryCache.cpp
     src/Renderer/Shader/ShaderLibrary.cpp
     src/Renderer/Shader/ShaderLibraryCompileWorker.cpp
+    src/Renderer/RayTracing/RayTracingPipelineWorker.cpp
     src/Renderer/LightingModeTransition.cpp
     external/imgui/imgui.cpp
     external/imgui/imgui_draw.cpp
@@ -266,6 +268,7 @@ add_library(EngineCore OBJECT
     src/Renderer/Passes/NrdDenoiser.cpp
     src/Renderer/Passes/NrdPreparePass.cpp
     src/Renderer/Passes/NrdPathTracePreparePass.cpp
+    src/Renderer/Passes/NrdHistoryConfidencePass.cpp
     src/Renderer/Passes/ReflectionContributionLimitPass.cpp
     src/Renderer/Passes/NrdReflectionResolvePass.cpp
     src/DemoContent/DemoSceneManager.cpp
@@ -448,6 +451,22 @@ if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Engine/t
     if(ENGINE_VERIFICATION_AVAILABLE)
         target_link_libraries(CameraDataTests PRIVATE $<$<CONFIG:Debug>:EngineVerification>)
     endif()
+endif()
+
+# Local-only E.4 regression: single-object inspection capture equals the full-scene capture, same guard as CameraDataTests.
+if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Engine/tests/ObjectInspectionCaptureTests.cpp")
+    add_executable(ObjectInspectionCaptureTests src/Engine/tests/ObjectInspectionCaptureTests.cpp)
+    target_link_libraries(ObjectInspectionCaptureTests PRIVATE EngineCore)
+
+    if(ENGINE_VERIFICATION_AVAILABLE)
+        target_link_libraries(ObjectInspectionCaptureTests PRIVATE $<$<CONFIG:Debug>:EngineVerification>)
+    endif()
+endif()
+
+# Local-only F.3 asset-browser script-lookup regression, same guard as the other diagnostics tests.
+if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Engine/tests/AssetBrowserScriptLookupTests.cpp")
+    add_executable(AssetBrowserScriptLookupTests src/Engine/tests/AssetBrowserScriptLookupTests.cpp)
+    target_link_libraries(AssetBrowserScriptLookupTests PRIVATE EngineCore)
 endif()
 
 # Local-only LIGHT.1 data/persistence/lighting/wireframe regression, same guard as CameraDataTests.
@@ -650,3 +669,10 @@ foreach(engine_directory IN ITEMS "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT
         endif()
     endforeach()
 endforeach()
+
+# Scene environment persistence, GPU binding and RTXDI light-set regression.
+if(ENGINE_BUILD_DIAGNOSTICS)
+    add_executable(SceneLightingEnvironmentTests tools/validation/SceneLightingEnvironmentCheck.cpp)
+    target_link_libraries(SceneLightingEnvironmentTests PRIVATE EngineCore)
+    engine_use_agility(SceneLightingEnvironmentTests)
+endif()

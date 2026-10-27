@@ -219,10 +219,10 @@ void Editor::DrawObjectCameraControls(IDemoScene& scene)
         return;
     }
 
-    const auto selection = owner->GetObjectMetadata(m_selectedObject);
+    std::optional<SceneObjectMetadata> selection(std::in_place);
     SceneObjectDocument object;
 
-    if(!selection || !owner->CaptureCameraInspection(selection->objectID, object))
+    if(!owner->InspectSelectedObject(m_selectedObject, *selection, object))
     {
         return;
     }
@@ -252,7 +252,7 @@ void Editor::DrawObjectCameraControls(IDemoScene& scene)
         m_cameraInspection->objectID != selection->objectID ||
         m_cameraInspection->runtimeIdentity != selection->runtimeIdentity ||
         m_cameraInspection->structureRevision != selection->structureRevision;
-    const bool blocked = !ResolveComponentEditTarget(scene);
+    const bool blocked = !ResolveComponentEditTarget(scene, *selection);
 
     // Any owner, session, history or value change discards drafts and retires widget IDs.
     if(changedTarget || m_cameraInspectedValue != object.camera || blocked)

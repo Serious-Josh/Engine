@@ -115,10 +115,10 @@ void Editor::DrawObjectCharacterControllerControls(IDemoScene& scene)
         return;
     }
 
-    const auto selection = owner->GetObjectMetadata(m_selectedObject);
+    std::optional<SceneObjectMetadata> selection(std::in_place);
     SceneObjectDocument object;
 
-    if(!selection || !owner->CaptureCharacterControllerInspection(selection->objectID, object))
+    if(!owner->InspectSelectedObject(m_selectedObject, *selection, object))
     {
         return;
     }
@@ -165,7 +165,7 @@ void Editor::DrawObjectCharacterControllerControls(IDemoScene& scene)
         m_controllerInspection->objectID != selection->objectID ||
         m_controllerInspection->runtimeIdentity != selection->runtimeIdentity ||
         m_controllerInspection->structureRevision != selection->structureRevision;
-    const bool blocked = !ResolveComponentEditTarget(scene);
+    const bool blocked = !ResolveComponentEditTarget(scene, *selection);
 
     if(changedTarget || m_controllerInspectedValue != object.characterController || blocked)
     {

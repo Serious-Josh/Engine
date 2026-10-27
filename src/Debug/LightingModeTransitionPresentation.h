@@ -17,6 +17,7 @@ inline bool IsLightingModePreparing(LightingModeTransitionStage stage)
     {
     case LightingModeTransitionStage::Queued:
     case LightingModeTransitionStage::Compiling:
+    case LightingModeTransitionStage::PreparingPipelines:
     case LightingModeTransitionStage::CreatingPipeline:
     case LightingModeTransitionStage::InitializingResources:
     case LightingModeTransitionStage::ReadyToActivate:
@@ -56,6 +57,8 @@ inline const char* GetLightingModeStageLabel(LightingModeTransitionStage stage)
         return "Queued";
     case LightingModeTransitionStage::Compiling:
         return "Compiling shaders";
+    case LightingModeTransitionStage::PreparingPipelines:
+        return "Preparing DXR pipelines";
     case LightingModeTransitionStage::CreatingPipeline:
         return "Creating pipeline";
     case LightingModeTransitionStage::InitializingResources:

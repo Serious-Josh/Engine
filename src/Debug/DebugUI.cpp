@@ -4,6 +4,8 @@
 #include "Renderer/DescriptorHeap.h"
 #include "Platform/Windows/WindowsWindow.h"
 
+#include <cmath>
+#include <format>
 #include "imgui.h"
 #include "imgui_impl_win32.h"
 #include "imgui_impl_dx12.h"
@@ -694,6 +696,9 @@ void DebugUI::DrawPerformanceWindow(
 
             drawGpuTiming("  NRD reflection resolve", GpuTimestampProfiler::Region::NrdResolve);
 
+            ImGui::Text("Primary DI shadows: %s",
+                m_lightingTransition.active == RendererLightingMode::PathTracedRasterPrimaryReSTIRDI ?
+                (m_primaryDiShadowActive ? "RayQuery (DI.1)" : "TraceRay (Original)") : "Not in use");
             ImGui::Text("Secondary shadows: %s | rolling GPU median (last 30 samples)",
                 m_secondaryShadowActive ? "RayQuery (GI.6)" : "TraceRay (Original)");
             if(ImGui::Button("Restart GPU comparison warm-up"))
@@ -1053,6 +1058,7 @@ PathTraceReferenceSettings DebugUI::GetPathTraceReferenceSettings() const
 {
     PathTraceReferenceSettings settings;
     settings.secondaryShadowRayQuery = m_secondaryShadowVisibility == 1;
+    settings.primaryDiShadowRayQuery = m_primaryDiShadowVisibility == 1;
     settings.samplesPerFrame = static_cast<std::uint32_t>(m_pathTraceSamplesPerFrame);
     settings.maxPathDepth = static_cast<std::uint32_t>(m_pathTraceMaxPathDepth);
     settings.russianRouletteDepth = static_cast<std::uint32_t>(m_pathTraceRussianRouletteDepth);
@@ -1110,6 +1116,12 @@ void DebugUI::DrawSharcSettings()
     }
 
     ImGui::Checkbox("SHARC statistics", &m_sharcStatistics);
+
+    if (!m_sharcStatus.preparation.empty())
+    {
+        ImGui::TextWrapped("%s", m_sharcStatus.preparation.c_str());
+        return;
+    }
 
     if (!m_sharcStatus.active)
     {
@@ -1280,6 +1292,24 @@ void DebugUI::DrawPathTraceReferenceSettings()
     }
 
     const char* visibilityModes[] = {"TraceRay (Original)", "RayQuery (GI.6)"};
+    const char* primaryDiVisibilityModes[] = {"TraceRay (Original)", "RayQuery (DI.1)"};
+    ImGui::BeginDisabled(!m_primaryDiShadowReady || preparing || m_lightingMode != 3);
+    ImGui::Combo("Primary DI Shadow Visibility", &m_primaryDiShadowVisibility,
+        primaryDiVisibilityModes, IM_ARRAYSIZE(primaryDiVisibilityModes));
+    ImGui::EndDisabled();
+    ImGui::Text("Active primary DI shadows: %s",
+        m_lightingTransition.active == RendererLightingMode::PathTracedRasterPrimaryReSTIRDI ?
+        primaryDiVisibilityModes[m_primaryDiShadowActive ? 1 : 0] : "Not in use");
+
+    if(m_lightingMode == 3 && m_primaryDiShadowFailed)
+    {
+        ImGui::TextDisabled("DI.1 pipelines failed (see the DI.1 log warning); original retained.");
+    }
+    else if(m_lightingMode == 3 && !m_primaryDiShadowReady)
+    {
+        ImGui::TextDisabled("DI.1 pipelines still preparing; original retained.");
+    }
+
     ImGui::BeginDisabled(!m_secondaryShadowReady || preparing);
     ImGui::Combo("Secondary Shadow Visibility", &m_secondaryShadowVisibility,
         visibilityModes, IM_ARRAYSIZE(visibilityModes));
@@ -1293,6 +1323,7 @@ void DebugUI::DrawPathTraceReferenceSettings()
 
     // Both path-traced modes share these settings; ranges match IsValidPathTraceReferenceSettings and every
     // change restarts accumulation.
+    DrawPathTraceSampleDiagnostic();
     ImGui::SliderInt("PT samples per frame", &m_pathTraceSamplesPerFrame, 1,
                      static_cast<int>(PathTraceReferenceSettings::MaximumSamplesPerFrame));
     ImGui::SliderInt("PT max path depth", &m_pathTraceMaxPathDepth, 1,
@@ -1349,6 +1380,11 @@ void DebugUI::DrawPathTraceReferenceSettings()
         if (ImGui::Combo("PT denoiser", &denoiserMode, denoiserModes, IM_ARRAYSIZE(denoiserModes)))
         {
             m_pathTraceDenoiserMode = static_cast<PathTraceDenoiserMode>(denoiserMode);
+        }
+
+        if (!m_pathTraceDenoiserPreparation.empty())
+        {
+            ImGui::TextWrapped("%s", m_pathTraceDenoiserPreparation.c_str());
         }
 
         if (IsNrdPathTraceDenoiserMode(m_pathTraceDenoiserMode))
@@ -1434,4 +1470,303 @@ void DebugUI::DrawMenu()
     ImGui::MenuItem("Rendering Settings", nullptr, &m_showRenderingSettings);
     ImGui::Separator();
     ImGui::MenuItem("GPU Timing Graph", nullptr, &m_gpuTimingGraph.visible);
+}
+
+void DebugUI::DrawPathTraceSampleDiagnostic()
+{
+    if(!ImGui::CollapsingHeader("Indirect sample provenance (R.9I.1)")) return;
+    ImGui::Checkbox("Capture selected PT pixel", &m_sampleDiagnosticSettings.enabled);
+    ImGui::InputInt("Render pixel X", &m_sampleDiagnosticSettings.x);
+    ImGui::InputInt("Render pixel Y", &m_sampleDiagnosticSettings.y);
+    ImGui::InputFloat("Detail luminance threshold (capture only)", &m_sampleDiagnosticSettings.threshold);
+    if(!std::isfinite(m_sampleDiagnosticSettings.threshold) || m_sampleDiagnosticSettings.threshold < 0.0f)
+        m_sampleDiagnosticSettings.threshold = 0.0f;
+    if(ImGui::Button("Clear sample records"))
+    {
+        ++m_sampleDiagnosticSettings.clearRequest;
+        m_sampleDiagnosticStatus.history.clear();
+        m_sampleDiagnosticStatus.havePeak = false;
+    }
+    const auto& status = m_sampleDiagnosticStatus;
+    ImGui::Text("%s", status.state.c_str());
+    ImGui::Text("Pixel (%d,%d), target %u x %u; run %llu; current N=%u",
+        m_sampleDiagnosticSettings.x, m_sampleDiagnosticSettings.y, status.width, status.height,
+        static_cast<unsigned long long>(status.run), status.currentSamples);
+    ImGui::Text("Captured %llu; dropped %llu; history overwritten %llu (last 128 kept)",
+        static_cast<unsigned long long>(status.captures), static_cast<unsigned long long>(status.dropped),
+        static_cast<unsigned long long>(status.overwritten));
+    ImGui::TextWrapped("Scene-linear HDR before denoisers, exposure, tone mapping and DLSS. Mean is after the entire batch, not after each individual sample. No new records at the sample target.");
+    const auto rgb = [](const char* label, const float* value)
+    {
+        ImGui::Text("%s RGB (%.7g, %.7g, %.7g), Y %.7g", label, value[0], value[1], value[2], value[3]);
+    };
+    const auto record = [&](const PathTraceSampleRecord& value)
+    {
+        ImGui::Text("Frame %u, sample %u, old N=%u, batch=%u; depth=%u target=%u seed=%u",
+            value.meta[0], value.meta[1], value.meta[2], value.meta[3], value.config[0], value.config[1], value.config[2]);
+        rgb("Raw sample", value.sample); rgb("Indirect", value.indirect); rgb("Progressive mean", value.mean);
+        rgb("Primary", value.primary); rgb("Secondary direct", value.secondary); rgb("Deeper direct", value.deeper);
+        rgb("Miss", value.miss); rgb("SHARC substitution", value.cache);
+        ImGui::Text("SHARC %s; rejected %s; expanded provenance %s; secondary distance %.7g",
+            value.config[3] & 1u ? "yes" : "no", value.config[3] & 2u ? "yes" : "no",
+            value.config[3] & 4u ? "yes" : "no", value.hit[0]);
+        if(value.config[3] & 4u)
+        {
+            rgb("Dominant individual secondary light", value.dominant);
+            rgb("Its diffuse", value.diffuse); rgb("Its specular remainder", value.specular);
+            ImGui::Text("Vertex %u, light %u type %u, material %u, roughness %.7g",
+                value.info[0], value.info[1], value.info[2], value.info[3], value.hit[1]);
+            ImGui::Text("f*cos*Li (%.7g,%.7g,%.7g), cosine %.7g",
+                value.factors[0], value.factors[1], value.factors[2], value.factors[3]);
+            ImGui::Text("Li (%.7g,%.7g,%.7g), light distance %.7g, light PDF %.7g, MIS/pdf %.7g",
+                value.incidence[0], value.incidence[1], value.incidence[2], value.incidence[3], value.hit[2], value.hit[3]);
+            ImGui::Text("Incoming throughput (%.7g,%.7g,%.7g), incoming BSDF PDF %.7g",
+                value.throughput[0], value.throughput[1], value.throughput[2], value.throughput[3]);
+        }
+    };
+    if(!status.history.empty())
+    {
+        ImGui::SeparatorText("Latest completed GPU record"); record(status.history.back());
+    }
+    if(status.havePeak && ImGui::TreeNode("Peak indirect sample (this capture/run)"))
+    {
+        record(status.peak); ImGui::TreePop();
+    }
+    if(ImGui::TreeNode("Recent individual samples"))
+    {
+        ImGui::BeginChild("sample-history", ImVec2(0, 180), true);
+        for(auto it = status.history.rbegin(); it != status.history.rend(); ++it)
+            ImGui::Text("frame %u sample %u N=%u+%u: indirect Y %.7g, mean Y %.7g, sample Y %.7g%s",
+                it->meta[0], it->meta[1], it->meta[2], it->meta[3], it->indirect[3], it->mean[3], it->sample[3],
+                it->config[3] & 1u ? " SHARC" : "");
+        ImGui::EndChild(); ImGui::TreePop();
+    }
+    ImGui::TextWrapped("Light types: 0 point, 1 spot, 2 directional, 3 sun, 4 environment. Sun/environment indices use UINT_MAX-1/-2. UINT_MAX means no dominant visible light. Raw BSDF f and a per-bounce weight trace are not captured; f*cos*Li and incoming throughput/PDF are captured without additional evaluations.");
+    DrawPathTraceAutoCapture();
+}
+
+namespace
+{
+    float AutoLuminance(float r, float g, float b)
+    {
+        return 0.2126f * r + 0.7152f * g + 0.0722f * b;
+    }
+
+    std::string AutoRGB(const float* value)
+    {
+        return std::format("({:.7g}, {:.7g}, {:.7g}) Y {:.7g}", value[0], value[1], value[2], value[3]);
+    }
+
+    std::string AutoLightType(std::uint32_t type)
+    {
+        constexpr const char* names[] = {"point", "spot", "directional", "sun", "environment"};
+        return type < 5 ? names[type] : "unavailable";
+    }
+
+    std::string AutoLightIndex(std::uint32_t index)
+    {
+        if(index == 0xFFFFFFFFu)
+        {
+            return "unavailable";
+        }
+
+        if(index == 0xFFFFFFFEu)
+        {
+            return "sun";
+        }
+
+        if(index == 0xFFFFFFFDu)
+        {
+            return "environment";
+        }
+
+        return std::to_string(index);
+    }
+
+    // Plain-text candidate block shared by the UI and report; every value is read back, none reconstructed by
+    // division.
+    std::string AutoCandidateText(unsigned rank, const PathTraceAutoCandidate& candidate)
+    {
+        const auto& record = candidate.record;
+        std::string text = std::format("#{} pixel ({}, {}) run {} frame {} sample {} old N {} batch {} depth {}"
+            " target {} seed {}\n", rank, candidate.x, candidate.y, candidate.run, record.meta[0], record.meta[1],
+            record.meta[2], record.meta[3], record.config[0], record.config[1], record.config[2]);
+        text += std::format("  flags: SHARC substitution {}, raw sample rejected {}, bucket maximum {}\n",
+            record.config[3] & 1u ? "yes" : "no", record.config[3] & 2u ? "yes" : "no",
+            candidate.bucketMaximum ? "yes" : "no (stronger same-bucket event lost the write lock)");
+        text += "  raw sample RGB " + AutoRGB(record.sample) + "\n";
+        text += "  indirect RGB " + AutoRGB(record.indirect) + "\n";
+
+        if(candidate.meanAvailable)
+        {
+            text += std::format("  progressive mean after batch (N {}) RGB {}\n", record.meta[2] + record.meta[3],
+                AutoRGB(record.mean));
+        }
+        else
+        {
+            text += "  progressive mean: unavailable (mean write lock contended or bucket reassigned)\n";
+        }
+
+        text += "  primary RGB " + AutoRGB(record.primary) + "\n";
+        text += "  secondary direct RGB " + AutoRGB(record.secondary) + "\n";
+        text += "  deeper direct RGB " + AutoRGB(record.deeper) + "\n";
+        text += "  indirect miss RGB " + AutoRGB(record.miss) + "\n";
+        text += "  SHARC substitution RGB " + AutoRGB(record.cache) + "\n";
+        const std::string hitDistance = record.hit[0] < 0.0f ? std::string("unavailable (no secondary hit)") :
+            std::format("{:.7g}", record.hit[0]);
+        text += "  first secondary hit distance " + hitDistance + "\n";
+
+        if(record.info[1] == 0xFFFFFFFFu)
+        {
+            text += "  dominant secondary light: unavailable (no visible secondary/deeper light sample)\n";
+            return text;
+        }
+
+        const float throughputY = AutoLuminance(record.throughput[0], record.throughput[1], record.throughput[2]);
+        const float responseY = AutoLuminance(record.factors[0], record.factors[1], record.factors[2]);
+        const float incidentY = AutoLuminance(record.incidence[0], record.incidence[1], record.incidence[2]);
+        text += std::format("  dominant light: vertex {} type {} index {} light distance {:.7g}\n", record.info[0],
+            AutoLightType(record.info[2]), AutoLightIndex(record.info[1]), record.incidence[3]);
+        text += "  dominant contribution RGB " + AutoRGB(record.dominant) + "\n";
+        text += "    diffuse part RGB " + AutoRGB(record.diffuse) + "\n";
+        text += "    specular remainder RGB " + AutoRGB(record.specular) + "\n";
+        text += std::format("  incoming throughput RGB ({:.7g}, {:.7g}, {:.7g}) Y {:.7g}, incoming BSDF PDF {:.7g}\n",
+            record.throughput[0], record.throughput[1], record.throughput[2], throughputY, record.throughput[3]);
+        text += std::format("  incident Li RGB ({:.7g}, {:.7g}, {:.7g}) Y {:.7g}\n", record.incidence[0],
+            record.incidence[1], record.incidence[2], incidentY);
+        text += std::format("  secondary f*cos*Li RGB ({:.7g}, {:.7g}, {:.7g}) Y {:.7g}, cosine {:.7g}\n",
+            record.factors[0], record.factors[1], record.factors[2], responseY, record.factors[3]);
+        text += std::format("  light PDF {:.7g}, MIS/pdf weight {:.7g}\n", record.hit[2], record.hit[3]);
+        const std::string material = record.info[3] == 0xFFFFFFFFu ? std::string("unavailable") :
+            std::to_string(record.info[3]);
+        text += std::format("  secondary material index {}, roughness {:.7g}\n", material, record.hit[1]);
+
+        // Forward product only: the shader recorded dominant as throughput * (f*cos*Li * weight).
+        const float weight = record.hit[3];
+        const float product[3] = {record.throughput[0] * record.factors[0] * weight,
+            record.throughput[1] * record.factors[1] * weight, record.throughput[2] * record.factors[2] * weight};
+        const std::string share = record.indirect[3] > 0.0f ?
+            std::format("{:.4g}", record.dominant[3] / record.indirect[3]) : std::string("unavailable");
+        text += std::format("  check: throughput x f*cos*Li x weight = ({:.7g}, {:.7g}, {:.7g}) Y {:.7g}"
+            " vs dominant Y {:.7g}; dominant share of indirect {}\n", product[0], product[1], product[2],
+            AutoLuminance(product[0], product[1], product[2]), record.dominant[3], share);
+        return text;
+    }
+}
+
+std::string DebugUI::BuildPathTraceAutoCaptureReport() const
+{
+    const auto& status = m_sampleDiagnosticStatus;
+    const auto& automatic = status.automatic;
+    const auto settings = GetPathTraceReferenceSettings();
+    constexpr const char* denoisers[] = {"Off", "Engine", "NRD REBLUR", "NRD RELAX", "NRD hybrid"};
+    constexpr const char* lightingModes[] = {"Legacy", "Path Traced Reference", "Path Traced Raster Primary",
+        "Path Traced Raster Primary ReSTIR DI"};
+    const int denoiser = static_cast<int>(GetPathTraceDenoiserMode());
+    const char* denoiserName = denoiser >= 0 && denoiser < 5 ? denoisers[denoiser] : "unknown";
+
+    std::string text = "Engine diagnostic R.9I.1D automatic specular firefly capture (report v1)\n";
+    text += "Candidates are large raw indirect path samples (firefly candidates), not confirmed visible white pixels.\n";
+    text += "Values are scene-linear, before denoisers, exposure, tone mapping and DLSS.\n\n";
+    text += std::format("Capture: automatic, strongest indirect luminance per hashed bucket ({} buckets) per frame,"
+        " merged into top {}; detection threshold {:.7g} (filter only)\n", PathTraceAutoBucketCount,
+        PathTraceAutoCapture::CandidateCapacity, automatic.threshold);
+    text += std::format("State: {}\n", automatic.state);
+    text += std::format("Render target {} x {}; run/reset {}; current accumulated N {}\n", status.width, status.height,
+        automatic.run, status.currentSamples);
+    text += std::format("Lighting mode {}; PT samples/frame {}, max depth {}, roulette from depth {}, target {};"
+        " denoiser {}; render scale index {} (DLSS {}); SHARC enabled {}\n",
+        lightingModes[static_cast<int>(GetLightingMode())], settings.samplesPerFrame, settings.maxPathDepth,
+        settings.russianRouletteDepth, settings.maxAccumulatedSamples, denoiserName, GetPathTraceRenderScaleIndex(),
+        IsPathTraceDlssSelected() ? "yes" : "no", m_sharcEnabled ? "yes" : "no");
+    text += "Scene light count, environment and sun state: unavailable in this report.\n";
+    text += std::format("Frames observed {}; frames not observed (readback busy/allocation) {}\n",
+        automatic.framesCaptured, automatic.framesSkipped);
+    text += std::format("Threshold-crossing samples {}; bucket winners read back {}; retained {}; not retained"
+        " (outranked/displaced) {}\n", automatic.crossings, automatic.bucketEvents, automatic.candidates.size(),
+        automatic.notRetained);
+    text += std::format("Bucket maxima lost to write-lock contention {}; record lock failures {}; mean lock failures"
+        " {}; mean unavailable {}; invalid records {}\n", automatic.maximaLost, automatic.lockFailures,
+        automatic.meanLockFailures, automatic.meanUnavailable, automatic.invalid);
+    text += "Coverage: only each bucket's strongest sample per frame can be retained; the list is not exhaustive.\n";
+    text += "Light types: point, spot, directional, sun, environment. Raw BSDF f and per-bounce weights are not"
+        " captured.\n\n";
+
+    if(automatic.candidates.empty())
+    {
+        text += "No candidates retained.\n";
+    }
+
+    for(unsigned i = 0; i < automatic.candidates.size(); ++i)
+    {
+        text += AutoCandidateText(i + 1, automatic.candidates[i]);
+    }
+
+    return text;
+}
+
+void DebugUI::DrawPathTraceAutoCapture()
+{
+    auto& settings = m_sampleDiagnosticSettings;
+    ImGui::SeparatorText("Automatic firefly capture (R.9I.1D)");
+    ImGui::Checkbox("Enable automatic capture", &settings.autoEnabled);
+    ImGui::InputFloat("Detection luminance threshold", &settings.autoThreshold);
+
+    if(!std::isfinite(settings.autoThreshold) || settings.autoThreshold < 0.0f)
+    {
+        settings.autoThreshold = 0.0f;
+    }
+
+    if(ImGui::Button("Clear automatic records"))
+    {
+        ++settings.autoClearRequest;
+        m_sampleDiagnosticStatus.automatic.candidates.clear();
+    }
+
+    ImGui::SameLine();
+
+    // ImGui's platform clipboard; no new dependency.
+    if(ImGui::Button("Copy Diagnostic Report"))
+    {
+        ImGui::SetClipboardText(BuildPathTraceAutoCaptureReport().c_str());
+    }
+
+    const auto& automatic = m_sampleDiagnosticStatus.automatic;
+    ImGui::Text("%s", automatic.state.c_str());
+    ImGui::Text("Run %llu; frames observed %llu, not observed %llu; retained %zu of %u",
+        static_cast<unsigned long long>(automatic.run), static_cast<unsigned long long>(automatic.framesCaptured),
+        static_cast<unsigned long long>(automatic.framesSkipped), automatic.candidates.size(),
+        PathTraceAutoCapture::CandidateCapacity);
+    ImGui::Text("Crossings %llu; bucket winners %llu; not retained %llu; maxima lost %llu; mean unavailable %llu;"
+        " invalid %llu", static_cast<unsigned long long>(automatic.crossings),
+        static_cast<unsigned long long>(automatic.bucketEvents), static_cast<unsigned long long>(automatic.notRetained),
+        static_cast<unsigned long long>(automatic.maximaLost), static_cast<unsigned long long>(automatic.meanUnavailable),
+        static_cast<unsigned long long>(automatic.invalid));
+    ImGui::TextWrapped("Detection only: the threshold never changes radiance. Candidates are large raw indirect samples, not confirmed visible white pixels. Restart accumulation after enabling.");
+
+    if(automatic.candidates.empty() || !ImGui::TreeNode("Strongest candidates"))
+    {
+        return;
+    }
+
+    ImGui::BeginChild("auto-candidates", ImVec2(0, 260), true);
+
+    for(unsigned i = 0; i < automatic.candidates.size(); ++i)
+    {
+        const auto& candidate = automatic.candidates[i];
+        const auto& record = candidate.record;
+        const float throughputY = AutoLuminance(record.throughput[0], record.throughput[1], record.throughput[2]);
+        const float responseY = AutoLuminance(record.factors[0], record.factors[1], record.factors[2]);
+        const void* id = reinterpret_cast<const void*>(static_cast<std::uintptr_t>(i + 1));
+
+        if(ImGui::TreeNode(id, "#%u (%u,%u) indirect Y %.7g, throughput Y %.4g, f*cos*Li Y %.4g", i + 1, candidate.x,
+            candidate.y, record.indirect[3], throughputY, responseY))
+        {
+            ImGui::TextUnformatted(AutoCandidateText(i + 1, candidate).c_str());
+            ImGui::TreePop();
+        }
+    }
+
+    ImGui::EndChild();
+    ImGui::TreePop();
 }

@@ -27,6 +27,56 @@ void RendererDiagnostics::FrameHitchDiagnostics::CommitFrame(
     diagnostics.nextFrame = (diagnostics.nextFrame + 1) % diagnostics.frames.size();
     diagnostics.frameCount = (std::min)(diagnostics.frameCount + 1, diagnostics.frames.size());
 
+    // Editor phases: the EngineUI-derived windows take the same frames as Editor::Draw, so they compare directly.
+    const auto& editorPhases = snapshot.editorPhases.durations;
+    const std::optional<double> editorDraw = editorPhases[static_cast<size_t>(EditorPhaseTiming::Phase::Draw)];
+    const std::optional<double> engineUI = snapshot.regions[static_cast<size_t>(FrameHitchRegion::EngineUI)];
+
+    if (editorDraw && engineUI)
+    {
+        double topLevel = 0.0;
+
+        for (size_t index = 0; index < EditorPhaseTiming::PhaseCount; ++index)
+        {
+            if (editorPhases[index])
+            {
+                diagnostics.editorPhases[index].Add(*editorPhases[index]);
+
+                if (EditorPhaseTiming::Parent[index] == EditorPhaseTiming::Phase::Draw)
+                {
+                    topLevel += *editorPhases[index];
+                }
+            }
+        }
+
+        diagnostics.engineUI.Add(*engineUI);
+        diagnostics.engineUIOutsideEditor.Add(*engineUI - *editorDraw);
+        diagnostics.editorRemainder.Add(*editorDraw - topLevel);
+
+        // Nested parents (not Draw, whose remainder is above): the parent minus the direct children that ran.
+        std::array<double, EditorPhaseTiming::PhaseCount> childTotals{};
+        std::array<bool, EditorPhaseTiming::PhaseCount> hasChildren{};
+
+        for (size_t index = 0; index < EditorPhaseTiming::PhaseCount; ++index)
+        {
+            const size_t parent = static_cast<size_t>(EditorPhaseTiming::Parent[index]);
+
+            if (parent < EditorPhaseTiming::PhaseCount)
+            {
+                hasChildren[parent] = true;
+                childTotals[parent] += editorPhases[index].value_or(0.0);
+            }
+        }
+
+        for (size_t index = 1; index < EditorPhaseTiming::PhaseCount; ++index)
+        {
+            if (hasChildren[index] && editorPhases[index])
+            {
+                diagnostics.editorPhaseRemainders[index].Add(*editorPhases[index] - childTotals[index]);
+            }
+        }
+    }
+
     // Missing/error outcomes interrupt a deferred streak but are not successful
     // render attempts. Minimized/message waits must not enter render statistics.
 
@@ -138,6 +188,36 @@ void RendererDiagnostics::FrameHitchDiagnostics::Report(
               ", elapsed=" + std::to_string(activeDeferredMilliseconds) +
               ", maxCount=" + std::to_string(diagnostics.maxConsecutiveDeferred) +
               ", maxInterval=" + std::to_string(diagnostics.maxDeferredIntervalMilliseconds) + ".");
+
+    // Diagnostics only: Editor::Draw's phases, one line per report, when the Editor recorded them.
+    if (diagnostics.editorPhases[static_cast<size_t>(EditorPhaseTiming::Phase::Draw)].count != 0)
+    {
+        std::string editorLine = "Editor phase timing: CPU wall-clock ms; latest 256 samples per metric; EngineUI, "
+            "outside-Editor and remainder share Editor::Draw's frames; a phase's n counts the frames it ran; "
+            "[in X] marks a child already included in X; EngineUI {" + describe(diagnostics.engineUI) +
+            "}; EngineUI outside Editor::Draw {" + describe(diagnostics.engineUIOutsideEditor) + "}";
+
+        for (size_t index = 0; index < EditorPhaseTiming::PhaseCount; ++index)
+        {
+            const EditorPhaseTiming::Phase parent = EditorPhaseTiming::Parent[index];
+            const bool child = parent != EditorPhaseTiming::Phase::Count && parent != EditorPhaseTiming::Phase::Draw;
+            editorLine += std::string("; ") + EditorPhaseTiming::Names[index] +
+                (child ? std::string(" [in ") + EditorPhaseTiming::Names[static_cast<size_t>(parent)] + "]" : "") +
+                " {" + describe(diagnostics.editorPhases[index]) + "}";
+        }
+
+        for (size_t index = 1; index < EditorPhaseTiming::PhaseCount; ++index)
+        {
+            if (diagnostics.editorPhaseRemainders[index].count != 0)
+            {
+                editorLine += std::string("; ") + EditorPhaseTiming::Names[index] + " remainder (outside its children) {" +
+                    describe(diagnostics.editorPhaseRemainders[index]) + "}";
+            }
+        }
+
+        Log::Info(editorLine + "; Editor::Draw remainder (outside top-level phases) {" +
+            describe(diagnostics.editorRemainder) + "}.");
+    }
 
     std::array<size_t, 256> worst{};
 

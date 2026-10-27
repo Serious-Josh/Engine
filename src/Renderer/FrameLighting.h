@@ -28,10 +28,10 @@ struct FrameLighting
 
 // Selects the sun and fills the light table in one step, so a frame never mixes sources.
 // - No snapshot (demo scenes, historical callers): the scene's legacy DirectionalLight, no table.
-// - Snapshot without Directional Light components: the legacy sun plus Point/Spot Lights.
-// - Snapshot with Directional Light components: the legacy sun is replaced by the shadow owner
-//   (direction, color, intensity; angular radius stays the scene's legacy value), or by a dark sun
-//   (zero intensity) when no owner is enabled and resolved; the remaining Lights fill the table.
+// - Captured file-scene snapshot: its objects own directional illumination, and its scene settings own
+//   ambient strength. No owner means a dark sun; no legacy fallback survives deletion.
+//   The owner's angular radius feeds the existing shadow, path-trace and RTXDI sun paths.
+// Explicit procedural callers may opt into their compatibility source on a manual snapshot.
 // Fails, leaving `lighting` untouched, if the table would overflow or a value is not finite.
 bool BuildFrameLighting(const DirectionalLight& legacySun, const SceneLightingSnapshot* snapshot,
     FrameLighting& lighting, std::string* error = nullptr);

@@ -3,6 +3,7 @@
 #endif
 
 #include "Renderer/Passes/NrdDenoiser.h"
+#include "Debug/TransitionTiming.h"
 #include "Renderer/DescriptorHeap.h"
 #include "Math/Matrix4.h"
 #include "Core/Log.h"
@@ -148,7 +149,8 @@ bool NrdDenoiser::Resize(
 
 void NrdDenoiser::Shutdown()
 {
-    // Destroy waits for the GPU (autoWaitForIdle) before the outputs it may still be writing are released.
+    // Destroy waits for the GPU (autoWaitForIdle) before the outputs it may still be writing are released. An externally
+    // synchronized instance (ER.1 Phase 3.1) does not wait: its caller proved that no submitted work references it.
     m_integration.Destroy();
     ReleaseOutputs();
 
@@ -189,7 +191,8 @@ bool NrdDenoiser::Recreate(
         return false;
     }
 
-    // Destroy drains submitted work before its external outputs are released. Callers must also discard any
+    // Destroy drains submitted work before its external outputs are released (an externally synchronized instance's
+    // caller drained it instead: Renderer resizes only after WaitForGPU). Callers must also discard any
     // unsubmitted recording that referenced the old instance. The following SDK Recreate starts from empty state.
     m_integration.Destroy();
     ReleaseOutputs();
@@ -206,7 +209,7 @@ bool NrdDenoiser::Recreate(
     integrationDesc.queuedFrameNum = static_cast<uint8_t>(m_description.queuedFrameCount);
 
     integrationDesc.enableWholeLifetimeDescriptorCaching = false;
-    integrationDesc.autoWaitForIdle = true;
+    integrationDesc.autoWaitForIdle = !m_description.externallySynchronized;
     integrationDesc.demoteFloat32to16 = false;
     integrationDesc.promoteFloat16to32 = m_description.promoteFloat16to32;
 
@@ -234,6 +237,7 @@ bool NrdDenoiser::Recreate(
     deviceDesc.disableD3D12EnhancedBarriers = true;
     deviceDesc.disableNVAPIInitialization = true;
 
+    TransitionTiming::Scope er1Scope("NRD RecreateD3D12 " + m_description.name);
     const nrd::Result result = m_integration.RecreateD3D12(integrationDesc, instanceDesc, deviceDesc);
 
     if (result != nrd::Result::SUCCESS)
@@ -314,6 +318,8 @@ bool NrdDenoiser::SetCommonSettings(const FrameSettings& settings)
     commonSettings.frameIndex = settings.frameIndex;
     commonSettings.accumulationMode = settings.accumulationMode;
     commonSettings.enableValidation = settings.enableValidation;
+    commonSettings.isHistoryConfidenceAvailable = settings.historyConfidence;
+    m_historyConfidence = settings.historyConfidence;
 
     return m_integration.SetCommonSettings(commonSettings) == nrd::Result::SUCCESS;
 }
@@ -435,6 +441,27 @@ bool NrdDenoiser::Denoise(
 
         setResource(nrd::ResourceType::OUT_DIFF_RADIANCE_HITDIST, denoiser->diffuseOutput,
                     DXGI_FORMAT_R16G16B16A16_FLOAT, writeState);
+    }
+
+    // R.9A: the confidence-enabled frame binds both confidence inputs (RELAX samples IN_SPEC_CONFIDENCE too).
+    if (m_historyConfidence)
+    {
+        if (!inputs.diffuseConfidence || (specular && !inputs.specularConfidence))
+        {
+            return false;
+        }
+
+        nrd::Resource confidence{};
+        confidence.d3d12.format = static_cast<DXGIFormat>(DXGI_FORMAT_R16_FLOAT);
+        confidence.state = readState;
+        confidence.d3d12.resource = inputs.diffuseConfidence;
+        snapshot.SetResource(nrd::ResourceType::IN_DIFF_CONFIDENCE, confidence);
+
+        if (specular)
+        {
+            confidence.d3d12.resource = inputs.specularConfidence;
+            snapshot.SetResource(nrd::ResourceType::IN_SPEC_CONFIDENCE, confidence);
+        }
     }
 
     if (inputs.validation)

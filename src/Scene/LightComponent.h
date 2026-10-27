@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Math/Vector3.h"
+#include "Math/Math.h"
 
 #include <cmath>
 #include <cstdint>
@@ -38,7 +39,8 @@ inline const char* LightTypeName(LightType type)
 //
 // Units, in the renderer's existing linear radiometric scale (the scale of the legacy scene
 // Directional Light, whose DefaultProject intensity is about 3):
-// - color: linear RGB tint, each channel in [0, 1]; magnitude lives in intensity.
+// - color: linear RGB tint; Point/Spot channels are in [0, 1]. Directional preserves
+//   legacy finite signed RGB and nonnegative intensity without clamping or rescaling.
 // - intensity, Directional: irradiance on a surface facing the light (legacy sun convention).
 // - intensity, Point/Spot: intensity at 1 m; irradiance falls off as intensity / distance^2.
 // - range (m), Point/Spot: the direct-light influence radius; contribution is windowed to zero.
@@ -56,6 +58,7 @@ struct LightComponent
     LightType type = LightType::Point;
     Vector3 color{1.0f, 1.0f, 1.0f};
     float intensity = 10.0f;
+    float angularRadius = ToRadians(0.27f);
     float range = 10.0f;
     float innerConeAngle = 0.34906585040f; // 20 degrees.
     float outerConeAngle = 0.52359877560f; // 30 degrees.
@@ -64,7 +67,7 @@ struct LightComponent
     {
         return enabled == other.enabled && type == other.type && color.x == other.color.x &&
             color.y == other.color.y && color.z == other.color.z && intensity == other.intensity &&
-            range == other.range && innerConeAngle == other.innerConeAngle &&
+            angularRadius == other.angularRadius && range == other.range && innerConeAngle == other.innerConeAngle &&
             outerConeAngle == other.outerConeAngle;
     }
 
@@ -74,8 +77,8 @@ struct LightComponent
     }
 };
 
-// Scene-wide bound on Light components, enabled or not. It equals the renderer's per-frame
-// light capacity, so a valid scene can never exceed the GPU light table.
+// GPU table capacity. A scene may also use the existing dedicated sun slot: at most
+// 65 components with a Directional, otherwise at most 64 (enabled or disabled).
 inline constexpr std::uint32_t MaximumSceneLights = 64;
 
 // Defaults used by Hierarchy creation for each type. Add Component uses LightComponent{} (Point).
@@ -103,7 +106,7 @@ inline bool ValidateLightComponent(const LightComponent& light, std::string* err
 
     const bool finite = std::isfinite(light.color.x) && std::isfinite(light.color.y) &&
         std::isfinite(light.color.z) && std::isfinite(light.intensity) && std::isfinite(light.range) &&
-        std::isfinite(light.innerConeAngle) && std::isfinite(light.outerConeAngle);
+        std::isfinite(light.innerConeAngle) && std::isfinite(light.outerConeAngle) && std::isfinite(light.angularRadius);
     const char* reason = nullptr;
 
     if(!LightTypeName(light.type))
@@ -112,17 +115,22 @@ inline bool ValidateLightComponent(const LightComponent& light, std::string* err
     }
     else if(!finite)
     {
-        reason = "Light color, intensity, range and cone angles must be finite.";
+        reason = "Light color, intensity, range and angles must be finite.";
     }
-    else if(light.color.x < 0.0f || light.color.y < 0.0f || light.color.z < 0.0f ||
+    else if(light.type != LightType::Directional && (light.color.x < 0.0f || light.color.y < 0.0f || light.color.z < 0.0f ||
         light.color.x > LightComponent::MaximumColorChannel || light.color.y > LightComponent::MaximumColorChannel ||
-        light.color.z > LightComponent::MaximumColorChannel)
+        light.color.z > LightComponent::MaximumColorChannel))
     {
         reason = "Light color channels must be between 0 and 1 (use intensity for brightness).";
     }
-    else if(light.intensity < 0.0f || light.intensity > LightComponent::MaximumIntensity)
+    else if(light.intensity < 0.0f || (light.type != LightType::Directional && light.intensity > LightComponent::MaximumIntensity))
     {
-        reason = "Light intensity must be between 0 and 1000000.";
+        reason = light.type == LightType::Directional ? "Directional intensity must be nonnegative." :
+            "Light intensity must be between 0 and 1000000.";
+    }
+    else if(light.angularRadius < 0.0f)
+    {
+        reason = "Angular radius must be nonnegative.";
     }
     else if(light.range < LightComponent::MinimumRange || light.range > LightComponent::MaximumRange)
     {

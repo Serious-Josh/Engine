@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cstring>
 #include <string>
+#include <utility>
 
 namespace
 {
@@ -136,4 +137,12 @@ unsigned int ShaderTable::GetRecordSize() const
 unsigned int ShaderTable::GetSizeInBytes() const
 {
     return m_sizeInBytes;
+}
+
+void ShaderTable::Swap(ShaderTable& other) noexcept
+{
+    std::swap(m_resource, other.m_resource);
+    std::swap(m_recordSize, other.m_recordSize);
+    std::swap(m_sizeInBytes, other.m_sizeInBytes);
+    std::swap(m_recordCount, other.m_recordCount);
 }

@@ -69,6 +69,21 @@ struct NrdPathTracePrepareConstants
 
 static_assert(sizeof(NrdPathTracePrepareConstants) == 2 * 64 + 8 * 16);
 
+// NRD RELAX R.4 diagnostics: CSResolveRelaxSignalView's b1. Must match NrdPathTracePrepare.hlsl.
+struct NrdRelaxSignalViewConstants
+{
+    // 1 RTXDI direct diffuse (A), 2 RELAX's diffuse input (B), 3 RELAX's denoised diffuse (C); R.9B: 4 the raw probe
+    // visibility change, 5 the probe confidence (NrdHistoryConfidencePass, previous-frame space).
+    std::uint32_t mode = 0;
+    // PathTraceReferencePass::GetSplitDirectDiffuseUAVIndex; read only by mode 1.
+    std::uint32_t splitDirectDiffuseIndex = 0;
+    std::uint32_t samplesPerFrame = 0;
+    // Modes 4, 5 and 6: NrdHistoryConfidencePass::GetSignal, GetConfidence or GetState SRV.
+    std::uint32_t probeTextureIndex = 0;
+};
+
+static_assert(sizeof(NrdRelaxSignalViewConstants) == 16);
+
 // NRD.3 path-traced NRD signal preparation and bypass reconstruction (diagnostics only; no NRD denoiser runs;
 // NrdPathTracePrepare.hlsl has the contracts). Prepare packs this frame's raw extraction outputs and the G-buffer into
 // REBLUR's normal/roughness, view Z and demodulated diffuse and specular inputs. Resolve unpacks those inputs as if NRD
@@ -156,6 +171,25 @@ class NrdPathTracePreparePass
         unsigned int width,
         unsigned int height);
 
+    // NRD RELAX R.4 (diagnostics only): the CSResolveRelaxSignalView pipeline of a RELAX or hybrid encoding, created on
+    // first request; a failure is sticky until Shutdown.
+    bool EnsureRelaxSignalView(GraphicsDevice& graphicsDevice, ShaderLibrary& shaderLibrary);
+
+    // Writes one diffuse signal (signalView.mode) into presentation's surface pixels in place of ExecuteDenoisedResolve,
+    // with the constants of this frame's ExecutePrepare. B is this instance's packed diffuse input, C denoisedDiffuse
+    // (the caller's RELAX diffuse output, so any RELAX instance's can be shown). A's buffer must have been written this
+    // frame on the same command list. Afterwards denoisedDiffuse is shader-readable and presentation is in
+    // unordered-access state.
+    void ExecuteRelaxSignalView(
+        ID3D12GraphicsCommandList* commandList,
+        UploadBuffer& uploadBuffer,
+        NrdPathTracePrepareConstants constants,
+        const NrdRelaxSignalViewConstants& signalView,
+        Texture& denoisedDiffuse,
+        Texture& presentation,
+        unsigned int width,
+        unsigned int height);
+
     bool HasTextures() const
     {
         return m_normalRoughness.GetResource() != nullptr;
@@ -222,6 +256,9 @@ class NrdPathTracePreparePass
     ComputePipeline m_preparePipeline;
     ComputePipeline m_resolvePipeline;
     ComputePipeline m_denoisedResolvePipeline;
+    ComputePipeline m_signalViewPipeline;
+    bool m_signalViewReady = false;
+    bool m_signalViewFailed = false;
     bool m_initialized = false;
     bool m_initializationFailed = false;
     Encoding m_encoding = Encoding::Reblur;

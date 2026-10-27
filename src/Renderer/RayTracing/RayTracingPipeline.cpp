@@ -1,9 +1,11 @@
 #include "RayTracingPipeline.h"
+#include "Debug/TransitionTiming.h"
 
 #include "Renderer/Shader/ShaderLibrary.h"
 #include "Core/Log.h"
 
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace
@@ -359,6 +361,7 @@ bool RayTracingPipeline::Initialize(
     stateObjectDescription.NumSubobjects = static_cast<UINT>(subobjects.size());
     stateObjectDescription.pSubobjects = subobjects.data();
 
+    TransitionTiming::Scope er1Scope("CreateStateObject");
     result = device->CreateStateObject(&stateObjectDescription, IID_PPV_ARGS(&m_stateObject));
 
     if (FAILED(result))
@@ -449,6 +452,7 @@ bool RayTracingPipeline::Initialize(
 
 void RayTracingPipeline::Shutdown()
 {
+    m_identity.clear();
     m_hitGroupShaderTable.Shutdown();
     m_missShaderTable.Shutdown();
     m_rayGenerationShaderTable.Shutdown();
@@ -528,4 +532,14 @@ void RayTracingPipeline::Dispatch(
     description.Depth = depth;
 
     commandList->DispatchRays(&description);
+}
+
+void RayTracingPipeline::Swap(RayTracingPipeline& other) noexcept
+{
+    std::swap(m_stateObject, other.m_stateObject);
+    std::swap(m_globalRootSignature, other.m_globalRootSignature);
+    m_rayGenerationShaderTable.Swap(other.m_rayGenerationShaderTable);
+    m_missShaderTable.Swap(other.m_missShaderTable);
+    m_hitGroupShaderTable.Swap(other.m_hitGroupShaderTable);
+    std::swap(m_identity, other.m_identity);
 }

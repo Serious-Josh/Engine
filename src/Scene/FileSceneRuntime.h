@@ -177,6 +177,13 @@ public:
         std::string& error) const;
     bool CaptureObjectDeletionSnapshot(std::string_view objectID, SceneObjectDocument& object,
         size_t& documentIndex, std::string* errorMessage = nullptr) const;
+    // Inspector reads: the object CaptureObjectDeletionSnapshot would return, with the same success or failure,
+    // without copying the scene document. Hierarchy documents use the full capture.
+    bool CaptureObjectInspection(std::string_view objectID, SceneObjectDocument& object) const;
+    // One component section's read: succeeds exactly when GetObjectMetadata(runtimeIndex) and then
+    // CaptureObjectInspection for its object both would, returning both results. Flat scenes validate once.
+    bool InspectSelectedObject(RenderObjectID runtimeIndex, SceneObjectMetadata& metadata,
+        SceneObjectDocument& object) const;
     std::unique_ptr<FileSceneRuntime> PrepareObjectDeletion(std::string_view objectID,
         std::string* errorMessage = nullptr, FileSceneAssetCatalog* catalog = nullptr) const;
 

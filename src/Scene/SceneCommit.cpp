@@ -43,7 +43,7 @@ namespace
 
         camera.SetNearPlane(prepared.camera.nearPlane);
         camera.SetFarPlane(prepared.camera.farPlane);
-        scene.GetDirectionalLight() = prepared.directionalLight;
+        scene.SetLightingSettings(prepared.lightingSettings);
         scene.SetEnvironmentReference(std::move(environment));
 
         newMapping.structureRevision = scene.GetStructureRevision();
@@ -77,7 +77,7 @@ bool CommitPreparedScene(
     validation.id = "prepared-scene-validation";
     validation.environmentReference=prepared.environmentReference;
     validation.camera = prepared.camera;
-    validation.directionalLight = prepared.directionalLight;
+    validation.lightingSettings = prepared.lightingSettings;
 
     for (const ResolvedSceneObject& object : prepared.objects)
     {
@@ -138,7 +138,7 @@ bool CommitPreparedEditorScene(const PreparedScene& prepared, const SceneDocumen
     SceneDocument validation = document;
     validation.environmentReference=prepared.environmentReference;
     validation.camera = prepared.camera;
-    validation.directionalLight = prepared.directionalLight;
+    validation.lightingSettings = prepared.lightingSettings;
 
     for (size_t index = 0; index < prepared.objects.size(); ++index)
     {

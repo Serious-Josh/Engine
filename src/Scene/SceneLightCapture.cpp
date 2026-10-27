@@ -40,6 +40,7 @@ bool FileSceneRuntime::CaptureSceneLighting(SceneLightingSnapshot& snapshot, std
         return false;
     }
 
+    snapshot.lightingSettings = m_scene.GetLightingSettings();
     return true;
 }
 

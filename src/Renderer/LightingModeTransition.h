@@ -16,7 +16,9 @@ enum class LightingModeTransitionStage
     Idle,
     Queued,
     Compiling,
-    // Render thread, within one recording: state objects, root signatures and shader tables.
+    // ER.1 Phase 4: the libraries are ready; the worker creates the DXR pipelines (state objects and shader tables).
+    PreparingPipelines,
+    // Render thread, within one recording: adopting the prepared pipelines, or creating any not prepared.
     CreatingPipeline,
     // Render thread, within one recording: accumulation, RTXDI and descriptor allocation.
     InitializingResources,

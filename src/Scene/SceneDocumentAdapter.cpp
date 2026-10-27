@@ -25,7 +25,7 @@ bool ApplySceneDocumentSettings(
     camera.SetNearPlane(document.camera.nearPlane);
     camera.SetFarPlane(document.camera.farPlane);
 
-    scene.GetDirectionalLight() = document.directionalLight;
+    scene.SetLightingSettings(document.lightingSettings);
     scene.SetEnvironmentReference(document.environmentReference);
 
     return true;
@@ -108,7 +108,7 @@ bool CaptureSceneDocument(
     candidate.camera.verticalFov = camera.GetVerticalFov();
     candidate.camera.nearPlane = camera.GetNearPlane();
     candidate.camera.farPlane = camera.GetFarPlane();
-    candidate.directionalLight = scene.GetDirectionalLight();
+    candidate.lightingSettings = scene.GetLightingSettings();
 
     if (!ValidateSceneDocument(candidate, errorMessage))
     {
@@ -139,11 +139,6 @@ bool SceneDocumentsEqual(
         return false;
     }
 
-    if (!sameVector(left.directionalLight.direction, right.directionalLight.direction) || !sameVector(left.directionalLight.color, right.directionalLight.color))
-    {
-        return false;
-    }
-
     if (left.camera.verticalFov != right.camera.verticalFov ||
         left.camera.aspectRatio != right.camera.aspectRatio ||
         left.camera.nearPlane != right.camera.nearPlane ||
@@ -152,12 +147,7 @@ bool SceneDocumentsEqual(
         return false;
     }
 
-    if (left.directionalLight.intensity != right.directionalLight.intensity ||
-        left.directionalLight.ambientStrength != right.directionalLight.ambientStrength ||
-        left.directionalLight.angularRadius != right.directionalLight.angularRadius)
-    {
-        return false;
-    }
+    if(left.lightingSettings != right.lightingSettings) return false;
 
     for (std::size_t index = 0; index < left.objects.size(); ++index)
     {

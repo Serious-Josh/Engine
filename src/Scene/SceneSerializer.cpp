@@ -1,4 +1,5 @@
 #include "Scene/SceneSerializer.h"
+#include "Scene/LegacyLightingMigration.h"
 
 #include <nlohmann/json.hpp>
 
@@ -386,7 +387,8 @@ namespace
         return component;
     }
 
-    // Schema 11 Light: exactly these fields, every field for every type. Type is a name so the
+    // Schema 13 adds angular radius; earlier components inherit the historical sun radius.
+    // Every field is retained for every type. Type is a name so the
     // file stays readable; angles are radians like the Camera FOV.
     Json ToJson(const LightComponent& light)
     {
@@ -397,13 +399,14 @@ namespace
             {"intensity", light.intensity},
             {"range", light.range},
             {"innerConeAngle", light.innerConeAngle},
-            {"outerConeAngle", light.outerConeAngle}
+            {"outerConeAngle", light.outerConeAngle},
+            {"angularRadius", light.angularRadius}
         };
     }
 
     LightComponent ReadLightComponent(const Json& value)
     {
-        ValidateFields(value, {"enabled", "type", "color", "intensity", "range", "innerConeAngle", "outerConeAngle"});
+        ValidateFields(value, {"enabled", "type", "color", "intensity", "range", "innerConeAngle", "outerConeAngle", "angularRadius"});
 
         if(!value.at("enabled").is_boolean())
         {
@@ -441,6 +444,7 @@ namespace
         light.range = ReadNumber(value.at("range"), "Light range");
         light.innerConeAngle = ReadNumber(value.at("innerConeAngle"), "Light inner cone angle");
         light.outerConeAngle = ReadNumber(value.at("outerConeAngle"), "Light outer cone angle");
+        if(value.contains("angularRadius")) light.angularRadius = ReadNumber(value.at("angularRadius"), "Angular radius");
         std::string error;
 
         if(!ValidateLightComponent(light, &error))
@@ -549,7 +553,7 @@ namespace
         }
 
         const auto& camera = document.camera;
-        const auto& light = document.directionalLight;
+
 
         return {
             {"schemaVersion", SceneDocument::kSchemaVersion},
@@ -565,19 +569,13 @@ namespace
                 {"nearPlane", camera.nearPlane},
                 {"farPlane", camera.farPlane}
             }},
-            {"directionalLight", {
-                {"direction", ToJson(light.direction)},
-                {"color", ToJson(light.color)},
-                {"intensity", light.intensity},
-                {"ambientStrength", light.ambientStrength},
-                {"angularRadius", light.angularRadius}
-            }}
+            {"lightingSettings", {{"ambientStrength", document.lightingSettings.ambientStrength}}}
         };
     }
 
     SceneDocument FromJson(const Json& value)
     {
-        ValidateFields(value, {"schemaVersion", "id", "name", "camera", "directionalLight", "objects", "environmentReference"});
+        ValidateFields(value, {"schemaVersion", "id", "name", "camera", "directionalLight", "objects", "environmentReference", "lightingSettings"});
         const auto& schemaVersion = value.at("schemaVersion");
         if (!schemaVersion.is_number_integer() ||
             (schemaVersion != SceneDocument::kLegacySchemaVersion &&
@@ -590,7 +588,9 @@ namespace
              schemaVersion != SceneDocument::kCharacterControllerSchemaVersion &&
              schemaVersion != SceneDocument::kHierarchySchemaVersion &&
              schemaVersion != SceneDocument::kCameraSchemaVersion &&
-             schemaVersion != SceneDocument::kLightSchemaVersion))
+             schemaVersion != SceneDocument::kLightSchemaVersion &&
+             schemaVersion != SceneDocument::kEnvironmentNoneSchemaVersion &&
+             schemaVersion != SceneDocument::kObjectLightingSchemaVersion))
         {
             throw std::runtime_error("Unsupported scene schema version.");
         }
@@ -598,7 +598,7 @@ namespace
         const bool hierarchySchema = schemaVersion.get<std::uint32_t>() >= SceneDocument::kHierarchySchemaVersion;
         SceneDocument result;
 
-        // Transitional readers preserve protected project content. New saves write v11;
+        // Transitional readers preserve protected project content. New saves write v13;
         // no migration is written to disk merely by loading a historical document.
         result.id = value.at("id").get<std::string>();
         result.name = value.at("name").get<std::string>();
@@ -613,15 +613,27 @@ namespace
         result.camera.nearPlane = ReadNumber(camera.at("nearPlane"), "Camera near plane");
         result.camera.farPlane = ReadNumber(camera.at("farPlane"), "Camera far plane");
 
-        const Json& light = value.at("directionalLight");
-        ValidateFields(light, {"direction", "color", "intensity", "ambientStrength", "angularRadius"});
-        result.directionalLight.direction = ReadVector3(light.at("direction"));
-        result.directionalLight.color = ReadVector3(light.at("color"));
-        result.directionalLight.intensity = ReadNumber(light.at("intensity"), "Light intensity");
-        result.directionalLight.ambientStrength =
-            ReadNumber(light.at("ambientStrength"), "Light ambient strength");
-        result.directionalLight.angularRadius =
-            ReadNumber(light.at("angularRadius"), "Light angular radius");
+        std::optional<DirectionalLight> legacySun;
+        // Current settings/objects take precedence if both representations are present.
+        const bool objectLighting = value.contains("lightingSettings") ||
+            schemaVersion.get<std::uint32_t>() >= SceneDocument::kObjectLightingSchemaVersion;
+        if(objectLighting)
+        {
+            const auto& settings = value.at("lightingSettings");
+            ValidateFields(settings, {"ambientStrength"});
+            result.lightingSettings.ambientStrength = ReadNumber(settings.at("ambientStrength"), "Ambient strength");
+        }
+        else if(value.contains("directionalLight"))
+        {
+            const Json& light = value.at("directionalLight");
+            ValidateFields(light, {"direction", "color", "intensity", "ambientStrength", "angularRadius"});
+            legacySun.emplace();
+            legacySun->direction = ReadVector3(light.at("direction"));
+            legacySun->color = ReadVector3(light.at("color"));
+            legacySun->intensity = ReadNumber(light.at("intensity"), "Light intensity");
+            legacySun->ambientStrength = ReadNumber(light.at("ambientStrength"), "Ambient strength");
+            legacySun->angularRadius = ReadNumber(light.at("angularRadius"), "Angular radius");
+        }
 
         const Json& objects = value.at("objects");
 
@@ -773,6 +785,7 @@ namespace
             result.objects.push_back(std::move(object));
         }
 
+        if(!objectLighting) MigrateLegacyLighting(result, legacySun);
         return result;
     }
 

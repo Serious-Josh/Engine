@@ -1,3 +1,4 @@
+#include "Renderer/BuiltinEnvironment.h"
 #include "assets/CookedEnvironment.h"
 #include "assets/CookedScene.h"
 #include "assets/CookedSurface.h"
@@ -60,6 +61,8 @@ HDRImageData Decode(std::span<const std::byte> bytes,const AssetID& id,std::uint
 std::optional<HDRImageData> ReadArchive(const CookedScene::ArchiveScene& scene)
 {
     if(scene.metadata.document.environmentReference.empty()) return {};
+    if(scene.metadata.document.environmentReference == SceneDocument::NoneEnvironmentReference)
+        return MakeBlackEnvironmentImage();
     const auto id=AssetID::ParseReference(scene.metadata.document.environmentReference);
     Check(bool(id) && scene.metadata.environment.has_value(),"Missing authored environment binding.");
     auto bytes=scene.provider->ReadEntry(*id,EngineAssetPak::Type::Resource,Version,MaxBytes);
@@ -68,6 +71,7 @@ std::optional<HDRImageData> ReadArchive(const CookedScene::ArchiveScene& scene)
 std::string ArchiveIdentity(const CookedScene::ArchiveScene& scene)
 {
     if(scene.metadata.document.environmentReference.empty()) return "neutral";
+    if(scene.metadata.document.environmentReference == SceneDocument::NoneEnvironmentReference) return SceneDocument::NoneEnvironmentReference;
     return CookedSurface::Identity(*scene.provider,*AssetID::ParseReference(scene.metadata.document.environmentReference));
 }
 }

@@ -278,7 +278,7 @@ void CookSceneAssets(const Request& request, const AssetID& sceneAssetID,
         meshInputs.push_back({asset.id, asset.generation, asset.bytes});
     }
     std::optional<CookedScene::EnvironmentInput> environmentInput;
-    if (!request.document.environmentReference.empty())
+    if (!request.document.environmentReference.empty() && request.document.environmentReference != SceneDocument::NoneEnvironmentReference)
     {
         progress.Report(.3f, "Cooking assigned HDR environment...");
         const auto assetID = *AssetID::ParseReference(request.document.environmentReference);

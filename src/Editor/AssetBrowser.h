@@ -4,6 +4,7 @@
 #include "Editor/MeshDragPayload.h"
 #include "Editor/MaterialDragPayload.h"
 #include "Editor/ThumbnailAdmission.h"
+#include "Debug/EditorPhaseTiming.h"
 #include <filesystem>
 #include <map>
 #include <optional>
@@ -28,6 +29,11 @@ public:
     void SetIcons(const EditorIcons& icons)
     {
         m_icons = &icons;
+    }
+    // Diagnostics only: the Editor's phase-timing frame, or null when timing is disabled.
+    void SetPhaseTiming(EditorPhaseTiming::Frame* frame) noexcept
+    {
+        m_phaseTiming = frame;
     }
     bool TakeScriptRefreshRequest()
     {
@@ -138,6 +144,7 @@ public:
 
 private:
     const EditorIcons* m_icons = nullptr;
+    EditorPhaseTiming::Frame* m_phaseTiming = nullptr;
 #if defined(ENGINE_HAS_VERIFICATION)
     friend class MaterialLocateVerification;
     friend class ThumbnailSchedulingVerification;

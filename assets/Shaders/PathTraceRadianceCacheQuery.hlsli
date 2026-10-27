@@ -12,14 +12,84 @@ cbuffer RadianceCacheD6QueryConstants : register(b3)
     RadianceCacheD6Binding radianceCache;
 };
 
+// Temporary spatial/coverage investigation. Rebuild/redeploy C++ and shaders together after changing the selector.
+// 0: production; 1: green = successful substitution, red = x1 reached but continued, blue = no x1 surface;
+// 2: successful substitution's full binding-key identity; 3: its cached hit-only radiance (after the existing clamp,
+// before throughput or distant-miss addition); 4: spatial-cell identity only (ignores normal bin and quarter slice).
+// Renderer preserves this frame's display output before denoiser resolves and bypasses DLSS/filtering/AgX.
+// Colors average over this frame's samples only; accumulation,
+// extraction, history-prior output and the actual path estimator remain untouched. Black in 2-4 = no substitution.
+#include "PathTraceSharcDiagnosticConfig.hlsli"
+
+#if defined(PATH_TRACE_RADIANCE_CACHE_RENDER) && PATH_TRACE_SHARC_SPATIAL_DIAGNOSTIC != 0
+static float3 g_pathTraceSharcDiagnosticSample = float3(0.0f, 0.0f, 0.0f);
+static float3 g_pathTraceSharcDiagnosticSum = float3(0.0f, 0.0f, 0.0f);
+
+void PathTraceSharcDiagnosticBeginSample()
+{
+    g_pathTraceSharcDiagnosticSample = PATH_TRACE_SHARC_SPATIAL_DIAGNOSTIC == 1 ?
+        float3(0.0f, 0.0f, 1.0f) : float3(0.0f, 0.0f, 0.0f);
+}
+
+float3 PathTraceSharcDiagnosticKeyColor(uint2 key)
+{
+    // Mix a copy of the exact lookup key; never change the key or use the hash-table slot as spatial identity.
+    uint hash = RadianceCacheD6Mix(key.x ^ RadianceCacheD6Mix(key.y));
+    return 0.15f + 0.85f * float3(hash & 255u, (hash >> 8u) & 255u, (hash >> 16u) & 255u) / 255.0f;
+}
+#endif
+
 // SHARC.4D-S termination probe (PATH_TRACE_RADIANCE_CACHE_TERMINATION, the QueryTermination libraries): queryMode 4
 // or 5 decides at vertex 1 whether the path ends after x1's BSDF sample. The path's radiance then
 // lacks everything after x1's next-event estimation; no cached value replaces it. A timing probe only: its image is
 // wrong by construction and is never presented.
+// SHARC Experiments B and C (render library only; 0 disables and compiles out all of their code). B: x1 substitutes only
+// when the x0-to-x1 segment is at least the lookup cell's edge. C: after x0's specular strategy, x1 substitutes only
+// when x0's GGX cone spread over that segment reaches the cell's edge. Defined before the harvest, which carries C's
+// x0 state.
+#ifndef PATH_TRACE_SHARC_EXPERIMENT_B_SEGMENT_LENGTH
+#define PATH_TRACE_SHARC_EXPERIMENT_B_SEGMENT_LENGTH 0
+#endif
+
+#ifndef PATH_TRACE_SHARC_EXPERIMENT_C_CONE_SPREAD
+#define PATH_TRACE_SHARC_EXPERIMENT_C_CONE_SPREAD 0
+#endif
+
+// SHARC Experiment D (render library only; 0 compiles it out): a path's x1 lookup runs only when x0's finalized
+// perceptual roughness (PathTraceFinalizeSurface) is at least the threshold, the same decision for every sample of the
+// pixel. Independent of x0's sampled strategy. A NaN roughness fails the comparison.
+#ifndef PATH_TRACE_SHARC_EXPERIMENT_D_X0_ROUGHNESS
+#define PATH_TRACE_SHARC_EXPERIMENT_D_X0_ROUGHNESS 1
+#endif
+
+#ifndef PATH_TRACE_SHARC_EXPERIMENT_D_ROUGHNESS_THRESHOLD
+#define PATH_TRACE_SHARC_EXPERIMENT_D_ROUGHNESS_THRESHOLD 0.30f
+#endif
+
+#if defined(PATH_TRACE_RADIANCE_CACHE_RENDER) && \
+    (PATH_TRACE_SHARC_EXPERIMENT_B_SEGMENT_LENGTH != 0 || PATH_TRACE_SHARC_EXPERIMENT_C_CONE_SPREAD != 0)
+#define PATH_TRACE_SHARC_EXPERIMENT_BC 1
+#else
+#define PATH_TRACE_SHARC_EXPERIMENT_BC 0
+#endif
+
+#if defined(PATH_TRACE_RADIANCE_CACHE_RENDER) && PATH_TRACE_SHARC_EXPERIMENT_D_X0_ROUGHNESS != 0
+#define PATH_TRACE_SHARC_EXPERIMENT_D 1
+#else
+#define PATH_TRACE_SHARC_EXPERIMENT_D 0
+#endif
+
+// Any experiment gate: B, C and D are independent conditions, all of which must admit the lookup.
+#define PATH_TRACE_SHARC_EXPERIMENT_GATE (PATH_TRACE_SHARC_EXPERIMENT_BC || PATH_TRACE_SHARC_EXPERIMENT_D)
+
 struct PathTraceRadianceCacheHarvest
 {
 #ifdef PATH_TRACE_RADIANCE_CACHE_TERMINATION
     bool terminate;
+#elif defined(PATH_TRACE_RADIANCE_CACHE_RENDER) && PATH_TRACE_SHARC_EXPERIMENT_C_CONE_SPREAD != 0
+    // Experiment C: the GGX alpha of x0's specular strategy (0 for its delta mirror), or negative after its diffuse
+    // strategy (no cone restriction). Recorded by the Continue hook at vertex 0 from the sample already drawn.
+    float x0ConeAlpha;
 #else
     uint unused;
 #endif
@@ -47,6 +117,12 @@ void PathTraceRadianceCacheHarvestVertex(inout PathTraceRadianceCacheHarvest har
 {
 #ifdef PATH_TRACE_RADIANCE_CACHE_RENDER
     // The render library looks up and substitutes at x1's Continue hook instead (PathTraceRadianceCacheSubstitute).
+#if PATH_TRACE_SHARC_SPATIAL_DIAGNOSTIC == 1
+    if(vertex == 1u && (primary == PATH_TRACE_PRIMARY_RASTER || primary == PATH_TRACE_PRIMARY_RASTER_SPLIT_INDIRECT))
+    {
+        g_pathTraceSharcDiagnosticSample = float3(1.0f, 0.0f, 0.0f);
+    }
+#endif
     return;
 #endif
 
@@ -279,9 +355,48 @@ bool PathTraceRadianceCacheQueryTerminates(PathTraceRadianceCacheHarvest harvest
 // SHARC.4E.1: with signal extraction (the denoiser's input), the completed path's radiance after x1 also joins the
 // diffuse signal through the vertex-0 diffuse throughput, exactly as the loop adds x1's later light; the specular
 // signal is the remainder the ray generation derives.
+// Experiment A: minimum perceptual roughness for production x1 substitution only (not GGX alpha).
+// Test values: 0.0, 0.1, 0.2, 0.25, 0.4. Zero disables the gate and preserves baseline eligibility.
+static const float PATH_TRACE_SHARC_EXPERIMENT_A_MIN_PERCEPTUAL_ROUGHNESS = 0.0f;
+
+#if PATH_TRACE_SHARC_EXPERIMENT_BC
+// Experiments B and C: whether the x0-to-x1 segment admits the x1 lookup on the cell of level (the lookup key's own
+// adaptive level; 0 on the uniform grid). A NaN input, a degenerate cell or a zero-length segment rejects, so the path
+// continues as after any failed lookup.
+bool PathTraceSharcExperimentAdmits(float segmentLength, float x0ConeAlpha, uint level)
+{
+    float cellEdge = exp2(float(level)) / radianceCache.inverseCellSize;
+    bool admitted = true;
+
+#if PATH_TRACE_SHARC_EXPERIMENT_B_SEGMENT_LENGTH != 0
+    admitted = admitted && segmentLength >= cellEdge;
+#endif
+
+#if PATH_TRACE_SHARC_EXPERIMENT_C_CONE_SPREAD != 0
+    // S = 2 L sqrt(0.5 a^2 / (1 - a^2)) >= edge, squared without a square root or division:
+    // 2 L^2 a^2 >= edge^2 (1 - a^2). a = 0 (delta) always rejects; a = 1 always admits.
+    if(!(x0ConeAlpha < 0.0f))
+    {
+        float alphaSquared = x0ConeAlpha * x0ConeAlpha;
+        admitted = admitted &&
+            2.0f * segmentLength * segmentLength * alphaSquared >= cellEdge * cellEdge * (1.0f - alphaSquared);
+    }
+#endif
+
+    return admitted;
+}
+#endif
+
 bool PathTraceRadianceCacheSubstitute(uint primary, float3 position, PathTraceSurface surface,
     PathTraceBSDFSample bsdfSample, float3 throughput, inout float3 radiance, inout uint rayCount, bool extract,
-    inout PathTraceExtraction extraction)
+    inout PathTraceExtraction extraction
+#if PATH_TRACE_SHARC_EXPERIMENT_BC
+    , float segmentLength, float x0ConeAlpha
+#endif
+#if PATH_TRACE_SHARC_EXPERIMENT_D
+    , float x0Roughness
+#endif
+    )
 {
     // SHARC.5B: the ReSTIR DI indirect pass (RASTER_SPLIT_INDIRECT) differs from Raster Primary only at x0 (RTXDI's
     // direct light, and no non-delta miss of x0's continuation); from x1 on it is the same estimator, so the same
@@ -294,9 +409,34 @@ bool PathTraceRadianceCacheSubstitute(uint primary, float3 position, PathTraceSu
     }
 
     uint2 key;
+#if PATH_TRACE_SHARC_EXPERIMENT_BC
+    // The binding key's own construction, which also names its level.
+    uint level = 0u;
+    bool eligible = !surface.deltaSpecular && surface.material.model <= 1u && surface.material.metallic <= 0.1f &&
+        RadianceCacheD6MakeClassKey(radianceCache, position, surface.geometricNormal, false, key, level);
+#else
     bool eligible = !surface.deltaSpecular && surface.material.model <= 1u && surface.material.metallic <= 0.1f &&
         RadianceCacheD6MakeBindingKey(radianceCache, position, surface.geometricNormal, key);
+#endif
+    if(PATH_TRACE_SHARC_EXPERIMENT_A_MIN_PERCEPTUAL_ROUGHNESS > 0.0f)
+    {
+        eligible = eligible && surface.material.roughness >= PATH_TRACE_SHARC_EXPERIMENT_A_MIN_PERCEPTUAL_ROUGHNESS;
+    }
+#if PATH_TRACE_SHARC_EXPERIMENT_GATE
+    // A rejection leaves ELIGIBLE and HEADER_REJECTED as they were; it is ELIGIBLE minus HEADER_REJECTED, ABSENT_* and
+    // FOUND. It skips the header check, lookup and visibility ray; the path continues as after any failed lookup.
+#if PATH_TRACE_SHARC_EXPERIMENT_BC && PATH_TRACE_SHARC_EXPERIMENT_D
+    bool admitted = eligible && x0Roughness >= PATH_TRACE_SHARC_EXPERIMENT_D_ROUGHNESS_THRESHOLD &&
+        PathTraceSharcExperimentAdmits(segmentLength, x0ConeAlpha, level);
+#elif PATH_TRACE_SHARC_EXPERIMENT_BC
+    bool admitted = eligible && PathTraceSharcExperimentAdmits(segmentLength, x0ConeAlpha, level);
+#else
+    bool admitted = eligible && x0Roughness >= PATH_TRACE_SHARC_EXPERIMENT_D_ROUGHNESS_THRESHOLD;
+#endif
+    bool trusted = admitted && RadianceCacheD6BindingAccepted(radianceCache);
+#else
     bool trusted = eligible && RadianceCacheD6BindingAccepted(radianceCache);
+#endif
     uint slot = trusted ? RadianceCacheD6FindSlot(radianceCache, key) : RADIANCE_CACHE_D6_NO_SLOT;
     bool substitute = false;
     bool clamped = false;
@@ -338,6 +478,16 @@ bool PathTraceRadianceCacheSubstitute(uint primary, float3 position, PathTraceSu
 
             if(substitute)
             {
+#if PATH_TRACE_SHARC_SPATIAL_DIAGNOSTIC == 1
+                g_pathTraceSharcDiagnosticSample = float3(0.0f, 1.0f, 0.0f);
+#elif PATH_TRACE_SHARC_SPATIAL_DIAGNOSTIC == 2
+                g_pathTraceSharcDiagnosticSample = PathTraceSharcDiagnosticKeyColor(key);
+#elif PATH_TRACE_SHARC_SPATIAL_DIAGNOSTIC == 3
+                g_pathTraceSharcDiagnosticSample = max(cached, 0.0f);
+#elif PATH_TRACE_SHARC_SPATIAL_DIAGNOSTIC == 4
+                // Keep packed XYZ and the version/level nibble, but discard normal-bin and quarter-slice bits.
+                g_pathTraceSharcDiagnosticSample = PathTraceSharcDiagnosticKeyColor(uint2(key.x, key.y & 0xF03FFFFFu));
+#endif
                 missed = PathTraceVisible(position, surface.geometricNormal, bsdfSample.direction,
                     PATH_TRACE_DISTANT_LIGHT_DISTANCE, rayCount);
                 // SHARC.5B diagnostics (queryMode 2, 3): the cached part zeroed, and (3) the miss term too, so a
@@ -351,6 +501,7 @@ bool PathTraceRadianceCacheSubstitute(uint primary, float3 position, PathTraceSu
                 }
 
                 radiance += throughput * incident;
+                if(g_sampleDiagnostic) PathTraceDiagnosticCache(throughput * incident);
 
                 if(extract)
                 {
@@ -379,7 +530,11 @@ bool PathTraceRadianceCacheSubstitute(uint primary, float3 position, PathTraceSu
         }
 
         PathTraceRadianceCacheCountQuery(RADIANCE_CACHE_D6_QUERY_ELIGIBLE, eligible);
+#if PATH_TRACE_SHARC_EXPERIMENT_GATE
+        PathTraceRadianceCacheCountQuery(RADIANCE_CACHE_D6_QUERY_HEADER_REJECTED, admitted && !trusted);
+#else
         PathTraceRadianceCacheCountQuery(RADIANCE_CACHE_D6_QUERY_HEADER_REJECTED, eligible && !trusted);
+#endif
         PathTraceRadianceCacheCountQuery(RADIANCE_CACHE_D6_QUERY_ABSENT_FULL, absent && bucketFull);
         PathTraceRadianceCacheCountQuery(RADIANCE_CACHE_D6_QUERY_ABSENT_FREE, absent && !bucketFull);
         PathTraceRadianceCacheCountQuery(RADIANCE_CACHE_D6_QUERY_FOUND, published);
@@ -396,9 +551,47 @@ bool PathTraceRadianceCacheSubstitute(uint primary, float3 position, PathTraceSu
 // PathTraceReference.hlsl's Continue hook statement sits directly in the path loop; in this library it expands to the
 // substitution, which reads the loop's own locals (primary, position, surface, throughput, radiance, rayCount,
 // extract, extraction), and a real break when it completed the path.
+#if PATH_TRACE_SHARC_EXPERIMENT_GATE
+// Experiments B and C also read the loop's ray, still x0's continuation at vertex 1 (its origin is x0's offset
+// position), and C at vertex 0 records x0's sampled strategy (specularStrategy) and event; no random number is drawn.
+// D reads PathTraceTracePath's rasterFirstVertex, x0 of every raster-primary path (the only paths that substitute).
+#if PATH_TRACE_SHARC_EXPERIMENT_C_CONE_SPREAD != 0
+#define PATH_TRACE_SHARC_EXPERIMENT_C_RECORD(harvest, vertex, bsdfSample) \
+    if(vertex == 0u) \
+    { \
+        harvest.x0ConeAlpha = !specularStrategy ? -1.0f : bsdfSample.delta ? 0.0f : \
+            PathTraceGGXAlpha(surface.material.roughness); \
+    }
+#define PATH_TRACE_SHARC_EXPERIMENT_C_ALPHA(harvest) harvest.x0ConeAlpha
+#else
+#define PATH_TRACE_SHARC_EXPERIMENT_C_RECORD(harvest, vertex, bsdfSample)
+#define PATH_TRACE_SHARC_EXPERIMENT_C_ALPHA(harvest) -1.0f
+#endif
+
+#if PATH_TRACE_SHARC_EXPERIMENT_BC
+#define PATH_TRACE_SHARC_EXPERIMENT_BC_ARGUMENTS(harvest) \
+    , length(position - ray.Origin), PATH_TRACE_SHARC_EXPERIMENT_C_ALPHA(harvest)
+#else
+#define PATH_TRACE_SHARC_EXPERIMENT_BC_ARGUMENTS(harvest)
+#endif
+
+#if PATH_TRACE_SHARC_EXPERIMENT_D
+#define PATH_TRACE_SHARC_EXPERIMENT_D_ARGUMENTS , rasterFirstVertex.surface.material.roughness
+#else
+#define PATH_TRACE_SHARC_EXPERIMENT_D_ARGUMENTS
+#endif
+
+#define PathTraceRadianceCacheHarvestContinue(harvest, vertex, bsdfSample) \
+    PATH_TRACE_SHARC_EXPERIMENT_C_RECORD(harvest, vertex, bsdfSample) \
+    if(vertex == 1u && PathTraceRadianceCacheSubstitute(primary, position, surface, bsdfSample, throughput, radiance, \
+        rayCount, extract, extraction PATH_TRACE_SHARC_EXPERIMENT_BC_ARGUMENTS(harvest) \
+        PATH_TRACE_SHARC_EXPERIMENT_D_ARGUMENTS)) \
+        break
+#else
 #define PathTraceRadianceCacheHarvestContinue(harvest, vertex, bsdfSample) \
     if(vertex == 1u && PathTraceRadianceCacheSubstitute(primary, position, surface, bsdfSample, throughput, radiance, \
         rayCount, extract, extraction)) break
+#endif
 #else
 void PathTraceRadianceCacheHarvestContinue(inout PathTraceRadianceCacheHarvest harvest, uint vertex,
     PathTraceBSDFSample bsdfSample)

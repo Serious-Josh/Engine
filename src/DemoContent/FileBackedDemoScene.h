@@ -83,40 +83,41 @@ public:
     bool ReorderObjects(const SceneObjectOrderIdentity& identity,
         const std::vector<std::string>& expectedOrder, const std::vector<std::string>& replacementOrder,
         std::string* errorMessage = nullptr);
+    // GetObjectMetadata(runtimeIndex) followed by that object's inspection capture, as one read.
+    bool InspectSelectedObject(RenderObjectID runtimeIndex, SceneObjectMetadata& metadata,
+        SceneObjectDocument& object) const
+    {
+        return m_initialized && m_runtime->InspectSelectedObject(runtimeIndex, metadata, object);
+    }
     bool CapturePhysicsInspection(std::string_view objectID, SceneObjectDocument& object) const
     {
-        size_t index = 0;
-        return m_runtime->CaptureObjectDeletionSnapshot(objectID, object, index);
+        return m_runtime->CaptureObjectInspection(objectID, object);
     }
     bool SetObjectPhysics(const SceneObjectMetadata& selection,
         const std::optional<Physics::PhysicsComponent>& expected,
         const std::optional<Physics::PhysicsComponent>& replacement, std::string* errorMessage = nullptr);
     bool CaptureTriggerColliderInspection(std::string_view objectID, SceneObjectDocument& object) const
     {
-        size_t index = 0;
-        return m_runtime->CaptureObjectDeletionSnapshot(objectID, object, index);
+        return m_runtime->CaptureObjectInspection(objectID, object);
     }
     bool SetObjectTriggerCollider(const SceneObjectMetadata& selection,
         const std::optional<Physics::TriggerColliderComponent>& expected,
         const std::optional<Physics::TriggerColliderComponent>& replacement, std::string* errorMessage = nullptr);
     bool CaptureCharacterControllerInspection(std::string_view objectID, SceneObjectDocument& object) const
     {
-        size_t index = 0;
-        return m_runtime->CaptureObjectDeletionSnapshot(objectID, object, index);
+        return m_runtime->CaptureObjectInspection(objectID, object);
     }
     bool SetObjectCharacterController(const SceneObjectMetadata& selection,
         const std::optional<Physics::CharacterControllerComponent>& expected,
         const std::optional<Physics::CharacterControllerComponent>& replacement, std::string* errorMessage = nullptr);
     bool CaptureCameraInspection(std::string_view objectID, SceneObjectDocument& object) const
     {
-        size_t index = 0;
-        return m_runtime->CaptureObjectDeletionSnapshot(objectID, object, index);
+        return m_runtime->CaptureObjectInspection(objectID, object);
     }
     bool SetObjectCameras(std::span<const SceneCameraChange> changes, std::string* errorMessage = nullptr);
     bool CaptureLightInspection(std::string_view objectID, SceneObjectDocument& object) const
     {
-        size_t index = 0;
-        return m_runtime->CaptureObjectDeletionSnapshot(objectID, object, index);
+        return m_runtime->CaptureObjectInspection(objectID, object);
     }
     bool SetObjectLight(const SceneObjectMetadata& selection, const std::optional<LightComponent>& expected,
         const std::optional<LightComponent>& replacement, std::string* errorMessage = nullptr);

@@ -15,6 +15,8 @@
 // extrapolate depth from that sample's true position, so overlay depth tests and outlines no longer follow the jitter
 // phase. With jitter 0 every expression reduces to the unjittered one.
 
+#include "PathTraceSharcDiagnosticConfig.hlsli"
+
 struct PresentationResolveConstants
 {
     uint sceneColorIndex;
@@ -60,6 +62,7 @@ VSOutput VSMain(uint vertexID : SV_VertexID)
 
     return output;
 }
+
 
 // Depth change per render pixel along axis at pixel: the smaller of the two one-sided differences whose neighbour is a
 // surface (0 when neither is). At the image border the missing side is skipped.
@@ -140,3 +143,19 @@ PSOutput PSMain(VSOutput input)
 
     return output;
 }
+
+#if PATH_TRACE_SHARC_SPATIAL_DIAGNOSTIC != 0
+// Same depth/mask/overlay mapping as the existing resolve, but categorical RGB is never linearly filtered.
+PSOutput PSSharcDiagnostic(VSOutput input)
+{
+    PSOutput output = PSMain(input);
+    Texture2D<float4> sceneColor = ResourceDescriptorHeap[resolveConstants.sceneColorIndex];
+    float2 uv = input.position.xy / float2(resolveConstants.outputWidth, resolveConstants.outputHeight);
+    float2 samplePosition = uv * float2(resolveConstants.renderWidth, resolveConstants.renderHeight) -
+        float2(resolveConstants.jitterX, resolveConstants.jitterY);
+    uint2 lastPixel = uint2(resolveConstants.renderWidth - 1u, resolveConstants.renderHeight - 1u);
+    uint2 renderPixel = min(uint2(max(samplePosition, 0.0f)), lastPixel);
+    output.color = sceneColor.Load(int3(renderPixel, 0));
+    return output;
+}
+#endif

@@ -154,8 +154,8 @@ bool BuildSceneLightingSnapshot(const SceneDocument& document,
     SceneLightingSnapshot& snapshot, std::string* error)
 {
     SceneLightingSnapshot candidate;
+    candidate.lightingSettings = document.lightingSettings;
     const SceneObjectDocument* shadowOwner = FindDirectionalShadowOwner(document);
-    std::uint32_t authoredLights = 0;
 
     // Document order is the deterministic light order; identity is the stable object ID.
     for(const auto& object : document.objects)
@@ -165,13 +165,7 @@ bool BuildSceneLightingSnapshot(const SceneDocument& document,
             continue;
         }
 
-        ++authoredLights;
         const LightComponent& light = *object.light;
-
-        if(light.type == LightType::Directional)
-        {
-            candidate.suppressLegacyDirectional = true;
-        }
 
         if(!light.enabled)
         {
@@ -193,6 +187,7 @@ bool BuildSceneLightingSnapshot(const SceneDocument& document,
         resolved.type = light.type;
         resolved.color = light.color;
         resolved.intensity = light.intensity;
+        resolved.angularRadius = light.angularRadius;
         resolved.range = light.range;
         resolved.innerConeAngle = light.innerConeAngle;
         resolved.outerConeAngle = light.outerConeAngle;
@@ -208,7 +203,7 @@ bool BuildSceneLightingSnapshot(const SceneDocument& document,
         }
     }
 
-    if(authoredLights > SceneLightingSnapshot::MaximumAdditionalLights)
+    if(candidate.additionalLights.size() > SceneLightingSnapshot::MaximumAdditionalLights)
     {
         return Fail(error, "The scene has more Light components than the renderer light table holds (" +
             std::to_string(SceneLightingSnapshot::MaximumAdditionalLights) + ").");

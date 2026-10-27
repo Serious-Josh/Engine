@@ -1,4 +1,5 @@
 #include "ShaderLibraryCompileWorker.h"
+#include "Debug/TransitionTiming.h"
 
 #include "Core/Log.h"
 
@@ -193,6 +194,7 @@ void ShaderLibraryCompileWorker::Run()
         Job& job = m_jobs.at(libraryPath);
         job.state = ShaderLibraryCompileState::Compiling;
         const std::wstring sourcePath = job.request.sourcePath.wstring();
+        const std::wstring includeDirectory = job.request.includeDirectory.wstring();
 
         // Compile without the lock so the owner can poll; only this thread touches a compiling job's outcome.
         lock.unlock();
@@ -205,6 +207,9 @@ void ShaderLibraryCompileWorker::Run()
             ShaderLibraryCompileDescription description{};
             description.path = sourcePath.c_str();
             description.profile = ShaderCompiler::GetLibraryProfile(libraryPath);
+            description.includeDirectory = includeDirectory.empty() ? nullptr : includeDirectory.c_str();
+            description.usePersistentCache = true;
+            TransitionTiming::Scope er1Scope("Worker CompileLibrary");
             outcome.succeeded = compiler.CompileLibrary(description, outcome.library, outcome.diagnostics);
         }
         else

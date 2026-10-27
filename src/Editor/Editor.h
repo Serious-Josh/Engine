@@ -17,6 +17,7 @@
 #include "ViewportIcons.h"
 #include "Scene/FileSceneAssetCatalog.h"
 #include "Project/ProjectContext.h"
+#include "Debug/EditorPhaseTiming.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -435,6 +436,13 @@ public:
     const std::vector<std::size_t>* GetViewportMarqueePreview(const IDemoScene& scene) const;
     const std::vector<size_t>& GetSelectedObjects() const noexcept { return m_selectedObjects; }
 
+    // Diagnostics only (ENGINE_FRAME_HITCH_LOGGING=1): Draw records its phase durations for the frame-hitch report.
+    void SetPhaseTimingEnabled(bool enabled) noexcept { m_phaseTimingEnabled = enabled; }
+    const EditorPhaseTiming::Frame* GetPhaseTiming() const noexcept
+    {
+        return m_phaseTimingEnabled ? &m_phaseTiming : nullptr;
+    }
+
     uint64_t GetSelectionStructureRevision() const
     {
         return m_selectionStructureRevision;
@@ -616,6 +624,12 @@ private:
     std::optional<ProjectFileAssociation::RegistryLocation> m_fileAssociationLocationForVerification;
 #endif
     bool m_showEditorPanel = false;
+
+    bool m_phaseTimingEnabled = false;
+    // Diagnostics only: mutable so that const inspection helpers can record their phases.
+    mutable EditorPhaseTiming::Frame m_phaseTiming{};
+
+    EditorPhaseTiming::Frame* PhaseTiming() const noexcept { return m_phaseTimingEnabled ? &m_phaseTiming : nullptr; }
 
     AssetBrowser m_assetBrowser;
 
@@ -849,7 +863,7 @@ private:
     std::optional<LightComponent> m_lightInspectedValue;
     std::uint64_t m_lightInspectionEpoch = 0;
     // Displayed units (angles in degrees): intensity, range, inner and outer cone angle.
-    std::array<float, 4> m_lightDragDrafts{};
+    std::array<float, 5> m_lightDragDrafts{};
     // Color gesture draft: edited live in the widget, committed once when the gesture ends.
     Vector3 m_lightColorDraft{1.0f, 1.0f, 1.0f};
     bool m_lightColorGestureActive = false;
@@ -895,6 +909,13 @@ private:
         float contentCenterX, ImVec2 popupSize, ImVec2 workMinimum, ImVec2 workMaximum, float gap);
     void DrawAddComponentControls(IDemoScene& scene);
     std::optional<SceneObjectMetadata> ResolveComponentEditTarget(IDemoScene& scene);
+    // The same check against a selection this frame already read, before any widget could edit it.
+    std::optional<SceneObjectMetadata> ResolveComponentEditTarget(IDemoScene& scene,
+        const SceneObjectMetadata& current);
+    // The scene, session and pending-operation conditions under which component edits are allowed.
+    bool ComponentEditAllowed(IDemoScene& scene);
+    // Whether `current` is still the object the Inspector was opened on. Requires ComponentEditAllowed.
+    bool MatchesComponentEditIdentity(IDemoScene& scene, const SceneObjectMetadata& current) const;
     void ValidateAddComponentPopup(IDemoScene& scene);
     void DismissAddComponentPopup();
     bool ComponentPopupMatches(IDemoScene& scene, const ComponentPopupTarget& target);

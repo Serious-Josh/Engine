@@ -1,5 +1,7 @@
 #pragma once
 
+#include "../../../assets/Shaders/PathTraceSharcDiagnosticConfig.hlsli"
+
 #include "Core/Log.h"
 #include "Renderer/DepthBuffer.h"
 #include "Renderer/Pipeline.h"
@@ -62,6 +64,17 @@ public:
             return false;
         }
 
+#if PATH_TRACE_SHARC_SPATIAL_DIAGNOSTIC != 0
+        pixelDescription.entryPoint = "PSSharcDiagnostic";
+        pipelineDescription.pixelShader = shaderLibrary.Load(pixelDescription);
+        if(!pipelineDescription.pixelShader || !m_sharcDiagnosticPipeline.Initialize(device, pipelineDescription))
+        {
+            Log::Error("Failed to initialize SHARC diagnostic presentation resolve.");
+            Shutdown();
+            return false;
+        }
+#endif
+
         return true;
     }
 
@@ -69,7 +82,11 @@ public:
     // jitter (render pixels, CameraJitterStatus convention; 0 without jitter), which places each render sample.
     void Execute(ID3D12GraphicsCommandList* commandList, RenderTarget& sceneColor, DepthBuffer& sceneDepth,
         RenderTarget& selectionMask, RenderTarget& outputColor, RenderTarget& outputSelectionMask,
-        DepthBuffer& outputDepth, float jitterX, float jitterY) const
+        DepthBuffer& outputDepth, float jitterX, float jitterY
+#if PATH_TRACE_SHARC_SPATIAL_DIAGNOSTIC != 0
+        , bool sharcDiagnostic = false
+#endif
+        ) const
     {
         constexpr D3D12_RESOURCE_STATES shaderRead = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
         sceneColor.Transition(commandList, shaderRead);
@@ -82,6 +99,13 @@ public:
         const D3D12_CPU_DESCRIPTOR_HANDLE targets[] = {outputColor.GetRTV(), outputSelectionMask.GetRTV()};
         const D3D12_CPU_DESCRIPTOR_HANDLE depth = outputDepth.GetDSV();
         commandList->OMSetRenderTargets(2, targets, FALSE, &depth);
+#if PATH_TRACE_SHARC_SPATIAL_DIAGNOSTIC != 0
+        if(sharcDiagnostic)
+        {
+            m_sharcDiagnosticPipeline.Bind(commandList);
+        }
+        else
+#endif
         m_pipeline.Bind(commandList);
 
         std::uint32_t constants[9] = {sceneColor.GetSRVIndex(), sceneDepth.GetSRVIndex(), selectionMask.GetSRVIndex(),
@@ -99,8 +123,14 @@ public:
     void Shutdown()
     {
         m_pipeline.Shutdown();
+#if PATH_TRACE_SHARC_SPATIAL_DIAGNOSTIC != 0
+        m_sharcDiagnosticPipeline.Shutdown();
+#endif
     }
 
 private:
     Pipeline m_pipeline;
+#if PATH_TRACE_SHARC_SPATIAL_DIAGNOSTIC != 0
+    Pipeline m_sharcDiagnosticPipeline;
+#endif
 };

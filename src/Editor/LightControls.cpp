@@ -20,11 +20,12 @@ namespace
 
     // Drag speeds only; ValidateLightComponent is the sole range contract. Order matches
     // Editor::m_lightDragDrafts.
-    constexpr std::array<LightNumericField, 4> kLightFields{{
+    constexpr std::array<LightNumericField, 5> kLightFields{{
         {"Intensity", &LightComponent::intensity, false, 0.05f},
         {"Range (m)", &LightComponent::range, false, 0.1f},
         {"Inner Cone Angle (deg)", &LightComponent::innerConeAngle, true, 0.25f},
-        {"Outer Cone Angle (deg)", &LightComponent::outerConeAngle, true, 0.25f}
+        {"Outer Cone Angle (deg)", &LightComponent::outerConeAngle, true, 0.25f},
+        {"Angular Radius (deg)", &LightComponent::angularRadius, true, 0.01f}
     }};
 
     constexpr size_t kIntensityField = 0;
@@ -50,6 +51,7 @@ namespace
             return type != LightType::Directional;
         }
 
+        if(fieldIndex == 4) return type == LightType::Directional;
         return type == LightType::Spot;
     }
 }
@@ -173,10 +175,10 @@ void Editor::DrawObjectLightControls(IDemoScene& scene)
         return;
     }
 
-    const auto selection = owner->GetObjectMetadata(m_selectedObject);
+    std::optional<SceneObjectMetadata> selection(std::in_place);
     SceneObjectDocument object;
 
-    if(!selection || !owner->CaptureLightInspection(selection->objectID, object))
+    if(!owner->InspectSelectedObject(m_selectedObject, *selection, object))
     {
         return;
     }
@@ -185,7 +187,7 @@ void Editor::DrawObjectLightControls(IDemoScene& scene)
         m_lightInspection->objectID != selection->objectID ||
         m_lightInspection->runtimeIdentity != selection->runtimeIdentity ||
         m_lightInspection->structureRevision != selection->structureRevision;
-    const bool blocked = !ResolveComponentEditTarget(scene);
+    const bool blocked = !ResolveComponentEditTarget(scene, *selection);
 
     // Any owner, session, history or value change discards drafts (including an unfinished
     // color gesture) and retires widget IDs.
@@ -307,7 +309,8 @@ void Editor::DrawObjectLightControls(IDemoScene& scene)
     float colorValues[3] = {m_lightColorDraft.x, m_lightColorDraft.y, m_lightColorDraft.z};
     const ImGuiColorEditFlags colorFlags = ImGuiColorEditFlags_Float | ImGuiColorEditFlags_NoAlpha;
 
-    if(ImGui::ColorEdit3("Color", colorValues, colorFlags) && !blocked)
+    if((light.type == LightType::Directional ? ImGui::InputFloat3("Color (linear RGB)", colorValues) :
+        ImGui::ColorEdit3("Color", colorValues, colorFlags)) && !blocked)
     {
         m_lightColorDraft = {colorValues[0], colorValues[1], colorValues[2]};
         m_lightColorGestureActive = true;

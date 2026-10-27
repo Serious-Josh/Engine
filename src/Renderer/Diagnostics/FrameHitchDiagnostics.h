@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Debug/CpuFrameTiming.h"
+#include "Debug/EditorPhaseTiming.h"
 
 #include <array>
 #include <climits>
@@ -106,6 +107,9 @@ namespace RendererDiagnostics
 
         bool uiTextureObserved = false;
         bool uiTextureUploadRequested = false;
+
+        // Editor::Draw's phases (ENGINE_FRAME_HITCH_LOGGING=1 only); empty in frames without a Draw.
+        EditorPhaseTiming::Frame editorPhases{};
     };
 
     struct FrameHitchDiagnostics
@@ -130,6 +134,15 @@ namespace RendererDiagnostics
         HitchSampleWindow submissionToObservedCompletion;
 
         HitchSampleWindow observedCompletionToFinalization;
+
+        // Frames with an Editor::Draw sample: EngineUI, EngineUI without Draw, and Draw without its top-level phases
+        // all come from those frames. Each phase window holds only the frames in which that phase ran.
+        HitchSampleWindow engineUI;
+        HitchSampleWindow engineUIOutsideEditor;
+        HitchSampleWindow editorRemainder;
+        std::array<HitchSampleWindow, EditorPhaseTiming::PhaseCount> editorPhases{};
+        // A nested parent phase (one with children) without its direct children, on the frames the parent ran.
+        std::array<HitchSampleWindow, EditorPhaseTiming::PhaseCount> editorPhaseRemainders{};
 
         CpuTiming::Clock::time_point lastReport{};
         CpuTiming::Clock::time_point previousRenderedStart{};

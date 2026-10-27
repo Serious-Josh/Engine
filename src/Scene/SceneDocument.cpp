@@ -47,7 +47,7 @@ bool ValidateSceneDocument(
         return Fail(errorMessage, "Unsupported scene schema version.");
     }
 
-    if(!document.environmentReference.empty())
+    if(!document.environmentReference.empty() && document.environmentReference != SceneDocument::NoneEnvironmentReference)
     {
         const auto id=AssetID::ParseReference(document.environmentReference);
         if(!id || id->ToReference()!=document.environmentReference) return Fail(errorMessage,"Invalid scene environment asset reference.");
@@ -75,23 +75,8 @@ bool ValidateSceneDocument(
         return Fail(errorMessage, "Invalid camera projection.");
     }
 
-    const DirectionalLight& light = document.directionalLight;
-
-    if (!IsFinite(light.direction) ||
-        !IsFinite(light.color) ||
-        !std::isfinite(light.intensity) ||
-        !std::isfinite(light.ambientStrength) ||
-        !std::isfinite(light.angularRadius))
-    {
-        return Fail(errorMessage, "Invalid directional light values.");
-    }
-
-    if (light.intensity < 0.0f ||
-        light.ambientStrength < 0.0f ||
-        light.angularRadius < 0.0f)
-    {
-        return Fail(errorMessage, "Invalid directional light parameters.");
-    }
+    if(!std::isfinite(document.lightingSettings.ambientStrength) || document.lightingSettings.ambientStrength < 0.0f)
+        return Fail(errorMessage, "Invalid scene ambient strength.");
 
     std::unordered_set<std::string> objectIDs;
     const SceneObjectDocument* mainCamera = nullptr;
@@ -133,10 +118,10 @@ bool ValidateSceneDocument(
         }
 
         // Disabled Lights count too: the bound is the renderer's fixed per-frame light capacity.
-        if(object.light && ++lightCount > MaximumSceneLights)
+        if(object.light && ++lightCount > MaximumSceneLights + 1)
         {
-            return Fail(errorMessage, "The scene has more than " + std::to_string(MaximumSceneLights) +
-                " Light components.");
+            return Fail(errorMessage, "The scene has more than " + std::to_string(MaximumSceneLights + 1) +
+                " Light components (including the dedicated sun slot).");
         }
 
         for(const auto& [slotID, reference] : object.materialSlotBindings)
@@ -147,6 +132,11 @@ bool ValidateSceneDocument(
             }
         }
     }
+
+    const bool hasDirectional = std::any_of(document.objects.begin(), document.objects.end(),
+        [](const auto& object) { return object.light && object.light->type == LightType::Directional; });
+    if(lightCount > MaximumSceneLights && !hasDirectional)
+        return Fail(errorMessage, "Lights exceed the table capacity without a directional sun slot.");
 
     // Existing flat validation above already checks identities/components. Avoid
     // graph allocation on ordinary frame-time captures and preserve loose count policy.

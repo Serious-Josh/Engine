@@ -1,4 +1,5 @@
 #include "NrdPathTracePreparePass.h"
+#include "Debug/TransitionTiming.h"
 
 #include "Core/Log.h"
 #include "Renderer/DescriptorHeap.h"
@@ -9,8 +10,9 @@
 
 namespace
 {
+    // signalViewConstants: a second root constant buffer at b1 (CSResolveRelaxSignalView only).
     bool CreatePipeline(GraphicsDevice& graphicsDevice, ShaderLibrary& shaderLibrary, const char* entryPoint,
-        ComputePipeline& pipeline)
+        ComputePipeline& pipeline, bool signalViewConstants = false)
     {
         ShaderDescription shaderDescription{};
         shaderDescription.path = "NrdPathTracePrepare.hlsl";
@@ -27,12 +29,19 @@ namespace
         constants.visibility = D3D12_SHADER_VISIBILITY_ALL;
         pipelineDescription.rootParameters.push_back(constants);
 
+        if(signalViewConstants)
+        {
+            constants.shaderRegister = 1;
+            pipelineDescription.rootParameters.push_back(constants);
+        }
+
         return computeShader && pipeline.Initialize(graphicsDevice.GetDevice(), pipelineDescription);
     }
 }
 
 bool NrdPathTracePreparePass::Initialize(GraphicsDevice& graphicsDevice, ShaderLibrary& shaderLibrary, Encoding encoding)
 {
+    TransitionTiming::Scope er1Scope("NrdPathTracePreparePass::Initialize", 0.5);
     if(m_initialized || m_initializationFailed)
     {
         return m_initialized && m_encoding == encoding;
@@ -84,6 +93,7 @@ bool NrdPathTracePreparePass::EnsureTextures(
     unsigned int height,
     bool reconstructions)
 {
+    TransitionTiming::Scope er1Scope("NrdPathTracePreparePass::EnsureTextures", 0.5);
     const bool hasReconstructions = m_reconstructedDiffuse.GetResource() != nullptr;
 
     if(HasTextures() && m_width == width && m_height == height && (hasReconstructions || !reconstructions))
@@ -157,9 +167,88 @@ void NrdPathTracePreparePass::Shutdown()
     m_preparePipeline.Shutdown();
     m_resolvePipeline.Shutdown();
     m_denoisedResolvePipeline.Shutdown();
+    m_signalViewPipeline.Shutdown();
     m_initialized = false;
     m_initializationFailed = false;
+    m_signalViewReady = false;
+    m_signalViewFailed = false;
     m_encoding = Encoding::Reblur;
+}
+
+bool NrdPathTracePreparePass::EnsureRelaxSignalView(GraphicsDevice& graphicsDevice, ShaderLibrary& shaderLibrary)
+{
+    // RELAX-encoded diffuse inputs only: the RELAX and hybrid encodings.
+    if(!m_initialized || m_encoding == Encoding::Reblur || m_signalViewFailed)
+    {
+        return m_signalViewReady;
+    }
+
+    if(!m_signalViewReady)
+    {
+        m_signalViewReady = CreatePipeline(graphicsDevice, shaderLibrary, "CSResolveRelaxSignalView",
+            m_signalViewPipeline, true);
+        m_signalViewFailed = !m_signalViewReady;
+
+        if(m_signalViewFailed)
+        {
+            Log::Error("The NRD RELAX signal view pipeline could not be created.");
+            m_signalViewPipeline.Shutdown();
+        }
+    }
+
+    return m_signalViewReady;
+}
+
+void NrdPathTracePreparePass::ExecuteRelaxSignalView(
+    ID3D12GraphicsCommandList* commandList,
+    UploadBuffer& uploadBuffer,
+    NrdPathTracePrepareConstants constants,
+    const NrdRelaxSignalViewConstants& signalView,
+    Texture& denoisedDiffuse,
+    Texture& presentation,
+    unsigned int width,
+    unsigned int height)
+{
+    if(!m_signalViewReady || !commandList || !HasTextures() || width != m_width || height != m_height)
+    {
+        return;
+    }
+
+    constexpr D3D12_RESOURCE_STATES shaderRead =
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    m_diffuse.Transition(commandList, shaderRead);
+    denoisedDiffuse.Transition(commandList, shaderRead);
+    presentation.Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+    constants.diffuseIndex = m_diffuse.GetDescriptorIndex();
+    constants.denoisedDiffuseIndex = denoisedDiffuse.GetDescriptorIndex();
+    constants.presentationIndex = presentation.GetUAVIndex();
+
+    const D3D12_GPU_VIRTUAL_ADDRESS signalViewAddress = uploadBuffer.Allocate(&signalView,
+        sizeof(NrdRelaxSignalViewConstants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
+
+    if(signalViewAddress == 0)
+    {
+        Log::Error("Failed to allocate NRD RELAX signal view constants.");
+        return;
+    }
+
+    // Dispatch binds b0 only, so this entry point binds both root constant buffers itself.
+    constants.resolution[0] = width;
+    constants.resolution[1] = height;
+    const D3D12_GPU_VIRTUAL_ADDRESS constantsAddress = uploadBuffer.Allocate(&constants,
+        sizeof(NrdPathTracePrepareConstants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
+
+    if(constantsAddress == 0)
+    {
+        Log::Error("Failed to allocate path-traced NRD preparation constants.");
+        return;
+    }
+
+    m_signalViewPipeline.Bind(commandList);
+    commandList->SetComputeRootConstantBufferView(0, constantsAddress);
+    commandList->SetComputeRootConstantBufferView(1, signalViewAddress);
+    commandList->Dispatch((width + 7u) / 8u, (height + 7u) / 8u, 1);
 }
 
 void NrdPathTracePreparePass::ExecutePrepare(

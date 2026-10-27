@@ -366,12 +366,12 @@ const Camera& Scene::GetCamera() const
 
 DirectionalLight& Scene::GetDirectionalLight()
 {
-    return m_directionalLight;
+    return m_directionalLight.value();
 }
 
 const DirectionalLight& Scene::GetDirectionalLight() const
 {
-    return m_directionalLight;
+    return m_directionalLight.value();
 }
 
 bool Scene::HasRenderableMeshes() const noexcept

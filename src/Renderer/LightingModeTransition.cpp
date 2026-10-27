@@ -51,6 +51,10 @@ RendererLightingMode LightingModeTransition::SelectCandidate(
         m_status.stage = LightingModeTransitionStage::Compiling;
         m_status.diagnostic.clear();
         return m_status.active;
+    case ShaderLibraryPreparationState::PreparingPipelines:
+        m_status.stage = LightingModeTransitionStage::PreparingPipelines;
+        m_status.diagnostic.clear();
+        return m_status.active;
     case ShaderLibraryPreparationState::Failed:
         Fail(preparation.diagnostic, now);
         return m_status.active;

@@ -3,6 +3,7 @@
 #include "Math/Matrix4.h"
 #include "Math/Vector3.h"
 #include "Scene/LightComponent.h"
+#include "Scene/SceneLightingSettings.h"
 
 #include <cstdint>
 #include <functional>
@@ -23,6 +24,7 @@ struct ResolvedSceneLight
     Vector3 direction{0.0f, 0.0f, 1.0f};
     Vector3 color{1.0f, 1.0f, 1.0f};
     float intensity = 0.0f;
+    float angularRadius = 0.0f;
     float range = 0.0f;
     float innerConeAngle = 0.0f;
     float outerConeAngle = 0.0f;
@@ -34,18 +36,18 @@ struct ResolvedSceneLight
 // Frame-local lighting of one committed scene, captured from a coherent document and its accepted
 // presentation transforms and passed by value to the renderer.
 //
-// Legacy migration: while a scene has no Directional Light components, the scene-level
-// DirectionalLight (the historical sun) keeps driving the existing sun path unchanged. Once any
-// Directional Light component exists, enabled or not, the legacy sun is suppressed so the two can
-// never double-illuminate. The shadow owner then is the first enabled Directional Light in scene
-// document order; it alone drives the existing sun path (ray-traced shadows, RTGI and reflection
-// secondary lighting). No other Light is ever promoted in its place.
+// File-scene snapshots are authoritative, including scenes with no directional components. The first
+// enabled directional in document order owns the existing shadow/secondary-lighting sun path.
+// Other directionals retain the existing direct table-light behavior.
 struct SceneLightingSnapshot
 {
-    // Renderer GPU light table capacity. Equal to the scene bound, so a valid scene always fits.
+    // Renderer GPU table capacity; the dedicated directional owner uses a separate sun slot.
     static constexpr std::uint32_t MaximumAdditionalLights = MaximumSceneLights;
 
-    bool suppressLegacyDirectional = false;
+    // Explicit procedural-demo/diagnostic compatibility only. Captured file scenes always
+    // leave this true; their Scene has no legacy storage regardless of this flag.
+    bool suppressLegacyDirectional = true;
+    SceneLightingSettings lightingSettings;
 
     // The shadow owner, when it is enabled and resolved this frame.
     std::optional<ResolvedSceneLight> sunDirectional;

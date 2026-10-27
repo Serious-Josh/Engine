@@ -184,11 +184,23 @@ struct PathTraceReferenceConstants
     // write when requested (PathTraceReferencePass::EnsureRawDiffuseHitDistance); UINT32_MAX writes nothing.
     std::uint32_t rawDiffuseHitDistanceIndex = 0xFFFFFFFFu;
     std::uint32_t rawDiffuseHitDistancePadding[3]{};
+    // R.9I.1 passive selected-pixel record buffer, UINT_MAX disables writes.
+    std::uint32_t sampleDiagnosticIndex = 0xFFFFFFFFu;
+    std::uint32_t sampleDiagnosticX = 0, sampleDiagnosticY = 0;
+    float sampleDiagnosticThreshold = 100.0f;
+    std::uint32_t sampleDiagnosticFrame = 0, sampleDiagnosticTarget = 0;
+    // R.9I.1D automatic capture bucket buffer, UINT_MAX disables; detection threshold only.
+    std::uint32_t sampleAutoIndex = 0xFFFFFFFFu;
+    float sampleAutoThreshold = 10.0f;
 };
 
-static_assert(sizeof(PathTraceReferenceConstants) == 64 + 7 * 16 + 64 + 3 * 16);
+static_assert(sizeof(PathTraceReferenceConstants) == 64 + 7 * 16 + 64 + 5 * 16);
 static_assert(offsetof(PathTraceReferenceConstants, sunDirectionToLight) == 64 + 4 * 16);
 static_assert(offsetof(PathTraceReferenceConstants, inverseCameraRelativeViewProjection) == 64 + 7 * 16);
+static_assert(offsetof(PathTraceReferenceConstants, sampleDiagnosticIndex) == 288);
+static_assert(offsetof(PathTraceReferenceConstants, sampleDiagnosticThreshold) == 300);
+static_assert(offsetof(PathTraceReferenceConstants, sampleDiagnosticFrame) == 304);
+static_assert(offsetof(PathTraceReferenceConstants, sampleAutoIndex) == 312);
 
 struct AOConstants
 {

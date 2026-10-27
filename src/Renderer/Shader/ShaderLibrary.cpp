@@ -1,4 +1,6 @@
 #include "ShaderLibrary.h"
+#include "DxilLibraryCache.h"
+#include "Debug/TransitionTiming.h"
 #include "Core/Log.h"
 #include <stdexcept>
 #include <cstring>
@@ -61,6 +63,7 @@ Shader* ShaderLibrary::Load(const ShaderDescription& description)
     compileDescription.entryPoint = entryPointString.c_str();
     compileDescription.stage = description.stage;
 
+    TransitionTiming::Scope er1Scope("Main-thread shader Compile " + key.path + ":" + key.entryPoint);
     ShaderCompileResult compileResult{};
 
     if (m_packaged)
@@ -103,13 +106,18 @@ bool ShaderLibrary::CompileLibrary(
     }
     const std::filesystem::path shaderPath = m_shaderRoot / path;
     const std::wstring shaderPathString = shaderPath.wstring();
+    const std::wstring shaderRootString = m_shaderRoot.wstring();
 
     ShaderLibraryCompileDescription description{};
     description.path = shaderPathString.c_str();
     description.profile = ShaderCompiler::GetLibraryProfile(path);
+    description.includeDirectory = shaderRootString.c_str();
+    description.usePersistentCache = true;
 
     ++m_libraryCompileCount;
-    return m_compiler.CompileLibrary(description, output);
+    const bool succeeded = m_compiler.CompileLibrary(description, output);
+    DxilLibraryCache::Report(path, output);
+    return succeeded;
 }
 
 bool ShaderLibrary::CreateLibraryCompileRequest(
@@ -123,6 +131,7 @@ bool ShaderLibrary::CreateLibraryCompileRequest(
 
     request.libraryPath = path;
     request.sourcePath = m_shaderRoot / path;
+    request.includeDirectory = m_shaderRoot;
     ++m_libraryCompileCount;
     return true;
 }

@@ -1,10 +1,13 @@
 #pragma once
 
+#include "../../../assets/Shaders/PathTraceSharcDiagnosticConfig.hlsli"
+
 #include "Renderer/Buffer.h"
 #include "Renderer/GpuTimestampProfiler.h"
 #include "Renderer/Texture.h"
 
 #include "Renderer/RayTracing/RayTracingPipeline.h"
+#include "Renderer/RayTracing/RayTracingPipelineWorker.h"
 #include "Renderer/RendererLightingMode.h"
 #include "Renderer/Shader/ShaderCompiler.h"
 #include "Renderer/Shader/ShaderLibraryCompileWorker.h"
@@ -68,6 +71,27 @@ enum class PathTraceRadianceCacheLibrary
     RenderExtractionRawDiffuseHitDistance,
     RenderSplitIndirectExtractionRawDiffuseHitDistance,
     Count
+};
+
+// ER.1 Phase 2: what a path-traced configuration records, for the DXR libraries it must have before activation.
+struct PathTraceLibraryNeeds
+{
+    PathTracePrimary primary = PathTracePrimary::Camera;
+    // ER.1 Phase 4: signal extraction (any path-tracing denoiser) records the extraction pipelines.
+    bool extraction = false;
+    // The raw diffuse hit distance extraction (NRD RELAX and the hybrid).
+    bool rawDiffuseHitDistance = false;
+    // SHARC: the sparse training library and the render library that substitutes cached radiance.
+    bool radianceCache = false;
+    PathTraceRadianceCacheLibrary radianceCacheRender = PathTraceRadianceCacheLibrary::Render;
+};
+
+// One DXR library a configuration acquires. An optional library is a GI.6 or DI.1 RayQuery twin: its failure keeps
+// the original TraceRay pipeline, so it never blocks activation.
+struct PathTraceLibraryRequirement
+{
+    std::filesystem::path path;
+    bool optional = false;
 };
 
 // What the library selection needs to know about the device and process.
@@ -159,6 +183,57 @@ class PathTraceReferencePass
         ShaderLibrary& shaderLibrary,
         ShaderLibraryCompileWorker& worker,
         PathTracePrimary primary);
+
+    // ER.1 Phase 2: the same preparation for any DXR library this pass acquires.
+    ShaderLibraryPreparation PrepareLibrary(
+        ShaderLibrary& shaderLibrary,
+        ShaderLibraryCompileWorker& worker,
+        const std::filesystem::path& path);
+
+    // ER.1 Phase 2: every library the pipelines of a configuration acquire, RayQuery twins included, so the worker
+    // can compile all of them before activation and no pipeline creation compiles on the render thread.
+    std::vector<PathTraceLibraryRequirement> GetRequiredLibraries(const PathTraceLibraryNeeds& needs) const;
+
+    // ER.1 Phase 4: every DXR pipeline the configuration's creation paths build (the same description builders), with
+    // the RayQuery twin InitializeVisibilityPipelines pairs with each. Optional entries are twins.
+    struct PipelineRequirement
+    {
+        RayTracingPipelineDescription description;
+        bool optional = false;
+    };
+
+    std::vector<PipelineRequirement> GetRequiredPipelines(const PathTraceLibraryNeeds& needs) const;
+
+    // ER.1 Phase 4: polls the pipeline worker for every required pipeline, never blocking. Requires the configuration's
+    // libraries accepted (PrepareLibrary Ready). Ready once each pipeline is live in its slot or prepared for adoption at
+    // the current library revision; PreparingPipelines while any is queued or creating; Failed when a required one
+    // failed (a failed twin counts as Ready: its pipeline keeps TraceRay). The creation paths then adopt the prepared
+    // pipelines (RayTracingPipeline::Swap) instead of calling CreateStateObject on the render thread.
+    ShaderLibraryPreparation PreparePipelines(RayTracingPipelineWorker& worker, ID3D12Device5* device,
+        const PathTraceLibraryNeeds& needs);
+
+    struct PipelineStatistics
+    {
+        std::uint64_t adopted = 0;
+        std::uint64_t synchronous = 0;
+        std::uint64_t submitted = 0;
+        std::uint64_t failures = 0;
+        std::uint64_t discarded = 0;
+        std::size_t prepared = 0;
+    };
+
+    PipelineStatistics GetPipelineStatistics() const
+    {
+        PipelineStatistics statistics = m_pipelineStatistics;
+        statistics.prepared = m_preparedPipelines.size();
+        return statistics;
+    }
+
+    // Diagnostics only: background creations whose description key contains this text fail (empty: none).
+    void SetPipelineFailureForTesting(std::string keyFragment)
+    {
+        m_pipelineFailureForTesting = std::move(keyFragment);
+    }
 
     bool IsInitialized() const
     {
@@ -300,6 +375,24 @@ class PathTraceReferencePass
         return m_rawDiffuseHitDistanceWritten;
     }
 
+    // NRD RELAX R.4 (diagnostics only): whether the last Execute or ExecuteReSTIRDISplit recorded the extraction direct
+    // pass, which wrote every pixel's and sample's slot of the split direct diffuse buffer. Only then may that frame's
+    // buffer be read, through its UAV (raw, float3 per pixel and sample), on the same command list.
+    bool WroteSplitDirectDiffuse() const
+    {
+        return m_splitDirectDiffuseWritten;
+    }
+
+    unsigned int GetSplitDirectDiffuseUAVIndex() const
+    {
+        return m_splitDirectDiffuse.buffer.GetUAVDescriptorIndex();
+    }
+
+    std::uint32_t GetSplitDirectDiffuseSamples() const
+    {
+        return m_splitDirectDiffuse.samples;
+    }
+
     // RTXPT D.1B.2 diffuse/specular signal extraction (diagnostics only, never enabled by default). Creates, on first
     // use, the extraction pipelines of Raster Primary or split ReSTIR DI (the extraction exports of the libraries
     // the production pipelines use) and the two RGBA16F outputs at the current extent. A failure is sticky until a
@@ -349,12 +442,17 @@ class PathTraceReferencePass
     bool HasRawDiffuseHitDistanceResources() const;
 
     // Releases the texture and every raw-distance pipeline (NRD.RELAX.2B), clearing their failures; the next request
-    // creates them again from the cached libraries. Caller guarantees the queue is idle.
+    // creates them again from the cached libraries. Caller guarantees no submitted work can still use them (an idle
+    // queue, or, for ER.1 Phase 3.1 eviction, a completed last-use fence).
     void ReleaseRawDiffuseHitDistanceResources();
 
     // Copies the presentation image into the HDR scene colour consumed by tone mapping. Both are
     // RGBA16F at the scene extent; the caller checks that before recording.
     void CopyToSceneColor(ID3D12GraphicsCommandList* commandList, RenderTarget& sceneColor);
+
+#if PATH_TRACE_SHARC_SPATIAL_DIAGNOSTIC != 0
+    bool WroteSharcDiagnostic() const { return m_sharcDiagnosticWritten; }
+#endif
 
     Texture& GetAccumulationTexture()
     {
@@ -377,15 +475,40 @@ class PathTraceReferencePass
     bool IsSecondaryShadowRayQueryReady() const;
     void SelectSecondaryShadowRayQuery(bool enabled);
 
+    bool IsPrimaryDiShadowRayQueryReady() const;
+    void SelectPrimaryDiShadowRayQuery(bool enabled);
+
+    // Both direct entries are prepared synchronously with the split pipelines, so not ready afterwards is a failure
+    // (logged as "DI.1 ..."), not unfinished preparation.
+    bool IsPrimaryDiShadowRayQueryFailed() const
+    {
+        return m_initialized && m_splitPipelinesReady && !IsPrimaryDiShadowRayQueryReady();
+    }
+
+    bool IsPrimaryDiShadowRayQueryActive() const
+    {
+        return m_primaryDiShadowRayQuery;
+    }
+
+    bool IsSecondaryShadowRayQueryActive() const
+    {
+        return m_secondaryShadowRayQuery;
+    }
+
     private:
     bool InitializeVisibilityPipelines(GraphicsDevice& device, ShaderLibrary& shaders,
         RayTracingPipeline& original, const std::vector<char>& bytecode,
         const RayTracingPipelineDescription& description);
     RayTracingPipeline& VisibilityPipeline(RayTracingPipeline& original);
+    RayTracingPipeline& PrimaryDiVisibilityPipeline(RayTracingPipeline& original);
+    bool PreparePrimaryDiExtractionPipeline(GraphicsDevice& device, ShaderLibrary& shaders);
 
     // Retained alongside the originals until the caller's existing idle teardown boundary.
     std::map<RayTracingPipeline*, std::unique_ptr<RayTracingPipeline>> m_rayQueryPipelines;
     bool m_secondaryShadowRayQuery = false;
+    std::map<RayTracingPipeline*, std::unique_ptr<RayTracingPipeline>> m_primaryDiRayQueryPipelines;
+    bool m_primaryDiShadowRayQuery = false;
+    bool m_primaryDiExtractionPipelineReady = false;
 
     // True once any library or pipeline exists, after which the library selection cannot change.
     bool LibrarySelectionFixed() const;
@@ -407,7 +530,34 @@ class PathTraceReferencePass
     {
         std::filesystem::path path;
         ShaderLibraryCompileResult library;
+        // ER.1 Phase 4: changes whenever library is replaced; a prepared pipeline is adopted only at its revision.
+        std::uint64_t revision = 0;
+        // ER.1 Phase 4: an immutable copy of library.bytecode shared with background pipeline requests.
+        std::shared_ptr<const std::vector<char>> snapshot;
     };
+
+    // ER.1 Phase 4: a pipeline the worker built, owned here until a creation path adopts it.
+    struct PreparedPipeline
+    {
+        std::uint64_t revision = 0;
+        ID3D12Device5* device = nullptr;
+        std::unique_ptr<RayTracingPipeline> pipeline;
+    };
+
+    std::uint64_t LibraryRevision(const std::filesystem::path& path) const;
+    // The slot's pipeline: the prepared one when its key, revision and device match; otherwise created here (a
+    // configuration no gate prepared: diagnostics, packaged runtimes, a library edited after preparation). A pipeline
+    // whose background creation failed at the current revision is not retried synchronously.
+    bool CreatePipeline(GraphicsDevice& device, RayTracingPipeline& slot, const std::vector<char>& bytecode,
+        const RayTracingPipelineDescription& description);
+    bool IsPipelineLive(const std::string& identity) const;
+
+    std::uint64_t m_libraryRevisionCounter = 0;
+    std::map<std::string, PreparedPipeline> m_preparedPipelines;
+    // Description key -> the library revision whose background creation failed.
+    std::map<std::string, std::uint64_t> m_failedPipelines;
+    PipelineStatistics m_pipelineStatistics;
+    std::string m_pipelineFailureForTesting;
 
     // The current failed worker compilation of a library, kept so it is not resubmitted until its
     // sources change.
@@ -503,6 +653,10 @@ class PathTraceReferencePass
     std::string m_extractRasterRawFailure;
     std::string m_extractSplitRawFailure;
     bool m_rawDiffuseHitDistanceWritten = false;
+    bool m_splitDirectDiffuseWritten = false;
+#if PATH_TRACE_SHARC_SPATIAL_DIAGNOSTIC != 0
+    bool m_sharcDiagnosticWritten = false;
+#endif
     Texture m_diffuseTexture;
     Texture m_specularTexture;
     Texture m_historyPriorTexture;

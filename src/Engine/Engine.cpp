@@ -1163,6 +1163,9 @@ bool Engine::InitializeProjectIndependent(const EngineStartup& startup)
         return false;
     }
 
+    // Diagnostics only: the Editor records its phases when the frame-hitch report is enabled.
+    m_editor.SetPhaseTimingEnabled(m_renderer.IsFrameHitchLoggingEnabled());
+
     // One-time descriptor budget baseline: renderer passes, targets, LUTs, environment and UI,
     // before any scene, mesh or thumbnail allocation.
     const auto descriptors = m_renderer.GetResourceDescriptorStatistics();
@@ -2216,6 +2219,11 @@ void Engine::Frame()
                   finalSceneImage.width, finalSceneImage.height, m_time.GetDeltaTime(),
                   inspectorPaths, m_projectAssetRegistry, m_renderer.GetMaterialPreviewImage());
 
+    if(const EditorPhaseTiming::Frame* editorPhases = m_editor.GetPhaseTiming())
+    {
+        m_renderer.RecordEditorPhaseTiming(*editorPhases);
+    }
+
     if(!m_projectNotice.empty())
     {
         ImGui::SetNextWindowSize(ImVec2(520, 0), ImGuiCond_FirstUseEver);
@@ -2234,6 +2242,8 @@ void Engine::Frame()
     }
 
     const PathTraceReferenceStatus& pathTraceStatus = m_renderer.GetPathTraceReferenceStatus();
+    debugUI.SetPrimaryDiShadowVisibilityStatus(pathTraceStatus.primaryDiShadowRayQueryReady,
+        pathTraceStatus.primaryDiShadowRayQueryActive, pathTraceStatus.primaryDiShadowRayQueryFailed);
     debugUI.SetSecondaryShadowVisibilityStatus(pathTraceStatus.secondaryShadowRayQueryReady,
         pathTraceStatus.secondaryShadowRayQueryActive,
         pathTraceStatus.visibilityTimingEpoch + m_renderer.GetShaderLibrary().GetLibraryCompileCount());
@@ -5423,7 +5433,7 @@ SceneLightingSnapshot Engine::CaptureSceneLightingForFrame(const FileSceneRuntim
         // No partial list: publish no component Lights and no legacy sun, so a rejected capture
         // can never double-illuminate or silently fall back.
         snapshot = {};
-        snapshot.suppressLegacyDirectional = true;
+        snapshot.lightingSettings = runtime.GetScene().GetLightingSettings();
 
         if(error != m_lightingCaptureError)
         {

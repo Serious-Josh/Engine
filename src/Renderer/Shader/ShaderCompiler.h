@@ -33,6 +33,11 @@ struct ShaderLibraryCompileDescription
 {
     const wchar_t* path = nullptr;
     ShaderLibraryProfile profile = ShaderLibraryProfile::Library66;
+    // The shader root. Added as a second -I only when it differs from the source's directory, so variant
+    // wrappers in subdirectories (DI1/, GI6/) resolve the RTXDI SDK's angled includes like their originals.
+    const wchar_t* includeDirectory = nullptr;
+    // Runtime callers opt in explicitly. Offline cooking and direct compiler clients remain uncached.
+    bool usePersistentCache = false;
 };
 
 // One source file a compilation read, or an include lookup that found no file. Together with the profile
@@ -47,6 +52,18 @@ struct ShaderSourceDependency
 
 struct ShaderLibraryCompileResult
 {
+    enum class CacheStatus
+    {
+        Disabled,
+        Miss,
+        Hit
+    };
+    CacheStatus cacheStatus = CacheStatus::Disabled;
+    bool cacheWritten = false;
+    bool dxcInvoked = false;
+    double cacheReadMilliseconds = 0.0;
+    double dxcMilliseconds = 0.0;
+    double cacheWriteMilliseconds = 0.0;
     std::vector<char> bytecode;
     // The profile the bytecode was compiled for; reuse requires it to match the library's mapped profile.
     ShaderLibraryProfile profile = ShaderLibraryProfile::Library66;

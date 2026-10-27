@@ -23,6 +23,8 @@ class ShaderTable
         ID3D12Device* device,
         const std::vector<ShaderRecord>& records);
     void Shutdown();
+    // ER.1 Phase 4: exchanges ownership with another table (the background pipeline handoff).
+    void Swap(ShaderTable& other) noexcept;
 
     D3D12_GPU_VIRTUAL_ADDRESS GetGPUAddress() const;
 

@@ -1,7 +1,7 @@
 #pragma once
 
 #include "Scene/Transform.h"
-#include "Scene/DirectionalLight.h"
+#include "Scene/SceneLightingSettings.h"
 #include "Scene/CameraComponent.h"
 #include "Scene/LightComponent.h"
 #include "Physics/PhysicsComponent.h"
@@ -74,19 +74,23 @@ struct SceneDocument
     static constexpr std::uint32_t kHierarchySchemaVersion = 9;
     static constexpr std::uint32_t kCameraSchemaVersion = 10;
     static constexpr std::uint32_t kLightSchemaVersion = 11;
-    static constexpr std::uint32_t kSchemaVersion = kLightSchemaVersion;
+    static constexpr std::uint32_t kEnvironmentNoneSchemaVersion = 12;
+    static constexpr std::uint32_t kObjectLightingSchemaVersion = 13;
+    static constexpr std::uint32_t kSchemaVersion = kObjectLightingSchemaVersion;
 
     std::uint32_t schemaVersion = kSchemaVersion;
 
     std::string id;
     std::string name = "Untitled Scene";
-    // Empty selects neutral; otherwise a canonical project texture asset reference.
+    // Empty preserves the historical neutral environment; builtin:none explicitly disables it.
+    // Otherwise a canonical project texture asset reference.
+    static constexpr const char* NoneEnvironmentReference = "builtin:none";
     std::string environmentReference;
 
     std::vector<SceneObjectDocument> objects;
 
     SceneCameraDocument camera;
-    DirectionalLight directionalLight;
+    SceneLightingSettings lightingSettings;
 };
 
 bool ValidateSceneDocument(

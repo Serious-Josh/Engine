@@ -1,4 +1,6 @@
 #include "PathTraceReferencePass.h"
+#include "Renderer/Shader/DxilLibraryCache.h"
+#include "Debug/TransitionTiming.h"
 
 #include "Core/Log.h"
 
@@ -296,6 +298,63 @@ namespace
 
         return description;
     }
+
+    // The RayQuery twin InitializeVisibilityPipelines pairs with a pipeline's library, if any. DI.1 pairs only the
+    // ReSTIR DI direct libraries; GI.6 pairs the reference libraries except training.
+    std::optional<std::filesystem::path> RayQueryTwinLibraryPath(const std::filesystem::path& path)
+    {
+        const std::string name = path.filename().string();
+
+        if(name.starts_with("PathTraceReSTIRDI"))
+        {
+            return std::filesystem::path("DI1") / path;
+        }
+
+        if(name.starts_with("PathTraceReference") && name.find("Training") == std::string::npos)
+        {
+            return std::filesystem::path("GI6") / path;
+        }
+
+        return std::nullopt;
+    }
+
+    // ER.1 Phase 4: everything a DXR pipeline is built from besides the library bytes (its path, exports, root signature
+    // and pipeline configuration), so two descriptions share a prepared pipeline only when they would build the same one.
+    std::string PipelineDescriptionKey(const RayTracingPipelineDescription& description)
+    {
+        std::string key = description.shaderPath.generic_string();
+        const auto add = [&](const std::wstring& text)
+        {
+            key += '|';
+            key += std::filesystem::path(text).string();
+        };
+
+        add(description.rayGenerationShader);
+
+        for(const std::wstring& missShader : description.missShaders)
+        {
+            add(missShader);
+        }
+
+        for(const RayTracingHitGroupDescription& hitGroup : description.hitGroups)
+        {
+            add(hitGroup.name);
+            add(hitGroup.closestHitShader);
+            add(hitGroup.anyHitShader);
+        }
+
+        for(const RootParameterDescription& parameter : description.rootParameters)
+        {
+            key += "|r" + std::to_string(static_cast<int>(parameter.type)) + ',' + std::to_string(parameter.shaderRegister) +
+                ',' + std::to_string(parameter.constantCount) + ',' + std::to_string(static_cast<int>(parameter.visibility)) +
+                ',' + std::to_string(static_cast<int>(parameter.descriptorRangeType)) + ',' +
+                std::to_string(parameter.descriptorCount);
+        }
+
+        key += "|p" + std::to_string(description.maxPayloadSize) + ',' + std::to_string(description.maxAttributeSize) + ',' +
+            std::to_string(description.maxRecursionDepth);
+        return key;
+    }
 }
 
 bool PathTraceReferencePass::LibrarySelectionFixed() const
@@ -393,6 +452,7 @@ bool PathTraceReferencePass::EnsurePrimaryPipeline(
     PathTracePrimary primary,
     std::string& failureReason)
 {
+    TransitionTiming::Scope er1Scope("EnsurePrimaryPipeline", 0.5);
     const size_t index = static_cast<size_t>(primary);
 
     if(!m_initialized)
@@ -456,7 +516,15 @@ ShaderLibraryPreparation PathTraceReferencePass::PrepareLibrary(
     ShaderLibraryCompileWorker& worker,
     PathTracePrimary primary)
 {
-    const std::filesystem::path path = PathTraceLibraryPath(primary, m_libraryVariant);
+    return PrepareLibrary(shaderLibrary, worker, PathTraceLibraryPath(primary, m_libraryVariant));
+}
+
+ShaderLibraryPreparation PathTraceReferencePass::PrepareLibrary(
+    ShaderLibrary& shaderLibrary,
+    ShaderLibraryCompileWorker& worker,
+    const std::filesystem::path& path)
+{
+    TransitionTiming::Scope er1Scope("PrepareLibrary", 0.5);
     const std::string libraryName = path.generic_string();
     ShaderLibraryPreparation preparation{};
 
@@ -474,6 +542,12 @@ ShaderLibraryPreparation PathTraceReferencePass::PrepareLibrary(
     }
 
     std::optional<ShaderLibraryCompileOutcome> completed = worker.TakeCompleted(path);
+
+    if(completed)
+    {
+        DxilLibraryCache::Report(path, completed->library);
+    }
+
     const auto failed = std::find_if(m_failedLibraries.begin(), m_failedLibraries.end(),
         [&](const FailedLibrary& failedLibrary)
         {
@@ -529,6 +603,8 @@ ShaderLibraryPreparation PathTraceReferencePass::PrepareLibrary(
         }
 
         entry->library = std::move(completed->library);
+        entry->revision = ++m_libraryRevisionCounter;
+        entry->snapshot.reset();
 
         // A new revision may fix what made a pipeline fail. Pipelines already created keep their state
         // objects, as they do under synchronous reuse.
@@ -616,6 +692,357 @@ ShaderLibraryPreparation PathTraceReferencePass::SubmitLibrary(
     return preparation;
 }
 
+std::vector<PathTraceLibraryRequirement> PathTraceReferencePass::GetRequiredLibraries(
+    const PathTraceLibraryNeeds& needs) const
+{
+    std::vector<PathTraceLibraryRequirement> libraries;
+
+    // Each pipeline library, followed by the RayQuery twin InitializeVisibilityPipelines pairs with it.
+    const auto add = [&](const std::filesystem::path& path)
+    {
+        const auto listed = [&](const std::filesystem::path& candidate)
+        {
+            return std::any_of(libraries.begin(), libraries.end(),
+                [&](const PathTraceLibraryRequirement& library)
+                {
+                    return library.path == candidate;
+                });
+        };
+
+        if(!listed(path))
+        {
+            libraries.push_back(PathTraceLibraryRequirement{path, false});
+        }
+
+        const std::optional<std::filesystem::path> twinPath = RayQueryTwinLibraryPath(path);
+
+        if(twinPath && !listed(*twinPath))
+        {
+            libraries.push_back(PathTraceLibraryRequirement{*twinPath, true});
+        }
+    };
+
+    // Initialize creates the Camera pipeline for every primary; Raster Primary, the ReSTIR DI indirect pass and the
+    // Raster Primary and split indirect extraction exports come from the same library.
+    add(ReferenceLibraryPath(m_libraryVariant));
+
+    // EnsureReSTIRDISplitPipelines creates the direct pass and, before the primary visibility selector is enabled,
+    // the extraction direct pass.
+    if(needs.primary == PathTracePrimary::RasterReSTIRDI)
+    {
+        add(ReSTIRDILibraryPath(m_libraryVariant));
+        add(ReSTIRDIExtractionLibraryPath(m_libraryVariant));
+    }
+
+    if(needs.rawDiffuseHitDistance)
+    {
+        add(RawDiffuseHitDistanceLibraryPath(m_libraryVariant));
+    }
+
+    if(needs.radianceCache)
+    {
+        add(RadianceCacheLibraryPath(m_libraryVariant, PathTraceRadianceCacheLibrary::Training));
+        add(RadianceCacheLibraryPath(m_libraryVariant, needs.radianceCacheRender));
+    }
+
+    return libraries;
+}
+
+std::vector<PathTraceReferencePass::PipelineRequirement> PathTraceReferencePass::GetRequiredPipelines(
+    const PathTraceLibraryNeeds& needs) const
+{
+    std::vector<PipelineRequirement> pipelines;
+
+    // Each pipeline, followed by the RayQuery twin InitializeVisibilityPipelines pairs with it.
+    const auto add = [&](const RayTracingPipelineDescription& description)
+    {
+        pipelines.push_back(PipelineRequirement{description, false});
+        const std::optional<std::filesystem::path> twinPath = RayQueryTwinLibraryPath(description.shaderPath);
+
+        if(twinPath)
+        {
+            RayTracingPipelineDescription twin = description;
+            twin.shaderPath = *twinPath;
+            pipelines.push_back(PipelineRequirement{std::move(twin), true});
+        }
+    };
+    const bool split = needs.primary == PathTracePrimary::RasterReSTIRDI;
+
+    // Initialize: the Camera pipeline, for every primary.
+    add(BuildPathTracePipelineDescription(PathTracePrimary::Camera, m_libraryVariant));
+
+    // EnsurePrimaryPipeline: a single-pipeline primary, or the ReSTIR DI split pair and its extraction direct pass.
+    if(split)
+    {
+        add(BuildReSTIRDISplitPipelineDescription(true, m_libraryVariant));
+        add(BuildReSTIRDISplitPipelineDescription(false, m_libraryVariant));
+        add(BuildReSTIRDISplitExtractionPipelineDescription(true, m_libraryVariant));
+    }
+    else if(needs.primary != PathTracePrimary::Camera)
+    {
+        add(BuildPathTracePipelineDescription(needs.primary, m_libraryVariant));
+    }
+
+    // EnsureSignalExtraction: the production extraction pipelines, and the raw-distance ones (their own library).
+    if(needs.extraction)
+    {
+        add(split ? BuildReSTIRDISplitExtractionPipelineDescription(false, m_libraryVariant) :
+            BuildRasterExtractionPipelineDescription(m_libraryVariant));
+    }
+
+    if(needs.extraction && needs.rawDiffuseHitDistance)
+    {
+        RayTracingPipelineDescription raw = split ?
+            BuildReSTIRDISplitExtractionPipelineDescription(false, m_libraryVariant) :
+            BuildRasterExtractionPipelineDescription(m_libraryVariant);
+        raw.shaderPath = RawDiffuseHitDistanceLibraryPath(m_libraryVariant);
+        add(raw);
+    }
+
+    // EnsureRadianceCacheLearning: SHARC's sparse training and render pipelines.
+    if(needs.radianceCache)
+    {
+        add(BuildRadianceCachePipelineDescription(m_libraryVariant, PathTraceRadianceCacheLibrary::Training));
+        add(BuildRadianceCachePipelineDescription(m_libraryVariant, needs.radianceCacheRender));
+    }
+
+    return pipelines;
+}
+
+std::uint64_t PathTraceReferencePass::LibraryRevision(const std::filesystem::path& path) const
+{
+    for(const CompiledLibrary& compiled : m_libraries)
+    {
+        if(compiled.path == path)
+        {
+            return compiled.revision;
+        }
+    }
+
+    return 0;
+}
+
+bool PathTraceReferencePass::IsPipelineLive(const std::string& identity) const
+{
+    const auto live = [&](const RayTracingPipeline& pipeline)
+    {
+        return pipeline.IsInitialized() && pipeline.GetIdentity() == identity;
+    };
+
+    if(std::any_of(std::begin(m_pipelines), std::end(m_pipelines), live) || live(m_splitDirectPipeline) ||
+        live(m_splitIndirectPipeline) || live(m_extractRasterPipeline) || live(m_extractSplitDirectPipeline) ||
+        live(m_extractSplitIndirectPipeline) || live(m_extractRasterRawPipeline) || live(m_extractSplitIndirectRawPipeline))
+    {
+        return true;
+    }
+
+    for(const RadianceCacheLearningPipeline& learning : m_radianceCache)
+    {
+        if(live(learning.pipeline))
+        {
+            return true;
+        }
+    }
+
+    for(const auto* alternates : {&m_rayQueryPipelines, &m_primaryDiRayQueryPipelines})
+    {
+        for(const auto& [original, alternate] : *alternates)
+        {
+            if(alternate && live(*alternate))
+            {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+ShaderLibraryPreparation PathTraceReferencePass::PreparePipelines(RayTracingPipelineWorker& worker, ID3D12Device5* device,
+    const PathTraceLibraryNeeds& needs)
+{
+    TransitionTiming::Scope er1Scope("PreparePipelines", 0.5);
+    ShaderLibraryPreparation combined{};
+    combined.state = ShaderLibraryPreparationState::Ready;
+
+    const auto worse = [&](ShaderLibraryPreparationState state, const std::string& diagnostic)
+    {
+        if(combined.state == ShaderLibraryPreparationState::Failed)
+        {
+            return;
+        }
+
+        if(state == ShaderLibraryPreparationState::Failed || combined.state == ShaderLibraryPreparationState::Ready)
+        {
+            combined.state = state;
+            combined.diagnostic = diagnostic;
+        }
+    };
+
+    for(const PipelineRequirement& requirement : GetRequiredPipelines(needs))
+    {
+        const RayTracingPipelineDescription& description = requirement.description;
+        const std::string libraryName = description.shaderPath.generic_string();
+        CompiledLibrary* library = nullptr;
+
+        for(CompiledLibrary& compiled : m_libraries)
+        {
+            if(compiled.path == description.shaderPath)
+            {
+                library = &compiled;
+                break;
+            }
+        }
+
+        // A twin whose library failed keeps its pipeline on TraceRay, as InitializeVisibilityPipelines does.
+        if(!library || library->library.bytecode.empty())
+        {
+            if(!requirement.optional)
+            {
+                worse(ShaderLibraryPreparationState::Failed, "The " + libraryName + " DXR library is unavailable.");
+            }
+
+            continue;
+        }
+
+        const std::string key = PipelineDescriptionKey(description);
+        const std::string identity = key + "#" + std::to_string(library->revision);
+
+        if(IsPipelineLive(identity))
+        {
+            continue;
+        }
+
+        const auto prepared = m_preparedPipelines.find(key);
+
+        if(prepared != m_preparedPipelines.end() && prepared->second.revision == library->revision &&
+            prepared->second.device == device)
+        {
+            continue;
+        }
+
+        const auto failed = m_failedPipelines.find(key);
+
+        if(failed != m_failedPipelines.end() && failed->second == library->revision)
+        {
+            if(!requirement.optional)
+            {
+                worse(ShaderLibraryPreparationState::Failed, "The " + libraryName + " DXR pipeline could not be created.");
+            }
+
+            continue;
+        }
+
+        switch(worker.GetState(identity))
+        {
+        case RayTracingPipelineJobState::Queued:
+        case RayTracingPipelineJobState::Creating:
+            worse(ShaderLibraryPreparationState::PreparingPipelines, "");
+            continue;
+        case RayTracingPipelineJobState::Completed:
+        {
+            std::optional<RayTracingPipelineOutcome> outcome = worker.TakeCompleted(identity);
+
+            // The identity carries the revision; the device must be this one too.
+            if(outcome && outcome->succeeded && outcome->device == device)
+            {
+                m_preparedPipelines[key] = PreparedPipeline{library->revision, device, std::move(outcome->pipeline)};
+                continue;
+            }
+
+            if(outcome && outcome->device != device)
+            {
+                ++m_pipelineStatistics.discarded;
+                break;
+            }
+
+            ++m_pipelineStatistics.failures;
+            m_failedPipelines[key] = library->revision;
+            Log::Error("Background creation of the " + libraryName + " DXR pipeline failed" +
+                (requirement.optional ? " (its TraceRay pipeline is kept)." : "."));
+
+            if(!requirement.optional)
+            {
+                worse(ShaderLibraryPreparationState::Failed, "The " + libraryName + " DXR pipeline could not be created.");
+            }
+
+            continue;
+        }
+        case RayTracingPipelineJobState::None:
+            break;
+        }
+
+        if(!library->snapshot)
+        {
+            library->snapshot = std::make_shared<const std::vector<char>>(library->library.bytecode);
+        }
+
+        RayTracingPipelineRequest request{};
+        request.key = identity;
+        request.device = device;
+        request.library = library->snapshot;
+        request.description = description;
+        request.failForTesting = !m_pipelineFailureForTesting.empty() &&
+            key.find(m_pipelineFailureForTesting) != std::string::npos;
+
+        if(!worker.Submit(std::move(request)))
+        {
+            worse(ShaderLibraryPreparationState::Failed, "The " + libraryName + " DXR pipeline could not be queued.");
+            continue;
+        }
+
+        ++m_pipelineStatistics.submitted;
+        worse(ShaderLibraryPreparationState::PreparingPipelines, "");
+    }
+
+    return combined;
+}
+
+bool PathTraceReferencePass::CreatePipeline(GraphicsDevice& device, RayTracingPipeline& slot,
+    const std::vector<char>& bytecode, const RayTracingPipelineDescription& description)
+{
+    const std::string key = PipelineDescriptionKey(description);
+    const std::uint64_t revision = LibraryRevision(description.shaderPath);
+    const std::string identity = key + "#" + std::to_string(revision);
+    ID3D12Device5* const rayTracingDevice = device.GetRayTracingDevice();
+    const auto prepared = m_preparedPipelines.find(key);
+
+    if(prepared != m_preparedPipelines.end())
+    {
+        PreparedPipeline candidate = std::move(prepared->second);
+        m_preparedPipelines.erase(prepared);
+
+        // Adopted only at this library revision on this device; anything else is discarded (it was never used).
+        if(candidate.revision == revision && candidate.device == rayTracingDevice && candidate.pipeline)
+        {
+            slot.Shutdown();
+            slot.Swap(*candidate.pipeline);
+            slot.SetIdentity(identity);
+            ++m_pipelineStatistics.adopted;
+            return true;
+        }
+
+        ++m_pipelineStatistics.discarded;
+    }
+
+    const auto failed = m_failedPipelines.find(key);
+
+    if(failed != m_failedPipelines.end() && failed->second == revision)
+    {
+        return false;
+    }
+
+    ++m_pipelineStatistics.synchronous;
+
+    if(!slot.Initialize(rayTracingDevice, bytecode, description))
+    {
+        return false;
+    }
+
+    slot.SetIdentity(identity);
+    return true;
+}
+
 const ShaderLibraryCompileResult* PathTraceReferencePass::AcquireLibrary(
     ShaderLibrary& shaderLibrary,
     const std::filesystem::path& path)
@@ -638,17 +1065,35 @@ const ShaderLibraryCompileResult* PathTraceReferencePass::AcquireLibrary(
         return &entry->library;
     }
 
+    // ER.1 Phase 2: a failure the worker reported for the current sources would fail again; it is not recompiled
+    // here (PrepareLibrary retries it once the sources change).
+    const bool failedCurrent = std::any_of(m_failedLibraries.begin(), m_failedLibraries.end(),
+        [&](const FailedLibrary& failedLibrary)
+        {
+            return failedLibrary.path == path && ShaderLibraryCompileWorker::IsCurrent(failedLibrary.outcome);
+        });
+
+    if(failedCurrent)
+    {
+        return nullptr;
+    }
+
     if(!entry)
     {
         entry = &m_libraries.emplace_back(CompiledLibrary{path, {}});
     }
 
+    TransitionTiming::Scope er1Scope("Main-thread CompileLibrary " + path.generic_string());
     if(!shaderLibrary.CompileLibrary(path, entry->library))
     {
         entry->library = {};
+        entry->revision = ++m_libraryRevisionCounter;
+        entry->snapshot.reset();
         return nullptr;
     }
 
+    entry->revision = ++m_libraryRevisionCounter;
+    entry->snapshot.reset();
     return &entry->library;
 }
 
@@ -752,8 +1197,12 @@ void PathTraceReferencePass::Execute(
     bool rawDiffuseHitDistance)
 {
     m_rawDiffuseHitDistanceWritten = false;
+    m_splitDirectDiffuseWritten = false;
 
     // NRD.RELAX.2B: raw-distance extraction only with its output; otherwise the legacy extraction, which writes none.
+#if PATH_TRACE_SHARC_SPATIAL_DIAGNOSTIC != 0
+    m_sharcDiagnosticWritten = false;
+#endif
     const bool raw = extract && rawDiffuseHitDistance && m_rawDiffuseHitDistanceTexture.GetResource();
 
     // SHARC.4D: a learning pipeline only for Raster Primary; otherwise the production one.
@@ -807,6 +1256,11 @@ void PathTraceReferencePass::Execute(
     }
 
     pipeline.Dispatch(commandList, width, height);
+#if PATH_TRACE_SHARC_SPATIAL_DIAGNOSTIC != 0
+    m_sharcDiagnosticWritten = learning && (radianceCacheLibrary == PathTraceRadianceCacheLibrary::Render ||
+        radianceCacheLibrary == PathTraceRadianceCacheLibrary::RenderExtraction ||
+        radianceCacheLibrary == PathTraceRadianceCacheLibrary::RenderExtractionRawDiffuseHitDistance);
+#endif
     m_rawDiffuseHitDistanceWritten = learning ? IsRawDiffuseHitDistanceLibrary(radianceCacheLibrary) : rawPipeline;
     RecordOutputBarriers(commandList, extract);
 }
@@ -846,6 +1300,7 @@ bool PathTraceReferencePass::EnsureRadianceCacheLearning(
     std::string& failureReason,
     PathTraceRadianceCacheLibrary library)
 {
+    TransitionTiming::Scope er1Scope("EnsureRadianceCacheLearning", 0.5);
     if(!m_initialized)
     {
         failureReason = "The path tracer is not initialized.";
@@ -927,6 +1382,7 @@ bool PathTraceReferencePass::EnsureReSTIRDISplitPipelines(
     ShaderLibrary& shaderLibrary,
     std::string& failureReason)
 {
+    TransitionTiming::Scope er1Scope("EnsureReSTIRDISplitPipelines", 0.5);
     if(!m_initialized)
     {
         failureReason = "The path tracer is not initialized.";
@@ -980,6 +1436,10 @@ bool PathTraceReferencePass::EnsureReSTIRDISplitPipelines(
         }
     }
 
+    // Prepare both direct entry points before enabling the primary visibility selector. This prevents an
+    // NRD/extraction change from constructing or replacing a direct state object after RayQuery is active.
+    // A preparation failure disables only DI.1 selection; the original non-extraction pass remains usable.
+    PreparePrimaryDiExtractionPipeline(graphicsDevice, shaderLibrary);
     m_splitPipelinesReady = true;
     return true;
 }
@@ -1066,8 +1526,12 @@ bool PathTraceReferencePass::EnsureExtractionPipelines(
         }
         else if(split)
         {
-            pipelines.emplace_back(&m_extractSplitDirectPipeline,
-                BuildReSTIRDISplitExtractionPipelineDescription(true, m_libraryVariant));
+            if(!m_primaryDiExtractionPipelineReady)
+            {
+                pipelines.emplace_back(&m_extractSplitDirectPipeline,
+                    BuildReSTIRDISplitExtractionPipelineDescription(true, m_libraryVariant));
+            }
+
             pipelines.emplace_back(&m_extractSplitIndirectPipeline,
                 BuildReSTIRDISplitExtractionPipelineDescription(false, m_libraryVariant));
         }
@@ -1107,6 +1571,11 @@ bool PathTraceReferencePass::EnsureExtractionPipelines(
                 failureReason = failure;
                 return false;
             }
+        }
+
+        if(split && !rawDiffuseHitDistance)
+        {
+            m_primaryDiExtractionPipelineReady = true;
         }
 
         ready = true;
@@ -1204,6 +1673,32 @@ void PathTraceReferencePass::ReleaseRawDiffuseHitDistanceResources()
 {
     m_rawDiffuseHitDistanceTexture.Shutdown();
     m_rawDiffuseHitDistanceWritten = false;
+
+    // ER.1 Phase 3.1: the GI.6 RayQuery twins of these pipelines go with them (erased, so the remaining twins still decide
+    // IsSecondaryShadowRayQueryReady); the next creation pairs new ones.
+    const auto releaseTwin = [&](RayTracingPipeline& original)
+    {
+        const auto found = m_rayQueryPipelines.find(&original);
+
+        if(found != m_rayQueryPipelines.end())
+        {
+            if(found->second)
+            {
+                found->second->Shutdown();
+            }
+
+            m_rayQueryPipelines.erase(found);
+        }
+    };
+
+    releaseTwin(m_extractRasterRawPipeline);
+    releaseTwin(m_extractSplitIndirectRawPipeline);
+
+    for(const PathTraceRadianceCacheLibrary library : {PathTraceRadianceCacheLibrary::RenderExtractionRawDiffuseHitDistance,
+        PathTraceRadianceCacheLibrary::RenderSplitIndirectExtractionRawDiffuseHitDistance})
+    {
+        releaseTwin(m_radianceCache[static_cast<size_t>(library)].pipeline);
+    }
 
     m_extractRasterRawPipeline.Shutdown();
     m_extractSplitIndirectRawPipeline.Shutdown();
@@ -1356,9 +1851,14 @@ void PathTraceReferencePass::ExecuteReSTIRDISplit(
     bool rawDiffuseHitDistance)
 {
     m_rawDiffuseHitDistanceWritten = false;
+    m_splitDirectDiffuseWritten = false;
     const bool ready = extract ?
         m_extractSplitReady && m_splitDirectDiffuse.buffer.GetResource() && m_diffuseTexture.GetResource() :
         m_splitPipelinesReady;
+
+#if PATH_TRACE_SHARC_SPATIAL_DIAGNOSTIC != 0
+    m_sharcDiagnosticWritten = false;
+#endif
 
     if(!m_initialized || !commandList || width != m_width || height != m_height || !ready ||
         !m_splitDirectRadiance.buffer.GetResource() || rtxdiConstantsAddress == 0)
@@ -1379,7 +1879,8 @@ void PathTraceReferencePass::ExecuteReSTIRDISplit(
     const bool cachedIndirect = radianceCacheConstants != 0 && radianceCacheLibrary == expectedLibrary &&
         radianceCache.ready;
     const bool rawPipeline = raw && !cachedIndirect && m_extractSplitRawReady;
-    RayTracingPipeline& directPipeline = extract ? m_extractSplitDirectPipeline : m_splitDirectPipeline;
+    RayTracingPipeline& directPipeline = PrimaryDiVisibilityPipeline(
+        extract ? m_extractSplitDirectPipeline : m_splitDirectPipeline);
     RayTracingPipeline& indirectPipeline = VisibilityPipeline(cachedIndirect ?
         m_radianceCache[static_cast<size_t>(radianceCacheLibrary)].pipeline :
         (extract ? (rawPipeline ? m_extractSplitIndirectRawPipeline : m_extractSplitIndirectPipeline) :
@@ -1416,6 +1917,7 @@ void PathTraceReferencePass::ExecuteReSTIRDISplit(
     commandList->SetComputeRootConstantBufferView(6, rtxdiConstantsAddress);
     directPipeline.Dispatch(commandList, width, height);
     profiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::PathTraceSplitDirect);
+    m_splitDirectDiffuseWritten = extract;
 
     // The indirect pass reads every direct radiance slot the direct pass wrote, and with extraction every direct
     // diffuse slot. Both passes only add to the statistics row atomically, so it needs no ordering between them.
@@ -1437,6 +1939,9 @@ void PathTraceReferencePass::ExecuteReSTIRDISplit(
     }
 
     indirectPipeline.Dispatch(commandList, width, height);
+#if PATH_TRACE_SHARC_SPATIAL_DIAGNOSTIC != 0
+    m_sharcDiagnosticWritten = cachedIndirect;
+#endif
     profiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::PathTraceSplitIndirect);
     m_rawDiffuseHitDistanceWritten = cachedIndirect ? IsRawDiffuseHitDistanceLibrary(radianceCacheLibrary) : rawPipeline;
 
@@ -1504,21 +2009,30 @@ void PathTraceReferencePass::Shutdown()
     ReleaseResources();
     m_libraries.clear();
     m_failedLibraries.clear();
+    // ER.1 Phase 4: never used by the GPU; the Renderer joined the pipeline worker before this.
+    m_preparedPipelines.clear();
+    m_failedPipelines.clear();
 }
 
 void PathTraceReferencePass::ReleaseResources()
 {
     // Same idle-device contract as the original pipeline teardown below.
-    for(auto& [original, alternate] : m_rayQueryPipelines)
+    for(auto* pipelines : {&m_rayQueryPipelines, &m_primaryDiRayQueryPipelines})
     {
-        if(alternate)
+        for(auto& [original, alternate] : *pipelines)
         {
-            alternate->Shutdown();
+            if(alternate)
+            {
+                alternate->Shutdown();
+            }
         }
+
+        pipelines->clear();
     }
 
-    m_rayQueryPipelines.clear();
     m_secondaryShadowRayQuery = false;
+    m_primaryDiShadowRayQuery = false;
+    m_primaryDiExtractionPipelineReady = false;
 
     m_accumulationTexture.Shutdown();
     m_outputTexture.Shutdown();
@@ -1737,20 +2251,23 @@ bool PathTraceReferencePass::InitializeVisibilityPipelines(
     GraphicsDevice& device, ShaderLibrary& shaders, RayTracingPipeline& original,
     const std::vector<char>& bytecode, const RayTracingPipelineDescription& description)
 {
-    if(!original.Initialize(device.GetRayTracingDevice(), bytecode, description))
+    TransitionTiming::Scope er1Scope("InitializeVisibilityPipelines", 0.5);
+    if(!CreatePipeline(device, original, bytecode, description))
     {
         return false;
     }
 
-    const std::string name = description.shaderPath.filename().string();
+    // DI.1 pairs only direct libraries; GI.6's secondary eligibility and training exclusion stay unchanged.
+    const std::optional<std::filesystem::path> twinPath = RayQueryTwinLibraryPath(description.shaderPath);
 
-    // Primary RTXDI and SHARC training deliberately retain the original library.
-    if(!name.starts_with("PathTraceReference") || name.find("Training") != std::string::npos)
+    if(!twinPath)
     {
         return true;
     }
 
-    auto& alternate = m_rayQueryPipelines[&original];
+    const bool primaryDi = description.shaderPath.filename().string().starts_with("PathTraceReSTIRDI");
+    auto& alternates = primaryDi ? m_primaryDiRayQueryPipelines : m_rayQueryPipelines;
+    auto& alternate = alternates[&original];
 
     if(alternate)
     {
@@ -1759,14 +2276,15 @@ bool PathTraceReferencePass::InitializeVisibilityPipelines(
 
     alternate = std::make_unique<RayTracingPipeline>();
     RayTracingPipelineDescription queryDescription = description;
-    queryDescription.shaderPath = std::filesystem::path("GI6") / description.shaderPath;
+    queryDescription.shaderPath = *twinPath;
     const ShaderLibraryCompileResult* library = AcquireLibrary(shaders, queryDescription.shaderPath);
 
-    if(!library || !alternate->Initialize(device.GetRayTracingDevice(), library->bytecode, queryDescription))
+    if(!library || !CreatePipeline(device, *alternate, library->bytecode, queryDescription))
     {
         alternate->Shutdown();
         alternate.reset();
-        Log::Warning("GI.6 RayQuery unavailable; original TraceRay retained: " + queryDescription.shaderPath.string());
+        Log::Warning(std::string(primaryDi ? "DI.1" : "GI.6") +
+            " RayQuery unavailable; original TraceRay retained: " + queryDescription.shaderPath.string());
     }
 
     return true;
@@ -1797,4 +2315,55 @@ RayTracingPipeline& PathTraceReferencePass::VisibilityPipeline(RayTracingPipelin
     }
 
     return original;
+}
+
+bool PathTraceReferencePass::IsPrimaryDiShadowRayQueryReady() const
+{
+    return m_initialized && m_splitPipelinesReady && m_primaryDiExtractionPipelineReady &&
+        !m_primaryDiRayQueryPipelines.empty() &&
+        std::all_of(m_primaryDiRayQueryPipelines.begin(), m_primaryDiRayQueryPipelines.end(),
+            [](const auto& entry)
+            {
+                return entry.second != nullptr;
+            });
+}
+
+void PathTraceReferencePass::SelectPrimaryDiShadowRayQuery(bool enabled)
+{
+    m_primaryDiShadowRayQuery = enabled && IsPrimaryDiShadowRayQueryReady();
+}
+
+RayTracingPipeline& PathTraceReferencePass::PrimaryDiVisibilityPipeline(RayTracingPipeline& original)
+{
+    const auto found = m_primaryDiRayQueryPipelines.find(&original);
+
+    if(m_primaryDiShadowRayQuery && found != m_primaryDiRayQueryPipelines.end() && found->second)
+    {
+        return *found->second;
+    }
+
+    return original;
+}
+
+bool PathTraceReferencePass::PreparePrimaryDiExtractionPipeline(GraphicsDevice& device, ShaderLibrary& shaders)
+{
+    TransitionTiming::Scope er1Scope("PreparePrimaryDiExtractionPipeline", 0.5);
+    if(m_primaryDiExtractionPipelineReady)
+    {
+        return true;
+    }
+
+    const RayTracingPipelineDescription description =
+        BuildReSTIRDISplitExtractionPipelineDescription(true, m_libraryVariant);
+    const ShaderLibraryCompileResult* library = AcquireLibrary(shaders, description.shaderPath);
+
+    if(!library || !LibraryNamesExport(library->bytecode, description.rayGenerationShader) ||
+        !InitializeVisibilityPipelines(device, shaders, m_extractSplitDirectPipeline, library->bytecode, description))
+    {
+        Log::Warning("DI.1 direct extraction preparation unavailable; primary visibility selector disabled.");
+        return false;
+    }
+
+    m_primaryDiExtractionPipelineReady = true;
+    return true;
 }

@@ -4,6 +4,7 @@
 #include "Debug/CpuFrameTiming.h"
 #include "Editor/TextureThumbnailCache.h"
 #include "Diagnostics/FrameHitchDiagnostics.h"
+#include "PathTraceSampleDiagnostic.h"
 
 #include "GBuffer.h"
 #include "Preview/MaterialPreviewRenderer.h"
@@ -56,6 +57,7 @@
 #include "Passes/NrdDenoiser.h"
 #include "Passes/NrdPreparePass.h"
 #include "Passes/NrdPathTracePreparePass.h"
+#include "Passes/NrdHistoryConfidencePass.h"
 #include "Passes/NrdReflectionResolvePass.h"
 #include "Passes/SelectionMaskPass.h"
 #include "Passes/RayTracedGIPass.h"
@@ -88,6 +90,8 @@
 #include <memory>
 #include <cstddef>
 #include <limits>
+
+struct IDXGIAdapter3;
 #include <climits>
 
 struct EnvironmentAsset
@@ -125,7 +129,7 @@ struct RendererOptions
     std::optional<RenderView> view;
 
     // LIGHT.1 scene lighting captured for this frame (FileSceneRuntime::CaptureSceneLighting).
-    // Absent: the scene's legacy DirectionalLight only, exactly as before LIGHT.1. Copied by value.
+    // Absent: procedural demos use their explicit sun; object-owned file scenes stay dark. Copied by value.
     std::optional<SceneLightingSnapshot> lighting;
 
     // RTXPT.1 experimental lighting mode for this frame only. Legacy is the default; the selection is
@@ -216,6 +220,9 @@ struct PathTraceReferenceStatus
     bool activeLastFrame = false;
     bool secondaryShadowRayQueryReady = false;
     bool secondaryShadowRayQueryActive = false;
+    bool primaryDiShadowRayQueryReady = false;
+    bool primaryDiShadowRayQueryActive = false;
+    bool primaryDiShadowRayQueryFailed = false;
     std::uint64_t visibilityTimingEpoch = 0;
     std::uint32_t accumulatedSamples = 0;
     std::uint64_t accumulationResets = 0;
@@ -745,6 +752,16 @@ class Renderer
         CpuTiming::Clock::time_point frameStart,
         double frameMilliseconds,
         std::optional<FrameRenderResult> outcome);
+
+    // Diagnostics only: whether ENGINE_FRAME_HITCH_LOGGING=1 enabled the report, and this frame's Editor phases for it.
+    bool IsFrameHitchLoggingEnabled() const noexcept { return m_frameHitchDiagnostics.loggingEnabled; }
+    void RecordEditorPhaseTiming(const EditorPhaseTiming::Frame& phases) noexcept
+    {
+        if constexpr (kEnableFrameHitchDiagnostics)
+        {
+            m_frameHitchDiagnostics.current.editorPhases = phases;
+        }
+    }
 
     void ResetCpuSubmissionCadence()
     {
@@ -1518,6 +1535,8 @@ class Renderer
     void UpdateSharcStatus(unsigned int frameSlot);
     // The query-side library the frame's settings select (Query, QueryTermination or Render). NRD.RELAX.2B:
     // rawDiffuseHitDistance selects the render library's raw-distance build for an extraction frame.
+    // The render library SHARC substitutes cached radiance with (SHARC.4E, 4E.1, 5B; NRD.RELAX.2B raw distance).
+    static PathTraceRadianceCacheLibrary SharcRenderLibrary(bool extract, bool splitReSTIRDI, bool rawDiffuseHitDistance);
     PathTraceRadianceCacheLibrary RadianceCacheQueryLibrary(bool extract, bool splitReSTIRDI,
         bool rawDiffuseHitDistance = false) const;
     SharcSettings m_sharcSettings;
@@ -1605,6 +1624,9 @@ class Renderer
     // spatial dispatch for display only, on frames that ran the temporal pass; it changes no history.
     PathTraceDenoiserVisualization m_pathTraceVisualization{};
     bool m_pathTraceScalarViewLastFrame = false;
+#if PATH_TRACE_SHARC_SPATIAL_DIAGNOSTIC != 0
+    bool m_sharcDiagnosticPresentedThisFrame = false;
+#endif
     // RTXPT D.3C.2 diagnostic: the spatial filter's a-trous iterations (0: the D.3B.2 5x5 pass; 1 or 2: 3x3
     // iterations at steps 1 and 2). It only matters while the spatial pass runs; without the a-trous pipelines or
     // intermediate the 5x5 pass is used. The count that ran on the last spatial frame (0 for the 5x5 pass) is kept
@@ -1687,6 +1709,8 @@ class Renderer
     std::uint32_t m_nrdPathTraceResolveComponents = 0;
     // NRD.4C diagnostics: create the instance with fp32 internal textures (takes effect at its next creation).
     bool m_nrdPathTracePromoteFloat16To32 = false;
+    // ER.1 Phase 3: the promotion the current (possibly retained) instance was created with.
+    bool m_nrdPathTraceCreatedPromoteFloat16To32 = false;
     // NRD.4D diagnostics: NrdPathTracePrepareConstants::specularHitDistanceMode (0 in production).
     std::uint32_t m_nrdPathTraceSpecularHitDistanceMode = 0;
     // Diagnostics: NRD's validation overlay (CommonSettings::enableValidation) into this RGBA16F texture.
@@ -1797,8 +1821,56 @@ class Renderer
     // NRD.RELAX.4 diagnostics, unset in production: RELAX settings used in place of PathTraceRelaxSettings (the caller
     // restarts history when it changes them).
     std::optional<nrd::RelaxSettings> m_nrdRelaxSettingsOverride;
+    // NRD RELAX R.4 diagnostics, 0 in production: ENGINE_NRD_RELAX_SIGNAL_VIEW, read at startup. RELAX still runs; its
+    // production resolve is replaced by one diffuse signal (NrdRelaxSignalViewConstants::mode).
+    std::uint32_t m_nrdRelaxSignalView = 0;
+    // Whether the signal view's fallback to the production resolve has been reported (once per run).
+    bool m_nrdRelaxSignalViewFallbackReported = false;
+    // NRD RELAX R.9A diagnostics, 0 in production: ENGINE_NRD_RELAX_HISTORY_CONFIDENCE, read at startup. 1 binds a
+    // constant diffuse history confidence of 1, 2 of 0.1; the specular confidence is always 1. Regular RELAX only.
+    std::uint32_t m_nrdRelaxHistoryConfidence = 0;
+    // 1x1 R16F constants for IN_DIFF/SPEC_CONFIDENCE, created on the first confidence frame, refilled by a clear each
+    // such frame, released with the RELAX instance. m_nrdRelaxConfidenceOne also serves IN_SPEC_CONFIDENCE.
+    RenderTarget m_nrdRelaxConfidenceOne;
+    RenderTarget m_nrdRelaxConfidenceLow;
+    bool m_nrdRelaxConfidenceReported = false;
+    // NRD RELAX R.9B diagnostics, off in production: ENGINE_NRD_RELAX_CONFIDENCE_PROBES=1, read at startup. Generates the
+    // paired-visibility confidence on raster ReSTIR DI frames under the NRD RELAX denoiser, for signal views 4, 5 and 6;
+    // bound to NRD only under m_nrdRelaxGeneratedConfidence (which also sets this).
+    bool m_nrdConfidenceProbesEnabled = false;
+    // NRD RELAX R.9C diagnostics, off in production: ENGINE_NRD_RELAX_GENERATED_CONFIDENCE=1, read at startup. Enables
+    // the probes and binds their confidence as regular RELAX's IN_DIFF_CONFIDENCE (specular 1). A frame without this
+    // frame's probes binds 1. Takes precedence over (and disables) ENGINE_NRD_RELAX_HISTORY_CONFIDENCE.
+    bool m_nrdRelaxGeneratedConfidence = false;
+    bool m_nrdRelaxGeneratedConfidenceFallbackReported = false;
+    // R.9F startup diagnostic: 1 preserves R.9C; 2/4/6 exponentiate its filtered confidence, generated mode only.
+    std::uint32_t m_nrdRelaxConfidenceStrength = 1;
+    NrdHistoryConfidencePass m_nrdConfidencePass;
+    // What the probe records were made under. A record is reused only by the immediately next submitted probe frame
+    // under an equal identity: scene resources, lights, sun, environment and render extent. TLAS updates (moving
+    // objects) do not change it: detecting their visibility changes is the purpose.
+    struct NrdConfidenceProbeIdentity
+    {
+        std::uint64_t sceneResourceLifetime = 0;
+        PathTraceTemporalKey lights;
+        std::uint32_t environment[5]{};
+        float environmentTotalWeight = 0.0f;
+        unsigned int width = 0;
+        unsigned int height = 0;
+    };
+    std::optional<NrdConfidenceProbeIdentity> m_nrdConfidencePendingIdentity;
+    std::optional<NrdConfidenceProbeIdentity> m_nrdConfidenceCommittedIdentity;
+    float m_nrdConfidencePendingCamera[3]{};
+    float m_nrdConfidenceCommittedCamera[3]{};
+    bool m_nrdConfidenceDispatchedThisFrame = false;
+    bool m_nrdConfidenceExecutedLastFrame = false;
+    std::uint32_t m_nrdConfidenceFrameIndex = 0;
+    // The last logged history state, so the log notes changes only.
+    std::string m_nrdConfidenceHistoryState;
     // NRD.RELAX.4 diagnostics: create the RELAX instance with fp32 internal textures (takes effect at its next creation).
     bool m_nrdRelaxPromoteFloat16To32 = false;
+    // ER.1 Phase 3: the promotion the current (possibly retained) instance was created with.
+    bool m_nrdRelaxCreatedPromoteFloat16To32 = false;
 
     // The production REBLUR settings (diagnostics compare overrides against them).
     static nrd::ReblurSettings PathTraceNrdProductionSettings();
@@ -1865,7 +1937,87 @@ class Renderer
     // pass that accepts its results.
     std::unique_ptr<ShaderLibraryCompileWorker> m_shaderCompileWorker;
     bool m_shaderCompileWorkerRunning = false;
+    // ER.1 Phase 4: DXR pipeline creation off the render thread (state objects and shader tables); joined in Shutdown
+    // before the pass and the device.
+    std::unique_ptr<RayTracingPipelineWorker> m_pipelineWorker;
+    bool m_pipelineWorkerRunning = false;
     LightingModeTransition m_lightingModeTransition;
+    // ER.1 Phase 2: DXR libraries the worker has prepared and the pass holds (or, for a RayQuery twin, that failed
+    // for their current sources). Gates skip polling them, so a settled configuration polls nothing per frame.
+    std::vector<std::filesystem::path> m_preparedDxrLibraries;
+    // ER.1 Phase 2: the requested NRD denoiser or SHARC whose libraries are still compiling (or failed); the
+    // effective setting stays the previous one meanwhile. Empty when nothing is pending.
+    std::string m_denoiserPreparation;
+    std::string m_sharcPreparation;
+    PathTraceLibraryNeeds GetPathTraceLibraryNeeds(RendererLightingMode mode, PathTraceDenoiserMode denoiser,
+        bool sharc) const;
+    // Polls the worker for every library of the configuration that is not prepared yet, never blocking. Failed
+    // outranks Compiling, which outranks Queued, which outranks Ready; an optional twin's failure counts as Ready.
+    ShaderLibraryPreparation PrepareDxrLibraries(const PathTraceLibraryNeeds& needs);
+    // The same preparation for every lighting mode a frame may record (the requested one and, while it prepares,
+    // the active one); Legacy needs none.
+    ShaderLibraryPreparation PrepareDxrLibraries(RendererLightingMode requestedMode, PathTraceDenoiserMode denoiser,
+        bool sharc);
+    // The effective denoiser and SHARC for this frame: the request once its libraries are prepared, otherwise the
+    // previous effective setting.
+    PathTraceDenoiserMode GateDenoiserRequest(RendererLightingMode requestedMode, PathTraceDenoiserMode requested);
+    bool GateSharcRequest(RendererLightingMode requestedMode, PathTraceDenoiserMode denoiser, bool requested);
+    // ER.1 Phase 3.1: inactive NRD resources retained for fast switching, evicted under video-memory pressure. A
+    // group is evicted only when it is inactive, its last submitted use has completed and no unsubmitted or uncertain
+    // recording referenced it; the eviction never waits for the GPU.
+    enum class NrdRetentionGroup
+    {
+        // RELAX instance, its preparation pass and the raw diffuse hit distance producer.
+        Relax,
+        // Path-traced REBLUR instance and its preparation textures.
+        PathTraceReblur,
+        // Legacy reflection and GI REBLUR pair.
+        Legacy,
+        Count
+    };
+
+    struct NrdRetentionState
+    {
+        // Set while recording a frame that may reference the group; resolved by that frame's submission.
+        bool usedThisRecording = false;
+        // A recording that referenced the group was not confirmed submitted: never evicted without a drain.
+        bool submissionUncertain = false;
+        std::uint64_t lastUseFence = 0;
+        // Least-recently-used order (render frame serial of the last frame the group was active).
+        std::uint64_t lastActiveFrame = 0;
+        std::uint64_t evictions = 0;
+        // Evictions postponed because the last use had not completed yet.
+        std::uint64_t deferrals = 0;
+    };
+
+    struct NrdRetentionStatus
+    {
+        bool budgetAvailable = false;
+        bool underPressure = false;
+        std::uint64_t budgetBytes = 0;
+        std::uint64_t usageBytes = 0;
+    };
+
+    // Enter pressure below 10% local-budget headroom, leave it above 20% (hysteresis).
+    static constexpr double NrdRetentionEvictHeadroom = 0.10;
+    static constexpr double NrdRetentionResumeHeadroom = 0.20;
+    std::array<NrdRetentionState, static_cast<size_t>(NrdRetentionGroup::Count)> m_nrdRetention{};
+    NrdRetentionStatus m_nrdRetentionStatus;
+    IDXGIAdapter3* m_videoMemoryAdapter = nullptr;
+    bool m_videoMemoryAdapterQueried = false;
+    std::uint64_t m_nrdRetentionFrame = 0;
+    // Diagnostics only: replaces the DXGI headroom fraction (negative: use DXGI).
+    double m_nrdRetentionHeadroomOverride = -1.0;
+    // Diagnostics only: behave as if DXGI reported no budget (the one-inactive-group fallback).
+    bool m_nrdRetentionBudgetUnavailableForTesting = false;
+    bool IsNrdRetentionGroupAllocated(NrdRetentionGroup group) const;
+    bool IsNrdRetentionGroupActive(NrdRetentionGroup group, bool runPathTrace) const;
+    // Marks this recording's active groups, then evicts at most one inactive group if the policy asks for it.
+    void UpdateNrdRetention(bool runPathTrace);
+    // After a confirmed submission: the active groups' last use is that submission's fence.
+    void CommitNrdRetentionSubmission();
+    bool EvictNrdRetentionGroup(NrdRetentionGroup group);
+    bool QueryVideoMemoryHeadroom(double& headroom);
     // Records one progressive iteration (or holds a converged image) and presents it as scene colour.
     // projection is the frame's rendering projection (jittered when UPSCALING.2B jitter is active): every G-buffer
     // reconstruction uses it. cameraProjection is the unjittered one and identifies the camera in the accumulation key.
@@ -1916,6 +2068,15 @@ class Renderer
     // settings) and records nothing when any of it fails; only a recorded dispatch is committed at submission.
     bool EnsureNrdRelaxDenoiser();
     void ReleaseNrdRelaxDenoiser();
+    // NRD RELAX R.9B diagnostics: records the confidence probes and filter for this frame (signal views 4 and 5).
+    void RecordNrdConfidenceProbes(
+        ID3D12GraphicsCommandList* commandList,
+        const PathTraceReferenceConstants& constants,
+        const FrameLighting& frameLighting,
+        const PathTraceReferenceSettings& settings,
+        PathTracePrimary primary,
+        D3D12_GPU_VIRTUAL_ADDRESS sceneLightConstants,
+        D3D12_GPU_VIRTUAL_ADDRESS rtxdiConstants);
     // Waits for the GPU, then releases the diagnostic resolved texture alone (the selected RELAX keeps its instance).
     void ReleaseNrdRelaxDiagnosticTexture();
     void ReportNrdRelaxUnavailable(const std::string& reason);
@@ -1990,6 +2151,7 @@ class Renderer
     ShaderLibrary m_shaderLibrary;
 
     DebugUI m_debugUI;
+    PathTraceSampleDiagnostic m_pathTraceSampleDiagnostic;
 
     unsigned int m_applicationWidth = 0;
     unsigned int m_applicationHeight = 0;
@@ -2157,6 +2319,7 @@ class Renderer
     bool m_hasPreviousNrdCamera = false;
 
     Vector3 m_previousShadowLightDirection{};
+    float m_previousShadowLightAngularRadius = 0.0f;
 
     bool m_hasPreviousShadowLightDirection = false;
 

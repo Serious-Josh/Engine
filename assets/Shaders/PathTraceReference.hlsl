@@ -108,7 +108,17 @@ cbuffer PathTraceConstants : register(b0)
     // layout, which the trailing bytes of PathTraceReferenceConstants extend.
     uint rawDiffuseHitDistanceIndex;
     uint3 rawDiffuseHitDistancePadding;
+#else
+    uint4 sampleDiagnosticReservedRawDistance;
 #endif
+    uint sampleDiagnosticIndex;
+    uint2 sampleDiagnosticPixel;
+    float sampleDiagnosticThreshold;
+    uint sampleDiagnosticFrame;
+    uint sampleDiagnosticTarget;
+    // R.9I.1D automatic capture bucket buffer (UINT_MAX disables) and its detection threshold.
+    uint sampleAutoIndex;
+    float sampleAutoThreshold;
 };
 
 cbuffer SceneLightConstants : register(b1)
@@ -182,6 +192,7 @@ RWTexture2D<uint> statisticsTexture : register(u2);
 static const uint PATH_TRACE_MISS_RADIANCE = 0u;
 static const uint PATH_TRACE_MISS_VISIBILITY = 1u;
 static const float PATH_TRACE_HALF_MAXIMUM = 65504.0f;
+#include "PathTraceSampleDiagnostic.hlsli"
 
 // -----------------------------------------------------------------------------
 // Random numbers: PCG32, seeded per pixel and per global sample index.
@@ -339,7 +350,8 @@ bool PathTraceVisible(float3 position, float3 geometricNormal, float3 direction,
     ray.TMax = distance >= PATH_TRACE_DISTANT_LIGHT_DISTANCE ? PATH_TRACE_DISTANT_LIGHT_DISTANCE :
         distance * (1.0f - 1.0e-4f);
 
-#if defined(PATH_TRACE_SECONDARY_SHADOW_RAY_QUERY) && !defined(PATH_TRACE_RESTIR_DI_LIBRARY) && !defined(PATH_TRACE_RADIANCE_CACHE_TRAINING)
+#if (defined(PATH_TRACE_PRIMARY_DI_SHADOW_RAY_QUERY) && defined(PATH_TRACE_RESTIR_DI_LIBRARY)) || \
+    (defined(PATH_TRACE_SECONDARY_SHADOW_RAY_QUERY) && !defined(PATH_TRACE_RESTIR_DI_LIBRARY) && !defined(PATH_TRACE_RADIANCE_CACHE_TRAINING))
     RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> query;
     query.TraceRayInline(scene, RAY_FLAG_NONE, 0xFF, ray);
     while(query.Proceed())
@@ -515,6 +527,7 @@ float3 PathTraceShadeLightSampleLobes(PathTraceSurface surface, float3 position,
         return float3(0.0f, 0.0f, 0.0f);
     }
 
+    if(g_sampleDiagnostic) PathTraceDiagnosticLight(surface, lightSample, value, diffuseValue, cosine, weight);
     diffuseRadiance = diffuseValue * cosine * lightSample.radiance * weight;
     return value * weight;
 }
@@ -541,6 +554,7 @@ float3 PathTraceDirectLightingLobes(PathTraceSurface surface, float3 position, i
 
     if(PathTraceSunHasEnergy(sun))
     {
+        if(g_sampleDiagnostic) { g_sampleLight = 0xFFFFFFFEu; g_sampleLightType = 3u; }
         radiance += PathTraceShadeLightSampleLobes(surface, position, PathTraceSampleSun(sun, sunRandom), rayCount,
             sampleDiffuse);
         diffuseRadiance += sampleDiffuse;
@@ -550,6 +564,7 @@ float3 PathTraceDirectLightingLobes(PathTraceSurface surface, float3 position, i
 
     for(uint lightIndex = 0u; lightIndex < lightCount; ++lightIndex)
     {
+        if(g_sampleDiagnostic) { g_sampleLight = lightIndex; g_sampleLightType = sceneLights[lightIndex].type; }
         PathTraceLightSample lightSample = PathTraceSampleTableLight(sceneLights[lightIndex], position);
         radiance += PathTraceShadeLightSampleLobes(surface, position, lightSample, rayCount, sampleDiffuse);
         diffuseRadiance += sampleDiffuse;
@@ -559,6 +574,7 @@ float3 PathTraceDirectLightingLobes(PathTraceSurface surface, float3 position, i
 
     if(PathTraceEnvironmentSamplingEnabled(environment))
     {
+        if(g_sampleDiagnostic) { g_sampleLight = 0xFFFFFFFDu; g_sampleLightType = 4u; }
         PathTraceLightSample environmentSample = PathTraceSampleEnvironment(environment, environmentSampler,
             environmentRandom);
         radiance += PathTraceShadeLightSampleLobes(surface, position, environmentSample, rayCount, sampleDiffuse);
@@ -984,6 +1000,12 @@ float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex 
     // traced so distant lights reached by BSDF sampling pair with that vertex's light samples.
     for(uint vertex = 0u; vertex <= maxPathDepth; ++vertex)
     {
+        if(g_sampleDiagnostic)
+        {
+            g_sampleVertex = vertex;
+            g_sampleThroughput = throughput;
+            g_samplePreviousPdf = previousPdf;
+        }
         float3 position;
         PathTraceSurface surface;
 
@@ -1013,8 +1035,10 @@ float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex 
             {
                 if(rasterFirstVertex.state == 0)
                 {
-                    radiance += throughput * PathTraceMissRadiance(rasterFirstVertex.backgroundDirection, previousDelta,
+                    float3 background = PathTraceMissRadiance(rasterFirstVertex.backgroundDirection, previousDelta,
                         previousPdf);
+                    radiance += throughput * background;
+                    if(g_sampleDiagnostic) PathTraceDiagnosticMiss(vertex, throughput * background);
                     break;
                 }
 
@@ -1028,6 +1052,8 @@ float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex 
             }
             else
             {
+                if(g_sampleDiagnostic && vertex == 1u) g_sampleRecord.hit.x = payload.hitDistance;
+                if(g_sampleDiagnostic) g_sampleMaterial = payload.materialIndex;
                 // The camera primaries' hit handling, unchanged.
                 ++rayCount;
 
@@ -1055,6 +1081,7 @@ float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex 
                     {
                         float3 missRadiance = PathTraceMissRadiance(ray.Direction, previousDelta, previousPdf);
                         radiance += throughput * missRadiance;
+                        if(g_sampleDiagnostic) PathTraceDiagnosticMiss(vertex, throughput * missRadiance);
                         PATH_TRACE_RADIANCE_CACHE_HARVEST(PathTraceRadianceCacheHarvestMiss(harvest, vertex, missRadiance));
 
                         if(extract)
@@ -1103,10 +1130,14 @@ float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex 
             TraceRay(scene, RAY_FLAG_NONE, 0xFF, 0, 1, PATH_TRACE_MISS_RADIANCE, ray, payload);
 #endif
             ++rayCount;
+            if(g_sampleDiagnostic && vertex == 1u) g_sampleRecord.hit.x = payload.hitDistance;
+            if(g_sampleDiagnostic) g_sampleMaterial = payload.materialIndex;
 
             if(payload.hitDistance < 0.0f)
             {
-                radiance += throughput * PathTraceMissRadiance(ray.Direction, previousDelta, previousPdf);
+                float3 missRadiance = PathTraceMissRadiance(ray.Direction, previousDelta, previousPdf);
+                radiance += throughput * missRadiance;
+                if(g_sampleDiagnostic) PathTraceDiagnosticMiss(vertex, throughput * missRadiance);
                 break;
             }
 
@@ -1146,6 +1177,7 @@ float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex 
             }
 
             radiance += throughput * direct;
+            if(g_sampleDiagnostic) PathTraceDiagnosticDirect(throughput * direct);
             PATH_TRACE_RADIANCE_CACHE_HARVEST(PathTraceRadianceCacheHarvestDirect(harvest, vertex, direct));
 
             // Vertex 0's direct light is split per lobe; later vertices' is carried by the diffuse throughput.
@@ -1372,8 +1404,18 @@ void PathTraceRunRayGeneration(uint primary, bool extract)
             diffuseNormalization = PathTraceExtractionDiffuseNormalization(rasterFirstVertex.position);
         }
 
+        g_sampleManual = sampleDiagnosticIndex != 0xFFFFFFFFu && all(pixel == sampleDiagnosticPixel);
+        g_sampleDiagnostic = g_sampleManual || sampleAutoIndex != 0xFFFFFFFFu;
+        g_samplePixel = pixel;
         for(uint sampleOffset = 0u; sampleOffset < samplesPerFrame; ++sampleOffset)
         {
+            if(g_sampleDiagnostic)
+            {
+                g_sampleRecord = (PathTraceSampleRecord)0;
+                g_sampleRecord.info = 0xFFFFFFFFu;
+                g_sampleRecord.hit.x = -1.0f;
+                g_sampleMaterial = 0xFFFFFFFFu;
+            }
             PathTraceRandom random = PathTraceCreateRandom(pixel, accumulatedSamples + sampleOffset);
 
             if(primary == PATH_TRACE_PRIMARY_RASTER_SPLIT_INDIRECT)
@@ -1382,9 +1424,17 @@ void PathTraceRunRayGeneration(uint primary, bool extract)
             }
 
             PathTraceExtraction extraction = PathTraceEmptyExtraction();
+#if defined(PATH_TRACE_RADIANCE_CACHE_RENDER) && PATH_TRACE_SHARC_SPATIAL_DIAGNOSTIC != 0
+            PathTraceSharcDiagnosticBeginSample();
+#endif
             float3 sampleRadiance = PathTracePrimaryRadiance(primary, pixel, rasterFirstVertex, random, rayCount, extract,
                 extraction);
+#if defined(PATH_TRACE_RADIANCE_CACHE_RENDER) && PATH_TRACE_SHARC_SPATIAL_DIAGNOSTIC != 0
+            g_pathTraceSharcDiagnosticSum += g_pathTraceSharcDiagnosticSample;
+#endif
 
+            if(g_sampleDiagnostic) PathTraceDiagnosticStore(sampleOffset, sampleRadiance,
+                !all(isfinite(sampleRadiance)) || any(sampleRadiance < 0.0f));
             // A non-finite estimate is a defect, never silently averaged; it is counted and dropped.
             if(!all(isfinite(sampleRadiance)) || any(sampleRadiance < 0.0f))
             {
@@ -1431,6 +1481,7 @@ void PathTraceRunRayGeneration(uint primary, bool extract)
             mean += accumulationTexture[pixel].rgb * (previousCount / totalCount);
         }
 
+        if(g_sampleDiagnostic) PathTraceDiagnosticMean(mean);
         accumulationTexture[pixel] = float4(mean, 1.0f);
         outputTexture[pixel] = float4(min(mean, PATH_TRACE_HALF_MAXIMUM), 1.0f);
 
@@ -1487,6 +1538,18 @@ void PathTraceRunRayGeneration(uint primary, bool extract)
             specularOutput[pixel] = float4(clamp(specularMean, -PATH_TRACE_HALF_MAXIMUM, PATH_TRACE_HALF_MAXIMUM),
                 min(hitDistance, PATH_TRACE_HALF_MAXIMUM));
         }
+
+#if defined(PATH_TRACE_RADIANCE_CACHE_RENDER) && PATH_TRACE_SHARC_SPATIAL_DIAGNOSTIC != 0
+        // Display only: leave the production accumulation and extracted signals above unchanged.
+        float3 diagnostic = g_pathTraceSharcDiagnosticSum / float(max(samplesPerFrame, 1u));
+#if PATH_TRACE_SHARC_SPATIAL_DIAGNOSTIC == 3
+        // Fixed visualization of the frame-mean cached RGB: c/(1+c), then sRGB. Never physical illumination.
+        diagnostic = diagnostic / (1.0f + diagnostic);
+        diagnostic = select(diagnostic <= 0.0031308f, diagnostic * 12.92f,
+            1.055f * pow(diagnostic, 1.0f / 2.4f) - 0.055f);
+#endif
+        outputTexture[pixel] = float4(diagnostic, 1.0f);
+#endif
     }
 
     // One atomic per wave keeps instrumentation cheap relative to the traced work.

@@ -16,27 +16,45 @@ std::optional<SceneObjectMetadata> Editor::ResolveComponentEditTarget(IDemoScene
 {
     auto* owner = dynamic_cast<FileBackedDemoScene*>(&scene);
 
-    if(!owner || owner->IsArchiveActivation() || !m_workspace.InspectorVisible() ||
-        m_inspectorTarget != InspectorTarget::SceneObject || !m_objectInspectionIdentity ||
-        IsPhysicsEditingLocked() || HasPendingSceneHistoryOperation() || m_sceneOperationPending ||
-        HasBlockingObjectCreation() || m_sceneObjectDeletionPending || m_sceneObjectDeletionRequest ||
-        m_meshCreationRequest || m_primitiveCreationRequest || m_emptyObjectCreationRequest || m_fileRequest ||
-        m_materialAssignmentRequest || !m_historySession || !RenameSessionMatches(scene, *m_historySession))
+    if(!ComponentEditAllowed(scene))
     {
         return std::nullopt;
     }
 
     const auto selection = owner->GetObjectMetadata(m_selectedObject);
-    const auto& identity = *m_objectInspectionIdentity;
+    return selection && MatchesComponentEditIdentity(scene, *selection) ? selection : std::nullopt;
+}
 
-    if(!selection || identity.scene != &scene.GetScene() ||
-        identity.revision != selection->structureRevision || identity.runtimeIdentity != selection->runtimeIdentity ||
-        identity.sceneID != selection->sceneID || identity.objectID != selection->objectID)
+// Pre-widget checks only: `current` must be this frame's read of m_selectedObject with no edit since.
+std::optional<SceneObjectMetadata> Editor::ResolveComponentEditTarget(IDemoScene& scene,
+    const SceneObjectMetadata& current)
+{
+    if(!ComponentEditAllowed(scene) || !MatchesComponentEditIdentity(scene, current))
     {
         return std::nullopt;
     }
 
-    return selection;
+    return current;
+}
+
+bool Editor::MatchesComponentEditIdentity(IDemoScene& scene, const SceneObjectMetadata& current) const
+{
+    const auto& identity = *m_objectInspectionIdentity;
+    return identity.scene == &scene.GetScene() && identity.revision == current.structureRevision &&
+        identity.runtimeIdentity == current.runtimeIdentity && identity.sceneID == current.sceneID &&
+        identity.objectID == current.objectID;
+}
+
+bool Editor::ComponentEditAllowed(IDemoScene& scene)
+{
+    auto* owner = dynamic_cast<FileBackedDemoScene*>(&scene);
+
+    return owner && !owner->IsArchiveActivation() && m_workspace.InspectorVisible() &&
+        m_inspectorTarget == InspectorTarget::SceneObject && m_objectInspectionIdentity &&
+        !IsPhysicsEditingLocked() && !HasPendingSceneHistoryOperation() && !m_sceneOperationPending &&
+        !HasBlockingObjectCreation() && !m_sceneObjectDeletionPending && !m_sceneObjectDeletionRequest &&
+        !m_meshCreationRequest && !m_primitiveCreationRequest && !m_emptyObjectCreationRequest && !m_fileRequest &&
+        !m_materialAssignmentRequest && m_historySession && RenameSessionMatches(scene, *m_historySession);
 }
 
 void Editor::CloseComponentPopup(ImGuiID popupID)
@@ -155,16 +173,16 @@ void Editor::DrawAddComponentControls(IDemoScene& scene)
         return;
     }
 
-    const auto selection = owner->GetObjectMetadata(m_selectedObject);
+    std::optional<SceneObjectMetadata> selection(std::in_place);
     SceneObjectDocument object;
 
-    if(!selection || !owner->CaptureTriggerColliderInspection(selection->objectID, object))
+    if(!owner->InspectSelectedObject(m_selectedObject, *selection, object))
     {
         DismissAddComponentPopup();
         return;
     }
 
-    const bool blocked = !ResolveComponentEditTarget(scene);
+    const bool blocked = !ResolveComponentEditTarget(scene, *selection);
     ImGui::PushID("GenericOptionals");
     ImGui::Spacing();
 
@@ -416,10 +434,10 @@ void Editor::DrawObjectTriggerColliderControls(IDemoScene& scene)
         return;
     }
 
-    const auto selection = owner->GetObjectMetadata(m_selectedObject);
+    std::optional<SceneObjectMetadata> selection(std::in_place);
     SceneObjectDocument object;
 
-    if(!selection || !owner->CaptureTriggerColliderInspection(selection->objectID, object))
+    if(!owner->InspectSelectedObject(m_selectedObject, *selection, object))
     {
         return;
     }
@@ -488,7 +506,7 @@ void Editor::DrawObjectTriggerColliderControls(IDemoScene& scene)
         m_triggerInspection->objectID != selection->objectID ||
         m_triggerInspection->runtimeIdentity != selection->runtimeIdentity ||
         m_triggerInspection->structureRevision != selection->structureRevision;
-    const bool blocked = !ResolveComponentEditTarget(scene);
+    const bool blocked = !ResolveComponentEditTarget(scene, *selection);
 
     if(changedTarget || m_triggerInspectedValue != object.triggerCollider || blocked)
     {

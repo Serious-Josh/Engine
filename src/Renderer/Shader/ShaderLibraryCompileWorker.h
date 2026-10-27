@@ -22,6 +22,8 @@ struct ShaderLibraryCompileRequest
     std::filesystem::path libraryPath;
     // The resolved source file DXC reads (the shader root joined with libraryPath).
     std::filesystem::path sourcePath;
+    // The shader root (ShaderLibraryCompileDescription::includeDirectory).
+    std::filesystem::path includeDirectory;
 };
 
 struct ShaderLibraryCompileOutcome
@@ -51,6 +53,8 @@ enum class ShaderLibraryPreparationState
     Ready,
     Queued,
     Compiling,
+    // ER.1 Phase 4: every library is ready; the DXR pipelines built from them are being created in the background.
+    PreparingPipelines,
     // The current sources fail to compile; retried only once they change.
     Failed
 };

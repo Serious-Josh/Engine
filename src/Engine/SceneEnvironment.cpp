@@ -32,6 +32,8 @@ bool Engine::ApplySceneEnvironment(std::string& error)
         auto* scene=dynamic_cast<FileBackedDemoScene*>(m_demoSceneManager.TryGetActiveScene());
         if(!scene) return true;
         const auto& reference=scene->GetScene().GetEnvironmentReference();
+        if(reference == SceneDocument::NoneEnvironmentReference)
+            return m_renderer.SetEnvironmentImage(nullptr,reference,"None",reference);
         if(scene->IsArchiveActivation())
         {
             const auto source=scene->ArchiveSource(); const auto identity=CookedEnvironment::ArchiveIdentity(*source);
@@ -55,6 +57,8 @@ bool Engine::AssignSceneEnvironment(size_t index,std::string& error)
             if(index>=entries.size()) { error="Invalid HDRI selection."; return false; }
             const auto selected=entries[index];
             if(!selected.relativePath.empty()) return m_renderer.SetEnvironment(index);
+            if(selected.reference == SceneDocument::NoneEnvironmentReference)
+                return m_renderer.SetEnvironmentImage(nullptr,selected.reference,"None",selected.reference);
             if(selected.reference.empty()) return m_renderer.SetEnvironmentImage(nullptr,"neutral","Neutral");
             return LoadProjectEnvironment(m_renderer,GetActiveProject().GetRoot(),m_projectAssetRegistry,selected.reference);
         }

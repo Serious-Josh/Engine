@@ -381,7 +381,7 @@ bool CommitPreparedMetadataScene(const PreparedMetadataScene& prepared, Scene& s
 
     camera.SetNearPlane(source.nearPlane);
     camera.SetFarPlane(source.farPlane);
-    scene.GetDirectionalLight() = prepared.document.directionalLight;
+    scene.SetLightingSettings(prepared.document.lightingSettings);
     scene.SetEnvironmentReference(std::move(environment));
 
     newMapping.structureRevision = scene.GetStructureRevision();

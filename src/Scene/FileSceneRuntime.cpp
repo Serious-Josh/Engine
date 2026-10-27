@@ -9,6 +9,7 @@
 #include <atomic>
 #include <type_traits>
 #include <algorithm>
+#include <cmath>
 #include <cctype>
 #include <unordered_map>
 #include <limits>
@@ -1570,7 +1571,7 @@ std::unique_ptr<FileSceneRuntime> FileSceneRuntime::PrepareObjectCreation(
     PreparedScene prepared;
     prepared.environmentReference = document.environmentReference;
     prepared.camera = document.camera;
-    prepared.directionalLight = document.directionalLight;
+    prepared.lightingSettings = document.lightingSettings;
     prepared.objects.reserve(document.objects.size());
 
     for(const auto& object : m_fileScene.GetDocument().objects)
@@ -1668,7 +1669,7 @@ std::unique_ptr<FileSceneRuntime> FileSceneRuntime::PrepareObjectDeletion(
     PreparedScene prepared;
     prepared.environmentReference = document.environmentReference;
     prepared.camera = document.camera;
-    prepared.directionalLight = document.directionalLight;
+    prepared.lightingSettings = document.lightingSettings;
     prepared.objects.reserve(document.objects.size());
 
     for(const auto& object : document.objects)
@@ -1785,7 +1786,7 @@ std::unique_ptr<FileSceneRuntime> FileSceneRuntime::PrepareObjectRestoration(Sce
     PreparedScene prepared;
     prepared.environmentReference = document.environmentReference;
     prepared.camera = document.camera;
-    prepared.directionalLight = document.directionalLight;
+    prepared.lightingSettings = document.lightingSettings;
     prepared.objects.reserve(document.objects.size());
 
     for(const auto& object : document.objects)
@@ -1861,6 +1862,186 @@ bool FileSceneRuntime::CaptureObjectDeletionSnapshot(std::string_view objectID,
 
     documentIndex = static_cast<size_t>(found - captured.objects.begin());
     object = *found;
+    return true;
+}
+
+namespace
+{
+    // Of ValidateSceneObjectComponents, only the Character Controller rule reads the transform.
+    bool InspectionRuntimeTransformValid(const SceneObjectDocument& entry, const Transform& transform)
+    {
+        const auto finite = [](const Vector3& value)
+        {
+            return std::isfinite(value.x) && std::isfinite(value.y) && std::isfinite(value.z);
+        };
+
+        return finite(transform.position) && finite(transform.rotation) && finite(transform.scale) &&
+            (!entry.characterController ||
+                Physics::ValidateCharacterControllerTransform(*entry.characterController, transform));
+    }
+
+    // The scene-level fields CaptureSceneDocument substitutes from the runtime, validated without the objects.
+    bool InspectionRuntimeHeaderValid(const SceneDocument& source, const Scene& scene)
+    {
+        SceneDocument header;
+        header.schemaVersion = source.schemaVersion;
+        header.id = source.id;
+        header.environmentReference = scene.GetEnvironmentReference();
+        header.camera = source.camera;
+        const Camera& camera = scene.GetCamera();
+        header.camera.position = camera.GetPosition();
+        header.camera.target = camera.GetTarget();
+        header.camera.verticalFov = camera.GetVerticalFov();
+        header.camera.nearPlane = camera.GetNearPlane();
+        header.camera.farPlane = camera.GetFarPlane();
+        header.lightingSettings = scene.GetLightingSettings();
+        return ValidateSceneDocument(header);
+    }
+}
+
+bool FileSceneRuntime::CaptureObjectInspection(std::string_view objectID, SceneObjectDocument& object) const
+{
+    if(!m_fileScene.HasDocument())
+    {
+        return false;
+    }
+
+    const SceneDocument& source = m_fileScene.GetDocument();
+
+    // Connected branches validate their transforms against the runtime transforms as a forest; keep the full capture.
+    if(std::any_of(source.objects.begin(), source.objects.end(),
+        [](const SceneObjectDocument& entry) { return !entry.parentID.empty(); }))
+    {
+        size_t documentIndex = 0;
+        return CaptureObjectDeletionSnapshot(objectID, object, documentIndex);
+    }
+
+    // CaptureSceneDocument's checks in its order. Its second validation sees the source with the runtime environment,
+    // camera, light and transforms in place; every other field is the source's, already validated here.
+    const auto& objects = m_scene.GetRenderObjects();
+    const auto& mapping = m_objectMapping;
+
+    if(!ValidateSceneDocument(source) || mapping.scene != &m_scene ||
+        mapping.structureRevision != m_scene.GetStructureRevision() || objects.size() != source.objects.size() ||
+        mapping.idToRuntimeIndex.size() != objects.size() || mapping.committedObjects.size() != objects.size())
+    {
+        return false;
+    }
+
+    std::vector<bool> visited(objects.size(), false);
+    const SceneObjectDocument* inspected = nullptr;
+    size_t inspectedIndex = 0;
+
+    for(const SceneObjectDocument& entry : source.objects)
+    {
+        const auto found = mapping.idToRuntimeIndex.find(entry.id);
+
+        if(found == mapping.idToRuntimeIndex.end() || found->second >= objects.size() || visited[found->second])
+        {
+            return false;
+        }
+
+        const size_t index = found->second;
+        visited[index] = true;
+
+        if(!MatchesCommittedSceneObjectBindings(entry, objects[index], mapping.committedObjects[index]) ||
+            !InspectionRuntimeTransformValid(entry, objects[index].transform))
+        {
+            return false;
+        }
+
+        if(!inspected && entry.id == objectID)
+        {
+            inspected = &entry;
+            inspectedIndex = index;
+        }
+    }
+
+    if(!inspected || !InspectionRuntimeHeaderValid(source, m_scene))
+    {
+        return false;
+    }
+
+    object = *inspected;
+    object.transform = objects[inspectedIndex].transform;
+    return true;
+}
+
+bool FileSceneRuntime::InspectSelectedObject(RenderObjectID runtimeIndex, SceneObjectMetadata& metadata,
+    SceneObjectDocument& object) const
+{
+    if(!m_fileScene.HasDocument())
+    {
+        return false;
+    }
+
+    const SceneDocument& source = m_fileScene.GetDocument();
+
+    // Archive and hierarchy documents carry checks the flat pass below does not repeat; compose the two reads.
+    if(m_archiveScene || std::any_of(source.objects.begin(), source.objects.end(),
+        [](const SceneObjectDocument& entry) { return !entry.parentID.empty(); }))
+    {
+        const auto current = GetObjectMetadata(runtimeIndex);
+
+        if(!current || !CaptureObjectInspection(current->objectID, object))
+        {
+            return false;
+        }
+
+        metadata = *current;
+        return true;
+    }
+
+    // GetObjectMetadata's checks, then CaptureObjectInspection's runtime checks, sharing one document validation and
+    // one mapping/binding traversal. Both reads validate the same document, mapping and bindings.
+    const auto& objects = m_scene.GetRenderObjects();
+    const auto& mapping = m_objectMapping;
+
+    if(mapping.scene != &m_scene || mapping.structureRevision != m_scene.GetStructureRevision() ||
+        runtimeIndex >= objects.size() || source.objects.size() != objects.size() ||
+        mapping.idToRuntimeIndex.size() != objects.size() || mapping.committedObjects.size() != objects.size() ||
+        mapping.bindingRevisions.size() != objects.size() || !ValidateSceneDocument(source))
+    {
+        return false;
+    }
+
+    std::vector<bool> visited(objects.size(), false);
+    const SceneObjectDocument* selected = nullptr;
+
+    for(const SceneObjectDocument& entry : source.objects)
+    {
+        const auto found = mapping.idToRuntimeIndex.find(entry.id);
+
+        if(found == mapping.idToRuntimeIndex.end() || found->second >= objects.size() || visited[found->second])
+        {
+            return false;
+        }
+
+        const size_t index = found->second;
+        visited[index] = true;
+
+        if(!MatchesCommittedSceneObjectBindings(entry, objects[index], mapping.committedObjects[index]) ||
+            !InspectionRuntimeTransformValid(entry, objects[index].transform))
+        {
+            return false;
+        }
+
+        if(index == runtimeIndex)
+        {
+            selected = &entry;
+        }
+    }
+
+    if(!selected || !InspectionRuntimeHeaderValid(source, m_scene))
+    {
+        return false;
+    }
+
+    metadata = SceneObjectMetadata{selected->name, selected->meshReference, selected->materialReference,
+        selected->id, source.id, runtimeIndex, m_instanceIdentity, mapping.structureRevision,
+        selected->materialSlotBindings, mapping.bindingRevisions[runtimeIndex]};
+    object = *selected;
+    object.transform = objects[runtimeIndex].transform;
     return true;
 }
 

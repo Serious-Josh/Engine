@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Renderer/RendererStatistics.h"
+#include "Renderer/PathTraceSampleDiagnostic.h"
 #include "Renderer/Passes/PathTraceSpatialPass.h"
 #include "Renderer/Passes/ToneMapPass.h"
 #include "Renderer/RendererLightingMode.h"
@@ -137,6 +138,8 @@ class DebugUI
         }
     }
 
+    PathTraceSampleDiagnosticSettings GetPathTraceSampleDiagnosticSettings() const { return m_sampleDiagnosticSettings; }
+    void SetPathTraceSampleDiagnosticStatus(const PathTraceSampleDiagnosticStatus& value) { m_sampleDiagnosticStatus = value; }
     PathTraceReferenceSettings GetPathTraceReferenceSettings() const;
 
     // SHARC.4E experimental cached-radiance rendering (the raster-primary path-traced modes), and its last statistics.
@@ -205,6 +208,12 @@ class DebugUI
         m_pathTraceNrdStatus = status;
     }
 
+    // ER.1 Phase 2: why the selected denoiser is not active yet (its libraries compile or failed); empty otherwise.
+    void SetPathTraceDenoiserPreparation(const std::string& status)
+    {
+        m_pathTraceDenoiserPreparation = status;
+    }
+
     void SetPathTraceCameraJitterReadout(bool active, std::uint32_t phase, std::uint32_t phaseCount, float x, float y)
     {
         m_pathTraceCameraJitterActive = active;
@@ -227,6 +236,13 @@ class DebugUI
         m_secondaryShadowReady = ready;
         m_secondaryShadowActive = active;
         m_visibilityTimingEpoch = epoch;
+    }
+
+    void SetPrimaryDiShadowVisibilityStatus(bool ready, bool active, bool failed)
+    {
+        m_primaryDiShadowReady = ready;
+        m_primaryDiShadowActive = active;
+        m_primaryDiShadowFailed = failed;
     }
 
     void SetPathTraceRasterPrimaryStatus(PathTraceRasterPrimaryAvailability availability, const std::string& reason);
@@ -260,6 +276,11 @@ class DebugUI
 
     void DrawFramePacingSpikes();
     void DrawPathTraceReferenceSettings();
+    void DrawPathTraceSampleDiagnostic();
+    void DrawPathTraceAutoCapture();
+    std::string BuildPathTraceAutoCaptureReport() const;
+    PathTraceSampleDiagnosticSettings m_sampleDiagnosticSettings;
+    PathTraceSampleDiagnosticStatus m_sampleDiagnosticStatus;
     FramePacingMonitor m_framePacingMonitor;
 
     std::array<FramePacingMonitor::Event, 16> m_pausedFramePacingEvents{};
@@ -275,6 +296,10 @@ class DebugUI
     int m_secondaryShadowVisibility = PathTraceReferenceSettings{}.secondaryShadowRayQuery ? 1 : 0;
     bool m_secondaryShadowReady = false;
     bool m_secondaryShadowActive = false;
+    int m_primaryDiShadowVisibility = PathTraceReferenceSettings{}.primaryDiShadowRayQuery ? 1 : 0;
+    bool m_primaryDiShadowReady = false;
+    bool m_primaryDiShadowActive = false;
+    bool m_primaryDiShadowFailed = false;
     std::uint64_t m_visibilityTimingEpoch = 0;
     std::uint64_t m_sampledVisibilityEpoch = UINT64_MAX;
     std::uint64_t m_visibilityWarmupUntil = 0;
@@ -332,6 +357,7 @@ class DebugUI
     // NRD.2: the selector offers Off and Engine only.
     PathTraceDenoiserMode m_pathTraceDenoiserMode = PathTraceDenoiserMode::Engine;
     std::string m_pathTraceNrdStatus;
+    std::string m_pathTraceDenoiserPreparation;
     PathTraceDenoiserStages m_pathTraceDenoiserStages{};
     bool m_pathTraceCameraJitter = false;
     std::string m_dlssState = "Not initialized";

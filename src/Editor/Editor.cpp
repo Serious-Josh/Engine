@@ -1280,7 +1280,9 @@ std::optional<SceneObjectInspectorView> Editor::ResolveObjectInspection(
         return view;
     }
 
+    EditorPhaseTiming::Scope metadataPhase(PhaseTiming(), EditorPhaseTiming::Phase::ObjectViewMetadata);
     const auto metadata = fileScene->GetObjectMetadata(m_selectedObject);
+    metadataPhase.End();
 
     if(!metadata || metadata->runtimeIdentity != m_objectInspectionIdentity->runtimeIdentity ||
        metadata->structureRevision != m_objectInspectionIdentity->revision ||
@@ -1325,8 +1327,10 @@ std::optional<SceneObjectInspectorView> Editor::ResolveObjectInspection(
     {
         view.name += " (active; " + std::to_string(m_selectedObjects.size()) + " selected)";
     }
+    EditorPhaseTiming::Scope assetLabelsPhase(PhaseTiming(), EditorPhaseTiming::Phase::ObjectViewAssetLabels);
     view.mesh = label(metadata->meshReference, AssetType::Mesh);
     view.material = label(metadata->materialReference, AssetType::Material);
+    assetLabelsPhase.End();
     view.meshReference = metadata->meshReference;
     view.meshResidency = metadata->GetMeshResidency(object);
     view.materialSlotMetadataAvailable = object.mesh != nullptr;
@@ -1346,6 +1350,8 @@ std::optional<SceneObjectInspectorView> Editor::ResolveObjectInspection(
     }
 
 
+    EditorPhaseTiming::Scope slotLabelsPhase(PhaseTiming(), EditorPhaseTiming::Phase::ObjectViewSlotLabels);
+
     for(auto& slot : view.materialSlots)
     {
         const auto binding = metadata->materialSlotBindings.find(slot.id);
@@ -1354,6 +1360,7 @@ std::optional<SceneObjectInspectorView> Editor::ResolveObjectInspection(
         slot.materialName = label(slot.materialReference, AssetType::Material);
     }
 
+    slotLabelsPhase.End();
     return view;
 }
 
@@ -1369,6 +1376,14 @@ void Editor::Draw(
     const ProjectAssetRegistry& assetRegistry,
     const std::optional<MaterialPreviewImage>& materialPreview)
 {
+    // Diagnostics only: the phases below end at the next phase's start; Draw ends when the function returns.
+    if(m_phaseTimingEnabled)
+    {
+        m_phaseTiming = {};
+    }
+
+    EditorPhaseTiming::Scope drawPhase(PhaseTiming(), EditorPhaseTiming::Phase::Draw);
+    EditorPhaseTiming::Scope selectionPhase(PhaseTiming(), EditorPhaseTiming::Phase::Selection);
 
     m_hierarchyPanel.SetIcons(debugUI.GetEditorIcons());
     m_assetBrowser.SetIcons(debugUI.GetEditorIcons());
@@ -1418,6 +1433,8 @@ void Editor::Draw(
     }
 
     RefreshSceneSelection(demoScene);
+    selectionPhase.End();
+    EditorPhaseTiming::Scope hierarchyPhase(PhaseTiming(), EditorPhaseTiming::Phase::Hierarchy);
     DrawHierarchy(demoScene, activeSceneName);
     if(m_selectionStructureRevision != scene.GetStructureRevision())
     {
@@ -1427,8 +1444,14 @@ void Editor::Draw(
         m_objectInspectionRequested = true;
     }
 
+    hierarchyPhase.End();
+    EditorPhaseTiming::Scope assetBrowserPhase(PhaseTiming(), EditorPhaseTiming::Phase::AssetBrowser);
     (void)debugUI;
-    m_assetBrowser.SetThumbnailProject(projectPaths, assetRegistry);
+    m_assetBrowser.SetPhaseTiming(PhaseTiming());
+    {
+        EditorPhaseTiming::Scope projectPhase(PhaseTiming(), EditorPhaseTiming::Phase::AssetBrowserProject);
+        m_assetBrowser.SetThumbnailProject(projectPaths, assetRegistry);
+    }
     ImGui::BeginDisabled(IsPhysicsEditingLocked() || m_materialLeaveAction != MaterialLeaveAction::None || m_sceneOperationPending);
 
     if(m_workspace.AssetBrowserVisible())
@@ -1442,6 +1465,8 @@ void Editor::Draw(
     }
 
     ImGui::EndDisabled();
+    assetBrowserPhase.End();
+    EditorPhaseTiming::Scope inspectionPhase(PhaseTiming(), EditorPhaseTiming::Phase::Inspection);
 
     if(const auto scenePath = m_assetBrowser.TakeSceneOpenRequest())
     {
@@ -1483,12 +1508,15 @@ void Editor::Draw(
         }
         else
         {
+            EditorPhaseTiming::Scope activationPhase(PhaseTiming(), EditorPhaseTiming::Phase::InspectionActivation);
             ActivateObjectInspection(demoScene, projectPaths, assetRegistry);
         }
     }
 
+    EditorPhaseTiming::Scope objectViewPhase(PhaseTiming(), EditorPhaseTiming::Phase::InspectionObjectView);
     const auto objectView = m_inspectorTarget == InspectorTarget::SceneObject ?
         ResolveObjectInspection(demoScene, projectPaths, assetRegistry) : std::nullopt;
+    objectViewPhase.End();
 
     if(m_inspectorTarget == InspectorTarget::SceneObject && !objectView)
     {
@@ -1533,6 +1561,9 @@ void Editor::Draw(
         m_inspectorPanel.DismissTexturePicker();
     }
 
+    inspectionPhase.End();
+    EditorPhaseTiming::Scope inspectorPhase(PhaseTiming(), EditorPhaseTiming::Phase::Inspector);
+
     if(m_workspace.InspectorVisible())
     {
         if(objectView)
@@ -1541,16 +1572,36 @@ void Editor::Draw(
             m_characterDriveCandidate.reset();
             m_inspectorPanel.DrawSceneObject(m_workspace.GetInspector(), *objectView, [this, &demoScene]()
             {
+                EditorPhaseTiming::Scope transformPhase(PhaseTiming(), EditorPhaseTiming::Phase::InspectorTransform);
                 DrawSelectedObjectTransformControls(demoScene);
             }, projectPaths, assetRegistry, m_materialAssignmentPending, m_materialAssignmentStatus,
             [this, &demoScene]()
             {
-                DrawObjectPhysicsControls(demoScene);
-                DrawObjectTriggerColliderControls(demoScene);
-                DrawObjectCharacterControllerControls(demoScene);
-                DrawObjectCameraControls(demoScene);
-                DrawObjectLightControls(demoScene);
-                DrawAddComponentControls(demoScene);
+                EditorPhaseTiming::Scope componentsPhase(PhaseTiming(), EditorPhaseTiming::Phase::InspectorComponents);
+                {
+                    EditorPhaseTiming::Scope phase(PhaseTiming(), EditorPhaseTiming::Phase::ComponentPhysics);
+                    DrawObjectPhysicsControls(demoScene);
+                }
+                {
+                    EditorPhaseTiming::Scope phase(PhaseTiming(), EditorPhaseTiming::Phase::ComponentTriggerColliders);
+                    DrawObjectTriggerColliderControls(demoScene);
+                }
+                {
+                    EditorPhaseTiming::Scope phase(PhaseTiming(), EditorPhaseTiming::Phase::ComponentCharacterController);
+                    DrawObjectCharacterControllerControls(demoScene);
+                }
+                {
+                    EditorPhaseTiming::Scope phase(PhaseTiming(), EditorPhaseTiming::Phase::ComponentCamera);
+                    DrawObjectCameraControls(demoScene);
+                }
+                {
+                    EditorPhaseTiming::Scope phase(PhaseTiming(), EditorPhaseTiming::Phase::ComponentLight);
+                    DrawObjectLightControls(demoScene);
+                }
+                {
+                    EditorPhaseTiming::Scope phase(PhaseTiming(), EditorPhaseTiming::Phase::ComponentAdd);
+                    DrawAddComponentControls(demoScene);
+                }
             });
 
             if(!m_materialAssignmentPending && !m_inspectorPanel.GetSlotPickerStatus().empty())
@@ -1595,6 +1646,8 @@ void Editor::Draw(
         m_inspectorPanel.DismissSceneMaterialPicker();
     }
 
+    inspectorPhase.End();
+    EditorPhaseTiming::Scope materialRevisionsPhase(PhaseTiming(), EditorPhaseTiming::Phase::MaterialRevisions);
     ProcessMaterialLocateRequest(projectPaths,assetRegistry);
 
     if(m_inspectorPanel.TakeRefreshRequest() && m_materialLeaveAction == MaterialLeaveAction::None &&
@@ -1646,6 +1699,8 @@ void Editor::Draw(
         m_assetBrowser.InvalidateMaterialSource(*savedSource);
     }
 
+    materialRevisionsPhase.End();
+    EditorPhaseTiming::Scope modalsPhase(PhaseTiming(), EditorPhaseTiming::Phase::ModalsAndViewport);
     m_assetBrowser.DrawRenameModal(IsPhysicsEditingLocked() || m_inspectorPanel.HasUnsavedChanges() ||
         m_materialLeaveAction != MaterialLeaveAction::None || m_sceneOperationPending);
 
@@ -1656,6 +1711,8 @@ void Editor::Draw(
     DrawSceneViewport(sceneTextureHandle, sceneWidth, sceneHeight);
     DrawMeshDropTarget(demoScene, projectPaths, assetRegistry);
     DrawMaterialDropTarget(demoScene, projectPaths, assetRegistry);
+    modalsPhase.End();
+    EditorPhaseTiming::Scope sceneInspectorPhase(PhaseTiming(), EditorPhaseTiming::Phase::SceneInspectorWindow);
 
     const ImGuiIO& io = ImGui::GetIO();
 
@@ -1716,6 +1773,9 @@ void Editor::Draw(
         ImGui::End();
     }
 
+    sceneInspectorPhase.End();
+    EditorPhaseTiming::Scope tailPhase(PhaseTiming(), EditorPhaseTiming::Phase::Tail);
+
     // Projection is driven by the actual render extent, including after Inspector controls.
     scene.GetCamera().SetAspectRatio(static_cast<float>(sceneWidth) / static_cast<float>(sceneHeight));
 
@@ -1725,7 +1785,9 @@ void Editor::Draw(
 
     UpdateCameraLook(demoScene, m_viewportImage.size.x, m_viewportImage.size.y);
     UpdateCameraMovement(demoScene, deltaTime);
+    EditorPhaseTiming::Scope viewportToolsPhase(PhaseTiming(), EditorPhaseTiming::Phase::TailViewportTools);
     DrawViewportTools(demoScene, debugUI.GetEditorIcons(), viewportWasFocused);
+    viewportToolsPhase.End();
     DrawSceneObjectDeletionControls(demoScene);
     UpdateCharacterDriveInput(demoScene);
 }
@@ -1809,29 +1871,23 @@ void Editor::DrawStressTestControls(StressTestScene& demoScene)
 
 void Editor::DrawDirectionalLight(IDemoScene& demoScene)
 {
-    if (!ImGui::CollapsingHeader("Directional Light", ImGuiTreeNodeFlags_DefaultOpen))
+    const char* heading = demoScene.GetScene().UsesObjectLighting() ? "Scene Lighting" : "Directional Light";
+    if (!ImGui::CollapsingHeader(heading, ImGuiTreeNodeFlags_DefaultOpen))
     {
         return;
     }
 
-    DirectionalLight& light = demoScene.GetScene().GetDirectionalLight();
-
-    // LIGHT.1 migration: Directional Light components replace this legacy scene sun entirely.
-    const auto* fileScene = dynamic_cast<const FileBackedDemoScene*>(&demoScene);
-
-    if(fileScene && fileScene->m_runtime->GetFileScene().HasDocument())
+    if(demoScene.GetScene().UsesObjectLighting())
     {
-        const auto& objects = fileScene->m_runtime->GetFileScene().GetDocument().objects;
-        const bool overridden = std::any_of(objects.begin(), objects.end(), [](const SceneObjectDocument& object)
-        {
-            return object.light && object.light->type == LightType::Directional;
-        });
-
-        if(overridden)
-        {
-            ImGui::TextDisabled("Inactive: this scene's Directional Light components replace the legacy sun.");
-        }
+        auto settings = demoScene.GetScene().GetLightingSettings();
+        ImGui::TextUnformatted("Directional lights are edited as objects in the hierarchy.");
+        if(ImGui::InputFloat("Scene Ambient Strength", &settings.ambientStrength) &&
+            std::isfinite(settings.ambientStrength) && settings.ambientStrength >= 0.0f)
+            demoScene.GetScene().SetLightingSettings(settings);
+        ImGui::TextDisabled("Ambient strength is preserved scene data; current shaders do not use it.");
+        return;
     }
+    DirectionalLight& light = demoScene.GetScene().GetDirectionalLight();
 
     ImGui::DragFloat3("Direction", &light.direction.x, 0.01f, -1.0f, 1.0f);
 
@@ -2184,6 +2240,7 @@ void Editor::DrawTransformGizmo(
         return;
     }
 
+    EditorPhaseTiming::Scope gizmoPhase(PhaseTiming(), EditorPhaseTiming::Phase::TailGizmo);
     Scene& scene = demoScene.GetScene();
 
     if (IsPhysicsEditingLocked() || scene.HasPhysicsPresentation())
@@ -4626,10 +4683,10 @@ void Editor::DrawObjectPhysicsControls(IDemoScene& scene)
         return;
     }
 
-    const auto selection = owner->GetObjectMetadata(m_selectedObject);
+    std::optional<SceneObjectMetadata> selection(std::in_place);
     SceneObjectDocument object;
 
-    if(!selection || !owner->CapturePhysicsInspection(selection->objectID, object))
+    if(!owner->InspectSelectedObject(m_selectedObject, *selection, object))
     {
         return;
     }

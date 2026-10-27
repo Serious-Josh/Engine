@@ -1,4 +1,5 @@
 #include "assets/CookedScene.h"
+#include "Scene/LegacyLightingMigration.h"
 #include "assets/CookedEnvironment.h"
 #include "assets/CookedSurface.h"
 #include "Scene/SceneSerializer.h"
@@ -23,7 +24,9 @@ constexpr char TriggerColliderMagic[] = "ENGSCN07";
 constexpr char CharacterControllerMagic[] = "ENGSCN08";
 constexpr char HierarchyMagic[] = "ENGSCN09";
 constexpr char CameraMagic[] = "ENGSCN10";
-constexpr char Magic[] = "ENGSCN11";
+constexpr char LightMagic[] = "ENGSCN11";
+constexpr char EnvironmentNoneMagic[] = "ENGSCN12";
+constexpr char Magic[] = "ENGSCN13";
 
 // Per-object hierarchy marker. Every version writes it first; payloads 9+ may carry a parent,
 // whose exact object ID follows the object name. Runtime slots are never encoded.
@@ -127,6 +130,10 @@ void ValidateMetadata(const Metadata& sceneMetadata, const Policy& policy)
     {
         throw std::runtime_error("Invalid cooked scene document: " + error);
     }
+    const auto& reference = sceneMetadata.document.environmentReference;
+    Require(sceneMetadata.environment.has_value() ==
+        (!reference.empty() && reference != SceneDocument::NoneEnvironmentReference),
+        "Environment binding does not match scene selection.");
     Require(sceneMetadata.document.objects.size() <= policy.maxObjects &&
                 sceneMetadata.meshes.size() == sceneMetadata.document.objects.size(),
             "Invalid cooked scene object count.");
@@ -496,8 +503,8 @@ std::optional<CameraComponent> ReadCameraComponent(Reader& reader)
     return camera;
 }
 
-// V11 Light: u32 presence; when present, u32 record length (36), then u32 enabled, u32 type,
-// float32 color RGB, intensity, range, inner and outer cone half-angles. No native padding.
+// V13 Light: V11's 36-byte body plus float32 angular radius (40 bytes total).
+// The reader keeps the old 36-byte body for payloads 11/12. No native padding.
 void WriteLightComponent(Writer& writer, const std::optional<LightComponent>& light)
 {
     writer.WriteUnsigned(light.has_value() ? 1 : 0, 4);
@@ -507,7 +514,7 @@ void WriteLightComponent(Writer& writer, const std::optional<LightComponent>& li
         return;
     }
 
-    writer.WriteUnsigned(36, 4);
+    writer.WriteUnsigned(40, 4);
     writer.WriteUnsigned(light->enabled ? 1 : 0, 4);
     writer.WriteUnsigned(static_cast<std::uint32_t>(light->type), 4);
     writer.WriteVector(light->color);
@@ -515,9 +522,10 @@ void WriteLightComponent(Writer& writer, const std::optional<LightComponent>& li
     writer.WriteFloat(light->range);
     writer.WriteFloat(light->innerConeAngle);
     writer.WriteFloat(light->outerConeAngle);
+    writer.WriteFloat(light->angularRadius);
 }
 
-std::optional<LightComponent> ReadLightComponent(Reader& reader)
+std::optional<LightComponent> ReadLightComponent(Reader& reader, std::uint32_t version)
 {
     const auto presence = reader.ReadUnsigned(4);
     Require(presence <= 1, "Invalid cooked Light presence flag.");
@@ -527,7 +535,7 @@ std::optional<LightComponent> ReadLightComponent(Reader& reader)
         return std::nullopt;
     }
 
-    Require(reader.ReadUnsigned(4) == 36, "Invalid cooked Light record length.");
+    Require(reader.ReadUnsigned(4) == (version >= ObjectLightingVersion ? 40u : 36u), "Invalid cooked Light record length.");
     const auto enabled = reader.ReadUnsigned(4);
     const auto type = reader.ReadUnsigned(4);
     Require(enabled <= 1, "Invalid cooked Light enabled flag.");
@@ -541,6 +549,7 @@ std::optional<LightComponent> ReadLightComponent(Reader& reader)
     light.range = reader.ReadFloat();
     light.innerConeAngle = reader.ReadFloat();
     light.outerConeAngle = reader.ReadFloat();
+    if(version >= ObjectLightingVersion) light.angularRadius = reader.ReadFloat();
     std::string error;
 
     if(!ValidateLightComponent(light, &error))
@@ -572,7 +581,8 @@ std::vector<std::byte> Encode(const Metadata& sceneMetadata, const Policy& polic
     writer.WriteUnsigned(HeaderBytes, 4);
     writer.WriteUnsigned(0, 8);
     writer.WriteUnsigned(sceneMetadata.document.objects.size(), 4);
-    writer.WriteUnsigned(sceneMetadata.environment ? 1 : 0, 4);
+    writer.WriteUnsigned(sceneMetadata.document.environmentReference == SceneDocument::NoneEnvironmentReference ? 2 :
+                         (sceneMetadata.environment ? 1 : 0), 4);
 
     // Scene fields precede the object records in every supported version.
     const auto& document = sceneMetadata.document;
@@ -584,11 +594,7 @@ std::vector<std::byte> Encode(const Metadata& sceneMetadata, const Policy& polic
     writer.WriteFloat(document.camera.aspectRatio);
     writer.WriteFloat(document.camera.nearPlane);
     writer.WriteFloat(document.camera.farPlane);
-    writer.WriteVector(document.directionalLight.direction);
-    writer.WriteVector(document.directionalLight.color);
-    writer.WriteFloat(document.directionalLight.intensity);
-    writer.WriteFloat(document.directionalLight.ambientStrength);
-    writer.WriteFloat(document.directionalLight.angularRadius);
+    writer.WriteFloat(document.lightingSettings.ambientStrength);
 
     for (size_t index = 0; index < document.objects.size(); ++index)
     {
@@ -726,7 +732,7 @@ std::vector<std::byte> Cook(const SceneDocument& document, std::span<const MeshI
         }
         sceneMetadata.meshes.push_back(found->second);
     }
-    if (!document.environmentReference.empty())
+    if (!document.environmentReference.empty() && document.environmentReference != SceneDocument::NoneEnvironmentReference)
     {
         const auto id = AssetID::ParseReference(document.environmentReference);
         const auto* record = id ? registry.Find(*id) : nullptr;
@@ -811,6 +817,9 @@ Metadata Decode(std::span<const std::byte> bytes, const Policy& policy)
         expectedMagic = CameraMagic;
     }
 
+    if(payloadVersion == LightVersion) expectedMagic = LightMagic;
+    if(payloadVersion == EnvironmentNoneVersion) expectedMagic = EnvironmentNoneMagic;
+
     Require(magic == expectedMagic, "Invalid cooked scene magic/version pair.");
     // Keep this short-circuit read: a bad header size does not consume the length.
     Require(reader.ReadUnsigned(4) == HeaderBytes && reader.ReadUnsigned(8) == bytes.size(),
@@ -819,7 +828,7 @@ Metadata Decode(std::span<const std::byte> bytes, const Policy& policy)
     Require(count <= policy.maxObjects && count <= (bytes.size() - HeaderBytes) / 64,
             "Invalid cooked scene count.");
     const auto flags = reader.ReadUnsigned(4);
-    Require(flags <= 1, "Unsupported cooked scene flags.");
+    Require(flags <= (payloadVersion >= EnvironmentNoneVersion ? 2u : 1u), "Unsupported cooked scene flags.");
 
     Metadata sceneMetadata;
     sceneMetadata.payloadVersion = payloadVersion;
@@ -832,11 +841,18 @@ Metadata Decode(std::span<const std::byte> bytes, const Policy& policy)
     document.camera.aspectRatio = reader.ReadFloat();
     document.camera.nearPlane = reader.ReadFloat();
     document.camera.farPlane = reader.ReadFloat();
-    document.directionalLight.direction = reader.ReadVector();
-    document.directionalLight.color = reader.ReadVector();
-    document.directionalLight.intensity = reader.ReadFloat();
-    document.directionalLight.ambientStrength = reader.ReadFloat();
-    document.directionalLight.angularRadius = reader.ReadFloat();
+    std::optional<DirectionalLight> legacySun;
+    if(payloadVersion >= ObjectLightingVersion)
+        document.lightingSettings.ambientStrength = reader.ReadFloat();
+    else
+    {
+        legacySun.emplace();
+        legacySun->direction = reader.ReadVector();
+        legacySun->color = reader.ReadVector();
+        legacySun->intensity = reader.ReadFloat();
+        legacySun->ambientStrength = reader.ReadFloat();
+        legacySun->angularRadius = reader.ReadFloat();
+    }
 
     document.objects.reserve(static_cast<size_t>(count));
     sceneMetadata.meshes.reserve(static_cast<size_t>(count));
@@ -952,7 +968,7 @@ Metadata Decode(std::span<const std::byte> bytes, const Policy& policy)
         {
             try
             {
-                object.light = ReadLightComponent(reader);
+                object.light = ReadLightComponent(reader, payloadVersion);
             }
             catch(const std::exception& exception)
             {
@@ -978,8 +994,15 @@ Metadata Decode(std::span<const std::byte> bytes, const Policy& policy)
         sceneMetadata.environment = environmentBinding;
     }
 
+    if(flags & 2) document.environmentReference = SceneDocument::NoneEnvironmentReference;
+
     // Reject trailing bytes before applying document and binding validation.
     Require(reader.cursor == bytes.size(), "Trailing cooked scene bytes.");
+    if(payloadVersion < ObjectLightingVersion)
+    {
+        MigrateLegacyLighting(document, legacySun);
+        sceneMetadata.meshes.resize(document.objects.size());
+    }
     ValidateMetadata(sceneMetadata, policy);
     return sceneMetadata;
 }
@@ -1008,7 +1031,7 @@ bool ArchiveScene::ValidateReferences(std::string* error) const
     {
         return fail("Stale archive scene entry/type/version/generation.");
     }
-    if (!metadata.document.environmentReference.empty())
+    if (!metadata.document.environmentReference.empty() && metadata.document.environmentReference != SceneDocument::NoneEnvironmentReference)
     {
         const auto id = AssetID::ParseReference(metadata.document.environmentReference);
         const auto* entry = id ? provider->ArchiveEntry(*id) : nullptr;

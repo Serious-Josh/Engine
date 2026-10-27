@@ -17,7 +17,9 @@ namespace CookedScene
     inline constexpr std::uint32_t HierarchyVersion = 9;
     inline constexpr std::uint32_t CameraVersion = 10;
     inline constexpr std::uint32_t LightVersion = 11;
-    inline constexpr std::uint32_t Version = LightVersion;
+    inline constexpr std::uint32_t EnvironmentNoneVersion = 12;
+    inline constexpr std::uint32_t ObjectLightingVersion = 13;
+    inline constexpr std::uint32_t Version = ObjectLightingVersion;
 
     constexpr bool IsSupportedVersion(std::uint32_t version)
     {
@@ -31,11 +33,13 @@ namespace CookedScene
             version == CharacterControllerVersion ||
             version == HierarchyVersion ||
             version == CameraVersion ||
-            version == LightVersion;
+            version == LightVersion ||
+            version == EnvironmentNoneVersion ||
+            version == ObjectLightingVersion;
     }
     struct Policy
     {
-        size_t maxBytes = 16 * 1024 * 1024, maxObjects = 8192, maxStringBytes = 4096, maxSlots = 4096;
+        size_t maxBytes = 16 * 1024 * 1024, maxObjects = 8193, maxStringBytes = 4096, maxSlots = 4096;
     };
     struct MeshInput
     {
