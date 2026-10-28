@@ -72,6 +72,8 @@ struct GpuTimingMonitor
     unsigned int nextEvent = 0;
     uint64_t lastFrame = 0;
     uint64_t sampledFrame = 0;
+    // Results of earlier frames were recorded under a previous configuration (Invalidate) and are never sampled.
+    uint64_t firstAcceptedFrame = 0;
 
     bool hasFrame = false;
     bool enabled = true;
@@ -88,6 +90,14 @@ struct GpuTimingMonitor
 
         nextEvent = 0;
         // Preserve the consumed frame marker so clear cannot replay a result.
+    }
+
+    // A configuration change: every region's history goes, including regions the new configuration no longer records,
+    // and frames before firstFrame (recorded, but not yet completed, under the old configuration) are skipped.
+    void Invalidate(uint64_t firstFrame)
+    {
+        Clear();
+        firstAcceptedFrame = (std::max)(firstAcceptedFrame, firstFrame);
     }
 
     void ResetExcursions()
@@ -179,7 +189,7 @@ struct GpuTimingMonitor
 
         // Freeze pauses monitor sampling only; the timestamp profiler keeps running.
 
-        if (!enabled || frozen)
+        if (!enabled || frozen || result.frameSerial < firstAcceptedFrame)
         {
             return;
         }

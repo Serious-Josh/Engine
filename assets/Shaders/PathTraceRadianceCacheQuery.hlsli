@@ -501,7 +501,6 @@ bool PathTraceRadianceCacheSubstitute(uint primary, float3 position, PathTraceSu
                 }
 
                 radiance += throughput * incident;
-                if(g_sampleDiagnostic) PathTraceDiagnosticCache(throughput * incident);
 
                 if(extract)
                 {

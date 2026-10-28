@@ -257,7 +257,8 @@ class PathTraceReferencePass
     // NRD.RELAX.2B: rawDiffuseHitDistance (with extract) selects the raw-distance extraction pipeline, or the matching raw
     // SHARC library, when it and the raw diffuse hit distance texture exist; otherwise the legacy extraction records,
     // writing no raw distance. WroteRawDiffuseHitDistance reports which.
-    void Execute(
+    // Returns whether a DispatchRays was recorded (diagnostic metadata only).
+    bool Execute(
         PathTracePrimary primary,
         ID3D12GraphicsCommandList4* commandList,
         DescriptorHeap& descriptorHeap,

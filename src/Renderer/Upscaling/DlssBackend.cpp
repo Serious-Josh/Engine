@@ -80,7 +80,7 @@ const char* DlssAvailabilityName(DlssAvailability availability) noexcept
     case DlssAvailability::Unsupported:
         return "Unsupported";
     case DlssAvailability::Available:
-        return "Available - evaluation not implemented";
+        return "Available";
     }
 
     return "Unknown";
@@ -112,7 +112,8 @@ void DlssBackend::Initialize(ID3D12Device*)
 {
     m_status = {};
     m_status.availability = DlssAvailability::NotCompiled;
-    m_status.detail = "Built without ENGINE_ENABLE_DLSS.";
+    m_status.detail = "DLSS backend was not built (SDK missing in AUTO, or build policy OFF).";
+    Log::Info("DLSS Super Resolution: Not compiled. " + m_status.detail);
 }
 
 void DlssBackend::Shutdown()
@@ -130,7 +131,7 @@ bool DlssBackend::QueryOptimalRenderExtent(DlssQualityPreset, unsigned int, unsi
 bool DlssBackend::EnsureFeature(ID3D12GraphicsCommandList*, unsigned int, unsigned int, unsigned int, unsigned int,
     std::optional<DlssQualityPreset>)
 {
-    m_feature.detail = "Built without ENGINE_ENABLE_DLSS.";
+    m_feature.detail = "DLSS backend not compiled (SDK missing in AUTO, or build policy OFF).";
     return false;
 }
 
@@ -234,6 +235,12 @@ void DlssBackend::Initialize(ID3D12Device* device)
         return;
     }
 
+    if(!availableKnown)
+    {
+        finish(DlssAvailability::InitializationFailed, "SuperSampling.Available capability query failed.");
+        return;
+    }
+
     if(!m_status.superSamplingAvailable)
     {
         finish(DlssAvailability::Unsupported, "SuperSampling.Available is 0 on this GPU/driver.");
@@ -248,7 +255,7 @@ void DlssBackend::Initialize(ID3D12Device* device)
         return;
     }
 
-    finish(DlssAvailability::Available, "NGX initialized; no DLSS feature created.");
+    finish(DlssAvailability::Available, "NGX initialized; Super Resolution capability available.");
 }
 
 bool DlssBackend::EnsureParameters()
@@ -315,6 +322,7 @@ bool DlssBackend::QueryOptimalRenderExtent(DlssQualityPreset preset, unsigned in
 
     if(NVSDK_NGX_FAILED(queried) || renderWidth == 0 || renderHeight == 0)
     {
+        m_feature.detail = "Optimal-settings query returned " + Hex(queried) + " (or an empty extent).";
         renderWidth = 0;
         renderHeight = 0;
         return false;
@@ -483,10 +491,13 @@ bool DlssBackend::Evaluate(ID3D12GraphicsCommandList* commandList, const DlssEva
     if(NVSDK_NGX_FAILED(result))
     {
         // The feature stays; the caller presents its fallback for this frame.
-        m_feature.detail = "NGX_D3D12_EVALUATE_DLSS_EXT returned " + Hex(result) + ".";
+        const std::string detail = "NGX_D3D12_EVALUATE_DLSS_EXT returned " + Hex(result) + ".";
+        if(m_feature.detail != detail) Log::Error("DLSS Super Resolution: " + detail);
+        m_feature.detail = detail;
         return false;
     }
 
+    m_feature.detail = std::string("Active (NGX quality mode ") + m_feature.perfQualityName + ").";
     ++m_feature.evaluations;
     return true;
 }

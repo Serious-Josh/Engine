@@ -11,6 +11,7 @@
 #include "Renderer/UploadBuffer.h"
 
 #include <d3d12.h>
+#include <string>
 
 // UPSCALING.3B: prepares DLSS-specific inputs from Engine's render-extent G-buffer (DlssInputPreparation.hlsl): the
 // DLSS motion-vector texture (RG16F, sky motion included) and the 1x1 exposure texture (R16F). Engine's own motion
@@ -19,6 +20,7 @@
 class DlssInputPreparationPass
 {
 public:
+    const std::string& FailureReason() const { return m_failure; }
     struct Matrices
     {
         // Render (jittered) projection, camera-relative: reconstructs each pixel's sample direction.
@@ -32,6 +34,7 @@ public:
     bool Ensure(ID3D12Device* device, ShaderLibrary& shaderLibrary, DescriptorHeap& heap, unsigned int width,
         unsigned int height)
     {
+        m_failure.clear();
         if(!m_pipelineReady)
         {
             ShaderDescription shaderDescription{};
@@ -42,7 +45,8 @@ public:
 
             if(!computeShader)
             {
-                Log::Error("Failed to load the DLSS input preparation shader.");
+                m_failure = "Failed to load the DLSS input preparation shader.";
+                Log::Error(m_failure);
                 return false;
             }
 
@@ -56,7 +60,8 @@ public:
 
             if(!m_pipeline.Initialize(device, pipelineDescription))
             {
-                Log::Error("Failed to create the DLSS input preparation pipeline.");
+                m_failure = "Failed to create the DLSS input preparation pipeline.";
+                Log::Error(m_failure);
                 return false;
             }
 
@@ -79,7 +84,8 @@ public:
 
         if(!created)
         {
-            Log::Error("Failed to create the DLSS input preparation textures.");
+            m_failure = "Failed to create the DLSS input preparation textures.";
+            Log::Error(m_failure);
             ReleaseTextures();
             return false;
         }
@@ -95,6 +101,7 @@ public:
     bool Record(ID3D12GraphicsCommandList* commandList, UploadBuffer& uploadBuffer, RenderTarget& motion,
         DepthBuffer& depth, const Matrices& matrices, float exposure)
     {
+        m_failure.clear();
         struct Constants
         {
             Matrix4 inverseCameraRelativeRenderViewProjection;
@@ -127,7 +134,8 @@ public:
 
         if(address == 0)
         {
-            Log::Error("Failed to allocate DLSS input preparation constants.");
+            m_failure = "Failed to allocate DLSS input preparation constants.";
+            Log::Error(m_failure);
             return false;
         }
 
@@ -171,6 +179,7 @@ public:
     }
 
 private:
+    std::string m_failure;
     ComputePipeline m_pipeline;
     bool m_pipelineReady = false;
     Texture m_motionVectors;

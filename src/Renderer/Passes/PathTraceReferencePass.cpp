@@ -1182,7 +1182,7 @@ bool PathTraceReferencePass::Resize(
     return true;
 }
 
-void PathTraceReferencePass::Execute(
+bool PathTraceReferencePass::Execute(
     PathTracePrimary primary,
     ID3D12GraphicsCommandList4* commandList,
     DescriptorHeap& descriptorHeap,
@@ -1228,7 +1228,7 @@ void PathTraceReferencePass::Execute(
     if(!m_initialized || !commandList || width != m_width || height != m_height ||
         primary == PathTracePrimary::RasterReSTIRDI || !ready)
     {
-        return;
+        return false;
     }
 
     m_accumulationTexture.Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -1263,6 +1263,7 @@ void PathTraceReferencePass::Execute(
 #endif
     m_rawDiffuseHitDistanceWritten = learning ? IsRawDiffuseHitDistanceLibrary(radianceCacheLibrary) : rawPipeline;
     RecordOutputBarriers(commandList, extract);
+    return true;
 }
 
 void PathTraceReferencePass::ExecuteRadianceCacheTraining(

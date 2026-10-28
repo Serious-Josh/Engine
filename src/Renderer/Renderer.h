@@ -4,7 +4,6 @@
 #include "Debug/CpuFrameTiming.h"
 #include "Editor/TextureThumbnailCache.h"
 #include "Diagnostics/FrameHitchDiagnostics.h"
-#include "PathTraceSampleDiagnostic.h"
 
 #include "GBuffer.h"
 #include "Preview/MaterialPreviewRenderer.h"
@@ -15,6 +14,7 @@
 #include "MaterialAdmission.h"
 #include "ProjectTextureLoader.h"
 #include "CommandContext.h"
+#include "ReferenceRayCounts.h"
 #include "DescriptorHeap.h"
 #include "GraphicsDevice.h"
 #include "GpuTimestampProfiler.h"
@@ -388,7 +388,8 @@ class Renderer
 
     // Takes effect at the next ResizeScene, which recreates the extent-sized resources only when the render extent
     // changes. Set it before ResizeScene, outside any frame recording.
-    void SetRenderScale(RenderScale scale) noexcept { m_requestedRenderScale = scale; }
+    void SetRenderScale(RenderScale scale, bool eligible = true, bool retry = false, bool normalRequest = false);
+    bool HasPendingDlssFallback() const noexcept { return !m_dlssFailure.empty() && IsDlssRenderScale(m_renderScale); }
     RenderScale GetRenderScale() const noexcept { return m_renderScale; }
 
     // UPSCALING.2B: length of the camera jitter sequence (Halton(2, 3), indices 1..8).
@@ -1321,6 +1322,7 @@ class Renderer
 
     SwapChain m_swapChain;
 
+    ReferenceRayCounts m_referenceRayCounts;
     CommandContext m_commandContext;
 
     GpuTimestampProfiler m_gpuTimestampProfiler;
@@ -2151,7 +2153,6 @@ class Renderer
     ShaderLibrary m_shaderLibrary;
 
     DebugUI m_debugUI;
-    PathTraceSampleDiagnostic m_pathTraceSampleDiagnostic;
 
     unsigned int m_applicationWidth = 0;
     unsigned int m_applicationHeight = 0;
@@ -2167,6 +2168,12 @@ class Renderer
     // UPSCALING.2C: the requested scale (SetRenderScale) and the one the current extents were built with.
     RenderScale m_requestedRenderScale = RenderScale::Native;
     RenderScale m_renderScale = RenderScale::Native;
+    bool m_dlssEligible = true;
+    bool m_dlssNormalRequest = false;
+    bool m_dlssRetryPending = false;
+    std::string m_dlssFailure;
+    std::string m_dlssPublishedState;
+    std::string m_dlssPublishedDetail;
 
     // UPSCALING.2C output-extent targets of the diagnostic presentation resolve: HDR colour (tone mapping's input),
     // selection mask (the outline's) and depth (the outline's and the Editor overlays'). Allocated only while the render
@@ -2177,7 +2184,7 @@ class Renderer
     PresentationResolvePass m_presentationResolvePass;
 
     // UPSCALING.3A: the NGX instance of m_graphicsDevice (Editor only). Initialized after the device, shut down after the
-    // final GPU drain and before the device is released. It creates no DLSS feature yet.
+    // final GPU drain and before the device is released. Features are created on demand.
     DlssBackend m_dlssBackend;
 
     // UPSCALING.3B DLSS input preparation (RendererOptions::dlssInputPreparation). Switching it releases or creates
@@ -2195,6 +2202,7 @@ class Renderer
     // changing image) and leaves the extended diffuse history out; Native and Diagnostic75 are unaffected.
     bool m_dlssModeThisFrame = false;
     bool m_dlssActiveLastFrame = false;
+    bool m_dlssFrameSubmitted = false;
     // Whether the previous frame evaluated DLSS (a gap resets DLSS history).
     bool m_dlssEvaluatedLastFrame = false;
     const char* m_dlssInactiveReason = "";
@@ -2209,10 +2217,6 @@ class Renderer
     // Native and added 35-50% still shimmer, while log2(render / output) halved the error of no bias (UPSCALING.3D).
     static constexpr float DlssTextureMipBiasOffset = 0.0f;
 
-    // The readout last sent to the Debug UI (sent again only on a change).
-    const char* m_dlssReadoutReason = nullptr;
-    bool m_dlssReadoutActive = false;
-    std::uint32_t m_dlssReadoutCreateResult = 0;
     // Diagnostics only: per-axis multipliers in place of DlssJitterSignX/Y, and a colour input in place of the scene
     // colour (a noise-free G-buffer target for the jitter-sign test).
     std::optional<std::array<float, 2>> m_dlssJitterSignForTesting;
@@ -2238,6 +2242,8 @@ class Renderer
     // Records the DLSS evaluation of a prepared Dlss75 frame into m_presentationColor; false leaves the resolve's colour.
     bool RecordDlssEvaluation(ID3D12GraphicsCommandList* commandList, unsigned int frameIndex);
     void PublishDlssReadout();
+    void FailDlss(const std::string& stage, const std::string& detail);
+    void RestoreDlssGraphicsState(ID3D12GraphicsCommandList* commandList);
     bool PresentationResolveActive() const noexcept
     {
         return m_sceneWidth != m_outputWidth || m_sceneHeight != m_outputHeight;

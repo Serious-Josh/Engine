@@ -1,7 +1,7 @@
 #pragma once
 
 #include "Renderer/RendererStatistics.h"
-#include "Renderer/PathTraceSampleDiagnostic.h"
+#include "Renderer/ReferenceRayCounts.h"
 #include "Renderer/Passes/PathTraceSpatialPass.h"
 #include "Renderer/Passes/ToneMapPass.h"
 #include "Renderer/RendererLightingMode.h"
@@ -39,6 +39,8 @@ class DebugUI
     friend class SceneHierarchyVerification;
 
     public:
+    bool ReferenceRayCountsEnabled() const { return m_referenceRayCountsEnabled; }
+    void SetReferenceRayCounts(const ReferenceRayCountResult& result) { m_referenceRayCounts = result; }
     DebugUI() = default;
 
     DebugUI(const DebugUI&) = delete;
@@ -138,8 +140,6 @@ class DebugUI
         }
     }
 
-    PathTraceSampleDiagnosticSettings GetPathTraceSampleDiagnosticSettings() const { return m_sampleDiagnosticSettings; }
-    void SetPathTraceSampleDiagnosticStatus(const PathTraceSampleDiagnosticStatus& value) { m_sampleDiagnosticStatus = value; }
     PathTraceReferenceSettings GetPathTraceReferenceSettings() const;
 
     // SHARC.4E experimental cached-radiance rendering (the raster-primary path-traced modes), and its last statistics.
@@ -172,21 +172,36 @@ class DebugUI
     // saved). Other modes always render at the output extent.
     bool IsPathTraceReducedRenderScale() const
     {
-        return m_pathTraceRenderScale != 0 && (m_lightingMode == 2 || m_lightingMode == 3);
+        return GetPathTraceRenderScaleIndex() != 0;
     }
 
     // UPSCALING.3C/3D: whether the reduced scale is a DLSS mode (the diagnostic 75% one or a preset).
     bool IsPathTraceDlssSelected() const
     {
-        return m_pathTraceRenderScale >= 2 && (m_lightingMode == 2 || m_lightingMode == 3);
+        return GetPathTraceRenderScaleIndex() >= 2;
     }
 
     // UPSCALING.3D: the selected render-scale entry in the raster-primary path-traced modes (0 otherwise): 0 Native,
     // 1 bilinear 75%, 2 DLSS 75% (diagnostic), 3 DLSS Quality, 4 DLSS Balanced, 5 DLSS Performance.
     int GetPathTraceRenderScaleIndex() const
     {
-        return m_lightingMode == 2 || m_lightingMode == 3 ? m_pathTraceRenderScale : 0;
+        return m_lightingMode == 2 || m_lightingMode == 3 ?
+            (m_dlssEnabled ? 3 + m_dlssQuality : m_pathTraceRenderScale) : 0;
     }
+
+    bool IsNormalDlssRequested() const { return m_dlssEnabled; }
+    bool IsDlssConfigurationEligible() const
+    {
+        return (m_lightingMode == 2 || m_lightingMode == 3) &&
+            m_lightingTransition.active == GetLightingMode() &&
+            GetPathTraceDenoiserMode() != PathTraceDenoiserMode::Off && m_pathTraceDenoiserPreparation.empty();
+    }
+    bool IsDlssPreparing() const
+    {
+        return (m_lightingMode == 2 || m_lightingMode == 3) && GetPathTraceDenoiserMode() != PathTraceDenoiserMode::Off &&
+            (m_lightingTransition.active != GetLightingMode() || !m_pathTraceDenoiserPreparation.empty());
+    }
+    bool ConsumeDlssRetry() { return std::exchange(m_dlssRetry, false); }
 
     // UPSCALING.3B: diagnostic DLSS input preparation (off by default, not saved). It never evaluates DLSS.
     bool IsDlssInputPreparationEnabled() const
@@ -194,9 +209,10 @@ class DebugUI
         return m_dlssInputPreparation;
     }
 
-    // UPSCALING.3A: the DLSS Super Resolution backend's state, set once at renderer initialization (informational).
-    void SetDlssReadout(std::string state, std::string detail)
+    // DLSS capability, requested/effective state and retry eligibility, refreshed by the renderer.
+    void SetDlssReadout(std::string state, std::string detail, bool canRetry = false)
     {
+        m_dlssCanRetry = canRetry;
         m_dlssState = std::move(state);
         m_dlssDetail = std::move(detail);
     }
@@ -238,6 +254,17 @@ class DebugUI
         m_visibilityTimingEpoch = epoch;
     }
 
+    // GPU Timing Monitor: the extents the renderer holds and whether DLSS evaluated the last recorded frame.
+    void SetGpuTimingRenderState(unsigned int renderWidth, unsigned int renderHeight, unsigned int outputWidth,
+        unsigned int outputHeight, bool dlssActive)
+    {
+        m_gpuTimingRenderWidth = renderWidth;
+        m_gpuTimingRenderHeight = renderHeight;
+        m_gpuTimingOutputWidth = outputWidth;
+        m_gpuTimingOutputHeight = outputHeight;
+        m_gpuTimingDlssActive = dlssActive;
+    }
+
     void SetPrimaryDiShadowVisibilityStatus(bool ready, bool active, bool failed)
     {
         m_primaryDiShadowReady = ready;
@@ -276,11 +303,6 @@ class DebugUI
 
     void DrawFramePacingSpikes();
     void DrawPathTraceReferenceSettings();
-    void DrawPathTraceSampleDiagnostic();
-    void DrawPathTraceAutoCapture();
-    std::string BuildPathTraceAutoCaptureReport() const;
-    PathTraceSampleDiagnosticSettings m_sampleDiagnosticSettings;
-    PathTraceSampleDiagnosticStatus m_sampleDiagnosticStatus;
     FramePacingMonitor m_framePacingMonitor;
 
     std::array<FramePacingMonitor::Event, 16> m_pausedFramePacingEvents{};
@@ -310,6 +332,46 @@ class DebugUI
     int m_visibilityTimingScale = -1;
     int m_visibilityTimingLighting = -1;
 
+    // D1 (ReferenceRestirResolutionDispatchAudit): what decides the GPU pass graph the monitor samples. Requested
+    // settings and the renderer's effective state, so a deferred activation (library preparation) also starts fresh
+    // statistics when it takes effect. Accumulated samples, jitter and frame serials are deliberately absent.
+    struct GpuTimingConfiguration
+    {
+        std::uint64_t epoch = 0;
+        int lightingMode = -1;
+        RendererLightingMode activeLightingMode = RendererLightingMode::Legacy;
+        int renderScale = -1;
+        unsigned int renderWidth = 0;
+        unsigned int renderHeight = 0;
+        unsigned int outputWidth = 0;
+        unsigned int outputHeight = 0;
+        bool dlssActive = false;
+        bool dlssInputPreparation = false;
+        bool cameraJitter = false;
+        PathTraceReferenceSettings settings{};
+        bool pathTraceActive = false;
+        bool secondaryShadowActive = false;
+        bool primaryDiShadowActive = false;
+        PathTraceDenoiserMode denoiser = PathTraceDenoiserMode::Off;
+        bool denoiserPreparing = false;
+        bool temporalHistory = false;
+        PathTraceSpatialFilter spatialFilter = PathTraceSpatialFilter::Atrous2;
+        bool extendedDiffuseHistory = false;
+        SharcSettings sharc{};
+        bool sharcActive = false;
+
+        bool operator==(const GpuTimingConfiguration&) const = default;
+    };
+
+    GpuTimingConfiguration CurrentGpuTimingConfiguration() const;
+    GpuTimingConfiguration m_gpuTimingConfiguration{};
+    bool m_gpuTimingConfigurationKnown = false;
+    unsigned int m_gpuTimingRenderWidth = 0;
+    unsigned int m_gpuTimingRenderHeight = 0;
+    unsigned int m_gpuTimingOutputWidth = 0;
+    unsigned int m_gpuTimingOutputHeight = 0;
+    bool m_gpuTimingDlssActive = false;
+
 
     GpuTimingGraph m_gpuTimingGraph;
 
@@ -337,6 +399,8 @@ class DebugUI
     float m_rtgiContactAORadius = 2.5f;
 
     int m_lightingMode = 0;
+    bool m_referenceRayCountsEnabled = false;
+    ReferenceRayCountResult m_referenceRayCounts{};
     int m_pathTraceSamplesPerFrame = 1;
     int m_pathTraceMaxPathDepth = 3;
     int m_pathTraceRussianRouletteDepth = 3;
@@ -361,6 +425,10 @@ class DebugUI
     PathTraceDenoiserStages m_pathTraceDenoiserStages{};
     bool m_pathTraceCameraJitter = false;
     std::string m_dlssState = "Not initialized";
+    bool m_dlssEnabled = false;
+    int m_dlssQuality = 0;
+    bool m_dlssRetry = false;
+    bool m_dlssCanRetry = false;
     bool m_dlssInputPreparation = false;
     std::string m_dlssDetail;
     // UPSCALING.2C/3C: 0 = 100% (Native), 1 = 75% (diagnostic resolve), 2 = 75% DLSS (experimental).

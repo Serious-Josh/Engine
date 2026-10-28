@@ -21,6 +21,9 @@ CmakeUserPresets.json
 *.exp
 
 # Test directories
+/src/Renderer/tests/AdaptiveCaustic/
+/src/Renderer/tests/CausticContracts/
+/src/Renderer/tests/CausticClassification/
 /Projects
 **/[Tt]est/
 **/[Tt]ests/

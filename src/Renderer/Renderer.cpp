@@ -748,6 +748,7 @@ bool Renderer::AbortTrackedRecording()
 
     if(discarded)
     {
+        m_referenceRayCounts.Abort(materialSlot, uploadGeneration);
         m_textureThumbnails.Discarded(m_commandRecordingGeneration);
         m_rayTracingScene.DiscardMembershipRecording(m_commandRecordingGeneration);
 
@@ -2873,6 +2874,10 @@ bool Renderer::Initialize(
         return false;
     }
 
+    m_dlssFailure.clear();
+    m_dlssRetryPending = false;
+    m_dlssPublishedState.clear();
+    m_dlssPublishedDetail.clear();
     m_packagedRuntime = !packagedShaders.empty();
     m_sceneResourceLifetime = 0;
     m_sceneResourceScene = nullptr;
@@ -3642,6 +3647,16 @@ bool Renderer::Resize(
     return true;
 }
 
+void Renderer::SetRenderScale(RenderScale scale, bool eligible, bool retry, bool normalRequest)
+{
+    if(scale != m_requestedRenderScale || eligible != m_dlssEligible)
+        m_dlssFailure.clear();
+    m_requestedRenderScale = scale;
+    m_dlssEligible = eligible;
+    m_dlssNormalRequest = normalRequest;
+    m_dlssRetryPending |= retry;
+}
+
 bool Renderer::ResizeScene(unsigned int width, unsigned int height)
 {
     if(m_resizeFailed || m_activeRecordingGeneration != 0 || m_displacementExitScopeGeneration != 0)
@@ -3649,11 +3664,17 @@ bool Renderer::ResizeScene(unsigned int width, unsigned int height)
         return false;
     }
 
-    // width x height is the requested output extent; a pending render-scale change also resizes (UPSCALING.2C).
-    const bool unchanged = width == m_outputWidth && height == m_outputHeight && m_requestedRenderScale == m_renderScale;
-
-    if(width == 0 || height == 0 || unchanged)
+    if(width == 0 || height == 0) return true;
+    if(width != m_outputWidth || height != m_outputHeight) m_dlssFailure.clear();
+    const auto effectiveScale = [&]()
     {
+        return IsDlssRenderScale(m_requestedRenderScale) &&
+            (!m_dlssEligible || m_dlssBackend.GetStatus().availability != DlssAvailability::Available || !m_dlssFailure.empty()) ?
+            RenderScale::Native : m_requestedRenderScale;
+    };
+    if(width == m_outputWidth && height == m_outputHeight && effectiveScale() == m_renderScale && !m_dlssRetryPending)
+    {
+        PublishDlssReadout();
         return true;
     }
 
@@ -3667,17 +3688,37 @@ bool Renderer::ResizeScene(unsigned int width, unsigned int height)
         return false;
     }
 
+    if(m_dlssRetryPending)
+    {
+        m_dlssBackend.ReleaseFeature();
+        if(m_dlssBackend.GetStatus().availability != DlssAvailability::Available)
+        {
+            m_dlssBackend.Shutdown();
+            m_dlssBackend.Initialize(m_graphicsDevice.GetDevice());
+        }
+        m_dlssFailure.clear();
+        m_dlssRetryPending = false;
+    }
     bool presetSupported = true;
-    const SceneResolution resolution = ResolveSceneResolution(width, height, m_requestedRenderScale, presetSupported);
+    RenderScale effective = effectiveScale();
+    const SceneResolution resolution = ResolveSceneResolution(width, height, effective, presetSupported);
+    if(!presetSupported)
+    {
+        FailDlss("Optimal settings", m_dlssBackend.GetFeatureStatus().detail);
+        effective = RenderScale::Native;
+    }
 
     if(!ResizeSceneResources(resolution))
     {
         return false;
     }
 
-    m_renderScale = m_requestedRenderScale;
+    m_renderScale = effective;
+    m_dlssActiveLastFrame = false;
+    m_dlssEvaluatedLastFrame = false;
     m_dlssPresetUnsupported = !presetSupported;
     m_resizeFailed = false;
+    PublishDlssReadout();
     return true;
 }
 
@@ -3721,8 +3762,7 @@ Renderer::SceneResolution Renderer::ResolveSceneResolution(unsigned int outputWi
             return {renderWidth, renderHeight, outputWidth, outputHeight};
         }
 
-        Log::Warning(std::string("DLSS ") + DlssQualityPresetName(*preset) + " reports no render extent for " +
-            std::to_string(outputWidth) + "x" + std::to_string(outputHeight) + "; rendering at 75% without DLSS.");
+        return {outputWidth, outputHeight, outputWidth, outputHeight};
     }
 
     // round(0.75 * extent), half up, in integers.
@@ -4838,8 +4878,8 @@ bool Renderer::ReleaseSceneResources()
 
 void Renderer::ResetSceneHistory()
 {
-    m_pathTraceSampleDiagnostic.Invalidate();
-    m_debugUI.SetPathTraceSampleDiagnosticStatus(m_pathTraceSampleDiagnostic.Status());
+    m_referenceRayCounts.Invalidate();
+    m_debugUI.SetReferenceRayCounts(m_referenceRayCounts.Get());
     ++m_pathTraceStatus.visibilityTimingEpoch;
     m_gpuTimestampProfiler.BreakFrameSequence();
     ResetCpuSubmissionCadence();
@@ -6245,31 +6285,61 @@ std::uint32_t Renderer::DlssJitterPhaseCount(unsigned int renderWidth, unsigned 
     return (std::max)(16u, scaled);
 }
 
+void Renderer::FailDlss(const std::string& stage, const std::string& detail)
+{
+    const std::string failure = stage + ": " + (detail.empty() ? "unavailable" : detail);
+    if(m_dlssFailure != failure) Log::Warning("DLSS: " + failure + "; Native fallback scheduled.");
+    m_dlssFailure = failure;
+    m_dlssActiveLastFrame = false;
+    m_dlssEvaluatedLastFrame = false;
+}
+
+void Renderer::RestoreDlssGraphicsState(ID3D12GraphicsCommandList* commandList)
+{
+    ID3D12DescriptorHeap* heaps[] = {m_resourceDescriptorHeap.GetHeap()};
+    commandList->SetDescriptorHeaps(1, heaps);
+    commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    const D3D12_VIEWPORT viewport{0, 0, float(m_outputWidth), float(m_outputHeight), 0, 1};
+    const D3D12_RECT scissor{0, 0, LONG(m_outputWidth), LONG(m_outputHeight)};
+    commandList->RSSetViewports(1, &viewport);
+    commandList->RSSetScissorRects(1, &scissor);
+    // Each following pass binds its own root signature, pipeline and targets.
+}
+
 void Renderer::PublishDlssReadout()
 {
-    const DlssFeatureStatus& feature = m_dlssBackend.GetFeatureStatus();
-    const bool changed = m_dlssReadoutReason != m_dlssInactiveReason || m_dlssReadoutActive != m_dlssActiveLastFrame ||
-        m_dlssReadoutCreateResult != feature.createResult;
-
-    if(!changed || !m_debugUIInitialized)
+    if(!m_debugUIInitialized) return;
+    const auto& backend = m_dlssBackend.GetStatus();
+    const auto& feature = m_dlssBackend.GetFeatureStatus();
+    const bool requested = m_dlssNormalRequest || IsDlssRenderScale(m_requestedRenderScale);
+    std::string state;
+    if(!requested) state = backend.availability == DlssAvailability::Available ? "Available (disabled)" : "Disabled";
+    else if(!m_dlssFailure.empty()) state = "Failed";
+    else if(backend.availability != DlssAvailability::Available) state = "Unavailable";
+    else if(!m_dlssEligible) state = m_debugUI.IsDlssPreparing() ? "Initializing (waiting for mode / denoiser)" : "Unavailable";
+    else if(m_dlssActiveLastFrame) state = "Active";
+    else state = "Initializing / awaiting eligible frame";
+    std::string detail = std::string("Backend: ") + DlssAvailabilityName(backend.availability) + ". " + backend.detail;
+    detail += " Internal " + std::to_string(m_sceneWidth) + "x" + std::to_string(m_sceneHeight) +
+        "; output " + std::to_string(m_outputWidth) + "x" + std::to_string(m_outputHeight) + ".";
+    if(auto preset = GetDlssPreset(m_requestedRenderScale)) detail += std::string(" Requested ") + DlssQualityPresetName(*preset) + ".";
+    detail += feature.active ? " Feature created." : " No feature created.";
+    if(requested && !m_dlssEligible) detail += " Requires active raster-primary rendering and a ready denoiser.";
+    if(!m_dlssFailure.empty()) detail += " " + m_dlssFailure;
+    else if(requested && m_dlssInactiveReason[0] != '\0') detail += std::string(" ") + m_dlssInactiveReason;
+    if(!feature.detail.empty() && (feature.active || !m_dlssFailure.empty())) detail += " " + feature.detail;
+    if(!m_dlssFailure.empty() && PresentationResolveActive())
+        detail += " Transitional bilinear output; Native scheduled at the next safe resize boundary.";
+    else if(m_renderScale == RenderScale::Native) detail += " Effective Native.";
+    if(state != m_dlssPublishedState || detail != m_dlssPublishedDetail)
     {
-        return;
+        Log::Info("DLSS: " + state + ". " + detail);
+        m_dlssPublishedState = state;
+        m_dlssPublishedDetail = detail;
     }
-
-    m_dlssReadoutReason = m_dlssInactiveReason;
-    m_dlssReadoutActive = m_dlssActiveLastFrame;
-    m_dlssReadoutCreateResult = feature.createResult;
-    std::string state = DlssAvailabilityName(m_dlssBackend.GetStatus().availability);
-    std::string detail = m_dlssBackend.GetStatus().detail;
-
-    if(IsDlssRenderScale(m_renderScale))
-    {
-        state = m_dlssActiveLastFrame ? std::string("Active (") + feature.perfQualityName + " range)" :
-            std::string("Requested, inactive: ") + m_dlssInactiveReason;
-        detail = feature.detail + (feature.supportedRanges.empty() ? "" : " Supported: " + feature.supportedRanges);
-    }
-
-    m_debugUI.SetDlssReadout(std::move(state), std::move(detail));
+    const bool canRetry = backend.availability != DlssAvailability::NotCompiled &&
+        (!m_dlssFailure.empty() || (requested && backend.availability != DlssAvailability::Available));
+    m_debugUI.SetDlssReadout(std::move(state), std::move(detail), canRetry);
 }
 
 bool Renderer::RecordEditorOverlayPrepass(ID3D12GraphicsCommandList* commandList, const Scene& scene,
@@ -6345,25 +6415,31 @@ bool Renderer::RecordDlssEvaluation(ID3D12GraphicsCommandList* commandList, unsi
     // Stage 1: DLSS needs this frame's denoised, changing image and the prepared inputs.
     if(m_dlssEvaluationFailureForTesting)
     {
+        FailDlss("Evaluation", "forced diagnostic failure");
         m_dlssInactiveReason = "DLSS evaluation failed (diagnostic)";
         return false;
     }
 
     if(!inputs.prepared)
     {
+        FailDlss("Input preparation", "inputs not prepared");
         m_dlssInactiveReason = "inputs not prepared";
         return false;
     }
 
     if(!inputs.colorIsPerFrameDenoised && !m_dlssColorOverrideForTesting)
     {
+        FailDlss("Color input", "no fresh per-frame denoised color");
         m_dlssInactiveReason = "the path-tracing denoiser is off (no per-frame denoised colour)";
         return false;
     }
 
-    if(!m_dlssBackend.EnsureFeature(commandList, inputs.renderWidth, inputs.renderHeight, inputs.outputWidth,
-        inputs.outputHeight, GetDlssPreset(m_renderScale)))
+    const bool featureReady = m_dlssBackend.EnsureFeature(commandList, inputs.renderWidth, inputs.renderHeight, inputs.outputWidth,
+        inputs.outputHeight, GetDlssPreset(m_renderScale));
+    RestoreDlssGraphicsState(commandList);
+    if(!featureReady)
     {
+        FailDlss("Feature creation", m_dlssBackend.GetFeatureStatus().detail);
         m_dlssInactiveReason = m_dlssBackend.GetStatus().availability != DlssAvailability::Available ?
             "DLSS unavailable" : "DLSS feature creation failed";
         return false;
@@ -6396,12 +6472,13 @@ bool Renderer::RecordDlssEvaluation(ID3D12GraphicsCommandList* commandList, unsi
 
     m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::DlssEvaluate);
     const bool evaluated = m_dlssBackend.Evaluate(commandList, evaluation);
+    RestoreDlssGraphicsState(commandList);
     m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::DlssEvaluate);
 
     if(!evaluated)
     {
-        // The frame presents the resolve's colour already in the output [assumption: a failed evaluation writes
-        // nothing]; the result code is in the feature status.
+        // The caller overwrites the complete output with a transitional resolve, even if NGX partially wrote it.
+        FailDlss("Evaluation", m_dlssBackend.GetFeatureStatus().detail);
         m_dlssInactiveReason = "DLSS evaluation failed";
         return false;
     }
@@ -6626,6 +6703,7 @@ bool Renderer::RecordPathTraceReference(
 
     if(m_pathTraceResetPending || keyChanged)
     {
+        m_referenceRayCounts.Invalidate();
         m_pathTraceStatus.accumulatedSamples = 0;
         ++m_pathTraceStatus.accumulationResets;
         m_pathTraceResetPending = false;
@@ -6644,11 +6722,6 @@ bool Renderer::RecordPathTraceReference(
 
     m_pathTraceAccumulationKey = key;
 
-    const auto diagnosticSettings = m_debugUI.GetPathTraceSampleDiagnosticSettings();
-    m_pathTraceSampleDiagnostic.Configure(diagnosticSettings, m_sceneWidth, m_sceneHeight,
-        m_pathTraceStatus.accumulatedSamples, m_pathTraceStatus.accumulationResets,
-        m_commandContext.GetCompletedFenceValue());
-    m_debugUI.SetPathTraceSampleDiagnosticStatus(m_pathTraceSampleDiagnostic.Status());
     const std::uint32_t accumulated = m_pathTraceStatus.accumulatedSamples;
     const std::uint32_t remaining = settings.maxAccumulatedSamples > accumulated ?
         settings.maxAccumulatedSamples - accumulated : 0u;
@@ -6679,6 +6752,10 @@ bool Renderer::RecordPathTraceReference(
     m_pathTraceScalarViewLastFrame = false;
     m_pathTraceSpatialIterationsLastFrame = 0;
 
+    if(primary != PathTracePrimary::Camera || frameSamples == 0 || !m_debugUI.ReferenceRayCountsEnabled())
+        m_referenceRayCounts.Invalidate();
+    m_debugUI.SetReferenceRayCounts(m_referenceRayCounts.Get());
+
     // Stage 2: one progressive iteration. A converged image is held without tracing.
     if(frameSamples > 0)
     {
@@ -6701,6 +6778,19 @@ bool Renderer::RecordPathTraceReference(
         constants.samplesPerFrame = frameSamples;
         constants.maxPathDepth = settings.maxPathDepth;
         constants.russianRouletteDepth = settings.russianRouletteDepth;
+        if(primary == PathTracePrimary::Camera && m_debugUI.ReferenceRayCountsEnabled())
+        {
+            ReferenceRayCountResult metadata{};
+            metadata.frame = m_gpuProfilerFrameSerial;
+            metadata.width = m_sceneWidth;
+            metadata.height = m_sceneHeight;
+            metadata.spp = frameSamples;
+            metadata.depth = settings.maxPathDepth;
+            constants.referenceRayCountIndex = m_referenceRayCounts.Begin(m_graphicsDevice.GetDevice(),
+                m_resourceDescriptorHeap, commandList, frameIndex, m_activeRecordingGeneration, metadata);
+            m_debugUI.SetReferenceRayCounts(m_referenceRayCounts.Get());
+        }
+
         constants.instanceDataIndex = m_rayTracingScene.GetInstanceDataDescriptorIndex();
         constants.materialBufferIndex = CurrentMaterialBuffer().GetDescriptorIndex();
         constants.environmentTextureIndex = key.environmentTextureIndex;
@@ -6828,20 +6918,6 @@ bool Renderer::RecordPathTraceReference(
         }
 
         m_pathTraceExtractedLastFrame = extract;
-        constants.sampleDiagnosticIndex = m_pathTraceSampleDiagnostic.Begin(m_graphicsDevice.GetDevice(),
-            m_resourceDescriptorHeap, commandList, frameIndex, frameSamples, accumulated,
-            static_cast<std::uint32_t>(m_gpuProfilerFrameSerial));
-        constants.sampleDiagnosticX = static_cast<std::uint32_t>(diagnosticSettings.x);
-        constants.sampleDiagnosticY = static_cast<std::uint32_t>(diagnosticSettings.y);
-        constants.sampleDiagnosticThreshold = diagnosticSettings.threshold;
-        constants.sampleDiagnosticFrame = static_cast<std::uint32_t>(m_gpuProfilerFrameSerial);
-        constants.sampleDiagnosticTarget = settings.maxAccumulatedSamples;
-        constants.sampleAutoIndex = m_pathTraceSampleDiagnostic.BeginAutomatic(m_graphicsDevice.GetDevice(),
-            m_resourceDescriptorHeap, commandList, frameIndex, frameSamples, accumulated,
-            static_cast<std::uint32_t>(m_gpuProfilerFrameSerial));
-        constants.sampleAutoThreshold = diagnosticSettings.autoThreshold;
-        m_debugUI.SetPathTraceSampleDiagnosticStatus(m_pathTraceSampleDiagnostic.Status());
-
         const D3D12_GPU_VIRTUAL_ADDRESS constantsAddress = m_uploadBuffer.Allocate(
             &constants, sizeof(PathTraceReferenceConstants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
 
@@ -6899,6 +6975,7 @@ bool Renderer::RecordPathTraceReference(
             }
         }
 
+        bool referenceDispatched = false;
         m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::PathTraceReference);
 
         if(splitReSTIRDI)
@@ -6910,13 +6987,18 @@ bool Renderer::RecordPathTraceReference(
         }
         else
         {
-            m_pathTraceReferencePass.Execute(primary, m_commandContext.GetRayTracingCommandList(),
+            referenceDispatched = m_pathTraceReferencePass.Execute(primary, m_commandContext.GetRayTracingCommandList(),
                 m_resourceDescriptorHeap, m_rayTracingScene, constantsAddress, sceneLightConstantsAddress, m_sceneWidth,
                 m_sceneHeight, extract, renderCacheAddress, renderCacheLibrary, rawExtraction);
         }
 
-        // Selected-pixel records are copied before reconstruction replaces presentation.
-        m_pathTraceSampleDiagnostic.Copy(commandList);
+        if(primary == PathTracePrimary::Camera && m_debugUI.ReferenceRayCountsEnabled())
+        {
+            if(referenceDispatched)
+                m_referenceRayCounts.Copy(commandList, frameIndex, m_activeRecordingGeneration);
+            else
+                m_referenceRayCounts.Cancel(commandList, frameIndex, m_activeRecordingGeneration);
+        }
 
         // NRD RELAX R.9B diagnostics: the confidence probes, on raster ReSTIR DI frames under the RELAX denoiser.
         if(m_nrdConfidenceProbesEnabled && usesRtxdi && rtxdiConstantsAddress != 0 &&
@@ -8822,6 +8904,10 @@ bool Renderer::TakeDisplacementCompletion(
 
 bool Renderer::RenderUIOnly()
 {
+    m_dlssActiveLastFrame = false;
+    PublishDlssReadout();
+    m_referenceRayCounts.Invalidate();
+    m_debugUI.SetReferenceRayCounts(m_referenceRayCounts.Get());
     if(m_packagedRuntime || m_resizeFailed || m_applicationWidth == 0 || m_applicationHeight == 0 ||
         m_sceneInitializationAttempt.candidate || !m_swapChain.GetCurrentBackBuffer())
     {
@@ -8878,6 +8964,23 @@ Renderer::FrameRenderResult Renderer::Render(
     const Scene& scene,
     const RendererOptions& options)
 {
+    m_referenceRayCounts.StartFrame();
+    struct RayCountFrameScope
+    {
+        ReferenceRayCounts& counts;
+        DebugUI& ui;
+        Renderer& renderer;
+        ~RayCountFrameScope()
+        {
+            counts.FinishFrame();
+            ui.SetReferenceRayCounts(counts.Get());
+            if(!renderer.m_dlssFrameSubmitted) renderer.m_dlssActiveLastFrame = false;
+            renderer.PublishDlssReadout();
+        }
+    } rayCountFrameScope{m_referenceRayCounts, m_debugUI, *this};
+    m_dlssActiveLastFrame = false;
+    m_dlssFrameSubmitted = false;
+
     TransitionTiming::Scope er1Scope("Frame Render", 0.0);
     PollPreparedTextureUploads();
     m_textureThumbnails.SetCompletedFence(m_commandContext.GetCompletedFenceValue());
@@ -9310,6 +9413,11 @@ bool Renderer::RecordRenderFrame(
         profilerProbe.emplace(*this, FrameHitchRegion::Profiler);
     }
 
+    if(!m_debugUI.ReferenceRayCountsEnabled() || options.lightingMode != RendererLightingMode::PathTracedReference)
+        m_referenceRayCounts.Invalidate();
+    if(m_debugUI.ReferenceRayCountsEnabled()) m_referenceRayCounts.Poll(m_commandContext);
+    m_debugUI.SetReferenceRayCounts(m_referenceRayCounts.Get());
+
     if (m_gpuTimestampProfiler.CollectCompleted(m_commandContext.GetCompletedFenceValue()))
     {
         const GpuTimestampProfiler::Results& gpuResults = m_gpuTimestampProfiler.GetResults();
@@ -9707,7 +9815,6 @@ bool Renderer::RecordRenderFrame(
     m_nrdConfidenceDispatchedThisFrame = false;
     m_previousGBufferAvailableThisFrame = false;
     m_rtxdiResources.AbandonFrame();
-    m_pathTraceSampleDiagnostic.AbandonRecording();
 
     const bool pathTracePrimaryChanged = runPathTrace && m_previousGBufferPrimary &&
         *m_previousGBufferPrimary != pathTracePrimary;
@@ -9761,7 +9868,9 @@ bool Renderer::RecordRenderFrame(
         m_dlssFallbackReason = "the path-tracing denoiser is off (no per-frame denoised colour)";
     }
 
-    m_dlssModeThisFrame = jitterApplies && IsDlssRenderScale(m_renderScale) && m_dlssFallbackReason[0] == '\0';
+    m_dlssModeThisFrame = jitterApplies && IsDlssRenderScale(m_renderScale) && m_dlssFailure.empty() && m_dlssFallbackReason[0] == '\0';
+    if(IsDlssRenderScale(m_renderScale) && !m_dlssModeThisFrame && m_dlssFailure.empty())
+        FailDlss("Frame eligibility", jitterApplies ? m_dlssFallbackReason : "not an active raster-primary frame");
     const bool dlssPhases = m_dlssInputPreparation || m_dlssModeThisFrame;
     const std::uint32_t jitterPhaseCount = dlssPhases ?
         DlssJitterPhaseCount(m_sceneWidth, m_sceneHeight, m_outputWidth, m_outputHeight) : CameraJitterPhaseCount;
@@ -10572,57 +10681,64 @@ bool Renderer::RecordRenderFrame(
     // them yet (UPSCALING.3C evaluates DLSS here, in place of the diagnostic resolve's colour).
     m_upscalerInputs.prepared = false;
 
-    if((m_dlssInputPreparation || m_dlssModeThisFrame)
+    if(((m_dlssInputPreparation && m_dlssFailure.empty()) || m_dlssModeThisFrame)
 #if PATH_TRACE_SHARC_SPATIAL_DIAGNOSTIC != 0
         && !m_sharcDiagnosticPresentedThisFrame
 #endif
         )
     {
-        if(!m_dlssInputPreparationPass.Ensure(m_graphicsDevice.GetDevice(), m_shaderLibrary, m_resourceDescriptorHeap,
-            m_sceneWidth, m_sceneHeight))
+        do
         {
-            return false;
-        }
+            if(!m_dlssInputPreparationPass.Ensure(m_graphicsDevice.GetDevice(), m_shaderLibrary, m_resourceDescriptorHeap,
+                m_sceneWidth, m_sceneHeight))
+            {
+                FailDlss("Input preparation", m_dlssInputPreparationPass.FailureReason());
+                m_dlssModeThisFrame = false;
+                break;
+            }
 
-        DlssInputPreparationPass::Matrices matrices{};
-        matrices.inverseCameraRelativeRenderViewProjection = CameraRelativeInverseViewProjection(currentView, renderProjection);
-        matrices.viewProjection = cameraConstants.unjitteredViewProjection;
-        matrices.previousViewProjection = cameraConstants.previousViewProjection;
-        // The tone mapper's fixed exposure (ToneMapPass); DLSS reads the same value from the 1x1 texture.
-        constexpr float toneMapExposure = 1.0f;
+            DlssInputPreparationPass::Matrices matrices{};
+            matrices.inverseCameraRelativeRenderViewProjection = CameraRelativeInverseViewProjection(currentView, renderProjection);
+            matrices.viewProjection = cameraConstants.unjitteredViewProjection;
+            matrices.previousViewProjection = cameraConstants.previousViewProjection;
+            // The tone mapper's fixed exposure (ToneMapPass); DLSS reads the same value from the 1x1 texture.
+            constexpr float toneMapExposure = 1.0f;
 
-        m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::DlssInputPreparation);
-        const bool prepared = m_dlssInputPreparationPass.Record(commandList, m_uploadBuffer, m_gBuffer.GetMotion(),
-            m_gBuffer.GetDepth(), matrices, toneMapExposure);
-        m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::DlssInputPreparation);
+            m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::DlssInputPreparation);
+            const bool prepared = m_dlssInputPreparationPass.Record(commandList, m_uploadBuffer, m_gBuffer.GetMotion(),
+                m_gBuffer.GetDepth(), matrices, toneMapExposure);
+            m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::DlssInputPreparation);
 
-        if(!prepared)
-        {
-            return false;
-        }
+            if(!prepared)
+            {
+                FailDlss("Input preparation", m_dlssInputPreparationPass.FailureReason());
+                m_dlssModeThisFrame = false;
+                break;
+            }
 
-        UpscalerFrameInputs& inputs = m_upscalerInputs;
-        inputs.prepared = true;
-        inputs.renderWidth = m_sceneWidth;
-        inputs.renderHeight = m_sceneHeight;
-        inputs.outputWidth = m_outputWidth;
-        inputs.outputHeight = m_outputHeight;
-        inputs.color = &m_sceneColor;
-        // NRD.4B: REBLUR's presentation is per-frame denoised colour, as the Engine denoiser's is; NRD.RELAX.4: RELAX's too;
-        // HYBRID.5: the hybrid's too.
-        inputs.colorIsPerFrameDenoised = runPathTrace && m_pathTracePendingSamples > 0 && ((m_pathTraceTemporalRanLastFrame &&
-            (m_pathTraceSpatialRanLastFrame || m_pathTraceTemporalPresentation)) || m_nrdPathTracePresentedLastFrame ||
-            m_nrdRelaxPresentedLastFrame || m_nrdHybridPresentedLastFrame);
-        inputs.depth = &m_gBuffer.GetDepth();
-        inputs.engineMotion = &m_gBuffer.GetMotion();
-        inputs.dlssMotionVectors = &m_dlssInputPreparationPass.GetMotionVectors();
-        inputs.exposure = &m_dlssInputPreparationPass.GetExposure();
-        inputs.exposureValue = toneMapExposure;
-        inputs.jitterX = m_cameraJitterStatus.x;
-        inputs.jitterY = m_cameraJitterStatus.y;
-        inputs.jitterPhaseCount = m_cameraJitterStatus.phaseCount;
-        inputs.reset = m_upscalerHistoryResetPending;
-        m_upscalerHistoryResetPending = false;
+            UpscalerFrameInputs& inputs = m_upscalerInputs;
+            inputs.prepared = true;
+            inputs.renderWidth = m_sceneWidth;
+            inputs.renderHeight = m_sceneHeight;
+            inputs.outputWidth = m_outputWidth;
+            inputs.outputHeight = m_outputHeight;
+            inputs.color = &m_sceneColor;
+            // NRD.4B: REBLUR's presentation is per-frame denoised colour, as the Engine denoiser's is; NRD.RELAX.4: RELAX's too;
+            // HYBRID.5: the hybrid's too.
+            inputs.colorIsPerFrameDenoised = runPathTrace && m_pathTracePendingSamples > 0 && ((m_pathTraceTemporalRanLastFrame &&
+                (m_pathTraceSpatialRanLastFrame || m_pathTraceTemporalPresentation)) || m_nrdPathTracePresentedLastFrame ||
+                m_nrdRelaxPresentedLastFrame || m_nrdHybridPresentedLastFrame);
+            inputs.depth = &m_gBuffer.GetDepth();
+            inputs.engineMotion = &m_gBuffer.GetMotion();
+            inputs.dlssMotionVectors = &m_dlssInputPreparationPass.GetMotionVectors();
+            inputs.exposure = &m_dlssInputPreparationPass.GetExposure();
+            inputs.exposureValue = toneMapExposure;
+            inputs.jitterX = m_cameraJitterStatus.x;
+            inputs.jitterY = m_cameraJitterStatus.y;
+            inputs.jitterPhaseCount = m_cameraJitterStatus.phaseCount;
+            inputs.reset = m_upscalerHistoryResetPending;
+            m_upscalerHistoryResetPending = false;
+        } while(false);
     }
 
 #if PATH_TRACE_SHARC_SPATIAL_DIAGNOSTIC != 0
@@ -10678,6 +10794,7 @@ bool Renderer::RecordRenderFrame(
         const bool overlayPrepass = !m_packagedRuntime && m_cameraJitterStatus.active;
         const auto recordResolve = [&]()
         {
+            RestoreDlssGraphicsState(commandList);
             m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex,
                 GpuTimestampProfiler::Region::PresentationResolve);
             // The G-buffer and mask were rasterized with this frame's jitter; the overlays drawn after use the
@@ -10714,8 +10831,6 @@ bool Renderer::RecordRenderFrame(
         m_dlssEvaluatedLastFrame = dlssEvaluated;
         m_presentationResolveSkippedLastFrame = dlssFirst && dlssEvaluated;
 
-        PublishDlssReadout();
-
         if(dlssEvaluated)
         {
             ID3D12DescriptorHeap* heaps[] = {m_resourceDescriptorHeap.GetHeap()};
@@ -10726,7 +10841,7 @@ bool Renderer::RecordRenderFrame(
         }
 
         // DLSS did not evaluate (creation or evaluation failed, or inputs missing): the resolve's colour is presented.
-        if(dlssFirst && !dlssEvaluated)
+        if(!dlssEvaluated && (dlssFirst || m_dlssModeThisFrame))
         {
             recordResolve();
         }
@@ -10899,6 +11014,8 @@ bool Renderer::RecordRenderFrame(
 
     if (!endedRecording)
     {
+        m_referenceRayCounts.Invalidate();
+        m_debugUI.SetReferenceRayCounts(m_referenceRayCounts.Get());
         Log::Error("Failed to end command recording.");
         return false;
     }
@@ -10962,6 +11079,8 @@ bool Renderer::RecordRenderFrame(
 
     if (!executed)
     {
+        m_referenceRayCounts.Invalidate();
+        m_debugUI.SetReferenceRayCounts(m_referenceRayCounts.Get());
         m_materialDependencies.MarkUncertain(frameIndex);
         m_radianceCacheD6.MarkSubmissionUncertain();
 
@@ -10975,6 +11094,9 @@ bool Renderer::RecordRenderFrame(
         Log::Error("Failed to submit command list or signal its fence; GPU work may already be in flight.");
         return false;
     }
+
+    m_dlssFrameSubmitted = true;
+    m_referenceRayCounts.Commit(frameIndex, textureUploadGeneration, m_commandContext);
 
     // The copy is now ordered on the queue ahead of every later frame; it becomes the previous frame. So does the
     // temporal history written by this frame (RTXPT D.2B), which is validated against that copy.
@@ -11041,7 +11163,6 @@ bool Renderer::RecordRenderFrame(
     m_nrdHybridDispatchedThisFrame = false;
     m_rtxdiResources.CommitFrame();
     m_radianceCacheD6.CommitSubmission();
-    m_pathTraceSampleDiagnostic.Commit(m_commandContext.GetLastSubmissionFenceValue());
 
     // Capture the successful submission fence now; confirmation retains owners, not completion proof.
     const auto materialSubmissionFence = m_commandContext.GetLastSubmissionFenceValue();
@@ -11243,6 +11364,7 @@ void Renderer::Shutdown()
     m_preparedDxrLibraries.clear();
     m_denoiserPreparation.clear();
     m_sharcPreparation.clear();
+    m_referenceRayCounts.Shutdown();
     m_pathTraceReferencePass.Shutdown();
     m_pathTraceTemporalPass.Shutdown();
     m_pathTraceSpatialPass.Shutdown();
@@ -11286,7 +11408,6 @@ void Renderer::Shutdown()
     m_sceneLightingInputs.reset();
     // After the drain above: nothing can still use the cache or its retired resources.
     m_radianceCacheD6.Shutdown();
-    m_pathTraceSampleDiagnostic.Shutdown();
     m_radianceCacheD6Failed = false;
     m_radianceCacheConfiguration = {};
     m_shadowDenoisePass.Shutdown();

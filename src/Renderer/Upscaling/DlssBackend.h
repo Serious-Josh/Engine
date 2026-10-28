@@ -10,7 +10,7 @@ struct ID3D12GraphicsCommandList;
 struct ID3D12Resource;
 
 // UPSCALING.3A: what the NVIDIA DLSS Super Resolution backend can do on this machine. Ordered by how far initialization
-// got; only Available means DLSS could be created (evaluation is not implemented yet).
+// got; Available means a feature may be created, not that reconstruction is active.
 enum class DlssAvailability
 {
     // Built without ENGINE_ENABLE_DLSS.
@@ -25,7 +25,7 @@ enum class DlssAvailability
     DriverOutdated,
     // NGX reports DLSS Super Resolution unavailable on this GPU/driver, or denied for this application.
     Unsupported,
-    // NGX initialized and reports DLSS Super Resolution available. No feature has been created.
+    // NGX reports DLSS Super Resolution available; feature/evaluation state is tracked separately.
     Available
 };
 
@@ -115,8 +115,7 @@ public:
     // second call without Shutdown is ignored.
     void Initialize(ID3D12Device* device);
 
-    // Releases the NGX instance of the initialized device. Call only when no DLSS work is in flight (there is none
-    // before UPSCALING.3B) and before the device is released. Safe to call more than once.
+    // Releases the NGX instance only after GPU completion, before releasing the device. Idempotent.
     void Shutdown();
 
     const DlssStatus& GetStatus() const noexcept { return m_status; }

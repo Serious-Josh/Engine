@@ -478,6 +478,19 @@ if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Engine/t
         target_link_libraries(LightDataTests PRIVATE $<$<CONFIG:Debug>:EngineVerification>)
     endif()
 endif()
+# Local-only R.9I.3A classification verification; no production shader dependency.
+if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Renderer/tests/AdaptiveCaustic/CMakeLists.txt")
+    add_subdirectory(src/Renderer/tests/AdaptiveCaustic)
+endif()
+
+if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Renderer/tests/CausticContracts/CMakeLists.txt")
+    add_subdirectory(src/Renderer/tests/CausticContracts)
+endif()
+
+if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Renderer/tests/CausticClassification/CMakeLists.txt")
+    add_subdirectory(src/Renderer/tests/CausticClassification)
+endif()
+
 # Local-only RTXPT.3 Batch 1 RTXDI foundation verification (headless D3D12), same guard as LightDataTests.
 if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Renderer/tests/RtxdiFoundationTests.cpp")
     add_executable(RtxdiFoundationTests src/Renderer/tests/RtxdiFoundationTests.cpp)

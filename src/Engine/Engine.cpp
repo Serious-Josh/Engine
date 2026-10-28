@@ -2178,13 +2178,14 @@ void Engine::Frame()
 
     // Coalesce splitter movement without storing a potentially stale pending extent.
     // The release frame always uses the latest finalized layout.
-    const bool resizeScene = !m_editor.IsWorkspaceSplitterDragging();
+    const bool resizeScene = !m_editor.IsWorkspaceSplitterDragging() || m_renderer.HasPendingDlssFallback();
 
     // UPSCALING.2C: applied by the ResizeScene below (and so also deferred while a splitter drags).
     // The combo entries follow Renderer::RenderScale's order (DebugUI::GetPathTraceRenderScaleIndex).
     const int renderScaleIndex = (std::clamp)(debugUI.GetPathTraceRenderScaleIndex(), 0,
         static_cast<int>(Renderer::RenderScale::DlssPerformance));
-    m_renderer.SetRenderScale(static_cast<Renderer::RenderScale>(renderScaleIndex));
+    m_renderer.SetRenderScale(static_cast<Renderer::RenderScale>(renderScaleIndex),
+        debugUI.IsDlssConfigurationEligible(), debugUI.ConsumeDlssRetry(), debugUI.IsNormalDlssRequested());
 
     if (sceneWidth == 0 || sceneHeight == 0 || (resizeScene && !m_renderer.ResizeScene(sceneWidth, sceneHeight)))
     {
@@ -2247,6 +2248,8 @@ void Engine::Frame()
     debugUI.SetSecondaryShadowVisibilityStatus(pathTraceStatus.secondaryShadowRayQueryReady,
         pathTraceStatus.secondaryShadowRayQueryActive,
         pathTraceStatus.visibilityTimingEpoch + m_renderer.GetShaderLibrary().GetLibraryCompileCount());
+    debugUI.SetGpuTimingRenderState(resolution.renderWidth, resolution.renderHeight, resolution.outputWidth,
+        resolution.outputHeight, m_renderer.IsDlssActiveLastFrame());
     debugUI.SetPathTraceReferenceStatus(pathTraceStatus.availability, pathTraceStatus.unavailableReason,
         pathTraceStatus.activeLastFrame, pathTraceStatus.accumulatedSamples, pathTraceStatus.resourceBytes);
     const PathTraceRasterPrimaryStatus& rasterPrimaryStatus = m_renderer.GetPathTraceRasterPrimaryStatus();
