@@ -3,6 +3,7 @@
 #include "Scene/Camera.h"
 #include "Scene/DirectionalLight.h"
 #include "Scene/SceneLightingSettings.h"
+#include "Scene/CameraExposure.h"
 #include "Renderer/RenderObject.h"
 
 #include <cstddef>
@@ -104,6 +105,9 @@ class Scene
         m_lightingSettings = settings;
         m_directionalLight.reset();
     }
+    // The Editor viewport camera's exposure (SceneCameraDocument::exposure); scene Cameras carry their own.
+    const CameraExposure& GetViewportExposure() const noexcept { return m_viewportExposure; }
+    void SetViewportExposure(const CameraExposure& exposure) noexcept { m_viewportExposure = exposure; }
     // Procedural-demo compatibility only; file scenes discard this storage on commit.
     DirectionalLight& GetDirectionalLight();
     const DirectionalLight& GetDirectionalLight() const;
@@ -188,6 +192,7 @@ class Scene
 
     std::optional<DirectionalLight> m_directionalLight{DirectionalLight{}};
     SceneLightingSettings m_lightingSettings;
+    CameraExposure m_viewportExposure;
 
     // Temporary camera-selected displacement LOD diagnostic.
     std::array<std::uint32_t, kDisplacementPatchCount> m_displacementPatchLODs{};

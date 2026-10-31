@@ -215,12 +215,15 @@ struct DirectionalLightConstants
     float intensity;
 
     float color[3];
-    float ambientStrength;
+    float padding;
 };
 
 // LIGHT.1 deferred light record; identical layout to GPULight in DeferredLighting.hlsl.
 // type: 0 Point, 1 Spot, 2 Directional (LightType). direction is the direction light travels.
-// radiance is color * intensity. Cone cosines are used by Spot only.
+// radiance is the light's value in GPU render units, built by BuildFrameLighting (PhotometricUnits.h): luminous
+// intensity (Point/Spot, cd) or illuminance (Directional, lx) times the unit-luminance tint and the scene
+// pre-scale. Cone cosines are used by Spot only. |range| is the Point/Spot influence radius (also the culling
+// bound); its sign is the attenuation mode: positive fades to zero approaching it, negative cuts off hard there.
 struct GPULight
 {
     float position[3];

@@ -1,4 +1,5 @@
 #include "BottomLevelAccelerationStructure.h"
+#include "BLASGeometryDescription.h"
 #include "Core/Log.h"
 
 #include "Renderer/Mesh.h"
@@ -122,6 +123,29 @@ bool BottomLevelAccelerationStructure::Initialize(
         return false;
     }
 
+    // Allocated before recording: a failed build consumes an ID but never publishes it.
+    BLASBuildIdentity identity{lifetime, 0};
+
+    if (!AllocateBLASBuildID(m_nextBuildID, identity.buildID))
+    {
+        return false;
+    }
+
+    if (!InitializeBuild(device, commandList, description, identity))
+    {
+        return false;
+    }
+
+    m_retirementLifetime = lifetime;
+    return true;
+}
+
+bool BottomLevelAccelerationStructure::InitializeBuild(
+    ID3D12Device5* device,
+    ID3D12GraphicsCommandList4* commandList,
+    const RayTracingBottomLevelDescription& description,
+    BLASBuildIdentity identity)
+{
     std::vector<D3D12_RAYTRACING_GEOMETRY_DESC> geometryDescriptions;
     geometryDescriptions.reserve(description.geometries.size());
 
@@ -143,18 +167,24 @@ bool BottomLevelAccelerationStructure::Initialize(
 
         const size_t indexCount = geometry.countOverride ? geometry.countOverride->indexCount : mesh.GetIndexCount();
 
-        D3D12_RAYTRACING_GEOMETRY_DESC geometryDescription{};
-        geometryDescription.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
-        geometryDescription.Flags =
-            geometry.opaque ? D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE : D3D12_RAYTRACING_GEOMETRY_FLAG_NONE;
-        geometryDescription.Triangles.VertexBuffer.StartAddress = mesh.GetVertexBufferAddress();
-        geometryDescription.Triangles.VertexBuffer.StrideInBytes = mesh.GetVertexStride();
-        geometryDescription.Triangles.VertexCount = static_cast<UINT>(vertexCount);
-        geometryDescription.Triangles.VertexFormat = DXGI_FORMAT_R32G32B32_FLOAT;
+        BLASTriangleGeometryInputs inputs{};
+        inputs.vertexAddress = mesh.GetVertexBufferAddress();
+        inputs.vertexStride = mesh.GetVertexStride();
+        inputs.vertexCount = vertexCount;
+        inputs.indexAddress = mesh.GetIndexBufferAddress();
+        inputs.indexFormat = mesh.GetIndexFormat();
+        inputs.indexCount = indexCount;
+        inputs.opaque = geometry.opaque;
 
-        geometryDescription.Triangles.IndexBuffer = mesh.GetIndexBufferAddress();
-        geometryDescription.Triangles.IndexCount = static_cast<UINT>(indexCount);
-        geometryDescription.Triangles.IndexFormat = mesh.GetIndexFormat();
+        D3D12_RAYTRACING_GEOMETRY_DESC geometryDescription{};
+
+        // Previously a count above UINT_MAX was silently truncated into a corrupt
+        // descriptor; it now fails before any allocation or recording.
+        if (!BuildBLASTriangleGeometryDescription(inputs, geometryDescription))
+        {
+            return false;
+        }
+
         geometryDescriptions.push_back(geometryDescription);
     }
 
@@ -164,9 +194,7 @@ bool BottomLevelAccelerationStructure::Initialize(
     buildInputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
     buildInputs.NumDescs = static_cast<UINT>(geometryDescriptions.size());
     buildInputs.pGeometryDescs = geometryDescriptions.data();
-    buildInputs.Flags = description.buildPreference == RayTracingAccelerationStructureBuildPreference::FastBuild
-                            ? D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_BUILD
-                            : D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
+    buildInputs.Flags = BLASBuildFlags(description.buildPreference);
 
     D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO prebuildInfo{};
 
@@ -233,8 +261,170 @@ bool BottomLevelAccelerationStructure::Initialize(
 
     commandList->ResourceBarrier(1, &barrier);
 
-    m_retirementLifetime = lifetime;
+    // Capture exactly what was just recorded. No allocation: COM references and
+    // values only, so the capture is adopted together with the resources or not at all.
+    BLASBuildCapture capture{};
+    capture.identity = identity;
+    capture.geometryCount = static_cast<std::uint32_t>(geometryDescriptions.size());
+    capture.flags = buildInputs.Flags;
+    capture.prebuild = prebuildInfo;
+    capture.result = m_resource;
+    capture.scratch = m_scratchResource;
+
+    if (geometryDescriptions.size() == 1)
+    {
+        const RayTracingGeometryDescription& recorded = description.geometries.front();
+        capture.geometry = geometryDescriptions.front();
+        capture.countOverride = recorded.countOverride.has_value();
+        capture.vertices = recorded.mesh->GetVertexBufferResource();
+        capture.indices = recorded.mesh->GetIndexBufferResource();
+    }
+
+    // A new build has no recording attribution until its owner supplies one.
+    m_currentCapture = std::move(capture);
+    m_currentRecording = {};
     return true;
+}
+
+bool BottomLevelAccelerationStructure::AttributeCurrentBuild(
+    BLASBuildIdentity expected,
+    BLASRecordingProvenance provenance) noexcept
+{
+    const auto& current = m_currentCapture.identity;
+
+    if (provenance.recordingOwner == 0 || provenance.generation == 0 || current.buildID == 0 ||
+        current.buildID != expected.buildID || current.ownerLifetime != expected.ownerLifetime ||
+        m_currentRecording.state != BLASRecordingState::Unattributed)
+    {
+        return false;
+    }
+
+    m_currentRecording = {provenance, BLASRecordingState::Recorded};
+    return true;
+}
+
+namespace
+{
+    // Mirrors membership recording bookkeeping: arm before Execute; confirmation
+    // or known non-submission resolves it; only unsubmitted recordings discard.
+    bool IsLegalRecordingTransition(BLASRecordingState from, BLASRecordingState to) noexcept
+    {
+        switch (from)
+        {
+        case BLASRecordingState::Recorded:
+        case BLASRecordingState::NotSubmitted:
+            return to == BLASRecordingState::SubmissionUncertain || to == BLASRecordingState::Discarded;
+        case BLASRecordingState::SubmissionUncertain:
+            return to == BLASRecordingState::NotSubmitted;
+        default:
+            return false;
+        }
+    }
+
+    std::size_t ApplyRecordingTransition(
+        BLASBuildRecording& recording,
+        BLASRecordingProvenance provenance,
+        BLASRecordingState next) noexcept
+    {
+        if (recording.provenance != provenance || !IsLegalRecordingTransition(recording.state, next))
+        {
+            return 0;
+        }
+
+        recording.state = next;
+        return 1;
+    }
+} // namespace
+
+std::size_t BottomLevelAccelerationStructure::TransitionRecording(
+    BLASRecordingProvenance provenance,
+    BLASRecordingState next) noexcept
+{
+    if (provenance.recordingOwner == 0 || provenance.generation == 0)
+    {
+        return 0;
+    }
+
+    std::size_t transitioned = ApplyRecordingTransition(m_currentRecording, provenance, next);
+
+    for (RetiredBatch& batch : m_retiredBatches)
+    {
+        transitioned += ApplyRecordingTransition(batch.recording, provenance, next);
+    }
+
+    return transitioned;
+}
+
+std::size_t BottomLevelAccelerationStructure::ConfirmRecording(
+    BLASRecordingProvenance provenance,
+    std::uint64_t submissionFence,
+    std::uint64_t submissionLifetime) noexcept
+{
+    const bool evidenceValid = provenance.recordingOwner != 0 && provenance.generation != 0 &&
+                               submissionFence != 0 && submissionFence != UINT64_MAX && submissionLifetime != 0;
+
+    if (!evidenceValid)
+    {
+        return 0;
+    }
+
+    const auto confirm = [&](BLASBuildRecording& recording) -> std::size_t
+    {
+        if (recording.provenance != provenance || recording.state != BLASRecordingState::SubmissionUncertain)
+        {
+            return 0;
+        }
+
+        recording.state = BLASRecordingState::Submitted;
+        recording.submissionFence = submissionFence;
+        recording.submissionLifetime = submissionLifetime;
+        return 1;
+    };
+
+    std::size_t confirmed = confirm(m_currentRecording);
+
+    for (RetiredBatch& batch : m_retiredBatches)
+    {
+        confirmed += confirm(batch.recording);
+    }
+
+    return confirmed;
+}
+
+std::size_t BottomLevelAccelerationStructure::ObserveCompletion(
+    std::uint64_t completedFence,
+    std::uint64_t contextLifetime) noexcept
+{
+    // Device loss reports UINT64_MAX; zero means no fence progress is available.
+    if (completedFence == 0 || completedFence == UINT64_MAX || contextLifetime == 0)
+    {
+        return 0;
+    }
+
+    const auto observe = [&](BLASBuildRecording& recording) -> std::size_t
+    {
+        const bool proven = recording.state == BLASRecordingState::Submitted &&
+                            recording.submissionFence != 0 && recording.submissionFence != UINT64_MAX &&
+                            recording.submissionLifetime == contextLifetime &&
+                            completedFence >= recording.submissionFence;
+
+        if (!proven)
+        {
+            return 0;
+        }
+
+        recording.state = BLASRecordingState::Completed;
+        return 1;
+    };
+
+    std::size_t completed = observe(m_currentRecording);
+
+    for (RetiredBatch& batch : m_retiredBatches)
+    {
+        completed += observe(batch.recording);
+    }
+
+    return completed;
 }
 
 bool BottomLevelAccelerationStructure::Rebuild(
@@ -256,24 +446,35 @@ bool BottomLevelAccelerationStructure::Rebuild(
         return false;
     }
 
+    // The replacement build belongs to this owner: same lifetime, next build ID.
+    BLASBuildIdentity identity{m_retirementLifetime, 0};
+
+    if (!AllocateBLASBuildID(m_nextBuildID, identity.buildID))
+    {
+        return false;
+    }
+
     // Reserve CPU storage before recording replacement commands/ownership swap.
 
     m_retiredBatches.reserve(m_retiredBatches.size() + 1);
 
-    if (!replacement.Initialize(device, commandList, description))
+    if (!replacement.InitializeBuild(device, commandList, description, identity))
     {
 
         return false;
     }
 
+    // Captures swap with their resource pairs; ComPtr moves cannot throw.
     std::swap(m_resource, replacement.m_resource);
     std::swap(m_scratchResource, replacement.m_scratchResource);
+    std::swap(m_currentCapture, replacement.m_currentCapture);
+    std::swap(m_currentRecording, replacement.m_currentRecording);
 
     // Retain the previous BLAS resources until the renderer
     // establishes that the GPU has finished using them.
 
-    m_retiredBatches.push_back(
-        {{m_retirementLifetime, batchID}, replacement.m_resource, replacement.m_scratchResource});
+    m_retiredBatches.push_back({{m_retirementLifetime, batchID}, replacement.m_resource,
+        replacement.m_scratchResource, std::move(replacement.m_currentCapture), replacement.m_currentRecording});
     replacement.m_resource = nullptr;
     replacement.m_scratchResource = nullptr;
 
@@ -345,6 +546,10 @@ void BottomLevelAccelerationStructure::Shutdown()
 {
     ReleaseRetiredResources();
 
+    // Release capture pins with the pair they describe. The build-ID counter is
+    // deliberately kept so a reinitialized owner never repeats an identity.
+    m_currentCapture = {};
+    m_currentRecording = {};
     m_retirementLifetime = 0;
 
     if (m_scratchResource)

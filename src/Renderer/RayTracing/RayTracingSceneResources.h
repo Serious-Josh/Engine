@@ -2,6 +2,8 @@
 
 #include "Renderer/RayTracing/BottomLevelAccelerationStructure.h"
 #include "Renderer/RayTracing/TopLevelAccelerationStructure.h"
+#include "Renderer/Mesh.h"
+#include "Renderer/CommandContext.h"
 #include "Renderer/StructuredBuffer.h"
 #include "Renderer/RenderObject.h"
 #include "Renderer/ShaderData.h"
@@ -14,6 +16,7 @@
 #include <optional>
 #include <span>
 #include <string_view>
+#include <string>
 #include <vector>
 #include <unordered_map>
 
@@ -34,6 +37,36 @@ struct SceneBLASRetirementBatchIdentity
     BLASRetirementBatchIdentity blas{};
 };
 
+// Opt-in association of one production BLAS build with the current P2.1 source
+// generation it was recorded from. Immutable; pins the generation and the exact
+// capture resources. Lifecycle evidence stays with the owning BLAS (looked up by
+// build identity) and is never copied here, so a record cannot claim completion.
+struct BLASAssociationRecord
+{
+    CausticContracts::Geometry::GeometrySourceHandle source;
+    BLASBuildCapture capture;
+    BLASRecordingProvenance provenance{};
+    std::uint64_t sceneLifetime = 0;
+    std::uint64_t blasCharge = 0; // result + scratch allocation-info bytes
+};
+
+using BLASAssociationHandle = std::shared_ptr<const BLASAssociationRecord>;
+
+struct BLASAssociationStatistics
+{
+    std::size_t liveRecords = 0;  // ledger-owned or externally held
+    std::size_t ledgerOwned = 0;
+    std::size_t pendingReaders = 0;
+    std::uint64_t blasBytes = 0;
+    // Separate from the BLAS budget: retained P2.1 source payload and its buffers.
+    std::uint64_t sourceBytes = 0;
+    std::uint64_t sourceResourceBytes = 0;
+    std::uint64_t rejectedIneligible = 0;
+    std::uint64_t rejectedCapacity = 0;
+    std::uint64_t rejectedBudget = 0;
+    std::uint64_t rejectedAllocation = 0;
+};
+
 struct TLASGeometryRecordingEvidence
 {
     SceneBLASRetirementBatchIdentity retirement{};
@@ -44,6 +77,65 @@ struct TLASGeometryRecordingEvidence
 
     D3D12_GPU_VIRTUAL_ADDRESS blasAddress = 0;
     unsigned int frameSlot = UINT_MAX;
+};
+
+// Advisory preparation only: no accepted publication identity, reader authority
+// or historical TLAS traversal permission. Descriptor bytes live in tlasCapture.
+struct ProspectiveTLASGeometryJoin
+{
+    struct Row
+    {
+        std::string objectID;
+        std::string meshReference;
+        std::size_t denseSlot = 0;
+        std::size_t authoredIndex = SIZE_MAX;
+        std::size_t registryIndex = SIZE_MAX;
+        std::size_t nativeInstance = SIZE_MAX; // Meshless slots have no native descriptor.
+        std::uint64_t bindingRevision = 0;
+        std::uint64_t anticipatedBindingRevision = 0;
+        Matrix4 presentationTransform;
+        const Mesh* mesh = nullptr; // Catalog borrow only; never dereference after its owner ends.
+        CausticContracts::Geometry::GeometrySourceHandle source;
+        BLASAssociationHandle association;
+    };
+
+    std::uint64_t recordingOwner = 0;
+    std::uint64_t rendererLifetime = 0;
+    std::uint64_t runtimeIdentity = 0;
+    std::uint64_t structureRevision = 0;
+    std::uint64_t hierarchyRevision = 0;
+    std::uint64_t residencyRevision = 0;
+    std::uint64_t anticipatedResidencyRevision = 0;
+    std::uint64_t bindingEpoch = 0;
+    std::uint64_t anticipatedBindingEpoch = 0;
+    std::string sceneID;
+    bool residencyCommitPending = false;
+    TLASRecordingHandle tlasCapture;
+    TLASSubmissionEvidence submission;
+    std::vector<Row> rows; // Dense scene order, including meshless slots.
+    std::size_t mappingBytes = 0;
+};
+
+using ProspectiveTLASGeometryJoinHandle = std::shared_ptr<const ProspectiveTLASGeometryJoin>;
+
+// Issued only by final CPU/GPU publication. Descriptive evidence, never reader
+// authorization; historical handles cannot preserve in-place TLAS contents.
+struct AcceptedTLASGeometry
+{
+    ProspectiveTLASGeometryJoinHandle geometry;
+    const FileSceneRuntime* runtime = nullptr; // Identity only; never dereference historical owner pointers.
+    std::uint64_t residencyRevision = 0;
+    std::uint64_t bindingEpoch = 0;
+    // R.9I.3 P5B: nonzero only for a current-frame record (BuildCurrentFrameGeometry): valid for GPU consumers recorded
+    // later in exactly this recording generation, never the owner's current accepted geometry, never reused.
+    std::uint64_t currentFrameGeneration = 0;
+};
+using AcceptedTLASGeometryHandle = std::shared_ptr<const AcceptedTLASGeometry>;
+enum class ProspectiveJoinStatus
+{
+    Unavailable, Ready, WrongLifetime, StaleCandidate, IncompleteCapture, UnprovenRecording,
+    SourceUnavailable, MissingAssociation, DescriptorMismatch, CapacityExceeded,
+    MappingBudgetExceeded, AllocationFailed, ValidationFailed
 };
 
 class RayTracingSceneResources
@@ -71,11 +163,64 @@ class RayTracingSceneResources
         friend class RayTracingSceneResources;
         friend class Renderer;
         friend class SceneMembershipPublication;
+        friend class RayTracingRecordingDiagnostic;
         std::uint64_t m_rendererLifetime = 0;
         std::shared_ptr<CandidateState> m_state;
     };
 
     enum class CandidateStatus { Pending, Ready, NeedsTransformRefresh, Stale, Failed };
+
+    // P2.4 GPU reader of one current accepted record. The manager, not this
+    // handle, owns every dependency until the reading submission is resolved.
+    enum class GeometryReaderState : std::uint8_t
+    {
+        Acquired, Recorded, SubmissionUncertain, NotSubmitted, Submitted, Completed, Discarded
+    };
+
+    class GeometryReader
+    {
+    public:
+        GeometryReader() = default;
+        GeometryReader(const GeometryReader&) = delete;
+        GeometryReader& operator=(const GeometryReader&) = delete;
+        GeometryReader(GeometryReader&&) noexcept = default;
+        GeometryReader& operator=(GeometryReader&&) noexcept = default;
+
+        explicit operator bool() const noexcept { return static_cast<bool>(m_record); }
+        GeometryReaderState GetState() const noexcept;
+        const AcceptedTLASGeometryHandle& GetAcceptedGeometry() const noexcept;
+
+    private:
+        friend class RayTracingSceneResources;
+        struct Record;
+        std::shared_ptr<Record> m_record;
+    };
+
+    // A frame acquires after retiring every reader whose fence is observed complete (Renderer). Frame
+    // pacing leaves at most FrameCount earlier submissions unfinished, so one slot per in-flight frame
+    // plus the acquiring frame's is the steady-state bound; fewer refuse periodically whenever the GPU
+    // runs behind the CPU.
+    static constexpr std::size_t MaxGeometryReaders = CommandContext::FrameCount + 1;
+    std::size_t GetLiveGeometryReaderCount() const noexcept;
+    // Diagnostics: each slot's state and submission fence; nullopt for a free slot.
+    std::array<std::optional<std::pair<GeometryReaderState, std::uint64_t>>, MaxGeometryReaders>
+        DescribeGeometryReaders() const noexcept;
+
+    // The last staged preparation may become stale. This is never accepted or
+    // current scene evidence; only the private final publication handoff can accept it.
+    ProspectiveTLASGeometryJoinHandle GetStagedProspectiveJoin() const noexcept
+    {
+        return m_stagedProspectiveJoin;
+    }
+
+    ProspectiveJoinStatus GetProspectiveJoinStatus() const noexcept
+    {
+        return m_prospectiveJoinStatus;
+    }
+
+    static constexpr std::size_t MaxProspectiveJoins = 3;
+    static constexpr std::size_t MaxProspectiveRows = 4096;
+    static constexpr std::size_t MaxProspectiveMappingBytes = 1024 * 1024;
     // Bounded batch target, not an architectural constant: every proposal is
     // charged against the metadata/table/AS budgets below, and a candidate
     // retires one membership whatever its size.
@@ -164,6 +309,23 @@ class RayTracingSceneResources
     std::size_t GetInstanceCount() const;
     bool ValidateMaterialBindings(const Scene& scene) const;
 
+    // Scene-resource lifetime that association records carry; 0 when uninitialized.
+    std::uint64_t GetSceneResourceLifetime() const noexcept
+    {
+        return m_recordingOwner;
+    }
+
+    // Opt-in BLAS-side evidence only (no TLAS, material or caustic acceptance).
+    // Returns the ledger-owned record for the mesh's CURRENT registry build when the
+    // lifetime is current, the mesh still owns exactly this P2.1 generation, the
+    // build read that generation's resources/descriptor without override, and it is
+    // Completed with no submission uncertainty. Otherwise empty. Historical records
+    // are never returned. The returned handle counts against ledger capacity.
+    BLASAssociationHandle QueryCompletedBLASAssociation(
+        const Mesh& mesh,
+        const CausticContracts::Geometry::GeometrySourceHandle& source,
+        std::uint64_t sceneLifetime) const noexcept;
+
     private:
     friend class Renderer;
     friend class FileSceneRuntime;
@@ -176,8 +338,11 @@ class RayTracingSceneResources
     friend class SceneHierarchyVerification;
     friend class DescriptorRecoveryVerification;
     friend class ResidencyBatchVerification;
+    friend class CausticVisibleVerification;
 #endif
     friend class SceneMaterialBindingPublication;
+    // Ignored caustics diagnostic host: drives the real recording hooks below.
+    friend class RayTracingRecordingDiagnostic;
 #if defined(ENGINE_HAS_VERIFICATION)
     friend class SceneMaterialBindingVerification;
     friend class MaterialAdmissionVerification;
@@ -259,7 +424,64 @@ class RayTracingSceneResources
       const Mesh* mesh,
       const std::optional<RayTracingGeometryCounts>& countOverride);
 
+    // Attributes a just-recorded registry build to the active tracked recording;
+    // without one the build stays Unattributed. Candidate builds are not covered.
+    void AttributeRecordedBuild(BottomLevelAccelerationStructure& bottomLevel);
+    void AttributeRecordedTLAS(TopLevelAccelerationStructure& topLevel);
+    void TransitionRecordedBuilds(std::uint64_t generation, BLASRecordingState next);
+    void ConfirmRecordedBuilds(std::uint64_t generation, std::uint64_t fence, std::uint64_t lifetime);
+    std::uint64_t EnsureRecordingOwner();
+    // Candidate-owned new builds; implemented beside CandidateState.
+    void ObserveCandidateCompletion(std::uint64_t completed, std::uint64_t lifetime) noexcept;
+    TopLevelAccelerationStructure* GetCandidateTopLevel() noexcept;
+    const BLASBuildRecording* FindCandidateBuildRecording(BLASBuildIdentity identity) const noexcept;
+
+    // Bounded opt-in association ledger. Exhaustion or ineligibility never fails
+    // the ordinary build; it is counted and the build proceeds unassociated.
+    static constexpr std::size_t MaxAssociationRecords = 8;
+    static constexpr std::uint64_t MaxAssociationBLASBytes = 32ull * 1024 * 1024;
+    static constexpr std::size_t MaxAssociationReaders = 2;
+
+    struct AssociationReader
+    {
+        std::uint64_t fence = 0;
+        std::uint64_t lifetime = 0;
+    };
+
+    struct AssociationSlot
+    {
+        BLASAssociationHandle owned; // ledger ownership
+        std::weak_ptr<const BLASAssociationRecord> tracked; // live while any holder remains
+        std::array<AssociationReader, MaxAssociationReaders> readers{};
+    };
+
+    void AssociateRecordedBuild(ID3D12Device5* device, const Mesh& mesh,
+        const BottomLevelAccelerationStructure& bottomLevel) noexcept;
+    // Current (or retired/candidate) recording for the record's build; null once
+    // the owning BLAS no longer holds that build. current = it is the BLAS's current build.
+    const BLASBuildRecording* FindAssociatedBuild(const BLASAssociationRecord& record, bool& current) const noexcept;
+    // Readers of a Completed record only, with a confirmed fence and its lifetime.
+    bool RegisterAssociationReader(const BLASAssociationHandle& record, std::uint64_t fence,
+        std::uint64_t lifetime) noexcept;
+    void CollectAssociations(std::uint64_t completed, std::uint64_t lifetime) noexcept;
+    BLASAssociationStatistics GetAssociationStatistics() const noexcept;
+
+    std::array<AssociationSlot, MaxAssociationRecords> m_associations{};
+    std::uint64_t m_associationBudget = MaxAssociationBLASBytes; // lowered only by the diagnostic host
+    BLASAssociationStatistics m_associationRejections{};
+
+    // Scene-resource lifetime that disambiguates renderer generations in build
+    // provenance. Assigned when Initialize starts recording; cleared by Shutdown.
+    std::uint64_t m_recordingOwner = 0;
+
     static constexpr std::size_t InvalidInstanceIndex = static_cast<std::size_t>(-1);
+    // The published membership's native TLAS instance of a render object (its TLAS InstanceID is the render
+    // object index), or InvalidInstanceIndex.
+    std::size_t GetNativeInstance(std::size_t renderObject) const noexcept
+    {
+        return m_membership && renderObject < m_membership->renderObjectToInstance.size() ?
+            m_membership->renderObjectToInstance[renderObject] : InvalidInstanceIndex;
+    }
 
     // Scene-lifetime ownership, keyed by the existing Mesh identity. Mesh and
     // geometry ownership remain with the scene: checked renderer teardown must
@@ -333,6 +555,93 @@ class RayTracingSceneResources
         FileSceneAssetCatalog& catalog, std::string& error) const;
     bool HasMatchingCandidateSubmissionState(const ReplacementCandidate& handle) const noexcept;
     void ShutdownReplacementCandidate();
+    // Called only after coordinator final readiness/source validation. Repeats
+    // candidate currency checks; all optional work is before ordinary commit.
+    ProspectiveJoinStatus PrepareProspectiveJoin(const ReplacementCandidate& candidate,
+        const FileSceneRuntime& runtime, FileSceneAssetCatalog& catalog, const CommandContext& context,
+        std::uint64_t rendererLifetime) noexcept;
+    // Shared exact join validation. A candidate supplies its prospective snapshot;
+    // null joins the active membership with the runtime's committed identities.
+    // currentFrameGeneration (P5B, BuildCurrentFrameGeometry only): join the active membership's capture recorded in
+    // this still-open generation instead of a completed one; every other check is unchanged.
+    ProspectiveJoinStatus BuildGeometryJoin(const CandidateState* candidate, const FileSceneRuntime& runtime,
+        FileSceneAssetCatalog& catalog, const CommandContext& context, std::uint64_t rendererLifetime,
+        ProspectiveTLASGeometryJoinHandle& joined, std::uint64_t currentFrameGeneration = 0) noexcept;
+    BLASAssociationHandle FindProspectiveAssociation(const Mesh& mesh,
+        const TLASRecordingCapture::BLASReference& reference) const noexcept;
+    void InvalidateProspectiveJoin() noexcept;
+
+    // Reconstructed active membership only, at the Engine owner boundary. Never
+    // used by candidate publication; it issues the same accepted record.
+    enum class ReconstructionAcceptance { Pending, Refused, Accepted };
+    ReconstructionAcceptance AcceptReconstructedGeometry(const FileSceneRuntime& runtime,
+        FileSceneAssetCatalog& catalog, const CommandContext& context, const Scene* rendererScene,
+        std::uint64_t rendererLifetime) noexcept;
+    std::uint64_t GetMembershipAdoptionCount() const noexcept { return m_membershipAdoptions; }
+    std::uint64_t m_membershipAdoptions = 0; // Any adopted publication supersedes reconstruction evidence.
+
+    // Acquisition outside recording revalidates the record as the owner's current
+    // evidence. Recording binds it to the active list only while its exact capture
+    // is still the latest TLAS contents.
+    GeometryReader AcquireGeometryReader(const AcceptedTLASGeometryHandle& accepted, const FileSceneRuntime& runtime,
+        const Scene* rendererScene, std::uint64_t rendererLifetime) noexcept;
+    bool RecordGeometryReader(const GeometryReader& reader, std::uint64_t generation, std::uint64_t rendererLifetime,
+        D3D12_GPU_VIRTUAL_ADDRESS& topLevel) noexcept;
+
+    // R.9I.3 P5B: transform-only motion. Inside the active recording, after this frame's TLAS write, a record of the
+    // capture recorded in this generation, validated exactly as accepted geometry (rows, bindings, residency,
+    // completed BLAS builds, byte-exact instance/presentation transforms) except that its proof is "recorded in this
+    // list" rather than "completed". It is never m_acceptedGeometry; GPU work recorded after the TLAS write and its
+    // UAV barrier in the same list sees exactly that build, and the list executes all-or-nothing.
+    AcceptedTLASGeometryHandle BuildCurrentFrameGeometry(const FileSceneRuntime& runtime, FileSceneAssetCatalog& catalog,
+        const CommandContext& context, const Scene* rendererScene, std::uint64_t rendererLifetime,
+        std::uint64_t generation) noexcept;
+    GeometryReader AcquireCurrentFrameGeometryReader(const AcceptedTLASGeometryHandle& record,
+        const FileSceneRuntime& runtime, const Scene* rendererScene, std::uint64_t rendererLifetime,
+        std::uint64_t generation) noexcept;
+    // Current-frame joins never take the persistent/publication join slots.
+    std::array<std::weak_ptr<const ProspectiveTLASGeometryJoin>, MaxGeometryReaders + 1> m_currentFrameJoins;
+    // Diagnostics: current-frame joins built and their total CPU time.
+    std::uint64_t m_currentFrameJoinCount = 0;
+    std::uint64_t m_currentFrameJoinNanoseconds = 0;
+    // A reader recorded earlier in this list must finish before an in-place TLAS write.
+    void OrderRecordedGeometryReaders(ID3D12GraphicsCommandList4* commandList) noexcept;
+    void TransitionGeometryReaders(std::uint64_t generation, GeometryReaderState from, GeometryReaderState to) noexcept;
+    void CollectGeometryReaders(std::uint64_t completed, std::uint64_t lifetime) noexcept;
+    std::array<std::shared_ptr<GeometryReader::Record>, MaxGeometryReaders> m_geometryReaders;
+
+    enum class PublicationKind { Residency, Membership };
+    class PublicationHandoff
+    {
+    public:
+        PublicationHandoff() = default;
+        PublicationHandoff(PublicationHandoff&&) noexcept = default;
+        PublicationHandoff& operator=(PublicationHandoff&&) noexcept = default;
+        PublicationHandoff(const PublicationHandoff&) = delete;
+        PublicationHandoff& operator=(const PublicationHandoff&) = delete;
+    private:
+        friend class RayTracingSceneResources;
+        std::shared_ptr<AcceptedTLASGeometry> record;
+        std::shared_ptr<CandidateState> candidate;
+        const MembershipSnapshot* snapshot = nullptr;
+        const FileSceneRuntime* runtime = nullptr;
+        const void* transaction = nullptr;
+    };
+    PublicationHandoff PreparePublicationHandoff(const ReplacementCandidate&, const FileSceneRuntime&,
+        const void* transaction, PublicationKind) noexcept;
+    void CommitPublicationAcceptance(PublicationHandoff&&, const FileSceneRuntime&,
+        const Scene* rendererScene, std::uint64_t rendererLifetime, const void* transaction) noexcept;
+    bool MatchesAcceptedGeometry(const AcceptedTLASGeometry&, const FileSceneRuntime&,
+        const Scene* rendererScene, std::uint64_t rendererLifetime) const noexcept;
+    AcceptedTLASGeometryHandle QueryAcceptedGeometry(const FileSceneRuntime&,
+        const Scene* rendererScene, std::uint64_t rendererLifetime) const noexcept;
+    mutable AcceptedTLASGeometryHandle m_acceptedGeometry;
+    std::weak_ptr<const AcceptedTLASGeometry> m_publicationHandoff;
+
+    std::array<std::weak_ptr<const ProspectiveTLASGeometryJoin>, MaxProspectiveJoins> m_prospectiveJoins;
+    ProspectiveTLASGeometryJoinHandle m_stagedProspectiveJoin;
+    ProspectiveJoinStatus m_prospectiveJoinStatus = ProspectiveJoinStatus::Unavailable;
+    std::size_t m_prospectiveMappingBudget = MaxProspectiveMappingBytes; // Diagnostic may only tighten.
 
     // One independently owned candidate; manager pin prevents destruction on
     // handle cancellation while recorded/submitted work still references it.

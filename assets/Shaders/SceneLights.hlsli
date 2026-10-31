@@ -2,7 +2,10 @@
 #define ENGINE_SCENE_LIGHTS
 
 // LIGHT.1 unshadowed Light table; identical layout to GPULight/SceneLightConstants in ShaderData.h.
-// direction is the direction light travels; radiance is color * intensity, applied once.
+// direction is the direction light travels; radiance is the light's value in GPU render units (luminous
+// intensity for Point/Spot, illuminance for Directional, times the unit-luminance tint and the scene pre-scale;
+// FrameLighting.cpp), applied once. |range| is the Point/Spot influence radius; a positive range fades to zero
+// approaching it (range attenuation), a negative one keeps the raw inverse-square law up to a hard cutoff.
 struct GPULight
 {
     float3 position;
@@ -28,9 +31,11 @@ static const uint SCENE_LIGHT_DIRECTIONAL = 2u;
 static const float SCENE_LIGHT_MINIMUM_DISTANCE = 0.01f;
 
 // Radiance arriving at a surface from one table Light (before BRDF and N.L), and the direction
-// towards it. Point and Spot: inverse-square falloff windowed smoothly to zero at range
-// (saturate(1 - (d / range)^4)^2). Spot: additionally (smoothstep-like) t^2 between the outer and
-// inner cone cosines. Directional: constant, no range.
+// towards it. Point and Spot: physical inverse-square falloff, zero at and beyond |range| (every path's
+// per-light culling test). With range attenuation (range > 0) it is also windowed smoothly to zero,
+// saturate(1 - (d / range)^4)^2; without (range < 0) the inverse-square law holds up to the cutoff.
+// Spot: additionally t^2 between the outer and inner cone cosines, the profile its flux is normalized
+// over (Photometry::SpotEmissionSolidAngle). Directional: constant illuminance.
 float3 EvaluateSceneLightIncidence(GPULight light, float3 surfacePosition, out float3 directionToLight)
 {
     if(light.type == SCENE_LIGHT_DIRECTIONAL)
@@ -44,16 +49,25 @@ float3 EvaluateSceneLightIncidence(GPULight light, float3 surfacePosition, out f
     float distance = sqrt(distanceSquared);
     directionToLight = distance > 0.0f ? toLight / distance : float3(0.0f, 0.0f, 1.0f);
 
-    if(!(distance < light.range))
+    float range = abs(light.range);
+
+    if(!(distance < range))
     {
         return float3(0.0f, 0.0f, 0.0f);
     }
 
-    float rangeRatio = distance / light.range;
-    float rangeRatioSquared = rangeRatio * rangeRatio;
-    float window = saturate(1.0f - rangeRatioSquared * rangeRatioSquared);
+    float window = 1.0f;
+
+    if(light.range > 0.0f)
+    {
+        float rangeRatio = distance / range;
+        float rangeRatioSquared = rangeRatio * rangeRatio;
+        float fade = saturate(1.0f - rangeRatioSquared * rangeRatioSquared);
+        window = fade * fade;
+    }
+
     float clampedDistanceSquared = max(distanceSquared, SCENE_LIGHT_MINIMUM_DISTANCE * SCENE_LIGHT_MINIMUM_DISTANCE);
-    float attenuation = (window * window) / clampedDistanceSquared;
+    float attenuation = window / clampedDistanceSquared;
 
     if(light.type == SCENE_LIGHT_SPOT)
     {

@@ -292,6 +292,11 @@ SceneMembershipPublication::Result SceneMembershipPublication::PublishAtBoundary
         p.target->GetScene().GetCamera()=active->GetScene().GetCamera();
         p.target->GetScene().SetLightingSettings(active->GetScene().GetLightingSettings());
         Result success{Status::Ready,"Membership published."};
+        // All final validation has passed. This allocates only optional advisory evidence.
+        r.m_rayTracingScene.PrepareProspectiveJoin(p.gpu, *p.target, catalog,
+            r.m_commandContext, r.m_sceneResourceLifetime);
+        auto geometryHandoff = r.m_rayTracingScene.PreparePublicationHandoff(p.gpu, *p.target, this,
+            RayTracingSceneResources::PublicationKind::Membership);
         // Allocation-free exclusive commit: no frame observes mixed CPU/GPU order.
         r.m_rayTracingScene.AdoptPreparedCandidate(p.gpu,evidence);
         active.swap(p.target);
@@ -299,6 +304,8 @@ SceneMembershipPublication::Result SceneMembershipPublication::PublishAtBoundary
         selectionIndex=mapped;
         r.InvalidateSceneLighting(SceneLightingInvalidation::Membership);
         r.ResetSceneHistory();
+        r.m_rayTracingScene.CommitPublicationAcceptance(std::move(geometryHandoff), *active,
+            r.m_sceneResourceScene, r.m_sceneResourceLifetime, this);
         m_prepared.reset();
         return success;
     }

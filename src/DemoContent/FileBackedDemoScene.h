@@ -211,6 +211,7 @@ private:
     friend class DescriptorRecoveryVerification;
     friend class ViewportMaterialDropVerification;
     friend class ResidencyBatchVerification;
+    friend class CausticVisibleVerification;
 #endif
     // Engine retains both runtimes until checked candidate initialization/cleanup.
     std::unique_ptr<FileSceneRuntime> m_objectMutationCandidate;

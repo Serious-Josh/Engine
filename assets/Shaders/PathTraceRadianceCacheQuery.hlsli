@@ -497,7 +497,16 @@ bool PathTraceRadianceCacheSubstitute(uint primary, float3 position, PathTraceSu
 
                 if(missed && radianceCache.queryMode != 3u)
                 {
-                    incident += PathTraceMissRadiance(bsdfSample.direction, false, bsdfSample.pdf);
+                    float3 missRadiance = PathTraceMissRadiance(bsdfSample.direction, false, bsdfSample.pdf);
+
+                    // Only x1's own miss is a fresh indirect contribution; the cached term is a mean of harvested
+                    // suffixes that were already clamped, so it is never clamped again.
+                    if(PathTraceIndirectClampActive(1u))
+                    {
+                        missRadiance *= PathTraceIndirectClampScale(throughput * missRadiance);
+                    }
+
+                    incident += missRadiance;
                 }
 
                 radiance += throughput * incident;

@@ -48,7 +48,7 @@ cbuffer DirectionalLightConstants : register(b2)
     float lightIntensity;
 
     float3 lightColor;
-    float ambientStrength;
+    float lightPadding;
 }
 
 #include "SceneLights.hlsli"

@@ -466,6 +466,7 @@ private:
     friend class SceneLifecycleVerification;
     friend class AssetBrowserSceneVerification;
     friend class StartupSceneVerification;
+    friend class CausticVisibleVerification;
     friend class ProjectSystemWorkflowVerification;
     friend class ProjectRelaunchVerification;
     friend class SceneDuplicationVerification;
@@ -862,7 +863,7 @@ private:
     std::optional<SceneObjectMetadata> m_lightInspection;
     std::optional<LightComponent> m_lightInspectedValue;
     std::uint64_t m_lightInspectionEpoch = 0;
-    // Displayed units (angles in degrees): intensity, range, inner and outer cone angle.
+    // Displayed units (angles in degrees): intensity (lm or lux), range, inner and outer cone angle, angular radius.
     std::array<float, 5> m_lightDragDrafts{};
     // Color gesture draft: edited live in the widget, committed once when the gesture ends.
     Vector3 m_lightColorDraft{1.0f, 1.0f, 1.0f};
@@ -1082,7 +1083,7 @@ private:
     void DrawObjectControls(IDemoScene& demoScene);
     void DrawStressTestControls(StressTestScene& demoScene);
     void DrawSphereGridControls(SphereGridScene& demoScene);
-    void DrawDirectionalLight(IDemoScene& demoScene);
+    void DrawDirectionalLight(IDemoScene& demoScene, const DebugUI& debugUI);
     void DrawCamera(IDemoScene& demoScene);
 
     size_t m_selectedObject = InvalidObjectSelection;

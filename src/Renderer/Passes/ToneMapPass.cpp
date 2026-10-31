@@ -45,7 +45,7 @@ bool ToneMapPass::Initialize(
 
     pipelineDescription.renderTargets.formats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
 
-    pipelineDescription.rootParameters.push_back({RootParameterType::Constants, 0, 11, D3D12_SHADER_VISIBILITY_PIXEL});
+    pipelineDescription.rootParameters.push_back({RootParameterType::Constants, 0, 12, D3D12_SHADER_VISIBILITY_PIXEL});
 
     if (!m_pipeline.Initialize(device, pipelineDescription))
     {
@@ -68,7 +68,9 @@ void ToneMapPass::Execute(
     RenderTarget* selectionMask,
     const Vector3& outlineColor,
     unsigned int outlineThickness,
-    unsigned int debugDepthIndex)
+    unsigned int debugDepthIndex,
+    ToneMapOperator toneMapOperator,
+    unsigned int exposureStateIndex)
 {
     sceneColor.Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
@@ -94,7 +96,7 @@ void ToneMapPass::Execute(
     struct ToneMapConstants
     {
         unsigned int sceneColorIndex;
-        float exposure;
+        unsigned int exposureStateIndex;
         unsigned int debugTextureIndex;
         unsigned int debugView;
         float nrdDenoisingRange;
@@ -103,6 +105,7 @@ void ToneMapPass::Execute(
         unsigned int outlineThickness;
         unsigned int debugDepthIndex;
         float outlineColor[3];
+        unsigned int toneMapOperator;
     };
 
 #ifdef NDEBUG
@@ -114,7 +117,7 @@ void ToneMapPass::Execute(
 
     ToneMapConstants constants{};
     constants.sceneColorIndex = sceneColor.GetSRVIndex();
-    constants.exposure = 1.0f;
+    constants.exposureStateIndex = exposureStateIndex;
     constants.debugDepthIndex = debugDepthIndex;
     constants.debugTextureIndex =
         debugRenderTarget ? debugRenderTarget->GetSRVIndex() : (debugTexture ? debugTexture->GetDescriptorIndex() : 0);
@@ -141,7 +144,9 @@ void ToneMapPass::Execute(
     constants.outlineColor[1] = outlineColor.y;
     constants.outlineColor[2] = outlineColor.z;
 
-    commandList->SetGraphicsRoot32BitConstants(0, 11, &constants, 0);
+    constants.toneMapOperator = static_cast<unsigned int>(toneMapOperator);
+
+    commandList->SetGraphicsRoot32BitConstants(0, 12, &constants, 0);
 
     commandList->DrawInstanced(3, 1, 0, 0);
 }

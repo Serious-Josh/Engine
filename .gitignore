@@ -30,6 +30,7 @@ CmakeUserPresets.json
 **/*-tests/
 **/*Verification.cpp
 **/*Tests.cpp
+/tools
 
 # Internal documentation
 /Documentation/

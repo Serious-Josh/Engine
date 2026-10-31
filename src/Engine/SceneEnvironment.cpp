@@ -10,7 +10,8 @@
 #include "Core/Log.h"
 namespace
 {
-bool LoadProjectEnvironment(Renderer& renderer,const std::filesystem::path& root,const ProjectAssetRegistry& registry,const std::string& reference)
+bool LoadProjectEnvironment(Renderer& renderer,const std::filesystem::path& root,const ProjectAssetRegistry& registry,const std::string& reference,
+    float radianceScale)
 {
         const auto id=AssetID::ParseReference(reference);
         const auto* record=id?registry.Find(*id):nullptr;
@@ -22,8 +23,22 @@ bool LoadProjectEnvironment(Renderer& renderer,const std::filesystem::path& root
         const auto hash=CookedSurface::Hash(std::as_bytes(std::span(image.pixels)));
         std::string identity="project:"+std::filesystem::canonical(root).generic_string()+":"+id->ToString()+":"+std::to_string(image.width)+"x"+std::to_string(image.height)+":";
         constexpr char hex[]="0123456789abcdef"; for(auto b:hash) { auto v=std::to_integer<unsigned>(b); identity+=hex[v>>4]; identity+=hex[v&15]; }
-        return renderer.SetEnvironmentImage(&image,identity,resolved.resolvedPath.stem().string(),reference);
+        return renderer.SetEnvironmentImage(&image,identity,resolved.resolvedPath.stem().string(),reference,radianceScale);
 }
+}
+// The active scene's HDRI calibration (scene environment luminance scale times its render pre-scale).
+float Engine::ActiveEnvironmentRadianceScale() const
+{
+    const auto* scene=m_demoSceneManager.TryGetActiveScene();
+    return EnvironmentRadianceMultiplier(scene ? scene->GetScene().GetLightingSettings() : SceneLightingSettings{});
+}
+// Rebuilds the scene environment when its calibration was edited (scene changes apply it on activation).
+void Engine::RefreshSceneEnvironmentCalibration()
+{
+    if(!dynamic_cast<FileBackedDemoScene*>(m_demoSceneManager.TryGetActiveScene())) return;
+    if(ActiveEnvironmentRadianceScale()==m_appliedEnvironmentRadianceScale) return;
+    std::string error;
+    if(!ApplySceneEnvironment(error)) Log::Error("Scene environment calibration failed: "+error);
 }
 bool Engine::ApplySceneEnvironment(std::string& error)
 {
@@ -31,18 +46,20 @@ bool Engine::ApplySceneEnvironment(std::string& error)
     {
         auto* scene=dynamic_cast<FileBackedDemoScene*>(m_demoSceneManager.TryGetActiveScene());
         if(!scene) return true;
+        const float scale=ActiveEnvironmentRadianceScale();
+        m_appliedEnvironmentRadianceScale=scale;
         const auto& reference=scene->GetScene().GetEnvironmentReference();
         if(reference == SceneDocument::NoneEnvironmentReference)
-            return m_renderer.SetEnvironmentImage(nullptr,reference,"None",reference);
+            return m_renderer.SetEnvironmentImage(nullptr,reference,"None",reference,scale);
         if(scene->IsArchiveActivation())
         {
             const auto source=scene->ArchiveSource(); const auto identity=CookedEnvironment::ArchiveIdentity(*source);
-            if(identity==m_renderer.GetEnvironmentIdentity()) return true;
+            if(Renderer::CalibratedEnvironmentIdentity(identity,scale)==m_renderer.GetEnvironmentIdentity()) return true;
             auto image=CookedEnvironment::ReadArchive(*source);
-            return m_renderer.SetEnvironmentImage(image?&*image:nullptr,identity,image?"Packaged HDRI":"Neutral",reference);
+            return m_renderer.SetEnvironmentImage(image?&*image:nullptr,identity,image?"Packaged HDRI":"Neutral",reference,scale);
         }
-        if(reference.empty()) return m_renderer.SetEnvironmentImage(nullptr,"neutral","Neutral");
-        return LoadProjectEnvironment(m_renderer,scene->GetProjectRoot(),m_projectAssetRegistry,reference);
+        if(reference.empty()) return m_renderer.SetEnvironmentImage(nullptr,"neutral","Neutral",{},scale);
+        return LoadProjectEnvironment(m_renderer,scene->GetProjectRoot(),m_projectAssetRegistry,reference,scale);
     }
     catch(const std::exception& e) { error=e.what(); return false; }
 }
@@ -56,11 +73,12 @@ bool Engine::AssignSceneEnvironment(size_t index,std::string& error)
             const auto& entries=m_renderer.GetAvailableEnvironments();
             if(index>=entries.size()) { error="Invalid HDRI selection."; return false; }
             const auto selected=entries[index];
-            if(!selected.relativePath.empty()) return m_renderer.SetEnvironment(index);
+            const float scale=ActiveEnvironmentRadianceScale();
+            if(!selected.relativePath.empty()) return m_renderer.SetEnvironment(index,scale);
             if(selected.reference == SceneDocument::NoneEnvironmentReference)
-                return m_renderer.SetEnvironmentImage(nullptr,selected.reference,"None",selected.reference);
-            if(selected.reference.empty()) return m_renderer.SetEnvironmentImage(nullptr,"neutral","Neutral");
-            return LoadProjectEnvironment(m_renderer,GetActiveProject().GetRoot(),m_projectAssetRegistry,selected.reference);
+                return m_renderer.SetEnvironmentImage(nullptr,selected.reference,"None",selected.reference,scale);
+            if(selected.reference.empty()) return m_renderer.SetEnvironmentImage(nullptr,"neutral","Neutral",{},scale);
+            return LoadProjectEnvironment(m_renderer,GetActiveProject().GetRoot(),m_projectAssetRegistry,selected.reference,scale);
         }
         catch(const std::exception& e) { error=e.what(); return false; }
     }

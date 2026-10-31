@@ -23,6 +23,8 @@ struct SceneCameraDocument
     float aspectRatio = 16.0f / 9.0f;
     float nearPlane = 0.1f;
     float farPlane = 1000.0f;
+    // The Editor viewport camera's own exposure, independent of every scene Camera.
+    CameraExposure exposure;
 };
 
 struct SceneObjectDocument
@@ -76,7 +78,9 @@ struct SceneDocument
     static constexpr std::uint32_t kLightSchemaVersion = 11;
     static constexpr std::uint32_t kEnvironmentNoneSchemaVersion = 12;
     static constexpr std::uint32_t kObjectLightingSchemaVersion = 13;
-    static constexpr std::uint32_t kSchemaVersion = kObjectLightingSchemaVersion;
+    // Physical light units (PhotometricUnits.h); earlier versions are converted on load.
+    static constexpr std::uint32_t kPhysicalLightingSchemaVersion = 14;
+    static constexpr std::uint32_t kSchemaVersion = kPhysicalLightingSchemaVersion;
 
     std::uint32_t schemaVersion = kSchemaVersion;
 

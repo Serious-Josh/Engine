@@ -472,11 +472,19 @@ MeshResidencyPublication::AcceptanceResult MeshResidencyPublication::PublishAtBo
         return result;
     }
 
-    // Everything fallible is complete. Keep every unique source pinned across the
-    // entire noexcept commit. Even the result strings have already been constructed.
+    // Ordinary readiness is complete. Keep every unique source pinned through
+    // optional preparation and the noexcept commit; result strings already exist.
     assert(sourcePins && static_cast<bool>(*sourcePins));
+    // Optional advisory evidence: refusal never changes ordinary publication.
+    renderer.m_rayTracingScene.PrepareProspectiveJoin(*m_candidate, runtime, catalog,
+        renderer.m_commandContext, renderer.m_sceneResourceLifetime);
+    auto geometryHandoff = renderer.m_rayTracingScene.PreparePublicationHandoff(*m_candidate, runtime, this,
+        RayTracingSceneResources::PublicationKind::Residency);
     result.published = true;
     ApplyPreparedPublication(renderer, runtime, evidence);
+    // GPU adoption, CPU residency and presentation/binding updates are complete.
+    renderer.m_rayTracingScene.CommitPublicationAcceptance(std::move(geometryHandoff), runtime,
+        renderer.m_sceneResourceScene, renderer.m_sceneResourceLifetime, this);
     return result;
 }
 

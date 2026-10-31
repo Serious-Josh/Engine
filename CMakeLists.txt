@@ -271,6 +271,8 @@ add_library(EngineCore OBJECT
     src/Renderer/Passes/NrdHistoryConfidencePass.cpp
     src/Renderer/Passes/ReflectionContributionLimitPass.cpp
     src/Renderer/Passes/NrdReflectionResolvePass.cpp
+    src/Renderer/Caustics/CausticPass.cpp
+    src/Renderer/Caustics/PixelCausticPass.cpp
     src/DemoContent/DemoSceneManager.cpp
     src/DemoContent/MirrorTestScene.cpp
     src/Renderer/GpuTimestampProfiler.cpp

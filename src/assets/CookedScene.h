@@ -19,7 +19,11 @@ namespace CookedScene
     inline constexpr std::uint32_t LightVersion = 11;
     inline constexpr std::uint32_t EnvironmentNoneVersion = 12;
     inline constexpr std::uint32_t ObjectLightingVersion = 13;
-    inline constexpr std::uint32_t Version = ObjectLightingVersion;
+    // Physical light units (PhotometricUnits.h): no range; scene calibration replaces ambient strength.
+    inline constexpr std::uint32_t PhysicalLightingVersion = 14;
+    // Photographic exposure on every Camera component and on the Editor viewport camera.
+    inline constexpr std::uint32_t CameraExposureVersion = 15;
+    inline constexpr std::uint32_t Version = CameraExposureVersion;
 
     constexpr bool IsSupportedVersion(std::uint32_t version)
     {
@@ -35,7 +39,9 @@ namespace CookedScene
             version == CameraVersion ||
             version == LightVersion ||
             version == EnvironmentNoneVersion ||
-            version == ObjectLightingVersion;
+            version == ObjectLightingVersion ||
+            version == PhysicalLightingVersion ||
+            version == CameraExposureVersion;
     }
     struct Policy
     {

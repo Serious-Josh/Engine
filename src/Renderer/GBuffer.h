@@ -14,6 +14,13 @@ class GBuffer
     // declares this format for render target 0 (FOUNDATION.4).
     static constexpr DXGI_FORMAT MaterialFormat = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
 
+    // R.9I.3 P5D.2A raster identity (render target 4): (TLAS InstanceID + 1, TLAS primitive index) of the surviving
+    // fragment. Cleared to (0, 0) = background; (InvalidIdentity, InvalidIdentity) = a draw with no exact TLAS mapping.
+    // Always allocated with the G-buffer: D3D12 permits a null RTV only where the pipeline format is UNKNOWN, so a
+    // caustics-only allocation would need a second set of G-buffer pipelines.
+    static constexpr DXGI_FORMAT IdentityFormat = DXGI_FORMAT_R32G32_UINT;
+    static constexpr unsigned int InvalidIdentity = 0xFFFFFFFFu;
+
     GBuffer() = default;
 
     GBuffer(const GBuffer&) = delete;
@@ -49,6 +56,9 @@ class GBuffer
     const DepthBuffer& GetDepth() const;
     const RenderTarget& GetMotion() const;
 
+    RenderTarget& GetIdentity() { return m_identity; }
+    const RenderTarget& GetIdentity() const { return m_identity; }
+
     private:
     RenderTarget m_material;
     RenderTarget m_surface;
@@ -56,4 +66,6 @@ class GBuffer
     RenderTarget m_motion;
 
     DepthBuffer m_depth;
+
+    RenderTarget m_identity;
 };

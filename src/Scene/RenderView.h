@@ -57,6 +57,9 @@ struct RenderView
 
     std::uint32_t width = 0;
     std::uint32_t height = 0;
+
+    // The viewing camera's photographic exposure (a scene Camera's own, or the Editor viewport's).
+    CameraExposure exposure;
 };
 
 // The Editor fly camera exactly as rendered before CAM.4: its fixed-up LookAt view and its own

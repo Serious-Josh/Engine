@@ -12,13 +12,16 @@ class DescriptorHeap;
 class EnvironmentMap
 {
     public:
+    // radianceScale multiplies every texel's RGB on upload (EnvironmentRadianceMultiplier: the scene's
+    // environment luminance scale times its render pre-scale); 1 uploads the source unchanged.
     bool Initialize(
       ID3D12Device* device,
       const std::filesystem::path& path,
       ResourceUploader& uploader,
-      DescriptorHeap& descriptorHeap);
+      DescriptorHeap& descriptorHeap,
+      float radianceScale = 1.0f);
 
-    bool Initialize(ID3D12Device*, const HDRImageData&, ResourceUploader&, DescriptorHeap&);
+    bool Initialize(ID3D12Device*, const HDRImageData&, ResourceUploader&, DescriptorHeap&, float radianceScale = 1.0f);
     void Shutdown();
 
     Texture& GetSourceTexture();

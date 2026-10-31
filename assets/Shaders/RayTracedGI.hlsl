@@ -71,7 +71,7 @@ struct DirectionalLightConstants
     float lightIntensity;
 
     float3 lightColor;
-    float ambientStrength;
+    float lightPadding;
 };
 
 ConstantBuffer<DirectionalLightConstants> lightConstants : register(b1);

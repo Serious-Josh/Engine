@@ -8,7 +8,7 @@
 // - Point, Spot and table Directional lights are delta lights: sampled only by NEE (MIS weight 1),
 //   never found by BSDF sampling. Incidence is EvaluateSceneLightIncidence, shared with deferred.
 // - The frame sun (legacy sun or shadow-owner Directional) is a uniform-radiance disk of half-angle
-//   angularRadius whose irradiance at normal incidence equals the authored intensity. NEE samples the
+//   angularRadius whose irradiance at normal incidence equals the authored illuminance. NEE samples the
 //   cone uniformly; BSDF-sampled misses inside the cone add its radiance. Both use the power heuristic.
 //   A zero angular radius degrades to a delta directional light.
 // - The HDRI is sampled with its existing marginal/conditional CDF (exact solid-angle density inside
@@ -31,7 +31,7 @@ struct PathTraceSun
 {
     float3 directionToSun;
     float cosAngularRadius; // 1 for a delta sun.
-    float3 irradiance;      // color * intensity at normal incidence.
+    float3 irradiance;      // Illuminance at normal incidence in render units (unit-luminance tint * pre-scaled lux).
 };
 
 struct PathTraceLightSample
@@ -165,7 +165,10 @@ bool PathTraceSunHasEnergy(PathTraceSun sun)
     return any(sun.irradiance > 0.0f) && all(isfinite(sun.irradiance));
 }
 
-// Radiance of the sun disk seen along direction (zero outside the cone or for a delta sun).
+// Radiance of the sun disk seen along direction (zero outside the cone or for a delta sun). A uniform disk of
+// half-angle alpha delivers E = integral of L cos(theta) d omega = L pi sin^2(alpha) at normal incidence, so
+// L = E / (pi (1 - c)(1 + c)) with c the same cosine the sampler and PDF use: the irradiance of the cone actually
+// sampled is exactly E.
 float3 PathTraceSunRadiance(PathTraceSun sun, float3 direction)
 {
     if(PathTraceSunIsDelta(sun) || !PathTraceSunHasEnergy(sun) || dot(direction, sun.directionToSun) < sun.cosAngularRadius)
@@ -173,7 +176,8 @@ float3 PathTraceSunRadiance(PathTraceSun sun, float3 direction)
         return float3(0.0f, 0.0f, 0.0f);
     }
 
-    return sun.irradiance / PathTraceSunSolidAngle(sun);
+    float sinSquared = (1.0f - sun.cosAngularRadius) * (1.0f + sun.cosAngularRadius);
+    return sun.irradiance / (PI * sinSquared);
 }
 
 float PathTraceSunPdf(PathTraceSun sun, float3 direction)

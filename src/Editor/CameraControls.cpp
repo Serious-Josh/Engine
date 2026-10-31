@@ -1,5 +1,6 @@
 #include "Editor/Editor.h"
 #include "Editor/InspectorNumericDrag.h"
+#include "Editor/ExposureControls.h"
 #include "DemoContent/FileBackedDemoScene.h"
 #include "Math/Math.h"
 #include <imgui.h>
@@ -388,6 +389,18 @@ void Editor::DrawObjectCameraControls(IDemoScene& scene)
     if(ImGui::Checkbox("Main Camera", &main) && !blocked)
     {
         CommitCameraMainDesignation(scene, *selection, main);
+    }
+
+    // Exposure of this Camera when it is the viewing camera (presentation only; one undoable edit per change).
+    ImGui::SeparatorText("Exposure");
+    CameraExposure exposure = camera.exposure;
+
+    if(DrawExposureControls("camera-exposure", exposure, scene.GetScene().GetLightingSettings().referenceEV100, nullptr) &&
+        !blocked)
+    {
+        auto edited = camera;
+        edited.exposure = exposure;
+        CommitObjectCamera(scene, *selection, object.camera, edited);
     }
 
     ImGui::EndDisabled();

@@ -1138,7 +1138,7 @@ SharcSettings DebugUI::GetSharcSettings() const
     settings.statistics = m_sharcStatistics;
     settings.resetRequest = m_sharcResetRequest;
     settings.adaptiveResolution = m_sharcSpatialResolution == 1;
-    settings.historyPrior = m_sharcHistoryPrior && m_pathTraceDenoiserMode == PathTraceDenoiserMode::Engine;
+    settings.historyPrior = m_sharcHistoryPrior && GetSelectedPathTraceDenoiserMode() == PathTraceDenoiserMode::Engine;
     return settings;
 }
 
@@ -1160,7 +1160,7 @@ void DebugUI::DrawSharcSettings()
     const char* spatialResolutions[] = {"Uniform 10 cm", "Adaptive (default)"};
     ImGui::Combo("Spatial resolution", &m_sharcSpatialResolution, spatialResolutions, IM_ARRAYSIZE(spatialResolutions));
     // Initializes rejected denoiser history from the cache, so it needs the Engine PT denoiser.
-    ImGui::BeginDisabled(m_pathTraceDenoiserMode != PathTraceDenoiserMode::Engine);
+    ImGui::BeginDisabled(GetSelectedPathTraceDenoiserMode() != PathTraceDenoiserMode::Engine);
     ImGui::Checkbox("SHARC-assisted history initialization (experimental)", &m_sharcHistoryPrior);
     ImGui::EndDisabled();
     ImGui::Checkbox("Freeze training", &m_sharcFreezeTraining);
@@ -1325,6 +1325,10 @@ void DebugUI::DrawPathTraceReferenceSettings()
     ImGui::Combo("Lighting mode", &m_lightingMode, modes, IM_ARRAYSIZE(modes));
     ImGui::EndDisabled();
 
+    // Final display mapping only, in every lighting mode; switching keeps the HDR image and accumulation.
+    const char* toneMappers[] = {"Existing", "GT7"};
+    ImGui::Combo("Tone mapper", &m_toneMapOperator, toneMappers, IM_ARRAYSIZE(toneMappers));
+
     const bool transitionFailed = m_lightingTransition.stage == LightingModeTransitionStage::Failed &&
         m_lightingTransition.requested == GetLightingMode();
 
@@ -1434,7 +1438,9 @@ void DebugUI::DrawPathTraceReferenceSettings()
         // (experimental); NRD.RELAX.4: RELAX (experimental); HYBRID.5: the hybrid (experimental).
         const char* denoiserModes[] = {"Off", "Engine", "NRD REBLUR (experimental)", "NRD RELAX (experimental)",
                                        "NRD Hybrid (experimental)"};
-        int denoiserMode = static_cast<int>(m_pathTraceDenoiserMode);
+        // Until a choice is made the lighting mode's default is shown (Hybrid with ReSTIR DI, Engine otherwise);
+        // choosing one keeps it for both raster-primary modes.
+        int denoiserMode = static_cast<int>(GetSelectedPathTraceDenoiserMode());
 
         if (ImGui::Combo("PT denoiser", &denoiserMode, denoiserModes, IM_ARRAYSIZE(denoiserModes)))
         {
@@ -1446,7 +1452,7 @@ void DebugUI::DrawPathTraceReferenceSettings()
             ImGui::TextWrapped("%s", m_pathTraceDenoiserPreparation.c_str());
         }
 
-        if (IsNrdPathTraceDenoiserMode(m_pathTraceDenoiserMode))
+        if (IsNrdPathTraceDenoiserMode(GetSelectedPathTraceDenoiserMode()))
         {
             if (!m_pathTraceNrdStatus.empty())
             {
@@ -1460,7 +1466,7 @@ void DebugUI::DrawPathTraceReferenceSettings()
         }
 
         // DENOISE.1: stage isolation for diagnosing the denoiser; the defaults are the production pipeline.
-        if (m_pathTraceDenoiserMode == PathTraceDenoiserMode::Engine)
+        if (GetSelectedPathTraceDenoiserMode() == PathTraceDenoiserMode::Engine)
         {
             const char* spatialFilters[] = {"Off", "5x5 single pass", "A-trous, 1 iteration",
                                             "A-trous, 2 iterations (default)"};
@@ -1513,6 +1519,75 @@ void DebugUI::DrawPathTraceReferenceSettings()
     else
     {
         ImGui::TextUnformatted("Waiting for a scene with ray-traced geometry.");
+    }
+
+    // R.9I.3: added to the undenoised path-traced image, which keeps its own naturally sampled caustics. Restricted
+    // domain (registered static reflector/receiver, one point light, PT denoiser Off); refusals render unchanged.
+    if (m_lightingMode >= 1 && m_lightingMode <= 3)
+    {
+        ImGui::SeparatorText("Dedicated Caustics");
+        if (ImGui::Checkbox("Dedicated caustics (experimental)", &m_dedicatedCaustics) && m_dedicatedCaustics)
+        {
+            m_pixelCentredCaustics = false;
+        }
+
+        ImGui::BeginDisabled(!m_dedicatedCaustics);
+        ImGui::Checkbox("Caustic-only view", &m_causticOnlyView);
+        ImGui::EndDisabled();
+
+        // R.9I.3 production integration (P1: K = 1 estimator, caustics-only views): Raster Primary + ReSTIR DI.
+        ImGui::BeginDisabled(m_lightingMode != 3);
+
+        if (ImGui::Checkbox("Pixel-centred caustics (experimental)", &m_pixelCentredCaustics) && m_pixelCentredCaustics)
+        {
+            m_dedicatedCaustics = false;
+        }
+
+        ImGui::EndDisabled();
+
+        if (m_pixelCentredCaustics)
+        {
+            static const char* const views[] = {"Ordinary image", "Caustic diffuse", "Caustic specular",
+                                                "Caustic combined", "Caustic validity"};
+            int view = static_cast<int>(m_pixelCausticView);
+
+            if (ImGui::Combo("Caustic view", &view, views, IM_ARRAYSIZE(views)))
+            {
+                m_pixelCausticView = static_cast<std::uint32_t>(view);
+            }
+
+            // P2: needs a PT denoiser (the extraction it adds into); maxPathDepth 1 avoids the known overlap.
+            ImGui::Checkbox("Add to lighting before denoising (experimental)", &m_pixelCausticInsertion);
+
+            ImGui::TextWrapped("Pixel-centred: %s", m_pixelCausticReason.c_str());
+            ImGui::Text("Seams verified: %llu of %llu", static_cast<unsigned long long>(m_pixelCausticVerifiedSeams),
+                        static_cast<unsigned long long>(m_pixelCausticSeamVisits));
+            ImGui::Text("GPU-completed frames: %llu (faulted %llu, last flags 0x%X)",
+                        static_cast<unsigned long long>(m_pixelCausticCompletedFrames),
+                        static_cast<unsigned long long>(m_pixelCausticFaultedFrames), m_pixelCausticLastFaults);
+            ImGui::Text("Caustic memory: %.2f MiB",
+                        static_cast<double>(m_pixelCausticResourceBytes) / (1024.0 * 1024.0));
+        }
+
+        if (m_dedicatedCaustics)
+        {
+            ImGui::TextWrapped("Status: %s", m_causticReason.c_str());
+            ImGui::Text("Presented last frame: %s", m_causticPresented ? "yes" : "no");
+            ImGui::Text("Accumulated frames: %llu x 65536 attempts",
+                        static_cast<unsigned long long>(m_causticHistoryFrames));
+            ImGui::Text("Caustic memory: %.2f MiB", static_cast<double>(m_causticResourceBytes) / (1024.0 * 1024.0));
+        }
+
+        if (m_causticFaulted)
+        {
+            ImGui::TextWrapped("Numerical fault latched (flags 0x%X); contribution refused until acknowledged.",
+                               m_causticFaultFlags);
+
+            if (ImGui::Button("Acknowledge fault and reset caustics"))
+            {
+                m_causticAcknowledgeRequested = true;
+            }
+        }
     }
 
     ImGui::Separator();

@@ -14,7 +14,8 @@
 #include <string>
 
 // UPSCALING.3B: prepares DLSS-specific inputs from Engine's render-extent G-buffer (DlssInputPreparation.hlsl): the
-// DLSS motion-vector texture (RG16F, sky motion included) and the 1x1 exposure texture (R16F). Engine's own motion
+// DLSS motion-vector texture (RG16F, sky motion included) and the 1x1 exposure texture (R16F, the tone mapper's
+// exposure multiplier copied from the GPU exposure state, AutoExposurePass). Engine's own motion
 // vectors are only read. Created and recorded only while RendererOptions::dlssInputPreparation is on; header-only so
 // that it needs no build-system change.
 class DlssInputPreparationPass
@@ -99,7 +100,7 @@ public:
 
     // Leaves both outputs in NON_PIXEL_SHADER_RESOURCE, the state DLSS evaluation requires (Programming Guide 3.4).
     bool Record(ID3D12GraphicsCommandList* commandList, UploadBuffer& uploadBuffer, RenderTarget& motion,
-        DepthBuffer& depth, const Matrices& matrices, float exposure)
+        DepthBuffer& depth, const Matrices& matrices, unsigned int exposureStateIndex)
     {
         m_failure.clear();
         struct Constants
@@ -113,7 +114,7 @@ public:
             unsigned int exposureIndex;
             unsigned int width;
             unsigned int height;
-            float exposure;
+            unsigned int exposureStateIndex;
             unsigned int padding;
         };
 
@@ -127,7 +128,7 @@ public:
         constants.exposureIndex = m_exposure.GetUAVIndex();
         constants.width = m_width;
         constants.height = m_height;
-        constants.exposure = exposure;
+        constants.exposureStateIndex = exposureStateIndex;
 
         const D3D12_GPU_VIRTUAL_ADDRESS address =
             uploadBuffer.Allocate(&constants, sizeof(constants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);

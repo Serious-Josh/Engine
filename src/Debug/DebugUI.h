@@ -14,6 +14,7 @@
 
 #include <climits>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -37,6 +38,7 @@ class DebugUI
 {
     // Local diagnostics drive the Editor's render settings directly (UPSCALING.3C.2).
     friend class SceneHierarchyVerification;
+    friend class CausticVisibleVerification;
 
     public:
     bool ReferenceRayCountsEnabled() const { return m_referenceRayCountsEnabled; }
@@ -88,6 +90,27 @@ class DebugUI
     ToneMapDebugView GetToneMapDebugView() const
     {
         return static_cast<ToneMapDebugView>(m_toneMapDebugView);
+    }
+
+    // The camera exposure state of the latest completed frame (GPU readback, a few frames old; display only).
+    struct ExposureDisplay
+    {
+        bool valid = false;
+        float effectiveEV100 = 0.0f;
+        float multiplier = 1.0f;
+        float targetEV100 = 0.0f;
+        float meteredEV100 = 0.0f;
+        std::uint32_t validPixels = 0;
+        std::uint32_t invalidPixels = 0;
+    };
+
+    void SetExposureDisplay(const ExposureDisplay& display) { m_exposureDisplay = display; }
+    const ExposureDisplay& GetExposureDisplay() const { return m_exposureDisplay; }
+
+    // Final display tone mapper: Existing (default) or GT7; not saved.
+    ToneMapOperator GetToneMapOperator() const
+    {
+        return static_cast<ToneMapOperator>(m_toneMapOperator);
     }
 
     // RTXPT D.3B.0 path-trace denoiser diagnostic view (the setter serves automated diagnostics).
@@ -153,13 +176,80 @@ class DebugUI
     // mode; Off outside those lighting modes.
     PathTraceDenoiserMode GetPathTraceDenoiserMode() const
     {
-        return m_lightingMode == 2 || m_lightingMode == 3 ? m_pathTraceDenoiserMode : PathTraceDenoiserMode::Off;
+        return m_lightingMode == 2 || m_lightingMode == 3 ? GetSelectedPathTraceDenoiserMode() : PathTraceDenoiserMode::Off;
+    }
+
+    // The selector's value: the explicit choice, or the lighting mode's default until one is made (Hybrid with
+    // ReSTIR DI, Engine otherwise). An explicit choice is shared by both raster-primary modes.
+    PathTraceDenoiserMode GetSelectedPathTraceDenoiserMode() const
+    {
+        return m_pathTraceDenoiserMode.value_or(m_lightingMode == 3 ? PathTraceDenoiserMode::NrdHybrid :
+            PathTraceDenoiserMode::Engine);
     }
 
     // DENOISE.1: the denoiser stages to run (diagnostics; the defaults are the production pipeline).
     PathTraceDenoiserStages GetPathTraceDenoiserStages() const
     {
         return m_pathTraceDenoiserStages;
+    }
+
+    // R.9I.3: experimental dedicated additive caustics in the path-traced modes (off by default, not saved).
+    bool IsDedicatedCausticsEnabled() const
+    {
+        return m_dedicatedCaustics && m_lightingMode >= 1 && m_lightingMode <= 3;
+    }
+
+    bool IsCausticOnlyView() const
+    {
+        return m_causticOnlyView;
+    }
+
+    // R.9I.3: experimental pixel-centred caustics in Raster Primary + ReSTIR DI (off by default, not saved). Never
+    // enabled together with Dedicated caustics above.
+    bool IsPixelCentredCausticsEnabled() const
+    {
+        return m_pixelCentredCaustics && m_lightingMode == 3;
+    }
+
+    // P2: add the caustics to the lighting before denoising (off by default, not saved).
+    bool IsPixelCausticInsertionEnabled() const
+    {
+        return m_pixelCentredCaustics && m_pixelCausticInsertion;
+    }
+
+    // 0 the ordinary image; 1 diffuse, 2 specular, 3 combined caustic radiance; 4 validity (PixelCausticView).
+    std::uint32_t GetPixelCausticView() const
+    {
+        return m_pixelCentredCaustics ? m_pixelCausticView : 0u;
+    }
+
+    void SetPixelCausticsStatus(const std::string& reason, std::uint64_t verifiedSeams, std::uint64_t seamVisits,
+        std::uint64_t completedFrames, std::uint64_t faultedFrames, std::uint32_t lastFaults, std::uint64_t resourceBytes)
+    {
+        m_pixelCausticReason = reason;
+        m_pixelCausticVerifiedSeams = verifiedSeams;
+        m_pixelCausticSeamVisits = seamVisits;
+        m_pixelCausticCompletedFrames = completedFrames;
+        m_pixelCausticFaultedFrames = faultedFrames;
+        m_pixelCausticLastFaults = lastFaults;
+        m_pixelCausticResourceBytes = resourceBytes;
+    }
+
+    // One request per button press; the Engine forwards it to the explicit fault recovery boundary.
+    bool ConsumeCausticFaultAcknowledgeRequest()
+    {
+        return std::exchange(m_causticAcknowledgeRequested, false);
+    }
+
+    void SetDedicatedCausticsStatus(const std::string& reason, bool presentedLastFrame, bool faulted,
+        std::uint32_t faultFlags, std::uint64_t historyFrames, std::uint64_t resourceBytes)
+    {
+        m_causticReason = reason;
+        m_causticPresented = presentedLastFrame;
+        m_causticFaulted = faulted;
+        m_causticFaultFlags = faultFlags;
+        m_causticHistoryFrames = historyFrames;
+        m_causticResourceBytes = resourceBytes;
     }
 
     // UPSCALING.2B: experimental camera jitter in the raster-primary path-traced modes (off by default, not saved).
@@ -399,6 +489,8 @@ class DebugUI
     float m_rtgiContactAORadius = 2.5f;
 
     int m_lightingMode = 0;
+    ExposureDisplay m_exposureDisplay;
+    int m_toneMapOperator = 0;
     bool m_referenceRayCountsEnabled = false;
     ReferenceRayCountResult m_referenceRayCounts{};
     int m_pathTraceSamplesPerFrame = 1;
@@ -417,9 +509,9 @@ class DebugUI
     bool m_sharcHistoryPrior = false;
     SharcStatus m_sharcStatus;
     void DrawSharcSettings();
-    // SHARC.4E.1: the path-tracing denoiser in the raster-primary path-traced modes (Engine by default in the Editor).
-    // NRD.2: the selector offers Off and Engine only.
-    PathTraceDenoiserMode m_pathTraceDenoiserMode = PathTraceDenoiserMode::Engine;
+    // SHARC.4E.1: the path-tracing denoiser in the raster-primary path-traced modes. Empty until the user (or a
+    // verification) chooses one; GetSelectedPathTraceDenoiserMode supplies the lighting mode's default meanwhile.
+    std::optional<PathTraceDenoiserMode> m_pathTraceDenoiserMode;
     std::string m_pathTraceNrdStatus;
     std::string m_pathTraceDenoiserPreparation;
     PathTraceDenoiserStages m_pathTraceDenoiserStages{};
@@ -444,6 +536,25 @@ class DebugUI
     bool m_pathTraceActiveLastFrame = false;
     std::uint32_t m_pathTraceAccumulatedSamples = 0;
     std::uint64_t m_pathTraceResourceBytes = 0;
+    bool m_dedicatedCaustics = false;
+    bool m_pixelCentredCaustics = false;
+    std::string m_pixelCausticReason;
+    std::uint64_t m_pixelCausticVerifiedSeams = 0;
+    std::uint64_t m_pixelCausticSeamVisits = 0;
+    std::uint64_t m_pixelCausticCompletedFrames = 0;
+    std::uint64_t m_pixelCausticFaultedFrames = 0;
+    std::uint32_t m_pixelCausticLastFaults = 0;
+    std::uint64_t m_pixelCausticResourceBytes = 0;
+    std::uint32_t m_pixelCausticView = 0;
+    bool m_pixelCausticInsertion = false;
+    bool m_causticOnlyView = false;
+    bool m_causticAcknowledgeRequested = false;
+    std::string m_causticReason;
+    bool m_causticPresented = false;
+    bool m_causticFaulted = false;
+    std::uint32_t m_causticFaultFlags = 0;
+    std::uint64_t m_causticHistoryFrames = 0;
+    std::uint64_t m_causticResourceBytes = 0;
 
     PathTraceRasterPrimaryAvailability m_rasterPrimaryAvailability = PathTraceRasterPrimaryAvailability::NotRequested;
     std::string m_rasterPrimaryReason;

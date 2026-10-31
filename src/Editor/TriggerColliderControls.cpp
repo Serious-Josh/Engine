@@ -341,7 +341,11 @@ void Editor::DrawAddComponentControls(IDemoScene& scene)
                 else if(addCamera && !latest.camera)
                 {
                     // Generic Add Component never designates Main; CAM.2 defaults have main=false.
-                    committed = CommitObjectCamera(scene, *current, std::nullopt, CameraComponent{});
+                    // A new Camera starts exactly at the scene's reference exposure.
+                    CameraComponent added;
+                    added.exposure = Photometry::ReferenceCameraExposure(
+                        scene.GetScene().GetLightingSettings().referenceEV100);
+                    committed = CommitObjectCamera(scene, *current, std::nullopt, added);
                 }
                 else if(addLight && !latest.light)
                 {

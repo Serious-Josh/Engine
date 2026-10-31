@@ -37,18 +37,24 @@ inline const char* LightTypeName(LightType type)
 // transform (light travels along local +Z); no GPU resource, shadow map or runtime state is
 // stored here. Every field is kept for every type, so switching type never discards values.
 //
-// Units, in the renderer's existing linear radiometric scale (the scale of the legacy scene
-// Directional Light, whose DefaultProject intensity is about 3):
-// - color: linear RGB tint; Point/Spot channels are in [0, 1]. Directional preserves
-//   legacy finite signed RGB and nonnegative intensity without clamping or rescaling.
-// - intensity, Directional: irradiance on a surface facing the light (legacy sun convention).
-// - intensity, Point/Spot: intensity at 1 m; irradiance falls off as intensity / distance^2.
-// - range (m), Point/Spot: the direct-light influence radius; contribution is windowed to zero.
+// Physical units (PhotometricUnits.h):
+// - color: linear Rec.709 tint, channels in [0, 1]; the renderer normalizes it to unit luminance, so it never
+//   changes brightness. A black tint emits nothing.
+// - intensity, Point/Spot: luminous flux in lumens. Irradiance follows the inverse-square law (evaluated no
+//   closer than 1 cm) inside range. Spot flux is normalized over its actual cone profile.
+// - range (m), Point/Spot: the light's influence radius, also its culling bound; nothing is lit at or beyond it.
+// - rangeAttenuation, Point/Spot: true fades illumination smoothly to zero approaching range
+//   (saturate(1 - (d / range)^4)^2); false keeps the raw inverse-square law up to a hard cutoff at range.
+//   Neither changes the light's flux definition.
+// - intensity, Directional: illuminance in lux on a surface facing the light.
+// - angularRadius (radians), Directional: the sun disk half-angle (shadow owner only).
 // - innerConeAngle/outerConeAngle (radians), Spot: half-angles from the +Z axis.
 struct LightComponent
 {
     static constexpr float MaximumColorChannel = 1.0f;
-    static constexpr float MaximumIntensity = 1000000.0f;
+    // Upper bound for intensity of every type, far above any real source (a stadium floodlight is ~10^6 lm;
+    // direct sunlight ~1.2 * 10^5 lx), so a type switch never invalidates a value.
+    static constexpr float MaximumIntensity = 1.0e10f;
     static constexpr float MinimumRange = 0.01f;
     static constexpr float MaximumRange = 10000.0f;
     static constexpr float MinimumOuterConeAngle = 0.01745329252f; // 1 degree.
@@ -57,9 +63,10 @@ struct LightComponent
     bool enabled = true;
     LightType type = LightType::Point;
     Vector3 color{1.0f, 1.0f, 1.0f};
-    float intensity = 10.0f;
+    float intensity = 1000.0f; // Lumens: roughly a 75 W incandescent bulb.
     float angularRadius = ToRadians(0.27f);
     float range = 10.0f;
+    bool rangeAttenuation = true;
     float innerConeAngle = 0.34906585040f; // 20 degrees.
     float outerConeAngle = 0.52359877560f; // 30 degrees.
 
@@ -67,7 +74,8 @@ struct LightComponent
     {
         return enabled == other.enabled && type == other.type && color.x == other.color.x &&
             color.y == other.color.y && color.z == other.color.z && intensity == other.intensity &&
-            angularRadius == other.angularRadius && range == other.range && innerConeAngle == other.innerConeAngle &&
+            angularRadius == other.angularRadius && range == other.range && rangeAttenuation == other.rangeAttenuation &&
+            innerConeAngle == other.innerConeAngle &&
             outerConeAngle == other.outerConeAngle;
     }
 
@@ -89,7 +97,8 @@ inline LightComponent DefaultLightComponent(LightType type)
 
     if(type == LightType::Directional)
     {
-        light.intensity = 3.0f;
+        // Lux: bright overcast daylight, which a mid-grey surface meters near the default reference exposure.
+        light.intensity = 2000.0f;
     }
 
     return light;
@@ -117,16 +126,15 @@ inline bool ValidateLightComponent(const LightComponent& light, std::string* err
     {
         reason = "Light color, intensity, range and angles must be finite.";
     }
-    else if(light.type != LightType::Directional && (light.color.x < 0.0f || light.color.y < 0.0f || light.color.z < 0.0f ||
+    else if((light.color.x < 0.0f || light.color.y < 0.0f || light.color.z < 0.0f ||
         light.color.x > LightComponent::MaximumColorChannel || light.color.y > LightComponent::MaximumColorChannel ||
         light.color.z > LightComponent::MaximumColorChannel))
     {
         reason = "Light color channels must be between 0 and 1 (use intensity for brightness).";
     }
-    else if(light.intensity < 0.0f || (light.type != LightType::Directional && light.intensity > LightComponent::MaximumIntensity))
+    else if(light.intensity < 0.0f || light.intensity > LightComponent::MaximumIntensity)
     {
-        reason = light.type == LightType::Directional ? "Directional intensity must be nonnegative." :
-            "Light intensity must be between 0 and 1000000.";
+        reason = "Light intensity (lumens, or lux for Directional) must be between 0 and 10^10.";
     }
     else if(light.angularRadius < 0.0f)
     {

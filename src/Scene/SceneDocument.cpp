@@ -75,8 +75,10 @@ bool ValidateSceneDocument(
         return Fail(errorMessage, "Invalid camera projection.");
     }
 
-    if(!std::isfinite(document.lightingSettings.ambientStrength) || document.lightingSettings.ambientStrength < 0.0f)
-        return Fail(errorMessage, "Invalid scene ambient strength.");
+    if(const char* reason = nullptr; !ValidateSceneLightingSettings(document.lightingSettings, &reason))
+        return Fail(errorMessage, reason);
+    if(const char* reason = nullptr; !ValidateCameraExposure(document.camera.exposure, &reason))
+        return Fail(errorMessage, std::string("Viewport camera exposure: ") + reason);
 
     std::unordered_set<std::string> objectIDs;
     const SceneObjectDocument* mainCamera = nullptr;

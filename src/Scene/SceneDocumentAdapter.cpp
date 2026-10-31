@@ -142,7 +142,7 @@ bool SceneDocumentsEqual(
     if (left.camera.verticalFov != right.camera.verticalFov ||
         left.camera.aspectRatio != right.camera.aspectRatio ||
         left.camera.nearPlane != right.camera.nearPlane ||
-        left.camera.farPlane != right.camera.farPlane)
+        left.camera.farPlane != right.camera.farPlane || !(left.camera.exposure == right.camera.exposure))
     {
         return false;
     }

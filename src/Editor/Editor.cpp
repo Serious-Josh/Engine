@@ -3,6 +3,7 @@
 #include "assets/ProjectAssetResolver.h"
 #include "Core/Log.h"
 #include "Editor.h"
+#include "Editor/ExposureControls.h"
 #include "ViewportCameraInput.h"
 #include "SceneViewportLayout.h"
 #include "GroupTransform.h"
@@ -1303,6 +1304,11 @@ std::optional<SceneObjectInspectorView> Editor::ResolveObjectInspection(
             return "Sphere";
         }
 
+        if(reference == "builtin:triangle" && type == AssetType::Mesh)
+        {
+            return "Triangle";
+        }
+
         if(reference == "builtin:default" && type == AssetType::Material)
         {
             return "Default Material";
@@ -1766,7 +1772,7 @@ void Editor::Draw(
 
             ImGui::Separator();
 
-            DrawDirectionalLight(demoScene);
+            DrawDirectionalLight(demoScene, debugUI);
 
         }
 
@@ -1869,8 +1875,20 @@ void Editor::DrawStressTestControls(StressTestScene& demoScene)
     ImGui::Text("Sphere instances: %u", currentGridSize * currentGridSize);
 }
 
-void Editor::DrawDirectionalLight(IDemoScene& demoScene)
+void Editor::DrawDirectionalLight(IDemoScene& demoScene, const DebugUI& debugUI)
 {
+    // The Editor viewport camera's own exposure, persisted with the scene; scene Cameras are edited in the inspector.
+    if (ImGui::CollapsingHeader("Viewport Camera Exposure", ImGuiTreeNodeFlags_DefaultOpen))
+    {
+        CameraExposure exposure = demoScene.GetScene().GetViewportExposure();
+
+        if (DrawExposureControls("viewport-exposure", exposure, demoScene.GetScene().GetLightingSettings().referenceEV100,
+            &debugUI.GetExposureDisplay()))
+        {
+            demoScene.GetScene().SetViewportExposure(exposure);
+        }
+    }
+
     const char* heading = demoScene.GetScene().UsesObjectLighting() ? "Scene Lighting" : "Directional Light";
     if (!ImGui::CollapsingHeader(heading, ImGuiTreeNodeFlags_DefaultOpen))
     {
@@ -1881,19 +1899,22 @@ void Editor::DrawDirectionalLight(IDemoScene& demoScene)
     {
         auto settings = demoScene.GetScene().GetLightingSettings();
         ImGui::TextUnformatted("Directional lights are edited as objects in the hierarchy.");
-        if(ImGui::InputFloat("Scene Ambient Strength", &settings.ambientStrength) &&
-            std::isfinite(settings.ambientStrength) && settings.ambientStrength >= 0.0f)
+        // Commit on deactivation only: each change rescales all lighting (reference exposure) or rebuilds the
+        // environment (luminance scale), so a drag must not do either every frame.
+        ImGui::InputFloat("Reference Exposure (EV100)", &settings.referenceEV100, 0.5f, 1.0f, "%.2f");
+        const bool referenceCommitted = ImGui::IsItemDeactivatedAfterEdit();
+        ImGui::InputFloat("Environment Luminance (cd/m^2 per HDRI unit)", &settings.environmentLuminanceScale, 0.0f, 0.0f, "%.6g");
+        const bool environmentCommitted = ImGui::IsItemDeactivatedAfterEdit();
+        if((referenceCommitted || environmentCommitted) && ValidateSceneLightingSettings(settings))
             demoScene.GetScene().SetLightingSettings(settings);
-        ImGui::TextDisabled("Ambient strength is preserved scene data; current shaders do not use it.");
+        ImGui::TextDisabled("Reference exposure fixes the scene's GPU lighting scale (mid-grey metering at this EV).");
         return;
     }
     DirectionalLight& light = demoScene.GetScene().GetDirectionalLight();
 
     ImGui::DragFloat3("Direction", &light.direction.x, 0.01f, -1.0f, 1.0f);
 
-    ImGui::DragFloat("Intensity", &light.intensity, 0.05f, 0.0f, 100.0f);
-
-    ImGui::DragFloat("Ambient Strength", &light.ambientStrength, 0.01f, 0.0f, 1.0f);
+    ImGui::DragFloat("Illuminance (lux)", &light.intensity, 10.0f, 0.0f, 150000.0f, "%.1f");
 
     float angularRadiusDegrees = light.angularRadius * (180.0f / 3.14159265358979323846f);
 

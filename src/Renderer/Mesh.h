@@ -6,11 +6,20 @@
 #include "Math/Vector3.h"
 #include "assets/MeshMetadata.h"
 #include <optional>
+#include <memory>
+#include <array>
 
 #include <d3d12.h>
 #include <cstddef>
 
 class DescriptorHeap;
+namespace CausticContracts::Geometry
+{
+    struct StaticSourceRequest;
+    struct AdmissionResult;
+    class MeshSourceGeneration;
+    using GeometrySourceHandle = std::shared_ptr<const MeshSourceGeneration>;
+}
 
 struct MeshBounds
 {
@@ -27,6 +36,19 @@ class Mesh
 
     Mesh(const Mesh&) = delete;
     Mesh& operator=(const Mesh&) = delete;
+
+    // Opt-in source-to-buffer evidence only. Empty static Mesh, owning render thread.
+    // No BLAS/TLAS/descriptor lease; borrowers must never write admitted resources.
+    // Failed preparation preserves output. Existing upload completion policy is retained.
+    // Optional metadata is validated and installed before the generation is published, so it is
+    // part of the admitted state (a later SetMetadata still revokes). Null keeps the default.
+    CausticContracts::Geometry::AdmissionResult InitializeWithStaticSource(
+        ID3D12Device*, ResourceUploader&, DescriptorHeap&,
+        const CausticContracts::Geometry::StaticSourceRequest&,
+        CausticContracts::Geometry::GeometrySourceHandle& output, const MeshMetadata* metadata = nullptr);
+    // Mutating entry points conservatively revoke; retained handles remain historical.
+    CausticContracts::Geometry::GeometrySourceHandle GetStaticSourceGeneration() const noexcept;
+    bool IsCurrentStaticSource(const CausticContracts::Geometry::GeometrySourceHandle&) const noexcept;
 
     bool Initialize(
         ID3D12Device* device,
@@ -133,6 +155,10 @@ class Mesh
     const MeshMetadata& GetMetadata() const noexcept;
 
     private:
+    CausticContracts::Geometry::GeometrySourceHandle m_staticSource;
+    // At most three live admitted generations per Mesh, including historical handles.
+    // Shutdown revokes current but deliberately preserves weak capacity accounting.
+    std::array<std::weak_ptr<const CausticContracts::Geometry::MeshSourceGeneration>, 3> m_sourceGenerations{};
 #if defined(ENGINE_HAS_VERIFICATION)
     friend class MarqueeSelectionVerification;
 #endif

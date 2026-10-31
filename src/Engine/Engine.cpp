@@ -1874,6 +1874,35 @@ void Engine::AcceptPreparedMeshResidencyForFrame(IDemoScene& activeDemo)
             CancelMeshResidencyAcceptance();
         }
     }
+
+    // Unresolved residency or whole-scene publication stays authoritative; a
+    // canceled transaction leaves the reconstruction token to be reconsidered.
+    if (!m_meshResidencyPublication.HasCandidate() && !m_pendingEditorMembership)
+    {
+        if (auto* fileScene = dynamic_cast<FileBackedDemoScene*>(&activeDemo))
+        {
+            if (m_sceneCausticRegistration && m_renderer.GetCausticSnapshotsRequested())
+            {
+                m_renderer.RequestTLASGeometryReacceptance(*fileScene->m_runtime);
+            }
+
+            m_renderer.AcceptReconstructedTLASGeometry(*fileScene->m_runtime, fileScene->m_assets);
+        }
+    }
+
+    // After acceptance settles: the optional caustic snapshot acquires its frame reader here,
+    // outside recording. Disabled (no diagnostic recorder) does nothing.
+    if (auto* fileScene = dynamic_cast<FileBackedDemoScene*>(&activeDemo))
+    {
+        // Scene-authored roles bind to each scene-resource lifetime; reconstruction clears them.
+        if (m_sceneCausticRegistration && m_renderer.GetCausticSnapshotsRequested() &&
+            !m_renderer.HasCurrentCausticRegistration())
+        {
+            m_renderer.SetCausticRegistration(*m_sceneCausticRegistration);
+        }
+
+        m_renderer.PrepareCausticSnapshotForFrame(*fileScene->m_runtime, fileScene->m_assets);
+    }
 }
 
 void Engine::Frame()
@@ -1943,6 +1972,8 @@ void Engine::Frame()
         // Archive-only lighting from the cooked document; payloads before 11 carry no Lights, so
         // they render with their legacy sun exactly as before.
         options.lighting = CaptureSceneLightingForFrame(*owner->m_runtime);
+        options.frameDeltaSeconds = m_time.GetDeltaTime();
+        options.exposureReset = std::exchange(m_exposureResetPending, false);
 
         const auto result = m_renderer.Render(demo.GetScene(), options);
         if (result == Renderer::FrameRenderResult::Error)
@@ -2252,6 +2283,14 @@ void Engine::Frame()
         resolution.outputHeight, m_renderer.IsDlssActiveLastFrame());
     debugUI.SetPathTraceReferenceStatus(pathTraceStatus.availability, pathTraceStatus.unavailableReason,
         pathTraceStatus.activeLastFrame, pathTraceStatus.accumulatedSamples, pathTraceStatus.resourceBytes);
+    const auto& causticPass = m_renderer.GetCausticPass();
+    debugUI.SetDedicatedCausticsStatus(m_renderer.GetDedicatedCausticsReason(),
+        m_renderer.DedicatedCausticsCompositeRecordedLastFrame(), causticPass.IsFaulted(), causticPass.GetLastFault(),
+        causticPass.GetHistoryFrames(), causticPass.GetResourceBytes());
+    const auto& pixelCausticPass = m_renderer.GetPixelCausticPass();
+    debugUI.SetPixelCausticsStatus(m_renderer.GetPixelCausticsReason(), pixelCausticPass.GetVerifiedSeams(),
+        pixelCausticPass.GetSeamVisits(), pixelCausticPass.GetCompletedFrames(), pixelCausticPass.GetFaultedFrames(),
+        pixelCausticPass.GetLastCompletedFaults(), pixelCausticPass.GetResourceBytes());
     const PathTraceRasterPrimaryStatus& rasterPrimaryStatus = m_renderer.GetPathTraceRasterPrimaryStatus();
     debugUI.SetPathTraceRasterPrimaryStatus(rasterPrimaryStatus.availability, rasterPrimaryStatus.reason);
     debugUI.SetSharcStatus(m_renderer.GetSharcStatus());
@@ -2632,6 +2671,18 @@ void Engine::Frame()
     rendererOptions.pathTraceDenoiserStages = debugUI.GetPathTraceDenoiserStages();
     rendererOptions.pathTraceCameraJitter = debugUI.IsPathTraceCameraJitterEnabled();
     rendererOptions.dlssInputPreparation = debugUI.IsDlssInputPreparationEnabled();
+    rendererOptions.toneMapOperator = debugUI.GetToneMapOperator();
+    rendererOptions.frameDeltaSeconds = m_time.GetDeltaTime();
+    rendererOptions.exposureReset = std::exchange(m_exposureResetPending, false);
+    // Before the caustic snapshot boundary below; a toggle resets only the dedicated history.
+    m_renderer.SetDedicatedCaustics(debugUI.IsDedicatedCausticsEnabled(), debugUI.IsCausticOnlyView());
+    m_renderer.SetPixelCentredCaustics(debugUI.IsPixelCentredCausticsEnabled(),
+        static_cast<PixelCausticView>(debugUI.GetPixelCausticView()), debugUI.IsPixelCausticInsertionEnabled());
+
+    if (debugUI.ConsumeCausticFaultAcknowledgeRequest() && !m_renderer.AcknowledgeDedicatedCausticsFault())
+    {
+        Log::Warning("Dedicated caustic fault acknowledgement refused: a caustic recording is still unresolved.");
+    }
 
     const size_t selectedObject = m_editor.GetSelectedObject();
 
@@ -2679,6 +2730,7 @@ void Engine::Frame()
     // Lighting uses the same accepted presentation as the meshes and overlays of this frame.
     if (physicsScene)
     {
+        RefreshSceneEnvironmentCalibration();
         rendererOptions.lighting = CaptureSceneLightingForFrame(*physicsScene->m_runtime);
     }
 
@@ -4549,6 +4601,150 @@ std::string Engine::GetMeshSourceIdentity(const SceneObjectMetadata& selection) 
     }
 }
 
+void Engine::LoadSceneCausticRegistration(FileBackedDemoScene& scene)
+{
+    // A new scene never inherits roles; the renderer clears its own association with the old lifetime.
+    m_sceneCausticRegistration.reset();
+    auto path = scene.GetScenePath();
+
+    if (scene.IsArchiveActivation() || path.empty())
+    {
+        return;
+    }
+
+    path.replace_extension(".caustics.json");
+    std::error_code exists;
+
+    if (!std::filesystem::is_regular_file(path, exists))
+    {
+        return;
+    }
+
+    try
+    {
+        std::ifstream stream(path, std::ios::binary);
+        const auto json = nlohmann::json::parse(stream);
+        const int schema = json.at("schemaVersion").get<int>();
+        // Schema 1: one "reflector" sharing the receiver's mesh. Schema 2: a "reflectors" list on
+        // independent mesh sources, or "auto" (P5D.1) to discover them every frame from the scene's
+        // geometry and materials (pixel-centred caustics only).
+        std::vector<std::string> reflectors;
+        bool automatic = false;
+
+        if (schema == 1)
+        {
+            reflectors.push_back(json.at("reflector").get<std::string>());
+        }
+        else if (schema == 2 && !json.contains("reflector") && json.at("reflectors") == "auto")
+        {
+            automatic = true;
+        }
+        else if (schema == 2 && !json.contains("reflector"))
+        {
+            reflectors = json.at("reflectors").get<std::vector<std::string>>();
+        }
+        else
+        {
+            Log::Warning("Caustic registration ignored: unsupported schema in " + path.string());
+            return;
+        }
+
+        // P5D.2B: schema 2 "receiver": "auto" certifies every eligible non-reflector surface per pixel.
+        const bool automaticReceivers = schema == 2 && json.at("receiver") == "auto";
+        Renderer::CausticRegistration registration{reflectors.empty() ? std::string{} : reflectors.front(),
+            automaticReceivers ? std::string{} : json.at("receiver").get<std::string>(), json.at("light").get<std::string>()};
+        registration.automaticReceivers = automaticReceivers;
+        const auto& objects = scene.m_runtime->GetFileScene().GetDocument().objects;
+        const auto authored = [&objects](const std::string& id)
+        {
+            return std::any_of(objects.begin(), objects.end(), [&id](const auto& object) { return object.id == id; });
+        };
+        auto sorted = reflectors;
+        std::sort(sorted.begin(), sorted.end());
+
+        if ((!automatic && reflectors.empty()) || reflectors.size() > Renderer::MaxCausticReflectors ||
+            std::adjacent_find(sorted.begin(), sorted.end()) != sorted.end() ||
+            std::find(sorted.begin(), sorted.end(), registration.receiverObjectID) != sorted.end())
+        {
+            Log::Warning("Caustic registration ignored: reflectors must be 1.." +
+                std::to_string(Renderer::MaxCausticReflectors) + " distinct objects other than the receiver in " + path.string());
+            return;
+        }
+
+        if (!std::all_of(reflectors.begin(), reflectors.end(), authored) ||
+            (!automaticReceivers && !authored(registration.receiverObjectID)) || !authored(registration.lightObjectID))
+        {
+            Log::Warning("Caustic registration ignored: unknown object ID in " + path.string());
+            return;
+        }
+
+        const auto mesh = [&objects](const std::string& id)
+        {
+            return std::find_if(objects.begin(), objects.end(), [&id](const auto& object) { return object.id == id; })->meshReference;
+        };
+        std::vector<std::string> sourceAssets;
+
+        for (const auto& reflector : reflectors)
+        {
+            const auto reflectorMesh = mesh(reflector);
+            const auto asset = AssetID::ParseReference(reflectorMesh);
+
+            // Schema 1 keeps its single-source contract: both roles share one mesh.
+            if (reflectorMesh.empty() || (schema == 1 && reflectorMesh != mesh(registration.receiverObjectID)))
+            {
+                Log::Warning("Caustic registration ignored: reflector " + reflector + " has no admissible mesh in " + path.string());
+                return;
+            }
+
+            if (asset && std::find(sourceAssets.begin(), sourceAssets.end(), asset->ToString()) == sourceAssets.end())
+            {
+                sourceAssets.push_back(asset->ToString());
+            }
+        }
+
+        // Accepted TLAS geometry requires every resident mesh on an admitted source, so schema 2 requests
+        // every mesh asset the scene references (receiver and occluders included). Each is admitted
+        // independently; a refused one only refuses caustics, never its ordinary geometry.
+        if (schema == 2)
+        {
+            for (const auto& object : objects)
+            {
+                const auto asset = AssetID::ParseReference(object.meshReference);
+
+                if (asset && std::find(sourceAssets.begin(), sourceAssets.end(), asset->ToString()) == sourceAssets.end())
+                {
+                    sourceAssets.push_back(asset->ToString());
+                }
+            }
+        }
+
+        // Built-in meshes own their sources, so an empty request set (Cleared) is admissible.
+        const auto requested = scene.m_assets.RequestStaticSourceAssets(std::move(sourceAssets));
+
+        if (requested != FileSceneAssetCatalog::StaticSourceRequestStatus::Ready &&
+            requested != FileSceneAssetCatalog::StaticSourceRequestStatus::Cleared)
+        {
+            Log::Warning("Caustic registration ignored: the reflector source set exceeds " +
+                std::to_string(FileSceneAssetCatalog::MaxStaticSources) + " assets in " + path.string());
+            return;
+        }
+
+        registration.automaticReflectors = automatic;
+
+        if (!reflectors.empty())
+        {
+            registration.additionalReflectorObjectIDs.assign(reflectors.begin() + 1, reflectors.end());
+        }
+
+        m_sceneCausticRegistration = std::move(registration);
+        Log::Info("Caustic registration loaded (experimental): " + path.string());
+    }
+    catch (const std::exception& exception)
+    {
+        Log::Warning("Caustic registration ignored: " + path.string() + ": " + exception.what());
+    }
+}
+
 void Engine::OnFileSceneActivated(std::chrono::steady_clock::time_point started)
 {
     auto* scene = dynamic_cast<FileBackedDemoScene*>(m_demoSceneManager.TryGetActiveScene());
@@ -4560,6 +4756,8 @@ void Engine::OnFileSceneActivated(std::chrono::steady_clock::time_point started)
 
     std::string environmentError;
     if(!ApplySceneEnvironment(environmentError)) { Log::Error("Scene environment restore failed: "+environmentError); m_window.Close(); return; }
+    // A new scene's HDR is unrelated to the adapted exposure: snap automatic exposure on its first frame.
+    m_exposureResetPending = true;
     if (m_automaticResidencyIntent)
     {
         Log::Info("Automatic mesh residency session " + std::to_string(m_automaticResidencyIntent) +
@@ -4568,6 +4766,7 @@ void Engine::OnFileSceneActivated(std::chrono::steady_clock::time_point started)
 
     m_automaticMeshResidency = {};
     m_automaticResidencyIntent = 0;
+    LoadSceneCausticRegistration(*scene);
     if(scene->IsArchiveActivation())
     {
         Log::Info("Archive-only metadata scene activated; explicit cooked mesh requests only; packaged materials remain deferred.");

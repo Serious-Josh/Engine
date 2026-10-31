@@ -55,6 +55,14 @@ bool GBuffer::Initialize(
     m_geometricNormal.GetResource()->SetName(L"GBuffer Geometric Normal");
     m_motion.GetResource()->SetName(L"GBuffer Motion");
 
+    if (!m_identity.Initialize(device, width, height, IdentityFormat, rtvHeap, resourceHeap, {0.0f, 0.0f, 0.0f, 0.0f}))
+    {
+        Shutdown();
+        return false;
+    }
+
+    m_identity.GetResource()->SetName(L"GBuffer Raster Identity");
+
     return true;
 }
 
@@ -73,6 +81,7 @@ bool GBuffer::Resize(
 
 void GBuffer::Shutdown()
 {
+    m_identity.Shutdown();
     m_depth.Shutdown();
     m_motion.Shutdown();
     m_geometricNormal.Shutdown();

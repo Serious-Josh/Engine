@@ -1,5 +1,7 @@
 #include "Scene/SceneSerializer.h"
 #include "Scene/LegacyLightingMigration.h"
+#include "Scene/PhysicalLightingMigration.h"
+#include "Core/Log.h"
 
 #include <nlohmann/json.hpp>
 
@@ -388,6 +390,7 @@ namespace
     }
 
     // Schema 13 adds angular radius; earlier components inherit the historical sun radius.
+    // Schema 14 stores physical units (intensity: lumens, or lux for Directional) and the range attenuation mode.
     // Every field is retained for every type. Type is a name so the
     // file stays readable; angles are radians like the Camera FOV.
     Json ToJson(const LightComponent& light)
@@ -398,15 +401,25 @@ namespace
             {"color", ToJson(light.color)},
             {"intensity", light.intensity},
             {"range", light.range},
+            {"rangeAttenuation", light.rangeAttenuation},
             {"innerConeAngle", light.innerConeAngle},
             {"outerConeAngle", light.outerConeAngle},
             {"angularRadius", light.angularRadius}
         };
     }
 
-    LightComponent ReadLightComponent(const Json& value)
+    // legacyRange is set (and the historical rules apply, before MigrateLegacyLightUnits) for legacy-unit input.
+    LightComponent ReadLightComponent(const Json& value, float* legacyRange)
     {
-        ValidateFields(value, {"enabled", "type", "color", "intensity", "range", "innerConeAngle", "outerConeAngle", "angularRadius"});
+        if(legacyRange)
+        {
+            ValidateFields(value, {"enabled", "type", "color", "intensity", "range", "innerConeAngle", "outerConeAngle", "angularRadius"});
+        }
+        else
+        {
+            ValidateFields(value, {"enabled", "type", "color", "intensity", "range", "rangeAttenuation", "innerConeAngle",
+                "outerConeAngle", "angularRadius"});
+        }
 
         if(!value.at("enabled").is_boolean())
         {
@@ -445,6 +458,23 @@ namespace
         light.innerConeAngle = ReadNumber(value.at("innerConeAngle"), "Light inner cone angle");
         light.outerConeAngle = ReadNumber(value.at("outerConeAngle"), "Light outer cone angle");
         if(value.contains("angularRadius")) light.angularRadius = ReadNumber(value.at("angularRadius"), "Angular radius");
+
+        if(legacyRange)
+        {
+            // Historical lights always faded to zero at their range.
+            *legacyRange = light.range;
+            light.rangeAttenuation = true;
+            ValidateLegacyLightValues(light, *legacyRange);
+            return light;
+        }
+
+        if(!value.at("rangeAttenuation").is_boolean())
+        {
+            throw std::runtime_error("Light rangeAttenuation must be a boolean.");
+        }
+
+        light.rangeAttenuation = value.at("rangeAttenuation").get<bool>();
+
         std::string error;
 
         if(!ValidateLightComponent(light, &error))
@@ -455,6 +485,64 @@ namespace
         return light;
     }
 
+    // Photographic exposure (CameraExposure.h). Optional in schema 14 (added within the physical lighting
+    // milestone): an absent object means the scene's exact reference exposure, so appearance is unchanged.
+    Json ToJson(const CameraExposure& exposure)
+    {
+        return {
+            {"mode", exposure.mode == ExposureMode::Auto ? "Auto" : "Manual"},
+            {"aperture", exposure.aperture},
+            {"shutterSeconds", exposure.shutterSeconds},
+            {"iso", exposure.iso},
+            {"compensation", exposure.compensation},
+            {"meteringMinEV100", exposure.meteringMinEV100},
+            {"meteringMaxEV100", exposure.meteringMaxEV100},
+            {"lowPercentile", exposure.lowPercentile},
+            {"highPercentile", exposure.highPercentile},
+            {"brighteningSpeed", exposure.brighteningSpeed},
+            {"darkeningSpeed", exposure.darkeningSpeed},
+            {"locked", exposure.locked}
+        };
+    }
+
+    CameraExposure ReadCameraExposure(const Json& value)
+    {
+        ValidateFields(value, {"mode", "aperture", "shutterSeconds", "iso", "compensation", "meteringMinEV100",
+            "meteringMaxEV100", "lowPercentile", "highPercentile", "brighteningSpeed", "darkeningSpeed", "locked"});
+
+        if(!value.at("mode").is_string() || (value.at("mode") != "Manual" && value.at("mode") != "Auto"))
+        {
+            throw std::runtime_error("Exposure mode must be Manual or Auto.");
+        }
+
+        if(!value.at("locked").is_boolean())
+        {
+            throw std::runtime_error("Exposure locked must be a boolean.");
+        }
+
+        CameraExposure exposure;
+        exposure.mode = value.at("mode") == "Auto" ? ExposureMode::Auto : ExposureMode::Manual;
+        exposure.aperture = ReadNumber(value.at("aperture"), "Aperture");
+        exposure.shutterSeconds = ReadNumber(value.at("shutterSeconds"), "Shutter speed");
+        exposure.iso = ReadNumber(value.at("iso"), "ISO");
+        exposure.compensation = ReadNumber(value.at("compensation"), "Exposure compensation");
+        exposure.meteringMinEV100 = ReadNumber(value.at("meteringMinEV100"), "Metering minimum");
+        exposure.meteringMaxEV100 = ReadNumber(value.at("meteringMaxEV100"), "Metering maximum");
+        exposure.lowPercentile = ReadNumber(value.at("lowPercentile"), "Low percentile");
+        exposure.highPercentile = ReadNumber(value.at("highPercentile"), "High percentile");
+        exposure.brighteningSpeed = ReadNumber(value.at("brighteningSpeed"), "Brightening speed");
+        exposure.darkeningSpeed = ReadNumber(value.at("darkeningSpeed"), "Darkening speed");
+        exposure.locked = value.at("locked").get<bool>();
+        const char* reason = nullptr;
+
+        if(!ValidateCameraExposure(exposure, &reason))
+        {
+            throw std::runtime_error(reason);
+        }
+
+        return exposure;
+    }
+
     Json ToJson(const CameraComponent& camera)
     {
         return {
@@ -463,13 +551,15 @@ namespace
             {"verticalFov", camera.verticalFov},
             {"nearPlane", camera.nearPlane},
             {"farPlane", camera.farPlane},
-            {"main", camera.main}
+            {"main", camera.main},
+            {"exposure", ToJson(camera.exposure)}
         };
     }
 
-    CameraComponent ReadCameraComponent(const Json& value)
+    // hasExposure reports whether the record carried exposure; the caller supplies the reference default otherwise.
+    CameraComponent ReadCameraComponent(const Json& value, bool& hasExposure)
     {
-        ValidateFields(value, {"enabled", "projection", "verticalFov", "nearPlane", "farPlane", "main"});
+        ValidateFields(value, {"enabled", "projection", "verticalFov", "nearPlane", "farPlane", "main", "exposure"});
 
         if(!value.at("enabled").is_boolean() || !value.at("main").is_boolean())
         {
@@ -487,6 +577,8 @@ namespace
         camera.verticalFov = ReadNumber(value.at("verticalFov"), "Camera vertical FOV");
         camera.nearPlane = ReadNumber(value.at("nearPlane"), "Camera near plane");
         camera.farPlane = ReadNumber(value.at("farPlane"), "Camera far plane");
+        hasExposure = value.contains("exposure");
+        if(hasExposure) camera.exposure = ReadCameraExposure(value.at("exposure"));
         std::string error;
 
         if(!ValidateCameraComponent(camera, &error))
@@ -567,13 +659,15 @@ namespace
                 {"verticalFov", camera.verticalFov},
                 {"aspectRatio", camera.aspectRatio},
                 {"nearPlane", camera.nearPlane},
-                {"farPlane", camera.farPlane}
+                {"farPlane", camera.farPlane},
+                {"exposure", ToJson(camera.exposure)}
             }},
-            {"lightingSettings", {{"ambientStrength", document.lightingSettings.ambientStrength}}}
+            {"lightingSettings", {{"referenceEV100", document.lightingSettings.referenceEV100},
+                {"environmentLuminanceScale", document.lightingSettings.environmentLuminanceScale}}}
         };
     }
 
-    SceneDocument FromJson(const Json& value)
+    SceneDocument FromJson(const Json& value, const LegacyLightingMigrationOptions& migration = {})
     {
         ValidateFields(value, {"schemaVersion", "id", "name", "camera", "directionalLight", "objects", "environmentReference", "lightingSettings"});
         const auto& schemaVersion = value.at("schemaVersion");
@@ -590,7 +684,8 @@ namespace
              schemaVersion != SceneDocument::kCameraSchemaVersion &&
              schemaVersion != SceneDocument::kLightSchemaVersion &&
              schemaVersion != SceneDocument::kEnvironmentNoneSchemaVersion &&
-             schemaVersion != SceneDocument::kObjectLightingSchemaVersion))
+             schemaVersion != SceneDocument::kObjectLightingSchemaVersion &&
+             schemaVersion != SceneDocument::kPhysicalLightingSchemaVersion))
         {
             throw std::runtime_error("Unsupported scene schema version.");
         }
@@ -605,7 +700,10 @@ namespace
         result.environmentReference=value.value("environmentReference",std::string{});
 
         const Json& camera = value.at("camera");
-        ValidateFields(camera, {"position", "target", "verticalFov", "aspectRatio", "nearPlane", "farPlane"});
+        ValidateFields(camera, {"position", "target", "verticalFov", "aspectRatio", "nearPlane", "farPlane", "exposure"});
+        const bool viewportExposure = camera.contains("exposure");
+        if(viewportExposure) result.camera.exposure = ReadCameraExposure(camera.at("exposure"));
+        std::vector<size_t> camerasWithoutExposure;
         result.camera.position = ReadVector3(camera.at("position"));
         result.camera.target = ReadVector3(camera.at("target"));
         result.camera.verticalFov = ReadNumber(camera.at("verticalFov"), "Camera vertical FOV");
@@ -613,15 +711,28 @@ namespace
         result.camera.nearPlane = ReadNumber(camera.at("nearPlane"), "Camera near plane");
         result.camera.farPlane = ReadNumber(camera.at("farPlane"), "Camera far plane");
 
-        std::optional<DirectionalLight> legacySun;
+        std::optional<LegacySceneSun> legacySun;
+        const bool physicalLighting = schemaVersion.get<std::uint32_t>() >= SceneDocument::kPhysicalLightingSchemaVersion;
+        float legacyAmbientStrength = 0.0f;
+        std::vector<LegacyLightValues> legacyLights;
         // Current settings/objects take precedence if both representations are present.
         const bool objectLighting = value.contains("lightingSettings") ||
             schemaVersion.get<std::uint32_t>() >= SceneDocument::kObjectLightingSchemaVersion;
-        if(objectLighting)
+        if(physicalLighting)
+        {
+            const auto& settings = value.at("lightingSettings");
+            ValidateFields(settings, {"referenceEV100", "environmentLuminanceScale"});
+            result.lightingSettings.referenceEV100 = ReadNumber(settings.at("referenceEV100"), "Reference exposure");
+            result.lightingSettings.environmentLuminanceScale =
+                ReadNumber(settings.at("environmentLuminanceScale"), "Environment luminance scale");
+        }
+        else if(objectLighting)
         {
             const auto& settings = value.at("lightingSettings");
             ValidateFields(settings, {"ambientStrength"});
-            result.lightingSettings.ambientStrength = ReadNumber(settings.at("ambientStrength"), "Ambient strength");
+            legacyAmbientStrength = ReadNumber(settings.at("ambientStrength"), "Ambient strength");
+            if(!std::isfinite(legacyAmbientStrength) || legacyAmbientStrength < 0.0f)
+                throw std::runtime_error("Invalid scene ambient strength.");
         }
         else if(value.contains("directionalLight"))
         {
@@ -757,7 +868,9 @@ namespace
 
                 try
                 {
-                    object.camera = ReadCameraComponent(item.at("camera"));
+                    bool hasExposure = false;
+                    object.camera = ReadCameraComponent(item.at("camera"), hasExposure);
+                    if(!hasExposure) camerasWithoutExposure.push_back(result.objects.size());
                 }
                 catch(const std::exception& exception)
                 {
@@ -774,7 +887,10 @@ namespace
 
                 try
                 {
-                    object.light = ReadLightComponent(item.at("light"));
+                    float range = std::numeric_limits<float>::quiet_NaN();
+                    object.light = ReadLightComponent(item.at("light"), physicalLighting ? nullptr : &range);
+                    if(!physicalLighting && object.light->type != LightType::Directional)
+                        legacyLights.push_back({object.id, range});
                 }
                 catch(const std::exception& exception)
                 {
@@ -785,7 +901,27 @@ namespace
             result.objects.push_back(std::move(object));
         }
 
-        if(!objectLighting) MigrateLegacyLighting(result, legacySun);
+        if(!objectLighting) legacyAmbientStrength = MigrateLegacyLighting(result, legacySun);
+        const auto applyReferenceExposure = [&]()
+        {
+            // Cameras authored before exposure existed take the default exposure (Auto), with manual settings at the
+            // scene reference exposure.
+            const auto reference = Photometry::ReferenceCameraExposure(result.lightingSettings.referenceEV100);
+            if(!viewportExposure) result.camera.exposure = reference;
+            for(const size_t index : camerasWithoutExposure) result.objects[index].camera->exposure = reference;
+        };
+        if(!physicalLighting)
+        {
+            LegacyLightingReport report;
+            LegacyLightingMigrationOptions options = migration;
+            if(!options.report) options.report = &report;
+            MigrateLegacyLightUnits(result, schemaVersion.get<std::uint32_t>(), legacyAmbientStrength, legacyLights, options);
+            result.schemaVersion = SceneDocument::kSchemaVersion;
+            Log::Info("Scene '" + result.name + "' converted from schema " + std::to_string(schemaVersion.get<std::uint32_t>()) +
+                " legacy light units at reference exposure EV100 " + std::to_string(options.referenceEV100) + " (" +
+                std::to_string(options.report->lights.size()) + " lights; ranges kept with range attenuation on). Save to persist.");
+        }
+        applyReferenceExposure();
         return result;
     }
 
@@ -954,6 +1090,15 @@ bool LoadSceneDocument(
     SceneDocument& document,
     std::string* errorMessage)
 {
+    return LoadSceneDocument(path, document, errorMessage, LegacyLightingMigrationOptions{});
+}
+
+bool LoadSceneDocument(
+    const std::filesystem::path& path,
+    SceneDocument& document,
+    std::string* errorMessage,
+    const LegacyLightingMigrationOptions& migration)
+{
     try
     {
         std::ifstream file(path, std::ios::binary);
@@ -965,7 +1110,7 @@ bool LoadSceneDocument(
 
         Json json = ParseSceneJson(file);
 
-        SceneDocument loaded = FromJson(json);
+        SceneDocument loaded = FromJson(json, migration);
 
         std::string validationError;
 

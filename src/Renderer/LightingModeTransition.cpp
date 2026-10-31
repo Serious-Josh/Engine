@@ -9,6 +9,7 @@ RendererLightingMode LightingModeTransition::SelectCandidate(
 {
     m_asynchronous = asynchronous;
     m_status.requested = requested;
+    m_preparationFailed = false;
 
     // Synchronous preparation, Legacy and the mode already rendering are attempted directly; the
     // recording's own gates decide, as before.
@@ -57,6 +58,7 @@ RendererLightingMode LightingModeTransition::SelectCandidate(
         return m_status.active;
     case ShaderLibraryPreparationState::Failed:
         Fail(preparation.diagnostic, now);
+        m_preparationFailed = true;
         return m_status.active;
     }
 
@@ -127,6 +129,7 @@ void LightingModeTransition::Reset()
 {
     m_status = {};
     m_asynchronous = false;
+    m_preparationFailed = false;
     m_failedMode = RendererLightingMode::Legacy;
     m_failedAt = {};
 }

@@ -23,7 +23,7 @@ struct DlssInputPreparationConstants
     uint exposureIndex;
     uint width;
     uint height;
-    float exposure;
+    uint exposureStateIndex; // Raw exposure state (AutoExposure.hlsl); word 1 is the tone mapper's multiplier.
     uint padding;
 };
 
@@ -43,7 +43,8 @@ void CSMain(uint3 dispatchThread : SV_DispatchThreadID)
     if(all(pixel == 0))
     {
         RWTexture2D<float> exposureTexture = ResourceDescriptorHeap[constants.exposureIndex];
-        exposureTexture[uint2(0, 0)] = constants.exposure;
+        ByteAddressBuffer exposureState = ResourceDescriptorHeap[constants.exposureStateIndex];
+        exposureTexture[uint2(0, 0)] = asfloat(exposureState.Load(4u));
     }
 
     if(pixel.x >= constants.width || pixel.y >= constants.height)

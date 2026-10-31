@@ -109,6 +109,8 @@ SceneObjectDocument PrepareCameraObject(const SceneDocument& document, const Vec
     PlaceAtEditorView(object, viewPosition, viewTarget, "Camera");
     AssignNewObjectIdentity(document, object, "camera");
     object.camera = CameraComponent{};
+    // A new Camera starts exactly at the scene's reference exposure.
+    object.camera->exposure = Photometry::ReferenceCameraExposure(document.lightingSettings.referenceEV100);
     object.camera->main = std::none_of(document.objects.begin(), document.objects.end(),
         [](const SceneObjectDocument& existing) { return existing.camera && existing.camera->main; });
     return object;

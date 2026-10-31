@@ -28,6 +28,9 @@ struct PSOutput
     float4 surface : SV_Target1;
     float4 motion : SV_Target2;
     float4 geometricNormal : SV_Target3;
+    // P5D.2A raster identity (GBuffer::IdentityFormat): (TLAS InstanceID + 1, TLAS primitive), or all ones when this
+    // draw has no exact TLAS mapping.
+    uint2 identity : SV_Target4;
 };
 
 cbuffer MaterialConstants : register(b0)
@@ -40,6 +43,8 @@ cbuffer MaterialConstants : register(b0)
     float3 baseColor;
     uint roughnessTextureIndex;
     uint displacementLODDescriptorIndex;
+    uint rasterInstance;
+    uint rasterPrimitiveBase;
 }
 
 cbuffer CameraConstants : register(b1)
@@ -484,7 +489,7 @@ VSOutput VSMain(VSInput input)
     return output;
 }
 
-PSOutput PSMain(VSOutput input)
+PSOutput PSMain(VSOutput input, uint primitiveID : SV_PrimitiveID)
 {
     PSOutput output;
 
@@ -646,6 +651,8 @@ PSOutput PSMain(VSOutput input)
     output.geometricNormal = float4(normalize(input.worldNormal), effectiveMetallic);
 
     output.motion = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    output.identity = rasterInstance == 0xFFFFFFFFu ? uint2(0xFFFFFFFFu, 0xFFFFFFFFu) :
+        uint2(rasterInstance + 1u, rasterPrimitiveBase + primitiveID);
 
     if(all(isfinite(input.currentClipPosition)) &&
        all(isfinite(input.previousClipPosition)) &&

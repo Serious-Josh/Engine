@@ -1895,6 +1895,7 @@ namespace
         header.camera.nearPlane = camera.GetNearPlane();
         header.camera.farPlane = camera.GetFarPlane();
         header.lightingSettings = scene.GetLightingSettings();
+        header.camera.exposure = scene.GetViewportExposure();
         return ValidateSceneDocument(header);
     }
 }

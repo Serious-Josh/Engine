@@ -44,6 +44,7 @@ namespace
         camera.SetNearPlane(prepared.camera.nearPlane);
         camera.SetFarPlane(prepared.camera.farPlane);
         scene.SetLightingSettings(prepared.lightingSettings);
+        scene.SetViewportExposure(prepared.camera.exposure);
         scene.SetEnvironmentReference(std::move(environment));
 
         newMapping.structureRevision = scene.GetStructureRevision();

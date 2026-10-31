@@ -62,7 +62,7 @@ struct DirectionalLightConstants
     float lightIntensity;
 
     float3 lightColor;
-    float ambientStrength;
+    float lightPadding;
 };
 
 RaytracingAccelerationStructure scene :

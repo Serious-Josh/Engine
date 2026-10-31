@@ -482,6 +482,24 @@ bool PathTraceBuildSurface(PathTracePayload payload, float3 rayDirection, out Pa
 // Transport
 // -----------------------------------------------------------------------------
 
+// Indirect luminance clamp: the scene-linear luminance above which one indirect contribution (last scattering vertex
+// >= 1) is scaled down to it, preserving RGB ratios. Primary direct lighting, ReSTIR DI and camera-ray misses are exempt.
+static const float PATH_TRACE_INDIRECT_LUMINANCE_CLAMP = 10.0f;
+
+// True when a contribution whose last scattering vertex is `vertex` is subject to the clamp.
+bool PathTraceIndirectClampActive(uint vertex)
+{
+    return vertex >= 1u;
+}
+
+// The factor that brings contribution's luminance down to the threshold (1 at or below it). The same factor scales
+// the contribution's diffuse-extraction share and its radiance-cache harvest, so the signals stay consistent.
+float PathTraceIndirectClampScale(float3 contribution)
+{
+    float luminance = PathTraceLuminance(contribution);
+    return luminance > PATH_TRACE_INDIRECT_LUMINANCE_CLAMP ? PATH_TRACE_INDIRECT_LUMINANCE_CLAMP / luminance : 1.0f;
+}
+
 float3 PathTraceMissRadiance(float3 direction, bool previousDelta, float previousPdf)
 {
     PathTraceEnvironment environment = PathTraceFrameEnvironment();
@@ -1078,6 +1096,13 @@ float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex 
                     if(!directFromRtxdi)
                     {
                         float3 missRadiance = PathTraceMissRadiance(ray.Direction, previousDelta, previousPdf);
+
+                        // The miss of the ray leaving vertex - 1 (vertex 0's own BSDF-sampled light stays unclamped).
+                        if(PathTraceIndirectClampActive(vertex - 1u))
+                        {
+                            missRadiance *= PathTraceIndirectClampScale(throughput * missRadiance);
+                        }
+
                         radiance += throughput * missRadiance;
                         PATH_TRACE_RADIANCE_CACHE_HARVEST(PathTraceRadianceCacheHarvestMiss(harvest, vertex, missRadiance));
 
@@ -1132,6 +1157,13 @@ float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex 
             if(payload.hitDistance < 0.0f)
             {
                 float3 missRadiance = PathTraceMissRadiance(ray.Direction, previousDelta, previousPdf);
+
+                // Camera-ray misses (vertex 0) and vertex 0's BSDF-sampled light stay unclamped.
+                if(vertex >= 1u && PathTraceIndirectClampActive(vertex - 1u))
+                {
+                    missRadiance *= PathTraceIndirectClampScale(throughput * missRadiance);
+                }
+
                 radiance += throughput * missRadiance;
                 break;
             }
@@ -1169,6 +1201,12 @@ float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex 
             else
             {
                 direct = PathTraceDirectLightingLobes(surface, position, random, rayCount, directDiffuse);
+            }
+
+            // Indirect next-event estimation (vertex >= 1): one contribution, scaled with its diffuse share.
+            if(PathTraceIndirectClampActive(vertex))
+            {
+                direct *= PathTraceIndirectClampScale(throughput * direct);
             }
 
             radiance += throughput * direct;

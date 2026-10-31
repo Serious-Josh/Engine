@@ -18,10 +18,10 @@ namespace
         float speed = 0.01f;
     };
 
-    // Drag speeds only; ValidateLightComponent is the sole range contract. Order matches
-    // Editor::m_lightDragDrafts.
+    // Drag speeds only; ValidateLightComponent is the sole value contract. Order matches
+    // Editor::m_lightDragDrafts. The intensity label names the unit of the light's type.
     constexpr std::array<LightNumericField, 5> kLightFields{{
-        {"Intensity", &LightComponent::intensity, false, 0.05f},
+        {"Luminous Flux (lm)", &LightComponent::intensity, false, 10.0f},
         {"Range (m)", &LightComponent::range, false, 0.1f},
         {"Inner Cone Angle (deg)", &LightComponent::innerConeAngle, true, 0.25f},
         {"Outer Cone Angle (deg)", &LightComponent::outerConeAngle, true, 0.25f},
@@ -30,8 +30,13 @@ namespace
 
     constexpr size_t kIntensityField = 0;
     constexpr size_t kRangeField = 1;
-    constexpr size_t kInnerConeField = 2;
-    constexpr size_t kOuterConeField = 3;
+    constexpr size_t kAngularRadiusField = 4;
+
+    const char* LightFieldLabel(LightType type, size_t fieldIndex)
+    {
+        return fieldIndex == kIntensityField && type == LightType::Directional ? "Illuminance (lux)" :
+            kLightFields[fieldIndex].label;
+    }
 
     float DisplayedLightValue(const LightComponent& light, const LightNumericField& field)
     {
@@ -51,7 +56,7 @@ namespace
             return type != LightType::Directional;
         }
 
-        if(fieldIndex == 4) return type == LightType::Directional;
+        if(fieldIndex == kAngularRadiusField) return type == LightType::Directional;
         return type == LightType::Spot;
     }
 }
@@ -309,8 +314,8 @@ void Editor::DrawObjectLightControls(IDemoScene& scene)
     float colorValues[3] = {m_lightColorDraft.x, m_lightColorDraft.y, m_lightColorDraft.z};
     const ImGuiColorEditFlags colorFlags = ImGuiColorEditFlags_Float | ImGuiColorEditFlags_NoAlpha;
 
-    if((light.type == LightType::Directional ? ImGui::InputFloat3("Color (linear RGB)", colorValues) :
-        ImGui::ColorEdit3("Color", colorValues, colorFlags)) && !blocked)
+    // Every type's colour is a [0, 1] tint; the photometric intensity alone sets brightness.
+    if(ImGui::ColorEdit3("Color", colorValues, colorFlags) && !blocked)
     {
         m_lightColorDraft = {colorValues[0], colorValues[1], colorValues[2]};
         m_lightColorGestureActive = true;
@@ -328,6 +333,24 @@ void Editor::DrawObjectLightControls(IDemoScene& scene)
         }
     }
 
+    if(light.type != LightType::Directional)
+    {
+        bool rangeAttenuation = light.rangeAttenuation;
+
+        if(ImGui::Checkbox("Range Attenuation", &rangeAttenuation) && !blocked)
+        {
+            auto edited = light;
+            edited.rangeAttenuation = rangeAttenuation;
+            CommitObjectLight(scene, *selection, object.light, edited);
+        }
+
+        if(ImGui::IsItemHovered())
+        {
+            ImGui::SetTooltip("On: fade smoothly to zero approaching the range. Off: full inverse-square light up to a "
+                "hard cutoff at the range.");
+        }
+    }
+
     for(size_t index = 0; index < kLightFields.size(); ++index)
     {
         if(!IsFieldShown(light.type, index))
@@ -339,7 +362,7 @@ void Editor::DrawObjectLightControls(IDemoScene& scene)
         float& draft = m_lightDragDrafts[index];
         // Unbounded drafts: authoritative validation rejects invalid values without clamping.
         const InspectorDragSpec drag{field.speed};
-        const auto result = InspectorDragFloatTransformWidth(field.label, draft, drag);
+        const auto result = InspectorDragFloatTransformWidth(LightFieldLabel(light.type, index), draft, drag);
 
         if(result == InspectorDragResult::Committed && !blocked)
         {

@@ -14,18 +14,273 @@ namespace
     uint64_t AllocateTLASRecordingIdentity()
     {
         static std::atomic<uint64_t> next{1};
-        auto value = next.load(std::memory_order_relaxed);
-        while (value != UINT64_MAX)
+        return AllocateTLASIdentity(next);
+    }
+} // namespace
+
+std::shared_ptr<TLASRecordingCapture> TopLevelAccelerationStructure::PrepareCapture(unsigned int slot,
+    std::uint64_t recording, const std::vector<const BottomLevelAccelerationStructure*>& bottomLevels) noexcept
+{
+    if(m_instanceDescriptions.size() > MaxCaptureInstances)
+    {
+        m_captureStatus = TLASCaptureStatus::InstanceLimit;
+        return {};
+    }
+
+    auto freeSlot = m_captureSlots.end();
+
+    for(auto iterator = m_captureSlots.begin(); iterator != m_captureSlots.end(); ++iterator)
+    {
+        if(iterator->tracked.expired())
         {
-            if (next.compare_exchange_weak(value, value + 1, std::memory_order_relaxed))
+            freeSlot = iterator;
+            break;
+        }
+    }
+
+    if(freeSlot == m_captureSlots.end())
+    {
+        m_captureStatus = TLASCaptureStatus::CapacityExceeded;
+        return {};
+    }
+
+    try
+    {
+        auto capture = std::make_shared<TLASRecordingCapture>();
+        capture->ownerLifetime = m_ownerLifetime;
+        capture->recordingIdentity = recording;
+        capture->uploadSlot = slot;
+        capture->instances = m_instanceDescriptions;
+        capture->bottomLevels.resize(m_instanceDescriptions.size());
+        capture->result = m_resource;
+        capture->scratch = m_scratchResource;
+        capture->instanceUpload = m_instanceBuffers[slot];
+        capture->completeBLASReferences = true;
+        Microsoft::WRL::ComPtr<ID3D12Device> device;
+
+        if(FAILED(m_resource->GetDevice(IID_PPV_ARGS(&device))))
+        {
+            m_captureStatus = TLASCaptureStatus::ResourceBudgetExceeded;
+            return {};
+        }
+
+        const auto charge = [&](ID3D12Resource* resource)
+        {
+            const auto description = resource->GetDesc();
+            const auto info = device->GetResourceAllocationInfo(0, 1, &description);
+
+            if(info.SizeInBytes > MaxCaptureResourceBytes ||
+                capture->resourceCharge > MaxCaptureResourceBytes - info.SizeInBytes)
             {
-                return value;
+                return false;
+            }
+
+            capture->resourceCharge += info.SizeInBytes;
+            return true;
+        };
+
+        if(!charge(m_resource) || !charge(m_scratchResource) || !charge(m_instanceBuffers[slot]))
+        {
+            m_captureStatus = TLASCaptureStatus::ResourceBudgetExceeded;
+            return {};
+        }
+
+        for(std::size_t index = 0; index < capture->instances.size(); ++index)
+        {
+            auto& reference = capture->bottomLevels[index];
+
+            if(index < m_instanceBuildIdentities.size())
+            {
+                reference.identity = m_instanceBuildIdentities[index];
+            }
+
+            const auto matches = [&](const BLASBuildCapture& build)
+            {
+                return reference.identity.ownerLifetime != 0 && reference.identity.buildID != 0 &&
+                    build.identity.ownerLifetime == reference.identity.ownerLifetime &&
+                    build.identity.buildID == reference.identity.buildID && build.result &&
+                    build.result->GetGPUVirtualAddress() == capture->instances[index].AccelerationStructure;
+            };
+
+            for(const auto* bottomLevel : bottomLevels)
+            {
+                if(!bottomLevel)
+                {
+                    continue;
+                }
+
+                const auto& current = bottomLevel->GetCurrentBuildCapture();
+
+                if(matches(current))
+                {
+                    reference.result = current.result;
+                    break;
+                }
+
+                for(std::size_t retiredIndex = 0; const auto* retired = bottomLevel->GetRetiredBuildCapture(retiredIndex);
+                    ++retiredIndex)
+                {
+                    if(matches(*retired))
+                    {
+                        reference.result = retired->result;
+                        break;
+                    }
+                }
+
+                if(reference.result)
+                {
+                    break;
+                }
+            }
+
+            if(!reference.result)
+            {
+                // Preserve the native descriptor even when the corresponding
+                // build is no longer discoverable. Never substitute a later VA match.
+                capture->completeBLASReferences = false;
+            }
+            else if(!charge(reference.result.Get()))
+            {
+                m_captureStatus = TLASCaptureStatus::ResourceBudgetExceeded;
+                return {};
             }
         }
 
-        return 0;
+        *freeSlot = {};
+        freeSlot->tracked = capture;
+        freeSlot->evidence.ownerLifetime = capture->ownerLifetime;
+        freeSlot->evidence.recordingIdentity = capture->recordingIdentity;
+        return capture;
     }
-} // namespace
+    catch(const std::bad_alloc&)
+    {
+        m_captureStatus = TLASCaptureStatus::AllocationFailed;
+        return {};
+    }
+}
+
+bool TopLevelAccelerationStructure::GetSubmissionEvidence(const TLASRecordingHandle& capture,
+    TLASSubmissionEvidence& output) const noexcept
+{
+    if(!capture)
+    {
+        return false;
+    }
+
+    for(const auto& slot : m_captureSlots)
+    {
+        const auto tracked = slot.tracked.lock();
+
+        if(tracked == capture && !tracked.owner_before(capture) && !capture.owner_before(tracked) &&
+            slot.evidence.ownerLifetime != 0 && slot.evidence.ownerLifetime == capture->ownerLifetime &&
+            slot.evidence.recordingIdentity == capture->recordingIdentity)
+        {
+            output = slot.evidence;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool TopLevelAccelerationStructure::AttributeCurrentCapture(const TLASRecordingHandle& expected,
+    TLASRecordingProvenance provenance) noexcept
+{
+    TLASSubmissionEvidence evidence;
+
+    if(!expected || expected != m_capture || expected.owner_before(m_capture) || m_capture.owner_before(expected) ||
+        expected->ownerLifetime != m_ownerLifetime || expected->recordingIdentity != m_recordingIdentity ||
+        !provenance.recordingOwner || !provenance.generation || !GetSubmissionEvidence(expected, evidence) ||
+        evidence.state != TLASRecordingState::Unattributed)
+    {
+        return false;
+    }
+
+    for(auto& slot : m_captureSlots)
+    {
+        if(slot.evidence.ownerLifetime == evidence.ownerLifetime &&
+            slot.evidence.recordingIdentity == evidence.recordingIdentity)
+        {
+            slot.evidence.provenance = provenance;
+            slot.evidence.state = TLASRecordingState::Recorded;
+            slot.unresolved = expected;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+void TopLevelAccelerationStructure::TransitionCaptures(TLASRecordingProvenance provenance,
+    TLASRecordingState next) noexcept
+{
+    if(!provenance.recordingOwner || !provenance.generation)
+    {
+        return;
+    }
+
+    for(auto& slot : m_captureSlots)
+    {
+        auto& evidence = slot.evidence;
+        const auto state = evidence.state;
+        const bool legal = ((state == TLASRecordingState::Recorded || state == TLASRecordingState::NotSubmitted) &&
+            (next == TLASRecordingState::SubmissionUncertain || next == TLASRecordingState::Discarded)) ||
+            (state == TLASRecordingState::SubmissionUncertain && next == TLASRecordingState::NotSubmitted);
+
+        if(evidence.provenance == provenance && legal)
+        {
+            evidence.state = next;
+
+            if(next == TLASRecordingState::Discarded)
+            {
+                slot.unresolved.reset();
+            }
+        }
+    }
+}
+
+void TopLevelAccelerationStructure::ConfirmCaptures(TLASRecordingProvenance provenance,
+    std::uint64_t fence, std::uint64_t lifetime) noexcept
+{
+    if(!provenance.recordingOwner || !provenance.generation || !fence || fence == UINT64_MAX || !lifetime)
+    {
+        return;
+    }
+
+    for(auto& slot : m_captureSlots)
+    {
+        auto& evidence = slot.evidence;
+
+        if(evidence.provenance == provenance && evidence.state == TLASRecordingState::SubmissionUncertain)
+        {
+            evidence.submissionFence = fence;
+            evidence.submissionLifetime = lifetime;
+            evidence.state = TLASRecordingState::Submitted;
+        }
+    }
+}
+
+void TopLevelAccelerationStructure::ObserveCaptureCompletion(std::uint64_t completed, std::uint64_t lifetime,
+    std::uint64_t recordingOwner) noexcept
+{
+    if(!completed || completed == UINT64_MAX || !lifetime || !recordingOwner)
+    {
+        return;
+    }
+
+    for(auto& slot : m_captureSlots)
+    {
+        auto& evidence = slot.evidence;
+
+        if(evidence.state == TLASRecordingState::Submitted && evidence.provenance.recordingOwner == recordingOwner &&
+            evidence.provenance.generation != 0 && evidence.submissionFence != 0 && evidence.submissionFence != UINT64_MAX &&
+            evidence.submissionLifetime == lifetime && completed >= evidence.submissionFence)
+        {
+            evidence.state = TLASRecordingState::Completed;
+            slot.unresolved.reset();
+        }
+    }
+}
 
 bool TopLevelAccelerationStructure::Initialize(
     ID3D12Device5* device,
@@ -35,10 +290,36 @@ bool TopLevelAccelerationStructure::Initialize(
 {
     m_recordingIdentity = 0;
     m_recordingSlot = UINT_MAX;
+    m_capture.reset();
+    m_captureStatus = TLASCaptureStatus::Unavailable;
 
-    if (!device || !commandList || description.instances.empty() || bottomLevelStructures.empty())
+    if (!device || !commandList || description.instances.empty() || bottomLevelStructures.empty() ||
+        m_resource || m_scratchResource || m_instanceBuffers[0] || m_instanceBuffers[1] ||
+        description.instances.size() > UINT_MAX)
     {
         return false;
+    }
+
+    m_ownerLifetime = AllocateTLASRecordingIdentity();
+    const auto recordingIdentity = AllocateTLASRecordingIdentity();
+
+    if(!m_ownerLifetime || !recordingIdentity)
+    {
+        return false;
+    }
+
+    m_instanceBuildIdentities.clear();
+
+    if(description.instances.size() <= MaxCaptureInstances)
+    {
+        try
+        {
+            m_instanceBuildIdentities.resize(description.instances.size());
+        }
+        catch(const std::bad_alloc&)
+        {
+            // Native evidence may still be captured without BLAS associations.
+        }
     }
 
     m_instanceDescriptions.clear();
@@ -79,6 +360,11 @@ bool TopLevelAccelerationStructure::Initialize(
         instance.Flags = D3D12_RAYTRACING_INSTANCE_FLAG_NONE;
 
         instance.AccelerationStructure = bottomLevel->GetGPUAddress();
+
+        if(i < m_instanceBuildIdentities.size())
+        {
+            m_instanceBuildIdentities[i] = bottomLevel->GetCurrentBuildCapture().identity;
+        }
     }
 
     const UINT64 instanceBufferSize = sizeof(D3D12_RAYTRACING_INSTANCE_DESC) * m_instanceDescriptions.size();
@@ -208,6 +494,15 @@ bool TopLevelAccelerationStructure::Initialize(
 
     buildDescription.DestAccelerationStructureData = m_resource->GetGPUVirtualAddress();
 
+    // All optional allocations/pins precede native recording. Both initialization
+    // uploads were memcpy'd from this exact image and have not been changed.
+    auto capture = PrepareCapture(0, recordingIdentity, bottomLevelStructures);
+
+    if(capture)
+    {
+        capture->build = buildDescription;
+    }
+
     commandList->BuildRaytracingAccelerationStructure(&buildDescription, 0, nullptr);
 
     D3D12_RESOURCE_BARRIER barrier{};
@@ -218,6 +513,14 @@ bool TopLevelAccelerationStructure::Initialize(
 
     m_instanceCount = description.instances.size();
     m_buildFlags = buildInputs.Flags;
+    m_recordingIdentity = recordingIdentity;
+    m_recordingSlot = 0;
+    m_capture = std::move(capture);
+
+    if(m_capture)
+    {
+        m_captureStatus = TLASCaptureStatus::Ready;
+    }
 
     return true;
 }
@@ -231,6 +534,8 @@ bool TopLevelAccelerationStructure::Update(
 {
     m_recordingIdentity = 0;
     m_recordingSlot = UINT_MAX;
+    m_capture.reset();
+    m_captureStatus = TLASCaptureStatus::Unavailable;
     const auto recordingIdentity = AllocateTLASRecordingIdentity();
 
     if (recordingIdentity == 0)
@@ -294,6 +599,11 @@ bool TopLevelAccelerationStructure::Update(
 
         instance.AccelerationStructure = bottomLevel->GetGPUAddress();
 
+        if(instanceIndex < m_instanceBuildIdentities.size())
+        {
+            m_instanceBuildIdentities[instanceIndex] = bottomLevel->GetCurrentBuildCapture().identity;
+        }
+
         for (unsigned int pendingFrame = 0; pendingFrame < FrameCount; ++pendingFrame)
         {
             if (!m_pendingInstanceUpdates[pendingFrame][instanceIndex])
@@ -305,6 +615,7 @@ bool TopLevelAccelerationStructure::Update(
         }
     }
 
+    auto capture = PrepareCapture(frameIndex, recordingIdentity, bottomLevelStructures);
     void* mappedData = nullptr;
 
     HRESULT result = m_instanceBuffers[frameIndex]->Map(0, nullptr, &mappedData);
@@ -326,6 +637,14 @@ bool TopLevelAccelerationStructure::Update(
 
     m_pendingInstanceIndices[frameIndex].clear();
 
+    if(capture)
+    {
+        // Copy the COMPLETE actual flushed image, including untouched entries
+        // and delayed writes carried from the other upload slot.
+        std::memcpy(capture->instances.data(), mappedInstances,
+            capture->instances.size() * sizeof(D3D12_RAYTRACING_INSTANCE_DESC));
+    }
+
     m_instanceBuffers[frameIndex]->Unmap(0, nullptr);
 
     D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS buildInputs{};
@@ -345,6 +664,11 @@ bool TopLevelAccelerationStructure::Update(
     buildDescription.DestAccelerationStructureData = m_resource->GetGPUVirtualAddress();
     buildDescription.ScratchAccelerationStructureData = m_scratchResource->GetGPUVirtualAddress();
 
+    if(capture)
+    {
+        capture->build = buildDescription;
+    }
+
     commandList->BuildRaytracingAccelerationStructure(&buildDescription, 0, nullptr);
 
     D3D12_RESOURCE_BARRIER barrier{};
@@ -355,6 +679,12 @@ bool TopLevelAccelerationStructure::Update(
 
     m_recordingIdentity = recordingIdentity;
     m_recordingSlot = frameIndex;
+    m_capture = std::move(capture);
+
+    if(m_capture)
+    {
+        m_captureStatus = TLASCaptureStatus::Ready;
+    }
     return true;
 }
 
@@ -397,6 +727,11 @@ bool TopLevelAccelerationStructure::RefreshBLASReferences(
     const std::vector<RayTracingInstanceDescription>& instances,
     const std::vector<const BottomLevelAccelerationStructure*>& bottomLevelStructures)
 {
+    m_recordingIdentity = 0;
+    m_recordingSlot = UINT_MAX;
+    m_capture.reset();
+    m_captureStatus = TLASCaptureStatus::Unavailable;
+
     if (!commandList || frameIndex >= FrameCount || instances.size() != m_instanceCount)
     {
         return false;
@@ -415,6 +750,19 @@ bool TopLevelAccelerationStructure::RefreshBLASReferences(
 
 void TopLevelAccelerationStructure::Shutdown()
 {
+    // Same checked drain/recording-abandonment precondition as the native owner.
+    // This ends lifecycle tracking, never invents Completed for uncertain work.
+    // Weak slots keep escaped historical captures charged across reinitialize.
+    for(auto& slot : m_captureSlots)
+    {
+        slot.unresolved.reset();
+        slot.evidence = {};
+    }
+
+    m_capture.reset();
+    m_captureStatus = TLASCaptureStatus::Unavailable;
+    m_ownerLifetime = 0;
+    m_instanceBuildIdentities.clear();
     m_recordingIdentity = 0;
     m_recordingSlot = UINT_MAX;
 

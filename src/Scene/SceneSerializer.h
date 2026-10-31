@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Scene/SceneDocument.h"
+#include "Scene/PhysicalLightingMigration.h"
 
 #include <filesystem>
 #include <string>
@@ -14,6 +15,13 @@ bool LoadSceneDocument(
     const std::filesystem::path& path,
     SceneDocument& document,
     std::string* errorMessage = nullptr);
+
+// As LoadSceneDocument, choosing how a document in legacy light units (schema < 14) is converted.
+bool LoadSceneDocument(
+    const std::filesystem::path& path,
+    SceneDocument& document,
+    std::string* errorMessage,
+    const LegacyLightingMigrationOptions& migration);
 // Collision is distinct from validation, write, and other filesystem errors.
 enum class CreateSceneDocumentResult
 {

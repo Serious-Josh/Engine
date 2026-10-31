@@ -13,12 +13,14 @@
 
 #include "Renderer/Material.h"
 #include "Renderer/Mesh.h"
+#include "Renderer/Caustics/CausticGeometrySourceManifest.h"
 #include "Renderer/Pipeline.h"
 #include "Renderer/VertexLayout.h"
 #include "Renderer/Texture.h"
 #include "Renderer/ProjectTextureLoader.h"
 #include "assets/ProjectTexturePreparationService.h"
 
+#include <array>
 #include <filesystem>
 #include <functional>
 #include <cstdint>
@@ -123,6 +125,13 @@ public:
         std::string* errorMessage);
     Mesh* FindRetainedMesh(std::string_view reference);
     const MeshMetadata* FindRetainedSlotMetadata(std::string_view reference) const;
+
+    // The 1x1 opaque white fallback base texture: uploaded once by Initialize, never written
+    // afterwards and destroyed only by Shutdown. Identity for caustic texture admission only.
+    const Texture* GetImmutableFallbackTexture() const noexcept
+    {
+        return m_initialized ? &m_whiteTexture : nullptr;
+    }
     Material* FindRetainedMaterial(std::string_view reference);
     // Existing renderer identity only; includes retained Inspector assignment versions.
     // Never resolves files, uploads resources, or admits a new table entry.
@@ -190,8 +199,46 @@ public:
         return m_meshError;
     }
 
-    // Registered meshes and builtin:sphere. CPU geometry shares the catalog borrow lifetime.
+    // Registered meshes and builtins. CPU geometry shares the catalog borrow lifetime.
     const ImportedMesh* GetMeshGeometry(const Mesh& mesh) const noexcept;
+    enum class StaticSourceAdmissionStatus
+    {
+        Disabled, Configured, Ready, NotSelected, InvalidSource, LateConfiguration,
+        NondefaultMetadata, InvalidMetadata, CapacityExceeded, PreparationFailed
+    };
+    struct StaticSourceAdmissionDiagnostic
+    {
+        StaticSourceAdmissionStatus status = StaticSourceAdmissionStatus::Disabled;
+        CausticContracts::Geometry::AdmissionResult preparation{CausticContracts::Geometry::AdmissionStatus::Ready};
+    };
+    // Owner thread, before first GPU creation. Only full, validated cooked
+    // completions are supported; fixtureID is provenance, never asset identity.
+    StaticSourceAdmissionStatus ConfigureStaticSourceAdmission(
+        const ProjectMeshPreparationService::Completion& completion,
+        const ProjectMeshPreparationService& preparation,
+        std::uint32_t firstPrimitive, std::uint32_t primitiveCount, std::uint64_t fixtureID);
+    StaticSourceAdmissionDiagnostic GetLastStaticSourceAdmission() const noexcept
+    {
+        return m_staticSourceDiagnostic;
+    }
+    // Upper bound on live static-source generations charged to one catalog. Each costs at most
+    // 638,976 B of source plus 2 MiB of resources, so the aggregate is bounded near 21 MiB.
+    static constexpr std::size_t MaxStaticSources = 8;
+    enum class StaticSourceRequestStatus { Ready, Cleared, EmptyAssetID, Duplicate, Overflow };
+    // Scene caustic registration opt-in, before residency: the first FBX-imported GPU creation of each
+    // requested asset ID is admitted as an immutable static source when every triangle certifies.
+    // Admission is independent per asset; a refused asset keeps ordinary geometry and never affects the
+    // others. Empty clears. Invalid sets are refused whole and clear the request. Never changes
+    // geometry already created.
+    StaticSourceRequestStatus RequestStaticSourceAssets(std::vector<std::string> assetIDs);
+    void RequestStaticSourceAsset(std::string assetID)
+    {
+        std::vector<std::string> assetIDs;
+        if(!assetID.empty())
+            assetIDs.push_back(std::move(assetID));
+        RequestStaticSourceAssets(std::move(assetIDs));
+    }
+    const std::vector<std::string>& GetStaticSourceAssetRequests() const noexcept { return m_staticSourceAssetRequests; }
     Material* ResolveMaterial(std::string_view reference) override;
     // Call outside active recording. Saved content and fresh dependency resources;
     // never changes existing Material objects. Uploads use the checked synchronous uploader.
@@ -237,6 +284,7 @@ public:
     }
 
 private:
+    friend class RayTracingRecordingDiagnostic;
     friend class SceneMaterialBindingPublication;
 #if defined(ENGINE_HAS_VERIFICATION)
     friend class PrimitiveCreationVerification;
@@ -268,6 +316,33 @@ private:
     ProjectMeshCPUCache* m_meshCPUCache = nullptr; // Engine-owned; CPU-only, outlives catalogs.
 
     std::string m_meshError;
+
+    struct StaticSourceSelection
+    {
+        MeshCacheKey key;
+        std::weak_ptr<const ImportedMesh> geometry;
+        std::shared_ptr<const CookedMeshResidencyEvidence> cooked;
+        std::uint64_t catalogIdentity = 0;
+        std::uint32_t firstPrimitive = 0;
+        std::uint32_t primitiveCount = 0;
+        std::uint64_t fixtureID = 0;
+    };
+    bool ValidateStaticSourceSelection(const StaticSourceSelection& selection) const;
+    std::optional<StaticSourceSelection> m_staticSourceSelection;
+    StaticSourceAdmissionDiagnostic m_staticSourceDiagnostic;
+    // Sorted and unique, so admission order and fixture provenance never depend on request order.
+    std::vector<std::string> m_staticSourceAssetRequests;
+    // Deliberately survive Shutdown/Initialize and selection changes. Historical external
+    // owners still consume their generation slot on this catalog.
+    struct AdmittedStaticSource
+    {
+        std::string assetID;
+        std::weak_ptr<const CausticContracts::Geometry::MeshSourceGeneration> generation;
+    };
+    std::array<AdmittedStaticSource, MaxStaticSources> m_admittedSources;
+    bool HasLiveStaticSource() const noexcept;
+    bool HasLiveStaticSource(const std::string& assetID) const noexcept;
+    AdmittedStaticSource* FindFreeStaticSourceSlot() noexcept;
 
     std::optional<RuntimeMaterialVersions> GetOwnedMaterialVersions(const std::filesystem::path& canonicalProject,
         const AssetID& id, bool requireRegistration, std::string* errorMessage) const;
@@ -471,6 +546,13 @@ private:
 
     Mesh m_sphereMesh;
     ImportedMesh m_sphereGeometry;
+
+    // builtin:triangle: one axis-aligned dyadic triangle, initialized as an immutable static
+    // source so the accepted caustic domain can be authored with ordinary scene references.
+    // Owns its own generation; it never consumes an m_admittedSources slot.
+    Mesh m_triangleMesh;
+    ImportedMesh m_triangleGeometry;
+    const Mesh* FindBuiltinMesh(std::string_view reference) const noexcept;
 
     Texture m_whiteTexture;
 

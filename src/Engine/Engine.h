@@ -31,6 +31,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <limits>
 #include <functional>
 
 // Uninitialized -> ProjectIndependent -> ProjectReady -> Running -> Stopped.
@@ -123,6 +124,7 @@ class Engine
     friend class SceneLifecycleVerification;
     friend class AssetBrowserSceneVerification;
     friend class StartupSceneVerification;
+    friend class CausticVisibleVerification;
     friend class ProjectSystemWorkflowVerification;
     friend class ProjectRelaunchVerification;
     void VerifyPackagedBootstrap();
@@ -331,6 +333,12 @@ class Engine
     void CancelEditorMembership(const std::string&);
     void PopulateArchiveScene(std::shared_ptr<const CookedScene::ArchiveScene>);
     bool ApplySceneEnvironment(std::string& error);
+    float ActiveEnvironmentRadianceScale() const;
+    void RefreshSceneEnvironmentCalibration();
+    // The HDRI calibration ApplySceneEnvironment last applied (NaN before the first).
+    float m_appliedEnvironmentRadianceScale = std::numeric_limits<float>::quiet_NaN();
+    // Set on scene activation; the next frame's automatic exposure snaps to its target.
+    bool m_exposureResetPending = true;
     bool AssignSceneEnvironment(size_t index, std::string& error);
     // Builds the game startup scene from its saved file (see ResolveBuildStartupScene). A dirty
     // active startup scene is refused, setting *startupSceneUnsaved, unless saveStartupScene asks
@@ -421,6 +429,11 @@ class Engine
     bool BeginMeshResidencyRequest(const SceneObjectMetadata& selection, bool automatic);
     void StartAutomaticMeshResidency();
     void OnFileSceneActivated(std::chrono::steady_clock::time_point started);
+    // R.9I.3: explicit opt-in roles from "<scene>.caustics.json" beside a development scene file.
+    // Absent, malformed or naming missing objects: no registration (caustics refuse as Unregistered).
+    // A registered asset mesh is requested as the catalog's static source before residency starts.
+    void LoadSceneCausticRegistration(FileBackedDemoScene& scene);
+    std::optional<Renderer::CausticRegistration> m_sceneCausticRegistration;
     void ContinueAutomaticMeshResidencyAfterReplacement(std::uint64_t previousRuntimeIdentity) noexcept;
     void AdvanceAutomaticMeshResidency();
     // failedObjectID names the batch entry responsible for a rejection, when known.

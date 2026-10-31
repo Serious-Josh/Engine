@@ -76,11 +76,19 @@ class LightingModeTransition
         return m_status;
     }
 
+    // Whether the last SelectCandidate rejected the requested mode because its DXR library preparation failed. The
+    // mode's own gates were then not evaluated; GetStatus().diagnostic says why.
+    bool PreparationFailed() const noexcept
+    {
+        return m_preparationFailed;
+    }
+
     private:
     void Fail(const std::string& diagnostic, Clock::time_point now);
 
     LightingModeTransitionStatus m_status;
     bool m_asynchronous = false;
+    bool m_preparationFailed = false;
     RendererLightingMode m_failedMode = RendererLightingMode::Legacy;
     Clock::time_point m_failedAt{};
 };

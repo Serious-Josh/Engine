@@ -13,7 +13,8 @@ bool EnvironmentMap::Initialize(
     ID3D12Device* device,
     const std::filesystem::path& path,
     ResourceUploader& uploader,
-    DescriptorHeap& descriptorHeap)
+    DescriptorHeap& descriptorHeap,
+    float radianceScale)
 {
     HDRImageData image{};
 
@@ -28,16 +29,41 @@ bool EnvironmentMap::Initialize(
         return false;
     }
 
-    return Initialize(device,image,uploader,descriptorHeap);
+    return Initialize(device,image,uploader,descriptorHeap,radianceScale);
 }
-bool EnvironmentMap::Initialize(ID3D12Device* device,const HDRImageData& image,ResourceUploader& uploader,DescriptorHeap& descriptorHeap)
+bool EnvironmentMap::Initialize(ID3D12Device* device,const HDRImageData& source,ResourceUploader& uploader,DescriptorHeap& descriptorHeap,
+    float radianceScale)
 {
-    if(image.width == 0 || image.height == 0 || image.channels != 4 ||
-        image.pixels.size() != static_cast<size_t>(image.width) * image.height * 4)
+    if(source.width == 0 || source.height == 0 || source.channels != 4 ||
+        source.pixels.size() != static_cast<size_t>(source.width) * source.height * 4)
     {
         Log::Error("Invalid environment image dimensions or pixel storage.");
         return false;
     }
+
+    if(!std::isfinite(radianceScale) || radianceScale < 0.0f)
+    {
+        Log::Error("Invalid environment radiance scale.");
+        return false;
+    }
+
+    // The calibrated copy feeds the source texture and the importance distribution alike (the CDF is normalized).
+    HDRImageData scaled;
+
+    if(radianceScale != 1.0f)
+    {
+        scaled = source;
+
+        for(size_t index = 0; index < scaled.pixels.size(); ++index)
+        {
+            if(index % 4 != 3)
+            {
+                scaled.pixels[index] *= radianceScale;
+            }
+        }
+    }
+
+    const HDRImageData& image = radianceScale != 1.0f ? scaled : source;
 
     Log::Info("HDR environment loaded: " + std::to_string(image.width) + "x" + std::to_string(image.height));
 

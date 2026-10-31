@@ -29,6 +29,8 @@
 #include "DisplacementGPUPatchBuffer.h"
 #include "Displacement/DisplacementUpdateState.h"
 #include "Displacement/DisplacementGeometryBinding.h"
+#include "Caustics/CausticPass.h"
+#include "Caustics/PixelCausticPass.h"
 
 #include "Debug/DebugUI.h"
 
@@ -44,6 +46,7 @@
 #include "Passes/ToneMapPass.h"
 #include "Passes/PresentationResolvePass.h"
 #include "Passes/DlssInputPreparationPass.h"
+#include "Passes/AutoExposurePass.h"
 #include "Upscaling/DlssBackend.h"
 #include "Passes/DeferredLightingPass.h"
 #include "Passes/BRDFIntegrationPass.h"
@@ -83,6 +86,7 @@
 
 #include <d3d12.h>
 #include <filesystem>
+#include <functional>
 #include <string>
 #include <vector>
 #include <array>
@@ -118,6 +122,8 @@ struct RendererOptions
 
     Vector3 selectionOutlineColor{1.0f, 0.72f, 0.0f};
     unsigned int selectionOutlineThickness = 2;
+    // Final display tone mapper only; HDR lighting and accumulation are unaffected, so switching never resets them.
+    ToneMapOperator toneMapOperator = ToneMapOperator::Existing;
 
     bool enableRTGI = true;
 
@@ -160,6 +166,11 @@ struct RendererOptions
     // DLSS jitter phase count, the per-frame upscaler input contract) without evaluating DLSS. Off by default: no pass,
     // no allocation, unchanged rendering. Not saved.
     bool dlssInputPreparation = false;
+    // Seconds since the previous frame, for exposure adaptation (0 holds the adapted exposure).
+    float frameDeltaSeconds = 0.0f;
+    // Snap automatic exposure to its target this frame (scene activation); camera cuts and reference-exposure
+    // changes snap on their own.
+    bool exposureReset = false;
 };
 
 // UPSCALING.3B: Engine's per-frame upscaler input contract, filled on frames that prepare DLSS inputs. Everything a
@@ -185,9 +196,8 @@ struct UpscalerFrameInputs
     RenderTarget* engineMotion = nullptr;
     // DLSS motion (RG16F: previous - current pixel position, render pixels, unjittered, sky included).
     Texture* dlssMotionVectors = nullptr;
-    // 1x1 R16F holding exposure (the tone mapper's fixed 1.0).
+    // 1x1 R16F holding the tone mapper's exposure multiplier, written on the GPU from the exposure state.
     Texture* exposure = nullptr;
-    float exposureValue = 1.0f;
     // This frame's jitter (render pixels; CameraJitterStatus convention).
     float jitterX = 0.0f;
     float jitterY = 0.0f;
@@ -585,6 +595,170 @@ class Renderer
     // Scene, DXR, material and in-flight descriptors are never touched. Returns the count freed.
     size_t ReclaimIdleEditorDescriptors();
 
+    // Returns only owner-committed, currently matching publication evidence.
+    // No GPU traversal permission follows from this handle.
+    AcceptedTLASGeometryHandle QueryAcceptedTLASGeometry(const FileSceneRuntime& runtime) const noexcept;
+    // Engine owner boundary only, after its publication coordinators. Re-establishes
+    // accepted evidence once after a successful scene-resource reconstruction, from
+    // current owner state alone; yields while publication or completion is pending.
+    void AcceptReconstructedTLASGeometry(const FileSceneRuntime& runtime, FileSceneAssetCatalog& catalog) noexcept;
+    // Caustics opt-in: arms that same deferred acceptance for the committed membership when a publication
+    // left no accepted evidence (its TLAS recording was not yet proven complete). At most once per
+    // membership adoption; the join's completed-recording proofs are unchanged.
+    void RequestTLASGeometryReacceptance(const FileSceneRuntime& runtime) noexcept;
+
+    // P2.4 noncontributing GPU readers. Acquire outside recording from the current
+    // accepted record only; record into the active tracked list before any TLAS
+    // write in it. The reader's submission resolves through the tracked wrappers.
+    RayTracingSceneResources::GeometryReader AcquireAcceptedGeometryReader(const FileSceneRuntime& runtime,
+        const AcceptedTLASGeometryHandle& accepted) noexcept;
+    bool RecordAcceptedGeometryReader(const RayTracingSceneResources::GeometryReader& reader,
+        D3D12_GPU_VIRTUAL_ADDRESS& topLevel) noexcept;
+
+    // R.9I.3 P3/P4: one bounded caustic registration for the current scene-resource
+    // lifetime. Every replacement issues a new identity; a lifetime change clears it.
+    struct CausticRegistration
+    {
+        std::string reflectorObjectID;
+        std::string receiverObjectID;
+        std::string lightObjectID;
+        // P5C (schema 2): further reflectors, pixel-centred caustics only. The light-first pass
+        // refuses any registration that has them.
+        std::vector<std::string> additionalReflectorObjectIDs;
+        // P5D.1: no designated reflectors (both fields above empty). Every frame's reflectors are the
+        // eligible rows of that frame's accepted geometry and recorded material table.
+        bool automaticReflectors = false;
+        // P5D.2B: no designated receiver (receiverObjectID empty). Every frame's receivers are the eligible
+        // non-reflector rows; each pixel is certified by exact raster/TLAS identity agreement.
+        bool automaticReceivers = false;
+    };
+    static constexpr std::size_t MaxCausticReflectors = 8;
+
+    enum class CausticSnapshotStatus
+    {
+        Disabled, Unregistered, GeometryUnavailable, ReaderUnavailable, ModeUnsupported, MembershipUnsupported,
+        MaterialUnsupported, TextureUnsupported, LightUnavailable, StaleCapture, IdentityExhausted, CameraUnsupported,
+        Recorded,
+        // P5D.1 automatic discovery: no eligible reflector, or more than MaxCausticReflectors (never truncated).
+        NoEligibleReflector, ReflectorCapacityExceeded,
+        // P5D.2B automatic receivers: no eligible receiver row.
+        NoEligibleReceiver
+    };
+
+    // Immutable association of the seven domains as actually recorded in one frame list.
+    // Material and light buffers are this frame slot's own (fence-retained by their owners);
+    // the geometry reader retains the accepted TLAS/BLAS/source dependencies.
+    struct AcceptedCausticSnapshot
+    {
+        std::uint64_t identity = 0;
+        std::uint64_t sceneLifetime = 0;
+        std::uint64_t registrationIdentity = 0;
+        CausticRegistration registration;
+        AcceptedTLASGeometryHandle geometry;
+        RayTracingSceneResources::GeometryReader reader;
+        std::size_t reflectorRow = SIZE_MAX;
+        std::size_t receiverRow = SIZE_MAX;
+        // Every registered reflector in registration order; entry 0 is reflectorRow / reflectorMaterial*.
+        std::vector<std::size_t> reflectorRows;
+        std::vector<std::uint32_t> reflectorMaterialIndices;
+        std::vector<GPUMaterial> reflectorMaterials;
+        // Automatic registrations: candidate rows examined and rows left as ordinary (occluding) geometry.
+        std::size_t automaticCandidates = 0;
+        std::size_t automaticIneligible = 0;
+        // Every receiver row with its material index (explicit: the one designated receiver); entry 0 is receiverRow.
+        std::vector<std::size_t> receiverRows;
+        std::vector<std::uint32_t> receiverMaterialIndices;
+        std::size_t automaticReceiverIneligible = 0;
+        D3D12_GPU_VIRTUAL_ADDRESS topLevel = 0;
+        std::uint64_t materialRevision = 0;
+        D3D12_GPU_VIRTUAL_ADDRESS materialTable = 0;
+        std::size_t materialCount = 0;
+        std::uint32_t reflectorMaterialIndex = UINT_MAX;
+        std::uint32_t receiverMaterialIndex = UINT_MAX;
+        GPUMaterial reflectorMaterial{};
+        GPUMaterial receiverMaterial{};
+        // The initial domain admits only the catalog's immutable fallback texture (manifest:
+        // descriptor, resource, exact retained texel); every other texture refuses.
+        std::size_t textureCount = 0;
+        unsigned int fallbackTextureDescriptor = UINT_MAX;
+        const ID3D12Resource* fallbackTextureResource = nullptr;
+        std::array<std::uint8_t, 4> fallbackTexel{};
+        D3D12_GPU_VIRTUAL_ADDRESS lightTable = 0;
+        std::uint32_t lightIndex = UINT_MAX;
+        GPULight light{};
+        unsigned int frameSlot = UINT_MAX;
+        std::uint64_t recordingGeneration = 0;
+        // Camera domain: the exact render view-projection of this frame's Reference dispatch.
+        // Jitter and DLSS refuse (CameraUnsupported); the pixel measure assumes neither.
+        Matrix4 viewProjection{};
+        Matrix4 inverseViewProjection{};
+        std::array<float, 3> cameraPosition{};
+        std::array<float, 3> cameraForward{};
+        float jacobianScale = 0.0f; // |P00 P11| / 4; |ds/dw| = jacobianScale / cos^3 at the eye.
+        std::uint32_t width = 0;
+        std::uint32_t height = 0;
+    };
+    using CausticSnapshotHandle = std::shared_ptr<const AcceptedCausticSnapshot>;
+
+    // Noncontributing diagnostic consumer recorded into the frame list; null disables all
+    // snapshot work, leaving ordinary rendering unchanged.
+    using CausticDiagnosticRecorder = std::function<bool(const AcceptedCausticSnapshot&, ID3D12GraphicsCommandList4&)>;
+
+    std::uint64_t SetCausticRegistration(CausticRegistration registration) noexcept;
+    void ClearCausticRegistration() noexcept;
+    // True while a registration is bound to the current scene-resource lifetime.
+    bool HasCurrentCausticRegistration() const noexcept
+    {
+        return m_causticRegistration.identity && m_causticRegistration.lifetime == m_sceneResourceLifetime;
+    }
+    void SetCausticDiagnosticRecorder(CausticDiagnosticRecorder recorder);
+    // Engine owner boundary, before recording: acquires the frame's geometry reader and
+    // admits the runtime catalog's immutable fallback texture.
+    void PrepareCausticSnapshotForFrame(const FileSceneRuntime& runtime, FileSceneAssetCatalog& catalog) noexcept;
+    CausticSnapshotStatus GetCausticSnapshotStatus() const noexcept { return m_causticStatus; }
+
+    // R.9I.3 Dedicated Caustics (additive development mode). OFF records no caustic snapshot, tracing,
+    // accumulation or composite; ON adds the dedicated contribution for accepted scenes only and leaves
+    // Reference transport, accumulation and histories unchanged. Takes effect at the next frame boundary.
+    void SetDedicatedCaustics(bool enabled, bool causticOnlyView) noexcept;
+    bool GetDedicatedCausticsEnabled() const noexcept { return m_dedicatedCausticsEnabled; }
+    // The explicit recovery boundary for a latched GPU numerical fault; toggling never acknowledges
+    // one. Outside recording. False while any caustic recording is unresolved.
+    bool AcknowledgeDedicatedCausticsFault() noexcept;
+    // CPU recording evidence only. The GPU may refuse the entire additive image;
+    // completion and fault evidence come from CausticPass's tracked readbacks.
+    bool DedicatedCausticsCompositeRecordedLastFrame() const noexcept
+    {
+        return m_causticPresentedLastFrame;
+    }
+
+    // Kept for existing callers; this is the same recording evidence, not a validity claim.
+    bool DedicatedCausticsPresentedLastFrame() const noexcept { return m_causticPresentedLastFrame; }
+    const std::string& GetDedicatedCausticsReason() const noexcept
+    {
+        return m_causticPass.IsFaulted() ? m_causticPass.GetReason() : m_dedicatedCausticsReason;
+    }
+    const CausticPass& GetCausticPass() const noexcept { return m_causticPass; }
+    CausticSnapshotHandle GetLastCausticSnapshot() const noexcept { return m_lastCausticSnapshot; }
+
+    // R.9I.3 pixel-centred caustics (production integration, experimental, default OFF). Independent of the
+    // light-first Dedicated Caustics gate above and never active with it: a request while the light-first pass is
+    // enabled is refused. At the ReSTIR DI seam a verified same-frame snapshot records the K = 1 estimator into its
+    // own lobe outputs; view selects a caustics-only debug presentation (None leaves the ordinary image).
+    // Takes effect at the next frame boundary; call after SetDedicatedCaustics.
+    // insertion (P2, default off) adds the accepted caustic lobes to this frame's diffuse/specular extraction before
+    // any denoiser reads it, as one GPU-validated whole-image transaction.
+    void SetPixelCentredCaustics(bool enabled, PixelCausticView view = PixelCausticView::None,
+        bool insertion = false) noexcept;
+    bool GetPixelCausticsEnabled() const noexcept { return m_pixelCausticsEnabled; }
+    const PixelCausticPass& GetPixelCausticPass() const noexcept { return m_pixelCausticPass; }
+    const std::string& GetPixelCausticsReason() const noexcept { return m_pixelCausticPass.GetLastSeam().reason; }
+    // Whether either caustics pass needs this frame's registration and accepted snapshot.
+    bool GetCausticSnapshotsRequested() const noexcept
+    {
+        return m_dedicatedCausticsEnabled || m_pixelCausticsEnabled;
+    }
+
     // Preparation only. No scene mesh binding or active DXR snapshot publication.
     std::optional<RayTracingSceneResources::ReplacementCandidate> PrepareDXRMembershipCandidate(
         const FileSceneRuntime& runtime, FileSceneAssetCatalog& catalog,
@@ -647,9 +821,16 @@ class Renderer
         return m_currentEnvironmentIndex;
     }
 
-    bool SetEnvironment(size_t index);
-    bool SetEnvironmentImage(const HDRImageData*, std::string identity, std::string displayName, std::string reference = {});
+    // radianceScale: EnvironmentRadianceMultiplier of the scene the environment lights. It is part of the
+    // environment's identity, so a calibration change rebuilds the environment.
+    bool SetEnvironment(size_t index, float radianceScale);
+    bool SetEnvironmentImage(const HDRImageData*, std::string identity, std::string displayName, std::string reference = {},
+        float radianceScale = 1.0f);
     const std::string& GetEnvironmentIdentity() const noexcept { return m_environmentIdentity; }
+    // The camera exposure state as last read back from the GPU (a few frames old; display only).
+    const AutoExposurePass::Readback& GetExposureReadback() const noexcept { return m_autoExposurePass.GetReadback(); }
+    // The identity SetEnvironmentImage records for a source identity at a radiance scale.
+    static std::string CalibratedEnvironmentIdentity(const std::string& identity, float radianceScale);
 
     const RendererStatistics& GetStatistics() const;
 
@@ -787,6 +968,7 @@ class Renderer
     friend class SceneDuplicationVerification;
     friend class SceneMembershipVerification;
     friend class ResidencyBatchVerification;
+    friend class CausticVisibleVerification;
 #endif
     friend class SceneMaterialBindingPublication;
 #if defined(ENGINE_HAS_VERIFICATION)
@@ -1269,6 +1451,81 @@ class Renderer
     };
 
     SceneInitializationAttempt m_sceneInitializationAttempt;
+    // One pending reconstruction acceptance, armed by successful initialization
+    // with renderable meshes. Any other publication or scene lifetime voids it.
+    struct ReconstructionAcceptanceToken
+    {
+        std::uint64_t lifetime = 0;
+        std::uint64_t recordingOwner = 0;
+        std::uint64_t membershipAdoptions = 0;
+        const Scene* scene = nullptr;
+    };
+    ReconstructionAcceptanceToken m_reconstructionAcceptance;
+    std::uint64_t m_reacceptanceAdoptions = UINT64_MAX;
+    // P5A: the TLAS recording the last re-acceptance request was made for, and the one observed at the previous
+    // request call (settled when they agree across calls). UINT64_MAX: none.
+    std::uint64_t m_reacceptanceRecording = UINT64_MAX;
+    std::uint64_t m_reacceptanceObservedRecording = UINT64_MAX;
+
+    struct CausticRegistrationState
+    {
+        CausticRegistration registration;
+        std::uint64_t identity = 0;
+        std::uint64_t lifetime = 0;
+    };
+    CausticRegistrationState m_causticRegistration;
+    std::uint64_t m_causticIdentity = 0; // Checked nonzero monotonic registration/snapshot identities.
+    RayTracingSceneResources::GeometryReader m_causticFrameReader;
+    // P5B: this frame's runtime and catalog from PrepareCausticSnapshotForFrame, used only during its recording.
+    const FileSceneRuntime* m_causticFrameRuntime = nullptr;
+    FileSceneAssetCatalog* m_causticFrameCatalog = nullptr;
+    // P5B: current-frame geometry admission for pixel caustics. Always on in production; verification turns it off to
+    // regress the earlier (P5A) fail-closed-while-moving contract unchanged.
+    bool m_currentFrameGeometryEnabled = true;
+    struct CausticFallbackTexture
+    {
+        const Texture* texture = nullptr;
+        unsigned int descriptor = UINT_MAX;
+        const ID3D12Resource* resource = nullptr;
+        std::array<std::uint8_t, 4> texel{};
+    };
+    CausticFallbackTexture m_causticFallbackTexture;
+    CausticPass m_causticPass;
+    bool m_dedicatedCausticsEnabled = false;
+    RendererLightingMode m_causticRecordedMode = RendererLightingMode::Legacy;
+    bool m_causticOnlyView = false;
+    bool m_causticFrameRecorded = false;
+    bool m_causticPresentedLastFrame = false;
+    std::uint32_t m_causticSeed = 0;
+    std::string m_dedicatedCausticsReason;
+    void RecordDedicatedCaustics(const AcceptedCausticSnapshot& snapshot, bool validationOnly = false) noexcept;
+    CausticDiagnosticRecorder m_causticRecorder;
+    CausticSnapshotStatus m_causticStatus = CausticSnapshotStatus::Disabled;
+    CausticSnapshotHandle m_lastCausticSnapshot;
+    PixelCausticPass m_pixelCausticPass;
+    // P5D.2A verification: this render object's draws write the invalid raster identity (SIZE_MAX: none).
+    std::size_t m_rasterIdentityInvalidObject = SIZE_MAX;
+    // P5D.2B verification: upload a one-entry receiver table, so any other TLAS instance is a broken binding.
+    bool m_receiverTableVerificationTruncate = false;
+    // P5C cost evidence: CPU time building the flattened reflector population (triangle records).
+    std::uint64_t m_pixelCausticPopulationCount = 0;
+    std::uint64_t m_pixelCausticPopulationNanoseconds = 0;
+    bool m_pixelCausticsEnabled = false;
+    // Set only by this recording's RecordCausticSnapshot while pixel caustics are enabled; moved into the
+    // RecordPathTraceReference call that consumes it, and cleared by the next snapshot boundary otherwise.
+    CausticSnapshotHandle m_frameCausticSnapshot;
+    PixelCausticView m_pixelCausticView = PixelCausticView::None;
+    bool m_pixelCausticInsertion = false;
+    // The seam's ownership checks against the live renderer state; true when the estimator may record.
+    bool VerifyPixelCausticSeam(const AcceptedCausticSnapshot* snapshot, unsigned int frameIndex) noexcept;
+    // Records the estimator at a verified seam; a refusal records nothing and leaves ordinary lighting unchanged.
+    void RecordPixelCaustics(const AcceptedCausticSnapshot& snapshot, ID3D12GraphicsCommandList* commandList,
+        unsigned int frameIndex, const Matrix4& inverseCameraRelativeViewProjection,
+        const Vector3& cameraPosition) noexcept;
+    void ResetCausticSceneState() noexcept;
+    void RecordCausticSnapshot(unsigned int frameSlot, bool referencePathTrace, std::uint64_t recordedMaterialRevision,
+        const FrameLighting& lighting, D3D12_GPU_VIRTUAL_ADDRESS lightTable, const Matrix4& renderViewProjection,
+        const Matrix4& renderProjection, const Vector3& cameraPosition) noexcept;
 
     std::uint64_t m_sceneResourceLifetime = 0;
     const Scene* m_sceneResourceScene = nullptr;
@@ -1300,6 +1557,7 @@ class Renderer
     void Draw(
         ID3D12GraphicsCommandList* commandList,
         const RenderObject& object,
+        std::size_t renderObjectIndex,
         D3D12_GPU_VIRTUAL_ADDRESS cameraConstantsAddress);
     // depthPrepass: the Editor overlay depth prepass variant (UPSCALING.3C.4) instead of the selection mask pipeline.
     void DrawSelectionMask(
@@ -1309,7 +1567,7 @@ class Renderer
         bool depthPrepass = false);
     void DrawMaterialRange(ID3D12GraphicsCommandList* commandList, const RenderObject& object,
         Material& material, unsigned int firstIndex, unsigned int indexCount,
-        D3D12_GPU_VIRTUAL_ADDRESS cameraConstantsAddress);
+        D3D12_GPU_VIRTUAL_ADDRESS cameraConstantsAddress, std::size_t renderObjectIndex);
     bool ValidateSceneMaterialSlots(const Scene& scene, const std::vector<Material*>& materials) const;
     void BeginGeometryPass(ID3D12GraphicsCommandList* commandList);
     void EndGeometryPass(ID3D12GraphicsCommandList* commandList);
@@ -2034,7 +2292,8 @@ class Renderer
         const Vector3& cameraPosition,
         const FrameLighting& frameLighting,
         D3D12_GPU_VIRTUAL_ADDRESS sceneLightConstantsAddress,
-        const PathTraceReferenceSettings& settings);
+        const PathTraceReferenceSettings& settings,
+        const AcceptedCausticSnapshot* causticSnapshot);
     static bool SamePathTraceAccumulationKey(const PathTraceAccumulationKey& left, const PathTraceAccumulationKey& right);
     // RTXPT D.2B: records the temporal pass after an extraction frame; false when it could not run (the caller then
     // invalidates temporal history).
@@ -2192,6 +2451,11 @@ class Renderer
     void ApplyDlssInputPreparation(bool requested);
     bool m_dlssInputPreparation = false;
     DlssInputPreparationPass m_dlssInputPreparationPass;
+    // Physical Lighting C2: this frame's camera exposure, read by tone mapping and the DLSS exposure texture.
+    AutoExposurePass m_autoExposurePass;
+    bool m_exposureInitialized = false;
+    RenderViewIdentity m_exposureViewIdentity;
+    float m_exposureReferenceEV100 = 0.0f;
     UpscalerFrameInputs m_upscalerInputs;
     // Set by every history discontinuity (ResetSceneHistory, scene resize, option changes); consumed by the next
     // prepared frame as UpscalerFrameInputs::reset.

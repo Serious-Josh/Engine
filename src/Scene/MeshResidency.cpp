@@ -35,12 +35,12 @@ MeshResidencySourceLock::~MeshResidencySourceLock()
 std::optional<MeshResidencyCandidate> FileSceneAssetCatalog::DescribeMeshResidencyCandidate(
     std::string_view reference, const Mesh& mesh, std::string* error) const
 {
-    if (ClassifyMeshReference(reference) == MeshReferenceKind::Builtin && &mesh == &m_sphereMesh)
+    if (ClassifyMeshReference(reference) == MeshReferenceKind::Builtin && &mesh == FindBuiltinMesh(reference))
     {
         MeshResidencyCandidate candidate;
         // The receipt exposes the catalog's existing mutable runtime borrow;
         // this const observation never changes the primitive.
-        candidate.mesh = const_cast<Mesh*>(&m_sphereMesh);
+        candidate.mesh = const_cast<Mesh*>(&mesh);
         candidate.catalogIdentity = m_catalogIdentity;
         candidate.vertexAddress = mesh.GetVertexBufferAddress();
 
@@ -144,14 +144,14 @@ MeshResidencySourceLock FileSceneAssetCatalog::ValidateMeshResidencyCandidate(
     if (builtin)
     {
         if (ClassifyMeshReference(reference) != MeshReferenceKind::Builtin ||
-            candidate.builtinReference != reference || candidate.mesh != &m_sphereMesh ||
+            candidate.builtinReference != reference || !candidate.mesh || candidate.mesh != FindBuiltinMesh(reference) ||
             candidate.key != ProjectMeshCPUCache::Key{} || candidate.cooked)
         {
             return reject("Built-in residency reference or catalog geometry identity changed.");
         }
 
-        ownedMesh = &m_sphereMesh;
-        ownedGeometry = &m_sphereGeometry;
+        ownedMesh = candidate.mesh;
+        ownedGeometry = GetMeshGeometry(*ownedMesh);
     }
     else
     {

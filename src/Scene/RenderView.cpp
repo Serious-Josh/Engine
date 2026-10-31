@@ -158,6 +158,7 @@ bool BuildCameraRenderView(const Matrix4& world, const CameraComponent& camera, 
 
     RenderView candidate;
     candidate.identity = std::move(identity);
+    candidate.exposure = camera.exposure;
     candidate.position = {world.m[0][3], world.m[1][3], world.m[2][3]};
     candidate.right = right;
     candidate.up = up;

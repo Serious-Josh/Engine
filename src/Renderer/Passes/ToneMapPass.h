@@ -50,6 +50,13 @@ enum class ToneMapDebugView : unsigned int
     PathTraceDenoiserScalar = 33
 };
 
+// Final display tone mapper; values match ToneMap.hlsl. Existing is Engine's AgX; GT7 is Polyphony Digital's GT7 operator.
+enum class ToneMapOperator : unsigned int
+{
+    Existing,
+    GT7
+};
+
 class ToneMapPass
 {
     public:
@@ -61,7 +68,8 @@ class ToneMapPass
                  ToneMapDebugView debugView = ToneMapDebugView::None, float nrdDenoisingRange = 0.0f,
                  RenderTarget* debugRenderTarget = nullptr, RenderTarget* selectionMask = nullptr,
                  const Vector3& outlineColor = Vector3{1.0f, 0.604f, 0.0f}, unsigned int outlineThickness = 2,
-                 unsigned int debugDepthIndex = 0);
+                 unsigned int debugDepthIndex = 0, ToneMapOperator toneMapOperator = ToneMapOperator::Existing,
+                 unsigned int exposureStateIndex = 0);
     void Shutdown();
 
     private:

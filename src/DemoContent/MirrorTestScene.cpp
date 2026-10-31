@@ -1,4 +1,5 @@
 #include "Platform/Windows/WindowsWindow.h"
+#include "Scene/PhotometricUnits.h"
 #include "DemoContent/MirrorTestScene.h"
 #include "DemoContent/SceneRegistry.h"
 
@@ -88,14 +89,15 @@ bool MirrorTestScene::Initialize(
     pipelineDescription.pixelShader = pixelShader;
     pipelineDescription.vertexLayout = &m_vertexLayout;
 
-    pipelineDescription.renderTargets.count = 4;
+    pipelineDescription.renderTargets.count = 5;
     pipelineDescription.renderTargets.formats[0] = GBuffer::MaterialFormat;
     pipelineDescription.renderTargets.formats[1] = DXGI_FORMAT_R16G16B16A16_FLOAT;
     pipelineDescription.renderTargets.formats[2] = DXGI_FORMAT_R16G16B16A16_FLOAT;
 
     pipelineDescription.renderTargets.formats[3] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    pipelineDescription.renderTargets.formats[4] = GBuffer::IdentityFormat;
 
-    pipelineDescription.rootParameters.push_back({RootParameterType::Constants, 0, 9, D3D12_SHADER_VISIBILITY_PIXEL});
+    pipelineDescription.rootParameters.push_back({RootParameterType::Constants, 0, 11, D3D12_SHADER_VISIBILITY_PIXEL});
 
     pipelineDescription.rootParameters.push_back(
         {RootParameterType::ConstantBuffer, 1, 0, D3D12_SHADER_VISIBILITY_ALL});
@@ -749,7 +751,7 @@ void MirrorTestScene::ResetDirectionalLight()
 
     light.direction = Vector3{-0.3f, -1.0f, 0.2f}.Normalized();
 
-    light.intensity = 3.0f;
-    light.ambientStrength = 0.0f;
+    // Lux: the former intensity 3 at the default reference exposure (unchanged on the GPU).
+    light.intensity = float(3.0 / Photometry::RenderScale(Photometry::DefaultReferenceEV100));
     light.angularRadius = ToRadians(5.0f);
 }

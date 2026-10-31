@@ -2,6 +2,7 @@
 
 #include "Renderer/DescriptorHeap.h"
 #include "Renderer/Vertex.h"
+#include "Renderer/Caustics/CausticGeometrySourceManifest.h"
 
 #include <algorithm>
 #include <cmath>
@@ -10,6 +11,7 @@
 #include <string_view>
 #include <cstdint>
 #include <climits>
+#include <type_traits>
 
 namespace
 {
@@ -100,6 +102,7 @@ bool Mesh::Initialize(
     size_t vertexCount,
     const VertexLayout& layout)
 {
+    m_staticSource.reset();
     m_layout = layout;
     m_vertexCount = vertexCount;
     ResetMetadata();
@@ -185,6 +188,7 @@ bool Mesh::InitializeGPUWritable(
     size_t indexCapacity,
     const MeshBounds& bounds)
 {
+    m_staticSource.reset();
     const size_t stride = layout.GetStride();
 
     if (!device ||
@@ -285,6 +289,7 @@ bool Mesh::InitializeGPUWritableSeeded(
     size_t indexCapacity,
     const MeshBounds& bounds)
 {
+    m_staticSource.reset();
     static_assert(sizeof(unsigned int) == sizeof(std::uint32_t));
 
     if (!device ||
@@ -442,6 +447,7 @@ bool Mesh::SetGPUGeneratedGeometryCounts(
     size_t vertexCount,
     size_t indexCount)
 {
+    m_staticSource.reset();
     if (!m_gpuWritable ||
         !m_vertexBuffer.GetResource() ||
         !m_indexBuffer.GetResource() ||
@@ -480,6 +486,7 @@ bool Mesh::ReplaceGeometry(
     const unsigned int* indices,
     size_t indexCount)
 {
+    m_staticSource.reset();
     (void)descriptorHeap;
 
     const size_t stride = m_layout.GetStride();
@@ -579,6 +586,7 @@ bool Mesh::ReplaceGeometry(
 
 void Mesh::Shutdown()
 {
+    m_staticSource.reset();
     m_vertexBuffer.Shutdown();
     m_indexBuffer.Shutdown();
     m_vertexCount = 0;
@@ -722,6 +730,7 @@ void Mesh::ResetMetadata() noexcept
 
 bool Mesh::SetMetadata(MeshMetadata metadata, std::string& error)
 {
+    m_staticSource.reset();
     if(!ValidateMeshMetadata(metadata, m_indexCount ? m_indexCount : m_vertexCount, error))
     {
         return false;
@@ -734,4 +743,82 @@ bool Mesh::SetMetadata(MeshMetadata metadata, std::string& error)
 const MeshMetadata& Mesh::GetMetadata() const noexcept
 {
     return m_metadata ? *m_metadata : m_defaultMetadata;
+}
+
+CausticContracts::Geometry::AdmissionResult Mesh::InitializeWithStaticSource(
+    ID3D12Device* device, ResourceUploader& uploader, DescriptorHeap& heap,
+    const CausticContracts::Geometry::StaticSourceRequest& request,
+    CausticContracts::Geometry::GeometrySourceHandle& output, const MeshMetadata* metadata)
+{
+    using namespace CausticContracts::Geometry;
+    if(m_vertexBuffer.GetResource() || m_indexBuffer.GetResource() || m_gpuWritable || m_vertexCount || m_indexCount)
+        return {AdmissionStatus::Stale};
+    std::size_t slot = m_sourceGenerations.size();
+    for(std::size_t i = 0; i < m_sourceGenerations.size(); ++i)
+        if(m_sourceGenerations[i].expired()) { slot = i; break; }
+    if(slot == m_sourceGenerations.size()) return {AdmissionStatus::CapacityExceeded};
+    if(!device) return {AdmissionStatus::InvalidInput};
+    std::shared_ptr<const ImmutableStaticSource> source;
+    const auto preparation = ImmutableStaticSource::Prepare(request, source);
+    if(preparation.status != AdmissionStatus::Ready) return preparation;
+    try
+    {
+        const auto layout = CreateVertexLayout();
+        static_assert(std::is_same_v<unsigned int, std::uint32_t>);
+        if(!Initialize(device, uploader, heap, source->Vertices().data(), source->Vertices().size(), layout,
+            source->Indices().data(), source->Indices().size()))
+        {
+            Shutdown();
+            return {AdmissionStatus::UploadFailed};
+        }
+        std::string metadataError;
+        if(metadata && !ValidateMeshMetadata(*metadata, m_indexCount, metadataError))
+        {
+            Shutdown();
+            return {AdmissionStatus::InvalidInput};
+        }
+        if(metadata) m_metadata = *metadata;
+        // Private factory: source is exactly the owned arrays used by Initialize above.
+        GeometrySourceHandle generation(new MeshSourceGeneration(source, device,
+            m_vertexBuffer.GetResource(), m_indexBuffer.GetResource()));
+        if(generation->AllocatedResourceBytes() > MaximumGenerationResourceBytes)
+        {
+            Shutdown();
+            return {AdmissionStatus::AllocationFailed};
+        }
+        m_staticSource = generation;
+        m_sourceGenerations[slot] = generation;
+        output = std::move(generation);
+        return {AdmissionStatus::Ready};
+    }
+    catch(const std::bad_alloc&)
+    {
+        Shutdown();
+        return {AdmissionStatus::AllocationFailed};
+    }
+}
+
+CausticContracts::Geometry::GeometrySourceHandle Mesh::GetStaticSourceGeneration() const noexcept
+{
+    return m_staticSource;
+}
+
+bool Mesh::IsCurrentStaticSource(const CausticContracts::Geometry::GeometrySourceHandle& handle) const noexcept
+{
+    if(!handle || handle != m_staticSource || handle.owner_before(m_staticSource) || m_staticSource.owner_before(handle) || m_gpuWritable ||
+        handle->VertexResource() != m_vertexBuffer.GetResource() || handle->IndexResource() != m_indexBuffer.GetResource() ||
+        handle->Source().Vertices().size() != m_vertexCount || handle->Source().Indices().size() != m_indexCount ||
+        GetVertexStride() != sizeof(Vertex) || GetIndexFormat() != DXGI_FORMAT_R32_UINT ||
+        m_vertexBuffer.GetUAVDescriptorIndex() != UINT_MAX || m_indexBuffer.GetUAVDescriptorIndex() != UINT_MAX)
+        return false;
+    const auto& attributes = m_layout.GetAttributes();
+    if(attributes.size() != 4) return false;
+    const char* names[] = {"POSITION", "NORMAL", "TEXCOORD", "TANGENT"};
+    const unsigned int offsets[] = {0, 12, 24, 32};
+    const VertexAttributeType types[] = {VertexAttributeType::Float3, VertexAttributeType::Float3,
+        VertexAttributeType::Float2, VertexAttributeType::Float4};
+    for(std::size_t i = 0; i < attributes.size(); ++i)
+        if(!attributes[i].semantic || std::strcmp(attributes[i].semantic, names[i]) != 0 ||
+            attributes[i].semanticIndex != 0 || attributes[i].offset != offsets[i] || attributes[i].type != types[i]) return false;
+    return true;
 }

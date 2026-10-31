@@ -3,7 +3,9 @@
 struct ToneMapConstants
 {
     uint sceneColorIndex;
-    float exposure;
+    // Raw camera exposure state (AutoExposure.hlsl): word 1 is the multiplier 2^(EV_ref - EV_eff) from GPU values to
+    // tone-mapper input, the same value DLSS receives as its exposure texture.
+    uint exposureStateIndex;
     uint debugTextureIndex;
     uint debugView;
     float nrdDenoisingRange;
@@ -12,6 +14,7 @@ struct ToneMapConstants
     uint outlineThickness;
     uint debugDepthIndex;
     float3 outlineColor;
+    uint toneMapOperator; // ToneMapOperator: 0 Existing (AgX), 1 GT7.
 };
 
 ConstantBuffer<ToneMapConstants> toneMapConstants : register(b0);
@@ -74,6 +77,168 @@ float3 AgX(float3 color)
     color = pow(max(color, 0.0), 2.2);
 
     return color;
+}
+
+// -------------------------------------------------------------------------------------------------
+// GT7 tone mapping: an HLSL port of Polyphony Digital's reference sample, gt7_tone_mapping.cpp v1.0 (2025-08-10,
+// MIT License, Copyright (c) 2025 Polyphony Digital Inc.), from "Driving Toward Reality: Physically Based Tone Mapping
+// and Perceptual Fidelity in Gran Turismo 7" (SIGGRAPH 2025 Physically Based Shading course). The sample's SDR mode
+// with its default ICtCp UCS: GT Tone Mapping curve V2 (alpha 0.25, mid point 0.538, linear section 0.444, toe 1.28)
+// at the 250 cd/m^2 SDR paper white, chroma fade 0.98..1.16, blend ratio 0.6. Frame-buffer 1.0 is 100 cd/m^2, as in
+// the sample; Engine's linear values enter at that scale unchanged.
+// -------------------------------------------------------------------------------------------------
+static const float GT7ReferenceLuminance = 100.0f;  // cd/m^2 <-> frame-buffer 1.0
+static const float GT7SdrPaperWhite = 250.0f;       // cd/m^2
+static const float GT7Peak = GT7SdrPaperWhite / GT7ReferenceLuminance;
+static const float GT7Alpha = 0.25f;
+static const float GT7MidPoint = 0.538f;
+static const float GT7LinearSection = 0.444f;
+static const float GT7ToeStrength = 1.280f;
+static const float GT7BlendRatio = 0.6f;
+static const float GT7FadeStart = 0.98f;
+static const float GT7FadeEnd = 1.16f;
+
+// Engine's linear colour is Rec.709/sRGB primaries; the GT7 operator works in linear Rec.2020 (ITU-R BT.2087).
+static const float3x3 Rec709ToRec2020 = float3x3(
+    0.6274038959, 0.3292830384, 0.0433130657,
+    0.0690972894, 0.9195403951, 0.0113623156,
+    0.0163914389, 0.0880133079, 0.8955952532
+);
+
+static const float3x3 Rec2020ToRec709 = float3x3(
+     1.6604910021, -0.5876411388, -0.0728498633,
+    -0.1245504745,  1.1328998971, -0.0083494226,
+    -0.0181507634, -0.1005788980,  1.1187296614
+);
+
+// The sample's smoothStep(x, edge0, edge1).
+float GT7SmoothStep(float x, float edge0, float edge1)
+{
+    float t = (x - edge0) / (edge1 - edge0);
+
+    if(x < edge0)
+    {
+        return 0.0f;
+    }
+
+    if(x > edge1)
+    {
+        return 1.0f;
+    }
+
+    return t * t * (3.0f - 2.0f * t);
+}
+
+// GTToneMappingCurveV2::evaluateCurve with the SDR initialisation (peak intensity = paper white).
+float GT7Curve(float x)
+{
+    const float k = (GT7LinearSection - 1.0f) / (GT7Alpha - 1.0f);
+    const float kA = GT7Peak * GT7LinearSection + GT7Peak * k;
+    const float kB = -GT7Peak * k * exp(GT7LinearSection / k);
+    const float kC = -1.0f / (k * GT7Peak);
+
+    if(x < 0.0f)
+    {
+        return 0.0f;
+    }
+
+    float weightLinear = GT7SmoothStep(x, 0.0f, GT7MidPoint);
+    float weightToe = 1.0f - weightLinear;
+    float shoulder = kA + kB * exp(x * kC);
+
+    if(x < GT7LinearSection * GT7Peak)
+    {
+        float toeMapped = GT7MidPoint * pow(x / GT7MidPoint, GT7ToeStrength);
+        return weightToe * toeMapped + weightLinear * x;
+    }
+
+    return shoulder;
+}
+
+// SMPTE ST 2084 (PQ) EOTF: normalised signal to frame-buffer linear.
+float3 GT7EotfSt2084(float3 n)
+{
+    const float m1 = 0.1593017578125f;
+    const float m2 = 78.84375f;
+    const float c1 = 0.8359375f;
+    const float c2 = 18.8515625f;
+    const float c3 = 18.6875f;
+    const float pqC = 10000.0f;
+
+    n = saturate(n);
+    float3 np = pow(n, 1.0f / m2);
+    float3 l = max(np - c1, 0.0f);
+    l = l / (c2 - c3 * np);
+    l = pow(l, 1.0f / m1);
+    return l * pqC / GT7ReferenceLuminance;
+}
+
+// Inverse PQ EOTF: frame-buffer linear to normalised signal.
+float3 GT7InverseEotfSt2084(float3 v)
+{
+    const float m1 = 0.1593017578125f;
+    const float m2 = 78.84375f;
+    const float c1 = 0.8359375f;
+    const float c2 = 18.8515625f;
+    const float c3 = 18.6875f;
+    const float pqC = 10000.0f;
+
+    float3 y = v * GT7ReferenceLuminance / pqC;
+    float3 ym = pow(y, m1);
+    return exp2(m2 * (log2(c1 + c2 * ym) - log2(1.0f + c3 * ym)));
+}
+
+// ICtCp (ITU-T T.302) from linear Rec.2020, as in the sample.
+float3 GT7RgbToICtCp(float3 rgb)
+{
+    float3 lms = float3(
+        dot(rgb, float3(1688.0f, 2146.0f, 262.0f)),
+        dot(rgb, float3(683.0f, 2951.0f, 462.0f)),
+        dot(rgb, float3(99.0f, 309.0f, 3688.0f))) / 4096.0f;
+    float3 pq = GT7InverseEotfSt2084(lms);
+
+    return float3(
+        2048.0f * pq.x + 2048.0f * pq.y,
+        6610.0f * pq.x - 13613.0f * pq.y + 7003.0f * pq.z,
+        17933.0f * pq.x - 17390.0f * pq.y - 543.0f * pq.z) / 4096.0f;
+}
+
+float3 GT7ICtCpToRgb(float3 ictCp)
+{
+    float3 pq = float3(
+        ictCp.x + 0.00860904f * ictCp.y + 0.11103f * ictCp.z,
+        ictCp.x - 0.00860904f * ictCp.y - 0.11103f * ictCp.z,
+        ictCp.x + 0.560031f * ictCp.y - 0.320627f * ictCp.z);
+    float3 lms = GT7EotfSt2084(pq);
+
+    return max(float3(
+        3.43661f * lms.x - 2.50645f * lms.y + 0.0698454f * lms.z,
+        -0.79133f * lms.x + 1.9836f * lms.y - 0.192271f * lms.z,
+        -0.0259499f * lms.x - 0.0989137f * lms.y + 1.12486f * lms.z), 0.0f);
+}
+
+// GT7ToneMapping::applyToneMapping in SDR mode. Input: linear Rec.709 scene colour (frame-buffer scale). Output: linear
+// Rec.709 display colour in [0, 1], ready for the sRGB encoding.
+float3 GT7(float3 color)
+{
+    // Negative, NaN and infinite input (max/min return the non-NaN operand) become finite before the PQ transforms;
+    // 65504 lies far beyond the curve's convergence, so it does not change finite results.
+    float3 rgb = min(max(mul(Rec709ToRec2020, max(color, 0.0f)), 0.0f), 65504.0f);
+
+    float3 ucs = GT7RgbToICtCp(rgb);
+    float3 skewedRgb = float3(GT7Curve(rgb.r), GT7Curve(rgb.g), GT7Curve(rgb.b));
+    float3 skewedUcs = GT7RgbToICtCp(skewedRgb);
+
+    const float targetUcs = GT7RgbToICtCp(GT7Peak.xxx).x;
+    float chromaScale = 1.0f - GT7SmoothStep(ucs.x / targetUcs, GT7FadeStart, GT7FadeEnd);
+    float3 scaledRgb = GT7ICtCpToRgb(float3(skewedUcs.x, ucs.y * chromaScale, ucs.z * chromaScale));
+
+    float3 blended = (1.0f - GT7BlendRatio) * skewedRgb + GT7BlendRatio * scaledRgb;
+    const float sdrCorrectionFactor = GT7ReferenceLuminance / GT7SdrPaperWhite;
+    float3 display2020 = sdrCorrectionFactor * min(blended, GT7Peak);
+
+    // Back to the Rec.709 display primaries; out-of-gamut Rec.2020 colours are clipped to the sRGB cube.
+    return saturate(mul(Rec2020ToRec709, display2020));
 }
 
 float3 LinearToSRGB(float3 color)
@@ -344,7 +509,12 @@ float4 PSMain(VSOutput input) : SV_TARGET
         return float4(all(isfinite(hdrColor)) ? hdrColor : float3(1.0f, 0.0f, 1.0f), 1.0f);
     }
 
-    hdrColor *= toneMapConstants.exposure;
+    // Camera exposure applies to the normal image only; diagnostic lighting views stay at the reference exposure.
+    if(toneMapConstants.debugView == 0u)
+    {
+        ByteAddressBuffer exposureState = ResourceDescriptorHeap[toneMapConstants.exposureStateIndex];
+        hdrColor *= asfloat(exposureState.Load(4u));
+    }
 
     if(((toneMapConstants.debugView >= 19u && toneMapConstants.debugView <= 23u) || toneMapConstants.debugView == 26u ||
         (toneMapConstants.debugView >= 28u && toneMapConstants.debugView <= 30u)) && !all(isfinite(hdrColor)))
@@ -352,7 +522,16 @@ float4 PSMain(VSOutput input) : SV_TARGET
         return float4(1.0f, 0.0f, 1.0f, 1.0f);
     }
 
-    float3 displayLinear = AgX(hdrColor);
+    float3 displayLinear;
+
+    if(toneMapConstants.toneMapOperator == 1u)
+    {
+        displayLinear = GT7(hdrColor);
+    }
+    else
+    {
+        displayLinear = AgX(hdrColor);
+    }
 
     float3 displaySRGB = LinearToSRGB(displayLinear);
 

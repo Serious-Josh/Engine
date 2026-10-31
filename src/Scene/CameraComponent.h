@@ -1,5 +1,7 @@
 #pragma once
 
+#include "Scene/CameraExposure.h"
+
 #include <cmath>
 #include <cstdint>
 #include <string>
@@ -24,6 +26,8 @@ struct CameraComponent
     float nearPlane = 0.1f;
     float farPlane = 1000.0f;
     bool main = false;
+    // Photographic exposure of this camera (CameraExposure.h); presentation only.
+    CameraExposure exposure;
 
     bool operator==(const CameraComponent&) const = default;
 };
@@ -60,6 +64,10 @@ inline bool ValidateCameraComponent(const CameraComponent& camera, std::string* 
     else if(camera.farPlane <= camera.nearPlane || camera.farPlane > CameraComponent::MaximumFarPlane)
     {
         reason = "Camera far plane must exceed near and be at most 1000000 meters.";
+    }
+    else if(const char* exposureReason = nullptr; !ValidateCameraExposure(camera.exposure, &exposureReason))
+    {
+        reason = exposureReason;
     }
 
     if(reason && error)

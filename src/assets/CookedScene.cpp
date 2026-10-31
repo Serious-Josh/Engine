@@ -1,5 +1,6 @@
 #include "assets/CookedScene.h"
 #include "Scene/LegacyLightingMigration.h"
+#include "Scene/PhysicalLightingMigration.h"
 #include "assets/CookedEnvironment.h"
 #include "assets/CookedSurface.h"
 #include "Scene/SceneSerializer.h"
@@ -26,7 +27,9 @@ constexpr char HierarchyMagic[] = "ENGSCN09";
 constexpr char CameraMagic[] = "ENGSCN10";
 constexpr char LightMagic[] = "ENGSCN11";
 constexpr char EnvironmentNoneMagic[] = "ENGSCN12";
-constexpr char Magic[] = "ENGSCN13";
+constexpr char ObjectLightingMagic[] = "ENGSCN13";
+constexpr char PhysicalLightingMagic[] = "ENGSCN14";
+constexpr char Magic[] = "ENGSCN15";
 
 // Per-object hierarchy marker. Every version writes it first; payloads 9+ may carry a parent,
 // whose exact object ID follows the object name. Runtime slots are never encoded.
@@ -447,8 +450,52 @@ std::optional<Physics::CharacterControllerComponent> ReadCharacterController(Rea
     return component;
 }
 
-// V10 Camera: u32 presence; when present, u32 record length (24), then
-// u32 enabled, u32 projection, float32 FOV/near/far, u32 main. No native padding.
+// Exposure (V15, 48 bytes): u32 mode, float32 aperture/shutter/ISO/compensation/metering min/max/low/high
+// percentile/brightening/darkening speed, u32 locked.
+constexpr std::uint32_t CookedExposureBytes = 48;
+
+void WriteCameraExposure(Writer& writer, const CameraExposure& exposure)
+{
+    writer.WriteUnsigned(static_cast<std::uint32_t>(exposure.mode), 4);
+    writer.WriteFloat(exposure.aperture);
+    writer.WriteFloat(exposure.shutterSeconds);
+    writer.WriteFloat(exposure.iso);
+    writer.WriteFloat(exposure.compensation);
+    writer.WriteFloat(exposure.meteringMinEV100);
+    writer.WriteFloat(exposure.meteringMaxEV100);
+    writer.WriteFloat(exposure.lowPercentile);
+    writer.WriteFloat(exposure.highPercentile);
+    writer.WriteFloat(exposure.brighteningSpeed);
+    writer.WriteFloat(exposure.darkeningSpeed);
+    writer.WriteUnsigned(exposure.locked ? 1 : 0, 4);
+}
+
+CameraExposure ReadCameraExposure(Reader& reader)
+{
+    CameraExposure exposure;
+    const auto mode = reader.ReadUnsigned(4);
+    Require(mode <= static_cast<std::uint32_t>(ExposureMode::Auto), "Invalid cooked exposure mode.");
+    exposure.mode = static_cast<ExposureMode>(mode);
+    exposure.aperture = reader.ReadFloat();
+    exposure.shutterSeconds = reader.ReadFloat();
+    exposure.iso = reader.ReadFloat();
+    exposure.compensation = reader.ReadFloat();
+    exposure.meteringMinEV100 = reader.ReadFloat();
+    exposure.meteringMaxEV100 = reader.ReadFloat();
+    exposure.lowPercentile = reader.ReadFloat();
+    exposure.highPercentile = reader.ReadFloat();
+    exposure.brighteningSpeed = reader.ReadFloat();
+    exposure.darkeningSpeed = reader.ReadFloat();
+    const auto locked = reader.ReadUnsigned(4);
+    Require(locked <= 1, "Invalid cooked exposure lock flag.");
+    exposure.locked = locked != 0;
+    const char* reason = nullptr;
+    Require(ValidateCameraExposure(exposure, &reason), reason ? reason : "Invalid cooked exposure.");
+    return exposure;
+}
+
+// V10 Camera: u32 presence; when present, u32 record length (24, or 72 from V15 with exposure), then
+// u32 enabled, u32 projection, float32 FOV/near/far, u32 main[, exposure]. No native padding.
 void WriteCameraComponent(Writer& writer, const std::optional<CameraComponent>& camera)
 {
     writer.WriteUnsigned(camera.has_value() ? 1 : 0, 4);
@@ -458,16 +505,18 @@ void WriteCameraComponent(Writer& writer, const std::optional<CameraComponent>& 
         return;
     }
 
-    writer.WriteUnsigned(24, 4);
+    writer.WriteUnsigned(24 + CookedExposureBytes, 4);
     writer.WriteUnsigned(camera->enabled ? 1 : 0, 4);
     writer.WriteUnsigned(static_cast<std::uint32_t>(camera->projection), 4);
     writer.WriteFloat(camera->verticalFov);
     writer.WriteFloat(camera->nearPlane);
     writer.WriteFloat(camera->farPlane);
     writer.WriteUnsigned(camera->main ? 1 : 0, 4);
+    WriteCameraExposure(writer, camera->exposure);
 }
 
-std::optional<CameraComponent> ReadCameraComponent(Reader& reader)
+// Payloads before 15 carry no exposure: hasExposure is false and the decoder applies the reference default.
+std::optional<CameraComponent> ReadCameraComponent(Reader& reader, std::uint32_t version, bool& hasExposure)
 {
     const auto presence = reader.ReadUnsigned(4);
     Require(presence <= 1, "Invalid cooked Camera presence flag.");
@@ -477,7 +526,8 @@ std::optional<CameraComponent> ReadCameraComponent(Reader& reader)
         return std::nullopt;
     }
 
-    Require(reader.ReadUnsigned(4) == 24, "Invalid cooked Camera record length.");
+    hasExposure = version >= CameraExposureVersion;
+    Require(reader.ReadUnsigned(4) == (hasExposure ? 24 + CookedExposureBytes : 24u), "Invalid cooked Camera record length.");
     const auto enabled = reader.ReadUnsigned(4);
     const auto projection = reader.ReadUnsigned(4);
     Require(enabled <= 1, "Invalid cooked Camera enabled flag.");
@@ -493,6 +543,7 @@ std::optional<CameraComponent> ReadCameraComponent(Reader& reader)
     const auto main = reader.ReadUnsigned(4);
     Require(main <= 1, "Invalid cooked Camera Main flag.");
     camera.main = main != 0;
+    if(hasExposure) camera.exposure = ReadCameraExposure(reader);
     std::string error;
 
     if(!ValidateCameraComponent(camera, &error))
@@ -504,7 +555,8 @@ std::optional<CameraComponent> ReadCameraComponent(Reader& reader)
 }
 
 // V13 Light: V11's 36-byte body plus float32 angular radius (40 bytes total).
-// The reader keeps the old 36-byte body for payloads 11/12. No native padding.
+// V14 Light: V13's 40 bytes (intensity in lumens or lux) plus a u32 range attenuation flag (44 bytes).
+// The reader keeps the old bodies for payloads 11/12/13 (legacy units). No native padding.
 void WriteLightComponent(Writer& writer, const std::optional<LightComponent>& light)
 {
     writer.WriteUnsigned(light.has_value() ? 1 : 0, 4);
@@ -514,7 +566,7 @@ void WriteLightComponent(Writer& writer, const std::optional<LightComponent>& li
         return;
     }
 
-    writer.WriteUnsigned(40, 4);
+    writer.WriteUnsigned(44, 4);
     writer.WriteUnsigned(light->enabled ? 1 : 0, 4);
     writer.WriteUnsigned(static_cast<std::uint32_t>(light->type), 4);
     writer.WriteVector(light->color);
@@ -523,9 +575,12 @@ void WriteLightComponent(Writer& writer, const std::optional<LightComponent>& li
     writer.WriteFloat(light->innerConeAngle);
     writer.WriteFloat(light->outerConeAngle);
     writer.WriteFloat(light->angularRadius);
+    writer.WriteUnsigned(light->rangeAttenuation ? 1 : 0, 4);
 }
 
-std::optional<LightComponent> ReadLightComponent(Reader& reader, std::uint32_t version)
+// Payloads before 14 carry legacy units: their range goes to legacyRange and the historical rules apply
+// (MigrateLegacyLightUnits converts the document afterwards).
+std::optional<LightComponent> ReadLightComponent(Reader& reader, std::uint32_t version, float& legacyRange)
 {
     const auto presence = reader.ReadUnsigned(4);
     Require(presence <= 1, "Invalid cooked Light presence flag.");
@@ -535,7 +590,8 @@ std::optional<LightComponent> ReadLightComponent(Reader& reader, std::uint32_t v
         return std::nullopt;
     }
 
-    Require(reader.ReadUnsigned(4) == (version >= ObjectLightingVersion ? 40u : 36u), "Invalid cooked Light record length.");
+    Require(reader.ReadUnsigned(4) == (version >= PhysicalLightingVersion ? 44u : version == ObjectLightingVersion ? 40u : 36u),
+        "Invalid cooked Light record length.");
     const auto enabled = reader.ReadUnsigned(4);
     const auto type = reader.ReadUnsigned(4);
     Require(enabled <= 1, "Invalid cooked Light enabled flag.");
@@ -546,10 +602,25 @@ std::optional<LightComponent> ReadLightComponent(Reader& reader, std::uint32_t v
     light.type = static_cast<LightType>(type);
     light.color = reader.ReadVector();
     light.intensity = reader.ReadFloat();
+    const bool legacyUnits = version < PhysicalLightingVersion;
     light.range = reader.ReadFloat();
     light.innerConeAngle = reader.ReadFloat();
     light.outerConeAngle = reader.ReadFloat();
     if(version >= ObjectLightingVersion) light.angularRadius = reader.ReadFloat();
+
+    if(legacyUnits)
+    {
+        // Historical lights always faded to zero at their range.
+        legacyRange = light.range;
+        light.rangeAttenuation = true;
+        ValidateLegacyLightValues(light, legacyRange);
+        return light;
+    }
+
+    const auto rangeAttenuation = reader.ReadUnsigned(4);
+    Require(rangeAttenuation <= 1, "Invalid cooked Light range attenuation flag.");
+    light.rangeAttenuation = rangeAttenuation != 0;
+
     std::string error;
 
     if(!ValidateLightComponent(light, &error))
@@ -594,7 +665,9 @@ std::vector<std::byte> Encode(const Metadata& sceneMetadata, const Policy& polic
     writer.WriteFloat(document.camera.aspectRatio);
     writer.WriteFloat(document.camera.nearPlane);
     writer.WriteFloat(document.camera.farPlane);
-    writer.WriteFloat(document.lightingSettings.ambientStrength);
+    writer.WriteFloat(document.lightingSettings.referenceEV100);
+    writer.WriteFloat(document.lightingSettings.environmentLuminanceScale);
+    WriteCameraExposure(writer, document.camera.exposure);
 
     for (size_t index = 0; index < document.objects.size(); ++index)
     {
@@ -819,6 +892,8 @@ Metadata Decode(std::span<const std::byte> bytes, const Policy& policy)
 
     if(payloadVersion == LightVersion) expectedMagic = LightMagic;
     if(payloadVersion == EnvironmentNoneVersion) expectedMagic = EnvironmentNoneMagic;
+    if(payloadVersion == ObjectLightingVersion) expectedMagic = ObjectLightingMagic;
+    if(payloadVersion == PhysicalLightingVersion) expectedMagic = PhysicalLightingMagic;
 
     Require(magic == expectedMagic, "Invalid cooked scene magic/version pair.");
     // Keep this short-circuit read: a bad header size does not consume the length.
@@ -841,9 +916,22 @@ Metadata Decode(std::span<const std::byte> bytes, const Policy& policy)
     document.camera.aspectRatio = reader.ReadFloat();
     document.camera.nearPlane = reader.ReadFloat();
     document.camera.farPlane = reader.ReadFloat();
-    std::optional<DirectionalLight> legacySun;
-    if(payloadVersion >= ObjectLightingVersion)
-        document.lightingSettings.ambientStrength = reader.ReadFloat();
+    std::optional<LegacySceneSun> legacySun;
+    float legacyAmbientStrength = 0.0f;
+    std::vector<LegacyLightValues> legacyLights;
+    std::vector<size_t> camerasWithoutExposure;
+    const bool viewportExposure = payloadVersion >= CameraExposureVersion;
+    if(payloadVersion >= PhysicalLightingVersion)
+    {
+        document.lightingSettings.referenceEV100 = reader.ReadFloat();
+        document.lightingSettings.environmentLuminanceScale = reader.ReadFloat();
+        if(viewportExposure) document.camera.exposure = ReadCameraExposure(reader);
+    }
+    else if(payloadVersion == ObjectLightingVersion)
+    {
+        legacyAmbientStrength = reader.ReadFloat();
+        Require(std::isfinite(legacyAmbientStrength) && legacyAmbientStrength >= 0.0f, "Invalid cooked ambient strength.");
+    }
     else
     {
         legacySun.emplace();
@@ -956,7 +1044,9 @@ Metadata Decode(std::span<const std::byte> bytes, const Policy& policy)
         {
             try
             {
-                object.camera = ReadCameraComponent(reader);
+                bool hasExposure = false;
+                object.camera = ReadCameraComponent(reader, payloadVersion, hasExposure);
+                if(object.camera && !hasExposure) camerasWithoutExposure.push_back(document.objects.size());
             }
             catch(const std::exception& exception)
             {
@@ -968,7 +1058,10 @@ Metadata Decode(std::span<const std::byte> bytes, const Policy& policy)
         {
             try
             {
-                object.light = ReadLightComponent(reader, payloadVersion);
+                float legacyRange = std::numeric_limits<float>::quiet_NaN();
+                object.light = ReadLightComponent(reader, payloadVersion, legacyRange);
+                if(object.light && payloadVersion < PhysicalLightingVersion && object.light->type != LightType::Directional)
+                    legacyLights.push_back({object.id, legacyRange});
             }
             catch(const std::exception& exception)
             {
@@ -1000,9 +1093,19 @@ Metadata Decode(std::span<const std::byte> bytes, const Policy& policy)
     Require(reader.cursor == bytes.size(), "Trailing cooked scene bytes.");
     if(payloadVersion < ObjectLightingVersion)
     {
-        MigrateLegacyLighting(document, legacySun);
+        legacyAmbientStrength = MigrateLegacyLighting(document, legacySun);
         sceneMetadata.meshes.resize(document.objects.size());
     }
+    if(payloadVersion < PhysicalLightingVersion)
+    {
+        // Historical payloads are converted at the default reference exposure; repository content is re-cooked.
+        MigrateLegacyLightUnits(document, payloadVersion, legacyAmbientStrength, legacyLights, {});
+    }
+    // Cameras cooked before exposure existed take the default exposure (Auto), with manual settings at the scene
+    // reference exposure.
+    const auto reference = Photometry::ReferenceCameraExposure(document.lightingSettings.referenceEV100);
+    if(!viewportExposure) document.camera.exposure = reference;
+    for(const size_t index : camerasWithoutExposure) document.objects[index].camera->exposure = reference;
     ValidateMetadata(sceneMetadata, policy);
     return sceneMetadata;
 }

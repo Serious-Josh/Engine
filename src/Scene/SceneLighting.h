@@ -26,6 +26,7 @@ struct ResolvedSceneLight
     float intensity = 0.0f;
     float angularRadius = 0.0f;
     float range = 0.0f;
+    bool rangeAttenuation = true;
     float innerConeAngle = 0.0f;
     float outerConeAngle = 0.0f;
 
@@ -73,8 +74,8 @@ bool BuildLightRigidWorld(const Matrix4& world, Matrix4& rigidWorld, std::string
 const SceneObjectDocument* FindDirectionalShadowOwner(const SceneDocument& document);
 
 // Editor wireframe model matrices for the overlay's unit shapes. They depict direct-light shape
-// and nominal influence only, never RTGI or bounced light. Ranges are drawn at their authored
-// size (at most 10 km); vertex counts are fixed, so extreme values stay bounded and finite.
+// and influence (the range, also the culling bound) only, never RTGI or bounced light. Ranges are
+// drawn at their authored size (at most 10 km); vertex counts are fixed, so extreme values stay finite.
 // - Point: the unit Sphere (three great circles) scaled to the range, centered on the Light.
 // - Spot: the unit Cone, apex at the Light, axis along world +Z of the rigid world; radial edges
 //   have the authored range as length and the ring sits at the authored half-angle.

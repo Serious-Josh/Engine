@@ -34,6 +34,8 @@ int VerifyProjectBrowser();
 int VerifySceneLifecycle();
 int VerifyAssetBrowserScenes();
 int VerifyStartupScene(const std::filesystem::path& outputRoot);
+int VerifyCausticsVisible(const std::filesystem::path& project, const std::filesystem::path& out);
+int MigrateSceneLighting(const std::filesystem::path& scene, float referenceEV100, const std::filesystem::path& report);
 int VerifyProjectSystemWorkflow(const std::string& stage, const std::filesystem::path& workRoot);
 int VerifyProjectRelaunch(const std::filesystem::path& source, const std::filesystem::path& target, const std::string& mode);
 int VerifyProjectWorkflowRegressions();
@@ -289,6 +291,15 @@ int main(int argc, char** argv)
     {
         const auto arguments = CommandLineArguments::Read();
         return VerifyProjectRelaunch(arguments[2], arguments[3], argv[4]);
+    }
+    // Physical Lighting C1: one-time conversion of a legacy-unit scene at an explicit reference exposure.
+    if(argc == 5 && std::string_view(argv[1]) == "--migrate-scene-lighting")
+    {
+        return MigrateSceneLighting(std::filesystem::absolute(argv[2]), std::stof(argv[3]), std::filesystem::absolute(argv[4]));
+    }
+    if(argc == 4 && std::string_view(argv[1]) == "--verify-caustics-visible")
+    {
+        return VerifyCausticsVisible(std::filesystem::absolute(argv[2]), std::filesystem::absolute(argv[3]));
     }
     if(argc == 3 && std::string_view(argv[1]) == "--verify-startup-scene")
     {
