@@ -1614,6 +1614,11 @@ class Renderer
     // PSR.2 Stage 3A: whether this frame lights replaced pixels (decided before the geometry pass, so replacement runs
     // without a diagnostic view only when it does), and the PSR.2 lighting pair's bindings, set by
     // RecordPsrInPlaceReplacement on such a frame (0 otherwise).
+#ifndef NDEBUG
+    // Verification only: withholds the combined PSR + SHARC path, as a failed preparation does.
+    bool m_psrSharcPreparationFailureForTesting = false;
+    Buffer* m_psrSharcEnergyReferenceForTesting = nullptr;
+#endif
     bool m_psrLightingThisFrame = false;
     static bool PsrLightingSupportsDenoiser(PathTraceDenoiserMode mode);
     // PSR.2 Stage 3B phase 4: an NRD mode's PSR bindings for its preparation pass on a frame whose replaced pixels the path

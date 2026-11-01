@@ -7145,12 +7145,6 @@ bool Renderer::RecordPsrInPlaceReplacement(ID3D12GraphicsCommandList* commandLis
     const D3D12_GPU_VIRTUAL_ADDRESS transformsAddress = m_uploadBuffer.Allocate(transforms.data(),
         transforms.size() * sizeof(PsrInPlaceReplacePass::ObjectTransform), D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT);
 
-    if(!m_psrInPlaceReplacePass.Execute(commandList, m_gBuffer, constantsAddress, transformsAddress, topLevel,
-        m_sceneWidth, m_sceneHeight, m_psrDiagnosticHits))
-    {
-        return false;
-    }
-
     // PSR.2 Stage 3A: the lighting pair recovers each mirror with this pass's camera and transforms.
     if(m_psrLightingThisFrame && constantsAddress != 0 && transformsAddress != 0)
     {
@@ -7162,6 +7156,9 @@ bool Renderer::RecordPsrInPlaceReplacement(ID3D12GraphicsCommandList* commandLis
         lighting.transformCount = constants.transformCount;
         // Verification only: the PSR probe's UAV.
         lighting.padding[0] = m_pathTraceReferencePass.PsrProbeUAVIndex();
+#ifndef NDEBUG
+        lighting.padding[2] = m_psrSharcEnergyReferenceForTesting ? m_psrSharcEnergyReferenceForTesting->GetUAVDescriptorIndex() : 0;
+#endif
         lighting.SetTextureMipBias(constants.textureMipBias);
         m_psrGBufferConstantsAddress = m_uploadBuffer.Allocate(&lighting, sizeof(lighting),
             D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
@@ -7183,6 +7180,17 @@ bool Renderer::RecordPsrInPlaceReplacement(ID3D12GraphicsCommandList* commandLis
         denoise.textureMipBias = constants.textureMipBias;
         m_psrDenoiseConstantsAddress = m_psrGBufferTransformsAddress != 0 ? m_uploadBuffer.Allocate(&denoise,
             sizeof(denoise), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT) : 0;
+    }
+
+    if(m_psrLightingThisFrame && (m_psrGBufferConstantsAddress == 0 ||
+        m_psrGBufferTransformsAddress == 0 || m_psrDenoiseConstantsAddress == 0))
+    {
+        return false;
+    }
+    if(!m_psrInPlaceReplacePass.Execute(commandList, m_gBuffer, constantsAddress, transformsAddress, topLevel,
+        m_sceneWidth, m_sceneHeight, m_psrDiagnosticHits))
+    {
+        return false;
     }
 
     return true;
@@ -8560,6 +8568,12 @@ bool Renderer::RecordPathTraceReference(
                 // Without a query binding (0) the reference pipeline renders.
                 renderCacheAddress = PrepareRadianceCacheQuery(commandList, extract, splitReSTIRDI, rawExtraction);
                 renderCacheLibrary = RadianceCacheQueryLibrary(extract, splitReSTIRDI, rawExtraction);
+                // PSR.2 lighting with SHARC is only granted through the combined preparation below: its replaced
+                // pixels need the combined library's physical decoder (B traced, never substituted).
+                if(m_psrLightingThisFrame && renderCacheAddress != 0)
+                    renderCacheLibrary = !extract ? PathTraceRadianceCacheLibrary::PsrRenderSplitIndirect :
+                        rawExtraction ? PathTraceRadianceCacheLibrary::PsrRenderSplitIndirectExtractionRawDiffuseHitDistance :
+                        PathTraceRadianceCacheLibrary::PsrRenderSplitIndirectExtraction;
             }
         }
 
@@ -8690,7 +8704,9 @@ bool Renderer::RecordPathTraceReference(
                 m_pathTraceReferencePass.ExecuteRadianceCacheTraining(m_commandContext.GetRayTracingCommandList(),
                     m_resourceDescriptorHeap, m_rayTracingScene, constantsAddress, sceneLightConstantsAddress,
                     radianceCacheAddress,
-                    static_cast<std::uint32_t>(m_radianceCacheD6.TrainingThreads(m_sceneWidth, m_sceneHeight)));
+                    static_cast<std::uint32_t>(m_radianceCacheD6.TrainingThreads(m_sceneWidth, m_sceneHeight)),
+                    m_psrLightingLastFrame ? m_psrGBufferConstantsAddress : 0,
+                    m_psrLightingLastFrame ? m_psrGBufferTransformsAddress : 0);
                 m_gpuTimestampProfiler.EndRegion(commandList, frameIndex,
                     GpuTimestampProfiler::Region::RadianceCacheTraining);
             }
@@ -8716,7 +8732,10 @@ bool Renderer::RecordPathTraceReference(
             renderCacheLibrary == PathTraceRadianceCacheLibrary::RenderSplitIndirect ||
             renderCacheLibrary == PathTraceRadianceCacheLibrary::RenderSplitIndirectExtraction ||
             renderCacheLibrary == PathTraceRadianceCacheLibrary::RenderExtractionRawDiffuseHitDistance ||
-            renderCacheLibrary == PathTraceRadianceCacheLibrary::RenderSplitIndirectExtractionRawDiffuseHitDistance);
+            renderCacheLibrary == PathTraceRadianceCacheLibrary::RenderSplitIndirectExtractionRawDiffuseHitDistance ||
+            renderCacheLibrary == PathTraceRadianceCacheLibrary::PsrRenderSplitIndirect ||
+            renderCacheLibrary == PathTraceRadianceCacheLibrary::PsrRenderSplitIndirectExtraction ||
+            renderCacheLibrary == PathTraceRadianceCacheLibrary::PsrRenderSplitIndirectExtractionRawDiffuseHitDistance);
 
         // SHARC.4E statistics: this frame's counters, read back when its slot comes round again.
         if(m_sharcSettings.enabled && m_sharcSettings.statistics && renderCacheAddress != 0)
@@ -11685,7 +11704,8 @@ bool Renderer::RecordRenderFrame(
         options.pathTraceReference.primarySurfaceReplacementInPlace && options.pathTraceReference.maxPathDepth > 0u &&
         m_psrInPlaceReplacePass.IsInitialized();
     // PSR.2 Stage 3A: only the PSR.2 lighting pair lights replaced pixels, and it needs the denoiser Off (no extraction),
-    // no SHARC or D6 cache, and a path that reaches the reflected surface (vertex 1). Without a diagnostic view the
+    // a path that reaches the reflected surface (vertex 1). SHARC remains excluded outside the development-only
+    // infrastructure harness, which prepares the combined set before replacement. Without a diagnostic view the
     // replacement runs only when it does; otherwise the mirror's G-buffer stays and the production path renders it.
     m_psrLightingThisFrame = false;
     m_psrGBufferConstantsAddress = 0;
@@ -11711,7 +11731,41 @@ bool Renderer::RecordRenderFrame(
         }
         else if(m_sharcSettings.enabled || options.experimentalD6RadianceCache)
         {
-            psrLightingUnavailable = "requires SHARC off";
+            // PSR.2 + SHARC: replaced pixels trace physical B through the combined libraries, ordinary pixels keep
+            // SHARC. Every pipeline and resource is prepared before replacement; otherwise PSR lighting waits.
+            if(
+#ifndef NDEBUG
+                !m_psrSharcPreparationFailureForTesting &&
+#endif
+                m_sharcSettings.enabled &&
+                !options.experimentalD6RadianceCache && options.pathTraceReference.maxPathDepth >= 2u &&
+                m_radianceCacheD6.HasResources() &&
+                [&]()
+                {
+                    const auto submitted = m_commandContext.GetLastSubmissionFenceValue();
+                    const auto completed = m_commandContext.GetCompletedFenceValue();
+                    bool ready = m_pathTraceReferencePass.EnsureSplitDirectRadiance(m_graphicsDevice.GetDevice(),
+                        m_resourceDescriptorHeap, options.pathTraceReference.samplesPerFrame, submitted, completed) != UINT_MAX;
+                    if(ready && psrExtraction)
+                    {
+                        ready = m_pathTraceReferencePass.EnsureSignalExtraction(m_graphicsDevice, m_shaderLibrary,
+                            m_resourceDescriptorHeap, PathTracePrimary::RasterReSTIRDI, failure, psrRawExtraction) &&
+                            m_pathTraceReferencePass.EnsureSplitDirectDiffuse(m_graphicsDevice.GetDevice(),
+                                m_resourceDescriptorHeap, options.pathTraceReference.samplesPerFrame, submitted, completed) != UINT_MAX;
+                    }
+                    if(ready && psrRawExtraction)
+                        ready = m_pathTraceReferencePass.EnsureRawDiffuseHitDistanceTexture(m_graphicsDevice.GetDevice(),
+                            m_resourceDescriptorHeap) != nullptr;
+                    if(!ready && failure.empty()) failure = "PSR + SHARC downstream resources are unavailable.";
+                    return ready;
+                }() &&
+                m_pathTraceReferencePass.EnsurePsrSharcInfrastructure(m_graphicsDevice, m_shaderLibrary,
+                    psrExtraction, psrRawExtraction, failure))
+                m_psrLightingThisFrame = true;
+            else
+                psrLightingUnavailable = options.experimentalD6RadianceCache ? "requires the experimental D6 radiance cache off" :
+                    options.pathTraceReference.maxPathDepth < 2u ? "requires PT max path depth 2 or more" :
+                    !failure.empty() ? failure : "PSR + SHARC pipelines are not ready";
         }
         else if(options.pathTraceReference.maxPathDepth < 2u)
         {
@@ -11736,8 +11790,11 @@ bool Renderer::RecordRenderFrame(
     }
 
     m_debugUI.SetPsrLightingStatus(psrRequested, psrLightingUnavailable);
+    // Diagnostic views must not force a virtual G-buffer into an ordinary cache pipeline
+    // after combined preparation failed (or while the development boundary is closed).
     const bool psrInPlace = psrRequested &&
-        (m_psrLightingThisFrame || m_debugUI.GetPsrDebugView() != ToneMapDebugView::None);
+        (m_psrLightingThisFrame || (!m_sharcSettings.enabled && !options.experimentalD6RadianceCache &&
+            m_debugUI.GetPsrDebugView() != ToneMapDebugView::None));
 
     if(psrInPlace)
     {

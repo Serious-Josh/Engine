@@ -69,6 +69,10 @@ enum class PathTraceRadianceCacheLibrary
     RenderSplitIndirectExtraction,
     RenderExtractionRawDiffuseHitDistance,
     RenderSplitIndirectExtractionRawDiffuseHitDistance,
+    PsrTraining,
+    PsrRenderSplitIndirect,
+    PsrRenderSplitIndirectExtraction,
+    PsrRenderSplitIndirectExtractionRawDiffuseHitDistance,
     Count
 };
 
@@ -340,6 +344,14 @@ class PathTraceReferencePass
     // library (PathTraceRadianceCacheLibrary, with the cache binding at b3). It traces and renders exactly as the
     // production pipeline and also records D6 training samples. A failure is sticky until a new revision of the
     // libraries is accepted. Creation only.
+    // Development-only preparation: all downstream state objects before in-place replacement.
+    bool EnsurePsrSharcInfrastructure(GraphicsDevice&, ShaderLibrary&, bool extract, bool raw, std::string&);
+    bool PsrSharcInfrastructureReady(bool extract, bool raw);
+    bool EnsurePsrSharcProbesForTesting(GraphicsDevice&, ShaderLibrary&, std::string&);
+    bool m_psrSharcTrainingProbeForTesting = false;
+    bool m_psrSharcEnergyForTesting = false;
+    bool EnsurePsrSharcEnergyForTesting(GraphicsDevice&, ShaderLibrary&, std::string&);
+
     bool EnsureRadianceCacheLearning(
         GraphicsDevice& graphicsDevice,
         ShaderLibrary& shaderLibrary,
@@ -356,7 +368,9 @@ class PathTraceReferencePass
         D3D12_GPU_VIRTUAL_ADDRESS constantsAddress,
         D3D12_GPU_VIRTUAL_ADDRESS sceneLightConstantsAddress,
         D3D12_GPU_VIRTUAL_ADDRESS trainingConstants,
-        std::uint32_t threads);
+        std::uint32_t threads,
+        D3D12_GPU_VIRTUAL_ADDRESS psrConstants = 0,
+        D3D12_GPU_VIRTUAL_ADDRESS psrTransforms = 0);
 
     bool IsRadianceCacheLearningReady(PathTraceRadianceCacheLibrary library) const
     {
@@ -834,6 +848,9 @@ class PathTraceReferencePass
     std::map<RayTracingPipeline*, std::unique_ptr<RayTracingPipeline>> m_psrPrimaryDiRayQueryPipelines;
 
     // PSR.2 Stage 3A: the G-buffer-storage split pair (EnsurePrimarySurfaceReplacementGBuffer); twins in the PSR maps.
+    RayTracingPipeline m_psrSharcEnergyPipelines[2];
+    RayTracingPipeline m_psrSharcImageProbePipeline;
+    RayTracingPipeline m_psrSharcTrainingProbePipeline;
     RayTracingPipeline m_psrGBufferDirectPipeline;
     RayTracingPipeline m_psrGBufferIndirectPipeline;
     bool m_psrGBufferPipelinesReady = false;

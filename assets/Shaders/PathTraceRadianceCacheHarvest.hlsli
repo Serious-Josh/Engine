@@ -63,6 +63,9 @@ uint PathTraceRadianceCacheRecord()
 
 struct PathTraceRadianceCacheHarvest
 {
+#ifdef PATH_TRACE_PSR_SHARC_INFRASTRUCTURE
+    bool psrReplaced;
+#endif
     // x1 is an eligible, keyed cache vertex of a raster-primary path in a learning frame.
     bool active;
     // x1's continuation direction was sampled (otherwise the sample is zero).
@@ -104,9 +107,18 @@ PathTraceRadianceCacheHarvest PathTraceRadianceCacheHarvestBegin()
 void PathTraceRadianceCacheHarvestVertex(inout PathTraceRadianceCacheHarvest harvest, uint primary, uint vertex,
     float3 position, PathTraceSurface surface)
 {
+#ifdef PATH_TRACE_PSR_SHARC_ENERGY_REFERENCE
+    // Independent diagnostic transport must never overwrite or insert production records.
+    return;
+#endif
 #ifdef PATH_TRACE_RADIANCE_CACHE_TRAINING
+    bool primaryAllowed = true;
+#ifdef PATH_TRACE_PSR_SHARC_INFRASTRUCTURE
+    // M2A: only x1 B is trained. Recovered A never generates an x0 prior record.
+    primaryAllowed = !harvest.psrReplaced;
+#endif
     // SHARC.6A: x0's eligibility is x1's rule; its key is the primary class's.
-    if(vertex == 0u && primary == PATH_TRACE_PRIMARY_RASTER && radianceCache.learning != 0u &&
+    if(primaryAllowed && vertex == 0u && primary == PATH_TRACE_PRIMARY_RASTER && radianceCache.learning != 0u &&
         radianceCache.primaryRecordOffset != 0u && !surface.deltaSpecular && surface.material.model <= 1u &&
         surface.material.metallic <= 0.1f)
     {

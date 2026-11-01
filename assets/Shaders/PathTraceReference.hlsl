@@ -921,6 +921,8 @@ struct PathTraceRasterFirstVertex
     // PSR.1a: PATH_TRACE_PSR_* of this pixel's record. PSR.1a-P: the replaced hit itself is read at vertex 1
     // (PathTracePsrLoadHit), so only this word stays live through the sample loop.
     uint psrState;
+    // Selected image pixel, independent of the sparse training dispatch index.
+    uint2 psrPixel;
 #ifdef PATH_TRACE_PSR_GBUFFER
     // PSR.2: a replaced pixel's mirror plane point (its exact camera-ray intersection, camera-relative).
     float3 psrPlanePoint;
@@ -980,6 +982,7 @@ PathTraceRasterFirstVertex PathTraceDecodeRasterFirstVertex(uint2 pixel)
         firstVertex.backgroundDirection);
 #ifdef PATH_TRACE_PSR_LIBRARY
     firstVertex.psrState = 0u;
+    firstVertex.psrPixel = pixel;
 #ifdef PATH_TRACE_PSR_GBUFFER
     firstVertex.psrPlanePoint = float3(0.0f, 0.0f, 0.0f);
 #endif
@@ -1379,15 +1382,25 @@ PathTraceExtraction PathTraceEmptyExtraction()
 #define PATH_TRACE_RADIANCE_CACHE_HARVEST(statement)
 #endif
 
+#ifdef PATH_TRACE_PSR_SHARC_ENERGY_DIAGNOSTIC
+#include "PsrSharcEnergyDiagnostic.hlsli"
+#endif
+
 float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex rasterFirstVertex,
     inout PathTraceRandom random, inout uint rayCount, bool extract, inout PathTraceExtraction extraction)
 {
     float3 radiance = float3(0.0f, 0.0f, 0.0f);
     float3 throughput = float3(1.0f, 1.0f, 1.0f);
+#ifdef PATH_TRACE_PSR_SHARC_ENERGY_DIAGNOSTIC
+    PsrSharcEnergyObservation energy = (PsrSharcEnergyObservation)0;
+#endif
     bool previousDelta = true;
     float previousPdf = 0.0f;
     PATH_TRACE_RADIANCE_CACHE_HARVEST(PathTraceRadianceCacheHarvest harvest = PathTraceRadianceCacheHarvestBegin());
 #ifdef PATH_TRACE_PSR_LIBRARY
+#if defined(PATH_TRACE_PSR_SHARC_INFRASTRUCTURE) && defined(PATH_TRACE_RADIANCE_CACHE_TRAINING)
+    harvest.psrReplaced = PathTracePsrReplaced(rasterFirstVertex.psrState);
+#endif
     // PSR.1c-A: the vertex whose direct light RTXDI estimated (the direct pass's split direct radiance).
     uint rtxdiVertex = primary == PATH_TRACE_PRIMARY_RASTER_SPLIT_INDIRECT ?
         PathTraceEffectivePrimaryVertex(rasterFirstVertex) : 0u;
@@ -1427,6 +1440,10 @@ float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex 
             bool replacementVertex = (primary == PATH_TRACE_PRIMARY_RASTER ||
                 primary == PATH_TRACE_PRIMARY_RASTER_SPLIT_INDIRECT) && vertex == 1u &&
                 PathTracePsrReplaced(rasterFirstVertex.psrState);
+#ifdef PATH_TRACE_PSR_SHARC_ENERGY_REFERENCE
+            // B is independently reached through the physical TLAS, from recovered mirror A.
+            replacementVertex = false;
+#endif
             bool untracedVertex = gBufferVertex || replacementVertex;
             // PSR.1a-P: the call stays unconditional. A wave-uniform skip (WaveActiveAllTrue(replacementVertex)) is
             // equivalent, but placing the call under a branch made this pass 0.5-1.8 ms slower (PSR1aPPerformance.md).
@@ -1438,7 +1455,7 @@ float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex 
 
             if(replacementVertex)
             {
-                payload = PathTraceEffectivePrimaryReplacementPayload(DispatchRaysIndex().xy);
+                payload = PathTraceEffectivePrimaryReplacementPayload(rasterFirstVertex.psrPixel);
             }
 #else
 #ifdef PATH_TRACE_SER
@@ -1513,6 +1530,10 @@ float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex 
                         }
 
                         radiance += throughput * missRadiance;
+#ifdef PATH_TRACE_PSR_SHARC_ENERGY_DIAGNOSTIC
+                        if(vertex == 2u) energy.immediateImage += throughput * missRadiance;
+                        if(vertex >= 3u) energy.suffixImage += throughput * missRadiance;
+#endif
                         PATH_TRACE_RADIANCE_CACHE_HARVEST(PathTraceRadianceCacheHarvestMiss(harvest, vertex, missRadiance));
 
                         if(extract)
@@ -1533,7 +1554,7 @@ float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex 
                 // PSR.2: a replaced pixel's vertex 1 is B reconstructed from the G-buffer, not a hit.
                 if(replacementVertex)
                 {
-                    if(!PathTracePsrReplacementSurface(DispatchRaysIndex().xy, rasterFirstVertex, position, surface))
+                    if(!PathTracePsrReplacementSurface(rasterFirstVertex.psrPixel, rasterFirstVertex, position, surface))
                     {
                         break;
                     }
@@ -1603,6 +1624,18 @@ float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex 
             }
         }
 
+#ifdef PATH_TRACE_PSR_SHARC_ENERGY_DIAGNOSTIC
+        if(vertex == 1u)
+        {
+            energy.seen = true;
+            energy.position = position;
+            energy.normal = surface.geometricNormal;
+            energy.metallic = surface.material.metallic;
+            energy.roughness = surface.material.roughness;
+            energy.eligible = !surface.deltaSpecular && surface.material.model <= 1u && surface.material.metallic <= 0.1f;
+            energy.mirrorThroughput = throughput;
+        }
+#endif
         PATH_TRACE_RADIANCE_CACHE_HARVEST(PathTraceRadianceCacheHarvestVertex(harvest, primary, vertex, position, surface));
         bool hasNonDeltaLobe = !surface.deltaSpecular || surface.specularProbability < 1.0f;
 
@@ -1637,6 +1670,10 @@ float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex 
             }
 
             radiance += throughput * direct;
+#ifdef PATH_TRACE_PSR_SHARC_ENERGY_DIAGNOSTIC
+            if(vertex == 1u) energy.direct = direct;
+            if(vertex >= 2u) energy.suffixImage += throughput * direct;
+#endif
             PATH_TRACE_RADIANCE_CACHE_HARVEST(PathTraceRadianceCacheHarvestDirect(harvest, vertex, direct));
 
             // Vertex 0's direct light is split per lobe; later vertices' is carried by the diffuse throughput.
@@ -1679,6 +1716,17 @@ float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex 
             }
         }
 
+#ifdef PATH_TRACE_PSR_SHARC_ENERGY_DIAGNOSTIC
+        if(vertex == 1u)
+        {
+            energy.valid = bsdfSample.valid;
+            energy.sampled = !bsdfSample.delta;
+            energy.bsdfWeight = bsdfSample.weight;
+            energy.continuationThroughput = throughput * bsdfSample.weight;
+            energy.direction = bsdfSample.direction;
+            energy.pdf = bsdfSample.pdf;
+        }
+#endif
         throughput *= bsdfSample.weight;
         PATH_TRACE_RADIANCE_CACHE_HARVEST(PathTraceRadianceCacheHarvestContinue(harvest, vertex, bsdfSample));
         previousDelta = bsdfSample.delta;
@@ -1716,6 +1764,9 @@ float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex 
         ray.TMax = PATH_TRACE_DISTANT_LIGHT_DISTANCE;
     }
 
+#ifdef PATH_TRACE_PSR_SHARC_ENERGY_DIAGNOSTIC
+    PsrSharcEnergyStore(energy, rasterFirstVertex, radiance);
+#endif
     PATH_TRACE_RADIANCE_CACHE_HARVEST(PathTraceRadianceCacheHarvestEnd(harvest));
 #undef PATH_TRACE_EXTRACTION_VERTEX
     return radiance;
@@ -2142,6 +2193,7 @@ void PathTracePsrRayGeneration()
 }
 
 // -----------------------------------------------------------------------------
+#ifndef PATH_TRACE_PSR_SHARC_INFRASTRUCTURE
 // PSR.1b virtual surface guides (diagnostic consumers only). PathTracePsrGuideRayGeneration replaces the record pass on
 // guide frames: it writes the identical record, from the identical ray and closest-hit evaluation, and in addition one
 // guide per pixel. Physical coordinates (lighting, visibility) stay in the record and the raster vertex 0; the guide
@@ -2449,6 +2501,8 @@ void PathTracePsrGuideRayGeneration()
         motion, virtualNormal);
 }
 
+#endif // PSR.1 guide b3 is not part of the combined PSR.2 library.
+
 // PSR.2 Stage 3A verification probe (development; dispatched only by a test hook after the split pair): per pixel, what
 // the split passes see through the effective primary surface interface, with this library's storage (PSR.1's records
 // or PSR.2's G-buffer). 48 words: flags (1 vertex 0 is a surface, 2 SURFACE, 4 B shaded, 8 delta sample valid), the
@@ -2461,10 +2515,8 @@ void PathTracePsrGuideRayGeneration()
 #define PATH_TRACE_PSR_PROBE_INDEX psrPadding
 #endif
 
-[shader("raygeneration")]
-void PathTracePsrProbeRayGeneration()
+void PathTracePsrProbe(uint2 pixel)
 {
-    uint2 pixel = DispatchRaysIndex().xy;
 
     if(any(pixel >= resolution))
     {
@@ -2504,6 +2556,21 @@ void PathTracePsrProbeRayGeneration()
     probe.Store4(address + 144u, uint4(asuint(surface.specularProbability), asuint(surface.normalDotView),
         asuint(firstVertex.surface.view.xy)));
     probe.Store4(address + 160u, uint4(asuint(firstVertex.surface.view.z), 0u, 0u, 0u));
+#ifdef PATH_TRACE_PSR_SHARC_INFRASTRUCTURE
+    uint2 key = 0u;
+    uint level = 0u;
+    bool keyed = shaded && RadianceCacheD6MakeClassKey(radianceCache, position, surface.geometricNormal, false, key, level);
+    probe.Store4(address + 176u, uint4(key, level, keyed ? PathTraceEffectivePrimaryVertex(firstVertex) : 0xFFFFFFFFu));
+    Texture2D<float4> storedSurface = ResourceDescriptorHeap[gBufferSurfaceIndex];
+    probe.Store(address + 164u, asuint(storedSurface.Load(int3(pixel, 0)).w));
+    probe.Store(address + 168u, firstVertex.psrPixel.y * resolution.x + firstVertex.psrPixel.x);
+#endif
+}
+
+[shader("raygeneration")]
+void PathTracePsrProbeRayGeneration()
+{
+    PathTracePsrProbe(DispatchRaysIndex().xy);
 }
 #endif
 

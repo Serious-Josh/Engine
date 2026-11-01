@@ -559,6 +559,13 @@ bool PathTraceRadianceCacheSubstitute(uint primary, float3 position, PathTraceSu
 // PathTraceReference.hlsl's Continue hook statement sits directly in the path loop; in this library it expands to the
 // substitution, which reads the loop's own locals (primary, position, surface, throughput, radiance, rayCount,
 // extract, extraction), and a real break when it completed the path.
+// PSR.2 + SHARC: a replaced pixel's x1 is physical B, whose continuation is always traced (the cache would replace it
+// with a D6 estimate the reflection makes visible, PSR2SharcProductionConsolidation.md); only ordinary pixels substitute.
+#ifdef PATH_TRACE_PSR_SHARC_INFRASTRUCTURE
+#define PATH_TRACE_SHARC_SUBSTITUTES (!PathTracePsrReplaced(rasterFirstVertex.psrState))
+#else
+#define PATH_TRACE_SHARC_SUBSTITUTES true
+#endif
 #if PATH_TRACE_SHARC_EXPERIMENT_GATE
 // Experiments B and C also read the loop's ray, still x0's continuation at vertex 1 (its origin is x0's offset
 // position), and C at vertex 0 records x0's sampled strategy (specularStrategy) and event; no random number is drawn.
@@ -591,13 +598,13 @@ bool PathTraceRadianceCacheSubstitute(uint primary, float3 position, PathTraceSu
 
 #define PathTraceRadianceCacheHarvestContinue(harvest, vertex, bsdfSample) \
     PATH_TRACE_SHARC_EXPERIMENT_C_RECORD(harvest, vertex, bsdfSample) \
-    if(vertex == 1u && PathTraceRadianceCacheSubstitute(primary, position, surface, bsdfSample, throughput, radiance, \
+    if(vertex == 1u && PATH_TRACE_SHARC_SUBSTITUTES && PathTraceRadianceCacheSubstitute(primary, position, surface, bsdfSample, throughput, radiance, \
         rayCount, extract, extraction PATH_TRACE_SHARC_EXPERIMENT_BC_ARGUMENTS(harvest) \
         PATH_TRACE_SHARC_EXPERIMENT_D_ARGUMENTS)) \
         break
 #else
 #define PathTraceRadianceCacheHarvestContinue(harvest, vertex, bsdfSample) \
-    if(vertex == 1u && PathTraceRadianceCacheSubstitute(primary, position, surface, bsdfSample, throughput, radiance, \
+    if(vertex == 1u && PATH_TRACE_SHARC_SUBSTITUTES && PathTraceRadianceCacheSubstitute(primary, position, surface, bsdfSample, throughput, radiance, \
         rayCount, extract, extraction)) break
 #endif
 #else

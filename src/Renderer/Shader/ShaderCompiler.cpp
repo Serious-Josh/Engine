@@ -548,7 +548,17 @@ ShaderLibraryProfile ShaderCompiler::GetLibraryProfile(const std::filesystem::pa
 {
     const std::filesystem::path fileName = libraryPath.filename();
 
-    if(fileName == "PathTraceReferenceSM69.hlsl" || fileName == "PathTraceReSTIRDISM69.hlsl" ||
+    if(fileName == "PathTraceReferencePsrSharcEnergyTrainingSM69.hlsl" ||
+        fileName == "PathTraceReferencePsrSharcEnergyTrainingSERSM69.hlsl" ||
+        fileName == "PathTraceReferencePsrSharcEnergyReferenceSM69.hlsl" ||
+        fileName == "PathTraceReferencePsrSharcEnergyReferenceSERSM69.hlsl" ||
+        fileName == "PathTraceReferencePsrSharcRenderSM69.hlsl" ||
+        fileName == "PathTraceReferencePsrSharcRenderSERSM69.hlsl" ||
+        fileName == "PathTraceReferencePsrSharcRenderRawDiffuseHitDistanceSM69.hlsl" ||
+        fileName == "PathTraceReferencePsrSharcRenderRawDiffuseHitDistanceSERSM69.hlsl" ||
+        fileName == "PathTraceReferencePsrSharcTrainingSM69.hlsl" ||
+        fileName == "PathTraceReferencePsrSharcTrainingSERSM69.hlsl" ||
+        fileName == "PathTraceReferenceSM69.hlsl" || fileName == "PathTraceReSTIRDISM69.hlsl" ||
         fileName == "PathTraceReferenceSERSM69.hlsl" || fileName == "PathTraceReSTIRDISERSM69.hlsl" ||
         fileName == "PathTraceReSTIRDIExtractSM69.hlsl" || fileName == "PathTraceReSTIRDIExtractSERSM69.hlsl" ||
         fileName == "PathTraceReferenceRadianceCacheDeferredSM69.hlsl" ||

@@ -97,7 +97,11 @@ namespace
                 "PathTraceReferenceRadianceCacheRenderRawDiffuseHitDistanceSERSM69.hlsl"},
             {"PathTraceReferenceRadianceCacheRenderRawDiffuseHitDistance.hlsl",
                 "PathTraceReferenceRadianceCacheRenderRawDiffuseHitDistanceSM69.hlsl",
-                "PathTraceReferenceRadianceCacheRenderRawDiffuseHitDistanceSERSM69.hlsl"}};
+                "PathTraceReferenceRadianceCacheRenderRawDiffuseHitDistanceSERSM69.hlsl"},
+            {"PathTraceReferencePsrSharcTraining.hlsl", "PathTraceReferencePsrSharcTrainingSM69.hlsl", "PathTraceReferencePsrSharcTrainingSERSM69.hlsl"},
+            {"PathTraceReferencePsrSharcRender.hlsl", "PathTraceReferencePsrSharcRenderSM69.hlsl", "PathTraceReferencePsrSharcRenderSERSM69.hlsl"},
+            {"PathTraceReferencePsrSharcRender.hlsl", "PathTraceReferencePsrSharcRenderSM69.hlsl", "PathTraceReferencePsrSharcRenderSERSM69.hlsl"},
+            {"PathTraceReferencePsrSharcRenderRawDiffuseHitDistance.hlsl", "PathTraceReferencePsrSharcRenderRawDiffuseHitDistanceSM69.hlsl", "PathTraceReferencePsrSharcRenderRawDiffuseHitDistanceSERSM69.hlsl"}};
         static_assert(std::size(paths) == static_cast<size_t>(PathTraceRadianceCacheLibrary::Count));
         size_t column = 0;
 
@@ -114,6 +118,18 @@ namespace
         }
 
         return paths[static_cast<size_t>(library)][column];
+    }
+
+    bool IsPsrCacheLibrary(PathTraceRadianceCacheLibrary library)
+    {
+        return library >= PathTraceRadianceCacheLibrary::PsrTraining && library < PathTraceRadianceCacheLibrary::Count;
+    }
+
+    PathTraceRadianceCacheLibrary PsrRenderLibrary(bool extract, bool raw)
+    {
+        return !extract ? PathTraceRadianceCacheLibrary::PsrRenderSplitIndirect : raw ?
+            PathTraceRadianceCacheLibrary::PsrRenderSplitIndirectExtractionRawDiffuseHitDistance :
+            PathTraceRadianceCacheLibrary::PsrRenderSplitIndirectExtraction;
     }
 
     // NRD.RELAX.2B: the reference library built with PATH_TRACE_RAW_DIFFUSE_HIT_DISTANCE_LIBRARY. Only its extraction
@@ -209,7 +225,8 @@ namespace
     bool IsRawDiffuseHitDistanceLibrary(PathTraceRadianceCacheLibrary library)
     {
         return library == PathTraceRadianceCacheLibrary::RenderExtractionRawDiffuseHitDistance ||
-            library == PathTraceRadianceCacheLibrary::RenderSplitIndirectExtractionRawDiffuseHitDistance;
+            library == PathTraceRadianceCacheLibrary::RenderSplitIndirectExtractionRawDiffuseHitDistance ||
+            library == PathTraceRadianceCacheLibrary::PsrRenderSplitIndirectExtractionRawDiffuseHitDistance;
     }
 
     const char* ReSTIRDIExtractionLibraryPath(PathTraceLibraryVariant variant)
@@ -318,7 +335,7 @@ namespace
         RayTracingPipelineDescription description = BuildPathTracePipelineDescription(PathTracePrimary::Raster, variant);
         description.shaderPath = RadianceCacheLibraryPath(variant, library);
 
-        if(library == PathTraceRadianceCacheLibrary::Training)
+        if(library == PathTraceRadianceCacheLibrary::Training || library == PathTraceRadianceCacheLibrary::PsrTraining)
         {
             description.rayGenerationShader = L"PathTraceRadianceCacheTrainingRayGeneration";
         }
@@ -327,17 +344,26 @@ namespace
         {
             description.rayGenerationShader = L"PathTraceRasterPrimaryExtractRayGeneration";
         }
-        else if(library == PathTraceRadianceCacheLibrary::RenderSplitIndirect)
+        else if(library == PathTraceRadianceCacheLibrary::RenderSplitIndirect ||
+            library == PathTraceRadianceCacheLibrary::PsrRenderSplitIndirect)
         {
             description.rayGenerationShader = L"PathTraceReSTIRDISplitIndirectRayGeneration";
         }
         else if(library == PathTraceRadianceCacheLibrary::RenderSplitIndirectExtraction ||
-            library == PathTraceRadianceCacheLibrary::RenderSplitIndirectExtractionRawDiffuseHitDistance)
+            library == PathTraceRadianceCacheLibrary::RenderSplitIndirectExtractionRawDiffuseHitDistance ||
+            library == PathTraceRadianceCacheLibrary::PsrRenderSplitIndirectExtraction ||
+            library == PathTraceRadianceCacheLibrary::PsrRenderSplitIndirectExtractionRawDiffuseHitDistance)
         {
             description.rayGenerationShader = L"PathTraceReSTIRDISplitIndirectExtractRayGeneration";
         }
 
         description.rootParameters.push_back({RootParameterType::ConstantBuffer, 3});
+        if(IsPsrCacheLibrary(library))
+        {
+            description.rootParameters.push_back({RootParameterType::ConstantBuffer, 4});
+            description.rootParameters.push_back({RootParameterType::ShaderResource, 2});
+            description.rasterMaterialSampler = true;
+        }
         return description;
     }
 
@@ -1939,10 +1965,11 @@ void PathTraceReferencePass::ReleasePrimarySurfaceReplacementPipelines()
     }
 
     m_psrPrimaryDiRayQueryPipelines.clear();
+    for(auto& pipeline : m_psrSharcEnergyPipelines) pipeline.Shutdown();
 
     for(RayTracingPipeline* original : {&m_psrRecordPipeline, &m_psrRasterPipeline, &m_psrGuidePipeline,
         &m_psrSplitDirectPipeline, &m_psrSplitIndirectPipeline, &m_psrGBufferDirectPipeline,
-        &m_psrGBufferIndirectPipeline, &m_psrProbePipelines[0], &m_psrProbePipelines[1],
+        &m_psrGBufferIndirectPipeline, &m_psrSharcImageProbePipeline, &m_psrSharcTrainingProbePipeline, &m_psrProbePipelines[0], &m_psrProbePipelines[1],
         &m_psrGBufferExtractDirectPipeline, &m_psrGBufferExtractIndirectPipeline, &m_psrGBufferExtractIndirectRawPipeline})
     {
         const auto found = m_psrRayQueryPipelines.find(original);
@@ -1968,6 +1995,75 @@ void PathTraceReferencePass::ReleasePrimarySurfaceReplacementPipelines()
     m_psrGBufferExtractReady[1] = false;
 }
 
+bool PathTraceReferencePass::EnsurePsrSharcProbesForTesting(GraphicsDevice& device, ShaderLibrary& shaders, std::string& failure)
+{
+    RayTracingPipeline* pipelines[] = {&m_psrSharcImageProbePipeline, &m_psrSharcTrainingProbePipeline};
+    for(int index = 0; index < 2; ++index)
+    {
+        if(pipelines[index]->IsInitialized()) continue;
+        auto description = BuildRadianceCachePipelineDescription(m_libraryVariant, index == 0 ?
+            PathTraceRadianceCacheLibrary::PsrRenderSplitIndirect : PathTraceRadianceCacheLibrary::PsrTraining);
+        description.rayGenerationShader = index == 0 ? L"PathTracePsrProbeRayGeneration" :
+            L"PathTracePsrSharcTrainingProbeRayGeneration";
+        const auto* library = AcquireLibrary(shaders, description.shaderPath);
+        if(!library || !pipelines[index]->Initialize(device.GetRayTracingDevice(), library->bytecode, description))
+        {
+            failure = "PSR + SHARC diagnostic state object failed.";
+            return false;
+        }
+    }
+    return true;
+}
+
+bool PathTraceReferencePass::EnsurePsrSharcEnergyForTesting(GraphicsDevice& device, ShaderLibrary& shaders, std::string& failure)
+{
+    const char* suffix = m_libraryVariant == PathTraceLibraryVariant::SM66 ? "" :
+        m_libraryVariant == PathTraceLibraryVariant::SM69 ? "SM69" : "SERSM69";
+    for(int index = 0; index < 2; ++index)
+    {
+        auto& pipeline = m_psrSharcEnergyPipelines[index];
+        if(pipeline.IsInitialized()) continue;
+        auto description = BuildRadianceCachePipelineDescription(m_libraryVariant, PathTraceRadianceCacheLibrary::PsrTraining);
+        description.shaderPath = std::string("PathTraceReferencePsrSharcEnergy") + (index == 0 ? "Training" : "Reference") + suffix + ".hlsl";
+        const auto* library = AcquireLibrary(shaders, description.shaderPath);
+        if(!library || !pipeline.Initialize(device.GetRayTracingDevice(), library->bytecode, description))
+        {
+            failure = "M2A energy diagnostic pipeline unavailable.";
+            return false;
+        }
+    }
+    return true;
+}
+
+bool PathTraceReferencePass::PsrSharcInfrastructureReady(bool extract, bool raw)
+{
+    const auto ready = [&](PathTraceRadianceCacheLibrary library)
+    {
+        auto& entry = m_radianceCache[static_cast<size_t>(library)];
+        return entry.ready && (!m_secondaryShadowRayQuery || library == PathTraceRadianceCacheLibrary::PsrTraining ||
+            m_psrRayQueryPipelines[&entry.pipeline] != nullptr);
+    };
+    return (extract ? IsPrimarySurfaceReplacementGBufferExtractionReady(raw) :
+        IsPrimarySurfaceReplacementGBufferReady()) && ready(PathTraceRadianceCacheLibrary::PsrTraining) &&
+        ready(PsrRenderLibrary(extract, raw));
+}
+
+bool PathTraceReferencePass::EnsurePsrSharcInfrastructure(GraphicsDevice& device, ShaderLibrary& shaders,
+    bool extract, bool raw, std::string& failure)
+{
+    if(!EnsurePrimarySurfaceReplacementGBuffer(device, shaders, failure) ||
+        (extract && !EnsurePrimarySurfaceReplacementGBufferExtraction(device, shaders, false, failure)) ||
+        (extract && raw && !EnsurePrimarySurfaceReplacementGBufferExtraction(device, shaders, true, failure)) ||
+        !EnsureRadianceCacheLearning(device, shaders, failure, PathTraceRadianceCacheLibrary::PsrTraining) ||
+        !EnsureRadianceCacheLearning(device, shaders, failure, PsrRenderLibrary(extract, raw))) return false;
+    if(!PsrSharcInfrastructureReady(extract, raw))
+    {
+        failure = "PSR + SHARC infrastructure visibility pipelines are unavailable.";
+        return false;
+    }
+    return true;
+}
+
 void PathTraceReferencePass::ExecuteRadianceCacheTraining(
     ID3D12GraphicsCommandList4* commandList,
     DescriptorHeap& descriptorHeap,
@@ -1975,10 +2071,12 @@ void PathTraceReferencePass::ExecuteRadianceCacheTraining(
     D3D12_GPU_VIRTUAL_ADDRESS constantsAddress,
     D3D12_GPU_VIRTUAL_ADDRESS sceneLightConstantsAddress,
     D3D12_GPU_VIRTUAL_ADDRESS trainingConstants,
-    std::uint32_t threads)
+    std::uint32_t threads, D3D12_GPU_VIRTUAL_ADDRESS psrConstants, D3D12_GPU_VIRTUAL_ADDRESS psrTransforms)
 {
+    if((psrConstants == 0) != (psrTransforms == 0)) return;
+    const bool psr = psrConstants != 0;
     RadianceCacheLearningPipeline& training =
-        m_radianceCache[static_cast<size_t>(PathTraceRadianceCacheLibrary::Training)];
+        m_radianceCache[static_cast<size_t>(psr ? PathTraceRadianceCacheLibrary::PsrTraining : PathTraceRadianceCacheLibrary::Training)];
 
     if(!m_initialized || !commandList || !training.ready || trainingConstants == 0 || threads == 0)
     {
@@ -1986,7 +2084,9 @@ void PathTraceReferencePass::ExecuteRadianceCacheTraining(
     }
 
     // The Raster Primary root signature: the image tables are bound but the training ray generation writes none of them.
-    training.pipeline.Bind(commandList);
+    RayTracingPipeline& trainingPipeline = psr && m_psrSharcEnergyForTesting ? m_psrSharcEnergyPipelines[0] : training.pipeline;
+    if(!trainingPipeline.IsInitialized()) return;
+    trainingPipeline.Bind(commandList);
     commandList->SetComputeRootShaderResourceView(0, rayTracingScene.GetTopLevel().GetGPUAddress());
     commandList->SetComputeRootDescriptorTable(1, descriptorHeap.GetGPUHandle(m_accumulationTexture.GetUAVIndex()));
     commandList->SetComputeRootDescriptorTable(2, descriptorHeap.GetGPUHandle(m_outputTexture.GetUAVIndex()));
@@ -1994,7 +2094,41 @@ void PathTraceReferencePass::ExecuteRadianceCacheTraining(
     commandList->SetComputeRootConstantBufferView(4, constantsAddress);
     commandList->SetComputeRootConstantBufferView(5, sceneLightConstantsAddress);
     commandList->SetComputeRootConstantBufferView(6, trainingConstants);
-    training.pipeline.Dispatch(commandList, threads, 1);
+    if(psr)
+    {
+        commandList->SetComputeRootConstantBufferView(7, psrConstants);
+        commandList->SetComputeRootShaderResourceView(8, psrTransforms);
+    }
+    trainingPipeline.Dispatch(commandList, threads, 1);
+    if(psr && m_psrSharcEnergyForTesting && m_psrSharcEnergyPipelines[1].IsInitialized())
+    {
+        m_psrSharcEnergyPipelines[1].Bind(commandList);
+        commandList->SetComputeRootShaderResourceView(0, rayTracingScene.GetTopLevel().GetGPUAddress());
+        commandList->SetComputeRootDescriptorTable(1, descriptorHeap.GetGPUHandle(m_accumulationTexture.GetUAVIndex()));
+        commandList->SetComputeRootDescriptorTable(2, descriptorHeap.GetGPUHandle(m_outputTexture.GetUAVIndex()));
+        commandList->SetComputeRootDescriptorTable(3, descriptorHeap.GetGPUHandle(m_statisticsTexture.GetUAVIndex()));
+        commandList->SetComputeRootConstantBufferView(4, constantsAddress);
+        commandList->SetComputeRootConstantBufferView(5, sceneLightConstantsAddress);
+        commandList->SetComputeRootConstantBufferView(6, trainingConstants);
+        commandList->SetComputeRootConstantBufferView(7, psrConstants);
+        commandList->SetComputeRootShaderResourceView(8, psrTransforms);
+        m_psrSharcEnergyPipelines[1].Dispatch(commandList, threads, 1);
+    }
+    if(psr && m_psrSharcTrainingProbeForTesting && m_psrSharcTrainingProbePipeline.IsInitialized())
+    {
+        // Readback follows this dispatch; the image probe and sparse probe use separate frames.
+        m_psrSharcTrainingProbePipeline.Bind(commandList);
+        commandList->SetComputeRootShaderResourceView(0, rayTracingScene.GetTopLevel().GetGPUAddress());
+        commandList->SetComputeRootDescriptorTable(1, descriptorHeap.GetGPUHandle(m_accumulationTexture.GetUAVIndex()));
+        commandList->SetComputeRootDescriptorTable(2, descriptorHeap.GetGPUHandle(m_outputTexture.GetUAVIndex()));
+        commandList->SetComputeRootDescriptorTable(3, descriptorHeap.GetGPUHandle(m_statisticsTexture.GetUAVIndex()));
+        commandList->SetComputeRootConstantBufferView(4, constantsAddress);
+        commandList->SetComputeRootConstantBufferView(5, sceneLightConstantsAddress);
+        commandList->SetComputeRootConstantBufferView(6, trainingConstants);
+        commandList->SetComputeRootConstantBufferView(7, psrConstants);
+        commandList->SetComputeRootShaderResourceView(8, psrTransforms);
+        m_psrSharcTrainingProbePipeline.Dispatch(commandList, threads, 1);
+    }
 }
 
 bool PathTraceReferencePass::EnsureRadianceCacheLearning(
@@ -2040,6 +2174,18 @@ bool PathTraceReferencePass::EnsureRadianceCacheLearning(
     {
         learning.failure = "The " + libraryName + " learning DXR pipeline could not be created" +
             TroubleshootingHint() + ".";
+    }
+
+    // Combined libraries are optional development paths. Their visibility twins must never
+    // change the ordinary SHARC/GI.6 readiness set, including a failed combined preparation.
+    if(IsPsrCacheLibrary(library))
+    {
+        const auto twin = m_rayQueryPipelines.find(&learning.pipeline);
+        if(twin != m_rayQueryPipelines.end())
+        {
+            m_psrRayQueryPipelines[&learning.pipeline] = std::move(twin->second);
+            m_rayQueryPipelines.erase(twin);
+        }
     }
 
     if(!learning.failure.empty())
@@ -2585,8 +2731,11 @@ void PathTraceReferencePass::ExecuteReSTIRDISplit(
         PathTraceRadianceCacheLibrary::RenderSplitIndirectExtraction;
     const PathTraceRadianceCacheLibrary expectedLibrary = extract ? extractionLibrary :
         PathTraceRadianceCacheLibrary::RenderSplitIndirect;
-    const bool cachedIndirect = radianceCacheConstants != 0 && radianceCacheLibrary == expectedLibrary &&
-        radianceCache.ready;
+    const bool combined = IsPsrCacheLibrary(radianceCacheLibrary) && psrGBufferConstants != 0 &&
+        psrGBufferTransforms != 0 && radianceCacheConstants != 0 &&
+        radianceCacheLibrary == PsrRenderLibrary(extract, raw) && PsrSharcInfrastructureReady(extract, raw);
+    const bool cachedIndirect = radianceCacheConstants != 0 &&
+        (radianceCacheLibrary == expectedLibrary || combined) && radianceCache.ready;
     const bool rawPipeline = raw && !cachedIndirect && m_extractSplitRawReady;
     // PSR.1c-A: without extraction or a cache library, with every PSR pipeline the frame's visibility selection needs
     // (the DI.1 twin of the direct pass, the GI.6 twins of the record and indirect passes); otherwise the production pair.
@@ -2595,7 +2744,7 @@ void PathTraceReferencePass::ExecuteReSTIRDISplit(
         m_psrRayQueryPipelines[&m_psrSplitIndirectPipeline]);
     // PSR.2 Stage 3A: without a cache library, with both of its bindings; it takes precedence over PSR.1. Stage 3B: with
     // extraction, its extraction pair (raw-distance indirect when the frame records raw distances).
-    const bool gBufferReplacement = psrGBufferConstants != 0 && psrGBufferTransforms != 0 && !cachedIndirect &&
+    const bool gBufferReplacement = psrGBufferConstants != 0 && psrGBufferTransforms != 0 && (!cachedIndirect || combined) &&
         (extract ? IsPrimarySurfaceReplacementGBufferExtractionReady(raw) : IsPrimarySurfaceReplacementGBufferReady());
     const bool replacement = !gBufferReplacement && primarySurfaceReplacement && !extract && !cachedIndirect &&
         m_psrPipelinesReady && m_psrSplitPipelinesReady && directVisibility && secondaryVisibility &&
@@ -2686,6 +2835,11 @@ void PathTraceReferencePass::ExecuteReSTIRDISplit(
     if(cachedIndirect)
     {
         commandList->SetComputeRootConstantBufferView(6, radianceCacheConstants);
+        if(combined)
+        {
+            commandList->SetComputeRootConstantBufferView(7, psrGBufferConstants);
+            commandList->SetComputeRootShaderResourceView(8, psrGBufferTransforms);
+        }
     }
     else if(gBufferReplacement)
     {
@@ -2704,15 +2858,22 @@ void PathTraceReferencePass::ExecuteReSTIRDISplit(
     m_psrGBufferWritten = gBufferReplacement;
 
     // Verification only: the recorded PSR pair's probe, with its indirect pass's bindings.
-    RayTracingPipeline& probePipeline = m_psrProbePipelines[gBufferReplacement ? 1 : 0];
+    RayTracingPipeline& probePipeline = combined ? m_psrSharcImageProbePipeline :
+        m_psrProbePipelines[gBufferReplacement ? 1 : 0];
 
-    if(m_psrProbeForTesting && (gBufferReplacement || replacement) && probePipeline.IsInitialized())
+    if(m_psrProbeForTesting && !m_psrSharcEnergyForTesting && !m_psrSharcTrainingProbeForTesting && (gBufferReplacement || replacement) && probePipeline.IsInitialized())
     {
         m_psrProbeForTesting->Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         probePipeline.Bind(commandList);
         bindSharedRootParameters();
 
-        if(gBufferReplacement)
+        if(combined)
+        {
+            commandList->SetComputeRootConstantBufferView(6, radianceCacheConstants);
+            commandList->SetComputeRootConstantBufferView(7, psrGBufferConstants);
+            commandList->SetComputeRootShaderResourceView(8, psrGBufferTransforms);
+        }
+        else if(gBufferReplacement)
         {
             commandList->SetComputeRootConstantBufferView(6, psrGBufferConstants);
             commandList->SetComputeRootShaderResourceView(7, psrGBufferTransforms);
@@ -2853,6 +3014,12 @@ void PathTraceReferencePass::ReleaseResources()
 
     for(RadianceCacheLearningPipeline& learning : m_radianceCache)
     {
+        const auto twin = m_psrRayQueryPipelines.find(&learning.pipeline);
+        if(twin != m_psrRayQueryPipelines.end())
+        {
+            if(twin->second) twin->second->Shutdown();
+            m_psrRayQueryPipelines.erase(twin);
+        }
         learning.pipeline.Shutdown();
         learning.ready = false;
         learning.failed = false;
