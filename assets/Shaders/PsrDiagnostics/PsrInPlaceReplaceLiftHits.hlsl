@@ -1,0 +1,5 @@
+// PSR.2 Stage 2 diagnostic variant (development only): reflected-ray origin 0 (lift) with per-pixel
+// hit records. See PsrInPlaceReplace.hlsl.
+#define PSR_REPLACEMENT_ORIGIN 0
+#define PSR_DIAGNOSTIC_HITS 1
+#include "../PsrInPlaceReplace.hlsl"

@@ -52,6 +52,50 @@ bool PathTraceTemporalPass::Initialize(GraphicsDevice& graphicsDevice, ShaderLib
     return true;
 }
 
+bool PathTraceTemporalPass::EnsurePsrVariant(GraphicsDevice& graphicsDevice, ShaderLibrary& shaderLibrary)
+{
+    if(m_psrVariantReady || m_psrVariantFailed)
+    {
+        return m_psrVariantReady;
+    }
+
+    ShaderDescription shaderDescription{};
+    shaderDescription.path = "PathTraceTemporalPsr.hlsl";
+    shaderDescription.entryPoint = "CSMain";
+    shaderDescription.stage = ShaderStage::Compute;
+    Shader* computeShader = shaderLibrary.Load(shaderDescription);
+
+    // The production root signature, then b2 (PsrDenoiseConstants), t0 (the replacement pass's transforms) and s0.
+    ComputePipelineDescription pipelineDescription{};
+    pipelineDescription.computeShader = computeShader;
+
+    for(std::uint32_t shaderRegister : {0u, 1u, 2u})
+    {
+        RootParameterDescription buffer{};
+        buffer.type = RootParameterType::ConstantBuffer;
+        buffer.shaderRegister = shaderRegister;
+        buffer.visibility = D3D12_SHADER_VISIBILITY_ALL;
+        pipelineDescription.rootParameters.push_back(buffer);
+    }
+
+    RootParameterDescription transforms{};
+    transforms.type = RootParameterType::ShaderResource;
+    transforms.shaderRegister = 0;
+    transforms.visibility = D3D12_SHADER_VISIBILITY_ALL;
+    pipelineDescription.rootParameters.push_back(transforms);
+    pipelineDescription.staticSamplers.push_back(PsrDenoiseMirrorSampler(0));
+
+    if(!computeShader || !m_psrPipeline.Initialize(graphicsDevice.GetDevice(), pipelineDescription))
+    {
+        Log::Error("The PSR.2 path tracing temporal pass could not be created.");
+        m_psrVariantFailed = true;
+        return false;
+    }
+
+    m_psrVariantReady = true;
+    return true;
+}
+
 bool PathTraceTemporalPass::EnsureHistory(
     ID3D12Device* device,
     DescriptorHeap& descriptorHeap,
@@ -134,6 +178,9 @@ void PathTraceTemporalPass::Shutdown()
 {
     ReleaseHistory();
     m_pipeline.Shutdown();
+    m_psrPipeline.Shutdown();
+    m_psrVariantReady = false;
+    m_psrVariantFailed = false;
     m_initialized = false;
     m_initializationFailed = false;
 }
@@ -151,7 +198,9 @@ void PathTraceTemporalPass::Execute(
     unsigned int width,
     unsigned int height,
     D3D12_GPU_VIRTUAL_ADDRESS priorCacheBinding,
-    bool extended)
+    bool extended,
+    D3D12_GPU_VIRTUAL_ADDRESS psrConstants,
+    D3D12_GPU_VIRTUAL_ADDRESS psrTransforms)
 {
     if(!m_initialized || !commandList || !m_diffuse[0].GetResource() || width != m_width || height != m_height)
     {
@@ -197,11 +246,21 @@ void PathTraceTemporalPass::Execute(
         return;
     }
 
-    m_pipeline.Bind(commandList);
+    // PSR.2 Stage 3B: the PSR variant on frames that light replaced pixels.
+    const bool psr = psrConstants != 0 && psrTransforms != 0 && m_psrVariantReady;
+    (psr ? m_psrPipeline : m_pipeline).Bind(commandList);
     commandList->SetComputeRootConstantBufferView(0, constantsAddress);
     // Without a prior the shader never reads b1; the constants stand in for it.
     commandList->SetComputeRootConstantBufferView(1,
         constants.priorIndex != 0 && priorCacheBinding != 0 ? priorCacheBinding : constantsAddress);
+
+    if(psr)
+    {
+        commandList->SetComputeRootConstantBufferView(2, psrConstants);
+        commandList->SetComputeRootShaderResourceView(3, psrTransforms);
+    }
+
+    m_psrLastFrame = psr;
     commandList->Dispatch((width + 7u) / 8u, (height + 7u) / 8u, 1);
 
     m_diffuse[writeSlot].Transition(commandList, shaderRead);

@@ -37,6 +37,14 @@ bool Pipeline::Initialize(
             parameter.Descriptor.RegisterSpace = 0;
             break;
         }
+
+        case RootParameterType::ShaderResource:
+        {
+            parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+            parameter.Descriptor.ShaderRegister = parameterDescription.shaderRegister;
+            parameter.Descriptor.RegisterSpace = 0;
+            break;
+        }
         }
 
         rootParameters.push_back(parameter);

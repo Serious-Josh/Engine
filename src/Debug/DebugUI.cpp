@@ -1119,6 +1119,7 @@ PathTraceReferenceSettings DebugUI::GetPathTraceReferenceSettings() const
     settings.maxPathDepth = static_cast<std::uint32_t>(m_pathTraceMaxPathDepth);
     settings.russianRouletteDepth = static_cast<std::uint32_t>(m_pathTraceRussianRouletteDepth);
     settings.maxAccumulatedSamples = static_cast<std::uint32_t>(m_pathTraceMaxAccumulatedSamples);
+    settings.primarySurfaceReplacementInPlace = m_primarySurfaceReplacementInPlace;
     return settings;
 }
 
@@ -1213,18 +1214,6 @@ void DebugUI::SetPathTraceReferenceStatus(
     m_pathTraceResourceBytes = resourceBytes;
 }
 
-void DebugUI::SetPathTraceRasterPrimaryStatus(PathTraceRasterPrimaryAvailability availability, const std::string& reason)
-{
-    m_rasterPrimaryAvailability = availability;
-    m_rasterPrimaryReason = reason;
-}
-
-void DebugUI::SetPathTraceReSTIRDIStatus(PathTraceRasterPrimaryAvailability availability, const std::string& reason)
-{
-    m_restirDIAvailability = availability;
-    m_restirDIReason = reason;
-}
-
 void DebugUI::SetLightingModeTransitionStatus(const LightingModeTransitionStatus& status)
 {
     m_lightingTransition = status;
@@ -1317,12 +1306,19 @@ void DebugUI::DrawPathTraceReferenceSettings()
 {
     ImGui::TextUnformatted("Lighting mode (experimental, not saved)");
 
-    const char* modes[] = {"Legacy", "Path Traced Reference", "Path Traced Raster Primary",
-        "Path Traced Raster Primary + ReSTIR DI"};
+    // m_lightingMode keeps the RendererLightingMode values (GetLightingMode): 0, 1, and 3 for Path Tracing (the
+    // raster-primary ReSTIR DI mode). Standalone Raster Primary (2) is verification-only and never selected here.
+    const char* modes[] = {"Legacy", "Reference Path Tracer", "Path Tracing"};
+    int modeSelection = m_lightingMode == 3 ? 2 : m_lightingMode;
     // While the Renderer prepares the requested mode, the selector shows it and accepts no other request.
     const bool preparing = IsLightingModePreparing(m_lightingTransition.stage);
     ImGui::BeginDisabled(preparing);
-    ImGui::Combo("Lighting mode", &m_lightingMode, modes, IM_ARRAYSIZE(modes));
+
+    if(ImGui::Combo("Lighting mode", &modeSelection, modes, IM_ARRAYSIZE(modes)))
+    {
+        m_lightingMode = modeSelection == 2 ? 3 : modeSelection;
+    }
+
     ImGui::EndDisabled();
 
     // Final display mapping only, in every lighting mode; switching keeps the HDR image and accumulation.
@@ -1361,7 +1357,11 @@ void DebugUI::DrawPathTraceReferenceSettings()
         m_lightingTransition.active == RendererLightingMode::PathTracedRasterPrimaryReSTIRDI ?
         primaryDiVisibilityModes[m_primaryDiShadowActive ? 1 : 0] : "Not in use");
 
-    if(m_lightingMode == 3 && m_primaryDiShadowFailed)
+    if(m_lightingMode == 3 && m_primaryDiShadowSerWorkaround)
+    {
+        ImGui::TextDisabled("SER compatibility: DI.1 RayQuery visibility is wrong with SM 6.9 + SER; TraceRay used.");
+    }
+    else if(m_lightingMode == 3 && m_primaryDiShadowFailed)
     {
         ImGui::TextDisabled("DI.1 pipelines failed (see the DI.1 log warning); original retained.");
     }
@@ -1397,8 +1397,35 @@ void DebugUI::DrawPathTraceReferenceSettings()
         m_pathTraceMaxAccumulatedSamples = m_pathTraceSamplesPerFrame;
     }
 
-    const bool rasterPrimary = m_lightingMode == 2;
-    const bool restirDI = m_lightingMode == 3;
+    // PSR.2 development prototype: production lighting does not interpret replaced pixels yet. The PSR.1 reference
+    // settings (primarySurfaceReplacement, its guides) are set only by the verification harnesses.
+    ImGui::Checkbox("PT PSR in-place replacement (dev)", &m_primarySurfaceReplacementInPlace);
+
+    if(m_primarySurfaceReplacementInPlace)
+    {
+        if(!m_psrLightingRequested)
+        {
+            ImGui::TextWrapped("Inactive: select the Path Tracing (ReSTIR DI) lighting mode.");
+        }
+        else if(!m_psrLightingUnavailable.empty())
+        {
+            ImGui::TextWrapped("Reflections not lit: %s. Mirrors render normally; a debug view still shows the "
+                "replacement.", m_psrLightingUnavailable.c_str());
+        }
+        else
+        {
+            ImGui::TextDisabled("Active: reflected surfaces are lit.");
+        }
+        const char* psrDebugViews[] = {"Off", "Replacement Mask", "Reflected Normals", "Reflected Albedo"};
+        ImGui::Combo("PSR Debug View", &m_psrDebugView, psrDebugViews, IM_ARRAYSIZE(psrDebugViews));
+
+        if(m_psrDebugView == 1)
+        {
+            ImGui::TextDisabled("Green replaced, red fallback, yellow pass did not run, magenta invalid.");
+        }
+    }
+
+    const bool pathTracing = m_lightingMode == 3;
 
     ImGui::SeparatorText("DLSS Super Resolution");
     ImGui::Checkbox("Enable DLSS Super Resolution", &m_dlssEnabled);
@@ -1422,8 +1449,8 @@ void DebugUI::DrawPathTraceReferenceSettings()
         ImGui::TreePop();
     }
 
-    // SHARC.4E.1 / 5B: the denoiser and SHARC serve both raster-primary modes.
-    if (rasterPrimary || restirDI)
+    // SHARC.4E.1 / 5B: the denoiser and SHARC serve Path Tracing.
+    if (pathTracing)
     {
         // UPSCALING.2B (experimental, off by default): diagnostics for future temporal upscaling.
         ImGui::Checkbox("PT camera jitter (experimental)", &m_pathTraceCameraJitter);
@@ -1438,8 +1465,7 @@ void DebugUI::DrawPathTraceReferenceSettings()
         // (experimental); NRD.RELAX.4: RELAX (experimental); HYBRID.5: the hybrid (experimental).
         const char* denoiserModes[] = {"Off", "Engine", "NRD REBLUR (experimental)", "NRD RELAX (experimental)",
                                        "NRD Hybrid (experimental)"};
-        // Until a choice is made the lighting mode's default is shown (Hybrid with ReSTIR DI, Engine otherwise);
-        // choosing one keeps it for both raster-primary modes.
+        // Until a choice is made Path Tracing's default (Hybrid) is shown.
         int denoiserMode = static_cast<int>(GetSelectedPathTraceDenoiserMode());
 
         if (ImGui::Combo("PT denoiser", &denoiserMode, denoiserModes, IM_ARRAYSIZE(denoiserModes)))
@@ -1497,15 +1523,12 @@ void DebugUI::DrawPathTraceReferenceSettings()
     {
         // Explained above, next to the selector.
     }
-    else if (rasterPrimary && m_rasterPrimaryAvailability == PathTraceRasterPrimaryAvailability::Unavailable)
+    else if (const PathTraceModeAvailability pathTracingStatus = GetReSTIRDIAvailability(m_rasterPrimaryStatus);
+        pathTracing && pathTracingStatus.availability == PathTraceRasterPrimaryAvailability::Unavailable)
     {
-        ImGui::TextWrapped("Unavailable, rendering Legacy: %s", m_rasterPrimaryReason.c_str());
+        ImGui::TextWrapped("Unavailable, rendering Legacy: %s", pathTracingStatus.reason.c_str());
     }
-    else if (restirDI && m_restirDIAvailability == PathTraceRasterPrimaryAvailability::Unavailable)
-    {
-        ImGui::TextWrapped("Unavailable, rendering Legacy: %s", m_restirDIReason.c_str());
-    }
-    else if (!rasterPrimary && !restirDI && m_pathTraceAvailability == PathTraceReferenceAvailability::Unavailable)
+    else if (!pathTracing && m_pathTraceAvailability == PathTraceReferenceAvailability::Unavailable)
     {
         ImGui::TextWrapped("Unavailable, rendering Legacy: %s", m_pathTraceUnavailableReason.c_str());
     }
@@ -1523,7 +1546,7 @@ void DebugUI::DrawPathTraceReferenceSettings()
 
     // R.9I.3: added to the undenoised path-traced image, which keeps its own naturally sampled caustics. Restricted
     // domain (registered static reflector/receiver, one point light, PT denoiser Off); refusals render unchanged.
-    if (m_lightingMode >= 1 && m_lightingMode <= 3)
+    if (m_lightingMode == 1 || m_lightingMode == 3)
     {
         ImGui::SeparatorText("Dedicated Caustics");
         if (ImGui::Checkbox("Dedicated caustics (experimental)", &m_dedicatedCaustics) && m_dedicatedCaustics)

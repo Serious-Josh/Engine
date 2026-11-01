@@ -6,6 +6,10 @@
 
 // RTXPT.1 renderer lighting mode. Selected per frame through RendererOptions; never serialized into
 // scenes, projects or cooked archives. Legacy is the default everywhere.
+// The Editor offers Legacy, "Reference Path Tracer" (PathTracedReference) and "Path Tracing"
+// (PathTracedRasterPrimaryReSTIRDI). PathTracedRasterPrimary (exhaustive primary direct lighting) is retired from the
+// Editor and kept only for the verification harnesses (RTXPT.2/3 baselines, PSR.1a/1b, the dense SHARC diagnostics); the
+// values are unchanged.
 enum class RendererLightingMode
 {
     Legacy,
@@ -55,6 +59,19 @@ struct PathTraceReferenceSettings
 
     // Independent runtime-only selection: DI.1 RayQuery by default; TraceRay retained for comparison and fallback.
     bool primaryDiShadowRayQuery = true;
+
+    // PSR.1a development toggle: primary surface replacement through pure-delta vertex-0 mirrors, Raster Primary with the
+    // denoiser Off and no SHARC only. Part of the accumulation key, so a change restarts accumulation.
+    bool primarySurfaceReplacement = false;
+
+    // PSR.1b development toggle (requires primarySurfaceReplacement): the guide pass, which writes the same records plus
+    // virtual surface guides and motion. No consumer reads the guides yet, so the image is unchanged.
+    bool primarySurfaceReplacementGuides = false;
+
+    // PSR.2 development prototype (default off; an Editor dev toggle): on Path Tracing (ReSTIR DI) frames the geometry
+    // pass marks PSR-eligible mirrors in identity.x bit 31 and PsrInPlaceReplacePass overwrites their G-buffer pixels
+    // with the reflected surface. Lighting consumers do not decode it yet, so lit images are invalid.
+    bool primarySurfaceReplacementInPlace = false;
 
     bool operator==(const PathTraceReferenceSettings&) const = default;
 };
@@ -147,3 +164,39 @@ enum class PathTraceRasterPrimaryAvailability
     Unavailable,
     Available
 };
+
+// One availability assessment and, when unavailable, why.
+struct PathTraceModeAvailability
+{
+    PathTraceRasterPrimaryAvailability availability = PathTraceRasterPrimaryAvailability::NotRequested;
+    std::string reason;
+
+    bool operator==(const PathTraceModeAvailability&) const = default;
+};
+
+// The raster-primary capability of the renderer, for the Editor and diagnostics. Values only. rasterPrimary is every
+// shared prerequisite (it alone gates the exhaustive estimator, PathTracedRasterPrimary); restirDI is what ReSTIR DI
+// needs beyond it (its pipelines, the RTXDI resources and its DXR library preparation), assessed only once
+// rasterPrimary is available.
+struct PathTraceRasterPrimaryStatus
+{
+    PathTraceModeAvailability rasterPrimary;
+    PathTraceModeAvailability restirDI;
+};
+
+// PathTracedRasterPrimaryReSTIRDI's availability: its own failure, else the shared prerequisites' failure, else its own
+// assessment.
+inline PathTraceModeAvailability GetReSTIRDIAvailability(const PathTraceRasterPrimaryStatus& status)
+{
+    if(status.restirDI.availability == PathTraceRasterPrimaryAvailability::Unavailable)
+    {
+        return status.restirDI;
+    }
+
+    if(status.rasterPrimary.availability == PathTraceRasterPrimaryAvailability::Unavailable)
+    {
+        return {PathTraceRasterPrimaryAvailability::Unavailable, "Raster primary unavailable: " + status.rasterPrimary.reason};
+    }
+
+    return status.restirDI;
+}

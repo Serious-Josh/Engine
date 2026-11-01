@@ -110,15 +110,13 @@ struct RadianceCacheD6Binding
     uint staleFrames;
     uint learning;
     // SHARC.4D-P profiling controls (diagnostics; 0 = production behaviour). learningThinning: 1 in N 8 x 8 pixel
-    // blocks learn per frame. harvestStop: 1 claims slots without accumulating, 2 computes the sample without
-    // claiming, 3 tracks the harvest state only, 4 makes no path active, 5 also skips the end-of-path epilogue,
-    // 6 looks the vertex-1 entry up (result discarded, nothing inserted), 7 stores each path's raw sample record with
-    // plain stores (the cost of deferring insertion to another pass; the accumulation buffer is scratch).
+    // blocks learn per frame. harvestStop: 4 or 5 makes no path active. (The other stops profiled the removed inline
+    // insertion.)
     uint learningThinning;
     uint harvestStop;
 
     // SHARC.4D-Q deferred insertion: the record buffer (UAV), its capacity in records, this learning frame's stamp
-    // sequence, and whether the ray generation stores records (1) instead of inserting at the end of each path (0).
+    // sequence, and whether this frame stores records (1 on every learning frame; 0 outside learning).
     uint recordsIndex;
     uint recordCapacity;
     uint recordSequence;

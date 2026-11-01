@@ -202,7 +202,18 @@ class PathTraceSpatialPass
         const PathTraceSpatialConstants& constants,
         std::uint32_t iterations,
         unsigned int width,
-        unsigned int height);
+        unsigned int height,
+        D3D12_GPU_VIRTUAL_ADDRESS psrConstants = 0,
+        D3D12_GPU_VIRTUAL_ADDRESS psrTransforms = 0);
+
+    // PSR.2 Stage 3B: creates, on first use, the a-trous PSR variants (PathTraceSpatialAtrousPsr.hlsl). ExecuteAtrous with
+    // both PSR addresses then records them. A failure is sticky.
+    bool EnsureAtrousPsrVariant(GraphicsDevice& graphicsDevice, ShaderLibrary& shaderLibrary);
+
+    bool RecordedAtrousPsrVariant() const
+    {
+        return m_atrousPsrLastFrame;
+    }
 
     Texture& GetIntermediateDiffuse()
     {
@@ -232,6 +243,11 @@ class PathTraceSpatialPass
     // RTXPT D.3C.2 a-trous: [0] first iteration to the intermediate, [1] first iteration to the presentation, [2]
     // second iteration, [3] and [4] the diagnostic variants of [1] and [2].
     ComputePipeline m_atrousPipelines[5];
+    // PSR.2 Stage 3B: the same five with PATH_TRACE_PSR_DENOISE.
+    ComputePipeline m_atrousPsrPipelines[5];
+    bool m_atrousPsrInitialized = false;
+    bool m_atrousPsrFailed = false;
+    bool m_atrousPsrLastFrame = false;
     bool m_atrousInitialized = false;
     bool m_atrousInitializationFailed = false;
     Texture m_intermediateDiffuse;

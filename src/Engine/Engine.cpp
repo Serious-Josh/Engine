@@ -2275,7 +2275,8 @@ void Engine::Frame()
 
     const PathTraceReferenceStatus& pathTraceStatus = m_renderer.GetPathTraceReferenceStatus();
     debugUI.SetPrimaryDiShadowVisibilityStatus(pathTraceStatus.primaryDiShadowRayQueryReady,
-        pathTraceStatus.primaryDiShadowRayQueryActive, pathTraceStatus.primaryDiShadowRayQueryFailed);
+        pathTraceStatus.primaryDiShadowRayQueryActive, pathTraceStatus.primaryDiShadowRayQueryFailed,
+        pathTraceStatus.primaryDiShadowRayQuerySerWorkaround);
     debugUI.SetSecondaryShadowVisibilityStatus(pathTraceStatus.secondaryShadowRayQueryReady,
         pathTraceStatus.secondaryShadowRayQueryActive,
         pathTraceStatus.visibilityTimingEpoch + m_renderer.GetShaderLibrary().GetLibraryCompileCount());
@@ -2291,11 +2292,8 @@ void Engine::Frame()
     debugUI.SetPixelCausticsStatus(m_renderer.GetPixelCausticsReason(), pixelCausticPass.GetVerifiedSeams(),
         pixelCausticPass.GetSeamVisits(), pixelCausticPass.GetCompletedFrames(), pixelCausticPass.GetFaultedFrames(),
         pixelCausticPass.GetLastCompletedFaults(), pixelCausticPass.GetResourceBytes());
-    const PathTraceRasterPrimaryStatus& rasterPrimaryStatus = m_renderer.GetPathTraceRasterPrimaryStatus();
-    debugUI.SetPathTraceRasterPrimaryStatus(rasterPrimaryStatus.availability, rasterPrimaryStatus.reason);
+    debugUI.SetPathTraceRasterPrimaryStatus(m_renderer.GetPathTraceRasterPrimaryCapability());
     debugUI.SetSharcStatus(m_renderer.GetSharcStatus());
-    const PathTraceRasterPrimaryStatus& restirDIStatus = m_renderer.GetPathTraceReSTIRDIStatus();
-    debugUI.SetPathTraceReSTIRDIStatus(restirDIStatus.availability, restirDIStatus.reason);
     // The snapshot of the last recording; this frame's request reaches the Renderer after the UI is drawn.
     debugUI.SetLightingModeTransitionStatus(m_renderer.GetLightingModeTransitionStatus());
     debugUI.DrawPerformanceWindow(environmentNames, m_renderer.GetCurrentEnvironmentIndex(),

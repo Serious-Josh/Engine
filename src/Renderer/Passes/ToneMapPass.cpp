@@ -1,6 +1,7 @@
 #include "ToneMapPass.h"
 
 #include "Core/Log.h"
+#include "Renderer/GBuffer.h"
 #include "Renderer/RenderTarget.h"
 #include "Renderer/Texture.h"
 #include "Renderer/Shader/ShaderLibrary.h"
@@ -45,7 +46,7 @@ bool ToneMapPass::Initialize(
 
     pipelineDescription.renderTargets.formats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
 
-    pipelineDescription.rootParameters.push_back({RootParameterType::Constants, 0, 12, D3D12_SHADER_VISIBILITY_PIXEL});
+    pipelineDescription.rootParameters.push_back({RootParameterType::Constants, 0, 16, D3D12_SHADER_VISIBILITY_PIXEL});
 
     if (!m_pipeline.Initialize(device, pipelineDescription))
     {
@@ -70,9 +71,18 @@ void ToneMapPass::Execute(
     unsigned int outlineThickness,
     unsigned int debugDepthIndex,
     ToneMapOperator toneMapOperator,
-    unsigned int exposureStateIndex)
+    unsigned int exposureStateIndex,
+    GBuffer* psrGBuffer,
+    bool psrReplacementRan)
 {
     sceneColor.Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+
+    if (psrGBuffer)
+    {
+        psrGBuffer->GetSurface().Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        psrGBuffer->GetMaterial().Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        psrGBuffer->GetIdentity().Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    }
 
     if (debugTexture)
     {
@@ -106,6 +116,11 @@ void ToneMapPass::Execute(
         unsigned int debugDepthIndex;
         float outlineColor[3];
         unsigned int toneMapOperator;
+
+        unsigned int psrSurfaceIndex;
+        unsigned int psrMaterialIndex;
+        unsigned int psrIdentityIndex;
+        unsigned int psrReplacementRan;
     };
 
 #ifdef NDEBUG
@@ -134,8 +149,18 @@ void ToneMapPass::Execute(
         debugView == ToneMapDebugView::HDRIDirectIntegralMip4 || debugView == ToneMapDebugView::HDRIDirectIntegralMip6 ||
         debugView == ToneMapDebugView::ShadingNormalViewHorizon ||
         debugView == ToneMapDebugView::PathTraceDenoiserScalar;
-    constants.debugView =
-        (debugTexture || debugRenderTarget || lightingDebug) ? static_cast<unsigned int>(debugView) : 0;
+    const bool psrDebug = debugView == ToneMapDebugView::PsrReplacementMask ||
+        debugView == ToneMapDebugView::PsrReflectedNormal || debugView == ToneMapDebugView::PsrReflectedAlbedo;
+    constants.debugView = (psrDebug ? psrGBuffer != nullptr : (debugTexture || debugRenderTarget || lightingDebug)) ?
+        static_cast<unsigned int>(debugView) : 0;
+
+    if (psrDebug && psrGBuffer)
+    {
+        constants.psrSurfaceIndex = psrGBuffer->GetSurface().GetSRVIndex();
+        constants.psrMaterialIndex = psrGBuffer->GetMaterial().GetSRVIndex();
+        constants.psrIdentityIndex = psrGBuffer->GetIdentity().GetSRVIndex();
+        constants.psrReplacementRan = psrReplacementRan ? 1u : 0u;
+    }
     constants.nrdDenoisingRange = nrdDenoisingRange;
     constants.selectionMaskIndex = selectionMask ? selectionMask->GetSRVIndex() : 0;
     constants.outlineThickness = selectionMask ? outlineThickness : 0;
@@ -146,7 +171,7 @@ void ToneMapPass::Execute(
 
     constants.toneMapOperator = static_cast<unsigned int>(toneMapOperator);
 
-    commandList->SetGraphicsRoot32BitConstants(0, 12, &constants, 0);
+    commandList->SetGraphicsRoot32BitConstants(0, 16, &constants, 0);
 
     commandList->DrawInstanced(3, 1, 0, 0);
 }

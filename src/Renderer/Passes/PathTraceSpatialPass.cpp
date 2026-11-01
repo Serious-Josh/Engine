@@ -103,6 +103,62 @@ bool PathTraceSpatialPass::InitializeAtrous(GraphicsDevice& graphicsDevice, Shad
     return true;
 }
 
+bool PathTraceSpatialPass::EnsureAtrousPsrVariant(GraphicsDevice& graphicsDevice, ShaderLibrary& shaderLibrary)
+{
+    if(m_atrousPsrInitialized || m_atrousPsrFailed)
+    {
+        return m_atrousPsrInitialized;
+    }
+
+    const char* entryPoints[5] = {"CSFirst", "CSFirstPresent", "CSSecond", "CSFirstPresentDiagnostic",
+        "CSSecondDiagnostic"};
+
+    for(int index = 0; index < 5; ++index)
+    {
+        ShaderDescription shaderDescription{};
+        shaderDescription.path = "PathTraceSpatialAtrousPsr.hlsl";
+        shaderDescription.entryPoint = entryPoints[index];
+        shaderDescription.stage = ShaderStage::Compute;
+        Shader* computeShader = shaderLibrary.Load(shaderDescription);
+
+        // The production root signature, then b1 (PsrDenoiseConstants), t0 (the replacement pass's transforms) and s0.
+        ComputePipelineDescription pipelineDescription{};
+        pipelineDescription.computeShader = computeShader;
+
+        for(std::uint32_t shaderRegister : {0u, 1u})
+        {
+            RootParameterDescription buffer{};
+            buffer.type = RootParameterType::ConstantBuffer;
+            buffer.shaderRegister = shaderRegister;
+            buffer.visibility = D3D12_SHADER_VISIBILITY_ALL;
+            pipelineDescription.rootParameters.push_back(buffer);
+        }
+
+        RootParameterDescription transforms{};
+        transforms.type = RootParameterType::ShaderResource;
+        transforms.shaderRegister = 0;
+        transforms.visibility = D3D12_SHADER_VISIBILITY_ALL;
+        pipelineDescription.rootParameters.push_back(transforms);
+        pipelineDescription.staticSamplers.push_back(PsrDenoiseMirrorSampler(0));
+
+        if(!computeShader || !m_atrousPsrPipelines[index].Initialize(graphicsDevice.GetDevice(), pipelineDescription))
+        {
+            Log::Error("The PSR.2 a-trous pipelines could not be created.");
+
+            for(ComputePipeline& pipeline : m_atrousPsrPipelines)
+            {
+                pipeline.Shutdown();
+            }
+
+            m_atrousPsrFailed = true;
+            return false;
+        }
+    }
+
+    m_atrousPsrInitialized = true;
+    return true;
+}
+
 bool PathTraceSpatialPass::EnsureIntermediate(
     ID3D12Device* device,
     DescriptorHeap& descriptorHeap,
@@ -161,9 +217,15 @@ void PathTraceSpatialPass::ExecuteAtrous(
     const PathTraceSpatialConstants& spatial,
     std::uint32_t iterations,
     unsigned int width,
-    unsigned int height)
+    unsigned int height,
+    D3D12_GPU_VIRTUAL_ADDRESS psrConstants,
+    D3D12_GPU_VIRTUAL_ADDRESS psrTransforms)
 {
     const bool twoIterations = iterations >= 2u;
+    // PSR.2 Stage 3B: the PSR variants on frames that light replaced pixels.
+    const bool psr = psrConstants != 0 && psrTransforms != 0 && m_atrousPsrInitialized;
+    ComputePipeline* pipelines = psr ? m_atrousPsrPipelines : m_atrousPipelines;
+    m_atrousPsrLastFrame = psr;
 
     if(!m_atrousInitialized || !commandList || width == 0 || height == 0 ||
         (twoIterations && (!m_intermediateDiffuse.GetResource() || m_intermediateWidth != width ||
@@ -222,13 +284,20 @@ void PathTraceSpatialPass::ExecuteAtrous(
 
         pipeline.Bind(commandList);
         commandList->SetComputeRootConstantBufferView(0, address);
+
+        if(psr)
+        {
+            commandList->SetComputeRootConstantBufferView(1, psrConstants);
+            commandList->SetComputeRootShaderResourceView(2, psrTransforms);
+        }
+
         commandList->Dispatch(groupsX, groupsY, 1);
         return true;
     };
 
     if(!twoIterations)
     {
-        dispatch(m_atrousPipelines[diagnostics ? 3 : 1], constants);
+        dispatch(pipelines[diagnostics ? 3 : 1], constants);
         return;
     }
 
@@ -241,7 +310,7 @@ void PathTraceSpatialPass::ExecuteAtrous(
     first.intermediateDiffuseIndex = m_intermediateDiffuse.GetUAVIndex();
     first.intermediateSpecularIndex = m_intermediateSpecular.GetUAVIndex();
 
-    if(!dispatch(m_atrousPipelines[0], first))
+    if(!dispatch(pipelines[0], first))
     {
         return;
     }
@@ -251,7 +320,7 @@ void PathTraceSpatialPass::ExecuteAtrous(
     PathTraceAtrousConstants second = constants;
     second.intermediateDiffuseIndex = m_intermediateDiffuse.GetDescriptorIndex();
     second.intermediateSpecularIndex = m_intermediateSpecular.GetDescriptorIndex();
-    dispatch(m_atrousPipelines[diagnostics ? 4 : 2], second);
+    dispatch(pipelines[diagnostics ? 4 : 2], second);
 }
 
 void PathTraceSpatialPass::Shutdown()
@@ -263,6 +332,13 @@ void PathTraceSpatialPass::Shutdown()
         pipeline.Shutdown();
     }
 
+    for(ComputePipeline& pipeline : m_atrousPsrPipelines)
+    {
+        pipeline.Shutdown();
+    }
+
+    m_atrousPsrInitialized = false;
+    m_atrousPsrFailed = false;
     m_atrousInitialized = false;
     m_atrousInitializationFailed = false;
     m_pipeline.Shutdown();

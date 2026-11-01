@@ -1,4 +1,5 @@
 #include "MaterialLighting.hlsli"
+#include "PsrEligibility.hlsli"
 
 #define DEBUG_DISPLACEMENT_TEST_LOD 1
 
@@ -58,6 +59,12 @@ cbuffer CameraConstants : register(b1)
     row_major float4x4 unjitteredViewProjection;
     // UPSCALING.3D: material texture mip bias, non-zero only while DLSS reconstructs the frame (0 keeps Sample).
     float textureMipBias;
+    // PSR.2: non-zero only on Path Tracing frames with in-place replacement enabled: identity.x bit 31 marks
+    // PSR-eligible mirrors (PsrEligibility.hlsli). The path tracer's camera for the decode it evaluates.
+    uint psrEligibility;
+    uint2 psrResolution;
+    row_major float4x4 psrInverseCameraRelativeViewProjection;
+    float3 psrCameraPosition;
 }
 
 float4 SampleMaterialTexture(Texture2D<float4> materialTexture, SamplerState materialSampler, float2 uv)
@@ -653,6 +660,21 @@ PSOutput PSMain(VSOutput input, uint primitiveID : SV_PrimitiveID)
     output.motion = float4(0.0f, 0.0f, 0.0f, 0.0f);
     output.identity = rasterInstance == 0xFFFFFFFFu ? uint2(0xFFFFFFFFu, 0xFFFFFFFFu) :
         uint2(rasterInstance + 1u, rasterPrimitiveBase + primitiveID);
+
+    if(psrEligibility != 0u && rasterInstance != 0xFFFFFFFFu)
+    {
+        PathTracePrimaryCamera camera;
+        camera.inverseCameraRelativeViewProjection = psrInverseCameraRelativeViewProjection;
+        camera.cameraPosition = psrCameraPosition;
+        camera.resolution = psrResolution;
+        StructuredBuffer<GPUMaterial> materials = ResourceDescriptorHeap[materialBufferIndex];
+
+        if(PsrRasterEligible(uint2(input.position.xy), input.position.z, output.material, output.surface,
+            output.geometricNormal, camera, materials))
+        {
+            output.identity.x |= PSR_IDENTITY_ELIGIBLE;
+        }
+    }
 
     if(all(isfinite(input.currentClipPosition)) &&
        all(isfinite(input.previousClipPosition)) &&

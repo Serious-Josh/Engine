@@ -10,12 +10,13 @@
 
 namespace
 {
-    // signalViewConstants: a second root constant buffer at b1 (CSResolveRelaxSignalView only).
+    // signalViewConstants: a second root constant buffer at b1 (CSResolveRelaxSignalView only). psr: the
+    // NrdPathTracePreparePsr.hlsl variant, with b1 (PsrDenoiseConstants), t0 (the replacement pass's transforms) and s0.
     bool CreatePipeline(GraphicsDevice& graphicsDevice, ShaderLibrary& shaderLibrary, const char* entryPoint,
-        ComputePipeline& pipeline, bool signalViewConstants = false)
+        ComputePipeline& pipeline, bool signalViewConstants = false, bool psr = false)
     {
         ShaderDescription shaderDescription{};
-        shaderDescription.path = "NrdPathTracePrepare.hlsl";
+        shaderDescription.path = psr ? "NrdPathTracePreparePsr.hlsl" : "NrdPathTracePrepare.hlsl";
         shaderDescription.entryPoint = entryPoint;
         shaderDescription.stage = ShaderStage::Compute;
         Shader* computeShader = shaderLibrary.Load(shaderDescription);
@@ -29,10 +30,20 @@ namespace
         constants.visibility = D3D12_SHADER_VISIBILITY_ALL;
         pipelineDescription.rootParameters.push_back(constants);
 
-        if(signalViewConstants)
+        if(signalViewConstants || psr)
         {
             constants.shaderRegister = 1;
             pipelineDescription.rootParameters.push_back(constants);
+        }
+
+        if(psr)
+        {
+            RootParameterDescription transforms{};
+            transforms.type = RootParameterType::ShaderResource;
+            transforms.shaderRegister = 0;
+            transforms.visibility = D3D12_SHADER_VISIBILITY_ALL;
+            pipelineDescription.rootParameters.push_back(transforms);
+            pipelineDescription.staticSamplers.push_back(PsrDenoiseMirrorSampler(0));
         }
 
         return computeShader && pipeline.Initialize(graphicsDevice.GetDevice(), pipelineDescription);
@@ -168,11 +179,52 @@ void NrdPathTracePreparePass::Shutdown()
     m_resolvePipeline.Shutdown();
     m_denoisedResolvePipeline.Shutdown();
     m_signalViewPipeline.Shutdown();
+    m_psrPreparePipeline.Shutdown();
+    m_psrResolvePipeline.Shutdown();
+    m_psrDenoisedResolvePipeline.Shutdown();
+    m_psrInitialized = false;
+    m_psrFailed = false;
+    m_psrPreparedLastDispatch = false;
     m_initialized = false;
     m_initializationFailed = false;
     m_signalViewReady = false;
     m_signalViewFailed = false;
     m_encoding = Encoding::Reblur;
+}
+
+bool NrdPathTracePreparePass::EnsurePsrVariant(GraphicsDevice& graphicsDevice, ShaderLibrary& shaderLibrary)
+{
+    if(!m_initialized || m_psrFailed)
+    {
+        return m_psrInitialized;
+    }
+
+    if(m_psrInitialized)
+    {
+        return true;
+    }
+
+    // The encoding's entry points, as Initialize creates them; the hybrid has no bypass resolve.
+    const bool relax = m_encoding == Encoding::Relax;
+    const bool hybrid = m_encoding == Encoding::Hybrid;
+    const char* prepare = hybrid ? "CSPrepareHybrid" : relax ? "CSPrepareRelax" : "CSPrepare";
+    const char* denoisedResolve = hybrid ? "CSResolveDenoisedHybrid" : relax ? "CSResolveDenoisedRelax" :
+        "CSResolveDenoised";
+    m_psrInitialized = CreatePipeline(graphicsDevice, shaderLibrary, prepare, m_psrPreparePipeline, false, true) &&
+        (hybrid || CreatePipeline(graphicsDevice, shaderLibrary, relax ? "CSResolveRelax" : "CSResolve",
+            m_psrResolvePipeline, false, true)) &&
+        CreatePipeline(graphicsDevice, shaderLibrary, denoisedResolve, m_psrDenoisedResolvePipeline, false, true);
+
+    if(!m_psrInitialized)
+    {
+        Log::Error("The PSR.2 path-traced NRD preparation pipelines could not be created.");
+        m_psrPreparePipeline.Shutdown();
+        m_psrResolvePipeline.Shutdown();
+        m_psrDenoisedResolvePipeline.Shutdown();
+        m_psrFailed = true;
+    }
+
+    return m_psrInitialized;
 }
 
 bool NrdPathTracePreparePass::EnsureRelaxSignalView(GraphicsDevice& graphicsDevice, ShaderLibrary& shaderLibrary)
@@ -256,8 +308,11 @@ void NrdPathTracePreparePass::ExecutePrepare(
     UploadBuffer& uploadBuffer,
     NrdPathTracePrepareConstants constants,
     unsigned int width,
-    unsigned int height)
+    unsigned int height,
+    const PsrBindings& psr)
 {
+    m_psrPreparedLastDispatch = false;
+
     if(!m_initialized || !commandList || !HasTextures() || width != m_width || height != m_height)
     {
         return;
@@ -274,7 +329,9 @@ void NrdPathTracePreparePass::ExecutePrepare(
 
     constants.diffuseIndex = m_diffuse.GetUAVIndex();
     constants.specularIndex = m_specular.GetUAVIndex();
-    Dispatch(commandList, uploadBuffer, m_preparePipeline, constants, width, height);
+    const bool usePsr = UsePsrVariant(psr);
+    Dispatch(commandList, uploadBuffer, usePsr ? m_psrPreparePipeline : m_preparePipeline, constants, width, height, psr);
+    m_psrPreparedLastDispatch = usePsr;
 
     for(Texture* output : outputs)
     {
@@ -287,7 +344,8 @@ void NrdPathTracePreparePass::ExecuteResolve(
     UploadBuffer& uploadBuffer,
     NrdPathTracePrepareConstants constants,
     unsigned int width,
-    unsigned int height)
+    unsigned int height,
+    const PsrBindings& psr)
 {
     if(!m_initialized || !commandList || !HasTextures() || !m_reconstructedDiffuse.GetResource() || width != m_width ||
         height != m_height)
@@ -305,7 +363,8 @@ void NrdPathTracePreparePass::ExecuteResolve(
     // The bypass reads the packed inputs where NRD's outputs would be.
     constants.diffuseIndex = m_diffuse.GetDescriptorIndex();
     constants.specularIndex = m_specular.GetDescriptorIndex();
-    Dispatch(commandList, uploadBuffer, m_resolvePipeline, constants, width, height);
+    Dispatch(commandList, uploadBuffer, UsePsrVariant(psr) ? m_psrResolvePipeline : m_resolvePipeline, constants, width,
+        height, psr);
 
     m_reconstructedDiffuse.Transition(commandList, shaderRead);
     m_reconstructedSpecular.Transition(commandList, shaderRead);
@@ -319,7 +378,8 @@ void NrdPathTracePreparePass::ExecuteDenoisedResolve(
     Texture& denoisedSpecular,
     Texture& presentation,
     unsigned int width,
-    unsigned int height)
+    unsigned int height,
+    const PsrBindings& psr)
 {
     if(!m_initialized || !commandList || !HasTextures() || width != m_width || height != m_height)
     {
@@ -335,7 +395,8 @@ void NrdPathTracePreparePass::ExecuteDenoisedResolve(
     constants.denoisedDiffuseIndex = denoisedDiffuse.GetDescriptorIndex();
     constants.denoisedSpecularIndex = denoisedSpecular.GetDescriptorIndex();
     constants.presentationIndex = presentation.GetUAVIndex();
-    Dispatch(commandList, uploadBuffer, m_denoisedResolvePipeline, constants, width, height);
+    Dispatch(commandList, uploadBuffer, UsePsrVariant(psr) ? m_psrDenoisedResolvePipeline : m_denoisedResolvePipeline,
+        constants, width, height, psr);
 }
 
 void NrdPathTracePreparePass::Dispatch(
@@ -344,7 +405,8 @@ void NrdPathTracePreparePass::Dispatch(
     ComputePipeline& pipeline,
     NrdPathTracePrepareConstants& constants,
     unsigned int width,
-    unsigned int height)
+    unsigned int height,
+    const PsrBindings& psr)
 {
     constants.resolution[0] = width;
     constants.resolution[1] = height;
@@ -365,6 +427,13 @@ void NrdPathTracePreparePass::Dispatch(
 
     pipeline.Bind(commandList);
     commandList->SetComputeRootConstantBufferView(0, constantsAddress);
+
+    if(UsePsrVariant(psr))
+    {
+        commandList->SetComputeRootConstantBufferView(1, psr.constants);
+        commandList->SetComputeRootShaderResourceView(2, psr.transforms);
+    }
+
     commandList->Dispatch((width + 7u) / 8u, (height + 7u) / 8u, 1);
 }
 

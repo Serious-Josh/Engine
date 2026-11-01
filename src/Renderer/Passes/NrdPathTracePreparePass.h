@@ -123,6 +123,31 @@ class NrdPathTracePreparePass
         return m_encoding;
     }
 
+    // PSR.2 Stage 3B phase 4: the frame's PSR denoise constants (PsrDenoiseConstants, b1) and the replacement pass's
+    // transforms (t0). With both set and the PSR variant created, the Execute functions run the encoding's
+    // NrdPathTracePreparePsr.hlsl pipelines, which filter replaced pixels as their virtual surface with the mirror's
+    // throughput demodulated; otherwise the production pipelines.
+    struct PsrBindings
+    {
+        D3D12_GPU_VIRTUAL_ADDRESS constants = 0;
+        D3D12_GPU_VIRTUAL_ADDRESS transforms = 0;
+
+        bool IsSet() const
+        {
+            return constants != 0 && transforms != 0;
+        }
+    };
+
+    // Creates the PSR variant of the encoding's pipelines after Initialize, on first use; a failure is sticky until
+    // Shutdown. Every encoding (the hybrid's has no bypass resolve, as in Initialize).
+    bool EnsurePsrVariant(GraphicsDevice& graphicsDevice, ShaderLibrary& shaderLibrary);
+
+    // Whether the last ExecutePrepare ran the PSR variant.
+    bool PreparedPsrVariant() const
+    {
+        return m_psrPreparedLastDispatch;
+    }
+
     bool IsInitialized() const
     {
         return m_initialized;
@@ -145,7 +170,8 @@ class NrdPathTracePreparePass
         UploadBuffer& uploadBuffer,
         NrdPathTracePrepareConstants constants,
         unsigned int width,
-        unsigned int height);
+        unsigned int height,
+        const PsrBindings& psr = {});
 
     // Records the bypass reconstruction from the textures ExecutePrepare wrote, with the same constants. Afterwards
     // the reconstructions are shader-readable.
@@ -154,7 +180,8 @@ class NrdPathTracePreparePass
         UploadBuffer& uploadBuffer,
         NrdPathTracePrepareConstants constants,
         unsigned int width,
-        unsigned int height);
+        unsigned int height,
+        const PsrBindings& psr = {});
 
     // NRD.4B: remodulates REBLUR's outputs (unordered-access state after NRD) into presentation's surface pixels, with
     // the constants of this frame's ExecutePrepare. Afterwards the outputs are shader-readable and presentation is in
@@ -169,7 +196,8 @@ class NrdPathTracePreparePass
         Texture& denoisedSpecular,
         Texture& presentation,
         unsigned int width,
-        unsigned int height);
+        unsigned int height,
+        const PsrBindings& psr = {});
 
     // NRD RELAX R.4 (diagnostics only): the CSResolveRelaxSignalView pipeline of a RELAX or hybrid encoding, created on
     // first request; a failure is sticky until Shutdown.
@@ -244,19 +272,33 @@ class NrdPathTracePreparePass
 
     private:
     // Fills in the resolution and the UAVs each entry point writes, uploads the constants and dispatches one thread per
-    // pixel. The caller sets diffuseIndex and specularIndex (UAVs to write, SRVs to read).
+    // pixel. The caller sets diffuseIndex and specularIndex (UAVs to write, SRVs to read). With psr set, pipeline is a
+    // PSR variant and b1 and t0 are bound too.
     void Dispatch(
         ID3D12GraphicsCommandList* commandList,
         UploadBuffer& uploadBuffer,
         ComputePipeline& pipeline,
         NrdPathTracePrepareConstants& constants,
         unsigned int width,
-        unsigned int height);
+        unsigned int height,
+        const PsrBindings& psr = {});
+
+    // The PSR variant applies to this frame: bindings set and the variant created.
+    bool UsePsrVariant(const PsrBindings& psr) const
+    {
+        return psr.IsSet() && m_psrInitialized;
+    }
 
     ComputePipeline m_preparePipeline;
     ComputePipeline m_resolvePipeline;
     ComputePipeline m_denoisedResolvePipeline;
     ComputePipeline m_signalViewPipeline;
+    ComputePipeline m_psrPreparePipeline;
+    ComputePipeline m_psrResolvePipeline;
+    ComputePipeline m_psrDenoisedResolvePipeline;
+    bool m_psrInitialized = false;
+    bool m_psrFailed = false;
+    bool m_psrPreparedLastDispatch = false;
     bool m_signalViewReady = false;
     bool m_signalViewFailed = false;
     bool m_initialized = false;

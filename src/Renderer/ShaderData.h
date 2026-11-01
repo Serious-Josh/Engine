@@ -3,6 +3,7 @@
 #include "Math/Matrix4.h"
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 
 struct MaterialConstants
 {
@@ -26,7 +27,13 @@ struct CameraConstants
     Matrix4 unjitteredViewProjection;
     // UPSCALING.3D: material texture mip bias (Triangle.hlsl); non-zero only on DLSS frames.
     float textureMipBias = 0.0f;
-    float cameraPadding[3] = {};
+    // PSR.2: non-zero only on Path Tracing frames with in-place replacement enabled (Triangle.hlsl marks PSR-eligible
+    // mirrors in identity.x bit 31), with the path tracer's camera for the decode it evaluates.
+    std::uint32_t psrEligibility = 0;
+    std::uint32_t psrResolution[2] = {};
+    Matrix4 psrInverseCameraRelativeViewProjection;
+    float psrCameraPosition[3] = {};
+    float psrPadding = 0.0f;
 };
 
 struct ObjectConstants
@@ -185,7 +192,10 @@ struct PathTraceReferenceConstants
     std::uint32_t rawDiffuseHitDistanceIndex = 0xFFFFFFFFu;
     // Reference-only optional raw UAV; reuses padding, preserving b0 size/prefix.
     std::uint32_t referenceRayCountIndex = 0xFFFFFFFFu;
-    std::uint32_t rawDiffuseHitDistancePadding[2]{};
+    // PSR.1a, in the first padding word: the raw UAV of the replacement records, read only by the PSR libraries
+    // (PathTraceReferencePsr*.hlsl); every other library still declares the word as padding.
+    std::uint32_t psrRecordIndex = 0;
+    std::uint32_t rawDiffuseHitDistancePadding = 0;
 };
 
 static_assert(sizeof(PathTraceReferenceConstants) == 64 + 7 * 16 + 64 + 3 * 16);
@@ -193,6 +203,75 @@ static_assert(offsetof(PathTraceReferenceConstants, sunDirectionToLight) == 64 +
 static_assert(offsetof(PathTraceReferenceConstants, inverseCameraRelativeViewProjection) == 64 + 7 * 16);
 static_assert(offsetof(PathTraceReferenceConstants, rawDiffuseHitDistanceIndex) == 272);
 static_assert(offsetof(PathTraceReferenceConstants, referenceRayCountIndex) == 276);
+static_assert(offsetof(PathTraceReferenceConstants, psrRecordIndex) == 280);
+
+// PSR.1b: b3 of the PSR guide pass (PathTracePsrGuideConstants, PathTraceReference.hlsl).
+struct PathTracePsrGuideConstants
+{
+    Matrix4 viewProjection;
+    Matrix4 previousViewProjection;
+    float viewDepthRow[4]{};
+    float previousViewDepthRow[4]{};
+    std::uint32_t guideIndex = 0;
+    std::uint32_t historyValid = 0;
+    std::uint32_t transformCount = 0;
+    std::uint32_t identityIndex = 0;
+};
+
+static_assert(sizeof(PathTracePsrGuideConstants) == 2 * 64 + 3 * 16);
+
+// PSR.2 Stage 3A: b4 of the PSR.2 lighting pair (PathTracePsrGBufferConstants, PathTraceReference.hlsl): the replacement
+// pass's camera (its PsrInPlaceReplacePass::Constants values) and identity target, and its transform count.
+struct PathTracePsrGBufferConstants
+{
+    Matrix4 cameraRelativeViewProjection;
+    Matrix4 inverseCameraRelativeViewProjection;
+    float cameraPosition[3]{};
+    std::uint32_t identityIndex = 0;
+    std::uint32_t transformCount = 0;
+    // [0] the verification probe's UAV; [1] the geometry pass's texture mip bias as a float's bits (SetTextureMipBias).
+    std::uint32_t padding[3]{};
+
+    void SetTextureMipBias(float bias)
+    {
+        std::memcpy(&padding[1], &bias, sizeof(bias));
+    }
+};
+
+static_assert(sizeof(PathTracePsrGBufferConstants) == 2 * 64 + 2 * 16);
+
+// PSR.2 Stage 3B: the denoisers' PSR variants' constants (PsrDenoiseConstantsData, PsrDenoise.hlsli): the replacement
+// pass's camera and identity target, and the path tracer's instance data, materials and material tables.
+struct PsrDenoiseConstants
+{
+    Matrix4 cameraRelativeViewProjection;
+    Matrix4 inverseCameraRelativeViewProjection;
+    float cameraPosition[3]{};
+    std::uint32_t identityIndex = 0;
+    std::uint32_t transformCount = 0;
+    std::uint32_t instanceDataIndex = 0;
+    std::uint32_t materialBufferIndex = 0;
+    std::uint32_t materialTableIndex = 0;
+    std::uint32_t materialAverageTableIndex = 0;
+    std::uint32_t materialTableCosineMapping = 0;
+    std::uint32_t resolution[2]{};
+    // The geometry pass's texture mip bias (PsrRecoverMirror).
+    float textureMipBias = 0.0f;
+    std::uint32_t padding[3]{};
+};
+
+static_assert(sizeof(PsrDenoiseConstants) == 2 * 64 + 4 * 16);
+
+// PSR.1b: one render object's (TLAS InstanceID's) current-to-previous world transform, rows of a 3x4 matrix
+// (PathTracePsrTransform).
+struct PathTracePsrTransform
+{
+    float rows[3][4]{};
+    std::uint32_t valid = 0;
+    std::uint32_t padding[3]{};
+};
+
+static_assert(sizeof(PathTracePsrTransform) == 64);
 
 struct AOConstants
 {
@@ -301,7 +380,7 @@ struct RayTracingInstanceData
 
 static_assert(sizeof(MaterialConstants) == 32);
 static_assert(sizeof(Matrix4) == 64);
-static_assert(sizeof(CameraConstants) == 336);
+static_assert(sizeof(CameraConstants) == 416);
 static_assert(sizeof(ObjectConstants) == 192);
 static_assert(sizeof(ReconstructionConstants) == 96);
 static_assert(offsetof(ReconstructionConstants, inverseViewProjection) == 0);

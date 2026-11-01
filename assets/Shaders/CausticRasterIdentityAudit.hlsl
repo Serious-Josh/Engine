@@ -14,6 +14,7 @@
 #include "PathTraceBSDF.hlsli"
 #include "SceneLights.hlsli"
 #include "PathTracePrimarySurface.hlsli"
+#include "PsrIdentity.hlsli"
 
 RaytracingAccelerationStructure Scene : register(t0);
 
@@ -68,6 +69,7 @@ uint Classify(uint2 pixel, out uint2 raster, out uint instanceID, out uint insta
 
     Texture2D<uint2> identity = ResourceDescriptorHeap[identityIndex];
     raster = identity.Load(int3(pixel, 0));
+    raster.x = PsrIdentityInstance(raster.x);
 
     if(raster.x == INVALID_IDENTITY)
     {
@@ -137,7 +139,8 @@ void CSAudit(uint3 id : SV_DispatchThreadID)
     const uint primitive = hit ? q.CommittedPrimitiveIndex() : NO_HIT;
 
     Texture2D<uint2> identity = ResourceDescriptorHeap[identityIndex];
-    const uint2 raster = identity.Load(int3(id.xy, 0));
+    uint2 raster = identity.Load(int3(id.xy, 0));
+    raster.x = PsrIdentityInstance(raster.x);
     const bool background = raster.x == 0;
     const bool unmapped = raster.x == INVALID_IDENTITY;
     uint category;

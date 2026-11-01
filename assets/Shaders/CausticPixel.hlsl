@@ -13,6 +13,7 @@
 #include "PathTraceBSDF.hlsli"
 #include "SceneLights.hlsli"
 #include "PathTracePrimarySurface.hlsli"
+#include "PsrIdentity.hlsli"
 
 RaytracingAccelerationStructure Scene : register(t0);
 // Accepted source triangle in world space, as uploaded (PixelCausticTriangle, 80 bytes). The reflector
@@ -607,7 +608,7 @@ void Attempt(uint pixel, uint attemptID, out float3 diffuseValue, out float3 spe
             const uint4 entry = hitTriangle && hit.instanceID < receiverTableCount ? ReceiverTable[hit.instanceID] : uint4(0, 0, 0, 0);
             Texture2D<uint2> identity = ResourceDescriptorHeap[identityIndex];
             const uint2 raster = identity.Load(int3(xy, 0));
-            certified = (entry.x == 1 && entry.y == hit.instanceIndex && raster.x == hit.instanceID + 1 &&
+            certified = (entry.x == 1 && entry.y == hit.instanceIndex && PsrIdentityInstance(raster.x) == hit.instanceID + 1 &&
                          raster.y == hit.primitive && vertex.materialIndex == entry.z && depthAgrees)
                             ? 1u
                             : 0u;

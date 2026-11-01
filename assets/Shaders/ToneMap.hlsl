@@ -1,4 +1,5 @@
 #include "NRD/NRD.hlsli"
+#include "PsrIdentity.hlsli"
 
 struct ToneMapConstants
 {
@@ -15,6 +16,12 @@ struct ToneMapConstants
     uint debugDepthIndex;
     float3 outlineColor;
     uint toneMapOperator; // ToneMapOperator: 0 Existing (AgX), 1 GT7.
+
+    // PSR.2 development views (34-36): the G-buffer after in-place replacement, and whether the replacement pass ran.
+    uint psrSurfaceIndex;
+    uint psrMaterialIndex;
+    uint psrIdentityIndex;
+    uint psrReplacementRan;
 };
 
 ConstantBuffer<ToneMapConstants> toneMapConstants : register(b0);
@@ -292,6 +299,63 @@ VSOutput VSMain(uint vertexID : SV_VertexID)
 float4 PSMain(VSOutput input) : SV_TARGET
 {
     uint2 pixel = uint2(input.position.xy);
+    if(toneMapConstants.debugView >= 34u && toneMapConstants.debugView <= 36u)
+    {
+        Texture2D<float4> surfaceTexture = ResourceDescriptorHeap[toneMapConstants.psrSurfaceIndex];
+        Texture2D<uint2> identityTexture = ResourceDescriptorHeap[toneMapConstants.psrIdentityIndex];
+        Texture2D<float4> outputTexture = ResourceDescriptorHeap[toneMapConstants.sceneColorIndex];
+        uint2 renderSize, outputSize;
+        surfaceTexture.GetDimensions(renderSize.x, renderSize.y);
+        outputTexture.GetDimensions(outputSize.x, outputSize.y);
+        // Nearest render-extent pixel, so the view also works when presentation runs at a larger output extent.
+        const int3 source = int3(min(pixel * renderSize / max(outputSize, 1u), renderSize - 1u), 0);
+
+        const float4 surface = surfaceTexture.Load(source);
+        // Replaced pixels carry both the identity's eligibility flag and surface.w = -(materialIndex + 1); a fallback
+        // is discarded by the replacement pass and keeps the mirror's non-negative index.
+        const bool eligible = PsrIdentityEligible(identityTexture.Load(source).x);
+        const bool replaced = eligible && toneMapConstants.psrReplacementRan != 0u && surface.w < 0.0f;
+
+        if(toneMapConstants.debugView == 34u)
+        {
+            if(!eligible)
+            {
+                // A negative index without the flag breaks the replacement's invariant.
+                return surface.w < 0.0f ? float4(1.0f, 0.0f, 1.0f, 1.0f) : float4(0.0f, 0.0f, 0.0f, 1.0f);
+            }
+
+            if(toneMapConstants.psrReplacementRan == 0u)
+            {
+                return float4(1.0f, 1.0f, 0.0f, 1.0f);
+            }
+
+            return replaced ? float4(0.0f, 1.0f, 0.0f, 1.0f) : float4(1.0f, 0.0f, 0.0f, 1.0f);
+        }
+
+        if(!replaced)
+        {
+            return float4(0.0f, 0.0f, 0.0f, 1.0f);
+        }
+
+        if(toneMapConstants.debugView == 35u)
+        {
+            // The surface target's signed world-space shading normal, as view 17 decodes it.
+            const float lengthSquared = dot(surface.xyz, surface.xyz);
+
+            if(!isfinite(lengthSquared) || lengthSquared < 1.0e-8f)
+            {
+                return float4(1.0f, 0.0f, 1.0f, 1.0f);
+            }
+
+            return float4(normalize(surface.xyz) * 0.5f + 0.5f, 1.0f);
+        }
+
+        // The sRGB material SRV decodes to linear base colour; encode once for display, as view 18 does.
+        Texture2D<float4> materialTexture = ResourceDescriptorHeap[toneMapConstants.psrMaterialIndex];
+        const float3 baseColor = materialTexture.Load(source).rgb;
+        return float4(all(isfinite(baseColor)) ? LinearToSRGB(saturate(baseColor)) : float3(1.0f, 0.0f, 1.0f), 1.0f);
+    }
+
     if(toneMapConstants.debugView == 17 || toneMapConstants.debugView == 18)
     {
         Texture2D<float> depthTexture = ResourceDescriptorHeap[toneMapConstants.debugDepthIndex];

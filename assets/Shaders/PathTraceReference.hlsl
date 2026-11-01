@@ -51,6 +51,22 @@ struct PATH_TRACE_RAY_PAYLOAD PathTraceVisibilityPayload
     uint visible PATH_TRACE_PAYLOAD_ACCESS(write(caller, miss) : read(caller));
 };
 
+#ifdef PATH_TRACE_PSR_LIBRARY
+#include "PsrIdentity.hlsli"
+
+// PSR.1b: PathTracePayload plus the hit's identity, traced only by the guide pass (its own hit group and miss).
+struct PATH_TRACE_RAY_PAYLOAD PathTracePsrGuidePayload
+{
+    float hitDistance PATH_TRACE_PAYLOAD_ACCESS(write(caller, closesthit, miss) : read(caller));
+    float3 geometricNormal PATH_TRACE_PAYLOAD_ACCESS(write(caller, closesthit) : read(caller));
+    float3 shadingNormal PATH_TRACE_PAYLOAD_ACCESS(write(caller, closesthit) : read(caller));
+    float2 uv PATH_TRACE_PAYLOAD_ACCESS(write(caller, closesthit) : read(caller));
+    uint materialIndex PATH_TRACE_PAYLOAD_ACCESS(write(caller, closesthit) : read(caller));
+    uint instanceID PATH_TRACE_PAYLOAD_ACCESS(write(caller, closesthit) : read(caller));
+    uint primitiveIndex PATH_TRACE_PAYLOAD_ACCESS(write(caller, closesthit) : read(caller));
+};
+#endif
+
 cbuffer PathTraceConstants : register(b0)
 {
     row_major float4x4 inverseViewProjection;
@@ -108,11 +124,24 @@ cbuffer PathTraceConstants : register(b0)
     // Ordinary libraries reserve the same row so its offset is always 276.
     uint rawDiffuseHitDistanceIndex;
     uint referenceRayCountIndex;
+#ifdef PATH_TRACE_PSR_LIBRARY
+    // PSR.2 Stage 3B: a PSR library's raw-distance build keeps the PSR words at the same offsets (280, 284).
+    uint psrRecordIndex;
+    uint psrPadding;
+#else
     uint2 rawDiffuseHitDistancePadding;
+#endif
 #else
     uint unusedRawDiffuseHitDistanceIndex;
     uint referenceRayCountIndex;
+#ifdef PATH_TRACE_PSR_LIBRARY
+    // PSR.1a, in the same padding row: the raw UAV of the per-pixel replacement records (PATH_TRACE_PSR_RECORD_STRIDE),
+    // written by PathTracePsrRayGeneration and read by this library's PathTraceRasterPrimaryRayGeneration.
+    uint psrRecordIndex;
+    uint psrPadding;
+#else
     uint2 referenceRayCountPadding;
+#endif
 #endif
 };
 
@@ -870,12 +899,33 @@ float3 PathTraceRtxdiDirectLighting(PathTraceSurface surface, float3 position, i
 
 // RTXPT.2 raster primary: this pixel's first vertex, decoded once per pixel before the sample loop (it is the
 // same for every sample; only the random numbers differ). state: 1 surface, 0 background, -1 unusable sample.
+#ifdef PATH_TRACE_PSR_LIBRARY
+// PSR.1a: the closest-hit payload of the vertex-0 mirror's specular continuation, as PathTracePayload carries it.
+struct PathTracePsrHit
+{
+    float hitDistance;
+    float3 geometricNormal;
+    float3 shadingNormal;
+    float2 uv;
+    uint materialIndex;
+};
+#endif
+
 struct PathTraceRasterFirstVertex
 {
     int state;
     float3 position;
     PathTraceSurface surface;
     float3 backgroundDirection;
+#ifdef PATH_TRACE_PSR_LIBRARY
+    // PSR.1a: PATH_TRACE_PSR_* of this pixel's record. PSR.1a-P: the replaced hit itself is read at vertex 1
+    // (PathTracePsrLoadHit), so only this word stays live through the sample loop.
+    uint psrState;
+#ifdef PATH_TRACE_PSR_GBUFFER
+    // PSR.2: a replaced pixel's mirror plane point (its exact camera-ray intersection, camera-relative).
+    float3 psrPlanePoint;
+#endif
+#endif
 };
 
 // RTXPT.2 raster primary: the first vertex from this pixel's G-buffer sample, without a camera ray.
@@ -928,8 +978,325 @@ PathTraceRasterFirstVertex PathTraceDecodeRasterFirstVertex(uint2 pixel)
     PathTraceRasterFirstVertex firstVertex;
     firstVertex.state = PathTraceLoadRasterPrimaryVertex(pixel, firstVertex.position, firstVertex.surface,
         firstVertex.backgroundDirection);
+#ifdef PATH_TRACE_PSR_LIBRARY
+    firstVertex.psrState = 0u;
+#ifdef PATH_TRACE_PSR_GBUFFER
+    firstVertex.psrPlanePoint = float3(0.0f, 0.0f, 0.0f);
+#endif
+#endif
     return firstVertex;
 }
+
+#ifdef PATH_TRACE_PSR_LIBRARY
+// -----------------------------------------------------------------------------
+// PSR.1a primary surface replacement (Raster Primary, denoiser Off). PathTracePsrRayGeneration traces the specular
+// continuation of every pure-delta vertex-0 mirror once per pixel and records its closest-hit payload. This library's
+// raster primary then takes vertex 1 from that record instead of tracing it. Vertex 0 itself is unchanged: its delta
+// event (Fresnel weight, randoms, roulette, depth) is still evaluated by the path loop, which applies the mirror
+// throughput exactly once. Only the traversal moves, so the transport is the production loop's.
+// -----------------------------------------------------------------------------
+
+// Not a pure-delta mirror (or no path continues past vertex 0): the production loop, untouched.
+static const uint PATH_TRACE_PSR_NONE = 0u;
+// Replaced: the continuation hit a surface with a non-delta lobe.
+static const uint PATH_TRACE_PSR_SURFACE = 1u;
+// Replaced: the continuation missed all geometry (the mirror shows the environment).
+static const uint PATH_TRACE_PSR_SKY = 2u;
+// Fallbacks to the production loop, which traces the continuation itself: the replacement is another delta surface
+// (mirror chains are out of scope), cannot form a surface, or the delta sample is invalid (reflection below the
+// geometric surface).
+static const uint PATH_TRACE_PSR_FALLBACK_MIRROR = 3u;
+static const uint PATH_TRACE_PSR_FALLBACK_SURFACE = 4u;
+static const uint PATH_TRACE_PSR_FALLBACK_DIRECTION = 5u;
+
+// PSR.1a-P: 10 words per pixel. Word 0 is the state (3 bits) and the material index (29 bits; Raster Primary refuses
+// tables above PathTraceRasterPrimaryMaximumMaterials); then hitDistance, geometricNormal, shadingNormal, uv, all at full
+// precision, because vertex 1's PathTraceBuildSurface must see exactly the payload. Ineligible pixels write word 0 only;
+// the other words are read only for a replaced state.
+static const uint PATH_TRACE_PSR_RECORD_STRIDE = 40u;
+static const uint PATH_TRACE_PSR_STATE_BITS = 3u;
+static const uint PATH_TRACE_PSR_STATE_MASK = (1u << PATH_TRACE_PSR_STATE_BITS) - 1u;
+static const uint PATH_TRACE_PSR_MAXIMUM_MATERIAL_INDEX = (1u << (32u - PATH_TRACE_PSR_STATE_BITS)) - 1u;
+
+bool PathTracePsrReplaced(uint state)
+{
+    return state == PATH_TRACE_PSR_SURFACE || state == PATH_TRACE_PSR_SKY;
+}
+
+// The production BSDF's own definition of a pure-delta mirror: the delta lobe is the only strategy (no diffuse or
+// multiple-scatter energy). Mixed smooth dielectrics, which choose the delta lobe stochastically, are not eligible.
+bool PathTracePsrEligible(PathTraceRasterFirstVertex firstVertex)
+{
+    return firstVertex.state > 0 && maxPathDepth > 0u && firstVertex.surface.deltaSpecular &&
+        firstVertex.surface.specularProbability >= 1.0f;
+}
+
+uint PathTracePsrRecordAddress(uint2 pixel)
+{
+    return (pixel.y * resolution.x + pixel.x) * PATH_TRACE_PSR_RECORD_STRIDE;
+}
+
+// An ineligible pixel's record: word 0 only.
+void PathTracePsrStoreState(uint2 pixel, uint state)
+{
+    RWByteAddressBuffer records = ResourceDescriptorHeap[psrRecordIndex];
+    records.Store(PathTracePsrRecordAddress(pixel), state);
+}
+
+void PathTracePsrStoreRecord(uint2 pixel, uint state, PathTracePayload payload)
+{
+    RWByteAddressBuffer records = ResourceDescriptorHeap[psrRecordIndex];
+    uint address = PathTracePsrRecordAddress(pixel);
+    records.Store(address, state | (payload.materialIndex << PATH_TRACE_PSR_STATE_BITS));
+    records.Store4(address + 4u, uint4(asuint(payload.hitDistance), asuint(payload.geometricNormal)));
+    records.Store4(address + 20u, uint4(asuint(payload.shadingNormal), asuint(payload.uv.x)));
+    records.Store(address + 36u, asuint(payload.uv.y));
+}
+
+void PathTracePsrLoadRecord(uint2 pixel, inout PathTraceRasterFirstVertex firstVertex)
+{
+    RWByteAddressBuffer records = ResourceDescriptorHeap[psrRecordIndex];
+    firstVertex.psrState = records.Load(PathTracePsrRecordAddress(pixel)) & PATH_TRACE_PSR_STATE_MASK;
+}
+
+PathTracePsrHit PathTracePsrLoadHit(uint2 pixel);
+
+// -----------------------------------------------------------------------------
+// PSR.2a effective primary surface. The only interface through which path-tracing consumers see PSR; the record
+// functions above are its storage and are called from nowhere else. The effective primary surface of a pixel is its
+// raster vertex 0, or for a replaced pure-delta mirror the physical surface B its reflection reaches. Physical B is
+// what shading uses; the virtual guides (PathTracePsrGuideRayGeneration) are a separate, reprojection-only view of it.
+// The mirror stays the path's vertex 0: its delta event (Fresnel, randoms, roulette, depth) is still evaluated by the
+// path loop, so B is the path's vertex 1.
+// -----------------------------------------------------------------------------
+
+#ifdef PATH_TRACE_PSR_GBUFFER
+// -----------------------------------------------------------------------------
+// PSR.2 Stage 3A storage (PathTraceReSTIRDIPsrGBuffer*, PathTraceReferencePsrGBuffer*): the G-buffer itself. A replaced
+// pixel (identity.x's eligibility flag and surface.w = -(materialIndex + 1), PsrInPlaceReplace.hlsl) holds the virtual
+// image Bv of its reflected surface B; the mirror is recovered from the identity (PsrMirrorRecovery.hlsli) with the
+// replacement pass's camera and transforms, and B is Bv reflected back through the mirror plane the replacement pass
+// used. An eligible pixel whose replacement fell back still holds its mirror and takes the production path.
+// -----------------------------------------------------------------------------
+
+// Defined with the closest-hit shader below.
+float3 PathTraceLoadPosition(ByteAddressBuffer vertexBuffer, uint vertexIndex, uint vertexStride);
+float3 PathTraceLoadNormal(ByteAddressBuffer vertexBuffer, uint vertexIndex, RayTracingInstanceData instance);
+float2 PathTraceLoadUV(ByteAddressBuffer vertexBuffer, uint vertexIndex, RayTracingInstanceData instance);
+float4 PathTraceLoadTangent(ByteAddressBuffer vertexBuffer, uint vertexIndex, RayTracingInstanceData instance);
+uint3 PathTraceTriangleIndices(RayTracingInstanceData instance, uint primitiveIndex);
+
+#include "PsrMirrorRecovery.hlsli"
+
+// b4: the replacement pass's camera (PsrInPlaceReplacePass::Constants) and the identity target; t2: its object
+// transforms; s2: Triangle.hlsl's material sampler (trilinear clamp), which the mirror's textures were sampled with.
+cbuffer PathTracePsrGBufferConstants : register(b4)
+{
+    row_major float4x4 psrGBufferCameraRelativeViewProjection;
+    row_major float4x4 psrGBufferInverseCameraRelativeViewProjection;
+    float3 psrGBufferCameraPosition;
+    uint psrGBufferIdentityIndex;
+    uint psrGBufferTransformCount;
+    // x: the verification probe's UAV (PATH_TRACE_PSR_PROBE_INDEX); y: the geometry pass's texture mip bias
+    // (PsrRecoverMirror), as a float's bits.
+    uint3 psrGBufferPadding;
+};
+
+StructuredBuffer<PsrObjectTransform> psrObjectTransforms : register(t2);
+SamplerState psrMirrorSampler : register(s2);
+
+PsrMirrorCamera PathTracePsrMirrorCamera()
+{
+    PsrMirrorCamera mirrorCamera;
+    mirrorCamera.camera.inverseCameraRelativeViewProjection = psrGBufferInverseCameraRelativeViewProjection;
+    mirrorCamera.camera.cameraPosition = psrGBufferCameraPosition;
+    mirrorCamera.camera.resolution = resolution;
+    mirrorCamera.cameraRelativeViewProjection = psrGBufferCameraRelativeViewProjection;
+    return mirrorCamera;
+}
+
+// A replaced pixel becomes its recovered mirror with state SURFACE (the production decode rejects its negative material
+// index); every other pixel is left as decoded. A replaced pixel whose mirror cannot be recovered stays unusable.
+void PathTraceResolveEffectivePrimary(uint2 pixel, inout PathTraceRasterFirstVertex firstVertex)
+{
+    Texture2D<uint2> identityTexture = ResourceDescriptorHeap[psrGBufferIdentityIndex];
+    Texture2D<float4> surfaceTexture = ResourceDescriptorHeap[gBufferSurfaceIndex];
+    const uint2 identity = identityTexture.Load(int3(pixel, 0));
+
+    if(!PsrIdentityEligible(identity.x) || !(surfaceTexture.Load(int3(pixel, 0)).w < 0.0f))
+    {
+        return;
+    }
+
+    StructuredBuffer<GPUMaterial> materials = ResourceDescriptorHeap[materialBufferIndex];
+    PsrRecoveredMirror mirror;
+
+    if(!PsrRecoverMirror(pixel, identity, PathTracePsrMirrorCamera(), psrObjectTransforms, psrGBufferTransformCount,
+        instanceDataIndex, materials, materialTableIndex, materialAverageTableIndex, materialTableCosineMapping,
+        psrMirrorSampler, asfloat(psrGBufferPadding.y), true, mirror))
+    {
+        return;
+    }
+
+    firstVertex.state = 1;
+    firstVertex.position = mirror.vertex.position;
+    firstVertex.surface = mirror.vertex.surface;
+    firstVertex.psrState = PATH_TRACE_PSR_SURFACE;
+    firstVertex.psrPlanePoint = mirror.mirrorPoint;
+}
+#else
+// Sets firstVertex.psrState. Only eligible vertices read storage: both record producers decode the same G-buffer
+// vertex and write PATH_TRACE_PSR_NONE for every vertex PathTracePsrEligible rejects, so an ineligible vertex's
+// state is NONE without reading it.
+void PathTraceResolveEffectivePrimary(uint2 pixel, inout PathTraceRasterFirstVertex firstVertex)
+{
+    if(PathTracePsrEligible(firstVertex))
+    {
+        PathTracePsrLoadRecord(pixel, firstVertex);
+    }
+}
+#endif
+
+// The path vertex at which the effective primary surface is shaded: 1 for a replaced surface the path reaches (vertex 1
+// is shaded only below maxPathDepth), otherwise 0.
+uint PathTraceEffectivePrimaryVertex(PathTraceRasterFirstVertex firstVertex)
+{
+    return firstVertex.psrState == PATH_TRACE_PSR_SURFACE && maxPathDepth > 1u ? 1u : 0u;
+}
+
+#ifdef PATH_TRACE_PSR_GBUFFER
+// PSR.2 Stage 3B: the G-buffer's virtual point Bv of a replaced pixel (world space), the surface the denoisers see.
+float3 PathTracePsrVirtualPosition(uint2 pixel)
+{
+    Texture2D<float> depthTexture = ResourceDescriptorHeap[gBufferDepthIndex];
+    return psrGBufferCameraPosition + PathTraceUnprojectCameraRelative(pixel, depthTexture.Load(int3(pixel, 0)),
+        PathTracePsrMirrorCamera().camera);
+}
+
+// PSR.2 keeps no hit: vertex 1 is built by PathTracePsrReplacementSurface. A non-negative distance only marks the hit.
+PathTracePayload PathTraceEffectivePrimaryReplacementPayload(uint2 pixel)
+{
+    PathTracePayload payload;
+    payload.hitDistance = 0.0f;
+    payload.geometricNormal = float3(0.0f, 0.0f, 1.0f);
+    payload.shadingNormal = float3(0.0f, 0.0f, 1.0f);
+    payload.uv = float2(0.0f, 0.0f);
+    payload.materialIndex = 0u;
+    return payload;
+}
+
+// PSR.2: the physical replacement surface B of a SURFACE pixel. The G-buffer's virtual surface Bv (decoded with its
+// material index -(i + 1) restored, from the replacement pass's camera, which projected it) is reflected back through
+// the plane the replacement pass reflected B through: the mirror's finalized shading normal at the exact intersection.
+// Position, both normals and the view reflect; the view becomes the reflected ray's -d (camera, mirror point and Bv are
+// collinear). The two-sided facing and the horizon correction use only dot products, so they commute with the
+// reflection, and the lift uses Bv's camera distance, the path length camera-mirror-B.
+bool PathTracePsrReplacementSurface(uint2 pixel, PathTraceRasterFirstVertex firstVertex, out float3 position,
+    out PathTraceSurface surface)
+{
+    position = float3(0.0f, 0.0f, 0.0f);
+    surface = (PathTraceSurface)0;
+
+    Texture2D<float> depthTexture = ResourceDescriptorHeap[gBufferDepthIndex];
+    Texture2D<float4> materialTexture = ResourceDescriptorHeap[gBufferMaterialIndex];
+    Texture2D<float4> surfaceTexture = ResourceDescriptorHeap[gBufferSurfaceIndex];
+    Texture2D<float4> geometricNormalTexture = ResourceDescriptorHeap[gBufferGeometricNormalIndex];
+    PathTraceGBufferSample gBuffer = PathTraceLoadGBuffer(pixel, depthTexture, materialTexture, surfaceTexture,
+        geometricNormalTexture);
+    gBuffer.surface.w = -gBuffer.surface.w - 1.0f;
+
+    StructuredBuffer<GPUMaterial> materials = ResourceDescriptorHeap[materialBufferIndex];
+    PathTracePrimaryVertex virtualVertex;
+
+    if(!PathTraceDecodePrimaryVertex(pixel, gBuffer, PathTracePsrMirrorCamera().camera, materials, materialTableIndex,
+        materialAverageTableIndex, materialTableCosineMapping, virtualVertex))
+    {
+        return false;
+    }
+
+    const float3 planeNormal = firstVertex.surface.normal;
+    surface = virtualVertex.surface;
+    surface.view = PsrReflectDirection(surface.view, planeNormal);
+    surface.normal = PsrReflectDirection(surface.normal, planeNormal);
+    surface.geometricNormal = PsrReflectDirection(surface.geometricNormal, planeNormal);
+    const float lift = PATH_TRACE_PRIMARY_SURFACE_LIFT * length(virtualVertex.cameraRelativePosition);
+    const float3 relative = PsrReflectPoint(virtualVertex.cameraRelativePosition, firstVertex.psrPlanePoint, planeNormal) +
+        surface.geometricNormal * lift;
+    position = psrGBufferCameraPosition + relative;
+    return all(isfinite(position)) && PathTraceFinalizeSurface(surface);
+}
+#else
+// The closest-hit payload of a replaced pixel's vertex 1, as the path loop's continuation would have returned it.
+PathTracePayload PathTraceEffectivePrimaryReplacementPayload(uint2 pixel)
+{
+    PathTracePsrHit hit = PathTracePsrLoadHit(pixel);
+    PathTracePayload payload;
+    payload.hitDistance = hit.hitDistance;
+    payload.geometricNormal = hit.geometricNormal;
+    payload.shadingNormal = hit.shadingNormal;
+    payload.uv = hit.uv;
+    payload.materialIndex = hit.materialIndex;
+    return payload;
+}
+
+// PSR.1c-A: the physical replacement surface of a SURFACE pixel and its position, built from the record exactly as the
+// path loop builds vertex 1: the vertex-0 delta sample's direction (independent of the randoms), the loop's origin
+// offset, the recorded payload and PathTraceBuildSurface, whose view is the reflected direction -d.
+bool PathTracePsrReplacementSurface(uint2 pixel, PathTraceRasterFirstVertex firstVertex, out float3 position,
+    out PathTraceSurface surface)
+{
+    position = float3(0.0f, 0.0f, 0.0f);
+    surface = (PathTraceSurface)0;
+    float3 diffuseShare;
+    bool specularStrategy;
+    PathTraceBSDFSample mirrorSample = PathTraceSampleBSDFLobes(firstVertex.surface, float3(0.0f, 0.0f, 0.0f),
+        diffuseShare, specularStrategy);
+
+    if(!mirrorSample.valid || !mirrorSample.delta)
+    {
+        return false;
+    }
+
+    PathTracePayload payload = PathTraceEffectivePrimaryReplacementPayload(pixel);
+    float3 origin = PathTraceOffsetRayOrigin(firstVertex.position, firstVertex.surface.geometricNormal);
+    position = origin + mirrorSample.direction * payload.hitDistance;
+    return PathTraceBuildSurface(payload, mirrorSample.direction, surface);
+}
+#endif
+
+// The physical vertex at which the effective primary surface is shaded. True for a replaced surface (position and
+// surface are B's); otherwise position and surface are the raster vertex 0's.
+bool PathTraceEffectivePrimaryShadingVertex(uint2 pixel, PathTraceRasterFirstVertex firstVertex, out float3 position,
+    out PathTraceSurface surface)
+{
+    if(PathTraceEffectivePrimaryVertex(firstVertex) == 1u &&
+        PathTracePsrReplacementSurface(pixel, firstVertex, position, surface))
+    {
+        return true;
+    }
+
+    position = firstVertex.position;
+    surface = firstVertex.surface;
+    return false;
+}
+
+// A replaced pixel's hit, read where vertex 1 consumes it.
+PathTracePsrHit PathTracePsrLoadHit(uint2 pixel)
+{
+    RWByteAddressBuffer records = ResourceDescriptorHeap[psrRecordIndex];
+    uint address = PathTracePsrRecordAddress(pixel);
+    uint header = records.Load(address);
+    uint4 first = records.Load4(address + 4u);
+    uint4 second = records.Load4(address + 20u);
+    PathTracePsrHit hit;
+    hit.materialIndex = header >> PATH_TRACE_PSR_STATE_BITS;
+    hit.hitDistance = asfloat(first.x);
+    hit.geometricNormal = asfloat(first.yzw);
+    hit.shadingNormal = asfloat(second.xyz);
+    hit.uv = float2(asfloat(second.w), asfloat(records.Load(address + 36u)));
+    return hit;
+}
+#endif
 
 // RTXPT D.1B.2 signal extraction for the raster primaries. A sample's radiance splits exactly into the parts its
 // vertex-0 BSDF lobes carry: vertex-0 direct light is evaluated per lobe with the full estimator's MIS weights and
@@ -1020,6 +1387,18 @@ float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex 
     bool previousDelta = true;
     float previousPdf = 0.0f;
     PATH_TRACE_RADIANCE_CACHE_HARVEST(PathTraceRadianceCacheHarvest harvest = PathTraceRadianceCacheHarvestBegin());
+#ifdef PATH_TRACE_PSR_LIBRARY
+    // PSR.1c-A: the vertex whose direct light RTXDI estimated (the direct pass's split direct radiance).
+    uint rtxdiVertex = primary == PATH_TRACE_PRIMARY_RASTER_SPLIT_INDIRECT ?
+        PathTraceEffectivePrimaryVertex(rasterFirstVertex) : 0u;
+#endif
+#ifdef PATH_TRACE_PSR_GBUFFER
+    // PSR.2 Stage 3B: the vertex whose lobes the extraction splits by, the effective primary: B (vertex 1) for a replaced
+    // pixel, which the denoisers filter as the G-buffer's virtual surface, and the mirror's throughput only scales it.
+#define PATH_TRACE_EXTRACTION_VERTEX rtxdiVertex
+#else
+#define PATH_TRACE_EXTRACTION_VERTEX 0u
+#endif
 
     // vertex counts surface interactions. The ray traced after the last allowed vertex is still
     // traced so distant lights reached by BSDF sampling pair with that vertex's light samples.
@@ -1042,12 +1421,33 @@ float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex 
             payload.shadingNormal = float3(0.0f, 0.0f, 1.0f);
             payload.uv = float2(0.0f, 0.0f);
             payload.materialIndex = 0u;
+#ifdef PATH_TRACE_PSR_LIBRARY
+            // PSR.1a: a replaced pixel's vertex 1 is its recorded hit. The call site stays uniform (R3-F): the ray is
+            // the loop's own continuation with mask 0, so nothing is traversed, and the payload is then the record's.
+            bool replacementVertex = (primary == PATH_TRACE_PRIMARY_RASTER ||
+                primary == PATH_TRACE_PRIMARY_RASTER_SPLIT_INDIRECT) && vertex == 1u &&
+                PathTracePsrReplaced(rasterFirstVertex.psrState);
+            bool untracedVertex = gBufferVertex || replacementVertex;
+            // PSR.1a-P: the call stays unconditional. A wave-uniform skip (WaveActiveAllTrue(replacementVertex)) is
+            // equivalent, but placing the call under a branch made this pass 0.5-1.8 ms slower (PSR1aPPerformance.md).
+#ifdef PATH_TRACE_SER
+            PathTraceTraceRadianceReordered(ray, untracedVertex ? 0x00 : 0xFF, !untracedVertex, payload);
+#else
+            TraceRay(scene, RAY_FLAG_NONE, untracedVertex ? 0x00 : 0xFF, 0, 1, PATH_TRACE_MISS_RADIANCE, ray, payload);
+#endif
+
+            if(replacementVertex)
+            {
+                payload = PathTraceEffectivePrimaryReplacementPayload(DispatchRaysIndex().xy);
+            }
+#else
 #ifdef PATH_TRACE_SER
             // SER S5A: the same single call site, as a HitObject. The empty vertex-0 ray keeps mask 0 and is never
             // reordered (it misses without traversal, exactly as before); continuation rays reorder.
             PathTraceTraceRadianceReordered(ray, gBufferVertex ? 0x00 : 0xFF, !gBufferVertex, payload);
 #else
             TraceRay(scene, RAY_FLAG_NONE, gBufferVertex ? 0x00 : 0xFF, 0, 1, PATH_TRACE_MISS_RADIANCE, ray, payload);
+#endif
 #endif
 
             if(gBufferVertex)
@@ -1073,12 +1473,14 @@ float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex 
                 // The camera primaries' hit handling, unchanged.
                 ++rayCount;
 
-                if(extract && vertex == 1u && extraction.hitDistance == PATH_TRACE_EXTRACTION_SPECULAR_PENDING)
+                if(extract && vertex == PATH_TRACE_EXTRACTION_VERTEX + 1u &&
+                    extraction.hitDistance == PATH_TRACE_EXTRACTION_SPECULAR_PENDING)
                 {
                     extraction.hitDistance = payload.hitDistance < 0.0f ? PATH_TRACE_HALF_MAXIMUM : payload.hitDistance;
                 }
 
-                if(extract && vertex == 1u && extraction.diffuseHitDistance == PATH_TRACE_EXTRACTION_DIFFUSE_PENDING)
+                if(extract && vertex == PATH_TRACE_EXTRACTION_VERTEX + 1u &&
+                    extraction.diffuseHitDistance == PATH_TRACE_EXTRACTION_DIFFUSE_PENDING)
                 {
                     extraction.diffuseHitDistance = payload.hitDistance < 0.0f ? PATH_TRACE_HALF_MAXIMUM :
                         payload.hitDistance;
@@ -1090,8 +1492,15 @@ float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex 
                     // the non-delta lobes, so a non-delta continuation that misses adds nothing. A delta-lobe
                     // continuation keeps its full radiance, as no light sample can produce it. The indirect pass's
                     // vertex 0 is that RTXDI estimate, made by the direct pass.
+#ifdef PATH_TRACE_PSR_LIBRARY
+                    // PSR.1c-A: the first non-delta continuation leaving the RTXDI vertex, which is vertex 1 (the
+                    // replacement surface) for a SURFACE pixel. The mirror's own delta continuation keeps its radiance.
+                    bool directFromRtxdi = primary == PATH_TRACE_PRIMARY_RASTER_SPLIT_INDIRECT &&
+                        vertex == rtxdiVertex + 1u && !previousDelta;
+#else
                     bool directFromRtxdi = primary == PATH_TRACE_PRIMARY_RASTER_SPLIT_INDIRECT && vertex == 1u &&
                         !previousDelta;
+#endif
 
                     if(!directFromRtxdi)
                     {
@@ -1120,11 +1529,24 @@ float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex 
                     break;
                 }
 
-                position = ray.Origin + ray.Direction * payload.hitDistance;
-
-                if(!PathTraceBuildSurface(payload, ray.Direction, surface))
+#ifdef PATH_TRACE_PSR_GBUFFER
+                // PSR.2: a replaced pixel's vertex 1 is B reconstructed from the G-buffer, not a hit.
+                if(replacementVertex)
                 {
-                    break;
+                    if(!PathTracePsrReplacementSurface(DispatchRaysIndex().xy, rasterFirstVertex, position, surface))
+                    {
+                        break;
+                    }
+                }
+                else
+#endif
+                {
+                    position = ray.Origin + ray.Direction * payload.hitDistance;
+
+                    if(!PathTraceBuildSurface(payload, ray.Direction, surface))
+                    {
+                        break;
+                    }
                 }
             }
         }
@@ -1189,7 +1611,12 @@ float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex 
             float3 direct;
             float3 directDiffuse = float3(0.0f, 0.0f, 0.0f);
 
+#ifdef PATH_TRACE_PSR_LIBRARY
+            // PSR.1c-A: the RTXDI estimate at the RTXDI vertex, drawing and discarding the randoms exhaustive NEE draws.
+            if(primary == PATH_TRACE_PRIMARY_RASTER_SPLIT_INDIRECT && vertex == rtxdiVertex)
+#else
             if(primary == PATH_TRACE_PRIMARY_RASTER_SPLIT_INDIRECT && vertex == 0u)
+#endif
             {
                 direct = PathTraceSplitDirectLighting(random);
 
@@ -1215,7 +1642,8 @@ float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex 
             // Vertex 0's direct light is split per lobe; later vertices' is carried by the diffuse throughput.
             if(extract)
             {
-                extraction.diffuse += vertex == 0u ? throughput * directDiffuse : extraction.diffuseThroughput * direct;
+                extraction.diffuse += vertex == PATH_TRACE_EXTRACTION_VERTEX ? throughput * directDiffuse :
+                    extraction.diffuseThroughput * direct;
             }
         }
 
@@ -1231,10 +1659,15 @@ float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex 
 
         if(extract)
         {
-            if(vertex == 0u)
+            if(vertex == PATH_TRACE_EXTRACTION_VERTEX)
             {
+#ifdef PATH_TRACE_PSR_GBUFFER
+                // PSR.2: the throughput before B's sample is the mirror's delta weight.
+                extraction.diffuseThroughput = throughput * diffuseShare * bsdfSample.weight;
+#else
                 // The throughput before vertex 0's sample is 1.
                 extraction.diffuseThroughput = diffuseShare * bsdfSample.weight;
+#endif
                 extraction.hitDistance = specularStrategy ? PATH_TRACE_EXTRACTION_SPECULAR_PENDING :
                     PATH_TRACE_EXTRACTION_NO_SPECULAR;
                 extraction.diffuseHitDistance = specularStrategy ? PATH_TRACE_EXTRACTION_NO_DIFFUSE :
@@ -1284,6 +1717,7 @@ float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex 
     }
 
     PATH_TRACE_RADIANCE_CACHE_HARVEST(PathTraceRadianceCacheHarvestEnd(harvest));
+#undef PATH_TRACE_EXTRACTION_VERTEX
     return radiance;
 }
 
@@ -1424,6 +1858,19 @@ void PathTraceRunRayGeneration(uint primary, bool extract)
             rasterFirstVertex = PathTraceDecodeRasterFirstVertex(pixel);
         }
 
+#ifdef PATH_TRACE_PSR_LIBRARY
+        // PSR.1a: Raster Primary; PSR.1c-A: and the split ReSTIR DI indirect pass. Extraction never runs from a PSR.1
+        // library; PSR.2 Stage 3B extracts at the effective primary.
+#ifdef PATH_TRACE_PSR_GBUFFER
+        if(primary == PATH_TRACE_PRIMARY_RASTER || primary == PATH_TRACE_PRIMARY_RASTER_SPLIT_INDIRECT)
+#else
+        if((primary == PATH_TRACE_PRIMARY_RASTER || primary == PATH_TRACE_PRIMARY_RASTER_SPLIT_INDIRECT) && !extract)
+#endif
+        {
+            PathTraceResolveEffectivePrimary(pixel, rasterFirstVertex);
+        }
+#endif
+
         if(primary == PATH_TRACE_PRIMARY_RASTER_SPLIT_INDIRECT)
         {
             g_splitPixel = pixel;
@@ -1433,7 +1880,14 @@ void PathTraceRunRayGeneration(uint primary, bool extract)
 
         if(extract && rasterFirstVertex.state > 0)
         {
+#ifdef PATH_TRACE_PSR_GBUFFER
+            // PSR.2: the view Z of the surface the denoisers see, the G-buffer's virtual point.
+            diffuseNormalization = PathTraceExtractionDiffuseNormalization(
+                rasterFirstVertex.psrState == PATH_TRACE_PSR_SURFACE ? PathTracePsrVirtualPosition(pixel) :
+                rasterFirstVertex.position);
+#else
             diffuseNormalization = PathTraceExtractionDiffuseNormalization(rasterFirstVertex.position);
+#endif
         }
 
         for(uint sampleOffset = 0u; sampleOffset < samplesPerFrame; ++sampleOffset)
@@ -1603,6 +2057,456 @@ void PathTraceRasterPrimaryRayGeneration()
     PathTraceRunRayGeneration(PATH_TRACE_PRIMARY_RASTER, false);
 }
 
+#ifdef PATH_TRACE_PSR_LIBRARY
+// PSR.1a: one record per pixel, before this library's raster primary. The continuation is built exactly as the path
+// loop builds vertex 0's: the delta sample of the decoded G-buffer vertex (its direction does not depend on the
+// randoms; random.x = 0 selects the delta lobe, whose probability is 1), the same origin offset and interval. Pixels
+// that are not pure-delta mirrors trace nothing.
+[shader("raygeneration")]
+void PathTracePsrRayGeneration()
+{
+    uint2 pixel = DispatchRaysIndex().xy;
+
+    if(any(pixel >= resolution))
+    {
+        return;
+    }
+
+    // PSR.1a-P: exact early rejection before the full decode. An eligible vertex is a surface (depth below 1) whose
+    // finalized roughness is at most PATH_TRACE_DELTA_ROUGHNESS, and the 8-bit G-buffer roughness holds only k / 255,
+    // so only 0 can be eligible.
+    Texture2D<float> depthTexture = ResourceDescriptorHeap[gBufferDepthIndex];
+    Texture2D<float4> materialTexture = ResourceDescriptorHeap[gBufferMaterialIndex];
+
+    if(maxPathDepth == 0u || !(depthTexture.Load(int3(pixel, 0)) < 1.0f) || materialTexture.Load(int3(pixel, 0)).w > 0.0f)
+    {
+        PathTracePsrStoreState(pixel, PATH_TRACE_PSR_NONE);
+        return;
+    }
+
+    PathTraceRasterFirstVertex firstVertex = PathTraceDecodeRasterFirstVertex(pixel);
+    PathTracePayload payload;
+    payload.hitDistance = -1.0f;
+    payload.geometricNormal = float3(0.0f, 0.0f, 1.0f);
+    payload.shadingNormal = float3(0.0f, 0.0f, 1.0f);
+    payload.uv = float2(0.0f, 0.0f);
+    payload.materialIndex = 0u;
+    uint state = PATH_TRACE_PSR_NONE;
+
+    if(PathTracePsrEligible(firstVertex))
+    {
+        float3 diffuseShare;
+        bool specularStrategy;
+        PathTraceBSDFSample mirrorSample = PathTraceSampleBSDFLobes(firstVertex.surface, float3(0.0f, 0.0f, 0.0f),
+            diffuseShare, specularStrategy);
+        state = PATH_TRACE_PSR_FALLBACK_DIRECTION;
+
+        if(mirrorSample.valid && mirrorSample.delta)
+        {
+            RayDesc ray;
+            ray.Origin = PathTraceOffsetRayOrigin(firstVertex.position, firstVertex.surface.geometricNormal);
+            ray.Direction = mirrorSample.direction;
+            ray.TMin = 0.0f;
+            ray.TMax = PATH_TRACE_DISTANT_LIGHT_DISTANCE;
+            TraceRay(scene, RAY_FLAG_NONE, 0xFF, 0, 1, PATH_TRACE_MISS_RADIANCE, ray, payload);
+
+            PathTraceSurface replacement;
+
+            if(payload.hitDistance < 0.0f)
+            {
+                state = PATH_TRACE_PSR_SKY;
+            }
+            else if(!PathTraceBuildSurface(payload, ray.Direction, replacement))
+            {
+                state = PATH_TRACE_PSR_FALLBACK_SURFACE;
+            }
+            else if(payload.materialIndex > PATH_TRACE_PSR_MAXIMUM_MATERIAL_INDEX)
+            {
+                state = PATH_TRACE_PSR_FALLBACK_SURFACE;
+            }
+            else
+            {
+                state = replacement.deltaSpecular ? PATH_TRACE_PSR_FALLBACK_MIRROR : PATH_TRACE_PSR_SURFACE;
+            }
+        }
+    }
+
+    if(PathTracePsrReplaced(state))
+    {
+        PathTracePsrStoreRecord(pixel, state, payload);
+    }
+    else
+    {
+        PathTracePsrStoreState(pixel, state);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// PSR.1b virtual surface guides (diagnostic consumers only). PathTracePsrGuideRayGeneration replaces the record pass on
+// guide frames: it writes the identical record, from the identical ray and closest-hit evaluation, and in addition one
+// guide per pixel. Physical coordinates (lighting, visibility) stay in the record and the raster vertex 0; the guide
+// holds only virtual coordinates (reprojection) and identity.
+//
+// Conventions (single planar mirror at vertex 0; P the unlifted raster mirror point, n its viewer-facing geometric
+// normal; B = origin + d t the physical replacement hit):
+//   reflect(X)     = X - 2 n dot(n, X - P), the mirror image of a point; normals reflect as m - 2 n dot(n, m)
+//   virtual point  Bv = reflect(B), on the pixel's camera ray
+//   virtual normal reflect of B's shading normal, after facing it towards the incoming ray -d (so it faces the camera)
+//   viewZ          dot(view row 2, Bv), +Z forward, linear, as Triangle.hlsl's view depth
+//   motion         Triangle.hlsl's convention: currentUV - previousUV of the unjittered projections, and
+//                  previous view depth - current view depth. The previous virtual point is reflect(T B), with T the
+//                  replacement instance's current-to-previous world transform and the current plane (static mirror).
+//   sky            a mirror-to-sky pixel's virtual image is the camera direction v at infinity: motion of the direction
+//                  only (w = 0, rotation), viewZ 0.
+// -----------------------------------------------------------------------------
+
+cbuffer PathTracePsrGuideConstants : register(b3)
+{
+    // Unjittered current and previous view-projection; row 2 of the current and previous views (view depth).
+    row_major float4x4 psrViewProjection;
+    row_major float4x4 psrPreviousViewProjection;
+    float4 psrViewDepthRow;
+    float4 psrPreviousViewDepthRow;
+    uint psrGuideIndex;
+    // 1 when the previous camera and the previous instance transforms describe the immediately previous frame.
+    uint psrHistoryValid;
+    uint psrTransformCount;
+    uint psrIdentityIndex;
+};
+
+// Current-to-previous world transform of each render object (TLAS InstanceID), rows of a 3x4 matrix; valid is 0 for
+// objects without a resident instance.
+struct PathTracePsrTransform
+{
+    float4 row0;
+    float4 row1;
+    float4 row2;
+    uint valid;
+    uint3 padding;
+};
+
+StructuredBuffer<PathTracePsrTransform> psrTransforms : register(t1);
+
+// Guide states (word 2 bits 24-31).
+static const uint PATH_TRACE_PSR_GUIDE_NONE = 0u;
+static const uint PATH_TRACE_PSR_GUIDE_VALID = 1u;
+static const uint PATH_TRACE_PSR_GUIDE_SKY = 2u;
+// Current-frame guides valid, motion invalid:
+static const uint PATH_TRACE_PSR_GUIDE_HISTORY_INVALID = 3u;
+static const uint PATH_TRACE_PSR_GUIDE_TRANSFORM_INVALID = 4u;
+static const uint PATH_TRACE_PSR_GUIDE_MIRROR_MOVED = 5u;
+static const uint PATH_TRACE_PSR_GUIDE_PROJECTION_INVALID = 6u;
+// replacement instance, replacement primitive, mirror identity | state << 24, viewZ, motion xyz, virtual normal (oct).
+static const uint PATH_TRACE_PSR_GUIDE_STRIDE = 32u;
+
+float2 PathTracePsrOctEncode(float3 normal)
+{
+    float2 projected = normal.xy / (abs(normal.x) + abs(normal.y) + abs(normal.z));
+
+    if(normal.z < 0.0f)
+    {
+        projected = (1.0f - abs(projected.yx)) * select(projected.xy >= 0.0f, 1.0f, -1.0f);
+    }
+
+    return projected * 0.5f + 0.5f;
+}
+
+float3 PathTracePsrReflectPoint(float3 position, float3 planePoint, float3 planeNormal)
+{
+    return position - 2.0f * planeNormal * dot(planeNormal, position - planePoint);
+}
+
+float3 PathTracePsrReflectDirection(float3 direction, float3 planeNormal)
+{
+    return direction - 2.0f * planeNormal * dot(planeNormal, direction);
+}
+
+float3 PathTracePsrTransformPoint(PathTracePsrTransform transform, float3 position)
+{
+    float4 homogeneous = float4(position, 1.0f);
+    return float3(dot(transform.row0, homogeneous), dot(transform.row1, homogeneous), dot(transform.row2, homogeneous));
+}
+
+bool PathTracePsrIsIdentity(PathTracePsrTransform transform)
+{
+    float4 difference = abs(transform.row0 - float4(1.0f, 0.0f, 0.0f, 0.0f)) + abs(transform.row1 -
+        float4(0.0f, 1.0f, 0.0f, 0.0f)) + abs(transform.row2 - float4(0.0f, 0.0f, 1.0f, 0.0f));
+    return transform.valid != 0u && all(difference < 1.0e-6f);
+}
+
+// Projects a point (w = 1) or direction (w = 0) to unjittered texture coordinates; false behind the camera.
+bool PathTracePsrProject(float4x4 viewProjection, float4 position, out float2 uv)
+{
+    float4 clip = mul(viewProjection, position);
+    uv = float2(0.0f, 0.0f);
+
+    if(!(clip.w > 1.0e-6f) || !all(isfinite(clip)))
+    {
+        return false;
+    }
+
+    uv = clip.xy / clip.w * float2(0.5f, -0.5f) + 0.5f;
+    return true;
+}
+
+void PathTracePsrStoreGuide(uint2 pixel, uint replacementInstance, uint replacementPrimitive, uint mirrorIdentity,
+    uint guideState, float viewZ, float3 motion, float3 virtualNormal)
+{
+    RWByteAddressBuffer guides = ResourceDescriptorHeap[psrGuideIndex];
+    uint address = (pixel.y * resolution.x + pixel.x) * PATH_TRACE_PSR_GUIDE_STRIDE;
+    uint2 octal = uint2(round(saturate(PathTracePsrOctEncode(virtualNormal)) * 65535.0f));
+    guides.Store4(address, uint4(replacementInstance, replacementPrimitive,
+        (mirrorIdentity & 0x00FFFFFFu) | (guideState << 24), asuint(viewZ)));
+    guides.Store4(address + 16u, uint4(asuint(motion), octal.x | (octal.y << 16)));
+}
+
+void PathTracePsrStoreGuideState(uint2 pixel, uint guideState)
+{
+    RWByteAddressBuffer guides = ResourceDescriptorHeap[psrGuideIndex];
+    guides.Store((pixel.y * resolution.x + pixel.x) * PATH_TRACE_PSR_GUIDE_STRIDE + 8u, guideState << 24);
+}
+
+[shader("raygeneration")]
+void PathTracePsrGuideRayGeneration()
+{
+    uint2 pixel = DispatchRaysIndex().xy;
+
+    if(any(pixel >= resolution))
+    {
+        return;
+    }
+
+    // The record pass, statement for statement, with the guide payload.
+    Texture2D<float> depthTexture = ResourceDescriptorHeap[gBufferDepthIndex];
+    Texture2D<float4> materialTexture = ResourceDescriptorHeap[gBufferMaterialIndex];
+
+    if(maxPathDepth == 0u || !(depthTexture.Load(int3(pixel, 0)) < 1.0f) || materialTexture.Load(int3(pixel, 0)).w > 0.0f)
+    {
+        PathTracePsrStoreState(pixel, PATH_TRACE_PSR_NONE);
+        PathTracePsrStoreGuideState(pixel, PATH_TRACE_PSR_GUIDE_NONE);
+        return;
+    }
+
+    PathTraceRasterFirstVertex firstVertex = PathTraceDecodeRasterFirstVertex(pixel);
+    PathTracePsrGuidePayload guidePayload;
+    guidePayload.hitDistance = -1.0f;
+    guidePayload.geometricNormal = float3(0.0f, 0.0f, 1.0f);
+    guidePayload.shadingNormal = float3(0.0f, 0.0f, 1.0f);
+    guidePayload.uv = float2(0.0f, 0.0f);
+    guidePayload.materialIndex = 0u;
+    guidePayload.instanceID = 0xFFFFFFFFu;
+    guidePayload.primitiveIndex = 0xFFFFFFFFu;
+    PathTracePayload payload;
+    payload.hitDistance = -1.0f;
+    payload.geometricNormal = float3(0.0f, 0.0f, 1.0f);
+    payload.shadingNormal = float3(0.0f, 0.0f, 1.0f);
+    payload.uv = float2(0.0f, 0.0f);
+    payload.materialIndex = 0u;
+    uint state = PATH_TRACE_PSR_NONE;
+    RayDesc ray;
+    ray.Origin = float3(0.0f, 0.0f, 0.0f);
+    ray.Direction = float3(0.0f, 0.0f, 1.0f);
+    ray.TMin = 0.0f;
+    ray.TMax = 0.0f;
+
+    if(PathTracePsrEligible(firstVertex))
+    {
+        float3 diffuseShare;
+        bool specularStrategy;
+        PathTraceBSDFSample mirrorSample = PathTraceSampleBSDFLobes(firstVertex.surface, float3(0.0f, 0.0f, 0.0f),
+            diffuseShare, specularStrategy);
+        state = PATH_TRACE_PSR_FALLBACK_DIRECTION;
+
+        if(mirrorSample.valid && mirrorSample.delta)
+        {
+            ray.Origin = PathTraceOffsetRayOrigin(firstVertex.position, firstVertex.surface.geometricNormal);
+            ray.Direction = mirrorSample.direction;
+            ray.TMin = 0.0f;
+            ray.TMax = PATH_TRACE_DISTANT_LIGHT_DISTANCE;
+            TraceRay(scene, RAY_FLAG_NONE, 0xFF, 0, 1, PATH_TRACE_MISS_RADIANCE, ray, guidePayload);
+            payload.hitDistance = guidePayload.hitDistance;
+            payload.geometricNormal = guidePayload.geometricNormal;
+            payload.shadingNormal = guidePayload.shadingNormal;
+            payload.uv = guidePayload.uv;
+            payload.materialIndex = guidePayload.materialIndex;
+
+            PathTraceSurface replacement;
+
+            if(payload.hitDistance < 0.0f)
+            {
+                state = PATH_TRACE_PSR_SKY;
+            }
+            else if(!PathTraceBuildSurface(payload, ray.Direction, replacement))
+            {
+                state = PATH_TRACE_PSR_FALLBACK_SURFACE;
+            }
+            else if(payload.materialIndex > PATH_TRACE_PSR_MAXIMUM_MATERIAL_INDEX)
+            {
+                state = PATH_TRACE_PSR_FALLBACK_SURFACE;
+            }
+            else
+            {
+                state = replacement.deltaSpecular ? PATH_TRACE_PSR_FALLBACK_MIRROR : PATH_TRACE_PSR_SURFACE;
+            }
+        }
+    }
+
+    if(!PathTracePsrReplaced(state))
+    {
+        PathTracePsrStoreState(pixel, state);
+        PathTracePsrStoreGuideState(pixel, PATH_TRACE_PSR_GUIDE_NONE);
+        return;
+    }
+
+    PathTracePsrStoreRecord(pixel, state, payload);
+
+    // The mirror plane: the raster point before PATH_TRACE_PRIMARY_SURFACE_LIFT, and its viewer-facing geometric normal.
+    float3 planeNormal = firstVertex.surface.geometricNormal;
+    // The lift is along n, so the lifted point's camera distance differs from the raster point's only to second order.
+    float lift = PATH_TRACE_PRIMARY_SURFACE_LIFT * length(firstVertex.position - cameraPosition);
+    float3 planePoint = firstVertex.position - planeNormal * lift;
+    Texture2D<uint2> identityTexture = ResourceDescriptorHeap[psrIdentityIndex];
+    uint mirrorIdentity = PsrIdentityInstance(identityTexture.Load(int3(pixel, 0)).x);
+    uint mirrorInstance = mirrorIdentity - 1u;
+    bool mirrorStatic = mirrorIdentity != 0u && mirrorIdentity != 0xFFFFFFFFu && mirrorInstance < psrTransformCount &&
+        PathTracePsrIsIdentity(psrTransforms[mirrorInstance]);
+
+    if(state == PATH_TRACE_PSR_SKY)
+    {
+        // The virtual image is the camera direction at infinity; with a static mirror its motion is that of the
+        // direction under the camera's rotation.
+        float3 virtualDirection = -firstVertex.surface.view;
+        float2 currentUV;
+        float2 previousUV;
+        uint skyState = PATH_TRACE_PSR_GUIDE_SKY;
+        float3 skyMotion = float3(0.0f, 0.0f, 0.0f);
+
+        if(psrHistoryValid == 0u)
+        {
+            skyState = PATH_TRACE_PSR_GUIDE_HISTORY_INVALID;
+        }
+        else if(!mirrorStatic)
+        {
+            skyState = PATH_TRACE_PSR_GUIDE_MIRROR_MOVED;
+        }
+        else if(!PathTracePsrProject(psrViewProjection, float4(virtualDirection, 0.0f), currentUV) ||
+            !PathTracePsrProject(psrPreviousViewProjection, float4(virtualDirection, 0.0f), previousUV))
+        {
+            skyState = PATH_TRACE_PSR_GUIDE_PROJECTION_INVALID;
+        }
+        else
+        {
+            skyMotion = float3(currentUV - previousUV, 0.0f);
+        }
+
+        PathTracePsrStoreGuide(pixel, 0xFFFFFFFFu, 0xFFFFFFFFu, mirrorIdentity, skyState, 0.0f, skyMotion,
+            -virtualDirection);
+        return;
+    }
+
+    float3 replacementPoint = ray.Origin + ray.Direction * payload.hitDistance;
+    float3 virtualPoint = PathTracePsrReflectPoint(replacementPoint, planePoint, planeNormal);
+    float3 replacementNormal = dot(payload.shadingNormal, ray.Direction) > 0.0f ? -payload.shadingNormal :
+        payload.shadingNormal;
+    float3 virtualNormal = PathTracePsrReflectDirection(replacementNormal, planeNormal);
+    float viewZ = dot(psrViewDepthRow, float4(virtualPoint, 1.0f));
+    uint guideState = PATH_TRACE_PSR_GUIDE_VALID;
+    float3 motion = float3(0.0f, 0.0f, 0.0f);
+    uint replacementInstance = guidePayload.instanceID;
+
+    if(psrHistoryValid == 0u)
+    {
+        guideState = PATH_TRACE_PSR_GUIDE_HISTORY_INVALID;
+    }
+    else if(replacementInstance >= psrTransformCount || psrTransforms[replacementInstance].valid == 0u)
+    {
+        guideState = PATH_TRACE_PSR_GUIDE_TRANSFORM_INVALID;
+    }
+    else if(!mirrorStatic)
+    {
+        guideState = PATH_TRACE_PSR_GUIDE_MIRROR_MOVED;
+    }
+    else
+    {
+        float3 previousPoint = PathTracePsrTransformPoint(psrTransforms[replacementInstance], replacementPoint);
+        float3 previousVirtualPoint = PathTracePsrReflectPoint(previousPoint, planePoint, planeNormal);
+        float2 currentUV;
+        float2 previousUV;
+
+        if(!PathTracePsrProject(psrViewProjection, float4(virtualPoint, 1.0f), currentUV) ||
+            !PathTracePsrProject(psrPreviousViewProjection, float4(previousVirtualPoint, 1.0f), previousUV))
+        {
+            guideState = PATH_TRACE_PSR_GUIDE_PROJECTION_INVALID;
+        }
+        else
+        {
+            motion = float3(currentUV - previousUV,
+                dot(psrPreviousViewDepthRow, float4(previousVirtualPoint, 1.0f)) - viewZ);
+        }
+    }
+
+    PathTracePsrStoreGuide(pixel, replacementInstance, guidePayload.primitiveIndex, mirrorIdentity, guideState, viewZ,
+        motion, virtualNormal);
+}
+
+// PSR.2 Stage 3A verification probe (development; dispatched only by a test hook after the split pair): per pixel, what
+// the split passes see through the effective primary surface interface, with this library's storage (PSR.1's records
+// or PSR.2's G-buffer). 48 words: flags (1 vertex 0 is a surface, 2 SURFACE, 4 B shaded, 8 delta sample valid), the
+// vertex-0 position, shading normal, geometric normal, base colour, delta weight and direction, then B's position,
+// shading normal, geometric normal, view, base colour, roughness, metallic, specular probability, normal dot view, and
+// the vertex-0 view. The raw UAV is the library's spare constant word.
+#ifdef PATH_TRACE_PSR_GBUFFER
+#define PATH_TRACE_PSR_PROBE_INDEX psrGBufferPadding.x
+#else
+#define PATH_TRACE_PSR_PROBE_INDEX psrPadding
+#endif
+
+[shader("raygeneration")]
+void PathTracePsrProbeRayGeneration()
+{
+    uint2 pixel = DispatchRaysIndex().xy;
+
+    if(any(pixel >= resolution))
+    {
+        return;
+    }
+
+    PathTraceRasterFirstVertex firstVertex = PathTraceDecodeRasterFirstVertex(pixel);
+    PathTraceResolveEffectivePrimary(pixel, firstVertex);
+    float3 diffuseShare;
+    bool specularStrategy;
+    PathTraceBSDFSample mirrorSample = (PathTraceBSDFSample)0;
+
+    if(firstVertex.state > 0)
+    {
+        mirrorSample = PathTraceSampleBSDFLobes(firstVertex.surface, float3(0.0f, 0.0f, 0.0f), diffuseShare,
+            specularStrategy);
+    }
+
+    float3 position = float3(0.0f, 0.0f, 0.0f);
+    PathTraceSurface surface = (PathTraceSurface)0;
+    bool shaded = firstVertex.state > 0 && PathTraceEffectivePrimaryShadingVertex(pixel, firstVertex, position, surface);
+    uint flags = (firstVertex.state > 0 ? 1u : 0u) | (firstVertex.psrState == PATH_TRACE_PSR_SURFACE ? 2u : 0u) |
+        (shaded ? 4u : 0u) | (mirrorSample.valid && mirrorSample.delta ? 8u : 0u);
+
+    RWByteAddressBuffer probe = ResourceDescriptorHeap[PATH_TRACE_PSR_PROBE_INDEX];
+    uint address = (pixel.y * resolution.x + pixel.x) * 192u;
+    probe.Store4(address, uint4(flags, asuint(firstVertex.position)));
+    probe.Store4(address + 16u, uint4(asuint(firstVertex.surface.normal), asuint(firstVertex.surface.geometricNormal.x)));
+    probe.Store4(address + 32u, uint4(asuint(firstVertex.surface.geometricNormal.yz), asuint(firstVertex.surface.baseColor.xy)));
+    probe.Store4(address + 48u, uint4(asuint(firstVertex.surface.baseColor.z), asuint(mirrorSample.weight)));
+    probe.Store4(address + 64u, uint4(asuint(mirrorSample.direction), asuint(position.x)));
+    probe.Store4(address + 80u, uint4(asuint(position.yz), asuint(surface.normal.xy)));
+    probe.Store4(address + 96u, uint4(asuint(surface.normal.z), asuint(surface.geometricNormal)));
+    probe.Store4(address + 112u, uint4(asuint(surface.view), asuint(surface.baseColor.x)));
+    probe.Store4(address + 128u, uint4(asuint(surface.baseColor.yz), asuint(surface.material.roughness),
+        asuint(surface.material.metallic)));
+    probe.Store4(address + 144u, uint4(asuint(surface.specularProbability), asuint(surface.normalDotView),
+        asuint(firstVertex.surface.view.xy)));
+    probe.Store4(address + 160u, uint4(asuint(firstVertex.surface.view.z), 0u, 0u, 0u));
+}
+#endif
+
 #ifdef PATH_TRACE_RESTIR_DI_LIBRARY
 // RTXPT.3 ReSTIR DI direct pass (PathTraceReSTIRDI.hlsl only): the RTXDI work of vertex 0 for every sample of this
 // dispatch, initial sampling, sample 0's spatiotemporal reuse, visibility and reservoir publication, with no path
@@ -1626,6 +2530,19 @@ void PathTraceRunReSTIRDISplitDirect(bool extract)
         bool hasNonDeltaLobe = !rasterFirstVertex.surface.deltaSpecular ||
             rasterFirstVertex.surface.specularProbability < 1.0f;
         bool directLighting = rasterFirstVertex.state > 0 && maxPathDepth > 0u && hasNonDeltaLobe;
+#ifdef PATH_TRACE_PSR_LIBRARY
+        // PSR.1c-A: a SURFACE pixel (a pure-delta mirror; the production pass computes nothing for it) is lit at its
+        // replacement surface, the path loop's vertex 1, which is shaded only below maxPathDepth. Reuse is disabled for
+        // it: sample 0 never reuses history (the fused pass would also gather spatial neighbors) and the pixel publishes
+        // the empty reservoir the production pass publishes for a pure mirror, so no other pixel's history changes.
+        // An ordinary lit vertex is never eligible (a pure-delta mirror has no non-delta lobe), so it reads no record.
+        PathTraceResolveEffectivePrimary(pixel, rasterFirstVertex);
+        float3 directPosition;
+        PathTraceSurface directSurface;
+        bool replacedSurface = PathTraceEffectivePrimaryShadingVertex(pixel, rasterFirstVertex, directPosition,
+            directSurface);
+        directLighting = directLighting || replacedSurface;
+#endif
 
         g_rtxdiPixel = pixel;
         g_rtxdiReservoirStored = false;
@@ -1636,6 +2553,9 @@ void PathTraceRunReSTIRDISplitDirect(bool extract)
             g_rtxdiSampleSeed = PathTraceHash((accumulatedSamples + sampleOffset) ^ PathTraceHash(randomSeed ^
                 0x52545844u));
             g_rtxdiStoreReservoir = sampleOffset == 0u;
+#ifdef PATH_TRACE_PSR_LIBRARY
+            g_rtxdiStoreReservoir = g_rtxdiStoreReservoir && !replacedSurface;
+#endif
             float3 sampleDirect = float3(0.0f, 0.0f, 0.0f);
             float3 sampleDirectDiffuse = float3(0.0f, 0.0f, 0.0f);
 
@@ -1643,8 +2563,13 @@ void PathTraceRunReSTIRDISplitDirect(bool extract)
             {
                 // RTXDI draws from its own sequence; the path randoms it discards are the indirect pass's.
                 PathTraceRandom discardedRandom = (PathTraceRandom)0;
+#ifdef PATH_TRACE_PSR_LIBRARY
+                sampleDirect = PathTraceRtxdiDirectLighting(directSurface, directPosition, discardedRandom, rayCount,
+                    sampleDirectDiffuse);
+#else
                 sampleDirect = PathTraceRtxdiDirectLighting(rasterFirstVertex.surface, rasterFirstVertex.position,
                     discardedRandom, rayCount, sampleDirectDiffuse);
+#endif
             }
 
             directRadiance.Store3(PathTraceSplitDirectRadianceAddress(pixel, sampleOffset), asuint(sampleDirect));
@@ -1872,3 +2797,123 @@ void PathTraceClosestHit(inout PathTracePayload payload, BuiltInTriangleIntersec
     payload.uv = uv;
     payload.materialIndex = instance.materialIndex;
 }
+
+#ifdef PATH_TRACE_PSR_LIBRARY
+// PSR.1b guide hit group: PathTraceClosestHit plus the hit's TLAS instance and primitive. The evaluation is a verbatim
+// copy (factoring it into a shared function changed every production library's DXIL); it must stay identical, which
+// the PSR bit-identity gates check, because the guide pass writes the records the raster primary consumes.
+[shader("closesthit")]
+void PathTracePsrGuideClosestHit(inout PathTracePsrGuidePayload payload, BuiltInTriangleIntersectionAttributes attributes)
+{
+    StructuredBuffer<RayTracingInstanceData> instances = ResourceDescriptorHeap[instanceDataIndex];
+    RayTracingInstanceData instance = instances[InstanceID()];
+    instance.materialIndex = ResolveHitMaterial(instance, PrimitiveIndex());
+
+    ByteAddressBuffer vertexBuffer = ResourceDescriptorHeap[NonUniformResourceIndex(instance.vertexBufferIndex)];
+    uint3 indices = PathTraceTriangleIndices(instance, PrimitiveIndex());
+    float3 barycentrics = float3(1.0f - attributes.barycentrics.x - attributes.barycentrics.y,
+        attributes.barycentrics.x, attributes.barycentrics.y);
+
+    // Normals use the inverse transpose of object-to-world (row vector times world-to-object).
+    float3x3 normalTransform = (float3x3)WorldToObject3x4();
+    float3 position0 = PathTraceLoadPosition(vertexBuffer, indices.x, instance.vertexStride);
+    float3 position1 = PathTraceLoadPosition(vertexBuffer, indices.y, instance.vertexStride);
+    float3 position2 = PathTraceLoadPosition(vertexBuffer, indices.z, instance.vertexStride);
+    float3 objectGeometricNormal = cross(position1 - position0, position2 - position0);
+    float3 geometricNormal = mul(objectGeometricNormal, normalTransform);
+    float geometricLengthSquared = dot(geometricNormal, geometricNormal);
+
+    float3 objectNormal = PathTraceLoadNormal(vertexBuffer, indices.x, instance) * barycentrics.x +
+        PathTraceLoadNormal(vertexBuffer, indices.y, instance) * barycentrics.y +
+        PathTraceLoadNormal(vertexBuffer, indices.z, instance) * barycentrics.z;
+    float3 worldNormal = mul(objectNormal, normalTransform);
+    float worldNormalLengthSquared = dot(worldNormal, worldNormal);
+
+    float2 uv = PathTraceLoadUV(vertexBuffer, indices.x, instance) * barycentrics.x +
+        PathTraceLoadUV(vertexBuffer, indices.y, instance) * barycentrics.y +
+        PathTraceLoadUV(vertexBuffer, indices.z, instance) * barycentrics.z;
+
+    if(!(geometricLengthSquared > 1.0e-30f) || !isfinite(geometricLengthSquared))
+    {
+        geometricNormal = -WorldRayDirection();
+    }
+    else
+    {
+        geometricNormal *= rsqrt(geometricLengthSquared);
+    }
+
+    if(!(worldNormalLengthSquared > 1.0e-16f) || !isfinite(worldNormalLengthSquared))
+    {
+        worldNormal = geometricNormal;
+    }
+    else
+    {
+        worldNormal *= rsqrt(worldNormalLengthSquared);
+    }
+
+    // Interpolated normals keep the triangle's orientation so two-sided flipping stays consistent.
+    if(dot(worldNormal, geometricNormal) < 0.0f)
+    {
+        geometricNormal = -geometricNormal;
+    }
+
+    float3 shadingNormal = worldNormal;
+    StructuredBuffer<GPUMaterial> materials = ResourceDescriptorHeap[materialBufferIndex];
+    uint materialCount;
+    uint materialStride;
+    materials.GetDimensions(materialCount, materialStride);
+
+    // Tangent-space normal mapping, identical to the RTGI/G-buffer convention.
+    if(instance.materialIndex < materialCount && instance.tangentOffset != 0xFFFFFFFFu &&
+        materials[instance.materialIndex].normalTextureIndex != 0xFFFFFFFFu)
+    {
+        GPUMaterial material = materials[instance.materialIndex];
+        float4 objectTangent = PathTraceLoadTangent(vertexBuffer, indices.x, instance) * barycentrics.x +
+            PathTraceLoadTangent(vertexBuffer, indices.y, instance) * barycentrics.y +
+            PathTraceLoadTangent(vertexBuffer, indices.z, instance) * barycentrics.z;
+        float3 tangent = mul((float3x3)ObjectToWorld3x4(), objectTangent.xyz);
+        tangent -= worldNormal * dot(worldNormal, tangent);
+        float tangentLengthSquared = dot(tangent, tangent);
+        float instanceDeterminant = determinant((float3x3)ObjectToWorld3x4());
+        float handedness = objectTangent.w * (instanceDeterminant < 0.0f ? -1.0f : 1.0f);
+
+        Texture2D<float4> normalTexture = ResourceDescriptorHeap[NonUniformResourceIndex(material.normalTextureIndex)];
+        float2 normalXY = normalTexture.SampleLevel(materialSampler, uv, 0.0f).rg * 2.0f - 1.0f;
+        float3 sampledNormal = float3(normalXY, sqrt(saturate(1.0f - dot(normalXY, normalXY))));
+        float sampledLengthSquared = dot(sampledNormal, sampledNormal);
+
+        bool frameValid = all(isfinite(tangent)) && isfinite(tangentLengthSquared) && tangentLengthSquared > 1.0e-8f &&
+            all(isfinite(sampledNormal)) && sampledLengthSquared > 1.0e-8f && isfinite(handedness) &&
+            abs(handedness) > 1.0e-8f && isfinite(instanceDeterminant) && instanceDeterminant != 0.0f;
+
+        if(frameValid)
+        {
+            sampledNormal = normalize(sampledNormal);
+            float3 tangentDirection = normalize(tangent);
+            float3 bitangent = cross(worldNormal, tangentDirection) * handedness;
+            float3 mappedNormal = tangentDirection * sampledNormal.x + bitangent * sampledNormal.y +
+                worldNormal * sampledNormal.z;
+            float mappedLengthSquared = dot(mappedNormal, mappedNormal);
+
+            if(all(isfinite(mappedNormal)) && isfinite(mappedLengthSquared) && mappedLengthSquared > 1.0e-8f)
+            {
+                shadingNormal = mappedNormal * rsqrt(mappedLengthSquared);
+            }
+        }
+    }
+
+    payload.hitDistance = RayTCurrent();
+    payload.geometricNormal = geometricNormal;
+    payload.shadingNormal = shadingNormal;
+    payload.uv = uv;
+    payload.materialIndex = instance.materialIndex;
+    payload.instanceID = InstanceID();
+    payload.primitiveIndex = PrimitiveIndex();
+}
+
+[shader("miss")]
+void PathTracePsrGuideMiss(inout PathTracePsrGuidePayload payload)
+{
+    payload.hitDistance = -1.0f;
+}
+#endif

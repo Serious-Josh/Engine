@@ -20,9 +20,8 @@
 #include <wrl/client.h>
 
 // SHARC.4C/4D production D6 radiance cache: GPU resources, generation clear, retirement, and (4D) the learning binding
-// and resolve. The path tracer's cache library inserts samples (learning only); nothing looks the cache up yet.
-// SHARC.4D-Q (experimental, Insertion::Deferred): the learning library stores training records instead, and
-// RecordDeferredInsertion inserts them before resolve; the record buffer exists only while deferred frames learn.
+// and resolve. SHARC.4D-Q: the learning libraries store training records, and RecordDeferredInsertion inserts them
+// before resolve; the record buffer exists only while frames learn.
 // Independent of SHARC.2's RadianceCache.
 // Header-only, so the build needs no new translation unit. Layout and header: assets/Shaders/RadianceCacheD6.hlsli.
 //
@@ -96,7 +95,7 @@ public:
         std::uint32_t learningThinning = 0;
         std::uint32_t harvestStop = 0;
 
-        // SHARC.4D-Q deferred insertion (0 for inline insertion and resolve).
+        // SHARC.4D-Q deferred insertion (0 outside learning, as for resolve).
         std::uint32_t recordsIndex = 0;
         std::uint32_t recordCapacity = 0;
         std::uint32_t recordSequence = 0;
@@ -126,15 +125,14 @@ public:
 
     static_assert(sizeof(Binding) == 10 * 16);
 
-    // SHARC.4D-Q: where a learning frame's samples are inserted (the default is the validated SHARC.4D path).
+    // SHARC.4D-Q: which paths a learning frame's training records come from. Both are inserted by CSInsertRecords before
+    // resolve.
     enum class Insertion
     {
-        // At the end of each path, in the ray generation.
-        Inline,
-        // The ray generation stores one training record per path; CSInsertRecords inserts them before resolve.
+        // Diagnostics: the image ray generation stores one training record per path.
         Deferred,
-        // SHARC.4D-R (diagnostics): the image renders without learning, and a separate training dispatch traces one
-        // pixel per SetTrainingTile tile, storing compact records that CSInsertRecords inserts.
+        // SHARC.4D-R (production): the image renders without learning, and a separate training dispatch traces one pixel
+        // per SetTrainingTile tile, storing compact records.
         Sparse
     };
 
@@ -659,16 +657,15 @@ public:
     // SHARC.4D learning, after RecordGeneration in the same list and before the path tracer's cache library runs:
     // clears the frame's statistics and returns the address of the insertion binding's constants (0: no learning this
     // frame). The insertion binding carries no published-entry buffer, so training can never read cached radiance.
-    // SHARC.4D-Q: with Insertion::Deferred, the frame stores its samples as records under a new stamp sequence, so
-    // EnsureRecords must have provided room for recordCount records (otherwise the frame does not learn).
+    // SHARC.4D-Q: the frame stores its samples as records under a new stamp sequence, so EnsureRecords must have
+    // provided room for recordCount records (otherwise the frame does not learn).
     D3D12_GPU_VIRTUAL_ADDRESS RecordLearningBegin(ID3D12GraphicsCommandList* commandList, UploadBuffer& uploadBuffer,
-        const SceneLightingEpoch::Status& epoch, std::uint64_t recordCount = 0, std::uint32_t trainingTilesX = 0)
+        const SceneLightingEpoch::Status& epoch, std::uint64_t recordCount, std::uint32_t trainingTilesX = 0)
     {
         m_learningBinding = Binding{};
-        const bool deferred = m_insertion != Insertion::Inline;
 
-        if(!m_usable || !m_resources || !commandList ||
-            (deferred && (!m_records || recordCount == 0 || recordCount > m_records->capacity || !m_insertPipelineReady)))
+        if(!m_usable || !m_resources || !commandList || !m_records || recordCount == 0 ||
+            recordCount > m_records->capacity || !m_insertPipelineReady)
         {
             return 0;
         }
@@ -691,15 +688,9 @@ public:
         binding.learning = 1;
         binding.learningThinning = m_profilingThinning;
         binding.harvestStop = m_profilingHarvestStop;
-        binding.primaryRecordOffset = deferred ? m_primaryRecordOffset : 0u;
+        binding.primaryRecordOffset = m_primaryRecordOffset;
 
-        // Profiling stop 6 reads published entries but inserts nothing, so it cannot train on them.
-        if(m_profilingHarvestStop == 6)
-        {
-            binding.publishedIndex = resources.published.GetUAVDescriptorIndex();
-        }
-
-        if(deferred && !RecordRecordsBegin(commandList, uploadBuffer, binding))
+        if(!RecordRecordsBegin(commandList, uploadBuffer, binding))
         {
             return 0;
         }
@@ -721,7 +712,7 @@ public:
         return address;
     }
 
-    // SHARC.4D-Q: the learning frames' insertion path; Inline unless a diagnostics run selects Deferred.
+    // SHARC.4D-Q: the learning frames' record source; Sparse unless a diagnostics run selects Deferred.
     void SetInsertion(Insertion insertion)
     {
         m_insertion = insertion;
@@ -1118,7 +1109,7 @@ public:
     }
 
     // Diagnostics only (SHARC.4D-P): learn in 1 of `thinning` 8 x 8 pixel blocks per frame, and stop the harvest at a
-    // stage (RadianceCacheD6Binding::harvestStop). 0, 0 is production behaviour.
+    // stage (RadianceCacheD6Binding::harvestStop; 4 and 5 remain). 0, 0 is production behaviour.
     void SetLearningProfiling(std::uint32_t thinning, std::uint32_t harvestStop)
     {
         m_profilingThinning = thinning;
@@ -1444,7 +1435,7 @@ private:
     // SHARC.4D-Q deferred insertion: the pipelines (created with the first record buffer), the record buffer, its
     // retired predecessors, and the stamp sequence of the last deferred learning frame (never reset, so a stamp is
     // only ever current in the frame that wrote it).
-    Insertion m_insertion = Insertion::Inline;
+    Insertion m_insertion = Insertion::Sparse;
     ComputePipeline m_insertPipeline;
     ComputePipeline m_clearStampsPipeline;
     bool m_insertPipelineReady = false;

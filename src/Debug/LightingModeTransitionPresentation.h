@@ -37,11 +37,11 @@ inline const char* GetLightingModeDisplayName(RendererLightingMode mode)
     case RendererLightingMode::Legacy:
         return "Legacy";
     case RendererLightingMode::PathTracedReference:
-        return "Path Traced Reference";
+        return "Reference Path Tracer";
     case RendererLightingMode::PathTracedRasterPrimary:
-        return "Raster Primary";
+        return "Path Tracing (exhaustive direct, diagnostic)";
     case RendererLightingMode::PathTracedRasterPrimaryReSTIRDI:
-        return "ReSTIR DI";
+        return "Path Tracing";
     }
 
     return "Unknown";

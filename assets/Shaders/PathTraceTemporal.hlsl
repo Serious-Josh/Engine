@@ -128,11 +128,27 @@ static const float PATH_TRACE_TEMPORAL_MAXIMUM_MATERIALS = 2048.0f;
 // The diffuse demodulation albedo floor: bounds the division's amplification to 50.
 static const float PATH_TRACE_TEMPORAL_MINIMUM_ALBEDO = 0.02f;
 
+#ifdef PATH_TRACE_PSR_DENOISE
+// PSR.2 Stage 3B (PathTraceTemporalPsr.hlsl): b2 the PSR denoise constants, t0 the replacement pass's transforms, s0
+// Triangle.hlsl's material sampler.
+#define PSR_DENOISE_CONSTANTS_REGISTER b2
+#define PSR_DENOISE_TRANSFORMS_REGISTER t0
+#define PSR_DENOISE_SAMPLER_REGISTER s0
+#include "PsrDenoise.hlsli"
+
+// A replaced pixel's word -(i + 1) is a surface too; the history test compares the words, so replaced and ordinary
+// surfaces never share history.
+bool PathTraceTemporalExactMaterial(float storedIndex)
+{
+    return PsrDenoiseExactMaterial(storedIndex, PATH_TRACE_TEMPORAL_MAXIMUM_MATERIALS);
+}
+#else
 bool PathTraceTemporalExactMaterial(float storedIndex)
 {
     return isfinite(storedIndex) && storedIndex >= 0.0f && storedIndex == floor(storedIndex) &&
         storedIndex < PATH_TRACE_TEMPORAL_MAXIMUM_MATERIALS;
 }
+#endif
 
 // The pixel centre's position relative to the camera that rendered it.
 float3 PathTraceTemporalCameraRelative(uint2 pixel, float depth, float4x4 inverseCameraRelativeViewProjection)
@@ -245,6 +261,14 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
     float3 specular = currentSpecular.Load(int3(pixel, 0)).rgb;
     diffuse = all(isfinite(diffuse)) ? diffuse : float3(0.0f, 0.0f, 0.0f);
     specular = all(isfinite(specular)) ? specular : float3(0.0f, 0.0f, 0.0f);
+#ifdef PATH_TRACE_PSR_DENOISE
+    // PSR.2: both signals without the mirror's throughput (the history and the moments are in these units), restored
+    // at presentation; and the mirror, whose virtual space a history tap must share.
+    float3 psrThroughput = PsrDenoiseThroughput(pixel, materialIndex);
+    float psrMirror = PsrDenoiseMirrorKey(int2(pixel), materialIndex);
+    diffuse /= psrThroughput;
+    specular /= psrThroughput;
+#endif
 
     float4 geometricNormal = geometricNormalTexture.Load(int3(pixel, 0));
     float3 normal = PathTraceTemporalNormal(geometricNormal.xyz);
@@ -299,6 +323,14 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
             {
                 continue;
             }
+#ifdef PATH_TRACE_PSR_DENOISE
+            // The history keeps no mirror identity, so equal words may come from another mirror reflecting the same
+            // material. Conservatively, a replaced pixel accepts a tap only where this frame shows the same mirror.
+            if(psrMirror >= 0.0f && PsrDenoiseMirrorKey(tapPixel, materialIndex) != psrMirror)
+            {
+                continue;
+            }
+#endif
 
             float3 tapRelative = PathTraceTemporalCameraRelative(uint2(tapPixel), tapDepth,
                 constants.previousInverseCameraRelativeViewProjection);
@@ -471,6 +503,9 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
     {
         RWTexture2D<float4> presentation = ResourceDescriptorHeap[constants.presentationIndex];
         float3 radiance = presentedLighting * diffuseAlbedo + specularResult.rgb;
+#ifdef PATH_TRACE_PSR_DENOISE
+        radiance *= psrThroughput;
+#endif
         presentation[pixel] = float4(min(radiance, PATH_TRACE_TEMPORAL_HALF_MAXIMUM), 1.0f);
     }
 }

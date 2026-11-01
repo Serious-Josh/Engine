@@ -50,6 +50,32 @@
 #define NRD_ROUGHNESS_ENCODING 1
 #include "NRD/NRD.hlsli"
 
+#ifdef NRD_PATH_TRACE_PSR
+// PSR.2 Stage 3B phase 4 (NrdPathTracePreparePsr.hlsl; REBLUR, RELAX and the hybrid): b1 the PSR denoise constants,
+// t0 the replacement pass's transforms, s0 Triangle.hlsl's material sampler. A replaced pixel's G-buffer holds the
+// virtual surface Bv of the reflected surface B, which NRD filters directly: Bv lies on the camera ray at the unfolded
+// path length with B's normal reflected, so NRD's view vector, lobe and hit-distance reprojection in virtual space
+// mirror B's exactly. The extraction scaled B's signals by the mirror's throughput F; the surface's factors include F,
+// so prepare divides it out with the material demodulation and every resolve multiplies it back once.
+#define PSR_DENOISE_CONSTANTS_REGISTER b1
+#define PSR_DENOISE_TRANSFORMS_REGISTER t0
+#define PSR_DENOISE_SAMPLER_REGISTER s0
+#include "PsrDenoise.hlsli"
+
+// NRD's materialID of a replaced pixel: 2 (B dielectric) or 3 (B conductor or metallic), so with the PSR frames'
+// minimum material 1 (specular; diffuse compares exactly) ordinary (0, 1) and replaced history never mix.
+static const float NRD_PATH_TRACE_PSR_MATERIAL_ID_OFFSET = 2.0f;
+
+// The demodulated value before packing. Without F, radianceScale 64 keeps every value inside fp16; with F divided out a
+// value exceeds it only where B's own radiance exceeds 65504 * 64 * factor (at least ~8.4e4), where an ordinary pixel's
+// raw signal would already clip. Such a value is clamped to fp16's maximum here instead of packing as infinity.
+#define NRD_PATH_TRACE_PACKED_RADIANCE(value) min(value, NRD_PATH_TRACE_HALF_MAXIMUM)
+#else
+#define NRD_PATH_TRACE_PACKED_RADIANCE(value) (value)
+// NRD's IN_MV of a pixel: the G-buffer motion unchanged (the PSR variant's NrdPathTracePsrMotion below).
+#define NRD_PATH_TRACE_MOTION(pixel, motion) (motion)
+#endif
+
 struct NrdPathTracePrepareConstants
 {
     row_major float4x4 inverseViewProjection;
@@ -119,6 +145,116 @@ struct NrdPathTraceSurface
     float3 diffuseFactor;
     float3 specularFactor;
 };
+
+#ifdef NRD_PATH_TRACE_PSR
+// The world-space plane (unit normal, offset) of the mirror triangle an eligible identity names, through its instance's
+// current transform as the geometry pass draws it; false for any other identity or a degenerate triangle.
+bool NrdPathTracePsrMirrorPlane(uint2 identity, out float4 plane)
+{
+    plane = float4(0.0f, 0.0f, 0.0f, 0.0f);
+
+    if(!PsrIdentityEligible(identity.x))
+    {
+        return false;
+    }
+
+    const uint instanceID = PsrIdentityInstance(identity.x) - 1u;
+
+    if(instanceID >= psrDenoise.transformCount)
+    {
+        return false;
+    }
+
+    StructuredBuffer<RayTracingInstanceData> instances = ResourceDescriptorHeap[psrDenoise.instanceDataIndex];
+    RayTracingInstanceData instance = instances[instanceID];
+    ByteAddressBuffer vertexBuffer = ResourceDescriptorHeap[NonUniformResourceIndex(instance.vertexBufferIndex)];
+    const uint3 indices = PathTraceTriangleIndices(instance, identity.y);
+    const float4x4 model = psrDenoiseTransforms[instanceID].model;
+    float3 corners[3];
+
+    [unroll]
+    for(uint corner = 0u; corner < 3u; ++corner)
+    {
+        corners[corner] = mul(model, float4(PathTraceLoadPosition(vertexBuffer, indices[corner], instance.vertexStride),
+            1.0f)).xyz;
+    }
+
+    const float3 normal = cross(corners[1] - corners[0], corners[2] - corners[0]);
+    const float lengthSquared = dot(normal, normal);
+
+    if(!(lengthSquared > 1.0e-20f) || !isfinite(lengthSquared))
+    {
+        return false;
+    }
+
+    plane.xyz = normal * rsqrt(lengthSquared);
+    plane.w = dot(plane.xyz, corners[0]);
+    return true;
+}
+
+// The same geometric plane: normals parallel either way (winding), offsets within 1 mm plus a relative 1e-5 for float
+// precision far from the origin. Two triangles of one planar face, or coplanar mirrors, which reflect one virtual world.
+bool NrdPathTracePsrSamePlane(float4 a, float4 b)
+{
+    const float alignment = dot(a.xyz, b.xyz);
+    const float offset = alignment < 0.0f ? -b.w : b.w;
+    return abs(alignment) > 0.9999f && abs(a.w - offset) <= 1.0e-3f + 1.0e-5f * max(abs(a.w), abs(offset));
+}
+
+// NRD's IN_MV of a replaced pixel whose history would come from another mirror plane: through every vertical face of a
+// mirror object the reflected floor is the same virtual plane, so NRD's depth, normal and materialID tests accept a
+// different face's history (a different reflected surface). This frame's identity stands in for the previous frame's:
+// if a replaced tap of the bilinear footprint at the reprojected position lies on another plane, the previous position
+// is moved off screen (UV -1, finite), which NRD treats as a disocclusion of the surface-motion history. G-buffer motion
+// is current UV - previous UV, which NRD reads with motionVectorScale (-1, -1, 1). Every other pixel keeps its motion.
+float4 NrdPathTracePsrMotion(uint2 pixel, float4 motion)
+{
+    Texture2D<float4> surfaceTexture = ResourceDescriptorHeap[constants.surfaceIndex];
+    Texture2D<uint2> identityTexture = ResourceDescriptorHeap[psrDenoise.identityIndex];
+    float4 plane;
+
+    if(!(surfaceTexture.Load(int3(pixel, 0)).w < 0.0f) ||
+        !NrdPathTracePsrMirrorPlane(identityTexture.Load(int3(pixel, 0)), plane) || !all(isfinite(motion.xy)))
+    {
+        return motion;
+    }
+
+    const float2 resolution = float2(constants.resolution);
+    const float2 currentUV = (float2(pixel) + 0.5f) / resolution;
+    const float2 previousPixel = (currentUV - motion.xy) * resolution - 0.5f;
+    const int2 base = int2(floor(previousPixel));
+    const float2 blend = previousPixel - float2(base);
+    bool crossesPlane = false;
+
+    [unroll]
+    for(uint tap = 0u; tap < 4u; ++tap)
+    {
+        const int2 offset = int2(tap & 1u, tap >> 1u);
+        const int2 tapPixel = base + offset;
+        // A tap NRD's bilinear footprint gives no weight (a static pixel's neighbours) carries no history.
+        const float weight = (offset.x != 0 ? blend.x : 1.0f - blend.x) * (offset.y != 0 ? blend.y : 1.0f - blend.y);
+
+        if(!(weight > 1.0e-3f) || any(tapPixel < 0) || any(tapPixel >= int2(constants.resolution)))
+        {
+            continue;
+        }
+
+        float4 tapPlane;
+
+        // Ordinary taps are already separated by materialID; only replaced taps of another plane are rejected.
+        if(surfaceTexture.Load(int3(tapPixel, 0)).w < 0.0f &&
+            NrdPathTracePsrMirrorPlane(identityTexture.Load(int3(tapPixel, 0)), tapPlane) &&
+            !NrdPathTracePsrSamePlane(plane, tapPlane))
+        {
+            crossesPlane = true;
+        }
+    }
+
+    return crossesPlane ? float4(currentUV + 1.0f, motion.zw) : motion;
+}
+
+#define NRD_PATH_TRACE_MOTION(pixel, motion) NrdPathTracePsrMotion(pixel, motion)
+#endif
 
 // The diffuse albedo and Schlick F0 of the path tracer's material models (PathTraceDiffuseAlbedo, PathTraceSchlickF0;
 // conductors use their average Fresnel), from the G-buffer's resolved base colour and metallic.
@@ -196,6 +332,11 @@ NrdPathTraceSurface NrdPathTraceLoadSurface(uint2 pixel)
     uint materialStride;
     materials.GetDimensions(materialCount, materialStride);
     float materialIndex = round(surface.w);
+#ifdef NRD_PATH_TRACE_PSR
+    // A replaced pixel's word is -(i + 1): B's material i.
+    bool replaced = materialIndex < 0.0f;
+    materialIndex = replaced ? -materialIndex - 1.0f : materialIndex;
+#endif
 
     if(materialIndex < 0.0f || materialIndex >= float(materialCount))
     {
@@ -244,6 +385,17 @@ NrdPathTraceSurface NrdPathTraceLoadSurface(uint2 pixel)
     result.materialID = material.model == 2u || metallic >= 0.5f ? 1.0f : 0.0f;
     NRD_MaterialFactors(normal, view, diffuseAlbedo, specularF0, result.roughness, result.diffuseFactor,
         result.specularFactor);
+#ifdef NRD_PATH_TRACE_PSR
+    if(replaced)
+    {
+        // F per channel, floored as the Engine denoiser's variants floor it; 1 where the mirror cannot be recovered (the
+        // signal then keeps F, as the path tracer's estimate does).
+        float3 throughput = PsrDenoiseThroughput(pixel, surface.w);
+        result.diffuseFactor *= throughput;
+        result.specularFactor *= throughput;
+        result.materialID += NRD_PATH_TRACE_PSR_MATERIAL_ID_OFFSET;
+    }
+#endif
     return result;
 }
 
@@ -314,7 +466,7 @@ void CSPrepare(uint3 dispatchThreadID : SV_DispatchThreadID)
     RWTexture2D<float4> specularOutput = ResourceDescriptorHeap[constants.specularIndex];
     Texture2D<float4> motion = ResourceDescriptorHeap[constants.motionIndex];
     RWTexture2D<float4> motionOutput = ResourceDescriptorHeap[constants.motionOutputIndex];
-    motionOutput[pixel] = motion.Load(int3(pixel, 0));
+    motionOutput[pixel] = NRD_PATH_TRACE_MOTION(pixel, motion.Load(int3(pixel, 0)));
     NrdPathTraceSurface surface = NrdPathTraceLoadSurface(pixel);
 
     // No surface (background, unusable G-buffer data): outside the denoising range, no radiance, no hit distance.
@@ -352,9 +504,11 @@ void CSPrepare(uint3 dispatchThreadID : SV_DispatchThreadID)
         surface.materialID);
     viewZOutput[pixel] = surface.viewZ;
     diffuseOutput[pixel] = NrdPathTraceRoundToHalf(REBLUR_FrontEnd_PackRadianceAndNormHitDist(
-        diffuse.rgb / (surface.diffuseFactor * constants.radianceScale), diffuseHitDistance, true));
+        NRD_PATH_TRACE_PACKED_RADIANCE(diffuse.rgb / (surface.diffuseFactor * constants.radianceScale)),
+        diffuseHitDistance, true));
     specularOutput[pixel] = NrdPathTraceRoundToHalf(REBLUR_FrontEnd_PackRadianceAndNormHitDist(
-        specular.rgb / (surface.specularFactor * constants.radianceScale), specularHitDistance, true));
+        NRD_PATH_TRACE_PACKED_RADIANCE(specular.rgb / (surface.specularFactor * constants.radianceScale)),
+        specularHitDistance, true));
 }
 
 [numthreads(8, 8, 1)]
@@ -449,7 +603,7 @@ void CSPrepareRelax(uint3 dispatchThreadID : SV_DispatchThreadID)
     RWTexture2D<float4> specularOutput = ResourceDescriptorHeap[constants.specularIndex];
     Texture2D<float4> motion = ResourceDescriptorHeap[constants.motionIndex];
     RWTexture2D<float4> motionOutput = ResourceDescriptorHeap[constants.motionOutputIndex];
-    motionOutput[pixel] = motion.Load(int3(pixel, 0));
+    motionOutput[pixel] = NRD_PATH_TRACE_MOTION(pixel, motion.Load(int3(pixel, 0)));
     NrdPathTraceSurface surface = NrdPathTraceLoadSurface(pixel);
 
     // As CSPrepare: outside the denoising range, no radiance, no hit distance.
@@ -473,10 +627,11 @@ void CSPrepareRelax(uint3 dispatchThreadID : SV_DispatchThreadID)
         surface.materialID);
     viewZOutput[pixel] = surface.viewZ;
     diffuseOutput[pixel] = NrdPathTraceRoundToHalf(RELAX_FrontEnd_PackRadianceAndHitDist(
-        diffuse / (surface.diffuseFactor * constants.radianceScale), diffuseHitDistance, true));
-    specularOutput[pixel] = NrdPathTraceRoundToHalf(RELAX_FrontEnd_PackRadianceAndHitDist(
-        specular.rgb / (surface.specularFactor * constants.radianceScale), NrdPathTraceRelaxHitDistance(specular.a),
+        NRD_PATH_TRACE_PACKED_RADIANCE(diffuse / (surface.diffuseFactor * constants.radianceScale)), diffuseHitDistance,
         true));
+    specularOutput[pixel] = NrdPathTraceRoundToHalf(RELAX_FrontEnd_PackRadianceAndHitDist(
+        NRD_PATH_TRACE_PACKED_RADIANCE(specular.rgb / (surface.specularFactor * constants.radianceScale)),
+        NrdPathTraceRelaxHitDistance(specular.a), true));
 }
 
 // The RELAX bypass: CSPrepareRelax's outputs unpacked as if RELAX had returned them unchanged, remodulated, in the
@@ -706,7 +861,7 @@ void CSPrepareHybrid(uint3 dispatchThreadID : SV_DispatchThreadID)
     RWTexture2D<float4> specularOutput = ResourceDescriptorHeap[constants.specularIndex];
     Texture2D<float4> motion = ResourceDescriptorHeap[constants.motionIndex];
     RWTexture2D<float4> motionOutput = ResourceDescriptorHeap[constants.motionOutputIndex];
-    motionOutput[pixel] = motion.Load(int3(pixel, 0));
+    motionOutput[pixel] = NRD_PATH_TRACE_MOTION(pixel, motion.Load(int3(pixel, 0)));
     NrdPathTraceSurface surface = NrdPathTraceLoadSurface(pixel);
 
     // As CSPrepare: outside the denoising range, no radiance, no hit distance.
@@ -730,9 +885,10 @@ void CSPrepareHybrid(uint3 dispatchThreadID : SV_DispatchThreadID)
         surface.materialID);
     viewZOutput[pixel] = surface.viewZ;
     diffuseOutput[pixel] = NrdPathTraceRoundToHalf(RELAX_FrontEnd_PackRadianceAndHitDist(
-        diffuse / (surface.diffuseFactor * constants.radianceScale), diffuseHitDistance, true));
+        NRD_PATH_TRACE_PACKED_RADIANCE(diffuse / (surface.diffuseFactor * constants.radianceScale)), diffuseHitDistance,
+        true));
     specularOutput[pixel] = NrdPathTraceRoundToHalf(REBLUR_FrontEnd_PackRadianceAndNormHitDist(
-        specular.rgb / (surface.specularFactor * constants.radianceScale),
+        NRD_PATH_TRACE_PACKED_RADIANCE(specular.rgb / (surface.specularFactor * constants.radianceScale)),
         NrdPathTraceNormalizedHitDistance(specular.a, surface.viewZ, surface.roughness), true));
 }
 

@@ -49,6 +49,18 @@
 
 namespace
 {
+    // PSR.1a-P: whether a material can reach the raster primary's delta threshold. The G-buffer roughness is the factor,
+    // or the factor times a roughness or ARM texture value (Triangle.hlsl), so it can only be at most
+    // PATH_TRACE_DELTA_ROUGHNESS when the factor is, or when such a texture is bound. Conservative: base colour, metallic
+    // and model are not inspected, so a material that passes may still produce no pure-delta pixel.
+    bool MaterialCanBeDeltaMirror(const GPUMaterial& material)
+    {
+        constexpr float deltaRoughness = 0.001f;
+        const bool roughnessTexture = material.roughnessTextureIndex != 0xFFFFFFFFu ||
+            (material.armTextureIndex != 0xFFFFFFFFu && material.preferARM != 0u);
+        return material.roughness <= deltaRoughness || roughnessTexture;
+    }
+
     // Scene lifetimes and command recordings share one non-reusing ID source.
     std::uint64_t AllocateRendererIdentity()
     {
@@ -4433,6 +4445,12 @@ bool Renderer::Initialize(
         return false;
     }
 
+    // PSR.2 Stage 1 development prototype; optional (the toggle then has no effect).
+    if(!m_packagedRuntime && !m_psrInPlaceReplacePass.Initialize(device, m_shaderLibrary))
+    {
+        Log::Error("PSR in-place replacement prototype pass unavailable.");
+    }
+
     if (!m_resourceUploader.Initialize(device))
     {
         Log::Error("Failed to init resource uploader.");
@@ -6993,13 +7011,181 @@ void Renderer::CreateLightingModeResources(RendererLightingMode mode)
 
 // RTXPT.2: unprojection relative to the camera (the view without its translation), so positions far from
 // the world origin keep their precision; callers then place results at the camera position.
-static Matrix4 CameraRelativeInverseViewProjection(const Matrix4& view, const Matrix4& projection)
+static Matrix4 CameraRelativeViewProjection(const Matrix4& view, const Matrix4& projection)
 {
     Matrix4 rotationOnlyView = view;
     rotationOnlyView.m[0][3] = 0.0f;
     rotationOnlyView.m[1][3] = 0.0f;
     rotationOnlyView.m[2][3] = 0.0f;
-    return (projection * rotationOnlyView).Inverse();
+    return projection * rotationOnlyView;
+}
+
+static Matrix4 CameraRelativeInverseViewProjection(const Matrix4& view, const Matrix4& projection)
+{
+    return CameraRelativeViewProjection(view, projection).Inverse();
+}
+
+// PSR.2 Stage 3B: the denoiser modes whose passes filter replaced pixels (as the G-buffer's virtual surface, with the
+// mirror's throughput demodulated). Off needs no filtering. Phase 4: the NRD modes through NrdPathTracePreparePsr.hlsl.
+bool Renderer::PsrLightingSupportsDenoiser(PathTraceDenoiserMode mode)
+{
+    return mode == PathTraceDenoiserMode::Off || mode == PathTraceDenoiserMode::Engine ||
+        mode == PathTraceDenoiserMode::NrdReblur || mode == PathTraceDenoiserMode::NrdRelax ||
+        mode == PathTraceDenoiserMode::NrdHybrid;
+}
+
+NrdPathTracePreparePass::PsrBindings Renderer::PathTraceNrdPsrBindings(NrdPathTracePreparePass& pass, bool& failed)
+{
+    failed = false;
+    NrdPathTracePreparePass::PsrBindings bindings;
+
+    if(!m_psrLightingLastFrame || m_psrDenoiseConstantsAddress == 0 || m_psrGBufferTransformsAddress == 0)
+    {
+        return bindings;
+    }
+
+    if(!pass.EnsurePsrVariant(m_graphicsDevice, m_shaderLibrary))
+    {
+        failed = true;
+        return bindings;
+    }
+
+    bindings.constants = m_psrDenoiseConstantsAddress;
+    bindings.transforms = m_psrGBufferTransformsAddress;
+    return bindings;
+}
+
+// PSR.2: replaced pixels carry NRD materialID 2 or 3 (NrdPathTracePrepare.hlsl). On PSR frames a comparison minimum of 1
+// keeps ordinary IDs 0 and 1 equal, as the SDK default 4 does, and never matches replaced with ordinary; an exact
+// comparison (REBLUR's diffuse minimum 0) stays. Ordinary frames keep their settings unchanged.
+template<typename Settings>
+void Renderer::ApplyNrdPsrMaterialSeparation(bool psrFrame, Settings& settings) const
+{
+    if(!psrFrame)
+    {
+        return;
+    }
+
+    if(m_nrdPathTracePsrSeparationDisabledForTesting)
+    {
+        settings.minMaterialForDiffuse = 4.0f;
+        settings.minMaterialForSpecular = 4.0f;
+        return;
+    }
+
+    settings.minMaterialForDiffuse = (std::min)(settings.minMaterialForDiffuse, 1.0f);
+    settings.minMaterialForSpecular = (std::min)(settings.minMaterialForSpecular, 1.0f);
+}
+
+// PSR.2 Stage 2 (development prototype): the in-place replacement pass, after EndGeometryPass, with this frame's
+// per-object transforms (the geometry pass's ObjectConstants, indexed by TLAS InstanceID = render-object index), its
+// motion matrices (the geometry pass's CameraConstants) and its TLAS.
+bool Renderer::RecordPsrInPlaceReplacement(ID3D12GraphicsCommandList* commandList, const Scene& scene,
+    const Matrix4& view, const Matrix4& renderProjection, const Vector3& cameraPosition,
+    const CameraConstants& cameraConstants)
+{
+    const auto& renderObjects = scene.GetRenderObjects();
+    const D3D12_GPU_VIRTUAL_ADDRESS topLevel = m_rayTracingScene.GetTopLevel().GetGPUAddress();
+
+    if(renderObjects.empty() || topLevel == 0)
+    {
+        return false;
+    }
+
+    std::vector<PsrInPlaceReplacePass::ObjectTransform> transforms(renderObjects.size());
+
+    for(std::size_t index = 0; index < renderObjects.size(); ++index)
+    {
+        const PresentationTransform presentation = renderObjects[index].GetPresentationTransform();
+        transforms[index].model = presentation.currentModel;
+        transforms[index].normalMatrix = transforms[index].model.Inverse().Transpose();
+        // An unchanged object gets the exact identity, so static geometry has exactly zero object motion (PSR.1b).
+        const bool unchanged = std::memcmp(presentation.currentModel.m, presentation.previousModel.m,
+            sizeof(presentation.currentModel.m)) == 0;
+        transforms[index].currentToPrevious = unchanged ? Matrix4::Identity() :
+            presentation.previousModel * presentation.currentModel.Inverse();
+    }
+
+    PsrInPlaceReplacePass::Constants constants{};
+    constants.cameraRelativeViewProjection = CameraRelativeViewProjection(view, renderProjection);
+    constants.inverseCameraRelativeViewProjection = CameraRelativeInverseViewProjection(view, renderProjection);
+    constants.unjitteredViewProjection = cameraConstants.unjitteredViewProjection;
+    constants.previousViewProjection = cameraConstants.previousViewProjection;
+    // DLSS: the mirror's recovered texture samples use the geometry pass's bias, as Triangle.hlsl's do.
+    constants.textureMipBias = cameraConstants.textureMipBias;
+
+    for(int column = 0; column < 4; ++column)
+    {
+        constants.viewDepthRow[column] = cameraConstants.view.m[2][column];
+        constants.previousViewDepthRow[column] = cameraConstants.previousView.m[2][column];
+    }
+
+    constants.materialBufferIndex = CurrentMaterialBuffer().GetDescriptorIndex();
+    constants.diagnosticHitsIndex = m_psrDiagnosticHits ? m_psrDiagnosticHits->GetUAVDescriptorIndex() : 0u;
+
+    // The diagnostic variant samples at PSR.1's reflected-hit UV; without PSR.1's records it reads its own buffer, whose
+    // state words are never 1 for the probe's purpose (the harness only uses the probe after a PSR.1 frame).
+    if(m_psrDiagnosticHits)
+    {
+        Buffer& psr1Records = m_pathTraceReferencePass.GetPrimarySurfaceReplacementRecords();
+        constants.psr1RecordsIndex = psr1Records.GetResource() ? psr1Records.GetUAVDescriptorIndex() :
+            constants.diagnosticHitsIndex;
+    }
+    constants.cameraPosition[0] = cameraPosition.x;
+    constants.cameraPosition[1] = cameraPosition.y;
+    constants.cameraPosition[2] = cameraPosition.z;
+    constants.identityIndex = m_gBuffer.GetIdentity().GetSRVIndex();
+    constants.instanceDataIndex = m_rayTracingScene.GetInstanceDataDescriptorIndex();
+    constants.transformCount = static_cast<std::uint32_t>(transforms.size());
+    constants.resolution[0] = m_sceneWidth;
+    constants.resolution[1] = m_sceneHeight;
+
+    const D3D12_GPU_VIRTUAL_ADDRESS constantsAddress = m_uploadBuffer.Allocate(&constants, sizeof(constants),
+        D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
+    const D3D12_GPU_VIRTUAL_ADDRESS transformsAddress = m_uploadBuffer.Allocate(transforms.data(),
+        transforms.size() * sizeof(PsrInPlaceReplacePass::ObjectTransform), D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT);
+
+    if(!m_psrInPlaceReplacePass.Execute(commandList, m_gBuffer, constantsAddress, transformsAddress, topLevel,
+        m_sceneWidth, m_sceneHeight, m_psrDiagnosticHits))
+    {
+        return false;
+    }
+
+    // PSR.2 Stage 3A: the lighting pair recovers each mirror with this pass's camera and transforms.
+    if(m_psrLightingThisFrame && constantsAddress != 0 && transformsAddress != 0)
+    {
+        PathTracePsrGBufferConstants lighting{};
+        lighting.cameraRelativeViewProjection = constants.cameraRelativeViewProjection;
+        lighting.inverseCameraRelativeViewProjection = constants.inverseCameraRelativeViewProjection;
+        std::copy(std::begin(constants.cameraPosition), std::end(constants.cameraPosition), lighting.cameraPosition);
+        lighting.identityIndex = constants.identityIndex;
+        lighting.transformCount = constants.transformCount;
+        // Verification only: the PSR probe's UAV.
+        lighting.padding[0] = m_pathTraceReferencePass.PsrProbeUAVIndex();
+        lighting.SetTextureMipBias(constants.textureMipBias);
+        m_psrGBufferConstantsAddress = m_uploadBuffer.Allocate(&lighting, sizeof(lighting),
+            D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
+        m_psrGBufferTransformsAddress = m_psrGBufferConstantsAddress != 0 ? transformsAddress : 0;
+
+        PsrDenoiseConstants denoise{};
+        denoise.cameraRelativeViewProjection = constants.cameraRelativeViewProjection;
+        denoise.inverseCameraRelativeViewProjection = constants.inverseCameraRelativeViewProjection;
+        std::copy(std::begin(constants.cameraPosition), std::end(constants.cameraPosition), denoise.cameraPosition);
+        denoise.identityIndex = constants.identityIndex;
+        denoise.transformCount = constants.transformCount;
+        denoise.instanceDataIndex = constants.instanceDataIndex;
+        denoise.materialBufferIndex = constants.materialBufferIndex;
+        denoise.materialTableIndex = m_materialTables.GetMissingEnergyTexture().GetDescriptorIndex();
+        denoise.materialAverageTableIndex = m_materialTables.GetAverageTexture().GetDescriptorIndex();
+        denoise.materialTableCosineMapping = static_cast<std::uint32_t>(m_materialTables.GetCosineMapping());
+        denoise.resolution[0] = m_sceneWidth;
+        denoise.resolution[1] = m_sceneHeight;
+        denoise.textureMipBias = constants.textureMipBias;
+        m_psrDenoiseConstantsAddress = m_psrGBufferTransformsAddress != 0 ? m_uploadBuffer.Allocate(&denoise,
+            sizeof(denoise), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT) : 0;
+    }
+
+    return true;
 }
 
 void Renderer::InvalidatePreviousGBufferHistory()
@@ -7068,20 +7254,21 @@ bool Renderer::TryGetPreviousGBuffer(PreviousGBufferView& view) const
 
 void Renderer::EvaluatePathTraceRasterPrimary()
 {
-    const PathTraceRasterPrimaryStatus previous = m_rasterPrimaryStatus;
+    PathTraceModeAvailability& status = m_rasterPrimaryStatus.rasterPrimary;
+    const PathTraceModeAvailability previous = status;
 
     if(!m_graphicsDevice.SupportsRayTracing())
     {
-        m_rasterPrimaryStatus = {PathTraceRasterPrimaryAvailability::Unavailable, "Ray tracing is not supported."};
+        status = {PathTraceRasterPrimaryAvailability::Unavailable, "Ray tracing is not supported."};
     }
     else if(m_gBuffer.GetDepth().GetResource() == nullptr || m_gBuffer.GetSurface().GetResource() == nullptr ||
         m_gBuffer.GetMaterial().GetResource() == nullptr || m_gBuffer.GetGeometricNormal().GetResource() == nullptr)
     {
-        m_rasterPrimaryStatus = {PathTraceRasterPrimaryAvailability::Unavailable, "The G-buffer is not available."};
+        status = {PathTraceRasterPrimaryAvailability::Unavailable, "The G-buffer is not available."};
     }
     else if(m_materialPublication.desired.size() > PathTraceRasterPrimaryMaximumMaterials)
     {
-        m_rasterPrimaryStatus = {PathTraceRasterPrimaryAvailability::Unavailable,
+        status = {PathTraceRasterPrimaryAvailability::Unavailable,
             std::to_string(m_materialPublication.desired.size()) + " materials exceed the " +
             std::to_string(PathTraceRasterPrimaryMaximumMaterials) + " indices the G-buffer stores exactly."};
     }
@@ -7089,7 +7276,7 @@ void Renderer::EvaluatePathTraceRasterPrimary()
     // bundles) and its resources. Its failure is sticky, so this does not retry every frame.
     else if(!EnsurePathTraceReference())
     {
-        m_rasterPrimaryStatus = {PathTraceRasterPrimaryAvailability::Unavailable,
+        status = {PathTraceRasterPrimaryAvailability::Unavailable,
             "Reference path tracer unavailable: " + m_pathTraceStatus.unavailableReason};
     }
     else
@@ -7100,44 +7287,44 @@ void Renderer::EvaluatePathTraceRasterPrimary()
         if(m_pathTraceReferencePass.EnsurePrimaryPipeline(m_graphicsDevice, m_shaderLibrary, PathTracePrimary::Raster,
             pipelineFailure))
         {
-            m_rasterPrimaryStatus = {PathTraceRasterPrimaryAvailability::Available, std::string()};
+            status = {PathTraceRasterPrimaryAvailability::Available, std::string()};
         }
         else
         {
-            m_rasterPrimaryStatus = {PathTraceRasterPrimaryAvailability::Unavailable, pipelineFailure};
+            status = {PathTraceRasterPrimaryAvailability::Unavailable, pipelineFailure};
         }
     }
 
-    if(m_rasterPrimaryStatus.availability != previous.availability || m_rasterPrimaryStatus.reason != previous.reason)
+    if(status != previous)
     {
-        if(m_rasterPrimaryStatus.availability == PathTraceRasterPrimaryAvailability::Available)
+        if(status.availability == PathTraceRasterPrimaryAvailability::Available)
         {
-            Log::Info("Raster-primary path tracing mode available.");
+            Log::Info("Raster-primary prerequisites available.");
         }
         else
         {
-            Log::Info("Raster-primary path tracing mode unavailable, rendering Legacy: " + m_rasterPrimaryStatus.reason);
+            Log::Info("Raster-primary prerequisites unavailable: " + status.reason);
         }
     }
 }
 
 void Renderer::EvaluatePathTraceReSTIRDI()
 {
-    const PathTraceRasterPrimaryStatus previous = m_restirDIStatus;
-
-    // The ReSTIR DI variant is the raster-primary mode plus RTXDI, so every raster-primary prerequisite applies.
+    // ReSTIR DI is the raster-primary mode plus RTXDI, so every raster-primary prerequisite applies; its own part is
+    // assessed only once they hold (GetReSTIRDIAvailability reports their failure).
     EvaluatePathTraceRasterPrimary();
+    PathTraceModeAvailability& status = m_rasterPrimaryStatus.restirDI;
+    const PathTraceModeAvailability previous = status;
     std::string pipelineFailure;
 
-    if(m_rasterPrimaryStatus.availability != PathTraceRasterPrimaryAvailability::Available)
+    if(m_rasterPrimaryStatus.rasterPrimary.availability != PathTraceRasterPrimaryAvailability::Available)
     {
-        m_restirDIStatus = {PathTraceRasterPrimaryAvailability::Unavailable,
-            "Raster primary unavailable: " + m_rasterPrimaryStatus.reason};
+        status = {};
     }
     else if(!m_pathTraceReferencePass.EnsurePrimaryPipeline(m_graphicsDevice, m_shaderLibrary,
         PathTracePrimary::RasterReSTIRDI, pipelineFailure))
     {
-        m_restirDIStatus = {PathTraceRasterPrimaryAvailability::Unavailable, pipelineFailure};
+        status = {PathTraceRasterPrimaryAvailability::Unavailable, pipelineFailure};
     }
     else
     {
@@ -7145,25 +7332,24 @@ void Renderer::EvaluatePathTraceReSTIRDI()
 
         if(m_rtxdiResources.IsInitialized())
         {
-            m_restirDIStatus = {PathTraceRasterPrimaryAvailability::Available, std::string()};
+            status = {PathTraceRasterPrimaryAvailability::Available, std::string()};
         }
         else
         {
-            m_restirDIStatus = {PathTraceRasterPrimaryAvailability::Unavailable,
-                "RTXDI reservoir resources could not be allocated."};
+            status = {PathTraceRasterPrimaryAvailability::Unavailable, "RTXDI reservoir resources could not be allocated."};
         }
     }
 
-    if(m_restirDIStatus.availability != previous.availability || m_restirDIStatus.reason != previous.reason)
+    // The shared prerequisites log their own changes.
+    if(status != previous && status.availability != PathTraceRasterPrimaryAvailability::NotRequested)
     {
-        if(m_restirDIStatus.availability == PathTraceRasterPrimaryAvailability::Available)
+        if(status.availability == PathTraceRasterPrimaryAvailability::Available)
         {
-            Log::Info("Raster-primary ReSTIR DI path tracing mode available.");
+            Log::Info("Path Tracing (raster-primary ReSTIR DI) available.");
         }
         else
         {
-            Log::Info("Raster-primary ReSTIR DI path tracing mode unavailable, rendering Legacy: " +
-                m_restirDIStatus.reason);
+            Log::Info("Path Tracing (raster-primary ReSTIR DI) unavailable, rendering Legacy: " + status.reason);
         }
     }
 }
@@ -7370,9 +7556,7 @@ D3D12_GPU_VIRTUAL_ADDRESS Renderer::PrepareRadianceCacheLearning(ID3D12GraphicsC
     std::string failure;
     const RadianceCacheD6::Insertion insertion = m_radianceCacheD6.GetInsertion();
     const bool sparse = insertion == RadianceCacheD6::Insertion::Sparse;
-    const bool deferred = insertion != RadianceCacheD6::Insertion::Inline;
-    m_radianceCacheLearningLibrary = sparse ? PathTraceRadianceCacheLibrary::Training :
-        (deferred ? m_radianceCacheDeferredLibrary : PathTraceRadianceCacheLibrary::Inline);
+    m_radianceCacheLearningLibrary = sparse ? PathTraceRadianceCacheLibrary::Training : m_radianceCacheDeferredLibrary;
 
     // SHARC.4D-R: sparse training with no tile size trains nothing this frame.
     if(sparse && m_radianceCacheD6.GetTrainingTile() == 0)
@@ -7401,7 +7585,7 @@ D3D12_GPU_VIRTUAL_ADDRESS Renderer::PrepareRadianceCacheLearning(ID3D12GraphicsC
     const std::uint64_t recordCount = paths * samplesPerFrame * (primaryRecords ? 2u : 1u);
     m_radianceCacheD6.SetPrimaryRecordOffset(primaryRecords ? static_cast<std::uint32_t>(paths * samplesPerFrame) : 0u);
 
-    if(deferred && !m_radianceCacheD6.EnsureRecords(m_graphicsDevice.GetDevice(), m_shaderLibrary,
+    if(!m_radianceCacheD6.EnsureRecords(m_graphicsDevice.GetDevice(), m_shaderLibrary,
         m_resourceDescriptorHeap, recordCount, m_commandContext.GetLastSubmissionFenceValue(),
         std::exchange(m_radianceCacheRecordsFailAllocationForTesting, false)))
     {
@@ -7409,7 +7593,7 @@ D3D12_GPU_VIRTUAL_ADDRESS Renderer::PrepareRadianceCacheLearning(ID3D12GraphicsC
     }
 
     return m_radianceCacheD6.RecordLearningBegin(commandList, m_uploadBuffer, m_sceneLightingEpoch.GetStatus(),
-        deferred ? recordCount : 0, sparse ? m_radianceCacheD6.TrainingTilesX(m_sceneWidth) : 0);
+        recordCount, sparse ? m_radianceCacheD6.TrainingTilesX(m_sceneWidth) : 0);
 }
 
 PathTraceRadianceCacheLibrary Renderer::SharcRenderLibrary(bool extract, bool splitReSTIRDI,
@@ -7491,7 +7675,7 @@ void Renderer::ApplySharcSettings(const SharcSettings& requested, bool rasterPri
             cache.SetQueryRender(false, 0.0f, false);
             cache.SetQuery(false, 0);
             cache.SetTrainingTile(5);
-            cache.SetInsertion(RadianceCacheD6::Insertion::Inline);
+            cache.SetInsertion(RadianceCacheD6::Insertion::Sparse);
             cache.SetHistoryPrior(false);
         }
 
@@ -7974,6 +8158,8 @@ bool Renderer::RecordPathTraceReference(
     key.width = m_sceneWidth;
     key.height = m_sceneHeight;
     key.settings = settings;
+    // PSR.2: whether this frame's G-buffer was replaced, which a diagnostic view can change without the setting.
+    key.settings.primarySurfaceReplacementInPlace = m_psrInPlaceReplacedLastFrame;
     key.sun = frameLighting.sun;
     key.lights = frameLighting.table;
     key.topLevelAddress = m_rayTracingScene.GetTopLevel().GetGPUAddress();
@@ -8216,6 +8402,110 @@ bool Renderer::RecordPathTraceReference(
         }
 
         m_pathTraceExtractedLastFrame = extract;
+
+        // PSR.1a (development toggle, default off): Raster Primary with the denoiser Off (no extraction) and SHARC off.
+        // Anything it cannot create leaves the frame on the production raster primary.
+        bool primarySurfaceReplacement = false;
+        D3D12_GPU_VIRTUAL_ADDRESS psrGuideConstantsAddress = 0;
+        D3D12_GPU_VIRTUAL_ADDRESS psrGuideTransformsAddress = 0;
+
+        // PSR.1a-P: a frame whose published materials cannot produce a pure-delta vertex 0 skips PSR entirely; it would
+        // replace no pixel, so the production raster primary renders the identical image with no record pass.
+        // Revisions restart with each scene-resource lifetime, so both identify the published table.
+        const std::pair<std::uint64_t, std::uint64_t> materialIdentity{m_sceneResourceLifetime,
+            m_pathTraceAccumulationKey->materialRevision};
+
+        if(m_primarySurfaceReplacementMaterials != materialIdentity)
+        {
+            m_primarySurfaceReplacementMaterials = materialIdentity;
+            m_primarySurfaceReplacementPossible = std::any_of(m_materialPublication.desired.begin(),
+                m_materialPublication.desired.end(), MaterialCanBeDeltaMirror);
+        }
+
+        // PSR.1c-A: also split ReSTIR DI, with its PSR pair. PSR.2 lighting takes precedence and skips PSR.1's records.
+        if(settings.primarySurfaceReplacement && m_psrGBufferConstantsAddress == 0 &&
+            (primary == PathTracePrimary::Raster || primary == PathTracePrimary::RasterReSTIRDI) && !extract &&
+            !m_radianceCacheD6.IsUsable() && m_primarySurfaceReplacementPossible)
+        {
+            std::string replacementFailure;
+            const unsigned int recordIndex = m_pathTraceReferencePass.EnsurePrimarySurfaceReplacement(m_graphicsDevice,
+                m_shaderLibrary, m_resourceDescriptorHeap, replacementFailure);
+            primarySurfaceReplacement = recordIndex != UINT_MAX;
+
+            if(primarySurfaceReplacement && primary == PathTracePrimary::RasterReSTIRDI &&
+                !m_pathTraceReferencePass.EnsurePrimarySurfaceReplacementReSTIRDI(m_graphicsDevice, m_shaderLibrary,
+                    replacementFailure))
+            {
+                primarySurfaceReplacement = false;
+            }
+
+            if(primarySurfaceReplacement)
+            {
+                constants.psrRecordIndex = recordIndex;
+                // Verification only: the PSR probe's UAV, in the PSR library's spare word.
+                constants.rawDiffuseHitDistancePadding = m_pathTraceReferencePass.PsrProbeUAVIndex();
+                m_primarySurfaceReplacementFailure.clear();
+            }
+
+            // PSR.1b: the guide pass, when requested and its pipeline and buffer exist; otherwise the record pass.
+            // Raster Primary only (PSR.1c-A records ReSTIR DI frames with the record pass).
+            if(primarySurfaceReplacement && primary == PathTracePrimary::Raster &&
+                settings.primarySurfaceReplacementGuides && !m_psrGuideTransforms.empty())
+            {
+                std::string guideFailure;
+                const unsigned int guideIndex = m_pathTraceReferencePass.EnsurePrimarySurfaceReplacementGuides(
+                    m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap, guideFailure);
+
+                if(guideIndex == UINT_MAX)
+                {
+                    if(guideFailure != m_primarySurfaceReplacementGuideFailure)
+                    {
+                        Log::Error("Primary surface replacement guides are unavailable: " + guideFailure);
+                        m_primarySurfaceReplacementGuideFailure = guideFailure;
+                    }
+                }
+                else
+                {
+                    m_primarySurfaceReplacementGuideFailure.clear();
+                    PreviousGBufferView previousGBuffer;
+                    PathTracePsrGuideConstants guideConstants{};
+                    guideConstants.viewProjection = cameraProjection * view;
+                    guideConstants.previousViewProjection = m_psrGuidePreviousViewProjection;
+
+                    for(int column = 0; column < 4; ++column)
+                    {
+                        guideConstants.viewDepthRow[column] = view.m[2][column];
+                        guideConstants.previousViewDepthRow[column] = m_psrGuidePreviousView.m[2][column];
+                    }
+
+                    guideConstants.guideIndex = guideIndex;
+                    // The raster previous camera and a valid path-traced history (reset with every scene, resize and
+                    // mode boundary) together describe the immediately previous frame.
+                    guideConstants.historyValid = m_psrGuidePreviousCameraValid && TryGetPreviousGBuffer(previousGBuffer) ?
+                        1u : 0u;
+                    guideConstants.transformCount = static_cast<std::uint32_t>(m_psrGuideTransforms.size());
+                    m_gBuffer.GetIdentity().Transition(commandList, shaderReadState);
+                    guideConstants.identityIndex = m_gBuffer.GetIdentity().GetSRVIndex();
+                    psrGuideConstantsAddress = m_uploadBuffer.Allocate(&guideConstants, sizeof(guideConstants),
+                        D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
+                    psrGuideTransformsAddress = m_uploadBuffer.Allocate(m_psrGuideTransforms.data(),
+                        m_psrGuideTransforms.size() * sizeof(PathTracePsrTransform), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
+
+                    if(psrGuideConstantsAddress == 0 || psrGuideTransformsAddress == 0)
+                    {
+                        psrGuideConstantsAddress = 0;
+                        psrGuideTransformsAddress = 0;
+                    }
+                }
+            }
+            else if(replacementFailure != m_primarySurfaceReplacementFailure)
+            {
+                // Reported once per distinct reason, not every frame.
+                Log::Error("Primary surface replacement is unavailable: " + replacementFailure);
+                m_primarySurfaceReplacementFailure = replacementFailure;
+            }
+        }
+
         const D3D12_GPU_VIRTUAL_ADDRESS constantsAddress = m_uploadBuffer.Allocate(
             &constants, sizeof(PathTraceReferenceConstants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
 
@@ -8248,7 +8538,7 @@ bool Renderer::RecordPathTraceReference(
         D3D12_GPU_VIRTUAL_ADDRESS radianceCacheAddress = 0;
         D3D12_GPU_VIRTUAL_ADDRESS renderCacheAddress = 0;
         m_sharcHistoryPriorWritten = false;
-        PathTraceRadianceCacheLibrary renderCacheLibrary = PathTraceRadianceCacheLibrary::Inline;
+        PathTraceRadianceCacheLibrary renderCacheLibrary = PathTraceRadianceCacheLibrary::Render;
         const bool sparseTraining = m_radianceCacheD6.GetInsertion() == RadianceCacheD6::Insertion::Sparse;
 
         // SHARC.5B: sparse SHARC also serves ReSTIR DI frames, through the indirect pass (the direct pass is unchanged).
@@ -8281,7 +8571,9 @@ bool Renderer::RecordPathTraceReference(
             m_pathTraceReferencePass.ExecuteReSTIRDISplit(m_commandContext.GetRayTracingCommandList(),
                 m_gpuTimestampProfiler, frameIndex, m_resourceDescriptorHeap, m_rayTracingScene, constantsAddress,
                 sceneLightConstantsAddress, m_sceneWidth, m_sceneHeight, rtxdiConstantsAddress, extract,
-                renderCacheAddress, renderCacheLibrary, rawExtraction);
+                renderCacheAddress, renderCacheLibrary, rawExtraction, primarySurfaceReplacement,
+                m_psrGBufferConstantsAddress, m_psrGBufferTransformsAddress);
+            m_psrLightingLastFrame = m_pathTraceReferencePass.WrotePrimarySurfaceReplacementGBuffer();
 
             // R.9I.3 pixel-centred caustics seam: the split's output barriers are recorded and no denoiser has read
             // the extraction yet. A verified seam records the estimator into this list; its outputs feed only the
@@ -8296,8 +8588,13 @@ bool Renderer::RecordPathTraceReference(
         {
             referenceDispatched = m_pathTraceReferencePass.Execute(primary, m_commandContext.GetRayTracingCommandList(),
                 m_resourceDescriptorHeap, m_rayTracingScene, constantsAddress, sceneLightConstantsAddress, m_sceneWidth,
-                m_sceneHeight, extract, renderCacheAddress, renderCacheLibrary, rawExtraction);
+                m_sceneHeight, extract, renderCacheAddress, renderCacheLibrary, rawExtraction, primarySurfaceReplacement,
+                &m_gpuTimestampProfiler, frameIndex, psrGuideConstantsAddress, psrGuideTransformsAddress);
         }
+
+        m_primarySurfaceReplacementLastFrame = m_pathTraceReferencePass.WrotePrimarySurfaceReplacement();
+        m_primarySurfaceReplacementGuidesLastFrame = m_primarySurfaceReplacementLastFrame &&
+            m_pathTraceReferencePass.WrotePrimarySurfaceReplacementGuides();
 
         if(primary == PathTracePrimary::Camera && m_debugUI.ReferenceRayCountsEnabled())
         {
@@ -8598,6 +8895,19 @@ bool Renderer::RecordPathTraceTemporal(
 
     m_pathTraceTemporalKey = key;
 
+    // PSR.2 Stage 3B: the PSR variant on frames whose replaced pixels the path tracer lit. Its history holds those pixels
+    // without the mirror's throughput, which the production variant's does not, so a change between them restarts it.
+    const bool psrDenoise = m_psrLightingLastFrame && m_psrDenoiseConstantsAddress != 0 &&
+        m_pathTraceTemporalPass.EnsurePsrVariant(m_graphicsDevice, m_shaderLibrary) &&
+        m_pathTraceSpatialPass.EnsureAtrousPsrVariant(m_graphicsDevice, m_shaderLibrary);
+
+    if(psrDenoise != m_psrTemporalLastFrame)
+    {
+        m_pathTraceTemporalPass.InvalidateHistory();
+    }
+
+    m_psrTemporalLastFrame = psrDenoise;
+
     // Without the previous frame's surfaces no tap can be validated: this frame starts new history.
     PreviousGBufferView previous;
 
@@ -8691,7 +9001,8 @@ bool Renderer::RecordPathTraceTemporal(
     }
 
     m_pathTraceTemporalPass.Execute(commandList, m_uploadBuffer, constants, m_sceneWidth, m_sceneHeight,
-        constants.priorIndex != 0 ? m_sharcHistoryPriorBinding : 0, extended);
+        constants.priorIndex != 0 ? m_sharcHistoryPriorBinding : 0, extended,
+        psrDenoise ? m_psrDenoiseConstantsAddress : 0, psrDenoise ? m_psrGBufferTransformsAddress : 0);
     return true;
 }
 
@@ -8749,13 +9060,21 @@ bool Renderer::RecordNrdPathTraceDiagnostic(
 
     const NrdPathTracePrepareConstants constants = MakeNrdPathTracePrepareConstants(commandList, view,
         inverseViewProjection, cameraPosition);
+    // PSR.2 Stage 3B phase 4A: the bypass of a PSR frame round-trips its replaced pixels through the PSR variant.
+    bool psrFailed = false;
+    const NrdPathTracePreparePass::PsrBindings psr = PathTraceNrdPsrBindings(m_nrdPathTracePreparePass, psrFailed);
+
+    if(psrFailed)
+    {
+        return false;
+    }
 
     m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::NrdPathTracePrepare);
-    m_nrdPathTracePreparePass.ExecutePrepare(commandList, m_uploadBuffer, constants, m_sceneWidth, m_sceneHeight);
+    m_nrdPathTracePreparePass.ExecutePrepare(commandList, m_uploadBuffer, constants, m_sceneWidth, m_sceneHeight, psr);
     m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::NrdPathTracePrepare);
 
     m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::NrdPathTraceResolve);
-    m_nrdPathTracePreparePass.ExecuteResolve(commandList, m_uploadBuffer, constants, m_sceneWidth, m_sceneHeight);
+    m_nrdPathTracePreparePass.ExecuteResolve(commandList, m_uploadBuffer, constants, m_sceneWidth, m_sceneHeight, psr);
     m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::NrdPathTraceResolve);
     return true;
 }
@@ -8779,9 +9098,17 @@ bool Renderer::RecordNrdRelaxPrepareDiagnostic(
     rawDiffuseHitDistance.Transition(commandList,
         D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     constants.rawDiffuseHitDistanceIndex = rawDiffuseHitDistance.GetDescriptorIndex();
+    // PSR.2 Stage 3B phase 4B: the bypass of a PSR frame round-trips its replaced pixels through the PSR variant.
+    bool psrFailed = false;
+    const NrdPathTracePreparePass::PsrBindings psr = PathTraceNrdPsrBindings(m_nrdRelaxPreparePass, psrFailed);
 
-    m_nrdRelaxPreparePass.ExecutePrepare(commandList, m_uploadBuffer, constants, m_sceneWidth, m_sceneHeight);
-    m_nrdRelaxPreparePass.ExecuteResolve(commandList, m_uploadBuffer, constants, m_sceneWidth, m_sceneHeight);
+    if(psrFailed)
+    {
+        return false;
+    }
+
+    m_nrdRelaxPreparePass.ExecutePrepare(commandList, m_uploadBuffer, constants, m_sceneWidth, m_sceneHeight, psr);
+    m_nrdRelaxPreparePass.ExecuteResolve(commandList, m_uploadBuffer, constants, m_sceneWidth, m_sceneHeight, psr);
     return true;
 }
 
@@ -8883,10 +9210,23 @@ bool Renderer::BeginNrdHybridFrame(
         return false;
     }
 
-    // RESTART sources as REBLUR's: the temporal key and a frame gap; the shared invalidations clear the flag directly.
+    // PSR.2 Stage 3B phase 4C: as REBLUR's (BeginPathTraceNrdFrame), the PSR variant on frames whose replaced pixels the
+    // path tracer lit; a frame that cannot create it falls back to the Engine stages.
+    bool psrFailed = false;
+    m_nrdHybridPsrThisFrame = PathTraceNrdPsrBindings(m_nrdHybridPreparePass, psrFailed).IsSet();
+
+    if(psrFailed)
+    {
+        ReportNrdHybridUnavailable("the PSR.2 hybrid pipelines could not be created");
+        return false;
+    }
+
+    // RESTART sources as REBLUR's: the temporal key, a frame gap and a change between PSR and ordinary frames; the shared
+    // invalidations clear the flag directly.
     const PathTraceTemporalKey key = MakePathTraceTemporalKey(primary, frameLighting, settings);
 
-    if(!m_nrdHybridKey || !SamePathTraceTemporalKey(*m_nrdHybridKey, key) || !m_nrdHybridExecutedLastFrame)
+    if(!m_nrdHybridKey || !SamePathTraceTemporalKey(*m_nrdHybridKey, key) || !m_nrdHybridExecutedLastFrame ||
+        m_nrdHybridPsrThisFrame != m_nrdHybridPsrLastFrame)
     {
         m_nrdHybridHistoryValid = false;
     }
@@ -8918,11 +9258,15 @@ bool Renderer::BeginNrdHybridFrame(
     frameSettings.accumulationMode = m_nrdHybridAccumulationMode;
 
     m_nrdHybridDenoiser.NewFrame();
+    nrd::RelaxSettings diffuseSettings = m_nrdRelaxSettingsOverride ? *m_nrdRelaxSettingsOverride :
+        PathTraceRelaxSettings();
+    nrd::ReblurSettings specularSettings = PathTraceNrdSettings();
+    ApplyNrdPsrMaterialSeparation(m_nrdHybridPsrThisFrame, diffuseSettings);
+    ApplyNrdPsrMaterialSeparation(m_nrdHybridPsrThisFrame, specularSettings);
 
     if(!m_nrdHybridDenoiser.SetCommonSettings(frameSettings) ||
-        !m_nrdHybridDenoiser.SetDenoiserSettings(PathTraceHybridDiffuseIdentifier,
-            m_nrdRelaxSettingsOverride ? *m_nrdRelaxSettingsOverride : PathTraceRelaxSettings()) ||
-        !m_nrdHybridDenoiser.SetDenoiserSettings(PathTraceHybridSpecularIdentifier, PathTraceNrdSettings()))
+        !m_nrdHybridDenoiser.SetDenoiserSettings(PathTraceHybridDiffuseIdentifier, diffuseSettings) ||
+        !m_nrdHybridDenoiser.SetDenoiserSettings(PathTraceHybridSpecularIdentifier, specularSettings))
     {
         ReportNrdHybridUnavailable("NRD rejected the hybrid frame settings");
         return false;
@@ -8964,13 +9308,19 @@ bool Renderer::RecordNrdHybrid(
     auto constants = MakeNrdPathTracePrepareConstants(commandList, view, inverseViewProjection, cameraPosition);
     constants.radianceScale = 64.0f;
     constants.specularHitDistanceMode = 0;
+    constants.resolveComponents = m_nrdHybridResolveComponents;
     auto& rawDistance = m_pathTraceReferencePass.GetRawDiffuseHitDistanceTexture();
     rawDistance.Transition(commandList,
         D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     constants.rawDiffuseHitDistanceIndex = rawDistance.GetDescriptorIndex();
 
+    // BeginNrdHybridFrame created the variant when this frame needs it, so this cannot fail.
+    bool psrFailed = false;
+    const NrdPathTracePreparePass::PsrBindings psr = m_nrdHybridPsrThisFrame ?
+        PathTraceNrdPsrBindings(m_nrdHybridPreparePass, psrFailed) : NrdPathTracePreparePass::PsrBindings{};
+
     m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::NrdHybridPrepare);
-    m_nrdHybridPreparePass.ExecutePrepare(commandList, m_uploadBuffer, constants, m_sceneWidth, m_sceneHeight);
+    m_nrdHybridPreparePass.ExecutePrepare(commandList, m_uploadBuffer, constants, m_sceneWidth, m_sceneHeight, psr);
     m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::NrdHybridPrepare);
 
     NrdDenoiser::Inputs inputs;
@@ -9015,7 +9365,7 @@ bool Renderer::RecordNrdHybrid(
         m_nrdHybridPreparePass.ExecuteDenoisedResolve(commandList, m_uploadBuffer, constants,
             m_nrdHybridDenoiser.GetDiffuseOutput(PathTraceHybridDiffuseIdentifier),
             m_nrdHybridDenoiser.GetSpecularOutput(PathTraceHybridSpecularIdentifier), *presentation, m_sceneWidth,
-            m_sceneHeight);
+            m_sceneHeight, psr);
         m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::NrdHybridResolve);
         m_debugUI.SetPathTraceNrdStatus("");
     }
@@ -9280,10 +9630,23 @@ bool Renderer::BeginNrdRelaxFrame(
         m_nrdRelaxResolvedTexture.GetResource()->SetName(L"NRD RELAX Resolved (diagnostic)");
     }
 
-    // RESTART sources as REBLUR's: the temporal key and a frame gap; the shared invalidations clear the flag directly.
+    // PSR.2 Stage 3B phase 4B: as REBLUR's (BeginPathTraceNrdFrame), the PSR variant on frames whose replaced pixels the
+    // path tracer lit; a frame that cannot create it falls back to the Engine stages.
+    bool psrFailed = false;
+    m_nrdRelaxPsrThisFrame = PathTraceNrdPsrBindings(m_nrdRelaxPreparePass, psrFailed).IsSet();
+
+    if(psrFailed)
+    {
+        ReportNrdRelaxUnavailable("the PSR.2 RELAX pipelines could not be created");
+        return false;
+    }
+
+    // RESTART sources as REBLUR's: the temporal key, a frame gap and a change between PSR and ordinary frames; the shared
+    // invalidations clear the flag directly.
     const PathTraceTemporalKey key = MakePathTraceTemporalKey(primary, frameLighting, settings);
 
-    if(!m_nrdRelaxKey || !SamePathTraceTemporalKey(*m_nrdRelaxKey, key) || !m_nrdRelaxExecutedLastFrame)
+    if(!m_nrdRelaxKey || !SamePathTraceTemporalKey(*m_nrdRelaxKey, key) || !m_nrdRelaxExecutedLastFrame ||
+        m_nrdRelaxPsrThisFrame != m_nrdRelaxPsrLastFrame)
     {
         m_nrdRelaxHistoryValid = false;
     }
@@ -9345,10 +9708,11 @@ bool Renderer::BeginNrdRelaxFrame(
     frameSettings.historyConfidence = historyConfidence;
 
     m_nrdRelaxDenoiser.NewFrame();
+    nrd::RelaxSettings relaxSettings = m_nrdRelaxSettingsOverride ? *m_nrdRelaxSettingsOverride : PathTraceRelaxSettings();
+    ApplyNrdPsrMaterialSeparation(m_nrdRelaxPsrThisFrame, relaxSettings);
 
     if(!m_nrdRelaxDenoiser.SetCommonSettings(frameSettings) ||
-        !m_nrdRelaxDenoiser.SetDenoiserSettings(PathTraceRelaxIdentifier,
-            m_nrdRelaxSettingsOverride ? *m_nrdRelaxSettingsOverride : PathTraceRelaxSettings()))
+        !m_nrdRelaxDenoiser.SetDenoiserSettings(PathTraceRelaxIdentifier, relaxSettings))
     {
         ReportNrdRelaxUnavailable("NRD rejected the RELAX frame settings");
         return false;
@@ -9377,9 +9741,13 @@ bool Renderer::RecordNrdRelax(
     rawDiffuseHitDistance.Transition(commandList,
         D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     relaxConstants.rawDiffuseHitDistanceIndex = rawDiffuseHitDistance.GetDescriptorIndex();
+    // BeginNrdRelaxFrame created the variant when this frame needs it, so this cannot fail.
+    bool psrFailed = false;
+    const NrdPathTracePreparePass::PsrBindings psr = m_nrdRelaxPsrThisFrame ?
+        PathTraceNrdPsrBindings(m_nrdRelaxPreparePass, psrFailed) : NrdPathTracePreparePass::PsrBindings{};
 
     m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::NrdRelaxPrepare);
-    m_nrdRelaxPreparePass.ExecutePrepare(commandList, m_uploadBuffer, relaxConstants, m_sceneWidth, m_sceneHeight);
+    m_nrdRelaxPreparePass.ExecutePrepare(commandList, m_uploadBuffer, relaxConstants, m_sceneWidth, m_sceneHeight, psr);
     m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::NrdRelaxPrepare);
 
     NrdDenoiser::Inputs inputs;
@@ -9521,7 +9889,7 @@ bool Renderer::RecordNrdRelax(
             }
 
             m_nrdRelaxPreparePass.ExecuteDenoisedResolve(commandList, m_uploadBuffer, presentConstants, diffuseOutput,
-                specularOutput, *presentation, m_sceneWidth, m_sceneHeight);
+                specularOutput, *presentation, m_sceneWidth, m_sceneHeight, psr);
         }
     }
 
@@ -9531,7 +9899,7 @@ bool Renderer::RecordNrdRelax(
         NrdPathTracePrepareConstants diagnosticConstants = relaxConstants;
         diagnosticConstants.relaxDiagnosticResolve = 1;
         m_nrdRelaxPreparePass.ExecuteDenoisedResolve(commandList, m_uploadBuffer, diagnosticConstants, diffuseOutput,
-            specularOutput, m_nrdRelaxResolvedTexture, m_sceneWidth, m_sceneHeight);
+            specularOutput, m_nrdRelaxResolvedTexture, m_sceneWidth, m_sceneHeight, psr);
     }
 
     m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::NrdRelaxResolve);
@@ -9678,10 +10046,23 @@ bool Renderer::BeginPathTraceNrdFrame(
         }
     }
 
-    // RESTART sources checked here: the temporal key (as the Engine temporal pass) and a frame gap.
+    // PSR.2 Stage 3B phase 4A: a frame whose replaced pixels the path tracer lit runs the PSR variant. Without it those
+    // pixels would be presented as background, so a frame that cannot create it falls back to the Engine stages.
+    bool psrFailed = false;
+    m_nrdPathTracePsrThisFrame = PathTraceNrdPsrBindings(m_nrdPathTracePreparePass, psrFailed).IsSet();
+
+    if(psrFailed)
+    {
+        ReportPathTraceNrdUnavailable("the PSR.2 NRD pipelines could not be created");
+        return false;
+    }
+
+    // RESTART sources checked here: the temporal key (as the Engine temporal pass), a frame gap, and (PSR.2) a change
+    // between PSR and ordinary frames.
     const PathTraceTemporalKey key = MakePathTraceTemporalKey(primary, frameLighting, settings);
 
-    if(!m_nrdPathTraceKey || !SamePathTraceTemporalKey(*m_nrdPathTraceKey, key) || !m_nrdPathTraceExecutedLastFrame)
+    if(!m_nrdPathTraceKey || !SamePathTraceTemporalKey(*m_nrdPathTraceKey, key) || !m_nrdPathTraceExecutedLastFrame ||
+        m_nrdPathTracePsrThisFrame != m_nrdPathTracePsrLastFrame)
     {
         m_nrdPathTraceHistoryValid = false;
     }
@@ -9713,10 +10094,13 @@ bool Renderer::BeginPathTraceNrdFrame(
     frameSettings.enableValidation = m_nrdPathTraceValidation;
 
     m_nrdPathTraceDenoiser.NewFrame();
+    nrd::ReblurSettings reblurSettings = m_nrdPathTraceSettingsOverride ? *m_nrdPathTraceSettingsOverride :
+        PathTraceNrdSettings();
+
+    ApplyNrdPsrMaterialSeparation(m_nrdPathTracePsrThisFrame, reblurSettings);
 
     if(!m_nrdPathTraceDenoiser.SetCommonSettings(frameSettings) ||
-        !m_nrdPathTraceDenoiser.SetDenoiserSettings(PathTraceNrdIdentifier,
-            m_nrdPathTraceSettingsOverride ? *m_nrdPathTraceSettingsOverride : PathTraceNrdSettings()))
+        !m_nrdPathTraceDenoiser.SetDenoiserSettings(PathTraceNrdIdentifier, reblurSettings))
     {
         ReportPathTraceNrdUnavailable("NRD rejected the frame settings");
         return false;
@@ -9740,9 +10124,13 @@ void Renderer::RecordPathTraceNrd(
 {
     const NrdPathTracePrepareConstants constants = MakeNrdPathTracePrepareConstants(commandList, view,
         inverseViewProjection, cameraPosition);
+    // BeginPathTraceNrdFrame created the variant when this frame needs it, so this cannot fail.
+    bool psrFailed = false;
+    const NrdPathTracePreparePass::PsrBindings psr = m_nrdPathTracePsrThisFrame ?
+        PathTraceNrdPsrBindings(m_nrdPathTracePreparePass, psrFailed) : NrdPathTracePreparePass::PsrBindings{};
 
     m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::NrdPathTracePrepare);
-    m_nrdPathTracePreparePass.ExecutePrepare(commandList, m_uploadBuffer, constants, m_sceneWidth, m_sceneHeight);
+    m_nrdPathTracePreparePass.ExecutePrepare(commandList, m_uploadBuffer, constants, m_sceneWidth, m_sceneHeight, psr);
     m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::NrdPathTracePrepare);
 
     NrdDenoiser::Inputs inputs;
@@ -9767,7 +10155,7 @@ void Renderer::RecordPathTraceNrd(
     m_nrdPathTracePreparePass.ExecuteDenoisedResolve(commandList, m_uploadBuffer, resolveConstants,
         m_nrdPathTraceDenoiser.GetDiffuseOutput(PathTraceNrdIdentifier),
         m_nrdPathTraceDenoiser.GetSpecularOutput(PathTraceNrdIdentifier), m_pathTraceReferencePass.GetOutputTexture(),
-        m_sceneWidth, m_sceneHeight);
+        m_sceneWidth, m_sceneHeight, psr);
     m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::NrdPathTraceResolve);
 
     m_nrdPathTraceDispatchedThisFrame = true;
@@ -9849,7 +10237,8 @@ void Renderer::RecordPathTraceSpatial(ID3D12GraphicsCommandList* commandList, co
     if(atrous)
     {
         m_pathTraceSpatialPass.ExecuteAtrous(commandList, m_uploadBuffer, constants, iterations, m_sceneWidth,
-            m_sceneHeight);
+            m_sceneHeight, m_psrTemporalLastFrame ? m_psrDenoiseConstantsAddress : 0,
+            m_psrTemporalLastFrame ? m_psrGBufferTransformsAddress : 0);
         m_pathTraceSpatialIterationsLastFrame = iterations;
         return;
     }
@@ -10806,10 +11195,17 @@ bool Renderer::RecordRenderFrame(
     const bool queryReady = m_pathTraceReferencePass.IsSecondaryShadowRayQueryReady();
     const bool queryActive = options.pathTraceReference.secondaryShadowRayQuery && queryReady;
     const bool primaryQueryReady = m_pathTraceReferencePass.IsPrimaryDiShadowRayQueryReady();
-    const bool primaryQueryActive = options.pathTraceReference.primaryDiShadowRayQuery && primaryQueryReady;
+    // F01.1: the production DI.1 direct pass compiled as SM 6.9 + SER returns wrong RayQuery visibility (RTX 4080,
+    // driver 621.01); that variant keeps TraceRay. The request is preserved and the override reported.
+    const bool primaryQuerySerWorkaround = options.pathTraceReference.primaryDiShadowRayQuery &&
+        m_pathTraceReferencePass.GetLibraryVariant() == PathTraceLibraryVariant::SM69SER &&
+        !m_primaryDiSerWorkaroundDisabledForTesting;
+    const bool primaryQueryActive = options.pathTraceReference.primaryDiShadowRayQuery && primaryQueryReady &&
+        !primaryQuerySerWorkaround;
     m_pathTraceStatus.secondaryShadowRayQueryReady = queryReady;
     m_pathTraceStatus.primaryDiShadowRayQueryReady = primaryQueryReady;
     m_pathTraceStatus.primaryDiShadowRayQueryFailed = m_pathTraceReferencePass.IsPrimaryDiShadowRayQueryFailed();
+    m_pathTraceStatus.primaryDiShadowRayQuerySerWorkaround = primaryQuerySerWorkaround;
 
     if(queryActive != m_pathTraceStatus.secondaryShadowRayQueryActive ||
         primaryQueryActive != m_pathTraceStatus.primaryDiShadowRayQueryActive)
@@ -11023,8 +11419,9 @@ bool Renderer::RecordRenderFrame(
         }
 
         const bool rasterPrimaryAvailable =
-            m_rasterPrimaryStatus.availability == PathTraceRasterPrimaryAvailability::Available;
-        const bool restirDIAvailable = m_restirDIStatus.availability == PathTraceRasterPrimaryAvailability::Available;
+            m_rasterPrimaryStatus.rasterPrimary.availability == PathTraceRasterPrimaryAvailability::Available;
+        const bool restirDIAvailable =
+            GetReSTIRDIAvailability(m_rasterPrimaryStatus).availability == PathTraceRasterPrimaryAvailability::Available;
         primary = m_pathTraceReferencePrimary;
 
         if(rasterPrimaryRequested)
@@ -11062,11 +11459,11 @@ bool Renderer::RecordRenderFrame(
         }
         else if(rasterPrimaryRequested)
         {
-            failure = m_rasterPrimaryStatus.reason;
+            failure = m_rasterPrimaryStatus.rasterPrimary.reason;
         }
         else
         {
-            failure = m_restirDIStatus.reason;
+            failure = GetReSTIRDIAvailability(m_rasterPrimaryStatus).reason;
         }
 
         return runnable;
@@ -11095,14 +11492,14 @@ bool Renderer::RecordRenderFrame(
     if(m_lightingModeTransition.PreparationFailed())
     {
         const std::string& diagnostic = m_lightingModeTransition.GetStatus().diagnostic;
-        const auto publish = [&](PathTraceRasterPrimaryStatus& status, const char* name)
+        const auto publish = [&](PathTraceModeAvailability& status, const char* name)
         {
-            const PathTraceRasterPrimaryStatus failed{PathTraceRasterPrimaryAvailability::Unavailable,
+            const PathTraceModeAvailability failed{PathTraceRasterPrimaryAvailability::Unavailable,
                 "DXR library preparation failed: " + diagnostic};
 
             if(status.availability != failed.availability || status.reason != failed.reason)
             {
-                Log::Info(std::string(name) + " path tracing mode unavailable, rendering Legacy: " + failed.reason);
+                Log::Info(std::string(name) + " unavailable, rendering Legacy: " + failed.reason);
             }
 
             status = failed;
@@ -11110,11 +11507,11 @@ bool Renderer::RecordRenderFrame(
 
         if(options.lightingMode == RendererLightingMode::PathTracedRasterPrimary)
         {
-            publish(m_rasterPrimaryStatus, "Raster-primary");
+            publish(m_rasterPrimaryStatus.rasterPrimary, "Raster-primary (verification)");
         }
         else if(options.lightingMode == RendererLightingMode::PathTracedRasterPrimaryReSTIRDI)
         {
-            publish(m_restirDIStatus, "Raster-primary ReSTIR DI");
+            publish(m_rasterPrimaryStatus.restirDI, "Path Tracing (raster-primary ReSTIR DI)");
         }
     }
 
@@ -11245,10 +11642,114 @@ bool Renderer::RecordRenderFrame(
     const Matrix4 renderViewProjection = m_cameraJitterStatus.active ? renderProjection * currentView :
         currentViewProjection;
 
+    // PSR.1b: the guide pass's history, read before this frame replaces it. A transform is valid for every render object
+    // with a mesh; an unchanged object gets the exact identity, so a static mirror is recognized without rounding.
+    m_psrGuidePreviousView = m_previousView;
+    m_psrGuidePreviousViewProjection = m_previousViewProjection;
+    m_psrGuidePreviousCameraValid = m_hasPreviousViewProjection;
+    m_psrGuideTransforms.clear();
+
+    if(options.pathTraceReference.primarySurfaceReplacement && options.pathTraceReference.primarySurfaceReplacementGuides)
+    {
+        const auto& renderObjects = scene.GetRenderObjects();
+        m_psrGuideTransforms.resize(renderObjects.size());
+
+        for(std::size_t index = 0; index < renderObjects.size(); ++index)
+        {
+            const PresentationTransform presentation = renderObjects[index].GetPresentationTransform();
+            PathTracePsrTransform& transform = m_psrGuideTransforms[index];
+            transform.valid = renderObjects[index].mesh ? 1u : 0u;
+            const bool unchanged = std::memcmp(presentation.currentModel.m, presentation.previousModel.m,
+                sizeof(presentation.currentModel.m)) == 0;
+            const Matrix4 currentToPrevious = unchanged ? Matrix4::Identity() :
+                presentation.previousModel * presentation.currentModel.Inverse();
+
+            for(int row = 0; row < 3; ++row)
+            {
+                for(int column = 0; column < 4; ++column)
+                {
+                    transform.rows[row][column] = currentToPrevious.m[row][column];
+                }
+            }
+        }
+    }
+
     CameraConstants cameraConstants = BuildFrameCameraConstants(
         currentView, currentViewProjection, m_previousView, m_previousViewProjection, m_hasPreviousViewProjection);
     cameraConstants.unjitteredViewProjection = currentViewProjection;
     cameraConstants.viewProjection = renderViewProjection;
+
+    // PSR.2 Stage 1 (development prototype): eligibility marking and in-place replacement on Path Tracing (ReSTIR DI)
+    // frames only, with the path tracer's camera. PathTracePsrEligible's maxPathDepth > 0 is checked here.
+    const bool psrRequested = runPathTrace && pathTracePrimary == PathTracePrimary::RasterReSTIRDI &&
+        options.pathTraceReference.primarySurfaceReplacementInPlace && options.pathTraceReference.maxPathDepth > 0u &&
+        m_psrInPlaceReplacePass.IsInitialized();
+    // PSR.2 Stage 3A: only the PSR.2 lighting pair lights replaced pixels, and it needs the denoiser Off (no extraction),
+    // no SHARC or D6 cache, and a path that reaches the reflected surface (vertex 1). Without a diagnostic view the
+    // replacement runs only when it does; otherwise the mirror's G-buffer stays and the production path renders it.
+    m_psrLightingThisFrame = false;
+    m_psrGBufferConstantsAddress = 0;
+    m_psrGBufferTransformsAddress = 0;
+    m_psrDenoiseConstantsAddress = 0;
+    m_psrLightingLastFrame = false;
+    std::string psrLightingUnavailable;
+
+    if(psrRequested)
+    {
+        std::string failure;
+
+        // PSR.2 Stage 3B: the denoisers that filter replaced pixels as their effective primary. A frame may extract
+        // without one (diagnostics); its extraction pair must then exist, with raw distances when the frame records them.
+        const bool psrExtraction = m_pathTraceSignalExtraction;
+        const bool psrRawExtraction = psrExtraction && (m_nrdHybridDispatchDiagnostic || m_nrdRelaxPrepareDiagnostic ||
+            m_nrdRelaxDispatchDiagnostic || m_pathTraceDenoiserMode == PathTraceDenoiserMode::NrdRelax ||
+            m_pathTraceDenoiserMode == PathTraceDenoiserMode::NrdHybrid);
+
+        if(!PsrLightingSupportsDenoiser(m_pathTraceDenoiserMode))
+        {
+            psrLightingUnavailable = "requires a supported path-tracing denoiser";
+        }
+        else if(m_sharcSettings.enabled || options.experimentalD6RadianceCache)
+        {
+            psrLightingUnavailable = "requires SHARC off";
+        }
+        else if(options.pathTraceReference.maxPathDepth < 2u)
+        {
+            psrLightingUnavailable = "requires PT max path depth 2 or more";
+        }
+        else if(!m_pathTraceReferencePass.EnsurePrimarySurfaceReplacementGBuffer(m_graphicsDevice, m_shaderLibrary,
+            failure) || !m_pathTraceReferencePass.IsPrimarySurfaceReplacementGBufferReady())
+        {
+            psrLightingUnavailable = failure.empty() ? "lighting pipelines are not ready" : failure;
+        }
+        else if(psrExtraction && (!m_pathTraceReferencePass.EnsurePrimarySurfaceReplacementGBufferExtraction(
+            m_graphicsDevice, m_shaderLibrary, false, failure) || (psrRawExtraction &&
+            !m_pathTraceReferencePass.EnsurePrimarySurfaceReplacementGBufferExtraction(m_graphicsDevice, m_shaderLibrary,
+            true, failure)) || !m_pathTraceReferencePass.IsPrimarySurfaceReplacementGBufferExtractionReady(psrRawExtraction)))
+        {
+            psrLightingUnavailable = failure.empty() ? "extraction pipelines are not ready" : failure;
+        }
+        else
+        {
+            m_psrLightingThisFrame = true;
+        }
+    }
+
+    m_debugUI.SetPsrLightingStatus(psrRequested, psrLightingUnavailable);
+    const bool psrInPlace = psrRequested &&
+        (m_psrLightingThisFrame || m_debugUI.GetPsrDebugView() != ToneMapDebugView::None);
+
+    if(psrInPlace)
+    {
+        cameraConstants.psrEligibility = 1u;
+        cameraConstants.psrResolution[0] = m_sceneWidth;
+        cameraConstants.psrResolution[1] = m_sceneHeight;
+        cameraConstants.psrInverseCameraRelativeViewProjection =
+            CameraRelativeInverseViewProjection(currentView, renderProjection);
+        cameraConstants.psrCameraPosition[0] = frameView.position.x;
+        cameraConstants.psrCameraPosition[1] = frameView.position.y;
+        cameraConstants.psrCameraPosition[2] = frameView.position.z;
+    }
     // UPSCALING.3D: DLSS reconstructs output-resolution texture detail from biased render samples.
     cameraConstants.textureMipBias = 0.0f;
 
@@ -11578,6 +12079,15 @@ bool Renderer::RecordRenderFrame(
     RecordSceneSelectionMask(commandList, scene, options, cameraConstantsAddress);
 
     EndGeometryPass(commandList);
+    m_psrInPlaceReplacedLastFrame = false;
+
+    if(psrInPlace)
+    {
+        m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::PsrInPlaceReplace);
+        m_psrInPlaceReplacedLastFrame = RecordPsrInPlaceReplacement(commandList, scene, currentView, renderProjection,
+            frameView.position, cameraConstants);
+        m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::PsrInPlaceReplace);
+    }
 
     constexpr float nrdDenoisingRange = 1000.0f;
     bool runNrd = false;
@@ -12262,6 +12772,7 @@ bool Renderer::RecordRenderFrame(
     {
         CameraConstants overlayCamera = cameraConstants;
         overlayCamera.viewProjection = overlayCamera.unjitteredViewProjection;
+        overlayCamera.psrEligibility = 0u;
         const D3D12_GPU_VIRTUAL_ADDRESS overlayCameraAddress = m_uploadBuffer.Allocate(&overlayCamera,
             sizeof(CameraConstants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
 
@@ -12291,14 +12802,19 @@ bool Renderer::RecordRenderFrame(
 #endif
         ) ?
         ToneMapDebugView::PathTraceDenoiserScalar : ToneMapDebugView::None;
-    const ToneMapDebugView presentedDebugView = runPathTrace ? pathTraceDebugView : debugView;
+    // PSR.2 development views replace the presented image with the G-buffer after in-place replacement; they read it
+    // at render extent, so they also apply at a reduced render scale.
+    const ToneMapDebugView psrDebugView = psrInPlace ? m_debugUI.GetPsrDebugView() : ToneMapDebugView::None;
+    const ToneMapDebugView presentedDebugView = psrDebugView != ToneMapDebugView::None ? psrDebugView :
+        runPathTrace ? pathTraceDebugView : debugView;
 
     m_finalSceneColor.Transition(commandList, D3D12_RESOURCE_STATE_RENDER_TARGET);
     m_toneMapPass.Execute(commandList, *presentedColor, m_finalSceneColor.GetRTV(), presentedDebugTexture,
                           hasRenderableMeshes ? presentedDebugView : ToneMapDebugView::None, nrdDenoisingRange,
                           presentedDebugRenderTarget, presentedSelectionMask, options.selectionOutlineColor,
                           presentedDebugView == ToneMapDebugView::None ? options.selectionOutlineThickness : 0,
-                          presentedDepth->GetSRVIndex(), options.toneMapOperator, m_autoExposurePass.GetStateSRVIndex());
+                          presentedDepth->GetSRVIndex(), options.toneMapOperator, m_autoExposurePass.GetStateSRVIndex(),
+                          psrDebugView != ToneMapDebugView::None ? &m_gBuffer : nullptr, m_psrInPlaceReplacedLastFrame);
 
     m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::ToneMap);
 
@@ -12518,6 +13034,7 @@ bool Renderer::RecordRenderFrame(
         m_nrdPathTracePreviousJitter[1] = m_nrdPathTracePendingJitter[1];
         m_nrdPathTraceHistoryValid = true;
         m_nrdPathTraceInstanceNew = false;
+        m_nrdPathTracePsrLastFrame = m_nrdPathTracePsrThisFrame;
         ++m_nrdPathTraceFrameIndex;
     }
 
@@ -12533,6 +13050,7 @@ bool Renderer::RecordRenderFrame(
         m_nrdRelaxPreviousJitter[1] = m_nrdRelaxPendingJitter[1];
         m_nrdRelaxHistoryValid = true;
         m_nrdRelaxInstanceNew = false;
+        m_nrdRelaxPsrLastFrame = m_nrdRelaxPsrThisFrame;
         ++m_nrdRelaxFrameIndex;
         ++m_nrdRelaxSubmittedDispatches;
     }
@@ -12559,6 +13077,7 @@ bool Renderer::RecordRenderFrame(
         m_nrdHybridPreviousJitter[1] = m_nrdHybridPendingJitter[1];
         m_nrdHybridHistoryValid = true;
         m_nrdHybridInstanceNew = false;
+        m_nrdHybridPsrLastFrame = m_nrdHybridPsrThisFrame;
         ++m_nrdHybridFrameIndex;
         ++m_nrdHybridSubmittedDispatches;
     }
@@ -12740,6 +13259,7 @@ void Renderer::Shutdown()
     m_toneMapPass.Shutdown();
     m_editorColliderPass.Shutdown();
     m_editorGridPass.Shutdown();
+    m_psrInPlaceReplacePass.Shutdown();
     m_brdfIntegrationPass.Shutdown();
     m_ggxAverageAlbedoPass.Shutdown();
     m_rayTracedShadowPass.Shutdown();
@@ -12818,7 +13338,6 @@ void Renderer::Shutdown()
     m_rtxdiResources.Shutdown();
     m_rtxdiResourcesFailed = false;
     m_rasterPrimaryStatus = {};
-    m_restirDIStatus = {};
     m_materialTables.Shutdown();
     m_materialTableUnavailableReason.clear();
     m_pathTraceAccumulationKey.reset();

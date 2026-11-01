@@ -6,6 +6,7 @@
 
 #include <d3d12.h>
 
+class GBuffer;
 class ShaderLibrary;
 class RenderTarget;
 class Texture;
@@ -47,7 +48,11 @@ enum class ToneMapDebugView : unsigned int
     GISignedReconstructed = 31,
     ShadingNormalViewHorizon = 32,
     // RTXPT D.3B.0: path-trace denoiser scalar views, display-encoded in scene colour (selected by the renderer).
-    PathTraceDenoiserScalar = 33
+    PathTraceDenoiserScalar = 33,
+    // PSR.2 development views of the G-buffer after in-place replacement (selected by the renderer; ToneMapPass's psrGBuffer).
+    PsrReplacementMask = 34,
+    PsrReflectedNormal = 35,
+    PsrReflectedAlbedo = 36
 };
 
 // Final display tone mapper; values match ToneMap.hlsl. Existing is Engine's AgX; GT7 is Polyphony Digital's GT7 operator.
@@ -69,7 +74,7 @@ class ToneMapPass
                  RenderTarget* debugRenderTarget = nullptr, RenderTarget* selectionMask = nullptr,
                  const Vector3& outlineColor = Vector3{1.0f, 0.604f, 0.0f}, unsigned int outlineThickness = 2,
                  unsigned int debugDepthIndex = 0, ToneMapOperator toneMapOperator = ToneMapOperator::Existing,
-                 unsigned int exposureStateIndex = 0);
+                 unsigned int exposureStateIndex = 0, GBuffer* psrGBuffer = nullptr, bool psrReplacementRan = false);
     void Shutdown();
 
     private:

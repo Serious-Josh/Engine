@@ -1,6 +1,7 @@
 #pragma once
 #include "Renderer/Passes/EditorColliderPass.h"
 #include "Renderer/Passes/EditorGridPass.h"
+#include "Renderer/Passes/PsrInPlaceReplacePass.h"
 #include "Debug/CpuFrameTiming.h"
 #include "Editor/TextureThumbnailCache.h"
 #include "Diagnostics/FrameHitchDiagnostics.h"
@@ -233,6 +234,8 @@ struct PathTraceReferenceStatus
     bool primaryDiShadowRayQueryReady = false;
     bool primaryDiShadowRayQueryActive = false;
     bool primaryDiShadowRayQueryFailed = false;
+    // F01.1: RayQuery was requested but the SM 6.9 + SER variant routes primary DI visibility to TraceRay.
+    bool primaryDiShadowRayQuerySerWorkaround = false;
     std::uint64_t visibilityTimingEpoch = 0;
     std::uint32_t accumulatedSamples = 0;
     std::uint64_t accumulationResets = 0;
@@ -259,13 +262,6 @@ struct PreviousGBufferView
     unsigned int geometricNormalIndex = 0;
     unsigned int materialIndex = 0;
     PreviousGBufferCamera camera;
-};
-
-// Evidence of the RTXPT.2 raster-primary mode for the Editor and diagnostics. Values only.
-struct PathTraceRasterPrimaryStatus
-{
-    PathTraceRasterPrimaryAvailability availability = PathTraceRasterPrimaryAvailability::NotRequested;
-    std::string reason;
 };
 
 class Scene;
@@ -463,8 +459,16 @@ class Renderer
     const PathTraceReferenceStatus& GetPathTraceReferenceStatus() const noexcept { return m_pathTraceStatus; }
     // SHARC.4E: the cache's statistics for the Editor (two frames old; valid only with SharcSettings::statistics).
     const SharcStatus& GetSharcStatus() const noexcept { return m_sharcStatus; }
-    const PathTraceRasterPrimaryStatus& GetPathTraceRasterPrimaryStatus() const noexcept { return m_rasterPrimaryStatus; }
-    const PathTraceRasterPrimaryStatus& GetPathTraceReSTIRDIStatus() const noexcept { return m_restirDIStatus; }
+    // The shared raster-primary prerequisites (PathTracedRasterPrimary), ReSTIR DI's effective availability, and both.
+    const PathTraceModeAvailability& GetPathTraceRasterPrimaryStatus() const noexcept
+    {
+        return m_rasterPrimaryStatus.rasterPrimary;
+    }
+    PathTraceModeAvailability GetPathTraceReSTIRDIStatus() const { return GetReSTIRDIAvailability(m_rasterPrimaryStatus); }
+    const PathTraceRasterPrimaryStatus& GetPathTraceRasterPrimaryCapability() const noexcept
+    {
+        return m_rasterPrimaryStatus;
+    }
     // Async DXR preparation: requested versus active lighting mode and the real preparation stage.
     const LightingModeTransitionStatus& GetLightingModeTransitionStatus() const noexcept
     {
@@ -1598,6 +1602,35 @@ class Renderer
     ToneMapPass m_toneMapPass;
     EditorColliderPass m_editorColliderPass;
     EditorGridPass m_editorGridPass;
+    // PSR.2 Stage 2 development prototype (PathTraceReferenceSettings::primarySurfaceReplacementInPlace).
+    PsrInPlaceReplacePass m_psrInPlaceReplacePass;
+    // Whether the last recorded frame ran the in-place replacement pass (diagnostics).
+    bool m_psrInPlaceReplacedLastFrame = false;
+    // Development verification only: when set (with the pass's diagnostic pipeline initialized), the replacement pass
+    // runs its diagnostic variant and writes per-pixel hit records here. Null in normal rendering.
+    Buffer* m_psrDiagnosticHits = nullptr;
+    bool RecordPsrInPlaceReplacement(ID3D12GraphicsCommandList* commandList, const Scene& scene, const Matrix4& view,
+        const Matrix4& renderProjection, const Vector3& cameraPosition, const CameraConstants& cameraConstants);
+    // PSR.2 Stage 3A: whether this frame lights replaced pixels (decided before the geometry pass, so replacement runs
+    // without a diagnostic view only when it does), and the PSR.2 lighting pair's bindings, set by
+    // RecordPsrInPlaceReplacement on such a frame (0 otherwise).
+    bool m_psrLightingThisFrame = false;
+    static bool PsrLightingSupportsDenoiser(PathTraceDenoiserMode mode);
+    // PSR.2 Stage 3B phase 4: an NRD mode's PSR bindings for its preparation pass on a frame whose replaced pixels the path
+    // tracer lit, creating the pass's variant on first use; empty otherwise, or when the variant cannot be created
+    // (failed reports why).
+    NrdPathTracePreparePass::PsrBindings PathTraceNrdPsrBindings(NrdPathTracePreparePass& pass, bool& failed);
+    // The NRD material comparison of a PSR frame (nrd::ReblurSettings or nrd::RelaxSettings); unchanged otherwise.
+    template<typename Settings>
+    void ApplyNrdPsrMaterialSeparation(bool psrFrame, Settings& settings) const;
+    D3D12_GPU_VIRTUAL_ADDRESS m_psrGBufferConstantsAddress = 0;
+    D3D12_GPU_VIRTUAL_ADDRESS m_psrGBufferTransformsAddress = 0;
+    // PSR.2 Stage 3B: the denoisers' PSR variants' constants on such a frame (0 otherwise), and whether the last
+    // temporal frame used the PSR variant (a change restarts the history).
+    D3D12_GPU_VIRTUAL_ADDRESS m_psrDenoiseConstantsAddress = 0;
+    bool m_psrTemporalLastFrame = false;
+    // Whether the last path-traced frame recorded the PSR.2 lighting pair.
+    bool m_psrLightingLastFrame = false;
 
     BRDFIntegrationPass m_brdfIntegrationPass;
 
@@ -1818,9 +1851,8 @@ class Renderer
     D3D12_GPU_VIRTUAL_ADDRESS PrepareRadianceCacheQuery(ID3D12GraphicsCommandList* commandList, bool extract,
         bool splitReSTIRDI, bool rawDiffuseHitDistance = false);
     // The learning library of the frame PrepareRadianceCacheLearning prepared.
-    PathTraceRadianceCacheLibrary m_radianceCacheLearningLibrary = PathTraceRadianceCacheLibrary::Inline;
-    // Diagnostics (SHARC.4D-Q): the library deferred frames learn with. Inline stores records from the inline library
-    // (the binding's deferred flag), which renders exactly as inline learning does.
+    PathTraceRadianceCacheLibrary m_radianceCacheLearningLibrary = PathTraceRadianceCacheLibrary::Training;
+    // Diagnostics (SHARC.4D-Q): the library Insertion::Deferred frames learn with (Deferred or DeferredLate).
     PathTraceRadianceCacheLibrary m_radianceCacheDeferredLibrary = PathTraceRadianceCacheLibrary::Deferred;
     // Diagnostics fault injection: the next record-buffer allocation fails.
     bool m_radianceCacheRecordsFailAllocationForTesting = false;
@@ -1831,6 +1863,8 @@ class Renderer
     // takes PathTraceSequenceSeed of its first frame's serial relative to m_pathTraceSequenceOrigin, so a moving
     // camera, which restarts accumulation every frame, no longer repeats one random sequence.
     std::optional<std::uint32_t> m_pathTraceRandomSeed;
+    // F01.1 verification only: disables the SM 6.9 + SER primary DI TraceRay routing (the guard's negative control).
+    bool m_primaryDiSerWorkaroundDisabledForTesting = false;
     // The seed of the current accumulation run, latched when accumulation restarts.
     std::uint32_t m_pathTraceRunSeed = 0;
     // m_gpuProfilerFrameSerial at the last ResetSceneHistory: the first run after a reset uses seed 0.
@@ -1841,6 +1875,23 @@ class Renderer
     bool m_pathTraceSignalExtraction = false;
     // Whether the last recorded path-tracing frame ran the extraction exports.
     bool m_pathTraceExtractedLastFrame = false;
+    // PSR.1a: whether the last path-traced frame recorded primary surface replacement, and the last reported reason it
+    // could not (reported once per distinct reason).
+    bool m_primarySurfaceReplacementLastFrame = false;
+    std::string m_primarySurfaceReplacementFailure;
+    // PSR.1a-P: whether any published material can produce a vertex-0 roughness at or below the delta threshold
+    // (MaterialCanBeDeltaMirror), cached per scene-resource lifetime and material revision.
+    std::pair<std::uint64_t, std::uint64_t> m_primarySurfaceReplacementMaterials{UINT64_MAX, UINT64_MAX};
+    bool m_primarySurfaceReplacementPossible = true;
+    // PSR.1b, captured by RecordRenderFrame when guides are requested: the unjittered previous camera raster motion uses
+    // (before this frame overwrites it) and each render object's current-to-previous world transform, indexed by its
+    // TLAS InstanceID (the render object index).
+    Matrix4 m_psrGuidePreviousView;
+    Matrix4 m_psrGuidePreviousViewProjection;
+    bool m_psrGuidePreviousCameraValid = false;
+    std::vector<PathTracePsrTransform> m_psrGuideTransforms;
+    bool m_primarySurfaceReplacementGuidesLastFrame = false;
+    std::string m_primarySurfaceReplacementGuideFailure;
     // NRD.3: requested by diagnostics only (never by default, any setting or the Editor). Each extraction frame then
     // also prepares REBLUR's inputs from the raw extraction and reconstructs the raw signals through an NRD bypass. It
     // reads the frame's signals and writes only its own textures: the image is unchanged. Frames without extraction
@@ -1960,6 +2011,22 @@ class Renderer
     float m_nrdPathTracePendingJitter[2] = {0.0f, 0.0f};
     std::uint32_t m_nrdPathTraceFrameIndex = 0;
     nrd::AccumulationMode m_nrdPathTraceAccumulationMode = nrd::AccumulationMode::CLEAR_AND_RESTART;
+    // PSR.2 Stage 3B phase 4A: whether this frame's REBLUR runs the PSR prepare/resolve variant (replaced pixels lit by
+    // the path tracer), and whether the last submitted REBLUR frame did. A change restarts history: the history of a
+    // PSR frame holds replaced pixels as their virtual surfaces without the mirror's throughput.
+    bool m_nrdPathTracePsrThisFrame = false;
+    bool m_nrdPathTracePsrLastFrame = false;
+    // Verification only, false in production: PSR frames of every NRD mode run without NRD's material comparison (every
+    // minimum at the SDK default 4), to measure what the separation of replaced and ordinary history prevents.
+    bool m_nrdPathTracePsrSeparationDisabledForTesting = false;
+    // Phases 4B and 4C: as m_nrdPathTracePsrThisFrame / LastFrame, for RELAX and the hybrid.
+    bool m_nrdRelaxPsrThisFrame = false;
+    bool m_nrdRelaxPsrLastFrame = false;
+    bool m_nrdHybridPsrThisFrame = false;
+    bool m_nrdHybridPsrLastFrame = false;
+    // Diagnostics, 0 in production: the hybrid's denoised resolve components (as m_nrdPathTraceResolveComponents: 0 both,
+    // 1 diffuse only, 2 specular only).
+    std::uint32_t m_nrdHybridResolveComponents = 0;
     // Whether the last recorded frame presented REBLUR's output (false after a frame of any other mode).
     bool m_nrdPathTracePresentedLastFrame = false;
     // NRD.4C diagnostics, unset/0 in production: REBLUR settings used in place of PathTraceNrdSettings (the caller
@@ -2173,14 +2240,11 @@ class Renderer
     ShaderLibraryPreparation PrepareLightingModeLibraries(RendererLightingMode mode);
     void CreateLightingModeResources(RendererLightingMode mode);
 
-    // RTXPT.2 raster-primary mode: whether its prerequisites hold, evaluated on frames that request it.
-    // It owns no resources beyond its pipeline in the reference pass.
+    // The raster-primary modes' capability, evaluated on frames that request them. RTXPT.2: the shared prerequisites
+    // (rasterPrimary), which own no resources beyond the Raster Primary pipeline in the reference pass. RTXPT.3: ReSTIR DI
+    // re-evaluates them, then its own pipelines and the RTXDI resources (restirDI; allocated on first request).
     PathTraceRasterPrimaryStatus m_rasterPrimaryStatus;
     void EvaluatePathTraceRasterPrimary();
-
-    // RTXPT.3 raster-primary ReSTIR DI mode: every raster-primary prerequisite, its own pipeline and the RTXDI
-    // resources (allocated here on first request). Evaluated on frames that request it.
-    PathTraceRasterPrimaryStatus m_restirDIStatus;
     void EvaluatePathTraceReSTIRDI();
 
     // Prepares this recording's RTXDI frame (light set, SDK buffer indices, reuse inputs, constants b2) and

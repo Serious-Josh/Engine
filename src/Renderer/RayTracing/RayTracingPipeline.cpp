@@ -265,14 +265,21 @@ bool RayTracingPipeline::Initialize(
 
     // Keep material texture wrapping at s0; equirectangular environments
     // wrap longitude but clamp latitude at s1.
-    D3D12_STATIC_SAMPLER_DESC staticSamplers[2] = {staticSampler, staticSampler};
+    D3D12_STATIC_SAMPLER_DESC staticSamplers[3] = {staticSampler, staticSampler, staticSampler};
     staticSamplers[1].ShaderRegister = 1;
     staticSamplers[1].AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+
+    // PSR.2 Stage 3A, on request: the geometry pass's material sampler (Pipeline's default trilinear clamp) at s2.
+    staticSamplers[2].ShaderRegister = 2;
+    staticSamplers[2].AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    staticSamplers[2].AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    staticSamplers[2].AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    staticSamplers[2].BorderColor = D3D12_STATIC_BORDER_COLOR_OPAQUE_BLACK;
 
     D3D12_ROOT_SIGNATURE_DESC rootSignatureDescription{};
     rootSignatureDescription.NumParameters = static_cast<UINT>(rootParameters.size());
     rootSignatureDescription.pParameters = rootParameters.empty() ? nullptr : rootParameters.data();
-    rootSignatureDescription.NumStaticSamplers = 2;
+    rootSignatureDescription.NumStaticSamplers = description.rasterMaterialSampler ? 3 : 2;
 
     rootSignatureDescription.pStaticSamplers = staticSamplers;
     rootSignatureDescription.Flags = D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED;

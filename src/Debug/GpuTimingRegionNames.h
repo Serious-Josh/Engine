@@ -62,5 +62,8 @@ inline constexpr const char* GpuTimingRegionNames[] = {"GPU frame",
                                                        "CausticReferenceLight",
                                                        "CausticReferenceCamera",
                                                        "Pixel caustic estimate",
-                                                       "Pixel caustic view"};
+                                                       "Pixel caustic view",
+                                                       "PT PSR record",
+                                                       "PT PSR raster",
+                                                       "PSR in-place replace"};
 static_assert(sizeof(GpuTimingRegionNames) / sizeof(GpuTimingRegionNames[0]) == GpuTimingMonitor::RegionCount);

@@ -12,11 +12,11 @@
 // are included. An invalid or delta continuation, roulette termination at x1, or a path whose suffix adds nothing is a
 // zero-valued sample (still counted). Every eligible path inserts exactly one sample, so each entry's samples are i.i.d.
 //
-// SHARC.4D-Q deferred insertion. With the binding's deferred flag, or always in the deferred learning libraries
-// (PATH_TRACE_RADIANCE_CACHE_DEFERRED, PathTraceReferenceRadianceCacheDeferred*.hlsl), a path stores its raw sample as
-// a record (RadianceCacheD6.hlsli) instead of inserting it; CSInsertRecords inserts the records after the dispatch with
-// the same header check, values and atomic insertion. The deferred library has no insertion, statistics or lookup code,
-// and stores x1's part of the record at vertex 1 so that it is not kept across later traces;
+// SHARC.4D-Q deferred insertion, the only insertion: every learning library is deferred
+// (PATH_TRACE_RADIANCE_CACHE_DEFERRED, PathTraceReferenceRadianceCacheDeferred*.hlsl and the training libraries). A path
+// stores its raw sample as a record (RadianceCacheD6.hlsli); CSInsertRecords inserts the records after the dispatch
+// with the header check, values and atomic insertion. The harvest has no insertion, statistics or lookup code, and
+// stores x1's part of the record at vertex 1 so that it is not kept across later traces;
 // PATH_TRACE_RADIANCE_CACHE_DEFERRED_LATE keeps it and stores the whole record at the end of the path instead.
 
 // SHARC.4D-R: the query library (PATH_TRACE_RADIANCE_CACHE_QUERY) has query-only hooks instead
@@ -26,9 +26,13 @@
 #include "PathTraceRadianceCacheQuery.hlsli"
 #else
 
+#ifndef PATH_TRACE_RADIANCE_CACHE_DEFERRED
+#error "SHARC learning libraries must define PATH_TRACE_RADIANCE_CACHE_DEFERRED (inline insertion was removed)."
+#endif
+
 #include "RadianceCacheD6.hlsli"
 
-#if defined(PATH_TRACE_RADIANCE_CACHE_DEFERRED) && !defined(PATH_TRACE_RADIANCE_CACHE_DEFERRED_LATE)
+#ifndef PATH_TRACE_RADIANCE_CACHE_DEFERRED_LATE
 #define PATH_TRACE_RADIANCE_CACHE_EARLY_RECORD 1
 #else
 #define PATH_TRACE_RADIANCE_CACHE_EARLY_RECORD 0
@@ -154,45 +158,6 @@ void PathTraceRadianceCacheHarvestVertex(inout PathTraceRadianceCacheHarvest har
         uint base = RadianceCacheD6RecordAddress(record);
         records.Store4(base, uint4(harvest.key, asuint(harvest.normal.xy)));
         records.Store(base + 16u, asuint(harvest.normal.z));
-    }
-#endif
-
-#ifndef PATH_TRACE_RADIANCE_CACHE_DEFERRED
-    // SHARC.4D-P profiling, stop 6: what a vertex-1 lookup of the published entry costs here (tags, full key, 24
-    // published words). The result only feeds a never-taken store; the path is then inactive, so nothing is inserted.
-    if(radianceCache.harvestStop == 6u && harvest.active)
-    {
-        RWByteAddressBuffer tags = ResourceDescriptorHeap[radianceCache.tagsIndex];
-        RWByteAddressBuffer keys = ResourceDescriptorHeap[radianceCache.keysIndex];
-        RWByteAddressBuffer published = ResourceDescriptorHeap[radianceCache.publishedIndex];
-        uint firstSlot = RadianceCacheD6Bucket(harvest.key, radianceCache.bucketCount) * RADIANCE_CACHE_D6_BUCKET_SLOTS;
-        uint tag = RadianceCacheD6Tag(harvest.key);
-        float found = 0.0f;
-
-        for(uint index = 0u; index < RADIANCE_CACHE_D6_BUCKET_SLOTS; ++index)
-        {
-            uint slot = firstSlot + index;
-
-            if(tags.Load(slot * 4u) == tag && all(keys.Load2(slot * 8u) == harvest.key))
-            {
-                [unroll]
-                for(uint word = 0u; word < RADIANCE_CACHE_D6_PUBLISHED_WORDS; word += 4u)
-                {
-                    uint4 words = published.Load4((slot * RADIANCE_CACHE_D6_PUBLISHED_WORDS + word) * 4u);
-                    found += asfloat(words.x) + asfloat(words.y) + asfloat(words.z) + asfloat(words.w);
-                }
-
-                break;
-            }
-        }
-
-        if(found == -1234.5f)
-        {
-            RWByteAddressBuffer statistics = ResourceDescriptorHeap[radianceCache.statisticsIndex];
-            statistics.InterlockedAdd(RADIANCE_CACHE_D6_STATISTIC_REJECTED_SAMPLES * 4u, 1u);
-        }
-
-        harvest.active = false;
     }
 #endif
 }
@@ -335,92 +300,10 @@ void PathTraceRadianceCacheHarvestStoreRecord(PathTraceRadianceCacheHarvest harv
         (radianceCache.recordSequence << 1u) | (harvest.sampled ? 1u : 0u));
 }
 
-// At the end of the path, by every lane that traced one (wave statistics): inserts the sample if the generation header
-// names this frame's epoch and identity. Deferred learning stores the sample's record instead.
+// At the end of the path, by every lane that traced one: stores the path's training record.
 void PathTraceRadianceCacheHarvestEnd(PathTraceRadianceCacheHarvest harvest)
 {
-#ifdef PATH_TRACE_RADIANCE_CACHE_DEFERRED
     PathTraceRadianceCacheHarvestStoreRecord(harvest);
-#else
-    if(radianceCache.deferred != 0u)
-    {
-        PathTraceRadianceCacheHarvestStoreRecord(harvest);
-        return;
-    }
-
-    // SHARC.4D-P profiling, stop 7: the raw sample record (key, direction, normal, pdf, suffix radiance; 12 words)
-    // with plain stores at the path's pixel, as a deferred insertion pass would read it. Nothing else runs.
-    if(radianceCache.harvestStop == 7u)
-    {
-        if(harvest.active)
-        {
-            RWByteAddressBuffer scratch = ResourceDescriptorHeap[radianceCache.accumulationIndex];
-            uint2 pixel = DispatchRaysIndex().xy;
-            uint records = radianceCache.bucketCount * RADIANCE_CACHE_D6_BUCKET_SLOTS * RADIANCE_CACHE_D6_ACCUMULATION_WORDS / 12u;
-            uint base = ((pixel.y * DispatchRaysDimensions().x + pixel.x) % records) * 48u;
-            scratch.Store4(base, uint4(harvest.key, asuint(harvest.direction.xy)));
-            scratch.Store4(base + 16u, uint4(asuint(harvest.direction.z), asuint(harvest.normal)));
-            scratch.Store4(base + 32u, uint4(asuint(harvest.pdf), asuint(harvest.suffixRadiance)));
-        }
-
-        return;
-    }
-
-    // SHARC.4D-P profiling, stops 5 and 6: no insertion and no epilogue.
-    if(radianceCache.harvestStop >= 5u)
-    {
-        return;
-    }
-
-    // SHARC.4D-P profiling, stop 3: the harvest state is kept (one never-taken store depends on all of it) but no
-    // header check, weights or insertion run.
-    if(radianceCache.harvestStop == 3u)
-    {
-        float state = harvest.suffixRadiance.x + harvest.suffixRadiance.y + harvest.suffixRadiance.z +
-            harvest.suffixThroughput.x + harvest.direction.x + harvest.normal.y + harvest.pdf + float(harvest.key.x ^ harvest.key.y);
-
-        if(harvest.active && harvest.sampled && state == -1234.5f)
-        {
-            RWByteAddressBuffer statistics = ResourceDescriptorHeap[radianceCache.statisticsIndex];
-            statistics.InterlockedAdd(RADIANCE_CACHE_D6_STATISTIC_REJECTED_SAMPLES * 4u, 1u);
-        }
-
-        return;
-    }
-
-    bool accepted = RadianceCacheD6BindingAccepted(radianceCache);
-    bool active = harvest.active && accepted;
-    bool sampled = active && harvest.sampled;
-    float3 values[RADIANCE_CACHE_D6_MOMENTS];
-    RadianceCacheD6SampleValues(radianceCache, sampled, harvest.normal, harvest.direction, harvest.pdf,
-        harvest.suffixRadiance, values);
-
-    bool zero = !sampled || all(harvest.suffixRadiance == 0.0f);
-    RadianceCacheD6CountWave(radianceCache, RADIANCE_CACHE_D6_STATISTIC_HEADER_REJECTED, harvest.active && !accepted);
-
-    // SHARC.4D-P profiling, stop 2: the sample is computed (one never-taken store depends on it), not inserted.
-    if(radianceCache.harvestStop == 2u)
-    {
-        float sample = 0.0f;
-
-        [unroll]
-        for(uint moment = 0u; moment < RADIANCE_CACHE_D6_MOMENTS; ++moment)
-        {
-            sample += values[moment].x + values[moment].y + values[moment].z;
-        }
-
-        if(active && sample == -1234.5f)
-        {
-            RWByteAddressBuffer statistics = ResourceDescriptorHeap[radianceCache.statisticsIndex];
-            statistics.InterlockedAdd(RADIANCE_CACHE_D6_STATISTIC_REJECTED_SAMPLES * 4u, 1u);
-        }
-
-        return;
-    }
-
-    // Stop 1 claims the slot but adds nothing to it.
-    RadianceCacheD6AddSample(radianceCache, active, harvest.key, values, zero, radianceCache.harvestStop != 1u);
-#endif
 }
 
 #endif

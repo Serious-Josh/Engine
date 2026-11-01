@@ -551,7 +551,6 @@ ShaderLibraryProfile ShaderCompiler::GetLibraryProfile(const std::filesystem::pa
     if(fileName == "PathTraceReferenceSM69.hlsl" || fileName == "PathTraceReSTIRDISM69.hlsl" ||
         fileName == "PathTraceReferenceSERSM69.hlsl" || fileName == "PathTraceReSTIRDISERSM69.hlsl" ||
         fileName == "PathTraceReSTIRDIExtractSM69.hlsl" || fileName == "PathTraceReSTIRDIExtractSERSM69.hlsl" ||
-        fileName == "PathTraceReferenceRadianceCacheSM69.hlsl" || fileName == "PathTraceReferenceRadianceCacheSERSM69.hlsl" ||
         fileName == "PathTraceReferenceRadianceCacheDeferredSM69.hlsl" ||
         fileName == "PathTraceReferenceRadianceCacheDeferredSERSM69.hlsl" ||
         fileName == "PathTraceReferenceRadianceCacheDeferredLateSM69.hlsl" ||
@@ -567,7 +566,15 @@ ShaderLibraryProfile ShaderCompiler::GetLibraryProfile(const std::filesystem::pa
         fileName == "PathTraceReferenceRawDiffuseHitDistanceSM69.hlsl" ||
         fileName == "PathTraceReferenceRawDiffuseHitDistanceSERSM69.hlsl" ||
         fileName == "PathTraceReferenceRadianceCacheRenderRawDiffuseHitDistanceSM69.hlsl" ||
-        fileName == "PathTraceReferenceRadianceCacheRenderRawDiffuseHitDistanceSERSM69.hlsl")
+        fileName == "PathTraceReferenceRadianceCacheRenderRawDiffuseHitDistanceSERSM69.hlsl" ||
+        fileName == "PathTraceReferencePsrSM69.hlsl" || fileName == "PathTraceReferencePsrSERSM69.hlsl" ||
+        fileName == "PathTraceReSTIRDIPsrSM69.hlsl" || fileName == "PathTraceReSTIRDIPsrSERSM69.hlsl" ||
+        fileName == "PathTraceReferencePsrGBufferSM69.hlsl" || fileName == "PathTraceReferencePsrGBufferSERSM69.hlsl" ||
+        fileName == "PathTraceReSTIRDIPsrGBufferSM69.hlsl" || fileName == "PathTraceReSTIRDIPsrGBufferSERSM69.hlsl" ||
+        fileName == "PathTraceReSTIRDIExtractPsrGBufferSM69.hlsl" ||
+        fileName == "PathTraceReSTIRDIExtractPsrGBufferSERSM69.hlsl" ||
+        fileName == "PathTraceReferenceRawDiffuseHitDistancePsrGBufferSM69.hlsl" ||
+        fileName == "PathTraceReferenceRawDiffuseHitDistancePsrGBufferSERSM69.hlsl")
     {
         return ShaderLibraryProfile::Library69;
     }

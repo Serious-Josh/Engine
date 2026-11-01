@@ -68,6 +68,15 @@ ConstantBuffer<PathTraceAtrousConstants> constants : register(b0);
 
 static const float PATH_TRACE_ATROUS_HALF_MAXIMUM = 65504.0f;
 static const float PATH_TRACE_ATROUS_MAXIMUM_MATERIALS = 2048.0f;
+
+#ifdef PATH_TRACE_PSR_DENOISE
+// PSR.2 Stage 3B (PathTraceSpatialAtrousPsr.hlsl): b1 the PSR denoise constants, t0 the replacement pass's transforms, s0
+// Triangle.hlsl's material sampler. The temporal outputs it filters are already without the mirror's throughput.
+#define PSR_DENOISE_CONSTANTS_REGISTER b1
+#define PSR_DENOISE_TRANSFORMS_REGISTER t0
+#define PSR_DENOISE_SAMPLER_REGISTER s0
+#include "PsrDenoise.hlsli"
+#endif
 static const float PATH_TRACE_ATROUS_MINIMUM_ALBEDO = 0.02f;
 static const float PATH_TRACE_ATROUS_LUMINANCE_EPSILON = 1.0e-8f;
 static const uint PATH_TRACE_ATROUS_SIGN_BIT = 0x80000000u;
@@ -86,6 +95,10 @@ struct PathTraceAtrousSample
     float4 diffuse;
     float4 specular;
     float2 moments;
+#ifdef PATH_TRACE_PSR_DENOISE
+    // PSR.2: the replaced pixel's mirror (PsrDenoiseMirrorKey), -1 otherwise.
+    float mirror;
+#endif
 };
 
 float PathTraceAtrousLuminance(float3 value)
@@ -130,8 +143,14 @@ PathTraceAtrousSample PathTraceAtrousLoadGuides(int2 pixel)
     Texture2D<float4> surfaceTexture = ResourceDescriptorHeap[constants.surfaceIndex];
     float depth = depthTexture.Load(int3(pixel, 0));
     float4 surface = surfaceTexture.Load(int3(pixel, 0));
+#ifdef PATH_TRACE_PSR_DENOISE
+    // A replaced pixel's word -(i + 1) is a surface too; neighbours compare words and mirrors.
+    bool exactMaterial = PsrDenoiseExactMaterial(surface.w, PATH_TRACE_ATROUS_MAXIMUM_MATERIALS);
+    result.mirror = PsrDenoiseMirrorKey(pixel, surface.w);
+#else
     bool exactMaterial = isfinite(surface.w) && surface.w >= 0.0f && surface.w == floor(surface.w) &&
         surface.w < PATH_TRACE_ATROUS_MAXIMUM_MATERIALS;
+#endif
 
     if(!(depth < 1.0f) || !(depth >= 0.0f) || !exactMaterial)
     {
@@ -201,6 +220,13 @@ float PathTraceAtrousGeometryWeight(PathTraceAtrousSample centre, PathTraceAtrou
     {
         return 0.0f;
     }
+#ifdef PATH_TRACE_PSR_DENOISE
+    // Another mirror's virtual image shares no space with this one's.
+    if(neighbour.mirror != centre.mirror)
+    {
+        return 0.0f;
+    }
+#endif
 
     float planeDistance = abs(dot(centre.geometricNormal, neighbour.position - centre.position));
     float depthWeight = exp(-planeDistance / (constants.depthSigma * centre.viewDepth));
@@ -234,7 +260,11 @@ void PathTraceAtrousStore(uint index, PathTraceAtrousSample value)
     g_atrousPosition[index] = float4(value.position, value.viewDepth);
     g_atrousGeometric[index] = float4(value.geometricNormal, value.valid ? 1.0f : 0.0f);
     g_atrousShading[index] = float4(value.shadingNormal, value.materialIndex);
+#ifdef PATH_TRACE_PSR_DENOISE
+    g_atrousMoments[index] = float4(value.moments, value.roughness, value.mirror);
+#else
     g_atrousMoments[index] = float4(value.moments, value.roughness, 0.0f);
+#endif
 }
 
 PathTraceAtrousSample PathTraceAtrousTile(int2 pixel)
@@ -252,6 +282,9 @@ PathTraceAtrousSample PathTraceAtrousTile(int2 pixel)
     result.materialIndex = g_atrousShading[index].w;
     result.moments = g_atrousMoments[index].xy;
     result.roughness = g_atrousMoments[index].z;
+#ifdef PATH_TRACE_PSR_DENOISE
+    result.mirror = g_atrousMoments[index].w;
+#endif
     return result;
 }
 
@@ -488,6 +521,11 @@ void PathTraceAtrousPresent(int2 pixel, float3 filtered[2], bool diagnostics)
     float metallic = geometricNormalTexture.Load(int3(pixel, 0)).w;
     float3 diffuseAlbedo = max(material.rgb * (1.0f - saturate(metallic)), PATH_TRACE_ATROUS_MINIMUM_ALBEDO);
     float3 radiance = filtered[0] * diffuseAlbedo + filtered[1];
+#ifdef PATH_TRACE_PSR_DENOISE
+    // The mirror's throughput, as the temporal pass divided it out.
+    Texture2D<float4> surfaceTexture = ResourceDescriptorHeap[constants.surfaceIndex];
+    radiance *= PsrDenoiseThroughput(uint2(pixel), surfaceTexture.Load(int3(pixel, 0)).w);
+#endif
     output[pixel] = float4(min(radiance, PATH_TRACE_ATROUS_HALF_MAXIMUM), 1.0f);
 }
 

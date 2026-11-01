@@ -29,4 +29,7 @@ struct RayTracingPipelineDescription
     std::uint32_t maxPayloadSize = 0;
     std::uint32_t maxAttributeSize = 0;
     std::uint32_t maxRecursionDepth = 1;
+
+    // PSR.2 Stage 3A: adds s2, the geometry pass's material sampler (trilinear clamp), to the global root signature.
+    bool rasterMaterialSampler = false;
 };

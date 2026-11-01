@@ -43,10 +43,10 @@ enum class PathTraceLibraryVariant
 
 const char* PathTraceLibraryVariantName(PathTraceLibraryVariant variant);
 
-// SHARC.4D/4D-Q learning libraries of each variant (experimental, default off). Inline inserts at the end of each path
-// (PathTraceReferenceRadianceCache*.hlsl); Deferred stores a training record per path for a later compute insertion
-// (PathTraceReferenceRadianceCacheDeferred*.hlsl); DeferredLate is Deferred with the whole record stored at the end of
-// the path (diagnostics, the SHARC.4D-Q shader-floor comparison). SHARC.4D-R (diagnostics): Query renders with query-only
+// SHARC.4D-Q learning libraries of each variant (experimental, default off). Deferred stores a training record per image
+// path for a later compute insertion (PathTraceReferenceRadianceCacheDeferred*.hlsl; diagnostics, the dense learning
+// reference); DeferredLate is Deferred with the whole record stored at the end of the path (diagnostics, the SHARC.4D-Q
+// shader-floor comparison). SHARC.4D-R (diagnostics): Query renders with query-only
 // hooks (PathTraceReferenceRadianceCacheQuery*.hlsl); Training is the Deferred library's training-only ray generation
 // (PathTraceReferenceRadianceCacheTraining*.hlsl), dispatched by ExecuteRadianceCacheTraining. SHARC.4D-S
 // (diagnostics): QueryTermination is Query with vertex-1 path termination (a timing probe; its images are wrong).
@@ -58,7 +58,6 @@ const char* PathTraceLibraryVariantName(PathTraceLibraryVariant variant);
 // (PathTraceReferenceRadianceCacheRenderRawDiffuseHitDistance*.hlsl), for frames that also write the raw diffuse hit distance.
 enum class PathTraceRadianceCacheLibrary
 {
-    Inline,
     Deferred,
     DeferredLate,
     Query,
@@ -269,18 +268,83 @@ class PathTraceReferencePass
         unsigned int height,
         bool extract,
         D3D12_GPU_VIRTUAL_ADDRESS radianceCacheConstants = 0,
-        PathTraceRadianceCacheLibrary radianceCacheLibrary = PathTraceRadianceCacheLibrary::Inline,
-        bool rawDiffuseHitDistance = false);
+        PathTraceRadianceCacheLibrary radianceCacheLibrary = PathTraceRadianceCacheLibrary::Render,
+        bool rawDiffuseHitDistance = false,
+        bool primarySurfaceReplacement = false,
+        GpuTimestampProfiler* profiler = nullptr,
+        unsigned int frameIndex = 0,
+        D3D12_GPU_VIRTUAL_ADDRESS guideConstants = 0,
+        D3D12_GPU_VIRTUAL_ADDRESS guideTransforms = 0);
+
+    // PSR.1b (development, default off): creates, on first use, the guide pipeline (the record pass plus virtual guides,
+    // with its own hit group and b3/t1 bindings) and the 32-byte-per-pixel guide buffer. Returns the guide buffer's raw
+    // UAV index (PathTracePsrGuideConstants::guideIndex), or UINT_MAX. Execute with nonzero guide inputs on a PSR frame
+    // then records the guide pass in place of the record pass.
+    unsigned int EnsurePrimarySurfaceReplacementGuides(
+        GraphicsDevice& graphicsDevice,
+        ShaderLibrary& shaderLibrary,
+        DescriptorHeap& descriptorHeap,
+        std::string& failureReason);
+
+    bool WrotePrimarySurfaceReplacementGuides() const
+    {
+        return m_psrGuidesWritten;
+    }
+
+    // Diagnostics only: the guides of the last guide pass (no resource before the first).
+    Buffer& GetPrimarySurfaceReplacementGuides()
+    {
+        return m_psrGuides;
+    }
+
+    // PSR.1a (development, default off): creates, on first use, the PSR library's record and Raster Primary pipelines
+    // and the per-pixel record buffer at the current extent. Returns the record buffer's raw UAV index
+    // (PathTraceReferenceConstants::psrRecordIndex), or UINT_MAX when anything is unavailable; a pipeline failure is
+    // sticky. Execute with primarySurfaceReplacement then records the replacement dispatch and the PSR raster primary in
+    // place of the production one, for Raster Primary without extraction or a SHARC library only.
+    unsigned int EnsurePrimarySurfaceReplacement(
+        GraphicsDevice& graphicsDevice,
+        ShaderLibrary& shaderLibrary,
+        DescriptorHeap& descriptorHeap,
+        std::string& failureReason);
+
+    // Whether the last Execute recorded the replacement (diagnostic metadata only).
+    bool WrotePrimarySurfaceReplacement() const
+    {
+        return m_psrWritten;
+    }
+
+    // Diagnostics only: discards the PSR GI.6 twins, as a failed twin build would leave them.
+    void DropPrimarySurfaceReplacementRayQueryForTesting()
+    {
+        for(auto* twins : {&m_psrRayQueryPipelines, &m_psrPrimaryDiRayQueryPipelines})
+        {
+            for(auto& [original, alternate] : *twins)
+            {
+                if(alternate)
+                {
+                    alternate->Shutdown();
+                    alternate.reset();
+                }
+            }
+        }
+    }
+
+    // Diagnostics only: the records of the last replacement dispatch (no resource before the first).
+    Buffer& GetPrimarySurfaceReplacementRecords()
+    {
+        return m_psrRecords;
+    }
 
     // SHARC.4D learning (experimental, default off): creates, on first use, the Raster Primary pipeline of a cache
     // library (PathTraceRadianceCacheLibrary, with the cache binding at b3). It traces and renders exactly as the
-    // production pipeline and also inserts or records D6 training samples. A failure is sticky until a new revision of
-    // the libraries is accepted. Creation only.
+    // production pipeline and also records D6 training samples. A failure is sticky until a new revision of the
+    // libraries is accepted. Creation only.
     bool EnsureRadianceCacheLearning(
         GraphicsDevice& graphicsDevice,
         ShaderLibrary& shaderLibrary,
         std::string& failureReason,
-        PathTraceRadianceCacheLibrary library = PathTraceRadianceCacheLibrary::Inline);
+        PathTraceRadianceCacheLibrary library);
 
     // SHARC.4D-R sparse training (diagnostics): after Execute in the same list, the training library's ray generation
     // over `threads` training threads (one per pixel tile), with the frame's path-trace constants and the training
@@ -294,7 +358,7 @@ class PathTraceReferencePass
         D3D12_GPU_VIRTUAL_ADDRESS trainingConstants,
         std::uint32_t threads);
 
-    bool IsRadianceCacheLearningReady(PathTraceRadianceCacheLibrary library = PathTraceRadianceCacheLibrary::Inline) const
+    bool IsRadianceCacheLearningReady(PathTraceRadianceCacheLibrary library) const
     {
         return m_radianceCache[static_cast<size_t>(library)].ready;
     }
@@ -302,7 +366,7 @@ class PathTraceReferencePass
     // Diagnostics (SHARC.4D-P/4D-Q): the driver's stack size of the Raster Primary ray generation, in the production
     // or a learning pipeline (0 if that pipeline does not exist).
     std::uint64_t GetRasterRayGenerationStackSize(bool learning,
-        PathTraceRadianceCacheLibrary library = PathTraceRadianceCacheLibrary::Inline) const
+        PathTraceRadianceCacheLibrary library = PathTraceRadianceCacheLibrary::Deferred) const
     {
         const RayTracingPipeline& pipeline = learning ? m_radianceCache[static_cast<size_t>(library)].pipeline :
             m_pipelines[static_cast<size_t>(PathTracePrimary::Raster)];
@@ -367,7 +431,57 @@ class PathTraceReferencePass
         bool extract,
         D3D12_GPU_VIRTUAL_ADDRESS radianceCacheConstants = 0,
         PathTraceRadianceCacheLibrary radianceCacheLibrary = PathTraceRadianceCacheLibrary::RenderSplitIndirect,
-        bool rawDiffuseHitDistance = false);
+        bool rawDiffuseHitDistance = false,
+        bool primarySurfaceReplacement = false,
+        D3D12_GPU_VIRTUAL_ADDRESS psrGBufferConstants = 0,
+        D3D12_GPU_VIRTUAL_ADDRESS psrGBufferTransforms = 0);
+
+    // PSR.2 Stage 3A (development, default off): creates, on first use, the PSR.2 lighting pair, the PSR.1c-A split
+    // pair built with G-buffer storage (PATH_TRACE_PSR_GBUFFER) and its DI.1/GI.6 twins. A failure is sticky.
+    // ExecuteReSTIRDISplit with both PSR.2 addresses (PathTracePsrGBufferConstants at b4, the replacement pass's object
+    // transforms at t2) then records this pair in place of the production pair and of PSR.1's, without extraction or a
+    // SHARC library only.
+    bool EnsurePrimarySurfaceReplacementGBuffer(
+        GraphicsDevice& graphicsDevice,
+        ShaderLibrary& shaderLibrary,
+        std::string& failureReason);
+    // Whether the pair and the twins the current visibility selections need exist.
+    bool IsPrimarySurfaceReplacementGBufferReady();
+    // PSR.2 Stage 3B: the pair's extraction counterparts, on first use: the extraction direct pass and the extraction
+    // (or, with rawDiffuseHitDistance, raw-distance extraction) indirect pass, each split at the effective primary. A
+    // failure is sticky per kind. ExecuteReSTIRDISplit with extraction then records them in place of the production
+    // extraction pair.
+    bool EnsurePrimarySurfaceReplacementGBufferExtraction(GraphicsDevice& graphicsDevice, ShaderLibrary& shaderLibrary,
+        bool rawDiffuseHitDistance, std::string& failureReason);
+    bool IsPrimarySurfaceReplacementGBufferExtractionReady(bool rawDiffuseHitDistance);
+
+    // Whether the last ExecuteReSTIRDISplit recorded the PSR.2 lighting pair.
+    bool WrotePrimarySurfaceReplacementGBuffer() const
+    {
+        return m_psrGBufferWritten;
+    }
+
+    // PSR.2 Stage 3A verification only: with a probe buffer (192 bytes per pixel, PathTracePsrProbeRayGeneration) and
+    // its pipelines, ExecuteReSTIRDISplit dispatches the probe of the PSR pair it recorded (PSR.1's or PSR.2's) after the
+    // indirect pass. The renderer passes PsrProbeUAVIndex in each library's spare constant word. Null in normal rendering.
+    bool EnsurePsrProbePipelinesForTesting(GraphicsDevice& graphicsDevice, ShaderLibrary& shaderLibrary);
+    void SetPsrProbeForTesting(Buffer* probe)
+    {
+        m_psrProbeForTesting = probe;
+    }
+    std::uint32_t PsrProbeUAVIndex() const
+    {
+        return m_psrProbeForTesting ? m_psrProbeForTesting->GetUAVDescriptorIndex() : 0u;
+    }
+
+    // PSR.1c-A (development, default off): creates, on first use, the PSR split pair: the direct pass from the PSR ReSTIR
+    // DI library and the indirect pass from the PSR reference library. EnsurePrimarySurfaceReplacement must have
+    // succeeded first (record pipeline and records). ExecuteReSTIRDISplit with primarySurfaceReplacement then records the
+    // record pass and the PSR pair in place of the production pair, without extraction or a SHARC library only.
+    bool EnsurePrimarySurfaceReplacementReSTIRDI(
+        GraphicsDevice& graphicsDevice,
+        ShaderLibrary& shaderLibrary,
+        std::string& failureReason);
 
     // NRD.RELAX.2B: whether the last Execute or ExecuteReSTIRDISplit recorded a raw-distance extraction, which wrote the
     // raw diffuse hit distance texture. Only then may that frame's texture be read.
@@ -686,6 +800,59 @@ class PathTraceReferencePass
     };
 
     RadianceCacheLearningPipeline m_radianceCache[static_cast<size_t>(PathTraceRadianceCacheLibrary::Count)];
+
+    // PSR.1a, created on first use (EnsurePrimarySurfaceReplacement): the record pass and the raster primary of the PSR
+    // library, and 48 bytes per pixel of records (PATH_TRACE_PSR_RECORD_STRIDE), recreated with the extent.
+    RayTracingPipeline m_psrRecordPipeline;
+    RayTracingPipeline m_psrRasterPipeline;
+    bool m_psrPipelinesReady = false;
+    bool m_psrPipelinesFailed = false;
+    std::string m_psrFailure;
+    Buffer m_psrRecords;
+    bool m_psrWritten = false;
+
+    // PSR.1b, created on first use (EnsurePrimarySurfaceReplacementGuides): the guide pass and 32 bytes per pixel of
+    // guides (PATH_TRACE_PSR_GUIDE_STRIDE), recreated with the extent.
+    RayTracingPipeline m_psrGuidePipeline;
+    bool m_psrGuidePipelineReady = false;
+    bool m_psrGuidePipelineFailed = false;
+    std::string m_psrGuideFailure;
+    Buffer m_psrGuides;
+    bool m_psrGuidesWritten = false;
+
+    // PSR.1a-P: the GI.6 RayQuery twins of the two PSR pipelines, kept apart from m_rayQueryPipelines so their
+    // readiness never gates IsSecondaryShadowRayQueryReady.
+    std::map<RayTracingPipeline*, std::unique_ptr<RayTracingPipeline>> m_psrRayQueryPipelines;
+
+    // PSR.1c-A: the PSR split ReSTIR DI pair, created on first use (EnsurePrimarySurfaceReplacementReSTIRDI), and the
+    // direct pass's DI.1 twin, kept apart from m_primaryDiRayQueryPipelines as the GI.6 twins are.
+    RayTracingPipeline m_psrSplitDirectPipeline;
+    RayTracingPipeline m_psrSplitIndirectPipeline;
+    bool m_psrSplitPipelinesReady = false;
+    bool m_psrSplitPipelinesFailed = false;
+    std::string m_psrSplitFailure;
+    std::map<RayTracingPipeline*, std::unique_ptr<RayTracingPipeline>> m_psrPrimaryDiRayQueryPipelines;
+
+    // PSR.2 Stage 3A: the G-buffer-storage split pair (EnsurePrimarySurfaceReplacementGBuffer); twins in the PSR maps.
+    RayTracingPipeline m_psrGBufferDirectPipeline;
+    RayTracingPipeline m_psrGBufferIndirectPipeline;
+    bool m_psrGBufferPipelinesReady = false;
+    bool m_psrGBufferPipelinesFailed = false;
+    std::string m_psrGBufferFailure;
+    bool m_psrGBufferWritten = false;
+    // PSR.2 Stage 3B: extraction direct, extraction indirect and raw-distance extraction indirect.
+    RayTracingPipeline m_psrGBufferExtractDirectPipeline;
+    RayTracingPipeline m_psrGBufferExtractIndirectPipeline;
+    RayTracingPipeline m_psrGBufferExtractIndirectRawPipeline;
+    bool m_psrGBufferExtractReady[2] = {};
+    bool m_psrGBufferExtractFailed[2] = {};
+    std::string m_psrGBufferExtractFailure[2];
+    // Verification only: the probe buffer and the probe pipelines of the PSR.1 and PSR.2 libraries.
+    Buffer* m_psrProbeForTesting = nullptr;
+    RayTracingPipeline m_psrProbePipelines[2];
+
+    // Shuts down both PSR pipelines and their GI.6 twins. Caller guarantees the queue is idle.
+    void ReleasePrimarySurfaceReplacementPipelines();
 
     // The UAV barriers after a frame's last dispatch: accumulation and statistics, plus the extraction outputs.
     void RecordOutputBarriers(ID3D12GraphicsCommandList* commandList, bool extract);

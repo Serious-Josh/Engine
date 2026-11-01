@@ -69,12 +69,10 @@ namespace
 
     // RTXPT D.1B.2: the library of the extraction direct pass. It never shares a library with the production direct
     // pass (PathTraceReSTIRDIExtract.hlsl), so the production ReSTIR DI library is unchanged.
-    // SHARC.4D: the learning libraries of each variant (the reference library with PATH_TRACE_RADIANCE_CACHE_LIBRARY).
+    // SHARC.4D: the cache libraries of each variant (the reference library with PATH_TRACE_RADIANCE_CACHE_LIBRARY).
     const char* RadianceCacheLibraryPath(PathTraceLibraryVariant variant, PathTraceRadianceCacheLibrary library)
     {
         static constexpr const char* paths[][3] = {
-            {"PathTraceReferenceRadianceCache.hlsl", "PathTraceReferenceRadianceCacheSM69.hlsl",
-                "PathTraceReferenceRadianceCacheSERSM69.hlsl"},
             {"PathTraceReferenceRadianceCacheDeferred.hlsl", "PathTraceReferenceRadianceCacheDeferredSM69.hlsl",
                 "PathTraceReferenceRadianceCacheDeferredSERSM69.hlsl"},
             {"PathTraceReferenceRadianceCacheDeferredLate.hlsl", "PathTraceReferenceRadianceCacheDeferredLateSM69.hlsl",
@@ -133,6 +131,79 @@ namespace
         }
 
         return "PathTraceReferenceRawDiffuseHitDistance.hlsl";
+    }
+
+    // PSR.1c-A: the ReSTIR DI library built with PATH_TRACE_PSR_LIBRARY (its direct pass only).
+    const char* PrimarySurfaceReplacementReSTIRDILibraryPath(PathTraceLibraryVariant variant)
+    {
+        switch(variant)
+        {
+        case PathTraceLibraryVariant::SM69:
+            return "PathTraceReSTIRDIPsrSM69.hlsl";
+        case PathTraceLibraryVariant::SM69SER:
+            return "PathTraceReSTIRDIPsrSERSM69.hlsl";
+        case PathTraceLibraryVariant::SM66:
+            break;
+        }
+
+        return "PathTraceReSTIRDIPsr.hlsl";
+    }
+
+    // PSR.1a: the reference library built with PATH_TRACE_PSR_LIBRARY. The production libraries never contain its code.
+    const char* PrimarySurfaceReplacementLibraryPath(PathTraceLibraryVariant variant)
+    {
+        switch(variant)
+        {
+        case PathTraceLibraryVariant::SM69:
+            return "PathTraceReferencePsrSM69.hlsl";
+        case PathTraceLibraryVariant::SM69SER:
+            return "PathTraceReferencePsrSERSM69.hlsl";
+        case PathTraceLibraryVariant::SM66:
+            break;
+        }
+
+        return "PathTraceReferencePsr.hlsl";
+    }
+
+    // PSR.2 Stage 3A: the PSR.1c-A split pair's libraries with PATH_TRACE_PSR_GBUFFER (G-buffer storage).
+    const char* PrimarySurfaceReplacementGBufferLibraryPath(bool directPass, PathTraceLibraryVariant variant)
+    {
+        switch(variant)
+        {
+        case PathTraceLibraryVariant::SM69:
+            return directPass ? "PathTraceReSTIRDIPsrGBufferSM69.hlsl" : "PathTraceReferencePsrGBufferSM69.hlsl";
+        case PathTraceLibraryVariant::SM69SER:
+            return directPass ? "PathTraceReSTIRDIPsrGBufferSERSM69.hlsl" : "PathTraceReferencePsrGBufferSERSM69.hlsl";
+        case PathTraceLibraryVariant::SM66:
+            break;
+        }
+
+        return directPass ? "PathTraceReSTIRDIPsrGBuffer.hlsl" : "PathTraceReferencePsrGBuffer.hlsl";
+    }
+
+    // PSR.2 Stage 3B: the extraction libraries with PATH_TRACE_PSR_GBUFFER. The extraction indirect export is in the
+    // PSR.2 reference library; the raw-distance one and the extraction direct pass have libraries of their own.
+    const char* PrimarySurfaceReplacementGBufferExtractionLibraryPath(bool directPass, bool rawDiffuseHitDistance,
+        PathTraceLibraryVariant variant)
+    {
+        if(!directPass && !rawDiffuseHitDistance)
+        {
+            return PrimarySurfaceReplacementGBufferLibraryPath(false, variant);
+        }
+
+        switch(variant)
+        {
+        case PathTraceLibraryVariant::SM69:
+            return directPass ? "PathTraceReSTIRDIExtractPsrGBufferSM69.hlsl" :
+                "PathTraceReferenceRawDiffuseHitDistancePsrGBufferSM69.hlsl";
+        case PathTraceLibraryVariant::SM69SER:
+            return directPass ? "PathTraceReSTIRDIExtractPsrGBufferSERSM69.hlsl" :
+                "PathTraceReferenceRawDiffuseHitDistancePsrGBufferSERSM69.hlsl";
+        case PathTraceLibraryVariant::SM66:
+            break;
+        }
+
+        return directPass ? "PathTraceReSTIRDIExtractPsrGBuffer.hlsl" : "PathTraceReferenceRawDiffuseHitDistancePsrGBuffer.hlsl";
     }
 
     bool IsRawDiffuseHitDistanceLibrary(PathTraceRadianceCacheLibrary library)
@@ -280,6 +351,42 @@ namespace
         return description;
     }
 
+    // PSR.1a: the Raster Primary description with the PSR library and, for the record pass, its record ray generation.
+    // Same root signature and bindings; the records are reached through the descriptor heap.
+    RayTracingPipelineDescription BuildPrimarySurfaceReplacementPipelineDescription(bool recordPass,
+        PathTraceLibraryVariant variant)
+    {
+        RayTracingPipelineDescription description = BuildPathTracePipelineDescription(PathTracePrimary::Raster, variant);
+        description.shaderPath = PrimarySurfaceReplacementLibraryPath(variant);
+
+        if(recordPass)
+        {
+            description.rayGenerationShader = L"PathTracePsrRayGeneration";
+        }
+
+        return description;
+    }
+
+    // PSR.1b: the record pass's description with the guide ray generation, its guide hit group and miss (payload
+    // PathTracePsrGuidePayload, 48 bytes), the guide constants (b3) and the instance transforms (t1, root SRV).
+    RayTracingPipelineDescription BuildPrimarySurfaceReplacementGuidePipelineDescription(PathTraceLibraryVariant variant)
+    {
+        RayTracingPipelineDescription description = BuildPrimarySurfaceReplacementPipelineDescription(true, variant);
+        description.rayGenerationShader = L"PathTracePsrGuideRayGeneration";
+        description.missShaders = {L"PathTracePsrGuideMiss", L"PathTraceVisibilityMiss"};
+        description.hitGroups = {{L"PathTracePsrGuideHitGroup", L"PathTracePsrGuideClosestHit", L""}};
+        description.rootParameters.push_back({RootParameterType::ConstantBuffer, 3});
+        description.rootParameters.push_back({RootParameterType::ShaderResource, 1});
+        description.maxPayloadSize = 48;
+        return description;
+    }
+
+    // PSR.1b: PATH_TRACE_PSR_GUIDE_STRIDE.
+    constexpr std::uint64_t PrimarySurfaceReplacementGuideStride = 32;
+
+    // PSR.1a-P: PATH_TRACE_PSR_RECORD_STRIDE.
+    constexpr std::uint64_t PrimarySurfaceReplacementRecordStride = 40;
+
     RayTracingPipelineDescription BuildReSTIRDISplitExtractionPipelineDescription(
         bool directPass,
         PathTraceLibraryVariant variant)
@@ -353,6 +460,12 @@ namespace
 
         key += "|p" + std::to_string(description.maxPayloadSize) + ',' + std::to_string(description.maxAttributeSize) + ',' +
             std::to_string(description.maxRecursionDepth);
+
+        if(description.rasterMaterialSampler)
+        {
+            key += "|s2";
+        }
+
         return key;
     }
 }
@@ -1172,6 +1285,9 @@ bool PathTraceReferencePass::Resize(
     m_specularTexture.Shutdown();
     m_historyPriorTexture.Shutdown();
     m_rawDiffuseHitDistanceTexture.Shutdown();
+    // PSR.1a: sized for the old extent; the next replacement frame allocates it again (PSR.1b: and the guides).
+    m_psrRecords.Shutdown();
+    m_psrGuides.Shutdown();
 
     if(!CreateTextures(device, descriptorHeap, width, height))
     {
@@ -1194,10 +1310,17 @@ bool PathTraceReferencePass::Execute(
     bool extract,
     D3D12_GPU_VIRTUAL_ADDRESS radianceCacheConstants,
     PathTraceRadianceCacheLibrary radianceCacheLibrary,
-    bool rawDiffuseHitDistance)
+    bool rawDiffuseHitDistance,
+    bool primarySurfaceReplacement,
+    GpuTimestampProfiler* profiler,
+    unsigned int frameIndex,
+    D3D12_GPU_VIRTUAL_ADDRESS guideConstants,
+    D3D12_GPU_VIRTUAL_ADDRESS guideTransforms)
 {
     m_rawDiffuseHitDistanceWritten = false;
     m_splitDirectDiffuseWritten = false;
+    m_psrWritten = false;
+    m_psrGuidesWritten = false;
 
     // NRD.RELAX.2B: raw-distance extraction only with its output; otherwise the legacy extraction, which writes none.
 #if PATH_TRACE_SHARC_SPATIAL_DIAGNOSTIC != 0
@@ -1217,9 +1340,18 @@ bool PathTraceReferencePass::Execute(
         extract == extractingLibrary && (!extract || radianceCacheLibrary == extractionLibrary) && radianceCache.ready &&
         (!extract || m_diffuseTexture.GetResource());
     const bool rawPipeline = raw && !learning && m_extractRasterRawReady;
+    // PSR.1a: Raster Primary without extraction or a cache library only; otherwise the frame records as without it.
+    // PSR.1a-P: with GI.6 selected the PSR pipelines need their own RayQuery twins, or PSR would render with TraceRay
+    // secondary shadows where the production frame uses RayQuery; without them the frame records as without PSR.
+    const bool replacementVisibility = !m_secondaryShadowRayQuery || (m_psrRayQueryPipelines[&m_psrRecordPipeline] &&
+        m_psrRayQueryPipelines[&m_psrRasterPipeline]);
+    const bool replacement = primarySurfaceReplacement && primary == PathTracePrimary::Raster && !extract && !learning &&
+        radianceCacheConstants == 0 && m_psrPipelinesReady && replacementVisibility && m_psrRecords.GetResource() &&
+        m_psrRecords.GetResource()->GetDesc().Width >=
+        static_cast<std::uint64_t>(width) * height * PrimarySurfaceReplacementRecordStride;
     RayTracingPipeline& pipeline = VisibilityPipeline(learning ? radianceCache.pipeline :
         (extract ? (rawPipeline ? m_extractRasterRawPipeline : m_extractRasterPipeline) :
-        m_pipelines[static_cast<size_t>(primary)]));
+        (replacement ? m_psrRasterPipeline : m_pipelines[static_cast<size_t>(primary)])));
     const bool ready = learning || (extract ?
         primary == PathTracePrimary::Raster && (rawPipeline || m_extractRasterReady) && m_diffuseTexture.GetResource() :
         m_pipelineReady[static_cast<size_t>(primary)]);
@@ -1241,14 +1373,66 @@ bool PathTraceReferencePass::Execute(
         m_specularTexture.Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     }
 
-    pipeline.Bind(commandList);
+    const auto bindRoots = [&]()
+    {
+        commandList->SetComputeRootShaderResourceView(0, rayTracingScene.GetTopLevel().GetGPUAddress());
+        commandList->SetComputeRootDescriptorTable(1, descriptorHeap.GetGPUHandle(m_accumulationTexture.GetUAVIndex()));
+        commandList->SetComputeRootDescriptorTable(2, descriptorHeap.GetGPUHandle(m_outputTexture.GetUAVIndex()));
+        commandList->SetComputeRootDescriptorTable(3, descriptorHeap.GetGPUHandle(m_statisticsTexture.GetUAVIndex()));
+        commandList->SetComputeRootConstantBufferView(4, constantsAddress);
+        commandList->SetComputeRootConstantBufferView(5, sceneLightConstantsAddress);
+    };
 
-    commandList->SetComputeRootShaderResourceView(0, rayTracingScene.GetTopLevel().GetGPUAddress());
-    commandList->SetComputeRootDescriptorTable(1, descriptorHeap.GetGPUHandle(m_accumulationTexture.GetUAVIndex()));
-    commandList->SetComputeRootDescriptorTable(2, descriptorHeap.GetGPUHandle(m_outputTexture.GetUAVIndex()));
-    commandList->SetComputeRootDescriptorTable(3, descriptorHeap.GetGPUHandle(m_statisticsTexture.GetUAVIndex()));
-    commandList->SetComputeRootConstantBufferView(4, constantsAddress);
-    commandList->SetComputeRootConstantBufferView(5, sceneLightConstantsAddress);
+    // PSR.1a: every pixel's record, ordered before the raster primary reads it. The record pass writes no image.
+    if(replacement)
+    {
+        m_psrRecords.Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+        if(profiler)
+        {
+            profiler->BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::PathTracePsrRecord);
+        }
+
+        // PSR.1b: the guide pass writes the same records, plus the guides.
+        const bool guides = guideConstants != 0 && guideTransforms != 0 && m_psrGuidePipelineReady &&
+            m_psrGuides.GetResource() &&
+            m_psrGuides.GetResource()->GetDesc().Width >= static_cast<std::uint64_t>(width) * height *
+            PrimarySurfaceReplacementGuideStride;
+        RayTracingPipeline& recordPipeline = VisibilityPipeline(guides ? m_psrGuidePipeline : m_psrRecordPipeline);
+
+        if(guides)
+        {
+            m_psrGuides.Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        }
+
+        recordPipeline.Bind(commandList);
+        bindRoots();
+
+        if(guides)
+        {
+            commandList->SetComputeRootConstantBufferView(6, guideConstants);
+            commandList->SetComputeRootShaderResourceView(7, guideTransforms);
+        }
+
+        recordPipeline.Dispatch(commandList, width, height);
+
+        D3D12_RESOURCE_BARRIER recordBarriers[2]{};
+        recordBarriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        recordBarriers[0].UAV.pResource = m_psrRecords.GetResource();
+        recordBarriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        recordBarriers[1].UAV.pResource = m_psrGuides.GetResource();
+        commandList->ResourceBarrier(guides ? 2 : 1, recordBarriers);
+        m_psrGuidesWritten = guides;
+
+        if(profiler)
+        {
+            profiler->EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::PathTracePsrRecord);
+            profiler->BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::PathTracePsrRaster);
+        }
+    }
+
+    pipeline.Bind(commandList);
+    bindRoots();
 
     if(learning)
     {
@@ -1262,8 +1446,526 @@ bool PathTraceReferencePass::Execute(
         radianceCacheLibrary == PathTraceRadianceCacheLibrary::RenderExtractionRawDiffuseHitDistance);
 #endif
     m_rawDiffuseHitDistanceWritten = learning ? IsRawDiffuseHitDistanceLibrary(radianceCacheLibrary) : rawPipeline;
+    m_psrWritten = replacement;
+
+    if(replacement && profiler)
+    {
+        profiler->EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::PathTracePsrRaster);
+    }
+
     RecordOutputBarriers(commandList, extract);
     return true;
+}
+
+unsigned int PathTraceReferencePass::EnsurePrimarySurfaceReplacement(
+    GraphicsDevice& graphicsDevice,
+    ShaderLibrary& shaderLibrary,
+    DescriptorHeap& descriptorHeap,
+    std::string& failureReason)
+{
+    if(!m_initialized)
+    {
+        failureReason = "The path tracer is not initialized.";
+        return UINT_MAX;
+    }
+
+    if(m_psrPipelinesFailed)
+    {
+        failureReason = m_psrFailure;
+        return UINT_MAX;
+    }
+
+    if(!m_psrPipelinesReady)
+    {
+        RayTracingPipeline* pipelines[2] = {&m_psrRecordPipeline, &m_psrRasterPipeline};
+
+        for(int pass = 0; pass < 2 && m_psrFailure.empty(); ++pass)
+        {
+            const RayTracingPipelineDescription description =
+                BuildPrimarySurfaceReplacementPipelineDescription(pass == 0, m_libraryVariant);
+            const std::string libraryName = description.shaderPath.generic_string();
+            const ShaderLibraryCompileResult* library = AcquireLibrary(shaderLibrary, description.shaderPath);
+
+            if(!library)
+            {
+                m_psrFailure = "The " + libraryName + " DXR library is unavailable or failed to compile" +
+                    TroubleshootingHint() + ".";
+            }
+            else if(!LibraryNamesExport(library->bytecode, description.rayGenerationShader))
+            {
+                m_psrFailure = "The " + libraryName + " DXR library has no primary surface replacement entry point.";
+            }
+            else if(!InitializeVisibilityPipelines(graphicsDevice, shaderLibrary, *pipelines[pass], library->bytecode,
+                description))
+            {
+                m_psrFailure = "The " + libraryName + " primary surface replacement DXR pipeline could not be created" +
+                    TroubleshootingHint() + ".";
+            }
+
+            // PSR.1a-P: the GI.6 twin moves out of the shared readiness set, so an optional PSR library that fails to
+            // build a twin cannot disable GI.6 for the production pipelines.
+            const auto twin = m_rayQueryPipelines.find(pipelines[pass]);
+
+            if(twin != m_rayQueryPipelines.end())
+            {
+                m_psrRayQueryPipelines[pipelines[pass]] = std::move(twin->second);
+                m_rayQueryPipelines.erase(twin);
+            }
+        }
+
+        if(!m_psrFailure.empty())
+        {
+            ReleasePrimarySurfaceReplacementPipelines();
+            m_psrPipelinesFailed = true;
+            failureReason = m_psrFailure;
+            return UINT_MAX;
+        }
+
+        m_psrPipelinesReady = true;
+    }
+
+    if(!m_psrRecords.GetResource())
+    {
+        const std::uint64_t bytes = static_cast<std::uint64_t>(m_width) * m_height * PrimarySurfaceReplacementRecordStride;
+
+        if(bytes > UINT_MAX || !m_psrRecords.InitializeGPUWritable(graphicsDevice.GetDevice(), static_cast<size_t>(bytes)) ||
+            !m_psrRecords.CreateRawUAV(graphicsDevice.GetDevice(), descriptorHeap))
+        {
+            m_psrRecords.Shutdown();
+            failureReason = "The primary surface replacement records (" + std::to_string(bytes) +
+                " bytes) could not be allocated.";
+            return UINT_MAX;
+        }
+
+        m_psrRecords.GetResource()->SetName(L"Path Trace PSR Records");
+    }
+
+    return m_psrRecords.GetUAVDescriptorIndex();
+}
+
+unsigned int PathTraceReferencePass::EnsurePrimarySurfaceReplacementGuides(
+    GraphicsDevice& graphicsDevice,
+    ShaderLibrary& shaderLibrary,
+    DescriptorHeap& descriptorHeap,
+    std::string& failureReason)
+{
+    if(!m_initialized)
+    {
+        failureReason = "The path tracer is not initialized.";
+        return UINT_MAX;
+    }
+
+    if(m_psrGuidePipelineFailed)
+    {
+        failureReason = m_psrGuideFailure;
+        return UINT_MAX;
+    }
+
+    if(!m_psrGuidePipelineReady)
+    {
+        const RayTracingPipelineDescription description =
+            BuildPrimarySurfaceReplacementGuidePipelineDescription(m_libraryVariant);
+        const std::string libraryName = description.shaderPath.generic_string();
+        const ShaderLibraryCompileResult* library = AcquireLibrary(shaderLibrary, description.shaderPath);
+
+        if(!library)
+        {
+            m_psrGuideFailure = "The " + libraryName + " DXR library is unavailable or failed to compile" +
+                TroubleshootingHint() + ".";
+        }
+        else if(!LibraryNamesExport(library->bytecode, description.rayGenerationShader))
+        {
+            m_psrGuideFailure = "The " + libraryName + " DXR library has no primary surface replacement guide entry point.";
+        }
+        else if(!InitializeVisibilityPipelines(graphicsDevice, shaderLibrary, m_psrGuidePipeline, library->bytecode,
+            description))
+        {
+            m_psrGuideFailure = "The " + libraryName + " primary surface replacement guide DXR pipeline could not be created" +
+                TroubleshootingHint() + ".";
+        }
+
+        // As the PSR pipelines: the twin stays outside the shared GI.6 readiness set.
+        const auto twin = m_rayQueryPipelines.find(&m_psrGuidePipeline);
+
+        if(twin != m_rayQueryPipelines.end())
+        {
+            m_psrRayQueryPipelines[&m_psrGuidePipeline] = std::move(twin->second);
+            m_rayQueryPipelines.erase(twin);
+        }
+
+        if(!m_psrGuideFailure.empty())
+        {
+            m_psrGuidePipeline.Shutdown();
+            m_psrRayQueryPipelines.erase(&m_psrGuidePipeline);
+            m_psrGuidePipelineFailed = true;
+            failureReason = m_psrGuideFailure;
+            return UINT_MAX;
+        }
+
+        m_psrGuidePipelineReady = true;
+    }
+
+    if(!m_psrGuides.GetResource())
+    {
+        const std::uint64_t bytes = static_cast<std::uint64_t>(m_width) * m_height * PrimarySurfaceReplacementGuideStride;
+
+        if(bytes > UINT_MAX || !m_psrGuides.InitializeGPUWritable(graphicsDevice.GetDevice(), static_cast<size_t>(bytes)) ||
+            !m_psrGuides.CreateRawUAV(graphicsDevice.GetDevice(), descriptorHeap))
+        {
+            m_psrGuides.Shutdown();
+            failureReason = "The primary surface replacement guides (" + std::to_string(bytes) +
+                " bytes) could not be allocated.";
+            return UINT_MAX;
+        }
+
+        m_psrGuides.GetResource()->SetName(L"Path Trace PSR Guides");
+    }
+
+    return m_psrGuides.GetUAVDescriptorIndex();
+}
+
+bool PathTraceReferencePass::EnsurePrimarySurfaceReplacementReSTIRDI(
+    GraphicsDevice& graphicsDevice,
+    ShaderLibrary& shaderLibrary,
+    std::string& failureReason)
+{
+    if(!m_initialized || !m_psrPipelinesReady)
+    {
+        failureReason = "Primary surface replacement is not prepared.";
+        return false;
+    }
+
+    if(m_psrSplitPipelinesFailed)
+    {
+        failureReason = m_psrSplitFailure;
+        return false;
+    }
+
+    if(m_psrSplitPipelinesReady)
+    {
+        return true;
+    }
+
+    RayTracingPipeline* pipelines[2] = {&m_psrSplitDirectPipeline, &m_psrSplitIndirectPipeline};
+
+    for(int pass = 0; pass < 2 && m_psrSplitFailure.empty(); ++pass)
+    {
+        const bool directPass = pass == 0;
+        RayTracingPipelineDescription description = BuildReSTIRDISplitPipelineDescription(directPass, m_libraryVariant);
+        description.shaderPath = directPass ? PrimarySurfaceReplacementReSTIRDILibraryPath(m_libraryVariant) :
+            PrimarySurfaceReplacementLibraryPath(m_libraryVariant);
+        const std::string libraryName = description.shaderPath.generic_string();
+        const ShaderLibraryCompileResult* library = AcquireLibrary(shaderLibrary, description.shaderPath);
+
+        if(!library)
+        {
+            m_psrSplitFailure = "The " + libraryName + " DXR library is unavailable or failed to compile" +
+                TroubleshootingHint() + ".";
+        }
+        else if(!LibraryNamesExport(library->bytecode, description.rayGenerationShader))
+        {
+            m_psrSplitFailure = "The " + libraryName + " DXR library has no split ReSTIR DI entry point.";
+        }
+        else if(!InitializeVisibilityPipelines(graphicsDevice, shaderLibrary, *pipelines[pass], library->bytecode,
+            description))
+        {
+            m_psrSplitFailure = "The " + libraryName + " primary surface replacement ReSTIR DI pipeline could not be created" +
+                TroubleshootingHint() + ".";
+        }
+
+        // Twins leave the shared readiness sets (DI.1 for the direct pass, GI.6 for the indirect pass).
+        auto& shared = directPass ? m_primaryDiRayQueryPipelines : m_rayQueryPipelines;
+        auto& isolated = directPass ? m_psrPrimaryDiRayQueryPipelines : m_psrRayQueryPipelines;
+        const auto twin = shared.find(pipelines[pass]);
+
+        if(twin != shared.end())
+        {
+            isolated[pipelines[pass]] = std::move(twin->second);
+            shared.erase(twin);
+        }
+    }
+
+    if(!m_psrSplitFailure.empty())
+    {
+        for(RayTracingPipeline* pipeline : pipelines)
+        {
+            pipeline->Shutdown();
+            m_psrPrimaryDiRayQueryPipelines.erase(pipeline);
+            m_psrRayQueryPipelines.erase(pipeline);
+        }
+
+        m_psrSplitPipelinesFailed = true;
+        failureReason = m_psrSplitFailure;
+        return false;
+    }
+
+    m_psrSplitPipelinesReady = true;
+    return true;
+}
+
+bool PathTraceReferencePass::EnsurePrimarySurfaceReplacementGBuffer(
+    GraphicsDevice& graphicsDevice,
+    ShaderLibrary& shaderLibrary,
+    std::string& failureReason)
+{
+    if(!m_initialized)
+    {
+        failureReason = "The path tracer is not initialized.";
+        return false;
+    }
+
+    if(m_psrGBufferPipelinesFailed)
+    {
+        failureReason = m_psrGBufferFailure;
+        return false;
+    }
+
+    if(m_psrGBufferPipelinesReady)
+    {
+        return true;
+    }
+
+    RayTracingPipeline* pipelines[2] = {&m_psrGBufferDirectPipeline, &m_psrGBufferIndirectPipeline};
+
+    for(int pass = 0; pass < 2 && m_psrGBufferFailure.empty(); ++pass)
+    {
+        const bool directPass = pass == 0;
+        RayTracingPipelineDescription description = BuildReSTIRDISplitPipelineDescription(directPass, m_libraryVariant);
+        description.shaderPath = PrimarySurfaceReplacementGBufferLibraryPath(directPass, m_libraryVariant);
+        // After the split pair's own parameters: b4 (the replacement pass's camera and identity) and t2 (its transforms).
+        description.rootParameters.push_back({RootParameterType::ConstantBuffer, 4});
+        description.rootParameters.push_back({RootParameterType::ShaderResource, 2});
+        description.rasterMaterialSampler = true;
+        const std::string libraryName = description.shaderPath.generic_string();
+        const ShaderLibraryCompileResult* library = AcquireLibrary(shaderLibrary, description.shaderPath);
+
+        if(!library)
+        {
+            m_psrGBufferFailure = "The " + libraryName + " DXR library is unavailable or failed to compile" +
+                TroubleshootingHint() + ".";
+        }
+        else if(!LibraryNamesExport(library->bytecode, description.rayGenerationShader))
+        {
+            m_psrGBufferFailure = "The " + libraryName + " DXR library has no split ReSTIR DI entry point.";
+        }
+        else if(!InitializeVisibilityPipelines(graphicsDevice, shaderLibrary, *pipelines[pass], library->bytecode,
+            description))
+        {
+            m_psrGBufferFailure = "The " + libraryName + " PSR.2 lighting pipeline could not be created" +
+                TroubleshootingHint() + ".";
+        }
+
+        // Twins leave the shared readiness sets (DI.1 for the direct pass, GI.6 for the indirect pass).
+        auto& shared = directPass ? m_primaryDiRayQueryPipelines : m_rayQueryPipelines;
+        auto& isolated = directPass ? m_psrPrimaryDiRayQueryPipelines : m_psrRayQueryPipelines;
+        const auto twin = shared.find(pipelines[pass]);
+
+        if(twin != shared.end())
+        {
+            isolated[pipelines[pass]] = std::move(twin->second);
+            shared.erase(twin);
+        }
+    }
+
+    if(!m_psrGBufferFailure.empty())
+    {
+        for(RayTracingPipeline* pipeline : pipelines)
+        {
+            pipeline->Shutdown();
+            m_psrPrimaryDiRayQueryPipelines.erase(pipeline);
+            m_psrRayQueryPipelines.erase(pipeline);
+        }
+
+        m_psrGBufferPipelinesFailed = true;
+        failureReason = m_psrGBufferFailure;
+        return false;
+    }
+
+    m_psrGBufferPipelinesReady = true;
+    return true;
+}
+
+bool PathTraceReferencePass::EnsurePrimarySurfaceReplacementGBufferExtraction(GraphicsDevice& graphicsDevice,
+    ShaderLibrary& shaderLibrary, bool rawDiffuseHitDistance, std::string& failureReason)
+{
+    const int kind = rawDiffuseHitDistance ? 1 : 0;
+
+    if(!m_initialized)
+    {
+        failureReason = "The path tracer is not initialized.";
+        return false;
+    }
+
+    if(m_psrGBufferExtractFailed[kind])
+    {
+        failureReason = m_psrGBufferExtractFailure[kind];
+        return false;
+    }
+
+    if(m_psrGBufferExtractReady[kind])
+    {
+        return true;
+    }
+
+    // The direct pass is shared by both kinds (as the production extraction direct pass is).
+    std::vector<std::pair<RayTracingPipeline*, bool>> pipelines;
+
+    if(!m_psrGBufferExtractDirectPipeline.IsInitialized())
+    {
+        pipelines.emplace_back(&m_psrGBufferExtractDirectPipeline, true);
+    }
+
+    pipelines.emplace_back(rawDiffuseHitDistance ? &m_psrGBufferExtractIndirectRawPipeline :
+        &m_psrGBufferExtractIndirectPipeline, false);
+    std::string& failure = m_psrGBufferExtractFailure[kind];
+
+    for(const auto& [pipeline, directPass] : pipelines)
+    {
+        RayTracingPipelineDescription description = BuildReSTIRDISplitExtractionPipelineDescription(directPass,
+            m_libraryVariant);
+        description.shaderPath = PrimarySurfaceReplacementGBufferExtractionLibraryPath(directPass, rawDiffuseHitDistance,
+            m_libraryVariant);
+        description.rootParameters.push_back({RootParameterType::ConstantBuffer, 4});
+        description.rootParameters.push_back({RootParameterType::ShaderResource, 2});
+        description.rasterMaterialSampler = true;
+        const std::string libraryName = description.shaderPath.generic_string();
+        const ShaderLibraryCompileResult* library = AcquireLibrary(shaderLibrary, description.shaderPath);
+
+        if(!library)
+        {
+            failure = "The " + libraryName + " DXR library is unavailable or failed to compile" + TroubleshootingHint() +
+                ".";
+        }
+        else if(!LibraryNamesExport(library->bytecode, description.rayGenerationShader))
+        {
+            failure = "The " + libraryName + " DXR library has no signal extraction entry point.";
+        }
+        else if(!InitializeVisibilityPipelines(graphicsDevice, shaderLibrary, *pipeline, library->bytecode, description))
+        {
+            failure = "The " + libraryName + " PSR.2 extraction pipeline could not be created" + TroubleshootingHint() +
+                ".";
+        }
+
+        auto& shared = directPass ? m_primaryDiRayQueryPipelines : m_rayQueryPipelines;
+        auto& isolated = directPass ? m_psrPrimaryDiRayQueryPipelines : m_psrRayQueryPipelines;
+        const auto twin = shared.find(pipeline);
+
+        if(twin != shared.end())
+        {
+            isolated[pipeline] = std::move(twin->second);
+            shared.erase(twin);
+        }
+
+        if(!failure.empty())
+        {
+            for(const auto& created : pipelines)
+            {
+                created.first->Shutdown();
+                m_psrPrimaryDiRayQueryPipelines.erase(created.first);
+                m_psrRayQueryPipelines.erase(created.first);
+            }
+
+            m_psrGBufferExtractFailed[kind] = true;
+            failureReason = failure;
+            return false;
+        }
+    }
+
+    m_psrGBufferExtractReady[kind] = true;
+    return true;
+}
+
+bool PathTraceReferencePass::IsPrimarySurfaceReplacementGBufferExtractionReady(bool rawDiffuseHitDistance)
+{
+    RayTracingPipeline* indirect = rawDiffuseHitDistance ? &m_psrGBufferExtractIndirectRawPipeline :
+        &m_psrGBufferExtractIndirectPipeline;
+    return m_psrGBufferExtractReady[rawDiffuseHitDistance ? 1 : 0] &&
+        (!m_primaryDiShadowRayQuery || m_psrPrimaryDiRayQueryPipelines[&m_psrGBufferExtractDirectPipeline]) &&
+        (!m_secondaryShadowRayQuery || m_psrRayQueryPipelines[indirect]);
+}
+
+bool PathTraceReferencePass::EnsurePsrProbePipelinesForTesting(GraphicsDevice& graphicsDevice,
+    ShaderLibrary& shaderLibrary)
+{
+    for(int storage = 0; storage < 2; ++storage)
+    {
+        if(m_psrProbePipelines[storage].IsInitialized())
+        {
+            continue;
+        }
+
+        const bool gBuffer = storage == 1;
+        RayTracingPipelineDescription description = BuildReSTIRDISplitPipelineDescription(false, m_libraryVariant);
+        description.rayGenerationShader = L"PathTracePsrProbeRayGeneration";
+        description.shaderPath = gBuffer ? PrimarySurfaceReplacementGBufferLibraryPath(false, m_libraryVariant) :
+            PrimarySurfaceReplacementLibraryPath(m_libraryVariant);
+
+        if(gBuffer)
+        {
+            description.rootParameters.push_back({RootParameterType::ConstantBuffer, 4});
+            description.rootParameters.push_back({RootParameterType::ShaderResource, 2});
+            description.rasterMaterialSampler = true;
+        }
+
+        const ShaderLibraryCompileResult* library = AcquireLibrary(shaderLibrary, description.shaderPath);
+
+        if(!library || !CreatePipeline(graphicsDevice, m_psrProbePipelines[storage], library->bytecode, description))
+        {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool PathTraceReferencePass::IsPrimarySurfaceReplacementGBufferReady()
+{
+    // The twins the frame's visibility selections need (DI.1 for the direct pass, GI.6 for the indirect pass).
+    return m_psrGBufferPipelinesReady &&
+        (!m_primaryDiShadowRayQuery || m_psrPrimaryDiRayQueryPipelines[&m_psrGBufferDirectPipeline]) &&
+        (!m_secondaryShadowRayQuery || m_psrRayQueryPipelines[&m_psrGBufferIndirectPipeline]);
+}
+
+void PathTraceReferencePass::ReleasePrimarySurfaceReplacementPipelines()
+{
+    // The GI.6 twins are registered against these slots; dropping them keeps the secondary selector's readiness about
+    // the pipelines that exist.
+    for(auto& [original, alternate] : m_psrPrimaryDiRayQueryPipelines)
+    {
+        if(alternate)
+        {
+            alternate->Shutdown();
+        }
+    }
+
+    m_psrPrimaryDiRayQueryPipelines.clear();
+
+    for(RayTracingPipeline* original : {&m_psrRecordPipeline, &m_psrRasterPipeline, &m_psrGuidePipeline,
+        &m_psrSplitDirectPipeline, &m_psrSplitIndirectPipeline, &m_psrGBufferDirectPipeline,
+        &m_psrGBufferIndirectPipeline, &m_psrProbePipelines[0], &m_psrProbePipelines[1],
+        &m_psrGBufferExtractDirectPipeline, &m_psrGBufferExtractIndirectPipeline, &m_psrGBufferExtractIndirectRawPipeline})
+    {
+        const auto found = m_psrRayQueryPipelines.find(original);
+
+        if(found != m_psrRayQueryPipelines.end())
+        {
+            if(found->second)
+            {
+                found->second->Shutdown();
+            }
+
+            m_psrRayQueryPipelines.erase(found);
+        }
+
+        original->Shutdown();
+    }
+
+    m_psrPipelinesReady = false;
+    m_psrGuidePipelineReady = false;
+    m_psrSplitPipelinesReady = false;
+    m_psrGBufferPipelinesReady = false;
+    m_psrGBufferExtractReady[0] = false;
+    m_psrGBufferExtractReady[1] = false;
 }
 
 void PathTraceReferencePass::ExecuteRadianceCacheTraining(
@@ -1849,10 +2551,16 @@ void PathTraceReferencePass::ExecuteReSTIRDISplit(
     bool extract,
     D3D12_GPU_VIRTUAL_ADDRESS radianceCacheConstants,
     PathTraceRadianceCacheLibrary radianceCacheLibrary,
-    bool rawDiffuseHitDistance)
+    bool rawDiffuseHitDistance,
+    bool primarySurfaceReplacement,
+    D3D12_GPU_VIRTUAL_ADDRESS psrGBufferConstants,
+    D3D12_GPU_VIRTUAL_ADDRESS psrGBufferTransforms)
 {
     m_rawDiffuseHitDistanceWritten = false;
     m_splitDirectDiffuseWritten = false;
+    m_psrWritten = false;
+    m_psrGuidesWritten = false;
+    m_psrGBufferWritten = false;
     const bool ready = extract ?
         m_extractSplitReady && m_splitDirectDiffuse.buffer.GetResource() && m_diffuseTexture.GetResource() :
         m_splitPipelinesReady;
@@ -1880,12 +2588,29 @@ void PathTraceReferencePass::ExecuteReSTIRDISplit(
     const bool cachedIndirect = radianceCacheConstants != 0 && radianceCacheLibrary == expectedLibrary &&
         radianceCache.ready;
     const bool rawPipeline = raw && !cachedIndirect && m_extractSplitRawReady;
-    RayTracingPipeline& directPipeline = PrimaryDiVisibilityPipeline(
-        extract ? m_extractSplitDirectPipeline : m_splitDirectPipeline);
+    // PSR.1c-A: without extraction or a cache library, with every PSR pipeline the frame's visibility selection needs
+    // (the DI.1 twin of the direct pass, the GI.6 twins of the record and indirect passes); otherwise the production pair.
+    const bool directVisibility = !m_primaryDiShadowRayQuery || m_psrPrimaryDiRayQueryPipelines[&m_psrSplitDirectPipeline];
+    const bool secondaryVisibility = !m_secondaryShadowRayQuery || (m_psrRayQueryPipelines[&m_psrRecordPipeline] &&
+        m_psrRayQueryPipelines[&m_psrSplitIndirectPipeline]);
+    // PSR.2 Stage 3A: without a cache library, with both of its bindings; it takes precedence over PSR.1. Stage 3B: with
+    // extraction, its extraction pair (raw-distance indirect when the frame records raw distances).
+    const bool gBufferReplacement = psrGBufferConstants != 0 && psrGBufferTransforms != 0 && !cachedIndirect &&
+        (extract ? IsPrimarySurfaceReplacementGBufferExtractionReady(raw) : IsPrimarySurfaceReplacementGBufferReady());
+    const bool replacement = !gBufferReplacement && primarySurfaceReplacement && !extract && !cachedIndirect &&
+        m_psrPipelinesReady && m_psrSplitPipelinesReady && directVisibility && secondaryVisibility &&
+        m_psrRecords.GetResource() && m_psrRecords.GetResource()->GetDesc().Width >=
+        static_cast<std::uint64_t>(width) * height * PrimarySurfaceReplacementRecordStride;
+    RayTracingPipeline& directPipeline = PrimaryDiVisibilityPipeline(extract ?
+        (gBufferReplacement ? m_psrGBufferExtractDirectPipeline : m_extractSplitDirectPipeline) :
+        (gBufferReplacement ? m_psrGBufferDirectPipeline :
+        (replacement ? m_psrSplitDirectPipeline : m_splitDirectPipeline)));
     RayTracingPipeline& indirectPipeline = VisibilityPipeline(cachedIndirect ?
         m_radianceCache[static_cast<size_t>(radianceCacheLibrary)].pipeline :
-        (extract ? (rawPipeline ? m_extractSplitIndirectRawPipeline : m_extractSplitIndirectPipeline) :
-        m_splitIndirectPipeline));
+        (extract ? (gBufferReplacement ? (raw ? m_psrGBufferExtractIndirectRawPipeline : m_psrGBufferExtractIndirectPipeline) :
+        (rawPipeline ? m_extractSplitIndirectRawPipeline : m_extractSplitIndirectPipeline)) :
+        (gBufferReplacement ? m_psrGBufferIndirectPipeline :
+        (replacement ? m_psrSplitIndirectPipeline : m_splitIndirectPipeline))));
 
     m_accumulationTexture.Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     m_outputTexture.Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -1911,11 +2636,35 @@ void PathTraceReferencePass::ExecuteReSTIRDISplit(
         commandList->SetComputeRootConstantBufferView(5, sceneLightConstantsAddress);
     };
 
+    // PSR.1c-A: the record pass, before the direct pass, which reads the records as the indirect pass does.
+    if(replacement)
+    {
+        m_psrRecords.Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        profiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::PathTracePsrRecord);
+        RayTracingPipeline& recordPipeline = VisibilityPipeline(m_psrRecordPipeline);
+        recordPipeline.Bind(commandList);
+        bindSharedRootParameters();
+        recordPipeline.Dispatch(commandList, width, height);
+        D3D12_RESOURCE_BARRIER recordBarrier{};
+        recordBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        recordBarrier.UAV.pResource = m_psrRecords.GetResource();
+        commandList->ResourceBarrier(1, &recordBarrier);
+        profiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::PathTracePsrRecord);
+        m_psrWritten = true;
+    }
+
     // Direct pass: RTXDI sampling, reuse, visibility and reservoir publication; writes the direct radiance.
     profiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::PathTraceSplitDirect);
     directPipeline.Bind(commandList);
     bindSharedRootParameters();
     commandList->SetComputeRootConstantBufferView(6, rtxdiConstantsAddress);
+
+    if(gBufferReplacement)
+    {
+        commandList->SetComputeRootConstantBufferView(7, psrGBufferConstants);
+        commandList->SetComputeRootShaderResourceView(8, psrGBufferTransforms);
+    }
+
     directPipeline.Dispatch(commandList, width, height);
     profiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::PathTraceSplitDirect);
     m_splitDirectDiffuseWritten = extract;
@@ -1938,13 +2687,39 @@ void PathTraceReferencePass::ExecuteReSTIRDISplit(
     {
         commandList->SetComputeRootConstantBufferView(6, radianceCacheConstants);
     }
+    else if(gBufferReplacement)
+    {
+        commandList->SetComputeRootConstantBufferView(6, psrGBufferConstants);
+        commandList->SetComputeRootShaderResourceView(7, psrGBufferTransforms);
+    }
 
     indirectPipeline.Dispatch(commandList, width, height);
 #if PATH_TRACE_SHARC_SPATIAL_DIAGNOSTIC != 0
     m_sharcDiagnosticWritten = cachedIndirect;
 #endif
     profiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::PathTraceSplitIndirect);
-    m_rawDiffuseHitDistanceWritten = cachedIndirect ? IsRawDiffuseHitDistanceLibrary(radianceCacheLibrary) : rawPipeline;
+    m_rawDiffuseHitDistanceWritten = cachedIndirect ? IsRawDiffuseHitDistanceLibrary(radianceCacheLibrary) :
+        (gBufferReplacement && extract ? raw : rawPipeline);
+
+    m_psrGBufferWritten = gBufferReplacement;
+
+    // Verification only: the recorded PSR pair's probe, with its indirect pass's bindings.
+    RayTracingPipeline& probePipeline = m_psrProbePipelines[gBufferReplacement ? 1 : 0];
+
+    if(m_psrProbeForTesting && (gBufferReplacement || replacement) && probePipeline.IsInitialized())
+    {
+        m_psrProbeForTesting->Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        probePipeline.Bind(commandList);
+        bindSharedRootParameters();
+
+        if(gBufferReplacement)
+        {
+            commandList->SetComputeRootConstantBufferView(6, psrGBufferConstants);
+            commandList->SetComputeRootShaderResourceView(7, psrGBufferTransforms);
+        }
+
+        probePipeline.Dispatch(commandList, width, height);
+    }
 
     RecordOutputBarriers(commandList, extract);
 }
@@ -2083,6 +2858,26 @@ void PathTraceReferencePass::ReleaseResources()
         learning.failed = false;
         learning.failure.clear();
     }
+
+    ReleasePrimarySurfaceReplacementPipelines();
+    m_psrPipelinesFailed = false;
+    m_psrFailure.clear();
+    m_psrRecords.Shutdown();
+    m_psrWritten = false;
+    m_psrGuidePipelineFailed = false;
+    m_psrGuideFailure.clear();
+    m_psrSplitPipelinesFailed = false;
+    m_psrSplitFailure.clear();
+    m_psrGBufferPipelinesFailed = false;
+    m_psrGBufferFailure.clear();
+
+    for(int kind = 0; kind < 2; ++kind)
+    {
+        m_psrGBufferExtractFailed[kind] = false;
+        m_psrGBufferExtractFailure[kind].clear();
+    }
+    m_psrGuides.Shutdown();
+    m_psrGuidesWritten = false;
 
     m_width = 0;
     m_height = 0;
@@ -2315,6 +3110,14 @@ RayTracingPipeline& PathTraceReferencePass::VisibilityPipeline(RayTracingPipelin
         return *found->second;
     }
 
+    // PSR.1a-P: the PSR twins, outside the shared readiness set.
+    const auto replacement = m_psrRayQueryPipelines.find(&original);
+
+    if(m_secondaryShadowRayQuery && replacement != m_psrRayQueryPipelines.end() && replacement->second)
+    {
+        return *replacement->second;
+    }
+
     return original;
 }
 
@@ -2341,6 +3144,14 @@ RayTracingPipeline& PathTraceReferencePass::PrimaryDiVisibilityPipeline(RayTraci
     if(m_primaryDiShadowRayQuery && found != m_primaryDiRayQueryPipelines.end() && found->second)
     {
         return *found->second;
+    }
+
+    // PSR.1c-A: the PSR direct pass's twin, outside the shared readiness set.
+    const auto replacement = m_psrPrimaryDiRayQueryPipelines.find(&original);
+
+    if(m_primaryDiShadowRayQuery && replacement != m_psrPrimaryDiRayQueryPipelines.end() && replacement->second)
+    {
+        return *replacement->second;
     }
 
     return original;

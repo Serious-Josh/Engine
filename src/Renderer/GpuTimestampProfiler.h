@@ -89,6 +89,12 @@ class GpuTimestampProfiler
         // R.9I.3 pixel-centred caustics: the complete tiled estimator, and the caustics-only debug view.
         PixelCausticEstimate,
         PixelCausticView,
+        // PSR.1a-P: the primary surface replacement record pass and the PSR raster primary, nested inside
+        // PathTraceReference on frames that record PSR.
+        PathTracePsrRecord,
+        PathTracePsrRaster,
+        // PSR.2: the in-place replacement pass, after the geometry pass.
+        PsrInPlaceReplace,
         Count
     };
 

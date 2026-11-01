@@ -123,7 +123,20 @@ class PathTraceTemporalPass
         unsigned int width,
         unsigned int height,
         D3D12_GPU_VIRTUAL_ADDRESS priorCacheBinding = 0,
-        bool extended = false);
+        bool extended = false,
+        D3D12_GPU_VIRTUAL_ADDRESS psrConstants = 0,
+        D3D12_GPU_VIRTUAL_ADDRESS psrTransforms = 0);
+
+    // PSR.2 Stage 3B: creates, on first use, the PSR variant (PathTraceTemporalPsr.hlsl). Execute with both PSR
+    // addresses (PsrDenoiseConstants, the replacement pass's transforms) then records it in place of the production
+    // pipeline. A failure is sticky.
+    bool EnsurePsrVariant(GraphicsDevice& graphicsDevice, ShaderLibrary& shaderLibrary);
+
+    // Whether the last Execute recorded the PSR variant.
+    bool RecordedPsrVariant() const
+    {
+        return m_psrLastFrame;
+    }
 
     // The frame recorded by Execute was submitted: its output becomes the history.
     void CommitHistory();
@@ -185,4 +198,9 @@ class PathTraceTemporalPass
     bool m_historyValid = false;
     std::optional<unsigned int> m_pendingSlot;
     unsigned int m_lastWrittenSlot = 0;
+    // PSR.2 Stage 3B.
+    ComputePipeline m_psrPipeline;
+    bool m_psrVariantReady = false;
+    bool m_psrVariantFailed = false;
+    bool m_psrLastFrame = false;
 };

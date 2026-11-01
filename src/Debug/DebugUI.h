@@ -91,6 +91,19 @@ class DebugUI
     {
         return static_cast<ToneMapDebugView>(m_toneMapDebugView);
     }
+    // PSR.2 Stage 3A: whether this frame requested in-place replacement, and why its reflections are not lit (empty when
+    // they are).
+    void SetPsrLightingStatus(bool requested, const std::string& unavailable)
+    {
+        m_psrLightingRequested = requested;
+        m_psrLightingUnavailable = unavailable;
+    }
+    // PSR.2 development view; None when Off. The renderer applies it only to Path Tracing frames with in-place replacement.
+    ToneMapDebugView GetPsrDebugView() const
+    {
+        return m_psrDebugView == 0 ? ToneMapDebugView::None :
+            static_cast<ToneMapDebugView>(static_cast<int>(ToneMapDebugView::PsrReplacementMask) + m_psrDebugView - 1);
+    }
 
     // The camera exposure state of the latest completed frame (GPU readback, a few frames old; display only).
     struct ExposureDisplay
@@ -154,8 +167,6 @@ class DebugUI
         {
         case 1:
             return RendererLightingMode::PathTracedReference;
-        case 2:
-            return RendererLightingMode::PathTracedRasterPrimary;
         case 3:
             return RendererLightingMode::PathTracedRasterPrimaryReSTIRDI;
         default:
@@ -176,15 +187,13 @@ class DebugUI
     // mode; Off outside those lighting modes.
     PathTraceDenoiserMode GetPathTraceDenoiserMode() const
     {
-        return m_lightingMode == 2 || m_lightingMode == 3 ? GetSelectedPathTraceDenoiserMode() : PathTraceDenoiserMode::Off;
+        return m_lightingMode == 3 ? GetSelectedPathTraceDenoiserMode() : PathTraceDenoiserMode::Off;
     }
 
-    // The selector's value: the explicit choice, or the lighting mode's default until one is made (Hybrid with
-    // ReSTIR DI, Engine otherwise). An explicit choice is shared by both raster-primary modes.
+    // The selector's value: the explicit choice, or Path Tracing's default (Hybrid) until one is made.
     PathTraceDenoiserMode GetSelectedPathTraceDenoiserMode() const
     {
-        return m_pathTraceDenoiserMode.value_or(m_lightingMode == 3 ? PathTraceDenoiserMode::NrdHybrid :
-            PathTraceDenoiserMode::Engine);
+        return m_pathTraceDenoiserMode.value_or(PathTraceDenoiserMode::NrdHybrid);
     }
 
     // DENOISE.1: the denoiser stages to run (diagnostics; the defaults are the production pipeline).
@@ -196,7 +205,7 @@ class DebugUI
     // R.9I.3: experimental dedicated additive caustics in the path-traced modes (off by default, not saved).
     bool IsDedicatedCausticsEnabled() const
     {
-        return m_dedicatedCaustics && m_lightingMode >= 1 && m_lightingMode <= 3;
+        return m_dedicatedCaustics && (m_lightingMode == 1 || m_lightingMode == 3);
     }
 
     bool IsCausticOnlyView() const
@@ -255,7 +264,7 @@ class DebugUI
     // UPSCALING.2B: experimental camera jitter in the raster-primary path-traced modes (off by default, not saved).
     bool IsPathTraceCameraJitterEnabled() const
     {
-        return m_pathTraceCameraJitter && (m_lightingMode == 2 || m_lightingMode == 3);
+        return m_pathTraceCameraJitter && m_lightingMode == 3;
     }
 
     // UPSCALING.2C: the experimental 75% render scale in the raster-primary path-traced modes (off by default, not
@@ -275,20 +284,18 @@ class DebugUI
     // 1 bilinear 75%, 2 DLSS 75% (diagnostic), 3 DLSS Quality, 4 DLSS Balanced, 5 DLSS Performance.
     int GetPathTraceRenderScaleIndex() const
     {
-        return m_lightingMode == 2 || m_lightingMode == 3 ?
-            (m_dlssEnabled ? 3 + m_dlssQuality : m_pathTraceRenderScale) : 0;
+        return m_lightingMode == 3 ? (m_dlssEnabled ? 3 + m_dlssQuality : m_pathTraceRenderScale) : 0;
     }
 
     bool IsNormalDlssRequested() const { return m_dlssEnabled; }
     bool IsDlssConfigurationEligible() const
     {
-        return (m_lightingMode == 2 || m_lightingMode == 3) &&
-            m_lightingTransition.active == GetLightingMode() &&
+        return m_lightingMode == 3 && m_lightingTransition.active == GetLightingMode() &&
             GetPathTraceDenoiserMode() != PathTraceDenoiserMode::Off && m_pathTraceDenoiserPreparation.empty();
     }
     bool IsDlssPreparing() const
     {
-        return (m_lightingMode == 2 || m_lightingMode == 3) && GetPathTraceDenoiserMode() != PathTraceDenoiserMode::Off &&
+        return m_lightingMode == 3 && GetPathTraceDenoiserMode() != PathTraceDenoiserMode::Off &&
             (m_lightingTransition.active != GetLightingMode() || !m_pathTraceDenoiserPreparation.empty());
     }
     bool ConsumeDlssRetry() { return std::exchange(m_dlssRetry, false); }
@@ -355,15 +362,19 @@ class DebugUI
         m_gpuTimingDlssActive = dlssActive;
     }
 
-    void SetPrimaryDiShadowVisibilityStatus(bool ready, bool active, bool failed)
+    void SetPrimaryDiShadowVisibilityStatus(bool ready, bool active, bool failed, bool serWorkaround)
     {
         m_primaryDiShadowReady = ready;
         m_primaryDiShadowActive = active;
         m_primaryDiShadowFailed = failed;
+        m_primaryDiShadowSerWorkaround = serWorkaround;
     }
 
-    void SetPathTraceRasterPrimaryStatus(PathTraceRasterPrimaryAvailability availability, const std::string& reason);
-    void SetPathTraceReSTIRDIStatus(PathTraceRasterPrimaryAvailability availability, const std::string& reason);
+    // The raster-primary capability: the shared prerequisites (the diagnostic exhaustive estimator) and ReSTIR DI's own.
+    void SetPathTraceRasterPrimaryStatus(const PathTraceRasterPrimaryStatus& status)
+    {
+        m_rasterPrimaryStatus = status;
+    }
 
     // Async DXR preparation: the Renderer's transition snapshot from the last recording. Set before the
     // rendering settings are drawn, so the selector and the indicator agree within a UI frame.
@@ -406,12 +417,17 @@ class DebugUI
     GpuTimingMonitor m_gpuTimingMonitor;
     GpuTimingMonitor m_visibilityTimings;
     int m_secondaryShadowVisibility = PathTraceReferenceSettings{}.secondaryShadowRayQuery ? 1 : 0;
+    bool m_primarySurfaceReplacementInPlace = PathTraceReferenceSettings{}.primarySurfaceReplacementInPlace;
+    int m_psrDebugView = 0; // Off, Replacement Mask, Reflected Normals, Reflected Albedo.
+    bool m_psrLightingRequested = false;
+    std::string m_psrLightingUnavailable;
     bool m_secondaryShadowReady = false;
     bool m_secondaryShadowActive = false;
     int m_primaryDiShadowVisibility = PathTraceReferenceSettings{}.primaryDiShadowRayQuery ? 1 : 0;
     bool m_primaryDiShadowReady = false;
     bool m_primaryDiShadowActive = false;
     bool m_primaryDiShadowFailed = false;
+    bool m_primaryDiShadowSerWorkaround = false;
     std::uint64_t m_visibilityTimingEpoch = 0;
     std::uint64_t m_sampledVisibilityEpoch = UINT64_MAX;
     std::uint64_t m_visibilityWarmupUntil = 0;
@@ -510,7 +526,7 @@ class DebugUI
     SharcStatus m_sharcStatus;
     void DrawSharcSettings();
     // SHARC.4E.1: the path-tracing denoiser in the raster-primary path-traced modes. Empty until the user (or a
-    // verification) chooses one; GetSelectedPathTraceDenoiserMode supplies the lighting mode's default meanwhile.
+    // verification) chooses one; GetSelectedPathTraceDenoiserMode supplies Path Tracing's default meanwhile.
     std::optional<PathTraceDenoiserMode> m_pathTraceDenoiserMode;
     std::string m_pathTraceNrdStatus;
     std::string m_pathTraceDenoiserPreparation;
@@ -556,10 +572,7 @@ class DebugUI
     std::uint64_t m_causticHistoryFrames = 0;
     std::uint64_t m_causticResourceBytes = 0;
 
-    PathTraceRasterPrimaryAvailability m_rasterPrimaryAvailability = PathTraceRasterPrimaryAvailability::NotRequested;
-    std::string m_rasterPrimaryReason;
-    PathTraceRasterPrimaryAvailability m_restirDIAvailability = PathTraceRasterPrimaryAvailability::NotRequested;
-    std::string m_restirDIReason;
+    PathTraceRasterPrimaryStatus m_rasterPrimaryStatus;
 
     LightingModeTransitionStatus m_lightingTransition;
     // UI time at which the indicator first observed the current preparation; negative when none.
