@@ -6,6 +6,10 @@
 #include <scriptbuilder.h>
 
 #include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <cstddef>
+#include <cstring>
 #include <exception>
 #include <stdexcept>
 #include <thread>
@@ -18,6 +22,47 @@ namespace
 constexpr std::size_t TextLimit = 1024;
 constexpr std::size_t DiagnosticLimit = 32;
 constexpr std::size_t SourceLimit = 1024 * 1024;
+
+// AS.5 engine section compiled into every behaviour module. Native classes cannot be script base
+// classes, so EAScript is a script class: an abstract base holding the checked owner handle the
+// host binds after construction, plus empty lifecycle callbacks a derived class may override.
+constexpr const char* EAScriptSection = "Engine/EAScript.as";
+constexpr const char* EAScriptSource =
+    "abstract class EAScript\n"
+    "{\n"
+    "    private SceneObject eaOwner_;\n"
+    "    SceneObject GetOwner() const { return eaOwner_; }\n"
+    "    void OnStart() {}\n"
+    "    void OnStop() {}\n"
+    "    void OnUpdate(float deltaTime) {}\n"
+    "}\n";
+constexpr const char* OwnerProperty = "eaOwner_";
+
+// Each successful initialization is a new world; handles from any other world never resolve.
+std::atomic<std::uint64_t> g_worldCounter{0};
+
+// Script-visible owner handle: plain data copied by value. The default handle is invalid.
+struct ObjectHandle
+{
+    std::uint64_t world = 0;
+    std::uint32_t slot = 0;
+    std::uint32_t reserved = 0;
+};
+
+struct ScriptVector3
+{
+    float x = 0.0f;
+    float y = 0.0f;
+    float z = 0.0f;
+};
+
+struct ScriptVector2
+{
+    float x = 0.0f;
+    float y = 0.0f;
+};
+
+const float MathPi = 3.14159265358979323846f;
 
 std::string Bounded(std::string_view text)
 {
@@ -33,6 +78,72 @@ void AddDiagnostic(Result& result, std::string_view text, std::string_view secti
     {
         result.diagnostics.push_back({Bounded(section), line, column, Bounded(severity), Bounded(text)});
     }
+}
+
+// Attributes diagnostics to the asset and revision of the source closure that produced them.
+void AttributeDiagnostics(Result& result, const SourceSnapshot& snapshot)
+{
+    for(auto& diagnostic : result.diagnostics)
+    {
+        diagnostic.assetReference = snapshot.rootAsset;
+        diagnostic.sourceRevision = snapshot.revision;
+
+        for(const auto& source : snapshot.sections)
+        {
+            if(source.name == diagnostic.section)
+            {
+                diagnostic.assetReference = source.assetReference;
+                break;
+            }
+        }
+    }
+}
+
+std::string QualifiedName(const asITypeInfo& type)
+{
+    const std::string space = type.GetNamespace() ? type.GetNamespace() : "";
+    return space.empty() ? type.GetName() : space + "::" + type.GetName();
+}
+
+asIScriptFunction* FindDefaultFactory(const asITypeInfo& type)
+{
+    for(asUINT index = 0; index < type.GetFactoryCount(); ++index)
+    {
+        auto* factory = type.GetFactoryByIndex(index);
+
+        if(factory && factory->GetParamCount() == 0)
+        {
+            return factory;
+        }
+    }
+
+    return nullptr;
+}
+
+// Instantiable EAScript classes of a module: concrete, derived and default-constructible.
+std::vector<std::string> FindBehaviourClasses(asIScriptModule& module)
+{
+    std::vector<std::string> classes;
+    const auto* base = module.GetTypeInfoByName("EAScript");
+
+    if(!base)
+    {
+        return classes;
+    }
+
+    for(asUINT index = 0; index < module.GetObjectTypeCount(); ++index)
+    {
+        const auto* type = module.GetObjectTypeByIndex(index);
+
+        if(type && type != base && type->DerivesFrom(base) && !(type->GetFlags() & asOBJ_ABSTRACT) &&
+            FindDefaultFactory(*type))
+        {
+            classes.push_back(QualifiedName(*type));
+        }
+    }
+
+    std::sort(classes.begin(), classes.end());
+    return classes;
 }
 
 struct EngineDeleter
@@ -55,10 +166,18 @@ struct ContextDeleter
 {
     void operator()(asIScriptContext* context) const noexcept
     {
-        // Abort suspended calls before unpreparing; a context never survives Execute.
+        // Abort suspended calls before unpreparing; a context never survives one call.
         context->Abort();
         context->Unprepare();
         context->Release();
+    }
+};
+
+struct ObjectDeleter
+{
+    void operator()(asIScriptObject* object) const noexcept
+    {
+        object->Release();
     }
 };
 
@@ -181,21 +300,358 @@ void CheckBudget(asIScriptContext* context, Budget* budget) noexcept
 
     --budget->remaining;
 }
+
+bool ValidLimits(const ExecutionLimits& limits)
+{
+    return limits.statements != 0 && limits.timeout.count() > 0 && limits.timeout <= std::chrono::seconds(10);
+}
+
+void ConstructVector3(asIScriptGeneric* generic)
+{
+    *static_cast<ScriptVector3*>(generic->GetObject()) = {};
+}
+
+void ConstructVector3Components(asIScriptGeneric* generic)
+{
+    *static_cast<ScriptVector3*>(generic->GetObject()) =
+        {generic->GetArgFloat(0), generic->GetArgFloat(1), generic->GetArgFloat(2)};
+}
+
+void ConstructObjectHandle(asIScriptGeneric* generic)
+{
+    *static_cast<ObjectHandle*>(generic->GetObject()) = {};
+}
+
+void RaiseScriptException(const char* text)
+{
+    if(auto* context = asGetActiveContext())
+    {
+        context->SetException(text);
+    }
+}
+
+// AS.6A Vector3 arithmetic. Generic functions must keep the exact type void(asIScriptGeneric*)
+// (no noexcept) so asFUNCTION selects the generic convention.
+const ScriptVector3& ThisVector(asIScriptGeneric* generic)
+{
+    return *static_cast<const ScriptVector3*>(generic->GetObject());
+}
+
+const ScriptVector3& ArgumentVector(asIScriptGeneric* generic)
+{
+    return *static_cast<const ScriptVector3*>(generic->GetArgObject(0));
+}
+
+void ReturnVector(asIScriptGeneric* generic, ScriptVector3 value)
+{
+    generic->SetReturnObject(&value);
+}
+
+void VectorAdd(asIScriptGeneric* generic)
+{
+    const auto& left = ThisVector(generic);
+    const auto& right = ArgumentVector(generic);
+    ReturnVector(generic, {left.x + right.x, left.y + right.y, left.z + right.z});
+}
+
+void VectorSubtract(asIScriptGeneric* generic)
+{
+    const auto& left = ThisVector(generic);
+    const auto& right = ArgumentVector(generic);
+    ReturnVector(generic, {left.x - right.x, left.y - right.y, left.z - right.z});
+}
+
+void VectorScale(asIScriptGeneric* generic)
+{
+    const auto& value = ThisVector(generic);
+    const float scale = generic->GetArgFloat(0);
+    ReturnVector(generic, {value.x * scale, value.y * scale, value.z * scale});
+}
+
+void VectorDivide(asIScriptGeneric* generic)
+{
+    const auto& value = ThisVector(generic);
+    const float divisor = generic->GetArgFloat(0);
+
+    if(divisor == 0.0f)
+    {
+        RaiseScriptException("Vector3 division by zero.");
+        return;
+    }
+
+    ReturnVector(generic, {value.x / divisor, value.y / divisor, value.z / divisor});
+}
+
+void VectorNegate(asIScriptGeneric* generic)
+{
+    const auto& value = ThisVector(generic);
+    ReturnVector(generic, {-value.x, -value.y, -value.z});
+}
+
+void VectorAddAssign(asIScriptGeneric* generic)
+{
+    auto& value = *static_cast<ScriptVector3*>(generic->GetObject());
+    const auto& other = ArgumentVector(generic);
+    value = {value.x + other.x, value.y + other.y, value.z + other.z};
+    generic->SetReturnAddress(&value);
+}
+
+void VectorSubtractAssign(asIScriptGeneric* generic)
+{
+    auto& value = *static_cast<ScriptVector3*>(generic->GetObject());
+    const auto& other = ArgumentVector(generic);
+    value = {value.x - other.x, value.y - other.y, value.z - other.z};
+    generic->SetReturnAddress(&value);
+}
+
+void VectorScaleAssign(asIScriptGeneric* generic)
+{
+    auto& value = *static_cast<ScriptVector3*>(generic->GetObject());
+    const float scale = generic->GetArgFloat(0);
+    value = {value.x * scale, value.y * scale, value.z * scale};
+    generic->SetReturnAddress(&value);
+}
+
+float VectorLengthOf(const ScriptVector3& value)
+{
+    return std::sqrt(value.x * value.x + value.y * value.y + value.z * value.z);
+}
+
+void VectorLength(asIScriptGeneric* generic)
+{
+    generic->SetReturnFloat(VectorLengthOf(ThisVector(generic)));
+}
+
+// AS.6B Vector2 (mouse deltas) and Math, kept to what mouse look needs.
+void ConstructVector2(asIScriptGeneric* generic)
+{
+    *static_cast<ScriptVector2*>(generic->GetObject()) = {};
+}
+
+void ConstructVector2Components(asIScriptGeneric* generic)
+{
+    *static_cast<ScriptVector2*>(generic->GetObject()) = {generic->GetArgFloat(0), generic->GetArgFloat(1)};
+}
+
+const ScriptVector2& ThisVector2(asIScriptGeneric* generic)
+{
+    return *static_cast<const ScriptVector2*>(generic->GetObject());
+}
+
+const ScriptVector2& ArgumentVector2(asIScriptGeneric* generic)
+{
+    return *static_cast<const ScriptVector2*>(generic->GetArgObject(0));
+}
+
+void ReturnVector2(asIScriptGeneric* generic, ScriptVector2 value)
+{
+    generic->SetReturnObject(&value);
+}
+
+void Vector2Add(asIScriptGeneric* generic)
+{
+    ReturnVector2(generic, {ThisVector2(generic).x + ArgumentVector2(generic).x,
+        ThisVector2(generic).y + ArgumentVector2(generic).y});
+}
+
+void Vector2Subtract(asIScriptGeneric* generic)
+{
+    ReturnVector2(generic, {ThisVector2(generic).x - ArgumentVector2(generic).x,
+        ThisVector2(generic).y - ArgumentVector2(generic).y});
+}
+
+void Vector2Scale(asIScriptGeneric* generic)
+{
+    const float scale = generic->GetArgFloat(0);
+    ReturnVector2(generic, {ThisVector2(generic).x * scale, ThisVector2(generic).y * scale});
+}
+
+void Vector2Length(asIScriptGeneric* generic)
+{
+    const auto& value = ThisVector2(generic);
+    generic->SetReturnFloat(std::sqrt(value.x * value.x + value.y * value.y));
+}
+
+void MathSin(asIScriptGeneric* generic)
+{
+    generic->SetReturnFloat(std::sin(generic->GetArgFloat(0)));
+}
+
+void MathCos(asIScriptGeneric* generic)
+{
+    generic->SetReturnFloat(std::cos(generic->GetArgFloat(0)));
+}
+
+void MathClamp(asIScriptGeneric* generic)
+{
+    const float value = generic->GetArgFloat(0);
+    const float minimum = generic->GetArgFloat(1);
+    const float maximum = generic->GetArgFloat(2);
+
+    if(minimum > maximum)
+    {
+        RaiseScriptException("Math::Clamp requires minimum <= maximum.");
+        return;
+    }
+
+    generic->SetReturnFloat(value < minimum ? minimum : value > maximum ? maximum : value);
+}
+
+void MathToRadians(asIScriptGeneric* generic)
+{
+    generic->SetReturnFloat(generic->GetArgFloat(0) * (MathPi / 180.0f));
+}
+
+// The zero vector normalizes to zero, so "no input" stays "no movement" without a script branch.
+void VectorNormalized(asIScriptGeneric* generic)
+{
+    const auto& value = ThisVector(generic);
+    const float length = VectorLengthOf(value);
+    ReturnVector(generic, length > 0.0f ? ScriptVector3{value.x / length, value.y / length, value.z / length} :
+        ScriptVector3{});
+}
 }
 
 struct ScriptHost::Impl
 {
+    struct Behaviour
+    {
+        std::unique_ptr<asIScriptModule, ModuleDeleter> module;
+        std::shared_ptr<const SourceSnapshot> snapshot;
+    };
+
+    struct Instance
+    {
+        std::unique_ptr<asIScriptObject, ObjectDeleter> object;
+        ModuleID module = 0;
+    };
+
     const std::thread::id owner = std::this_thread::get_id();
     Result result;
     bool executing = false;
     std::string section;
-    // Reverse member destruction releases the module before its engine.
+    std::uint64_t world = 0;
+    ObjectResolver* resolver = nullptr;
+    InputSource* input = nullptr;
+    std::size_t logCount = 0;
+    // Reverse member destruction releases instances, then modules, then the engine.
     std::unique_ptr<asIScriptEngine, EngineDeleter> engine;
     std::unique_ptr<asIScriptModule, ModuleDeleter> module;
+    std::vector<Behaviour> behaviours;
+    std::vector<Instance> instances;
 
     bool IsAvailable() const noexcept
     {
         return owner == std::this_thread::get_id() && !executing;
+    }
+
+    // Drops every script object before the modules defining their types, then the engine.
+    void Release() noexcept
+    {
+        instances.clear();
+
+        if(engine)
+        {
+            engine->GarbageCollect(asGC_FULL_CYCLE);
+        }
+
+        behaviours.clear();
+        module.reset();
+        engine.reset();
+        world = 0;
+    }
+
+    bool Resolves(const ObjectHandle& handle) const noexcept
+    {
+        try
+        {
+            return resolver && world != 0 && handle.world == world && executing &&
+                owner == std::this_thread::get_id() && resolver->IsValid(handle.slot);
+        }
+        catch(...)
+        {
+            return false;
+        }
+    }
+
+    // Runs one prepared call under the budget; the context never survives it. Fills
+    // result.status and diagnostics. created receives a factory's returned object.
+    void Run(asIScriptFunction& function, asIScriptObject* object, const ExecutionLimits& limits,
+        std::string_view diagnosticSection, asIScriptObject** created, const float* argument = nullptr)
+    {
+        Budget budget{limits.statements, std::chrono::steady_clock::now() + limits.timeout};
+        std::unique_ptr<asIScriptContext, ContextDeleter> context(engine->CreateContext());
+
+        if(!context || context->Prepare(&function) < 0 || (object && context->SetObject(object) < 0) ||
+            (argument && context->SetArgFloat(0, *argument) < 0) ||
+            context->SetLineCallback(asFUNCTION(CheckBudget), &budget, asCALL_CDECL) < 0)
+        {
+            AddDiagnostic(result, "Cannot prepare bounded execution context.");
+            result.status = Status::Failed;
+            return;
+        }
+
+        struct ExecutionScope
+        {
+            bool& active;
+            ~ExecutionScope()
+            {
+                active = false;
+            }
+        } executionScope{executing};
+
+        executing = true;
+        logCount = 0;
+        const int execution = context->Execute();
+
+        if(execution == asEXECUTION_FINISHED)
+        {
+            result.status = Status::Finished;
+
+            if(created)
+            {
+                auto* returned = static_cast<asIScriptObject*>(context->GetReturnObject());
+
+                if(returned)
+                {
+                    returned->AddRef();
+                }
+
+                *created = returned;
+            }
+        }
+        else if(budget.exceeded)
+        {
+            result.status = Status::BudgetExceeded;
+            AddDiagnostic(result, "Script execution budget exceeded; context aborted.", diagnosticSection);
+        }
+        else if(execution == asEXECUTION_EXCEPTION)
+        {
+            result.status = Status::Exception;
+            const char* exceptionSection = nullptr;
+            int column = 0;
+            const int line = context->GetExceptionLineNumber(&column, &exceptionSection);
+            AddDiagnostic(result, context->GetExceptionString(), exceptionSection ? exceptionSection : "", line, column);
+
+            for(asUINT index = 0; index < (std::min)(context->GetCallstackSize(), asUINT(8)); ++index)
+            {
+                auto* frame = context->GetFunction(index);
+                const char* frameSection = nullptr;
+                const int frameLine = context->GetLineNumber(index, nullptr, &frameSection);
+
+                if(frame)
+                {
+                    AddDiagnostic(result, frame->GetDeclaration(), frameSection ? frameSection : diagnosticSection,
+                        frameLine, 0, "Stack");
+                }
+            }
+        }
+        else
+        {
+            result.status = execution == asEXECUTION_SUSPENDED ? Status::Suspended : Status::Failed;
+            AddDiagnostic(result, "Unexpected execution status " + std::to_string(execution) +
+                "; context discarded without resumption.", diagnosticSection);
+        }
     }
 
     static void Message(const asSMessageInfo* message, Impl* state) noexcept
@@ -252,14 +708,410 @@ struct ScriptHost::Impl
         }
     }
 
-    std::size_t logCount = 0;
+    // SceneObject methods; not declared noexcept, because asFUNCTION recognises the generic
+    // convention by the exact type void(asIScriptGeneric*). Each catches everything itself.
+    // Expected misuse (stale or default handles) answers false or an empty
+    // name; reading the position of an invalid object raises a script exception instead.
+    static void ObjectIsValid(asIScriptGeneric* generic)
+    {
+        const auto& state = *static_cast<const Impl*>(generic->GetAuxiliary());
+        generic->SetReturnByte(state.Resolves(*static_cast<const ObjectHandle*>(generic->GetObject())) ? 1 : 0);
+    }
+
+    static void ObjectGetName(asIScriptGeneric* generic)
+    {
+        const auto& state = *static_cast<const Impl*>(generic->GetAuxiliary());
+        const auto& handle = *static_cast<const ObjectHandle*>(generic->GetObject());
+
+        try
+        {
+            std::string name = state.Resolves(handle) ? Bounded(state.resolver->GetName(handle.slot)) : std::string();
+            generic->SetReturnObject(&name);
+        }
+        catch(...)
+        {
+            if(auto* context = asGetActiveContext())
+            {
+                context->SetException("SceneObject name is unavailable.");
+            }
+        }
+    }
+
+    bool ControllerUsable(const ObjectHandle& handle) const noexcept
+    {
+        try
+        {
+            return Resolves(handle) && resolver->HasCharacterController(handle.slot);
+        }
+        catch(...)
+        {
+            return false;
+        }
+    }
+
+    // AS.6A Character Controller handle: same world and slot as its SceneObject, checked against
+    // the current Play session on every use. Requests are recorded by the runtime, never applied here.
+    static void ObjectGetCharacterController(asIScriptGeneric* generic)
+    {
+        const auto& state = *static_cast<const Impl*>(generic->GetAuxiliary());
+        const auto& handle = *static_cast<const ObjectHandle*>(generic->GetObject());
+        ObjectHandle controller{};
+
+        if(state.ControllerUsable(handle))
+        {
+            controller = handle;
+        }
+
+        generic->SetReturnObject(&controller);
+    }
+
+    static void ControllerIsValid(asIScriptGeneric* generic)
+    {
+        const auto& state = *static_cast<const Impl*>(generic->GetAuxiliary());
+        generic->SetReturnByte(state.ControllerUsable(*static_cast<const ObjectHandle*>(generic->GetObject())) ? 1 : 0);
+    }
+
+    static void ControllerIsGrounded(asIScriptGeneric* generic)
+    {
+        const auto& state = *static_cast<const Impl*>(generic->GetAuxiliary());
+        const auto& handle = *static_cast<const ObjectHandle*>(generic->GetObject());
+        bool grounded = false;
+
+        try
+        {
+            grounded = state.ControllerUsable(handle) && state.resolver->IsCharacterGrounded(handle.slot);
+        }
+        catch(...)
+        {
+            grounded = false;
+        }
+
+        generic->SetReturnByte(grounded ? 1 : 0);
+    }
+
+    static void ControllerMove(asIScriptGeneric* generic)
+    {
+        const auto& state = *static_cast<const Impl*>(generic->GetAuxiliary());
+        const auto& handle = *static_cast<const ObjectHandle*>(generic->GetObject());
+        const auto& velocity = ArgumentVector(generic);
+
+        try
+        {
+            if(!state.ControllerUsable(handle))
+            {
+                RaiseScriptException("CharacterController is not valid.");
+                return;
+            }
+
+            const float values[3] = {velocity.x, velocity.y, velocity.z};
+            std::string error;
+
+            if(!state.resolver->MoveCharacter(handle.slot, values, error))
+            {
+                RaiseScriptException(Bounded(error).c_str());
+            }
+        }
+        catch(...)
+        {
+            RaiseScriptException("CharacterController movement request failed.");
+        }
+    }
+
+    static void ControllerJump(asIScriptGeneric* generic)
+    {
+        const auto& state = *static_cast<const Impl*>(generic->GetAuxiliary());
+        const auto& handle = *static_cast<const ObjectHandle*>(generic->GetObject());
+
+        try
+        {
+            if(!state.ControllerUsable(handle))
+            {
+                RaiseScriptException("CharacterController is not valid.");
+                return;
+            }
+
+            std::string error;
+
+            if(!state.resolver->JumpCharacter(handle.slot, error))
+            {
+                RaiseScriptException(Bounded(error).c_str());
+            }
+        }
+        catch(...)
+        {
+            RaiseScriptException("CharacterController jump request failed.");
+        }
+    }
+
+    // AS.6A Input: false outside a gameplay dispatch, without focus, or for an unknown key.
+    static void InputQuery(asIScriptGeneric* generic, bool pressed)
+    {
+        const auto& state = *static_cast<const Impl*>(generic->GetAuxiliary());
+        const auto value = static_cast<int>(generic->GetArgDWord(0));
+        bool result = false;
+
+        try
+        {
+            if(state.input && state.executing && state.owner == std::this_thread::get_id() &&
+                value >= static_cast<int>(Key::W) && value <= static_cast<int>(Key::Space))
+            {
+                const auto key = static_cast<Key>(value);
+                result = pressed ? state.input->WasKeyPressed(key) : state.input->IsKeyDown(key);
+            }
+        }
+        catch(...)
+        {
+            result = false;
+        }
+
+        generic->SetReturnByte(result ? 1 : 0);
+    }
+
+    static void InputIsKeyDown(asIScriptGeneric* generic)
+    {
+        InputQuery(generic, false);
+    }
+
+    bool InputAvailable() const noexcept
+    {
+        return input && executing && owner == std::this_thread::get_id();
+    }
+
+    static void InputGetMouseDelta(asIScriptGeneric* generic)
+    {
+        const auto& state = *static_cast<const Impl*>(generic->GetAuxiliary());
+        float delta[2] = {};
+
+        try
+        {
+            if(state.InputAvailable())
+            {
+                state.input->GetMouseDelta(delta);
+            }
+        }
+        catch(...)
+        {
+            delta[0] = 0.0f;
+            delta[1] = 0.0f;
+        }
+
+        ScriptVector2 value{delta[0], delta[1]};
+        generic->SetReturnObject(&value);
+    }
+
+    static void InputSetCursorLocked(asIScriptGeneric* generic)
+    {
+        const auto& state = *static_cast<const Impl*>(generic->GetAuxiliary());
+
+        try
+        {
+            if(state.InputAvailable())
+            {
+                state.input->SetCursorLocked(generic->GetArgByte(0) != 0);
+            }
+        }
+        catch(...)
+        {
+            RaiseScriptException("Cursor lock request failed.");
+        }
+    }
+
+    // AS.6B controller yaw: reading an invalid handle gives 0; changing it raises an exception.
+    static void ControllerGetYaw(asIScriptGeneric* generic)
+    {
+        const auto& state = *static_cast<const Impl*>(generic->GetAuxiliary());
+        const auto& handle = *static_cast<const ObjectHandle*>(generic->GetObject());
+        float yaw = 0.0f;
+
+        try
+        {
+            if(!state.ControllerUsable(handle) || !state.resolver->GetCharacterYaw(handle.slot, yaw))
+            {
+                yaw = 0.0f;
+            }
+        }
+        catch(...)
+        {
+            yaw = 0.0f;
+        }
+
+        generic->SetReturnFloat(yaw);
+    }
+
+    static void ControllerSetYaw(asIScriptGeneric* generic)
+    {
+        const auto& state = *static_cast<const Impl*>(generic->GetAuxiliary());
+        const auto& handle = *static_cast<const ObjectHandle*>(generic->GetObject());
+        const float yaw = generic->GetArgFloat(0);
+
+        try
+        {
+            if(!state.ControllerUsable(handle))
+            {
+                RaiseScriptException("CharacterController is not valid.");
+                return;
+            }
+
+            std::string error;
+
+            if(!state.resolver->SetCharacterYaw(handle.slot, yaw, error))
+            {
+                RaiseScriptException(Bounded(error).c_str());
+            }
+        }
+        catch(...)
+        {
+            RaiseScriptException("CharacterController yaw request failed.");
+        }
+    }
+
+    // AS.6B hierarchy and runtime transform methods on SceneObject.
+    static void ObjectFindChild(asIScriptGeneric* generic)
+    {
+        const auto& state = *static_cast<const Impl*>(generic->GetAuxiliary());
+        const auto& handle = *static_cast<const ObjectHandle*>(generic->GetObject());
+        const auto& name = *static_cast<const std::string*>(generic->GetArgObject(0));
+        ObjectHandle child{};
+
+        try
+        {
+            std::uint32_t slot = 0;
+
+            if(state.Resolves(handle) && state.resolver->FindChild(handle.slot, name, slot))
+            {
+                child = {state.world, slot, 0};
+            }
+        }
+        catch(...)
+        {
+            child = {};
+        }
+
+        generic->SetReturnObject(&child);
+    }
+
+    static void ReturnResolvedVector(asIScriptGeneric* generic, bool resolved, const float (&value)[3], const char* failure)
+    {
+        if(!resolved)
+        {
+            RaiseScriptException(failure);
+            return;
+        }
+
+        ScriptVector3 result{value[0], value[1], value[2]};
+        generic->SetReturnObject(&result);
+    }
+
+    static void ObjectGetLocalRotation(asIScriptGeneric* generic)
+    {
+        const auto& state = *static_cast<const Impl*>(generic->GetAuxiliary());
+        const auto& handle = *static_cast<const ObjectHandle*>(generic->GetObject());
+        float rotation[3] = {};
+        bool resolved = false;
+
+        try
+        {
+            resolved = state.Resolves(handle) && state.resolver->GetLocalRotation(handle.slot, rotation);
+        }
+        catch(...)
+        {
+            resolved = false;
+        }
+
+        ReturnResolvedVector(generic, resolved, rotation, "SceneObject is not valid.");
+    }
+
+    static void ObjectGetForward(asIScriptGeneric* generic)
+    {
+        const auto& state = *static_cast<const Impl*>(generic->GetAuxiliary());
+        const auto& handle = *static_cast<const ObjectHandle*>(generic->GetObject());
+        float forward[3] = {};
+        bool resolved = false;
+
+        try
+        {
+            resolved = state.Resolves(handle) && state.resolver->GetForward(handle.slot, forward);
+        }
+        catch(...)
+        {
+            resolved = false;
+        }
+
+        ReturnResolvedVector(generic, resolved, forward, "SceneObject is not valid.");
+    }
+
+    static void ObjectSetLocalRotation(asIScriptGeneric* generic)
+    {
+        const auto& state = *static_cast<const Impl*>(generic->GetAuxiliary());
+        const auto& handle = *static_cast<const ObjectHandle*>(generic->GetObject());
+        const auto& value = ArgumentVector(generic);
+
+        try
+        {
+            if(!state.Resolves(handle))
+            {
+                RaiseScriptException("SceneObject is not valid.");
+                return;
+            }
+
+            const float rotation[3] = {value.x, value.y, value.z};
+            std::string error;
+
+            if(!state.resolver->SetLocalRotation(handle.slot, rotation, error))
+            {
+                RaiseScriptException(Bounded(error).c_str());
+            }
+        }
+        catch(...)
+        {
+            RaiseScriptException("SceneObject rotation request failed.");
+        }
+    }
+
+    static void InputWasKeyPressed(asIScriptGeneric* generic)
+    {
+        InputQuery(generic, true);
+    }
+
+    static void ObjectGetPosition(asIScriptGeneric* generic)
+    {
+        const auto& state = *static_cast<const Impl*>(generic->GetAuxiliary());
+        const auto& handle = *static_cast<const ObjectHandle*>(generic->GetObject());
+        float position[3] = {};
+
+        try
+        {
+            if(!state.Resolves(handle) || !state.resolver->GetPosition(handle.slot, position))
+            {
+                if(auto* context = asGetActiveContext())
+                {
+                    context->SetException("SceneObject is not valid.");
+                }
+
+                return;
+            }
+
+            ScriptVector3 value{position[0], position[1], position[2]};
+            generic->SetReturnObject(&value);
+        }
+        catch(...)
+        {
+            if(auto* context = asGetActiveContext())
+            {
+                context->SetException("SceneObject position is unavailable.");
+            }
+        }
+    }
 };
 
 ScriptHost::ScriptHost() : m_impl(std::make_unique<Impl>())
 {
 }
 
-ScriptHost::~ScriptHost() = default;
+ScriptHost::~ScriptHost()
+{
+    m_impl->Release();
+}
 
 Result ScriptHost::Initialize()
 {
@@ -275,8 +1127,7 @@ Result ScriptHost::InitializeWithLogDeclaration(const char* declaration)
         return {Status::InvalidRequest};
     }
 
-    state.module.reset();
-    state.engine.reset();
+    state.Release();
     state.result = {Status::Failed};
     std::unique_ptr<asIScriptEngine, EngineDeleter> candidate(asCreateScriptEngine(ANGELSCRIPT_VERSION));
 
@@ -297,7 +1148,7 @@ Result ScriptHost::InitializeWithLogDeclaration(const char* declaration)
     try
     {
         require(candidate->SetMessageCallback(asFUNCTION(Impl::Message), &state, asCALL_CDECL));
-        // No global initializer or module teardown script execution is admitted by AS.2.
+        // No global initializer or module teardown script execution is admitted.
         require(candidate->SetEngineProperty(asEP_DISALLOW_GLOBAL_VARS, true));
         require(candidate->SetEngineProperty(asEP_INIT_GLOBAL_VARS_AFTER_BUILD, false));
         require(candidate->SetEngineProperty(asEP_MAX_STACK_SIZE, 256 * 1024));
@@ -312,6 +1163,124 @@ Result ScriptHost::InitializeWithLogDeclaration(const char* declaration)
         require(candidate->SetDefaultNamespace("Log"));
         require(candidate->RegisterGlobalFunction(declaration, asFUNCTION(Impl::Info), asCALL_CDECL_OBJLAST, &state));
         require(candidate->SetDefaultNamespace(""));
+
+        // AS.5 value types. Generic calling convention avoids native ABI assumptions for
+        // by-value returns; both types are plain data copied bitwise and constructed zeroed.
+        const asDWORD vectorFlags = asOBJ_VALUE | asOBJ_POD | asOBJ_APP_CLASS_C | asOBJ_APP_CLASS_ALLFLOATS;
+        require(candidate->RegisterObjectType("Vector3", sizeof(ScriptVector3), vectorFlags));
+        require(candidate->RegisterObjectBehaviour("Vector3", asBEHAVE_CONSTRUCT, "void f()",
+            asFUNCTION(ConstructVector3), asCALL_GENERIC));
+        require(candidate->RegisterObjectBehaviour("Vector3", asBEHAVE_CONSTRUCT, "void f(float, float, float)",
+            asFUNCTION(ConstructVector3Components), asCALL_GENERIC));
+        require(candidate->RegisterObjectProperty("Vector3", "float x", offsetof(ScriptVector3, x)));
+        require(candidate->RegisterObjectProperty("Vector3", "float y", offsetof(ScriptVector3, y)));
+        require(candidate->RegisterObjectProperty("Vector3", "float z", offsetof(ScriptVector3, z)));
+        require(candidate->RegisterObjectMethod("Vector3", "Vector3 opAdd(const Vector3 &in) const",
+            asFUNCTION(VectorAdd), asCALL_GENERIC));
+        require(candidate->RegisterObjectMethod("Vector3", "Vector3 opSub(const Vector3 &in) const",
+            asFUNCTION(VectorSubtract), asCALL_GENERIC));
+        require(candidate->RegisterObjectMethod("Vector3", "Vector3 opMul(float) const",
+            asFUNCTION(VectorScale), asCALL_GENERIC));
+        require(candidate->RegisterObjectMethod("Vector3", "Vector3 opMul_r(float) const",
+            asFUNCTION(VectorScale), asCALL_GENERIC));
+        require(candidate->RegisterObjectMethod("Vector3", "Vector3 opDiv(float) const",
+            asFUNCTION(VectorDivide), asCALL_GENERIC));
+        require(candidate->RegisterObjectMethod("Vector3", "Vector3 opNeg() const",
+            asFUNCTION(VectorNegate), asCALL_GENERIC));
+        require(candidate->RegisterObjectMethod("Vector3", "Vector3 &opAddAssign(const Vector3 &in)",
+            asFUNCTION(VectorAddAssign), asCALL_GENERIC));
+        require(candidate->RegisterObjectMethod("Vector3", "Vector3 &opSubAssign(const Vector3 &in)",
+            asFUNCTION(VectorSubtractAssign), asCALL_GENERIC));
+        require(candidate->RegisterObjectMethod("Vector3", "Vector3 &opMulAssign(float)",
+            asFUNCTION(VectorScaleAssign), asCALL_GENERIC));
+        require(candidate->RegisterObjectMethod("Vector3", "float Length() const",
+            asFUNCTION(VectorLength), asCALL_GENERIC));
+        require(candidate->RegisterObjectMethod("Vector3", "Vector3 Normalized() const",
+            asFUNCTION(VectorNormalized), asCALL_GENERIC));
+
+        // AS.6B Vector2 for mouse deltas.
+        const asDWORD vector2Flags = asOBJ_VALUE | asOBJ_POD | asOBJ_APP_CLASS_C | asOBJ_APP_CLASS_ALLFLOATS;
+        require(candidate->RegisterObjectType("Vector2", sizeof(ScriptVector2), vector2Flags));
+        require(candidate->RegisterObjectBehaviour("Vector2", asBEHAVE_CONSTRUCT, "void f()",
+            asFUNCTION(ConstructVector2), asCALL_GENERIC));
+        require(candidate->RegisterObjectBehaviour("Vector2", asBEHAVE_CONSTRUCT, "void f(float, float)",
+            asFUNCTION(ConstructVector2Components), asCALL_GENERIC));
+        require(candidate->RegisterObjectProperty("Vector2", "float x", offsetof(ScriptVector2, x)));
+        require(candidate->RegisterObjectProperty("Vector2", "float y", offsetof(ScriptVector2, y)));
+        require(candidate->RegisterObjectMethod("Vector2", "Vector2 opAdd(const Vector2 &in) const",
+            asFUNCTION(Vector2Add), asCALL_GENERIC));
+        require(candidate->RegisterObjectMethod("Vector2", "Vector2 opSub(const Vector2 &in) const",
+            asFUNCTION(Vector2Subtract), asCALL_GENERIC));
+        require(candidate->RegisterObjectMethod("Vector2", "Vector2 opMul(float) const",
+            asFUNCTION(Vector2Scale), asCALL_GENERIC));
+        require(candidate->RegisterObjectMethod("Vector2", "Vector2 opMul_r(float) const",
+            asFUNCTION(Vector2Scale), asCALL_GENERIC));
+        require(candidate->RegisterObjectMethod("Vector2", "float Length() const",
+            asFUNCTION(Vector2Length), asCALL_GENERIC));
+
+        require(candidate->SetDefaultNamespace("Math"));
+        require(candidate->RegisterGlobalFunction("float Sin(float)", asFUNCTION(MathSin), asCALL_GENERIC));
+        require(candidate->RegisterGlobalFunction("float Cos(float)", asFUNCTION(MathCos), asCALL_GENERIC));
+        require(candidate->RegisterGlobalFunction("float Clamp(float, float, float)", asFUNCTION(MathClamp), asCALL_GENERIC));
+        require(candidate->RegisterGlobalFunction("float ToRadians(float)", asFUNCTION(MathToRadians), asCALL_GENERIC));
+        require(candidate->RegisterGlobalProperty("const float Pi", const_cast<float*>(&MathPi)));
+        require(candidate->SetDefaultNamespace(""));
+
+        // AS.6A keys and gameplay input queries.
+        require(candidate->RegisterEnum("Key"));
+        require(candidate->RegisterEnumValue("Key", "W", static_cast<int>(Key::W)));
+        require(candidate->RegisterEnumValue("Key", "A", static_cast<int>(Key::A)));
+        require(candidate->RegisterEnumValue("Key", "S", static_cast<int>(Key::S)));
+        require(candidate->RegisterEnumValue("Key", "D", static_cast<int>(Key::D)));
+        require(candidate->RegisterEnumValue("Key", "Space", static_cast<int>(Key::Space)));
+        require(candidate->SetDefaultNamespace("Input"));
+        require(candidate->RegisterGlobalFunction("bool IsKeyDown(Key)", asFUNCTION(Impl::InputIsKeyDown),
+            asCALL_GENERIC, &state));
+        require(candidate->RegisterGlobalFunction("bool WasKeyPressed(Key)", asFUNCTION(Impl::InputWasKeyPressed),
+            asCALL_GENERIC, &state));
+        require(candidate->RegisterGlobalFunction("Vector2 GetMouseDelta()", asFUNCTION(Impl::InputGetMouseDelta),
+            asCALL_GENERIC, &state));
+        require(candidate->RegisterGlobalFunction("void SetCursorLocked(bool)", asFUNCTION(Impl::InputSetCursorLocked),
+            asCALL_GENERIC, &state));
+        require(candidate->SetDefaultNamespace(""));
+
+        const asDWORD objectFlags = asOBJ_VALUE | asOBJ_POD | asOBJ_APP_CLASS_C | asOBJ_APP_CLASS_ALLINTS;
+        require(candidate->RegisterObjectType("SceneObject", sizeof(ObjectHandle), objectFlags));
+        require(candidate->RegisterObjectBehaviour("SceneObject", asBEHAVE_CONSTRUCT, "void f()",
+            asFUNCTION(ConstructObjectHandle), asCALL_GENERIC));
+        require(candidate->RegisterObjectMethod("SceneObject", "bool IsValid() const",
+            asFUNCTION(Impl::ObjectIsValid), asCALL_GENERIC, &state));
+        require(candidate->RegisterObjectMethod("SceneObject", "string GetName() const",
+            asFUNCTION(Impl::ObjectGetName), asCALL_GENERIC, &state));
+        require(candidate->RegisterObjectMethod("SceneObject", "Vector3 GetPosition() const",
+            asFUNCTION(Impl::ObjectGetPosition), asCALL_GENERIC, &state));
+
+        require(candidate->RegisterObjectType("CharacterController", sizeof(ObjectHandle), objectFlags));
+        require(candidate->RegisterObjectBehaviour("CharacterController", asBEHAVE_CONSTRUCT, "void f()",
+            asFUNCTION(ConstructObjectHandle), asCALL_GENERIC));
+        require(candidate->RegisterObjectMethod("CharacterController", "bool IsValid() const",
+            asFUNCTION(Impl::ControllerIsValid), asCALL_GENERIC, &state));
+        require(candidate->RegisterObjectMethod("CharacterController", "void Move(const Vector3 &in)",
+            asFUNCTION(Impl::ControllerMove), asCALL_GENERIC, &state));
+        require(candidate->RegisterObjectMethod("CharacterController", "void Jump()",
+            asFUNCTION(Impl::ControllerJump), asCALL_GENERIC, &state));
+        require(candidate->RegisterObjectMethod("CharacterController", "bool IsGrounded() const",
+            asFUNCTION(Impl::ControllerIsGrounded), asCALL_GENERIC, &state));
+        require(candidate->RegisterObjectMethod("SceneObject", "CharacterController GetCharacterController() const",
+            asFUNCTION(Impl::ObjectGetCharacterController), asCALL_GENERIC, &state));
+        require(candidate->RegisterObjectMethod("CharacterController", "float GetYaw() const",
+            asFUNCTION(Impl::ControllerGetYaw), asCALL_GENERIC, &state));
+        require(candidate->RegisterObjectMethod("CharacterController", "void SetYaw(float)",
+            asFUNCTION(Impl::ControllerSetYaw), asCALL_GENERIC, &state));
+        require(candidate->RegisterObjectMethod("SceneObject", "SceneObject FindChild(const string &in) const",
+            asFUNCTION(Impl::ObjectFindChild), asCALL_GENERIC, &state));
+        require(candidate->RegisterObjectMethod("SceneObject", "Vector3 GetLocalRotation() const",
+            asFUNCTION(Impl::ObjectGetLocalRotation), asCALL_GENERIC, &state));
+        require(candidate->RegisterObjectMethod("SceneObject", "void SetLocalRotation(const Vector3 &in)",
+            asFUNCTION(Impl::ObjectSetLocalRotation), asCALL_GENERIC, &state));
+        require(candidate->RegisterObjectMethod("SceneObject", "Vector3 GetForward() const",
+            asFUNCTION(Impl::ObjectGetForward), asCALL_GENERIC, &state));
+
         // Build an empty module to validate the complete configuration, including the
         // upstream string add-on whose registration entry point returns void.
         std::unique_ptr<asIScriptModule, ModuleDeleter> probe(candidate->GetModule("configuration", asGM_ALWAYS_CREATE));
@@ -324,6 +1293,7 @@ Result ScriptHost::InitializeWithLogDeclaration(const char* declaration)
         require(probe->Build());
         probe.reset();
         state.engine = std::move(candidate);
+        state.world = ++g_worldCounter;
         state.result.status = Status::Ready;
     }
     catch(const std::exception& error)
@@ -343,8 +1313,7 @@ Result ScriptHost::Shutdown()
         return {Status::InvalidRequest};
     }
 
-    state.module.reset();
-    state.engine.reset();
+    state.Release();
     state.section.clear();
     state.result = {Status::NotInitialized};
     return state.result;
@@ -387,9 +1356,10 @@ Result ScriptHost::Compile(std::string_view section, std::string_view source)
         return state.result;
     }
 
+    // The isolated AS.2 path runs global functions only; classes run through behaviour modules.
     if(candidate->GetObjectTypeCount() != 0)
     {
-        AddDiagnostic(state.result, "Script classes/interfaces are deferred to the Play-scoped host.", section);
+        AddDiagnostic(state.result, "Script classes run only as EAScript behaviours, not in the isolated host.", section);
         return state.result;
     }
 
@@ -399,6 +1369,18 @@ Result ScriptHost::Compile(std::string_view section, std::string_view source)
 }
 
 Result ScriptHost::ValidateSources(std::string_view rootSection, const SourceReader& reader, SourceLimits limits)
+{
+    return BuildClosure(rootSection, reader, limits, nullptr);
+}
+
+Result ScriptHost::BuildSources(std::string_view rootSection, const SourceReader& reader, ModuleID& module,
+    SourceLimits limits)
+{
+    return BuildClosure(rootSection, reader, limits, &module);
+}
+
+Result ScriptHost::BuildClosure(std::string_view rootSection, const SourceReader& reader, SourceLimits limits,
+    ModuleID* keep)
 {
     auto& state = *m_impl;
 
@@ -415,6 +1397,7 @@ Result ScriptHost::ValidateSources(std::string_view rootSection, const SourceRea
     state.module.reset();
     state.result = {Status::Failed};
     SourceCollection collection{reader, limits, state.result};
+    std::unique_ptr<asIScriptModule, ModuleDeleter> built;
     struct ValidationScope
     {
         bool& busy;
@@ -438,24 +1421,28 @@ Result ScriptHost::ValidateSources(std::string_view rootSection, const SourceRea
         CanonicalScriptSection(rootSection);
         CScriptBuilder builder;
         builder.SetIncludeCallback(SourceCollection::Include, &collection);
+        const std::string moduleName = keep ? "behaviour-" + std::to_string(state.behaviours.size()) : "validation-only";
 
-        if(builder.StartNewModule(state.engine.get(), "validation-only") < 0)
+        if(builder.StartNewModule(state.engine.get(), moduleName.c_str()) < 0)
         {
             throw std::runtime_error("Cannot prepare source validation module.");
         }
 
-        std::unique_ptr<asIScriptModule, ModuleDeleter> module(builder.GetModule());
+        built.reset(builder.GetModule());
+
+        // The engine section is part of every module but never of the project source closure.
+        if(builder.AddSectionFromMemory(EAScriptSection, EAScriptSource) < 0)
+        {
+            throw std::runtime_error("Cannot add the EAScript engine section.");
+        }
+
         collection.Load(std::string(rootSection), builder);
         collection.snapshot.complete = true;
-        const int built = builder.BuildModule();
 
-        if(built >= 0 && module->GetObjectTypeCount() == 0)
+        if(builder.BuildModule() >= 0)
         {
+            state.result.classes = FindBehaviourClasses(*built);
             state.result.status = Status::Compiled;
-        }
-        else if(built >= 0)
-        {
-            AddDiagnostic(state.result, "Script classes/interfaces remain deferred; validation does not instantiate them.", rootSection);
         }
     }
     catch(const std::exception& error)
@@ -469,30 +1456,34 @@ Result ScriptHost::ValidateSources(std::string_view rootSection, const SourceRea
     }
 
     collection.snapshot.revision = SourceClosureRevision(collection.snapshot);
+    AttributeDiagnostics(state.result, collection.snapshot);
+    state.result.snapshot = std::make_shared<const SourceSnapshot>(std::move(collection.snapshot));
 
-    for(auto& diagnostic : state.result.diagnostics)
+    if(keep && state.result.status == Status::Compiled)
     {
-        diagnostic.assetReference = collection.snapshot.rootAsset;
-        diagnostic.sourceRevision = collection.snapshot.revision;
-
-        for(const auto& source : collection.snapshot.sections)
-        {
-            if(source.name == diagnostic.section)
-            {
-                diagnostic.assetReference = source.assetReference;
-                break;
-            }
-        }
+        *keep = state.behaviours.size();
+        state.behaviours.push_back({std::move(built), state.result.snapshot});
     }
 
-    state.result.snapshot = std::make_shared<const SourceSnapshot>(std::move(collection.snapshot));
     return state.result;
 }
 
 Result ScriptHost::ValidateSnapshot(const SourceSnapshot& snapshot, SourceLimits limits)
 {
+    return BuildSnapshotClosure(snapshot, limits, nullptr);
+}
+
+Result ScriptHost::BuildSnapshot(const SourceSnapshot& snapshot, ModuleID& module, SourceLimits limits)
+{
+    return BuildSnapshotClosure(snapshot, limits, &module);
+}
+
+Result ScriptHost::BuildSnapshotClosure(const SourceSnapshot& snapshot, SourceLimits limits, ModuleID* keep)
+{
+    const std::size_t behavioursBefore = m_impl->behaviours.size();
+
     // Reapply include/path/closure policy to memory-only data. No filesystem fallback.
-    auto result = ValidateSources(snapshot.rootSection, [&](std::string_view name)
+    auto result = BuildClosure(snapshot.rootSection, [&](std::string_view name)
     {
         const SourceSection* match = nullptr;
 
@@ -515,11 +1506,12 @@ Result ScriptHost::ValidateSnapshot(const SourceSnapshot& snapshot, SourceLimits
         }
 
         return *match;
-    }, limits);
+    }, limits, keep);
 
     if(result.snapshot && snapshot.complete && result.snapshot->revision != snapshot.revision)
     {
         result.status = Status::Failed;
+        result.classes.clear();
         const auto previousCount = result.diagnostics.size();
         AddDiagnostic(result, "Snapshot digest/identity or unused-section mismatch.", snapshot.rootSection);
 
@@ -528,6 +1520,12 @@ Result ScriptHost::ValidateSnapshot(const SourceSnapshot& snapshot, SourceLimits
             auto& diagnostic = result.diagnostics.back();
             diagnostic.assetReference = snapshot.rootAsset;
             diagnostic.sourceRevision = result.snapshot->revision;
+        }
+
+        // A mismatched snapshot never leaves an executable module behind.
+        if(m_impl->behaviours.size() > behavioursBefore)
+        {
+            m_impl->behaviours.pop_back();
         }
     }
 
@@ -551,8 +1549,7 @@ Result ScriptHost::Execute(std::string_view declaration, ExecutionLimits limits)
     state.result = {Status::Failed};
 
     if(!state.module || declaration.empty() || declaration.size() > 256 ||
-        declaration.find('\0') != std::string_view::npos || limits.statements == 0 ||
-        limits.timeout.count() <= 0 || limits.timeout > std::chrono::seconds(10))
+        declaration.find('\0') != std::string_view::npos || !ValidLimits(limits))
     {
         AddDiagnostic(state.result, "Execution requires a compiled module and bounded limits.");
         state.result.status = Status::InvalidRequest;
@@ -576,63 +1573,198 @@ Result ScriptHost::Execute(std::string_view declaration, ExecutionLimits limits)
         return state.result;
     }
 
-    Budget budget{limits.statements, std::chrono::steady_clock::now() + limits.timeout};
-    std::unique_ptr<asIScriptContext, ContextDeleter> context(state.engine->CreateContext());
+    state.Run(*function, nullptr, limits, state.section, nullptr);
+    return state.result;
+}
 
-    if(!context || context->Prepare(function) < 0 ||
-        context->SetLineCallback(asFUNCTION(CheckBudget), &budget, asCALL_CDECL) < 0)
+Result ScriptHost::CreateInstance(ModuleID module, std::string_view className, std::uint32_t ownerSlot,
+    InstanceID& instance, ExecutionLimits limits)
+{
+    auto& state = *m_impl;
+
+    if(!state.IsAvailable())
     {
-        AddDiagnostic(state.result, "Cannot prepare bounded execution context.");
+        return {Status::InvalidRequest};
+    }
+
+    if(!state.engine)
+    {
+        return {Status::NotInitialized};
+    }
+
+    state.result = {Status::Failed};
+
+    if(module >= state.behaviours.size() || !ValidLimits(limits))
+    {
+        AddDiagnostic(state.result, "Instance creation requires a built module and bounded limits.");
+        state.result.status = Status::InvalidRequest;
         return state.result;
     }
 
-    struct ExecutionScope
-    {
-        bool& active;
-        ~ExecutionScope()
-        {
-            active = false;
-        }
-    } executionScope{state.executing};
+    const auto& behaviour = state.behaviours[module];
+    const auto& snapshot = *behaviour.snapshot;
+    const auto classes = FindBehaviourClasses(*behaviour.module);
 
-    state.executing = true;
-    state.logCount = 0;
-    const int execution = context->Execute();
-
-    if(execution == asEXECUTION_FINISHED)
+    if(std::find(classes.begin(), classes.end(), className) == classes.end())
     {
-        state.result.status = Status::Finished;
+        AddDiagnostic(state.result, "Class '" + std::string(className) + "' is not an instantiable EAScript class.",
+            snapshot.rootSection);
+        state.result.status = Status::MissingFunction;
+        AttributeDiagnostics(state.result, snapshot);
+        return state.result;
     }
-    else if(budget.exceeded)
-    {
-        state.result.status = Status::BudgetExceeded;
-        AddDiagnostic(state.result, "Script execution budget exceeded; context aborted.", state.section);
-    }
-    else if(execution == asEXECUTION_EXCEPTION)
-    {
-        state.result.status = Status::Exception;
-        const char* section = nullptr;
-        int column = 0;
-        const int line = context->GetExceptionLineNumber(&column, &section);
-        AddDiagnostic(state.result, context->GetExceptionString(), section ? section : "", line, column);
 
-        for(asUINT index = 0; index < (std::min)(context->GetCallstackSize(), asUINT(8)); ++index)
+    asITypeInfo* type = nullptr;
+
+    for(asUINT index = 0; index < behaviour.module->GetObjectTypeCount() && !type; ++index)
+    {
+        auto* candidate = behaviour.module->GetObjectTypeByIndex(index);
+
+        if(candidate && QualifiedName(*candidate) == className)
         {
-            auto* frame = context->GetFunction(index);
-
-            if(frame)
-            {
-                AddDiagnostic(state.result, frame->GetDeclaration(), state.section, context->GetLineNumber(index), 0, "Stack");
-            }
+            type = candidate;
         }
     }
-    else
+
+    auto* factory = type ? FindDefaultFactory(*type) : nullptr;
+
+    if(!factory)
     {
-        state.result.status = execution == asEXECUTION_SUSPENDED ? Status::Suspended : Status::Failed;
-        AddDiagnostic(state.result, "Unexpected execution status " + std::to_string(execution) +
-            "; context discarded without resumption.", state.section);
+        AddDiagnostic(state.result, "Class '" + std::string(className) + "' has no default constructor.", snapshot.rootSection);
+        AttributeDiagnostics(state.result, snapshot);
+        return state.result;
     }
 
+    asIScriptObject* created = nullptr;
+    state.Run(*factory, nullptr, limits, snapshot.rootSection, &created);
+    std::unique_ptr<asIScriptObject, ObjectDeleter> object(created);
+
+    if(state.result.status != Status::Finished || !object)
+    {
+        if(state.result.status == Status::Finished)
+        {
+            state.result.status = Status::Failed;
+            AddDiagnostic(state.result, "Constructor returned no object.", snapshot.rootSection);
+        }
+
+        AttributeDiagnostics(state.result, snapshot);
+        return state.result;
+    }
+
+    // Bind the owner after construction: the handle is valid from OnStart onwards.
+    bool bound = false;
+
+    for(asUINT index = 0; index < object->GetPropertyCount() && !bound; ++index)
+    {
+        if(std::strcmp(object->GetPropertyName(index), OwnerProperty) == 0)
+        {
+            *static_cast<ObjectHandle*>(object->GetAddressOfProperty(index)) = {state.world, ownerSlot, 0};
+            bound = true;
+        }
+    }
+
+    if(!bound)
+    {
+        state.result.status = Status::Failed;
+        AddDiagnostic(state.result, "EAScript owner property is missing.", snapshot.rootSection);
+        return state.result;
+    }
+
+    instance = state.instances.size();
+    state.instances.push_back({std::move(object), module});
     return state.result;
+}
+
+Result ScriptHost::Invoke(InstanceID instance, Lifecycle callback, ExecutionLimits limits)
+{
+    auto& state = *m_impl;
+
+    if(!state.IsAvailable())
+    {
+        return {Status::InvalidRequest};
+    }
+
+    if(!state.engine)
+    {
+        return {Status::NotInitialized};
+    }
+
+    state.result = {Status::Failed};
+
+    if(instance >= state.instances.size() || !ValidLimits(limits))
+    {
+        AddDiagnostic(state.result, "Lifecycle call requires a live instance and bounded limits.");
+        state.result.status = Status::InvalidRequest;
+        return state.result;
+    }
+
+    auto& target = state.instances[instance];
+    const auto& snapshot = *state.behaviours[target.module].snapshot;
+    const char* declaration = callback == Lifecycle::Start ? "void OnStart()" : "void OnStop()";
+    // Virtual lookup: the most derived override, or EAScript's empty default.
+    auto* method = target.object->GetObjectType()->GetMethodByDecl(declaration);
+
+    if(!method)
+    {
+        AddDiagnostic(state.result, std::string("Missing lifecycle method: ") + declaration, snapshot.rootSection);
+        state.result.status = Status::MissingFunction;
+        AttributeDiagnostics(state.result, snapshot);
+        return state.result;
+    }
+
+    state.Run(*method, target.object.get(), limits, snapshot.rootSection, nullptr);
+    AttributeDiagnostics(state.result, snapshot);
+    return state.result;
+}
+
+Result ScriptHost::Update(InstanceID instance, float deltaTime, ExecutionLimits limits)
+{
+    auto& state = *m_impl;
+
+    if(!state.IsAvailable())
+    {
+        return {Status::InvalidRequest};
+    }
+
+    if(!state.engine)
+    {
+        return {Status::NotInitialized};
+    }
+
+    state.result = {Status::Failed};
+
+    if(instance >= state.instances.size() || !ValidLimits(limits) || !std::isfinite(deltaTime) || deltaTime < 0.0f)
+    {
+        AddDiagnostic(state.result, "Update requires a live instance, bounded limits and a finite delta time.");
+        state.result.status = Status::InvalidRequest;
+        return state.result;
+    }
+
+    auto& target = state.instances[instance];
+    const auto& snapshot = *state.behaviours[target.module].snapshot;
+    // Virtual lookup: the most derived override, or EAScript's empty default.
+    auto* method = target.object->GetObjectType()->GetMethodByDecl("void OnUpdate(float)");
+
+    if(!method)
+    {
+        AddDiagnostic(state.result, "Missing lifecycle method: void OnUpdate(float)", snapshot.rootSection);
+        state.result.status = Status::MissingFunction;
+        AttributeDiagnostics(state.result, snapshot);
+        return state.result;
+    }
+
+    state.Run(*method, target.object.get(), limits, snapshot.rootSection, nullptr, &deltaTime);
+    AttributeDiagnostics(state.result, snapshot);
+    return state.result;
+}
+
+void ScriptHost::SetObjectResolver(ObjectResolver* resolver) noexcept
+{
+    m_impl->resolver = resolver;
+}
+
+void ScriptHost::SetInputSource(InputSource* input) noexcept
+{
+    m_impl->input = input;
 }
 }

@@ -40,7 +40,7 @@ struct RenderObject
 
         const Matrix4 current = presentationPose
             ? Physics::ComposeRuntimeModelMatrix(*presentationPose, transform.scale)
-            : transform.GetModelMatrix();
+            : (runtimeLocal ? runtimeLocal->GetModelMatrix() : transform.GetModelMatrix());
         return {current, previousHierarchyWorld.value_or(
             previousPresentedModel.value_or(previousTransform.GetModelMatrix()))};
     }
@@ -61,6 +61,8 @@ private:
     friend class Scene;
     // Scene owns these copied values. Candidates may copy them, but never own bodies.
     std::optional<Physics::Pose> presentationPose;
+    // AS.6B gameplay-only local transform (never authored); exclusive with presentationPose.
+    std::optional<Transform> runtimeLocal;
     std::optional<Matrix4> previousPresentedModel;
     bool presentationDirty = false;
 

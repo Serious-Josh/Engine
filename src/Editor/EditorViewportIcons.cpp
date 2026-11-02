@@ -105,7 +105,8 @@ std::optional<size_t> Editor::PickViewportIcon(const IDemoScene& scene, ImVec2 m
 
 void Editor::DrawViewportTools(IDemoScene& scene, const EditorIcons& icons, bool viewportWasFocused)
 {
-    if(m_viewportImage.size.x <= 0 || m_viewportImage.size.y <= 0)
+    // Game Play hides selection, gizmos and icons; picking cannot select through the game view.
+    if(m_viewportImage.size.x <= 0 || m_viewportImage.size.y <= 0 || IsGamePlaying())
     {
         m_viewportGizmoInteractive = false;
         m_viewportIcons.clear();

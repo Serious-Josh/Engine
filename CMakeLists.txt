@@ -326,9 +326,13 @@ add_library(EngineCore OBJECT
     src/Scene/SceneLightCapture.cpp
     src/Engine/PhysicsSimulationController.cpp
     src/Engine/EditorPhysicsSimulation.cpp
-    src/Engine/PackagedPhysicsSimulation.cpp
+    src/Engine/PackagedGame.cpp
+    src/Engine/GameRuntime.cpp
+    src/Engine/EditorGamePlay.cpp
     src/Engine/CharacterDriveScheduling.cpp
     src/Editor/PhysicsSimulationControls.cpp
+    src/Editor/GamePlayControls.cpp
+    src/Editor/ScriptControls.cpp
     src/Scene/FileSceneAssetCatalog.cpp
     src/Scene/SceneMetadataPreparation.cpp
     src/Scene/MeshResidency.cpp

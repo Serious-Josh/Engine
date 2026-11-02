@@ -5,6 +5,7 @@
 
 #include <chrono>
 #include <functional>
+#include <optional>
 #include <filesystem>
 #include <vector>
 
@@ -41,6 +42,19 @@ class WindowsWindow
 
     void* GetNativeHandle() const;
 
+    // AS.6B gameplay cursor lock: confines the cursor to a client-space rectangle and hides it,
+    // or releases it (nullopt). Hosts call this every frame; focus loss releases it immediately.
+    struct CursorRectangle
+    {
+        int left = 0;
+        int top = 0;
+        int right = 0;
+        int bottom = 0;
+    };
+    void SetCursorConfinement(const std::optional<CursorRectangle>& clientRectangle);
+    bool IsCursorConfined() const noexcept { return m_cursorConfined; }
+    void ReleaseCursorConfinement();
+
     void SetEventCallback(EventCallback callback);
     void DispatchEvent(const Event& event);
 
@@ -61,4 +75,6 @@ class WindowsWindow
 
     unsigned int m_clientWidth = 0;
     unsigned int m_clientHeight = 0;
+
+    bool m_cursorConfined = false;
 };

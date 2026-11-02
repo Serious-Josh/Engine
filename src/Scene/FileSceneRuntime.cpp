@@ -325,6 +325,79 @@ bool FileSceneRuntime::SetObjectLight(const SceneObjectMetadata& selection,
     return true;
 }
 
+bool FileSceneRuntime::SetObjectScript(const SceneObjectMetadata& selection,
+    const std::optional<ScriptComponent>& expected,
+    const std::optional<ScriptComponent>& replacement, std::string* errorMessage)
+{
+    const auto fail = [&](const char* message)
+    {
+        if(errorMessage)
+        {
+            *errorMessage = message;
+        }
+
+        return false;
+    };
+
+    if(errorMessage)
+    {
+        errorMessage->clear();
+    }
+
+    if(m_archiveScene || HasPreparedScene() || m_materialAssignment || m_activePresentationAssociation)
+    {
+        return fail("Script authoring requires an idle editable scene.");
+    }
+
+    const auto current = GetObjectMetadata(selection.objectID, errorMessage);
+
+    if(!current)
+    {
+        return false;
+    }
+
+    if(current->sceneID != selection.sceneID || current->runtimeIdentity != selection.runtimeIdentity ||
+        current->structureRevision != selection.structureRevision || current->runtimeIndex != selection.runtimeIndex)
+    {
+        return fail("Script target belongs to a stale scene selection.");
+    }
+
+    const auto& objects = m_fileScene.GetDocument().objects;
+    const auto found = std::find_if(objects.begin(), objects.end(),
+        [&](const SceneObjectDocument& object) { return object.id == selection.objectID; });
+
+    if(found == objects.end() || found->script != expected)
+    {
+        return fail("Script changed since inspection; edit rejected.");
+    }
+
+    const size_t index = static_cast<size_t>(found - objects.begin());
+    SceneDocument candidate;
+
+    if(!CaptureSceneDocument(m_fileScene.GetDocument(), m_scene, m_objectMapping, candidate, errorMessage))
+    {
+        return false;
+    }
+
+    candidate.objects[index].script = replacement;
+
+    if(!ValidateSceneDocument(candidate, errorMessage))
+    {
+        return false;
+    }
+
+    if(expected == replacement)
+    {
+        return true;
+    }
+
+    // The copy may allocate, so it is made before the document is touched; the move cannot fail.
+    // Scripts are compiled from the current document at Play, so no renderer or physics state changes.
+    std::optional<ScriptComponent> accepted = replacement;
+    m_fileScene.EditDocument().objects[index].script = std::move(accepted);
+    return true;
+}
+
 bool FileSceneRuntime::SetObjectPhysics(const SceneObjectMetadata& selection,
     const std::optional<Physics::PhysicsComponent>& expected,
     const std::optional<Physics::PhysicsComponent>& replacement, std::string* errorMessage)
@@ -535,14 +608,42 @@ std::optional<SceneObjectMetadata> FileSceneRuntime::GetObjectMetadata(
         errorMessage->clear();
     }
 
-    const auto fail = [errorMessage](const char* message) -> std::optional<SceneObjectMetadata>
+    const SceneObjectDocument* selected = nullptr;
+
+    if(!ValidateObjectMetadataState(runtimeIndex, selected, errorMessage))
+    {
+        return std::nullopt;
+    }
+
+    if(!selected)
+    {
+        if(errorMessage)
+        {
+            *errorMessage = "Selected runtime object has no document metadata.";
+        }
+
+        return std::nullopt;
+    }
+
+    const auto& mapping = m_objectMapping;
+    return SceneObjectMetadata{selected->name, selected->meshReference, selected->materialReference,
+        selected->id, m_fileScene.GetDocument().id, runtimeIndex, m_instanceIdentity, mapping.structureRevision,
+        selected->materialSlotBindings, mapping.bindingRevisions[runtimeIndex]};
+}
+
+bool FileSceneRuntime::ValidateObjectMetadataState(std::optional<RenderObjectID> selectedIndex,
+    const SceneObjectDocument*& selected, std::string* errorMessage) const
+{
+    selected = nullptr;
+
+    const auto fail = [errorMessage](const char* message)
     {
         if(errorMessage)
         {
             *errorMessage = message;
         }
 
-        return std::nullopt;
+        return false;
     };
 
     if(!m_fileScene.HasDocument())
@@ -561,7 +662,7 @@ std::optional<SceneObjectMetadata> FileSceneRuntime::GetObjectMetadata(
         return fail("Scene object metadata mapping is stale or belongs to another scene.");
     }
 
-    if(runtimeIndex >= objects.size())
+    if(selectedIndex && *selectedIndex >= objects.size())
     {
         return fail("Selected runtime object index is out of range.");
     }
@@ -574,11 +675,10 @@ std::optional<SceneObjectMetadata> FileSceneRuntime::GetObjectMetadata(
 
     if(!ValidateSceneDocument(document, errorMessage))
     {
-        return std::nullopt;
+        return false;
     }
 
     std::vector<bool> visited(objects.size(), false);
-    const SceneObjectDocument* selected = nullptr;
 
     for(const auto& object : document.objects)
     {
@@ -597,20 +697,13 @@ std::optional<SceneObjectMetadata> FileSceneRuntime::GetObjectMetadata(
             return fail("Runtime asset bindings no longer match the committed scene objects.");
         }
 
-        if(index == runtimeIndex)
+        if(selectedIndex && index == *selectedIndex)
         {
             selected = &object;
         }
     }
 
-    if(!selected)
-    {
-        return fail("Selected runtime object has no document metadata.");
-    }
-
-    return SceneObjectMetadata{selected->name, selected->meshReference, selected->materialReference,
-        selected->id, document.id, runtimeIndex, m_instanceIdentity, mapping.structureRevision,
-        selected->materialSlotBindings, mapping.bindingRevisions[runtimeIndex]};
+    return true;
 }
 
 namespace

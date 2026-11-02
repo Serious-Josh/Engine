@@ -1,11 +1,33 @@
 #include "Engine/PhysicsSimulationController.h"
 #include "Scene/SceneDocumentAdapter.h"
 
+#include <chrono>
 #include <cmath>
 #include <limits>
 #include <stdexcept>
 #include <utility>
 #include <type_traits>
+
+namespace
+{
+// Diagnostics: milliseconds since `start`; measures the latest Update/Publish stages.
+double ElapsedMilliseconds(std::chrono::steady_clock::time_point start) noexcept
+{
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+}
+
+// Records the whole call's duration however it returns.
+struct TimedScope
+{
+    double& target;
+    std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+
+    ~TimedScope()
+    {
+        target = ElapsedMilliseconds(start);
+    }
+};
+}
 
 PhysicsSimulationController::PhysicsSimulationController(std::size_t maximumStepsPerUpdate)
     : m_maximumStepsPerUpdate(maximumStepsPerUpdate)
@@ -145,9 +167,14 @@ PhysicsSimulationController::Result PhysicsSimulationController::Update(
     {
         return {Status::InvalidInput, 0, "Elapsed time must be finite, nonnegative and keep accumulated debt within one day."};
     }
+    m_lastFrameTiming.updateReadiness = 0.0;
+    m_lastFrameTiming.updateSteps = 0.0;
+    m_lastFrameTiming.updateCapture = 0.0;
+    TimedScope updateScope{m_lastFrameTiming.update};
     try
     {
         std::string error;
+        const auto readinessStart = std::chrono::steady_clock::now();
         const auto readiness = runtime.CheckPhysicsPresentation(renderer, *m_association, *m_lease, error);
         if (readiness == PhysicsPresentationReadiness::Stale || readiness == PhysicsPresentationReadiness::Failed)
         {
@@ -157,6 +184,7 @@ PhysicsSimulationController::Result PhysicsSimulationController::Update(
         {
             return FailAndStop(runtime, renderer, error);
         }
+        m_lastFrameTiming.updateReadiness = ElapsedMilliseconds(readinessStart);
         m_lastUpdateSteps = 0;
         m_lastUpdateContactEvents.clear();
         m_lastUpdateContactNotifications.clear();
@@ -174,14 +202,18 @@ PhysicsSimulationController::Result PhysicsSimulationController::Update(
         // Due ticks use the shared tolerance and cap (ConsumeDueTicks); catch-up debt stays.
         m_accumulatedTicks += elapsedSeconds * 60.0;
         const std::size_t dueSteps = ConsumeDueTicks(m_accumulatedTicks, m_maximumStepsPerUpdate);
+        const auto stepsStart = std::chrono::steady_clock::now();
         while (m_lastUpdateSteps < dueSteps)
         {
             m_session->Step();
             ++m_lastUpdateSteps;
             ++m_totalSteps;
         }
+        m_lastFrameTiming.updateSteps = ElapsedMilliseconds(stepsStart);
+
         if (m_lastUpdateSteps != 0)
         {
+            const auto captureStart = std::chrono::steady_clock::now();
             // Every step's events, each tagged with its own fixed step, after all steps finished.
             m_lastUpdateContactEvents = m_session->TakeContactEvents();
             m_lastUpdateContactNotifications = m_session->SelectContactNotifications(m_lastUpdateContactEvents);
@@ -195,6 +227,7 @@ PhysicsSimulationController::Result PhysicsSimulationController::Update(
             m_snapshot.swap(snapshot);
             m_pendingCharacterDiagnostics = CaptureCharacterDiagnostics();
             m_pendingPresentation = true;
+            m_lastFrameTiming.updateCapture = ElapsedMilliseconds(captureStart);
         }
         return {Status::Updated, m_lastUpdateSteps};
     }
@@ -210,6 +243,8 @@ PhysicsSimulationController::Result PhysicsSimulationController::PublishAtBounda
     {
         return {Status::Failed, 0, "Publication requires the owning thread and an active simulation."};
     }
+    m_lastFrameTiming.publishApply = 0.0;
+    TimedScope publishScope{m_lastFrameTiming.publish};
     std::string error;
     const auto readiness = runtime.CheckPhysicsPresentation(renderer, *m_association, *m_lease, error);
     if (readiness == PhysicsPresentationReadiness::Retry)
@@ -229,10 +264,12 @@ PhysicsSimulationController::Result PhysicsSimulationController::PublishAtBounda
         if (m_pendingPresentation)
         {
             PhysicsPresentationLease acceptedLease;
+            const auto applyStart = std::chrono::steady_clock::now();
             if (!runtime.ApplyPhysicsPresentation(renderer, *m_association, *m_snapshot, error, &acceptedLease))
             {
                 return FailAndStop(runtime, renderer, error);
             }
+            m_lastFrameTiming.publishApply = ElapsedMilliseconds(applyStart);
             m_lease = acceptedLease;
             m_pendingPresentation = false;
 
@@ -285,6 +322,45 @@ bool PhysicsSimulationController::SubmitCharacterJump(std::uint64_t sessionGener
     }
 
     return m_session->SubmitCharacterJump(objectID, fixedStep, &error);
+}
+
+bool PhysicsSimulationController::SetCharacterYaw(std::uint64_t sessionGeneration, std::string_view objectID, float yaw,
+    std::string& error)
+{
+    if(!IsOwningThread() || m_state != State::Active || !m_session)
+    {
+        error = "Character yaw requires the owning thread and an active simulation.";
+        return false;
+    }
+
+    if(sessionGeneration == 0 || sessionGeneration != m_sessionGeneration)
+    {
+        error = "Character yaw belongs to a stopped or replaced simulation session.";
+        return false;
+    }
+
+    if(!m_session->SetCharacterYaw(objectID, yaw, &error))
+    {
+        return false;
+    }
+
+    // The rotated pose is presented at the next publication boundary, with or without a step.
+    auto snapshot = m_session->CapturePoses(&error);
+
+    if(!snapshot)
+    {
+        return false;
+    }
+
+    m_snapshot.swap(snapshot);
+    m_pendingCharacterDiagnostics = CaptureCharacterDiagnostics();
+    m_pendingPresentation = true;
+    return true;
+}
+
+std::optional<float> PhysicsSimulationController::GetCharacterYaw(std::string_view objectID) const
+{
+    return m_state == State::Active && m_session ? m_session->GetCharacterYaw(objectID) : std::nullopt;
 }
 
 std::size_t PhysicsSimulationController::ConsumeDueTicks(double& accumulatedTicks, std::size_t maximumSteps) noexcept

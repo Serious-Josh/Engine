@@ -51,6 +51,7 @@ public:
     void SetTextureStreamingEnabled(bool enabled) noexcept { m_textureStreamingEnabled = enabled; }
     void AdvanceTextureStreaming(ProjectTexturePreparationService& preparation, Renderer& renderer,
         const std::function<bool(const AssetID&, const MaterialAssetData&)>& mayPublish);
+    bool IsTextureStreamingSettled() const { return m_assets.IsTextureStreamingSettled(); }
 
     const std::filesystem::path& GetScenePath() const noexcept
     {
@@ -121,6 +122,8 @@ public:
     }
     bool SetObjectLight(const SceneObjectMetadata& selection, const std::optional<LightComponent>& expected,
         const std::optional<LightComponent>& replacement, std::string* errorMessage = nullptr);
+    bool SetObjectScript(const SceneObjectMetadata& selection, const std::optional<ScriptComponent>& expected,
+        const std::optional<ScriptComponent>& replacement, std::string* errorMessage = nullptr);
     bool ValidateObjectTransform(RenderObjectID index, const Transform& transform, std::string& error) const;
     bool RenameObject(const SceneObjectMetadata& selection, std::string_view expectedName,
         std::string name, std::string* errorMessage = nullptr,
@@ -212,6 +215,8 @@ private:
     friend class ViewportMaterialDropVerification;
     friend class ResidencyBatchVerification;
     friend class CausticVisibleVerification;
+    friend class GamePlayGPUVerification;
+    friend class ScriptWorkflowVerification;
 #endif
     // Engine retains both runtimes until checked candidate initialization/cleanup.
     std::unique_ptr<FileSceneRuntime> m_objectMutationCandidate;

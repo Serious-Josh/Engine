@@ -158,13 +158,37 @@ bool FileSceneRuntime::ValidatePhysicsPresentationAssociation(const Renderer& re
         error = "Physics presentation association belongs to an obsolete runtime or scene membership.";
         return false;
     }
+    // The scene-wide state GetObjectPresentation would revalidate for every object is checked once
+    // (O(N)); each identity is then compared with exactly the values that read would accept.
+    const SceneObjectDocument* unused = nullptr;
+
+    if (!ValidateObjectMetadataState(std::nullopt, unused, &error))
+    {
+        return false;
+    }
+
+    const auto& mapping = m_objectMapping;
+
     for (std::size_t index = 0; index < association.objects.size(); ++index)
     {
         const auto& identity = association.objects[index];
-        if (!GetObjectPresentation(identity, &error))
+        const auto found = mapping.idToRuntimeIndex.find(identity.objectID);
+
+        if (found == mapping.idToRuntimeIndex.end())
         {
+            error = "Scene object persistent ID is not present in the current runtime mapping.";
             return false;
         }
+
+        // The validated mapping is a bijection over document objects, so the slot has document metadata.
+        if (identity.sceneID != document.id || identity.runtimeIdentity != m_instanceIdentity ||
+            identity.structureRevision != mapping.structureRevision || identity.runtimeIndex != found->second ||
+            identity.bindingRevision != mapping.bindingRevisions[found->second])
+        {
+            error = "Presentation read belongs to a stale scene object or binding.";
+            return false;
+        }
+
         const auto& object = document.objects[index];
         if(object.id != identity.objectID || object.physics != association.components[index] ||
             object.triggerCollider != association.triggerComponents[index] ||
@@ -304,6 +328,8 @@ bool FileSceneRuntime::ClearPhysicsPresentation(Renderer& renderer, std::string&
         }
 
         m_scene.CommitPresentation({}, false);
+        // Gameplay runtime local transforms never outlive the simulation they ran beside.
+        m_scene.ClearRuntimeLocalTransforms();
         m_activePresentationAssociation.reset();
         return true;
     }

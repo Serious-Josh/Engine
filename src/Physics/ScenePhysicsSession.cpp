@@ -382,6 +382,7 @@ void ScenePhysicsSession::RegisterCharacterControllers(const SceneDocument& docu
         runtime.configuration = component;
         runtime.spawnPose = {object.transform.position, OrientationFromEulerRadians(object.transform.rotation)};
         runtime.pose = runtime.spawnPose;
+        runtime.yaw = object.transform.rotation.y;
         runtime.centerOffset = RotateVector(runtime.spawnPose.orientation, component.localOffset);
         const float halfCylinder = component.capsuleCylinderHeight * 0.5f;
         auto& settings = runtime.settings;
@@ -738,6 +739,67 @@ bool ScenePhysicsSession::SubmitCharacterMovement(std::string_view objectID, std
     }
 
     return true;
+}
+
+bool ScenePhysicsSession::SetCharacterYaw(std::string_view objectID, float yaw, std::string* errorMessage)
+{
+    const auto fail = [errorMessage](std::string message)
+    {
+        if(errorMessage)
+        {
+            *errorMessage = std::move(message);
+        }
+
+        return false;
+    };
+
+    const auto controller = m_characterControllers.find(objectID);
+
+    if(controller == m_characterControllers.end())
+    {
+        return fail("No Character Controller is registered for object " + std::string(objectID) + ".");
+    }
+
+    if(!std::isfinite(yaw))
+    {
+        return fail("Character yaw must be finite.");
+    }
+
+    auto& runtime = controller->second;
+    const Vector3& offset = runtime.configuration.localOffset;
+
+    // Rotating a sideways offset would swing the capsule into geometry without a sweep.
+    if(offset.x != 0.0f || offset.z != 0.0f)
+    {
+        return fail("Character yaw requires a capsule without a sideways local offset (x and z must be 0).");
+    }
+
+    Pose rotated = runtime.pose;
+    rotated.orientation = OrientationFromEulerRadians({0.0f, yaw, 0.0f});
+    std::string error;
+
+    if(!ValidateRuntimePose(rotated, &error))
+    {
+        return fail("Character yaw produced an invalid pose: " + error);
+    }
+
+    // The vertical offset is unchanged by a rotation about Y, so the capsule center stays put.
+    runtime.host.SetKinematicPose(rotated);
+    runtime.pose = rotated;
+    runtime.yaw = yaw;
+
+    if(errorMessage)
+    {
+        errorMessage->clear();
+    }
+
+    return true;
+}
+
+std::optional<float> ScenePhysicsSession::GetCharacterYaw(std::string_view objectID) const
+{
+    const auto controller = m_characterControllers.find(objectID);
+    return controller == m_characterControllers.end() ? std::nullopt : std::optional<float>(controller->second.yaw);
 }
 
 bool ScenePhysicsSession::SubmitCharacterJump(std::string_view objectID, std::uint64_t fixedStep,

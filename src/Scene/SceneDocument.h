@@ -4,6 +4,7 @@
 #include "Scene/SceneLightingSettings.h"
 #include "Scene/CameraComponent.h"
 #include "Scene/LightComponent.h"
+#include "Scene/ScriptComponent.h"
 #include "Physics/PhysicsComponent.h"
 #include "Physics/TriggerColliderComponent.h"
 #include "Physics/CharacterControllerComponent.h"
@@ -58,6 +59,9 @@ struct SceneObjectDocument
     // Optional authored light; owns no GPU resource. Persisted from schema 11 / cooked payload 11.
     std::optional<LightComponent> light;
 
+    // Optional script attachment; owns no instance. Persisted from schema 15 / cooked payload 16.
+    std::optional<ScriptComponent> script;
+
     // Empty means root; otherwise the exact ID of another object in this scene. Persisted from
     // schema 9 / cooked payload 9; historical versions load every object as a root.
     std::string parentID;
@@ -80,7 +84,8 @@ struct SceneDocument
     static constexpr std::uint32_t kObjectLightingSchemaVersion = 13;
     // Physical light units (PhotometricUnits.h); earlier versions are converted on load.
     static constexpr std::uint32_t kPhysicalLightingSchemaVersion = 14;
-    static constexpr std::uint32_t kSchemaVersion = kPhysicalLightingSchemaVersion;
+    static constexpr std::uint32_t kScriptSchemaVersion = 15;
+    static constexpr std::uint32_t kSchemaVersion = kScriptSchemaVersion;
 
     std::uint32_t schemaVersion = kSchemaVersion;
 

@@ -106,7 +106,7 @@ bool Editor::CommitObjectLight(IDemoScene& scene, const SceneObjectMetadata& sel
 {
     auto* owner = dynamic_cast<FileBackedDemoScene*>(&scene);
 
-    if(IsPhysicsEditingLocked() || !owner || !m_historySession ||
+    if(IsSceneEditingLocked() || !owner || !m_historySession ||
         !RenameSessionMatches(scene, *m_historySession) || HasPendingSceneHistoryOperation() ||
         m_sceneOperationPending || HasBlockingObjectCreation())
     {

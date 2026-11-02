@@ -153,4 +153,106 @@ std::string SourceClosureRevision(const SourceSnapshot& snapshot)
 
     return result;
 }
+namespace
+{
+constexpr std::uint32_t SnapshotMagic = 0x4E534145; // "EASN"
+constexpr std::uint32_t SnapshotVersion = 1;
+
+void PutUnsigned(std::vector<std::byte>& out, std::uint32_t value)
+{
+    for(int shift = 0; shift < 32; shift += 8)
+    {
+        out.push_back(static_cast<std::byte>((value >> shift) & 0xFF));
+    }
+}
+
+void PutText(std::vector<std::byte>& out, std::string_view text)
+{
+    PutUnsigned(out, static_cast<std::uint32_t>(text.size()));
+
+    for(const char character : text)
+    {
+        out.push_back(static_cast<std::byte>(character));
+    }
+}
+
+struct SnapshotReader
+{
+    std::span<const std::byte> bytes;
+    std::size_t cursor = 0;
+
+    std::uint32_t Unsigned()
+    {
+        Require(bytes.size() - cursor >= 4, "Truncated script snapshot.");
+        std::uint32_t value = 0;
+
+        for(int shift = 0; shift < 32; shift += 8)
+        {
+            value |= static_cast<std::uint32_t>(bytes[cursor++]) << shift;
+        }
+
+        return value;
+    }
+
+    std::string Text(std::size_t limit)
+    {
+        const auto length = Unsigned();
+        Require(length <= limit && bytes.size() - cursor >= length, "Invalid script snapshot string.");
+        std::string text(reinterpret_cast<const char*>(bytes.data() + cursor), length);
+        cursor += length;
+        return text;
+    }
+};
+}
+
+std::vector<std::byte> EncodeSnapshot(const SourceSnapshot& snapshot)
+{
+    Require(snapshot.complete && !snapshot.sections.empty(), "Only a complete script closure can be packaged.");
+    std::vector<std::byte> out;
+    PutUnsigned(out, SnapshotMagic);
+    PutUnsigned(out, SnapshotVersion);
+    PutText(out, snapshot.rootSection);
+    PutText(out, snapshot.rootAsset);
+    PutText(out, snapshot.revision);
+    PutUnsigned(out, static_cast<std::uint32_t>(snapshot.sections.size()));
+
+    for(const auto& section : snapshot.sections)
+    {
+        PutText(out, section.name);
+        PutText(out, section.assetReference);
+        PutText(out, section.bytes);
+    }
+
+    return out;
+}
+
+SourceSnapshot DecodeSnapshot(std::span<const std::byte> bytes, SourceLimits limits)
+{
+    SnapshotReader reader{bytes};
+    Require(reader.Unsigned() == SnapshotMagic && reader.Unsigned() == SnapshotVersion,
+        "Unsupported script snapshot format.");
+    SourceSnapshot snapshot;
+    snapshot.rootSection = reader.Text(1024);
+    snapshot.rootAsset = reader.Text(256);
+    snapshot.revision = reader.Text(64);
+    const auto count = reader.Unsigned();
+    Require(count != 0 && count <= limits.sections, "Invalid script snapshot section count.");
+    std::size_t total = 0;
+
+    for(std::uint32_t index = 0; index < count; ++index)
+    {
+        SourceSection section;
+        section.name = reader.Text(1024);
+        section.assetReference = reader.Text(256);
+        section.bytes = reader.Text(limits.sectionBytes);
+        total += section.bytes.size();
+        Require(total <= limits.totalBytes, "Script snapshot exceeds the closure size limit.");
+        snapshot.sections.push_back(std::move(section));
+    }
+
+    Require(reader.cursor == bytes.size(), "Trailing script snapshot bytes.");
+    snapshot.complete = true;
+    return snapshot;
+}
+
 }

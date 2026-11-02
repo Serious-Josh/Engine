@@ -6,12 +6,14 @@
 #include "assets/CookedSurface.h"
 #include "assets/ModelImporter.h"
 #include "assets/ProjectAssetResolver.h"
+#include "assets/ProjectScriptAssets.h"
 #include "Renderer/Shader/ShaderLibrary.h"
 
 #include <Windows.h>
 #include "Platform/Windows/WindowsText.h"
 
 #include <algorithm>
+#include <map>
 #include <cctype>
 #include <fstream>
 #include <mutex>
@@ -301,6 +303,69 @@ void CookSceneAssets(const Request& request, const AssetID& sceneAssetID,
         build.Append(std::move(asset));
     }
     build.Append({sceneAssetID, EngineAssetPak::Type::Scene, 1, std::move(scenePayload)});
+}
+
+// AS.5: every Script asset an enabled component uses is validated exactly as Play validates it
+// and packaged as its immutable source closure. Invalid scripts or classes fail the build.
+void CookScriptAssets(const Request& request, BuildAssets& build, const BuildProgress& progress)
+{
+    static_assert(Scripting::PackagedSnapshotVersion == 1, "Non-scene archive payloads are written as version 1.");
+    std::map<std::string, std::set<std::string>> classesByScript;
+
+    for(const auto& object : request.document.objects)
+    {
+        if(!object.script || !object.script->enabled)
+        {
+            continue;
+        }
+
+        Require(AssetID::ParseReference(object.script->scriptReference).has_value(),
+            "Object '" + object.name + "' has a Script component without a script asset.");
+        Require(!object.script->className.empty(),
+            "Object '" + object.name + "' has a Script component without a selected class.");
+        classesByScript[object.script->scriptReference].insert(object.script->className);
+    }
+
+    if(classesByScript.empty())
+    {
+        return;
+    }
+
+    progress.Report(.4f, "Validating and packaging scripts...");
+    Scripting::ScriptHost host;
+    Require(host.Initialize().status == Scripting::Status::Ready, "Cannot initialize script validation.");
+
+    for(const auto& [reference, classes] : classesByScript)
+    {
+        const auto assetID = *AssetID::ParseReference(reference);
+        const auto result = ProjectScriptAssets::Validate(host, ProjectPaths(request.project), request.registry, assetID);
+        const std::string asset = result.snapshot ? result.snapshot->rootSection : reference;
+
+        if(result.status != Scripting::Status::Compiled || !result.snapshot)
+        {
+            std::string detail = "unknown error";
+
+            if(!result.diagnostics.empty())
+            {
+                // The first error, not AngelScript's preceding informational "Compiling ..." line.
+                const auto error = std::find_if(result.diagnostics.begin(), result.diagnostics.end(),
+                    [](const Scripting::Diagnostic& diagnostic) { return diagnostic.severity == "Error"; });
+                const auto& first = error != result.diagnostics.end() ? *error : result.diagnostics.front();
+                detail = first.section + "(" + std::to_string(first.line) + "," + std::to_string(first.column) + "): " +
+                    first.text;
+            }
+
+            Require(false, "Script " + asset + " failed to compile: " + detail);
+        }
+
+        for(const auto& className : classes)
+        {
+            Require(std::find(result.classes.begin(), result.classes.end(), className) != result.classes.end(),
+                "Script " + asset + " defines no EAScript class '" + className + "'.");
+        }
+
+        build.Append({assetID, EngineAssetPak::Type::Resource, 1, Scripting::EncodeSnapshot(*result.snapshot)});
+    }
 }
 
 void CompilePackagedShaders(const Request& request, BuildAssets& build, const BuildProgress& progress)
@@ -640,6 +705,8 @@ bool Service::Start(Request request, std::string& error)
                 BuildAssets build;
                 CookMeshAssets(request, build, progress);
                 CookSceneAssets(request, sceneAssetID, build, progress);
+                // After the scene: scene cooking treats every earlier asset as a mesh input.
+                CookScriptAssets(request, build, progress);
                 CompilePackagedShaders(request, build, progress);
                 WriteAndVerifyArchives(request, sceneAssetID, stagingDirectory, build, progress);
                 DeployRuntimeFiles(request, sceneAssetID, stagingDirectory, progress);

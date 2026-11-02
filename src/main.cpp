@@ -35,6 +35,10 @@ int VerifySceneLifecycle();
 int VerifyAssetBrowserScenes();
 int VerifyStartupScene(const std::filesystem::path& outputRoot);
 int VerifyCausticsVisible(const std::filesystem::path& project, const std::filesystem::path& out);
+int VerifyGamePlayGPU(const std::filesystem::path& projectDirectory, const std::filesystem::path& scene);
+int VerifyPhysicsPerformance(const std::filesystem::path& projectDirectory, const std::filesystem::path& scene);
+int VerifyScriptWorkflow(const std::filesystem::path& projectDirectory, const std::filesystem::path& scene,
+    const std::vector<std::string>& objectNames);
 int MigrateSceneLighting(const std::filesystem::path& scene, float referenceEV100, const std::filesystem::path& report);
 int VerifyProjectSystemWorkflow(const std::string& stage, const std::filesystem::path& workRoot);
 int VerifyProjectRelaunch(const std::filesystem::path& source, const std::filesystem::path& target, const std::string& mode);
@@ -300,6 +304,19 @@ int main(int argc, char** argv)
     if(argc == 4 && std::string_view(argv[1]) == "--verify-caustics-visible")
     {
         return VerifyCausticsVisible(std::filesystem::absolute(argv[2]), std::filesystem::absolute(argv[3]));
+    }
+    if(argc == 4 && std::string_view(argv[1]) == "--verify-physics-performance")
+    {
+        return VerifyPhysicsPerformance(std::filesystem::absolute(argv[2]), std::filesystem::absolute(argv[3]));
+    }
+    if(argc == 4 && std::string_view(argv[1]) == "--verify-game-play-gpu")
+    {
+        return VerifyGamePlayGPU(std::filesystem::absolute(argv[2]), std::filesystem::absolute(argv[3]));
+    }
+    if(argc >= 5 && std::string_view(argv[1]) == "--verify-script-workflow")
+    {
+        return VerifyScriptWorkflow(std::filesystem::absolute(argv[2]), std::filesystem::absolute(argv[3]),
+            std::vector<std::string>(argv + 4, argv + argc));
     }
     if(argc == 3 && std::string_view(argv[1]) == "--verify-startup-scene")
     {

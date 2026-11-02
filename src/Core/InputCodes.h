@@ -8,6 +8,7 @@ namespace KeyCode
     constexpr unsigned int D = 0x44;
     constexpr unsigned int Space = 0x20;
     constexpr unsigned int Escape = 0x1B;
+    constexpr unsigned int Home = 0x24;
 }
 
 namespace MouseButton

@@ -140,6 +140,7 @@ bool Engine::DrainAndResolveEditorScene(IDemoScene& scene)
     if(m_startup.mode != EngineStartup::Mode::PackagedRuntime)
     {
         RefreshEditorPhysicsStatus(false);
+        RefreshEditorGameStatus(false);
     }
     return true;
 }
@@ -1244,6 +1245,15 @@ bool Engine::InitializeProjectIndependent(const EngineStartup& startup)
                 }
 
                 break;
+            case EventType::FocusLost:
+                // Held keys would otherwise stay down forever (gameplay movement included).
+                m_input.Clear();
+                // The window already freed the cursor; only a click on the game view takes it back.
+                m_gameCursorReleased = m_gameRuntime.WantsCursorLock();
+                break;
+            case EventType::MouseRawMoved:
+                m_input.AddRawMouseDelta(event.mouseX, event.mouseY);
+                break;
             case EventType::KeyPressed:
                 m_input.SetKeyState(event.code, true);
 
@@ -1630,9 +1640,9 @@ bool Engine::InitializeScene(SceneSource source)
                 throw std::runtime_error(error);
             }
 
-            if(!StartPackagedPhysics(*owner->m_runtime, error))
+            if(!StartPackagedGame(*owner->m_runtime, error))
             {
-                throw std::runtime_error("Packaged physics initialization failed: " + error);
+                throw std::runtime_error("Packaged Game Play initialization failed: " + error);
             }
 
             // Archive cooking/upload/admission time is not simulated elapsed time.
@@ -1938,7 +1948,7 @@ void Engine::Frame()
         return;
     }
 
-    // Packaged frames share physics orchestration without entering Editor UI/input.
+    // Packaged frames run the shared GameRuntime without entering Editor UI/input.
     if (m_startup.mode == EngineStartup::Mode::PackagedRuntime)
     {
         auto& demo = m_demoSceneManager.GetActiveScene();
@@ -1946,27 +1956,20 @@ void Engine::Frame()
         auto* owner = dynamic_cast<FileBackedDemoScene*>(&demo);
         std::string physicsError;
 
-        if(!owner || !AdvancePackagedPhysics(*owner->m_runtime, m_time.GetDeltaTime(), physicsError))
+        if(!owner || !AdvancePackagedGame(*owner->m_runtime, m_time.GetDeltaTime(), physicsError))
         {
-            throw std::runtime_error("Packaged physics frame failed: " + physicsError);
+            throw std::runtime_error("Packaged game frame failed: " + physicsError);
         }
 
         RendererOptions options{};
+        std::string cameraError;
 
-        if(m_packagedMainCamera)
+        // Resolved every frame from the committed scene and accepted poses; nothing is retained.
+        if(!m_gameRuntime.ResolveView(*owner->m_runtime, m_window.GetWidth(), m_window.GetHeight(), options.view, cameraError))
         {
-            // Resolved every frame from the committed scene and accepted poses; nothing is retained.
-            RenderView view;
-            std::string cameraError;
-
-            if(!ResolveMainCameraView(*owner->m_runtime, m_window.GetWidth(), m_window.GetHeight(), view, &cameraError))
-            {
-                Log::Error("Packaged Main Camera became unusable; requesting shutdown: " + cameraError);
-                m_window.Close();
-                return;
-            }
-
-            options.view = std::move(view);
+            Log::Error("Packaged Main Camera became unusable; requesting shutdown: " + cameraError);
+            m_window.Close();
+            return;
         }
 
         // Archive-only lighting from the cooked document; payloads before 11 carry no Lights, so
@@ -2176,6 +2179,7 @@ void Engine::Frame()
                                       m_demoSceneManager.HasPendingSceneChange());
     const auto* physicsOwner = dynamic_cast<const FileBackedDemoScene*>(&activeDemo);
     RefreshEditorPhysicsStatus(physicsOwner && !physicsOwner->IsArchiveActivation());
+    RefreshEditorGameStatus(physicsOwner && !physicsOwner->IsArchiveActivation());
     const auto& viewportRectangle = m_editor.PrepareWorkspace(activeDemo, m_demoSceneManager, debugUI);
     const ImVec2 framebufferScale = ImGui::GetIO().DisplayFramebufferScale;
 
@@ -2184,6 +2188,8 @@ void Engine::Frame()
         // The menu remains usable with a hidden/empty viewport. Honor Stop and
         // cleanup retries without advancing time or successful-frame history.
         auto* owner = dynamic_cast<FileBackedDemoScene*>(&activeDemo);
+        ProcessEditorGamePlay(owner ? owner->m_runtime.get() : nullptr, 0.0,
+            owner && !owner->IsArchiveActivation(), 0, 0);
         ProcessEditorPhysicsSimulation(owner ? owner->m_runtime.get() : nullptr, 0.0,
             owner && !owner->IsArchiveActivation());
         m_editor.SuspendViewportInteraction();
@@ -2714,12 +2720,36 @@ void Engine::Frame()
     // Accept bindings before physics validates and publishes the current presentation.
     ProcessViewportMaterialAssignment(activeDemo);
     auto* physicsScene = dynamic_cast<FileBackedDemoScene*>(&activeDemo);
+    const bool editableFileScene = physicsScene && !physicsScene->IsArchiveActivation();
+    // Game Play first: while it owns the shared simulation, the Physics Simulation tool steps aside.
+    ProcessEditorGamePlay(physicsScene ? physicsScene->m_runtime.get() : nullptr, m_time.GetDeltaTime(),
+        editableFileScene, finalSceneImage.width, finalSceneImage.height);
     ProcessEditorPhysicsSimulation(physicsScene ? physicsScene->m_runtime.get() : nullptr,
-        m_time.GetDeltaTime(), physicsScene && !physicsScene->IsArchiveActivation());
+        m_time.GetDeltaTime(), editableFileScene);
+    const bool gamePlaying = m_gameRuntime.IsActive();
+
+    if (gamePlaying)
+    {
+        // The viewport shows the running game: gameplay camera, no Editor selection or overlays.
+        std::string cameraError;
+
+        if (!m_gameRuntime.ResolveView(*physicsScene->m_runtime, finalSceneImage.width, finalSceneImage.height,
+            rendererOptions.view, cameraError))
+        {
+            m_gameMessage = "Game Play stopped: " + cameraError;
+            Log::Warning(m_gameMessage);
+            m_gameStopping = !m_gameRuntime.Stop(*physicsScene->m_runtime, m_renderer);
+            RefreshEditorGameStatus(editableFileScene);
+        }
+
+        rendererOptions.selectedObject = (std::numeric_limits<std::size_t>::max)();
+        rendererOptions.selectedObjects.clear();
+    }
+
     // Capture after physics publication so mesh and collider use the same accepted pose.
     // This stack-owned payload outlives the synchronous Render call; Renderer retains none of it.
-    const auto colliderOverlay = CaptureEditorColliderOverlayForFrame(
-        physicsScene ? physicsScene->m_runtime.get() : nullptr, physicsScene && !physicsScene->IsArchiveActivation());
+    const auto colliderOverlay = gamePlaying ? std::nullopt : CaptureEditorColliderOverlayForFrame(
+        physicsScene ? physicsScene->m_runtime.get() : nullptr, editableFileScene);
     if (colliderOverlay)
     {
         rendererOptions.editorColliderOverlay = &*colliderOverlay;
@@ -2732,6 +2762,7 @@ void Engine::Frame()
         rendererOptions.lighting = CaptureSceneLightingForFrame(*physicsScene->m_runtime);
     }
 
+    // The grid follows the authored-edit lock, so it is already hidden during Game Play.
     if (const auto gridSpacing = m_editor.GetViewportGridSpacing())
     {
         rendererOptions.editorGrid = EditorGridRequest{*gridSpacing};
@@ -2740,7 +2771,7 @@ void Engine::Frame()
     viewportPublication = m_renderer.GetSelectionPublicationIdentity(activeScene);
     m_editor.SetViewportPublicationIdentity(viewportPublication.rendererLifetime, viewportPublication.bindingEpoch);
     m_editor.RefreshViewportMarqueePreview(activeDemo);
-    if (const auto* marqueePreview = m_editor.GetViewportMarqueePreview(activeDemo))
+    if (const auto* marqueePreview = gamePlaying ? nullptr : m_editor.GetViewportMarqueePreview(activeDemo))
     {
         rendererOptions.selectedObject = (std::numeric_limits<std::size_t>::max)();
         rendererOptions.selectedObjects = *marqueePreview;
@@ -2777,6 +2808,15 @@ void Engine::Frame()
 
 void Engine::Shutdown()
 {
+    // Gameplay ends before any scene teardown, so every started script receives OnStop.
+    if(m_gameRuntime.IsRunning())
+    {
+        if(auto* owner = dynamic_cast<FileBackedDemoScene*>(m_demoSceneManager.TryGetActiveScene()))
+        {
+            m_gameRuntime.Stop(*owner->m_runtime, m_renderer);
+        }
+    }
+
     CancelEditorMembership("Shutdown canceled the pending membership edit.");
     CancelViewportMaterialAssignment("Engine shutdown canceled the material assignment.");
     if (m_diagnosticMeshToken || m_diagnosticCPUPreparation)

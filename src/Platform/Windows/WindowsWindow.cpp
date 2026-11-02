@@ -39,6 +39,13 @@ LRESULT CALLBACK WindowProc(
         window = reinterpret_cast<WindowsWindow*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
     }
 
+    // A gameplay cursor lock hides the cursor over the client area ahead of ImGui's choice.
+    if(uMsg == WM_SETCURSOR && window && window->IsCursorConfined() && LOWORD(lParam) == HTCLIENT)
+    {
+        SetCursor(nullptr);
+        return TRUE;
+    }
+
     const LRESULT imguiResult = ImGui_ImplWin32_WndProcHandler(hwnd, uMsg, wParam, lParam);
 
     // ImGui owns client-area cursor selection while its backend is active.
@@ -216,6 +223,55 @@ LRESULT CALLBACK WindowProc(
         return 0;
     }
 
+    case WM_KILLFOCUS:
+    {
+        Event event;
+        event.type = EventType::FocusLost;
+
+        if (window)
+        {
+            // Never keep the cursor confined or hidden for a window the user has left.
+            window->ReleaseCursorConfinement();
+            window->DispatchEvent(event);
+        }
+
+        return 0;
+    }
+
+    case WM_SETFOCUS:
+    {
+        Event event;
+        event.type = EventType::FocusGained;
+
+        if (window)
+        {
+            window->DispatchEvent(event);
+        }
+
+        return 0;
+    }
+
+    case WM_INPUT:
+    {
+        RAWINPUT input{};
+        UINT size = sizeof(input);
+
+        // Relative motion only; absolute devices (tablets, remote desktop) keep using positions.
+        if (GetRawInputData(reinterpret_cast<HRAWINPUT>(lParam), RID_INPUT, &input, &size, sizeof(RAWINPUTHEADER)) !=
+                static_cast<UINT>(-1) &&
+            input.header.dwType == RIM_TYPEMOUSE && !(input.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE) && window)
+        {
+            Event event;
+            event.type = EventType::MouseRawMoved;
+            event.mouseX = static_cast<int>(input.data.mouse.lLastX);
+            event.mouseY = static_cast<int>(input.data.mouse.lLastY);
+            window->DispatchEvent(event);
+        }
+
+        // DefWindowProc must still clean up the raw input message.
+        break;
+    }
+
     case WM_SYSKEYDOWN:
     case WM_KEYDOWN:
     {
@@ -356,13 +412,66 @@ bool WindowsWindow::Initialize(const WindowProperties& properties)
     }
 
     DragAcceptFiles(static_cast<HWND>(m_windowHandle), TRUE);
+
+    // Raw relative mouse motion for gameplay look; legacy mouse messages are unaffected.
+    RAWINPUTDEVICE mouse{};
+    mouse.usUsagePage = 0x01;
+    mouse.usUsage = 0x02;
+    mouse.hwndTarget = static_cast<HWND>(m_windowHandle);
+
+    if (!RegisterRawInputDevices(&mouse, 1, sizeof(mouse)))
+    {
+        // Gameplay mouse deltas stay zero; everything else keeps working.
+        OutputDebugStringW(L"Raw mouse input registration failed.\n");
+    }
+
     ShowWindow(static_cast<HWND>(m_windowHandle), SW_SHOW);
 
     return true;
 }
 
+void WindowsWindow::SetCursorConfinement(const std::optional<CursorRectangle>& clientRectangle)
+{
+    const auto window = static_cast<HWND>(m_windowHandle);
+
+    if (!clientRectangle || !window || GetFocus() != window ||
+        clientRectangle->right <= clientRectangle->left || clientRectangle->bottom <= clientRectangle->top)
+    {
+        ReleaseCursorConfinement();
+        return;
+    }
+
+    POINT topLeft{clientRectangle->left, clientRectangle->top};
+    POINT bottomRight{clientRectangle->right, clientRectangle->bottom};
+    ClientToScreen(window, &topLeft);
+    ClientToScreen(window, &bottomRight);
+    const RECT screen{topLeft.x, topLeft.y, bottomRight.x, bottomRight.y};
+
+    // Reapplied every frame, so window moves and resizes keep the confinement current.
+    ClipCursor(&screen);
+
+    if (!m_cursorConfined)
+    {
+        m_cursorConfined = true;
+        SetCursor(nullptr);
+    }
+}
+
+void WindowsWindow::ReleaseCursorConfinement()
+{
+    if (!m_cursorConfined)
+    {
+        return;
+    }
+
+    m_cursorConfined = false;
+    ClipCursor(nullptr);
+    SetCursor(LoadCursorW(nullptr, MAKEINTRESOURCEW(32512)));
+}
+
 void WindowsWindow::Shutdown()
 {
+    ReleaseCursorConfinement();
     m_fileDrops.clear();
     if (m_windowHandle != nullptr)
     {

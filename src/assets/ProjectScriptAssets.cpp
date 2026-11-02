@@ -305,6 +305,33 @@ Scripting::Result Validate(Scripting::ScriptHost& host, const ProjectPaths& path
     }
 }
 
+Scripting::Result Build(Scripting::ScriptHost& host, const ProjectPaths& paths,
+    const ProjectAssetRegistry& registry, const AssetID& root, Scripting::ModuleID& module,
+    Scripting::SourceLimits limits)
+{
+    std::string rootSection = "Content/Scripts/unavailable.as";
+
+    try
+    {
+        const auto* record = registry.Find(root);
+        Require(record && record->type == AssetType::Script, "Root is not a registered Script asset.");
+        rootSection = UTF8(record->relativePath);
+        PinnedSources pins(paths);
+        return AttributeRoot(host.BuildSources(rootSection, Reader(pins, registry, limits.sectionBytes), module, limits),
+            root);
+    }
+    catch(const std::exception& exception)
+    {
+        // Admission failures report through the same structured diagnostics as compile errors.
+        auto result = host.ValidateSources(rootSection, [&](std::string_view) -> Scripting::SourceSection
+        {
+            throw std::runtime_error(exception.what());
+        }, limits);
+
+        return AttributeRoot(std::move(result), root);
+    }
+}
+
 bool IsCurrent(const Scripting::SourceSnapshot& snapshot, const ProjectPaths& paths,
     const ProjectAssetRegistry& registry, std::string& error)
 {

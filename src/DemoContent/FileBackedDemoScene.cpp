@@ -786,6 +786,23 @@ bool FileBackedDemoScene::SetObjectLight(const SceneObjectMetadata& selection,
     return m_runtime->SetObjectLight(selection, expected, replacement, errorMessage);
 }
 
+bool FileBackedDemoScene::SetObjectScript(const SceneObjectMetadata& selection,
+    const std::optional<ScriptComponent>& expected, const std::optional<ScriptComponent>& replacement,
+    std::string* errorMessage)
+{
+    if(!m_initialized || m_objectMutationCandidate)
+    {
+        if(errorMessage)
+        {
+            *errorMessage = "Script editing requires an initialized scene without pending structure changes.";
+        }
+
+        return false;
+    }
+
+    return m_runtime->SetObjectScript(selection, expected, replacement, errorMessage);
+}
+
 bool FileBackedDemoScene::ValidateObjectTransform(RenderObjectID index, const Transform& transform, std::string& error) const
 {
     const auto identity = m_runtime->GetObjectMetadata(index, &error);

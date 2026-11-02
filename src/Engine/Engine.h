@@ -22,6 +22,7 @@
 #include "Scene/SceneMembershipPublication.h"
 #include "Scene/SceneMaterialBindingPublication.h"
 #include "Engine/PhysicsSimulationController.h"
+#include "Engine/GameRuntime.h"
 #include "Project/ProjectContext.h"
 #include "Project/ProjectLoader.h"
 #include "Project/ProjectWorkspace.h"
@@ -125,6 +126,8 @@ class Engine
     friend class AssetBrowserSceneVerification;
     friend class StartupSceneVerification;
     friend class CausticVisibleVerification;
+    friend class GamePlayGPUVerification;
+    friend class ScriptWorkflowVerification;
     friend class ProjectSystemWorkflowVerification;
     friend class ProjectRelaunchVerification;
     void VerifyPackagedBootstrap();
@@ -269,9 +272,25 @@ class Engine
     friend class PresentationTransformVerification;
 #endif
     PhysicsSimulationController m_physicsSimulation;
-    std::uint64_t m_packagedPhysicsRuntimeIdentity = 0;
-    bool StartPackagedPhysics(FileSceneRuntime& runtime, std::string& error);
-    bool AdvancePackagedPhysics(FileSceneRuntime& runtime, double elapsedSeconds, std::string& error);
+    // Shared by Editor Play and the packaged runtime; borrows m_physicsSimulation.
+    GameRuntime m_gameRuntime{m_physicsSimulation};
+    bool StartPackagedGame(FileSceneRuntime& runtime, std::string& error);
+    bool AdvancePackagedGame(FileSceneRuntime& runtime, double elapsedSeconds, std::string& error);
+    // AS.6B cursor lock policy shared by both hosts. A script's lock request is granted over
+    // `area` (client pixels; nullopt while gameplay lacks focus) unless Home or window focus
+    // loss released it; only a click on the game view (`areaClicked`) clears that release, so
+    // repeated script requests cannot. Returns whether the cursor is captured this frame.
+    // Without an active session it releases everything.
+    bool UpdateGameCursor(const std::optional<WindowsWindow::CursorRectangle>& area, bool areaClicked);
+    bool m_gameCursorReleased = false;
+    // Editor Play host: toolbar requests, edit locks and the viewport's gameplay view.
+    std::string m_gameMessage;
+    bool m_gameStopping = false;
+    bool IsEditorGameOwningSimulation() const noexcept;
+    bool IsEditorSceneStreamingSettled() const;
+    void RefreshEditorGameStatus(bool compatibleScene);
+    void ProcessEditorGamePlay(FileSceneRuntime* runtime, double elapsedSeconds, bool compatibleScene,
+        std::uint32_t viewWidth, std::uint32_t viewHeight);
     std::string m_physicsMessage;
     bool CanStartEditorPhysics() const;
     void RefreshEditorPhysicsStatus(bool compatibleScene);
@@ -316,7 +335,7 @@ class Engine
     bool BeginEmptyObjectCreation(const Editor::EmptyObjectCreationRequest&, std::string& error);
     bool BeginCameraObjectCreation(const Editor::CameraObjectCreationRequest&, std::string& error);
     bool BeginLightObjectCreation(const Editor::LightObjectCreationRequest&, std::string& error);
-    // CAM.4 packaged admission; sets m_packagedMainCamera for the frame loop.
+    // CAM.4 packaged camera policy: whether StartPackagedGame requires a Main Camera.
     bool AdmitPackagedMainCamera(const FileSceneRuntime& runtime, std::uint32_t payloadVersion, std::string& error);
     bool m_packagedMainCamera = false;
 

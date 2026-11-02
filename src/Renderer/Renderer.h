@@ -974,6 +974,7 @@ class Renderer
     friend class SceneMembershipVerification;
     friend class ResidencyBatchVerification;
     friend class CausticVisibleVerification;
+    friend class GamePlayGPUVerification;
 #endif
     friend class SceneMaterialBindingPublication;
 #if defined(ENGINE_HAS_VERIFICATION)

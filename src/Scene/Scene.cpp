@@ -266,7 +266,7 @@ void Scene::ClearChangedTransforms()
 
         if (object.previousPresentedModel)
         {
-            if (object.presentationPose)
+            if (object.presentationPose || object.runtimeLocal)
             {
                 object.previousPresentedModel = object.GetPresentationTransform().currentModel;
             }
@@ -285,6 +285,119 @@ void Scene::ClearChangedTransforms()
     }
 
     m_changedTransforms.clear();
+}
+
+bool Scene::SetRuntimeLocalTransform(RenderObjectID id, const std::optional<Transform>& local, std::string* error)
+{
+    const auto fail = [&](const char* message)
+    {
+        if (error)
+        {
+            *error = message;
+        }
+
+        return false;
+    };
+
+    if (id >= m_renderObjects.size())
+    {
+        return fail("Runtime transform target is not part of the scene.");
+    }
+
+    RenderObject& object = m_renderObjects[id];
+
+    if (object.presentationPose)
+    {
+        return fail("A physics-driven object's transform belongs to the simulation.");
+    }
+
+    // Prove the rendered hierarchy with the candidate before changing committed state.
+    std::vector<Matrix4> worlds;
+    const std::optional<Transform> previous = object.runtimeLocal;
+
+    if (HasHierarchy())
+    {
+        worlds.resize(m_renderObjects.size());
+        object.runtimeLocal = local;
+        const bool valid = EvaluateHierarchy(m_renderObjects, m_hierarchy, m_hierarchyHasChildren, HierarchyInputs{},
+            worlds, error);
+        object.runtimeLocal = previous;
+
+        if (!valid)
+        {
+            return false;
+        }
+    }
+
+    m_changedPresentationTransforms.reserve(m_renderObjects.size());
+    const auto before = object.GetPresentationTransform();
+
+    // Continue motion history from the presented model, as accepted physics poses do.
+    if (!object.previousPresentedModel)
+    {
+        object.previousPresentedModel = before.previousModel;
+    }
+
+    object.runtimeLocal = local;
+    const auto after = object.GetPresentationTransform();
+
+    if (std::memcmp(before.currentModel.m, after.currentModel.m, sizeof(before.currentModel.m)) != 0 &&
+        !object.presentationDirty)
+    {
+        object.presentationDirty = true;
+        m_changedPresentationTransforms.push_back(id);
+    }
+
+    if (HasHierarchy())
+    {
+        m_hierarchyWorlds.swap(worlds);
+        CommitHierarchyWorlds(false);
+    }
+
+    return true;
+}
+
+const std::optional<Transform>& Scene::GetRuntimeLocalTransform(RenderObjectID id) const
+{
+    return m_renderObjects.at(id).runtimeLocal;
+}
+
+void Scene::ClearRuntimeLocalTransforms() noexcept
+{
+    bool cleared = false;
+
+    for (RenderObjectID id = 0; id < m_renderObjects.size(); ++id)
+    {
+        RenderObject& object = m_renderObjects[id];
+
+        if (!object.runtimeLocal)
+        {
+            continue;
+        }
+
+        const auto before = object.GetPresentationTransform();
+
+        if (!object.previousPresentedModel)
+        {
+            object.previousPresentedModel = before.previousModel;
+        }
+
+        object.runtimeLocal.reset();
+        cleared = true;
+
+        if (!object.presentationDirty && m_changedPresentationTransforms.size() < m_changedPresentationTransforms.capacity())
+        {
+            object.presentationDirty = true;
+            m_changedPresentationTransforms.push_back(id);
+        }
+    }
+
+    // Authored local worlds were validated on every edit, so this evaluation cannot fail.
+    if (cleared && HasHierarchy() && EvaluateHierarchy(m_renderObjects, m_hierarchy, m_hierarchyHasChildren,
+        HierarchyInputs{}, m_hierarchyWorlds, nullptr))
+    {
+        CommitHierarchyWorlds(false);
+    }
 }
 
 bool Scene::PreparePresentationCommit(std::span<const std::optional<Physics::Pose>> poses)
@@ -485,7 +598,8 @@ bool Scene::EvaluateHierarchy(std::span<const RenderObject> objects, const Scene
     {
         const RenderObject& object = objects[slot];
         const Transform* overrideLocal = inputs.localOverrides ? (*inputs.localOverrides)[slot] : nullptr;
-        const Transform& local = overrideLocal ? *overrideLocal : object.transform;
+        const Transform* runtimeLocal = inputs.useRuntimeLocals && object.runtimeLocal ? &*object.runtimeLocal : nullptr;
+        const Transform& local = overrideLocal ? *overrideLocal : runtimeLocal ? *runtimeLocal : object.transform;
         std::optional<Physics::Pose> pose;
 
         if (inputs.useCommittedPoses)
@@ -549,6 +663,7 @@ bool Scene::EvaluateHierarchyEdit(std::string* error) noexcept
     HierarchyInputs authored;
     authored.localOverrides = &m_hierarchyLocalOverrides;
     authored.useCommittedPoses = false;
+    authored.useRuntimeLocals = false;
 
     if (!EvaluateHierarchy(m_renderObjects, m_hierarchy, m_hierarchyHasChildren, authored, m_hierarchyWorlds, error))
     {

@@ -171,6 +171,7 @@ std::vector<std::byte> ShaderLibrary::CookBootstrap(const std::filesystem::path&
     };
     for(auto file:raster) { stage(file,"VSMain",ShaderStage::Vertex); stage(file,"PSMain",ShaderStage::Pixel); }
     for(auto file:compute) stage(file,"CSMain",ShaderStage::Compute);
+    for(auto entry:{"CSClear","CSHistogram","CSAdapt"}) stage("AutoExposure",entry,ShaderStage::Compute);
     for(auto entry:{"SphereVS","LightingVS"}) stage("MaterialPreview",entry,ShaderStage::Vertex);
     for(auto entry:{"SpherePS","LightingPS"}) stage("MaterialPreview",entry,ShaderStage::Pixel);
     for(auto name:libraries)

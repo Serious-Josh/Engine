@@ -10,7 +10,12 @@ enum class EventType
     MouseButtonPressed,
     MouseButtonReleased,
     MouseMoved,
-    MouseScrolled
+    MouseScrolled,
+    // The window lost keyboard focus; key-up messages for held keys will not arrive.
+    FocusLost,
+    FocusGained,
+    // Raw relative mouse motion (mouseX/mouseY hold the delta): no acceleration, no screen edges.
+    MouseRawMoved
 };
 
 struct Event

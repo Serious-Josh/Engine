@@ -157,7 +157,8 @@ bool SceneDocumentsEqual(
         if (a.id != b.id || a.parentID != b.parentID || a.name != b.name || a.meshReference != b.meshReference ||
             a.materialReference != b.materialReference || a.materialSlotBindings != b.materialSlotBindings ||
             a.physics != b.physics || a.triggerCollider != b.triggerCollider ||
-            a.characterController != b.characterController || a.camera != b.camera || a.light != b.light)
+            a.characterController != b.characterController || a.camera != b.camera || a.light != b.light ||
+            a.script != b.script)
         {
             return false;
         }

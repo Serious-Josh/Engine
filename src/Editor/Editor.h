@@ -18,6 +18,7 @@
 #include "Scene/FileSceneAssetCatalog.h"
 #include "Project/ProjectContext.h"
 #include "Debug/EditorPhaseTiming.h"
+#include "Scripting/ScriptHost.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -141,6 +142,22 @@ public:
     void SetPhysicsStatus(PhysicsState state, bool canPlay, std::string message);
     std::optional<PhysicsRequest> TakePhysicsRequest();
     bool CanStartPhysics() const;
+    // AS.4 Game Play. Engine reports the shared GameRuntime's state each frame; the viewport
+    // toolbar only requests Play/Stop. Playing turns the Scene viewport into the game view.
+    enum class GameState { Editing, Playing, Stopping };
+    enum class GameRequest { Play, Stop };
+    void SetGameStatus(GameState state, bool canPlay, std::string message);
+    std::optional<GameRequest> TakeGameRequest();
+    bool IsGamePlaying() const noexcept { return m_gameState != GameState::Editing; }
+    // Gameplay receives input only while the viewport it renders into has focus and no ImGui
+    // widget or window is capturing the keyboard.
+    bool HasGameplayFocus() const;
+    // AS.6B cursor lock area: the game view image in client pixels while it has gameplay focus.
+    std::optional<EditorWorkspaceRect> GetGameplayCursorArea() const;
+    // A left click on the game view image this frame (recaptures a released cursor lock).
+    bool WasGameViewClicked() const;
+    // Keeps ImGui from showing its cursor over the captured game view this frame.
+    static void HideGameplayCursor();
     bool ArePhysicsCollidersVisible() const noexcept { return m_showPhysicsColliders; }
     bool AreCameraFrustaVisible() const noexcept { return m_showCameraFrusta; }
     bool AreLightWireframesVisible() const noexcept { return m_showLightWireframes; }
@@ -158,7 +175,11 @@ public:
     void SetCharacterDiagnostics(const Physics::CharacterDiagnosticsFrame* frame);
     std::optional<CharacterDriveIntent> TakeCharacterDriveIntent() const;
     void AcknowledgeCharacterDriveJump();
-    bool IsPhysicsEditingLocked() const noexcept { return m_physicsState != PhysicsState::Stopped; }
+    // Authored edits are locked while Physics Simulation or Game Play owns the scene.
+    bool IsSceneEditingLocked() const noexcept
+    {
+        return m_physicsState != PhysicsState::Stopped || m_gameState != GameState::Editing;
+    }
     void OnSceneActivated();
     // Interaction cleanup alone does not change the history session or cursor.
     void ResetSceneInteractions();
@@ -457,6 +478,11 @@ private:
     std::string m_physicsMessage;
     std::optional<PhysicsRequest> m_physicsRequest;
     void DrawPhysicsControls();
+    GameState m_gameState = GameState::Editing;
+    bool m_canPlayGame = false;
+    std::string m_gameMessage;
+    std::optional<GameRequest> m_gameRequest;
+    void DrawGamePlayControls(const EditorIcons& icons, float centerX);
 #if defined(ENGINE_HAS_VERIFICATION)
     friend class MaterialLocateVerification;
     friend class ViewportPanVerification;
@@ -467,6 +493,8 @@ private:
     friend class AssetBrowserSceneVerification;
     friend class StartupSceneVerification;
     friend class CausticVisibleVerification;
+    friend class GamePlayGPUVerification;
+    friend class ScriptWorkflowVerification;
     friend class ProjectSystemWorkflowVerification;
     friend class ProjectRelaunchVerification;
     friend class SceneDuplicationVerification;
@@ -687,7 +715,7 @@ private:
     float m_rotationSnapIntervalDraft = ViewportGridSnap::kDefaultRotationIntervalDegrees;
     EditorWorkspaceRect m_viewportContentRegion;
     void DrawResolutionInfo(const ImVec2& position) const;
-    void DrawSceneViewportToolbar(const EditorWorkspaceRect& toolbarRectangle);
+    void DrawSceneViewportToolbar(const EditorWorkspaceRect& toolbarRectangle, const EditorIcons& icons);
     void DrawGridSnapControls(float rightEdge);
     Vector3 SnapGizmoTranslation(const Vector3& dragStart, const Vector3& continuousPosition) const;
     bool IsRotationSnapActive() const;
@@ -870,6 +898,39 @@ private:
     bool m_lightColorGestureActive = false;
     std::string m_lightEditStatus;
     std::uint64_t m_lightControlsRevision = 0;
+    // AS.5: one complete Script component replacement (add, asset, class or enabled edit, remove) per entry.
+    struct ScriptEdit
+    {
+        SceneHistorySession session;
+        std::string objectID;
+        std::optional<ScriptComponent> before;
+        std::optional<ScriptComponent> after;
+    };
+    void DrawObjectScriptControls(IDemoScene& scene, const ProjectPaths& paths, const ProjectAssetRegistry& registry);
+    bool CommitObjectScript(IDemoScene& scene, const SceneObjectMetadata& selection,
+        const std::optional<ScriptComponent>& before, const std::optional<ScriptComponent>& after);
+    static size_t ScriptEditPayloadBytes(const ScriptEdit& edit);
+    void ValidateScriptManagementPopup(IDemoScene& scene);
+    void DismissScriptManagementPopup();
+    void DrawScriptPickerContents(IDemoScene& scene, const SceneObjectMetadata& selection, const ScriptComponent& script,
+        const ProjectPaths& paths, const ProjectAssetRegistry& registry);
+    // Eligible EAScript classes of an assigned script, validated on demand (assignment, a new
+    // inspection target or Refresh), never every frame.
+    void RefreshScriptClasses(const std::string& reference, const ProjectPaths& paths, const ProjectAssetRegistry& registry);
+    std::optional<SceneObjectMetadata> m_scriptInspection;
+    std::optional<ScriptComponent> m_scriptInspectedValue;
+    std::uint64_t m_scriptInspectionEpoch = 0;
+    std::string m_scriptEditStatus;
+    std::uint64_t m_scriptControlsRevision = 0;
+    std::array<char, 128> m_scriptSearch{};
+    struct ScriptClassList
+    {
+        std::string reference;
+        std::vector<std::string> classes;
+        std::string error;
+    };
+    std::optional<ScriptClassList> m_scriptClasses;
+    std::unique_ptr<Scripting::ScriptHost> m_scriptValidator;
     // CM.9: read-only runtime diagnostics and the explicitly activated diagnostic drive.
     bool ViewportOwnsKeyboard() const;
     void DisableCharacterDrive(std::string reason);
@@ -932,6 +993,7 @@ private:
     std::optional<ComponentPopupTarget> m_controllerManagementPopup;
     std::optional<ComponentPopupTarget> m_cameraManagementPopup;
     std::optional<ComponentPopupTarget> m_lightManagementPopup;
+    std::optional<ComponentPopupTarget> m_scriptManagementPopup;
     std::array<char, 128> m_componentSearch{};
     bool m_focusComponentSearch = false;
     struct RenameObject
@@ -976,7 +1038,8 @@ private:
     using SceneHistoryCommand = std::variant<std::unique_ptr<PhysicsComponentEdit>,
         std::unique_ptr<TriggerColliderEdit>, std::unique_ptr<CharacterControllerEdit>, TransformEdit, std::unique_ptr<GroupTransformEdit>,
         std::unique_ptr<ObjectDeletion>, std::unique_ptr<RenameObject>, std::unique_ptr<ReorderObjects>,
-        std::unique_ptr<MaterialBindingsEdit>, std::unique_ptr<CameraEdit>, std::unique_ptr<LightEdit>>;
+        std::unique_ptr<MaterialBindingsEdit>, std::unique_ptr<CameraEdit>, std::unique_ptr<LightEdit>,
+        std::unique_ptr<ScriptEdit>>;
     struct SceneHistoryEntry
     {
         SceneHistoryCommand command;

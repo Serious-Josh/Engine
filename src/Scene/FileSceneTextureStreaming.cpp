@@ -585,14 +585,20 @@ bool FileSceneAssetCatalog::PublishStreamingTexture(const TextureCacheKey& key, 
     return true;
 }
 
-void FileSceneAssetCatalog::ReportTextureStreaming()
+bool FileSceneAssetCatalog::IsTextureStreamingSettled() const
 {
     using Phase = StreamingTexture::Phase;
-    const bool settled = std::all_of(m_streamingTextures.begin(), m_streamingTextures.end(), [](const auto& entry)
+    return std::all_of(m_streamingTextures.begin(), m_streamingTextures.end(), [](const auto& entry)
     {
         const auto phase = entry.second.phase;
         return phase == Phase::Resident || phase == Phase::Failed || phase == Phase::Superseded;
     });
+}
+
+void FileSceneAssetCatalog::ReportTextureStreaming()
+{
+    using Phase = StreamingTexture::Phase;
+    const bool settled = IsTextureStreamingSettled();
 
     if(!settled || m_streamingReported)
     {

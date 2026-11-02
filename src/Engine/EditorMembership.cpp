@@ -365,7 +365,7 @@ bool Engine::BeginObjectCreation(std::uint64_t runtimeIdentity, std::uint64_t hi
     try
     {
         auto* owner = dynamic_cast<FileBackedDemoScene*>(m_demoSceneManager.TryGetActiveScene());
-        if(PhysicsBlocksSceneEdits() || m_editor.IsPhysicsEditingLocked() || m_state != EngineState::Running ||
+        if(PhysicsBlocksSceneEdits() || m_editor.IsSceneEditingLocked() || m_state != EngineState::Running ||
             !owner || owner->IsArchiveActivation() || owner->GetRuntimeIdentity() != runtimeIdentity ||
             historyEpoch != m_editor.GetSceneHistoryEpoch() || m_pendingEditorMembership ||
             m_pendingSceneObjectCreation || m_pendingSceneObjectDeletion || m_pendingSceneObjectRestoration ||

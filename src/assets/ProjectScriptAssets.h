@@ -15,6 +15,12 @@ bool Reconcile(const ProjectPaths& paths, ProjectAssetRegistry& registry, std::s
 Scripting::Result Validate(Scripting::ScriptHost& host, const ProjectPaths& paths,
     const ProjectAssetRegistry& registry, const AssetID& root, Scripting::SourceLimits limits = {});
 
+// AS.5 gameplay build: the same pinned project sources and policy as Validate, compiled once
+// into an executable EAScript module of the host.
+Scripting::Result Build(Scripting::ScriptHost& host, const ProjectPaths& paths,
+    const ProjectAssetRegistry& registry, const AssetID& root, Scripting::ModuleID& module,
+    Scripting::SourceLimits limits = {});
+
 // Explicit content-based freshness check; no file watcher or timestamp-only cache.
 bool IsCurrent(const Scripting::SourceSnapshot& snapshot, const ProjectPaths& paths,
     const ProjectAssetRegistry& registry, std::string& error);

@@ -642,6 +642,15 @@ namespace
             {
                 objects.back()["light"] = ToJson(*object.light);
             }
+
+            if(object.script)
+            {
+                objects.back()["script"] = {
+                    {"enabled", object.script->enabled},
+                    {"scriptReference", object.script->scriptReference},
+                    {"className", object.script->className}
+                };
+            }
         }
 
         const auto& camera = document.camera;
@@ -685,7 +694,8 @@ namespace
              schemaVersion != SceneDocument::kLightSchemaVersion &&
              schemaVersion != SceneDocument::kEnvironmentNoneSchemaVersion &&
              schemaVersion != SceneDocument::kObjectLightingSchemaVersion &&
-             schemaVersion != SceneDocument::kPhysicalLightingSchemaVersion))
+             schemaVersion != SceneDocument::kPhysicalLightingSchemaVersion &&
+             schemaVersion != SceneDocument::kScriptSchemaVersion))
         {
             throw std::runtime_error("Unsupported scene schema version.");
         }
@@ -756,7 +766,7 @@ namespace
         for (const Json& item : objects)
         {
             ValidateFields(item, {"id", "parentID", "name", "transform", "meshReference", "materialReference",
-                "materialSlotBindings", "physics", "triggerCollider", "characterController", "camera", "light"});
+                "materialSlotBindings", "physics", "triggerCollider", "characterController", "camera", "light", "script"});
             if (legacySchema && item.contains("physics"))
             {
                 throw std::runtime_error("Physics fields require scene schema version 2.");
@@ -896,6 +906,36 @@ namespace
                 {
                     throw std::runtime_error("Invalid Light for object " + object.id + ": " + exception.what());
                 }
+            }
+
+            if(item.contains("script"))
+            {
+                if(schemaVersion.get<std::uint32_t>() < SceneDocument::kScriptSchemaVersion)
+                {
+                    throw std::runtime_error("Script component fields require scene schema version 15.");
+                }
+
+                const auto& value = item.at("script");
+                ValidateFields(value, {"enabled", "scriptReference", "className"});
+
+                if(!value.at("enabled").is_boolean() || !value.at("scriptReference").is_string() ||
+                    !value.at("className").is_string())
+                {
+                    throw std::runtime_error("Invalid Script field types for object " + object.id + ".");
+                }
+
+                ScriptComponent script;
+                script.enabled = value.at("enabled").get<bool>();
+                script.scriptReference = value.at("scriptReference").get<std::string>();
+                script.className = value.at("className").get<std::string>();
+                std::string scriptError;
+
+                if(!ValidateScriptComponent(script, &scriptError))
+                {
+                    throw std::runtime_error("Invalid Script for object " + object.id + ": " + scriptError);
+                }
+
+                object.script = std::move(script);
             }
 
             result.objects.push_back(std::move(object));

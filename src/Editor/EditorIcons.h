@@ -8,7 +8,7 @@
 
 enum class EditorIcon : unsigned int
 {
-    Box, Camera, File, Folder, Light, Spot, Point, Directional, Count
+    Box, Camera, File, Folder, Light, Spot, Point, Directional, Play, Stop, Count
 };
 
 constexpr EditorIcon SceneObjectIcon(bool camera, const LightComponent* light)

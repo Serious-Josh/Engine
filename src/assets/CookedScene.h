@@ -23,7 +23,9 @@ namespace CookedScene
     inline constexpr std::uint32_t PhysicalLightingVersion = 14;
     // Photographic exposure on every Camera component and on the Editor viewport camera.
     inline constexpr std::uint32_t CameraExposureVersion = 15;
-    inline constexpr std::uint32_t Version = CameraExposureVersion;
+    // AS.5 Script component per object (enabled, script asset reference, class name).
+    inline constexpr std::uint32_t ScriptVersion = 16;
+    inline constexpr std::uint32_t Version = ScriptVersion;
 
     constexpr bool IsSupportedVersion(std::uint32_t version)
     {
@@ -41,7 +43,8 @@ namespace CookedScene
             version == EnvironmentNoneVersion ||
             version == ObjectLightingVersion ||
             version == PhysicalLightingVersion ||
-            version == CameraExposureVersion;
+            version == CameraExposureVersion ||
+            version == ScriptVersion;
     }
     struct Policy
     {

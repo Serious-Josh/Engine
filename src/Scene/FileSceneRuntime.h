@@ -249,6 +249,11 @@ public:
     bool SetObjectLight(const SceneObjectMetadata& selection,
         const std::optional<LightComponent>& expected,
         const std::optional<LightComponent>& replacement, std::string* errorMessage = nullptr);
+    // AS.5 authored Script attachment edit with the same identity, expected-value and whole-scene
+    // checks as SetObjectLight. Script instances belong to the gameplay runtime, never here.
+    bool SetObjectScript(const SceneObjectMetadata& selection,
+        const std::optional<ScriptComponent>& expected,
+        const std::optional<ScriptComponent>& replacement, std::string* errorMessage = nullptr);
     bool SetObjectCharacterController(const SceneObjectMetadata& selection,
         const std::optional<Physics::CharacterControllerComponent>& expected,
         const std::optional<Physics::CharacterControllerComponent>& replacement, std::string* errorMessage = nullptr);
@@ -294,6 +299,8 @@ public:
     // policy; FileBackedDemoScene configures it for this mode.
     bool LoadArchive(std::shared_ptr<const CookedScene::ArchiveScene> source, std::string* errorMessage = nullptr);
     bool IsArchiveActivation() const noexcept { return bool(m_archiveScene); }
+    // The archive this packaged runtime scene was loaded from; null for editable project scenes.
+    const std::shared_ptr<const CookedScene::ArchiveScene>& GetArchiveScene() const noexcept { return m_archiveScene; }
     bool PrepareMetadata(FileSceneAssetCatalog& catalog, std::string* errorMessage = nullptr);
     bool CommitMetadata(FileSceneAssetCatalog& catalog, std::string* errorMessage = nullptr);
 
@@ -362,6 +369,11 @@ private:
     bool OwnsPhysicsPresentation(const Renderer& renderer, const PhysicsPresentationLease& lease) const noexcept;
     bool ValidatePhysicsPresentationAssociation(const Renderer& renderer,
         const PhysicsPresentationAssociation& association, std::string& error) const;
+    // Every scene-wide invariant GetObjectMetadata checks: document, archive, mapping identity and
+    // counts, document validity and each object's unique slot and committed bindings. Returns the
+    // document object at `selectedIndex` when one is given (nullptr when none maps to it).
+    bool ValidateObjectMetadataState(std::optional<RenderObjectID> selectedIndex,
+        const SceneObjectDocument*& selected, std::string* errorMessage) const;
     PhysicsPresentationReadiness GetPhysicsPresentationBoundaryReadiness(const Renderer& renderer,
         std::string& error, bool clearing) const;
     std::uint64_t m_physicsPresentationRevision = 0;

@@ -32,7 +32,7 @@ size_t Editor::MaterialBindingPayloadBytes(const MaterialBindingsEdit& edit)
 void Editor::QueueViewportMaterialDrop(const IDemoScene& scene,
     const SceneObjectMetadata& target, const AssetID& material)
 {
-    if (IsPhysicsEditingLocked())
+    if (IsSceneEditingLocked())
     {
         return;
     }

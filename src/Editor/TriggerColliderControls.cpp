@@ -51,7 +51,7 @@ bool Editor::ComponentEditAllowed(IDemoScene& scene)
 
     return owner && !owner->IsArchiveActivation() && m_workspace.InspectorVisible() &&
         m_inspectorTarget == InspectorTarget::SceneObject && m_objectInspectionIdentity &&
-        !IsPhysicsEditingLocked() && !HasPendingSceneHistoryOperation() && !m_sceneOperationPending &&
+        !IsSceneEditingLocked() && !HasPendingSceneHistoryOperation() && !m_sceneOperationPending &&
         !HasBlockingObjectCreation() && !m_sceneObjectDeletionPending && !m_sceneObjectDeletionRequest &&
         !m_meshCreationRequest && !m_primitiveCreationRequest && !m_emptyObjectCreationRequest && !m_fileRequest &&
         !m_materialAssignmentRequest && m_historySession && RenameSessionMatches(scene, *m_historySession);
@@ -276,10 +276,12 @@ void Editor::DrawAddComponentControls(IDemoScene& scene)
         const bool cameraMatches = cameraAvailable && std::string_view("camera").find(query) != std::string_view::npos;
         const bool lightAvailable = !object.light;
         const bool lightMatches = lightAvailable && std::string_view("light").find(query) != std::string_view::npos;
+        const bool scriptAvailable = !object.script;
+        const bool scriptMatches = scriptAvailable && std::string_view("script").find(query) != std::string_view::npos;
         const bool triggerMatches = triggerAvailable && std::string_view("trigger collider").find(query) != std::string_view::npos;
         const bool controllerMatches = controllerAbsent && std::string_view("character controller").find(query) != std::string_view::npos;
         const int eligibleMatches = static_cast<int>(triggerMatches) + static_cast<int>(controllerMatches && controllerAvailable) +
-            static_cast<int>(cameraMatches) + static_cast<int>(lightMatches);
+            static_cast<int>(cameraMatches) + static_cast<int>(lightMatches) + static_cast<int>(scriptMatches);
         ImGui::Separator();
         ImGui::PushItemFlag(ImGuiItemFlags_AutoClosePopups, false);
         const bool triggerSelected = triggerMatches && ImGui::MenuItem("Trigger Collider");
@@ -297,8 +299,9 @@ void Editor::DrawAddComponentControls(IDemoScene& scene)
 
         const bool cameraSelected = cameraMatches && ImGui::MenuItem("Camera");
         const bool lightSelected = lightMatches && ImGui::MenuItem("Light");
+        const bool scriptSelected = scriptMatches && ImGui::MenuItem("Script");
 
-        if(!triggerAvailable && !controllerAvailable && !cameraAvailable && !lightAvailable)
+        if(!triggerAvailable && !controllerAvailable && !cameraAvailable && !lightAvailable && !scriptAvailable)
         {
             ImGui::TextDisabled("No components available.");
         }
@@ -313,14 +316,15 @@ void Editor::DrawAddComponentControls(IDemoScene& scene)
 
         const bool addCamera = cameraMatches && (cameraSelected || (searchEnter && eligibleMatches == 1));
         const bool addLight = lightMatches && (lightSelected || (searchEnter && eligibleMatches == 1));
+        const bool addScript = scriptMatches && (scriptSelected || (searchEnter && eligibleMatches == 1));
 
         // Enter deactivates the search field; keep it focused when the query selects nothing.
-        if(searchEnter && !addTrigger && !addController && !addCamera && !addLight)
+        if(searchEnter && !addTrigger && !addController && !addCamera && !addLight && !addScript)
         {
             m_focusComponentSearch = true;
         }
 
-        if(m_addComponentPopup && (addTrigger || addController || addCamera || addLight))
+        if(m_addComponentPopup && (addTrigger || addController || addCamera || addLight || addScript))
         {
             ValidateAddComponentPopup(scene);
             const auto current = ResolveComponentEditTarget(scene);
@@ -352,6 +356,11 @@ void Editor::DrawAddComponentControls(IDemoScene& scene)
                     // Add Component defaults to a Point Light; the Inspector switches type.
                     committed = CommitObjectLight(scene, *current, std::nullopt, LightComponent{});
                 }
+                else if(addScript && !latest.script)
+                {
+                    // An empty Script; the Inspector then assigns the asset and class.
+                    committed = CommitObjectScript(scene, *current, std::nullopt, ScriptComponent{});
+                }
 
                 if(committed)
                 {
@@ -373,7 +382,7 @@ bool Editor::CommitObjectTriggerCollider(IDemoScene& scene, const SceneObjectMet
 {
     auto* owner = dynamic_cast<FileBackedDemoScene*>(&scene);
 
-    if(IsPhysicsEditingLocked() || !owner || !m_historySession ||
+    if(IsSceneEditingLocked() || !owner || !m_historySession ||
         !RenameSessionMatches(scene, *m_historySession) || HasPendingSceneHistoryOperation() ||
         m_sceneOperationPending || HasBlockingObjectCreation())
     {

@@ -155,6 +155,47 @@ bool ValidateSceneDocument(
         SceneHierarchy::ValidateConnectedTransforms(document.objects, hierarchy, errorMessage);
 }
 
+bool ValidateScriptComponent(const ScriptComponent& script, std::string* error)
+{
+    if(error)
+    {
+        error->clear();
+    }
+
+    const char* reason = nullptr;
+
+    if(!script.scriptReference.empty() && !AssetID::ParseReference(script.scriptReference))
+    {
+        reason = "Script reference must be empty or a canonical asset reference.";
+    }
+    else if(script.className.size() > ScriptComponent::MaximumClassNameBytes)
+    {
+        reason = "Script class name is too long.";
+    }
+    else
+    {
+        // AngelScript identifiers joined by "::"; anything else can never name a script class.
+        for(const char character : script.className)
+        {
+            const bool identifier = (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') ||
+                (character >= '0' && character <= '9') || character == '_' || character == ':';
+
+            if(!identifier)
+            {
+                reason = "Script class name may contain only letters, digits, '_' and '::'.";
+                break;
+            }
+        }
+    }
+
+    if(reason && error)
+    {
+        *error = reason;
+    }
+
+    return reason == nullptr;
+}
+
 bool ValidateSceneObjectComponents(const SceneObjectDocument& object, std::string* errorMessage)
 {
     if(errorMessage)
@@ -182,6 +223,11 @@ bool ValidateSceneObjectComponents(const SceneObjectDocument& object, std::strin
     if(object.light && !ValidateLightComponent(*object.light, &componentError))
     {
         return Fail(errorMessage, "Invalid Light for object " + object.id + ": " + componentError);
+    }
+
+    if(object.script && !ValidateScriptComponent(*object.script, &componentError))
+    {
+        return Fail(errorMessage, "Invalid Script for object " + object.id + ": " + componentError);
     }
 
     if(object.physics && !Physics::ValidatePhysicsComponent(*object.physics, &componentError))

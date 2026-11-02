@@ -40,6 +40,15 @@ class Input
 
     void Update();
 
+    // AS.6B raw relative mouse motion accumulated since the last Update (frame start).
+    void AddRawMouseDelta(int x, int y);
+    int GetRawMouseDeltaX() const;
+    int GetRawMouseDeltaY() const;
+    void ClearRawMouseDelta();
+    // Releases every key and mouse button without reporting a press or release edge.
+    // Used on focus loss, after which the matching key-up messages never arrive.
+    void Clear();
+
     private:
     bool m_keys[256]{};
     bool m_previousKeys[256]{};
@@ -57,4 +66,7 @@ class Input
     float m_scrollY = 0.0f;
 
     bool m_mousePositionInitialized = false;
+
+    int m_rawMouseDeltaX = 0;
+    int m_rawMouseDeltaY = 0;
 };

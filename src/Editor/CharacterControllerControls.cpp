@@ -40,7 +40,7 @@ bool Editor::CommitObjectCharacterController(IDemoScene& scene, const SceneObjec
 {
     auto* owner = dynamic_cast<FileBackedDemoScene*>(&scene);
 
-    if(IsPhysicsEditingLocked() || !owner || !m_historySession ||
+    if(IsSceneEditingLocked() || !owner || !m_historySession ||
         !RenameSessionMatches(scene, *m_historySession) || HasPendingSceneHistoryOperation() ||
         m_sceneOperationPending || HasBlockingObjectCreation())
     {
@@ -306,7 +306,7 @@ void Editor::DrawObjectCharacterControllerControls(IDemoScene& scene)
 
 bool Editor::ApplyObjectTransformEdits(IDemoScene& scene, std::span<const RenderObjectTransformUpdate> updates)
 {
-    if(IsPhysicsEditingLocked() || scene.GetScene().HasPhysicsPresentation())
+    if(IsSceneEditingLocked() || scene.GetScene().HasPhysicsPresentation())
     {
         m_transformEditStatus = "Transform editing requires a stopped scene.";
         return false;

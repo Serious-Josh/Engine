@@ -126,6 +126,8 @@ class Scene
 
     private:
     friend class FileSceneRuntime;
+    // AS.6B runtime local transforms only.
+    friend class GameRuntime;
 #if defined(ENGINE_HAS_VERIFICATION)
     friend class PresentationTransformVerification;
     friend class ColliderVisualizationVerification;
@@ -133,6 +135,13 @@ class Scene
     friend class SceneHierarchyVerification;
     friend class ViewportGridSnapVerification;
 #endif
+    // AS.6B gameplay-only local transform of an object without a simulation pose. Descendants
+    // follow through hierarchy evaluation, which is proven valid before anything changes.
+    // nullopt removes it. Authored transforms and authored hierarchy validation never see it.
+    bool SetRuntimeLocalTransform(RenderObjectID id, const std::optional<Transform>& local, std::string* error = nullptr);
+    const std::optional<Transform>& GetRuntimeLocalTransform(RenderObjectID id) const;
+    // Removes every runtime local transform (Game Play Stop); cannot fail.
+    void ClearRuntimeLocalTransforms() noexcept;
     // Preparation allocates before acceptance and, for hierarchy scenes, proves that every
     // descendant world under these poses is valid. Commit only copies value types.
     bool PreparePresentationCommit(std::span<const std::optional<Physics::Pose>> poses = {});
@@ -154,6 +163,8 @@ class Scene
         const std::vector<const Transform*>* localOverrides = nullptr;
         std::span<const std::optional<Physics::Pose>> poses;
         bool useCommittedPoses = true;
+        // Gameplay runtime local transforms apply to rendered worlds, never to authored validation.
+        bool useRuntimeLocals = true;
     };
 
     // Checks that the order is a parent-before-child permutation of every slot.

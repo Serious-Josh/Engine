@@ -41,6 +41,18 @@ public:
     bool HasPendingPresentation() const noexcept { return m_pendingPresentation; }
     std::uint64_t GetTotalSimulatedSteps() const noexcept { return m_totalSteps; }
     std::size_t GetLastUpdateSteps() const noexcept { return m_lastUpdateSteps; }
+
+    // Diagnostics: CPU wall-clock durations (ms) of the latest Update and PublishAtBoundary.
+    struct FrameTiming
+    {
+        double updateReadiness = 0.0;
+        double updateSteps = 0.0;
+        double updateCapture = 0.0;
+        double update = 0.0;
+        double publishApply = 0.0;
+        double publish = 0.0;
+    };
+    const FrameTiming& GetLastFrameTiming() const noexcept { return m_lastFrameTiming; }
     double GetAccumulatedSeconds() const noexcept { return m_accumulatedTicks / 60.0; }
     const Physics::RuntimePoseSnapshot* GetLatestSnapshot() const noexcept;
 
@@ -59,6 +71,10 @@ public:
     // thread, state and session-generation checks as movement.
     bool SubmitCharacterJump(std::uint64_t sessionGeneration, std::string_view objectID, std::uint64_t fixedStep,
         std::string& error);
+    // AS.6B: forwards ScenePhysicsSession::SetCharacterYaw with the same checks, then captures a
+    // new snapshot so the next publication presents the yaw even if no fixed step runs.
+    bool SetCharacterYaw(std::uint64_t sessionGeneration, std::string_view objectID, float yaw, std::string& error);
+    std::optional<float> GetCharacterYaw(std::string_view objectID) const;
 
     // Number of fixed steps the next Update(elapsedSeconds) will run, from the same due-tick
     // arithmetic and per-Update cap; 0 when inactive or for input Update would reject. Lets a
@@ -125,6 +141,7 @@ private:
     std::uint64_t m_totalSteps = 0;
     std::uint64_t m_sessionGeneration = 0;
     std::size_t m_lastUpdateSteps = 0;
+    FrameTiming m_lastFrameTiming;
     std::vector<Physics::ContactEvent> m_lastUpdateContactEvents;
     std::vector<Physics::ContactNotification> m_lastUpdateContactNotifications;
     std::vector<Physics::TriggerEvent> m_lastUpdateTriggerEvents;

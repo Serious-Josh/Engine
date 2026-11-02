@@ -176,9 +176,9 @@ bool Editor::RequestApplicationClose()
 bool Editor::QueueFileRequest(FileRequest request)
 {
     if(m_sceneOperationPending || m_fileRequest || m_materialLeaveAction != MaterialLeaveAction::None ||
-        IsPhysicsEditingLocked())
+        IsSceneEditingLocked())
     {
-        ReportLifecycleMessage("Finish the pending operation and stop physics before leaving the scene.");
+        ReportLifecycleMessage("Finish the pending operation and stop Game Play or physics before leaving the scene.");
         return false;
     }
 
@@ -281,7 +281,7 @@ void Editor::DrawMainMenu(
     if(ImGui::BeginMenu("File"))
     {
         ImGui::BeginDisabled(m_sceneOperationPending || m_fileRequest.has_value() ||
-            m_materialLeaveAction != MaterialLeaveAction::None || IsPhysicsEditingLocked());
+            m_materialLeaveAction != MaterialLeaveAction::None || IsSceneEditingLocked());
 
         if(ImGui::MenuItem("New Scene"))
         {
@@ -458,7 +458,7 @@ void Editor::DrawResolutionInfo(const ImVec2& position) const
     }
 }
 
-void Editor::DrawSceneViewportToolbar(const EditorWorkspaceRect& toolbarRectangle)
+void Editor::DrawSceneViewportToolbar(const EditorWorkspaceRect& toolbarRectangle, const EditorIcons& icons)
 {
     if(toolbarRectangle.size.x <= 0.0f || toolbarRectangle.size.y <= 0.0f)
     {
@@ -481,6 +481,8 @@ void Editor::DrawSceneViewportToolbar(const EditorWorkspaceRect& toolbarRectangl
             ImGui::GetStyle().FramePadding.x * 2.0f;
         const float overlaysPositionX = (std::max)(0.0f, toolbarRectangle.size.x - buttonWidth);
 
+        DrawGamePlayControls(icons, toolbarRectangle.size.x * 0.5f);
+        ImGui::SameLine();
         DrawGridSnapControls(overlaysPositionX - ImGui::GetStyle().ItemSpacing.x);
 
         ImGui::SameLine();
@@ -649,7 +651,7 @@ std::optional<float> Editor::GetViewportGridSpacing() const
 {
     // The grid is an editing aid: hidden while Play/Pause simulates, restored on Stop. The
     // translation interval only ever holds a validated value, so invalid drafts keep the grid.
-    if(!m_showViewportGrid || IsPhysicsEditingLocked())
+    if(!m_showViewportGrid || IsSceneEditingLocked())
     {
         return std::nullopt;
     }
@@ -758,6 +760,15 @@ void Editor::DrawSceneViewport(
                     IM_COL32(240, 220, 170, 255), m_materialDropStatus.c_str());
             }
 
+            if(!m_gameMessage.empty())
+            {
+                // A refused Play (for example no Main Camera) stays visible until the next attempt.
+                const float offset = m_materialDropStatus.empty() ? 1.0f : 2.0f;
+                ImGui::GetWindowDrawList()->AddText(ImVec2(position.x + 12.0f,
+                    position.y + size.y - offset * ImGui::GetTextLineHeightWithSpacing() - 12.0f),
+                    IM_COL32(240, 220, 170, 255), m_gameMessage.c_str());
+            }
+
             if(m_showResolutionInfo)
             {
                 // Below any status lines at the top-left; drawn into this input-less window, so it never takes input.
@@ -794,7 +805,7 @@ const EditorWorkspaceRect& Editor::PrepareWorkspace(
     m_workspace.Update();
     const auto regions = CalculateSceneViewportRegions(m_workspace.GetSceneViewport(), ImGui::GetFrameHeight());
     m_viewportContentRegion = regions.imageArea;
-    DrawSceneViewportToolbar(regions.toolbar);
+    DrawSceneViewportToolbar(regions.toolbar, debugUI.GetEditorIcons());
     return m_viewportContentRegion;
 }
 
@@ -831,7 +842,7 @@ void Editor::CancelObjectRename()
 
 void Editor::QueueObjectRename(const IDemoScene& scene, const SceneObjectMetadata& target)
 {
-    if (IsPhysicsEditingLocked())
+    if (IsSceneEditingLocked())
     {
         return;
     }
@@ -852,7 +863,7 @@ void Editor::QueueObjectRename(const IDemoScene& scene, const SceneObjectMetadat
 
 void Editor::CommitObjectRename(IDemoScene& scene, std::string name)
 {
-    if (IsPhysicsEditingLocked())
+    if (IsSceneEditingLocked())
     {
         return;
     }
@@ -920,7 +931,7 @@ void Editor::CommitObjectRename(IDemoScene& scene, std::string name)
 
 void Editor::CommitObjectReorder(IDemoScene& scene, const HierarchyReorderRequest& request)
 {
-    if (IsPhysicsEditingLocked())
+    if (IsSceneEditingLocked())
     {
         return;
     }
@@ -1061,7 +1072,7 @@ void Editor::DrawHierarchy(IDemoScene& demoScene, const std::string& activeScene
         m_materialAssignmentPending || m_materialAssignmentRequest || m_gizmoWasUsing ||
         m_workspace.IsSplitterDragging() || ImGuizmo::IsUsing() || m_transformFieldEditing;
 
-    if(m_renameIntent && (IsPhysicsEditingLocked() || blocked || m_inspectorPanel.HasUnsavedChanges() || !RenameIntentMatches(demoScene)))
+    if(m_renameIntent && (IsSceneEditingLocked() || blocked || m_inspectorPanel.HasUnsavedChanges() || !RenameIntentMatches(demoScene)))
     {
         CancelObjectRename();
     }
@@ -1072,7 +1083,7 @@ void Editor::DrawHierarchy(IDemoScene& demoScene, const std::string& activeScene
     }
 
     const auto* fileScene = dynamic_cast<const FileBackedDemoScene*>(&demoScene);
-    const bool allowReorder = !IsPhysicsEditingLocked() && !blocked && fileScene && m_historySession &&
+    const bool allowReorder = !IsSceneEditingLocked() && !blocked && fileScene && m_historySession &&
         RenameSessionMatches(demoScene, *m_historySession) && !m_inspectorPanel.HasUnsavedChanges() &&
         !m_renameIntent && !ImGui::GetIO().AppFocusLost &&
         !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel);
@@ -1096,7 +1107,7 @@ void Editor::DrawHierarchy(IDemoScene& demoScene, const std::string& activeScene
 
     const auto clicked = m_hierarchyPanel.Draw(m_workspace.GetHierarchy(), snapshot, selected, &scene, error,
         dragIdentity, allowReorder,
-        !IsPhysicsEditingLocked() && !blocked && fileScene && !fileScene->IsArchiveActivation() &&
+        !IsSceneEditingLocked() && !blocked && fileScene && !fileScene->IsArchiveActivation() &&
         m_historySession && RenameSessionMatches(demoScene,*m_historySession) &&
         !m_inspectorPanel.HasUnsavedChanges() && !m_renameIntent, m_selectedObjects,
         [&](const HierarchyDropRequest& request, std::string& reason)
@@ -1112,7 +1123,7 @@ void Editor::DrawHierarchy(IDemoScene& demoScene, const std::string& activeScene
 
     if(auto primitive=m_hierarchyPanel.TakePrimitiveRequest())
     {
-        if(!IsPhysicsEditingLocked() && !blocked && fileScene && !fileScene->IsArchiveActivation() &&
+        if(!IsSceneEditingLocked() && !blocked && fileScene && !fileScene->IsArchiveActivation() &&
             m_historySession && RenameSessionMatches(demoScene,*m_historySession) && !HasBlockingObjectCreation())
             m_primitiveCreationRequest=PrimitiveCreationRequest{*primitive,fileScene->GetRuntimeIdentity(),m_historyEpoch};
     }
@@ -1120,7 +1131,7 @@ void Editor::DrawHierarchy(IDemoScene& demoScene, const std::string& activeScene
     // Same eligibility as primitive creation; Engine re-checks everything before staging.
     if(m_hierarchyPanel.TakeEmptyObjectRequest())
     {
-        const bool canCreate = !IsPhysicsEditingLocked() && !blocked && fileScene && !fileScene->IsArchiveActivation() &&
+        const bool canCreate = !IsSceneEditingLocked() && !blocked && fileScene && !fileScene->IsArchiveActivation() &&
             m_historySession && RenameSessionMatches(demoScene, *m_historySession) && !HasBlockingObjectCreation();
 
         if(canCreate)
@@ -1131,7 +1142,7 @@ void Editor::DrawHierarchy(IDemoScene& demoScene, const std::string& activeScene
 
     if(m_hierarchyPanel.TakeCameraObjectRequest())
     {
-        const bool canCreate = !IsPhysicsEditingLocked() && !blocked && fileScene && !fileScene->IsArchiveActivation() &&
+        const bool canCreate = !IsSceneEditingLocked() && !blocked && fileScene && !fileScene->IsArchiveActivation() &&
             m_historySession && RenameSessionMatches(demoScene, *m_historySession) && !HasBlockingObjectCreation();
 
         if(canCreate)
@@ -1142,7 +1153,7 @@ void Editor::DrawHierarchy(IDemoScene& demoScene, const std::string& activeScene
 
     if(const auto lightType = m_hierarchyPanel.TakeLightObjectRequest())
     {
-        const bool canCreate = !IsPhysicsEditingLocked() && !blocked && fileScene && !fileScene->IsArchiveActivation() &&
+        const bool canCreate = !IsSceneEditingLocked() && !blocked && fileScene && !fileScene->IsArchiveActivation() &&
             m_historySession && RenameSessionMatches(demoScene, *m_historySession) && !HasBlockingObjectCreation();
 
         if(canCreate)
@@ -1175,7 +1186,7 @@ void Editor::DrawHierarchy(IDemoScene& demoScene, const std::string& activeScene
         const auto* owner = dynamic_cast<const FileBackedDemoScene*>(&demoScene);
         const auto target = owner ? owner->GetObjectMetadata(*objectID) : std::nullopt;
 
-        if(!IsPhysicsEditingLocked() && !blocked && target)
+        if(!IsSceneEditingLocked() && !blocked && target)
         {
             OpenSceneObjectContext(demoScene, *target);
         }
@@ -1183,7 +1194,7 @@ void Editor::DrawHierarchy(IDemoScene& demoScene, const std::string& activeScene
 
     if(auto name = m_hierarchyPanel.TakeRenameCommit())
     {
-        if(!IsPhysicsEditingLocked() && !blocked)
+        if(!IsSceneEditingLocked() && !blocked)
         {
             CommitObjectRename(demoScene, std::move(*name));
         }
@@ -1211,6 +1222,7 @@ void Editor::ActivateObjectInspection(
     DismissControllerManagementPopup();
     DismissCameraManagementPopup();
     DismissLightManagementPopup();
+    DismissScriptManagementPopup();
     m_objectInspectionIdentity.reset();
     m_transformEditStatus.clear();
     m_physicsInspection.reset();
@@ -1218,6 +1230,7 @@ void Editor::ActivateObjectInspection(
     m_controllerInspection.reset();
     m_cameraInspection.reset();
     m_lightInspection.reset();
+    m_scriptInspection.reset();
     m_inspectorTarget = InspectorTarget::None;
     m_inspectorPanel.LoadSelection({}, paths, registry);
     const auto& scene = static_cast<const IDemoScene&>(demoScene).GetScene();
@@ -1458,7 +1471,7 @@ void Editor::Draw(
         EditorPhaseTiming::Scope projectPhase(PhaseTiming(), EditorPhaseTiming::Phase::AssetBrowserProject);
         m_assetBrowser.SetThumbnailProject(projectPaths, assetRegistry);
     }
-    ImGui::BeginDisabled(IsPhysicsEditingLocked() || m_materialLeaveAction != MaterialLeaveAction::None || m_sceneOperationPending);
+    ImGui::BeginDisabled(IsSceneEditingLocked() || m_materialLeaveAction != MaterialLeaveAction::None || m_sceneOperationPending);
 
     if(m_workspace.AssetBrowserVisible())
     {
@@ -1540,7 +1553,7 @@ void Editor::Draw(
         FinishTransformFieldEdit(demoScene);
     }
 
-    const bool disableInspector = IsPhysicsEditingLocked() || m_materialLeaveAction != MaterialLeaveAction::None || m_sceneOperationPending ||
+    const bool disableInspector = IsSceneEditingLocked() || m_materialLeaveAction != MaterialLeaveAction::None || m_sceneOperationPending ||
         m_pendingMaterialBinding.has_value();
 
     ValidateAddComponentPopup(demoScene);
@@ -1581,7 +1594,7 @@ void Editor::Draw(
                 EditorPhaseTiming::Scope transformPhase(PhaseTiming(), EditorPhaseTiming::Phase::InspectorTransform);
                 DrawSelectedObjectTransformControls(demoScene);
             }, projectPaths, assetRegistry, m_materialAssignmentPending, m_materialAssignmentStatus,
-            [this, &demoScene]()
+            [this, &demoScene, &projectPaths, &assetRegistry]()
             {
                 EditorPhaseTiming::Scope componentsPhase(PhaseTiming(), EditorPhaseTiming::Phase::InspectorComponents);
                 {
@@ -1604,6 +1617,7 @@ void Editor::Draw(
                     EditorPhaseTiming::Scope phase(PhaseTiming(), EditorPhaseTiming::Phase::ComponentLight);
                     DrawObjectLightControls(demoScene);
                 }
+                DrawObjectScriptControls(demoScene, projectPaths, assetRegistry);
                 {
                     EditorPhaseTiming::Scope phase(PhaseTiming(), EditorPhaseTiming::Phase::ComponentAdd);
                     DrawAddComponentControls(demoScene);
@@ -1648,6 +1662,7 @@ void Editor::Draw(
         m_controllerInspection.reset();
         m_cameraInspection.reset();
         m_lightInspection.reset();
+        m_scriptInspection.reset();
         m_inspectorPanel.ReleaseSceneObjectPreview();
         m_inspectorPanel.DismissSceneMaterialPicker();
     }
@@ -1707,10 +1722,10 @@ void Editor::Draw(
 
     materialRevisionsPhase.End();
     EditorPhaseTiming::Scope modalsPhase(PhaseTiming(), EditorPhaseTiming::Phase::ModalsAndViewport);
-    m_assetBrowser.DrawRenameModal(IsPhysicsEditingLocked() || m_inspectorPanel.HasUnsavedChanges() ||
+    m_assetBrowser.DrawRenameModal(IsSceneEditingLocked() || m_inspectorPanel.HasUnsavedChanges() ||
         m_materialLeaveAction != MaterialLeaveAction::None || m_sceneOperationPending);
 
-    m_assetBrowser.DrawDeletionConfirmation(IsPhysicsEditingLocked() || m_inspectorPanel.HasUnsavedChanges() ||
+    m_assetBrowser.DrawDeletionConfirmation(IsSceneEditingLocked() || m_inspectorPanel.HasUnsavedChanges() ||
         m_materialLeaveAction != MaterialLeaveAction::None || m_sceneOperationPending);
 
     DrawBuildGame(demoScene);
@@ -1730,7 +1745,8 @@ void Editor::Draw(
         m_viewportFocused = false;
     }
 
-    if(m_viewportFocused && !io.WantTextInput && !ImGuizmo::IsUsing() && !ImGui::IsMouseDown(ImGuiMouseButton_Right))
+    if(m_viewportFocused && !IsGamePlaying() && !io.WantTextInput && !ImGuizmo::IsUsing() &&
+        !ImGui::IsMouseDown(ImGuiMouseButton_Right))
     {
         if (ImGui::IsKeyPressed(ImGuiKey_W, false))
         {
@@ -1789,8 +1805,12 @@ void Editor::Draw(
     HandleTransformUndo(demoScene);
     HandleTransformRedo(demoScene);
 
-    UpdateCameraLook(demoScene, m_viewportImage.size.x, m_viewportImage.size.y);
-    UpdateCameraMovement(demoScene, deltaTime);
+    // Game Play renders from the gameplay camera; the Editor camera stays where Stop returns to it.
+    if(!IsGamePlaying())
+    {
+        UpdateCameraLook(demoScene, m_viewportImage.size.x, m_viewportImage.size.y);
+        UpdateCameraMovement(demoScene, deltaTime);
+    }
     EditorPhaseTiming::Scope viewportToolsPhase(PhaseTiming(), EditorPhaseTiming::Phase::TailViewportTools);
     DrawViewportTools(demoScene, debugUI.GetEditorIcons(), viewportWasFocused);
     viewportToolsPhase.End();
@@ -1989,7 +2009,7 @@ void Editor::DrawSelectedObjectTransformControls(IDemoScene& demoScene)
         return;
     }
 
-    ImGui::BeginDisabled(IsPhysicsEditingLocked());
+    ImGui::BeginDisabled(IsSceneEditingLocked());
     Transform transform = objects[m_selectedObject].transform;
 
     bool transformChanged = false;
@@ -2057,7 +2077,7 @@ void Editor::DrawSelectedObjectTransformControls(IDemoScene& demoScene)
         return std::isfinite(value.x) && std::isfinite(value.y) && std::isfinite(value.z);
     };
 
-    if(!IsPhysicsEditingLocked() && m_fieldHistoryTarget && transformChanged && finite(transform.position) && finite(transform.rotation) && finite(transform.scale))
+    if(!IsSceneEditingLocked() && m_fieldHistoryTarget && transformChanged && finite(transform.position) && finite(transform.rotation) && finite(transform.scale))
     {
         ApplyObjectTransformEdit(demoScene, m_selectedObject, transform);
     }
@@ -2264,7 +2284,7 @@ void Editor::DrawTransformGizmo(
     EditorPhaseTiming::Scope gizmoPhase(PhaseTiming(), EditorPhaseTiming::Phase::TailGizmo);
     Scene& scene = demoScene.GetScene();
 
-    if (IsPhysicsEditingLocked() || scene.HasPhysicsPresentation())
+    if (IsSceneEditingLocked() || scene.HasPhysicsPresentation())
     {
         // Block the whole selection, including mixed groups and existing drags.
         // Never decompose a simulated model into an authored history entry.
@@ -2974,10 +2994,13 @@ void Editor::ResetSceneInteractions()
     DismissControllerManagementPopup();
     DismissCameraManagementPopup();
     DismissLightManagementPopup();
+    DismissScriptManagementPopup();
     m_triggerInspection.reset();
     m_controllerInspection.reset();
     m_cameraInspection.reset();
     m_lightInspection.reset();
+    m_scriptInspection.reset();
+    m_scriptEditStatus.clear();
     m_lightColorGestureActive = false;
     m_triggerEditStatus.clear();
     m_controllerEditStatus.clear();
@@ -3047,7 +3070,7 @@ void Editor::ImportFileDrop(
     const ProjectPaths& paths,
     ProjectAssetRegistry& registry)
 {
-    if (IsPhysicsEditingLocked())
+    if (IsSceneEditingLocked())
     {
         return;
     }
@@ -3063,7 +3086,7 @@ void Editor::ImportFileDrop(
 
 void Editor::ProcessAssetDeletion(const ProjectPaths& paths, ProjectAssetRegistry& registry)
 {
-    if (IsPhysicsEditingLocked())
+    if (IsSceneEditingLocked())
     {
         return;
     }
@@ -3119,7 +3142,7 @@ void Editor::ProcessAssetRename(
     ProjectAssetRegistry& registry,
     const std::filesystem::path& activeScenePath)
 {
-    if (IsPhysicsEditingLocked())
+    if (IsSceneEditingLocked())
     {
         return;
     }
@@ -3178,7 +3201,7 @@ void Editor::ProcessAssetRename(
 
 void Editor::ProcessAssetMove(const ProjectPaths& paths, ProjectAssetRegistry& registry)
 {
-    if (IsPhysicsEditingLocked())
+    if (IsSceneEditingLocked())
     {
         return;
     }
@@ -3280,7 +3303,7 @@ void Editor::PublishCreatedObjectSelection(
 void Editor::DrawMaterialDropTarget(IDemoScene& scene, const ProjectPaths& paths,
     const ProjectAssetRegistry& registry)
 {
-    if (IsPhysicsEditingLocked())
+    if (IsSceneEditingLocked())
     {
         return;
     }
@@ -3352,7 +3375,7 @@ void Editor::DrawMaterialDropTarget(IDemoScene& scene, const ProjectPaths& paths
 void Editor::DrawMeshDropTarget(const IDemoScene& scene, const ProjectPaths& paths,
     const ProjectAssetRegistry& registry)
 {
-    if (IsPhysicsEditingLocked())
+    if (IsSceneEditingLocked())
     {
         return;
     }
@@ -3460,7 +3483,7 @@ void Editor::OnMeshCreationCompleted(bool succeeded, const std::string& error)
 
 bool Editor::SceneObjectDeletionBlocked() const
 {
-    if (IsPhysicsEditingLocked())
+    if (IsSceneEditingLocked())
     {
         return true;
     }
@@ -4030,7 +4053,7 @@ void Editor::AppendSceneHistoryEntry(SceneHistoryEntry entry) noexcept
 
 bool Editor::HistoryReplayBlocked() const
 {
-    if (IsPhysicsEditingLocked())
+    if (IsSceneEditingLocked())
     {
         return true;
     }
@@ -4048,7 +4071,7 @@ bool Editor::HistoryReplayBlocked() const
 
 void Editor::ReplaySceneHistory(IDemoScene& demoScene, bool redo)
 {
-    if (IsPhysicsEditingLocked())
+    if (IsSceneEditingLocked())
     {
         return;
     }
@@ -4227,6 +4250,35 @@ void Editor::ReplaySceneHistory(IDemoScene& demoScene, bool redo)
         m_historyCursor = redo ? m_historyCursor + 1 : m_historyCursor - 1;
         m_lightInspection.reset();
         ++m_lightControlsRevision;
+        m_sceneHistoryStatus.clear();
+        return;
+    }
+
+    if(const auto* script = std::get_if<std::unique_ptr<ScriptEdit>>(&entry.command); script && *script)
+    {
+        const auto& edit = **script;
+        auto* owner = dynamic_cast<FileBackedDemoScene*>(&demoScene);
+
+        if(!owner || !RenameSessionMatches(demoScene, edit.session))
+        {
+            ReportSceneHistoryFailure("Script replay belongs to a stale scene session.");
+            return;
+        }
+
+        std::string error;
+        // Resolved by stable ID now; the runtime checks the expected value before restoring.
+        const auto selection = owner->GetObjectMetadata(edit.objectID, &error);
+
+        if(!selection || !owner->SetObjectScript(*selection, redo ? edit.before : edit.after,
+            redo ? edit.after : edit.before, &error))
+        {
+            ReportSceneHistoryFailure(error);
+            return;
+        }
+
+        m_historyCursor = redo ? m_historyCursor + 1 : m_historyCursor - 1;
+        m_scriptInspection.reset();
+        ++m_scriptControlsRevision;
         m_sceneHistoryStatus.clear();
         return;
     }
@@ -4662,7 +4714,7 @@ bool Editor::CommitObjectPhysics(IDemoScene& scene, const SceneObjectMetadata& s
     const std::optional<Physics::PhysicsComponent>& after)
 {
     auto* owner = dynamic_cast<FileBackedDemoScene*>(&scene);
-    if(IsPhysicsEditingLocked() || !owner || !m_historySession ||
+    if(IsSceneEditingLocked() || !owner || !m_historySession ||
         !RenameSessionMatches(scene, *m_historySession) || HasPendingSceneHistoryOperation() ||
         m_sceneOperationPending || HasBlockingObjectCreation())
     {
@@ -4844,7 +4896,7 @@ void Editor::DrawObjectPhysicsControls(IDemoScene& scene)
         m_physicsInspection->structureRevision != selection->structureRevision;
     const bool changedValue = m_physicsInspectedValue != object.physics;
 
-    if(changedTarget || changedValue || IsPhysicsEditingLocked())
+    if(changedTarget || changedValue || IsSceneEditingLocked())
     {
         m_physicsInspection = selection;
         m_physicsInspectionEpoch = m_historyEpoch;
@@ -4868,7 +4920,7 @@ void Editor::DrawObjectPhysicsControls(IDemoScene& scene)
     ImGui::PushID(static_cast<int>(m_historyEpoch));
     ImGui::PushID(selection->objectID.c_str());
     ImGui::Separator();
-    ImGui::BeginDisabled(IsPhysicsEditingLocked() || HasPendingSceneHistoryOperation());
+    ImGui::BeginDisabled(IsSceneEditingLocked() || HasPendingSceneHistoryOperation());
 
     bool enabled = object.physics.has_value();
 
@@ -5081,7 +5133,7 @@ bool Editor::QueueHierarchyEdit(IDemoScene& scene, SceneHierarchyEdit edit,
 {
     const auto* owner = dynamic_cast<const FileBackedDemoScene*>(&scene);
 
-    if(IsPhysicsEditingLocked() || !owner || !m_historySession ||
+    if(IsSceneEditingLocked() || !owner || !m_historySession ||
         !CanPreserveSceneHistory(scene, m_historySession->projectIdentity, m_historyEpoch) ||
         HasPendingSceneHistoryOperation() || m_sceneOperationPending || HasBlockingObjectCreation() ||
         HasBlockingMaterialOperation() || m_transformFieldEditing || m_gizmoWasUsing)
@@ -5153,7 +5205,7 @@ bool Editor::PrepareHierarchyDrop(IDemoScene& scene, const HierarchyDropRequest&
 {
     const auto* owner = dynamic_cast<const FileBackedDemoScene*>(&scene);
 
-    if(!owner || owner->IsArchiveActivation() || IsPhysicsEditingLocked() || !m_historySession ||
+    if(!owner || owner->IsArchiveActivation() || IsSceneEditingLocked() || !m_historySession ||
         !CanPreserveSceneHistory(scene, m_historySession->projectIdentity, m_historyEpoch) ||
         request.identity != HierarchyDragIdentity{m_historyEpoch, owner->GetRuntimeIdentity(),
             scene.GetScene().GetStructureRevision(), owner->m_runtime->GetHierarchyRevision()} ||

@@ -580,6 +580,42 @@ void WriteLightComponent(Writer& writer, const std::optional<LightComponent>& li
 
 // Payloads before 14 carry legacy units: their range goes to legacyRange and the historical rules apply
 // (MigrateLegacyLightUnits converts the document afterwards).
+// V16 Script: u32 presence; when present u32 enabled, then the script reference and class name strings.
+void WriteScriptComponent(Writer& writer, const std::optional<ScriptComponent>& script)
+{
+    writer.WriteUnsigned(script.has_value() ? 1 : 0, 4);
+
+    if(!script)
+    {
+        return;
+    }
+
+    writer.WriteUnsigned(script->enabled ? 1 : 0, 4);
+    writer.WriteString(script->scriptReference);
+    writer.WriteString(script->className);
+}
+
+std::optional<ScriptComponent> ReadScriptComponent(Reader& reader)
+{
+    const auto presence = reader.ReadUnsigned(4);
+    Require(presence <= 1, "Invalid cooked Script presence flag.");
+
+    if(presence == 0)
+    {
+        return std::nullopt;
+    }
+
+    const auto enabled = reader.ReadUnsigned(4);
+    Require(enabled <= 1, "Invalid cooked Script enabled flag.");
+    ScriptComponent script;
+    script.enabled = enabled != 0;
+    script.scriptReference = reader.ReadString();
+    script.className = reader.ReadString();
+    std::string error;
+    Require(ValidateScriptComponent(script, &error), error.c_str());
+    return script;
+}
+
 std::optional<LightComponent> ReadLightComponent(Reader& reader, std::uint32_t version, float& legacyRange)
 {
     const auto presence = reader.ReadUnsigned(4);
@@ -720,6 +756,7 @@ std::vector<std::byte> Encode(const Metadata& sceneMetadata, const Policy& polic
         WriteCharacterController(writer, object.characterController);
         WriteCameraComponent(writer, object.camera);
         WriteLightComponent(writer, object.light);
+        WriteScriptComponent(writer, object.script);
     }
 
     if (sceneMetadata.environment)
@@ -1066,6 +1103,18 @@ Metadata Decode(std::span<const std::byte> bytes, const Policy& policy)
             catch(const std::exception& exception)
             {
                 throw std::runtime_error("Invalid cooked Light for object " + object.id + ": " + exception.what());
+            }
+        }
+
+        if(payloadVersion >= ScriptVersion)
+        {
+            try
+            {
+                object.script = ReadScriptComponent(reader);
+            }
+            catch(const std::exception& exception)
+            {
+                throw std::runtime_error("Invalid cooked Script for object " + object.id + ": " + exception.what());
             }
         }
 

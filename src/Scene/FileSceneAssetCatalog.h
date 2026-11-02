@@ -109,6 +109,9 @@ public:
         std::uint64_t runtimeIdentity, const Scene& scene,
         const std::function<bool(const AssetID&, const MaterialAssetData&)>& mayPublish);
     void CancelTextureStreaming();
+    // Every streamed texture is resident, failed or superseded, so no further material
+    // publication is coming (the condition the settled-residency report uses).
+    bool IsTextureStreamingSettled() const;
     const std::string& GetLastMaterialError() const noexcept
     {
         return m_materialError;

@@ -19,7 +19,8 @@ bool Engine::CanStartEditorPhysics() const
 void Engine::RefreshEditorPhysicsStatus(bool compatibleScene)
 {
     using State = PhysicsSimulationController::State;
-    const auto state = m_physicsSimulation.GetState();
+    // While Game Play owns the shared simulation, the Physics Simulation tool reads as stopped.
+    const auto state = IsEditorGameOwningSimulation() ? State::Inactive : m_physicsSimulation.GetState();
     const auto editorState = state == State::Active ? Editor::PhysicsState::Playing :
         state == State::Stopping ? Editor::PhysicsState::Stopping : Editor::PhysicsState::Stopped;
     m_editor.SetPhysicsStatus(editorState, compatibleScene && CanStartEditorPhysics(), m_physicsMessage);
@@ -27,6 +28,12 @@ void Engine::RefreshEditorPhysicsStatus(bool compatibleScene)
 
 bool Engine::StopEditorPhysicsSimulation(FileSceneRuntime& runtime)
 {
+    // Every generic teardown ends Game Play through its runtime first, so OnStop still runs.
+    if (m_gameRuntime.IsRunning())
+    {
+        m_gameStopping = !m_gameRuntime.Stop(runtime, m_renderer);
+    }
+
     const auto result = m_physicsSimulation.Stop(runtime, m_renderer);
     if (result.status == PhysicsSimulationController::Status::Failed && result.message != m_physicsMessage)
     {
@@ -53,6 +60,13 @@ void Engine::ProcessEditorPhysicsSimulation(FileSceneRuntime* runtime, double el
         }
         m_editor.SetCharacterDiagnostics(nullptr);
         RefreshEditorPhysicsStatus(false);
+        return;
+    }
+    if (m_gameRuntime.IsActive())
+    {
+        // Game Play advances the shared simulation; the toolbar refuses Physics Play meanwhile.
+        m_editor.SetCharacterDiagnostics(nullptr);
+        RefreshEditorPhysicsStatus(compatibleScene);
         return;
     }
     const bool leavingScene = m_pendingEditorSceneOperation.has_value() || m_demoSceneManager.HasPendingSceneChange();

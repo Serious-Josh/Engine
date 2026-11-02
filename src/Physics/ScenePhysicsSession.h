@@ -94,6 +94,12 @@ public:
     // Consumed by that step: accepted only if grounded at the step start (vertical velocity
     // becomes jumpSpeed), otherwise discarded. No buffering, coyote time or later replay.
     bool SubmitCharacterJump(std::string_view objectID, std::uint64_t fixedStep, std::string* errorMessage = nullptr);
+    // AS.6B runtime facing: rotates an upright controller about world Y immediately (between
+    // steps), with its kinematic host and owned Trigger Collider. The capsule is symmetric about
+    // its vertical axis, so collision is unchanged; a sideways local offset would move the
+    // capsule and is rejected. Runtime-only: discarded with the session.
+    bool SetCharacterYaw(std::string_view objectID, float yaw, std::string* errorMessage = nullptr);
+    std::optional<float> GetCharacterYaw(std::string_view objectID) const;
     static constexpr std::uint64_t MaximumCharacterCommandLeadSteps = 600;
     // Spawn admission: shapes within radius + collisionClearance + guard must all be walkable
     // floor contact (no wall/ceiling/unclassifiable overlap), and the solid capsule shrunk by
@@ -174,8 +180,10 @@ private:
     {
         CharacterControllerComponent configuration;
         Pose spawnPose;
-        // Accepted current pose: object origin, orientation fixed at the authored yaw.
+        // Accepted current pose: object origin, upright orientation at the current yaw.
         Pose pose;
+        // Runtime yaw in radians about world +Y; starts at the authored yaw (AS.6B SetCharacterYaw).
+        float yaw = 0.0f;
         // World-space offset from object origin to capsule center (rotated local offset).
         Vector3 centerOffset;
         // Capsule, gravity, jump, slope and snap constants derived once at admission.

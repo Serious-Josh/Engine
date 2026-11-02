@@ -7,7 +7,7 @@
 #include <exception>
 void Editor::HandleSceneObjectDuplication(IDemoScene& scene)
 {
-    if (IsPhysicsEditingLocked())
+    if (IsSceneEditingLocked())
     {
         return;
     }
@@ -44,7 +44,7 @@ bool Editor::QueueSceneObjectDuplication(IDemoScene& scene, const SceneObjectMet
 {
     const auto* owner = dynamic_cast<const FileBackedDemoScene*>(&scene);
 
-    if(!owner || owner->IsArchiveActivation() || !m_historySession || IsPhysicsEditingLocked() ||
+    if(!owner || owner->IsArchiveActivation() || !m_historySession || IsSceneEditingLocked() ||
         !SceneObjectDeletionMatches(scene, target) ||
         !CanPreserveSceneHistory(scene, m_historySession->projectIdentity, m_historyEpoch) ||
         HasPendingSceneHistoryOperation() || m_sceneOperationPending || HasBlockingObjectCreation())

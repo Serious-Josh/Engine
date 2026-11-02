@@ -1,9 +1,50 @@
 #include "Input.h"
 
+void Input::AddRawMouseDelta(int x, int y)
+{
+    m_rawMouseDeltaX += x;
+    m_rawMouseDeltaY += y;
+}
+
+int Input::GetRawMouseDeltaX() const
+{
+    return m_rawMouseDeltaX;
+}
+
+int Input::GetRawMouseDeltaY() const
+{
+    return m_rawMouseDeltaY;
+}
+
+void Input::ClearRawMouseDelta()
+{
+    m_rawMouseDeltaX = 0;
+    m_rawMouseDeltaY = 0;
+}
+
+void Input::Clear()
+{
+    ClearRawMouseDelta();
+
+    for (unsigned int i = 0; i < 256; ++i)
+    {
+        m_keys[i] = false;
+        m_previousKeys[i] = false;
+    }
+
+    for (unsigned int i = 0; i < 3; ++i)
+    {
+        m_mouseButtons[i] = false;
+        m_previousMouseButtons[i] = false;
+    }
+}
+
 void Input::Update()
 {
     m_scrollX = 0.0f;
     m_scrollY = 0.0f;
+    // Raw motion is consumed per frame; messages after this call belong to the new frame.
+    ClearRawMouseDelta();
 
     for (unsigned int i = 0; i < 256; ++i)
     {

@@ -1,0 +1,784 @@
+#include "Engine/GameRuntime.h"
+#include "Renderer/Renderer.h"
+#include "Core/Log.h"
+#include "Core/Input.h"
+
+#include <Windows.h>
+
+#include <algorithm>
+#include <map>
+
+namespace
+{
+std::string DescribeDiagnostic(const Scripting::Diagnostic& diagnostic)
+{
+    std::string location = diagnostic.section.empty() ? std::string("script") : diagnostic.section;
+
+    if(diagnostic.line > 0)
+    {
+        location += "(" + std::to_string(diagnostic.line) + "," + std::to_string(diagnostic.column) + ")";
+    }
+
+    return location + ": " + diagnostic.severity + ": " + diagnostic.text;
+}
+
+// Logs every diagnostic and returns "<context>: <first error>" for the host's status message.
+// AngelScript precedes compile errors with informational "Compiling ..." lines; they are logged
+// but never chosen as the summary while an error exists.
+std::string ReportScriptResult(const Scripting::Result& result, const std::string& context)
+{
+    std::string first;
+    std::string firstError;
+
+    for(const auto& diagnostic : result.diagnostics)
+    {
+        const auto text = DescribeDiagnostic(diagnostic);
+        Log::Error(context + ": " + text);
+
+        if(first.empty() && diagnostic.severity != "Stack")
+        {
+            first = text;
+        }
+
+        if(firstError.empty() && diagnostic.severity == "Error")
+        {
+            firstError = text;
+        }
+    }
+
+    const auto& summary = firstError.empty() ? first : firstError;
+    return summary.empty() ? context + "." : context + ": " + summary;
+}
+
+bool Succeeded(const Scripting::Result& result)
+{
+    return result.status == Scripting::Status::Finished;
+}
+}
+
+bool GameRuntime::ObjectTable::IsValid(std::uint32_t slot) const
+{
+    return Find(slot) != nullptr;
+}
+
+const SceneObjectDocument* GameRuntime::ObjectTable::Find(std::uint32_t slot) const
+{
+    if(!runtime || runtime->GetRuntimeIdentity() != runtimeIdentity || slot >= objectIDs.size())
+    {
+        return nullptr;
+    }
+
+    const auto& objects = runtime->GetFileScene().GetDocument().objects;
+    const auto found = std::find_if(objects.begin(), objects.end(),
+        [&](const SceneObjectDocument& object) { return object.id == objectIDs[slot]; });
+    return found == objects.end() ? nullptr : &*found;
+}
+
+std::string GameRuntime::ObjectTable::GetName(std::uint32_t slot) const
+{
+    const auto* object = Find(slot);
+    return object ? object->name : std::string();
+}
+
+bool GameRuntime::ObjectTable::GetPosition(std::uint32_t slot, float (&position)[3]) const
+{
+    if(!Find(slot))
+    {
+        return false;
+    }
+
+    // The accepted presentation pose: the current physics pose during gameplay.
+    const auto& mapping = runtime->GetObjectMapping().idToRuntimeIndex;
+    const auto found = mapping.find(objectIDs[slot]);
+    const auto& objects = runtime->GetScene().GetRenderObjects();
+
+    if(found == mapping.end() || found->second >= objects.size())
+    {
+        return false;
+    }
+
+    const Matrix4 world = objects[found->second].GetPresentationTransform().currentModel;
+    position[0] = world.m[0][3];
+    position[1] = world.m[1][3];
+    position[2] = world.m[2][3];
+    return true;
+}
+
+bool GameRuntime::ObjectTable::HasCharacterController(std::uint32_t slot) const
+{
+    // Controllers exist only in the live simulation the session started.
+    const auto* object = Find(slot);
+    return object && object->characterController && owner && owner->IsActive();
+}
+
+bool GameRuntime::ObjectTable::MoveCharacter(std::uint32_t slot, const float (&velocity)[3], std::string& error)
+{
+    if(!HasCharacterController(slot) || slot >= requests.size())
+    {
+        error = "CharacterController is not valid.";
+        return false;
+    }
+
+    if(!std::isfinite(velocity[0]) || !std::isfinite(velocity[1]) || !std::isfinite(velocity[2]))
+    {
+        error = "CharacterController.Move velocity must be finite.";
+        return false;
+    }
+
+    if(velocity[1] != 0.0f)
+    {
+        error = "CharacterController.Move takes a horizontal velocity: y must be 0.";
+        return false;
+    }
+
+    // The latest request of the frame wins; the native controller enforces its speed limit.
+    requests[slot].velocity = {velocity[0], 0.0f, velocity[2]};
+    requests[slot].moving = true;
+    return true;
+}
+
+bool GameRuntime::ObjectTable::JumpCharacter(std::uint32_t slot, std::string& error)
+{
+    if(!HasCharacterController(slot) || slot >= requests.size())
+    {
+        error = "CharacterController is not valid.";
+        return false;
+    }
+
+    requests[slot].jump = true;
+    return true;
+}
+
+bool GameRuntime::ObjectTable::IsCharacterGrounded(std::uint32_t slot) const
+{
+    if(!HasCharacterController(slot))
+    {
+        return false;
+    }
+
+    // Published diagnostics describe the presented poses, never a newer unpublished step.
+    const auto* diagnostics = owner->m_physics.GetPublishedCharacterDiagnostics();
+    const auto* controller = diagnostics && diagnostics->sessionGeneration == owner->m_physicsSession ?
+        diagnostics->Find(objectIDs[slot]) : nullptr;
+    return controller && controller->ground.grounded;
+}
+
+namespace
+{
+int VirtualKey(Scripting::Key key)
+{
+    switch(key)
+    {
+    case Scripting::Key::W:
+        return 'W';
+    case Scripting::Key::A:
+        return 'A';
+    case Scripting::Key::S:
+        return 'S';
+    case Scripting::Key::D:
+        return 'D';
+    case Scripting::Key::Space:
+        return VK_SPACE;
+    }
+
+    return 0;
+}
+}
+
+std::optional<RenderObjectID> GameRuntime::ObjectTable::RuntimeIndex(std::uint32_t slot) const
+{
+    if(!Find(slot))
+    {
+        return std::nullopt;
+    }
+
+    const auto& mapping = runtime->GetObjectMapping().idToRuntimeIndex;
+    const auto found = mapping.find(objectIDs[slot]);
+
+    if(found == mapping.end() || found->second >= runtime->GetScene().GetRenderObjects().size())
+    {
+        return std::nullopt;
+    }
+
+    return found->second;
+}
+
+bool GameRuntime::ObjectTable::GetCharacterYaw(std::uint32_t slot, float& yaw) const
+{
+    if(!HasCharacterController(slot))
+    {
+        return false;
+    }
+
+    const auto current = owner->m_physics.GetCharacterYaw(objectIDs[slot]);
+    yaw = current.value_or(0.0f);
+    return current.has_value();
+}
+
+bool GameRuntime::ObjectTable::SetCharacterYaw(std::uint32_t slot, float yaw, std::string& error)
+{
+    if(!HasCharacterController(slot))
+    {
+        error = "CharacterController is not valid.";
+        return false;
+    }
+
+    // Immediate: the next publication presents it in this frame, with or without a fixed step.
+    return owner->m_physics.SetCharacterYaw(owner->m_physicsSession, objectIDs[slot], yaw, error);
+}
+
+bool GameRuntime::ObjectTable::FindChild(std::uint32_t slot, std::string_view name, std::uint32_t& child)
+{
+    const auto* parent = Find(slot);
+
+    if(!parent)
+    {
+        return false;
+    }
+
+    // The first direct child with that exact name, in document order.
+    const auto& objects = runtime->GetFileScene().GetDocument().objects;
+    const auto found = std::find_if(objects.begin(), objects.end(),
+        [&](const SceneObjectDocument& object) { return object.parentID == parent->id && object.name == name; });
+
+    if(found == objects.end())
+    {
+        return false;
+    }
+
+    const auto existing = std::find(objectIDs.begin(), objectIDs.end(), found->id);
+
+    if(existing != objectIDs.end())
+    {
+        child = static_cast<std::uint32_t>(existing - objectIDs.begin());
+        return true;
+    }
+
+    // Handles to further objects join this session's table; the table dies with the session.
+    if(objectIDs.size() >= 65536)
+    {
+        return false;
+    }
+
+    child = static_cast<std::uint32_t>(objectIDs.size());
+    objectIDs.push_back(found->id);
+    requests.emplace_back();
+    return true;
+}
+
+bool GameRuntime::ObjectTable::GetLocalRotation(std::uint32_t slot, float (&rotation)[3]) const
+{
+    const auto index = RuntimeIndex(slot);
+
+    if(!index)
+    {
+        return false;
+    }
+
+    const auto& scene = runtime->GetScene();
+    const auto& runtimeLocal = scene.GetRuntimeLocalTransform(*index);
+    const Vector3 value = runtimeLocal ? runtimeLocal->rotation : scene.GetRenderObjects()[*index].transform.rotation;
+    rotation[0] = value.x;
+    rotation[1] = value.y;
+    rotation[2] = value.z;
+    return true;
+}
+
+bool GameRuntime::ObjectTable::SetLocalRotation(std::uint32_t slot, const float (&rotation)[3], std::string& error)
+{
+    const auto* object = Find(slot);
+    const auto index = RuntimeIndex(slot);
+
+    if(!object || !index)
+    {
+        error = "SceneObject is not valid.";
+        return false;
+    }
+
+    if(object->physics || object->characterController)
+    {
+        error = "A physics-driven object cannot be rotated with SetLocalRotation; use CharacterController.SetYaw.";
+        return false;
+    }
+
+    if(!std::isfinite(rotation[0]) || !std::isfinite(rotation[1]) || !std::isfinite(rotation[2]))
+    {
+        error = "SetLocalRotation requires finite Euler angles.";
+        return false;
+    }
+
+    // Runtime-only local transform: position and scale stay as authored (or as last set).
+    auto& scene = runtime->GetScene();
+    Transform local = scene.GetRuntimeLocalTransform(*index).value_or(scene.GetRenderObjects()[*index].transform);
+    local.rotation = {rotation[0], rotation[1], rotation[2]};
+    return scene.SetRuntimeLocalTransform(*index, local, &error);
+}
+
+bool GameRuntime::ObjectTable::GetForward(std::uint32_t slot, float (&forward)[3]) const
+{
+    const auto index = RuntimeIndex(slot);
+
+    if(!index)
+    {
+        return false;
+    }
+
+    // Local +Z of the presented world transform (the camera view direction convention).
+    const Matrix4 world = runtime->GetScene().GetRenderObjects()[*index].GetPresentationTransform().currentModel;
+    const Vector3 axis{world.m[0][2], world.m[1][2], world.m[2][2]};
+    const float length = std::sqrt(axis.x * axis.x + axis.y * axis.y + axis.z * axis.z);
+
+    if(!(length > 0.0f) || !std::isfinite(length))
+    {
+        return false;
+    }
+
+    forward[0] = axis.x / length;
+    forward[1] = axis.y / length;
+    forward[2] = axis.z / length;
+    return true;
+}
+
+void GameRuntime::GameplayInput::GetMouseDelta(float (&delta)[2]) const
+{
+    // Raw pixels, never scaled by frame time; only while the host granted the cursor lock.
+    const bool available = input && cursorCaptured;
+    delta[0] = available ? static_cast<float>(input->GetRawMouseDeltaX()) : 0.0f;
+    delta[1] = available ? static_cast<float>(input->GetRawMouseDeltaY()) : 0.0f;
+}
+
+void GameRuntime::GameplayInput::SetCursorLocked(bool locked)
+{
+    if(cursorLockRequest)
+    {
+        *cursorLockRequest = locked;
+    }
+}
+
+bool GameRuntime::GameplayInput::IsKeyDown(Scripting::Key key) const
+{
+    return input && input->IsKeyDown(VirtualKey(key));
+}
+
+bool GameRuntime::GameplayInput::WasKeyPressed(Scripting::Key key) const
+{
+    return input && input->WasKeyPressed(VirtualKey(key));
+}
+
+bool GameRuntime::Start(FileSceneRuntime& runtime, Renderer& renderer, bool requireMainCamera,
+    std::uint32_t viewWidth, std::uint32_t viewHeight, std::string& error, const ScriptModuleSource& scripts)
+{
+    if(IsActive())
+    {
+        error = "Game Play is already running.";
+        return false;
+    }
+
+    // A session whose simulation was ended outside Stop is stale; Engine teardown paths call Stop
+    // first, so only direct controller use reaches here. Its scripts are released without OnStop.
+    ReleaseScripts();
+    m_running = false;
+
+    m_physicsSession = 0;
+    m_scriptFault.clear();
+    m_cursorLockRequested = false;
+    RenderView view;
+
+    // The camera is checked first so a missing Main Camera never starts a simulation.
+    if(requireMainCamera && !ResolveMainCameraView(runtime, viewWidth, viewHeight, view, &error))
+    {
+        error = "No usable Main Camera: " + error;
+        return false;
+    }
+
+    // Scripts compile and validate before anything starts; an invalid script never starts physics.
+    std::vector<PendingScript> pending;
+
+    if(!PrepareScripts(runtime, scripts, pending, error))
+    {
+        ReleaseScripts();
+        return false;
+    }
+
+    const auto started = m_physics.Start(runtime, renderer);
+
+    if(started.status != PhysicsSimulationController::Status::Started)
+    {
+        ReleaseScripts();
+        error = started.message;
+        return false;
+    }
+
+    // Constructors run script code; a failure discards every instance and the simulation.
+    m_objects.runtime = &runtime;
+
+    if(!CreateScriptInstances(pending, error))
+    {
+        m_objects.runtime = nullptr;
+        ReleaseScripts();
+        m_physics.Stop(runtime, renderer);
+        return false;
+    }
+
+    m_physicsSession = m_physics.GetSessionGeneration();
+    m_runtimeIdentity = runtime.GetRuntimeIdentity();
+    m_mainCamera = requireMainCamera;
+    m_running = true;
+    RunScriptCallbacks(runtime, Scripting::Lifecycle::Start);
+    error.clear();
+    return true;
+}
+
+bool GameRuntime::PrepareScripts(FileSceneRuntime& runtime, const ScriptModuleSource& scripts,
+    std::vector<PendingScript>& pending, std::string& error)
+{
+    const auto& objects = runtime.GetFileScene().GetDocument().objects;
+    m_objects = {};
+    m_objects.owner = this;
+    m_objects.runtimeIdentity = runtime.GetRuntimeIdentity();
+    // Each Script asset compiles once per session, shared by every object that uses it.
+    std::map<std::string, std::pair<Scripting::ModuleID, std::vector<std::string>>> modules;
+
+    for(const auto& object : objects)
+    {
+        if(!object.script || !object.script->enabled)
+        {
+            continue;
+        }
+
+        const auto& script = *object.script;
+        const std::string label = "'" + object.name + "'";
+        const auto assetID = AssetID::ParseReference(script.scriptReference);
+
+        if(!assetID)
+        {
+            error = "Object " + label + " has a Script component without a script asset.";
+            return false;
+        }
+
+        if(script.className.empty())
+        {
+            error = "Object " + label + " has a Script component without a selected class.";
+            return false;
+        }
+
+        if(!scripts)
+        {
+            error = "Scripts are unavailable in this runtime.";
+            return false;
+        }
+
+        if(!m_scripts)
+        {
+            m_scripts = std::make_unique<Scripting::ScriptHost>();
+            const auto initialized = m_scripts->Initialize();
+
+            if(initialized.status != Scripting::Status::Ready)
+            {
+                error = ReportScriptResult(initialized, "Script engine initialization failed");
+                return false;
+            }
+        }
+
+        auto module = modules.find(script.scriptReference);
+
+        if(module == modules.end())
+        {
+            Scripting::ModuleID built = 0;
+            const auto result = scripts(*m_scripts, *assetID, built);
+
+            if(result.status != Scripting::Status::Compiled)
+            {
+                const std::string asset = result.snapshot ? result.snapshot->rootSection : script.scriptReference;
+                error = ReportScriptResult(result, "Script " + asset + " failed to compile");
+                return false;
+            }
+
+            module = modules.emplace(script.scriptReference, std::make_pair(built, result.classes)).first;
+        }
+
+        const auto& classes = module->second.second;
+
+        if(std::find(classes.begin(), classes.end(), script.className) == classes.end())
+        {
+            std::string available;
+
+            for(const auto& name : classes)
+            {
+                available += (available.empty() ? "" : ", ") + name;
+            }
+
+            error = "Object " + label + ": '" + script.className + "' is not an EAScript class of its script" +
+                (available.empty() ? " (it defines none)." : " (available: " + available + ").");
+            return false;
+        }
+
+        const auto slot = static_cast<std::uint32_t>(m_objects.objectIDs.size());
+        m_objects.objectIDs.push_back(object.id);
+        m_objects.requests.emplace_back();
+        pending.push_back({slot, module->second.first, script.className, label + " (" + script.className + ")"});
+    }
+
+    return true;
+}
+
+bool GameRuntime::CreateScriptInstances(const std::vector<PendingScript>& pending, std::string& error)
+{
+    if(pending.empty())
+    {
+        return true;
+    }
+
+    m_scripts->SetObjectResolver(&m_objects);
+
+    for(const auto& script : pending)
+    {
+        Scripting::InstanceID instance = 0;
+        const auto result = m_scripts->CreateInstance(script.module, script.className, script.slot, instance);
+
+        if(!Succeeded(result))
+        {
+            error = ReportScriptResult(result, "Script " + script.label + " failed to construct");
+            return false;
+        }
+
+        m_scriptInstances.push_back({instance, script.slot, script.label, false, false});
+    }
+
+    return true;
+}
+
+void GameRuntime::RunScriptCallbacks(FileSceneRuntime& runtime, Scripting::Lifecycle callback)
+{
+    if(!m_scripts || m_scriptInstances.empty())
+    {
+        return;
+    }
+
+    // Owner handles resolve only during a dispatch, against the runtime passed for it. Lifecycle
+    // callbacks see no frame input but may request the cursor lock.
+    m_objects.runtime = &runtime;
+    m_input.input = nullptr;
+    m_input.cursorCaptured = false;
+    m_input.cursorLockRequest = &m_cursorLockRequested;
+    m_scripts->SetInputSource(&m_input);
+    const bool starting = callback == Scripting::Lifecycle::Start;
+
+    for(auto& script : m_scriptInstances)
+    {
+        // OnStop runs once for, and only for, each instance whose OnStart completed.
+        if(!starting && !script.started)
+        {
+            continue;
+        }
+
+        const auto result = m_scripts->Invoke(script.instance, callback);
+        const bool succeeded = Succeeded(result);
+
+        if(starting)
+        {
+            script.started = succeeded;
+            script.updating = succeeded;
+        }
+
+        if(!succeeded)
+        {
+            // A faulted instance is disabled; the rest of the game keeps running.
+            m_objects.requests[script.slot] = {};
+            ReportScriptFault(ReportScriptResult(result, "Script " + script.label +
+                (starting ? " OnStart failed" : " OnStop failed")));
+        }
+    }
+
+    m_scripts->SetInputSource(nullptr);
+    m_objects.runtime = nullptr;
+}
+
+void GameRuntime::ReportScriptFault(const std::string& message)
+{
+    if(m_scriptFault.empty())
+    {
+        m_scriptFault = message;
+    }
+}
+
+void GameRuntime::RunScriptUpdates(FileSceneRuntime& runtime, const Frame& frame)
+{
+    // Without gameplay focus, requests left from focused frames are dropped (no delayed jump);
+    // scripts still run and may request movement that does not depend on input.
+    if(!frame.input)
+    {
+        for(auto& request : m_objects.requests)
+        {
+            request = {};
+        }
+    }
+
+    if(!m_scripts || m_scriptInstances.empty())
+    {
+        return;
+    }
+
+    m_objects.runtime = &runtime;
+    m_input.input = frame.input;
+    m_input.cursorCaptured = frame.input && frame.cursorCaptured;
+    m_input.cursorLockRequest = &m_cursorLockRequested;
+    m_scripts->SetInputSource(&m_input);
+    const float deltaTime = static_cast<float>(frame.deltaSeconds);
+
+    for(auto& script : m_scriptInstances)
+    {
+        if(!script.updating)
+        {
+            continue;
+        }
+
+        const auto result = m_scripts->Update(script.instance, deltaTime);
+
+        if(!Succeeded(result))
+        {
+            // Exception isolation: this instance stops updating and its requests are discarded.
+            script.updating = false;
+            m_objects.requests[script.slot] = {};
+            ReportScriptFault(ReportScriptResult(result, "Script " + script.label + " OnUpdate failed"));
+        }
+    }
+
+    m_scripts->SetInputSource(nullptr);
+    m_input.input = nullptr;
+    m_objects.runtime = nullptr;
+}
+
+void GameRuntime::SubmitCharacterRequests(double elapsedSeconds)
+{
+    // Exactly the steps the following Update will run (same due-tick arithmetic and step cap).
+    const std::size_t dueSteps = m_physics.PredictStepsForUpdate(elapsedSeconds);
+    const std::uint64_t firstStep = m_physics.GetNextFixedStep();
+
+    for(std::size_t slot = 0; slot < m_objects.requests.size(); ++slot)
+    {
+        auto& request = m_objects.requests[slot];
+        const auto& objectID = m_objects.objectIDs[slot];
+        std::string error;
+
+        if(dueSteps != 0 && request.moving && (request.velocity.x != 0.0f || request.velocity.z != 0.0f))
+        {
+            // Held velocity applies to every due step, catch-up steps included.
+            for(std::size_t offset = 0; offset < dueSteps; ++offset)
+            {
+                if(!m_physics.SubmitCharacterMovement(m_physicsSession, objectID, firstStep + offset,
+                    request.velocity, error))
+                {
+                    Log::Warning("Character movement request for " + objectID + " rejected: " + error);
+                    break;
+                }
+            }
+        }
+
+        // A jump waits for the first frame that runs a step, then is consumed by that step.
+        if(dueSteps != 0 && request.jump)
+        {
+            if(!m_physics.SubmitCharacterJump(m_physicsSession, objectID, firstStep, error))
+            {
+                Log::Warning("Character jump request for " + objectID + " rejected: " + error);
+            }
+
+            request.jump = false;
+        }
+
+        // Movement is per frame: a held key re-requests it from the next OnUpdate.
+        request.moving = false;
+        request.velocity = {};
+    }
+}
+
+void GameRuntime::ReleaseScripts() noexcept
+{
+    // Instances, modules and the engine die together; nothing survives into the next session.
+    m_scriptInstances.clear();
+    m_scripts.reset();
+    m_objects = {};
+}
+
+bool GameRuntime::Update(FileSceneRuntime& runtime, Renderer& renderer, const Frame& frame, std::string& error)
+{
+    if(!IsActive() || runtime.GetRuntimeIdentity() != m_runtimeIdentity || renderer.IsCommandRecordingActive())
+    {
+        error = "Game Play lost its runtime scene or idle renderer boundary.";
+        return false;
+    }
+
+    // Scripts run first, so their requests address the steps this frame is about to simulate.
+    RunScriptUpdates(runtime, frame);
+    SubmitCharacterRequests(frame.deltaSeconds);
+
+    // The shared controller owns the only clock and command consumption order.
+    // A deferred publication never causes the elapsed interval to be submitted twice.
+    const auto updated = m_physics.Update(runtime, renderer, frame.deltaSeconds);
+
+    if(updated.status != PhysicsSimulationController::Status::Updated)
+    {
+        error = updated.message;
+        return false;
+    }
+
+    const auto published = m_physics.PublishAtBoundary(runtime, renderer);
+
+    if(published.status != PhysicsSimulationController::Status::Published &&
+        published.status != PhysicsSimulationController::Status::Pending)
+    {
+        error = published.message;
+        return false;
+    }
+
+    error.clear();
+    return true;
+}
+
+bool GameRuntime::ResolveView(const FileSceneRuntime& runtime, std::uint32_t width, std::uint32_t height,
+    std::optional<RenderView>& view, std::string& error) const
+{
+    view.reset();
+
+    if(!m_mainCamera)
+    {
+        return true;
+    }
+
+    RenderView resolved;
+
+    if(!ResolveMainCameraView(runtime, width, height, resolved, &error))
+    {
+        return false;
+    }
+
+    view = std::move(resolved);
+    return true;
+}
+
+bool GameRuntime::Stop(FileSceneRuntime& runtime, Renderer& renderer)
+{
+    // Never stops a physics session it did not start (the Editor's Physics Simulation tool).
+    const bool owned = IsActive();
+
+    if(m_running && runtime.GetRuntimeIdentity() == m_runtimeIdentity)
+    {
+        RunScriptCallbacks(runtime, Scripting::Lifecycle::Stop);
+        // Runtime-only child rotations end with the session; the authored transforms return.
+        runtime.GetScene().ClearRuntimeLocalTransforms();
+    }
+
+    ReleaseScripts();
+    m_cursorLockRequested = false;
+    m_running = false;
+    m_physicsSession = 0;
+    m_mainCamera = false;
+
+    if(!owned)
+    {
+        return true;
+    }
+
+    m_physics.Stop(runtime, renderer);
+    return m_physics.GetState() == PhysicsSimulationController::State::Inactive;
+}
