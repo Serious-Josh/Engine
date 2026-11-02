@@ -44,6 +44,8 @@ class ComputePipeline
     bool Initialize(
         ID3D12Device* device,
         const ComputePipelineDescription& description);
+    // Shares immutable device objects; caller keeps the source alive through all submitted uses.
+    void CopyFrom(const ComputePipeline& source);
     void Shutdown();
 
     void Bind(ID3D12GraphicsCommandList* commandList) const;

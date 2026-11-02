@@ -2,6 +2,7 @@
 #include "Renderer/Passes/EditorColliderPass.h"
 #include "Renderer/Passes/EditorGridPass.h"
 #include "Renderer/Passes/PsrInPlaceReplacePass.h"
+#include "Renderer/PsrPipelinePreparation.h"
 #include "Debug/CpuFrameTiming.h"
 #include "Editor/TextureThumbnailCache.h"
 #include "Diagnostics/FrameHitchDiagnostics.h"
@@ -1604,6 +1605,12 @@ class Renderer
     EditorGridPass m_editorGridPass;
     // PSR.2 Stage 2 development prototype (PathTraceReferenceSettings::primarySurfaceReplacementInPlace).
     PsrInPlaceReplacePass m_psrInPlaceReplacePass;
+    std::shared_ptr<PsrPipelinePreparation> m_psrPreparedAuxiliary;
+    bool m_psrAuxiliaryReady = false;
+    bool m_psrAuxiliaryFailed = false;
+    std::uint32_t m_psrActiveChain = 0;
+    ShaderLibraryPreparation PreparePsrAuxiliary();
+
     // Whether the last recorded frame ran the in-place replacement pass (diagnostics).
     bool m_psrInPlaceReplacedLastFrame = false;
     // Multibounce PSR: this frame's effective chain length (1, or 2 for two-bounce PSR), decided with its lighting.

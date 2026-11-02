@@ -270,6 +270,28 @@ class NrdPathTracePreparePass
         return m_textureCreations;
     }
 
+    // Builds only private PSR pipelines, without allocating textures or ordinary pipelines.
+    bool PreparePsrVariant(GraphicsDevice& device, ShaderLibrary& shaders, Encoding encoding)
+    {
+        m_encoding = encoding;
+        m_initialized = true;
+        const bool ready = EnsurePsrVariant(device, shaders);
+        m_initialized = false;
+        return ready;
+    }
+
+    void AdoptPsrVariant(const NrdPathTracePreparePass& prepared)
+    {
+        if(!m_psrInitialized && prepared.m_psrInitialized && (!m_initialized || m_encoding == prepared.m_encoding))
+        {
+            m_psrPreparePipeline.CopyFrom(prepared.m_psrPreparePipeline);
+            m_psrResolvePipeline.CopyFrom(prepared.m_psrResolvePipeline);
+            m_psrDenoisedResolvePipeline.CopyFrom(prepared.m_psrDenoisedResolvePipeline);
+            m_psrInitialized = true;
+            m_psrFailed = false;
+        }
+    }
+
     private:
     // Fills in the resolution and the UAVs each entry point writes, uploads the constants and dispatches one thread per
     // pixel. The caller sets diffuseIndex and specularIndex (UAVs to write, SRVs to read). With psr set, pipeline is a

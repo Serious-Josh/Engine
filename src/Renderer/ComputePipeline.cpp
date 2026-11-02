@@ -109,6 +109,16 @@ bool ComputePipeline::Initialize(
     return true;
 }
 
+void ComputePipeline::CopyFrom(const ComputePipeline& source)
+{
+    if(this == &source) return;
+    Shutdown();
+    m_rootSignature = source.m_rootSignature;
+    m_pipelineState = source.m_pipelineState;
+    if(m_rootSignature) m_rootSignature->AddRef();
+    if(m_pipelineState) m_pipelineState->AddRef();
+}
+
 void ComputePipeline::Shutdown()
 {
     if (m_pipelineState)

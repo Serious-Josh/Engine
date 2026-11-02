@@ -93,6 +93,7 @@ class DebugUI
     }
     // PSR.2 Stage 3A: whether this frame requested in-place replacement, and why its reflections are not lit (empty when
     // they are).
+    void SetPsrActiveMode(std::uint32_t mode) { m_psrActiveMode = mode; }
     void SetPsrLightingStatus(bool requested, const std::string& unavailable)
     {
         m_psrLightingRequested = requested;
@@ -416,15 +417,14 @@ class DebugUI
     void DrawGpuTimingMonitor(const GpuTimestampProfiler::Results& results);
     GpuTimingMonitor m_gpuTimingMonitor;
     GpuTimingMonitor m_visibilityTimings;
-    int m_secondaryShadowVisibility = PathTraceReferenceSettings{}.secondaryShadowRayQuery ? 1 : 0;
     bool m_primarySurfaceReplacementInPlace = PathTraceReferenceSettings{}.primarySurfaceReplacementInPlace;
     std::uint32_t m_primarySurfaceReplacementChain = PathTraceReferenceSettings{}.primarySurfaceReplacementChain;
     int m_psrDebugView = 0; // Off, Replacement Mask, Reflected Normals, Reflected Albedo.
+    std::uint32_t m_psrActiveMode = 0;
     bool m_psrLightingRequested = false;
     std::string m_psrLightingUnavailable;
     bool m_secondaryShadowReady = false;
     bool m_secondaryShadowActive = false;
-    int m_primaryDiShadowVisibility = PathTraceReferenceSettings{}.primaryDiShadowRayQuery ? 1 : 0;
     bool m_primaryDiShadowReady = false;
     bool m_primaryDiShadowActive = false;
     bool m_primaryDiShadowFailed = false;

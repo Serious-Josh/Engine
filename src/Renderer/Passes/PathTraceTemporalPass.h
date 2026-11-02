@@ -181,6 +181,16 @@ class PathTraceTemporalPass
 
     std::uint64_t GetResourceBytes() const;
 
+    void AdoptPsrVariant(const PathTraceTemporalPass& prepared)
+    {
+        if(!m_psrVariantReady && prepared.m_psrVariantReady)
+        {
+            m_psrPipeline.CopyFrom(prepared.m_psrPipeline);
+            m_psrVariantReady = true;
+            m_psrVariantFailed = false;
+        }
+    }
+
     private:
     ComputePipeline m_pipeline;
     bool m_initialized = false;

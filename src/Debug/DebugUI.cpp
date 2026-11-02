@@ -1113,8 +1113,6 @@ void DebugUI::SetTLASUpdated(bool updated)
 PathTraceReferenceSettings DebugUI::GetPathTraceReferenceSettings() const
 {
     PathTraceReferenceSettings settings;
-    settings.secondaryShadowRayQuery = m_secondaryShadowVisibility == 1;
-    settings.primaryDiShadowRayQuery = m_primaryDiShadowVisibility == 1;
     settings.samplesPerFrame = static_cast<std::uint32_t>(m_pathTraceSamplesPerFrame);
     settings.maxPathDepth = static_cast<std::uint32_t>(m_pathTraceMaxPathDepth);
     settings.russianRouletteDepth = static_cast<std::uint32_t>(m_pathTraceRussianRouletteDepth);
@@ -1350,10 +1348,6 @@ void DebugUI::DrawPathTraceReferenceSettings()
 
     const char* visibilityModes[] = {"TraceRay (Original)", "RayQuery (GI.6)"};
     const char* primaryDiVisibilityModes[] = {"TraceRay (Original)", "RayQuery (DI.1)"};
-    ImGui::BeginDisabled(!m_primaryDiShadowReady || preparing || m_lightingMode != 3);
-    ImGui::Combo("Primary DI Shadow Visibility", &m_primaryDiShadowVisibility,
-        primaryDiVisibilityModes, IM_ARRAYSIZE(primaryDiVisibilityModes));
-    ImGui::EndDisabled();
     ImGui::Text("Active primary DI shadows: %s",
         m_lightingTransition.active == RendererLightingMode::PathTracedRasterPrimaryReSTIRDI ?
         primaryDiVisibilityModes[m_primaryDiShadowActive ? 1 : 0] : "Not in use");
@@ -1371,10 +1365,6 @@ void DebugUI::DrawPathTraceReferenceSettings()
         ImGui::TextDisabled("DI.1 pipelines still preparing; original retained.");
     }
 
-    ImGui::BeginDisabled(!m_secondaryShadowReady || preparing);
-    ImGui::Combo("Secondary Shadow Visibility", &m_secondaryShadowVisibility,
-        visibilityModes, IM_ARRAYSIZE(visibilityModes));
-    ImGui::EndDisabled();
     ImGui::Text("Active secondary shadows: %s", visibilityModes[m_secondaryShadowActive ? 1 : 0]);
 
     if(!m_secondaryShadowReady)
@@ -1410,6 +1400,7 @@ void DebugUI::DrawPathTraceReferenceSettings()
         m_primarySurfaceReplacementChain = psrMode == 2 ? 2u : 1u;
     }
 
+    ImGui::Text("Active PSR: %s", psrModes[m_psrActiveMode >= 2u ? 2 : m_psrActiveMode]);
     if(m_primarySurfaceReplacementInPlace)
     {
         if(m_primarySurfaceReplacementChain >= 2u && m_pathTraceMaxPathDepth < 3)
@@ -1423,8 +1414,7 @@ void DebugUI::DrawPathTraceReferenceSettings()
         }
         else if(!m_psrLightingUnavailable.empty())
         {
-            ImGui::TextWrapped("Reflections not lit: %s. Mirrors render normally; a debug view still shows the "
-                "replacement.", m_psrLightingUnavailable.c_str());
+            ImGui::TextWrapped("PSR status: %s.", m_psrLightingUnavailable.c_str());
         }
         else
         {

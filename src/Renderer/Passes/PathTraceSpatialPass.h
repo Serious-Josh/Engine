@@ -233,6 +233,17 @@ class PathTraceSpatialPass
         return m_lastConstants;
     }
 
+    void AdoptPsrVariant(const PathTraceSpatialPass& prepared)
+    {
+        if(!m_atrousPsrInitialized && prepared.m_atrousPsrInitialized)
+        {
+            for(int index = 0; index < 5; ++index)
+                m_atrousPsrPipelines[index].CopyFrom(prepared.m_atrousPsrPipelines[index]);
+            m_atrousPsrInitialized = true;
+            m_atrousPsrFailed = false;
+        }
+    }
+
     private:
     ComputePipeline m_pipeline;
     ComputePipeline m_diagnosticPipeline;

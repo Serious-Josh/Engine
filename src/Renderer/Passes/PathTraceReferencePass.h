@@ -81,6 +81,8 @@ struct PathTraceLibraryNeeds
 {
     PathTracePrimary primary = PathTracePrimary::Camera;
     // ER.1 Phase 4: signal extraction (any path-tracing denoiser) records the extraction pipelines.
+    // Zero prepares the ordinary path; 1/2 prepare only the compatible PSR lighting set.
+    std::uint32_t psrChain = 0;
     bool extraction = false;
     // The raw diffuse hit distance extraction (NRD RELAX and the hybrid).
     bool rawDiffuseHitDistance = false;
@@ -350,8 +352,8 @@ class PathTraceReferencePass
     bool EnsurePsrSharcInfrastructure(GraphicsDevice&, ShaderLibrary&, bool extract, bool raw, std::string&);
 
     // Multibounce PSR: the chain length the PSR.2 lighting libraries handle, 1 or 2 (their PsrK2/ variants, built with
-    // PATH_TRACE_PSR_CHAIN 2). A change releases every PSR lighting pipeline (and its failure), so the next Ensure call
-    // builds them from the other libraries; the caller guarantees the queue is idle. Returns whether it changed.
+    // PATH_TRACE_PSR_CHAIN 2). A change parks the live pipelines for later adoption. Identified production
+    // pipelines stay alive until GPU-confirmed shutdown, so switching requires no GPU wait. Returns whether it changed.
     bool SetPrimarySurfaceReplacementChain(std::uint32_t chain);
     std::uint32_t GetPrimarySurfaceReplacementChain() const
     {
@@ -700,6 +702,9 @@ class PathTraceReferencePass
     bool CreatePipeline(GraphicsDevice& device, RayTracingPipeline& slot, const std::vector<char>& bytecode,
         const RayTracingPipelineDescription& description);
     bool IsPipelineLive(const std::string& identity) const;
+    void RetainPsrPipeline(RayTracingPipeline& pipeline);
+    std::map<std::string, std::unique_ptr<RayTracingPipeline>> m_retainedPsrPipelines;
+    std::vector<std::unique_ptr<RayTracingPipeline>> m_retiredPsrDuplicates;
 
     std::uint64_t m_libraryRevisionCounter = 0;
     std::map<std::string, PreparedPipeline> m_preparedPipelines;

@@ -6,6 +6,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -32,6 +33,10 @@ struct RayTracingPipelineRequest
     RayTracingPipelineDescription description;
     // Diagnostics only: the job fails without creating anything.
     bool failForTesting = false;
+    // CPU-only preparation of a private auxiliary pipeline bundle on this same owned worker.
+    // Captures must own their output and must not mutate active renderer state.
+    std::function<bool()> prepareAuxiliary;
+
 };
 
 struct RayTracingPipelineOutcome

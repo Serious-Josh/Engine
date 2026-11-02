@@ -68,14 +68,12 @@ struct PathTraceReferenceSettings
     // virtual surface guides and motion. No consumer reads the guides yet, so the image is unchanged.
     bool primarySurfaceReplacementGuides = false;
 
-    // PSR.2 development prototype (default off; an Editor dev toggle): on Path Tracing (ReSTIR DI) frames the geometry
-    // pass marks PSR-eligible mirrors in identity.x bit 31 and PsrInPlaceReplacePass overwrites their G-buffer pixels
-    // with the reflected surface. Lighting consumers do not decode it yet, so lit images are invalid.
-    bool primarySurfaceReplacementInPlace = false;
+    // Runtime-only Editor choice, not serialized. Two-bounce is requested by default only in supported
+    // ReSTIR DI frames; preparation, path depth and geometric fallback decide the effective mode.
+    bool primarySurfaceReplacementInPlace = true;
 
-    // Multibounce PSR (with primarySurfaceReplacementInPlace): the longest pure-delta mirror chain a pixel replaces, 1
-    // (single-bounce) or 2 (two-bounce, which needs maxPathDepth >= 3; below that the frame replaces single-bounce).
-    std::uint32_t primarySurfaceReplacementChain = 1;
+    // Longest supported delta chain; depth below three automatically uses K=1.
+    std::uint32_t primarySurfaceReplacementChain = 2;
 
     bool operator==(const PathTraceReferenceSettings&) const = default;
 };

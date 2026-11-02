@@ -66,6 +66,13 @@ public:
         return true;
     }
 
+    // Render-thread adoption; both source pipelines are complete and have never been submitted.
+    void AdoptPrepared(PsrInPlaceReplacePass& prepared)
+    {
+        m_pipeline.Swap(prepared.m_pipeline);
+        m_chainPipeline.Swap(prepared.m_chainPipeline);
+    }
+
     // Multibounce PSR: whether the two-bounce variant exists.
     bool IsChainAvailable() const
     {

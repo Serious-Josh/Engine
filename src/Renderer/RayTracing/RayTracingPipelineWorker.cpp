@@ -103,7 +103,7 @@ void RayTracingPipelineWorker::Shutdown()
 
 bool RayTracingPipelineWorker::Submit(RayTracingPipelineRequest request)
 {
-    if(!request.device || !request.library)
+    if(!request.device || (!request.library && !request.prepareAuxiliary))
     {
         return false;
     }
@@ -191,7 +191,20 @@ void RayTracingPipelineWorker::Run()
         outcome.key = key;
         outcome.device = request.device;
 
-        if(!request.failForTesting)
+        if(request.prepareAuxiliary && !request.failForTesting)
+        {
+            try
+            {
+                TransitionTiming::Scope scope("Worker PSR auxiliary preparation");
+                outcome.succeeded = request.prepareAuxiliary();
+            }
+            catch(...)
+            {
+                // A failed private bundle is never published. The owner reports the failed preparation.
+                outcome.succeeded = false;
+            }
+        }
+        else if(!request.failForTesting)
         {
             auto pipeline = std::make_unique<RayTracingPipeline>();
             TransitionTiming::Scope er1Scope("Worker RayTracingPipeline " + request.description.shaderPath.generic_string());

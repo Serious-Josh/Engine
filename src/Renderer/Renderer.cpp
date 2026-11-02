@@ -4445,11 +4445,7 @@ bool Renderer::Initialize(
         return false;
     }
 
-    // PSR.2 Stage 1 development prototype; optional (the toggle then has no effect).
-    if(!m_packagedRuntime && !m_psrInPlaceReplacePass.Initialize(device, m_shaderLibrary))
-    {
-        Log::Error("PSR in-place replacement prototype pass unavailable.");
-    }
+    // PSR replacement and denoiser variants are queued on first supported request.
 
     if (!m_resourceUploader.Initialize(device))
     {
@@ -7027,6 +7023,70 @@ static Matrix4 CameraRelativeInverseViewProjection(const Matrix4& view, const Ma
 
 // PSR.2 Stage 3B: the denoiser modes whose passes filter replaced pixels (as the G-buffer's virtual surface, with the
 // mirror's throughput demodulated). Off needs no filtering. Phase 4: the NRD modes through NrdPathTracePreparePsr.hlsl.
+ShaderLibraryPreparation Renderer::PreparePsrAuxiliary()
+{
+    ShaderLibraryPreparation result{};
+    result.state = ShaderLibraryPreparationState::PreparingPipelines;
+    if(m_psrAuxiliaryFailed || !m_pipelineWorkerRunning)
+    {
+        result.state = ShaderLibraryPreparationState::Failed;
+        result.diagnostic = "PSR auxiliary pipeline preparation unavailable";
+        return result;
+    }
+    if(!m_psrAuxiliaryReady)
+    {
+        const std::string key = "PSR auxiliary pipelines";
+        if(m_pipelineWorker->GetState(key) == RayTracingPipelineJobState::Completed)
+        {
+            auto outcome = m_pipelineWorker->TakeCompleted(key);
+            if(!outcome || !outcome->succeeded || outcome->device != m_graphicsDevice.GetRayTracingDevice())
+            {
+                m_psrAuxiliaryFailed = true;
+                result.state = ShaderLibraryPreparationState::Failed;
+                result.diagnostic = "PSR auxiliary pipeline compilation failed";
+                return result;
+            }
+            // Nothing in this private bundle was ever bound. Publish only on the renderer thread.
+            m_psrInPlaceReplacePass.AdoptPrepared(m_psrPreparedAuxiliary->replacement);
+            m_psrAuxiliaryReady = true;
+        }
+        else if(m_pipelineWorker->GetState(key) == RayTracingPipelineJobState::None)
+        {
+            auto prepared = std::make_shared<PsrPipelinePreparation>();
+            m_psrPreparedAuxiliary = prepared;
+            const auto root = m_assetRoot / "Shaders";
+            // The device wrapper is read only (GetDevice); Shutdown joins the worker before releasing it.
+            auto* device = &m_graphicsDevice;
+            RayTracingPipelineRequest request{};
+            request.key = key;
+            request.device = m_graphicsDevice.GetRayTracingDevice();
+            request.prepareAuxiliary = [prepared, root, device]()
+            {
+                ShaderLibrary shaders;
+                bool ready = shaders.Initialize(root) && prepared->replacement.Initialize(device->GetDevice(), shaders);
+                ready = ready && prepared->temporal.EnsurePsrVariant(*device, shaders) &&
+                    prepared->spatial.EnsureAtrousPsrVariant(*device, shaders) &&
+                    prepared->reblur.PreparePsrVariant(*device, shaders, NrdPathTracePreparePass::Encoding::Reblur) &&
+                    prepared->relax.PreparePsrVariant(*device, shaders, NrdPathTracePreparePass::Encoding::Relax) &&
+                    prepared->hybrid.PreparePsrVariant(*device, shaders, NrdPathTracePreparePass::Encoding::Hybrid);
+                shaders.Shutdown();
+                return ready;
+            };
+            if(!m_pipelineWorker->Submit(std::move(request))) m_psrAuxiliaryFailed = true;
+        }
+    }
+    if(m_psrAuxiliaryReady)
+    {
+        m_pathTraceTemporalPass.AdoptPsrVariant(m_psrPreparedAuxiliary->temporal);
+        m_pathTraceSpatialPass.AdoptPsrVariant(m_psrPreparedAuxiliary->spatial);
+        m_nrdPathTracePreparePass.AdoptPsrVariant(m_psrPreparedAuxiliary->reblur);
+        m_nrdRelaxPreparePass.AdoptPsrVariant(m_psrPreparedAuxiliary->relax);
+        m_nrdHybridPreparePass.AdoptPsrVariant(m_psrPreparedAuxiliary->hybrid);
+        result.state = ShaderLibraryPreparationState::Ready;
+    }
+    return result;
+}
+
 bool Renderer::PsrLightingSupportsDenoiser(PathTraceDenoiserMode mode)
 {
     return mode == PathTraceDenoiserMode::Off || mode == PathTraceDenoiserMode::Engine ||
@@ -11707,8 +11767,7 @@ bool Renderer::RecordRenderFrame(
     // PSR.2 Stage 1 (development prototype): eligibility marking and in-place replacement on Path Tracing (ReSTIR DI)
     // frames only, with the path tracer's camera. PathTracePsrEligible's maxPathDepth > 0 is checked here.
     const bool psrRequested = runPathTrace && pathTracePrimary == PathTracePrimary::RasterReSTIRDI &&
-        options.pathTraceReference.primarySurfaceReplacementInPlace && options.pathTraceReference.maxPathDepth > 0u &&
-        m_psrInPlaceReplacePass.IsInitialized();
+        options.pathTraceReference.primarySurfaceReplacementInPlace && options.pathTraceReference.maxPathDepth > 0u && !m_packagedRuntime;
     // PSR.2 Stage 3A: only the PSR.2 lighting pair lights replaced pixels, and it needs the denoiser Off (no extraction),
     // a path that reaches the reflected surface (vertex 1). SHARC remains excluded outside the development-only
     // infrastructure harness, which prepares the combined set before replacement. Without a diagnostic view the
@@ -11719,20 +11778,59 @@ bool Renderer::RecordRenderFrame(
     m_psrDenoiseConstantsAddress = 0;
     m_psrLightingLastFrame = false;
     std::string psrLightingUnavailable;
-    // Multibounce PSR: two-bounce needs D (vertex 2) below maxPathDepth; otherwise the frame replaces single-bounce.
-    m_psrChainThisFrame = options.pathTraceReference.primarySurfaceReplacementChain >= 2u &&
-        options.pathTraceReference.maxPathDepth >= 3u && m_psrInPlaceReplacePass.IsChainAvailable() ? 2u : 1u;
-
-    // The lighting pipelines follow the chain length; switching rebuilds them once the queue is idle.
-    if(psrRequested && m_pathTraceReferencePass.GetPrimarySurfaceReplacementChain() != m_psrChainThisFrame &&
-        m_commandContext.WaitForGPU())
+    // Prepare a complete chain/lighting/extraction/cache set without touching the currently bound slots.
+    // A compatible last active chain may continue; otherwise the ordinary path renders while preparation runs.
+    std::uint32_t requestedChain = options.pathTraceReference.primarySurfaceReplacementChain >= 2u &&
+        options.pathTraceReference.maxPathDepth >= 3u ? 2u : 1u;
+    m_psrChainThisFrame = requestedChain;
+    bool psrPrepared = false;
+    std::string psrPreparation;
+    if(psrRequested)
     {
-        m_pathTraceReferencePass.SetPrimarySurfaceReplacementChain(m_psrChainThisFrame);
+        const auto auxiliary = PreparePsrAuxiliary();
+        if(auxiliary.state == ShaderLibraryPreparationState::Ready && requestedChain == 2u &&
+            !m_psrInPlaceReplacePass.IsChainAvailable())
+        {
+            requestedChain = 1u;
+            psrPreparation = "two-bounce replacement pipeline unavailable; using single-bounce";
+        }
+        PathTraceLibraryNeeds needs{};
+        needs.primary = PathTracePrimary::RasterReSTIRDI;
+        needs.psrChain = requestedChain;
+        needs.extraction = m_pathTraceSignalExtraction;
+        needs.rawDiffuseHitDistance = needs.extraction && (m_nrdHybridDispatchDiagnostic || m_nrdRelaxPrepareDiagnostic ||
+            m_nrdRelaxDispatchDiagnostic || m_pathTraceDenoiserMode == PathTraceDenoiserMode::NrdRelax ||
+            m_pathTraceDenoiserMode == PathTraceDenoiserMode::NrdHybrid);
+        needs.radianceCache = m_sharcSettings.enabled;
+        const auto lighting = PrepareDxrLibraries(needs);
+        psrPrepared = auxiliary.state == ShaderLibraryPreparationState::Ready &&
+            lighting.state == ShaderLibraryPreparationState::Ready;
+        m_psrChainThisFrame = requestedChain;
+        if(!psrPrepared)
+        {
+            psrPreparation = auxiliary.state == ShaderLibraryPreparationState::Failed ? auxiliary.diagnostic :
+                lighting.state == ShaderLibraryPreparationState::Failed ? lighting.diagnostic :
+                "requested PSR pipelines preparing in the background";
+            if(m_psrActiveChain != 0 && m_psrActiveChain != requestedChain &&
+                (m_psrActiveChain == 1u || options.pathTraceReference.maxPathDepth >= 3u) &&
+                auxiliary.state == ShaderLibraryPreparationState::Ready)
+            {
+                needs.psrChain = m_psrActiveChain;
+                psrPrepared = PrepareDxrLibraries(needs).state == ShaderLibraryPreparationState::Ready;
+                if(psrPrepared) m_psrChainThisFrame = m_psrActiveChain;
+            }
+        }
+        if(psrPrepared && m_pathTraceReferencePass.GetPrimarySurfaceReplacementChain() != m_psrChainThisFrame)
+        {
+            // Old pipeline objects remain retained through GPU-confirmed shutdown, including every visibility twin.
+            // Switching slots therefore requires no queue drain.
+            m_pathTraceReferencePass.SetPrimarySurfaceReplacementChain(m_psrChainThisFrame);
+        }
     }
 
-    if(psrRequested && m_pathTraceReferencePass.GetPrimarySurfaceReplacementChain() != m_psrChainThisFrame)
+    if(psrRequested && !psrPrepared)
     {
-        psrLightingUnavailable = "the PSR mode's lighting pipelines are not ready";
+        psrLightingUnavailable = psrPreparation;
     }
     else if(psrRequested)
     {
@@ -11809,10 +11907,13 @@ bool Renderer::RecordRenderFrame(
         }
     }
 
+    if(m_psrLightingThisFrame && !psrPreparation.empty()) psrLightingUnavailable = psrPreparation;
+    m_psrActiveChain = m_psrLightingThisFrame ? m_psrChainThisFrame : 0u;
+    m_debugUI.SetPsrActiveMode(m_psrActiveChain);
     m_debugUI.SetPsrLightingStatus(psrRequested, psrLightingUnavailable);
     // Diagnostic views must not force a virtual G-buffer into an ordinary cache pipeline
     // after combined preparation failed (or while the development boundary is closed).
-    const bool psrInPlace = psrRequested &&
+    const bool psrInPlace = psrRequested && psrPrepared &&
         (m_psrLightingThisFrame || (!m_sharcSettings.enabled && !options.experimentalD6RadianceCache &&
             m_debugUI.GetPsrDebugView() != ToneMapDebugView::None));
 
@@ -13376,6 +13477,10 @@ void Renderer::Shutdown()
     }
 
     m_pipelineWorkerRunning = false;
+    m_psrPreparedAuxiliary.reset();
+    m_psrAuxiliaryReady = false;
+    m_psrAuxiliaryFailed = false;
+    m_psrActiveChain = 0;
     m_lightingModeTransition.Reset();
     m_preparedDxrLibraries.clear();
     m_denoiserPreparation.clear();

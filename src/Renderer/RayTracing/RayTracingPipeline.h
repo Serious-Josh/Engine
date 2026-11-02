@@ -16,6 +16,7 @@ class RayTracingPipeline
 {
     public:
     RayTracingPipeline() = default;
+    ~RayTracingPipeline() { Shutdown(); }
     RayTracingPipeline(const RayTracingPipeline&) = delete;
     RayTracingPipeline& operator=(const RayTracingPipeline&) = delete;
 
