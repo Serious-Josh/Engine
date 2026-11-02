@@ -73,6 +73,10 @@ struct PathTraceReferenceSettings
     // with the reflected surface. Lighting consumers do not decode it yet, so lit images are invalid.
     bool primarySurfaceReplacementInPlace = false;
 
+    // Multibounce PSR (with primarySurfaceReplacementInPlace): the longest pure-delta mirror chain a pixel replaces, 1
+    // (single-bounce) or 2 (two-bounce, which needs maxPathDepth >= 3; below that the frame replaces single-bounce).
+    std::uint32_t primarySurfaceReplacementChain = 1;
+
     bool operator==(const PathTraceReferenceSettings&) const = default;
 };
 

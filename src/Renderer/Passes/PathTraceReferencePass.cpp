@@ -1757,7 +1757,8 @@ bool PathTraceReferencePass::EnsurePrimarySurfaceReplacementGBuffer(
     {
         const bool directPass = pass == 0;
         RayTracingPipelineDescription description = BuildReSTIRDISplitPipelineDescription(directPass, m_libraryVariant);
-        description.shaderPath = PrimarySurfaceReplacementGBufferLibraryPath(directPass, m_libraryVariant);
+        description.shaderPath = PsrChainLibraryPath(PrimarySurfaceReplacementGBufferLibraryPath(directPass,
+            m_libraryVariant));
         // After the split pair's own parameters: b4 (the replacement pass's camera and identity) and t2 (its transforms).
         description.rootParameters.push_back({RootParameterType::ConstantBuffer, 4});
         description.rootParameters.push_back({RootParameterType::ShaderResource, 2});
@@ -1849,8 +1850,8 @@ bool PathTraceReferencePass::EnsurePrimarySurfaceReplacementGBufferExtraction(Gr
     {
         RayTracingPipelineDescription description = BuildReSTIRDISplitExtractionPipelineDescription(directPass,
             m_libraryVariant);
-        description.shaderPath = PrimarySurfaceReplacementGBufferExtractionLibraryPath(directPass, rawDiffuseHitDistance,
-            m_libraryVariant);
+        description.shaderPath = PsrChainLibraryPath(PrimarySurfaceReplacementGBufferExtractionLibraryPath(directPass,
+            rawDiffuseHitDistance, m_libraryVariant));
         description.rootParameters.push_back({RootParameterType::ConstantBuffer, 4});
         description.rootParameters.push_back({RootParameterType::ShaderResource, 2});
         description.rasterMaterialSampler = true;
@@ -1944,6 +1945,31 @@ bool PathTraceReferencePass::EnsurePsrProbePipelinesForTesting(GraphicsDevice& g
     return true;
 }
 
+bool PathTraceReferencePass::EnsurePsrChainProbePipelinesForTesting(GraphicsDevice& graphicsDevice,
+    ShaderLibrary& shaderLibrary, const std::filesystem::path& indirectLibrary, const std::filesystem::path& directLibrary)
+{
+    for(int pass = 0; pass < 2; ++pass)
+    {
+        // The PSR.2 split pass's own description (the direct pass adds b2), with its PSR bindings appended.
+        const bool directPass = pass == 1;
+        RayTracingPipelineDescription description = BuildReSTIRDISplitPipelineDescription(directPass, m_libraryVariant);
+        description.rayGenerationShader = L"PsrChainProbeRayGeneration";
+        description.shaderPath = directPass ? directLibrary : indirectLibrary;
+        description.rootParameters.push_back({RootParameterType::ConstantBuffer, 4});
+        description.rootParameters.push_back({RootParameterType::ShaderResource, 2});
+        description.rasterMaterialSampler = true;
+        m_psrChainProbePipelines[pass].Shutdown();
+        const ShaderLibraryCompileResult* library = AcquireLibrary(shaderLibrary, description.shaderPath);
+
+        if(!library || !CreatePipeline(graphicsDevice, m_psrChainProbePipelines[pass], library->bytecode, description))
+        {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 bool PathTraceReferencePass::IsPrimarySurfaceReplacementGBufferReady()
 {
     // The twins the frame's visibility selections need (DI.1 for the direct pass, GI.6 for the indirect pass).
@@ -1970,6 +1996,7 @@ void PathTraceReferencePass::ReleasePrimarySurfaceReplacementPipelines()
     for(RayTracingPipeline* original : {&m_psrRecordPipeline, &m_psrRasterPipeline, &m_psrGuidePipeline,
         &m_psrSplitDirectPipeline, &m_psrSplitIndirectPipeline, &m_psrGBufferDirectPipeline,
         &m_psrGBufferIndirectPipeline, &m_psrSharcImageProbePipeline, &m_psrSharcTrainingProbePipeline, &m_psrProbePipelines[0], &m_psrProbePipelines[1],
+        &m_psrChainProbePipelines[0], &m_psrChainProbePipelines[1],
         &m_psrGBufferExtractDirectPipeline, &m_psrGBufferExtractIndirectPipeline, &m_psrGBufferExtractIndirectRawPipeline})
     {
         const auto found = m_psrRayQueryPipelines.find(original);
@@ -2046,6 +2073,75 @@ bool PathTraceReferencePass::PsrSharcInfrastructureReady(bool extract, bool raw)
     return (extract ? IsPrimarySurfaceReplacementGBufferExtractionReady(raw) :
         IsPrimarySurfaceReplacementGBufferReady()) && ready(PathTraceRadianceCacheLibrary::PsrTraining) &&
         ready(PsrRenderLibrary(extract, raw));
+}
+
+bool PathTraceReferencePass::SetPrimarySurfaceReplacementChain(std::uint32_t chain)
+{
+    chain = chain >= 2u ? 2u : 1u;
+
+    if(chain == m_psrChain)
+    {
+        return false;
+    }
+
+    m_psrChain = chain;
+    ResetPrimarySurfaceReplacementChainPipelines();
+    return true;
+}
+
+void PathTraceReferencePass::SetPrimarySurfaceReplacementChainDirectoryForTesting(const std::filesystem::path& directory)
+{
+    if(directory == m_psrChainDirectoryForTesting)
+    {
+        return;
+    }
+
+    m_psrChainDirectoryForTesting = directory;
+
+    if(m_psrChain >= 2)
+    {
+        ResetPrimarySurfaceReplacementChainPipelines();
+    }
+}
+
+void PathTraceReferencePass::ResetPrimarySurfaceReplacementChainPipelines()
+{
+    ReleasePrimarySurfaceReplacementPipelines();
+    m_psrGBufferPipelinesFailed = false;
+    m_psrGBufferFailure.clear();
+
+    for(int kind = 0; kind < 2; ++kind)
+    {
+        m_psrGBufferExtractFailed[kind] = false;
+        m_psrGBufferExtractFailure[kind].clear();
+    }
+
+    // The combined PSR + SHARC learning pipelines and their GI.6 twins.
+    for(size_t index = 0; index < std::size(m_radianceCache); ++index)
+    {
+        if(!IsPsrCacheLibrary(static_cast<PathTraceRadianceCacheLibrary>(index)))
+        {
+            continue;
+        }
+
+        RadianceCacheLearningPipeline& learning = m_radianceCache[index];
+        const auto twin = m_psrRayQueryPipelines.find(&learning.pipeline);
+
+        if(twin != m_psrRayQueryPipelines.end())
+        {
+            if(twin->second)
+            {
+                twin->second->Shutdown();
+            }
+
+            m_psrRayQueryPipelines.erase(twin);
+        }
+
+        learning.pipeline.Shutdown();
+        learning.ready = false;
+        learning.failed = false;
+        learning.failure.clear();
+    }
 }
 
 bool PathTraceReferencePass::EnsurePsrSharcInfrastructure(GraphicsDevice& device, ShaderLibrary& shaders,
@@ -2157,7 +2253,14 @@ bool PathTraceReferencePass::EnsureRadianceCacheLearning(
         return false;
     }
 
-    const RayTracingPipelineDescription description = BuildRadianceCachePipelineDescription(m_libraryVariant, library);
+    RayTracingPipelineDescription description = BuildRadianceCachePipelineDescription(m_libraryVariant, library);
+
+    // Multibounce PSR: the combined PSR + SHARC libraries follow the PSR chain length.
+    if(IsPsrCacheLibrary(library))
+    {
+        description.shaderPath = PsrChainLibraryPath(description.shaderPath);
+    }
+
     const std::string libraryName = description.shaderPath.generic_string();
     const ShaderLibraryCompileResult* compiled = AcquireLibrary(shaderLibrary, description.shaderPath);
 
@@ -2818,6 +2921,18 @@ void PathTraceReferencePass::ExecuteReSTIRDISplit(
     profiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::PathTraceSplitDirect);
     m_splitDirectDiffuseWritten = extract;
 
+    // Verification only (M2-A): the direct library's chain probe, with the direct pass's bindings.
+    if(m_psrProbeForTesting && gBufferReplacement && !combined && m_psrChainProbePipelines[1].IsInitialized())
+    {
+        m_psrProbeForTesting->Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        m_psrChainProbePipelines[1].Bind(commandList);
+        bindSharedRootParameters();
+        commandList->SetComputeRootConstantBufferView(6, rtxdiConstantsAddress);
+        commandList->SetComputeRootConstantBufferView(7, psrGBufferConstants);
+        commandList->SetComputeRootShaderResourceView(8, psrGBufferTransforms);
+        m_psrChainProbePipelines[1].Dispatch(commandList, width, height);
+    }
+
     // The indirect pass reads every direct radiance slot the direct pass wrote, and with extraction every direct
     // diffuse slot. Both passes only add to the statistics row atomically, so it needs no ordering between them.
     D3D12_RESOURCE_BARRIER directBarriers[2]{};
@@ -2859,7 +2974,8 @@ void PathTraceReferencePass::ExecuteReSTIRDISplit(
 
     // Verification only: the recorded PSR pair's probe, with its indirect pass's bindings.
     RayTracingPipeline& probePipeline = combined ? m_psrSharcImageProbePipeline :
-        m_psrProbePipelines[gBufferReplacement ? 1 : 0];
+        (gBufferReplacement && m_psrChainProbePipelines[0].IsInitialized() ? m_psrChainProbePipelines[0] :
+        m_psrProbePipelines[gBufferReplacement ? 1 : 0]);
 
     if(m_psrProbeForTesting && !m_psrSharcEnergyForTesting && !m_psrSharcTrainingProbeForTesting && (gBufferReplacement || replacement) && probePipeline.IsInitialized())
     {

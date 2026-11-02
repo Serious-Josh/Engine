@@ -54,9 +54,22 @@ public:
     };
     static_assert(sizeof(ObjectTransform) == 192);
 
+    // Also builds the two-bounce variant (PsrInPlaceReplaceK2.hlsl); if that alone fails, single-bounce stays available.
     bool Initialize(ID3D12Device* device, ShaderLibrary& shaderLibrary)
     {
-        return InitializePipeline(device, shaderLibrary, "PsrInPlaceReplace.hlsl", m_pipeline);
+        if(!InitializePipeline(device, shaderLibrary, "PsrInPlaceReplace.hlsl", m_pipeline))
+        {
+            return false;
+        }
+
+        InitializePipeline(device, shaderLibrary, "PsrInPlaceReplaceK2.hlsl", m_chainPipeline);
+        return true;
+    }
+
+    // Multibounce PSR: whether the two-bounce variant exists.
+    bool IsChainAvailable() const
+    {
+        return m_chainPipeline.IsInitialized();
     }
 
     // Development verification only: a variant of the pass (PsrDiagnostics/, the same root signature) that also writes
@@ -76,17 +89,18 @@ public:
     void Shutdown()
     {
         m_diagnosticPipeline.Shutdown();
+        m_chainPipeline.Shutdown();
         m_pipeline.Shutdown();
     }
 
     // After EndGeometryPass. Every G-buffer resource is returned to the state it was found in. Records nothing (and
     // returns false) without the pipeline or its inputs. diagnosticHits (development verification) selects the
-    // diagnostic pipeline; its UAV index must be in the constants.
+    // diagnostic pipeline; its UAV index must be in the constants. chain selects the two-bounce variant.
     bool Execute(ID3D12GraphicsCommandList* commandList, GBuffer& gBuffer, D3D12_GPU_VIRTUAL_ADDRESS constants,
         D3D12_GPU_VIRTUAL_ADDRESS transforms, D3D12_GPU_VIRTUAL_ADDRESS topLevel, unsigned int width,
-        unsigned int height, Buffer* diagnosticHits = nullptr) const
+        unsigned int height, Buffer* diagnosticHits = nullptr, bool chain = false) const
     {
-        const Pipeline& pipeline = diagnosticHits ? m_diagnosticPipeline : m_pipeline;
+        const Pipeline& pipeline = diagnosticHits ? m_diagnosticPipeline : chain ? m_chainPipeline : m_pipeline;
 
         if(!pipeline.IsInitialized() || !commandList || constants == 0 || transforms == 0 || topLevel == 0 ||
             width == 0 || height == 0)
@@ -208,5 +222,6 @@ private:
     }
 
     Pipeline m_pipeline;
+    Pipeline m_chainPipeline;
     Pipeline m_diagnosticPipeline;
 };

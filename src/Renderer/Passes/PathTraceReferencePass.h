@@ -137,6 +137,8 @@ std::uint32_t PathTraceSequenceSeed(std::uint64_t sequenceFrame);
 // created on first use. The Renderer owns scheduling, accumulation counts, resets and submission.
 class PathTraceReferencePass
 {
+    // Read-only local regression instrumentation; no production execution path.
+    friend class SceneHierarchyVerification;
     public:
     // Statistics texel layout written by PathTraceReference.hlsl (cumulative, never reset on GPU).
     static constexpr unsigned int StatisticsWidth = 8;
@@ -346,6 +348,18 @@ class PathTraceReferencePass
     // libraries is accepted. Creation only.
     // Development-only preparation: all downstream state objects before in-place replacement.
     bool EnsurePsrSharcInfrastructure(GraphicsDevice&, ShaderLibrary&, bool extract, bool raw, std::string&);
+
+    // Multibounce PSR: the chain length the PSR.2 lighting libraries handle, 1 or 2 (their PsrK2/ variants, built with
+    // PATH_TRACE_PSR_CHAIN 2). A change releases every PSR lighting pipeline (and its failure), so the next Ensure call
+    // builds them from the other libraries; the caller guarantees the queue is idle. Returns whether it changed.
+    bool SetPrimarySurfaceReplacementChain(std::uint32_t chain);
+    std::uint32_t GetPrimarySurfaceReplacementChain() const
+    {
+        return m_psrChain;
+    }
+    // Verification only: the directory of the two-bounce libraries in place of PsrK2/ (empty: PsrK2/), with the same
+    // release rules as SetPrimarySurfaceReplacementChain.
+    void SetPrimarySurfaceReplacementChainDirectoryForTesting(const std::filesystem::path& directory);
     bool PsrSharcInfrastructureReady(bool extract, bool raw);
     bool EnsurePsrSharcProbesForTesting(GraphicsDevice&, ShaderLibrary&, std::string&);
     bool m_psrSharcTrainingProbeForTesting = false;
@@ -487,6 +501,12 @@ class PathTraceReferencePass
     {
         return m_psrProbeForTesting ? m_psrProbeForTesting->GetUAVDescriptorIndex() : 0u;
     }
+    // Multibounce PSR M2-A verification only: chain probes built from diagnostic libraries that include the PSR.2 split
+    // pair's production libraries (raygeneration PsrChainProbeRayGeneration). With the probe buffer set they replace the
+    // PSR.2 probe after the indirect pass and also run after the direct pass, each with its pass's bindings. Uninitialized
+    // in normal rendering.
+    bool EnsurePsrChainProbePipelinesForTesting(GraphicsDevice& graphicsDevice, ShaderLibrary& shaderLibrary,
+        const std::filesystem::path& indirectLibrary, const std::filesystem::path& directLibrary);
 
     // PSR.1c-A (development, default off): creates, on first use, the PSR split pair: the direct pass from the PSR ReSTIR
     // DI library and the indirect pass from the PSR reference library. EnsurePrimarySurfaceReplacement must have
@@ -856,6 +876,22 @@ class PathTraceReferencePass
     bool m_psrGBufferPipelinesReady = false;
     bool m_psrGBufferPipelinesFailed = false;
     std::string m_psrGBufferFailure;
+    // Multibounce PSR (SetPrimarySurfaceReplacementChain).
+    std::uint32_t m_psrChain = 1;
+    std::filesystem::path m_psrChainDirectoryForTesting;
+    // A PSR lighting library's path for m_psrChain: PsrK2/<path> for two-mirror chains.
+    std::filesystem::path PsrChainLibraryPath(const std::filesystem::path& path) const
+    {
+        if(m_psrChain < 2)
+        {
+            return path;
+        }
+
+        return (m_psrChainDirectoryForTesting.empty() ? std::filesystem::path("PsrK2") : m_psrChainDirectoryForTesting) /
+            path;
+    }
+    // Releases every PSR lighting pipeline and its failure, including the combined PSR + SHARC learning pipelines.
+    void ResetPrimarySurfaceReplacementChainPipelines();
     bool m_psrGBufferWritten = false;
     // PSR.2 Stage 3B: extraction direct, extraction indirect and raw-distance extraction indirect.
     RayTracingPipeline m_psrGBufferExtractDirectPipeline;
@@ -867,6 +903,8 @@ class PathTraceReferencePass
     // Verification only: the probe buffer and the probe pipelines of the PSR.1 and PSR.2 libraries.
     Buffer* m_psrProbeForTesting = nullptr;
     RayTracingPipeline m_psrProbePipelines[2];
+    // Verification only (M2-A): the chain probes of the PSR.2 indirect (0) and direct (1) libraries.
+    RayTracingPipeline m_psrChainProbePipelines[2];
 
     // Shuts down both PSR pipelines and their GI.6 twins. Caller guarantees the queue is idle.
     void ReleasePrimarySurfaceReplacementPipelines();

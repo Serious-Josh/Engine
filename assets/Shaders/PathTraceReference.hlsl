@@ -926,6 +926,10 @@ struct PathTraceRasterFirstVertex
 #ifdef PATH_TRACE_PSR_GBUFFER
     // PSR.2: a replaced pixel's mirror plane point (its exact camera-ray intersection, camera-relative).
     float3 psrPlanePoint;
+#if PATH_TRACE_PSR_CHAIN >= 2
+    // Multibounce PSR: a replaced pixel's chain length, motion.w (1, or 2 for a two-mirror chain).
+    uint psrChain;
+#endif
 #endif
 #endif
 };
@@ -985,6 +989,9 @@ PathTraceRasterFirstVertex PathTraceDecodeRasterFirstVertex(uint2 pixel)
     firstVertex.psrPixel = pixel;
 #ifdef PATH_TRACE_PSR_GBUFFER
     firstVertex.psrPlanePoint = float3(0.0f, 0.0f, 0.0f);
+#if PATH_TRACE_PSR_CHAIN >= 2
+    firstVertex.psrChain = 1u;
+#endif
 #endif
 #endif
     return firstVertex;
@@ -1146,6 +1153,11 @@ void PathTraceResolveEffectivePrimary(uint2 pixel, inout PathTraceRasterFirstVer
     firstVertex.surface = mirror.vertex.surface;
     firstVertex.psrState = PATH_TRACE_PSR_SURFACE;
     firstVertex.psrPlanePoint = mirror.mirrorPoint;
+#if PATH_TRACE_PSR_CHAIN >= 2
+    // psrGBufferPadding.z: the motion target's SRV, whose w the replacement pass sets to the chain length.
+    Texture2D<float4> motionTexture = ResourceDescriptorHeap[psrGBufferPadding.z];
+    firstVertex.psrChain = motionTexture.Load(int3(pixel, 0)).w == 2.0f ? 2u : 1u;
+#endif
 }
 #else
 // Sets firstVertex.psrState. Only eligible vertices read storage: both record producers decode the same G-buffer
@@ -1164,7 +1176,13 @@ void PathTraceResolveEffectivePrimary(uint2 pixel, inout PathTraceRasterFirstVer
 // is shaded only below maxPathDepth), otherwise 0.
 uint PathTraceEffectivePrimaryVertex(PathTraceRasterFirstVertex firstVertex)
 {
+#if PATH_TRACE_PSR_CHAIN >= 2
+    // Multibounce PSR: the terminal surface D of a two-mirror chain is vertex 2.
+    return firstVertex.psrState == PATH_TRACE_PSR_SURFACE && maxPathDepth > firstVertex.psrChain ? firstVertex.psrChain :
+        0u;
+#else
     return firstVertex.psrState == PATH_TRACE_PSR_SURFACE && maxPathDepth > 1u ? 1u : 0u;
+#endif
 }
 
 #ifdef PATH_TRACE_PSR_GBUFFER
@@ -1228,6 +1246,169 @@ bool PathTracePsrReplacementSurface(uint2 pixel, PathTraceRasterFirstVertex firs
     position = psrGBufferCameraPosition + relative;
     return all(isfinite(position)) && PathTraceFinalizeSurface(surface);
 }
+
+#if PATH_TRACE_PSR_CHAIN >= 2
+// -----------------------------------------------------------------------------
+// Multibounce PSR (K = 2). The G-buffer holds Dv = R_A(R_B(D)) of a two-mirror chain A -> B -> D. Nothing stores B, so
+// each lighting pass retraces A -> B with the replacement pass's convention (origin: A's exact intersection with A's
+// geometric-normal offset; direction: A's delta sample) and reconstructs D from Dv through A's and B's planes. The
+// verification (M2-A.1, the same tolerances: production's lift 2e-4 L and 0.5 degrees) accepts only when the retraced
+// chain physically reaches the guides' surface:
+//   direct pass    B is a pure-delta mirror and D lies on B's delta ray, in front of it;
+//   indirect pass  additionally, the path loop's own B -> D ray hits a non-delta surface at D's distance with the
+//                  G-buffer's material and virtual face normal.
+// A rejection by either pass makes the indirect pass's path the ordinary production path for the pixel (its traced hits,
+// its own next-event estimation, the direct pass's value unused), with the extraction still split at vertex 2.
+// -----------------------------------------------------------------------------
+static const float PATH_TRACE_PSR_CHAIN_TOLERANCE = 2.0e-4f;
+static const float PATH_TRACE_PSR_CHAIN_NORMAL_COSINE = 0.99996192f;
+
+// The direct pass's split-direct value of a sample whose chain it rejected (x < 0; valid values are non-negative).
+static const float PATH_TRACE_PSR_CHAIN_REJECTED = -1.0f;
+
+// D reconstructed from the G-buffer's Dv through A's plane, then the plane of B (its exact hit point and finalized shading
+// normal, camera-relative): its lifted shading position, its exact point (both world space), the surface, the unfolded
+// path length L = |Dv - camera| and the stored material index and virtual geometric normal.
+bool PathTracePsrChainSurface(uint2 pixel, PathTraceRasterFirstVertex firstVertex, float3 chainPoint, float3 chainNormal,
+    out float3 position, out float3 exactPoint, out PathTraceSurface surface, out float pathLength,
+    out uint storedMaterial, out float3 storedNormal)
+{
+    position = float3(0.0f, 0.0f, 0.0f);
+    exactPoint = float3(0.0f, 0.0f, 0.0f);
+    surface = (PathTraceSurface)0;
+    pathLength = 0.0f;
+
+    Texture2D<float> depthTexture = ResourceDescriptorHeap[gBufferDepthIndex];
+    Texture2D<float4> materialTexture = ResourceDescriptorHeap[gBufferMaterialIndex];
+    Texture2D<float4> surfaceTexture = ResourceDescriptorHeap[gBufferSurfaceIndex];
+    Texture2D<float4> geometricNormalTexture = ResourceDescriptorHeap[gBufferGeometricNormalIndex];
+    PathTraceGBufferSample gBuffer = PathTraceLoadGBuffer(pixel, depthTexture, materialTexture, surfaceTexture,
+        geometricNormalTexture);
+    gBuffer.surface.w = -gBuffer.surface.w - 1.0f;
+    storedMaterial = uint(gBuffer.surface.w);
+    storedNormal = gBuffer.geometricNormal.xyz;
+
+    StructuredBuffer<GPUMaterial> materials = ResourceDescriptorHeap[materialBufferIndex];
+    PathTracePrimaryVertex virtualVertex;
+
+    if(!PathTraceDecodePrimaryVertex(pixel, gBuffer, PathTracePsrMirrorCamera().camera, materials, materialTableIndex,
+        materialAverageTableIndex, materialTableCosineMapping, virtualVertex))
+    {
+        return false;
+    }
+
+    const float3 planeNormal = firstVertex.surface.normal;
+    surface = virtualVertex.surface;
+    surface.view = PsrReflectDirection(PsrReflectDirection(surface.view, planeNormal), chainNormal);
+    surface.normal = PsrReflectDirection(PsrReflectDirection(surface.normal, planeNormal), chainNormal);
+    surface.geometricNormal = PsrReflectDirection(PsrReflectDirection(surface.geometricNormal, planeNormal), chainNormal);
+    pathLength = length(virtualVertex.cameraRelativePosition);
+    const float3 relative = PsrReflectPoint(PsrReflectPoint(virtualVertex.cameraRelativePosition,
+        firstVertex.psrPlanePoint, planeNormal), chainPoint, chainNormal);
+    exactPoint = psrGBufferCameraPosition + relative;
+    position = exactPoint + surface.geometricNormal * (PATH_TRACE_PRIMARY_SURFACE_LIFT * pathLength);
+    return all(isfinite(position)) && pathLength > 0.0f && PathTraceFinalizeSurface(surface);
+}
+
+// The first chain segment's ray: A's exact intersection, offset along A's geometric normal, in A's delta direction.
+bool PathTracePsrChainFirstRay(PathTraceRasterFirstVertex firstVertex, out RayDesc ray)
+{
+    float3 diffuseShare;
+    bool specularStrategy;
+    const PathTraceBSDFSample mirrorSample = PathTraceSampleBSDFLobes(firstVertex.surface, float3(0.0f, 0.0f, 0.0f),
+        diffuseShare, specularStrategy);
+    ray.Origin = PathTraceOffsetRayOrigin(psrGBufferCameraPosition + firstVertex.psrPlanePoint,
+        firstVertex.surface.geometricNormal);
+    ray.Direction = mirrorSample.direction;
+    ray.TMin = 0.0f;
+    ray.TMax = PATH_TRACE_DISTANT_LIGHT_DISTANCE;
+    return mirrorSample.valid && mirrorSample.delta;
+}
+
+// B's delta ray towards D, and whether D (exact) lies on it, in front of its origin, within the tolerance. along is D's
+// distance along the ray.
+bool PathTracePsrChainOnRay(float3 chainHit, PathTraceSurface chainSurface, float3 exactPoint, float pathLength,
+    out RayDesc terminalRay, out float along)
+{
+    float3 diffuseShare;
+    bool specularStrategy;
+    const PathTraceBSDFSample chainSample = PathTraceSampleBSDFLobes(chainSurface, float3(0.0f, 0.0f, 0.0f), diffuseShare,
+        specularStrategy);
+    terminalRay.Origin = PathTraceOffsetRayOrigin(chainHit, chainSurface.geometricNormal);
+    terminalRay.Direction = chainSample.direction;
+    terminalRay.TMin = 0.0f;
+    terminalRay.TMax = PATH_TRACE_DISTANT_LIGHT_DISTANCE;
+    const float3 toPoint = exactPoint - terminalRay.Origin;
+    along = dot(toPoint, terminalRay.Direction);
+    return chainSample.valid && chainSample.delta && along > 0.0f &&
+        length(toPoint - terminalRay.Direction * along) <= PATH_TRACE_PSR_CHAIN_TOLERANCE * pathLength;
+}
+
+bool PathTracePsrPureMirror(PathTraceSurface surface)
+{
+    return surface.deltaSpecular && surface.specularProbability >= 1.0f;
+}
+
+// The direct pass's K = 2 shading vertex: retraces A -> B (one ray) and accepts D if it lies on B's delta ray.
+bool PathTracePsrChainDirectSurface(uint2 pixel, PathTraceRasterFirstVertex firstVertex, out float3 position,
+    out PathTraceSurface surface)
+{
+    position = float3(0.0f, 0.0f, 0.0f);
+    surface = (PathTraceSurface)0;
+    RayDesc ray;
+
+    if(!PathTracePsrChainFirstRay(firstVertex, ray))
+    {
+        return false;
+    }
+
+    PathTracePayload payload;
+    payload.hitDistance = -1.0f;
+    payload.geometricNormal = float3(0.0f, 0.0f, 1.0f);
+    payload.shadingNormal = float3(0.0f, 0.0f, 1.0f);
+    payload.uv = float2(0.0f, 0.0f);
+    payload.materialIndex = 0u;
+#ifdef PATH_TRACE_SER
+    PathTraceTraceRadianceReordered(ray, 0xFF, false, payload);
+#else
+    TraceRay(scene, RAY_FLAG_NONE, 0xFF, 0, 1, PATH_TRACE_MISS_RADIANCE, ray, payload);
+#endif
+    PathTraceSurface chainSurface;
+
+    if(payload.hitDistance < 0.0f || !PathTraceBuildSurface(payload, ray.Direction, chainSurface) ||
+        !PathTracePsrPureMirror(chainSurface))
+    {
+        return false;
+    }
+
+    const float3 chainHit = ray.Origin + ray.Direction * payload.hitDistance;
+    float3 exactPoint;
+    float pathLength;
+    uint storedMaterial;
+    float3 storedNormal;
+    RayDesc terminalRay;
+    float along;
+    return PathTracePsrChainSurface(pixel, firstVertex, chainHit - psrGBufferCameraPosition, chainSurface.normal,
+        position, exactPoint, surface, pathLength, storedMaterial, storedNormal) &&
+        PathTracePsrChainOnRay(chainHit, chainSurface, exactPoint, pathLength, terminalRay, along);
+}
+
+// The indirect pass's terminal check of its traced B -> D hit against the reconstruction.
+bool PathTracePsrChainTerminalMatches(PathTracePayload payload, RayDesc terminalRay, float along, float pathLength,
+    uint storedMaterial, float3 storedNormal, float3 chainNormal, float3 planeNormal)
+{
+    if(payload.hitDistance < 0.0f || payload.materialIndex != storedMaterial ||
+        !(abs(payload.hitDistance - along) <= PATH_TRACE_PSR_CHAIN_TOLERANCE * pathLength))
+    {
+        return false;
+    }
+
+    const float facing = dot(payload.geometricNormal, -terminalRay.Direction) < 0.0f ? -1.0f : 1.0f;
+    const float3 virtualNormal = PsrReflectDirection(PsrReflectDirection(payload.geometricNormal * facing, chainNormal),
+        planeNormal);
+    return dot(normalize(virtualNormal), normalize(storedNormal)) >= PATH_TRACE_PSR_CHAIN_NORMAL_COSINE;
+}
+#endif
 #else
 // The closest-hit payload of a replaced pixel's vertex 1, as the path loop's continuation would have returned it.
 PathTracePayload PathTraceEffectivePrimaryReplacementPayload(uint2 pixel)
@@ -1272,6 +1453,14 @@ bool PathTracePsrReplacementSurface(uint2 pixel, PathTraceRasterFirstVertex firs
 bool PathTraceEffectivePrimaryShadingVertex(uint2 pixel, PathTraceRasterFirstVertex firstVertex, out float3 position,
     out PathTraceSurface surface)
 {
+#if PATH_TRACE_PSR_CHAIN >= 2
+    // Multibounce PSR: a two-mirror chain's D, if the retraced chain verifies; otherwise the mirror (nothing is lit).
+    if(PathTraceEffectivePrimaryVertex(firstVertex) == 2u &&
+        PathTracePsrChainDirectSurface(pixel, firstVertex, position, surface))
+    {
+        return true;
+    }
+#endif
     if(PathTraceEffectivePrimaryVertex(firstVertex) == 1u &&
         PathTracePsrReplacementSurface(pixel, firstVertex, position, surface))
     {
@@ -1405,10 +1594,36 @@ float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex 
     uint rtxdiVertex = primary == PATH_TRACE_PRIMARY_RASTER_SPLIT_INDIRECT ?
         PathTraceEffectivePrimaryVertex(rasterFirstVertex) : 0u;
 #endif
+#if PATH_TRACE_PSR_CHAIN >= 2
+    // Multibounce PSR: a two-mirror chain traces A -> B (vertex 1) and B -> D (vertex 2) as ordinary vertices, from the
+    // replacement pass's first origin, and verifies D (PathTracePsrChainTerminalMatches). Accepted, vertex 2 is the
+    // guides' D, lit by RTXDI; rejected here or by the direct pass, rtxdiVertex becomes 0 (mirror A, which has no
+    // non-delta lobe) and the path is the ordinary one. The extraction splits at vertex 2 either way.
+    const bool psrChain = primary == PATH_TRACE_PRIMARY_RASTER_SPLIT_INDIRECT && rtxdiVertex == 2u;
+    const uint psrExtractionVertex = rtxdiVertex;
+    bool psrChainValid = psrChain;
+    float3 psrChainPoint = float3(0.0f, 0.0f, 0.0f);
+    PathTraceSurface psrChainSurface = (PathTraceSurface)0;
+
+    if(psrChain)
+    {
+        RWByteAddressBuffer chainDirect = ResourceDescriptorHeap[splitDirectRadianceIndex];
+
+        if(asfloat(chainDirect.Load(PathTraceSplitDirectRadianceAddress(g_splitPixel, g_splitSampleOffset))) < 0.0f)
+        {
+            psrChainValid = false;
+            rtxdiVertex = 0u;
+        }
+    }
+#endif
 #ifdef PATH_TRACE_PSR_GBUFFER
     // PSR.2 Stage 3B: the vertex whose lobes the extraction splits by, the effective primary: B (vertex 1) for a replaced
     // pixel, which the denoisers filter as the G-buffer's virtual surface, and the mirror's throughput only scales it.
+#if PATH_TRACE_PSR_CHAIN >= 2
+#define PATH_TRACE_EXTRACTION_VERTEX psrExtractionVertex
+#else
 #define PATH_TRACE_EXTRACTION_VERTEX rtxdiVertex
+#endif
 #else
 #define PATH_TRACE_EXTRACTION_VERTEX 0u
 #endif
@@ -1437,6 +1652,13 @@ float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex 
 #ifdef PATH_TRACE_PSR_LIBRARY
             // PSR.1a: a replaced pixel's vertex 1 is its recorded hit. The call site stays uniform (R3-F): the ray is
             // the loop's own continuation with mask 0, so nothing is traversed, and the payload is then the record's.
+#if PATH_TRACE_PSR_CHAIN >= 2
+            // Multibounce PSR: a chain's replacement vertex is D (vertex 2), traced for its verification.
+            bool replacementVertex = (primary == PATH_TRACE_PRIMARY_RASTER ||
+                primary == PATH_TRACE_PRIMARY_RASTER_SPLIT_INDIRECT) && vertex == (psrChain ? 2u : 1u) &&
+                PathTracePsrReplaced(rasterFirstVertex.psrState);
+            bool untracedVertex = gBufferVertex || (replacementVertex && !psrChain);
+#else
             bool replacementVertex = (primary == PATH_TRACE_PRIMARY_RASTER ||
                 primary == PATH_TRACE_PRIMARY_RASTER_SPLIT_INDIRECT) && vertex == 1u &&
                 PathTracePsrReplaced(rasterFirstVertex.psrState);
@@ -1445,6 +1667,7 @@ float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex 
             replacementVertex = false;
 #endif
             bool untracedVertex = gBufferVertex || replacementVertex;
+#endif
             // PSR.1a-P: the call stays unconditional. A wave-uniform skip (WaveActiveAllTrue(replacementVertex)) is
             // equivalent, but placing the call under a branch made this pass 0.5-1.8 ms slower (PSR1aPPerformance.md).
 #ifdef PATH_TRACE_SER
@@ -1453,7 +1676,11 @@ float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex 
             TraceRay(scene, RAY_FLAG_NONE, untracedVertex ? 0x00 : 0xFF, 0, 1, PATH_TRACE_MISS_RADIANCE, ray, payload);
 #endif
 
+#if PATH_TRACE_PSR_CHAIN >= 2
+            if(replacementVertex && !psrChain)
+#else
             if(replacementVertex)
+#endif
             {
                 payload = PathTraceEffectivePrimaryReplacementPayload(rasterFirstVertex.psrPixel);
             }
@@ -1550,6 +1777,45 @@ float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex 
                     break;
                 }
 
+#if PATH_TRACE_PSR_CHAIN >= 2
+                // Multibounce PSR: the chain's traced D. Verified, it becomes the guides' D; otherwise the traced hit.
+                if(replacementVertex && psrChain)
+                {
+                    bool accepted = false;
+
+                    if(psrChainValid)
+                    {
+                        float3 exactPoint;
+                        float pathLength;
+                        uint storedMaterial;
+                        float3 storedNormal;
+                        RayDesc terminalRay;
+                        float along;
+                        accepted = PathTracePsrChainSurface(rasterFirstVertex.psrPixel, rasterFirstVertex,
+                            psrChainPoint - psrGBufferCameraPosition, psrChainSurface.normal, position, exactPoint, surface,
+                            pathLength, storedMaterial, storedNormal) &&
+                            PathTracePsrChainOnRay(psrChainPoint, psrChainSurface, exactPoint, pathLength, terminalRay,
+                            along) && PathTracePsrChainTerminalMatches(payload, terminalRay, along, pathLength,
+                            storedMaterial, storedNormal, psrChainSurface.normal, rasterFirstVertex.surface.normal);
+                    }
+#ifdef PATH_TRACE_PSR_CHAIN_FORCE_REJECT
+                    // Verification only: the indirect pass also rejects every chain pixel with (x + 2y) % 6 == 0.
+                    accepted = accepted && (rasterFirstVertex.psrPixel.x + 2u * rasterFirstVertex.psrPixel.y) % 6u != 0u;
+#endif
+
+                    if(!accepted)
+                    {
+                        rtxdiVertex = 0u;
+                        position = ray.Origin + ray.Direction * payload.hitDistance;
+
+                        if(!PathTraceBuildSurface(payload, ray.Direction, surface))
+                        {
+                            break;
+                        }
+                    }
+                }
+                else
+#endif
 #ifdef PATH_TRACE_PSR_GBUFFER
                 // PSR.2: a replaced pixel's vertex 1 is B reconstructed from the G-buffer, not a hit.
                 if(replacementVertex)
@@ -1624,6 +1890,20 @@ float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex 
             }
         }
 
+#if PATH_TRACE_PSR_CHAIN >= 2
+        // Multibounce PSR: the chain's B, which must be a pure-delta mirror.
+        if(psrChain && vertex == 1u)
+        {
+            psrChainPoint = position;
+            psrChainSurface = surface;
+
+            if(!PathTracePsrPureMirror(surface))
+            {
+                psrChainValid = false;
+                rtxdiVertex = 0u;
+            }
+        }
+#endif
 #ifdef PATH_TRACE_PSR_SHARC_ENERGY_DIAGNOSTIC
         if(vertex == 1u)
         {
@@ -1759,6 +2039,14 @@ float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex 
         }
 
         ray.Origin = PathTraceOffsetRayOrigin(position, surface.geometricNormal);
+#if PATH_TRACE_PSR_CHAIN >= 2
+        // Multibounce PSR: A -> B leaves A's exact intersection, as the replacement pass's ray does.
+        if(psrChain && vertex == 0u)
+        {
+            ray.Origin = PathTraceOffsetRayOrigin(psrGBufferCameraPosition + rasterFirstVertex.psrPlanePoint,
+                surface.geometricNormal);
+        }
+#endif
         ray.Direction = bsdfSample.direction;
         ray.TMin = 0.0f;
         ray.TMax = PATH_TRACE_DISTANT_LIGHT_DISTANCE;
@@ -2609,6 +2897,17 @@ void PathTraceRunReSTIRDISplitDirect(bool extract)
         bool replacedSurface = PathTraceEffectivePrimaryShadingVertex(pixel, rasterFirstVertex, directPosition,
             directSurface);
         directLighting = directLighting || replacedSurface;
+#if PATH_TRACE_PSR_CHAIN >= 2
+        // Multibounce PSR: a two-mirror chain this pass rejected publishes the sentinel, so the indirect pass takes the
+        // ordinary path (and its own next-event estimation) for the pixel.
+#ifdef PATH_TRACE_PSR_CHAIN_FORCE_REJECT
+        // Verification only (tests/PsrK2Reject/): the direct pass also rejects every chain pixel with (x + 2y) % 6 == 3.
+        const bool chainRejected = PathTraceEffectivePrimaryVertex(rasterFirstVertex) == 2u &&
+            (!replacedSurface || (pixel.x + 2u * pixel.y) % 6u == 3u);
+#else
+        const bool chainRejected = PathTraceEffectivePrimaryVertex(rasterFirstVertex) == 2u && !replacedSurface;
+#endif
+#endif
 #endif
 
         g_rtxdiPixel = pixel;
@@ -2639,6 +2938,12 @@ void PathTraceRunReSTIRDISplitDirect(bool extract)
 #endif
             }
 
+#if PATH_TRACE_PSR_CHAIN >= 2
+            if(chainRejected)
+            {
+                sampleDirect = float3(PATH_TRACE_PSR_CHAIN_REJECTED, 0.0f, 0.0f);
+            }
+#endif
             directRadiance.Store3(PathTraceSplitDirectRadianceAddress(pixel, sampleOffset), asuint(sampleDirect));
 
             if(extract)

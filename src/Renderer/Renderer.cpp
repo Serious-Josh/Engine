@@ -7156,8 +7156,13 @@ bool Renderer::RecordPsrInPlaceReplacement(ID3D12GraphicsCommandList* commandLis
         lighting.transformCount = constants.transformCount;
         // Verification only: the PSR probe's UAV.
         lighting.padding[0] = m_pathTraceReferencePass.PsrProbeUAVIndex();
+        // Multibounce PSR: the motion target, whose w holds each replaced pixel's chain length (PsrK2/ libraries only).
+        lighting.padding[2] = m_gBuffer.GetMotion().GetSRVIndex();
 #ifndef NDEBUG
-        lighting.padding[2] = m_psrSharcEnergyReferenceForTesting ? m_psrSharcEnergyReferenceForTesting->GetUAVDescriptorIndex() : 0;
+        if(m_psrSharcEnergyReferenceForTesting)
+        {
+            lighting.padding[2] = m_psrSharcEnergyReferenceForTesting->GetUAVDescriptorIndex();
+        }
 #endif
         lighting.SetTextureMipBias(constants.textureMipBias);
         m_psrGBufferConstantsAddress = m_uploadBuffer.Allocate(&lighting, sizeof(lighting),
@@ -7188,7 +7193,7 @@ bool Renderer::RecordPsrInPlaceReplacement(ID3D12GraphicsCommandList* commandLis
         return false;
     }
     if(!m_psrInPlaceReplacePass.Execute(commandList, m_gBuffer, constantsAddress, transformsAddress, topLevel,
-        m_sceneWidth, m_sceneHeight, m_psrDiagnosticHits))
+        m_sceneWidth, m_sceneHeight, m_psrDiagnosticHits, m_psrChainThisFrame >= 2u))
     {
         return false;
     }
@@ -8168,6 +8173,7 @@ bool Renderer::RecordPathTraceReference(
     key.settings = settings;
     // PSR.2: whether this frame's G-buffer was replaced, which a diagnostic view can change without the setting.
     key.settings.primarySurfaceReplacementInPlace = m_psrInPlaceReplacedLastFrame;
+    key.settings.primarySurfaceReplacementChain = m_psrInPlaceReplacedLastFrame ? m_psrChainThisFrame : 1u;
     key.sun = frameLighting.sun;
     key.lights = frameLighting.table;
     key.topLevelAddress = m_rayTracingScene.GetTopLevel().GetGPUAddress();
@@ -11713,8 +11719,22 @@ bool Renderer::RecordRenderFrame(
     m_psrDenoiseConstantsAddress = 0;
     m_psrLightingLastFrame = false;
     std::string psrLightingUnavailable;
+    // Multibounce PSR: two-bounce needs D (vertex 2) below maxPathDepth; otherwise the frame replaces single-bounce.
+    m_psrChainThisFrame = options.pathTraceReference.primarySurfaceReplacementChain >= 2u &&
+        options.pathTraceReference.maxPathDepth >= 3u && m_psrInPlaceReplacePass.IsChainAvailable() ? 2u : 1u;
 
-    if(psrRequested)
+    // The lighting pipelines follow the chain length; switching rebuilds them once the queue is idle.
+    if(psrRequested && m_pathTraceReferencePass.GetPrimarySurfaceReplacementChain() != m_psrChainThisFrame &&
+        m_commandContext.WaitForGPU())
+    {
+        m_pathTraceReferencePass.SetPrimarySurfaceReplacementChain(m_psrChainThisFrame);
+    }
+
+    if(psrRequested && m_pathTraceReferencePass.GetPrimarySurfaceReplacementChain() != m_psrChainThisFrame)
+    {
+        psrLightingUnavailable = "the PSR mode's lighting pipelines are not ready";
+    }
+    else if(psrRequested)
     {
         std::string failure;
 

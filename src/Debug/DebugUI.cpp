@@ -1120,6 +1120,7 @@ PathTraceReferenceSettings DebugUI::GetPathTraceReferenceSettings() const
     settings.russianRouletteDepth = static_cast<std::uint32_t>(m_pathTraceRussianRouletteDepth);
     settings.maxAccumulatedSamples = static_cast<std::uint32_t>(m_pathTraceMaxAccumulatedSamples);
     settings.primarySurfaceReplacementInPlace = m_primarySurfaceReplacementInPlace;
+    settings.primarySurfaceReplacementChain = m_primarySurfaceReplacementChain;
     return settings;
 }
 
@@ -1397,12 +1398,25 @@ void DebugUI::DrawPathTraceReferenceSettings()
         m_pathTraceMaxAccumulatedSamples = m_pathTraceSamplesPerFrame;
     }
 
-    // PSR.2 development prototype: production lighting does not interpret replaced pixels yet. The PSR.1 reference
-    // settings (primarySurfaceReplacement, its guides) are set only by the verification harnesses.
-    ImGui::Checkbox("PT PSR in-place replacement (dev)", &m_primarySurfaceReplacementInPlace);
+    // PSR.2: primary surface replacement through pure-delta mirrors, single-bounce (A -> B) or two-bounce
+    // (A -> B -> D). The PSR.1 reference settings (primarySurfaceReplacement, its guides) are set only by the verification
+    // harnesses.
+    const char* psrModes[] = {"Off", "Single-bounce", "Two-bounce"};
+    int psrMode = m_primarySurfaceReplacementInPlace ? static_cast<int>(m_primarySurfaceReplacementChain) : 0;
+
+    if(ImGui::Combo("PT PSR mode", &psrMode, psrModes, IM_ARRAYSIZE(psrModes)))
+    {
+        m_primarySurfaceReplacementInPlace = psrMode != 0;
+        m_primarySurfaceReplacementChain = psrMode == 2 ? 2u : 1u;
+    }
 
     if(m_primarySurfaceReplacementInPlace)
     {
+        if(m_primarySurfaceReplacementChain >= 2u && m_pathTraceMaxPathDepth < 3)
+        {
+            ImGui::TextWrapped("Two-bounce needs PT max path depth 3 or more; replacing single-bounce.");
+        }
+
         if(!m_psrLightingRequested)
         {
             ImGui::TextWrapped("Inactive: select the Path Tracing (ReSTIR DI) lighting mode.");

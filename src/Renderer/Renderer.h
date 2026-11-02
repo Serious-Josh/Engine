@@ -1606,6 +1606,8 @@ class Renderer
     PsrInPlaceReplacePass m_psrInPlaceReplacePass;
     // Whether the last recorded frame ran the in-place replacement pass (diagnostics).
     bool m_psrInPlaceReplacedLastFrame = false;
+    // Multibounce PSR: this frame's effective chain length (1, or 2 for two-bounce PSR), decided with its lighting.
+    std::uint32_t m_psrChainThisFrame = 1;
     // Development verification only: when set (with the pass's diagnostic pipeline initialized), the replacement pass
     // runs its diagnostic variant and writes per-pixel hit records here. Null in normal rendering.
     Buffer* m_psrDiagnosticHits = nullptr;

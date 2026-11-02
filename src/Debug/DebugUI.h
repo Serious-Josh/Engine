@@ -418,6 +418,7 @@ class DebugUI
     GpuTimingMonitor m_visibilityTimings;
     int m_secondaryShadowVisibility = PathTraceReferenceSettings{}.secondaryShadowRayQuery ? 1 : 0;
     bool m_primarySurfaceReplacementInPlace = PathTraceReferenceSettings{}.primarySurfaceReplacementInPlace;
+    std::uint32_t m_primarySurfaceReplacementChain = PathTraceReferenceSettings{}.primarySurfaceReplacementChain;
     int m_psrDebugView = 0; // Off, Replacement Mask, Reflected Normals, Reflected Albedo.
     bool m_psrLightingRequested = false;
     std::string m_psrLightingUnavailable;

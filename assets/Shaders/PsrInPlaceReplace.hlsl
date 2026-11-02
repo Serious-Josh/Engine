@@ -24,6 +24,16 @@
 // surface or is itself a pure-delta mirror (PSR.1's fallback states), its material index is not representable as
 // -(i + 1) in fp16, or Bv is not strictly inside the finite depth range.
 // The identity target is not bound and keeps the mirror's identity.
+//
+// Multibounce PSR (PsrInPlaceReplaceK2.hlsl, PSR_MAX_CHAIN 2): a reflected hit that is a pure-delta mirror B is followed
+// by one more delta reflection to the terminal surface D. The pixel then holds Dv = R_A(R_B(D)) with D's material and
+// normals reflected through B and A, motion from D moved by its instance and reflected in B's and A's moved planes, and
+// motion.w 2 (the chain length; the lighting passes retrace B and verify D against these guides). Every other fallback is
+// unchanged, and a second mirror, a mixed-smooth B or a miss after B falls back.
+
+#ifndef PSR_MAX_CHAIN
+#define PSR_MAX_CHAIN 1
+#endif
 
 #include "PathTracePrimarySurface.hlsli"
 #include "PsrEligibility.hlsli"
@@ -575,14 +585,65 @@ PixelOutput PSMain(VertexOutput input)
         discard;
     }
 
-    const PathTracePayload payload = PsrClosestHit(query);
+    PathTracePayload payload = PsrClosestHit(query);
     PathTraceSurface replacement;
-    const uint replacementInstance = query.CommittedInstanceID();
-    const uint replacementPrimitive = query.CommittedPrimitiveIndex();
-    const float2 replacementBarycentrics = query.CommittedTriangleBarycentrics();
+    uint replacementInstance = query.CommittedInstanceID();
+    uint replacementPrimitive = query.CommittedPrimitiveIndex();
+    float2 replacementBarycentrics = query.CommittedTriangleBarycentrics();
+    bool built = PathTraceBuildSurface(payload, ray.Direction, replacement);
+#if PSR_MAX_CHAIN >= 2
+    // K = 2: a pure-delta mirror B is followed by its delta reflection, traced from B's exact hit with the path loop's
+    // offset, exactly as the lighting passes retrace it. B's plane is its finalized shading normal through the unlifted
+    // hit, as A's is.
+    bool chained = false;
+    float3 chainPlanePoint = float3(0.0f, 0.0f, 0.0f);
+    float3 chainPlaneNormal = float3(0.0f, 0.0f, 1.0f);
+    uint chainInstance = 0u;
 
-    if(!PathTraceBuildSurface(payload, ray.Direction, replacement) || replacement.deltaSpecular ||
-        payload.materialIndex > PSR_MAXIMUM_REPLACEMENT_MATERIAL)
+    if(built && replacement.deltaSpecular && replacement.specularProbability >= 1.0f)
+    {
+        float3 chainShare;
+        bool chainStrategy;
+        const PathTraceBSDFSample chainSample = PathTraceSampleBSDFLobes(replacement, float3(0.0f, 0.0f, 0.0f), chainShare,
+            chainStrategy);
+
+        if(!chainSample.valid || !chainSample.delta)
+        {
+            discard;
+        }
+
+        const float3 chainHit = ray.Origin + ray.Direction * payload.hitDistance;
+        chainPlanePoint = chainHit - cameraPosition;
+        chainPlaneNormal = replacement.normal;
+        chainInstance = replacementInstance;
+        ray.Origin = PathTraceOffsetRayOrigin(chainHit, replacement.geometricNormal);
+        ray.Direction = chainSample.direction;
+        RayQuery<RAY_FLAG_NONE> terminalQuery;
+        terminalQuery.TraceRayInline(scene, RAY_FLAG_NONE, 0xFF, ray);
+
+        while(terminalQuery.Proceed())
+        {
+            if(terminalQuery.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE)
+            {
+                terminalQuery.CommitNonOpaqueTriangleHit();
+            }
+        }
+
+        if(terminalQuery.CommittedStatus() != COMMITTED_TRIANGLE_HIT)
+        {
+            discard;
+        }
+
+        payload = PsrClosestHit(terminalQuery);
+        replacementInstance = terminalQuery.CommittedInstanceID();
+        replacementPrimitive = terminalQuery.CommittedPrimitiveIndex();
+        replacementBarycentrics = terminalQuery.CommittedTriangleBarycentrics();
+        built = PathTraceBuildSurface(payload, ray.Direction, replacement);
+        chained = true;
+    }
+#endif
+
+    if(!built || replacement.deltaSpecular || payload.materialIndex > PSR_MAXIMUM_REPLACEMENT_MATERIAL)
     {
         PsrStoreDiagnostic(pixel, PSR_DIAGNOSTIC_REFLECTED_MIRROR_OR_INVALID, replacementInstance, replacementPrimitive,
             payload.hitDistance, replacementBarycentrics, payload.uv);
@@ -595,7 +656,14 @@ PixelOutput PSMain(VertexOutput input)
     // plane is PSR.1b's (the geometric normal); for a normal-mapped one PSR.1b's plane would put the point off the ray.
     const float3 planeNormal = mirror.surface.normal;
     const float3 replacementPoint = (ray.Origin - cameraPosition) + ray.Direction * payload.hitDistance;
+#if PSR_MAX_CHAIN >= 2
+    // K = 2: D through B's plane, then A's (Dv = R_A(R_B(D)), also on the pixel's camera ray).
+    const float3 chainedPoint = chained ? PsrReflectPoint(replacementPoint, chainPlanePoint, chainPlaneNormal) :
+        replacementPoint;
+    const float3 virtualPoint = PsrReflectPoint(chainedPoint, planePoint, planeNormal);
+#else
     const float3 virtualPoint = PsrReflectPoint(replacementPoint, planePoint, planeNormal);
+#endif
     const float4 virtualClip = mul(cameraRelativeViewProjection, float4(virtualPoint, 1.0f));
     const float virtualDepth = virtualClip.z / virtualClip.w;
 
@@ -614,12 +682,33 @@ PixelOutput PSMain(VertexOutput input)
         objectTransforms[replacementInstance].currentToPrevious : transform.currentToPrevious;
     const float3 worldReplacementPoint = cameraPosition + replacementPoint;
     const float3 worldPlanePoint = cameraPosition + planePoint;
+#if PSR_MAX_CHAIN >= 2
+    // K = 2: D moved by its instance, reflected in B's plane moved by B's instance, then in A's moved plane.
+    float3 worldChainedPoint = worldReplacementPoint;
+    float3 previousChainedPoint = PsrTransformPoint(replacementToPrevious, worldReplacementPoint);
+
+    if(chained)
+    {
+        const float4x4 chainToPrevious = chainInstance < transformCount ?
+            objectTransforms[chainInstance].currentToPrevious : transform.currentToPrevious;
+        const float3 worldChainPlanePoint = cameraPosition + chainPlanePoint;
+        worldChainedPoint = PsrReflectPoint(worldReplacementPoint, worldChainPlanePoint, chainPlaneNormal);
+        previousChainedPoint = PsrReflectPoint(previousChainedPoint, PsrTransformPoint(chainToPrevious, worldChainPlanePoint),
+            mul((float3x3)chainToPrevious, chainPlaneNormal));
+    }
+
+    precise const float3 worldVirtualPoint = PsrReflectPoint(worldChainedPoint, worldPlanePoint, planeNormal);
+    precise const float3 previousVirtualPoint = PsrReflectPoint(previousChainedPoint,
+        PsrTransformPoint(transform.currentToPrevious, worldPlanePoint),
+        mul((float3x3)transform.currentToPrevious, planeNormal));
+#else
     precise const float3 worldVirtualPoint = PsrReflectPoint(worldReplacementPoint, worldPlanePoint, planeNormal);
     // A plane's normal moves with the inverse transpose; for the rigid and uniformly scaled transforms of the scene the
     // linear part gives the same direction (unit length, so no renormalization is needed).
     precise const float3 previousVirtualPoint = PsrReflectPoint(PsrTransformPoint(replacementToPrevious, worldReplacementPoint),
         PsrTransformPoint(transform.currentToPrevious, worldPlanePoint),
         mul((float3x3)transform.currentToPrevious, planeNormal));
+#endif
     precise const float4 currentMotionClip = mul(unjitteredViewProjection, float4(worldVirtualPoint, 1.0f));
     precise const float4 previousMotionClip = mul(previousViewProjection, float4(previousVirtualPoint, 1.0f));
     float4 motion = float4(0.0f, 0.0f, 0.0f, 1.0f);
@@ -643,10 +732,22 @@ PixelOutput PSMain(VertexOutput input)
     const float facing = dot(payload.geometricNormal, -ray.Direction) < 0.0f ? -1.0f : 1.0f;
     PixelOutput output;
     output.material = float4(replacement.baseColor, replacement.material.roughness);
+#if PSR_MAX_CHAIN >= 2
+    const float3 chainedShadingNormal = chained ?
+        PsrReflectDirection(payload.shadingNormal * facing, chainPlaneNormal) : payload.shadingNormal * facing;
+    const float3 chainedGeometricNormal = chained ?
+        PsrReflectDirection(payload.geometricNormal * facing, chainPlaneNormal) : payload.geometricNormal * facing;
+    output.surface = float4(PsrReflectDirection(chainedShadingNormal, planeNormal), -(float(payload.materialIndex) + 1.0f));
+    output.geometricNormal = float4(PsrReflectDirection(chainedGeometricNormal, planeNormal),
+        replacement.material.model == 0u ? replacement.material.metallic : 0.0f);
+    // The chain length (M2-A.1's key): 1.0 as the K = 1 pass writes, 2.0 for a two-mirror chain.
+    motion.w = chained ? 2.0f : 1.0f;
+#else
     output.surface = float4(PsrReflectDirection(payload.shadingNormal * facing, planeNormal),
         -(float(payload.materialIndex) + 1.0f));
     output.geometricNormal = float4(PsrReflectDirection(payload.geometricNormal * facing, planeNormal),
         replacement.material.model == 0u ? replacement.material.metallic : 0.0f);
+#endif
     output.motion = motion;
     output.depth = virtualDepth;
 #if PSR_DIAGNOSTIC_HITS
