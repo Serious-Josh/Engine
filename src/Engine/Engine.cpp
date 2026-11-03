@@ -3,6 +3,8 @@
 #include "assets/ProjectScriptAssets.h"
 #include "assets/ProjectMeshImportService.h"
 #include "Engine/PackagedBootstrap.h"
+#include "Engine/PackagedRenderingSettings.h"
+#include "Engine/RenderingConfigurationResolver.h"
 #include "Renderer/MaterialTables/MaterialTableFile.h"
 #include "Platform/Windows/EditorDistributionPaths.h"
 #include "assets/CookedScene.h"
@@ -49,6 +51,117 @@ namespace
     {
         const auto text = path.u8string();
         return {text.begin(), text.end()};
+    }
+
+    // Project-facing lighting mode names, as the Project Settings window shows them.
+    const char* DescribeLightingMode(RendererLightingMode mode)
+    {
+        switch(mode)
+        {
+        case RendererLightingMode::PathTracedReference:
+            return "Reference Path Tracer";
+        case RendererLightingMode::PathTracedRasterPrimary:
+            return "Raster primary (verification)";
+        case RendererLightingMode::PathTracedRasterPrimaryReSTIRDI:
+            return "Path Tracing";
+        case RendererLightingMode::Legacy:
+        default:
+            return "Legacy";
+        }
+    }
+
+    const char* DescribeDenoiser(PathTraceDenoiserMode denoiser)
+    {
+        switch(denoiser)
+        {
+        case PathTraceDenoiserMode::Engine:
+            return "Engine";
+        case PathTraceDenoiserMode::NrdReblur:
+            return "NRD REBLUR";
+        case PathTraceDenoiserMode::NrdRelax:
+            return "NRD RELAX";
+        case PathTraceDenoiserMode::NrdHybrid:
+            return "NRD Hybrid";
+        case PathTraceDenoiserMode::Off:
+        default:
+            return "Off";
+        }
+    }
+
+    // PS.5B: Path Tracing features whose shaders packaged games do not carry (caustics stay Editor-only) are turned
+    // off before the configuration reaches the renderer, which would otherwise enable them and fail at pipeline
+    // creation. The saved settings are unchanged. Returns the requested features it turned off. PS.5E: DLSS is no
+    // longer restricted; without its runtime the renderer renders Native and reports why.
+    std::vector<std::string> RestrictToPackagedFeatures(RenderingConfiguration& configuration)
+    {
+        std::vector<std::string> off;
+
+        if(configuration.lightingMode != RendererLightingMode::PathTracedRasterPrimaryReSTIRDI)
+        {
+            return off;
+        }
+
+        if(configuration.dedicatedCaustics || configuration.pixelCentredCaustics)
+        {
+            off.push_back("caustics");
+            configuration.dedicatedCaustics = false;
+            configuration.causticOnlyView = false;
+            configuration.pixelCentredCaustics = false;
+        }
+
+        return off;
+    }
+
+    // PS.5E: requested versus effective DLSS. "on" only on frames DLSS reconstructed, with the preset and extents;
+    // otherwise the reason the renderer holds (failure, backend availability, eligibility, or evaluation).
+    void AppendPackagedDlssStatus(const Renderer& renderer, const RenderingConfiguration& configuration,
+        std::string& report)
+    {
+        const auto requestedScale = static_cast<Renderer::RenderScale>(configuration.renderScaleIndex);
+        const std::optional<DlssQualityPreset> requestedPreset = Renderer::GetDlssPreset(requestedScale);
+
+        if(!configuration.dlssRequested || !requestedPreset)
+        {
+            return;
+        }
+
+        const Renderer::SceneResolution resolution = renderer.GetSceneResolution();
+
+        if(renderer.IsDlssActiveLastFrame())
+        {
+            report += std::string(" | DLSS: on (") + DlssQualityPresetName(*requestedPreset) + ", " +
+                std::to_string(resolution.renderWidth) + "x" + std::to_string(resolution.renderHeight) + " to " +
+                std::to_string(resolution.outputWidth) + "x" + std::to_string(resolution.outputHeight) + ")";
+            return;
+        }
+
+        const DlssStatus& backend = renderer.GetDlssStatus();
+        std::string reason;
+
+        // Without a denoiser DLSS is never eligible, and Build Game ships no runtime for it: that is the reason.
+        if(configuration.denoiser == PathTraceDenoiserMode::Off)
+        {
+            reason = "DLSS needs a path-tracing denoiser";
+        }
+        else if(!renderer.GetDlssFailure().empty())
+        {
+            reason = renderer.GetDlssFailure();
+        }
+        else if(backend.availability != DlssAvailability::Available)
+        {
+            reason = std::string(DlssAvailabilityName(backend.availability)) + ": " + backend.detail;
+        }
+        else if(renderer.GetDlssInactiveReason()[0] != '\0')
+        {
+            reason = renderer.GetDlssInactiveReason();
+        }
+        else
+        {
+            reason = "waiting for an eligible frame";
+        }
+
+        report += std::string(" | DLSS: off (requested ") + DlssQualityPresetName(*requestedPreset) + "; " + reason +
+            ")";
     }
 
 
@@ -788,6 +901,8 @@ void Engine::SetStartupProject(OpenedProject project)
 
     m_activeProject.emplace(std::move(project.context));
     m_projectLock = std::move(project.lock);
+    // PS.2C: session overrides never carry over to another project.
+    m_renderer.GetDebugUI().ClearRenderingOverrides();
 }
 
 const ProjectContext& Engine::GetActiveProject() const
@@ -1074,6 +1189,146 @@ bool Engine::AdmitPackagedMainCamera(const FileSceneRuntime& runtime, std::uint3
     return true;
 }
 
+// PS.4: what the saved settings ask for against what the last recorded frame rendered, logged only on change. PS.5B adds
+// the effective denoiser and RayQuery visibility of a Path Tracing frame, and when each report happened.
+void Engine::ReportPackagedLightingMode(double renderMilliseconds)
+{
+    const LightingModeTransitionStatus& status = m_renderer.GetLightingModeTransitionStatus();
+    const RendererLightingMode requested = m_packagedRenderingConfiguration.lightingMode;
+    std::string report = std::string("Requested: ") + DescribeLightingMode(requested) +
+        " | Effective: " + DescribeLightingMode(status.active);
+
+    if(status.active != requested)
+    {
+        switch(status.stage)
+        {
+        // Not a failure: the requested mode is still being prepared, off the render thread until activation.
+        case LightingModeTransitionStage::Queued:
+        case LightingModeTransitionStage::Compiling:
+            report += " | Preparing: shader libraries";
+            break;
+        case LightingModeTransitionStage::PreparingPipelines:
+            report += " | Preparing: DXR pipelines (background)";
+            break;
+        case LightingModeTransitionStage::CreatingPipeline:
+        case LightingModeTransitionStage::InitializingResources:
+        case LightingModeTransitionStage::ReadyToActivate:
+            report += " | Preparing: activating";
+            break;
+        default:
+            report += " | Reason: " + (status.diagnostic.empty() ?
+                std::string("the renderer reported no reason") : status.diagnostic);
+            break;
+        }
+    }
+
+    const PathTraceReferenceStatus& pathTrace = m_renderer.GetPathTraceReferenceStatus();
+
+    if(status.active == RendererLightingMode::PathTracedRasterPrimaryReSTIRDI)
+    {
+        // PS.5F: the effective denoiser, and the requested one while it prepares or after it failed.
+        const std::string failure = m_renderer.GetPathTraceDenoiserFailure();
+        const PathTraceDenoiserMode effectiveDenoiser = m_renderer.GetPathTraceDenoiserMode();
+        const PathTraceDenoiserMode requestedDenoiser = m_packagedRenderingConfiguration.denoiser;
+        report += std::string(" | Denoiser: ") + DescribeDenoiser(effectiveDenoiser);
+
+        if(effectiveDenoiser != requestedDenoiser)
+        {
+            const std::string& preparation = m_renderer.GetDenoiserPreparation();
+            const std::string reason = !failure.empty() ? "unavailable: " + failure :
+                preparation.empty() ? std::string("preparing") : preparation;
+            report += std::string(" (requested ") + DescribeDenoiser(requestedDenoiser) + "; " + reason + ")";
+        }
+        else if(!failure.empty())
+        {
+            report += " (unavailable: " + failure + ")";
+        }
+        report += std::string(" | Visibility: ") + (pathTrace.primaryDiShadowRayQueryActive ? "RayQuery" : "TraceRay") +
+            " direct, " + (pathTrace.secondaryShadowRayQueryActive ? "RayQuery" : "TraceRay") + " secondary";
+
+        // PS.5C: the saved PSR mode against the replacement chain that actually ran.
+        const PathTraceReferenceSettings& requestedPathTrace = m_packagedRenderingConfiguration.pathTrace;
+        const Renderer::PsrStatus& psr = m_renderer.GetPsrStatus();
+        const auto chainName = [](std::uint32_t chain)
+        {
+            return chain == 0 ? "Off" : chain == 1 ? "single-bounce" : "two-bounce";
+        };
+        report += std::string(" | PSR: ") + chainName(psr.activeChain);
+
+        if(requestedPathTrace.primarySurfaceReplacementInPlace &&
+            psr.activeChain != requestedPathTrace.primarySurfaceReplacementChain)
+        {
+            // The renderer renders two-bounce PSR as single-bounce below max path depth 3 without a status.
+            const std::string reason = !psr.unavailable.empty() ? psr.unavailable :
+                requestedPathTrace.primarySurfaceReplacementChain >= 2u && requestedPathTrace.maxPathDepth < 3u ?
+                "two-bounce needs max path depth 3 or more" : "";
+            report += std::string(" (requested ") + chainName(requestedPathTrace.primarySurfaceReplacementChain) +
+                (reason.empty() ? std::string(")") : "; " + reason + ")");
+        }
+
+        // PS.5F: a saved PSR debug view is presented only on frames that replace primary surfaces.
+        const ToneMapDebugView psrView = m_packagedRenderingConfiguration.psrDebugView;
+
+        if(psrView != ToneMapDebugView::None)
+        {
+            report += std::string(" | PSR view: ") + (psrView == ToneMapDebugView::PsrReplacementMask ? "replacement mask" :
+                psrView == ToneMapDebugView::PsrReflectedNormal ? "reflected normals" : "reflected albedo") +
+                (psr.activeChain == 0 ? " (not shown while PSR is off)" : "");
+        }
+
+        // PS.5D: SHARC is on only while its cache exists and the last frame rendered with cached radiance.
+        const SharcStatus& sharc = m_renderer.GetSharcStatus();
+        report += std::string(" | SHARC: ") + (sharc.active ? "on" : "off");
+
+        if(m_packagedRenderingConfiguration.sharc.enabled && !sharc.active)
+        {
+            report += " (requested; " + (sharc.preparation.empty() ? std::string("not rendering with the cache yet") :
+                sharc.preparation) + ")";
+        }
+
+        AppendPackagedDlssStatus(m_renderer, m_packagedRenderingConfiguration, report);
+    }
+    else if(status.active == RendererLightingMode::PathTracedReference)
+    {
+        report += std::string(" | Visibility: ") + (pathTrace.secondaryShadowRayQueryActive ? "RayQuery" : "TraceRay") +
+            " secondary";
+    }
+
+    // PS.5F: every mode presents through the saved tone mapper.
+    report += std::string(" | Tone map: ") +
+        (m_packagedRenderingConfiguration.toneMapOperator == ToneMapOperator::GT7 ? "GT7" : "AgX");
+
+    const double sinceStart = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - m_initializationStarted).count();
+
+    // Once: the first frame whose path-traced image holds a sample of the requested mode.
+    if(!m_packagedFirstPathTraceImageLogged && status.active == requested && requested != RendererLightingMode::Legacy &&
+        pathTrace.activeLastFrame && pathTrace.accumulatedSamples > 0)
+    {
+        m_packagedFirstPathTraceImageLogged = true;
+        Log::Info("Packaged " + std::string(DescribeLightingMode(requested)) + ": first image after " +
+            std::to_string(sinceStart) + " ms from startup.");
+    }
+
+    if(report == m_packagedLightingReport)
+    {
+        return;
+    }
+
+    m_packagedLightingReport = report;
+    const std::string timing = " (" + std::to_string(sinceStart) + " ms from startup; this frame's Render " +
+        std::to_string(renderMilliseconds) + " ms)";
+
+    if(status.active == requested && report.find("unavailable") == std::string::npos)
+    {
+        Log::Info("Packaged lighting mode: " + report + timing);
+    }
+    else
+    {
+        Log::Warning("Packaged lighting mode: " + report + timing);
+    }
+}
+
 bool Engine::InitializeInitialScene(InitialScene scene)
 {
     if(m_startup.mode == EngineStartup::Mode::PackagedRuntime)
@@ -1129,6 +1384,41 @@ bool Engine::InitializeProjectIndependent(const EngineStartup& startup)
                     EngineAssetPak::Type::Resource, PackagedBootstrap::MaterialTablesPayloadVersion,
                     MaterialTables::MaximumFileBytes);
             }
+
+            // PS.4: the cooked Project Settings. Missing (an older archive) or invalid entries render the default
+            // Legacy configuration; an entry from a newer Engine throws and fails preflight.
+            const auto rendering = PackagedRenderingSettings::Admit(
+                m_startupArchive->provider->ArchiveEntry(PackagedRenderingSettings::ID()), [&]()
+                {
+                    return m_startupArchive->provider->ReadEntry(PackagedRenderingSettings::ID(),
+                        EngineAssetPak::Type::Resource, PackagedRenderingSettings::PayloadVersion,
+                        PackagedRenderingSettings::MaximumPayloadBytes);
+                });
+
+            for(const auto& warning : rendering.warnings)
+            {
+                Log::Warning("Packaged rendering settings: " + warning);
+            }
+
+            m_packagedRequestedLightingMode = rendering.rendering.lightingMode;
+            m_packagedRenderingConfiguration = ResolveRenderingConfiguration(rendering.rendering);
+            const std::vector<std::string> deferred = RestrictToPackagedFeatures(m_packagedRenderingConfiguration);
+            Log::Info("Packaged rendering settings: " + std::string(PackagedRenderingSettings::Describe(rendering.source)) +
+                "; requested " + std::string(ToSerializedName(rendering.rendering.lightingMode)) + " lighting, " +
+                std::string(ToSerializedName(rendering.rendering.toneMapper)) + " tonemapper.");
+
+            if(!deferred.empty())
+            {
+                std::string list;
+
+                for(const std::string& feature : deferred)
+                {
+                    list += (list.empty() ? "" : ", ") + feature;
+                }
+
+                Log::Warning("Packaged games cannot run " + list + " yet; requested but off (the saved settings are "
+                    "unchanged). Path Tracing runs without them.");
+            }
         }
         catch(const std::exception& e) { Log::Error(std::string("Packaged preflight failed: ")+e.what()); return false; }
         m_windowProperties.width=startup.width; m_windowProperties.height=startup.height;
@@ -1156,12 +1446,19 @@ bool Engine::InitializeProjectIndependent(const EngineStartup& startup)
     const std::filesystem::path assetRoot = packaged ? std::filesystem::path{} : executableDirectory / "assets";
 
     m_rendererAttempted=true;
+    const auto rendererStarted = std::chrono::steady_clock::now();
     if(!m_renderer.Initialize(m_window.GetNativeHandle(), m_window.GetWidth(), m_window.GetHeight(),
         assetRoot, shaderBytes, environmentImage ? &*environmentImage : nullptr, environmentIdentity,
         startup.projectBrowserWorkflow, materialTableBytes))
     {
         Log::Error("Failed to initialize renderer.");
         return false;
+    }
+
+    if(packaged)
+    {
+        Log::Info("Packaged renderer initialized in " + std::to_string(std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - rendererStarted).count()) + " ms.");
     }
 
     // Diagnostics only: the Editor records its phases when the frame-hitch report is enabled.
@@ -1305,12 +1602,19 @@ bool Engine::InitializeProject()
         try
         {
             m_activeProject.emplace(ProjectLocator::GetDefaultProjectRoot());
+            m_activeProject->LoadProjectSettings();
         }
         catch(const std::exception& error)
         {
             Log::Error(std::string("Failed to resolve the default project root: ") + error.what());
             return false;
         }
+    }
+
+    // PS.1: settings are loaded (never written) when the context is installed; PS.2 applies them.
+    for(const auto& warning : GetActiveProject().GetProjectSettings().warnings)
+    {
+        Log::Warning("Project settings: " + warning);
     }
 
     const auto initializeLooseProject = [&]() -> bool
@@ -1961,7 +2265,24 @@ void Engine::Frame()
             throw std::runtime_error("Packaged game frame failed: " + physicsError);
         }
 
+        // PS.4: the cooked configuration through the shared application path. DLSS eligibility comes from
+        // the renderer's own state, never the Debug panel.
+        const RenderingConfiguration& configuration = m_packagedRenderingConfiguration;
+        ApplyRenderScale(configuration, m_renderer, IsDlssConfigurationEligible(configuration,
+            m_renderer.GetLightingModeTransitionStatus().active, !m_renderer.GetDenoiserPreparation().empty()), false);
+
+        // PS.5E: as in the Editor, every frame, so a DLSS scale applies once it becomes eligible and a DLSS failure
+        // returns to Native. A no-op while neither the window nor the effective scale changed.
+        if(m_window.GetWidth() > 0 && m_window.GetHeight() > 0 &&
+            !m_renderer.ResizeScene(m_window.GetWidth(), m_window.GetHeight()))
+        {
+            Log::Error("Packaged scene resize failed; requesting shutdown.");
+            m_window.Close();
+            return;
+        }
+
         RendererOptions options{};
+        ApplyRenderingConfiguration(configuration, m_renderer, options);
         std::string cameraError;
 
         // Resolved every frame from the committed scene and accepted poses; nothing is retained.
@@ -1978,12 +2299,16 @@ void Engine::Frame()
         options.frameDeltaSeconds = m_time.GetDeltaTime();
         options.exposureReset = std::exchange(m_exposureResetPending, false);
 
+        const auto renderStarted = std::chrono::steady_clock::now();
         const auto result = m_renderer.Render(demo.GetScene(), options);
+        const double renderMilliseconds = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - renderStarted).count();
         if (result == Renderer::FrameRenderResult::Error)
         {
             Log::Error("Packaged renderer frame failed; requesting shutdown.");
             m_window.Close();
         }
+        ReportPackagedLightingMode(renderMilliseconds);
         if (result == Renderer::FrameRenderResult::Rendered)
         {
             demo.GetScene().ClearChangedTransforms();
@@ -1992,6 +2317,8 @@ void Engine::Frame()
     }
 
     DebugUI& debugUI = m_renderer.GetDebugUI();
+    // PS.2C: the project's saved rendering settings are the configuration; the panel adds session overrides.
+    debugUI.SetSavedRenderingSettings(GetActiveProject().GetProjectSettings().settings.rendering);
 
     // Deliver completed work while its original scene owner is still active.
     bool displacementCompletionDelivered;
@@ -2217,12 +2544,10 @@ void Engine::Frame()
     // The release frame always uses the latest finalized layout.
     const bool resizeScene = !m_editor.IsWorkspaceSplitterDragging() || m_renderer.HasPendingDlssFallback();
 
-    // UPSCALING.2C: applied by the ResizeScene below (and so also deferred while a splitter drags).
-    // The combo entries follow Renderer::RenderScale's order (DebugUI::GetPathTraceRenderScaleIndex).
-    const int renderScaleIndex = (std::clamp)(debugUI.GetPathTraceRenderScaleIndex(), 0,
-        static_cast<int>(Renderer::RenderScale::DlssPerformance));
-    m_renderer.SetRenderScale(static_cast<Renderer::RenderScale>(renderScaleIndex),
-        debugUI.IsDlssConfigurationEligible(), debugUI.ConsumeDlssRetry(), debugUI.IsNormalDlssRequested());
+    // UPSCALING.2C: applied by the ResizeScene below (and so also deferred while a splitter drags). It
+    // uses the panel's state before this frame's settings window is drawn, as it always has.
+    ApplyRenderScale(debugUI.GetRenderingConfiguration(), m_renderer, debugUI.IsDlssConfigurationEligible(),
+        debugUI.ConsumeDlssRetry());
 
     if (sceneWidth == 0 || sceneHeight == 0 || (resizeScene && !m_renderer.ResizeScene(sceneWidth, sceneHeight)))
     {
@@ -2531,6 +2856,14 @@ void Engine::Frame()
         m_editor.OnStartupSceneChanged(changed, std::move(message));
     }
 
+    // PS.3: a Project Settings draft saved through the one save path; the next frame renders it.
+    if(const auto projectSettings = m_editor.TakeProjectSettingsSaveRequest())
+    {
+        std::string message;
+        const bool saved = SaveProjectSettings(*projectSettings, message);
+        m_editor.OnProjectSettingsSaveCompleted(saved, std::move(message));
+    }
+
     ProcessEditorSceneRequests(activeDemo);
 
     if(m_window.ShouldClose())
@@ -2665,23 +2998,11 @@ void Engine::Frame()
     // This follows asset mutations and precedes frame recording.
     m_renderer.PollMeshThumbnails(inspectorPaths, m_projectAssetRegistry);
 
-    rendererOptions.enableRTGI = debugUI.IsRTGIEnabled();
-    rendererOptions.rtgiContactAOStrength = debugUI.GetRTGIContactAOStrength();
-    rendererOptions.rtgiContactAORadius = debugUI.GetRTGIContactAORadius();
-    rendererOptions.lightingMode = debugUI.GetLightingMode();
-    rendererOptions.pathTraceReference = debugUI.GetPathTraceReferenceSettings();
-    rendererOptions.sharc = debugUI.GetSharcSettings();
-    rendererOptions.pathTraceDenoiserMode = debugUI.GetPathTraceDenoiserMode();
-    rendererOptions.pathTraceDenoiserStages = debugUI.GetPathTraceDenoiserStages();
-    rendererOptions.pathTraceCameraJitter = debugUI.IsPathTraceCameraJitterEnabled();
-    rendererOptions.dlssInputPreparation = debugUI.IsDlssInputPreparationEnabled();
-    rendererOptions.toneMapOperator = debugUI.GetToneMapOperator();
+    // PS.2B: the resolved rendering configuration (the Debug panel through the shared resolver until PS.2C),
+    // applied before the caustic snapshot boundary below.
+    ApplyRenderingConfiguration(debugUI.GetRenderingConfiguration(), m_renderer, rendererOptions);
     rendererOptions.frameDeltaSeconds = m_time.GetDeltaTime();
     rendererOptions.exposureReset = std::exchange(m_exposureResetPending, false);
-    // Before the caustic snapshot boundary below; a toggle resets only the dedicated history.
-    m_renderer.SetDedicatedCaustics(debugUI.IsDedicatedCausticsEnabled(), debugUI.IsCausticOnlyView());
-    m_renderer.SetPixelCentredCaustics(debugUI.IsPixelCentredCausticsEnabled(),
-        static_cast<PixelCausticView>(debugUI.GetPixelCausticView()), debugUI.IsPixelCausticInsertionEnabled());
 
     if (debugUI.ConsumeCausticFaultAcknowledgeRequest() && !m_renderer.AcknowledgeDedicatedCausticsFault())
     {
@@ -2808,6 +3129,15 @@ void Engine::Frame()
 
 void Engine::Shutdown()
 {
+    // PS.5B.2: a packaged game leaves the screen as soon as shutdown begins. No frame presents after this, and the
+    // teardown below may wait for an in-flight DXR pipeline creation (it cannot be cancelled), during which the window
+    // is no longer pumped; hidden, it is not shown as Not Responding. It is destroyed last, as before.
+    if(m_startup.mode == EngineStartup::Mode::PackagedRuntime && m_windowInitialized)
+    {
+        m_window.Hide();
+        Log::Info("Packaged shutdown: window hidden.");
+    }
+
     // Gameplay ends before any scene teardown, so every started script receives OnStop.
     if(m_gameRuntime.IsRunning())
     {
@@ -5513,6 +5843,19 @@ bool Engine::StartBuildGame(BuildGame::Settings settings, std::string& error, bo
         return false;
     }
 
+    // PS.4: the last successfully saved Project Settings; a draft is never saved or packaged here.
+    ProjectSettings projectSettings;
+
+    if(!PackagedRenderingSettings::SelectBuildSource(GetActiveProject().GetProjectSettings(), projectSettings, error))
+    {
+        return false;
+    }
+
+    if(m_editor.HasUnsavedProjectSettings())
+    {
+        Log::Info("Build Game packages the saved Project Settings; unsaved Project Settings changes are not included.");
+    }
+
     const bool sceneOperationPending = m_demoSceneManager.HasPendingSceneChange() || m_pendingMaterialAssignment ||
         m_pendingSceneObjectCreation || m_pendingSceneObjectDeletion || m_pendingSceneObjectRestoration ||
         m_pendingEditorSceneOperation || m_editor.HasBlockingMaterialOperation() ||
@@ -5590,7 +5933,10 @@ bool Engine::StartBuildGame(BuildGame::Settings settings, std::string& error, bo
 
     BuildGame::Request request{std::move(settings), std::move(document), m_projectAssetRegistry,
         GetActiveProject().GetRoot(), WindowsWindow::GetExecutableDirectory() / "assets" / "Shaders",
-        EditorDistributionPaths::RuntimeDirectory()};
+        EditorDistributionPaths::RuntimeDirectory(), std::move(projectSettings)};
+    Log::Info("Build Game rendering settings: " +
+        std::string(ToSerializedName(request.projectSettings.rendering.lightingMode)) + " lighting, " +
+        std::string(ToSerializedName(request.projectSettings.rendering.toneMapper)) + " tonemapper (saved Project Settings).");
     return m_buildGame.Start(std::move(request), error);
 }
 

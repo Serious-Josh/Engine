@@ -54,3 +54,36 @@ std::filesystem::path ProjectContext::ResolveCanonicalRoot(std::error_code& erro
 {
     return std::filesystem::canonical(m_paths.GetRoot(), error);
 }
+
+const LoadedProjectSettings& ProjectContext::GetProjectSettings() const noexcept
+{
+    return m_projectSettings;
+}
+
+void ProjectContext::LoadProjectSettings()
+{
+    m_projectSettings = ProjectSettingsFile::Load(m_paths.GetProjectSettingsPath());
+}
+
+bool ProjectContext::SaveProjectSettings(const ProjectLock& lock, const ProjectSettings& settings,
+    std::string& errorMessage)
+{
+    errorMessage.clear();
+
+    if(!m_manifest || !lock.IsLockFor(GetManifestPath()))
+    {
+        errorMessage = "Project settings can be saved only in a project opened from its locked .engineproj manifest.";
+        return false;
+    }
+
+    // Save updates the copy only after the file was replaced, so a failure leaves memory and disk agreeing.
+    LoadedProjectSettings candidate = m_projectSettings;
+
+    if(!ProjectSettingsFile::Save(m_paths.GetProjectSettingsPath(), candidate, settings, errorMessage))
+    {
+        return false;
+    }
+
+    m_projectSettings = std::move(candidate);
+    return true;
+}

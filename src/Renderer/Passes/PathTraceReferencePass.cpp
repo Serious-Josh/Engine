@@ -432,6 +432,13 @@ namespace
         return description;
     }
 
+    // Whether the library is itself a RayQuery twin (they live under DI1/ and GI6/).
+    bool RayQueryTwinOf(const std::filesystem::path& path)
+    {
+        const std::filesystem::path first = *path.begin();
+        return first == "DI1" || first == "GI6";
+    }
+
     // The RayQuery twin InitializeVisibilityPipelines pairs with a pipeline's library, if any. DI.1 pairs only the
     // ReSTIR DI direct libraries; GI.6 pairs the reference libraries except training.
     std::optional<std::filesystem::path> RayQueryTwinLibraryPath(const std::filesystem::path& path)
@@ -658,12 +665,84 @@ ShaderLibraryPreparation PathTraceReferencePass::PrepareLibrary(
     return PrepareLibrary(shaderLibrary, worker, PathTraceLibraryPath(primary, m_libraryVariant));
 }
 
+ShaderLibraryPreparation PathTraceReferencePass::PreparePackagedLibrary(
+    ShaderLibrary& shaderLibrary,
+    const std::filesystem::path& path,
+    bool optional)
+{
+    const std::string libraryName = path.generic_string();
+    ShaderLibraryPreparation preparation{};
+
+    for(const CompiledLibrary& compiled : m_libraries)
+    {
+        if(compiled.path == path && !compiled.library.bytecode.empty())
+        {
+            preparation.state = ShaderLibraryPreparationState::Ready;
+            return preparation;
+        }
+    }
+
+    // Cooked bytes never change, so a failure is final for the session; it is reported once.
+    const auto failed = m_packagedLibraryFailures.find(path);
+
+    if(failed != m_packagedLibraryFailures.end())
+    {
+        preparation.state = ShaderLibraryPreparationState::Failed;
+        preparation.diagnostic = failed->second;
+        return preparation;
+    }
+
+    ShaderLibraryCompileResult library;
+    std::string problem;
+
+    if(!shaderLibrary.AcquirePackagedLibrary(path, library, problem))
+    {
+        preparation.state = ShaderLibraryPreparationState::Failed;
+        preparation.diagnostic = "The " + libraryName + " DXR library " + problem + ".";
+        m_packagedLibraryFailures.emplace(path, preparation.diagnostic);
+        const bool missingTwin = optional && !shaderLibrary.HasPackagedLibrary(path);
+
+        if(missingTwin)
+        {
+            ReportMissingPackagedTwin(path);
+        }
+        else
+        {
+            Log::Error(preparation.diagnostic);
+        }
+
+        return preparation;
+    }
+
+    m_libraries.push_back(CompiledLibrary{path, std::move(library)});
+    m_libraries.back().revision = ++m_libraryRevisionCounter;
+    preparation.state = ShaderLibraryPreparationState::Ready;
+    return preparation;
+}
+
+void PathTraceReferencePass::ReportMissingPackagedTwin(const std::filesystem::path& path)
+{
+    // One report per twin, however many pipelines pair with it.
+    if(m_reportedMissingTwins.insert(path.generic_string()).second)
+    {
+        const bool primaryDi = path.filename().string().starts_with("PathTraceReSTIRDI");
+        Log::Warning(std::string(primaryDi ? "DI.1" : "GI.6") + " RayQuery variant is not in this game's shaders; the "
+            "original TraceRay pipeline is used: " + path.generic_string());
+    }
+}
+
 ShaderLibraryPreparation PathTraceReferencePass::PrepareLibrary(
     ShaderLibrary& shaderLibrary,
     ShaderLibraryCompileWorker& worker,
     const std::filesystem::path& path)
 {
     TransitionTiming::Scope er1Scope("PrepareLibrary", 0.5);
+
+    // PS.5B.1: packaged games have no compiler; their cooked DXIL is the library, admitted without the worker.
+    if(shaderLibrary.IsPackaged())
+    {
+        return PreparePackagedLibrary(shaderLibrary, path, RayQueryTwinOf(path));
+    }
     const std::string libraryName = path.generic_string();
     ShaderLibraryPreparation preparation{};
 
@@ -893,6 +972,47 @@ std::vector<PathTraceLibraryRequirement> PathTraceReferencePass::GetRequiredLibr
     {
         add(RadianceCacheLibraryPath(m_libraryVariant, PathTraceRadianceCacheLibrary::Training));
         add(RadianceCacheLibraryPath(m_libraryVariant, needs.radianceCacheRender));
+    }
+
+    return libraries;
+}
+
+std::vector<PathTraceLibraryRequirement> PathTraceReferencePass::GetPackagedLibraries()
+{
+    // A pass that has created nothing selects SM66, the only variant packaged games use.
+    const auto pass = std::make_unique<PathTraceReferencePass>();
+    std::vector<PathTraceLibraryRequirement> libraries;
+
+    // PS.5C: the ordinary path with every denoiser's extraction, and each PSR chain (single, two-bounce) with and
+    // without extraction and the raw diffuse hit distance, as PSR prepares exactly the set its frame needs.
+    // PS.5D: each of those with SHARC, whose ReSTIR DI render library follows the signal (Renderer::SharcRenderLibrary);
+    // the experimental D6 cache's query and deferred libraries are never used by packaged games.
+    constexpr PathTraceRadianceCacheLibrary sharcRender[] = {PathTraceRadianceCacheLibrary::RenderSplitIndirect,
+        PathTraceRadianceCacheLibrary::RenderSplitIndirectExtraction,
+        PathTraceRadianceCacheLibrary::RenderSplitIndirectExtractionRawDiffuseHitDistance};
+
+    for(const std::uint32_t psrChain : {0u, 1u, 2u})
+    for(const bool sharc : {false, true})
+    {
+        for(const int signal : {0, 1, 2})
+        {
+            PathTraceLibraryNeeds needs{};
+            needs.primary = PathTracePrimary::RasterReSTIRDI;
+            needs.psrChain = psrChain;
+            needs.extraction = signal >= 1;
+            needs.rawDiffuseHitDistance = signal == 2;
+            needs.radianceCache = sharc;
+            needs.radianceCacheRender = sharcRender[signal];
+
+            for(PathTraceLibraryRequirement& library : pass->GetRequiredLibraries(needs))
+            {
+                if(std::none_of(libraries.begin(), libraries.end(),
+                    [&](const PathTraceLibraryRequirement& listed) { return listed.path == library.path; }))
+                {
+                    libraries.push_back(std::move(library));
+                }
+            }
+        }
     }
 
     return libraries;
@@ -3143,6 +3263,8 @@ void PathTraceReferencePass::Shutdown()
     ReleaseResources();
     m_libraries.clear();
     m_failedLibraries.clear();
+    m_packagedLibraryFailures.clear();
+    m_reportedMissingTwins.clear();
     // ER.1 Phase 4: never used by the GPU; the Renderer joined the pipeline worker before this.
     m_preparedPipelines.clear();
     for(auto& [identity, pipeline] : m_retainedPsrPipelines) pipeline->Shutdown();
@@ -3438,17 +3560,43 @@ bool PathTraceReferencePass::InitializeVisibilityPipelines(
         alternate->Shutdown();
     }
 
-    alternate = std::make_unique<RayTracingPipeline>();
     RayTracingPipelineDescription queryDescription = description;
     queryDescription.shaderPath = *twinPath;
+
+    // PS.5B: a game cooked before its twins existed keeps the TraceRay pipeline it already built. That is the expected
+    // fallback, so it is reported once per twin; a cooked twin that fails is a genuine error.
+    if(shaders.IsPackaged() && !shaders.HasPackagedLibrary(queryDescription.shaderPath))
+    {
+        alternate.reset();
+        ReportMissingPackagedTwin(queryDescription.shaderPath);
+        return true;
+    }
+
+    // A cooked twin that PreparePackagedLibrary already rejected (and reported) is not admitted again.
+    if(m_packagedLibraryFailures.contains(queryDescription.shaderPath))
+    {
+        alternate.reset();
+        return true;
+    }
+
+    alternate = std::make_unique<RayTracingPipeline>();
     const ShaderLibraryCompileResult* library = AcquireLibrary(shaders, queryDescription.shaderPath);
 
     if(!library || !CreatePipeline(device, *alternate, library->bytecode, queryDescription))
     {
         alternate->Shutdown();
         alternate.reset();
-        Log::Warning(std::string(primaryDi ? "DI.1" : "GI.6") +
-            " RayQuery unavailable; original TraceRay retained: " + queryDescription.shaderPath.string());
+        const std::string message = std::string(primaryDi ? "DI.1" : "GI.6") +
+            " RayQuery unavailable; original TraceRay retained: " + queryDescription.shaderPath.string();
+
+        if(shaders.IsPackaged())
+        {
+            Log::Error(message);
+        }
+        else
+        {
+            Log::Warning(message);
+        }
     }
 
     return true;

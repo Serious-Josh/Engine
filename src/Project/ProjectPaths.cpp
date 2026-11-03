@@ -40,6 +40,11 @@ std::filesystem::path ProjectPaths::GetAssetRegistryPath() const
     return m_root / "Assets.registry.json";
 }
 
+std::filesystem::path ProjectPaths::GetProjectSettingsPath() const
+{
+    return m_root / "ProjectSettings.json";
+}
+
 std::filesystem::path ProjectPaths::GetScriptsDirectory() const
 {
     return m_root / "Content" / "Scripts";

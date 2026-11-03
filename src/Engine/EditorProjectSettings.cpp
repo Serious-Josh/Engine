@@ -33,7 +33,7 @@ bool Engine::ResolveBuildStartupScene(BuildStartupScene& startup, std::string& e
         if(!ResolveEditorSceneLocation(GetActiveProject().GetRoot() / configured, true, startup.path, reason))
         {
             error = "The configured game startup scene " + PathText(configured) + " cannot be used: " + reason +
-                " Choose another scene or clear the setting in File > Project Settings.";
+                " Choose another scene or clear the setting in Edit > Project Settings.";
             return false;
         }
 
@@ -44,7 +44,7 @@ bool Engine::ResolveBuildStartupScene(BuildStartupScene& startup, std::string& e
         if(!activeSceneSaved)
         {
             error = "No game startup scene is configured and the active scene has not been saved. Save the scene, "
-                "or choose a startup scene in File > Project Settings.";
+                "or choose a startup scene in Edit > Project Settings.";
             return false;
         }
 
@@ -69,6 +69,42 @@ bool Engine::ResolveBuildStartupScene(BuildStartupScene& startup, std::string& e
         }
     }
 
+    return true;
+}
+
+bool Engine::SaveProjectSettings(const ProjectSettings& settings, std::string& message)
+{
+    message.clear();
+
+    if(m_startup.mode != EngineStartup::Mode::Editor || !m_activeProject)
+    {
+        message = "Project settings are available only in the Editor with an open project.";
+        return false;
+    }
+
+    if(m_projectOwnershipLost)
+    {
+        message = "Project ownership could not be verified; shared settings cannot be saved.";
+        return false;
+    }
+
+    // PS.3: Game Play and Physics Simulation own the scene and its rendering until they stop.
+    if(PhysicsBlocksSceneEdits() || m_gameRuntime.IsActive())
+    {
+        message = "Stop Game Play or Physics Simulation before saving project settings.";
+        return false;
+    }
+
+    // PS.2C: a successful save decides the overrides that conflict with it; a failed one changes nothing.
+    const RenderingSettings previousRendering = m_activeProject->GetProjectSettings().settings.rendering;
+
+    if(!m_activeProject->SaveProjectSettings(m_projectLock, settings, message))
+    {
+        return false;
+    }
+
+    m_renderer.GetDebugUI().OnProjectSettingsSaved(previousRendering,
+        m_activeProject->GetProjectSettings().settings.rendering);
     return true;
 }
 

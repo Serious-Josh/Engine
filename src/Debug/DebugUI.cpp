@@ -1,6 +1,7 @@
 #include "DebugUI.h"
 #include "LightingModeTransitionPresentation.h"
 
+#include "Engine/RenderingConfigurationResolver.h"
 #include "Renderer/DescriptorHeap.h"
 #include "Platform/Windows/WindowsWindow.h"
 
@@ -548,7 +549,7 @@ DebugUI::GpuTimingConfiguration DebugUI::CurrentGpuTimingConfiguration() const
 {
     GpuTimingConfiguration configuration;
     configuration.epoch = m_visibilityTimingEpoch;
-    configuration.lightingMode = m_lightingMode;
+    configuration.lightingMode = static_cast<int>(GetEffectiveRenderingSettings().lightingMode);
     configuration.activeLightingMode = m_lightingTransition.active;
     configuration.renderScale = GetPathTraceRenderScaleIndex();
     configuration.renderWidth = m_gpuTimingRenderWidth;
@@ -557,7 +558,7 @@ DebugUI::GpuTimingConfiguration DebugUI::CurrentGpuTimingConfiguration() const
     configuration.outputHeight = m_gpuTimingOutputHeight;
     configuration.dlssActive = m_gpuTimingDlssActive;
     configuration.dlssInputPreparation = m_dlssInputPreparation;
-    configuration.cameraJitter = m_pathTraceCameraJitter;
+    configuration.cameraJitter = GetRenderingConfiguration().cameraJitter;
     configuration.settings = GetPathTraceReferenceSettings();
     configuration.pathTraceActive = m_pathTraceActiveLastFrame;
     configuration.secondaryShadowActive = m_secondaryShadowActive;
@@ -605,7 +606,8 @@ void DebugUI::DrawPerformanceWindow(
         m_pathTraceDenoiserStages.spatialFilter != m_visibilityTimingStages.spatialFilter ||
         m_pathTraceDenoiserStages.historyResetRequest != m_visibilityTimingStages.historyResetRequest ||
         m_pathTraceDenoiserStages.extendedDiffuseHistory != m_visibilityTimingStages.extendedDiffuseHistory ||
-        m_pathTraceRenderScale != m_visibilityTimingScale || m_lightingMode != m_visibilityTimingLighting ||
+        m_pathTraceRenderScale != m_visibilityTimingScale ||
+        static_cast<int>(GetEffectiveRenderingSettings().lightingMode) != m_visibilityTimingLighting ||
         !m_pathTraceActiveLastFrame)
     {
         m_visibilityTimings.Clear();
@@ -613,9 +615,9 @@ void DebugUI::DrawPerformanceWindow(
         m_visibilityTimingSettings = visibilitySettings;
         m_visibilityTimingSharc = GetSharcSettings();
         m_visibilityTimingDenoiser = GetPathTraceDenoiserMode();
-        m_visibilityTimingStages = GetPathTraceDenoiserStages();
+        m_visibilityTimingStages = m_pathTraceDenoiserStages;
         m_visibilityTimingScale = m_pathTraceRenderScale;
-        m_visibilityTimingLighting = m_lightingMode;
+        m_visibilityTimingLighting = static_cast<int>(GetEffectiveRenderingSettings().lightingMode);
         // Completed timestamps lag recording. Discard buffered/reset frames and 60 warm-up frames.
         m_visibilityWarmupUntil = gpu.frameSerial + 62;
     }
@@ -893,11 +895,20 @@ void DebugUI::DrawPerformanceWindow(
             };
             const char* denoisers[] = {"NRD", "Native"};
 
-            ImGui::Combo("Reflection denoiser", &m_reflectionDenoiserMode, denoisers, IM_ARRAYSIZE(denoisers));
-            ImGui::Checkbox("NRD contribution limiter", &m_contributionLimiterEnabled);
-            ImGui::Checkbox("Enable RTGI", &m_rtgiEnabled);
-            ImGui::SliderFloat("RTGI Contact AO Strength", &m_rtgiContactAOStrength, 0.0f, 1.0f, "%.2f");
-            ImGui::SliderFloat("RTGI Contact AO Radius", &m_rtgiContactAORadius, 0.05f, 5.0f, "%.2f");
+            const RenderingSettings effective = GetEffectiveRenderingSettings();
+            RenderingOverrides& overrides = m_renderingOverrides;
+
+            OverrideCombo("Reflection denoiser", effective.legacy.reflectionDenoiser, denoisers,
+                IM_ARRAYSIZE(denoisers), overrides.reflectionDenoiser, RenderingOverrideField::reflectionDenoiser);
+            OverrideCheckbox("NRD contribution limiter", effective.legacy.contributionLimiter,
+                overrides.contributionLimiter, RenderingOverrideField::contributionLimiter);
+            OverrideCheckbox("Enable RTGI", effective.legacy.rtgi, overrides.rtgi, RenderingOverrideField::rtgi);
+            OverrideSliderFloat("RTGI Contact AO Strength", effective.legacy.rtgiContactAOStrength,
+                LegacyRenderingSettings::MinimumContactAOStrength, LegacyRenderingSettings::MaximumContactAOStrength,
+                "%.2f", 0, overrides.rtgiContactAOStrength, RenderingOverrideField::rtgiContactAOStrength);
+            OverrideSliderFloat("RTGI Contact AO Radius", effective.legacy.rtgiContactAORadius,
+                LegacyRenderingSettings::MinimumContactAORadius, LegacyRenderingSettings::MaximumContactAORadius,
+                "%.2f", 0, overrides.rtgiContactAORadius, RenderingOverrideField::rtgiContactAORadius);
             ImGui::Combo("Diagnostic view", &m_toneMapDebugView, views, IM_ARRAYSIZE(views));
 
             // RTXPT D.3B.0: path-trace denoiser views. They need the diagnostic extraction and temporal passes
@@ -906,18 +917,23 @@ void DebugUI::DrawPerformanceWindow(
                 const char* denoiserViews[] = {"Normal", "Temporal (demodulated)", "Spatial (demodulated)",
                     "Spatial - temporal difference", "Estimated uncertainty", "History length", "Raw extraction"};
                 const char* signals[] = {"Diffuse lighting", "Specular"};
-                int denoiserView = static_cast<int>(m_pathTraceDenoiserVisualization.view);
-                int signal = static_cast<int>(m_pathTraceDenoiserVisualization.signal);
-                ImGui::Combo("PT denoiser view", &denoiserView, denoiserViews, IM_ARRAYSIZE(denoiserViews));
-                ImGui::Combo("PT denoiser signal", &signal, signals, IM_ARRAYSIZE(signals));
-                ImGui::SliderFloat("PT view exposure (stops)", &m_pathTraceDenoiserVisualization.exposureStops, -8.0f, 16.0f,
-                    "%.1f");
-                ImGui::SliderFloat("PT difference amplification", &m_pathTraceDenoiserVisualization.differenceAmplification,
-                    1.0f, 1024.0f, "%.0f", ImGuiSliderFlags_Logarithmic);
-                ImGui::SliderFloat("PT uncertainty floor (log10)", &m_pathTraceDenoiserVisualization.uncertaintyFloorLog10,
-                    -6.0f, -1.0f, "%.1f");
-                m_pathTraceDenoiserVisualization.view = static_cast<PathTraceDenoiserView>(denoiserView);
-                m_pathTraceDenoiserVisualization.signal = static_cast<std::uint32_t>(signal);
+                using Limits = PathTracingRenderingSettings;
+                const PathTracingRenderingSettings& pathTracing = effective.pathTracing;
+                const int denoiserView = static_cast<int>(OverrideCombo("PT denoiser view", pathTracing.denoiserView,
+                    denoiserViews, IM_ARRAYSIZE(denoiserViews), overrides.denoiserView,
+                    RenderingOverrideField::denoiserView));
+                OverrideCombo("PT denoiser signal", pathTracing.denoiserSignal, signals, IM_ARRAYSIZE(signals),
+                    overrides.denoiserSignal, RenderingOverrideField::denoiserSignal);
+                OverrideSliderFloat("PT view exposure (stops)", pathTracing.viewExposureStops,
+                    Limits::MinimumViewExposureStops, Limits::MaximumViewExposureStops, "%.1f", 0,
+                    overrides.viewExposureStops, RenderingOverrideField::viewExposureStops);
+                OverrideSliderFloat("PT difference amplification", pathTracing.differenceAmplification,
+                    Limits::MinimumDifferenceAmplification, Limits::MaximumDifferenceAmplification, "%.0f",
+                    ImGuiSliderFlags_Logarithmic, overrides.differenceAmplification,
+                    RenderingOverrideField::differenceAmplification);
+                OverrideSliderFloat("PT uncertainty floor (log10)", pathTracing.uncertaintyFloorLog10,
+                    Limits::MinimumUncertaintyFloorLog10, Limits::MaximumUncertaintyFloorLog10, "%.1f", 0,
+                    overrides.uncertaintyFloorLog10, RenderingOverrideField::uncertaintyFloorLog10);
 
                 if(denoiserView == 3)
                 {
@@ -1110,44 +1126,136 @@ void DebugUI::SetTLASUpdated(bool updated)
     }
 }
 
-PathTraceReferenceSettings DebugUI::GetPathTraceReferenceSettings() const
-{
-    PathTraceReferenceSettings settings;
-    settings.samplesPerFrame = static_cast<std::uint32_t>(m_pathTraceSamplesPerFrame);
-    settings.maxPathDepth = static_cast<std::uint32_t>(m_pathTraceMaxPathDepth);
-    settings.russianRouletteDepth = static_cast<std::uint32_t>(m_pathTraceRussianRouletteDepth);
-    settings.maxAccumulatedSamples = static_cast<std::uint32_t>(m_pathTraceMaxAccumulatedSamples);
-    settings.primarySurfaceReplacementInPlace = m_primarySurfaceReplacementInPlace;
-    settings.primarySurfaceReplacementChain = m_primarySurfaceReplacementChain;
-    return settings;
-}
-
 namespace
 {
     constexpr std::uint32_t SharcTrainingTiles[] = {5, 8};
     constexpr std::uint32_t SharcMinimumSamples[] = {8, 16, 32, 64, 256};
 }
 
-SharcSettings DebugUI::GetSharcSettings() const
+RenderingSettings DebugUI::GetEffectiveRenderingSettings() const
 {
-    SharcSettings settings;
-    settings.enabled = m_sharcEnabled;
-    settings.trainingTile = SharcTrainingTiles[m_sharcDensity];
-    settings.minimumSamples = SharcMinimumSamples[m_sharcMinimumSamples];
-    settings.freezeTraining = m_sharcFreezeTraining;
-    settings.statistics = m_sharcStatistics;
-    settings.resetRequest = m_sharcResetRequest;
-    settings.adaptiveResolution = m_sharcSpatialResolution == 1;
-    settings.historyPrior = m_sharcHistoryPrior && GetSelectedPathTraceDenoiserMode() == PathTraceDenoiserMode::Engine;
-    return settings;
+    return ApplyRenderingOverrides(m_savedRendering, m_renderingOverrides);
+}
+
+void DebugUI::OnProjectSettingsSaved(const RenderingSettings& previousSaved, const RenderingSettings& saved)
+{
+    ClearConflictingOverrides(m_renderingOverrides, previousSaved, saved);
+    m_savedRendering = saved;
+}
+
+RenderingDiagnostics DebugUI::GetRenderingDiagnostics() const
+{
+    RenderingDiagnostics diagnostics;
+    diagnostics.diagnosticRenderScale = m_pathTraceRenderScale;
+    diagnostics.dlssInputPreparation = m_dlssInputPreparation;
+    diagnostics.denoiserStages = m_pathTraceDenoiserStages;
+
+    SharcSettings& sharc = diagnostics.sharcTuning;
+    sharc.trainingTile = SharcTrainingTiles[m_sharcDensity];
+    sharc.minimumSamples = SharcMinimumSamples[m_sharcMinimumSamples];
+    sharc.freezeTraining = m_sharcFreezeTraining;
+    sharc.statistics = m_sharcStatistics;
+    sharc.resetRequest = m_sharcResetRequest;
+    sharc.adaptiveResolution = m_sharcSpatialResolution == 1;
+    sharc.historyPrior = m_sharcHistoryPrior;
+
+    diagnostics.pixelCausticView = m_pixelCausticView;
+    diagnostics.pixelCausticInsertion = m_pixelCausticInsertion;
+    ApplyReferenceOverrides(m_renderingOverrides, diagnostics);
+
+    return diagnostics;
+}
+
+RenderingConfiguration DebugUI::GetRenderingConfiguration() const
+{
+    return ResolveRenderingConfiguration(GetEffectiveRenderingSettings(), GetRenderingDiagnostics());
+}
+
+void DebugUI::DrawOverrideMarker(RenderingOverrideField field)
+{
+    if(!IsOverridden(m_renderingOverrides, field))
+    {
+        return;
+    }
+
+    ImGui::SameLine();
+    ImGui::PushID(static_cast<int>(field));
+
+    if(ImGui::SmallButton("Overridden  x"))
+    {
+        ClearOverride(m_renderingOverrides, field);
+    }
+
+    if(ImGui::IsItemHovered())
+    {
+        ImGui::SetTooltip("Session override; not saved. Click to use the project setting.");
+    }
+
+    ImGui::PopID();
+}
+
+bool DebugUI::OverrideCheckbox(const char* label, bool value, std::optional<bool>& slot, RenderingOverrideField field)
+{
+    if(ImGui::Checkbox(label, &value))
+    {
+        slot = value;
+    }
+
+    DrawOverrideMarker(field);
+    return value;
+}
+
+float DebugUI::OverrideSliderFloat(const char* label, float value, float minimum, float maximum, const char* format,
+    int flags, std::optional<float>& slot, RenderingOverrideField field)
+{
+    if(ImGui::SliderFloat(label, &value, minimum, maximum, format, flags))
+    {
+        slot = value;
+    }
+
+    DrawOverrideMarker(field);
+    return value;
+}
+
+std::uint32_t DebugUI::OverrideSliderUInt(const char* label, std::uint32_t value, int minimum, int maximum, int flags,
+    std::optional<std::uint32_t>& slot, RenderingOverrideField field)
+{
+    int edited = static_cast<int>(value);
+
+    if(ImGui::SliderInt(label, &edited, minimum, maximum, "%d", flags))
+    {
+        value = static_cast<std::uint32_t>((std::max)(edited, minimum));
+        slot = value;
+    }
+
+    DrawOverrideMarker(field);
+    return value;
+}
+
+// The combo index is the enum value: every project enum lists its choices in display order.
+template<typename Enum>
+Enum DebugUI::OverrideCombo(const char* label, Enum value, const char* const* items, int count,
+    std::optional<Enum>& slot, RenderingOverrideField field)
+{
+    int selection = static_cast<int>(value);
+
+    if(ImGui::Combo(label, &selection, items, count))
+    {
+        value = static_cast<Enum>(selection);
+        slot = value;
+    }
+
+    DrawOverrideMarker(field);
+    return value;
 }
 
 void DebugUI::DrawSharcSettings()
 {
-    ImGui::TextUnformatted("SHARC radiance cache (experimental, not saved)");
-    ImGui::Checkbox("Enable SHARC", &m_sharcEnabled);
+    ImGui::TextUnformatted("SHARC radiance cache (experimental; tuning is not saved)");
+    const bool sharcEnabled = OverrideCheckbox("Enable SHARC", GetEffectiveRenderingSettings().pathTracing.sharc,
+        m_renderingOverrides.sharc, RenderingOverrideField::sharc);
 
-    if (!m_sharcEnabled)
+    if (!sharcEnabled)
     {
         return;
     }
@@ -1303,26 +1411,42 @@ void DebugUI::DrawLightingModeTransitionIndicator(
 
 void DebugUI::DrawPathTraceReferenceSettings()
 {
-    ImGui::TextUnformatted("Lighting mode (experimental, not saved)");
+    RenderingOverrides& overrides = m_renderingOverrides;
+    const RenderingSettings effective = GetEffectiveRenderingSettings();
+    const RenderingConfiguration resolved = GetRenderingConfiguration();
+    const PathTracingRenderingSettings& pathTracing = effective.pathTracing;
 
-    // m_lightingMode keeps the RendererLightingMode values (GetLightingMode): 0, 1, and 3 for Path Tracing (the
-    // raster-primary ReSTIR DI mode). Standalone Raster Primary (2) is verification-only and never selected here.
+    // PS.2C: the project's saved rendering settings; edits here are session overrides and are never saved.
+    ImGui::TextUnformatted("Rendering (project settings; edits are session overrides)");
+    const std::size_t overrideCount = CountOverrides(overrides);
+
+    if(overrideCount == 0)
+    {
+        ImGui::TextDisabled("Showing the project settings; no session overrides.");
+    }
+    else
+    {
+        ImGui::Text("%zu session override%s active.", overrideCount, overrideCount == 1 ? "" : "s");
+        ImGui::SameLine();
+
+        if(ImGui::SmallButton("Restore project settings"))
+        {
+            ClearRenderingOverrides();
+        }
+    }
+
     const char* modes[] = {"Legacy", "Reference Path Tracer", "Path Tracing"};
-    int modeSelection = m_lightingMode == 3 ? 2 : m_lightingMode;
     // While the Renderer prepares the requested mode, the selector shows it and accepts no other request.
     const bool preparing = IsLightingModePreparing(m_lightingTransition.stage);
     ImGui::BeginDisabled(preparing);
-
-    if(ImGui::Combo("Lighting mode", &modeSelection, modes, IM_ARRAYSIZE(modes)))
-    {
-        m_lightingMode = modeSelection == 2 ? 3 : modeSelection;
-    }
-
+    const ProjectLightingMode lightingMode = OverrideCombo("Lighting mode", effective.lightingMode, modes,
+        IM_ARRAYSIZE(modes), overrides.lightingMode, RenderingOverrideField::lightingMode);
     ImGui::EndDisabled();
 
     // Final display mapping only, in every lighting mode; switching keeps the HDR image and accumulation.
-    const char* toneMappers[] = {"Existing", "GT7"};
-    ImGui::Combo("Tone mapper", &m_toneMapOperator, toneMappers, IM_ARRAYSIZE(toneMappers));
+    const char* toneMappers[] = {"AgX", "GT7"};
+    OverrideCombo("Tone mapper", effective.toneMapper, toneMappers, IM_ARRAYSIZE(toneMappers), overrides.toneMapper,
+        RenderingOverrideField::toneMapper);
 
     const bool transitionFailed = m_lightingTransition.stage == LightingModeTransitionStage::Failed &&
         m_lightingTransition.requested == GetLightingMode();
@@ -1340,11 +1464,14 @@ void DebugUI::DrawPathTraceReferenceSettings()
             SummarizeLightingModeDiagnostic(m_lightingTransition.diagnostic, 3).c_str());
     }
 
-    if (m_lightingMode == 0)
+    if(lightingMode == ProjectLightingMode::Legacy)
     {
         ImGui::Separator();
         return;
     }
+
+    const bool isPathTracing = lightingMode == ProjectLightingMode::PathTracing;
+    const bool reference = lightingMode == ProjectLightingMode::ReferencePathTracer;
 
     const char* visibilityModes[] = {"TraceRay (Original)", "RayQuery (GI.6)"};
     const char* primaryDiVisibilityModes[] = {"TraceRay (Original)", "RayQuery (DI.1)"};
@@ -1352,15 +1479,15 @@ void DebugUI::DrawPathTraceReferenceSettings()
         m_lightingTransition.active == RendererLightingMode::PathTracedRasterPrimaryReSTIRDI ?
         primaryDiVisibilityModes[m_primaryDiShadowActive ? 1 : 0] : "Not in use");
 
-    if(m_lightingMode == 3 && m_primaryDiShadowSerWorkaround)
+    if(isPathTracing && m_primaryDiShadowSerWorkaround)
     {
         ImGui::TextDisabled("SER compatibility: DI.1 RayQuery visibility is wrong with SM 6.9 + SER; TraceRay used.");
     }
-    else if(m_lightingMode == 3 && m_primaryDiShadowFailed)
+    else if(isPathTracing && m_primaryDiShadowFailed)
     {
         ImGui::TextDisabled("DI.1 pipelines failed (see the DI.1 log warning); original retained.");
     }
-    else if(m_lightingMode == 3 && !m_primaryDiShadowReady)
+    else if(isPathTracing && !m_primaryDiShadowReady)
     {
         ImGui::TextDisabled("DI.1 pipelines still preparing; original retained.");
     }
@@ -1372,38 +1499,48 @@ void DebugUI::DrawPathTraceReferenceSettings()
         ImGui::TextDisabled("GI.6 unavailable or pipelines still preparing; original retained.");
     }
 
-    // Both path-traced modes share these settings; ranges match IsValidPathTraceReferenceSettings and every
-    // change restarts accumulation.
-    ImGui::SliderInt("PT samples per frame", &m_pathTraceSamplesPerFrame, 1,
-                     static_cast<int>(PathTraceReferenceSettings::MaximumSamplesPerFrame));
-    ImGui::SliderInt("PT max path depth", &m_pathTraceMaxPathDepth, 1,
-                     static_cast<int>(PathTraceReferenceSettings::MaximumPathDepth));
-    ImGui::SliderInt("PT roulette from depth", &m_pathTraceRussianRouletteDepth, 1,
-                     static_cast<int>(PathTraceReferenceSettings::MaximumPathDepth) + 1);
-    ImGui::SliderInt("PT sample target", &m_pathTraceMaxAccumulatedSamples, 1, 1 << 16, "%d",
-                     ImGuiSliderFlags_Logarithmic);
+    // The mode's own quality: Path Tracing's settings, or Reference's fixed quality with Debug-only Reference
+    // overrides. Ranges match IsValidPathTraceReferenceSettings; every change restarts accumulation.
+    using Limits = PathTracingRenderingSettings;
+    const PathTraceReferenceSettings& quality = resolved.pathTrace;
 
-    if (m_pathTraceMaxAccumulatedSamples < m_pathTraceSamplesPerFrame)
+    if(reference)
     {
-        m_pathTraceMaxAccumulatedSamples = m_pathTraceSamplesPerFrame;
+        ImGui::TextDisabled("Reference uses fixed quality; changes are Debug-only overrides.");
+        OverrideSliderUInt("PT samples per frame", quality.samplesPerFrame, 1, static_cast<int>(Limits::MaximumSamplesPerFrame),
+            0, overrides.referenceSamplesPerFrame, RenderingOverrideField::referenceSamplesPerFrame);
+        OverrideSliderUInt("PT max path depth", quality.maxPathDepth, 1, static_cast<int>(Limits::MaximumPathDepth), 0,
+            overrides.referenceMaxPathDepth, RenderingOverrideField::referenceMaxPathDepth);
+        OverrideSliderUInt("PT roulette from depth", quality.russianRouletteDepth, 1,
+            static_cast<int>(Limits::MaximumRouletteDepth), 0, overrides.referenceRouletteFromDepth,
+            RenderingOverrideField::referenceRouletteFromDepth);
+        OverrideSliderUInt("PT sample target", quality.maxAccumulatedSamples, 1, 1 << 16, ImGuiSliderFlags_Logarithmic,
+            overrides.referenceSampleTarget, RenderingOverrideField::referenceSampleTarget);
+    }
+    else
+    {
+        OverrideSliderUInt("PT samples per frame", quality.samplesPerFrame, 1, static_cast<int>(Limits::MaximumSamplesPerFrame),
+            0, overrides.samplesPerFrame, RenderingOverrideField::samplesPerFrame);
+        OverrideSliderUInt("PT max path depth", quality.maxPathDepth, 1, static_cast<int>(Limits::MaximumPathDepth), 0,
+            overrides.maxPathDepth, RenderingOverrideField::maxPathDepth);
+        OverrideSliderUInt("PT roulette from depth", quality.russianRouletteDepth, 1,
+            static_cast<int>(Limits::MaximumRouletteDepth), 0, overrides.rouletteFromDepth,
+            RenderingOverrideField::rouletteFromDepth);
+        OverrideSliderUInt("PT sample target", quality.maxAccumulatedSamples, 1, 1 << 16, ImGuiSliderFlags_Logarithmic,
+            overrides.sampleTarget, RenderingOverrideField::sampleTarget);
     }
 
     // PSR.2: primary surface replacement through pure-delta mirrors, single-bounce (A -> B) or two-bounce
     // (A -> B -> D). The PSR.1 reference settings (primarySurfaceReplacement, its guides) are set only by the verification
     // harnesses.
     const char* psrModes[] = {"Off", "Single-bounce", "Two-bounce"};
-    int psrMode = m_primarySurfaceReplacementInPlace ? static_cast<int>(m_primarySurfaceReplacementChain) : 0;
-
-    if(ImGui::Combo("PT PSR mode", &psrMode, psrModes, IM_ARRAYSIZE(psrModes)))
-    {
-        m_primarySurfaceReplacementInPlace = psrMode != 0;
-        m_primarySurfaceReplacementChain = psrMode == 2 ? 2u : 1u;
-    }
+    const ProjectPsrMode psrMode = OverrideCombo("PT PSR mode", pathTracing.psrMode, psrModes, IM_ARRAYSIZE(psrModes),
+        overrides.psrMode, RenderingOverrideField::psrMode);
 
     ImGui::Text("Active PSR: %s", psrModes[m_psrActiveMode >= 2u ? 2 : m_psrActiveMode]);
-    if(m_primarySurfaceReplacementInPlace)
+    if(psrMode != ProjectPsrMode::Off)
     {
-        if(m_primarySurfaceReplacementChain >= 2u && m_pathTraceMaxPathDepth < 3)
+        if(psrMode == ProjectPsrMode::TwoBounce && pathTracing.maxPathDepth < 3)
         {
             ImGui::TextWrapped("Two-bounce needs PT max path depth 3 or more; replacing single-bounce.");
         }
@@ -1421,43 +1558,58 @@ void DebugUI::DrawPathTraceReferenceSettings()
             ImGui::TextDisabled("Active: reflected surfaces are lit.");
         }
         const char* psrDebugViews[] = {"Off", "Replacement Mask", "Reflected Normals", "Reflected Albedo"};
-        ImGui::Combo("PSR Debug View", &m_psrDebugView, psrDebugViews, IM_ARRAYSIZE(psrDebugViews));
+        const ProjectPsrDebugView psrDebugView = OverrideCombo("PSR Debug View", pathTracing.psrDebugView,
+            psrDebugViews, IM_ARRAYSIZE(psrDebugViews), overrides.psrDebugView, RenderingOverrideField::psrDebugView);
 
-        if(m_psrDebugView == 1)
+        if(psrDebugView == ProjectPsrDebugView::ReplacementMask)
         {
             ImGui::TextDisabled("Green replaced, red fallback, yellow pass did not run, magenta invalid.");
         }
     }
 
-    const bool pathTracing = m_lightingMode == 3;
-
     ImGui::SeparatorText("DLSS Super Resolution");
-    ImGui::Checkbox("Enable DLSS Super Resolution", &m_dlssEnabled);
+    const bool dlssEnabled = OverrideCheckbox("Enable DLSS Super Resolution", pathTracing.dlss, overrides.dlss,
+        RenderingOverrideField::dlss);
     const char* dlssQualities[] = {"Quality", "Balanced", "Performance"};
-    ImGui::BeginDisabled(!m_dlssEnabled);
-    ImGui::Combo("DLSS quality", &m_dlssQuality, dlssQualities, IM_ARRAYSIZE(dlssQualities));
+    ImGui::BeginDisabled(!dlssEnabled);
+    OverrideCombo("DLSS quality", pathTracing.dlssQuality, dlssQualities, IM_ARRAYSIZE(dlssQualities),
+        overrides.dlssQuality, RenderingOverrideField::dlssQuality);
     ImGui::EndDisabled();
     ImGui::TextWrapped("%s", m_dlssState.c_str());
     ImGui::TextWrapped("%s", m_dlssDetail.c_str());
-    if(m_dlssEnabled && !IsDlssConfigurationEligible())
+
+    if(dlssEnabled && !IsDlssConfigurationEligible())
+    {
         ImGui::TextWrapped("Requires an active raster-primary path-tracing mode and a ready denoiser.");
-    if(m_dlssEnabled && m_dlssCanRetry && ImGui::Button("Retry DLSS")) m_dlssRetry = true;
+    }
+
+    if(dlssEnabled && m_dlssCanRetry && ImGui::Button("Retry DLSS"))
+    {
+        m_dlssRetry = true;
+    }
+
     if(ImGui::TreeNode("Advanced upscaling diagnostics"))
     {
         const char* diagnosticScales[] = {"Native", "75% bilinear", "75% DLSS"};
-        ImGui::BeginDisabled(m_dlssEnabled);
+        ImGui::BeginDisabled(dlssEnabled);
         ImGui::Combo("Diagnostic render scale", &m_pathTraceRenderScale, diagnosticScales, IM_ARRAYSIZE(diagnosticScales));
         ImGui::EndDisabled();
         ImGui::Checkbox("DLSS input preparation only", &m_dlssInputPreparation);
-        if(!m_dlssEnabled && m_dlssCanRetry && ImGui::Button("Retry diagnostic upscaling")) m_dlssRetry = true;
+
+        if(!dlssEnabled && m_dlssCanRetry && ImGui::Button("Retry diagnostic upscaling"))
+        {
+            m_dlssRetry = true;
+        }
+
         ImGui::TreePop();
     }
 
     // SHARC.4E.1 / 5B: the denoiser and SHARC serve Path Tracing.
-    if (pathTracing)
+    if (isPathTracing)
     {
         // UPSCALING.2B (experimental, off by default): diagnostics for future temporal upscaling.
-        ImGui::Checkbox("PT camera jitter (experimental)", &m_pathTraceCameraJitter);
+        OverrideCheckbox("PT camera jitter (experimental)", pathTracing.cameraJitter, overrides.cameraJitter,
+            RenderingOverrideField::cameraJitter);
 
         if (m_pathTraceCameraJitterActive)
         {
@@ -1465,17 +1617,12 @@ void DebugUI::DrawPathTraceReferenceSettings()
                         m_pathTraceCameraJitterPhaseCount, m_pathTraceCameraJitterX, m_pathTraceCameraJitterY);
         }
 
-        // NRD.2: only the implemented modes are offered; the combo index is the PathTraceDenoiserMode value. NRD.4B: REBLUR
-        // (experimental); NRD.RELAX.4: RELAX (experimental); HYBRID.5: the hybrid (experimental).
+        // NRD.2: only the implemented modes are offered, in ProjectPathTraceDenoiser order. NRD.4B: REBLUR
+        // (experimental); NRD.RELAX.4: RELAX (experimental); HYBRID.5: the hybrid (experimental, the default).
         const char* denoiserModes[] = {"Off", "Engine", "NRD REBLUR (experimental)", "NRD RELAX (experimental)",
                                        "NRD Hybrid (experimental)"};
-        // Until a choice is made Path Tracing's default (Hybrid) is shown.
-        int denoiserMode = static_cast<int>(GetSelectedPathTraceDenoiserMode());
-
-        if (ImGui::Combo("PT denoiser", &denoiserMode, denoiserModes, IM_ARRAYSIZE(denoiserModes)))
-        {
-            m_pathTraceDenoiserMode = static_cast<PathTraceDenoiserMode>(denoiserMode);
-        }
+        OverrideCombo("PT denoiser", pathTracing.denoiser, denoiserModes, IM_ARRAYSIZE(denoiserModes),
+            overrides.denoiser, RenderingOverrideField::denoiser);
 
         if (!m_pathTraceDenoiserPreparation.empty())
         {
@@ -1528,18 +1675,18 @@ void DebugUI::DrawPathTraceReferenceSettings()
         // Explained above, next to the selector.
     }
     else if (const PathTraceModeAvailability pathTracingStatus = GetReSTIRDIAvailability(m_rasterPrimaryStatus);
-        pathTracing && pathTracingStatus.availability == PathTraceRasterPrimaryAvailability::Unavailable)
+        isPathTracing && pathTracingStatus.availability == PathTraceRasterPrimaryAvailability::Unavailable)
     {
         ImGui::TextWrapped("Unavailable, rendering Legacy: %s", pathTracingStatus.reason.c_str());
     }
-    else if (!pathTracing && m_pathTraceAvailability == PathTraceReferenceAvailability::Unavailable)
+    else if (!isPathTracing && m_pathTraceAvailability == PathTraceReferenceAvailability::Unavailable)
     {
         ImGui::TextWrapped("Unavailable, rendering Legacy: %s", m_pathTraceUnavailableReason.c_str());
     }
     else if (m_pathTraceActiveLastFrame)
     {
-        ImGui::Text("Accumulated %u / %d samples per pixel", m_pathTraceAccumulatedSamples,
-                    m_pathTraceMaxAccumulatedSamples);
+        ImGui::Text("Accumulated %u / %u samples per pixel", m_pathTraceAccumulatedSamples,
+                    quality.maxAccumulatedSamples);
         ImGui::Text("Accumulation memory: %.2f MiB",
                     static_cast<double>(m_pathTraceResourceBytes) / (1024.0 * 1024.0));
     }
@@ -1550,29 +1697,53 @@ void DebugUI::DrawPathTraceReferenceSettings()
 
     // R.9I.3: added to the undenoised path-traced image, which keeps its own naturally sampled caustics. Restricted
     // domain (registered static reflector/receiver, one point light, PT denoiser Off); refusals render unchanged.
-    if (m_lightingMode == 1 || m_lightingMode == 3)
+    // Path Tracing's caustics are project settings; Reference's are Debug-only overrides.
     {
         ImGui::SeparatorText("Dedicated Caustics");
-        if (ImGui::Checkbox("Dedicated caustics (experimental)", &m_dedicatedCaustics) && m_dedicatedCaustics)
+        bool dedicatedCaustics = false;
+
+        if(reference)
         {
-            m_pixelCentredCaustics = false;
+            dedicatedCaustics = OverrideCheckbox("Dedicated caustics (experimental, Debug only)",
+                overrides.referenceDedicatedCaustics.value_or(false), overrides.referenceDedicatedCaustics,
+                RenderingOverrideField::referenceDedicatedCaustics);
+            ImGui::BeginDisabled(!dedicatedCaustics);
+            OverrideCheckbox("Caustic-only view", overrides.referenceCausticOnlyView.value_or(false),
+                overrides.referenceCausticOnlyView, RenderingOverrideField::referenceCausticOnlyView);
+            ImGui::EndDisabled();
+        }
+        else
+        {
+            const bool wasDedicated = pathTracing.dedicatedCaustics;
+            dedicatedCaustics = OverrideCheckbox("Dedicated caustics (experimental)", wasDedicated,
+                overrides.dedicatedCaustics, RenderingOverrideField::dedicatedCaustics);
+
+            // The two caustics passes are exclusive; enabling one switches the other off.
+            if(dedicatedCaustics && !wasDedicated && pathTracing.pixelCentredCaustics)
+            {
+                overrides.pixelCentredCaustics = false;
+            }
+
+            ImGui::BeginDisabled(!dedicatedCaustics);
+            OverrideCheckbox("Caustic-only view", pathTracing.causticOnlyView, overrides.causticOnlyView,
+                RenderingOverrideField::causticOnlyView);
+            ImGui::EndDisabled();
         }
 
-        ImGui::BeginDisabled(!m_dedicatedCaustics);
-        ImGui::Checkbox("Caustic-only view", &m_causticOnlyView);
-        ImGui::EndDisabled();
+        // R.9I.3 production integration (P1: K = 1 estimator, caustics-only views): Path Tracing only.
+        ImGui::BeginDisabled(!isPathTracing);
+        const bool wasPixelCentred = pathTracing.pixelCentredCaustics;
+        const bool pixelCentredCaustics = OverrideCheckbox("Pixel-centred caustics (experimental)", wasPixelCentred,
+            overrides.pixelCentredCaustics, RenderingOverrideField::pixelCentredCaustics);
 
-        // R.9I.3 production integration (P1: K = 1 estimator, caustics-only views): Raster Primary + ReSTIR DI.
-        ImGui::BeginDisabled(m_lightingMode != 3);
-
-        if (ImGui::Checkbox("Pixel-centred caustics (experimental)", &m_pixelCentredCaustics) && m_pixelCentredCaustics)
+        if(pixelCentredCaustics && !wasPixelCentred && pathTracing.dedicatedCaustics)
         {
-            m_dedicatedCaustics = false;
+            overrides.dedicatedCaustics = false;
         }
 
         ImGui::EndDisabled();
 
-        if (m_pixelCentredCaustics)
+        if (pixelCentredCaustics)
         {
             static const char* const views[] = {"Ordinary image", "Caustic diffuse", "Caustic specular",
                                                 "Caustic combined", "Caustic validity"};
@@ -1596,7 +1767,7 @@ void DebugUI::DrawPathTraceReferenceSettings()
                         static_cast<double>(m_pixelCausticResourceBytes) / (1024.0 * 1024.0));
         }
 
-        if (m_dedicatedCaustics)
+        if (resolved.dedicatedCaustics)
         {
             ImGui::TextWrapped("Status: %s", m_causticReason.c_str());
             ImGui::Text("Presented last frame: %s", m_causticPresented ? "yes" : "no");

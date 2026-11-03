@@ -4148,6 +4148,9 @@ bool Renderer::Initialize(
     m_dlssPublishedState.clear();
     m_dlssPublishedDetail.clear();
     m_packagedRuntime = !packagedShaders.empty();
+    // PS.5C: the worker's private shader library for the PSR auxiliary pipelines reads the same cooked bootstrap.
+    m_packagedShaderPayload = m_packagedRuntime ?
+        std::make_shared<const std::vector<std::byte>>(packagedShaders.begin(), packagedShaders.end()) : nullptr;
     m_reconstructionAcceptance = {};
     m_sceneResourceLifetime = 0;
     m_sceneResourceScene = nullptr;
@@ -4346,7 +4349,8 @@ bool Renderer::Initialize(
         return false;
     }
 
-    // UPSCALING.3A: capability only; any DLSS failure is reported, never fatal. The packaged runtime does not use DLSS.
+    // UPSCALING.3A: capability only; any DLSS failure is reported, never fatal. PS.5E: packaged games initialize NGX
+    // in SetRenderScale once their fixed configuration requests DLSS, so games without DLSS skip its startup cost.
     if(!m_packagedRuntime)
     {
         m_dlssBackend.Initialize(m_graphicsDevice.GetDevice());
@@ -4378,32 +4382,39 @@ bool Renderer::Initialize(
 
     SelectPathTraceLibraries();
 
-    // Packaged bytecode never compiles, so only the Editor prepares DXR libraries asynchronously. Without
-    // the worker, lighting modes keep their synchronous first-use compilation.
+    // The Editor compiles DXR libraries on the compile worker; packaged games admit their cooked libraries directly
+    // (PathTraceReferencePass::PrepareLibrary). Either way, once a configuration's libraries are ready its DXR
+    // pipelines are created on the pipeline worker (PS.5B.1: packaged games too), and lighting modes activate only
+    // when everything is prepared. Without the workers, lighting modes keep their synchronous first-use creation.
     m_lightingModeTransition.Reset();
     m_preparedDxrLibraries.clear();
     m_denoiserPreparation.clear();
     m_sharcPreparation.clear();
     m_shaderCompileWorkerRunning = false;
+    m_asynchronousDxrPreparation = false;
+
+    // Packaged games keep the worker object for PrepareLibrary's signature but never start its thread.
+    m_shaderCompileWorker = std::make_unique<ShaderLibraryCompileWorker>();
 
     if(!m_packagedRuntime)
     {
-        m_shaderCompileWorker = std::make_unique<ShaderLibraryCompileWorker>();
         m_shaderCompileWorkerRunning = m_shaderCompileWorker->Start();
 
         if(!m_shaderCompileWorkerRunning)
         {
             Log::Warning("DXR shader compile worker unavailable; lighting modes compile synchronously.");
         }
+    }
 
-        // ER.1 Phase 4: DXR state objects and shader tables are created on their own worker once the libraries are ready.
-        m_pipelineWorker = std::make_unique<RayTracingPipelineWorker>();
-        m_pipelineWorkerRunning = m_shaderCompileWorkerRunning && m_pipelineWorker->Start();
+    // ER.1 Phase 4: DXR state objects and shader tables are created on their own worker once the libraries are ready.
+    const bool librariesPreparable = m_packagedRuntime || m_shaderCompileWorkerRunning;
+    m_pipelineWorker = std::make_unique<RayTracingPipelineWorker>();
+    m_pipelineWorkerRunning = librariesPreparable && m_pipelineWorker->Start();
+    m_asynchronousDxrPreparation = m_shaderCompileWorkerRunning || m_pipelineWorkerRunning;
 
-        if(m_shaderCompileWorkerRunning && !m_pipelineWorkerRunning)
-        {
-            Log::Warning("DXR pipeline worker unavailable; DXR pipelines are created on the render thread.");
-        }
+    if(librariesPreparable && !m_pipelineWorkerRunning)
+    {
+        Log::Warning("DXR pipeline worker unavailable; DXR pipelines are created on the render thread.");
     }
 
     if (!m_displacementVerticesPass.Initialize(m_graphicsDevice, m_shaderLibrary))
@@ -4927,6 +4938,15 @@ void Renderer::SetRenderScale(RenderScale scale, bool eligible, bool retry, bool
     m_dlssEligible = eligible;
     m_dlssNormalRequest = normalRequest;
     m_dlssRetryPending |= retry;
+
+    // PS.5E: a packaged game's first DLSS request initializes NGX (between frames, before ResizeScene applies the
+    // scale). Without nvngx_dlss.dll beside the executable the backend reports RuntimeMissing: Native.
+    const bool dlssRequested = normalRequest || IsDlssRenderScale(scale);
+
+    if(m_packagedRuntime && dlssRequested && m_dlssBackend.GetStatus().availability == DlssAvailability::NotInitialized)
+    {
+        m_dlssBackend.Initialize(m_graphicsDevice.GetDevice());
+    }
 }
 
 bool Renderer::ResizeScene(unsigned int width, unsigned int height)
@@ -6767,8 +6787,8 @@ ShaderLibraryPreparation Renderer::PrepareDxrLibraries(const PathTraceLibraryNee
     ShaderLibraryPreparation combined{};
     combined.state = ShaderLibraryPreparationState::Ready;
 
-    // Without the worker (packaged runtimes) pipelines keep their synchronous first-use compilation.
-    if(!m_shaderCompileWorkerRunning)
+    // Without the workers pipelines keep their synchronous first-use creation.
+    if(!m_asynchronousDxrPreparation)
     {
         return combined;
     }
@@ -7055,15 +7075,18 @@ ShaderLibraryPreparation Renderer::PreparePsrAuxiliary()
             auto prepared = std::make_shared<PsrPipelinePreparation>();
             m_psrPreparedAuxiliary = prepared;
             const auto root = m_assetRoot / "Shaders";
+            const std::shared_ptr<const std::vector<std::byte>> packagedShaders = m_packagedShaderPayload;
             // The device wrapper is read only (GetDevice); Shutdown joins the worker before releasing it.
             auto* device = &m_graphicsDevice;
             RayTracingPipelineRequest request{};
             request.key = key;
             request.device = m_graphicsDevice.GetRayTracingDevice();
-            request.prepareAuxiliary = [prepared, root, device]()
+            request.prepareAuxiliary = [prepared, root, device, packagedShaders]()
             {
                 ShaderLibrary shaders;
-                bool ready = shaders.Initialize(root) && prepared->replacement.Initialize(device->GetDevice(), shaders);
+                const bool shadersReady = packagedShaders ? shaders.InitializePackaged(*packagedShaders) :
+                    shaders.Initialize(root);
+                bool ready = shadersReady && prepared->replacement.Initialize(device->GetDevice(), shaders);
                 ready = ready && prepared->temporal.EnsurePsrVariant(*device, shaders) &&
                     prepared->spatial.EnsureAtrousPsrVariant(*device, shaders) &&
                     prepared->reblur.PreparePsrVariant(*device, shaders, NrdPathTracePreparePass::Encoding::Reblur) &&
@@ -7602,7 +7625,8 @@ void Renderer::UpdateRadianceCacheD6(bool enabled)
     m_radianceCacheD6.ReleaseRetired(m_commandContext.GetCompletedFenceValue());
     const std::uint64_t lastSubmissionFence = m_commandContext.GetLastSubmissionFenceValue();
 
-    if(!enabled || m_packagedRuntime)
+    // PS.5D: packaged games allocate the cache too; it is SHARC's (and the experimental D6 cache's) only storage.
+    if(!enabled)
     {
         m_radianceCacheD6.Retire(lastSubmissionFence);
         m_radianceCacheD6Failed = false;
@@ -8135,7 +8159,9 @@ void Renderer::ApplyPathTraceDenoiserStages(const PathTraceDenoiserStages& stage
 
 void Renderer::UpdateSharcStatus(unsigned int frameSlot)
 {
-    m_sharcStatus.active = m_sharcSettings.enabled && m_radianceCacheD6.HasResources() && m_sharcRenderedLastFrame;
+    // PS.5D: a cache that cannot learn is not active either (RecordRenderFrame reports why).
+    m_sharcStatus.active = m_sharcSettings.enabled && m_radianceCacheD6.HasResources() && m_sharcRenderedLastFrame &&
+        !m_radianceCacheD6.IsLearningUnavailable();
     m_sharcStatus.trainedFrames = m_radianceCacheD6.GetTrainedFrames();
     m_sharcStatus.cacheBytes = 0;
 
@@ -8747,7 +8773,7 @@ bool Renderer::RecordPathTraceReference(
         {
             // RTXPT D.3B: decided first, because the spatial pass replaces the temporal pass's own presentation. A
             // D.3B.0 diagnostic view also runs it, for display only.
-            m_pathTraceVisualization = m_debugUI.GetPathTraceDenoiserVisualization();
+            m_pathTraceVisualization = m_requestedPathTraceVisualization;
             const bool diagnosticView = m_pathTraceVisualization.view != PathTraceDenoiserView::Normal;
             m_pathTraceSpatialRequested = ((m_pathTraceSpatial && !m_pathTraceSpatialBypass) || diagnosticView) &&
                 m_pathTraceSpatialPass.Initialize(m_graphicsDevice, m_shaderLibrary);
@@ -10083,6 +10109,31 @@ void Renderer::ReleasePathTraceNrdDenoiser()
     Log::Info("NRD path-traced REBLUR released.");
 }
 
+std::string Renderer::GetPathTraceDenoiserFailure() const
+{
+    if(m_pathTraceDenoiserMode == PathTraceDenoiserMode::Off)
+    {
+        return {};
+    }
+
+    if(m_pathTraceTemporalPass.HasInitializationFailed() || m_pathTraceSpatialPass.HasInitializationFailed())
+    {
+        return "the Engine denoiser's compute pipelines could not be created; frames are not denoised";
+    }
+
+    switch(m_pathTraceDenoiserMode)
+    {
+    case PathTraceDenoiserMode::NrdReblur:
+        return m_nrdPathTraceFailure;
+    case PathTraceDenoiserMode::NrdRelax:
+        return m_nrdRelaxFailure;
+    case PathTraceDenoiserMode::NrdHybrid:
+        return m_nrdHybridFailure;
+    default:
+        return {};
+    }
+}
+
 void Renderer::ReportPathTraceNrdUnavailable(const std::string& reason)
 {
     if(reason != m_nrdPathTraceFailure)
@@ -10999,6 +11050,9 @@ bool Renderer::RecordRenderFrame(
     const Scene& scene,
     const RendererOptions& options)
 {
+    // Read by RecordPathTraceReference, which runs inside this frame's recording.
+    m_requestedPathTraceVisualization = options.pathTraceDenoiserVisualization;
+
     FinalSceneImage finalImage{};
 
     if (!TryGetFinalSceneImage(finalImage) || !m_swapChain.GetCurrentBackBuffer())
@@ -11274,6 +11328,21 @@ bool Renderer::RecordRenderFrame(
     sharc.enabled = GateSharcRequest(options.lightingMode, denoiser, options.sharc.enabled && rasterPrimaryMode);
     ApplySharcSettings(sharc, rasterPrimaryMode);
     m_sharcStatus.preparation = m_sharcPreparation;
+
+    // PS.5D: cache and learning failures are sticky (UpdateRadianceCacheD6, PrepareRadianceCacheLearning); say so
+    // rather than leave SHARC silently off once its libraries are prepared.
+    if(sharc.enabled && m_sharcStatus.preparation.empty())
+    {
+        if(m_radianceCacheD6Failed)
+        {
+            m_sharcStatus.preparation = "SHARC unavailable: its cache pipelines or resources could not be created.";
+        }
+        else if(m_radianceCacheD6.IsLearningUnavailable())
+        {
+            m_sharcStatus.preparation = "SHARC unavailable: its training pipelines or records could not be created.";
+        }
+    }
+
     m_debugUI.SetPathTraceDenoiserPreparation(m_denoiserPreparation);
     ApplyPathTraceDenoiser(denoiser, rasterPrimaryMode);
     ApplyPathTraceDenoiserStages(options.pathTraceDenoiserStages);
@@ -11560,7 +11629,7 @@ bool Renderer::RecordRenderFrame(
     const LightingModeTransition::Clock::time_point transitionTime = LightingModeTransition::Clock::now();
     const RendererLightingMode candidateMode = m_lightingModeTransition.SelectCandidate(
         options.lightingMode,
-        m_shaderCompileWorkerRunning,
+        m_asynchronousDxrPreparation,
         transitionTime,
         [&]()
         {
@@ -11767,7 +11836,7 @@ bool Renderer::RecordRenderFrame(
     // PSR.2 Stage 1 (development prototype): eligibility marking and in-place replacement on Path Tracing (ReSTIR DI)
     // frames only, with the path tracer's camera. PathTracePsrEligible's maxPathDepth > 0 is checked here.
     const bool psrRequested = runPathTrace && pathTracePrimary == PathTracePrimary::RasterReSTIRDI &&
-        options.pathTraceReference.primarySurfaceReplacementInPlace && options.pathTraceReference.maxPathDepth > 0u && !m_packagedRuntime;
+        options.pathTraceReference.primarySurfaceReplacementInPlace && options.pathTraceReference.maxPathDepth > 0u;
     // PSR.2 Stage 3A: only the PSR.2 lighting pair lights replaced pixels, and it needs the denoiser Off (no extraction),
     // a path that reaches the reflected surface (vertex 1). SHARC remains excluded outside the development-only
     // infrastructure harness, which prepares the combined set before replacement. Without a diagnostic view the
@@ -11883,7 +11952,10 @@ bool Renderer::RecordRenderFrame(
             else
                 psrLightingUnavailable = options.experimentalD6RadianceCache ? "requires the experimental D6 radiance cache off" :
                     options.pathTraceReference.maxPathDepth < 2u ? "requires PT max path depth 2 or more" :
-                    !failure.empty() ? failure : "PSR + SHARC pipelines are not ready";
+                    !failure.empty() ? failure :
+                    // PS.5F: a failed cache is sticky, so PSR's combined path will not become ready; say why.
+                    m_radianceCacheD6Failed ? "PSR with SHARC needs the SHARC cache, which could not be created" :
+                    "PSR + SHARC pipelines are not ready";
         }
         else if(options.pathTraceReference.maxPathDepth < 2u)
         {
@@ -11892,7 +11964,10 @@ bool Renderer::RecordRenderFrame(
         else if(!m_pathTraceReferencePass.EnsurePrimarySurfaceReplacementGBuffer(m_graphicsDevice, m_shaderLibrary,
             failure) || !m_pathTraceReferencePass.IsPrimarySurfaceReplacementGBufferReady())
         {
-            psrLightingUnavailable = failure.empty() ? "lighting pipelines are not ready" : failure;
+            psrLightingUnavailable = !failure.empty() ? failure :
+                m_pathTraceReferencePass.ArePrimarySurfaceReplacementGBufferPipelinesCreated() ?
+                "the RayQuery visibility variants of its lighting pipelines are unavailable" :
+                "lighting pipelines are not ready";
         }
         else if(psrExtraction && (!m_pathTraceReferencePass.EnsurePrimarySurfaceReplacementGBufferExtraction(
             m_graphicsDevice, m_shaderLibrary, false, failure) || (psrRawExtraction &&
@@ -11911,11 +11986,12 @@ bool Renderer::RecordRenderFrame(
     m_psrActiveChain = m_psrLightingThisFrame ? m_psrChainThisFrame : 0u;
     m_debugUI.SetPsrActiveMode(m_psrActiveChain);
     m_debugUI.SetPsrLightingStatus(psrRequested, psrLightingUnavailable);
+    m_psrStatus = {psrRequested, m_psrActiveChain, psrLightingUnavailable};
     // Diagnostic views must not force a virtual G-buffer into an ordinary cache pipeline
     // after combined preparation failed (or while the development boundary is closed).
     const bool psrInPlace = psrRequested && psrPrepared &&
         (m_psrLightingThisFrame || (!m_sharcSettings.enabled && !options.experimentalD6RadianceCache &&
-            m_debugUI.GetPsrDebugView() != ToneMapDebugView::None));
+            options.psrDebugView != ToneMapDebugView::None));
 
     if(psrInPlace)
     {
@@ -12270,7 +12346,7 @@ bool Renderer::RecordRenderFrame(
     constexpr float nrdDenoisingRange = 1000.0f;
     bool runNrd = false;
     bool runNative = false;
-    const bool limiterEnabled = m_debugUI.IsReflectionContributionLimiterEnabled();
+    const bool limiterEnabled = options.contributionLimiter;
 
     Texture* debugTexture = nullptr;
     RenderTarget* debugRenderTarget = nullptr;
@@ -12467,7 +12543,7 @@ bool Renderer::RecordRenderFrame(
             signedGIReconstructed = true;
         }
 
-        const ReflectionDenoiserMode reflectionMode = m_debugUI.GetReflectionDenoiserMode();
+        const ReflectionDenoiserMode reflectionMode = options.reflectionDenoiser;
         runNrd = reflectionMode == ReflectionDenoiserMode::Nrd;
 
         switch (debugView)
@@ -12982,17 +13058,27 @@ bool Renderer::RecordRenderFrame(
         ToneMapDebugView::PathTraceDenoiserScalar : ToneMapDebugView::None;
     // PSR.2 development views replace the presented image with the G-buffer after in-place replacement; they read it
     // at render extent, so they also apply at a reduced render scale.
-    const ToneMapDebugView psrDebugView = psrInPlace ? m_debugUI.GetPsrDebugView() : ToneMapDebugView::None;
+    const ToneMapDebugView psrDebugView = psrInPlace ? options.psrDebugView : ToneMapDebugView::None;
     const ToneMapDebugView presentedDebugView = psrDebugView != ToneMapDebugView::None ? psrDebugView :
         runPathTrace ? pathTraceDebugView : debugView;
 
-    m_finalSceneColor.Transition(commandList, D3D12_RESOURCE_STATE_RENDER_TARGET);
-    m_toneMapPass.Execute(commandList, *presentedColor, m_finalSceneColor.GetRTV(), presentedDebugTexture,
-                          hasRenderableMeshes ? presentedDebugView : ToneMapDebugView::None, nrdDenoisingRange,
-                          presentedDebugRenderTarget, presentedSelectionMask, options.selectionOutlineColor,
-                          presentedDebugView == ToneMapDebugView::None ? options.selectionOutlineThickness : 0,
-                          presentedDepth->GetSRVIndex(), options.toneMapOperator, m_autoExposurePass.GetStateSRVIndex(),
-                          psrDebugView != ToneMapDebugView::None ? &m_gBuffer : nullptr, m_psrInPlaceReplacedLastFrame);
+    // The one tone mapping of the frame: into the Editor's final image, or (PS.5B) straight into the packaged back
+    // buffer below with these same arguments.
+    const auto toneMap = [&](D3D12_CPU_DESCRIPTOR_HANDLE output)
+    {
+        m_toneMapPass.Execute(commandList, *presentedColor, output, presentedDebugTexture,
+                              hasRenderableMeshes ? presentedDebugView : ToneMapDebugView::None, nrdDenoisingRange,
+                              presentedDebugRenderTarget, presentedSelectionMask, options.selectionOutlineColor,
+                              presentedDebugView == ToneMapDebugView::None ? options.selectionOutlineThickness : 0,
+                              presentedDepth->GetSRVIndex(), options.toneMapOperator, m_autoExposurePass.GetStateSRVIndex(),
+                              psrDebugView != ToneMapDebugView::None ? &m_gBuffer : nullptr, m_psrInPlaceReplacedLastFrame);
+    };
+
+    if (!m_packagedRuntime)
+    {
+        m_finalSceneColor.Transition(commandList, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        toneMap(m_finalSceneColor.GetRTV());
+    }
 
     m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::ToneMap);
 
@@ -13035,9 +13121,22 @@ bool Renderer::RecordRenderFrame(
         const D3D12_RECT scissor{0, 0, static_cast<LONG>(m_applicationWidth), static_cast<LONG>(m_applicationHeight)};
         commandList->RSSetViewports(1, &viewport);
         commandList->RSSetScissorRects(1, &scissor);
-        m_toneMapPass.Execute(commandList, *presentedColor, rtvHandle, nullptr, ToneMapDebugView::None,
-            nrdDenoisingRange, nullptr, presentedSelectionMask, options.selectionOutlineColor, 0,
-            presentedDepth->GetSRVIndex(), options.toneMapOperator, m_autoExposurePass.GetStateSRVIndex());
+        toneMap(rtvHandle);
+
+        if(m_packagedPresentCopyForTesting && m_packagedPresentCopyForTesting->GetWidth() == m_applicationWidth &&
+            m_packagedPresentCopyForTesting->GetHeight() == m_applicationHeight)
+        {
+            barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            commandList->ResourceBarrier(1, &barrier);
+            m_packagedPresentCopyForTesting->Transition(commandList, D3D12_RESOURCE_STATE_COPY_DEST);
+            commandList->CopyResource(m_packagedPresentCopyForTesting->GetResource(), m_swapChain.GetCurrentBackBuffer());
+            m_packagedPresentCopyForTesting->Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            commandList->ResourceBarrier(1, &barrier);
+        }
+
         barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
         barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
         commandList->ResourceBarrier(1, &barrier);
@@ -13468,6 +13567,7 @@ void Renderer::Shutdown()
     }
 
     m_shaderCompileWorkerRunning = false;
+    m_asynchronousDxrPreparation = false;
 
     // ER.1 Phase 4: joined before the pass and the device go; untaken pipelines (never used by the GPU) are destroyed.
     if(m_pipelineWorker)

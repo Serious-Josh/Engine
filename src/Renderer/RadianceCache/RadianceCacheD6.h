@@ -273,6 +273,12 @@ public:
         return m_resources.has_value();
     }
 
+    // PS.5D: the insertion pipelines or the training records could not be created, so frames render without learning.
+    bool IsLearningUnavailable() const
+    {
+        return m_insertPipelineFailed || m_recordsFailedCount != 0;
+    }
+
     // The identity of the current resources; all zero without resources.
     RadianceCacheConfigurationIdentity GetIdentity() const
     {
@@ -440,6 +446,7 @@ public:
         m_headerPipeline.Shutdown();
         m_resolvePipeline.Shutdown();
         m_insertPipeline.Shutdown();
+        m_clearStampsPipeline.Shutdown();
         m_readback.Reset();
         m_readbackRecorded[0] = false;
         m_readbackRecorded[1] = false;

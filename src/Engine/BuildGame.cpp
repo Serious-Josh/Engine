@@ -1,5 +1,6 @@
 #include "Engine/BuildGame.h"
 #include "Engine/PackagedBootstrap.h"
+#include "Engine/PackagedRenderingSettings.h"
 #include "assets/CookedScene.h"
 #include "Scene/RenderView.h"
 #include "assets/CookedEnvironment.h"
@@ -8,6 +9,7 @@
 #include "assets/ProjectAssetResolver.h"
 #include "assets/ProjectScriptAssets.h"
 #include "Renderer/Shader/ShaderLibrary.h"
+#include "Core/Log.h"
 
 #include <Windows.h>
 #include "Platform/Windows/WindowsText.h"
@@ -371,15 +373,33 @@ void CookScriptAssets(const Request& request, BuildAssets& build, const BuildPro
 void CompilePackagedShaders(const Request& request, BuildAssets& build, const BuildProgress& progress)
 {
     progress.Report(.55f, "Compiling packaged shaders offline...");
-    auto shaderPayload = ShaderLibrary::CookBootstrap(request.shaderRoot);
-    Require(shaderPayload.size() <= 64ull * 1024 * 1024,
-        "Shader bootstrap exceeds the runtime 64 MiB limit.");
+    // PS.5B: the renderer's packaged inventory; CookBootstrap enforces the bootstrap limits.
+    ShaderBootstrapStatistics statistics;
+    auto shaderPayload = ShaderLibrary::CookBootstrap(request.shaderRoot, GetPackagedShaderInventory(),
+        GetPackagedLibraryInventory(), &statistics);
+    Log::Info("Packaged shaders: " + std::to_string(statistics.shaders) + " graphics/compute and " +
+        std::to_string(statistics.libraries) + " DXR libraries (" + std::to_string(statistics.optionalLibraries) +
+        " optional RayQuery variants; " + std::to_string(statistics.libraryCacheHits) + " from the DXIL cache), " +
+        std::to_string(statistics.bytes) + " bytes, largest record " + std::to_string(statistics.largestRecordBytes) +
+        " bytes, cooked in " + std::to_string(statistics.seconds) + " s.");
     build.Append({PackagedBootstrap::ShaderID(), EngineAssetPak::Type::Shader, 1, std::move(shaderPayload)});
 
     // The path tracer's material tables travel verbatim; their SHA-256 pin is checked here and again at startup.
     auto materialTables = PackagedBootstrap::ReadBundledMaterialTables(request.shaderRoot);
     build.Append({PackagedBootstrap::MaterialTablesID(), EngineAssetPak::Type::Resource,
         PackagedBootstrap::MaterialTablesPayloadVersion, std::move(materialTables)});
+
+    // PS.4: the saved Project Settings, checked to decode back to exactly what was cooked.
+    const AssetID settingsID = PackagedRenderingSettings::ID();
+    Require(std::none_of(build.cookedAssets.begin(), build.cookedAssets.end(),
+        [&](const CookedSurface::Asset& asset) { return asset.id == settingsID; }),
+        "Asset " + settingsID.ToString() + " collides with the reserved packaged rendering settings identity.");
+    auto settingsPayload = PackagedRenderingSettings::Encode(request.projectSettings);
+    const auto decoded = PackagedRenderingSettings::Decode(settingsPayload);
+    Require(decoded.source == PackagedRenderingSettings::Source::Cooked &&
+        decoded.rendering == request.projectSettings.rendering,
+        "Packaged rendering settings do not round-trip; the saved Project Settings may need to be saved again.");
+    build.Append({settingsID, EngineAssetPak::Type::Resource, 1, std::move(settingsPayload)});
     std::uint64_t totalPayloadBytes = 0;
     for (const auto& asset : build.cookedAssets)
     {
@@ -407,6 +427,13 @@ void WriteAndVerifyArchives(const Request& request, const AssetID& sceneAssetID,
         {
             archiveReader.Read(entry.id);
         }
+
+        // Admitted exactly as packaged preflight admits it.
+        const auto settings = PackagedRenderingSettings::Admit(archiveReader.Lookup(PackagedRenderingSettings::ID()),
+            [&]() { return archiveReader.Read(PackagedRenderingSettings::ID()); });
+        Require(settings.source == PackagedRenderingSettings::Source::Cooked &&
+            settings.rendering == request.projectSettings.rendering,
+            "Packaged rendering settings differ from the saved Project Settings.");
     }
     {
         auto verifiedScene = CookedScene::OpenArchive(
@@ -487,6 +514,29 @@ void DeployRuntimeFiles(const Request& request, const AssetID& sceneAssetID,
     }
 
     deploymentFiles.emplace_back("AngelScriptNotices.txt");
+
+    // PS.5E: DLSS Super Resolution's runtime, only for saved settings that can use it (Path Tracing with a denoiser;
+    // without one DLSS is never eligible). NGX loads nvngx_dlss.dll from beside the executable. The runtime directory
+    // holds the SDK's production lib/Windows_x86_64/rel copy (engine_deploy_dlss(EngineRuntime)); the watermarked
+    // development DLL is never deployed there. A game that requests DLSS is never built without its runtime.
+    const RenderingSettings& rendering = request.projectSettings.rendering;
+    const bool dlssUsable = rendering.lightingMode == ProjectLightingMode::PathTracing && rendering.pathTracing.dlss &&
+        rendering.pathTracing.denoiser != ProjectPathTraceDenoiser::Off;
+
+    if(dlssUsable)
+    {
+        const fs::path dlssRuntime = request.runtimeDirectory / "nvngx_dlss.dll";
+        Require(fs::is_regular_file(dlssRuntime) && !IsReparsePoint(dlssRuntime),
+            "Project Settings enable DLSS, but the runtime directory has no nvngx_dlss.dll (EngineRuntime was built "
+            "without the NVIDIA DLSS SDK). Turn DLSS off in Project Settings, or build EngineRuntime with the SDK.");
+
+        copyRuntimeFile(dlssRuntime, "nvngx_dlss.dll");
+        deploymentFiles.emplace_back("nvngx_dlss.dll");
+        // NVIDIA RTX supplement 7.1(b) and 4 (../DLSS/LICENSE.txt) bind the game's author, not the build.
+        Log::Info("Build Game: deployed NVIDIA DLSS Super Resolution (nvngx_dlss.dll). Its license requires the game "
+            "to attribute the DLSS SDK with the NVIDIA Marks (splash screen, about box, credits) and NVIDIA to be "
+            "notified before commercial release.");
+    }
 
     // EngineRuntime's build writes RuntimeNotices.txt, plus the app-local MSVC redistributables for Release.
     // Keep this list explicit: arbitrary DLLs/files in a runtime directory are never deployed.

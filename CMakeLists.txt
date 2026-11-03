@@ -136,6 +136,8 @@ add_library(EngineCore OBJECT
     src/Engine/ArchiveSurfaceAdmission.cpp
     src/Engine/ArchiveSceneBootstrap.cpp
     src/Engine/PackagedBootstrap.cpp
+    src/Engine/PackagedRenderingSettings.cpp
+    src/Renderer/PackagedShaderInventory.cpp
     src/assets/ProjectTexturePreparationService.cpp
     src/assets/ProjectMaterialPreparationService.cpp
     src/Renderer/MaterialAdmission.cpp
@@ -159,6 +161,8 @@ add_library(EngineCore OBJECT
     src/Core/Input.cpp
     src/Core/Log.cpp
     src/Renderer/Renderer.cpp
+    src/Renderer/RenderingConfiguration.cpp
+    src/Renderer/RenderingConfigurationApply.cpp
     src/Renderer/Upscaling/DlssBackend.cpp
     src/Renderer/Displacement/DisplacementUpdateState.cpp
     src/Renderer/Displacement/DisplacementUpdateCoordinator.cpp
@@ -312,6 +316,7 @@ add_library(EngineCore OBJECT
     src/Project/ProjectLoader.cpp
     src/Project/EditorCommandLine.cpp
     src/Project/PersonalSettingsFile.cpp
+    src/Project/ProjectSettings.cpp
     src/Project/ProjectWorkspace.cpp
     src/Scene/FileScene.cpp
     src/Scene/SceneDocumentAdapter.cpp
@@ -344,6 +349,8 @@ add_library(EngineCore OBJECT
     src/Engine/EditorPersonalSettings.cpp
     src/Engine/EditorSceneLifecycle.cpp
     src/Engine/EditorProjectSettings.cpp
+    src/Engine/RenderingConfigurationResolver.cpp
+    src/Engine/RenderingOverrides.cpp
     src/Platform/Windows/EditorFileDialogs.cpp
     src/Scene/SceneMembershipPublication.cpp
     src/Scene/MeshResidencyPublication.cpp
@@ -378,8 +385,15 @@ if(ENGINE_BUILD_DIAGNOSTICS)
     set(ENGINE_VERIFICATION_AVAILABLE ON)
     # A consistent definition across core, tests and entry points guards test-only access.
     target_compile_definitions(EngineCore PUBLIC $<$<CONFIG:Debug>:ENGINE_HAS_VERIFICATION=1>)
+    # PS.3 UI verification: Dear ImGui's item hooks, recorded by the ignored verifiers (Debug only, inert by default).
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Engine/tests/ImGuiTestEngineHooks.cpp")
+        target_compile_definitions(EngineCore PRIVATE $<$<CONFIG:Debug>:IMGUI_ENABLE_TEST_ENGINE>)
+        target_sources(EngineCore PRIVATE $<$<CONFIG:Debug>:src/Engine/tests/ImGuiTestEngineHooks.cpp>)
+    endif()
     add_library(EngineVerification OBJECT)
     target_link_libraries(EngineVerification PRIVATE EngineCore)
+    # The hook declarations and item status flags the PS.3 UI verifier reads (declarations only; no layout change).
+    target_compile_definitions(EngineVerification PRIVATE $<$<CONFIG:Debug>:IMGUI_ENABLE_TEST_ENGINE>)
     target_compile_definitions(EngineVerification PRIVATE
         ENGINE_SOURCE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}"
         ENGINE_RUNTIME_DEPLOY_DIR="$<TARGET_FILE_DIR:EngineRuntime>"
@@ -614,8 +628,10 @@ add_custom_command(
     COMMENT "Copying runtime assets and dependencies"
 )
 engine_deploy_dxc(Engine)
-# The Editor initializes DLSS; the packaged runtime does not yet, so it gets no DLSS runtime.
+# The Editor and (PS.5E) the packaged runtime both initialize DLSS. EngineRuntime's directory gets the SDK's production
+# runtime too; Build Game ships it only in games whose saved settings can use DLSS (BuildGame.cpp DeployRuntimeFiles).
 engine_deploy_dlss(Engine)
+engine_deploy_dlss(EngineRuntime)
 
 # Agility SDK D3D12 headers take precedence over the Windows SDK copies.
 target_include_directories(EngineCore BEFORE PUBLIC "${ENGINE_AGILITY_SDK_INCLUDE_DIR}")

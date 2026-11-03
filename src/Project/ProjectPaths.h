@@ -15,6 +15,8 @@ public:
     std::filesystem::path GetTexturesDirectory() const;
     std::filesystem::path GetScriptsDirectory() const;
     std::filesystem::path GetAssetRegistryPath() const;
+    // Shared, packaged project configuration (PS.1); separate from the .engineproj manifest.
+    std::filesystem::path GetProjectSettingsPath() const;
 
     // Creates the standard project content directories.
     bool EnsureDirectories(std::string* errorMessage = nullptr) const;

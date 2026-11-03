@@ -81,6 +81,10 @@ public:
     // Lock and pin are held, and both the pin and the manifest path name the locked file.
     bool IsFullyOwned() const;
 
+    // PS.2C: full ownership of exactly this manifest. The path must name the locked file itself (the
+    // same file identity), so a lock on another project, or on a replaced or relocated file, is refused.
+    bool IsLockFor(const std::filesystem::path& manifestPath) const;
+
     // Reopens a missing pin, only after verifying that the manifest path still names the file the
     // byte-range lock protects. A lock on an obsolete file is never treated as ownership.
     bool RestoreOwnership(std::string& errorMessage);

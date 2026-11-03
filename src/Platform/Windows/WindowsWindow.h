@@ -33,6 +33,8 @@ class WindowsWindow
     void WaitForMessage();
     bool ShouldClose() const;
     void Close();
+    // Removes the window from the screen and taskbar without destroying it (shutdown in progress).
+    void Hide();
 
     void SetSize(
         unsigned int width,

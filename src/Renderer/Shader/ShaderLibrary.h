@@ -3,6 +3,7 @@
 #include "Shader.h"
 #include "ShaderCompiler.h"
 #include "ShaderLibraryCompileWorker.h"
+#include "Renderer/PackagedShaderInventory.h"
 
 #include <memory>
 #include <filesystem>
@@ -36,6 +37,18 @@ struct ShaderKeyHash
     }
 };
 
+// What one CookBootstrap produced.
+struct ShaderBootstrapStatistics
+{
+    std::size_t shaders = 0;
+    std::size_t libraries = 0;
+    std::size_t optionalLibraries = 0;
+    std::size_t libraryCacheHits = 0;
+    std::uint64_t bytes = 0;
+    std::uint64_t largestRecordBytes = 0;
+    double seconds = 0.0;
+};
+
 class ShaderLibrary
 {
     public:
@@ -46,8 +59,38 @@ class ShaderLibrary
     bool Initialize(const std::filesystem::path& shaderRoot);
     void Shutdown();
     bool InitializePackaged(std::span<const std::byte> payload);
-    // Offline authoring only. Compiles the explicit engine shader manifest.
-    static std::vector<std::byte> CookBootstrap(const std::filesystem::path& root);
+
+    // The shader bootstrap limits InitializePackaged admits.
+    static constexpr std::size_t MaximumBootstrapRecords = 256;
+    static constexpr std::size_t MaximumBootstrapRecordBytes = 16 * 1024 * 1024;
+    static constexpr std::size_t MaximumBootstrapBytes = 64 * 1024 * 1024;
+
+    // Offline authoring only. Compiles the renderer's packaged inventory (PackagedShaderInventory) with the arguments
+    // the runtime uses, libraries through the persistent DXIL cache. Throws when any entry fails or a limit is exceeded.
+    static std::vector<std::byte> CookBootstrap(
+        const std::filesystem::path& root,
+        std::span<const PackagedShaderEntry> shaders,
+        std::span<const PackagedLibraryEntry> libraries,
+        ShaderBootstrapStatistics* statistics = nullptr);
+
+    bool IsPackaged() const
+    {
+        return m_packaged;
+    }
+
+    // Whether the packaged bootstrap holds the library at path (its runtime key). Always false outside packaged games.
+    bool HasPackagedLibrary(const std::filesystem::path& path) const
+    {
+        return m_packaged && m_packagedBytecode.contains(path.generic_string() + ":library");
+    }
+
+    // PS.5B.1: the cooked library at path, the packaged counterpart of compiling it. On failure problem says whether it
+    // "is not in this game's shaders", "is corrupt (...)" or "is incompatible (...)". Never logs.
+    bool AcquirePackagedLibrary(const std::filesystem::path& path, ShaderLibraryCompileResult& output,
+        std::string& problem) const;
+
+    // "path:entry:stage" of every graphics or compute shader loaded this session (inventory verification).
+    std::vector<std::string> GetLoadedShaderKeys() const;
 
     Shader* Load(const ShaderDescription& description);
 

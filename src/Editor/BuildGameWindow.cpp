@@ -99,17 +99,17 @@ void Editor::DrawBuildGame(const IDemoScene& demoScene)
 
         if(!configured.empty())
         {
-            ImGui::TextWrapped("Startup scene: %s (File > Project Settings)", BuildPathText(configured).c_str());
+            ImGui::TextWrapped("Startup scene: %s (Edit > Project Settings)", BuildPathText(configured).c_str());
         }
         else if(activeSaved && m_activeProject)
         {
             const auto relative = activeScene->GetScenePath().lexically_relative(m_activeProject->GetRoot());
-            ImGui::TextWrapped("Startup scene: active saved scene %s (none configured in File > Project Settings)",
+            ImGui::TextWrapped("Startup scene: active saved scene %s (none configured in Edit > Project Settings)",
                 BuildPathText(relative).c_str());
         }
         else
         {
-            ImGui::TextWrapped("Startup scene: none. Save the active scene or choose one in File > Project Settings.");
+            ImGui::TextWrapped("Startup scene: none. Save the active scene or choose one in Edit > Project Settings.");
         }
 
         const auto queueBuild = [&](bool saveStartupScene)

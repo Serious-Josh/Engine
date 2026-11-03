@@ -543,6 +543,15 @@ void WindowsWindow::Close()
     m_shouldClose = true;
 }
 
+void WindowsWindow::Hide()
+{
+    // Repeated calls are harmless; the window stays alive until Shutdown destroys it.
+    if (m_windowHandle != nullptr)
+    {
+        ShowWindow(static_cast<HWND>(m_windowHandle), SW_HIDE);
+    }
+}
+
 void WindowsWindow::SetSize(
 
     unsigned int width,

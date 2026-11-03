@@ -1,7 +1,9 @@
 #pragma once
 
+#include "Project/ProjectLock.h"
 #include "Project/ProjectManifest.h"
 #include "Project/ProjectPaths.h"
+#include "Project/ProjectSettings.h"
 
 #include <filesystem>
 #include <optional>
@@ -47,8 +49,20 @@ public:
     // use this as the project's identity. Fails when the root does not exist.
     std::filesystem::path ResolveCanonicalRoot(std::error_code& error) const;
 
+    // PS.1 shared project configuration (ProjectSettings.json). Defaults until LoadProjectSettings,
+    // which whoever installs the context (ProjectLoader, the legacy bootstrap) calls once. Loading
+    // only reads: a missing, malformed or newer file is never created, repaired or replaced here.
+    const LoadedProjectSettings& GetProjectSettings() const noexcept;
+    void LoadProjectSettings();
+
+    // Explicit save. Only a project opened from its manifest may write, and only with full ownership of
+    // that manifest's lock (ProjectLock::IsLockFor); read-only states (newer version, unreadable file)
+    // are refused unchanged. On failure the in-memory settings are unchanged.
+    bool SaveProjectSettings(const ProjectLock& lock, const ProjectSettings& settings, std::string& errorMessage);
+
 private:
     ProjectPaths m_paths;
     std::optional<ProjectManifest> m_manifest;
     std::filesystem::path m_manifestFileName;
+    LoadedProjectSettings m_projectSettings;
 };

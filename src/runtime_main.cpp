@@ -11,16 +11,22 @@
 
 #if !defined(NDEBUG) && defined(ENGINE_HAS_VERIFICATION)
 void VerifyPackagedPhysicsApplication(Engine& engine);
+void VerifyPackagedRendering(Engine& engine, const std::filesystem::path& out, unsigned int width, unsigned int height,
+    std::uint32_t samples, unsigned int delayMilliseconds);
 #endif
 
 int RunRuntime(int argc, const std::vector<std::string>& argv)
 {
 #if !defined(NDEBUG) && defined(ENGINE_HAS_VERIFICATION)
     const bool verifyPhysics = argc > 1 && argv[1] == "--verify-physics";
+    // PS.5B: --verify-rendering <out> <width> <height> <samples> [<delay ms>], on the game's configured startup scene.
+    const bool verifyRendering = (argc == 6 || argc == 7) && argv[1] == "--verify-rendering";
 #endif
     bool verify = false;
+    int verificationArguments = 1;
 #if !defined(NDEBUG) && defined(ENGINE_HAS_VERIFICATION)
-    verify = verifyPhysics || (argc > 1 && std::string_view(argv[1]) == "--verify-bootstrap");
+    verify = verifyPhysics || verifyRendering || (argc > 1 && std::string_view(argv[1]) == "--verify-bootstrap");
+    verificationArguments = verifyRendering ? argc - 1 : 1;
 #else
     if(argc > 1 && std::string_view(argv[1]).starts_with("--verify-"))
     {
@@ -33,7 +39,7 @@ int RunRuntime(int argc, const std::vector<std::string>& argv)
         if(GetConsoleWindow()!=nullptr) throw std::runtime_error("Packaged runtime unexpectedly has a console window.");
         Log::Info("Verified GUI runtime has no console window.");
     }
-    const int sceneArgument=verify ? 2 : 1;
+    const int sceneArgument=verify ? 1 + verificationArguments : 1;
     const bool configured=argc==sceneArgument;
     if(!configured && argc!=sceneArgument+1 && argc!=sceneArgument+3)
     {
@@ -70,7 +76,14 @@ int RunRuntime(int argc, const std::vector<std::string>& argv)
             {
                 VerifyPackagedPhysicsApplication(engine);
             }
-            if(verify)
+            if(verifyRendering)
+            {
+                VerifyPackagedRendering(engine, std::filesystem::u8path(argv[2]),
+                    static_cast<unsigned int>(std::stoul(argv[3])), static_cast<unsigned int>(std::stoul(argv[4])),
+                    static_cast<std::uint32_t>(std::stoul(argv[5])),
+                    argc == 7 ? static_cast<unsigned int>(std::stoul(argv[6])) : 0u);
+            }
+            else if(verify)
             {
                 engine.VerifyPackagedBootstrap();
             }

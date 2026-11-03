@@ -375,6 +375,17 @@ public:
 
     void OnStartupSceneChanged(bool succeeded, std::string message);
 
+    // PS.3 Project Settings (Edit > Project Settings). The window edits a draft of the saved settings; Save
+    // queues the validated draft, which Engine persists through Engine::SaveProjectSettings and reports back.
+    void OpenProjectSettings();
+    std::optional<ProjectSettings> TakeProjectSettingsSaveRequest()
+    {
+        return std::exchange(m_projectSettingsSaveRequest, std::nullopt);
+    }
+    void OnProjectSettingsSaveCompleted(bool succeeded, std::string message);
+    // The draft differs from the saved settings.
+    bool HasUnsavedProjectSettings() const;
+
     // Blocking prompt while project manifest ownership cannot be verified (Engine fail-closed state).
     enum class OwnershipAction
     {
@@ -622,7 +633,7 @@ private:
     bool m_sceneOperationPending = false;
     bool m_showProjectSettings = false;
     std::string m_lifecycleMessage;
-    void DrawLifecycleWindows(const IDemoScene& demoScene);
+    void DrawLifecycleWindows(const IDemoScene& demoScene, const DebugUI& debugUI);
 
     // Project Settings: shared game startup scene. Candidates are listed from the Scenes directory
     // when the window opens or on Refresh, never per frame and without reading scene documents.
@@ -631,8 +642,37 @@ private:
     bool m_startupSceneCandidatesListed = false;
     std::string m_projectSettingsMessage;
     bool m_projectSettingsMessageIsError = false;
-    void DrawProjectSettings(const IDemoScene& demoScene);
+    void DrawProjectSettings(const IDemoScene& demoScene, const DebugUI& debugUI);
     void ListStartupSceneCandidates();
+
+    // PS.3 Project Settings draft. The startup scene above is a separate, immediately saved legacy section.
+    enum class ProjectSettingsCloseAction
+    {
+        None,
+        // The window's close button with unsaved changes.
+        CloseWindow,
+        // A held Exit, New Project or Open Project request with unsaved changes.
+        LeaveProject
+    };
+
+    std::optional<ProjectSettings> m_projectSettingsDraft;
+    std::optional<ProjectSettings> m_projectSettingsSaveRequest;
+    bool m_projectSettingsSavePending = false;
+    ProjectSettingsCloseAction m_projectSettingsCloseAction = ProjectSettingsCloseAction::None;
+    // The close action to finish once the requested save succeeds.
+    ProjectSettingsCloseAction m_projectSettingsCloseAfterSave = ProjectSettingsCloseAction::None;
+    std::size_t m_projectSettingsCategory = 0;
+    std::vector<std::string> m_projectSettingsCorrections;
+    std::string m_renderingSettingsMessage;
+    bool m_renderingSettingsMessageIsError = false;
+    void DrawStartupSceneSection(const IDemoScene& demoScene);
+    void DrawRenderingSettingsCategory(const DebugUI& debugUI, bool editable);
+    void DrawRenderingRuntimeStatus(const DebugUI& debugUI);
+    void DrawProjectSettingsCloseConfirmation();
+    void RequestProjectSettingsSave(ProjectSettingsCloseAction closeAfterSave);
+    void CloseProjectSettings();
+    // Why Save is unavailable; empty when it is available.
+    std::string ProjectSettingsSaveBlocker() const;
 
     // Windows .engineproj association: a personal Windows preference, separate from the project.
     bool m_showFileAssociation = false;

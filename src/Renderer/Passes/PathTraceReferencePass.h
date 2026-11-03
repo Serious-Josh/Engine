@@ -19,6 +19,7 @@
 #include <vector>
 #include <map>
 #include <memory>
+#include <set>
 
 class DescriptorHeap;
 class GraphicsDevice;
@@ -200,6 +201,10 @@ class PathTraceReferencePass
     // ER.1 Phase 2: every library the pipelines of a configuration acquire, RayQuery twins included, so the worker
     // can compile all of them before activation and no pipeline creation compiles on the render thread.
     std::vector<PathTraceLibraryRequirement> GetRequiredLibraries(const PathTraceLibraryNeeds& needs) const;
+
+    // PS.5B: the SM 6.6 libraries packaged games cook. GetRequiredLibraries for Reference and Path Tracing (Raster
+    // Primary + ReSTIR DI) with every path-tracing denoiser's extraction; no PSR or SHARC.
+    static std::vector<PathTraceLibraryRequirement> GetPackagedLibraries();
 
     // ER.1 Phase 4: every DXR pipeline the configuration's creation paths build (the same description builders), with
     // the RayQuery twin InitializeVisibilityPipelines pairs with each. Optional entries are twins.
@@ -477,6 +482,9 @@ class PathTraceReferencePass
         std::string& failureReason);
     // Whether the pair and the twins the current visibility selections need exist.
     bool IsPrimarySurfaceReplacementGBufferReady();
+    // PS.5C: the PSR.2 lighting pipelines exist (IsPrimarySurfaceReplacementGBufferReady also needs their RayQuery twins
+    // while the frame selects RayQuery visibility).
+    bool ArePrimarySurfaceReplacementGBufferPipelinesCreated() const { return m_psrGBufferPipelinesReady; }
     // PSR.2 Stage 3B: the pair's extraction counterparts, on first use: the extraction direct pass and the extraction
     // (or, with rawDiffuseHitDistance, raw-distance extraction) indirect pass, each split at the effective primary. A
     // failure is sticky per kind. ExecuteReSTIRDISplit with extraction then records them in place of the production
@@ -729,10 +737,21 @@ class PathTraceReferencePass
         ShaderLibraryCompileWorker& worker,
         const std::filesystem::path& path);
 
+    // PS.5B.1: PrepareLibrary in a packaged game. The cooked library is admitted (ShaderLibrary validates its
+    // container) and is then Ready like a compiled one; a failure is final for the session and reported once,
+    // a missing optional twin as the expected TraceRay fallback, anything else as an error.
+    ShaderLibraryPreparation PreparePackagedLibrary(
+        ShaderLibrary& shaderLibrary,
+        const std::filesystem::path& path,
+        bool optional);
+    void ReportMissingPackagedTwin(const std::filesystem::path& path);
+
     // Every primary shares PathTraceReference.hlsl except ReSTIR DI, so this holds at most two libraries
     // until Shutdown. Pipelines keep their own copies inside their state objects.
     std::vector<CompiledLibrary> m_libraries;
     std::vector<FailedLibrary> m_failedLibraries;
+    std::map<std::filesystem::path, std::string> m_packagedLibraryFailures;
+    std::set<std::string> m_reportedMissingTwins;
 
     Texture m_accumulationTexture;
     Texture m_outputTexture;

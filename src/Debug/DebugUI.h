@@ -6,6 +6,9 @@
 #include "Renderer/Passes/ToneMapPass.h"
 #include "Renderer/RendererLightingMode.h"
 #include "Renderer/LightingModeTransition.h"
+#include "Renderer/RenderingConfiguration.h"
+#include "Project/ProjectSettings.h"
+#include "Engine/RenderingOverrides.h"
 #include "GpuTimingMonitor.h"
 #include "GpuTimingGraph.h"
 #include "CpuFrameTiming.h"
@@ -27,12 +30,6 @@ struct HWND__;
 using HWND = HWND__*;
 
 class DescriptorHeap;
-
-enum class ReflectionDenoiserMode
-{
-    Nrd,
-    Native
-};
 
 class DebugUI
 {
@@ -79,14 +76,80 @@ class DebugUI
         m_framePacingMonitor.RecordGaps(results);
     }
     void RecordCpuFrameTiming(const CpuTiming::FrameSample& sample);
-    ReflectionDenoiserMode GetReflectionDenoiserMode() const
+    // PS.2C: the project's saved rendering settings (Engine supplies them every frame) and this session's
+    // Debug panel overrides. The panel's rendering controls show the effective values and edit only the
+    // overrides; nothing here writes ProjectSettings.json.
+    void SetSavedRenderingSettings(const RenderingSettings& saved)
     {
-        return static_cast<ReflectionDenoiserMode>(m_reflectionDenoiserMode);
+        m_savedRendering = saved;
     }
-    bool IsReflectionContributionLimiterEnabled() const
+    const RenderingSettings& GetSavedRenderingSettings() const
     {
-        return m_contributionLimiterEnabled;
+        return m_savedRendering;
     }
+    RenderingOverrides& GetRenderingOverrides()
+    {
+        return m_renderingOverrides;
+    }
+    const RenderingOverrides& GetRenderingOverrides() const
+    {
+        return m_renderingOverrides;
+    }
+    void ClearRenderingOverrides()
+    {
+        m_renderingOverrides = {};
+    }
+
+    // After a successful Project Settings save: the overrides the save decided are cleared, then the saved
+    // settings are replaced.
+    void OnProjectSettingsSaved(const RenderingSettings& previousSaved, const RenderingSettings& saved);
+
+    // Saved settings with the session overrides applied.
+    RenderingSettings GetEffectiveRenderingSettings() const;
+    // The panel's diagnostic controls and Debug-only Reference overrides.
+    RenderingDiagnostics GetRenderingDiagnostics() const;
+
+    // The effective settings resolved by the shared ResolveRenderingConfiguration.
+    RenderingConfiguration GetRenderingConfiguration() const;
+
+    // PS.3: read-only runtime status for other Editor views. Copies of what this panel already displays (renderer
+    // publications of the last frame); nothing is read back from the GPU and nothing here is saved.
+    struct RenderingStatus
+    {
+        LightingModeTransitionStatus transition;
+        std::uint32_t psrActiveChain = 0;
+        bool psrRequested = false;
+        std::string psrUnavailable;
+        std::string dlssState;
+        std::string dlssDetail;
+        bool pathTraceActiveLastFrame = false;
+        std::uint32_t accumulatedSamples = 0;
+        std::uint64_t accumulationBytes = 0;
+        std::string denoiserPreparation;
+        SharcStatus sharc;
+        std::string dedicatedCausticsReason;
+        bool dedicatedCausticsPresented = false;
+    };
+
+    RenderingStatus GetRenderingStatus() const
+    {
+        RenderingStatus status;
+        status.transition = m_lightingTransition;
+        status.psrActiveChain = m_psrActiveMode;
+        status.psrRequested = m_psrLightingRequested;
+        status.psrUnavailable = m_psrLightingUnavailable;
+        status.dlssState = m_dlssState;
+        status.dlssDetail = m_dlssDetail;
+        status.pathTraceActiveLastFrame = m_pathTraceActiveLastFrame;
+        status.accumulatedSamples = m_pathTraceAccumulatedSamples;
+        status.accumulationBytes = m_pathTraceResourceBytes;
+        status.denoiserPreparation = m_pathTraceDenoiserPreparation;
+        status.sharc = m_sharcStatus;
+        status.dedicatedCausticsReason = m_causticReason;
+        status.dedicatedCausticsPresented = m_causticPresented;
+        return status;
+    }
+
     ToneMapDebugView GetToneMapDebugView() const
     {
         return static_cast<ToneMapDebugView>(m_toneMapDebugView);
@@ -98,12 +161,6 @@ class DebugUI
     {
         m_psrLightingRequested = requested;
         m_psrLightingUnavailable = unavailable;
-    }
-    // PSR.2 development view; None when Off. The renderer applies it only to Path Tracing frames with in-place replacement.
-    ToneMapDebugView GetPsrDebugView() const
-    {
-        return m_psrDebugView == 0 ? ToneMapDebugView::None :
-            static_cast<ToneMapDebugView>(static_cast<int>(ToneMapDebugView::PsrReplacementMask) + m_psrDebugView - 1);
     }
 
     // The camera exposure state of the latest completed frame (GPU readback, a few frames old; display only).
@@ -121,23 +178,6 @@ class DebugUI
     void SetExposureDisplay(const ExposureDisplay& display) { m_exposureDisplay = display; }
     const ExposureDisplay& GetExposureDisplay() const { return m_exposureDisplay; }
 
-    // Final display tone mapper: Existing (default) or GT7; not saved.
-    ToneMapOperator GetToneMapOperator() const
-    {
-        return static_cast<ToneMapOperator>(m_toneMapOperator);
-    }
-
-    // RTXPT D.3B.0 path-trace denoiser diagnostic view (the setter serves automated diagnostics).
-    PathTraceDenoiserVisualization GetPathTraceDenoiserVisualization() const
-    {
-        return m_pathTraceDenoiserVisualization;
-    }
-
-    void SetPathTraceDenoiserVisualization(const PathTraceDenoiserVisualization& visualization)
-    {
-        m_pathTraceDenoiserVisualization = visualization;
-    }
-
     bool IsShadingNormalCorrectionEnabled() const
     {
 #ifndef NDEBUG
@@ -147,90 +187,16 @@ class DebugUI
 #endif
     }
 
-    bool IsRTGIEnabled() const
-    {
-        return m_rtgiEnabled;
-    }
-    float GetRTGIContactAOStrength() const
-    {
-        return m_rtgiContactAOStrength;
-    }
-    float GetRTGIContactAORadius() const
-    {
-        return m_rtgiContactAORadius;
-    }
-
-    // RTXPT.1 experimental lighting mode. Session-only Editor state: never saved to preferences,
-    // scenes or projects, and Legacy whenever the Editor starts.
-    RendererLightingMode GetLightingMode() const
-    {
-        switch (m_lightingMode)
-        {
-        case 1:
-            return RendererLightingMode::PathTracedReference;
-        case 3:
-            return RendererLightingMode::PathTracedRasterPrimaryReSTIRDI;
-        default:
-            return RendererLightingMode::Legacy;
-        }
-    }
-
-    PathTraceReferenceSettings GetPathTraceReferenceSettings() const;
-
-    // SHARC.4E experimental cached-radiance rendering (the raster-primary path-traced modes), and its last statistics.
-    SharcSettings GetSharcSettings() const;
+    // SHARC.4E cached-radiance statistics of the last frame.
     void SetSharcStatus(const SharcStatus& status)
     {
         m_sharcStatus = status;
     }
 
-    // SHARC.4E.1: the path-tracing denoiser (Path Traced Raster Primary, and with ReSTIR DI since SHARC.5B). NRD.2: a
-    // mode; Off outside those lighting modes.
-    PathTraceDenoiserMode GetPathTraceDenoiserMode() const
-    {
-        return m_lightingMode == 3 ? GetSelectedPathTraceDenoiserMode() : PathTraceDenoiserMode::Off;
-    }
-
-    // The selector's value: the explicit choice, or Path Tracing's default (Hybrid) until one is made.
+    // The selector's value: the effective Path Tracing denoiser (the enums share their order).
     PathTraceDenoiserMode GetSelectedPathTraceDenoiserMode() const
     {
-        return m_pathTraceDenoiserMode.value_or(PathTraceDenoiserMode::NrdHybrid);
-    }
-
-    // DENOISE.1: the denoiser stages to run (diagnostics; the defaults are the production pipeline).
-    PathTraceDenoiserStages GetPathTraceDenoiserStages() const
-    {
-        return m_pathTraceDenoiserStages;
-    }
-
-    // R.9I.3: experimental dedicated additive caustics in the path-traced modes (off by default, not saved).
-    bool IsDedicatedCausticsEnabled() const
-    {
-        return m_dedicatedCaustics && (m_lightingMode == 1 || m_lightingMode == 3);
-    }
-
-    bool IsCausticOnlyView() const
-    {
-        return m_causticOnlyView;
-    }
-
-    // R.9I.3: experimental pixel-centred caustics in Raster Primary + ReSTIR DI (off by default, not saved). Never
-    // enabled together with Dedicated caustics above.
-    bool IsPixelCentredCausticsEnabled() const
-    {
-        return m_pixelCentredCaustics && m_lightingMode == 3;
-    }
-
-    // P2: add the caustics to the lighting before denoising (off by default, not saved).
-    bool IsPixelCausticInsertionEnabled() const
-    {
-        return m_pixelCentredCaustics && m_pixelCausticInsertion;
-    }
-
-    // 0 the ordinary image; 1 diffuse, 2 specular, 3 combined caustic radiance; 4 validity (PixelCausticView).
-    std::uint32_t GetPixelCausticView() const
-    {
-        return m_pixelCentredCaustics ? m_pixelCausticView : 0u;
+        return static_cast<PathTraceDenoiserMode>(GetEffectiveRenderingSettings().pathTracing.denoiser);
     }
 
     void SetPixelCausticsStatus(const std::string& reason, std::uint64_t verifiedSeams, std::uint64_t seamVisits,
@@ -262,50 +228,18 @@ class DebugUI
         m_causticResourceBytes = resourceBytes;
     }
 
-    // UPSCALING.2B: experimental camera jitter in the raster-primary path-traced modes (off by default, not saved).
-    bool IsPathTraceCameraJitterEnabled() const
-    {
-        return m_pathTraceCameraJitter && m_lightingMode == 3;
-    }
-
-    // UPSCALING.2C: the experimental 75% render scale in the raster-primary path-traced modes (off by default, not
-    // saved). Other modes always render at the output extent.
-    bool IsPathTraceReducedRenderScale() const
-    {
-        return GetPathTraceRenderScaleIndex() != 0;
-    }
-
-    // UPSCALING.3C/3D: whether the reduced scale is a DLSS mode (the diagnostic 75% one or a preset).
-    bool IsPathTraceDlssSelected() const
-    {
-        return GetPathTraceRenderScaleIndex() >= 2;
-    }
-
-    // UPSCALING.3D: the selected render-scale entry in the raster-primary path-traced modes (0 otherwise): 0 Native,
-    // 1 bilinear 75%, 2 DLSS 75% (diagnostic), 3 DLSS Quality, 4 DLSS Balanced, 5 DLSS Performance.
-    int GetPathTraceRenderScaleIndex() const
-    {
-        return m_lightingMode == 3 ? (m_dlssEnabled ? 3 + m_dlssQuality : m_pathTraceRenderScale) : 0;
-    }
-
-    bool IsNormalDlssRequested() const { return m_dlssEnabled; }
+    // DLSS eligibility against the transition and denoiser state last published to the panel (the shared rules).
     bool IsDlssConfigurationEligible() const
     {
-        return m_lightingMode == 3 && m_lightingTransition.active == GetLightingMode() &&
-            GetPathTraceDenoiserMode() != PathTraceDenoiserMode::Off && m_pathTraceDenoiserPreparation.empty();
+        return ::IsDlssConfigurationEligible(GetRenderingConfiguration(), m_lightingTransition.active,
+            !m_pathTraceDenoiserPreparation.empty());
     }
     bool IsDlssPreparing() const
     {
-        return m_lightingMode == 3 && GetPathTraceDenoiserMode() != PathTraceDenoiserMode::Off &&
-            (m_lightingTransition.active != GetLightingMode() || !m_pathTraceDenoiserPreparation.empty());
+        return ::IsDlssPreparing(GetRenderingConfiguration(), m_lightingTransition.active,
+            !m_pathTraceDenoiserPreparation.empty());
     }
     bool ConsumeDlssRetry() { return std::exchange(m_dlssRetry, false); }
-
-    // UPSCALING.3B: diagnostic DLSS input preparation (off by default, not saved). It never evaluates DLSS.
-    bool IsDlssInputPreparationEnabled() const
-    {
-        return m_dlssInputPreparation;
-    }
 
     // DLSS capability, requested/effective state and retry eligibility, refreshed by the renderer.
     void SetDlssReadout(std::string state, std::string detail, bool canRetry = false)
@@ -400,6 +334,43 @@ class DebugUI
     }
 
     private:
+    // Views of GetRenderingConfiguration for the panel's own status and timing displays.
+    RendererLightingMode GetLightingMode() const
+    {
+        return GetRenderingConfiguration().lightingMode;
+    }
+    PathTraceReferenceSettings GetPathTraceReferenceSettings() const
+    {
+        return GetRenderingConfiguration().pathTrace;
+    }
+    SharcSettings GetSharcSettings() const
+    {
+        return GetRenderingConfiguration().sharc;
+    }
+    PathTraceDenoiserMode GetPathTraceDenoiserMode() const
+    {
+        return GetRenderingConfiguration().denoiser;
+    }
+    int GetPathTraceRenderScaleIndex() const
+    {
+        return GetRenderingConfiguration().renderScaleIndex;
+    }
+
+    // Typed override controls: each shows value, writes the override only when edited, marks a present
+    // override (with a button that restores the project value) and returns the value after the edit.
+    bool OverrideCheckbox(const char* label, bool value, std::optional<bool>& slot, RenderingOverrideField field);
+    float OverrideSliderFloat(const char* label, float value, float minimum, float maximum, const char* format,
+        int flags, std::optional<float>& slot, RenderingOverrideField field);
+    std::uint32_t OverrideSliderUInt(const char* label, std::uint32_t value, int minimum, int maximum, int flags,
+        std::optional<std::uint32_t>& slot, RenderingOverrideField field);
+    template<typename Enum>
+    Enum OverrideCombo(const char* label, Enum value, const char* const* items, int count, std::optional<Enum>& slot,
+        RenderingOverrideField field);
+    void DrawOverrideMarker(RenderingOverrideField field);
+
+    RenderingSettings m_savedRendering;
+    RenderingOverrides m_renderingOverrides;
+
     bool m_showRenderingSettings = false;
     bool m_showPassTimings = false;
 
@@ -417,9 +388,6 @@ class DebugUI
     void DrawGpuTimingMonitor(const GpuTimestampProfiler::Results& results);
     GpuTimingMonitor m_gpuTimingMonitor;
     GpuTimingMonitor m_visibilityTimings;
-    bool m_primarySurfaceReplacementInPlace = PathTraceReferenceSettings{}.primarySurfaceReplacementInPlace;
-    std::uint32_t m_primarySurfaceReplacementChain = PathTraceReferenceSettings{}.primarySurfaceReplacementChain;
-    int m_psrDebugView = 0; // Off, Replacement Mask, Reflected Normals, Reflected Albedo.
     std::uint32_t m_psrActiveMode = 0;
     bool m_psrLightingRequested = false;
     std::string m_psrLightingUnavailable;
@@ -488,11 +456,6 @@ class DebugUI
     bool m_tlasUpdated = false;
 
     int m_toneMapDebugView = 0;
-    PathTraceDenoiserVisualization m_pathTraceDenoiserVisualization{};
-    int m_reflectionDenoiserMode = static_cast<int>(ReflectionDenoiserMode::Nrd);
-
-    bool m_contributionLimiterEnabled = true;
-
     std::uint64_t m_totalTLASUpdates = 0;
 
     int m_requestedEnvironmentIndex = -1;
@@ -500,23 +463,12 @@ class DebugUI
 #ifndef NDEBUG
     bool m_shadingNormalCorrectionEnabled = true;
 #endif
-    bool m_rtgiEnabled = true;
-
-    float m_rtgiContactAOStrength = 1.0f;
-    float m_rtgiContactAORadius = 2.5f;
-
-    int m_lightingMode = 0;
     ExposureDisplay m_exposureDisplay;
-    int m_toneMapOperator = 0;
     bool m_referenceRayCountsEnabled = false;
     ReferenceRayCountResult m_referenceRayCounts{};
-    int m_pathTraceSamplesPerFrame = 1;
-    int m_pathTraceMaxPathDepth = 3;
-    int m_pathTraceRussianRouletteDepth = 3;
-    int m_pathTraceMaxAccumulatedSamples = 1 << 16;
 
-    // SHARC.4E: indices into the density (5x5, 8x8) and minimum-sample (8, 16, 32, 64, 256) choices.
-    bool m_sharcEnabled = false;
+    // SHARC.4E tuning (Debug-only): indices into the density (5x5, 8x8) and minimum-sample (8, 16, 32, 64, 256)
+    // choices. Enabling SHARC is a project setting.
     int m_sharcDensity = 0;
     int m_sharcMinimumSamples = 3;
     bool m_sharcFreezeTraining = false;
@@ -526,16 +478,10 @@ class DebugUI
     bool m_sharcHistoryPrior = false;
     SharcStatus m_sharcStatus;
     void DrawSharcSettings();
-    // SHARC.4E.1: the path-tracing denoiser in the raster-primary path-traced modes. Empty until the user (or a
-    // verification) chooses one; GetSelectedPathTraceDenoiserMode supplies Path Tracing's default meanwhile.
-    std::optional<PathTraceDenoiserMode> m_pathTraceDenoiserMode;
     std::string m_pathTraceNrdStatus;
     std::string m_pathTraceDenoiserPreparation;
     PathTraceDenoiserStages m_pathTraceDenoiserStages{};
-    bool m_pathTraceCameraJitter = false;
     std::string m_dlssState = "Not initialized";
-    bool m_dlssEnabled = false;
-    int m_dlssQuality = 0;
     bool m_dlssRetry = false;
     bool m_dlssCanRetry = false;
     bool m_dlssInputPreparation = false;
@@ -553,8 +499,6 @@ class DebugUI
     bool m_pathTraceActiveLastFrame = false;
     std::uint32_t m_pathTraceAccumulatedSamples = 0;
     std::uint64_t m_pathTraceResourceBytes = 0;
-    bool m_dedicatedCaustics = false;
-    bool m_pixelCentredCaustics = false;
     std::string m_pixelCausticReason;
     std::uint64_t m_pixelCausticVerifiedSeams = 0;
     std::uint64_t m_pixelCausticSeamVisits = 0;
@@ -564,7 +508,6 @@ class DebugUI
     std::uint64_t m_pixelCausticResourceBytes = 0;
     std::uint32_t m_pixelCausticView = 0;
     bool m_pixelCausticInsertion = false;
-    bool m_causticOnlyView = false;
     bool m_causticAcknowledgeRequested = false;
     std::string m_causticReason;
     bool m_causticPresented = false;

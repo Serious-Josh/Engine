@@ -198,6 +198,22 @@ bool Editor::TakeApplicationCloseApproval()
 
 std::optional<Editor::FileRequest> Editor::TakeFileRequest()
 {
+    // PS.3: leaving the project (Exit, New or Open Project) with an unsaved Project Settings draft asks first; the
+    // request stays held until the draft is saved or discarded, and Keep Editing drops it.
+    const bool leavesProject = m_fileRequest && (m_fileRequest->type == FileRequestType::Exit ||
+        m_fileRequest->type == FileRequestType::NewProject || m_fileRequest->type == FileRequestType::OpenProject);
+
+    if(leavesProject && HasUnsavedProjectSettings())
+    {
+        if(m_projectSettingsCloseAction == ProjectSettingsCloseAction::None && !m_projectSettingsSavePending)
+        {
+            m_projectSettingsCloseAction = ProjectSettingsCloseAction::LeaveProject;
+            m_showProjectSettings = true;
+        }
+
+        return std::nullopt;
+    }
+
     if(m_fileRequest && (m_fileRequest->type != FileRequestType::Save && m_fileRequest->type != FileRequestType::SaveAs) &&
         m_inspectorPanel.HasUnsavedChanges())
     {
@@ -236,9 +252,9 @@ bool Editor::HasFileRequest(FileRequestType type) const noexcept
     return m_fileRequest && m_fileRequest->type == type;
 }
 
-void Editor::DrawLifecycleWindows(const IDemoScene& demoScene)
+void Editor::DrawLifecycleWindows(const IDemoScene& demoScene, const DebugUI& debugUI)
 {
-    DrawProjectSettings(demoScene);
+    DrawProjectSettings(demoScene, debugUI);
     DrawFileAssociation();
     DrawProjectOwnershipLost();
 
@@ -319,12 +335,6 @@ void Editor::DrawMainMenu(
             QueueFileRequest(FileRequest{FileRequestType::OpenProject, {}});
         }
 
-        if(ImGui::MenuItem("Project Settings"))
-        {
-            m_showProjectSettings = true;
-            m_startupSceneCandidatesListed = false;
-        }
-
         ImGui::Separator();
 
         if(ImGui::MenuItem("Exit"))
@@ -333,6 +343,17 @@ void Editor::DrawMainMenu(
         }
 
         ImGui::EndDisabled();
+        ImGui::EndMenu();
+    }
+
+    // PS.3: Edit holds the project-wide settings (File keeps scene and project lifecycle).
+    if(ImGui::BeginMenu("Edit"))
+    {
+        if(ImGui::MenuItem("Project Settings"))
+        {
+            OpenProjectSettings();
+        }
+
         ImGui::EndMenu();
     }
 
@@ -792,7 +813,7 @@ const EditorWorkspaceRect& Editor::PrepareWorkspace(
 {
     ViewportCameraInput::ReserveLeftButton(m_cameraLooking, m_panLeftHeld);
     DrawMainMenu(demoScene, sceneManager, debugUI);
-    DrawLifecycleWindows(demoScene);
+    DrawLifecycleWindows(demoScene, debugUI);
 
     // Save is application-wide even when an input owns keyboard focus. The Engine applies
     // the same eligibility and persistence path as File -> Save Scene.

@@ -35,6 +35,7 @@
 #include "Caustics/PixelCausticPass.h"
 
 #include "Debug/DebugUI.h"
+#include "RenderingConfiguration.h"
 
 #include "Math/Vector3.h"
 #include "Math/Matrix4.h"
@@ -131,6 +132,16 @@ struct RendererOptions
 
     float rtgiContactAOStrength = 1.0f;
     float rtgiContactAORadius = 2.5f;
+
+    // Legacy reflection denoising (PS.2B: formerly read from the Debug panel by the renderer).
+    ReflectionDenoiserMode reflectionDenoiser = ReflectionDenoiserMode::Nrd;
+    bool contributionLimiter = true;
+
+    // PSR.2 development view; None when Off. Applied only to Path Tracing frames with in-place replacement.
+    ToneMapDebugView psrDebugView = ToneMapDebugView::None;
+
+    // RTXPT D.3B.0 path-trace denoiser diagnostic view (Normal: the production presentation).
+    PathTraceDenoiserVisualization pathTraceDenoiserVisualization{};
 
     // Checked view for this frame (BuildFlyRenderView/ResolveMainCameraView). Absent: the scene's
     // Editor fly camera, unchanged. Copied by value; the renderer retains only its identity.
@@ -436,6 +447,8 @@ class Renderer
     // UPSCALING.3C: whether the last frame was reconstructed by DLSS, and why not when DLSS was requested.
     bool IsDlssActiveLastFrame() const noexcept { return m_dlssActiveLastFrame; }
     const char* GetDlssInactiveReason() const noexcept { return m_dlssInactiveReason; }
+    // PS.5E: the scheduled Native fallback's stage and detail; empty while DLSS has not failed.
+    const std::string& GetDlssFailure() const noexcept { return m_dlssFailure; }
     const DlssFeatureStatus& GetDlssFeatureStatus() const noexcept { return m_dlssBackend.GetFeatureStatus(); }
 
     // UPSCALING.3C: NGX InJitterOffset = DlssJitterSign * CameraJitterStatus (per axis). Verified by the jitter-sign
@@ -445,7 +458,7 @@ class Renderer
 
     const CameraJitterStatus& GetCameraJitterStatus() const noexcept { return m_cameraJitterStatus; }
 
-    // UPSCALING.3A: what the DLSS Super Resolution backend found at initialization (Editor only; informational).
+    // UPSCALING.3A: what the DLSS Super Resolution backend found at initialization (informational).
     const DlssStatus& GetDlssStatus() const noexcept { return m_dlssBackend.GetStatus(); }
 
     // Copied evidence of the most recently recorded frame view (identity and matrices) and the
@@ -458,6 +471,15 @@ class Renderer
     const DirectionalLight& GetRecordedSun() const noexcept { return m_recordedSun; }
     std::uint32_t GetRecordedAdditionalLightCount() const noexcept { return m_recordedAdditionalLightCount; }
     const PathTraceReferenceStatus& GetPathTraceReferenceStatus() const noexcept { return m_pathTraceStatus; }
+    // PS.5C: the last recorded frame's PSR: whether it was requested, the replacement chain that actually ran (0: none)
+    // and why the requested PSR lighting is unavailable (empty while it runs). The same values DebugUI shows.
+    struct PsrStatus
+    {
+        bool requested = false;
+        std::uint32_t activeChain = 0;
+        std::string unavailable;
+    };
+    const PsrStatus& GetPsrStatus() const noexcept { return m_psrStatus; }
     // SHARC.4E: the cache's statistics for the Editor (two frames old; valid only with SharcSettings::statistics).
     const SharcStatus& GetSharcStatus() const noexcept { return m_sharcStatus; }
     // The shared raster-primary prerequisites (PathTracedRasterPrimary), ReSTIR DI's effective availability, and both.
@@ -470,6 +492,12 @@ class Renderer
     {
         return m_rasterPrimaryStatus;
     }
+    // ER.1 Phase 2: why the selected path-tracing denoiser is not active yet; empty otherwise.
+    const std::string& GetDenoiserPreparation() const noexcept { return m_denoiserPreparation; }
+    // PS.5B: the effective path-tracing denoiser, and why it cannot denoise (empty while it does): a creation failure
+    // of the Engine denoiser's passes, which every denoiser presents through or falls back to, or the NRD fallback.
+    PathTraceDenoiserMode GetPathTraceDenoiserMode() const noexcept { return m_pathTraceDenoiserMode; }
+    std::string GetPathTraceDenoiserFailure() const;
     // Async DXR preparation: requested versus active lighting mode and the real preparation stage.
     const LightingModeTransitionStatus& GetLightingModeTransitionStatus() const noexcept
     {
@@ -1607,6 +1635,9 @@ class Renderer
     // PSR.2 Stage 2 development prototype (PathTraceReferenceSettings::primarySurfaceReplacementInPlace).
     PsrInPlaceReplacePass m_psrInPlaceReplacePass;
     std::shared_ptr<PsrPipelinePreparation> m_psrPreparedAuxiliary;
+    // PS.5C: a packaged game's cooked shader bootstrap, shared with the PSR auxiliary job (null in the Editor).
+    std::shared_ptr<const std::vector<std::byte>> m_packagedShaderPayload;
+    PsrStatus m_psrStatus;
     bool m_psrAuxiliaryReady = false;
     bool m_psrAuxiliaryFailed = false;
     std::uint32_t m_psrActiveChain = 0;
@@ -1949,6 +1980,8 @@ class Renderer
     // path-tracing frame presented a scalar view (shown without tone mapping). A view other than Normal runs the
     // spatial dispatch for display only, on frames that ran the temporal pass; it changes no history.
     PathTraceDenoiserVisualization m_pathTraceVisualization{};
+    // PS.2B: this frame's requested view (RendererOptions::pathTraceDenoiserVisualization).
+    PathTraceDenoiserVisualization m_requestedPathTraceVisualization{};
     bool m_pathTraceScalarViewLastFrame = false;
 #if PATH_TRACE_SHARC_SPATIAL_DIAGNOSTIC != 0
     bool m_sharcDiagnosticPresentedThisFrame = false;
@@ -2276,6 +2309,9 @@ class Renderer
     // pass that accepts its results.
     std::unique_ptr<ShaderLibraryCompileWorker> m_shaderCompileWorker;
     bool m_shaderCompileWorkerRunning = false;
+    // PS.5B.1: DXR libraries and pipelines are prepared off the render thread (the Editor's compile worker, or a
+    // packaged game's pipeline worker over its cooked libraries); lighting modes then activate only once ready.
+    bool m_asynchronousDxrPreparation = false;
     // ER.1 Phase 4: DXR pipeline creation off the render thread (state objects and shader tables); joined in Shutdown
     // before the pass and the device.
     std::unique_ptr<RayTracingPipelineWorker> m_pipelineWorker;
@@ -2582,6 +2618,9 @@ class Renderer
     // Diagnostics only (UPSCALING.3C.2): when set, each frame copies the final scene image as it is before the Editor
     // overlays (grid, colliders) into this target of the same extent and format. Null in production: no commands.
     RenderTarget* m_preOverlayCopyForTesting = nullptr;
+    // Diagnostics only (PS.5F): when set, each packaged frame copies its back buffer after tone mapping, before
+    // Present, into this target of the application extent and the swap chain's format. Null in production.
+    RenderTarget* m_packagedPresentCopyForTesting = nullptr;
     // Records the DLSS evaluation of a prepared Dlss75 frame into m_presentationColor; false leaves the resolve's colour.
     bool RecordDlssEvaluation(ID3D12GraphicsCommandList* commandList, unsigned int frameIndex);
     void PublishDlssReadout();

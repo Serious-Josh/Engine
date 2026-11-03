@@ -339,6 +339,14 @@ class Engine
     bool AdmitPackagedMainCamera(const FileSceneRuntime& runtime, std::uint32_t payloadVersion, std::string& error);
     bool m_packagedMainCamera = false;
 
+    // PS.4: the packaged game's rendering configuration, resolved once in preflight from its cooked Project
+    // Settings (no session overrides), and the last requested/effective lighting report logged.
+    RenderingConfiguration m_packagedRenderingConfiguration;
+    ProjectLightingMode m_packagedRequestedLightingMode = ProjectLightingMode::Legacy;
+    std::string m_packagedLightingReport;
+    bool m_packagedFirstPathTraceImageLogged = false;
+    void ReportPackagedLightingMode(double renderMilliseconds);
+
     // Checked insertion of one new authored object at the end of the scene, selected after
     // creation, as one history entry. prepareObject builds it from the captured document.
     using PrepareCreatedObject = std::function<bool(const std::filesystem::path& project, const SceneDocument& document,
@@ -381,6 +389,10 @@ class Engine
     // Validates scene as the active project's game startup scene (an empty path clears the
     // setting) and persists it to the locked manifest; the context changes only after success.
     bool SetProjectStartupScene(const std::filesystem::path& scene, std::string& message);
+
+    // PS.1 explicit save of the active project's ProjectSettings.json, under the same Editor, lock
+    // and ownership rules as the startup scene. Nothing else writes the file.
+    bool SaveProjectSettings(const ProjectSettings& settings, std::string& message);
 
     // Fail-closed state after full manifest ownership (lock + verified pin) could not be confirmed.
     // Project writes, scene lifecycle, builds and file-drop imports are refused; the Editor shows a

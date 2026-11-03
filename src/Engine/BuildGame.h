@@ -1,13 +1,15 @@
 #pragma once
 #include "Scene/SceneDocument.h"
 #include "assets/ProjectAssetRegistry.h"
+#include "Project/ProjectSettings.h"
 #include <filesystem>
 #include <memory>
 #include <thread>
 namespace BuildGame
 {
 struct Settings { std::string title="MyGame"; std::filesystem::path output; bool advanced=false; };
-struct Request { Settings settings; SceneDocument document; ProjectAssetRegistry registry; std::filesystem::path project, shaderRoot, runtimeDirectory; };
+// projectSettings: the last successfully saved Project Settings (PackagedRenderingSettings::SelectBuildSource).
+struct Request { Settings settings; SceneDocument document; ProjectAssetRegistry registry; std::filesystem::path project, shaderRoot, runtimeDirectory; ProjectSettings projectSettings; };
 struct Status { bool busy=false, success=false; float progress=0; std::string message="Ready."; };
 bool ValidateTitle(std::string_view title, std::string& error);
 AssetID SceneIdentity(std::string_view persistentID);

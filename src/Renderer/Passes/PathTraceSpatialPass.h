@@ -34,6 +34,8 @@ struct PathTraceDenoiserVisualization
     float differenceAmplification = 16.0f;
     // The uncertainty view maps log10(sigma / Y) from this floor (blue) to 0 (red).
     float uncertaintyFloorLog10 = -3.0f;
+
+    bool operator==(const PathTraceDenoiserVisualization&) const = default;
 };
 
 // DENOISE.1 diagnostic stage isolation (PT denoiser settings). The defaults are the production pipeline: temporal
@@ -58,6 +60,8 @@ struct PathTraceDenoiserStages
     std::uint32_t historyResetRequest = 0;
     // DENOISE.3B (experimental): extended diffuse history while the scene and view stay unchanged.
     bool extendedDiffuseHistory = false;
+
+    bool operator==(const PathTraceDenoiserStages&) const = default;
 };
 
 // Views shown as display-encoded colours without tone mapping.
@@ -172,6 +176,12 @@ class PathTraceSpatialPass
     bool IsInitialized() const
     {
         return m_initialized;
+    }
+
+    // PS.5B: a sticky creation failure of the filter or its a-trous pipelines (the denoiser cannot run them).
+    bool HasInitializationFailed() const
+    {
+        return m_initializationFailed || m_atrousInitializationFailed;
     }
 
     // Records the filter. The inputs must be shader-readable and the output an unordered-access view; the caller

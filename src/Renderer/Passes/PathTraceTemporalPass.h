@@ -149,6 +149,12 @@ class PathTraceTemporalPass
         return m_initialized;
     }
 
+    // PS.5B: a sticky creation failure (the Engine denoiser cannot run).
+    bool HasInitializationFailed() const
+    {
+        return m_initializationFailed;
+    }
+
     bool HasHistory() const
     {
         return m_historyValid;

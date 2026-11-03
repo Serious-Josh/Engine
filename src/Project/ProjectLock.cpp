@@ -556,6 +556,11 @@ ProjectLock::Publication ProjectLock::ReplaceManifest(std::string_view contents,
     return Publication::Published;
 }
 
+bool ProjectLock::IsLockFor(const std::filesystem::path& manifestPath) const
+{
+    return IsFullyOwned() && PathNamesFile(manifestPath, static_cast<HANDLE>(m_lockHandle));
+}
+
 bool ProjectLock::IsFullyOwned() const
 {
     return m_lockHandle && m_pinHandle && SameFile(m_pinHandle, m_lockHandle) &&

@@ -215,6 +215,8 @@ namespace ProjectLoader
             return std::nullopt;
         }
 
+        // Read-only and never fatal: an unusable ProjectSettings.json falls back to defaults.
+        context.LoadProjectSettings();
         return OpenedProject{std::move(context), std::move(lock)};
     }
 }
