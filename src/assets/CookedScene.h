@@ -25,7 +25,9 @@ namespace CookedScene
     inline constexpr std::uint32_t CameraExposureVersion = 15;
     // AS.5 Script component per object (enabled, script asset reference, class name).
     inline constexpr std::uint32_t ScriptVersion = 16;
-    inline constexpr std::uint32_t Version = ScriptVersion;
+    // Audio.2A Audio Source and Audio Listener components per object.
+    inline constexpr std::uint32_t AudioVersion = 17;
+    inline constexpr std::uint32_t Version = AudioVersion;
 
     constexpr bool IsSupportedVersion(std::uint32_t version)
     {
@@ -44,7 +46,8 @@ namespace CookedScene
             version == ObjectLightingVersion ||
             version == PhysicalLightingVersion ||
             version == CameraExposureVersion ||
-            version == ScriptVersion;
+            version == ScriptVersion ||
+            version == AudioVersion;
     }
     struct Policy
     {

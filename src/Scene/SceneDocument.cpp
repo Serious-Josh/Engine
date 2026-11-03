@@ -3,6 +3,7 @@
 #include "Scene/SceneHierarchyTransforms.h"
 #include "assets/AssetID.h"
 
+#include <algorithm>
 #include <cmath>
 #include <unordered_set>
 
@@ -196,6 +197,58 @@ bool ValidateScriptComponent(const ScriptComponent& script, std::string* error)
     return reason == nullptr;
 }
 
+bool ValidateAudioSourceComponent(const AudioSourceComponent& source, std::string* error)
+{
+    if(error)
+    {
+        error->clear();
+    }
+
+    const char* reason = nullptr;
+    const std::string& guid = source.eventGuid;
+
+    // FMOD Studio's GUID text: {8-4-4-4-12 hex digits}. Checked lexically; whether a bank defines it is Play's concern.
+    if(!guid.empty())
+    {
+        bool lexical = guid.size() == 38 && guid.front() == '{' && guid.back() == '}';
+
+        for(std::size_t index = 1; lexical && index + 1 < guid.size(); ++index)
+        {
+            const char character = guid[index];
+            const bool dash = index == 9 || index == 14 || index == 19 || index == 24;
+            const bool hex = (character >= '0' && character <= '9') || (character >= 'a' && character <= 'f') ||
+                (character >= 'A' && character <= 'F');
+            lexical = dash ? character == '-' : hex;
+        }
+
+        if(!lexical)
+        {
+            reason = "Audio Source event must be empty or an FMOD GUID {xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}.";
+        }
+    }
+
+    if(!reason && !source.eventPath.empty() &&
+        (!source.eventPath.starts_with("event:/") || source.eventPath.size() > AudioSourceComponent::MaximumEventPathBytes))
+    {
+        reason = "Audio Source event path must be empty or an \"event:/...\" path of at most 512 bytes.";
+    }
+
+    if(!reason && std::any_of(source.eventPath.begin(), source.eventPath.end(), [](unsigned char character)
+        {
+            return character < 32;
+        }))
+    {
+        reason = "Audio Source event path must not contain control characters.";
+    }
+
+    if(reason && error)
+    {
+        *error = reason;
+    }
+
+    return reason == nullptr;
+}
+
 bool ValidateSceneObjectComponents(const SceneObjectDocument& object, std::string* errorMessage)
 {
     if(errorMessage)
@@ -228,6 +281,11 @@ bool ValidateSceneObjectComponents(const SceneObjectDocument& object, std::strin
     if(object.script && !ValidateScriptComponent(*object.script, &componentError))
     {
         return Fail(errorMessage, "Invalid Script for object " + object.id + ": " + componentError);
+    }
+
+    if(object.audioSource && !ValidateAudioSourceComponent(*object.audioSource, &componentError))
+    {
+        return Fail(errorMessage, "Invalid Audio Source for object " + object.id + ": " + componentError);
     }
 
     if(object.physics && !Physics::ValidatePhysicsComponent(*object.physics, &componentError))

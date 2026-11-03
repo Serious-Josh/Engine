@@ -19,6 +19,7 @@
 #include "Project/ProjectContext.h"
 #include "Debug/EditorPhaseTiming.h"
 #include "Scripting/ScriptHost.h"
+#include "Audio/AudioSystem.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -119,6 +120,13 @@ public:
     bool NeedsThumbnailReset() const
     {
         return m_assetBrowser.NeedsThumbnailReset();
+    }
+
+    // Audio.2B: the process's AudioSystem, read-only, for the Audio Source event picker. Null or not running shows
+    // the inspector without event names.
+    void SetAudioSystem(const Audio::AudioSystem* audio) noexcept
+    {
+        m_audioSystem = audio;
     }
 
     bool TakeScriptRefreshRequest()
@@ -729,8 +737,19 @@ private:
     // Session-only display preference like Camera Frusta; never authored or persisted.
     bool m_showLightWireframes = true;
     bool m_showLightIcons = true;
+    bool m_showAudioIcons = true;
     bool m_showCameraIcons = true;
     std::vector<ViewportIcons::Icon> m_viewportIcons;
+    // Audio.2B: facing direction of each visible Audio Listener icon; the active listener is highlighted.
+    struct ViewportListenerFacing
+    {
+        ImVec2 start;
+        ImVec2 end;
+        bool active = false;
+    };
+    std::vector<ViewportListenerFacing> m_viewportListenerFacings;
+    // The active listener's runtime slot: its icon is tinted, since a facing line along the view is foreshortened.
+    std::optional<size_t> m_viewportActiveListener;
     ImDrawListSplitter m_viewportIconLayers;
     const Scene* m_viewportIconScene = nullptr;
     std::uint64_t m_viewportIconRuntime = 0;
@@ -971,6 +990,52 @@ private:
     };
     std::optional<ScriptClassList> m_scriptClasses;
     std::unique_ptr<Scripting::ScriptHost> m_scriptValidator;
+    // Audio.2B: one complete replacement of an object's Audio Source and Audio Listener (add, field edit, remove of
+    // either) per entry.
+    struct AudioComponentsEdit
+    {
+        SceneHistorySession session;
+        std::string objectID;
+        AudioComponentState before;
+        AudioComponentState after;
+    };
+    enum class AudioComponentKind
+    {
+        Source,
+        Listener
+    };
+    void DrawObjectAudioControls(IDemoScene& scene);
+    void DrawAudioSourceControls(IDemoScene& scene, const SceneObjectMetadata& selection,
+        const SceneObjectDocument& object, bool blocked);
+    void DrawAudioListenerControls(IDemoScene& scene, const SceneObjectMetadata& selection,
+        const SceneObjectDocument& object, bool blocked);
+    // Opens the "..." header menu of one audio component; returns true when it removed the component.
+    bool DrawAudioComponentMenu(IDemoScene& scene, const SceneObjectMetadata& selection, AudioComponentKind kind,
+        bool blocked);
+    void DrawAudioEventPicker(IDemoScene& scene, const SceneObjectMetadata& selection, const SceneObjectDocument& object);
+    bool CommitObjectAudio(IDemoScene& scene, const SceneObjectMetadata& selection, const AudioComponentState& before,
+        const AudioComponentState& after);
+    static size_t AudioEditPayloadBytes(const AudioComponentsEdit& edit);
+    // What the Inspector shows for an Audio Source's event, judged against the loaded banks.
+    struct AudioEventDescription
+    {
+        std::string text;
+        std::string status;
+        bool flat = false;
+    };
+    static AudioEventDescription DescribeAudioEvent(const AudioSourceComponent& source, const Audio::AudioSystem* audio);
+    // Gameplay's rule: the first enabled Audio Listener in scene order; nullptr means the Main Camera hears.
+    static const SceneObjectDocument* FindActiveAudioListener(std::span<const SceneObjectDocument> objects);
+    void ValidateAudioManagementPopup(IDemoScene& scene);
+    void DismissAudioManagementPopup();
+    std::optional<SceneObjectMetadata> m_audioInspection;
+    AudioComponentState m_audioInspectedValue;
+    std::uint64_t m_audioInspectionEpoch = 0;
+    std::string m_audioEditStatus;
+    std::uint64_t m_audioControlsRevision = 0;
+    std::array<char, 128> m_audioEventSearch{};
+    AudioComponentKind m_audioManagementKind = AudioComponentKind::Source;
+    const Audio::AudioSystem* m_audioSystem = nullptr;
     // CM.9: read-only runtime diagnostics and the explicitly activated diagnostic drive.
     bool ViewportOwnsKeyboard() const;
     void DisableCharacterDrive(std::string reason);
@@ -1034,6 +1099,7 @@ private:
     std::optional<ComponentPopupTarget> m_cameraManagementPopup;
     std::optional<ComponentPopupTarget> m_lightManagementPopup;
     std::optional<ComponentPopupTarget> m_scriptManagementPopup;
+    std::optional<ComponentPopupTarget> m_audioManagementPopup;
     std::array<char, 128> m_componentSearch{};
     bool m_focusComponentSearch = false;
     struct RenameObject
@@ -1079,7 +1145,7 @@ private:
         std::unique_ptr<TriggerColliderEdit>, std::unique_ptr<CharacterControllerEdit>, TransformEdit, std::unique_ptr<GroupTransformEdit>,
         std::unique_ptr<ObjectDeletion>, std::unique_ptr<RenameObject>, std::unique_ptr<ReorderObjects>,
         std::unique_ptr<MaterialBindingsEdit>, std::unique_ptr<CameraEdit>, std::unique_ptr<LightEdit>,
-        std::unique_ptr<ScriptEdit>>;
+        std::unique_ptr<ScriptEdit>, std::unique_ptr<AudioComponentsEdit>>;
     struct SceneHistoryEntry
     {
         SceneHistoryCommand command;

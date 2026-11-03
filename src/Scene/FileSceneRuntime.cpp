@@ -398,6 +398,82 @@ bool FileSceneRuntime::SetObjectScript(const SceneObjectMetadata& selection,
     return true;
 }
 
+bool FileSceneRuntime::SetObjectAudio(const SceneObjectMetadata& selection, const AudioComponentState& expected,
+    const AudioComponentState& replacement, std::string* errorMessage)
+{
+    const auto fail = [&](const char* message)
+    {
+        if(errorMessage)
+        {
+            *errorMessage = message;
+        }
+
+        return false;
+    };
+
+    if(errorMessage)
+    {
+        errorMessage->clear();
+    }
+
+    if(m_archiveScene || HasPreparedScene() || m_materialAssignment || m_activePresentationAssociation)
+    {
+        return fail("Audio authoring requires an idle editable scene.");
+    }
+
+    const auto current = GetObjectMetadata(selection.objectID, errorMessage);
+
+    if(!current)
+    {
+        return false;
+    }
+
+    if(current->sceneID != selection.sceneID || current->runtimeIdentity != selection.runtimeIdentity ||
+        current->structureRevision != selection.structureRevision || current->runtimeIndex != selection.runtimeIndex)
+    {
+        return fail("Audio target belongs to a stale scene selection.");
+    }
+
+    const auto& objects = m_fileScene.GetDocument().objects;
+    const auto found = std::find_if(objects.begin(), objects.end(),
+        [&](const SceneObjectDocument& object) { return object.id == selection.objectID; });
+
+    if(found == objects.end() || AudioComponentState{found->audioSource, found->audioListener} != expected)
+    {
+        return fail("Audio components changed since inspection; edit rejected.");
+    }
+
+    const size_t index = static_cast<size_t>(found - objects.begin());
+    SceneDocument candidate;
+
+    if(!CaptureSceneDocument(m_fileScene.GetDocument(), m_scene, m_objectMapping, candidate, errorMessage))
+    {
+        return false;
+    }
+
+    candidate.objects[index].audioSource = replacement.source;
+    candidate.objects[index].audioListener = replacement.listener;
+
+    if(!ValidateSceneDocument(candidate, errorMessage))
+    {
+        return false;
+    }
+
+    if(expected == replacement)
+    {
+        return true;
+    }
+
+    // Copies may allocate, so they are made before the document is touched; the moves cannot fail. Gameplay reads
+    // the components at Play, so no renderer, physics or audio state changes here.
+    std::optional<AudioSourceComponent> source = replacement.source;
+    std::optional<AudioListenerComponent> listener = replacement.listener;
+    auto& object = m_fileScene.EditDocument().objects[index];
+    object.audioSource = std::move(source);
+    object.audioListener = std::move(listener);
+    return true;
+}
+
 bool FileSceneRuntime::SetObjectPhysics(const SceneObjectMetadata& selection,
     const std::optional<Physics::PhysicsComponent>& expected,
     const std::optional<Physics::PhysicsComponent>& replacement, std::string* errorMessage)

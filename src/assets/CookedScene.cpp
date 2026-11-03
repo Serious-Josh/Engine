@@ -616,6 +616,62 @@ std::optional<ScriptComponent> ReadScriptComponent(Reader& reader)
     return script;
 }
 
+// V17 Audio: u32 Audio Source presence; when present u32 enabled, the event GUID and path strings and u32 autoplay.
+// Then u32 Audio Listener presence; when present u32 enabled.
+void WriteAudioComponents(Writer& writer, const std::optional<AudioSourceComponent>& source,
+    const std::optional<AudioListenerComponent>& listener)
+{
+    writer.WriteUnsigned(source.has_value() ? 1 : 0, 4);
+
+    if(source)
+    {
+        writer.WriteUnsigned(source->enabled ? 1 : 0, 4);
+        writer.WriteString(source->eventGuid);
+        writer.WriteString(source->eventPath);
+        writer.WriteUnsigned(source->autoplay ? 1 : 0, 4);
+    }
+
+    writer.WriteUnsigned(listener.has_value() ? 1 : 0, 4);
+
+    if(listener)
+    {
+        writer.WriteUnsigned(listener->enabled ? 1 : 0, 4);
+    }
+}
+
+void ReadAudioComponents(Reader& reader, std::optional<AudioSourceComponent>& source,
+    std::optional<AudioListenerComponent>& listener)
+{
+    const auto sourcePresence = reader.ReadUnsigned(4);
+    Require(sourcePresence <= 1, "Invalid cooked Audio Source presence flag.");
+
+    if(sourcePresence == 1)
+    {
+        const auto enabled = reader.ReadUnsigned(4);
+        Require(enabled <= 1, "Invalid cooked Audio Source enabled flag.");
+        AudioSourceComponent value;
+        value.enabled = enabled != 0;
+        value.eventGuid = reader.ReadString();
+        value.eventPath = reader.ReadString();
+        const auto autoplay = reader.ReadUnsigned(4);
+        Require(autoplay <= 1, "Invalid cooked Audio Source autoplay flag.");
+        value.autoplay = autoplay != 0;
+        std::string error;
+        Require(ValidateAudioSourceComponent(value, &error), error.c_str());
+        source = std::move(value);
+    }
+
+    const auto listenerPresence = reader.ReadUnsigned(4);
+    Require(listenerPresence <= 1, "Invalid cooked Audio Listener presence flag.");
+
+    if(listenerPresence == 1)
+    {
+        const auto enabled = reader.ReadUnsigned(4);
+        Require(enabled <= 1, "Invalid cooked Audio Listener enabled flag.");
+        listener = AudioListenerComponent{enabled != 0};
+    }
+}
+
 std::optional<LightComponent> ReadLightComponent(Reader& reader, std::uint32_t version, float& legacyRange)
 {
     const auto presence = reader.ReadUnsigned(4);
@@ -757,6 +813,7 @@ std::vector<std::byte> Encode(const Metadata& sceneMetadata, const Policy& polic
         WriteCameraComponent(writer, object.camera);
         WriteLightComponent(writer, object.light);
         WriteScriptComponent(writer, object.script);
+        WriteAudioComponents(writer, object.audioSource, object.audioListener);
     }
 
     if (sceneMetadata.environment)
@@ -1115,6 +1172,19 @@ Metadata Decode(std::span<const std::byte> bytes, const Policy& policy)
             catch(const std::exception& exception)
             {
                 throw std::runtime_error("Invalid cooked Script for object " + object.id + ": " + exception.what());
+            }
+        }
+
+        if(payloadVersion >= AudioVersion)
+        {
+            try
+            {
+                ReadAudioComponents(reader, object.audioSource, object.audioListener);
+            }
+            catch(const std::exception& exception)
+            {
+                throw std::runtime_error("Invalid cooked audio components for object " + object.id + ": " +
+                    exception.what());
             }
         }
 

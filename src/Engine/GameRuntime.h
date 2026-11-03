@@ -1,5 +1,6 @@
 #pragma once
 
+#include "Engine/GameAudioSession.h"
 #include "Engine/PhysicsSimulationController.h"
 #include "Scene/RenderView.h"
 #include "Scripting/ScriptHost.h"
@@ -42,6 +43,11 @@ public:
     explicit GameRuntime(PhysicsSimulationController& physics) : m_physics(physics) {}
     GameRuntime(const GameRuntime&) = delete;
     GameRuntime& operator=(const GameRuntime&) = delete;
+
+    // Audio.1C: the process's AudioSystem, borrowed by every gameplay audio session. Set once by the host; null
+    // (or audio not running) leaves scripts' audio calls as quiet no-ops.
+    void SetAudioSystem(Audio::AudioSystem* audio) noexcept { m_audio.SetAudioSystem(audio); }
+    const GameAudioSession& GetAudioSession() const noexcept { return m_audio; }
 
     // Admits the Main Camera (when required), compiles and validates every enabled Script
     // component, starts physics, constructs one instance per scripted object and runs OnStart.
@@ -114,6 +120,7 @@ private:
         bool GetLocalRotation(std::uint32_t slot, float (&rotation)[3]) const override;
         bool SetLocalRotation(std::uint32_t slot, const float (&rotation)[3], std::string& error) override;
         bool GetForward(std::uint32_t slot, float (&forward)[3]) const override;
+        std::string GetObjectKey(std::uint32_t slot) const override;
 
     private:
         const SceneObjectDocument* Find(std::uint32_t slot) const;
@@ -159,6 +166,13 @@ private:
     void RunScriptUpdates(FileSceneRuntime& runtime, const Frame& frame);
     void SubmitCharacterRequests(double elapsedSeconds);
     void ReportScriptFault(const std::string& message);
+    // Audio.2C: selects and places the listener and gives the audio session the scene's Audio Sources and object
+    // poses, before any script code runs.
+    void BeginSceneAudio(FileSceneRuntime& runtime);
+    // Audio.2A autoplay after OnStart (the listener was selected by BeginSceneAudio).
+    void StartSceneAudio(FileSceneRuntime& runtime);
+    // Audio.2A: moves the FMOD listener and every object-bound event to the presented world poses of this frame.
+    void UpdateSceneAudio(const FileSceneRuntime& runtime, double deltaSeconds);
     void ReleaseScripts() noexcept;
 
     PhysicsSimulationController& m_physics;
@@ -170,6 +184,10 @@ private:
     std::unique_ptr<Scripting::ScriptHost> m_scripts;
     ObjectTable m_objects;
     GameplayInput m_input;
+    // Audio.1C: begins before script constructors and OnStart, ends after OnStop (or on any failed Start).
+    GameAudioSession m_audio;
+    // Audio.2A: the active Audio Listener's object (first enabled in scene order), or empty for the camera fallback.
+    std::string m_listenerObjectID;
     std::vector<ScriptInstance> m_scriptInstances;
     std::string m_scriptFault;
 };

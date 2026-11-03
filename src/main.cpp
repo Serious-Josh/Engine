@@ -39,6 +39,14 @@ int VerifyGamePlayGPU(const std::filesystem::path& projectDirectory, const std::
 int VerifyPhysicsPerformance(const std::filesystem::path& projectDirectory, const std::filesystem::path& scene);
 int VerifyScriptWorkflow(const std::filesystem::path& projectDirectory, const std::filesystem::path& scene,
     const std::vector<std::string>& objectNames);
+int VerifyGameplayAudio(const std::filesystem::path& projectDirectory, const std::filesystem::path& scene,
+    const std::filesystem::path& buildOutput);
+int VerifySceneAudio(const std::filesystem::path& projectDirectory, const std::filesystem::path& baseScene,
+    const std::filesystem::path& buildOutput);
+int VerifyEditorAudio(const std::filesystem::path& projectDirectory, const std::filesystem::path& scene,
+    const std::filesystem::path& buildOutput);
+int VerifyScriptAudio(const std::filesystem::path& projectDirectory, const std::filesystem::path& scene,
+    const std::filesystem::path& buildOutput);
 int MigrateSceneLighting(const std::filesystem::path& scene, float referenceEV100, const std::filesystem::path& report);
 int VerifyProjectSystemWorkflow(const std::string& stage, const std::filesystem::path& workRoot);
 int VerifyProjectRelaunch(const std::filesystem::path& source, const std::filesystem::path& target, const std::string& mode);
@@ -317,6 +325,31 @@ int main(int argc, char** argv)
     {
         return VerifyScriptWorkflow(std::filesystem::absolute(argv[2]), std::filesystem::absolute(argv[3]),
             std::vector<std::string>(argv + 4, argv + argc));
+    }
+    if((argc == 4 || argc == 5) && std::string_view(argv[1]) == "--verify-gameplay-audio")
+    {
+        // Optional fifth argument (Audio.1D): Build Game output directory for the packaged acceptance run.
+        return VerifyGameplayAudio(std::filesystem::absolute(argv[2]), std::filesystem::absolute(argv[3]),
+            argc == 5 ? std::filesystem::absolute(argv[4]) : std::filesystem::path{});
+    }
+    if((argc == 4 || argc == 5) && std::string_view(argv[1]) == "--verify-scene-audio")
+    {
+        // Audio.2A: <project> <base scene with a Main Camera> [Build Game output].
+        return VerifySceneAudio(std::filesystem::absolute(argv[2]), std::filesystem::absolute(argv[3]),
+            argc == 5 ? std::filesystem::absolute(argv[4]) : std::filesystem::path{});
+    }
+    if((argc == 4 || argc == 5) && std::string_view(argv[1]) == "--verify-editor-audio")
+    {
+        // Audio.2B: <project with banks and Scenes/Flat.scene> <scene to author> [Build Game output].
+        return VerifyEditorAudio(std::filesystem::absolute(argv[2]), std::filesystem::absolute(argv[3]),
+            argc == 5 ? std::filesystem::absolute(argv[4]) : std::filesystem::path{});
+    }
+    if((argc == 4 || argc == 5) && std::string_view(argv[1]) == "--verify-script-audio")
+    {
+        // Audio.2C: <project with banks, Scenes/Flat.scene and Content/Scripts/AudioDirector.as> <scene to author>
+        // [Build Game output].
+        return VerifyScriptAudio(std::filesystem::absolute(argv[2]), std::filesystem::absolute(argv[3]),
+            argc == 5 ? std::filesystem::absolute(argv[4]) : std::filesystem::path{});
     }
     if(argc == 3 && std::string_view(argv[1]) == "--verify-startup-scene")
     {

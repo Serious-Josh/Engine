@@ -118,6 +118,12 @@ public:
     {
         return false;
     }
+
+    // Audio.2C: the object's persistent scene ID, the key gameplay audio uses; empty when the slot is not valid.
+    virtual std::string GetObjectKey(std::uint32_t) const
+    {
+        return {};
+    }
 };
 
 // AS.6A keys scripts may query, mirrored by the script enum Key; hosts map them to platform keys.
@@ -150,6 +156,63 @@ public:
     virtual void SetCursorLocked(bool)
     {
     }
+};
+
+// Audio.1C script-visible event handle: plain data copied by value. `session` is the gameplay audio session that
+// issued it, so a handle never reaches an instance of another Play session. The default handle is invalid.
+struct AudioEventHandle
+{
+    std::uint64_t session = 0;
+    std::uint32_t index = 0;
+    std::uint32_t generation = 0;
+};
+
+// Audio.1C gameplay audio. Installed only while the gameplay session is running; without one every call fails
+// quietly (scripts keep running, events are not played). Implementations validate every handle and value and never
+// throw; expected misuse (stale handles) answers false, actionable problems are reported by the implementation.
+class AudioService
+{
+public:
+    virtual ~AudioService() = default;
+
+    // `event` is "{guid}" (FMOD Studio's event GUID text) or "event:/path" (needs the strings bank). On success the
+    // event is playing and `handle` refers to it.
+    virtual bool PlayEvent(std::string_view event, AudioEventHandle& handle) = 0;
+    virtual bool IsEventValid(const AudioEventHandle& handle) const = 0;
+    // True from Play until the event has stopped (including a fade-out in progress).
+    virtual bool IsEventPlaying(const AudioEventHandle& handle) const = 0;
+    virtual bool StopEvent(const AudioEventHandle& handle, bool allowFadeOut) = 0;
+    virtual bool SetEventParameter(const AudioEventHandle& handle, std::string_view name, float value) = 0;
+    virtual bool SetEventVolume(const AudioEventHandle& handle, float volume) = 0;
+    // Stops the event (allowing its authored fade-out) and gives it back; the handle becomes invalid at once.
+    virtual bool ReleaseEvent(const AudioEventHandle& handle) = 0;
+
+    // Audio.2C positional events. Positions are world-space meters (Engine and FMOD share +X right, +Y up, +Z
+    // forward). Whether an event is 3D, loops or attenuates stays as authored in FMOD Studio.
+    virtual bool PlayEventAt(std::string_view event, const float (&position)[3], AudioEventHandle& handle) = 0;
+    // Places the event; an attached event is detached first (an explicit position wins).
+    virtual bool SetEventPosition(const AudioEventHandle& handle, const float (&position)[3]) = 0;
+    // The event follows the object's world pose every frame and stops when the object leaves the scene.
+    virtual bool AttachEvent(const AudioEventHandle& handle, std::string_view objectKey) = 0;
+    // Stops following; the event stays where the object last placed it.
+    virtual bool DetachEvent(const AudioEventHandle& handle) = 0;
+
+    // Audio.2C runtime control of an object's authored Audio Source. `objectKey` is GetObjectKey's ID (empty for a
+    // stale object). Runtime state lasts for the session only; the authored component never changes.
+    virtual bool HasAudioSource(std::string_view objectKey) const = 0;
+    // Starts the source's event unless it is already playing (never a second instance) or the source is disabled.
+    virtual bool PlayAudioSource(std::string_view objectKey) = 0;
+    // Stops the source's event; also cancels a pending autoplay when called during OnStart.
+    virtual bool StopAudioSource(std::string_view objectKey, bool allowFadeOut) = 0;
+    virtual bool IsAudioSourcePlaying(std::string_view objectKey) const = 0;
+    // Disabling stops a playing source (allowing its fade-out) and makes Play and autoplay ignore it.
+    virtual bool SetAudioSourceEnabled(std::string_view objectKey, bool enabled) = 0;
+    virtual bool IsAudioSourceEnabled(std::string_view objectKey) const = 0;
+
+    // Session-scoped mixer changes: the session restores every value it changed when gameplay stops.
+    virtual bool SetGlobalParameter(std::string_view name, float value) = 0;
+    virtual bool SetBusVolume(std::string_view bus, float volume) = 0;
+    virtual bool SetVCAVolume(std::string_view vca, float volume) = 0;
 };
 
 // Indices into one host's built modules and created instances.
@@ -197,6 +260,8 @@ public:
     Result Update(InstanceID instance, float deltaTime, ExecutionLimits limits = {});
     void SetObjectResolver(ObjectResolver* resolver) noexcept;
     void SetInputSource(InputSource* input) noexcept;
+    // Audio.1C: the gameplay audio session; scripts reach it only while their code executes.
+    void SetAudioService(AudioService* audio) noexcept;
 
 private:
     friend class ScriptHostVerification;

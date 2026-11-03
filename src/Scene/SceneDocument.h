@@ -5,6 +5,7 @@
 #include "Scene/CameraComponent.h"
 #include "Scene/LightComponent.h"
 #include "Scene/ScriptComponent.h"
+#include "Scene/AudioComponents.h"
 #include "Physics/PhysicsComponent.h"
 #include "Physics/TriggerColliderComponent.h"
 #include "Physics/CharacterControllerComponent.h"
@@ -62,6 +63,10 @@ struct SceneObjectDocument
     // Optional script attachment; owns no instance. Persisted from schema 15 / cooked payload 16.
     std::optional<ScriptComponent> script;
 
+    // Optional audio intent; owns no event instance. Persisted from schema 16 / cooked payload 17.
+    std::optional<AudioSourceComponent> audioSource;
+    std::optional<AudioListenerComponent> audioListener;
+
     // Empty means root; otherwise the exact ID of another object in this scene. Persisted from
     // schema 9 / cooked payload 9; historical versions load every object as a root.
     std::string parentID;
@@ -85,7 +90,9 @@ struct SceneDocument
     // Physical light units (PhotometricUnits.h); earlier versions are converted on load.
     static constexpr std::uint32_t kPhysicalLightingSchemaVersion = 14;
     static constexpr std::uint32_t kScriptSchemaVersion = 15;
-    static constexpr std::uint32_t kSchemaVersion = kScriptSchemaVersion;
+    // Audio.2A Audio Source and Audio Listener components.
+    static constexpr std::uint32_t kAudioSchemaVersion = 16;
+    static constexpr std::uint32_t kSchemaVersion = kAudioSchemaVersion;
 
     std::uint32_t schemaVersion = kSchemaVersion;
 

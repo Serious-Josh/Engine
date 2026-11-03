@@ -50,6 +50,11 @@ std::filesystem::path ProjectPaths::GetScriptsDirectory() const
     return m_root / "Content" / "Scripts";
 }
 
+std::filesystem::path ProjectPaths::GetAudioBanksDirectory() const
+{
+    return m_root / "Content" / "Audio" / "Banks";
+}
+
 bool ProjectPaths::EnsureDirectories(
     std::string* errorMessage) const
 {

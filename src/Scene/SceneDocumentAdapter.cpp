@@ -158,7 +158,7 @@ bool SceneDocumentsEqual(
             a.materialReference != b.materialReference || a.materialSlotBindings != b.materialSlotBindings ||
             a.physics != b.physics || a.triggerCollider != b.triggerCollider ||
             a.characterController != b.characterController || a.camera != b.camera || a.light != b.light ||
-            a.script != b.script)
+            a.script != b.script || a.audioSource != b.audioSource || a.audioListener != b.audioListener)
         {
             return false;
         }

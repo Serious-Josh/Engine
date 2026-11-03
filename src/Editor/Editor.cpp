@@ -517,6 +517,7 @@ void Editor::DrawSceneViewportToolbar(const EditorWorkspaceRect& toolbarRectangl
             ImGui::Checkbox("Light Wireframes", &m_showLightWireframes);
             ImGui::Checkbox("Camera Icons", &m_showCameraIcons);
             ImGui::Checkbox("Light Icons", &m_showLightIcons);
+            ImGui::Checkbox("Audio Icons", &m_showAudioIcons);
             ImGui::Checkbox("Grid", &m_showViewportGrid);
             ImGui::Checkbox("Resolution Info", &m_showResolutionInfo);
             ImGui::EndCombo();
@@ -1244,6 +1245,7 @@ void Editor::ActivateObjectInspection(
     DismissCameraManagementPopup();
     DismissLightManagementPopup();
     DismissScriptManagementPopup();
+    DismissAudioManagementPopup();
     m_objectInspectionIdentity.reset();
     m_transformEditStatus.clear();
     m_physicsInspection.reset();
@@ -1639,6 +1641,7 @@ void Editor::Draw(
                     DrawObjectLightControls(demoScene);
                 }
                 DrawObjectScriptControls(demoScene, projectPaths, assetRegistry);
+                DrawObjectAudioControls(demoScene);
                 {
                     EditorPhaseTiming::Scope phase(PhaseTiming(), EditorPhaseTiming::Phase::ComponentAdd);
                     DrawAddComponentControls(demoScene);
@@ -3016,6 +3019,7 @@ void Editor::ResetSceneInteractions()
     DismissCameraManagementPopup();
     DismissLightManagementPopup();
     DismissScriptManagementPopup();
+    DismissAudioManagementPopup();
     m_triggerInspection.reset();
     m_controllerInspection.reset();
     m_cameraInspection.reset();
@@ -4300,6 +4304,35 @@ void Editor::ReplaySceneHistory(IDemoScene& demoScene, bool redo)
         m_historyCursor = redo ? m_historyCursor + 1 : m_historyCursor - 1;
         m_scriptInspection.reset();
         ++m_scriptControlsRevision;
+        m_sceneHistoryStatus.clear();
+        return;
+    }
+
+    if(const auto* audio = std::get_if<std::unique_ptr<AudioComponentsEdit>>(&entry.command); audio && *audio)
+    {
+        const auto& edit = **audio;
+        auto* owner = dynamic_cast<FileBackedDemoScene*>(&demoScene);
+
+        if(!owner || !RenameSessionMatches(demoScene, edit.session))
+        {
+            ReportSceneHistoryFailure("Audio replay belongs to a stale scene session.");
+            return;
+        }
+
+        std::string error;
+        // Resolved by stable ID now; the runtime checks the expected value before restoring.
+        const auto selection = owner->GetObjectMetadata(edit.objectID, &error);
+
+        if(!selection || !owner->SetObjectAudio(*selection, redo ? edit.before : edit.after,
+            redo ? edit.after : edit.before, &error))
+        {
+            ReportSceneHistoryFailure(error);
+            return;
+        }
+
+        m_historyCursor = redo ? m_historyCursor + 1 : m_historyCursor - 1;
+        m_audioInspection.reset();
+        ++m_audioControlsRevision;
         m_sceneHistoryStatus.clear();
         return;
     }

@@ -11,7 +11,9 @@ enum class AssetType : std::uint8_t
     Material,
     Mesh,
     Texture,
-    Script
+    Script,
+    // Audio.1B: an FMOD Studio bank built by FMOD Studio into Content/Audio/Banks (never imported or converted).
+    AudioBank
 };
 
 struct AssetRecord

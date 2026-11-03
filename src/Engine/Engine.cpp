@@ -1,6 +1,8 @@
 #include "Scene/SceneSwitchTiming.h"
 #include "Engine/Engine.h"
 #include "assets/ProjectScriptAssets.h"
+#include "assets/ProjectAudioBankAssets.h"
+#include "Engine/PackagedAudioBanks.h"
 #include "assets/ProjectMeshImportService.h"
 #include "Engine/PackagedBootstrap.h"
 #include "Engine/PackagedRenderingSettings.h"
@@ -952,6 +954,9 @@ void Engine::ProcessProjectIndependentFrame()
 {
     ENGINE_ASSERT(m_state == EngineState::ProjectIndependent || m_state == EngineState::ProjectReady);
 
+    // Exactly one audio update when this frame ends, whichever return it takes.
+    const Audio::FrameUpdateScope audioUpdate(m_audio);
+
     m_time.Update();
     m_input.Update();
     m_window.ProcessMessages();
@@ -1470,6 +1475,28 @@ bool Engine::InitializeProjectIndependent(const EngineStartup& startup)
     Log::Info("Descriptor heap baseline after renderer initialization: " + std::to_string(descriptors.allocated) +
         " of " + std::to_string(descriptors.capacity) + " CBV/SRV/UAV descriptors in use.");
 
+    // Audio.1A: project-independent, and before any scene or gameplay. A failure is logged and reported by the
+    // audio status; it never stops Engine from starting.
+    if(startup.mode == EngineStartup::Mode::ArchiveDiagnostic)
+    {
+        m_audio.Disable("archive diagnostics do not start audio");
+    }
+    else
+    {
+        m_audio.Initialize();
+    }
+
+    // Audio.1C: gameplay audio sessions borrow the process's AudioSystem. Shutdown stops gameplay (ending its
+    // session) before m_audio shuts down, so no session outlives the system it uses.
+    m_gameRuntime.SetAudioSystem(&m_audio);
+    // Audio.2B: the Audio Source inspector lists and checks events of the project's loaded banks.
+    m_editor.SetAudioSystem(&m_audio);
+
+    if(packaged)
+    {
+        LoadPackagedAudioBanks();
+    }
+
     Log::Info(packaged ? "Initializing archived scene." : "Project-independent Editor services initialized.");
 
     ShaderDescription vertexShaderDescription{};
@@ -1726,6 +1753,8 @@ bool Engine::InitializeProject()
         Log::Warning("Script discovery skipped; registry retained: " + projectError);
     }
 
+    LoadProjectAudioBanks(projectPaths);
+
     // Inspect the reconciled registry without modifying it further.
     std::size_t availableAssets = 0;
     std::size_t missingAssets = 0;
@@ -1808,6 +1837,118 @@ bool Engine::InitializeProject()
 
 // Phase 3: the initial scene, preparation workers, Renderer scene resources and the Running
 // state. Packaged runtime enters from the project-independent state with its archive scene.
+void Engine::LoadProjectAudioBanks(const ProjectPaths& paths)
+{
+    ProjectAudioBankAssets::ReconcileReport report;
+    std::string error;
+
+    if(!ProjectAudioBankAssets::Reconcile(paths, m_projectAssetRegistry, report, error))
+    {
+        Log::Warning("Audio bank discovery skipped; registry retained: " + error);
+        return;
+    }
+
+    if(report.registered == 0)
+    {
+        return;
+    }
+
+    Log::Info("Audio bank discovery: " + std::to_string(report.registered) + " registered, " +
+        std::to_string(report.available) + " available, " + std::to_string(report.missing) + " missing.");
+
+    if(m_audio.GetStatus() != Audio::Status::Active && m_audio.GetStatus() != Audio::Status::NoOutput)
+    {
+        Log::Warning("Audio banks not loaded: audio is " + std::string(Audio::ToString(m_audio.GetStatus())) + ".");
+        return;
+    }
+
+    // Master banks first: FMOD resolves buses and event paths through them. The rest in registry (path) order.
+    std::vector<AssetRecord> banks = m_projectAssetRegistry.GetAssets(AssetType::AudioBank);
+    std::stable_partition(banks.begin(), banks.end(), [](const AssetRecord& record)
+    {
+        return record.relativePath.filename().wstring().starts_with(L"Master.");
+    });
+
+    std::size_t loaded = 0;
+
+    for(const AssetRecord& record : banks)
+    {
+        const AssetResolution resolution = ProjectAssetResolver::Resolve(paths, m_projectAssetRegistry, record.id);
+
+        if(resolution.status != AssetAvailability::Available)
+        {
+            continue;
+        }
+
+        if(!m_audio.LoadBankFile(record.id.ToReference(), resolution.resolvedPath, error))
+        {
+            Log::Warning("Audio bank " + ProjectPathText(record.relativePath) + " not loaded: " + error);
+            continue;
+        }
+
+        ++loaded;
+    }
+
+    Log::Info("Audio banks loaded: " + std::to_string(loaded) + " of " + std::to_string(report.available) + ".");
+}
+
+void Engine::LoadPackagedAudioBanks()
+{
+    if(!m_startupArchive || !m_startupArchive->provider->ArchiveEntry(PackagedAudioBanks::ListID()))
+    {
+        return;
+    }
+
+    std::vector<AssetRecord> banks;
+
+    try
+    {
+        banks = PackagedAudioBanks::DecodeList(m_startupArchive->provider->ReadEntry(PackagedAudioBanks::ListID(),
+            EngineAssetPak::Type::Resource, PackagedAudioBanks::PayloadVersion, PackagedAudioBanks::MaximumListBytes));
+    }
+    catch(const std::exception& exception)
+    {
+        Log::Warning(std::string("Packaged audio banks not loaded: ") + exception.what());
+        return;
+    }
+
+    if(m_audio.GetStatus() != Audio::Status::Active && m_audio.GetStatus() != Audio::Status::NoOutput)
+    {
+        Log::Warning("Packaged audio banks not loaded: audio is " + std::string(Audio::ToString(m_audio.GetStatus())) + ".");
+        return;
+    }
+
+    std::size_t loaded = 0;
+
+    for(const AssetRecord& bank : banks)
+    {
+        const std::string name = bank.relativePath.generic_string();
+
+        try
+        {
+            // The archive read verifies the entry's integrity. FMOD copies the bytes (FMOD_STUDIO_LOAD_MEMORY), so the
+            // buffer is released at the end of this iteration.
+            const std::vector<std::byte> bytes = m_startupArchive->provider->ReadEntry(bank.id,
+                EngineAssetPak::Type::Resource, PackagedAudioBanks::PayloadVersion, PackagedAudioBanks::MaximumBankBytes);
+            std::string error;
+
+            if(!PackagedAudioBanks::IsBank(bytes, error) || !m_audio.LoadBankMemory(bank.id.ToReference(), bytes, error))
+            {
+                Log::Warning("Packaged audio bank " + name + " not loaded: " + error);
+                continue;
+            }
+
+            ++loaded;
+        }
+        catch(const std::exception& exception)
+        {
+            Log::Warning("Packaged audio bank " + name + " not loaded: " + exception.what());
+        }
+    }
+
+    Log::Info("Packaged audio banks loaded: " + std::to_string(loaded) + " of " + std::to_string(banks.size()) + ".");
+}
+
 bool Engine::InitializeScene(SceneSource source)
 {
     const bool packaged = source == SceneSource::Archive;
@@ -2221,6 +2362,10 @@ void Engine::AcceptPreparedMeshResidencyForFrame(IDemoScene& activeDemo)
 
 void Engine::Frame()
 {
+    // Exactly one audio update when this frame ends, on every return path, after gameplay and presentation and
+    // independent of whether the renderer submitted anything. It never waits on GPU work.
+    const Audio::FrameUpdateScope audioUpdate(m_audio);
+
     std::optional<Renderer::FrameHitchProbe> inputProbe;
 
     if constexpr (Renderer::IsFrameHitchDiagnosticsEnabled())
@@ -3146,6 +3291,9 @@ void Engine::Shutdown()
             m_gameRuntime.Stop(*owner->m_runtime, m_renderer);
         }
     }
+
+    // Audio ends with gameplay, before scene and renderer teardown, so no GPU drain waits behind FMOD's thread joins.
+    m_audio.Shutdown();
 
     CancelEditorMembership("Shutdown canceled the pending membership edit.");
     CancelViewportMaterialAssignment("Engine shutdown canceled the material assignment.");

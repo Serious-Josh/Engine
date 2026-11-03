@@ -51,6 +51,13 @@ bool ProjectAssetDeletion::RemoveFile(
             throw std::runtime_error("Script deletion is deferred until dependency-aware file management.");
         }
 
+        const auto* bank = registry.FindByPath(original.lexically_relative(root));
+
+        if(_wcsicmp(original.extension().c_str(), L".bank") == 0 || (bank && bank->type == AssetType::AudioBank))
+        {
+            throw std::runtime_error("Audio banks are FMOD Studio build output; remove them from the FMOD Studio project.");
+        }
+
         const auto relative = original.lexically_relative(root);
 
         if(relative.empty() || relative.is_absolute() || relative == ".")

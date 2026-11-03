@@ -39,6 +39,8 @@ namespace
                 return paths.GetMeshesDirectory();
             case AssetType::Script:
                 return paths.GetScriptsDirectory();
+            case AssetType::AudioBank:
+                return paths.GetAudioBanksDirectory();
 
             case AssetType::Texture:
                 // Textures may live anywhere below the project's asset root.

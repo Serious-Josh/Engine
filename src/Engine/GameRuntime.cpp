@@ -74,6 +74,11 @@ const SceneObjectDocument* GameRuntime::ObjectTable::Find(std::uint32_t slot) co
     return found == objects.end() ? nullptr : &*found;
 }
 
+std::string GameRuntime::ObjectTable::GetObjectKey(std::uint32_t slot) const
+{
+    return Find(slot) ? objectIDs[slot] : std::string();
+}
+
 std::string GameRuntime::ObjectTable::GetName(std::uint32_t slot) const
 {
     const auto* object = Find(slot);
@@ -377,6 +382,7 @@ bool GameRuntime::Start(FileSceneRuntime& runtime, Renderer& renderer, bool requ
     // A session whose simulation was ended outside Stop is stale; Engine teardown paths call Stop
     // first, so only direct controller use reaches here. Its scripts are released without OnStop.
     ReleaseScripts();
+    m_audio.End();
     m_running = false;
 
     m_physicsSession = 0;
@@ -409,24 +415,134 @@ bool GameRuntime::Start(FileSceneRuntime& runtime, Renderer& renderer, bool requ
         return false;
     }
 
+    // Gameplay audio is available from the first script code (constructors) on. The session ends with the scripts
+    // on every failure below, so a failed Start leaves no sound behind.
+    // The camera fallback of the listener is known before the session places it.
+    m_mainCamera = requireMainCamera;
+    m_audio.Begin();
+    BeginSceneAudio(runtime);
+
+    if(m_scripts)
+    {
+        m_scripts->SetAudioService(&m_audio);
+    }
+
     // Constructors run script code; a failure discards every instance and the simulation.
     m_objects.runtime = &runtime;
 
     if(!CreateScriptInstances(pending, error))
     {
         m_objects.runtime = nullptr;
+        m_mainCamera = false;
         ReleaseScripts();
+        m_audio.End();
         m_physics.Stop(runtime, renderer);
         return false;
     }
 
     m_physicsSession = m_physics.GetSessionGeneration();
     m_runtimeIdentity = runtime.GetRuntimeIdentity();
-    m_mainCamera = requireMainCamera;
     m_running = true;
     RunScriptCallbacks(runtime, Scripting::Lifecycle::Start);
+    // Autoplay after OnStart (Architecture D5): scripts set up their state before scene sounds begin.
+    StartSceneAudio(runtime);
     error.clear();
     return true;
+}
+
+namespace
+{
+    // An object's presented world pose this frame (the same transform the renderer and camera use).
+    std::optional<GameAudioSession::ObjectPose> ResolveAudioPose(const FileSceneRuntime& runtime,
+        std::string_view objectID)
+    {
+        const auto& mapping = runtime.GetObjectMapping().idToRuntimeIndex;
+        const auto found = mapping.find(std::string(objectID));
+        const auto& objects = runtime.GetScene().GetRenderObjects();
+
+        if(found == mapping.end() || found->second >= objects.size())
+        {
+            return std::nullopt;
+        }
+
+        return GameAudioSession::PoseFromWorld(objects[found->second].GetPresentationTransform().currentModel);
+    }
+}
+
+void GameRuntime::BeginSceneAudio(FileSceneRuntime& runtime)
+{
+    std::vector<GameAudioSession::SceneSource> sources;
+    std::size_t listeners = 0;
+    std::string listenerName;
+    m_listenerObjectID.clear();
+
+    for(const auto& object : runtime.GetFileScene().GetDocument().objects)
+    {
+        // Deterministic: the first enabled listener in scene order is the active one.
+        if(object.audioListener && object.audioListener->enabled && listeners++ == 0)
+        {
+            m_listenerObjectID = object.id;
+            listenerName = object.name;
+        }
+
+        if(object.audioSource)
+        {
+            const auto& source = *object.audioSource;
+            sources.push_back({object.id, object.name, source.eventGuid, source.enabled, source.autoplay});
+        }
+    }
+
+    if(listeners > 1)
+    {
+        Log::Warning("Gameplay audio: " + std::to_string(listeners) + " enabled Audio Listeners; '" + listenerName +
+            "' (first in scene order) is the active one.");
+    }
+
+    // The runtime outlives the session: Stop and every failed Start end the session before the scene goes.
+    m_audio.SetPoseResolver([&runtime](std::string_view objectID)
+    {
+        return ResolveAudioPose(runtime, objectID);
+    });
+    m_audio.RegisterSceneSources(std::move(sources));
+    // The listener is placed before any script code, so events scripts start in OnStart are heard from it.
+    UpdateSceneAudio(runtime, 0.0);
+}
+
+void GameRuntime::StartSceneAudio(FileSceneRuntime& runtime)
+{
+    // OnStart may have rotated objects; a zero delta re-places everything without a velocity.
+    UpdateSceneAudio(runtime, 0.0);
+    m_audio.StartAutoplaySources();
+}
+
+void GameRuntime::UpdateSceneAudio(const FileSceneRuntime& runtime, double deltaSeconds)
+{
+    std::optional<GameAudioSession::ObjectPose> listener;
+    std::string listenerKey;
+
+    if(!m_listenerObjectID.empty())
+    {
+        listener = ResolveAudioPose(runtime, m_listenerObjectID);
+        listenerKey = m_listenerObjectID;
+    }
+
+    // Without an Audio Listener (or once its object is gone) the gameplay Main Camera hears.
+    if(!listener && m_mainCamera)
+    {
+        RenderView view;
+
+        if(ResolveMainCameraView(runtime, 1, 1, view, nullptr))
+        {
+            listener = GameAudioSession::ObjectPose{{view.position.x, view.position.y, view.position.z},
+                {view.forward.x, view.forward.y, view.forward.z}, {view.up.x, view.up.y, view.up.z}};
+            listenerKey = "<main camera>";
+        }
+    }
+
+    m_audio.UpdateSpatial(deltaSeconds, listenerKey, listener, [&runtime](std::string_view objectID)
+    {
+        return ResolveAudioPose(runtime, objectID);
+    });
 }
 
 bool GameRuntime::PrepareScripts(FileSceneRuntime& runtime, const ScriptModuleSource& scripts,
@@ -710,6 +826,7 @@ bool GameRuntime::Update(FileSceneRuntime& runtime, Renderer& renderer, const Fr
 
     // Scripts run first, so their requests address the steps this frame is about to simulate.
     RunScriptUpdates(runtime, frame);
+    m_audio.Update();
     SubmitCharacterRequests(frame.deltaSeconds);
 
     // The shared controller owns the only clock and command consumption order.
@@ -731,6 +848,8 @@ bool GameRuntime::Update(FileSceneRuntime& runtime, Renderer& renderer, const Fr
         return false;
     }
 
+    // Audio follows the poses this frame presents (after scripts and physics).
+    UpdateSceneAudio(runtime, frame.deltaSeconds);
     error.clear();
     return true;
 }
@@ -768,6 +887,10 @@ bool GameRuntime::Stop(FileSceneRuntime& runtime, Renderer& renderer)
         runtime.GetScene().ClearRuntimeLocalTransforms();
     }
 
+    // After OnStop (scripts may stop or release their own sounds there), before the scripts are destroyed: every
+    // remaining gameplay sound stops now and the mixer returns to its pre-Play state, even if physics cleanup must
+    // be retried below.
+    m_audio.End();
     ReleaseScripts();
     m_cursorLockRequested = false;
     m_running = false;

@@ -1,4 +1,5 @@
 #include "Engine/BuildGame.h"
+#include "Engine/PackagedAudioBanks.h"
 #include "Engine/PackagedBootstrap.h"
 #include "Engine/PackagedRenderingSettings.h"
 #include "assets/CookedScene.h"
@@ -370,6 +371,82 @@ void CookScriptAssets(const Request& request, BuildAssets& build, const BuildPro
     }
 }
 
+// Reads a whole pinned build input through its pinned handle, so the cooked bytes are exactly the pinned file's.
+std::vector<std::byte> ReadPinned(const Pin& pin, const fs::path& path, std::size_t limit, const std::string& what)
+{
+    LARGE_INTEGER size{};
+    Require(GetFileSizeEx(pin.handle, &size) && size.QuadPart >= 0, "Cannot read the size of " + what + ".");
+    Require(static_cast<unsigned long long>(size.QuadPart) <= limit,
+        what + " is " + std::to_string(size.QuadPart) + " bytes; the limit is " + std::to_string(limit) +
+        " bytes. Split it into smaller banks in FMOD Studio.");
+
+    std::vector<std::byte> bytes(static_cast<std::size_t>(size.QuadPart));
+    DWORD read = 0;
+    Require(ReadFile(pin.handle, bytes.data(), static_cast<DWORD>(bytes.size()), &read, nullptr) && read == bytes.size(),
+        "Cannot read " + what + ": " + path.string());
+    return bytes;
+}
+
+// Audio.1D: every available AudioBank of the project is packaged unchanged as its own Resource entry, plus the bank
+// list entry naming them in load order. Registered banks whose file is gone (identities FMOD Studio renames leave
+// behind, Audio.1B) are skipped with a warning; an available bank that cannot be read, is too large or is not an FMOD
+// Studio bank fails the build.
+void CookAudioBanks(const Request& request, BuildAssets& build, const BuildProgress& progress)
+{
+    const std::vector<AssetRecord> registered = PackagedAudioBanks::LoadOrder(request.registry.GetAssets(AssetType::AudioBank));
+
+    if(registered.empty())
+    {
+        return;
+    }
+
+    progress.Report(.5f, "Packaging FMOD Studio banks...");
+    const ProjectPaths paths(request.project);
+    std::vector<AssetRecord> packaged;
+    std::uint64_t packagedBytes = 0;
+
+    for(const AssetRecord& bank : registered)
+    {
+        const std::string name = bank.relativePath.generic_string();
+        Require(bank.id != PackagedAudioBanks::ListID() && std::none_of(build.cookedAssets.begin(),
+            build.cookedAssets.end(), [&](const CookedSurface::Asset& asset) { return asset.id == bank.id; }),
+            "Audio bank " + name + " collides with another packaged asset identity.");
+
+        const auto resolution = ProjectAssetResolver::Resolve(paths, request.registry, bank.id);
+
+        if(resolution.status == AssetAvailability::Missing)
+        {
+            Log::Warning("Build Game: audio bank " + name + " is registered but missing; it is not packaged "
+                "(rebuild it in FMOD Studio if the game needs it).");
+            continue;
+        }
+
+        Require(resolution.status == AssetAvailability::Available,
+            "Audio bank " + name + " is unreadable or outside Content/Audio/Banks; fix or remove it.");
+
+        const Pin pin(resolution.resolvedPath);
+        const std::string what = "audio bank " + name;
+        std::vector<std::byte> bytes = ReadPinned(pin, resolution.resolvedPath, PackagedAudioBanks::MaximumBankBytes, what);
+        std::string error;
+        const bool isBank = PackagedAudioBanks::IsBank(bytes, error);
+        Require(isBank, "Audio bank " + name + " is invalid: " + error + ". Rebuild the banks in FMOD Studio.");
+
+        packagedBytes += bytes.size();
+        build.Append({bank.id, EngineAssetPak::Type::Resource, 1, std::move(bytes)});
+        packaged.push_back(bank);
+    }
+
+    if(packaged.empty())
+    {
+        return;
+    }
+
+    build.Append({PackagedAudioBanks::ListID(), EngineAssetPak::Type::Resource, 1,
+        PackagedAudioBanks::EncodeList(packaged)});
+    Log::Info("Build Game: packaged " + std::to_string(packaged.size()) + " FMOD Studio banks (" +
+        std::to_string(packagedBytes) + " bytes).");
+}
+
 void CompilePackagedShaders(const Request& request, BuildAssets& build, const BuildProgress& progress)
 {
     progress.Report(.55f, "Compiling packaged shaders offline...");
@@ -434,6 +511,20 @@ void WriteAndVerifyArchives(const Request& request, const AssetID& sceneAssetID,
         Require(settings.source == PackagedRenderingSettings::Source::Cooked &&
             settings.rendering == request.projectSettings.rendering,
             "Packaged rendering settings differ from the saved Project Settings.");
+
+        // Audio.1D: the bank list decodes, and every bank it names is in the archive and still a bank.
+        if(archiveReader.Lookup(PackagedAudioBanks::ListID()))
+        {
+            for(const AssetRecord& bank : PackagedAudioBanks::DecodeList(archiveReader.Read(PackagedAudioBanks::ListID())))
+            {
+                const auto* entry = archiveReader.Lookup(bank.id);
+                Require(entry && entry->type == EngineAssetPak::Type::Resource,
+                    "Packaged audio bank " + bank.relativePath.generic_string() + " is missing from the archive.");
+                std::string error;
+                const bool isBank = PackagedAudioBanks::IsBank(archiveReader.Read(bank.id), error);
+                Require(isBank, "Packaged audio bank " + bank.relativePath.generic_string() + " is invalid: " + error);
+            }
+        }
     }
     {
         auto verifiedScene = CookedScene::OpenArchive(
@@ -536,6 +627,32 @@ void DeployRuntimeFiles(const Request& request, const AssetID& sceneAssetID,
         Log::Info("Build Game: deployed NVIDIA DLSS Super Resolution (nvngx_dlss.dll). Its license requires the game "
             "to attribute the DLSS SDK with the NVIDIA Marks (splash screen, about box, credits) and NVIDIA to be "
             "notified before commercial release.");
+    }
+
+    // Audio.1D: FMOD's production runtime (EngineRuntime delay-loads fmod.dll and fmodstudio.dll in every
+    // configuration; the Editor's Debug logging variants fmodL/fmodstudioL are never deployed). Both or neither: a
+    // runtime directory with one of them is inconsistent. A project with audio banks needs them.
+    const bool fmodCore = fs::is_regular_file(request.runtimeDirectory / "fmod.dll");
+    const bool fmodStudio = fs::is_regular_file(request.runtimeDirectory / "fmodstudio.dll");
+    const bool projectHasBanks = !request.registry.GetAssets(AssetType::AudioBank).empty();
+    Require(fmodCore == fmodStudio, "The runtime directory has only one of fmod.dll and fmodstudio.dll; rebuild "
+        "EngineRuntime.");
+    Require(fmodCore || !projectHasBanks, "The project has FMOD Studio banks, but the runtime directory has no FMOD "
+        "runtime (EngineRuntime was built with ENGINE_ENABLE_FMOD=OFF or without the FMOD SDK).");
+
+    if(fmodCore)
+    {
+        for(const auto* fileName : {"fmod.dll", "fmodstudio.dll"})
+        {
+            const fs::path source = request.runtimeDirectory / fileName;
+            Require(!IsReparsePoint(source), std::string("The FMOD runtime ") + fileName + " must be an ordinary file.");
+            copyRuntimeFile(source, fileName);
+            deploymentFiles.emplace_back(fileName);
+        }
+
+        // Not a legal statement: the obligations are the game author's, under the FMOD license they hold.
+        Log::Info("Build Game: deployed the FMOD runtime (fmod.dll, fmodstudio.dll). Firelight's FMOD license governs "
+            "redistributing them; check its attribution and title-registration requirements before release.");
     }
 
     // EngineRuntime's build writes RuntimeNotices.txt, plus the app-local MSVC redistributables for Release.
@@ -757,6 +874,7 @@ bool Service::Start(Request request, std::string& error)
                 CookSceneAssets(request, sceneAssetID, build, progress);
                 // After the scene: scene cooking treats every earlier asset as a mesh input.
                 CookScriptAssets(request, build, progress);
+                CookAudioBanks(request, build, progress);
                 CompilePackagedShaders(request, build, progress);
                 WriteAndVerifyArchives(request, sceneAssetID, stagingDirectory, build, progress);
                 DeployRuntimeFiles(request, sceneAssetID, stagingDirectory, progress);

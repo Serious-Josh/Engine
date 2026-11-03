@@ -533,6 +533,7 @@ struct ScriptHost::Impl
     std::uint64_t world = 0;
     ObjectResolver* resolver = nullptr;
     InputSource* input = nullptr;
+    AudioService* audio = nullptr;
     std::size_t logCount = 0;
     // Reverse member destruction releases instances, then modules, then the engine.
     std::unique_ptr<asIScriptEngine, EngineDeleter> engine;
@@ -865,6 +866,260 @@ struct ScriptHost::Impl
         }
 
         generic->SetReturnByte(result ? 1 : 0);
+    }
+
+    // Audio.1C gameplay audio. Like input, the service answers only during this host's own execution; without it
+    // every call is a quiet no-op (an invalid handle, false). The service validates handles and values itself and
+    // reports actionable problems; nothing here raises a script exception, so audio can never stop gameplay.
+    bool AudioAvailable() const noexcept
+    {
+        return audio && executing && owner == std::this_thread::get_id();
+    }
+
+    static Impl& State(asIScriptGeneric* generic)
+    {
+        return *static_cast<Impl*>(generic->GetAuxiliary());
+    }
+
+    static const AudioEventHandle& ThisAudioEvent(asIScriptGeneric* generic)
+    {
+        return *static_cast<const AudioEventHandle*>(generic->GetObject());
+    }
+
+    static void ConstructAudioEvent(asIScriptGeneric* generic)
+    {
+        *static_cast<AudioEventHandle*>(generic->GetObject()) = {};
+    }
+
+    static void AudioPlay(asIScriptGeneric* generic)
+    {
+        Impl& state = State(generic);
+        AudioEventHandle handle{};
+
+        try
+        {
+            const auto& event = *static_cast<const std::string*>(generic->GetArgObject(0));
+
+            if(state.AudioAvailable() && !state.audio->PlayEvent(event, handle))
+            {
+                handle = {};
+            }
+        }
+        catch(...)
+        {
+            handle = {};
+        }
+
+        generic->SetReturnObject(&handle);
+    }
+
+    // Runs one service query or command; any failure (or an exception escaping a service) answers false.
+    template<typename Call>
+    static bool AudioCall(asIScriptGeneric* generic, Call call)
+    {
+        Impl& state = State(generic);
+
+        try
+        {
+            return state.AudioAvailable() && call(*state.audio);
+        }
+        catch(...)
+        {
+            return false;
+        }
+    }
+
+    static void AudioEventIsValid(asIScriptGeneric* generic)
+    {
+        const AudioEventHandle handle = ThisAudioEvent(generic);
+        const bool valid = AudioCall(generic, [&](AudioService& audio) { return audio.IsEventValid(handle); });
+        generic->SetReturnByte(valid ? 1 : 0);
+    }
+
+    static void AudioEventIsPlaying(asIScriptGeneric* generic)
+    {
+        const AudioEventHandle handle = ThisAudioEvent(generic);
+        const bool playing = AudioCall(generic, [&](AudioService& audio) { return audio.IsEventPlaying(handle); });
+        generic->SetReturnByte(playing ? 1 : 0);
+    }
+
+    static void AudioEventStop(asIScriptGeneric* generic)
+    {
+        const AudioEventHandle handle = ThisAudioEvent(generic);
+        const bool allowFadeOut = generic->GetArgByte(0) != 0;
+        AudioCall(generic, [&](AudioService& audio) { return audio.StopEvent(handle, allowFadeOut); });
+    }
+
+    static void AudioEventSetParameter(asIScriptGeneric* generic)
+    {
+        const AudioEventHandle handle = ThisAudioEvent(generic);
+        const auto& name = *static_cast<const std::string*>(generic->GetArgObject(0));
+        const float value = generic->GetArgFloat(1);
+        const bool set = AudioCall(generic, [&](AudioService& audio)
+        {
+            return audio.SetEventParameter(handle, name, value);
+        });
+        generic->SetReturnByte(set ? 1 : 0);
+    }
+
+    static void AudioEventSetVolume(asIScriptGeneric* generic)
+    {
+        const AudioEventHandle handle = ThisAudioEvent(generic);
+        const float volume = generic->GetArgFloat(0);
+        const bool set = AudioCall(generic, [&](AudioService& audio) { return audio.SetEventVolume(handle, volume); });
+        generic->SetReturnByte(set ? 1 : 0);
+    }
+
+    static void AudioEventRelease(asIScriptGeneric* generic)
+    {
+        const AudioEventHandle handle = ThisAudioEvent(generic);
+        AudioCall(generic, [&](AudioService& audio) { return audio.ReleaseEvent(handle); });
+    }
+
+    // Audio.2C positional events and attachment.
+    static void AudioPlayAt(asIScriptGeneric* generic)
+    {
+        Impl& state = State(generic);
+        AudioEventHandle handle{};
+
+        try
+        {
+            const auto& event = *static_cast<const std::string*>(generic->GetArgObject(0));
+            const auto& value = *static_cast<const ScriptVector3*>(generic->GetArgObject(1));
+            const float position[3] = {value.x, value.y, value.z};
+
+            if(state.AudioAvailable() && !state.audio->PlayEventAt(event, position, handle))
+            {
+                handle = {};
+            }
+        }
+        catch(...)
+        {
+            handle = {};
+        }
+
+        generic->SetReturnObject(&handle);
+    }
+
+    static void AudioEventSetPosition(asIScriptGeneric* generic)
+    {
+        const AudioEventHandle handle = ThisAudioEvent(generic);
+        const auto& value = ArgumentVector(generic);
+        const float position[3] = {value.x, value.y, value.z};
+        const bool set = AudioCall(generic, [&](AudioService& audio) { return audio.SetEventPosition(handle, position); });
+        generic->SetReturnByte(set ? 1 : 0);
+    }
+
+    static void AudioEventAttachTo(asIScriptGeneric* generic)
+    {
+        const AudioEventHandle handle = ThisAudioEvent(generic);
+        const auto& object = *static_cast<const ObjectHandle*>(generic->GetArgObject(0));
+        const std::string key = State(generic).ObjectKey(object);
+        const bool attached = AudioCall(generic, [&](AudioService& audio) { return audio.AttachEvent(handle, key); });
+        generic->SetReturnByte(attached ? 1 : 0);
+    }
+
+    static void AudioEventDetach(asIScriptGeneric* generic)
+    {
+        const AudioEventHandle handle = ThisAudioEvent(generic);
+        const bool detached = AudioCall(generic, [&](AudioService& audio) { return audio.DetachEvent(handle); });
+        generic->SetReturnByte(detached ? 1 : 0);
+    }
+
+    // Audio.2C AudioSource: the same world and slot as its SceneObject, resolved to the object's persistent ID on
+    // every call. The session owns the runtime state; a stale or default handle reaches it with an empty key, so
+    // the session warns once and nothing changes.
+    std::string ObjectKey(const ObjectHandle& handle) const
+    {
+        try
+        {
+            return Resolves(handle) ? resolver->GetObjectKey(handle.slot) : std::string();
+        }
+        catch(...)
+        {
+            return {};
+        }
+    }
+
+    static std::string SourceKey(asIScriptGeneric* generic)
+    {
+        return State(generic).ObjectKey(*static_cast<const ObjectHandle*>(generic->GetObject()));
+    }
+
+    static void ObjectGetAudioSource(asIScriptGeneric* generic)
+    {
+        const auto& handle = *static_cast<const ObjectHandle*>(generic->GetObject());
+        const std::string key = State(generic).ObjectKey(handle);
+        const bool present = !key.empty() &&
+            AudioCall(generic, [&](AudioService& audio) { return audio.HasAudioSource(key); });
+        ObjectHandle source = present ? handle : ObjectHandle{};
+        generic->SetReturnObject(&source);
+    }
+
+    static void AudioSourceIsValid(asIScriptGeneric* generic)
+    {
+        const std::string key = SourceKey(generic);
+        const bool valid = !key.empty() &&
+            AudioCall(generic, [&](AudioService& audio) { return audio.HasAudioSource(key); });
+        generic->SetReturnByte(valid ? 1 : 0);
+    }
+
+    static void AudioSourcePlay(asIScriptGeneric* generic)
+    {
+        const std::string key = SourceKey(generic);
+        AudioCall(generic, [&](AudioService& audio) { return audio.PlayAudioSource(key); });
+    }
+
+    static void AudioSourceStop(asIScriptGeneric* generic)
+    {
+        const std::string key = SourceKey(generic);
+        const bool allowFadeOut = generic->GetArgByte(0) != 0;
+        AudioCall(generic, [&](AudioService& audio) { return audio.StopAudioSource(key, allowFadeOut); });
+    }
+
+    static void AudioSourceIsPlaying(asIScriptGeneric* generic)
+    {
+        const std::string key = SourceKey(generic);
+        const bool playing = AudioCall(generic, [&](AudioService& audio) { return audio.IsAudioSourcePlaying(key); });
+        generic->SetReturnByte(playing ? 1 : 0);
+    }
+
+    static void AudioSourceSetEnabled(asIScriptGeneric* generic)
+    {
+        const std::string key = SourceKey(generic);
+        const bool enabled = generic->GetArgByte(0) != 0;
+        AudioCall(generic, [&](AudioService& audio) { return audio.SetAudioSourceEnabled(key, enabled); });
+    }
+
+    static void AudioSourceIsEnabled(asIScriptGeneric* generic)
+    {
+        const std::string key = SourceKey(generic);
+        const bool enabled = AudioCall(generic, [&](AudioService& audio) { return audio.IsAudioSourceEnabled(key); });
+        generic->SetReturnByte(enabled ? 1 : 0);
+    }
+
+    static void AudioSetGlobalParameter(asIScriptGeneric* generic)
+    {
+        const auto& name = *static_cast<const std::string*>(generic->GetArgObject(0));
+        const float value = generic->GetArgFloat(1);
+        const bool set = AudioCall(generic, [&](AudioService& audio) { return audio.SetGlobalParameter(name, value); });
+        generic->SetReturnByte(set ? 1 : 0);
+    }
+
+    static void AudioSetBusVolume(asIScriptGeneric* generic)
+    {
+        const auto& bus = *static_cast<const std::string*>(generic->GetArgObject(0));
+        const float volume = generic->GetArgFloat(1);
+        const bool set = AudioCall(generic, [&](AudioService& audio) { return audio.SetBusVolume(bus, volume); });
+        generic->SetReturnByte(set ? 1 : 0);
+    }
+
+    static void AudioSetVCAVolume(asIScriptGeneric* generic)
+    {
+        const auto& vca = *static_cast<const std::string*>(generic->GetArgObject(0));
+        const float volume = generic->GetArgFloat(1);
+        const bool set = AudioCall(generic, [&](AudioService& audio) { return audio.SetVCAVolume(vca, volume); });
+        generic->SetReturnByte(set ? 1 : 0);
     }
 
     static void InputIsKeyDown(asIScriptGeneric* generic)
@@ -1280,6 +1535,62 @@ Result ScriptHost::InitializeWithLogDeclaration(const char* declaration)
             asFUNCTION(Impl::ObjectSetLocalRotation), asCALL_GENERIC, &state));
         require(candidate->RegisterObjectMethod("SceneObject", "Vector3 GetForward() const",
             asFUNCTION(Impl::ObjectGetForward), asCALL_GENERIC, &state));
+
+        // Audio.1C gameplay audio: AudioEvent value handles and the Audio namespace.
+        const asDWORD audioFlags = asOBJ_VALUE | asOBJ_POD | asOBJ_APP_CLASS_C | asOBJ_APP_CLASS_ALLINTS;
+        require(candidate->RegisterObjectType("AudioEvent", sizeof(AudioEventHandle), audioFlags));
+        require(candidate->RegisterObjectBehaviour("AudioEvent", asBEHAVE_CONSTRUCT, "void f()",
+            asFUNCTION(Impl::ConstructAudioEvent), asCALL_GENERIC));
+        require(candidate->RegisterObjectMethod("AudioEvent", "bool IsValid() const",
+            asFUNCTION(Impl::AudioEventIsValid), asCALL_GENERIC, &state));
+        require(candidate->RegisterObjectMethod("AudioEvent", "bool IsPlaying() const",
+            asFUNCTION(Impl::AudioEventIsPlaying), asCALL_GENERIC, &state));
+        require(candidate->RegisterObjectMethod("AudioEvent", "void Stop(bool allowFadeOut = true)",
+            asFUNCTION(Impl::AudioEventStop), asCALL_GENERIC, &state));
+        require(candidate->RegisterObjectMethod("AudioEvent", "bool SetParameter(const string &in, float)",
+            asFUNCTION(Impl::AudioEventSetParameter), asCALL_GENERIC, &state));
+        require(candidate->RegisterObjectMethod("AudioEvent", "bool SetVolume(float)",
+            asFUNCTION(Impl::AudioEventSetVolume), asCALL_GENERIC, &state));
+        require(candidate->RegisterObjectMethod("AudioEvent", "void Release()",
+            asFUNCTION(Impl::AudioEventRelease), asCALL_GENERIC, &state));
+        require(candidate->RegisterObjectMethod("AudioEvent", "bool SetPosition(const Vector3 &in)",
+            asFUNCTION(Impl::AudioEventSetPosition), asCALL_GENERIC, &state));
+        require(candidate->RegisterObjectMethod("AudioEvent", "bool AttachTo(const SceneObject &in)",
+            asFUNCTION(Impl::AudioEventAttachTo), asCALL_GENERIC, &state));
+        require(candidate->RegisterObjectMethod("AudioEvent", "bool Detach()",
+            asFUNCTION(Impl::AudioEventDetach), asCALL_GENERIC, &state));
+
+        // Audio.2C runtime control of a SceneObject's Audio Source component.
+        require(candidate->RegisterObjectType("AudioSource", sizeof(ObjectHandle), objectFlags));
+        require(candidate->RegisterObjectBehaviour("AudioSource", asBEHAVE_CONSTRUCT, "void f()",
+            asFUNCTION(ConstructObjectHandle), asCALL_GENERIC));
+        require(candidate->RegisterObjectMethod("SceneObject", "AudioSource GetAudioSource() const",
+            asFUNCTION(Impl::ObjectGetAudioSource), asCALL_GENERIC, &state));
+        require(candidate->RegisterObjectMethod("AudioSource", "bool IsValid() const",
+            asFUNCTION(Impl::AudioSourceIsValid), asCALL_GENERIC, &state));
+        require(candidate->RegisterObjectMethod("AudioSource", "void Play()",
+            asFUNCTION(Impl::AudioSourcePlay), asCALL_GENERIC, &state));
+        require(candidate->RegisterObjectMethod("AudioSource", "void Stop(bool allowFadeOut = true)",
+            asFUNCTION(Impl::AudioSourceStop), asCALL_GENERIC, &state));
+        require(candidate->RegisterObjectMethod("AudioSource", "bool IsPlaying() const",
+            asFUNCTION(Impl::AudioSourceIsPlaying), asCALL_GENERIC, &state));
+        require(candidate->RegisterObjectMethod("AudioSource", "void SetEnabled(bool)",
+            asFUNCTION(Impl::AudioSourceSetEnabled), asCALL_GENERIC, &state));
+        require(candidate->RegisterObjectMethod("AudioSource", "bool IsEnabled() const",
+            asFUNCTION(Impl::AudioSourceIsEnabled), asCALL_GENERIC, &state));
+
+        require(candidate->SetDefaultNamespace("Audio"));
+        require(candidate->RegisterGlobalFunction("AudioEvent Play(const string &in)",
+            asFUNCTION(Impl::AudioPlay), asCALL_GENERIC, &state));
+        require(candidate->RegisterGlobalFunction("AudioEvent PlayAt(const string &in, const Vector3 &in)",
+            asFUNCTION(Impl::AudioPlayAt), asCALL_GENERIC, &state));
+        require(candidate->RegisterGlobalFunction("bool SetGlobalParameter(const string &in, float)",
+            asFUNCTION(Impl::AudioSetGlobalParameter), asCALL_GENERIC, &state));
+        require(candidate->RegisterGlobalFunction("bool SetBusVolume(const string &in, float)",
+            asFUNCTION(Impl::AudioSetBusVolume), asCALL_GENERIC, &state));
+        require(candidate->RegisterGlobalFunction("bool SetVCAVolume(const string &in, float)",
+            asFUNCTION(Impl::AudioSetVCAVolume), asCALL_GENERIC, &state));
+        require(candidate->SetDefaultNamespace(""));
 
         // Build an empty module to validate the complete configuration, including the
         // upstream string add-on whose registration entry point returns void.
@@ -1766,5 +2077,10 @@ void ScriptHost::SetObjectResolver(ObjectResolver* resolver) noexcept
 void ScriptHost::SetInputSource(InputSource* input) noexcept
 {
     m_impl->input = input;
+}
+
+void ScriptHost::SetAudioService(AudioService* audio) noexcept
+{
+    m_impl->audio = audio;
 }
 }

@@ -117,12 +117,14 @@ bool ProjectAssetReconciliation::Run(
         for(const auto& record : registry.GetAssets())
         {
             const auto resolution = ProjectAssetResolver::Resolve(paths, registry, record.id);
-            // Missing scripts retain identity for repair/reappearance. No reference pruning.
-            if(record.type == AssetType::Script)
+            // Missing scripts and audio banks retain identity for repair/reappearance (an FMOD Studio rebuild
+            // rewrites banks in place). No reference pruning.
+            if(record.type == AssetType::Script || record.type == AssetType::AudioBank)
             {
                 if(resolution.status != AssetAvailability::Available)
                 {
-                    report.skipped.push_back(record.id.ToReference() + ": script registration retained for repair.");
+                    const char* kind = record.type == AssetType::Script ? "script" : "audio bank";
+                    report.skipped.push_back(record.id.ToReference() + ": " + kind + " registration retained for repair.");
                 }
 
                 continue;

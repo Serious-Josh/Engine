@@ -22,6 +22,7 @@
 #include "Scene/SceneMembershipPublication.h"
 #include "Scene/SceneMaterialBindingPublication.h"
 #include "Engine/PhysicsSimulationController.h"
+#include "Audio/AudioSystem.h"
 #include "Engine/GameRuntime.h"
 #include "Project/ProjectContext.h"
 #include "Project/ProjectLoader.h"
@@ -274,6 +275,15 @@ class Engine
     PhysicsSimulationController m_physicsSimulation;
     // Shared by Editor Play and the packaged runtime; borrows m_physicsSimulation.
     GameRuntime m_gameRuntime{m_physicsSimulation};
+    // The process's only FMOD Studio system (Audio.1A): started with the project-independent services, updated once
+    // per frame, released in Shutdown after gameplay stops.
+    Audio::AudioSystem m_audio;
+    // Audio.1B: discovers the project's FMOD Studio banks and loads every available one for the project's (= the
+    // process's) lifetime; AudioSystem::Shutdown unloads them. Failures are logged and never block project opening.
+    void LoadProjectAudioBanks(const ProjectPaths& paths);
+    // Audio.1D: packaged games load every bank the archive lists from Game.eap through FMOD's copying memory path,
+    // before gameplay starts. A missing list means no banks; a damaged list or bank is logged and skipped (nonfatal).
+    void LoadPackagedAudioBanks();
     bool StartPackagedGame(FileSceneRuntime& runtime, std::string& error);
     bool AdvancePackagedGame(FileSceneRuntime& runtime, double elapsedSeconds, std::string& error);
     // AS.6B cursor lock policy shared by both hosts. A script's lock request is granted over

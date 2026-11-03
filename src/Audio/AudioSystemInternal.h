@@ -1,0 +1,93 @@
+#pragma once
+
+// Private to the audio module (AudioSystem.cpp, AudioBanks.cpp): the only headers that include FMOD.
+
+#include "Audio/AudioSystem.h"
+
+#include <string>
+#include <vector>
+
+#if defined(ENGINE_HAS_FMOD)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+
+#include <fmod.hpp>
+#include <fmod_errors.h>
+#include <fmod_studio.hpp>
+#endif
+
+namespace Audio
+{
+#if defined(ENGINE_HAS_FMOD)
+namespace Internal
+{
+    enum class Output
+    {
+        Device,
+        NoSound
+    };
+
+    // "<FMOD's message> (FMOD_RESULT n)".
+    std::string DescribeResult(FMOD_RESULT result);
+}
+#endif
+
+struct AudioSystem::Impl
+{
+    Status status = Status::NotStarted;
+    std::string statusDetail;
+    std::uint64_t updateCount = 0;
+    bool claimedProcessSystem = false;
+    bool updateFailureReported = false;
+
+    bool IsRunning() const noexcept
+    {
+        return status == Status::Active || status == Status::NoOutput;
+    }
+
+#if defined(ENGINE_HAS_FMOD)
+    // Owned. Its Core system is borrowed from it and released by Studio::System::release, never directly.
+    FMOD::Studio::System* studio = nullptr;
+    FMOD::System* core = nullptr;
+
+    FMOD_RESULT Start(Internal::Output output, InjectedFailure injectedFailure);
+    void ReleaseStudioSystem() noexcept;
+    std::string DescribeRunningOutput(Internal::Output output) const;
+
+    // Audio.1B banks: one entry per loaded key. The Bank handle is FMOD's; Engine owns the right to unload it.
+    struct BankEntry
+    {
+        std::string key;
+        FMOD::Studio::Bank* bank = nullptr;
+        std::uint32_t references = 0;
+    };
+
+    // Audio.1B event instances created through AudioSystem. FMOD's handles are validated by FMOD itself
+    // (EventInstance::isValid), so an instance destroyed by a bank unload is detected rather than dereferenced.
+    struct EventSlot
+    {
+        FMOD::Studio::EventInstance* instance = nullptr;
+        std::uint32_t generation = 0;
+    };
+
+    std::vector<BankEntry> banks;
+    std::vector<EventSlot> eventSlots;
+    std::vector<std::uint32_t> freeEventSlots;
+
+    BankEntry* FindBank(std::string_view key);
+    const BankEntry* FindBank(std::string_view key) const;
+    bool AddLoadedBank(std::string_view key, FMOD_RESULT result, FMOD::Studio::Bank* bank, std::string& error);
+    FMOD::Studio::EventInstance* ResolveEvent(EventHandle handle) const;
+    void FreeEventSlot(std::uint32_t index) noexcept;
+    // Drops slots whose instance FMOD has destroyed (bank unloaded, or released and finished).
+    void ReapEventSlots() noexcept;
+    void ReleaseAllEvents() noexcept;
+    void UnloadAllBanks() noexcept;
+#endif
+};
+}

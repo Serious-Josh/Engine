@@ -278,10 +278,15 @@ void Editor::DrawAddComponentControls(IDemoScene& scene)
         const bool lightMatches = lightAvailable && std::string_view("light").find(query) != std::string_view::npos;
         const bool scriptAvailable = !object.script;
         const bool scriptMatches = scriptAvailable && std::string_view("script").find(query) != std::string_view::npos;
+        const bool sourceAvailable = !object.audioSource;
+        const bool sourceMatches = sourceAvailable && std::string_view("audio source").find(query) != std::string_view::npos;
+        const bool listenerAvailable = !object.audioListener;
+        const bool listenerMatches = listenerAvailable && std::string_view("audio listener").find(query) != std::string_view::npos;
         const bool triggerMatches = triggerAvailable && std::string_view("trigger collider").find(query) != std::string_view::npos;
         const bool controllerMatches = controllerAbsent && std::string_view("character controller").find(query) != std::string_view::npos;
         const int eligibleMatches = static_cast<int>(triggerMatches) + static_cast<int>(controllerMatches && controllerAvailable) +
-            static_cast<int>(cameraMatches) + static_cast<int>(lightMatches) + static_cast<int>(scriptMatches);
+            static_cast<int>(cameraMatches) + static_cast<int>(lightMatches) + static_cast<int>(scriptMatches) +
+            static_cast<int>(sourceMatches) + static_cast<int>(listenerMatches);
         ImGui::Separator();
         ImGui::PushItemFlag(ImGuiItemFlags_AutoClosePopups, false);
         const bool triggerSelected = triggerMatches && ImGui::MenuItem("Trigger Collider");
@@ -300,8 +305,11 @@ void Editor::DrawAddComponentControls(IDemoScene& scene)
         const bool cameraSelected = cameraMatches && ImGui::MenuItem("Camera");
         const bool lightSelected = lightMatches && ImGui::MenuItem("Light");
         const bool scriptSelected = scriptMatches && ImGui::MenuItem("Script");
+        const bool sourceSelected = sourceMatches && ImGui::MenuItem("Audio Source");
+        const bool listenerSelected = listenerMatches && ImGui::MenuItem("Audio Listener");
 
-        if(!triggerAvailable && !controllerAvailable && !cameraAvailable && !lightAvailable && !scriptAvailable)
+        if(!triggerAvailable && !controllerAvailable && !cameraAvailable && !lightAvailable && !scriptAvailable &&
+            !sourceAvailable && !listenerAvailable)
         {
             ImGui::TextDisabled("No components available.");
         }
@@ -317,14 +325,16 @@ void Editor::DrawAddComponentControls(IDemoScene& scene)
         const bool addCamera = cameraMatches && (cameraSelected || (searchEnter && eligibleMatches == 1));
         const bool addLight = lightMatches && (lightSelected || (searchEnter && eligibleMatches == 1));
         const bool addScript = scriptMatches && (scriptSelected || (searchEnter && eligibleMatches == 1));
+        const bool addSource = sourceMatches && (sourceSelected || (searchEnter && eligibleMatches == 1));
+        const bool addListener = listenerMatches && (listenerSelected || (searchEnter && eligibleMatches == 1));
 
         // Enter deactivates the search field; keep it focused when the query selects nothing.
-        if(searchEnter && !addTrigger && !addController && !addCamera && !addLight && !addScript)
+        if(searchEnter && !addTrigger && !addController && !addCamera && !addLight && !addScript && !addSource && !addListener)
         {
             m_focusComponentSearch = true;
         }
 
-        if(m_addComponentPopup && (addTrigger || addController || addCamera || addLight || addScript))
+        if(m_addComponentPopup && (addTrigger || addController || addCamera || addLight || addScript || addSource || addListener))
         {
             ValidateAddComponentPopup(scene);
             const auto current = ResolveComponentEditTarget(scene);
@@ -360,6 +370,17 @@ void Editor::DrawAddComponentControls(IDemoScene& scene)
                 {
                     // An empty Script; the Inspector then assigns the asset and class.
                     committed = CommitObjectScript(scene, *current, std::nullopt, ScriptComponent{});
+                }
+                else if(addSource && !latest.audioSource)
+                {
+                    // An Audio Source without an event; the Inspector then picks one from the loaded banks.
+                    committed = CommitObjectAudio(scene, *current, {latest.audioSource, latest.audioListener},
+                        {AudioSourceComponent{}, latest.audioListener});
+                }
+                else if(addListener && !latest.audioListener)
+                {
+                    committed = CommitObjectAudio(scene, *current, {latest.audioSource, latest.audioListener},
+                        {latest.audioSource, AudioListenerComponent{}});
                 }
 
                 if(committed)

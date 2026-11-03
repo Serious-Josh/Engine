@@ -14,7 +14,11 @@
 
 namespace
 {
-    constexpr int kSchemaVersion = 3;
+    // Each version adds what older executables must reject rather than silently drop: 2 mesh import units,
+    // 3 script assets, 4 audio bank assets. Output uses the lowest version that can hold the registry.
+    constexpr int kScriptSchemaVersion = 3;
+    constexpr int kAudioBankSchemaVersion = 4;
+    constexpr int kSchemaVersion = kAudioBankSchemaVersion;
 
     const char* AssetTypeToString(AssetType type)
     {
@@ -27,6 +31,8 @@ namespace
                 return "texture";
             case AssetType::Script:
                 return "script";
+            case AssetType::AudioBank:
+                return "audioBank";
             default:
                 return nullptr;
         }
@@ -57,6 +63,12 @@ namespace
         if(value == "script")
         {
             type = AssetType::Script;
+            return true;
+        }
+
+        if(value == "audioBank")
+        {
+            type = AssetType::AudioBank;
             return true;
         }
 
@@ -109,7 +121,12 @@ nlohmann::json AssetRegistrySerializer::Serialize(const ProjectAssetRegistry& re
 
         if(record.type == AssetType::Script)
         {
-            document["schemaVersion"] = kSchemaVersion;
+            document["schemaVersion"] = (std::max)(document["schemaVersion"].get<int>(), kScriptSchemaVersion);
+        }
+
+        if(record.type == AssetType::AudioBank)
+        {
+            document["schemaVersion"] = (std::max)(document["schemaVersion"].get<int>(), kAudioBankSchemaVersion);
         }
     }
 
@@ -184,16 +201,22 @@ bool AssetRegistrySerializer::Deserialize(
 
             AssetRecord record{*id, type, std::filesystem::u8path(pathText)};
 
-            if(type == AssetType::Script && document["schemaVersion"].get<int>() < 3)
+            if(type == AssetType::Script && document["schemaVersion"].get<int>() < kScriptSchemaVersion)
             {
                 return Fail(errorMessage, "Script assets require registry schema 3.");
             }
 
-            const auto canonicalPath = record.relativePath.generic_u8string();
-
-            if(type == AssetType::Script && pathText != std::string(canonicalPath.begin(), canonicalPath.end()))
+            if(type == AssetType::AudioBank && document["schemaVersion"].get<int>() < kAudioBankSchemaVersion)
             {
-                return Fail(errorMessage, "Script registry paths must use canonical spelling.");
+                return Fail(errorMessage, "Audio bank assets require registry schema 4.");
+            }
+
+            const auto canonicalPath = record.relativePath.generic_u8string();
+            const bool discoveredType = type == AssetType::Script || type == AssetType::AudioBank;
+
+            if(discoveredType && pathText != std::string(canonicalPath.begin(), canonicalPath.end()))
+            {
+                return Fail(errorMessage, "Script and audio bank registry paths must use canonical spelling.");
             }
 
             if(entry.contains("importUnits"))

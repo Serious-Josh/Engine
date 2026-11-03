@@ -76,6 +76,7 @@ FetchContent_MakeAvailable(nlohmann_json)
 include(cmake/AgilitySDK.cmake)
 include(cmake/DXC.cmake)
 include(cmake/DLSS.cmake)
+include(cmake/FMOD.cmake)
 
 include(cmake/Box3D.cmake)
 add_subdirectory(src/Physics)
@@ -84,6 +85,29 @@ include(cmake/AngelScript.cmake)
 add_library(EngineScripting STATIC src/Scripting/ScriptHost.cpp src/Scripting/ScriptSources.cpp)
 target_include_directories(EngineScripting PUBLIC src)
 target_link_libraries(EngineScripting PRIVATE EngineScriptString EngineScriptBuilder bcrypt)
+
+# Audio.1A: the only target compiled against FMOD headers. Without the SDK it builds a backend-free AudioSystem
+# that reports audio as disabled, so no other target needs to know whether FMOD is present.
+add_library(EngineAudio STATIC src/Audio/AudioSystem.cpp src/Audio/AudioBanks.cpp src/Audio/AudioControl.cpp)
+target_include_directories(EngineAudio PUBLIC src)
+engine_configure_fmod(EngineAudio)
+
+if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Audio/tests/AudioSystemTests.cpp")
+    add_executable(AudioSystemTests src/Audio/tests/AudioSystemTests.cpp src/Core/Log.cpp)
+    target_link_libraries(AudioSystemTests PRIVATE EngineAudio)
+    set_target_properties(AudioSystemTests PROPERTIES ENGINE_FMOD_LOGGING ON)
+    engine_deploy_fmod(AudioSystemTests)
+endif()
+
+# Audio.1C local-only regression: AngelScript -> GameAudioSession -> AudioSystem with real FMOD banks.
+if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Engine/tests/AudioSessionTests.cpp")
+    add_executable(AudioSessionTests src/Engine/tests/AudioSessionTests.cpp src/Engine/GameAudioSession.cpp
+        src/Core/Log.cpp)
+    target_include_directories(AudioSessionTests PRIVATE src)
+    target_link_libraries(AudioSessionTests PRIVATE EngineAudio EngineScripting EngineScriptString)
+    set_target_properties(AudioSessionTests PROPERTIES ENGINE_FMOD_LOGGING ON)
+    engine_deploy_fmod(AudioSessionTests)
+endif()
 
 add_library(EngineScriptAssets STATIC src/assets/ProjectScriptAssets.cpp)
 target_include_directories(EngineScriptAssets PUBLIC src)
@@ -102,6 +126,18 @@ if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/assets/t
         src/assets/AssetReconciliationTransaction.cpp src/assets/ProjectAssetRename.cpp
         src/assets/ProjectAssetDeletion.cpp src/assets/MaterialAssetSerializer.cpp src/Core/Log.cpp)
     target_link_libraries(ScriptAssetTests PRIVATE EngineScriptAssets nlohmann_json ole32)
+endif()
+
+# Audio.1B local-only regression: AudioBank discovery and registry persistence (no FMOD needed).
+if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/assets/tests/AudioBankAssetTests.cpp")
+    add_executable(AudioBankAssetTests src/assets/tests/AudioBankAssetTests.cpp src/assets/ProjectAudioBankAssets.cpp
+        src/Engine/PackagedAudioBanks.cpp
+        src/Project/ProjectPaths.cpp src/assets/AssetID.cpp src/assets/AssetRecord.cpp
+        src/assets/ProjectAssetRegistry.cpp src/assets/AssetRegistrySerializer.cpp
+        src/assets/ProjectAssetResolver.cpp src/assets/ProjectAssetReconciliation.cpp
+        src/assets/AssetReconciliationTransaction.cpp src/assets/ProjectAssetRename.cpp
+        src/assets/ProjectAssetDeletion.cpp src/assets/MaterialAssetSerializer.cpp src/Core/Log.cpp)
+    target_link_libraries(AudioBankAssetTests PRIVATE EngineScriptAssets nlohmann_json ole32)
 endif()
 
 # RTXPT.1A.1 offline generator for the bundled GGX single-scatter complement tables
@@ -262,6 +298,7 @@ add_library(EngineCore OBJECT
     src/assets/ProjectAssetRename.cpp
     src/assets/AssetReconciliationTransaction.cpp
     src/assets/ProjectAssetReconciliation.cpp
+    src/assets/ProjectAudioBankAssets.cpp
     src/Editor/TextureThumbnailCache.cpp
     src/Editor/TextureThumbnailDiskCache.cpp
     src/Editor/AssetBrowser.cpp
@@ -333,11 +370,14 @@ add_library(EngineCore OBJECT
     src/Engine/EditorPhysicsSimulation.cpp
     src/Engine/PackagedGame.cpp
     src/Engine/GameRuntime.cpp
+    src/Engine/GameAudioSession.cpp
+    src/Engine/PackagedAudioBanks.cpp
     src/Engine/EditorGamePlay.cpp
     src/Engine/CharacterDriveScheduling.cpp
     src/Editor/PhysicsSimulationControls.cpp
     src/Editor/GamePlayControls.cpp
     src/Editor/ScriptControls.cpp
+    src/Editor/AudioControls.cpp
     src/Scene/FileSceneAssetCatalog.cpp
     src/Scene/SceneMetadataPreparation.cpp
     src/Scene/MeshResidency.cpp
@@ -471,6 +511,12 @@ if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Engine/t
     if(ENGINE_VERIFICATION_AVAILABLE)
         target_link_libraries(CameraDataTests PRIVATE $<$<CONFIG:Debug>:EngineVerification>)
     endif()
+endif()
+
+# Local-only Audio.2A scene audio data regression (components, codecs, audio world poses).
+if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Engine/tests/AudioSceneDataTests.cpp")
+    add_executable(AudioSceneDataTests src/Engine/tests/AudioSceneDataTests.cpp)
+    target_link_libraries(AudioSceneDataTests PRIVATE EngineCore)
 endif()
 
 # Local-only E.4 regression: single-object inspection capture equals the full-scene capture, same guard as CameraDataTests.
@@ -632,6 +678,11 @@ engine_deploy_dxc(Engine)
 # runtime too; Build Game ships it only in games whose saved settings can use DLSS (BuildGame.cpp DeployRuntimeFiles).
 engine_deploy_dlss(Engine)
 engine_deploy_dlss(EngineRuntime)
+# Both executables start audio. The Editor uses FMOD's logging DLLs in Debug; EngineRuntime, whose directory Build Game
+# deploys games from, always uses the production DLLs (cmake/FMOD.cmake, ENGINE_FMOD_LOGGING).
+set_target_properties(Engine PROPERTIES ENGINE_FMOD_LOGGING ON)
+engine_deploy_fmod(Engine)
+engine_deploy_fmod(EngineRuntime)
 
 # Agility SDK D3D12 headers take precedence over the Windows SDK copies.
 target_include_directories(EngineCore BEFORE PUBLIC "${ENGINE_AGILITY_SDK_INCLUDE_DIR}")
@@ -655,6 +706,7 @@ target_link_libraries(EngineCore
         EnginePhysics
         EngineScripting
         EngineScriptAssets
+        EngineAudio
         Rtxdi
         shell32
         ole32

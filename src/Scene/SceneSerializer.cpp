@@ -651,6 +651,21 @@ namespace
                     {"className", object.script->className}
                 };
             }
+
+            if(object.audioSource)
+            {
+                objects.back()["audioSource"] = {
+                    {"enabled", object.audioSource->enabled},
+                    {"eventGuid", object.audioSource->eventGuid},
+                    {"eventPath", object.audioSource->eventPath},
+                    {"autoplay", object.audioSource->autoplay}
+                };
+            }
+
+            if(object.audioListener)
+            {
+                objects.back()["audioListener"] = {{"enabled", object.audioListener->enabled}};
+            }
         }
 
         const auto& camera = document.camera;
@@ -695,7 +710,8 @@ namespace
              schemaVersion != SceneDocument::kEnvironmentNoneSchemaVersion &&
              schemaVersion != SceneDocument::kObjectLightingSchemaVersion &&
              schemaVersion != SceneDocument::kPhysicalLightingSchemaVersion &&
-             schemaVersion != SceneDocument::kScriptSchemaVersion))
+             schemaVersion != SceneDocument::kScriptSchemaVersion &&
+             schemaVersion != SceneDocument::kAudioSchemaVersion))
         {
             throw std::runtime_error("Unsupported scene schema version.");
         }
@@ -766,7 +782,8 @@ namespace
         for (const Json& item : objects)
         {
             ValidateFields(item, {"id", "parentID", "name", "transform", "meshReference", "materialReference",
-                "materialSlotBindings", "physics", "triggerCollider", "characterController", "camera", "light", "script"});
+                "materialSlotBindings", "physics", "triggerCollider", "characterController", "camera", "light", "script",
+                "audioSource", "audioListener"});
             if (legacySchema && item.contains("physics"))
             {
                 throw std::runtime_error("Physics fields require scene schema version 2.");
@@ -936,6 +953,53 @@ namespace
                 }
 
                 object.script = std::move(script);
+            }
+
+            if(item.contains("audioSource") || item.contains("audioListener"))
+            {
+                if(schemaVersion.get<std::uint32_t>() < SceneDocument::kAudioSchemaVersion)
+                {
+                    throw std::runtime_error("Audio component fields require scene schema version 16.");
+                }
+            }
+
+            if(item.contains("audioSource"))
+            {
+                const auto& value = item.at("audioSource");
+                ValidateFields(value, {"enabled", "eventGuid", "eventPath", "autoplay"});
+
+                if(!value.at("enabled").is_boolean() || !value.at("eventGuid").is_string() ||
+                    !value.at("eventPath").is_string() || !value.at("autoplay").is_boolean())
+                {
+                    throw std::runtime_error("Invalid Audio Source field types for object " + object.id + ".");
+                }
+
+                AudioSourceComponent source;
+                source.enabled = value.at("enabled").get<bool>();
+                source.eventGuid = value.at("eventGuid").get<std::string>();
+                source.eventPath = value.at("eventPath").get<std::string>();
+                source.autoplay = value.at("autoplay").get<bool>();
+                std::string sourceError;
+
+                if(!ValidateAudioSourceComponent(source, &sourceError))
+                {
+                    throw std::runtime_error("Invalid Audio Source for object " + object.id + ": " + sourceError);
+                }
+
+                object.audioSource = std::move(source);
+            }
+
+            if(item.contains("audioListener"))
+            {
+                const auto& value = item.at("audioListener");
+                ValidateFields(value, {"enabled"});
+
+                if(!value.at("enabled").is_boolean())
+                {
+                    throw std::runtime_error("Invalid Audio Listener field types for object " + object.id + ".");
+                }
+
+                object.audioListener = AudioListenerComponent{value.at("enabled").get<bool>()};
             }
 
             result.objects.push_back(std::move(object));

@@ -1789,7 +1789,7 @@ void AssetBrowser::DrawAssetMoveSource(const std::filesystem::path& path, const 
         return;
     }
     const auto* record = m_thumbnailRegistry->FindByPath(path.lexically_relative(m_thumbnailPaths->GetRoot()));
-    if(!record || record->type == AssetType::Script ||
+    if(!record || record->type == AssetType::Script || record->type == AssetType::AudioBank ||
         !ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceNoHoldToOpenOthers))
     {
         return;
