@@ -258,6 +258,10 @@ public:
     Result Invoke(InstanceID instance, Lifecycle callback, ExecutionLimits limits = {});
     // AS.6A: runs OnUpdate(float deltaTime) under the same limits and fault reporting.
     Result Update(InstanceID instance, float deltaTime, ExecutionLimits limits = {});
+    // Developer tooling: the registered script API plus EAScript, written as as.predefined declarations for the
+    // AngelScript Language Server. Compiles EAScript in a private module to reflect it; runs no script code and
+    // leaves built modules and instances untouched.
+    Result DescribeApi(std::string& declarations);
     void SetObjectResolver(ObjectResolver* resolver) noexcept;
     void SetInputSource(InputSource* input) noexcept;
     // Audio.1C: the gameplay audio session; scripts reach it only while their code executes.

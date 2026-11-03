@@ -82,9 +82,21 @@ include(cmake/Box3D.cmake)
 add_subdirectory(src/Physics)
 include(cmake/AngelScript.cmake)
 
-add_library(EngineScripting STATIC src/Scripting/ScriptHost.cpp src/Scripting/ScriptSources.cpp)
+add_library(EngineScripting STATIC src/Scripting/ScriptHost.cpp src/Scripting/ScriptSources.cpp
+    src/Scripting/ScriptApiDeclarations.cpp src/Scripting/ScriptApiExport.cpp)
 target_include_directories(EngineScripting PUBLIC src)
 target_link_libraries(EngineScripting PRIVATE EngineScriptString EngineScriptBuilder bcrypt)
+
+# Developer tooling: writes as.predefined (Engine's script API for the AngelScript Language Server) from the live
+# ScriptHost registrations. Needs no renderer, audio or project. `cmake --build build --target
+# UpdateScriptApiDeclarations` refreshes Projects/as.predefined; it never runs as part of a normal build.
+add_executable(ScriptApiExport src/Scripting/ScriptApiExportMain.cpp src/Core/Log.cpp)
+target_link_libraries(ScriptApiExport PRIVATE EngineScripting)
+add_custom_target(UpdateScriptApiDeclarations
+    COMMAND ScriptApiExport "${CMAKE_CURRENT_SOURCE_DIR}/Projects/as.predefined"
+    DEPENDS ScriptApiExport
+    COMMENT "Writing Projects/as.predefined from the registered AngelScript API"
+    VERBATIM)
 
 # Audio.1A: the only target compiled against FMOD headers. Without the SDK it builds a backend-free AudioSystem
 # that reports audio as disabled, so no other target needs to know whether FMOD is present.
@@ -116,6 +128,11 @@ target_link_libraries(EngineScriptAssets PUBLIC EngineScripting PRIVATE nlohmann
 if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Engine/tests/ScriptHostTests.cpp")
     add_executable(ScriptHostTests src/Engine/tests/ScriptHostTests.cpp src/Core/Log.cpp)
     target_link_libraries(ScriptHostTests PRIVATE EngineScripting EngineScriptString)
+endif()
+
+if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Engine/tests/ScriptApiDeclarationTests.cpp")
+    add_executable(ScriptApiDeclarationTests src/Engine/tests/ScriptApiDeclarationTests.cpp src/Core/Log.cpp)
+    target_link_libraries(ScriptApiDeclarationTests PRIVATE EngineScripting EngineScriptString)
 endif()
 
 if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/assets/tests/ScriptAssetTests.cpp")

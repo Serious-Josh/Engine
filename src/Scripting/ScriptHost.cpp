@@ -1,5 +1,6 @@
 #include "Scripting/ScriptHost.h"
 #include "Core/Log.h"
+#include "Scripting/ScriptApiDeclarations.h"
 
 #include <angelscript.h>
 #include <scriptstdstring.h>
@@ -2066,6 +2067,55 @@ Result ScriptHost::Update(InstanceID instance, float deltaTime, ExecutionLimits 
 
     state.Run(*method, target.object.get(), limits, snapshot.rootSection, nullptr, &deltaTime);
     AttributeDiagnostics(state.result, snapshot);
+    return state.result;
+}
+
+Result ScriptHost::DescribeApi(std::string& declarations)
+{
+    auto& state = *m_impl;
+
+    if(!state.IsAvailable())
+    {
+        return {Status::InvalidRequest};
+    }
+
+    state.result = {Status::Failed};
+
+    if(!state.engine)
+    {
+        return {Status::NotInitialized};
+    }
+
+    // EAScript is script source, so engine reflection does not list it. Compile the same embedded section every
+    // behaviour module receives, in a module of its own, and reflect the resulting class.
+    std::unique_ptr<asIScriptModule, ModuleDeleter> baseModule(
+        state.engine->GetModule("api-declarations", asGM_ALWAYS_CREATE));
+
+    if(!baseModule || baseModule->AddScriptSection(EAScriptSection, EAScriptSource) < 0 || baseModule->Build() < 0)
+    {
+        AddDiagnostic(state.result, "Cannot compile the EAScript base class for API declarations.", EAScriptSection);
+        return state.result;
+    }
+
+    const asITypeInfo* scriptBase = baseModule->GetTypeInfoByName("EAScript");
+
+    if(!scriptBase)
+    {
+        AddDiagnostic(state.result, "The EAScript base class is missing from its section.", EAScriptSection);
+        return state.result;
+    }
+
+    try
+    {
+        declarations = WriteScriptApiDeclarations(*state.engine, scriptBase);
+    }
+    catch(const std::exception& error)
+    {
+        AddDiagnostic(state.result, error.what());
+        return state.result;
+    }
+
+    state.result.status = Status::Finished;
     return state.result;
 }
 
