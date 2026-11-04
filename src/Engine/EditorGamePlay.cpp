@@ -118,6 +118,18 @@ void Engine::ProcessEditorGamePlay(FileSceneRuntime* runtime, double elapsedSeco
                 return ProjectScriptAssets::Build(host, GetActiveProject().GetPaths(), m_projectAssetRegistry, asset, module);
             };
 
+            // M4: the acoustic scene is built from the meshes the scene already holds, once, at Play.
+            GameRuntime::AcousticAssets acousticAssets;
+            acousticAssets.meshGeometry = [this](const Mesh& mesh) -> const ImportedMesh*
+            {
+                return m_demoSceneManager.GetActiveScene().GetMeshGeometry(mesh);
+            };
+            acousticAssets.material = [this](const std::string& reference, std::string* materialError)
+            {
+                return AcousticMaterials::Resolve(reference, &GetActiveProject().GetPaths(), &m_projectAssetRegistry, materialError);
+            };
+            m_gameRuntime.SetAcousticAssets(std::move(acousticAssets));
+
             if(!m_gameRuntime.Start(*runtime, m_renderer, true, viewWidth, viewHeight, error, scripts))
             {
                 m_gameMessage = "Cannot play: " + error;

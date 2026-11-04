@@ -14,7 +14,8 @@ struct TriggerColliderComponent
     float capsuleRadius = 0.5f;
     float capsuleCylinderHeight = 1.0f;
 
-    // Unscaled meters. Capsule rotation turns its +Y axis about this offset,
+    // Local (unscaled) space like PhysicsComponent: the sensor uses these times the object's
+    // scale (ColliderScaling.h). Capsule rotation turns its +Y axis about this offset,
     // without rotating the offset itself. Rotation is Rz * Ry * Rx in radians.
     Vector3 colliderLocalPositionOffset{0.0f, 0.0f, 0.0f};
     Vector3 capsuleLocalRotation{0.0f, 0.0f, 0.0f};

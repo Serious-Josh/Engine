@@ -133,8 +133,9 @@ Vector3 ColliderArrowsVertex(unsigned int vertexIndex);
 unsigned int ColliderVertexCount(ColliderOverlayShape shape);
 Vector3 ColliderShapeVertex(ColliderOverlayShape shape, unsigned int vertexIndex, float halfCylinderHeightInRadii = 0.0f);
 
-// Shape-specific collider placement. Each rejects the other collider types, and none
-// applies authored visual scale.
+// Shape-specific collider placement. Each rejects the other collider types. Box, Sphere and
+// Capsule (Physics and Trigger) draw the effective collider at the object's scale
+// (ColliderScaling.h), the shape physics registers; Character Controllers ignore scale.
 bool BuildColliderBoxMatrix(const Physics::PhysicsComponent& component, const RenderObject& object,
     bool presentationActive, Matrix4& colliderWorldTransform);
 bool BuildColliderSphereMatrix(const Physics::PhysicsComponent& component, const RenderObject& object,

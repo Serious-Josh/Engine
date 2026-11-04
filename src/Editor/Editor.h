@@ -423,6 +423,7 @@ public:
     void DrawMaterialLeaveConfirmation(IDemoScene& scene, const ProjectPaths& projectPaths,
         const ProjectAssetRegistry& assetRegistry);
     std::optional<AssetBrowser::MaterialCreationRequest> TakeMaterialCreationRequest();
+    std::optional<AssetBrowser::AcousticMaterialCreationRequest> TakeAcousticMaterialCreationRequest();
     std::optional<AssetBrowser::MeshImportUnitsRequest> TakeMeshImportUnitsRequest()
     {
         return m_assetBrowser.TakeMeshImportUnitsRequest();
@@ -675,6 +676,8 @@ private:
     bool m_renderingSettingsMessageIsError = false;
     void DrawStartupSceneSection(const IDemoScene& demoScene);
     void DrawRenderingSettingsCategory(const DebugUI& debugUI, bool editable);
+    // SA.2B: Steam Audio enablement (audio.steamAudio.enabled) and this session's runtime state.
+    void DrawAudioSettingsCategory(const DebugUI& debugUI, bool editable);
     void DrawRenderingRuntimeStatus(const DebugUI& debugUI);
     void DrawProjectSettingsCloseConfirmation();
     void RequestProjectSettingsSave(ProjectSettingsCloseAction closeAfterSave);
@@ -999,6 +1002,26 @@ private:
         AudioComponentState before;
         AudioComponentState after;
     };
+    // M4: one complete replacement of a mesh object's inherent acoustic settings per entry (AcousticControls.cpp).
+    struct AcousticSettingsEdit
+    {
+        SceneHistorySession session;
+        std::string objectID;
+        std::optional<AcousticSettings> before;
+        std::optional<AcousticSettings> after;
+    };
+    void DrawObjectAcousticControls(IDemoScene& scene, const ProjectPaths& paths, const ProjectAssetRegistry& registry);
+    void DrawAcousticSubmeshField(IDemoScene& scene, const SceneObjectMetadata& selection, const std::optional<AcousticSettings>& before,
+        const std::string& submeshKey, const std::string& label, const ProjectPaths& paths, const ProjectAssetRegistry& registry, bool blocked);
+    void DrawAcousticMaterialPicker(IDemoScene& scene, const SceneObjectMetadata& selection, const std::optional<AcousticSettings>& before,
+        const std::string& submeshKey, const ProjectAssetRegistry& registry);
+    bool CommitObjectAcoustics(IDemoScene& scene, const SceneObjectMetadata& selection, const std::optional<AcousticSettings>& before,
+        const std::optional<AcousticSettings>& after);
+    bool AssignAcousticMaterialReference(IDemoScene& scene, const SceneObjectMetadata& selection, const std::optional<AcousticSettings>& before,
+        const std::string& submeshKey, std::string_view reference, const ProjectAssetRegistry& registry);
+    static size_t AcousticEditPayloadBytes(const AcousticSettingsEdit& edit);
+    std::string m_acousticEditStatus;
+    std::array<char, 128> m_acousticMaterialSearch{};
     enum class AudioComponentKind
     {
         Source,
@@ -1145,7 +1168,7 @@ private:
         std::unique_ptr<TriggerColliderEdit>, std::unique_ptr<CharacterControllerEdit>, TransformEdit, std::unique_ptr<GroupTransformEdit>,
         std::unique_ptr<ObjectDeletion>, std::unique_ptr<RenameObject>, std::unique_ptr<ReorderObjects>,
         std::unique_ptr<MaterialBindingsEdit>, std::unique_ptr<CameraEdit>, std::unique_ptr<LightEdit>,
-        std::unique_ptr<ScriptEdit>, std::unique_ptr<AudioComponentsEdit>>;
+        std::unique_ptr<ScriptEdit>, std::unique_ptr<AudioComponentsEdit>, std::unique_ptr<AcousticSettingsEdit>>;
     struct SceneHistoryEntry
     {
         SceneHistoryCommand command;

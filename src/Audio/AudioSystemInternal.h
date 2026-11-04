@@ -3,7 +3,10 @@
 // Private to the audio module (AudioSystem.cpp, AudioBanks.cpp): the only headers that include FMOD.
 
 #include "Audio/AudioSystem.h"
+#include "Audio/SteamAudioRuntime.h"
+#include "Audio/SteamAudioSimulation.h"
 
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -29,7 +32,9 @@ namespace Internal
     enum class Output
     {
         Device,
-        NoSound
+        NoSound,
+        // Verification: FMOD's offline output, with each Studio update mixing synchronously.
+        Offline
     };
 
     // "<FMOD's message> (FMOD_RESULT n)".
@@ -44,6 +49,8 @@ struct AudioSystem::Impl
     std::uint64_t updateCount = 0;
     bool claimedProcessSystem = false;
     bool updateFailureReported = false;
+    SteamAudioStatus steamAudioStatus = SteamAudioStatus::NotRequested;
+    std::string steamAudioDetail;
 
     bool IsRunning() const noexcept
     {
@@ -54,8 +61,16 @@ struct AudioSystem::Impl
     // Owned. Its Core system is borrowed from it and released by Studio::System::release, never directly.
     FMOD::Studio::System* studio = nullptr;
     FMOD::System* core = nullptr;
+#if defined(ENGINE_HAS_STEAMAUDIO)
+    // SA.1: present while Steam Audio is Active. ReleaseStudioSystem terminates it after FMOD has destroyed every
+    // Steam Audio effect (SteamAudioRuntime.h).
+    std::unique_ptr<Internal::SteamAudioRuntime> steamAudio;
+    // SA.3: the simulation sources and D9's worker; present whenever steamAudio is. It borrows steamAudio, so it goes first.
+    std::unique_ptr<Internal::SteamAudioSimulation> steamAudioSimulation;
+#endif
 
     FMOD_RESULT Start(Internal::Output output, InjectedFailure injectedFailure);
+    int softwareSpeakerModeForTesting = 0;
     void ReleaseStudioSystem() noexcept;
     std::string DescribeRunningOutput(Internal::Output output) const;
 

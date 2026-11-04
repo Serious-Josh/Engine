@@ -5,6 +5,7 @@
 #include "assets/ProjectAssetRegistry.h"
 #include "Renderer/Preview/MaterialThumbnailDiskCache.h"
 
+#include <chrono>
 #include <deque>
 #include <future>
 #include <map>
@@ -37,8 +38,10 @@ public:
         MaterialThumbnailDiskCache::Source diskSource;
     };
 
-    // Eight browser entries plus one independent Scene Object Inspector consumer.
-    static constexpr size_t kJobCapacity = 9;
+    // One retained entry per resident preview image (32 browser + 1 Scene Object Inspector), plus
+    // entries for the eight admitted browser tiles and the inspector before their images exist.
+    // Completed entries own no CPU bytes; kMaximumRetainedBytes bounds in-flight memory.
+    static constexpr size_t kJobCapacity = 42;
     static constexpr size_t kMaximumJobBytes = 64 * 1024 * 1024;
     static constexpr size_t kMaximumRetainedBytes = 128 * 1024 * 1024;
 
@@ -71,7 +74,14 @@ private:
         Job job;
         Source source;
         size_t bytes = 0;
+
+        // Next poll that repeats the file-system part of the staleness check (project root,
+        // resolution, size and timestamp). Registration checks run on every poll.
+        std::chrono::steady_clock::time_point nextSourceCheck{};
     };
+
+    // Retained entries re-check their source at most this often instead of on every frame.
+    static constexpr std::chrono::milliseconds kSourceCheckInterval{250};
     struct Completion
     {
         Job job;

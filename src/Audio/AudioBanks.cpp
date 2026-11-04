@@ -151,6 +151,15 @@ bool AudioSystem::Impl::AddLoadedBank(std::string_view key, FMOD_RESULT result, 
         return false;
     }
 
+    // SA.1: the whole bank fails when one of its events uses an effect plug-in FMOD has not registered, typically
+    // Steam Audio in a project (or build) running FMOD only.
+    if(result == FMOD_ERR_PLUGIN_MISSING)
+    {
+        error = DescribeResult(result) + "; the bank uses an effect plug-in that is not loaded (Steam Audio effects "
+            "need Steam Audio enabled in Project Settings and a build with Steam Audio)";
+        return false;
+    }
+
     if(result != FMOD_OK)
     {
         error = DescribeResult(result);
@@ -551,6 +560,14 @@ std::optional<EventHandle> AudioSystem::CreateEventInstance(const Guid& event, s
         error = "cannot create an instance of " + ToString(event) + ": " + DescribeResult(result);
         return std::nullopt;
     }
+
+#if defined(ENGINE_HAS_STEAMAUDIO)
+    // SA.3: before any start(), so every Steam Audio effect of this instance is seen as FMOD creates it.
+    if(m_impl->steamAudioSimulation)
+    {
+        m_impl->steamAudioSimulation->AttachToInstance(*instance);
+    }
+#endif
 
     std::uint32_t index = 0;
 

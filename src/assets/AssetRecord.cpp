@@ -64,6 +64,14 @@ bool ValidateAssetRecord(const AssetRecord& record)
         case AssetType::Texture:
             // Texture identity is independent of organizational folders.
             break;
+        case AssetType::AcousticMaterial:
+            // Like textures, identity is independent of organizational folders.
+            if(_wcsicmp(record.relativePath.extension().c_str(), L".acousticmaterial") != 0)
+            {
+                return false;
+            }
+
+            break;
         case AssetType::Script:
             return IsCanonicalContentPath(record.relativePath, "Content/Scripts/", L".as");
         case AssetType::AudioBank:
@@ -94,7 +102,7 @@ bool ValidateAssetRecord(const AssetRecord& record)
         }
     }
 
-    if(record.type == AssetType::Texture)
+    if(record.type == AssetType::Texture || record.type == AssetType::AcousticMaterial)
     {
         return true;
     }

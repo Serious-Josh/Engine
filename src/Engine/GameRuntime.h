@@ -1,6 +1,8 @@
 #pragma once
 
 #include "Engine/GameAudioSession.h"
+#include "assets/AcousticMaterial.h"
+#include "assets/ImportedMesh.h"
 #include "Engine/PhysicsSimulationController.h"
 #include "Scene/RenderView.h"
 #include "Scripting/ScriptHost.h"
@@ -20,6 +22,8 @@ class Input;
 // The runtime scene is the authored scene's runtime instance: physics simulates a captured
 // copy of the document and presents poses through a lease that Stop clears, so the authored
 // document and Editor history never observe gameplay. AS.5 script instances live here too.
+class Mesh;
+
 class GameRuntime
 {
 public:
@@ -47,6 +51,15 @@ public:
     // Audio.1C: the process's AudioSystem, borrowed by every gameplay audio session. Set once by the host; null
     // (or audio not running) leaves scripts' audio calls as quiet no-ops.
     void SetAudioSystem(Audio::AudioSystem* audio) noexcept { m_audio.SetAudioSystem(audio); }
+
+    // M4: what a Play needs to build its acoustic scene. Set by the host before Start; both may be empty (no acoustics).
+    struct AcousticAssets
+    {
+        std::function<const ImportedMesh*(const Mesh&)> meshGeometry;
+        std::function<std::optional<AcousticMaterialData>(const std::string& reference, std::string* error)> material;
+    };
+
+    void SetAcousticAssets(AcousticAssets assets) { m_acousticAssets = std::move(assets); }
     const GameAudioSession& GetAudioSession() const noexcept { return m_audio; }
 
     // Admits the Main Camera (when required), compiles and validates every enabled Script
@@ -169,6 +182,7 @@ private:
     // Audio.2C: selects and places the listener and gives the audio session the scene's Audio Sources and object
     // poses, before any script code runs.
     void BeginSceneAudio(FileSceneRuntime& runtime);
+    void PublishAcousticScene(FileSceneRuntime& runtime);
     // Audio.2A autoplay after OnStart (the listener was selected by BeginSceneAudio).
     void StartSceneAudio(FileSceneRuntime& runtime);
     // Audio.2A: moves the FMOD listener and every object-bound event to the presented world poses of this frame.
@@ -186,6 +200,7 @@ private:
     GameplayInput m_input;
     // Audio.1C: begins before script constructors and OnStart, ends after OnStop (or on any failed Start).
     GameAudioSession m_audio;
+    AcousticAssets m_acousticAssets;
     // Audio.2A: the active Audio Listener's object (first enabled in scene order), or empty for the camera fallback.
     std::string m_listenerObjectID;
     std::vector<ScriptInstance> m_scriptInstances;

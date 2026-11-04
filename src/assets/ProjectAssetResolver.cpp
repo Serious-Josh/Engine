@@ -37,6 +37,8 @@ namespace
 
             case AssetType::Mesh:
                 return paths.GetMeshesDirectory();
+            case AssetType::AcousticMaterial:
+                return paths.GetRoot();
             case AssetType::Script:
                 return paths.GetScriptsDirectory();
             case AssetType::AudioBank:
@@ -101,7 +103,8 @@ AssetResolution ProjectAssetResolver::Resolve(
 
     // Texture resolution uses the root itself; other category directories
     // must still remain strictly inside it, including through junctions.
-    const bool textureRoot = record->type == AssetType::Texture && resolvedCategory == resolvedRoot;
+    const bool textureRoot = (record->type == AssetType::Texture || record->type == AssetType::AcousticMaterial) &&
+        resolvedCategory == resolvedRoot;
 
     if(!textureRoot && !IsContainedWithin(resolvedCategory, resolvedRoot))
     {

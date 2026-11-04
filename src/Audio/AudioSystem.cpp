@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <memory>
+#include <utility>
 #include <vector>
 
 namespace Audio
@@ -28,6 +30,23 @@ std::string_view ToString(Status status)
     case Status::Disabled:
         return "disabled";
     case Status::Unavailable:
+        return "unavailable";
+    }
+
+    return "unknown";
+}
+
+std::string_view ToString(SteamAudioStatus status)
+{
+    switch(status)
+    {
+    case SteamAudioStatus::NotRequested:
+        return "not requested";
+    case SteamAudioStatus::Active:
+        return "active";
+    case SteamAudioStatus::NotCompiled:
+        return "not compiled";
+    case SteamAudioStatus::Unavailable:
         return "unavailable";
     }
 
@@ -176,9 +195,19 @@ FMOD_RESULT AudioSystem::Impl::Start(Output output, InjectedFailure injectedFail
 
     result = studio->getCoreSystem(&core);
 
+    if(result == FMOD_OK && softwareSpeakerModeForTesting != 0)
+    {
+        result = core->setSoftwareFormat(0, static_cast<FMOD_SPEAKERMODE>(softwareSpeakerModeForTesting), 0);
+    }
+
     if(result == FMOD_OK && output == Output::NoSound)
     {
         result = core->setOutput(FMOD_OUTPUTTYPE_NOSOUND);
+    }
+
+    if(result == FMOD_OK && output == Output::Offline)
+    {
+        result = core->setOutput(FMOD_OUTPUTTYPE_NOSOUND_NRT);
     }
 
     // FMOD reports a missing device only at initialize; checking first gives the clearer reason.
@@ -214,7 +243,9 @@ FMOD_RESULT AudioSystem::Impl::Start(Output output, InjectedFailure injectedFail
         {
             // Studio's default asynchronous mode: update() only queues commands for FMOD's Studio thread, so a
             // stalled Engine frame never stalls the mixer. Live Update is not enabled (Audio.5, Editor only).
-            result = studio->initialize(MaximumChannels, FMOD_STUDIO_INIT_NORMAL, FMOD_INIT_NORMAL, nullptr);
+            const FMOD_STUDIO_INITFLAGS studioFlags =
+                output == Output::Offline ? FMOD_STUDIO_INIT_SYNCHRONOUS_UPDATE : FMOD_STUDIO_INIT_NORMAL;
+            result = studio->initialize(MaximumChannels, studioFlags, FMOD_INIT_NORMAL, nullptr);
         }
     }
 
@@ -243,6 +274,19 @@ void AudioSystem::Impl::ReleaseStudioSystem() noexcept
 
     studio = nullptr;
     core = nullptr;
+
+#if defined(ENGINE_HAS_STEAMAUDIO)
+    // SA.1: only now, with every Steam Audio DSP destroyed by the release above, may the plugin's state go. SA.3:
+    // sources and their simulator first, while Steam Audio's context still exists.
+    steamAudioSimulation.reset();
+
+    if(steamAudio)
+    {
+        steamAudio->Terminate();
+        steamAudio.reset();
+        Log::Info("Audio: Steam Audio stopped.");
+    }
+#endif
 }
 
 std::string AudioSystem::Impl::DescribeRunningOutput(Output output) const
@@ -265,7 +309,7 @@ std::string AudioSystem::Impl::DescribeRunningOutput(Output output) const
         description += ", " + std::to_string(sampleRate) + " Hz";
     }
 
-    if(output == Output::NoSound)
+    if(output != Output::Device)
     {
         return description + ", no-sound output";
     }
@@ -366,6 +410,13 @@ Status AudioSystem::Initialize(const InitializeOptions& options)
 
     // Device output first, unless the host asked for none. Only an output failure falls back to no-sound output.
     Output output = options.noSoundOutput ? Output::NoSound : Output::Device;
+
+    if(options.offlineRendering)
+    {
+        output = Output::Offline;
+    }
+
+    m_impl->softwareSpeakerModeForTesting = options.softwareSpeakerModeForTesting;
     FMOD_RESULT result = m_impl->Start(output, options.injectedFailure);
     std::string deviceFailure;
 
@@ -430,6 +481,13 @@ void AudioSystem::Update() noexcept
         return;
     }
 
+#if defined(ENGINE_HAS_STEAMAUDIO)
+    if(m_impl->steamAudioSimulation)
+    {
+        m_impl->steamAudioSimulation->Update();
+    }
+#endif
+
     const FMOD_RESULT result = m_impl->studio->update();
 
     if(result == FMOD_OK)
@@ -478,6 +536,8 @@ void AudioSystem::Shutdown() noexcept
 
     m_impl->status = Status::NotStarted;
     m_impl->statusDetail.clear();
+    m_impl->steamAudioStatus = SteamAudioStatus::NotRequested;
+    m_impl->steamAudioDetail.clear();
 }
 
 Status AudioSystem::GetStatus() const noexcept
@@ -493,5 +553,335 @@ const std::string& AudioSystem::GetStatusDetail() const noexcept
 std::uint64_t AudioSystem::GetUpdateCount() const noexcept
 {
     return m_impl->updateCount;
+}
+
+bool AudioSystem::IsSteamAudioCompiled() noexcept
+{
+#if defined(ENGINE_HAS_STEAMAUDIO)
+    return true;
+#else
+    return false;
+#endif
+}
+
+SteamAudioStatus AudioSystem::EnableSteamAudio(const SteamAudioOptions& options)
+{
+    if(m_impl->steamAudioStatus != SteamAudioStatus::NotRequested)
+    {
+        return m_impl->steamAudioStatus;
+    }
+
+#if !defined(ENGINE_HAS_STEAMAUDIO)
+    static_cast<void>(options);
+    m_impl->steamAudioStatus = SteamAudioStatus::NotCompiled;
+    m_impl->steamAudioDetail = "this build has no Steam Audio (ENGINE_ENABLE_STEAMAUDIO=OFF, or its SDK or the FMOD "
+        "backend was not found)";
+    Log::Warning("Audio: the project uses Steam Audio, but " + m_impl->steamAudioDetail + "; using FMOD only.");
+    return m_impl->steamAudioStatus;
+#else
+    const auto refuse = [this](std::string detail)
+    {
+        m_impl->steamAudioStatus = SteamAudioStatus::Unavailable;
+        m_impl->steamAudioDetail = std::move(detail);
+        Log::Warning("Audio: Steam Audio unavailable; " + m_impl->steamAudioDetail + ". Using FMOD only.");
+        return m_impl->steamAudioStatus;
+    };
+
+    if(!m_impl->IsRunning())
+    {
+        return refuse("audio is " + std::string(ToString(m_impl->status)));
+    }
+
+    // A bank loaded without the plugin has already failed (or loaded without its Steam Audio effects resolved).
+    if(!m_impl->banks.empty())
+    {
+        return refuse("it must start before any audio bank is loaded");
+    }
+
+    auto runtime = std::make_unique<Internal::SteamAudioRuntime>();
+
+    if(std::string error; !runtime->Start(*m_impl->core, options.injectedFailure, error))
+    {
+        return refuse(error);
+    }
+
+    m_impl->steamAudioStatus = SteamAudioStatus::Active;
+    m_impl->steamAudioDetail = runtime->GetDescription();
+    m_impl->steamAudio = std::move(runtime);
+    Log::Info("Audio: Steam Audio active; " + m_impl->steamAudioDetail + ".");
+
+    // Direct HRTF does not need the simulator, so a failure here keeps Steam Audio Active.
+    m_impl->steamAudioSimulation =
+        std::make_unique<Internal::SteamAudioSimulation>(*m_impl->steamAudio, *m_impl->studio, *m_impl->core);
+    m_impl->steamAudioSimulation->Start(options);
+
+    return m_impl->steamAudioStatus;
+#endif
+}
+
+SteamAudioStatus AudioSystem::GetSteamAudioStatus() const noexcept
+{
+    return m_impl->steamAudioStatus;
+}
+
+const std::string& AudioSystem::GetSteamAudioStatusDetail() const noexcept
+{
+    return m_impl->steamAudioDetail;
+}
+
+#if defined(ENGINE_HAS_FMOD)
+namespace
+{
+    // Every DSP of a group and its nested groups (an event's master track and its group tracks). Steam Audio
+    // spatializers are recognised by plugin identity (SteamAudioRuntime::IsSpatializer); FMOD's own spatializer by
+    // its built-in DSP type (FMOD Studio's spatializer and panner effects both run as an FMOD Pan DSP).
+    enum class SteamAudioKind
+    {
+        None,
+        WithDistanceAttenuation,
+        WithoutDistanceAttenuation
+    };
+
+    template<typename ClassifySteamAudio>
+    void CountSpatializers(FMOD::ChannelGroup& group, const ClassifySteamAudio& classifySteamAudio,
+        SpatializerSummary& summary)
+    {
+        int dspCount = 0;
+        group.getNumDSPs(&dspCount);
+
+        for(int index = 0; index < dspCount; ++index)
+        {
+            FMOD::DSP* dsp = nullptr;
+
+            if(group.getDSP(index, &dsp) != FMOD_OK || !dsp)
+            {
+                continue;
+            }
+
+            FMOD_DSP_TYPE type = FMOD_DSP_TYPE_UNKNOWN;
+
+            if(dsp->getType(&type) == FMOD_OK && type == FMOD_DSP_TYPE_PAN)
+            {
+                ++summary.fmod;
+            }
+            else if(const SteamAudioKind kind = classifySteamAudio(*dsp); kind != SteamAudioKind::None)
+            {
+                ++summary.steamAudio;
+
+                if(kind == SteamAudioKind::WithoutDistanceAttenuation)
+                {
+                    ++summary.steamAudioWithoutDistanceAttenuation;
+                }
+            }
+        }
+
+        int childCount = 0;
+        group.getNumGroups(&childCount);
+
+        for(int index = 0; index < childCount; ++index)
+        {
+            FMOD::ChannelGroup* child = nullptr;
+
+            if(group.getGroup(index, &child) == FMOD_OK && child)
+            {
+                CountSpatializers(*child, classifySteamAudio, summary);
+            }
+        }
+    }
+}
+#endif
+
+std::optional<SpatializerSummary> AudioSystem::DescribeEventSpatializers(EventHandle handle) const
+{
+#if defined(ENGINE_HAS_FMOD)
+    FMOD::Studio::EventInstance* instance = m_impl->ResolveEvent(handle);
+
+    if(!instance)
+    {
+        return std::nullopt;
+    }
+
+    // FMOD creates an instance's DSPs asynchronously, after start() reaches its Studio thread.
+    FMOD::ChannelGroup* group = nullptr;
+
+    if(instance->getChannelGroup(&group) != FMOD_OK || !group)
+    {
+        return std::nullopt;
+    }
+
+    const auto classifySteamAudio = [this](FMOD::DSP& dsp)
+    {
+#if defined(ENGINE_HAS_STEAMAUDIO)
+        if(!m_impl->steamAudio || !m_impl->steamAudio->IsSpatializer(dsp))
+        {
+            return SteamAudioKind::None;
+        }
+
+        return m_impl->steamAudio->HasDistanceAttenuation(dsp) ? SteamAudioKind::WithDistanceAttenuation :
+            SteamAudioKind::WithoutDistanceAttenuation;
+#else
+        static_cast<void>(dsp);
+        return SteamAudioKind::None;
+#endif
+    };
+    SpatializerSummary summary;
+    CountSpatializers(*group, classifySteamAudio, summary);
+    return summary;
+#else
+    static_cast<void>(handle);
+    return std::nullopt;
+#endif
+}
+
+bool AudioSystem::IsAcousticSimulationAvailable() const noexcept
+{
+#if defined(ENGINE_HAS_STEAMAUDIO)
+    return m_impl->steamAudioSimulation && m_impl->steamAudioSimulation->IsAcousticSimulationAvailable();
+#else
+    return false;
+#endif
+}
+
+bool AudioSystem::SetAcousticObject(std::uint64_t id, std::shared_ptr<const AcousticMeshData> mesh, const AcousticTransform& world)
+{
+#if defined(ENGINE_HAS_STEAMAUDIO)
+    return IsAcousticSimulationAvailable() && m_impl->steamAudioSimulation->SetAcousticObject(id, std::move(mesh), world);
+#else
+    static_cast<void>(id);
+    static_cast<void>(mesh);
+    static_cast<void>(world);
+    return false;
+#endif
+}
+
+bool AudioSystem::SetAcousticObjectTransform(std::uint64_t id, const AcousticTransform& world)
+{
+#if defined(ENGINE_HAS_STEAMAUDIO)
+    return IsAcousticSimulationAvailable() && m_impl->steamAudioSimulation->SetAcousticObjectTransform(id, world);
+#else
+    static_cast<void>(id);
+    static_cast<void>(world);
+    return false;
+#endif
+}
+
+bool AudioSystem::RemoveAcousticObject(std::uint64_t id)
+{
+#if defined(ENGINE_HAS_STEAMAUDIO)
+    return IsAcousticSimulationAvailable() && m_impl->steamAudioSimulation->RemoveAcousticObject(id);
+#else
+    static_cast<void>(id);
+    return false;
+#endif
+}
+
+bool AudioSystem::ClearAcousticScene()
+{
+#if defined(ENGINE_HAS_STEAMAUDIO)
+    return IsAcousticSimulationAvailable() && m_impl->steamAudioSimulation->ClearAcousticScene();
+#else
+    return false;
+#endif
+}
+
+SteamAudioSimulationStats AudioSystem::GetSteamAudioSimulationStats() const
+{
+#if defined(ENGINE_HAS_STEAMAUDIO)
+    if(m_impl->steamAudioSimulation)
+    {
+        return m_impl->steamAudioSimulation->GetStats();
+    }
+#endif
+
+    return {};
+}
+
+void* AudioSystem::GetSteamAudioContextForTesting() const noexcept
+{
+#if defined(ENGINE_HAS_STEAMAUDIO)
+    if(m_impl->steamAudio)
+    {
+        return m_impl->steamAudio->GetContext();
+    }
+#endif
+
+    return nullptr;
+}
+
+void* AudioSystem::GetNativeCoreForTesting() const noexcept
+{
+#if defined(ENGINE_HAS_FMOD)
+    return m_impl->core;
+#else
+    return nullptr;
+#endif
+}
+
+void* AudioSystem::GetSteamAudioWorkerThreadForTesting() const noexcept
+{
+#if defined(ENGINE_HAS_STEAMAUDIO)
+    if(m_impl->steamAudioSimulation)
+    {
+        return m_impl->steamAudioSimulation->GetWorkerThreadForTesting();
+    }
+#endif
+
+    return nullptr;
+}
+
+void AudioSystem::RunSteamAudioSimulationForTesting() noexcept
+{
+#if defined(ENGINE_HAS_STEAMAUDIO)
+    if(m_impl->steamAudioSimulation)
+    {
+        m_impl->steamAudioSimulation->RunNow();
+    }
+#endif
+}
+
+std::vector<SteamAudioSourceSnapshot> AudioSystem::GetSteamAudioSourcesForTesting() const
+{
+#if defined(ENGINE_HAS_STEAMAUDIO)
+    if(m_impl->steamAudioSimulation)
+    {
+        return m_impl->steamAudioSimulation->GetSnapshots();
+    }
+#endif
+
+    return {};
+}
+
+void AudioSystem::SetSteamAudioTestControls(const SteamAudioSimulationTestControls& controls)
+{
+#if defined(ENGINE_HAS_STEAMAUDIO)
+    if(m_impl->steamAudioSimulation)
+    {
+        m_impl->steamAudioSimulation->SetTestControls(controls);
+    }
+#else
+    static_cast<void>(controls);
+#endif
+}
+
+void* AudioSystem::GetNativeEventForTesting(EventHandle handle) const
+{
+#if defined(ENGINE_HAS_FMOD)
+    return m_impl->ResolveEvent(handle);
+#else
+    static_cast<void>(handle);
+    return nullptr;
+#endif
+}
+
+std::optional<std::size_t> AudioSystem::CountSteamAudioSpatializers(EventHandle handle) const
+{
+    const std::optional<SpatializerSummary> summary = DescribeEventSpatializers(handle);
+
+    if(!summary)
+    {
+        return std::nullopt;
+    }
+
+    return summary->steamAudio;
 }
 }

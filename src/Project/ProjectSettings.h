@@ -161,9 +161,27 @@ struct RenderingSettings
     bool operator==(const RenderingSettings&) const = default;
 };
 
+// SA.1: audio choices that change how FMOD runs. Steam Audio is opt-in per project and read when the project opens
+// (before its banks load), so a change applies from the project's next launch.
+enum class ProjectSteamAudioRayTracer
+{
+    Default,
+    Embree
+};
+
+struct AudioSettings
+{
+    bool steamAudio = false;
+    // Saved as a name, and never rewritten because of what a session could actually run.
+    ProjectSteamAudioRayTracer steamAudioRayTracer = ProjectSteamAudioRayTracer::Default;
+
+    bool operator==(const AudioSettings&) const = default;
+};
+
 struct ProjectSettings
 {
     RenderingSettings rendering;
+    AudioSettings audio;
 
     bool operator==(const ProjectSettings&) const = default;
 };

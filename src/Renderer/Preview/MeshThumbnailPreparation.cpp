@@ -5,6 +5,7 @@
 #include "assets/ModelImporter.h"
 #include "assets/ProjectAssetResolver.h"
 #include "Project/ProjectPaths.h"
+#include "Debug/MeshThumbnailDiagnostics.h"
 
 #include <Windows.h>
 #include <chrono>
@@ -125,7 +126,13 @@ MeshThumbnailPreparation::Completion MeshThumbnailPreparation::Prepare(Source so
         result.source.modified = std::filesystem::last_write_time(result.source.path);
         MaterialThumbnailValidation validation;
         auto& identity = result.job.identity;
-        identity.sourceFingerprint = validation.Digest(result.source.path);
+        auto& diagnostics = MeshThumbnailDiagnostics::Get();
+
+        {
+            MeshThumbnailDiagnostics::Timer digestTimer(diagnostics.workerDigestMicroseconds);
+            MeshThumbnailDiagnostics::Add(diagnostics.workerDigests);
+            identity.sourceFingerprint = validation.Digest(result.source.path);
+        }
 
         if(!result.source.previousFingerprint.empty())
         {
@@ -144,11 +151,13 @@ MeshThumbnailPreparation::Completion MeshThumbnailPreparation::Prepare(Source so
         if(MaterialThumbnailDiskCache::Load(result.job.diskSource, result.job.cachedPixels) &&
             result.job.cachedPixels.width == 256 && result.job.cachedPixels.height == 256)
         {
+            MeshThumbnailDiagnostics::Add(diagnostics.diskCacheHits);
             result.job.state = State::CacheHit;
             result.bytes = result.job.cachedPixels.pixels.capacity();
             return result; // No Assimp work or CPU geometry allocation on a cache hit.
         }
 
+        MeshThumbnailDiagnostics::Add(diagnostics.fullImports);
         result.job.cachedPixels = {};
         result.job.geometry = ModelImporter::LoadFlattened(result.source.path, MeshUVOrientation::FlipV,
             kMaximumJobBytes, result.source.record.meshImportUnits);
@@ -211,6 +220,8 @@ bool MeshThumbnailPreparation::Request(const ProjectPaths& paths, const ProjectA
 
             if(entry.job.state == State::Prepared || entry.job.state == State::CacheHit)
             {
+                MeshThumbnailDiagnostics::Add(MeshThumbnailDiagnostics::Get().sourceRevalidations);
+
                 // Rehash off-thread before reusing retained content, including
                 // changes whose size/timestamp are indistinguishable.
                 entry.source.previousFingerprint = entry.job.identity.sourceFingerprint;
@@ -230,6 +241,7 @@ bool MeshThumbnailPreparation::Request(const ProjectPaths& paths, const ProjectA
 
         Source source{project, resolved.resolvedPath, *record};
         const auto next = m_nextTicket++;
+        MeshThumbnailDiagnostics::Add(MeshThumbnailDiagnostics::Get().newPreparations);
         Entry entry{Job{}, source};
         entry.job.identity.project = project;
         entry.job.identity.assetReference = id.ToReference();
@@ -302,29 +314,49 @@ void MeshThumbnailPreparation::StartNext()
 
 void MeshThumbnailPreparation::Poll(const ProjectPaths& paths, const ProjectAssetRegistry& registry)
 {
+    const auto now = std::chrono::steady_clock::now();
+    std::optional<std::filesystem::path> activeProject;
     std::error_code projectError;
-    const auto activeProject = std::filesystem::canonical(paths.GetRoot(), projectError);
 
     for(auto& [ticket, entry] : m_jobs)
     {
-        const auto* record = registry.Find(entry.source.record.id);
-        const auto resolved = ProjectAssetResolver::Resolve(paths, registry, entry.source.record.id);
-        bool current = !projectError && activeProject == entry.source.project && record &&
-            record->type == AssetType::Mesh && record->relativePath == entry.source.record.relativePath &&
-            record->meshImportUnits == entry.source.record.meshImportUnits;
-
-        current = current && resolved.status == AssetAvailability::Available && resolved.resolvedPath == entry.source.path;
-
-        if(current && (entry.job.state == State::Prepared || entry.job.state == State::CacheHit))
+        if(entry.job.state == State::Cancelled)
         {
-            std::error_code sizeError;
-            std::error_code timeError;
-            const auto size = std::filesystem::file_size(entry.source.path, sizeError);
-            const auto modified = std::filesystem::last_write_time(entry.source.path, timeError);
-            current = !sizeError && !timeError && size == entry.source.size && modified == entry.source.modified;
+            continue;
         }
 
-        if(!current && entry.job.state != State::Cancelled)
+        // Registration changes (rename, move, unit edits, unregistration) are in-memory checks and
+        // are detected on every poll.
+        const auto* record = registry.Find(entry.source.record.id);
+        bool current = record && record->type == AssetType::Mesh &&
+            record->relativePath == entry.source.record.relativePath &&
+            record->meshImportUnits == entry.source.record.meshImportUnits;
+
+        // File-system checks (project switch, deletion, source replacement) are throttled per entry.
+        if(current && now >= entry.nextSourceCheck)
+        {
+            entry.nextSourceCheck = now + kSourceCheckInterval;
+
+            if(!activeProject)
+            {
+                activeProject = std::filesystem::canonical(paths.GetRoot(), projectError);
+            }
+
+            const auto resolved = ProjectAssetResolver::Resolve(paths, registry, entry.source.record.id);
+            current = !projectError && *activeProject == entry.source.project &&
+                resolved.status == AssetAvailability::Available && resolved.resolvedPath == entry.source.path;
+
+            if(current && (entry.job.state == State::Prepared || entry.job.state == State::CacheHit))
+            {
+                std::error_code sizeError;
+                std::error_code timeError;
+                const auto size = std::filesystem::file_size(entry.source.path, sizeError);
+                const auto modified = std::filesystem::last_write_time(entry.source.path, timeError);
+                current = !sizeError && !timeError && size == entry.source.size && modified == entry.source.modified;
+            }
+        }
+
+        if(!current)
         {
             Release(entry);
             entry.job.state = State::Cancelled;

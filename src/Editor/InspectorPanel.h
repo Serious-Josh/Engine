@@ -1,5 +1,7 @@
 #pragma once
 
+#include "assets/AcousticMaterial.h"
+
 #include "assets/AssetRecord.h"
 #include "assets/MaterialSavedRevision.h"
 #include "Scene/Transform.h"
@@ -114,7 +116,16 @@ public:
 private:
 #if defined(ENGINE_HAS_VERIFICATION)
     friend class MaterialLocateVerification;
+    friend class ScriptWorkflowVerification;
 #endif
+    // M4: an Acoustic Material selected in the Asset Browser. Same autosave and leave rules as a visual material; m_record
+    // holds its registration, and m_material stays empty, so no visual preview or texture logic runs.
+    std::optional<AcousticMaterialData> m_acousticMaterial;
+    std::optional<AcousticMaterialData> m_savedAcousticMaterial;
+    std::string m_savedAcousticBytes;
+    void LoadAcousticSelection(const std::filesystem::path& selection, const ProjectPaths& paths, const ProjectAssetRegistry& registry);
+    void DrawAcousticMaterial(const ProjectPaths& paths, const ProjectAssetRegistry& registry, bool protectedAction);
+    bool SaveAcousticMaterial(const ProjectPaths& paths, const ProjectAssetRegistry& registry, bool overwriteConflict);
     void HandleMaterialLocateItem(std::string_view reference);
     std::optional<std::string> m_materialLocateRequest;
     std::string m_materialLocateStatus;

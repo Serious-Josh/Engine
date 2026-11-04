@@ -124,6 +124,8 @@ public:
         const std::optional<LightComponent>& replacement, std::string* errorMessage = nullptr);
     bool SetObjectScript(const SceneObjectMetadata& selection, const std::optional<ScriptComponent>& expected,
         const std::optional<ScriptComponent>& replacement, std::string* errorMessage = nullptr);
+    bool SetObjectAcoustics(const SceneObjectMetadata& selection, const std::optional<AcousticSettings>& expected,
+        const std::optional<AcousticSettings>& replacement, std::string* errorMessage = nullptr);
     bool SetObjectAudio(const SceneObjectMetadata& selection, const AudioComponentState& expected,
         const AudioComponentState& replacement, std::string* errorMessage = nullptr);
     bool ValidateObjectTransform(RenderObjectID index, const Transform& transform, std::string& error) const;

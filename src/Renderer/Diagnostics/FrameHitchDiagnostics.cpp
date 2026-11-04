@@ -1,6 +1,8 @@
 #include "Renderer/Diagnostics/FrameHitchDiagnostics.h"
 
 #include "Core/Log.h"
+#include "Debug/MaterialThumbnailDiagnostics.h"
+#include "Debug/MeshThumbnailDiagnostics.h"
 
 #include <algorithm>
 #include <chrono>
@@ -188,6 +190,22 @@ void RendererDiagnostics::FrameHitchDiagnostics::Report(
               ", elapsed=" + std::to_string(activeDeferredMilliseconds) +
               ", maxCount=" + std::to_string(diagnostics.maxConsecutiveDeferred) +
               ", maxInterval=" + std::to_string(diagnostics.maxDeferredIntervalMilliseconds) + ".");
+
+    // Diagnostics builds only: thumbnail work since the previous report (report cadence is two seconds).
+    if constexpr(MeshThumbnailDiagnostics::kEnabled)
+    {
+        static MeshThumbnailDiagnostics::Snapshot previousMeshThumbnails = MeshThumbnailDiagnostics::Capture();
+        const auto meshThumbnails = MeshThumbnailDiagnostics::Capture();
+        Log::Info("Mesh thumbnail work since last report: " +
+            MeshThumbnailDiagnostics::Describe(previousMeshThumbnails, meshThumbnails) + ".");
+        previousMeshThumbnails = meshThumbnails;
+
+        static MaterialThumbnailDiagnostics::Snapshot previousMaterialThumbnails = MaterialThumbnailDiagnostics::Capture();
+        const auto materialThumbnails = MaterialThumbnailDiagnostics::Capture();
+        Log::Info("Material thumbnail work since last report: " +
+            MaterialThumbnailDiagnostics::Describe(previousMaterialThumbnails, materialThumbnails) + ".");
+        previousMaterialThumbnails = materialThumbnails;
+    }
 
     // Diagnostics only: Editor::Draw's phases, one line per report, when the Editor recorded them.
     if (diagnostics.editorPhases[static_cast<size_t>(EditorPhaseTiming::Phase::Draw)].count != 0)

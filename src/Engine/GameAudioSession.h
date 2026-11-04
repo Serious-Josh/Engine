@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <set>
 #include <string>
@@ -93,6 +94,23 @@ public:
     // change, a non-positive delta or an implausible jump. An event whose object is gone is stopped and released.
     void UpdateSpatial(double deltaSeconds, std::string_view listenerKey, const std::optional<ObjectPose>& listener,
         const PoseResolver& resolve);
+    // M4: one mesh object's place in the acoustic scene.
+    struct AcousticObject
+    {
+        std::string objectID;
+        std::shared_ptr<const Audio::AcousticMeshData> mesh;
+        Audio::AcousticTransform world{};
+    };
+
+    // M4: replaces this session's acoustic scene. Without snapshot synchronization there is no geometry simulation: geometry
+    // is not sent, and when objects asked for it a warning says so. Project settings are never changed. End clears it.
+    void PublishAcousticScene(std::vector<AcousticObject> objects);
+    // M4, once per gameplay frame: a moved object is sent to the worker only when its transform really changed. Null removes it
+    // (the object left the running scene).
+    using AcousticTransformResolver = std::function<std::optional<Audio::AcousticTransform>(std::string_view objectID)>;
+    void UpdateAcousticTransforms(const AcousticTransformResolver& resolve);
+    std::size_t GetAcousticObjectCount() const noexcept { return m_acousticObjects.size(); }
+
     // Diagnostics and tests: the object an event is bound to (empty for script events or an invalid handle).
     std::string GetEventObject(const Scripting::AudioEventHandle& handle) const;
     // Events started for Audio Source components (autoplay or AudioSource.Play); script events are not included.
@@ -140,6 +158,9 @@ private:
         std::optional<std::array<float, 3>> lastPosition;
         // Started for an Audio Source component (not a script event).
         bool sceneSource = false;
+        // SA.2: the event's FMOD Studio GUID, and whether its spatializers have been checked (CheckSpatialization).
+        Audio::Guid event;
+        bool spatializationChecked = false;
     };
 
     // Audio.2C runtime state of one scene Audio Source for this session.
@@ -184,6 +205,7 @@ private:
     std::optional<Audio::EventHandle> StartPlaced(const Audio::Guid& guid, const std::optional<ObjectPose>& pose,
         const std::string& context);
     void StopAndRelease(std::size_t index);
+    void CheckSpatialization(OwnedEvent& event);
     bool ChangeMixerValue(MixerTarget target, std::string_view name, float value);
     // Logs each distinct message once per session, so a script calling every frame cannot flood the log.
     void Warn(const std::string& message);
@@ -199,4 +221,13 @@ private:
     // Audio.2A listener continuity: which listener moved last, and from where.
     std::string m_listenerKey;
     std::optional<std::array<float, 3>> m_listenerLastPosition;
+
+    struct PublishedAcousticObject
+    {
+        std::string objectID;
+        std::uint64_t id = 0;
+        Audio::AcousticTransform world{};
+    };
+
+    std::vector<PublishedAcousticObject> m_acousticObjects;
 };

@@ -12,6 +12,10 @@ namespace
         {ProjectLightingMode::Legacy, "legacy"},
         {ProjectLightingMode::ReferencePathTracer, "referencePathTracer"},
         {ProjectLightingMode::PathTracing, "pathTracing"}};
+    constexpr std::pair<ProjectSteamAudioRayTracer, std::string_view> kSteamAudioRayTracers[] = {
+        {ProjectSteamAudioRayTracer::Default, "default"},
+        {ProjectSteamAudioRayTracer::Embree, "embree"},
+    };
     constexpr std::pair<ProjectToneMapper, std::string_view> kToneMappers[] = {
         {ProjectToneMapper::AgX, "agx"},
         {ProjectToneMapper::GT7, "gt7"}};
@@ -507,6 +511,8 @@ namespace ProjectSettingsFile
         loaded.status = Status::Loaded;
         const FieldReader root(&document, "ProjectSettings", loaded.warnings);
         ReadRendering(root.Child("rendering"), loaded.settings.rendering);
+        root.Child("audio").Child("steamAudio").Bool("enabled", loaded.settings.audio.steamAudio);
+        root.Child("audio").Child("steamAudio").Name("rayTracer", loaded.settings.audio.steamAudioRayTracer, kSteamAudioRayTracers);
         ValidateProjectSettings(loaded.settings, &loaded.warnings);
         loaded.document = std::move(document);
         return loaded;
@@ -583,6 +589,10 @@ namespace ProjectSettingsFile
         caustics["dedicated"] = pt.dedicatedCaustics;
         caustics["causticOnlyView"] = pt.causticOnlyView;
         caustics["pixelCentred"] = pt.pixelCentredCaustics;
+
+        auto& steamAudio = ObjectMember(ObjectMember(document, "audio"), "steamAudio");
+        steamAudio["enabled"] = settings.audio.steamAudio;
+        steamAudio["rayTracer"] = std::string(NameOf(kSteamAudioRayTracers, settings.audio.steamAudioRayTracer));
 
         return document.dump(4) + "\n";
     }

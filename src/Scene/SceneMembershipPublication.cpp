@@ -290,6 +290,8 @@ SceneMembershipPublication::Result SceneMembershipPublication::PublishAtBoundary
             if(found!=p.target->GetObjectMapping().idToRuntimeIndex.end()) mapped=found->second;
         }
         p.target->GetScene().GetCamera()=active->GetScene().GetCamera();
+        // Live viewport exposure, like the camera: an exposure edit while this transaction was pending must survive.
+        p.target->GetScene().SetViewportExposure(active->GetScene().GetViewportExposure());
         p.target->GetScene().SetLightingSettings(active->GetScene().GetLightingSettings());
         Result success{Status::Ready,"Membership published."};
         // All final validation has passed. This allocates only optional advisory evidence.

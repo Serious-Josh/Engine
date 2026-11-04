@@ -108,6 +108,9 @@ bool CaptureSceneDocument(
     candidate.camera.verticalFov = camera.GetVerticalFov();
     candidate.camera.nearPlane = camera.GetNearPlane();
     candidate.camera.farPlane = camera.GetFarPlane();
+    // The Viewport Camera Exposure panel edits only the live Scene; without this, every capture committed into a
+    // replacement runtime (membership edits, history replay) would restore the last saved exposure.
+    candidate.camera.exposure = scene.GetViewportExposure();
     candidate.lightingSettings = scene.GetLightingSettings();
 
     if (!ValidateSceneDocument(candidate, errorMessage))
@@ -158,7 +161,8 @@ bool SceneDocumentsEqual(
             a.materialReference != b.materialReference || a.materialSlotBindings != b.materialSlotBindings ||
             a.physics != b.physics || a.triggerCollider != b.triggerCollider ||
             a.characterController != b.characterController || a.camera != b.camera || a.light != b.light ||
-            a.script != b.script || a.audioSource != b.audioSource || a.audioListener != b.audioListener)
+            a.script != b.script || a.audioSource != b.audioSource || a.audioListener != b.audioListener ||
+            a.acoustics != b.acoustics)
         {
             return false;
         }

@@ -382,6 +382,8 @@ bool CommitPreparedMetadataScene(const PreparedMetadataScene& prepared, Scene& s
     camera.SetNearPlane(source.nearPlane);
     camera.SetFarPlane(source.farPlane);
     scene.SetLightingSettings(prepared.document.lightingSettings);
+    // The saved Viewport Camera Exposure, as the geometry-ready commit applies it (SceneCommit.cpp).
+    scene.SetViewportExposure(source.exposure);
     scene.SetEnvironmentReference(std::move(environment));
 
     newMapping.structureRevision = scene.GetStructureRevision();

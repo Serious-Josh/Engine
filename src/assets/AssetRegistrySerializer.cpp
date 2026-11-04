@@ -18,7 +18,8 @@ namespace
     // 3 script assets, 4 audio bank assets. Output uses the lowest version that can hold the registry.
     constexpr int kScriptSchemaVersion = 3;
     constexpr int kAudioBankSchemaVersion = 4;
-    constexpr int kSchemaVersion = kAudioBankSchemaVersion;
+    constexpr int kAcousticMaterialSchemaVersion = 5;
+    constexpr int kSchemaVersion = kAcousticMaterialSchemaVersion;
 
     const char* AssetTypeToString(AssetType type)
     {
@@ -33,6 +34,8 @@ namespace
                 return "script";
             case AssetType::AudioBank:
                 return "audioBank";
+            case AssetType::AcousticMaterial:
+                return "acousticMaterial";
             default:
                 return nullptr;
         }
@@ -69,6 +72,12 @@ namespace
         if(value == "audioBank")
         {
             type = AssetType::AudioBank;
+            return true;
+        }
+
+        if(value == "acousticMaterial")
+        {
+            type = AssetType::AcousticMaterial;
             return true;
         }
 
@@ -127,6 +136,11 @@ nlohmann::json AssetRegistrySerializer::Serialize(const ProjectAssetRegistry& re
         if(record.type == AssetType::AudioBank)
         {
             document["schemaVersion"] = (std::max)(document["schemaVersion"].get<int>(), kAudioBankSchemaVersion);
+        }
+
+        if(record.type == AssetType::AcousticMaterial)
+        {
+            document["schemaVersion"] = (std::max)(document["schemaVersion"].get<int>(), kAcousticMaterialSchemaVersion);
         }
     }
 
@@ -204,6 +218,11 @@ bool AssetRegistrySerializer::Deserialize(
             if(type == AssetType::Script && document["schemaVersion"].get<int>() < kScriptSchemaVersion)
             {
                 return Fail(errorMessage, "Script assets require registry schema 3.");
+            }
+
+            if(type == AssetType::AcousticMaterial && document["schemaVersion"].get<int>() < kAcousticMaterialSchemaVersion)
+            {
+                return Fail(errorMessage, "Acoustic material assets require registry schema 5.");
             }
 
             if(type == AssetType::AudioBank && document["schemaVersion"].get<int>() < kAudioBankSchemaVersion)

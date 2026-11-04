@@ -819,6 +819,22 @@ bool FileBackedDemoScene::SetObjectAudio(const SceneObjectMetadata& selection, c
     return m_runtime->SetObjectAudio(selection, expected, replacement, errorMessage);
 }
 
+bool FileBackedDemoScene::SetObjectAcoustics(const SceneObjectMetadata& selection, const std::optional<AcousticSettings>& expected,
+    const std::optional<AcousticSettings>& replacement, std::string* errorMessage)
+{
+    if(!m_initialized || m_objectMutationCandidate)
+    {
+        if(errorMessage)
+        {
+            *errorMessage = "The scene is not ready for acoustic edits.";
+        }
+
+        return false;
+    }
+
+    return m_runtime->SetObjectAcoustics(selection, expected, replacement, errorMessage);
+}
+
 bool FileBackedDemoScene::ValidateObjectTransform(RenderObjectID index, const Transform& transform, std::string& error) const
 {
     const auto identity = m_runtime->GetObjectMetadata(index, &error);

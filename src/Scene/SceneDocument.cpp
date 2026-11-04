@@ -197,6 +197,35 @@ bool ValidateScriptComponent(const ScriptComponent& script, std::string* error)
     return reason == nullptr;
 }
 
+bool ValidateAcousticSettings(const AcousticSettings& settings, std::string* error)
+{
+    if(settings.submeshMaterials.size() > AcousticSettings::MaximumAssignments)
+    {
+        if(error)
+        {
+            *error = "Too many acoustic material assignments.";
+        }
+
+        return false;
+    }
+
+    for(const auto& [key, reference] : settings.submeshMaterials)
+    {
+        if(key.empty() || reference.empty() || key.size() > AcousticSettings::MaximumTextBytes ||
+            reference.size() > AcousticSettings::MaximumTextBytes)
+        {
+            if(error)
+            {
+                *error = "Acoustic material assignments need a submesh key and a material reference.";
+            }
+
+            return false;
+        }
+    }
+
+    return true;
+}
+
 bool ValidateAudioSourceComponent(const AudioSourceComponent& source, std::string* error)
 {
     if(error)
@@ -286,6 +315,11 @@ bool ValidateSceneObjectComponents(const SceneObjectDocument& object, std::strin
     if(object.audioSource && !ValidateAudioSourceComponent(*object.audioSource, &componentError))
     {
         return Fail(errorMessage, "Invalid Audio Source for object " + object.id + ": " + componentError);
+    }
+
+    if(object.acoustics && !ValidateAcousticSettings(*object.acoustics, &componentError))
+    {
+        return Fail(errorMessage, "Invalid acoustics for object " + object.id + ": " + componentError);
     }
 
     if(object.physics && !Physics::ValidatePhysicsComponent(*object.physics, &componentError))

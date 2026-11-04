@@ -1,4 +1,5 @@
 #include "Editor/Editor.h"
+#include "Editor/SteamAudioSettingsStatus.h"
 #include "Debug/DebugUI.h"
 #include "Debug/LightingModeTransitionPresentation.h"
 #include "DemoContent/FileBackedDemoScene.h"
@@ -286,7 +287,10 @@ void Editor::DrawProjectSettings(const IDemoScene& demoScene, const DebugUI& deb
         const char* name;
         void (Editor::*draw)(const DebugUI&, bool);
     };
-    static constexpr std::array<Category, 1> categories{{{"Rendering", &Editor::DrawRenderingSettingsCategory}}};
+    static constexpr std::array<Category, 2> categories{{{"Rendering", &Editor::DrawRenderingSettingsCategory},
+        {"Audio", &Editor::DrawAudioSettingsCategory}}};
+    const std::size_t categoryIndex = (std::min)(m_projectSettingsCategory, categories.size() - 1);
+    const bool audioCategory = categories[categoryIndex].draw == &Editor::DrawAudioSettingsCategory;
 
     ImGui::SetNextWindowSize(ImVec2(860, 660), ImGuiCond_FirstUseEver);
     bool open = true;
@@ -345,7 +349,7 @@ void Editor::DrawProjectSettings(const IDemoScene& demoScene, const DebugUI& deb
     ImGui::EndChild();
     ImGui::SameLine();
     ImGui::BeginChild("ProjectSettingsCategory", ImVec2(0.0f, -footerHeight), ImGuiChildFlags_Borders);
-    const Category& category = categories[(std::min)(m_projectSettingsCategory, categories.size() - 1)];
+    const Category& category = categories[categoryIndex];
     (this->*category.draw)(debugUI, editable);
     ImGui::EndChild();
 
@@ -381,12 +385,21 @@ void Editor::DrawProjectSettings(const IDemoScene& demoScene, const DebugUI& deb
     ImGui::SameLine();
     ImGui::BeginDisabled(!editable);
 
+    // Resets only the category on screen, so reverting Audio never touches the Rendering draft or the reverse.
     if(ImGui::Button("Revert to Defaults"))
     {
-        m_projectSettingsDraft->rendering = RenderingSettings{};
+        if(audioCategory)
+        {
+            m_projectSettingsDraft->audio = AudioSettings{};
+        }
+        else
+        {
+            m_projectSettingsDraft->rendering = RenderingSettings{};
+        }
     }
 
-    Tooltip("Resets the Rendering draft to the Engine defaults. Nothing changes until you save.");
+    Tooltip(audioCategory ? "Resets the Audio draft to the Engine defaults. Nothing changes until you save." :
+        "Resets the Rendering draft to the Engine defaults. Nothing changes until you save.");
     ImGui::EndDisabled();
 
     if(!blocker.empty())
@@ -638,6 +651,74 @@ void Editor::DrawRenderingSettingsCategory(const DebugUI& debugUI, bool editable
 
     ImGui::EndDisabled();
     DrawRenderingRuntimeStatus(debugUI);
+}
+
+void Editor::DrawAudioSettingsCategory(const DebugUI&, bool editable)
+{
+    AudioSettings& draft = m_projectSettingsDraft->audio;
+
+    ImGui::PushTextWrapPos(0.0f);
+    ImGui::TextDisabled("Saved in ProjectSettings.json. Built games do not ship Steam Audio yet and run FMOD only.");
+    ImGui::PopTextWrapPos();
+
+    ImGui::SeparatorText("Steam Audio");
+    ImGui::BeginDisabled(!editable);
+    ImGui::Checkbox("Enable Steam Audio", &draft.steamAudio);
+    static constexpr const char* rayTracers[] = {"Default", "Embree"};
+    DraftCombo("Ray Tracer", draft.steamAudioRayTracer, rayTracers);
+    ImGui::EndDisabled();
+    ImGui::PushTextWrapPos(0.0f);
+    ImGui::TextDisabled("Enables Steam Audio spatialization for FMOD Studio events configured with Steam Audio effects.");
+    ImGui::PopTextWrapPos();
+
+    // The runtime state comes from the audio system, never from the checkbox: Steam Audio starts (or not) once, when
+    // the project opens, before its banks load, and a session never loads or unloads the plugin afterwards.
+    const bool savedEnabled = m_activeProject->GetProjectSettings().settings.audio.steamAudio;
+    const SteamAudioSettingsStatus status = DescribeSteamAudioSettings(savedEnabled, m_audioSystem);
+
+    ImGui::Spacing();
+    ImGui::Text("Saved setting: %s", savedEnabled ? "enabled" : "disabled");
+    ImGui::TextWrapped("This session: %s", status.summary.c_str());
+
+    if(!status.detail.empty())
+    {
+        ImGui::PushTextWrapPos(0.0f);
+        ImGui::TextDisabled("%s", status.detail.c_str());
+        ImGui::PopTextWrapPos();
+    }
+
+    // What runs, from the audio system: it can differ from the saved choice, which a fallback never rewrites.
+    const ProjectSteamAudioRayTracer savedRayTracer = m_activeProject->GetProjectSettings().settings.audio.steamAudioRayTracer;
+    bool rayTracerReloadRequired = false;
+
+    if(m_audioSystem && status.state == SteamAudioSettingsStatus::State::Active)
+    {
+        const Audio::SteamAudioSimulationStats stats = m_audioSystem->GetSteamAudioSimulationStats();
+        ImGui::Text("Ray tracer this session: %s (requested %s)", Audio::ToString(stats.activeRayTracer), Audio::ToString(stats.requestedRayTracer));
+
+        if(!stats.rayTracerDetail.empty())
+        {
+            ImGui::PushTextWrapPos(0.0f);
+            ImGui::TextDisabled("%s", stats.rayTracerDetail.c_str());
+            ImGui::PopTextWrapPos();
+        }
+
+        rayTracerReloadRequired = (savedRayTracer == ProjectSteamAudioRayTracer::Embree) !=
+            (stats.requestedRayTracer == Audio::SteamAudioRayTracer::Embree);
+    }
+
+    if(draft.steamAudio != savedEnabled || draft.steamAudioRayTracer != savedRayTracer)
+    {
+        ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f), "Save, then reload the project to apply the Steam Audio setting.");
+    }
+    else if(rayTracerReloadRequired)
+    {
+        ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f), "Reload the project to apply the Ray Tracer setting.");
+    }
+    else if(status.reloadRequired)
+    {
+        ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f), "Reload the project to apply the Steam Audio setting.");
+    }
 }
 
 void Editor::DrawRenderingRuntimeStatus(const DebugUI& debugUI)

@@ -27,7 +27,11 @@ namespace CookedScene
     inline constexpr std::uint32_t ScriptVersion = 16;
     // Audio.2A Audio Source and Audio Listener components per object.
     inline constexpr std::uint32_t AudioVersion = 17;
-    inline constexpr std::uint32_t Version = AudioVersion;
+    // Same layout as AudioVersion; collider dimensions and offsets are object-local (ColliderScaleMigration.h).
+    inline constexpr std::uint32_t ColliderScaleVersion = 18;
+    // M4: per-object acoustic settings.
+    inline constexpr std::uint32_t AcousticsVersion = 19;
+    inline constexpr std::uint32_t Version = AcousticsVersion;
 
     constexpr bool IsSupportedVersion(std::uint32_t version)
     {
@@ -47,7 +51,9 @@ namespace CookedScene
             version == PhysicalLightingVersion ||
             version == CameraExposureVersion ||
             version == ScriptVersion ||
-            version == AudioVersion;
+            version == AudioVersion ||
+            version == ColliderScaleVersion ||
+            version == AcousticsVersion;
     }
     struct Policy
     {

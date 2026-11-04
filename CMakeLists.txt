@@ -77,6 +77,7 @@ include(cmake/AgilitySDK.cmake)
 include(cmake/DXC.cmake)
 include(cmake/DLSS.cmake)
 include(cmake/FMOD.cmake)
+include(cmake/SteamAudio.cmake)
 
 include(cmake/Box3D.cmake)
 add_subdirectory(src/Physics)
@@ -100,15 +101,42 @@ add_custom_target(UpdateScriptApiDeclarations
 
 # Audio.1A: the only target compiled against FMOD headers. Without the SDK it builds a backend-free AudioSystem
 # that reports audio as disabled, so no other target needs to know whether FMOD is present.
-add_library(EngineAudio STATIC src/Audio/AudioSystem.cpp src/Audio/AudioBanks.cpp src/Audio/AudioControl.cpp)
+#
+# SA.1: Steam Audio's FMOD plugin and C API live behind the same target; without the SDK (or with FMOD disabled)
+# EngineAudio reports Steam Audio as not compiled and every project runs FMOD-only.
+add_library(EngineAudio STATIC src/Audio/AudioSystem.cpp src/Audio/AudioBanks.cpp src/Audio/AudioControl.cpp
+    src/Audio/SteamAudioRuntime.cpp src/Audio/SteamAudioSimulation.cpp src/Audio/SteamAudioSnapshotSource.cpp)
 target_include_directories(EngineAudio PUBLIC src)
 engine_configure_fmod(EngineAudio)
+engine_configure_steamaudio(EngineAudio)
 
 if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Audio/tests/AudioSystemTests.cpp")
     add_executable(AudioSystemTests src/Audio/tests/AudioSystemTests.cpp src/Core/Log.cpp)
     target_link_libraries(AudioSystemTests PRIVATE EngineAudio)
     set_target_properties(AudioSystemTests PROPERTIES ENGINE_FMOD_LOGGING ON)
     engine_deploy_fmod(AudioSystemTests)
+endif()
+
+# SA.1/SA.2 local-only regression: Steam Audio enablement, failure fallback, lifecycle, spatializer identification,
+# coordinate conversion and gameplay-session spatialization.
+if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Audio/tests/SteamAudioTests.cpp")
+    add_executable(SteamAudioTests src/Audio/tests/SteamAudioTests.cpp src/Engine/GameAudioSession.cpp src/Core/Log.cpp
+        src/Engine/AcousticGeometry.cpp src/assets/AcousticMaterial.cpp src/assets/AssetID.cpp src/assets/AssetRecord.cpp
+        src/assets/ProjectAssetRegistry.cpp src/assets/ProjectAssetResolver.cpp src/assets/AssetRegistrySerializer.cpp
+        src/Project/ProjectPaths.cpp)
+    target_include_directories(SteamAudioTests PRIVATE src)
+    target_link_libraries(SteamAudioTests PRIVATE EngineAudio EngineScripting EngineScriptString psapi nlohmann_json ole32)
+    target_compile_definitions(SteamAudioTests PRIVATE NOMINMAX)
+    # SA.3 checks reach the plugin's DSPs and build test geometry with the SDKs directly.
+    target_include_directories(SteamAudioTests PRIVATE "${ENGINE_STEAMAUDIO_INCLUDE_DIR}" "${ENGINE_FMOD_CORE_INCLUDE_DIR}"
+        "${ENGINE_FMOD_STUDIO_INCLUDE_DIR}")
+
+    if(ENGINE_STEAMAUDIO_AVAILABLE)
+        target_compile_definitions(SteamAudioTests PRIVATE ENGINE_HAS_STEAMAUDIO=1)
+    endif()
+    set_target_properties(SteamAudioTests PROPERTIES ENGINE_FMOD_LOGGING ON)
+    engine_deploy_fmod(SteamAudioTests)
+    engine_deploy_steamaudio(SteamAudioTests)
 endif()
 
 # Audio.1C local-only regression: AngelScript -> GameAudioSession -> AudioSystem with real FMOD banks.
@@ -316,6 +344,8 @@ add_library(EngineCore OBJECT
     src/assets/AssetReconciliationTransaction.cpp
     src/assets/ProjectAssetReconciliation.cpp
     src/assets/ProjectAudioBankAssets.cpp
+    src/assets/AcousticMaterial.cpp
+    src/Engine/AcousticGeometry.cpp
     src/Editor/TextureThumbnailCache.cpp
     src/Editor/TextureThumbnailDiskCache.cpp
     src/Editor/AssetBrowser.cpp
@@ -360,6 +390,7 @@ add_library(EngineCore OBJECT
     src/Scene/RenderView.cpp
     src/Scene/SceneLighting.cpp
     src/Scene/SceneSerializer.cpp
+    src/Scene/ColliderScaleMigration.cpp
     src/Scene/SceneFileCreation.cpp
     src/Project/ProjectPaths.cpp
     src/Project/ProjectLocator.cpp
@@ -395,6 +426,7 @@ add_library(EngineCore OBJECT
     src/Editor/GamePlayControls.cpp
     src/Editor/ScriptControls.cpp
     src/Editor/AudioControls.cpp
+    src/Editor/AcousticControls.cpp
     src/Scene/FileSceneAssetCatalog.cpp
     src/Scene/SceneMetadataPreparation.cpp
     src/Scene/MeshResidency.cpp
@@ -479,6 +511,7 @@ if(ENGINE_BUILD_DIAGNOSTICS)
         $<$<CONFIG:Debug>:src/Engine/tests/ColliderVisualizationVerification.cpp>
         $<$<CONFIG:Debug>:src/Engine/tests/MarqueeSelectionVerification.cpp>
         $<$<CONFIG:Debug>:src/Engine/tests/ScenePhysicsPersistenceVerification.cpp>
+        $<$<CONFIG:Debug>:src/Engine/tests/ColliderScaleMigrationVerification.cpp>
         $<$<CONFIG:Debug>:src/Engine/tests/PresentationTransformVerification.cpp>
         $<$<CONFIG:Debug>:src/Engine/tests/SceneMembershipVerification.cpp>
         $<$<CONFIG:Debug>:src/Engine/tests/ResidencyBatchVerification.cpp>
@@ -700,6 +733,9 @@ engine_deploy_dlss(EngineRuntime)
 set_target_properties(Engine PROPERTIES ENGINE_FMOD_LOGGING ON)
 engine_deploy_fmod(Engine)
 engine_deploy_fmod(EngineRuntime)
+# SA.1: Steam Audio is enabled per project in the Editor only; packaged games run FMOD-only until Build Game ships
+# the Steam Audio runtime, so EngineRuntime's directory (Build Game's source) does not receive it.
+engine_deploy_steamaudio(Engine)
 
 # Agility SDK D3D12 headers take precedence over the Windows SDK copies.
 target_include_directories(EngineCore BEFORE PUBLIC "${ENGINE_AGILITY_SDK_INCLUDE_DIR}")

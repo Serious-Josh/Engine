@@ -31,10 +31,27 @@ class ProjectPaths;
 // Renderer-owned resources, independent of the active scene and its material tables.
 class MaterialPreviewRenderer
 {
+#if defined(ENGINE_HAS_VERIFICATION)
+    friend class ThumbnailSchedulingVerification;
+#endif
+
     public:
     static constexpr unsigned int kExtent = 256;
+    // Material generation budget: Asset Browser tiles admitted to request a thumbnail at once, and the
+    // Scene Object Inspector's own request limit.
     static constexpr size_t kThumbnailCapacity = 16;
+
+    // Material residency budget: completed Asset Browser material images kept displayed and pinned
+    // without admission, so rotation does not hide or regenerate finished thumbnails.
+    static constexpr size_t kThumbnailResidentCapacity = 32;
+
+    // Generation budget: Asset Browser tiles admitted to request and prepare a thumbnail at once.
     static constexpr size_t kMeshThumbnailCapacity = 8;
+
+    // Residency budget: completed Asset Browser images kept alive (one 256x256 RGBA8 target and one
+    // SRV/RTV each). Separate from generation so a visible set larger than the generation budget
+    // keeps its finished thumbnails instead of regenerating them on every admission rotation.
+    static constexpr size_t kMeshResidentImageCapacity = 32;
     enum class MeshThumbnailConsumer : unsigned int { AssetBrowser = 1, SceneInspector = 2 };
 
     // Recording borrows this context for the duration of a call.
@@ -115,6 +132,15 @@ class MaterialPreviewRenderer
     std::optional<MaterialPreviewImage> GetThumbnailImage(const DescriptorHeap& heap);
     std::optional<MaterialPreviewImage> GetThumbnailImage(
         const DescriptorHeap& heap, const ProjectPaths& paths, const AssetID& id);
+    // Resident fast path for a saved-thumbnail image the caller already displayed (its cacheSlot and
+    // cacheSerial). O(1): no request, registry, path or working-set processing. Display pins the image for
+    // this working set exactly like GetThumbnailImage; ValidationDue means the image is still current but its
+    // periodic validation is due, so the caller takes the full request path this frame; Invalid means the
+    // entry was reassigned, invalidated or is unusable, and the handle must be dropped.
+    enum class ResidentThumbnail { Display, ValidationDue, Invalid };
+    ResidentThumbnail PinResidentThumbnail(const DescriptorHeap& heap, size_t slot, std::uint64_t serial,
+        D3D12_GPU_DESCRIPTOR_HANDLE& srv);
+
     // Stops queued work only. Recorded/submitted jobs and images retain lifetime protection.
     void DiscardThumbnailRequests();
     // UI begins one enumeration; bounded Browser and Inspector requests share the pinned working set.
@@ -129,8 +155,9 @@ class MaterialPreviewRenderer
     void Shutdown();
 
     private:
-    // Browser admits 16 entries; remaining bounded capacity serves visible Inspector slots.
-    static constexpr size_t kThumbnailImageCapacity = 32;
+    // Browser residents (admitted and resident tiles together never exceed kThumbnailResidentCapacity)
+    // plus the Inspector's kThumbnailCapacity visible slots. One 256x256 RGBA8 target and SRV/RTV each.
+    static constexpr size_t kThumbnailImageCapacity = kThumbnailResidentCapacity + kThumbnailCapacity;
     MeshThumbnailPreparation m_meshPreparation;
     // Recording-only borrows. Caller retains buffers/ranges through submission
     // and GPU completion; describing geometry never allocates GPU resources.
@@ -152,8 +179,11 @@ class MaterialPreviewRenderer
         Vector3 eye;
     };
 
-    // One active geometry allocation (64 MiB), one staging slice (8 MiB), nine images.
-    static constexpr size_t kMeshImageCapacity = kMeshThumbnailCapacity + 1;
+    // One active geometry allocation (64 MiB), one staging slice (8 MiB), and the resident browser
+    // images plus one Scene Object Inspector image. Least recently displayed images are evicted first.
+    static constexpr size_t kMeshImageCapacity = kMeshResidentImageCapacity + 1;
+    static_assert(kMeshImageCapacity + kMeshThumbnailCapacity + 1 <= MeshThumbnailPreparation::kJobCapacity,
+        "Resident images and in-flight generation must both fit the preparation entries.");
     static constexpr size_t kMeshUploadBytes = 8 * 1024 * 1024;
     struct MeshGPUJob
     {
@@ -177,6 +207,10 @@ class MaterialPreviewRenderer
         std::uint64_t ticket = 0;
         std::uint64_t fence = 0;
         std::uint64_t displayFence = 0;
+
+        // Value of m_meshDisplayClock at the last display lookup; orders capacity eviction.
+        std::uint64_t lastDisplayUse = 0;
+        bool displayed = false;
         bool recorded = false;
         bool rendered = false;
         bool renderRecorded = false;
@@ -188,6 +222,7 @@ class MaterialPreviewRenderer
         bool persistenceAttempted = false;
     };
     std::deque<MeshGPUJob> m_meshJobs;
+    std::uint64_t m_meshDisplayClock = 0;
     std::vector<std::uint64_t> m_meshTickets;
     std::map<std::uint64_t, unsigned int> m_meshConsumers;
     std::uint64_t m_meshCompletedFence = 0;
@@ -246,6 +281,13 @@ class MaterialPreviewRenderer
         bool recorded = false;
         bool awaitingDisplaySubmission = false;
         std::chrono::steady_clock::time_point nextValidation{};
+
+        // Fixed position in m_thumbnailImages, and the assignment serial that resident handles must match.
+        size_t slot = SIZE_MAX;
+        std::uint64_t serial = 0;
+
+        // Working-set epoch in which a resident fast-path lookup pinned this image.
+        std::uint64_t pinnedEpoch = 0;
     };
 
     struct ThumbnailRequest
@@ -316,14 +358,25 @@ class MaterialPreviewRenderer
     InspectorState m_inspector;
     ThumbnailState m_thumbnail;
     MaterialThumbnailValidation m_thumbnailValidation;
-    static constexpr size_t kThumbnailQueueCapacity = 32;
+    // Every pinned image may have one queued validation or generation.
+    static constexpr size_t kThumbnailQueueCapacity = kThumbnailImageCapacity;
     // Stable nodes: the active job may borrow a cache entry until capture completes.
     std::deque<ThumbnailImage> m_thumbnailImages;
     std::deque<ThumbnailRequest> m_thumbnailRequests;
     DescriptorHeap* m_thumbnailRTVHeap = nullptr;
     std::filesystem::path m_thumbnailProject;
+
+    // Canonical form of m_thumbnailRootSource, resolved once per project root instead of per tile per frame.
+    std::filesystem::path m_thumbnailRootSource;
+    std::filesystem::path m_thumbnailRootCanonical;
+    std::filesystem::path ResolveThumbnailRoot(const ProjectPaths& paths, std::error_code& error);
     std::string m_lastThumbnailIdentity;
     std::uint64_t m_thumbnailUseSerial = 0;
+
+    // Never reset (including across recovery), so stale resident handles cannot match a new assignment.
+    std::uint64_t m_thumbnailImageSerial = 0;
+    std::uint64_t m_thumbnailWorkingSetEpoch = 0;
+    bool IsThumbnailPinned(const ThumbnailImage& image) const;
     bool m_thumbnailWorkingSetActive = false;
     std::vector<std::pair<std::filesystem::path, std::string>> m_thumbnailWorkingSet;
 

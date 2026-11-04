@@ -256,6 +256,8 @@ public:
         const std::optional<ScriptComponent>& replacement, std::string* errorMessage = nullptr);
     // Audio.2B authored Audio Source/Listener edit (add, field edits, remove of either), with the same identity,
     // expected-value and whole-scene checks as SetObjectScript. Event instances belong to gameplay, never here.
+    bool SetObjectAcoustics(const SceneObjectMetadata& selection, const std::optional<AcousticSettings>& expected,
+        const std::optional<AcousticSettings>& replacement, std::string* errorMessage = nullptr);
     bool SetObjectAudio(const SceneObjectMetadata& selection, const AudioComponentState& expected,
         const AudioComponentState& replacement, std::string* errorMessage = nullptr);
     bool SetObjectCharacterController(const SceneObjectMetadata& selection,

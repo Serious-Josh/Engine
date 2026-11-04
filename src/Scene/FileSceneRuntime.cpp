@@ -474,6 +474,51 @@ bool FileSceneRuntime::SetObjectAudio(const SceneObjectMetadata& selection, cons
     return true;
 }
 
+// M4: gameplay reads these at Play, so no renderer, physics or audio state changes here.
+bool FileSceneRuntime::SetObjectAcoustics(const SceneObjectMetadata& selection, const std::optional<AcousticSettings>& expected,
+    const std::optional<AcousticSettings>& replacement, std::string* errorMessage)
+{
+    const auto fail = [&](const char* message)
+    {
+        if(errorMessage)
+        {
+            *errorMessage = message;
+        }
+
+        return false;
+    };
+
+    const auto current = GetObjectMetadata(selection.objectID, errorMessage);
+
+    if(!current || current->runtimeIdentity != selection.runtimeIdentity || current->structureRevision != selection.structureRevision)
+    {
+        return fail("The object changed since inspection; edit rejected.");
+    }
+
+    const auto& objects = m_fileScene.GetDocument().objects;
+    const auto found = std::find_if(objects.begin(), objects.end(),
+        [&](const SceneObjectDocument& object) { return object.id == selection.objectID; });
+
+    if(found == objects.end() || found->acoustics != expected)
+    {
+        return fail("Acoustic settings changed since inspection; edit rejected.");
+    }
+
+    if(replacement && !ValidateAcousticSettings(*replacement, errorMessage))
+    {
+        return false;
+    }
+
+    if(expected == replacement)
+    {
+        return true;
+    }
+
+    std::optional<AcousticSettings> accepted = replacement;
+    m_fileScene.EditDocument().objects[static_cast<size_t>(found - objects.begin())].acoustics = std::move(accepted);
+    return true;
+}
+
 bool FileSceneRuntime::SetObjectPhysics(const SceneObjectMetadata& selection,
     const std::optional<Physics::PhysicsComponent>& expected,
     const std::optional<Physics::PhysicsComponent>& replacement, std::string* errorMessage)

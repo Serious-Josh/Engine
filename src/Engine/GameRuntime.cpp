@@ -1,4 +1,8 @@
 #include "Engine/GameRuntime.h"
+#include "Engine/AcousticGeometry.h"
+
+#include <map>
+#include <utility>
 #include "Renderer/Renderer.h"
 #include "Core/Log.h"
 #include "Core/Input.h"
@@ -469,6 +473,94 @@ namespace
     }
 }
 
+namespace
+{
+    Audio::AcousticTransform ToAcousticTransform(const Matrix4& world)
+    {
+        Audio::AcousticTransform transform{};
+
+        for(std::size_t row = 0; row < 4; ++row)
+        {
+            for(std::size_t column = 0; column < 4; ++column)
+            {
+                transform[row][column] = world.m[row][column];
+            }
+        }
+
+        return transform;
+    }
+}
+
+// M4: geometry is immutable once built, and objects with the same mesh and materials share it. The work happens only at Play;
+// afterwards only changed transforms travel.
+void GameRuntime::PublishAcousticScene(FileSceneRuntime& runtime)
+{
+    std::vector<GameAudioSession::AcousticObject> published;
+    std::map<std::pair<const ImportedMesh*, std::map<std::string, std::string>>, std::shared_ptr<const Audio::AcousticMeshData>> shared;
+    const auto& mapping = runtime.GetObjectMapping().idToRuntimeIndex;
+    const auto& renderObjects = runtime.GetScene().GetRenderObjects();
+    std::size_t enabled = 0;
+    std::size_t skipped = 0;
+    std::uint64_t triangles = 0;
+
+    for(const auto& object : runtime.GetFileScene().GetDocument().objects)
+    {
+        if(!object.acoustics || !object.acoustics->enabled)
+        {
+            continue;
+        }
+
+        ++enabled;
+        const auto found = mapping.find(object.id);
+        const RenderObject* renderObject = found != mapping.end() && found->second < renderObjects.size() ?
+            &renderObjects[found->second] : nullptr;
+        const ImportedMesh* geometry = renderObject && renderObject->mesh && m_acousticAssets.meshGeometry ?
+            m_acousticAssets.meshGeometry(*renderObject->mesh) : nullptr;
+
+        if(!geometry || !m_acousticAssets.material)
+        {
+            Log::Warning("Acoustics: '" + object.name + "' has no available mesh geometry; it contributes no acoustic surface.");
+            ++skipped;
+            continue;
+        }
+
+        auto& mesh = shared[{geometry, object.acoustics->submeshMaterials}];
+
+        if(!mesh)
+        {
+            AcousticGeometry::BuildReport report;
+            mesh = AcousticGeometry::Build(*geometry, *object.acoustics, m_acousticAssets.material, report);
+
+            for(const std::string& warning : report.warnings)
+            {
+                Log::Warning("Acoustics: '" + object.name + "': " + warning + ".");
+            }
+
+            if(!mesh)
+            {
+                Log::Warning("Acoustics: '" + object.name + "' contributes no acoustic surface: " + report.error + ".");
+            }
+        }
+
+        if(!mesh)
+        {
+            ++skipped;
+            continue;
+        }
+
+        triangles += mesh->triangles.size();
+        published.push_back({object.id, mesh, ToAcousticTransform(renderObject->GetPresentationTransform().currentModel)});
+    }
+
+    if(enabled > 0)
+    {
+        Log::Info("Acoustics: " + std::to_string(published.size()) + " of " + std::to_string(enabled) + " enabled objects, " +
+            std::to_string(shared.size()) + " distinct geometries, " + std::to_string(triangles) + " triangles.");
+    }
+
+    m_audio.PublishAcousticScene(std::move(published));
+}
+
 void GameRuntime::BeginSceneAudio(FileSceneRuntime& runtime)
 {
     std::vector<GameAudioSession::SceneSource> sources;
@@ -504,6 +596,7 @@ void GameRuntime::BeginSceneAudio(FileSceneRuntime& runtime)
         return ResolveAudioPose(runtime, objectID);
     });
     m_audio.RegisterSceneSources(std::move(sources));
+    PublishAcousticScene(runtime);
     // The listener is placed before any script code, so events scripts start in OnStart are heard from it.
     UpdateSceneAudio(runtime, 0.0);
 }
@@ -542,6 +635,20 @@ void GameRuntime::UpdateSceneAudio(const FileSceneRuntime& runtime, double delta
     m_audio.UpdateSpatial(deltaSeconds, listenerKey, listener, [&runtime](std::string_view objectID)
     {
         return ResolveAudioPose(runtime, objectID);
+    });
+
+    m_audio.UpdateAcousticTransforms([&runtime](std::string_view objectID) -> std::optional<Audio::AcousticTransform>
+    {
+        const auto& mapping = runtime.GetObjectMapping().idToRuntimeIndex;
+        const auto found = mapping.find(std::string(objectID));
+        const auto& objects = runtime.GetScene().GetRenderObjects();
+
+        if(found == mapping.end() || found->second >= objects.size())
+        {
+            return std::nullopt;
+        }
+
+        return ToAcousticTransform(objects[found->second].GetPresentationTransform().currentModel);
     });
 }
 

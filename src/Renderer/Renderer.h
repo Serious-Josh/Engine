@@ -100,6 +100,7 @@
 
 struct IDXGIAdapter3;
 #include <climits>
+#include "Debug/MeshThumbnailDiagnostics.h"
 
 struct EnvironmentAsset
 {
@@ -535,6 +536,13 @@ class Renderer
         return m_materialPreviewRenderer.GetThumbnailImage(m_resourceDescriptorHeap, paths, id);
     }
 
+    // O(1) display of a resident saved-thumbnail image by its cache handle; see MaterialPreviewRenderer.
+    MaterialPreviewRenderer::ResidentThumbnail PinResidentMaterialThumbnail(size_t slot, std::uint64_t serial,
+        D3D12_GPU_DESCRIPTOR_HANDLE& srv)
+    {
+        return m_materialPreviewRenderer.PinResidentThumbnail(m_resourceDescriptorHeap, slot, serial, srv);
+    }
+
     void BeginSavedMaterialThumbnailWorkingSet()
     {
         m_materialPreviewRenderer.BeginThumbnailWorkingSet();
@@ -550,6 +558,9 @@ class Renderer
 
     void PollMeshThumbnails(const ProjectPaths& paths, const ProjectAssetRegistry& registry)
     {
+        auto& diagnostics = MeshThumbnailDiagnostics::Get();
+        MeshThumbnailDiagnostics::Timer pollTimer(diagnostics.pollMicroseconds);
+        MeshThumbnailDiagnostics::Add(diagnostics.polls);
         m_materialPreviewRenderer.PollMeshThumbnailGPUCompletion(m_commandContext.GetCompletedFenceValue());
         m_materialPreviewRenderer.PollMeshThumbnailPreparation(paths, registry);
     }
@@ -583,6 +594,7 @@ class Renderer
     void DiscardMeshThumbnail(std::uint64_t ticket,
         MaterialPreviewRenderer::MeshThumbnailConsumer consumer = MaterialPreviewRenderer::MeshThumbnailConsumer::AssetBrowser)
     {
+        MeshThumbnailDiagnostics::Add(MeshThumbnailDiagnostics::Get().browserDiscards);
         m_materialPreviewRenderer.DiscardMeshThumbnailPreparation(ticket, consumer);
     }
 

@@ -846,7 +846,7 @@ void InspectorPanel::Draw(
         {
             const auto name = m_record->relativePath.stem().string();
             const auto path = m_record->relativePath.generic_string();
-            ImGui::TextWrapped("Material: %s", name.c_str());
+            ImGui::TextWrapped("%s: %s", m_record->type == AssetType::AcousticMaterial ? "Acoustic Material" : "Material", name.c_str());
             ImGui::TextWrapped("Path: %s", path.c_str());
         }
 
@@ -904,6 +904,10 @@ void InspectorPanel::Draw(
             }
 
             ImGui::TextWrapped("%s", m_status.c_str());
+        }
+        else if(m_acousticMaterial)
+        {
+            DrawAcousticMaterial(paths, registry, protectedAction);
         }
         else
         {
@@ -1043,10 +1047,19 @@ void InspectorPanel::LoadSelection(
     m_persistenceState = PersistenceState::Saved;
     m_record.reset();
     m_material.reset();
+    m_acousticMaterial.reset();
+    m_savedAcousticMaterial.reset();
+    m_savedAcousticBytes.clear();
     m_status = "No asset or scene object selected.";
 
     if(selection.empty())
     {
+        return;
+    }
+
+    if(_wcsicmp(selection.extension().c_str(), std::wstring(AcousticMaterials::FileExtension).c_str()) == 0)
+    {
+        LoadAcousticSelection(selection, paths, registry);
         return;
     }
 
@@ -1123,6 +1136,148 @@ void InspectorPanel::LoadSelection(
     m_savedMaterial = material;
     m_material = std::move(material);
     m_status.clear();
+}
+
+void InspectorPanel::LoadAcousticSelection(const std::filesystem::path& selection, const ProjectPaths& paths,
+    const ProjectAssetRegistry& registry)
+{
+    const AssetRecord* record = registry.FindByPath(selection.lexically_relative(paths.GetRoot()).lexically_normal());
+
+    if(!record || record->type != AssetType::AcousticMaterial)
+    {
+        m_status = "This .acousticmaterial file is not registered in the project asset registry.";
+        return;
+    }
+
+    m_record = *record;
+    const auto resolution = ProjectAssetResolver::Resolve(paths, registry, record->id);
+
+    if(resolution.status != AssetAvailability::Available)
+    {
+        m_status = "The acoustic material file is missing or unavailable.";
+        return;
+    }
+
+    std::string bytes;
+    AcousticMaterialData material;
+
+    // Corrupted or out-of-range data is reported and left alone: nothing can be saved over it from here.
+    if(!ReadMaterialBytes(resolution.resolvedPath, bytes))
+    {
+        m_status = "Cannot read the acoustic material file.";
+        return;
+    }
+
+    if(!AcousticMaterials::LoadFromFile(resolution.resolvedPath, material, &m_status))
+    {
+        m_status = "This acoustic material can't be edited: " + m_status;
+        return;
+    }
+
+    m_savedAcousticBytes = std::move(bytes);
+    m_savedAcousticMaterial = material;
+    m_acousticMaterial = material;
+    m_status.clear();
+}
+
+void InspectorPanel::DrawAcousticMaterial(const ProjectPaths& paths, const ProjectAssetRegistry& registry, bool protectedAction)
+{
+    constexpr InspectorDragSpec UnitInterval{0.005f, 0.0f, 1.0f, true, "%.4g"};
+    const AcousticMaterialData before = *m_acousticMaterial;
+    AcousticMaterialData& material = *m_acousticMaterial;
+
+    const auto drawBands = [&](const char* title, std::array<float, 3>& bands)
+    {
+        ImGui::SeparatorText(title);
+        ImGui::PushID(title);
+        InspectorDragFloats("Low frequency", &bands[0], 1, UnitInterval);
+        InspectorDragFloats("Mid frequency", &bands[1], 1, UnitInterval);
+        InspectorDragFloats("High frequency", &bands[2], 1, UnitInterval);
+        ImGui::PopID();
+    };
+
+    drawBands("Absorption", material.absorption);
+    drawBands("Transmission", material.transmission);
+    ImGui::SeparatorText("Scattering");
+    InspectorDragFloats("Scattering", &material.scattering, 1, UnitInterval);
+
+    // Anything out of range or non-finite never reaches the draft.
+    if(!AcousticMaterials::Validate(material, &m_status))
+    {
+        material = AcousticMaterials::Validate(before) ? before : *m_savedAcousticMaterial;
+    }
+    else if(!(material == before))
+    {
+        m_lastPropertyChangeTime = ImGui::GetTime();
+        m_saveScheduled = HasUnsavedChanges() && !m_externalConflict;
+        m_persistenceState = m_externalConflict ? PersistenceState::Failed : PersistenceState::Waiting;
+
+        if(!m_externalConflict)
+        {
+            m_status.clear();
+        }
+    }
+
+    if(!HasUnsavedChanges())
+    {
+        m_saveScheduled = false;
+        m_persistenceState = m_externalConflict ? PersistenceState::Failed : PersistenceState::Saved;
+    }
+
+    const bool settled = ImGui::GetTime() - m_lastPropertyChangeTime >= 0.4;
+
+    if(m_saveScheduled && settled && !protectedAction && !ImGui::IsMouseDown(ImGuiMouseButton_Left))
+    {
+        Save(paths, registry);
+    }
+
+    ImGui::Separator();
+    ImGui::TextUnformatted(m_persistenceState == PersistenceState::Saved ? "Saved" :
+        m_persistenceState == PersistenceState::Failed ? "Save failed - working values retained" : "Unsaved changes");
+
+    if(m_persistenceState == PersistenceState::Failed && ImGui::Button("Retry"))
+    {
+        Save(paths, registry);
+    }
+
+    ImGui::TextWrapped("%s", m_status.c_str());
+    ImGui::TextDisabled("Used the next time Play starts.");
+}
+
+bool InspectorPanel::SaveAcousticMaterial(const ProjectPaths& paths, const ProjectAssetRegistry& registry, bool overwriteConflict)
+{
+    const auto resolution = m_record ? ProjectAssetResolver::Resolve(paths, registry, m_record->id) : AssetResolution{};
+    std::string current;
+
+    if(!m_record || resolution.status != AssetAvailability::Available || !ReadMaterialBytes(resolution.resolvedPath, current))
+    {
+        m_status = "The acoustic material file is missing or unavailable.";
+        m_persistenceState = PersistenceState::Failed;
+        return false;
+    }
+
+    if(current != m_savedAcousticBytes && !overwriteConflict)
+    {
+        m_status = "This acoustic material changed outside the Inspector.";
+        m_externalConflict = true;
+        m_showConflictConfirmation = true;
+        m_persistenceState = PersistenceState::Failed;
+        return false;
+    }
+
+    if(!AcousticMaterials::SaveToFile(*m_acousticMaterial, resolution.resolvedPath, &m_status) ||
+        !ReadMaterialBytes(resolution.resolvedPath, m_savedAcousticBytes))
+    {
+        m_persistenceState = PersistenceState::Failed;
+        return false;
+    }
+
+    m_savedAcousticMaterial = m_acousticMaterial;
+    m_externalConflict = false;
+    m_showConflictConfirmation = false;
+    m_persistenceState = PersistenceState::Saved;
+    m_status.clear();
+    return true;
 }
 
 void InspectorPanel::DrawMaterial(
@@ -1767,6 +1922,11 @@ void InspectorPanel::DrawTexturePickerContents(TextureSlot slot,
 
 bool InspectorPanel::HasUnsavedChanges() const
 {
+    if(m_acousticMaterial)
+    {
+        return m_savedAcousticMaterial && !(*m_acousticMaterial == *m_savedAcousticMaterial);
+    }
+
     return m_material && m_savedMaterial && !EqualMaterials(*m_material, *m_savedMaterial);
 }
 
@@ -1799,6 +1959,11 @@ bool InspectorPanel::Save(
     bool overwriteConflict)
 {
     m_saveScheduled = false;
+
+    if(m_acousticMaterial)
+    {
+        return SaveAcousticMaterial(paths, registry, overwriteConflict);
+    }
 
     if(!HasUnsavedChanges() && !m_externalConflict)
     {

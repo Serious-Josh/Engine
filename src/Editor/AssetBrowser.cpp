@@ -15,6 +15,8 @@
 #include "Editor/InspectorNumericDrag.h"
 #include "assets/ProjectAssetResolver.h"
 #include "Core/Log.h"
+#include "Debug/MaterialThumbnailDiagnostics.h"
+#include "Debug/MeshThumbnailDiagnostics.h"
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -181,6 +183,7 @@ AssetBrowser::AssetBrowser() = default;
 void AssetBrowser::InvalidateFileListings()
 {
     m_listings.clear();
+    m_activeSceneIdentity.reset();
 }
 
 std::optional<std::filesystem::path> AssetBrowser::TakeSceneOpenRequest()
@@ -304,6 +307,143 @@ bool AssetBrowser::CanCreateMaterial(std::string& error) const
     return CanBrowse(
         m_directory,
         error);
+}
+
+std::optional<AssetBrowser::AcousticMaterialCreationRequest> AssetBrowser::TakeAcousticMaterialCreationRequest()
+{
+    return std::exchange(m_acousticRequest, std::nullopt);
+}
+
+// Built-in presets are read-only, so this is how one becomes an editable project asset: the new file starts with its values.
+void AssetBrowser::DrawAcousticMaterialCreationModal()
+{
+    if(m_openAcousticModal)
+    {
+        ImGui::OpenPopup("Create Acoustic Material");
+        m_openAcousticModal = false;
+    }
+
+    bool creationOpen = true;
+
+    if(!ImGui::BeginPopupModal("Create Acoustic Material", &creationOpen, ImGuiWindowFlags_AlwaysAutoResize))
+    {
+        return;
+    }
+
+    if(ImGui::IsWindowAppearing())
+    {
+        ImGui::SetKeyboardFocusHere();
+    }
+
+    ImGui::InputText("Name", m_acousticName.data(), m_acousticName.size());
+    const std::vector<std::string> presets = AcousticMaterials::BuiltinReferences();
+    m_acousticPreset = std::clamp(m_acousticPreset, 0, static_cast<int>(presets.size()) - 1);
+
+    if(ImGui::BeginCombo("Start from", AcousticMaterials::BuiltinDisplayName(presets[m_acousticPreset]).c_str()))
+    {
+        for(int index = 0; index < static_cast<int>(presets.size()); ++index)
+        {
+            if(ImGui::Selectable(AcousticMaterials::BuiltinDisplayName(presets[index]).c_str(), index == m_acousticPreset))
+            {
+                m_acousticPreset = index;
+            }
+        }
+
+        ImGui::EndCombo();
+    }
+
+    if(!m_acousticError.empty())
+    {
+        ImGui::TextWrapped("%s", m_acousticError.c_str());
+    }
+
+    ImGui::BeginDisabled(m_materialCreationPending);
+
+    if(ImGui::Button("Create"))
+    {
+        m_acousticError.clear();
+
+        try
+        {
+            std::filesystem::path filename;
+
+            if(CreationFilename(m_acousticName.data(), filename, m_acousticError, false) && CanBrowse(m_acousticDirectory, m_acousticError))
+            {
+                if(!filename.has_extension())
+                {
+                    filename += std::wstring(AcousticMaterials::FileExtension);
+                }
+
+                const auto destination = m_acousticDirectory / filename;
+                std::error_code ec;
+
+                if(_wcsicmp(filename.extension().c_str(), std::wstring(AcousticMaterials::FileExtension).c_str()) != 0)
+                {
+                    m_acousticError = "The filename extension must be .acousticmaterial.";
+                }
+                else if(std::filesystem::exists(destination, ec) || ec)
+                {
+                    m_acousticError = ec ? "Cannot inspect destination: " + ec.message() : "A file with this name already exists.";
+                }
+                else
+                {
+                    m_acousticRequest = AcousticMaterialCreationRequest{destination.lexically_relative(m_root),
+                        *AcousticMaterials::FindBuiltin(presets[m_acousticPreset])};
+                    m_materialCreationPending = true;
+                    ImGui::CloseCurrentPopup();
+                }
+            }
+        }
+        catch(const std::exception& exception)
+        {
+            m_acousticError = exception.what();
+        }
+    }
+
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+
+    if(ImGui::Button("Cancel"))
+    {
+        ImGui::CloseCurrentPopup();
+    }
+
+    ImGui::EndPopup();
+}
+
+// Copies the saved values under the first free "<name> Copy" name, in the same folder. The copy is a new asset with its own
+// identity: references to the original stay on the original.
+void AssetBrowser::RequestAcousticMaterialDuplicate(const std::filesystem::path& source)
+{
+    AcousticMaterialData material;
+
+    if(!AcousticMaterials::LoadFromFile(source, material, &m_error))
+    {
+        return;
+    }
+
+    std::error_code ec;
+
+    for(int attempt = 1; attempt < 1000; ++attempt)
+    {
+        std::wstring stem = source.stem().native() + L" Copy";
+
+        if(attempt > 1)
+        {
+            stem += L" " + std::to_wstring(attempt);
+        }
+
+        const auto destination = source.parent_path() / (stem + source.extension().native());
+
+        if(!std::filesystem::exists(destination, ec) && !ec)
+        {
+            m_acousticRequest = AcousticMaterialCreationRequest{destination.lexically_relative(m_root), material};
+            m_materialCreationPending = true;
+            return;
+        }
+    }
+
+    m_error = "No free name for a copy of this acoustic material.";
 }
 
 void AssetBrowser::DrawMaterialCreationModal()
@@ -477,7 +617,7 @@ bool AssetBrowser::CanBrowse(
     return true;
 }
 
-const AssetBrowser::Listing& AssetBrowser::GetListing(const std::filesystem::path& path)
+AssetBrowser::Listing& AssetBrowser::GetListing(const std::filesystem::path& path)
 {
     auto [position, inserted] = m_listings.try_emplace(path);
     auto& listing = position->second;
@@ -491,6 +631,8 @@ const AssetBrowser::Listing& AssetBrowser::GetListing(const std::filesystem::pat
     {
         return listing;
     }
+
+    listing.browsable = true;
 
     std::error_code ec;
     std::filesystem::directory_iterator iterator(
@@ -511,8 +653,14 @@ const AssetBrowser::Listing& AssetBrowser::GetListing(const std::filesystem::pat
         else
         {
             const bool directory = (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
-            listing.entries.push_back({entryPath, DisplayName(entryPath), directory,
-                directory && (attributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0});
+            const bool reparsePoint = (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+            Entry entry;
+            entry.path = entryPath;
+            entry.name = DisplayName(entryPath);
+            entry.directory = directory;
+            entry.navigable = directory && !reparsePoint;
+            entry.ordinaryFile = !directory && !reparsePoint;
+            listing.entries.push_back(std::move(entry));
         }
 
         iterator.increment(ec);
@@ -535,11 +683,148 @@ const AssetBrowser::Listing& AssetBrowser::GetListing(const std::filesystem::pat
     return listing;
 }
 
+void AssetBrowser::ClassifySceneEntries(Listing& listing, const ProjectContext& project) const
+{
+    // A listing built for another project (or before a project switch) is re-resolved once.
+    if(!ProjectAssetRegistry::PathsEqual(listing.sceneProjectRoot, project.GetRoot()))
+    {
+        listing.sceneProjectRoot = project.GetRoot();
+        std::error_code rootError;
+        listing.sceneRoot = project.ResolveCanonicalRoot(rootError);
+
+        if(rootError)
+        {
+            listing.sceneRoot.clear();
+        }
+
+        for(auto& entry : listing.entries)
+        {
+            entry.sceneCanonicalPath.reset();
+        }
+    }
+
+    for(auto& entry : listing.entries)
+    {
+        if(entry.sceneCanonicalPath)
+        {
+            continue;
+        }
+
+        entry.sceneCanonicalPath.emplace();
+        const bool sceneCandidate = entry.ordinaryFile && listing.browsable && !listing.sceneRoot.empty() &&
+            ProjectAssetRegistry::PathsEqual(entry.path.extension(), ".scene");
+
+        if(!sceneCandidate)
+        {
+            continue;
+        }
+
+        // Same containment rule as IsSceneEntry; the directory walk is already covered by listing.browsable.
+        std::error_code canonicalError;
+        auto resolved = std::filesystem::canonical(entry.path, canonicalError);
+
+        if(!canonicalError && IsPathWithin(resolved, listing.sceneRoot))
+        {
+            *entry.sceneCanonicalPath = std::move(resolved);
+        }
+    }
+}
+
+const std::filesystem::path& AssetBrowser::GetActiveScenePath(const ProjectContext& project,
+    const FileBackedDemoScene* activeScene)
+{
+    static const std::filesystem::path none;
+    const bool eligible = activeScene && !activeScene->IsUnsaved() && !activeScene->IsArchiveActivation();
+    const auto& scenePath = eligible ? activeScene->GetScenePath() : none;
+    const auto& ownerRoot = eligible ? activeScene->GetProjectRoot() : none;
+
+    const bool current = m_activeSceneIdentity &&
+        m_activeSceneIdentity->eligible == eligible &&
+        m_activeSceneIdentity->projectRoot == project.GetRoot() &&
+        m_activeSceneIdentity->scenePath == scenePath &&
+        m_activeSceneIdentity->sceneOwnerRoot == ownerRoot;
+
+    if(current)
+    {
+        return m_activeSceneIdentity->canonicalScenePath;
+    }
+
+    // Resolution mirrors IsActiveSceneEntry: same owning project, and the scene inside that project.
+    ActiveSceneIdentity identity;
+    identity.projectRoot = project.GetRoot();
+    identity.scenePath = scenePath;
+    identity.sceneOwnerRoot = ownerRoot;
+    identity.eligible = eligible;
+
+    if(eligible)
+    {
+        identity.canonicalScenePath = ResolveActiveScenePath(project, ownerRoot, scenePath);
+    }
+
+    m_activeSceneIdentity = std::move(identity);
+    return m_activeSceneIdentity->canonicalScenePath;
+}
+
+std::filesystem::path AssetBrowser::ResolveActiveScenePath(const ProjectContext& project,
+    const std::filesystem::path& ownerRoot, const std::filesystem::path& scenePath)
+{
+    std::error_code error;
+    const auto projectRoot = project.ResolveCanonicalRoot(error);
+
+    if(error)
+    {
+        return {};
+    }
+
+    const auto canonicalOwner = std::filesystem::canonical(ownerRoot, error);
+
+    if(error || !ProjectAssetRegistry::PathsEqual(canonicalOwner, projectRoot))
+    {
+        return {};
+    }
+
+    auto activePath = std::filesystem::canonical(scenePath, error);
+
+    if(error || !IsPathWithin(activePath, projectRoot))
+    {
+        return {};
+    }
+
+    return activePath;
+}
+
+bool AssetBrowser::CanRequestFileOperation(const std::filesystem::path& path, std::string& error) const
+{
+    // Live re-check before a destructive request: cached listing facts never authorize an operation.
+    // ProjectAssetDeletion/rename still perform their own pinned containment checks when executing.
+    const DWORD attributes = GetFileAttributesW(path.c_str());
+
+    if(attributes == INVALID_FILE_ATTRIBUTES)
+    {
+        error = "Cannot access " + DisplayName(path) + ": " + std::system_category().message(GetLastError());
+        return false;
+    }
+
+    if((attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0)
+    {
+        error = DisplayName(path) + " is no longer an ordinary file.";
+        return false;
+    }
+
+    if(!m_thumbnailPaths || path == m_thumbnailPaths->GetAssetRegistryPath())
+    {
+        error = "The project asset registry cannot be modified here.";
+        return false;
+    }
+
+    return CanBrowse(path.parent_path(), error);
+}
+
 bool AssetBrowser::RevealMaterial(const AssetID& id,const ProjectPaths& paths,const ProjectAssetRegistry& registry,std::string& error)
 {
     error.clear();
     const auto* record=registry.Find(id);
-    if(!record || record->type!=AssetType::Material) { error="Assigned material is not registered as a project material."; return false; }
+    if(!record || (record->type!=AssetType::Material && record->type!=AssetType::AcousticMaterial)) { error="Assigned material is not registered as a project material."; return false; }
     const auto resolved=ProjectAssetResolver::Resolve(paths,registry,id);
     if(resolved.status!=AssetAvailability::Available) { error="Assigned material is missing or unavailable."; return false; }
     auto directory=resolved.resolvedPath.parent_path();
@@ -561,6 +846,7 @@ void AssetBrowser::Navigate(const std::filesystem::path& path)
         m_materialRequestsReset = true;
         m_directory = path;
         m_listings.erase(path);
+        m_activeSceneIdentity.reset();
         m_navigationHighlight.reset(); m_revealPending=false;
         m_selection.clear();
     }
@@ -636,12 +922,25 @@ void AssetBrowser::DrawTree(
 
 void AssetBrowser::DrawContents(const ProjectContext* project, const FileBackedDemoScene* activeScene)
 {
-    const auto& listing = GetListing(m_directory);
+    auto& listing = GetListing(m_directory);
 
     if (!listing.error.empty())
     {
         ImGui::TextWrapped("%s", listing.error.c_str());
     }
+
+    // Filesystem facts are resolved once per listing (and per active-scene change), not per tile per frame.
+    EditorPhaseTiming::Scope classificationPhase(m_phaseTiming,
+        EditorPhaseTiming::Phase::AssetBrowserContentsFilesystem);
+    static const std::filesystem::path noActiveScene;
+
+    if(project)
+    {
+        ClassifySceneEntries(listing, *project);
+    }
+
+    const auto& activeScenePath = project ? GetActiveScenePath(*project, activeScene) : noActiveScene;
+    classificationPhase.End();
 
     const auto& style = ImGui::GetStyle();
     const float compactIconSize = ImGui::GetFontSize() * 2.0f;
@@ -663,6 +962,10 @@ void AssetBrowser::DrawContents(const ProjectContext* project, const FileBackedD
     const int columns = (std::max)(1, static_cast<int>(ImGui::GetContentRegionAvail().x / columnPitch));
     std::filesystem::path destination;
     bool tileHovered = false;
+
+    // Set when a live re-check contradicts the cached listing; the listing is rebuilt after the loop
+    // because erasing it here would invalidate the entries being iterated.
+    bool staleListing = false;
     const auto now = ThumbnailAdmission::Clock::now();
 
     if (ImGui::BeginTable("Files", columns, ImGuiTableFlags_SizingFixedSame))
@@ -699,11 +1002,15 @@ void AssetBrowser::DrawContents(const ProjectContext* project, const FileBackedD
                 _wcsicmp(entry.path.extension().c_str(), L".material") == 0;
             const bool isMesh = !entry.directory && !sceneDocument && m_meshRecords.contains(entry.path.lexically_normal());
             lookupPhase.End();
-            EditorPhaseTiming::Scope sceneCheckPhase(m_phaseTiming,
-                EditorPhaseTiming::Phase::AssetBrowserContentsFilesystem);
-            const bool isScene = sceneDocument && project && IsSceneEntry(entry.path, *project);
-            const bool active = isScene && IsActiveSceneEntry(entry.path, *project, activeScene);
-            sceneCheckPhase.End();
+            const bool isScene = sceneDocument && project &&
+                entry.sceneCanonicalPath && !entry.sceneCanonicalPath->empty();
+            const bool active = isScene && !activeScenePath.empty() &&
+                ProjectAssetRegistry::PathsEqual(*entry.sceneCanonicalPath, activeScenePath);
+            // M4: an icon tile; acoustic materials have no visual preview, so no thumbnail is ever requested.
+            const auto* acousticRecord = !entry.directory && project && m_thumbnailRegistry &&
+                _wcsicmp(entry.path.extension().c_str(), L".acousticmaterial") == 0 ?
+                m_thumbnailRegistry->FindByPath(entry.path.lexically_relative(project->GetRoot())) : nullptr;
+            const bool isAcoustic = acousticRecord && acousticRecord->type == AssetType::AcousticMaterial;
             const bool hasThumbnail = isTexture || isMaterial || isMesh;
             const bool compactTile = !hasThumbnail && !isScript;
             const auto tilePosition = ImGui::GetCursorScreenPos();
@@ -727,7 +1034,7 @@ void AssetBrowser::DrawContents(const ProjectContext* project, const FileBackedD
 
                 if(m_icons)
                 {
-                    m_icons->Draw(*draw, entry.directory ? EditorIcon::Folder :
+                    m_icons->Draw(*draw, entry.directory ? EditorIcon::Folder : isAcoustic ? EditorIcon::AudioWaveform :
                         sceneDocument ? EditorIcon::Box : EditorIcon::File,
                         iconPosition, ImVec2(compactIconSize, compactIconSize), ImGui::GetColorU32(ImGuiCol_Text));
                 }
@@ -751,7 +1058,7 @@ void AssetBrowser::DrawContents(const ProjectContext* project, const FileBackedD
             {
                 DrawMeshDragSource(entry.path, entry.name);
             }
-            else if(isTexture || isMaterial)
+            else if(isTexture || isMaterial || isAcoustic)
             {
                 DrawAssetMoveSource(entry.path, entry.name);
             }
@@ -784,17 +1091,28 @@ void AssetBrowser::DrawContents(const ProjectContext* project, const FileBackedD
                 }
                 else if(isMaterial && m_materialRenderer && m_thumbnailPaths && m_thumbnailRegistry)
                 {
-                    // Only admitted tiles join the renderer's per-frame working set (B.2 rotation).
+                    // Resident tiles display their finished image and join the renderer's working set
+                    // directly; only the remaining tiles go through admission (B.2 rotation).
                     const auto key = material->second.id.ToReference();
-                    const auto admission = m_materialAdmission.MarkVisible(key, now);
-                    std::optional<MaterialPreviewImage> image;
+                    std::optional<MaterialPreviewImage> image = GetResidentMaterialThumbnail(key, material->second.id);
+                    const auto admission = image ? ThumbnailAdmission::TileState::Admitted :
+                        m_materialAdmission.MarkVisible(key, now);
                     const char* status = admission == ThumbnailAdmission::TileState::CoolingDown ? "Unavailable" : "Queued";
 
-                    if(admission == ThumbnailAdmission::TileState::Admitted)
+                    if(!image && admission == ThumbnailAdmission::TileState::Admitted)
                     {
-                        m_materialRenderer->RequestSavedMaterialThumbnail(
-                            *m_thumbnailPaths, *m_thumbnailRegistry, material->second.id, materialError);
+                        auto& diagnostics = MaterialThumbnailDiagnostics::Get();
+
+                        {
+                            MaterialThumbnailDiagnostics::Timer requestTimer(diagnostics.browserRequestMicroseconds);
+                            MaterialThumbnailDiagnostics::Add(diagnostics.browserRequests);
+                            m_materialRenderer->RequestSavedMaterialThumbnail(
+                                *m_thumbnailPaths, *m_thumbnailRegistry, material->second.id, materialError);
+                        }
+
                         // Lookup registers this exact image's current ImGui reference with Renderer.
+                        MaterialThumbnailDiagnostics::Timer lookupTimer(diagnostics.imageLookupMicroseconds);
+                        MaterialThumbnailDiagnostics::Add(diagnostics.imageLookups);
                         image = m_materialRenderer->GetSavedMaterialThumbnailImage(*m_thumbnailPaths, material->second.id);
                         status = "Generating";
 
@@ -802,6 +1120,7 @@ void AssetBrowser::DrawContents(const ProjectContext* project, const FileBackedD
                         {
                             m_materialAdmission.MarkShown(key, now);
                             m_thumbnailFailures.erase(key);
+                            m_materialResidents[key] = ResidentMaterialThumbnail{now, true, image->cacheSlot, image->cacheSerial};
                         }
                         else if(!materialError.empty())
                         {
@@ -810,6 +1129,8 @@ void AssetBrowser::DrawContents(const ProjectContext* project, const FileBackedD
                             status = "Unavailable";
                         }
                     }
+
+                    RecordMaterialDisplayForDiagnostics(key, image.has_value());
 
                     if(image)
                     {
@@ -825,14 +1146,17 @@ void AssetBrowser::DrawContents(const ProjectContext* project, const FileBackedD
                 {
                     const auto& record = m_meshRecords.at(entry.path.lexically_normal());
                     const auto key = record.id.ToReference();
-                    const auto admission = m_meshAdmission.MarkVisible(key, now);
-                    std::optional<D3D12_GPU_DESCRIPTOR_HANDLE> image;
+
+                    // A resident tile displays its retained image without occupying a generation slot.
+                    std::optional<D3D12_GPU_DESCRIPTOR_HANDLE> image = GetResidentMeshThumbnail(record);
+                    const auto admission = image ? ThumbnailAdmission::TileState::Admitted :
+                        m_meshAdmission.MarkVisible(key, now);
                     const auto failure = m_thumbnailFailures.find(key);
                     const bool terminalFailure = failure != m_thumbnailFailures.end() && failure->second.terminal;
                     const char* status = admission != ThumbnailAdmission::TileState::CoolingDown ? "Queued" :
                         terminalFailure ? "No preview" : "Retrying soon";
 
-                    if(admission == ThumbnailAdmission::TileState::Admitted)
+                    if(!image && admission == ThumbnailAdmission::TileState::Admitted)
                     {
                         bool terminal = false;
                         image = GetVisibleMeshThumbnail(record, materialError, terminal);
@@ -842,6 +1166,9 @@ void AssetBrowser::DrawContents(const ProjectContext* project, const FileBackedD
                         {
                             m_meshAdmission.MarkShown(key, now);
                             m_thumbnailFailures.erase(key);
+                            auto& residentRequest = m_meshThumbnailRequests[key];
+                            residentRequest.resident = true;
+                            residentRequest.residentSince = now;
                         }
                         else if(!materialError.empty())
                         {
@@ -881,7 +1208,8 @@ void AssetBrowser::DrawContents(const ProjectContext* project, const FileBackedD
             }
             ImGui::EndGroup();
             CaptureDropTarget(entry.navigable ? entry.path : std::filesystem::path{});
-            const bool located=isMaterial && m_navigationHighlight && material->second.id==*m_navigationHighlight;
+            const bool located=m_navigationHighlight && ((isMaterial && material->second.id==*m_navigationHighlight) ||
+                (isAcoustic && acousticRecord->id==*m_navigationHighlight));
             if(located)
             {
                 if(m_revealPending) { ImGui::SetScrollHereY(0.5f); m_revealPending=false; }
@@ -926,16 +1254,9 @@ void AssetBrowser::DrawContents(const ProjectContext* project, const FileBackedD
                     !materialError.empty() ? ("\n" + materialError).c_str() : "");
             }
 
-            EditorPhaseTiming::Scope eligibilityPhase(m_phaseTiming,
-                EditorPhaseTiming::Phase::AssetBrowserContentsFilesystem);
-            const DWORD attributes = GetFileAttributesW(entry.path.c_str());
-            const bool ordinaryFile = attributes != INVALID_FILE_ATTRIBUTES &&
-                (attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) == 0;
-
-            std::string deleteEligibility;
-            const bool eligible = ordinaryFile && m_thumbnailPaths &&
-                entry.path != m_thumbnailPaths->GetAssetRegistryPath() && CanBrowse(entry.path.parent_path(), deleteEligibility);
-            eligibilityPhase.End();
+            // Only decides whether the menu is offered; Rename/Delete re-check the filesystem when chosen.
+            const bool eligible = entry.ordinaryFile && listing.browsable && m_thumbnailPaths &&
+                entry.path != m_thumbnailPaths->GetAssetRegistryPath();
 
             if(eligible && hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right))
             {
@@ -972,21 +1293,44 @@ void AssetBrowser::DrawContents(const ProjectContext* project, const FileBackedD
                     }
                 }
 
+                std::string operationError;
+
+                if(isAcoustic && ImGui::MenuItem("Duplicate", nullptr, false, canModify && !m_materialCreationPending))
+                {
+                    RequestAcousticMaterialDuplicate(entry.path);
+                }
+
                 if(ImGui::MenuItem("Rename", nullptr, false, canModify))
                 {
-                    m_renameTarget = entry.path;
-                    const auto stem = entry.path.stem().u8string();
-                    m_renameStem.fill(0);
-                    memcpy(m_renameStem.data(), stem.data(), (std::min)(stem.size(), m_renameStem.size() - 1));
-                    m_renameError.clear();
-                    m_openRenameModal = true;
-                    m_focusRename = true;
+                    if(CanRequestFileOperation(entry.path, operationError))
+                    {
+                        m_renameTarget = entry.path;
+                        const auto stem = entry.path.stem().u8string();
+                        m_renameStem.fill(0);
+                        memcpy(m_renameStem.data(), stem.data(), (std::min)(stem.size(), m_renameStem.size() - 1));
+                        m_renameError.clear();
+                        m_openRenameModal = true;
+                        m_focusRename = true;
+                    }
+                    else
+                    {
+                        m_error = operationError;
+                        staleListing = true;
+                    }
                 }
 
                 if(ImGui::MenuItem("Delete", nullptr, false, canModify))
                 {
-                    m_deleteTarget = entry.path;
-                    m_openDeleteModal = true;
+                    if(CanRequestFileOperation(entry.path, operationError))
+                    {
+                        m_deleteTarget = entry.path;
+                        m_openDeleteModal = true;
+                    }
+                    else
+                    {
+                        m_error = operationError;
+                        staleListing = true;
+                    }
                 }
 
                 ImGui::EndPopup();
@@ -1001,6 +1345,12 @@ void AssetBrowser::DrawContents(const ProjectContext* project, const FileBackedD
     if (listing.entries.empty() && listing.error.empty())
     {
         ImGui::TextDisabled("This directory is empty.");
+    }
+
+    if(staleListing)
+    {
+        m_listings.erase(m_directory);
+        m_activeSceneIdentity.reset();
     }
 
     if (!destination.empty())
@@ -1027,12 +1377,34 @@ void AssetBrowser::DrawContents(const ProjectContext* project, const FileBackedD
                 m_openFolderModal = true;
             }
 
-            if (CanCreateMaterial(error) && ImGui::MenuItem("Material", nullptr, false, !m_materialCreationPending))
+            if (ImGui::BeginMenu("Material"))
             {
-                m_materialDirectory = m_directory;
-                std::strcpy(m_materialName.data(), "NewMaterial");
-                m_materialError.clear();
-                m_openMaterialModal = true;
+                // Visual materials keep their rule: only inside the project's Materials folder.
+                std::string visualError;
+                const bool canCreateVisual = CanCreateMaterial(visualError);
+
+                if (ImGui::MenuItem("Visual Material", nullptr, false, canCreateVisual && !m_materialCreationPending))
+                {
+                    m_materialDirectory = m_directory;
+                    std::strcpy(m_materialName.data(), "NewMaterial");
+                    m_materialError.clear();
+                    m_openMaterialModal = true;
+                }
+
+                if (!canCreateVisual && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                {
+                    ImGui::SetTooltip("%s", visualError.c_str());
+                }
+
+                if (ImGui::MenuItem("Acoustic Material", nullptr, false, !m_materialCreationPending))
+                {
+                    m_acousticDirectory = m_directory;
+                    std::strcpy(m_acousticName.data(), "NewAcousticMaterial");
+                    m_acousticError.clear();
+                    m_openAcousticModal = true;
+                }
+
+                ImGui::EndMenu();
             }
 
             ImGui::EndMenu();
@@ -1056,6 +1428,11 @@ void AssetBrowser::Draw(const EditorWorkspaceRect& rectangle, const ProjectConte
     for(auto& [identity, request] : m_meshThumbnailRequests)
     {
         request.visible = false;
+    }
+
+    for(auto& [identity, resident] : m_materialResidents)
+    {
+        resident.visible = false;
     }
 
     m_meshAdmission.BeginFrame();
@@ -1111,6 +1488,7 @@ void AssetBrowser::Draw(const EditorWorkspaceRect& rectangle, const ProjectConte
         {
             m_scriptRefreshRequested = true;
             m_listings.clear();
+            m_activeSceneIdentity.reset();
             m_thumbnailResetRequested = true;
             m_materialRequestsReset = true;
             m_materialImagesInvalidated = true;
@@ -1201,6 +1579,7 @@ void AssetBrowser::Draw(const EditorWorkspaceRect& rectangle, const ProjectConte
         }
 
         DrawMaterialCreationModal();
+    DrawAcousticMaterialCreationModal();
         DrawFolderCreationModal();
         DrawMeshImportUnits();
     }
@@ -1219,6 +1598,7 @@ void AssetBrowser::ScheduleThumbnails()
     const auto now = ThumbnailAdmission::Clock::now();
     std::vector<std::string> released;
     m_meshAdmission.Schedule(MaterialPreviewRenderer::kMeshThumbnailCapacity, now, released);
+    MeshThumbnailDiagnostics::Add(MeshThumbnailDiagnostics::Get().admissionReleases, released.size());
 
     // A released mesh tile stops requesting and displaying. The renderer retires its image only
     // after every fence and display pin clears, so an in-flight draw is never invalidated.
@@ -1226,7 +1606,9 @@ void AssetBrowser::ScheduleThumbnails()
     {
         const auto request = m_meshThumbnailRequests.find(key);
 
-        if(request == m_meshThumbnailRequests.end())
+        // A resident tile leaving admission keeps its finished image; only leaving the view
+        // (PruneMeshThumbnailRequests) or invalidation discards it.
+        if(request == m_meshThumbnailRequests.end() || request->second.resident)
         {
             continue;
         }
@@ -1239,9 +1621,187 @@ void AssetBrowser::ScheduleThumbnails()
         m_meshThumbnailRequests.erase(request);
     }
 
+    YieldResidentMeshThumbnail(now);
+
+    ScheduleMaterialThumbnails(now);
+}
+
+std::optional<MaterialPreviewImage> AssetBrowser::GetResidentMaterialThumbnail(const std::string& key, const AssetID& id)
+{
+    const auto found = m_materialResidents.find(key);
+
+    if(found == m_materialResidents.end() || !m_materialRenderer || !m_thumbnailPaths || !m_thumbnailRegistry)
+    {
+        return std::nullopt;
+    }
+
+    found->second.visible = true;
+    auto& diagnostics = MaterialThumbnailDiagnostics::Get();
+
+    // Fast path: an unchanged resident image is pinned and displayed by its cache handle in O(1).
+    D3D12_GPU_DESCRIPTOR_HANDLE srv{};
+    MaterialPreviewRenderer::ResidentThumbnail resident;
+
+    {
+        MaterialThumbnailDiagnostics::Timer fastTimer(diagnostics.residentFastMicroseconds);
+        MaterialThumbnailDiagnostics::Add(diagnostics.residentFastLookups);
+        resident = m_materialRenderer->PinResidentMaterialThumbnail(found->second.cacheSlot, found->second.cacheSerial, srv);
+    }
+
+    if(resident == MaterialPreviewRenderer::ResidentThumbnail::Display)
+    {
+        MaterialPreviewImage image;
+        image.srv = srv;
+        image.cacheSlot = found->second.cacheSlot;
+        image.cacheSerial = found->second.cacheSerial;
+        return image;
+    }
+
+    if(resident == MaterialPreviewRenderer::ResidentThumbnail::Invalid)
+    {
+        // Reassigned, stale (changed material or dependency) or unusable: the tile rejoins admission.
+        m_materialResidents.erase(found);
+        return std::nullopt;
+    }
+
+    // Validation due: the full request path queues the periodic source and dependency validation and
+    // pins the image through the working set until the validation has run.
+    std::string error;
+
+    {
+        MaterialThumbnailDiagnostics::Timer requestTimer(diagnostics.browserRequestMicroseconds);
+        MaterialThumbnailDiagnostics::Add(diagnostics.browserRequests);
+        m_materialRenderer->RequestSavedMaterialThumbnail(*m_thumbnailPaths, *m_thumbnailRegistry, id, error);
+    }
+
+    std::optional<MaterialPreviewImage> image;
+
+    if(error.empty())
+    {
+        MaterialThumbnailDiagnostics::Timer lookupTimer(diagnostics.imageLookupMicroseconds);
+        MaterialThumbnailDiagnostics::Add(diagnostics.imageLookups);
+        image = m_materialRenderer->GetSavedMaterialThumbnailImage(*m_thumbnailPaths, id);
+    }
+
+    if(!image)
+    {
+        // Stale (changed material or dependency), evicted or failing: the tile rejoins admission.
+        m_materialResidents.erase(found);
+        return std::nullopt;
+    }
+
+    // Validation never reassigns the displayed entry while it stays current, but keep the handle exact.
+    found->second.cacheSlot = image->cacheSlot;
+    found->second.cacheSerial = image->cacheSerial;
+    return image;
+}
+
+void AssetBrowser::ScheduleMaterialThumbnails(std::chrono::steady_clock::time_point now)
+{
+    std::erase_if(m_materialResidents, [](const auto& resident)
+    {
+        return !resident.second.visible;
+    });
+
+    // Admitted and resident tiles together stay within the residency budget, so every pinned image fits.
+    const size_t residentCount = m_materialResidents.size();
+    const size_t freeResidency = residentCount >= MaterialPreviewRenderer::kThumbnailResidentCapacity ? 0 :
+        MaterialPreviewRenderer::kThumbnailResidentCapacity - residentCount;
+    const size_t budget = (std::min)(MaterialPreviewRenderer::kThumbnailCapacity, freeResidency);
+
     // Released material tiles simply leave the next frame's renderer working set.
-    released.clear();
-    m_materialAdmission.Schedule(MaterialPreviewRenderer::kThumbnailCapacity, now, released);
+    std::vector<std::string> released;
+    m_materialAdmission.Schedule(budget, now, released);
+    MaterialThumbnailDiagnostics::Add(MaterialThumbnailDiagnostics::Get().admissionReleases, released.size());
+
+    // Over budget with tiles waiting: the longest resident yields after the minimum residency, at most once
+    // per minimum-residency interval, so every visible material eventually receives a thumbnail.
+    const bool waiting = m_materialAdmission.GetWaitingCount(now) > 0;
+    const bool full = residentCount + m_materialAdmission.GetAdmittedCount() >= MaterialPreviewRenderer::kThumbnailResidentCapacity;
+    const bool yieldDue = now - m_lastMaterialResidentYield >= ThumbnailAdmission::kMinimumResidency;
+
+    if(!waiting || !full || !yieldDue || m_materialResidents.empty())
+    {
+        return;
+    }
+
+    const auto longest = std::min_element(m_materialResidents.begin(), m_materialResidents.end(),
+        [](const auto& left, const auto& right)
+        {
+            return left.second.since < right.second.since;
+        });
+
+    if(now - longest->second.since >= ThumbnailAdmission::kMinimumResidency)
+    {
+        m_materialResidents.erase(longest);
+        m_lastMaterialResidentYield = now;
+    }
+}
+
+void AssetBrowser::RecordMaterialDisplayForDiagnostics(const std::string& key, bool displayed)
+{
+#if defined(ENGINE_HAS_VERIFICATION)
+    // A tile that has displayed its thumbnail and later draws a status label instead is a visible dropout.
+    if(displayed)
+    {
+        m_materialDisplayedForDiagnostics.insert(key);
+    }
+    else if(m_materialDisplayedForDiagnostics.contains(key))
+    {
+        MaterialThumbnailDiagnostics::Add(MaterialThumbnailDiagnostics::Get().displayDropouts);
+    }
+#else
+    (void)key;
+    (void)displayed;
+#endif
+}
+
+void AssetBrowser::YieldResidentMeshThumbnail(std::chrono::steady_clock::time_point now)
+{
+    // Displayed images are never evictable, so a visible set larger than the residency budget would
+    // starve its waiting tiles. Only then does the longest-resident tile yield, after the same minimum
+    // residency and at the same one-per-frame rate as admission rotation. Within budget nothing yields.
+    size_t residentCount = 0;
+    size_t generatingCount = 0;
+    auto longestResident = m_meshThumbnailRequests.end();
+
+    for(auto request = m_meshThumbnailRequests.begin(); request != m_meshThumbnailRequests.end(); ++request)
+    {
+        if(!request->second.resident)
+        {
+            ++generatingCount;
+            continue;
+        }
+
+        ++residentCount;
+
+        if(longestResident == m_meshThumbnailRequests.end() ||
+            request->second.residentSince < longestResident->second.residentSince)
+        {
+            longestResident = request;
+        }
+    }
+
+    const bool overBudget = residentCount + generatingCount > MaterialPreviewRenderer::kMeshResidentImageCapacity;
+
+    // At most one yield per minimum-residency interval: yielded tiles requeue and keep the set over
+    // budget, so a per-frame rate would cycle every resident image within a few frames.
+    const bool yieldDue = now - m_lastResidentYield >= ThumbnailAdmission::kMinimumResidency;
+
+    if(!overBudget || !yieldDue || generatingCount == 0 || longestResident == m_meshThumbnailRequests.end() ||
+        now - longestResident->second.residentSince < ThumbnailAdmission::kMinimumResidency)
+    {
+        return;
+    }
+
+    m_lastResidentYield = now;
+
+    if(m_materialRenderer && longestResident->second.ticket)
+    {
+        m_materialRenderer->DiscardMeshThumbnail(longestResident->second.ticket);
+    }
+
+    m_meshThumbnailRequests.erase(longestResident);
 }
 
 std::string AssetBrowser::FindThumbnailFailure(const std::string& key) const
@@ -1521,6 +2081,7 @@ void AssetBrowser::PruneMeshThumbnailRequests(bool all)
     {
         m_meshAdmission.Clear();
         m_materialAdmission.Clear();
+        m_materialResidents.clear();
         m_thumbnailFailures.clear();
     }
 
@@ -1551,29 +2112,33 @@ std::optional<D3D12_GPU_DESCRIPTOR_HANDLE> AssetBrowser::GetVisibleMeshThumbnail
         return std::nullopt;
     }
 
-    const auto* registered = m_thumbnailRegistry->Find(record.id);
-    const auto resolved = ProjectAssetResolver::Resolve(*m_thumbnailPaths, *m_thumbnailRegistry, record.id);
+    auto& diagnostics = MeshThumbnailDiagnostics::Get();
+    MeshThumbnailDiagnostics::Add(diagnostics.visibleLookups);
+    const auto key = record.id.ToReference();
+    const auto now = std::chrono::steady_clock::now();
+    const auto existing = m_meshThumbnailRequests.find(key);
+    const bool validationDue = existing == m_meshThumbnailRequests.end() || now >= existing->second.nextValidation;
 
-    if(!registered || registered->type != AssetType::Mesh || resolved.status != AssetAvailability::Available)
+    // Source resolution touches the file system, so it runs with the periodic validation rather than
+    // every frame. Between validations the renderer's own staleness poll cancels a changed source.
+    if(validationDue && !IsMeshSourceAvailable(record.id))
     {
         error = "Mesh thumbnail source is missing or no longer registered.";
         terminal = true;
-        const auto previous = m_meshThumbnailRequests.find(record.id.ToReference());
 
-        if(previous != m_meshThumbnailRequests.end())
+        if(existing != m_meshThumbnailRequests.end())
         {
-            m_materialRenderer->DiscardMeshThumbnail(previous->second.ticket);
-            m_meshThumbnailRequests.erase(previous);
+            m_materialRenderer->DiscardMeshThumbnail(existing->second.ticket);
+            m_meshThumbnailRequests.erase(existing);
         }
 
         return std::nullopt;
     }
 
-    auto& request = m_meshThumbnailRequests[record.id.ToReference()];
+    auto& request = m_meshThumbnailRequests[key];
     request.visible = true;
-    const auto now = std::chrono::steady_clock::now();
 
-    if(now >= request.nextValidation)
+    if(validationDue)
     {
         if(request.ticket && !m_materialRenderer->IsMeshThumbnailRequestCurrent(request.ticket))
         {
@@ -1581,8 +2146,13 @@ std::optional<D3D12_GPU_DESCRIPTOR_HANDLE> AssetBrowser::GetVisibleMeshThumbnail
             request.ticket = 0;
         }
 
-        m_materialRenderer->RequestMeshThumbnail(*m_thumbnailPaths, *m_thumbnailRegistry,
-            record.id, request.ticket, request.error);
+        {
+            MeshThumbnailDiagnostics::Timer requestTimer(diagnostics.browserRequestMicroseconds);
+            MeshThumbnailDiagnostics::Add(diagnostics.browserRequests);
+            m_materialRenderer->RequestMeshThumbnail(*m_thumbnailPaths, *m_thumbnailRegistry,
+                record.id, request.ticket, request.error);
+        }
+
         request.nextValidation = now + std::chrono::milliseconds(request.ticket ? 2000 : 250);
     }
 
@@ -1601,6 +2171,70 @@ std::optional<D3D12_GPU_DESCRIPTOR_HANDLE> AssetBrowser::GetVisibleMeshThumbnail
     }
     const auto image = m_materialRenderer->GetMeshThumbnailImage(request.ticket);
     return image ? std::optional<D3D12_GPU_DESCRIPTOR_HANDLE>(image->srv) : std::nullopt;
+}
+
+bool AssetBrowser::IsMeshSourceAvailable(const AssetID& id) const
+{
+    auto& diagnostics = MeshThumbnailDiagnostics::Get();
+    MeshThumbnailDiagnostics::Timer resolveTimer(diagnostics.browserResolveMicroseconds);
+    MeshThumbnailDiagnostics::Add(diagnostics.browserResolves);
+    const auto* registered = m_thumbnailRegistry->Find(id);
+    const auto resolved = ProjectAssetResolver::Resolve(*m_thumbnailPaths, *m_thumbnailRegistry, id);
+    return registered && registered->type == AssetType::Mesh && resolved.status == AssetAvailability::Available;
+}
+
+std::optional<D3D12_GPU_DESCRIPTOR_HANDLE> AssetBrowser::GetResidentMeshThumbnail(const AssetRecord& record)
+{
+    const auto key = record.id.ToReference();
+    const auto found = m_meshThumbnailRequests.find(key);
+
+    if(found == m_meshThumbnailRequests.end() || !found->second.resident || !m_materialRenderer ||
+        !m_thumbnailPaths || !m_thumbnailRegistry)
+    {
+        return std::nullopt;
+    }
+
+    auto& request = found->second;
+    request.visible = true;
+    const auto now = std::chrono::steady_clock::now();
+    bool keep = true;
+
+    // Resident tiles keep the admitted tiles' validation cadence. Revalidation re-hashes the same
+    // retained entry; anything that would need a new preparation leaves residency instead, so new
+    // generation only ever starts from an admitted tile.
+    if(now >= request.nextValidation)
+    {
+        request.nextValidation = now + std::chrono::milliseconds(2000);
+        keep = m_materialRenderer->IsMeshThumbnailRequestCurrent(request.ticket) && IsMeshSourceAvailable(record.id);
+
+        if(keep)
+        {
+            auto& diagnostics = MeshThumbnailDiagnostics::Get();
+            MeshThumbnailDiagnostics::Timer requestTimer(diagnostics.browserRequestMicroseconds);
+            MeshThumbnailDiagnostics::Add(diagnostics.browserRequests);
+            std::uint64_t ticket = 0;
+            std::string error;
+            keep = m_materialRenderer->RequestMeshThumbnail(*m_thumbnailPaths, *m_thumbnailRegistry,
+                record.id, ticket, error) && ticket == request.ticket;
+
+            if(!keep && ticket != 0 && ticket != request.ticket)
+            {
+                m_materialRenderer->DiscardMeshThumbnail(ticket);
+            }
+        }
+    }
+
+    const auto image = keep ? m_materialRenderer->GetMeshThumbnailImage(request.ticket) : std::nullopt;
+
+    if(!image)
+    {
+        // Evicted, invalidated or changed: the tile rejoins admission to regenerate.
+        m_materialRenderer->DiscardMeshThumbnail(request.ticket);
+        m_meshThumbnailRequests.erase(found);
+        return std::nullopt;
+    }
+
+    return image->srv;
 }
 
 void AssetBrowser::ResetThumbnailRequests()
@@ -1635,7 +2269,20 @@ void AssetBrowser::DrawDeletionConfirmation(bool protectedEdits)
 
         if(ImGui::Button("Delete"))
         {
-            m_deleteRequest = m_deleteTarget;
+            // The file may have changed while the confirmation was open.
+            std::string error;
+
+            if(CanRequestFileOperation(m_deleteTarget, error))
+            {
+                m_deleteRequest = m_deleteTarget;
+            }
+            else
+            {
+                m_error = error;
+                m_listings.erase(m_deleteTarget.parent_path());
+                m_activeSceneIdentity.reset();
+            }
+
             m_deleteTarget.clear();
             ImGui::CloseCurrentPopup();
         }

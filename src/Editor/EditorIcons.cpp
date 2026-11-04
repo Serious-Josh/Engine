@@ -11,7 +11,7 @@ void EditorIcons::Initialize(ID3D12Device* device, DescriptorHeap& heap, const s
     // Reinitialization is permitted only after the owner has drained the previous device.
     Shutdown();
     constexpr std::array names{"box.svg", "camera.svg", "file.svg", "folder.svg", "lightbulb.svg",
-        "spotlight.svg", "sun.svg", "sun-moon.svg", "play.svg", "square.svg", "audio-source.svg", "audio-listener.svg"};
+        "spotlight.svg", "sun.svg", "sun-moon.svg", "play.svg", "square.svg", "audio-source.svg", "audio-listener.svg", "audio-waveform.svg"};
     std::vector<unsigned char> pixels(Cell * Count * Cell * 4, 0);
     bool any = false;
 

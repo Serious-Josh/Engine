@@ -13,7 +13,9 @@ enum class AssetType : std::uint8_t
     Texture,
     Script,
     // Audio.1B: an FMOD Studio bank built by FMOD Studio into Content/Audio/Banks (never imported or converted).
-    AudioBank
+    AudioBank,
+    // M4: a reusable acoustic material, in AcousticMaterials/.
+    AcousticMaterial
 };
 
 struct AssetRecord

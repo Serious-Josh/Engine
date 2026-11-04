@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <map>
 #include <optional>
 #include <string>
 
@@ -44,6 +45,23 @@ struct AudioComponentState
 
     bool operator==(const AudioComponentState&) const = default;
 };
+
+// M4: a mesh object's inherent acoustic settings. Absent or disabled, it contributes no acoustic geometry. Holds intent only:
+// no Steam Audio object, and independent of visual materials.
+struct AcousticSettings
+{
+    static constexpr std::size_t MaximumAssignments = 4096;
+    static constexpr std::size_t MaximumTextBytes = 512;
+
+    bool enabled = false;
+    // One acoustic material reference per submesh, keyed by AcousticGeometry::SubmeshKey ("<index>:<name>"). A built-in
+    // ("builtin:acoustic/concrete") or a project asset ("asset:<uuid>"). Unassigned submeshes use the default material.
+    std::map<std::string, std::string> submeshMaterials;
+
+    bool operator==(const AcousticSettings&) const = default;
+};
+
+bool ValidateAcousticSettings(const AcousticSettings& settings, std::string* error = nullptr);
 
 // Lexical contract shared by authoring and both codecs. Whether the event exists is decided by the loaded banks at
 // Play, never by scene loading.

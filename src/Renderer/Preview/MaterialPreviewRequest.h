@@ -34,4 +34,9 @@ struct MaterialPreviewImage
     std::filesystem::path projectRoot;
     std::string materialIdentity;
     std::uint64_t revision = 0;
+
+    // Saved-thumbnail cache entry that produced this image. The serial changes whenever the entry is
+    // reassigned, so a retained (slot, serial) pair can never resolve to a recycled image.
+    size_t cacheSlot = SIZE_MAX;
+    std::uint64_t cacheSerial = 0;
 };

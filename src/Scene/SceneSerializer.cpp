@@ -1,6 +1,7 @@
 #include "Scene/SceneSerializer.h"
 #include "Scene/LegacyLightingMigration.h"
 #include "Scene/PhysicalLightingMigration.h"
+#include "Scene/ColliderScaleMigration.h"
 #include "Core/Log.h"
 
 #include <nlohmann/json.hpp>
@@ -662,6 +663,14 @@ namespace
                 };
             }
 
+            if(object.acoustics)
+            {
+                objects.back()["acoustics"] = {
+                    {"enabled", object.acoustics->enabled},
+                    {"submeshMaterials", object.acoustics->submeshMaterials}
+                };
+            }
+
             if(object.audioListener)
             {
                 objects.back()["audioListener"] = {{"enabled", object.audioListener->enabled}};
@@ -711,7 +720,9 @@ namespace
              schemaVersion != SceneDocument::kObjectLightingSchemaVersion &&
              schemaVersion != SceneDocument::kPhysicalLightingSchemaVersion &&
              schemaVersion != SceneDocument::kScriptSchemaVersion &&
-             schemaVersion != SceneDocument::kAudioSchemaVersion))
+             schemaVersion != SceneDocument::kAudioSchemaVersion &&
+             schemaVersion != SceneDocument::kColliderScaleSchemaVersion &&
+             schemaVersion != SceneDocument::kAcousticsSchemaVersion))
         {
             throw std::runtime_error("Unsupported scene schema version.");
         }
@@ -783,7 +794,7 @@ namespace
         {
             ValidateFields(item, {"id", "parentID", "name", "transform", "meshReference", "materialReference",
                 "materialSlotBindings", "physics", "triggerCollider", "characterController", "camera", "light", "script",
-                "audioSource", "audioListener"});
+                "audioSource", "audioListener", "acoustics"});
             if (legacySchema && item.contains("physics"))
             {
                 throw std::runtime_error("Physics fields require scene schema version 2.");
@@ -963,6 +974,28 @@ namespace
                 }
             }
 
+            if(item.contains("acoustics"))
+            {
+                if(schemaVersion.get<std::uint32_t>() < SceneDocument::kAcousticsSchemaVersion)
+                {
+                    throw std::runtime_error("Acoustics fields require scene schema version 18.");
+                }
+
+                const auto& value = item.at("acoustics");
+                ValidateFields(value, {"enabled", "submeshMaterials"});
+                AcousticSettings acoustics;
+                acoustics.enabled = value.at("enabled").get<bool>();
+                acoustics.submeshMaterials = value.at("submeshMaterials").get<std::map<std::string, std::string>>();
+                std::string acousticsError;
+
+                if(!ValidateAcousticSettings(acoustics, &acousticsError))
+                {
+                    throw std::runtime_error("Invalid acoustics: " + acousticsError);
+                }
+
+                object.acoustics = std::move(acoustics);
+            }
+
             if(item.contains("audioSource"))
             {
                 const auto& value = item.at("audioSource");
@@ -1026,6 +1059,17 @@ namespace
                 std::to_string(options.report->lights.size()) + " lights; ranges kept with range attenuation on). Save to persist.");
         }
         applyReferenceExposure();
+
+        // Runs after every object and transform is read. Only older schemas convert, and saves write the current
+        // schema, so a scene is converted at most once.
+        const std::uint32_t loadedSchema = schemaVersion.get<std::uint32_t>();
+
+        if(loadedSchema < SceneDocument::kColliderScaleSchemaVersion)
+        {
+            LogColliderScaleMigration(result, MigrateStoredColliderScale(result),
+                "schema " + std::to_string(loadedSchema));
+        }
+
         return result;
     }
 

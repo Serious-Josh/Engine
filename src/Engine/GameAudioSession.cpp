@@ -183,6 +183,7 @@ void GameAudioSession::Update()
         if(IsSounding(state))
         {
             event.seenPlaying = true;
+            CheckSpatialization(event);
             continue;
         }
 
@@ -192,6 +193,41 @@ void GameAudioSession::Update()
             m_audio->ReleaseEvent(event.handle);
             m_events.erase(m_events.begin() + static_cast<std::ptrdiff_t>(index));
         }
+    }
+}
+
+// SA.2: an event carrying both FMOD's spatializer and Steam Audio's is panned and attenuated twice. Reported once
+// per event (Warn de-duplicates), and only while Steam Audio runs, after FMOD has created the instance's DSPs.
+void GameAudioSession::CheckSpatialization(OwnedEvent& event)
+{
+    if(event.spatializationChecked || m_audio->GetSteamAudioStatus() != Audio::SteamAudioStatus::Active)
+    {
+        return;
+    }
+
+    const std::optional<Audio::SpatializerSummary> summary = m_audio->DescribeEventSpatializers(event.handle);
+
+    if(!summary)
+    {
+        return;
+    }
+
+    event.spatializationChecked = true;
+    const std::string path = m_audio->GetEventPath(event.event);
+    const std::string name = path.empty() ? Audio::ToString(event.event) : path;
+
+    if(summary->IsDoubleSpatialized())
+    {
+        Warn("event " + name + " has both an FMOD spatializer and the Steam Audio Spatializer; it is panned and "
+            "attenuated twice. Remove FMOD's spatializer from the event in FMOD Studio.");
+    }
+
+    // Authored settings are never overridden; the author is told instead.
+    if(summary->steamAudioWithoutDistanceAttenuation > 0)
+    {
+        Warn("event " + name + " uses the Steam Audio Spatializer with Distance Attenuation Off, so it does not get "
+            "quieter with distance. Set Distance Attenuation to Curve-Driven in FMOD Studio to use the event's "
+            "min/max distance.");
     }
 }
 
@@ -246,6 +282,12 @@ void GameAudioSession::End() noexcept
         // Logging allocation failure only; the session still ends.
     }
 
+    if(running && !m_acousticObjects.empty())
+    {
+        m_audio->ClearAcousticScene();
+    }
+
+    m_acousticObjects.clear();
     m_events.clear();
     m_restores.clear();
     m_sources.clear();
@@ -254,6 +296,74 @@ void GameAudioSession::End() noexcept
     m_listenerKey.clear();
     m_listenerLastPosition.reset();
     m_active = false;
+}
+
+void GameAudioSession::PublishAcousticScene(std::vector<AcousticObject> objects)
+{
+    if(!Running())
+    {
+        return;
+    }
+
+    if(!m_acousticObjects.empty())
+    {
+        m_audio->ClearAcousticScene();
+        m_acousticObjects.clear();
+    }
+
+    if(objects.empty())
+    {
+        return;
+    }
+
+    if(!m_audio->IsAcousticSimulationAvailable())
+    {
+        if(m_audio->GetSteamAudioStatus() == Audio::SteamAudioStatus::Active)
+        {
+            Warn(std::to_string(objects.size()) + " objects have acoustics enabled, but occlusion and transmission are "
+                "unavailable because Steam Audio's snapshot path failed validation (see the log). HRTF and distance attenuation "
+                "still work.");
+        }
+
+        return;
+    }
+
+    std::uint64_t id = 0;
+
+    for(AcousticObject& object : objects)
+    {
+        ++id;
+
+        if(m_audio->SetAcousticObject(id, std::move(object.mesh), object.world))
+        {
+            m_acousticObjects.push_back({std::move(object.objectID), id, object.world});
+        }
+    }
+}
+
+void GameAudioSession::UpdateAcousticTransforms(const AcousticTransformResolver& resolve)
+{
+    if(!Running())
+    {
+        return;
+    }
+
+    for(std::size_t index = m_acousticObjects.size(); index-- > 0;)
+    {
+        PublishedAcousticObject& object = m_acousticObjects[index];
+        const std::optional<Audio::AcousticTransform> world = resolve(object.objectID);
+
+        if(!world)
+        {
+            m_audio->RemoveAcousticObject(object.id);
+            m_acousticObjects.erase(m_acousticObjects.begin() + static_cast<std::ptrdiff_t>(index));
+        }
+        else if(*world != object.world)
+        {
+            object.world = *world;
+            m_audio->SetAcousticObjectTransform(object.id, *world);
+        }
+    }
 }
 
 void GameAudioSession::SetPoseResolver(PoseResolver resolve)
@@ -355,6 +465,7 @@ std::optional<Audio::EventHandle> GameAudioSession::StartPlaced(const Audio::Gui
     }
 
     OwnedEvent owned{*created, m_audio->GetUpdateCount(), false};
+    owned.event = guid;
 
     if(pose)
     {

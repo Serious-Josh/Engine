@@ -1,6 +1,8 @@
 #include "Renderer/Preview/MaterialPreviewRenderer.h"
 
 #include "Core/Log.h"
+#include "Debug/MaterialThumbnailDiagnostics.h"
+#include "Debug/MeshThumbnailDiagnostics.h"
 #include "Renderer/Geometry/SphereGenerator.h"
 #include "Renderer/ResourceUploader.h"
 #include "Renderer/TangentGenerator.h"
@@ -698,6 +700,9 @@ bool MaterialPreviewRenderer::PrepareSavedThumbnail(
     const auto& registry = queued.registry;
     const auto& id = queued.id;
     error.clear();
+    auto& diagnostics = MaterialThumbnailDiagnostics::Get();
+    MaterialThumbnailDiagnostics::Timer validationTimer(diagnostics.validationMicroseconds);
+    MaterialThumbnailDiagnostics::Add(diagnostics.validations);
 
     try
     {
@@ -760,6 +765,7 @@ bool MaterialPreviewRenderer::PrepareSavedThumbnail(
 
         if(existing && existing->fingerprint == fingerprint && existing->ready && !existing->recorded)
         {
+            MaterialThumbnailDiagnostics::Add(diagnostics.validationsUnchanged);
             existing->stale = false;
             existing->lastUse = ++m_thumbnailUseSerial;
             existing->nextValidation = std::chrono::steady_clock::now() + std::chrono::seconds(1);
@@ -784,6 +790,8 @@ bool MaterialPreviewRenderer::PrepareSavedThumbnail(
         MaterialThumbnailDiskCache::Image pixels;
         const bool diskHit = MaterialThumbnailDiskCache::Load(diskSource, pixels) &&
             pixels.width == kExtent && pixels.height == kExtent;
+        MaterialThumbnailDiagnostics::Add(diagnostics.generations);
+        MaterialThumbnailDiagnostics::Add(diskHit ? diagnostics.diskCacheHits : diagnostics.fullRenders);
         TextureDependencies dependencies;
         bool cacheEligible = true;
 
@@ -963,7 +971,7 @@ bool MaterialPreviewRenderer::CanAcquireThumbnailImage(
     for(const auto& image : m_thumbnailImages)
     {
         const bool sameMaterial = image.projectRoot == root && image.materialIdentity == identity;
-        const bool pinned = !image.stale && m_thumbnailWorkingSetActive && IsThumbnailAdmitted(image.projectRoot, image.materialIdentity);
+        const bool pinned = IsThumbnailPinned(image);
 
         if((!pinned || sameMaterial) && &image != m_thumbnail.destination && !image.recorded &&
            !image.awaitingDisplaySubmission && image.generationFence <= completedFence && image.displayFence <= completedFence)
@@ -983,7 +991,7 @@ MaterialPreviewRenderer::ThumbnailImage* MaterialPreviewRenderer::AcquireThumbna
     for(auto& image : m_thumbnailImages)
     {
         const bool sameMaterial = image.projectRoot == root && image.materialIdentity == identity;
-        const bool pinned = !image.stale && m_thumbnailWorkingSetActive && IsThumbnailAdmitted(image.projectRoot, image.materialIdentity);
+        const bool pinned = IsThumbnailPinned(image);
 
         if((pinned && !sameMaterial) || &image == m_thumbnail.destination || image.recorded || image.awaitingDisplaySubmission ||
            image.generationFence > completedFence || image.displayFence > completedFence)
@@ -1001,6 +1009,7 @@ MaterialPreviewRenderer::ThumbnailImage* MaterialPreviewRenderer::AcquireThumbna
     {
         m_thumbnailImages.emplace_back();
         victim = &m_thumbnailImages.back();
+        victim->slot = m_thumbnailImages.size() - 1;
     }
 
     if(!victim)
@@ -1008,10 +1017,17 @@ MaterialPreviewRenderer::ThumbnailImage* MaterialPreviewRenderer::AcquireThumbna
         return nullptr;
     }
 
-    // The allocation is always 256x256 RGBA8. Reuse it only after every reference retires.
+    auto& diagnostics = MaterialThumbnailDiagnostics::Get();
+    MaterialThumbnailDiagnostics::Add(victim->color.GetResource() ? diagnostics.imagesReused : diagnostics.imagesCreated);
+
+    // The allocation is always 256x256 RGBA8. Reuse it only after every reference retires. The new serial
+    // invalidates every resident handle that referred to the previous assignment of this entry.
     auto allocation = std::move(victim->color);
+    const auto slot = victim->slot;
     *victim = ThumbnailImage{};
     victim->color = std::move(allocation);
+    victim->slot = slot;
+    victim->serial = ++m_thumbnailImageSerial;
 
     if(!victim->color.GetResource() && !victim->color.Initialize(m_device, kExtent, kExtent, DXGI_FORMAT_R8G8B8A8_UNORM,
             *m_thumbnailRTVHeap, *m_heap))
@@ -1022,6 +1038,28 @@ MaterialPreviewRenderer::ThumbnailImage* MaterialPreviewRenderer::AcquireThumbna
 
     victim->color.GetResource()->SetName(L"Cached Material Thumbnail Display");
     return victim;
+}
+
+std::filesystem::path MaterialPreviewRenderer::ResolveThumbnailRoot(const ProjectPaths& paths, std::error_code& error)
+{
+    error.clear();
+
+    // UI lookups call this per visible tile per frame. The canonical root is recomputed when the
+    // project root changes; preparation still re-resolves everything it validates.
+    if(m_thumbnailRootCanonical.empty() || m_thumbnailRootSource != paths.GetRoot())
+    {
+        auto canonical = std::filesystem::canonical(paths.GetRoot(), error);
+
+        if(error)
+        {
+            return {};
+        }
+
+        m_thumbnailRootSource = paths.GetRoot();
+        m_thumbnailRootCanonical = std::move(canonical);
+    }
+
+    return m_thumbnailRootCanonical;
 }
 
 bool MaterialPreviewRenderer::RequestSavedThumbnail(
@@ -1046,7 +1084,14 @@ bool MaterialPreviewRenderer::RequestSavedThumbnail(
             throw std::runtime_error("Thumbnail renderer unavailable or device removed.");
         }
 
-        const auto root = std::filesystem::canonical(paths.GetRoot());
+        std::error_code rootError;
+        const auto root = ResolveThumbnailRoot(paths, rootError);
+
+        if(rootError)
+        {
+            throw std::runtime_error("Cannot resolve the thumbnail project root: " + rootError.message());
+        }
+
         const auto identity = id.ToReference();
         const auto* record = registry.Find(id);
 
@@ -1135,6 +1180,43 @@ void MaterialPreviewRenderer::BeginThumbnailWorkingSet()
 
     m_thumbnailWorkingSetActive = true;
     m_thumbnailWorkingSet.clear();
+    ++m_thumbnailWorkingSetEpoch;
+}
+
+bool MaterialPreviewRenderer::IsThumbnailPinned(const ThumbnailImage& image) const
+{
+    // Pinned by this enumeration's working set, either as an admitted request or a resident fast-path display.
+    return !image.stale && m_thumbnailWorkingSetActive &&
+        (image.pinnedEpoch == m_thumbnailWorkingSetEpoch || IsThumbnailAdmitted(image.projectRoot, image.materialIdentity));
+}
+
+MaterialPreviewRenderer::ResidentThumbnail MaterialPreviewRenderer::PinResidentThumbnail(
+    const DescriptorHeap& heap, size_t slot, std::uint64_t serial, D3D12_GPU_DESCRIPTOR_HANDLE& srv)
+{
+    if(m_recording || m_quarantined || !m_initialized || !m_thumbnailWorkingSetActive ||
+        slot >= m_thumbnailImages.size())
+    {
+        return ResidentThumbnail::Invalid;
+    }
+
+    auto& image = m_thumbnailImages[slot];
+
+    // Same conditions as GetThumbnailImage; the serial proves the entry still holds the displayed assignment.
+    if(image.serial != serial || !image.ready || image.stale || image.recorded)
+    {
+        return ResidentThumbnail::Invalid;
+    }
+
+    if(std::chrono::steady_clock::now() >= image.nextValidation)
+    {
+        return ResidentThumbnail::ValidationDue;
+    }
+
+    image.pinnedEpoch = m_thumbnailWorkingSetEpoch;
+    image.lastUse = ++m_thumbnailUseSerial;
+    image.awaitingDisplaySubmission = true;
+    srv = heap.GetGPUHandle(image.color.GetSRVIndex());
+    return ResidentThumbnail::Display;
 }
 
 void MaterialPreviewRenderer::DiscardThumbnailRequests()
@@ -1300,7 +1382,7 @@ std::optional<MaterialPreviewImage> MaterialPreviewRenderer::GetThumbnailImage(
     }
 
     std::error_code error;
-    const auto root = std::filesystem::canonical(paths.GetRoot(), error);
+    const auto root = ResolveThumbnailRoot(paths, error);
     auto* image = error || !IsThumbnailAdmitted(root, id.ToReference()) ? nullptr : FindThumbnailImage(root, id.ToReference());
 
     if(!image || !image->ready || image->stale || image->recorded)
@@ -1310,8 +1392,11 @@ std::optional<MaterialPreviewImage> MaterialPreviewRenderer::GetThumbnailImage(
 
     image->lastUse = ++m_thumbnailUseSerial;
     image->awaitingDisplaySubmission = true;
-    return MaterialPreviewImage{heap.GetGPUHandle(image->color.GetSRVIndex()),
+    MaterialPreviewImage result{heap.GetGPUHandle(image->color.GetSRVIndex()),
         image->projectRoot, image->materialIdentity, image->revision};
+    result.cacheSlot = image->slot;
+    result.cacheSerial = image->serial;
+    return result;
 }
 
 std::optional<MaterialPreviewImage> MaterialPreviewRenderer::GetImage(const DescriptorHeap& heap) const
@@ -1976,17 +2061,39 @@ void MaterialPreviewRenderer::PrepareMeshGPUJob(std::uint64_t ticket)
 
     if(m_meshJobs.size() >= kMeshImageCapacity)
     {
-        const auto victim = std::find_if(m_meshJobs.begin(), m_meshJobs.end(), [this](const auto& job)
+        // Only fence-retired images that no unsubmitted frame displays may be evicted. Among those,
+        // stale images go first, then the least recently displayed, so visible thumbnails stay resident
+        // while the visible set fits the residency budget. An image that was never displayed is still
+        // owed to its requester and is evictable only once stale (its requester discarded it).
+        auto victim = m_meshJobs.end();
+
+        for(auto job = m_meshJobs.begin(); job != m_meshJobs.end(); ++job)
         {
-            return !job.recorded && !job.awaitingDisplaySubmission &&
-                job.fence <= m_meshCompletedFence && job.displayFence <= m_meshCompletedFence;
-        });
+            const bool retired = !job->recorded && !job->awaitingDisplaySubmission &&
+                job->fence <= m_meshCompletedFence && job->displayFence <= m_meshCompletedFence;
+
+            if(!retired || (!job->stale && !job->displayed))
+            {
+                continue;
+            }
+
+            const auto evictionAge = [](const MeshGPUJob& candidate)
+            {
+                return candidate.stale ? 0 : candidate.lastDisplayUse;
+            };
+
+            if(victim == m_meshJobs.end() || evictionAge(*job) < evictionAge(*victim))
+            {
+                victim = job;
+            }
+        }
 
         if(victim == m_meshJobs.end())
         {
             return;
         }
 
+        MeshThumbnailDiagnostics::Add(MeshThumbnailDiagnostics::Get().gpuJobsEvicted);
         m_meshPreparation.Discard(victim->ticket);
         m_meshConsumers.erase(victim->ticket);
         // Remove expired ticket entries after the preparation enumeration completes.
@@ -1994,6 +2101,7 @@ void MaterialPreviewRenderer::PrepareMeshGPUJob(std::uint64_t ticket)
         m_meshJobs.erase(victim);
     }
 
+    MeshThumbnailDiagnostics::Add(MeshThumbnailDiagnostics::Get().gpuJobsCreated);
     m_meshJobs.emplace_back();
     auto& job = m_meshJobs.back();
     job.ticket = ticket;
@@ -2277,6 +2385,8 @@ std::optional<MaterialPreviewRenderer::MeshThumbnailImage> MaterialPreviewRender
             prepared->state != MeshThumbnailPreparation::State::Failed)
         {
             job.awaitingDisplaySubmission = true;
+            job.displayed = true;
+            job.lastDisplayUse = ++m_meshDisplayClock;
             return MeshThumbnailImage{heap.GetGPUHandle(job.color.GetSRVIndex()), job.identity};
         }
     }

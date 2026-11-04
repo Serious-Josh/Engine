@@ -1,5 +1,6 @@
 #include "EditorColliderOverlay.h"
 
+#include "Physics/ColliderScaling.h"
 #include "Scene/Scene.h"
 
 #include <algorithm>
@@ -78,8 +79,9 @@ bool HasFiniteWorldCoordinates(const Matrix4& colliderWorldTransform, ColliderOv
 
 // Composes bodyRigidTransform * Translation(localOffset) * shapeRotation * Scale(shapeScale).
 // The offset is applied once, in body-local meters, so it rotates with the body but not
-// with shapeRotation (identity except for Capsule). Authored visual scale is never part of
-// this transform; shapeRotation and shapeScale come only from collider data.
+// with shapeRotation (identity except for Capsule). The object's scale is never a matrix factor here: callers pass
+// the effective collider (ColliderScaling.h), whose offset and dimensions already include it, so the wireframe is
+// exactly the shape physics registers, including the hemispherical capsule caps.
 bool BuildColliderMatrix(Vector3 localPositionOffset, const RenderObject& object,
     bool presentationActive, const Matrix4& shapeRotation, Vector3 shapeScale, ColliderOverlayShape shape,
     float halfCylinderHeightInRadii, Matrix4& colliderWorldTransform)
@@ -115,8 +117,8 @@ template <typename Component>
 bool BuildCapsulePlacement(const Component& component, const RenderObject& object,
     bool presentationActive, CapsuleColliderOverlay& capsuleCollider)
 {
-    // The matrix scales the radius-1 wireframe uniformly by the authored radius, so the
-    // caps stay hemispherical whatever the visual scale. The cylinder half-height is
+    // The matrix scales the radius-1 wireframe uniformly by the effective radius, so the
+    // caps stay hemispherical as in Box3D. The cylinder half-height is
     // expressed in radius units, matching Box3D's centers at offset + (0, -/+ h/2, 0).
     const float radius = component.capsuleRadius;
     const float halfCylinderHeightInRadii = component.capsuleCylinderHeight * 0.5f / radius;
@@ -440,14 +442,21 @@ bool BuildColliderBoxMatrix(const Physics::PhysicsComponent& component, const Re
         return false;
     }
 
+    const Physics::PhysicsComponent effective = Physics::ScaleCollider(component, object.transform.scale);
+
+    if(!Physics::ValidatePhysicsComponent(effective))
+    {
+        return false;
+    }
+
     // Unit coordinates in [-0.5, +0.5] times full dimensions give half-extents exactly once.
     const Vector3 colliderDimensions{
-        component.boxDimensions.width,
-        component.boxDimensions.height,
-        component.boxDimensions.depth
+        effective.boxDimensions.width,
+        effective.boxDimensions.height,
+        effective.boxDimensions.depth
     };
 
-    return BuildColliderMatrix(component.colliderLocalPositionOffset, object, presentationActive,
+    return BuildColliderMatrix(effective.colliderLocalPositionOffset, object, presentationActive,
         Matrix4::Identity(), colliderDimensions, ColliderOverlayShape::Box, 0.0f, colliderWorldTransform);
 }
 
@@ -460,12 +469,18 @@ bool BuildColliderSphereMatrix(const Physics::PhysicsComponent& component, const
         return false;
     }
 
-    // Unit circles times the authored radius in meters. The scale is uniform, so the
-    // wireframe stays spherical whatever the object's visual scale.
-    const float radius = component.sphereRadius;
+    const Physics::PhysicsComponent effective = Physics::ScaleCollider(component, object.transform.scale);
+
+    if(!Physics::ValidatePhysicsComponent(effective))
+    {
+        return false;
+    }
+
+    // Unit circles times the effective radius in meters; a sphere stays spherical under any object scale.
+    const float radius = effective.sphereRadius;
     const Vector3 uniformRadiusScale{radius, radius, radius};
 
-    return BuildColliderMatrix(component.colliderLocalPositionOffset, object, presentationActive,
+    return BuildColliderMatrix(effective.colliderLocalPositionOffset, object, presentationActive,
         Matrix4::Identity(), uniformRadiusScale, ColliderOverlayShape::Sphere, 0.0f, colliderWorldTransform);
 }
 
@@ -478,7 +493,14 @@ bool BuildColliderCapsule(const Physics::PhysicsComponent& component, const Rend
         return false;
     }
 
-    return BuildCapsulePlacement(component, object, presentationActive, capsuleCollider);
+    const Physics::PhysicsComponent effective = Physics::ScaleCollider(component, object.transform.scale);
+
+    if(!Physics::ValidatePhysicsComponent(effective))
+    {
+        return false;
+    }
+
+    return BuildCapsulePlacement(effective, object, presentationActive, capsuleCollider);
 }
 
 bool BuildColliderBoxMatrix(const Physics::TriggerColliderComponent& component, const RenderObject& object,
@@ -489,8 +511,15 @@ bool BuildColliderBoxMatrix(const Physics::TriggerColliderComponent& component, 
         return false;
     }
 
-    const Vector3 dimensions{component.boxDimensions.width, component.boxDimensions.height, component.boxDimensions.depth};
-    return BuildColliderMatrix(component.colliderLocalPositionOffset, object, presentationActive, Matrix4::Identity(),
+    const Physics::TriggerColliderComponent effective = Physics::ScaleCollider(component, object.transform.scale);
+
+    if(!Physics::ValidateTriggerColliderComponent(effective))
+    {
+        return false;
+    }
+
+    const Vector3 dimensions{effective.boxDimensions.width, effective.boxDimensions.height, effective.boxDimensions.depth};
+    return BuildColliderMatrix(effective.colliderLocalPositionOffset, object, presentationActive, Matrix4::Identity(),
         dimensions, ColliderOverlayShape::Box, 0.0f, colliderWorldTransform);
 }
 
@@ -502,8 +531,15 @@ bool BuildColliderSphereMatrix(const Physics::TriggerColliderComponent& componen
         return false;
     }
 
-    const float radius = component.sphereRadius;
-    return BuildColliderMatrix(component.colliderLocalPositionOffset, object, presentationActive, Matrix4::Identity(),
+    const Physics::TriggerColliderComponent effective = Physics::ScaleCollider(component, object.transform.scale);
+
+    if(!Physics::ValidateTriggerColliderComponent(effective))
+    {
+        return false;
+    }
+
+    const float radius = effective.sphereRadius;
+    return BuildColliderMatrix(effective.colliderLocalPositionOffset, object, presentationActive, Matrix4::Identity(),
         {radius, radius, radius}, ColliderOverlayShape::Sphere, 0.0f, colliderWorldTransform);
 }
 
@@ -515,7 +551,14 @@ bool BuildColliderCapsule(const Physics::TriggerColliderComponent& component, co
         return false;
     }
 
-    return BuildCapsulePlacement(component, object, presentationActive, capsuleCollider);
+    const Physics::TriggerColliderComponent effective = Physics::ScaleCollider(component, object.transform.scale);
+
+    if(!Physics::ValidateTriggerColliderComponent(effective))
+    {
+        return false;
+    }
+
+    return BuildCapsulePlacement(effective, object, presentationActive, capsuleCollider);
 }
 
 bool BuildCharacterControllerCapsule(const Physics::CharacterControllerComponent& component, const RenderObject& object,

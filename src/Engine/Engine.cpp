@@ -874,6 +874,19 @@ void Engine::ProcessEditorMaterialRequests()
         return;
     }
 
+    if(const auto request = m_editor.TakeAcousticMaterialCreationRequest())
+    {
+        std::string error;
+
+        if(!AcousticMaterials::CreateAsset(GetActiveProject().GetPaths(), m_projectAssetRegistry, request->relativePath,
+            request->material, &error) && error.empty())
+        {
+            error = "Failed to create the acoustic material.";
+        }
+
+        m_editor.OnMaterialCreationCompleted(request->relativePath, error);
+    }
+
     if(const auto request = m_editor.TakeMaterialCreationRequest())
     {
         const ProjectPaths& projectPaths = GetActiveProject().GetPaths();
@@ -1751,6 +1764,18 @@ bool Engine::InitializeProject()
     {
         // Script admission can be repaired independently of the authored scene.
         Log::Warning("Script discovery skipped; registry retained: " + projectError);
+    }
+
+    // SA.1: a project that uses Steam Audio starts it before its first bank loads (banks using Steam Audio effects
+    // need the plugin registered). The project is fixed for the process, so this runs once; a failure leaves FMOD
+    // running unchanged.
+    if(GetActiveProject().GetProjectSettings().settings.audio.steamAudio)
+    {
+        Audio::SteamAudioOptions steamAudioOptions;
+        steamAudioOptions.rayTracer =
+            GetActiveProject().GetProjectSettings().settings.audio.steamAudioRayTracer == ProjectSteamAudioRayTracer::Embree ?
+            Audio::SteamAudioRayTracer::Embree : Audio::SteamAudioRayTracer::Default;
+        m_audio.EnableSteamAudio(steamAudioOptions);
     }
 
     LoadProjectAudioBanks(projectPaths);

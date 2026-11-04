@@ -1,5 +1,7 @@
 #pragma once
 
+#include "assets/AcousticMaterial.h"
+
 #include "Editor/TextureThumbnailCache.h"
 #include "Editor/MeshDragPayload.h"
 #include "Editor/MaterialDragPayload.h"
@@ -7,6 +9,7 @@
 #include "Debug/EditorPhaseTiming.h"
 #include <filesystem>
 #include <map>
+#include <set>
 #include <optional>
 #include <array>
 #include <string>
@@ -22,6 +25,7 @@ class Renderer;
 class ProjectContext;
 class FileBackedDemoScene;
 class EditorIcons;
+struct MaterialPreviewImage;
 
 class AssetBrowser
 {
@@ -122,6 +126,21 @@ public:
     std::optional<std::filesystem::path> TakeDeletionRequest();
     void OnDeletionCompleted(const std::filesystem::path& path, const std::string& error);
 
+    // The Asset Browser's asset drag payload: a canonical reference of any asset type, which each drop target validates.
+    struct MovePayload
+    {
+        std::uint64_t projectIdentity = 0;
+        std::array<char, 43> reference{};
+    };
+
+    // M4: a new Acoustic Material, from a preset or by duplicating another.
+    struct AcousticMaterialCreationRequest
+    {
+        std::filesystem::path relativePath;
+        AcousticMaterialData material;
+    };
+    std::optional<AcousticMaterialCreationRequest> TakeAcousticMaterialCreationRequest();
+
     struct MaterialCreationRequest
     {
         std::filesystem::path relativePath;
@@ -147,14 +166,10 @@ private:
     EditorPhaseTiming::Frame* m_phaseTiming = nullptr;
 #if defined(ENGINE_HAS_VERIFICATION)
     friend class MaterialLocateVerification;
+    friend class ScriptWorkflowVerification;
     friend class ThumbnailSchedulingVerification;
     friend class AssetBrowserSceneVerification;
 #endif
-    struct MovePayload
-    {
-        std::uint64_t projectIdentity = 0;
-        std::array<char, 43> reference{};
-    };
     void DrawAssetMoveSource(const std::filesystem::path& path, const std::string& name);
     void DrawAssetMoveTarget(const std::filesystem::path& directory);
     std::optional<MoveRequest> m_moveRequest;
@@ -202,8 +217,52 @@ private:
         std::chrono::steady_clock::time_point nextValidation{};
         std::string error;
         bool visible = false;
+
+        // Set once the tile has displayed its completed image. A resident tile keeps its ticket and
+        // image after leaving admission, so generation rotation does not discard finished thumbnails.
+        bool resident = false;
+        std::chrono::steady_clock::time_point residentSince{};
     };
     std::map<std::string, MeshThumbnailRequest> m_meshThumbnailRequests;
+
+    // Registration and resolution check for a mesh thumbnail source (file-system work).
+    bool IsMeshSourceAvailable(const AssetID& id) const;
+
+    // Image of a resident tile, revalidated on the usual cadence; drops residency (returning nothing)
+    // when the image was evicted or its source changed, so the tile rejoins admission.
+    std::optional<D3D12_GPU_DESCRIPTOR_HANDLE> GetResidentMeshThumbnail(const AssetRecord& record);
+
+    // Residency budget enforcement for visible sets larger than kMeshResidentImageCapacity.
+    void YieldResidentMeshThumbnail(std::chrono::steady_clock::time_point now);
+
+    // Material tiles that displayed their thumbnail. A resident tile keeps displaying (and pinning) its
+    // image without admission; admission then only schedules tiles that still need one.
+    struct ResidentMaterialThumbnail
+    {
+        std::chrono::steady_clock::time_point since{};
+        bool visible = false;
+
+        // Renderer cache handle of the displayed image (MaterialPreviewImage::cacheSlot / cacheSerial).
+        size_t cacheSlot = SIZE_MAX;
+        std::uint64_t cacheSerial = 0;
+    };
+    std::map<std::string, ResidentMaterialThumbnail> m_materialResidents;
+    std::chrono::steady_clock::time_point m_lastMaterialResidentYield{};
+
+    // Image of a resident material tile. The request keeps the image pinned for this frame and runs the
+    // renderer's periodic validation; residency ends (returning nothing) once the image is stale or gone.
+    std::optional<MaterialPreviewImage> GetResidentMaterialThumbnail(const std::string& key, const AssetID& id);
+
+    // Forgets residents that left the view, admits only into free residency, and lets the longest resident
+    // yield when a visible set larger than kThumbnailResidentCapacity has tiles waiting.
+    void ScheduleMaterialThumbnails(std::chrono::steady_clock::time_point now);
+
+    // Diagnostics builds only: counts material tiles that displayed a thumbnail and later drew a status label.
+    void RecordMaterialDisplayForDiagnostics(const std::string& key, bool displayed);
+#if defined(ENGINE_HAS_VERIFICATION)
+    std::set<std::string> m_materialDisplayedForDiagnostics;
+#endif
+    std::chrono::steady_clock::time_point m_lastResidentYield{};
     void PruneMeshThumbnailRequests(bool all = false);
 
     // `terminal` reports an unreadable or unsupported source rather than a temporary failure.
@@ -258,6 +317,15 @@ private:
 
         bool directory = false;
         bool navigable = false;
+
+        // Captured at enumeration. Listings are rebuilt by Refresh, navigation, scene saves and every
+        // browser-initiated file operation, so this only goes stale after an external change; actions
+        // re-check the filesystem before they act and never treat this as authorization.
+        bool ordinaryFile = false;
+
+        // Canonical path of a .scene entry that passed the project containment checks, or empty when the
+        // entry is not a browsable scene. Unset until the entry is first classified against sceneRoot.
+        std::optional<std::filesystem::path> sceneCanonicalPath;
     };
 
     struct Listing
@@ -265,12 +333,42 @@ private:
         std::vector<Entry> entries;
 
         std::string error;
+
+        // The listed directory passed CanBrowse when it was enumerated.
+        bool browsable = false;
+
+        // Canonical project root that the entries' scene classifications were resolved against.
+        // Recorded per listing so a project switch or Refresh re-resolves it once, not once per frame.
+        std::filesystem::path sceneProjectRoot;
+        std::filesystem::path sceneRoot;
     };
+
+    // Active-scene identity resolved once per change of its inputs instead of once per tile per frame.
+    // Every input is part of the key, so switching scenes, Save As, New and project changes take effect
+    // on the next draw without invalidating any listing.
+    struct ActiveSceneIdentity
+    {
+        std::filesystem::path projectRoot;
+        std::filesystem::path scenePath;
+        std::filesystem::path sceneOwnerRoot;
+        bool eligible = false;
+
+        // Canonical active scene path; empty when no listed entry can be the active scene.
+        std::filesystem::path canonicalScenePath;
+    };
+
+    std::optional<ActiveSceneIdentity> m_activeSceneIdentity;
 
     bool CanBrowse(
         const std::filesystem::path& path,
         std::string& error) const;
-    const Listing& GetListing(const std::filesystem::path& path);
+    Listing& GetListing(const std::filesystem::path& path);
+    void ClassifySceneEntries(Listing& listing, const ProjectContext& project) const;
+    const std::filesystem::path& GetActiveScenePath(const ProjectContext& project,
+        const FileBackedDemoScene* activeScene);
+    static std::filesystem::path ResolveActiveScenePath(const ProjectContext& project,
+        const std::filesystem::path& ownerRoot, const std::filesystem::path& scenePath);
+    bool CanRequestFileOperation(const std::filesystem::path& path, std::string& error) const;
     void DrawTree(
         const std::filesystem::path& path,
         const std::string& label);
@@ -299,6 +397,14 @@ private:
     std::string m_error;
 
     std::optional<MaterialCreationRequest> m_materialRequest;
+    std::optional<AcousticMaterialCreationRequest> m_acousticRequest;
+    bool m_openAcousticModal = false;
+    std::filesystem::path m_acousticDirectory;
+    std::array<char, 256> m_acousticName{};
+    std::string m_acousticError;
+    int m_acousticPreset = 0;
+    void DrawAcousticMaterialCreationModal();
+    void RequestAcousticMaterialDuplicate(const std::filesystem::path& source);
 
     bool m_materialCreationPending = false;
     bool m_openMaterialModal = false;

@@ -43,6 +43,7 @@ int VerifyGameplayAudio(const std::filesystem::path& projectDirectory, const std
     const std::filesystem::path& buildOutput);
 int VerifySceneAudio(const std::filesystem::path& projectDirectory, const std::filesystem::path& baseScene,
     const std::filesystem::path& buildOutput);
+int VerifyAcousticPlay(const std::filesystem::path& projectDirectory, const std::filesystem::path& baseScene);
 int VerifyEditorAudio(const std::filesystem::path& projectDirectory, const std::filesystem::path& scene,
     const std::filesystem::path& buildOutput);
 int VerifyScriptAudio(const std::filesystem::path& projectDirectory, const std::filesystem::path& scene,
@@ -58,6 +59,7 @@ int VerifyPrimitiveCreation();
 int VerifyColliderVisualization();
 int VerifyViewportMarquee();
 int VerifyScenePhysicsPersistence();
+int VerifyColliderScaleMigration();
 int VerifyPresentationTransforms();
 int VerifyPhysicsSimulationController();
 int VerifyEditorPhysicsIntegration();
@@ -227,6 +229,10 @@ int main(int argc, char** argv)
     {
         return VerifyScenePhysicsData();
     }
+    if(argc == 2 && std::string_view(argv[1]) == "--verify-collider-scale-migration")
+    {
+        return VerifyColliderScaleMigration();
+    }
 #endif
 
     if(argc>=2 && std::string_view(argv[1])=="--package-bootstrap")
@@ -331,6 +337,11 @@ int main(int argc, char** argv)
         // Optional fifth argument (Audio.1D): Build Game output directory for the packaged acceptance run.
         return VerifyGameplayAudio(std::filesystem::absolute(argv[2]), std::filesystem::absolute(argv[3]),
             argc == 5 ? std::filesystem::absolute(argv[4]) : std::filesystem::path{});
+    }
+    if(argc == 4 && std::string_view(argv[1]) == "--verify-acoustic-play")
+    {
+        // M4: <project with Steam Audio enabled and its banks> <base scene with a Main Camera>.
+        return VerifyAcousticPlay(std::filesystem::absolute(argv[2]), std::filesystem::absolute(argv[3]));
     }
     if((argc == 4 || argc == 5) && std::string_view(argv[1]) == "--verify-scene-audio")
     {

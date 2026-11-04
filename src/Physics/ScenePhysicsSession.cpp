@@ -1,5 +1,7 @@
 #include "Physics/ScenePhysicsSession.h"
 
+#include "Physics/ColliderScaling.h"
+
 #include "Scene/SceneDocument.h"
 #include "Scene/SceneHierarchy.h"
 
@@ -42,7 +44,10 @@ Quaternion OrientationFromEulerRadians(const Vector3& rotation)
     return orientation;
 }
 
-void ValidatePhysicsObject(const SceneObjectDocument& object)
+// Validates the authored component and transform, then returns the collider at the object's scale (ColliderScaling.h).
+// A degenerate scale (zero, or overflowing the dimensions) fails here with the validator's message; it is never
+// clamped into a different shape.
+PhysicsComponent EffectivePhysicsCollider(const SceneObjectDocument& object)
 {
     std::string error;
 
@@ -59,26 +64,33 @@ void ValidatePhysicsObject(const SceneObjectDocument& object)
     {
         throw std::invalid_argument("Authored physics object transform must be finite");
     }
+
+    PhysicsComponent effective = ScaleCollider(*object.physics, authoredTransform.scale);
+
+    if(!ValidatePhysicsComponent(effective, &error))
+    {
+        throw std::invalid_argument("At the object's scale: " + error);
+    }
+
+    return effective;
 }
 
-BoxDefinition MakeBoxDefinition(const SceneObjectDocument& object)
+BoxDefinition MakeBoxDefinition(const SceneObjectDocument& object, const PhysicsComponent& component)
 {
-    const PhysicsComponent& component = *object.physics;
     BoxDefinition definition;
 
-    // Body: authored origin and rotation; visual scale never reaches physics.
+    // Body: authored origin and rotation. Scale reaches only the shape, through the effective component.
     definition.pose.position = object.transform.position;
     definition.pose.orientation = OrientationFromEulerRadians(object.transform.rotation);
     definition.bodyType = component.bodyType;
 
-    // Geometry: full authored dimensions become half-extents exactly once.
+    // Geometry: full effective dimensions become half-extents exactly once.
     definition.halfExtents = {
         component.boxDimensions.width * 0.5f,
         component.boxDimensions.height * 0.5f,
         component.boxDimensions.depth * 0.5f
     };
     // Offset is baked into local hull geometry, not added to the body origin.
-    // Authored visual scale is deliberately absent from both conversions.
     definition.localPositionOffset = component.colliderLocalPositionOffset;
 
     // Material.
@@ -89,20 +101,18 @@ BoxDefinition MakeBoxDefinition(const SceneObjectDocument& object)
     return definition;
 }
 
-SphereDefinition MakeSphereDefinition(const SceneObjectDocument& object)
+SphereDefinition MakeSphereDefinition(const SceneObjectDocument& object, const PhysicsComponent& component)
 {
-    const PhysicsComponent& component = *object.physics;
     SphereDefinition definition;
 
-    // Body: authored origin and rotation; visual scale never reaches physics.
+    // Body: authored origin and rotation. Scale reaches only the shape, through the effective component.
     definition.pose.position = object.transform.position;
     definition.pose.orientation = OrientationFromEulerRadians(object.transform.rotation);
     definition.bodyType = component.bodyType;
 
-    // Geometry: the stored radius is already the physical radius in meters; no halving.
+    // Geometry: the effective radius is the physical radius in meters; no halving.
     definition.radius = component.sphereRadius;
     // As for Box, the offset becomes the shape's local center, not a body-origin shift.
-    // Authored visual scale is deliberately absent from both radius and offset.
     definition.localPositionOffset = component.colliderLocalPositionOffset;
 
     // Material.
@@ -113,17 +123,16 @@ SphereDefinition MakeSphereDefinition(const SceneObjectDocument& object)
     return definition;
 }
 
-CapsuleDefinition MakeCapsuleDefinition(const SceneObjectDocument& object)
+CapsuleDefinition MakeCapsuleDefinition(const SceneObjectDocument& object, const PhysicsComponent& component)
 {
-    const PhysicsComponent& component = *object.physics;
     CapsuleDefinition definition;
 
-    // Body: authored origin and rotation; visual scale never reaches physics.
+    // Body: authored origin and rotation. Scale reaches only the shape, through the effective component.
     definition.pose.position = object.transform.position;
     definition.pose.orientation = OrientationFromEulerRadians(object.transform.rotation);
     definition.bodyType = component.bodyType;
 
-    // Geometry: +Y capsule with the authored radius and cylinder height (caps excluded).
+    // Geometry: +Y capsule with the effective radius and cylinder height (caps excluded).
     // The offset moves both hemisphere centers once, inside the shape, not the body origin.
     definition.radius = component.capsuleRadius;
     definition.cylinderHeight = component.capsuleCylinderHeight;
@@ -151,18 +160,18 @@ Vector3 RotateVector(const Quaternion& rotation, const Vector3& vector)
 
 Body CreateColliderBody(World& world, const SceneObjectDocument& object)
 {
-    ValidatePhysicsObject(object);
+    const PhysicsComponent effective = EffectivePhysicsCollider(object);
 
-    switch (object.physics->colliderType)
+    switch (effective.colliderType)
     {
     case ColliderType::Box:
-        return world.CreateBox(MakeBoxDefinition(object));
+        return world.CreateBox(MakeBoxDefinition(object, effective));
 
     case ColliderType::Sphere:
-        return world.CreateSphere(MakeSphereDefinition(object));
+        return world.CreateSphere(MakeSphereDefinition(object, effective));
 
     case ColliderType::Capsule:
-        return world.CreateCapsule(MakeCapsuleDefinition(object));
+        return world.CreateCapsule(MakeCapsuleDefinition(object, effective));
 
     default:
         // ValidatePhysicsComponent already rejects unknown collider types.
@@ -270,6 +279,13 @@ void ScenePhysicsSession::RegisterObjects(const SceneDocument& document)
                     throw std::invalid_argument("Trigger Collider: " +
                         (error.empty() ? std::string("authored transform must be finite") : error));
                 }
+
+                const auto effective = ScaleCollider(*object.triggerCollider, object.transform.scale);
+
+                if(!ValidateTriggerColliderComponent(effective, &error))
+                {
+                    throw std::invalid_argument("Trigger Collider at the object's scale: " + error);
+                }
             }
 
             // The body is stored only in this not-yet-returned session; a later failure
@@ -309,7 +325,8 @@ void ScenePhysicsSession::RegisterObjects(const SceneDocument& document)
                     host = &inserted.first->second;
                 }
 
-                auto inserted = m_sensors.emplace(object.id, m_world.AttachSensor(*host, *object.triggerCollider));
+                const auto effective = ScaleCollider(*object.triggerCollider, object.transform.scale);
+                auto inserted = m_sensors.emplace(object.id, m_world.AttachSensor(*host, effective));
                 m_triggerShapeOwners.emplace(inserted.first->second.GetShapeKey(), TriggerShapeOwner{object.id, true});
             }
         }
@@ -429,7 +446,8 @@ void ScenePhysicsSession::RegisterCharacterControllers(const SceneDocument& docu
 
         if(object.triggerCollider)
         {
-            auto inserted = m_sensors.emplace(object.id, m_world.AttachSensor(runtime.host, *object.triggerCollider));
+            const auto effective = ScaleCollider(*object.triggerCollider, object.transform.scale);
+            auto inserted = m_sensors.emplace(object.id, m_world.AttachSensor(runtime.host, effective));
             m_triggerShapeOwners.emplace(inserted.first->second.GetShapeKey(), TriggerShapeOwner{object.id, true});
         }
 

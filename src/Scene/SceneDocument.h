@@ -67,6 +67,9 @@ struct SceneObjectDocument
     std::optional<AudioSourceComponent> audioSource;
     std::optional<AudioListenerComponent> audioListener;
 
+    // Inherent acoustic settings of a mesh object; absent means disabled. Persisted from schema 18 / cooked payload 19.
+    std::optional<AcousticSettings> acoustics;
+
     // Empty means root; otherwise the exact ID of another object in this scene. Persisted from
     // schema 9 / cooked payload 9; historical versions load every object as a root.
     std::string parentID;
@@ -92,7 +95,11 @@ struct SceneDocument
     static constexpr std::uint32_t kScriptSchemaVersion = 15;
     // Audio.2A Audio Source and Audio Listener components.
     static constexpr std::uint32_t kAudioSchemaVersion = 16;
-    static constexpr std::uint32_t kSchemaVersion = kAudioSchemaVersion;
+    // Physics and Trigger Collider dimensions and offsets are object-local and follow the object's scale; earlier
+    // versions stored absolute meters and are converted on load (ColliderScaleMigration.h).
+    static constexpr std::uint32_t kColliderScaleSchemaVersion = 17;
+    static constexpr std::uint32_t kAcousticsSchemaVersion = 18;
+    static constexpr std::uint32_t kSchemaVersion = kAcousticsSchemaVersion;
 
     std::uint32_t schemaVersion = kSchemaVersion;
 

@@ -35,7 +35,9 @@ struct PhysicsComponent
     BodyType bodyType = BodyType::Static;
     ColliderType colliderType = ColliderType::Box;
 
-    // Stored shape dimensions/radius and shared offset are meters, independent of visual scale.
+    // Shape dimensions/radii and the offset are authored in the object's local (unscaled) space. Physics and the
+    // Editor overlay use them times the object's scale (ColliderScaling.h); these stored values never change.
+    // Scenes before schema 17 stored absolute meters and are converted on load.
     BoxDimensions boxDimensions;
     float sphereRadius = 0.5f;
 

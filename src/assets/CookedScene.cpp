@@ -1,6 +1,7 @@
 #include "assets/CookedScene.h"
 #include "Scene/LegacyLightingMigration.h"
 #include "Scene/PhysicalLightingMigration.h"
+#include "Scene/ColliderScaleMigration.h"
 #include "assets/CookedEnvironment.h"
 #include "assets/CookedSurface.h"
 #include "Scene/SceneSerializer.h"
@@ -639,6 +640,52 @@ void WriteAudioComponents(Writer& writer, const std::optional<AudioSourceCompone
     }
 }
 
+// V19 Acoustics: u32 presence; when present u32 enabled, u32 assignment count, then key and reference strings.
+void WriteAcousticSettings(Writer& writer, const std::optional<AcousticSettings>& acoustics)
+{
+    writer.WriteUnsigned(acoustics.has_value() ? 1 : 0, 4);
+
+    if(acoustics)
+    {
+        writer.WriteUnsigned(acoustics->enabled ? 1 : 0, 4);
+        writer.WriteUnsigned(acoustics->submeshMaterials.size(), 4);
+
+        for(const auto& [key, reference] : acoustics->submeshMaterials)
+        {
+            writer.WriteString(key);
+            writer.WriteString(reference);
+        }
+    }
+}
+
+void ReadAcousticSettings(Reader& reader, std::optional<AcousticSettings>& acoustics)
+{
+    const auto presence = reader.ReadUnsigned(4);
+    Require(presence <= 1, "Invalid cooked acoustics presence flag.");
+
+    if(presence == 0)
+    {
+        return;
+    }
+
+    const auto enabled = reader.ReadUnsigned(4);
+    Require(enabled <= 1, "Invalid cooked acoustics enabled flag.");
+    const auto count = reader.ReadUnsigned(4);
+    Require(count <= AcousticSettings::MaximumAssignments, "Too many cooked acoustic material assignments.");
+    AcousticSettings value;
+    value.enabled = enabled != 0;
+
+    for(std::uint64_t index = 0; index < count; ++index)
+    {
+        std::string key = reader.ReadString();
+        value.submeshMaterials[std::move(key)] = reader.ReadString();
+    }
+
+    std::string error;
+    Require(ValidateAcousticSettings(value, &error), error.c_str());
+    acoustics = std::move(value);
+}
+
 void ReadAudioComponents(Reader& reader, std::optional<AudioSourceComponent>& source,
     std::optional<AudioListenerComponent>& listener)
 {
@@ -814,6 +861,7 @@ std::vector<std::byte> Encode(const Metadata& sceneMetadata, const Policy& polic
         WriteLightComponent(writer, object.light);
         WriteScriptComponent(writer, object.script);
         WriteAudioComponents(writer, object.audioSource, object.audioListener);
+        WriteAcousticSettings(writer, object.acoustics);
     }
 
     if (sceneMetadata.environment)
@@ -1188,6 +1236,18 @@ Metadata Decode(std::span<const std::byte> bytes, const Policy& policy)
             }
         }
 
+        if(payloadVersion >= AcousticsVersion)
+        {
+            try
+            {
+                ReadAcousticSettings(reader, object.acoustics);
+            }
+            catch(const std::exception& exception)
+            {
+                throw std::runtime_error("Invalid cooked acoustics for object " + object.id + ": " + exception.what());
+            }
+        }
+
         document.objects.push_back(std::move(object));
         sceneMetadata.meshes.push_back(std::move(mesh));
     }
@@ -1225,6 +1285,15 @@ Metadata Decode(std::span<const std::byte> bytes, const Policy& policy)
     const auto reference = Photometry::ReferenceCameraExposure(document.lightingSettings.referenceEV100);
     if(!viewportExposure) document.camera.exposure = reference;
     for(const size_t index : camerasWithoutExposure) document.objects[index].camera->exposure = reference;
+
+    // Payloads cooked before collider scaling stored absolute collider meters; convert them once, as the JSON
+    // reader does, before validation sees the document.
+    if(payloadVersion < ColliderScaleVersion)
+    {
+        LogColliderScaleMigration(document, MigrateStoredColliderScale(document),
+            "cooked payload " + std::to_string(payloadVersion));
+    }
+
     ValidateMetadata(sceneMetadata, policy);
     return sceneMetadata;
 }
