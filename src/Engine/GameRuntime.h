@@ -2,6 +2,7 @@
 
 #include "Engine/GameAudioSession.h"
 #include "assets/AcousticMaterial.h"
+#include "assets/ProbeBatchAsset.h"
 #include "assets/ImportedMesh.h"
 #include "Engine/PhysicsSimulationController.h"
 #include "Scene/RenderView.h"
@@ -56,7 +57,11 @@ public:
     struct AcousticAssets
     {
         std::function<const ImportedMesh*(const Mesh&)> meshGeometry;
+        // Packaged games: geometry by the object's mesh reference, because a cooked mesh's CPU copy is not kept with its GPU resources.
+        std::function<const ImportedMesh*(const std::string& meshReference)> meshGeometryByReference;
         std::function<std::optional<AcousticMaterialData>(const std::string& reference, std::string* error)> material;
+        // M7: a volume's stored probes.
+        std::function<std::optional<ProbeBatchAssets::Data>(const std::string& reference, std::string* error)> probeBatch;
     };
 
     void SetAcousticAssets(AcousticAssets assets) { m_acousticAssets = std::move(assets); }
@@ -183,6 +188,7 @@ private:
     // poses, before any script code runs.
     void BeginSceneAudio(FileSceneRuntime& runtime);
     void PublishAcousticScene(FileSceneRuntime& runtime);
+    void LoadProbeVolumes(FileSceneRuntime& runtime);
     // Audio.2A autoplay after OnStart (the listener was selected by BeginSceneAudio).
     void StartSceneAudio(FileSceneRuntime& runtime);
     // Audio.2A: moves the FMOD listener and every object-bound event to the presented world poses of this frame.

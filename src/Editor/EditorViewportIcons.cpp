@@ -227,6 +227,14 @@ void Editor::DrawViewportTools(IDemoScene& scene, const EditorIcons& icons, bool
         !ImGui::GetDragDropPayload() && !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId);
     const auto hovered = allowHover ? PickViewportIcon(scene, io.MousePos) : std::nullopt;
     const float outline = (std::max)(1.0f, ImGui::GetFontSize() / 13.0f);
+    {
+        const auto& camera = scene.GetScene().GetCamera();
+        const Matrix4 viewProjection = camera.GetProjectionMatrix() * camera.GetViewMatrix();
+        DrawProbeVolumeOverlay(scene, *draw, [&](const Vector3& point)
+        {
+            return ProjectPoint(viewProjection, point, m_viewportImage.position, m_viewportImage.size);
+        });
+    }
 
     // Listener facing lines under the icons; the active listener is green, others grey.
     for(const auto& facing : m_viewportListenerFacings)

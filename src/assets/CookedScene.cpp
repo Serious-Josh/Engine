@@ -619,6 +619,7 @@ std::optional<ScriptComponent> ReadScriptComponent(Reader& reader)
 
 // V17 Audio: u32 Audio Source presence; when present u32 enabled, the event GUID and path strings and u32 autoplay.
 // Then u32 Audio Listener presence; when present u32 enabled.
+// V20 adds u32 source-centric and u32 baked after autoplay, and u32 baked after the listener's enabled.
 void WriteAudioComponents(Writer& writer, const std::optional<AudioSourceComponent>& source,
     const std::optional<AudioListenerComponent>& listener)
 {
@@ -630,6 +631,8 @@ void WriteAudioComponents(Writer& writer, const std::optional<AudioSourceCompone
         writer.WriteString(source->eventGuid);
         writer.WriteString(source->eventPath);
         writer.WriteUnsigned(source->autoplay ? 1 : 0, 4);
+        writer.WriteUnsigned(source->sourceCentricReflections ? 1 : 0, 4);
+        writer.WriteUnsigned(source->bakedReflections ? 1 : 0, 4);
     }
 
     writer.WriteUnsigned(listener.has_value() ? 1 : 0, 4);
@@ -637,6 +640,7 @@ void WriteAudioComponents(Writer& writer, const std::optional<AudioSourceCompone
     if(listener)
     {
         writer.WriteUnsigned(listener->enabled ? 1 : 0, 4);
+        writer.WriteUnsigned(listener->bakedReflections ? 1 : 0, 4);
     }
 }
 
@@ -686,7 +690,100 @@ void ReadAcousticSettings(Reader& reader, std::optional<AcousticSettings>& acous
     acoustics = std::move(value);
 }
 
-void ReadAudioComponents(Reader& reader, std::optional<AudioSourceComponent>& source,
+// V21 Probe Volume: u32 presence; when present u32 enabled, u32 placement, f32 x3 size, f32 spacing, f32 height, u32 manual count, f32 x3 each, reference string.
+// V22 adds u32 filterInsideSolids. V21 probes were generated unfiltered, so reading one as unfiltered keeps its fingerprint valid.
+void WriteProbeVolume(Writer& writer, const std::optional<ProbeVolumeComponent>& volume)
+{
+    writer.WriteUnsigned(volume.has_value() ? 1 : 0, 4);
+
+    if(!volume)
+    {
+        return;
+    }
+
+    writer.WriteUnsigned(volume->enabled ? 1 : 0, 4);
+    writer.WriteUnsigned(static_cast<std::uint32_t>(volume->placement), 4);
+
+    for(const float edge : volume->size)
+    {
+        writer.WriteFloat(edge);
+    }
+
+    writer.WriteFloat(volume->probeSpacing);
+    writer.WriteFloat(volume->heightAboveFloor);
+    writer.WriteUnsigned(volume->manualProbes.size(), 4);
+
+    for(const auto& probe : volume->manualProbes)
+    {
+        writer.WriteFloat(probe[0]);
+        writer.WriteFloat(probe[1]);
+        writer.WriteFloat(probe[2]);
+    }
+
+    writer.WriteString(volume->probeBatch);
+    writer.WriteUnsigned(volume->filterInsideSolids ? 1 : 0, 4);
+}
+
+void ReadProbeVolume(Reader& reader, std::optional<ProbeVolumeComponent>& volume, std::uint32_t version)
+{
+    const auto presence = reader.ReadUnsigned(4);
+    Require(presence <= 1, "Invalid cooked Probe Volume presence flag.");
+
+    if(presence == 0)
+    {
+        return;
+    }
+
+    const auto enabled = reader.ReadUnsigned(4);
+    Require(enabled <= 1, "Invalid cooked Probe Volume enabled flag.");
+    const auto placement = reader.ReadUnsigned(4);
+    Require(placement <= static_cast<std::uint32_t>(ProbePlacement::Uniform3D), "Invalid cooked probe placement.");
+    ProbeVolumeComponent value;
+    value.enabled = enabled != 0;
+    value.placement = static_cast<ProbePlacement>(placement);
+
+    for(float& edge : value.size)
+    {
+        edge = reader.ReadFloat();
+    }
+
+    value.probeSpacing = reader.ReadFloat();
+    value.heightAboveFloor = reader.ReadFloat();
+    const auto count = reader.ReadUnsigned(4);
+    Require(count <= ProbeVolumeComponent::MaximumManualProbes, "Too many cooked manual probes.");
+
+    for(std::uint64_t index = 0; index < count; ++index)
+    {
+        std::array<float, 3> probe{};
+        probe[0] = reader.ReadFloat();
+        probe[1] = reader.ReadFloat();
+        probe[2] = reader.ReadFloat();
+        value.manualProbes.push_back(probe);
+    }
+
+    value.probeBatch = reader.ReadString();
+    value.filterInsideSolids = false;
+
+    if(version >= ProbeFilterVersion)
+    {
+        const auto filter = reader.ReadUnsigned(4);
+        Require(filter <= 1, "Invalid cooked Probe Volume filter flag.");
+        value.filterInsideSolids = filter != 0;
+    }
+
+    std::string error;
+    Require(ValidateProbeVolume(value, &error), error.c_str());
+    volume = std::move(value);
+}
+
+bool ReadCookedFlag(Reader& reader, const char* error)
+{
+    const auto flag = reader.ReadUnsigned(4);
+    Require(flag <= 1, error);
+    return flag != 0;
+}
+
+void ReadAudioComponents(Reader& reader, std::uint32_t version, std::optional<AudioSourceComponent>& source,
     std::optional<AudioListenerComponent>& listener)
 {
     const auto sourcePresence = reader.ReadUnsigned(4);
@@ -703,6 +800,13 @@ void ReadAudioComponents(Reader& reader, std::optional<AudioSourceComponent>& so
         const auto autoplay = reader.ReadUnsigned(4);
         Require(autoplay <= 1, "Invalid cooked Audio Source autoplay flag.");
         value.autoplay = autoplay != 0;
+
+        if(version >= ReflectionSettingsVersion)
+        {
+            value.sourceCentricReflections = ReadCookedFlag(reader, "Invalid cooked Audio Source reflections flag.");
+            value.bakedReflections = ReadCookedFlag(reader, "Invalid cooked Audio Source baked flag.");
+        }
+
         std::string error;
         Require(ValidateAudioSourceComponent(value, &error), error.c_str());
         source = std::move(value);
@@ -715,7 +819,15 @@ void ReadAudioComponents(Reader& reader, std::optional<AudioSourceComponent>& so
     {
         const auto enabled = reader.ReadUnsigned(4);
         Require(enabled <= 1, "Invalid cooked Audio Listener enabled flag.");
-        listener = AudioListenerComponent{enabled != 0};
+        AudioListenerComponent value;
+        value.enabled = enabled != 0;
+
+        if(version >= ReflectionSettingsVersion)
+        {
+            value.bakedReflections = ReadCookedFlag(reader, "Invalid cooked Audio Listener baked flag.");
+        }
+
+        listener = value;
     }
 }
 
@@ -862,6 +974,7 @@ std::vector<std::byte> Encode(const Metadata& sceneMetadata, const Policy& polic
         WriteScriptComponent(writer, object.script);
         WriteAudioComponents(writer, object.audioSource, object.audioListener);
         WriteAcousticSettings(writer, object.acoustics);
+        WriteProbeVolume(writer, object.probeVolume);
     }
 
     if (sceneMetadata.environment)
@@ -1227,7 +1340,7 @@ Metadata Decode(std::span<const std::byte> bytes, const Policy& policy)
         {
             try
             {
-                ReadAudioComponents(reader, object.audioSource, object.audioListener);
+                ReadAudioComponents(reader, payloadVersion, object.audioSource, object.audioListener);
             }
             catch(const std::exception& exception)
             {
@@ -1245,6 +1358,18 @@ Metadata Decode(std::span<const std::byte> bytes, const Policy& policy)
             catch(const std::exception& exception)
             {
                 throw std::runtime_error("Invalid cooked acoustics for object " + object.id + ": " + exception.what());
+            }
+        }
+
+        if(payloadVersion >= ProbeVolumeVersion)
+        {
+            try
+            {
+                ReadProbeVolume(reader, object.probeVolume, payloadVersion);
+            }
+            catch(const std::exception& exception)
+            {
+                throw std::runtime_error("Invalid cooked Probe Volume for object " + object.id + ": " + exception.what());
             }
         }
 

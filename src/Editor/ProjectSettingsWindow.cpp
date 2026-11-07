@@ -666,6 +666,15 @@ void Editor::DrawAudioSettingsCategory(const DebugUI&, bool editable)
     ImGui::Checkbox("Enable Steam Audio", &draft.steamAudio);
     static constexpr const char* rayTracers[] = {"Default", "Embree"};
     DraftCombo("Ray Tracer", draft.steamAudioRayTracer, rayTracers);
+    static constexpr const char* bounceChoices[] = {"8", "16", "32", "64"};
+    int bounceChoice = draft.steamAudioReflectionBounces == 64 ? 3 : draft.steamAudioReflectionBounces == 32 ? 2 : draft.steamAudioReflectionBounces == 16 ? 1 : 0;
+
+    if(ImGui::Combo("Reflection Bounces", &bounceChoice, bounceChoices, IM_ARRAYSIZE(bounceChoices)))
+    {
+        draft.steamAudioReflectionBounces = 8u << bounceChoice;
+    }
+
+    ImGui::TextDisabled("More bounces give longer tails and more reflected level, at more simulation cost. Applies from the next Play.");
     ImGui::EndDisabled();
     ImGui::PushTextWrapPos(0.0f);
     ImGui::TextDisabled("Enables Steam Audio spatialization for FMOD Studio events configured with Steam Audio effects.");

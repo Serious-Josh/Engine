@@ -87,6 +87,7 @@ namespace PackagedRenderingSettings
         loaded.warnings = parsed.warnings;
 
         loaded.rendering = parsed.settings.rendering;
+        loaded.audio = parsed.settings.audio;
         loaded.source = parsed.warnings.empty() ? Source::Cooked : Source::Recovered;
         return loaded;
     }

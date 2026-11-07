@@ -1,3 +1,5 @@
+#include "assets/AcousticMaterial.h"
+#include "assets/ProbeBatchAsset.h"
 #include "Engine/BuildGame.h"
 #include "Engine/PackagedAudioBanks.h"
 #include "Engine/PackagedBootstrap.h"
@@ -239,6 +241,71 @@ fs::path PrepareOutputDirectory(const Request& request)
     return outputDirectory;
 }
 
+// With Steam Audio on, every project material a scene names, so the game never needs the project's files. A built-in travels in the code. A material
+// that cannot be read refuses the build, because the game would otherwise simulate a different surface than was authored.
+void CookAcousticMaterials(const Request& request, BuildAssets& build)
+{
+    if(!request.projectSettings.audio.steamAudio)
+    {
+        return;
+    }
+
+    const ProjectPaths paths(request.project);
+    std::set<std::string> references;
+
+    for(const auto& object : request.document.objects)
+    {
+        if(object.acoustics && object.acoustics->enabled)
+        {
+            for(const auto& [submesh, reference] : object.acoustics->submeshMaterials)
+            {
+                if(!reference.starts_with(AcousticMaterials::BuiltinPrefix))
+                {
+                    references.insert(reference);
+                }
+            }
+        }
+    }
+
+    for(const std::string& reference : references)
+    {
+        std::string error;
+        const auto material = AcousticMaterials::Resolve(reference, &paths, &request.registry, &error);
+        Require(material.has_value(), "Acoustic material " + reference + " cannot be packaged: " + error);
+        build.Append({*AssetID::ParseReference(reference), EngineAssetPak::Type::Resource, AcousticMaterials::PackagedPayloadVersion,
+            AcousticMaterials::EncodePackaged(*material)});
+    }
+}
+
+// M7: staleness is reported at Play. A file that is present but fails validation stops the build, because it would ship broken.
+void CookProbeBatches(const Request& request, BuildAssets& build)
+{
+    if(!request.projectSettings.audio.steamAudio)
+    {
+        return;
+    }
+
+    const ProjectPaths paths(request.project);
+    std::set<std::string> references;
+
+    for(const auto& object : request.document.objects)
+    {
+        if(object.probeVolume && object.probeVolume->enabled && !object.probeVolume->probeBatch.empty())
+        {
+            references.insert(object.probeVolume->probeBatch);
+        }
+    }
+
+    for(const std::string& reference : references)
+    {
+        std::string error;
+        const auto data = ProbeBatchAssets::Resolve(reference, paths, request.registry, &error);
+        Require(data.has_value(), "Probe batch " + reference + " cannot be packaged: " + error);
+        build.Append({*AssetID::ParseReference(reference), EngineAssetPak::Type::Resource, ProbeBatchAssets::PackagedPayloadVersion,
+            ProbeBatchAssets::Encode(*data)});
+    }
+}
+
 void CookMeshAssets(const Request& request, BuildAssets& build, const BuildProgress& progress)
 {
     std::set<std::string> meshIDs;
@@ -474,7 +541,7 @@ void CompilePackagedShaders(const Request& request, BuildAssets& build, const Bu
     auto settingsPayload = PackagedRenderingSettings::Encode(request.projectSettings);
     const auto decoded = PackagedRenderingSettings::Decode(settingsPayload);
     Require(decoded.source == PackagedRenderingSettings::Source::Cooked &&
-        decoded.rendering == request.projectSettings.rendering,
+        decoded.rendering == request.projectSettings.rendering && decoded.audio == request.projectSettings.audio,
         "Packaged rendering settings do not round-trip; the saved Project Settings may need to be saved again.");
     build.Append({settingsID, EngineAssetPak::Type::Resource, 1, std::move(settingsPayload)});
     std::uint64_t totalPayloadBytes = 0;
@@ -653,6 +720,24 @@ void DeployRuntimeFiles(const Request& request, const AssetID& sceneAssetID,
         // Not a legal statement: the obligations are the game author's, under the FMOD license they hold.
         Log::Info("Build Game: deployed the FMOD runtime (fmod.dll, fmodstudio.dll). Firelight's FMOD license governs "
             "redistributing them; check its attribution and title-registration requirements before release.");
+    }
+
+    // Steam Audio's runtime, only for saved settings that enable it, and never without FMOD or its notices. Embree is linked into phonon.dll.
+    if(request.projectSettings.audio.steamAudio)
+    {
+        Require(fmodCore, "Project Settings enable Steam Audio, but the runtime directory has no FMOD runtime.");
+
+        for(const auto* fileName : {"phonon.dll", "phonon_fmod.dll", "SteamAudio-THIRDPARTY.md"})
+        {
+            const fs::path source = request.runtimeDirectory / fileName;
+            Require(fs::is_regular_file(source) && !IsReparsePoint(source), std::string("Project Settings enable Steam Audio, but the runtime "
+                "directory has no ") + fileName + " (EngineRuntime was built without the Steam Audio SDK). Turn Steam Audio off in Project Settings, "
+                "or build EngineRuntime with the SDK.");
+            copyRuntimeFile(source, fileName);
+            deploymentFiles.emplace_back(fileName);
+        }
+
+        Log::Info("Build Game: deployed Steam Audio (phonon.dll, phonon_fmod.dll, SteamAudio-THIRDPARTY.md). Keep its Apache-2.0 notices with the game.");
     }
 
     // EngineRuntime's build writes RuntimeNotices.txt, plus the app-local MSVC redistributables for Release.
@@ -875,6 +960,8 @@ bool Service::Start(Request request, std::string& error)
                 // After the scene: scene cooking treats every earlier asset as a mesh input.
                 CookScriptAssets(request, build, progress);
                 CookAudioBanks(request, build, progress);
+                CookAcousticMaterials(request, build);
+                CookProbeBatches(request, build);
                 CompilePackagedShaders(request, build, progress);
                 WriteAndVerifyArchives(request, sceneAssetID, stagingDirectory, build, progress);
                 DeployRuntimeFiles(request, sceneAssetID, stagingDirectory, progress);

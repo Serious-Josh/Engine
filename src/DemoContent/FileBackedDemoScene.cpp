@@ -835,6 +835,22 @@ bool FileBackedDemoScene::SetObjectAcoustics(const SceneObjectMetadata& selectio
     return m_runtime->SetObjectAcoustics(selection, expected, replacement, errorMessage);
 }
 
+bool FileBackedDemoScene::SetObjectProbeVolume(const SceneObjectMetadata& selection, const std::optional<ProbeVolumeComponent>& expected,
+    const std::optional<ProbeVolumeComponent>& replacement, std::string* errorMessage)
+{
+    if(!m_initialized || m_objectMutationCandidate)
+    {
+        if(errorMessage)
+        {
+            *errorMessage = "The scene is not ready for Probe Volume edits.";
+        }
+
+        return false;
+    }
+
+    return m_runtime->SetObjectProbeVolume(selection, expected, replacement, errorMessage);
+}
+
 bool FileBackedDemoScene::ValidateObjectTransform(RenderObjectID index, const Transform& transform, std::string& error) const
 {
     const auto identity = m_runtime->GetObjectMetadata(index, &error);

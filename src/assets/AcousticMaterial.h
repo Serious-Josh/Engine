@@ -1,6 +1,9 @@
 #pragma once
 
 #include <array>
+#include <cstddef>
+#include <cstdint>
+#include <span>
 #include <filesystem>
 #include <optional>
 #include <string>
@@ -36,6 +39,12 @@ nlohmann::json Serialize(const AcousticMaterialData& material);
 bool Deserialize(const nlohmann::json& document, AcousticMaterialData& material, std::string* error = nullptr);
 bool SaveToFile(const AcousticMaterialData& material, const std::filesystem::path& path, std::string* error = nullptr);
 bool LoadFromFile(const std::filesystem::path& path, AcousticMaterialData& material, std::string* error = nullptr);
+
+// A project material inside a game archive: its Serialize document, in a Resource entry under the asset's own ID.
+inline constexpr std::uint32_t PackagedPayloadVersion = 1;
+inline constexpr std::size_t MaximumPackagedBytes = 64 * 1024;
+std::vector<std::byte> EncodePackaged(const AcousticMaterialData& material);
+bool DecodePackaged(std::span<const std::byte> payload, AcousticMaterialData& material, std::string* error = nullptr);
 
 // Valve's Steam Audio presets, with their values: "builtin:acoustic/concrete" and so on.
 std::optional<AcousticMaterialData> FindBuiltin(std::string_view reference);

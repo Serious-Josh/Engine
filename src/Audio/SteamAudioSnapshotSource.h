@@ -108,6 +108,33 @@ public:
         return m_channel;
     }
 
+    // Worker, once. `ir` is the triple buffer inside the private source's SimulationData, which Steam Audio's own convolution
+    // reads lock-free. The private source outlives every plugin reference to this object (ReclaimRetiredSources), so the
+    // pointer never dangles while the plugin can ask for it. The sizes are written first and the release pairs with getOutputs.
+    void PublishReflectionIr(IPLReflectionEffectIR ir, int channels, int samples) noexcept
+    {
+        m_irChannels = channels;
+        m_irSamples = samples;
+        m_ir.store(ir, std::memory_order_release);
+    }
+
+    // Owner, as Stage B releases the private source. A read after this would be a read of freed memory, and counts as an anomaly.
+    void MarkIrReleased() noexcept
+    {
+        m_irReleased.store(true, std::memory_order_release);
+    }
+
+    // Main thread. While withheld the plugin sees no IR, which is silence after the effect's own tail.
+    void SetIrWithheld(bool withheld) noexcept
+    {
+        m_irWithheld.store(withheld, std::memory_order_relaxed);
+    }
+
+    std::int64_t IrReads() const noexcept
+    {
+        return m_irReads.load(std::memory_order_relaxed);
+    }
+
     // Including the owner's own. Acquire pairs with release(): what a holder did happens before the owner sees it gone.
     int References() const noexcept
     {
@@ -126,6 +153,12 @@ private:
     std::atomic<std::int64_t> m_anomalies{0};
     // Catches a second concurrent reader without waiting: it gets neutral values and leaves the channel alone.
     std::atomic<bool> m_readerBusy{false};
+    std::atomic<IPLReflectionEffectIR> m_ir{nullptr};
+    int m_irChannels = 0;
+    int m_irSamples = 0;
+    std::atomic<bool> m_irReleased{false};
+    std::atomic<bool> m_irWithheld{false};
+    std::atomic<std::int64_t> m_irReads{0};
 };
 
 // Verification only: called on the mixer for each read, between acquiring a snapshot and leaving it.

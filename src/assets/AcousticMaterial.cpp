@@ -188,6 +188,26 @@ bool LoadFromFile(const std::filesystem::path& path, AcousticMaterialData& mater
     return Deserialize(document, material, error);
 }
 
+std::vector<std::byte> EncodePackaged(const AcousticMaterialData& material)
+{
+    const std::string text = Serialize(material).dump();
+    const auto* const begin = reinterpret_cast<const std::byte*>(text.data());
+    return std::vector<std::byte>(begin, begin + text.size());
+}
+
+bool DecodePackaged(std::span<const std::byte> payload, AcousticMaterialData& material, std::string* error)
+{
+    const auto* const begin = reinterpret_cast<const char*>(payload.data());
+    const nlohmann::json document = nlohmann::json::parse(begin, begin + payload.size(), nullptr, false);
+
+    if(document.is_discarded())
+    {
+        return Fail(error, "The packaged acoustic material is not valid JSON.");
+    }
+
+    return Deserialize(document, material, error);
+}
+
 std::optional<AcousticMaterialData> FindBuiltin(std::string_view reference)
 {
     if(!reference.starts_with(BuiltinPrefix))

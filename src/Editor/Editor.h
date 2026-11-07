@@ -15,6 +15,9 @@
 #include "ViewportGridSnap.h"
 #include "EditorPreferences.h"
 #include "ViewportIcons.h"
+#include "Engine/ProbeAssetCleanup.h"
+#include "Engine/ProbeVolumes.h"
+#include "assets/ProbeBatchAsset.h"
 #include "Scene/FileSceneAssetCatalog.h"
 #include "Project/ProjectContext.h"
 #include "Debug/EditorPhaseTiming.h"
@@ -124,7 +127,7 @@ public:
 
     // Audio.2B: the process's AudioSystem, read-only, for the Audio Source event picker. Null or not running shows
     // the inspector without event names.
-    void SetAudioSystem(const Audio::AudioSystem* audio) noexcept
+    void SetAudioSystem(Audio::AudioSystem* audio) noexcept
     {
         m_audioSystem = audio;
     }
@@ -424,6 +427,29 @@ public:
         const ProjectAssetRegistry& assetRegistry);
     std::optional<AssetBrowser::MaterialCreationRequest> TakeMaterialCreationRequest();
     std::optional<AssetBrowser::AcousticMaterialCreationRequest> TakeAcousticMaterialCreationRequest();
+    // M7: Engine owns the registry, so it stores a volume's probes on the Editor's behalf.
+    struct ProbeBatchRequest
+    {
+        std::string objectID;
+        std::vector<std::byte> encoded;
+    };
+    // M7.1: applies a finished background generation, and cancels one that lost its scene. Runs every frame, whatever is selected.
+    void PollProbeGeneration(IDemoScene& scene);
+    struct ProbeCleanupRequest
+    {
+        std::set<std::string> liveReferences;
+        std::vector<AssetID> confirmed;
+    };
+    std::optional<ProbeCleanupRequest> TakeProbeCleanupRequest()
+    {
+        return std::exchange(m_probeCleanupRequest, std::nullopt);
+    }
+    void OnProbeCleanupCompleted(std::size_t removed, const std::string& error);
+    std::optional<ProbeBatchRequest> TakeProbeBatchRequest()
+    {
+        return std::exchange(m_probeBatchRequest, std::nullopt);
+    }
+    void OnProbeBatchRequestCompleted(IDemoScene& scene, const std::string& objectID, const std::string& reference, const std::string& error);
     std::optional<AssetBrowser::MeshImportUnitsRequest> TakeMeshImportUnitsRequest()
     {
         return m_assetBrowser.TakeMeshImportUnitsRequest();
@@ -1020,6 +1046,63 @@ private:
     bool AssignAcousticMaterialReference(IDemoScene& scene, const SceneObjectMetadata& selection, const std::optional<AcousticSettings>& before,
         const std::string& submeshKey, std::string_view reference, const ProjectAssetRegistry& registry);
     static size_t AcousticEditPayloadBytes(const AcousticSettingsEdit& edit);
+    // M7: one complete replacement of an object's Probe Volume per entry (ProbeVolumeControls.cpp).
+    struct ProbeVolumeEdit
+    {
+        SceneHistorySession session;
+        std::string objectID;
+        std::optional<ProbeVolumeComponent> before;
+        std::optional<ProbeVolumeComponent> after;
+    };
+    // The selected volume's stored probes, reread only when its file changes.
+    struct ProbeView
+    {
+        std::string objectID;
+        std::string reference;
+        std::filesystem::file_time_type fileTime{};
+        bool fileExists = false;
+        std::optional<ProbeBatchAssets::Data> stored;
+        std::string loadError;
+        std::uint64_t fingerprint = 0;
+        double nextFingerprint = 0.0;
+        ProbeVolumes::Status status = ProbeVolumes::Status::NotGenerated;
+    };
+    struct ProbeOverlay
+    {
+        int frame = -1000;
+        bool valid = false;
+        std::array<float, 3> size{};
+        std::string objectID;
+    };
+    void DrawObjectProbeVolumeControls(IDemoScene& scene, const ProjectPaths& paths, const ProjectAssetRegistry& registry);
+    bool CommitObjectProbeVolume(IDemoScene& scene, const SceneObjectMetadata& selection, const std::optional<ProbeVolumeComponent>& before,
+        const std::optional<ProbeVolumeComponent>& after);
+    void RefreshProbeView(const FileBackedDemoScene& owner, const IDemoScene& scene, const SceneObjectDocument& object, const ProjectPaths& paths,
+        const ProjectAssetRegistry& registry);
+    void GenerateProbes(IDemoScene& scene, const FileBackedDemoScene& owner, const SceneObjectDocument& object);
+    void DrawProbeGenerationProgress();
+    void DrawProbeCleanup(const FileBackedDemoScene& owner, const ProjectPaths& paths, const ProjectAssetRegistry& registry, bool blocked);
+    // What undo, redo and the open document can still bring back.
+    std::set<std::string> CollectLiveProbeReferences(const FileBackedDemoScene& owner) const;
+    struct ProbeGeneration
+    {
+        std::shared_ptr<Audio::ProbeGenerationJob> job;
+        std::string objectID;
+        std::uint64_t fingerprint = 0;
+        std::vector<std::string> skippedObjects;
+        SceneHistorySession session;
+    };
+    std::optional<ProbeGeneration> m_probeGeneration;
+    std::optional<ProbeAssetCleanup::Report> m_probeCleanupReport;
+    std::optional<ProbeCleanupRequest> m_probeCleanupRequest;
+    void DrawProbeVolumeOverlay(const IDemoScene& scene, ImDrawList& draw, const std::function<std::optional<ImVec2>(const Vector3&)>& project) const;
+    std::string m_probeEditStatus;
+    ProbeVolumeComponent m_probeDraft;
+    ProbeVolumeComponent m_probeDraftBase;
+    std::string m_probeDraftObject;
+    ProbeView m_probeView;
+    ProbeOverlay m_probeOverlay;
+    std::optional<ProbeBatchRequest> m_probeBatchRequest;
     std::string m_acousticEditStatus;
     std::array<char, 128> m_acousticMaterialSearch{};
     enum class AudioComponentKind
@@ -1058,7 +1141,7 @@ private:
     std::uint64_t m_audioControlsRevision = 0;
     std::array<char, 128> m_audioEventSearch{};
     AudioComponentKind m_audioManagementKind = AudioComponentKind::Source;
-    const Audio::AudioSystem* m_audioSystem = nullptr;
+    Audio::AudioSystem* m_audioSystem = nullptr;
     // CM.9: read-only runtime diagnostics and the explicitly activated diagnostic drive.
     bool ViewportOwnsKeyboard() const;
     void DisableCharacterDrive(std::string reason);
@@ -1168,7 +1251,7 @@ private:
         std::unique_ptr<TriggerColliderEdit>, std::unique_ptr<CharacterControllerEdit>, TransformEdit, std::unique_ptr<GroupTransformEdit>,
         std::unique_ptr<ObjectDeletion>, std::unique_ptr<RenameObject>, std::unique_ptr<ReorderObjects>,
         std::unique_ptr<MaterialBindingsEdit>, std::unique_ptr<CameraEdit>, std::unique_ptr<LightEdit>,
-        std::unique_ptr<ScriptEdit>, std::unique_ptr<AudioComponentsEdit>, std::unique_ptr<AcousticSettingsEdit>>;
+        std::unique_ptr<ScriptEdit>, std::unique_ptr<AudioComponentsEdit>, std::unique_ptr<AcousticSettingsEdit>, std::unique_ptr<ProbeVolumeEdit>>;
     struct SceneHistoryEntry
     {
         SceneHistoryCommand command;

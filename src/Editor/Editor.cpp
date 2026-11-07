@@ -1648,6 +1648,7 @@ void Editor::Draw(
                 DrawObjectScriptControls(demoScene, projectPaths, assetRegistry);
                 DrawObjectAudioControls(demoScene);
                 DrawObjectAcousticControls(demoScene, projectPaths, assetRegistry);
+                DrawObjectProbeVolumeControls(demoScene, projectPaths, assetRegistry);
                 {
                     EditorPhaseTiming::Scope phase(PhaseTiming(), EditorPhaseTiming::Phase::ComponentAdd);
                     DrawAddComponentControls(demoScene);
@@ -4366,6 +4367,33 @@ void Editor::ReplaySceneHistory(IDemoScene& demoScene, bool redo)
 
         m_historyCursor = redo ? m_historyCursor + 1 : m_historyCursor - 1;
         m_acousticEditStatus.clear();
+        m_sceneHistoryStatus.clear();
+        return;
+    }
+
+    if(const auto* probes = std::get_if<std::unique_ptr<ProbeVolumeEdit>>(&entry.command); probes && *probes)
+    {
+        const auto& edit = **probes;
+        auto* owner = dynamic_cast<FileBackedDemoScene*>(&demoScene);
+
+        if(!owner || !RenameSessionMatches(demoScene, edit.session))
+        {
+            ReportSceneHistoryFailure("Probe Volume replay belongs to a stale scene session.");
+            return;
+        }
+
+        std::string error;
+        const auto selection = owner->GetObjectMetadata(edit.objectID, &error);
+
+        if(!selection || !owner->SetObjectProbeVolume(*selection, redo ? edit.before : edit.after,
+            redo ? edit.after : edit.before, &error))
+        {
+            ReportSceneHistoryFailure(error);
+            return;
+        }
+
+        m_historyCursor = redo ? m_historyCursor + 1 : m_historyCursor - 1;
+        m_probeEditStatus.clear();
         m_sceneHistoryStatus.clear();
         return;
     }

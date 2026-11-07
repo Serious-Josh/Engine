@@ -1,6 +1,10 @@
 #include "Engine/Engine.h"
+#include "assets/AcousticMaterial.h"
 #include "assets/ArchiveCookedMeshProvider.h"
+#include "assets/CookedMesh.h"
 
+#include <map>
+#include <memory>
 #include <stdexcept>
 
 bool Engine::StartPackagedGame(FileSceneRuntime& runtime, std::string& error)
@@ -36,6 +40,92 @@ bool Engine::StartPackagedGame(FileSceneRuntime& runtime, std::string& error)
             return result;
         }
     };
+
+    // The acoustic scene comes from the archive alone: cooked meshes decoded once, built-in materials, and the project materials Build Game cooked.
+    GameRuntime::AcousticAssets acousticAssets;
+    const auto decodedMeshes = std::make_shared<std::map<std::string, std::shared_ptr<const ImportedMesh>>>();
+    acousticAssets.meshGeometryByReference = [&runtime, decodedMeshes](const std::string& reference) -> const ImportedMesh*
+    {
+        const auto found = decodedMeshes->find(reference);
+
+        if(found != decodedMeshes->end())
+        {
+            return found->second.get();
+        }
+
+        const auto id = AssetID::ParseReference(reference);
+        const auto& archive = runtime.GetArchiveScene();
+        const EngineAssetPak::Entry* const entry = id && archive && archive->provider ? archive->provider->ArchiveEntry(*id) : nullptr;
+
+        if(!entry)
+        {
+            return nullptr;
+        }
+
+        const CookedMesh::Policy policy;
+        const auto bytes = archive->provider->ReadEntry(*id, entry->type, entry->payloadVersion, policy.maxDecodedBytes);
+        auto decoded = CookedMesh::Decode(bytes, policy).geometry;
+        const ImportedMesh* const geometry = decoded.get();
+        decodedMeshes->emplace(reference, std::move(decoded));
+        return geometry;
+    };
+    acousticAssets.material = [&runtime](const std::string& reference, std::string* materialError) -> std::optional<AcousticMaterialData>
+    {
+        if(reference.starts_with(AcousticMaterials::BuiltinPrefix))
+        {
+            return AcousticMaterials::Resolve(reference, nullptr, nullptr, materialError);
+        }
+
+        const auto id = AssetID::ParseReference(reference);
+        const auto& archive = runtime.GetArchiveScene();
+
+        if(!id || !archive || !archive->provider || !archive->provider->ArchiveEntry(*id))
+        {
+            if(materialError)
+            {
+                *materialError = "the acoustic material is not in the game archive";
+            }
+
+            return std::nullopt;
+        }
+
+        const auto bytes = archive->provider->ReadEntry(*id, EngineAssetPak::Type::Resource, AcousticMaterials::PackagedPayloadVersion,
+            AcousticMaterials::MaximumPackagedBytes);
+        AcousticMaterialData material;
+
+        if(!AcousticMaterials::DecodePackaged(bytes, material, materialError))
+        {
+            return std::nullopt;
+        }
+
+        return material;
+    };
+    acousticAssets.probeBatch = [&runtime](const std::string& reference, std::string* probeError) -> std::optional<ProbeBatchAssets::Data>
+    {
+        const auto id = AssetID::ParseReference(reference);
+        const auto& archive = runtime.GetArchiveScene();
+
+        if(!id || !archive || !archive->provider || !archive->provider->ArchiveEntry(*id))
+        {
+            if(probeError)
+            {
+                *probeError = "the probe batch is not in the game archive";
+            }
+
+            return std::nullopt;
+        }
+
+        const auto bytes = archive->provider->ReadEntry(*id, EngineAssetPak::Type::Resource, ProbeBatchAssets::PackagedPayloadVersion, ProbeBatchAssets::MaximumBytes);
+        ProbeBatchAssets::Data data;
+
+        if(!ProbeBatchAssets::Decode(bytes, data, probeError))
+        {
+            return std::nullopt;
+        }
+
+        return data;
+    };
+    m_gameRuntime.SetAcousticAssets(std::move(acousticAssets));
 
     return m_gameRuntime.Start(runtime, m_renderer, m_packagedMainCamera, m_window.GetWidth(), m_window.GetHeight(),
         error, scripts);

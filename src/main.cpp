@@ -259,6 +259,14 @@ int main(int argc, char** argv)
                 {
                     engine.VerifyPackagedBootstrap();
                 }
+                else if(std::getenv("ENGINE_DIAG_PACKAGED_PROBES"))
+                {
+                    engine.VerifyPackagedProbes();
+                }
+                else if(std::getenv("ENGINE_DIAG_PACKAGED_REFLECTIONS"))
+                {
+                    engine.VerifyPackagedReflections();
+                }
                 else
 #endif
                 {

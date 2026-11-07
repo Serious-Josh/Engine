@@ -31,7 +31,13 @@ namespace CookedScene
     inline constexpr std::uint32_t ColliderScaleVersion = 18;
     // M4: per-object acoustic settings.
     inline constexpr std::uint32_t AcousticsVersion = 19;
-    inline constexpr std::uint32_t Version = AcousticsVersion;
+    // M6.9: Audio Source and Audio Listener reflection settings.
+    inline constexpr std::uint32_t ReflectionSettingsVersion = 20;
+    // M7: Probe Volumes.
+    inline constexpr std::uint32_t ProbeVolumeVersion = 21;
+    // M7.1: a Probe Volume's inside-solid filter setting.
+    inline constexpr std::uint32_t ProbeFilterVersion = 22;
+    inline constexpr std::uint32_t Version = ProbeFilterVersion;
 
     constexpr bool IsSupportedVersion(std::uint32_t version)
     {
@@ -53,7 +59,10 @@ namespace CookedScene
             version == ScriptVersion ||
             version == AudioVersion ||
             version == ColliderScaleVersion ||
-            version == AcousticsVersion;
+            version == AcousticsVersion ||
+            version == ReflectionSettingsVersion ||
+            version == ProbeVolumeVersion ||
+            version == ProbeFilterVersion;
     }
     struct Policy
     {

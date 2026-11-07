@@ -257,6 +257,23 @@ FMOD_RESULT AudioSystem::Impl::Start(Output output, InjectedFailure injectedFail
     return result;
 }
 
+#if defined(ENGINE_HAS_STEAMAUDIO)
+void AudioSystem::Impl::StopProbeGeneration() noexcept
+{
+    if(probeJob)
+    {
+        probeJob->Cancel();
+    }
+
+    if(probeThread.joinable())
+    {
+        probeThread.join();
+    }
+
+    probeJob.reset();
+}
+#endif
+
 void AudioSystem::Impl::ReleaseStudioSystem() noexcept
 {
     if(!studio)
@@ -278,7 +295,9 @@ void AudioSystem::Impl::ReleaseStudioSystem() noexcept
 #if defined(ENGINE_HAS_STEAMAUDIO)
     // SA.1: only now, with every Steam Audio DSP destroyed by the release above, may the plugin's state go. SA.3:
     // sources and their simulator first, while Steam Audio's context still exists.
+    StopProbeGeneration();
     steamAudioSimulation.reset();
+    probeBatches.reset();
 
     if(steamAudio)
     {
@@ -287,6 +306,88 @@ void AudioSystem::Impl::ReleaseStudioSystem() noexcept
         Log::Info("Audio: Steam Audio stopped.");
     }
 #endif
+}
+
+ProbeGenerationResult AudioSystem::GenerateProbes(const ProbeGenerationRequest& request) const
+{
+#if defined(ENGINE_HAS_STEAMAUDIO)
+    if(m_impl->steamAudio && m_impl->steamAudioStatus == SteamAudioStatus::Active)
+    {
+        return Internal::GenerateProbeBatch(m_impl->steamAudio->GetContext(), request);
+    }
+#else
+    static_cast<void>(request);
+#endif
+
+    ProbeGenerationResult result;
+    result.error = "Steam Audio is not active in this project";
+    return result;
+}
+
+std::shared_ptr<ProbeGenerationJob> AudioSystem::StartProbeGeneration(ProbeGenerationRequest request)
+{
+#if defined(ENGINE_HAS_STEAMAUDIO)
+    if(!m_impl->steamAudio || m_impl->steamAudioStatus != SteamAudioStatus::Active || (m_impl->probeJob && !m_impl->probeJob->IsFinished()))
+    {
+        return nullptr;
+    }
+
+    m_impl->StopProbeGeneration();
+    auto job = std::make_shared<ProbeGenerationJob>();
+    // The context outlives the thread: StopProbeGeneration joins it before Steam Audio stops.
+    m_impl->probeThread = std::thread([job, context = m_impl->steamAudio->GetContext(), request = std::move(request)]
+    {
+        job->Finish(Internal::GenerateProbeBatch(context, request, job.get()));
+    });
+    m_impl->probeJob = job;
+    return job;
+#else
+    static_cast<void>(request);
+    return nullptr;
+#endif
+}
+
+bool AudioSystem::LoadProbeBatch(std::span<const std::byte> batch, std::size_t expectedProbes, std::string& error)
+{
+#if defined(ENGINE_HAS_STEAMAUDIO)
+    if(m_impl->steamAudio && m_impl->steamAudioStatus == SteamAudioStatus::Active)
+    {
+        if(!m_impl->probeBatches)
+        {
+            m_impl->probeBatches = std::make_unique<Internal::SteamAudioProbeBatches>();
+        }
+
+        return m_impl->probeBatches->Load(m_impl->steamAudio->GetContext(), batch, expectedProbes, error);
+    }
+#else
+    static_cast<void>(batch);
+    static_cast<void>(expectedProbes);
+#endif
+
+    error = "Steam Audio is not active";
+    return false;
+}
+
+void AudioSystem::ClearProbeBatches() noexcept
+{
+#if defined(ENGINE_HAS_STEAMAUDIO)
+    if(m_impl->probeBatches)
+    {
+        m_impl->probeBatches->Clear();
+    }
+#endif
+}
+
+ProbeBatchStats AudioSystem::GetProbeBatchStats() const noexcept
+{
+#if defined(ENGINE_HAS_STEAMAUDIO)
+    if(m_impl->probeBatches)
+    {
+        return m_impl->probeBatches->GetStats();
+    }
+#endif
+
+    return {};
 }
 
 std::string AudioSystem::Impl::DescribeRunningOutput(Output output) const
@@ -482,6 +583,11 @@ void AudioSystem::Update() noexcept
     }
 
 #if defined(ENGINE_HAS_STEAMAUDIO)
+    if(m_impl->steamAudio)
+    {
+        m_impl->steamAudio->UpdateMixerPool();
+    }
+
     if(m_impl->steamAudioSimulation)
     {
         m_impl->steamAudioSimulation->Update();
@@ -516,6 +622,12 @@ void AudioSystem::Shutdown() noexcept
     // system alone would free them too, but this keeps the order independent of FMOD's internal release sequence.
     if(released)
     {
+#if defined(ENGINE_HAS_STEAMAUDIO)
+        if(m_impl->steamAudioSimulation)
+        {
+            m_impl->steamAudioSimulation->ReleaseReflectionReturn();
+        }
+#endif
         m_impl->ReleaseAllEvents();
         m_impl->UnloadAllBanks();
     }
@@ -600,6 +712,8 @@ SteamAudioStatus AudioSystem::EnableSteamAudio(const SteamAudioOptions& options)
 
     auto runtime = std::make_unique<Internal::SteamAudioRuntime>();
 
+    runtime->SetContextAllocatorForTesting(options.contextAllocateForTesting, options.contextFreeForTesting, options.useSdkAllocatorForTesting);
+
     if(std::string error; !runtime->Start(*m_impl->core, options.injectedFailure, error))
     {
         return refuse(error);
@@ -614,6 +728,12 @@ SteamAudioStatus AudioSystem::EnableSteamAudio(const SteamAudioOptions& options)
     m_impl->steamAudioSimulation =
         std::make_unique<Internal::SteamAudioSimulation>(*m_impl->steamAudio, *m_impl->studio, *m_impl->core);
     m_impl->steamAudioSimulation->Start(options);
+
+    // After Start, which decides whether reflections are active, and before any bank, so before any DSP can mix.
+    const auto stats = m_impl->steamAudioSimulation->GetStats();
+    m_impl->steamAudio->ArmMixerPool(*m_impl->core, stats.reflectionInfrastructureActive, options);
+    // Before any bank, so the authored return finds the source when its DSP first runs.
+    m_impl->steamAudioSimulation->StartEnvironmentalReverb();
 
     return m_impl->steamAudioStatus;
 #endif
@@ -784,6 +904,18 @@ bool AudioSystem::ClearAcousticScene()
 #endif
 }
 
+SteamAudioMixerPoolStats AudioSystem::GetSteamAudioMixerPoolStats() const
+{
+#if defined(ENGINE_HAS_STEAMAUDIO)
+    if(m_impl->steamAudio)
+    {
+        return m_impl->steamAudio->GetMixerPoolStats();
+    }
+#endif
+
+    return {};
+}
+
 SteamAudioSimulationStats AudioSystem::GetSteamAudioSimulationStats() const
 {
 #if defined(ENGINE_HAS_STEAMAUDIO)
@@ -815,6 +947,50 @@ void* AudioSystem::GetNativeCoreForTesting() const noexcept
 #else
     return nullptr;
 #endif
+}
+
+void AudioSystem::BeginReflectionSession() noexcept
+{
+#if defined(ENGINE_HAS_STEAMAUDIO)
+    if(m_impl->steamAudioSimulation)
+    {
+        m_impl->steamAudioSimulation->BeginReflectionSession();
+    }
+#endif
+}
+
+void AudioSystem::EndReflectionSession() noexcept
+{
+#if defined(ENGINE_HAS_STEAMAUDIO)
+    if(m_impl->steamAudioSimulation)
+    {
+        m_impl->steamAudioSimulation->EndReflectionSession();
+    }
+#endif
+}
+
+void AudioSystem::SetListenerReflectionsWithheld(bool withheld) noexcept
+{
+#if defined(ENGINE_HAS_STEAMAUDIO)
+    if(m_impl->steamAudioSimulation)
+    {
+        m_impl->steamAudioSimulation->SetListenerReflectionsWithheld(withheld);
+    }
+#else
+    static_cast<void>(withheld);
+#endif
+}
+
+void* AudioSystem::GetSteamAudioReverbGroupForTesting() const noexcept
+{
+#if defined(ENGINE_HAS_STEAMAUDIO)
+    if(m_impl->steamAudioSimulation)
+    {
+        return m_impl->steamAudioSimulation->GetReverbGroupForTesting();
+    }
+#endif
+
+    return nullptr;
 }
 
 void* AudioSystem::GetSteamAudioWorkerThreadForTesting() const noexcept

@@ -57,6 +57,8 @@ public:
         std::string eventGuid;
         bool enabled = true;
         bool autoplay = true;
+        bool sourceCentricReflections = false;
+        bool bakedReflections = false;
     };
 
     // Engine's world matrices (row-indexed storage, column-vector math): translation is column 3, local +Z and +Y
@@ -82,6 +84,9 @@ public:
     // Audio.2C: records every Audio Source of the running scene before any script code runs, so scripts can control
     // them from their constructors and OnStart on.
     void RegisterSceneSources(std::vector<SceneSource> sources);
+    // The active Audio Listener asks for baked shared reflections. No baked data exists yet (M8), so they are reported unavailable and silent:
+    // never simulated in real time instead.
+    void SetListenerBakedReflections(bool baked);
     // Audio.2A autoplay, after every OnStart: starts each registered source that is enabled, set to autoplay, not
     // already playing, and not stopped by a script during startup. Each event is placed at its object before it
     // starts; missing events and pose-less objects are skipped with a warning.
@@ -105,6 +110,8 @@ public:
     // M4: replaces this session's acoustic scene. Without snapshot synchronization there is no geometry simulation: geometry
     // is not sent, and when objects asked for it a warning says so. Project settings are never changed. End clears it.
     void PublishAcousticScene(std::vector<AcousticObject> objects);
+    // M7: held until End, which releases it. Nothing consumes it until M8.
+    void LoadProbeBatch(const std::string& objectName, std::span<const std::byte> batch, std::size_t probes);
     // M4, once per gameplay frame: a moved object is sent to the worker only when its transform really changed. Null removes it
     // (the object left the running scene).
     using AcousticTransformResolver = std::function<std::optional<Audio::AcousticTransform>(std::string_view objectID)>;
@@ -203,7 +210,7 @@ private:
     bool StartSource(SourceState& source);
     // Creates, places and starts one event; shared by script and component playback.
     std::optional<Audio::EventHandle> StartPlaced(const Audio::Guid& guid, const std::optional<ObjectPose>& pose,
-        const std::string& context);
+        const std::string& context, bool sourceCentricReflections = false);
     void StopAndRelease(std::size_t index);
     void CheckSpatialization(OwnedEvent& event);
     bool ChangeMixerValue(MixerTarget target, std::string_view name, float value);

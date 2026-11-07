@@ -258,6 +258,8 @@ public:
     // expected-value and whole-scene checks as SetObjectScript. Event instances belong to gameplay, never here.
     bool SetObjectAcoustics(const SceneObjectMetadata& selection, const std::optional<AcousticSettings>& expected,
         const std::optional<AcousticSettings>& replacement, std::string* errorMessage = nullptr);
+    bool SetObjectProbeVolume(const SceneObjectMetadata& selection, const std::optional<ProbeVolumeComponent>& expected,
+        const std::optional<ProbeVolumeComponent>& replacement, std::string* errorMessage = nullptr);
     bool SetObjectAudio(const SceneObjectMetadata& selection, const AudioComponentState& expected,
         const AudioComponentState& replacement, std::string* errorMessage = nullptr);
     bool SetObjectCharacterController(const SceneObjectMetadata& selection,

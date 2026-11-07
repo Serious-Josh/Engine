@@ -70,6 +70,9 @@ struct SceneObjectDocument
     // Inherent acoustic settings of a mesh object; absent means disabled. Persisted from schema 18 / cooked payload 19.
     std::optional<AcousticSettings> acoustics;
 
+    // M7: a volume of acoustic probes. Persisted from cooked payload 21; the optional field needs no new scene schema.
+    std::optional<ProbeVolumeComponent> probeVolume;
+
     // Empty means root; otherwise the exact ID of another object in this scene. Persisted from
     // schema 9 / cooked payload 9; historical versions load every object as a root.
     std::string parentID;

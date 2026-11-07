@@ -16,10 +16,11 @@
 //
 // Thread ownership under Snapshot:
 //
-// * Main thread: FMOD. Applies lifecycle changes, reads poses, hands the worker immutable frames, destroys SnapshotSources.
+// * Main thread: FMOD. Applies lifecycle changes, reads poses, hands the worker immutable frames, destroys SnapshotSources
+//   and releases the private sources the worker has handed back.
 // * Studio thread: PLUGIN_CREATED and PLUGIN_DESTROYED. Creates and binds SnapshotSources, and reports to the main thread.
-// * Worker: between thread start and join it alone calls the simulator and private sources, and writes the channels. It
-//   never calls FMOD.
+// * Worker: between thread start and join it alone calls the simulator and the private sources it holds, and writes the
+//   channels. A private source leaves it only after being removed and committed out. It never calls FMOD.
 // * Mixer: SnapshotSource::getOutputs only. It takes no lock and never waits for anyone.
 //
 // M4 acoustic scene (Snapshot only; never under the DSP lock): the worker owns the Steam Audio root scene, one sub-scene per
@@ -28,6 +29,22 @@
 //
 // m_mutex guards handoffs only. It is never held across FMOD, simulation or join; under DspLock the order is lockDSP, then
 // m_mutex, because the Studio thread may create real sources.
+//
+// M7 probe batches are not the simulator's: AudioSystem holds them, and only M8 may hand them to iplSimulatorAddProbeBatch.
+//
+// M6.4 reflection infrastructure (Snapshot only, verification sessions only; off in production). A second worker runs
+// iplSimulatorRunReflections on its own cadence and never publishes to the plugin. m_simulatorGate is what makes that safe:
+// the direct worker holds it exclusively around every commit and every scene or source change, and the reflection worker
+// shares it across its run. RunDirect takes no gate: only its own thread changes the simulator, and the SDK allows direct and
+// reflection runs to overlap. Lock order: m_simulatorGate, then m_mutex. Neither is ever taken by the mixer, the Studio thread
+// or the main thread, and no thread waits for the gate while holding m_mutex, so shutdown can join both workers.
+//
+// Direct-first scheduling: std::shared_mutex does not hold new readers back for a waiting writer, so the gate alone can let
+// consecutive reflection runs delay a change (section 25). So the direct worker only tries the gate: if a run holds it, the
+// worker keeps its changes, still simulates and publishes on the current scene, and retries. Meanwhile its request stops a
+// new run from starting, and a run in progress is never interrupted, so a change waits for at most that one run. Overdue
+// reflection frames are replaced, never queued. If direct work never lets up, one run is let through per
+// ReflectionStarvationLimit, and the limit keeps those from being consecutive.
 
 #include "Audio/AudioSystem.h"
 #include "Audio/SteamAudioRuntime.h"
@@ -40,7 +57,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <atomic>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -81,6 +100,21 @@ public:
     std::vector<SteamAudioSourceSnapshot> GetSnapshots() const;
     void SetTestControls(const SteamAudioSimulationTestControls& controls);
     void* GetWorkerThreadForTesting() noexcept;
+    void* GetReverbGroupForTesting() noexcept;
+
+    // M6.7, main thread, before any bank: binds the reverb source. The DSP and the sends are authored; see section 28.
+    void StartEnvironmentalReverb() noexcept;
+
+    // Production route, main thread. See AudioSystem and section 29.
+    void BeginReflectionSession() noexcept;
+    void EndReflectionSession() noexcept;
+    void ReleaseReflectionReturn() noexcept;
+    void SetListenerReflectionsWithheld(bool withheld) noexcept;
+    bool SetSourceCentricRequest(FMOD::Studio::EventInstance& instance, bool enabled);
+    // An empty return passes what it receives, which would double any event's fixed send. So the return bus stays muted whenever the route
+    // was asked for and its effects are not installed. It costs no event its direct sound or any other send.
+    void MuteReturnUntilInstalled() noexcept;
+    void SetReflectionBounces(int bounces) noexcept;
 
     bool IsAcousticSimulationAvailable() const noexcept
     {
@@ -112,6 +146,8 @@ private:
         SnapshotSource* snapshot = nullptr;
         // DspLock only: the real source the DSP is bound to.
         IPLSource realSource = nullptr;
+        // Authored with Apply Reflections, in a session with reflections.
+        bool reflectionConsumer = false;
     };
 
     // Main-thread record of a bound source.
@@ -122,14 +158,37 @@ private:
         SnapshotSource* snapshot = nullptr;
         IPLSource realSource = nullptr;
         IPLCoordinateSpace3 pose{};
+        bool reflectionConsumer = false;
+        // M6.7.
+        bool hasReverbSend = false;
+        float reverbSendLevel = 0.0f;
+        float reverbSendTarget = 0.0f;
+        bool sendOpened = false;
+        bool sendSearchReported = false;
+        bool slotAssigned = false;
+        bool slotDenied = false;
     };
 
-    // Main-thread record of a SnapshotSource on its way out: destroyed when the worker has let go and the plugin has.
+    // Main-thread record of a source on its way out. Stage A: the worker removes the private source from the simulator,
+    // commits, and hands it here (workerDone). Stage B: once the plugin has also let go of the snapshot, the private source
+    // is released and the snapshot destroyed. Anything the plugin reaches through a snapshot therefore outlives the plugin.
     struct RetiringSource
     {
         SnapshotSource* snapshot = nullptr;
         SourceId id = 0;
         bool workerDone = false;
+        // Null when private creation failed or was never reached. Out of the simulator; owned here from workerDone on.
+        IPLSource privateSource = nullptr;
+        // M6.7: a slot given after creation is a second source, because a source's flags are fixed when it is made.
+        IPLSource privateReflectionSource = nullptr;
+    };
+
+    // The worker's acknowledgement of Stage A, sent only after the commit that took the source out of the run list.
+    struct RemovedPrivateSource
+    {
+        SourceId id = 0;
+        IPLSource realSource = nullptr;
+        IPLSource reflectionSource = nullptr;
     };
 
     // Worker's request to change its sources or scene.
@@ -142,12 +201,14 @@ private:
             SetScene,
             SetAcousticObject,
             RemoveAcousticObject,
-            ClearAcousticScene
+            ClearAcousticScene,
+            AddReverbSource
         };
 
         Kind kind = Kind::AddSource;
         SourceId id = 0;
         SnapshotSource* snapshot = nullptr;
+        bool reflectionConsumer = false;
         void* scene = nullptr;
         std::shared_ptr<const AcousticMeshData> mesh;
         AcousticTransform world{};
@@ -183,6 +244,7 @@ private:
         IPLCoordinateSpace3 listener{};
         std::vector<FramePose> poses;
         SteamAudioSimulationTestControls controls;
+        std::chrono::steady_clock::time_point postedAt{};
     };
 
     // Worker-owned, between thread start and join.
@@ -192,6 +254,10 @@ private:
         // Null when creation failed: the snapshot then stays at its last, neutral value.
         IPLSource realSource = nullptr;
         IPLCoordinateSpace3 pose{};
+        // Null unless given a slot after creation; then the reflection worker uses this, and realSource stays direct only.
+        IPLSource reflectionSource = nullptr;
+        // Changes only with the simulator gate held exclusively.
+        bool reflectionCapable = false;
     };
 
     struct PublishedRecord
@@ -215,8 +281,15 @@ private:
     void SimulateUnderLock() noexcept;
 
     void WorkerMain() noexcept;
-    void ApplyWorkerCommands(const std::vector<WorkerCommand>& commands, std::vector<SourceId>& removed) noexcept;
+    void ApplyWorkerCommands(const std::vector<WorkerCommand>& commands, std::vector<RemovedPrivateSource>& removed) noexcept;
+    // Requires m_mutex, or that the worker has been joined.
+    void AcceptWorkerRemovals() noexcept;
     void SimulateAndPublish(const InputFrame& frame) noexcept;
+    bool ReflectionDimensionsMatch(const IPLSimulationSettings& settings) const noexcept;
+    void StartReflectionInfrastructure(const IPLSimulationSettings& settings, const SteamAudioOptions& options);
+    void ReflectionWorkerMain() noexcept;
+    // False when it gave way to direct work without running.
+    bool RunReflections(const InputFrame& frame, bool yieldToDirect) noexcept;
     // Chooses the session's ray tracer, once, before the simulator exists. Any failure leaves the default one.
     void SelectRayTracer(const SteamAudioOptions& options, bool geometryAllowed);
     void ReleaseEmbree() noexcept;
@@ -255,9 +328,11 @@ private:
     bool m_workerStop = false;
     InputFrame m_pendingFrame;
     std::vector<WorkerCommand> m_pendingCommands;
-    std::vector<SourceId> m_workerRemoved;
+    std::vector<RemovedPrivateSource> m_workerRemoved;
     std::unordered_map<SourceId, AcousticTransform> m_pendingAcousticTransforms;
     std::uint64_t m_completedTicket = 0;
+    std::condition_variable m_reflectionWake;
+    InputFrame m_pendingReflectionFrame;
     std::unordered_map<SourceId, PublishedRecord> m_published;
     bool m_diagnosticsWanted = false;
 
@@ -272,10 +347,70 @@ private:
     std::vector<FramePose> m_framePoses;
     std::unordered_set<SourceId> m_acousticObjectIds;
     std::thread m_worker;
+    std::thread m_reflectionWorker;
+    std::chrono::steady_clock::time_point m_nextReflectionFrame{};
+    // Reflection worker only.
+    std::chrono::steady_clock::time_point m_lastReflectionStart{};
+    void ServeReflectionSlots(bool& commit) noexcept;
+    void ApplySlotReports() noexcept;
+    void RampReverbSends() noexcept;
+    bool m_reflectionRoutingRequested = false;
+    std::atomic<int> m_reflectionBounces{8};
+    bool m_warnedSourceCentricWithoutSend = false;
+    bool m_capacityReported = false;
+
+    // M6.7. The SnapshotSource belongs to the main thread; the real source to the worker until it is joined.
+    bool m_reverbWanted = false;
+    SteamAudioReverbRoutingForTesting m_reverbRouting = SteamAudioReverbRoutingForTesting::Exclusive;
+    SnapshotSource* m_reverbSnapshot = nullptr;
+    IPLSource m_reverbRealSource = nullptr;
+    // Worker only: authored consumers waiting for a reflection slot, oldest first, each with whether fallback was reported.
+    std::vector<std::pair<SourceId, bool>> m_slotQueue;
+    // Worker to main thread, under m_mutex: true for a slot given, false for no slot free.
+    std::vector<std::pair<SourceId, bool>> m_slotReports;
+    std::chrono::steady_clock::time_point m_lastReverbRamp{};
+    bool m_reverbGroupLocked = false;
+    bool m_holdReverbReturn = false;
+
+    // Production route. The DSPs live until shutdown: releasing a Reverb clears the plugin's global source from an FMOD thread that FMOD's DSP lock
+    // does not exclude, so Engine never does that while a source is bound and in use. The group and lock last one gameplay session.
+    bool m_productionRouting = false;
+    FMOD::Studio::Bus* m_returnBus = nullptr;
+    FMOD::ChannelGroup* m_returnGroup = nullptr;
+    FMOD::DSP* m_returnReverb = nullptr;
+    FMOD::DSP* m_returnMixer = nullptr;
+    // Installed means sends may open: either Engine's DSPs are on the group, or the banks authored their own.
+    bool m_returnInstalled = false;
+    bool m_returnDspsAdded = false;
+    bool m_bindingLossReported = false;
+    // Under m_mutex: read on the Studio thread as a spatializer is created. Instances that asked; forgotten when the pointer is attached again.
+    std::vector<const FMOD::Studio::EventInstance*> m_sourceCentricRequests;
+
+    // Set by Start before any bank, then read-only until Shutdown.
+    bool m_reflectionsActive = false;
+    bool m_assumeReflectionConsumers = false;
+    bool m_withholdReflectionIr = false;
+    // Main thread: geometry has existed, so reflection runs continue through an empty scene and its IRs fall to silence.
+    bool m_reflectionSceneUsed = false;
+    // The SDK decides whether to restart accumulation by comparing scene version numbers only, and a replaced root restarts its
+    // numbering, so the old room's energy could survive. A listener change also restarts it: set under the exclusive gate
+    // when the root is replaced, and taken by the next reflection run.
+    std::atomic<bool> m_reflectionAccumulationStale{false};
+    IPLSimulationSettings m_reflectionSettings{};
+
+    // Exclusive around simulator and scene changes, shared across a reflection run. See the lock order above.
+    std::shared_mutex m_simulatorGate;
+    // The direct worker is at, or about to reach, the gate. Lets the reflection worker give way before taking it.
+    std::atomic<int> m_directGateRequests{0};
+    // Guarded by m_mutex. Verification only: the direct worker blocks at the gate, as with the gate alone.
+    bool m_blockAtGateForTesting = false;
 
     // Worker only, between thread start and join.
+    // Changed only with m_simulatorGate held exclusively, so the reflection worker may look entries up while sharing it.
     std::unordered_map<SourceId, PrivateSource> m_privateSources;
+    std::size_t m_reflectionSourceCount = 0;
     std::uint32_t m_generation = 0;
+    // Written with m_simulatorGate held exclusively; the reflection worker reads it while sharing the gate.
     IPLScene m_acousticRoot = nullptr;
     // Worker: removed instances, held until the root that contains them is gone (see RebuildEmbreeRoot).
     std::vector<IPLInstancedMesh> m_retiredEmbreeInstances;

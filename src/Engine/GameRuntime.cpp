@@ -1,3 +1,4 @@
+#include "Engine/ProbeVolumes.h"
 #include "Engine/GameRuntime.h"
 #include "Engine/AcousticGeometry.h"
 
@@ -514,8 +515,16 @@ void GameRuntime::PublishAcousticScene(FileSceneRuntime& runtime)
         const auto found = mapping.find(object.id);
         const RenderObject* renderObject = found != mapping.end() && found->second < renderObjects.size() ?
             &renderObjects[found->second] : nullptr;
-        const ImportedMesh* geometry = renderObject && renderObject->mesh && m_acousticAssets.meshGeometry ?
-            m_acousticAssets.meshGeometry(*renderObject->mesh) : nullptr;
+        const ImportedMesh* geometry = nullptr;
+
+        if(m_acousticAssets.meshGeometryByReference)
+        {
+            geometry = m_acousticAssets.meshGeometryByReference(object.meshReference);
+        }
+        else if(renderObject && renderObject->mesh && m_acousticAssets.meshGeometry)
+        {
+            geometry = m_acousticAssets.meshGeometry(*renderObject->mesh);
+        }
 
         if(!geometry || !m_acousticAssets.material)
         {
@@ -561,11 +570,75 @@ void GameRuntime::PublishAcousticScene(FileSceneRuntime& runtime)
     m_audio.PublishAcousticScene(std::move(published));
 }
 
+// M7: stale probes are refused rather than loaded, so what M8 consumes always describes the scene that is playing.
+void GameRuntime::LoadProbeVolumes(FileSceneRuntime& runtime)
+{
+    const SceneDocument& document = runtime.GetFileScene().GetDocument();
+    const auto& mapping = runtime.GetObjectMapping().idToRuntimeIndex;
+    const auto& renderObjects = runtime.GetScene().GetRenderObjects();
+
+    ProbeVolumes::SceneAccess access;
+    access.world = [&](const SceneObjectDocument& object) -> std::optional<Audio::AcousticTransform>
+    {
+        const auto found = mapping.find(object.id);
+
+        if(found == mapping.end() || found->second >= renderObjects.size())
+        {
+            return std::nullopt;
+        }
+
+        return ToAcousticTransform(renderObjects[found->second].GetPresentationTransform().currentModel);
+    };
+    access.mesh = [&](const SceneObjectDocument& object) -> const ImportedMesh*
+    {
+        if(m_acousticAssets.meshGeometryByReference)
+        {
+            return m_acousticAssets.meshGeometryByReference(object.meshReference);
+        }
+
+        const auto found = mapping.find(object.id);
+        const bool hasMesh = found != mapping.end() && found->second < renderObjects.size() && renderObjects[found->second].mesh;
+        return hasMesh && m_acousticAssets.meshGeometry ? m_acousticAssets.meshGeometry(*renderObjects[found->second].mesh) : nullptr;
+    };
+
+    for(const SceneObjectDocument& object : document.objects)
+    {
+        if(!object.probeVolume || !object.probeVolume->enabled)
+        {
+            continue;
+        }
+
+        if(object.probeVolume->probeBatch.empty() || !m_acousticAssets.probeBatch)
+        {
+            Log::Warning("Probe Volume '" + object.name + "' has no generated probes.");
+            continue;
+        }
+
+        std::string error;
+        const auto stored = m_acousticAssets.probeBatch(object.probeVolume->probeBatch, &error);
+
+        if(!stored)
+        {
+            Log::Warning("Probe Volume '" + object.name + "': " + error + ".");
+            continue;
+        }
+
+        if(stored->fingerprint != ProbeVolumes::Fingerprint(document, object, access))
+        {
+            Log::Warning("Probe Volume '" + object.name + "' is stale: regenerate it. Its probes were not loaded.");
+            continue;
+        }
+
+        m_audio.LoadProbeBatch(object.name, stored->batch, stored->probes.size());
+    }
+}
+
 void GameRuntime::BeginSceneAudio(FileSceneRuntime& runtime)
 {
     std::vector<GameAudioSession::SceneSource> sources;
     std::size_t listeners = 0;
     std::string listenerName;
+    bool listenerBaked = false;
     m_listenerObjectID.clear();
 
     for(const auto& object : runtime.GetFileScene().GetDocument().objects)
@@ -575,12 +648,14 @@ void GameRuntime::BeginSceneAudio(FileSceneRuntime& runtime)
         {
             m_listenerObjectID = object.id;
             listenerName = object.name;
+            listenerBaked = object.audioListener->bakedReflections;
         }
 
         if(object.audioSource)
         {
             const auto& source = *object.audioSource;
-            sources.push_back({object.id, object.name, source.eventGuid, source.enabled, source.autoplay});
+            sources.push_back({object.id, object.name, source.eventGuid, source.enabled, source.autoplay, source.sourceCentricReflections,
+                source.bakedReflections});
         }
     }
 
@@ -596,7 +671,9 @@ void GameRuntime::BeginSceneAudio(FileSceneRuntime& runtime)
         return ResolveAudioPose(runtime, objectID);
     });
     m_audio.RegisterSceneSources(std::move(sources));
+    m_audio.SetListenerBakedReflections(listenerBaked);
     PublishAcousticScene(runtime);
+    LoadProbeVolumes(runtime);
     // The listener is placed before any script code, so events scripts start in OnStart are heard from it.
     UpdateSceneAudio(runtime, 0.0);
 }

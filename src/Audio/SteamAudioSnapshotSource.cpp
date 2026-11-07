@@ -241,11 +241,30 @@ void SnapshotSource::setInputs(IPLSimulationFlags, IPLSimulationInputs*)
     m_anomalies.fetch_add(1, std::memory_order_relaxed);
 }
 
-// FMOD's mixer thread. Two atomic operations and a copy: no loop, wait, allocation or free.
+// FMOD's mixer thread. A few atomic operations and a copy: no loop, wait, allocation or free.
 void SnapshotSource::getOutputs(IPLSimulationFlags flags, IPLSimulationOutputs* outputs)
 {
-    // Reflections and pathing stay as the plugin zeroed them. Their branches need gIsSimulationSettingsValid, which only
-    // iplFMODSetSimulationSettings sets; Engine never calls it. M6 must revisit this.
+    // Pointer and sizes only: convolution reads the IR through Steam Audio's own triple buffer. Without a published IR, and for
+    // pathing, the outputs stay as the plugin zeroed them. The plugin overwrites type and sizes from its settings anyway; these
+    // were checked against those at start.
+    if((flags & IPL_SIMULATIONFLAGS_REFLECTIONS) != 0)
+    {
+        const IPLReflectionEffectIR ir = m_ir.load(std::memory_order_acquire);
+
+        if(ir && !m_irWithheld.load(std::memory_order_relaxed))
+        {
+            outputs->reflections.ir = ir;
+            outputs->reflections.numChannels = m_irChannels;
+            outputs->reflections.irSize = m_irSamples;
+            m_irReads.fetch_add(1, std::memory_order_relaxed);
+
+            if(m_irReleased.load(std::memory_order_relaxed))
+            {
+                m_anomalies.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    }
+
     if((flags & IPL_SIMULATIONFLAGS_DIRECT) == 0)
     {
         return;

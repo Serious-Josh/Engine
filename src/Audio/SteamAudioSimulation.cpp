@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <system_error>
 #include <utility>
 
@@ -19,6 +20,33 @@ namespace
 
     // The simulator's occlusion sample limit; only used once simulation has a scene.
     constexpr int MaximumOcclusionSamples = 16;
+
+    // M6.4: how often reflections simulate. Reflections change slowly and cost far more than direct simulation.
+    constexpr std::chrono::milliseconds ReflectionInterval{150};
+
+    // Direct work takes priority, but continual scene changes must not stop reflections for good.
+    constexpr std::chrono::milliseconds ReflectionStarvationLimit{1000};
+
+    // How often a deferred reflection frame looks again; a newer frame may have replaced it by then.
+    constexpr std::chrono::milliseconds ReflectionDeferralPoll{5};
+
+    // The settings M6.2 validated against the pinned plugin. Capacity is the SDK's maxNumSources, reported when exceeded.
+    constexpr IPLReflectionEffectType ReflectionType = IPL_REFLECTIONEFFECTTYPE_CONVOLUTION;
+    constexpr int ReflectionMaxRays = 4096;
+    constexpr int ReflectionDiffuseSamples = 32;
+    constexpr int ReflectionBounces = 8;
+    constexpr float ReflectionMaxDuration = SteamAudioReflectionMaxDuration;
+    constexpr int ReflectionMaxOrder = SteamAudioReflectionMaxOrder;
+    constexpr int ReflectionMaxSources = 16;
+    // M6.7: the local parameter an event authors to be able to use the reverb. 0 silent, 1 full.
+    constexpr const char* ReverbSendParameter = "SteamAudioReverbSend";
+    constexpr const char* ReflectionReturnBus = "bus:/SteamAudioReverb";
+    // Steam Audio's own pool for tracing rays; the reflection worker only waits for it. Embree's device has a separate pool
+    // for scene builds, which this does not change.
+    constexpr int ReflectionThreads = 2;
+
+    // Enough for the SDK to see a listener change, far too little to hear: restarts accumulation after a root is replaced.
+    constexpr float AccumulationResetOffset = 0.001f;
 
     using Clock = std::chrono::steady_clock;
 
@@ -240,10 +268,74 @@ void SteamAudioSimulation::Start(const SteamAudioOptions& options)
     settings.samplingRate = m_runtime.GetSampleRate();
     settings.frameSize = m_runtime.GetBlockLength();
 
+    // Off in production: nothing about reflections exists, in the simulator or the plugin, unless a verification session asks.
+    bool routingWanted = options.reflectionRouting;
+    m_reflectionRoutingRequested = options.reflectionRouting;
+    m_reflectionBounces.store(options.reflectionBounces, std::memory_order_relaxed);
+
+    if(routingWanted)
+    {
+        // Only stereo has been validated: other layouts crash (mono) or give unverified wet levels (5.1, 7.1). One condition, so wider support is one
+        // change once it is validated. Direct audio is unaffected.
+        int sampleRate = 0;
+        int rawSpeakers = 0;
+        FMOD_SPEAKERMODE speakerMode = FMOD_SPEAKERMODE_DEFAULT;
+
+        if(m_core.getSoftwareFormat(&sampleRate, &speakerMode, &rawSpeakers) != FMOD_OK || speakerMode != FMOD_SPEAKERMODE_STEREO)
+        {
+            routingWanted = false;
+            m_stats.reflectionInfrastructureDetail = "reflections support only a stereo mixer";
+            Log::Warning("Audio: Steam Audio reflections are unavailable: the mixer is not stereo. Direct audio continues.");
+        }
+    }
+
+    bool reflectionsWanted = routingWanted || options.reflectionInfrastructureForTesting || options.environmentalReverbForTesting;
+
+    if(reflectionsWanted && !startWorker)
+    {
+        reflectionsWanted = false;
+        routingWanted = false;
+        m_stats.reflectionInfrastructureDetail = "reflections need the snapshot path";
+
+        if(options.reflectionRouting)
+        {
+            Log::Warning("Audio: Steam Audio reflections are unavailable: they need the snapshot path. Direct audio continues.");
+        }
+    }
+
+    m_productionRouting = routingWanted;
+
+    const IPLSimulationSettings directSettings = settings;
+
+    if(reflectionsWanted)
+    {
+        settings.flags = static_cast<IPLSimulationFlags>(IPL_SIMULATIONFLAGS_DIRECT | IPL_SIMULATIONFLAGS_REFLECTIONS);
+        settings.reflectionType = ReflectionType;
+        settings.maxNumRays = ReflectionMaxRays;
+        settings.numDiffuseSamples = ReflectionDiffuseSamples;
+        settings.maxDuration = ReflectionMaxDuration;
+        settings.maxOrder = ReflectionMaxOrder;
+        // One more for reverb. Events still get ReflectionMaxSources.
+        settings.maxNumSources = ReflectionMaxSources + (options.environmentalReverbForTesting || m_productionRouting ? 1 : 0);
+        settings.numThreads = ReflectionThreads;
+    }
+
     IPLerror status = IPL_STATUS_FAILURE;
 
     if(options.injectedFailure != SteamAudioInjectedFailure::SimulatorCreation)
     {
+        status = iplSimulatorCreate(m_runtime.GetContext(), &settings, &m_simulator);
+    }
+
+    if(reflectionsWanted && status == IPL_STATUS_SUCCESS &&
+        (options.injectedFailure == SteamAudioInjectedFailure::ReflectionCompatibility || !ReflectionDimensionsMatch(settings)))
+    {
+        // Never run on with disagreeing buffer sizes: direct simulation carries on with a simulator that has no reflections.
+        reflectionsWanted = false;
+        m_productionRouting = false;
+        m_stats.reflectionInfrastructureDetail = "simulator and plugin reflection dimensions disagree";
+        iplSimulatorRelease(&m_simulator);
+        settings = directSettings;
         status = iplSimulatorCreate(m_runtime.GetContext(), &settings, &m_simulator);
     }
 
@@ -286,6 +378,16 @@ void SteamAudioSimulation::Start(const SteamAudioOptions& options)
 
     m_stats.synchronization = m_synchronization;
 
+    if(reflectionsWanted && m_synchronization == SteamAudioSynchronization::Snapshot)
+    {
+        StartReflectionInfrastructure(settings, options);
+    }
+
+    if(options.reflectionInfrastructureForTesting && !m_reflectionsActive)
+    {
+        Log::Warning("Audio: Steam Audio reflection infrastructure stays off: " + m_stats.reflectionInfrastructureDetail + ".");
+    }
+
     if(m_synchronization == SteamAudioSynchronization::Snapshot)
     {
         Log::Info("Audio: Steam Audio simulation uses snapshots; " + m_stats.synchronizationDetail + ".");
@@ -294,6 +396,79 @@ void SteamAudioSimulation::Start(const SteamAudioOptions& options)
     {
         Log::Warning("Audio: Steam Audio simulation falls back to the DSP lock: " + m_stats.synchronizationDetail + ".");
     }
+}
+
+// What the plugin would compute for its convolution effect, against what a real source of this simulator reports. A throwaway
+// source, never added to the simulator.
+bool SteamAudioSimulation::ReflectionDimensionsMatch(const IPLSimulationSettings& settings) const noexcept
+{
+    IPLSourceSettings sourceSettings{};
+    sourceSettings.flags = IPL_SIMULATIONFLAGS_REFLECTIONS;
+    IPLSource source = nullptr;
+
+    if(iplSourceCreate(m_simulator, &sourceSettings, &source) != IPL_STATUS_SUCCESS)
+    {
+        return false;
+    }
+
+    IPLSimulationOutputs outputs{};
+    iplSourceGetOutputs(source, IPL_SIMULATIONFLAGS_REFLECTIONS, &outputs);
+    iplSourceRelease(&source);
+
+    const int channels = (settings.maxOrder + 1) * (settings.maxOrder + 1);
+    const int samples = static_cast<int>(std::ceil(settings.maxDuration * static_cast<float>(settings.samplingRate)));
+    return outputs.reflections.numChannels == channels && outputs.reflections.irSize == samples &&
+        settings.samplingRate == m_runtime.GetSampleRate() && settings.frameSize == m_runtime.GetBlockLength();
+}
+
+// Before any bank, so before any DSP. The plugin call comes last and cannot fail after it: once made it holds until Terminate.
+void SteamAudioSimulation::StartReflectionInfrastructure(const IPLSimulationSettings& settings, const SteamAudioOptions& options)
+{
+    m_assumeReflectionConsumers = options.assumeReflectionConsumersForTesting;
+    m_withholdReflectionIr = options.withholdReflectionIrForTesting;
+
+    try
+    {
+        if(options.injectedFailure == SteamAudioInjectedFailure::ReflectionWorkerStart)
+        {
+            throw std::system_error(std::make_error_code(std::errc::resource_unavailable_try_again));
+        }
+
+        m_reflectionWorker = std::thread(&SteamAudioSimulation::ReflectionWorkerMain, this);
+    }
+    catch(const std::system_error& error)
+    {
+        m_stats.reflectionInfrastructureDetail = std::string("the reflection worker could not start: ") + error.what();
+        return;
+    }
+
+    if(!m_runtime.SetPluginSimulationSettings(settings))
+    {
+        m_productionRouting = false;
+        // The worker idles until shutdown: no frame is posted while reflections are inactive.
+        m_stats.reflectionInfrastructureDetail = "the plugin has no iplFMODSetSimulationSettings";
+        return;
+    }
+
+    m_reflectionSettings = settings;
+    m_reflectionsActive = true;
+    m_stats.reflectionInfrastructureActive = true;
+    m_stats.reflectionSourceCapacity = ReflectionMaxSources;
+    m_reverbWanted = options.environmentalReverbForTesting || m_productionRouting;
+    m_reverbRouting = m_productionRouting ? SteamAudioReverbRoutingForTesting::Combined : options.reverbRoutingForTesting;
+    m_holdReverbReturn = options.holdReverbReturnForTesting;
+
+    if(m_productionRouting)
+    {
+        m_stats.reflectionRoutingActive = true;
+        m_stats.reflectionInfrastructureDetail = "listener-centric reverb, with source-centric reflections on request";
+        Log::Info("Audio: Steam Audio reflections are active.");
+        return;
+    }
+
+    m_stats.reflectionInfrastructureDetail = m_withholdReflectionIr ? "verification session; the plugin gets a null IR" :
+        "verification session; events authored with Apply Reflections are audible";
+    Log::Warning("Audio: Steam Audio reflection infrastructure is active for verification.");
 }
 
 void SteamAudioSimulation::SelectRayTracer(const SteamAudioOptions& options, bool geometryAllowed)
@@ -404,8 +579,18 @@ void SteamAudioSimulation::Shutdown() noexcept
 
     try
     {
+        if(m_stats.reflectionRoutingActive)
+        {
+            Log::Info("Audio: Steam Audio reflections stopped; " + std::to_string(m_stats.reflectionSessions) + " sessions, " +
+                std::to_string(m_stats.reverbSends) + " sends opened, reverb IR reads " + std::to_string(m_stats.reverbIrReads) +
+                ", source-centric IR reads " + std::to_string(m_stats.reflectionIrReads - m_stats.reverbIrReads) + ", denied " + std::to_string(m_stats.sourceCentricDenied) +
+                ", binding lost " + std::to_string(m_stats.reverbBindingLost) + ".");
+        }
+
         Log::Info("Audio: Steam Audio simulation stopped; " + std::to_string(m_stats.sourcesCreated) +
-            " sources created, " + std::to_string(m_stats.sourcesDestroyed) + " destroyed.");
+            " sources created, " + std::to_string(m_stats.sourcesDestroyed) + " destroyed; private: " +
+            std::to_string(m_stats.privateSourcesCreated) + " created, " + std::to_string(m_stats.privateSourcesRemoved) +
+            " removed, " + std::to_string(m_stats.privateSourcesReleased) + " released.");
 
         if(m_stats.quarantinedSources > 0)
         {
@@ -417,6 +602,504 @@ void SteamAudioSimulation::Shutdown() noexcept
     {
         // Logging allocation failure only.
     }
+}
+
+void SteamAudioSimulation::StartEnvironmentalReverb() noexcept
+{
+    if(!m_reverbWanted || !m_reflectionsActive)
+    {
+        m_reverbWanted = false;
+        return;
+    }
+
+    auto* const snapshot = new(std::nothrow) SnapshotSource();
+
+    if(!snapshot || !m_runtime.SetPluginReverbSource(snapshot->AsIPLSource()))
+    {
+        delete snapshot;
+        m_reverbWanted = false;
+        Log::Warning("Audio: the Steam Audio plugin has no reverb source call; reverb stays off.");
+        return;
+    }
+
+    m_reverbSnapshot = snapshot;
+
+    {
+        const std::lock_guard lock(m_mutex);
+        WorkerCommand command;
+        command.kind = WorkerCommand::Kind::AddReverbSource;
+        command.snapshot = snapshot;
+        m_pendingCommands.push_back(std::move(command));
+        m_stats.environmentalReverbActive = true;
+        ++m_stats.sourcesCreated;
+    }
+
+    m_workerWake.notify_one();
+
+    if(!m_productionRouting)
+    {
+        Log::Warning("Audio: Steam Audio environmental reverb is active for verification.");
+    }
+}
+
+namespace
+{
+    bool GroupHoldsEffect(FMOD::ChannelGroup& group, std::string_view effect)
+    {
+        int count = 0;
+        group.getNumDSPs(&count);
+
+        for(int index = 0; index < count; ++index)
+        {
+            FMOD::DSP* dsp = nullptr;
+            char name[64]{};
+
+            if(group.getDSP(index, &dsp) == FMOD_OK && dsp->getInfo(name, nullptr, nullptr, nullptr) == FMOD_OK && effect == name)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    // The values the validated listening banks authored. From Final Out: the Mixer Return adds its input to its output and assumes they match.
+    void ConfigureReturnEffect(FMOD::DSP& dsp)
+    {
+        int count = 0;
+        dsp.getNumParameters(&count);
+
+        for(int index = 0; index < count; ++index)
+        {
+            FMOD_DSP_PARAMETER_DESC* description = nullptr;
+
+            if(dsp.getParameterInfo(index, &description) != FMOD_OK)
+            {
+                continue;
+            }
+
+            if(std::string_view(description->name) == "OutputFormat")
+            {
+                dsp.setParameterInt(index, 1);
+            }
+            else if(std::string_view(description->name) == "Binaural")
+            {
+                dsp.setParameterBool(index, true);
+            }
+        }
+    }
+}
+
+// The bus is locked first: an idle return has no channel group, and FMOD frees it, and any effect on it, when nothing feeds it.
+void SteamAudioSimulation::BeginReflectionSession() noexcept
+{
+    if(!m_productionRouting || m_returnBus)
+    {
+        return;
+    }
+
+    {
+        const std::lock_guard lock(m_mutex);
+        ++m_stats.reflectionSessions;
+    }
+
+    FMOD::Studio::Bus* bus = nullptr;
+
+    if(m_studio.getBus(ReflectionReturnBus, &bus) != FMOD_OK)
+    {
+        Log::Warning("Audio: the banks have no bus:/SteamAudioReverb; Steam Audio reflections are silent and direct audio continues.");
+        return;
+    }
+
+    if(bus->lockChannelGroup() != FMOD_OK)
+    {
+        Log::Warning("Audio: the Steam Audio reflection return cannot be held; reflections are silent and direct audio continues.");
+        return;
+    }
+
+    m_returnBus = bus;
+    m_studio.flushCommands();
+
+    if(m_returnBus->getChannelGroup(&m_returnGroup) != FMOD_OK)
+    {
+        Log::Warning("Audio: the Steam Audio reflection return has no channel group; reflections are silent and direct audio continues.");
+        EndReflectionSession();
+        return;
+    }
+
+    // Banks that author these effects, as the listening fixtures do, keep them: a second set would process twice.
+    const bool authored = GroupHoldsEffect(*m_returnGroup, "Steam Audio Reverb") || GroupHoldsEffect(*m_returnGroup, "Steam Audio Mixer Return");
+
+    if(!authored)
+    {
+        if(!m_returnReverb)
+        {
+            m_returnReverb = m_runtime.CreateEffectByName(m_core, "Steam Audio Reverb");
+        }
+
+        if(!m_returnMixer)
+        {
+            m_returnMixer = m_runtime.CreateEffectByName(m_core, "Steam Audio Mixer Return");
+        }
+
+        if(!m_returnReverb || !m_returnMixer)
+        {
+            Log::Warning("Audio: the Steam Audio return effects cannot be created; reflections are silent and direct audio continues.");
+            EndReflectionSession();
+            return;
+        }
+
+        ConfigureReturnEffect(*m_returnReverb);
+        ConfigureReturnEffect(*m_returnMixer);
+
+        // The group's last DSP is the bus input, and the effects must be downstream of it: anything past it hears nothing, and the send leaks dry.
+        int count = 0;
+        m_returnGroup->getNumDSPs(&count);
+        const int inputIndex = std::max(count - 1, 0);
+
+        if(m_returnGroup->addDSP(inputIndex, m_returnMixer) != FMOD_OK || m_returnGroup->addDSP(inputIndex + 1, m_returnReverb) != FMOD_OK)
+        {
+            Log::Warning("Audio: the Steam Audio return effects cannot be installed; reflections are silent and direct audio continues.");
+            m_returnDspsAdded = true;
+            EndReflectionSession();
+            return;
+        }
+
+        m_returnDspsAdded = true;
+    }
+
+    m_returnInstalled = true;
+    m_returnBus->setMute(false);
+    Log::Info("Audio: Steam Audio reflections use " + std::to_string(m_reflectionBounces.load(std::memory_order_relaxed)) + " bounces.");
+    m_studio.flushCommands();
+    const std::lock_guard lock(m_mutex);
+    m_stats.reflectionReturnInstalled = true;
+}
+
+void SteamAudioSimulation::SetReflectionBounces(int bounces) noexcept
+{
+    m_reflectionBounces.store(bounces, std::memory_order_relaxed);
+}
+
+void SteamAudioSimulation::MuteReturnUntilInstalled() noexcept
+{
+    FMOD::Studio::Bus* bus = nullptr;
+
+    // Asked for each new event: a reloaded bank brings a new, unmuted bus.
+    if(m_reflectionRoutingRequested && !m_returnInstalled && m_studio.getBus(ReflectionReturnBus, &bus) == FMOD_OK)
+    {
+        bus->setMute(true);
+    }
+}
+
+void SteamAudioSimulation::EndReflectionSession() noexcept
+{
+    if(!m_returnBus)
+    {
+        return;
+    }
+
+    // Before the effects leave, so a send never reaches an empty return.
+    if(m_returnBus->isValid())
+    {
+        m_returnBus->setMute(true);
+        m_studio.flushCommands();
+    }
+
+    if(m_returnDspsAdded && m_returnGroup)
+    {
+        m_returnGroup->removeDSP(m_returnReverb);
+        m_returnGroup->removeDSP(m_returnMixer);
+    }
+
+    m_returnDspsAdded = false;
+    m_returnInstalled = false;
+    m_returnGroup = nullptr;
+
+    if(m_returnBus->isValid())
+    {
+        m_returnBus->unlockChannelGroup();
+        m_studio.flushCommands();
+    }
+
+    m_returnBus = nullptr;
+    SetListenerReflectionsWithheld(false);
+    const std::lock_guard lock(m_mutex);
+    m_stats.reflectionReturnInstalled = false;
+}
+
+void SteamAudioSimulation::ReleaseReflectionReturn() noexcept
+{
+    EndReflectionSession();
+
+    if(m_returnReverb)
+    {
+        m_returnReverb->release();
+        m_returnReverb = nullptr;
+    }
+
+    if(m_returnMixer)
+    {
+        m_returnMixer->release();
+        m_returnMixer = nullptr;
+    }
+}
+
+void SteamAudioSimulation::SetListenerReflectionsWithheld(bool withheld) noexcept
+{
+    if(m_reverbSnapshot)
+    {
+        m_reverbSnapshot->SetIrWithheld(withheld);
+    }
+}
+
+bool SteamAudioSimulation::SetSourceCentricRequest(FMOD::Studio::EventInstance& instance, bool enabled)
+{
+    if(!m_productionRouting)
+    {
+        return false;
+    }
+
+    const std::lock_guard lock(m_mutex);
+    std::erase(m_sourceCentricRequests, &instance);
+
+    if(enabled)
+    {
+        m_sourceCentricRequests.push_back(&instance);
+    }
+
+    return true;
+}
+
+void* SteamAudioSimulation::GetReverbGroupForTesting() noexcept
+{
+    FMOD::Studio::Bus* bus = nullptr;
+    FMOD::ChannelGroup* group = nullptr;
+
+    if(!m_reverbSnapshot || m_studio.getBus("bus:/SteamAudioReverb", &bus) != FMOD_OK)
+    {
+        return nullptr;
+    }
+
+    if(!m_reverbGroupLocked)
+    {
+        m_reverbGroupLocked = bus->lockChannelGroup() == FMOD_OK;
+        m_studio.flushCommands();
+    }
+
+    return bus->getChannelGroup(&group) == FMOD_OK ? group : nullptr;
+}
+
+// Worker. Gives free slots to waiting events, oldest first, and reports the rest once, so they fall back. A slot is a new source
+// because flags are fixed at creation; the gate is held exclusively here, so no reflection run sees the change half made.
+void SteamAudioSimulation::ServeReflectionSlots(bool& commit) noexcept
+{
+    std::vector<std::pair<SourceId, bool>> reports;
+    auto waiting = m_slotQueue.begin();
+
+    while(waiting != m_slotQueue.end())
+    {
+        const auto found = m_privateSources.find(waiting->first);
+
+        if(found == m_privateSources.end())
+        {
+            waiting = m_slotQueue.erase(waiting);
+            continue;
+        }
+
+        if(m_reflectionSourceCount >= static_cast<std::size_t>(ReflectionMaxSources))
+        {
+            if(!waiting->second)
+            {
+                waiting->second = true;
+                reports.emplace_back(waiting->first, false);
+            }
+
+            ++waiting;
+            continue;
+        }
+
+        IPLSourceSettings settings{};
+        settings.flags = IPL_SIMULATIONFLAGS_REFLECTIONS;
+        IPLSource source = nullptr;
+
+        if(iplSourceCreate(m_simulator, &settings, &source) != IPL_STATUS_SUCCESS)
+        {
+            if(!waiting->second)
+            {
+                waiting->second = true;
+                reports.emplace_back(waiting->first, false);
+            }
+
+            ++waiting;
+            continue;
+        }
+
+        iplSourceAdd(source, m_simulator);
+        commit = true;
+        IPLSimulationOutputs outputs{};
+        iplSourceGetOutputs(source, IPL_SIMULATIONFLAGS_REFLECTIONS, &outputs);
+        found->second.snapshot->PublishReflectionIr(outputs.reflections.ir, outputs.reflections.numChannels, outputs.reflections.irSize);
+        found->second.reflectionSource = source;
+        found->second.reflectionCapable = true;
+        ++m_reflectionSourceCount;
+        reports.emplace_back(waiting->first, true);
+        waiting = m_slotQueue.erase(waiting);
+    }
+
+    if(!reports.empty())
+    {
+        const std::lock_guard lock(m_mutex);
+        m_slotReports.insert(m_slotReports.end(), reports.begin(), reports.end());
+        m_stats.reflectionSources = m_reflectionSourceCount;
+    }
+}
+
+namespace
+{
+    bool GroupHoldsSend(FMOD::ChannelGroup& group) noexcept
+    {
+        int count = 0;
+        group.getNumDSPs(&count);
+
+        for(int index = 0; index < count; ++index)
+        {
+            FMOD::DSP* dsp = nullptr;
+            FMOD_DSP_TYPE type = FMOD_DSP_TYPE_UNKNOWN;
+
+            if(group.getDSP(index, &dsp) == FMOD_OK && dsp->getType(&type) == FMOD_OK && type == FMOD_DSP_TYPE_SEND)
+            {
+                return true;
+            }
+        }
+
+        int groups = 0;
+        group.getNumGroups(&groups);
+
+        for(int index = 0; index < groups; ++index)
+        {
+            FMOD::ChannelGroup* child = nullptr;
+
+            if(group.getGroup(index, &child) == FMOD_OK && child && GroupHoldsSend(*child))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+}
+
+// Main thread. The send closes as reflections open, and the reverse, with RampReverbSends making it gradual.
+void SteamAudioSimulation::ApplySlotReports() noexcept
+{
+    std::vector<std::pair<SourceId, bool>> reports;
+
+    {
+        const std::lock_guard lock(m_mutex);
+        reports.swap(m_slotReports);
+    }
+
+    for(const auto& [id, assigned] : reports)
+    {
+        for(auto& [dsp, active] : m_activeSources)
+        {
+            if(active.id != id)
+            {
+                continue;
+            }
+
+            active.slotAssigned = assigned;
+
+            if(m_productionRouting && !assigned && !active.slotDenied)
+            {
+                active.slotDenied = true;
+                const std::lock_guard lock(m_mutex);
+                ++m_stats.sourceCentricDenied;
+                Log::Warning("Audio: source-centric reflections are unavailable for an event: all " + std::to_string(ReflectionMaxSources) +
+                    " slots are in use. It keeps listener-centric reflections, and gets a slot if one frees.");
+            }
+
+            if(assigned)
+            {
+                active.slotDenied = false;
+                m_runtime.SetAppliesReflections(*dsp, true);
+                const std::lock_guard lock(m_mutex);
+                m_stats.reflectionSlotPromotions += active.sendOpened ? 1 : 0;
+            }
+
+            active.reverbSendTarget = assigned && m_reverbRouting != SteamAudioReverbRoutingForTesting::Combined ? 0.0f : 1.0f;
+            break;
+        }
+    }
+}
+
+// Main thread, every Update. Only for events authored with the optional SteamAudioReverbSend parameter, from before fixed sends were
+// supported: moves it towards its target. An ordinary send needs none of this, as the return's mute covers its one unsafe state. Writing
+// the Send DSP's own level would not work: it reads back as set and changes nothing.
+void SteamAudioSimulation::RampReverbSends() noexcept
+{
+    constexpr float RampSeconds = 0.15f;
+    const auto now = Clock::now();
+    const float step = std::chrono::duration<float>(now - m_lastReverbRamp).count() / RampSeconds;
+    m_lastReverbRamp = now;
+    std::size_t slots = 0;
+    std::size_t fallback = 0;
+    std::size_t denied = 0;
+    std::uint64_t opened = 0;
+    std::uint64_t withoutSend = 0;
+
+    for(auto& [dsp, active] : m_activeSources)
+    {
+        slots += active.slotAssigned ? 1 : 0;
+        denied += active.slotDenied ? 1 : 0;
+
+        if(!active.sendSearchReported && active.instance->isValid())
+        {
+            active.sendSearchReported = true;
+            FMOD_STUDIO_PARAMETER_DESCRIPTION description{};
+            FMOD::Studio::EventDescription* eventDescription = nullptr;
+            active.hasReverbSend = active.instance->getDescription(&eventDescription) == FMOD_OK &&
+                eventDescription->getParameterDescriptionByName(ReverbSendParameter, &description) == FMOD_OK;
+            withoutSend += active.hasReverbSend ? 0 : 1;
+        }
+
+        if(!active.hasReverbSend)
+        {
+            continue;
+        }
+
+        // An empty return passes what it receives, so a send may open only once the effects are on it.
+        const float target = m_productionRouting && !m_returnInstalled ? 0.0f : active.reverbSendTarget;
+        fallback += target > 0.0f ? 1 : 0;
+
+        if(active.reverbSendLevel != target && active.instance->isValid())
+        {
+            const float distance = target - active.reverbSendLevel;
+            active.reverbSendLevel += std::clamp(distance, -step, step);
+            active.instance->setParameterByName(ReverbSendParameter, active.reverbSendLevel, true);
+
+            if(target > 0.0f && !active.sendOpened)
+            {
+                active.sendOpened = true;
+                ++opened;
+            }
+        }
+    }
+
+    const std::lock_guard lock(m_mutex);
+
+    if(m_stats.sourceCentricWithoutSend > 0 && !m_warnedSourceCentricWithoutSend)
+    {
+        m_warnedSourceCentricWithoutSend = true;
+        Log::Warning("Audio: Source-Centric Reflections is on for an event with no Send, so it gets no reflections. Add a Send to SteamAudioReverb in FMOD Studio.");
+    }
+
+    m_stats.reverbFallbackEvents = fallback;
+    m_stats.reflectionSlotEvents = slots;
+    m_stats.sourceCentricUnavailableEvents = denied;
+    m_stats.reverbSends += opened;
+    m_stats.reverbEventsWithoutSend += withoutSend;
 }
 
 void SteamAudioSimulation::ShutdownSnapshotPath() noexcept
@@ -431,28 +1114,75 @@ void SteamAudioSimulation::ShutdownSnapshotPath() noexcept
 
     // Without m_mutex: the worker needs it to finish. Cancellation waits for at most the RunDirect in progress.
     m_workerWake.notify_all();
+    m_reflectionWake.notify_all();
     m_worker.join();
 
-    // The join hands the private sources back to this thread.
+    if(m_reflectionWorker.joinable())
+    {
+        m_reflectionWorker.join();
+    }
+
+    m_reflectionsActive = false;
+    m_stats.reflectionInfrastructureActive = false;
+    m_stats.reflectionSources = 0;
+
+    for(auto& [dsp, active] : m_activeSources)
+    {
+        m_retiringSources.push_back({active.snapshot, active.id, true, nullptr});
+    }
+
+    m_activeSources.clear();
+
+    // The join hands everything the worker held to this thread: acknowledgements it sent, and sources it never got to remove.
+    AcceptWorkerRemovals();
+
     for(auto& [id, privateSource] : m_privateSources)
     {
-        if(privateSource.realSource)
+        if(!privateSource.realSource)
         {
-            iplSourceRemove(privateSource.realSource, m_simulator);
-            iplSourceRelease(&privateSource.realSource);
+            continue;
+        }
+
+        iplSourceRemove(privateSource.realSource, m_simulator);
+        ++m_stats.privateSourcesRemoved;
+
+        if(privateSource.reflectionSource)
+        {
+            iplSourceRemove(privateSource.reflectionSource, m_simulator);
+        }
+
+        for(RetiringSource& retiring : m_retiringSources)
+        {
+            if(retiring.id == id)
+            {
+                retiring.privateSource = privateSource.realSource;
+                retiring.privateReflectionSource = privateSource.reflectionSource;
+            }
         }
     }
 
     m_privateSources.clear();
-    ReleaseAcousticScene();
-    iplSimulatorCommit(m_simulator);
 
-    for(auto& [dsp, active] : m_activeSources)
+    // The DSP went with the graph; the plugin's own reference goes now, and the usual retirement does the rest.
+    if(m_reverbSnapshot)
     {
-        m_retiringSources.push_back({active.snapshot, active.id, true});
+        m_runtime.SetPluginReverbSource(nullptr);
+
+        if(m_reverbRealSource)
+        {
+            iplSourceRemove(m_reverbRealSource, m_simulator);
+            ++m_stats.privateSourcesRemoved;
+        }
+
+        m_stats.reverbIrReads = static_cast<std::uint64_t>(m_reverbSnapshot->IrReads());
+        m_retiringSources.push_back({m_reverbSnapshot, 0, true, m_reverbRealSource});
+        m_reverbSnapshot = nullptr;
+        m_reverbRealSource = nullptr;
     }
 
-    m_activeSources.clear();
+    m_stats.environmentalReverbActive = false;
+    ReleaseAcousticScene();
+    iplSimulatorCommit(m_simulator);
 
     for(RetiringSource& retiring : m_retiringSources)
     {
@@ -474,7 +1204,7 @@ void SteamAudioSimulation::ShutdownSnapshotPath() noexcept
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
 
-    // Deliberately leaked: freeing one could leave the plugin a dangling vtable.
+    // Deliberately leaked, each with its private source: freeing either could leave the plugin a dangling pointer.
     m_stats.quarantinedSources += m_retiringSources.size();
     m_retiringSources.clear();
     m_boundDsps.clear();
@@ -498,9 +1228,17 @@ void SteamAudioSimulation::ShutdownLockPath() noexcept
 
 void SteamAudioSimulation::AttachToInstance(FMOD::Studio::EventInstance& instance)
 {
+    MuteReturnUntilInstalled();
+
     if(!m_simulator)
     {
         return;
+    }
+
+    {
+        // A new instance can reuse a released one's address.
+        const std::lock_guard lock(m_mutex);
+        std::erase(m_sourceCentricRequests, &instance);
     }
 
     // Set before start(), so no DSP of this instance can be created unobserved. A failure leaves the event as direct
@@ -606,8 +1344,48 @@ void SteamAudioSimulation::BindSnapshotSource(FMOD::Studio::EventInstance& insta
         return;
     }
 
+    // FMOD Studio is the authority: this reads what was authored, and never enables anything. Reflections need the authored
+    // value at creation; a later automation of it finds no IR and adds nothing.
+    bool reflectionConsumer = m_reflectionsActive && (m_assumeReflectionConsumers || m_runtime.AppliesReflections(dsp));
+
+    // On the production route the Audio Source decides, whatever the event authored.
+    if(m_productionRouting)
+    {
+        const std::lock_guard lock(m_mutex);
+        const auto request = std::find(m_sourceCentricRequests.begin(), m_sourceCentricRequests.end(), &instance);
+        reflectionConsumer = request != m_sourceCentricRequests.end();
+    }
+
+    // A slot is only worth having for an event with a Send. FMOD can say that one exists but not where it goes: every Studio send reports
+    // the same FMOD_DSP_SEND_RETURNID, so an event with only unrelated sends still gets a slot. Asked here, before the slot, as a later check
+    // would delay reflections past the start of a short event. If the groups can't be read yet, the slot is granted. See section 35.
+    if(m_productionRouting && reflectionConsumer)
+    {
+        FMOD::ChannelGroup* group = nullptr;
+        const FMOD_RESULT readable = instance.getChannelGroup(&group);
+        const std::lock_guard lock(m_mutex);
+        ++m_stats.sourceCentricSendChecks;
+
+        if(readable != FMOD_OK || !group)
+        {
+            ++m_stats.sourceCentricSendChecksUnreadable;
+        }
+        else if(!GroupHoldsSend(*group))
+        {
+            reflectionConsumer = false;
+            ++m_stats.sourceCentricWithoutSend;
+        }
+    }
+
     const bool bound = !ConsumeInjectedFailure(SteamAudioInjectedFailure::SourceBinding) &&
         m_runtime.BindSimulationSource(dsp, source->AsIPLSource());
+
+    // With reverb, a reflection effect exists only for an event with a slot: the plugin would otherwise create it for every event authored
+    // with reflections, and it is what would exhaust the pool. Before the first mix, so none is ever made here.
+    if(m_reverbWanted && (reflectionConsumer || m_productionRouting))
+    {
+        m_runtime.SetAppliesReflections(dsp, false);
+    }
 
     const std::lock_guard lock(m_mutex);
     ++m_stats.sourcesCreated;
@@ -615,7 +1393,7 @@ void SteamAudioSimulation::BindSnapshotSource(FMOD::Studio::EventInstance& insta
     if(bound)
     {
         ++m_stats.bindings;
-        m_lifecycleChanges.push_back({LifecycleChange::Kind::Created, &dsp, &instance, source, nullptr});
+        m_lifecycleChanges.push_back({LifecycleChange::Kind::Created, &dsp, &instance, source, nullptr, reflectionConsumer});
         return;
     }
 
@@ -692,7 +1470,7 @@ void SteamAudioSimulation::ApplyLifecycleChanges() noexcept
         {
             if(change.kind == LifecycleChange::Kind::BindFailed)
             {
-                m_retiringSources.push_back({change.snapshot, 0, true});
+                m_retiringSources.push_back({change.snapshot, 0, true, nullptr});
                 continue;
             }
 
@@ -703,6 +1481,10 @@ void SteamAudioSimulation::ApplyLifecycleChanges() noexcept
                 active.id = m_nextSourceId++;
                 active.snapshot = change.snapshot;
                 active.realSource = change.realSource;
+                active.reflectionConsumer = change.reflectionConsumer;
+                // No reflections authored: this event has only the reverb.
+                active.reverbSendTarget = m_reverbRouting == SteamAudioReverbRoutingForTesting::SourceOnly ||
+                    (m_reverbWanted && (!change.reflectionConsumer || m_reverbRouting != SteamAudioReverbRoutingForTesting::Exclusive)) ? 1.0f : 0.0f;
 
                 if(active.snapshot)
                 {
@@ -710,6 +1492,7 @@ void SteamAudioSimulation::ApplyLifecycleChanges() noexcept
                     command.kind = WorkerCommand::Kind::AddSource;
                     command.id = active.id;
                     command.snapshot = active.snapshot;
+                    command.reflectionConsumer = change.reflectionConsumer;
                     m_pendingCommands.push_back(std::move(command));
                 }
                 else
@@ -738,7 +1521,7 @@ void SteamAudioSimulation::ApplyLifecycleChanges() noexcept
                 command.kind = WorkerCommand::Kind::RemoveSource;
                 command.id = active.id;
                 m_pendingCommands.push_back(std::move(command));
-                m_retiringSources.push_back({active.snapshot, active.id, false});
+                m_retiringSources.push_back({active.snapshot, active.id, false, nullptr});
             }
             else
             {
@@ -759,20 +1542,7 @@ void SteamAudioSimulation::ApplyLifecycleChanges() noexcept
             iplSimulatorCommit(m_simulator);
         }
 
-        for(const SourceId id : m_workerRemoved)
-        {
-            for(RetiringSource& retiring : m_retiringSources)
-            {
-                if(retiring.id == id)
-                {
-                    retiring.workerDone = true;
-                }
-            }
-
-            m_published.erase(id);
-        }
-
-        m_workerRemoved.clear();
+        AcceptWorkerRemovals();
         m_stats.activeSources = m_activeSources.size();
         m_stats.retiringSources = m_retiringSources.size();
     }
@@ -781,6 +1551,21 @@ void SteamAudioSimulation::ApplyLifecycleChanges() noexcept
     ReclaimRetiredSources();
 
     SteamAudioSimulationStats stats = GetStats();
+
+    if(stats.reflectionCapacityExhausted > 0 && !m_capacityReported)
+    {
+        m_capacityReported = true;
+
+        try
+        {
+            Log::Warning("Audio: more Steam Audio sources than the reflection capacity of " +
+                std::to_string(stats.reflectionSourceCapacity) + "; the extra sources simulate direct only.");
+        }
+        catch(...)
+        {
+            // Logging allocation failure only.
+        }
+    }
 
     if((stats.creationFailures > 0 || stats.bindingFailures > 0) && !m_failuresReported)
     {
@@ -798,16 +1583,57 @@ void SteamAudioSimulation::ApplyLifecycleChanges() noexcept
     }
 }
 
+void SteamAudioSimulation::AcceptWorkerRemovals() noexcept
+{
+    for(const RemovedPrivateSource& removed : m_workerRemoved)
+    {
+        for(RetiringSource& retiring : m_retiringSources)
+        {
+            if(retiring.id == removed.id)
+            {
+                retiring.workerDone = true;
+                retiring.privateSource = removed.realSource;
+                retiring.privateReflectionSource = removed.reflectionSource;
+            }
+        }
+
+        m_published.erase(removed.id);
+    }
+
+    m_workerRemoved.clear();
+}
+
+// Stage B. Main thread, every Update and at shutdown, so it progresses whether or not anything else plays.
+//
+// References() == 1 means the only reference left is the owner's: bind took the plugin's before the DSP was reported, and the
+// plugin returns it when the DSP is finally destroyed, after its last block. The private source is out of the simulator's run
+// list (committed before workerDone), and iplSourceRelease does not touch the simulator, so this may overlap a simulation.
 void SteamAudioSimulation::ReclaimRetiredSources() noexcept
 {
     std::size_t destroyed = 0;
+    std::size_t released = 0;
     std::int64_t anomalies = 0;
+    std::int64_t irReads = 0;
 
     for(auto retiring = m_retiringSources.begin(); retiring != m_retiringSources.end();)
     {
         if(retiring->workerDone && retiring->snapshot->References() == 1)
         {
+            retiring->snapshot->MarkIrReleased();
+
+            if(retiring->privateReflectionSource)
+            {
+                iplSourceRelease(&retiring->privateReflectionSource);
+            }
+
+            if(retiring->privateSource)
+            {
+                iplSourceRelease(&retiring->privateSource);
+                ++released;
+            }
+
             anomalies += retiring->snapshot->Anomalies();
+            irReads += retiring->snapshot->IrReads();
             delete retiring->snapshot;
             ++destroyed;
             retiring = m_retiringSources.erase(retiring);
@@ -821,6 +1647,8 @@ void SteamAudioSimulation::ReclaimRetiredSources() noexcept
     {
         const std::lock_guard lock(m_mutex);
         m_stats.sourcesDestroyed += destroyed;
+        m_stats.privateSourcesReleased += released;
+        m_stats.reflectionIrReads += static_cast<std::uint64_t>(irReads);
         m_stats.sourceAnomalies += static_cast<std::uint64_t>(anomalies);
         m_stats.retiringSources = m_retiringSources.size();
     }
@@ -845,6 +1673,7 @@ void SteamAudioSimulation::PostFrame(std::uint64_t ticket) noexcept
     IPLCoordinateSpace3 listener{};
     const bool hasListener = ReadListener(listener);
     m_framePoses.clear();
+    const auto now = Clock::now();
 
     for(auto& [dsp, active] : m_activeSources)
     {
@@ -859,8 +1688,34 @@ void SteamAudioSimulation::PostFrame(std::uint64_t ticket) noexcept
         m_framePoses.push_back({active.id, active.pose});
     }
 
+    // Nothing reflects without geometry, so an empty scene costs the reflection worker nothing.
+    m_reflectionSceneUsed |= !m_acousticObjectIds.empty();
+    const std::int64_t reverbIrReads = m_reverbSnapshot ? m_reverbSnapshot->IrReads() : 0;
+    const bool reflectionDue = m_reflectionsActive && hasListener && m_reflectionSceneUsed &&
+        now >= m_nextReflectionFrame;
+
+    if(reflectionDue)
+    {
+        // Frames are only posted on simulation ticks, so one due frame is late by up to a tick. Counting the next from when this one
+        // was due keeps the mean at the interval whatever the frame rate; counting from now would add that lateness every time.
+        // After a stall it restarts rather than catching up.
+        const auto fromDue = m_nextReflectionFrame + ReflectionInterval;
+        m_nextReflectionFrame = m_testControls.legacyReflectionCadence || fromDue <= now ? now + ReflectionInterval : fromDue;
+    }
+
     {
         const std::lock_guard lock(m_mutex);
+        m_stats.reverbIrReads = static_cast<std::uint64_t>(reverbIrReads);
+
+        if(reflectionDue)
+        {
+            m_stats.reflectionFramesCoalesced += m_pendingReflectionFrame.valid ? 1 : 0;
+            m_pendingReflectionFrame.valid = true;
+            m_pendingReflectionFrame.listener = listener;
+            m_pendingReflectionFrame.poses = m_framePoses;
+            m_pendingReflectionFrame.controls = m_testControls;
+            m_pendingReflectionFrame.postedAt = now;
+        }
 
         if(m_pendingFrame.valid)
         {
@@ -886,6 +1741,11 @@ void SteamAudioSimulation::PostFrame(std::uint64_t ticket) noexcept
     }
 
     m_workerWake.notify_one();
+
+    if(reflectionDue)
+    {
+        m_reflectionWake.notify_one();
+    }
 }
 
 // Option A: outputs are published in place, so the plugin's reads are excluded for the whole of RunDirect.
@@ -957,6 +1817,29 @@ void SteamAudioSimulation::Update() noexcept
     }
 
     ApplyLifecycleChanges();
+
+    // Retried until the bank holding the bus has loaded.
+    if(m_holdReverbReturn && !m_reverbGroupLocked)
+    {
+        FMOD::Studio::Bus* bus = nullptr;
+        m_reverbGroupLocked = m_studio.getBus("bus:/SteamAudioReverb", &bus) == FMOD_OK && bus->lockChannelGroup() == FMOD_OK;
+    }
+
+    if(m_productionRouting && m_reverbSnapshot && m_reverbSnapshot->References() == 1 && !m_bindingLossReported)
+    {
+        // Rebinding here would race the plugin's release, which FMOD's DSP lock does not exclude. Reported instead: it means something released a Reverb.
+        m_bindingLossReported = true;
+        Log::Error("Audio: the Steam Audio plugin lost the reverb source; listener-centric reflections are silent until restart.");
+        const std::lock_guard lock(m_mutex);
+        ++m_stats.reverbBindingLost;
+    }
+
+    if(m_reverbWanted || m_reverbRouting == SteamAudioReverbRoutingForTesting::SourceOnly)
+    {
+        ApplySlotReports();
+        RampReverbSends();
+    }
+
     const auto now = Clock::now();
 
     if(now - m_lastSimulation < SimulationInterval || m_activeSources.empty())
@@ -1008,18 +1891,34 @@ void SteamAudioSimulation::WorkerMain() noexcept
 {
     std::vector<WorkerCommand> commands;
     InputFrame frame;
-    std::vector<SourceId> removed;
+    std::vector<RemovedPrivateSource> removed;
     std::unordered_map<SourceId, AcousticTransform> transforms;
+    // Set while changes wait for a reflection run to end, from the first attempt at the gate.
+    bool gateRequested = false;
+    auto gateRequestTime = Clock::now();
+    std::uint64_t runsBeforeWait = 0;
 
     for(;;)
     {
+        bool blockAtGate = false;
+
         {
             std::unique_lock lock(m_mutex);
-            m_workerWake.wait(lock, [&]
+            const auto hasWork = [&]
             {
                 return m_workerStop || m_pendingFrame.valid || !m_pendingCommands.empty() ||
                     !m_pendingAcousticTransforms.empty();
-            });
+            };
+
+            // Changes it is holding need a retry, whether or not anything new arrives.
+            if(gateRequested)
+            {
+                m_workerWake.wait_for(lock, ReflectionDeferralPoll, hasWork);
+            }
+            else
+            {
+                m_workerWake.wait(lock, hasWork);
+            }
 
             // Queued work is dropped at stop: Shutdown cleans up whatever this thread still owns.
             if(m_workerStop)
@@ -1027,7 +1926,26 @@ void SteamAudioSimulation::WorkerMain() noexcept
                 return;
             }
 
-            commands.swap(m_pendingCommands);
+            blockAtGate = m_blockAtGateForTesting;
+
+            // After changes held back from earlier passes, in order. A newer object command overrides a held transform, which
+            // would otherwise be applied after it.
+            for(WorkerCommand& command : m_pendingCommands)
+            {
+                if(command.kind == WorkerCommand::Kind::ClearAcousticScene)
+                {
+                    transforms.clear();
+                }
+                else if(command.kind == WorkerCommand::Kind::SetAcousticObject ||
+                    command.kind == WorkerCommand::Kind::RemoveAcousticObject)
+                {
+                    transforms.erase(command.id);
+                }
+
+                commands.push_back(std::move(command));
+            }
+
+            m_pendingCommands.clear();
             frame.valid = m_pendingFrame.valid;
 
             if(frame.valid)
@@ -1039,28 +1957,75 @@ void SteamAudioSimulation::WorkerMain() noexcept
                 m_pendingFrame.valid = false;
             }
 
-            transforms.swap(m_pendingAcousticTransforms);
+            for(const auto& [id, world] : m_pendingAcousticTransforms)
+            {
+                transforms[id] = world;
+            }
+
+            m_pendingAcousticTransforms.clear();
         }
 
         removed.clear();
-        ApplyWorkerCommands(commands, removed);
-        commands.clear();
 
-        if(!transforms.empty())
+        // Taken only for actual changes, so a frame with none never touches the gate. Released before the acknowledgement
+        // below: by then the reflection worker can no longer reach a removed source. Without the gate the changes stay here and
+        // this pass still simulates: RunDirect needs no gate, because only this thread changes the simulator.
+        if(!commands.empty() || !transforms.empty() || !m_retiredEmbreeInstances.empty())
         {
-            bool changed = false;
-            WorkerApplyTransforms(transforms, changed);
-            transforms.clear();
+            std::unique_lock gate(m_simulatorGate, std::defer_lock);
 
-            if(changed)
+            if(!gate.try_lock() && !gateRequested)
             {
-                CommitAcousticScene();
+                gateRequested = true;
+                gateRequestTime = Clock::now();
+                m_directGateRequests.fetch_add(1, std::memory_order_seq_cst);
+                const std::lock_guard lock(m_mutex);
+                runsBeforeWait = m_stats.reflectionRuns;
+            }
+
+            if(!gate.owns_lock() && blockAtGate)
+            {
+                gate.lock();
+            }
+
+            if(gate.owns_lock())
+            {
+                if(gateRequested)
+                {
+                    gateRequested = false;
+                    m_directGateRequests.fetch_sub(1, std::memory_order_seq_cst);
+                    const double gateWait = Microseconds(gateRequestTime, Clock::now());
+                    const std::lock_guard lock(m_mutex);
+                    m_stats.maximumSimulatorGateWaitMicroseconds = std::max(m_stats.maximumSimulatorGateWaitMicroseconds, gateWait);
+                    m_stats.maximumReflectionRunsDuringGateWait = std::max(m_stats.maximumReflectionRunsDuringGateWait,
+                        m_stats.reflectionRuns - runsBeforeWait);
+                }
+
+                ApplyWorkerCommands(commands, removed);
+                commands.clear();
+
+                if(!transforms.empty())
+                {
+                    bool changed = false;
+                    WorkerApplyTransforms(transforms, changed);
+                    transforms.clear();
+
+                    if(changed)
+                    {
+                        CommitAcousticScene();
+                    }
+                }
             }
         }
 
         {
             const std::lock_guard lock(m_mutex);
             m_workerRemoved.insert(m_workerRemoved.end(), removed.begin(), removed.end());
+
+            for(const RemovedPrivateSource& source : removed)
+            {
+                m_stats.privateSourcesRemoved += source.realSource ? 1 : 0;
+            }
         }
 
         if(frame.valid)
@@ -1070,8 +2035,153 @@ void SteamAudioSimulation::WorkerMain() noexcept
     }
 }
 
+// The reflection worker: never calls FMOD, never publishes, and sees the simulator only while sharing m_simulatorGate.
+void SteamAudioSimulation::ReflectionWorkerMain() noexcept
+{
+    InputFrame frame;
+    auto lastRun = Clock::now();
+
+    for(;;)
+    {
+        bool yieldToDirect = false;
+
+        {
+            std::unique_lock lock(m_mutex);
+            m_reflectionWake.wait(lock, [&]
+            {
+                return m_workerStop || m_pendingReflectionFrame.valid;
+            });
+
+            if(m_workerStop)
+            {
+                return;
+            }
+
+            const bool directFirst = !m_pendingReflectionFrame.controls.disableDirectFirstScheduling;
+            const bool directPending = !m_pendingCommands.empty() || !m_pendingAcousticTransforms.empty() ||
+                m_pendingFrame.valid || m_directGateRequests.load(std::memory_order_seq_cst) > 0 ||
+                m_pendingReflectionFrame.controls.reportDirectWorkAlwaysPending;
+            const bool overdue = Clock::now() - lastRun >= ReflectionStarvationLimit;
+
+            if(directFirst && directPending && !overdue)
+            {
+                // The frame stays pending, where the main thread replaces it: overdue runs are skipped, not queued.
+                ++m_stats.reflectionDeferrals;
+                m_reflectionWake.wait_for(lock, ReflectionDeferralPoll, [&]
+                {
+                    return m_workerStop;
+                });
+                continue;
+            }
+
+            if(directFirst && directPending)
+            {
+                ++m_stats.reflectionForcedRuns;
+            }
+
+            // A run let through for starvation must not give way below, or continual changes would stop it after all.
+            yieldToDirect = directFirst && !overdue;
+            frame.listener = m_pendingReflectionFrame.listener;
+            frame.controls = m_pendingReflectionFrame.controls;
+            frame.postedAt = m_pendingReflectionFrame.postedAt;
+            frame.poses.swap(m_pendingReflectionFrame.poses);
+            m_pendingReflectionFrame.valid = false;
+        }
+
+        if(RunReflections(frame, yieldToDirect))
+        {
+            lastRun = Clock::now();
+        }
+    }
+}
+
+bool SteamAudioSimulation::RunReflections(const InputFrame& frame, bool yieldToDirect) noexcept
+{
+    const auto start = Clock::now();
+
+    {
+        const std::shared_lock gate(m_simulatorGate);
+
+        // The direct worker may have asked between the check above and this lock. It counts first and then waits, so with
+        // this reader in place either it is seen here, or it arrives after this point and waits for this one run only.
+        if(yieldToDirect && m_directGateRequests.load(std::memory_order_seq_cst) > 0)
+        {
+            const std::lock_guard lock(m_mutex);
+            ++m_stats.reflectionDeferrals;
+            return false;
+        }
+
+        if(!m_acousticRoot)
+        {
+            return false;
+        }
+
+        IPLSimulationSharedInputs shared{};
+        shared.listener = frame.listener;
+
+        if(m_reflectionAccumulationStale.exchange(false, std::memory_order_relaxed))
+        {
+            shared.listener.origin.y += AccumulationResetOffset;
+        }
+
+        shared.numRays = m_reflectionSettings.maxNumRays;
+        shared.numBounces = m_reflectionBounces.load(std::memory_order_relaxed);
+        shared.duration = m_reflectionSettings.maxDuration;
+        shared.order = m_reflectionSettings.maxOrder;
+        shared.irradianceMinDistance = 1.0f;
+        iplSimulatorSetSharedInputs(m_simulator, IPL_SIMULATIONFLAGS_REFLECTIONS, &shared);
+
+        IPLSimulationInputs inputs = MakeInputs(frame.controls);
+        inputs.flags = IPL_SIMULATIONFLAGS_REFLECTIONS;
+        inputs.reverbScale[0] = 1.0f;
+        inputs.reverbScale[1] = 1.0f;
+        inputs.reverbScale[2] = 1.0f;
+
+        for(const FramePose& framePose : frame.poses)
+        {
+            // A source retired since the frame was made is gone from the map, and cannot return: ids are never reused.
+            const auto found = m_privateSources.find(framePose.id);
+
+            if(found != m_privateSources.end() && found->second.reflectionCapable)
+            {
+                inputs.source = framePose.pose;
+                iplSourceSetInputs(found->second.reflectionSource ? found->second.reflectionSource : found->second.realSource, IPL_SIMULATIONFLAGS_REFLECTIONS, &inputs);
+            }
+        }
+
+        // Always at the listener: this one source is the whole cost of the reverb, however many events send to it.
+        if(m_reverbRealSource)
+        {
+            inputs.source = frame.listener;
+            iplSourceSetInputs(m_reverbRealSource, IPL_SIMULATIONFLAGS_REFLECTIONS, &inputs);
+        }
+
+        iplSimulatorRunReflections(m_simulator);
+        InjectSimulationDelay(frame.controls.injectedReflectionMilliseconds);
+    }
+
+    const double elapsed = Microseconds(start, Clock::now());
+    const std::lock_guard lock(m_mutex);
+    ++m_stats.reflectionRuns;
+    m_stats.maximumReflectionRunMicroseconds = std::max(m_stats.maximumReflectionRunMicroseconds, elapsed);
+    const double wake = Microseconds(frame.postedAt, start);
+    m_stats.reflectionWakeMicrosecondsSum += wake;
+    m_stats.maximumReflectionWakeMicroseconds = std::max(m_stats.maximumReflectionWakeMicroseconds, wake);
+
+    if(m_lastReflectionStart != Clock::time_point{})
+    {
+        const double interval = Microseconds(m_lastReflectionStart, start);
+        m_stats.reflectionIntervalMicrosecondsSum += interval;
+        m_stats.maximumReflectionIntervalMicroseconds = std::max(m_stats.maximumReflectionIntervalMicroseconds, interval);
+        ++m_stats.reflectionIntervals;
+    }
+
+    m_lastReflectionStart = start;
+    return true;
+}
+
 void SteamAudioSimulation::ApplyWorkerCommands(const std::vector<WorkerCommand>& commands,
-    std::vector<SourceId>& removed) noexcept
+    std::vector<RemovedPrivateSource>& removed) noexcept
 {
     bool commit = false;
     bool acousticChanged = false;
@@ -1105,6 +2215,28 @@ void SteamAudioSimulation::ApplyWorkerCommands(const std::vector<WorkerCommand>&
             iplSimulatorSetScene(m_simulator, static_cast<IPLScene>(command.scene));
             commit = true;
         }
+        else if(command.kind == WorkerCommand::Kind::AddReverbSource)
+        {
+            IPLSourceSettings settings{};
+            settings.flags = IPL_SIMULATIONFLAGS_REFLECTIONS;
+
+            if(iplSourceCreate(m_simulator, &settings, &m_reverbRealSource) == IPL_STATUS_SUCCESS)
+            {
+                iplSourceAdd(m_reverbRealSource, m_simulator);
+                commit = true;
+                IPLSimulationOutputs outputs{};
+                iplSourceGetOutputs(m_reverbRealSource, IPL_SIMULATIONFLAGS_REFLECTIONS, &outputs);
+                command.snapshot->PublishReflectionIr(outputs.reflections.ir, outputs.reflections.numChannels, outputs.reflections.irSize);
+                const std::lock_guard lock(m_mutex);
+                m_stats.reverbIrPublished = true;
+                ++m_stats.privateSourcesCreated;
+            }
+            else
+            {
+                m_reverbRealSource = nullptr;
+                Log::Warning("Audio: the Steam Audio reverb source could not be created; the reverb stays silent.");
+            }
+        }
         else if(command.kind == WorkerCommand::Kind::AddSource)
         {
             PrivateSource privateSource;
@@ -1112,16 +2244,54 @@ void SteamAudioSimulation::ApplyWorkerCommands(const std::vector<WorkerCommand>&
             IPLSourceSettings settings{};
             settings.flags = IPL_SIMULATIONFLAGS_DIRECT;
 
+            // With reverb, slots are given and reported by ServeReflectionSlots.
+            if(m_reverbWanted && command.reflectionConsumer)
+            {
+                if(m_reverbRouting != SteamAudioReverbRoutingForTesting::ListenerOnly)
+                {
+                    m_slotQueue.emplace_back(command.id, false);
+                }
+            }
+            else if(m_reflectionsActive && command.reflectionConsumer)
+            {
+                if(m_reflectionSourceCount < static_cast<std::size_t>(ReflectionMaxSources))
+                {
+                    settings.flags = static_cast<IPLSimulationFlags>(IPL_SIMULATIONFLAGS_DIRECT | IPL_SIMULATIONFLAGS_REFLECTIONS);
+                    privateSource.reflectionCapable = true;
+                }
+                else
+                {
+                    const std::lock_guard lock(m_mutex);
+                    ++m_stats.reflectionCapacityExhausted;
+                }
+            }
+
             if(!ConsumeInjectedFailure(SteamAudioInjectedFailure::PrivateSourceCreation) &&
                 iplSourceCreate(m_simulator, &settings, &privateSource.realSource) == IPL_STATUS_SUCCESS)
             {
                 iplSourceAdd(privateSource.realSource, m_simulator);
                 commit = true;
+                m_reflectionSourceCount += privateSource.reflectionCapable ? 1 : 0;
+                const bool publishIr = privateSource.reflectionCapable && !m_withholdReflectionIr;
+
+                if(publishIr)
+                {
+                    IPLSimulationOutputs outputs{};
+                    iplSourceGetOutputs(privateSource.realSource, IPL_SIMULATIONFLAGS_REFLECTIONS, &outputs);
+                    privateSource.snapshot->PublishReflectionIr(outputs.reflections.ir, outputs.reflections.numChannels,
+                        outputs.reflections.irSize);
+                }
+
+                const std::lock_guard lock(m_mutex);
+                ++m_stats.privateSourcesCreated;
+                m_stats.reflectionIrPublished += publishIr ? 1 : 0;
+                m_stats.reflectionSources = m_reflectionSourceCount;
             }
             else
             {
                 // Stays bound, with its neutral snapshot: the same sound as a source in a scene-less simulation.
                 privateSource.realSource = nullptr;
+                privateSource.reflectionCapable = false;
                 const std::lock_guard lock(m_mutex);
                 ++m_stats.privateSourceFailures;
             }
@@ -1130,23 +2300,42 @@ void SteamAudioSimulation::ApplyWorkerCommands(const std::vector<WorkerCommand>&
         }
         else
         {
+            // Stage A. Erased here, and ids are never reused, so no later frame or command can reach this source again.
+            IPLSource realSource = nullptr;
+            IPLSource reflectionSource = nullptr;
             const auto found = m_privateSources.find(command.id);
 
             if(found != m_privateSources.end())
             {
-                if(found->second.realSource)
+                realSource = found->second.realSource;
+                reflectionSource = found->second.reflectionSource;
+
+                if(realSource)
                 {
-                    iplSourceRemove(found->second.realSource, m_simulator);
-                    iplSourceRelease(&found->second.realSource);
+                    iplSourceRemove(realSource, m_simulator);
                     commit = true;
                 }
 
+                if(reflectionSource)
+                {
+                    iplSourceRemove(reflectionSource, m_simulator);
+                    commit = true;
+                }
+
+                m_reflectionSourceCount -= found->second.reflectionCapable ? 1 : 0;
                 m_privateSources.erase(found);
+                const std::lock_guard lock(m_mutex);
+                m_stats.reflectionSources = m_reflectionSourceCount;
             }
 
-            // After this the worker holds no pointer to the SnapshotSource.
-            removed.push_back(command.id);
+            // Sent after this function's commit. After this the worker holds no pointer to either source.
+            removed.push_back({command.id, realSource, reflectionSource});
         }
+    }
+
+    if(m_reverbWanted)
+    {
+        ServeReflectionSlots(commit);
     }
 
     if(commit)
@@ -1208,6 +2397,7 @@ void SteamAudioSimulation::RebuildEmbreeRoot() noexcept
     iplSceneCommit(root);
     iplSimulatorSetScene(m_simulator, root);
     iplSimulatorCommit(m_simulator);
+    m_reflectionAccumulationStale.store(true, std::memory_order_relaxed);
 
     for(const SourceId id : failed)
     {
@@ -1765,6 +2955,12 @@ std::vector<SteamAudioSourceSnapshot> SteamAudioSimulation::GetSnapshots() const
 void SteamAudioSimulation::SetTestControls(const SteamAudioSimulationTestControls& controls)
 {
     m_testControls = controls;
+
+    {
+        const std::lock_guard lock(m_mutex);
+        m_blockAtGateForTesting = controls.disableDirectFirstScheduling;
+    }
+
     SetSnapshotReadObserver(controls.readObserver);
 
     if(!m_simulator || !controls.scene)

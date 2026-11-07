@@ -19,6 +19,40 @@
 
 namespace
 {
+    const char* ProbePlacementToString(ProbePlacement placement)
+    {
+        switch(placement)
+        {
+            case ProbePlacement::Centroid:
+                return "centroid";
+            case ProbePlacement::Uniform3D:
+                return "uniform3D";
+            case ProbePlacement::UniformFloor:
+            default:
+                return "uniformFloor";
+        }
+    }
+
+    ProbePlacement ProbePlacementFromString(const std::string& text)
+    {
+        if(text == "uniformFloor")
+        {
+            return ProbePlacement::UniformFloor;
+        }
+
+        if(text == "centroid")
+        {
+            return ProbePlacement::Centroid;
+        }
+
+        if(text == "uniform3D")
+        {
+            return ProbePlacement::Uniform3D;
+        }
+
+        throw std::runtime_error("Unknown probe placement '" + text + "'.");
+    }
+
     using Json = nlohmann::json;
 
     void ValidateFields(const Json& object, std::initializer_list<std::string_view> allowedFields)
@@ -661,6 +695,17 @@ namespace
                     {"eventPath", object.audioSource->eventPath},
                     {"autoplay", object.audioSource->autoplay}
                 };
+
+                // Written only when set, so scenes that do not use them stay byte-identical.
+                if(object.audioSource->sourceCentricReflections)
+                {
+                    objects.back()["audioSource"]["sourceCentricReflections"] = true;
+                }
+
+                if(object.audioSource->bakedReflections)
+                {
+                    objects.back()["audioSource"]["bakedReflections"] = true;
+                }
             }
 
             if(object.acoustics)
@@ -671,9 +716,34 @@ namespace
                 };
             }
 
+            if(object.probeVolume)
+            {
+                const ProbeVolumeComponent& volume = *object.probeVolume;
+                objects.back()["probeVolume"] = {
+                    {"enabled", volume.enabled},
+                    {"placement", ProbePlacementToString(volume.placement)},
+                    {"size", volume.size},
+                    {"probeSpacing", volume.probeSpacing},
+                    {"heightAboveFloor", volume.heightAboveFloor},
+                    {"manualProbes", volume.manualProbes},
+                    {"probeBatch", volume.probeBatch}
+                };
+
+                // Written only when it differs from the default, as with other optional fields.
+                if(!volume.filterInsideSolids)
+                {
+                    objects.back()["probeVolume"]["filterInsideSolids"] = false;
+                }
+            }
+
             if(object.audioListener)
             {
                 objects.back()["audioListener"] = {{"enabled", object.audioListener->enabled}};
+
+                if(object.audioListener->bakedReflections)
+                {
+                    objects.back()["audioListener"]["bakedReflections"] = true;
+                }
             }
         }
 
@@ -794,7 +864,7 @@ namespace
         {
             ValidateFields(item, {"id", "parentID", "name", "transform", "meshReference", "materialReference",
                 "materialSlotBindings", "physics", "triggerCollider", "characterController", "camera", "light", "script",
-                "audioSource", "audioListener", "acoustics"});
+                "audioSource", "audioListener", "acoustics", "probeVolume"});
             if (legacySchema && item.contains("physics"))
             {
                 throw std::runtime_error("Physics fields require scene schema version 2.");
@@ -996,10 +1066,33 @@ namespace
                 object.acoustics = std::move(acoustics);
             }
 
+            if(item.contains("probeVolume"))
+            {
+                const auto& value = item.at("probeVolume");
+                ValidateFields(value, {"enabled", "placement", "size", "probeSpacing", "heightAboveFloor", "manualProbes", "probeBatch", "filterInsideSolids"});
+                ProbeVolumeComponent volume;
+                volume.enabled = value.at("enabled").get<bool>();
+                volume.placement = ProbePlacementFromString(value.at("placement").get<std::string>());
+                volume.size = value.at("size").get<std::array<float, 3>>();
+                volume.probeSpacing = value.at("probeSpacing").get<float>();
+                volume.heightAboveFloor = value.at("heightAboveFloor").get<float>();
+                volume.manualProbes = value.at("manualProbes").get<std::vector<std::array<float, 3>>>();
+                volume.probeBatch = value.at("probeBatch").get<std::string>();
+                volume.filterInsideSolids = value.value("filterInsideSolids", true);
+                std::string volumeError;
+
+                if(!ValidateProbeVolume(volume, &volumeError))
+                {
+                    throw std::runtime_error("Invalid Probe Volume: " + volumeError);
+                }
+
+                object.probeVolume = std::move(volume);
+            }
+
             if(item.contains("audioSource"))
             {
                 const auto& value = item.at("audioSource");
-                ValidateFields(value, {"enabled", "eventGuid", "eventPath", "autoplay"});
+                ValidateFields(value, {"enabled", "eventGuid", "eventPath", "autoplay", "sourceCentricReflections", "bakedReflections"});
 
                 if(!value.at("enabled").is_boolean() || !value.at("eventGuid").is_string() ||
                     !value.at("eventPath").is_string() || !value.at("autoplay").is_boolean())
@@ -1012,6 +1105,27 @@ namespace
                 source.eventGuid = value.at("eventGuid").get<std::string>();
                 source.eventPath = value.at("eventPath").get<std::string>();
                 source.autoplay = value.at("autoplay").get<bool>();
+
+                if(value.contains("sourceCentricReflections"))
+                {
+                    if(!value.at("sourceCentricReflections").is_boolean())
+                    {
+                        throw std::runtime_error("Invalid Audio Source field types for object " + object.id + ".");
+                    }
+
+                    source.sourceCentricReflections = value.at("sourceCentricReflections").get<bool>();
+                }
+
+                if(value.contains("bakedReflections"))
+                {
+                    if(!value.at("bakedReflections").is_boolean())
+                    {
+                        throw std::runtime_error("Invalid Audio Source field types for object " + object.id + ".");
+                    }
+
+                    source.bakedReflections = value.at("bakedReflections").get<bool>();
+                }
+
                 std::string sourceError;
 
                 if(!ValidateAudioSourceComponent(source, &sourceError))
@@ -1025,14 +1139,17 @@ namespace
             if(item.contains("audioListener"))
             {
                 const auto& value = item.at("audioListener");
-                ValidateFields(value, {"enabled"});
+                ValidateFields(value, {"enabled", "bakedReflections"});
 
-                if(!value.at("enabled").is_boolean())
+                if(!value.at("enabled").is_boolean() || (value.contains("bakedReflections") && !value.at("bakedReflections").is_boolean()))
                 {
                     throw std::runtime_error("Invalid Audio Listener field types for object " + object.id + ".");
                 }
 
-                object.audioListener = AudioListenerComponent{value.at("enabled").get<bool>()};
+                AudioListenerComponent listener;
+                listener.enabled = value.at("enabled").get<bool>();
+                listener.bakedReflections = value.value("bakedReflections", false);
+                object.audioListener = listener;
             }
 
             result.objects.push_back(std::move(object));

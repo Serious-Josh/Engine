@@ -38,6 +38,7 @@ namespace
             case AssetType::Mesh:
                 return paths.GetMeshesDirectory();
             case AssetType::AcousticMaterial:
+            case AssetType::ProbeBatch:
                 return paths.GetRoot();
             case AssetType::Script:
                 return paths.GetScriptsDirectory();
@@ -103,7 +104,7 @@ AssetResolution ProjectAssetResolver::Resolve(
 
     // Texture resolution uses the root itself; other category directories
     // must still remain strictly inside it, including through junctions.
-    const bool textureRoot = (record->type == AssetType::Texture || record->type == AssetType::AcousticMaterial) &&
+    const bool textureRoot = (record->type == AssetType::Texture || record->type == AssetType::AcousticMaterial || record->type == AssetType::ProbeBatch) &&
         resolvedCategory == resolvedRoot;
 
     if(!textureRoot && !IsContainedWithin(resolvedCategory, resolvedRoot))

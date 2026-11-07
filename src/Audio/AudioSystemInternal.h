@@ -4,10 +4,12 @@
 
 #include "Audio/AudioSystem.h"
 #include "Audio/SteamAudioRuntime.h"
+#include "Audio/SteamAudioProbes.h"
 #include "Audio/SteamAudioSimulation.h"
 
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #if defined(ENGINE_HAS_FMOD)
@@ -67,6 +69,12 @@ struct AudioSystem::Impl
     std::unique_ptr<Internal::SteamAudioRuntime> steamAudio;
     // SA.3: the simulation sources and D9's worker; present whenever steamAudio is. It borrows steamAudio, so it goes first.
     std::unique_ptr<Internal::SteamAudioSimulation> steamAudioSimulation;
+    // M7: the gameplay session's loaded probes. Gone before the context.
+    std::unique_ptr<Internal::SteamAudioProbeBatches> probeBatches;
+    // M7.1: at most one generation. Joined before the context goes.
+    std::shared_ptr<ProbeGenerationJob> probeJob;
+    std::thread probeThread;
+    void StopProbeGeneration() noexcept;
 #endif
 
     FMOD_RESULT Start(Internal::Output output, InjectedFailure injectedFailure);

@@ -112,6 +112,9 @@ function(engine_deploy_steamaudio target)
             "${ENGINE_STEAMAUDIO_RUNTIME_DIR}/phonon.dll"
             "${ENGINE_STEAMAUDIO_RUNTIME_DIR}/phonon_fmod.dll"
             "$<TARGET_FILE_DIR:${target}>"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${ENGINE_STEAMAUDIO_ROOT}/steamaudio_fmod/THIRDPARTY.md"
+            "$<TARGET_FILE_DIR:${target}>/SteamAudio-THIRDPARTY.md"
         COMMENT "Deploying Steam Audio runtime DLLs for ${target}"
         VERBATIM
     )

@@ -887,6 +887,28 @@ void Engine::ProcessEditorMaterialRequests()
         m_editor.OnMaterialCreationCompleted(request->relativePath, error);
     }
 
+    m_editor.PollProbeGeneration(m_demoSceneManager.GetActiveScene());
+
+    if(auto request = m_editor.TakeProbeBatchRequest())
+    {
+        std::string error;
+        std::string reference;
+
+        if(const auto stored = ProbeBatchAssets::Store(GetActiveProject().GetPaths(), m_projectAssetRegistry, request->encoded, &error))
+        {
+            reference = *stored;
+        }
+
+        m_editor.OnProbeBatchRequestCompleted(m_demoSceneManager.GetActiveScene(), request->objectID, reference, error);
+    }
+
+    if(const auto request = m_editor.TakeProbeCleanupRequest())
+    {
+        std::string error;
+        const std::size_t removed = ProbeAssetCleanup::RemoveConfirmed(GetActiveProject().GetPaths(), m_projectAssetRegistry, request->liveReferences, request->confirmed, error);
+        m_editor.OnProbeCleanupCompleted(removed, error);
+    }
+
     if(const auto request = m_editor.TakeMaterialCreationRequest())
     {
         const ProjectPaths& projectPaths = GetActiveProject().GetPaths();
@@ -1775,10 +1797,44 @@ bool Engine::InitializeProject()
         steamAudioOptions.rayTracer =
             GetActiveProject().GetProjectSettings().settings.audio.steamAudioRayTracer == ProjectSteamAudioRayTracer::Embree ?
             Audio::SteamAudioRayTracer::Embree : Audio::SteamAudioRayTracer::Default;
+        steamAudioOptions.reflectionBounces = static_cast<int>(GetActiveProject().GetProjectSettings().settings.audio.steamAudioReflectionBounces);
+        steamAudioOptions.reflectionRouting = true;
+#if defined(_DEBUG)
+        // M6.5 listening diagnostic, in Debug builds only: no setting, UI or serialization. The plugin's simulation settings are
+        // process-wide and fixed before any bank, so this is read once here; changing it means restarting Engine.
+        steamAudioOptions.reflectionInfrastructureForTesting = std::getenv("ENGINE_DIAG_STEAM_AUDIO_REFLECTIONS") != nullptr;
+        steamAudioOptions.environmentalReverbForTesting = std::getenv("ENGINE_DIAG_STEAM_AUDIO_REVERB") != nullptr;
+        // The listening diagnostics choose their own route.
+        steamAudioOptions.reflectionRouting = !steamAudioOptions.reflectionInfrastructureForTesting && !steamAudioOptions.environmentalReverbForTesting;
+
+        // Reflection routing listening comparison: see tests/SteamAudioFixture/routing/Listen.bat.
+        steamAudioOptions.holdReverbReturnForTesting = std::getenv("ENGINE_DIAG_STEAM_AUDIO_HOLD_RETURN") != nullptr;
+
+        if(const char* const routing = std::getenv("ENGINE_DIAG_STEAM_AUDIO_ROUTING"))
+        {
+            const std::string_view name(routing);
+            steamAudioOptions.reverbRoutingForTesting = name == "combined" ? Audio::SteamAudioReverbRoutingForTesting::Combined :
+                name == "listener" ? Audio::SteamAudioReverbRoutingForTesting::ListenerOnly :
+                name == "source" ? Audio::SteamAudioReverbRoutingForTesting::SourceOnly : Audio::SteamAudioReverbRoutingForTesting::Exclusive;
+        }
+#endif
         m_audio.EnableSteamAudio(steamAudioOptions);
     }
 
     LoadProjectAudioBanks(projectPaths);
+
+#if defined(_DEBUG)
+    // M6.7 listening diagnostic: the authored return's fader, in dB, at each launch.
+    if(const char* const wetDb = std::getenv("ENGINE_DIAG_STEAM_AUDIO_REVERB_WET_DB"))
+    {
+        std::string error;
+
+        if(!m_audio.SetBusVolume("bus:/SteamAudioReverb", std::pow(10.0f, static_cast<float>(std::atof(wetDb)) / 20.0f), error))
+        {
+            Log::Warning("Audio: reverb wet level not applied: " + error);
+        }
+    }
+#endif
 
     // Inspect the reconciled registry without modifying it further.
     std::size_t availableAssets = 0;
@@ -1941,6 +1997,30 @@ void Engine::LoadPackagedAudioBanks()
     {
         Log::Warning("Packaged audio banks not loaded: audio is " + std::string(Audio::ToString(m_audio.GetStatus())) + ".");
         return;
+    }
+
+    // Before any bank, as in the Editor. A failure leaves FMOD running; a bank that holds Steam Audio effects then fails to load, with its own warning.
+    const auto packagedSettings = PackagedRenderingSettings::Admit(
+        m_startupArchive->provider->ArchiveEntry(PackagedRenderingSettings::ID()), [&]()
+        {
+            return m_startupArchive->provider->ReadEntry(PackagedRenderingSettings::ID(),
+                EngineAssetPak::Type::Resource, PackagedRenderingSettings::PayloadVersion,
+                PackagedRenderingSettings::MaximumPayloadBytes);
+        });
+
+    if(packagedSettings.audio.steamAudio)
+    {
+        Audio::SteamAudioOptions steamAudioOptions;
+        steamAudioOptions.rayTracer = packagedSettings.audio.steamAudioRayTracer == ProjectSteamAudioRayTracer::Embree ?
+            Audio::SteamAudioRayTracer::Embree : Audio::SteamAudioRayTracer::Default;
+        steamAudioOptions.reflectionBounces = static_cast<int>(packagedSettings.audio.steamAudioReflectionBounces);
+        steamAudioOptions.reflectionRouting = true;
+
+        if(m_audio.EnableSteamAudio(steamAudioOptions) != Audio::SteamAudioStatus::Active)
+        {
+            Log::Warning("Packaged Steam Audio is unavailable (" + std::string(Audio::ToString(m_audio.GetSteamAudioStatus())) +
+                "). Banks that hold Steam Audio effects will not load; other FMOD audio continues.");
+        }
     }
 
     std::size_t loaded = 0;

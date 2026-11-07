@@ -174,6 +174,8 @@ struct AudioSettings
     bool steamAudio = false;
     // Saved as a name, and never rewritten because of what a session could actually run.
     ProjectSteamAudioRayTracer steamAudioRayTracer = ProjectSteamAudioRayTracer::Default;
+    // How many times reflection rays bounce: 8, 16, 32 or 64. More gives longer tails and more level, at more simulation cost.
+    std::uint32_t steamAudioReflectionBounces = 8;
 
     bool operator==(const AudioSettings&) const = default;
 };

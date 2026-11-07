@@ -197,6 +197,51 @@ bool ValidateScriptComponent(const ScriptComponent& script, std::string* error)
     return reason == nullptr;
 }
 
+bool ValidateProbeVolume(const ProbeVolumeComponent& volume, std::string* error)
+{
+    const char* reason = nullptr;
+
+    for(const float edge : volume.size)
+    {
+        if(!std::isfinite(edge) || edge <= 0.0f)
+        {
+            reason = "Probe Volume size must be positive.";
+        }
+    }
+
+    if(!std::isfinite(volume.probeSpacing) || volume.probeSpacing <= 0.0f)
+    {
+        reason = "Probe spacing must be positive.";
+    }
+    else if(!std::isfinite(volume.heightAboveFloor) || volume.heightAboveFloor < 0.0f)
+    {
+        reason = "Height above floor must not be negative.";
+    }
+    else if(volume.placement != ProbePlacement::UniformFloor && volume.placement != ProbePlacement::Centroid && volume.placement != ProbePlacement::Uniform3D)
+    {
+        reason = "Unknown probe placement.";
+    }
+    else if(volume.manualProbes.size() > ProbeVolumeComponent::MaximumManualProbes || volume.probeBatch.size() > ProbeVolumeComponent::MaximumReferenceBytes)
+    {
+        reason = "Probe Volume data is too large.";
+    }
+
+    for(const auto& probe : volume.manualProbes)
+    {
+        if(!std::isfinite(probe[0]) || !std::isfinite(probe[1]) || !std::isfinite(probe[2]))
+        {
+            reason = "A manual probe has a non-finite position.";
+        }
+    }
+
+    if(reason && error)
+    {
+        *error = reason;
+    }
+
+    return reason == nullptr;
+}
+
 bool ValidateAcousticSettings(const AcousticSettings& settings, std::string* error)
 {
     if(settings.submeshMaterials.size() > AcousticSettings::MaximumAssignments)
@@ -320,6 +365,11 @@ bool ValidateSceneObjectComponents(const SceneObjectDocument& object, std::strin
     if(object.acoustics && !ValidateAcousticSettings(*object.acoustics, &componentError))
     {
         return Fail(errorMessage, "Invalid acoustics for object " + object.id + ": " + componentError);
+    }
+
+    if(object.probeVolume && !ValidateProbeVolume(*object.probeVolume, &componentError))
+    {
+        return Fail(errorMessage, "Invalid Probe Volume for object " + object.id + ": " + componentError);
     }
 
     if(object.physics && !Physics::ValidatePhysicsComponent(*object.physics, &componentError))

@@ -50,6 +50,8 @@ namespace PackagedRenderingSettings
     struct Loaded
     {
         RenderingSettings rendering;
+        // Steam Audio's saved settings travel in the same document. Missing or malformed: off.
+        AudioSettings audio;
         Source source = Source::Missing;
         std::vector<std::string> warnings;
     };

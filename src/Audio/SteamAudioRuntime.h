@@ -30,6 +30,7 @@
 
 #include "Audio/AudioSystem.h"
 
+#include <cstdint>
 #include <string>
 
 #if defined(ENGINE_HAS_FMOD)
@@ -51,6 +52,9 @@
 namespace Audio::Internal
 {
 #if defined(ENGINE_HAS_STEAMAUDIO)
+inline constexpr int SteamAudioReflectionMaxOrder = 1;
+inline constexpr float SteamAudioReflectionMaxDuration = 1.0f;
+
 class SteamAudioRuntime final
 {
 public:
@@ -75,10 +79,36 @@ public:
     // SA.2: whether a spatializer (IsSpatializer) applies distance attenuation as authored. FMOD Studio stores the
     // effect's UI default, Off, unless the author chooses Curve-Driven or Physics-Based. Unreadable counts as on.
     bool HasDistanceAttenuation(FMOD::DSP& spatializer) const;
+    // M6.5: read only, the effect's Apply Reflections as authored in FMOD Studio. Engine never writes it. Unreadable counts as off.
+    bool AppliesReflections(FMOD::DSP& spatializer) const;
 
     // SA.3: binds `source` to a new spatializer, once, before it processes. The plugin's handle exists only inside
     // this call: its registry recycles handles, and the DSP keeps its own reference to the source. Thread-safe.
     bool BindSimulationSource(FMOD::DSP& spatializer, IPLSource source) const;
+
+    // M6.4: process-wide in the plugin until Terminate, and every spatializer reads it. Before any bank; never changed while
+    // DSPs exist. False when the plugin lacks the entry point.
+    bool SetPluginSimulationSettings(const IPLSimulationSettings& settings) const;
+    // M6.7. False when the plugin lacks the export.
+    bool SetPluginReverbSource(IPLSource source) const;
+    // One of the plugin's effects, unconnected. The caller owns it. Null when the plugin has no effect of that name.
+    FMOD::DSP* CreateEffectByName(FMOD::System& core, std::string_view name) const;
+    void SetAppliesReflections(FMOD::DSP& spatializer, bool applies) const;
+
+    // Verification only, before Start.
+    void SetContextAllocatorForTesting(void* (*allocate)(std::size_t, std::size_t), void (*release)(void*), bool useSdkAllocator) noexcept
+    {
+        m_testAllocate = allocate;
+        m_testFree = release;
+        m_useSdkAllocator = useSdkAllocator;
+    }
+
+    // M6.6: sizes the mixer pool from what this session's effects really allocate at the mixer's format. Main thread, before any bank.
+    // On failure Steam Audio simply stays on the heap, as a warning says.
+    void ArmMixerPool(FMOD::System& core, bool reflectionsActive, const SteamAudioOptions& options);
+    // Main thread, every update: hands back heap blocks freed during a mix, and reports exhaustion once per occurrence.
+    void UpdateMixerPool() noexcept;
+    SteamAudioMixerPoolStats GetMixerPoolStats() const noexcept;
 
     // D9 handshake only: a real spatializer connected to nothing, which no mixer block can reach; and the bind above,
     // returning the source's reference count as the plugin leaves it, for a source whose owner holds one reference.
@@ -117,6 +147,17 @@ private:
     using RemoveSourceFunction = void(F_CALL*)(IPLint32);
     AddSourceFunction m_addSource = nullptr;
     RemoveSourceFunction m_removeSource = nullptr;
+    using SetSimulationSettingsFunction = void(F_CALL*)(IPLSimulationSettings);
+    SetSimulationSettingsFunction m_setSimulationSettings = nullptr;
+    using SetReverbSourceFunction = void(F_CALL*)(IPLSource);
+    SetReverbSourceFunction m_setReverbSource = nullptr;
+    void* (*m_testAllocate)(std::size_t, std::size_t) = nullptr;
+    void (*m_testFree)(void*) = nullptr;
+    bool m_useSdkAllocator = false;
+    bool m_usesMixerAllocator = false;
+    std::uint64_t m_reportedMixerHeapAllocations = 0;
+    std::uint64_t m_reportedBadFrees = 0;
+    bool m_reportedLargerClass = false;
     int m_sampleRate = 0;
     int m_blockLength = 0;
 };

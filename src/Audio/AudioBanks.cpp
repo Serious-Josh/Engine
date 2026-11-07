@@ -615,6 +615,46 @@ bool AudioSystem::StopEvent(EventHandle handle, bool allowFadeOut)
 #endif
 }
 
+bool AudioSystem::HasEventTimelineEnded(EventHandle handle) const
+{
+#if defined(ENGINE_HAS_FMOD)
+    FMOD::Studio::EventInstance* const instance = static_cast<FMOD::Studio::EventInstance*>(GetNativeEventForTesting(handle));
+    FMOD::Studio::EventDescription* description = nullptr;
+    int length = 0;
+    int position = 0;
+    return instance && instance->getDescription(&description) == FMOD_OK && description->getLength(&length) == FMOD_OK && length > 0 &&
+        instance->getTimelinePosition(&position) == FMOD_OK && position >= length;
+#else
+    static_cast<void>(handle);
+    return false;
+#endif
+}
+
+void AudioSystem::SetSteamAudioReflectionBounces(int bounces) noexcept
+{
+#if defined(ENGINE_HAS_STEAMAUDIO)
+    if(m_impl->steamAudioSimulation)
+    {
+        m_impl->steamAudioSimulation->SetReflectionBounces(bounces);
+    }
+#else
+    static_cast<void>(bounces);
+#endif
+}
+
+bool AudioSystem::SetEventSourceCentricReflections(EventHandle handle, bool enabled)
+{
+#if defined(ENGINE_HAS_STEAMAUDIO)
+    FMOD::Studio::EventInstance* instance = m_impl->ResolveEvent(handle);
+
+    return instance && m_impl->steamAudioSimulation && m_impl->steamAudioSimulation->SetSourceCentricRequest(*instance, enabled);
+#else
+    static_cast<void>(handle);
+    static_cast<void>(enabled);
+    return false;
+#endif
+}
+
 bool AudioSystem::ReleaseEvent(EventHandle handle)
 {
 #if defined(ENGINE_HAS_FMOD)

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -165,11 +166,29 @@ enum class SteamAudioInjectedFailure
     // M4 Stage 2 (these fall back to the default ray tracer): iplEmbreeDeviceCreate fails.
     EmbreeDevice,
     // The device was created, but Embree does not give the right answer on a known scene.
-    EmbreeProbe
+    EmbreeProbe,
+    // M6.4 (these leave direct simulation running): reflection dimensions disagree, so the infrastructure stays off.
+    ReflectionCompatibility,
+    // The reflection worker cannot start, so the infrastructure stays off.
+    ReflectionWorkerStart
 };
 
 // M4 Stage 2: which CPU ray tracer builds the acoustic scene. Independent of SteamAudioSynchronization, and fixed for the
 // session: a simulator's scene type cannot change, and every scene in it must be of that type.
+// Listening diagnostic only. How events authored with Apply Reflections use the reverb when environmentalReverbForTesting is on.
+enum class SteamAudioReverbRoutingForTesting
+{
+    // The M6.7 behaviour: an event uses its reflection slot or the reverb, never both.
+    Exclusive,
+    // With reflectionInfrastructureForTesting and no reverb: every send stays open, so a Mixer Return sharing the bus keeps processing. With no
+    // reverb source, the Steam Audio Reverb DSP adds nothing. A diagnostic workaround, not a production routing decision.
+    SourceOnly,
+    // No event gets a reflection slot; every event sends to the reverb.
+    ListenerOnly,
+    // An event with a slot keeps its send open too. Both responses overlap, deliberately and uncompensated.
+    Combined
+};
+
 enum class SteamAudioRayTracer
 {
     Default,
@@ -200,6 +219,35 @@ struct SteamAudioOptions
     // Verification: use the DSP lock path whatever the compatibility gate would say.
     bool forceDspLockSynchronization = false;
     SteamAudioRayTracer rayTracer = SteamAudioRayTracer::Default;
+    // M6.4 verification only, and never a user setting. Off: no plugin settings call, no reflection worker, no reflection
+    // resources. Fixed before audio initialization for the whole session, because the plugin call is process-wide and every
+    // spatializer reads it. No reflected audio is produced either way; see SteamAudioIntegration.md, section 25.
+    bool reflectionInfrastructureForTesting = false;
+    // M6.7 verification only, and never a user setting: listener-centric reverb through an authored return and sends. Starts the
+    // reflection infrastructure if needed. An event uses its reflection slot or the reverb, never both. See SteamAudioIntegration.md, section 28.
+    bool environmentalReverbForTesting = false;
+    SteamAudioReverbRoutingForTesting reverbRoutingForTesting = SteamAudioReverbRoutingForTesting::Exclusive;
+    // Production route: every eligible event feeds the shared listener-centric reverb through its post-Spatializer send, and events that ask
+    // also get source-centric reflections. Engine owns the return's Reverb and Mixer Return DSPs. Stereo mixer only. Section 29.
+    bool reflectionRouting = false;
+    // How many times reflection rays bounce. See SetSteamAudioReflectionBounces.
+    int reflectionBounces = 8;
+    // Listening diagnostic only: holds bus:/SteamAudioReverb open with lockChannelGroup. Releasing a Steam Audio Reverb DSP clears the plugin's reverb source,
+    // and Engine sets it once, so without this the listener-centric path is silent after the bus is freed. Not a production lifecycle.
+    bool holdReverbReturnForTesting = false;
+    // Verification only: treat every spatializer as authored with Apply Reflections, for tests of the worker and its capacity.
+    bool assumeReflectionConsumersForTesting = false;
+    // Verification only: reflection sources simulate, but the plugin gets a null IR.
+    bool withholdReflectionIrForTesting = false;
+    // Verification only: Steam Audio context allocator, for poison-on-free and per-thread allocation counts.
+    // M6.6: the mixer pool is on unless a test replaces the allocator or asks for the SDK's own (a before/after baseline).
+    bool useSdkAllocatorForTesting = false;
+    // Fills freed pool blocks, so anything relying on freed or zeroed memory misbehaves visibly.
+    bool fillFreedPoolBlocksForTesting = false;
+    // Multiplies the supported DSP counts the pool is sized for; below 1 forces exhaustion.
+    float poolCapacityScaleForTesting = 1.0f;
+    void* (*contextAllocateForTesting)(std::size_t size, std::size_t alignment) = nullptr;
+    void (*contextFreeForTesting)(void* block) = nullptr;
 };
 
 // The direct results of one simulation of one source: plain values, as the plugin reads them.
@@ -220,6 +268,31 @@ using SteamAudioSnapshotPublishFilter = void (*)(SteamAudioDirectSnapshot& slot)
 using SteamAudioSnapshotReadObserver = void (*)(const SteamAudioDirectSnapshot& snapshot, const void* source);
 
 // SA.3: the simulation sources of the running system, for diagnostics and verification.
+// M6.6: what Steam Audio's allocations during a mix did. See SteamAudioMixerAllocator.h.
+struct SteamAudioMixerPoolStats
+{
+    bool armed = false;
+    std::size_t capacityBytes = 0;
+    std::size_t usedBytes = 0;
+    std::size_t peakBytes = 0;
+    std::size_t outstandingBlocks = 0;
+    std::uint64_t poolAllocations = 0;
+    std::uint64_t poolFrees = 0;
+    // Pool exhausted or unsupported request: the heap served it, on the mixer. Logged. Zero in the supported workload.
+    std::uint64_t mixerHeapAllocations = 0;
+    // Heap blocks freed during a mix, handed to the main thread.
+    std::uint64_t mixerHeapFrees = 0;
+    // A full size class served from a larger one: still no heap, and the warning that the pool is short.
+    std::uint64_t largerClassAllocations = 0;
+    std::size_t largestHeapRequest = 0;
+    std::uint64_t doubleFrees = 0;
+    std::uint64_t invalidFrees = 0;
+    // Process lifetime: regions kept past their session for late blocks, regions unmapped, and regions held now.
+    std::uint64_t regionsRetained = 0;
+    std::uint64_t regionsReclaimed = 0;
+    int regionsHeld = 0;
+};
+
 struct SteamAudioSimulationStats
 {
     bool simulatorActive = false;
@@ -244,6 +317,60 @@ struct SteamAudioSimulationStats
     std::uint64_t simulationRuns = 0;
     // Option B: sources whose private half failed (they stay neutral), and the worker's and plugin's accounting.
     std::uint64_t privateSourceFailures = 0;
+    // Option B private-source lifetime: created by the worker, removed from simulation (Stage A), released (Stage B).
+    std::uint64_t privateSourcesCreated = 0;
+    std::uint64_t privateSourcesRemoved = 0;
+    std::uint64_t privateSourcesReleased = 0;
+    // M6.4 reflection infrastructure: off unless a verification session asked for it and it passed its checks.
+    bool reflectionInfrastructureActive = false;
+    std::string reflectionInfrastructureDetail;
+    int reflectionSourceCapacity = 0;
+    // Reflection-capable private sources now in the simulator; sources over capacity simulate direct only and are counted.
+    std::size_t reflectionSources = 0;
+    std::uint64_t reflectionCapacityExhausted = 0;
+    // M6.5: sources whose IR the plugin can read, and the plugin's reads of it, counted when each source is reclaimed.
+    std::uint64_t reflectionIrPublished = 0;
+    // M6.7. Now: events with a reflection slot, and events whose send is open. Ever: sends opened, and waiting events given a slot
+    // after they had fallen back. Events with no authored send cannot fall back.
+    bool environmentalReverbActive = false;
+    std::size_t reflectionSlotEvents = 0;
+    std::size_t reverbFallbackEvents = 0;
+    std::uint64_t reverbSends = 0;
+    std::uint64_t reflectionSlotPromotions = 0;
+    std::uint64_t reverbEventsWithoutSend = 0;
+    bool reverbIrPublished = false;
+    // Production route. Requested source-centric events that hold no slot now, and how often a request found none free.
+    bool reflectionRoutingActive = false;
+    bool reflectionReturnInstalled = false;
+    std::uint64_t reflectionSessions = 0;
+    std::size_t sourceCentricUnavailableEvents = 0;
+    std::uint64_t sourceCentricDenied = 0;
+    // Asked for source-centric reflections on an event with no Send anywhere in it. No slot: nothing of it would reach the return.
+    std::uint64_t sourceCentricWithoutSend = 0;
+    std::uint64_t sourceCentricSendChecks = 0;
+    // The event's groups weren't readable when asked, so the slot was granted.
+    std::uint64_t sourceCentricSendChecksUnreadable = 0;
+    // The plugin dropped the reverb source. Never expected while Engine owns the DSPs.
+    std::uint64_t reverbBindingLost = 0;
+    std::uint64_t reverbIrReads = 0;
+    std::uint64_t reflectionIrReads = 0;
+    std::uint64_t reflectionRuns = 0;
+    // Reflection frames replaced before they ran: skipped, never queued.
+    std::uint64_t reflectionFramesCoalesced = 0;
+    // Direct-first scheduling: times a reflection run gave way, and runs let through to prevent starvation.
+    std::uint64_t reflectionDeferrals = 0;
+    std::uint64_t reflectionForcedRuns = 0;
+    // The most reflection runs that completed during one wait of the direct worker at the gate.
+    std::uint64_t maximumReflectionRunsDuringGateWait = 0;
+    double maximumReflectionRunMicroseconds = 0.0;
+    // Start to start of successive reflection runs, and from a frame being posted to its run starting.
+    double reflectionIntervalMicrosecondsSum = 0.0;
+    double maximumReflectionIntervalMicroseconds = 0.0;
+    std::uint64_t reflectionIntervals = 0;
+    double reflectionWakeMicrosecondsSum = 0.0;
+    double maximumReflectionWakeMicroseconds = 0.0;
+    // Longest a simulator or scene change waited for a reflection run. Direct simulation does not wait with it.
+    double maximumSimulatorGateWaitMicroseconds = 0.0;
     std::uint64_t snapshotsPublished = 0;
     std::uint64_t publicationsSkipped = 0;
     // Frames replaced before the worker took them: simulation slower than its cadence.
@@ -301,6 +428,14 @@ struct SteamAudioSimulationTestControls
     bool volumetricOcclusion = false;
     // Simulation time added inside the simulation span (under the lock, for the DSP lock path).
     int injectedSimulationMilliseconds = 0;
+    // Added inside the reflection run, with the simulator gate held.
+    int injectedReflectionMilliseconds = 0;
+    // Verification only: measures each reflection interval from the last due frame, which rounds up to the frame and simulation ticks.
+    bool legacyReflectionCadence = false;
+    // Verification only: reflection runs start without giving way to direct work, to compare against direct-first scheduling.
+    bool disableDirectFirstScheduling = false;
+    // Verification only: reflection runs always see direct work pending, so only the starvation limit lets them through.
+    bool reportDirectWorkAlwaysPending = false;
     // Each source's fill is abandoned before Publish.
     bool skipPublication = false;
     SteamAudioSnapshotPublishFilter publishFilter = nullptr;
@@ -341,6 +476,122 @@ struct AcousticMeshData
 
 // Engine's convention: row-indexed storage, column-vector math, translation in column 3.
 using AcousticTransform = std::array<std::array<float, 4>, 4>;
+
+// M7. UniformFloor and Centroid are Steam Audio's own; Uniform3D is an Engine-computed grid (see SteamAudioProbes).
+enum class ProbePlacementMode
+{
+    UniformFloor,
+    Centroid,
+    Uniform3D
+};
+
+struct ProbeGeometryObject
+{
+    std::shared_ptr<const AcousticMeshData> mesh;
+    AcousticTransform world{};
+};
+
+// All values in Engine space.
+struct ProbeGenerationRequest
+{
+    ProbePlacementMode placement = ProbePlacementMode::UniformFloor;
+    // The volume's object. The volume is a box of `size`, centred on this transform's origin.
+    AcousticTransform world{};
+    std::array<float, 3> size{};
+    float spacing = 0.0f;
+    float height = 0.0f;
+    // In the object's local space.
+    std::vector<std::array<float, 3>> manualProbes;
+    // Read by UniformFloor, and by Uniform3D when filtering.
+    std::vector<ProbeGeometryObject> geometry;
+    // Drops generated probes inside provably closed geometry. Floor and Uniform 3D; never manual probes.
+    bool filterInsideSolids = false;
+};
+
+struct ProbeSphere
+{
+    std::array<float, 3> center{};
+    float radius = 0.0f;
+};
+
+struct ProbeGenerationResult
+{
+    bool success = false;
+    std::string error;
+    std::vector<ProbeSphere> probes;
+    // What iplProbeBatchSave wrote.
+    std::vector<std::byte> batch;
+    // Manual probes dropped for coinciding with another probe.
+    std::size_t duplicatesRemoved = 0;
+    // Stopped on request. `error` says so too.
+    bool cancelled = false;
+    // Inside-solid filter: dropped, kept because they could not be classified, and the surfaces it could and could not trust.
+    std::size_t rejectedProbes = 0;
+    std::size_t ambiguousProbes = 0;
+    std::size_t closedPieces = 0;
+    std::size_t openPieces = 0;
+    // Every generated probe lay inside closed geometry that also holds the whole box, which is more likely a room with outward faces: all were kept.
+    bool enclosedByOneShell = false;
+};
+
+enum class ProbeGenerationStage
+{
+    Starting,
+    BuildingScene,
+    // Inside Steam Audio's generator, which reports no progress and can't be interrupted.
+    Placing,
+    Filtering,
+    Packing,
+    Finished
+};
+
+// One generation running on its own thread, on data it owns. Cancelling takes effect at the next checkpoint between SDK calls.
+class ProbeGenerationJob final
+{
+public:
+    void Cancel() noexcept { m_cancel.store(true, std::memory_order_relaxed); }
+    bool IsCancelRequested() const noexcept { return m_cancel.load(std::memory_order_relaxed); }
+    bool IsFinished() const noexcept { return m_finished.load(std::memory_order_acquire); }
+    ProbeGenerationStage GetStage() const noexcept { return m_stage.load(std::memory_order_relaxed); }
+    // Of the current stage; 0 of 0 when it can't tell.
+    std::uint64_t GetDone() const noexcept { return m_done.load(std::memory_order_relaxed); }
+    std::uint64_t GetTotal() const noexcept { return m_total.load(std::memory_order_relaxed); }
+    // Only once finished.
+    ProbeGenerationResult& GetResult() noexcept { return m_result; }
+
+    // The generator's side.
+    void SetStage(ProbeGenerationStage stage, std::uint64_t total = 0) noexcept
+    {
+        m_total.store(total, std::memory_order_relaxed);
+        m_done.store(0, std::memory_order_relaxed);
+        m_stage.store(stage, std::memory_order_relaxed);
+    }
+    void SetDone(std::uint64_t done) noexcept { m_done.store(done, std::memory_order_relaxed); }
+    void Finish(ProbeGenerationResult result) noexcept
+    {
+        m_result = std::move(result);
+        SetStage(ProbeGenerationStage::Finished);
+        m_finished.store(true, std::memory_order_release);
+    }
+
+private:
+    std::atomic<bool> m_cancel{false};
+    std::atomic<bool> m_finished{false};
+    std::atomic<ProbeGenerationStage> m_stage{ProbeGenerationStage::Starting};
+    std::atomic<std::uint64_t> m_done{0};
+    std::atomic<std::uint64_t> m_total{0};
+    ProbeGenerationResult m_result;
+};
+
+// Batches held for a gameplay session. Nothing consumes them until M8.
+struct ProbeBatchStats
+{
+    std::size_t loadedBatches = 0;
+    std::size_t loadedProbes = 0;
+    std::uint64_t batchesCreated = 0;
+    std::uint64_t batchesReleased = 0;
+    std::uint64_t loadFailures = 0;
+};
 
 // Engine-owned FMOD Studio system (Audio.1A). Construct, use and destroy on the main thread. FMOD types never appear
 // in this interface; the Studio system, and the Core system it owns, stay private to the audio module.
@@ -414,8 +665,20 @@ public:
     bool RemoveAcousticObject(std::uint64_t id);
     bool ClearAcousticScene();
 
+    // --- M7 probes: main thread. ---
+    // Blocks until done. Needs Steam Audio Active, because the SDK objects need its context. A failure changes nothing and says why.
+    ProbeGenerationResult GenerateProbes(const ProbeGenerationRequest& request) const;
+    // As GenerateProbes, on a worker thread. One at a time: nullptr while another runs or when Steam Audio isn't active. Shutdown cancels
+    // the job and waits for it, before the context goes; the returned object stays readable after that.
+    std::shared_ptr<ProbeGenerationJob> StartProbeGeneration(ProbeGenerationRequest request);
+    // `batch` must already have passed ProbeBatchAssets::Decode. Holds the batch until ClearProbeBatches or Shutdown; never adds it to the simulator.
+    bool LoadProbeBatch(std::span<const std::byte> batch, std::size_t expectedProbes, std::string& error);
+    void ClearProbeBatches() noexcept;
+    ProbeBatchStats GetProbeBatchStats() const noexcept;
+
     // SA.3 diagnostics: zeros unless Steam Audio is Active.
     SteamAudioSimulationStats GetSteamAudioSimulationStats() const;
+    SteamAudioMixerPoolStats GetSteamAudioMixerPoolStats() const;
     // SA.3 verification: Steam Audio's IPLContext (opaque), an immediate simulation tick, the source table and the
     // simulation inputs production does not use yet.
     void* GetSteamAudioContextForTesting() const noexcept;
@@ -425,6 +688,8 @@ public:
     // The opaque FMOD::System, and the worker's native thread handle (null without a worker).
     void* GetNativeCoreForTesting() const noexcept;
     void* GetSteamAudioWorkerThreadForTesting() const noexcept;
+    // The authored reverb return's channel group; null unless the verification reverb is active and its bank is loaded.
+    void* GetSteamAudioReverbGroupForTesting() const noexcept;
     // The opaque FMOD instance behind a handle, to match it against a SteamAudioSourceSnapshot; null when stale.
     void* GetNativeEventForTesting(EventHandle handle) const;
 
@@ -462,6 +727,13 @@ public:
     // Creates one instance of a loaded event; AudioSystem tracks it until ReleaseEvent, its bank unloads or Shutdown.
     // The returned handle is the caller's only way to reach it.
     std::optional<EventHandle> CreateEventInstance(const Guid& event, std::string& error);
+    // Before StartEvent. Asks for source-centric reflections on this instance's spatializers. False when the handle is stale or the route is off.
+    bool SetEventSourceCentricReflections(EventHandle handle, bool enabled);
+    // Taken up by the next reflection simulation, with no rebuild: bounces are an input to each run, not part of the simulator. Main thread.
+    void SetSteamAudioReflectionBounces(int bounces) noexcept;
+    // True once the event's timeline has reached its end and only effect tails keep it alive. A looping or sustaining event never gets
+    // there, and an event with no timeline length never reports it.
+    bool HasEventTimelineEnded(EventHandle handle) const;
     bool StartEvent(EventHandle handle);
     bool StopEvent(EventHandle handle, bool allowFadeOut);
     // Gives the instance back to FMOD, which destroys it once it has stopped (a looping event must be stopped
@@ -470,6 +742,13 @@ public:
     PlaybackState GetPlaybackState(EventHandle handle) const;
     // Tracked instances whose handles are still valid.
     std::size_t GetEventInstanceCount() const;
+
+    // --- Production reflection route: one gameplay session at a time -------------------------------------------------
+    // Holds the return bus and installs Engine's DSPs. Sends open only between these calls, so an empty return never passes dry signal.
+    void BeginReflectionSession() noexcept;
+    void EndReflectionSession() noexcept;
+    // True silences the shared listener-centric response without closing sends, which keep the Mixer Return processing source-centric reflections.
+    void SetListenerReflectionsWithheld(bool withheld) noexcept;
 
     // --- Audio.1C control ----------------------------------------------------------------------------------------
     // Volumes are linear gains in [0, MaximumVolume]; parameter values must be finite (FMOD clamps them to the

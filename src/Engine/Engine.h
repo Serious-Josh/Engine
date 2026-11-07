@@ -132,6 +132,8 @@ class Engine
     friend class ProjectSystemWorkflowVerification;
     friend class ProjectRelaunchVerification;
     void VerifyPackagedBootstrap();
+    void VerifyPackagedReflections();
+    void VerifyPackagedProbes();
     // Preparation checkpoint only. Never enters the publication coordinator.
     bool VerifyCookedMeshGPUPreparation(const std::filesystem::path& scenePath,
         std::shared_ptr<const CookedMeshSource::Provider> source = {});

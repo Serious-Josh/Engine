@@ -322,6 +322,19 @@ namespace
 bool ValidateProjectSettings(ProjectSettings& settings, std::vector<std::string>* warnings)
 {
     bool valid = true;
+    std::uint32_t& bounces = settings.audio.steamAudioReflectionBounces;
+
+    if(bounces != 8 && bounces != 16 && bounces != 32 && bounces != 64)
+    {
+        if(warnings)
+        {
+            warnings->push_back("audio.steamAudio.reflectionBounces must be 8, 16, 32 or 64; using 8.");
+        }
+
+        bounces = 8;
+        valid = false;
+    }
+
     auto& rendering = settings.rendering;
     const RenderingSettings defaults;
 
@@ -513,6 +526,7 @@ namespace ProjectSettingsFile
         ReadRendering(root.Child("rendering"), loaded.settings.rendering);
         root.Child("audio").Child("steamAudio").Bool("enabled", loaded.settings.audio.steamAudio);
         root.Child("audio").Child("steamAudio").Name("rayTracer", loaded.settings.audio.steamAudioRayTracer, kSteamAudioRayTracers);
+        root.Child("audio").Child("steamAudio").UInt("reflectionBounces", loaded.settings.audio.steamAudioReflectionBounces, 8, 64);
         ValidateProjectSettings(loaded.settings, &loaded.warnings);
         loaded.document = std::move(document);
         return loaded;
@@ -593,6 +607,7 @@ namespace ProjectSettingsFile
         auto& steamAudio = ObjectMember(ObjectMember(document, "audio"), "steamAudio");
         steamAudio["enabled"] = settings.audio.steamAudio;
         steamAudio["rayTracer"] = std::string(NameOf(kSteamAudioRayTracers, settings.audio.steamAudioRayTracer));
+        steamAudio["reflectionBounces"] = settings.audio.steamAudioReflectionBounces;
 
         return document.dump(4) + "\n";
     }

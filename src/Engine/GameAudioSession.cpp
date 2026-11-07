@@ -116,6 +116,26 @@ void GameAudioSession::Begin()
     End();
     m_session = ++g_sessionCounter;
     m_active = true;
+
+    if(Running())
+    {
+        m_audio->BeginReflectionSession();
+    }
+}
+
+void GameAudioSession::SetListenerBakedReflections(bool baked)
+{
+    if(!Running())
+    {
+        return;
+    }
+
+    if(baked)
+    {
+        Warn("the Audio Listener asks for baked reflections, and no baked data is available yet; shared listener-centric reflections are silent.");
+    }
+
+    m_audio->SetListenerReflectionsWithheld(baked);
 }
 
 bool GameAudioSession::Running() const noexcept
@@ -282,9 +302,19 @@ void GameAudioSession::End() noexcept
         // Logging allocation failure only; the session still ends.
     }
 
+    if(running)
+    {
+        m_audio->EndReflectionSession();
+    }
+
     if(running && !m_acousticObjects.empty())
     {
         m_audio->ClearAcousticScene();
+    }
+
+    if(m_audio)
+    {
+        m_audio->ClearProbeBatches();
     }
 
     m_acousticObjects.clear();
@@ -296,6 +326,24 @@ void GameAudioSession::End() noexcept
     m_listenerKey.clear();
     m_listenerLastPosition.reset();
     m_active = false;
+}
+
+void GameAudioSession::LoadProbeBatch(const std::string& objectName, std::span<const std::byte> batch, std::size_t probes)
+{
+    if(!Running() || m_audio->GetSteamAudioStatus() != Audio::SteamAudioStatus::Active)
+    {
+        return;
+    }
+
+    std::string error;
+
+    if(!m_audio->LoadProbeBatch(batch, probes, error))
+    {
+        Warn("Probe Volume '" + objectName + "': " + error + ".");
+        return;
+    }
+
+    Log::Info("Probe Volume '" + objectName + "': " + std::to_string(probes) + " probes loaded. Nothing consumes them yet.");
 }
 
 void GameAudioSession::PublishAcousticScene(std::vector<AcousticObject> objects)
@@ -437,7 +485,7 @@ void GameAudioSession::StartSceneSources(const std::vector<SceneSource>& sources
 }
 
 std::optional<Audio::EventHandle> GameAudioSession::StartPlaced(const Audio::Guid& guid,
-    const std::optional<ObjectPose>& pose, const std::string& context)
+    const std::optional<ObjectPose>& pose, const std::string& context, bool sourceCentricReflections)
 {
     if(m_events.size() >= MaximumEvents)
     {
@@ -452,6 +500,11 @@ std::optional<Audio::EventHandle> GameAudioSession::StartPlaced(const Audio::Gui
     {
         Warn(context + ": " + error);
         return std::nullopt;
+    }
+
+    if(sourceCentricReflections && !m_audio->SetEventSourceCentricReflections(*created, true))
+    {
+        Warn(context + ": source-centric reflections are unavailable in this session; it plays without them.");
     }
 
     // Positioned before it starts, so the first mixed block is already in place (no pan jump from the origin).
@@ -495,7 +548,16 @@ bool GameAudioSession::StartSource(SourceState& source)
         return false;
     }
 
-    const auto started = StartPlaced(*guid, pose, context);
+    bool sourceCentric = source.authored.sourceCentricReflections;
+
+    if(sourceCentric && source.authored.bakedReflections)
+    {
+        // Baked was asked for: real time would be a different sound than the author chose.
+        Warn(context + ": baked source-centric reflections are not available yet, so they do not play. Listener-centric reflections still do.");
+        sourceCentric = false;
+    }
+
+    const auto started = StartPlaced(*guid, pose, context, sourceCentric);
 
     if(!started)
     {
@@ -938,8 +1000,10 @@ bool GameAudioSession::PlayAudioSource(std::string_view objectKey)
 
     const OwnedEvent* current = source->event ? FindOwned(*source->event) : nullptr;
 
-    // One instance per source: Play while it is playing changes nothing.
-    if(current && IsEventSounding(*current))
+    // One running timeline per source: Play while it is playing changes nothing. A timeline that has ended is only ringing out an effect
+    // tail, which for source-centric reflections outlasts the event by far. That must not swallow the next Play, so the tail finishes
+    // alongside the new instance and Update releases it.
+    if(current && IsEventSounding(*current) && !m_audio->HasEventTimelineEnded(current->handle))
     {
         return true;
     }
@@ -963,6 +1027,18 @@ bool GameAudioSession::StopAudioSource(std::string_view objectKey, bool allowFad
     // Stopping before autoplay cancels it: the script decided the source stays silent.
     source->autoplayHandled = true;
     const OwnedEvent* current = source->event && Running() ? FindOwned(*source->event) : nullptr;
+
+    // Tails of earlier Plays stop with it.
+    if(Running())
+    {
+        for(const OwnedEvent& event : m_events)
+        {
+            if(event.sceneSource && event.objectID == source->authored.objectID && (!current || event.handle != current->handle))
+            {
+                m_audio->StopEvent(event.handle, allowFadeOut);
+            }
+        }
+    }
 
     // The event stays owned until FMOD reports it stopped (after any fade-out); Update then releases it.
     return !current || m_audio->StopEvent(current->handle, allowFadeOut);

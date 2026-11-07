@@ -1,9 +1,12 @@
 #include "Audio/AudioSystemInternal.h"
 
 #if defined(ENGINE_HAS_STEAMAUDIO)
+#include "Audio/SteamAudioMixerAllocator.h"
+#include "Core/Log.h"
 #include "Audio/SteamAudioSnapshotSource.h"
 
 #include <atomic>
+#include <cmath>
 #include <filesystem>
 #include <string_view>
 #endif
@@ -45,6 +48,9 @@ namespace
     // IPL_SPATIALIZE_APPLY_DISTANCEATTENUATION: Off (0), Physics-Based (1) or Curve-Driven (2), as authored.
     constexpr int DistanceAttenuationParameter = 2;
     constexpr std::string_view DistanceAttenuationName = "ApplyDA";
+    // IPL_SPATIALIZE_APPLY_REFLECTIONS.
+    constexpr int ApplyReflectionsParameter = 7;
+    constexpr std::string_view ApplyReflectionsName = "ApplyRefl";
 
     // phonon.dll stays loaded for the process once loaded: the delay-load thunks keep pointing into it.
     std::atomic<bool> phononLoaded{false};
@@ -133,6 +139,50 @@ bool SteamAudioRuntime::Start(FMOD::System& core, SteamAudioInjectedFailure inje
     return true;
 }
 
+namespace
+{
+    // The DSP counts the pool holds without touching the heap. Reflection DSPs match the simulator's source capacity. Direct DSPs
+    // count every spatializer playing at once; beyond them Steam Audio still works, with a warning.
+    constexpr float SupportedSpatializers = 64.0f;
+    constexpr float SupportedReflectionSpatializers = 16.0f;
+    // Small blocks vary with channel changes between a DSP's first blocks. Blocks from this size up are one per effect.
+    constexpr std::size_t ExactDemandFromBytes = 64 * 1024;
+    constexpr float SmallBlockMargin = 1.25f;
+    constexpr std::size_t ExtraSmallBlocks = 4;
+
+    // Marks exactly the span in which the plugin can allocate on the mixer. FMOD runs both on the thread that mixes.
+    FMOD_RESULT F_CALL MixBoundaryCallback(FMOD_SYSTEM*, FMOD_SYSTEM_CALLBACK_TYPE type, void*, void*, void*)
+    {
+        if(type == FMOD_SYSTEM_CALLBACK_PREMIX)
+        {
+            SteamAudioMixerAllocator::EnterMix();
+        }
+        else if(type == FMOD_SYSTEM_CALLBACK_POSTMIX)
+        {
+            SteamAudioMixerAllocator::LeaveMix();
+        }
+
+        return FMOD_OK;
+    }
+
+    IPLSpeakerLayoutType LayoutForChannels(int channels)
+    {
+        switch(channels)
+        {
+        case 1:
+            return IPL_SPEAKERLAYOUTTYPE_MONO;
+        case 4:
+            return IPL_SPEAKERLAYOUTTYPE_QUADRAPHONIC;
+        case 6:
+            return IPL_SPEAKERLAYOUTTYPE_SURROUND_5_1;
+        case 8:
+            return IPL_SPEAKERLAYOUTTYPE_SURROUND_7_1;
+        default:
+            return IPL_SPEAKERLAYOUTTYPE_STEREO;
+        }
+    }
+}
+
 bool SteamAudioRuntime::LoadRuntime(SteamAudioInjectedFailure injectedFailure, std::string& error)
 {
     const std::filesystem::path directory = ExecutableDirectory();
@@ -177,6 +227,9 @@ bool SteamAudioRuntime::LoadRuntime(SteamAudioInjectedFailure injectedFailure, s
     m_setHRTF = Resolve<SetHRTFFunction>(m_plugin, "iplFMODSetHRTF");
     m_addSource = Resolve<AddSourceFunction>(m_plugin, "iplFMODAddSource");
     m_removeSource = Resolve<RemoveSourceFunction>(m_plugin, "iplFMODRemoveSource");
+    // Optional: only the reflection infrastructure needs it, and it stays off without it.
+    m_setSimulationSettings = Resolve<SetSimulationSettingsFunction>(m_plugin, "iplFMODSetSimulationSettings");
+    m_setReverbSource = Resolve<SetReverbSourceFunction>(m_plugin, "iplFMODSetReverbSource");
 
     if(!getVersion || !m_initialize || !m_terminate || !m_setHRTF || !m_addSource || !m_removeSource)
     {
@@ -208,6 +261,10 @@ bool SteamAudioRuntime::CreateContextAndHRTF(FMOD::System& core, SteamAudioInjec
     contextSettings.version = STEAMAUDIO_VERSION;
     // The level the FMOD plugin itself selects; higher levels can lower clocks for little gain.
     contextSettings.simdLevel = IPL_SIMDLEVEL_AVX2;
+    // The SDK keeps these in one process-wide static; see SteamAudioMixerAllocator.h for why that is safe here.
+    m_usesMixerAllocator = !m_testAllocate && !m_useSdkAllocator;
+    contextSettings.allocateCallback = reinterpret_cast<IPLAllocateFunction>(m_usesMixerAllocator ? &SteamAudioMixerAllocator::Allocate : m_testAllocate);
+    contextSettings.freeCallback = reinterpret_cast<IPLFreeFunction>(m_usesMixerAllocator ? &SteamAudioMixerAllocator::Free : m_testFree);
 
     IPLerror status = IPL_STATUS_INITIALIZATION;
 
@@ -327,7 +384,9 @@ bool SteamAudioRuntime::RegisterPlugin(FMOD::System& core, SteamAudioInjectedFai
         SameParameter(spatializer->paramdesc[SimulationOutputsHandleParameter], SimulationOutputsHandleName,
             FMOD_DSP_PARAMETER_TYPE_INT) &&
         SameParameter(spatializer->paramdesc[DistanceAttenuationParameter], DistanceAttenuationName,
-            FMOD_DSP_PARAMETER_TYPE_INT);
+            FMOD_DSP_PARAMETER_TYPE_INT) &&
+        SameParameter(spatializer->paramdesc[ApplyReflectionsParameter], ApplyReflectionsName,
+            FMOD_DSP_PARAMETER_TYPE_BOOL);
 
     if(injectedFailure == SteamAudioInjectedFailure::PluginIdentity || !registeredValid)
     {
@@ -339,6 +398,166 @@ bool SteamAudioRuntime::RegisterPlugin(FMOD::System& core, SteamAudioInjectedFai
 
     m_spatializer = spatializer;
     return true;
+}
+
+void SteamAudioRuntime::ArmMixerPool(FMOD::System& core, bool reflectionsActive, const SteamAudioOptions& options)
+{
+    if(!m_usesMixerAllocator)
+    {
+        return;
+    }
+
+    // The same effects, with the same settings, that the plugin's lazyInit creates: the demand of one DSP. Both channel counts,
+    // because a DSP's input can change over its first blocks, and the plugin keeps old and new briefly.
+    IPLAudioSettings audio{m_sampleRate, m_blockLength};
+    int outputChannels = 2;
+    FMOD_SPEAKERMODE speakerMode = FMOD_SPEAKERMODE_DEFAULT;
+    int rawSpeakers = 0;
+
+    if(core.getSoftwareFormat(nullptr, &speakerMode, &rawSpeakers) == FMOD_OK)
+    {
+        core.getSpeakerModeChannels(speakerMode, &outputChannels);
+    }
+
+    const auto measureDirect = [&]
+    {
+        SteamAudioMixerAllocator::BeginProfile();
+        IPLPanningEffectSettings panningSettings{};
+        panningSettings.speakerLayout.type = LayoutForChannels(outputChannels);
+        IPLPanningEffect panning = nullptr;
+        iplPanningEffectCreate(m_context, &audio, &panningSettings, &panning);
+        IPLBinauralEffectSettings binauralSettings{};
+        binauralSettings.hrtf = m_hrtf;
+        IPLBinauralEffect binaural = nullptr;
+        iplBinauralEffectCreate(m_context, &audio, &binauralSettings, &binaural);
+        IPLDirectEffect directEffects[2] = {};
+        IPLAudioBuffer buffers[7] = {};
+
+        for(int channels = 1; channels <= 2; ++channels)
+        {
+            IPLDirectEffectSettings directSettings{};
+            directSettings.numChannels = channels;
+            iplDirectEffectCreate(m_context, &audio, &directSettings, &directEffects[channels - 1]);
+            iplAudioBufferAllocate(m_context, channels, m_blockLength, &buffers[(channels - 1) * 2]);
+            iplAudioBufferAllocate(m_context, channels, m_blockLength, &buffers[(channels - 1) * 2 + 1]);
+        }
+
+        iplAudioBufferAllocate(m_context, outputChannels, m_blockLength, &buffers[4]);
+        iplAudioBufferAllocate(m_context, 1, m_blockLength, &buffers[5]);
+        IPLAmbisonicsDecodeEffect decode = nullptr;
+
+        if(reflectionsActive)
+        {
+            IPLAmbisonicsDecodeEffectSettings decodeSettings{};
+            decodeSettings.speakerLayout.type = LayoutForChannels(outputChannels);
+            decodeSettings.hrtf = m_hrtf;
+            decodeSettings.maxOrder = SteamAudioReflectionMaxOrder;
+            iplAmbisonicsDecodeEffectCreate(m_context, &audio, &decodeSettings, &decode);
+        }
+
+        const auto demand = SteamAudioMixerAllocator::EndProfile();
+        iplPanningEffectRelease(&panning);
+        iplBinauralEffectRelease(&binaural);
+        iplDirectEffectRelease(&directEffects[0]);
+        iplDirectEffectRelease(&directEffects[1]);
+        iplAmbisonicsDecodeEffectRelease(&decode);
+
+        for(int index = 0; index < 6; ++index)
+        {
+            iplAudioBufferFree(m_context, &buffers[index]);
+        }
+
+        return demand;
+    };
+
+    const auto measureReflections = [&]
+    {
+        const int ambisonicChannels = (SteamAudioReflectionMaxOrder + 1) * (SteamAudioReflectionMaxOrder + 1);
+        SteamAudioMixerAllocator::BeginProfile();
+        IPLReflectionEffectSettings reflectionSettings{};
+        reflectionSettings.type = IPL_REFLECTIONEFFECTTYPE_CONVOLUTION;
+        reflectionSettings.numChannels = ambisonicChannels;
+        reflectionSettings.irSize = static_cast<int>(std::ceil(SteamAudioReflectionMaxDuration * static_cast<float>(m_sampleRate)));
+        IPLReflectionEffect reflection = nullptr;
+        iplReflectionEffectCreate(m_context, &audio, &reflectionSettings, &reflection);
+        IPLAudioBuffer ambisonic{};
+        IPLAudioBuffer spatialized{};
+        iplAudioBufferAllocate(m_context, ambisonicChannels, m_blockLength, &ambisonic);
+        iplAudioBufferAllocate(m_context, outputChannels, m_blockLength, &spatialized);
+        const auto demand = SteamAudioMixerAllocator::EndProfile();
+        iplReflectionEffectRelease(&reflection);
+        iplAudioBufferFree(m_context, &ambisonic);
+        iplAudioBufferFree(m_context, &spatialized);
+        return demand;
+    };
+
+    const SteamAudioMixerAllocator::ClassCounts direct = measureDirect();
+    SteamAudioMixerAllocator::ClassCounts reflection{};
+
+    if(reflectionsActive)
+    {
+        reflection = measureReflections();
+    }
+
+    SteamAudioMixerAllocator::ClassCounts blocks{};
+    const float scale = options.poolCapacityScaleForTesting;
+
+    for(std::size_t index = 0; index < blocks.size(); ++index)
+    {
+        // The reverb DSP creates the same effects as one more reflecting spatializer.
+        const float reflecting = SupportedReflectionSpatializers + (options.environmentalReverbForTesting || options.reflectionRouting ? 1.0f : 0.0f);
+        const float demand = (static_cast<float>(direct[index]) * SupportedSpatializers + static_cast<float>(reflection[index]) * reflecting) * scale;
+        const bool small = SteamAudioMixerAllocator::ClassSize(static_cast<int>(index)) < ExactDemandFromBytes;
+        const std::size_t count = static_cast<std::size_t>(std::ceil(small ? demand * SmallBlockMargin : demand));
+        blocks[index] = count == 0 ? 0 : count + (small && scale >= 1.0f ? ExtraSmallBlocks : 0);
+    }
+
+    if(core.setCallback(MixBoundaryCallback, FMOD_SYSTEM_CALLBACK_PREMIX | FMOD_SYSTEM_CALLBACK_POSTMIX) != FMOD_OK ||
+        !SteamAudioMixerAllocator::Arm(blocks, options.fillFreedPoolBlocksForTesting))
+    {
+        Log::Warning("Audio: Steam Audio mixer pool not armed; effect creation allocates from the heap on the mixer.");
+        return;
+    }
+
+    const SteamAudioMixerPoolStats stats = SteamAudioMixerAllocator::GetStats();
+    Log::Info("Audio: Steam Audio mixer pool: " + std::to_string(stats.capacityBytes / (1024 * 1024)) + " MB for " +
+        std::to_string(static_cast<int>(SupportedSpatializers)) + " spatializers, " +
+        std::to_string(reflectionsActive ? static_cast<int>(SupportedReflectionSpatializers) : 0) + " with reflections.");
+}
+
+void SteamAudioRuntime::UpdateMixerPool() noexcept
+{
+    if(!m_usesMixerAllocator)
+    {
+        return;
+    }
+
+    SteamAudioMixerAllocator::Drain();
+    const SteamAudioMixerPoolStats stats = SteamAudioMixerAllocator::GetStats();
+
+    if(stats.mixerHeapAllocations != m_reportedMixerHeapAllocations)
+    {
+        Log::Warning("Audio: Steam Audio mixer pool exhausted: " + std::to_string(stats.mixerHeapAllocations) +
+            " allocations took the heap on the mixer so far, the largest " + std::to_string(stats.largestHeapRequest) + " bytes. The mix may glitch.");
+        m_reportedMixerHeapAllocations = stats.mixerHeapAllocations;
+    }
+
+    if(stats.largerClassAllocations > 0 && !m_reportedLargerClass)
+    {
+        Log::Warning("Audio: Steam Audio mixer pool is short of a size class, and is using larger blocks instead.");
+        m_reportedLargerClass = true;
+    }
+
+    if(stats.doubleFrees + stats.invalidFrees != m_reportedBadFrees)
+    {
+        Log::Error("Audio: Steam Audio returned a block to the mixer pool twice or at a wrong address: " + std::to_string(stats.doubleFrees + stats.invalidFrees) + " so far.");
+        m_reportedBadFrees = stats.doubleFrees + stats.invalidFrees;
+    }
+}
+
+SteamAudioMixerPoolStats SteamAudioRuntime::GetMixerPoolStats() const noexcept
+{
+    return m_usesMixerAllocator ? SteamAudioMixerAllocator::GetStats() : SteamAudioMixerPoolStats{};
 }
 
 void SteamAudioRuntime::ReleaseUnstarted(FMOD::System& core) noexcept
@@ -391,6 +610,12 @@ void SteamAudioRuntime::Terminate() noexcept
     FreeLibrary(m_plugin);
     m_plugin = nullptr;
     m_description.clear();
+
+    // Last: effects, sources and context are all gone, and no mixer remains to allocate.
+    if(m_usesMixerAllocator)
+    {
+        SteamAudioMixerAllocator::Disarm();
+    }
 }
 
 bool SteamAudioRuntime::IsSpatializer(FMOD::DSP& dsp) const
@@ -427,6 +652,12 @@ bool SteamAudioRuntime::HasDistanceAttenuation(FMOD::DSP& spatializer) const
     return spatializer.getParameterInt(DistanceAttenuationParameter, &mode, nullptr, 0) != FMOD_OK || mode != 0;
 }
 
+bool SteamAudioRuntime::AppliesReflections(FMOD::DSP& spatializer) const
+{
+    bool applies = false;
+    return spatializer.getParameterBool(ApplyReflectionsParameter, &applies, nullptr, 0) == FMOD_OK && applies;
+}
+
 FMOD::DSP* SteamAudioRuntime::CreateUnconnectedSpatializer(FMOD::System& core) const
 {
     int nestedCount = 0;
@@ -450,6 +681,58 @@ FMOD::DSP* SteamAudioRuntime::CreateUnconnectedSpatializer(FMOD::System& core) c
     }
 
     return nullptr;
+}
+
+FMOD::DSP* SteamAudioRuntime::CreateEffectByName(FMOD::System& core, std::string_view name) const
+{
+    int nestedCount = 0;
+
+    if(core.getNumNestedPlugins(m_pluginHandle, &nestedCount) != FMOD_OK)
+    {
+        return nullptr;
+    }
+
+    for(int index = 0; index < nestedCount; ++index)
+    {
+        unsigned int nested = 0;
+        const FMOD_DSP_DESCRIPTION* description = nullptr;
+
+        if(core.getNestedPlugin(m_pluginHandle, index, &nested) == FMOD_OK &&
+            core.getDSPInfoByPlugin(nested, &description) == FMOD_OK && name == description->name)
+        {
+            FMOD::DSP* dsp = nullptr;
+            return core.createDSPByPlugin(nested, &dsp) == FMOD_OK ? dsp : nullptr;
+        }
+    }
+
+    return nullptr;
+}
+
+bool SteamAudioRuntime::SetPluginReverbSource(IPLSource source) const
+{
+    if(!m_setReverbSource)
+    {
+        return false;
+    }
+
+    m_setReverbSource(source);
+    return true;
+}
+
+void SteamAudioRuntime::SetAppliesReflections(FMOD::DSP& spatializer, bool applies) const
+{
+    spatializer.setParameterBool(ApplyReflectionsParameter, applies);
+}
+
+bool SteamAudioRuntime::SetPluginSimulationSettings(const IPLSimulationSettings& settings) const
+{
+    if(!m_setSimulationSettings)
+    {
+        return false;
+    }
+
+    m_setSimulationSettings(settings);
+    return true;
 }
 
 int SteamAudioRuntime::BindSimulationSourceForHandshake(FMOD::DSP& spatializer, IPLSource source) const

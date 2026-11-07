@@ -519,6 +519,51 @@ bool FileSceneRuntime::SetObjectAcoustics(const SceneObjectMetadata& selection, 
     return true;
 }
 
+// M7: like acoustics, read at Play and by generation, so no renderer, physics or audio state changes here.
+bool FileSceneRuntime::SetObjectProbeVolume(const SceneObjectMetadata& selection, const std::optional<ProbeVolumeComponent>& expected,
+    const std::optional<ProbeVolumeComponent>& replacement, std::string* errorMessage)
+{
+    const auto fail = [&](const char* message)
+    {
+        if(errorMessage)
+        {
+            *errorMessage = message;
+        }
+
+        return false;
+    };
+
+    const auto current = GetObjectMetadata(selection.objectID, errorMessage);
+
+    if(!current || current->runtimeIdentity != selection.runtimeIdentity || current->structureRevision != selection.structureRevision)
+    {
+        return fail("The object changed since inspection; edit rejected.");
+    }
+
+    const auto& objects = m_fileScene.GetDocument().objects;
+    const auto found = std::find_if(objects.begin(), objects.end(),
+        [&](const SceneObjectDocument& object) { return object.id == selection.objectID; });
+
+    if(found == objects.end() || found->probeVolume != expected)
+    {
+        return fail("The Probe Volume changed since inspection; edit rejected.");
+    }
+
+    if(replacement && !ValidateProbeVolume(*replacement, errorMessage))
+    {
+        return false;
+    }
+
+    if(expected == replacement)
+    {
+        return true;
+    }
+
+    std::optional<ProbeVolumeComponent> accepted = replacement;
+    m_fileScene.EditDocument().objects[static_cast<size_t>(found - objects.begin())].probeVolume = std::move(accepted);
+    return true;
+}
+
 bool FileSceneRuntime::SetObjectPhysics(const SceneObjectMetadata& selection,
     const std::optional<Physics::PhysicsComponent>& expected,
     const std::optional<Physics::PhysicsComponent>& replacement, std::string* errorMessage)

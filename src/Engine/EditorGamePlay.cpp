@@ -128,7 +128,13 @@ void Engine::ProcessEditorGamePlay(FileSceneRuntime* runtime, double elapsedSeco
             {
                 return AcousticMaterials::Resolve(reference, &GetActiveProject().GetPaths(), &m_projectAssetRegistry, materialError);
             };
+            acousticAssets.probeBatch = [this](const std::string& reference, std::string* probeError)
+            {
+                return ProbeBatchAssets::Resolve(reference, GetActiveProject().GetPaths(), m_projectAssetRegistry, probeError);
+            };
             m_gameRuntime.SetAcousticAssets(std::move(acousticAssets));
+            // Saved settings apply from each Play: bounces are an input to each simulation run, so no reload or rebuild is needed.
+            m_audio.SetSteamAudioReflectionBounces(static_cast<int>(GetActiveProject().GetProjectSettings().settings.audio.steamAudioReflectionBounces));
 
             if(!m_gameRuntime.Start(*runtime, m_renderer, true, viewWidth, viewHeight, error, scripts))
             {

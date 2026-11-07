@@ -404,11 +404,38 @@ void Editor::DrawAudioSourceControls(IDemoScene& scene, const SceneObjectMetadat
         CommitObjectAudio(scene, selection, before, after);
     }
 
+    bool sourceCentric = source.sourceCentricReflections;
+
+    if(ImGui::Checkbox("Source-Centric Reflections", &sourceCentric) && !blocked)
+    {
+        auto after = before;
+        after.source->sourceCentricReflections = sourceCentric;
+        CommitObjectAudio(scene, selection, before, after);
+    }
+
+    bool sourceBaked = source.bakedReflections;
+
+    if(ImGui::Checkbox("Baked Reflections", &sourceBaked) && !blocked)
+    {
+        auto after = before;
+        after.source->bakedReflections = sourceBaked;
+        CommitObjectAudio(scene, selection, before, after);
+    }
+
     ImGui::EndDisabled();
 
     if(!description.status.empty())
     {
         StatusText(description.status);
+    }
+
+    if(source.sourceCentricReflections && source.bakedReflections)
+    {
+        StatusText("Baked data is not available yet: source-centric reflections will not play. Listener-centric reflections still do.");
+    }
+    else if(source.bakedReflections)
+    {
+        StatusText("Baked Reflections applies only with Source-Centric Reflections.");
     }
 
     if(!source.enabled)
@@ -450,7 +477,21 @@ void Editor::DrawAudioListenerControls(IDemoScene& scene, const SceneObjectMetad
         CommitObjectAudio(scene, selection, before, after);
     }
 
+    bool baked = object.audioListener->bakedReflections;
+
+    if(ImGui::Checkbox("Baked Reflections", &baked) && !blocked)
+    {
+        auto after = before;
+        after.listener->bakedReflections = baked;
+        CommitObjectAudio(scene, selection, before, after);
+    }
+
     ImGui::EndDisabled();
+
+    if(object.audioListener->bakedReflections)
+    {
+        StatusText("Baked data is not available yet: shared listener-centric reflections will be silent.");
+    }
 
     const SceneObjectDocument* active = nullptr;
 
