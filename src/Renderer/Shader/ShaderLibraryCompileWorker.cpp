@@ -86,6 +86,8 @@ void ShaderLibraryCompileWorker::Shutdown()
             m_jobs.erase(queuedLibrary);
         }
 
+        m_activity.dropped += m_queue.size();
+        m_activity.queued = 0;
         m_queue.clear();
 
         for(const auto& [libraryPath, job] : m_jobs)
@@ -108,6 +110,9 @@ void ShaderLibraryCompileWorker::Shutdown()
     m_thread.join();
 
     std::lock_guard lock(m_mutex);
+    // Only completed jobs remain after the join: queued ones were erased above and the one in flight has finished.
+    m_activity.discarded += m_jobs.size();
+    m_activity.untaken = 0;
     m_jobs.clear();
     m_stopRequested = false;
 }
@@ -127,6 +132,8 @@ bool ShaderLibraryCompileWorker::Submit(const ShaderLibraryCompileRequest& reque
         job.outcome.libraryPath = request.libraryPath;
         m_jobs.emplace(request.libraryPath, std::move(job));
         m_queue.push_back(request.libraryPath);
+        ++m_activity.submitted;
+        ++m_activity.queued;
     }
 
     m_wake.notify_one();
@@ -159,7 +166,21 @@ std::optional<ShaderLibraryCompileOutcome> ShaderLibraryCompileWorker::TakeCompl
 
     ShaderLibraryCompileOutcome outcome = std::move(found->second.outcome);
     m_jobs.erase(found);
+    ++m_activity.taken;
+    --m_activity.untaken;
     return outcome;
+}
+
+void ShaderLibraryCompileWorker::GetActivity(AsyncWorkerActivity& activity) const
+{
+    std::lock_guard lock(m_mutex);
+    activity = m_activity;
+}
+
+std::uint64_t ShaderLibraryCompileWorker::GetTakenCount() const
+{
+    std::lock_guard lock(m_mutex);
+    return m_activity.taken;
 }
 
 bool ShaderLibraryCompileWorker::IsCurrent(const ShaderLibraryCompileOutcome& outcome)
@@ -193,6 +214,9 @@ void ShaderLibraryCompileWorker::Run()
         m_queue.pop_front();
         Job& job = m_jobs.at(libraryPath);
         job.state = ShaderLibraryCompileState::Compiling;
+        --m_activity.queued;
+        m_activity.active = true;
+        m_activity.activeJob = libraryPath.generic_string();
         const std::wstring sourcePath = job.request.sourcePath.wstring();
         const std::wstring includeDirectory = job.request.includeDirectory.wstring();
 
@@ -226,6 +250,10 @@ void ShaderLibraryCompileWorker::Run()
         // Shutdown never erases a compiling job, so the reference is still valid.
         job.outcome = std::move(outcome);
         job.state = ShaderLibraryCompileState::Completed;
+        m_activity.active = false;
+        m_activity.activeJob.clear();
+        ++m_activity.finished;
+        ++m_activity.untaken;
     }
 
     lock.unlock();

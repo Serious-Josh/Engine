@@ -211,6 +211,7 @@ endif()
 add_library(EngineCore OBJECT
     src/Engine/Engine.cpp
     src/Engine/BuildGame.cpp
+    src/Engine/DxrPreparationTasks.cpp
     src/Engine/SceneEnvironment.cpp
     src/assets/CookedEnvironment.cpp
     src/Editor/BuildGameWindow.cpp
@@ -241,6 +242,7 @@ add_library(EngineCore OBJECT
     src/Core/Time.cpp
     src/Core/Input.cpp
     src/Core/Log.cpp
+    src/Core/BackgroundTasks.cpp
     src/Renderer/Renderer.cpp
     src/Renderer/RenderingConfiguration.cpp
     src/Renderer/RenderingConfigurationApply.cpp
@@ -331,6 +333,7 @@ add_library(EngineCore OBJECT
     src/Editor/CharacterControllerDiagnosticsControls.cpp
     src/Editor/ViewportMaterialDrop.cpp
     src/Editor/EditorWorkspace.cpp
+    src/Editor/BackgroundTasksUI.cpp
     src/Editor/ViewportMarquee.cpp
     src/Editor/ViewportMarqueeControls.cpp
     src/Editor/SceneHierarchyPanel.cpp
@@ -642,6 +645,12 @@ if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Renderer
     add_executable(PathTraceAsyncPreparationTests src/Renderer/tests/PathTraceAsyncPreparationTests.cpp)
     target_link_libraries(PathTraceAsyncPreparationTests PRIVATE EngineCore)
     engine_use_agility(PathTraceAsyncPreparationTests)
+endif()
+# Local-only BT.3 regression: DXR worker activity counters on the real workers, same guard.
+if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Renderer/tests/DxrWorkerActivityTests.cpp")
+    add_executable(DxrWorkerActivityTests src/Renderer/tests/DxrWorkerActivityTests.cpp)
+    target_link_libraries(DxrWorkerActivityTests PRIVATE EngineCore)
+    engine_use_agility(DxrWorkerActivityTests)
 endif()
 # Local-only async DXR preparation Gate 3 Editor presentation regression (pure logic), same guard.
 if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Debug/tests/LightingModeTransitionPresentationTests.cpp")

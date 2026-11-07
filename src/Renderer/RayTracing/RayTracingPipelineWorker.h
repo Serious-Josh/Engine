@@ -2,6 +2,7 @@
 
 #include "RayTracingPipeline.h"
 #include "RayTracingPipelineDescription.h"
+#include "Renderer/AsyncWorkerActivity.h"
 
 #include <condition_variable>
 #include <cstdint>
@@ -79,6 +80,12 @@ class RayTracingPipelineWorker
     // Moves a completed result out; the key then has no job and may be submitted again.
     std::optional<RayTracingPipelineOutcome> TakeCompleted(const std::string& key);
 
+    // Read-only progress reporting for the Editor's Background Tasks; see AsyncWorkerActivity for the counters.
+    void GetActivity(AsyncWorkerActivity& activity) const;
+
+    // AsyncWorkerActivity::taken alone, for telling a newly taken result from a re-reported one.
+    std::uint64_t GetTakenCount() const;
+
     private:
     struct Job
     {
@@ -96,4 +103,7 @@ class RayTracingPipelineWorker
     std::deque<std::string> m_queue;
     bool m_running = false;
     bool m_stopRequested = false;
+
+    // Activity counters, guarded by m_mutex like the jobs they count.
+    AsyncWorkerActivity m_activity;
 };

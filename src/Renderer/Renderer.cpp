@@ -6793,6 +6793,7 @@ ShaderLibraryPreparation Renderer::PrepareDxrLibraries(const PathTraceLibraryNee
         return combined;
     }
 
+    const std::uint64_t resultsTakenBefore = GetDxrResultsTaken();
     const auto readinessRank = [](ShaderLibraryPreparationState state)
     {
         switch(state)
@@ -6858,13 +6859,77 @@ ShaderLibraryPreparation Renderer::PrepareDxrLibraries(const PathTraceLibraryNee
 
     // ER.1 Phase 4: with every library ready, the configuration's DXR pipelines are created in the background; the
     // creation paths then adopt them instead of calling CreateStateObject while recording.
-    if(combined.state == ShaderLibraryPreparationState::Ready && m_pipelineWorkerRunning)
+    const bool librariesReady = combined.state == ShaderLibraryPreparationState::Ready;
+
+    if(librariesReady && m_pipelineWorkerRunning)
     {
         combined = m_pathTraceReferencePass.PreparePipelines(*m_pipelineWorker, m_graphicsDevice.GetRayTracingDevice(),
             needs);
     }
 
+    RecordDxrPreparation(combined, librariesReady, GetDxrResultsTaken() != resultsTakenBefore);
     return combined;
+}
+
+std::uint64_t Renderer::GetDxrResultsTaken() const
+{
+    const std::uint64_t libraries = m_shaderCompileWorker ? m_shaderCompileWorker->GetTakenCount() : 0;
+    const std::uint64_t pipelines = m_pipelineWorker ? m_pipelineWorker->GetTakenCount() : 0;
+    return libraries + pipelines;
+}
+
+void Renderer::RecordDxrPreparation(const ShaderLibraryPreparation& preparation, bool pipelinePhase, bool tookResult)
+{
+    switch(preparation.state)
+    {
+    case ShaderLibraryPreparationState::Ready:
+        break;
+    case ShaderLibraryPreparationState::Queued:
+    case ShaderLibraryPreparationState::Compiling:
+    case ShaderLibraryPreparationState::PreparingPipelines:
+        m_dxrPreparationReport.waiting = true;
+        break;
+    case ShaderLibraryPreparationState::Failed:
+    {
+        if(!tookResult)
+        {
+            break;
+        }
+
+        std::string& failure = pipelinePhase ? m_dxrPreparationReport.pipelineFailure :
+            m_dxrPreparationReport.libraryFailure;
+
+        if(failure.empty())
+        {
+            const std::string_view diagnostic = preparation.diagnostic;
+            failure = diagnostic.empty() ? std::string("DXR preparation failed; see the log.") :
+                std::string(diagnostic.substr(0, diagnostic.find('\n')));
+        }
+
+        break;
+    }
+    }
+}
+
+void Renderer::GetDxrWorkerActivity(AsyncWorkerActivity& libraries, AsyncWorkerActivity& pipelines) const
+{
+    if(m_shaderCompileWorker)
+    {
+        m_shaderCompileWorker->GetActivity(libraries);
+    }
+    else
+    {
+        libraries = {};
+    }
+
+    if(m_pipelineWorker)
+    {
+        m_pipelineWorker->GetActivity(pipelines);
+    }
+    else
+    {
+        pipelines = {};
+    }
 }
 
 ShaderLibraryPreparation Renderer::PrepareDxrLibraries(RendererLightingMode requestedMode,
@@ -10832,6 +10897,9 @@ Renderer::FrameRenderResult Renderer::Render(
     } rayCountFrameScope{m_referenceRayCounts, m_debugUI, *this};
     m_dlssActiveLastFrame = false;
     m_dlssFrameSubmitted = false;
+    m_dxrPreparationReport.waiting = false;
+    m_dxrPreparationReport.libraryFailure.clear();
+    m_dxrPreparationReport.pipelineFailure.clear();
 
     TransitionTiming::Scope er1Scope("Frame Render", 0.0);
     PollPreparedTextureUploads();
@@ -11856,7 +11924,9 @@ bool Renderer::RecordRenderFrame(
     std::string psrPreparation;
     if(psrRequested)
     {
+        const std::uint64_t resultsTakenBefore = GetDxrResultsTaken();
         const auto auxiliary = PreparePsrAuxiliary();
+        RecordDxrPreparation(auxiliary, true, GetDxrResultsTaken() != resultsTakenBefore);
         if(auxiliary.state == ShaderLibraryPreparationState::Ready && requestedChain == 2u &&
             !m_psrInPlaceReplacePass.IsChainAvailable())
         {

@@ -389,6 +389,36 @@ int main(int argc, char** argv)
         catch(const std::exception& e) { Log::Error(std::string("Editor grid diagnostic: ")+e.what()); success=false; }
         engine->Shutdown(); return success ? 0 : 1;
     }
+    if(argc==2 && (std::string_view(argv[1])=="--verify-background-tasks" || std::string_view(argv[1])=="--background-tasks-demo" ||
+        std::string_view(argv[1])=="--verify-dxr-background-tasks" ||
+        std::string_view(argv[1])=="--verify-dxr-background-tasks-failure"))
+    {
+        const bool demo = std::string_view(argv[1]) == "--background-tasks-demo";
+        const bool dxr = std::string_view(argv[1]) == "--verify-dxr-background-tasks";
+        const bool dxrFailure = std::string_view(argv[1]) == "--verify-dxr-background-tasks-failure";
+        auto engine = std::make_unique<Engine>();
+        bool success = false;
+
+        try
+        {
+            success = engine->Initialize();
+
+            if(success)
+            {
+                success = demo ? engine->RunBackgroundTasksDemo() :
+                    dxr ? engine->VerifyDxrBackgroundTasks() :
+                    dxrFailure ? engine->VerifyDxrBackgroundTaskFailure() : engine->VerifyBackgroundTasks();
+            }
+        }
+        catch(const std::exception& e)
+        {
+            Log::Error(std::string("Background tasks diagnostic: ") + e.what());
+            success = false;
+        }
+
+        engine->Shutdown();
+        return success ? 0 : 1;
+    }
     if(argc==2 && std::string_view(argv[1])=="--verify-viewport-grid-snap")
     {
         auto engine=std::make_unique<Engine>(); bool success=false;

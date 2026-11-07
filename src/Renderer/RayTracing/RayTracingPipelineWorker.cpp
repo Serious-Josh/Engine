@@ -68,6 +68,8 @@ void RayTracingPipelineWorker::Shutdown()
             }
         }
 
+        m_activity.dropped += m_queue.size();
+        m_activity.queued = 0;
         m_queue.clear();
 
         for(const auto& [key, job] : m_jobs)
@@ -90,6 +92,9 @@ void RayTracingPipelineWorker::Shutdown()
 
     // Untaken results were never used by the GPU; their objects and the device references go now.
     std::lock_guard lock(m_mutex);
+    // Only completed jobs remain after the join: queued ones were erased above and the one in flight has finished.
+    m_activity.discarded += m_jobs.size();
+    m_activity.untaken = 0;
 
     for(auto& [key, job] : m_jobs)
     {
@@ -125,6 +130,8 @@ bool RayTracingPipelineWorker::Submit(RayTracingPipelineRequest request)
         job.request = std::move(request);
         m_jobs.emplace(key, std::move(job));
         m_queue.push_back(key);
+        ++m_activity.submitted;
+        ++m_activity.queued;
     }
 
     m_wake.notify_one();
@@ -158,7 +165,21 @@ std::optional<RayTracingPipelineOutcome> RayTracingPipelineWorker::TakeCompleted
     // The caller compares the device pointer; the device itself outlives this worker (Renderer shuts it down first).
     found->second.request.device->Release();
     m_jobs.erase(found);
+    ++m_activity.taken;
+    --m_activity.untaken;
     return outcome;
+}
+
+void RayTracingPipelineWorker::GetActivity(AsyncWorkerActivity& activity) const
+{
+    std::lock_guard lock(m_mutex);
+    activity = m_activity;
+}
+
+std::uint64_t RayTracingPipelineWorker::GetTakenCount() const
+{
+    std::lock_guard lock(m_mutex);
+    return m_activity.taken;
 }
 
 void RayTracingPipelineWorker::Run()
@@ -181,6 +202,9 @@ void RayTracingPipelineWorker::Run()
         m_queue.pop_front();
         Job& job = m_jobs.at(key);
         job.state = RayTracingPipelineJobState::Creating;
+        --m_activity.queued;
+        m_activity.active = true;
+        m_activity.activeJob = key;
         // Immutable while creating: Submit never replaces a job's request and Shutdown never erases a creating job.
         const RayTracingPipelineRequest& request = job.request;
 
@@ -219,5 +243,9 @@ void RayTracingPipelineWorker::Run()
         lock.lock();
         job.outcome = std::move(outcome);
         job.state = RayTracingPipelineJobState::Completed;
+        m_activity.active = false;
+        m_activity.activeJob.clear();
+        ++m_activity.finished;
+        ++m_activity.untaken;
     }
 }

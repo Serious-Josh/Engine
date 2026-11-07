@@ -13,17 +13,14 @@ A fundamental principle for Engine is 'what you see is what you get' (WYSIWYG). 
     - Complex n/k IOR complient materials
         - Dielectrics
         - Conductors
-- RayTracing
-    - RT soft shadows
-    - RT reflections
-    - RTGI
-    - RTAO
+- RayTracing and PathTracing
 - GPU-Driven Adaptive Displacement w/ DXR Support (WIP)
 - Box3D Physics Integration
-- AngelScript Integration (WIP)
+- AngelScript Integration
+- FMOD Audio Engine
+    - SteamAudio Support (WIP)
 
 Future goals listed here:
 
 - Mesh Shading System
 - Multi-threaded rendering
-- ReSTIR Path Tracing

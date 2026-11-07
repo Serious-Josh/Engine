@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ShaderCompiler.h"
+#include "Renderer/AsyncWorkerActivity.h"
 
 #include <condition_variable>
 #include <deque>
@@ -97,6 +98,12 @@ class ShaderLibraryCompileWorker
     // caller and the library resubmitted.
     static bool IsCurrent(const ShaderLibraryCompileOutcome& outcome);
 
+    // Read-only progress reporting for the Editor's Background Tasks; see AsyncWorkerActivity for the counters.
+    void GetActivity(AsyncWorkerActivity& activity) const;
+
+    // AsyncWorkerActivity::taken alone, for telling a newly taken result from a re-reported one.
+    std::uint64_t GetTakenCount() const;
+
     private:
     struct Job
     {
@@ -115,4 +122,7 @@ class ShaderLibraryCompileWorker
     std::deque<std::filesystem::path> m_queue;
     bool m_running = false;
     bool m_stopRequested = false;
+
+    // Activity counters, guarded by m_mutex like the jobs they count.
+    AsyncWorkerActivity m_activity;
 };

@@ -12,6 +12,7 @@
 #include "Renderer/Renderer.h"
 
 #include "Editor/Editor.h"
+#include "Engine/DxrPreparationTasks.h"
 
 #include "assets/ProjectAssetRegistry.h"
 #include "assets/ProjectTexturePreparationService.h"
@@ -143,6 +144,11 @@ class Engine
     bool VerifyViewportPan();
     bool VerifyViewportGridSnap();
     bool VerifyEditorGrid();
+    bool VerifyBackgroundTasks();
+    bool VerifyDxrBackgroundTasks();
+    bool VerifyDxrBackgroundTaskFailure();
+    // Interactive: runs the Editor with representative fake tasks for manual UI review.
+    bool RunBackgroundTasksDemo();
     bool VerifySceneDuplication(const std::filesystem::path& scene);
     bool VerifySceneMembership(const std::filesystem::path& scene);
     // Phase 2 multi-object residency transactions over a self-created fixture project.
@@ -274,6 +280,12 @@ class Engine
 #if defined(ENGINE_HAS_VERIFICATION)
     friend class PresentationTransformVerification;
 #endif
+    // Holds plain data only. Declared ahead of every system that uses it, so it is destroyed after all of them.
+    BackgroundTaskManager m_backgroundTasks;
+    // BT.3: Editor frames only. The activity structs are reused so polling the workers does not allocate.
+    DxrPreparationTasks m_dxrPreparationTasks;
+    AsyncWorkerActivity m_dxrLibraryActivity;
+    AsyncWorkerActivity m_dxrPipelineActivity;
     PhysicsSimulationController m_physicsSimulation;
     // Shared by Editor Play and the packaged runtime; borrows m_physicsSimulation.
     GameRuntime m_gameRuntime{m_physicsSimulation};
@@ -315,6 +327,7 @@ class Engine
     friend class ViewportPanVerification;
     friend class ViewportGridSnapVerification;
     friend class EditorGridVerification;
+    friend class BackgroundTasksVerification;
 #endif
     struct EditorMembershipOperation
     {

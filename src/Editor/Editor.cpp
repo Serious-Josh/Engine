@@ -819,6 +819,8 @@ const EditorWorkspaceRect& Editor::PrepareWorkspace(
 {
     ViewportCameraInput::ReserveLeftButton(m_cameraLooking, m_panLeftHeld);
     DrawMainMenu(demoScene, sceneManager, debugUI);
+    // Before the workspace's Update; here it also survives Engine's empty-viewport early return.
+    m_backgroundTasksUI.Draw(m_backgroundTasks, BackgroundTasksUI::Clock::now());
     DrawLifecycleWindows(demoScene, debugUI);
 
     // Save is application-wide even when an input owns keyboard focus. The Engine applies

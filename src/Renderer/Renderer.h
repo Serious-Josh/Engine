@@ -505,6 +505,15 @@ class Renderer
         return m_lightingModeTransition.GetStatus();
     }
 
+    // BT.3, read-only: the DXR workers' activity (zero when a worker does not exist), and what the last Render's
+    // preparation gates concluded. Render thread only.
+    void GetDxrWorkerActivity(AsyncWorkerActivity& libraries, AsyncWorkerActivity& pipelines) const;
+
+    const DxrPreparationFrameReport& GetDxrPreparationFrameReport() const noexcept
+    {
+        return m_dxrPreparationReport;
+    }
+
     // RTXPT.2 R4: false, leaving the view untouched, unless the previous PT frame's copy was submitted and
     // no invalidation has happened since.
     bool TryGetPreviousGBuffer(PreviousGBufferView& view) const;
@@ -1006,6 +1015,7 @@ class Renderer
     friend class ThumbnailSchedulingVerification;
     friend class NormalMapVerification;
     friend class EditorGridVerification;
+    friend class BackgroundTasksVerification;
     friend class ProjectBrowserVerification;
 #endif
     friend class SceneMembershipPublication;
@@ -2328,6 +2338,12 @@ class Renderer
     // before the pass and the device.
     std::unique_ptr<RayTracingPipelineWorker> m_pipelineWorker;
     bool m_pipelineWorkerRunning = false;
+    // BT.3: reset at the start of each Render and filled by the preparation gates; observation only.
+    DxrPreparationFrameReport m_dxrPreparationReport;
+    // A failure counts only when the reporting call itself took a worker result: an unchanged failure re-reported on
+    // every poll (a sticky SHARC or PSR failure, say) must not fail an unrelated batch.
+    void RecordDxrPreparation(const ShaderLibraryPreparation& preparation, bool pipelinePhase, bool tookResult);
+    std::uint64_t GetDxrResultsTaken() const;
     LightingModeTransition m_lightingModeTransition;
     // ER.1 Phase 2: DXR libraries the worker has prepared and the pass holds (or, for a RayQuery twin, that failed
     // for their current sources). Gates skip polling them, so a settled configuration polls nothing per frame.

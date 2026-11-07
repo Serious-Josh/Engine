@@ -10,6 +10,7 @@
 #include "ViewportMarquee.h"
 #include "AssetBrowser.h"
 #include "EditorWorkspace.h"
+#include "BackgroundTasksUI.h"
 #include "InspectorPanel.h"
 #include "SceneHierarchyPanel.h"
 #include "ViewportGridSnap.h"
@@ -130,6 +131,12 @@ public:
     void SetAudioSystem(Audio::AudioSystem* audio) noexcept
     {
         m_audioSystem = audio;
+    }
+
+    // Engine owns the manager and destroys it after this Editor. Null shows an idle bar.
+    void SetBackgroundTasks(BackgroundTaskManager* manager) noexcept
+    {
+        m_backgroundTasks = manager;
     }
 
     bool TakeScriptRefreshRequest()
@@ -534,6 +541,7 @@ private:
     friend class ViewportPanVerification;
     friend class ViewportGridSnapVerification;
     friend class EditorGridVerification;
+    friend class BackgroundTasksVerification;
     friend class ProjectIndependentStartupVerification;
     friend class SceneLifecycleVerification;
     friend class AssetBrowserSceneVerification;
@@ -740,6 +748,8 @@ private:
     AssetBrowser m_assetBrowser;
 
     EditorWorkspace m_workspace;
+    BackgroundTasksUI m_backgroundTasksUI;
+    BackgroundTaskManager* m_backgroundTasks = nullptr;
     SceneHierarchyPanel m_hierarchyPanel;
 
     InspectorPanel m_inspectorPanel;

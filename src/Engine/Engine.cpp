@@ -1526,6 +1526,7 @@ bool Engine::InitializeProjectIndependent(const EngineStartup& startup)
     m_gameRuntime.SetAudioSystem(&m_audio);
     // Audio.2B: the Audio Source inspector lists and checks events of the project's loaded banks.
     m_editor.SetAudioSystem(&m_audio);
+    m_editor.SetBackgroundTasks(&m_backgroundTasks);
 
     if(packaged)
     {
@@ -3350,6 +3351,11 @@ void Engine::Frame()
     const Renderer::FrameRenderResult renderResult = m_renderer.Render(activeScene, rendererOptions);
     renderProbe.reset();
 
+    // BT.3: after Render, whose gates take worker results; only a rendered frame's report can end a batch.
+    m_renderer.GetDxrWorkerActivity(m_dxrLibraryActivity, m_dxrPipelineActivity);
+    m_dxrPreparationTasks.Update(m_backgroundTasks, m_dxrLibraryActivity, m_dxrPipelineActivity,
+        renderResult == Renderer::FrameRenderResult::Rendered ? &m_renderer.GetDxrPreparationFrameReport() : nullptr);
+
     if constexpr (Renderer::IsFrameHitchDiagnosticsEnabled())
     {
         m_diagnosticRenderOutcome = renderResult;
@@ -3480,6 +3486,8 @@ void Engine::Shutdown()
     m_editor.ResetThumbnailRequests();
     m_demoSceneManager.Shutdown();
     m_meshCPUCache.Clear();
+    // The Renderer's shutdown drops queued DXR work; the open batch says so instead of waiting for it.
+    m_dxrPreparationTasks.Stop();
     if(m_rendererAttempted) m_renderer.Shutdown();
     if(m_windowInitialized) m_window.Shutdown();
 
