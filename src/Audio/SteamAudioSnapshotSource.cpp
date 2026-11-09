@@ -5,8 +5,10 @@
 
 #include <bcrypt.h>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <memory>
 #include <string_view>
 #include <thread>
@@ -17,6 +19,17 @@ namespace Audio::Internal
 namespace
 {
     std::atomic<SteamAudioSnapshotReadObserver> readObserver{nullptr};
+    std::atomic<SteamAudioPathingReadObserver> pathingReadObserver{nullptr};
+    // simulation_data.cpp's initial pathing EQ (v4.8.1).
+    constexpr float NeutralPathingEq = 0.1f;
+    // Published EQ bands are raised to at least this. A band at exactly zero makes the path effect output NaN on every sample
+    // (measured: EQ 1,0,1); 1e-6 and 1e-4 stayed finite. -80 dB, so nothing audible is lost.
+    constexpr float MinimumPathingEq = 1e-4f;
+    // The plugin renders at its own simulation order. Engine's is 1, so it reads four coefficients; the rest stay zero.
+    constexpr int PathingCoefficients(int order) noexcept
+    {
+        return (order + 1) * (order + 1);
+    }
 
     void CopyDirect(const SteamAudioDirectSnapshot& snapshot, IPLDirectEffectParams& direct) noexcept
     {
@@ -241,12 +254,111 @@ void SnapshotSource::setInputs(IPLSimulationFlags, IPLSimulationInputs*)
     m_anomalies.fetch_add(1, std::memory_order_relaxed);
 }
 
-// FMOD's mixer thread. A few atomic operations and a copy: no loop, wait, allocation or free.
+bool SnapshotSource::PublishPathing(const SteamAudioPathingSnapshot& result) noexcept
+{
+    SteamAudioPathingSnapshot& slot = m_pathingChannel.WriteSlot();
+    bool unaltered = true;
+    const int order = std::clamp(result.order, 0, SteamAudioPathingSnapshot::MaximumOrder);
+    const int coefficients = PathingCoefficients(order);
+    bool finite = true;
+
+    for(int index = 0; index < coefficients; ++index)
+    {
+        finite = finite && std::isfinite(result.sh[index]);
+    }
+
+    for(int band = 0; band < IPL_NUM_BANDS; ++band)
+    {
+        finite = finite && std::isfinite(result.eq[band]);
+    }
+
+    slot = SteamAudioPathingSnapshot{};
+    slot.generation = result.generation;
+    slot.order = order;
+
+    if(result.valid && finite)
+    {
+        slot.valid = true;
+
+        for(int band = 0; band < IPL_NUM_BANDS; ++band)
+        {
+            slot.eq[band] = std::max(result.eq[band], MinimumPathingEq);
+            unaltered = unaltered && slot.eq[band] == result.eq[band];
+        }
+
+        for(int index = 0; index < coefficients; ++index)
+        {
+            slot.sh[index] = result.sh[index];
+        }
+    }
+    else
+    {
+        unaltered = !result.valid;
+    }
+
+    unaltered = unaltered && order == result.order;
+    const bool available = slot.valid;
+    m_pathingChannel.Publish();
+    m_pathingAvailable.store(available, std::memory_order_release);
+    return unaltered;
+}
+
+// FMOD's mixer thread. A few atomic operations and short copies: no loop over anything unbounded, no wait, allocation or free.
 void SnapshotSource::getOutputs(IPLSimulationFlags flags, IPLSimulationOutputs* outputs)
 {
-    // Pointer and sizes only: convolution reads the IR through Steam Audio's own triple buffer. Without a published IR, and for
-    // pathing, the outputs stay as the plugin zeroed them. The plugin overwrites type and sizes from its settings anyway; these
-    // were checked against those at start.
+    // Never a null shCoeffs (M9.1). The plugin asks for pathing on every block of a bound source, and runs its path effect whenever
+    // Apply Pathing is on. Zero Ambisonic coefficients are silence. The EQ is never zero: the path effect then outputs NaN on every
+    // sample, which would spread through the whole mix. 0.1 is what Steam Audio itself gives a source with no pathing result yet.
+    // M9.2: a valid published result is copied into m_pathingOutput, which shCoeffs then points at; PublishPathing kept its EQ positive.
+    if((flags & IPL_SIMULATIONFLAGS_PATHING) != 0)
+    {
+        bool valid = false;
+
+        // One reader at a time, as for direct: a second one gets silence and leaves the channel and the output buffer alone.
+        if(!m_readerBusy.exchange(true, std::memory_order_acquire))
+        {
+            const SteamAudioPathingSnapshot& snapshot = m_pathingChannel.AcquireLatest();
+            valid = snapshot.valid;
+
+            if(valid)
+            {
+                for(int band = 0; band < IPL_NUM_BANDS; ++band)
+                {
+                    outputs->pathing.eqCoeffs[band] = snapshot.eq[band];
+                }
+
+                m_pathingOutput = std::to_array(snapshot.sh);
+                outputs->pathing.shCoeffs = m_pathingOutput.data();
+            }
+
+            m_readerBusy.store(false, std::memory_order_release);
+        }
+        else
+        {
+            m_anomalies.fetch_add(1, std::memory_order_relaxed);
+        }
+
+        if(!valid)
+        {
+            for(int band = 0; band < IPL_NUM_BANDS; ++band)
+            {
+                outputs->pathing.eqCoeffs[band] = NeutralPathingEq;
+            }
+
+            outputs->pathing.shCoeffs = m_neutralPathing.data();
+        }
+
+        (valid ? m_validPathingReads : m_neutralPathingReads).fetch_add(1, std::memory_order_relaxed);
+
+        if(const SteamAudioPathingReadObserver observer = pathingReadObserver.load(std::memory_order_relaxed))
+        {
+            observer(outputs->pathing.eqCoeffs, outputs->pathing.shCoeffs, SteamAudioPathingSnapshot::MaximumCoefficients, valid, this);
+        }
+    }
+
+    // Pointer and sizes only: convolution reads the IR through Steam Audio's own triple buffer. Without a published IR the
+    // outputs stay as the plugin zeroed them. The plugin overwrites type and sizes from its settings anyway; these were checked
+    // against those at start.
     if((flags & IPL_SIMULATIONFLAGS_REFLECTIONS) != 0)
     {
         const IPLReflectionEffectIR ir = m_ir.load(std::memory_order_acquire);
@@ -291,6 +403,11 @@ void SnapshotSource::getOutputs(IPLSimulationFlags flags, IPLSimulationOutputs* 
 void SetSnapshotReadObserver(SteamAudioSnapshotReadObserver observer) noexcept
 {
     readObserver.store(observer, std::memory_order_relaxed);
+}
+
+void SetPathingReadObserver(SteamAudioPathingReadObserver observer) noexcept
+{
+    pathingReadObserver.store(observer, std::memory_order_relaxed);
 }
 
 SnapshotCompatibility CheckSnapshotCompatibility(const SteamAudioRuntime& runtime, FMOD::Studio::System& studio,

@@ -358,6 +358,20 @@ bool Engine::BeginLightObjectCreation(const Editor::LightObjectCreationRequest& 
     return BeginObjectCreation(intent.runtimeIdentity, intent.historyEpoch, "Light", prepareLight, error);
 }
 
+bool Engine::BeginProbeVolumeObjectCreation(const Editor::ProbeVolumeObjectCreationRequest& intent, std::string& error)
+{
+    // As for Cameras, the fly view is read only after the eligibility checks and never written.
+    const auto prepareProbeVolume = [this](const std::filesystem::path&, const SceneDocument& document,
+        SceneObjectDocument& object, std::string&)
+    {
+        const auto& view = m_demoSceneManager.TryGetActiveScene()->GetScene().GetCamera();
+        object = PrepareProbeVolumeObject(document, view.GetPosition());
+        return true;
+    };
+
+    return BeginObjectCreation(intent.runtimeIdentity, intent.historyEpoch, "Probe Volume", prepareProbeVolume, error);
+}
+
 bool Engine::BeginObjectCreation(std::uint64_t runtimeIdentity, std::uint64_t historyEpoch, const char* operationName,
     const PrepareCreatedObject& prepareObject, std::string& error)
 {

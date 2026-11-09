@@ -371,7 +371,8 @@ std::optional<std::size_t> SceneHierarchyPanel::Draw(const EditorWorkspaceRect& 
     const SceneHierarchySnapshot& snapshot, std::optional<std::size_t> selectedObject,
     const void* sceneIdentity, const std::string& error,
     const HierarchyDragIdentity& dragIdentity, bool allowReorder, bool allowCreation, std::span<const std::size_t> selectedObjects,
-    const DropValidator& validateDrop, const std::function<EditorIcon(std::string_view)>& iconForObject)
+    const DropValidator& validateDrop, const std::function<EditorIcon(std::string_view)>& iconForObject,
+    const std::function<const char*(std::string_view)>& warningForObject)
 {
     ObserveSelection(snapshot, selectedObject, dragIdentity.sessionEpoch, sceneIdentity);
     m_focused = false;
@@ -447,6 +448,17 @@ std::optional<std::size_t> SceneHierarchyPanel::Draw(const EditorWorkspaceRect& 
                 if(ImGui::MenuItem("Directional Light"))
                 {
                     m_lightObjectRequest = LightType::Directional;
+                }
+
+                ImGui::EndMenu();
+            }
+
+            // Top level: meshless objects carrying only a Steam Audio component.
+            if(ImGui::BeginMenu("Steam Audio"))
+            {
+                if(ImGui::MenuItem("Probe Volume"))
+                {
+                    m_probeVolumeObjectRequest = true;
                 }
 
                 ImGui::EndMenu();
@@ -626,9 +638,18 @@ std::optional<std::size_t> SceneHierarchyPanel::Draw(const EditorWorkspaceRect& 
                         }
                     }
 
+                    const char* warning = warningForObject && !entry.objectID.empty() ? warningForObject(entry.objectID) : nullptr;
+
                     if(ImGui::IsItemHovered() && !ImGui::GetDragDropPayload())
                     {
-                        ImGui::SetTooltip("%s\nDepth: %zu\n%s", entry.name.c_str(), row.depth, entry.objectID.c_str());
+                        if(warning)
+                        {
+                            ImGui::SetTooltip("%s\nDepth: %zu\n%s\n%s", entry.name.c_str(), row.depth, entry.objectID.c_str(), warning);
+                        }
+                        else
+                        {
+                            ImGui::SetTooltip("%s\nDepth: %zu\n%s", entry.name.c_str(), row.depth, entry.objectID.c_str());
+                        }
                     }
 
                     if(allowReorder && !IsRenaming() && !entry.objectID.empty())
@@ -668,8 +689,25 @@ std::optional<std::size_t> SceneHierarchyPanel::Draw(const EditorWorkspaceRect& 
                         DrawObjectIcon(*draw, iconOrigin, iconSize);
                     }
 
-                    draw->AddText(ImVec2(rowPosition.x + indent + arrowWidth + iconSize + ImGui::GetStyle().ItemInnerSpacing.x, rowPosition.y), color,
-                        entry.name.empty() ? "(Unnamed Object)" : entry.name.c_str());
+                    const char* label = entry.name.empty() ? "(Unnamed Object)" : entry.name.c_str();
+                    const float textX = rowPosition.x + indent + arrowWidth + iconSize + ImGui::GetStyle().ItemInnerSpacing.x;
+                    draw->AddText(ImVec2(textX, rowPosition.y), color, label);
+
+                    // Decoration only, after the name: it adds no item, so selection, dragging and renaming are unchanged.
+                    if(warning)
+                    {
+                        const ImVec2 warningOrigin(textX + ImGui::CalcTextSize(label).x + ImGui::GetStyle().ItemInnerSpacing.x, iconOrigin.y);
+                        const ImU32 warningColor = IM_COL32(255, 200, 40, 255);
+
+                        if(m_icons)
+                        {
+                            m_icons->Draw(*draw, EditorIcon::Warning, warningOrigin, ImVec2(iconSize, iconSize), warningColor);
+                        }
+                        else
+                        {
+                            draw->AddText(warningOrigin, warningColor, "!");
+                        }
+                    }
                 }
 
                 if(entry.objectID == m_pendingRevealID && !m_pendingRevealID.empty())
@@ -726,4 +764,9 @@ bool SceneHierarchyPanel::TakeCameraObjectRequest()
 std::optional<LightType> SceneHierarchyPanel::TakeLightObjectRequest()
 {
     return std::exchange(m_lightObjectRequest, std::nullopt);
+}
+
+bool SceneHierarchyPanel::TakeProbeVolumeObjectRequest()
+{
+    return std::exchange(m_probeVolumeObjectRequest, false);
 }

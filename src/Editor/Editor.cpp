@@ -424,6 +424,22 @@ void Editor::DrawMainMenu(
     if(ImGui::BeginMenu("Build"))
     {
         if(ImGui::MenuItem("Build")) m_showBuildGame=true;
+        ImGui::Separator();
+        // M8.3: started at the next acoustic poll, which has the mutable scene this menu lacks. StartReflectionBake refuses, with
+        // the reason, while acoustic meshes are not ready.
+        const bool canBake = m_audioSystem && m_audioSystem->GetSteamAudioStatus() == Audio::SteamAudioStatus::Active &&
+            !m_reflectionBake && !m_probeGeneration && !IsSceneEditingLocked();
+
+        if(ImGui::MenuItem("Bake All Reflections", nullptr, false, canBake))
+        {
+            m_bakeAllRequest = false;
+        }
+
+        if(ImGui::MenuItem("Force Rebake All Reflections", nullptr, false, canBake))
+        {
+            m_bakeAllRequest = true;
+        }
+
         ImGui::EndMenu();
     }
 
@@ -1147,6 +1163,9 @@ void Editor::DrawHierarchy(IDemoScene& demoScene, const std::string& activeScene
         {
             const auto found = objectIcons.find(id);
             return found == objectIcons.end() ? EditorIcon::Box : found->second;
+        }, [this](std::string_view id)
+        {
+            return ReflectionBakeWarning(id);
         });
     ImGui::EndDisabled();
 
@@ -1189,6 +1208,18 @@ void Editor::DrawHierarchy(IDemoScene& demoScene, const std::string& activeScene
         {
             m_lightObjectCreationRequest =
                 LightObjectCreationRequest{*lightType, fileScene->GetRuntimeIdentity(), m_historyEpoch};
+        }
+    }
+
+    if(m_hierarchyPanel.TakeProbeVolumeObjectRequest())
+    {
+        const bool canCreate = !IsSceneEditingLocked() && !blocked && fileScene && !fileScene->IsArchiveActivation() &&
+            m_historySession && RenameSessionMatches(demoScene, *m_historySession) && !HasBlockingObjectCreation();
+
+        if(canCreate)
+        {
+            m_probeVolumeObjectCreationRequest =
+                ProbeVolumeObjectCreationRequest{fileScene->GetRuntimeIdentity(), m_historyEpoch};
         }
     }
 
@@ -3015,6 +3046,10 @@ void Editor::SuspendViewportInteraction()
 
 void Editor::OnSceneActivated()
 {
+    // M8.3: a bake in progress notices the new session and cancels itself; status is the new scene's.
+    m_reflectionBakeStatus.Invalidate();
+    m_reflectionBakeFailures.clear();
+    m_reflectionBakeStatusNext = {};
     InvalidateSceneFiles();
     ClearSceneHistory();
     ResetSceneInteractions();
@@ -5178,6 +5213,17 @@ std::optional<Editor::LightObjectCreationRequest> Editor::TakeLightObjectCreatio
 void Editor::OnLightObjectCreationFailed(const std::string& error)
 {
     m_meshCreationStatus = "Light creation rejected: " + error;
+    Log::Warning(m_meshCreationStatus);
+}
+
+std::optional<Editor::ProbeVolumeObjectCreationRequest> Editor::TakeProbeVolumeObjectCreationRequest()
+{
+    return std::exchange(m_probeVolumeObjectCreationRequest, std::nullopt);
+}
+
+void Editor::OnProbeVolumeObjectCreationFailed(const std::string& error)
+{
+    m_meshCreationStatus = "Probe Volume creation rejected: " + error;
     Log::Warning(m_meshCreationStatus);
 }
 

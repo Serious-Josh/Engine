@@ -1,4 +1,5 @@
 #include "Audio/AudioSystemInternal.h"
+#include "Audio/SteamAudioCoordinates.h"
 #include "Core/Log.h"
 
 #include <algorithm>
@@ -258,19 +259,25 @@ FMOD_RESULT AudioSystem::Impl::Start(Output output, InjectedFailure injectedFail
 }
 
 #if defined(ENGINE_HAS_STEAMAUDIO)
-void AudioSystem::Impl::StopProbeGeneration() noexcept
+// Waits for the SDK call in progress: a cancelled bake stops at its next probe, generation at its next checkpoint.
+void AudioSystem::Impl::StopAcousticJob() noexcept
 {
-    if(probeJob)
+    if(acousticJob)
     {
-        probeJob->Cancel();
+        acousticJob->Cancel();
     }
 
-    if(probeThread.joinable())
+    if(acousticThread.joinable())
     {
-        probeThread.join();
+        acousticThread.join();
     }
 
-    probeJob.reset();
+    acousticJob.reset();
+}
+
+bool AudioSystem::Impl::CanStartAcousticJob() const noexcept
+{
+    return steamAudio && steamAudioStatus == SteamAudioStatus::Active && !(acousticJob && !acousticJob->IsFinished());
 }
 #endif
 
@@ -295,7 +302,7 @@ void AudioSystem::Impl::ReleaseStudioSystem() noexcept
 #if defined(ENGINE_HAS_STEAMAUDIO)
     // SA.1: only now, with every Steam Audio DSP destroyed by the release above, may the plugin's state go. SA.3:
     // sources and their simulator first, while Steam Audio's context still exists.
-    StopProbeGeneration();
+    StopAcousticJob();
     steamAudioSimulation.reset();
     probeBatches.reset();
 
@@ -327,23 +334,361 @@ ProbeGenerationResult AudioSystem::GenerateProbes(const ProbeGenerationRequest& 
 std::shared_ptr<ProbeGenerationJob> AudioSystem::StartProbeGeneration(ProbeGenerationRequest request)
 {
 #if defined(ENGINE_HAS_STEAMAUDIO)
-    if(!m_impl->steamAudio || m_impl->steamAudioStatus != SteamAudioStatus::Active || (m_impl->probeJob && !m_impl->probeJob->IsFinished()))
+    if(!m_impl->CanStartAcousticJob())
     {
         return nullptr;
     }
 
-    m_impl->StopProbeGeneration();
+    m_impl->StopAcousticJob();
     auto job = std::make_shared<ProbeGenerationJob>();
-    // The context outlives the thread: StopProbeGeneration joins it before Steam Audio stops.
-    m_impl->probeThread = std::thread([job, context = m_impl->steamAudio->GetContext(), request = std::move(request)]
+    // The context outlives the thread: StopAcousticJob joins it before Steam Audio stops.
+    m_impl->acousticThread = std::thread([job, context = m_impl->steamAudio->GetContext(), request = std::move(request)]
     {
         job->Finish(Internal::GenerateProbeBatch(context, request, job.get()));
     });
-    m_impl->probeJob = job;
+    m_impl->acousticJob = job;
     return job;
 #else
     static_cast<void>(request);
     return nullptr;
+#endif
+}
+
+std::size_t AudioSystem::SetBakedListenerReverb(std::span<const BakedReverbVolume> volumes, std::vector<std::string>& errors)
+{
+    return RegisterBakedReflections(volumes, true, errors);
+}
+
+std::size_t AudioSystem::RegisterBakedReflections(std::span<const BakedReverbVolume> volumes, bool listener, std::vector<std::string>& errors)
+{
+#if defined(ENGINE_HAS_STEAMAUDIO)
+    if(!m_impl->steamAudio || m_impl->steamAudioStatus != SteamAudioStatus::Active || !m_impl->steamAudioSimulation)
+    {
+        errors.push_back("Steam Audio is not active");
+        return 0;
+    }
+
+    m_impl->NoteGameplayCall();
+    const IPLContext context = m_impl->steamAudio->GetContext();
+    std::vector<Internal::SteamAudioSimulation::BakedReverbBatch> batches;
+
+    for(const BakedReverbVolume& volume : volumes)
+    {
+        std::string error;
+        IPLProbeBatch batch = Internal::LoadCommittedProbeBatch(context, volume.batch, volume.probes.size(), error);
+
+        if(!batch)
+        {
+            errors.push_back(volume.name + ": " + error);
+            continue;
+        }
+
+        // The identifier exactly as the simulator will ask for it.
+        IPLBakedDataIdentifier reverb{};
+        reverb.type = IPL_BAKEDDATATYPE_REFLECTIONS;
+        reverb.variation = IPL_BAKEDDATAVARIATION_REVERB;
+
+        if(iplProbeBatchGetDataSize(batch, &reverb) == 0)
+        {
+            iplProbeBatchRelease(&batch);
+            errors.push_back(volume.name + ": the batch holds no listener reverb");
+            continue;
+        }
+
+        Internal::SteamAudioSimulation::BakedReverbBatch entry;
+        entry.batch = batch;
+
+        for(const std::array<float, 4>& probe : volume.probes)
+        {
+            const SteamAudio::Vector centre = SteamAudio::ToSteamAudio(SteamAudio::Vector{probe[0], probe[1], probe[2]});
+            entry.spheres.push_back({centre[0], centre[1], centre[2], probe[3]});
+        }
+
+        batches.push_back(std::move(entry));
+    }
+
+    const std::size_t count = batches.size();
+
+    if(count == 0)
+    {
+        return 0;
+    }
+
+    if(!m_impl->steamAudioSimulation->SetBakedReverb(std::move(batches), listener))
+    {
+        errors.push_back("baked reverb needs the environmental reverb route, which this session does not run");
+        return 0;
+    }
+
+    return count;
+#else
+    static_cast<void>(volumes);
+    errors.push_back("Steam Audio is not compiled into this build");
+    return 0;
+#endif
+}
+
+void AudioSystem::ClearBakedListenerReverb() noexcept
+{
+#if defined(ENGINE_HAS_STEAMAUDIO)
+    if(m_impl->steamAudioSimulation)
+    {
+        m_impl->steamAudioSimulation->SetBakedReverb({});
+    }
+#endif
+}
+
+std::size_t AudioSystem::SetPathingVolumes(std::span<const BakedReverbVolume> volumes, std::vector<std::string>& errors)
+{
+#if defined(ENGINE_HAS_STEAMAUDIO)
+    if(!m_impl->steamAudio || m_impl->steamAudioStatus != SteamAudioStatus::Active || !m_impl->steamAudioSimulation ||
+        !m_impl->steamAudioSimulation->IsPathingAvailable())
+    {
+        m_impl->pathingDisplay.clear();
+
+        if(!volumes.empty())
+        {
+            errors.push_back("this session runs no pathing simulator");
+        }
+
+        return 0;
+    }
+
+    std::vector<Internal::SteamAudioSimulation::BakedReverbBatch> batches;
+    std::vector<PathingVolumeDisplay> display;
+
+    for(const BakedReverbVolume& volume : volumes)
+    {
+        std::string error;
+        IPLProbeBatch batch = Internal::LoadCommittedProbeBatch(m_impl->steamAudio->GetContext(), volume.batch, volume.probes.size(), error);
+
+        if(!batch)
+        {
+            errors.push_back(volume.name + ": " + error);
+            continue;
+        }
+
+        IPLBakedDataIdentifier pathing{};
+        pathing.type = IPL_BAKEDDATATYPE_PATHING;
+        pathing.variation = IPL_BAKEDDATAVARIATION_DYNAMIC;
+
+        if(iplProbeBatchGetDataSize(batch, &pathing) == 0)
+        {
+            iplProbeBatchRelease(&batch);
+            errors.push_back(volume.name + ": the batch holds no pathing layer");
+            continue;
+        }
+
+        Internal::SteamAudioSimulation::BakedReverbBatch entry;
+        entry.batch = batch;
+
+        for(const std::array<float, 4>& probe : volume.probes)
+        {
+            const SteamAudio::Vector centre = SteamAudio::ToSteamAudio(SteamAudio::Vector{probe[0], probe[1], probe[2]});
+            entry.spheres.push_back({centre[0], centre[1], centre[2], probe[3]});
+        }
+
+        batches.push_back(std::move(entry));
+        // Indexed as the simulation indexes its batches, so a status's batch names its volume here.
+        display.push_back({volume.name, volume.probes});
+    }
+
+    const std::size_t count = batches.size();
+    m_impl->steamAudioSimulation->SetPathingBatches(std::move(batches));
+    m_impl->pathingDisplay = std::move(display);
+    return count;
+#else
+    if(!volumes.empty())
+    {
+        errors.push_back("Steam Audio is not compiled into this build");
+    }
+
+    return 0;
+#endif
+}
+
+std::vector<AudioSystem::PathingVolumeDisplay> AudioSystem::GetPathingVolumesForDisplay() const
+{
+#if defined(ENGINE_HAS_STEAMAUDIO)
+    return m_impl->pathingDisplay;
+#else
+    return {};
+#endif
+}
+
+void AudioSystem::SetPathingVisualization(bool enabled) noexcept
+{
+#if defined(ENGINE_HAS_STEAMAUDIO)
+    if(m_impl->steamAudioSimulation)
+    {
+        m_impl->steamAudioSimulation->SetPathingVisualization(enabled);
+    }
+#else
+    static_cast<void>(enabled);
+#endif
+}
+
+std::vector<AudioSystem::PathingSegment> AudioSystem::GetPathingSegments() const
+{
+    std::vector<PathingSegment> segments;
+#if defined(ENGINE_HAS_STEAMAUDIO)
+    if(m_impl->steamAudioSimulation)
+    {
+        segments = m_impl->steamAudioSimulation->GetPathingSegments();
+
+        for(PathingSegment& segment : segments)
+        {
+            const SteamAudio::Vector from = SteamAudio::FromSteamAudio(SteamAudio::Vector{segment.from[0], segment.from[1], segment.from[2]});
+            const SteamAudio::Vector to = SteamAudio::FromSteamAudio(SteamAudio::Vector{segment.to[0], segment.to[1], segment.to[2]});
+            segment.from = {from[0], from[1], from[2]};
+            segment.to = {to[0], to[1], to[2]};
+        }
+    }
+#endif
+    return segments;
+}
+
+bool AudioSystem::SetPathingBatchForTesting(const BakedReverbVolume* volume, std::string& error)
+{
+    std::vector<std::string> errors;
+    const std::size_t registered = SetPathingVolumes(volume ? std::span(volume, 1) : std::span<const BakedReverbVolume>{}, errors);
+    error = errors.empty() ? std::string{} : errors.front();
+    return volume ? registered == 1 : errors.empty();
+}
+
+ReflectionBakeResult AudioSystem::BakeReflections(const ReflectionBakeRequest& request) const
+{
+#if defined(ENGINE_HAS_STEAMAUDIO)
+    if(m_impl->steamAudio && m_impl->steamAudioStatus == SteamAudioStatus::Active)
+    {
+        const IPLEmbreeDevice embree = m_impl->steamAudioSimulation ? m_impl->steamAudioSimulation->GetEmbreeDevice() : nullptr;
+        return Internal::BakeReflectionLayers(m_impl->steamAudio->GetContext(), embree, request);
+    }
+#else
+    static_cast<void>(request);
+#endif
+
+    ReflectionBakeResult result;
+    result.error = "Steam Audio is not active in this project";
+    return result;
+}
+
+std::shared_ptr<ReflectionBakeJob> AudioSystem::StartReflectionBake(ReflectionBakeRequest request)
+{
+#if defined(ENGINE_HAS_STEAMAUDIO)
+    if(!m_impl->CanStartAcousticJob())
+    {
+        return nullptr;
+    }
+
+    m_impl->StopAcousticJob();
+    auto job = std::make_shared<ReflectionBakeJob>();
+    // The bake holds its own reference to the session's Embree device, released on the job thread before the job reports
+    // finished. StopAcousticJob joins that thread before the simulation (which owns the device) and the context go.
+    IPLEmbreeDevice embree = m_impl->steamAudioSimulation ? m_impl->steamAudioSimulation->GetEmbreeDevice() : nullptr;
+
+    if(embree)
+    {
+        embree = iplEmbreeDeviceRetain(embree);
+    }
+
+    m_impl->acousticThread = std::thread([job, context = m_impl->steamAudio->GetContext(), embree, request = std::move(request)]() mutable
+    {
+        ReflectionBakeResult result = Internal::BakeReflectionLayers(context, embree, request, job.get());
+
+        if(embree)
+        {
+            iplEmbreeDeviceRelease(&embree);
+        }
+
+        job->Finish(std::move(result));
+    });
+    m_impl->acousticJob = job;
+    return job;
+#else
+    static_cast<void>(request);
+    return nullptr;
+#endif
+}
+
+PathingBakeResult AudioSystem::BakePathing(const PathingBakeRequest& request) const
+{
+#if defined(ENGINE_HAS_STEAMAUDIO)
+    if(m_impl->steamAudio && m_impl->steamAudioStatus == SteamAudioStatus::Active)
+    {
+        const IPLEmbreeDevice embree = m_impl->steamAudioSimulation ? m_impl->steamAudioSimulation->GetEmbreeDevice() : nullptr;
+        return Internal::BakePathingLayer(m_impl->steamAudio->GetContext(), embree, request);
+    }
+#else
+    static_cast<void>(request);
+#endif
+
+    PathingBakeResult result;
+    result.error = "Steam Audio is not active in this project";
+    return result;
+}
+
+std::shared_ptr<PathingBakeJob> AudioSystem::StartPathingBake(PathingBakeRequest request)
+{
+#if defined(ENGINE_HAS_STEAMAUDIO)
+    if(!m_impl->CanStartAcousticJob())
+    {
+        return nullptr;
+    }
+
+    m_impl->StopAcousticJob();
+    auto job = std::make_shared<PathingBakeJob>();
+    // As for reflection bakes: the job holds its own reference to the session's Embree device until it finishes.
+    IPLEmbreeDevice embree = m_impl->steamAudioSimulation ? m_impl->steamAudioSimulation->GetEmbreeDevice() : nullptr;
+
+    if(embree)
+    {
+        embree = iplEmbreeDeviceRetain(embree);
+    }
+
+    m_impl->acousticThread = std::thread([job, context = m_impl->steamAudio->GetContext(), embree, request = std::move(request)]() mutable
+    {
+        PathingBakeResult result = Internal::BakePathingLayer(context, embree, request, job.get());
+
+        if(embree)
+        {
+            iplEmbreeDeviceRelease(&embree);
+        }
+
+        job->Finish(std::move(result));
+    });
+    m_impl->acousticJob = job;
+    return job;
+#else
+    static_cast<void>(request);
+    return nullptr;
+#endif
+}
+
+std::chrono::steady_clock::duration AudioSystem::StopAcousticJob() noexcept
+{
+    const auto start = std::chrono::steady_clock::now();
+#if defined(ENGINE_HAS_STEAMAUDIO)
+    m_impl->StopAcousticJob();
+#endif
+    return std::chrono::steady_clock::now() - start;
+}
+
+std::uint64_t AudioSystem::GetAcousticJobOverlapsForTesting() const noexcept
+{
+#if defined(ENGINE_HAS_STEAMAUDIO)
+    return m_impl->acousticJobOverlaps;
+#else
+    return 0;
+#endif
+}
+
+bool AudioSystem::IsAcousticJobRunning() const noexcept
+{
+#if defined(ENGINE_HAS_STEAMAUDIO)
+    return m_impl->acousticJob && !m_impl->acousticJob->IsFinished();
+#else
+    return false;
 #endif
 }
 
@@ -352,6 +697,8 @@ bool AudioSystem::LoadProbeBatch(std::span<const std::byte> batch, std::size_t e
 #if defined(ENGINE_HAS_STEAMAUDIO)
     if(m_impl->steamAudio && m_impl->steamAudioStatus == SteamAudioStatus::Active)
     {
+        m_impl->NoteGameplayCall();
+
         if(!m_impl->probeBatches)
         {
             m_impl->probeBatches = std::make_unique<Internal::SteamAudioProbeBatches>();
@@ -865,6 +1212,7 @@ bool AudioSystem::IsAcousticSimulationAvailable() const noexcept
 bool AudioSystem::SetAcousticObject(std::uint64_t id, std::shared_ptr<const AcousticMeshData> mesh, const AcousticTransform& world)
 {
 #if defined(ENGINE_HAS_STEAMAUDIO)
+    m_impl->NoteGameplayCall();
     return IsAcousticSimulationAvailable() && m_impl->steamAudioSimulation->SetAcousticObject(id, std::move(mesh), world);
 #else
     static_cast<void>(id);

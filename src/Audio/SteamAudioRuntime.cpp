@@ -51,6 +51,15 @@ namespace
     // IPL_SPATIALIZE_APPLY_REFLECTIONS.
     constexpr int ApplyReflectionsParameter = 7;
     constexpr std::string_view ApplyReflectionsName = "ApplyRefl";
+    // IPL_SPATIALIZE_APPLY_PATHING.
+    constexpr int ApplyPathingParameter = 8;
+    constexpr std::string_view ApplyPathingName = "ApplyPath";
+    // IPL_SPATIALIZE_APPLY_OCCLUSION and _TRANSMISSION: Off (0), Simulation-Defined (1) or User-Defined (2), as authored.
+    constexpr int ApplyOcclusionParameter = 5;
+    constexpr std::string_view ApplyOcclusionName = "ApplyOccl";
+    constexpr int ApplyTransmissionParameter = 6;
+    constexpr std::string_view ApplyTransmissionName = "ApplyTrans";
+    constexpr int SimulationDefined = 1;
 
     // phonon.dll stays loaded for the process once loaded: the delay-load thunks keep pointing into it.
     std::atomic<bool> phononLoaded{false};
@@ -386,7 +395,10 @@ bool SteamAudioRuntime::RegisterPlugin(FMOD::System& core, SteamAudioInjectedFai
         SameParameter(spatializer->paramdesc[DistanceAttenuationParameter], DistanceAttenuationName,
             FMOD_DSP_PARAMETER_TYPE_INT) &&
         SameParameter(spatializer->paramdesc[ApplyReflectionsParameter], ApplyReflectionsName,
-            FMOD_DSP_PARAMETER_TYPE_BOOL);
+            FMOD_DSP_PARAMETER_TYPE_BOOL) &&
+        SameParameter(spatializer->paramdesc[ApplyPathingParameter], ApplyPathingName, FMOD_DSP_PARAMETER_TYPE_BOOL) &&
+        SameParameter(spatializer->paramdesc[ApplyOcclusionParameter], ApplyOcclusionName, FMOD_DSP_PARAMETER_TYPE_INT) &&
+        SameParameter(spatializer->paramdesc[ApplyTransmissionParameter], ApplyTransmissionName, FMOD_DSP_PARAMETER_TYPE_INT);
 
     if(injectedFailure == SteamAudioInjectedFailure::PluginIdentity || !registeredValid)
     {
@@ -722,6 +734,29 @@ bool SteamAudioRuntime::SetPluginReverbSource(IPLSource source) const
 void SteamAudioRuntime::SetAppliesReflections(FMOD::DSP& spatializer, bool applies) const
 {
     spatializer.setParameterBool(ApplyReflectionsParameter, applies);
+}
+
+bool SteamAudioRuntime::AppliesPathing(FMOD::DSP& spatializer) const
+{
+    bool applies = false;
+    return spatializer.getParameterBool(ApplyPathingParameter, &applies, nullptr, 0) == FMOD_OK && applies;
+}
+
+void SteamAudioRuntime::SetAppliesPathing(FMOD::DSP& spatializer, bool applies) const
+{
+    spatializer.setParameterBool(ApplyPathingParameter, applies);
+}
+
+bool SteamAudioRuntime::AppliesSimulatedOcclusion(FMOD::DSP& spatializer) const
+{
+    int mode = 0;
+    return spatializer.getParameterInt(ApplyOcclusionParameter, &mode, nullptr, 0) == FMOD_OK && mode == SimulationDefined;
+}
+
+bool SteamAudioRuntime::AppliesSimulatedTransmission(FMOD::DSP& spatializer) const
+{
+    int mode = 0;
+    return spatializer.getParameterInt(ApplyTransmissionParameter, &mode, nullptr, 0) == FMOD_OK && mode == SimulationDefined;
 }
 
 bool SteamAudioRuntime::SetPluginSimulationSettings(const IPLSimulationSettings& settings) const

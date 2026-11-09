@@ -620,6 +620,7 @@ std::optional<ScriptComponent> ReadScriptComponent(Reader& reader)
 // V17 Audio: u32 Audio Source presence; when present u32 enabled, the event GUID and path strings and u32 autoplay.
 // Then u32 Audio Listener presence; when present u32 enabled.
 // V20 adds u32 source-centric and u32 baked after autoplay, and u32 baked after the listener's enabled.
+// V24 adds u32 pathing after the source's baked flag. Older payloads read as no pathing.
 void WriteAudioComponents(Writer& writer, const std::optional<AudioSourceComponent>& source,
     const std::optional<AudioListenerComponent>& listener)
 {
@@ -633,6 +634,7 @@ void WriteAudioComponents(Writer& writer, const std::optional<AudioSourceCompone
         writer.WriteUnsigned(source->autoplay ? 1 : 0, 4);
         writer.WriteUnsigned(source->sourceCentricReflections ? 1 : 0, 4);
         writer.WriteUnsigned(source->bakedReflections ? 1 : 0, 4);
+        writer.WriteUnsigned(source->pathing ? 1 : 0, 4);
     }
 
     writer.WriteUnsigned(listener.has_value() ? 1 : 0, 4);
@@ -692,6 +694,10 @@ void ReadAcousticSettings(Reader& reader, std::optional<AcousticSettings>& acous
 
 // V21 Probe Volume: u32 presence; when present u32 enabled, u32 placement, f32 x3 size, f32 spacing, f32 height, u32 manual count, f32 x3 each, reference string.
 // V22 adds u32 filterInsideSolids. V21 probes were generated unfiltered, so reading one as unfiltered keeps its fingerprint valid.
+// V23 adds u32 rays, u32 diffuse samples, u32 bounces, f32 irradiance minimum and the baked reflections reference string. Older
+// payloads read as the default settings and no baked data.
+// V24 adds u32 pathing enabled, u32 pathing samples, f32 radius, f32 threshold, f32 visibility range, f32 path range and the baked
+// pathing reference string. Older payloads read as pathing enabled, the default settings and no baked pathing.
 void WriteProbeVolume(Writer& writer, const std::optional<ProbeVolumeComponent>& volume)
 {
     writer.WriteUnsigned(volume.has_value() ? 1 : 0, 4);
@@ -722,6 +728,18 @@ void WriteProbeVolume(Writer& writer, const std::optional<ProbeVolumeComponent>&
 
     writer.WriteString(volume->probeBatch);
     writer.WriteUnsigned(volume->filterInsideSolids ? 1 : 0, 4);
+    writer.WriteUnsigned(volume->bakeSettings.rays, 4);
+    writer.WriteUnsigned(volume->bakeSettings.diffuseSamples, 4);
+    writer.WriteUnsigned(volume->bakeSettings.bounces, 4);
+    writer.WriteFloat(volume->bakeSettings.irradianceMinimumDistance);
+    writer.WriteString(volume->bakedReflections);
+    writer.WriteUnsigned(volume->pathingEnabled ? 1 : 0, 4);
+    writer.WriteUnsigned(volume->pathingSettings.samples, 4);
+    writer.WriteFloat(volume->pathingSettings.radius);
+    writer.WriteFloat(volume->pathingSettings.threshold);
+    writer.WriteFloat(volume->pathingSettings.visibilityRange);
+    writer.WriteFloat(volume->pathingSettings.pathRange);
+    writer.WriteString(volume->bakedPathing);
 }
 
 void ReadProbeVolume(Reader& reader, std::optional<ProbeVolumeComponent>& volume, std::uint32_t version)
@@ -771,6 +789,28 @@ void ReadProbeVolume(Reader& reader, std::optional<ProbeVolumeComponent>& volume
         value.filterInsideSolids = filter != 0;
     }
 
+    if(version >= BakedReflectionsVersion)
+    {
+        value.bakeSettings.rays = static_cast<std::uint32_t>(reader.ReadUnsigned(4));
+        value.bakeSettings.diffuseSamples = static_cast<std::uint32_t>(reader.ReadUnsigned(4));
+        value.bakeSettings.bounces = static_cast<std::uint32_t>(reader.ReadUnsigned(4));
+        value.bakeSettings.irradianceMinimumDistance = reader.ReadFloat();
+        value.bakedReflections = reader.ReadString();
+    }
+
+    if(version >= PathingVersion)
+    {
+        const auto pathing = reader.ReadUnsigned(4);
+        Require(pathing <= 1, "Invalid cooked Probe Volume pathing flag.");
+        value.pathingEnabled = pathing != 0;
+        value.pathingSettings.samples = static_cast<std::uint32_t>(reader.ReadUnsigned(4));
+        value.pathingSettings.radius = reader.ReadFloat();
+        value.pathingSettings.threshold = reader.ReadFloat();
+        value.pathingSettings.visibilityRange = reader.ReadFloat();
+        value.pathingSettings.pathRange = reader.ReadFloat();
+        value.bakedPathing = reader.ReadString();
+    }
+
     std::string error;
     Require(ValidateProbeVolume(value, &error), error.c_str());
     volume = std::move(value);
@@ -805,6 +845,11 @@ void ReadAudioComponents(Reader& reader, std::uint32_t version, std::optional<Au
         {
             value.sourceCentricReflections = ReadCookedFlag(reader, "Invalid cooked Audio Source reflections flag.");
             value.bakedReflections = ReadCookedFlag(reader, "Invalid cooked Audio Source baked flag.");
+        }
+
+        if(version >= PathingVersion)
+        {
+            value.pathing = ReadCookedFlag(reader, "Invalid cooked Audio Source pathing flag.");
         }
 
         std::string error;

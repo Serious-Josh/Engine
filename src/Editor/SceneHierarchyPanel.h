@@ -25,6 +25,8 @@ public:
     bool TakeCameraObjectRequest();
     // The Light type once after a "Light" submenu entry was chosen.
     std::optional<LightType> TakeLightObjectRequest();
+    // True once after "Steam Audio > Probe Volume" was chosen.
+    bool TakeProbeVolumeObjectRequest();
     bool IsFocused() const noexcept { return m_focused; }
     void BeginRename(const std::string& objectID, const std::string& name);
     void CancelRename();
@@ -48,7 +50,9 @@ public:
         const SceneHierarchySnapshot& snapshot, std::optional<std::size_t> selectedObject,
         const void* sceneIdentity, const std::string& error,
         const HierarchyDragIdentity& dragIdentity, bool allowReorder, bool allowCreation = false, std::span<const std::size_t> selectedObjects = {}, const DropValidator& validateDrop = {},
-        const std::function<EditorIcon(std::string_view)>& iconForObject = {});
+        const std::function<EditorIcon(std::string_view)>& iconForObject = {},
+        // M8.3: a short warning drawn as an icon after the row's name, with its text in the row's tooltip; null for none.
+        const std::function<const char*(std::string_view)>& warningForObject = {});
 
 private:
     const EditorIcons* m_icons = nullptr;
@@ -71,6 +75,7 @@ private:
     bool m_emptyObjectRequest = false;
     bool m_cameraObjectRequest = false;
     std::optional<LightType> m_lightObjectRequest;
+    bool m_probeVolumeObjectRequest = false;
     std::optional<HierarchyDropRequest> m_dropRequest;
     SceneHierarchySnapshot m_treeSnapshot;
     SceneHierarchy::Forest m_tree;

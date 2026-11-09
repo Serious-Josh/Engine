@@ -2,6 +2,8 @@
 
 #include "Engine/GameAudioSession.h"
 #include "assets/AcousticMaterial.h"
+#include "assets/BakedPathingAsset.h"
+#include "assets/BakedReflectionsAsset.h"
 #include "assets/ProbeBatchAsset.h"
 #include "assets/ImportedMesh.h"
 #include "Engine/PhysicsSimulationController.h"
@@ -62,6 +64,10 @@ public:
         std::function<std::optional<AcousticMaterialData>(const std::string& reference, std::string* error)> material;
         // M7: a volume's stored probes.
         std::function<std::optional<ProbeBatchAssets::Data>(const std::string& reference, std::string* error)> probeBatch;
+        // M8.4: a volume's baked reflections, as resolved and decoded. Unset (packaged games until M8.6): baked reverb is unavailable.
+        std::function<BakedReflectionsAssets::Resolution(const std::string& reference)> bakedReflections;
+        // M9.5: a volume's baked pathing, as resolved and decoded. Unset (packaged games until M9.7): pathing is unavailable.
+        std::function<BakedPathingAssets::Resolution(const std::string& reference)> bakedPathing;
     };
 
     void SetAcousticAssets(AcousticAssets assets) { m_acousticAssets = std::move(assets); }
@@ -188,7 +194,8 @@ private:
     // poses, before any script code runs.
     void BeginSceneAudio(FileSceneRuntime& runtime);
     void PublishAcousticScene(FileSceneRuntime& runtime);
-    void LoadProbeVolumes(FileSceneRuntime& runtime);
+    // M7 probes, then (M8.4) the baked reverb the listener uses when it asks for baked reflections.
+    void LoadProbeVolumes(FileSceneRuntime& runtime, bool listenerBaked);
     // Audio.2A autoplay after OnStart (the listener was selected by BeginSceneAudio).
     void StartSceneAudio(FileSceneRuntime& runtime);
     // Audio.2A: moves the FMOD listener and every object-bound event to the presented world poses of this frame.

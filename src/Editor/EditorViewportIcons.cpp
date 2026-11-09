@@ -195,6 +195,24 @@ void Editor::DrawViewportTools(IDemoScene& scene, const EditorIcons& icons, bool
         m_viewportActiveListener.reset();
         m_viewportIconFrame = -1;
         m_viewportIconScene = nullptr;
+
+        // M9.6: the pathing overlay is what Play is for, so it stays over the game view when asked for. Display only, no input.
+        const auto* owner = dynamic_cast<const FileBackedDemoScene*>(&scene);
+
+        if(owner && owner->m_runtime && owner->m_runtime->GetFileScene().HasDocument() && m_viewportImage.size.x > 0 && m_viewportImage.size.y > 0)
+        {
+            ImDrawList* draw = ImGui::GetForegroundDrawList();
+            const ImVec2 end(m_viewportImage.position.x + m_viewportImage.size.x, m_viewportImage.position.y + m_viewportImage.size.y);
+            draw->PushClipRect(m_viewportImage.position, end, true);
+            const auto& camera = scene.GetScene().GetCamera();
+            DrawPathingOverlay(*owner, *draw, camera.GetProjectionMatrix() * camera.GetViewMatrix(), m_viewportImage.position, m_viewportImage.size);
+            draw->PopClipRect();
+        }
+        else if(m_audioSystem)
+        {
+            m_audioSystem->SetPathingVisualization(false);
+        }
+
         return;
     }
 
@@ -230,10 +248,7 @@ void Editor::DrawViewportTools(IDemoScene& scene, const EditorIcons& icons, bool
     {
         const auto& camera = scene.GetScene().GetCamera();
         const Matrix4 viewProjection = camera.GetProjectionMatrix() * camera.GetViewMatrix();
-        DrawProbeVolumeOverlay(scene, *draw, [&](const Vector3& point)
-        {
-            return ProjectPoint(viewProjection, point, m_viewportImage.position, m_viewportImage.size);
-        });
+        DrawProbeVolumeOverlay(scene, *draw, viewProjection, m_viewportImage.position, m_viewportImage.size);
     }
 
     // Listener facing lines under the icons; the active listener is green, others grey.

@@ -657,6 +657,28 @@ bool Scene::EvaluateHierarchy(std::span<const RenderObject> objects, const Scene
     return true;
 }
 
+bool Scene::ComputeAuthoredWorlds(std::vector<Matrix4>& worlds, std::string* error) const
+{
+    worlds.resize(m_renderObjects.size());
+
+    if(!HasHierarchy())
+    {
+        for(std::size_t slot = 0; slot < m_renderObjects.size(); ++slot)
+        {
+            worlds[slot] = m_renderObjects[slot].transform.GetModelMatrix();
+        }
+
+        return true;
+    }
+
+    // The authored inputs of EvaluateHierarchyEdit.
+    HierarchyInputs authored;
+    authored.localOverrides = &m_hierarchyLocalOverrides;
+    authored.useCommittedPoses = false;
+    authored.useRuntimeLocals = false;
+    return EvaluateHierarchy(m_renderObjects, m_hierarchy, m_hierarchyHasChildren, authored, worlds, error);
+}
+
 bool Scene::EvaluateHierarchyEdit(std::string* error) noexcept
 {
     // Authored worlds must stay valid so that clearing poses (Stop) can never fail.

@@ -69,12 +69,24 @@ struct AudioSystem::Impl
     std::unique_ptr<Internal::SteamAudioRuntime> steamAudio;
     // SA.3: the simulation sources and D9's worker; present whenever steamAudio is. It borrows steamAudio, so it goes first.
     std::unique_ptr<Internal::SteamAudioSimulation> steamAudioSimulation;
+    // M9.6, display only: the registered pathing volumes, as SetPathingVolumes kept them.
+    std::vector<AudioSystem::PathingVolumeDisplay> pathingDisplay;
     // M7: the gameplay session's loaded probes. Gone before the context.
     std::unique_ptr<Internal::SteamAudioProbeBatches> probeBatches;
-    // M7.1: at most one generation. Joined before the context goes.
-    std::shared_ptr<ProbeGenerationJob> probeJob;
-    std::thread probeThread;
-    void StopProbeGeneration() noexcept;
+    // M7.1, M8.3: at most one acoustic job (a probe generation or a reflection bake). Joined before the context goes.
+    std::shared_ptr<AcousticJob> acousticJob;
+    std::thread acousticThread;
+    void StopAcousticJob() noexcept;
+    bool CanStartAcousticJob() const noexcept;
+    // Counts gameplay simulation calls made while an acoustic job runs; Play must have stopped it first.
+    void NoteGameplayCall() noexcept
+    {
+        if(acousticJob && !acousticJob->IsFinished())
+        {
+            ++acousticJobOverlaps;
+        }
+    }
+    std::uint64_t acousticJobOverlaps = 0;
 #endif
 
     FMOD_RESULT Start(Internal::Output output, InjectedFailure injectedFailure);

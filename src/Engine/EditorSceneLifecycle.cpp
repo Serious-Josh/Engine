@@ -278,6 +278,8 @@ void Engine::ProcessEditorSceneRequests(IDemoScene& activeScene)
                 if(!ResolveSceneLocation(GetActiveProject(), operation.path, true, resolved, m_sceneOperationError) ||
                     !LoadSceneDocument(resolved, document, &m_sceneOperationError))
                 {
+                    // The dialog is not the only record: a failed open is also logged, so unattended runs can see why.
+                    Log::Error("Could not open scene " + operation.path.string() + ": " + m_sceneOperationError);
                     m_editor.ReportLifecycleMessage(m_sceneOperationError);
                     return;
                 }

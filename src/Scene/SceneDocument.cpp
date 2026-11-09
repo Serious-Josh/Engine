@@ -221,9 +221,19 @@ bool ValidateProbeVolume(const ProbeVolumeComponent& volume, std::string* error)
     {
         reason = "Unknown probe placement.";
     }
-    else if(volume.manualProbes.size() > ProbeVolumeComponent::MaximumManualProbes || volume.probeBatch.size() > ProbeVolumeComponent::MaximumReferenceBytes)
+    else if(volume.manualProbes.size() > ProbeVolumeComponent::MaximumManualProbes || volume.probeBatch.size() > ProbeVolumeComponent::MaximumReferenceBytes ||
+        volume.bakedReflections.size() > ProbeVolumeComponent::MaximumReferenceBytes ||
+        volume.bakedPathing.size() > ProbeVolumeComponent::MaximumReferenceBytes)
     {
         reason = "Probe Volume data is too large.";
+    }
+    else if(!ValidateReflectionBakeSettings(volume.bakeSettings))
+    {
+        reason = "Probe Volume bake settings are out of range.";
+    }
+    else if(!ValidatePathingBakeSettings(volume.pathingSettings))
+    {
+        reason = "Probe Volume pathing settings are out of range.";
     }
 
     for(const auto& probe : volume.manualProbes)
@@ -232,6 +242,38 @@ bool ValidateProbeVolume(const ProbeVolumeComponent& volume, std::string* error)
         {
             reason = "A manual probe has a non-finite position.";
         }
+    }
+
+    if(reason && error)
+    {
+        *error = reason;
+    }
+
+    return reason == nullptr;
+}
+
+bool ValidateReflectionBakeSettings(const ReflectionBakeSettings& settings, std::string* error)
+{
+    using Limits = ReflectionBakeSettings;
+    const char* reason = nullptr;
+
+    if(settings.rays < Limits::MinimumRays || settings.rays > Limits::MaximumRays)
+    {
+        reason = "Bake rays must be between 1 and 1048576.";
+    }
+    else if(settings.diffuseSamples < Limits::MinimumDiffuseSamples || settings.diffuseSamples > Limits::MaximumDiffuseSamples)
+    {
+        reason = "Bake diffuse samples must be between 1 and 65536.";
+    }
+    else if(settings.bounces < Limits::MinimumBounces || settings.bounces > Limits::MaximumBounces)
+    {
+        reason = "Bake bounces must be between 1 and 256.";
+    }
+    else if(!std::isfinite(settings.irradianceMinimumDistance) ||
+        settings.irradianceMinimumDistance < Limits::MinimumIrradianceDistance ||
+        settings.irradianceMinimumDistance > Limits::MaximumIrradianceDistance)
+    {
+        reason = "Bake irradiance minimum must be between 0.01 and 100 metres.";
     }
 
     if(reason && error)

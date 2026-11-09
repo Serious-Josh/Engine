@@ -105,7 +105,7 @@ add_custom_target(UpdateScriptApiDeclarations
 # SA.1: Steam Audio's FMOD plugin and C API live behind the same target; without the SDK (or with FMOD disabled)
 # EngineAudio reports Steam Audio as not compiled and every project runs FMOD-only.
 add_library(EngineAudio STATIC src/Audio/AudioSystem.cpp src/Audio/AudioBanks.cpp src/Audio/AudioControl.cpp
-    src/Audio/SteamAudioMixerAllocator.cpp src/Audio/ProbeSolidClassifier.cpp src/Audio/SteamAudioProbes.cpp src/Audio/SteamAudioRuntime.cpp src/Audio/SteamAudioSimulation.cpp src/Audio/SteamAudioSnapshotSource.cpp)
+    src/Audio/SteamAudioMixerAllocator.cpp src/Audio/ProbeSolidClassifier.cpp src/Audio/SteamAudioProbes.cpp src/Audio/SteamAudioReflectionBaker.cpp src/Audio/SteamAudioRuntime.cpp src/Audio/SteamAudioSimulation.cpp src/Audio/SteamAudioSnapshotSource.cpp)
 target_include_directories(EngineAudio PUBLIC src)
 engine_configure_fmod(EngineAudio)
 engine_configure_steamaudio(EngineAudio)
@@ -349,6 +349,13 @@ add_library(EngineCore OBJECT
     src/assets/ProjectAudioBankAssets.cpp
     src/assets/AcousticMaterial.cpp
     src/assets/ProbeBatchAsset.cpp
+    src/assets/BakedReflectionsAsset.cpp
+    src/Engine/ReflectionBakes.cpp
+    src/Engine/ReflectionBakeJobs.cpp
+    src/Engine/ReflectionBakeStatus.cpp
+    src/assets/BakedPathingAsset.cpp
+    src/Engine/PathingBakes.cpp
+    src/Engine/BakedReverbRuntime.cpp
     src/Engine/AcousticGeometry.cpp
     src/Engine/ProbeVolumes.cpp
     src/Engine/ProbeAssetCleanup.cpp
@@ -434,6 +441,8 @@ add_library(EngineCore OBJECT
     src/Editor/AudioControls.cpp
     src/Editor/AcousticControls.cpp
     src/Editor/ProbeVolumeControls.cpp
+    src/Editor/ReflectionBakeControls.cpp
+    src/Editor/PathingBakeControls.cpp
     src/Scene/FileSceneAssetCatalog.cpp
     src/Scene/SceneMetadataPreparation.cpp
     src/Scene/MeshResidency.cpp
@@ -574,6 +583,40 @@ endif()
 if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Engine/tests/AudioSceneDataTests.cpp")
     add_executable(AudioSceneDataTests src/Engine/tests/AudioSceneDataTests.cpp)
     target_link_libraries(AudioSceneDataTests PRIVATE EngineCore)
+endif()
+
+# M8.2 local-only regression: baked reflection assets, fingerprints, stale detection, planning and cleanup, same guard.
+if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Engine/tests/ReflectionBakeTests.cpp")
+    add_executable(ReflectionBakeTests src/Engine/tests/ReflectionBakeTests.cpp)
+    target_link_libraries(ReflectionBakeTests PRIVATE EngineCore)
+endif()
+
+# M8.3 local-only regression: real Steam Audio baking through AudioSystem and ReflectionBakeJobs, same guard.
+if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Engine/tests/ReflectionBakeJobTests.cpp")
+    add_executable(ReflectionBakeJobTests src/Engine/tests/ReflectionBakeJobTests.cpp)
+    target_link_libraries(ReflectionBakeJobTests PRIVATE EngineCore)
+    target_include_directories(ReflectionBakeJobTests PRIVATE "${ENGINE_STEAMAUDIO_INCLUDE_DIR}")
+
+    if(ENGINE_STEAMAUDIO_AVAILABLE)
+        target_compile_definitions(ReflectionBakeJobTests PRIVATE ENGINE_HAS_STEAMAUDIO=1)
+    endif()
+
+    engine_deploy_fmod(ReflectionBakeJobTests)
+    engine_deploy_steamaudio(ReflectionBakeJobTests)
+endif()
+
+# M9.4 local-only regression: pathing bakes through AudioSystem, the .bakedpathing asset and PathingBakes, same guard.
+if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Engine/tests/PathingBakeTests.cpp")
+    add_executable(PathingBakeTests src/Engine/tests/PathingBakeTests.cpp)
+    target_link_libraries(PathingBakeTests PRIVATE EngineCore)
+    target_include_directories(PathingBakeTests PRIVATE "${ENGINE_STEAMAUDIO_INCLUDE_DIR}")
+
+    if(ENGINE_STEAMAUDIO_AVAILABLE)
+        target_compile_definitions(PathingBakeTests PRIVATE ENGINE_HAS_STEAMAUDIO=1)
+    endif()
+
+    engine_deploy_fmod(PathingBakeTests)
+    engine_deploy_steamaudio(PathingBakeTests)
 endif()
 
 # Local-only E.4 regression: single-object inspection capture equals the full-scene capture, same guard as CameraDataTests.

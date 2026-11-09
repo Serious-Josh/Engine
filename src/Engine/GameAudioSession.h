@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <set>
@@ -59,6 +60,8 @@ public:
         bool autoplay = true;
         bool sourceCentricReflections = false;
         bool bakedReflections = false;
+        // M9.5: the event may also be heard along baked paths (AudioSourceComponent::pathing).
+        bool pathing = false;
     };
 
     // Engine's world matrices (row-indexed storage, column-vector math): translation is column 3, local +Z and +Y
@@ -84,9 +87,27 @@ public:
     // Audio.2C: records every Audio Source of the running scene before any script code runs, so scripts can control
     // them from their constructors and OnStart on.
     void RegisterSceneSources(std::vector<SceneSource> sources);
-    // The active Audio Listener asks for baked shared reflections. No baked data exists yet (M8), so they are reported unavailable and silent:
-    // never simulated in real time instead.
-    void SetListenerBakedReflections(bool baked);
+    // Whether the active Audio Listener hears baked shared reflections (M8.4). Baked: the given volumes' REVERB layers are registered and the
+    // shared reverb is looked up from them, withheld wherever they do not cover the listener; with none usable it is reported unavailable and
+    // silent, never simulated in real time instead. Not baked: realtime, as before. Call once per session, after the acoustic scene.
+    void SetListenerBakedReflections(bool baked, std::span<const Audio::AudioSystem::BakedReverbVolume> volumes = {});
+    // M8.5: a static Audio Source with a baked layer every registered batch holds identically.
+    struct BakedSource
+    {
+        std::string objectID;
+        // The stored identifier, bit for bit.
+        Audio::ReflectionLayerIdentifier identifier;
+        // Engine space, where it was baked, and how far it may be from there (ReflectionBakes::StaticSourceTolerance).
+        std::array<float, 3> position{};
+        float tolerance = 0.01f;
+    };
+    // M8.4 and M8.5 together: registers `volumes` when the listener is baked or any source is, and records the baked sources, whose
+    // events then look their layer up. A source that moves out of tolerance loses its baked reflections for the rest of the session,
+    // with one warning; it never falls back to realtime source-centric reflections.
+    void SetBakedReflections(bool listenerBaked, std::span<const Audio::AudioSystem::BakedReverbVolume> volumes, std::vector<BakedSource> sources);
+    // M9.5: the volumes whose baked pathing is current, for Audio Sources that opt in. Independent of baked reflections in every way. Call once
+    // per session, after the acoustic scene; End unregisters them.
+    void SetPathingVolumes(std::span<const Audio::AudioSystem::BakedReverbVolume> volumes);
     // Audio.2A autoplay, after every OnStart: starts each registered source that is enabled, set to autoplay, not
     // already playing, and not stopped by a script during startup. Each event is placed at its object before it
     // starts; missing events and pose-less objects are skipped with a warning.
@@ -124,6 +145,8 @@ public:
     std::vector<Scripting::AudioEventHandle> GetSceneEvents() const;
     // Diagnostics and tests: every event the session owns, script and component.
     std::vector<Scripting::AudioEventHandle> GetEvents() const;
+    // M9.6, display only: the pathing status of the event an Audio Source object is playing, when it has one with a bound Steam Audio Spatializer.
+    std::optional<Audio::AudioSystem::PathingEventStatus> GetSourcePathingStatus(std::string_view objectID) const;
 
     bool IsActive() const noexcept { return m_active; }
     std::uint64_t GetSessionID() const noexcept { return m_session; }
@@ -165,6 +188,8 @@ private:
         std::optional<std::array<float, 3>> lastPosition;
         // Started for an Audio Source component (not a script event).
         bool sceneSource = false;
+        // M8.5: its reflections come from a baked layer, until the source moves out of tolerance.
+        bool baked = false;
         // SA.2: the event's FMOD Studio GUID, and whether its spatializers have been checked (CheckSpatialization).
         Audio::Guid event;
         bool spatializationChecked = false;
@@ -210,7 +235,7 @@ private:
     bool StartSource(SourceState& source);
     // Creates, places and starts one event; shared by script and component playback.
     std::optional<Audio::EventHandle> StartPlaced(const Audio::Guid& guid, const std::optional<ObjectPose>& pose,
-        const std::string& context, bool sourceCentricReflections = false);
+        const std::string& context, bool sourceCentricReflections = false, const Audio::ReflectionLayerIdentifier* baked = nullptr, bool pathing = false);
     void StopAndRelease(std::size_t index);
     void CheckSpatialization(OwnedEvent& event);
     bool ChangeMixerValue(MixerTarget target, std::string_view name, float value);
@@ -219,6 +244,17 @@ private:
 
     Audio::AudioSystem* m_audio = nullptr;
     bool m_active = false;
+    // M8.4: this session registered baked reverb, which End unregisters.
+    bool m_bakedReverbRegistered = false;
+    bool m_pathingRegistered = false;
+    // M8.5: by object id. `disabled` once the source has moved: for the rest of the session, including later restarts.
+    struct BakedSourceState
+    {
+        BakedSource source;
+        bool disabled = false;
+    };
+    std::map<std::string, BakedSourceState, std::less<>> m_bakedSources;
+    void DisableBakedSource(BakedSourceState& state, std::string_view label);
     std::uint64_t m_session = 0;
     std::vector<OwnedEvent> m_events;
     std::vector<MixerRestore> m_restores;

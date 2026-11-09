@@ -24,3 +24,9 @@ SceneObjectDocument PrepareCameraObject(const SceneDocument&, const Vector3& vie
 inline constexpr float PointLightCreationDistance = 3.0f;
 SceneObjectDocument PrepareLightObject(const SceneDocument&, LightType type, const Vector3& viewPosition,
     const Vector3& viewTarget);
+
+// A meshless root object with a default Steam Audio Probe Volume, named "Probe Volume" under the
+// duplicate-name convention. Placed at the fly-view position with identity rotation and unit scale,
+// so the box stays level for floor placement. It has no generated probes and no baked reflections.
+// Throws on a non-finite view position.
+SceneObjectDocument PrepareProbeVolumeObject(const SceneDocument&, const Vector3& viewPosition);

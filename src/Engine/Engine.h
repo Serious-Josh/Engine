@@ -135,6 +135,7 @@ class Engine
     void VerifyPackagedBootstrap();
     void VerifyPackagedReflections();
     void VerifyPackagedProbes();
+    void VerifyPackagedPathing();
     // Preparation checkpoint only. Never enters the publication coordinator.
     bool VerifyCookedMeshGPUPreparation(const std::filesystem::path& scenePath,
         std::shared_ptr<const CookedMeshSource::Provider> source = {});
@@ -360,6 +361,7 @@ class Engine
     bool BeginEmptyObjectCreation(const Editor::EmptyObjectCreationRequest&, std::string& error);
     bool BeginCameraObjectCreation(const Editor::CameraObjectCreationRequest&, std::string& error);
     bool BeginLightObjectCreation(const Editor::LightObjectCreationRequest&, std::string& error);
+    bool BeginProbeVolumeObjectCreation(const Editor::ProbeVolumeObjectCreationRequest&, std::string& error);
     // CAM.4 packaged camera policy: whether StartPackagedGame requires a Main Camera.
     bool AdmitPackagedMainCamera(const FileSceneRuntime& runtime, std::uint32_t payloadVersion, std::string& error);
     bool m_packagedMainCamera = false;
@@ -502,6 +504,10 @@ class Engine
     void SubmitAutomaticResidencyBatch(FileBackedDemoScene& scene,
         const std::vector<FileSceneRuntime::MeshResidencyRequest>& batch);
     bool IsTerminalAutomaticFailure(const SceneObjectMetadata& selection) const;
+    // Whether every acoustic mesh of the scene has geometry to bake from: nullopt when ready (including when nothing is acoustic),
+    // otherwise why not. Read-only, from the automatic residency state: loading, a recorded terminal failure (missing file or
+    // unloadable source), or nothing loading it.
+    std::optional<std::string> DescribeAcousticGeometryReadiness(const FileBackedDemoScene& scene) const;
     std::string GetMeshSourceIdentity(const SceneObjectMetadata& selection) const;
 
     struct AutomaticMeshResidency

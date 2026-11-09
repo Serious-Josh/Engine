@@ -3,6 +3,7 @@
 #include <array>
 #include <atomic>
 #include <cstddef>
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
@@ -239,6 +240,18 @@ struct SteamAudioOptions
     bool assumeReflectionConsumersForTesting = false;
     // Verification only: reflection sources simulate, but the plugin gets a null IR.
     bool withholdReflectionIrForTesting = false;
+    // M9.5: a second, pathing-only simulator sharing the acoustic scene, run on the reflection worker after each reflection run. Only with
+    // reflections active: the plugin renders pathing only once it has simulation settings. It costs nothing until an Audio Source opts in
+    // (SetEventPathing) and a volume's baked pathing is registered (SetPathingVolumes).
+    bool pathing = true;
+    // M9.5: at most this many opted-in sources simulate pathing at once; later ones wait, oldest first, and keep their usual sound meanwhile.
+    // M9.0 measured 32 sources at 0.06-0.11 ms per pathing run on both ray tracers, under 0.4% of one reflection run.
+    int pathingSourceLimit = 32;
+    // M9.5: volumetric occlusion samples for sources simulating pathing, whose pathing level follows how much of the direct path is
+    // blocked (M9.5 E9: raycast occlusion flips 0/1 and steps the mix by about 6 dB). At most MaximumOcclusionSamples (16).
+    int pathingOcclusionSamples = 16;
+    // M9.3: re-check baked paths against the current scene and look for alternates when one is blocked (M9.0: validation alone does nothing).
+    bool pathingValidationForTesting = false;
     // Verification only: Steam Audio context allocator, for poison-on-free and per-thread allocation counts.
     // M6.6: the mixer pool is on unless a test replaces the allocator or asks for the SDK's own (a before/after baseline).
     bool useSdkAllocatorForTesting = false;
@@ -262,10 +275,26 @@ struct SteamAudioDirectSnapshot
     float transmission[3] = {1.0f, 1.0f, 1.0f};
 };
 
+// M9.2: one source's pathing result, as the simulation worker publishes it and the plugin's path effect reads it. Steam Audio space.
+// Invalid means no result: the plugin then gets silent coefficients. Coefficients past the plugin's Ambisonic order are ignored.
+struct SteamAudioPathingSnapshot
+{
+    static constexpr int MaximumOrder = 3;
+    static constexpr int MaximumCoefficients = (MaximumOrder + 1) * (MaximumOrder + 1);
+
+    std::uint32_t generation = 0;
+    bool valid = false;
+    int order = 0;
+    float eq[3] = {0.1f, 0.1f, 0.1f};
+    alignas(16) float sh[MaximumCoefficients] = {};
+};
+
 // Verification hooks: the first runs on the simulation worker on a slot not yet published, the second on the mixer on the
 // snapshot being read.
 using SteamAudioSnapshotPublishFilter = void (*)(SteamAudioDirectSnapshot& slot);
 using SteamAudioSnapshotReadObserver = void (*)(const SteamAudioDirectSnapshot& snapshot, const void* source);
+// M9.2: on the mixer, after a pathing read: the EQ and coefficients exactly as handed to the plugin.
+using SteamAudioPathingReadObserver = void (*)(const float* eq, const float* sh, int coefficients, bool valid, const void* source);
 
 // SA.3: the simulation sources of the running system, for diagnostics and verification.
 // M6.6: what Steam Audio's allocations during a mix did. See SteamAudioMixerAllocator.h.
@@ -339,6 +368,23 @@ struct SteamAudioSimulationStats
     std::uint64_t reflectionSlotPromotions = 0;
     std::uint64_t reverbEventsWithoutSend = 0;
     bool reverbIrPublished = false;
+    // M8.4 baked listener reverb. Batches registered with the simulator now; ever added, removed and released (they balance at
+    // shutdown); runs that looked the reverb up from baked data, and how many of them found the listener outside every probe.
+    std::size_t bakedReverbBatches = 0;
+    std::uint64_t bakedReverbBatchesAdded = 0;
+    std::uint64_t bakedReverbBatchesRemoved = 0;
+    std::uint64_t bakedReverbBatchesReleased = 0;
+    std::uint64_t bakedReverbRuns = 0;
+    std::uint64_t bakedReverbUncoveredRuns = 0;
+    // The last baked run's verdict; false outside baked mode.
+    bool bakedReverbCovered = false;
+    // M8.5: slots given to baked static sources, ever; baked sources turned off for moving; and, for the last reflection run, how
+    // many slot sources were traced in real time and how many looked baked data up. Run time summed over every run, for costs.
+    std::uint64_t bakedSourceSlots = 0;
+    std::uint64_t bakedSourcesDisabled = 0;
+    std::size_t lastRunRealtimeSources = 0;
+    std::size_t lastRunBakedSources = 0;
+    double reflectionRunMicrosecondsSum = 0.0;
     // Production route. Requested source-centric events that hold no slot now, and how often a request found none free.
     bool reflectionRoutingActive = false;
     bool reflectionReturnInstalled = false;
@@ -354,6 +400,36 @@ struct SteamAudioSimulationStats
     std::uint64_t reverbBindingLost = 0;
     std::uint64_t reverbIrReads = 0;
     std::uint64_t reflectionIrReads = 0;
+    // M9.1: spatializers that had Apply Pathing on when Engine first saw them, which Engine turned off; and the plugin's pathing reads,
+    // each answered with silent coefficients. The plugin asks on every block of a bound source, whether or not its path effect runs.
+    // Reads are counted as sources retire.
+    std::uint64_t pathingDisabledAtBind = 0;
+    std::uint64_t pathingNeutralReads = 0;
+    // M9.2: pathing reads that handed the plugin a published result (counted as sources retire); pathing results published, and those
+    // PublishPathing had to alter (an EQ band raised from zero, a non-finite value, an order out of range).
+    std::uint64_t pathingValidReads = 0;
+    std::uint64_t pathingSnapshotsPublished = 0;
+    std::uint64_t pathingSnapshotsAltered = 0;
+    // M9.3: the pathing simulator runs, a batch is registered, its runs, and in the last run how many sources were covered (source and
+    // listener both inside a probe) and how many were not; Apply Pathing turned on and off by Engine as results came and went.
+    bool pathingActive = false;
+    bool pathingBatchRegistered = false;
+    std::uint64_t pathingRuns = 0;
+    std::size_t lastPathingCoveredSources = 0;
+    std::size_t lastPathingUncoveredSources = 0;
+    std::uint64_t pathingActivations = 0;
+    std::uint64_t pathingDeactivations = 0;
+    std::uint64_t pathingSourcesCreated = 0;
+    std::uint64_t pathingSourcesReleased = 0;
+    // M9.5: registered batches; opted-in sources simulating pathing now and waiting for capacity; how often a source's selected batch changed.
+    std::size_t pathingBatches = 0;
+    std::size_t pathingSources = 0;
+    std::size_t pathingSourcesWaiting = 0;
+    std::uint64_t pathingBatchSwitches = 0;
+    // M9.8: wall time of each pathing run on the reflection worker (selection, inputs, the SDK run, smoothing and publication).
+    double lastPathingRunMicroseconds = 0.0;
+    double pathingRunMicrosecondsSum = 0.0;
+    double maximumPathingRunMicroseconds = 0.0;
     std::uint64_t reflectionRuns = 0;
     // Reflection frames replaced before they ran: skipped, never queued.
     std::uint64_t reflectionFramesCoalesced = 0;
@@ -440,6 +516,11 @@ struct SteamAudioSimulationTestControls
     bool skipPublication = false;
     SteamAudioSnapshotPublishFilter publishFilter = nullptr;
     SteamAudioSnapshotReadObserver readObserver = nullptr;
+    // M9.2, verification only, until a pathing simulator exists: published to every source's pathing channel on each direct tick,
+    // `syntheticPathingRepeats` times in a row (at least once), with generation advancing on each.
+    std::optional<SteamAudioPathingSnapshot> syntheticPathing;
+    int syntheticPathingRepeats = 1;
+    SteamAudioPathingReadObserver pathingReadObserver = nullptr;
 };
 
 // SA.2: the spatializers on one event instance. An event authored with both pans and attenuates its sound twice;
@@ -545,13 +626,29 @@ enum class ProbeGenerationStage
     Finished
 };
 
-// One generation running on its own thread, on data it owns. Cancelling takes effect at the next checkpoint between SDK calls.
-class ProbeGenerationJob final
+// M8.3: what every acoustic job shares. AudioSystem runs one acoustic job at a time, of either kind, on its own thread.
+// Cancel only sets a flag: the job stops at its next checkpoint, and IsFinished turns true only once it has.
+class AcousticJob
 {
 public:
+    virtual ~AcousticJob() = default;
     void Cancel() noexcept { m_cancel.store(true, std::memory_order_relaxed); }
     bool IsCancelRequested() const noexcept { return m_cancel.load(std::memory_order_relaxed); }
     bool IsFinished() const noexcept { return m_finished.load(std::memory_order_acquire); }
+
+protected:
+    // After the result is in place.
+    void MarkFinished() noexcept { m_finished.store(true, std::memory_order_release); }
+
+private:
+    std::atomic<bool> m_cancel{false};
+    std::atomic<bool> m_finished{false};
+};
+
+// One generation running on its own thread, on data it owns. Cancelling takes effect at the next checkpoint between SDK calls.
+class ProbeGenerationJob final : public AcousticJob
+{
+public:
     ProbeGenerationStage GetStage() const noexcept { return m_stage.load(std::memory_order_relaxed); }
     // Of the current stage; 0 of 0 when it can't tell.
     std::uint64_t GetDone() const noexcept { return m_done.load(std::memory_order_relaxed); }
@@ -571,16 +668,196 @@ public:
     {
         m_result = std::move(result);
         SetStage(ProbeGenerationStage::Finished);
-        m_finished.store(true, std::memory_order_release);
+        MarkFinished();
     }
 
 private:
-    std::atomic<bool> m_cancel{false};
-    std::atomic<bool> m_finished{false};
     std::atomic<ProbeGenerationStage> m_stage{ProbeGenerationStage::Starting};
     std::atomic<std::uint64_t> m_done{0};
     std::atomic<std::uint64_t> m_total{0};
     ProbeGenerationResult m_result;
+};
+
+// M8.3: Steam Audio's baked data identifier, as Engine bakes it. The centre is Steam Audio space and is kept bit for bit: the
+// SDK matches identifiers by exact float equality.
+enum class ReflectionLayerKind : std::uint32_t
+{
+    // Listener-centric; the sphere is always all zeros.
+    Reverb = 0,
+    StaticSource = 1
+};
+
+struct ReflectionLayerIdentifier
+{
+    ReflectionLayerKind kind = ReflectionLayerKind::Reverb;
+    std::array<float, 3> centre{};
+    float radius = 0.0f;
+};
+
+// Everything one bake needs, owned by the request: the job never reads the scene. Geometry is Engine space and carries its
+// resolved materials. `batch` is iplProbeBatchSave's bytes, already verified by the caller's decoder, since iplProbeBatchLoad is
+// not safe on malformed data; the job bakes into its own copy and never changes the caller's.
+struct ReflectionBakeRequest
+{
+    std::vector<ProbeGeometryObject> geometry;
+    std::vector<std::byte> batch;
+    std::size_t expectedProbes = 0;
+    // Layers dropped from the loaded batch before baking: stale ones, and those of sources that no longer need one.
+    std::vector<ReflectionLayerIdentifier> remove;
+    // Baked in order.
+    std::vector<ReflectionLayerIdentifier> bake;
+    // Layers the loaded batch already holds and must still hold afterwards.
+    std::vector<ReflectionLayerIdentifier> keep;
+    std::uint32_t rays = 0;
+    std::uint32_t diffuseSamples = 0;
+    std::uint32_t bounces = 0;
+    float irradianceMinimumDistance = 0.0f;
+    std::uint32_t order = 0;
+    float duration = 0.0f;
+    // Zero picks a count from the machine. It never changes the result.
+    std::uint32_t threads = 0;
+};
+
+struct ReflectionBakeResult
+{
+    bool success = false;
+    // Stopped on request. Nothing comes back: a cancelled bake leaves partial data, which is discarded with the copy.
+    bool cancelled = false;
+    std::string error;
+    // The finished batch, saved and read back once to prove it loads.
+    std::vector<std::byte> batch;
+    // iplProbeBatchGetDataSize of each `bake` and `keep` layer, in request order. Never zero on success.
+    std::vector<std::uint64_t> bakedBytes;
+    std::vector<std::uint64_t> keptBytes;
+    // The ray tracer the bake ran on: the session's own (the project's choice, or Default after Embree fell back).
+    SteamAudioRayTracer rayTracer = SteamAudioRayTracer::Default;
+};
+
+enum class ReflectionBakeStage
+{
+    Starting,
+    // Short SDK calls between checkpoints; cancelling waits for the current one.
+    BuildingScene,
+    LoadingProbes,
+    // Interruptible at every probe through the bake's progress callback.
+    Baking,
+    Validating,
+    Serializing,
+    Finished
+};
+
+class ReflectionBakeJob final : public AcousticJob
+{
+public:
+    ReflectionBakeStage GetStage() const noexcept { return m_stage.load(std::memory_order_relaxed); }
+    // The layer being baked (index into the request's `bake`), and its probes done of the batch's.
+    std::size_t GetLayer() const noexcept { return m_layer.load(std::memory_order_relaxed); }
+    std::size_t GetLayersDone() const noexcept { return m_layersDone.load(std::memory_order_relaxed); }
+    std::uint64_t GetDone() const noexcept { return m_done.load(std::memory_order_relaxed); }
+    std::uint64_t GetTotal() const noexcept { return m_total.load(std::memory_order_relaxed); }
+    // Only once finished.
+    ReflectionBakeResult& GetResult() noexcept { return m_result; }
+
+    // The baker's side.
+    void SetStage(ReflectionBakeStage stage, std::uint64_t total = 0) noexcept
+    {
+        m_total.store(total, std::memory_order_relaxed);
+        m_done.store(0, std::memory_order_relaxed);
+        m_stage.store(stage, std::memory_order_relaxed);
+    }
+    void BeginLayer(std::size_t layer, std::uint64_t probes) noexcept
+    {
+        m_layer.store(layer, std::memory_order_relaxed);
+        SetStage(ReflectionBakeStage::Baking, probes);
+    }
+    void EndLayer() noexcept { m_layersDone.fetch_add(1, std::memory_order_relaxed); }
+    void SetDone(std::uint64_t done) noexcept { m_done.store(done, std::memory_order_relaxed); }
+    void Finish(ReflectionBakeResult result) noexcept
+    {
+        m_result = std::move(result);
+        SetStage(ReflectionBakeStage::Finished);
+        MarkFinished();
+    }
+
+private:
+    std::atomic<ReflectionBakeStage> m_stage{ReflectionBakeStage::Starting};
+    std::atomic<std::size_t> m_layer{0};
+    std::atomic<std::size_t> m_layersDone{0};
+    std::atomic<std::uint64_t> m_done{0};
+    std::atomic<std::uint64_t> m_total{0};
+    ReflectionBakeResult m_result;
+};
+
+// M9.4: one pathing layer baked into a private copy of a probe batch. Values as iplPathBakerBake takes them; see PathingBakeSettings.
+struct PathingBakeRequest
+{
+    std::vector<ProbeGeometryObject> geometry;
+    // The volume's probe asset batch, which holds no pathing layer.
+    std::vector<std::byte> batch;
+    std::size_t expectedProbes = 0;
+    std::uint32_t samples = 0;
+    float radius = 0.0f;
+    float threshold = 0.0f;
+    float visibilityRange = 0.0f;
+    float pathRange = 0.0f;
+    // Zero picks a count from the machine. It never changes the result.
+    std::uint32_t threads = 0;
+};
+
+struct PathingBakeResult
+{
+    bool success = false;
+    // Stopped on request. Nothing comes back: the private copy is discarded whole.
+    bool cancelled = false;
+    std::string error;
+    // The finished batch, saved and read back once to prove it loads with the same pathing layer.
+    std::vector<std::byte> batch;
+    // iplProbeBatchGetDataSize of the pathing layer. Never zero on success.
+    std::uint64_t layerBytes = 0;
+    SteamAudioRayTracer rayTracer = SteamAudioRayTracer::Default;
+};
+
+enum class PathingBakeStage
+{
+    Starting,
+    BuildingScene,
+    LoadingProbes,
+    // One uninterruptible SDK call: Steam Audio 4.8.1 crashes on iplPathBakerCancelBake (M9.4), so a cancel waits for it, then discards.
+    Baking,
+    Serializing,
+    Finished
+};
+
+class PathingBakeJob final : public AcousticJob
+{
+public:
+    PathingBakeStage GetStage() const noexcept { return m_stage.load(std::memory_order_relaxed); }
+    // Of the current stage; for Baking, a thousandth of the SDK's progress.
+    std::uint64_t GetDone() const noexcept { return m_done.load(std::memory_order_relaxed); }
+    std::uint64_t GetTotal() const noexcept { return m_total.load(std::memory_order_relaxed); }
+    // Only once finished.
+    PathingBakeResult& GetResult() noexcept { return m_result; }
+
+    // The baker's side.
+    void SetStage(PathingBakeStage stage, std::uint64_t total = 0) noexcept
+    {
+        m_total.store(total, std::memory_order_relaxed);
+        m_done.store(0, std::memory_order_relaxed);
+        m_stage.store(stage, std::memory_order_relaxed);
+    }
+    void SetDone(std::uint64_t done) noexcept { m_done.store(done, std::memory_order_relaxed); }
+    void Finish(PathingBakeResult result) noexcept
+    {
+        m_result = std::move(result);
+        SetStage(PathingBakeStage::Finished);
+        MarkFinished();
+    }
+
+private:
+    std::atomic<PathingBakeStage> m_stage{PathingBakeStage::Starting};
+    std::atomic<std::uint64_t> m_done{0};
+    std::atomic<std::uint64_t> m_total{0};
+    PathingBakeResult m_result;
 };
 
 // Batches held for a gameplay session. Nothing consumes them until M8.
@@ -671,6 +948,104 @@ public:
     // As GenerateProbes, on a worker thread. One at a time: nullptr while another runs or when Steam Audio isn't active. Shutdown cancels
     // the job and waits for it, before the context goes; the returned object stays readable after that.
     std::shared_ptr<ProbeGenerationJob> StartProbeGeneration(ProbeGenerationRequest request);
+    // M8.4: one Probe Volume's baked data for the listener-centric reverb. `batch` is the asset's iplProbeBatchSave bytes, already
+    // verified by BakedReflectionsAssets::Decode and judged current by ReflectionBakes; `probes` are its Engine-space spheres.
+    struct BakedReverbVolume
+    {
+        std::string name;
+        std::vector<std::byte> batch;
+        std::vector<std::array<float, 4>> probes;
+    };
+    // Main thread, during a gameplay session. Loads and commits every batch, keeps those whose REVERB layer holds data under the
+    // exact all-zero identifier, and registers them with the simulator in place of any earlier set; the reverb source then looks
+    // the reverb up from them, withheld whenever the listener is outside every probe. Returns how many were registered; a reason
+    // for each refused one goes to `errors`. Registering none leaves realtime reverb in place.
+    std::size_t SetBakedListenerReverb(std::span<const BakedReverbVolume> volumes, std::vector<std::string>& errors);
+    // M8.5: the same registration, for baked static sources and, when `listener`, the shared reverb too. Without it the reverb stays
+    // realtime while static sources use the batches.
+    std::size_t RegisterBakedReflections(std::span<const BakedReverbVolume> volumes, bool listener, std::vector<std::string>& errors);
+    // Unregisters every baked batch (they are released after removal) and returns the reverb to realtime simulation.
+    void ClearBakedListenerReverb() noexcept;
+    // M9.5, main thread, during a gameplay session: loads and commits each volume's baked pathing batch, keeps those holding a PATHING
+    // layer, and registers them with the pathing simulator in place of any earlier set, in this order (the tie-break where volumes overlap).
+    // Never with the reflection simulator: a batch without the REVERB layer beside one with it crashes reflection runs (M9.0). Returns how
+    // many were registered, with a reason for each refused one in `errors`. An empty set clears them.
+    std::size_t SetPathingVolumes(std::span<const BakedReverbVolume> volumes, std::vector<std::string>& errors);
+    // Verification: one volume, or none (null).
+    bool SetPathingBatchForTesting(const BakedReverbVolume* volume, std::string& error);
+
+    // M9.6, display only (the Editor's Inspector and viewport). Main thread.
+    // One event's pathing as the simulation last decided it, and its Steam Audio Spatializer's authored configuration as read at bind.
+    struct PathingEventStatus
+    {
+        enum class Capacity
+        {
+            NotRequested,
+            // Over the pathing source limit: it keeps its usual sound until a place frees.
+            Waiting,
+            Simulating
+        };
+
+        // The session runs a pathing simulator.
+        bool available = false;
+        // The event's Audio Source asked for pathing (SetEventPathing).
+        bool requested = false;
+        Capacity capacity = Capacity::NotRequested;
+        // Index into GetPathingVolumesForDisplay, -1 when no registered batch covers both source and listener.
+        int batch = -1;
+        // Inside some registered batch's probes; both must be inside the same one for pathing to run.
+        bool sourceCovered = false;
+        bool listenerCovered = false;
+        // The smoothed share pathing makes up: 0 in clear sight, 1 fully blocked (M9.5 option A).
+        float gain = 0.0f;
+        // Apply Pathing as Engine has set it now, and as the event was authored (Engine turns it off at bind, whatever was authored).
+        bool applyPathing = false;
+        bool authoredApplyPathing = false;
+        // The spatializer applies the simulation's occlusion and transmission (Simulation-Defined). Without simulated occlusion the direct
+        // path is never reduced, so pathing has nothing to make up for and stays silent.
+        bool occlusionApplied = false;
+        bool transmissionApplied = false;
+    };
+
+    // Nullopt when the event has no bound Steam Audio Spatializer (not playing yet, no spatializer, or Steam Audio inactive).
+    std::optional<PathingEventStatus> GetEventPathingStatus(EventHandle handle) const;
+
+    // The registered pathing volumes, in priority order: names and Engine-space probes, as SetPathingVolumes kept them.
+    struct PathingVolumeDisplay
+    {
+        std::string name;
+        std::vector<std::array<float, 4>> probes;
+    };
+    std::vector<PathingVolumeDisplay> GetPathingVolumesForDisplay() const;
+
+    // M9.6: the probe-to-probe segments of the baked paths Steam Audio walked in its last pathing run, from its own visualization callback,
+    // with whether each was found blocked. For every pathing source together: the SDK does not say which source a segment belongs to.
+    // Off by default and costs nothing then; on, each run reports its segments. Engine space.
+    struct PathingSegment
+    {
+        std::array<float, 3> from{};
+        std::array<float, 3> to{};
+        bool occluded = false;
+    };
+    void SetPathingVisualization(bool enabled) noexcept;
+    std::vector<PathingSegment> GetPathingSegments() const;
+
+    // M8.3: bakes reflection layers into a private copy of the request's batch. Blocks; same availability rules as GenerateProbes.
+    ReflectionBakeResult BakeReflections(const ReflectionBakeRequest& request) const;
+    // As BakeReflections, on the acoustic job thread it shares with StartProbeGeneration: nullptr while either kind of job runs or
+    // when Steam Audio isn't active. Shutdown cancels and waits, as for generation.
+    std::shared_ptr<ReflectionBakeJob> StartReflectionBake(ReflectionBakeRequest request);
+    // M9.4: the same, for a pathing layer. One acoustic job at a time, of any kind; StopAcousticJob cancels and joins it too.
+    PathingBakeResult BakePathing(const PathingBakeRequest& request) const;
+    std::shared_ptr<PathingBakeJob> StartPathingBake(PathingBakeRequest request);
+    // Whether a generation or bake still runs (including one asked to cancel that has not yet stopped).
+    bool IsAcousticJobRunning() const noexcept;
+    // M8.3: the Play boundary. Asks the running acoustic job to stop and waits until its thread has ended, so no generation or bake
+    // SDK work overlaps gameplay simulation. A bake stops at its next probe (the SDK cancel is issued from its progress callback);
+    // generation at its next checkpoint, or after Steam Audio's uninterruptible placement. Returns how long it waited. Main thread.
+    std::chrono::steady_clock::duration StopAcousticJob() noexcept;
+    // Verification: gameplay simulation calls (acoustic geometry, probe batch loads) made while an acoustic job was still running.
+    std::uint64_t GetAcousticJobOverlapsForTesting() const noexcept;
     // `batch` must already have passed ProbeBatchAssets::Decode. Holds the batch until ClearProbeBatches or Shutdown; never adds it to the simulator.
     bool LoadProbeBatch(std::span<const std::byte> batch, std::size_t expectedProbes, std::string& error);
     void ClearProbeBatches() noexcept;
@@ -729,6 +1104,16 @@ public:
     std::optional<EventHandle> CreateEventInstance(const Guid& event, std::string& error);
     // Before StartEvent. Asks for source-centric reflections on this instance's spatializers. False when the handle is stale or the route is off.
     bool SetEventSourceCentricReflections(EventHandle handle, bool enabled);
+    // M9.5, before the event starts: it may simulate pathing (subject to the pathing source limit and to a registered volume covering it and
+    // the listener). Engine decides Apply Pathing, whatever the event authored. False when this session runs no pathing simulator.
+    bool SetEventPathing(EventHandle handle, bool enabled);
+    // M8.5: as above, for a static source with baked reflections. Its reflection slot looks `baked` (the exact stored STATICSOURCE
+    // identifier) up in the registered batches and is never traced in real time; without a free slot it falls back to the shared reverb
+    // send. Needs batches registered by RegisterBakedReflections.
+    bool SetEventBakedSourceReflections(EventHandle handle, const ReflectionLayerIdentifier& baked);
+    // M8.5: the source moved from where it was baked. Its baked reflections stay withheld for the rest of the event; direct sound and
+    // everything else are unchanged, and nothing realtime replaces them.
+    bool DisableEventBakedReflections(EventHandle handle);
     // Taken up by the next reflection simulation, with no rebuild: bounces are an input to each run, not part of the simulator. Main thread.
     void SetSteamAudioReflectionBounces(int bounces) noexcept;
     // True once the event's timeline has reached its end and only effect tails keep it alive. A looping or sustaining event never gets

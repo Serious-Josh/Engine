@@ -422,6 +422,20 @@ void Editor::DrawAudioSourceControls(IDemoScene& scene, const SceneObjectMetadat
         CommitObjectAudio(scene, selection, before, after);
     }
 
+    bool pathing = source.pathing;
+
+    if(ImGui::Checkbox("Pathing", &pathing) && !blocked)
+    {
+        auto after = before;
+        after.source->pathing = pathing;
+        CommitObjectAudio(scene, selection, before, after);
+    }
+
+    if(ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+    {
+        ImGui::SetTooltip("Lets sound blocked by geometry arrive around it, along paths baked in a Probe Volume.");
+    }
+
     ImGui::EndDisabled();
 
     if(!description.status.empty())
@@ -431,11 +445,16 @@ void Editor::DrawAudioSourceControls(IDemoScene& scene, const SceneObjectMetadat
 
     if(source.sourceCentricReflections && source.bakedReflections)
     {
-        StatusText("Baked data is not available yet: source-centric reflections will not play. Listener-centric reflections still do.");
+        StatusText("Plays baked data inside probe coverage. Needs a current Probe Volume bake (Bake All) and an FMOD event with a Send to SteamAudioReverb; without them its source-centric reflections do not play. Listener-centric reflections still do.");
     }
     else if(source.bakedReflections)
     {
         StatusText("Baked Reflections applies only with Source-Centric Reflections.");
+    }
+
+    if(source.pathing)
+    {
+        DrawAudioSourcePathingStatus(scene, object);
     }
 
     if(!source.enabled)
@@ -490,7 +509,7 @@ void Editor::DrawAudioListenerControls(IDemoScene& scene, const SceneObjectMetad
 
     if(object.audioListener->bakedReflections)
     {
-        StatusText("Baked data is not available yet: shared listener-centric reflections will be silent.");
+        StatusText("Plays baked data inside probe coverage. Needs a current Probe Volume bake (Bake All); without one, shared listener-centric reflections are silent.");
     }
 
     const SceneObjectDocument* active = nullptr;

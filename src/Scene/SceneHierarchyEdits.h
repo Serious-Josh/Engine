@@ -187,6 +187,15 @@ namespace SceneHierarchy
                 copy.camera->main = false;
             }
 
+            // A copied Probe Volume keeps its settings but starts without generated probes, baked reflections or baked pathing, so
+            // each asset keeps a single owner. The original keeps its references.
+            if(copy.probeVolume)
+            {
+                copy.probeVolume->probeBatch.clear();
+                copy.probeVolume->bakedReflections.clear();
+                copy.probeVolume->bakedPathing.clear();
+            }
+
             copy.id = remap.at(object.id);
             copy.name = DuplicateName(copy.name, naming);
             naming.objects.push_back(copy);

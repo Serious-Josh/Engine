@@ -1,6 +1,7 @@
 #include "Engine/Engine.h"
 #include "assets/AcousticMaterial.h"
 #include "assets/ArchiveCookedMeshProvider.h"
+#include "assets/BakedPathingAsset.h"
 #include "assets/CookedMesh.h"
 
 #include <map>
@@ -124,6 +125,72 @@ bool Engine::StartPackagedGame(FileSceneRuntime& runtime, std::string& error)
         }
 
         return data;
+    };
+    // M8.6: Build Game packages the baked reflections of enabled volumes. An absent entry reads as missing, as a missing file does in the
+    // Editor; a corrupt one carries Decode's error. Either way the volume is refused, never played.
+    acousticAssets.bakedReflections = [&runtime](const std::string& reference) -> BakedReflectionsAssets::Resolution
+    {
+        BakedReflectionsAssets::Resolution resolution;
+        const auto id = AssetID::ParseReference(reference);
+        const auto& archive = runtime.GetArchiveScene();
+
+        if(!id || !archive || !archive->provider || !archive->provider->ArchiveEntry(*id))
+        {
+            resolution.missing = true;
+            return resolution;
+        }
+
+        try
+        {
+            const auto bytes = archive->provider->ReadEntry(*id, EngineAssetPak::Type::Resource, BakedReflectionsAssets::PackagedPayloadVersion,
+                BakedReflectionsAssets::MaximumBytes);
+            BakedReflectionsAssets::Data data;
+            resolution.decode = BakedReflectionsAssets::Decode(bytes, data);
+
+            if(resolution.decode)
+            {
+                resolution.data = std::move(data);
+            }
+        }
+        catch(const std::exception& exception)
+        {
+            resolution.decode = {BakedReflectionsAssets::DecodeError::Corrupt, exception.what()};
+        }
+
+        return resolution;
+    };
+    // M9.7: as baked reflections. Only decoded, validated bytes ever reach the probe batch loader; Play's PathingBakes::Select then checks
+    // the bake against the scene as it plays, exactly as in the Editor.
+    acousticAssets.bakedPathing = [&runtime](const std::string& reference) -> BakedPathingAssets::Resolution
+    {
+        BakedPathingAssets::Resolution resolution;
+        const auto id = AssetID::ParseReference(reference);
+        const auto& archive = runtime.GetArchiveScene();
+
+        if(!id || !archive || !archive->provider || !archive->provider->ArchiveEntry(*id))
+        {
+            resolution.missing = true;
+            return resolution;
+        }
+
+        try
+        {
+            const auto bytes = archive->provider->ReadEntry(*id, EngineAssetPak::Type::Resource, BakedPathingAssets::PackagedPayloadVersion,
+                BakedPathingAssets::MaximumBytes);
+            BakedPathingAssets::Data data;
+            resolution.decode = BakedPathingAssets::Decode(bytes, data);
+
+            if(resolution.decode)
+            {
+                resolution.data = std::move(data);
+            }
+        }
+        catch(const std::exception& exception)
+        {
+            resolution.decode = {BakedPathingAssets::DecodeError::Corrupt, exception.what()};
+        }
+
+        return resolution;
     };
     m_gameRuntime.SetAcousticAssets(std::move(acousticAssets));
 

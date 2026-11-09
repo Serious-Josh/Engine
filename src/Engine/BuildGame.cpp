@@ -1,5 +1,7 @@
 #include "assets/AcousticMaterial.h"
 #include "assets/ProbeBatchAsset.h"
+#include "assets/BakedReflectionsAsset.h"
+#include "assets/BakedPathingAsset.h"
 #include "Engine/BuildGame.h"
 #include "Engine/PackagedAudioBanks.h"
 #include "Engine/PackagedBootstrap.h"
@@ -303,6 +305,77 @@ void CookProbeBatches(const Request& request, BuildAssets& build)
         Require(data.has_value(), "Probe batch " + reference + " cannot be packaged: " + error);
         build.Append({*AssetID::ParseReference(reference), EngineAssetPak::Type::Resource, ProbeBatchAssets::PackagedPayloadVersion,
             ProbeBatchAssets::Encode(*data)});
+    }
+}
+
+// M8.6: as probe batches. A referenced file that is missing or fails validation stops the build; a stale bake is packaged, and Play's
+// validity check refuses it.
+void CookBakedReflections(const Request& request, BuildAssets& build)
+{
+    if(!request.projectSettings.audio.steamAudio)
+    {
+        return;
+    }
+
+    const ProjectPaths paths(request.project);
+    std::set<std::string> references;
+
+    for(const auto& object : request.document.objects)
+    {
+        if(object.probeVolume && object.probeVolume->enabled && !object.probeVolume->bakedReflections.empty())
+        {
+            references.insert(object.probeVolume->bakedReflections);
+        }
+    }
+
+    for(const std::string& reference : references)
+    {
+        const BakedReflectionsAssets::Resolution resolved = BakedReflectionsAssets::Resolve(reference, paths, request.registry);
+
+        Require(!resolved.missing, "Baked reflections " + reference + " cannot be packaged: the file is missing.");
+        Require(resolved.data.has_value(), "Baked reflections " + reference + " cannot be packaged: " + resolved.decode.message);
+        build.Append({*AssetID::ParseReference(reference), EngineAssetPak::Type::Resource, BakedReflectionsAssets::PackagedPayloadVersion,
+            BakedReflectionsAssets::Encode(*resolved.data)});
+    }
+}
+
+// M9.7: as baked reflections, for volumes whose pathing Play would use (enabled, pathing enabled). A referenced file that is missing or fails
+// validation stops the build; a stale bake is packaged, and Play's validity check refuses it. A scene without pathing packages nothing here.
+void CookBakedPathing(const Request& request, BuildAssets& build)
+{
+    if(!request.projectSettings.audio.steamAudio)
+    {
+        return;
+    }
+
+    const ProjectPaths paths(request.project);
+    std::set<std::string> references;
+
+    for(const auto& object : request.document.objects)
+    {
+        if(object.probeVolume && object.probeVolume->enabled && object.probeVolume->pathingEnabled && !object.probeVolume->bakedPathing.empty())
+        {
+            references.insert(object.probeVolume->bakedPathing);
+        }
+    }
+
+    for(const std::string& reference : references)
+    {
+        const BakedPathingAssets::Resolution resolved = BakedPathingAssets::Resolve(reference, paths, request.registry);
+
+        Require(!resolved.missing, "Baked pathing " + reference + " cannot be packaged: the file is missing.");
+        Require(resolved.data.has_value(), "Baked pathing " + reference + " cannot be packaged: " + resolved.decode.message);
+        std::vector<std::byte> encoded = BakedPathingAssets::Encode(*resolved.data);
+        // M9.8: the archive admits at most 256 MiB per entry. Said here, with the asset and its size, rather than as the writer's generic
+        // admission error. Pathing data grows with the square of the probe count (about 5.25 bytes per probe pair).
+        const std::uint64_t limit = EngineAssetPak::Limits{}.payloadBytes;
+        // Rounded up, so an entry just over the limit never reads as equal to it.
+        const std::uint64_t mebibyte = 1024 * 1024;
+        Require(encoded.size() <= limit, "Baked pathing " + reference + " cannot be packaged: it is " +
+            std::to_string((encoded.size() + mebibyte - 1) / mebibyte) + " MiB (" + std::to_string(encoded.size()) + " bytes), and a game archive entry holds at most " + std::to_string(limit / (1024 * 1024)) +
+            " MiB. Use a larger probe spacing or split the Probe Volume, then bake again.");
+        build.Append({*AssetID::ParseReference(reference), EngineAssetPak::Type::Resource, BakedPathingAssets::PackagedPayloadVersion,
+            std::move(encoded)});
     }
 }
 
@@ -962,6 +1035,8 @@ bool Service::Start(Request request, std::string& error)
                 CookAudioBanks(request, build, progress);
                 CookAcousticMaterials(request, build);
                 CookProbeBatches(request, build);
+                CookBakedReflections(request, build);
+                CookBakedPathing(request, build);
                 CompilePackagedShaders(request, build, progress);
                 WriteAndVerifyArchives(request, sceneAssetID, stagingDirectory, build, progress);
                 DeployRuntimeFiles(request, sceneAssetID, stagingDirectory, progress);

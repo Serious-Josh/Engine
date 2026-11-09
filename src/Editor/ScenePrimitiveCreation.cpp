@@ -155,3 +155,20 @@ SceneObjectDocument PrepareLightObject(const SceneDocument& document, LightType 
     object.light = DefaultLightComponent(type);
     return object;
 }
+
+SceneObjectDocument PrepareProbeVolumeObject(const SceneDocument& document, const Vector3& viewPosition)
+{
+    if(!std::isfinite(viewPosition.x) || !std::isfinite(viewPosition.y) || !std::isfinite(viewPosition.z))
+    {
+        throw std::invalid_argument("The Editor view has no valid position for a new Probe Volume.");
+    }
+
+    SceneObjectDocument object;
+    object.name = "Probe Volume";
+    object.transform.position = viewPosition;
+    AssignNewObjectIdentity(document, object, "Probe Volume");
+
+    // The defaults are a valid volume with empty probeBatch and bakedReflections references.
+    object.probeVolume = ProbeVolumeComponent{};
+    return object;
+}

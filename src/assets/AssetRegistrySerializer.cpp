@@ -20,7 +20,9 @@ namespace
     constexpr int kAudioBankSchemaVersion = 4;
     constexpr int kAcousticMaterialSchemaVersion = 5;
     constexpr int kProbeBatchSchemaVersion = 6;
-    constexpr int kSchemaVersion = kProbeBatchSchemaVersion;
+    constexpr int kBakedReflectionsSchemaVersion = 7;
+    constexpr int kBakedPathingSchemaVersion = 8;
+    constexpr int kSchemaVersion = kBakedPathingSchemaVersion;
 
     const char* AssetTypeToString(AssetType type)
     {
@@ -39,6 +41,10 @@ namespace
                 return "acousticMaterial";
             case AssetType::ProbeBatch:
                 return "probeBatch";
+            case AssetType::BakedReflections:
+                return "bakedReflections";
+            case AssetType::BakedPathing:
+                return "bakedPathing";
             default:
                 return nullptr;
         }
@@ -81,6 +87,18 @@ namespace
         if(value == "probeBatch")
         {
             type = AssetType::ProbeBatch;
+            return true;
+        }
+
+        if(value == "bakedReflections")
+        {
+            type = AssetType::BakedReflections;
+            return true;
+        }
+
+        if(value == "bakedPathing")
+        {
+            type = AssetType::BakedPathing;
             return true;
         }
 
@@ -150,6 +168,16 @@ nlohmann::json AssetRegistrySerializer::Serialize(const ProjectAssetRegistry& re
         if(record.type == AssetType::ProbeBatch)
         {
             document["schemaVersion"] = (std::max)(document["schemaVersion"].get<int>(), kProbeBatchSchemaVersion);
+        }
+
+        if(record.type == AssetType::BakedReflections)
+        {
+            document["schemaVersion"] = (std::max)(document["schemaVersion"].get<int>(), kBakedReflectionsSchemaVersion);
+        }
+
+        if(record.type == AssetType::BakedPathing)
+        {
+            document["schemaVersion"] = (std::max)(document["schemaVersion"].get<int>(), kBakedPathingSchemaVersion);
         }
 
         if(record.type == AssetType::AcousticMaterial)
@@ -242,6 +270,16 @@ bool AssetRegistrySerializer::Deserialize(
             if(type == AssetType::ProbeBatch && document["schemaVersion"].get<int>() < kProbeBatchSchemaVersion)
             {
                 return Fail(errorMessage, "Probe batch assets require registry schema 6.");
+            }
+
+            if(type == AssetType::BakedReflections && document["schemaVersion"].get<int>() < kBakedReflectionsSchemaVersion)
+            {
+                return Fail(errorMessage, "Baked reflections assets require registry schema 7.");
+            }
+
+            if(type == AssetType::BakedPathing && document["schemaVersion"].get<int>() < kBakedPathingSchemaVersion)
+            {
+                return Fail(errorMessage, "Baked pathing assets require registry schema 8.");
             }
 
             if(type == AssetType::AudioBank && document["schemaVersion"].get<int>() < kAudioBankSchemaVersion)

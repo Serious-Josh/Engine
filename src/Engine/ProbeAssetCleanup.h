@@ -11,7 +11,7 @@
 
 class ProjectPaths;
 
-// M7.1: finds probe assets that nothing references, and removes them only on request. See SteamAudioIntegration.md, section 33.
+// M7.1: finds probe assets (M8.2: and baked reflection assets) that nothing references, and removes them only on request. See SteamAudioIntegration.md, section 33.
 //
 // A probe asset is unused only when no .scene file anywhere under the project and no live reference holds it. Live references are the
 // open document and the Editor's undo and redo history, so neither unsaved work nor a saved scene alone can decide it. One scene that
@@ -27,7 +27,7 @@ struct Report
     std::uint64_t unusedBytes = 0;
     std::size_t referenced = 0;
     std::size_t scenesRead = 0;
-    // .probebatch files with no registration. Reported, never deleted: a registry restored from elsewhere may claim them.
+    // .probebatch and .bakedreflections files with no registration. Reported, never deleted: a registry restored from elsewhere may claim them.
     std::vector<std::filesystem::path> unregisteredFiles;
 };
 

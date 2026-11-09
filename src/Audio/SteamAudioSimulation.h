@@ -50,6 +50,7 @@
 #include "Audio/SteamAudioRuntime.h"
 
 #if defined(ENGINE_HAS_STEAMAUDIO)
+#include <optional>
 #include <fmod_studio.hpp>
 
 #include <chrono>
@@ -94,6 +95,12 @@ public:
     void Update() noexcept;
 
     SteamAudioSimulationStats GetStats() const;
+    // M8.3: the session's validated Embree device, or null when the session runs the default ray tracer (not requested, or
+    // fallen back). Main thread. Offline baking shares it, retaining it for as long as a bake runs.
+    IPLEmbreeDevice GetEmbreeDevice() const noexcept
+    {
+        return m_embreeDevice;
+    }
 
     // Verification: an immediate tick that returns after its results are published.
     void RunNow() noexcept;
@@ -110,7 +117,26 @@ public:
     void EndReflectionSession() noexcept;
     void ReleaseReflectionReturn() noexcept;
     void SetListenerReflectionsWithheld(bool withheld) noexcept;
-    bool SetSourceCentricRequest(FMOD::Studio::EventInstance& instance, bool enabled);
+
+    // M8.4: one committed batch holding a valid REVERB layer, and its probes (Steam Audio space: x, y, z, radius) for coverage.
+    struct BakedReverbBatch
+    {
+        IPLProbeBatch batch = nullptr;
+        std::vector<std::array<float, 4>> spheres;
+    };
+
+    // Main thread. Replaces the registered set; an empty set returns the reverb source to realtime simulation. Takes ownership of
+    // every batch: the worker adds them to the simulator, and releases each only after removing it and committing. False when no
+    // reverb source runs here (no reflections, or the DSP lock path), in which case the batches are released at once. While baked
+    // data is registered, the reverb is withheld until a baked run finds the listener inside a probe, and again whenever one does not.
+    // `listener`: the shared reverb uses the batches too (M8.4). Without it they serve baked static sources only (M8.5), and the reverb
+    // stays realtime.
+    bool SetBakedReverb(std::vector<BakedReverbBatch> batches, bool listener = true) noexcept;
+    // M8.5: `baked`, when given, is the static source's exact STATICSOURCE identifier. Its slot then looks that layer up and is never
+    // traced in real time; without a slot it falls back to the shared reverb send like any other source-centric request.
+    bool SetSourceCentricRequest(FMOD::Studio::EventInstance& instance, bool enabled, const IPLBakedDataIdentifier* baked = nullptr);
+    // M8.5, main thread: the source moved from where it was baked. Its baked reflections are withheld for good; nothing else changes.
+    bool DisableBakedReflections(FMOD::Studio::EventInstance& instance) noexcept;
     // An empty return passes what it receives, which would double any event's fixed send. So the return bus stays muted whenever the route
     // was asked for and its effects are not installed. It costs no event its direct sound or any other send.
     void MuteReturnUntilInstalled() noexcept;
@@ -120,6 +146,27 @@ public:
     {
         return m_synchronization == SteamAudioSynchronization::Snapshot;
     }
+
+    // M9.3. Set by Start, then read-only.
+    bool IsPathingAvailable() const noexcept
+    {
+        return m_pathingSimulator != nullptr;
+    }
+
+    // M9.5, main thread: the batches pathing searches (their PATHING layers, and their probes for coverage), owned from here on, in priority
+    // order; empty clears them. The worker registers them with the pathing simulator only, commits, and releases those they replace after
+    // removing them and committing.
+    void SetPathingBatches(std::vector<BakedReverbBatch> batches) noexcept;
+    // M9.5, main thread, before the instance starts: read on the Studio thread as its spatializers are bound. False without a pathing simulator.
+    bool SetPathingRequest(FMOD::Studio::EventInstance& instance, bool enabled);
+    // M9.6, main thread, display only.
+    std::optional<AudioSystem::PathingEventStatus> GetPathingStatus(const FMOD::Studio::EventInstance& instance) const;
+    void SetPathingVisualization(bool enabled) noexcept
+    {
+        m_pathingVisualize.store(enabled, std::memory_order_relaxed);
+    }
+    // Steam Audio space.
+    std::vector<AudioSystem::PathingSegment> GetPathingSegments() const;
 
     bool SetAcousticObject(std::uint64_t id, std::shared_ptr<const AcousticMeshData> mesh, const AcousticTransform& world);
     bool SetAcousticObjectTransform(std::uint64_t id, const AcousticTransform& world);
@@ -148,6 +195,15 @@ private:
         IPLSource realSource = nullptr;
         // Authored with Apply Reflections, in a session with reflections.
         bool reflectionConsumer = false;
+        // M8.5: the baked layer it asked for, if any.
+        std::optional<IPLBakedDataIdentifier> baked;
+        // M9.5: its Audio Source asked for pathing; and how its spatializer applies the direct simulation's occlusion and transmission
+        // (Simulation-Defined), as authored, which is what pathing makes up for.
+        bool pathing = false;
+        bool occlusionApplied = false;
+        bool transmissionApplied = false;
+        // M9.6, display only: authored Apply Pathing, before Engine turned it off.
+        bool pathingAuthored = false;
     };
 
     // Main-thread record of a bound source.
@@ -159,6 +215,7 @@ private:
         IPLSource realSource = nullptr;
         IPLCoordinateSpace3 pose{};
         bool reflectionConsumer = false;
+        std::optional<IPLBakedDataIdentifier> baked;
         // M6.7.
         bool hasReverbSend = false;
         float reverbSendLevel = 0.0f;
@@ -167,6 +224,13 @@ private:
         bool sendSearchReported = false;
         bool slotAssigned = false;
         bool slotDenied = false;
+        // M9.3: Apply Pathing as Engine last set it on this DSP: on only while the snapshot holds a valid pathing result.
+        bool pathingApplied = false;
+        bool pathingRequested = false;
+        // M9.6, display only: as authored, read at bind.
+        bool pathingAuthored = false;
+        bool occlusionApplied = false;
+        bool transmissionApplied = false;
     };
 
     // Main-thread record of a source on its way out. Stage A: the worker removes the private source from the simulator,
@@ -202,7 +266,10 @@ private:
             SetAcousticObject,
             RemoveAcousticObject,
             ClearAcousticScene,
-            AddReverbSource
+            AddReverbSource,
+            SetBakedReverb,
+            DisableBakedSource,
+            SetPathingBatch
         };
 
         Kind kind = Kind::AddSource;
@@ -212,6 +279,17 @@ private:
         void* scene = nullptr;
         std::shared_ptr<const AcousticMeshData> mesh;
         AcousticTransform world{};
+        // SetBakedReverb: the new set, owned by the command until the worker takes it, and whether the listener uses it.
+        std::shared_ptr<std::vector<BakedReverbBatch>> baked;
+        bool bakedListener = false;
+        // AddSource: the baked layer the source asked for.
+        std::optional<IPLBakedDataIdentifier> bakedSource;
+        // SetPathingBatches: the new set (empty clears), owned by the command until the worker takes it.
+        std::shared_ptr<std::vector<BakedReverbBatch>> pathingBatches;
+        // AddSource, M9.5: as in LifecycleChange.
+        bool pathing = false;
+        bool occlusionApplied = false;
+        bool transmissionApplied = false;
     };
 
     // Worker-owned: one Steam Audio sub-scene per distinct geometry, shared by its instances.
@@ -258,6 +336,23 @@ private:
         IPLSource reflectionSource = nullptr;
         // Changes only with the simulator gate held exclusively.
         bool reflectionCapable = false;
+        // M8.5: its slot looks this layer up instead of tracing. Disabled once the source moves: then withheld for good.
+        std::optional<IPLBakedDataIdentifier> baked;
+        bool bakedDisabled = false;
+        // M9.3: its source in the pathing simulator, when pathing runs. Never seen by the plugin: results reach it only as copies, through
+        // the snapshot's pathing channel. Released by the worker once removed and committed. M9.5: only for a source that asked for
+        // pathing and got capacity; created and removed by the direct worker under the exclusive gate.
+        IPLSource pathingSource = nullptr;
+        bool pathingRequested = false;
+        bool occlusionApplied = false;
+        bool transmissionApplied = false;
+        // M9.5, reflection worker only: the batch its paths come from (index into m_pathingBatches, -1 for none), its smoothed pathing gain,
+        // and when that gain was last advanced. Reset whenever the batch changes, coverage is lost, or the pathing source is (re)created.
+        int pathingBatch = -1;
+        float pathingGain = 0.0f;
+        std::chrono::steady_clock::time_point pathingGainAt{};
+        // M9.6, display only: inside some registered batch's probes.
+        bool pathingSourceInside = false;
     };
 
     struct PublishedRecord
@@ -271,7 +366,7 @@ private:
     void OnPluginCreated(FMOD::Studio::EventInstance& instance, FMOD::DSP& dsp);
     void OnPluginDestroyed(FMOD::DSP& dsp);
     bool ConsumeInjectedFailure(SteamAudioInjectedFailure failure);
-    void BindSnapshotSource(FMOD::Studio::EventInstance& instance, FMOD::DSP& dsp);
+    void BindSnapshotSource(FMOD::Studio::EventInstance& instance, FMOD::DSP& dsp, bool pathingAuthored);
     void BindRealSource(FMOD::Studio::EventInstance& instance, FMOD::DSP& dsp);
 
     void ApplyLifecycleChanges() noexcept;
@@ -358,12 +453,31 @@ private:
     std::atomic<int> m_reflectionBounces{8};
     bool m_warnedSourceCentricWithoutSend = false;
     bool m_capacityReported = false;
+    // M10.4: the first time opted-in sources wait for a pathing place, said once, as reflection capacity is.
+    bool m_pathingCapacityReported = false;
 
     // M6.7. The SnapshotSource belongs to the main thread; the real source to the worker until it is joined.
     bool m_reverbWanted = false;
     SteamAudioReverbRoutingForTesting m_reverbRouting = SteamAudioReverbRoutingForTesting::Exclusive;
     SnapshotSource* m_reverbSnapshot = nullptr;
     IPLSource m_reverbRealSource = nullptr;
+    // M8.4. The reverb is withheld when either the session asks (main thread) or baked data does not cover the listener (worker,
+    // after each baked run, so what is heard always comes from a run that covered it). One lock, so the two writers agree.
+    std::mutex m_withholdMutex;
+    bool m_listenerWithheld = false;
+    bool m_bakedUncovered = false;
+    void ApplyReverbWithhold() noexcept;
+    void SetBakedUncovered(bool uncovered) noexcept;
+    // Worker: the registered set, read by reflection runs under the shared gate and changed only under the exclusive one.
+    std::vector<BakedReverbBatch> m_bakedReverb;
+    // Worker: the shared reverb uses the registered set (M8.4), as opposed to baked static sources alone.
+    bool m_bakedListener = false;
+    // Main thread, under m_mutex: the baked layer each requesting instance asked for (M8.5).
+    std::vector<std::pair<FMOD::Studio::EventInstance*, IPLBakedDataIdentifier>> m_bakedRequests;
+    // Worker: the reverb snapshot it published to, set with the source it belongs to.
+    SnapshotSource* m_workerReverbSnapshot = nullptr;
+    void WorkerSetBakedReverb(std::vector<BakedReverbBatch>& batches, bool& commit) noexcept;
+    void ReleaseBakedBatches(std::vector<BakedReverbBatch>& batches) noexcept;
     // Worker only: authored consumers waiting for a reflection slot, oldest first, each with whether fallback was reported.
     std::vector<std::pair<SourceId, bool>> m_slotQueue;
     // Worker to main thread, under m_mutex: true for a slot given, false for no slot free.
@@ -397,6 +511,33 @@ private:
     // when the root is replaced, and taken by the next reflection run.
     std::atomic<bool> m_reflectionAccumulationStale{false};
     IPLSimulationSettings m_reflectionSettings{};
+
+    // M9.3: the pathing-only simulator, sharing m_acousticRoot. Created by Start before the workers, released at Shutdown after both are
+    // joined. Everything that changes it (scene, sources, batch, commit) runs on the direct worker with m_simulatorGate held exclusively,
+    // exactly as for m_simulator; its runs follow each reflection run on the reflection worker, under the shared gate. Never concurrently.
+    IPLSimulator m_pathingSimulator = nullptr;
+    bool m_pathingValidation = false;
+    // Set by Start, then read-only.
+    std::size_t m_pathingSourceLimit = 0;
+    int m_pathingOcclusionSamples = 0;
+    // Worker: the registered batches in priority order, read by pathing runs under the shared gate and changed only under the exclusive one.
+    std::vector<BakedReverbBatch> m_pathingBatches;
+    // Direct worker: pathing sources now, and opted-in sources waiting for capacity, oldest first.
+    std::size_t m_pathingSourceCount = 0;
+    std::vector<SourceId> m_pathingQueue;
+    // Under m_mutex: instances that asked for pathing, read on the Studio thread as a spatializer is bound.
+    std::vector<const FMOD::Studio::EventInstance*> m_pathingRequests;
+    // M9.6: the Editor wants path segments; and the last run's, under m_mutex (Steam Audio space).
+    std::atomic<bool> m_pathingVisualize{false};
+    std::vector<AudioSystem::PathingSegment> m_pathingSegments;
+    void WorkerSetPathingBatches(std::vector<BakedReverbBatch>& batches) noexcept;
+    // Direct worker, exclusive gate: a pathing source for `source`, true when created.
+    bool CreatePathingSource(PrivateSource& source) noexcept;
+    void ServePathingQueue(bool& commit) noexcept;
+    void RunPathing(const InputFrame& frame) noexcept;
+    void SetSimulatorScenes(IPLScene scene) noexcept;
+    // Main thread: Apply Pathing follows each source's pathing availability.
+    void UpdatePathingActivation() noexcept;
 
     // Exclusive around simulator and scene changes, shared across a reflection run. See the lock order above.
     std::shared_mutex m_simulatorGate;

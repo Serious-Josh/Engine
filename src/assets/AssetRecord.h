@@ -17,7 +17,11 @@ enum class AssetType : std::uint8_t
     // M4: a reusable acoustic material, in AcousticMaterials/.
     AcousticMaterial,
     // M7: generated probes of one Probe Volume, in Content/Audio/Probes/.
-    ProbeBatch
+    ProbeBatch,
+    // M8.2: baked reflection layers of one Probe Volume, in Content/Audio/Probes/.
+    BakedReflections,
+    // M9.4: the baked pathing layer of one Probe Volume, in Content/Audio/Probes/.
+    BakedPathing
 };
 
 struct AssetRecord

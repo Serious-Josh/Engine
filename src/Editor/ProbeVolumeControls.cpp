@@ -1,6 +1,8 @@
 #include "Editor/Editor.h"
 
 #include "DemoContent/FileBackedDemoScene.h"
+#include "Editor/ProbeSceneAccess.h"
+#include "Editor/ViewportLineClip.h"
 #include "Engine/ProbeVolumes.h"
 #include "Scene/FileSceneRuntime.h"
 #include "assets/ProjectAssetResolver.h"
@@ -15,53 +17,16 @@ namespace
     const ImVec4 WarningColor(1.0f, 0.65f, 0.3f, 1.0f);
     const ImVec4 ValidColor(0.45f, 0.85f, 0.45f, 1.0f);
     constexpr double FingerprintRefreshSeconds = 0.5;
+    // Twice the original 3 px, so each marker is twice as wide and tall.
+    constexpr float ProbeMarkerRadius = 6.0f;
+    using ProbeSceneAccess::MakeSceneAccess;
+}
 
-    Audio::AcousticTransform ToTransform(const Matrix4& world)
-    {
-        Audio::AcousticTransform transform{};
-
-        for(std::size_t row = 0; row < 4; ++row)
-        {
-            for(std::size_t column = 0; column < 4; ++column)
-            {
-                transform[row][column] = world.m[row][column];
-            }
-        }
-
-        return transform;
-    }
-
-    ProbeVolumes::SceneAccess MakeSceneAccess(const FileSceneRuntime& runtime, const IDemoScene& scene)
-    {
-        ProbeVolumes::SceneAccess access;
-        access.world = [&runtime](const SceneObjectDocument& object) -> std::optional<Audio::AcousticTransform>
-        {
-            const auto& mapping = runtime.GetObjectMapping().idToRuntimeIndex;
-            const auto& objects = runtime.GetScene().GetRenderObjects();
-            const auto found = mapping.find(object.id);
-
-            if(found == mapping.end() || found->second >= objects.size())
-            {
-                return std::nullopt;
-            }
-
-            return ToTransform(objects[found->second].GetPresentationTransform().currentModel);
-        };
-        access.mesh = [&runtime, &scene](const SceneObjectDocument& object) -> const ImportedMesh*
-        {
-            const auto& mapping = runtime.GetObjectMapping().idToRuntimeIndex;
-            const auto& objects = runtime.GetScene().GetRenderObjects();
-            const auto found = mapping.find(object.id);
-
-            if(found == mapping.end() || found->second >= objects.size() || !objects[found->second].mesh)
-            {
-                return nullptr;
-            }
-
-            return scene.GetMeshGeometry(*objects[found->second].mesh);
-        };
-        return access;
-    }
+bool Editor::CanEditProbeVolumes(const IDemoScene& scene) const
+{
+    return !IsSceneEditingLocked() && dynamic_cast<const FileBackedDemoScene*>(&scene) && m_historySession &&
+        RenameSessionMatches(scene, *m_historySession) && !HasPendingSceneHistoryOperation() && !m_sceneOperationPending &&
+        !HasBlockingObjectCreation();
 }
 
 // One complete replacement of the object's Probe Volume per history entry.
@@ -70,8 +35,7 @@ bool Editor::CommitObjectProbeVolume(IDemoScene& scene, const SceneObjectMetadat
 {
     auto* owner = dynamic_cast<FileBackedDemoScene*>(&scene);
 
-    if(IsSceneEditingLocked() || !owner || !m_historySession || !RenameSessionMatches(scene, *m_historySession) ||
-        HasPendingSceneHistoryOperation() || m_sceneOperationPending || HasBlockingObjectCreation())
+    if(!owner || !CanEditProbeVolumes(scene))
     {
         m_probeEditStatus = "Probe Volumes can be edited in a stopped scene without pending edits.";
         return false;
@@ -191,12 +155,26 @@ void Editor::RefreshProbeView(const FileBackedDemoScene& owner, const IDemoScene
     }
 }
 
-void Editor::GenerateProbes(IDemoScene& scene, const FileBackedDemoScene& owner, const SceneObjectDocument& object)
+bool Editor::GenerateProbes(IDemoScene& scene, const FileBackedDemoScene& owner, const SceneObjectDocument& object, BackgroundTaskId parent)
 {
-    if(!m_audioSystem || m_probeGeneration || !m_historySession)
+    if(!m_audioSystem || m_probeGeneration || m_probeBatchRequest || m_probePublishTask.IsValid() || !m_historySession)
     {
         m_probeEditStatus = m_audioSystem ? "Another generation is running." : "Audio is not running.";
-        return;
+        return false;
+    }
+
+    // A bake run starts its own generations; one started from the Inspector would not belong to it.
+    if(parent == InvalidBackgroundTaskId && m_reflectionBake)
+    {
+        m_probeEditStatus = "Reflections are baking. Generate probes when the bake has finished.";
+        return false;
+    }
+
+    // Probe placement reads the acoustic meshes; one still loading would be treated as absent. Same main-thread step as the read below.
+    if(const auto notReady = AcousticGeometryNotReady(scene))
+    {
+        m_probeEditStatus = "Cannot generate probes yet. " + *notReady;
+        return false;
     }
 
     const SceneDocument& document = owner.m_runtime->GetFileScene().GetDocument();
@@ -211,7 +189,7 @@ void Editor::GenerateProbes(IDemoScene& scene, const FileBackedDemoScene& owner,
     {
         // Existing probes stay: failing to regenerate must not lose them.
         m_probeEditStatus = "Generation failed: " + error + ".";
-        return;
+        return false;
     }
 
     generation.fingerprint = ProbeVolumes::Fingerprint(document, object, access);
@@ -219,12 +197,71 @@ void Editor::GenerateProbes(IDemoScene& scene, const FileBackedDemoScene& owner,
 
     if(!generation.job)
     {
-        m_probeEditStatus = "Generation failed: Steam Audio is not active, or another generation is still stopping.";
-        return;
+        m_probeEditStatus = "Generation failed: Steam Audio is not active, or another acoustic job is still stopping.";
+        return false;
+    }
+
+    if(m_backgroundTasks)
+    {
+        const std::string name = parent == InvalidBackgroundTaskId ? "Generate Probes: " + (object.name.empty() ? object.id : object.name) :
+            std::string("Generate probes");
+        generation.task = m_backgroundTasks->Begin({name, true, parent});
+        generation.task.Start();
     }
 
     m_probeEditStatus.clear();
     m_probeGeneration = std::move(generation);
+    UpdateProbeGenerationTask();
+    return true;
+}
+
+// Mirrors the job's stage. Placement inside Steam Audio reports nothing, so it stays indeterminate rather than invent a figure.
+void Editor::UpdateProbeGenerationTask()
+{
+    ProbeGeneration& generation = *m_probeGeneration;
+    const Audio::ProbeGenerationJob& job = *generation.job;
+    const char* stage = "Starting";
+    bool counted = true;
+
+    switch(job.GetStage())
+    {
+        case Audio::ProbeGenerationStage::BuildingScene:
+            stage = "Building the generation scene";
+            break;
+        case Audio::ProbeGenerationStage::Placing:
+            stage = "Placing probes";
+            counted = false;
+            break;
+        case Audio::ProbeGenerationStage::Filtering:
+            stage = "Filtering probes inside solids";
+            break;
+        case Audio::ProbeGenerationStage::Packing:
+            stage = "Packing the batch";
+            break;
+        case Audio::ProbeGenerationStage::Finished:
+            stage = "Finishing";
+            counted = false;
+            break;
+        default:
+            break;
+    }
+
+    if(generation.task.IsCancelRequested())
+    {
+        generation.job->Cancel();
+    }
+
+    generation.task.SetStatus(job.IsCancelRequested() ? "Cancelling" : stage);
+    const std::uint64_t total = job.GetTotal();
+
+    if(counted && total > 0)
+    {
+        generation.task.SetProgress((std::min)(job.GetDone(), total), total);
+    }
+    else
+    {
+        generation.task.SetIndeterminate();
+    }
 }
 
 void Editor::PollProbeGeneration(IDemoScene& scene)
@@ -245,12 +282,14 @@ void Editor::PollProbeGeneration(IDemoScene& scene)
         generation.job->Cancel();
     }
 
+    UpdateProbeGenerationTask();
+
     if(!generation.job->IsFinished())
     {
         return;
     }
 
-    const ProbeGeneration finished = std::move(generation);
+    ProbeGeneration finished = std::move(generation);
     m_probeGeneration.reset();
     Audio::ProbeGenerationResult& result = finished.job->GetResult();
 
@@ -258,12 +297,15 @@ void Editor::PollProbeGeneration(IDemoScene& scene)
     if(result.cancelled || sceneLost)
     {
         m_probeEditStatus = "Generation cancelled. Existing probes are unchanged.";
+        finished.task.MarkCancelled(sceneLost ? "The scene changed or Play started. Existing probes are unchanged." :
+            "Cancelled. Existing probes are unchanged.");
         return;
     }
 
     if(!result.success)
     {
         m_probeEditStatus = "Generation failed: " + result.error + ". Existing probes are unchanged.";
+        finished.task.Fail(result.error);
         return;
     }
 
@@ -273,6 +315,7 @@ void Editor::PollProbeGeneration(IDemoScene& scene)
     if(!owner->CaptureTriggerColliderInspection(finished.objectID, object) || !object.probeVolume)
     {
         m_probeEditStatus = "The Probe Volume's object is gone. Nothing was stored.";
+        finished.task.Fail(m_probeEditStatus);
         return;
     }
 
@@ -280,11 +323,16 @@ void Editor::PollProbeGeneration(IDemoScene& scene)
     if(ProbeVolumes::Fingerprint(document, object, MakeSceneAccess(*owner->m_runtime, scene)) != finished.fingerprint)
     {
         m_probeEditStatus = "The scene changed during generation, so the result was discarded. Existing probes are unchanged.";
+        finished.task.Fail(m_probeEditStatus);
         return;
     }
 
     const ProbeVolumes::GenerationOutcome outcome = ProbeVolumes::FinishGeneration(std::move(result), finished.fingerprint, finished.skippedObjects);
     m_probeBatchRequest = ProbeBatchRequest{finished.objectID, ProbeBatchAssets::Encode(outcome.data)};
+    // The task stays open until Engine has stored the probes and the reference is committed.
+    finished.task.SetStatus("Storing the probes");
+    finished.task.SetIndeterminate();
+    m_probePublishTask = std::move(finished.task);
     m_probeEditStatus = "Generated " + std::to_string(outcome.data.probes.size()) + (outcome.data.probes.size() == 1 ? " probe." : " probes.");
 
     if(outcome.duplicatesRemoved > 0)
@@ -363,6 +411,16 @@ std::set<std::string> Editor::CollectLiveProbeReferences(const FileBackedDemoSce
         {
             references.insert(volume->probeBatch);
         }
+
+        if(volume && !volume->bakedReflections.empty())
+        {
+            references.insert(volume->bakedReflections);
+        }
+
+        if(volume && !volume->bakedPathing.empty())
+        {
+            references.insert(volume->bakedPathing);
+        }
     };
 
     for(const SceneObjectDocument& object : owner.m_runtime->GetFileScene().GetDocument().objects)
@@ -381,6 +439,18 @@ std::set<std::string> Editor::CollectLiveProbeReferences(const FileBackedDemoSce
         else if(const auto* deletion = std::get_if<std::unique_ptr<ObjectDeletion>>(&entry.command); deletion && *deletion)
         {
             add((*deletion)->object.probeVolume);
+
+            // Hierarchy edits (creation, duplication, subtree deletion and reparenting) keep whole-scene snapshots instead.
+            if(const auto& hierarchy = (*deletion)->hierarchy)
+            {
+                for(const SceneDocument* snapshot : {&hierarchy->before, &hierarchy->after})
+                {
+                    for(const SceneObjectDocument& object : snapshot->objects)
+                    {
+                        add(object.probeVolume);
+                    }
+                }
+            }
         }
     }
 
@@ -406,7 +476,7 @@ void Editor::DrawProbeCleanup(const FileBackedDemoScene& owner, const ProjectPat
     }
 
     ImGui::TextDisabled("Clear and Regenerate keep old files, so Undo and other scenes stay valid. A file counts as unused only when no scene in the project, the open document or the undo history references it.");
-    ImGui::BeginDisabled(blocked || m_gameState != GameState::Editing || m_probeGeneration.has_value());
+    ImGui::BeginDisabled(blocked || m_gameState != GameState::Editing || m_probeGeneration.has_value() || m_reflectionBake.has_value());
 
     if(ImGui::Button("Find Unused Files"))
     {
@@ -468,9 +538,13 @@ void Editor::DrawProbeCleanup(const FileBackedDemoScene& owner, const ProjectPat
 // Engine owns the registry, so it performs the store and hands back the reference.
 void Editor::OnProbeBatchRequestCompleted(IDemoScene& scene, const std::string& objectID, const std::string& reference, const std::string& error)
 {
+    BackgroundTaskHandle task = std::move(m_probePublishTask);
+    m_probePublishTask = {};
+
     if(!error.empty())
     {
         m_probeEditStatus = "Could not store the probes: " + error + ".";
+        task.Fail(m_probeEditStatus);
         return;
     }
 
@@ -482,6 +556,7 @@ void Editor::OnProbeBatchRequestCompleted(IDemoScene& scene, const std::string& 
     if(!selection || !owner->CaptureTriggerColliderInspection(objectID, object) || !object.probeVolume)
     {
         m_probeEditStatus = "The Probe Volume's object is gone.";
+        task.Fail(m_probeEditStatus);
         return;
     }
 
@@ -489,9 +564,15 @@ void Editor::OnProbeBatchRequestCompleted(IDemoScene& scene, const std::string& 
     after.probeBatch = reference;
     const std::string status = m_probeEditStatus;
 
+    // Complete only once the scene references the new probes.
     if(CommitObjectProbeVolume(scene, *selection, object.probeVolume, after))
     {
         m_probeEditStatus = status;
+        task.Complete(status);
+    }
+    else
+    {
+        task.Fail(m_probeEditStatus.empty() ? std::string("The scene did not accept the probes.") : m_probeEditStatus);
     }
 
     // Same reference, new contents: the view must reread them.
@@ -551,6 +632,8 @@ void Editor::DrawObjectProbeVolumeControls(IDemoScene& scene, const ProjectPaths
         return;
     }
 
+    // Every description in the section wraps at the Inspector's current width, so resizing the panel rewraps it.
+    ImGui::PushTextWrapPos(0.0f);
     ImGui::BeginDisabled(blocked);
     ProbeVolumeComponent& draft = m_probeDraft;
     bool commit = false;
@@ -672,8 +755,17 @@ void Editor::DrawObjectProbeVolumeControls(IDemoScene& scene, const ProjectPaths
     }
 
     ImGui::Separator();
-    const bool canGenerate = m_audioSystem && m_audioSystem->GetSteamAudioStatus() == Audio::SteamAudioStatus::Active;
-    const bool generating = m_probeGeneration.has_value();
+    const bool generating = m_probeGeneration.has_value() || m_reflectionBake.has_value();
+    const auto notReady = generating ? std::nullopt : AcousticGeometryNotReady(scene);
+    const bool canGenerate = m_audioSystem && m_audioSystem->GetSteamAudioStatus() == Audio::SteamAudioStatus::Active && !notReady;
+
+    if(notReady)
+    {
+        ImGui::PushStyleColor(ImGuiCol_Text, WarningColor);
+        ImGui::TextWrapped("%s", notReady->c_str());
+        ImGui::PopStyleColor();
+    }
+
     ImGui::BeginDisabled(!canGenerate || generating || m_probeBatchRequest.has_value() || (estimate.exact && !estimate.fitsAsset));
 
     if(ImGui::Button(before->probeBatch.empty() ? "Generate Probes" : "Regenerate Probes"))
@@ -779,7 +871,10 @@ void Editor::DrawObjectProbeVolumeControls(IDemoScene& scene, const ProjectPaths
         ImGui::TextWrapped("%s", m_probeEditStatus.c_str());
     }
 
+    DrawReflectionBakeControls(scene, *selection, object, blocked);
+    DrawPathingControls(scene, paths, registry, *selection, object, blocked);
     DrawProbeCleanup(*owner, paths, registry, blocked);
+    ImGui::PopTextWrapPos();
 
     // What the viewport draws this frame.
     m_probeOverlay.frame = ImGui::GetFrameCount();
@@ -792,67 +887,254 @@ void Editor::DrawObjectProbeVolumeControls(IDemoScene& scene, const ProjectPaths
     ImGui::PopID();
 }
 
-// Wire box and probe dots of the selected volume.
-void Editor::DrawProbeVolumeOverlay(const IDemoScene& scene, ImDrawList& draw, const std::function<std::optional<ImVec2>(const Vector3&)>& project) const
+// Every Probe Volume's wire box, always; the probe dots of the selected volume only. Edges are clipped at the camera's near side
+// instead of dropped, so a box keeps its visible edges when a corner is behind the camera or the camera is inside it. Drawn over the
+// scene without depth, like the other viewport icons and lines.
+void Editor::DrawProbeVolumeOverlay(const IDemoScene& scene, ImDrawList& draw, const Matrix4& viewProjection, ImVec2 origin, ImVec2 size) const
 {
-    if(ImGui::GetFrameCount() - m_probeOverlay.frame > 1 || m_probeOverlay.objectID.empty())
-    {
-        return;
-    }
-
     const auto* owner = dynamic_cast<const FileBackedDemoScene*>(&scene);
 
-    if(!owner || !owner->m_runtime)
+    if(!owner || !owner->m_runtime || !owner->m_runtime->GetFileScene().HasDocument())
     {
         return;
     }
 
     const auto& mapping = owner->m_runtime->GetObjectMapping().idToRuntimeIndex;
     const auto& objects = owner->m_runtime->GetScene().GetRenderObjects();
-    const auto found = mapping.find(m_probeOverlay.objectID);
+    const ViewportLineClip::ScreenPoint screenOrigin{origin.x, origin.y};
+    const ViewportLineClip::ScreenPoint screenSize{size.x, size.y};
+    // The Inspector feeds the selected volume's state each frame; it stops when the selection moves on.
+    const bool inspected = ImGui::GetFrameCount() - m_probeOverlay.frame <= 1 && !m_probeOverlay.objectID.empty();
 
-    if(found == mapping.end() || found->second >= objects.size())
+    for(const SceneObjectDocument& object : owner->m_runtime->GetFileScene().GetDocument().objects)
     {
-        return;
-    }
+        const auto found = object.probeVolume ? mapping.find(object.id) : mapping.end();
 
-    const Matrix4 model = objects[found->second].GetPresentationTransform().currentModel;
-    const ImU32 boxColor = m_probeOverlay.valid ? IM_COL32(110, 230, 110, 230) : IM_COL32(255, 170, 70, 230);
-    const ImU32 probeColor = m_probeOverlay.valid ? IM_COL32(90, 210, 255, 230) : IM_COL32(255, 170, 70, 180);
-    std::array<std::optional<ImVec2>, 8> corners;
-
-    for(std::size_t index = 0; index < corners.size(); ++index)
-    {
-        const float x = ((index & 1) ? 0.5f : -0.5f) * m_probeOverlay.size[0];
-        const float y = ((index & 2) ? 0.5f : -0.5f) * m_probeOverlay.size[1];
-        const float z = ((index & 4) ? 0.5f : -0.5f) * m_probeOverlay.size[2];
-        const Vector3 world{model.m[0][0] * x + model.m[0][1] * y + model.m[0][2] * z + model.m[0][3],
-            model.m[1][0] * x + model.m[1][1] * y + model.m[1][2] * z + model.m[1][3],
-            model.m[2][0] * x + model.m[2][1] * y + model.m[2][2] * z + model.m[2][3]};
-        corners[index] = project(world);
-    }
-
-    for(std::size_t index = 0; index < corners.size(); ++index)
-    {
-        for(const std::size_t bit : {std::size_t{1}, std::size_t{2}, std::size_t{4}})
+        if(found == mapping.end() || found->second >= objects.size())
         {
-            if(!(index & bit) && corners[index] && corners[index | bit])
+            continue;
+        }
+
+        const bool selected = inspected && object.id == m_probeOverlay.objectID;
+        // The selected box shows the Inspector's draft size and probe status; others their saved size, in the icons' neutral grey.
+        const std::array<float, 3> boxSize = selected ? m_probeOverlay.size : object.probeVolume->size;
+        const ImU32 boxColor = !selected ? IM_COL32(200, 200, 200, 170) :
+            m_probeOverlay.valid ? IM_COL32(110, 230, 110, 230) : IM_COL32(255, 170, 70, 230);
+        const Matrix4 model = objects[found->second].GetPresentationTransform().currentModel;
+        std::array<Vector3, 8> corners;
+
+        for(std::size_t index = 0; index < corners.size(); ++index)
+        {
+            const float x = ((index & 1) ? 0.5f : -0.5f) * boxSize[0];
+            const float y = ((index & 2) ? 0.5f : -0.5f) * boxSize[1];
+            const float z = ((index & 4) ? 0.5f : -0.5f) * boxSize[2];
+            corners[index] = Vector3{model.m[0][0] * x + model.m[0][1] * y + model.m[0][2] * z + model.m[0][3],
+                model.m[1][0] * x + model.m[1][1] * y + model.m[1][2] * z + model.m[1][3],
+                model.m[2][0] * x + model.m[2][1] * y + model.m[2][2] * z + model.m[2][3]};
+        }
+
+        for(std::size_t index = 0; index < corners.size(); ++index)
+        {
+            for(const std::size_t bit : {std::size_t{1}, std::size_t{2}, std::size_t{4}})
             {
-                draw.AddLine(*corners[index], *corners[index | bit], boxColor, 1.5f);
+                if(index & bit)
+                {
+                    continue;
+                }
+
+                const auto segment = ViewportLineClip::Project(viewProjection, corners[index], corners[index | bit], screenOrigin, screenSize);
+
+                if(segment)
+                {
+                    draw.AddLine(ImVec2(segment->start[0], segment->start[1]), ImVec2(segment->end[0], segment->end[1]), boxColor, 1.5f);
+                }
             }
         }
     }
 
-    if(m_probeView.objectID != m_probeOverlay.objectID || !m_probeView.stored)
+    DrawPathingOverlay(*owner, draw, viewProjection, origin, size);
+
+    if(!inspected || m_probeView.objectID != m_probeOverlay.objectID || !m_probeView.stored)
     {
         return;
     }
 
+    const ImU32 probeColor = m_probeOverlay.valid ? IM_COL32(90, 210, 255, 230) : IM_COL32(255, 170, 70, 180);
+
     for(const std::array<float, 4>& probe : m_probeView.stored->probes)
     {
-        if(const auto point = project(Vector3{probe[0], probe[1], probe[2]}))
+        const auto clip = ViewportLineClip::ToClip(viewProjection, Vector3{probe[0], probe[1], probe[2]});
+
+        if(std::isfinite(clip[0]) && std::isfinite(clip[1]) && clip[3] >= ViewportLineClip::MinimumW)
         {
-            draw.AddCircleFilled(*point, 3.0f, probeColor, 8);
+            const ViewportLineClip::ScreenPoint point = ViewportLineClip::ToScreen(clip, screenOrigin, screenSize);
+            draw.AddCircleFilled(ImVec2(point[0], point[1]), ProbeMarkerRadius, probeColor, 8);
         }
     }
+}
+
+// M9.6: what the pathing simulation registered and decided, drawn only on request. Volumes and decisions exist only during Play; the segments
+// are the SDK's own report (pathingVisCallback) of the baked probe-to-probe paths it walked in its last run, for all pathed sources together.
+// Nothing here is computed again: coverage and selection are the workers' results.
+void Editor::DrawPathingOverlay(const FileBackedDemoScene& owner, ImDrawList& draw, const Matrix4& viewProjection, ImVec2 origin, ImVec2 size) const
+{
+    if(!m_audioSystem)
+    {
+        return;
+    }
+
+    m_audioSystem->SetPathingVisualization(m_pathingOverlay && m_gameState != GameState::Editing);
+
+    if(!m_pathingOverlay || m_gameState == GameState::Editing)
+    {
+        return;
+    }
+
+    const ViewportLineClip::ScreenPoint screenOrigin{origin.x, origin.y};
+    const ViewportLineClip::ScreenPoint screenSize{size.x, size.y};
+    const auto toScreen = [&](const Vector3& position) -> std::optional<ImVec2>
+    {
+        const auto clip = ViewportLineClip::ToClip(viewProjection, position);
+
+        if(!std::isfinite(clip[0]) || !std::isfinite(clip[1]) || clip[3] < ViewportLineClip::MinimumW)
+        {
+            return std::nullopt;
+        }
+
+        const ViewportLineClip::ScreenPoint point = ViewportLineClip::ToScreen(clip, screenOrigin, screenSize);
+        return ImVec2(point[0], point[1]);
+    };
+
+    const auto& mapping = owner.m_runtime->GetObjectMapping().idToRuntimeIndex;
+    const auto& objects = owner.m_runtime->GetScene().GetRenderObjects();
+    const auto positionOf = [&](const std::string& id) -> std::optional<Vector3>
+    {
+        const auto found = mapping.find(id);
+
+        if(found == mapping.end() || found->second >= objects.size())
+        {
+            return std::nullopt;
+        }
+
+        const Matrix4 model = objects[found->second].GetPresentationTransform().currentModel;
+        return Vector3{model.m[0][3], model.m[1][3], model.m[2][3]};
+    };
+
+    // Which volumes some pathed source is using now.
+    const std::vector<Audio::AudioSystem::PathingVolumeDisplay> volumes = m_audioSystem->GetPathingVolumesForDisplay();
+    std::vector<bool> used(volumes.size());
+    std::optional<bool> listenerCovered;
+
+    for(const SceneObjectDocument& object : owner.m_runtime->GetFileScene().GetDocument().objects)
+    {
+        if(!object.audioSource || !object.audioSource->pathing)
+        {
+            continue;
+        }
+
+        const auto status = m_pathingStatusProvider ? m_pathingStatusProvider(object.id) : std::nullopt;
+        const auto position = positionOf(object.id);
+        const auto point = position ? toScreen(*position) : std::nullopt;
+        // Green: pathed. Orange: not covered or no shared volume. Grey: waiting for capacity, not playing or not compatible.
+        ImU32 color = IM_COL32(150, 150, 150, 230);
+        const char* label = "not pathed";
+
+        if(status && status->available && status->occlusionApplied)
+        {
+            listenerCovered = status->listenerCovered;
+
+            if(status->capacity == Audio::AudioSystem::PathingEventStatus::Capacity::Waiting)
+            {
+                label = "waiting";
+            }
+            else if(status->batch >= 0)
+            {
+                color = IM_COL32(110, 230, 110, 240);
+                label = "pathed";
+
+                if(static_cast<std::size_t>(status->batch) < used.size())
+                {
+                    used[static_cast<std::size_t>(status->batch)] = true;
+                }
+            }
+            else
+            {
+                color = IM_COL32(255, 170, 70, 240);
+
+                if(!status->sourceCovered)
+                {
+                    label = "source uncovered";
+                }
+                else if(!status->listenerCovered)
+                {
+                    label = "listener uncovered";
+                }
+                else
+                {
+                    label = "no shared volume";
+                }
+            }
+        }
+        else if(status && !status->occlusionApplied)
+        {
+            label = "incompatible event";
+        }
+
+        if(point)
+        {
+            draw.AddCircle(*point, 9.0f, color, 16, 2.5f);
+            draw.AddText(ImVec2(point->x + 11.0f, point->y - 7.0f), color, label);
+        }
+    }
+
+    for(std::size_t index = 0; index < volumes.size(); ++index)
+    {
+        const ImU32 color = used[index] ? IM_COL32(120, 255, 160, 220) : IM_COL32(120, 160, 200, 110);
+
+        for(const std::array<float, 4>& probe : volumes[index].probes)
+        {
+            if(const auto point = toScreen(Vector3{probe[0], probe[1], probe[2]}))
+            {
+                draw.AddCircleFilled(*point, used[index] ? 2.5f : 1.5f, color, 6);
+            }
+        }
+    }
+
+    for(const SceneObjectDocument& object : owner.m_runtime->GetFileScene().GetDocument().objects)
+    {
+        const auto position = object.audioListener ? positionOf(object.id) : std::nullopt;
+        const auto point = position ? toScreen(*position) : std::nullopt;
+
+        if(point)
+        {
+            // Grey until some pathed source has reported the listener's coverage.
+            ImU32 color = IM_COL32(150, 150, 150, 230);
+            const char* label = "listener";
+
+            if(listenerCovered)
+            {
+                color = *listenerCovered ? IM_COL32(110, 230, 110, 240) : IM_COL32(255, 170, 70, 240);
+                label = *listenerCovered ? "listener covered" : "listener uncovered";
+            }
+
+            draw.AddRect(ImVec2(point->x - 8.0f, point->y - 8.0f), ImVec2(point->x + 8.0f, point->y + 8.0f), color, 0.0f, 0, 2.5f);
+            draw.AddText(ImVec2(point->x + 11.0f, point->y - 7.0f), color, label);
+        }
+    }
+
+    // The SDK's walked segments: cyan clear, red found blocked by validation.
+    for(const Audio::AudioSystem::PathingSegment& segment : m_audioSystem->GetPathingSegments())
+    {
+        const auto line = ViewportLineClip::Project(viewProjection, Vector3{segment.from[0], segment.from[1], segment.from[2]},
+            Vector3{segment.to[0], segment.to[1], segment.to[2]}, screenOrigin, screenSize);
+
+        if(line)
+        {
+            draw.AddLine(ImVec2(line->start[0], line->start[1]), ImVec2(line->end[0], line->end[1]),
+                segment.occluded ? IM_COL32(255, 80, 80, 230) : IM_COL32(80, 230, 255, 230), 2.0f);
+        }
+    }
+
+    draw.AddText(ImVec2(origin.x + 8.0f, origin.y + size.y - 20.0f), IM_COL32(220, 220, 220, 230),
+        "Pathing: lines are the baked paths Steam Audio walked in its last run, for all pathed sources together.");
 }

@@ -123,19 +123,93 @@ void GameAudioSession::Begin()
     }
 }
 
-void GameAudioSession::SetListenerBakedReflections(bool baked)
+void GameAudioSession::SetPathingVolumes(std::span<const Audio::AudioSystem::BakedReverbVolume> volumes)
 {
+    if(!Running() || (volumes.empty() && !m_pathingRegistered))
+    {
+        return;
+    }
+
+    std::vector<std::string> errors;
+    const std::size_t registered = m_audio->SetPathingVolumes(volumes, errors);
+
+    for(const std::string& error : errors)
+    {
+        Warn("baked pathing: " + error + ".");
+    }
+
+    m_pathingRegistered = registered > 0;
+
+    if(registered > 0)
+    {
+        Log::Info("Baked pathing: " + std::to_string(registered) + (registered == 1 ? " Probe Volume" : " Probe Volumes") +
+            " registered for Audio Sources that use pathing.");
+    }
+}
+
+void GameAudioSession::SetListenerBakedReflections(bool baked, std::span<const Audio::AudioSystem::BakedReverbVolume> volumes)
+{
+    SetBakedReflections(baked, volumes, {});
+}
+
+void GameAudioSession::SetBakedReflections(bool listenerBaked, std::span<const Audio::AudioSystem::BakedReverbVolume> volumes,
+    std::vector<BakedSource> sources)
+{
+    m_bakedSources.clear();
+
     if(!Running())
     {
         return;
     }
 
-    if(baked)
+    if(!listenerBaked && sources.empty())
     {
-        Warn("the Audio Listener asks for baked reflections, and no baked data is available yet; shared listener-centric reflections are silent.");
+        m_audio->SetListenerReflectionsWithheld(false);
+        return;
     }
 
-    m_audio->SetListenerReflectionsWithheld(baked);
+    std::vector<std::string> errors;
+    const std::size_t registered = volumes.empty() ? 0 : m_audio->RegisterBakedReflections(volumes, listenerBaked, errors);
+
+    for(const std::string& error : errors)
+    {
+        Warn("baked reflections: " + error + ".");
+    }
+
+    if(registered == 0)
+    {
+        if(listenerBaked)
+        {
+            Warn("the Audio Listener asks for baked reflections, and no valid baked data is available; shared listener-centric reflections are silent.");
+        }
+
+        m_audio->SetListenerReflectionsWithheld(listenerBaked);
+        return;
+    }
+
+    m_bakedReverbRegistered = true;
+
+    for(BakedSource& source : sources)
+    {
+        std::string key = source.objectID;
+        m_bakedSources.emplace(std::move(key), BakedSourceState{std::move(source), false});
+    }
+
+    Log::Info("Baked reflections: " + std::to_string(registered) + (registered == 1 ? " Probe Volume" : " Probe Volumes") +
+        " registered for " + (listenerBaked ? std::string("the shared reverb and ") : std::string()) + std::to_string(m_bakedSources.size()) +
+        " static sources; baked output is silent wherever none covers the listener.");
+    m_audio->SetListenerReflectionsWithheld(false);
+}
+
+void GameAudioSession::DisableBakedSource(BakedSourceState& state, std::string_view label)
+{
+    if(state.disabled)
+    {
+        return;
+    }
+
+    state.disabled = true;
+    Warn("Audio Source on '" + std::string(label) + "' moved from where its reflections were baked; its baked reflections are off for the rest of this session.");
 }
 
 bool GameAudioSession::Running() const noexcept
@@ -317,6 +391,24 @@ void GameAudioSession::End() noexcept
         m_audio->ClearProbeBatches();
     }
 
+    // M8.4: nothing baked outlives the session that registered it.
+    if(m_audio && m_bakedReverbRegistered)
+    {
+        m_audio->ClearBakedListenerReverb();
+    }
+
+    m_bakedReverbRegistered = false;
+    m_bakedSources.clear();
+
+    // M9.5: nor does any pathing batch.
+    if(m_audio && m_pathingRegistered)
+    {
+        std::vector<std::string> ignored;
+        m_audio->SetPathingVolumes({}, ignored);
+    }
+
+    m_pathingRegistered = false;
+
     m_acousticObjects.clear();
     m_events.clear();
     m_restores.clear();
@@ -343,7 +435,7 @@ void GameAudioSession::LoadProbeBatch(const std::string& objectName, std::span<c
         return;
     }
 
-    Log::Info("Probe Volume '" + objectName + "': " + std::to_string(probes) + " probes loaded. Nothing consumes them yet.");
+    Log::Info("Probe Volume '" + objectName + "': " + std::to_string(probes) + " probes loaded.");
 }
 
 void GameAudioSession::PublishAcousticScene(std::vector<AcousticObject> objects)
@@ -485,7 +577,8 @@ void GameAudioSession::StartSceneSources(const std::vector<SceneSource>& sources
 }
 
 std::optional<Audio::EventHandle> GameAudioSession::StartPlaced(const Audio::Guid& guid,
-    const std::optional<ObjectPose>& pose, const std::string& context, bool sourceCentricReflections)
+    const std::optional<ObjectPose>& pose, const std::string& context, bool sourceCentricReflections, const Audio::ReflectionLayerIdentifier* baked,
+    bool pathing)
 {
     if(m_events.size() >= MaximumEvents)
     {
@@ -502,9 +595,18 @@ std::optional<Audio::EventHandle> GameAudioSession::StartPlaced(const Audio::Gui
         return std::nullopt;
     }
 
-    if(sourceCentricReflections && !m_audio->SetEventSourceCentricReflections(*created, true))
+    const bool requested = baked ? m_audio->SetEventBakedSourceReflections(*created, *baked) :
+        !sourceCentricReflections || m_audio->SetEventSourceCentricReflections(*created, true);
+
+    if(sourceCentricReflections && !requested)
     {
         Warn(context + ": source-centric reflections are unavailable in this session; it plays without them.");
+    }
+
+    // M9.5: without a pathing simulator the event plays as it would without pathing, which is what a missing bake does too; not a warning.
+    if(pathing)
+    {
+        m_audio->SetEventPathing(*created, true);
     }
 
     // Positioned before it starts, so the first mixed block is already in place (no pan jump from the origin).
@@ -550,14 +652,38 @@ bool GameAudioSession::StartSource(SourceState& source)
 
     bool sourceCentric = source.authored.sourceCentricReflections;
 
+    const Audio::ReflectionLayerIdentifier* bakedLayer = nullptr;
+
     if(sourceCentric && source.authored.bakedReflections)
     {
-        // Baked was asked for: real time would be a different sound than the author chose.
-        Warn(context + ": baked source-centric reflections are not available yet, so they do not play. Listener-centric reflections still do.");
-        sourceCentric = false;
+        const auto baked = m_bakedSources.find(source.authored.objectID);
+
+        if(baked != m_bakedSources.end() && !baked->second.disabled)
+        {
+            const auto& at = baked->second.source.position;
+            const float x = pose->position[0] - at[0];
+            const float y = pose->position[1] - at[1];
+            const float z = pose->position[2] - at[2];
+
+            if(std::sqrt(x * x + y * y + z * z) > baked->second.source.tolerance)
+            {
+                DisableBakedSource(baked->second, source.authored.label);
+            }
+        }
+
+        if(baked != m_bakedSources.end() && !baked->second.disabled)
+        {
+            bakedLayer = &baked->second.source.identifier;
+        }
+        else
+        {
+            // Baked was asked for: real time would be a different sound than the author chose.
+            Warn(context + ": baked source-centric reflections are not available, so they do not play. Listener-centric reflections still do.");
+            sourceCentric = false;
+        }
     }
 
-    const auto started = StartPlaced(*guid, pose, context, sourceCentric);
+    const auto started = StartPlaced(*guid, pose, context, sourceCentric, bakedLayer, source.authored.pathing);
 
     if(!started)
     {
@@ -567,6 +693,7 @@ bool GameAudioSession::StartSource(SourceState& source)
     OwnedEvent& owned = m_events.back();
     owned.objectID = source.authored.objectID;
     owned.sceneSource = true;
+    owned.baked = bakedLayer != nullptr;
     source.event = *started;
     return true;
 }
@@ -622,6 +749,27 @@ void GameAudioSession::UpdateSpatial(double deltaSeconds, std::string_view liste
             continue;
         }
 
+        // M8.5: a baked layer describes one position. Beyond tolerance it is withdrawn, not replaced.
+        if(event.baked)
+        {
+            const auto baked = m_bakedSources.find(event.objectID);
+
+            if(baked != m_bakedSources.end())
+            {
+                const auto& at = baked->second.source.position;
+                const float x = pose->position[0] - at[0];
+                const float y = pose->position[1] - at[1];
+                const float z = pose->position[2] - at[2];
+
+                if(std::sqrt(x * x + y * y + z * z) > baked->second.source.tolerance)
+                {
+                    m_audio->DisableEventBakedReflections(event.handle);
+                    DisableBakedSource(baked->second, event.objectID);
+                    event.baked = false;
+                }
+            }
+        }
+
         const Vector velocity = Velocity(event.lastPosition, pose->position, deltaSeconds);
         const bool placed = m_audio->SetEventAttributes(event.handle, Attributes(*pose, velocity), error);
 
@@ -638,6 +786,27 @@ std::string GameAudioSession::GetEventObject(const Scripting::AudioEventHandle& 
 {
     const OwnedEvent* event = Find(handle);
     return event ? event->objectID : std::string();
+}
+
+std::optional<Audio::AudioSystem::PathingEventStatus> GameAudioSession::GetSourcePathingStatus(std::string_view objectID) const
+{
+    if(!m_audio)
+    {
+        return std::nullopt;
+    }
+
+    for(const OwnedEvent& event : m_events)
+    {
+        if(event.sceneSource && event.objectID == objectID)
+        {
+            if(auto status = m_audio->GetEventPathingStatus(event.handle))
+            {
+                return status;
+            }
+        }
+    }
+
+    return std::nullopt;
 }
 
 std::vector<Scripting::AudioEventHandle> GameAudioSession::GetSceneEvents() const

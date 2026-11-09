@@ -37,7 +37,11 @@ namespace CookedScene
     inline constexpr std::uint32_t ProbeVolumeVersion = 21;
     // M7.1: a Probe Volume's inside-solid filter setting.
     inline constexpr std::uint32_t ProbeFilterVersion = 22;
-    inline constexpr std::uint32_t Version = ProbeFilterVersion;
+    // M8.2: a Probe Volume's reflection bake settings and baked reflections reference.
+    inline constexpr std::uint32_t BakedReflectionsVersion = 23;
+    // M9.5: a Probe Volume's pathing enable, pathing bake settings and baked pathing reference; an Audio Source's pathing opt-in.
+    inline constexpr std::uint32_t PathingVersion = 24;
+    inline constexpr std::uint32_t Version = PathingVersion;
 
     constexpr bool IsSupportedVersion(std::uint32_t version)
     {
@@ -62,7 +66,9 @@ namespace CookedScene
             version == AcousticsVersion ||
             version == ReflectionSettingsVersion ||
             version == ProbeVolumeVersion ||
-            version == ProbeFilterVersion;
+            version == ProbeFilterVersion ||
+            version == BakedReflectionsVersion ||
+            version == PathingVersion;
     }
     struct Policy
     {

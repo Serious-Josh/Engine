@@ -45,6 +45,26 @@ namespace
     // for scene builds, which this does not change.
     constexpr int ReflectionThreads = 2;
 
+    // M9.3: the pathing inputs M9.0 measured with. The order is the plugin's simulation order, the one it renders paths at.
+    constexpr int PathingVisSamples = 4;
+    constexpr float PathingVisRadius = 0.5f;
+    constexpr float PathingVisThreshold = 0.1f;
+    constexpr float PathingVisRange = 50.0f;
+    constexpr int PathingOrder = ReflectionMaxOrder;
+    // M9.5: how fast the pathing gain follows the direct path's visibility. Twice the 150 ms simulation cadence: no step between runs is heard.
+    constexpr double PathingGainSeconds = 0.3;
+
+    bool InsideAnyProbe(const std::vector<std::array<float, 4>>& spheres, const IPLVector3& point) noexcept
+    {
+        return std::any_of(spheres.begin(), spheres.end(), [&](const std::array<float, 4>& sphere)
+        {
+            const float x = point.x - sphere[0];
+            const float y = point.y - sphere[1];
+            const float z = point.z - sphere[2];
+            return x * x + y * y + z * z <= sphere[3] * sphere[3];
+        });
+    }
+
     // Enough for the SDK to see a listener change, far too little to hear: restarts accumulation after a root is replaced.
     constexpr float AccumulationResetOffset = 0.001f;
 
@@ -386,6 +406,33 @@ void SteamAudioSimulation::Start(const SteamAudioOptions& options)
     if(options.reflectionInfrastructureForTesting && !m_reflectionsActive)
     {
         Log::Warning("Audio: Steam Audio reflection infrastructure stays off: " + m_stats.reflectionInfrastructureDetail + ".");
+    }
+
+    // M9.3: before any bank, so before any source or command can reach it. The workers read it only through work posted after Start
+    // returns, under m_mutex, which orders this write before them.
+    if(options.pathing && m_reflectionsActive)
+    {
+        IPLSimulationSettings pathingSettings{};
+        pathingSettings.flags = IPL_SIMULATIONFLAGS_PATHING;
+        pathingSettings.sceneType = settings.sceneType;
+        pathingSettings.maxOrder = PathingOrder;
+        pathingSettings.numVisSamples = PathingVisSamples;
+        pathingSettings.samplingRate = settings.samplingRate;
+        pathingSettings.frameSize = settings.frameSize;
+
+        if(iplSimulatorCreate(m_runtime.GetContext(), &pathingSettings, &m_pathingSimulator) != IPL_STATUS_SUCCESS)
+        {
+            m_pathingSimulator = nullptr;
+            Log::Warning("Audio: the Steam Audio pathing simulator could not be created; pathing stays off.");
+        }
+        else
+        {
+            m_pathingValidation = options.pathingValidationForTesting;
+            m_pathingSourceLimit = static_cast<std::size_t>(std::max(options.pathingSourceLimit, 0));
+            m_pathingOcclusionSamples = std::clamp(options.pathingOcclusionSamples, 1, MaximumOcclusionSamples);
+            m_stats.pathingActive = true;
+            Log::Info("Audio: Steam Audio pathing is available for up to " + std::to_string(m_pathingSourceLimit) + " sources.");
+        }
     }
 
     if(m_synchronization == SteamAudioSynchronization::Snapshot)
@@ -847,13 +894,264 @@ void SteamAudioSimulation::ReleaseReflectionReturn() noexcept
 
 void SteamAudioSimulation::SetListenerReflectionsWithheld(bool withheld) noexcept
 {
-    if(m_reverbSnapshot)
     {
-        m_reverbSnapshot->SetIrWithheld(withheld);
+        const std::lock_guard lock(m_withholdMutex);
+        m_listenerWithheld = withheld;
+    }
+
+    ApplyReverbWithhold();
+}
+
+void SteamAudioSimulation::SetBakedUncovered(bool uncovered) noexcept
+{
+    {
+        const std::lock_guard lock(m_withholdMutex);
+
+        if(m_bakedUncovered == uncovered)
+        {
+            return;
+        }
+
+        m_bakedUncovered = uncovered;
+    }
+
+    ApplyReverbWithhold();
+}
+
+// Either thread. The snapshot outlives both workers (it is retired only after they are joined).
+void SteamAudioSimulation::ApplyReverbWithhold() noexcept
+{
+    const std::lock_guard lock(m_withholdMutex);
+    SnapshotSource* const snapshot = m_reverbSnapshot ? m_reverbSnapshot : m_workerReverbSnapshot;
+
+    if(snapshot)
+    {
+        snapshot->SetIrWithheld(m_listenerWithheld || m_bakedUncovered);
     }
 }
 
-bool SteamAudioSimulation::SetSourceCentricRequest(FMOD::Studio::EventInstance& instance, bool enabled)
+bool SteamAudioSimulation::SetBakedReverb(std::vector<BakedReverbBatch> batches, bool listener) noexcept
+{
+    if(!m_reflectionsActive || !m_reverbSnapshot || !m_worker.joinable())
+    {
+        ReleaseBakedBatches(batches);
+        return false;
+    }
+
+    std::shared_ptr<std::vector<BakedReverbBatch>> payload;
+
+    try
+    {
+        payload = std::make_shared<std::vector<BakedReverbBatch>>(std::move(batches));
+        const bool baked = !payload->empty() && listener;
+
+        // Silent from now until a baked run has covered the listener, so no earlier realtime IR is heard as baked.
+        if(baked)
+        {
+            SetBakedUncovered(true);
+        }
+
+        {
+            const std::lock_guard lock(m_mutex);
+            WorkerCommand command;
+            command.kind = WorkerCommand::Kind::SetBakedReverb;
+            command.baked = std::move(payload);
+            command.bakedListener = listener;
+            m_pendingCommands.push_back(std::move(command));
+        }
+
+        m_workerWake.notify_one();
+        return true;
+    }
+    catch(...)
+    {
+        ReleaseBakedBatches(payload ? *payload : batches);
+        return false;
+    }
+}
+
+void SteamAudioSimulation::ReleaseBakedBatches(std::vector<BakedReverbBatch>& batches) noexcept
+{
+    for(BakedReverbBatch& entry : batches)
+    {
+        if(entry.batch)
+        {
+            iplProbeBatchRelease(&entry.batch);
+            const std::lock_guard lock(m_mutex);
+            ++m_stats.bakedReverbBatchesReleased;
+        }
+    }
+
+    batches.clear();
+}
+
+void SteamAudioSimulation::SetPathingBatches(std::vector<BakedReverbBatch> batches) noexcept
+{
+    const auto release = [](std::vector<BakedReverbBatch>& entries)
+    {
+        for(BakedReverbBatch& entry : entries)
+        {
+            if(entry.batch)
+            {
+                iplProbeBatchRelease(&entry.batch);
+            }
+        }
+
+        entries.clear();
+    };
+
+    if(!m_pathingSimulator || !m_worker.joinable())
+    {
+        release(batches);
+        return;
+    }
+
+    std::shared_ptr<std::vector<BakedReverbBatch>> payload;
+
+    try
+    {
+        payload = std::make_shared<std::vector<BakedReverbBatch>>(std::move(batches));
+        const std::lock_guard lock(m_mutex);
+        WorkerCommand command;
+        command.kind = WorkerCommand::Kind::SetPathingBatch;
+        command.pathingBatches = payload;
+        m_pendingCommands.push_back(std::move(command));
+    }
+    catch(...)
+    {
+        release(payload ? *payload : batches);
+        return;
+    }
+
+    m_workerWake.notify_one();
+}
+
+// Under the exclusive gate, so no pathing run is using the old set. The pathing simulator alone: a batch without the REVERB layer next to
+// one with it crashes reflection runs (M9.0). Removal and the commit come before any release. Sources choose their batch per run, by index,
+// so every selection is reset here: none may outlive the set it indexed.
+void SteamAudioSimulation::WorkerSetPathingBatches(std::vector<BakedReverbBatch>& batches) noexcept
+{
+    std::vector<BakedReverbBatch> previous = std::move(m_pathingBatches);
+    m_pathingBatches.clear();
+
+    for(BakedReverbBatch& entry : previous)
+    {
+        iplSimulatorRemoveProbeBatch(m_pathingSimulator, entry.batch);
+    }
+
+    for(BakedReverbBatch& entry : batches)
+    {
+        iplSimulatorAddProbeBatch(m_pathingSimulator, entry.batch);
+    }
+
+    iplSimulatorCommit(m_pathingSimulator);
+
+    for(BakedReverbBatch& entry : previous)
+    {
+        iplProbeBatchRelease(&entry.batch);
+    }
+
+    m_pathingBatches = std::move(batches);
+
+    for(auto& [id, source] : m_privateSources)
+    {
+        source.pathingBatch = -1;
+        source.pathingGain = 0.0f;
+    }
+
+    const std::lock_guard lock(m_mutex);
+    m_stats.pathingBatchRegistered = !m_pathingBatches.empty();
+    m_stats.pathingBatches = m_pathingBatches.size();
+}
+
+// Direct worker, exclusive gate. The pathing source starts with no batch and no gain, so its first result fades in from silence.
+bool SteamAudioSimulation::CreatePathingSource(PrivateSource& source) noexcept
+{
+    IPLSourceSettings settings{};
+    settings.flags = IPL_SIMULATIONFLAGS_PATHING;
+
+    if(iplSourceCreate(m_pathingSimulator, &settings, &source.pathingSource) != IPL_STATUS_SUCCESS)
+    {
+        source.pathingSource = nullptr;
+        return false;
+    }
+
+    iplSourceAdd(source.pathingSource, m_pathingSimulator);
+    source.snapshot->SetPathingCapacity(SnapshotSource::PathingCapacity::Simulating);
+    source.pathingBatch = -1;
+    source.pathingGain = 0.0f;
+    source.pathingGainAt = {};
+    ++m_pathingSourceCount;
+    const std::lock_guard lock(m_mutex);
+    ++m_stats.pathingSourcesCreated;
+    return true;
+}
+
+// Direct worker, exclusive gate: freed capacity goes to the longest-waiting opted-in source still alive. No source is ever preempted, so
+// nothing churns: a source keeps its pathing from creation until it retires.
+void SteamAudioSimulation::ServePathingQueue(bool& commit) noexcept
+{
+    while(m_pathingSourceCount < m_pathingSourceLimit && !m_pathingQueue.empty())
+    {
+        const SourceId id = m_pathingQueue.front();
+        m_pathingQueue.erase(m_pathingQueue.begin());
+        const auto found = m_privateSources.find(id);
+
+        if(found != m_privateSources.end() && !found->second.pathingSource && CreatePathingSource(found->second))
+        {
+            commit = true;
+        }
+    }
+
+    const std::lock_guard lock(m_mutex);
+    m_stats.pathingSources = m_pathingSourceCount;
+    m_stats.pathingSourcesWaiting = m_pathingQueue.size();
+}
+
+// Under the exclusive gate: no reflection run can be using the old set. Removal and the commit come before any release.
+void SteamAudioSimulation::WorkerSetBakedReverb(std::vector<BakedReverbBatch>& batches, bool& commit) noexcept
+{
+    std::vector<BakedReverbBatch> previous = std::move(m_bakedReverb);
+    m_bakedReverb.clear();
+
+    for(BakedReverbBatch& entry : previous)
+    {
+        iplSimulatorRemoveProbeBatch(m_simulator, entry.batch);
+    }
+
+    for(BakedReverbBatch& entry : batches)
+    {
+        iplSimulatorAddProbeBatch(m_simulator, entry.batch);
+    }
+
+    iplSimulatorCommit(m_simulator);
+    static_cast<void>(commit);
+    const std::size_t removedCount = previous.size();
+    ReleaseBakedBatches(previous);
+    const bool baked = !batches.empty();
+    m_bakedReverb = std::move(batches);
+
+    {
+        const std::lock_guard lock(m_mutex);
+        m_stats.bakedReverbBatchesRemoved += removedCount;
+        m_stats.bakedReverbBatches = m_bakedReverb.size();
+        m_stats.bakedReverbBatchesAdded += m_bakedReverb.size();
+
+        if(!baked)
+        {
+            m_stats.bakedReverbCovered = false;
+        }
+    }
+
+    // Back to realtime: the reverb source's next realtime run starts its accumulation afresh.
+    if(!baked || !m_bakedListener)
+    {
+        m_reflectionAccumulationStale.store(true, std::memory_order_relaxed);
+        SetBakedUncovered(false);
+    }
+}
+
+bool SteamAudioSimulation::SetSourceCentricRequest(FMOD::Studio::EventInstance& instance, bool enabled, const IPLBakedDataIdentifier* baked)
 {
     if(!m_productionRouting)
     {
@@ -862,13 +1160,81 @@ bool SteamAudioSimulation::SetSourceCentricRequest(FMOD::Studio::EventInstance& 
 
     const std::lock_guard lock(m_mutex);
     std::erase(m_sourceCentricRequests, &instance);
+    std::erase_if(m_bakedRequests, [&](const auto& request)
+    {
+        return request.first == &instance;
+    });
 
     if(enabled)
     {
         m_sourceCentricRequests.push_back(&instance);
+
+        if(baked)
+        {
+            m_bakedRequests.emplace_back(&instance, *baked);
+        }
     }
 
     return true;
+}
+
+bool SteamAudioSimulation::SetPathingRequest(FMOD::Studio::EventInstance& instance, bool enabled)
+{
+    if(!m_pathingSimulator)
+    {
+        return false;
+    }
+
+    const std::lock_guard lock(m_mutex);
+    std::erase(m_pathingRequests, &instance);
+
+    if(enabled)
+    {
+        m_pathingRequests.push_back(&instance);
+    }
+
+    return true;
+}
+
+bool SteamAudioSimulation::DisableBakedReflections(FMOD::Studio::EventInstance& instance) noexcept
+{
+    try
+    {
+        const std::lock_guard lock(m_mutex);
+
+        for(auto& [dsp, active] : m_activeSources)
+        {
+            if(active.instance == &instance && active.baked)
+            {
+                WorkerCommand command;
+                command.kind = WorkerCommand::Kind::DisableBakedSource;
+                command.id = active.id;
+                m_pendingCommands.push_back(std::move(command));
+                active.baked.reset();
+                ++m_stats.bakedSourcesDisabled;
+                m_workerWake.notify_one();
+                return true;
+            }
+        }
+
+        // Not bound yet: withdraw the request whole. Without its baked layer it must not become realtime.
+        const bool requested = std::erase_if(m_bakedRequests, [&](const auto& request)
+        {
+            return request.first == &instance;
+        }) > 0;
+
+        if(requested)
+        {
+            std::erase(m_sourceCentricRequests, &instance);
+            ++m_stats.bakedSourcesDisabled;
+        }
+
+        return requested;
+    }
+    catch(...)
+    {
+        return false;
+    }
 }
 
 void* SteamAudioSimulation::GetReverbGroupForTesting() noexcept
@@ -939,6 +1305,15 @@ void SteamAudioSimulation::ServeReflectionSlots(bool& commit) noexcept
         commit = true;
         IPLSimulationOutputs outputs{};
         iplSourceGetOutputs(source, IPL_SIMULATIONFLAGS_REFLECTIONS, &outputs);
+
+        // A baked slot is silent until a baked run covers the listener (RunReflections decides it after each run).
+        if(found->second.baked)
+        {
+            found->second.snapshot->SetIrWithheld(true);
+            const std::lock_guard lock(m_mutex);
+            ++m_stats.bakedSourceSlots;
+        }
+
         found->second.snapshot->PublishReflectionIr(outputs.reflections.ir, outputs.reflections.numChannels, outputs.reflections.irSize);
         found->second.reflectionSource = source;
         found->second.reflectionCapable = true;
@@ -1126,6 +1501,89 @@ void SteamAudioSimulation::ShutdownSnapshotPath() noexcept
     m_stats.reflectionInfrastructureActive = false;
     m_stats.reflectionSources = 0;
 
+    // M9.3: both workers are joined. Pathing sources and the batches leave the pathing simulator, which is committed, before any release;
+    // then the simulator itself, before the scene it holds is released below. Batches still in a command were never registered.
+    if(m_pathingSimulator)
+    {
+        for(auto& [id, privateSource] : m_privateSources)
+        {
+            if(privateSource.pathingSource)
+            {
+                iplSourceRemove(privateSource.pathingSource, m_pathingSimulator);
+            }
+        }
+
+        for(BakedReverbBatch& entry : m_pathingBatches)
+        {
+            iplSimulatorRemoveProbeBatch(m_pathingSimulator, entry.batch);
+        }
+
+        iplSimulatorCommit(m_pathingSimulator);
+
+        for(auto& [id, privateSource] : m_privateSources)
+        {
+            if(privateSource.pathingSource)
+            {
+                iplSourceRelease(&privateSource.pathingSource);
+                ++m_stats.pathingSourcesReleased;
+            }
+        }
+
+        for(BakedReverbBatch& entry : m_pathingBatches)
+        {
+            iplProbeBatchRelease(&entry.batch);
+        }
+
+        m_pathingBatches.clear();
+
+        for(WorkerCommand& command : m_pendingCommands)
+        {
+            if(command.kind == WorkerCommand::Kind::SetPathingBatch && command.pathingBatches)
+            {
+                for(BakedReverbBatch& entry : *command.pathingBatches)
+                {
+                    iplProbeBatchRelease(&entry.batch);
+                }
+
+                command.pathingBatches->clear();
+            }
+        }
+
+        iplSimulatorRelease(&m_pathingSimulator);
+        m_pathingSourceCount = 0;
+        m_pathingQueue.clear();
+        m_stats.pathingActive = false;
+        m_stats.pathingBatchRegistered = false;
+        m_stats.pathingBatches = 0;
+        m_stats.pathingSources = 0;
+        m_stats.pathingSourcesWaiting = 0;
+    }
+
+    // M8.4: both workers are joined. Registered batches leave the simulator before their release; unapplied ones were never in it.
+    for(BakedReverbBatch& entry : m_bakedReverb)
+    {
+        iplSimulatorRemoveProbeBatch(m_simulator, entry.batch);
+        ++m_stats.bakedReverbBatchesRemoved;
+    }
+
+    if(!m_bakedReverb.empty())
+    {
+        iplSimulatorCommit(m_simulator);
+    }
+
+    ReleaseBakedBatches(m_bakedReverb);
+    m_stats.bakedReverbBatches = 0;
+
+    for(WorkerCommand& command : m_pendingCommands)
+    {
+        if(command.kind == WorkerCommand::Kind::SetBakedReverb && command.baked)
+        {
+            ReleaseBakedBatches(*command.baked);
+        }
+    }
+
+    m_workerReverbSnapshot = nullptr;
+
     for(auto& [dsp, active] : m_activeSources)
     {
         m_retiringSources.push_back({active.snapshot, active.id, true, nullptr});
@@ -1239,6 +1697,11 @@ void SteamAudioSimulation::AttachToInstance(FMOD::Studio::EventInstance& instanc
         // A new instance can reuse a released one's address.
         const std::lock_guard lock(m_mutex);
         std::erase(m_sourceCentricRequests, &instance);
+        std::erase(m_pathingRequests, &instance);
+        std::erase_if(m_bakedRequests, [&](const auto& request)
+        {
+            return request.first == &instance;
+        });
     }
 
     // Set before start(), so no DSP of this instance can be created unobserved. A failure leaves the event as direct
@@ -1303,8 +1766,19 @@ void SteamAudioSimulation::OnPluginCreated(FMOD::Studio::EventInstance& instance
         return;
     }
 
+    // M9.1: Engine publishes no pathing output, and the plugin's path effect crashes on the null coefficients a source would
+    // otherwise give it (M9.0). Off before the first block, whatever was authored and whether or not this DSP gets a source.
+    // SnapshotSource still answers a pathing read with silent coefficients, in case automation turns it back on.
+    const bool pathingAuthored = m_runtime.AppliesPathing(dsp);
+
+    if(pathingAuthored)
+    {
+        m_runtime.SetAppliesPathing(dsp, false);
+    }
+
     {
         const std::lock_guard lock(m_mutex);
+        m_stats.pathingDisabledAtBind += pathingAuthored ? 1 : 0;
 
         // Binding twice could be dropped or stuck (section 3.3), so a repeated report is never bound again.
         if(!m_boundDsps.insert(&dsp).second)
@@ -1316,7 +1790,7 @@ void SteamAudioSimulation::OnPluginCreated(FMOD::Studio::EventInstance& instance
 
     if(m_synchronization == SteamAudioSynchronization::Snapshot)
     {
-        BindSnapshotSource(instance, dsp);
+        BindSnapshotSource(instance, dsp, pathingAuthored);
     }
     else
     {
@@ -1324,7 +1798,7 @@ void SteamAudioSimulation::OnPluginCreated(FMOD::Studio::EventInstance& instance
     }
 }
 
-void SteamAudioSimulation::BindSnapshotSource(FMOD::Studio::EventInstance& instance, FMOD::DSP& dsp)
+void SteamAudioSimulation::BindSnapshotSource(FMOD::Studio::EventInstance& instance, FMOD::DSP& dsp, bool pathingAuthored)
 {
     if(ConsumeInjectedFailure(SteamAudioInjectedFailure::SourceCreation))
     {
@@ -1347,6 +1821,7 @@ void SteamAudioSimulation::BindSnapshotSource(FMOD::Studio::EventInstance& insta
     // FMOD Studio is the authority: this reads what was authored, and never enables anything. Reflections need the authored
     // value at creation; a later automation of it finds no IR and adds nothing.
     bool reflectionConsumer = m_reflectionsActive && (m_assumeReflectionConsumers || m_runtime.AppliesReflections(dsp));
+    std::optional<IPLBakedDataIdentifier> baked;
 
     // On the production route the Audio Source decides, whatever the event authored.
     if(m_productionRouting)
@@ -1354,6 +1829,22 @@ void SteamAudioSimulation::BindSnapshotSource(FMOD::Studio::EventInstance& insta
         const std::lock_guard lock(m_mutex);
         const auto request = std::find(m_sourceCentricRequests.begin(), m_sourceCentricRequests.end(), &instance);
         reflectionConsumer = request != m_sourceCentricRequests.end();
+        const auto bakedRequest = std::find_if(m_bakedRequests.begin(), m_bakedRequests.end(), [&](const auto& entry)
+        {
+            return entry.first == &instance;
+        });
+
+        if(reflectionConsumer && bakedRequest != m_bakedRequests.end())
+        {
+            baked = bakedRequest->second;
+
+            // Baked layers are looked up only through a reverb-route slot; the legacy path would trace this source in real time.
+            if(!m_reverbWanted)
+            {
+                reflectionConsumer = false;
+                baked.reset();
+            }
+        }
     }
 
     // A slot is only worth having for an event with a Send. FMOD can say that one exists but not where it goes: every Studio send reports
@@ -1387,13 +1878,22 @@ void SteamAudioSimulation::BindSnapshotSource(FMOD::Studio::EventInstance& insta
         m_runtime.SetAppliesReflections(dsp, false);
     }
 
+    // M9.5: how much of the direct path this spatializer takes away, as authored; pathing restores only that part.
+    const bool occlusionApplied = m_runtime.AppliesSimulatedOcclusion(dsp);
+    const bool transmissionApplied = m_runtime.AppliesSimulatedTransmission(dsp);
     const std::lock_guard lock(m_mutex);
     ++m_stats.sourcesCreated;
 
     if(bound)
     {
         ++m_stats.bindings;
-        m_lifecycleChanges.push_back({LifecycleChange::Kind::Created, &dsp, &instance, source, nullptr, reflectionConsumer});
+        LifecycleChange change{LifecycleChange::Kind::Created, &dsp, &instance, source, nullptr, reflectionConsumer,
+            reflectionConsumer ? baked : std::nullopt};
+        change.pathing = m_pathingSimulator && std::find(m_pathingRequests.begin(), m_pathingRequests.end(), &instance) != m_pathingRequests.end();
+        change.occlusionApplied = occlusionApplied;
+        change.transmissionApplied = transmissionApplied;
+        change.pathingAuthored = pathingAuthored;
+        m_lifecycleChanges.push_back(std::move(change));
         return;
     }
 
@@ -1482,6 +1982,11 @@ void SteamAudioSimulation::ApplyLifecycleChanges() noexcept
                 active.snapshot = change.snapshot;
                 active.realSource = change.realSource;
                 active.reflectionConsumer = change.reflectionConsumer;
+                active.baked = change.baked;
+                active.pathingRequested = change.pathing;
+                active.pathingAuthored = change.pathingAuthored;
+                active.occlusionApplied = change.occlusionApplied;
+                active.transmissionApplied = change.transmissionApplied;
                 // No reflections authored: this event has only the reverb.
                 active.reverbSendTarget = m_reverbRouting == SteamAudioReverbRoutingForTesting::SourceOnly ||
                     (m_reverbWanted && (!change.reflectionConsumer || m_reverbRouting != SteamAudioReverbRoutingForTesting::Exclusive)) ? 1.0f : 0.0f;
@@ -1493,6 +1998,10 @@ void SteamAudioSimulation::ApplyLifecycleChanges() noexcept
                     command.id = active.id;
                     command.snapshot = active.snapshot;
                     command.reflectionConsumer = change.reflectionConsumer;
+                    command.bakedSource = change.baked;
+                    command.pathing = change.pathing;
+                    command.occlusionApplied = change.occlusionApplied;
+                    command.transmissionApplied = change.transmissionApplied;
                     m_pendingCommands.push_back(std::move(command));
                 }
                 else
@@ -1567,6 +2076,21 @@ void SteamAudioSimulation::ApplyLifecycleChanges() noexcept
         }
     }
 
+    if(stats.pathingSourcesWaiting > 0 && !m_pathingCapacityReported)
+    {
+        m_pathingCapacityReported = true;
+
+        try
+        {
+            Log::Warning("Audio: more Audio Sources use pathing than the limit of " + std::to_string(m_pathingSourceLimit) +
+                "; the extra sources wait, with direct sound only, until a place is free.");
+        }
+        catch(...)
+        {
+            // Logging allocation failure only.
+        }
+    }
+
     if((stats.creationFailures > 0 || stats.bindingFailures > 0) && !m_failuresReported)
     {
         m_failuresReported = true;
@@ -1614,6 +2138,8 @@ void SteamAudioSimulation::ReclaimRetiredSources() noexcept
     std::size_t released = 0;
     std::int64_t anomalies = 0;
     std::int64_t irReads = 0;
+    std::int64_t pathingReads = 0;
+    std::int64_t validPathingReads = 0;
 
     for(auto retiring = m_retiringSources.begin(); retiring != m_retiringSources.end();)
     {
@@ -1634,6 +2160,8 @@ void SteamAudioSimulation::ReclaimRetiredSources() noexcept
 
             anomalies += retiring->snapshot->Anomalies();
             irReads += retiring->snapshot->IrReads();
+            pathingReads += retiring->snapshot->NeutralPathingReads();
+            validPathingReads += retiring->snapshot->ValidPathingReads();
             delete retiring->snapshot;
             ++destroyed;
             retiring = m_retiringSources.erase(retiring);
@@ -1643,12 +2171,14 @@ void SteamAudioSimulation::ReclaimRetiredSources() noexcept
         ++retiring;
     }
 
-    if(destroyed > 0 || anomalies > 0)
+    if(destroyed > 0 || anomalies > 0 || pathingReads > 0)
     {
         const std::lock_guard lock(m_mutex);
         m_stats.sourcesDestroyed += destroyed;
         m_stats.privateSourcesReleased += released;
         m_stats.reflectionIrReads += static_cast<std::uint64_t>(irReads);
+        m_stats.pathingNeutralReads += static_cast<std::uint64_t>(pathingReads);
+        m_stats.pathingValidReads += static_cast<std::uint64_t>(validPathingReads);
         m_stats.sourceAnomalies += static_cast<std::uint64_t>(anomalies);
         m_stats.retiringSources = m_retiringSources.size();
     }
@@ -1809,6 +2339,39 @@ void SteamAudioSimulation::SimulateUnderLock() noexcept
     m_stats.maximumLockHoldMicroseconds = std::max(m_stats.maximumLockHoldMicroseconds, hold);
 }
 
+// M9.3, main thread. Apply Pathing is Engine's to set, never the authored value's: on only while the source's snapshot holds a valid result.
+// Either order of the two is safe, because a read without a valid result gets silent coefficients (M9.1, M9.2); this keeps the path effect
+// from running, and costing, while there is nothing for it to render.
+void SteamAudioSimulation::UpdatePathingActivation() noexcept
+{
+    std::uint64_t activations = 0;
+    std::uint64_t deactivations = 0;
+
+    for(auto& [dsp, active] : m_activeSources)
+    {
+        if(!active.snapshot)
+        {
+            continue;
+        }
+
+        const bool wanted = active.snapshot->PathingAvailable();
+
+        if(wanted != active.pathingApplied)
+        {
+            m_runtime.SetAppliesPathing(*dsp, wanted);
+            active.pathingApplied = wanted;
+            (wanted ? activations : deactivations) += 1;
+        }
+    }
+
+    if(activations > 0 || deactivations > 0)
+    {
+        const std::lock_guard lock(m_mutex);
+        m_stats.pathingActivations += activations;
+        m_stats.pathingDeactivations += deactivations;
+    }
+}
+
 void SteamAudioSimulation::Update() noexcept
 {
     if(!m_simulator)
@@ -1838,6 +2401,11 @@ void SteamAudioSimulation::Update() noexcept
     {
         ApplySlotReports();
         RampReverbSends();
+    }
+
+    if(m_pathingSimulator)
+    {
+        UpdatePathingActivation();
     }
 
     const auto now = Clock::now();
@@ -2118,6 +2686,8 @@ bool SteamAudioSimulation::RunReflections(const InputFrame& frame, bool yieldToD
 
         IPLSimulationSharedInputs shared{};
         shared.listener = frame.listener;
+        // Before the accumulation nudge below: coverage is judged at the listener itself.
+        const IPLVector3 listenerAt = frame.listener.origin;
 
         if(m_reflectionAccumulationStale.exchange(false, std::memory_order_relaxed))
         {
@@ -2137,6 +2707,9 @@ bool SteamAudioSimulation::RunReflections(const InputFrame& frame, bool yieldToD
         inputs.reverbScale[1] = 1.0f;
         inputs.reverbScale[2] = 1.0f;
 
+        std::size_t realtimeSources = 0;
+        std::size_t bakedSources = 0;
+
         for(const FramePose& framePose : frame.poses)
         {
             // A source retired since the frame was made is gone from the map, and cannot return: ids are never reused.
@@ -2144,25 +2717,129 @@ bool SteamAudioSimulation::RunReflections(const InputFrame& frame, bool yieldToD
 
             if(found != m_privateSources.end() && found->second.reflectionCapable)
             {
-                inputs.source = framePose.pose;
-                iplSourceSetInputs(found->second.reflectionSource ? found->second.reflectionSource : found->second.realSource, IPL_SIMULATIONFLAGS_REFLECTIONS, &inputs);
+                // M8.5: a baked source looks its own layer up and is never traced, whatever else this run traces.
+                IPLSimulationInputs sourceInputs = inputs;
+                sourceInputs.source = framePose.pose;
+
+                if(found->second.baked)
+                {
+                    sourceInputs.baked = IPL_TRUE;
+                    sourceInputs.bakedDataIdentifier = *found->second.baked;
+                    ++bakedSources;
+                }
+                else
+                {
+                    ++realtimeSources;
+                }
+
+                iplSourceSetInputs(found->second.reflectionSource ? found->second.reflectionSource : found->second.realSource, IPL_SIMULATIONFLAGS_REFLECTIONS,
+                    &sourceInputs);
             }
         }
 
-        // Always at the listener: this one source is the whole cost of the reverb, however many events send to it.
+        // Always at the listener: this one source is the whole cost of the reverb, however many events send to it. M8.4: with baked
+        // data registered for the listener it looks the REVERB layer up instead of tracing, so realtime and baked never both feed it.
+        const bool baked = m_reverbRealSource && m_bakedListener && !m_bakedReverb.empty();
+
         if(m_reverbRealSource)
         {
-            inputs.source = frame.listener;
-            iplSourceSetInputs(m_reverbRealSource, IPL_SIMULATIONFLAGS_REFLECTIONS, &inputs);
+            IPLSimulationInputs reverbInputs = inputs;
+            reverbInputs.source = frame.listener;
+
+            if(baked)
+            {
+                reverbInputs.baked = IPL_TRUE;
+                reverbInputs.bakedDataIdentifier.type = IPL_BAKEDDATATYPE_REFLECTIONS;
+                reverbInputs.bakedDataIdentifier.variation = IPL_BAKEDDATAVARIATION_REVERB;
+                // The REVERB identifier's sphere is all zeros; the SDK compares it even for this variation (M8.1).
+                reverbInputs.bakedDataIdentifier.endpointInfluence = IPLSphere{};
+            }
+
+            iplSourceSetInputs(m_reverbRealSource, IPL_SIMULATIONFLAGS_REFLECTIONS, &reverbInputs);
         }
 
         iplSimulatorRunReflections(m_simulator);
+
+        // Outside every probe the SDK keeps the last output (M8.1), so baked output is withheld there rather than trusted to clear: the
+        // reverb's (M8.4) and each baked source's (M8.5), all judged by the same listener position.
+        if(!m_bakedReverb.empty())
+        {
+            bool covered = false;
+
+            for(const BakedReverbBatch& entry : m_bakedReverb)
+            {
+                for(const std::array<float, 4>& sphere : entry.spheres)
+                {
+                    const float x = listenerAt.x - sphere[0];
+                    const float y = listenerAt.y - sphere[1];
+                    const float z = listenerAt.z - sphere[2];
+
+                    if(x * x + y * y + z * z <= sphere[3] * sphere[3])
+                    {
+                        covered = true;
+                        break;
+                    }
+                }
+
+                if(covered)
+                {
+                    break;
+                }
+            }
+
+            if(baked)
+            {
+                SetBakedUncovered(!covered);
+            }
+
+            for(const FramePose& framePose : frame.poses)
+            {
+                const auto found = m_privateSources.find(framePose.id);
+
+                if(found != m_privateSources.end() && found->second.reflectionCapable && found->second.baked && found->second.snapshot)
+                {
+                    found->second.snapshot->SetIrWithheld(!covered || found->second.bakedDisabled);
+                }
+            }
+
+            const std::lock_guard lock(m_mutex);
+            ++m_stats.bakedReverbRuns;
+            m_stats.bakedReverbUncoveredRuns += covered ? 0 : 1;
+            m_stats.bakedReverbCovered = covered;
+        }
+        else
+        {
+            // No baked data registered: a baked slot has nothing to look up, and stays silent rather than keeping old output.
+            for(const FramePose& framePose : frame.poses)
+            {
+                const auto found = m_privateSources.find(framePose.id);
+
+                if(found != m_privateSources.end() && found->second.reflectionCapable && found->second.baked && found->second.snapshot)
+                {
+                    found->second.snapshot->SetIrWithheld(true);
+                }
+            }
+        }
+
+        {
+            const std::lock_guard lock(m_mutex);
+            m_stats.lastRunRealtimeSources = realtimeSources;
+            m_stats.lastRunBakedSources = bakedSources;
+        }
+
+        // M9.3: sequentially, still under the shared gate, so no scene, batch or source change can overlap it.
+        if(m_pathingSimulator)
+        {
+            RunPathing(frame);
+        }
+
         InjectSimulationDelay(frame.controls.injectedReflectionMilliseconds);
     }
 
     const double elapsed = Microseconds(start, Clock::now());
     const std::lock_guard lock(m_mutex);
     ++m_stats.reflectionRuns;
+    m_stats.reflectionRunMicrosecondsSum += elapsed;
     m_stats.maximumReflectionRunMicroseconds = std::max(m_stats.maximumReflectionRunMicroseconds, elapsed);
     const double wake = Microseconds(frame.postedAt, start);
     m_stats.reflectionWakeMicrosecondsSum += wake;
@@ -2180,15 +2857,195 @@ bool SteamAudioSimulation::RunReflections(const InputFrame& frame, bool yieldToD
     return true;
 }
 
+// M9.5, reflection worker, shared gate held.
+//
+// Coverage and batch: a source is simulated only when it and the listener are both inside one registered batch's probes, because paths
+// never cross from one batch to another and outside a batch the SDK leaves the previous output in place (M9.0). Where several batches
+// cover both, the one the source already uses is kept for as long as it still does, so overlapping volumes never flip a source back and
+// forth; otherwise the first in priority order is chosen. Without one the source is disabled (never given a null batch, which crashes
+// the SDK) and published invalid.
+//
+// Mixing (M9.5 option A): pathing makes up only what the direct path loses. Its Ambisonic coefficients are scaled by
+// 1 - visibility, where visibility is what the plugin lets through of the direct path (SetDirectVisibility). In clear sight that is
+// nothing, so the authored direct sound is heard alone; fully blocked, pathing plays in full, beside whatever the direct path's own
+// transmission lets through. The gain moves towards its target with a time constant, so a 150 ms simulation cadence never steps it, and
+// starts from silence whenever the source's batch changes or it regains coverage. The EQ is left as simulated.
+void SteamAudioSimulation::RunPathing(const InputFrame& frame) noexcept
+{
+    const auto now = Clock::now();
+    std::vector<bool> listenerInside(m_pathingBatches.size());
+
+    for(std::size_t index = 0; index < m_pathingBatches.size(); ++index)
+    {
+        listenerInside[index] = InsideAnyProbe(m_pathingBatches[index].spheres, frame.listener.origin);
+    }
+
+    std::vector<PrivateSource*> simulated;
+    simulated.reserve(frame.poses.size());
+    std::uint64_t switches = 0;
+    bool anyCovered = false;
+
+    for(const FramePose& framePose : frame.poses)
+    {
+        const auto found = m_privateSources.find(framePose.id);
+
+        if(found == m_privateSources.end() || !found->second.pathingSource)
+        {
+            continue;
+        }
+
+        PrivateSource& source = found->second;
+        const auto covers = [&](int index)
+        {
+            return index >= 0 && static_cast<std::size_t>(index) < m_pathingBatches.size() && listenerInside[static_cast<std::size_t>(index)] &&
+                InsideAnyProbe(m_pathingBatches[static_cast<std::size_t>(index)].spheres, framePose.pose.origin);
+        };
+        int chosen = covers(source.pathingBatch) ? source.pathingBatch : -1;
+        // M9.6, display only: each end inside some batch, not necessarily the same one.
+        source.pathingSourceInside = false;
+
+        for(const BakedReverbBatch& batch : m_pathingBatches)
+        {
+            source.pathingSourceInside = source.pathingSourceInside || InsideAnyProbe(batch.spheres, framePose.pose.origin);
+        }
+
+        for(int index = 0; chosen < 0 && static_cast<std::size_t>(index) < m_pathingBatches.size(); ++index)
+        {
+            chosen = covers(index) ? index : -1;
+        }
+
+        if(chosen != source.pathingBatch)
+        {
+            switches += source.pathingBatch >= 0 && chosen >= 0 ? 1 : 0;
+            source.pathingBatch = chosen;
+            source.pathingGain = 0.0f;
+            source.pathingGainAt = {};
+        }
+
+        IPLSimulationInputs inputs{};
+        inputs.flags = chosen >= 0 ? IPL_SIMULATIONFLAGS_PATHING : static_cast<IPLSimulationFlags>(0);
+        inputs.source = framePose.pose;
+        inputs.distanceAttenuationModel.type = IPL_DISTANCEATTENUATIONTYPE_INVERSEDISTANCE;
+        inputs.distanceAttenuationModel.minDistance = 1.0f;
+        // Never null while enabled: the SDK dereferences the batch's path simulator without a check (M9.0).
+        inputs.pathingProbes = chosen >= 0 ? m_pathingBatches[static_cast<std::size_t>(chosen)].batch : nullptr;
+        inputs.visRadius = PathingVisRadius;
+        inputs.visThreshold = PathingVisThreshold;
+        inputs.visRange = PathingVisRange;
+        inputs.pathingOrder = PathingOrder;
+        inputs.enableValidation = m_pathingValidation ? IPL_TRUE : IPL_FALSE;
+        inputs.findAlternatePaths = m_pathingValidation ? IPL_TRUE : IPL_FALSE;
+        iplSourceSetInputs(source.pathingSource, IPL_SIMULATIONFLAGS_PATHING, &inputs);
+        simulated.push_back(&source);
+        anyCovered |= chosen >= 0;
+    }
+
+    const bool visualize = m_pathingVisualize.load(std::memory_order_relaxed);
+    const bool listenerInsideAny = std::find(listenerInside.begin(), listenerInside.end(), true) != listenerInside.end();
+    // The SDK does not document which thread reports segments, so the capture is locked. Only while visualizing.
+    struct SegmentCapture
+    {
+        std::mutex mutex;
+        std::vector<AudioSystem::PathingSegment> segments;
+    } capture;
+
+    if(anyCovered)
+    {
+        IPLSimulationSharedInputs shared{};
+        shared.listener = frame.listener;
+
+        // M9.6: the SDK's own report of the probe-to-probe segments it walked, only while the Editor asks for them.
+        if(visualize)
+        {
+            shared.pathingVisCallback = [](IPLVector3 from, IPLVector3 to, IPLbool occluded, void* userData)
+            {
+                try
+                {
+                    auto& target = *static_cast<SegmentCapture*>(userData);
+                    const std::lock_guard segmentLock(target.mutex);
+                    target.segments.push_back({{from.x, from.y, from.z}, {to.x, to.y, to.z}, occluded == IPL_TRUE});
+                }
+                catch(...)
+                {
+                }
+            };
+            shared.pathingUserData = &capture;
+        }
+
+        iplSimulatorSetSharedInputs(m_pathingSimulator, IPL_SIMULATIONFLAGS_PATHING, &shared);
+        iplSimulatorRunPathing(m_pathingSimulator);
+    }
+
+    std::size_t covered = 0;
+
+    for(PrivateSource* source : simulated)
+    {
+        SteamAudioPathingSnapshot result;
+        result.order = PathingOrder;
+
+        if(source->pathingBatch >= 0)
+        {
+            IPLSimulationOutputs outputs{};
+            iplSourceGetOutputs(source->pathingSource, IPL_SIMULATIONFLAGS_PATHING, &outputs);
+            result.valid = outputs.pathing.shCoeffs != nullptr;
+            const float target = std::clamp(1.0f - source->snapshot->DirectVisibility(), 0.0f, 1.0f);
+            const double elapsed = source->pathingGainAt == Clock::time_point{} ? std::chrono::duration<double>(ReflectionInterval).count() :
+                std::chrono::duration<double>(now - source->pathingGainAt).count();
+            source->pathingGain += (target - source->pathingGain) * static_cast<float>(1.0 - std::exp(-elapsed / PathingGainSeconds));
+            source->pathingGainAt = now;
+
+            for(int band = 0; band < IPL_NUM_BANDS; ++band)
+            {
+                result.eq[band] = outputs.pathing.eqCoeffs[band];
+            }
+
+            for(int index = 0; result.valid && index < (PathingOrder + 1) * (PathingOrder + 1); ++index)
+            {
+                result.sh[index] = outputs.pathing.shCoeffs[index] * source->pathingGain;
+            }
+
+            covered += result.valid ? 1 : 0;
+        }
+
+        source->snapshot->PublishPathing(result);
+        source->snapshot->SetPathingRun(source->pathingBatch, source->pathingSourceInside, listenerInsideAny,
+            source->pathingBatch >= 0 ? source->pathingGain : 0.0f);
+    }
+
+    const double elapsed = Microseconds(now, Clock::now());
+    const std::lock_guard lock(m_mutex);
+
+    if(visualize || !m_pathingSegments.empty())
+    {
+        m_pathingSegments = std::move(capture.segments);
+    }
+
+    ++m_stats.pathingRuns;
+    m_stats.lastPathingRunMicroseconds = elapsed;
+    m_stats.pathingRunMicrosecondsSum += elapsed;
+    m_stats.maximumPathingRunMicroseconds = std::max(m_stats.maximumPathingRunMicroseconds, elapsed);
+    m_stats.lastPathingCoveredSources = covered;
+    m_stats.lastPathingUncoveredSources = simulated.size() - covered;
+    m_stats.pathingSnapshotsPublished += simulated.size();
+    m_stats.pathingBatchSwitches += switches;
+}
+
 void SteamAudioSimulation::ApplyWorkerCommands(const std::vector<WorkerCommand>& commands,
     std::vector<RemovedPrivateSource>& removed) noexcept
 {
     bool commit = false;
     bool acousticChanged = false;
+    // M9.3: pathing sources leave the pathing simulator, which is committed, before they are released.
+    bool pathingCommit = false;
+    std::vector<IPLSource> pathingRemoved;
 
     for(const WorkerCommand& command : commands)
     {
-        if(command.kind == WorkerCommand::Kind::SetAcousticObject)
+        if(command.kind == WorkerCommand::Kind::SetPathingBatch)
+        {
+            WorkerSetPathingBatches(*command.pathingBatches);
+        }
+        else if(command.kind == WorkerCommand::Kind::SetAcousticObject)
         {
             acousticChanged |= WorkerSetAcousticObject(command.id, command.mesh, command.world);
         }
@@ -2223,6 +3080,7 @@ void SteamAudioSimulation::ApplyWorkerCommands(const std::vector<WorkerCommand>&
             if(iplSourceCreate(m_simulator, &settings, &m_reverbRealSource) == IPL_STATUS_SUCCESS)
             {
                 iplSourceAdd(m_reverbRealSource, m_simulator);
+                m_workerReverbSnapshot = command.snapshot;
                 commit = true;
                 IPLSimulationOutputs outputs{};
                 iplSourceGetOutputs(m_reverbRealSource, IPL_SIMULATIONFLAGS_REFLECTIONS, &outputs);
@@ -2237,12 +3095,33 @@ void SteamAudioSimulation::ApplyWorkerCommands(const std::vector<WorkerCommand>&
                 Log::Warning("Audio: the Steam Audio reverb source could not be created; the reverb stays silent.");
             }
         }
+        else if(command.kind == WorkerCommand::Kind::SetBakedReverb)
+        {
+            m_bakedListener = command.bakedListener;
+            WorkerSetBakedReverb(*command.baked, commit);
+        }
+        else if(command.kind == WorkerCommand::Kind::DisableBakedSource)
+        {
+            const auto found = m_privateSources.find(command.id);
+
+            if(found != m_privateSources.end())
+            {
+                found->second.bakedDisabled = true;
+
+                if(found->second.snapshot)
+                {
+                    found->second.snapshot->SetIrWithheld(true);
+                }
+            }
+        }
         else if(command.kind == WorkerCommand::Kind::AddSource)
         {
             PrivateSource privateSource;
             privateSource.snapshot = command.snapshot;
+            privateSource.baked = command.bakedSource;
             IPLSourceSettings settings{};
             settings.flags = IPL_SIMULATIONFLAGS_DIRECT;
+
 
             // With reverb, slots are given and reported by ServeReflectionSlots.
             if(m_reverbWanted && command.reflectionConsumer)
@@ -2296,6 +3175,25 @@ void SteamAudioSimulation::ApplyWorkerCommands(const std::vector<WorkerCommand>&
                 ++m_stats.privateSourceFailures;
             }
 
+            // M9.5: only for a source that asked, and only within capacity; otherwise it waits, keeping M9.1's silent pathing answer and its
+            // usual sound. Without a pathing source Apply Pathing stays off.
+            privateSource.pathingRequested = command.pathing && m_pathingSimulator;
+            privateSource.occlusionApplied = command.occlusionApplied;
+            privateSource.transmissionApplied = command.transmissionApplied;
+
+            if(privateSource.pathingRequested)
+            {
+                if(m_pathingSourceCount < m_pathingSourceLimit)
+                {
+                    pathingCommit |= CreatePathingSource(privateSource);
+                }
+                else
+                {
+                    m_pathingQueue.push_back(command.id);
+                    privateSource.snapshot->SetPathingCapacity(SnapshotSource::PathingCapacity::Waiting);
+                }
+            }
+
             m_privateSources[command.id] = privateSource;
         }
         else
@@ -2322,6 +3220,16 @@ void SteamAudioSimulation::ApplyWorkerCommands(const std::vector<WorkerCommand>&
                     commit = true;
                 }
 
+                if(found->second.pathingSource)
+                {
+                    iplSourceRemove(found->second.pathingSource, m_pathingSimulator);
+                    pathingRemoved.push_back(found->second.pathingSource);
+                    pathingCommit = true;
+                    --m_pathingSourceCount;
+                }
+
+                std::erase(m_pathingQueue, command.id);
+
                 m_reflectionSourceCount -= found->second.reflectionCapable ? 1 : 0;
                 m_privateSources.erase(found);
                 const std::lock_guard lock(m_mutex);
@@ -2341,6 +3249,28 @@ void SteamAudioSimulation::ApplyWorkerCommands(const std::vector<WorkerCommand>&
     if(commit)
     {
         iplSimulatorCommit(m_simulator);
+    }
+
+    if(m_pathingSimulator)
+    {
+        ServePathingQueue(pathingCommit);
+    }
+
+    if(pathingCommit)
+    {
+        iplSimulatorCommit(m_pathingSimulator);
+    }
+
+    // Out of the pathing simulator's run list since the commit, and never reachable by the plugin: nothing else holds them.
+    for(IPLSource& source : pathingRemoved)
+    {
+        iplSourceRelease(&source);
+    }
+
+    if(!pathingRemoved.empty())
+    {
+        const std::lock_guard lock(m_mutex);
+        m_stats.pathingSourcesReleased += pathingRemoved.size();
     }
 
     if(!m_retiredEmbreeInstances.empty())
@@ -2395,8 +3325,7 @@ void SteamAudioSimulation::RebuildEmbreeRoot() noexcept
     }
 
     iplSceneCommit(root);
-    iplSimulatorSetScene(m_simulator, root);
-    iplSimulatorCommit(m_simulator);
+    SetSimulatorScenes(root);
     m_reflectionAccumulationStale.store(true, std::memory_order_relaxed);
 
     for(const SourceId id : failed)
@@ -2456,9 +3385,21 @@ bool SteamAudioSimulation::EnsureRootAcousticScene() noexcept
         return false;
     }
 
-    iplSimulatorSetScene(m_simulator, m_acousticRoot);
-    iplSimulatorCommit(m_simulator);
+    SetSimulatorScenes(m_acousticRoot);
     return true;
+}
+
+// M9.3: one scene, both simulators (M9.0 E4: shared on Default and Embree, each simulator committed after the scene). Exclusive gate.
+void SteamAudioSimulation::SetSimulatorScenes(IPLScene scene) noexcept
+{
+    iplSimulatorSetScene(m_simulator, scene);
+    iplSimulatorCommit(m_simulator);
+
+    if(m_pathingSimulator)
+    {
+        iplSimulatorSetScene(m_pathingSimulator, scene);
+        iplSimulatorCommit(m_pathingSimulator);
+    }
 }
 
 // One sub-scene per distinct geometry: vertices through the single coordinate helper, with triangles wound the other way,
@@ -2657,6 +3598,12 @@ void SteamAudioSimulation::CommitAcousticScene() noexcept
         iplSceneCommit(m_acousticRoot);
     }
 
+    // M9.3: as M9.0 verified the shared scene, the pathing simulator is committed after the scene it reads.
+    if(m_pathingSimulator)
+    {
+        iplSimulatorCommit(m_pathingSimulator);
+    }
+
     const double commit = Microseconds(start, Clock::now());
     std::uint64_t triangles = 0;
 
@@ -2802,8 +3749,18 @@ void SteamAudioSimulation::SimulateAndPublish(const InputFrame& frame) noexcept
 
         if(found->second.realSource)
         {
-            inputs.source = framePose.pose;
-            iplSourceSetInputs(found->second.realSource, IPL_SIMULATIONFLAGS_DIRECT, &inputs);
+            // M9.5: a source simulating pathing traces volumetric occlusion, so the share pathing makes up changes gradually across an
+            // edge instead of flipping (M9.5 E9). Everyone else keeps the single ray.
+            IPLSimulationInputs sourceInputs = inputs;
+            sourceInputs.source = framePose.pose;
+
+            if(found->second.pathingSource && !frame.controls.volumetricOcclusion)
+            {
+                sourceInputs.occlusionType = IPL_OCCLUSIONTYPE_VOLUMETRIC;
+                sourceInputs.numOcclusionSamples = m_pathingOcclusionSamples;
+            }
+
+            iplSourceSetInputs(found->second.realSource, IPL_SIMULATIONFLAGS_DIRECT, &sourceInputs);
         }
     }
 
@@ -2840,6 +3797,24 @@ void SteamAudioSimulation::SimulateAndPublish(const InputFrame& frame) noexcept
             slot.transmission[band] = outputs.direct.transmission[band];
         }
 
+        // M9.5: what the plugin will let through of this direct path, by Steam Audio's own rule (direct_effect.cpp): occlusion alone, or
+        // occlusion + (1 - occlusion) * transmission, transmission averaged over the bands as the frequency-independent mode does and as the
+        // frequency-dependent one does on average. A spatializer that doesn't apply the simulation's occlusion lets everything through.
+        if(privateSource.pathingSource)
+        {
+            float visibility = 1.0f;
+
+            if(privateSource.occlusionApplied)
+            {
+                const float occlusion = std::clamp(outputs.direct.occlusion, 0.0f, 1.0f);
+                const float transmission = privateSource.transmissionApplied ? std::clamp((outputs.direct.transmission[0] + outputs.direct.transmission[1] +
+                    outputs.direct.transmission[2]) / 3.0f, 0.0f, 1.0f) : 0.0f;
+                visibility = occlusion + (1.0f - occlusion) * transmission;
+            }
+
+            privateSource.snapshot->SetDirectVisibility(std::isfinite(visibility) ? visibility : 1.0f);
+        }
+
         if(frame.controls.publishFilter)
         {
             frame.controls.publishFilter(slot);
@@ -2856,6 +3831,32 @@ void SteamAudioSimulation::SimulateAndPublish(const InputFrame& frame) noexcept
         ++published;
     }
 
+    // M9.2, verification only until a pathing simulator exists: synthetic results through the production pathing channel, as a
+    // pathing run on this worker will publish them.
+    std::uint64_t pathingPublished = 0;
+    std::uint64_t pathingAltered = 0;
+
+    // Never to a source with a pathing source: pathing runs publish to that one on the reflection worker, and each channel has one writer.
+    if(frame.controls.syntheticPathing)
+    {
+        SteamAudioPathingSnapshot synthetic = *frame.controls.syntheticPathing;
+
+        for(int repeat = 0; repeat < std::max(frame.controls.syntheticPathingRepeats, 1); ++repeat)
+        {
+            for(auto& [id, privateSource] : m_privateSources)
+            {
+                if(privateSource.pathingSource)
+                {
+                    continue;
+                }
+
+                synthetic.generation = m_generation * 1000u + static_cast<std::uint32_t>(repeat);
+                pathingAltered += privateSource.snapshot->PublishPathing(synthetic) ? 0 : 1;
+                ++pathingPublished;
+            }
+        }
+    }
+
     const auto end = Clock::now();
     const double simulation = Microseconds(simulationStart, publicationStart);
     const double publication = Microseconds(publicationStart, end);
@@ -2863,6 +3864,8 @@ void SteamAudioSimulation::SimulateAndPublish(const InputFrame& frame) noexcept
     const std::lock_guard lock(m_mutex);
     ++m_stats.simulationRuns;
     m_stats.snapshotsPublished += published;
+    m_stats.pathingSnapshotsPublished += pathingPublished;
+    m_stats.pathingSnapshotsAltered += pathingAltered;
     m_stats.publicationsSkipped += skipped;
     m_stats.lastSimulationMicroseconds = simulation;
     m_stats.maximumSimulationMicroseconds = std::max(m_stats.maximumSimulationMicroseconds, simulation);
@@ -2899,6 +3902,54 @@ SteamAudioSimulationStats SteamAudioSimulation::GetStats() const
 {
     const std::lock_guard lock(m_mutex);
     return m_stats;
+}
+
+std::optional<AudioSystem::PathingEventStatus> SteamAudioSimulation::GetPathingStatus(const FMOD::Studio::EventInstance& instance) const
+{
+    const std::lock_guard lock(m_mutex);
+
+    for(const auto& [dsp, active] : m_activeSources)
+    {
+        if(active.instance != &instance || !active.snapshot)
+        {
+            continue;
+        }
+
+        AudioSystem::PathingEventStatus status;
+        status.available = m_pathingSimulator != nullptr;
+        status.requested = active.pathingRequested;
+
+        switch(active.snapshot->GetPathingCapacity())
+        {
+        case SnapshotSource::PathingCapacity::Simulating:
+            status.capacity = AudioSystem::PathingEventStatus::Capacity::Simulating;
+            break;
+        case SnapshotSource::PathingCapacity::Waiting:
+            status.capacity = AudioSystem::PathingEventStatus::Capacity::Waiting;
+            break;
+        case SnapshotSource::PathingCapacity::NotRequested:
+            status.capacity = AudioSystem::PathingEventStatus::Capacity::NotRequested;
+            break;
+        }
+
+        status.batch = active.snapshot->PathingBatchShown();
+        status.sourceCovered = active.snapshot->PathingSourceCovered();
+        status.listenerCovered = active.snapshot->PathingListenerCovered();
+        status.gain = active.snapshot->PathingGainShown();
+        status.applyPathing = active.pathingApplied;
+        status.authoredApplyPathing = active.pathingAuthored;
+        status.occlusionApplied = active.occlusionApplied;
+        status.transmissionApplied = active.transmissionApplied;
+        return status;
+    }
+
+    return std::nullopt;
+}
+
+std::vector<AudioSystem::PathingSegment> SteamAudioSimulation::GetPathingSegments() const
+{
+    const std::lock_guard lock(m_mutex);
+    return m_pathingSegments;
 }
 
 std::vector<SteamAudioSourceSnapshot> SteamAudioSimulation::GetSnapshots() const
@@ -2962,6 +4013,7 @@ void SteamAudioSimulation::SetTestControls(const SteamAudioSimulationTestControl
     }
 
     SetSnapshotReadObserver(controls.readObserver);
+    SetPathingReadObserver(controls.pathingReadObserver);
 
     if(!m_simulator || !controls.scene)
     {

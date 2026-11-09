@@ -112,6 +112,16 @@ void Engine::ProcessEditorGamePlay(FileSceneRuntime* runtime, double elapsedSeco
         }
         else
         {
+            // M8.3: a probe generation or bake must have stopped before gameplay simulation touches Steam Audio. The Editor sees the
+            // cancelled job on its next poll and reports it; nothing it produced is published into a playing scene.
+            const auto waited = m_audio.StopAcousticJob();
+            const double waitedMs = std::chrono::duration<double, std::milli>(waited).count();
+
+            if(waitedMs >= 1.0)
+            {
+                Log::Info("Play: waited " + std::to_string(waitedMs) + " ms for the acoustic job to stop.");
+            }
+
             // Editor Play compiles scripts from the project's saved source files.
             const auto scripts = [this](Scripting::ScriptHost& host, const AssetID& asset, Scripting::ModuleID& module)
             {
@@ -131,6 +141,14 @@ void Engine::ProcessEditorGamePlay(FileSceneRuntime* runtime, double elapsedSeco
             acousticAssets.probeBatch = [this](const std::string& reference, std::string* probeError)
             {
                 return ProbeBatchAssets::Resolve(reference, GetActiveProject().GetPaths(), m_projectAssetRegistry, probeError);
+            };
+            acousticAssets.bakedReflections = [this](const std::string& reference)
+            {
+                return BakedReflectionsAssets::Resolve(reference, GetActiveProject().GetPaths(), m_projectAssetRegistry);
+            };
+            acousticAssets.bakedPathing = [this](const std::string& reference)
+            {
+                return BakedPathingAssets::Resolve(reference, GetActiveProject().GetPaths(), m_projectAssetRegistry);
             };
             m_gameRuntime.SetAcousticAssets(std::move(acousticAssets));
             // Saved settings apply from each Play: bounces are an input to each simulation run, so no reload or rebuild is needed.

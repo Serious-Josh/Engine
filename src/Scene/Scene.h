@@ -84,6 +84,12 @@ class Scene
         return !m_hierarchy.parentSlots.empty();
     }
 
+    // Every object's authored world, by slot: what the document describes, without physics presentation poses or gameplay-only runtime
+    // locals. Roots use their transform's model matrix; parented objects are evaluated through the hierarchy exactly as authored
+    // validation evaluates them (EvaluateHierarchyEdit). Outside gameplay it equals the presented world bit for bit. Acoustic validity
+    // (probe and bake fingerprints) reads this, so a physics pose's rounding never makes generated or baked data look stale.
+    bool ComputeAuthoredWorlds(std::vector<Matrix4>& worlds, std::string* error = nullptr) const;
+
     // True when the installed hierarchy gives this slot a parent.
     bool HasHierarchyParent(RenderObjectID id) const noexcept
     {

@@ -18,6 +18,9 @@
 #include "ViewportIcons.h"
 #include "Engine/ProbeAssetCleanup.h"
 #include "Engine/ProbeVolumes.h"
+#include "Engine/PathingBakes.h"
+#include "Engine/ReflectionBakeJobs.h"
+#include "Engine/ReflectionBakeStatus.h"
 #include "assets/ProbeBatchAsset.h"
 #include "Scene/FileSceneAssetCatalog.h"
 #include "Project/ProjectContext.h"
@@ -27,8 +30,11 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <chrono>
+#include <deque>
 #include <filesystem>
 #include <limits>
+#include <map>
 #include <optional>
 #include <string>
 #include <vector>
@@ -137,6 +143,14 @@ public:
     void SetBackgroundTasks(BackgroundTaskManager* manager) noexcept
     {
         m_backgroundTasks = manager;
+    }
+
+    // Engine reports whether the scene's acoustic meshes have loaded: nullopt when ready, otherwise why not. Baking and probe
+    // generation read that geometry, so they refuse until it is ready. Unset means ready.
+    using AcousticGeometryReadiness = std::function<std::optional<std::string>(const FileBackedDemoScene&)>;
+    void SetAcousticGeometryReadiness(AcousticGeometryReadiness readiness)
+    {
+        m_acousticGeometryReadiness = std::move(readiness);
     }
 
     bool TakeScriptRefreshRequest()
@@ -289,6 +303,10 @@ public:
     };
     std::optional<LightObjectCreationRequest> TakeLightObjectCreationRequest();
     void OnLightObjectCreationFailed(const std::string& error);
+    // Hierarchy "Steam Audio > Probe Volume": same eligibility and identity as Camera creation.
+    using ProbeVolumeObjectCreationRequest = EmptyObjectCreationRequest;
+    std::optional<ProbeVolumeObjectCreationRequest> TakeProbeVolumeObjectCreationRequest();
+    void OnProbeVolumeObjectCreationFailed(const std::string& error);
     struct MeshCreationRequest
     {
         std::string meshReference;
@@ -440,8 +458,34 @@ public:
         std::string objectID;
         std::vector<std::byte> encoded;
     };
-    // M7.1: applies a finished background generation, and cancels one that lost its scene. Runs every frame, whatever is selected.
-    void PollProbeGeneration(IDemoScene& scene);
+    // M7.1, M8.3: applies finished acoustic jobs (probe generation and reflection baking), cancels any that lost their scene, and
+    // refreshes the bake status the Inspector and Scene Hierarchy show. Runs every frame, whatever is selected.
+    void PollAcousticJobs(IDemoScene& scene, const ProjectPaths& paths, const ProjectAssetRegistry& registry);
+    // M8.3: Engine stores a validated bake on the Editor's behalf, as for probes.
+    struct ReflectionBakeStoreRequest
+    {
+        std::string objectID;
+        std::vector<std::byte> encoded;
+    };
+    std::optional<ReflectionBakeStoreRequest> TakeReflectionBakeStoreRequest()
+    {
+        return std::exchange(m_reflectionBakeStoreRequest, std::nullopt);
+    }
+    void OnReflectionBakeStoreCompleted(IDemoScene& scene, const std::string& objectID, const std::string& reference, const std::string& error);
+    // M9.6: the same for a baked pathing asset.
+    std::optional<ReflectionBakeStoreRequest> TakePathingStoreRequest()
+    {
+        return std::exchange(m_pathingStoreRequest, std::nullopt);
+    }
+    void OnPathingStoreCompleted(IDemoScene& scene, const std::string& objectID, const std::string& reference, const std::string& error);
+    // M9.6, display only: Play-mode pathing status per Audio Source object. Engine supplies it from the game session's events.
+    using PathingStatusProvider = std::function<std::optional<Audio::AudioSystem::PathingEventStatus>(std::string_view objectID)>;
+    void SetPathingStatusProvider(PathingStatusProvider provider)
+    {
+        m_pathingStatusProvider = std::move(provider);
+    }
+    // After AudioSystem::Shutdown has stopped and joined the acoustic job: finishes every task it left open as cancelled.
+    void StopAcousticWork(std::string_view reason);
     struct ProbeCleanupRequest
     {
         std::set<std::string> liveReferences;
@@ -577,6 +621,7 @@ private:
     std::optional<EmptyObjectCreationRequest> m_emptyObjectCreationRequest;
     std::optional<CameraObjectCreationRequest> m_cameraObjectCreationRequest;
     std::optional<LightObjectCreationRequest> m_lightObjectCreationRequest;
+    std::optional<ProbeVolumeObjectCreationRequest> m_probeVolumeObjectCreationRequest;
     std::string m_meshCreationStatus;
 
     std::uint64_t m_meshDragRuntimeIdentity = 0;
@@ -750,6 +795,9 @@ private:
     EditorWorkspace m_workspace;
     BackgroundTasksUI m_backgroundTasksUI;
     BackgroundTaskManager* m_backgroundTasks = nullptr;
+    AcousticGeometryReadiness m_acousticGeometryReadiness;
+    // Why the scene's acoustic geometry cannot be read yet, or nullopt.
+    std::optional<std::string> AcousticGeometryNotReady(const IDemoScene& scene) const;
     SceneHierarchyPanel m_hierarchyPanel;
 
     InspectorPanel m_inspectorPanel;
@@ -1089,7 +1137,13 @@ private:
         const std::optional<ProbeVolumeComponent>& after);
     void RefreshProbeView(const FileBackedDemoScene& owner, const IDemoScene& scene, const SceneObjectDocument& object, const ProjectPaths& paths,
         const ProjectAssetRegistry& registry);
-    void GenerateProbes(IDemoScene& scene, const FileBackedDemoScene& owner, const SceneObjectDocument& object);
+    // `parent`, when given, is the bake that needs these probes; otherwise the generation is a root task of its own.
+    bool GenerateProbes(IDemoScene& scene, const FileBackedDemoScene& owner, const SceneObjectDocument& object,
+        BackgroundTaskId parent = InvalidBackgroundTaskId);
+    void PollProbeGeneration(IDemoScene& scene);
+    void UpdateProbeGenerationTask();
+    // Whether a Probe Volume edit would be accepted now (CommitObjectProbeVolume's own preconditions).
+    bool CanEditProbeVolumes(const IDemoScene& scene) const;
     void DrawProbeGenerationProgress();
     void DrawProbeCleanup(const FileBackedDemoScene& owner, const ProjectPaths& paths, const ProjectAssetRegistry& registry, bool blocked);
     // What undo, redo and the open document can still bring back.
@@ -1101,11 +1155,15 @@ private:
         std::uint64_t fingerprint = 0;
         std::vector<std::string> skippedObjects;
         SceneHistorySession session;
+        BackgroundTaskHandle task;
     };
     std::optional<ProbeGeneration> m_probeGeneration;
+    // A generation's task stays open until Engine has stored the probes and the reference is committed.
+    BackgroundTaskHandle m_probePublishTask;
     std::optional<ProbeAssetCleanup::Report> m_probeCleanupReport;
     std::optional<ProbeCleanupRequest> m_probeCleanupRequest;
-    void DrawProbeVolumeOverlay(const IDemoScene& scene, ImDrawList& draw, const std::function<std::optional<ImVec2>(const Vector3&)>& project) const;
+    void DrawProbeVolumeOverlay(const IDemoScene& scene, ImDrawList& draw, const Matrix4& viewProjection, ImVec2 origin, ImVec2 size) const;
+    void DrawPathingOverlay(const FileBackedDemoScene& owner, ImDrawList& draw, const Matrix4& viewProjection, ImVec2 origin, ImVec2 size) const;
     std::string m_probeEditStatus;
     ProbeVolumeComponent m_probeDraft;
     ProbeVolumeComponent m_probeDraftBase;
@@ -1113,6 +1171,116 @@ private:
     ProbeView m_probeView;
     ProbeOverlay m_probeOverlay;
     std::optional<ProbeBatchRequest> m_probeBatchRequest;
+    // M8.3 reflection baking (ReflectionBakeControls.cpp). One run at a time: Bake All, or one volume. Both go through the same
+    // per-volume steps, so they share every check. A run processes its volumes one after another and continues past a volume that
+    // fails; cancelling the run stops it after the current volume's job has stopped.
+    struct ReflectionBakeVolume
+    {
+        std::string objectID;
+        std::string name;
+        // Bake All only: the volume's child task. A single-volume run reports on the run's own task.
+        BackgroundTaskHandle task;
+        std::vector<BackgroundTaskHandle> layers;
+        std::shared_ptr<Audio::ReflectionBakeJob> job;
+        ReflectionBakeJobs::Expectation expected;
+        std::size_t reused = 0;
+        // What the finished bake ran on, for the report.
+        Audio::SteamAudioRayTracer rayTracer = Audio::SteamAudioRayTracer::Default;
+        bool probesRequested = false;
+        bool waitingForProbes = false;
+        // The validated result, waiting for the scene to accept an edit.
+        std::vector<std::byte> encoded;
+        bool storing = false;
+    };
+    struct ReflectionBakeRun
+    {
+        bool all = false;
+        bool force = false;
+        SceneHistorySession session;
+        BackgroundTaskHandle task;
+        std::deque<std::string> pending;
+        std::optional<ReflectionBakeVolume> current;
+        std::size_t total = 0;
+        std::size_t baked = 0;
+        std::size_t upToDate = 0;
+        std::size_t failed = 0;
+        std::size_t cancelled = 0;
+        std::string firstFailure;
+        // Set once the run must end: cancelled, Play started or the scene went. The current job is stopped first.
+        std::string stopReason;
+    };
+    enum class BakeVolumeOutcome
+    {
+        Baked,
+        UpToDate,
+        Failed,
+        Cancelled
+    };
+    ReflectionBakeStatus::Host MakeReflectionBakeHost(const FileBackedDemoScene& owner, const IDemoScene& scene, const ProjectPaths& paths,
+        const ProjectAssetRegistry& registry) const;
+    void StartReflectionBake(IDemoScene& scene, std::vector<std::string> objectIDs, bool all, bool force, const std::string& title);
+    void StartBakeAll(IDemoScene& scene, bool force);
+    void PollReflectionBake(IDemoScene& scene, const ProjectPaths& paths, const ProjectAssetRegistry& registry);
+    void BeginBakeVolume(IDemoScene& scene, FileBackedDemoScene& owner, const ProjectPaths& paths, const ProjectAssetRegistry& registry);
+    void UpdateBakeVolumeTasks();
+    void FinishBakedJob();
+    void FinishBakeVolume(BakeVolumeOutcome outcome, const std::string& message);
+    void FinishReflectionBakeRun();
+    BackgroundTaskHandle& BakeVolumeTask();
+    void DrawReflectionBakeControls(IDemoScene& scene, const SceneObjectMetadata& selection, const SceneObjectDocument& object, bool blocked);
+    // The hierarchy's warning: the volume has baked data that no longer fully matches the scene. Null when it has none.
+    const char* ReflectionBakeWarning(std::string_view objectID) const;
+    std::optional<ReflectionBakeRun> m_reflectionBake;
+    std::optional<ReflectionBakeStoreRequest> m_reflectionBakeStoreRequest;
+    // The last attempt's error per volume, until it bakes successfully or the scene changes. Never touches published data.
+    std::map<std::string, std::string, std::less<>> m_reflectionBakeFailures;
+    ReflectionBakeStatus::Cache m_reflectionBakeStatus;
+    std::chrono::steady_clock::time_point m_reflectionBakeStatusNext{};
+    // The bounded fallback: the acoustic scene is recollected at least this often while editing.
+    std::chrono::steady_clock::time_point m_reflectionBakeRecollectNext{};
+    // From the Build menu, which has no mutable scene: Bake All (false) or Force Rebake All (true), started at the next poll.
+    std::optional<bool> m_bakeAllRequest;
+    std::string m_reflectionBakeMessage;
+    // M9.6 pathing baking (PathingBakeControls.cpp). One volume at a time, never alongside another acoustic job. The SDK call cannot be
+    // interrupted (Steam Audio 4.8.1 crashes on iplPathBakerCancelBake), so a cancel or Play waits for it to return, then discards it.
+    struct PathingBakeRun
+    {
+        std::string objectID;
+        std::string name;
+        SceneHistorySession session;
+        BackgroundTaskHandle task;
+        std::shared_ptr<Audio::PathingBakeJob> job;
+        // Exactly what was baked: the volume as it was, its probes, and the inputs that fingerprint them.
+        ProbeVolumeComponent volume;
+        ProbeBatchAssets::Data probes;
+        PathingBakes::Inputs inputs;
+        std::vector<std::byte> encoded;
+        bool storing = false;
+        std::string stopReason;
+    };
+    struct PathingStatusEntry
+    {
+        PathingBakes::Status status;
+        std::size_t probes = 0;
+        std::chrono::steady_clock::time_point next{};
+    };
+    PathingBakes::Inputs CurrentPathingInputs(const FileBackedDemoScene& owner, const IDemoScene& scene, const SceneObjectDocument& object,
+        const ProjectPaths& paths, const ProjectAssetRegistry& registry, std::optional<ProbeBatchAssets::Data>& probes,
+        std::vector<Audio::ProbeGeometryObject>* geometry) const;
+    const PathingStatusEntry& RefreshPathingStatus(const IDemoScene& scene, const SceneObjectDocument& object, const ProjectPaths& paths,
+        const ProjectAssetRegistry& registry);
+    void StartPathingBake(IDemoScene& scene, const SceneObjectDocument& object, const ProjectPaths& paths, const ProjectAssetRegistry& registry);
+    void PollPathingBake(IDemoScene& scene, const ProjectPaths& paths, const ProjectAssetRegistry& registry);
+    void FinishPathingBake(bool success, bool failed, const std::string& message);
+    void DrawPathingControls(IDemoScene& scene, const ProjectPaths& paths, const ProjectAssetRegistry& registry, const SceneObjectMetadata& selection, const SceneObjectDocument& object, bool blocked);
+    void DrawAudioSourcePathingStatus(const IDemoScene& scene, const SceneObjectDocument& object);
+    std::optional<PathingBakeRun> m_pathingBake;
+    std::optional<ReflectionBakeStoreRequest> m_pathingStoreRequest;
+    std::map<std::string, PathingStatusEntry, std::less<>> m_pathingStatus;
+    std::string m_pathingMessage;
+    PathingStatusProvider m_pathingStatusProvider;
+    // Whether the viewport shows pathing (probes, coverage and the SDK's walked segments).
+    bool m_pathingOverlay = false;
     std::string m_acousticEditStatus;
     std::array<char, 128> m_acousticMaterialSearch{};
     enum class AudioComponentKind

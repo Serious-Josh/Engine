@@ -18,6 +18,14 @@ bool PrepareSceneObjectDuplicate(const FileSceneRuntime& scene,std::string_view 
         snapshot.camera->main = false;
     }
 
+    // As in SceneHierarchy::DuplicateSubtree: the copy starts without generated probes, baked reflections or baked pathing.
+    if(snapshot.probeVolume)
+    {
+        snapshot.probeVolume->probeBatch.clear();
+        snapshot.probeVolume->bakedReflections.clear();
+        snapshot.probeVolume->bakedPathing.clear();
+    }
+
     const auto& document=scene.GetFileScene().GetDocument();
     snapshot.name=UniqueDuplicateObjectName(snapshot.name,document);
     do

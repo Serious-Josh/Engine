@@ -642,6 +642,40 @@ void AudioSystem::SetSteamAudioReflectionBounces(int bounces) noexcept
 #endif
 }
 
+bool AudioSystem::SetEventBakedSourceReflections(EventHandle handle, const ReflectionLayerIdentifier& baked)
+{
+#if defined(ENGINE_HAS_STEAMAUDIO)
+    FMOD::Studio::EventInstance* instance = m_impl->ResolveEvent(handle);
+
+    if(!instance || !m_impl->steamAudioSimulation || baked.kind != ReflectionLayerKind::StaticSource)
+    {
+        return false;
+    }
+
+    // The stored identifier, bit for bit.
+    IPLBakedDataIdentifier identifier{};
+    identifier.type = IPL_BAKEDDATATYPE_REFLECTIONS;
+    identifier.variation = IPL_BAKEDDATAVARIATION_STATICSOURCE;
+    identifier.endpointInfluence = IPLSphere{IPLVector3{baked.centre[0], baked.centre[1], baked.centre[2]}, baked.radius};
+    return m_impl->steamAudioSimulation->SetSourceCentricRequest(*instance, true, &identifier);
+#else
+    static_cast<void>(handle);
+    static_cast<void>(baked);
+    return false;
+#endif
+}
+
+bool AudioSystem::DisableEventBakedReflections(EventHandle handle)
+{
+#if defined(ENGINE_HAS_STEAMAUDIO)
+    FMOD::Studio::EventInstance* instance = m_impl->ResolveEvent(handle);
+    return instance && m_impl->steamAudioSimulation && m_impl->steamAudioSimulation->DisableBakedReflections(*instance);
+#else
+    static_cast<void>(handle);
+    return false;
+#endif
+}
+
 bool AudioSystem::SetEventSourceCentricReflections(EventHandle handle, bool enabled)
 {
 #if defined(ENGINE_HAS_STEAMAUDIO)
@@ -653,6 +687,34 @@ bool AudioSystem::SetEventSourceCentricReflections(EventHandle handle, bool enab
     static_cast<void>(enabled);
     return false;
 #endif
+}
+
+bool AudioSystem::SetEventPathing(EventHandle handle, bool enabled)
+{
+#if defined(ENGINE_HAS_STEAMAUDIO)
+    FMOD::Studio::EventInstance* instance = m_impl->ResolveEvent(handle);
+
+    return instance && m_impl->steamAudioSimulation && m_impl->steamAudioSimulation->SetPathingRequest(*instance, enabled);
+#else
+    static_cast<void>(handle);
+    static_cast<void>(enabled);
+    return false;
+#endif
+}
+
+std::optional<AudioSystem::PathingEventStatus> AudioSystem::GetEventPathingStatus(EventHandle handle) const
+{
+#if defined(ENGINE_HAS_STEAMAUDIO)
+    FMOD::Studio::EventInstance* instance = m_impl->ResolveEvent(handle);
+
+    if(instance && m_impl->steamAudioSimulation)
+    {
+        return m_impl->steamAudioSimulation->GetPathingStatus(*instance);
+    }
+#else
+    static_cast<void>(handle);
+#endif
+    return std::nullopt;
 }
 
 bool AudioSystem::ReleaseEvent(EventHandle handle)

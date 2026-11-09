@@ -706,6 +706,11 @@ namespace
                 {
                     objects.back()["audioSource"]["bakedReflections"] = true;
                 }
+
+                if(object.audioSource->pathing)
+                {
+                    objects.back()["audioSource"]["pathing"] = true;
+                }
             }
 
             if(object.acoustics)
@@ -733,6 +738,44 @@ namespace
                 if(!volume.filterInsideSolids)
                 {
                     objects.back()["probeVolume"]["filterInsideSolids"] = false;
+                }
+
+                // M8.2, the same convention: absent means the defaults, and no baked data.
+                if(volume.bakeSettings != ReflectionBakeSettings{})
+                {
+                    objects.back()["probeVolume"]["bakeSettings"] = {
+                        {"rays", volume.bakeSettings.rays},
+                        {"diffuseSamples", volume.bakeSettings.diffuseSamples},
+                        {"bounces", volume.bakeSettings.bounces},
+                        {"irradianceMinimumDistance", volume.bakeSettings.irradianceMinimumDistance}
+                    };
+                }
+
+                if(!volume.bakedReflections.empty())
+                {
+                    objects.back()["probeVolume"]["bakedReflections"] = volume.bakedReflections;
+                }
+
+                // M9.5, the same convention.
+                if(!volume.pathingEnabled)
+                {
+                    objects.back()["probeVolume"]["pathingEnabled"] = false;
+                }
+
+                if(volume.pathingSettings != PathingBakeSettings{})
+                {
+                    objects.back()["probeVolume"]["pathingSettings"] = {
+                        {"samples", volume.pathingSettings.samples},
+                        {"radius", volume.pathingSettings.radius},
+                        {"threshold", volume.pathingSettings.threshold},
+                        {"visibilityRange", volume.pathingSettings.visibilityRange},
+                        {"pathRange", volume.pathingSettings.pathRange}
+                    };
+                }
+
+                if(!volume.bakedPathing.empty())
+                {
+                    objects.back()["probeVolume"]["bakedPathing"] = volume.bakedPathing;
                 }
             }
 
@@ -1069,7 +1112,8 @@ namespace
             if(item.contains("probeVolume"))
             {
                 const auto& value = item.at("probeVolume");
-                ValidateFields(value, {"enabled", "placement", "size", "probeSpacing", "heightAboveFloor", "manualProbes", "probeBatch", "filterInsideSolids"});
+                ValidateFields(value, {"enabled", "placement", "size", "probeSpacing", "heightAboveFloor", "manualProbes", "probeBatch", "filterInsideSolids",
+                    "bakeSettings", "bakedReflections", "pathingEnabled", "pathingSettings", "bakedPathing"});
                 ProbeVolumeComponent volume;
                 volume.enabled = value.at("enabled").get<bool>();
                 volume.placement = ProbePlacementFromString(value.at("placement").get<std::string>());
@@ -1077,8 +1121,36 @@ namespace
                 volume.probeSpacing = value.at("probeSpacing").get<float>();
                 volume.heightAboveFloor = value.at("heightAboveFloor").get<float>();
                 volume.manualProbes = value.at("manualProbes").get<std::vector<std::array<float, 3>>>();
-                volume.probeBatch = value.at("probeBatch").get<std::string>();
+                // A generated reference like bakedReflections and bakedPathing: absent means no probes generated yet. A present value of the
+                // wrong type is still refused, by value().
+                volume.probeBatch = value.value("probeBatch", std::string{});
                 volume.filterInsideSolids = value.value("filterInsideSolids", true);
+
+                if(value.contains("bakeSettings"))
+                {
+                    const auto& bake = value.at("bakeSettings");
+                    ValidateFields(bake, {"rays", "diffuseSamples", "bounces", "irradianceMinimumDistance"});
+                    volume.bakeSettings.rays = bake.at("rays").get<std::uint32_t>();
+                    volume.bakeSettings.diffuseSamples = bake.at("diffuseSamples").get<std::uint32_t>();
+                    volume.bakeSettings.bounces = bake.at("bounces").get<std::uint32_t>();
+                    volume.bakeSettings.irradianceMinimumDistance = bake.at("irradianceMinimumDistance").get<float>();
+                }
+
+                volume.bakedReflections = value.value("bakedReflections", std::string{});
+                volume.pathingEnabled = value.value("pathingEnabled", true);
+
+                if(value.contains("pathingSettings"))
+                {
+                    const auto& pathing = value.at("pathingSettings");
+                    ValidateFields(pathing, {"samples", "radius", "threshold", "visibilityRange", "pathRange"});
+                    volume.pathingSettings.samples = pathing.at("samples").get<std::uint32_t>();
+                    volume.pathingSettings.radius = pathing.at("radius").get<float>();
+                    volume.pathingSettings.threshold = pathing.at("threshold").get<float>();
+                    volume.pathingSettings.visibilityRange = pathing.at("visibilityRange").get<float>();
+                    volume.pathingSettings.pathRange = pathing.at("pathRange").get<float>();
+                }
+
+                volume.bakedPathing = value.value("bakedPathing", std::string{});
                 std::string volumeError;
 
                 if(!ValidateProbeVolume(volume, &volumeError))
@@ -1092,7 +1164,7 @@ namespace
             if(item.contains("audioSource"))
             {
                 const auto& value = item.at("audioSource");
-                ValidateFields(value, {"enabled", "eventGuid", "eventPath", "autoplay", "sourceCentricReflections", "bakedReflections"});
+                ValidateFields(value, {"enabled", "eventGuid", "eventPath", "autoplay", "sourceCentricReflections", "bakedReflections", "pathing"});
 
                 if(!value.at("enabled").is_boolean() || !value.at("eventGuid").is_string() ||
                     !value.at("eventPath").is_string() || !value.at("autoplay").is_boolean())
@@ -1124,6 +1196,16 @@ namespace
                     }
 
                     source.bakedReflections = value.at("bakedReflections").get<bool>();
+                }
+
+                if(value.contains("pathing"))
+                {
+                    if(!value.at("pathing").is_boolean())
+                    {
+                        throw std::runtime_error("Invalid Audio Source field types for object " + object.id + ".");
+                    }
+
+                    source.pathing = value.at("pathing").get<bool>();
                 }
 
                 std::string sourceError;

@@ -74,6 +74,10 @@ bool ValidateAssetRecord(const AssetRecord& record)
             break;
         case AssetType::ProbeBatch:
             return IsCanonicalContentPath(record.relativePath, "Content/Audio/Probes/", L".probebatch");
+        case AssetType::BakedReflections:
+            return IsCanonicalContentPath(record.relativePath, "Content/Audio/Probes/", L".bakedreflections");
+        case AssetType::BakedPathing:
+            return IsCanonicalContentPath(record.relativePath, "Content/Audio/Probes/", L".bakedpathing");
         case AssetType::Script:
             return IsCanonicalContentPath(record.relativePath, "Content/Scripts/", L".as");
         case AssetType::AudioBank:

@@ -1,5 +1,8 @@
 #include "Engine/ProbeVolumes.h"
 #include "Engine/GameRuntime.h"
+#include "Engine/BakedReverbRuntime.h"
+#include "Engine/PathingBakes.h"
+#include "Engine/ReflectionBakes.h"
 #include "Engine/AcousticGeometry.h"
 
 #include <map>
@@ -571,23 +574,35 @@ void GameRuntime::PublishAcousticScene(FileSceneRuntime& runtime)
 }
 
 // M7: stale probes are refused rather than loaded, so what M8 consumes always describes the scene that is playing.
-void GameRuntime::LoadProbeVolumes(FileSceneRuntime& runtime)
+void GameRuntime::LoadProbeVolumes(FileSceneRuntime& runtime, bool listenerBaked)
 {
     const SceneDocument& document = runtime.GetFileScene().GetDocument();
     const auto& mapping = runtime.GetObjectMapping().idToRuntimeIndex;
     const auto& renderObjects = runtime.GetScene().GetRenderObjects();
 
     ProbeVolumes::SceneAccess access;
+    // Validity reads authored worlds: physics has already started, and a body presented through its pose differs from its authored
+    // transform in the last bits, which would make current probes and bakes look stale. The live simulation keeps the presented worlds
+    // (PublishAcousticScene).
+    std::vector<Matrix4> authoredWorlds;
+    std::string authoredError;
+
+    if(!runtime.GetScene().ComputeAuthoredWorlds(authoredWorlds, &authoredError))
+    {
+        Log::Warning("Probe Volumes: the authored scene could not be evaluated (" + authoredError + "); no probes or baked reflections are loaded.");
+        authoredWorlds.clear();
+    }
+
     access.world = [&](const SceneObjectDocument& object) -> std::optional<Audio::AcousticTransform>
     {
         const auto found = mapping.find(object.id);
 
-        if(found == mapping.end() || found->second >= renderObjects.size())
+        if(found == mapping.end() || found->second >= authoredWorlds.size())
         {
             return std::nullopt;
         }
 
-        return ToAcousticTransform(renderObjects[found->second].GetPresentationTransform().currentModel);
+        return ToAcousticTransform(authoredWorlds[found->second]);
     };
     access.mesh = [&](const SceneObjectDocument& object) -> const ImportedMesh*
     {
@@ -631,6 +646,80 @@ void GameRuntime::LoadProbeVolumes(FileSceneRuntime& runtime)
 
         m_audio.LoadProbeBatch(object.name, stored->batch, stored->probes.size());
     }
+
+    // M9.5: what opted-in Audio Sources may path through. Decided once, here, from the scene as it starts, independently of baked reflections.
+    const bool pathingWanted = std::any_of(document.objects.begin(), document.objects.end(), [](const SceneObjectDocument& object)
+    {
+        return object.audioSource && object.audioSource->enabled && object.audioSource->pathing;
+    });
+
+    if(pathingWanted)
+    {
+        PathingBakes::Loaders pathingLoaders;
+        pathingLoaders.probes = m_acousticAssets.probeBatch;
+        pathingLoaders.pathing = m_acousticAssets.bakedPathing;
+        const PathingBakes::Selection pathing = PathingBakes::Select(document, access, m_acousticAssets.material, pathingLoaders);
+
+        for(const PathingBakes::VolumeReport& report : pathing.reports)
+        {
+            if(report.eligible)
+            {
+                Log::Info("Probe Volume '" + report.name + "': baked pathing is current.");
+            }
+            else
+            {
+                Log::Warning("Probe Volume '" + report.name + "': its baked pathing is not used (" + report.reason + ").");
+            }
+        }
+
+        m_audio.SetPathingVolumes(pathing.volumes);
+    }
+
+    // M8.4 and M8.5: what the listener-centric reverb and static sources may use. Decided once, here, from the scene as it starts.
+    const bool sourcesBaked = std::any_of(document.objects.begin(), document.objects.end(), [](const SceneObjectDocument& object)
+    {
+        return object.audioSource && object.audioSource->enabled && object.audioSource->sourceCentricReflections && object.audioSource->bakedReflections;
+    });
+
+    if(!listenerBaked && !sourcesBaked)
+    {
+        m_audio.SetListenerBakedReflections(false);
+        return;
+    }
+
+    BakedReverbRuntime::Loaders loaders;
+    loaders.probes = m_acousticAssets.probeBatch;
+    loaders.baked = m_acousticAssets.bakedReflections;
+    const BakedReverbRuntime::Selection selection = BakedReverbRuntime::Select(document, access, m_acousticAssets.material, loaders);
+
+    for(const BakedReverbRuntime::VolumeReport& report : selection.reports)
+    {
+        if(report.eligible)
+        {
+            Log::Info("Probe Volume '" + report.name + "': baked reverb is current.");
+        }
+        else
+        {
+            Log::Warning("Probe Volume '" + report.name + "': its baked reverb is not used (" + report.reason + ").");
+        }
+    }
+
+    std::vector<GameAudioSession::BakedSource> sources;
+
+    for(const BakedReverbRuntime::SourceReport& report : selection.sourceReports)
+    {
+        if(!report.eligible)
+        {
+            Log::Warning("Audio Source '" + report.objectId + "': its baked reflections are not used (" + report.reason + ").");
+        }
+    }
+
+    for(const BakedReverbRuntime::BakedSource& source : selection.sources)
+    {
+        sources.push_back({source.objectId, source.identifier, source.position, ReflectionBakes::StaticSourceTolerance});
+    }
+
+    m_audio.SetBakedReflections(listenerBaked, selection.volumes, std::move(sources));
 }
 
 void GameRuntime::BeginSceneAudio(FileSceneRuntime& runtime)
@@ -655,7 +744,7 @@ void GameRuntime::BeginSceneAudio(FileSceneRuntime& runtime)
         {
             const auto& source = *object.audioSource;
             sources.push_back({object.id, object.name, source.eventGuid, source.enabled, source.autoplay, source.sourceCentricReflections,
-                source.bakedReflections});
+                source.bakedReflections, source.pathing});
         }
     }
 
@@ -671,9 +760,8 @@ void GameRuntime::BeginSceneAudio(FileSceneRuntime& runtime)
         return ResolveAudioPose(runtime, objectID);
     });
     m_audio.RegisterSceneSources(std::move(sources));
-    m_audio.SetListenerBakedReflections(listenerBaked);
     PublishAcousticScene(runtime);
-    LoadProbeVolumes(runtime);
+    LoadProbeVolumes(runtime, listenerBaked);
     // The listener is placed before any script code, so events scripts start in OnStart are heard from it.
     UpdateSceneAudio(runtime, 0.0);
 }

@@ -10,6 +10,8 @@
 #include "Renderer/MaterialTables/MaterialTableFile.h"
 #include "Platform/Windows/EditorDistributionPaths.h"
 #include "assets/CookedScene.h"
+#include "assets/BakedReflectionsAsset.h"
+#include "assets/BakedPathingAsset.h"
 #include "assets/CookedEnvironment.h"
 
 #include "Core/Log.h"
@@ -869,6 +871,10 @@ bool Engine::ChangeMeshImportUnits(const ProjectPaths& paths, const AssetBrowser
 
 void Engine::ProcessEditorMaterialRequests()
 {
+    // M8.3: before the physics gate, so Play or a physics simulation stops a running bake or generation at once. Nothing is
+    // published from here while edits are blocked: the stores below wait behind the gate, and the Editor refuses edits.
+    m_editor.PollAcousticJobs(m_demoSceneManager.GetActiveScene(), GetActiveProject().GetPaths(), m_projectAssetRegistry);
+
     if (PhysicsBlocksSceneEdits())
     {
         return;
@@ -887,8 +893,6 @@ void Engine::ProcessEditorMaterialRequests()
         m_editor.OnMaterialCreationCompleted(request->relativePath, error);
     }
 
-    m_editor.PollProbeGeneration(m_demoSceneManager.GetActiveScene());
-
     if(auto request = m_editor.TakeProbeBatchRequest())
     {
         std::string error;
@@ -900,6 +904,42 @@ void Engine::ProcessEditorMaterialRequests()
         }
 
         m_editor.OnProbeBatchRequestCompleted(m_demoSceneManager.GetActiveScene(), request->objectID, reference, error);
+    }
+
+    // M8.3: a new immutable asset; the Editor commits the reference, and the previous asset stays for undo and cleanup.
+    if(auto request = m_editor.TakeReflectionBakeStoreRequest())
+    {
+        std::string error;
+        std::string reference;
+
+        if(const auto stored = BakedReflectionsAssets::Store(GetActiveProject().GetPaths(), m_projectAssetRegistry, request->encoded, &error))
+        {
+            reference = *stored;
+        }
+        else if(error.empty())
+        {
+            error = "the asset could not be written";
+        }
+
+        m_editor.OnReflectionBakeStoreCompleted(m_demoSceneManager.GetActiveScene(), request->objectID, reference, error);
+    }
+
+    // M9.6: the same for baked pathing.
+    if(auto request = m_editor.TakePathingStoreRequest())
+    {
+        std::string error;
+        std::string reference;
+
+        if(const auto stored = BakedPathingAssets::Store(GetActiveProject().GetPaths(), m_projectAssetRegistry, request->encoded, &error))
+        {
+            reference = *stored;
+        }
+        else if(error.empty())
+        {
+            error = "the asset could not be written";
+        }
+
+        m_editor.OnPathingStoreCompleted(m_demoSceneManager.GetActiveScene(), request->objectID, reference, error);
     }
 
     if(const auto request = m_editor.TakeProbeCleanupRequest())
@@ -1518,7 +1558,12 @@ bool Engine::InitializeProjectIndependent(const EngineStartup& startup)
     }
     else
     {
-        m_audio.Initialize();
+        Audio::InitializeOptions audioOptions;
+#if !defined(NDEBUG) && defined(ENGINE_HAS_VERIFICATION)
+        // M10.6, verification builds only: FMOD's no-sound output, so measurements do not depend on the machine's audio device.
+        audioOptions.noSoundOutput = std::getenv("ENGINE_DIAG_AUDIO_NOSOUND") != nullptr;
+#endif
+        m_audio.Initialize(audioOptions);
     }
 
     // Audio.1C: gameplay audio sessions borrow the process's AudioSystem. Shutdown stops gameplay (ending its
@@ -1527,6 +1572,14 @@ bool Engine::InitializeProjectIndependent(const EngineStartup& startup)
     // Audio.2B: the Audio Source inspector lists and checks events of the project's loaded banks.
     m_editor.SetAudioSystem(&m_audio);
     m_editor.SetBackgroundTasks(&m_backgroundTasks);
+    m_editor.SetAcousticGeometryReadiness([this](const FileBackedDemoScene& scene)
+    {
+        return DescribeAcousticGeometryReadiness(scene);
+    });
+    m_editor.SetPathingStatusProvider([this](std::string_view objectID)
+    {
+        return m_gameRuntime.IsActive() ? m_gameRuntime.GetAudioSession().GetSourcePathingStatus(objectID) : std::nullopt;
+    });
 
     if(packaged)
     {
@@ -3024,6 +3077,16 @@ void Engine::Frame()
         }
     }
 
+    if(auto request = m_editor.TakeProbeVolumeObjectCreationRequest())
+    {
+        std::string error;
+
+        if(!BeginProbeVolumeObjectCreation(*request, error))
+        {
+            m_editor.OnProbeVolumeObjectCreationFailed(error);
+        }
+    }
+
     if (auto request = m_editor.TakeMeshCreationRequest())
     {
         const auto* owner = dynamic_cast<const FileBackedDemoScene*>(&activeDemo);
@@ -3405,6 +3468,8 @@ void Engine::Shutdown()
 
     // Audio ends with gameplay, before scene and renderer teardown, so no GPU drain waits behind FMOD's thread joins.
     m_audio.Shutdown();
+    // M8.3: the acoustic job has stopped and been joined; only now may its tasks report cancellation.
+    m_editor.StopAcousticWork("The Editor shut down");
 
     CancelEditorMembership("Shutdown canceled the pending membership edit.");
     CancelViewportMaterialAssignment("Engine shutdown canceled the material assignment.");
@@ -5685,6 +5750,88 @@ bool Engine::IsTerminalAutomaticFailure(const SceneObjectMetadata& selection) co
 
     // Terminal only while the recorded source is unchanged.
     return failure != failures.end() && failure->sourceIdentity == GetMeshSourceIdentity(selection);
+}
+
+std::optional<std::string> Engine::DescribeAcousticGeometryReadiness(const FileBackedDemoScene& scene) const
+{
+    if(!scene.m_runtime || !scene.m_runtime->GetFileScene().HasDocument())
+    {
+        return std::nullopt;
+    }
+
+    const FileSceneRuntime& runtime = *scene.m_runtime;
+    const auto& mapping = runtime.GetObjectMapping().idToRuntimeIndex;
+    const auto& renderObjects = runtime.GetScene().GetRenderObjects();
+    // Residency for this scene, not one left over from a replaced runtime.
+    const bool residencyRunning = m_automaticMeshResidency.enabled && m_automaticMeshResidency.runtimeIdentity == scene.GetRuntimeIdentity();
+    std::size_t required = 0;
+    std::size_t loading = 0;
+    std::optional<std::string> failure;
+
+    for(const SceneObjectDocument& object : runtime.GetFileScene().GetDocument().objects)
+    {
+        // Objects without Acoustics, or with no mesh, contribute no geometry and need none.
+        if(!object.acoustics || !object.acoustics->enabled || object.meshReference.empty())
+        {
+            continue;
+        }
+
+        ++required;
+        const std::string name = "'" + (object.name.empty() ? object.id : object.name) + "'";
+        const auto found = mapping.find(object.id);
+
+        if(found == mapping.end() || found->second >= renderObjects.size())
+        {
+            failure = failure.value_or("The acoustic mesh of " + name + " is not part of the loaded scene.");
+            continue;
+        }
+
+        const RenderObject& renderObject = renderObjects[found->second];
+
+        if(renderObject.mesh)
+        {
+            if(!scene.GetMeshGeometry(*renderObject.mesh))
+            {
+                failure = failure.value_or("The acoustic mesh of " + name + " has no geometry to bake from.");
+            }
+
+            continue;
+        }
+
+        const auto metadata = scene.GetObjectMetadata(object.id);
+
+        if(metadata && IsTerminalAutomaticFailure(*metadata))
+        {
+            // Why it failed, as far as the project can tell: a file that is not there, or one that is there but did not load.
+            const auto id = AssetID::ParseReference(object.meshReference);
+            const bool missing = id && ProjectAssetResolver::Resolve(GetActiveProject().GetPaths(), m_projectAssetRegistry, *id).status ==
+                AssetAvailability::Missing;
+            failure = failure.value_or("The acoustic mesh of " + name + (missing ? " is missing (" + object.meshReference + ")." :
+                " could not be loaded (" + object.meshReference + ")."));
+            continue;
+        }
+
+        if(!residencyRunning)
+        {
+            failure = failure.value_or("The acoustic mesh of " + name + " is not loaded, and nothing is loading it. Reopen the scene.");
+            continue;
+        }
+
+        ++loading;
+    }
+
+    if(failure)
+    {
+        return *failure + " Fix it, or turn off that object's Acoustics.";
+    }
+
+    if(loading > 0)
+    {
+        return "Acoustic meshes are still loading (" + std::to_string(required - loading) + " of " + std::to_string(required) +
+            " ready). Wait for them to load.";
+    }
+
+    return std::nullopt;
 }
 
 std::optional<MeshResidencyCandidate> Engine::DescribeSynchronousMeshCandidate(FileBackedDemoScene& scene,

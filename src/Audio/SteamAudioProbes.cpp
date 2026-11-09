@@ -3,11 +3,20 @@
 #if defined(ENGINE_HAS_STEAMAUDIO)
 #include "Audio/ProbeSolidClassifier.h"
 #include "Audio/SteamAudioCoordinates.h"
+#include "Audio/SteamAudioRuntime.h"
+#include "assets/BakedReflectionsAsset.h"
 
 #include <cmath>
 #include <cstring>
 #include <limits>
 #include <new>
+
+// M8.2: baked reflection assets record the SDK and the simulator dimensions they were baked for.
+static_assert(BakedReflectionsAssets::SteamAudioVersion == STEAMAUDIO_VERSION, "Baked reflection assets name another Steam Audio version.");
+static_assert(BakedReflectionsAssets::SimulatorOrder == static_cast<std::uint32_t>(Audio::Internal::SteamAudioReflectionMaxOrder),
+    "Bakes must use the simulator's reflection order.");
+static_assert(BakedReflectionsAssets::SimulatorDuration == Audio::Internal::SteamAudioReflectionMaxDuration,
+    "Bakes must use the simulator's reflection duration.");
 
 namespace Audio::Internal
 {
@@ -227,6 +236,12 @@ namespace
 
             handles.meshes.push_back(mesh);
             iplStaticMeshAdd(mesh, handles.scene);
+
+            // M8.3: scene construction reports real work units, one per object.
+            if(job)
+            {
+                job->SetDone(handles.meshes.size());
+            }
         }
 
         iplSceneCommit(handles.scene);
@@ -609,39 +624,58 @@ SteamAudioProbeBatches::~SteamAudioProbeBatches()
     Clear();
 }
 
-bool SteamAudioProbeBatches::Load(IPLContext context, std::span<const std::byte> batch, std::size_t expectedProbes, std::string& error)
+IPLProbeBatch LoadCommittedProbeBatch(IPLContext context, std::span<const std::byte> batch, std::size_t expectedProbes, std::string& error) noexcept
 {
-    std::vector<IPLbyte> bytes(batch.size());
-    std::memcpy(bytes.data(), batch.data(), batch.size());
-    IPLSerializedObjectSettings settings{};
-    settings.data = bytes.data();
-    settings.size = bytes.size();
-    IPLSerializedObject serialized = nullptr;
-    IPLProbeBatch loaded = nullptr;
-
-    if(iplSerializedObjectCreate(context, &settings, &serialized) != IPL_STATUS_SUCCESS)
+    try
     {
-        ++m_stats.loadFailures;
-        error = "Steam Audio could not read the probe batch";
-        return false;
-    }
+        std::vector<IPLbyte> bytes(batch.size());
+        std::memcpy(bytes.data(), batch.data(), batch.size());
+        IPLSerializedObjectSettings settings{};
+        settings.data = bytes.data();
+        settings.size = bytes.size();
+        IPLSerializedObject serialized = nullptr;
+        IPLProbeBatch loaded = nullptr;
 
-    const IPLerror status = iplProbeBatchLoad(context, serialized, &loaded);
-    iplSerializedObjectRelease(&serialized);
-
-    if(status != IPL_STATUS_SUCCESS || !loaded || static_cast<std::size_t>(iplProbeBatchGetNumProbes(loaded)) != expectedProbes)
-    {
-        if(loaded)
+        if(iplSerializedObjectCreate(context, &settings, &serialized) != IPL_STATUS_SUCCESS)
         {
-            iplProbeBatchRelease(&loaded);
+            error = "Steam Audio could not read the probe batch";
+            return nullptr;
         }
 
+        const IPLerror status = iplProbeBatchLoad(context, serialized, &loaded);
+        iplSerializedObjectRelease(&serialized);
+
+        if(status != IPL_STATUS_SUCCESS || !loaded || static_cast<std::size_t>(iplProbeBatchGetNumProbes(loaded)) != expectedProbes)
+        {
+            if(loaded)
+            {
+                iplProbeBatchRelease(&loaded);
+            }
+
+            error = "Steam Audio could not load the probe batch";
+            return nullptr;
+        }
+
+        iplProbeBatchCommit(loaded);
+        return loaded;
+    }
+    catch(const std::exception&)
+    {
+        error = "there is not enough memory to load the probe batch";
+        return nullptr;
+    }
+}
+
+bool SteamAudioProbeBatches::Load(IPLContext context, std::span<const std::byte> batch, std::size_t expectedProbes, std::string& error)
+{
+    IPLProbeBatch loaded = LoadCommittedProbeBatch(context, batch, expectedProbes, error);
+
+    if(!loaded)
+    {
         ++m_stats.loadFailures;
-        error = "Steam Audio could not load the probe batch";
         return false;
     }
 
-    iplProbeBatchCommit(loaded);
     m_batches.push_back(loaded);
     ++m_stats.batchesCreated;
     m_stats.loadedBatches = m_batches.size();

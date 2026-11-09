@@ -94,6 +94,14 @@ public:
     // One of the plugin's effects, unconnected. The caller owns it. Null when the plugin has no effect of that name.
     FMOD::DSP* CreateEffectByName(FMOD::System& core, std::string_view name) const;
     void SetAppliesReflections(FMOD::DSP& spatializer, bool applies) const;
+    // M9.1: Apply Pathing. Engine publishes no pathing output yet, so it turns this off on every spatializer it sees; see
+    // SteamAudioSimulation::OnPluginCreated. Unreadable counts as off.
+    bool AppliesPathing(FMOD::DSP& spatializer) const;
+    void SetAppliesPathing(FMOD::DSP& spatializer, bool applies) const;
+    // M9.5: read only, as authored: whether the spatializer applies the simulation's occlusion and transmission (Simulation-Defined).
+    // Off or User-Defined is false: then the simulation does not change what is heard, and pathing has nothing to make up for.
+    bool AppliesSimulatedOcclusion(FMOD::DSP& spatializer) const;
+    bool AppliesSimulatedTransmission(FMOD::DSP& spatializer) const;
 
     // Verification only, before Start.
     void SetContextAllocatorForTesting(void* (*allocate)(std::size_t, std::size_t), void (*release)(void*), bool useSdkAllocator) noexcept
