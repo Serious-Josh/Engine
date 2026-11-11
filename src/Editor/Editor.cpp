@@ -382,6 +382,8 @@ void Editor::DrawMainMenu(
         ImGui::EndDisabled();
         ImGui::MenuItem("Hierarchy", nullptr, &m_workspace.HierarchyVisible());
         ImGui::MenuItem("Asset Browser", nullptr, &m_workspace.AssetBrowserVisible());
+        ImGui::MenuItem("Voxels", nullptr, &m_showVoxelWindow);
+        ImGui::MenuItem("Air", nullptr, &m_showAirWindow);
         ImGui::Separator();
 
         if(ImGui::MenuItem("Windows File Association..."))
@@ -438,6 +440,19 @@ void Editor::DrawMainMenu(
         if(ImGui::MenuItem("Force Rebake All Reflections", nullptr, false, canBake))
         {
             m_bakeAllRequest = true;
+        }
+
+        ImGui::Separator();
+        // VX.4C.1: started at the next voxel poll, which has the registry this menu lacks.
+        if(ImGui::MenuItem("Bake Voxels", nullptr, false, !m_voxelBake && !m_voxelBakeRequested && !IsSceneEditingLocked()))
+        {
+            m_voxelBakeRequested = true;
+            m_showVoxelWindow = true;
+        }
+
+        if(ImGui::MenuItem("Cancel Voxel Bake", nullptr, false, m_voxelBake.has_value()))
+        {
+            m_voxelBake->job->Cancel();
         }
 
         ImGui::EndMenu();
@@ -536,6 +551,7 @@ void Editor::DrawSceneViewportToolbar(const EditorWorkspaceRect& toolbarRectangl
             ImGui::Checkbox("Physics Colliders", &m_showPhysicsColliders);
             ImGui::Checkbox("Camera Frusta", &m_showCameraFrusta);
             ImGui::Checkbox("Light Wireframes", &m_showLightWireframes);
+            ImGui::Checkbox("Emitters", &m_showAirMotorWireframes);
             ImGui::Checkbox("Camera Icons", &m_showCameraIcons);
             ImGui::Checkbox("Light Icons", &m_showLightIcons);
             ImGui::Checkbox("Audio Icons", &m_showAudioIcons);
@@ -1291,6 +1307,8 @@ void Editor::ActivateObjectInspection(
     m_controllerInspection.reset();
     m_cameraInspection.reset();
     m_lightInspection.reset();
+    m_airMotorInspection.reset();
+    m_mistEmitterInspection.reset();
     m_scriptInspection.reset();
     m_inspectorTarget = InspectorTarget::None;
     m_inspectorPanel.LoadSelection({}, paths, registry);
@@ -1678,9 +1696,12 @@ void Editor::Draw(
                     EditorPhaseTiming::Scope phase(PhaseTiming(), EditorPhaseTiming::Phase::ComponentLight);
                     DrawObjectLightControls(demoScene);
                 }
+                DrawObjectAirMotorControls(demoScene);
+                DrawObjectMistEmitterControls(demoScene);
                 DrawObjectScriptControls(demoScene, projectPaths, assetRegistry);
                 DrawObjectAudioControls(demoScene);
                 DrawObjectAcousticControls(demoScene, projectPaths, assetRegistry);
+                DrawObjectVoxelControls(demoScene);
                 DrawObjectProbeVolumeControls(demoScene, projectPaths, assetRegistry);
                 {
                     EditorPhaseTiming::Scope phase(PhaseTiming(), EditorPhaseTiming::Phase::ComponentAdd);
@@ -1726,6 +1747,8 @@ void Editor::Draw(
         m_controllerInspection.reset();
         m_cameraInspection.reset();
         m_lightInspection.reset();
+        m_airMotorInspection.reset();
+        m_mistEmitterInspection.reset();
         m_scriptInspection.reset();
         m_inspectorPanel.ReleaseSceneObjectPreview();
         m_inspectorPanel.DismissSceneMaterialPicker();
@@ -1793,6 +1816,8 @@ void Editor::Draw(
         m_materialLeaveAction != MaterialLeaveAction::None || m_sceneOperationPending);
 
     DrawBuildGame(demoScene);
+    DrawVoxelWindow(demoScene);
+    DrawAirWindow(demoScene);
     DrawSceneViewport(sceneTextureHandle, sceneWidth, sceneHeight);
     DrawMeshDropTarget(demoScene, projectPaths, assetRegistry);
     DrawMaterialDropTarget(demoScene, projectPaths, assetRegistry);
@@ -3050,6 +3075,21 @@ void Editor::OnSceneActivated()
     m_reflectionBakeStatus.Invalidate();
     m_reflectionBakeFailures.clear();
     m_reflectionBakeStatusNext = {};
+    // VX.4C.1: a bake belongs to the scene it captured; a new scene cancels it, and nothing it staged survives.
+    if(m_voxelBake)
+    {
+        m_voxelBake.reset();
+        m_voxelMessage = "The voxel bake was cancelled: another scene was opened.";
+        m_voxelMessageIsError = true;
+    }
+    m_voxelBakeRequested = false;
+    m_voxelStatusCheck.reset();
+    m_voxelStatus.reset();
+    m_voxelStatusManifest.clear();
+    m_voxelStatusRequested = true;
+    m_voxelStatusPending = false;
+    // VX.4C.2: the overlay showed the previous scene's bake; drop it (the Renderer releases its buffers once the GPU is done).
+    ResetVoxelOverlay();
     InvalidateSceneFiles();
     ClearSceneHistory();
     ResetSceneInteractions();
@@ -3062,12 +3102,18 @@ void Editor::ResetSceneInteractions()
     DismissControllerManagementPopup();
     DismissCameraManagementPopup();
     DismissLightManagementPopup();
+    DismissAirMotorManagementPopup();
+    DismissMistEmitterManagementPopup();
     DismissScriptManagementPopup();
     DismissAudioManagementPopup();
     m_triggerInspection.reset();
     m_controllerInspection.reset();
     m_cameraInspection.reset();
     m_lightInspection.reset();
+    m_airMotorInspection.reset();
+    m_airMotorEditStatus.clear();
+    m_mistEmitterInspection.reset();
+    m_mistEmitterEditStatus.clear();
     m_scriptInspection.reset();
     m_scriptEditStatus.clear();
     m_lightColorGestureActive = false;
@@ -4323,6 +4369,62 @@ void Editor::ReplaySceneHistory(IDemoScene& demoScene, bool redo)
         return;
     }
 
+    if(const auto* motor = std::get_if<std::unique_ptr<AirMotorEdit>>(&entry.command); motor && *motor)
+    {
+        const auto& edit = **motor;
+        auto* owner = dynamic_cast<FileBackedDemoScene*>(&demoScene);
+
+        if(!owner || !RenameSessionMatches(demoScene, edit.session))
+        {
+            ReportSceneHistoryFailure("Air Motor replay belongs to a stale scene session.");
+            return;
+        }
+
+        std::string error;
+        // Resolved by stable ID now; the runtime checks the expected value before restoring.
+        const auto selection = owner->GetObjectMetadata(edit.objectID, &error);
+
+        if(!selection || !owner->SetObjectAirMotor(*selection, redo ? edit.before : edit.after, redo ? edit.after : edit.before, &error))
+        {
+            ReportSceneHistoryFailure(error);
+            return;
+        }
+
+        m_historyCursor = redo ? m_historyCursor + 1 : m_historyCursor - 1;
+        m_airMotorInspection.reset();
+        ++m_airMotorControlsRevision;
+        m_sceneHistoryStatus.clear();
+        return;
+    }
+
+    if(const auto* emitter = std::get_if<std::unique_ptr<MistEmitterEdit>>(&entry.command); emitter && *emitter)
+    {
+        const auto& edit = **emitter;
+        auto* owner = dynamic_cast<FileBackedDemoScene*>(&demoScene);
+
+        if(!owner || !RenameSessionMatches(demoScene, edit.session))
+        {
+            ReportSceneHistoryFailure("Mist Emitter replay belongs to a stale scene session.");
+            return;
+        }
+
+        std::string error;
+        // Resolved by stable ID now; the runtime checks the expected value before restoring.
+        const auto selection = owner->GetObjectMetadata(edit.objectID, &error);
+
+        if(!selection || !owner->SetObjectMistEmitter(*selection, redo ? edit.before : edit.after, redo ? edit.after : edit.before, &error))
+        {
+            ReportSceneHistoryFailure(error);
+            return;
+        }
+
+        m_historyCursor = redo ? m_historyCursor + 1 : m_historyCursor - 1;
+        m_mistEmitterInspection.reset();
+        ++m_mistEmitterControlsRevision;
+        m_sceneHistoryStatus.clear();
+        return;
+    }
+
     if(const auto* script = std::get_if<std::unique_ptr<ScriptEdit>>(&entry.command); script && *script)
     {
         const auto& edit = **script;
@@ -4377,6 +4479,56 @@ void Editor::ReplaySceneHistory(IDemoScene& demoScene, bool redo)
         m_historyCursor = redo ? m_historyCursor + 1 : m_historyCursor - 1;
         m_audioInspection.reset();
         ++m_audioControlsRevision;
+        m_sceneHistoryStatus.clear();
+        return;
+    }
+
+    if(const auto* voxels = std::get_if<std::unique_ptr<VoxelSettingsEdit>>(&entry.command); voxels && *voxels)
+    {
+        std::string error;
+
+        if(!ReplayVoxelSettings(demoScene, **voxels, redo, error))
+        {
+            ReportSceneHistoryFailure(error);
+            return;
+        }
+
+        m_historyCursor = redo ? m_historyCursor + 1 : m_historyCursor - 1;
+        m_voxelEditStatus.clear();
+        m_sceneHistoryStatus.clear();
+        return;
+    }
+
+    if(const auto* mist = std::get_if<std::unique_ptr<MistRenderingEdit>>(&entry.command); mist && *mist)
+    {
+        std::string error;
+
+        if(!ReplayMistRendering(demoScene, **mist, redo, error))
+        {
+            ReportSceneHistoryFailure(error);
+            return;
+        }
+
+        m_historyCursor = redo ? m_historyCursor + 1 : m_historyCursor - 1;
+        m_mistRenderingDraft.reset();
+        m_mistRenderingStatus.clear();
+        m_sceneHistoryStatus.clear();
+        return;
+    }
+
+    if(const auto* bake = std::get_if<std::unique_ptr<VoxelBakeEdit>>(&entry.command); bake && *bake)
+    {
+        std::string error;
+
+        if(!ReplayVoxelBake(demoScene, **bake, redo, error))
+        {
+            ReportSceneHistoryFailure(error);
+            return;
+        }
+
+        m_historyCursor = redo ? m_historyCursor + 1 : m_historyCursor - 1;
+        m_voxelEditStatus.clear();
+        m_voxelStatusRequested = true;
         m_sceneHistoryStatus.clear();
         return;
     }

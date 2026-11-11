@@ -74,6 +74,8 @@ struct MaterialAssignmentToken
 
 namespace CookedScene { struct ArchiveScene; }
 class Renderer;
+struct AirMotorInstance;
+struct MistEmitterInstance;
 
 enum class PhysicsPresentationReadiness { Ready, Retry, Stale, Failed };
 
@@ -175,6 +177,19 @@ public:
     bool CaptureEditorLightWireframes(const Renderer&, EditorColliderOverlay&,
         std::span<const size_t> selectedRuntimeIndices, std::vector<std::string>& rejected,
         std::string& error) const;
+    // AIR.3 (AirMotorCapture.cpp): the enabled Air Motors of the committed scene (editable or archive) for this frame, from each
+    // object's accepted presentation pose; a Moving motor's velocity is its presented motion over `frameSeconds`, and zero for a
+    // jump faster than AirMotorTeleportSpeed. Owner thread only.
+    static constexpr float AirMotorTeleportSpeed = 60.0f;
+    void CaptureAirMotors(double frameSeconds, std::vector<AirMotorInstance>& motors) const;
+    // AIR.4F F2 (AirMotorCapture.cpp): the enabled Mist Emitters of the committed scene for this frame, from each object's accepted
+    // presentation pose, in document order. Owner thread only.
+    void CaptureMistEmitters(std::vector<MistEmitterInstance>& emitters) const;
+    // AIR.3: appends one wireframe set per Air Motor (selected motors last), like CaptureEditorLightWireframes. AIR.4F F2: and per
+    // Mist Emitter, its shape and origin.
+    bool CaptureEditorAirMotorWireframes(const Renderer&, EditorColliderOverlay&,
+        std::span<const size_t> selectedRuntimeIndices, std::vector<std::string>& rejected,
+        std::string& error) const;
     bool CaptureObjectDeletionSnapshot(std::string_view objectID, SceneObjectDocument& object,
         size_t& documentIndex, std::string* errorMessage = nullptr) const;
     // Inspector reads: the object CaptureObjectDeletionSnapshot would return, with the same success or failure,
@@ -249,6 +264,15 @@ public:
     bool SetObjectLight(const SceneObjectMetadata& selection,
         const std::optional<LightComponent>& expected,
         const std::optional<LightComponent>& replacement, std::string* errorMessage = nullptr);
+    // AIR.3 authored Air Motor edit, with the same identity, expected-value and whole-scene checks as SetObjectLight. Motors are
+    // captured from the document every frame, so no renderer or physics state changes.
+    bool SetObjectAirMotor(const SceneObjectMetadata& selection,
+        const std::optional<AirMotorComponent>& expected,
+        const std::optional<AirMotorComponent>& replacement, std::string* errorMessage = nullptr);
+    // AIR.4F F2 authored Mist Emitter edit, with SetObjectAirMotor's checks. Emitters are captured from the document every frame.
+    bool SetObjectMistEmitter(const SceneObjectMetadata& selection,
+        const std::optional<MistEmitterComponent>& expected,
+        const std::optional<MistEmitterComponent>& replacement, std::string* errorMessage = nullptr);
     // AS.5 authored Script attachment edit with the same identity, expected-value and whole-scene
     // checks as SetObjectLight. Script instances belong to the gameplay runtime, never here.
     bool SetObjectScript(const SceneObjectMetadata& selection,
@@ -260,6 +284,21 @@ public:
         const std::optional<AcousticSettings>& replacement, std::string* errorMessage = nullptr);
     bool SetObjectProbeVolume(const SceneObjectMetadata& selection, const std::optional<ProbeVolumeComponent>& expected,
         const std::optional<ProbeVolumeComponent>& replacement, std::string* errorMessage = nullptr);
+    // VX.4C.1: voxel settings of several objects as one edit. Every object must exist and still hold its expected value, and every
+    // replacement must be valid, or nothing changes. Read only by voxel capture, so no renderer, physics or audio state changes.
+    struct VoxelSettingsChange
+    {
+        std::string objectID;
+        std::optional<VoxelSettings> expected;
+        std::optional<VoxelSettings> replacement;
+    };
+    bool SetObjectsVoxelSettings(const std::vector<VoxelSettingsChange>& changes, std::string* errorMessage = nullptr);
+    // VX.4C.1: the scene's voxel bake settings and manifest reference, replaced only if they still equal `expected`.
+    bool SetSceneVoxelBake(const std::optional<VoxelBakeSettings>& expected, const std::optional<VoxelBakeSettings>& replacement,
+        std::string* errorMessage = nullptr);
+    // AIR.4F F4.4.1: the scene's mist appearance, replaced only if it still equals `expected`; only sanitized settings are accepted.
+    bool SetSceneMistRendering(const std::optional<MistRenderSettings>& expected, const std::optional<MistRenderSettings>& replacement,
+        std::string* errorMessage = nullptr);
     bool SetObjectAudio(const SceneObjectMetadata& selection, const AudioComponentState& expected,
         const AudioComponentState& replacement, std::string* errorMessage = nullptr);
     bool SetObjectCharacterController(const SceneObjectMetadata& selection,

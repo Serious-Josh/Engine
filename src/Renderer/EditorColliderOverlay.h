@@ -20,7 +20,9 @@ enum class ColliderOverlayShape : std::uint32_t
     Sphere = 1,
     Capsule = 2,
     Cone = 3,  // LIGHT.1 Spot Light: apex at the origin, unit ring at z = 1.
-    Arrows = 4 // LIGHT.1 Directional Light: parallel unit arrows along +Z.
+    Arrows = 4, // LIGHT.1 Directional Light: parallel unit arrows along +Z.
+    // AIR.3 Air Motors: the capsule's rings and longitudinal lines only (a cylinder along +Y; no hemisphere arcs).
+    Cylinder = 5
 };
 
 // Also selects the wireframe color in EditorCollider.hlsl; keep the values identical.
@@ -37,7 +39,11 @@ enum class ColliderOverlayRole : std::uint32_t
     CameraFrustumDisabled = 8, // Dim grey: frustum of a disabled Camera, selected or not.
     Light = 9,                 // Pale yellow: LIGHT.1 Light wireframe.
     LightSelected = 10,        // Selection orange: wireframe of a selected Light.
-    LightDisabled = 11         // Dim olive grey: wireframe of a disabled Light, selected or not.
+    LightDisabled = 11,        // Dim olive grey: wireframe of a disabled Light, selected or not.
+    AirMotor = 12,             // Sky blue: AIR.3 Air Motor region.
+    AirMotorSelected = 13,     // Selection orange: region of a selected Air Motor.
+    AirMotorDisabled = 14,     // Dim slate: region of a disabled Air Motor, selected or not.
+    AirMotorEmission = 15      // Mint: AIR.4D D2 Air Motor emission origin and emitter.
 };
 
 // A Capsule needs one value beyond its matrix. The matrix scales uniformly by the radius,
@@ -99,6 +105,9 @@ struct EditorColliderOverlay
     static constexpr unsigned int LinesPerArrow = 5;
     static constexpr unsigned int VerticesPerArrows = ArrowCount * LinesPerArrow * 2;
 
+    // A unit-radius cylinder along +Y: the first CapsuleRingLineCount + CapsuleLongitudinalLineCount lines of a capsule.
+    static constexpr unsigned int VerticesPerCylinder = (CapsuleRingLineCount + CapsuleLongitudinalLineCount) * 2;
+
     const Scene* scene = nullptr; // Identity comparison only; not an owning pointer.
     std::uint64_t structureRevision = 0;
     std::uint64_t rendererLifetime = 0;
@@ -114,6 +123,8 @@ struct EditorColliderOverlay
     std::vector<ColliderOverlayMarker> cameraFrusta;
     // LIGHT.1 Light wireframes (Sphere, Cone or Arrows), selected Lights last.
     std::vector<ColliderOverlayMarker> lightWireframes;
+    // AIR.3 Air Motor regions (Box, Sphere, Cylinder and direction Arrows), selected motors last.
+    std::vector<ColliderOverlayMarker> airMotorWireframes;
     // Capsule, ground point and normal, and a point and normal per copied contact.
     static constexpr std::size_t MaxMarkersPerCharacter = 3 + 2 * Physics::MaximumCharacterDiagnosticContacts;
 

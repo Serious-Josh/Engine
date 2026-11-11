@@ -284,11 +284,16 @@ void Editor::DrawAddComponentControls(IDemoScene& scene)
         const bool listenerMatches = listenerAvailable && std::string_view("audio listener").find(query) != std::string_view::npos;
         const bool probeVolumeAvailable = !object.probeVolume;
         const bool probeVolumeMatches = probeVolumeAvailable && std::string_view("steam audio probe volume").find(query) != std::string_view::npos;
+        const bool airMotorAvailable = !object.airMotor;
+        const bool airMotorMatches = airMotorAvailable && std::string_view("air motor").find(query) != std::string_view::npos;
+        const bool mistEmitterAvailable = !object.mistEmitter;
+        const bool mistEmitterMatches = mistEmitterAvailable && std::string_view("mist emitter").find(query) != std::string_view::npos;
         const bool triggerMatches = triggerAvailable && std::string_view("trigger collider").find(query) != std::string_view::npos;
         const bool controllerMatches = controllerAbsent && std::string_view("character controller").find(query) != std::string_view::npos;
         const int eligibleMatches = static_cast<int>(triggerMatches) + static_cast<int>(controllerMatches && controllerAvailable) +
             static_cast<int>(cameraMatches) + static_cast<int>(lightMatches) + static_cast<int>(scriptMatches) +
-            static_cast<int>(sourceMatches) + static_cast<int>(listenerMatches) + static_cast<int>(probeVolumeMatches);
+            static_cast<int>(sourceMatches) + static_cast<int>(listenerMatches) + static_cast<int>(probeVolumeMatches) +
+            static_cast<int>(airMotorMatches) + static_cast<int>(mistEmitterMatches);
         ImGui::Separator();
         ImGui::PushItemFlag(ImGuiItemFlags_AutoClosePopups, false);
         const bool triggerSelected = triggerMatches && ImGui::MenuItem("Trigger Collider");
@@ -310,9 +315,11 @@ void Editor::DrawAddComponentControls(IDemoScene& scene)
         const bool sourceSelected = sourceMatches && ImGui::MenuItem("Audio Source");
         const bool listenerSelected = listenerMatches && ImGui::MenuItem("Audio Listener");
         const bool probeVolumeSelected = probeVolumeMatches && ImGui::MenuItem("Steam Audio Probe Volume");
+        const bool airMotorSelected = airMotorMatches && ImGui::MenuItem("Air Motor");
+        const bool mistEmitterSelected = mistEmitterMatches && ImGui::MenuItem("Mist Emitter");
 
         if(!triggerAvailable && !controllerAvailable && !cameraAvailable && !lightAvailable && !scriptAvailable &&
-            !sourceAvailable && !listenerAvailable && !probeVolumeAvailable)
+            !sourceAvailable && !listenerAvailable && !probeVolumeAvailable && !airMotorAvailable && !mistEmitterAvailable)
         {
             ImGui::TextDisabled("No components available.");
         }
@@ -331,14 +338,18 @@ void Editor::DrawAddComponentControls(IDemoScene& scene)
         const bool addSource = sourceMatches && (sourceSelected || (searchEnter && eligibleMatches == 1));
         const bool addListener = listenerMatches && (listenerSelected || (searchEnter && eligibleMatches == 1));
         const bool addProbeVolume = probeVolumeMatches && (probeVolumeSelected || (searchEnter && eligibleMatches == 1));
+        const bool addAirMotor = airMotorMatches && (airMotorSelected || (searchEnter && eligibleMatches == 1));
+        const bool addMistEmitter = mistEmitterMatches && (mistEmitterSelected || (searchEnter && eligibleMatches == 1));
 
         // Enter deactivates the search field; keep it focused when the query selects nothing.
-        if(searchEnter && !addTrigger && !addController && !addCamera && !addLight && !addScript && !addSource && !addListener && !addProbeVolume)
+        if(searchEnter && !addTrigger && !addController && !addCamera && !addLight && !addScript && !addSource && !addListener && !addProbeVolume &&
+            !addAirMotor && !addMistEmitter)
         {
             m_focusComponentSearch = true;
         }
 
-        if(m_addComponentPopup && (addTrigger || addController || addCamera || addLight || addScript || addSource || addListener || addProbeVolume))
+        if(m_addComponentPopup && (addTrigger || addController || addCamera || addLight || addScript || addSource || addListener || addProbeVolume ||
+            addAirMotor || addMistEmitter))
         {
             ValidateAddComponentPopup(scene);
             const auto current = ResolveComponentEditTarget(scene);
@@ -389,6 +400,16 @@ void Editor::DrawAddComponentControls(IDemoScene& scene)
                 else if(addProbeVolume && !latest.probeVolume)
                 {
                     committed = CommitObjectProbeVolume(scene, *current, std::nullopt, ProbeVolumeComponent{});
+                }
+                else if(addAirMotor && !latest.airMotor)
+                {
+                    // A Directional motor by default; the Inspector switches type.
+                    committed = CommitObjectAirMotor(scene, *current, std::nullopt, AirMotorComponent{});
+                }
+                else if(addMistEmitter && !latest.mistEmitter)
+                {
+                    // A white 0.5 m sphere at the object by default.
+                    committed = CommitObjectMistEmitter(scene, *current, std::nullopt, MistEmitterComponent{});
                 }
 
                 if(committed)

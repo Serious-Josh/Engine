@@ -48,6 +48,20 @@ bool ValidateSceneDocument(
         return Fail(errorMessage, "Unsupported scene schema version.");
     }
 
+    if(document.mistRendering && !ValidateMistRenderSettings(*document.mistRendering))
+    {
+        return Fail(errorMessage, "Invalid mist rendering settings.");
+    }
+
+    if(document.voxelBake)
+    {
+        std::string voxelError;
+        if(!ValidateVoxelBakeSettings(*document.voxelBake, &voxelError))
+        {
+            return Fail(errorMessage, "Invalid voxel bake settings: " + voxelError);
+        }
+    }
+
     if(!document.environmentReference.empty() && document.environmentReference != SceneDocument::NoneEnvironmentReference)
     {
         const auto id=AssetID::ParseReference(document.environmentReference);
@@ -407,6 +421,21 @@ bool ValidateSceneObjectComponents(const SceneObjectDocument& object, std::strin
     if(object.acoustics && !ValidateAcousticSettings(*object.acoustics, &componentError))
     {
         return Fail(errorMessage, "Invalid acoustics for object " + object.id + ": " + componentError);
+    }
+
+    if(object.airMotor && !ValidateAirMotorComponent(*object.airMotor, &componentError))
+    {
+        return Fail(errorMessage, "Invalid Air Motor for object " + object.id + ": " + componentError);
+    }
+
+    if(object.mistEmitter && !ValidateMistEmitterComponent(*object.mistEmitter, &componentError))
+    {
+        return Fail(errorMessage, "Invalid Mist Emitter for object " + object.id + ": " + componentError);
+    }
+
+    if(object.voxel && !ValidateVoxelSettings(*object.voxel, &componentError))
+    {
+        return Fail(errorMessage, "Invalid voxel settings for object " + object.id + ": " + componentError);
     }
 
     if(object.probeVolume && !ValidateProbeVolume(*object.probeVolume, &componentError))

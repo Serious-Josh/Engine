@@ -176,7 +176,10 @@ bool ResourceUploader::UploadTexture(
         return false;
     }
 
-    if (dataSize < rowSize * numRows)
+    // AIR.4F F4.1: a 3D texture's slices follow each other, numRows rows apart; 2D textures have one slice.
+    const UINT depth = footprint.Footprint.Depth;
+
+    if (dataSize < rowSize * numRows * depth)
     {
         return false;
     }
@@ -221,7 +224,7 @@ bool ResourceUploader::UploadTexture(
 
     const unsigned char* sourceData = static_cast<const unsigned char*>(data);
 
-    for (UINT row = 0; row < numRows; ++row)
+    for (UINT row = 0; row < numRows * depth; ++row)
     {
         std::memcpy(destinationData + footprint.Offset + static_cast<size_t>(row) * footprint.Footprint.RowPitch,
                     sourceData + static_cast<size_t>(row) * rowSize, static_cast<size_t>(rowSize));

@@ -721,6 +721,49 @@ namespace
                 };
             }
 
+            if(object.airMotor)
+            {
+                const AirMotorComponent& motor = *object.airMotor;
+                objects.back()["airMotor"] = {
+                    {"enabled", motor.enabled},
+                    {"type", AirMotorTypeName(motor.type)},
+                    {"strength", motor.strength},
+                    {"falloff", motor.falloff},
+                    {"halfExtents", ToJson(motor.halfExtents)},
+                    {"radius", motor.radius},
+                    {"length", motor.length},
+                    {"inwardPull", motor.inwardPull},
+                    {"coupling", motor.coupling},
+                    {"emissionOrigin", ToJson(motor.emissionOrigin)},
+                    {"emissionSemiAxes", ToJson(motor.emissionSemiAxes)},
+                    {"emissionRotation", ToJson(motor.emissionRotation)}
+                };
+            }
+
+            if(object.mistEmitter)
+            {
+                const MistEmitterComponent& emitter = *object.mistEmitter;
+                objects.back()["mistEmitter"] = {
+                    {"enabled", emitter.enabled},
+                    {"shape", MistEmitterShapeName(emitter.shape)},
+                    {"emissionOrigin", ToJson(emitter.emissionOrigin)},
+                    {"emissionRotation", ToJson(emitter.emissionRotation)},
+                    {"radius", emitter.radius},
+                    {"halfExtents", ToJson(emitter.halfExtents)},
+                    {"rate", emitter.rate},
+                    {"color", ToJson(emitter.color)},
+                    {"density", emitter.density}
+                };
+            }
+
+            if(object.voxel)
+            {
+                objects.back()["voxel"] = {
+                    {"participation", VoxelParticipationToString(object.voxel->participation)},
+                    {"orientation", VoxelOrientationToString(object.voxel->orientation)}
+                };
+            }
+
             if(object.probeVolume)
             {
                 const ProbeVolumeComponent& volume = *object.probeVolume;
@@ -793,7 +836,7 @@ namespace
         const auto& camera = document.camera;
 
 
-        return {
+        Json scene = {
             {"schemaVersion", SceneDocument::kSchemaVersion},
             {"id", document.id},
             {"name", document.name},
@@ -811,11 +854,41 @@ namespace
             {"lightingSettings", {{"referenceEV100", document.lightingSettings.referenceEV100},
                 {"environmentLuminanceScale", document.lightingSettings.environmentLuminanceScale}}}
         };
+
+        if(document.voxelBake)
+        {
+            const VoxelBakeSettings& bake = *document.voxelBake;
+            scene["voxelBake"] = {
+                {"baseExponent", bake.baseExponent},
+                {"regionBricks", bake.regionBricks},
+                {"narrowBand", bake.narrowBand},
+                {"coarseClamp", bake.coarseClamp},
+                {"manifest", bake.manifestReference}
+            };
+        }
+
+        // AIR.4F F4.4.1: every field, so a saved scene never depends on the defaults of a later version.
+        if(document.mistRendering)
+        {
+            const MistRenderSettings& mist = *document.mistRendering;
+            scene["mistRendering"] = {
+                {"opacity", mist.opacity},
+                {"worley", {{"enabled", mist.detail}, {"strength", mist.detailStrength}, {"scale", mist.detailScale}}},
+                {"curl", {{"enabled", mist.curl}, {"strength", mist.curlStrength}, {"scale", mist.curlScale}, {"flowInfluence", mist.curlFlow}}},
+                {"wisps", {{"enabled", mist.wisps}, {"strength", mist.wispStrength}, {"scale", mist.wispScale}}},
+                {"densityDetail", {{"enabled", mist.densityDetail}, {"strength", mist.densityDetailStrength}}},
+                {"lighting", {{"enabled", mist.lighting}, {"sunShadows", mist.sunShadows}, {"scattering", mist.scattering},
+                    {"anisotropy", mist.anisotropy}, {"ambient", mist.ambient}}}
+            };
+        }
+
+        return scene;
     }
 
     SceneDocument FromJson(const Json& value, const LegacyLightingMigrationOptions& migration = {})
     {
-        ValidateFields(value, {"schemaVersion", "id", "name", "camera", "directionalLight", "objects", "environmentReference", "lightingSettings"});
+        ValidateFields(value, {"schemaVersion", "id", "name", "camera", "directionalLight", "objects", "environmentReference", "lightingSettings",
+            "voxelBake", "mistRendering"});
         const auto& schemaVersion = value.at("schemaVersion");
         if (!schemaVersion.is_number_integer() ||
             (schemaVersion != SceneDocument::kLegacySchemaVersion &&
@@ -835,7 +908,13 @@ namespace
              schemaVersion != SceneDocument::kScriptSchemaVersion &&
              schemaVersion != SceneDocument::kAudioSchemaVersion &&
              schemaVersion != SceneDocument::kColliderScaleSchemaVersion &&
-             schemaVersion != SceneDocument::kAcousticsSchemaVersion))
+             schemaVersion != SceneDocument::kAcousticsSchemaVersion &&
+             schemaVersion != SceneDocument::kVoxelSchemaVersion &&
+             schemaVersion != SceneDocument::kAirMotorSchemaVersion &&
+             schemaVersion != SceneDocument::kAirMotorEmissionSchemaVersion &&
+             schemaVersion != SceneDocument::kAirMotorShapeSchemaVersion &&
+             schemaVersion != SceneDocument::kMistEmitterSchemaVersion &&
+             schemaVersion != SceneDocument::kMistRenderingSchemaVersion))
         {
             throw std::runtime_error("Unsupported scene schema version.");
         }
@@ -848,6 +927,122 @@ namespace
         result.id = value.at("id").get<std::string>();
         result.name = value.at("name").get<std::string>();
         result.environmentReference=value.value("environmentReference",std::string{});
+
+        if(value.contains("voxelBake"))
+        {
+            if(schemaVersion.get<std::uint32_t>() < SceneDocument::kVoxelSchemaVersion)
+            {
+                throw std::runtime_error("Voxel bake settings require scene schema version 19.");
+            }
+
+            const Json& voxelBake = value.at("voxelBake");
+            ValidateFields(voxelBake, {"baseExponent", "regionBricks", "narrowBand", "coarseClamp", "manifest"});
+            VoxelBakeSettings bake;
+            bake.baseExponent = voxelBake.at("baseExponent").get<std::int32_t>();
+            bake.regionBricks = voxelBake.at("regionBricks").get<std::uint32_t>();
+            bake.narrowBand = voxelBake.at("narrowBand").get<std::uint32_t>();
+            bake.coarseClamp = voxelBake.at("coarseClamp").get<std::uint32_t>();
+            bake.manifestReference = voxelBake.at("manifest").get<std::string>();
+            std::string voxelError;
+
+            if(!ValidateVoxelBakeSettings(bake, &voxelError))
+            {
+                throw std::runtime_error("Invalid voxel bake settings: " + voxelError);
+            }
+
+            result.voxelBake = std::move(bake);
+        }
+
+        // AIR.4F F4.4.1: a missing field keeps its default; a value that is not a finite number (or not a boolean) keeps the default
+        // too, and a number out of its range is clamped, so no file can hand the renderer an invalid constant.
+        if(value.contains("mistRendering"))
+        {
+            if(schemaVersion.get<std::uint32_t>() < SceneDocument::kMistRenderingSchemaVersion)
+            {
+                throw std::runtime_error("Mist rendering settings require scene schema version 24.");
+            }
+
+            const Json& block = value.at("mistRendering");
+
+            if(!block.is_object())
+            {
+                throw std::runtime_error("Mist rendering settings must be an object.");
+            }
+
+            // AIR.4F F4.4.2 added "wisps" and F4.4.2e "densityDetail" to the schema 24 block (absent: off, as before).
+            ValidateFields(block, {"opacity", "worley", "curl", "wisps", "densityDetail", "lighting"});
+            MistRenderSettings mist;
+            const auto readNumber = [](const Json& group, const char* key, float& target)
+            {
+                if(group.contains(key) && group.at(key).is_number())
+                {
+                    target = group.at(key).get<float>();
+                }
+            };
+            const auto readFlag = [](const Json& group, const char* key, bool& target)
+            {
+                if(group.contains(key) && group.at(key).is_boolean())
+                {
+                    target = group.at(key).get<bool>();
+                }
+            };
+            const auto readGroup = [&](const char* key, std::initializer_list<std::string_view> fields) -> const Json*
+            {
+                if(!block.contains(key))
+                {
+                    return nullptr;
+                }
+
+                if(!block.at(key).is_object())
+                {
+                    throw std::runtime_error(std::string("Mist rendering '") + key + "' must be an object.");
+                }
+
+                ValidateFields(block.at(key), fields);
+                return &block.at(key);
+            };
+
+            readNumber(block, "opacity", mist.opacity);
+
+            if(const Json* worley = readGroup("worley", {"enabled", "strength", "scale"}))
+            {
+                readFlag(*worley, "enabled", mist.detail);
+                readNumber(*worley, "strength", mist.detailStrength);
+                readNumber(*worley, "scale", mist.detailScale);
+            }
+
+            if(const Json* curl = readGroup("curl", {"enabled", "strength", "scale", "flowInfluence"}))
+            {
+                readFlag(*curl, "enabled", mist.curl);
+                readNumber(*curl, "strength", mist.curlStrength);
+                readNumber(*curl, "scale", mist.curlScale);
+                readNumber(*curl, "flowInfluence", mist.curlFlow);
+            }
+
+            if(const Json* wisps = readGroup("wisps", {"enabled", "strength", "scale"}))
+            {
+                readFlag(*wisps, "enabled", mist.wisps);
+                readNumber(*wisps, "strength", mist.wispStrength);
+                readNumber(*wisps, "scale", mist.wispScale);
+            }
+
+            if(const Json* densityDetail = readGroup("densityDetail", {"enabled", "strength"}))
+            {
+                readFlag(*densityDetail, "enabled", mist.densityDetail);
+                readNumber(*densityDetail, "strength", mist.densityDetailStrength);
+            }
+
+            if(const Json* lighting = readGroup("lighting", {"enabled", "sunShadows", "scattering", "anisotropy", "ambient"}))
+            {
+                readFlag(*lighting, "enabled", mist.lighting);
+                readFlag(*lighting, "sunShadows", mist.sunShadows);
+                readNumber(*lighting, "scattering", mist.scattering);
+                readNumber(*lighting, "anisotropy", mist.anisotropy);
+                readNumber(*lighting, "ambient", mist.ambient);
+            }
+
+            result.mistRendering = SanitizeMistRenderSettings(mist);
+        }
 
         const Json& camera = value.at("camera");
         ValidateFields(camera, {"position", "target", "verticalFov", "aspectRatio", "nearPlane", "farPlane", "exposure"});
@@ -907,7 +1102,7 @@ namespace
         {
             ValidateFields(item, {"id", "parentID", "name", "transform", "meshReference", "materialReference",
                 "materialSlotBindings", "physics", "triggerCollider", "characterController", "camera", "light", "script",
-                "audioSource", "audioListener", "acoustics", "probeVolume"});
+                "audioSource", "audioListener", "acoustics", "probeVolume", "voxel", "airMotor", "mistEmitter"});
             if (legacySchema && item.contains("physics"))
             {
                 throw std::runtime_error("Physics fields require scene schema version 2.");
@@ -1107,6 +1302,154 @@ namespace
                 }
 
                 object.acoustics = std::move(acoustics);
+            }
+
+            if(item.contains("airMotor"))
+            {
+                if(schemaVersion.get<std::uint32_t>() < SceneDocument::kAirMotorSchemaVersion)
+                {
+                    throw std::runtime_error("Air Motors require scene schema version 20.");
+                }
+
+                const auto& value = item.at("airMotor");
+                // AIR.4D D2 emission fields: required from schema 21. Schema 20 motors take the defaults (the origin at the object, a
+                // point emission), which is where AIR.3 motors were centred. AIR.4D D2.1 replaces the emission radius with the
+                // emission shape from schema 22; older motors are migrated below.
+                const bool emissionSchema = schemaVersion.get<std::uint32_t>() >= SceneDocument::kAirMotorEmissionSchemaVersion;
+                const bool shapeSchema = schemaVersion.get<std::uint32_t>() >= SceneDocument::kAirMotorShapeSchemaVersion;
+
+                if(shapeSchema)
+                {
+                    ValidateFields(value, {"enabled", "type", "strength", "falloff", "halfExtents", "radius", "length", "inwardPull", "coupling",
+                        "emissionOrigin", "emissionSemiAxes", "emissionRotation"});
+                }
+                else if(emissionSchema)
+                {
+                    ValidateFields(value, {"enabled", "type", "strength", "falloff", "halfExtents", "radius", "length", "inwardPull", "coupling",
+                        "emissionOrigin", "emissionRadius"});
+                }
+                else
+                {
+                    ValidateFields(value, {"enabled", "type", "strength", "falloff", "halfExtents", "radius", "length", "inwardPull", "coupling"});
+                }
+
+                if(!value.at("enabled").is_boolean() || !value.at("type").is_string())
+                {
+                    throw std::runtime_error("Air Motor enabled must be a boolean and type a name.");
+                }
+
+                AirMotorComponent motor;
+                motor.enabled = value.at("enabled").get<bool>();
+
+                if(!TryParseAirMotorType(value.at("type").get<std::string>(), motor.type))
+                {
+                    throw std::runtime_error("Air Motor type must be Directional, Omni, Vortex, Moving or Cylinder.");
+                }
+
+                motor.strength = ReadNumber(value.at("strength"), "Air Motor strength");
+                motor.falloff = ReadNumber(value.at("falloff"), "Air Motor falloff");
+                motor.halfExtents = ReadVector3(value.at("halfExtents"));
+                motor.radius = ReadNumber(value.at("radius"), "Air Motor radius");
+                motor.length = ReadNumber(value.at("length"), "Air Motor length");
+                motor.inwardPull = ReadNumber(value.at("inwardPull"), "Air Motor inward pull");
+                motor.coupling = ReadNumber(value.at("coupling"), "Air Motor coupling");
+
+                if(emissionSchema)
+                {
+                    motor.emissionOrigin = ReadVector3(value.at("emissionOrigin"));
+                }
+
+                if(shapeSchema)
+                {
+                    motor.emissionSemiAxes = ReadVector3(value.at("emissionSemiAxes"));
+                    motor.emissionRotation = ReadVector3(value.at("emissionRotation"));
+                }
+                else
+                {
+                    // Schema 20 had no emission radius: every AIR.3 motor emitted from a point.
+                    const float legacyEmissionRadius = emissionSchema ? ReadNumber(value.at("emissionRadius"), "Air Motor emission radius") : 0.0f;
+
+                    if(!std::isfinite(legacyEmissionRadius) || legacyEmissionRadius < 0.0f || legacyEmissionRadius > AirMotorComponent::MaximumSize)
+                    {
+                        throw std::runtime_error("Invalid Air Motor: emission radius must be finite, from 0 to 256 m.");
+                    }
+
+                    if(MigrateLegacyAirMotorEmission(motor, legacyEmissionRadius))
+                    {
+                        LogAirMotorReconfiguration(object.name, object.id, motor.type,
+                            "schema " + std::to_string(schemaVersion.get<std::uint32_t>()));
+                    }
+                }
+
+                std::string motorError;
+
+                if(!ValidateAirMotorComponent(motor, &motorError))
+                {
+                    throw std::runtime_error("Invalid Air Motor: " + motorError);
+                }
+
+                object.airMotor = motor;
+            }
+
+            if(item.contains("mistEmitter"))
+            {
+                if(schemaVersion.get<std::uint32_t>() < SceneDocument::kMistEmitterSchemaVersion)
+                {
+                    throw std::runtime_error("Mist Emitters require scene schema version 23.");
+                }
+
+                const auto& value = item.at("mistEmitter");
+                ValidateFields(value, {"enabled", "shape", "emissionOrigin", "emissionRotation", "radius", "halfExtents", "rate", "color",
+                    "density"});
+
+                if(!value.at("enabled").is_boolean() || !value.at("shape").is_string())
+                {
+                    throw std::runtime_error("Mist Emitter enabled must be a boolean and shape a name.");
+                }
+
+                MistEmitterComponent emitter;
+                emitter.enabled = value.at("enabled").get<bool>();
+
+                if(!TryParseMistEmitterShape(value.at("shape").get<std::string>(), emitter.shape))
+                {
+                    throw std::runtime_error("Mist Emitter shape must be Sphere or Box.");
+                }
+
+                emitter.emissionOrigin = ReadVector3(value.at("emissionOrigin"));
+                emitter.emissionRotation = ReadVector3(value.at("emissionRotation"));
+                emitter.radius = ReadNumber(value.at("radius"), "Mist Emitter radius");
+                emitter.halfExtents = ReadVector3(value.at("halfExtents"));
+                emitter.rate = ReadNumber(value.at("rate"), "Mist Emitter rate");
+                emitter.color = ReadVector3(value.at("color"));
+                emitter.density = ReadNumber(value.at("density"), "Mist Emitter density");
+                std::string emitterError;
+
+                if(!ValidateMistEmitterComponent(emitter, &emitterError))
+                {
+                    throw std::runtime_error("Invalid Mist Emitter: " + emitterError);
+                }
+
+                object.mistEmitter = emitter;
+            }
+
+            if(item.contains("voxel"))
+            {
+                if(schemaVersion.get<std::uint32_t>() < SceneDocument::kVoxelSchemaVersion)
+                {
+                    throw std::runtime_error("Voxel fields require scene schema version 19.");
+                }
+
+                const auto& value = item.at("voxel");
+                ValidateFields(value, {"participation", "orientation"});
+                VoxelSettings voxel;
+
+                if(!TryParseVoxelParticipation(value.at("participation").get<std::string>(), voxel.participation) ||
+                    !TryParseVoxelOrientation(value.at("orientation").get<std::string>(), voxel.orientation))
+                {
+                    throw std::runtime_error("Invalid voxel settings.");
+                }
+
+                object.voxel = voxel;
             }
 
             if(item.contains("probeVolume"))

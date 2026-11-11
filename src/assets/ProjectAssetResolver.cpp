@@ -41,6 +41,8 @@ namespace
             case AssetType::ProbeBatch:
             case AssetType::BakedReflections:
             case AssetType::BakedPathing:
+            case AssetType::VoxelRegion:
+            case AssetType::VoxelManifest:
                 return paths.GetRoot();
             case AssetType::Script:
                 return paths.GetScriptsDirectory();
@@ -107,7 +109,8 @@ AssetResolution ProjectAssetResolver::Resolve(
     // Texture resolution uses the root itself; other category directories
     // must still remain strictly inside it, including through junctions.
     const bool textureRoot = (record->type == AssetType::Texture || record->type == AssetType::AcousticMaterial || record->type == AssetType::ProbeBatch ||
-        record->type == AssetType::BakedReflections || record->type == AssetType::BakedPathing) &&
+        record->type == AssetType::BakedReflections || record->type == AssetType::BakedPathing || record->type == AssetType::VoxelRegion ||
+        record->type == AssetType::VoxelManifest) &&
         resolvedCategory == resolvedRoot;
 
     if(!textureRoot && !IsContainedWithin(resolvedCategory, resolvedRoot))

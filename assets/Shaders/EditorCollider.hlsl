@@ -15,6 +15,7 @@ static const uint ColliderShapeSphere = 1;
 static const uint ColliderShapeCapsule = 2;
 static const uint ColliderShapeCone = 3;
 static const uint ColliderShapeArrows = 4;
+static const uint ColliderShapeCylinder = 5;
 
 static const uint SphereSegmentsPerCircle = 64;
 static const uint CapsuleRingSegments = 64;
@@ -215,6 +216,14 @@ float4 ColliderRoleColor(uint role)
         return float4(1.0, 0.72, 0.0, 1.0);                             // Selected Light: selection orange.
     case 11:
         return float4(0.40, 0.39, 0.33, 1.0);                           // Disabled Light: dim olive grey.
+    case 12:
+        return float4(0.45, 0.75, 1.0, 1.0);                            // Air Motor: sky blue.
+    case 13:
+        return float4(1.0, 0.72, 0.0, 1.0);                             // Selected Air Motor: selection orange.
+    case 14:
+        return float4(0.33, 0.38, 0.46, 1.0);                           // Disabled Air Motor: dim slate.
+    case 15:
+        return float4(0.55, 1.0, 0.8, 1.0);                             // Air Motor emission: mint.
     default:
         return float4(0.1, 1.0, 0.35, 1.0);                             // Solid: green.
     }
@@ -230,7 +239,8 @@ ColliderVertexOutput VSMain(uint vertexIndex : SV_VertexID)
 {
     float3 localPosition;
 
-    if(colliderShape == ColliderShapeCapsule)
+    // A cylinder is the capsule's leading lines (rings, then longitudinal lines); its draw count stops before the arcs.
+    if(colliderShape == ColliderShapeCapsule || colliderShape == ColliderShapeCylinder)
     {
         localPosition = CapsuleEndpoint(vertexIndex, capsuleHalfCylinderHeight);
     }

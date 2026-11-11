@@ -1,5 +1,6 @@
 #include "Renderer/BuiltinEnvironment.h"
 #include "Scene/SceneDocument.h"
+#include "Platform/Windows/WindowsWindow.h"
 #include <cassert>
 #include "Debug/TransitionTiming.h"
 #include <cstring>
@@ -4456,6 +4457,28 @@ bool Renderer::Initialize(
         return false;
     }
 
+    if(!m_packagedRuntime && !m_editorVoxelPass.Initialize(device, m_shaderLibrary))
+    {
+        Log::Error("Failed to initialize editor voxel overlay pass.");
+        return false;
+    }
+
+    // VX.5: allocates nothing until residency is configured.
+    m_voxelResidency.Initialize(device, m_resourceDescriptorHeap, {});
+
+    if(!m_packagedRuntime && !m_editorAirPass.Initialize(device, m_shaderLibrary))
+    {
+        Log::Error("Failed to initialize the editor air visualization pass.");
+        return false;
+    }
+
+    // AIR.1: allocates nothing until air is first enabled.
+    if (!m_airField.Initialize(device, m_resourceDescriptorHeap, m_shaderLibrary))
+    {
+        Log::Error("Failed to initialize the air field.");
+        return false;
+    }
+
     // PSR replacement and denoiser variants are queued on first supported request.
 
     if (!m_resourceUploader.Initialize(device))
@@ -4474,6 +4497,17 @@ bool Renderer::Initialize(
     {
         Log::Error("Failed to init resource descriptor heap.");
 
+        return false;
+    }
+
+    // AIR.4F F3: allocates nothing until mist is first drawn, except (F4.1) the 256 KiB Worley texture, uploaded here (after the
+    // uploader and the resource heap it needs).
+    if(!m_packagedRuntime && !m_editorMistPass.Initialize(device, m_resourceDescriptorHeap, m_shaderLibrary, m_resourceUploader,
+        WindowsWindow::GetExecutableDirectory() / "assets" / "Textures" / "Air" / "MistWorley64.dds",
+        WindowsWindow::GetExecutableDirectory() / "assets" / "Textures" / "Air" / "MistCurl64.dds",
+        WindowsWindow::GetExecutableDirectory() / "assets" / "Textures" / "Air" / "MistFilaments128.dds"))
+    {
+        Log::Error("Failed to initialize the editor mist pass.");
         return false;
     }
 
@@ -11473,6 +11507,14 @@ bool Renderer::RecordRenderFrame(
     m_uploadBuffer.Reset(frameIndex);
     ObserveFrameUploadReset(frameIndex);
 
+    // VX.5: residency copies first, before any pass; the slot's previous submission is complete (Begin waited for it).
+    m_voxelResidency.RecordUploads(commandList, frameIndex, m_commandContext.GetLastSubmissionFenceValue(),
+        m_commandContext.GetCompletedFenceValue(), m_commandContext.GetSubmissionLifetime());
+
+    // AIR.1: after the residency uploads, so its obstacle mask reads this frame's VX.5 binding; before any pass.
+    m_airField.Record(commandList, m_resourceDescriptorHeap, m_uploadBuffer, options.air.value_or(AirFrameRequest{}), m_voxelResidency.GetBinding(),
+        frameIndex, m_commandContext.GetLastSubmissionFenceValue(), m_commandContext.GetCompletedFenceValue());
+
     // Camera-selected displacement LODs.
     // Diagnostic only; does not modify geometry.
     const auto& diagnosticPatchLODs = scene.GetDisplacementPatchLODs();
@@ -13115,6 +13157,26 @@ bool Renderer::RecordRenderFrame(
         presentedDepth = &m_overlayDepth;
     }
 
+    // AIR.4F F4.3: lit mist scatters the scene's light, so it is scene radiance: composited into the HDR scene colour before tone mapping
+    // (and after exposure metering, which therefore does not see it). It reads the sun, the Light table and the TLAS as this frame's
+    // deferred lighting and sun shadow do. Unlit mist keeps its place after tone mapping, below.
+    const bool litMist = !m_packagedRuntime && options.airMist && options.airMist->lighting;
+    m_lastAirMistRequestForTesting = options.airMist;
+
+    if(litMist)
+    {
+        AirMistLighting mistLighting;
+        mistLighting.sunDirection = light.direction;
+        mistLighting.sunRadiance = light.color * light.intensity;
+        mistLighting.lightTable = sceneLightConstantsAddress;
+        mistLighting.topLevel = m_rayTracingScene.GetTopLevel().GetGPUAddress();
+        mistLighting.environmentIrradiance = m_environment.GetDiffuseIrradiance().GetDescriptorIndex();
+        m_editorMistPass.Execute(commandList, m_resourceDescriptorHeap, m_uploadBuffer, *presentedColor, *presentedDepth,
+            currentViewProjection, frameView.position, m_airField.GetBinding(), m_airField.GetMistBinding(), *options.airMist,
+            m_airField.GetMistSeconds(), m_commandContext.GetLastSubmissionFenceValue(), m_commandContext.GetCompletedFenceValue(),
+            nullptr, 0, &mistLighting);
+    }
+
     // Final composition precedes collider lines and the distinct Editor/packaged presentation paths.
     m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::ToneMap);
 
@@ -13167,6 +13229,48 @@ bool Renderer::RecordRenderFrame(
     // The grid goes first so collider lines stay on top of it.
     // Editor overlays are composed only into the Editor fly view; a Game Camera frame never shows them.
     const bool editorOverlayFrame = !m_packagedRuntime && frameView.identity.source == RenderViewSource::EditorFly;
+
+    // VX.4C.2: the voxel cubes write the presented depth, so the grid and collider lines after them respect them. This frame's
+    // lighting and depth-history copy are already recorded, and the next frame clears or rewrites this depth before reading it.
+    m_editorVoxelPass.CollectRetired(m_commandContext.GetCompletedFenceValue());
+
+    if (editorOverlayFrame && options.editorVoxelOverlay)
+    {
+        m_editorVoxelPass.Execute(commandList, m_finalSceneColor, *presentedDepth, currentViewProjection, *options.editorVoxelOverlay);
+    }
+
+    // AIR.4A: velocity vectors from this frame's air field, in Editor and Play frames alike (Play shows the game camera's view).
+    // AIR.4F F3: the mist before the air diagnostics and vectors, so they stay readable over it; a frame without mist retires the
+    // pass's storage and records nothing.
+    if(!m_packagedRuntime && options.airMist && !litMist)
+    {
+        m_editorMistPass.Execute(commandList, m_resourceDescriptorHeap, m_uploadBuffer, m_finalSceneColor, *presentedDepth,
+            currentViewProjection, frameView.position, m_airField.GetBinding(), m_airField.GetMistBinding(), *options.airMist,
+            m_airField.GetMistSeconds(), m_commandContext.GetLastSubmissionFenceValue(), m_commandContext.GetCompletedFenceValue());
+    }
+    else if(!m_packagedRuntime && !litMist)
+    {
+        m_editorMistPass.Idle(m_commandContext.GetLastSubmissionFenceValue(), m_commandContext.GetCompletedFenceValue());
+    }
+
+    m_lastAirVectorCount = 0;
+    m_lastAirCellCount = 0;
+    m_lastAirSubcellCount = 0;
+
+    // AIR.4C/AIR.4D: the obstacle mask's cells and the fluid pieces' boundary first, so the vectors draw over them.
+    if (!m_packagedRuntime && options.airCells)
+    {
+        m_lastAirCellCount = m_editorAirPass.ExecuteCells(commandList, m_resourceDescriptorHeap, m_finalSceneColor, *presentedDepth,
+            currentViewProjection, m_airField.GetBinding(), *options.airCells);
+        m_lastAirSubcellCount = m_editorAirPass.ExecutePieces(commandList, m_resourceDescriptorHeap, m_uploadBuffer, m_finalSceneColor,
+            *presentedDepth, currentViewProjection, m_airField.GetBinding(), GetVoxelWorldBinding(), *options.airCells);
+    }
+
+    if (!m_packagedRuntime && options.airVisualization)
+    {
+        m_lastAirVectorCount = m_editorAirPass.Execute(commandList, m_resourceDescriptorHeap, m_finalSceneColor, *presentedDepth,
+            currentViewProjection, m_airField.GetBinding(), *options.airVisualization);
+    }
 
     if (editorOverlayFrame && options.editorGrid)
     {
@@ -13468,6 +13572,7 @@ bool Renderer::RecordRenderFrame(
 
     m_gpuTimestampProfiler.MarkSubmitted(frameIndex, submissionFence, m_gpuProfilerFrameSerial);
     m_autoExposurePass.MarkSubmitted(frameIndex, submissionFence);
+    m_airField.MarkSubmitted(frameIndex, submissionFence);
     m_aoExecutedLastFrame = runAO;
 
     m_pendingStatistics[frameIndex].statistics = m_currentFrameStatistics;
@@ -13606,6 +13711,12 @@ void Renderer::Shutdown()
     m_toneMapPass.Shutdown();
     m_editorColliderPass.Shutdown();
     m_editorGridPass.Shutdown();
+    // After the GPU drain above: also releases overlay buffers still queued for retirement.
+    m_editorVoxelPass.Shutdown();
+    m_editorAirPass.Shutdown();
+    m_editorMistPass.Shutdown();
+    m_voxelResidency.Shutdown();
+    m_airField.Shutdown();
     m_psrInPlaceReplacePass.Shutdown();
     m_brdfIntegrationPass.Shutdown();
     m_ggxAverageAlbedoPass.Shutdown();
@@ -14211,6 +14322,53 @@ std::uint64_t Renderer::GetEditorCompletedFence() const
 std::uint64_t Renderer::GetEditorSubmissionFence() const
 {
     return m_commandContext.GetLastSubmissionFenceValue();
+}
+
+std::uint64_t Renderer::PublishEditorVoxelOverlay(const EditorVoxelOverlay::Data& data, std::string* error)
+{
+    m_editorVoxelPass.CollectRetired(m_commandContext.GetCompletedFenceValue());
+    return m_editorVoxelPass.Publish(m_graphicsDevice.GetDevice(), m_resourceUploader, data,
+        m_commandContext.GetLastSubmissionFenceValue(), error);
+}
+
+void Renderer::ClearEditorVoxelOverlay()
+{
+    m_editorVoxelPass.Clear(m_commandContext.GetLastSubmissionFenceValue());
+}
+
+bool Renderer::ConfigureVoxelResidency(std::uint32_t regionBricks, int baseExponent, std::uint32_t window, std::string* error)
+{
+    return m_voxelResidency.Configure(regionBricks, baseExponent, window, m_commandContext.GetLastSubmissionFenceValue(), error);
+}
+
+void Renderer::ReleaseAirField()
+{
+    m_airField.Release(m_commandContext.GetLastSubmissionFenceValue());
+}
+
+void Renderer::ResetVoxelResidency()
+{
+    m_voxelResidency.Reset(m_commandContext.GetLastSubmissionFenceValue());
+}
+
+std::optional<std::uint32_t> Renderer::AddVoxelResidencyRegion(const Voxel::Residency::PackedRegion& region)
+{
+    return m_voxelResidency.AddRegion(region, m_commandContext.GetCompletedFenceValue());
+}
+
+void Renderer::RemoveVoxelResidencyRegion(std::uint32_t slot)
+{
+    m_voxelResidency.RemoveRegion(slot);
+}
+
+void Renderer::SetVoxelResidencyTable(std::vector<Voxel::Residency::TableEntry> table)
+{
+    m_voxelResidency.SetTable(std::move(table));
+}
+
+std::vector<std::uint32_t> Renderer::TakeUploadedVoxelResidencySlots()
+{
+    return m_voxelResidency.TakeUploadedSlots();
 }
 
 bool Renderer::WaitForGPU()

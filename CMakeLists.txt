@@ -185,6 +185,46 @@ if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/assets/t
     target_link_libraries(AudioBankAssetTests PRIVATE EngineScriptAssets nlohmann_json ole32)
 endif()
 
+# VX.1 local-only diagnostics: voxel lattice, region and manifest formats. No other Engine dependency.
+if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Voxel/tests/VoxelFormatTests.cpp")
+    add_executable(VoxelFormatTests src/Voxel/tests/VoxelFormatTests.cpp src/Voxel/VoxelRegion.cpp src/Voxel/VoxelManifest.cpp)
+    target_include_directories(VoxelFormatTests PRIVATE src)
+    target_compile_options(VoxelFormatTests PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/W4>)
+endif()
+
+# VX.2 local-only diagnostics: CPU voxelization. Links the audio probe classifier read-only, as an equivalence reference.
+if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Voxel/tests/VoxelBakeTests.cpp")
+    add_executable(VoxelBakeTests src/Voxel/tests/VoxelBakeTests.cpp src/Voxel/VoxelBake.cpp src/Voxel/VoxelGeometry.cpp
+        src/Voxel/VoxelAcceleration.cpp src/Voxel/VoxelRegion.cpp src/Audio/ProbeSolidClassifier.cpp)
+    target_include_directories(VoxelBakeTests PRIVATE src)
+    target_compile_options(VoxelBakeTests PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/W4>)
+endif()
+
+# VX.4A local-only diagnostics: world partitioning, bake orchestration and publication. Run in Release.
+if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Voxel/tests/VoxelWorldBakeTests.cpp")
+    add_executable(VoxelWorldBakeTests src/Voxel/tests/VoxelWorldBakeTests.cpp src/Voxel/VoxelWorldBake.cpp src/Voxel/VoxelAssetStore.cpp
+        src/Voxel/VoxelBake.cpp src/Voxel/VoxelGeometry.cpp src/Voxel/VoxelAcceleration.cpp src/Voxel/VoxelRegion.cpp src/Voxel/VoxelManifest.cpp)
+    target_include_directories(VoxelWorldBakeTests PRIVATE src)
+    target_compile_options(VoxelWorldBakeTests PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/W4>)
+endif()
+
+# VX.3b local-only benchmark: per-stage Release timings of the voxel bake scenes.
+# VX.5 local-only regression: residency packing, lookup and planning against an independent oracle. Run in Release.
+if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Voxel/tests/VoxelResidencyTests.cpp")
+    add_executable(VoxelResidencyTests src/Voxel/tests/VoxelResidencyTests.cpp src/Voxel/VoxelResidency.cpp src/Voxel/VoxelWorldBake.cpp
+        src/Voxel/VoxelAssetStore.cpp src/Voxel/VoxelBake.cpp src/Voxel/VoxelGeometry.cpp src/Voxel/VoxelAcceleration.cpp
+        src/Voxel/VoxelRegion.cpp src/Voxel/VoxelManifest.cpp)
+    target_include_directories(VoxelResidencyTests PRIVATE src)
+    target_compile_options(VoxelResidencyTests PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/W4>)
+endif()
+
+if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Voxel/tests/VoxelBakeBenchmark.cpp")
+    add_executable(VoxelBakeBenchmark src/Voxel/tests/VoxelBakeBenchmark.cpp src/Voxel/VoxelBake.cpp src/Voxel/VoxelGeometry.cpp
+        src/Voxel/VoxelAcceleration.cpp src/Voxel/VoxelRegion.cpp)
+    target_include_directories(VoxelBakeBenchmark PRIVATE src)
+    target_compile_options(VoxelBakeBenchmark PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/W4>)
+endif()
+
 # RTXPT.1A.1 offline generator for the bundled GGX single-scatter complement tables
 # (assets/MaterialTables). Off by default: normal builds neither need nor run it.
 option(ENGINE_BUILD_MATERIAL_TABLE_GENERATOR "Build the offline material table generator" OFF)
@@ -385,6 +425,11 @@ add_library(EngineCore OBJECT
     src/Renderer/EditorColliderOverlay.cpp
     src/Renderer/FrameLighting.cpp
     src/Renderer/Passes/EditorColliderPass.cpp
+    src/Renderer/Passes/EditorVoxelPass.cpp
+    src/Renderer/Passes/EditorAirPass.cpp
+    src/Renderer/Passes/EditorMistPass.cpp
+    src/Renderer/VoxelResidencyResources.cpp
+    src/Renderer/AirField.cpp
     src/Renderer/Passes/SelectionMaskPass.cpp
     src/Renderer/Passes/RayTracedGIPass.cpp
     src/Renderer/Passes/NrdDiffuseResolvePass.cpp
@@ -400,6 +445,21 @@ add_library(EngineCore OBJECT
     src/Renderer//DisplacementGPUIndexLayout.cpp
     src/Renderer/DisplacementGPUPatchBuffer.cpp
     src/Scene/SceneDocument.cpp
+    src/Scene/VoxelComponents.cpp
+    src/Scene/AirMotorComponent.cpp
+    src/Scene/MistEmitterComponent.cpp
+    src/Voxel/VoxelAcceleration.cpp
+    src/Voxel/VoxelAssetStore.cpp
+    src/Voxel/VoxelBake.cpp
+    src/Voxel/VoxelGeometry.cpp
+    src/Voxel/VoxelManifest.cpp
+    src/Voxel/VoxelRegion.cpp
+    src/Voxel/VoxelResidency.cpp
+    src/Voxel/VoxelWorldBake.cpp
+    src/Engine/VoxelProjectStore.cpp
+    src/Engine/VoxelScene.cpp
+    src/Engine/VoxelVisualization.cpp
+    src/Engine/VoxelResidencyController.cpp
     src/Scene/RenderView.cpp
     src/Scene/SceneLighting.cpp
     src/Scene/SceneSerializer.cpp
@@ -427,6 +487,7 @@ add_library(EngineCore OBJECT
     src/Scene/PhysicsPresentation.cpp
     src/Scene/CameraFrustumOverlay.cpp
     src/Scene/SceneLightCapture.cpp
+    src/Scene/AirMotorCapture.cpp
     src/Engine/PhysicsSimulationController.cpp
     src/Engine/EditorPhysicsSimulation.cpp
     src/Engine/PackagedGame.cpp
@@ -440,6 +501,10 @@ add_library(EngineCore OBJECT
     src/Editor/ScriptControls.cpp
     src/Editor/AudioControls.cpp
     src/Editor/AcousticControls.cpp
+    src/Editor/VoxelControls.cpp
+    src/Editor/AirMotorControls.cpp
+    src/Editor/MistEmitterControls.cpp
+    src/Editor/AirControls.cpp
     src/Editor/ProbeVolumeControls.cpp
     src/Editor/ReflectionBakeControls.cpp
     src/Editor/PathingBakeControls.cpp
@@ -521,6 +586,13 @@ if(ENGINE_BUILD_DIAGNOSTICS)
         $<$<CONFIG:Debug>:src/assets/tests/CookedMeshPreparationVerification.cpp>
         $<$<CONFIG:Debug>:src/Engine/tests/MaterialLocateVerification.cpp>
         $<$<CONFIG:Debug>:src/Engine/tests/ViewportPanVerification.cpp>
+        $<$<CONFIG:Debug>:src/Engine/tests/VoxelEditorVerification.cpp>
+        $<$<CONFIG:Debug>:src/Engine/tests/VoxelOverlayVerification.cpp>
+        $<$<CONFIG:Debug>:src/Engine/tests/VoxelResidencyVerification.cpp>
+        $<$<CONFIG:Debug>:src/Engine/tests/VoxelQueryVerification.cpp>
+        $<$<CONFIG:Debug>:src/Engine/tests/VoxelStreamingVerification.cpp>
+        $<$<CONFIG:Debug>:src/Engine/tests/AirFieldVerification.cpp>
+        $<$<CONFIG:Debug>:src/Engine/tests/AirMotorEditorVerification.cpp>
         $<$<CONFIG:Debug>:src/Engine/tests/SceneDuplicationVerification.cpp>
         $<$<CONFIG:Debug>:src/Engine/tests/ScenePhysicsDataVerification.cpp>
         $<$<CONFIG:Debug>:src/Engine/tests/PrimitiveCreationVerification.cpp>
@@ -580,6 +652,13 @@ if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Engine/t
 endif()
 
 # Local-only Audio.2A scene audio data regression (components, codecs, audio world poses).
+# AIR.3 local-only regression: Air Motor validation, scene and cooked round trips. Run in Release.
+if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Engine/tests/AirMotorSceneTests.cpp")
+    add_executable(AirMotorSceneTests src/Engine/tests/AirMotorSceneTests.cpp)
+    target_link_libraries(AirMotorSceneTests PRIVATE EngineCore)
+    target_compile_definitions(AirMotorSceneTests PRIVATE ENGINE_SOURCE_DIRECTORY="${CMAKE_CURRENT_SOURCE_DIR}")
+endif()
+
 if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Engine/tests/AudioSceneDataTests.cpp")
     add_executable(AudioSceneDataTests src/Engine/tests/AudioSceneDataTests.cpp)
     target_link_libraries(AudioSceneDataTests PRIVATE EngineCore)
@@ -589,6 +668,18 @@ endif()
 if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Engine/tests/ReflectionBakeTests.cpp")
     add_executable(ReflectionBakeTests src/Engine/tests/ReflectionBakeTests.cpp)
     target_link_libraries(ReflectionBakeTests PRIVATE EngineCore)
+endif()
+
+# VX.4B local-only regression: voxel participation, scene capture, bake jobs and project persistence. Run in Release.
+if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Engine/tests/VoxelSceneTests.cpp")
+    add_executable(VoxelSceneTests src/Engine/tests/VoxelSceneTests.cpp)
+    target_link_libraries(VoxelSceneTests PRIVATE EngineCore)
+endif()
+
+# VX.4C.2 local-only regression: the voxel overlay build against an independent oracle. Run in Release.
+if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Engine/tests/VoxelOverlayTests.cpp")
+    add_executable(VoxelOverlayTests src/Engine/tests/VoxelOverlayTests.cpp)
+    target_link_libraries(VoxelOverlayTests PRIVATE EngineCore)
 endif()
 
 # M8.3 local-only regression: real Steam Audio baking through AudioSystem and ReflectionBakeJobs, same guard.

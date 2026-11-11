@@ -786,6 +786,40 @@ bool FileBackedDemoScene::SetObjectLight(const SceneObjectMetadata& selection,
     return m_runtime->SetObjectLight(selection, expected, replacement, errorMessage);
 }
 
+bool FileBackedDemoScene::SetObjectAirMotor(const SceneObjectMetadata& selection,
+    const std::optional<AirMotorComponent>& expected, const std::optional<AirMotorComponent>& replacement,
+    std::string* errorMessage)
+{
+    if(!m_initialized || m_objectMutationCandidate)
+    {
+        if(errorMessage)
+        {
+            *errorMessage = "Air Motor editing requires an initialized scene without pending structure changes.";
+        }
+
+        return false;
+    }
+
+    return m_runtime->SetObjectAirMotor(selection, expected, replacement, errorMessage);
+}
+
+bool FileBackedDemoScene::SetObjectMistEmitter(const SceneObjectMetadata& selection,
+    const std::optional<MistEmitterComponent>& expected, const std::optional<MistEmitterComponent>& replacement,
+    std::string* errorMessage)
+{
+    if(!m_initialized || m_objectMutationCandidate)
+    {
+        if(errorMessage)
+        {
+            *errorMessage = "Mist Emitter editing requires an initialized scene without pending structure changes.";
+        }
+
+        return false;
+    }
+
+    return m_runtime->SetObjectMistEmitter(selection, expected, replacement, errorMessage);
+}
+
 bool FileBackedDemoScene::SetObjectScript(const SceneObjectMetadata& selection,
     const std::optional<ScriptComponent>& expected, const std::optional<ScriptComponent>& replacement,
     std::string* errorMessage)
@@ -817,6 +851,53 @@ bool FileBackedDemoScene::SetObjectAudio(const SceneObjectMetadata& selection, c
     }
 
     return m_runtime->SetObjectAudio(selection, expected, replacement, errorMessage);
+}
+
+bool FileBackedDemoScene::SetObjectsVoxelSettings(const std::vector<FileSceneRuntime::VoxelSettingsChange>& changes, std::string* errorMessage)
+{
+    if(!m_initialized || m_objectMutationCandidate)
+    {
+        if(errorMessage)
+        {
+            *errorMessage = "The scene is not ready for voxel edits.";
+        }
+
+        return false;
+    }
+
+    return m_runtime->SetObjectsVoxelSettings(changes, errorMessage);
+}
+
+bool FileBackedDemoScene::SetSceneVoxelBake(const std::optional<VoxelBakeSettings>& expected, const std::optional<VoxelBakeSettings>& replacement,
+    std::string* errorMessage)
+{
+    if(!m_initialized || m_objectMutationCandidate)
+    {
+        if(errorMessage)
+        {
+            *errorMessage = "The scene is not ready for voxel edits.";
+        }
+
+        return false;
+    }
+
+    return m_runtime->SetSceneVoxelBake(expected, replacement, errorMessage);
+}
+
+bool FileBackedDemoScene::SetSceneMistRendering(const std::optional<MistRenderSettings>& expected,
+    const std::optional<MistRenderSettings>& replacement, std::string* errorMessage)
+{
+    if(!m_initialized || m_objectMutationCandidate)
+    {
+        if(errorMessage)
+        {
+            *errorMessage = "The scene is not ready for mist rendering edits.";
+        }
+
+        return false;
+    }
+
+    return m_runtime->SetSceneMistRendering(expected, replacement, errorMessage);
 }
 
 bool FileBackedDemoScene::SetObjectAcoustics(const SceneObjectMetadata& selection, const std::optional<AcousticSettings>& expected,

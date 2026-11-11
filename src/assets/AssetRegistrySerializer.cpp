@@ -22,7 +22,8 @@ namespace
     constexpr int kProbeBatchSchemaVersion = 6;
     constexpr int kBakedReflectionsSchemaVersion = 7;
     constexpr int kBakedPathingSchemaVersion = 8;
-    constexpr int kSchemaVersion = kBakedPathingSchemaVersion;
+    constexpr int kVoxelSchemaVersion = 9;
+    constexpr int kSchemaVersion = kVoxelSchemaVersion;
 
     const char* AssetTypeToString(AssetType type)
     {
@@ -45,6 +46,10 @@ namespace
                 return "bakedReflections";
             case AssetType::BakedPathing:
                 return "bakedPathing";
+            case AssetType::VoxelRegion:
+                return "voxelRegion";
+            case AssetType::VoxelManifest:
+                return "voxelManifest";
             default:
                 return nullptr;
         }
@@ -99,6 +104,18 @@ namespace
         if(value == "bakedPathing")
         {
             type = AssetType::BakedPathing;
+            return true;
+        }
+
+        if(value == "voxelRegion")
+        {
+            type = AssetType::VoxelRegion;
+            return true;
+        }
+
+        if(value == "voxelManifest")
+        {
+            type = AssetType::VoxelManifest;
             return true;
         }
 
@@ -178,6 +195,11 @@ nlohmann::json AssetRegistrySerializer::Serialize(const ProjectAssetRegistry& re
         if(record.type == AssetType::BakedPathing)
         {
             document["schemaVersion"] = (std::max)(document["schemaVersion"].get<int>(), kBakedPathingSchemaVersion);
+        }
+
+        if(record.type == AssetType::VoxelRegion || record.type == AssetType::VoxelManifest)
+        {
+            document["schemaVersion"] = (std::max)(document["schemaVersion"].get<int>(), kVoxelSchemaVersion);
         }
 
         if(record.type == AssetType::AcousticMaterial)
@@ -280,6 +302,11 @@ bool AssetRegistrySerializer::Deserialize(
             if(type == AssetType::BakedPathing && document["schemaVersion"].get<int>() < kBakedPathingSchemaVersion)
             {
                 return Fail(errorMessage, "Baked pathing assets require registry schema 8.");
+            }
+
+            if((type == AssetType::VoxelRegion || type == AssetType::VoxelManifest) && document["schemaVersion"].get<int>() < kVoxelSchemaVersion)
+            {
+                return Fail(errorMessage, "Voxel assets require registry schema 9.");
             }
 
             if(type == AssetType::AudioBank && document["schemaVersion"].get<int>() < kAudioBankSchemaVersion)

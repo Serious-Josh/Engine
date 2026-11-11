@@ -1,6 +1,11 @@
 #pragma once
 #include "Renderer/Passes/EditorColliderPass.h"
 #include "Renderer/Passes/EditorGridPass.h"
+#include "Renderer/Passes/EditorVoxelPass.h"
+#include "Renderer/Passes/EditorAirPass.h"
+#include "Renderer/Passes/EditorMistPass.h"
+#include "Renderer/VoxelResidencyResources.h"
+#include "Renderer/AirField.h"
 #include "Renderer/Passes/PsrInPlaceReplacePass.h"
 #include "Renderer/PsrPipelinePreparation.h"
 #include "Debug/CpuFrameTiming.h"
@@ -113,6 +118,16 @@ struct EnvironmentAsset
 struct RendererOptions
 {
     const EditorColliderOverlay* editorColliderOverlay = nullptr; // Borrowed for this Render call only.
+    // VX.4C.2 voxel debug overlay; drawn only while its generation names the published data. Borrowed for this call.
+    const EditorVoxelOverlay::Request* editorVoxelOverlay = nullptr;
+    // AIR.1: the camera-centred air field; absent or disabled means no air work (the air binding is then invalid).
+    std::optional<AirFrameRequest> air;
+    // AIR.4A: the Editor's velocity vectors, drawn in Editor and Play frames (never in a packaged runtime).
+    std::optional<AirVisualizationRequest> airVisualization;
+    // AIR.4F F3: the Editor's volumetric mist, drawn like the vectors (before them) while the air field holds mist.
+    std::optional<AirMistRenderRequest> airMist;
+    // AIR.4C: the Editor's air-cell diagnostic (blocked and unknown cells of the obstacle mask), drawn like the vectors.
+    std::optional<AirCellRequest> airCells;
     // Editor viewport grid for this frame; absent in Play mode, with the Overlay off and in runtime.
     std::optional<EditorGridRequest> editorGrid;
 
@@ -849,6 +864,62 @@ class Renderer
     std::uint64_t GetEditorCompletedFence() const;
     std::uint64_t GetEditorSubmissionFence() const;
 
+    // VX.4C.2: replaces the Editor voxel overlay data (synchronous upload). Call between frames, never while recording.
+    // Returns the new generation for EditorVoxelOverlay::Request, or 0 on failure (the previous data stays current).
+    std::uint64_t PublishEditorVoxelOverlay(const EditorVoxelOverlay::Data& data, std::string* error);
+    // Drops the overlay data; its buffers are released once the GPU completes every frame that read them.
+    void ClearEditorVoxelOverlay();
+    std::size_t GetEditorVoxelRetiredBufferCount() const noexcept
+    {
+        return m_editorVoxelPass.GetRetiredCount();
+    }
+
+    // VX.5 static voxel obstacle residency (VoxelResidencyResources.h). Main thread, between frames; Render records the uploads
+    // at the start of its command list and publishes the table once every region it names is uploaded.
+    bool ConfigureVoxelResidency(std::uint32_t regionBricks, int baseExponent, std::uint32_t window, std::string* error);
+    void ResetVoxelResidency();
+    std::optional<std::uint32_t> AddVoxelResidencyRegion(const Voxel::Residency::PackedRegion& region);
+    void RemoveVoxelResidencyRegion(std::uint32_t slot);
+    void SetVoxelResidencyTable(std::vector<Voxel::Residency::TableEntry> table);
+    std::vector<std::uint32_t> TakeUploadedVoxelResidencySlots();
+    // The binding this frame's consumers read; `valid` is 0 until a table is published (every query then answers unknown).
+    const VoxelWorldBinding& GetVoxelWorldBinding() const noexcept
+    {
+        return m_voxelResidency.GetBinding();
+    }
+
+    // AIR.1 air field (AirField.h). Reset re-initializes the whole field on the next enabled frame (scene change); Release frees
+    // its storage once the GPU is done with it.
+    void ResetAirField() noexcept
+    {
+        m_airField.ResetField();
+    }
+
+    void ReleaseAirField();
+
+    // AIR.4F: zeroes all mist on the next frame with mist.
+    void ClearAirMist() noexcept
+    {
+        m_airField.ClearMist();
+    }
+    // Valid after an enabled frame recorded its update; consumers in that frame read it.
+    const AirFieldBinding& GetAirFieldBinding() const noexcept
+    {
+        return m_airField.GetBinding();
+    }
+
+    // AIR.4D D2: the latest Air Motor emission status, by AirMotorInstance::tag (a few frames old; empty while air is off).
+    const std::map<std::uint64_t, AirMotorEmissionStatus>& GetAirMotorEmission() const noexcept
+    {
+        return m_airField.GetEmissionStatus();
+    }
+
+    // AIR.4F F2: the latest Mist Emitter status, by MistEmitterInstance::tag (a few frames old; empty while mist is off).
+    const std::map<std::uint64_t, MistEmitterStatus>& GetMistEmitterStatus() const noexcept
+    {
+        return m_airField.GetMistEmitterStatus();
+    }
+
     bool WaitForGPU();
 
     bool ReplaceMeshGeometry(
@@ -1015,6 +1086,13 @@ class Renderer
     friend class ThumbnailSchedulingVerification;
     friend class NormalMapVerification;
     friend class EditorGridVerification;
+    friend class VoxelOverlayVerification;
+    friend class VoxelResidencyVerification;
+    friend class VoxelQueryVerification;
+    friend class VoxelQueryRig;
+    friend class VoxelStreamingVerification;
+    friend class AirFieldVerification;
+    friend class AirMotorEditorVerification;
     friend class BackgroundTasksVerification;
     friend class ProjectBrowserVerification;
 #endif
@@ -1654,6 +1732,17 @@ class Renderer
     ToneMapPass m_toneMapPass;
     EditorColliderPass m_editorColliderPass;
     EditorGridPass m_editorGridPass;
+    EditorVoxelPass m_editorVoxelPass;
+    EditorAirPass m_editorAirPass;
+    EditorMistPass m_editorMistPass;
+    // Diagnostics: vectors drawn by the last frame.
+    std::uint32_t m_lastAirVectorCount = 0;
+    // Diagnostics: cells examined by the last frame's air-cell view.
+    std::uint32_t m_lastAirCellCount = 0;
+    // Diagnostics: sub-cells examined by the last frame's fluid-pieces view.
+    std::uint32_t m_lastAirSubcellCount = 0;
+    VoxelResidencyResources m_voxelResidency;
+    AirField m_airField;
     // PSR.2 Stage 2 development prototype (PathTraceReferenceSettings::primarySurfaceReplacementInPlace).
     PsrInPlaceReplacePass m_psrInPlaceReplacePass;
     std::shared_ptr<PsrPipelinePreparation> m_psrPreparedAuxiliary;
@@ -1892,6 +1981,8 @@ class Renderer
     CameraJitterStatus m_cameraJitterStatus;
     // Diagnostics only: this offset (render pixels) on every jittered frame in place of the sequence.
     std::optional<std::array<float, 2>> m_cameraJitterForTesting;
+    // AIR.4F F4.4.1: the last recorded frame's mist request (none: no mist requested), for checking what the Engine passed.
+    std::optional<AirMistRenderRequest> m_lastAirMistRequestForTesting;
 
     void UpdateSharcStatus(unsigned int frameSlot);
     // The query-side library the frame's settings select (Query, QueryTermination or Render). NRD.RELAX.2B:

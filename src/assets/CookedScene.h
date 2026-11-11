@@ -41,7 +41,15 @@ namespace CookedScene
     inline constexpr std::uint32_t BakedReflectionsVersion = 23;
     // M9.5: a Probe Volume's pathing enable, pathing bake settings and baked pathing reference; an Audio Source's pathing opt-in.
     inline constexpr std::uint32_t PathingVersion = 24;
-    inline constexpr std::uint32_t Version = PathingVersion;
+    // AIR.3: an Air Motor per object.
+    inline constexpr std::uint32_t AirMotorVersion = 25;
+    // AIR.4D D2: an Air Motor's emission origin and emission radius.
+    inline constexpr std::uint32_t AirMotorEmissionVersion = 26;
+    // AIR.4D D2.1: Air Motor emission semi-axes and rotation replace the emission radius.
+    inline constexpr std::uint32_t AirMotorShapeVersion = 27;
+    // AIR.4F F2: a Mist Emitter per object.
+    inline constexpr std::uint32_t MistEmitterVersion = 28;
+    inline constexpr std::uint32_t Version = MistEmitterVersion;
 
     constexpr bool IsSupportedVersion(std::uint32_t version)
     {
@@ -68,7 +76,11 @@ namespace CookedScene
             version == ProbeVolumeVersion ||
             version == ProbeFilterVersion ||
             version == BakedReflectionsVersion ||
-            version == PathingVersion;
+            version == PathingVersion ||
+            version == AirMotorVersion ||
+            version == AirMotorEmissionVersion ||
+            version == AirMotorShapeVersion ||
+            version == MistEmitterVersion;
     }
     struct Policy
     {

@@ -122,12 +122,22 @@ public:
     }
     bool SetObjectLight(const SceneObjectMetadata& selection, const std::optional<LightComponent>& expected,
         const std::optional<LightComponent>& replacement, std::string* errorMessage = nullptr);
+    bool SetObjectAirMotor(const SceneObjectMetadata& selection, const std::optional<AirMotorComponent>& expected,
+        const std::optional<AirMotorComponent>& replacement, std::string* errorMessage = nullptr);
+    bool SetObjectMistEmitter(const SceneObjectMetadata& selection, const std::optional<MistEmitterComponent>& expected,
+        const std::optional<MistEmitterComponent>& replacement, std::string* errorMessage = nullptr);
     bool SetObjectScript(const SceneObjectMetadata& selection, const std::optional<ScriptComponent>& expected,
         const std::optional<ScriptComponent>& replacement, std::string* errorMessage = nullptr);
     bool SetObjectAcoustics(const SceneObjectMetadata& selection, const std::optional<AcousticSettings>& expected,
         const std::optional<AcousticSettings>& replacement, std::string* errorMessage = nullptr);
     bool SetObjectProbeVolume(const SceneObjectMetadata& selection, const std::optional<ProbeVolumeComponent>& expected,
         const std::optional<ProbeVolumeComponent>& replacement, std::string* errorMessage = nullptr);
+    bool SetObjectsVoxelSettings(const std::vector<FileSceneRuntime::VoxelSettingsChange>& changes, std::string* errorMessage = nullptr);
+    bool SetSceneVoxelBake(const std::optional<VoxelBakeSettings>& expected, const std::optional<VoxelBakeSettings>& replacement,
+        std::string* errorMessage = nullptr);
+    // AIR.4F F4.4.1.
+    bool SetSceneMistRendering(const std::optional<MistRenderSettings>& expected, const std::optional<MistRenderSettings>& replacement,
+        std::string* errorMessage = nullptr);
     bool SetObjectAudio(const SceneObjectMetadata& selection, const AudioComponentState& expected,
         const AudioComponentState& replacement, std::string* errorMessage = nullptr);
     bool ValidateObjectTransform(RenderObjectID index, const Transform& transform, std::string& error) const;
@@ -223,6 +233,10 @@ private:
     friend class CausticVisibleVerification;
     friend class GamePlayGPUVerification;
     friend class ScriptWorkflowVerification;
+    friend class VoxelEditorVerification;
+    friend class VoxelOverlayVerification;
+    friend class VoxelStreamingVerification;
+    friend class AirMotorEditorVerification;
 #endif
     // Engine retains both runtimes until checked candidate initialization/cleanup.
     std::unique_ptr<FileSceneRuntime> m_objectMutationCandidate;

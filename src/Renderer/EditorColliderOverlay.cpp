@@ -163,7 +163,7 @@ std::size_t EditorColliderOverlay::GetColliderCount() const noexcept
 {
     const std::array counts{boxColliderWorldTransforms.size(), sphereColliderWorldTransforms.size(), capsuleColliders.size(),
         triggerBoxWorldTransforms.size(), triggerSphereWorldTransforms.size(), triggerCapsules.size(),
-        characterMarkers.size(), cameraFrusta.size(), lightWireframes.size()};
+        characterMarkers.size(), cameraFrusta.size(), lightWireframes.size(), airMotorWireframes.size()};
     std::size_t count = 0;
 
     for(const auto size : counts)
@@ -404,6 +404,9 @@ unsigned int ColliderVertexCount(ColliderOverlayShape shape)
     case ColliderOverlayShape::Arrows:
         return EditorColliderOverlay::VerticesPerArrows;
 
+    case ColliderOverlayShape::Cylinder:
+        return EditorColliderOverlay::VerticesPerCylinder;
+
     default:
         throw std::invalid_argument("Unsupported collider overlay shape");
     }
@@ -427,6 +430,15 @@ Vector3 ColliderShapeVertex(ColliderOverlayShape shape, unsigned int vertexIndex
 
     case ColliderOverlayShape::Arrows:
         return ColliderArrowsVertex(vertexIndex);
+
+    case ColliderOverlayShape::Cylinder:
+        // The capsule's leading lines: rings, then longitudinal lines.
+        if(vertexIndex >= EditorColliderOverlay::VerticesPerCylinder)
+        {
+            throw std::out_of_range("Collider cylinder vertex ID");
+        }
+
+        return ColliderCapsuleVertex(vertexIndex, halfCylinderHeightInRadii);
 
     default:
         throw std::invalid_argument("Unsupported collider overlay shape");

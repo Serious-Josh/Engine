@@ -60,6 +60,20 @@ int VerifyColliderVisualization();
 int VerifyViewportMarquee();
 int VerifyScenePhysicsPersistence();
 int VerifyColliderScaleMigration();
+int VerifyVoxelEditor(const std::filesystem::path& work);
+int VerifyVoxelOverlay(const std::filesystem::path& work);
+int VerifyVoxelResidency();
+int VerifyVoxelQueries();
+int VerifyVoxelStreaming(const std::filesystem::path& work);
+int VerifyAirField();
+int VerifyAirSolver();
+int VerifyAirMotors();
+int VerifyAirMotorEditor(const std::filesystem::path& work);
+int VerifyAirVisualization();
+int VerifyAirObstacles(const std::filesystem::path& work);
+int VerifyAirPieces();
+int VerifyAirPieceSolver();
+int VerifyAirMist();
 int VerifyPresentationTransforms();
 int VerifyPhysicsSimulationController();
 int VerifyEditorPhysicsIntegration();
@@ -232,6 +246,77 @@ int main(int argc, char** argv)
     if(argc == 2 && std::string_view(argv[1]) == "--verify-collider-scale-migration")
     {
         return VerifyColliderScaleMigration();
+    }
+    // VX.4C.1: <empty work directory>; creates a scratch project there.
+    if(argc == 3 && std::string_view(argv[1]) == "--verify-voxel-editor")
+    {
+        return VerifyVoxelEditor(std::filesystem::absolute(argv[2]));
+    }
+    // AIR.4A: the velocity-vector geometry against a CPU reference.
+    if(argc == 2 && std::string_view(argv[1]) == "--verify-air-visualization")
+    {
+        return VerifyAirVisualization();
+    }
+
+    if(argc == 2 && std::string_view(argv[1]) == "--verify-air-pieces")
+    {
+        return VerifyAirPieces();
+    }
+
+    // AIR.4D D2: the piece-aware solver against its CPU reference, rebuild remapping and cost.
+    if(argc == 2 && std::string_view(argv[1]) == "--verify-air-piece-solver")
+    {
+        return VerifyAirPieceSolver();
+    }
+    // AIR.4F F1: passive mist transport against its CPU reference, isolation, window behaviour and cost.
+    if(argc == 2 && std::string_view(argv[1]) == "--verify-air-mist")
+    {
+        return VerifyAirMist();
+    }
+    // AIR.3: Air Motors through the Editor and Engine frames; <empty work directory>, a scratch project is created there.
+    if(argc == 3 && std::string_view(argv[1]) == "--verify-air-motor-editor")
+    {
+        return VerifyAirMotorEditor(std::filesystem::absolute(argv[2]));
+    }
+
+    if(argc == 3 && std::string_view(argv[1]) == "--verify-air-obstacles")
+    {
+        return VerifyAirObstacles(std::filesystem::absolute(argv[2]));
+    }
+    // AIR.3: Air Motors in the solver against a CPU reference.
+    if(argc == 2 && std::string_view(argv[1]) == "--verify-air-motors")
+    {
+        return VerifyAirMotors();
+    }
+    // AIR.2: the velocity solver against a CPU fp32 reference.
+    if(argc == 2 && std::string_view(argv[1]) == "--verify-air-solver")
+    {
+        return VerifyAirSolver();
+    }
+    // AIR.1: the air field's grid, recentring and obstacle mask against CPU references.
+    if(argc == 2 && std::string_view(argv[1]) == "--verify-air-field")
+    {
+        return VerifyAirField();
+    }
+    // VX.5: camera-centred residency through Engine frames; <empty work directory>, a scratch project is created there.
+    if(argc == 3 && std::string_view(argv[1]) == "--verify-voxel-streaming")
+    {
+        return VerifyVoxelStreaming(std::filesystem::absolute(argv[2]));
+    }
+    // VX.5: Voxel.hlsli queries on the GPU against CPU references.
+    if(argc == 2 && std::string_view(argv[1]) == "--verify-voxel-queries")
+    {
+        return VerifyVoxelQueries();
+    }
+    // VX.5: GPU voxel residency resources against GPU readback.
+    if(argc == 2 && std::string_view(argv[1]) == "--verify-voxel-residency")
+    {
+        return VerifyVoxelResidency();
+    }
+    // VX.4C.2: <empty work directory>; creates a scratch project there.
+    if(argc == 3 && std::string_view(argv[1]) == "--verify-voxel-overlay")
+    {
+        return VerifyVoxelOverlay(std::filesystem::absolute(argv[2]));
     }
 #endif
 

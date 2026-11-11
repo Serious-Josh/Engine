@@ -21,7 +21,10 @@ enum class AssetType : std::uint8_t
     // M8.2: baked reflection layers of one Probe Volume, in Content/Audio/Probes/.
     BakedReflections,
     // M9.4: the baked pathing layer of one Probe Volume, in Content/Audio/Probes/.
-    BakedPathing
+    BakedPathing,
+    // VX.4B: one baked voxel region and one scene voxel manifest, in Content/Voxels/.
+    VoxelRegion,
+    VoxelManifest
 };
 
 struct AssetRecord

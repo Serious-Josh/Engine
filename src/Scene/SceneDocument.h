@@ -6,6 +6,10 @@
 #include "Scene/LightComponent.h"
 #include "Scene/ScriptComponent.h"
 #include "Scene/AudioComponents.h"
+#include "Scene/AirMotorComponent.h"
+#include "Scene/MistEmitterComponent.h"
+#include "Scene/MistRenderSettings.h"
+#include "Scene/VoxelComponents.h"
 #include "Physics/PhysicsComponent.h"
 #include "Physics/TriggerColliderComponent.h"
 #include "Physics/CharacterControllerComponent.h"
@@ -73,6 +77,15 @@ struct SceneObjectDocument
     // M7: a volume of acoustic probes. Persisted from cooked payload 21; the optional field needs no new scene schema.
     std::optional<ProbeVolumeComponent> probeVolume;
 
+    // VX.4B: voxel participation and orientation; absent means Automatic. Persisted from schema 19; not yet in cooked payloads.
+    std::optional<VoxelSettings> voxel;
+
+    // AIR.3: an Air Motor; owns no simulation state. Persisted from schema 20 / cooked payload 25.
+    std::optional<AirMotorComponent> airMotor;
+
+    // AIR.4F F2: a Mist Emitter; owns no simulation state. Persisted from schema 23 / cooked payload 28.
+    std::optional<MistEmitterComponent> mistEmitter;
+
     // Empty means root; otherwise the exact ID of another object in this scene. Persisted from
     // schema 9 / cooked payload 9; historical versions load every object as a root.
     std::string parentID;
@@ -102,7 +115,20 @@ struct SceneDocument
     // versions stored absolute meters and are converted on load (ColliderScaleMigration.h).
     static constexpr std::uint32_t kColliderScaleSchemaVersion = 17;
     static constexpr std::uint32_t kAcousticsSchemaVersion = 18;
-    static constexpr std::uint32_t kSchemaVersion = kAcousticsSchemaVersion;
+    // VX.4B: per-object voxel settings and the scene's voxel bake.
+    static constexpr std::uint32_t kVoxelSchemaVersion = 19;
+    // AIR.3: per-object Air Motors.
+    static constexpr std::uint32_t kAirMotorSchemaVersion = 20;
+    // AIR.4D D2: an Air Motor's emission origin and emission radius.
+    static constexpr std::uint32_t kAirMotorEmissionSchemaVersion = 21;
+    // AIR.4D D2.1: Omni and Vortex emission shapes (semi-axes and rotation) replace the emission radius; older motors are migrated
+    // on load (MigrateLegacyAirMotorEmission).
+    static constexpr std::uint32_t kAirMotorShapeSchemaVersion = 22;
+    // AIR.4F F2: per-object Mist Emitters.
+    static constexpr std::uint32_t kMistEmitterSchemaVersion = 23;
+    // AIR.4F F4.4.1: the scene's mist appearance (mistRendering).
+    static constexpr std::uint32_t kMistRenderingSchemaVersion = 24;
+    static constexpr std::uint32_t kSchemaVersion = kMistRenderingSchemaVersion;
 
     std::uint32_t schemaVersion = kSchemaVersion;
 
@@ -117,6 +143,13 @@ struct SceneDocument
 
     SceneCameraDocument camera;
     SceneLightingSettings lightingSettings;
+
+    // VX.4B: the scene's voxel bake settings and current manifest; absent until configured. Persisted from schema 19.
+    std::optional<VoxelBakeSettings> voxelBake;
+
+    // AIR.4F F4.4.1: the scene's mist appearance; absent until first edited, and then MistRenderSettings' defaults apply. Persisted from
+    // schema 24; Editor-only (not cooked: packaged games draw no mist).
+    std::optional<MistRenderSettings> mistRendering;
 };
 
 bool ValidateSceneDocument(

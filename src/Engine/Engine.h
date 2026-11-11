@@ -25,6 +25,7 @@
 #include "Engine/PhysicsSimulationController.h"
 #include "Audio/AudioSystem.h"
 #include "Engine/GameRuntime.h"
+#include "Engine/VoxelResidencyController.h"
 #include "Project/ProjectContext.h"
 #include "Project/ProjectLoader.h"
 #include "Project/ProjectWorkspace.h"
@@ -130,6 +131,13 @@ class Engine
     friend class CausticVisibleVerification;
     friend class GamePlayGPUVerification;
     friend class ScriptWorkflowVerification;
+    friend class VoxelEditorVerification;
+    friend class VoxelOverlayVerification;
+    friend class VoxelStreamingVerification;
+    friend class AirMotorEditorVerification;
+    friend class AirFieldVerification;
+    friend class VoxelResidencyVerification;
+    friend class VoxelQueryVerification;
     friend class ProjectSystemWorkflowVerification;
     friend class ProjectRelaunchVerification;
     void VerifyPackagedBootstrap();
@@ -145,6 +153,7 @@ class Engine
     bool VerifyViewportPan();
     bool VerifyViewportGridSnap();
     bool VerifyEditorGrid();
+    bool VerifyVoxelResidency();
     bool VerifyBackgroundTasks();
     bool VerifyDxrBackgroundTasks();
     bool VerifyDxrBackgroundTaskFailure();
@@ -738,6 +747,11 @@ class Engine
     Shader* m_demoPixelShader = nullptr;
 
     Editor m_editor;
+    // VX.5: keeps the active scene's baked voxel regions near the camera resident on the GPU, for obstacle queries.
+    VoxelResidencyController m_voxelResidency;
+    // AIR.1: the air field request (disabled until the Editor's air controls exist) and the scene it belongs to.
+    AirFrameRequest m_airRequest;
+    std::uint64_t m_airScene = 0;
 
     std::optional<Editor::FileRequest> m_pendingEditorSceneOperation;
 

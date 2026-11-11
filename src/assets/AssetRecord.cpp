@@ -78,6 +78,10 @@ bool ValidateAssetRecord(const AssetRecord& record)
             return IsCanonicalContentPath(record.relativePath, "Content/Audio/Probes/", L".bakedreflections");
         case AssetType::BakedPathing:
             return IsCanonicalContentPath(record.relativePath, "Content/Audio/Probes/", L".bakedpathing");
+        case AssetType::VoxelRegion:
+            return IsCanonicalContentPath(record.relativePath, "Content/Voxels/", L".voxelregion");
+        case AssetType::VoxelManifest:
+            return IsCanonicalContentPath(record.relativePath, "Content/Voxels/", L".voxelmanifest");
         case AssetType::Script:
             return IsCanonicalContentPath(record.relativePath, "Content/Scripts/", L".as");
         case AssetType::AudioBank:

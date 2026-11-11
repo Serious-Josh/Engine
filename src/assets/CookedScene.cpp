@@ -742,6 +742,136 @@ void WriteProbeVolume(Writer& writer, const std::optional<ProbeVolumeComponent>&
     writer.WriteString(volume->bakedPathing);
 }
 
+// V25 Air Motor: u32 present; then u32 enabled, u32 type, f32 strength, f32 falloff, 3 x f32 half extents, f32 radius, f32 length,
+// f32 inward pull, f32 coupling (52 bytes). V26 adds 3 x f32 emission origin and f32 emission radius (68 bytes); V25 motors read
+// the defaults. V27 replaces the emission radius with 3 x f32 emission semi-axes and 3 x f32 emission rotation (88 bytes); V25 and
+// V26 motors are migrated (MigrateLegacyAirMotorEmission).
+void WriteAirMotor(Writer& writer, const std::optional<AirMotorComponent>& motor)
+{
+    writer.WriteUnsigned(motor.has_value() ? 1 : 0, 4);
+
+    if(!motor)
+    {
+        return;
+    }
+
+    writer.WriteUnsigned(motor->enabled ? 1 : 0, 4);
+    writer.WriteUnsigned(static_cast<std::uint32_t>(motor->type), 4);
+    writer.WriteFloat(motor->strength);
+    writer.WriteFloat(motor->falloff);
+    writer.WriteVector(motor->halfExtents);
+    writer.WriteFloat(motor->radius);
+    writer.WriteFloat(motor->length);
+    writer.WriteFloat(motor->inwardPull);
+    writer.WriteFloat(motor->coupling);
+    writer.WriteVector(motor->emissionOrigin);
+    writer.WriteVector(motor->emissionSemiAxes);
+    writer.WriteVector(motor->emissionRotation);
+}
+
+void ReadAirMotor(Reader& reader, std::optional<AirMotorComponent>& motor, std::uint32_t version, const std::string& objectName,
+    const std::string& objectID)
+{
+    const std::uint32_t present = static_cast<std::uint32_t>(reader.ReadUnsigned(4));
+    Require(present <= 1, "Invalid Air Motor presence.");
+
+    if(present == 0)
+    {
+        motor.reset();
+        return;
+    }
+
+    AirMotorComponent value;
+    const std::uint32_t enabled = static_cast<std::uint32_t>(reader.ReadUnsigned(4));
+    Require(enabled <= 1, "Invalid Air Motor enabled flag.");
+    value.enabled = enabled == 1;
+    value.type = static_cast<AirMotorType>(reader.ReadUnsigned(4));
+    value.strength = reader.ReadFloat();
+    value.falloff = reader.ReadFloat();
+    value.halfExtents = reader.ReadVector();
+    value.radius = reader.ReadFloat();
+    value.length = reader.ReadFloat();
+    value.inwardPull = reader.ReadFloat();
+    value.coupling = reader.ReadFloat();
+
+    if(version >= AirMotorEmissionVersion)
+    {
+        value.emissionOrigin = reader.ReadVector();
+    }
+
+    if(version >= AirMotorShapeVersion)
+    {
+        value.emissionSemiAxes = reader.ReadVector();
+        value.emissionRotation = reader.ReadVector();
+    }
+    else
+    {
+        // V25 had no emission radius: every AIR.3 motor emitted from a point.
+        const float legacyEmissionRadius = version >= AirMotorEmissionVersion ? reader.ReadFloat() : 0.0f;
+        Require(std::isfinite(legacyEmissionRadius) && legacyEmissionRadius >= 0.0f && legacyEmissionRadius <= AirMotorComponent::MaximumSize,
+            "Air Motor emission radius must be finite, from 0 to 256 m.");
+
+        if(MigrateLegacyAirMotorEmission(value, legacyEmissionRadius))
+        {
+            LogAirMotorReconfiguration(objectName, objectID, value.type, "cooked payload " + std::to_string(version));
+        }
+    }
+
+    std::string error;
+    Require(ValidateAirMotorComponent(value, &error), error.c_str());
+    motor = value;
+}
+
+// V28 Mist Emitter: u32 present; then u32 enabled, u32 shape, 3 x f32 emission origin, 3 x f32 emission rotation, f32 radius,
+// 3 x f32 half extents, f32 rate, 3 x f32 colour, f32 density (68 bytes).
+void WriteMistEmitter(Writer& writer, const std::optional<MistEmitterComponent>& emitter)
+{
+    writer.WriteUnsigned(emitter.has_value() ? 1 : 0, 4);
+
+    if(!emitter)
+    {
+        return;
+    }
+
+    writer.WriteUnsigned(emitter->enabled ? 1 : 0, 4);
+    writer.WriteUnsigned(static_cast<std::uint32_t>(emitter->shape), 4);
+    writer.WriteVector(emitter->emissionOrigin);
+    writer.WriteVector(emitter->emissionRotation);
+    writer.WriteFloat(emitter->radius);
+    writer.WriteVector(emitter->halfExtents);
+    writer.WriteFloat(emitter->rate);
+    writer.WriteVector(emitter->color);
+    writer.WriteFloat(emitter->density);
+}
+
+void ReadMistEmitter(Reader& reader, std::optional<MistEmitterComponent>& emitter)
+{
+    const std::uint32_t present = static_cast<std::uint32_t>(reader.ReadUnsigned(4));
+    Require(present <= 1, "Invalid Mist Emitter presence.");
+
+    if(present == 0)
+    {
+        emitter.reset();
+        return;
+    }
+
+    MistEmitterComponent value;
+    const std::uint32_t enabled = static_cast<std::uint32_t>(reader.ReadUnsigned(4));
+    Require(enabled <= 1, "Invalid Mist Emitter enabled flag.");
+    value.enabled = enabled == 1;
+    value.shape = static_cast<MistEmitterShape>(reader.ReadUnsigned(4));
+    value.emissionOrigin = reader.ReadVector();
+    value.emissionRotation = reader.ReadVector();
+    value.radius = reader.ReadFloat();
+    value.halfExtents = reader.ReadVector();
+    value.rate = reader.ReadFloat();
+    value.color = reader.ReadVector();
+    value.density = reader.ReadFloat();
+    std::string error;
+    Require(ValidateMistEmitterComponent(value, &error), error.c_str());
+    emitter = value;
+}
+
 void ReadProbeVolume(Reader& reader, std::optional<ProbeVolumeComponent>& volume, std::uint32_t version)
 {
     const auto presence = reader.ReadUnsigned(4);
@@ -1020,6 +1150,8 @@ std::vector<std::byte> Encode(const Metadata& sceneMetadata, const Policy& polic
         WriteAudioComponents(writer, object.audioSource, object.audioListener);
         WriteAcousticSettings(writer, object.acoustics);
         WriteProbeVolume(writer, object.probeVolume);
+        WriteAirMotor(writer, object.airMotor);
+        WriteMistEmitter(writer, object.mistEmitter);
     }
 
     if (sceneMetadata.environment)
@@ -1415,6 +1547,30 @@ Metadata Decode(std::span<const std::byte> bytes, const Policy& policy)
             catch(const std::exception& exception)
             {
                 throw std::runtime_error("Invalid cooked Probe Volume for object " + object.id + ": " + exception.what());
+            }
+        }
+
+        if(payloadVersion >= AirMotorVersion)
+        {
+            try
+            {
+                ReadAirMotor(reader, object.airMotor, payloadVersion, object.name, object.id);
+            }
+            catch(const std::exception& exception)
+            {
+                throw std::runtime_error("Invalid cooked Air Motor for object " + object.id + ": " + exception.what());
+            }
+        }
+
+        if(payloadVersion >= MistEmitterVersion)
+        {
+            try
+            {
+                ReadMistEmitter(reader, object.mistEmitter);
+            }
+            catch(const std::exception& exception)
+            {
+                throw std::runtime_error("Invalid cooked Mist Emitter for object " + object.id + ": " + exception.what());
             }
         }
 

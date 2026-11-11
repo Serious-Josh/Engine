@@ -21,6 +21,8 @@
 #include "Engine/PathingBakes.h"
 #include "Engine/ReflectionBakeJobs.h"
 #include "Engine/ReflectionBakeStatus.h"
+#include "Engine/VoxelScene.h"
+#include "Engine/VoxelVisualization.h"
 #include "assets/ProbeBatchAsset.h"
 #include "Scene/FileSceneAssetCatalog.h"
 #include "Project/ProjectContext.h"
@@ -33,6 +35,7 @@
 #include <chrono>
 #include <deque>
 #include <filesystem>
+#include <functional>
 #include <limits>
 #include <map>
 #include <optional>
@@ -193,6 +196,8 @@ public:
     bool ArePhysicsCollidersVisible() const noexcept { return m_showPhysicsColliders; }
     bool AreCameraFrustaVisible() const noexcept { return m_showCameraFrusta; }
     bool AreLightWireframesVisible() const noexcept { return m_showLightWireframes; }
+    // The Overlay menu's Emitters: Air Motor (wind) and Mist Emitter wireframes together.
+    bool AreAirMotorWireframesVisible() const noexcept { return m_showAirMotorWireframes; }
     // G.3 viewport grid spacing for this frame: the applied translation snap interval, or empty
     // when the Grid overlay is off or Play mode has locked authored editing.
     std::optional<float> GetViewportGridSpacing() const;
@@ -486,6 +491,92 @@ public:
     }
     // After AudioSystem::Shutdown has stopped and joined the acoustic job: finishes every task it left open as cancelled.
     void StopAcousticWork(std::string_view reason);
+
+    // VX.4C.1 (VoxelControls.cpp). Engine calls this every frame after the physics gate, with its registry: it starts a requested
+    // voxel bake, publishes a finished one on this (main) thread and records its manifest in the scene through history, and keeps
+    // the Voxels window's status current. A finished bake waits here while Play or a simulation blocks edits.
+    void PollVoxelBake(IDemoScene& scene, const ProjectPaths& paths, ProjectAssetRegistry& registry);
+
+    // AIR.4A: the Air window's settings (AirControls.cpp). Session values, not scene data: the Engine maps them onto the frame's
+    // air request and velocity-vector view every frame.
+    struct AirEditorSettings
+    {
+        bool enabled = false;
+        bool paused = false;
+        Vector3 ambientVelocity{0.0f, 0.0f, 0.0f};
+        float dampingRate = 0.5f;
+        float maximumMotorSpeed = 40.0f;
+        bool showVectors = true;
+        // Vectors are 2^exponent cells apart per axis (-2 to 3: a quarter of a cell to 8 cells).
+        int vectorSpacingExponent = 0;
+        // The most vectors drawn; past it, only a box around the camera.
+        int vectorBudget = 262'144;
+        float vectorLengthScale = 0.1f;
+        float vectorMaximumLength = 1.5f;
+        float colorMaximumSpeed = 10.0f;
+        float minimumSpeed = 0.05f;
+        // AIR.4D D3: one vector per fluid piece at its anchor, instead of one per block at its hashed point.
+        bool vectorsAtPieceAnchors = false;
+        // AIR.4C diagnostic: the obstacle mask's blocked and unknown cells.
+        bool showBlockedCells = false;
+        bool showUnknownCells = false;
+        // AIR.4D diagnostic: the fluid pieces' sub-cell boundary.
+        bool showFluidPieces = false;
+        // AIR.4F: the passive mist. Its storage exists only while an enabled Mist Emitter feeds it; Show Mist only draws it.
+        bool showMist = true;
+        bool mistPaused = false;
+        // Per second: mist fades by exp(-rate * t).
+        float mistDissipationRate = 0.25f;
+        // AIR.4F F3: the rendered mist's quality preset (0 Low, 1 Medium, 2 High), a view and cost choice. AIR.4F F4.4.1: the mist's
+        // appearance (opacity, Worley, curl, lighting) is scene data (SceneDocument::mistRendering), not a session setting.
+        int mistQuality = 1;
+    };
+
+    const AirEditorSettings& GetAirSettings() const noexcept
+    {
+        return m_airSettings;
+    }
+
+    // AIR.4F F4.4.1: the mist appearance to draw for `document` of the scene runtime `runtimeIdentity` (null: no file scene, so the
+    // defaults): the value being dragged in the Air window for that runtime, else the scene's own (its defaults when it has none).
+    MistRenderSettings GetEffectiveMistRendering(const SceneDocument* document, std::uint64_t runtimeIdentity) const;
+
+    // AIR.4D D2: the latest emission status of each Air Motor the air field ran, keyed by AirMotorTag of its object's ID (Engine::
+    // Frame passes it on from the Renderer); shown by the Air Motor Inspector.
+    void SetAirMotorEmission(std::map<std::uint64_t, AirMotorEmissionStatus> emission)
+    {
+        m_airMotorEmission = std::move(emission);
+    }
+
+    // AIR.4F F2: the latest status of each Mist Emitter, keyed by MistEmitterTag of its object's ID; shown by its Inspector.
+    void SetMistEmitterStatus(std::map<std::uint64_t, MistEmitterStatus> status)
+    {
+        m_mistEmitterStatus = std::move(status);
+    }
+
+    // True once after the Air window's Clear Mist.
+    bool TakeMistClearRequest() noexcept
+    {
+        return std::exchange(m_mistClearRequested, false);
+    }
+
+    // True once after the Air window's Reset.
+    bool TakeAirResetRequest() noexcept
+    {
+        return std::exchange(m_airResetRequested, false);
+    }
+    // Cancels and joins voxel work; nothing it staged survives, and the scene keeps its manifest. Before the project and its registry go.
+    void StopVoxelWork() noexcept;
+    // VX.4C.2 voxel overlay. Engine calls this between frames (never while recording): it hands a finished overlay build to the
+    // Renderer through `publish` (which returns the generation, or 0 with an error), or drops the overlay through `clear`.
+    void PublishVoxelOverlay(const std::function<std::uint64_t(const EditorVoxelOverlay::Data&, std::string*)>& publish,
+        const std::function<void()>& clear);
+    // The frame's draw request while the overlay is shown and published.
+    std::optional<EditorVoxelOverlay::Request> GetVoxelOverlayRequest() const;
+    bool IsVoxelBakeRunning() const noexcept
+    {
+        return m_voxelBake.has_value();
+    }
     struct ProbeCleanupRequest
     {
         std::set<std::string> liveReferences;
@@ -593,6 +684,10 @@ private:
     friend class CausticVisibleVerification;
     friend class GamePlayGPUVerification;
     friend class ScriptWorkflowVerification;
+    friend class VoxelEditorVerification;
+    friend class VoxelOverlayVerification;
+    friend class VoxelStreamingVerification;
+    friend class AirMotorEditorVerification;
     friend class ProjectSystemWorkflowVerification;
     friend class ProjectRelaunchVerification;
     friend class SceneDuplicationVerification;
@@ -823,6 +918,15 @@ private:
     bool m_showCameraFrusta = true;
     // Session-only display preference like Camera Frusta; never authored or persisted.
     bool m_showLightWireframes = true;
+    // AIR.4A Air window.
+    void DrawAirWindow(IDemoScene& scene);
+    // AIR.4F F4.4.1: the Air window's scene-owned Mist rendering controls.
+    void DrawMistRenderingControls(IDemoScene& scene);
+    bool m_showAirWindow = false;
+    AirEditorSettings m_airSettings;
+    bool m_airResetRequested = false;
+    bool m_mistClearRequested = false;
+    bool m_showAirMotorWireframes = true;
     bool m_showLightIcons = true;
     bool m_showAudioIcons = true;
     bool m_showCameraIcons = true;
@@ -1028,6 +1132,72 @@ private:
         std::optional<LightComponent> before;
         std::optional<LightComponent> after;
     };
+    // AIR.3: one complete Air Motor replacement (add, edit, type switch or remove) per entry (AirMotorControls.cpp).
+    struct AirMotorEdit
+    {
+        SceneHistorySession session;
+        std::string objectID;
+        std::optional<AirMotorComponent> before;
+        std::optional<AirMotorComponent> after;
+    };
+    void DrawObjectAirMotorControls(IDemoScene& scene);
+    bool CommitObjectAirMotor(IDemoScene& scene, const SceneObjectMetadata& selection,
+        const std::optional<AirMotorComponent>& before, const std::optional<AirMotorComponent>& after);
+    static size_t AirMotorEditPayloadBytes(const AirMotorEdit& edit);
+    void ValidateAirMotorManagementPopup(IDemoScene& scene);
+    void DismissAirMotorManagementPopup();
+    // AIR.4F F2: one complete Mist Emitter replacement (add, edit or remove) per entry (MistEmitterControls.cpp).
+    struct MistEmitterEdit
+    {
+        SceneHistorySession session;
+        std::string objectID;
+        std::optional<MistEmitterComponent> before;
+        std::optional<MistEmitterComponent> after;
+    };
+    void DrawObjectMistEmitterControls(IDemoScene& scene);
+    // AIR.4F F4.4.1: one edit of the scene's mist appearance (the Air window's Mist rendering controls).
+    struct MistRenderingEdit
+    {
+        SceneHistorySession session;
+        std::optional<MistRenderSettings> before;
+        std::optional<MistRenderSettings> after;
+    };
+    bool CommitMistRendering(IDemoScene& scene, const std::optional<MistRenderSettings>& before, const MistRenderSettings& after,
+        std::string* error = nullptr);
+    bool ReplayMistRendering(IDemoScene& scene, const MistRenderingEdit& edit, bool redo, std::string& error);
+    static size_t MistRenderingEditPayloadBytes(const MistRenderingEdit& edit);
+    // While a slider is held: the value shown and drawn for the scene runtime `runtimeIdentity`, committed as one edit on release.
+    // Never saved and never a second source of truth: it is dropped on commit and on undo or redo, and applies to no other runtime (a
+    // reopened or switched scene has a new identity).
+    struct MistRenderingDraft
+    {
+        std::uint64_t runtimeIdentity = 0;
+        MistRenderSettings settings;
+    };
+    std::optional<MistRenderingDraft> m_mistRenderingDraft;
+    std::string m_mistRenderingStatus;
+    bool CommitObjectMistEmitter(IDemoScene& scene, const SceneObjectMetadata& selection,
+        const std::optional<MistEmitterComponent>& before, const std::optional<MistEmitterComponent>& after);
+    static size_t MistEmitterEditPayloadBytes(const MistEmitterEdit& edit);
+    void ValidateMistEmitterManagementPopup(IDemoScene& scene);
+    void DismissMistEmitterManagementPopup();
+    std::optional<SceneObjectMetadata> m_mistEmitterInspection;
+    std::optional<MistEmitterComponent> m_mistEmitterInspectedValue;
+    std::uint64_t m_mistEmitterInspectionEpoch = 0;
+    // Drafts of the Inspector's numeric fields, in MistEmitterControls.cpp's field order.
+    std::array<float, 15> m_mistEmitterDragDrafts{};
+    std::map<std::uint64_t, MistEmitterStatus> m_mistEmitterStatus;
+    std::string m_mistEmitterEditStatus;
+    std::uint64_t m_mistEmitterControlsRevision = 0;
+    std::optional<SceneObjectMetadata> m_airMotorInspection;
+    std::optional<AirMotorComponent> m_airMotorInspectedValue;
+    std::uint64_t m_airMotorInspectionEpoch = 0;
+    // Strength, falloff, half extents X, Y, Z, radius, length, inward pull, coupling, emission origin X, Y, Z, emission radius
+    // (AirMotorControls.cpp).
+    std::array<float, 18> m_airMotorDragDrafts{};
+    std::map<std::uint64_t, AirMotorEmissionStatus> m_airMotorEmission;
+    std::string m_airMotorEditStatus;
+    std::uint64_t m_airMotorControlsRevision = 0;
     void DrawObjectLightControls(IDemoScene& scene);
     bool CommitObjectLight(IDemoScene& scene, const SceneObjectMetadata& selection,
         const std::optional<LightComponent>& before, const std::optional<LightComponent>& after);
@@ -1104,6 +1274,84 @@ private:
     bool AssignAcousticMaterialReference(IDemoScene& scene, const SceneObjectMetadata& selection, const std::optional<AcousticSettings>& before,
         const std::string& submeshKey, std::string_view reference, const ProjectAssetRegistry& registry);
     static size_t AcousticEditPayloadBytes(const AcousticSettingsEdit& edit);
+    // VX.4C.1: the voxel settings of one or more objects (a bulk edit is one entry), and the scene's voxel bake settings and
+    // manifest reference (a settings edit or a published bake is one entry), each a complete before/after replacement.
+    struct VoxelObjectChange
+    {
+        std::string objectID;
+        std::optional<VoxelSettings> before;
+        std::optional<VoxelSettings> after;
+    };
+    struct VoxelSettingsEdit
+    {
+        SceneHistorySession session;
+        std::vector<VoxelObjectChange> changes;
+    };
+    struct VoxelBakeEdit
+    {
+        SceneHistorySession session;
+        std::optional<VoxelBakeSettings> before;
+        std::optional<VoxelBakeSettings> after;
+    };
+    void DrawObjectVoxelControls(IDemoScene& scene);
+    void DrawVoxelWindow(IDemoScene& scene);
+    bool CommitVoxelSettings(IDemoScene& scene, std::vector<VoxelObjectChange> changes);
+    bool CommitVoxelBake(IDemoScene& scene, const std::optional<VoxelBakeSettings>& before, const std::optional<VoxelBakeSettings>& after,
+        std::string* error);
+    void StartVoxelBake(IDemoScene& scene, const ProjectPaths& paths, ProjectAssetRegistry& registry);
+    void FinishVoxelBake(IDemoScene& scene);
+    void RefreshVoxelStatus(IDemoScene& scene, const ProjectPaths& paths, const ProjectAssetRegistry& registry);
+    // History replay of the two voxel edits; false, with `error`, when the scene no longer matches the entry.
+    bool ReplayVoxelSettings(IDemoScene& scene, const VoxelSettingsEdit& edit, bool redo, std::string& error);
+    bool ReplayVoxelBake(IDemoScene& scene, const VoxelBakeEdit& edit, bool redo, std::string& error);
+    static size_t VoxelEditPayloadBytes(const SceneHistorySession& session, std::size_t changes);
+    // One running bake: the job, and what it must still match when it finishes to be published into this scene.
+    struct VoxelBakeRun
+    {
+        std::unique_ptr<VoxelScene::SceneBakeJob> job;
+        SceneHistorySession session;
+        std::optional<VoxelBakeSettings> sceneBefore;
+        Voxel::BakeSettings settings;
+        VoxelScene::CaptureReport report;
+        std::chrono::steady_clock::time_point started;
+    };
+    std::optional<VoxelBakeRun> m_voxelBake;
+    bool m_voxelBakeRequested = false;
+    bool m_showVoxelWindow = false;
+    std::string m_voxelMessage;
+    bool m_voxelMessageIsError = false;
+    std::optional<VoxelScene::BakeOutcome> m_voxelLastOutcome;
+    std::string m_voxelEditStatus;
+    // The current bake's status, evaluated on a worker for the manifest it names.
+    std::unique_ptr<VoxelScene::BakeStatusCheck> m_voxelStatusCheck;
+    std::optional<VoxelScene::BakeStatus> m_voxelStatus;
+    std::string m_voxelStatusManifest;
+    bool m_voxelStatusRequested = true;
+    // Participating meshes were still loading at the last refresh; the status is re-evaluated once they are.
+    bool m_voxelStatusPending = false;
+
+    // VX.4C.2 overlay: the latest finished build (its cube data is released once published), the build in progress, and what
+    // the Renderer holds. A build is identified by the manifest reference and the isolated region it was made for.
+    void RefreshVoxelOverlay(IDemoScene& scene, const ProjectPaths& paths, const ProjectAssetRegistry& registry);
+    void DrawVoxelOverlayControls();
+    void ResetVoxelOverlay() noexcept;
+    enum class VoxelOverlayUpload
+    {
+        None,
+        Publish,
+        Clear
+    };
+    bool m_voxelOverlayVisible = false;
+    bool m_voxelOverlayBoxes = true;
+    std::optional<Voxel::RegionKey> m_voxelOverlayIsolate;
+    std::unique_ptr<VoxelVisualization::Job> m_voxelOverlayJob;
+    std::string m_voxelOverlayJobFor;
+    std::optional<VoxelVisualization::Result> m_voxelOverlayResult;
+    std::string m_voxelOverlayBuiltFor;
+    VoxelOverlayUpload m_voxelOverlayUpload = VoxelOverlayUpload::None;
+    std::uint64_t m_voxelOverlayGeneration = 0;
+    Matrix4 m_voxelOverlayWorldFromLattice = Matrix4::Identity();
+    std::string m_voxelOverlayError;
     // M7: one complete replacement of an object's Probe Volume per entry (ProbeVolumeControls.cpp).
     struct ProbeVolumeEdit
     {
@@ -1382,6 +1630,8 @@ private:
     std::optional<ComponentPopupTarget> m_controllerManagementPopup;
     std::optional<ComponentPopupTarget> m_cameraManagementPopup;
     std::optional<ComponentPopupTarget> m_lightManagementPopup;
+    std::optional<ComponentPopupTarget> m_airMotorManagementPopup;
+    std::optional<ComponentPopupTarget> m_mistEmitterManagementPopup;
     std::optional<ComponentPopupTarget> m_scriptManagementPopup;
     std::optional<ComponentPopupTarget> m_audioManagementPopup;
     std::array<char, 128> m_componentSearch{};
@@ -1429,7 +1679,9 @@ private:
         std::unique_ptr<TriggerColliderEdit>, std::unique_ptr<CharacterControllerEdit>, TransformEdit, std::unique_ptr<GroupTransformEdit>,
         std::unique_ptr<ObjectDeletion>, std::unique_ptr<RenameObject>, std::unique_ptr<ReorderObjects>,
         std::unique_ptr<MaterialBindingsEdit>, std::unique_ptr<CameraEdit>, std::unique_ptr<LightEdit>,
-        std::unique_ptr<ScriptEdit>, std::unique_ptr<AudioComponentsEdit>, std::unique_ptr<AcousticSettingsEdit>, std::unique_ptr<ProbeVolumeEdit>>;
+        std::unique_ptr<ScriptEdit>, std::unique_ptr<AudioComponentsEdit>, std::unique_ptr<AcousticSettingsEdit>, std::unique_ptr<ProbeVolumeEdit>,
+        std::unique_ptr<VoxelSettingsEdit>, std::unique_ptr<VoxelBakeEdit>, std::unique_ptr<AirMotorEdit>, std::unique_ptr<MistEmitterEdit>,
+        std::unique_ptr<MistRenderingEdit>>;
     struct SceneHistoryEntry
     {
         SceneHistoryCommand command;

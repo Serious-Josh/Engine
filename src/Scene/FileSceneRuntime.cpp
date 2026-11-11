@@ -324,6 +324,151 @@ bool FileSceneRuntime::SetObjectLight(const SceneObjectMetadata& selection,
     m_fileScene.EditDocument().objects[index].light = replacement;
     return true;
 }
+
+bool FileSceneRuntime::SetObjectAirMotor(const SceneObjectMetadata& selection,
+    const std::optional<AirMotorComponent>& expected,
+    const std::optional<AirMotorComponent>& replacement, std::string* errorMessage)
+{
+    const auto fail = [&](const char* message)
+    {
+        if(errorMessage)
+        {
+            *errorMessage = message;
+        }
+
+        return false;
+    };
+
+    if(errorMessage)
+    {
+        errorMessage->clear();
+    }
+
+    if(m_archiveScene || HasPreparedScene() || m_materialAssignment || m_activePresentationAssociation)
+    {
+        return fail("Air Motor authoring requires an idle editable scene.");
+    }
+
+    const auto current = GetObjectMetadata(selection.objectID, errorMessage);
+
+    if(!current)
+    {
+        return false;
+    }
+
+    if(current->sceneID != selection.sceneID || current->runtimeIdentity != selection.runtimeIdentity ||
+        current->structureRevision != selection.structureRevision || current->runtimeIndex != selection.runtimeIndex)
+    {
+        return fail("Air Motor target belongs to a stale scene selection.");
+    }
+
+    const auto& objects = m_fileScene.GetDocument().objects;
+    const auto found = std::find_if(objects.begin(), objects.end(),
+        [&](const SceneObjectDocument& object) { return object.id == selection.objectID; });
+
+    if(found == objects.end() || found->airMotor != expected)
+    {
+        return fail("Air Motor changed since inspection; edit rejected.");
+    }
+
+    const size_t index = static_cast<size_t>(found - objects.begin());
+    SceneDocument candidate;
+
+    if(!CaptureSceneDocument(m_fileScene.GetDocument(), m_scene, m_objectMapping, candidate, errorMessage))
+    {
+        return false;
+    }
+
+    candidate.objects[index].airMotor = replacement;
+
+    if(!ValidateSceneDocument(candidate, errorMessage))
+    {
+        return false;
+    }
+
+    if(expected == replacement)
+    {
+        return true;
+    }
+
+    // Identity, expected-value and whole-scene checks all precede dirty marking. Assigning a
+    // trivially copyable optional cannot fail. Air Motors are re-read from the document each frame,
+    // so no renderer, mesh, BLAS/TLAS or physics state is republished.
+    m_fileScene.EditDocument().objects[index].airMotor = replacement;
+    return true;
+}
+
+bool FileSceneRuntime::SetObjectMistEmitter(const SceneObjectMetadata& selection,
+    const std::optional<MistEmitterComponent>& expected,
+    const std::optional<MistEmitterComponent>& replacement, std::string* errorMessage)
+{
+    const auto fail = [&](const char* message)
+    {
+        if(errorMessage)
+        {
+            *errorMessage = message;
+        }
+
+        return false;
+    };
+
+    if(errorMessage)
+    {
+        errorMessage->clear();
+    }
+
+    if(m_archiveScene || HasPreparedScene() || m_materialAssignment || m_activePresentationAssociation)
+    {
+        return fail("Mist Emitter authoring requires an idle editable scene.");
+    }
+
+    const auto current = GetObjectMetadata(selection.objectID, errorMessage);
+
+    if(!current)
+    {
+        return false;
+    }
+
+    if(current->sceneID != selection.sceneID || current->runtimeIdentity != selection.runtimeIdentity ||
+        current->structureRevision != selection.structureRevision || current->runtimeIndex != selection.runtimeIndex)
+    {
+        return fail("Mist Emitter target belongs to a stale scene selection.");
+    }
+
+    const auto& objects = m_fileScene.GetDocument().objects;
+    const auto found = std::find_if(objects.begin(), objects.end(),
+        [&](const SceneObjectDocument& object) { return object.id == selection.objectID; });
+
+    if(found == objects.end() || found->mistEmitter != expected)
+    {
+        return fail("Mist Emitter changed since inspection; edit rejected.");
+    }
+
+    const size_t index = static_cast<size_t>(found - objects.begin());
+    SceneDocument candidate;
+
+    if(!CaptureSceneDocument(m_fileScene.GetDocument(), m_scene, m_objectMapping, candidate, errorMessage))
+    {
+        return false;
+    }
+
+    candidate.objects[index].mistEmitter = replacement;
+
+    if(!ValidateSceneDocument(candidate, errorMessage))
+    {
+        return false;
+    }
+
+    if(expected == replacement)
+    {
+        return true;
+    }
+
+    // As for Air Motors: every check precedes dirty marking, and emitters are re-read from the document each frame, so no renderer,
+    // mesh or physics state is republished (and no GPU buffer is rebuilt).
+    m_fileScene.EditDocument().objects[index].mistEmitter = replacement;
+    return true;
+}
 
 bool FileSceneRuntime::SetObjectScript(const SceneObjectMetadata& selection,
     const std::optional<ScriptComponent>& expected,
@@ -516,6 +661,122 @@ bool FileSceneRuntime::SetObjectAcoustics(const SceneObjectMetadata& selection, 
 
     std::optional<AcousticSettings> accepted = replacement;
     m_fileScene.EditDocument().objects[static_cast<size_t>(found - objects.begin())].acoustics = std::move(accepted);
+    return true;
+}
+
+bool FileSceneRuntime::SetObjectsVoxelSettings(const std::vector<VoxelSettingsChange>& changes, std::string* errorMessage)
+{
+    const auto fail = [&](std::string message)
+    {
+        if(errorMessage)
+        {
+            *errorMessage = std::move(message);
+        }
+
+        return false;
+    };
+
+    const auto& objects = m_fileScene.GetDocument().objects;
+    std::vector<std::size_t> indices;
+    indices.reserve(changes.size());
+
+    // Validate everything before changing anything.
+    for(const VoxelSettingsChange& change : changes)
+    {
+        const auto found = std::find_if(objects.begin(), objects.end(),
+            [&](const SceneObjectDocument& object) { return object.id == change.objectID; });
+
+        if(found == objects.end())
+        {
+            return fail("An object of the voxel edit no longer exists; edit rejected.");
+        }
+
+        if(found->voxel != change.expected)
+        {
+            return fail("Voxel settings changed since inspection; edit rejected.");
+        }
+
+        if(change.replacement && !ValidateVoxelSettings(*change.replacement, errorMessage))
+        {
+            return false;
+        }
+
+        indices.push_back(static_cast<std::size_t>(found - objects.begin()));
+    }
+
+    const bool changed = std::any_of(changes.begin(), changes.end(),
+        [](const VoxelSettingsChange& change) { return change.expected != change.replacement; });
+
+    if(!changed)
+    {
+        return true;
+    }
+
+    SceneDocument& document = m_fileScene.EditDocument();
+
+    for(std::size_t index = 0; index < changes.size(); ++index)
+    {
+        document.objects[indices[index]].voxel = changes[index].replacement;
+    }
+
+    return true;
+}
+
+bool FileSceneRuntime::SetSceneVoxelBake(const std::optional<VoxelBakeSettings>& expected, const std::optional<VoxelBakeSettings>& replacement,
+    std::string* errorMessage)
+{
+    if(m_fileScene.GetDocument().voxelBake != expected)
+    {
+        if(errorMessage)
+        {
+            *errorMessage = "The scene's voxel bake changed meanwhile; edit rejected.";
+        }
+
+        return false;
+    }
+
+    if(replacement && !ValidateVoxelBakeSettings(*replacement, errorMessage))
+    {
+        return false;
+    }
+
+    if(expected != replacement)
+    {
+        m_fileScene.EditDocument().voxelBake = replacement;
+    }
+
+    return true;
+}
+
+// AIR.4F F4.4.1: read by the Engine each frame to build the mist's render request, so nothing else changes here.
+bool FileSceneRuntime::SetSceneMistRendering(const std::optional<MistRenderSettings>& expected,
+    const std::optional<MistRenderSettings>& replacement, std::string* errorMessage)
+{
+    if(m_fileScene.GetDocument().mistRendering != expected)
+    {
+        if(errorMessage)
+        {
+            *errorMessage = "The scene's mist rendering settings changed meanwhile; edit rejected.";
+        }
+
+        return false;
+    }
+
+    if(replacement && !ValidateMistRenderSettings(*replacement))
+    {
+        if(errorMessage)
+        {
+            *errorMessage = "Mist rendering settings out of range.";
+        }
+
+        return false;
+    }
+
+    if(expected != replacement)
+    {
+        m_fileScene.EditDocument().mistRendering = replacement;
+    }
+
     return true;
 }
 

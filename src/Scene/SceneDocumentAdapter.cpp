@@ -151,6 +151,8 @@ bool SceneDocumentsEqual(
     }
 
     if(left.lightingSettings != right.lightingSettings) return false;
+    if(left.voxelBake != right.voxelBake) return false;
+    if(left.mistRendering != right.mistRendering) return false;
 
     for (std::size_t index = 0; index < left.objects.size(); ++index)
     {
@@ -162,7 +164,8 @@ bool SceneDocumentsEqual(
             a.physics != b.physics || a.triggerCollider != b.triggerCollider ||
             a.characterController != b.characterController || a.camera != b.camera || a.light != b.light ||
             a.script != b.script || a.audioSource != b.audioSource || a.audioListener != b.audioListener ||
-            a.acoustics != b.acoustics || a.probeVolume != b.probeVolume)
+            a.acoustics != b.acoustics || a.probeVolume != b.probeVolume || a.voxel != b.voxel ||
+            a.airMotor != b.airMotor || a.mistEmitter != b.mistEmitter)
         {
             return false;
         }

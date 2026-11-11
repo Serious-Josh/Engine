@@ -5,6 +5,7 @@
 #include "Engine/PackagedAudioBanks.h"
 #include "assets/ProjectMeshImportService.h"
 #include "Engine/PackagedBootstrap.h"
+#include "Engine/VoxelProjectStore.h"
 #include "Engine/PackagedRenderingSettings.h"
 #include "Engine/RenderingConfigurationResolver.h"
 #include "Renderer/MaterialTables/MaterialTableFile.h"
@@ -879,6 +880,9 @@ void Engine::ProcessEditorMaterialRequests()
     {
         return;
     }
+
+    // VX.4C.1: after the gate, so a finished voxel bake is published (registry, then the scene's manifest) only in an editable scene.
+    m_editor.PollVoxelBake(m_demoSceneManager.GetActiveScene(), GetActiveProject().GetPaths(), m_projectAssetRegistry);
 
     if(const auto request = m_editor.TakeAcousticMaterialCreationRequest())
     {
@@ -3397,6 +3401,129 @@ void Engine::Frame()
         rendererOptions.lighting = CaptureSceneLightingForFrame(*physicsScene->m_runtime);
     }
 
+    // VX.5: static voxel residency follows the scene's published bake and the camera that renders this frame (the Game Play
+    // camera while playing). Between frames; the Renderer records the uploads at the start of its next frame.
+    {
+        std::uint64_t residencyScene = 0;
+        std::string residencyManifest;
+
+        if (physicsScene && physicsScene->m_runtime && !physicsScene->IsArchiveActivation())
+        {
+            const SceneDocument& document = physicsScene->m_runtime->GetFileScene().GetDocument();
+            residencyScene = physicsScene->GetRuntimeIdentity();
+            residencyManifest = document.voxelBake ? document.voxelBake->manifestReference : std::string{};
+        }
+
+        const Vector3 camera = rendererOptions.view ? rendererOptions.view->position : activeScene.GetCamera().GetPosition();
+        const double now = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        const auto makeStore = [&]() -> std::shared_ptr<const Voxel::AssetStore>
+        {
+            return std::make_shared<const VoxelScene::ProjectAssetStore>(GetActiveProject().GetPaths(),
+                static_cast<const ProjectAssetRegistry&>(m_projectAssetRegistry), residencyManifest);
+        };
+        m_voxelResidency.Update(residencyScene, residencyManifest, makeStore, {camera.x, camera.y, camera.z}, now, m_renderer);
+
+        // AIR.1: the air field follows the same camera; a different scene starts from a fresh field.
+        if (residencyScene != m_airScene)
+        {
+            m_renderer.ResetAirField();
+            m_airScene = residencyScene;
+        }
+
+        // AIR.4A: the Air window's settings drive the request; Reset re-initializes the whole field on the next frame.
+        const Editor::AirEditorSettings& air = m_editor.GetAirSettings();
+        m_airRequest.enabled = air.enabled;
+        m_airRequest.paused = air.paused;
+        m_airRequest.settings.ambientVelocity = air.ambientVelocity;
+        m_airRequest.solver.dampingRate = air.dampingRate;
+        m_airRequest.solver.maximumMotorSpeed = air.maximumMotorSpeed;
+
+        if (m_editor.TakeAirResetRequest())
+        {
+            m_renderer.ResetAirField();
+        }
+
+        if (air.enabled && air.showVectors)
+        {
+            AirVisualizationRequest vectors;
+            vectors.spacingExponent = std::clamp(air.vectorSpacingExponent, -2, 3);
+            vectors.maximumVectors = static_cast<std::uint32_t>(std::clamp(air.vectorBudget, 1'024, 4'194'304));
+            vectors.focus = camera;
+            vectors.lengthScale = air.vectorLengthScale;
+            vectors.maximumLength = air.vectorMaximumLength;
+            vectors.colorMaximumSpeed = air.colorMaximumSpeed;
+            vectors.minimumSpeed = air.minimumSpeed;
+            vectors.placement = air.vectorsAtPieceAnchors ? AirVectorPlacement::PieceAnchors : AirVectorPlacement::HashedPoints;
+            vectors.ambientVelocity = air.ambientVelocity;
+            rendererOptions.airVisualization = vectors;
+        }
+
+        // AIR.4F F3: the mist view; it draws only while the field holds mist (an enabled emitter feeds it). AIR.4F F4.4.1: its
+        // appearance is the active scene's (or the value being dragged in the Air window); the quality preset is the Editor's.
+        if (air.enabled && air.showMist)
+        {
+            const SceneDocument* mistDocument = physicsScene && physicsScene->m_runtime && !physicsScene->IsArchiveActivation() ?
+                &physicsScene->m_runtime->GetFileScene().GetDocument() : nullptr;
+            rendererOptions.airMist = MakeAirMistRenderRequest(m_editor.GetEffectiveMistRendering(mistDocument,
+                    mistDocument != nullptr ? physicsScene->GetRuntimeIdentity() : 0),
+                static_cast<AirMistQuality>(std::clamp(air.mistQuality, 0, 2)));
+        }
+
+        if (air.enabled && (air.showBlockedCells || air.showUnknownCells || air.showFluidPieces))
+        {
+            AirCellRequest cells;
+            cells.blocked = air.showBlockedCells;
+            cells.unknown = air.showUnknownCells;
+            cells.pieces = air.showFluidPieces;
+            cells.focus = camera;
+            rendererOptions.airCells = cells;
+        }
+
+        m_airRequest.cameraPosition = camera;
+        m_airRequest.deltaSeconds = m_time.GetDeltaTime();
+
+        // AIR.3: the scene's Air Motors from this frame's presented poses (after physics publication), only while air runs.
+        if (m_airRequest.enabled && physicsScene && physicsScene->m_runtime)
+        {
+            physicsScene->m_runtime->CaptureAirMotors(m_time.GetDeltaTime(), m_airRequest.motors);
+            // AIR.4F F2: the scene's Mist Emitters, likewise.
+            physicsScene->m_runtime->CaptureMistEmitters(m_airRequest.mistEmitters);
+        }
+        else
+        {
+            m_airRequest.motors.clear();
+            m_airRequest.mistEmitters.clear();
+        }
+
+        // AIR.4F: the mist exists (and its 64 MiB is allocated) only while an enabled emitter feeds it.
+        m_airRequest.mist.enabled = m_airRequest.enabled && !m_airRequest.mistEmitters.empty();
+        m_airRequest.mist.paused = air.mistPaused;
+        m_airRequest.mist.dissipationRate = air.mistDissipationRate;
+
+        if (m_editor.TakeMistClearRequest())
+        {
+            m_renderer.ClearAirMist();
+        }
+
+        rendererOptions.air = m_airRequest;
+        // AIR.4D D2: what the field found at each motor's emission points, for the Inspector.
+        m_editor.SetAirMotorEmission(m_renderer.GetAirMotorEmission());
+        // AIR.4F F2: where each Mist Emitter's origin lies and how many pieces it reached.
+        m_editor.SetMistEmitterStatus(m_renderer.GetMistEmitterStatus());
+    }
+
+    // VX.4C.2: publish between frames, so the Renderer's buffer replacement never meets an open recording. The request is
+    // stack-owned and outlives the synchronous Render call. Game Play shows the game, without Editor overlays.
+    m_editor.PublishVoxelOverlay(
+        [this](const EditorVoxelOverlay::Data& data, std::string* error) { return m_renderer.PublishEditorVoxelOverlay(data, error); },
+        [this] { m_renderer.ClearEditorVoxelOverlay(); });
+    const auto voxelOverlay = gamePlaying ? std::nullopt : m_editor.GetVoxelOverlayRequest();
+
+    if (voxelOverlay)
+    {
+        rendererOptions.editorVoxelOverlay = &*voxelOverlay;
+    }
+
     // The grid follows the authored-edit lock, so it is already hidden during Game Play.
     if (const auto gridSpacing = m_editor.GetViewportGridSpacing())
     {
@@ -3470,6 +3597,10 @@ void Engine::Shutdown()
     m_audio.Shutdown();
     // M8.3: the acoustic job has stopped and been joined; only now may its tasks report cancellation.
     m_editor.StopAcousticWork("The Editor shut down");
+    // VX.4C.1: joined while the project, its paths and registry still exist; anything staged is removed, nothing is published.
+    m_editor.StopVoxelWork();
+    // VX.5: the residency worker is joined before the project and the Renderer go.
+    m_voxelResidency.Stop();
 
     CancelEditorMembership("Shutdown canceled the pending membership edit.");
     CancelViewportMaterialAssignment("Engine shutdown canceled the material assignment.");
@@ -6356,8 +6487,9 @@ std::optional<EditorColliderOverlay> Engine::CaptureEditorColliderOverlayForFram
     const bool collidersVisible = m_editor.ArePhysicsCollidersVisible();
     const bool frustaVisible = m_editor.AreCameraFrustaVisible();
     const bool lightWireframesVisible = m_editor.AreLightWireframesVisible();
+    const bool airMotorWireframesVisible = m_editor.AreAirMotorWireframesVisible();
 
-    if((!collidersVisible && !frustaVisible && !lightWireframesVisible) || !runtime || !editableScene)
+    if((!collidersVisible && !frustaVisible && !lightWireframesVisible && !airMotorWireframesVisible) || !runtime || !editableScene)
     {
         return std::nullopt;
     }
@@ -6406,6 +6538,20 @@ std::optional<EditorColliderOverlay> Engine::CaptureEditorColliderOverlayForFram
             selectionCurrent ? std::span<const size_t>(selected) : std::span<const size_t>{}, rejected, captureError))
         {
             ReportLightOmissions(rejected, "Light wireframe omitted", m_lightWireframeOmissions);
+        }
+    }
+
+    // AIR.3: independent of the other overlays; an omitted motor is named once in the log. AIR.4F: with the Mist Emitters too.
+    if(airMotorWireframesVisible)
+    {
+        const auto& selected = m_editor.GetSelectedObjects();
+        const bool selectionCurrent = m_editor.GetSelectionStructureRevision() == runtime->GetScene().GetStructureRevision();
+        std::vector<std::string> rejected;
+
+        if(!runtime->CaptureEditorAirMotorWireframes(m_renderer, capturedOverlay,
+            selectionCurrent ? std::span<const size_t>(selected) : std::span<const size_t>{}, rejected, captureError))
+        {
+            rejected.clear();
         }
     }
 
