@@ -13451,6 +13451,21 @@ bool Renderer::RecordRenderFrame(
 
         m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::DebugUI);
 
+        // Verification only, like m_packagedPresentCopyForTesting: the Editor's finished image, UI included.
+        if(m_editorPresentCopyForTesting && m_editorPresentCopyForTesting->GetWidth() == m_applicationWidth &&
+            m_editorPresentCopyForTesting->GetHeight() == m_applicationHeight)
+        {
+            barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            commandList->ResourceBarrier(1, &barrier);
+            m_editorPresentCopyForTesting->Transition(commandList, D3D12_RESOURCE_STATE_COPY_DEST);
+            commandList->CopyResource(m_editorPresentCopyForTesting->GetResource(), m_swapChain.GetCurrentBackBuffer());
+            m_editorPresentCopyForTesting->Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            commandList->ResourceBarrier(1, &barrier);
+        }
+
         barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
         barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
 

@@ -2787,6 +2787,8 @@ class Renderer
     // Diagnostics only (PS.5F): when set, each packaged frame copies its back buffer after tone mapping, before
     // Present, into this target of the application extent and the swap chain's format. Null in production.
     RenderTarget* m_packagedPresentCopyForTesting = nullptr;
+    // Diagnostics only (M0b.1 P3): the same for Editor frames, after the UI is drawn. Null in production.
+    RenderTarget* m_editorPresentCopyForTesting = nullptr;
     // Records the DLSS evaluation of a prepared Dlss75 frame into m_presentationColor; false leaves the resolve's colour.
     bool RecordDlssEvaluation(ID3D12GraphicsCommandList* commandList, unsigned int frameIndex);
     void PublishDlssReadout();

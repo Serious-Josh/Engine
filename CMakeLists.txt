@@ -249,7 +249,8 @@ if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Tools/Ma
 endif()
 
 # M0b.1: empty memory-registry functions. Packaged games and tools link only these; see src/Debug/MemoryRegistry.h.
-add_library(EngineMemoryRegistryDisabled STATIC src/Debug/MemoryRegistryDisabled.cpp)
+add_library(EngineMemoryRegistryDisabled STATIC src/Debug/MemoryRegistryDisabled.cpp src/Debug/MemoryMonitorDisabled.cpp
+    src/Debug/MemoryProfilerWindowDisabled.cpp)
 target_include_directories(EngineMemoryRegistryDisabled PRIVATE src)
 
 add_library(EngineCore OBJECT
@@ -627,14 +628,15 @@ endif()
 # Both executables use one implementation; only the entry point selects capabilities.
 # M0b.1 local-only Release smoke test: the real memory registry, linked as in the Editor.
 if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Debug/tests/MemoryRegistryReleaseSmoke.cpp")
-    add_executable(MemoryRegistryReleaseSmoke src/Debug/tests/MemoryRegistryReleaseSmoke.cpp src/Debug/MemoryRegistry.cpp)
+    add_executable(MemoryRegistryReleaseSmoke src/Debug/tests/MemoryRegistryReleaseSmoke.cpp src/Debug/MemoryRegistry.cpp
+        src/Debug/MemoryMonitor.cpp)
     target_link_libraries(MemoryRegistryReleaseSmoke PRIVATE EngineCore)
 endif()
 
 add_executable(Engine src/main.cpp)
 # M0b.1: the Editor alone links the real GPU memory registry. As an object file it takes precedence over the
 # EngineMemoryRegistryDisabled library member that every other EngineCore consumer (EngineRuntime, tests) resolves.
-target_sources(Engine PRIVATE src/Debug/MemoryRegistry.cpp)
+target_sources(Engine PRIVATE src/Debug/MemoryRegistry.cpp src/Debug/MemoryMonitor.cpp src/Debug/MemoryProfilerWindow.cpp)
 target_link_libraries(Engine PRIVATE EngineCore)
 engine_use_agility(Engine)
 

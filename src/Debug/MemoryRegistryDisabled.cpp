@@ -2,7 +2,8 @@
 
 // Linked by every EngineCore consumer except the Editor, whose MemoryRegistry.cpp object takes precedence over this
 // library member. Keep this file's function set identical to MemoryRegistry.cpp: the linker then never loads this
-// member into the Editor, and never loads MemoryRegistry.cpp into anything else.
+// member into the Editor, and never loads MemoryRegistry.cpp into anything else. MemoryMonitorDisabled.cpp and
+// MemoryProfilerWindowDisabled.cpp are separate members for the same reason, so each real file replaces only its own.
 
 namespace MemoryRegistry
 {

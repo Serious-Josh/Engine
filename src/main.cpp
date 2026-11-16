@@ -37,6 +37,7 @@ int VerifyStartupScene(const std::filesystem::path& outputRoot);
 int VerifyCausticsVisible(const std::filesystem::path& project, const std::filesystem::path& out);
 int VerifyGamePlayGPU(const std::filesystem::path& projectDirectory, const std::filesystem::path& scene);
 int VerifyMemoryRegistry(const std::filesystem::path& projectDirectory, const std::filesystem::path& scene);
+int VerifyMemorySoak(const std::filesystem::path& projectDirectory, const std::filesystem::path& scene, int cycles);
 int VerifyPhysicsPerformance(const std::filesystem::path& projectDirectory, const std::filesystem::path& scene);
 int VerifyScriptWorkflow(const std::filesystem::path& projectDirectory, const std::filesystem::path& scene,
     const std::vector<std::string>& objectNames);
@@ -529,6 +530,10 @@ int main(int argc, char** argv)
     if(argc == 4 && std::string_view(argv[1]) == "--verify-physics-performance")
     {
         return VerifyPhysicsPerformance(std::filesystem::absolute(argv[2]), std::filesystem::absolute(argv[3]));
+    }
+    if(argc == 5 && std::string_view(argv[1]) == "--verify-memory-soak")
+    {
+        return VerifyMemorySoak(std::filesystem::absolute(argv[2]), std::filesystem::absolute(argv[3]), std::atoi(argv[4]));
     }
     if(argc == 4 && std::string_view(argv[1]) == "--verify-memory-registry")
     {

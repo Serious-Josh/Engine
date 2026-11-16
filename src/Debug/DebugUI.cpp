@@ -1,4 +1,5 @@
 #include "DebugUI.h"
+#include "Debug/MemoryProfilerWindow.h"
 #include "LightingModeTransitionPresentation.h"
 
 #include "Engine/RenderingConfigurationResolver.h"
@@ -1092,6 +1093,7 @@ void DebugUI::EndFrame(
 {
     m_editorIcons.Prepare(commandList);
     m_gpuTimingGraph.Draw(m_gpuTimingMonitor);
+    MemoryProfilerWindow::Draw();
 
     ImGui::Render();
 
@@ -1802,4 +1804,6 @@ void DebugUI::DrawMenu()
     ImGui::MenuItem("Rendering Settings", nullptr, &m_showRenderingSettings);
     ImGui::Separator();
     ImGui::MenuItem("GPU Timing Graph", nullptr, &m_gpuTimingGraph.visible);
+    // M0b.1 P3: Editor-only; the packaged build links an empty implementation.
+    MemoryProfilerWindow::DrawMenuItem();
 }

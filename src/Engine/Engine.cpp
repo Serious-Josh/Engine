@@ -1,5 +1,6 @@
 #include "Scene/SceneSwitchTiming.h"
 #include "Engine/Engine.h"
+#include "Debug/MemoryMonitor.h"
 #include "assets/ProjectScriptAssets.h"
 #include "assets/ProjectAudioBankAssets.h"
 #include "Engine/PackagedAudioBanks.h"
@@ -1914,6 +1915,12 @@ bool Engine::InitializeProjectIndependent(const EngineStartup& startup)
             std::chrono::steady_clock::now() - rendererStarted).count()) + " ms.");
     }
 
+    // M0b.1 P2: Editor memory sampling, from the frame loop until Shutdown stops it before the device is released.
+    if(!packaged)
+    {
+        MemoryMonitor::Start(m_renderer.GetDevice());
+    }
+
     // Diagnostics only: the Editor records its phases when the frame-hitch report is enabled.
     m_editor.SetPhaseTimingEnabled(m_renderer.IsFrameHitchLoggingEnabled());
 
@@ -2895,6 +2902,33 @@ void Engine::AcceptPreparedMeshResidencyForFrame(IDemoScene& activeDemo)
     }
 }
 
+void Engine::SampleMemoryMonitor()
+{
+    const auto now = std::chrono::steady_clock::now();
+
+    if(!MemoryMonitor::IsSampleDue(now))
+    {
+        return;
+    }
+
+    // Main thread, between frames: the mesh cache's statistics are main-thread state; the texture service and FMOD
+    // report atomically maintained totals.
+    CpuMemoryStatistics cpu{};
+    const ProjectMeshCPUCache::Statistics mesh = m_meshCPUCache.GetStatistics();
+    cpu[static_cast<std::size_t>(CpuMemoryStatistic::MeshCacheRetained)] = {true, mesh.retainedBytes};
+    cpu[static_cast<std::size_t>(CpuMemoryStatistic::MeshLeasesOutsideCache)] = {true, mesh.pinnedOutsideCacheBytes};
+    cpu[static_cast<std::size_t>(CpuMemoryStatistic::TexturePreparationRetained)] = {true, m_texturePreparation.RetainedBytes()};
+
+    const std::int64_t audioBytes = Audio::AudioSystem::GetBackendAllocatedBytes();
+
+    if(audioBytes >= 0)
+    {
+        cpu[static_cast<std::size_t>(CpuMemoryStatistic::AudioBackend)] = {true, static_cast<std::uint64_t>(audioBytes)};
+    }
+
+    MemoryMonitor::Record(now, cpu);
+}
+
 void Engine::Frame()
 {
     // Exactly one audio update when this frame ends, on every return path, after gameplay and presentation and
@@ -2931,6 +2965,8 @@ void Engine::Frame()
         m_time.Update();
         return;
     }
+
+    SampleMemoryMonitor();
 
     // Packaged frames run the shared GameRuntime without entering Editor UI/input.
     if (m_startup.mode == EngineStartup::Mode::PackagedRuntime)
@@ -4063,6 +4099,9 @@ void Engine::Frame()
 
 void Engine::Shutdown()
 {
+    // Before any teardown: no memory sample may query a device or subsystem that is being released.
+    MemoryMonitor::Stop();
+
     // PS.5B.2: a packaged game leaves the screen as soon as shutdown begins. No frame presents after this, and the
     // teardown below may wait for an in-flight DXR pipeline creation (it cannot be cancelled), during which the window
     // is no longer pumped; hidden, it is not shown as Not Responding. It is destroyed last, as before.

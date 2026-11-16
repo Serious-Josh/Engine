@@ -819,6 +819,9 @@ class Engine
     // packaged shutdown, the totals with the AIR step count. Observation only: nothing here changes what residency does.
     void ReportPackagedVoxelResidency(std::uint64_t residencyScene);
     void ReportPackagedVoxelResidencyTotals() const;
+    // M0b.1 P2: gathers existing subsystem CPU statistics for the Editor-only memory monitor when a sample is due.
+    // The disabled monitor (packaged games) is never due, so nothing is gathered there.
+    void SampleMemoryMonitor();
     std::uint64_t m_packagedResidencyReportScene = 0;
     bool m_packagedResidencySettledReported = false;
     std::chrono::steady_clock::time_point m_packagedResidencyStarted;
