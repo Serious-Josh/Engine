@@ -154,6 +154,14 @@ void RayTracedReflectionPass::Execute(
     m_specularTrackingDistanceTexture.Transition(commandList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 }
 
+void RayTracedReflectionPass::ReleaseTextures()
+{
+    m_rawReflectionTexture.Shutdown();
+
+    m_hitDistanceTexture.Shutdown();
+    m_specularTrackingDistanceTexture.Shutdown();
+}
+
 bool RayTracedReflectionPass::Resize(
     ID3D12Device* device,
     DescriptorHeap& descriptorHeap,
@@ -167,10 +175,7 @@ bool RayTracedReflectionPass::Resize(
 
     const MemoryCategoryScope memoryScope(MemoryCategory::LegacyRayTracing);
 
-    m_rawReflectionTexture.Shutdown();
-
-    m_hitDistanceTexture.Shutdown();
-    m_specularTrackingDistanceTexture.Shutdown();
+    ReleaseTextures();
 
     if (!m_rawReflectionTexture.Initialize(device, width, height, 1, 1, DXGI_FORMAT_R16G16B16A16_FLOAT,
                                            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,

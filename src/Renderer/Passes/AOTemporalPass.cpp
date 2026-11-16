@@ -49,6 +49,16 @@ bool AOTemporalPass::Initialize(
 
     return Resize(graphicsDevice, descriptorHeap, width, height);
 }
+void AOTemporalPass::ReleaseTextures()
+{
+    for (unsigned int i = 0; i < 2; ++i)
+    {
+        m_accumulatedAO[i].Shutdown();
+        m_historyDepth[i].Shutdown();
+        m_historyLength[i].Shutdown();
+    }
+}
+
 bool AOTemporalPass::Resize(
     GraphicsDevice& graphicsDevice,
     DescriptorHeap& descriptorHeap,
@@ -59,12 +69,7 @@ bool AOTemporalPass::Resize(
 
     ID3D12Device* device = graphicsDevice.GetDevice();
 
-    for (unsigned int i = 0; i < 2; ++i)
-    {
-        m_accumulatedAO[i].Shutdown();
-        m_historyDepth[i].Shutdown();
-        m_historyLength[i].Shutdown();
-    }
+    ReleaseTextures();
 
     auto createTexture = [&](Texture& texture, DXGI_FORMAT format) -> bool
     {

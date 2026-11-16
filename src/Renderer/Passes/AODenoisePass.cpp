@@ -50,6 +50,14 @@ bool AODenoisePass::Initialize(
     return Resize(graphicsDevice, descriptorHeap, width, height);
 }
 
+void AODenoisePass::ReleaseTextures()
+{
+    for (unsigned int i = 0; i < 2; ++i)
+    {
+        m_filteredAO[i].Shutdown();
+    }
+}
+
 bool AODenoisePass::Resize(
     GraphicsDevice& graphicsDevice,
     DescriptorHeap& descriptorHeap,
@@ -60,10 +68,7 @@ bool AODenoisePass::Resize(
 
     ID3D12Device* device = graphicsDevice.GetDevice();
 
-    for (unsigned int i = 0; i < 2; ++i)
-    {
-        m_filteredAO[i].Shutdown();
-    }
+    ReleaseTextures();
 
     for (unsigned int i = 0; i < 2; ++i)
     {

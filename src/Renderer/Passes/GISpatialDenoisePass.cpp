@@ -100,14 +100,19 @@ bool GISpatialDenoisePass::CreateTextures(
     return true;
 }
 
+void GISpatialDenoisePass::ReleaseTextures()
+{
+    m_pingTexture.Shutdown();
+    m_pongTexture.Shutdown();
+}
+
 bool GISpatialDenoisePass::Resize(
     GraphicsDevice& graphicsDevice,
     DescriptorHeap& descriptorHeap,
     unsigned int width,
     unsigned int height)
 {
-    m_pingTexture.Shutdown();
-    m_pongTexture.Shutdown();
+    ReleaseTextures();
 
     return CreateTextures(graphicsDevice, descriptorHeap, width, height);
 }

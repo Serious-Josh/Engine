@@ -71,6 +71,11 @@ bool ReflectionContributionLimitPass::CreateTexture(
     return true;
 }
 
+void ReflectionContributionLimitPass::ReleaseTextures()
+{
+    m_output.Shutdown();
+}
+
 bool ReflectionContributionLimitPass::Resize(
 
     GraphicsDevice& device,
@@ -78,7 +83,7 @@ bool ReflectionContributionLimitPass::Resize(
     unsigned int width,
     unsigned int height)
 {
-    m_output.Shutdown();
+    ReleaseTextures();
     return CreateTexture(device, heap, width, height);
 }
 

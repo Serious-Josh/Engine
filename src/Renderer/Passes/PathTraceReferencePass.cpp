@@ -1485,17 +1485,8 @@ bool PathTraceReferencePass::CreateTextures(
     return true;
 }
 
-bool PathTraceReferencePass::Resize(
-    ID3D12Device* device,
-    DescriptorHeap& descriptorHeap,
-    unsigned int width,
-    unsigned int height)
+void PathTraceReferencePass::ReleaseTextures()
 {
-    if(!m_initialized)
-    {
-        return true;
-    }
-
     m_accumulationTexture.Shutdown();
     m_outputTexture.Shutdown();
 
@@ -1508,6 +1499,20 @@ bool PathTraceReferencePass::Resize(
     // PSR.1a: sized for the old extent; the next replacement frame allocates it again (PSR.1b: and the guides).
     m_psrRecords.Shutdown();
     m_psrGuides.Shutdown();
+}
+
+bool PathTraceReferencePass::Resize(
+    ID3D12Device* device,
+    DescriptorHeap& descriptorHeap,
+    unsigned int width,
+    unsigned int height)
+{
+    if(!m_initialized)
+    {
+        return true;
+    }
+
+    ReleaseTextures();
 
     if(!CreateTextures(device, descriptorHeap, width, height))
     {

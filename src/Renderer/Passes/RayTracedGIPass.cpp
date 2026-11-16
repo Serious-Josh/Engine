@@ -122,6 +122,12 @@ bool RayTracedGIPass::CreateTextures(
     return true;
 }
 
+void RayTracedGIPass::ReleaseTextures()
+{
+    m_rawGITexture.Shutdown();
+    m_hitDistanceTexture.Shutdown();
+}
+
 bool RayTracedGIPass::Resize(
     ID3D12Device* device,
     DescriptorHeap& descriptorHeap,
@@ -133,8 +139,7 @@ bool RayTracedGIPass::Resize(
         return false;
     }
 
-    m_rawGITexture.Shutdown();
-    m_hitDistanceTexture.Shutdown();
+    ReleaseTextures();
 
     if (!CreateTextures(device, descriptorHeap, width, height))
     {

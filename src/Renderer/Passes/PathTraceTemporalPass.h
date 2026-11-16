@@ -160,6 +160,12 @@ class PathTraceTemporalPass
         return m_historyValid;
     }
 
+    // Whether the history textures exist (EnsureHistory created them; ReleaseHistory has not released them since).
+    bool HasHistoryTextures() const
+    {
+        return m_width != 0;
+    }
+
     // The slot written by the last recorded frame (pending or committed): its temporal diffuse lighting
     // (demodulated: multiply by the G-buffer diffuse albedo, PathTraceTemporal.hlsl) and specular radiance.
     Texture& GetDiffuseOutput()

@@ -36,6 +36,10 @@ class ShadowDenoisePass
       DescriptorHeap& descriptorHeap,
       unsigned int width,
       unsigned int height);
+    // M0c.2: releases the render-extent textures and their descriptors; the pipeline stays. Resize creates them again.
+    // The caller guarantees the GPU no longer uses them.
+    void ReleaseTextures();
+
     bool Resize(
         GraphicsDevice& graphicsDevice,
         DescriptorHeap& descriptorHeap,

@@ -167,14 +167,8 @@ void RayTracedShadowPass::Execute(
     ++m_accumulatedFrameCount;
 }
 
-bool RayTracedShadowPass::Resize(
-    ID3D12Device* device,
-    DescriptorHeap& descriptorHeap,
-    unsigned int width,
-    unsigned int height)
+void RayTracedShadowPass::ReleaseTextures()
 {
-    const MemoryCategoryScope memoryScope(MemoryCategory::LegacyRayTracing);
-
     for (Texture& texture : m_historyTextures)
     {
         texture.Shutdown();
@@ -189,6 +183,17 @@ bool RayTracedShadowPass::Resize(
     {
         texture.Shutdown();
     }
+}
+
+bool RayTracedShadowPass::Resize(
+    ID3D12Device* device,
+    DescriptorHeap& descriptorHeap,
+    unsigned int width,
+    unsigned int height)
+{
+    const MemoryCategoryScope memoryScope(MemoryCategory::LegacyRayTracing);
+
+    ReleaseTextures();
 
     for (unsigned int i = 0; i < 2; ++i)
     {

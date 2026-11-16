@@ -56,6 +56,15 @@ bool NrdPreparePass::Initialize(
     return true;
 }
 
+void NrdPreparePass::ReleaseTextures()
+{
+    m_viewZTexture.Shutdown();
+    m_motionTexture.Shutdown();
+    m_normalRoughnessTexture.Shutdown();
+    m_specRadianceHitDistTexture.Shutdown();
+    m_diffRadianceHitDistTexture.Shutdown();
+}
+
 bool NrdPreparePass::Resize(
 
     GraphicsDevice& graphicsDevice,
@@ -63,11 +72,7 @@ bool NrdPreparePass::Resize(
     unsigned int width,
     unsigned int height)
 {
-    m_viewZTexture.Shutdown();
-    m_motionTexture.Shutdown();
-    m_normalRoughnessTexture.Shutdown();
-    m_specRadianceHitDistTexture.Shutdown();
-    m_diffRadianceHitDistTexture.Shutdown();
+    ReleaseTextures();
 
     return CreateTextures(graphicsDevice, descriptorHeap, width, height);
 }

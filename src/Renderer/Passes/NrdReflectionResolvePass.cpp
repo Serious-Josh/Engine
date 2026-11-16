@@ -54,6 +54,11 @@ bool NrdReflectionResolvePass::Initialize(
     return true;
 }
 
+void NrdReflectionResolvePass::ReleaseTextures()
+{
+    m_outputTexture.Shutdown();
+}
+
 bool NrdReflectionResolvePass::Resize(
 
     GraphicsDevice& graphicsDevice,
@@ -61,7 +66,7 @@ bool NrdReflectionResolvePass::Resize(
     unsigned int width,
     unsigned int height)
 {
-    m_outputTexture.Shutdown();
+    ReleaseTextures();
 
     return CreateTexture(graphicsDevice, descriptorHeap, width, height);
 }

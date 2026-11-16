@@ -70,6 +70,14 @@ bool ShadowDenoisePass::Initialize(
     return true;
 }
 
+void ShadowDenoisePass::ReleaseTextures()
+{
+    for (Texture& texture : m_filteredVisibility)
+    {
+        texture.Shutdown();
+    }
+}
+
 bool ShadowDenoisePass::Resize(
 
     GraphicsDevice& graphicsDevice,
@@ -81,10 +89,7 @@ bool ShadowDenoisePass::Resize(
 
     ID3D12Device* device = graphicsDevice.GetDevice();
 
-    for (Texture& texture : m_filteredVisibility)
-    {
-        texture.Shutdown();
-    }
+    ReleaseTextures();
 
     for (unsigned int i = 0; i < 2; ++i)
     {

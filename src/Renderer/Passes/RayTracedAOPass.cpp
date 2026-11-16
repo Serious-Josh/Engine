@@ -96,6 +96,11 @@ bool RayTracedAOPass::CreateTextures(
     return true;
 }
 
+void RayTracedAOPass::ReleaseTextures()
+{
+    m_rawAOTexture.Shutdown();
+}
+
 bool RayTracedAOPass::Resize(
     ID3D12Device* device,
     DescriptorHeap& descriptorHeap,
@@ -107,7 +112,7 @@ bool RayTracedAOPass::Resize(
         return false;
     }
 
-    m_rawAOTexture.Shutdown();
+    ReleaseTextures();
 
     if (!CreateTextures(device, descriptorHeap, width, height))
     {

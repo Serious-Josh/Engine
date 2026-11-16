@@ -91,13 +91,18 @@ bool AOResolvePass::CreateTexture(
     return true;
 }
 
+void AOResolvePass::ReleaseTextures()
+{
+    m_outputTexture.Shutdown();
+}
+
 bool AOResolvePass::Resize(
     GraphicsDevice& graphicsDevice,
     DescriptorHeap& descriptorHeap,
     unsigned int width,
     unsigned int height)
 {
-    m_outputTexture.Shutdown();
+    ReleaseTextures();
 
     return CreateTexture(graphicsDevice, descriptorHeap, width, height);
 }

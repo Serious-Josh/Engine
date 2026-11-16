@@ -198,6 +198,9 @@ namespace
             {PathTraceHybridDiffuseIdentifier, nrd::Denoiser::RELAX_DIFFUSE},
             {PathTraceHybridSpecularIdentifier, nrd::Denoiser::REBLUR_SPECULAR}};
         description.queuedFrameCount = HybridNrdQueuedFrames;
+        // M0c.3 Phase B: like RELAX and path-traced REBLUR (ER.1 Phase 3.1), so NRD retention can evict it without a wait;
+        // every other path that destroys it drains the GPU first.
+        description.externallySynchronized = true;
         return description;
     }
 
@@ -4573,14 +4576,14 @@ bool Renderer::Initialize(
     // Optional for Legacy: unavailable tables only disable the path-traced reference mode.
     LoadMaterialTables(packagedMaterialTables);
 
-    if (!m_rayTracedShadowPass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap, m_sceneWidth,
+    if (!m_legacyLighting.rayTracedShadowPass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap, m_sceneWidth,
                                           m_sceneHeight))
     {
         Log::Error("Faield to init ray traced shadow pass.");
         return false;
     }
 
-    if (!m_rayTracedReflectionPass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap, m_sceneWidth,
+    if (!m_legacyLighting.rayTracedReflectionPass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap, m_sceneWidth,
                                               m_sceneHeight))
     {
         Log::Error("Failed to init ray traced reflection pass.");
@@ -4594,40 +4597,40 @@ bool Renderer::Initialize(
     const uint32_t aoWidth = (m_sceneWidth + 1u) / 2u;
     const uint32_t aoHeight = (m_sceneHeight + 1u) / 2u;
 
-    if (!m_rayTracedGIPass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap, giWidth, giHeight))
+    if (!m_legacyLighting.rayTracedGIPass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap, giWidth, giHeight))
     {
         Log::Error("Failed to init ray traced gi pass.");
         return false;
     }
 
-    if (!m_rayTracedAOPass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap, aoWidth, aoHeight))
+    if (!m_legacyLighting.rayTracedAOPass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap, aoWidth, aoHeight))
     {
         Log::Error("Failed to init ray traced AO pass.");
 
         return false;
     }
 
-    if (!m_aoTemporalPass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap, aoWidth, aoHeight))
+    if (!m_legacyLighting.aoTemporalPass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap, aoWidth, aoHeight))
     {
         Log::Error("Failed to init AO temporal pass.");
 
         return false;
     }
 
-    if (!m_aoDenoisePass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap, aoWidth, aoHeight))
+    if (!m_legacyLighting.aoDenoisePass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap, aoWidth, aoHeight))
     {
         Log::Error("Failed to init ray traced ao denoise pass.");
 
         return false;
     }
 
-    if (!m_aoResolvePass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap, m_sceneWidth, m_sceneHeight))
+    if (!m_legacyLighting.aoResolvePass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap, m_sceneWidth, m_sceneHeight))
     {
         Log::Error("Failed to initialize AO resolve pass.");
         return false;
     }
 
-    if (!m_rayTracedReflectionTemporalPass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap,
+    if (!m_legacyLighting.rayTracedReflectionTemporalPass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap,
                                                       m_sceneWidth, m_sceneHeight))
     {
         Log::Error("Failed to init ray traced reflection temporal pass.");
@@ -4635,28 +4638,28 @@ bool Renderer::Initialize(
         return false;
     }
 
-    if (!m_rayTracedReflectionDenoisePass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap,
+    if (!m_legacyLighting.rayTracedReflectionDenoisePass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap,
                                                      m_sceneWidth, m_sceneHeight))
     {
         Log::Error("Failed to init ray traced reflection denoise pass.");
         return false;
     }
 
-    if (!m_reflectionContributionLimitPass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap,
+    if (!m_legacyLighting.reflectionContributionLimitPass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap,
                                                       m_sceneWidth, m_sceneHeight))
     {
         Log::Error("Failed to initialize reflection contribution limiter.");
         return false;
     }
 
-    if (!m_nrdReflectionPreparePass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap, m_sceneWidth,
+    if (!m_legacyLighting.nrdReflectionPreparePass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap, m_sceneWidth,
                                                m_sceneHeight))
     {
         Log::Error("Failed to initialize NRD reflection preparation pass.");
         return false;
     }
 
-    if (!m_nrdGIPreparePass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap, giWidth, giHeight,
+    if (!m_legacyLighting.nrdGIPreparePass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap, giWidth, giHeight,
                                        NrdPreparePass::Signal::Diffuse))
     {
         Log::Error("Failed to initialize NRD GI preparation pass.");
@@ -4664,21 +4667,21 @@ bool Renderer::Initialize(
         return false;
     }
 
-    if (!m_nrdReflectionResolvePass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap, m_sceneWidth,
+    if (!m_legacyLighting.nrdReflectionResolvePass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap, m_sceneWidth,
                                                m_sceneHeight))
     {
         Log::Error("Failed to initialize NRD reflection resolve pass.");
         return false;
     }
 
-    if (!m_nrdDiffuseResolvePass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap, m_sceneWidth,
+    if (!m_legacyLighting.nrdDiffuseResolvePass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap, m_sceneWidth,
                                             m_sceneHeight))
     {
         Log::Error("Failed to initialize NRD diffuse resolve pass.");
         return false;
     }
 
-    if (!m_giSpatialDenoisePass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap, m_sceneWidth,
+    if (!m_legacyLighting.giSpatialDenoisePass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap, m_sceneWidth,
                                            m_sceneHeight))
     {
         Log::Error("Failed to init the ray traced GI spatial denoise pass.");
@@ -4688,12 +4691,18 @@ bool Renderer::Initialize(
 
     // NRD.2: the hybrid mode's NRD instances are created on its first NRD frame (EnsureHybridNrdDenoisers).
 
-    if (!m_shadowDenoisePass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap, m_sceneWidth, m_sceneHeight))
+    if (!m_legacyLighting.shadowDenoisePass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap, m_sceneWidth, m_sceneHeight))
     {
         Log::Error("Failed to init shadow denoise pass.");
 
         return false;
     }
+
+    m_legacyLighting.MarkSized(m_sceneWidth, m_sceneHeight);
+    m_legacyLighting.retention = {};
+    m_legacyLighting.retention.lastActive = std::chrono::steady_clock::now();
+    m_pathTracingResidency = {};
+    m_pathTracingResidency.lastActive = m_legacyLighting.retention.lastActive;
 
     if(m_packagedRuntime)
     {
@@ -5167,104 +5176,21 @@ bool Renderer::ResizeSceneResources(const SceneResolution& resolution)
         return false;
     }
 
-    if(!m_rayTracedShadowPass.Resize(m_graphicsDevice.GetDevice(), m_resourceDescriptorHeap, width, height))
+    // M0c.1: Legacy's own passes follow the render extent only while Legacy is the active (last rendered) mode. Otherwise
+    // they keep their previous extent (stale) and EnsureLegacyLightingExtent resizes them before the next Legacy frame.
+    if(m_lightingModeTransition.GetStatus().active == RendererLightingMode::Legacy &&
+        !m_legacyLighting.Resize(m_graphicsDevice, m_resourceDescriptorHeap, width, height))
     {
-        Log::Error("Failed to resize ray traced shadow pass.");
-
-        return false;
-    }
-
-    if(!m_rayTracedReflectionPass.Resize(m_graphicsDevice.GetDevice(), m_resourceDescriptorHeap, width, height))
-    {
-        Log::Error("Failed to resize ray traced reflection pass.");
-
         return false;
     }
 
     const uint32_t giWidth = (width + 1u) / 2u;
     const uint32_t giHeight = (height + 1u) / 2u;
 
-    const uint32_t aoWidth = (width + 1u) / 2u;
-    const uint32_t aoHeight = (height + 1u) / 2u;
-
     if(m_giSignedCorrectionInitialized &&
 
         !m_giSignedCorrectionPass.Resize(m_graphicsDevice, m_resourceDescriptorHeap, width, height))
     {
-        return false;
-    }
-
-    if(!m_rayTracedGIPass.Resize(m_graphicsDevice.GetDevice(), m_resourceDescriptorHeap, giWidth, giHeight))
-    {
-        Log::Error("Failed to resize ray traced GI pass.");
-        return false;
-    }
-
-    if(!m_rayTracedAOPass.Resize(m_graphicsDevice.GetDevice(), m_resourceDescriptorHeap, aoWidth, aoHeight))
-    {
-        Log::Error("Failed to resize ray traced AO pass.");
-        return false;
-    }
-
-    if(!m_aoTemporalPass.Resize(m_graphicsDevice, m_resourceDescriptorHeap, aoWidth, aoHeight))
-    {
-        Log::Error("Failed to resize AO temporal pass.");
-        return false;
-    }
-
-    if(!m_aoDenoisePass.Resize(m_graphicsDevice, m_resourceDescriptorHeap, aoWidth, aoHeight))
-    {
-        Log::Error("Failed to resize AO denoise pass.");
-        return false;
-    }
-
-    if(!m_aoResolvePass.Resize(m_graphicsDevice, m_resourceDescriptorHeap, width, height))
-    {
-        Log::Error("Failed to resize AO resolve pass.");
-        return false;
-    }
-
-    if(!m_rayTracedReflectionTemporalPass.Resize(m_graphicsDevice.GetDevice(), m_resourceDescriptorHeap, width,
-                                                  height))
-    {
-        Log::Error("Failed to resize ray traced reflection temporal pass.");
-
-        return false;
-    }
-
-    if(!m_reflectionContributionLimitPass.Resize(m_graphicsDevice, m_resourceDescriptorHeap, width, height))
-    {
-        Log::Error("Failed to resize reflection contribution limiter.");
-        return false;
-    }
-
-    if(!m_nrdReflectionPreparePass.Resize(m_graphicsDevice, m_resourceDescriptorHeap, width, height))
-    {
-        Log::Error("Failed to resize NRD reflection preparation pass.");
-        return false;
-    }
-
-    if(!m_nrdGIPreparePass.Resize(m_graphicsDevice, m_resourceDescriptorHeap, giWidth, giHeight))
-    {
-        Log::Error("Failed to resize NRD GI preparation pass.");
-        return false;
-    }
-
-    if(!m_nrdReflectionResolvePass.Resize(m_graphicsDevice, m_resourceDescriptorHeap, width, height))
-    {
-        Log::Error("Failed to resize NRD reflection resolve pass.");
-        return false;
-    }
-
-    if(!m_nrdDiffuseResolvePass.Resize(m_graphicsDevice, m_resourceDescriptorHeap, width, height))
-    {
-        Log::Error("Failed to resize NRD diffuse resolve pass.");
-        return false;
-    }
-
-    if(!m_giSpatialDenoisePass.Resize(m_graphicsDevice, m_resourceDescriptorHeap, width, height))
-    {
-        Log::Error("Failed to resize gi spatial denoise pass.");
         return false;
     }
 
@@ -5284,18 +5210,6 @@ bool Renderer::ResizeSceneResources(const SceneResolution& resolution)
 
     m_hybridNrdCreationFailed = false;
     m_hasPreviousNrdCamera = false;
-
-    if(!m_rayTracedReflectionDenoisePass.Resize(m_graphicsDevice, m_resourceDescriptorHeap, width, height))
-    {
-        Log::Error("Failed to resize ray traced reflection denoise pass.");
-        return false;
-    }
-
-    if(!m_shadowDenoisePass.Resize(m_graphicsDevice, m_resourceDescriptorHeap, width, height))
-    {
-        Log::Error("Failed to resize shadow denoise pass.");
-        return false;
-    }
 
     m_sceneColor.Shutdown();
 
@@ -5354,7 +5268,8 @@ bool Renderer::ResizeSceneResources(const SceneResolution& resolution)
     }
 
     // The reference path tracer is optional: a failed resize disables it but never fails Legacy.
-    if(m_pathTraceReferencePass.IsInitialized() &&
+    // M0c.3: retired textures stay released; EnsurePathTracingResident creates them at the extent of their next frame.
+    if(m_pathTracingResidency.resident && m_pathTraceReferencePass.IsInitialized() &&
         !m_pathTraceReferencePass.Resize(m_graphicsDevice.GetDevice(), m_resourceDescriptorHeap, width, height))
     {
         m_pathTraceStatus.availability = PathTraceReferenceAvailability::Unavailable;
@@ -5431,6 +5346,259 @@ bool Renderer::ResizeSceneResources(const SceneResolution& resolution)
     m_sceneHeight = height;
     m_outputWidth = resolution.outputWidth;
     m_outputHeight = resolution.outputHeight;
+    return true;
+}
+
+// The Legacy passes are not sized for this recording in two cases, and neither needs a wait:
+// - M0c.1, stale: a scene resize while another mode rendered left them at an older extent. That resize drained the GPU
+//   (ResizeScene waits before ResizeSceneResources), and no Legacy frame has been recorded since (one would have run this
+//   first), so no submitted work and nothing in this recording references their resources or descriptors.
+// - M0c.2, retired: UpdateLegacyLightingRetention released them after their last use completed; nothing remains to
+//   replace.
+// The passes recreate their textures and descriptors exactly as an active-mode resize does. After a retirement their
+// temporal histories restart as well.
+bool Renderer::EnsureLegacyLightingExtent()
+{
+    if(m_legacyLighting.IsSizedFor(m_sceneWidth, m_sceneHeight))
+    {
+        return true;
+    }
+
+    TransitionTiming::Scope er1Scope("EnsureLegacyLightingExtent");
+    const MemoryCategoryScope memoryScope(MemoryCategory::CoreRenderer);
+    LegacyLightingResources::Retention& retention = m_legacyLighting.retention;
+    const bool retired = !retention.resident;
+    const auto started = std::chrono::steady_clock::now();
+
+    if(!m_legacyLighting.Resize(m_graphicsDevice, m_resourceDescriptorHeap, m_sceneWidth, m_sceneHeight))
+    {
+        Log::Error(retired ? "Legacy lighting resources could not be recreated after retirement." :
+            "Legacy lighting resources could not be resized for reactivation.");
+        return false;
+    }
+
+    if(retired)
+    {
+        m_legacyLighting.rayTracedShadowPass.ResetHistory();
+        m_legacyLighting.rayTracedReflectionTemporalPass.ResetHistory();
+        m_legacyLighting.aoTemporalPass.ResetHistory();
+        retention.resident = true;
+        ++retention.recreations;
+        retention.lastRecreationMilliseconds =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+    }
+
+    Log::Info("Legacy lighting resources " + std::string(retired ? "recreated after retirement" : "resized on reactivation") +
+        " at " + std::to_string(m_sceneWidth) + "x" + std::to_string(m_sceneHeight) + ".");
+    return true;
+}
+
+// M0c.2 / M0c.3: retirement releases resources and returns descriptor indices to the shader-visible heap at once, so it
+// happens only when the GPU has completed the last submission that used them (never waiting: a later recording retries),
+// and never while a mode transition is pending, since that may still need the mode's resources.
+Renderer::ModeResourceDecision Renderer::EvaluateModeResourceRetirement(ModeResourceResidency& residency,
+    bool transitionPending, bool dueRegardless)
+{
+    if(!residency.resident || transitionPending)
+    {
+        return ModeResourceDecision::Keep;
+    }
+
+    const bool graceExpired =
+        dueRegardless || std::chrono::steady_clock::now() - residency.lastActive >= ModeResourceGracePeriod;
+    const bool underPressure = !graceExpired && IsModeResourceMemoryUnderPressure();
+
+    if(!graceExpired && !underPressure)
+    {
+        return ModeResourceDecision::Keep;
+    }
+
+    // The last fence that may reference the resources is unknown after an unconfirmed submission; such a session ends anyway.
+    if(residency.submissionUncertain)
+    {
+        return ModeResourceDecision::Keep;
+    }
+
+    if(m_commandContext.GetCompletedFenceValue() < residency.lastUseFence)
+    {
+        ++residency.deferrals;
+        return ModeResourceDecision::Deferred;
+    }
+
+    ++residency.retirements;
+
+    if(underPressure)
+    {
+        ++residency.pressureRetirements;
+        return ModeResourceDecision::RetireUnderPressure;
+    }
+
+    return ModeResourceDecision::Retire;
+}
+
+void Renderer::BeginModeResourceRecording(ModeResourceResidency& residency) noexcept
+{
+    if(residency.usedThisRecording)
+    {
+        // The previous recording used the resources but never reached CommitModeResourceSubmission.
+        residency.usedThisRecording = false;
+        residency.submissionUncertain = true;
+    }
+}
+
+void Renderer::MarkModeResourceUsed(ModeResourceResidency& residency) noexcept
+{
+    residency.usedThisRecording = true;
+    residency.lastActive = std::chrono::steady_clock::now();
+}
+
+void Renderer::CommitModeResourceSubmission(ModeResourceResidency& residency)
+{
+    if(residency.usedThisRecording)
+    {
+        residency.usedThisRecording = false;
+        residency.lastUseFence = m_commandContext.GetLastSubmissionFenceValue();
+    }
+}
+
+bool Renderer::IsModeResourceMemoryUnderPressure()
+{
+    double headroom = 1.0;
+
+    if(m_modeResourceHeadroomOverrideForTesting >= 0.0)
+    {
+        headroom = m_modeResourceHeadroomOverrideForTesting;
+    }
+    else if(!QueryVideoMemoryHeadroom(headroom))
+    {
+        // Without a budget only the grace period retires resources.
+        return false;
+    }
+
+    // The thresholds NRD retention uses: below 10% headroom is pressure, above 20% ends it.
+    if(headroom < NrdRetentionEvictHeadroom)
+    {
+        m_modeResourceUnderPressure = true;
+    }
+    else if(headroom > NrdRetentionResumeHeadroom)
+    {
+        m_modeResourceUnderPressure = false;
+    }
+
+    return m_modeResourceUnderPressure;
+}
+
+// M0c.2: called on recordings that do not render Legacy, after the frame's mode is committed and before it records
+// anything. Pipelines stay resident, so recreation is the ordinary Resize.
+void Renderer::UpdateLegacyLightingRetention()
+{
+    const LightingModeTransitionStatus& status = m_lightingModeTransition.GetStatus();
+    const bool transitionPending =
+        status.stage != LightingModeTransitionStage::Idle || status.requested == RendererLightingMode::Legacy;
+    const ModeResourceDecision decision = EvaluateModeResourceRetirement(m_legacyLighting.retention, transitionPending);
+
+    if(decision != ModeResourceDecision::Retire && decision != ModeResourceDecision::RetireUnderPressure)
+    {
+        return;
+    }
+
+    m_legacyLighting.ReleaseTextures();
+    m_legacyLighting.retention.resident = false;
+    Log::Info(std::string("Retired the inactive Legacy lighting resources (") +
+        (decision == ModeResourceDecision::RetireUnderPressure ? "video memory pressure" : "grace period ended") + ").");
+}
+
+// M0c.3 Phase A: called on recordings that do not render a path-traced mode, after the frame's mode is committed and
+// before it records anything. Any requested path-traced mode counts as a pending transition (its activation, or a
+// failure it is still retrying), so Path Tracing never retires while it is wanted. Switching between Reference, Raster
+// Primary and ReSTIR DI renders a path-traced mode on every frame and never reaches this.
+void Renderer::UpdatePathTracingRetention()
+{
+    // Nothing was ever created (a Legacy-only session): nothing to retire.
+    if(!m_pathTraceReferencePass.IsInitialized())
+    {
+        return;
+    }
+
+    const LightingModeTransitionStatus& status = m_lightingModeTransition.GetStatus();
+    const bool transitionPending =
+        status.stage != LightingModeTransitionStage::Idle || status.requested != RendererLightingMode::Legacy;
+
+    // While retired, ReSTIR DI's per-frame availability check for a requested (but not rendering) Path Tracing creates the
+    // RTXDI resources again. Their creation records no GPU work, and no recording has used them since (a path-traced
+    // recording makes the set resident first), so once nothing requests Path Tracing they are released without a fence.
+    if(!m_pathTracingResidency.resident)
+    {
+        if(!transitionPending && m_rtxdiResources.IsInitialized())
+        {
+            m_rtxdiResources.Shutdown();
+            Log::Info("Released RTXDI resources created while Path Tracing was retired and not rendering.");
+        }
+
+        return;
+    }
+
+    const ModeResourceDecision decision = EvaluateModeResourceRetirement(m_pathTracingResidency, transitionPending);
+
+    if(decision != ModeResourceDecision::Retire && decision != ModeResourceDecision::RetireUnderPressure)
+    {
+        return;
+    }
+
+    ReleasePathTracingResources();
+    m_pathTracingResidency.resident = false;
+    Log::Info(std::string("Retired the inactive Path Tracing resources (") +
+        (decision == ModeResourceDecision::RetireUnderPressure ? "video memory pressure" : "grace period ended") + ").");
+}
+
+void Renderer::ReleasePathTracingResources()
+{
+    m_pathTraceReferencePass.ReleaseTextures();
+    m_pathTraceTemporalPass.ReleaseHistory();
+    m_pathTraceSpatialPass.ReleaseIntermediate();
+    // Both are created again on their next path-traced use (EnsureRtxdiResources, EnsurePreviousGBufferHistory).
+    m_rtxdiResources.Shutdown();
+    m_previousGBufferHistory.Shutdown();
+    InvalidatePreviousGBufferHistory();
+    m_previousGBufferReadSlot = 0;
+    m_pathTraceResetPending = true;
+    m_pathTraceStatus.resourceBytes = 0;
+}
+
+// The reference pass is initialized but its textures were released: Resize creates them at the render extent, as a scene
+// resize does. No wait is needed: they were released only after their last use completed, and nothing in this recording
+// has referenced them yet (path-traced work is recorded after this). The other released resources are created on first
+// use, and every history restarts.
+bool Renderer::EnsurePathTracingResident()
+{
+    if(m_pathTracingResidency.resident)
+    {
+        return true;
+    }
+
+    TransitionTiming::Scope er1Scope("EnsurePathTracingResident");
+    const MemoryCategoryScope memoryScope(MemoryCategory::CoreRenderer);
+    const auto started = std::chrono::steady_clock::now();
+
+    if(m_pathTracingRecreationFailureForTesting ||
+        !m_pathTraceReferencePass.Resize(m_graphicsDevice.GetDevice(), m_resourceDescriptorHeap, m_sceneWidth, m_sceneHeight))
+    {
+        m_pathTracingRecreationFailureForTesting = false;
+        m_pathTraceStatus.availability = PathTraceReferenceAvailability::Unavailable;
+        m_pathTraceStatus.unavailableReason = "Path tracing resources could not be recreated after retirement.";
+        Log::Error(m_pathTraceStatus.unavailableReason);
+        return false;
+    }
+
+    m_pathTraceStatus.resourceBytes = m_pathTraceReferencePass.GetResourceBytes();
+    m_pathTraceResetPending = true;
+    InvalidatePreviousGBufferHistory();
+    m_pathTracingResidency.resident = true;
+    ++m_pathTracingResidency.recreations;
+    m_pathTracingResidency.lastRecreationMilliseconds =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+    Log::Info("Path Tracing resources recreated after retirement at " + std::to_string(m_sceneWidth) + "x" +
+        std::to_string(m_sceneHeight) + ".");
     return true;
 }
 
@@ -6277,11 +6445,11 @@ void Renderer::ResetSceneHistory()
     m_giSignedCorrectionPass.ResetHistory();
 
     m_signedCorrectionExecutedLastFrame = false;
-    m_rayTracedShadowPass.ResetHistory();
+    m_legacyLighting.rayTracedShadowPass.ResetHistory();
 
-    m_rayTracedReflectionTemporalPass.ResetHistory();
+    m_legacyLighting.rayTracedReflectionTemporalPass.ResetHistory();
 
-    m_aoTemporalPass.ResetHistory();
+    m_legacyLighting.aoTemporalPass.ResetHistory();
 
     m_hasPreviousViewProjection = false;
     m_hasPreviousShadowLightDirection = false;
@@ -6532,11 +6700,16 @@ bool Renderer::IsNrdRetentionGroupAllocated(NrdRetentionGroup group) const
     {
     case NrdRetentionGroup::Relax:
         return m_nrdRelaxDenoiser.IsInitialized() || m_nrdRelaxResolvedTexture.GetResource() ||
-            m_nrdRelaxPreparePass.IsInitialized() || m_nrdRelaxPreparePass.HasTextures() ||
-            m_pathTraceReferencePass.HasRawDiffuseHitDistanceResources();
+            m_nrdRelaxPreparePass.IsInitialized() || m_nrdRelaxPreparePass.HasTextures();
+    case NrdRetentionGroup::RawDiffuseHitDistance:
+        return m_pathTraceReferencePass.HasRawDiffuseHitDistanceResources();
     case NrdRetentionGroup::PathTraceReblur:
         return m_nrdPathTraceDenoiser.IsInitialized() || m_nrdPathTraceValidationTexture.GetResource() ||
             m_nrdPathTracePreparePass.HasTextures();
+    case NrdRetentionGroup::Hybrid:
+        return m_nrdHybridDenoiser.IsInitialized() || m_nrdHybridPreparePass.HasTextures();
+    case NrdRetentionGroup::EngineDenoiser:
+        return m_pathTraceTemporalPass.HasHistoryTextures() || m_pathTraceSpatialPass.HasIntermediate();
     case NrdRetentionGroup::Legacy:
         return m_nrdReflectionDenoiser.IsInitialized() || m_nrdGIDenoiser.IsInitialized();
     case NrdRetentionGroup::Count:
@@ -6546,18 +6719,28 @@ bool Renderer::IsNrdRetentionGroupAllocated(NrdRetentionGroup group) const
     return false;
 }
 
-// Whether this recording may reference the group. Selection counts even on frames the denoiser does not dispatch, and
-// the raw diffuse hit distance is shared with the hybrid (selected or diagnostic), so RELAX's group stays active then.
+// Whether this recording may reference the group. Selection counts even on frames the denoiser does not dispatch.
+// M0c.3 Phase B: the path-traced groups are active only on recordings that render a path-traced mode (and the diagnostics
+// that hold them regardless), so a session in Legacy lets them retire. The raw diffuse hit distance is shared by RELAX and
+// the hybrid, so it is its own group, active for either; the Engine denoiser's group is active while it is selected or
+// ran on the previous frame (a fallback when an NRD denoiser could not be created).
 bool Renderer::IsNrdRetentionGroupActive(NrdRetentionGroup group, bool runPathTrace) const
 {
+    const bool relaxDiagnostic = m_nrdRelaxPrepareDiagnostic || m_nrdRelaxDispatchDiagnostic || m_nrdHybridDispatchDiagnostic;
+
     switch(group)
     {
     case NrdRetentionGroup::Relax:
-        return m_pathTraceDenoiserMode == PathTraceDenoiserMode::NrdRelax ||
-            m_pathTraceDenoiserMode == PathTraceDenoiserMode::NrdHybrid || m_nrdRelaxPrepareDiagnostic ||
-            m_nrdRelaxDispatchDiagnostic || m_nrdHybridDispatchDiagnostic;
+        return (runPathTrace && m_pathTraceDenoiserMode == PathTraceDenoiserMode::NrdRelax) || relaxDiagnostic;
+    case NrdRetentionGroup::RawDiffuseHitDistance:
+        return (runPathTrace && (m_pathTraceDenoiserMode == PathTraceDenoiserMode::NrdRelax ||
+            m_pathTraceDenoiserMode == PathTraceDenoiserMode::NrdHybrid)) || relaxDiagnostic;
     case NrdRetentionGroup::PathTraceReblur:
-        return m_pathTraceDenoiserMode == PathTraceDenoiserMode::NrdReblur || m_nrdPathTraceDiagnostic;
+        return (runPathTrace && m_pathTraceDenoiserMode == PathTraceDenoiserMode::NrdReblur) || m_nrdPathTraceDiagnostic;
+    case NrdRetentionGroup::Hybrid:
+        return (runPathTrace && m_pathTraceDenoiserMode == PathTraceDenoiserMode::NrdHybrid) || m_nrdHybridDispatchDiagnostic;
+    case NrdRetentionGroup::EngineDenoiser:
+        return runPathTrace && (m_pathTraceDenoiserMode == PathTraceDenoiserMode::Engine || m_pathTraceTemporalRanLastFrame);
     case NrdRetentionGroup::Legacy:
         return !runPathTrace;
     case NrdRetentionGroup::Count:
@@ -6565,6 +6748,26 @@ bool Renderer::IsNrdRetentionGroupActive(NrdRetentionGroup group, bool runPathTr
     }
 
     return true;
+}
+
+// M0c.3 Phase B: an inactive group is kept while a transition may still need it: the path-traced groups while a path-traced
+// mode is requested but not rendering (its activation, or a failure it retries), the Legacy pair while Legacy is requested
+// but not rendering, and every group while a lighting-mode activation is in progress or a denoiser change is preparing.
+bool Renderer::IsNrdRetentionGroupTransitionPending(NrdRetentionGroup group, bool runPathTrace) const
+{
+    const LightingModeTransitionStatus& status = m_lightingModeTransition.GetStatus();
+
+    if(status.stage != LightingModeTransitionStage::Idle || !m_denoiserPreparation.empty())
+    {
+        return true;
+    }
+
+    if(group == NrdRetentionGroup::Legacy)
+    {
+        return runPathTrace && status.requested == RendererLightingMode::Legacy;
+    }
+
+    return !runPathTrace && status.requested != RendererLightingMode::Legacy;
 }
 
 // DXGI local-segment headroom, (budget - usage) / budget. False when the adapter or its budget is unavailable.
@@ -6602,13 +6805,14 @@ bool Renderer::QueryVideoMemoryHeadroom(double& headroom)
 }
 
 // Called before this recording records anything that could reference an NRD group (where the groups used to be released
-// with a GPU wait). Thresholds: below 10% headroom the budget is close enough that the OS may demote or the next
-// allocation may fail; 20% to resume keeps an evicted group's own size (~50-150 MiB at 1600x900, a few percent of a
-// typical budget) from flipping the state back at once. One eviction per frame lets DXGI usage settle between them.
+// with a GPU wait). M0c.3 Phase B: each group carries the shared ModeResourceResidency, and the least recently active
+// inactive group retires through EvaluateModeResourceRetirement: after the 5 s grace period, earlier under DXGI memory
+// pressure (below 10% headroom, until above 20%), never while a transition may need it, never after an unconfirmed
+// submission, and only once its last use completed (never waiting). Without a budget, at most one inactive group is
+// retained (the ER.1 rule, applied through the same evaluation). One eviction per frame lets DXGI usage settle between them.
 void Renderer::UpdateNrdRetention(bool runPathTrace)
 {
     ++m_nrdRetentionFrame;
-    const std::uint64_t completedFence = m_commandContext.GetCompletedFenceValue();
     std::optional<NrdRetentionGroup> leastRecent;
     std::uint32_t inactiveGroups = 0;
 
@@ -6616,30 +6820,29 @@ void Renderer::UpdateNrdRetention(bool runPathTrace)
     {
         const NrdRetentionGroup group = static_cast<NrdRetentionGroup>(index);
         NrdRetentionState& state = m_nrdRetention[index];
-
-        // A previous recording that referenced the group never reached CommitNrdRetentionSubmission.
-        if(state.usedThisRecording)
-        {
-            state.usedThisRecording = false;
-            state.submissionUncertain = true;
-        }
+        BeginModeResourceRecording(state.residency);
 
         if(!IsNrdRetentionGroupAllocated(group))
         {
-            state = NrdRetentionState{false, false, 0, 0, state.evictions, state.deferrals};
+            // Nothing to track until the group is created again; its counters stay.
+            state.residency.resident = false;
+            state.residency.submissionUncertain = false;
+            state.residency.lastUseFence = 0;
             continue;
         }
 
+        state.residency.resident = true;
+
         if(IsNrdRetentionGroupActive(group, runPathTrace))
         {
-            state.usedThisRecording = true;
+            MarkModeResourceUsed(state.residency);
             state.lastActiveFrame = m_nrdRetentionFrame;
             continue;
         }
 
         ++inactiveGroups;
 
-        if(!state.submissionUncertain && (!leastRecent ||
+        if(!state.residency.submissionUncertain && (!leastRecent ||
             state.lastActiveFrame < m_nrdRetention[static_cast<size_t>(*leastRecent)].lastActiveFrame))
         {
             leastRecent = group;
@@ -6651,72 +6854,49 @@ void Renderer::UpdateNrdRetention(bool runPathTrace)
         return;
     }
 
+    // ER.1 fallback: without a budget, at most one inactive group is retained, so a second one is due at once.
     double headroom = 1.0;
-    bool evict = false;
+    const bool budgetAvailable = !m_nrdRetentionBudgetUnavailableForTesting &&
+        (m_modeResourceHeadroomOverrideForTesting >= 0.0 || QueryVideoMemoryHeadroom(headroom));
+    const bool dueWithoutBudget = !budgetAvailable && inactiveGroups > 1;
+    NrdRetentionState& state = m_nrdRetention[static_cast<size_t>(*leastRecent)];
+    const ModeResourceDecision decision = EvaluateModeResourceRetirement(state.residency,
+        IsNrdRetentionGroupTransitionPending(*leastRecent, runPathTrace), dueWithoutBudget);
+    m_nrdRetentionStatus.underPressure = m_modeResourceUnderPressure;
 
-    if(!m_nrdRetentionBudgetUnavailableForTesting &&
-        (m_nrdRetentionHeadroomOverride >= 0.0 || QueryVideoMemoryHeadroom(headroom)))
+    if(decision != ModeResourceDecision::Retire && decision != ModeResourceDecision::RetireUnderPressure)
     {
-        if(m_nrdRetentionHeadroomOverride >= 0.0)
-        {
-            headroom = m_nrdRetentionHeadroomOverride;
-        }
+        return;
+    }
 
-        if(headroom < NrdRetentionEvictHeadroom)
-        {
-            m_nrdRetentionStatus.underPressure = true;
-        }
-        else if(headroom > NrdRetentionResumeHeadroom)
-        {
-            m_nrdRetentionStatus.underPressure = false;
-        }
-
-        evict = m_nrdRetentionStatus.underPressure;
+    if(EvictNrdRetentionGroup(*leastRecent, decision == ModeResourceDecision::RetireUnderPressure))
+    {
+        state.residency.resident = false;
     }
     else
     {
-        // Without a budget, at most one inactive group is retained.
-        evict = inactiveGroups > 1;
-    }
+        // Kept (an instance that is not externally synchronized): the evaluation counted a retirement that did not happen.
+        --state.residency.retirements;
 
-    if(!evict)
-    {
-        return;
-    }
-
-    NrdRetentionState& state = m_nrdRetention[static_cast<size_t>(*leastRecent)];
-
-    // Its last submitted use is still in flight: postponed to a later frame, never waited for.
-    if(completedFence < state.lastUseFence)
-    {
-        ++state.deferrals;
-        return;
-    }
-
-    if(EvictNrdRetentionGroup(*leastRecent))
-    {
-        ++state.evictions;
+        if(decision == ModeResourceDecision::RetireUnderPressure)
+        {
+            --state.residency.pressureRetirements;
+        }
     }
 }
 
 void Renderer::CommitNrdRetentionSubmission()
 {
-    const std::uint64_t submissionFence = m_commandContext.GetLastSubmissionFenceValue();
-
     for(NrdRetentionState& state : m_nrdRetention)
     {
-        if(state.usedThisRecording)
-        {
-            state.usedThisRecording = false;
-            state.lastUseFence = submissionFence;
-        }
+        CommitModeResourceSubmission(state.residency);
     }
 }
 
 // No wait: UpdateNrdRetention proved the group inactive in this recording, confirmed every recording that used it
 // submitted, and saw its last submission's fence complete. The instances are externally synchronized, so NRD does not
-// wait either.
-bool Renderer::EvictNrdRetentionGroup(NrdRetentionGroup group)
+// wait either; their next creation starts with CLEAR_AND_RESTART like any new instance.
+bool Renderer::EvictNrdRetentionGroup(NrdRetentionGroup group, bool underPressure)
 {
     TransitionTiming::Scope er1Scope("EvictNrdRetentionGroup");
     const auto synchronized = [](const NrdDenoiser& denoiser)
@@ -6726,7 +6906,7 @@ bool Renderer::EvictNrdRetentionGroup(NrdRetentionGroup group)
 
     // An instance that would wait for the GPU in Destroy is never evicted here; the release paths that drain own it.
     const bool external = synchronized(m_nrdRelaxDenoiser) && synchronized(m_nrdPathTraceDenoiser) &&
-        synchronized(m_nrdReflectionDenoiser) && synchronized(m_nrdGIDenoiser);
+        synchronized(m_nrdHybridDenoiser) && synchronized(m_nrdReflectionDenoiser) && synchronized(m_nrdGIDenoiser);
 
     if(!external)
     {
@@ -6735,24 +6915,31 @@ bool Renderer::EvictNrdRetentionGroup(NrdRetentionGroup group)
     }
 
     const char* name = "";
+    // NRD's own report of the instances' pools (persistent + transient), which Engine's registry does not track.
+    double nrdReportedMegabytes = 0.0;
 
     switch(group)
     {
     case NrdRetentionGroup::Relax:
+        nrdReportedMegabytes = m_nrdRelaxDenoiser.IsInitialized() ? m_nrdRelaxDenoiser.GetTotalMemoryUsageInMb() : 0.0;
         m_nrdRelaxDenoiser.Shutdown();
         m_nrdRelaxResolvedTexture.Shutdown();
         m_nrdRelaxConfidenceOne.Shutdown();
         m_nrdRelaxConfidenceLow.Shutdown();
         m_nrdConfidencePass.Shutdown();
         m_nrdRelaxPreparePass.Shutdown();
-        m_pathTraceReferencePass.ReleaseRawDiffuseHitDistanceResources();
         m_nrdRelaxCreationFailed = false;
         m_nrdRelaxHistoryValid = false;
         m_nrdRelaxExecutedLastFrame = false;
         m_nrdRelaxFailure.clear();
         name = "RELAX";
         break;
+    case NrdRetentionGroup::RawDiffuseHitDistance:
+        m_pathTraceReferencePass.ReleaseRawDiffuseHitDistanceResources();
+        name = "raw diffuse hit distance";
+        break;
     case NrdRetentionGroup::PathTraceReblur:
+        nrdReportedMegabytes = m_nrdPathTraceDenoiser.IsInitialized() ? m_nrdPathTraceDenoiser.GetTotalMemoryUsageInMb() : 0.0;
         m_nrdPathTraceDenoiser.Shutdown();
         m_nrdPathTraceValidationTexture.Shutdown();
         m_nrdPathTracePreparePass.ReleaseTextures();
@@ -6760,7 +6947,27 @@ bool Renderer::EvictNrdRetentionGroup(NrdRetentionGroup group)
         m_nrdPathTraceExecutedLastFrame = false;
         name = "path-traced REBLUR";
         break;
+    case NrdRetentionGroup::Hybrid:
+        // The preparation pass keeps its pipelines (Initialize is a no-op on the next hybrid frame); its textures go.
+        nrdReportedMegabytes = m_nrdHybridDenoiser.IsInitialized() ? m_nrdHybridDenoiser.GetTotalMemoryUsageInMb() : 0.0;
+        m_nrdHybridDenoiser.Shutdown();
+        m_nrdHybridPreparePass.ReleaseTextures();
+        m_nrdHybridCreationFailed = false;
+        m_nrdHybridHistoryValid = false;
+        m_nrdHybridExecutedLastFrame = false;
+        m_nrdHybridDispatchedThisFrame = false;
+        m_nrdHybridKey.reset();
+        name = "path-traced hybrid";
+        break;
+    case NrdRetentionGroup::EngineDenoiser:
+        // Created again by the next temporal or spatial frame (EnsureHistory, EnsureIntermediate), starting a new history.
+        m_pathTraceTemporalPass.ReleaseHistory();
+        m_pathTraceSpatialPass.ReleaseIntermediate();
+        name = "Engine denoiser";
+        break;
     case NrdRetentionGroup::Legacy:
+        nrdReportedMegabytes = (m_nrdReflectionDenoiser.IsInitialized() ? m_nrdReflectionDenoiser.GetTotalMemoryUsageInMb() : 0.0) +
+            (m_nrdGIDenoiser.IsInitialized() ? m_nrdGIDenoiser.GetTotalMemoryUsageInMb() : 0.0);
         m_nrdReflectionDenoiser.Shutdown();
         m_nrdGIDenoiser.Shutdown();
         m_nrdExecutedLastFrame = false;
@@ -6770,7 +6977,10 @@ bool Renderer::EvictNrdRetentionGroup(NrdRetentionGroup group)
         return false;
     }
 
-    Log::Info(std::string("Evicted the inactive ") + name + " NRD resources (retention policy).");
+    m_nrdRetentionLastEvictedReportedMegabytes = nrdReportedMegabytes;
+    Log::Info(std::string("Evicted the inactive ") + name + " NRD resources (" +
+        (underPressure ? "video memory pressure" : "retention policy") + "; NRD-reported instance pools " +
+        std::to_string(nrdReportedMegabytes) + " MiB).");
     return true;
 }
 
@@ -11167,28 +11377,28 @@ bool Renderer::RecordAmbientOcclusionPasses(
 
     if (!m_aoExecutedLastFrame || m_previousAORadius != constants.maxDistance)
     {
-        m_aoTemporalPass.ResetHistory();
+        m_legacyLighting.aoTemporalPass.ResetHistory();
     }
 
     m_previousAORadius = constants.maxDistance;
 
     m_gpuTimestampProfiler.BeginRegion(commandList, frameSlot, GpuTimestampProfiler::Region::RayTracedAO);
-    m_rayTracedAOPass.Execute(m_commandContext.GetRayTracingCommandList(), m_resourceDescriptorHeap,
+    m_legacyLighting.rayTracedAOPass.Execute(m_commandContext.GetRayTracingCommandList(), m_resourceDescriptorHeap,
                               m_rayTracingScene, aoConstantsAddress, width, height);
     m_gpuTimestampProfiler.EndRegion(commandList, frameSlot, GpuTimestampProfiler::Region::RayTracedAO);
 
     m_gpuTimestampProfiler.BeginRegion(commandList, frameSlot, GpuTimestampProfiler::Region::AOTemporal);
-    m_aoTemporalPass.Execute(commandList, m_rayTracedAOPass.GetRawAOTexture(), m_gBuffer, m_uploadBuffer,
+    m_legacyLighting.aoTemporalPass.Execute(commandList, m_legacyLighting.rayTracedAOPass.GetRawAOTexture(), m_gBuffer, m_uploadBuffer,
                              constants.inverseViewProjection, shadowConstants.previousViewProjection,
                              shadowConstants.previousInverseViewProjection, width, height);
     m_gpuTimestampProfiler.EndRegion(commandList, frameSlot, GpuTimestampProfiler::Region::AOTemporal);
 
     m_gpuTimestampProfiler.BeginRegion(commandList, frameSlot, GpuTimestampProfiler::Region::AODenoise);
-    m_aoDenoisePass.Execute(commandList, m_aoTemporalPass.GetAccumulatedAOTexture(), m_gBuffer, m_uploadBuffer,
+    m_legacyLighting.aoDenoisePass.Execute(commandList, m_legacyLighting.aoTemporalPass.GetAccumulatedAOTexture(), m_gBuffer, m_uploadBuffer,
                             constants.inverseViewProjection, width, height);
     m_gpuTimestampProfiler.EndRegion(commandList, frameSlot, GpuTimestampProfiler::Region::AODenoise);
 
-    m_aoResolvePass.Execute(commandList, m_aoDenoisePass.GetFilteredAOTexture(), m_gBuffer.GetDepth(),
+    m_legacyLighting.aoResolvePass.Execute(commandList, m_legacyLighting.aoDenoisePass.GetFilteredAOTexture(), m_gBuffer.GetDepth(),
                             m_gBuffer.GetSurface(), m_uploadBuffer, m_sceneWidth, m_sceneHeight);
 
     return true;
@@ -11852,7 +12062,42 @@ bool Renderer::RecordRenderFrame(
         runPathTrace = evaluateLightingMode(recordedMode, pathTracePrimary, ignoredFailure);
     }
 
+    // M0c.1/M0c.2: before anything in this recording reads a Legacy pass (constants below, then the Legacy branch), a
+    // Legacy recording makes the set resident at the render extent and marks it used; any other recording may retire it.
+    // M0c.3: the same for Path Tracing's resources, shared by every path-traced mode.
+    BeginModeResourceRecording(m_legacyLighting.retention);
+    BeginModeResourceRecording(m_pathTracingResidency);
+
+    if(!runPathTrace)
+    {
+        if(!EnsureLegacyLightingExtent())
+        {
+            return false;
+        }
+
+        MarkModeResourceUsed(m_legacyLighting.retention);
+    }
+    else
+    {
+        if(!EnsurePathTracingResident())
+        {
+            return false;
+        }
+
+        MarkModeResourceUsed(m_pathTracingResidency);
+    }
+
     m_lightingModeTransition.CommitRendered(runPathTrace ? recordedMode : RendererLightingMode::Legacy);
+
+    // After the commit, so a transition counts as pending only while the requested mode has not rendered yet.
+    if(runPathTrace)
+    {
+        UpdateLegacyLightingRetention();
+    }
+    else
+    {
+        UpdatePathTracingRetention();
+    }
 
     if(m_pathTraceRenderedLastFrame && !runPathTrace)
     {
@@ -12277,7 +12522,7 @@ bool Renderer::RecordRenderFrame(
 
         if (directionDifference > 0.0001f || light.angularRadius != m_previousShadowLightAngularRadius)
         {
-            m_rayTracedShadowPass.ResetHistory();
+            m_legacyLighting.rayTracedShadowPass.ResetHistory();
             m_giSignedCorrectionPass.ResetHistory();
             giLightingChanged = true;
         }
@@ -12332,13 +12577,13 @@ bool Renderer::RecordRenderFrame(
     shadowConstants.lightAngularRadius = light.angularRadius;
 
     shadowConstants.frameIndex = m_shadowSampleIndex++;
-    shadowConstants.historyIndex = m_rayTracedShadowPass.GetVisibilityTexture().GetDescriptorIndex();
-    shadowConstants.previousDepthIndex = m_rayTracedShadowPass.GetPreviousDepthIndex();
-    shadowConstants.outputDepthIndex = m_rayTracedShadowPass.GetOutputDepthIndex();
+    shadowConstants.historyIndex = m_legacyLighting.rayTracedShadowPass.GetVisibilityTexture().GetDescriptorIndex();
+    shadowConstants.previousDepthIndex = m_legacyLighting.rayTracedShadowPass.GetPreviousDepthIndex();
+    shadowConstants.outputDepthIndex = m_legacyLighting.rayTracedShadowPass.GetOutputDepthIndex();
 
-    shadowConstants.previousHistoryLengthIndex = m_rayTracedShadowPass.GetPreviousHistoryLengthIndex();
-    shadowConstants.outputHistoryLengthIndex = m_rayTracedShadowPass.GetOutputHistoryLengthIndex();
-    shadowConstants.accumulatedFrameCount = m_rayTracedShadowPass.GetAccumulatedFrameCount();
+    shadowConstants.previousHistoryLengthIndex = m_legacyLighting.rayTracedShadowPass.GetPreviousHistoryLengthIndex();
+    shadowConstants.outputHistoryLengthIndex = m_legacyLighting.rayTracedShadowPass.GetOutputHistoryLengthIndex();
+    shadowConstants.accumulatedFrameCount = m_legacyLighting.rayTracedShadowPass.GetAccumulatedFrameCount();
 
     ReflectionConstants reflectionConstants{};
 
@@ -12534,9 +12779,12 @@ bool Renderer::RecordRenderFrame(
         m_nrdHybridPresentedLastFrame = false;
     }
 
-    if(!m_nrdHybridDispatchDiagnostic && !hybridSelected)
+    // M0c.3 Phase B: a deselected hybrid is kept by NRD retention (evicted after the grace period, never waiting) instead of
+    // being released here with a GPU wait. Like an inactive RELAX, its next frame starts with CLEAR_AND_RESTART.
+    if(!m_nrdHybridDispatchDiagnostic && !hybridSelected && m_nrdHybridDenoiser.IsInitialized())
     {
-        ReleaseNrdHybridDenoiser();
+        m_nrdHybridInstanceNew = true;
+        m_nrdHybridHistoryValid = false;
     }
 
     // NRD.RELAX.2: the same for the RELAX preparation diagnostic. NRD.RELAX.3: the RELAX dispatch diagnostic uses the same
@@ -12632,7 +12880,7 @@ bool Renderer::RecordRenderFrame(
 
         m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::RayTracedShadows);
 
-        m_rayTracedShadowPass.Execute(m_commandContext.GetRayTracingCommandList(), m_resourceDescriptorHeap,
+        m_legacyLighting.rayTracedShadowPass.Execute(m_commandContext.GetRayTracingCommandList(), m_resourceDescriptorHeap,
                                       m_rayTracingScene, shadowConstantsAddress, m_sceneWidth, m_sceneHeight);
 
         m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::RayTracedShadows);
@@ -12651,7 +12899,7 @@ bool Renderer::RecordRenderFrame(
 
         m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::RayTracedReflections);
 
-        m_rayTracedReflectionPass.Execute(m_commandContext.GetRayTracingCommandList(), m_resourceDescriptorHeap,
+        m_legacyLighting.rayTracedReflectionPass.Execute(m_commandContext.GetRayTracingCommandList(), m_resourceDescriptorHeap,
                                           m_rayTracingScene, reflectionConstantsAddress, lightConstantsAddress, m_sceneWidth,
                                           m_sceneHeight);
 
@@ -12668,12 +12916,12 @@ bool Renderer::RecordRenderFrame(
                                                                              D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         }
 
-        m_rayTracedGIPass.Execute(m_commandContext.GetRayTracingCommandList(), m_resourceDescriptorHeap, m_rayTracingScene,
+        m_legacyLighting.rayTracedGIPass.Execute(m_commandContext.GetRayTracingCommandList(), m_resourceDescriptorHeap, m_rayTracingScene,
                                   giConstantsAddress, lightConstantsAddress, sceneLightConstantsAddress, giWidth, giHeight);
 
         m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::RayTracedGI);
 
-        Texture* giNrdInput = &m_rayTracedGIPass.GetRawGITexture();
+        Texture* giNrdInput = &m_legacyLighting.rayTracedGIPass.GetRawGITexture();
 
         bool signedGIReconstructed = false;
 
@@ -12691,7 +12939,7 @@ bool Renderer::RecordRenderFrame(
 
             if (!m_giSignedCorrectionPass.Reconstruct(commandList, m_uploadBuffer, m_gBuffer,
                                                       m_environment.GetDiffuseIrradiance(),
-                                                      m_rayTracedGIPass.GetRawGITexture()))
+                                                      m_legacyLighting.rayTracedGIPass.GetRawGITexture()))
             {
                 Log::Error("Failed to reconstruct signed GI irradiance.");
                 return false;
@@ -12776,7 +13024,7 @@ bool Renderer::RecordRenderFrame(
                 return false;
             }
 
-            Texture* nrdInput = &m_rayTracedReflectionPass.GetRawReflectionTexture();
+            Texture* nrdInput = &m_legacyLighting.rayTracedReflectionPass.GetRawReflectionTexture();
 
             if (limiterEnabled)
             {
@@ -12784,7 +13032,7 @@ bool Renderer::RecordRenderFrame(
                                                    GpuTimestampProfiler::Region::ReflectionContributionLimiter);
 
                 const bool limited =
-                    m_reflectionContributionLimitPass.Execute(commandList, *nrdInput, m_uploadBuffer, m_sceneWidth, m_sceneHeight);
+                    m_legacyLighting.reflectionContributionLimitPass.Execute(commandList, *nrdInput, m_uploadBuffer, m_sceneWidth, m_sceneHeight);
                 m_gpuTimestampProfiler.EndRegion(commandList, frameIndex,
                                                  GpuTimestampProfiler::Region::ReflectionContributionLimiter);
 
@@ -12794,17 +13042,17 @@ bool Renderer::RecordRenderFrame(
                     return false;
                 }
 
-                nrdInput = &m_reflectionContributionLimitPass.GetOutputTexture();
+                nrdInput = &m_legacyLighting.reflectionContributionLimitPass.GetOutputTexture();
             }
 
             m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::NrdPrepare);
 
-            m_nrdReflectionPreparePass.ExecuteReflections(
-                commandList, m_gBuffer, *nrdInput, m_rayTracedReflectionPass.GetSpecularTrackingDistanceTexture(),
+            m_legacyLighting.nrdReflectionPreparePass.ExecuteReflections(
+                commandList, m_gBuffer, *nrdInput, m_legacyLighting.rayTracedReflectionPass.GetSpecularTrackingDistanceTexture(),
                 m_uploadBuffer, reconstructionConstants.inverseViewProjection, currentView,
                 CurrentMaterialBuffer().GetDescriptorIndex(), m_sceneWidth, m_sceneHeight, nrdDenoisingRange);
 
-            m_nrdGIPreparePass.ExecuteGI(commandList, m_gBuffer, *giNrdInput, m_rayTracedGIPass.GetHitDistanceTexture(),
+            m_legacyLighting.nrdGIPreparePass.ExecuteGI(commandList, m_gBuffer, *giNrdInput, m_legacyLighting.rayTracedGIPass.GetHitDistanceTexture(),
                                          m_uploadBuffer, reconstructionConstants.inverseViewProjection, currentView,
                                          CurrentMaterialBuffer().GetDescriptorIndex(), m_sceneWidth, m_sceneHeight, giWidth, giHeight,
                                          nrdDenoisingRange);
@@ -12814,10 +13062,10 @@ bool Renderer::RecordRenderFrame(
             m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::NrdReblurSpecular);
 
             NrdDenoiser::Inputs reflectionInputs;
-            reflectionInputs.motion = m_nrdReflectionPreparePass.GetMotionTexture().GetResource();
-            reflectionInputs.normalRoughness = &m_nrdReflectionPreparePass.GetNormalRoughnessTexture();
-            reflectionInputs.viewZ = &m_nrdReflectionPreparePass.GetViewZTexture();
-            reflectionInputs.specularRadianceHitDistance = &m_nrdReflectionPreparePass.GetSpecRadianceHitDistTexture();
+            reflectionInputs.motion = m_legacyLighting.nrdReflectionPreparePass.GetMotionTexture().GetResource();
+            reflectionInputs.normalRoughness = &m_legacyLighting.nrdReflectionPreparePass.GetNormalRoughnessTexture();
+            reflectionInputs.viewZ = &m_legacyLighting.nrdReflectionPreparePass.GetViewZTexture();
+            reflectionInputs.specularRadianceHitDistance = &m_legacyLighting.nrdReflectionPreparePass.GetSpecRadianceHitDistTexture();
             m_nrdReflectionDenoiser.Denoise(commandList, HybridNrdReflectionIdentifier, reflectionInputs);
 
             m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::NrdReblurSpecular);
@@ -12825,10 +13073,10 @@ bool Renderer::RecordRenderFrame(
             m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::NrdReblurDiffuse);
 
             NrdDenoiser::Inputs giInputs;
-            giInputs.motion = m_nrdGIPreparePass.GetMotionTexture().GetResource();
-            giInputs.normalRoughness = &m_nrdGIPreparePass.GetNormalRoughnessTexture();
-            giInputs.viewZ = &m_nrdGIPreparePass.GetViewZTexture();
-            giInputs.diffuseRadianceHitDistance = &m_nrdGIPreparePass.GetDiffRadianceHitDistTexture();
+            giInputs.motion = m_legacyLighting.nrdGIPreparePass.GetMotionTexture().GetResource();
+            giInputs.normalRoughness = &m_legacyLighting.nrdGIPreparePass.GetNormalRoughnessTexture();
+            giInputs.viewZ = &m_legacyLighting.nrdGIPreparePass.GetViewZTexture();
+            giInputs.diffuseRadianceHitDistance = &m_legacyLighting.nrdGIPreparePass.GetDiffRadianceHitDistTexture();
             m_nrdGIDenoiser.Denoise(commandList, HybridNrdGIIdentifier, giInputs);
 
             m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::NrdReblurDiffuse);
@@ -12837,7 +13085,7 @@ bool Renderer::RecordRenderFrame(
 
             m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::NrdResolve);
 
-            m_nrdReflectionResolvePass.Execute(commandList, m_gBuffer,
+            m_legacyLighting.nrdReflectionResolvePass.Execute(commandList, m_gBuffer,
                                                m_nrdReflectionDenoiser.GetSpecularOutput(HybridNrdReflectionIdentifier),
                                                m_uploadBuffer, reconstructionConstants.inverseViewProjection, currentView,
                                                CurrentMaterialBuffer().GetDescriptorIndex(), m_sceneWidth, m_sceneHeight);
@@ -12845,14 +13093,14 @@ bool Renderer::RecordRenderFrame(
             m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::NrdResolve);
 
             m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::NrdDiffuseResolve);
-            m_nrdDiffuseResolvePass.Execute(commandList, m_gBuffer, m_nrdGIDenoiser.GetDiffuseOutput(HybridNrdGIIdentifier),
-                                            m_nrdGIPreparePass.GetViewZTexture(), *giNrdInput, m_uploadBuffer, m_sceneWidth, m_sceneHeight,
+            m_legacyLighting.nrdDiffuseResolvePass.Execute(commandList, m_gBuffer, m_nrdGIDenoiser.GetDiffuseOutput(HybridNrdGIIdentifier),
+                                            m_legacyLighting.nrdGIPreparePass.GetViewZTexture(), *giNrdInput, m_uploadBuffer, m_sceneWidth, m_sceneHeight,
                                             nrdDenoisingRange);
 
             m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::NrdDiffuseResolve);
 
             m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::GISpatialDenoise);
-            m_giSpatialDenoisePass.Execute(commandList, m_gBuffer, m_nrdDiffuseResolvePass.GetOutputTexture(),
+            m_legacyLighting.giSpatialDenoisePass.Execute(commandList, m_gBuffer, m_legacyLighting.nrdDiffuseResolvePass.GetOutputTexture(),
                                            m_uploadBuffer, m_sceneWidth, m_sceneHeight);
             m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::GISpatialDenoise);
         }
@@ -12861,11 +13109,11 @@ bool Renderer::RecordRenderFrame(
         {
             if (!m_nativeReflectionExecutedLastFrame)
             {
-                m_rayTracedReflectionTemporalPass.ResetHistory();
+                m_legacyLighting.rayTracedReflectionTemporalPass.ResetHistory();
             }
 
             m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::ReflectionTemporal);
-            m_rayTracedReflectionTemporalPass.Execute(commandList, m_rayTracedReflectionPass.GetRawReflectionTexture(),
+            m_legacyLighting.rayTracedReflectionTemporalPass.Execute(commandList, m_legacyLighting.rayTracedReflectionPass.GetRawReflectionTexture(),
                                                       m_gBuffer, m_uploadBuffer, reflectionConstants.inverseViewProjection,
                                                       shadowConstants.previousViewProjection,
                                                       shadowConstants.previousInverseViewProjection, m_sceneWidth, m_sceneHeight);
@@ -12873,20 +13121,20 @@ bool Renderer::RecordRenderFrame(
             m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::ReflectionTemporal);
 
             m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::ReflectionDenoise);
-            m_rayTracedReflectionDenoisePass.Execute(commandList, m_rayTracedReflectionTemporalPass.GetReflectionTexture(),
-                                                     m_rayTracedReflectionPass.GetHitDistanceTexture(), m_gBuffer,
+            m_legacyLighting.rayTracedReflectionDenoisePass.Execute(commandList, m_legacyLighting.rayTracedReflectionTemporalPass.GetReflectionTexture(),
+                                                     m_legacyLighting.rayTracedReflectionPass.GetHitDistanceTexture(), m_gBuffer,
                                                      m_uploadBuffer, reflectionConstants.inverseViewProjection, m_sceneWidth,
                                                      m_sceneHeight);
             m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::ReflectionDenoise);
         }
 
         Texture& finalReflection = reflectionMode == ReflectionDenoiserMode::Nrd
-                                       ? m_nrdReflectionResolvePass.GetOutputTexture()
-                                       : m_rayTracedReflectionDenoisePass.GetFilteredReflectionTexture();
+                                       ? m_legacyLighting.nrdReflectionResolvePass.GetOutputTexture()
+                                       : m_legacyLighting.rayTracedReflectionDenoisePass.GetFilteredReflectionTexture();
 
         m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::ShadowDenoise);
 
-        m_shadowDenoisePass.Execute(commandList, m_rayTracedShadowPass.GetVisibilityTexture(), m_gBuffer, m_uploadBuffer,
+        m_legacyLighting.shadowDenoisePass.Execute(commandList, m_legacyLighting.rayTracedShadowPass.GetVisibilityTexture(), m_gBuffer, m_uploadBuffer,
                                     reconstructionConstants.inverseViewProjection, m_sceneWidth, m_sceneHeight);
 
         m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::ShadowDenoise);
@@ -12896,8 +13144,8 @@ bool Renderer::RecordRenderFrame(
         m_deferredLightingPass.Execute(
             commandList, m_gBuffer, CurrentMaterialBuffer(), m_environment.GetSourceTexture(), m_environment.GetCubemap(),
             m_environment.GetDiffuseIrradiance(), m_brdfIntegrationLUT, m_ggxAverageAlbedoLUT,
-            m_environment.GetGGXMultiscatterIrradiance(), m_shadowDenoisePass.GetFilteredVisibilityTexture(),
-            finalReflection, m_giSpatialDenoisePass.GetOutputTexture(), m_aoResolvePass.GetOutputTexture(),
+            m_environment.GetGGXMultiscatterIrradiance(), m_legacyLighting.shadowDenoisePass.GetFilteredVisibilityTexture(),
+            finalReflection, m_legacyLighting.giSpatialDenoisePass.GetOutputTexture(), m_legacyLighting.aoResolvePass.GetOutputTexture(),
             options.enableRTGI, options.rtgiContactAOStrength, m_sceneColor, reconstructionConstantsAddress,
             lightConstantsAddress, sceneLightConstantsAddress, static_cast<unsigned int>(debugView),
             m_debugUI.IsShadingNormalCorrectionEnabled());
@@ -12916,38 +13164,38 @@ bool Renderer::RecordRenderFrame(
             debugRenderTarget = &m_gBuffer.GetMotion();
             break;
         case ToneMapDebugView::SpecularTrackingDistance:
-            debugTexture = &m_rayTracedReflectionPass.GetSpecularTrackingDistanceTexture();
+            debugTexture = &m_legacyLighting.rayTracedReflectionPass.GetSpecularTrackingDistanceTexture();
             break;
         case ToneMapDebugView::NrdViewZ:
-            debugTexture = &m_nrdReflectionPreparePass.GetViewZTexture();
+            debugTexture = &m_legacyLighting.nrdReflectionPreparePass.GetViewZTexture();
             break;
         case ToneMapDebugView::NrdNormal:
         case ToneMapDebugView::NrdRoughness:
-            debugTexture = &m_nrdReflectionPreparePass.GetNormalRoughnessTexture();
+            debugTexture = &m_legacyLighting.nrdReflectionPreparePass.GetNormalRoughnessTexture();
             break;
         case ToneMapDebugView::NrdMotion:
-            debugTexture = &m_nrdReflectionPreparePass.GetMotionTexture();
+            debugTexture = &m_legacyLighting.nrdReflectionPreparePass.GetMotionTexture();
             break;
         case ToneMapDebugView::NrdSpecularRadiance:
         case ToneMapDebugView::NrdHitDistance:
-            debugTexture = &m_nrdReflectionPreparePass.GetSpecRadianceHitDistTexture();
+            debugTexture = &m_legacyLighting.nrdReflectionPreparePass.GetSpecRadianceHitDistTexture();
             break;
         case ToneMapDebugView::NrdResolvedReflection:
-            debugTexture = &m_nrdReflectionResolvePass.GetOutputTexture();
+            debugTexture = &m_legacyLighting.nrdReflectionResolvePass.GetOutputTexture();
             break;
 
         case ToneMapDebugView::SelectionMask:
             debugRenderTarget = &m_selectionMask;
             break;
         case ToneMapDebugView::GIRaw:
-            debugTexture = &m_rayTracedGIPass.GetRawGITexture();
+            debugTexture = &m_legacyLighting.rayTracedGIPass.GetRawGITexture();
 
             break;
         case ToneMapDebugView::GIHitDistance:
-            debugTexture = &m_rayTracedGIPass.GetHitDistanceTexture();
+            debugTexture = &m_legacyLighting.rayTracedGIPass.GetHitDistanceTexture();
             break;
         case ToneMapDebugView::GIDenoised:
-            debugTexture = &m_giSpatialDenoisePass.GetOutputTexture();
+            debugTexture = &m_legacyLighting.giSpatialDenoisePass.GetOutputTexture();
             break;
         case ToneMapDebugView::GISignedReconstructed:
             // A null debug input safely falls back to normal rendering in ToneMapPass.
@@ -12959,13 +13207,13 @@ bool Renderer::RecordRenderFrame(
 
             break;
         case ToneMapDebugView::AORaw:
-            debugTexture = &m_rayTracedAOPass.GetRawAOTexture();
+            debugTexture = &m_legacyLighting.rayTracedAOPass.GetRawAOTexture();
             break;
         case ToneMapDebugView::AOTemporal:
-            debugTexture = &m_aoTemporalPass.GetAccumulatedAOTexture();
+            debugTexture = &m_legacyLighting.aoTemporalPass.GetAccumulatedAOTexture();
             break;
         case ToneMapDebugView::AOFiltered:
-            debugTexture = &m_aoDenoisePass.GetFilteredAOTexture();
+            debugTexture = &m_legacyLighting.aoDenoisePass.GetFilteredAOTexture();
             break;
         default:
             break;
@@ -13573,6 +13821,9 @@ bool Renderer::RecordRenderFrame(
     m_pathTraceTemporalPass.CommitHistory();
     // ER.1 Phase 3.1: the NRD groups this frame used were last used by this submission.
     CommitNrdRetentionSubmission();
+    // M0c.2 / M0c.3: likewise the Legacy and Path Tracing resources, whichever this frame rendered.
+    CommitModeResourceSubmission(m_legacyLighting.retention);
+    CommitModeResourceSubmission(m_pathTracingResidency);
 
     // NRD.4B: a submitted REBLUR frame is the previous frame of the next; any other submitted frame is a gap.
     if(m_nrdPathTraceDispatchedThisFrame)
@@ -13818,24 +14069,24 @@ void Renderer::Shutdown()
     m_psrInPlaceReplacePass.Shutdown();
     m_brdfIntegrationPass.Shutdown();
     m_ggxAverageAlbedoPass.Shutdown();
-    m_rayTracedShadowPass.Shutdown();
-    m_rayTracedReflectionPass.Shutdown();
-    m_rayTracedGIPass.Shutdown();
-    m_rayTracedAOPass.Shutdown();
-    m_aoResolvePass.Shutdown();
-    m_aoDenoisePass.Shutdown();
-    m_aoTemporalPass.Shutdown();
+    m_legacyLighting.rayTracedShadowPass.Shutdown();
+    m_legacyLighting.rayTracedReflectionPass.Shutdown();
+    m_legacyLighting.rayTracedGIPass.Shutdown();
+    m_legacyLighting.rayTracedAOPass.Shutdown();
+    m_legacyLighting.aoResolvePass.Shutdown();
+    m_legacyLighting.aoDenoisePass.Shutdown();
+    m_legacyLighting.aoTemporalPass.Shutdown();
 
-    m_rayTracedReflectionTemporalPass.Shutdown();
-    m_rayTracedReflectionDenoisePass.Shutdown();
-    m_reflectionContributionLimitPass.Shutdown();
-    m_nrdReflectionPreparePass.Shutdown();
-    m_nrdGIPreparePass.Shutdown();
+    m_legacyLighting.rayTracedReflectionTemporalPass.Shutdown();
+    m_legacyLighting.rayTracedReflectionDenoisePass.Shutdown();
+    m_legacyLighting.reflectionContributionLimitPass.Shutdown();
+    m_legacyLighting.nrdReflectionPreparePass.Shutdown();
+    m_legacyLighting.nrdGIPreparePass.Shutdown();
     m_nrdReflectionDenoiser.Shutdown();
     m_nrdGIDenoiser.Shutdown();
-    m_nrdReflectionResolvePass.Shutdown();
-    m_nrdDiffuseResolvePass.Shutdown();
-    m_giSpatialDenoisePass.Shutdown();
+    m_legacyLighting.nrdReflectionResolvePass.Shutdown();
+    m_legacyLighting.nrdDiffuseResolvePass.Shutdown();
+    m_legacyLighting.giSpatialDenoisePass.Shutdown();
     m_giSignedCorrectionPass.Shutdown();
     m_giSignedCorrectionInitialized = false;
     // Joined first: no compilation result may outlive the pass and library it was prepared for.
@@ -13909,7 +14160,7 @@ void Renderer::Shutdown()
     m_radianceCacheD6.Shutdown();
     m_radianceCacheD6Failed = false;
     m_radianceCacheConfiguration = {};
-    m_shadowDenoisePass.Shutdown();
+    m_legacyLighting.shadowDenoisePass.Shutdown();
     m_selectionMaskCandidate.reset();
     m_selectionMaskCandidateLifetime = 0;
     m_selectionMaskPass.Shutdown();

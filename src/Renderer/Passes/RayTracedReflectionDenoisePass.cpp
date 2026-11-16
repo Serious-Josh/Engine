@@ -70,6 +70,14 @@ bool RayTracedReflectionDenoisePass::Initialize(
     return true;
 }
 
+void RayTracedReflectionDenoisePass::ReleaseTextures()
+{
+    for (Texture& texture : m_filteredReflection)
+    {
+        texture.Shutdown();
+    }
+}
+
 bool RayTracedReflectionDenoisePass::Resize(
 
     GraphicsDevice& graphicsDevice,
@@ -81,10 +89,7 @@ bool RayTracedReflectionDenoisePass::Resize(
 
     ID3D12Device* device = graphicsDevice.GetDevice();
 
-    for (Texture& texture : m_filteredReflection)
-    {
-        texture.Shutdown();
-    }
+    ReleaseTextures();
 
     for (unsigned int i = 0; i < 2; ++i)
     {

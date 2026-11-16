@@ -60,6 +60,7 @@
 #include "Passes/BRDFIntegrationPass.h"
 #include "Passes/GGXAverageAlbedoPass.h"
 #include "Passes/RayTracedShadowPass.h"
+#include "LegacyLightingResources.h"
 #include "Passes/RayTracedReflectionPass.h"
 #include "Passes/ShadowDenoisePass.h"
 #include "Passes/RayTracedReflectionTemporalPass.h"
@@ -1840,25 +1841,60 @@ class Renderer
 
     GGXAverageAlbedoPass m_ggxAverageAlbedoPass;
 
-    RayTracedShadowPass m_rayTracedShadowPass;
+    // M0c.1: the passes only Legacy lighting records (LegacyLightingResources.h).
+    LegacyLightingResources m_legacyLighting;
+    // Brings the Legacy passes to the render extent when a resize skipped them or they retired; before a Legacy recording
+    // reads them.
+    bool EnsureLegacyLightingExtent();
 
-    RayTracedReflectionPass m_rayTracedReflectionPass;
+    // M0c.2 / M0c.3: the residency policy shared by the Legacy and Path Tracing resource owners (ModeResourceResidency.h).
+    // An inactive mode keeps its resources this long after the last frame that used them before they may retire.
+    static constexpr std::chrono::seconds ModeResourceGracePeriod{5};
 
-    RayTracedReflectionTemporalPass m_rayTracedReflectionTemporalPass;
+    enum class ModeResourceDecision
+    {
+        Keep,
+        // Due, but the last use has not completed on the GPU; retried by a later recording, never waited for.
+        Deferred,
+        Retire,
+        RetireUnderPressure
+    };
 
-    RayTracedReflectionDenoisePass m_rayTracedReflectionDenoisePass;
+    // Whether an inactive mode's resources may retire now: never while a transition is pending or after an unconfirmed
+    // submission; otherwise once the grace period ended (or earlier under DXGI memory pressure, or when the caller's own
+    // rule makes them due) and the last use completed.
+    ModeResourceDecision EvaluateModeResourceRetirement(ModeResourceResidency& residency, bool transitionPending,
+        bool dueRegardless = false);
+    // At the start of a recording's resource decisions: a use the previous recording never committed makes the residency's
+    // last fence unknown.
+    static void BeginModeResourceRecording(ModeResourceResidency& residency) noexcept;
+    // This recording uses the mode's resources (they are resident): the grace period restarts.
+    static void MarkModeResourceUsed(ModeResourceResidency& residency) noexcept;
+    // After a confirmed submission: a mode used by the recording was last used at that submission's fence.
+    void CommitModeResourceSubmission(ModeResourceResidency& residency);
+    // The DXGI local-segment pressure state for retirement, with the hysteresis NRD retention uses.
+    bool IsModeResourceMemoryUnderPressure();
+    bool m_modeResourceUnderPressure = false;
+    // Testing only: a DXGI headroom fraction used instead of the adapter's (negative queries DXGI).
+    double m_modeResourceHeadroomOverrideForTesting = -1.0;
 
-    RayTracedGIPass m_rayTracedGIPass;
+    // Retires the inactive Legacy textures (M0c.2). Called on recordings that do not render Legacy.
+    void UpdateLegacyLightingRetention();
 
-    RayTracedAOPass m_rayTracedAOPass;
-
-    AOTemporalPass m_aoTemporalPass;
-
-    AODenoisePass m_aoDenoisePass;
-
-    AOResolvePass m_aoResolvePass;
-
-    ReflectionContributionLimitPass m_reflectionContributionLimitPass;
+    // M0c.3 Phase A: residency of Path Tracing's exclusive resources, shared by Reference, Raster Primary and ReSTIR DI:
+    // the reference pass's render-extent textures and buffers, the temporal history, the spatial intermediates, the RTXDI
+    // reservoirs and the previous-frame G-buffer copy. Their pass objects stay Renderer members; this record owns their
+    // lifecycle.
+    ModeResourceResidency m_pathTracingResidency;
+    // Retires the inactive Path Tracing resources. Called on recordings that do not render a path-traced mode.
+    void UpdatePathTracingRetention();
+    // Releases them (the caller has established that no submitted or recorded work references them).
+    void ReleasePathTracingResources();
+    // Recreates the reference pass's textures at the render extent after a retirement, before a path-traced recording uses
+    // them; the lazily created resources follow on first use as after a resize. False fails the recording closed.
+    bool EnsurePathTracingResident();
+    // Testing only: the next recreation fails as an allocation failure would.
+    bool m_pathTracingRecreationFailureForTesting = false;
 
     // The hybrid lighting mode's REBLUR instances (reflections, half-resolution GI). NRD.2: created on the first frame
     // that denoises with them, released on the first path-traced frame (the only modes that never use them).
@@ -1872,8 +1908,6 @@ class Renderer
     bool EnsureHybridNrdDenoisers();
     // Waits for the GPU, then releases both hybrid instances when they exist. Their next use starts new history.
     void ReleaseHybridNrdDenoisers();
-
-    GISpatialDenoisePass m_giSpatialDenoisePass;
 
     GISignedCorrectionPass m_giSignedCorrectionPass;
 
@@ -2506,12 +2540,20 @@ class Renderer
     // ER.1 Phase 3.1: inactive NRD resources retained for fast switching, evicted under video-memory pressure. A
     // group is evicted only when it is inactive, its last submitted use has completed and no unsubmitted or uncertain
     // recording referenced it; the eviction never waits for the GPU.
+    // M0c.3 Phase B: the groups also retire after the shared grace period, through the residency policy Legacy and Path
+    // Tracing use.
     enum class NrdRetentionGroup
     {
-        // RELAX instance, its preparation pass and the raw diffuse hit distance producer.
+        // RELAX instance, its resolved output, confidence inputs and preparation pass.
         Relax,
+        // The path tracer's raw diffuse hit distance texture and extraction pipelines, shared by RELAX and the hybrid.
+        RawDiffuseHitDistance,
         // Path-traced REBLUR instance and its preparation textures.
         PathTraceReblur,
+        // Path-traced hybrid instance (RELAX diffuse + REBLUR specular) and its preparation textures.
+        Hybrid,
+        // The Engine denoiser: the path tracer's temporal history and spatial intermediates.
+        EngineDenoiser,
         // Legacy reflection and GI REBLUR pair.
         Legacy,
         Count
@@ -2519,16 +2561,11 @@ class Renderer
 
     struct NrdRetentionState
     {
-        // Set while recording a frame that may reference the group; resolved by that frame's submission.
-        bool usedThisRecording = false;
-        // A recording that referenced the group was not confirmed submitted: never evicted without a drain.
-        bool submissionUncertain = false;
-        std::uint64_t lastUseFence = 0;
+        // Use, last-use fence, grace period and counters (retirements are evictions; deferrals were postponed because the
+        // last use had not completed yet). `resident` mirrors whether the group holds anything.
+        ModeResourceResidency residency;
         // Least-recently-used order (render frame serial of the last frame the group was active).
         std::uint64_t lastActiveFrame = 0;
-        std::uint64_t evictions = 0;
-        // Evictions postponed because the last use had not completed yet.
-        std::uint64_t deferrals = 0;
     };
 
     struct NrdRetentionStatus
@@ -2547,17 +2584,19 @@ class Renderer
     IDXGIAdapter3* m_videoMemoryAdapter = nullptr;
     bool m_videoMemoryAdapterQueried = false;
     std::uint64_t m_nrdRetentionFrame = 0;
-    // Diagnostics only: replaces the DXGI headroom fraction (negative: use DXGI).
-    double m_nrdRetentionHeadroomOverride = -1.0;
-    // Diagnostics only: behave as if DXGI reported no budget (the one-inactive-group fallback).
+    // Diagnostics only: behave as if DXGI reported no budget (the one-inactive-group fallback). The headroom override is the
+    // shared m_modeResourceHeadroomOverrideForTesting.
     bool m_nrdRetentionBudgetUnavailableForTesting = false;
+    // NRD's own report (persistent + transient pools) for the instances of the last evicted group.
+    double m_nrdRetentionLastEvictedReportedMegabytes = 0.0;
     bool IsNrdRetentionGroupAllocated(NrdRetentionGroup group) const;
     bool IsNrdRetentionGroupActive(NrdRetentionGroup group, bool runPathTrace) const;
+    bool IsNrdRetentionGroupTransitionPending(NrdRetentionGroup group, bool runPathTrace) const;
     // Marks this recording's active groups, then evicts at most one inactive group if the policy asks for it.
     void UpdateNrdRetention(bool runPathTrace);
     // After a confirmed submission: the active groups' last use is that submission's fence.
     void CommitNrdRetentionSubmission();
-    bool EvictNrdRetentionGroup(NrdRetentionGroup group);
+    bool EvictNrdRetentionGroup(NrdRetentionGroup group, bool underPressure);
     bool QueryVideoMemoryHeadroom(double& headroom);
     // Records one progressive iteration (or holds a converged image) and presents it as scene colour.
     // projection is the frame's rendering projection (jittered when UPSCALING.2B jitter is active): every G-buffer
@@ -2655,15 +2694,6 @@ class Renderer
 
     bool m_giSignedCorrectionInitialized = false;
     bool m_signedCorrectionExecutedLastFrame = false;
-
-    NrdPreparePass m_nrdReflectionPreparePass;
-    NrdPreparePass m_nrdGIPreparePass;
-
-    NrdReflectionResolvePass m_nrdReflectionResolvePass;
-
-    NrdDiffuseResolvePass m_nrdDiffuseResolvePass;
-
-    ShadowDenoisePass m_shadowDenoisePass;
 
     // Never recorded or bound until the future coordinator accepts it.
     struct SelectionMaskPipelineCandidate final : SelectionMaskPass

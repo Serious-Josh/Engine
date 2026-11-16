@@ -203,6 +203,12 @@ class PathTraceSpatialPass
     // Releases the intermediate (resize). Caller guarantees the queue is idle.
     void ReleaseIntermediate();
 
+    // Whether the intermediate textures exist (EnsureIntermediate created them; ReleaseIntermediate has not released them).
+    bool HasIntermediate() const
+    {
+        return m_intermediateDiffuse.GetResource() != nullptr;
+    }
+
     // Records one or two a-trous iterations (iterations 1 or 2) from the same inputs as Execute, which must be in the
     // same states; the last iteration writes the presentation (diagnostics: a D.3B.0 view 2 or 3). Two iterations
     // need EnsureIntermediate first. constants carries the 5x5 pass's values, recorded as its last constants too.

@@ -157,6 +157,12 @@ class PathTraceReferencePass
         unsigned int height,
         std::string& failureReason);
     // Recreates the size-dependent textures. Caller guarantees the queue is idle.
+    // M0c.3 Phase A: releases every render-extent texture and buffer (the ones Resize recreates, including the lazily
+    // created extraction, split-sample and PSR resources) with their descriptors; pipelines and the statistics texture stay.
+    // Resize creates the textures again; the lazy resources follow on their next use. The caller guarantees the GPU no
+    // longer uses them.
+    void ReleaseTextures();
+
     bool Resize(
         ID3D12Device* device,
         DescriptorHeap& descriptorHeap,

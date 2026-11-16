@@ -112,20 +112,8 @@ bool RayTracedReflectionTemporalPass::Initialize(
     return true;
 }
 
-bool RayTracedReflectionTemporalPass::Resize(
-
-    ID3D12Device* device,
-    DescriptorHeap& descriptorHeap,
-    unsigned int width,
-    unsigned int height)
+void RayTracedReflectionTemporalPass::ReleaseTextures()
 {
-    if (!device || width == 0 || height == 0)
-    {
-        return false;
-    }
-
-    const MemoryCategoryScope memoryScope(MemoryCategory::LegacyRayTracing);
-
     for (Texture& texture : m_historyTextures)
     {
         texture.Shutdown();
@@ -140,6 +128,23 @@ bool RayTracedReflectionTemporalPass::Resize(
     {
         texture.Shutdown();
     }
+}
+
+bool RayTracedReflectionTemporalPass::Resize(
+
+    ID3D12Device* device,
+    DescriptorHeap& descriptorHeap,
+    unsigned int width,
+    unsigned int height)
+{
+    if (!device || width == 0 || height == 0)
+    {
+        return false;
+    }
+
+    const MemoryCategoryScope memoryScope(MemoryCategory::LegacyRayTracing);
+
+    ReleaseTextures();
 
     for (unsigned int i = 0; i < 2; ++i)
     {
