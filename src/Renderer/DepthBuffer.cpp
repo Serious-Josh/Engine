@@ -1,4 +1,5 @@
 #include "DepthBuffer.h"
+#include "Debug/MemoryRegistry.h"
 #include "DescriptorHeap.h"
 #include "Core/Log.h"
 
@@ -50,6 +51,8 @@ bool DepthBuffer::Initialize(
         Log::Error("Failed to allocate depth resource. HRESULT: " + std::to_string(result));
         return false;
     }
+
+    MemoryRegistry::TrackResource(m_resource);
 
     m_state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
 

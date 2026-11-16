@@ -751,6 +751,124 @@ struct ScriptHost::Impl
         }
     }
 
+    bool RigidBodyUsable(const ObjectHandle& handle) const noexcept
+    {
+        try
+        {
+            return Resolves(handle) && resolver->HasRigidBody(handle.slot);
+        }
+        catch(...)
+        {
+            return false;
+        }
+    }
+
+    // AS.7 RigidBody handle: like CharacterController, the same world and slot as its SceneObject, checked against the
+    // current Play session on every use; it owns nothing. Velocity requests go to physics, which applies them from its
+    // next fixed step; queries read the last completed step.
+    static void ObjectGetRigidBody(asIScriptGeneric* generic)
+    {
+        const auto& state = *static_cast<const Impl*>(generic->GetAuxiliary());
+        const auto& handle = *static_cast<const ObjectHandle*>(generic->GetObject());
+        ObjectHandle body{};
+
+        if(state.RigidBodyUsable(handle))
+        {
+            body = handle;
+        }
+
+        generic->SetReturnObject(&body);
+    }
+
+    static void RigidBodyIsValid(asIScriptGeneric* generic)
+    {
+        const auto& state = *static_cast<const Impl*>(generic->GetAuxiliary());
+        generic->SetReturnByte(state.RigidBodyUsable(*static_cast<const ObjectHandle*>(generic->GetObject())) ? 1 : 0);
+    }
+
+    // Reading an invalid handle gives a zero velocity.
+    static void RigidBodyGetLinearVelocity(asIScriptGeneric* generic)
+    {
+        const auto& state = *static_cast<const Impl*>(generic->GetAuxiliary());
+        const auto& handle = *static_cast<const ObjectHandle*>(generic->GetObject());
+        float velocity[3] = {};
+
+        try
+        {
+            if(!state.RigidBodyUsable(handle) || !state.resolver->GetRigidBodyVelocity(handle.slot, velocity))
+            {
+                velocity[0] = velocity[1] = velocity[2] = 0.0f;
+            }
+        }
+        catch(...)
+        {
+            velocity[0] = velocity[1] = velocity[2] = 0.0f;
+        }
+
+        ScriptVector3 value{velocity[0], velocity[1], velocity[2]};
+        generic->SetReturnObject(&value);
+    }
+
+    static void SetRigidBodyVelocity(asIScriptGeneric* generic, const float (&values)[3])
+    {
+        const auto& state = *static_cast<const Impl*>(generic->GetAuxiliary());
+        const auto& handle = *static_cast<const ObjectHandle*>(generic->GetObject());
+
+        try
+        {
+            if(!state.RigidBodyUsable(handle))
+            {
+                RaiseScriptException("RigidBody is not valid.");
+                return;
+            }
+
+            std::string error;
+
+            if(!state.resolver->SetRigidBodyVelocity(handle.slot, values, error))
+            {
+                RaiseScriptException(Bounded(error).c_str());
+            }
+        }
+        catch(...)
+        {
+            RaiseScriptException("RigidBody velocity request failed.");
+        }
+    }
+
+    static void RigidBodySetLinearVelocity(asIScriptGeneric* generic)
+    {
+        const auto& velocity = ArgumentVector(generic);
+        const float values[3] = {velocity.x, velocity.y, velocity.z};
+        SetRigidBodyVelocity(generic, values);
+    }
+
+    static void RigidBodyStop(asIScriptGeneric* generic)
+    {
+        const float zero[3] = {0.0f, 0.0f, 0.0f};
+        SetRigidBodyVelocity(generic, zero);
+    }
+
+    // Whether this body's shapes touch `other`'s after the last completed physics step (false for an invalid handle).
+    static void RigidBodyIsTouching(asIScriptGeneric* generic)
+    {
+        const auto& state = *static_cast<const Impl*>(generic->GetAuxiliary());
+        const auto& handle = *static_cast<const ObjectHandle*>(generic->GetObject());
+        const auto* other = static_cast<const ObjectHandle*>(generic->GetArgObject(0));
+        bool touching = false;
+
+        try
+        {
+            touching = other != nullptr && state.RigidBodyUsable(handle) && state.Resolves(*other) &&
+                state.resolver->IsRigidBodyTouching(handle.slot, other->slot);
+        }
+        catch(...)
+        {
+            touching = false;
+        }
+
+        generic->SetReturnByte(touching ? 1 : 0);
+    }
+
     // AS.6A Character Controller handle: same world and slot as its SceneObject, checked against
     // the current Play session on every use. Requests are recorded by the runtime, never applied here.
     static void ObjectGetCharacterController(asIScriptGeneric* generic)
@@ -1246,6 +1364,31 @@ struct ScriptHost::Impl
         generic->SetReturnObject(&child);
     }
 
+    // AS.7 Scene::FindObject: an invalid handle when nothing has the name, or outside a script call on the owner thread.
+    static void SceneFindObject(asIScriptGeneric* generic)
+    {
+        auto& state = *static_cast<Impl*>(generic->GetAuxiliary());
+        const auto& name = *static_cast<const std::string*>(generic->GetArgObject(0));
+        ObjectHandle found{};
+
+        try
+        {
+            std::uint32_t slot = 0;
+            const bool callable = state.resolver && state.world != 0 && state.executing && state.owner == std::this_thread::get_id();
+
+            if(callable && state.resolver->FindObject(name, slot))
+            {
+                found = {state.world, slot, 0};
+            }
+        }
+        catch(...)
+        {
+            found = {};
+        }
+
+        generic->SetReturnObject(&found);
+    }
+
     static void ReturnResolvedVector(asIScriptGeneric* generic, bool resolved, const float (&value)[3], const char* failure)
     {
         if(!resolved)
@@ -1528,6 +1671,25 @@ Result ScriptHost::InitializeWithLogDeclaration(const char* declaration)
             asFUNCTION(Impl::ControllerGetYaw), asCALL_GENERIC, &state));
         require(candidate->RegisterObjectMethod("CharacterController", "void SetYaw(float)",
             asFUNCTION(Impl::ControllerSetYaw), asCALL_GENERIC, &state));
+        require(candidate->RegisterObjectType("RigidBody", sizeof(ObjectHandle), objectFlags));
+        require(candidate->RegisterObjectBehaviour("RigidBody", asBEHAVE_CONSTRUCT, "void f()",
+            asFUNCTION(ConstructObjectHandle), asCALL_GENERIC));
+        require(candidate->RegisterObjectMethod("RigidBody", "bool IsValid() const",
+            asFUNCTION(Impl::RigidBodyIsValid), asCALL_GENERIC, &state));
+        require(candidate->RegisterObjectMethod("RigidBody", "Vector3 GetLinearVelocity() const",
+            asFUNCTION(Impl::RigidBodyGetLinearVelocity), asCALL_GENERIC, &state));
+        require(candidate->RegisterObjectMethod("RigidBody", "void SetLinearVelocity(const Vector3 &in)",
+            asFUNCTION(Impl::RigidBodySetLinearVelocity), asCALL_GENERIC, &state));
+        require(candidate->RegisterObjectMethod("RigidBody", "void Stop()",
+            asFUNCTION(Impl::RigidBodyStop), asCALL_GENERIC, &state));
+        require(candidate->RegisterObjectMethod("RigidBody", "bool IsTouching(const SceneObject &in) const",
+            asFUNCTION(Impl::RigidBodyIsTouching), asCALL_GENERIC, &state));
+        require(candidate->RegisterObjectMethod("SceneObject", "RigidBody GetRigidBody() const",
+            asFUNCTION(Impl::ObjectGetRigidBody), asCALL_GENERIC, &state));
+        require(candidate->SetDefaultNamespace("Scene"));
+        require(candidate->RegisterGlobalFunction("SceneObject FindObject(const string &in)", asFUNCTION(Impl::SceneFindObject),
+            asCALL_GENERIC, &state));
+        require(candidate->SetDefaultNamespace(""));
         require(candidate->RegisterObjectMethod("SceneObject", "SceneObject FindChild(const string &in) const",
             asFUNCTION(Impl::ObjectFindChild), asCALL_GENERIC, &state));
         require(candidate->RegisterObjectMethod("SceneObject", "Vector3 GetLocalRotation() const",

@@ -1,4 +1,5 @@
 #include "CausticPass.h"
+#include "Debug/MemoryRegistry.h"
 
 #include "Core/Log.h"
 #include "Renderer/DescriptorHeap.h"
@@ -205,6 +206,8 @@ bool CausticPass::Initialize(GraphicsDevice& graphicsDevice, ShaderLibrary& shad
         return m_initialized;
     }
 
+    const MemoryCategoryScope memoryScope(MemoryCategory::Caustics);
+
     ID3D12Device* device = graphicsDevice.GetDevice();
     D3D12_FEATURE_DATA_D3D12_OPTIONS options{};
     m_doublePrecision = device && SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options))) &&
@@ -324,6 +327,8 @@ bool CausticPass::EnsureResources(ID3D12Device* device, ResourceUploader& upload
         return true;
     }
 
+    const MemoryCategoryScope memoryScope(MemoryCategory::Caustics);
+
     // Reallocation happens only at drained boundaries (ReleaseResources); a size change otherwise refuses.
     if(m_records.GetResource())
     {
@@ -377,6 +382,8 @@ bool CausticPass::EnsureResources(ID3D12Device* device, ResourceUploader& upload
             ReleaseResources();
             return Refuse("caustic readback allocation failed");
         }
+
+        MemoryRegistry::TrackResource(measurement.readback);
     }
 
     const std::uint32_t zero[4]{};

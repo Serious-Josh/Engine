@@ -1,4 +1,5 @@
 #include "Buffer.h"
+#include "Debug/MemoryRegistry.h"
 #include "DescriptorHeap.h"
 #include "ResourceUploader.h"
 
@@ -77,6 +78,8 @@ bool Buffer::Initialize(
     {
         return false;
     }
+
+    MemoryRegistry::TrackResource(m_resource);
 
     if (!uploader.UploadBuffer(m_resource, data, size, finalState))
     {
@@ -177,6 +180,8 @@ bool Buffer::AllocateGPUWritable(
     {
         return false;
     }
+
+    MemoryRegistry::TrackResource(resource);
 
     m_resource = resource;
     m_resourceState = initialState;
@@ -322,6 +327,8 @@ bool Buffer::ReplaceData(
     {
         return false;
     }
+
+    MemoryRegistry::TrackResource(replacement);
 
     if (!uploader.UploadBuffer(replacement, data, size, finalState))
     {
@@ -526,4 +533,24 @@ void Buffer::Transition(
     commandList->ResourceBarrier(1, &barrier);
 
     m_resourceState = newState;
+}
+
+bool Buffer::PrepareTransition(
+    D3D12_RESOURCE_STATES newState,
+    D3D12_RESOURCE_BARRIER& barrier)
+{
+    if (!m_resource || m_resourceState == newState)
+    {
+        return false;
+    }
+
+    barrier = {};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+    barrier.Transition.pResource = m_resource;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barrier.Transition.StateBefore = m_resourceState;
+    barrier.Transition.StateAfter = newState;
+    m_resourceState = newState;
+    return true;
 }

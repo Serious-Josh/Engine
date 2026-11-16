@@ -1,4 +1,5 @@
 #include "NrdReflectionResolvePass.h"
+#include "Debug/MemoryRegistry.h"
 
 #include "Renderer/DescriptorHeap.h"
 #include "Renderer/GraphicsDevice.h"
@@ -14,6 +15,8 @@ bool NrdReflectionResolvePass::Initialize(
     unsigned int width,
     unsigned int height)
 {
+    const MemoryCategoryScope memoryScope(MemoryCategory::DenoisersUpscaling);
+
     ShaderDescription shaderDescription{};
     shaderDescription.path = "NrdReflectionResolve.hlsl";
     shaderDescription.entryPoint = "CSMain";
@@ -135,6 +138,8 @@ bool NrdReflectionResolvePass::CreateTexture(
     unsigned int width,
     unsigned int height)
 {
+    const MemoryCategoryScope memoryScope(MemoryCategory::DenoisersUpscaling);
+
     ID3D12Device* device = graphicsDevice.GetDevice();
 
     if (!m_outputTexture.Initialize(device, width, height, 1, 1, DXGI_FORMAT_R16G16B16A16_FLOAT,

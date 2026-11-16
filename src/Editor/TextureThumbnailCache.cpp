@@ -1,4 +1,5 @@
 #include "TextureThumbnailCache.h"
+#include "Debug/MemoryRegistry.h"
 #include "Renderer/ImageLoader.h"
 #include "Renderer/DDSLoader.h"
 #include "Renderer/DescriptorHeap.h"
@@ -668,6 +669,8 @@ bool TextureThumbnailCache::Upload(ID3D12GraphicsCommandList* commandList, Entry
         return FailUpload(entry, Failure::UploadResource,
             "Cannot allocate thumbnail upload staging. HRESULT: " + std::to_string(stagingResult) + ". Retry scheduled.");
     }
+
+    MemoryRegistry::TrackResource(entry.staging);
 
     void* mapped = nullptr;
     const D3D12_RANGE noReads{0, 0};

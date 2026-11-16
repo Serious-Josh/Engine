@@ -183,15 +183,39 @@ void FileSceneRuntime::CaptureMistEmitters(std::vector<MistEmitterInstance>& emi
         const MistEmitterComponent& component = *object.mistEmitter;
         const MotorPose emission = EmitterPose(*pose, component);
         MistEmitterInstance emitter;
+        emitter.mode = component.mode;
         emitter.shape = component.shape;
         emitter.position = emission.position;
         emitter.axisX = emission.axes[0];
         emitter.axisY = emission.axes[1];
         emitter.axisZ = emission.axes[2];
-        emitter.radius = component.radius;
         emitter.halfExtents = component.halfExtents;
-        emitter.densityRate = component.rate * component.density;
+
+        // AIR.4F.2b: a Point emitter's radius is its footprint's, and its rate a quantity (the density multiplier is Legacy-only).
+        // AIR.4F.2c: a Volume's box and maintenance settings.
+        if(component.mode == MistEmitterMode::Volume)
+        {
+            emitter.shape = MistEmitterShape::Box;
+            emitter.targetDensity = component.targetDensity;
+            emitter.replenishmentRate = component.replenishmentRate;
+            emitter.fillHeight = component.fillHeight;
+            emitter.edgeSoftness = component.edgeSoftness;
+            emitter.temperatureRate = component.volumeTemperatureRate;
+        }
+        else if(component.mode == MistEmitterMode::Point)
+        {
+            emitter.radius = MistEmitterPointFootprint(component);
+            emitter.massRate = component.emissionRate;
+            emitter.temperatureRate = component.temperatureResponseRate;
+        }
+        else
+        {
+            emitter.radius = component.radius;
+            emitter.densityRate = component.rate * component.density;
+        }
+
         emitter.color = component.color;
+        emitter.temperature = component.temperature;
         emitter.tag = MistEmitterTag(object.id);
         emitters.push_back(emitter);
     }
@@ -261,6 +285,53 @@ void FileSceneRuntime::CaptureAirMotors(double frameSeconds, std::vector<AirMoto
             motor.velocity = teleport ? Vector3{0.0f, 0.0f, 0.0f} : velocity;
         }
 
+        motors.push_back(motor);
+    }
+
+    // AIR.4F.2b: each enabled Point Mist Emitter with a jet, as a Moving motor just downstream of its emission origin pulling air toward
+    // jetSpeed along its emission +Z (MistEmitterComponent::JetCentreOffset). Appended after every Air Motor component, so when the motor slots run out a jet is the one left without
+    // (AirField reports it) and no Air Motor is ever displaced. The jet's tag is the emitter's, which names it in that report.
+    for(const SceneObjectDocument& object : m_fileScene.GetDocument().objects)
+    {
+        const bool jet = object.mistEmitter && object.mistEmitter->enabled && object.mistEmitter->mode == MistEmitterMode::Point &&
+            object.mistEmitter->jetSpeed > 0.0f;
+
+        if(!jet || !ValidateMistEmitterComponent(*object.mistEmitter))
+        {
+            continue;
+        }
+
+        const auto found = mapping.find(object.id);
+
+        if(found == mapping.end() || found->second >= objects.size())
+        {
+            continue;
+        }
+
+        const auto pose = PoseOf(objects[found->second].GetPresentationTransform().currentModel);
+
+        if(!pose)
+        {
+            continue;
+        }
+
+        const MistEmitterComponent& component = *object.mistEmitter;
+        const MotorPose emission = EmitterPose(*pose, component);
+        const Vector3& direction = emission.axes[2];
+        const float reach = MistEmitterJetReach(component);
+        const float ahead = reach * MistEmitterComponent::JetCentreOffset;
+        AirMotorInstance motor;
+        motor.type = AirMotorType::Moving;
+        motor.position = {emission.position.x + direction.x * ahead, emission.position.y + direction.y * ahead,
+            emission.position.z + direction.z * ahead};
+        motor.axisX = emission.axes[0];
+        motor.axisY = emission.axes[1];
+        motor.axisZ = direction;
+        motor.radius = reach;
+        motor.falloff = MistEmitterComponent::JetFalloff;
+        motor.coupling = MistEmitterComponent::JetCoupling;
+        motor.velocity = {direction.x * component.jetSpeed, direction.y * component.jetSpeed, direction.z * component.jetSpeed};
+        motor.tag = MistEmitterTag(object.id);
         motors.push_back(motor);
     }
 }
@@ -459,12 +530,47 @@ bool FileSceneRuntime::CaptureEditorAirMotorWireframes(const Renderer& renderer,
             (selected ? ColliderOverlayRole::AirMotorSelected : ColliderOverlayRole::AirMotorEmission);
         auto& target = selected ? selectedWireframes : wireframes;
         const Matrix4 rigid = RigidMatrix(EmitterPose(*pose, emitter));
+        const Matrix4 marker = rigid * Matrix4::Scale(EmissionMarkerRadius, EmissionMarkerRadius, EmissionMarkerRadius);
+
+        // AIR.4F.2c: a Volume is its box, and inside it a box from the bottom to the fill height (when lower than the top).
+        if(emitter.mode == MistEmitterMode::Volume)
+        {
+            const Vector3& half = emitter.halfExtents;
+            target.push_back({rigid * Matrix4::Scale(half.x * 2.0f, half.y * 2.0f, half.z * 2.0f), ColliderOverlayShape::Box, role, 0.0f});
+
+            if(emitter.fillHeight < half.y * 2.0f)
+            {
+                const float fill = emitter.fillHeight;
+                target.push_back({rigid * Matrix4::Translation(0.0f, -half.y + fill * 0.5f, 0.0f) * Matrix4::Scale(half.x * 2.0f, fill, half.z * 2.0f),
+                    ColliderOverlayShape::Box, role, 0.0f});
+            }
+
+            target.push_back({marker, ColliderOverlayShape::Sphere, role, 0.0f});
+            continue;
+        }
+
+        // AIR.4F.2b: a Point emitter is its footprint's sphere, and with a jet an arrow along its emission +Z to the far edge of the jet's
+        // region.
+        if(emitter.mode == MistEmitterMode::Point)
+        {
+            const float footprint = MistEmitterPointFootprint(emitter);
+            target.push_back({rigid * Matrix4::Scale(footprint, footprint, footprint), ColliderOverlayShape::Sphere, role, 0.0f});
+            target.push_back({marker, ColliderOverlayShape::Sphere, role, 0.0f});
+
+            if(emitter.jetSpeed > 0.0f)
+            {
+                const float length = MistEmitterJetReach(emitter) * (1.0f + MistEmitterComponent::JetCentreOffset);
+                target.push_back({rigid * Matrix4::Scale(EmissionArrowWidth, EmissionArrowWidth, length), ColliderOverlayShape::Arrows, role, 0.0f});
+            }
+
+            continue;
+        }
+
         const Matrix4 shape = emitter.shape == MistEmitterShape::Sphere ? Matrix4::Scale(emitter.radius, emitter.radius, emitter.radius) :
             Matrix4::Scale(emitter.halfExtents.x * 2.0f, emitter.halfExtents.y * 2.0f, emitter.halfExtents.z * 2.0f);
         const ColliderOverlayShape outline = emitter.shape == MistEmitterShape::Sphere ? ColliderOverlayShape::Sphere : ColliderOverlayShape::Box;
         target.push_back({rigid * shape, outline, role, 0.0f});
-        target.push_back({rigid * Matrix4::Scale(EmissionMarkerRadius, EmissionMarkerRadius, EmissionMarkerRadius), ColliderOverlayShape::Sphere,
-            role, 0.0f});
+        target.push_back({marker, ColliderOverlayShape::Sphere, role, 0.0f});
     }
 
     if(wireframes.empty() && selectedWireframes.empty())

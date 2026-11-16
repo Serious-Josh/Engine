@@ -1,4 +1,5 @@
 #include "RayTracedReflectionTemporalPass.h"
+#include "Debug/MemoryRegistry.h"
 
 #include "../DescriptorHeap.h"
 #include "../GraphicsDevice.h"
@@ -17,6 +18,8 @@ bool RayTracedReflectionTemporalPass::Initialize(
     {
         return false;
     }
+
+    const MemoryCategoryScope memoryScope(MemoryCategory::LegacyRayTracing);
 
     ID3D12Device* device = graphicsDevice.GetDevice();
 
@@ -120,6 +123,8 @@ bool RayTracedReflectionTemporalPass::Resize(
     {
         return false;
     }
+
+    const MemoryCategoryScope memoryScope(MemoryCategory::LegacyRayTracing);
 
     for (Texture& texture : m_historyTextures)
     {

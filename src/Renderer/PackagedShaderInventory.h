@@ -26,7 +26,14 @@ enum class PackagedShaderFeature
     Sharc,
     // PS.5E: DLSS Super Resolution's Engine-side input preparation (its motion vectors and exposure). NGX itself is
     // a runtime library, not a cooked shader.
-    Dlss
+    Dlss,
+    // R1.2b: the fog pass's environmental haze (the atmosphere march, the production filter and the composite). The froxel and
+    // integrated diagnostics are never packaged.
+    Volumetrics,
+    // R1.5b: the AIR simulation (AirField's 40 kernels, AirPressure's 34) and the AIR mist's Original Raymarch stages (4). Cooked only
+    // when the packaged startup scene requests AIR (SelectPackagedShaderInventory): a packaged game has exactly one startup scene, so
+    // no other scene can need them. A future multi-scene game must widen this to every scene it can activate.
+    Air
 };
 
 const char* PackagedShaderFeatureName(PackagedShaderFeature feature);
@@ -51,4 +58,6 @@ struct PackagedLibraryEntry
 };
 
 std::span<const PackagedShaderEntry> GetPackagedShaderInventory();
+// R1.5b: the entries a build cooks: every entry, without the Air feature's unless `air` (the startup scene requests AIR).
+std::vector<PackagedShaderEntry> SelectPackagedShaderInventory(bool air);
 std::vector<PackagedLibraryEntry> GetPackagedLibraryInventory();

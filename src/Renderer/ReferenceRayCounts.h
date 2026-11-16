@@ -2,6 +2,7 @@
 
 #include "Buffer.h"
 #include "CommandContext.h"
+#include "Debug/MemoryRegistry.h"
 #include <array>
 #include <cstdint>
 #include <cstring>
@@ -46,9 +47,16 @@ class ReferenceRayCounts
         desc.Height = desc.DepthOrArraySize = desc.MipLevels = 1;
         desc.SampleDesc.Count = 1;
         desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-        return SUCCEEDED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+        if(FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
             type == D3D12_HEAP_TYPE_UPLOAD ? D3D12_RESOURCE_STATE_GENERIC_READ : D3D12_RESOURCE_STATE_COPY_DEST,
-            nullptr, IID_PPV_ARGS(out)));
+            nullptr, IID_PPV_ARGS(out))))
+        {
+            return false;
+        }
+
+        MemoryRegistry::TrackResource(*out);
+
+        return true;
     }
 public:
     void StartFrame() { activeFrame = false; submittedFrame = false; }

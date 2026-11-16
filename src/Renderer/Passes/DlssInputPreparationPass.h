@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Core/Log.h"
+#include "Debug/MemoryRegistry.h"
 #include "Math/Matrix4.h"
 #include "Renderer/ComputePipeline.h"
 #include "Renderer/DepthBuffer.h"
@@ -75,6 +76,9 @@ public:
         }
 
         ReleaseTextures();
+
+        // Scoped past the early returns, so only frames that recreate the textures pay for attribution.
+        const MemoryCategoryScope memoryScope(MemoryCategory::DenoisersUpscaling);
         constexpr D3D12_RESOURCE_FLAGS uav = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
         constexpr D3D12_RESOURCE_STATES shaderRead = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
         const bool created =

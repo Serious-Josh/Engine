@@ -1,6 +1,7 @@
 #pragma once
 
 #include "CausticGeometrySourceManifest.h"
+#include "Debug/MemoryRegistry.h"
 #include "Renderer/CommandContext.h"
 #include "Renderer/Mesh.h"
 #include "Renderer/RayTracing/BLASGeometryDescription.h"
@@ -235,6 +236,9 @@ namespace CausticContracts::Geometry
             {
                 return BuildStatus::AllocationFailed;
             }
+
+            MemoryRegistry::TrackResource(scratch, MemoryCategory::Caustics);
+            MemoryRegistry::TrackResource(result, MemoryCategory::Caustics);
 
             *slot = {};
             slot->state = BuildState::Prepared;

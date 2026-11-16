@@ -7,7 +7,8 @@
 #include <cstdint>
 #include <optional>
 
-// PS.2C: temporary Debug panel overrides of the saved rendering settings, for this Editor session only.
+// PS.2C: temporary Debug panel overrides of the saved rendering settings, for this Editor session only. R1.3: the Air window's
+// volumetric quality and resolution basis controls edit the same overrides.
 // They are never written to ProjectSettings.json; the effective settings are the saved settings with every
 // present override applied, resolved by ResolveRenderingConfiguration like the saved settings alone.
 //
@@ -39,7 +40,9 @@
     X(sharc, pathTracing.sharc) \
     X(dedicatedCaustics, pathTracing.dedicatedCaustics) \
     X(causticOnlyView, pathTracing.causticOnlyView) \
-    X(pixelCentredCaustics, pathTracing.pixelCentredCaustics)
+    X(pixelCentredCaustics, pathTracing.pixelCentredCaustics) \
+    X(volumetricQuality, volumetrics.quality) \
+    X(volumetricResolutionBasis, volumetrics.resolutionBasis)
 
 // Debug-only Reference Path Tracer development overrides (name, type). No project setting reaches Reference;
 // without these it renders with its fixed internal quality and no dedicated caustics.

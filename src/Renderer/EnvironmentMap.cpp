@@ -1,4 +1,5 @@
 #include "EnvironmentMap.h"
+#include "Debug/MemoryRegistry.h"
 
 #include "Core/Log.h"
 #include "Renderer/DescriptorHeap.h"
@@ -34,6 +35,8 @@ bool EnvironmentMap::Initialize(
 bool EnvironmentMap::Initialize(ID3D12Device* device,const HDRImageData& source,ResourceUploader& uploader,DescriptorHeap& descriptorHeap,
     float radianceScale)
 {
+    const MemoryCategoryScope memoryScope(MemoryCategory::MeshesTextures);
+
     if(source.width == 0 || source.height == 0 || source.channels != 4 ||
         source.pixels.size() != static_cast<size_t>(source.width) * source.height * 4)
     {

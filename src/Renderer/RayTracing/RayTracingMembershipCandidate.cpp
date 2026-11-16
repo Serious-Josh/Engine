@@ -1,4 +1,5 @@
 #include <cassert>
+#include "Debug/MemoryRegistry.h"
 #include "RayTracingSceneResources.h"
 
 #include "Renderer/CommandContext.h"
@@ -115,6 +116,8 @@ namespace
             return false;
         }
 
+        MemoryRegistry::TrackResource(upload);
+
         void* mapped = nullptr;
         const D3D12_RANGE read{0, 0};
 
@@ -216,6 +219,8 @@ std::optional<RayTracingSceneResources::ReplacementCandidate> RayTracingSceneRes
     const std::vector<ResidencyProposal>& proposals, std::size_t materialCount, std::string& error,
     const FileSceneRuntime* membershipSource, CandidateFailure* failure)
 {
+    const MemoryCategoryScope memoryScope(MemoryCategory::AccelerationStructures);
+
     error.clear();
 
     // CPU-only preparation: recording and submission happen after this returns,

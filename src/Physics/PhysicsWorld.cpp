@@ -600,6 +600,30 @@ BodyType Body::GetType() const
     }
 }
 
+ColliderType Body::GetColliderType() const
+{
+    if(!IsValid() || !b3Shape_IsValid(m_impl->shapeId))
+    {
+        throw std::logic_error("Physics body has no solid shape");
+    }
+
+    // Engine creates hull shapes only for Box colliders.
+    switch(b3Shape_GetType(m_impl->shapeId))
+    {
+    case b3_hullShape:
+        return ColliderType::Box;
+
+    case b3_sphereShape:
+        return ColliderType::Sphere;
+
+    case b3_capsuleShape:
+        return ColliderType::Capsule;
+
+    default:
+        throw std::logic_error("Physics body has an unsupported shape type");
+    }
+}
+
 BoxProperties Body::GetBoxProperties() const
 {
     if (!IsValid())
@@ -720,6 +744,74 @@ void Body::SetKinematicPose(const Pose& pose)
     const Quaternion& orientation = pose.orientation;
     b3Body_SetTransform(m_impl->bodyId, b3ToPos(ToBox3DVector(pose.position)),
         {{orientation.x, orientation.y, orientation.z}, orientation.w});
+}
+
+Vector3 Body::GetLinearVelocity() const
+{
+    if(!IsValid())
+    {
+        throw std::logic_error("Invalid physics body");
+    }
+
+    const b3Vec3 velocity = b3Body_GetLinearVelocity(m_impl->bodyId);
+    return {velocity.x, velocity.y, velocity.z};
+}
+
+Vector3 Body::GetAngularVelocity() const
+{
+    if(!IsValid())
+    {
+        throw std::logic_error("Invalid physics body");
+    }
+
+    const b3Vec3 velocity = b3Body_GetAngularVelocity(m_impl->bodyId);
+    return {velocity.x, velocity.y, velocity.z};
+}
+
+void Body::SetKinematicTarget(const Pose& target, float timeStep)
+{
+    if(!IsValid() || b3Body_GetType(m_impl->bodyId) != b3_kinematicBody)
+    {
+        throw std::logic_error("Only a live Kinematic body can follow a target pose");
+    }
+
+    if(!std::isfinite(timeStep) || timeStep <= 0.0f)
+    {
+        throw std::invalid_argument("Kinematic target time step must be positive and finite");
+    }
+
+    ValidateBodyPose(target, BodyType::Kinematic, "kinematic target");
+
+    // An asleep body would ignore a target whose velocity is below its sleep threshold, and
+    // a slow door would then never move. Waking first makes every target take effect.
+    b3Body_SetAwake(m_impl->bodyId, true);
+
+    const Quaternion& orientation = target.orientation;
+    const b3WorldTransform nativeTarget{b3ToPos(ToBox3DVector(target.position)),
+        {{orientation.x, orientation.y, orientation.z}, orientation.w}};
+    b3Body_SetTargetTransform(m_impl->bodyId, nativeTarget, timeStep, true);
+}
+
+void Body::StopKinematicMotion()
+{
+    if(!IsValid() || b3Body_GetType(m_impl->bodyId) != b3_kinematicBody)
+    {
+        throw std::logic_error("Only a live Kinematic body can be stopped");
+    }
+
+    b3Body_SetLinearVelocity(m_impl->bodyId, {0.0f, 0.0f, 0.0f});
+    b3Body_SetAngularVelocity(m_impl->bodyId, {0.0f, 0.0f, 0.0f});
+}
+
+void Body::SetDynamicLinearVelocity(const Vector3& velocity)
+{
+    if(!IsValid() || b3Body_GetType(m_impl->bodyId) != b3_dynamicBody)
+    {
+        throw std::logic_error("Only a live Dynamic body takes a linear velocity");
+    }
+
+    b3Body_SetLinearVelocity(m_impl->bodyId, {velocity.x, velocity.y, velocity.z});
+    b3Body_SetAwake(m_impl->bodyId, true);
 }
 
 Vector3 Body::GetWorldCenterOfMass() const

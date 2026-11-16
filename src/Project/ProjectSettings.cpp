@@ -16,6 +16,13 @@ namespace
         {ProjectSteamAudioRayTracer::Default, "default"},
         {ProjectSteamAudioRayTracer::Embree, "embree"},
     };
+    constexpr std::pair<ProjectVolumetricQuality, std::string_view> kVolumetricQualities[] = {
+        {ProjectVolumetricQuality::Low, "low"},
+        {ProjectVolumetricQuality::Medium, "medium"},
+        {ProjectVolumetricQuality::High, "high"}};
+    constexpr std::pair<ProjectVolumetricResolutionBasis, std::string_view> kVolumetricResolutionBases[] = {
+        {ProjectVolumetricResolutionBasis::Internal, "internal"},
+        {ProjectVolumetricResolutionBasis::Output, "output"}};
     constexpr std::pair<ProjectToneMapper, std::string_view> kToneMappers[] = {
         {ProjectToneMapper::AgX, "agx"},
         {ProjectToneMapper::GT7, "gt7"}};
@@ -238,6 +245,11 @@ namespace
         rendering.Name("lightingMode", settings.lightingMode, kLightingModes);
         rendering.Name("toneMapper", settings.toneMapper, kToneMappers);
 
+        // R1.3: an older file has no group, so it keeps the defaults (its earlier behaviour).
+        const auto volumetrics = rendering.Child("volumetrics");
+        volumetrics.Name("quality", settings.volumetrics.quality, kVolumetricQualities);
+        volumetrics.Name("resolutionBasis", settings.volumetrics.resolutionBasis, kVolumetricResolutionBases);
+
         auto& legacy = settings.legacy;
         const auto legacyReader = rendering.Child("legacy");
         legacyReader.Name("reflectionDenoiser", legacy.reflectionDenoiser, kReflectionDenoisers);
@@ -347,6 +359,18 @@ bool ValidateProjectSettings(ProjectSettings& settings, std::vector<std::string>
     if(!IsKnown(kToneMappers, rendering.toneMapper))
     {
         Repair(rendering.toneMapper, defaults.toneMapper, "rendering.toneMapper was invalid; using agx.", warnings, valid);
+    }
+
+    if(!IsKnown(kVolumetricQualities, rendering.volumetrics.quality))
+    {
+        Repair(rendering.volumetrics.quality, defaults.volumetrics.quality, "rendering.volumetrics.quality was invalid; using medium.",
+            warnings, valid);
+    }
+
+    if(!IsKnown(kVolumetricResolutionBases, rendering.volumetrics.resolutionBasis))
+    {
+        Repair(rendering.volumetrics.resolutionBasis, defaults.volumetrics.resolutionBasis,
+            "rendering.volumetrics.resolutionBasis was invalid; using internal.", warnings, valid);
     }
 
     auto& legacy = rendering.legacy;
@@ -480,6 +504,16 @@ std::string_view ToSerializedName(ProjectPathTraceDenoiserSignal value)
     return NameOf(kDenoiserSignals, value);
 }
 
+std::string_view ToSerializedName(ProjectVolumetricQuality value)
+{
+    return NameOf(kVolumetricQualities, value);
+}
+
+std::string_view ToSerializedName(ProjectVolumetricResolutionBasis value)
+{
+    return NameOf(kVolumetricResolutionBases, value);
+}
+
 namespace ProjectSettingsFile
 {
     LoadedProjectSettings Parse(std::string_view text)
@@ -564,6 +598,10 @@ namespace ProjectSettingsFile
         auto& rendering = ObjectMember(document, "rendering");
         rendering["lightingMode"] = ToSerializedName(source.lightingMode);
         rendering["toneMapper"] = ToSerializedName(source.toneMapper);
+
+        auto& volumetrics = ObjectMember(rendering, "volumetrics");
+        volumetrics["quality"] = ToSerializedName(source.volumetrics.quality);
+        volumetrics["resolutionBasis"] = ToSerializedName(source.volumetrics.resolutionBasis);
 
         auto& legacy = ObjectMember(rendering, "legacy");
         legacy["reflectionDenoiser"] = ToSerializedName(source.legacy.reflectionDenoiser);

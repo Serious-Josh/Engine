@@ -1,5 +1,6 @@
 #pragma once
 
+#include "Renderer/Passes/EditorMistPass.h"
 #include "Renderer/Passes/PathTraceSpatialPass.h"
 #include "Renderer/Passes/ToneMapPass.h"
 #include "Renderer/RendererLightingMode.h"
@@ -56,6 +57,10 @@ struct RenderingConfiguration
     // Path Tracing, and Reference through a Debug panel request only.
     bool dedicatedCaustics = false;
     bool causticOnlyView = false;
+
+    // R1.3: the volumetric fog's quality preset and resolution basis, in every lighting mode (RenderingSettings::volumetrics).
+    AirMistQuality volumetricQuality = AirMistQuality::Medium;
+    AirMistResolutionBasis volumetricResolutionBasis = AirMistResolutionBasis::Internal;
 
     bool operator==(const RenderingConfiguration&) const = default;
 };

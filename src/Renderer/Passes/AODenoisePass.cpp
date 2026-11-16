@@ -1,4 +1,5 @@
 #include "AODenoisePass.h"
+#include "Debug/MemoryRegistry.h"
 
 #include "Renderer/DescriptorHeap.h"
 #include "Renderer/GraphicsDevice.h"
@@ -14,6 +15,8 @@ bool AODenoisePass::Initialize(
     unsigned int width,
     unsigned int height)
 {
+    const MemoryCategoryScope memoryScope(MemoryCategory::LegacyRayTracing);
+
     ID3D12Device* device = graphicsDevice.GetDevice();
 
     ShaderDescription shaderDescription{};
@@ -53,6 +56,8 @@ bool AODenoisePass::Resize(
     unsigned int width,
     unsigned int height)
 {
+    const MemoryCategoryScope memoryScope(MemoryCategory::LegacyRayTracing);
+
     ID3D12Device* device = graphicsDevice.GetDevice();
 
     for (unsigned int i = 0; i < 2; ++i)

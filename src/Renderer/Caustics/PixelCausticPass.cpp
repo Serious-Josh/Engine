@@ -1,6 +1,7 @@
 #include "PixelCausticPass.h"
 
 #include "Core/Log.h"
+#include "Debug/MemoryRegistry.h"
 #include "Renderer/DescriptorHeap.h"
 #include "Renderer/GraphicsDevice.h"
 #include "Renderer/RenderTarget.h"
@@ -160,6 +161,8 @@ namespace
             return nullptr;
         }
 
+        MemoryRegistry::TrackResource(resource);
+
         return resource;
     }
 
@@ -195,6 +198,8 @@ bool PixelCausticPass::Initialize(GraphicsDevice& graphicsDevice, ShaderLibrary&
     {
         return m_initialized;
     }
+
+    const MemoryCategoryScope memoryScope(MemoryCategory::Caustics);
 
     ID3D12Device* device = graphicsDevice.GetDevice();
     D3D12_FEATURE_DATA_D3D12_OPTIONS options{};
@@ -318,6 +323,8 @@ void PixelCausticPass::Shutdown()
 bool PixelCausticPass::EnsureResources(ID3D12Device* device, DescriptorHeap& heap, std::uint32_t width,
     std::uint32_t height, std::uint32_t triangleCount)
 {
+    const MemoryCategoryScope memoryScope(MemoryCategory::Caustics);
+
     // Resolution-sized resources are replaced only at a drained boundary (ReleaseResources).
     if(m_diffuse.GetResource() && (m_width != width || m_height != height))
     {
@@ -408,6 +415,8 @@ bool PixelCausticPass::EnsureResources(ID3D12Device* device, DescriptorHeap& hea
 #if defined(ENGINE_HAS_VERIFICATION)
 bool PixelCausticPass::EnsureDiagnosticResources(ID3D12Device* device, DescriptorHeap& heap, std::uint32_t triangleCount)
 {
+    const MemoryCategoryScope memoryScope(MemoryCategory::Caustics);
+
     if(!m_probeAttempts.GetResource())
     {
         if(!m_probeAttempts.InitializeGPUWritable(device, ProbeAttemptBytes) || !m_probeAttempts.CreateRawUAV(device, heap) ||

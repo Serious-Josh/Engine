@@ -1,4 +1,5 @@
 #include "TopLevelAccelerationStructure.h"
+#include "Debug/MemoryRegistry.h"
 #include "Core/Log.h"
 #include "BottomLevelAccelerationStructure.h"
 #include "Math/Matrix4.h"
@@ -396,6 +397,8 @@ bool TopLevelAccelerationStructure::Initialize(
             Shutdown();
             return false;
         }
+
+        MemoryRegistry::TrackResource(m_instanceBuffers[i]);
     }
 
     for (unsigned int frameIndex = 0; frameIndex < FrameCount; ++frameIndex)
@@ -475,6 +478,8 @@ bool TopLevelAccelerationStructure::Initialize(
         return false;
     }
 
+    MemoryRegistry::TrackResource(m_scratchResource, MemoryCategory::AccelerationStructures);
+
     resourceDescription.Width = prebuildInfo.ResultDataMaxSizeInBytes;
 
     result = device->CreateCommittedResource(&defaultHeapProperties, D3D12_HEAP_FLAG_NONE, &resourceDescription,
@@ -487,6 +492,8 @@ bool TopLevelAccelerationStructure::Initialize(
         Shutdown();
         return false;
     }
+
+    MemoryRegistry::TrackResource(m_resource, MemoryCategory::AccelerationStructures);
 
     D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC buildDescription{};
     buildDescription.Inputs = buildInputs;

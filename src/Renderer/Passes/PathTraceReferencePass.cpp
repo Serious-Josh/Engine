@@ -1,4 +1,5 @@
 #include "PathTraceReferencePass.h"
+#include "Debug/MemoryRegistry.h"
 #include "Renderer/Shader/DxilLibraryCache.h"
 #include "Debug/TransitionTiming.h"
 
@@ -1320,6 +1321,8 @@ ShaderLibraryPreparation PathTraceReferencePass::PreparePipelines(RayTracingPipe
 bool PathTraceReferencePass::CreatePipeline(GraphicsDevice& device, RayTracingPipeline& slot,
     const std::vector<char>& bytecode, const RayTracingPipelineDescription& description)
 {
+    const MemoryCategoryScope memoryScope(MemoryCategory::PathTracing);
+
     const std::string key = PipelineDescriptionKey(description);
     const std::uint64_t revision = LibraryRevision(description.shaderPath);
     const std::string identity = key + "#" + std::to_string(revision);
@@ -1435,6 +1438,8 @@ bool PathTraceReferencePass::CreateTextures(
     {
         return false;
     }
+
+    const MemoryCategoryScope memoryScope(MemoryCategory::PathTracing);
 
     constexpr D3D12_RESOURCE_FLAGS unorderedAccess = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     constexpr D3D12_RESOURCE_STATES initialState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
@@ -1678,6 +1683,8 @@ unsigned int PathTraceReferencePass::EnsurePrimarySurfaceReplacement(
     DescriptorHeap& descriptorHeap,
     std::string& failureReason)
 {
+    const MemoryCategoryScope memoryScope(MemoryCategory::PathTracing);
+
     if(!m_initialized)
     {
         failureReason = "The path tracer is not initialized.";
@@ -1764,6 +1771,8 @@ unsigned int PathTraceReferencePass::EnsurePrimarySurfaceReplacementGuides(
     DescriptorHeap& descriptorHeap,
     std::string& failureReason)
 {
+    const MemoryCategoryScope memoryScope(MemoryCategory::PathTracing);
+
     if(!m_initialized)
     {
         failureReason = "The path tracer is not initialized.";
@@ -2225,6 +2234,8 @@ void PathTraceReferencePass::ReleasePrimarySurfaceReplacementPipelines()
 
 bool PathTraceReferencePass::EnsurePsrSharcProbesForTesting(GraphicsDevice& device, ShaderLibrary& shaders, std::string& failure)
 {
+    const MemoryCategoryScope memoryScope(MemoryCategory::PathTracing);
+
     RayTracingPipeline* pipelines[] = {&m_psrSharcImageProbePipeline, &m_psrSharcTrainingProbePipeline};
     for(int index = 0; index < 2; ++index)
     {
@@ -2245,6 +2256,8 @@ bool PathTraceReferencePass::EnsurePsrSharcProbesForTesting(GraphicsDevice& devi
 
 bool PathTraceReferencePass::EnsurePsrSharcEnergyForTesting(GraphicsDevice& device, ShaderLibrary& shaders, std::string& failure)
 {
+    const MemoryCategoryScope memoryScope(MemoryCategory::PathTracing);
+
     const char* suffix = m_libraryVariant == PathTraceLibraryVariant::SM66 ? "" :
         m_libraryVariant == PathTraceLibraryVariant::SM69 ? "SM69" : "SERSM69";
     for(int index = 0; index < 2; ++index)
@@ -2744,6 +2757,8 @@ bool PathTraceReferencePass::CreateExtractionTextures(ID3D12Device* device, Desc
         return true;
     }
 
+    const MemoryCategoryScope memoryScope(MemoryCategory::PathTracing);
+
     constexpr D3D12_RESOURCE_FLAGS unorderedAccess = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     constexpr D3D12_RESOURCE_STATES initialState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     Texture* outputs[2] = {&m_diffuseTexture, &m_specularTexture};
@@ -2775,6 +2790,8 @@ Texture* PathTraceReferencePass::EnsureHistoryPriorTexture(ID3D12Device* device,
         return &m_historyPriorTexture;
     }
 
+    const MemoryCategoryScope memoryScope(MemoryCategory::PathTracing);
+
     if(m_width == 0 || m_height == 0 || !m_historyPriorTexture.Initialize(device, m_width, m_height, 1, 1,
         DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS) || !m_historyPriorTexture.CreateSRV(device, descriptorHeap) ||
@@ -2795,6 +2812,8 @@ Texture* PathTraceReferencePass::EnsureRawDiffuseHitDistanceTexture(ID3D12Device
     {
         return &m_rawDiffuseHitDistanceTexture;
     }
+
+    const MemoryCategoryScope memoryScope(MemoryCategory::PathTracing);
 
     if(m_width == 0 || m_height == 0 || !m_rawDiffuseHitDistanceTexture.Initialize(device, m_width, m_height, 1, 1,
         DXGI_FORMAT_R32_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS) ||
@@ -2908,6 +2927,8 @@ unsigned int PathTraceReferencePass::EnsureSplitSampleBuffer(
     {
         return UINT_MAX;
     }
+
+    const MemoryCategoryScope memoryScope(MemoryCategory::PathTracing);
 
     // Retired buffers whose last possible reader has completed.
     std::erase_if(target.retired,

@@ -1,4 +1,5 @@
 #include "RenderTarget.h"
+#include "Debug/MemoryRegistry.h"
 #include "DescriptorHeap.h"
 #include "Core/Log.h"
 
@@ -105,6 +106,8 @@ bool RenderTarget::Initialize(
         Log::Error("Failed to allocate render-target resource. HRESULT: " + std::to_string(result));
         return false;
     }
+
+    MemoryRegistry::TrackResource(m_resource);
 
     m_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
 

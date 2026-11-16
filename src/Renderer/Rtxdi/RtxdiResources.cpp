@@ -1,4 +1,5 @@
 #include "Renderer/Rtxdi/RtxdiResources.h"
+#include "Debug/MemoryRegistry.h"
 #include "Renderer/DescriptorHeap.h"
 #include "Core/Log.h"
 
@@ -25,6 +26,8 @@ bool RtxdiResources::Initialize(
     unsigned int width,
     unsigned int height)
 {
+    const MemoryCategoryScope memoryScope(MemoryCategory::PathTracing);
+
     Shutdown();
 
     if(!device || width == 0 || height == 0)
@@ -237,6 +240,8 @@ bool RtxdiResources::CreateReservoirUAV(ID3D12Device* device, DescriptorHeap& de
         return false;
     }
 
+    const MemoryCategoryScope memoryScope(MemoryCategory::PathTracing);
+
     // Buffer offers raw views only; RTXDI_LIGHT_RESERVOIR_BUFFER is a structured buffer.
     const unsigned int index = descriptorHeap.Allocate();
 
@@ -261,6 +266,8 @@ bool RtxdiResources::CreateReservoirUAV(ID3D12Device* device, DescriptorHeap& de
 
 bool RtxdiResources::CreateNeighborOffsets(ID3D12Device* device, DescriptorHeap& descriptorHeap)
 {
+    const MemoryCategoryScope memoryScope(MemoryCategory::PathTracing);
+
     // Immutable lookup table, written once through an upload heap: no commands, no upload submission, no wait.
     std::vector<std::uint8_t> offsets(NeighborOffsetCount * 2);
     rtxdi::FillNeighborOffsetBuffer(offsets.data(), NeighborOffsetCount);
@@ -281,6 +288,8 @@ bool RtxdiResources::CreateNeighborOffsets(ID3D12Device* device, DescriptorHeap&
     {
         return false;
     }
+
+    MemoryRegistry::TrackResource(m_neighborOffsets);
 
     void* mapped = nullptr;
     const D3D12_RANGE readRange{0, 0};

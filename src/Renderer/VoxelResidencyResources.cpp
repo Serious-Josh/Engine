@@ -1,4 +1,5 @@
 #include "Renderer/VoxelResidencyResources.h"
+#include "Debug/MemoryRegistry.h"
 
 #include "Renderer/CommandContext.h"
 #include "Renderer/DescriptorHeap.h"
@@ -71,6 +72,8 @@ void VoxelResidencyResources::Shutdown()
 bool VoxelResidencyResources::Configure(std::uint32_t regionBricks, int baseExponent, std::uint32_t window, std::uint64_t lastSubmissionFence,
     std::string* error)
 {
+    const MemoryCategoryScope memoryScope(MemoryCategory::VoxelResidency);
+
     const auto fail = [&](const char* message)
     {
         if(error)
@@ -187,6 +190,8 @@ void VoxelResidencyResources::RetireBuffer(Buffer& buffer, std::uint64_t fence)
 
 bool VoxelResidencyResources::CreateChunk(std::size_t bytes, Buffer& chunk)
 {
+    const MemoryCategoryScope memoryScope(MemoryCategory::VoxelResidency);
+
     if(chunk.InitializeGPUWritable(m_device, bytes) && chunk.CreateRawSRV(m_device, *m_descriptorHeap))
     {
         return true;
@@ -251,6 +256,8 @@ std::optional<std::uint32_t> VoxelResidencyResources::AddRegion(const Voxel::Res
     {
         return std::nullopt;
     }
+
+    const MemoryCategoryScope memoryScope(MemoryCategory::VoxelResidency);
 
     m_pages.Collect(completedFence);
     m_slots.Collect(completedFence);
@@ -414,6 +421,8 @@ void VoxelResidencyResources::PublishTable(ID3D12GraphicsCommandList* commandLis
     {
         return;
     }
+
+    const MemoryCategoryScope memoryScope(MemoryCategory::VoxelResidency);
 
     // Consistent snapshot: every Populated entry names a region that is fully uploaded and not leaving.
     for(const TableEntry& entry : *m_pendingTable)

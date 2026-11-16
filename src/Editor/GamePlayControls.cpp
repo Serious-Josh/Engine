@@ -17,6 +17,12 @@ void Editor::SetGameStatus(GameState state, bool canPlay, std::string message)
     m_gameState = state;
     m_canPlayGame = canPlay;
     m_gameMessage = std::move(message);
+
+    // R1.1: an AIR session override lives only while Play or the simulation locks scene editing.
+    if(!IsSceneEditingLocked())
+    {
+        DiscardAirSimulationOverride();
+    }
 }
 
 bool Editor::HasGameplayFocus() const

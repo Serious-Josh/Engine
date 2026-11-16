@@ -1,4 +1,5 @@
 #include "GpuTimestampProfiler.h"
+#include "Debug/MemoryRegistry.h"
 
 bool GpuTimestampProfiler::Initialize(
     ID3D12Device* device,
@@ -55,6 +56,8 @@ bool GpuTimestampProfiler::Initialize(
         Shutdown();
         return false;
     }
+
+    MemoryRegistry::TrackResource(m_readbackBuffer);
 
     result = commandQueue->GetTimestampFrequency(&m_timestampFrequency);
 

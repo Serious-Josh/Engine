@@ -7,6 +7,7 @@ add_library(EnginePhysics STATIC
     CharacterControllerMover.cpp
     ScenePhysicsSession.cpp
     RuntimePoseSnapshot.cpp
+    MovingSolidSnapshot.cpp
 )
 target_include_directories(EnginePhysics PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/..")
 target_compile_features(EnginePhysics PUBLIC cxx_std_23)
@@ -27,7 +28,8 @@ endif()
 
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/NativeSensorDiagnostic.cpp")
     add_executable(NativeSensorDiagnostic tests/NativeSensorDiagnostic.cpp
-        PhysicsComponent.cpp ColliderScaling.cpp TriggerColliderComponent.cpp CharacterControllerComponent.cpp CharacterControllerMover.cpp RuntimePoseSnapshot.cpp)
+        PhysicsComponent.cpp ColliderScaling.cpp TriggerColliderComponent.cpp CharacterControllerComponent.cpp CharacterControllerMover.cpp RuntimePoseSnapshot.cpp
+        MovingSolidSnapshot.cpp)
     target_include_directories(NativeSensorDiagnostic PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/..")
     target_compile_features(NativeSensorDiagnostic PRIVATE cxx_std_23)
     target_link_libraries(NativeSensorDiagnostic PRIVATE box3d::box3d)
@@ -39,7 +41,8 @@ endif()
 # Test sources are local-only and Git-ignored; a clone without them still builds EnginePhysics.
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/CharacterControllerNativeDiagnostic.cpp")
     add_executable(CharacterControllerNativeDiagnostic tests/CharacterControllerNativeDiagnostic.cpp
-        PhysicsComponent.cpp ColliderScaling.cpp TriggerColliderComponent.cpp CharacterControllerComponent.cpp CharacterControllerMover.cpp RuntimePoseSnapshot.cpp)
+        PhysicsComponent.cpp ColliderScaling.cpp TriggerColliderComponent.cpp CharacterControllerComponent.cpp CharacterControllerMover.cpp RuntimePoseSnapshot.cpp
+        MovingSolidSnapshot.cpp)
     target_include_directories(CharacterControllerNativeDiagnostic PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/..")
     target_compile_features(CharacterControllerNativeDiagnostic PRIVATE cxx_std_23)
     target_link_libraries(CharacterControllerNativeDiagnostic PRIVATE box3d::box3d)
@@ -94,11 +97,21 @@ endif()
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/CharacterControllerInteractionDiagnostic.cpp")
     add_executable(CharacterControllerInteractionDiagnostic tests/CharacterControllerInteractionDiagnostic.cpp
         PhysicsComponent.cpp ColliderScaling.cpp TriggerColliderComponent.cpp CharacterControllerComponent.cpp CharacterControllerMover.cpp
-        RuntimePoseSnapshot.cpp)
+        RuntimePoseSnapshot.cpp MovingSolidSnapshot.cpp)
     target_include_directories(CharacterControllerInteractionDiagnostic PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/..")
     target_compile_features(CharacterControllerInteractionDiagnostic PRIVATE cxx_std_23)
     target_link_libraries(CharacterControllerInteractionDiagnostic PRIVATE box3d::box3d)
     if(MSVC)
         target_compile_options(CharacterControllerInteractionDiagnostic PRIVATE /EHsc)
+    endif()
+endif()
+
+# AIR.4F.3 P1 local-only moving-solid snapshot and Kinematic motion diagnostic over the production library.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/MovingSolidSnapshotDiagnostic.cpp")
+    add_executable(MovingSolidSnapshotDiagnostic tests/MovingSolidSnapshotDiagnostic.cpp)
+    target_link_libraries(MovingSolidSnapshotDiagnostic PRIVATE EnginePhysics)
+
+    if(MSVC)
+        target_compile_options(MovingSolidSnapshotDiagnostic PRIVATE /EHsc)
     endif()
 endif()

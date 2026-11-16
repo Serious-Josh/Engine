@@ -1,4 +1,5 @@
 #include "RayTracedAOPass.h"
+#include "Debug/MemoryRegistry.h"
 
 #include "Core/Log.h"
 
@@ -21,6 +22,8 @@ bool RayTracedAOPass::Initialize(
     {
         return false;
     }
+
+    const MemoryCategoryScope memoryScope(MemoryCategory::LegacyRayTracing);
 
     if (!CreateTextures(graphicsDevice.GetDevice(), descriptorHeap, width, height))
     {
@@ -66,6 +69,8 @@ bool RayTracedAOPass::CreateTextures(
     {
         return false;
     }
+
+    const MemoryCategoryScope memoryScope(MemoryCategory::LegacyRayTracing);
 
     if (!m_rawAOTexture.Initialize(device, width, height, 1, 1, DXGI_FORMAT_R16_FLOAT,
                                    D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS))

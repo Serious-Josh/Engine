@@ -248,6 +248,10 @@ if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Tools/Ma
     target_compile_definitions(MaterialTableTests PRIVATE ENGINE_SOURCE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}")
 endif()
 
+# M0b.1: empty memory-registry functions. Packaged games and tools link only these; see src/Debug/MemoryRegistry.h.
+add_library(EngineMemoryRegistryDisabled STATIC src/Debug/MemoryRegistryDisabled.cpp)
+target_include_directories(EngineMemoryRegistryDisabled PRIVATE src)
+
 add_library(EngineCore OBJECT
     src/Engine/Engine.cpp
     src/Engine/BuildGame.cpp
@@ -430,6 +434,7 @@ add_library(EngineCore OBJECT
     src/Renderer/Passes/EditorMistPass.cpp
     src/Renderer/VoxelResidencyResources.cpp
     src/Renderer/AirField.cpp
+    src/Renderer/AirPressure.cpp
     src/Renderer/Passes/SelectionMaskPass.cpp
     src/Renderer/Passes/RayTracedGIPass.cpp
     src/Renderer/Passes/NrdDiffuseResolvePass.cpp
@@ -456,6 +461,7 @@ add_library(EngineCore OBJECT
     src/Voxel/VoxelRegion.cpp
     src/Voxel/VoxelResidency.cpp
     src/Voxel/VoxelWorldBake.cpp
+    src/Engine/VoxelArchiveStore.cpp
     src/Engine/VoxelProjectStore.cpp
     src/Engine/VoxelScene.cpp
     src/Engine/VoxelVisualization.cpp
@@ -591,6 +597,9 @@ if(ENGINE_BUILD_DIAGNOSTICS)
         $<$<CONFIG:Debug>:src/Engine/tests/VoxelResidencyVerification.cpp>
         $<$<CONFIG:Debug>:src/Engine/tests/VoxelQueryVerification.cpp>
         $<$<CONFIG:Debug>:src/Engine/tests/VoxelStreamingVerification.cpp>
+        $<$<CONFIG:Debug>:src/Engine/tests/VoxelResidencyParityVerification.cpp>
+        $<$<CONFIG:Debug>:src/Engine/tests/AirPackagedParityVerification.cpp>
+        $<$<CONFIG:Debug>:src/Engine/tests/MemoryRegistryVerification.cpp>
         $<$<CONFIG:Debug>:src/Engine/tests/AirFieldVerification.cpp>
         $<$<CONFIG:Debug>:src/Engine/tests/AirMotorEditorVerification.cpp>
         $<$<CONFIG:Debug>:src/Engine/tests/SceneDuplicationVerification.cpp>
@@ -616,7 +625,16 @@ endif()
 
 # Object sharing also retains static scene-registration units for editor startup.
 # Both executables use one implementation; only the entry point selects capabilities.
+# M0b.1 local-only Release smoke test: the real memory registry, linked as in the Editor.
+if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Debug/tests/MemoryRegistryReleaseSmoke.cpp")
+    add_executable(MemoryRegistryReleaseSmoke src/Debug/tests/MemoryRegistryReleaseSmoke.cpp src/Debug/MemoryRegistry.cpp)
+    target_link_libraries(MemoryRegistryReleaseSmoke PRIVATE EngineCore)
+endif()
+
 add_executable(Engine src/main.cpp)
+# M0b.1: the Editor alone links the real GPU memory registry. As an object file it takes precedence over the
+# EngineMemoryRegistryDisabled library member that every other EngineCore consumer (EngineRuntime, tests) resolves.
+target_sources(Engine PRIVATE src/Debug/MemoryRegistry.cpp)
 target_link_libraries(Engine PRIVATE EngineCore)
 engine_use_agility(Engine)
 
@@ -674,6 +692,19 @@ endif()
 if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Engine/tests/VoxelSceneTests.cpp")
     add_executable(VoxelSceneTests src/Engine/tests/VoxelSceneTests.cpp)
     target_link_libraries(VoxelSceneTests PRIVATE EngineCore)
+endif()
+
+# R1.5 local-only regression: moving-solid participation policy, scene schema 27 and cooked payload 37, request-level parity.
+if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Engine/tests/MovingSolidParticipationTests.cpp")
+    add_executable(MovingSolidParticipationTests src/Engine/tests/MovingSolidParticipationTests.cpp)
+    target_link_libraries(MovingSolidParticipationTests PRIVATE EngineCore)
+endif()
+
+# R1.4a local-only regression: cooked voxel bake (payload 36), Build Game's voxel bake check and entries, the archive voxel store.
+# Run in Release with an output directory, the deployed shader directory and the runtime directory.
+if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Engine/tests/VoxelArchiveTests.cpp")
+    add_executable(VoxelArchiveTests src/Engine/tests/VoxelArchiveTests.cpp)
+    target_link_libraries(VoxelArchiveTests PRIVATE EngineCore)
 endif()
 
 # VX.4C.2 local-only regression: the voxel overlay build against an independent oracle. Run in Release.
@@ -904,6 +935,7 @@ target_include_directories(EngineCore
 
 target_link_libraries(EngineCore
     PUBLIC
+        EngineMemoryRegistryDisabled
         EnginePhysics
         EngineScripting
         EngineScriptAssets

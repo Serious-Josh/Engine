@@ -1,4 +1,5 @@
 #include "BottomLevelAccelerationStructure.h"
+#include "Debug/MemoryRegistry.h"
 #include "BLASGeometryDescription.h"
 #include "Core/Log.h"
 
@@ -234,6 +235,8 @@ bool BottomLevelAccelerationStructure::InitializeBuild(
         return false;
     }
 
+    MemoryRegistry::TrackResource(m_scratchResource, MemoryCategory::AccelerationStructures);
+
     resourceDescription.Width = prebuildInfo.ResultDataMaxSizeInBytes;
 
     result = device->CreateCommittedResource(&heapProperties, D3D12_HEAP_FLAG_NONE, &resourceDescription,
@@ -246,6 +249,8 @@ bool BottomLevelAccelerationStructure::InitializeBuild(
         Shutdown();
         return false;
     }
+
+    MemoryRegistry::TrackResource(m_resource, MemoryCategory::AccelerationStructures);
 
     D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC buildDescription{};
     buildDescription.Inputs = buildInputs;

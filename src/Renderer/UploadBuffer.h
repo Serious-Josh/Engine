@@ -23,6 +23,17 @@ class UploadBuffer
 
     void Reset(unsigned int frameIndex);
 
+    // Bytes allocated in the current frame's region, and its capacity.
+    std::size_t GetFrameBytesUsed() const noexcept
+    {
+        return m_offset - m_frameOffset;
+    }
+
+    std::size_t GetCapacityPerFrame() const noexcept
+    {
+        return m_capacityPerFrame;
+    }
+
     D3D12_GPU_VIRTUAL_ADDRESS Allocate(
         const void* data,
         std::size_t size,

@@ -1,4 +1,5 @@
 #include "Mesh.h"
+#include "Debug/MemoryRegistry.h"
 
 #include "Renderer/DescriptorHeap.h"
 #include "Renderer/Vertex.h"
@@ -102,6 +103,8 @@ bool Mesh::Initialize(
     size_t vertexCount,
     const VertexLayout& layout)
 {
+    const MemoryCategoryScope memoryScope(MemoryCategory::MeshesTextures);
+
     m_staticSource.reset();
     m_layout = layout;
     m_vertexCount = vertexCount;
@@ -153,6 +156,8 @@ bool Mesh::Initialize(
         return false;
     }
 
+    const MemoryCategoryScope memoryScope(MemoryCategory::MeshesTextures);
+
     const D3D12_RESOURCE_STATES indexState =
         D3D12_RESOURCE_STATE_INDEX_BUFFER | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 
@@ -188,6 +193,8 @@ bool Mesh::InitializeGPUWritable(
     size_t indexCapacity,
     const MeshBounds& bounds)
 {
+    const MemoryCategoryScope memoryScope(MemoryCategory::MeshesTextures);
+
     m_staticSource.reset();
     const size_t stride = layout.GetStride();
 
@@ -486,6 +493,8 @@ bool Mesh::ReplaceGeometry(
     const unsigned int* indices,
     size_t indexCount)
 {
+    const MemoryCategoryScope memoryScope(MemoryCategory::MeshesTextures);
+
     m_staticSource.reset();
     (void)descriptorHeap;
 
@@ -750,6 +759,8 @@ CausticContracts::Geometry::AdmissionResult Mesh::InitializeWithStaticSource(
     const CausticContracts::Geometry::StaticSourceRequest& request,
     CausticContracts::Geometry::GeometrySourceHandle& output, const MeshMetadata* metadata)
 {
+    const MemoryCategoryScope memoryScope(MemoryCategory::MeshesTextures);
+
     using namespace CausticContracts::Geometry;
     if(m_vertexBuffer.GetResource() || m_indexBuffer.GetResource() || m_gpuWritable || m_vertexCount || m_indexCount)
         return {AdmissionStatus::Stale};

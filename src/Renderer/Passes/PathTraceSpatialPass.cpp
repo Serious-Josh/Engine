@@ -1,4 +1,5 @@
 #include "PathTraceSpatialPass.h"
+#include "Debug/MemoryRegistry.h"
 
 #include "Core/Log.h"
 #include "Renderer/DescriptorHeap.h"
@@ -18,6 +19,8 @@ bool PathTraceSpatialPass::Initialize(GraphicsDevice& graphicsDevice, ShaderLibr
     {
         return false;
     }
+
+    const MemoryCategoryScope memoryScope(MemoryCategory::PathTracing);
 
     // The normal filter and (RTXPT D.3B.0) the diagnostic views share one source and root signature.
     const auto createPipeline = [&](const char* entryPoint, ComputePipeline& pipeline)
@@ -65,6 +68,8 @@ bool PathTraceSpatialPass::InitializeAtrous(GraphicsDevice& graphicsDevice, Shad
         return false;
     }
 
+    const MemoryCategoryScope memoryScope(MemoryCategory::PathTracing);
+
     const char* entryPoints[5] = {"CSFirst", "CSFirstPresent", "CSSecond", "CSFirstPresentDiagnostic",
         "CSSecondDiagnostic"};
 
@@ -109,6 +114,8 @@ bool PathTraceSpatialPass::EnsureAtrousPsrVariant(GraphicsDevice& graphicsDevice
     {
         return m_atrousPsrInitialized;
     }
+
+    const MemoryCategoryScope memoryScope(MemoryCategory::PathTracing);
 
     const char* entryPoints[5] = {"CSFirst", "CSFirstPresent", "CSSecond", "CSFirstPresentDiagnostic",
         "CSSecondDiagnostic"};
@@ -169,6 +176,8 @@ bool PathTraceSpatialPass::EnsureIntermediate(
     {
         return true;
     }
+
+    const MemoryCategoryScope memoryScope(MemoryCategory::PathTracing);
 
     ReleaseIntermediate();
 

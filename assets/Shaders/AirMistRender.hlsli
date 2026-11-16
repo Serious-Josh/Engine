@@ -92,24 +92,185 @@ AirCornerChoice AirRenderCorners(AirPathField path, float3 position, int3 cell, 
 // AIR.4F F4.3: no sun visibility buffer (AirRenderMistAndVelocity's visibilityIndex): every sample sees the sun.
 static const uint AirNoVisibility = 0xFFFFFFFFu;
 
-// AIR.4F F4.3: a piece's sun visibility (0 or 1) from the visibility buffer (EditorMist.hlsl, CSSunVisibility): one uint per cell
-// slot, bit `piece` set when the ray from the piece's anchor toward the sun reached it.
+// AIR.4F.2d.3d: a piece's sun visibility (0 to 1) from its cell's visibility word (EditorMist.hlsl, CSSunVisibility): the fraction of the
+// piece's samples that reached the sun, 8 bits per piece (piece 0 in bits 0 to 7, piece 1 in bits 8 to 15).
+float AirUnpackSunVisibility(uint word, uint piece)
+{
+    return float((word >> (8u * piece)) & 0xFFu) / 255.0;
+}
+
+// AIR.4F.2d.3e: a piece's indirect fill I (0 to 1) from its cell's visibility word (EditorMist.hlsl, CSIndirectFill): 8 bits per piece
+// (piece 0 in bits 16 to 23, piece 1 in bits 24 to 31), square-root encoded so thin fog's small values keep their precision.
+float AirUnpackIndirect(uint word, uint piece)
+{
+    const float encoded = float((word >> (16u + 8u * piece)) & 0xFFu) / 255.0;
+    return encoded * encoded;
+}
+
+// AIR.4F F4.3: a piece's sun visibility from the visibility buffer: one uint per cell slot (AirUnpackSunVisibility).
 float AirPieceSunVisibility(AirPathField path, uint visibilityIndex, int3 cell, uint piece)
 {
     ByteAddressBuffer visibility = ResourceDescriptorHeap[NonUniformResourceIndex(visibilityIndex)];
-    const uint bits = visibility.Load(AirVelocityAddress(path.field, AirSlotOf(path.field, cell)) / 4);
-    return float((bits >> piece) & 1u);
+    return AirUnpackSunVisibility(visibility.Load(AirVelocityAddress(path.field, AirSlotOf(path.field, cell)) / 4), piece);
+}
+
+// AIR.4F.2d.3e: a piece's indirect fill from the visibility buffer (AirUnpackIndirect).
+float AirPieceIndirect(AirPathField path, uint visibilityIndex, int3 cell, uint piece)
+{
+    ByteAddressBuffer visibility = ResourceDescriptorHeap[NonUniformResourceIndex(visibilityIndex)];
+    return AirUnpackIndirect(visibility.Load(AirVelocityAddress(path.field, AirSlotOf(path.field, cell)) / 4), piece);
+}
+
+// AIR.4E.5c: an open footprint's eight corners (base + offset, `corner` = x + 2y + 4z as in AirSampleOpen), resolved once for the
+// open-path gathers below: each corner's containment and slot. The +1 neighbour's slot is the base's plus one, or 0 at the window's
+// size, which is exactly AirSlotOf's value; so one division per axis replaces one per axis, corner and gather. The gathers then read
+// the same values, with the same weights and in the same order, as AirCornersOpen, AirSampleMistOpen, AirSampleOpen and the per-corner
+// AirPieceSunVisibility: their results are bit-identical.
+struct AirRenderFootprint
+{
+    bool inside[8];
+    uint3 slot[8];
+};
+
+AirRenderFootprint AirRenderFootprintOf(AirFieldBinding field, int3 base)
+{
+    const int3 low = field.minimum + base;
+    const int3 high = low + 1;
+    const int3 end = field.minimum + int3(field.dimensions);
+    const uint3 lowSlot = AirSlotOf(field, low);
+    const uint3 highSlot = uint3(lowSlot.x + 1 == field.dimensions.x ? 0 : lowSlot.x + 1, lowSlot.y + 1 == field.dimensions.y ? 0 : lowSlot.y + 1,
+        lowSlot.z + 1 == field.dimensions.z ? 0 : lowSlot.z + 1);
+    const bool3 lowInside = and(low >= field.minimum, low < end);
+    const bool3 highInside = and(high >= field.minimum, high < end);
+    AirRenderFootprint footprint;
+
+    [unroll]
+    for(uint corner = 0; corner < 8; ++corner)
+    {
+        const bool3 upper = bool3((corner & 1u) != 0, (corner & 2u) != 0, (corner & 4u) != 0);
+        footprint.inside[corner] = all(select(upper, highInside, lowInside));
+        footprint.slot[corner] = select(upper, highSlot, lowSlot);
+    }
+
+    return footprint;
+}
+
+uint AirRenderSlotIndex(AirFieldBinding field, uint3 slot)
+{
+    return slot.x + field.dimensions.x * (slot.y + field.dimensions.y * slot.z);
+}
+
+// AIR.4E.5c: AirLoadCell for a cell inside the window whose slot is known (the same loads and result).
+AirCell AirRenderLoadCell(AirPathField path, uint3 slot)
+{
+    AirCell result;
+    result.inside = true;
+    result.piece0 = 0;
+    result.piece1 = 0;
+    AirPathBuffer obstacles = ResourceDescriptorHeap[NonUniformResourceIndex(path.obstacleIndex)];
+    const uint bits = (obstacles.Load(AirObstacleWord(path.field, slot) * 4) >> ((slot.x % AirSlotsPerObstacleWord) * 2)) & 3u;
+
+    // CSBuildPieces settles a cell with no blocked voxel as one whole piece (AirLoadCell).
+    if((bits & AirObstacleBlocked) == 0)
+    {
+        result.piece0 = AirSubcellsAll;
+        return result;
+    }
+
+    AirPathBuffer pieces = ResourceDescriptorHeap[NonUniformResourceIndex(path.pieceIndex)];
+    const uint4 words = pieces.Load4(AirRenderSlotIndex(path.field, slot) * 16);
+    result.piece0 = uint64_t(words.x) | (uint64_t(words.y) << 32);
+    result.piece1 = uint64_t(words.z) | (uint64_t(words.w) << 32);
+    return result;
+}
+
+// AirCornersOpen: every corner outside the window or a whole cell (its obstacle bit clear).
+bool AirRenderCornersOpen(AirPathField path, AirRenderFootprint footprint)
+{
+    AirPathBuffer obstacles = ResourceDescriptorHeap[NonUniformResourceIndex(path.obstacleIndex)];
+    bool open = true;
+
+    [unroll]
+    for(uint corner = 0; corner < 8; ++corner)
+    {
+        const uint3 slot = footprint.slot[corner];
+        const bool cornerOpen = !footprint.inside[corner] ||
+            ((obstacles.Load(AirObstacleWord(path.field, slot) * 4) >> ((slot.x % AirSlotsPerObstacleWord) * 2)) & AirObstacleBlocked) == 0;
+        open = open && cornerOpen;
+    }
+
+    return open;
+}
+
+// AirSampleMistOpen.
+float4 AirRenderMistOpen(AirPathField path, AirMistField mist, AirRenderFootprint footprint, float3 fraction, float4 fallback)
+{
+    AirPathBuffer values = ResourceDescriptorHeap[NonUniformResourceIndex(mist.piece0Index)];
+    float4 sum = 0.0;
+    float total = 0.0;
+
+    [unroll]
+    for(uint corner = 0; corner < 8; ++corner)
+    {
+        const int3 offset = int3(corner & 1u, (corner >> 1) & 1u, (corner >> 2) & 1u);
+        const float3 axisWeight = lerp(1.0 - fraction, fraction, float3(offset));
+        const float weight = axisWeight.x * axisWeight.y * axisWeight.z;
+
+        if(weight > 0.0)
+        {
+            const float4 value = footprint.inside[corner] ? asfloat(values.Load4(AirRenderSlotIndex(path.field, footprint.slot[corner]) * 16)) :
+                float4(0.0, 0.0, 0.0, 0.0);
+            sum += value * weight;
+            total += weight;
+        }
+    }
+
+    return total > 0.0 ? sum / total : fallback;
+}
+
+// AirSampleOpen (piece 0's velocity; the ambient outside the window). The fallback (no weight at all) is the velocity of piece
+// `fallbackPiece` of the slot `fallbackIndex`, loaded only then: AirSampleOpen's argument was always evaluated.
+float3 AirRenderVelocityOpen(AirPathField path, AirRenderFootprint footprint, float3 fraction, uint fallbackIndex, uint fallbackPiece)
+{
+    AirPathBuffer velocity = ResourceDescriptorHeap[NonUniformResourceIndex(path.velocityIndex)];
+    float3 sum = 0.0;
+    float total = 0.0;
+
+    [unroll]
+    for(uint corner = 0; corner < 8; ++corner)
+    {
+        const int3 offset = int3(corner & 1u, (corner >> 1) & 1u, (corner >> 2) & 1u);
+        const float3 axisWeight = lerp(1.0 - fraction, fraction, float3(offset));
+        const float weight = axisWeight.x * axisWeight.y * axisWeight.z;
+
+        if(weight > 0.0)
+        {
+            const float3 value = footprint.inside[corner] ? asfloat(velocity.Load3(AirRenderSlotIndex(path.field, footprint.slot[corner]) * 16)) :
+                path.ambient;
+            sum += value * weight;
+            total += weight;
+        }
+    }
+
+    if(total > 0.0)
+    {
+        return sum / total;
+    }
+
+    AirPathBuffer own = ResourceDescriptorHeap[NonUniformResourceIndex(fallbackPiece == 0 ? path.velocityIndex : path.velocityPiece1Index)];
+    return asfloat(own.Load3(fallbackIndex * 16));
 }
 
 // AIR.4F F4.1: the mist at a point and, when asked for, the air's velocity there by the same rule, so flow-advected detail follows the
 // air connected to the point and never the air beyond a wall. AIR.4F F4.3: likewise, with a visibility buffer, the sun's visibility:
 // the same corners and weights as the mist, so it is blended only between connected pieces; outside the window, a corner takes the
-// point's own piece's visibility.
+// point's own piece's visibility. AIR.4F.2d.3e: the indirect fill likewise, from the same words (0 without a visibility buffer).
 struct AirRenderSample
 {
     float4 mist;
     float3 velocity;
     float sunVisibility;
+    float indirect;
 };
 
 AirRenderSample AirRenderMistAndVelocity(AirPathField path, AirMistField mist, float3 position, bool withVelocity,
@@ -119,14 +280,20 @@ AirRenderSample AirRenderMistAndVelocity(AirPathField path, AirMistField mist, f
     result.mist = float4(0.0, 0.0, 0.0, 0.0);
     result.velocity = float3(0.0, 0.0, 0.0);
     result.sunVisibility = 1.0;
+    result.indirect = 0.0;
     const bool withVisibility = visibilityIndex != AirNoVisibility;
     const int3 cell = path.field.minimum + int3(floor(position));
-    const AirCell holder = AirLoadCell(path, cell);
 
-    if(!holder.inside)
+    if(!AirContains(path.field, cell))
     {
         return result;
     }
+
+    // AIR.4E.5c: the cell's slot once, for its masks, its own mist and its own visibility (AirLoadCell, AirPieceMist and
+    // AirPieceSunVisibility each computed it).
+    const uint3 cellSlot = AirSlotOf(path.field, cell);
+    const uint cellIndex = AirRenderSlotIndex(path.field, cellSlot);
+    const AirCell holder = AirRenderLoadCell(path, cellSlot);
 
     const int3 subcell = clamp(int3(floor(position * 4.0)) - (cell - path.field.minimum) * 4, 0, 3);
     const uint piece = AirPieceOfSubcell(holder, subcell);
@@ -139,41 +306,62 @@ AirRenderSample AirRenderMistAndVelocity(AirPathField path, AirMistField mist, f
     const float3 shifted = position - 0.5;
     const int3 base = int3(floor(shifted));
     const float3 fraction = shifted - float3(base);
-    const float4 own = AirPieceMist(path, mist, cell, piece);
-    const float ownVisibility = withVisibility ? AirPieceSunVisibility(path, visibilityIndex, cell, piece) : 1.0;
+    AirPathBuffer ownMist = ResourceDescriptorHeap[NonUniformResourceIndex(piece == 0 ? mist.piece0Index : mist.piece1Index)];
+    const float4 own = asfloat(ownMist.Load4(cellIndex * 16));
+    float ownVisibility = 1.0;
+    float ownIndirect = 0.0;
+
+    if(withVisibility)
+    {
+        ByteAddressBuffer visibilityBits = ResourceDescriptorHeap[NonUniformResourceIndex(visibilityIndex)];
+        const uint ownWord = visibilityBits.Load(cellIndex * 4);
+        ownVisibility = AirUnpackSunVisibility(ownWord, piece);
+        ownIndirect = AirUnpackIndirect(ownWord, piece);
+    }
 
     // The fast path: an open footprint is plain trilinear. HLSL evaluates both sides of a conditional expression, so branches guard
-    // each path.
-    if(AirCornersOpen(path, base))
+    // each path. AIR.4E.5c: its eight corners are resolved once (AirRenderFootprint) for every gather.
+    const AirRenderFootprint footprint = AirRenderFootprintOf(path.field, base);
+
+    if(AirRenderCornersOpen(path, footprint))
     {
-        result.mist = AirSampleMistOpen(path, mist, base, fraction, own);
+        result.mist = AirRenderMistOpen(path, mist, footprint, fraction, own);
 
         if(withVelocity && result.mist.a > 0.0)
         {
-            result.velocity = AirSampleOpen(path, base, fraction, AirPieceVelocity(path, cell, piece));
+            result.velocity = AirRenderVelocityOpen(path, footprint, fraction, cellIndex, piece);
         }
 
         if(withVisibility && result.mist.a > 0.0)
         {
+            ByteAddressBuffer visibility = ResourceDescriptorHeap[NonUniformResourceIndex(visibilityIndex)];
             float visibilitySum = 0.0;
+            float indirectSum = 0.0;
             float visibilityTotal = 0.0;
 
+            [unroll]
             for(uint corner = 0; corner < 8; ++corner)
             {
                 const int3 offset = int3(corner & 1u, (corner >> 1) & 1u, (corner >> 2) & 1u);
                 const float3 axisWeight = lerp(1.0 - fraction, fraction, float3(offset));
                 const float weight = axisWeight.x * axisWeight.y * axisWeight.z;
-                const int3 cornerCell = path.field.minimum + base + offset;
 
                 if(weight > 0.0)
                 {
-                    const bool inside = AirContains(path.field, cornerCell);
-                    visibilitySum += (inside ? AirPieceSunVisibility(path, visibilityIndex, cornerCell, 0) : ownVisibility) * weight;
+                    // AirPieceSunVisibility of piece 0 (every open corner inside the window is a whole cell).
+                    // The coverage keeps its pre-2d.3e expression (so the direct light compiles as before); the fill reads the same word.
+                    const float cornerVisibility = footprint.inside[corner] ?
+                        AirUnpackSunVisibility(visibility.Load(AirRenderSlotIndex(path.field, footprint.slot[corner]) * 4), 0) : ownVisibility;
+                    const float cornerIndirect = footprint.inside[corner] ?
+                        AirUnpackIndirect(visibility.Load(AirRenderSlotIndex(path.field, footprint.slot[corner]) * 4), 0) : ownIndirect;
+                    visibilitySum += cornerVisibility * weight;
+                    indirectSum += cornerIndirect * weight;
                     visibilityTotal += weight;
                 }
             }
 
             result.sunVisibility = visibilityTotal > 0.0 ? visibilitySum / visibilityTotal : ownVisibility;
+            result.indirect = visibilityTotal > 0.0 ? indirectSum / visibilityTotal : ownIndirect;
         }
 
         return result;
@@ -183,6 +371,7 @@ AirRenderSample AirRenderMistAndVelocity(AirPathField path, AirMistField mist, f
     float4 mistSum = float4(0.0, 0.0, 0.0, 0.0);
     float3 velocitySum = float3(0.0, 0.0, 0.0);
     float visibilitySum = 0.0;
+    float indirectSum = 0.0;
     float total = 0.0;
 
     for(uint corner = 0; corner < 8; ++corner)
@@ -207,6 +396,8 @@ AirRenderSample AirRenderMistAndVelocity(AirPathField path, AirMistField mist, f
             const bool inside = AirContains(path.field, cornerCell);
             visibilitySum += (inside ? AirPieceSunVisibility(path, visibilityIndex, cornerCell, choice.piece[corner]) : ownVisibility) *
                 choice.weight[corner];
+            indirectSum += (inside ? AirPieceIndirect(path, visibilityIndex, cornerCell, choice.piece[corner]) : ownIndirect) *
+                choice.weight[corner];
         }
 
         total += choice.weight[corner];
@@ -222,6 +413,7 @@ AirRenderSample AirRenderMistAndVelocity(AirPathField path, AirMistField mist, f
     if(withVisibility && result.mist.a > 0.0)
     {
         result.sunVisibility = total > 0.0 ? visibilitySum / total : ownVisibility;
+        result.indirect = total > 0.0 ? indirectSum / total : ownIndirect;
     }
 
     return result;

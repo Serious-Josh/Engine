@@ -1,4 +1,5 @@
 #include "Renderer/BuiltinEnvironment.h"
+#include "Debug/MemoryRegistry.h"
 #include "Scene/SceneDocument.h"
 #include "Platform/Windows/WindowsWindow.h"
 #include <cassert>
@@ -4130,6 +4131,8 @@ bool Renderer::Initialize(
     const HDRImageData* initialEnvironment, std::string environmentIdentity, bool deferEditorResources,
     std::span<const std::byte> packagedMaterialTables)
 {
+    const MemoryCategoryScope memoryScope(MemoryCategory::CoreRenderer);
+
     if (m_heightmapRegistration.owner)
     {
         Log::Error("Cannot reinitialize Renderer before checked heightmap unregistration.");
@@ -4472,8 +4475,10 @@ bool Renderer::Initialize(
         return false;
     }
 
-    // AIR.1: allocates nothing until air is first enabled.
-    if (!m_airField.Initialize(device, m_resourceDescriptorHeap, m_shaderLibrary))
+    // AIR.1: allocates nothing until air is first enabled. R1.2a: not here in a packaged runtime; R1.5b initializes it there eagerly,
+    // before the first AIR frame, when the startup scene requests AIR (InitializePackagedAir, the AIR shaders then in the bootstrap).
+    // The uninitialized field records nothing (AirField::Record).
+    if(!m_packagedRuntime && !m_airField.Initialize(device, m_resourceDescriptorHeap, m_shaderLibrary))
     {
         Log::Error("Failed to initialize the air field.");
         return false;
@@ -4502,10 +4507,15 @@ bool Renderer::Initialize(
 
     // AIR.4F F3: allocates nothing until mist is first drawn, except (F4.1) the 256 KiB Worley texture, uploaded here (after the
     // uploader and the resource heap it needs).
-    if(!m_packagedRuntime && !m_editorMistPass.Initialize(device, m_resourceDescriptorHeap, m_shaderLibrary, m_resourceUploader,
-        WindowsWindow::GetExecutableDirectory() / "assets" / "Textures" / "Air" / "MistWorley64.dds",
-        WindowsWindow::GetExecutableDirectory() / "assets" / "Textures" / "Air" / "MistCurl64.dds",
-        WindowsWindow::GetExecutableDirectory() / "assets" / "Textures" / "Air" / "MistFilaments128.dds"))
+    // R1.2b: a packaged runtime initializes the haze core only (PackagedShaderFeature::Volumetrics): no mist pipelines and no loose
+    // noise textures, since packaged games never draw AIR mist.
+    const std::filesystem::path mistTextures = WindowsWindow::GetExecutableDirectory() / "assets" / "Textures" / "Air";
+    const bool mistPassReady = m_packagedRuntime ?
+        m_editorMistPass.Initialize(device, m_resourceDescriptorHeap, m_shaderLibrary, m_resourceUploader, {}) :
+        m_editorMistPass.Initialize(device, m_resourceDescriptorHeap, m_shaderLibrary, m_resourceUploader, mistTextures / "MistWorley64.dds",
+            mistTextures / "MistCurl64.dds", mistTextures / "MistFilaments128.dds") && m_editorMistPass.EnsureMistPipelines();
+
+    if(!mistPassReady)
     {
         Log::Error("Failed to initialize the editor mist pass.");
         return false;
@@ -4836,6 +4846,8 @@ bool Renderer::InitializeEditorResources()
         return false;
     }
 
+    const MemoryCategoryScope memoryScope(MemoryCategory::Editor);
+
     if(!m_materialPreviewRenderer.Initialize(
             m_graphicsDevice.GetDevice(),
             m_shaderLibrary,
@@ -4903,6 +4915,8 @@ void Renderer::SelectPathTraceLibraries()
 
 bool Renderer::InitializeDevice()
 {
+    const MemoryCategoryScope memoryScope(MemoryCategory::CoreRenderer);
+
     RecordingEligibilityScope recordingEligibility{*this};
 
     if (!m_graphicsDevice.Initialize())
@@ -4923,6 +4937,8 @@ bool Renderer::InitializeDevice()
 
 bool Renderer::InitializeSwapChain(void* windowHandle)
 {
+    const MemoryCategoryScope memoryScope(MemoryCategory::CoreRenderer);
+
     return m_swapChain.Initialize(m_graphicsDevice.GetFactory(), m_graphicsDevice.GetDevice(),
                                   m_commandContext.GetCommandQueue(), windowHandle, m_applicationWidth, m_applicationHeight);
 }
@@ -5112,6 +5128,8 @@ bool Renderer::ResizeApplicationResources(
     unsigned int width,
     unsigned int height)
 {
+    const MemoryCategoryScope memoryScope(MemoryCategory::CoreRenderer);
+
     // ResizeBuffers or view creation can fail after destroying the previous backbuffers.
     m_applicationWidth = 0;
     m_applicationHeight = 0;
@@ -5129,6 +5147,8 @@ bool Renderer::ResizeApplicationResources(
 
 bool Renderer::ResizeSceneResources(const SceneResolution& resolution)
 {
+    const MemoryCategoryScope memoryScope(MemoryCategory::CoreRenderer);
+
     // No coherent scene extent is published while resources are partially recreated.
     m_sceneWidth = 0;
     m_sceneHeight = 0;
@@ -5825,6 +5845,8 @@ bool Renderer::InitializeSceneResources(
     const Scene& scene,
     const std::vector<Material*>& materials)
 {
+    const MemoryCategoryScope memoryScope(MemoryCategory::CoreRenderer);
+
     if (scene.HasPhysicsPresentation())
     {
         Log::Error("Clear physics presentation before initializing another renderer scene lifetime.");
@@ -5952,6 +5974,8 @@ bool Renderer::InitializeSceneResources(
 
 bool Renderer::InitializeMaterials(const std::vector<Material*>& materials)
 {
+    const MemoryCategoryScope memoryScope(MemoryCategory::MeshesTextures);
+
     if (materials.empty())
     {
         Log::Error("Cannot init an empty material buffer.");
@@ -6040,6 +6064,8 @@ bool Renderer::InitializeMaterials(const std::vector<Material*>& materials)
 
 bool Renderer::InitializeRayTracingScene(const Scene& scene)
 {
+    const MemoryCategoryScope memoryScope(MemoryCategory::AccelerationStructures);
+
     SceneSwitchTiming::Measure asTiming(SceneSwitchTiming::Stage::AccelerationStructures);
     // No AS or instance buffer is needed when every object is intentionally meshless.
     // Scene-resource release still owns draining and destruction when switching scenes.
@@ -6282,6 +6308,8 @@ void Renderer::ResetSceneHistory()
 
 void Renderer::LoadMaterialTables(std::span<const std::byte> packagedMaterialTables)
 {
+    const MemoryCategoryScope memoryScope(MemoryCategory::MeshesTextures);
+
     std::vector<std::byte> developmentBytes;
     std::span<const std::byte> bytes = packagedMaterialTables;
     std::string failureReason;
@@ -6325,6 +6353,8 @@ bool Renderer::EnsurePathTraceReference()
         return true;
     }
 
+    const MemoryCategoryScope memoryScope(MemoryCategory::PathTracing);
+
     // A failure is sticky for this renderer lifetime so a missing shader is not retried every frame.
     if(m_pathTraceStatus.availability == PathTraceReferenceAvailability::Unavailable)
     {
@@ -6364,6 +6394,8 @@ void Renderer::EnsurePreviousGBufferHistory()
         return;
     }
 
+    const MemoryCategoryScope memoryScope(MemoryCategory::CoreRenderer);
+
     // Creation only: no GPU work is recorded, so allocating during recording is safe. A failure leaves the
     // path-traced modes rendering without history.
     if(!m_previousGBufferHistory.Initialize(m_graphicsDevice.GetDevice(), m_resourceDescriptorHeap, m_sceneWidth,
@@ -6389,6 +6421,8 @@ bool Renderer::EnsureHybridNrdDenoisers()
     {
         return false;
     }
+
+    const MemoryCategoryScope memoryScope(MemoryCategory::DenoisersUpscaling);
 
     ID3D12Device* device = m_graphicsDevice.GetDevice();
     const uint32_t giWidth = (m_sceneWidth + 1u) / 2u;
@@ -6742,6 +6776,8 @@ bool Renderer::EvictNrdRetentionGroup(NrdRetentionGroup group)
 
 void Renderer::EnsureRtxdiResources()
 {
+    const MemoryCategoryScope memoryScope(MemoryCategory::PathTracing);
+
     TransitionTiming::Scope er1Scope("EnsureRtxdiResources");
     if(m_rtxdiResources.IsInitialized() || m_rtxdiResourcesFailed)
     {
@@ -7144,6 +7180,8 @@ static Matrix4 CameraRelativeInverseViewProjection(const Matrix4& view, const Ma
 // mirror's throughput demodulated). Off needs no filtering. Phase 4: the NRD modes through NrdPathTracePreparePsr.hlsl.
 ShaderLibraryPreparation Renderer::PreparePsrAuxiliary()
 {
+    const MemoryCategoryScope memoryScope(MemoryCategory::PathTracing);
+
     ShaderLibraryPreparation result{};
     result.state = ShaderLibraryPreparationState::PreparingPipelines;
     if(m_psrAuxiliaryFailed || !m_pipelineWorkerRunning)
@@ -8027,6 +8065,8 @@ bool Renderer::RecordEditorOverlayPrepass(ID3D12GraphicsCommandList* commandList
 
     if(!m_overlayDepth.GetResource())
     {
+        // Scoped to creation only, so the per-frame path pays nothing for attribution.
+        const MemoryCategoryScope memoryScope(MemoryCategory::Editor);
         const bool created = m_overlayDepth.Initialize(device, m_outputWidth, m_outputHeight, m_dsvDescriptorHeap,
             m_resourceDescriptorHeap) && m_overlaySelectionMask.Initialize(device, m_outputWidth, m_outputHeight,
             DXGI_FORMAT_R8_UNORM, m_rtvDescriptorHeap, m_resourceDescriptorHeap);
@@ -9334,6 +9374,8 @@ bool Renderer::EnsureNrdHybridDenoiser()
         return false;
     }
 
+    const MemoryCategoryScope memoryScope(MemoryCategory::DenoisersUpscaling);
+
     NrdDenoiser::Description description = PathTraceHybridDescription();
 
     if(std::exchange(m_nrdHybridFailCreationForTesting, false) ||
@@ -9586,6 +9628,8 @@ bool Renderer::RecordNrdHybrid(
 
 bool Renderer::EnsureNrdRelaxDenoiser()
 {
+    const MemoryCategoryScope memoryScope(MemoryCategory::DenoisersUpscaling);
+
     TransitionTiming::Scope er1Scope("EnsureNrdRelaxDenoiser", 0.5);
     // ER.1 Phase 3: a retained instance is reused only while its description still matches; otherwise it is released
     // (after the GPU drains) and created again.
@@ -10148,6 +10192,8 @@ nrd::ReblurSettings Renderer::PathTraceNrdProductionSettings()
 
 bool Renderer::EnsurePathTraceNrdDenoiser()
 {
+    const MemoryCategoryScope memoryScope(MemoryCategory::DenoisersUpscaling);
+
     TransitionTiming::Scope er1Scope("EnsurePathTraceNrdDenoiser", 0.5);
     // ER.1 Phase 3: as RELAX's, a retained instance is reused only with an unchanged description.
     if(m_nrdPathTraceDenoiser.IsInitialized() &&
@@ -13160,8 +13206,25 @@ bool Renderer::RecordRenderFrame(
     // AIR.4F F4.3: lit mist scatters the scene's light, so it is scene radiance: composited into the HDR scene colour before tone mapping
     // (and after exposure metering, which therefore does not see it). It reads the sun, the Light table and the TLAS as this frame's
     // deferred lighting and sun shadow do. Unlit mist keeps its place after tone mapping, below.
-    const bool litMist = !m_packagedRuntime && options.airMist && options.airMist->lighting;
+    // R1.2b: packaged frames draw the haze too (lit or unlit), never the AIR mist or a froxel path.
+    const bool litMist = options.airMist && options.airMist->lighting;
     m_lastAirMistRequestForTesting = options.airMist;
+    // AIR.4E.5c.2: this frame's render extent, for the Internal resolution basis.
+    std::optional<AirMistRenderRequest> mistRequest = options.airMist;
+
+    if(mistRequest)
+    {
+        mistRequest->internalWidth = m_sceneWidth;
+        mistRequest->internalHeight = m_sceneHeight;
+
+        // R1.2b: a backstop besides the packaged frame's own restriction (no experimental froxel path). R1.5b: and the AIR mist only once
+        // packaged AIR was initialized (its pipelines and noise exist only then).
+        if(m_packagedRuntime)
+        {
+            RestrictToPackagedVolumetrics(*mistRequest);
+            mistRequest->mistVisible = mistRequest->mistVisible && m_airField.IsInitialized();
+        }
+    }
 
     if(litMist)
     {
@@ -13172,7 +13235,7 @@ bool Renderer::RecordRenderFrame(
         mistLighting.topLevel = m_rayTracingScene.GetTopLevel().GetGPUAddress();
         mistLighting.environmentIrradiance = m_environment.GetDiffuseIrradiance().GetDescriptorIndex();
         m_editorMistPass.Execute(commandList, m_resourceDescriptorHeap, m_uploadBuffer, *presentedColor, *presentedDepth,
-            currentViewProjection, frameView.position, m_airField.GetBinding(), m_airField.GetMistBinding(), *options.airMist,
+            currentViewProjection, frameView.position, m_airField.GetBinding(), m_airField.GetMistBinding(), *mistRequest,
             m_airField.GetMistSeconds(), m_commandContext.GetLastSubmissionFenceValue(), m_commandContext.GetCompletedFenceValue(),
             nullptr, 0, &mistLighting);
     }
@@ -13242,18 +13305,20 @@ bool Renderer::RecordRenderFrame(
     // AIR.4A: velocity vectors from this frame's air field, in Editor and Play frames alike (Play shows the game camera's view).
     // AIR.4F F3: the mist before the air diagnostics and vectors, so they stay readable over it; a frame without mist retires the
     // pass's storage and records nothing.
-    if(!m_packagedRuntime && options.airMist && !litMist)
+    if(options.airMist && !litMist)
     {
         m_editorMistPass.Execute(commandList, m_resourceDescriptorHeap, m_uploadBuffer, m_finalSceneColor, *presentedDepth,
-            currentViewProjection, frameView.position, m_airField.GetBinding(), m_airField.GetMistBinding(), *options.airMist,
+            currentViewProjection, frameView.position, m_airField.GetBinding(), m_airField.GetMistBinding(), *mistRequest,
             m_airField.GetMistSeconds(), m_commandContext.GetLastSubmissionFenceValue(), m_commandContext.GetCompletedFenceValue());
     }
-    else if(!m_packagedRuntime && !litMist)
+    else if(!litMist)
     {
         m_editorMistPass.Idle(m_commandContext.GetLastSubmissionFenceValue(), m_commandContext.GetCompletedFenceValue());
     }
 
     m_lastAirVectorCount = 0;
+    m_lastAirTemperatureCount = 0;
+    m_lastAirDivergenceCount = 0;
     m_lastAirCellCount = 0;
     m_lastAirSubcellCount = 0;
 
@@ -13264,6 +13329,24 @@ bool Renderer::RecordRenderFrame(
             currentViewProjection, m_airField.GetBinding(), *options.airCells);
         m_lastAirSubcellCount = m_editorAirPass.ExecutePieces(commandList, m_resourceDescriptorHeap, m_uploadBuffer, m_finalSceneColor,
             *presentedDepth, currentViewProjection, m_airField.GetBinding(), GetVoxelWorldBinding(), *options.airCells);
+    }
+
+    if (!m_packagedRuntime && options.airTemperature)
+    {
+        m_lastAirTemperatureCount = m_editorAirPass.ExecuteTemperature(commandList, m_resourceDescriptorHeap, m_finalSceneColor, *presentedDepth,
+            currentViewProjection, m_airField.GetBinding(), *options.airTemperature);
+    }
+
+    // AIR.4E.2: the divergence is computed only on frames that show it; a frame without it retires its buffer.
+    if(!m_packagedRuntime && options.airDivergence)
+    {
+        m_lastAirDivergenceCount = m_editorAirPass.ExecuteDivergence(commandList, m_resourceDescriptorHeap, m_finalSceneColor, *presentedDepth,
+            currentViewProjection, m_airField.GetBinding(), m_airField.GetApertureIndex(), m_airField.GetPressureDiagnostics(), *options.airDivergence,
+            m_commandContext.GetLastSubmissionFenceValue(), m_commandContext.GetCompletedFenceValue());
+    }
+    else if(!m_packagedRuntime)
+    {
+        m_editorAirPass.IdleDivergence(m_commandContext.GetLastSubmissionFenceValue(), m_commandContext.GetCompletedFenceValue());
     }
 
     if (!m_packagedRuntime && options.airVisualization)
@@ -14346,6 +14429,60 @@ void Renderer::ReleaseAirField()
     m_airField.Release(m_commandContext.GetLastSubmissionFenceValue());
 }
 
+bool Renderer::InitializePackagedAir(std::span<const std::byte> worley, std::span<const std::byte> curl, std::span<const std::byte> filaments,
+    PackagedAirInitialization* report)
+{
+    if(m_airField.IsInitialized())
+    {
+        return true;
+    }
+
+    const MemoryCategoryScope memoryScope(MemoryCategory::AirVolumetrics);
+
+    if(!m_packagedRuntime)
+    {
+        Log::Error("InitializePackagedAir is for packaged runtimes; the Editor initializes AIR at startup.");
+        return false;
+    }
+
+    const auto started = std::chrono::steady_clock::now();
+    PackagedAirInitialization result;
+
+    // The pipelines come from the cooked bootstrap (Feature::Air): creation only, never compilation. The field's storage waits for its
+    // first enabled frame, as in the Editor.
+    if(!m_airField.Initialize(m_graphicsDevice.GetDevice(), m_resourceDescriptorHeap, m_shaderLibrary))
+    {
+        Log::Error("Packaged AIR: the air field's pipelines could not be created; AIR stays off.");
+        return false;
+    }
+
+    result.pressurePipelines = m_airField.GetPressure().PreparePipelines();
+    result.noiseVolumes = m_editorMistPass.LoadPackagedNoise(m_resourceUploader, worley, curl, filaments);
+    result.mistPipelines = m_editorMistPass.EnsureMistPipelines();
+    result.milliseconds = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+
+    if(!result.pressurePipelines)
+    {
+        Log::Warning("Packaged AIR: the pressure solver's pipelines could not be created; the projection is never run.");
+    }
+
+    if(!result.mistPipelines)
+    {
+        Log::Warning("Packaged AIR: the mist's pipelines could not be created; the mist is simulated but never drawn.");
+    }
+
+    Log::Info("R1.5b: packaged AIR initialized in " + std::to_string(result.milliseconds) + " ms: air field, pressure solver " +
+        (result.pressurePipelines ? "ready" : "unavailable") + ", mist " + (result.mistPipelines ? "ready" : "unavailable") + ", " +
+        std::to_string(result.noiseVolumes) + " of 3 noise volumes.");
+
+    if(report)
+    {
+        *report = result;
+    }
+
+    return true;
+}
+
 void Renderer::ResetVoxelResidency()
 {
     m_voxelResidency.Reset(m_commandContext.GetLastSubmissionFenceValue());
@@ -14515,6 +14652,8 @@ std::string Renderer::CalibratedEnvironmentIdentity(const std::string& identity,
 
 bool Renderer::SetEnvironment(size_t index, float radianceScale)
 {
+    const MemoryCategoryScope memoryScope(MemoryCategory::MeshesTextures);
+
     if(m_packagedRuntime) { Log::Error("Loose environment selection rejected in packaged mode."); return false; }
     if (index >= m_availableEnvironments.size())
     {
@@ -14578,6 +14717,8 @@ bool Renderer::SetEnvironment(size_t index, float radianceScale)
 bool Renderer::SetEnvironmentImage(const HDRImageData* image,std::string identity,std::string displayName,std::string reference,
     float radianceScale)
 {
+    const MemoryCategoryScope memoryScope(MemoryCategory::MeshesTextures);
+
     // The source identity selects the built-in black environment; the calibrated one only detects changes.
     const bool none=!image && identity == SceneDocument::NoneEnvironmentReference;
     identity=CalibratedEnvironmentIdentity(identity,radianceScale);
@@ -14604,6 +14745,8 @@ bool Renderer::SetEnvironmentImage(const HDRImageData* image,std::string identit
 
 bool Renderer::PreprocessEnvironment(EnvironmentMap& environment)
 {
+    const MemoryCategoryScope memoryScope(MemoryCategory::MeshesTextures);
+
     RecordingEligibilityScope recordingEligibility{*this};
 
     EnvironmentMipPass environmentMipPass;

@@ -2,6 +2,7 @@
 #include "Scene/SceneHierarchyEdits.h"
 
 #include "Scene/Transform.h"
+#include "Scene/AirSimulationSettings.h"
 #include "Engine/BuildGame.h"
 #include "Platform/Windows/ProjectFileAssociation.h"
 #include "Engine/CharacterDriveScheduling.h"
@@ -497,15 +498,12 @@ public:
     // the Voxels window's status current. A finished bake waits here while Play or a simulation blocks edits.
     void PollVoxelBake(IDemoScene& scene, const ProjectPaths& paths, ProjectAssetRegistry& registry);
 
-    // AIR.4A: the Air window's settings (AirControls.cpp). Session values, not scene data: the Engine maps them onto the frame's
-    // air request and velocity-vector view every frame.
+    // AIR.4A: the Air window's session settings (AirControls.cpp): pause, views, diagnostics and rendering quality, never saved. R1.1:
+    // the simulation configuration (enabled, pressure, buoyancy, steps, wind, damping, motor cap, mist dissipation) is scene data,
+    // AirSimulationSettings, resolved by the Engine through ResolveAirSimulation with GetAirSimulationOverride.
     struct AirEditorSettings
     {
-        bool enabled = false;
         bool paused = false;
-        Vector3 ambientVelocity{0.0f, 0.0f, 0.0f};
-        float dampingRate = 0.5f;
-        float maximumMotorSpeed = 40.0f;
         bool showVectors = true;
         // Vectors are 2^exponent cells apart per axis (-2 to 3: a quarter of a cell to 8 cells).
         int vectorSpacingExponent = 0;
@@ -517,6 +515,16 @@ public:
         float minimumSpeed = 0.05f;
         // AIR.4D D3: one vector per fluid piece at its anchor, instead of one per block at its hashed point.
         bool vectorsAtPieceAnchors = false;
+        // AIR.4F F4.5.1b.1: temperature points over the whole window, 2^exponent cells apart (0 to 3), saturating at +/- range kelvin.
+        bool showTemperature = false;
+        int temperatureSpacingExponent = 1;
+        float temperatureDisplayRange = 100.0f;
+        // AIR.4E.2 diagnostic: each fluid piece's divergence as points (the temperature points' placement), saturating at +/- range in
+        // 1/s; measure 0 is the pressure operator's face fluxes, 1 the stored (collocated) velocities'.
+        bool showDivergence = false;
+        int divergenceSpacingExponent = 1;
+        float divergenceDisplayRange = 2.0f;
+        int divergenceMeasure = 0;
         // AIR.4C diagnostic: the obstacle mask's blocked and unknown cells.
         bool showBlockedCells = false;
         bool showUnknownCells = false;
@@ -525,17 +533,29 @@ public:
         // AIR.4F: the passive mist. Its storage exists only while an enabled Mist Emitter feeds it; Show Mist only draws it.
         bool showMist = true;
         bool mistPaused = false;
-        // Per second: mist fades by exp(-rate * t).
-        float mistDissipationRate = 0.25f;
-        // AIR.4F F3: the rendered mist's quality preset (0 Low, 1 Medium, 2 High), a view and cost choice. AIR.4F F4.4.1: the mist's
-        // appearance (opacity, Worley, curl, lighting) is scene data (SceneDocument::mistRendering), not a session setting.
-        int mistQuality = 1;
+        // AIR.4F F4.4.1: the mist's appearance (opacity, Worley, curl, lighting) is scene data (SceneDocument::mistRendering). R1.3: its
+        // quality preset and resolution basis are project settings (RenderingSettings::volumetrics), overridden here only through the
+        // Debug panel's session RenderingOverrides.
+        // V1d follow-up, session only (never saved): the volumetric renderer for the mist and haze, the original raymarch (0, the
+        // default) or the experimental integrated froxels (1; AirVolumetricV1dReport.md).
+        int volumetricRenderer = 0;
+        // V1d distant banding (temporary, session only): the medium's adaptive samples per slice (one per AIR cell of depth) or a fixed 4.
+        bool volumetricAdaptiveSamples = true;
+        // V1d lateral experiment (temporary, session only): 0 baseline (1 x 1 rays, 4 depth samples), 1 2 x 2 rays with 4 depth samples,
+        // 2 2 x 2 rays with 1 depth sample (cost parity); and twice the froxel XY resolution.
+        int volumetricLateralMode = 0;
+        bool volumetricDoubleXY = false;
     };
 
     const AirEditorSettings& GetAirSettings() const noexcept
     {
         return m_airSettings;
     }
+
+    // R1.1: the Play or Physics Simulation session override of the scene runtime `runtimeIdentity`'s AIR simulation configuration,
+    // if the Air window made one; nullopt in a stopped scene and for any other runtime. Never saved: it is dropped when Play or the
+    // simulation ends and when a scene is activated.
+    std::optional<AirSimulationSettings> GetAirSimulationOverride(std::uint64_t runtimeIdentity) const;
 
     // AIR.4F F4.4.1: the mist appearance to draw for `document` of the scene runtime `runtimeIdentity` (null: no file scene, so the
     // defaults): the value being dragged in the Air window for that runtime, else the scene's own (its defaults when it has none).
@@ -546,6 +566,12 @@ public:
     void SetAirMotorEmission(std::map<std::uint64_t, AirMotorEmissionStatus> emission)
     {
         m_airMotorEmission = std::move(emission);
+    }
+
+    // AIR.4E.5b.1: the fixed air steps the latest rendered frame ran (Engine::Frame passes it on from the Renderer); shown in the Air window.
+    void SetAirStepCount(std::uint32_t steps) noexcept
+    {
+        m_airStepCount = steps;
     }
 
     // AIR.4F F2: the latest status of each Mist Emitter, keyed by MistEmitterTag of its object's ID; shown by its Inspector.
@@ -683,6 +709,7 @@ private:
     friend class StartupSceneVerification;
     friend class CausticVisibleVerification;
     friend class GamePlayGPUVerification;
+    friend class MemoryRegistryVerification;
     friend class ScriptWorkflowVerification;
     friend class VoxelEditorVerification;
     friend class VoxelOverlayVerification;
@@ -919,9 +946,13 @@ private:
     // Session-only display preference like Camera Frusta; never authored or persisted.
     bool m_showLightWireframes = true;
     // AIR.4A Air window.
-    void DrawAirWindow(IDemoScene& scene);
+    void DrawAirWindow(IDemoScene& scene, DebugUI& debugUI);
+    // R1.3: the Air window's view of the project's Volumetrics settings, edited as session rendering overrides.
+    void DrawVolumetricQualityControls(DebugUI& debugUI);
     // AIR.4F F4.4.1: the Air window's scene-owned Mist rendering controls.
     void DrawMistRenderingControls(IDemoScene& scene);
+    // AIR.4F F4.5.1b: the scene's air environment (ambient temperature, thermal relaxation time).
+    void DrawAirEnvironmentControls(IDemoScene& scene);
     bool m_showAirWindow = false;
     AirEditorSettings m_airSettings;
     bool m_airResetRequested = false;
@@ -1176,6 +1207,62 @@ private:
     };
     std::optional<MistRenderingDraft> m_mistRenderingDraft;
     std::string m_mistRenderingStatus;
+    // AIR.4F F4.5.1b: one edit of the scene's air environment (the Air window's Environment controls). Fields commit when their input
+    // is finished, so there is no draft.
+    struct AirEnvironmentEdit
+    {
+        SceneHistorySession session;
+        std::optional<AirEnvironmentSettings> before;
+        std::optional<AirEnvironmentSettings> after;
+    };
+    bool CommitAirEnvironment(IDemoScene& scene, const std::optional<AirEnvironmentSettings>& before, const AirEnvironmentSettings& after,
+        std::string* error = nullptr);
+    bool ReplayAirEnvironment(IDemoScene& scene, const AirEnvironmentEdit& edit, bool redo, std::string& error);
+    static size_t AirEnvironmentEditPayloadBytes(const AirEnvironmentEdit& edit);
+    std::string m_airEnvironmentStatus;
+    // R1.1: one edit of the scene's AIR simulation configuration (the Air window's simulation controls in a stopped scene). A checkbox,
+    // combo or preset commits at once; a drag shows its value in a draft and commits on release, so one drag is one history entry.
+    // Session overrides are never recorded.
+    struct AirSimulationEdit
+    {
+        SceneHistorySession session;
+        std::optional<AirSimulationSettings> before;
+        std::optional<AirSimulationSettings> after;
+    };
+    bool CommitAirSimulation(IDemoScene& scene, const std::optional<AirSimulationSettings>& before, const AirSimulationSettings& after,
+        std::string* error = nullptr);
+    bool ReplayAirSimulation(IDemoScene& scene, const AirSimulationEdit& edit, bool redo, std::string& error);
+    static size_t AirSimulationEditPayloadBytes(const AirSimulationEdit& edit);
+    // The settings the Air window shows for `scene`: the session override while scene editing is locked, else a held drag's draft,
+    // else the scene's (its defaults without a block or a project scene).
+    AirSimulationSettings GetDisplayedAirSimulation(IDemoScene& scene) const;
+    // Applies the Air window's edit: to the session override while scene editing is locked, else to the scene through history
+    // (`commit`) or to the drag draft.
+    void ApplyAirSimulationEdit(IDemoScene& scene, const AirSimulationSettings& edited, bool commit);
+    void DiscardAirSimulationOverride() noexcept;
+    // Both keyed by the scene runtime identity, so neither applies to a reopened or switched scene.
+    struct AirSimulationSessionValue
+    {
+        std::uint64_t runtimeIdentity = 0;
+        AirSimulationSettings settings;
+    };
+    std::optional<AirSimulationSessionValue> m_airSimulationOverride;
+    std::optional<AirSimulationSessionValue> m_airSimulationDraft;
+    std::string m_airSimulationStatus;
+    // AIR.4F.2d.3: one edit of the scene's environmental haze (the Scene Inspector's Environmental Haze section). Fields commit when their
+    // input is finished, as the air environment's.
+    struct EnvironmentalHazeEdit
+    {
+        SceneHistorySession session;
+        std::optional<EnvironmentalHazeSettings> before;
+        std::optional<EnvironmentalHazeSettings> after;
+    };
+    void DrawEnvironmentalHazeControls(IDemoScene& scene);
+    bool CommitEnvironmentalHaze(IDemoScene& scene, const std::optional<EnvironmentalHazeSettings>& before,
+        const EnvironmentalHazeSettings& after, std::string* error = nullptr);
+    bool ReplayEnvironmentalHaze(IDemoScene& scene, const EnvironmentalHazeEdit& edit, bool redo, std::string& error);
+    static size_t EnvironmentalHazeEditPayloadBytes(const EnvironmentalHazeEdit& edit);
+    std::string m_environmentalHazeStatus;
     bool CommitObjectMistEmitter(IDemoScene& scene, const SceneObjectMetadata& selection,
         const std::optional<MistEmitterComponent>& before, const std::optional<MistEmitterComponent>& after);
     static size_t MistEmitterEditPayloadBytes(const MistEmitterEdit& edit);
@@ -1185,7 +1272,7 @@ private:
     std::optional<MistEmitterComponent> m_mistEmitterInspectedValue;
     std::uint64_t m_mistEmitterInspectionEpoch = 0;
     // Drafts of the Inspector's numeric fields, in MistEmitterControls.cpp's field order.
-    std::array<float, 15> m_mistEmitterDragDrafts{};
+    std::array<float, 24> m_mistEmitterDragDrafts{};
     std::map<std::uint64_t, MistEmitterStatus> m_mistEmitterStatus;
     std::string m_mistEmitterEditStatus;
     std::uint64_t m_mistEmitterControlsRevision = 0;
@@ -1196,6 +1283,7 @@ private:
     // (AirMotorControls.cpp).
     std::array<float, 18> m_airMotorDragDrafts{};
     std::map<std::uint64_t, AirMotorEmissionStatus> m_airMotorEmission;
+    std::uint32_t m_airStepCount = 0;
     std::string m_airMotorEditStatus;
     std::uint64_t m_airMotorControlsRevision = 0;
     void DrawObjectLightControls(IDemoScene& scene);
@@ -1681,7 +1769,8 @@ private:
         std::unique_ptr<MaterialBindingsEdit>, std::unique_ptr<CameraEdit>, std::unique_ptr<LightEdit>,
         std::unique_ptr<ScriptEdit>, std::unique_ptr<AudioComponentsEdit>, std::unique_ptr<AcousticSettingsEdit>, std::unique_ptr<ProbeVolumeEdit>,
         std::unique_ptr<VoxelSettingsEdit>, std::unique_ptr<VoxelBakeEdit>, std::unique_ptr<AirMotorEdit>, std::unique_ptr<MistEmitterEdit>,
-        std::unique_ptr<MistRenderingEdit>>;
+        std::unique_ptr<MistRenderingEdit>, std::unique_ptr<AirEnvironmentEdit>, std::unique_ptr<EnvironmentalHazeEdit>,
+        std::unique_ptr<AirSimulationEdit>>;
     struct SceneHistoryEntry
     {
         SceneHistoryCommand command;

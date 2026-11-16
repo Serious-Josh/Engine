@@ -187,15 +187,30 @@ public:
     bool IsAwake() const;
     bool HasContact() const;
     BodyType GetType() const;
+    // The registered solid shape's collider type; throws for a shape-free host.
+    ColliderType GetColliderType() const;
     // Each shape query throws logic_error for a different collider type or shape-free host.
     BoxProperties GetBoxProperties() const;
     SphereProperties GetSphereProperties() const;
     CapsuleProperties GetCapsuleProperties() const;
     float GetMass() const;
     Vector3 GetWorldCenterOfMass() const;
-    // Teleports a Kinematic body (zero velocity is preserved). Intended for shape-free
-    // controller hosts between steps; throws for other body types or invalid poses.
+    // World-space velocities from Box3D: linear of the center of mass (m/s), angular (rad/s).
+    Vector3 GetLinearVelocity() const;
+    Vector3 GetAngularVelocity() const;
+    // Teleports a Kinematic body between steps (its velocity is kept): controller hosts and
+    // ScenePhysicsSession::TeleportKinematicBody. Throws for other body types or invalid poses.
     void SetKinematicPose(const Pose& pose);
+    // Kinematic motion for the next native step: sets the velocities that carry the body to
+    // the target over timeStep (b3Body_SetTargetTransform, shortest rotation arc), waking it
+    // first so that small motions are never dropped as sleepy. Box3D integrates the step, so
+    // the reached pose is close to the target, not exact. Throws for other body types.
+    void SetKinematicTarget(const Pose& target, float timeStep);
+    // Zero linear and angular velocity; the pose is unchanged. Throws for non-Kinematic bodies.
+    void StopKinematicMotion();
+    // AS.7 rigid-body scripting: sets a Dynamic body's world linear velocity (center of mass, m/s) between steps and
+    // wakes it; Box3D integrates it with gravity, contacts and damping from the next step. Throws for other body types.
+    void SetDynamicLinearVelocity(const Vector3& velocity);
 
 private:
     struct Impl;

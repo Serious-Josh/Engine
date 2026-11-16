@@ -18,7 +18,7 @@ A fundamental principle for Engine is 'what you see is what you get' (WYSIWYG). 
 - Box3D Physics Integration
 - AngelScript Integration
 - FMOD Audio Engine
-    - SteamAudio Support (WIP)
+    - SteamAudio Support
 
 Future goals listed here:
 

@@ -1,4 +1,5 @@
 #include "Scene/SceneSwitchTiming.h"
+#include "Debug/MemoryRegistry.h"
 #include "Renderer/ProjectTextureLoader.h"
 #include "Renderer/DescriptorHeap.h"
 #include "Renderer/ResourceUploader.h"
@@ -370,6 +371,8 @@ PreparedTextureUpload::RecordResult PreparedTextureUpload::Record(ID3D12Device* 
     ID3D12GraphicsCommandList* commands, std::uint64_t generation, unsigned int slot,
     size_t availableStaging, std::string& error)
 {
+    const MemoryCategoryScope memoryScope(MemoryCategory::MeshesTextures);
+
     error.clear();
 
     if(m_state != State::Queued || m_cancelled || !device || !commands || generation == 0 || !Validate(m_prepared))
@@ -453,6 +456,8 @@ PreparedTextureUpload::RecordResult PreparedTextureUpload::Record(ID3D12Device* 
         {
             throw std::runtime_error("Cannot allocate texture upload staging.");
         }
+
+        MemoryRegistry::TrackResource(m_staging);
 
         void* mapped = nullptr;
         D3D12_RANGE readRange{0, 0};

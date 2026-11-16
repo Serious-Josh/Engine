@@ -161,6 +161,24 @@ RenderingConfiguration ResolveRenderingConfiguration(const RenderingSettings& se
     configuration.lightingMode = mode;
     configuration.toneMapOperator = ToToneMapOperator(settings.toneMapper);
 
+    // R1.3: the fog pass is mode-independent, so its settings reach every frame unchanged.
+    switch(settings.volumetrics.quality)
+    {
+    case ProjectVolumetricQuality::Low:
+        configuration.volumetricQuality = AirMistQuality::Low;
+        break;
+    case ProjectVolumetricQuality::High:
+        configuration.volumetricQuality = AirMistQuality::High;
+        break;
+    case ProjectVolumetricQuality::Medium:
+    default:
+        configuration.volumetricQuality = AirMistQuality::Medium;
+        break;
+    }
+
+    configuration.volumetricResolutionBasis = settings.volumetrics.resolutionBasis == ProjectVolumetricResolutionBasis::Output ?
+        AirMistResolutionBasis::Output : AirMistResolutionBasis::Internal;
+
     // The Legacy values reach every frame, as before; the renderer applies them to Legacy lighting only.
     configuration.reflectionDenoiser = ToReflectionDenoiser(settings.legacy.reflectionDenoiser);
     configuration.contributionLimiter = settings.legacy.contributionLimiter;

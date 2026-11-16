@@ -1,4 +1,5 @@
 #include "Scene/SceneSwitchTiming.h"
+#include "Debug/MemoryRegistry.h"
 #include "Scene/PreparedScene.h"
 #include "Scene/FileSceneAssetCatalog.h"
 #include "Scene/MaterialParameterPropagation.h"
@@ -614,6 +615,8 @@ bool FileSceneAssetCatalog::Initialize(
     {
         return false;
     }
+
+    const MemoryCategoryScope memoryScope(MemoryCategory::MeshesTextures);
 
     // Clear any resources left by an earlier failed initialization.
     // The caller must ensure no GPU work references those resources.
@@ -1767,6 +1770,8 @@ FileSceneAssetCatalog::StaticSourceAdmissionStatus FileSceneAssetCatalog::Config
 Mesh* FileSceneAssetCatalog::CreateProjectMesh(const ProjectMeshCPUCache::Key& key,
     std::shared_ptr<const ImportedMesh> prepared, std::shared_ptr<const CookedMeshResidencyEvidence> cooked)
 {
+    const MemoryCategoryScope memoryScope(MemoryCategory::MeshesTextures);
+
     auto asset = std::make_unique<MeshAsset>();
     asset->geometry = std::move(prepared);
     asset->cooked = std::move(cooked);

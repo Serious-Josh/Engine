@@ -1,4 +1,5 @@
 #include "NrdPreparePass.h"
+#include "Debug/MemoryRegistry.h"
 
 #include "Renderer/DescriptorHeap.h"
 #include "Renderer/GraphicsDevice.h"
@@ -15,6 +16,8 @@ bool NrdPreparePass::Initialize(
     unsigned int height,
     Signal signal)
 {
+    const MemoryCategoryScope memoryScope(MemoryCategory::DenoisersUpscaling);
+
     m_signal = signal;
 
     ShaderDescription shaderDescription{};
@@ -269,6 +272,8 @@ bool NrdPreparePass::CreateTextures(
     unsigned int width,
     unsigned int height)
 {
+    const MemoryCategoryScope memoryScope(MemoryCategory::DenoisersUpscaling);
+
     ID3D12Device* device = graphicsDevice.GetDevice();
 
     if (!m_viewZTexture.Initialize(device, width, height, 1, 1, DXGI_FORMAT_R32_FLOAT,

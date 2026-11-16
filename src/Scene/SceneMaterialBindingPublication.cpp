@@ -1,4 +1,5 @@
 #include "assets/CookedScene.h"
+#include "Debug/MemoryRegistry.h"
 #include "Scene/SceneMaterialBindingPublication.h"
 
 #include "Scene/FileSceneAssetCatalog.h"

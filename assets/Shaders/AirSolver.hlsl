@@ -11,7 +11,8 @@
 //      is plain trilinear, as before D2. Otherwise each corner contributes one piece, never a blend of two: the piece a straight
 //      path from the point enters it by, else the piece reachable through linked pieces of the 8 cells (fewest links, then nearest
 //      sub-cell, then piece 0), else nothing; the weights left are renormalized. Outside the window reads the ambient velocity.
-//      With no corner left, the piece keeps its own velocity;
+//      With no corner left, the piece keeps its own velocity. AIR.4F.1b: the weights are evaluated at the end moved back by the piece's
+//      anchor offset from its cell centre (AirSampleState), so a still partial piece keeps its own state;
 //   3. damping toward the ambient velocity: v = a + (v - a) * dampingFactor;
 //   4. AIR.3 motors at the anchor: each motor whose region holds it, and whose emission geometry sees the piece (its visibility
 //      bit, CSMotorVisibility), adds its acceleration * dt (scaled by its falloff); Moving motors pull the air towards their own
@@ -67,8 +68,16 @@ cbuffer AirSolverConstants : register(b0)
     uint splitArgumentsIndex;
     // AIR.4D D2.1: the shaped emitters' lattice states, AirSampleWordsPerMotor words per visibility slot (writable view).
     uint emissionSamplesIndex;
-    uint constantsPadding;
+    // AIR.4F F4.5.1b: exp(-timeStep / relaxation time), the share of ΔT kept per step (1: no relaxation).
+    float temperatureFactor;
 };
+
+// The transported ΔT after the step's relaxation toward the ambient, bounded and finite (a non-finite value becomes the ambient).
+float RelaxTemperature(float temperature)
+{
+    const float relaxed = temperature * temperatureFactor;
+    return isfinite(relaxed) ? clamp(relaxed, AirMinimumTemperature, AirMaximumTemperature) : 0.0;
+}
 
 // Matches GpuAirMotor (AirField.cpp) and AirMotorType (AirMotorComponent.h).
 struct AirMotor
@@ -682,16 +691,18 @@ float3 DriveAndCap(float3 world, int3 cell, uint piece, float3 velocity)
     return velocity;
 }
 
-// One piece's new velocity (steps 1 to 5 above).
-float3 StepPiece(int3 cell, uint64_t mask, uint piece)
+// One piece's new state (steps 1 to 5 above): velocity, and (AIR.4F F4.5.1b) ΔT carried by the same sample and relaxed. The
+// temperature never acts on the velocity.
+float4 StepPiece(int3 cell, uint64_t mask, uint piece)
 {
     const float3 anchor = AirPieceAnchor(mask);
-    const float3 current = AirPieceVelocity(Path(), cell, piece);
+    const float4 current = AirPieceState(Path(), cell, piece);
     const float3 start = float3(cell - field.minimum) + anchor;
-    const float3 displacement = AirBacktraceDisplacement(current, timeStep, field.inverseCellSize);
+    const float3 displacement = AirBacktraceDisplacement(current.xyz, timeStep, field.inverseCellSize);
 
     const AirPathEnd from = AirBacktrace(Path(), cell, mask, piece, start, displacement);
-    float3 velocity = AirSampleVelocity(Path(), from, current);
+    const float4 sampled = AirSampleState(Path(), from, anchor - 0.5, current);
+    float3 velocity = sampled.xyz;
 
     velocity = ambientVelocity + (velocity - ambientVelocity) * dampingFactor;
     velocity = DriveAndCap((float3(cell) + anchor) * field.cellSize, cell, piece, velocity);
@@ -707,7 +718,7 @@ float3 StepPiece(int3 cell, uint64_t mask, uint piece)
         }
     }
 
-    return velocity;
+    return float4(velocity, RelaxTemperature(sampled.w));
 }
 
 // Both pieces of a cell, the full path, written to the output buffers.
@@ -719,10 +730,10 @@ void StepCell(uint3 slot)
     const uint address = AirVelocityAddress(field, slot);
     const AirCell own = AirLoadCell(Path(), cell);
 
-    const float3 velocity0 = own.piece0 != 0 ? StepPiece(cell, own.piece0, 0) : float3(0.0, 0.0, 0.0);
-    const float3 velocity1 = own.piece1 != 0 ? StepPiece(cell, own.piece1, 1) : float3(0.0, 0.0, 0.0);
-    output0.Store4(address, asuint(float4(velocity0, 0.0)));
-    output1.Store4(address, asuint(float4(velocity1, 0.0)));
+    const float4 state0 = own.piece0 != 0 ? StepPiece(cell, own.piece0, 0) : float4(0.0, 0.0, 0.0, 0.0);
+    const float4 state1 = own.piece1 != 0 ? StepPiece(cell, own.piece1, 1) : float4(0.0, 0.0, 0.0, 0.0);
+    output0.Store4(address, asuint(state0));
+    output1.Store4(address, asuint(state1));
 }
 
 // The two-pass step. CSStepOpen settles every cell whose whole step meets only open cells: it is one whole piece, its backtrace
@@ -745,18 +756,21 @@ void CSStepOpen(uint3 slot : SV_DispatchThreadID)
     const int3 cell = AirCellOfSlot(field, slot);
     bool settled = false;
     float3 velocity = float3(0.0, 0.0, 0.0);
+    float temperature = 0.0;
 
     if(AirCellIsOpen(Path(), cell))
     {
-        const float3 current = AirPieceVelocity(Path(), cell, 0);
+        const float4 current = AirPieceState(Path(), cell, 0);
         const float3 start = float3(cell - field.minimum) + 0.5;
-        const float3 end = start + AirBacktraceDisplacement(current, timeStep, field.inverseCellSize);
+        const float3 end = start + AirBacktraceDisplacement(current.xyz, timeStep, field.inverseCellSize);
         const float3 shifted = end - 0.5;
         const int3 base = int3(floor(shifted));
 
         if(AirOpenBacktrace(Path(), start, end) && AirCornersOpen(Path(), base))
         {
-            velocity = AirSampleOpen(Path(), base, shifted - float3(base), current);
+            const float4 sampled = AirSampleStateOpen(Path(), base, shifted - float3(base), current);
+            velocity = sampled.xyz;
+            temperature = RelaxTemperature(sampled.w);
             velocity = ambientVelocity + (velocity - ambientVelocity) * dampingFactor;
             velocity = DriveAndCap((float3(cell) + 0.5) * field.cellSize, cell, 0, velocity);
             settled = true;
@@ -776,7 +790,7 @@ void CSStepOpen(uint3 slot : SV_DispatchThreadID)
         RWByteAddressBuffer output0 = ResourceDescriptorHeap[NonUniformResourceIndex(velocityWriteIndex)];
         RWByteAddressBuffer output1 = ResourceDescriptorHeap[NonUniformResourceIndex(piece1WriteIndex)];
         const uint address = AirVelocityAddress(field, slot);
-        output0.Store4(address, asuint(float4(velocity, 0.0)));
+        output0.Store4(address, asuint(float4(velocity, temperature)));
         output1.Store4(address, asuint(float4(0.0, 0.0, 0.0, 0.0)));
         return;
     }

@@ -1,4 +1,5 @@
 #include "EditorIcons.h"
+#include "Debug/MemoryRegistry.h"
 #include "SvgIconRasterizer.h"
 #include "Renderer/DescriptorHeap.h"
 #include "Renderer/ResourceUploader.h"
@@ -8,6 +9,8 @@
 
 void EditorIcons::Initialize(ID3D12Device* device, DescriptorHeap& heap, const std::filesystem::path& directory)
 {
+    const MemoryCategoryScope memoryScope(MemoryCategory::Editor);
+
     // Reinitialization is permitted only after the owner has drained the previous device.
     Shutdown();
     constexpr std::array names{"box.svg", "camera.svg", "file.svg", "folder.svg", "lightbulb.svg",

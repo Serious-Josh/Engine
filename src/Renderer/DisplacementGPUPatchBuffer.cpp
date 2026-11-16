@@ -1,4 +1,5 @@
 #include "DisplacementGPUPatchBuffer.h"
+#include "Debug/MemoryRegistry.h"
 
 #include "Renderer/DescriptorHeap.h"
 #include "Renderer/ResourceUploader.h"
@@ -20,6 +21,8 @@ bool DisplacementGPUPatchBuffer::Initialize(
     {
         return false;
     }
+
+    const MemoryCategoryScope memoryScope(MemoryCategory::MeshesTextures);
 
     constexpr std::uint64_t patchStride = sizeof(DisplacementGPUPatch);
 
@@ -74,6 +77,8 @@ bool DisplacementGPUPatchBuffer::PreparePersistentStorage(
     {
         return false;
     }
+
+    const MemoryCategoryScope memoryScope(MemoryCategory::MeshesTextures);
 
     const size_t capacityBytes = patchCapacity * sizeof(DisplacementGPUPatch);
 

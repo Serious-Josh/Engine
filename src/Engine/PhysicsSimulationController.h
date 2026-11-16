@@ -4,6 +4,7 @@
 #include "Scene/FileSceneRuntime.h"
 
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <thread>
 
@@ -76,6 +77,37 @@ public:
     bool SetCharacterYaw(std::uint64_t sessionGeneration, std::string_view objectID, float yaw, std::string& error);
     std::optional<float> GetCharacterYaw(std::string_view objectID) const;
 
+    // AIR.4F.3 P1 forwards (see ScenePhysicsSession), with the same thread, state and
+    // session-generation checks as movement. Teleport and participation take effect between
+    // steps and are captured at once, so the next publication shows them without a step.
+    bool SubmitKinematicTarget(std::uint64_t sessionGeneration, std::string_view objectID, std::uint64_t fixedStep,
+        const Physics::Pose& target, std::string& error);
+    bool TeleportKinematicBody(std::uint64_t sessionGeneration, std::string_view objectID, const Physics::Pose& pose,
+        std::string& error);
+    bool SetMovingSolidParticipation(std::uint64_t sessionGeneration, std::string_view objectID, bool participates,
+        std::string& error);
+    // Every Dynamic and Kinematic body of the session starts participating (one publication capture for all).
+    bool SetAllMovableBodiesParticipating(std::uint64_t sessionGeneration, std::string& error);
+    // R1.5: the Dynamic and Kinematic bodies the authored policy admits start participating (ResolveMovingSolidParticipation on
+    // the document the session registered, by stable object ID; one publication capture). Bodies it does not admit are left as
+    // they are. `participants` receives the admitted object IDs in object-ID order.
+    bool ApplyMovingSolidParticipationPolicy(std::uint64_t sessionGeneration, std::vector<std::string>& participants, std::string& error);
+
+    // AS.7 rigid-body scripting (see ScenePhysicsSession), with the same thread, state and session-generation checks as
+    // movement. Velocities take effect from the next fixed step; queries read the state after the last completed step.
+    bool SetBodyLinearVelocity(std::uint64_t sessionGeneration, std::string_view objectID, const Vector3& velocity, std::string& error);
+    std::optional<Vector3> GetBodyLinearVelocity(std::uint64_t sessionGeneration, std::string_view objectID) const;
+    bool AreObjectsTouching(std::uint64_t sessionGeneration, std::string_view objectA, std::string_view objectB) const;
+
+    // Moving solids describing exactly the currently presented poses (never a newer, unpublished
+    // step); null unless Active. The snapshot is immutable and value-owned: a holder may keep it
+    // and read it on any thread after Stop or replacement. Compare its session generation and
+    // each entry's motion epoch to detect that a held snapshot belongs to an earlier session.
+    std::shared_ptr<const Physics::MovingSolidSnapshot> GetPublishedMovingSolids() const noexcept
+    {
+        return m_state == State::Active ? m_publishedMovingSolids : nullptr;
+    }
+
     // Number of fixed steps the next Update(elapsedSeconds) will run, from the same due-tick
     // arithmetic and per-Update cap; 0 when inactive or for input Update would reject. Lets a
     // caller address exactly the steps a frame will execute (CM.9 diagnostic drive).
@@ -127,6 +159,10 @@ private:
     // PredictStepsForUpdate so prediction can never diverge from execution.
     static std::size_t ConsumeDueTicks(double& accumulatedTicks, std::size_t maximumSteps) noexcept;
     Physics::CharacterDiagnosticsFrame CaptureCharacterDiagnostics() const;
+    std::shared_ptr<const Physics::MovingSolidSnapshot> CaptureMovingSolids(std::uint64_t sessionGeneration) const;
+    // After a between-steps change: captures poses, diagnostics and moving solids for the next publication.
+    bool CaptureForNextPublication(std::string& error);
+    bool CheckCommandSession(std::uint64_t sessionGeneration, const char* operation, std::string& error) const;
 
     const std::thread::id m_ownerThread = std::this_thread::get_id();
     const std::size_t m_maximumStepsPerUpdate;
@@ -148,4 +184,7 @@ private:
     // Captured with each snapshot; promoted to published only when that snapshot publishes.
     std::optional<Physics::CharacterDiagnosticsFrame> m_pendingCharacterDiagnostics;
     std::optional<Physics::CharacterDiagnosticsFrame> m_publishedCharacterDiagnostics;
+    // Captured and promoted exactly like the character diagnostics.
+    std::shared_ptr<const Physics::MovingSolidSnapshot> m_pendingMovingSolids;
+    std::shared_ptr<const Physics::MovingSolidSnapshot> m_publishedMovingSolids;
 };

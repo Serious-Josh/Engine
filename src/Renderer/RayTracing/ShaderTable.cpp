@@ -1,4 +1,5 @@
 #include "ShaderTable.h"
+#include "Debug/MemoryRegistry.h"
 #include "Core/Log.h"
 
 #include <algorithm>
@@ -73,6 +74,8 @@ bool ShaderTable::Initialize(
         m_recordSize = 0;
         return false;
     }
+
+    MemoryRegistry::TrackResource(m_resource);
 
     void* mappedData = nullptr;
 

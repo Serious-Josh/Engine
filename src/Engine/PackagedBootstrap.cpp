@@ -4,6 +4,7 @@
 #include "Renderer/MaterialTables/MaterialTableFile.h"
 #include "assets/EngineAssetPak.h"
 #include "Core/Log.h"
+#include <cstring>
 #include <stdexcept>
 #include <fstream>
 namespace PackagedBootstrap
@@ -40,6 +41,60 @@ std::vector<std::byte> ReadBundledMaterialTables(const std::filesystem::path& sh
         !MaterialTables::ValidateBundledMaterialTables(bytes, tables, &error))
     {
         throw std::runtime_error("Bundled material tables cannot be packaged: " + error);
+    }
+
+    return bytes;
+}
+
+AssetID MistNoiseID(MistNoise noise)
+{
+    switch(noise)
+    {
+    case MistNoise::Worley:
+        return *AssetID::Parse("00000000-0000-0000-0000-000000000039");
+    case MistNoise::Curl:
+        return *AssetID::Parse("00000000-0000-0000-0000-00000000003a");
+    case MistNoise::Filaments:
+        break;
+    }
+
+    return *AssetID::Parse("00000000-0000-0000-0000-00000000003b");
+}
+
+const char* MistNoiseFileName(MistNoise noise)
+{
+    switch(noise)
+    {
+    case MistNoise::Worley:
+        return "MistWorley64.dds";
+    case MistNoise::Curl:
+        return "MistCurl64.dds";
+    case MistNoise::Filaments:
+        break;
+    }
+
+    return "MistFilaments128.dds";
+}
+
+std::vector<std::byte> ReadBundledMistNoise(const std::filesystem::path& shaderRoot, MistNoise noise)
+{
+    const std::filesystem::path path = shaderRoot.parent_path() / "Textures" / "Air" / MistNoiseFileName(noise);
+    std::error_code error;
+    const std::uintmax_t size = std::filesystem::file_size(path, error);
+
+    if(error || size < 4 || size > MaximumMistNoiseBytes)
+    {
+        throw std::runtime_error("AIR mist noise " + path.generic_string() + " cannot be packaged: it is missing or larger than " +
+            std::to_string(MaximumMistNoiseBytes) + " bytes.");
+    }
+
+    std::vector<std::byte> bytes(static_cast<std::size_t>(size));
+    std::ifstream file(path, std::ios::binary);
+
+    if(!file.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size())) ||
+        std::memcmp(bytes.data(), "DDS ", 4) != 0)
+    {
+        throw std::runtime_error("AIR mist noise " + path.generic_string() + " cannot be packaged: it does not read as a DDS file.");
     }
 
     return bytes;

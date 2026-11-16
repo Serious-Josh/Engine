@@ -1,4 +1,5 @@
 #include "StructuredBuffer.h"
+#include "Debug/MemoryRegistry.h"
 #include "DescriptorHeap.h"
 #include "ResourceUploader.h"
 
@@ -34,7 +35,11 @@ bool StructuredBuffer::InitializeReadOnlyUpload(ID3D12Device* device, const void
     description.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     if(FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &description,
         D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&m_resource))))
+    {
         return false;
+    }
+
+    MemoryRegistry::TrackResource(m_resource);
 
     void* mapped = nullptr;
     const D3D12_RANGE readRange{0, 0};
@@ -117,6 +122,8 @@ bool StructuredBuffer::InitializeStorage(ID3D12Device* device, size_t elementSiz
     {
         return false;
     }
+
+    MemoryRegistry::TrackResource(m_resource);
 
     m_descriptorIndex = descriptorHeap.Allocate();
 

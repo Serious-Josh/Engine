@@ -1,4 +1,5 @@
 #include "NrdHistoryConfidencePass.h"
+#include "Debug/MemoryRegistry.h"
 
 #include "Core/Log.h"
 #include "Renderer/DescriptorHeap.h"
@@ -45,6 +46,8 @@ bool NrdHistoryConfidencePass::Initialize(GraphicsDevice& graphicsDevice, Shader
     {
         return m_initialized;
     }
+
+    const MemoryCategoryScope memoryScope(MemoryCategory::DenoisersUpscaling);
 
     // The probe pass: b0 probe constants, b1 scene lights, b2 RTXDI constants, t0 the TLAS, and the path tracer's
     // environment sampler at s1 (RayTracingPipeline.cpp: linear, U wraps, V clamps).
@@ -93,6 +96,8 @@ bool NrdHistoryConfidencePass::EnsureResources(
     unsigned int height,
     bool& recreated)
 {
+    const MemoryCategoryScope memoryScope(MemoryCategory::DenoisersUpscaling);
+
     recreated = false;
 
     if(HasResources() && m_width == width && m_height == height)

@@ -22,7 +22,7 @@ struct MistEmitterNumericField
 };
 
 // Order matches Editor::m_mistEmitterDragDrafts. Drag speeds only; ValidateMistEmitterComponent is the sole value contract.
-constexpr std::array<MistEmitterNumericField, 15> kMistEmitterFields{{
+constexpr std::array<MistEmitterNumericField, 24> kMistEmitterFields{{
     {"Emission Origin X (m)", 0.02f},
     {"Emission Origin Y (m)", 0.02f},
     {"Emission Origin Z (m)", 0.02f},
@@ -37,7 +37,16 @@ constexpr std::array<MistEmitterNumericField, 15> kMistEmitterFields{{
     {"Colour R", 0.01f},
     {"Colour G", 0.01f},
     {"Colour B", 0.01f},
-    {"Density", 0.02f}
+    {"Density", 0.02f},
+    {"Temperature (K from ambient)", 1.0f},
+    {"Emission Rate (density x m^3/s)", 0.05f},
+    {"Jet Speed (m/s)", 0.1f},
+    {"Temperature Response (1/s)", 0.1f},
+    {"Target Density", 0.01f},
+    {"Replenishment Rate (1/s)", 0.01f},
+    {"Fill Height (m)", 0.02f},
+    {"Edge Softness (m)", 0.01f},
+    {"Volume Temperature Response (1/s)", 0.01f}
 }};
 
 enum MistEmitterFieldIndex : std::size_t
@@ -56,7 +65,16 @@ enum MistEmitterFieldIndex : std::size_t
     ColorRField,
     ColorGField,
     ColorBField,
-    DensityField
+    DensityField,
+    TemperatureField,
+    EmissionRateField,
+    JetSpeedField,
+    TemperatureResponseField,
+    TargetDensityField,
+    ReplenishmentField,
+    FillHeightField,
+    EdgeSoftnessField,
+    VolumeTemperatureResponseField
 };
 
 constexpr float kRadiansPerDegree = 0.0174532925f;
@@ -93,8 +111,26 @@ float& FieldOf(MistEmitterComponent& emitter, std::size_t field)
         return emitter.color.y;
     case ColorBField:
         return emitter.color.z;
-    default:
+    case DensityField:
         return emitter.density;
+    case EmissionRateField:
+        return emitter.emissionRate;
+    case JetSpeedField:
+        return emitter.jetSpeed;
+    case TemperatureResponseField:
+        return emitter.temperatureResponseRate;
+    case TargetDensityField:
+        return emitter.targetDensity;
+    case ReplenishmentField:
+        return emitter.replenishmentRate;
+    case FillHeightField:
+        return emitter.fillHeight;
+    case EdgeSoftnessField:
+        return emitter.edgeSoftness;
+    case VolumeTemperatureResponseField:
+        return emitter.volumeTemperatureRate;
+    default:
+        return emitter.temperature;
     }
 }
 
@@ -111,17 +147,35 @@ float StoredValue(std::size_t field, float shown)
     return kMistEmitterFields[field].degrees ? shown * kRadiansPerDegree : shown;
 }
 
-// Every field is kept for both shapes, so switching shape never discards values; only the shape's own size is shown.
-bool IsFieldShown(MistEmitterShape shape, std::size_t field)
+// Every field is kept for both shapes and both modes, so switching never discards values; only the shape's own size and the mode's
+// own fields are shown. AIR.4F.2b: a Point emitter has a radius but no shape, and its emission rotation aims its jet.
+bool IsFieldShown(const MistEmitterComponent& emitter, std::size_t field)
 {
+    const bool point = emitter.mode == MistEmitterMode::Point;
+    const bool volume = emitter.mode == MistEmitterMode::Volume;
+    const bool legacy = !point && !volume;
+
     switch(field)
     {
     case RadiusField:
-        return shape == MistEmitterShape::Sphere;
+        return point || (legacy && emitter.shape == MistEmitterShape::Sphere);
     case HalfExtentXField:
     case HalfExtentYField:
     case HalfExtentZField:
-        return shape == MistEmitterShape::Box;
+        return volume || (legacy && emitter.shape == MistEmitterShape::Box);
+    case RateField:
+    case DensityField:
+        return legacy;
+    case EmissionRateField:
+    case JetSpeedField:
+    case TemperatureResponseField:
+        return point;
+    case TargetDensityField:
+    case ReplenishmentField:
+    case FillHeightField:
+    case EdgeSoftnessField:
+    case VolumeTemperatureResponseField:
+        return volume;
     default:
         return true;
     }
@@ -152,7 +206,16 @@ std::string StatusText(const MistEmitterStatus& status, bool& warning)
         return "The origin is in open air, but no fluid piece in the shape is in its straight line of sight: nothing is emitted.";
     }
 
-    return "Emitting into " + std::to_string(status.pieces) + " fluid pieces in the origin's line of sight.";
+    std::string text = "Emitting into " + std::to_string(status.pieces) + " fluid pieces in the origin's line of sight.";
+
+    // AIR.4F.2b: a Point footprint crossing the window's edge loses that share (it is not moved inside).
+    if(status.outsideShare > 0.0005f)
+    {
+        text += " " + std::to_string(static_cast<int>(std::lround(status.outsideShare * 100.0f))) +
+            "% of the emission falls outside the air window and is lost.";
+    }
+
+    return text;
 }
 }
 
@@ -377,10 +440,25 @@ void Editor::DrawObjectMistEmitterControls(IDemoScene& scene)
         CommitObjectMistEmitter(scene, *selection, object.mistEmitter, edited);
     }
 
+    // AIR.4F.2b: switching mode keeps every value. A switch the new mode cannot accept (a Legacy radius above Point's 2 m) is rejected
+    // by validation like any other edit, never clamped.
+    const char* modeNames[] = {"Legacy", "Point", "Volume"};
+    int modeIndex = static_cast<int>(emitter.mode);
+
+    if(ImGui::Combo("Mode", &modeIndex, modeNames, IM_ARRAYSIZE(modeNames)) && !blocked && modeIndex != static_cast<int>(emitter.mode))
+    {
+        auto edited = emitter;
+        edited.mode = static_cast<MistEmitterMode>(modeIndex);
+        CommitObjectMistEmitter(scene, *selection, object.mistEmitter, edited);
+    }
+
+    const bool point = emitter.mode == MistEmitterMode::Point;
+    const bool volume = emitter.mode == MistEmitterMode::Volume;
     const char* shapeNames[] = {"Sphere", "Box"};
     int shapeIndex = static_cast<int>(emitter.shape);
 
-    if(ImGui::Combo("Shape", &shapeIndex, shapeNames, IM_ARRAYSIZE(shapeNames)) && !blocked && shapeIndex != static_cast<int>(emitter.shape))
+    if(!point && !volume && ImGui::Combo("Shape", &shapeIndex, shapeNames, IM_ARRAYSIZE(shapeNames)) && !blocked &&
+        shapeIndex != static_cast<int>(emitter.shape))
     {
         auto edited = emitter;
         edited.shape = static_cast<MistEmitterShape>(shapeIndex);
@@ -389,7 +467,7 @@ void Editor::DrawObjectMistEmitterControls(IDemoScene& scene)
 
     for(std::size_t field = 0; field < kMistEmitterFields.size(); ++field)
     {
-        if(!IsFieldShown(emitter.shape, field))
+        if(!IsFieldShown(emitter, field))
         {
             continue;
         }
@@ -420,8 +498,45 @@ void Editor::DrawObjectMistEmitterControls(IDemoScene& scene)
     }
 
     ImGui::EndDisabled();
-    ImGui::TextWrapped("%s", emitter.enabled ? "Adds mist (density = rate x density per second, in its colour) to air inside the shape "
-        "that the emission origin sees in a straight line; solid geometry is never crossed." : "Disabled: emits no mist.");
+
+    if(!emitter.enabled)
+    {
+        ImGui::TextWrapped("Disabled: emits no mist.");
+    }
+    else if(volume)
+    {
+        ImGui::TextWrapped("Keeps the box's air at the target density (a concentration, not a rate), in its colour: wherever mist is "
+            "thinner than the target it is replenished at the replenishment rate; it is never removed, so mist leaves and enters freely. "
+            "The target fills the box from its bottom to the fill height, fading over the edge softness inside the sides and below the "
+            "fill height's top. The temperature, independent of the density, moves the air inside toward it at its own response.");
+    }
+    else if(point)
+    {
+        ImGui::TextWrapped("Adds the emission rate's quantity of mist per second, in its colour, whatever the radius: the radius spreads it "
+            "over a smooth footprint around the emission origin, within the air the origin sees in a straight line, so a small point is "
+            "dense and a large one thin. Solid geometry is never crossed. The temperature heats or cools the footprint; a jet speed "
+            "above 0 blows air along the emission rotation's +Z axis (the arrow) through an Air Motor slot.");
+
+        if(emitter.radius < MistEmitterComponent::MinimumPointFootprint)
+        {
+            ImGui::TextDisabled("Radii below 0.25 m deposit over a 0.25 m footprint (half an air cell).");
+        }
+
+        // AIR.4F.2d.4 Stage 1: a jet needs the projection to carry its air (and mist) beyond the nozzle. Read from the displayed setting
+        // every frame, so it appears and clears as the projection, the jet speed, the mode or Enabled change.
+        if(MistEmitterJetNeedsProjectionWarning(emitter, GetDisplayedAirSimulation(scene).pressureProjection))
+        {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.7f, 0.25f, 1.0f));
+            ImGui::TextWrapped("Pressure projection is off (Air window, Pressure): the jet's air stops at the nozzle, so its mist does not "
+                "travel as a jet and most of it is lost there. Enable pressure projection for accurate jet transport.");
+            ImGui::PopStyleColor();
+        }
+    }
+    else
+    {
+        ImGui::TextWrapped("Adds mist (density = rate x density per second, in its colour) to air inside the shape that the emission "
+            "origin sees in a straight line; solid geometry is never crossed.");
+    }
 
     if(emitter.enabled)
     {
@@ -430,6 +545,20 @@ void Editor::DrawObjectMistEmitterControls(IDemoScene& scene)
         if(status == m_mistEmitterStatus.end())
         {
             ImGui::TextDisabled("Emission check: needs Simulate air, the emitter in the air window, and at most 32 emitters.");
+        }
+        else if(volume)
+        {
+            // AIR.4F.2c: the origin's state means nothing for a volume; only the pieces inside it matter.
+            if(status->second.pieces == 0)
+            {
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.7f, 0.25f, 1.0f));
+                ImGui::TextWrapped("No fluid piece of the air window lies in the volume's profile: it maintains nothing.");
+                ImGui::PopStyleColor();
+            }
+            else
+            {
+                ImGui::TextDisabled("Maintaining mist in %u fluid pieces.", status->second.pieces);
+            }
         }
         else
         {
@@ -445,6 +574,15 @@ void Editor::DrawObjectMistEmitterControls(IDemoScene& scene)
             else
             {
                 ImGui::TextDisabled("%s", text.c_str());
+            }
+
+            // AIR.4F.2b: a jet without a motor slot is reported, never dropped silently.
+            if(point && emitter.jetSpeed > 0.0f && status->second.jetWithoutCapacity)
+            {
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.7f, 0.25f, 1.0f));
+                ImGui::TextWrapped("The jet found all 64 Air Motor slots taken (Air Motor components come first): it moves no air. Mist is "
+                    "still emitted. Disable Air Motors or other jets to free a slot.");
+                ImGui::PopStyleColor();
             }
         }
     }

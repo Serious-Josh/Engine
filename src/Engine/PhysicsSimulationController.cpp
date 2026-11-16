@@ -1,12 +1,15 @@
 #include "Engine/PhysicsSimulationController.h"
+#include "Scene/MovingSolidParticipants.h"
 #include "Scene/SceneDocumentAdapter.h"
 
 #include <chrono>
 #include <cmath>
 #include <limits>
 #include <stdexcept>
+#include <algorithm>
 #include <utility>
 #include <type_traits>
+#include <vector>
 
 namespace
 {
@@ -91,6 +94,15 @@ PhysicsSimulationController::Result PhysicsSimulationController::Start(FileScene
         initialFrame.completedSteps = 0;
         initialFrame.controllers = session->CaptureCharacterDiagnostics();
         std::optional<Physics::CharacterDiagnosticsFrame> initialDiagnostics(std::move(initialFrame));
+        std::string movingSolidError;
+        auto initialMovingSolids = session->CaptureMovingSolids(m_sessionGeneration + 1, &movingSolidError);
+
+        if(!initialMovingSolids)
+        {
+            return {Status::Failed, 0, movingSolidError};
+        }
+
+        auto publishedMovingSolids = std::make_shared<const Physics::MovingSolidSnapshot>(std::move(*initialMovingSolids));
         PhysicsPresentationLease lease;
         static_assert(std::is_nothrow_swappable_v<decltype(m_registeredDocument)>);
         static_assert(std::is_nothrow_swappable_v<decltype(m_association)>);
@@ -110,6 +122,8 @@ PhysicsSimulationController::Result PhysicsSimulationController::Start(FileScene
         // Initial diagnostics describe the new session at step zero. Their allocations
         // precede publication, so a capture failure cannot leave a partially started owner.
         m_publishedCharacterDiagnostics.swap(initialDiagnostics);
+        m_pendingMovingSolids.reset();
+        m_publishedMovingSolids = std::move(publishedMovingSolids);
         m_accumulatedTicks = 0.0;
         m_totalSteps = 0;
         m_lastUpdateSteps = 0;
@@ -226,6 +240,7 @@ PhysicsSimulationController::Result PhysicsSimulationController::Update(
             }
             m_snapshot.swap(snapshot);
             m_pendingCharacterDiagnostics = CaptureCharacterDiagnostics();
+            m_pendingMovingSolids = CaptureMovingSolids(m_sessionGeneration);
             m_pendingPresentation = true;
             m_lastFrameTiming.updateCapture = ElapsedMilliseconds(captureStart);
         }
@@ -278,6 +293,11 @@ PhysicsSimulationController::Result PhysicsSimulationController::PublishAtBounda
             {
                 m_publishedCharacterDiagnostics.swap(m_pendingCharacterDiagnostics);
                 m_pendingCharacterDiagnostics.reset();
+            }
+
+            if(m_pendingMovingSolids)
+            {
+                m_publishedMovingSolids = std::move(m_pendingMovingSolids);
             }
         }
         return {Status::Published};
@@ -345,17 +365,7 @@ bool PhysicsSimulationController::SetCharacterYaw(std::uint64_t sessionGeneratio
     }
 
     // The rotated pose is presented at the next publication boundary, with or without a step.
-    auto snapshot = m_session->CapturePoses(&error);
-
-    if(!snapshot)
-    {
-        return false;
-    }
-
-    m_snapshot.swap(snapshot);
-    m_pendingCharacterDiagnostics = CaptureCharacterDiagnostics();
-    m_pendingPresentation = true;
-    return true;
+    return CaptureForNextPublication(error);
 }
 
 std::optional<float> PhysicsSimulationController::GetCharacterYaw(std::string_view objectID) const
@@ -408,10 +418,201 @@ Physics::CharacterDiagnosticsFrame PhysicsSimulationController::CaptureCharacter
     return frame;
 }
 
+std::shared_ptr<const Physics::MovingSolidSnapshot> PhysicsSimulationController::CaptureMovingSolids(
+    std::uint64_t sessionGeneration) const
+{
+    std::string error;
+    auto snapshot = m_session->CaptureMovingSolids(sessionGeneration, &error);
+
+    if(!snapshot)
+    {
+        throw std::runtime_error(error);
+    }
+
+    return std::make_shared<const Physics::MovingSolidSnapshot>(std::move(*snapshot));
+}
+
+bool PhysicsSimulationController::CaptureForNextPublication(std::string& error)
+{
+    auto snapshot = m_session->CapturePoses(&error);
+
+    if(!snapshot)
+    {
+        return false;
+    }
+
+    auto movingSolids = m_session->CaptureMovingSolids(m_sessionGeneration, &error);
+
+    if(!movingSolids)
+    {
+        return false;
+    }
+
+    m_snapshot.swap(snapshot);
+    m_pendingCharacterDiagnostics = CaptureCharacterDiagnostics();
+    m_pendingMovingSolids = std::make_shared<const Physics::MovingSolidSnapshot>(std::move(*movingSolids));
+    m_pendingPresentation = true;
+    return true;
+}
+
+bool PhysicsSimulationController::CheckCommandSession(std::uint64_t sessionGeneration, const char* operation,
+    std::string& error) const
+{
+    if(!IsOwningThread() || m_state != State::Active || !m_session)
+    {
+        error = std::string(operation) + " requires the owning thread and an active simulation.";
+        return false;
+    }
+
+    if(sessionGeneration == 0 || sessionGeneration != m_sessionGeneration)
+    {
+        error = std::string(operation) + " belongs to a stopped or replaced simulation session.";
+        return false;
+    }
+
+    return true;
+}
+
+bool PhysicsSimulationController::SubmitKinematicTarget(std::uint64_t sessionGeneration, std::string_view objectID,
+    std::uint64_t fixedStep, const Physics::Pose& target, std::string& error)
+{
+    if(!CheckCommandSession(sessionGeneration, "Kinematic motion", error))
+    {
+        return false;
+    }
+
+    return m_session->SubmitKinematicTarget(objectID, fixedStep, target, &error);
+}
+
+bool PhysicsSimulationController::TeleportKinematicBody(std::uint64_t sessionGeneration, std::string_view objectID,
+    const Physics::Pose& pose, std::string& error)
+{
+    if(!CheckCommandSession(sessionGeneration, "Kinematic teleport", error))
+    {
+        return false;
+    }
+
+    if(!m_session->TeleportKinematicBody(objectID, pose, &error))
+    {
+        return false;
+    }
+
+    return CaptureForNextPublication(error);
+}
+
+bool PhysicsSimulationController::SetBodyLinearVelocity(std::uint64_t sessionGeneration, std::string_view objectID,
+    const Vector3& velocity, std::string& error)
+{
+    if(!CheckCommandSession(sessionGeneration, "Rigid-body velocity", error))
+    {
+        return false;
+    }
+
+    return m_session->SetBodyLinearVelocity(objectID, velocity, &error);
+}
+
+std::optional<Vector3> PhysicsSimulationController::GetBodyLinearVelocity(std::uint64_t sessionGeneration,
+    std::string_view objectID) const
+{
+    if(!IsOwningThread() || m_state != State::Active || !m_session || sessionGeneration != m_sessionGeneration)
+    {
+        return std::nullopt;
+    }
+
+    return m_session->GetBodyLinearVelocity(objectID);
+}
+
+bool PhysicsSimulationController::AreObjectsTouching(std::uint64_t sessionGeneration, std::string_view objectA,
+    std::string_view objectB) const
+{
+    return IsOwningThread() && m_state == State::Active && m_session && sessionGeneration == m_sessionGeneration &&
+        m_session->AreObjectsTouching(objectA, objectB);
+}
+
+bool PhysicsSimulationController::SetAllMovableBodiesParticipating(std::uint64_t sessionGeneration, std::string& error)
+{
+    if(!CheckCommandSession(sessionGeneration, "Moving-solid participation", error))
+    {
+        return false;
+    }
+
+    for(const std::string& objectID : m_session->GetMovableBodyIDs())
+    {
+        if(!m_session->SetMovingSolidParticipation(objectID, true, &error))
+        {
+            return false;
+        }
+    }
+
+    return CaptureForNextPublication(error);
+}
+
+bool PhysicsSimulationController::ApplyMovingSolidParticipationPolicy(std::uint64_t sessionGeneration,
+    std::vector<std::string>& participants, std::string& error)
+{
+    participants.clear();
+
+    if(!CheckCommandSession(sessionGeneration, "Moving-solid participation", error))
+    {
+        return false;
+    }
+
+    if(!m_registeredDocument)
+    {
+        error = "Moving-solid participation requires the session's registered scene.";
+        return false;
+    }
+
+    // The shared rule, asked with the feature on (the caller applies it only while the scene's moving solids are enabled), on the
+    // document this session registered. Every admitted body must be one of the session's movable bodies: the rule never admits a
+    // Static body, and every Dynamic or Kinematic PhysicsComponent is registered.
+    AirSimulationSettings enabled;
+    enabled.enabled = true;
+    enabled.movingSolids = true;
+    const std::vector<std::string> admitted = ResolveMovingSolidParticipants(*m_registeredDocument, enabled);
+    const std::vector<std::string> movable = m_session->GetMovableBodyIDs();
+
+    for(const std::string& objectID : admitted)
+    {
+        if(!std::binary_search(movable.begin(), movable.end(), objectID))
+        {
+            error = "Moving-solid participant " + objectID + " is not a movable body of the session.";
+            return false;
+        }
+
+        if(!m_session->SetMovingSolidParticipation(objectID, true, &error))
+        {
+            return false;
+        }
+
+        participants.push_back(objectID);
+    }
+
+    return CaptureForNextPublication(error);
+}
+
+bool PhysicsSimulationController::SetMovingSolidParticipation(std::uint64_t sessionGeneration, std::string_view objectID,
+    bool participates, std::string& error)
+{
+    if(!CheckCommandSession(sessionGeneration, "Moving-solid participation", error))
+    {
+        return false;
+    }
+
+    if(!m_session->SetMovingSolidParticipation(objectID, participates, &error))
+    {
+        return false;
+    }
+
+    return CaptureForNextPublication(error);
+}
+
 void PhysicsSimulationController::ReleaseSimulation() noexcept
 {
     m_pendingCharacterDiagnostics.reset();
     m_publishedCharacterDiagnostics.reset();
+    m_pendingMovingSolids.reset();
+    m_publishedMovingSolids.reset();
     m_session.reset();
     m_snapshot.reset();
     m_lastUpdateContactEvents.clear();

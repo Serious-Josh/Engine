@@ -1,4 +1,5 @@
 #include "SelectionMaskPass.h"
+#include "Debug/MemoryRegistry.h"
 
 #include "Core/Log.h"
 #include <cassert>
@@ -14,6 +15,8 @@ bool SelectionMaskPass::Initialize(
     {
         return false;
     }
+
+    const MemoryCategoryScope memoryScope(MemoryCategory::Editor);
 
     std::vector<LayoutAttribute> layout;
 

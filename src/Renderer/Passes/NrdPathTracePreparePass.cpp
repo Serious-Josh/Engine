@@ -1,4 +1,5 @@
 #include "NrdPathTracePreparePass.h"
+#include "Debug/MemoryRegistry.h"
 #include "Debug/TransitionTiming.h"
 
 #include "Core/Log.h"
@@ -104,6 +105,8 @@ bool NrdPathTracePreparePass::EnsureTextures(
     unsigned int height,
     bool reconstructions)
 {
+    const MemoryCategoryScope memoryScope(MemoryCategory::DenoisersUpscaling);
+
     TransitionTiming::Scope er1Scope("NrdPathTracePreparePass::EnsureTextures", 0.5);
     const bool hasReconstructions = m_reconstructedDiffuse.GetResource() != nullptr;
 

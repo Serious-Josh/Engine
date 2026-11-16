@@ -145,9 +145,16 @@ private:
         bool SetLocalRotation(std::uint32_t slot, const float (&rotation)[3], std::string& error) override;
         bool GetForward(std::uint32_t slot, float (&forward)[3]) const override;
         std::string GetObjectKey(std::uint32_t slot) const override;
+        bool HasRigidBody(std::uint32_t slot) const override;
+        bool GetRigidBodyVelocity(std::uint32_t slot, float (&velocity)[3]) const override;
+        bool SetRigidBodyVelocity(std::uint32_t slot, const float (&velocity)[3], std::string& error) override;
+        bool IsRigidBodyTouching(std::uint32_t slot, std::uint32_t other) const override;
+        bool FindObject(std::string_view name, std::uint32_t& slot) override;
 
     private:
         const SceneObjectDocument* Find(std::uint32_t slot) const;
+        // The slot of `objectID` in this session's table, added when new (false once the table is full).
+        bool SlotOf(const std::string& objectID, std::uint32_t& slot);
         std::optional<RenderObjectID> RuntimeIndex(std::uint32_t slot) const;
     };
 

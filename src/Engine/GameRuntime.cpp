@@ -117,6 +117,51 @@ bool GameRuntime::ObjectTable::GetPosition(std::uint32_t slot, float (&position)
     return true;
 }
 
+bool GameRuntime::ObjectTable::HasRigidBody(std::uint32_t slot) const
+{
+    // Bodies exist only in the live simulation the session started; Static bodies are not scriptable.
+    const auto* object = Find(slot);
+    return object && object->physics && object->physics->bodyType != Physics::BodyType::Static && owner && owner->IsActive();
+}
+
+bool GameRuntime::ObjectTable::GetRigidBodyVelocity(std::uint32_t slot, float (&velocity)[3]) const
+{
+    if(!HasRigidBody(slot))
+    {
+        return false;
+    }
+
+    const std::optional<Vector3> value = owner->m_physics.GetBodyLinearVelocity(owner->m_physicsSession, objectIDs[slot]);
+
+    if(!value)
+    {
+        return false;
+    }
+
+    velocity[0] = value->x;
+    velocity[1] = value->y;
+    velocity[2] = value->z;
+    return true;
+}
+
+bool GameRuntime::ObjectTable::SetRigidBodyVelocity(std::uint32_t slot, const float (&velocity)[3], std::string& error)
+{
+    if(!HasRigidBody(slot))
+    {
+        error = "RigidBody is not valid.";
+        return false;
+    }
+
+    return owner->m_physics.SetBodyLinearVelocity(owner->m_physicsSession, objectIDs[slot], {velocity[0], velocity[1], velocity[2]},
+        error);
+}
+
+bool GameRuntime::ObjectTable::IsRigidBodyTouching(std::uint32_t slot, std::uint32_t other) const
+{
+    return HasRigidBody(slot) && Find(other) != nullptr && owner->m_physics.AreObjectsTouching(owner->m_physicsSession,
+        objectIDs[slot], objectIDs[other]);
+}
+
 bool GameRuntime::ObjectTable::HasCharacterController(std::uint32_t slot) const
 {
     // Controllers exist only in the live simulation the session started.
@@ -259,11 +304,16 @@ bool GameRuntime::ObjectTable::FindChild(std::uint32_t slot, std::string_view na
         return false;
     }
 
-    const auto existing = std::find(objectIDs.begin(), objectIDs.end(), found->id);
+    return SlotOf(found->id, child);
+}
+
+bool GameRuntime::ObjectTable::SlotOf(const std::string& objectID, std::uint32_t& slot)
+{
+    const auto existing = std::find(objectIDs.begin(), objectIDs.end(), objectID);
 
     if(existing != objectIDs.end())
     {
-        child = static_cast<std::uint32_t>(existing - objectIDs.begin());
+        slot = static_cast<std::uint32_t>(existing - objectIDs.begin());
         return true;
     }
 
@@ -273,10 +323,23 @@ bool GameRuntime::ObjectTable::FindChild(std::uint32_t slot, std::string_view na
         return false;
     }
 
-    child = static_cast<std::uint32_t>(objectIDs.size());
-    objectIDs.push_back(found->id);
+    slot = static_cast<std::uint32_t>(objectIDs.size());
+    objectIDs.push_back(objectID);
     requests.emplace_back();
     return true;
+}
+
+bool GameRuntime::ObjectTable::FindObject(std::string_view name, std::uint32_t& slot)
+{
+    if(!runtime || runtime->GetRuntimeIdentity() != runtimeIdentity)
+    {
+        return false;
+    }
+
+    // The first object with that exact name, in document order.
+    const auto& objects = runtime->GetFileScene().GetDocument().objects;
+    const auto found = std::find_if(objects.begin(), objects.end(), [&](const SceneObjectDocument& object) { return object.name == name; });
+    return found != objects.end() && SlotOf(found->id, slot);
 }
 
 bool GameRuntime::ObjectTable::GetLocalRotation(std::uint32_t slot, float (&rotation)[3]) const

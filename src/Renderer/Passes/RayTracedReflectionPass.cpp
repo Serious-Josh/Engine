@@ -1,4 +1,5 @@
 #include "RayTracedReflectionPass.h"
+#include "Debug/MemoryRegistry.h"
 
 #include "Core/Log.h"
 #include "Renderer/DescriptorHeap.h"
@@ -16,6 +17,8 @@ bool RayTracedReflectionPass::Initialize(
     {
         return false;
     }
+
+    const MemoryCategoryScope memoryScope(MemoryCategory::LegacyRayTracing);
 
     ID3D12Device* device = graphicsDevice.GetDevice();
 
@@ -161,6 +164,8 @@ bool RayTracedReflectionPass::Resize(
     {
         return false;
     }
+
+    const MemoryCategoryScope memoryScope(MemoryCategory::LegacyRayTracing);
 
     m_rawReflectionTexture.Shutdown();
 

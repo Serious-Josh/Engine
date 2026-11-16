@@ -1,4 +1,5 @@
 #include "Texture.h"
+#include "Debug/MemoryRegistry.h"
 #include "DescriptorHeap.h"
 #include "Core/Log.h"
 
@@ -107,6 +108,8 @@ bool Texture::Initialize(
         return false;
     }
 
+    MemoryRegistry::TrackResource(m_resource);
+
     m_subresourceStates.assign(1, D3D12_RESOURCE_STATE_COPY_DEST);
 
     m_width = width;
@@ -179,6 +182,8 @@ bool Texture::Initialize(
 
         return false;
     }
+
+    MemoryRegistry::TrackResource(m_resource);
 
     const unsigned int subresourceCount = arraySize * mipLevels;
 

@@ -81,6 +81,12 @@ class Buffer
         ID3D12GraphicsCommandList* commandList,
         D3D12_RESOURCE_STATES newState);
 
+    // The transition to `newState` as a barrier for the caller to submit (in the same command list, before any use in the new state),
+    // tracked as done; false, with `barrier` untouched, when the buffer is already there.
+    bool PrepareTransition(
+        D3D12_RESOURCE_STATES newState,
+        D3D12_RESOURCE_BARRIER& barrier);
+
     unsigned int GetDescriptorIndex() const;
     unsigned int GetUAVDescriptorIndex() const;
 

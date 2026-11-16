@@ -233,6 +233,9 @@ void WritePhysicsComponent(Writer& writer, const std::optional<Physics::PhysicsC
 
     // v6 appends the contact-event opt-in as a u32 flag (0 or 1); earlier fields keep their offsets.
     writer.WriteUnsigned(component->generateContactEvents ? 1 : 0, 4);
+
+    // V37 (R1.5) appends the AIR participation as a u32 (0 Automatic, 1 Always, 2 Never); earlier fields keep their offsets.
+    writer.WriteUnsigned(static_cast<std::uint32_t>(component->airParticipation), 4);
 }
 
 std::optional<Physics::PhysicsComponent> ReadPhysicsComponent(Reader& reader, std::uint32_t version)
@@ -310,6 +313,14 @@ std::optional<Physics::PhysicsComponent> ReadPhysicsComponent(Reader& reader, st
         const auto generateContactEvents = reader.ReadUnsigned(4);
         Require(generateContactEvents <= 1, "Invalid cooked physics contact-event flag.");
         component.generateContactEvents = generateContactEvents == 1;
+    }
+
+    // Before V37 every body reads Automatic; any V37 value other than 0, 1 or 2 is malformed.
+    if(version >= MovingSolidParticipationVersion)
+    {
+        const auto participation = reader.ReadUnsigned(4);
+        Require(participation <= 2, "Invalid cooked physics AIR participation.");
+        component.airParticipation = static_cast<Physics::MovingSolidParticipation>(participation);
     }
 
     std::string error;
@@ -823,7 +834,329 @@ void ReadAirMotor(Reader& reader, std::optional<AirMotorComponent>& motor, std::
 }
 
 // V28 Mist Emitter: u32 present; then u32 enabled, u32 shape, 3 x f32 emission origin, 3 x f32 emission rotation, f32 radius,
-// 3 x f32 half extents, f32 rate, 3 x f32 colour, f32 density (68 bytes).
+// 3 x f32 half extents, f32 rate, 3 x f32 colour, f32 density (68 bytes); from V29, f32 temperature (72 bytes). From V30 (AIR.4F.2b):
+// u32 mode, u32 n, then n x f32 mode fields: emission rate, jet speed, (AIR.4F.2b.1) temperature response rate, and (AIR.4F.2c) target
+// density, replenishment rate, fill height, edge softness and volume temperature rate (n = 8). The count lets AIR.4F.2c append its Volume fields
+// within V30: a reader takes the fields it knows, defaults any a shorter list lacks, and skips the rest.
+// V30: the mode fields this writer stores, and the most a reader accepts (room for AIR.4F.2c's Volume fields).
+constexpr std::uint32_t MistEmitterModeFieldCount = 8;
+constexpr std::uint32_t MaximumMistEmitterModeFields = 64;
+
+// V31 environmental haze: u32 present; then u32 enabled, f32 attenuation distance, 3 x f32 colour, f32 near distance, f32 near
+// transition (32 bytes). V32 appends f32 ambient contribution (36 bytes); a V31 haze reads ambient 0. V33 appends u32 height bounds,
+// f32 base height, f32 max height, f32 height transition (52 bytes); earlier hazes read the bounds off.
+void WriteEnvironmentalHaze(Writer& writer, const std::optional<EnvironmentalHazeSettings>& haze)
+{
+    writer.WriteUnsigned(haze.has_value() ? 1 : 0, 4);
+
+    if(!haze)
+    {
+        return;
+    }
+
+    writer.WriteUnsigned(haze->enabled ? 1 : 0, 4);
+    writer.WriteFloat(haze->attenuationDistance);
+
+    for(const float channel : haze->color)
+    {
+        writer.WriteFloat(channel);
+    }
+
+    writer.WriteFloat(haze->nearDistance);
+    writer.WriteFloat(haze->nearTransition);
+    writer.WriteFloat(haze->ambient);
+    writer.WriteUnsigned(haze->heightBounds ? 1 : 0, 4);
+    writer.WriteFloat(haze->baseHeight);
+    writer.WriteFloat(haze->maxHeight);
+    writer.WriteFloat(haze->heightTransition);
+}
+
+void ReadEnvironmentalHaze(Reader& reader, std::uint32_t payloadVersion, std::optional<EnvironmentalHazeSettings>& haze)
+{
+    const std::uint32_t present = static_cast<std::uint32_t>(reader.ReadUnsigned(4));
+    Require(present <= 1, "Invalid environmental haze presence.");
+
+    if(present == 0)
+    {
+        haze.reset();
+        return;
+    }
+
+    EnvironmentalHazeSettings value;
+    const std::uint32_t enabled = static_cast<std::uint32_t>(reader.ReadUnsigned(4));
+    Require(enabled <= 1, "Invalid environmental haze enabled flag.");
+    value.enabled = enabled == 1;
+    value.attenuationDistance = reader.ReadFloat();
+
+    for(float& channel : value.color)
+    {
+        channel = reader.ReadFloat();
+    }
+
+    value.nearDistance = reader.ReadFloat();
+    value.nearTransition = reader.ReadFloat();
+    value.ambient = payloadVersion >= HazeAmbientVersion ? reader.ReadFloat() : 0.0f;
+
+    if(payloadVersion >= HazeHeightVersion)
+    {
+        const std::uint32_t bounded = static_cast<std::uint32_t>(reader.ReadUnsigned(4));
+        Require(bounded <= 1, "Invalid environmental haze height bounds flag.");
+        value.heightBounds = bounded == 1;
+        value.baseHeight = reader.ReadFloat();
+        value.maxHeight = reader.ReadFloat();
+        value.heightTransition = reader.ReadFloat();
+    }
+    std::string error;
+    Require(ValidateEnvironmentalHazeSettings(value, &error), error.c_str());
+    haze = value;
+}
+
+// V34 (R1.1) air configuration, after the haze: u32 environment present; if so f32 ambient temperature, f32 relaxation time. Then u32
+// simulation present; if so u32 enabled, u32 pressure projection, u32 buoyancy, f32 buoyancy gravity, u32 maximum steps per frame,
+// 3 x f32 ambient velocity, f32 damping rate, f32 maximum motor speed, f32 mist dissipation rate (48 bytes).
+void WriteAirConfiguration(Writer& writer, const std::optional<AirEnvironmentSettings>& environment,
+    const std::optional<AirSimulationSettings>& simulation)
+{
+    writer.WriteUnsigned(environment.has_value() ? 1 : 0, 4);
+
+    if(environment)
+    {
+        writer.WriteFloat(environment->ambientTemperature);
+        writer.WriteFloat(environment->relaxationTime);
+    }
+
+    writer.WriteUnsigned(simulation.has_value() ? 1 : 0, 4);
+
+    if(!simulation)
+    {
+        return;
+    }
+
+    writer.WriteUnsigned(simulation->enabled ? 1 : 0, 4);
+    writer.WriteUnsigned(simulation->pressureProjection ? 1 : 0, 4);
+    writer.WriteUnsigned(simulation->buoyancy ? 1 : 0, 4);
+    writer.WriteFloat(simulation->buoyancyGravity);
+    writer.WriteUnsigned(static_cast<std::uint32_t>(simulation->maximumStepsPerFrame), 4);
+    writer.WriteFloat(simulation->ambientVelocity.x);
+    writer.WriteFloat(simulation->ambientVelocity.y);
+    writer.WriteFloat(simulation->ambientVelocity.z);
+    writer.WriteFloat(simulation->dampingRate);
+    writer.WriteFloat(simulation->maximumMotorSpeed);
+    writer.WriteFloat(simulation->mistDissipationRate);
+}
+
+void ReadAirConfiguration(Reader& reader, std::optional<AirEnvironmentSettings>& environment, std::optional<AirSimulationSettings>& simulation)
+{
+    const auto readFlag = [&](const char* message)
+    {
+        const std::uint32_t flag = static_cast<std::uint32_t>(reader.ReadUnsigned(4));
+        Require(flag <= 1, message);
+        return flag == 1;
+    };
+    std::string error;
+
+    environment.reset();
+
+    if(readFlag("Invalid air environment presence."))
+    {
+        AirEnvironmentSettings value;
+        value.ambientTemperature = reader.ReadFloat();
+        value.relaxationTime = reader.ReadFloat();
+        Require(ValidateAirEnvironmentSettings(value, &error), error.c_str());
+        environment = value;
+    }
+
+    simulation.reset();
+
+    if(!readFlag("Invalid AIR simulation presence."))
+    {
+        return;
+    }
+
+    AirSimulationSettings value;
+    value.enabled = readFlag("Invalid AIR simulation enabled flag.");
+    value.pressureProjection = readFlag("Invalid AIR pressure projection flag.");
+    value.buoyancy = readFlag("Invalid AIR buoyancy flag.");
+    value.buoyancyGravity = reader.ReadFloat();
+    const std::uint32_t steps = static_cast<std::uint32_t>(reader.ReadUnsigned(4));
+    value.maximumStepsPerFrame = steps == 1 || steps == 2 ? static_cast<int>(steps) : 0;
+    value.ambientVelocity.x = reader.ReadFloat();
+    value.ambientVelocity.y = reader.ReadFloat();
+    value.ambientVelocity.z = reader.ReadFloat();
+    value.dampingRate = reader.ReadFloat();
+    value.maximumMotorSpeed = reader.ReadFloat();
+    value.mistDissipationRate = reader.ReadFloat();
+    Require(ValidateAirSimulationSettings(value, &error), error.c_str());
+    simulation = value;
+}
+
+// V35 (R1.3) mist appearance, after the air configuration: u32 present; if so, in MistRenderSettings' declaration order, f32 opacity;
+// u32 detail, f32 strength, f32 scale; u32 curl, f32 strength, f32 scale, f32 flow; u32 wisps, f32 strength, f32 scale; u32 density
+// detail, f32 strength; u32 lighting, u32 sun shadows, f32 scattering, f32 anisotropy, f32 ambient, 3 x f32 tint, f32 multiple
+// scattering, f32 indirect scattering; f32 near distance, f32 near transition (all 23 fields, 25 values: 100 bytes after the presence
+// word).
+void WriteMistRendering(Writer& writer, const std::optional<MistRenderSettings>& mist)
+{
+    writer.WriteUnsigned(mist.has_value() ? 1 : 0, 4);
+
+    if(!mist)
+    {
+        return;
+    }
+
+    const auto flag = [&](bool value)
+    {
+        writer.WriteUnsigned(value ? 1 : 0, 4);
+    };
+
+    writer.WriteFloat(mist->opacity);
+    flag(mist->detail);
+    writer.WriteFloat(mist->detailStrength);
+    writer.WriteFloat(mist->detailScale);
+    flag(mist->curl);
+    writer.WriteFloat(mist->curlStrength);
+    writer.WriteFloat(mist->curlScale);
+    writer.WriteFloat(mist->curlFlow);
+    flag(mist->wisps);
+    writer.WriteFloat(mist->wispStrength);
+    writer.WriteFloat(mist->wispScale);
+    flag(mist->densityDetail);
+    writer.WriteFloat(mist->densityDetailStrength);
+    flag(mist->lighting);
+    flag(mist->sunShadows);
+    writer.WriteFloat(mist->scattering);
+    writer.WriteFloat(mist->anisotropy);
+    writer.WriteFloat(mist->ambient);
+
+    for(const float channel : mist->scatteringTint)
+    {
+        writer.WriteFloat(channel);
+    }
+
+    writer.WriteFloat(mist->multipleScattering);
+    writer.WriteFloat(mist->indirectScattering);
+    writer.WriteFloat(mist->nearDistance);
+    writer.WriteFloat(mist->nearTransition);
+}
+
+// Strict, unlike a scene file's load (which sanitizes): a cook writes only validated documents, so anything else is corruption.
+void ReadMistRendering(Reader& reader, std::optional<MistRenderSettings>& mist)
+{
+    const auto flag = [&](const char* message)
+    {
+        const std::uint32_t value = static_cast<std::uint32_t>(reader.ReadUnsigned(4));
+        Require(value <= 1, message);
+        return value == 1;
+    };
+
+    mist.reset();
+
+    if(!flag("Invalid mist rendering presence."))
+    {
+        return;
+    }
+
+    MistRenderSettings value;
+    value.opacity = reader.ReadFloat();
+    value.detail = flag("Invalid mist detail flag.");
+    value.detailStrength = reader.ReadFloat();
+    value.detailScale = reader.ReadFloat();
+    value.curl = flag("Invalid mist curl flag.");
+    value.curlStrength = reader.ReadFloat();
+    value.curlScale = reader.ReadFloat();
+    value.curlFlow = reader.ReadFloat();
+    value.wisps = flag("Invalid mist wisps flag.");
+    value.wispStrength = reader.ReadFloat();
+    value.wispScale = reader.ReadFloat();
+    value.densityDetail = flag("Invalid mist density detail flag.");
+    value.densityDetailStrength = reader.ReadFloat();
+    value.lighting = flag("Invalid mist lighting flag.");
+    value.sunShadows = flag("Invalid mist sun shadows flag.");
+    value.scattering = reader.ReadFloat();
+    value.anisotropy = reader.ReadFloat();
+    value.ambient = reader.ReadFloat();
+
+    for(float& channel : value.scatteringTint)
+    {
+        channel = reader.ReadFloat();
+    }
+
+    value.multipleScattering = reader.ReadFloat();
+    value.indirectScattering = reader.ReadFloat();
+    value.nearDistance = reader.ReadFloat();
+    value.nearTransition = reader.ReadFloat();
+    Require(ValidateMistRenderSettings(value), "Invalid cooked mist rendering settings.");
+    mist = value;
+}
+
+// V36 (R1.4a) voxel bake, after the mist appearance: u32 present; if so, i32 base exponent, u32 bricks per region axis, u32 narrow
+// band, u32 coarse clamp, then the manifest reference as a string (empty for settings that were never baked). Only the authored
+// settings and the reference travel: residency and AIR state are rebuilt at runtime, and the manifest itself is an archive entry.
+void WriteVoxelBake(Writer& writer, const std::optional<VoxelBakeSettings>& bake)
+{
+    writer.WriteUnsigned(bake.has_value() ? 1 : 0, 4);
+
+    if(!bake)
+    {
+        return;
+    }
+
+    writer.WriteUnsigned(std::bit_cast<std::uint32_t>(bake->baseExponent), 4);
+    writer.WriteUnsigned(bake->regionBricks, 4);
+    writer.WriteUnsigned(bake->narrowBand, 4);
+    writer.WriteUnsigned(bake->coarseClamp, 4);
+    writer.WriteString(bake->manifestReference);
+}
+
+// Strict, like the mist appearance: the reference must be empty or a canonical asset reference, because the archive resolves the
+// manifest by exactly that identity.
+void ReadVoxelBake(Reader& reader, std::optional<VoxelBakeSettings>& bake)
+{
+    bake.reset();
+    const std::uint32_t present = static_cast<std::uint32_t>(reader.ReadUnsigned(4));
+    Require(present <= 1, "Invalid voxel bake presence.");
+
+    if(present == 0)
+    {
+        return;
+    }
+
+    VoxelBakeSettings value;
+    value.baseExponent = std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(reader.ReadUnsigned(4)));
+    value.regionBricks = static_cast<std::uint32_t>(reader.ReadUnsigned(4));
+    value.narrowBand = static_cast<std::uint32_t>(reader.ReadUnsigned(4));
+    value.coarseClamp = static_cast<std::uint32_t>(reader.ReadUnsigned(4));
+    value.manifestReference = reader.ReadString();
+    Require(ValidateVoxelBakeSettings(value), "Invalid cooked voxel bake settings.");
+
+    if(!value.manifestReference.empty())
+    {
+        const std::optional<AssetID> manifest = AssetID::ParseReference(value.manifestReference);
+        Require(manifest.has_value() && manifest->ToReference() == value.manifestReference, "Invalid cooked voxel manifest reference.");
+    }
+
+    bake = std::move(value);
+}
+
+// V37 (R1.5) AIR moving-solid enable, after the voxel bake: u32 0 or 1. Kept outside the V34 air configuration block so that block's
+// layout never changes; it belongs to airSimulation, so a scene without that block writes 0 and must read 0.
+void WriteMovingSolidSetting(Writer& writer, const std::optional<AirSimulationSettings>& simulation)
+{
+    writer.WriteUnsigned(simulation && simulation->movingSolids ? 1 : 0, 4);
+}
+
+void ReadMovingSolidSetting(Reader& reader, std::optional<AirSimulationSettings>& simulation)
+{
+    const std::uint32_t value = static_cast<std::uint32_t>(reader.ReadUnsigned(4));
+    Require(value <= 1, "Invalid cooked AIR moving-solid flag.");
+    Require(value == 0 || simulation.has_value(), "A cooked AIR moving-solid flag without an AIR simulation block.");
+
+    if(simulation)
+    {
+        simulation->movingSolids = value == 1;
+    }
+}
+
 void WriteMistEmitter(Writer& writer, const std::optional<MistEmitterComponent>& emitter)
 {
     writer.WriteUnsigned(emitter.has_value() ? 1 : 0, 4);
@@ -842,9 +1175,20 @@ void WriteMistEmitter(Writer& writer, const std::optional<MistEmitterComponent>&
     writer.WriteFloat(emitter->rate);
     writer.WriteVector(emitter->color);
     writer.WriteFloat(emitter->density);
+    writer.WriteFloat(emitter->temperature);
+    writer.WriteUnsigned(static_cast<std::uint32_t>(emitter->mode), 4);
+    writer.WriteUnsigned(MistEmitterModeFieldCount, 4);
+    writer.WriteFloat(emitter->emissionRate);
+    writer.WriteFloat(emitter->jetSpeed);
+    writer.WriteFloat(emitter->temperatureResponseRate);
+    writer.WriteFloat(emitter->targetDensity);
+    writer.WriteFloat(emitter->replenishmentRate);
+    writer.WriteFloat(emitter->fillHeight);
+    writer.WriteFloat(emitter->edgeSoftness);
+    writer.WriteFloat(emitter->volumeTemperatureRate);
 }
 
-void ReadMistEmitter(Reader& reader, std::optional<MistEmitterComponent>& emitter)
+void ReadMistEmitter(Reader& reader, std::optional<MistEmitterComponent>& emitter, std::uint32_t version)
 {
     const std::uint32_t present = static_cast<std::uint32_t>(reader.ReadUnsigned(4));
     Require(present <= 1, "Invalid Mist Emitter presence.");
@@ -867,6 +1211,31 @@ void ReadMistEmitter(Reader& reader, std::optional<MistEmitterComponent>& emitte
     value.rate = reader.ReadFloat();
     value.color = reader.ReadVector();
     value.density = reader.ReadFloat();
+    // Before V29 an emitter has no temperature: 0, no heating.
+    value.temperature = version >= MistEmitterTemperatureVersion ? reader.ReadFloat() : 0.0f;
+
+    // Before V30 an emitter is Legacy, with the defaults for the Point fields.
+    if(version >= MistEmitterModeVersion)
+    {
+        value.mode = static_cast<MistEmitterMode>(reader.ReadUnsigned(4));
+        const std::uint32_t fieldCount = static_cast<std::uint32_t>(reader.ReadUnsigned(4));
+        Require(fieldCount <= MaximumMistEmitterModeFields, "Invalid Mist Emitter mode field count.");
+
+        // In stored order; a shorter list leaves the rest at their defaults, and fields past these are skipped.
+        float* const fields[] = {&value.emissionRate, &value.jetSpeed, &value.temperatureResponseRate, &value.targetDensity,
+            &value.replenishmentRate, &value.fillHeight, &value.edgeSoftness, &value.volumeTemperatureRate};
+
+        for(std::uint32_t field = 0; field < fieldCount; ++field)
+        {
+            const float number = reader.ReadFloat();
+
+            if(field < std::size(fields))
+            {
+                *fields[field] = number;
+            }
+        }
+    }
+
     std::string error;
     Require(ValidateMistEmitterComponent(value, &error), error.c_str());
     emitter = value;
@@ -1094,6 +1463,11 @@ std::vector<std::byte> Encode(const Metadata& sceneMetadata, const Policy& polic
     writer.WriteFloat(document.lightingSettings.referenceEV100);
     writer.WriteFloat(document.lightingSettings.environmentLuminanceScale);
     WriteCameraExposure(writer, document.camera.exposure);
+    WriteEnvironmentalHaze(writer, document.environmentalHaze);
+    WriteAirConfiguration(writer, document.airEnvironment, document.airSimulation);
+    WriteMistRendering(writer, document.mistRendering);
+    WriteVoxelBake(writer, document.voxelBake);
+    WriteMovingSolidSetting(writer, document.airSimulation);
 
     for (size_t index = 0; index < document.objects.size(); ++index)
     {
@@ -1358,6 +1732,36 @@ Metadata Decode(std::span<const std::byte> bytes, const Policy& policy)
         document.lightingSettings.referenceEV100 = reader.ReadFloat();
         document.lightingSettings.environmentLuminanceScale = reader.ReadFloat();
         if(viewportExposure) document.camera.exposure = ReadCameraExposure(reader);
+
+        // AIR.4F.2d.3: before V31 a scene has no haze.
+        if(payloadVersion >= EnvironmentalHazeVersion)
+        {
+            ReadEnvironmentalHaze(reader, payloadVersion, document.environmentalHaze);
+        }
+
+        // R1.1: before V34 a scene has neither block, so it resolves to the defaults.
+        if(payloadVersion >= AirConfigurationVersion)
+        {
+            ReadAirConfiguration(reader, document.airEnvironment, document.airSimulation);
+        }
+
+        // R1.3: before V35 a scene has no cooked mist appearance (the defaults apply).
+        if(payloadVersion >= MistRenderingVersion)
+        {
+            ReadMistRendering(reader, document.mistRendering);
+        }
+
+        // R1.4a: before V36 a scene has no cooked voxel bake.
+        if(payloadVersion >= VoxelBakeVersion)
+        {
+            ReadVoxelBake(reader, document.voxelBake);
+        }
+
+        // R1.5: before V37 a scene's AIR block (if any) reads moving solids off.
+        if(payloadVersion >= MovingSolidParticipationVersion)
+        {
+            ReadMovingSolidSetting(reader, document.airSimulation);
+        }
     }
     else if(payloadVersion == ObjectLightingVersion)
     {
@@ -1566,7 +1970,7 @@ Metadata Decode(std::span<const std::byte> bytes, const Policy& policy)
         {
             try
             {
-                ReadMistEmitter(reader, object.mistEmitter);
+                ReadMistEmitter(reader, object.mistEmitter, payloadVersion);
             }
             catch(const std::exception& exception)
             {

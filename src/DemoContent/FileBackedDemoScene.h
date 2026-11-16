@@ -136,6 +136,13 @@ public:
     bool SetSceneVoxelBake(const std::optional<VoxelBakeSettings>& expected, const std::optional<VoxelBakeSettings>& replacement,
         std::string* errorMessage = nullptr);
     // AIR.4F F4.4.1.
+    bool SetSceneEnvironmentalHaze(const std::optional<EnvironmentalHazeSettings>& expected,
+        const std::optional<EnvironmentalHazeSettings>& replacement, std::string* errorMessage = nullptr);
+    bool SetSceneAirEnvironment(const std::optional<AirEnvironmentSettings>& expected, const std::optional<AirEnvironmentSettings>& replacement,
+        std::string* errorMessage = nullptr);
+    // R1.1.
+    bool SetSceneAirSimulation(const std::optional<AirSimulationSettings>& expected, const std::optional<AirSimulationSettings>& replacement,
+        std::string* errorMessage = nullptr);
     bool SetSceneMistRendering(const std::optional<MistRenderSettings>& expected, const std::optional<MistRenderSettings>& replacement,
         std::string* errorMessage = nullptr);
     bool SetObjectAudio(const SceneObjectMetadata& selection, const AudioComponentState& expected,
@@ -232,10 +239,13 @@ private:
     friend class ResidencyBatchVerification;
     friend class CausticVisibleVerification;
     friend class GamePlayGPUVerification;
+    friend class MemoryRegistryVerification;
+    friend class AirPackagedParityVerification;
     friend class ScriptWorkflowVerification;
     friend class VoxelEditorVerification;
     friend class VoxelOverlayVerification;
     friend class VoxelStreamingVerification;
+    friend class VoxelResidencyParityVerification;
     friend class AirMotorEditorVerification;
 #endif
     // Engine retains both runtimes until checked candidate initialization/cleanup.

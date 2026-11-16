@@ -1,5 +1,6 @@
 #include "Scene/MistEmitterComponent.h"
 
+#include <algorithm>
 #include <cmath>
 #include <string>
 
@@ -51,6 +52,50 @@ bool TryParseMistEmitterShape(std::string_view text, MistEmitterShape& shape) no
     }
 
     return false;
+}
+
+const char* MistEmitterModeName(MistEmitterMode mode) noexcept
+{
+    switch(mode)
+    {
+    case MistEmitterMode::Legacy:
+        return "Legacy";
+    case MistEmitterMode::Point:
+        return "Point";
+    case MistEmitterMode::Volume:
+        return "Volume";
+    }
+
+    return nullptr;
+}
+
+bool TryParseMistEmitterMode(std::string_view text, MistEmitterMode& mode) noexcept
+{
+    for(const MistEmitterMode candidate : {MistEmitterMode::Legacy, MistEmitterMode::Point, MistEmitterMode::Volume})
+    {
+        if(text == MistEmitterModeName(candidate))
+        {
+            mode = candidate;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+float MistEmitterPointFootprint(const MistEmitterComponent& emitter) noexcept
+{
+    return (std::max)(emitter.radius, MistEmitterComponent::MinimumPointFootprint);
+}
+
+float MistEmitterJetReach(const MistEmitterComponent& emitter) noexcept
+{
+    return (std::max)(MistEmitterPointFootprint(emitter), MistEmitterComponent::JetMinimumReach);
+}
+
+bool MistEmitterJetNeedsProjectionWarning(const MistEmitterComponent& emitter, bool pressureProjection) noexcept
+{
+    return !pressureProjection && emitter.enabled && emitter.mode == MistEmitterMode::Point && emitter.jetSpeed > 0.0f;
 }
 
 std::uint64_t MistEmitterTag(std::string_view objectID) noexcept
@@ -109,6 +154,54 @@ bool ValidateMistEmitterComponent(const MistEmitterComponent& emitter, std::stri
     if(!InRange(emitter.density, 0.0f, Limits::MaximumDensity))
     {
         return Fail(error, "Mist Emitter density must be finite, from 0 to 100.");
+    }
+
+    if(!InRange(emitter.temperature, Limits::MinimumTemperature, Limits::MaximumTemperature))
+    {
+        return Fail(error, "Mist Emitter temperature must be finite, from -200 K to +1000 K relative to the ambient.");
+    }
+
+    if(MistEmitterModeName(emitter.mode) == nullptr)
+    {
+        return Fail(error, "Mist Emitter mode must be Legacy, Point or Volume.");
+    }
+
+    if(!InRange(emitter.emissionRate, 0.0f, Limits::MaximumEmissionRate))
+    {
+        return Fail(error, "Mist Emitter emission rate must be finite, from 0 to 1000 density x m^3 per second.");
+    }
+
+    if(!InRange(emitter.jetSpeed, 0.0f, Limits::MaximumJetSpeed))
+    {
+        return Fail(error, "Mist Emitter jet speed must be finite, from 0 to 30 m/s.");
+    }
+
+    if(!InRange(emitter.temperatureResponseRate, Limits::MinimumTemperatureResponseRate, Limits::MaximumTemperatureResponseRate))
+    {
+        return Fail(error, "Mist Emitter temperature response rate must be finite, from 0.1 to 120 per second.");
+    }
+
+    if(!InRange(emitter.targetDensity, 0.0f, Limits::MaximumTargetDensity) ||
+        !InRange(emitter.replenishmentRate, 0.0f, Limits::MaximumReplenishmentRate))
+    {
+        return Fail(error, "Mist Emitter target density must be from 0 to 100 and replenishment rate from 0 to 60 per second.");
+    }
+
+    if(!InRange(emitter.fillHeight, Limits::MinimumFillHeight, Limits::MaximumFillHeight) ||
+        !InRange(emitter.edgeSoftness, 0.0f, Limits::MaximumEdgeSoftness))
+    {
+        return Fail(error, "Mist Emitter fill height must be from 0.05 to 512 m and edge softness from 0 to 64 m.");
+    }
+
+    if(!InRange(emitter.volumeTemperatureRate, 0.0f, Limits::MaximumVolumeTemperatureRate))
+    {
+        return Fail(error, "Mist Emitter volume temperature response must be finite, from 0 to 60 per second.");
+    }
+
+    // The Point limit applies only in Point mode, so a large Legacy sphere stays valid; the Inspector reports it on switching.
+    if(emitter.mode == MistEmitterMode::Point && emitter.radius > Limits::MaximumPointRadius)
+    {
+        return Fail(error, "A Point Mist Emitter's radius must be at most 2 m.");
     }
 
     return true;

@@ -130,6 +130,8 @@ class Engine
     friend class StartupSceneVerification;
     friend class CausticVisibleVerification;
     friend class GamePlayGPUVerification;
+    friend class AirPackagedParityVerification;
+    friend class MemoryRegistryVerification;
     friend class ScriptWorkflowVerification;
     friend class VoxelEditorVerification;
     friend class VoxelOverlayVerification;
@@ -138,9 +140,14 @@ class Engine
     friend class AirFieldVerification;
     friend class VoxelResidencyVerification;
     friend class VoxelQueryVerification;
+    friend class VoxelResidencyParityVerification;
     friend class ProjectSystemWorkflowVerification;
     friend class ProjectRelaunchVerification;
     void VerifyPackagedBootstrap();
+    // R1.4b: after VerifyPackagedBootstrap, with ENGINE_DIAG_PACKAGED_VOXEL_RESIDENCY naming the Editor run's digest file.
+    void VerifyPackagedVoxelResidency();
+    // R1.5b: with ENGINE_DIAG_PACKAGED_AIR naming the Editor run's AIR parity digest, before VerifyPackagedBootstrap.
+    void VerifyPackagedAirParity();
     void VerifyPackagedReflections();
     void VerifyPackagedProbes();
     void VerifyPackagedPathing();
@@ -297,6 +304,8 @@ class Engine
     AsyncWorkerActivity m_dxrLibraryActivity;
     AsyncWorkerActivity m_dxrPipelineActivity;
     PhysicsSimulationController m_physicsSimulation;
+    // AIR.4F.3 (diagnostic overlay): the physics session whose movable bodies were opted in as moving solids.
+    std::uint64_t m_movingSolidOptInGeneration = 0;
     // Shared by Editor Play and the packaged runtime; borrows m_physicsSimulation.
     GameRuntime m_gameRuntime{m_physicsSimulation};
     // The process's only FMOD Studio system (Audio.1A): started with the project-independent services, updated once
@@ -382,6 +391,12 @@ class Engine
     std::string m_packagedLightingReport;
     bool m_packagedFirstPathTraceImageLogged = false;
     void ReportPackagedLightingMode(double renderMilliseconds);
+    // R1.1: resolves the active archive scene's cooked AIR configuration into m_airConfiguration and reports, once per scene, that it
+    // requests simulation. R1.5b: the packaged frame then requests AIR when PreparePackagedAir initialized it.
+    void ResolvePackagedAirConfiguration(const FileBackedDemoScene& scene);
+    // R1.2b/R1.5b: the packaged frame's fog request: the haze, and the AIR mist while packaged AIR runs, both through the Original
+    // Raymarch (RestrictToPackagedVolumetrics); nullopt with neither.
+    std::optional<AirMistRenderRequest> BuildPackagedFogRequest(const FileBackedDemoScene& scene) const;
 
     // Checked insertion of one new authored object at the end of the scene, selected after
     // creation, as one history entry. prepareObject builds it from the captured document.
@@ -749,9 +764,80 @@ class Engine
     Editor m_editor;
     // VX.5: keeps the active scene's baked voxel regions near the camera resident on the GPU, for obstacle queries.
     VoxelResidencyController m_voxelResidency;
+    // R1.4b: feeds the controller for `scene` (or none): its runtime identity, its bake's manifest, and a store for the scene's
+    // source (the project's registered assets for a file scene, the activation's archive for an archive scene). Not admitted, or
+    // without a bake, the controller is told there is nothing (identity 0), which retires any residency and does no work.
+    // Returns the residency scene identity this frame used. Main thread, between frames, before Render.
+    std::uint64_t UpdateVoxelResidency(const FileBackedDemoScene* scene, bool admitted, const Vector3& camera);
+    // R1.4b: whether a packaged frame keeps `scene`'s bake resident: it has one and its cooked AIR configuration requests AIR (the
+    // only consumer), or the diagnostics override forces it. Logged once per scene runtime.
+    bool AdmitPackagedVoxelResidency(const FileBackedDemoScene& scene);
+    // R1.4b: the single AIR reset decision: a different scene starts from a fresh air field. R1.5b (decision D2): keyed by the active
+    // scene runtime's identity (0 for none), in the Editor and in packaged frames, so an unbaked scene (no residency) still resets.
+    // World-owned AIR will change this one place (reset on a world identity instead). R1.6: also keyed by the physics session generation
+    // (0 outside a session), which Editor Play and Physics Simulation share, so every Start and Stop begins from a fresh field too: a
+    // session never inherits the previous session's or the editing field's state, and editing never inherits a session's.
+    void FollowAirScene(std::uint64_t airScene, std::uint64_t physicsSession);
+    // R1.5b (verification only, never set otherwise): a fixed AIR frame delta for both the Editor's and packaged frames, so a parity run
+    // takes the same AIR steps in both. The AIR camera follows m_voxelResidencyCameraOverride as residency does.
+    std::optional<double> m_airDeltaOverrideForVerification;
+    // R1.5b (decision D4): when the packaged scene's cooked AIR configuration requests AIR, initializes it (Renderer::
+    // InitializePackagedAir, with the mist noise read from the archive) before the scene's first AIR frame. Once per scene runtime; a
+    // scene that does not request AIR initializes nothing.
+    void PreparePackagedAir(const FileBackedDemoScene& scene);
+    std::uint64_t m_packagedAirPreparedScene = 0;
+    Renderer::PackagedAirInitialization m_packagedAirInitialization;
+    // R1.5: the packaged scene runtime's cooked moving-solid participants (ResolveMovingSolidParticipants), for request-level parity.
+    std::uint64_t m_packagedMovingSolidScene = 0;
+    std::vector<std::string> m_packagedMovingSolidParticipants;
+    // R1.5b: the inputs of an AIR frame request that only the Editor provides. A packaged runtime passes the defaults: running, the mist
+    // running, no diagnostics, the production transport, and no diagnostic overrides.
+    struct AirRequestControls
+    {
+        bool paused = false;
+        bool mistPaused = false;
+        // The pressure solver's diagnostics (the Air window's divergence view).
+        bool pressureDiagnostics = false;
+        // AIR.4F.2d.4 diagnostics (ENGINE_AIR_CONSERVATIVE_MIST=0, ENGINE_AIR_MIST_SUBSTEPS): the Editor reads them; production keeps
+        // the conservative transport with adaptive substeps.
+        bool conservativeMistTransport = true;
+        std::uint32_t forcedMistSubsteps = 0;
+        // AIR.4F.3 diagnostic (ENGINE_AIR_MOVING_SOLIDS=1, Debug builds): overlay on and every movable body participating.
+        bool diagnosticMovingSolids = false;
+    };
+    // R1.5b: the one construction of an AIR frame request, shared by the Editor and packaged frames: the simulation and environment
+    // settings, the pressure projection and buoyancy, the mist and its transport, the scene's motors and emitters (captured from this
+    // frame's presented poses) and its moving solids. `scene` may be null (no motors, emitters or environment). Main thread, after
+    // physics publication, before Render.
+    void BuildAirFrameRequest(AirFrameRequest& request, const AirSimulationSettings& simulation, FileBackedDemoScene* scene,
+        const Vector3& camera, double deltaSeconds, const AirRequestControls& controls);
+    // R1.5: the frame's moving-solid overlay request (enable, participants and their poses) from `simulation` (this frame's resolved
+    // AIR configuration) and the physics snapshot presented this frame. Applies the participation policy once per physics session.
+    // Main thread, Editor frames, before Render.
+    void BuildAirMovingSolidRequest(AirMovingSolidRequest& request, const AirSimulationSettings& simulation, bool diagnosticOverlay);
+    // R1.4c: logs, once per admitted packaged scene runtime, how long its residency took to settle and what it holds; and at
+    // packaged shutdown, the totals with the AIR step count. Observation only: nothing here changes what residency does.
+    void ReportPackagedVoxelResidency(std::uint64_t residencyScene);
+    void ReportPackagedVoxelResidencyTotals() const;
+    std::uint64_t m_packagedResidencyReportScene = 0;
+    bool m_packagedResidencySettledReported = false;
+    std::chrono::steady_clock::time_point m_packagedResidencyStarted;
+    // R1.4b (diagnostics only, verification builds): ENGINE_DIAG_PACKAGED_VOXEL_RESIDENCY forces packaged residency without AIR.
+    bool m_packagedVoxelResidencyForced = false;
+    std::optional<std::uint64_t> m_packagedVoxelResidencyLoggedScene;
+    // R1.4b (verification only): a fixed residency camera, so Editor and packaged runs settle the same window. Never set otherwise.
+    std::optional<Vector3> m_voxelResidencyCameraOverride;
     // AIR.1: the air field request (disabled until the Editor's air controls exist) and the scene it belongs to.
     AirFrameRequest m_airRequest;
+    // R1.1: the AIR simulation configuration ResolveAirSimulation gave the latest frame, before the packaged restriction (a packaged
+    // runtime resolves its cooked settings but m_airRequest stays disabled).
+    AirSimulationSettings m_airConfiguration;
+    // R1.1: the scene runtime whose cooked AIR request the packaged restriction last reported (logged once per scene).
+    std::optional<std::uint64_t> m_packagedAirRestrictionLoggedScene;
+    // AIR.4F.2b: how many motors lacked a slot when that count was last logged.
+    std::size_t m_loggedMotorsWithoutCapacity = 0;
     std::uint64_t m_airScene = 0;
+    std::uint64_t m_airPhysicsSession = 0;
 
     std::optional<Editor::FileRequest> m_pendingEditorSceneOperation;
 

@@ -8,7 +8,9 @@
 #include "Renderer/Pipeline.h"
 #include "Renderer/VoxelResidencyResources.h"
 
+#include <cstddef>
 #include <cstdint>
+#include <deque>
 
 #include <d3d12.h>
 #include <wrl/client.h>
@@ -65,6 +67,53 @@ struct AirCellRequest
     Vector3 focus{0.0f, 0.0f, 0.0f};
 
     bool operator==(const AirCellRequest&) const = default;
+};
+
+// AIR.4F F4.5.1b.1: the Editor's temperature points (EditorAirTemperature.hlsl): one round point per fluid piece of the cell holding each
+// block's point (the vectors' anchor placement), coloured by the piece's ΔT. Always the whole window: at one-cell spacing, at most
+// 2 x 1,048,576 instances at the default size.
+struct AirTemperatureRequest
+{
+    // One block per world-aligned 2^spacingExponent cells on a side (0 to 3: 1 to 8 cells).
+    int spacingExponent = 1;
+    // Kelvin from the ambient at which the colour saturates (red above, blue below).
+    float displayRange = 100.0f;
+    // The point's diameter in pixels.
+    float pointPixels = 5.0f;
+
+    bool operator==(const AirTemperatureRequest&) const = default;
+};
+
+// AIR.4E.2: which divergence the Editor's divergence points show (AirDivergence.hlsli). AIR.4E.4: with the pressure projection on, every
+// measure describes the frame's last projected step.
+enum class AirDivergenceMeasure : std::uint32_t
+{
+    // The pressure operator's face fluxes. Projection on: the predicted face-flux divergence after the step's correction (minus the
+    // solver's residual). Off: the stored velocity's face fluxes (equal to Collocated).
+    Face = 0,
+    // The fluxes of the pieces' stored (collocated) velocities: what the solver and the mist consume. Projection on: the corrected
+    // velocity's, which keeps a measurable divergence (the approximate projection).
+    Collocated = 1,
+    // Projection on: the step's divergence before its correction (the solver's right-hand side, compatible in closed pockets). Off:
+    // equal to Collocated.
+    BeforeProjection = 2
+};
+
+// AIR.4E.2: the Editor's divergence points (EditorAirDivergence.hlsl): the temperature points' placement, coloured by each fluid piece's
+// divergence, computed this frame by CSDivergence (AirDivergence.hlsl). Always the whole window.
+struct AirDivergenceRequest
+{
+    // One block per world-aligned 2^spacingExponent cells on a side (0 to 3: 1 to 8 cells).
+    int spacingExponent = 1;
+    // Divergence in 1/s (net outflow over a whole cell's volume) at which the colour saturates (orange above, cyan below).
+    float displayRange = 2.0f;
+    AirDivergenceMeasure measure = AirDivergenceMeasure::Face;
+    // The velocity outside the window (the simulation's ambient), which the window's open faces exchange with.
+    Vector3 ambientVelocity{0.0f, 0.0f, 0.0f};
+    // The point's diameter in pixels.
+    float pointPixels = 5.0f;
+
+    bool operator==(const AirDivergenceRequest&) const = default;
 };
 
 // Mirrors AirVectorParameters in AirVisualization.hlsli.
@@ -125,6 +174,32 @@ public:
     // viewProjection (16), AirFieldBinding (16), first cell and mask (4), cell counts (4).
     static constexpr unsigned int CellConstantCount = 40;
 
+    // AIR.4F F4.5.1b.1: the temperature points over the whole window, depth-tested without writing depth, in one instanced draw.
+    // Returns the number of instances recorded (two per block; absent pieces draw nothing).
+    std::uint32_t ExecuteTemperature(ID3D12GraphicsCommandList* commandList, DescriptorHeap& descriptorHeap, RenderTarget& viewportColor,
+        DepthBuffer& viewportDepth, const Matrix4& viewProjection, const AirFieldBinding& field, const AirTemperatureRequest& request) const;
+
+    // viewProjection (16), AirFieldBinding (16), AirVectorParameters (16), range and point size (4).
+    static constexpr unsigned int TemperatureConstantCount = 52;
+
+    // AIR.4E.2: each fluid piece's divergence over the window (CSDivergence, one dispatch, then a transition for the draw), shown as
+    // points like the temperature's in one instanced draw. `apertureIndex` is AirField::GetApertureIndex(). The divergence buffer (16 bytes
+    // per cell) is created on first use and kept while frames draw the view; IdleDivergence retires it. Returns the number of instances
+    // recorded (two per block).
+    std::uint32_t ExecuteDivergence(ID3D12GraphicsCommandList* commandList, DescriptorHeap& descriptorHeap, RenderTarget& viewportColor,
+        DepthBuffer& viewportDepth, const Matrix4& viewProjection, const AirFieldBinding& field, std::uint32_t apertureIndex,
+        const AirPressureDiagnostics& pressure, const AirDivergenceRequest& request, std::uint64_t lastSubmissionFence,
+        std::uint64_t completedFence);
+    // AIR.4E.2: a frame without the divergence view: its buffer is retired with `lastSubmissionFence` and released once the GPU completes it.
+    void IdleDivergence(std::uint64_t lastSubmissionFence, std::uint64_t completedFence);
+
+    // viewProjection (16), AirFieldBinding (16), AirVectorParameters (16), the buffer, range, point size and measure (8).
+    static constexpr unsigned int DivergenceConstantCount = 56;
+    // AirFieldBinding (16), apertures, pressure, output (4), ambient velocity (4).
+    static constexpr unsigned int DivergenceComputeConstantCount = 24;
+    // (face, collocated) of piece 0, then of piece 1, as floats.
+    static constexpr std::size_t DivergenceBytesPerCell = 16;
+
     // AIR.4D: solid sub-cells' faces bordering fluid, coloured by piece; `request.pieces` must be set. The constants (with the VX.5
     // binding, which the view queries) go through `upload`. Returns the number of sub-cells examined.
     std::uint32_t ExecutePieces(ID3D12GraphicsCommandList* commandList, DescriptorHeap& descriptorHeap, UploadBuffer& upload,
@@ -133,6 +208,7 @@ public:
 
 private:
     friend class AirFieldVerification;
+    friend class AirMotorEditorVerification;
 
     // AIR.4D D3: creates the split list, its arguments and their views on first use; false when that fails.
     bool EnsureSplitResources(DescriptorHeap& descriptorHeap);
@@ -142,9 +218,40 @@ private:
         const Pipeline& pipeline, D3D12_RESOURCE_STATES& previousDepthState) const;
     void End(ID3D12GraphicsCommandList* commandList, RenderTarget& viewportColor, DepthBuffer& viewportDepth, D3D12_RESOURCE_STATES previousDepthState) const;
 
+    // AIR.4E.2: the divergence buffer for `cells` window cells (a new size retires the old one with `lastSubmissionFence`); false when its
+    // creation fails.
+    bool EnsureDivergenceStorage(DescriptorHeap& descriptorHeap, std::size_t cells, std::uint64_t lastSubmissionFence);
+    void RetireDivergence(std::uint64_t fence);
+    void CollectRetiredDivergence(std::uint64_t completedFence);
+    // CSDivergence over the window into the divergence buffer, left readable by the vertex shader. `pressureIndex` is a read-only float2
+    // per slot (AirDivergence.hlsli), or AirNoPressure (0xFFFFFFFF): the Editor has none; the verification supplies one. AIR.4E.4: a face
+    // source (read-only float2 per slot, times `faceSourceScale`) replaces the face value, or AirNoPressure.
+    void RecordDivergence(ID3D12GraphicsCommandList* commandList, DescriptorHeap& descriptorHeap, const AirFieldBinding& field,
+        std::uint32_t apertureIndex, std::uint32_t pressureIndex, const Vector3& ambientVelocity, std::uint32_t faceSourceIndex = 0xFFFFFFFFu,
+        float faceSourceScale = 1.0f);
+    // The points from the divergence buffer RecordDivergence filled; returns the number of instances drawn (0 when the targets differ in size).
+    std::uint32_t DrawDivergence(ID3D12GraphicsCommandList* commandList, DescriptorHeap& descriptorHeap, RenderTarget& viewportColor,
+        DepthBuffer& viewportDepth, const Matrix4& viewProjection, const AirFieldBinding& field, const AirDivergenceRequest& request) const;
+
     Pipeline m_pipeline;
     Pipeline m_cellPipeline;
     Pipeline m_piecePipeline;
+    Pipeline m_temperaturePipeline;
+
+    // AIR.4E.2: the divergence kernel, the points, and the buffer they share (allocated only while the view is shown).
+    struct RetiredBuffer
+    {
+        Buffer buffer;
+        std::uint64_t fence = 0;
+    };
+
+    ComputePipeline m_divergenceComputePipeline;
+    Pipeline m_divergencePipeline;
+    Buffer m_divergence;
+    std::size_t m_divergenceCells = 0;
+    // Diagnostics: divergence dispatches recorded (none while the view is hidden).
+    std::uint64_t m_divergenceDispatches = 0;
+    std::deque<RetiredBuffer> m_retiredDivergence;
 
     // AIR.4D D3 split pass: its vertex shader, the list's reset and classification, the list and the indirect draw's arguments.
     ID3D12Device* m_device = nullptr;

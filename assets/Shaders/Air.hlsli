@@ -37,6 +37,11 @@ struct AirFieldBinding
     uint velocityPiece1OtherIndex;
 };
 
+// AIR.4F F4.5.1b: the supported ΔT (velocity.w), in kelvin from the ambient. The scene's ambient (223.15 to 373.15 K) keeps the absolute
+// temperature above 23 K at the lower bound. Shared by the solver's transport and the pressure projection's buoyancy (AIR.4F.1b).
+static const float AirMinimumTemperature = -200.0;
+static const float AirMaximumTemperature = 1000.0;
+
 static const uint AirSlotsPerObstacleWord = 16;
 static const uint AirObstacleBlocked = 1;
 static const uint AirObstacleKnown = 2;
@@ -192,6 +197,41 @@ uint AirPieceLink(uint64_t lower, uint64_t upper, uint axis)
     }
 
     return AirSubcellCount(((lower & AirSubcellsHighZ) >> 48) & upper & AirSubcellsLowZ);
+}
+
+// AIR.4E.1: each window slot's face connections toward its +x, +y and +z neighbours, for the pressure projection (AirField.hlsl's
+// CSBuildApertures, rebuilt whenever the pieces are). 8 bytes per slot, in the velocity buffers' slot order:
+//   - bits (axis * 4 + lower * 2 + upper) * 5, 5 bits each: the aperture, in sub-cell faces (0 to 16), between piece `lower` of this
+//     cell and piece `upper` of the +axis neighbour: AirPieceLink of their masks, so pieces meet only through shared open sub-faces
+//     (never through solid, or along an edge or a corner), and a cell's two pieces never meet at all;
+//   - bit 60 + axis set: the +axis neighbour is outside the window, an open boundary; then the field at (axis, lower, 0) holds piece
+//     `lower`'s open sub-faces on that face, and (axis, lower, 1) is 0.
+// A face toward -axis is the -axis neighbour's record, read with the pieces' roles swapped; at the window's low edge it is an open
+// boundary whose aperture is the piece's open sub-faces on that face (AirLowBoundaryAperture). An aperture of 0 is a closed face.
+static const uint AirApertureBytesPerSlot = 8;
+
+uint AirApertureOf(uint2 record, uint axis, uint lower, uint upper)
+{
+    const uint shift = (axis * 4u + lower * 2u + upper) * 5u;
+    const uint64_t bits = uint64_t(record.x) | (uint64_t(record.y) << 32);
+    return uint((bits >> shift) & 31u);
+}
+
+bool AirHighBoundary(uint2 record, uint axis)
+{
+    return ((record.y >> (28u + axis)) & 1u) != 0;
+}
+
+// Piece `mask`'s open sub-faces on its face at the low (-axis) side.
+uint AirLowBoundaryAperture(uint64_t mask, uint axis)
+{
+    return AirSubcellCount(mask & (axis == 0 ? AirSubcellsLowX : (axis == 1 ? AirSubcellsLowY : AirSubcellsLowZ)));
+}
+
+// Piece `mask`'s open sub-faces on its face at the high (+axis) side.
+uint AirHighBoundaryAperture(uint64_t mask, uint axis)
+{
+    return AirSubcellCount(mask & (axis == 0 ? AirSubcellsHighX : (axis == 1 ? AirSubcellsHighY : AirSubcellsHighZ)));
 }
 
 #endif

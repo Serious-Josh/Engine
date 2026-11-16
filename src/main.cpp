@@ -36,6 +36,7 @@ int VerifyAssetBrowserScenes();
 int VerifyStartupScene(const std::filesystem::path& outputRoot);
 int VerifyCausticsVisible(const std::filesystem::path& project, const std::filesystem::path& out);
 int VerifyGamePlayGPU(const std::filesystem::path& projectDirectory, const std::filesystem::path& scene);
+int VerifyMemoryRegistry(const std::filesystem::path& projectDirectory, const std::filesystem::path& scene);
 int VerifyPhysicsPerformance(const std::filesystem::path& projectDirectory, const std::filesystem::path& scene);
 int VerifyScriptWorkflow(const std::filesystem::path& projectDirectory, const std::filesystem::path& scene,
     const std::vector<std::string>& objectNames);
@@ -65,6 +66,12 @@ int VerifyVoxelOverlay(const std::filesystem::path& work);
 int VerifyVoxelResidency();
 int VerifyVoxelQueries();
 int VerifyVoxelStreaming(const std::filesystem::path& work);
+int VerifyVoxelResidencyParity(const std::filesystem::path& scene, const std::filesystem::path& toc, const std::filesystem::path& pak,
+    const AssetID& sceneID, const std::filesystem::path& digest);
+int VerifyVoxelResidencyLifecycle(int argc, char** argv);
+int VerifyAirParity(const std::filesystem::path& toc, const std::filesystem::path& pak, const AssetID& sceneID,
+    const std::filesystem::path& out);
+int VerifyAirLifecycle(const std::filesystem::path& packages, const AssetID& sceneID);
 int VerifyAirField();
 int VerifyAirSolver();
 int VerifyAirMotors();
@@ -72,6 +79,16 @@ int VerifyAirMotorEditor(const std::filesystem::path& work);
 int VerifyAirVisualization();
 int VerifyAirObstacles(const std::filesystem::path& work);
 int VerifyAirPieces();
+int VerifyAirPressure();
+int VerifyAirProjection();
+int VerifyAirBuoyancy();
+int VerifyAirPointEmitters();
+int VerifyAirVolumeEmitters();
+int VerifyAirProfile();
+int VerifyAirPressureExperiments();
+int VerifyAirFogExperiments();
+int VerifyAirFogDlss();
+int VerifyAirMovingSolids();
 int VerifyAirPieceSolver();
 int VerifyAirMist();
 int VerifyPresentationTransforms();
@@ -263,6 +280,65 @@ int main(int argc, char** argv)
         return VerifyAirPieces();
     }
 
+    // AIR.4E.3: the pressure solver's components, operator, hierarchy and convergence against the AIR.4E.0 CPU reference.
+    if(argc == 2 && std::string_view(argv[1]) == "--verify-air-pressure")
+    {
+        return VerifyAirPressure();
+    }
+
+    // AIR.4E.4: the experimental pressure projection in the air step.
+    if(argc == 2 && std::string_view(argv[1]) == "--verify-air-projection")
+    {
+        return VerifyAirProjection();
+    }
+
+    // AIR.4F.1b: temperature-driven buoyancy in the pressure projection.
+    if(argc == 2 && std::string_view(argv[1]) == "--verify-air-buoyancy")
+    {
+        return VerifyAirBuoyancy();
+    }
+
+    // AIR.4F.2b: Point Mist Emitters: deposition against the CPU reference, geometry, temperature, jets and cost.
+    if(argc == 2 && std::string_view(argv[1]) == "--verify-air-point-emitters")
+    {
+        return VerifyAirPointEmitters();
+    }
+
+    // AIR.4F.2c: Volume Mist Emitters: maintenance against the CPU reference, overlap, geometry, temperature and cost.
+    if(argc == 2 && std::string_view(argv[1]) == "--verify-air-volume-emitters")
+    {
+        return VerifyAirVolumeEmitters();
+    }
+
+    // AIR.4E.5a: AIR and volumetric fog performance investigation (measurement only).
+    if(argc == 2 && std::string_view(argv[1]) == "--verify-air-profile")
+    {
+        return VerifyAirProfile();
+    }
+
+    // AIR.4E.5b: pressure optimization experiments (measurement).
+    if(argc == 2 && std::string_view(argv[1]) == "--verify-air-pressure-experiments")
+    {
+        return VerifyAirPressureExperiments();
+    }
+
+    // AIR.4E.5c: volumetric fog optimization experiments (measurement and image comparison).
+    if(argc == 2 && std::string_view(argv[1]) == "--verify-air-fog-experiments")
+    {
+        return VerifyAirFogExperiments();
+    }
+
+    if(argc == 2 && std::string_view(argv[1]) == "--verify-air-fog-dlss")
+    {
+        return VerifyAirFogDlss();
+    }
+
+    // AIR.4F.3 F1a: the moving-solid geometry overlay against its CPU reference.
+    if(argc == 2 && std::string_view(argv[1]) == "--verify-air-moving-solids")
+    {
+        return VerifyAirMovingSolids();
+    }
+
     // AIR.4D D2: the piece-aware solver against its CPU reference, rebuild remapping and cost.
     if(argc == 2 && std::string_view(argv[1]) == "--verify-air-piece-solver")
     {
@@ -308,6 +384,27 @@ int main(int argc, char** argv)
     {
         return VerifyVoxelQueries();
     }
+    // R1.5b: the Editor's measurement of a package's AIR (archive activation); writes the digest the packaged run compares against.
+    if(argc == 6 && std::string_view(argv[1]) == "--verify-air-parity" && AssetID::Parse(argv[4]))
+    {
+        return VerifyAirParity(argv[2], argv[3], *AssetID::Parse(argv[4]), argv[5]);
+    }
+    // R1.5b: AIR across activation, replacement, a failed activation, AIR off and shutdown (<packages> holds the R1.5b fixtures).
+    if(argc == 4 && std::string_view(argv[1]) == "--verify-air-lifecycle" && AssetID::Parse(argv[3]))
+    {
+        return VerifyAirLifecycle(argv[2], *AssetID::Parse(argv[3]));
+    }
+    // R1.4c: residency lifecycle transitions, the eviction route (writes its digest), and shutdown with work in flight.
+    if(argc >= 2 && (std::string_view(argv[1]) == "--verify-voxel-residency-lifecycle" ||
+        std::string_view(argv[1]) == "--verify-voxel-residency-route" || std::string_view(argv[1]) == "--verify-voxel-residency-shutdown"))
+    {
+        return VerifyVoxelResidencyLifecycle(argc, argv);
+    }
+    // R1.4b: Editor file/archive residency parity; writes the digest the packaged run compares against.
+    if(argc == 7 && std::string_view(argv[1]) == "--verify-voxel-residency-parity" && AssetID::Parse(argv[5]))
+    {
+        return VerifyVoxelResidencyParity(argv[2], argv[3], argv[4], *AssetID::Parse(argv[5]), argv[6]);
+    }
     // VX.5: GPU voxel residency resources against GPU readback.
     if(argc == 2 && std::string_view(argv[1]) == "--verify-voxel-residency")
     {
@@ -342,6 +439,19 @@ int main(int argc, char** argv)
 #if ENGINE_VERIFICATION_ENABLED
                 if(std::string_view(argv[1]) == "--verify-packaged-bootstrap")
                 {
+                    // R1.4b/R1.4c: the residency override's parity (or eviction route) check runs first: the bootstrap's own
+                    // checks end with its window-close loop, after which packaged frames no longer update residency.
+                    if(std::getenv("ENGINE_DIAG_PACKAGED_VOXEL_RESIDENCY"))
+                    {
+                        engine.VerifyPackagedVoxelResidency();
+                    }
+
+                    // R1.5b: packaged AIR parity, likewise before the bootstrap's window-close loop.
+                    if(std::getenv("ENGINE_DIAG_PACKAGED_AIR"))
+                    {
+                        engine.VerifyPackagedAirParity();
+                    }
+
                     engine.VerifyPackagedBootstrap();
                 }
                 else if(std::getenv("ENGINE_DIAG_PACKAGED_PROBES"))
@@ -419,6 +529,10 @@ int main(int argc, char** argv)
     if(argc == 4 && std::string_view(argv[1]) == "--verify-physics-performance")
     {
         return VerifyPhysicsPerformance(std::filesystem::absolute(argv[2]), std::filesystem::absolute(argv[3]));
+    }
+    if(argc == 4 && std::string_view(argv[1]) == "--verify-memory-registry")
+    {
+        return VerifyMemoryRegistry(std::filesystem::absolute(argv[2]), std::filesystem::absolute(argv[3]));
     }
     if(argc == 4 && std::string_view(argv[1]) == "--verify-game-play-gpu")
     {

@@ -95,6 +95,7 @@
 #include <d3d12.h>
 #include <filesystem>
 #include <functional>
+#include <span>
 #include <string>
 #include <vector>
 #include <array>
@@ -124,6 +125,10 @@ struct RendererOptions
     std::optional<AirFrameRequest> air;
     // AIR.4A: the Editor's velocity vectors, drawn in Editor and Play frames (never in a packaged runtime).
     std::optional<AirVisualizationRequest> airVisualization;
+    // AIR.4F F4.5.1b.1: the Editor's temperature points, drawn like the vectors (before them).
+    std::optional<AirTemperatureRequest> airTemperature;
+    // AIR.4E.2: the Editor's divergence points, drawn like the temperature points (after them); absent frames release their storage.
+    std::optional<AirDivergenceRequest> airDivergence;
     // AIR.4F F3: the Editor's volumetric mist, drawn like the vectors (before them) while the air field holds mist.
     std::optional<AirMistRenderRequest> airMist;
     // AIR.4C: the Editor's air-cell diagnostic (blocked and unknown cells of the obstacle mask), drawn like the vectors.
@@ -888,6 +893,12 @@ class Renderer
         return m_voxelResidency.GetBinding();
     }
 
+    // R1.4c diagnostics: chunk, page, slot, retirement and upload counters of the residency storage (read-only).
+    VoxelResidencyResources::Statistics GetVoxelResidencyStatistics() const
+    {
+        return m_voxelResidency.GetStatistics();
+    }
+
     // AIR.1 air field (AirField.h). Reset re-initializes the whole field on the next enabled frame (scene change); Release frees
     // its storage once the GPU is done with it.
     void ResetAirField() noexcept
@@ -896,6 +907,25 @@ class Renderer
     }
 
     void ReleaseAirField();
+
+    // R1.5b (decisions D4, D5): a packaged game whose cooked scene requests AIR initializes it here, before its first AIR frame: the air
+    // field's pipelines, the pressure solver's (eagerly), the mist noise volumes from their archive bytes and the mist's Original
+    // Raymarch stages. Main thread, after Initialize, between frames. Allocates no field storage (that waits for the first enabled
+    // frame). Idempotent; false when a pipeline cannot be created (the field then stays uninitialized and records nothing).
+    struct PackagedAirInitialization
+    {
+        double milliseconds = 0.0;
+        int noiseVolumes = 0;
+        bool pressurePipelines = false;
+        bool mistPipelines = false;
+    };
+
+    bool InitializePackagedAir(std::span<const std::byte> worley, std::span<const std::byte> curl, std::span<const std::byte> filaments,
+        PackagedAirInitialization* report = nullptr);
+    bool IsAirFieldInitialized() const noexcept
+    {
+        return m_airField.IsInitialized();
+    }
 
     // AIR.4F: zeroes all mist on the next frame with mist.
     void ClearAirMist() noexcept
@@ -909,6 +939,12 @@ class Renderer
     }
 
     // AIR.4D D2: the latest Air Motor emission status, by AirMotorInstance::tag (a few frames old; empty while air is off).
+    // AIR.4E.5b.1: the fixed air steps the latest frame recorded.
+    std::uint32_t GetAirStepCount() const noexcept
+    {
+        return m_airField.GetLastStepCount();
+    }
+
     const std::map<std::uint64_t, AirMotorEmissionStatus>& GetAirMotorEmission() const noexcept
     {
         return m_airField.GetEmissionStatus();
@@ -918,6 +954,12 @@ class Renderer
     const std::map<std::uint64_t, MistEmitterStatus>& GetMistEmitterStatus() const noexcept
     {
         return m_airField.GetMistEmitterStatus();
+    }
+
+    // AIR.4F.2b: the latest frame's motors (by tag) that reached the air window but found every motor slot taken.
+    const std::vector<std::uint64_t>& GetAirMotorsWithoutCapacity() const noexcept
+    {
+        return m_airField.GetMotorsWithoutCapacity();
     }
 
     bool WaitForGPU();
@@ -1103,6 +1145,9 @@ class Renderer
     friend class ResidencyBatchVerification;
     friend class CausticVisibleVerification;
     friend class GamePlayGPUVerification;
+    friend class AirPackagedParityVerification;
+    friend class MemoryRegistryVerification;
+    friend class PackagedVolumetricsVerification;
 #endif
     friend class SceneMaterialBindingPublication;
 #if defined(ENGINE_HAS_VERIFICATION)
@@ -1737,6 +1782,8 @@ class Renderer
     EditorMistPass m_editorMistPass;
     // Diagnostics: vectors drawn by the last frame.
     std::uint32_t m_lastAirVectorCount = 0;
+    std::uint32_t m_lastAirTemperatureCount = 0;
+    std::uint32_t m_lastAirDivergenceCount = 0;
     // Diagnostics: cells examined by the last frame's air-cell view.
     std::uint32_t m_lastAirCellCount = 0;
     // Diagnostics: sub-cells examined by the last frame's fluid-pieces view.

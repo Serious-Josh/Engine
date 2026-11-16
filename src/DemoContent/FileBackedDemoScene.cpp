@@ -884,6 +884,54 @@ bool FileBackedDemoScene::SetSceneVoxelBake(const std::optional<VoxelBakeSetting
     return m_runtime->SetSceneVoxelBake(expected, replacement, errorMessage);
 }
 
+bool FileBackedDemoScene::SetSceneEnvironmentalHaze(const std::optional<EnvironmentalHazeSettings>& expected,
+    const std::optional<EnvironmentalHazeSettings>& replacement, std::string* errorMessage)
+{
+    if(!m_initialized || m_objectMutationCandidate)
+    {
+        if(errorMessage)
+        {
+            *errorMessage = "The scene is not ready for environmental haze edits.";
+        }
+
+        return false;
+    }
+
+    return m_runtime->SetSceneEnvironmentalHaze(expected, replacement, errorMessage);
+}
+
+bool FileBackedDemoScene::SetSceneAirEnvironment(const std::optional<AirEnvironmentSettings>& expected,
+    const std::optional<AirEnvironmentSettings>& replacement, std::string* errorMessage)
+{
+    if(!m_initialized || m_objectMutationCandidate)
+    {
+        if(errorMessage)
+        {
+            *errorMessage = "The scene is not ready for air environment edits.";
+        }
+
+        return false;
+    }
+
+    return m_runtime->SetSceneAirEnvironment(expected, replacement, errorMessage);
+}
+
+bool FileBackedDemoScene::SetSceneAirSimulation(const std::optional<AirSimulationSettings>& expected,
+    const std::optional<AirSimulationSettings>& replacement, std::string* errorMessage)
+{
+    if(!m_initialized || m_objectMutationCandidate)
+    {
+        if(errorMessage)
+        {
+            *errorMessage = "The scene is not ready for AIR simulation edits.";
+        }
+
+        return false;
+    }
+
+    return m_runtime->SetSceneAirSimulation(expected, replacement, errorMessage);
+}
+
 bool FileBackedDemoScene::SetSceneMistRendering(const std::optional<MistRenderSettings>& expected,
     const std::optional<MistRenderSettings>& replacement, std::string* errorMessage)
 {

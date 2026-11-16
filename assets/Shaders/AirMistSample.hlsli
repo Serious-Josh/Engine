@@ -72,10 +72,13 @@ float4 AirSampleMistSplit(AirPathField path, AirMistField mist, AirPathEnd at, i
     return total > 0.0 ? sum / total : fallback;
 }
 
-// The mist at a backtrace's end; `fallback` (the piece's own mist) where no corner is left.
-float4 AirSampleMist(AirPathField path, AirMistField mist, AirPathEnd at, float4 fallback)
+// The mist at a backtrace's end; `fallback` (the piece's own mist) where no corner is left. AIR.4F.2a: as AirSampleState (AirSample.hlsli),
+// the weights are evaluated at the end moved back by the piece's anchor offset (`anchorOffset` = anchor - 0.5, in cells), because a piece's
+// mist is one value on the cell-centre lattice while its backtrace starts at its anchor. Zero displacement then samples the piece's own mist
+// exactly; whole cells (offset 0) sample as before; the corner pieces are still chosen from the end itself.
+float4 AirSampleMist(AirPathField path, AirMistField mist, AirPathEnd at, float3 anchorOffset, float4 fallback)
 {
-    const float3 shifted = at.position - 0.5;
+    const float3 shifted = at.position - anchorOffset - 0.5;
     const int3 base = int3(floor(shifted));
     const float3 fraction = shifted - float3(base);
 

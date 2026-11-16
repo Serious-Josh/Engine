@@ -42,8 +42,12 @@ cbuffer AirFieldConstants : register(b0)
     uint mistPiece1Unordered1;
     uint currentMist;
     uint mistEnabled;
-    uint2 mistPadding;
+    // AIR.4E.1: the face connections (CSBuildApertures), writable.
+    uint apertureUnordered;
+    uint maintenancePadding;
 };
+
+#include "AirGeometryBuild.hlsli"
 
 bool Entering(int3 cell)
 {
@@ -82,25 +86,6 @@ void CSInitializeVelocity(uint3 slot : SV_DispatchThreadID)
             mist.Store4(address, uint4(0, 0, 0, 0));
         }
     }
-}
-
-// Conservative: a lattice cell `level` levels above the voxels is blocked when any voxel it covers is known blocked
-// (VoxelQueryCell is the exact OR); below the voxels (negative level) it takes the containing voxel. An invalid VX.5 binding
-// answers unknown, which is free air.
-VoxelSample QueryLattice(int3 cell, int level)
-{
-    if(level >= 0)
-    {
-        return VoxelQueryCell(voxels, cell, level);
-    }
-
-    return VoxelQueryVoxel(voxels, cell >> (-level));
-}
-
-uint ObstacleBits(int3 cell)
-{
-    const VoxelSample sample = QueryLattice(cell, voxelLevel);
-    return (sample.known ? AirObstacleKnown : 0u) | (sample.blocked ? AirObstacleBlocked : 0u);
 }
 
 // One thread per packed word (16 slots along x), so no atomics: unchanged slots keep their bits.
@@ -143,39 +128,16 @@ void CSBuildObstacles(uint3 thread : SV_DispatchThreadID)
     }
 }
 
-// The cell's free sub-cells: each free unless a voxel it covers is known blocked. A cell with no blocked voxel at all (known
-// free or unknown) is free throughout, which settles nearly every cell with one query.
-uint64_t FreeSubcells(int3 cell)
-{
-    if(!QueryLattice(cell, voxelLevel).blocked)
-    {
-        return AirSubcellsAll;
-    }
-
-    const int subcellLevel = voxelLevel - 2;
-    uint64_t free = 0;
-
-    for(uint bit = 0; bit < 64; ++bit)
-    {
-        const int3 subcell = cell * int(AirSubcellsPerAxis) + int3(bit & 3u, (bit >> 2) & 3u, bit >> 4);
-
-        if(!QueryLattice(subcell, subcellLevel).blocked)
-        {
-            free |= uint64_t(1) << bit;
-        }
-    }
-
-    return free;
-}
-
 // D2: the velocity a rebuilt piece starts with, from the old pieces of the same cell. It takes the velocity of the old piece it
 // shares most sub-cells with (piece 0 on a tie), which carries velocity across a relabelling (pieces swapped or reshaped). A newly
 // exposed piece, sharing nothing, starts at the ambient velocity; an absent piece is zero.
-float3 RemappedVelocity(uint64_t piece, AirPieces previous, float3 previous0, float3 previous1)
+// AIR.4F F4.5.1b: the state (velocity and ΔT) a rebuilt piece starts with: the old piece it shares most sub-cells with, whole; a
+// newly exposed piece is at the ambient (ambient velocity, ΔT 0).
+float4 RemappedState(uint64_t piece, AirPieces previous, float4 previous0, float4 previous1)
 {
     if(piece == 0)
     {
-        return float3(0.0, 0.0, 0.0);
+        return float4(0.0, 0.0, 0.0, 0.0);
     }
 
     const uint overlap0 = AirSubcellCount(piece & previous.piece0);
@@ -183,7 +145,7 @@ float3 RemappedVelocity(uint64_t piece, AirPieces previous, float3 previous0, fl
 
     if(overlap0 == 0 && overlap1 == 0)
     {
-        return ambientVelocity;
+        return float4(ambientVelocity, 0.0);
     }
 
     return overlap1 > overlap0 ? previous1 : previous0;
@@ -248,10 +210,10 @@ void CSBuildPieces(uint3 slot : SV_DispatchThreadID)
         previous.piece1 = uint64_t(words.z) | (uint64_t(words.w) << 32);
         RWByteAddressBuffer current0 = ResourceDescriptorHeap[NonUniformResourceIndex(currentVelocity == 0 ? velocityUnordered0 : velocityUnordered1)];
         RWByteAddressBuffer current1 = ResourceDescriptorHeap[NonUniformResourceIndex(currentVelocity == 0 ? piece1Unordered0 : piece1Unordered1)];
-        const float3 previous0 = asfloat(current0.Load3(address));
-        const float3 previous1 = asfloat(current1.Load3(address));
-        current0.Store4(address, asuint(float4(RemappedVelocity(pieces.piece0, previous, previous0, previous1), 0.0)));
-        current1.Store4(address, asuint(float4(RemappedVelocity(pieces.piece1, previous, previous0, previous1), 0.0)));
+        const float4 previous0 = asfloat(current0.Load4(address));
+        const float4 previous1 = asfloat(current1.Load4(address));
+        current0.Store4(address, asuint(RemappedState(pieces.piece0, previous, previous0, previous1)));
+        current1.Store4(address, asuint(RemappedState(pieces.piece1, previous, previous0, previous1)));
 
         if(mistEnabled != 0)
         {
@@ -265,4 +227,21 @@ void CSBuildPieces(uint3 slot : SV_DispatchThreadID)
     }
 
     output.Store4(address, rebuilt);
+}
+
+// AIR.4E.1: one thread per slot builds its face connections toward its +x, +y and +z neighbours (Air.hlsli, AirApertureOf) from the
+// pieces this maintenance pass wrote (read through the writable view, the state the buffer is in). Every slot is rebuilt whenever the
+// pieces may have changed (a reset, a recentre, a VX.5 change), because a record also depends on its neighbours' pieces.
+[numthreads(8, 8, 8)]
+void CSBuildApertures(uint3 slot : SV_DispatchThreadID)
+{
+    if(any(slot >= field.dimensions))
+    {
+        return;
+    }
+
+    const uint64_t record = AirBuildApertureRecord(slot);
+    RWByteAddressBuffer apertures = ResourceDescriptorHeap[NonUniformResourceIndex(apertureUnordered)];
+    const uint index = slot.x + field.dimensions.x * (slot.y + field.dimensions.y * slot.z);
+    apertures.Store2(index * AirApertureBytesPerSlot, uint2(uint(record), uint(record >> 32)));
 }

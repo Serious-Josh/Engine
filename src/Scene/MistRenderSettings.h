@@ -6,6 +6,7 @@
 // which are the values every scene had before the block existed. See Documentation/Air/AirArchitecture.md, AIR.4F F4.4.1.
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 
 struct MistRenderSettings
@@ -24,6 +25,9 @@ struct MistRenderSettings
     static constexpr float MaximumWispScale = 32.0f;
     // F4.3 lighting: the Henyey-Greenstein anisotropy's magnitude.
     static constexpr float MaximumAnisotropy = 0.9f;
+    static constexpr float MaximumNearDistance = 1000.0f;
+    static constexpr float MinimumNearTransition = 0.1f;
+    static constexpr float MaximumNearTransition = 1000.0f;
 
     float opacity = 1.0f;
 
@@ -50,6 +54,17 @@ struct MistRenderSettings
     float scattering = 1.0f;
     float anisotropy = 0.3f;
     float ambient = 0.0f;
+    // AIR.4F.2d.2: the scattering colour multiplying the mist's albedo (0 to 1 per channel; white is no change), and the
+    // multiple-scattering strength (0 to 1; 0 is single scattering as before).
+    std::array<float, 3> scatteringTint{1.0f, 1.0f, 1.0f};
+    float multipleScattering = 0.0f;
+    // AIR.4F.2d.3e: the indirect scattering strength (0 to 1; 0 is none, as before): the share of the sunlight that sunlit mist nearby
+    // scatters toward shadowed mist which that mist receives. 1 is the full single-bounce estimate; it lights only shadowed mist.
+    float indirectScattering = 0.0f;
+    // AIR.4F.2d.3b: the AIR mist's near clearance: clear up to nearDistance metres from the camera, full strength nearTransition metres
+    // beyond (a smoothstep in its extinction; 0: off). Independent of the environmental haze's clearance.
+    float nearDistance = 0.0f;
+    float nearTransition = 5.0f;
 
     bool operator==(const MistRenderSettings&) const = default;
 };
@@ -74,6 +89,16 @@ inline MistRenderSettings SanitizeMistRenderSettings(MistRenderSettings settings
     bound(settings.scattering, defaults.scattering, 0.0f, 1.0f);
     bound(settings.anisotropy, defaults.anisotropy, -MistRenderSettings::MaximumAnisotropy, MistRenderSettings::MaximumAnisotropy);
     bound(settings.ambient, defaults.ambient, 0.0f, 1.0f);
+
+    for(float& channel : settings.scatteringTint)
+    {
+        bound(channel, 1.0f, 0.0f, 1.0f);
+    }
+
+    bound(settings.multipleScattering, defaults.multipleScattering, 0.0f, 1.0f);
+    bound(settings.indirectScattering, defaults.indirectScattering, 0.0f, 1.0f);
+    bound(settings.nearDistance, defaults.nearDistance, 0.0f, MistRenderSettings::MaximumNearDistance);
+    bound(settings.nearTransition, defaults.nearTransition, MistRenderSettings::MinimumNearTransition, MistRenderSettings::MaximumNearTransition);
     return settings;
 }
 

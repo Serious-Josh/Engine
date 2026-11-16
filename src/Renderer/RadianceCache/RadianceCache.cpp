@@ -1,4 +1,5 @@
 #include "RadianceCache.h"
+#include "Debug/MemoryRegistry.h"
 
 #include "Core/Log.h"
 #include "Renderer/DescriptorHeap.h"

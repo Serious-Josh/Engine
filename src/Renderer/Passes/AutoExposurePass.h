@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Core/Log.h"
+#include "Debug/MemoryRegistry.h"
 #include "Renderer/Buffer.h"
 #include "Renderer/CommandContext.h"
 #include "Renderer/ComputePipeline.h"
@@ -60,6 +61,9 @@ public:
             return true;
         }
 
+        // Past the ready check, so steady-state frames pay nothing for attribution.
+        const MemoryCategoryScope memoryScope(MemoryCategory::CoreRenderer);
+
         const auto pipeline = [&](const char* entryPoint, ComputePipeline& target)
         {
             ShaderDescription shaderDescription{};
@@ -113,6 +117,8 @@ public:
                 Shutdown();
                 return false;
             }
+
+            MemoryRegistry::TrackResource(slot.readback);
         }
 
         m_histogram.GetResource()->SetName(L"Exposure Histogram");

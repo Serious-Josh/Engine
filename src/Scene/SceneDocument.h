@@ -8,6 +8,9 @@
 #include "Scene/AudioComponents.h"
 #include "Scene/AirMotorComponent.h"
 #include "Scene/MistEmitterComponent.h"
+#include "Scene/AirEnvironmentSettings.h"
+#include "Scene/AirSimulationSettings.h"
+#include "Scene/EnvironmentalHazeSettings.h"
 #include "Scene/MistRenderSettings.h"
 #include "Scene/VoxelComponents.h"
 #include "Physics/PhysicsComponent.h"
@@ -128,7 +131,15 @@ struct SceneDocument
     static constexpr std::uint32_t kMistEmitterSchemaVersion = 23;
     // AIR.4F F4.4.1: the scene's mist appearance (mistRendering).
     static constexpr std::uint32_t kMistRenderingSchemaVersion = 24;
-    static constexpr std::uint32_t kSchemaVersion = kMistRenderingSchemaVersion;
+    // AIR.4F.2b: a Mist Emitter's mode (Legacy, Point; AIR.4F.2c adds Volume) and its Point fields. Optional: an emitter without
+    // them is Legacy. AIR.4F.2c's Volume fields join this version as further optional fields rather than bumping it again.
+    static constexpr std::uint32_t kMistEmitterModeSchemaVersion = 25;
+    // R1.1: the scene's AIR simulation configuration (airSimulation).
+    static constexpr std::uint32_t kAirSimulationSchemaVersion = 26;
+    // R1.5: moving-solid participation: airSimulation.movingSolids (optional, false when absent) and each physics component's
+    // airParticipation (required from this version; earlier scenes read Automatic).
+    static constexpr std::uint32_t kMovingSolidParticipationSchemaVersion = 27;
+    static constexpr std::uint32_t kSchemaVersion = kMovingSolidParticipationSchemaVersion;
 
     std::uint32_t schemaVersion = kSchemaVersion;
 
@@ -144,17 +155,35 @@ struct SceneDocument
     SceneCameraDocument camera;
     SceneLightingSettings lightingSettings;
 
-    // VX.4B: the scene's voxel bake settings and current manifest; absent until configured. Persisted from schema 19.
+    // VX.4B: the scene's voxel bake settings and current manifest; absent until configured. Persisted from schema 19 and
+    // cooked from payload 36 (R1.4a), with the manifest reference unchanged so the archive resolves it by the same asset identity.
     std::optional<VoxelBakeSettings> voxelBake;
 
     // AIR.4F F4.4.1: the scene's mist appearance; absent until first edited, and then MistRenderSettings' defaults apply. Persisted from
-    // schema 24; Editor-only (not cooked: packaged games draw no mist).
+    // schema 24 (sanitized on load) and cooked from payload 35 (R1.3; refused when invalid). The haze's lighting reads it too.
     std::optional<MistRenderSettings> mistRendering;
+
+    // AIR.4F F4.5.1b: the scene's air environment (ambient temperature, thermal relaxation); absent until first edited, and then
+    // AirEnvironmentSettings' defaults apply. Persisted in schema 24 files; cooked from payload 34 (R1.1).
+    std::optional<AirEnvironmentSettings> airEnvironment;
+
+    // R1.1: the scene's AIR simulation configuration; absent until first edited in a stopped scene, and then AirSimulationSettings'
+    // defaults (AIR off) apply. Persisted from schema 26 and cooked from payload 34. Read only through ResolveAirSimulation.
+    std::optional<AirSimulationSettings> airSimulation;
+
+    // AIR.4F.2d.3: the scene's environmental haze and near-fog clearance; absent: neither. Persisted in schema 25 files and cooked
+    // (payload 31). Rendered by the Editor's fog pass.
+    std::optional<EnvironmentalHazeSettings> environmentalHaze;
 };
 
 bool ValidateSceneDocument(
     const SceneDocument& document,
     std::string* errorMessage = nullptr);
+
+// R1.1: the AIR simulation configuration a frame runs with, the one path the Engine uses. In order: the Editor's Play or Physics
+// Simulation session override, if any (the packaged runtime never has one); the scene's own block; the defaults. `document` is null
+// when no scene document is active.
+AirSimulationSettings ResolveAirSimulation(const SceneDocument* document, const std::optional<AirSimulationSettings>& sessionOverride);
 
 // Shared authoritative component/coexistence validation for proposed object values.
 bool ValidateSceneObjectComponents(const SceneObjectDocument& object, std::string* errorMessage = nullptr);

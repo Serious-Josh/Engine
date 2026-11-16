@@ -1,4 +1,5 @@
 #include "Renderer/Passes/EditorVoxelPass.h"
+#include "Debug/MemoryRegistry.h"
 
 #include "Renderer/DepthBuffer.h"
 #include "Renderer/RenderTarget.h"
@@ -55,6 +56,8 @@ PipelineDescription OverlayPipeline(const Shader* vertexShader, const Shader* pi
 
 bool EditorVoxelPass::Initialize(ID3D12Device* device, ShaderLibrary& shaderLibrary)
 {
+    const MemoryCategoryScope memoryScope(MemoryCategory::Editor);
+
     const Shader* cellVertex = shaderLibrary.Load({"EditorVoxel.hlsl", "CellVS", ShaderStage::Vertex});
     const Shader* boxVertex = shaderLibrary.Load({"EditorVoxel.hlsl", "BoxVS", ShaderStage::Vertex});
     const Shader* pixel = shaderLibrary.Load({"EditorVoxel.hlsl", "OverlayPS", ShaderStage::Pixel});

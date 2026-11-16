@@ -4,6 +4,7 @@
 #include "Core/Log.h"
 #include "Editor.h"
 #include "Editor/ExposureControls.h"
+#include "Physics/MovingSolidParticipation.h"
 #include "ViewportCameraInput.h"
 #include "SceneViewportLayout.h"
 #include "GroupTransform.h"
@@ -1817,7 +1818,7 @@ void Editor::Draw(
 
     DrawBuildGame(demoScene);
     DrawVoxelWindow(demoScene);
-    DrawAirWindow(demoScene);
+    DrawAirWindow(demoScene, debugUI);
     DrawSceneViewport(sceneTextureHandle, sceneWidth, sceneHeight);
     DrawMeshDropTarget(demoScene, projectPaths, assetRegistry);
     DrawMaterialDropTarget(demoScene, projectPaths, assetRegistry);
@@ -1878,6 +1879,10 @@ void Editor::Draw(
             ImGui::Separator();
 
             DrawDirectionalLight(demoScene, debugUI);
+
+            ImGui::Separator();
+
+            DrawEnvironmentalHazeControls(demoScene);
 
         }
 
@@ -3093,6 +3098,10 @@ void Editor::OnSceneActivated()
     InvalidateSceneFiles();
     ClearSceneHistory();
     ResetSceneInteractions();
+    // R1.1: session values of the AIR configuration belong to the previous scene runtime.
+    DiscardAirSimulationOverride();
+    m_airSimulationDraft.reset();
+    m_airSimulationStatus.clear();
 }
 
 void Editor::ResetSceneInteractions()
@@ -4499,6 +4508,55 @@ void Editor::ReplaySceneHistory(IDemoScene& demoScene, bool redo)
         return;
     }
 
+    if(const auto* haze = std::get_if<std::unique_ptr<EnvironmentalHazeEdit>>(&entry.command); haze && *haze)
+    {
+        std::string error;
+
+        if(!ReplayEnvironmentalHaze(demoScene, **haze, redo, error))
+        {
+            ReportSceneHistoryFailure(error);
+            return;
+        }
+
+        m_historyCursor = redo ? m_historyCursor + 1 : m_historyCursor - 1;
+        m_environmentalHazeStatus.clear();
+        m_sceneHistoryStatus.clear();
+        return;
+    }
+
+    if(const auto* simulation = std::get_if<std::unique_ptr<AirSimulationEdit>>(&entry.command); simulation && *simulation)
+    {
+        std::string error;
+
+        if(!ReplayAirSimulation(demoScene, **simulation, redo, error))
+        {
+            ReportSceneHistoryFailure(error);
+            return;
+        }
+
+        m_historyCursor = redo ? m_historyCursor + 1 : m_historyCursor - 1;
+        m_airSimulationDraft.reset();
+        m_airSimulationStatus.clear();
+        m_sceneHistoryStatus.clear();
+        return;
+    }
+
+    if(const auto* environment = std::get_if<std::unique_ptr<AirEnvironmentEdit>>(&entry.command); environment && *environment)
+    {
+        std::string error;
+
+        if(!ReplayAirEnvironment(demoScene, **environment, redo, error))
+        {
+            ReportSceneHistoryFailure(error);
+            return;
+        }
+
+        m_historyCursor = redo ? m_historyCursor + 1 : m_historyCursor - 1;
+        m_airEnvironmentStatus.clear();
+        m_sceneHistoryStatus.clear();
+        return;
+    }
+
     if(const auto* mist = std::get_if<std::unique_ptr<MistRenderingEdit>>(&entry.command); mist && *mist)
     {
         std::string error;
@@ -5322,6 +5380,40 @@ void Editor::DrawObjectPhysicsControls(IDemoScene& scene)
             auto edited = *object.physics;
             edited.generateContactEvents = generateContactEvents;
             CommitObjectPhysics(scene, *selection, object.physics, edited);
+        }
+
+        // R1.5: moving-solid participation (MovingSolidParticipation.h). Combo indices equal the enum values: Automatic 0, Always 1,
+        // Never 2. A Static body never participates; its value is kept (and shown) so switching to Dynamic or Kinematic restores it.
+        const bool movable = object.physics->bodyType != Physics::BodyType::Static;
+        int participation = static_cast<int>(object.physics->airParticipation);
+        ImGui::BeginDisabled(!movable);
+
+        if(ImGui::Combo("AIR Participation", &participation, "Automatic\0Always\0Never\0"))
+        {
+            auto edited = *object.physics;
+            edited.airParticipation = static_cast<Physics::MovingSolidParticipation>(participation);
+            CommitObjectPhysics(scene, *selection, object.physics, edited);
+        }
+
+        ImGui::EndDisabled();
+
+        if(ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        {
+            ImGui::SetTooltip("Whether this body pushes the air aside while the scene's \"Moving-solid displacement\" (Air window) is on.\n"
+                "Automatic: when its longest collider dimension is at least one AIR cell (0.5 m). Always / Never override that.\n"
+                "Static bodies never participate.");
+        }
+
+        if(!movable)
+        {
+            ImGui::TextDisabled("AIR participation: Static bodies do not move the air.");
+        }
+        else if(object.physics->airParticipation == Physics::MovingSolidParticipation::Automatic)
+        {
+            const Physics::MovingSolidParticipationDecision automatic =
+                Physics::ResolveMovingSolidParticipation(true, *object.physics, object.transform.scale);
+            ImGui::TextDisabled("Automatic: %s (longest dimension %.2f m)", automatic.participates ? "participates" : "too small",
+                automatic.extent);
         }
     }
 

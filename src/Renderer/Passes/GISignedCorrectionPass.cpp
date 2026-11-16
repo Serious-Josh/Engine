@@ -1,4 +1,5 @@
 #include "GISignedCorrectionPass.h"
+#include "Debug/MemoryRegistry.h"
 
 #include "Renderer/GraphicsDevice.h"
 #include "Renderer/DescriptorHeap.h"
@@ -17,6 +18,8 @@ bool GISignedCorrectionPass::Initialize(
     {
         return false;
     }
+
+    const MemoryCategoryScope memoryScope(MemoryCategory::LegacyRayTracing);
 
     ShaderDescription shaderDescription{};
 
@@ -86,6 +89,8 @@ bool GISignedCorrectionPass::CreateTextures(
     {
         return false;
     }
+
+    const MemoryCategoryScope memoryScope(MemoryCategory::LegacyRayTracing);
 
     const unsigned int giWidth = (width + 1u) / 2u;
     const unsigned int giHeight = (height + 1u) / 2u;

@@ -1,4 +1,5 @@
 #include "PathTraceTemporalPass.h"
+#include "Debug/MemoryRegistry.h"
 
 #include "Core/Log.h"
 #include "Renderer/DescriptorHeap.h"
@@ -18,6 +19,8 @@ bool PathTraceTemporalPass::Initialize(GraphicsDevice& graphicsDevice, ShaderLib
     {
         return false;
     }
+
+    const MemoryCategoryScope memoryScope(MemoryCategory::PathTracing);
 
     ShaderDescription shaderDescription{};
     shaderDescription.path = "PathTraceTemporal.hlsl";
@@ -58,6 +61,8 @@ bool PathTraceTemporalPass::EnsurePsrVariant(GraphicsDevice& graphicsDevice, Sha
     {
         return m_psrVariantReady;
     }
+
+    const MemoryCategoryScope memoryScope(MemoryCategory::PathTracing);
 
     ShaderDescription shaderDescription{};
     shaderDescription.path = "PathTraceTemporalPsr.hlsl";
@@ -107,6 +112,8 @@ bool PathTraceTemporalPass::EnsureHistory(
         return true;
     }
 
+    const MemoryCategoryScope memoryScope(MemoryCategory::PathTracing);
+
     ReleaseHistory();
 
     constexpr D3D12_RESOURCE_FLAGS unorderedAccess = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
@@ -144,6 +151,8 @@ bool PathTraceTemporalPass::EnsureExtended(ID3D12Device* device, DescriptorHeap&
     {
         return true;
     }
+
+    const MemoryCategoryScope memoryScope(MemoryCategory::PathTracing);
 
     if(!m_diffuse[0].GetResource() || !m_extended.Initialize(device, m_width, m_height, 1, 1,
         DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS) ||

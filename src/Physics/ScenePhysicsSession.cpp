@@ -235,6 +235,14 @@ std::unique_ptr<ScenePhysicsSession> ScenePhysicsSession::Create(const SceneDocu
         auto session = std::unique_ptr<ScenePhysicsSession>(new ScenePhysicsSession(config));
         session->RegisterObjects(document);
         session->RegisterCharacterControllers(document);
+
+        // Controllers always publish as moving solids; bodies only after opting in.
+        for(const auto& [objectID, controller] : session->m_characterControllers)
+        {
+            session->m_movingSolidHistory.emplace(objectID, MovingSolidHistory{});
+            session->MarkMovingSolidDiscontinuity(objectID, controller.pose);
+        }
+
         return session;
     }
     catch (const std::exception& exception)
@@ -357,8 +365,11 @@ void ScenePhysicsSession::Step()
     // Controllers move against start-of-tick geometry; their hosts then take the accepted
     // poses, so this step's native sensor events describe those poses. After the single
     // native step, carry and recovery adjust controllers and hosts for the next step.
+    // Moving-solid history describes this step: poses before any movement of it.
+    RecordMovingSolidStepStart();
     MoveCharacterControllers();
     SynchronizeCharacterHosts();
+    ApplyKinematicTargets();
     m_world.Step();
     ++m_completedSteps;
     ReconcileCharacterControllers();
@@ -970,6 +981,7 @@ bool ScenePhysicsSession::RetireCharacterController(std::string_view objectID, s
         m_sensors.erase(ownedTrigger);
     }
 
+    m_movingSolidHistory.erase(controller->first);
     m_characterControllers.erase(controller);
     return true;
 }
@@ -1257,6 +1269,480 @@ std::optional<RuntimePoseSnapshot> ScenePhysicsSession::CapturePoses(std::string
         {
             *errorMessage = exception.what();
         }
+        return std::nullopt;
+    }
+}
+}
+
+namespace Physics
+{
+namespace
+{
+// Smallest angle (radians) of the rotation taking one unit quaternion to another.
+float RotationAngleBetween(const Quaternion& from, const Quaternion& to)
+{
+    const float dot = from.x * to.x + from.y * to.y + from.z * to.z + from.w * to.w;
+    return 2.0f * std::acos(std::min(std::fabs(dot), 1.0f));
+}
+
+MovingSolidShape CaptureBodyShape(const Body& body)
+{
+    MovingSolidShape shape;
+    shape.type = body.GetColliderType();
+
+    switch(shape.type)
+    {
+    case ColliderType::Box:
+    {
+        const BoxProperties box = body.GetBoxProperties();
+        shape.center = box.localPositionOffset;
+        shape.halfExtents = box.halfExtents;
+        break;
+    }
+
+    case ColliderType::Sphere:
+    {
+        const SphereProperties sphere = body.GetSphereProperties();
+        shape.center = sphere.localPositionOffset;
+        shape.radius = sphere.radius;
+        break;
+    }
+
+    case ColliderType::Capsule:
+    {
+        const CapsuleProperties capsule = body.GetCapsuleProperties();
+        shape.lowerCenter = capsule.lowerCenter;
+        shape.upperCenter = capsule.upperCenter;
+        shape.center = (capsule.lowerCenter + capsule.upperCenter) * 0.5f;
+        shape.radius = capsule.radius;
+        break;
+    }
+    }
+
+    return shape;
+}
+
+bool FailWith(std::string* errorMessage, std::string message)
+{
+    if(errorMessage)
+    {
+        *errorMessage = std::move(message);
+    }
+
+    return false;
+}
+}
+
+std::shared_ptr<Body> ScenePhysicsSession::FindKinematicBody(std::string_view objectID, std::string* errorMessage) const
+{
+    const auto body = m_bodies.find(objectID);
+
+    if(body == m_bodies.end())
+    {
+        FailWith(errorMessage, "No physics body is registered for object " + std::string(objectID) + ".");
+        return nullptr;
+    }
+
+    if(body->second->GetType() != BodyType::Kinematic)
+    {
+        FailWith(errorMessage, "Object " + std::string(objectID) + " is not a Kinematic body.");
+        return nullptr;
+    }
+
+    return body->second;
+}
+
+bool ScenePhysicsSession::SubmitKinematicTarget(std::string_view objectID, std::uint64_t fixedStep, const Pose& target,
+    std::string* errorMessage)
+{
+    const std::shared_ptr<Body> body = FindKinematicBody(objectID, errorMessage);
+
+    if(!body)
+    {
+        return false;
+    }
+
+    if(fixedStep <= m_completedSteps)
+    {
+        return FailWith(errorMessage, "Kinematic target names a fixed step that has already run.");
+    }
+
+    if(fixedStep - m_completedSteps > MaximumCharacterCommandLeadSteps)
+    {
+        return FailWith(errorMessage, "Kinematic target names a fixed step beyond the bounded command window.");
+    }
+
+    std::string validationError;
+
+    if(!ValidateRuntimePose(target, &validationError))
+    {
+        return FailWith(errorMessage, "Invalid Kinematic target: " + validationError);
+    }
+
+    // Checked against the current pose. For a step further ahead, the caller keeps each
+    // step's turn within the limit; Box3D then still takes the shortest arc.
+    if(RotationAngleBetween(body->GetPose().orientation, target.orientation) > MaximumKinematicTargetRotation)
+    {
+        return FailWith(errorMessage, "Kinematic target turns more than a quarter turn in one step; use a teleport.");
+    }
+
+    m_pendingKinematicTargets[std::string(objectID)].insert_or_assign(fixedStep, target);
+
+    if(errorMessage)
+    {
+        errorMessage->clear();
+    }
+
+    return true;
+}
+
+bool ScenePhysicsSession::TeleportKinematicBody(std::string_view objectID, const Pose& pose, std::string* errorMessage)
+{
+    const std::shared_ptr<Body> body = FindKinematicBody(objectID, errorMessage);
+
+    if(!body)
+    {
+        return false;
+    }
+
+    std::string validationError;
+
+    if(!ValidateRuntimePose(pose, &validationError))
+    {
+        return FailWith(errorMessage, "Invalid Kinematic teleport pose: " + validationError);
+    }
+
+    // A jump never carries velocity, and targets planned from the old pose no longer apply.
+    body->SetKinematicPose(pose);
+    body->StopKinematicMotion();
+    const std::string key(objectID);
+    m_pendingKinematicTargets.erase(key);
+    m_movingKinematicBodies.erase(key);
+    m_kinematicVelocities.erase(key);
+
+    if(m_movingSolidHistory.contains(key))
+    {
+        MarkMovingSolidDiscontinuity(key, pose);
+    }
+
+    if(errorMessage)
+    {
+        errorMessage->clear();
+    }
+
+    return true;
+}
+
+void ScenePhysicsSession::ApplyKinematicTargets()
+{
+    const std::uint64_t step = m_completedSteps + 1;
+    std::set<std::string, std::less<>> targetedBodies;
+
+    for(auto request = m_pendingKinematicTargets.begin(); request != m_pendingKinematicTargets.end();)
+    {
+        auto& [objectID, targets] = *request;
+        const auto target = targets.find(step);
+
+        if(target != targets.end())
+        {
+            m_bodies.at(objectID)->SetKinematicTarget(target->second, World::FixedTimeStep);
+            targetedBodies.insert(objectID);
+            targets.erase(target);
+        }
+
+        if(targets.empty())
+        {
+            request = m_pendingKinematicTargets.erase(request);
+        }
+        else
+        {
+            ++request;
+        }
+    }
+
+    // AS.7: a body with a persistent velocity and no explicit target this step moves by velocity * step.
+    for(const auto& [objectID, velocity] : m_kinematicVelocities)
+    {
+        if(targetedBodies.contains(objectID))
+        {
+            continue;
+        }
+
+        const std::shared_ptr<Body>& body = m_bodies.at(objectID);
+        Pose target = body->GetPose();
+        target.position = target.position + velocity * World::FixedTimeStep;
+        body->SetKinematicTarget(target, World::FixedTimeStep);
+        targetedBodies.insert(objectID);
+    }
+
+    // Motion never outlives its target: a body moved by the previous step stops now.
+    for(const std::string& objectID : m_movingKinematicBodies)
+    {
+        if(!targetedBodies.contains(objectID))
+        {
+            m_bodies.at(objectID)->StopKinematicMotion();
+        }
+    }
+
+    m_movingKinematicBodies = std::move(targetedBodies);
+}
+
+bool ScenePhysicsSession::SetBodyLinearVelocity(std::string_view objectID, const Vector3& velocity, std::string* errorMessage)
+{
+    if(!std::isfinite(velocity.x) || !std::isfinite(velocity.y) || !std::isfinite(velocity.z))
+    {
+        return FailWith(errorMessage, "A rigid-body velocity must be finite.");
+    }
+
+    const auto found = m_bodies.find(objectID);
+
+    if(found == m_bodies.end())
+    {
+        return FailWith(errorMessage, "No physics body is registered for object " + std::string(objectID) + ".");
+    }
+
+    const std::shared_ptr<Body>& body = found->second;
+
+    if(body->GetType() == BodyType::Dynamic)
+    {
+        body->SetDynamicLinearVelocity(velocity);
+    }
+    else if(body->GetType() == BodyType::Kinematic)
+    {
+        const std::string key(objectID);
+
+        if(velocity.x == 0.0f && velocity.y == 0.0f && velocity.z == 0.0f)
+        {
+            // Stop: no further targets from the velocity, and no motion carried into the next step.
+            m_kinematicVelocities.erase(key);
+            m_pendingKinematicTargets.erase(key);
+            body->StopKinematicMotion();
+        }
+        else
+        {
+            m_kinematicVelocities.insert_or_assign(key, velocity);
+        }
+    }
+    else
+    {
+        return FailWith(errorMessage, "Static bodies do not move.");
+    }
+
+    if(errorMessage)
+    {
+        errorMessage->clear();
+    }
+
+    return true;
+}
+
+std::optional<Vector3> ScenePhysicsSession::GetBodyLinearVelocity(std::string_view objectID) const
+{
+    const auto found = m_bodies.find(objectID);
+
+    if(found == m_bodies.end() || found->second->GetType() == BodyType::Static)
+    {
+        return std::nullopt;
+    }
+
+    return found->second->GetLinearVelocity();
+}
+
+bool ScenePhysicsSession::AreObjectsTouching(std::string_view objectA, std::string_view objectB) const
+{
+    // Canonical pair order, as CaptureStepContactEvents stores it (named strings: std::minmax returns references).
+    const std::string first(objectA);
+    const std::string second(objectB);
+    const auto found = m_touchingContactCounts.find(first < second ? std::make_pair(first, second) : std::make_pair(second, first));
+    return found != m_touchingContactCounts.end() && found->second > 0;
+}
+
+std::vector<std::string> ScenePhysicsSession::GetMovableBodyIDs() const
+{
+    std::vector<std::string> identifiers;
+
+    for(const auto& [objectID, body] : m_bodies)
+    {
+        if(body->GetType() != BodyType::Static)
+        {
+            identifiers.push_back(objectID);
+        }
+    }
+
+    return identifiers;
+}
+
+bool ScenePhysicsSession::SetMovingSolidParticipation(std::string_view objectID, bool participates,
+    std::string* errorMessage)
+{
+    const std::string key(objectID);
+
+    if(m_characterControllers.contains(key))
+    {
+        if(!participates)
+        {
+            return FailWith(errorMessage, "Character Controllers always participate as moving solids.");
+        }
+    }
+    else
+    {
+        const auto body = m_bodies.find(key);
+
+        if(body == m_bodies.end())
+        {
+            return FailWith(errorMessage, "No physics body is registered for object " + key + ".");
+        }
+
+        if(body->second->GetType() == BodyType::Static)
+        {
+            return FailWith(errorMessage, "Static bodies do not move and cannot participate as moving solids.");
+        }
+
+        if(!participates)
+        {
+            m_movingSolidHistory.erase(key);
+        }
+        else if(!m_movingSolidHistory.contains(key))
+        {
+            // No history exists before participation starts, so it begins as a discontinuity.
+            m_movingSolidHistory.emplace(key, MovingSolidHistory{});
+            MarkMovingSolidDiscontinuity(key, body->second->GetPose());
+        }
+    }
+
+    if(errorMessage)
+    {
+        errorMessage->clear();
+    }
+
+    return true;
+}
+
+bool ScenePhysicsSession::IsMovingSolidParticipant(std::string_view objectID) const
+{
+    return m_movingSolidHistory.find(objectID) != m_movingSolidHistory.end();
+}
+
+Pose ScenePhysicsSession::GetParticipantPose(const std::string& objectID) const
+{
+    const auto controller = m_characterControllers.find(objectID);
+
+    if(controller != m_characterControllers.end())
+    {
+        return controller->second.pose;
+    }
+
+    return m_bodies.at(objectID)->GetPose();
+}
+
+void ScenePhysicsSession::MarkMovingSolidDiscontinuity(const std::string& objectID, const Pose& pose)
+{
+    MovingSolidHistory& history = m_movingSolidHistory.at(objectID);
+    history.poseBeforeStep = pose;
+    history.motionEpoch = ++m_lastMotionEpoch;
+    history.discontinuous = true;
+}
+
+void ScenePhysicsSession::RecordMovingSolidStepStart()
+{
+    for(auto& [objectID, history] : m_movingSolidHistory)
+    {
+        history.poseBeforeStep = GetParticipantPose(objectID);
+        history.discontinuous = false;
+    }
+}
+
+std::optional<MovingSolidSnapshot> ScenePhysicsSession::CaptureMovingSolids(std::uint64_t sessionGeneration,
+    std::string* errorMessage) const
+{
+    if(errorMessage)
+    {
+        errorMessage->clear();
+    }
+
+    try
+    {
+        MovingSolidSnapshot snapshot;
+        snapshot.m_sessionGeneration = sessionGeneration;
+        snapshot.m_completedSteps = m_completedSteps;
+        snapshot.m_entries.reserve(m_movingSolidHistory.size());
+
+        // The history map is in stable-ID order, so entries need no sorting.
+        for(const auto& [objectID, history] : m_movingSolidHistory)
+        {
+            MovingSolidEntry entry;
+            entry.objectID = objectID;
+            entry.previousPose = history.poseBeforeStep;
+            entry.motionEpoch = history.motionEpoch;
+            entry.discontinuous = history.discontinuous;
+            const auto controller = m_characterControllers.find(objectID);
+
+            if(controller != m_characterControllers.end())
+            {
+                // The controller's real solid capsule, upright in its yaw-only frame. Its velocity is
+                // the accepted displacement of the last step (walk, fall, carry and recovery). Yaw is
+                // applied between steps and does not move a vertical capsule, so angular velocity is 0.
+                const CharacterControllerRuntime& runtime = controller->second;
+                const Vector3 localCenter = runtime.configuration.localOffset;
+                entry.kind = MovingSolidKind::CharacterController;
+                entry.pose = runtime.pose;
+                entry.shape.type = ColliderType::Capsule;
+                entry.shape.center = localCenter;
+                entry.shape.lowerCenter = localCenter + runtime.settings.queryCapsule.lowerCenter;
+                entry.shape.upperCenter = localCenter + runtime.settings.queryCapsule.upperCenter;
+                entry.shape.radius = runtime.settings.solidRadius;
+                // F2b.6: SetCharacterYaw turns the pose between steps without moving the solid (only a capsule with no sideways
+                // offset may turn, and it is symmetric about its upright axis). The previous pose takes the current yaw so
+                // consumers deriving wall motion from the two poses see no rotation (it would spin the air around the player).
+                entry.previousPose.orientation = entry.pose.orientation;
+
+                if(!history.discontinuous)
+                {
+                    const Vector3 displacement = entry.pose.position - entry.previousPose.position;
+                    entry.linearVelocity = displacement * (1.0f / World::FixedTimeStep);
+                }
+            }
+            else
+            {
+                const Body& body = *m_bodies.at(objectID);
+                const bool kinematic = body.GetType() == BodyType::Kinematic;
+                entry.kind = kinematic ? MovingSolidKind::Kinematic : MovingSolidKind::Dynamic;
+                entry.pose = body.GetPose();
+                entry.shape = CaptureBodyShape(body);
+
+                // Box3D reports the center of mass's velocity; consumers use the origin's.
+                const Vector3 angularVelocity = body.GetAngularVelocity();
+                const Vector3 originFromCenter = entry.pose.position - body.GetWorldCenterOfMass();
+                entry.angularVelocity = angularVelocity;
+                entry.linearVelocity = body.GetLinearVelocity() + Vector3::Cross(angularVelocity, originFromCenter);
+            }
+
+            std::string validationError;
+            const bool posesValid = ValidateRuntimePose(entry.pose, &validationError) &&
+                ValidateRuntimePose(entry.previousPose, &validationError);
+
+            if(!posesValid)
+            {
+                throw std::runtime_error("Moving-solid capture failed for object " + objectID + ": " + validationError);
+            }
+
+            if(!IsFinite(entry.linearVelocity) || !IsFinite(entry.angularVelocity))
+            {
+                throw std::runtime_error("Moving-solid capture failed for object " + objectID + ": nonfinite velocity");
+            }
+
+            snapshot.m_entries.push_back(std::move(entry));
+        }
+
+        return snapshot;
+    }
+    catch(const std::exception& exception)
+    {
+        if(errorMessage)
+        {
+            *errorMessage = exception.what();
+        }
+
         return std::nullopt;
     }
 }

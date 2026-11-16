@@ -5,6 +5,9 @@
 #include "Engine/PackagedAudioBanks.h"
 #include "assets/ProjectMeshImportService.h"
 #include "Engine/PackagedBootstrap.h"
+#include "assets/ArchiveCookedMeshProvider.h"
+#include "Engine/VoxelArchiveStore.h"
+#include "Scene/MovingSolidParticipants.h"
 #include "Engine/VoxelProjectStore.h"
 #include "Engine/PackagedRenderingSettings.h"
 #include "Engine/RenderingConfigurationResolver.h"
@@ -45,6 +48,7 @@
 #include <filesystem>
 #include <fstream>
 #include <algorithm>
+#include <array>
 #include <system_error>
 #include <cstdlib>
 #include <chrono>
@@ -1013,6 +1017,11 @@ bool Engine::Initialize(const EngineStartup& startup)
     if(startup.mode == EngineStartup::Mode::PackagedRuntime)
     {
         Log::Info("Packaged runtime startup: loose project registry, reconciliation and asset scans disabled.");
+#if !defined(NDEBUG) && defined(ENGINE_HAS_VERIFICATION)
+        // R1.4b diagnostics: keep a baked scene resident without the AIR request, for the packaged bootstrap verification. AIR
+        // execution stays disabled either way. Never compiled into shipping or Release runtimes.
+        m_packagedVoxelResidencyForced = std::getenv("ENGINE_DIAG_PACKAGED_VOXEL_RESIDENCY") != nullptr;
+#endif
         return InitializeScene(SceneSource::Archive);
     }
 
@@ -1275,6 +1284,366 @@ bool Engine::AdmitPackagedMainCamera(const FileSceneRuntime& runtime, std::uint3
 
 // PS.4: what the saved settings ask for against what the last recorded frame rendered, logged only on change. PS.5B adds
 // the effective denoiser and RayQuery visibility of a Path Tracing frame, and when each report happened.
+std::optional<AirMistRenderRequest> Engine::BuildPackagedFogRequest(const FileBackedDemoScene& scene) const
+{
+    if(!scene.m_runtime)
+    {
+        return std::nullopt;
+    }
+
+    const SceneDocument& document = scene.m_runtime->GetFileScene().GetDocument();
+    FogRenderInputs fog;
+    fog.appearance = document.mistRendering.value_or(MistRenderSettings{});
+    fog.haze = document.environmentalHaze.value_or(EnvironmentalHazeSettings{});
+    // R1.3: the cooked project's Volumetrics settings (Medium on the render extent for archives built before R1.3).
+    fog.quality = m_packagedRenderingConfiguration.volumetricQuality;
+    fog.resolutionBasis = m_packagedRenderingConfiguration.volumetricResolutionBasis;
+    // R1.5b (decision D6): the AIR mist, through the Original Raymarch, whenever packaged AIR runs (its cooked request and an initialized
+    // field); the haze is drawn as before either way.
+    fog.mistVisible = m_airConfiguration.enabled && m_renderer.IsAirFieldInitialized();
+
+    std::optional<AirMistRenderRequest> request = BuildFogRenderRequest(fog);
+
+    if(request)
+    {
+        RestrictToPackagedVolumetrics(*request);
+    }
+
+    return request;
+}
+
+void Engine::ResolvePackagedAirConfiguration(const FileBackedDemoScene& scene)
+{
+    if(!scene.m_runtime)
+    {
+        return;
+    }
+
+    m_airConfiguration = ResolveAirSimulation(&scene.m_runtime->GetFileScene().GetDocument(), std::nullopt);
+    const std::uint64_t runtimeIdentity = scene.GetRuntimeIdentity();
+
+    // R1.5 request-level parity: the cooked moving-solid participants, by the rule the Editor's physics sessions apply. Resolved once
+    // per scene runtime, for the log and the bootstrap check; R1.5b's frame request applies the policy itself (BuildAirMovingSolidRequest,
+    // on the physics session the packaged game shares).
+    if(m_packagedMovingSolidScene != runtimeIdentity)
+    {
+        m_packagedMovingSolidScene = runtimeIdentity;
+        m_packagedMovingSolidParticipants = ResolveMovingSolidParticipants(scene.m_runtime->GetFileScene().GetDocument(), m_airConfiguration);
+
+        if(m_airConfiguration.enabled && m_airConfiguration.movingSolids)
+        {
+            Log::Info("R1.5: the cooked scene enables moving-solid displacement; " + std::to_string(m_packagedMovingSolidParticipants.size()) +
+                " bodies participate (Character Controllers always)" + (m_renderer.IsAirFieldInitialized() ? "." :
+                "; AIR is not initialized, so nothing is displaced."));
+        }
+    }
+
+    if(!m_airConfiguration.enabled || m_packagedAirRestrictionLoggedScene == runtimeIdentity)
+    {
+        return;
+    }
+
+    Log::Info("R1.1: the scene's AIR configuration requests simulation (pressure projection " +
+        std::string(m_airConfiguration.pressureProjection ? "on" : "off") + ", " + std::to_string(m_airConfiguration.maximumStepsPerFrame) +
+        " steps per frame); R1.5b: packaged AIR runs it.");
+    m_packagedAirRestrictionLoggedScene = runtimeIdentity;
+}
+
+std::uint64_t Engine::UpdateVoxelResidency(const FileBackedDemoScene* scene, bool admitted, const Vector3& camera)
+{
+    std::uint64_t residencyScene = 0;
+    std::string manifest;
+
+    // The scene runtime's own identity (nonzero and unique per activation) keys everything the controller holds: a new
+    // activation, archive or file, resets residency and drops the previous generation's worker results.
+    if(admitted && scene && scene->m_runtime)
+    {
+        const SceneDocument& document = scene->m_runtime->GetFileScene().GetDocument();
+        residencyScene = scene->GetRuntimeIdentity();
+        manifest = document.voxelBake ? document.voxelBake->manifestReference : std::string{};
+    }
+
+    // Called only when the manifest changes. The archive store pins the activation's archive for as long as the controller holds
+    // it; the project store reads registered assets only.
+    const auto makeStore = [&]() -> std::shared_ptr<const Voxel::AssetStore>
+    {
+        if(scene->IsArchiveActivation())
+        {
+            return std::make_shared<const VoxelScene::ArchiveAssetStore>(scene->ArchiveSource()->provider, manifest);
+        }
+
+        return std::make_shared<const VoxelScene::ProjectAssetStore>(GetActiveProject().GetPaths(),
+            static_cast<const ProjectAssetRegistry&>(m_projectAssetRegistry), manifest);
+    };
+
+    const Vector3 residencyCamera = m_voxelResidencyCameraOverride.value_or(camera);
+    const double now = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    m_voxelResidency.Update(residencyScene, manifest, makeStore, {residencyCamera.x, residencyCamera.y, residencyCamera.z}, now,
+        m_renderer);
+    return residencyScene;
+}
+
+bool Engine::AdmitPackagedVoxelResidency(const FileBackedDemoScene& scene)
+{
+    if(!scene.m_runtime)
+    {
+        return false;
+    }
+
+    const SceneDocument& document = scene.m_runtime->GetFileScene().GetDocument();
+    const bool baked = document.voxelBake.has_value() && !document.voxelBake->manifestReference.empty();
+    // m_airConfiguration is this frame's cooked configuration (ResolvePackagedAirConfiguration runs first).
+    const bool admitted = baked && (m_airConfiguration.enabled || m_packagedVoxelResidencyForced);
+    const std::uint64_t runtimeIdentity = scene.GetRuntimeIdentity();
+
+    if(m_packagedVoxelResidencyLoggedScene != runtimeIdentity)
+    {
+        m_packagedVoxelResidencyLoggedScene = runtimeIdentity;
+
+        if(!baked)
+        {
+            Log::Info("R1.4b: the packaged scene has no voxel bake; voxel residency stays idle.");
+        }
+        else if(admitted)
+        {
+            Log::Info("R1.4b: packaged voxel residency follows the cooked bake " + document.voxelBake->manifestReference + " (" +
+                (m_airConfiguration.enabled ? "the scene requests AIR" : "forced by ENGINE_DIAG_PACKAGED_VOXEL_RESIDENCY") + ").");
+        }
+        else
+        {
+            Log::Info("R1.4b: the packaged scene's voxel bake stays unloaded: its AIR configuration does not request AIR.");
+        }
+    }
+
+    return admitted;
+}
+
+void Engine::BuildAirFrameRequest(AirFrameRequest& request, const AirSimulationSettings& simulation, FileBackedDemoScene* scene,
+    const Vector3& camera, double deltaSeconds, const AirRequestControls& controls)
+{
+    const SceneDocument* document = scene && scene->m_runtime ? &scene->m_runtime->GetFileScene().GetDocument() : nullptr;
+
+    request.enabled = simulation.enabled;
+    request.paused = controls.paused;
+    request.maximumStepsPerFrame = simulation.maximumStepsPerFrame == 1 ? 1u : 2u;
+    request.settings.ambientVelocity = simulation.ambientVelocity;
+    request.solver.dampingRate = simulation.dampingRate;
+    request.solver.maximumMotorSpeed = simulation.maximumMotorSpeed;
+
+    // AIR.4F F4.5.1b: the active scene's air environment (its defaults without a scene document or block). R1.1: cooked from payload
+    // 34, so archive activations and packaged games read it too.
+    const AirEnvironmentSettings environment = document != nullptr ? document->airEnvironment.value_or(AirEnvironmentSettings{}) :
+        AirEnvironmentSettings{};
+    request.solver.ambientTemperature = environment.ambientTemperature;
+    request.solver.temperatureRelaxationTime = environment.relaxationTime;
+
+    // AIR.4E.4 (experimental): the pressure projection, scene configuration (R1.1); its diagnostics only when the Editor shows them.
+    request.pressure.enabled = simulation.pressureProjection;
+    request.pressure.diagnostics = simulation.pressureProjection && simulation.enabled && controls.pressureDiagnostics;
+    // AIR.4F.1b: buoyancy acts through the projection; AirField applies it only to projected steps.
+    request.pressure.buoyancyGravity = simulation.buoyancy ? std::clamp(simulation.buoyancyGravity, 0.0f,
+        AirSimulationSettings::MaximumBuoyancyGravity) : 0.0f;
+
+    request.cameraPosition = camera;
+    request.deltaSeconds = deltaSeconds;
+
+    // AIR.3: the scene's Air Motors from this frame's presented poses (after physics publication), only while air runs. AIR.4F F2: the
+    // scene's Mist Emitters, likewise. File and archive runtimes capture the same way.
+    if(request.enabled && scene && scene->m_runtime)
+    {
+        scene->m_runtime->CaptureAirMotors(deltaSeconds, request.motors);
+        scene->m_runtime->CaptureMistEmitters(request.mistEmitters);
+    }
+    else
+    {
+        request.motors.clear();
+        request.mistEmitters.clear();
+    }
+
+    // AIR.4F: the mist exists (and its 64 MiB is allocated) only while an enabled emitter feeds it. AIR.4F.2d.4 Stage 2c.4: the
+    // conservative transport is the default for projected steps (AirField keeps the advective one without the projection).
+    request.mist.enabled = request.enabled && !request.mistEmitters.empty();
+    request.mist.paused = controls.mistPaused;
+    request.mist.dissipationRate = simulation.mistDissipationRate;
+    request.mist.conservativeTransport = controls.conservativeMistTransport;
+    request.mist.forcedSubsteps = controls.forcedMistSubsteps;
+
+    BuildAirMovingSolidRequest(request.movingSolids, simulation, controls.diagnosticMovingSolids);
+}
+
+void Engine::BuildAirMovingSolidRequest(AirMovingSolidRequest& request, const AirSimulationSettings& simulation, bool diagnosticOverlay)
+{
+    // AIR.4F.3 diagnostic, kept by R1.5 for the studies' baselines: `diagnosticOverlay` (the Editor's ENGINE_AIR_MOVING_SOLIDS=1, Debug
+    // builds only) turns the overlay on whatever the scene says and opts in every Dynamic and Kinematic body. Packaged frames pass false.
+
+    // R1.5: the scene's moving-solid displacement (its AIR configuration, or the Play/simulation session override). The overlay carves
+    // the published moving solids (the physics snapshot presented this frame) out of the air's fluid pieces with the validated F1a.3
+    // pressure path (obstacle bits, local hierarchy updates, topology check and relabel fallback, warm starts, GPU recovery), and the
+    // F2b coupling. Warm pressure stays coupled to it (AirField: warmPressure = movingSolids.enabled).
+    const bool authored = simulation.enabled && simulation.movingSolids;
+    const bool overlay = authored || diagnosticOverlay;
+    request.enabled = overlay;
+    request.solids.clear();
+
+    // Participation is applied once per physics session (Physics Simulation and Play share the controller): when a session starts
+    // with the overlay on, or when the overlay turns on during one (a session override). Character Controllers always publish. The
+    // authored policy admits bodies by MovingSolidParticipation.h; the diagnostic admits every movable body. Opting in starts a new
+    // motion epoch (a discontinuity); the first publication is the next one. A new session (another scene, or Stop and Play) has a
+    // new generation, so nothing of an earlier session's participation carries over.
+    const std::uint64_t physicsGeneration = m_physicsSimulation.GetSessionGeneration();
+
+    if(overlay && m_physicsSimulation.GetState() == PhysicsSimulationController::State::Active &&
+        physicsGeneration != 0 && physicsGeneration != m_movingSolidOptInGeneration)
+    {
+        std::string participationError;
+        std::vector<std::string> participants;
+        const bool applied = diagnosticOverlay ?
+            m_physicsSimulation.SetAllMovableBodiesParticipating(physicsGeneration, participationError) :
+            m_physicsSimulation.ApplyMovingSolidParticipationPolicy(physicsGeneration, participants, participationError);
+
+        if(!applied)
+        {
+            Log::Warning("AIR moving solids: bodies could not join the overlay: " + participationError);
+        }
+        else if(!diagnosticOverlay)
+        {
+            Log::Info("AIR moving solids: " + std::to_string(participants.size()) +
+                " bodies participate by the scene's policy (Character Controllers always).");
+        }
+
+        m_movingSolidOptInGeneration = physicsGeneration;
+    }
+
+    const auto movingSolids = overlay ? m_physicsSimulation.GetPublishedMovingSolids() : nullptr;
+    // AIR.4F.3 F2b.5: the snapshot's session and step, so AIR takes one physics step of motion per AIR step.
+    request.physicsSession = movingSolids ? movingSolids->GetSessionGeneration() : 0;
+    request.physicsStep = movingSolids ? movingSolids->GetCompletedSteps() : 0;
+
+    if(!movingSolids)
+    {
+        return;
+    }
+
+    for(const Physics::MovingSolidEntry& entry : movingSolids->GetEntries())
+    {
+        AirMovingSolid solid;
+        solid.objectID = entry.objectID;
+        solid.motionEpoch = entry.motionEpoch;
+        solid.shape = entry.shape.type == Physics::ColliderType::Sphere ? AirMovingSolidShape::Sphere :
+            (entry.shape.type == Physics::ColliderType::Capsule ? AirMovingSolidShape::Capsule : AirMovingSolidShape::Box);
+        solid.position = entry.pose.position;
+        solid.orientation = {entry.pose.orientation.x, entry.pose.orientation.y, entry.pose.orientation.z, entry.pose.orientation.w};
+        solid.center = entry.shape.center;
+        solid.halfExtents = entry.shape.halfExtents;
+        solid.lowerCenter = entry.shape.lowerCenter;
+        solid.upperCenter = entry.shape.upperCenter;
+        solid.radius = entry.shape.radius;
+        // AIR.4F.3 F2b.2a: the pose at the start of the latest physics step, for frames with several AIR steps.
+        solid.hasPrevious = !entry.discontinuous;
+        solid.previousPosition = entry.previousPose.position;
+        solid.previousOrientation = {entry.previousPose.orientation.x, entry.previousPose.orientation.y,
+            entry.previousPose.orientation.z, entry.previousPose.orientation.w};
+        request.solids.push_back(std::move(solid));
+    }
+}
+
+void Engine::ReportPackagedVoxelResidency(std::uint64_t residencyScene)
+{
+    // A new admitted scene runtime starts a new report; identity 0 (not admitted, or no bake) is never reported.
+    if(residencyScene != m_packagedResidencyReportScene)
+    {
+        m_packagedResidencyReportScene = residencyScene;
+        m_packagedResidencySettledReported = false;
+        m_packagedResidencyStarted = std::chrono::steady_clock::now();
+    }
+
+    const bool settled = m_voxelResidency.IsSettled() && m_renderer.GetVoxelWorldBinding().valid != 0;
+
+    if(residencyScene == 0 || m_packagedResidencySettledReported || !settled)
+    {
+        return;
+    }
+
+    m_packagedResidencySettledReported = true;
+    const double milliseconds = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - m_packagedResidencyStarted).count();
+    const VoxelResidencyController::Statistics& controller = m_voxelResidency.GetStatistics();
+    const VoxelResidencyResources::Statistics storage = m_renderer.GetVoxelResidencyStatistics();
+    Log::Info("R1.4c: packaged voxel residency settled " + std::to_string(milliseconds) + " ms after the scene's first residency frame: " +
+        std::to_string(controller.regionsPublished) + " regions published (" + std::to_string(controller.regionsDecoded) + " decoded), " +
+        std::to_string(storage.brickChunks) + " brick and " + std::to_string(storage.indexChunks) + " index chunks, " +
+        std::to_string(storage.bytesUploaded) + " bytes uploaded, window " + std::to_string(m_renderer.GetVoxelWorldBinding().window) + ".");
+}
+
+void Engine::ReportPackagedVoxelResidencyTotals() const
+{
+    const VoxelResidencyController::Statistics& controller = m_voxelResidency.GetStatistics();
+    const VoxelResidencyResources::Statistics storage = m_renderer.GetVoxelResidencyStatistics();
+    Log::Info("R1.4c: packaged voxel residency totals: " + std::to_string(controller.manifestsDecoded) + " manifests and " +
+        std::to_string(controller.regionsDecoded) + " regions decoded, " + std::to_string(controller.regionsPublished) + " published, " +
+        std::to_string(controller.regionsEvicted) + " evicted, " + std::to_string(controller.resultsDropped) + " results dropped, " +
+        std::to_string(controller.loadFailures) + " load failures, " + std::to_string(controller.tablesSet) + " tables; storage " +
+        std::to_string(storage.brickChunks) + " brick and " + std::to_string(storage.indexChunks) + " index chunks, " +
+        std::to_string(storage.bytesUploaded) + " bytes uploaded, " + std::to_string(storage.retiredBuffers) + " buffers awaiting retirement; " +
+        "AIR steps in the latest frame " + std::to_string(m_renderer.GetAirStepCount()) + ", air binding " +
+        (m_renderer.GetAirFieldBinding().valid != 0 ? "valid" : "invalid") + ".");
+}
+
+void Engine::PreparePackagedAir(const FileBackedDemoScene& scene)
+{
+    if(m_startup.mode != EngineStartup::Mode::PackagedRuntime || !scene.m_runtime || !scene.IsArchiveActivation() ||
+        m_renderer.IsAirFieldInitialized())
+    {
+        return;
+    }
+
+    const std::uint64_t runtimeIdentity = scene.GetRuntimeIdentity();
+    const AirSimulationSettings cooked = ResolveAirSimulation(&scene.m_runtime->GetFileScene().GetDocument(), std::nullopt);
+
+    if(!cooked.enabled || m_packagedAirPreparedScene == runtimeIdentity)
+    {
+        return;
+    }
+
+    m_packagedAirPreparedScene = runtimeIdentity;
+
+    // Build Game archives the three noise volumes with AIR (decision D5). One that cannot be read is passed empty: the mist pass then
+    // warns and draws without that detail, as the Editor does for a missing loose file.
+    std::array<std::vector<std::byte>, 3> noise;
+
+    for(std::size_t index = 0; index < noise.size(); ++index)
+    {
+        const PackagedBootstrap::MistNoise volume = PackagedBootstrap::MistNoiseVolumes[index];
+
+        try
+        {
+            noise[index] = scene.ArchiveSource()->provider->ReadEntry(PackagedBootstrap::MistNoiseID(volume), EngineAssetPak::Type::Resource,
+                PackagedBootstrap::MistNoisePayloadVersion, PackagedBootstrap::MaximumMistNoiseBytes);
+        }
+        catch(const std::exception& exception)
+        {
+            Log::Warning(std::string("Packaged AIR: the mist noise ") + PackagedBootstrap::MistNoiseFileName(volume) +
+                " is unavailable: " + exception.what());
+        }
+    }
+
+    if(!m_renderer.InitializePackagedAir(noise[0], noise[1], noise[2], &m_packagedAirInitialization))
+    {
+        Log::Error("Packaged AIR could not be initialized; the scene runs without AIR.");
+    }
+}
+
+void Engine::FollowAirScene(std::uint64_t airScene, std::uint64_t physicsSession)
+{
+    if(airScene == m_airScene && physicsSession == m_airPhysicsSession)
+    {
+        return;
+    }
+
+    m_renderer.ResetAirField();
+    m_airScene = airScene;
+    m_airPhysicsSession = physicsSession;
+}
+
 void Engine::ReportPackagedLightingMode(double renderMilliseconds)
 {
     const LightingModeTransitionStatus& status = m_renderer.GetLightingModeTransitionStatus();
@@ -2253,6 +2622,9 @@ bool Engine::InitializeScene(SceneSource source)
                 throw std::runtime_error("Packaged Game Play initialization failed: " + error);
             }
 
+            // R1.5b: AIR's pipelines and noise before the first frame, when the cooked scene requests AIR.
+            PreparePackagedAir(*owner);
+
             // Archive cooking/upload/admission time is not simulated elapsed time.
             m_time.Update();
         }
@@ -2600,6 +2972,33 @@ void Engine::Frame()
             m_window.Close();
             return;
         }
+
+        // R1.1: the cooked AIR configuration resolves through the shared path (no session override exists here). R1.5b: packaged frames
+        // request AIR below when it was initialized for the scene.
+        ResolvePackagedAirConfiguration(*owner);
+
+        // R1.4b: the same controller as the Editor, fed from the archive, admitted only for a bake whose scene requests AIR (or the
+        // diagnostics override). Between frames, before Render, which records the uploads; decoding stays on the controller's worker.
+        const Vector3 residencyCamera = options.view ? options.view->position : demo.GetScene().GetCamera().GetPosition();
+        ReportPackagedVoxelResidency(UpdateVoxelResidency(owner, AdmitPackagedVoxelResidency(*owner), residencyCamera));
+
+        // R1.5b: packaged AIR, as the Editor runs it. A scene activated after startup prepares here (startup prepared before its first
+        // frame). The air field follows the scene runtime's identity (decision D2), so an unbaked scene, which has no residency, still
+        // starts from a fresh field. The request is the Editor's BuildAirFrameRequest with production controls (running, no diagnostics),
+        // built after physics publication from this frame's presented poses; Render records it after the residency uploads.
+        PreparePackagedAir(*owner);
+        FollowAirScene(owner->GetRuntimeIdentity(), m_physicsSimulation.GetSessionGeneration());
+
+        if(m_airConfiguration.enabled && m_renderer.IsAirFieldInitialized())
+        {
+            BuildAirFrameRequest(m_airRequest, m_airConfiguration, owner, m_voxelResidencyCameraOverride.value_or(residencyCamera),
+                m_airDeltaOverrideForVerification.value_or(m_time.GetDeltaTime()), AirRequestControls{});
+            options.air = m_airRequest;
+        }
+
+        // R1.2b/R1.3: the cooked environmental haze, built as the Editor builds its request: the cooked mist appearance (payload 35;
+        // earlier archives use the defaults) and the cooked project's Volumetrics settings. Only the haze is ever drawn here.
+        options.airMist = BuildPackagedFogRequest(*owner);
 
         // Archive-only lighting from the cooked document; payloads before 11 carry no Lights, so
         // they render with their legacy sun exactly as before.
@@ -3318,7 +3717,9 @@ void Engine::Frame()
 
     // PS.2B: the resolved rendering configuration (the Debug panel through the shared resolver until PS.2C),
     // applied before the caustic snapshot boundary below.
-    ApplyRenderingConfiguration(debugUI.GetRenderingConfiguration(), m_renderer, rendererOptions);
+    // R1.3: resolved once per frame; the fog request below reads its Volumetrics settings too.
+    const RenderingConfiguration frameRenderingConfiguration = debugUI.GetRenderingConfiguration();
+    ApplyRenderingConfiguration(frameRenderingConfiguration, m_renderer, rendererOptions);
     rendererOptions.frameDeltaSeconds = m_time.GetDeltaTime();
     rendererOptions.exposureReset = std::exchange(m_exposureResetPending, false);
 
@@ -3404,46 +3805,101 @@ void Engine::Frame()
     // VX.5: static voxel residency follows the scene's published bake and the camera that renders this frame (the Game Play
     // camera while playing). Between frames; the Renderer records the uploads at the start of its next frame.
     {
-        std::uint64_t residencyScene = 0;
-        std::string residencyManifest;
-
-        if (physicsScene && physicsScene->m_runtime && !physicsScene->IsArchiveActivation())
-        {
-            const SceneDocument& document = physicsScene->m_runtime->GetFileScene().GetDocument();
-            residencyScene = physicsScene->GetRuntimeIdentity();
-            residencyManifest = document.voxelBake ? document.voxelBake->manifestReference : std::string{};
-        }
-
+        // R1.4b: file and archive activations alike (an archive activation reads its bake from its archive).
         const Vector3 camera = rendererOptions.view ? rendererOptions.view->position : activeScene.GetCamera().GetPosition();
-        const double now = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
-        const auto makeStore = [&]() -> std::shared_ptr<const Voxel::AssetStore>
-        {
-            return std::make_shared<const VoxelScene::ProjectAssetStore>(GetActiveProject().GetPaths(),
-                static_cast<const ProjectAssetRegistry&>(m_projectAssetRegistry), residencyManifest);
-        };
-        m_voxelResidency.Update(residencyScene, residencyManifest, makeStore, {camera.x, camera.y, camera.z}, now, m_renderer);
+        UpdateVoxelResidency(physicsScene, true, camera);
 
-        // AIR.1: the air field follows the same camera; a different scene starts from a fresh field.
-        if (residencyScene != m_airScene)
-        {
-            m_renderer.ResetAirField();
-            m_airScene = residencyScene;
-        }
+        // AIR.1: the air field follows the same camera; a different scene starts from a fresh field. R1.5b: keyed by the scene runtime's
+        // identity, which is the residency's whenever residency runs (in the Editor, always for a scene), so the two never disagree.
+        // R1.6: and by the physics session, so each Play or Physics Simulation Start and each Stop starts from a fresh field.
+        FollowAirScene(physicsScene && physicsScene->m_runtime ? physicsScene->GetRuntimeIdentity() : 0,
+            m_physicsSimulation.GetSessionGeneration());
 
-        // AIR.4A: the Air window's settings drive the request; Reset re-initializes the whole field on the next frame.
+        // R1.1: the simulation configuration comes from ResolveAirSimulation alone: the Editor's Play or Physics Simulation session
+        // override, else the active scene's block (file or cooked), else the defaults. The Air window keeps pause, the views and Reset.
         const Editor::AirEditorSettings& air = m_editor.GetAirSettings();
-        m_airRequest.enabled = air.enabled;
-        m_airRequest.paused = air.paused;
-        m_airRequest.settings.ambientVelocity = air.ambientVelocity;
-        m_airRequest.solver.dampingRate = air.dampingRate;
-        m_airRequest.solver.maximumMotorSpeed = air.maximumMotorSpeed;
+        const SceneDocument* airDocument = physicsScene && physicsScene->m_runtime ? &physicsScene->m_runtime->GetFileScene().GetDocument() :
+            nullptr;
+        const std::optional<AirSimulationSettings> airOverride = physicsScene && physicsScene->m_runtime ?
+            m_editor.GetAirSimulationOverride(physicsScene->GetRuntimeIdentity()) : std::nullopt;
+        m_airConfiguration = ResolveAirSimulation(airDocument, airOverride);
+        const AirSimulationSettings& simulation = m_airConfiguration;
+
+        // R1.1: packaged frames never reach this block (they render from their own branch; ResolvePackagedAirConfiguration). The
+        // gate stays as a backstop, so AIR could not run in a packaged runtime even if that changed.
+        const bool airExecutionAllowed = m_startup.mode != EngineStartup::Mode::PackagedRuntime;
+        const bool airEnabled = simulation.enabled && airExecutionAllowed;
+
+        // R1.5b: the Editor's own inputs (the Air window's pause, mist pause and divergence view, and the diagnostic overrides); the
+        // request itself is BuildAirFrameRequest's, shared with packaged frames.
+        AirRequestControls controls;
+        controls.paused = air.paused;
+        controls.mistPaused = air.mistPaused;
+        controls.pressureDiagnostics = air.showDivergence;
+
+        // AIR.4F.2d.4 Stage 2c.4: the conservative mist transport is the default for projected steps (AirField keeps the advective one
+        // without the projection). ENGINE_AIR_CONSERVATIVE_MIST (diagnostic A/B): "0" selects the advective transport everywhere; unset or
+        // "1" keeps the default. Read once; never saved; not an Inspector setting.
+        static const char* const conservativeMistSetting = std::getenv("ENGINE_AIR_CONSERVATIVE_MIST");
+        static const bool conservativeMistDisabled = conservativeMistSetting != nullptr && std::string_view(conservativeMistSetting) == "0";
+        static const bool conservativeMistRequested = conservativeMistSetting != nullptr && std::string_view(conservativeMistSetting) == "1";
+        controls.conservativeMistTransport = !conservativeMistDisabled;
+
+        // AIR.4F.2d.4 Stage 2b.1 (diagnostic): ENGINE_AIR_MIST_SUBSTEPS=1..4 forces the conservative transport's substep count; unset or
+        // anything else keeps it adaptive. It never enables the conservative transport (ENGINE_AIR_CONSERVATIVE_MIST=0 still disables it).
+        static const std::uint32_t forcedMistSubsteps = []
+        {
+            const char* setting = std::getenv("ENGINE_AIR_MIST_SUBSTEPS");
+            const int value = setting != nullptr ? std::atoi(setting) : 0;
+            return value >= 1 && value <= 4 ? static_cast<std::uint32_t>(value) : 0u;
+        }();
+        controls.forcedMistSubsteps = forcedMistSubsteps;
+
+        // AIR.4F.3 diagnostic, kept by R1.5 for the studies' baselines: ENGINE_AIR_MOVING_SOLIDS=1 turns the overlay on whatever the scene
+        // says, and opts in every Dynamic and Kinematic body. Debug builds only, so no Release Editor or packaged runtime can be forced.
+#if !defined(NDEBUG)
+        static const bool diagnosticMovingSolids = []
+        {
+            const char* setting = std::getenv("ENGINE_AIR_MOVING_SOLIDS");
+            return setting != nullptr && std::string_view(setting) == "1";
+        }();
+        controls.diagnosticMovingSolids = diagnosticMovingSolids;
+#endif
+
+        // The packaged backstop (airExecutionAllowed) is part of the simulation the request is built from.
+        AirSimulationSettings requested = simulation;
+        requested.enabled = airEnabled;
+        BuildAirFrameRequest(m_airRequest, requested, physicsScene, m_voxelResidencyCameraOverride.value_or(camera),
+            m_airDeltaOverrideForVerification.value_or(m_time.GetDeltaTime()), controls);
 
         if (m_editor.TakeAirResetRequest())
         {
             m_renderer.ResetAirField();
         }
 
-        if (air.enabled && air.showVectors)
+
+        // AIR.4F F4.5.1b.1: the temperature points, independent of the vectors.
+        if (airEnabled && air.showTemperature)
+        {
+            AirTemperatureRequest temperature;
+            temperature.spacingExponent = std::clamp(air.temperatureSpacingExponent, 0, 3);
+            temperature.displayRange = std::clamp(air.temperatureDisplayRange, 1.0f, 1000.0f);
+            rendererOptions.airTemperature = temperature;
+        }
+
+        // AIR.4E.2: the divergence points, independent of the other views; computed only while shown.
+        if (airEnabled && air.showDivergence)
+        {
+            AirDivergenceRequest divergence;
+            divergence.spacingExponent = std::clamp(air.divergenceSpacingExponent, 0, 3);
+            divergence.displayRange = std::clamp(air.divergenceDisplayRange, 0.01f, 100.0f);
+            divergence.measure = air.divergenceMeasure == 1 ? AirDivergenceMeasure::Collocated :
+                (air.divergenceMeasure == 2 ? AirDivergenceMeasure::BeforeProjection : AirDivergenceMeasure::Face);
+            divergence.ambientVelocity = simulation.ambientVelocity;
+            rendererOptions.airDivergence = divergence;
+        }
+
+        if (airEnabled && air.showVectors)
         {
             AirVisualizationRequest vectors;
             vectors.spacingExponent = std::clamp(air.vectorSpacingExponent, -2, 3);
@@ -3454,22 +3910,34 @@ void Engine::Frame()
             vectors.colorMaximumSpeed = air.colorMaximumSpeed;
             vectors.minimumSpeed = air.minimumSpeed;
             vectors.placement = air.vectorsAtPieceAnchors ? AirVectorPlacement::PieceAnchors : AirVectorPlacement::HashedPoints;
-            vectors.ambientVelocity = air.ambientVelocity;
+            vectors.ambientVelocity = simulation.ambientVelocity;
             rendererOptions.airVisualization = vectors;
         }
 
         // AIR.4F F3: the mist view; it draws only while the field holds mist (an enabled emitter feeds it). AIR.4F F4.4.1: its
-        // appearance is the active scene's (or the value being dragged in the Air window); the quality preset is the Editor's.
-        if (air.enabled && air.showMist)
+        // appearance is the active scene's (or the value being dragged in the Air window).
+        // AIR.4F.2d.3: the fog request also carries the scene's environmental haze, so it exists whenever the haze is enabled, with or
+        // without AIR. R1.2b: built by BuildFogRenderRequest, as packaged frames build theirs, from the active scene's document whether
+        // it is a file or an archive activation.
+        const SceneDocument* fogDocument = physicsScene && physicsScene->m_runtime ? &physicsScene->m_runtime->GetFileScene().GetDocument() :
+            nullptr;
+        FogRenderInputs fog;
+        fog.appearance = m_editor.GetEffectiveMistRendering(fogDocument, fogDocument != nullptr ? physicsScene->GetRuntimeIdentity() : 0);
+        fog.haze = fogDocument != nullptr ? fogDocument->environmentalHaze.value_or(EnvironmentalHazeSettings{}) : EnvironmentalHazeSettings{};
+        // R1.3: the project's Volumetrics settings with any session override (the Air window's or the Debug panel's).
+        fog.quality = frameRenderingConfiguration.volumetricQuality;
+        fog.resolutionBasis = frameRenderingConfiguration.volumetricResolutionBasis;
+        fog.mistVisible = airEnabled && air.showMist;
+        rendererOptions.airMist = BuildFogRenderRequest(fog);
+
+        // V1d follow-up (Editor diagnostic): the experimental integrated froxel renderer.
+        if (rendererOptions.airMist && air.volumetricRenderer == 1)
         {
-            const SceneDocument* mistDocument = physicsScene && physicsScene->m_runtime && !physicsScene->IsArchiveActivation() ?
-                &physicsScene->m_runtime->GetFileScene().GetDocument() : nullptr;
-            rendererOptions.airMist = MakeAirMistRenderRequest(m_editor.GetEffectiveMistRendering(mistDocument,
-                    mistDocument != nullptr ? physicsScene->GetRuntimeIdentity() : 0),
-                static_cast<AirMistQuality>(std::clamp(air.mistQuality, 0, 2)));
+            ApplyIntegratedFroxelRenderer(*rendererOptions.airMist, air.volumetricAdaptiveSamples, air.volumetricLateralMode,
+                air.volumetricDoubleXY);
         }
 
-        if (air.enabled && (air.showBlockedCells || air.showUnknownCells || air.showFluidPieces))
+        if (airEnabled && (air.showBlockedCells || air.showUnknownCells || air.showFluidPieces))
         {
             AirCellRequest cells;
             cells.blocked = air.showBlockedCells;
@@ -3479,26 +3947,16 @@ void Engine::Frame()
             rendererOptions.airCells = cells;
         }
 
-        m_airRequest.cameraPosition = camera;
-        m_airRequest.deltaSeconds = m_time.GetDeltaTime();
+        // Said once per session whenever it cannot act: without the projection the advective transport stays.
+        static bool conservativeMistWithoutProjectionReported = false;
 
-        // AIR.3: the scene's Air Motors from this frame's presented poses (after physics publication), only while air runs.
-        if (m_airRequest.enabled && physicsScene && physicsScene->m_runtime)
+        if (conservativeMistRequested && m_airRequest.mist.enabled && !m_airRequest.pressure.enabled &&
+            !conservativeMistWithoutProjectionReported)
         {
-            physicsScene->m_runtime->CaptureAirMotors(m_time.GetDeltaTime(), m_airRequest.motors);
-            // AIR.4F F2: the scene's Mist Emitters, likewise.
-            physicsScene->m_runtime->CaptureMistEmitters(m_airRequest.mistEmitters);
+            Log::Warning("ENGINE_AIR_CONSERVATIVE_MIST is set, but pressure projection is off: the mist keeps the advective transport "
+                "until the projection is enabled (Air window, Pressure).");
+            conservativeMistWithoutProjectionReported = true;
         }
-        else
-        {
-            m_airRequest.motors.clear();
-            m_airRequest.mistEmitters.clear();
-        }
-
-        // AIR.4F: the mist exists (and its 64 MiB is allocated) only while an enabled emitter feeds it.
-        m_airRequest.mist.enabled = m_airRequest.enabled && !m_airRequest.mistEmitters.empty();
-        m_airRequest.mist.paused = air.mistPaused;
-        m_airRequest.mist.dissipationRate = air.mistDissipationRate;
 
         if (m_editor.TakeMistClearRequest())
         {
@@ -3508,8 +3966,38 @@ void Engine::Frame()
         rendererOptions.air = m_airRequest;
         // AIR.4D D2: what the field found at each motor's emission points, for the Inspector.
         m_editor.SetAirMotorEmission(m_renderer.GetAirMotorEmission());
-        // AIR.4F F2: where each Mist Emitter's origin lies and how many pieces it reached.
-        m_editor.SetMistEmitterStatus(m_renderer.GetMistEmitterStatus());
+        // AIR.4E.5b.1: the steps the previous frame ran (0 while air is off or paused).
+        m_editor.SetAirStepCount(m_renderer.GetAirStepCount());
+        // AIR.4F F2: where each Mist Emitter's origin lies and how many pieces it reached. AIR.4F.2b: and whether a Point emitter's
+        // jet (a motor tagged as its emitter) found a motor slot; a change in how many did not is logged once.
+        std::map<std::uint64_t, MistEmitterStatus> mistEmitterStatus = m_renderer.GetMistEmitterStatus();
+        const std::vector<std::uint64_t>& motorsWithoutCapacity = m_renderer.GetAirMotorsWithoutCapacity();
+        std::size_t jetsWithoutCapacity = 0;
+
+        for(const std::uint64_t tag : motorsWithoutCapacity)
+        {
+            const auto status = mistEmitterStatus.find(tag);
+
+            if(status != mistEmitterStatus.end())
+            {
+                status->second.jetWithoutCapacity = true;
+                ++jetsWithoutCapacity;
+            }
+        }
+
+        if(motorsWithoutCapacity.size() != m_loggedMotorsWithoutCapacity)
+        {
+            m_loggedMotorsWithoutCapacity = motorsWithoutCapacity.size();
+
+            if(m_loggedMotorsWithoutCapacity > 0)
+            {
+                Log::Warning("Air: " + std::to_string(m_loggedMotorsWithoutCapacity) + " motors reaching the air window found all " +
+                    std::to_string(AirField::MaximumMotors) + " motor slots taken and move no air (" + std::to_string(jetsWithoutCapacity) +
+                    " of them Mist Emitter jets).");
+            }
+        }
+
+        m_editor.SetMistEmitterStatus(std::move(mistEmitterStatus));
     }
 
     // VX.4C.2: publish between frames, so the Renderer's buffer replacement never meets an open recording. The request is
@@ -3582,6 +4070,7 @@ void Engine::Shutdown()
     {
         m_window.Hide();
         Log::Info("Packaged shutdown: window hidden.");
+        ReportPackagedVoxelResidencyTotals();
     }
 
     // Gameplay ends before any scene teardown, so every started script receives OnStop.

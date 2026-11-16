@@ -193,6 +193,7 @@ namespace
             {"capsuleCylinderHeight", component.capsuleCylinderHeight},
             {"capsuleLocalRotation", ToJson(component.capsuleLocalRotation)},
             {"generateContactEvents", component.generateContactEvents},
+            {"airParticipation", Physics::MovingSolidParticipationName(component.airParticipation)},
             {"boxDimensions", {
                 {"width", component.boxDimensions.width},
                 {"height", component.boxDimensions.height},
@@ -214,8 +215,15 @@ namespace
         const bool capsuleSchema = schemaVersion >= SceneDocument::kCapsuleSchemaVersion;
         const bool capsuleRotationSchema = schemaVersion >= SceneDocument::kCapsuleRotationSchemaVersion;
         const bool contactEventsSchema = schemaVersion >= SceneDocument::kContactEventsSchemaVersion;
+        const bool participationSchema = schemaVersion >= SceneDocument::kMovingSolidParticipationSchemaVersion;
 
-        if(contactEventsSchema)
+        if(participationSchema)
+        {
+            ValidateFields(value, {"bodyType", "colliderType", "boxDimensions", "sphereRadius", "capsuleRadius",
+                "capsuleCylinderHeight", "capsuleLocalRotation", "colliderLocalPositionOffset", "density", "friction",
+                "restitution", "generateContactEvents", "airParticipation"});
+        }
+        else if(contactEventsSchema)
         {
             ValidateFields(value, {"bodyType", "colliderType", "boxDimensions", "sphereRadius", "capsuleRadius",
                 "capsuleCylinderHeight", "capsuleLocalRotation", "colliderLocalPositionOffset", "density", "friction",
@@ -307,6 +315,18 @@ namespace
             }
 
             component.generateContactEvents = generateContactEvents.get<bool>();
+        }
+
+        // R1.5: v1-v26 keep Automatic; v27 requires one of the three names (no numbers, no other spelling).
+        if(participationSchema)
+        {
+            const Json& participation = value.at("airParticipation");
+
+            if(!participation.is_string() ||
+                !Physics::TryParseMovingSolidParticipation(participation.get<std::string>(), component.airParticipation))
+            {
+                throw std::runtime_error("Physics airParticipation must be Automatic, Always or Never.");
+            }
         }
 
         const auto& dimensions = value.at("boxDimensions");
@@ -752,7 +772,17 @@ namespace
                     {"halfExtents", ToJson(emitter.halfExtents)},
                     {"rate", emitter.rate},
                     {"color", ToJson(emitter.color)},
-                    {"density", emitter.density}
+                    {"density", emitter.density},
+                    {"temperature", emitter.temperature},
+                    {"mode", MistEmitterModeName(emitter.mode)},
+                    {"emissionRate", emitter.emissionRate},
+                    {"jetSpeed", emitter.jetSpeed},
+                    {"temperatureResponseRate", emitter.temperatureResponseRate},
+                    {"targetDensity", emitter.targetDensity},
+                    {"replenishmentRate", emitter.replenishmentRate},
+                    {"fillHeight", emitter.fillHeight},
+                    {"edgeSoftness", emitter.edgeSoftness},
+                    {"volumeTemperatureRate", emitter.volumeTemperatureRate}
                 };
             }
 
@@ -878,7 +908,52 @@ namespace
                 {"wisps", {{"enabled", mist.wisps}, {"strength", mist.wispStrength}, {"scale", mist.wispScale}}},
                 {"densityDetail", {{"enabled", mist.densityDetail}, {"strength", mist.densityDetailStrength}}},
                 {"lighting", {{"enabled", mist.lighting}, {"sunShadows", mist.sunShadows}, {"scattering", mist.scattering},
-                    {"anisotropy", mist.anisotropy}, {"ambient", mist.ambient}}}
+                    {"anisotropy", mist.anisotropy}, {"ambient", mist.ambient}, {"scatteringTint", mist.scatteringTint},
+                    {"multipleScattering", mist.multipleScattering}, {"indirectScattering", mist.indirectScattering}}},
+                {"nearClearance", {{"distance", mist.nearDistance}, {"transition", mist.nearTransition}}}
+            };
+        }
+
+        // AIR.4F F4.5.1b: every field, as for mistRendering.
+        if(document.airEnvironment)
+        {
+            scene["airEnvironment"] = {
+                {"ambientTemperature", document.airEnvironment->ambientTemperature},
+                {"relaxationTime", document.airEnvironment->relaxationTime}
+            };
+        }
+
+        // R1.1: every field, as for airEnvironment.
+        if(document.airSimulation)
+        {
+            const AirSimulationSettings& simulation = *document.airSimulation;
+            scene["airSimulation"] = {
+                {"enabled", simulation.enabled},
+                {"pressureProjection", simulation.pressureProjection},
+                {"buoyancy", simulation.buoyancy},
+                {"buoyancyGravity", simulation.buoyancyGravity},
+                {"maximumStepsPerFrame", simulation.maximumStepsPerFrame},
+                {"ambientVelocity", ToJson(simulation.ambientVelocity)},
+                {"dampingRate", simulation.dampingRate},
+                {"maximumMotorSpeed", simulation.maximumMotorSpeed},
+                {"mistDissipationRate", simulation.mistDissipationRate},
+                {"movingSolids", simulation.movingSolids}
+            };
+        }
+
+        // AIR.4F.2d.3: every field.
+        if(document.environmentalHaze)
+        {
+            const EnvironmentalHazeSettings& haze = *document.environmentalHaze;
+            scene["environmentalHaze"] = {
+                {"enabled", haze.enabled},
+                {"attenuationDistance", haze.attenuationDistance},
+                {"color", haze.color},
+                {"nearDistance", haze.nearDistance},
+                {"nearTransition", haze.nearTransition},
+                {"ambient", haze.ambient},
+                {"heightBounds", {{"enabled", haze.heightBounds}, {"baseHeight", haze.baseHeight}, {"maxHeight", haze.maxHeight},
+                    {"transition", haze.heightTransition}}}
             };
         }
 
@@ -888,7 +963,7 @@ namespace
     SceneDocument FromJson(const Json& value, const LegacyLightingMigrationOptions& migration = {})
     {
         ValidateFields(value, {"schemaVersion", "id", "name", "camera", "directionalLight", "objects", "environmentReference", "lightingSettings",
-            "voxelBake", "mistRendering"});
+            "voxelBake", "mistRendering", "airEnvironment", "airSimulation", "environmentalHaze"});
         const auto& schemaVersion = value.at("schemaVersion");
         if (!schemaVersion.is_number_integer() ||
             (schemaVersion != SceneDocument::kLegacySchemaVersion &&
@@ -914,7 +989,10 @@ namespace
              schemaVersion != SceneDocument::kAirMotorEmissionSchemaVersion &&
              schemaVersion != SceneDocument::kAirMotorShapeSchemaVersion &&
              schemaVersion != SceneDocument::kMistEmitterSchemaVersion &&
-             schemaVersion != SceneDocument::kMistRenderingSchemaVersion))
+             schemaVersion != SceneDocument::kMistRenderingSchemaVersion &&
+             schemaVersion != SceneDocument::kMistEmitterModeSchemaVersion &&
+             schemaVersion != SceneDocument::kAirSimulationSchemaVersion &&
+             schemaVersion != SceneDocument::kMovingSolidParticipationSchemaVersion))
         {
             throw std::runtime_error("Unsupported scene schema version.");
         }
@@ -970,7 +1048,8 @@ namespace
             }
 
             // AIR.4F F4.4.2 added "wisps" and F4.4.2e "densityDetail" to the schema 24 block (absent: off, as before).
-            ValidateFields(block, {"opacity", "worley", "curl", "wisps", "densityDetail", "lighting"});
+            // AIR.4F.2d.3b added "nearClearance" (absent: off).
+            ValidateFields(block, {"opacity", "worley", "curl", "wisps", "densityDetail", "lighting", "nearClearance"});
             MistRenderSettings mist;
             const auto readNumber = [](const Json& group, const char* key, float& target)
             {
@@ -1032,16 +1111,293 @@ namespace
                 readNumber(*densityDetail, "strength", mist.densityDetailStrength);
             }
 
-            if(const Json* lighting = readGroup("lighting", {"enabled", "sunShadows", "scattering", "anisotropy", "ambient"}))
+            // AIR.4F.2d.2 added "scatteringTint" (three numbers) and "multipleScattering", AIR.4F.2d.3e "indirectScattering"; absent,
+            // their neutral defaults (so an older scene keeps its look).
+            if(const Json* lighting = readGroup("lighting", {"enabled", "sunShadows", "scattering", "anisotropy", "ambient", "scatteringTint",
+                "multipleScattering", "indirectScattering"}))
             {
                 readFlag(*lighting, "enabled", mist.lighting);
                 readFlag(*lighting, "sunShadows", mist.sunShadows);
                 readNumber(*lighting, "scattering", mist.scattering);
                 readNumber(*lighting, "anisotropy", mist.anisotropy);
                 readNumber(*lighting, "ambient", mist.ambient);
+                readNumber(*lighting, "multipleScattering", mist.multipleScattering);
+                readNumber(*lighting, "indirectScattering", mist.indirectScattering);
+
+                // Like every number in the block, a malformed tint keeps its default rather than failing the load.
+                if(lighting->contains("scatteringTint") && lighting->at("scatteringTint").is_array() && lighting->at("scatteringTint").size() == 3)
+                {
+                    for(std::size_t channel = 0; channel < 3; ++channel)
+                    {
+                        const Json& value = lighting->at("scatteringTint")[channel];
+
+                        if(value.is_number())
+                        {
+                            mist.scatteringTint[channel] = value.get<float>();
+                        }
+                    }
+                }
+            }
+
+            if(const Json* clearance = readGroup("nearClearance", {"distance", "transition"}))
+            {
+                readNumber(*clearance, "distance", mist.nearDistance);
+                readNumber(*clearance, "transition", mist.nearTransition);
             }
 
             result.mistRendering = SanitizeMistRenderSettings(mist);
+        }
+
+        // AIR.4F F4.5.1b: the air environment, in schema 24 files (as F4.4.2 added "wisps"). A missing field keeps its default; a value
+        // that is not a number, or is out of range, refuses the scene (it drives the simulation, so it is never silently changed).
+        // AIR.4F.2d.3: the environmental haze (schema 25). Missing fields keep their defaults; invalid values are refused.
+        if(value.contains("environmentalHaze"))
+        {
+            if(schemaVersion.get<std::uint32_t>() < SceneDocument::kMistEmitterModeSchemaVersion)
+            {
+                throw std::runtime_error("Environmental haze requires scene schema version 25.");
+            }
+
+            const Json& block = value.at("environmentalHaze");
+
+            if(!block.is_object())
+            {
+                throw std::runtime_error("Environmental haze must be an object.");
+            }
+
+            ValidateFields(block, {"enabled", "attenuationDistance", "color", "nearDistance", "nearTransition", "ambient", "heightBounds"});
+            EnvironmentalHazeSettings haze;
+            // AIR.4F.2d.3a: a block saved before the ambient contribution existed scattered the sun alone, and keeps doing so.
+            haze.ambient = 0.0f;
+
+            if(block.contains("enabled"))
+            {
+                if(!block.at("enabled").is_boolean())
+                {
+                    throw std::runtime_error("Environmental haze 'enabled' must be a boolean.");
+                }
+
+                haze.enabled = block.at("enabled").get<bool>();
+            }
+
+            if(block.contains("attenuationDistance"))
+            {
+                haze.attenuationDistance = ReadNumber(block.at("attenuationDistance"), "Fog attenuation distance");
+            }
+
+            if(block.contains("color"))
+            {
+                const Json& color = block.at("color");
+
+                if(!color.is_array() || color.size() != 3)
+                {
+                    throw std::runtime_error("Haze colour must be three numbers.");
+                }
+
+                for(std::size_t channel = 0; channel < 3; ++channel)
+                {
+                    haze.color[channel] = ReadNumber(color[channel], "Haze colour");
+                }
+            }
+
+            if(block.contains("nearDistance"))
+            {
+                haze.nearDistance = ReadNumber(block.at("nearDistance"), "Near fog distance");
+            }
+
+            if(block.contains("nearTransition"))
+            {
+                haze.nearTransition = ReadNumber(block.at("nearTransition"), "Near fog transition");
+            }
+
+            if(block.contains("ambient"))
+            {
+                haze.ambient = ReadNumber(block.at("ambient"), "Haze ambient contribution");
+            }
+
+            // AIR.4F.2d.3b: the height bounds (absent: off). Every block written since has the group, so its absence also marks a block
+            // from before the clearances were separated.
+            const bool sharedClearance = !block.contains("heightBounds");
+
+            if(!sharedClearance)
+            {
+                const Json& bounds = block.at("heightBounds");
+
+                if(!bounds.is_object())
+                {
+                    throw std::runtime_error("Haze height bounds must be an object.");
+                }
+
+                ValidateFields(bounds, {"enabled", "baseHeight", "maxHeight", "transition"});
+
+                if(bounds.contains("enabled"))
+                {
+                    if(!bounds.at("enabled").is_boolean())
+                    {
+                        throw std::runtime_error("Haze height bounds 'enabled' must be a boolean.");
+                    }
+
+                    haze.heightBounds = bounds.at("enabled").get<bool>();
+                }
+
+                if(bounds.contains("baseHeight"))
+                {
+                    haze.baseHeight = ReadNumber(bounds.at("baseHeight"), "Haze base height");
+                }
+
+                if(bounds.contains("maxHeight"))
+                {
+                    haze.maxHeight = ReadNumber(bounds.at("maxHeight"), "Haze max height");
+                }
+
+                if(bounds.contains("transition"))
+                {
+                    haze.heightTransition = ReadNumber(bounds.at("transition"), "Haze height transition");
+                }
+            }
+
+            std::string hazeError;
+
+            if(!ValidateEnvironmentalHazeSettings(haze, &hazeError))
+            {
+                throw std::runtime_error("Invalid environmental haze: " + hazeError);
+            }
+
+            result.environmentalHaze = haze;
+
+            // Before AIR.4F.2d.3b the haze block's clearance also cleared the AIR mist. Such a scene keeps that look: the AIR mist gets
+            // the same clearance (its rendering block is created with the defaults if the scene had none).
+            if(sharedClearance && haze.nearDistance > 0.0f)
+            {
+                MistRenderSettings mist = result.mistRendering.value_or(MistRenderSettings{});
+                mist.nearDistance = haze.nearDistance;
+                mist.nearTransition = haze.nearTransition;
+                result.mistRendering = SanitizeMistRenderSettings(mist);
+            }
+        }
+
+        if(value.contains("airEnvironment"))
+        {
+            if(schemaVersion.get<std::uint32_t>() < SceneDocument::kMistRenderingSchemaVersion)
+            {
+                throw std::runtime_error("Air environment settings require scene schema version 24.");
+            }
+
+            const Json& block = value.at("airEnvironment");
+
+            if(!block.is_object())
+            {
+                throw std::runtime_error("Air environment settings must be an object.");
+            }
+
+            ValidateFields(block, {"ambientTemperature", "relaxationTime"});
+            AirEnvironmentSettings environment;
+
+            if(block.contains("ambientTemperature"))
+            {
+                environment.ambientTemperature = ReadNumber(block.at("ambientTemperature"), "Ambient temperature");
+            }
+
+            if(block.contains("relaxationTime"))
+            {
+                environment.relaxationTime = ReadNumber(block.at("relaxationTime"), "Thermal relaxation time");
+            }
+
+            std::string environmentError;
+
+            if(!ValidateAirEnvironmentSettings(environment, &environmentError))
+            {
+                throw std::runtime_error("Invalid air environment: " + environmentError);
+            }
+
+            result.airEnvironment = environment;
+        }
+
+        // R1.1: missing fields keep their defaults; unknown fields, wrong types and out-of-range values refuse the scene.
+        if(value.contains("airSimulation"))
+        {
+            if(schemaVersion.get<std::uint32_t>() < SceneDocument::kAirSimulationSchemaVersion)
+            {
+                throw std::runtime_error("AIR simulation settings require scene schema version 26.");
+            }
+
+            const Json& block = value.at("airSimulation");
+
+            if(!block.is_object())
+            {
+                throw std::runtime_error("AIR simulation settings must be an object.");
+            }
+
+            // R1.5: movingSolids exists from schema 27; a schema 26 block carrying it is refused, as any unknown field.
+            if(schemaVersion.get<std::uint32_t>() >= SceneDocument::kMovingSolidParticipationSchemaVersion)
+            {
+                ValidateFields(block, {"enabled", "pressureProjection", "buoyancy", "buoyancyGravity", "maximumStepsPerFrame",
+                    "ambientVelocity", "dampingRate", "maximumMotorSpeed", "mistDissipationRate", "movingSolids"});
+            }
+            else
+            {
+                ValidateFields(block, {"enabled", "pressureProjection", "buoyancy", "buoyancyGravity", "maximumStepsPerFrame",
+                    "ambientVelocity", "dampingRate", "maximumMotorSpeed", "mistDissipationRate"});
+            }
+
+            AirSimulationSettings simulation;
+
+            const auto readFlag = [&](const char* field, bool& target)
+            {
+                if(!block.contains(field))
+                {
+                    return;
+                }
+
+                if(!block.at(field).is_boolean())
+                {
+                    throw std::runtime_error(std::string("AIR simulation ") + field + " must be a boolean.");
+                }
+
+                target = block.at(field).get<bool>();
+            };
+            const auto readFloat = [&](const char* field, float& target)
+            {
+                if(block.contains(field))
+                {
+                    target = ReadNumber(block.at(field), field);
+                }
+            };
+
+            readFlag("enabled", simulation.enabled);
+            readFlag("pressureProjection", simulation.pressureProjection);
+            readFlag("buoyancy", simulation.buoyancy);
+            readFlag("movingSolids", simulation.movingSolids);
+            readFloat("buoyancyGravity", simulation.buoyancyGravity);
+            readFloat("dampingRate", simulation.dampingRate);
+            readFloat("maximumMotorSpeed", simulation.maximumMotorSpeed);
+            readFloat("mistDissipationRate", simulation.mistDissipationRate);
+
+            if(block.contains("maximumStepsPerFrame"))
+            {
+                if(!block.at("maximumStepsPerFrame").is_number_integer())
+                {
+                    throw std::runtime_error("AIR simulation maximumStepsPerFrame must be an integer.");
+                }
+
+                // Read wide, so a huge value is refused by validation instead of wrapping into range.
+                const std::int64_t steps = block.at("maximumStepsPerFrame").get<std::int64_t>();
+                simulation.maximumStepsPerFrame = steps == 1 || steps == 2 ? static_cast<int>(steps) : 0;
+            }
+
+            if(block.contains("ambientVelocity"))
+            {
+                simulation.ambientVelocity = ReadVector3(block.at("ambientVelocity"));
+            }
+
+            std::string simulationError;
+
+            if(!ValidateAirSimulationSettings(simulation, &simulationError))
+            {
+                throw std::runtime_error("Invalid AIR simulation settings: " + simulationError);
+            }
+
+            result.airSimulation = simulation;
         }
 
         const Json& camera = value.at("camera");
@@ -1399,8 +1755,24 @@ namespace
                 }
 
                 const auto& value = item.at("mistEmitter");
+                // AIR.4F F4.5.1b added "temperature" (absent: 0, no heating). AIR.4F.2b (schema 25) added "mode", "emissionRate" and
+                // "jetSpeed"; absent, an emitter is Legacy with the defaults for the others, exactly as before modes existed.
                 ValidateFields(value, {"enabled", "shape", "emissionOrigin", "emissionRotation", "radius", "halfExtents", "rate", "color",
-                    "density"});
+                    "density", "temperature", "mode", "emissionRate", "jetSpeed", "temperatureResponseRate", "targetDensity",
+                    "replenishmentRate", "fillHeight", "edgeSoftness", "volumeTemperatureRate"});
+                // AIR.4F.2b.1 added "temperatureResponseRate" and AIR.4F.2c the Volume fields, all within schema 25 (absent: the defaults).
+                bool modeFields = false;
+
+                for(const char* name : {"mode", "emissionRate", "jetSpeed", "temperatureResponseRate", "targetDensity", "replenishmentRate",
+                    "fillHeight", "edgeSoftness", "volumeTemperatureRate"})
+                {
+                    modeFields = modeFields || value.contains(name);
+                }
+
+                if(modeFields && schemaVersion.get<std::uint32_t>() < SceneDocument::kMistEmitterModeSchemaVersion)
+                {
+                    throw std::runtime_error("Mist Emitter modes require scene schema version 25.");
+                }
 
                 if(!value.at("enabled").is_boolean() || !value.at("shape").is_string())
                 {
@@ -1422,6 +1794,47 @@ namespace
                 emitter.rate = ReadNumber(value.at("rate"), "Mist Emitter rate");
                 emitter.color = ReadVector3(value.at("color"));
                 emitter.density = ReadNumber(value.at("density"), "Mist Emitter density");
+
+                if(value.contains("temperature"))
+                {
+                    emitter.temperature = ReadNumber(value.at("temperature"), "Mist Emitter temperature");
+                }
+
+                if(value.contains("mode"))
+                {
+                    if(!value.at("mode").is_string() || !TryParseMistEmitterMode(value.at("mode").get<std::string>(), emitter.mode))
+                    {
+                        throw std::runtime_error("Mist Emitter mode must be Legacy, Point or Volume.");
+                    }
+                }
+
+                if(value.contains("emissionRate"))
+                {
+                    emitter.emissionRate = ReadNumber(value.at("emissionRate"), "Mist Emitter emission rate");
+                }
+
+                if(value.contains("jetSpeed"))
+                {
+                    emitter.jetSpeed = ReadNumber(value.at("jetSpeed"), "Mist Emitter jet speed");
+                }
+
+                if(value.contains("temperatureResponseRate"))
+                {
+                    emitter.temperatureResponseRate = ReadNumber(value.at("temperatureResponseRate"), "Mist Emitter temperature response rate");
+                }
+
+                // AIR.4F.2c: the Volume fields.
+                const std::pair<const char*, float*> volumeFields[] = {{"targetDensity", &emitter.targetDensity},
+                    {"replenishmentRate", &emitter.replenishmentRate}, {"fillHeight", &emitter.fillHeight}, {"edgeSoftness", &emitter.edgeSoftness},
+                    {"volumeTemperatureRate", &emitter.volumeTemperatureRate}};
+
+                for(const auto& [name, field] : volumeFields)
+                {
+                    if(value.contains(name))
+                    {
+                        *field = ReadNumber(value.at(name), (std::string("Mist Emitter ") + name).c_str());
+                    }
+                }
                 std::string emitterError;
 
                 if(!ValidateMistEmitterComponent(emitter, &emitterError))

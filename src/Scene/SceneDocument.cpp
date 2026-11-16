@@ -53,6 +53,21 @@ bool ValidateSceneDocument(
         return Fail(errorMessage, "Invalid mist rendering settings.");
     }
 
+    if(std::string hazeError; document.environmentalHaze && !ValidateEnvironmentalHazeSettings(*document.environmentalHaze, &hazeError))
+    {
+        return Fail(errorMessage, ("Invalid environmental haze: " + hazeError).c_str());
+    }
+
+    if(std::string environmentError; document.airEnvironment && !ValidateAirEnvironmentSettings(*document.airEnvironment, &environmentError))
+    {
+        return Fail(errorMessage, "Invalid air environment: " + environmentError);
+    }
+
+    if(std::string simulationError; document.airSimulation && !ValidateAirSimulationSettings(*document.airSimulation, &simulationError))
+    {
+        return Fail(errorMessage, "Invalid AIR simulation settings: " + simulationError);
+    }
+
     if(document.voxelBake)
     {
         std::string voxelError;
@@ -466,4 +481,19 @@ bool ValidateSceneDocumentPersistence(const SceneDocument& document, std::string
 {
     // Current codecs preserve authored hierarchy and all optional component values.
     return ValidateSceneDocument(document, errorMessage);
+}
+
+AirSimulationSettings ResolveAirSimulation(const SceneDocument* document, const std::optional<AirSimulationSettings>& sessionOverride)
+{
+    if(sessionOverride)
+    {
+        return *sessionOverride;
+    }
+
+    if(document != nullptr && document->airSimulation)
+    {
+        return *document->airSimulation;
+    }
+
+    return AirSimulationSettings{};
 }

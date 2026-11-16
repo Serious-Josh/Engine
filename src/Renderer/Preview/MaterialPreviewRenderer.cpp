@@ -1,4 +1,5 @@
 #include "Renderer/Preview/MaterialPreviewRenderer.h"
+#include "Debug/MemoryRegistry.h"
 
 #include "Core/Log.h"
 #include "Debug/MaterialThumbnailDiagnostics.h"
@@ -91,6 +92,8 @@ bool MaterialPreviewRenderer::Initialize(
     {
         return false;
     }
+
+    const MemoryCategoryScope memoryScope(MemoryCategory::Editor);
 
     // These resources have not been recorded into any renderer command list.
     // Mesh uploads complete synchronously, or the uploader fails closed before cleanup.
@@ -194,6 +197,8 @@ bool MaterialPreviewRenderer::Initialize(
             return false;
         }
 
+        MemoryRegistry::TrackResource(m_thumbnailReadback);
+
         heap.Type = D3D12_HEAP_TYPE_UPLOAD;
 
         if(FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer,
@@ -202,6 +207,8 @@ bool MaterialPreviewRenderer::Initialize(
             Shutdown();
             return false;
         }
+
+        MemoryRegistry::TrackResource(m_thumbnailUpload);
     }
     catch(const std::exception&)
     {
@@ -329,6 +336,8 @@ bool MaterialPreviewRenderer::InitializePipelines(
     ID3D12Device* device,
     ShaderLibrary& shaders)
 {
+    const MemoryCategoryScope memoryScope(MemoryCategory::Editor);
+
     Shader* geometryVS = shaders.Load({"MaterialPreview.hlsl", "SphereVS", ShaderStage::Vertex});
     Shader* geometryPS = shaders.Load({"MaterialPreview.hlsl", "SpherePS", ShaderStage::Pixel});
     Shader* lightingVS = shaders.Load({"MaterialPreview.hlsl", "LightingVS", ShaderStage::Vertex});
@@ -986,6 +995,8 @@ bool MaterialPreviewRenderer::CanAcquireThumbnailImage(
 MaterialPreviewRenderer::ThumbnailImage* MaterialPreviewRenderer::AcquireThumbnailImage(
     std::uint64_t completedFence, const std::filesystem::path& root, const std::string& identity)
 {
+    const MemoryCategoryScope memoryScope(MemoryCategory::Editor);
+
     ThumbnailImage* victim = nullptr;
 
     for(auto& image : m_thumbnailImages)
@@ -2031,8 +2042,15 @@ namespace
         const auto state = type == D3D12_HEAP_TYPE_UPLOAD ? D3D12_RESOURCE_STATE_GENERIC_READ :
             type == D3D12_HEAP_TYPE_READBACK ? D3D12_RESOURCE_STATE_COPY_DEST : D3D12_RESOURCE_STATE_COMMON;
 
-        return SUCCEEDED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE,
-            &description, state, nullptr, IID_PPV_ARGS(resource.ReleaseAndGetAddressOf())));
+        if(FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE,
+            &description, state, nullptr, IID_PPV_ARGS(resource.ReleaseAndGetAddressOf()))))
+        {
+            return false;
+        }
+
+        MemoryRegistry::TrackResource(resource, MemoryCategory::Editor);
+
+        return true;
     }
 }
 
@@ -2043,6 +2061,8 @@ void MaterialPreviewRenderer::PrepareMeshGPUJob(std::uint64_t ticket)
     {
         return;
     }
+
+    const MemoryCategoryScope memoryScope(MemoryCategory::Editor);
 
     // Completed images own no geometry. At most one job retains source/destination buffers.
     if(std::any_of(m_meshJobs.begin(), m_meshJobs.end(), [](const auto& job)

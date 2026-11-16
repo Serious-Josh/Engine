@@ -1,4 +1,5 @@
 #include "RayTracingSceneResources.h"
+#include "Debug/MemoryRegistry.h"
 #include "Scene/FileSceneRuntime.h"
 
 #include "Renderer/Mesh.h"
@@ -85,6 +86,8 @@ bool RayTracingSceneResources::Initialize(
     DescriptorHeap& descriptorHeap,
     const Scene& scene)
 {
+    const MemoryCategoryScope memoryScope(MemoryCategory::AccelerationStructures);
+
     m_blasRegistry.retirementLifetime = 0;
 
     if (!device || !commandList)
@@ -1492,6 +1495,8 @@ std::size_t RayTracingSceneResources::GetInstanceCount() const
 bool RayTracingSceneResources::InitializeMaterialSlots(ID3D12Device5* device, ResourceUploader& uploader,
     DescriptorHeap& heap, const Scene& scene, std::vector<RayTracingInstanceData>& instances)
 {
+    const MemoryCategoryScope memoryScope(MemoryCategory::AccelerationStructures);
+
     std::vector<unsigned int> triangles{0};
     std::vector<unsigned int> materials;
 

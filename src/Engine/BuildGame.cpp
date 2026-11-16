@@ -6,7 +6,15 @@
 #include "Engine/PackagedAudioBanks.h"
 #include "Engine/PackagedBootstrap.h"
 #include "Engine/PackagedRenderingSettings.h"
+#include "Engine/VoxelArchiveStore.h"
+#include "Engine/VoxelProjectStore.h"
+#include "Engine/VoxelScene.h"
+#include "assets/ArchiveCookedMeshProvider.h"
 #include "assets/CookedScene.h"
+#include "assets/ImportedMesh.h"
+#include "Project/ProjectPaths.h"
+#include "Scene/SceneHierarchyTransforms.h"
+#include "Voxel/VoxelManifest.h"
 #include "Scene/RenderView.h"
 #include "assets/CookedEnvironment.h"
 #include "assets/CookedSurface.h"
@@ -187,6 +195,19 @@ void CheckDestination(const fs::path& outputDirectory)
     }
 }
 
+// R1.5b: whether the packaged game needs AIR: its startup scene (its only scene) has an AIR block that enables simulation. Decides
+// the AIR shader kernels (D3) and the mist noise textures (D5).
+bool StartupSceneRequestsAir(const SceneDocument& document)
+{
+    return document.airSimulation.has_value() && document.airSimulation->enabled;
+}
+
+// R1.4a: a scene references a VX.5 bake once it has published one. Settings that were never baked package without voxel assets.
+bool RequiresVoxelBake(const SceneDocument& document)
+{
+    return document.voxelBake.has_value() && !document.voxelBake->manifestReference.empty();
+}
+
 // References point only into the shared Service state retained by the worker capture.
 // A concrete reporter avoids allocating a type-erased callback at each stage boundary.
 struct BuildProgress
@@ -211,6 +232,14 @@ struct BuildAssets
     std::vector<CookedSurface::Asset> cookedAssets;
     std::vector<std::unique_ptr<Pin>> sourcePins;
     std::uint64_t retainedPayloadBytes = 0;
+
+    // R1.4a: the decoded geometry of every mesh a voxel participant uses, kept from mesh cooking (only for a scene with a bake) so
+    // the bake check captures exactly what was cooked. Keyed by mesh asset ID.
+    std::map<std::string, std::shared_ptr<const ImportedMesh>> voxelMeshes;
+    // The scene's validated voxel bake, once cooked: what the written archive must read back as.
+    std::optional<VoxelScene::CapturedScene> voxelScene;
+    std::uint64_t voxelContentHash = 0;
+    std::size_t voxelEntries = 0;
 
     void Append(CookedSurface::Asset asset)
     {
@@ -379,6 +408,229 @@ void CookBakedPathing(const Request& request, BuildAssets& build)
     }
 }
 
+// How the bake check reads the saved scene, as VoxelSceneAccess reads the Editor's live one: authored worlds (roots are their local
+// transform, children compose through the shared hierarchy rule, which is Scene::ComputeAuthoredWorlds without poses or overrides)
+// and the meshes kept from mesh cooking. Borrows `document` and `build` for the Capture call.
+VoxelScene::SceneAccess MakeDocumentVoxelAccess(const SceneDocument& document, const BuildAssets& build)
+{
+    SceneHierarchy::Forest forest;
+    std::string hierarchyError;
+    Require(SceneHierarchy::Build(document.objects, forest, &hierarchyError), "The scene hierarchy is invalid: " + hierarchyError);
+
+    std::vector<Matrix4> worlds(document.objects.size());
+
+    for(const std::size_t index : forest.parentBeforeChild)
+    {
+        const SceneObjectDocument& object = document.objects[index];
+        const std::optional<std::size_t> parent = forest.parents[index];
+
+        if(!parent)
+        {
+            worlds[index] = object.transform.GetModelMatrix();
+            continue;
+        }
+
+        const char* failure = SceneHierarchy::EvaluateChildWorld(worlds[*parent], object.transform, worlds[index]);
+        Require(failure == nullptr, "The world transform of object " + object.id + " is invalid: " + (failure ? failure : ""));
+    }
+
+    std::map<const SceneObjectDocument*, std::size_t> indices;
+
+    for(std::size_t index = 0; index < document.objects.size(); ++index)
+    {
+        indices[&document.objects[index]] = index;
+    }
+
+    VoxelScene::SceneAccess access;
+
+    access.world = [worlds = std::move(worlds), indices](const SceneObjectDocument& object) -> std::optional<Matrix4>
+    {
+        const auto found = indices.find(&object);
+        return found != indices.end() ? std::optional<Matrix4>(worlds[found->second]) : std::nullopt;
+    };
+
+    access.mesh = [&build](const SceneObjectDocument& object) -> const ImportedMesh*
+    {
+        const std::optional<AssetID> id = AssetID::ParseReference(object.meshReference);
+
+        if(!id)
+        {
+            return nullptr;
+        }
+
+        const auto found = build.voxelMeshes.find(id->ToString());
+        return found != build.voxelMeshes.end() ? found->second.get() : nullptr;
+    };
+
+    return access;
+}
+
+// Reads through the project store and keeps every asset it returned, so the bytes cooked are exactly the bytes the bake check
+// validated, read once. Single-threaded use (EvaluateBakeStatus on the build worker).
+class RetainingVoxelStore final : public Voxel::AssetStore
+{
+public:
+    explicit RetainingVoxelStore(const Voxel::AssetStore& source) :
+        m_source(source)
+    {
+    }
+
+    std::optional<std::string> GetCurrentManifest() const override
+    {
+        return m_source.GetCurrentManifest();
+    }
+
+    std::expected<std::vector<std::byte>, std::string> Read(std::string_view reference) const override
+    {
+        auto bytes = m_source.Read(reference);
+
+        if(bytes)
+        {
+            m_retained[std::string(reference)] = *bytes;
+        }
+
+        return bytes;
+    }
+
+    std::expected<std::string, std::string> Stage(std::span<const std::byte>) override
+    {
+        return std::unexpected(std::string("The build's voxel store is read-only."));
+    }
+
+    std::expected<void, std::string> Publish(std::span<const std::string>, std::string_view) override
+    {
+        return std::unexpected(std::string("The build's voxel store is read-only."));
+    }
+
+    void Discard(std::span<const std::string>) noexcept override
+    {
+    }
+
+    std::vector<std::byte> Take(const std::string& reference)
+    {
+        const auto found = m_retained.find(reference);
+        Require(found != m_retained.end(), "Voxel asset " + reference + " was not read by the bake check.");
+        return std::move(found->second);
+    }
+
+private:
+    const Voxel::AssetStore& m_source;
+    mutable std::map<std::string, std::vector<std::byte>> m_retained;
+};
+
+std::string VoxelRebakeAdvice(const SceneDocument& document)
+{
+    return " Open the scene \"" + document.name + "\" in the Editor, bake its voxels again (Build > Bake Voxels), save it, and build again.";
+}
+
+// R1.4a: a scene that references a VX.5 bake packages it only when the Editor's bake check (EvaluateBakeStatus, on the same
+// capture) reports it up to date. A missing, incomplete, stale, differently configured or corrupt bake refuses the build: the game
+// would otherwise answer voxel queries with geometry the scene no longer has. Nothing is rebaked here. The manifest and every
+// populated region are cooked unchanged as Resource entries under their own asset IDs; Uniform Inside regions have no asset.
+// After the scene: scene cooking treats every earlier asset as a mesh input.
+void CookVoxelBake(const Request& request, BuildAssets& build, const BuildProgress& progress)
+{
+    if(!RequiresVoxelBake(request.document))
+    {
+        return;
+    }
+
+    progress.Report(.5f, "Checking the scene's voxel bake...");
+    const std::string& manifestReference = request.document.voxelBake->manifestReference;
+    const std::string advice = VoxelRebakeAdvice(request.document);
+    const ProjectPaths paths(request.project);
+    const VoxelScene::ProjectAssetStore projectStore(paths, request.registry, manifestReference);
+
+    // Capacity first, from the manifest alone, so an archive that cannot hold the bake is refused before every region is read. A
+    // manifest that does not read or decode is left to the bake check, which names the problem.
+    if(const auto manifestBytes = projectStore.Read(manifestReference))
+    {
+        Voxel::ManifestData manifest;
+
+        if(Voxel::DecodeManifest(*manifestBytes, manifest))
+        {
+            std::size_t populated = 0;
+            std::uint64_t populatedBytes = 0;
+
+            for(const Voxel::ManifestEntry& entry : manifest.entries)
+            {
+                if(entry.kind == Voxel::RegionKind::Populated)
+                {
+                    ++populated;
+                    populatedBytes += entry.byteSize;
+                }
+            }
+
+            const std::uint64_t entryLimit = EngineAssetPak::Limits{}.entries;
+            const std::uint64_t voxelEntries = populated + 1;
+            Require(build.cookedAssets.size() + voxelEntries <= entryLimit, "The scene's voxel bake cannot be packaged: it needs " +
+                std::to_string(voxelEntries) + " archive entries (its manifest and " + std::to_string(populated) +
+                " populated regions), the game's other assets need " + std::to_string(build.cookedAssets.size()) +
+                ", and a game archive holds at most " + std::to_string(entryLimit) +
+                ". Use larger voxels or bricks per region (fewer, larger regions), or bake fewer objects, then bake again.");
+
+            const std::uint64_t batchLimit = 512ull * 1024 * 1024;
+            const std::uint64_t voxelBytes = populatedBytes + manifestBytes->size();
+            Require(voxelBytes <= batchLimit - (std::min)(batchLimit, build.retainedPayloadBytes),
+                "The scene's voxel bake cannot be packaged: its " + std::to_string(voxelBytes) +
+                " bytes and the game's other assets exceed the 512 MiB build payload limit. Use larger voxels or bake fewer objects, then bake again.");
+        }
+    }
+
+    // The Editor's bake check, on the saved scene's capture.
+    auto captured = VoxelScene::Capture(request.document, MakeDocumentVoxelAccess(request.document, build));
+    Require(captured.has_value(), "The scene's voxel bake cannot be checked: " + (captured ? std::string{} : captured.error()) + advice);
+
+    RetainingVoxelStore store(projectStore);
+    const VoxelScene::BakeStatus status = VoxelScene::EvaluateBakeStatus(*captured, store);
+
+    Require(status.state == VoxelScene::BakeState::UpToDate, "The scene's voxel bake " + manifestReference + " is " +
+        VoxelScene::BakeStateToString(status.state) + ": " + status.detail + advice);
+
+    // The manifest decoded and validated in the check; cook it, then each populated region once.
+    Voxel::ManifestData manifest;
+    std::vector<std::byte> manifestBytes = store.Take(manifestReference);
+    Require(bool(Voxel::DecodeManifest(manifestBytes, manifest)), "The scene's voxel manifest no longer decodes." + advice);
+
+    static_assert(VoxelScene::ArchivedAssetPayloadVersion == 1, "Non-scene archive payloads are written as version 1.");
+    const std::uint64_t entryPayloadLimit = EngineAssetPak::Limits{}.payloadBytes;
+    std::set<std::string> cooked;
+
+    const auto cook = [&](const std::string& reference, std::vector<std::byte> bytes)
+    {
+        cooked.insert(reference);
+        Require(bytes.size() <= entryPayloadLimit, "Voxel asset " + reference + " cannot be packaged: it is " + std::to_string(bytes.size()) +
+            " bytes, and a game archive entry holds at most " + std::to_string(entryPayloadLimit) + ". Use fewer bricks per region, then bake again.");
+        build.Append({*AssetID::ParseReference(reference), EngineAssetPak::Type::Resource, VoxelScene::ArchivedAssetPayloadVersion, std::move(bytes)});
+    };
+
+    cook(manifestReference, std::move(manifestBytes));
+
+    for(const Voxel::ManifestEntry& entry : manifest.entries)
+    {
+        // A region listed twice is one asset, cooked once.
+        if(entry.kind == Voxel::RegionKind::Populated && !cooked.contains(entry.reference))
+        {
+            cook(entry.reference, store.Take(entry.reference));
+        }
+    }
+
+    build.voxelEntries = cooked.size();
+    build.voxelContentHash = *status.contentHash;
+    build.voxelScene = std::move(*captured);
+    Log::Info("Build Game voxel bake: " + manifestReference + ", " + std::to_string(status.populated) + " populated and " +
+        std::to_string(status.uniformInside) + " Uniform Inside regions, " + std::to_string(cooked.size()) + " archive entries.");
+}
+
+// R1.4a: said before writing, with the voxel share, rather than as the archive writer's generic admission error.
+void CheckArchiveCapacity(const BuildAssets& build)
+{
+    const std::uint64_t entryLimit = EngineAssetPak::Limits{}.entries;
+    Require(build.cookedAssets.size() <= entryLimit, "The game needs " + std::to_string(build.cookedAssets.size()) + " archive entries (" + std::to_string(build.voxelEntries) +
+        " of them voxel assets), and a game archive holds at most " + std::to_string(entryLimit) +
+        ". Use larger voxels or bricks per region, or bake fewer objects, then bake again.");
+}
+
 void CookMeshAssets(const Request& request, BuildAssets& build, const BuildProgress& progress)
 {
     std::set<std::string> meshIDs;
@@ -392,6 +644,21 @@ void CookMeshAssets(const Request& request, BuildAssets& build, const BuildProgr
             meshIDs.insert(assetID->ToString());
         }
     }
+
+    // Meshes the voxel bake check needs: those of participating objects, when the scene references a bake.
+    std::set<std::string> voxelMeshIDs;
+
+    if(RequiresVoxelBake(request.document))
+    {
+        for(const auto& object : request.document.objects)
+        {
+            if(!object.meshReference.empty() && VoxelScene::ResolveParticipation(object).participates)
+            {
+                voxelMeshIDs.insert(AssetID::ParseReference(object.meshReference)->ToString());
+            }
+        }
+    }
+
     for (const auto& meshIDText : meshIDs)
     {
         progress.Report(.1f, "Cooking mesh " + meshIDText);
@@ -410,6 +677,13 @@ void CookMeshAssets(const Request& request, BuildAssets& build, const BuildProgr
         auto encodedMesh = CookedMesh::Encode(decodedGeometry, CookedMesh::Policy{});
         Require(encodedMesh.status == CookedMesh::Status::Success, std::string(encodedMesh.message));
         build.Append({assetID, EngineAssetPak::Type::Mesh, 1, std::move(encodedMesh.payload)});
+
+        // The same import the Editor's scene catalog performs (flattened, V flipped, the record's units), so the bake check sees
+        // the Editor's triangles.
+        if(voxelMeshIDs.contains(meshIDText))
+        {
+            build.voxelMeshes[meshIDText] = std::make_shared<const ImportedMesh>(std::move(decodedGeometry));
+        }
     }
 }
 
@@ -590,16 +864,32 @@ void CookAudioBanks(const Request& request, BuildAssets& build, const BuildProgr
 void CompilePackagedShaders(const Request& request, BuildAssets& build, const BuildProgress& progress)
 {
     progress.Report(.55f, "Compiling packaged shaders offline...");
-    // PS.5B: the renderer's packaged inventory; CookBootstrap enforces the bootstrap limits.
+    // PS.5B: the renderer's packaged inventory; CookBootstrap enforces the bootstrap limits. R1.5b (decision D3): the AIR simulation and
+    // mist kernels only when the startup scene, the game's one scene, requests AIR.
+    const bool air = StartupSceneRequestsAir(request.document);
+    const std::vector<PackagedShaderEntry> shaders = SelectPackagedShaderInventory(air);
     ShaderBootstrapStatistics statistics;
-    auto shaderPayload = ShaderLibrary::CookBootstrap(request.shaderRoot, GetPackagedShaderInventory(),
-        GetPackagedLibraryInventory(), &statistics);
-    Log::Info("Packaged shaders: " + std::to_string(statistics.shaders) + " graphics/compute and " +
+    auto shaderPayload = ShaderLibrary::CookBootstrap(request.shaderRoot, shaders, GetPackagedLibraryInventory(), &statistics);
+    Log::Info(std::string("Packaged shaders (AIR ") + (air ? "included" : "not requested") + "): " + std::to_string(statistics.shaders) +
+        " graphics/compute and " +
         std::to_string(statistics.libraries) + " DXR libraries (" + std::to_string(statistics.optionalLibraries) +
         " optional RayQuery variants; " + std::to_string(statistics.libraryCacheHits) + " from the DXIL cache), " +
         std::to_string(statistics.bytes) + " bytes, largest record " + std::to_string(statistics.largestRecordBytes) +
         " bytes, cooked in " + std::to_string(statistics.seconds) + " s.");
     build.Append({PackagedBootstrap::ShaderID(), EngineAssetPak::Type::Shader, 1, std::move(shaderPayload)});
+
+    // R1.5b (decision D5): with AIR, the mist's three noise volumes, unchanged, under their fixed IDs. A missing file refuses the build:
+    // the game would otherwise draw mist without its detail.
+    if(air)
+    {
+        static_assert(PackagedBootstrap::MistNoisePayloadVersion == 1, "Non-scene archive payloads are written as version 1.");
+
+        for(const PackagedBootstrap::MistNoise noise : PackagedBootstrap::MistNoiseVolumes)
+        {
+            build.Append({PackagedBootstrap::MistNoiseID(noise), EngineAssetPak::Type::Resource, PackagedBootstrap::MistNoisePayloadVersion,
+                PackagedBootstrap::ReadBundledMistNoise(request.shaderRoot, noise)});
+        }
+    }
 
     // The path tracer's material tables travel verbatim; their SHA-256 pin is checked here and again at startup.
     auto materialTables = PackagedBootstrap::ReadBundledMaterialTables(request.shaderRoot);
@@ -671,6 +961,19 @@ void WriteAndVerifyArchives(const Request& request, const AssetID& sceneAssetID,
             stagingDirectory / "Game.toc", stagingDirectory / "Game.eap", sceneAssetID);
         Require(verifiedScene->metadata.document.id == request.document.id,
             "Packaged startup scene identity differs.");
+
+        // R1.4a: the archived bake is the bake that was checked. Read back through the archive store, as the game will read it,
+        // it must still be up to date for the same capture and have the same content hash (every region's bytes).
+        if(build.voxelScene)
+        {
+            const auto& cookedBake = verifiedScene->metadata.document.voxelBake;
+            Require(cookedBake && cookedBake->manifestReference == build.voxelScene->currentManifest,
+                "The packaged scene does not reference the cooked voxel bake.");
+            const VoxelScene::ArchiveAssetStore archiveStore(verifiedScene->provider, cookedBake->manifestReference);
+            const VoxelScene::BakeStatus archived = VoxelScene::EvaluateBakeStatus(*build.voxelScene, archiveStore);
+            Require(archived.state == VoxelScene::BakeState::UpToDate && archived.contentHash == build.voxelContentHash,
+                "The packaged voxel bake does not read back as the checked bake: " + archived.detail);
+        }
     }
 }
 
@@ -1037,7 +1340,9 @@ bool Service::Start(Request request, std::string& error)
                 CookProbeBatches(request, build);
                 CookBakedReflections(request, build);
                 CookBakedPathing(request, build);
+                CookVoxelBake(request, build, progress);
                 CompilePackagedShaders(request, build, progress);
+                CheckArchiveCapacity(build);
                 WriteAndVerifyArchives(request, sceneAssetID, stagingDirectory, build, progress);
                 DeployRuntimeFiles(request, sceneAssetID, stagingDirectory, progress);
 

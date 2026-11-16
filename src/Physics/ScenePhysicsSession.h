@@ -4,6 +4,7 @@
 #include "Physics/CharacterControllerDiagnostics.h"
 #include "Physics/CharacterControllerMover.h"
 #include "Physics/ContactEvents.h"
+#include "Physics/MovingSolidSnapshot.h"
 #include "Physics/TriggerEvents.h"
 #include "Physics/PhysicsWorld.h"
 #include "Physics/RuntimePoseSnapshot.h"
@@ -107,6 +108,47 @@ public:
     static constexpr float CharacterSpawnGuard = 0.002f;
     static constexpr float CharacterSpawnContactTolerance = 0.005f;
 
+    // AIR.4F.3 P1 Kinematic motion. Requests that a Kinematic body reach `target` (world pose of
+    // the object origin) at the end of exactly one future fixed step, numbered and windowed like
+    // SubmitCharacterMovement; a later request for the same body and step replaces the earlier.
+    // The step sets the velocities that carry the body there (Box3D target transform), so it moves
+    // continuously and pushes Dynamic bodies through the solver. A step with no request for a
+    // body leaves it at rest (zero velocity): motion never continues without a target. The target
+    // is measured from the pose the body has when its step begins; the rotation must be at most
+    // MaximumKinematicTargetRotation from the current one (larger turns per step are ambiguous).
+    // There is no distance limit: a distant target is fast motion. Use TeleportKinematicBody to jump.
+    bool SubmitKinematicTarget(std::string_view objectID, std::uint64_t fixedStep, const Pose& target,
+        std::string* errorMessage = nullptr);
+    // Moves a Kinematic body immediately (between steps), with zero velocity and no solver
+    // interaction across the jump, and discards its pending targets. Marks a discontinuity.
+    bool TeleportKinematicBody(std::string_view objectID, const Pose& pose, std::string* errorMessage = nullptr);
+    static constexpr float MaximumKinematicTargetRotation = 1.57079632679f;
+
+    // AS.7 rigid-body scripting. A Dynamic body's velocity is set between steps and integrated by Box3D (gravity and
+    // contacts still act). A Kinematic body keeps the velocity: each fixed step targets its current pose moved by
+    // velocity * step (rotation unchanged), through the same targets as SubmitKinematicTarget, until a zero velocity,
+    // a teleport or the session's end. An explicit target for a step takes precedence for that step. Static bodies
+    // and unknown IDs are rejected; components must be finite.
+    bool SetBodyLinearVelocity(std::string_view objectID, const Vector3& velocity, std::string* errorMessage = nullptr);
+    // The body's linear velocity (Box3D's, of the center of mass); nullopt for a Static body or an unknown ID.
+    std::optional<Vector3> GetBodyLinearVelocity(std::string_view objectID) const;
+    // Whether two objects' shapes touch after the last completed step (object-level contact state; any body types
+    // whose shapes Box3D lets collide).
+    bool AreObjectsTouching(std::string_view objectA, std::string_view objectB) const;
+
+    // AIR.4F.3 P1 moving-solid publication. Character Controllers always participate; Dynamic and
+    // Kinematic bodies only after opting in here (runtime only, discarded with the session).
+    // Participation never changes collision. Starting participation is a discontinuity (no
+    // history); Static bodies and unknown IDs are rejected.
+    bool SetMovingSolidParticipation(std::string_view objectID, bool participates, std::string* errorMessage = nullptr);
+    bool IsMovingSolidParticipant(std::string_view objectID) const;
+    // The object IDs of every Dynamic and Kinematic body (those that may participate), in object-ID order.
+    std::vector<std::string> GetMovableBodyIDs() const;
+    // Complete value-owned snapshot of the participants after the last completed step, in
+    // object-ID order, or nullopt. Read-only; never concurrent with stepping or destruction.
+    std::optional<MovingSolidSnapshot> CaptureMovingSolids(std::uint64_t sessionGeneration,
+        std::string* errorMessage = nullptr) const;
+
     // Number of completed fixed steps in this session (the last ContactEvent::fixedStep).
     std::uint64_t GetCompletedStepCount() const noexcept;
 
@@ -171,6 +213,8 @@ private:
 
     std::uint64_t m_completedSteps = 0;
     std::vector<ContactEvent> m_pendingContactEvents;
+    // AS.7: the persistent velocities of script-moved Kinematic bodies (see SetBodyLinearVelocity).
+    std::map<std::string, Vector3, std::less<>> m_kinematicVelocities;
 
     // Objects whose PhysicsComponent opted into contact notifications.
     std::set<std::string, std::less<>> m_contactNotificationObjects;
@@ -221,5 +265,28 @@ private:
     float m_characterGravity = 0.0f;
     // Solid shapes of Dynamic/Kinematic bodies, by World shape key: possible moving supports.
     std::unordered_map<std::uint64_t, std::string> m_movingBodyShapes;
+
+    // Kinematic targets keyed by the fixed step that consumes them, per body. Only bodies with
+    // requests have an entry; m_movingKinematicBodies holds bodies given velocity by a target,
+    // which the next step without a target stops.
+    std::map<std::string, std::map<std::uint64_t, Pose>, std::less<>> m_pendingKinematicTargets;
+    std::set<std::string, std::less<>> m_movingKinematicBodies;
+
+    // Moving-solid history per participant (bodies that opted in and every controller).
+    struct MovingSolidHistory
+    {
+        Pose poseBeforeStep;
+        std::uint64_t motionEpoch = 0;
+        bool discontinuous = true;
+    };
+    std::map<std::string, MovingSolidHistory, std::less<>> m_movingSolidHistory;
+    // Last motion epoch handed out; epochs are session-unique and never reused.
+    std::uint64_t m_lastMotionEpoch = 0;
+
+    void ApplyKinematicTargets();
+    void RecordMovingSolidStepStart();
+    void MarkMovingSolidDiscontinuity(const std::string& objectID, const Pose& pose);
+    Pose GetParticipantPose(const std::string& objectID) const;
+    std::shared_ptr<Body> FindKinematicBody(std::string_view objectID, std::string* errorMessage) const;
 };
 }

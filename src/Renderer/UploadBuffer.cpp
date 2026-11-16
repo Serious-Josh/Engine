@@ -1,4 +1,5 @@
 #include "UploadBuffer.h"
+#include "Debug/MemoryRegistry.h"
 #include "DescriptorHeap.h"
 
 #include <climits>
@@ -56,6 +57,8 @@ bool UploadBuffer::Initialize(
     {
         return false;
     }
+
+    MemoryRegistry::TrackResource(m_resource);
 
     result = m_resource->Map(0, nullptr, reinterpret_cast<void**>(&m_mappedData));
 

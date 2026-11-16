@@ -1,4 +1,5 @@
 #include "ShadowDenoisePass.h"
+#include "Debug/MemoryRegistry.h"
 
 #include "../DescriptorHeap.h"
 #include "../GraphicsDevice.h"
@@ -12,6 +13,8 @@ bool ShadowDenoisePass::Initialize(
     unsigned int width,
     unsigned int height)
 {
+    const MemoryCategoryScope memoryScope(MemoryCategory::LegacyRayTracing);
+
     ID3D12Device* device = graphicsDevice.GetDevice();
 
     ShaderDescription shaderDescription{};
@@ -74,6 +77,8 @@ bool ShadowDenoisePass::Resize(
     unsigned int width,
     unsigned int height)
 {
+    const MemoryCategoryScope memoryScope(MemoryCategory::LegacyRayTracing);
+
     ID3D12Device* device = graphicsDevice.GetDevice();
 
     for (Texture& texture : m_filteredVisibility)

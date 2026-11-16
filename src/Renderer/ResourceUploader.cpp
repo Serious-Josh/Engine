@@ -1,4 +1,5 @@
 #include "ResourceUploader.h"
+#include "Debug/MemoryRegistry.h"
 #include "Core/Log.h"
 #ifdef _DEBUG
 #include "GraphicsDevice.h"
@@ -210,6 +211,8 @@ bool ResourceUploader::UploadTexture(
         return false;
     }
 
+    MemoryRegistry::TrackResource(uploadBuffer, MemoryCategory::UploadReadback);
+
     void* mappedData = nullptr;
 
     result = uploadBuffer->Map(0, nullptr, &mappedData);
@@ -381,6 +384,8 @@ bool ResourceUploader::UploadTexture(
     {
         return false;
     }
+
+    MemoryRegistry::TrackResource(uploadBuffer, MemoryCategory::UploadReadback);
 
     void* mappedData = nullptr;
 
@@ -588,6 +593,8 @@ bool ResourceUploader::UploadBuffer(
     {
         return false;
     }
+
+    MemoryRegistry::TrackResource(uploadBuffer, MemoryCategory::UploadReadback);
 
     void* mappedData = nullptr;
 

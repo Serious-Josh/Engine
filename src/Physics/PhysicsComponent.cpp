@@ -33,7 +33,37 @@ bool PhysicsComponent::operator==(const PhysicsComponent& other) const
            colliderLocalPositionOffset.y == other.colliderLocalPositionOffset.y &&
            colliderLocalPositionOffset.z == other.colliderLocalPositionOffset.z &&
            density == other.density && friction == other.friction && restitution == other.restitution &&
-           generateContactEvents == other.generateContactEvents;
+           generateContactEvents == other.generateContactEvents && airParticipation == other.airParticipation;
+}
+
+const char* MovingSolidParticipationName(MovingSolidParticipation participation) noexcept
+{
+    switch(participation)
+    {
+    case MovingSolidParticipation::Automatic:
+        return "Automatic";
+    case MovingSolidParticipation::Always:
+        return "Always";
+    case MovingSolidParticipation::Never:
+        return "Never";
+    }
+
+    return "Unknown";
+}
+
+bool TryParseMovingSolidParticipation(std::string_view name, MovingSolidParticipation& participation) noexcept
+{
+    for(const MovingSolidParticipation candidate :
+        {MovingSolidParticipation::Automatic, MovingSolidParticipation::Always, MovingSolidParticipation::Never})
+    {
+        if(name == MovingSolidParticipationName(candidate))
+        {
+            participation = candidate;
+            return true;
+        }
+    }
+
+    return false;
 }
 
 bool ValidatePhysicsComponent(const PhysicsComponent& component, std::string* errorMessage)
@@ -132,6 +162,17 @@ bool ValidatePhysicsComponent(const PhysicsComponent& component, std::string* er
     if (!std::isfinite(component.restitution) || component.restitution < 0.0f || component.restitution > 1.0f)
     {
         return Fail(errorMessage, "Physics restitution must be finite and in [0, 1].");
+    }
+
+    // A Static body's value is kept (it never participates); only an unknown value is refused.
+    switch(component.airParticipation)
+    {
+    case MovingSolidParticipation::Automatic:
+    case MovingSolidParticipation::Always:
+    case MovingSolidParticipation::Never:
+        break;
+    default:
+        return Fail(errorMessage, "Unsupported physics AIR participation.");
     }
 
     return true;

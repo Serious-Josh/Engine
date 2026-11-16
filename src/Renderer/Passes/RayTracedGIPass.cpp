@@ -1,4 +1,5 @@
 #include "RayTracedGIPass.h"
+#include "Debug/MemoryRegistry.h"
 
 #include "Core/Log.h"
 
@@ -21,6 +22,8 @@ bool RayTracedGIPass::Initialize(
     {
         return false;
     }
+
+    const MemoryCategoryScope memoryScope(MemoryCategory::LegacyRayTracing);
 
     if (!CreateTextures(graphicsDevice.GetDevice(), descriptorHeap, width, height))
     {
@@ -70,6 +73,8 @@ bool RayTracedGIPass::CreateTextures(
     {
         return false;
     }
+
+    const MemoryCategoryScope memoryScope(MemoryCategory::LegacyRayTracing);
 
     if (!m_rawGITexture.Initialize(device, width, height, 1, 1, DXGI_FORMAT_R16G16B16A16_FLOAT,
                                    D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS))

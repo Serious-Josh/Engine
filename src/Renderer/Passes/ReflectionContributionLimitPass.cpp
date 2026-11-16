@@ -1,4 +1,5 @@
 #include "ReflectionContributionLimitPass.h"
+#include "Debug/MemoryRegistry.h"
 #include "Renderer/GraphicsDevice.h"
 #include "Renderer/DescriptorHeap.h"
 #include "Renderer/Shader/ShaderLibrary.h"
@@ -11,6 +12,8 @@ bool ReflectionContributionLimitPass::Initialize(
     unsigned int width,
     unsigned int height)
 {
+    const MemoryCategoryScope memoryScope(MemoryCategory::LegacyRayTracing);
+
     ShaderDescription shader{};
     shader.path = "ReflectionContributionLimit.hlsl";
     shader.entryPoint = "CSMain";
@@ -52,6 +55,8 @@ bool ReflectionContributionLimitPass::CreateTexture(
     unsigned int width,
     unsigned int height)
 {
+    const MemoryCategoryScope memoryScope(MemoryCategory::LegacyRayTracing);
+
     if (!m_output.Initialize(device.GetDevice(), width, height, 1, 1, DXGI_FORMAT_R16G16B16A16_FLOAT,
                              D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
     {

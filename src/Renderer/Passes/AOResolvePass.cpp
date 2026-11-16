@@ -1,4 +1,5 @@
 #include "AOResolvePass.h"
+#include "Debug/MemoryRegistry.h"
 
 #include "Renderer/DescriptorHeap.h"
 #include "Renderer/GraphicsDevice.h"
@@ -15,6 +16,8 @@ bool AOResolvePass::Initialize(
     unsigned int width,
     unsigned int height)
 {
+    const MemoryCategoryScope memoryScope(MemoryCategory::LegacyRayTracing);
+
     ShaderDescription shaderDescription{};
     shaderDescription.path = "AOResolve.hlsl";
     shaderDescription.entryPoint = "CSMain";
@@ -59,6 +62,8 @@ bool AOResolvePass::CreateTexture(
     unsigned int width,
     unsigned int height)
 {
+    const MemoryCategoryScope memoryScope(MemoryCategory::LegacyRayTracing);
+
     ID3D12Device* device = graphicsDevice.GetDevice();
 
     if (!m_outputTexture.Initialize(device, width, height, 1, 1, DXGI_FORMAT_R16_FLOAT,

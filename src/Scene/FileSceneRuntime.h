@@ -297,6 +297,15 @@ public:
     bool SetSceneVoxelBake(const std::optional<VoxelBakeSettings>& expected, const std::optional<VoxelBakeSettings>& replacement,
         std::string* errorMessage = nullptr);
     // AIR.4F F4.4.1: the scene's mist appearance, replaced only if it still equals `expected`; only sanitized settings are accepted.
+    // AIR.4F F4.5.1b: the scene's air environment, read by the Engine each frame.
+    // AIR.4F.2d.3: the scene's environmental haze, as SetSceneAirEnvironment.
+    bool SetSceneEnvironmentalHaze(const std::optional<EnvironmentalHazeSettings>& expected,
+        const std::optional<EnvironmentalHazeSettings>& replacement, std::string* errorMessage = nullptr);
+    bool SetSceneAirEnvironment(const std::optional<AirEnvironmentSettings>& expected, const std::optional<AirEnvironmentSettings>& replacement,
+        std::string* errorMessage = nullptr);
+    // R1.1: the scene's AIR simulation configuration, as SetSceneAirEnvironment; read by the Engine each frame through ResolveAirSimulation.
+    bool SetSceneAirSimulation(const std::optional<AirSimulationSettings>& expected, const std::optional<AirSimulationSettings>& replacement,
+        std::string* errorMessage = nullptr);
     bool SetSceneMistRendering(const std::optional<MistRenderSettings>& expected, const std::optional<MistRenderSettings>& replacement,
         std::string* errorMessage = nullptr);
     bool SetObjectAudio(const SceneObjectMetadata& selection, const AudioComponentState& expected,

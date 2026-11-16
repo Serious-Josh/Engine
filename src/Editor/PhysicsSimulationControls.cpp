@@ -8,6 +8,12 @@ void Editor::SetPhysicsStatus(PhysicsState state, bool canPlay, std::string mess
     m_physicsState = state;
     m_canPlayPhysics = canPlay;
     m_physicsMessage = std::move(message);
+
+    // R1.1: an AIR session override lives only while Play or the simulation locks scene editing.
+    if(!IsSceneEditingLocked())
+    {
+        DiscardAirSimulationOverride();
+    }
 }
 
 std::optional<Editor::PhysicsRequest> Editor::TakePhysicsRequest()

@@ -150,6 +150,31 @@ struct PathTracingRenderingSettings
     bool operator==(const PathTracingRenderingSettings&) const = default;
 };
 
+// R1.3: the volumetric fog's (environmental haze and AIR mist) cost and resolution, in every lighting mode. Low, Medium and High
+// are the fog pass's presets (quarter resolution with 32 or 64 steps, half resolution with 96).
+enum class ProjectVolumetricQuality
+{
+    Low,
+    Medium,
+    High
+};
+
+// What the quality's resolution scales: the frame's render extent (lower under DLSS or a render scale) or the output.
+enum class ProjectVolumetricResolutionBasis
+{
+    Internal,
+    Output
+};
+
+// The defaults are the Editor's and packaged games' behaviour before R1.3.
+struct VolumetricRenderingSettings
+{
+    ProjectVolumetricQuality quality = ProjectVolumetricQuality::Medium;
+    ProjectVolumetricResolutionBasis resolutionBasis = ProjectVolumetricResolutionBasis::Internal;
+
+    bool operator==(const VolumetricRenderingSettings&) const = default;
+};
+
 struct RenderingSettings
 {
     ProjectLightingMode lightingMode = ProjectLightingMode::Legacy;
@@ -157,6 +182,8 @@ struct RenderingSettings
     // Both mode sections are always kept, so switching modes never loses the other mode's values.
     LegacyRenderingSettings legacy;
     PathTracingRenderingSettings pathTracing;
+    // R1.3: mode-independent.
+    VolumetricRenderingSettings volumetrics;
 
     bool operator==(const RenderingSettings&) const = default;
 };
@@ -203,6 +230,8 @@ std::string_view ToSerializedName(ProjectDlssQuality value);
 std::string_view ToSerializedName(ProjectPathTraceDenoiser value);
 std::string_view ToSerializedName(ProjectPathTraceDenoiserView value);
 std::string_view ToSerializedName(ProjectPathTraceDenoiserSignal value);
+std::string_view ToSerializedName(ProjectVolumetricQuality value);
+std::string_view ToSerializedName(ProjectVolumetricResolutionBasis value);
 
 // ProjectSettings.json as loaded: the effective settings, why they look the way they do, and the
 // retained document whose unknown members a later save writes back.

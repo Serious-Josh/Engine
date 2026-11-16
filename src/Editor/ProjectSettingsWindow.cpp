@@ -518,6 +518,19 @@ void Editor::DrawRenderingSettingsCategory(const DebugUI& debugUI, bool editable
     Tooltip("Final display mapping only; the lighting and accumulation are unchanged.");
     SessionOverrideNote(debugUI, Field::toneMapper);
 
+    // R1.3: the volumetric fog (environmental haze and AIR mist), in every lighting mode.
+    ImGui::SeparatorText("Volumetrics");
+    const char* volumetricQualities[] = {"Low (1/4 res, 32 steps)", "Medium (1/4 res, 64 steps)", "High (1/2 res, 96 steps)"};
+    DraftCombo("Volumetric quality", draft.volumetrics.quality, volumetricQualities);
+    Tooltip("The volumetric fog's raymarch resolution and step count, in the Editor and in built games. The Air window can\n"
+        "override it for this session only.");
+    SessionOverrideNote(debugUI, Field::volumetricQuality);
+    const char* volumetricBases[] = {"Internal Resolution", "Output Resolution"};
+    DraftCombo("Volumetric resolution basis", draft.volumetrics.resolutionBasis, volumetricBases);
+    Tooltip("What the quality's resolution scales: the scene's render resolution (lower under DLSS or a render scale) or the\n"
+        "output image. The fog is always composited at the output.");
+    SessionOverrideNote(debugUI, Field::volumetricResolutionBasis);
+
     if(draft.lightingMode == ProjectLightingMode::Legacy)
     {
         ImGui::SeparatorText("Legacy");

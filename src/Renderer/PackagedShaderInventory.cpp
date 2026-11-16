@@ -112,7 +112,97 @@ namespace
         {"RadianceCacheD6Insert.hlsl", "CSClearRecordStamps", Compute, Feature::Sharc},
 
         // DLSS: the input preparation every DLSS frame records (Renderer::RecordRenderFrame, DlssInputPreparationPass).
-        {"DlssInputPreparation.hlsl", "CSMain", Compute, Feature::Dlss}};
+        {"DlssInputPreparation.hlsl", "CSMain", Compute, Feature::Dlss},
+
+        // R1.2b: EditorMistPass's haze core (Initialize) and its production Gaussian filter (EnsureFilterPipeline). The mist
+        // stages (EnsureMistPipelines) are Feature::Air below; the froxel diagnostics stay unpackaged.
+        {"EditorMist.hlsl", "CSRaymarchAtmosphere", Compute, Feature::Volumetrics},
+        {"EditorMist.hlsl", "CSRaymarchAtmosphereBounded", Compute, Feature::Volumetrics},
+        {"EditorMist.hlsl", "CSFilterIntegrated", Compute, Feature::Volumetrics},
+        {"EditorMist.hlsl", "VSComposite", Vertex, Feature::Volumetrics},
+        {"EditorMist.hlsl", "PSComposite", Pixel, Feature::Volumetrics},
+        // R1.5b: the AIR simulation (Feature::Air, cooked only when the startup scene requests AIR). AirField::Initialize creates the
+        // field, solver, mist, mist flux and moving-solid kernels; AirPressure::EnsurePipelines its 34 (eagerly when packaged).
+        {"AirField.hlsl", "CSInitializeVelocity", Compute, Feature::Air},
+        {"AirField.hlsl", "CSBuildObstacles", Compute, Feature::Air},
+        {"AirField.hlsl", "CSBuildPieces", Compute, Feature::Air},
+        {"AirField.hlsl", "CSBuildApertures", Compute, Feature::Air},
+        {"AirSolver.hlsl", "CSStepOpen", Compute, Feature::Air},
+        {"AirSolver.hlsl", "CSStepSplit", Compute, Feature::Air},
+        {"AirSolver.hlsl", "CSPrepareSplit", Compute, Feature::Air},
+        {"AirSolver.hlsl", "CSResetSplit", Compute, Feature::Air},
+        {"AirSolver.hlsl", "CSMotorVisibility", Compute, Feature::Air},
+        {"AirSolver.hlsl", "CSEmissionStatus", Compute, Feature::Air},
+        {"AirSolver.hlsl", "CSEmissionSamples", Compute, Feature::Air},
+        {"AirMist.hlsl", "CSMistOpen", Compute, Feature::Air},
+        {"AirMist.hlsl", "CSMistSplit", Compute, Feature::Air},
+        {"AirMist.hlsl", "CSMistPrepare", Compute, Feature::Air},
+        {"AirMist.hlsl", "CSMistClear", Compute, Feature::Air},
+        {"AirMist.hlsl", "CSMistEmit", Compute, Feature::Air},
+        {"AirMist.hlsl", "CSMistEmitterStatus", Compute, Feature::Air},
+        {"AirMist.hlsl", "CSMistPointSum", Compute, Feature::Air},
+        {"AirMist.hlsl", "CSMistPointDeposit", Compute, Feature::Air},
+        {"AirMist.hlsl", "CSMistVolume", Compute, Feature::Air},
+        {"AirMistFlux.hlsl", "CSMistFluxOut", Compute, Feature::Air},
+        {"AirMistFlux.hlsl", "CSMistFluxUpdate", Compute, Feature::Air},
+        {"AirMistFlux.hlsl", "CSMistCourant", Compute, Feature::Air},
+        {"AirMistFlux.hlsl", "CSMistSubsteps", Compute, Feature::Air},
+        {"AirMovingSolids.hlsl", "CSMovingSolidPieces", Compute, Feature::Air},
+        {"AirMovingSolids.hlsl", "CSMovingSolidApertures", Compute, Feature::Air},
+        {"AirMovingSolids.hlsl", "CSMovingSolidTopologyReset", Compute, Feature::Air},
+        {"AirMovingSolids.hlsl", "CSMovingSolidRemapClassify", Compute, Feature::Air},
+        {"AirMovingSolids.hlsl", "CSMovingSolidRelayDistance", Compute, Feature::Air},
+        {"AirMovingSolids.hlsl", "CSMovingSolidRelayFlow", Compute, Feature::Air},
+        {"AirMovingSolids.hlsl", "CSMovingSolidRemapDistribute", Compute, Feature::Air},
+        {"AirMovingSolids.hlsl", "CSBoundaryCorrectionClear", Compute, Feature::Air},
+        {"AirMovingSolids.hlsl", "CSBoundaryCorrectionSums", Compute, Feature::Air},
+        {"AirMovingSolids.hlsl", "CSBoundaryVolumes", Compute, Feature::Air},
+        {"AirMovingSolids.hlsl", "CSBoundaryGather", Compute, Feature::Air},
+        {"AirMovingSolids.hlsl", "CSWallTangential", Compute, Feature::Air},
+        {"AirMovingSolids.hlsl", "CSBoundaryClear", Compute, Feature::Air},
+        {"AirMovingSolids.hlsl", "CSBoundarySnapshot", Compute, Feature::Air},
+        {"AirMovingSolids.hlsl", "CSBoundaryToGeometric", Compute, Feature::Air},
+        {"AirMovingSolids.hlsl", "CSBoundaryZero", Compute, Feature::Air},
+        {"AirPressure.hlsl", "CSLabelInit", Compute, Feature::Air},
+        {"AirPressure.hlsl", "CSLabelHook", Compute, Feature::Air},
+        {"AirPressure.hlsl", "CSLabelJump", Compute, Feature::Air},
+        {"AirPressure.hlsl", "CSLabelGround", Compute, Feature::Air},
+        {"AirPressure.hlsl", "CSLabelCompact", Compute, Feature::Air},
+        {"AirPressure.hlsl", "CSLabelFinalize", Compute, Feature::Air},
+        {"AirPressure.hlsl", "CSLabelVolume", Compute, Feature::Air},
+        {"AirPressure.hlsl", "CSClearEntries", Compute, Feature::Air},
+        {"AirPressure.hlsl", "CSAggregateFine", Compute, Feature::Air},
+        {"AirPressure.hlsl", "CSAggregateCoarse", Compute, Feature::Air},
+        {"AirPressure.hlsl", "CSCouplingsFine", Compute, Feature::Air},
+        {"AirPressure.hlsl", "CSCouplingsCoarse", Compute, Feature::Air},
+        {"AirPressure.hlsl", "CSDiagonal", Compute, Feature::Air},
+        {"AirPressure.hlsl", "CSClearSums", Compute, Feature::Air},
+        {"AirPressure.hlsl", "CSPrepare", Compute, Feature::Air},
+        {"AirPressure.hlsl", "CSClosedSum", Compute, Feature::Air},
+        {"AirPressure.hlsl", "CSCompatible", Compute, Feature::Air},
+        {"AirPressure.hlsl", "CSSmoothFine", Compute, Feature::Air},
+        {"AirPressure.hlsl", "CSRestrictFine", Compute, Feature::Air},
+        {"AirPressure.hlsl", "CSSmoothCoarse", Compute, Feature::Air},
+        {"AirPressure.hlsl", "CSRestrictCoarse", Compute, Feature::Air},
+        {"AirPressure.hlsl", "CSCoarsest", Compute, Feature::Air},
+        {"AirPressure.hlsl", "CSProlongCoarse", Compute, Feature::Air},
+        {"AirPressure.hlsl", "CSProlongFine", Compute, Feature::Air},
+        {"AirPressure.hlsl", "CSGaugeScale", Compute, Feature::Air},
+        {"AirPressure.hlsl", "CSGaugeSum", Compute, Feature::Air},
+        {"AirPressure.hlsl", "CSGaugeApply", Compute, Feature::Air},
+        {"AirPressure.hlsl", "CSResidual", Compute, Feature::Air},
+        {"AirPressure.hlsl", "CSZeroPhi", Compute, Feature::Air},
+        {"AirPressure.hlsl", "CSCorrect", Compute, Feature::Air},
+        {"AirPressure.hlsl", "CSLabelGate", Compute, Feature::Air},
+        {"AirPressure.hlsl", "CSTopologyCheck", Compute, Feature::Air},
+        {"AirPressure.hlsl", "CSTopologyArguments", Compute, Feature::Air},
+        {"AirPressure.hlsl", "CSRecoveryGate", Compute, Feature::Air},
+        // R1.5b: the AIR mist's Original Raymarch stages (EditorMistPass::EnsureMistPipelines). The froxel and integrated renderers
+        // stay unpackaged (experimental).
+        {"EditorMist.hlsl", "CSRaymarch", Compute, Feature::Air},
+        {"EditorMist.hlsl", "CSSunVisibility", Compute, Feature::Air},
+        {"EditorMist.hlsl", "CSIndirectFill", Compute, Feature::Air},
+        {"EditorMist.hlsl", "CSOccupancy", Compute, Feature::Air}};
 }
 
 const char* PackagedShaderFeatureName(PackagedShaderFeature feature)
@@ -133,6 +223,10 @@ const char* PackagedShaderFeatureName(PackagedShaderFeature feature)
         return "SHARC";
     case Feature::Dlss:
         return "DLSS";
+    case Feature::Volumetrics:
+        return "volumetrics";
+    case Feature::Air:
+        return "AIR";
     case Feature::Presentation:
     default:
         return "presentation";
@@ -142,6 +236,21 @@ const char* PackagedShaderFeatureName(PackagedShaderFeature feature)
 std::span<const PackagedShaderEntry> GetPackagedShaderInventory()
 {
     return kShaders;
+}
+
+std::vector<PackagedShaderEntry> SelectPackagedShaderInventory(bool air)
+{
+    std::vector<PackagedShaderEntry> selected;
+
+    for(const PackagedShaderEntry& entry : kShaders)
+    {
+        if(air || entry.feature != Feature::Air)
+        {
+            selected.push_back(entry);
+        }
+    }
+
+    return selected;
 }
 
 std::vector<PackagedLibraryEntry> GetPackagedLibraryInventory()

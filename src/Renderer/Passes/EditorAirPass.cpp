@@ -1,4 +1,5 @@
 #include "Renderer/Passes/EditorAirPass.h"
+#include "Debug/MemoryRegistry.h"
 
 #include "Renderer/DepthBuffer.h"
 #include "Renderer/DescriptorHeap.h"
@@ -121,6 +122,8 @@ std::uint32_t AirVectorCount(const AirVectorParameters& parameters)
 
 bool EditorAirPass::Initialize(ID3D12Device* device, ShaderLibrary& shaderLibrary)
 {
+    const MemoryCategoryScope memoryScope(MemoryCategory::AirVolumetrics);
+
     m_device = device;
     const Shader* vertexShader = shaderLibrary.Load({"EditorAir.hlsl", "VSMain", ShaderStage::Vertex});
     const Shader* pixelShader = shaderLibrary.Load({"EditorAir.hlsl", "PSMain", ShaderStage::Pixel});
@@ -131,9 +134,15 @@ bool EditorAirPass::Initialize(ID3D12Device* device, ShaderLibrary& shaderLibrar
     const Shader* cellPixelShader = shaderLibrary.Load({"EditorAirCells.hlsl", "PSMain", ShaderStage::Pixel});
     const Shader* pieceVertexShader = shaderLibrary.Load({"EditorAirPieces.hlsl", "VSMain", ShaderStage::Vertex});
     const Shader* piecePixelShader = shaderLibrary.Load({"EditorAirPieces.hlsl", "PSMain", ShaderStage::Pixel});
+    const Shader* temperatureVertexShader = shaderLibrary.Load({"EditorAirTemperature.hlsl", "VSMain", ShaderStage::Vertex});
+    const Shader* temperaturePixelShader = shaderLibrary.Load({"EditorAirTemperature.hlsl", "PSMain", ShaderStage::Pixel});
+    const Shader* divergenceComputeShader = shaderLibrary.Load({"AirDivergence.hlsl", "CSDivergence", ShaderStage::Compute});
+    const Shader* divergenceVertexShader = shaderLibrary.Load({"EditorAirDivergence.hlsl", "VSMain", ShaderStage::Vertex});
+    const Shader* divergencePixelShader = shaderLibrary.Load({"EditorAirDivergence.hlsl", "PSMain", ShaderStage::Pixel});
 
     if(!vertexShader || !pixelShader || !cellVertexShader || !cellPixelShader || !pieceVertexShader || !piecePixelShader ||
-        !splitVertexShader || !resetShader || !classifyShader)
+        !splitVertexShader || !resetShader || !classifyShader || !temperatureVertexShader || !temperaturePixelShader ||
+        !divergenceComputeShader || !divergenceVertexShader || !divergencePixelShader)
     {
         return false;
     }
@@ -169,6 +178,22 @@ bool EditorAirPass::Initialize(ID3D12Device* device, ShaderLibrary& shaderLibrar
     constants.visibility = D3D12_SHADER_VISIBILITY_VERTEX;
     pieces.rootParameters = {constants};
 
+    // AIR.4F F4.5.1b.1: the temperature points: opaque triangles, the vectors' depth rules.
+    PipelineDescription temperature = description;
+    temperature.vertexShader = temperatureVertexShader;
+    temperature.pixelShader = temperaturePixelShader;
+    temperature.topologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    temperature.rootParameters = {{RootParameterType::Constants, 0, TemperatureConstantCount, D3D12_SHADER_VISIBILITY_VERTEX}};
+
+    // AIR.4E.2: the divergence points draw as the temperature points; their kernel takes its own root constants.
+    PipelineDescription divergence = temperature;
+    divergence.vertexShader = divergenceVertexShader;
+    divergence.pixelShader = divergencePixelShader;
+    divergence.rootParameters = {{RootParameterType::Constants, 0, DivergenceConstantCount, D3D12_SHADER_VISIBILITY_VERTEX}};
+    ComputePipelineDescription divergenceCompute{};
+    divergenceCompute.computeShader = divergenceComputeShader;
+    divergenceCompute.rootParameters.push_back({RootParameterType::Constants, 0, DivergenceComputeConstantCount, D3D12_SHADER_VISIBILITY_ALL});
+
     // AIR.4D D3: the split pass draws like the lean one; its list is reset and filled by compute shaders with the same constants.
     PipelineDescription split = description;
     split.vertexShader = splitVertexShader;
@@ -186,6 +211,8 @@ bool EditorAirPass::Initialize(ID3D12Device* device, ShaderLibrary& shaderLibrar
     signature.pArgumentDescs = &draw;
 
     return m_pipeline.Initialize(device, description) && m_cellPipeline.Initialize(device, cells) && m_piecePipeline.Initialize(device, pieces) &&
+        m_temperaturePipeline.Initialize(device, temperature) && m_divergencePipeline.Initialize(device, divergence) &&
+        m_divergenceComputePipeline.Initialize(device, divergenceCompute) &&
         m_splitPipeline.Initialize(device, split) && m_resetSplitPipeline.Initialize(device, reset) &&
         m_classifyPipeline.Initialize(device, classify) &&
         SUCCEEDED(device->CreateCommandSignature(&signature, nullptr, IID_PPV_ARGS(&m_splitSignature)));
@@ -197,6 +224,8 @@ bool EditorAirPass::EnsureSplitResources(DescriptorHeap& descriptorHeap)
     {
         return true;
     }
+
+    const MemoryCategoryScope memoryScope(MemoryCategory::AirVolumetrics);
 
     // Capacity for every vector the largest budget allows, so the list never overflows.
     m_splitResourcesReady = m_device != nullptr && m_splitList.InitializeGPUWritable(m_device, SplitListBytes) &&
@@ -222,10 +251,16 @@ void EditorAirPass::ReleaseSplitResources()
 void EditorAirPass::Shutdown()
 {
     ReleaseSplitResources();
+    // After the Renderer's drain: every retired divergence buffer is complete.
+    RetireDivergence(0);
+    CollectRetiredDivergence(UINT64_MAX);
+    m_divergencePipeline.Shutdown();
+    m_divergenceComputePipeline.Shutdown();
     m_splitSignature.Reset();
     m_classifyPipeline.Shutdown();
     m_resetSplitPipeline.Shutdown();
     m_splitPipeline.Shutdown();
+    m_temperaturePipeline.Shutdown();
     m_piecePipeline.Shutdown();
     m_cellPipeline.Shutdown();
     m_pipeline.Shutdown();
@@ -412,4 +447,202 @@ std::uint32_t EditorAirPass::ExecutePieces(ID3D12GraphicsCommandList* commandLis
     commandList->DrawInstanced(36, count, 0, 0);
     End(commandList, viewportColor, viewportDepth, previousDepthState);
     return count;
+}
+
+std::uint32_t EditorAirPass::ExecuteTemperature(ID3D12GraphicsCommandList* commandList, DescriptorHeap& descriptorHeap, RenderTarget& viewportColor,
+    DepthBuffer& viewportDepth, const Matrix4& viewProjection, const AirFieldBinding& field, const AirTemperatureRequest& request) const
+{
+    // The vectors' anchor placement over the whole window: the largest budget covers it at one-cell spacing (2 x 1,048,576 instances).
+    AirVisualizationRequest box;
+    box.spacingExponent = std::clamp(request.spacingExponent, 0, 3);
+    box.placement = AirVectorPlacement::PieceAnchors;
+    box.maximumVectors = MaximumVectors;
+    const AirVectorParameters parameters = MakeAirVectorParameters(field, box);
+    const float pixels = std::isfinite(request.pointPixels) ? std::clamp(request.pointPixels, 1.0f, 32.0f) : 5.0f;
+
+    struct
+    {
+        Matrix4 viewProjection;
+        AirFieldBinding field;
+        AirVectorParameters parameters;
+        float displayRange;
+        float pointHalfSize[2];
+        float padding;
+    } constants{viewProjection, field, parameters, std::isfinite(request.displayRange) ? std::clamp(request.displayRange, 1.0f, 1000.0f) : 100.0f,
+        {pixels / static_cast<float>((std::max)(1u, viewportColor.GetWidth())), pixels / static_cast<float>((std::max)(1u, viewportColor.GetHeight()))},
+        0.0f};
+    static_assert(sizeof(constants) == TemperatureConstantCount * sizeof(float));
+
+    const std::uint32_t count = field.valid != 0 ? AirVectorCount(parameters) : 0;
+    D3D12_RESOURCE_STATES previousDepthState{};
+
+    if(count == 0 || !Begin(commandList, descriptorHeap, viewportColor, viewportDepth, m_temperaturePipeline, previousDepthState))
+    {
+        return 0;
+    }
+
+    commandList->SetGraphicsRoot32BitConstants(0, TemperatureConstantCount, &constants, 0);
+    commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    commandList->DrawInstanced(6, count, 0, 0);
+    End(commandList, viewportColor, viewportDepth, previousDepthState);
+    return count;
+}
+
+std::uint32_t EditorAirPass::ExecuteDivergence(ID3D12GraphicsCommandList* commandList, DescriptorHeap& descriptorHeap, RenderTarget& viewportColor,
+    DepthBuffer& viewportDepth, const Matrix4& viewProjection, const AirFieldBinding& field, std::uint32_t apertureIndex,
+    const AirPressureDiagnostics& pressure, const AirDivergenceRequest& request, std::uint64_t lastSubmissionFence, std::uint64_t completedFence)
+{
+    CollectRetiredDivergence(completedFence);
+
+    const std::size_t cells = std::size_t{field.dimensions[0]} * field.dimensions[1] * field.dimensions[2];
+    const bool drawable = field.valid != 0 && apertureIndex != UINT32_MAX && viewportColor.GetWidth() == viewportDepth.GetWidth() &&
+        viewportColor.GetHeight() == viewportDepth.GetHeight();
+
+    if(!drawable || !EnsureDivergenceStorage(descriptorHeap, cells, lastSubmissionFence))
+    {
+        return 0;
+    }
+
+    // AIR.4E.4: with a projected step this frame, the face value is the solver's: minus its residual (the predicted face divergence after
+    // the correction) or minus its right-hand side (the divergence before it). Both describe the step whose corrected velocity is published.
+    std::uint32_t faceSource = 0xFFFFFFFFu;
+
+    if(pressure.valid != 0 && request.measure == AirDivergenceMeasure::Face)
+    {
+        faceSource = pressure.residualIndex;
+    }
+    else if(pressure.valid != 0 && request.measure == AirDivergenceMeasure::BeforeProjection)
+    {
+        faceSource = pressure.rhsIndex;
+    }
+
+    RecordDivergence(commandList, descriptorHeap, field, apertureIndex, 0xFFFFFFFFu, request.ambientVelocity, faceSource, -1.0f);
+    return DrawDivergence(commandList, descriptorHeap, viewportColor, viewportDepth, viewProjection, field, request);
+}
+
+std::uint32_t EditorAirPass::DrawDivergence(ID3D12GraphicsCommandList* commandList, DescriptorHeap& descriptorHeap, RenderTarget& viewportColor,
+    DepthBuffer& viewportDepth, const Matrix4& viewProjection, const AirFieldBinding& field, const AirDivergenceRequest& request) const
+{
+    // The temperature points' placement over the whole window.
+    AirVisualizationRequest box;
+    box.spacingExponent = std::clamp(request.spacingExponent, 0, 3);
+    box.placement = AirVectorPlacement::PieceAnchors;
+    box.maximumVectors = MaximumVectors;
+    const AirVectorParameters parameters = MakeAirVectorParameters(field, box);
+    const std::uint32_t count = AirVectorCount(parameters);
+
+    const float pixels = std::isfinite(request.pointPixels) ? std::clamp(request.pointPixels, 1.0f, 32.0f) : 5.0f;
+    const float range = std::isfinite(request.displayRange) ? std::clamp(request.displayRange, 0.01f, 100.0f) : 2.0f;
+
+    struct
+    {
+        Matrix4 viewProjection;
+        AirFieldBinding field;
+        AirVectorParameters parameters;
+        std::uint32_t divergenceIndex;
+        float displayRange;
+        float pointHalfSize[2];
+        std::uint32_t measure;
+        std::uint32_t padding[3];
+    } constants{viewProjection, field, parameters, m_divergence.GetDescriptorIndex(), range,
+        {pixels / static_cast<float>((std::max)(1u, viewportColor.GetWidth())), pixels / static_cast<float>((std::max)(1u, viewportColor.GetHeight()))},
+        static_cast<std::uint32_t>(request.measure), {0, 0, 0}};
+    static_assert(sizeof(constants) == DivergenceConstantCount * sizeof(float));
+
+    D3D12_RESOURCE_STATES previousDepthState{};
+
+    if(!Begin(commandList, descriptorHeap, viewportColor, viewportDepth, m_divergencePipeline, previousDepthState))
+    {
+        return 0;
+    }
+
+    commandList->SetGraphicsRoot32BitConstants(0, DivergenceConstantCount, &constants, 0);
+    commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    commandList->DrawInstanced(6, count, 0, 0);
+    End(commandList, viewportColor, viewportDepth, previousDepthState);
+    return count;
+}
+
+void EditorAirPass::IdleDivergence(std::uint64_t lastSubmissionFence, std::uint64_t completedFence)
+{
+    CollectRetiredDivergence(completedFence);
+
+    if(m_divergence.GetResource() != nullptr)
+    {
+        RetireDivergence(lastSubmissionFence);
+    }
+}
+
+bool EditorAirPass::EnsureDivergenceStorage(DescriptorHeap& descriptorHeap, std::size_t cells, std::uint64_t lastSubmissionFence)
+{
+    if(m_divergence.GetResource() != nullptr && cells == m_divergenceCells)
+    {
+        return true;
+    }
+
+    const MemoryCategoryScope memoryScope(MemoryCategory::AirVolumetrics);
+
+    // A new size: frames still in flight may read the old buffer, so it waits for the last submission.
+    RetireDivergence(lastSubmissionFence);
+
+    if(m_device == nullptr || !m_divergence.InitializeGPUWritable(m_device, cells * DivergenceBytesPerCell) ||
+        !m_divergence.CreateRawSRV(m_device, descriptorHeap) || !m_divergence.CreateRawUAV(m_device, descriptorHeap))
+    {
+        // Never recorded into: released at once.
+        m_divergence.Shutdown();
+        return false;
+    }
+
+    m_divergenceCells = cells;
+    return true;
+}
+
+void EditorAirPass::RetireDivergence(std::uint64_t fence)
+{
+    if(m_divergence.GetResource() != nullptr)
+    {
+        RetiredBuffer retired;
+        retired.buffer = std::move(m_divergence);
+        retired.fence = fence;
+        m_retiredDivergence.push_back(std::move(retired));
+    }
+
+    m_divergenceCells = 0;
+}
+
+void EditorAirPass::CollectRetiredDivergence(std::uint64_t completedFence)
+{
+    while(!m_retiredDivergence.empty() && m_retiredDivergence.front().fence <= completedFence)
+    {
+        m_retiredDivergence.front().buffer.Shutdown();
+        m_retiredDivergence.pop_front();
+    }
+}
+
+void EditorAirPass::RecordDivergence(ID3D12GraphicsCommandList* commandList, DescriptorHeap& descriptorHeap, const AirFieldBinding& field,
+    std::uint32_t apertureIndex, std::uint32_t pressureIndex, const Vector3& ambientVelocity, std::uint32_t faceSourceIndex, float faceSourceScale)
+{
+    struct
+    {
+        AirFieldBinding field;
+        std::uint32_t apertureIndex;
+        std::uint32_t pressureIndex;
+        std::uint32_t outputIndex;
+        std::uint32_t faceSourceIndex;
+        float ambientVelocity[3];
+        float faceSourceScale;
+    } constants{field, apertureIndex, pressureIndex, m_divergence.GetUAVDescriptorIndex(), faceSourceIndex,
+        {ambientVelocity.x, ambientVelocity.y, ambientVelocity.z}, faceSourceScale};
+    static_assert(sizeof(constants) == DivergenceComputeConstantCount * sizeof(float));
+
+    // The field is in its shader-read state after the frame's air work; only the divergence buffer is written. Its transition to the
+    // vertex shader's read state orders the draw after the dispatch.
+    ID3D12DescriptorHeap* heaps[]{descriptorHeap.GetHeap()};
+    commandList->SetDescriptorHeaps(1, heaps);
+    m_divergence.Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    m_divergenceComputePipeline.Bind(commandList);
+    commandList->SetComputeRoot32BitConstants(0, DivergenceComputeConstantCount, &constants, 0);
+    commandList->Dispatch((field.dimensions[0] + 7) / 8, (field.dimensions[1] + 7) / 8, (field.dimensions[2] + 7) / 8);
+    m_divergence.Transition(commandList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    ++m_divergenceDispatches;
 }

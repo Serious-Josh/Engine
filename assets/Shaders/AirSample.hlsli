@@ -268,6 +268,89 @@ float3 AirSampleOpen(AirPathField path, int3 base, float3 fraction, float3 fallb
     return total > 0.0 ? sum / total : fallback;
 }
 
+// AIR.4F F4.5.1b: the solver samples each piece's state, velocity (xyz, m/s) and temperature (w: ΔT, kelvin from the scene's
+// ambient), by the same corners and weights: the velocity sums exactly as AirSampleSplit and AirSampleOpen do, and the temperature
+// alongside as its own sum. Corners outside the window are at the ambient (ΔT 0). The field's other consumers keep the velocity-only
+// samplers above.
+float4 AirPieceState(AirPathField path, int3 cell, uint piece)
+{
+    if(!AirContains(path.field, cell))
+    {
+        return float4(path.ambient, 0.0);
+    }
+
+    AirPathBuffer velocity = ResourceDescriptorHeap[NonUniformResourceIndex(piece == 0 ? path.velocityIndex : path.velocityPiece1Index)];
+    return asfloat(velocity.Load4(AirVelocityAddress(path.field, AirSlotOf(path.field, cell))));
+}
+
+float4 AirSampleStateSplit(AirPathField path, AirPathEnd at, int3 base, float3 fraction, float4 fallback)
+{
+    const AirCornerChoice choice = AirChooseCorners(path, at, base, fraction);
+    float3 sum = 0.0;
+    float temperatureSum = 0.0;
+    float total = 0.0;
+
+    for(uint corner = 0; corner < 8; ++corner)
+    {
+        const int3 offset = int3(corner & 1u, (corner >> 1) & 1u, (corner >> 2) & 1u);
+
+        if(choice.piece[corner] != AirNoPiece)
+        {
+            const float4 state = AirPieceState(path, path.field.minimum + base + offset, choice.piece[corner]);
+            sum += state.xyz * choice.weight[corner];
+            temperatureSum += state.w * choice.weight[corner];
+            total += choice.weight[corner];
+        }
+    }
+
+    return total > 0.0 ? float4(sum / total, temperatureSum / total) : fallback;
+}
+
+float4 AirSampleStateOpen(AirPathField path, int3 base, float3 fraction, float4 fallback)
+{
+    float3 sum = 0.0;
+    float temperatureSum = 0.0;
+    float total = 0.0;
+
+    for(uint corner = 0; corner < 8; ++corner)
+    {
+        const int3 offset = int3(corner & 1u, (corner >> 1) & 1u, (corner >> 2) & 1u);
+        const int3 cell = path.field.minimum + base + offset;
+        const float3 axisWeight = lerp(1.0 - fraction, fraction, float3(offset));
+        const float weight = axisWeight.x * axisWeight.y * axisWeight.z;
+
+        if(weight > 0.0)
+        {
+            const float4 state = AirPieceState(path, cell, 0);
+            sum += state.xyz * weight;
+            temperatureSum += state.w * weight;
+            total += weight;
+        }
+    }
+
+    return total > 0.0 ? float4(sum / total, temperatureSum / total) : fallback;
+}
+
+// AIR.4F.1b: each piece's state is one value on the cell-centre lattice, but a partial piece's backtrace starts at its anchor (the sub-cell
+// nearest its centroid), up to 0.375 cells from the centre. Interpolating the lattice at the backtrace's end directly would blend a still
+// partial piece with its neighbours every step. So the weights are evaluated at the end moved back by the piece's anchor offset
+// (`anchorOffset` = anchor - 0.5, in cells): zero displacement samples exactly the piece's own value, and the displacement still comes from
+// the wall-aware traversal. The corner pieces are chosen from the end itself, as before. The offset is under half a cell, so the end's cell
+// stays among the 8 corners; a whole cell's offset is 0, so whole cells sample exactly as before.
+float4 AirSampleState(AirPathField path, AirPathEnd at, float3 anchorOffset, float4 fallback)
+{
+    const float3 shifted = at.position - anchorOffset - 0.5;
+    const int3 base = int3(floor(shifted));
+    const float3 fraction = shifted - float3(base);
+
+    if(!AirCornersOpen(path, base))
+    {
+        return AirSampleStateSplit(path, at, base, fraction, fallback);
+    }
+
+    return AirSampleStateOpen(path, base, fraction, fallback);
+}
+
 float3 AirSampleVelocity(AirPathField path, AirPathEnd at, float3 fallback)
 {
     // Trilinear over the cells whose centres surround the point.

@@ -124,6 +124,35 @@ public:
     {
         return {};
     }
+
+    // AS.7 rigid bodies (Dynamic or Kinematic, during the Play session). The defaults describe an object without one.
+    // Setting a velocity is applied by physics from its next fixed step; queries read the last completed step.
+    virtual bool HasRigidBody(std::uint32_t) const
+    {
+        return false;
+    }
+
+    virtual bool GetRigidBodyVelocity(std::uint32_t, float (&)[3]) const
+    {
+        return false;
+    }
+
+    virtual bool SetRigidBodyVelocity(std::uint32_t, const float (&)[3], std::string& error)
+    {
+        error = "The object has no Dynamic or Kinematic rigid body.";
+        return false;
+    }
+
+    virtual bool IsRigidBodyTouching(std::uint32_t, std::uint32_t) const
+    {
+        return false;
+    }
+
+    // AS.7 Scene::FindObject: the first object in the scene with that exact name (document order), as a new or existing slot.
+    virtual bool FindObject(std::string_view, std::uint32_t&)
+    {
+        return false;
+    }
 };
 
 // AS.6A keys scripts may query, mirrored by the script enum Key; hosts map them to platform keys.

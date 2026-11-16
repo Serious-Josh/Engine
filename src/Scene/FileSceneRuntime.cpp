@@ -748,6 +748,85 @@ bool FileSceneRuntime::SetSceneVoxelBake(const std::optional<VoxelBakeSettings>&
     return true;
 }
 
+// AIR.4F F4.5.1b: read by the Engine each frame for the air's request, so nothing else changes here.
+bool FileSceneRuntime::SetSceneEnvironmentalHaze(const std::optional<EnvironmentalHazeSettings>& expected,
+    const std::optional<EnvironmentalHazeSettings>& replacement, std::string* errorMessage)
+{
+    if(m_fileScene.GetDocument().environmentalHaze != expected)
+    {
+        if(errorMessage)
+        {
+            *errorMessage = "The scene's environmental haze changed meanwhile; edit rejected.";
+        }
+
+        return false;
+    }
+
+    if(replacement && !ValidateEnvironmentalHazeSettings(*replacement, errorMessage))
+    {
+        return false;
+    }
+
+    if(expected != replacement)
+    {
+        m_fileScene.EditDocument().environmentalHaze = replacement;
+    }
+
+    return true;
+}
+
+bool FileSceneRuntime::SetSceneAirEnvironment(const std::optional<AirEnvironmentSettings>& expected,
+    const std::optional<AirEnvironmentSettings>& replacement, std::string* errorMessage)
+{
+    if(m_fileScene.GetDocument().airEnvironment != expected)
+    {
+        if(errorMessage)
+        {
+            *errorMessage = "The scene's air environment changed meanwhile; edit rejected.";
+        }
+
+        return false;
+    }
+
+    if(replacement && !ValidateAirEnvironmentSettings(*replacement, errorMessage))
+    {
+        return false;
+    }
+
+    if(expected != replacement)
+    {
+        m_fileScene.EditDocument().airEnvironment = replacement;
+    }
+
+    return true;
+}
+
+bool FileSceneRuntime::SetSceneAirSimulation(const std::optional<AirSimulationSettings>& expected,
+    const std::optional<AirSimulationSettings>& replacement, std::string* errorMessage)
+{
+    if(m_fileScene.GetDocument().airSimulation != expected)
+    {
+        if(errorMessage)
+        {
+            *errorMessage = "The scene's AIR simulation settings changed meanwhile; edit rejected.";
+        }
+
+        return false;
+    }
+
+    if(replacement && !ValidateAirSimulationSettings(*replacement, errorMessage))
+    {
+        return false;
+    }
+
+    if(expected != replacement)
+    {
+        m_fileScene.EditDocument().airSimulation = replacement;
+    }
+
+    return true;
+}
+
 // AIR.4F F4.4.1: read by the Engine each frame to build the mist's render request, so nothing else changes here.
 bool FileSceneRuntime::SetSceneMistRendering(const std::optional<MistRenderSettings>& expected,
     const std::optional<MistRenderSettings>& replacement, std::string* errorMessage)

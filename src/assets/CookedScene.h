@@ -49,7 +49,30 @@ namespace CookedScene
     inline constexpr std::uint32_t AirMotorShapeVersion = 27;
     // AIR.4F F2: a Mist Emitter per object.
     inline constexpr std::uint32_t MistEmitterVersion = 28;
-    inline constexpr std::uint32_t Version = MistEmitterVersion;
+    // AIR.4F F4.5.1b: a Mist Emitter's temperature.
+    inline constexpr std::uint32_t MistEmitterTemperatureVersion = 29;
+    // AIR.4F.2b: a Mist Emitter's mode and a counted list of its mode fields (Point; AIR.4F.2c appends Volume's within this version).
+    inline constexpr std::uint32_t MistEmitterModeVersion = 30;
+    // AIR.4F.2d.3: the scene's environmental haze, after the camera exposure.
+    inline constexpr std::uint32_t EnvironmentalHazeVersion = 31;
+    // AIR.4F.2d.3a: the haze's ambient contribution, after its near transition (a V31 haze reads 0: the sun alone).
+    inline constexpr std::uint32_t HazeAmbientVersion = 32;
+    // AIR.4F.2d.3b: the haze's height bounds, after its ambient (V32 and earlier: off). A V31/V32 haze's clearance stays the haze's: the
+    // mist appearance, with its own clearance, is cooked only from V35.
+    inline constexpr std::uint32_t HazeHeightVersion = 33;
+    // R1.1: the scene's air environment and AIR simulation configuration, after the haze. Earlier payloads read neither (the
+    // defaults apply through ResolveAirSimulation).
+    inline constexpr std::uint32_t AirConfigurationVersion = 34;
+    // R1.3: the scene's mist appearance (SceneDocument::mistRendering), after the air configuration. Earlier payloads have none (the
+    // defaults apply), as packaged games rendered before.
+    inline constexpr std::uint32_t MistRenderingVersion = 35;
+    // R1.4a: the scene's voxel bake settings and manifest reference (SceneDocument::voxelBake), after the mist appearance. Earlier
+    // payloads have none, so their scenes have no bake, as packaged games ran before.
+    inline constexpr std::uint32_t VoxelBakeVersion = 36;
+    // R1.5: moving-solid participation: each physics record's airParticipation (u32), and the scene's AIR moving-solid enable (u32)
+    // after the voxel bake. Earlier payloads read Automatic and off.
+    inline constexpr std::uint32_t MovingSolidParticipationVersion = 37;
+    inline constexpr std::uint32_t Version = MovingSolidParticipationVersion;
 
     constexpr bool IsSupportedVersion(std::uint32_t version)
     {
@@ -80,7 +103,16 @@ namespace CookedScene
             version == AirMotorVersion ||
             version == AirMotorEmissionVersion ||
             version == AirMotorShapeVersion ||
-            version == MistEmitterVersion;
+            version == MistEmitterVersion ||
+            version == MistEmitterTemperatureVersion ||
+            version == MistEmitterModeVersion ||
+            version == EnvironmentalHazeVersion ||
+            version == HazeAmbientVersion ||
+            version == HazeHeightVersion ||
+            version == AirConfigurationVersion ||
+            version == MistRenderingVersion ||
+            version == VoxelBakeVersion ||
+            version == MovingSolidParticipationVersion;
     }
     struct Policy
     {

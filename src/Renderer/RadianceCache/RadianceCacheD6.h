@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Core/Log.h"
+#include "Debug/MemoryRegistry.h"
 #include "Renderer/Buffer.h"
 #include "Renderer/ComputePipeline.h"
 #include "Renderer/DescriptorHeap.h"
@@ -627,6 +628,8 @@ public:
             {
                 return;
             }
+
+            MemoryRegistry::TrackResource(m_readback);
 
             m_readback->SetName(L"SHARC D6 statistics readback");
         }

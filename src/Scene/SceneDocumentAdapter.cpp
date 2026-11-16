@@ -153,6 +153,9 @@ bool SceneDocumentsEqual(
     if(left.lightingSettings != right.lightingSettings) return false;
     if(left.voxelBake != right.voxelBake) return false;
     if(left.mistRendering != right.mistRendering) return false;
+    if(left.airEnvironment != right.airEnvironment) return false;
+    if(left.airSimulation != right.airSimulation) return false;
+    if(left.environmentalHaze != right.environmentalHaze) return false;
 
     for (std::size_t index = 0; index < left.objects.size(); ++index)
     {
