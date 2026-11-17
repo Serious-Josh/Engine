@@ -94,6 +94,9 @@ bool CommandContext::Initialize(ID3D12Device* device)
         return false;
     }
 
+    // Debug name, so validation messages identify the frame recording.
+    m_commandList->SetName(L"Frame command list");
+
     result = m_commandList->QueryInterface(IID_PPV_ARGS(&m_rayTracingCommandList));
 
     if (FAILED(result))
@@ -438,7 +441,7 @@ bool CommandContext::Execute(unsigned int frameIndex)
 
 bool CommandContext::WaitForGPU()
 {
-    TransitionTiming::Scope er1Scope("GPU WaitForGPU (idle)", 0.0);
+    TransitionTiming::Scope er1Scope("GPU WaitForGPU (idle)", 0.0, TransitionTiming::TransitionsAndStartup);
     ++m_gpuDrainCount;
     if (!m_commandQueue || !m_fence || !m_fenceEvent)
     {
@@ -866,6 +869,8 @@ bool CommandContext::DiscardCommandsAfterGPUDrain()
     {
         return false;
     }
+
+    commands->SetName(L"Frame command list (replacement)");
 
     if (FAILED(commands.As(&rayTracingCommands)) || FAILED(commands->Close()))
     {

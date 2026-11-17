@@ -597,6 +597,22 @@ bool EditorAirPass::EnsureDivergenceStorage(DescriptorHeap& descriptorHeap, std:
     return true;
 }
 
+void EditorAirPass::RetireSplitResources(std::uint64_t fence)
+{
+    for(Buffer* buffer : {&m_splitList, &m_splitArguments})
+    {
+        if(buffer->GetResource() != nullptr)
+        {
+            RetiredBuffer retired;
+            retired.buffer = std::move(*buffer);
+            retired.fence = fence;
+            m_retiredDivergence.push_back(std::move(retired));
+        }
+    }
+
+    m_splitResourcesReady = false;
+}
+
 void EditorAirPass::RetireDivergence(std::uint64_t fence)
 {
     if(m_divergence.GetResource() != nullptr)

@@ -5,6 +5,7 @@
 #include <cassert>
 #include "Debug/TransitionTiming.h"
 #include <cstring>
+#include <cwchar>
 #include "Scene/SceneSwitchTiming.h"
 #include "Scene/FileSceneRuntime.h"
 #include "Scene/FileSceneAssetCatalog.h"
@@ -4132,9 +4133,25 @@ bool Renderer::Initialize(
     unsigned int height,
     const std::filesystem::path& assetRoot, std::span<const std::byte> packagedShaders,
     const HDRImageData* initialEnvironment, std::string environmentIdentity, bool deferEditorResources,
-    std::span<const std::byte> packagedMaterialTables)
+    std::span<const std::byte> packagedMaterialTables, const RenderingConfiguration* initialConfiguration,
+    bool deferSceneRenderer, bool projectWorkflowStart)
 {
     const MemoryCategoryScope memoryScope(MemoryCategory::CoreRenderer);
+
+    // M0c.5 Stage 5.0 diagnostics (ENGINE_STARTUP_TIMING): back-to-back phases of initialization on the startup timeline.
+    // Each beginStartupPhase ends the previous phase; the last ends when this function returns. One flag test when disabled.
+    std::optional<TransitionTiming::Scope> startupPhase;
+    const auto beginStartupPhase = [&startupPhase](std::string_view phase)
+    {
+        if(!TransitionTiming::StartupEnabled())
+        {
+            return;
+        }
+
+        startupPhase.reset();
+        startupPhase.emplace(std::string("Renderer::Initialize: ") + std::string(phase), 0.0, TransitionTiming::Startup);
+    };
+    beginStartupPhase("Settings and diagnostic configuration");
 
     if (m_heightmapRegistration.owner)
     {
@@ -4155,6 +4172,7 @@ bool Renderer::Initialize(
     m_dlssPublishedState.clear();
     m_dlssPublishedDetail.clear();
     m_packagedRuntime = !packagedShaders.empty();
+    m_projectWorkflowStart = projectWorkflowStart && !m_packagedRuntime;
     // PS.5C: the worker's private shader library for the PSR auxiliary pipelines reads the same cooked bootstrap.
     m_packagedShaderPayload = m_packagedRuntime ?
         std::make_shared<const std::vector<std::byte>>(packagedShaders.begin(), packagedShaders.end()) : nullptr;
@@ -4351,18 +4369,24 @@ bool Renderer::Initialize(
     m_outputWidth = initialResolution.outputWidth;
     m_outputHeight = initialResolution.outputHeight;
 
+    beginStartupPhase("Device (D3D12 device, debug layer, DRED, queue, command context)");
     if (!InitializeDevice())
     {
         return false;
     }
 
-    // UPSCALING.3A: capability only; any DLSS failure is reported, never fatal. PS.5E: packaged games initialize NGX
-    // in SetRenderScale once their fixed configuration requests DLSS, so games without DLSS skip its startup cost.
-    if(!m_packagedRuntime)
+    // UPSCALING.3A: DLSS is a capability; any failure is reported, never fatal. PS.5E, M0c.5 Stage 5.1: NGX is initialized
+    // in SetRenderScale by the first configuration that requests DLSS, in every runtime, so starts without DLSS skip its cost.
+
+    // M0c.5 Stage 5.5: a command-line project's configuration is known now; when it requests DLSS, NGX initializes on its own
+    // thread while the rest of startup runs (packaged games keep PS.5E's first-request initialization).
+    if(!m_packagedRuntime && initialConfiguration)
     {
-        m_dlssBackend.Initialize(m_graphicsDevice.GetDevice());
+        BeginDlssBackend(initialConfiguration->dlssRequested ||
+            IsDlssRenderScale(static_cast<RenderScale>(initialConfiguration->renderScaleIndex)));
     }
 
+    beginStartupPhase("GPU timestamp profiler");
     if (!m_gpuTimestampProfiler.Initialize(m_graphicsDevice.GetDevice(), m_commandContext.GetCommandQueue()))
     {
         Log::Error("Failed to init GPU timestamp profiler.");
@@ -4381,6 +4405,7 @@ bool Renderer::Initialize(
         return false;
     }
 
+    beginStartupPhase("Shader library and DXR workers");
     if (!(m_packagedRuntime ? m_shaderLibrary.InitializePackaged(packagedShaders) : m_shaderLibrary.Initialize(shaderRoot)))
     {
         Log::Error("Failed to initialize shader library.");
@@ -4405,7 +4430,28 @@ bool Renderer::Initialize(
 
     if(!m_packagedRuntime)
     {
-        m_shaderCompileWorkerRunning = m_shaderCompileWorker->Start();
+        // M0c.5 Stage 5.4: DXR libraries compile on several threads, each with its own DXC (a cold cache compiles 16
+        // libraries of 4.5–8 s each). One per eight hardware threads, from 1 to 4, which leaves the render thread, the
+        // pipeline worker and the system their cores; ENGINE_SHADER_COMPILE_WORKERS (1–8) overrides it for measurement.
+        const unsigned int hardwareThreads = (std::max)(std::thread::hardware_concurrency(), 1u);
+        unsigned int compileThreads = std::clamp(hardwareThreads / 8u, 1u, 4u);
+        char workerOverride[3]{};
+        const DWORD overrideLength = GetEnvironmentVariableA("ENGINE_SHADER_COMPILE_WORKERS", workerOverride,
+            sizeof(workerOverride));
+
+        if(overrideLength >= 1 && overrideLength < sizeof(workerOverride))
+        {
+            const int requested = std::atoi(workerOverride);
+
+            if(requested >= 1 && requested <= 8)
+            {
+                compileThreads = static_cast<unsigned int>(requested);
+            }
+        }
+
+        m_shaderCompileWorkerRunning = m_shaderCompileWorker->Start(compileThreads);
+        Log::Info("DXR shader compile worker: " + std::to_string(compileThreads) + " thread(s) for " +
+            std::to_string(hardwareThreads) + " hardware threads.");
 
         if(!m_shaderCompileWorkerRunning)
         {
@@ -4424,6 +4470,154 @@ bool Renderer::Initialize(
         Log::Warning("DXR pipeline worker unavailable; DXR pipelines are created on the render thread.");
     }
 
+    m_configurationPreparation.Reset();
+    m_preparedSteps = 0;
+    m_preparedStepsGeneration = 0;
+
+    beginStartupPhase("Uploader, upload ring, descriptor heaps");
+    if (!m_resourceUploader.Initialize(device))
+    {
+        Log::Error("Failed to init resource uploader.");
+        return false;
+    }
+
+    if (!m_uploadBuffer.Initialize(device, 1024 * 1024, 2))
+    {
+        Log::Error("Failed to init upload buffer.");
+        return false;
+    }
+
+    if (!m_resourceDescriptorHeap.Initialize(device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, ResourceDescriptorCapacity, true))
+    {
+        Log::Error("Failed to init resource descriptor heap.");
+
+        return false;
+    }
+
+    if (!m_rtvDescriptorHeap.Initialize(device, D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 256, false))
+    {
+        Log::Error("Failed to init rtv descriptor heap.");
+
+        return false;
+    }
+
+    if (!m_dsvDescriptorHeap.Initialize(device, D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 16, false))
+    {
+        Log::Error("Failed to init dsv descriptor heap.");
+
+        return false;
+    }
+
+    // M0c.5 Stage 5.1: the Project Browser needs only the core above, ImGui and the swap chain; its project's selection
+    // initializes the scene renderer (EnsureSceneRenderer). Every other start initializes it here, before the UI.
+    startupPhase.reset();
+
+    if(deferSceneRenderer)
+    {
+        Log::Info("Scene renderer deferred until a project is selected.");
+    }
+    else if(!InitializeSceneRenderer(initialEnvironment, std::move(environmentIdentity), packagedMaterialTables))
+    {
+        return false;
+    }
+
+    beginStartupPhase("DebugUI (ImGui, Editor icons)");
+    if (!m_packagedRuntime && !m_debugUI.Initialize(static_cast<HWND>(windowHandle), device, m_commandContext.GetCommandQueue(),
+                              m_resourceDescriptorHeap))
+    {
+        Log::Error("Failed to init debug UI.");
+        return false;
+    }
+
+    m_debugUIInitialized = !m_packagedRuntime;
+
+    if(m_debugUIInitialized)
+    {
+        const DlssStatus& dlss = m_dlssBackend.GetStatus();
+        m_debugUI.SetDlssReadout(DlssAvailabilityName(dlss.availability), dlss.detail);
+    }
+
+    beginStartupPhase("Swap chain");
+    if (!InitializeSwapChain(windowHandle))
+    {
+        return false;
+    }
+
+    beginStartupPhase("Editor preview resources and initial configuration");
+    if(!m_packagedRuntime && !deferEditorResources && !InitializeEditorResources())
+    {
+        return false;
+    }
+
+    m_resizeFailed = false;
+
+    // M0c.4 Stage 4.4: a configuration already known at startup (packaged preflight, a command-line project) starts
+    // preparing now, before the project and scene initialize; its unused Legacy textures are released at once.
+    if(initialConfiguration)
+    {
+        if(deferSceneRenderer)
+        {
+            Log::Error("An initial rendering configuration requires the scene renderer at startup.");
+            return false;
+        }
+
+        BeginConfigurationPreparation(*initialConfiguration);
+    }
+
+    return true;
+}
+
+bool Renderer::EnsureSceneRenderer()
+{
+    if(m_sceneRendererState == SceneRendererState::Initialized)
+    {
+        return true;
+    }
+
+    // Not retried: a failed attempt may have created part of the group, which only Shutdown releases.
+    if(m_sceneRendererState == SceneRendererState::Failed || m_packagedRuntime || !m_commandContextInitialized ||
+        m_commandRecordingGeneration != 0)
+    {
+        Log::Error("The scene renderer cannot be initialized in this renderer state.");
+        return false;
+    }
+
+    // The Project Browser's frames may still be in flight; the scene group starts, as at startup, on an idle GPU.
+    if(!m_commandContext.WaitForGPU())
+    {
+        m_sceneRendererState = SceneRendererState::Failed;
+        Log::Error("Failed to confirm GPU completion before scene renderer initialization.");
+        return false;
+    }
+
+    return InitializeSceneRenderer(nullptr, {}, {});
+}
+
+bool Renderer::InitializeSceneRenderer(const HDRImageData* initialEnvironment, std::string environmentIdentity,
+    std::span<const std::byte> packagedMaterialTables)
+{
+    const MemoryCategoryScope memoryScope(MemoryCategory::CoreRenderer);
+    const TransitionTiming::Scope sceneRendererTiming("Renderer::InitializeSceneRenderer", 0.0, TransitionTiming::Startup);
+
+    // Same phase helper as Initialize; one flag test when disabled.
+    std::optional<TransitionTiming::Scope> startupPhase;
+    const auto beginStartupPhase = [&startupPhase](std::string_view phase)
+    {
+        if(!TransitionTiming::StartupEnabled())
+        {
+            return;
+        }
+
+        startupPhase.reset();
+        startupPhase.emplace(std::string("Renderer::InitializeSceneRenderer: ") + std::string(phase), 0.0,
+            TransitionTiming::Startup);
+    };
+
+    // Failed until every step below succeeds; a failure leaves the partial group to Shutdown.
+    m_sceneRendererState = SceneRendererState::Failed;
+    ID3D12Device* device = m_graphicsDevice.GetDevice();
+
+    beginStartupPhase("Core passes (displacement, deferred lighting, tone map)");
     if (!m_displacementVerticesPass.Initialize(m_graphicsDevice, m_shaderLibrary))
     {
 
@@ -4451,6 +4645,7 @@ bool Renderer::Initialize(
         return false;
     }
 
+    beginStartupPhase("Editor overlay passes (collider, grid, voxel)");
     if(!m_packagedRuntime && !m_editorColliderPass.Initialize(device, m_shaderLibrary))
     {
         Log::Error("Failed to initialize editor collider line pass.");
@@ -4470,67 +4665,40 @@ bool Renderer::Initialize(
     }
 
     // VX.5: allocates nothing until residency is configured.
+    beginStartupPhase("Voxel residency");
     m_voxelResidency.Initialize(device, m_resourceDescriptorHeap, {});
-
-    if(!m_packagedRuntime && !m_editorAirPass.Initialize(device, m_shaderLibrary))
-    {
-        Log::Error("Failed to initialize the editor air visualization pass.");
-        return false;
-    }
-
-    // AIR.1: allocates nothing until air is first enabled. R1.2a: not here in a packaged runtime; R1.5b initializes it there eagerly,
-    // before the first AIR frame, when the startup scene requests AIR (InitializePackagedAir, the AIR shaders then in the bootstrap).
-    // The uninitialized field records nothing (AirField::Record).
-    if(!m_packagedRuntime && !m_airField.Initialize(device, m_resourceDescriptorHeap, m_shaderLibrary))
-    {
-        Log::Error("Failed to initialize the air field.");
-        return false;
-    }
 
     // PSR replacement and denoiser variants are queued on first supported request.
 
-    if (!m_resourceUploader.Initialize(device))
+    // M0c.5 Stage 5.3: a project workflow start prepares the AIR field, AIR views and mist pass (haze included) on the first
+    // frame that requests any of them (PrepareVolumetrics). Developer and verification starts create them here, as before. R1.2b:
+    // a packaged runtime initializes the haze core only (PackagedShaderFeature::Volumetrics); R1.5b adds its AIR through
+    // InitializePackagedAir.
+    m_volumetricState = VolumetricState::NotRequested;
+
+    if(m_packagedRuntime)
     {
-        Log::Error("Failed to init resource uploader.");
-        return false;
+        beginStartupPhase("Mist pass (haze core)");
+
+        if(!m_editorMistPass.Initialize(device, m_resourceDescriptorHeap, m_shaderLibrary, m_resourceUploader, {}))
+        {
+            Log::Error("Failed to initialize the editor mist pass.");
+            return false;
+        }
+    }
+    else if(!m_projectWorkflowStart)
+    {
+        beginStartupPhase("AIR field, AIR views and mist pass");
+
+        if(!InitializeVolumetrics())
+        {
+            return false;
+        }
+
+        m_volumetricState = VolumetricState::Ready;
     }
 
-    if (!m_uploadBuffer.Initialize(device, 1024 * 1024, 2))
-    {
-        Log::Error("Failed to init upload buffer.");
-        return false;
-    }
-
-    if (!m_resourceDescriptorHeap.Initialize(device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, ResourceDescriptorCapacity, true))
-    {
-        Log::Error("Failed to init resource descriptor heap.");
-
-        return false;
-    }
-
-    // AIR.4F F3: allocates nothing until mist is first drawn, except (F4.1) the 256 KiB Worley texture, uploaded here (after the
-    // uploader and the resource heap it needs).
-    // R1.2b: a packaged runtime initializes the haze core only (PackagedShaderFeature::Volumetrics): no mist pipelines and no loose
-    // noise textures, since packaged games never draw AIR mist.
-    const std::filesystem::path mistTextures = WindowsWindow::GetExecutableDirectory() / "assets" / "Textures" / "Air";
-    const bool mistPassReady = m_packagedRuntime ?
-        m_editorMistPass.Initialize(device, m_resourceDescriptorHeap, m_shaderLibrary, m_resourceUploader, {}) :
-        m_editorMistPass.Initialize(device, m_resourceDescriptorHeap, m_shaderLibrary, m_resourceUploader, mistTextures / "MistWorley64.dds",
-            mistTextures / "MistCurl64.dds", mistTextures / "MistFilaments128.dds") && m_editorMistPass.EnsureMistPipelines();
-
-    if(!mistPassReady)
-    {
-        Log::Error("Failed to initialize the editor mist pass.");
-        return false;
-    }
-
-    if (!m_rtvDescriptorHeap.Initialize(device, D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 256, false))
-    {
-        Log::Error("Failed to init rtv descriptor heap.");
-
-        return false;
-    }
-
+    beginStartupPhase("LUT resources and passes");
     if (!m_brdfIntegrationLUT.Initialize(device, 512, 512, 1, 1, DXGI_FORMAT_R16G16_FLOAT,
                                          D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET))
     {
@@ -4574,7 +4742,183 @@ bool Renderer::Initialize(
     }
 
     // Optional for Legacy: unavailable tables only disable the path-traced reference mode.
+    beginStartupPhase("Material tables");
     LoadMaterialTables(packagedMaterialTables);
+
+    beginStartupPhase("Legacy Ray Tracing passes and textures");
+    // M0c.5 Stage 5.3: a project workflow start creates the Legacy passes (pipelines, four DXR state objects and textures) with
+    // its first Legacy frame, in EnsureLegacyLightingExtent; until then the set is not resident, as after a retirement. Packaged,
+    // developer and verification starts create it here, as before.
+    m_legacyLighting.retention = {};
+    m_legacyLighting.retention.lastActive = std::chrono::steady_clock::now();
+
+    if(!m_projectWorkflowStart && !InitializeLegacyLighting())
+    {
+        return false;
+    }
+
+    if(m_projectWorkflowStart)
+    {
+        m_legacyLighting.retention.resident = false;
+    }
+    m_pathTracingResidency = {};
+    m_pathTracingResidency.lastActive = m_legacyLighting.retention.lastActive;
+
+    beginStartupPhase("Bootstrap environment");
+    if(m_packagedRuntime)
+    {
+        const bool none = environmentIdentity == SceneDocument::NoneEnvironmentReference;
+        m_availableEnvironments = {{none ? "None" : (initialEnvironment ? "Packaged scene HDRI" : "Embedded neutral environment"),
+            {}, none ? SceneDocument::NoneEnvironmentReference : ""}};
+    }
+    if (m_availableEnvironments.empty())
+    {
+        Log::Error("No HDR environments were discovered.");
+        return false;
+    }
+
+    m_currentEnvironmentIndex = 0;
+
+    // M0c.5 Stage 5.2: Project Browser workflow starts (a Browser selection or a command-line project) bootstrap with the
+    // packaged runtime's 16x8 neutral source. Their scene applies its own environment on activation (ApplySceneEnvironment),
+    // so the first .hdr was decoded, uploaded and preprocessed only to be replaced. The neutral entry is the one
+    // SetEnvironmentImage(nullptr, "neutral", "Neutral", …) uses, so a scene without an environment reuses it. Developer and
+    // verification starts keep the first .hdr, which their non-file demo scenes show.
+    const bool neutralBootstrap = m_projectWorkflowStart;
+
+    if(neutralBootstrap)
+    {
+        const auto neutral = std::find_if(m_availableEnvironments.begin(), m_availableEnvironments.end(), [](const EnvironmentAsset& entry)
+        {
+            return entry.relativePath.empty() && entry.reference.empty() && entry.displayName == "Neutral";
+        });
+
+        if(neutral == m_availableEnvironments.end())
+        {
+            m_availableEnvironments.push_back({"Neutral", {}, ""});
+            m_currentEnvironmentIndex = m_availableEnvironments.size() - 1;
+        }
+        else
+        {
+            m_currentEnvironmentIndex = static_cast<size_t>(neutral - m_availableEnvironments.begin());
+        }
+    }
+
+    const EnvironmentAsset& defaultEnvironment = m_availableEnvironments[m_currentEnvironmentIndex];
+
+    const std::filesystem::path environmentPath = m_packagedRuntime || neutralBootstrap ? std::filesystem::path{} :
+        m_assetRoot / defaultEnvironment.relativePath;
+
+    m_environmentIdentity = m_packagedRuntime ? (environmentIdentity.empty()?"neutral":environmentIdentity) : "bootstrap:"+defaultEnvironment.displayName;
+    if (!(initialEnvironment ? m_environment.Initialize(device,*initialEnvironment,m_resourceUploader,m_resourceDescriptorHeap) :
+        m_environment.Initialize(device, environmentPath, m_resourceUploader, m_resourceDescriptorHeap)))
+    {
+        Log::Error("Failed to initialize environment: " + defaultEnvironment.displayName);
+
+        m_environment.Shutdown();
+        return false;
+    }
+
+    Log::Info("Initial environment: " + defaultEnvironment.displayName);
+
+    beginStartupPhase("LUT generation (GPU)");
+    if (!BeginTrackedRecording(0))
+    {
+        Log::Error("Failed to begin environment-independent LUT generation.");
+
+        return false;
+    }
+
+    ID3D12GraphicsCommandList* lutCommandList = m_commandContext.GetCommandList();
+
+    ID3D12DescriptorHeap* descriptorHeaps[] = {m_resourceDescriptorHeap.GetHeap()};
+
+    lutCommandList->SetDescriptorHeaps(1, descriptorHeaps);
+
+    m_brdfIntegrationPass.Execute(lutCommandList, m_brdfIntegrationLUT);
+
+    m_ggxAverageAlbedoPass.Execute(lutCommandList, m_ggxAverageAlbedoLUT);
+
+    if (!EndTrackedRecording())
+    {
+        Log::Error("Failed to end environment-independent LUT generation.");
+        return false;
+    }
+
+    const bool lutSubmitted = ExecuteTrackedRecording(0);
+
+    // Execute can fail to signal after submitting work; still attempt to drain it.
+
+    if (!m_commandContext.WaitForGPU())
+    {
+        Log::Error("Failed to confirm GPU completion after LUT generation.");
+        return false;
+    }
+
+    if (!lutSubmitted)
+    {
+        Log::Error("Failed to execute or signal environment-independent LUT generation.");
+        return false;
+    }
+
+    if (!PreprocessEnvironment(m_environment))
+    {
+        Log::Error("Failed to preprocess environment.");
+        return false;
+    }
+
+    beginStartupPhase("Scene and final colour");
+    if (!m_sceneColor.Initialize(device, m_sceneWidth, m_sceneHeight, DXGI_FORMAT_R16G16B16A16_FLOAT, m_rtvDescriptorHeap,
+                                 m_resourceDescriptorHeap))
+    {
+        Log::Error("Failed to init HDR scene color");
+        return false;
+    }
+
+    if(!m_finalSceneColor.Initialize(device, m_outputWidth, m_outputHeight, DXGI_FORMAT_R8G8B8A8_UNORM,
+                                    m_rtvDescriptorHeap, m_resourceDescriptorHeap))
+    {
+        Log::Error("Failed to initialize final scene color.");
+        return false;
+    }
+
+    beginStartupPhase("G-buffer and selection mask");
+    if (!m_gBuffer.Initialize(device, m_sceneWidth, m_sceneHeight, m_rtvDescriptorHeap, m_dsvDescriptorHeap,
+                              m_resourceDescriptorHeap))
+    {
+        Log::Error("Failed to init G-Buffer.");
+        return false;
+    }
+
+    if (!m_selectionMask.Initialize(device, m_sceneWidth, m_sceneHeight, DXGI_FORMAT_R8_UNORM, m_rtvDescriptorHeap,
+                                    m_resourceDescriptorHeap))
+    {
+        Log::Error("Failed to init selection mask.");
+        return false;
+    }
+
+    m_sceneRendererState = SceneRendererState::Initialized;
+    return true;
+}
+
+// M0c.5 Stage 5.3: the Legacy (Ray Tracing) passes at the current render extent, once: from InitializeSceneRenderer, or for a
+// project workflow start from EnsureLegacyLightingExtent, before its first Legacy frame reads a pass. A failure is final;
+// Shutdown releases a partial set.
+bool Renderer::InitializeLegacyLighting()
+{
+    if(m_legacyLightingInitialized)
+    {
+        return true;
+    }
+
+    if(m_legacyLightingFailed)
+    {
+        return false;
+    }
+
+    const MemoryCategoryScope memoryScope(MemoryCategory::CoreRenderer);
+    const TransitionTiming::Scope legacyTiming("Legacy Ray Tracing pass initialization", 0.0, TransitionTiming::TransitionsAndStartup);
+    m_legacyLightingFailed = true;
 
     if (!m_legacyLighting.rayTracedShadowPass.Initialize(m_graphicsDevice, m_shaderLibrary, m_resourceDescriptorHeap, m_sceneWidth,
                                           m_sceneHeight))
@@ -4699,147 +5043,9 @@ bool Renderer::Initialize(
     }
 
     m_legacyLighting.MarkSized(m_sceneWidth, m_sceneHeight);
-    m_legacyLighting.retention = {};
-    m_legacyLighting.retention.lastActive = std::chrono::steady_clock::now();
-    m_pathTracingResidency = {};
-    m_pathTracingResidency.lastActive = m_legacyLighting.retention.lastActive;
-
-    if(m_packagedRuntime)
-    {
-        const bool none = environmentIdentity == SceneDocument::NoneEnvironmentReference;
-        m_availableEnvironments = {{none ? "None" : (initialEnvironment ? "Packaged scene HDRI" : "Embedded neutral environment"),
-            {}, none ? SceneDocument::NoneEnvironmentReference : ""}};
-    }
-    if (m_availableEnvironments.empty())
-    {
-        Log::Error("No HDR environments were discovered.");
-        return false;
-    }
-
-    m_currentEnvironmentIndex = 0;
-
-    const EnvironmentAsset& defaultEnvironment = m_availableEnvironments[m_currentEnvironmentIndex];
-
-    const std::filesystem::path environmentPath = m_packagedRuntime ? std::filesystem::path{} : m_assetRoot / defaultEnvironment.relativePath;
-
-    m_environmentIdentity = m_packagedRuntime ? (environmentIdentity.empty()?"neutral":environmentIdentity) : "bootstrap:"+defaultEnvironment.displayName;
-    if (!(initialEnvironment ? m_environment.Initialize(device,*initialEnvironment,m_resourceUploader,m_resourceDescriptorHeap) :
-        m_environment.Initialize(device, environmentPath, m_resourceUploader, m_resourceDescriptorHeap)))
-    {
-        Log::Error("Failed to initialize environment: " + defaultEnvironment.displayName);
-
-        m_environment.Shutdown();
-        return false;
-    }
-
-    Log::Info("Initial environment: " + defaultEnvironment.displayName);
-
-    if (!BeginTrackedRecording(0))
-    {
-        Log::Error("Failed to begin environment-independent LUT generation.");
-
-        return false;
-    }
-
-    ID3D12GraphicsCommandList* lutCommandList = m_commandContext.GetCommandList();
-
-    ID3D12DescriptorHeap* descriptorHeaps[] = {m_resourceDescriptorHeap.GetHeap()};
-
-    lutCommandList->SetDescriptorHeaps(1, descriptorHeaps);
-
-    m_brdfIntegrationPass.Execute(lutCommandList, m_brdfIntegrationLUT);
-
-    m_ggxAverageAlbedoPass.Execute(lutCommandList, m_ggxAverageAlbedoLUT);
-
-    if (!EndTrackedRecording())
-    {
-        Log::Error("Failed to end environment-independent LUT generation.");
-        return false;
-    }
-
-    const bool lutSubmitted = ExecuteTrackedRecording(0);
-
-    // Execute can fail to signal after submitting work; still attempt to drain it.
-
-    if (!m_commandContext.WaitForGPU())
-    {
-        Log::Error("Failed to confirm GPU completion after LUT generation.");
-        return false;
-    }
-
-    if (!lutSubmitted)
-    {
-        Log::Error("Failed to execute or signal environment-independent LUT generation.");
-        return false;
-    }
-
-    if (!PreprocessEnvironment(m_environment))
-    {
-        Log::Error("Failed to preprocess environment.");
-        return false;
-    }
-
-    if (!m_sceneColor.Initialize(device, m_sceneWidth, m_sceneHeight, DXGI_FORMAT_R16G16B16A16_FLOAT, m_rtvDescriptorHeap,
-                                 m_resourceDescriptorHeap))
-    {
-        Log::Error("Failed to init HDR scene color");
-        return false;
-    }
-
-    if(!m_finalSceneColor.Initialize(device, m_outputWidth, m_outputHeight, DXGI_FORMAT_R8G8B8A8_UNORM,
-                                    m_rtvDescriptorHeap, m_resourceDescriptorHeap))
-    {
-        Log::Error("Failed to initialize final scene color.");
-        return false;
-    }
-
-    if (!m_dsvDescriptorHeap.Initialize(device, D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 16, false))
-    {
-        Log::Error("Failed to init dsv descriptor heap.");
-
-        return false;
-    }
-
-    if (!m_packagedRuntime && !m_debugUI.Initialize(static_cast<HWND>(windowHandle), device, m_commandContext.GetCommandQueue(),
-                              m_resourceDescriptorHeap))
-    {
-        Log::Error("Failed to init debug UI.");
-        return false;
-    }
-
-    m_debugUIInitialized = !m_packagedRuntime;
-
-    if(m_debugUIInitialized)
-    {
-        const DlssStatus& dlss = m_dlssBackend.GetStatus();
-        m_debugUI.SetDlssReadout(DlssAvailabilityName(dlss.availability), dlss.detail);
-    }
-
-    if (!m_gBuffer.Initialize(device, m_sceneWidth, m_sceneHeight, m_rtvDescriptorHeap, m_dsvDescriptorHeap,
-                              m_resourceDescriptorHeap))
-    {
-        Log::Error("Failed to init G-Buffer.");
-        return false;
-    }
-
-    if (!m_selectionMask.Initialize(device, m_sceneWidth, m_sceneHeight, DXGI_FORMAT_R8_UNORM, m_rtvDescriptorHeap,
-                                    m_resourceDescriptorHeap))
-    {
-        Log::Error("Failed to init selection mask.");
-        return false;
-    }
-
-    if (!InitializeSwapChain(windowHandle))
-    {
-        return false;
-    }
-
-    if(!m_packagedRuntime && !deferEditorResources && !InitializeEditorResources())
-    {
-        return false;
-    }
-
-    m_resizeFailed = false;
+    m_legacyLighting.retention.resident = true;
+    m_legacyLightingFailed = false;
+    m_legacyLightingInitialized = true;
     return true;
 }
 
@@ -4850,7 +5056,9 @@ bool Renderer::InitializeEditorResources()
         return true;
     }
 
-    if(m_packagedRuntime || !m_graphicsDevice.GetDevice() || m_commandRecordingGeneration != 0)
+    // The material preview renders with the scene renderer's LUTs and environment.
+    if(m_packagedRuntime || !m_graphicsDevice.GetDevice() || m_commandRecordingGeneration != 0 ||
+        m_sceneRendererState != SceneRendererState::Initialized)
     {
         return false;
     }
@@ -4998,14 +5206,61 @@ void Renderer::SetRenderScale(RenderScale scale, bool eligible, bool retry, bool
     m_dlssNormalRequest = normalRequest;
     m_dlssRetryPending |= retry;
 
-    // PS.5E: a packaged game's first DLSS request initializes NGX (between frames, before ResizeScene applies the
-    // scale). Without nvngx_dlss.dll beside the executable the backend reports RuntimeMissing: Native.
-    const bool dlssRequested = normalRequest || IsDlssRenderScale(scale);
-
-    if(m_packagedRuntime && dlssRequested && m_dlssBackend.GetStatus().availability == DlssAvailability::NotInitialized)
+    // PS.5E: a packaged game's first DLSS request initializes NGX (between frames, before ResizeScene applies the scale).
+    // M0c.5 Stage 5.1: the Editor initializes it with a project that requests DLSS (EnsureDlssBackend from
+    // InitializeProject); this covers a first request made later in the session. Without nvngx_dlss.dll beside the
+    // executable the backend reports RuntimeMissing: Native.
+    // M0c.5 Stage 5.5: only an eligible request (the next ResizeScene may size the scene for DLSS) needs NGX now; an ineligible
+    // one renders Native, so NGX initializes on its own thread for later.
+    if(eligible)
     {
-        m_dlssBackend.Initialize(m_graphicsDevice.GetDevice());
+        EnsureDlssBackend(normalRequest || IsDlssRenderScale(scale));
     }
+    else
+    {
+        BeginDlssBackend(normalRequest || IsDlssRenderScale(scale));
+    }
+}
+
+void Renderer::EnsureDlssBackend(bool dlssRequested)
+{
+    // M0c.5 Stage 5.5: an initialization started by BeginDlssBackend is completed (waited for) rather than repeated.
+    if(m_dlssBackend.IsInitializing())
+    {
+        if(dlssRequested)
+        {
+            const TransitionTiming::Scope ngxWaitTiming("DLSS backend (NGX) wait for its thread", 0.0, TransitionTiming::Startup);
+            m_dlssBackend.CompleteInitialize(true);
+        }
+
+        return;
+    }
+
+    if(!dlssRequested || m_dlssBackend.GetStatus().availability != DlssAvailability::NotInitialized ||
+        !m_graphicsDevice.GetDevice())
+    {
+        return;
+    }
+
+    const TransitionTiming::Scope ngxTiming("DLSS backend (NGX) initialization", 0.0, TransitionTiming::Startup);
+    m_dlssBackend.Initialize(m_graphicsDevice.GetDevice());
+}
+
+void Renderer::BeginDlssBackend(bool dlssRequested)
+{
+    if(!dlssRequested || m_dlssBackend.IsInitializing() ||
+        m_dlssBackend.GetStatus().availability != DlssAvailability::NotInitialized || !m_graphicsDevice.GetDevice())
+    {
+        return;
+    }
+
+    Log::Info("DLSS (NGX) initialization started on its own thread.");
+    m_dlssBackend.BeginInitialize(m_graphicsDevice.GetDevice());
+}
+
+bool Renderer::PollDlssBackend()
+{
+    return m_dlssBackend.CompleteInitialize(false);
 }
 
 bool Renderer::ResizeScene(unsigned int width, unsigned int height)
@@ -5029,6 +5284,7 @@ bool Renderer::ResizeScene(unsigned int width, unsigned int height)
         return true;
     }
 
+    TransitionTiming::Scope er1Scope("ResizeScene", 0.1, TransitionTiming::TransitionsAndStartup);
     m_gpuTimestampProfiler.BreakFrameSequence();
     ResetCpuSubmissionCadence();
     m_resizeFailed = true;
@@ -5178,7 +5434,9 @@ bool Renderer::ResizeSceneResources(const SceneResolution& resolution)
 
     // M0c.1: Legacy's own passes follow the render extent only while Legacy is the active (last rendered) mode. Otherwise
     // they keep their previous extent (stale) and EnsureLegacyLightingExtent resizes them before the next Legacy frame.
-    if(m_lightingModeTransition.GetStatus().active == RendererLightingMode::Legacy &&
+    // M0c.4: and only while resident: released textures (retired, or never used at startup, where the transition's active
+    // mode is still Legacy while nothing is lit) are created by that same first Legacy frame, not by a resize.
+    if(m_lightingModeTransition.GetStatus().active == RendererLightingMode::Legacy && m_legacyLighting.retention.resident &&
         !m_legacyLighting.Resize(m_graphicsDevice, m_resourceDescriptorHeap, width, height))
     {
         return false;
@@ -5359,6 +5617,20 @@ bool Renderer::ResizeSceneResources(const SceneResolution& resolution)
 // temporal histories restart as well.
 bool Renderer::EnsureLegacyLightingExtent()
 {
+    // M0c.5 Stage 5.3: a project workflow start's first Legacy frame creates the passes, sized for this frame and resident.
+    if(!m_legacyLightingInitialized)
+    {
+        if(!InitializeLegacyLighting())
+        {
+            Log::Error("Legacy lighting passes could not be created on first use.");
+            return false;
+        }
+
+        Log::Info("Legacy lighting passes created on first use at " + std::to_string(m_sceneWidth) + "x" +
+            std::to_string(m_sceneHeight) + ".");
+        return true;
+    }
+
     if(m_legacyLighting.IsSizedFor(m_sceneWidth, m_sceneHeight))
     {
         return true;
@@ -5493,8 +5765,9 @@ bool Renderer::IsModeResourceMemoryUnderPressure()
 void Renderer::UpdateLegacyLightingRetention()
 {
     const LightingModeTransitionStatus& status = m_lightingModeTransition.GetStatus();
-    const bool transitionPending =
-        status.stage != LightingModeTransitionStage::Idle || status.requested == RendererLightingMode::Legacy;
+    // M0c.4: a pending configuration that renders Legacy keeps them for its switch.
+    const bool transitionPending = status.stage != LightingModeTransitionStage::Idle ||
+        status.requested == RendererLightingMode::Legacy || IsPendingConfigurationMode(false);
     const ModeResourceDecision decision = EvaluateModeResourceRetirement(m_legacyLighting.retention, transitionPending);
 
     if(decision != ModeResourceDecision::Retire && decision != ModeResourceDecision::RetireUnderPressure)
@@ -5521,8 +5794,9 @@ void Renderer::UpdatePathTracingRetention()
     }
 
     const LightingModeTransitionStatus& status = m_lightingModeTransition.GetStatus();
-    const bool transitionPending =
-        status.stage != LightingModeTransitionStage::Idle || status.requested != RendererLightingMode::Legacy;
+    // M0c.4: so does a pending path-traced configuration, prepared while another one is presented.
+    const bool transitionPending = status.stage != LightingModeTransitionStage::Idle ||
+        status.requested != RendererLightingMode::Legacy || IsPendingConfigurationMode(true);
 
     // While retired, ReSTIR DI's per-frame availability check for a requested (but not rendering) Path Tracing creates the
     // RTXDI resources again. Their creation records no GPU work, and no recording has used them since (a path-traced
@@ -6014,6 +6288,12 @@ bool Renderer::InitializeSceneResources(
     const std::vector<Material*>& materials)
 {
     const MemoryCategoryScope memoryScope(MemoryCategory::CoreRenderer);
+
+    if (m_sceneRendererState != SceneRendererState::Initialized)
+    {
+        Log::Error("Scene resources require the scene renderer (M0c.5 Stage 5.1: EnsureSceneRenderer).");
+        return false;
+    }
 
     if (scene.HasPhysicsPresentation())
     {
@@ -6762,6 +7042,12 @@ bool Renderer::IsNrdRetentionGroupTransitionPending(NrdRetentionGroup group, boo
         return true;
     }
 
+    // M0c.4: a group the pending configuration will use is kept for its switch.
+    if(IsPendingConfigurationNrdGroup(static_cast<int>(group)))
+    {
+        return true;
+    }
+
     if(group == NrdRetentionGroup::Legacy)
     {
         return runPathTrace && status.requested == RendererLightingMode::Legacy;
@@ -6840,7 +7126,14 @@ void Renderer::UpdateNrdRetention(bool runPathTrace)
             continue;
         }
 
-        ++inactiveGroups;
+        // The raw diffuse hit distance group is an input shared by RELAX and the hybrid, not a denoiser of its own: it is
+        // not counted against the no-budget limit, so keeping the most recently used denoiser keeps its input as well
+        // (it still retires through the grace period or pressure). Counting it made RELAX and its input two groups with
+        // the same last-active frame, and the tie evicted RELAX at once.
+        if(group != NrdRetentionGroup::RawDiffuseHitDistance)
+        {
+            ++inactiveGroups;
+        }
 
         if(!state.residency.submissionUncertain && (!leastRecent ||
             state.lastActiveFrame < m_nrdRetention[static_cast<size_t>(*leastRecent)].lastActiveFrame))
@@ -7551,6 +7844,15 @@ bool Renderer::RecordPsrInPlaceReplacement(ID3D12GraphicsCommandList* commandLis
     }
 
     constants.materialBufferIndex = CurrentMaterialBuffer().GetDescriptorIndex();
+    constants.materialTableIndex = m_materialTables.GetMissingEnergyTexture().GetDescriptorIndex();
+    constants.materialAverageTableIndex = m_materialTables.GetAverageTexture().GetDescriptorIndex();
+    constants.materialTableCosineMapping = static_cast<std::uint32_t>(m_materialTables.GetCosineMapping());
+#ifndef NDEBUG
+    // M0c.4 (GBV #940): the replacement's surfaces read these as Texture2D<float2>; an absent or zero index reads another
+    // resource (descriptor 0 is a 3D texture).
+    ENGINE_ASSERT(IsValidMaterialTableDescriptor(m_materialTables.GetMissingEnergyTexture()) &&
+        IsValidMaterialTableDescriptor(m_materialTables.GetAverageTexture()));
+#endif
     constants.diagnosticHitsIndex = m_psrDiagnosticHits ? m_psrDiagnosticHits->GetUAVDescriptorIndex() : 0u;
 
     // The diagnostic variant samples at PSR.1's reflected-hit UV; without PSR.1's records it reads its own buffer, whose
@@ -7569,6 +7871,10 @@ bool Renderer::RecordPsrInPlaceReplacement(ID3D12GraphicsCommandList* commandLis
     constants.transformCount = static_cast<std::uint32_t>(transforms.size());
     constants.resolution[0] = m_sceneWidth;
     constants.resolution[1] = m_sceneHeight;
+
+#ifndef NDEBUG
+    ValidatePsrFrameRecords();
+#endif
 
     const D3D12_GPU_VIRTUAL_ADDRESS constantsAddress = m_uploadBuffer.Allocate(&constants, sizeof(constants),
         D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
@@ -8361,6 +8667,7 @@ bool Renderer::RecordDlssEvaluation(ID3D12GraphicsCommandList* commandList, unsi
         return false;
     }
 
+    TransitionTiming::Scope dlssFeatureScope("DlssEnsureFeature", 0.5);
     const bool featureReady = m_dlssBackend.EnsureFeature(commandList, inputs.renderWidth, inputs.renderHeight, inputs.outputWidth,
         inputs.outputHeight, GetDlssPreset(m_renderScale));
     RestoreDlssGraphicsState(commandList);
@@ -9041,6 +9348,7 @@ bool Renderer::RecordPathTraceReference(
         }
         else
         {
+            MarkDredStage(commandList, L"Path tracing: path tracer dispatch");
             referenceDispatched = m_pathTraceReferencePass.Execute(primary, m_commandContext.GetRayTracingCommandList(),
                 m_resourceDescriptorHeap, m_rayTracingScene, constantsAddress, sceneLightConstantsAddress, m_sceneWidth,
                 m_sceneHeight, extract, renderCacheAddress, renderCacheLibrary, rawExtraction, primarySurfaceReplacement,
@@ -9214,6 +9522,7 @@ bool Renderer::RecordPathTraceReference(
         // complete pair is resolved; otherwise the path tracer's own frame mean stays presented and no history commits.
         if(hybridFrame)
         {
+            MarkDredStage(commandList, L"Path tracing: NRD hybrid");
             m_nrdHybridPresentedLastFrame = RecordNrdHybrid(commandList, frameIndex, view, inverseViewProjection,
                 cameraPosition, &m_pathTraceReferencePass.GetOutputTexture());
         }
@@ -9578,6 +9887,8 @@ bool Renderer::EnsureNrdHybridDenoiser()
     {
         return true;
     }
+
+    TransitionTiming::Scope er1Scope("EnsureNrdHybridDenoiser");
 
     if(m_nrdHybridCreationFailed)
     {
@@ -11169,8 +11480,29 @@ bool Renderer::RenderUIOnly()
 
 Renderer::FrameRenderResult Renderer::Render(
     const Scene& scene,
-    const RendererOptions& options)
+    const RendererOptions& requestedOptions)
 {
+    // M0c.5 Stage 5.3: an Editor frame requesting AIR, its views, mist or haze prepares them first (between frames: nothing is
+    // recording yet). Until they are ready the frame records without those requests, so the previous presentation (no AIR) stays;
+    // before the first lit frame it also stays unlit (RecordRenderFrame), so no frame is lit without its volumetrics.
+    std::optional<RendererOptions> withheldOptions;
+    m_volumetricHoldThisFrame = false;
+
+    if(!m_packagedRuntime && RequestsVolumetrics(requestedOptions) && !PrepareVolumetrics())
+    {
+        m_volumetricHoldThisFrame = m_volumetricState == VolumetricState::Preparing && !m_litFramePresented;
+        withheldOptions = requestedOptions;
+        withheldOptions->air.reset();
+        withheldOptions->airMist.reset();
+        withheldOptions->airCells.reset();
+        withheldOptions->airTemperature.reset();
+        withheldOptions->airDivergence.reset();
+        withheldOptions->airVisualization.reset();
+    }
+
+    const RendererOptions& options = withheldOptions ? *withheldOptions : requestedOptions;
+    // M0c.5 Stage 5.5: a finished NGX initialization is adopted here, between frames, without waiting.
+    PollDlssBackend();
     m_referenceRayCounts.StartFrame();
     struct RayCountFrameScope
     {
@@ -11187,9 +11519,9 @@ Renderer::FrameRenderResult Renderer::Render(
     } rayCountFrameScope{m_referenceRayCounts, m_debugUI, *this};
     m_dlssActiveLastFrame = false;
     m_dlssFrameSubmitted = false;
-    m_dxrPreparationReport.waiting = false;
-    m_dxrPreparationReport.libraryFailure.clear();
-    m_dxrPreparationReport.pipelineFailure.clear();
+    // M0c.5 Stage 5.6: the DXR preparation report is not reset here. It is reset where the frame's preparation begins
+    // (SelectPresentedConfiguration), so what that preparation recorded (M0c.4 polls the workers there, before this call)
+    // reaches DxrPreparationTasks::Update together with what this frame's gates record.
 
     TransitionTiming::Scope er1Scope("Frame Render", 0.0);
     PollPreparedTextureUploads();
@@ -11504,11 +11836,18 @@ bool Renderer::RecordRenderFrame(
     } signedHistoryFrame{m_giSignedCorrectionPass};
 
     const bool hasRenderableMeshes = scene.HasRenderableMeshes();
+    // M0c.4 Stage 4.3: while the first requested configuration prepares at startup nothing is lit, and nothing only the
+    // Legacy lighting records (its textures, the signed GI correction, AO) is created or used. Geometry, uploads,
+    // acceleration structures, residency and AIR continue as on any frame.
+    // Only a frame whose options are the startup presentation is unlit: SelectPresentedConfiguration arms it for the next
+    // recording. Direct Render callers (harnesses, captures) never select, so they are never suppressed.
+    const bool lightingSuppressed = std::exchange(m_lightingSuppressedForNextFrame, false) || m_volumetricHoldThisFrame;
+    const bool legacyLightingAllowed = hasRenderableMeshes && !lightingSuppressed;
 
     // Compile-time mode selection is shared with the shader; diagnostics never consume stale corrections.
 #if GI_DIAGNOSTIC_MODE == GI_MODE_BASELINE_CORRECTION
 
-    const bool runSignedCorrection = hasRenderableMeshes && options.enableRTGI;
+    const bool runSignedCorrection = legacyLightingAllowed && options.enableRTGI;
 #else
 
     const bool runSignedCorrection = false;
@@ -11535,7 +11874,7 @@ bool Renderer::RecordRenderFrame(
     const float aoRadius =
         runContactAO && debugView != ToneMapDebugView::HDRIDiffuseAmbientOnly ? options.rtgiContactAORadius : 1.5f;
 
-    const bool runAO = hasRenderableMeshes && (!options.enableRTGI || runContactAO || debugView == ToneMapDebugView::AORaw ||
+    const bool runAO = legacyLightingAllowed && (!options.enableRTGI || runContactAO || debugView == ToneMapDebugView::AORaw ||
                        debugView == ToneMapDebugView::AOTemporal || debugView == ToneMapDebugView::AOFiltered ||
 
                        debugView == ToneMapDebugView::HDRIDiffuseAmbientOnly);
@@ -11737,6 +12076,7 @@ bool Renderer::RecordRenderFrame(
     UpdateRadianceCacheD6(options.experimentalD6RadianceCache || m_sharcSettings.enabled);
     // Keep generation/revision evidence through End, which invalidates active eligibility.
     const auto textureUploadGeneration = m_activeRecordingGeneration;
+    MarkDredStage(commandList, L"Frame: texture uploads and material table");
     RecordPreparedTextureUploads(commandList); // Copies/transitions precede every material consumer.
     const auto materialRevision = m_materialPublication.revision;
 
@@ -11764,10 +12104,48 @@ bool Renderer::RecordRenderFrame(
     ObserveFrameUploadReset(frameIndex);
 
     // VX.5: residency copies first, before any pass; the slot's previous submission is complete (Begin waited for it).
+    MarkDredStage(commandList, L"Frame: VX.5 residency uploads");
     m_voxelResidency.RecordUploads(commandList, frameIndex, m_commandContext.GetLastSubmissionFenceValue(),
         m_commandContext.GetCompletedFenceValue(), m_commandContext.GetSubmissionLifetime());
 
+    // M0c.6: AIR's window storage (≈240 MiB at the default window) is retired once no frame has requested enabled AIR for the
+    // mode-resource grace period (M0c.2/M0c.3). Release moves every storage buffer, with its descriptor, to the field's retired list
+    // at the last submitted fence; CollectRetired (every Record) destroys them once the GPU has completed it, so nothing waits.
+    // This recording has not touched AIR yet, and a disabled request leaves its bindings invalid for the mist and the views. A
+    // paused request is still enabled and keeps its state; AIR enabled again after a retirement allocates fresh storage and starts
+    // from a reset field, as a first enable does.
+    const bool airRequested = options.air && options.air->enabled;
+    const auto airNow = std::chrono::steady_clock::now();
+
+    if(airRequested || !m_airField.IsAllocated())
+    {
+        m_airLastRequested = airNow;
+    }
+    else if(airNow - m_airLastRequested >= ModeResourceGracePeriod)
+    {
+        m_airField.Release(m_commandContext.GetLastSubmissionFenceValue());
+        ++m_airStorageRetirements;
+        Log::Info("AIR storage retired (AIR unused for " + std::to_string(ModeResourceGracePeriod.count()) +
+            " s); released once the GPU completes fence " + std::to_string(m_commandContext.GetLastSubmissionFenceValue()) + ".");
+    }
+
+    // M0c.6: the AIR vector view's split list (16 MiB, sized for the largest vector budget) the same way, after the grace period
+    // without a vector view. This recording draws no view yet; IdleDivergence/ExecuteDivergence collect it every Editor frame.
+    if(!m_packagedRuntime)
+    {
+        if(options.airVisualization || !m_editorAirPass.HasSplitResources())
+        {
+            m_airVectorsLastRequested = airNow;
+        }
+        else if(airNow - m_airVectorsLastRequested >= ModeResourceGracePeriod)
+        {
+            m_editorAirPass.RetireSplitResources(m_commandContext.GetLastSubmissionFenceValue());
+            Log::Info("AIR vector view resources retired (unused for " + std::to_string(ModeResourceGracePeriod.count()) + " s).");
+        }
+    }
+
     // AIR.1: after the residency uploads, so its obstacle mask reads this frame's VX.5 binding; before any pass.
+    MarkDredStage(commandList, L"Frame: AIR");
     m_airField.Record(commandList, m_resourceDescriptorHeap, m_uploadBuffer, options.air.value_or(AirFrameRequest{}), m_voxelResidency.GetBinding(),
         frameIndex, m_commandContext.GetLastSubmissionFenceValue(), m_commandContext.GetCompletedFenceValue());
 
@@ -11803,6 +12181,7 @@ bool Renderer::RecordRenderFrame(
                                 diagnosticDescriptorCreated);
 
     recordingSetupProbe.reset();
+    MarkDredStage(commandList, L"Frame: displacement and TLAS");
 
     if (preparedDisplacement &&
 
@@ -11918,7 +12297,10 @@ bool Renderer::RecordRenderFrame(
     // RTXPT.2: the raster-primary mode is the same progressive path tracer with its first vertex taken
     // from this frame's G-buffer; it shares the settings, accumulation and resets.
     // RTXPT.3: the raster-primary mode with RTXDI direct light at its first vertex; same settings and resets.
-    const bool pathTraceSettingsValid = hasRenderableMeshes && IsValidPathTraceReferenceSettings(options.pathTraceReference);
+    // M0c.4 Stage 4.5: the meshes are not part of a mode's runnability. A path-traced mode whose scene has no resident
+    // geometry yet (a scene opening while its meshes stream in) stays the active mode and records an empty frame, rather
+    // than failing over to Legacy and retrying once geometry arrives.
+    const bool pathTraceSettingsValid = IsValidPathTraceReferenceSettings(options.pathTraceReference);
 
     // Evaluates one mode's gates for this recording, creating what it needs on first use. Returns whether
     // it can run, its primary constructor and, when it cannot, why.
@@ -11970,7 +12352,7 @@ bool Renderer::RecordRenderFrame(
         }
         else if(!pathTraceSettingsValid)
         {
-            failure = "The scene has no renderable meshes or the path tracing settings are invalid.";
+            failure = "The path tracing settings are invalid.";
         }
         else if(referenceRequested)
         {
@@ -12062,22 +12444,23 @@ bool Renderer::RecordRenderFrame(
         runPathTrace = evaluateLightingMode(recordedMode, pathTracePrimary, ignoredFailure);
     }
 
+    // Stage 4.5: a runnable path-traced mode without resident geometry records no path tracing this frame (there is no TLAS
+    // content to trace), but stays active, keeps its resources and its render extent, and resumes with the first mesh.
+    const bool pathTracedSceneEmpty = runPathTrace && !hasRenderableMeshes;
+
+    if(pathTracedSceneEmpty)
+    {
+        runPathTrace = false;
+    }
+
     // M0c.1/M0c.2: before anything in this recording reads a Legacy pass (constants below, then the Legacy branch), a
     // Legacy recording makes the set resident at the render extent and marks it used; any other recording may retire it.
     // M0c.3: the same for Path Tracing's resources, shared by every path-traced mode.
     BeginModeResourceRecording(m_legacyLighting.retention);
     BeginModeResourceRecording(m_pathTracingResidency);
 
-    if(!runPathTrace)
-    {
-        if(!EnsureLegacyLightingExtent())
-        {
-            return false;
-        }
-
-        MarkModeResourceUsed(m_legacyLighting.retention);
-    }
-    else
+    // Stage 4.3/4.5: an unlit startup frame and an empty path-traced frame use neither set.
+    if(runPathTrace)
     {
         if(!EnsurePathTracingResident())
         {
@@ -12086,11 +12469,21 @@ bool Renderer::RecordRenderFrame(
 
         MarkModeResourceUsed(m_pathTracingResidency);
     }
+    else if(!pathTracedSceneEmpty && !lightingSuppressed)
+    {
+        if(!EnsureLegacyLightingExtent())
+        {
+            return false;
+        }
 
-    m_lightingModeTransition.CommitRendered(runPathTrace ? recordedMode : RendererLightingMode::Legacy);
+        MarkModeResourceUsed(m_legacyLighting.retention);
+    }
+
+    m_lightingModeTransition.CommitRendered(runPathTrace || pathTracedSceneEmpty ? recordedMode :
+        RendererLightingMode::Legacy);
 
     // After the commit, so a transition counts as pending only while the requested mode has not rendered yet.
-    if(runPathTrace)
+    if(runPathTrace || pathTracedSceneEmpty)
     {
         UpdateLegacyLightingRetention();
     }
@@ -12182,7 +12575,11 @@ bool Renderer::RecordRenderFrame(
     }
 
     m_dlssModeThisFrame = jitterApplies && IsDlssRenderScale(m_renderScale) && m_dlssFailure.empty() && m_dlssFallbackReason[0] == '\0';
-    if(IsDlssRenderScale(m_renderScale) && !m_dlssModeThisFrame && m_dlssFailure.empty())
+    // Stage 4.3/4.5: an unlit startup frame or an empty path-traced frame keeps the DLSS render extent it was sized for; it
+    // presents through the ordinary resolve, and DLSS evaluates again with the first lit frame.
+    const bool dlssHeldForUnlitFrame = lightingSuppressed || pathTracedSceneEmpty;
+
+    if(IsDlssRenderScale(m_renderScale) && !m_dlssModeThisFrame && m_dlssFailure.empty() && !dlssHeldForUnlitFrame)
         FailDlss("Frame eligibility", jitterApplies ? m_dlssFallbackReason : "not an active raster-primary frame");
     const bool dlssPhases = m_dlssInputPreparation || m_dlssModeThisFrame;
     const std::uint32_t jitterPhaseCount = dlssPhases ?
@@ -12720,6 +13117,7 @@ bool Renderer::RecordRenderFrame(
 
     commandList->ClearRenderTargetView(rtvHandle, clearColor, 0, nullptr);
 
+    MarkDredStage(commandList, L"Frame: geometry");
     m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::Geometry);
 
     // Selection uses geometry depth before EndGeometryPass transitions the G-buffer for consumers.
@@ -12733,6 +13131,7 @@ bool Renderer::RecordRenderFrame(
     }
 
     m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::Geometry);
+    MarkDredStage(commandList, L"Frame: selection mask");
     RecordSceneSelectionMask(commandList, scene, options, cameraConstantsAddress);
 
     EndGeometryPass(commandList);
@@ -12740,6 +13139,7 @@ bool Renderer::RecordRenderFrame(
 
     if(psrInPlace)
     {
+        MarkDredStage(commandList, L"Frame: PSR in-place replacement");
         m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::PsrInPlaceReplace);
         m_psrInPlaceReplacedLastFrame = RecordPsrInPlaceReplacement(commandList, scene, currentView, renderProjection,
             frameView.position, cameraConstants);
@@ -12837,6 +13237,7 @@ bool Renderer::RecordRenderFrame(
 
         // R.9I.3: only this recording's accepted snapshot reaches the pixel caustics seam (null when disabled).
         const CausticSnapshotHandle pixelCausticSnapshot = std::move(m_frameCausticSnapshot);
+        MarkDredStage(commandList, L"Frame: path tracing");
 
         if(!RecordPathTraceReference(commandList, frameIndex, pathTracePrimary, currentView, renderProjection,
             currentProjection, reconstructionConstants.inverseViewProjection, frameView.position, frameLighting,
@@ -12850,10 +13251,11 @@ bool Renderer::RecordRenderFrame(
         const PreviousGBufferCamera copiedCamera{currentView, renderProjection,
             CameraRelativeInverseViewProjection(currentView, renderProjection), frameView.position};
         m_previousGBufferAvailableThisFrame = m_previousGBufferValid;
+        MarkDredStage(commandList, L"Frame: previous G-buffer copy");
         RecordPreviousGBufferCopy(commandList, copiedCamera);
     }
     // Preserve the fixed AO -> shadows -> reflections -> GI -> denoise -> lighting order.
-    else if (hasRenderableMeshes)
+    else if (legacyLightingAllowed)
     {
         const uint32_t aoWidth = (m_sceneWidth + 1u) / 2u;
         const uint32_t aoHeight = (m_sceneHeight + 1u) / 2u;
@@ -13227,6 +13629,18 @@ bool Renderer::RecordRenderFrame(
         m_sceneColor.Transition(commandList, D3D12_RESOURCE_STATE_RENDER_TARGET);
         const float emptyColor[] = {0.0f, 0.0f, 0.0f, 1.0f};
         commandList->ClearRenderTargetView(m_sceneColor.GetRTV(), emptyColor, 0, nullptr);
+
+        // M0c.4: frames without lighting (startup preparation, a scene without resident geometry) still record compute
+        // consumers of the environment (the AIR mist's lighting); they need the same shader-read state the lit branches
+        // establish, or GPU-based validation reports the texture in a pixel-shader-only layout (#1358).
+        constexpr D3D12_RESOURCE_STATES shaderReadState =
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        m_environment.GetSourceTexture().Transition(commandList, shaderReadState);
+        m_environment.GetCubemap().Transition(commandList, shaderReadState);
+        m_environment.GetDiffuseIrradiance().Transition(commandList, shaderReadState);
+        m_environment.GetGGXMultiscatterIrradiance().Transition(commandList, shaderReadState);
+        m_brdfIntegrationLUT.Transition(commandList, shaderReadState);
+        m_ggxAverageAlbedoLUT.Transition(commandList, shaderReadState);
     }
 
     // Physical Lighting C2: meter and adapt the camera exposure from the final HDR scene colour, before DLSS and tone
@@ -13239,7 +13653,14 @@ bool Renderer::RecordRenderFrame(
         exposure.exposure = frameExposure;
         exposure.referenceEV100 = lightingSettings.referenceEV100;
         exposure.deltaSeconds = options.frameDeltaSeconds;
-        exposure.reset = options.exposureReset || !m_exposureInitialized || !(frameView.identity == m_exposureViewIdentity) ||
+        // Stage 4.3/4.5: the first lit frame after unlit ones (startup preparation, an empty scene) snaps rather than
+        // adapting from black.
+        const bool litThisFrame = runPathTrace || legacyLightingAllowed;
+        const bool snapAfterUnlitFrames = litThisFrame && m_exposureSnapAfterUnlitFrames;
+        m_exposureSnapAfterUnlitFrames = !litThisFrame;
+        m_litLastFrame = litThisFrame;
+        m_litFramePresented = m_litFramePresented || litThisFrame;
+        exposure.reset = options.exposureReset || snapAfterUnlitFrames || !m_exposureInitialized || !(frameView.identity == m_exposureViewIdentity) ||
             lightingSettings.referenceEV100 != m_exposureReferenceEV100;
 
         if(!m_autoExposurePass.Ensure(m_graphicsDevice.GetDevice(), m_shaderLibrary, m_resourceDescriptorHeap) ||
@@ -13355,6 +13776,7 @@ bool Renderer::RecordRenderFrame(
 
     if(PresentationResolveActive())
     {
+        MarkDredStage(commandList, L"Frame: presentation resolve and DLSS");
         const D3D12_VIEWPORT outputViewport{0.0f, 0.0f, static_cast<float>(m_outputWidth),
             static_cast<float>(m_outputHeight), 0.0f, 1.0f};
         const D3D12_RECT outputScissor{0, 0, static_cast<LONG>(m_outputWidth), static_cast<LONG>(m_outputHeight)};
@@ -13436,6 +13858,7 @@ bool Renderer::RecordRenderFrame(
         const D3D12_GPU_VIRTUAL_ADDRESS overlayCameraAddress = m_uploadBuffer.Allocate(&overlayCamera,
             sizeof(CameraConstants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
 
+        MarkDredStage(commandList, L"Frame: Editor overlay prepass");
         m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::EditorOverlayPrepass);
         const bool prepassed = overlayCameraAddress != 0 &&
             RecordEditorOverlayPrepass(commandList, scene, options, overlayCameraAddress);
@@ -13482,6 +13905,7 @@ bool Renderer::RecordRenderFrame(
         mistLighting.lightTable = sceneLightConstantsAddress;
         mistLighting.topLevel = m_rayTracingScene.GetTopLevel().GetGPUAddress();
         mistLighting.environmentIrradiance = m_environment.GetDiffuseIrradiance().GetDescriptorIndex();
+        MarkDredStage(commandList, L"Frame: lit mist");
         m_editorMistPass.Execute(commandList, m_resourceDescriptorHeap, m_uploadBuffer, *presentedColor, *presentedDepth,
             currentViewProjection, frameView.position, m_airField.GetBinding(), m_airField.GetMistBinding(), *mistRequest,
             m_airField.GetMistSeconds(), m_commandContext.GetLastSubmissionFenceValue(), m_commandContext.GetCompletedFenceValue(),
@@ -13489,6 +13913,7 @@ bool Renderer::RecordRenderFrame(
     }
 
     // Final composition precedes collider lines and the distinct Editor/packaged presentation paths.
+    MarkDredStage(commandList, L"Frame: tone mapping and presentation");
     m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::ToneMap);
 
     // Legacy diagnostic views describe legacy passes; the reference image is always shown as is, except a D.3B.0 scalar
@@ -13520,7 +13945,15 @@ bool Renderer::RecordRenderFrame(
     if (!m_packagedRuntime)
     {
         m_finalSceneColor.Transition(commandList, D3D12_RESOURCE_STATE_RENDER_TARGET);
-        toneMap(m_finalSceneColor.GetRTV());
+
+        if(lightingSuppressed)
+        {
+            RecordPreparationScreen(commandList, m_finalSceneColor.GetRTV(), m_outputWidth, m_outputHeight, false);
+        }
+        else
+        {
+            toneMap(m_finalSceneColor.GetRTV());
+        }
     }
 
     m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::ToneMap);
@@ -13626,7 +14059,15 @@ bool Renderer::RecordRenderFrame(
         const D3D12_RECT scissor{0, 0, static_cast<LONG>(m_applicationWidth), static_cast<LONG>(m_applicationHeight)};
         commandList->RSSetViewports(1, &viewport);
         commandList->RSSetScissorRects(1, &scissor);
-        toneMap(rtvHandle);
+
+        if(lightingSuppressed)
+        {
+            RecordPreparationScreen(commandList, rtvHandle, m_applicationWidth, m_applicationHeight, true);
+        }
+        else
+        {
+            toneMap(rtvHandle);
+        }
 
         if(m_packagedPresentCopyForTesting && m_packagedPresentCopyForTesting->GetWidth() == m_applicationWidth &&
             m_packagedPresentCopyForTesting->GetHeight() == m_applicationHeight)
@@ -14038,6 +14479,8 @@ void Renderer::Shutdown()
 
     m_materialPreviewRenderer.Shutdown();
     m_editorResourcesInitialized = false;
+    // Every scene-renderer member below is released whether its group never ran, ran partly or completed.
+    m_sceneRendererState = SceneRendererState::NotInitialized;
     m_commandRecordingGeneration = 0;
     m_commandSubmissionAttempted = false;
 
@@ -14087,6 +14530,9 @@ void Renderer::Shutdown()
     m_legacyLighting.nrdReflectionResolvePass.Shutdown();
     m_legacyLighting.nrdDiffuseResolvePass.Shutdown();
     m_legacyLighting.giSpatialDenoisePass.Shutdown();
+    // The shadow denoise pass, the last of the set, is released below; every pass tolerates never having been created.
+    m_legacyLightingInitialized = false;
+    m_legacyLightingFailed = false;
     m_giSignedCorrectionPass.Shutdown();
     m_giSignedCorrectionInitialized = false;
     // Joined first: no compilation result may outlive the pass and library it was prepared for.
@@ -14107,6 +14553,24 @@ void Renderer::Shutdown()
     }
 
     m_pipelineWorkerRunning = false;
+
+    // M0c.5 Stage 5.5: the volumetric worker is joined like the pipeline worker (an untaken job is destroyed with it).
+    if(m_volumetricWorker)
+    {
+        m_volumetricWorker->Shutdown();
+        m_volumetricWorker.reset();
+    }
+
+    // M0c.5 Stage 5.3: after the joins, no job still uses the private library; the objects it prepared are released above.
+    if(m_volumetricShaders)
+    {
+        m_volumetricShaders->Shutdown();
+        m_volumetricShaders.reset();
+    }
+
+    m_volumetricState = VolumetricState::NotRequested;
+    m_volumetricHoldThisFrame = false;
+    m_litFramePresented = false;
     m_psrPreparedAuxiliary.reset();
     m_psrAuxiliaryReady = false;
     m_psrAuxiliaryFailed = false;
@@ -14693,6 +15157,178 @@ bool Renderer::ConfigureVoxelResidency(std::uint32_t regionBricks, int baseExpon
 void Renderer::ReleaseAirField()
 {
     m_airField.Release(m_commandContext.GetLastSubmissionFenceValue());
+}
+
+bool Renderer::RequestsVolumetrics(const RendererOptions& options) noexcept
+{
+    return (options.air && options.air->enabled) || options.airMist || options.airCells || options.airTemperature ||
+        options.airDivergence || options.airVisualization;
+}
+
+// M0c.5 Stage 5.3: the render-thread half, between frames: the same objects the Editor created in InitializeSceneRenderer before
+// this stage, from m_shaderLibrary (holding the worker's shaders by now, so these are lookups and pipeline creation).
+bool Renderer::InitializeVolumetrics()
+{
+    const MemoryCategoryScope memoryScope(MemoryCategory::AirVolumetrics);
+    const TransitionTiming::Scope initializationTiming("AIR and volumetrics initialization (render thread)", 0.0,
+        TransitionTiming::TransitionsAndStartup);
+    ID3D12Device* device = m_graphicsDevice.GetDevice();
+
+    if(!m_editorAirPass.Initialize(device, m_shaderLibrary))
+    {
+        Log::Error("Failed to initialize the editor air visualization pass.");
+        return false;
+    }
+
+    // AIR.1: allocates nothing until air is first enabled; the uninitialized field records nothing (AirField::Record).
+    if(!m_airField.Initialize(device, m_resourceDescriptorHeap, m_shaderLibrary))
+    {
+        Log::Error("Failed to initialize the air field.");
+        return false;
+    }
+
+    // Created here rather than by the first projection's frame; a failure is retried there, as before.
+    if(!m_airField.GetPressure().PreparePipelines())
+    {
+        Log::Warning("The AIR pressure solver's pipelines could not be created yet; the first projection retries.");
+    }
+
+    // AIR.4F F3: allocates nothing until mist is first drawn, except (F4.1) the noise volumes uploaded here.
+    const std::filesystem::path mistTextures = WindowsWindow::GetExecutableDirectory() / "assets" / "Textures" / "Air";
+
+    if(!m_editorMistPass.Initialize(device, m_resourceDescriptorHeap, m_shaderLibrary, m_resourceUploader,
+            mistTextures / "MistWorley64.dds", mistTextures / "MistCurl64.dds", mistTextures / "MistFilaments128.dds") ||
+        !m_editorMistPass.EnsureMistPipelines())
+    {
+        Log::Error("Failed to initialize the editor mist pass.");
+        return false;
+    }
+
+    return true;
+}
+
+// M0c.5 Stage 5.3: called by an Editor frame that requests AIR, its views, mist or haze, before it records. Returns whether
+// they can be recorded this frame.
+bool Renderer::PrepareVolumetrics()
+{
+    if(m_volumetricState == VolumetricState::Ready)
+    {
+        return true;
+    }
+
+    if(m_volumetricState == VolumetricState::Failed)
+    {
+        return false;
+    }
+
+    static constexpr const char* JobKey = "AIR and volumetric shaders";
+    const auto milliseconds = [this]()
+    {
+        return std::to_string(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+            m_volumetricRequested).count());
+    };
+
+    if(m_volumetricState == VolumetricState::NotRequested)
+    {
+        m_volumetricRequested = std::chrono::steady_clock::now();
+
+        // M0c.5 Stage 5.5: on a pipeline worker of its own (the same RayTracingPipelineWorker), created on this first request,
+        // so the job runs beside the configuration's DXR pipelines instead of queueing behind them. If it cannot start, the
+        // shared pipeline worker takes the job as before.
+        if(!m_volumetricWorker)
+        {
+            auto worker = std::make_unique<RayTracingPipelineWorker>();
+
+            if(worker->Start())
+            {
+                m_volumetricWorker = std::move(worker);
+            }
+        }
+
+        RayTracingPipelineWorker* const volumetricWorker = m_volumetricWorker ? m_volumetricWorker.get() :
+            (m_pipelineWorkerRunning ? m_pipelineWorker.get() : nullptr);
+
+        // Without any worker: synchronous, as every Editor start was before Stage 5.3.
+        if(!volumetricWorker)
+        {
+            m_volumetricState = InitializeVolumetrics() ? VolumetricState::Ready : VolumetricState::Failed;
+            Log::Info("AIR and volumetrics initialized synchronously (no pipeline worker) in " + milliseconds() + " ms.");
+            return m_volumetricState == VolumetricState::Ready;
+        }
+
+        auto shaders = std::make_shared<ShaderLibrary>();
+        const std::filesystem::path root = m_assetRoot / "Shaders";
+        // Read only (GetDevice); Shutdown joins the worker before releasing it.
+        GraphicsDevice* graphicsDevice = &m_graphicsDevice;
+        RayTracingPipelineRequest request{};
+        request.key = JobKey;
+        request.device = m_graphicsDevice.GetRayTracingDevice();
+        // The same Initialize calls as InitializeVolumetrics, on throwaway objects with a private library and private (never
+        // initialized) heap and uploader, which these calls only store: they compile exactly the shaders the real objects load,
+        // and their pipelines warm the driver's cache. No descriptor, upload or renderer state is touched; only free-threaded
+        // device methods are called.
+        request.prepareAuxiliary = [shaders, root, graphicsDevice]()
+        {
+            const MemoryCategoryScope memoryScope(MemoryCategory::AirVolumetrics);
+
+            if(!shaders->Initialize(root))
+            {
+                return false;
+            }
+
+            ID3D12Device* device = graphicsDevice->GetDevice();
+            DescriptorHeap unusedHeap;
+            ResourceUploader unusedUploader;
+            auto views = std::make_unique<EditorAirPass>();
+            auto field = std::make_unique<AirField>();
+            auto mist = std::make_unique<EditorMistPass>();
+            const bool compiled = views->Initialize(device, *shaders) && field->Initialize(device, unusedHeap, *shaders) &&
+                field->GetPressure().PreparePipelines() &&
+                mist->Initialize(device, unusedHeap, *shaders, unusedUploader, {}, {}, {}) && mist->EnsureMistPipelines();
+            mist->Shutdown();
+            field->Shutdown();
+            views->Shutdown();
+            return compiled;
+        };
+
+        if(!volumetricWorker->Submit(std::move(request)))
+        {
+            m_volumetricState = VolumetricState::Failed;
+            Log::Error("AIR and volumetrics could not be queued for preparation; they stay off for this session.");
+            return false;
+        }
+
+        m_volumetricShaders = std::move(shaders);
+        m_volumetricState = VolumetricState::Preparing;
+        Log::Info("AIR and volumetrics requested: compiling their shaders on the pipeline worker.");
+        return false;
+    }
+
+    RayTracingPipelineWorker* const volumetricWorker = m_volumetricWorker ? m_volumetricWorker.get() : m_pipelineWorker.get();
+
+    if(volumetricWorker->GetState(JobKey) != RayTracingPipelineJobState::Completed)
+    {
+        return false;
+    }
+
+    const auto outcome = volumetricWorker->TakeCompleted(JobKey);
+    const bool compiled = outcome && outcome->succeeded && outcome->device == m_graphicsDevice.GetRayTracingDevice();
+    const std::size_t adopted = compiled ? m_shaderLibrary.AdoptShaders(*m_volumetricShaders) : 0;
+    m_volumetricShaders->Shutdown();
+    m_volumetricShaders.reset();
+    m_volumetricState = compiled && InitializeVolumetrics() ? VolumetricState::Ready : VolumetricState::Failed;
+
+    if(m_volumetricState == VolumetricState::Ready)
+    {
+        Log::Info("AIR and volumetrics ready " + milliseconds() + " ms after the first request (" + std::to_string(adopted) +
+            " shaders prepared on the pipeline worker, from the shader cache or DXC).");
+    }
+    else
+    {
+        Log::Error("AIR and volumetrics could not be prepared; AIR, mist and haze stay off for this session.");
+    }
+
+    return m_volumetricState == VolumetricState::Ready;
 }
 
 bool Renderer::InitializePackagedAir(std::span<const std::byte> worley, std::span<const std::byte> curl, std::span<const std::byte> filaments,
@@ -15586,3 +16222,128 @@ Renderer::SelectionPublicationIdentity Renderer::GetSelectionPublicationIdentity
     if(m_sceneResourceScene != &scene || m_sceneResourceLifetime == 0) return {};
     return {m_sceneResourceLifetime, m_rayTracingScene.m_materialBindingEpoch};
 }
+
+// M0c.4 Stage 4.3: the preparation screen of an unlit startup frame, in place of tone mapping (the Editor's final image or the
+// packaged back buffer, already a render target). Clears only, so it needs no pipeline and cannot fail; the scene is not shown
+// until the requested configuration presents it completely. The Editor's final image is cleared to its optimized clear value
+// (opaque black; any other value draws a D3D12 performance warning) and the Editor viewport draws status and progress over it;
+// the packaged back buffer has no optimized clear value and gets a dark background and the progress bar here.
+void Renderer::RecordPreparationScreen(ID3D12GraphicsCommandList* commandList, D3D12_CPU_DESCRIPTOR_HANDLE output,
+    unsigned int width, unsigned int height, bool drawProgress) const
+{
+    if(!drawProgress)
+    {
+        const float optimizedClear[] = {0.0f, 0.0f, 0.0f, 1.0f};
+        commandList->ClearRenderTargetView(output, optimizedClear, 0, nullptr);
+        return;
+    }
+
+    const float background[] = {0.035f, 0.038f, 0.045f, 1.0f};
+    commandList->ClearRenderTargetView(output, background, 0, nullptr);
+
+    if(width < 64 || height < 64)
+    {
+        return;
+    }
+
+    const LONG barWidth = static_cast<LONG>(width) * 2 / 5;
+    const LONG barHeight = (std::max)(4L, static_cast<LONG>(height) / 120);
+    const LONG left = (static_cast<LONG>(width) - barWidth) / 2;
+    const LONG top = static_cast<LONG>(height) * 3 / 5;
+    const D3D12_RECT track{left, top, left + barWidth, top + barHeight};
+    const float trackColor[] = {0.12f, 0.13f, 0.15f, 1.0f};
+    commandList->ClearRenderTargetView(output, trackColor, 1, &track);
+
+    const float progress = std::clamp(m_configurationPreparation.GetStatus().progress, 0.0f, 1.0f);
+    const LONG filled = static_cast<LONG>(static_cast<float>(barWidth) * progress);
+
+    if(filled > 0)
+    {
+        const D3D12_RECT fill{left, top, left + filled, top + barHeight};
+        const float fillColor[] = {0.45f, 0.58f, 0.78f, 1.0f};
+        commandList->ClearRenderTargetView(output, fillColor, 1, &fill);
+    }
+}
+
+#ifndef NDEBUG
+// M0c.4 diagnostics (GBV #940 investigation): the records this frame's PSR replacement draw reaches through the TLAS, checked on
+// the CPU against what was staged and published for this recording; no GPU wait or readback. The material buffer of this
+// frame slot must hold exactly the published records (a larger buffer would expose zero-filled entries, whose texture index
+// 0 is the 3D Worley texture). Findings are logged, never repaired.
+void Renderer::ValidatePsrFrameRecords()
+{
+    ++m_psrRecordCheckFrames;
+    std::string report;
+    std::size_t findings = m_rayTracingScene.ValidateStagedRecords(m_materialPublication.desired, 8, report);
+    const StructuredBuffer& materials = CurrentMaterialBuffer();
+    const std::uint64_t capacity = materials.GetResource() ? materials.GetResource()->GetDesc().Width / sizeof(GPUMaterial) : 0;
+
+    if(capacity != m_materialPublication.desired.size())
+    {
+        report += "\n    material buffer of slot " + std::to_string(m_activeRecordingSlot) + " holds " + std::to_string(capacity) +
+            " records, " + std::to_string(m_materialPublication.desired.size()) + " published";
+        ++findings;
+    }
+
+    if(findings == 0)
+    {
+        return;
+    }
+
+    m_psrRecordFindings += findings;
+
+    // Logged for the first frames with findings only, so a persistent problem cannot flood the log.
+    if(m_psrRecordFindings <= 64)
+    {
+        Log::Error("PSR record check, frame " + std::to_string(m_psrRecordCheckFrames) + ": " + std::to_string(findings) +
+            " findings" + report);
+    }
+}
+#endif
+
+// M0c.4 diagnostics (GBV streaming hang): with ENGINE_DIAG_DRED_MARKERS set in a Debug build, the frame recording names its
+// stages with markers, so a DRED report (a hang, or a controlled RemoveDevice capture) attributes breadcrumb operation indices
+// to passes. Off by default: each marker is a DRED operation of its own and would shift the indices other runs report.
+void Renderer::MarkDredStage([[maybe_unused]] ID3D12GraphicsCommandList* commandList,
+    [[maybe_unused]] const wchar_t* stage) const
+{
+#ifndef NDEBUG
+    static const bool markersEnabled = std::getenv("ENGINE_DIAG_DRED_MARKERS") != nullptr;
+
+    if(markersEnabled && commandList && stage)
+    {
+        // Confirms in the log that the markers are being recorded (once per process).
+        static bool announced = false;
+
+        if(!announced)
+        {
+            announced = true;
+            Log::Info("DRED stage markers enabled (ENGINE_DIAG_DRED_MARKERS): first marker recorded in the frame command list.");
+        }
+
+        // Metadata 0: a null-terminated wide string (the unversioned PIX marker format), which DRED keeps as the context.
+        const UINT bytes = static_cast<UINT>((std::wcslen(stage) + 1) * sizeof(wchar_t));
+        commandList->SetMarker(0, stage, bytes);
+    }
+#endif
+}
+
+#ifndef NDEBUG
+// M0c.4 (GBV #940): a material table is a 2D texture with a real descriptor (not the UINT_MAX sentinel and not 0, which
+// holds the 3D Worley texture). Logged with what was found, so a failing assertion names the cause.
+bool Renderer::IsValidMaterialTableDescriptor(Texture& table) const
+{
+    const unsigned int index = table.GetDescriptorIndex();
+    ID3D12Resource* const resource = table.GetResource();
+    const bool valid = index != 0u && index != UINT_MAX && resource &&
+        resource->GetDesc().Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+
+    if(!valid)
+    {
+        Log::Error("Material table descriptor invalid: index " + std::to_string(index) + ", resource " +
+            (resource ? "dimension " + std::to_string(static_cast<int>(resource->GetDesc().Dimension)) : std::string("missing")));
+    }
+
+    return valid;
+}
+#endif

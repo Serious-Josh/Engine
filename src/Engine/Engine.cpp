@@ -1,6 +1,7 @@
 #include "Scene/SceneSwitchTiming.h"
 #include "Engine/Engine.h"
 #include "Debug/MemoryMonitor.h"
+#include "Debug/TransitionTiming.h"
 #include "assets/ProjectScriptAssets.h"
 #include "assets/ProjectAudioBankAssets.h"
 #include "Engine/PackagedAudioBanks.h"
@@ -1010,6 +1011,10 @@ bool Engine::Initialize(bool archiveDiagnostic)
 // project-independent platform/GPU infrastructure, then the active project, then the scene.
 bool Engine::Initialize(const EngineStartup& startup)
 {
+    // M0c.5 diagnostics (ENGINE_STARTUP_TIMING): the startup timeline; this thread is the main thread.
+    TransitionTiming::StartupMilestone("Engine::Initialize begins (main thread)");
+    const TransitionTiming::Scope initializeTiming("Engine::Initialize", 0.0, TransitionTiming::Startup);
+
     if(!InitializeProjectIndependent(startup))
     {
         return false;
@@ -1070,10 +1075,38 @@ void Engine::ProcessProjectIndependentFrame()
         std::abort();
     }
 
+    if(!m_startupBrowserFrameNoted)
+    {
+        m_startupBrowserFrameNoted = true;
+        TransitionTiming::StartupMilestone("first Project Browser frame presented");
+    }
+
     // Initialization runs between submissions, never inside ImGui or renderer recording.
     if(request)
     {
         ProcessProjectBrowserRequest(*request);
+    }
+}
+
+// M0c.5 diagnostics (ENGINE_STARTUP_TIMING): the first scene frame after startup or a project selection, and the first lit
+// one (the requested configuration presented; M0c.4 preparing frames are unlit). One flag test each when disabled.
+void Engine::NoteStartupFrame(Renderer::FrameRenderResult result)
+{
+    if(m_startupLitFrameNoted || !TransitionTiming::StartupEnabled() || result != Renderer::FrameRenderResult::Rendered)
+    {
+        return;
+    }
+
+    if(!m_startupSceneFrameNoted)
+    {
+        m_startupSceneFrameNoted = true;
+        TransitionTiming::StartupMilestone("first scene frame rendered (Editor usable)");
+    }
+
+    if(m_renderer.GetRenderedConfiguration().lit)
+    {
+        m_startupLitFrameNoted = true;
+        TransitionTiming::StartupMilestone("first lit frame (requested configuration presented)");
     }
 }
 
@@ -1120,6 +1153,10 @@ void Engine::ProcessProjectBrowserRequest(const ProjectBrowser::Request& request
         return;
     }
 
+    // M0c.5 diagnostics (ENGINE_STARTUP_TIMING): the selection, from here to the first frames, on the startup timeline.
+    TransitionTiming::StartupMilestone("project selected in the Project Browser");
+    const TransitionTiming::Scope selectionTiming("Project selection (open, InitializeProject, InitializeProjectScene)", 0.0,
+        TransitionTiming::Startup);
     std::string error;
     auto opened = request.action == ProjectBrowser::Action::Create ?
         ProjectCreation::Create(request.name, request.path, error) : ProjectLoader::Open(request.path, error);
@@ -1184,6 +1221,7 @@ void Engine::ProcessProjectBrowserRequest(const ProjectBrowser::Request& request
 
 bool Engine::InitializeProjectScene()
 {
+    const TransitionTiming::Scope sceneTiming("Engine::InitializeProjectScene", 0.0, TransitionTiming::Startup);
     SceneSource source = SceneSource::CleanUnsaved;
 
     if(m_projectWorkspace && !m_projectWorkspace->GetLastScene().empty())
@@ -1206,7 +1244,10 @@ bool Engine::InitializeProjectScene()
 
     // Once validated scene data starts allocating resources, failure is fatal to this open;
     // it must not be disguised as a missing-file fallback.
-    return InitializeScene(source);
+    const bool initialized = InitializeScene(source);
+    // M0c.5 Stage 5.5: the last poll before the first frame (the scene's activation took its time too).
+    m_renderer.AdvanceConfigurationPreparation();
+    return initialized;
 }
 
 bool Engine::RequestCleanScene(std::string& errorMessage)
@@ -1809,6 +1850,7 @@ bool Engine::InitializeProjectIndependent(const EngineStartup& startup)
     }
 
     m_initializationStarted = std::chrono::steady_clock::now();
+    const TransitionTiming::Scope phaseTiming("Engine::InitializeProjectIndependent", 0.0, TransitionTiming::Startup);
     m_startup=startup;
     const bool packaged=startup.mode==EngineStartup::Mode::PackagedRuntime;
     std::vector<std::byte> shaderBytes;
@@ -1817,6 +1859,9 @@ bool Engine::InitializeProjectIndependent(const EngineStartup& startup)
     std::string environmentIdentity;
     if(packaged)
     {
+        const TransitionTiming::Scope preflightTiming("Packaged preflight (archive, shaders, environment, settings)", 0.0,
+            TransitionTiming::Startup);
+
         try
         {
             if(!startup.sceneID || startup.width==0 || startup.height==0 || startup.width>8192 || startup.height>8192)
@@ -1886,7 +1931,14 @@ bool Engine::InitializeProjectIndependent(const EngineStartup& startup)
         return false;
     }
 
-    if (!m_window.Initialize(m_windowProperties))
+    bool windowCreated = false;
+
+    {
+        const TransitionTiming::Scope windowTiming("Window creation", 0.0, TransitionTiming::Startup);
+        windowCreated = m_window.Initialize(m_windowProperties);
+    }
+
+    if (!windowCreated)
     {
         Log::Error("Failed to initialize window.");
         return false;
@@ -1899,11 +1951,36 @@ bool Engine::InitializeProjectIndependent(const EngineStartup& startup)
 
     const std::filesystem::path assetRoot = packaged ? std::filesystem::path{} : executableDirectory / "assets";
 
+    // M0c.4 Stage 4.4: the configuration is already known for a packaged game (its cooked settings, from preflight) and for
+    // a project opened from the command line (its saved settings); the renderer starts preparing it during initialization.
+    // A Project Browser selection starts it in InitializeProject instead.
+    std::optional<RenderingConfiguration> initialConfiguration;
+
+    if(packaged)
+    {
+        initialConfiguration = m_packagedRenderingConfiguration;
+    }
+    else if(m_activeProject)
+    {
+        initialConfiguration = ResolveRenderingConfiguration(GetActiveProject().GetProjectSettings().settings.rendering);
+    }
+
     m_rendererAttempted=true;
     const auto rendererStarted = std::chrono::steady_clock::now();
-    if(!m_renderer.Initialize(m_window.GetNativeHandle(), m_window.GetWidth(), m_window.GetHeight(),
-        assetRoot, shaderBytes, environmentImage ? &*environmentImage : nullptr, environmentIdentity,
-        startup.projectBrowserWorkflow, materialTableBytes))
+    bool rendererInitialized = false;
+
+    {
+        const TransitionTiming::Scope rendererTiming("Renderer::Initialize", 0.0, TransitionTiming::Startup);
+        rendererInitialized = m_renderer.Initialize(m_window.GetNativeHandle(), m_window.GetWidth(), m_window.GetHeight(),
+            assetRoot, shaderBytes, environmentImage ? &*environmentImage : nullptr, environmentIdentity,
+            startup.projectBrowserWorkflow, materialTableBytes, initialConfiguration ? &*initialConfiguration : nullptr,
+            // M0c.5 Stage 5.1: only the Project Browser starts without a project; InitializeProject completes the renderer.
+            !packaged && startup.projectBrowserWorkflow && !m_activeProject,
+            // M0c.5 Stages 5.2/5.3: a project workflow start (neutral bootstrap; AIR, volumetrics and Legacy on first use).
+            !packaged && startup.projectBrowserWorkflow);
+    }
+
+    if(!rendererInitialized)
     {
         Log::Error("Failed to initialize renderer.");
         return false;
@@ -1915,17 +1992,25 @@ bool Engine::InitializeProjectIndependent(const EngineStartup& startup)
             std::chrono::steady_clock::now() - rendererStarted).count()) + " ms.");
     }
 
+    // M0c.4 Stage 4.0: readiness tracing is opt-in diagnostics.
+    if(std::getenv("ENGINE_DIAG_READINESS"))
+    {
+        m_readinessTrace = std::make_unique<ConfigurationReadinessTrace>();
+        Log::Info("Configuration readiness tracing enabled (ENGINE_DIAG_READINESS).");
+    }
+
     // M0b.1 P2: Editor memory sampling, from the frame loop until Shutdown stops it before the device is released.
     if(!packaged)
     {
+        const TransitionTiming::Scope monitorTiming("MemoryMonitor::Start", 0.0, TransitionTiming::Startup);
         MemoryMonitor::Start(m_renderer.GetDevice());
     }
 
     // Diagnostics only: the Editor records its phases when the frame-hitch report is enabled.
     m_editor.SetPhaseTimingEnabled(m_renderer.IsFrameHitchLoggingEnabled());
 
-    // One-time descriptor budget baseline: renderer passes, targets, LUTs, environment and UI,
-    // before any scene, mesh or thumbnail allocation.
+    // One-time descriptor budget baseline before any scene, mesh or thumbnail allocation: the UI, plus the scene renderer's
+    // passes, targets, LUTs and environment except in the Project Browser (M0c.5 Stage 5.1: initialized at selection).
     const auto descriptors = m_renderer.GetResourceDescriptorStatistics();
     Log::Info("Descriptor heap baseline after renderer initialization: " + std::to_string(descriptors.allocated) +
         " of " + std::to_string(descriptors.capacity) + " CBV/SRV/UAV descriptors in use.");
@@ -1938,6 +2023,7 @@ bool Engine::InitializeProjectIndependent(const EngineStartup& startup)
     }
     else
     {
+        const TransitionTiming::Scope audioTiming("Audio initialization", 0.0, TransitionTiming::Startup);
         Audio::InitializeOptions audioOptions;
 #if !defined(NDEBUG) && defined(ENGINE_HAS_VERIFICATION)
         // M10.6, verification builds only: FMOD's no-sound output, so measurements do not depend on the machine's audio device.
@@ -1963,39 +2049,43 @@ bool Engine::InitializeProjectIndependent(const EngineStartup& startup)
 
     if(packaged)
     {
+        const TransitionTiming::Scope banksTiming("Packaged audio banks", 0.0, TransitionTiming::Startup);
         LoadPackagedAudioBanks();
     }
 
     Log::Info(packaged ? "Initializing archived scene." : "Project-independent Editor services initialized.");
 
-    ShaderDescription vertexShaderDescription{};
-
-    vertexShaderDescription.path = "Triangle.hlsl";
-    vertexShaderDescription.entryPoint = "VSMain";
-    vertexShaderDescription.stage = ShaderStage::Vertex;
-
-    m_demoVertexShader = m_renderer.GetShaderLibrary().Load(vertexShaderDescription);
-
-    if (!m_demoVertexShader)
     {
-        Log::Error("Failed to load demo vertex shader.");
+        const TransitionTiming::Scope demoShaderTiming("Demo shaders (Triangle.hlsl)", 0.0, TransitionTiming::Startup);
+        ShaderDescription vertexShaderDescription{};
 
-        return false;
-    }
+        vertexShaderDescription.path = "Triangle.hlsl";
+        vertexShaderDescription.entryPoint = "VSMain";
+        vertexShaderDescription.stage = ShaderStage::Vertex;
 
-    ShaderDescription pixelShaderDescription{};
-    pixelShaderDescription.path = "Triangle.hlsl";
+        m_demoVertexShader = m_renderer.GetShaderLibrary().Load(vertexShaderDescription);
 
-    pixelShaderDescription.entryPoint = "PSMain";
-    pixelShaderDescription.stage = ShaderStage::Pixel;
+        if (!m_demoVertexShader)
+        {
+            Log::Error("Failed to load demo vertex shader.");
 
-    m_demoPixelShader = m_renderer.GetShaderLibrary().Load(pixelShaderDescription);
+            return false;
+        }
 
-    if(!m_demoPixelShader)
-    {
-        Log::Error("Failed to load demo pixel shader.");
+        ShaderDescription pixelShaderDescription{};
+        pixelShaderDescription.path = "Triangle.hlsl";
 
-        return false;
+        pixelShaderDescription.entryPoint = "PSMain";
+        pixelShaderDescription.stage = ShaderStage::Pixel;
+
+        m_demoPixelShader = m_renderer.GetShaderLibrary().Load(pixelShaderDescription);
+
+        if(!m_demoPixelShader)
+        {
+            Log::Error("Failed to load demo pixel shader.");
+
+            return false;
+        }
     }
 
     m_window.SetEventCallback(
@@ -2070,8 +2160,11 @@ bool Engine::InitializeProjectIndependent(const EngineStartup& startup)
         });
 
     // Global personal preferences need no project, so they apply before one is chosen.
-    LoadEditorPreferences();
-    ConfigureImGuiSettingsLocation();
+    {
+        const TransitionTiming::Scope preferencesTiming("Editor preferences and ImGui settings", 0.0, TransitionTiming::Startup);
+        LoadEditorPreferences();
+        ConfigureImGuiSettingsLocation();
+    }
 
     m_state = EngineState::ProjectIndependent;
     return true;
@@ -2081,6 +2174,8 @@ bool Engine::InitializeProjectIndependent(const EngineStartup& startup)
 // reconciliation) and project-bound Editor/scene-manager configuration. No scene exists yet.
 bool Engine::InitializeProject()
 {
+    const TransitionTiming::Scope projectTiming("Engine::InitializeProject", 0.0, TransitionTiming::Startup);
+
     if(m_state != EngineState::ProjectIndependent || m_startup.mode == EngineStartup::Mode::PackagedRuntime)
     {
         Log::Error("Project initialization requires the project-independent Editor state.");
@@ -2111,6 +2206,31 @@ bool Engine::InitializeProject()
     for(const auto& warning : GetActiveProject().GetProjectSettings().warnings)
     {
         Log::Warning("Project settings: " + warning);
+    }
+
+    const RenderingConfiguration projectConfiguration =
+        ResolveRenderingConfiguration(GetActiveProject().GetProjectSettings().settings.rendering);
+
+    // M0c.5 Stages 5.1/5.5: NGX for a project that requests DLSS (others skip it), started first and on its own thread, so it
+    // overlaps the scene renderer, the project and the scene. The first frame that sizes the scene completes it
+    // (Renderer::EnsureDlssBackend), so the first render extent is NGX's.
+    m_renderer.BeginDlssBackend(projectConfiguration.dlssRequested ||
+        Renderer::IsDlssRenderScale(static_cast<Renderer::RenderScale>(projectConfiguration.renderScaleIndex)));
+
+    // M0c.5 Stage 5.1: a Project Browser start completes the renderer here, once, before any preparation or scene. A failure
+    // fails project initialization (closed, as before); other starts initialized it in Renderer::Initialize.
+    if(!m_renderer.EnsureSceneRenderer())
+    {
+        Log::Error("Failed to initialize the scene renderer.");
+        return false;
+    }
+
+    // M0c.4 Stage 4.4: a project selected in the Project Browser (or the default project) starts preparing its saved
+    // rendering configuration now, while the project and its scene initialize. A command-line project already started
+    // in Renderer::Initialize.
+    if(!m_renderer.HasPresentedConfiguration())
+    {
+        m_renderer.BeginConfigurationPreparation(projectConfiguration);
     }
 
     const auto initializeLooseProject = [&]() -> bool
@@ -2190,8 +2310,17 @@ bool Engine::InitializeProject()
     }
 
     ProjectAssetReconciliation::Report reconciliation;
+    bool reconciled = false;
 
-    if(!ProjectAssetReconciliation::Run(projectPaths, m_projectAssetRegistry, reconciliation, projectError))
+    {
+        const TransitionTiming::Scope reconciliationTiming("Project asset reconciliation", 0.0, TransitionTiming::Startup);
+        reconciled = ProjectAssetReconciliation::Run(projectPaths, m_projectAssetRegistry, reconciliation, projectError);
+    }
+
+    // M0c.5 Stage 5.5: libraries finished meanwhile have their DXR pipelines queued now, not at the first frame.
+    m_renderer.AdvanceConfigurationPreparation();
+
+    if(!reconciled)
     {
         Log::Error("Project asset reconciliation failed: " + projectError);
         return false;
@@ -2255,7 +2384,12 @@ bool Engine::InitializeProject()
         m_audio.EnableSteamAudio(steamAudioOptions);
     }
 
-    LoadProjectAudioBanks(projectPaths);
+    {
+        const TransitionTiming::Scope banksTiming("Project audio banks", 0.0, TransitionTiming::Startup);
+        LoadProjectAudioBanks(projectPaths);
+    }
+
+    m_renderer.AdvanceConfigurationPreparation();
 
 #if defined(_DEBUG)
     // M6.7 listening diagnostic: the authored return's fader, in dB, at each launch.
@@ -2346,6 +2480,7 @@ bool Engine::InitializeProject()
     // Personal workspace state only after the project context is validated and installed.
     LoadProjectWorkspace();
 
+    m_renderer.AdvanceConfigurationPreparation();
     m_state = EngineState::ProjectReady;
     return true;
 }
@@ -2902,6 +3037,74 @@ void Engine::AcceptPreparedMeshResidencyForFrame(IDemoScene& activeDemo)
     }
 }
 
+// M0c.4 Stage 4.3: a pending rendering configuration is one Background Task (fraction and current step), finished when it is
+// presented, superseded, cancelled or failed; the viewport shows its status while nothing is lit at startup, and a failure.
+void Engine::UpdateConfigurationPreparationPresentation()
+{
+    const ConfigurationPreparationStatus& status = m_renderer.GetConfigurationPreparationStatus();
+    const bool preparing = status.pending.has_value() && status.state == ConfigurationPreparationState::Preparing;
+
+    if(m_configurationPreparationTask.IsValid() && status.generation != m_configurationPreparationTaskGeneration)
+    {
+        m_configurationPreparationTask.MarkCancelled("superseded by a newer request");
+        m_configurationPreparationTask = {};
+    }
+
+    if(preparing && !m_configurationPreparationTask.IsValid())
+    {
+        BackgroundTaskOptions options;
+        options.name = "Preparing rendering configuration";
+        m_configurationPreparationTask = m_backgroundTasks.Begin(options);
+        m_configurationPreparationTask.Start();
+        m_configurationPreparationTaskGeneration = status.generation;
+        m_configurationPreparationTaskSwitches = status.switches;
+    }
+
+    if(m_configurationPreparationTask.IsValid())
+    {
+        if(!status.pending)
+        {
+            if(status.switches != m_configurationPreparationTaskSwitches)
+            {
+                m_configurationPreparationTask.Complete("presented");
+            }
+            else
+            {
+                m_configurationPreparationTask.MarkCancelled("the presented configuration was requested again");
+            }
+
+            m_configurationPreparationTask = {};
+        }
+        else if(status.state == ConfigurationPreparationState::Failed)
+        {
+            m_configurationPreparationTask.Fail(status.detail);
+            m_configurationPreparationTask = {};
+        }
+        else
+        {
+            m_configurationPreparationTask.SetFraction(std::clamp(status.progress, 0.0f, 1.0f));
+            m_configurationPreparationTask.SetStatus(DescribeConfigurationIdentity(*status.pending) +
+                (status.detail.empty() ? "" : ": " + status.detail));
+        }
+    }
+
+    std::string viewportStatus;
+    float viewportProgress = -1.0f;
+
+    if(status.startupPreparing && status.pending)
+    {
+        viewportProgress = std::clamp(status.progress, 0.0f, 1.0f);
+        viewportStatus = "Preparing " + DescribeConfigurationIdentity(*status.pending) + " (" +
+            std::to_string(static_cast<int>(status.progress * 100.0f)) + "%)";
+    }
+    else if(status.state == ConfigurationPreparationState::Failed && status.pending)
+    {
+        viewportStatus = "Rendering configuration unavailable: " + status.detail;
+    }
+
+    m_editor.SetViewportPreparationStatus(std::move(viewportStatus), viewportProgress);
+}
+
 void Engine::SampleMemoryMonitor()
 {
     const auto now = std::chrono::steady_clock::now();
@@ -2931,6 +3134,9 @@ void Engine::SampleMemoryMonitor()
 
 void Engine::Frame()
 {
+    // ER.1/M0c.4 diagnostics (ENGINE_ER1_TIMING only): the whole frame's CPU time, for hitches around configuration switches.
+    const TransitionTiming::Scope frameTiming("EngineFrame", 0.0);
+
     // Exactly one audio update when this frame ends, on every return path, after gameplay and presentation and
     // independent of whether the renderer submitted anything. It never waits on GPU work.
     const Audio::FrameUpdateScope audioUpdate(m_audio);
@@ -2983,9 +3189,9 @@ void Engine::Frame()
 
         // PS.4: the cooked configuration through the shared application path. DLSS eligibility comes from
         // the renderer's own state, never the Debug panel.
-        const RenderingConfiguration& configuration = m_packagedRenderingConfiguration;
-        ApplyRenderScale(configuration, m_renderer, IsDlssConfigurationEligible(configuration,
-            m_renderer.GetLightingModeTransitionStatus().active, !m_renderer.GetDenoiserPreparation().empty()), false);
+        // M0c.4: the presented configuration; a different cooked request is prepared while it renders.
+        const RenderingConfiguration& configuration = m_renderer.SelectPresentedConfiguration(m_packagedRenderingConfiguration);
+        ApplyRenderScale(configuration, m_renderer, m_renderer.IsPresentedDlssEligible(), false);
 
         // PS.5E: as in the Editor, every frame, so a DLSS scale applies once it becomes eligible and a DLSS failure
         // returns to Native. A no-op while neither the window nor the effective scale changed.
@@ -3046,6 +3252,30 @@ void Engine::Frame()
         const auto result = m_renderer.Render(demo.GetScene(), options);
         const double renderMilliseconds = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - renderStarted).count();
+
+
+        NoteStartupFrame(result);
+
+        // M0c.4 Stage 4.0 diagnostics: full readiness while the request settles or changes, what was rendered every frame.
+        if(m_readinessTrace)
+        {
+            const bool rendered = result == Renderer::FrameRenderResult::Rendered;
+            const auto now = ConfigurationReadinessTrace::Clock::now();
+
+            // The cooked request, not the presented configuration.
+            const RenderingConfiguration& requested = m_packagedRenderingConfiguration;
+
+            if(m_readinessTrace->NeedsEvaluation(requested, m_window.GetWidth(), m_window.GetHeight()))
+            {
+                const ConfigurationReadiness readiness =
+                    m_renderer.EvaluateConfigurationReadiness(requested, m_window.GetWidth(), m_window.GetHeight());
+                m_readinessTrace->Observe(readiness, m_renderer.GetRenderedConfiguration(), rendered, now);
+            }
+            else
+            {
+                m_readinessTrace->ObserveRendered(m_renderer.GetRenderedConfiguration(), rendered, now);
+            }
+        }
         if (result == Renderer::FrameRenderResult::Error)
         {
             Log::Error("Packaged renderer frame failed; requesting shutdown.");
@@ -3289,8 +3519,11 @@ void Engine::Frame()
 
     // UPSCALING.2C: applied by the ResizeScene below (and so also deferred while a splitter drags). It
     // uses the panel's state before this frame's settings window is drawn, as it always has.
-    ApplyRenderScale(debugUI.GetRenderingConfiguration(), m_renderer, debugUI.IsDlssConfigurationEligible(),
-        debugUI.ConsumeDlssRetry());
+    // M0c.4: the presented configuration. A request whose identity differs is prepared while this one keeps rendering,
+    // and its render scale applies in the frame that first presents it.
+    const RenderingConfiguration& presentedConfiguration =
+        m_renderer.SelectPresentedConfiguration(debugUI.GetRenderingConfiguration());
+    ApplyRenderScale(presentedConfiguration, m_renderer, m_renderer.IsPresentedDlssEligible(), debugUI.ConsumeDlssRetry());
 
     if (sceneWidth == 0 || sceneHeight == 0 || (resizeScene && !m_renderer.ResizeScene(sceneWidth, sceneHeight)))
     {
@@ -3754,7 +3987,10 @@ void Engine::Frame()
     // PS.2B: the resolved rendering configuration (the Debug panel through the shared resolver until PS.2C),
     // applied before the caustic snapshot boundary below.
     // R1.3: resolved once per frame; the fog request below reads its Volumetrics settings too.
-    const RenderingConfiguration frameRenderingConfiguration = debugUI.GetRenderingConfiguration();
+    // M0c.4: this frame's settings window may have changed the request; its per-frame values apply now, a new identity
+    // from the next frame (the scale above was applied for the selected identity).
+    const RenderingConfiguration frameRenderingConfiguration =
+        m_renderer.PresentConfiguration(debugUI.GetRenderingConfiguration());
     ApplyRenderingConfiguration(frameRenderingConfiguration, m_renderer, rendererOptions);
     rendererOptions.frameDeltaSeconds = m_time.GetDeltaTime();
     rendererOptions.exposureReset = std::exchange(m_exposureResetPending, false);
@@ -4064,11 +4300,33 @@ void Engine::Frame()
     }
     const Renderer::FrameRenderResult renderResult = m_renderer.Render(activeScene, rendererOptions);
     renderProbe.reset();
+    NoteStartupFrame(renderResult);
+
+    // M0c.4 Stage 4.0 diagnostics: full readiness while the request settles or changes, what was rendered every frame.
+    if(m_readinessTrace)
+    {
+        const bool rendered = renderResult == Renderer::FrameRenderResult::Rendered;
+        const auto now = ConfigurationReadinessTrace::Clock::now();
+
+        // The request, not the presented configuration: the trace checks independently what was rendered until it matched.
+        const RenderingConfiguration& requested = debugUI.GetRenderingConfiguration();
+
+        if(m_readinessTrace->NeedsEvaluation(requested, sceneWidth, sceneHeight))
+        {
+            m_readinessTrace->Observe(m_renderer.EvaluateConfigurationReadiness(requested, sceneWidth, sceneHeight),
+                m_renderer.GetRenderedConfiguration(), rendered, now);
+        }
+        else
+        {
+            m_readinessTrace->ObserveRendered(m_renderer.GetRenderedConfiguration(), rendered, now);
+        }
+    }
 
     // BT.3: after Render, whose gates take worker results; only a rendered frame's report can end a batch.
     m_renderer.GetDxrWorkerActivity(m_dxrLibraryActivity, m_dxrPipelineActivity);
     m_dxrPreparationTasks.Update(m_backgroundTasks, m_dxrLibraryActivity, m_dxrPipelineActivity,
         renderResult == Renderer::FrameRenderResult::Rendered ? &m_renderer.GetDxrPreparationFrameReport() : nullptr);
+    UpdateConfigurationPreparationPresentation();
 
     if constexpr (Renderer::IsFrameHitchDiagnosticsEnabled())
     {

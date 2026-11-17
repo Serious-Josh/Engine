@@ -97,7 +97,7 @@ bool ComputePipeline::Initialize(
     pipelineDescription.CS.pShaderBytecode = description.computeShader->GetByteCode();
     pipelineDescription.CS.BytecodeLength = description.computeShader->GetBytecodeSize();
 
-    TransitionTiming::Scope er1Scope("CreateComputePipelineState");
+    TransitionTiming::Scope er1Scope("CreateComputePipelineState", 0.1, TransitionTiming::TransitionsAndStartup);
     result = device->CreateComputePipelineState(&pipelineDescription, IID_PPV_ARGS(&m_pipelineState));
 
     if (FAILED(result))
@@ -105,6 +105,10 @@ bool ComputePipeline::Initialize(
         Shutdown();
         return false;
     }
+
+    // Debug name from the shader (one string at creation), so GPU-based validation messages name the dispatch's pipeline.
+    const std::string pipelineName = "PSO " + description.computeShader->GetName();
+    m_pipelineState->SetName(std::wstring(pipelineName.begin(), pipelineName.end()).c_str());
 
     return true;
 }

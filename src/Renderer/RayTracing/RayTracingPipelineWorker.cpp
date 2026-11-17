@@ -204,6 +204,7 @@ void RayTracingPipelineWorker::Run()
         job.state = RayTracingPipelineJobState::Creating;
         --m_activity.queued;
         m_activity.active = true;
+        m_activity.activeCount = 1;
         m_activity.activeJob = key;
         // Immutable while creating: Submit never replaces a job's request and Shutdown never erases a creating job.
         const RayTracingPipelineRequest& request = job.request;
@@ -219,7 +220,8 @@ void RayTracingPipelineWorker::Run()
         {
             try
             {
-                TransitionTiming::Scope scope("Worker PSR auxiliary preparation");
+                // Named by the job's key: the PSR auxiliary pipelines, or (M0c.5 Stage 5.3) AIR and volumetric shaders.
+                TransitionTiming::Scope scope("Worker auxiliary preparation: " + key, 0.1, TransitionTiming::TransitionsAndStartup);
                 outcome.succeeded = request.prepareAuxiliary();
             }
             catch(...)
@@ -231,7 +233,8 @@ void RayTracingPipelineWorker::Run()
         else if(!request.failForTesting)
         {
             auto pipeline = std::make_unique<RayTracingPipeline>();
-            TransitionTiming::Scope er1Scope("Worker RayTracingPipeline " + request.description.shaderPath.generic_string());
+            TransitionTiming::Scope er1Scope("Worker RayTracingPipeline " + request.description.shaderPath.generic_string(), 0.1,
+                TransitionTiming::TransitionsAndStartup);
 
             if(pipeline->Initialize(request.device, *request.library, request.description))
             {
@@ -244,6 +247,7 @@ void RayTracingPipelineWorker::Run()
         job.outcome = std::move(outcome);
         job.state = RayTracingPipelineJobState::Completed;
         m_activity.active = false;
+        m_activity.activeCount = 0;
         m_activity.activeJob.clear();
         ++m_activity.finished;
         ++m_activity.untaken;

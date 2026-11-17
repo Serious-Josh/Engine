@@ -1,5 +1,6 @@
 #include "EnvironmentMap.h"
 #include "Debug/MemoryRegistry.h"
+#include "Debug/TransitionTiming.h"
 
 #include "Core/Log.h"
 #include "Renderer/DescriptorHeap.h"
@@ -7,6 +8,7 @@
 #include "Renderer/ResourceUploader.h"
 
 #include <algorithm>
+#include <optional>
 #include <cmath>
 #include <vector>
 
@@ -24,10 +26,17 @@ bool EnvironmentMap::Initialize(
         image.width=16; image.height=8; image.channels=4; image.pixels.resize(16*8*4,0.18f);
         for(size_t i=3;i<image.pixels.size();i+=4) image.pixels[i]=1.0f;
     }
-    else if (!ImageLoader::LoadHDR(path, image))
+    else
     {
-        Log::Error("Failed to load HDR environment.");
-        return false;
+        // M0c.5 diagnostics (ENGINE_STARTUP_TIMING): the CPU decode of the .hdr file.
+        const TransitionTiming::Scope decodeTiming("Environment HDR decode " + path.filename().string(), 0.0,
+            TransitionTiming::Startup);
+
+        if (!ImageLoader::LoadHDR(path, image))
+        {
+            Log::Error("Failed to load HDR environment.");
+            return false;
+        }
     }
 
     return Initialize(device,image,uploader,descriptorHeap,radianceScale);
@@ -69,6 +78,10 @@ bool EnvironmentMap::Initialize(ID3D12Device* device,const HDRImageData& source,
     const HDRImageData& image = radianceScale != 1.0f ? scaled : source;
 
     Log::Info("HDR environment loaded: " + std::to_string(image.width) + "x" + std::to_string(image.height));
+
+    // M0c.5 diagnostics (ENGINE_STARTUP_TIMING): the CPU importance distribution, then the GPU resources and precompute.
+    std::optional<TransitionTiming::Scope> phaseTiming;
+    phaseTiming.emplace("Environment importance CDF (CPU) and CDF buffers", 0.0, TransitionTiming::Startup);
 
     std::vector<float> conditionalCDF(static_cast<size_t>(image.width) * static_cast<size_t>(image.height));
 
@@ -187,6 +200,8 @@ bool EnvironmentMap::Initialize(ID3D12Device* device,const HDRImageData& source,
 
     Log::Info("Environment importance CDF built: " + std::to_string(m_importanceWidth) + "x" +
               std::to_string(m_importanceHeight) + ", total weight = " + std::to_string(m_importanceTotalWeight));
+    phaseTiming.reset();
+    phaseTiming.emplace("Environment source, cubemap and irradiance resources and precompute", 0.0, TransitionTiming::Startup);
 
     const unsigned int sourceMipLevels =
         static_cast<unsigned int>(std::floor(std::log2(static_cast<double>((std::max)(image.width, image.height))))) +

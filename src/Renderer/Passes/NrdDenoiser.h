@@ -134,6 +134,17 @@ class NrdDenoiser
         return m_width != 0;
     }
 
+    // The extent the instance was created for (0 when not initialized).
+    uint32_t GetWidth() const
+    {
+        return m_width;
+    }
+
+    uint32_t GetHeight() const
+    {
+        return m_height;
+    }
+
     bool IsExternallySynchronized() const
     {
         return m_description.externallySynchronized;

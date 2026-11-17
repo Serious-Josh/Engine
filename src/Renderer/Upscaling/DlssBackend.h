@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <future>
 #include <optional>
 #include <string>
 
@@ -112,8 +113,24 @@ public:
     ~DlssBackend();
 
     // Once per device, after it is created. Never fails the caller: every outcome is reported through GetStatus. A
-    // second call without Shutdown is ignored.
+    // second call without Shutdown is ignored. M0c.5 Stage 5.5: completes (waits for) an initialization BeginInitialize
+    // started, rather than starting another.
     void Initialize(ID3D12Device* device);
+
+    // M0c.5 Stage 5.5: the same initialization on a thread of its own, so it overlaps the caller's work. The NGX API is not
+    // thread safe but has no thread affinity (DLSS Programming Guide 5.2.4): while it runs, nothing else calls NGX (the
+    // status stays NotInitialized and every other method finds no NGX instance), and its outcome is adopted only by
+    // CompleteInitialize, after the thread has finished. Ignored when initialized or already initializing.
+    void BeginInitialize(ID3D12Device* device);
+
+    // Adopts a finished BeginInitialize, logging its outcome as Initialize does; with wait, waits for an unfinished one.
+    // True when no initialization is pending afterwards.
+    bool CompleteInitialize(bool wait);
+
+    bool IsInitializing() const noexcept
+    {
+        return m_pending.valid();
+    }
 
     // Releases the NGX instance only after GPU completion, before releasing the device. Idempotent.
     void Shutdown();
@@ -151,6 +168,21 @@ public:
 private:
     // The capability parameter map (allocated once); false with the failure in m_feature.
     bool EnsureParameters();
+
+    // M0c.5 Stage 5.5: everything Initialize decides, computed without touching this object (so on any thread).
+    struct InitializationOutcome
+    {
+        DlssStatus status;
+        // The NGX instance exists (Shutdown must release it), whatever the capability query found.
+        bool initialized = false;
+    };
+
+    static InitializationOutcome RunInitialize(ID3D12Device* device, const std::string& projectId);
+    void Adopt(InitializationOutcome outcome, ID3D12Device* device);
+    std::string ProjectId() const;
+
+    std::future<InitializationOutcome> m_pending;
+    ID3D12Device* m_pendingDevice = nullptr;
 
     ID3D12Device* m_device = nullptr;
     bool m_initialized = false;

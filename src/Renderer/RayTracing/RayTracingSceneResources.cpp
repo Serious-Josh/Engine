@@ -1993,3 +1993,101 @@ std::uint64_t RayTracingSceneResources::ReserveBLASRegistryLifetime() const
 
     return AllocateSceneRetirementLifetime();
 }
+
+#ifndef NDEBUG
+std::size_t RayTracingSceneResources::ValidateStagedRecords(const std::vector<GPUMaterial>& publishedMaterials,
+    std::size_t limit, std::string& report) const
+{
+    std::size_t findings = 0;
+    const auto note = [&](const std::string& finding)
+    {
+        if(findings < limit)
+        {
+            report += "\n    " + finding;
+        }
+
+        ++findings;
+    };
+
+    if(!m_membership)
+    {
+        return 0;
+    }
+
+    const MembershipSnapshot& membership = *m_membership;
+    const unsigned int triangleSlotDescriptor = membership.triangleSlots.GetDescriptorIndex();
+    const unsigned int slotMaterialDescriptor = membership.slotMaterials.GetDescriptorIndex();
+    const auto invalidDescriptor = [](unsigned int index)
+    {
+        return index == 0u || index == UINT_MAX;
+    };
+
+    for(const RayTracingInstanceDescription& instance : membership.instances)
+    {
+        const std::uint32_t object = instance.instanceID;
+        const std::string name = "instance " + std::to_string(object);
+
+        if(object >= membership.instanceRecords.size())
+        {
+            note(name + ": no instance record (" + std::to_string(membership.instanceRecords.size()) + " records)");
+            continue;
+        }
+
+        const RayTracingInstanceData& record = membership.instanceRecords[object];
+
+        if(invalidDescriptor(record.vertexBufferIndex))
+        {
+            note(name + ": vertex buffer descriptor " + std::to_string(record.vertexBufferIndex));
+        }
+
+        if(record.indexed != 0u && invalidDescriptor(record.indexBufferIndex))
+        {
+            note(name + ": index buffer descriptor " + std::to_string(record.indexBufferIndex));
+        }
+
+        if(record.slotMaterialBufferIndex != slotMaterialDescriptor)
+        {
+            note(name + ": slot material buffer " + std::to_string(record.slotMaterialBufferIndex) + ", membership's " +
+                std::to_string(slotMaterialDescriptor));
+        }
+
+        if(record.triangleSlotBufferIndex != UINT_MAX && record.triangleSlotBufferIndex != triangleSlotDescriptor)
+        {
+            note(name + ": triangle slot buffer " + std::to_string(record.triangleSlotBufferIndex) + ", membership's " +
+                std::to_string(triangleSlotDescriptor));
+        }
+
+        if(object >= membership.slotMaterialIndices.size() || membership.slotMaterialIndices[object].empty())
+        {
+            note(name + ": no slot materials");
+            continue;
+        }
+
+        for(const unsigned int material : membership.slotMaterialIndices[object])
+        {
+            if(material >= publishedMaterials.size())
+            {
+                note(name + ": slot material " + std::to_string(material) + " is not published (" +
+                    std::to_string(publishedMaterials.size()) + " published this recording)");
+                continue;
+            }
+
+            const GPUMaterial& record2 = publishedMaterials[material];
+            const unsigned int textures[] = {record2.textureIndex, record2.normalTextureIndex, record2.roughnessTextureIndex,
+                record2.metallicTextureIndex, record2.armTextureIndex, record2.aoTextureIndex, record2.heightTextureIndex};
+            const char* names[] = {"base colour", "normal", "roughness", "metallic", "ARM", "AO", "height"};
+
+            for(std::size_t index = 0; index < std::size(textures); ++index)
+            {
+                if(textures[index] == 0u)
+                {
+                    note(name + ": material " + std::to_string(material) + " " + names[index] +
+                        " texture index 0 (descriptor 0 holds no 2D texture)");
+                }
+            }
+        }
+    }
+
+    return findings;
+}
+#endif

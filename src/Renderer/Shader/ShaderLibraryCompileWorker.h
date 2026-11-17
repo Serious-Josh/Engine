@@ -12,9 +12,11 @@
 #include <string>
 #include <thread>
 
-// Async DXR preparation, Gate 1: compiles DXR shader libraries on one owned worker thread so a first-time
-// compilation never blocks frame recording. The worker owns a private ShaderCompiler (its own DXC compiler,
+// Async DXR preparation, Gate 1: compiles DXR shader libraries on owned worker threads so a first-time
+// compilation never blocks frame recording. Each thread owns a private ShaderCompiler (its own DXC compiler,
 // utils and include handlers), touches no Renderer or ShaderLibrary state and never calls Engine logging.
+// M0c.5 Stage 5.4: several threads may share the queue; a library has at most one job, so no library is compiled
+// twice, and each result is published only when its owner takes it, in whatever order the owner polls.
 // Results are owned values taken by the owner thread; this is not a cache, and a taken result must pass
 // IsCurrent before it is published.
 struct ShaderLibraryCompileRequest
@@ -76,8 +78,9 @@ class ShaderLibraryCompileWorker
     ShaderLibraryCompileWorker& operator=(const ShaderLibraryCompileWorker&) = delete;
     ~ShaderLibraryCompileWorker();
 
-    // Starts the worker thread. False if it is already running or could not be started.
-    bool Start();
+    // Starts the worker threads (M0c.5 Stage 5.4: threadCount of them, at least one). False if it is already
+    // running or no thread could be started; fewer threads than requested run if some could not be started.
+    bool Start(unsigned int threadCount = 1);
 
     // Drops queued jobs, waits for the compilation in flight (DXC cannot be cancelled) and joins the
     // thread. Logs the wait from the calling thread when a compilation is still running. Untaken results
@@ -116,7 +119,7 @@ class ShaderLibraryCompileWorker
 
     mutable std::mutex m_mutex;
     std::condition_variable m_wake;
-    std::thread m_thread;
+    std::vector<std::thread> m_threads;
     // Every library with a job, by key; the queue holds the keys of queued jobs in submission order.
     std::map<std::filesystem::path, Job> m_jobs;
     std::deque<std::filesystem::path> m_queue;

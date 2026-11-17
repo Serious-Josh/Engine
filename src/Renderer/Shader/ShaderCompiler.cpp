@@ -238,7 +238,7 @@ bool ShaderCompiler::Compile(
     const ShaderCompileDescription& description,
     ShaderCompileResult& output)
 {
-    output.bytecode.clear();
+    output = {};
 
     if (!m_utils || !m_compiler)
     {
@@ -256,6 +256,29 @@ bool ShaderCompiler::Compile(
     {
         return false;
     }
+
+    std::filesystem::path shaderPath = description.path;
+
+    std::wstring shaderDirectory = shaderPath.parent_path().wstring();
+
+    const wchar_t* arguments[] = {description.path, L"-E", description.entryPoint, L"-T", profile, L"-HV",
+                                  L"2021",          L"-I", shaderDirectory.c_str()};
+
+    // M0c.5 Stage 5.4: the persistent cache, for the same target and arguments. A miss compiles exactly as before.
+    const auto cacheStart = std::chrono::steady_clock::now();
+    const std::string target = std::filesystem::path(profile).string() + ":" + std::filesystem::path(description.entryPoint).string();
+    const DxilLibraryCache cache(description.usePersistentCache, description.path, description.shaderRoot, target, arguments);
+    std::vector<ShaderSourceDependency> dependencies;
+    output.cacheHit = cache.Load(m_utils, output.bytecode, dependencies);
+    output.cacheReadMilliseconds = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - cacheStart).count();
+
+    if (output.cacheHit)
+    {
+        return true;
+    }
+
+    output.bytecode.clear();
+    dependencies.clear();
 
     IDxcBlobEncoding* source = nullptr;
 
@@ -284,18 +307,17 @@ bool ShaderCompiler::Compile(
         return false;
     }
 
-    std::filesystem::path shaderPath = description.path;
-
-    std::wstring shaderDirectory = shaderPath.parent_path().wstring();
-
-    const wchar_t* arguments[] = {description.path, L"-E", description.entryPoint, L"-T", profile, L"-HV",
-                                  L"2021",          L"-I", shaderDirectory.c_str()};
-
     IDxcResult* compileResult = nullptr;
+    // Every file read and include lookup, for the cache entry (as CompileLibrary records them).
+    RecordDependency(dependencies, description.path, source);
+    RecordingIncludeHandler recordingIncludeHandler(includeHandler, dependencies);
 
+    const auto compileStart = std::chrono::steady_clock::now();
+    output.dxcInvoked = true;
     result =
         m_compiler->Compile(&sourceBuffer, arguments, static_cast<UINT32>(sizeof(arguments) / sizeof(arguments[0])),
-                            includeHandler, IID_PPV_ARGS(&compileResult));
+                            &recordingIncludeHandler, IID_PPV_ARGS(&compileResult));
+    output.dxcMilliseconds = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - compileStart).count();
 
     includeHandler->Release();
 
@@ -358,6 +380,9 @@ bool ShaderCompiler::Compile(
 
     compileResult->Release();
     source->Release();
+
+    // Only a successful compilation is stored, so a failing source is never answered from the cache.
+    output.cacheWritten = cache.Store(output.bytecode, dependencies);
 
     return true;
 }

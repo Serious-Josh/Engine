@@ -531,6 +531,12 @@ public:
         return m_initialized;
     }
 
+    // M0c.6: whether the field's window storage exists (allocated by an enabled request, retired by Release or a reshape).
+    bool IsAllocated() const noexcept
+    {
+        return m_allocated;
+    }
+
     AirPressure& GetPressure() noexcept
     {
         return m_pressure;

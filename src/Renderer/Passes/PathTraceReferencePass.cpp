@@ -1178,6 +1178,126 @@ bool PathTraceReferencePass::IsPipelineLive(const std::string& identity) const
     return false;
 }
 
+std::string PathTraceReferencePass::PipelineKey(const RayTracingPipelineDescription& description)
+{
+    return PipelineDescriptionKey(description);
+}
+
+ShaderLibraryPreparationState PathTraceReferencePass::ObserveLibrary(const ShaderLibraryCompileWorker* worker, bool packaged,
+    const std::filesystem::path& path, std::string& detail) const
+{
+    for(const CompiledLibrary& compiled : m_libraries)
+    {
+        if(compiled.path == path && !compiled.library.bytecode.empty())
+        {
+            return ShaderLibraryPreparationState::Ready;
+        }
+    }
+
+    const bool failed = std::any_of(m_failedLibraries.begin(), m_failedLibraries.end(), [&](const FailedLibrary& library)
+    {
+        return library.path == path;
+    });
+
+    if(failed || m_packagedLibraryFailures.contains(path))
+    {
+        detail = path.filename().string() + " failed";
+        return ShaderLibraryPreparationState::Failed;
+    }
+
+    if(packaged || !worker)
+    {
+        detail = path.filename().string() + (packaged ? " not admitted yet" : " compiled on first use (no worker)");
+        return ShaderLibraryPreparationState::Queued;
+    }
+
+    switch(worker->GetState(path))
+    {
+    case ShaderLibraryCompileState::Queued:
+        detail = path.filename().string() + " queued";
+        return ShaderLibraryPreparationState::Queued;
+    case ShaderLibraryCompileState::Compiling:
+        detail = path.filename().string() + " compiling";
+        return ShaderLibraryPreparationState::Compiling;
+    case ShaderLibraryCompileState::Completed:
+        detail = path.filename().string() + " compiled, not accepted yet";
+        return ShaderLibraryPreparationState::Compiling;
+    case ShaderLibraryCompileState::None:
+        break;
+    }
+
+    detail = path.filename().string() + " not requested yet";
+    return ShaderLibraryPreparationState::Queued;
+}
+
+ShaderLibraryPreparationState PathTraceReferencePass::ObservePipeline(const RayTracingPipelineWorker* worker, ID3D12Device5* device,
+    const PipelineRequirement& requirement, std::string& detail) const
+{
+    const RayTracingPipelineDescription& description = requirement.description;
+    const CompiledLibrary* library = nullptr;
+
+    for(const CompiledLibrary& compiled : m_libraries)
+    {
+        if(compiled.path == description.shaderPath)
+        {
+            library = &compiled;
+            break;
+        }
+    }
+
+    const std::string name = description.shaderPath.filename().string();
+
+    if(!library || library->library.bytecode.empty())
+    {
+        detail = name + " library not accepted";
+        return requirement.optional ? ShaderLibraryPreparationState::Ready : ShaderLibraryPreparationState::Queued;
+    }
+
+    const std::string key = PipelineDescriptionKey(description);
+
+    if(IsPipelineLive(key + "#" + std::to_string(library->revision)))
+    {
+        return ShaderLibraryPreparationState::Ready;
+    }
+
+    const auto prepared = m_preparedPipelines.find(key);
+
+    if(prepared != m_preparedPipelines.end() && prepared->second.revision == library->revision && prepared->second.device == device)
+    {
+        return ShaderLibraryPreparationState::Ready;
+    }
+
+    const auto failed = m_failedPipelines.find(key);
+
+    if(failed != m_failedPipelines.end() && failed->second == library->revision)
+    {
+        detail = name + " pipeline failed";
+        return requirement.optional ? ShaderLibraryPreparationState::Ready : ShaderLibraryPreparationState::Failed;
+    }
+
+    if(!worker)
+    {
+        detail = name + " pipeline created on first use (no worker)";
+        return ShaderLibraryPreparationState::PreparingPipelines;
+    }
+
+    switch(worker->GetState(key + "#" + std::to_string(library->revision)))
+    {
+    case RayTracingPipelineJobState::Queued:
+    case RayTracingPipelineJobState::Creating:
+        detail = name + " pipeline creating";
+        return ShaderLibraryPreparationState::PreparingPipelines;
+    case RayTracingPipelineJobState::Completed:
+        detail = name + " pipeline created, not adopted yet";
+        return ShaderLibraryPreparationState::PreparingPipelines;
+    case RayTracingPipelineJobState::None:
+        break;
+    }
+
+    detail = name + " pipeline not requested yet";
+    return ShaderLibraryPreparationState::PreparingPipelines;
+}
+
 ShaderLibraryPreparation PathTraceReferencePass::PreparePipelines(RayTracingPipelineWorker& worker, ID3D12Device5* device,
     const PathTraceLibraryNeeds& needs)
 {
@@ -1414,7 +1534,8 @@ const ShaderLibraryCompileResult* PathTraceReferencePass::AcquireLibrary(
         entry = &m_libraries.emplace_back(CompiledLibrary{path, {}});
     }
 
-    TransitionTiming::Scope er1Scope("Main-thread CompileLibrary " + path.generic_string());
+    TransitionTiming::Scope er1Scope("Main-thread CompileLibrary " + path.generic_string(), 0.1,
+        TransitionTiming::TransitionsAndStartup);
     if(!shaderLibrary.CompileLibrary(path, entry->library))
     {
         entry->library = {};

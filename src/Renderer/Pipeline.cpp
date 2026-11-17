@@ -1,4 +1,5 @@
 #include "Pipeline.h"
+#include "Debug/TransitionTiming.h"
 
 bool Pipeline::Initialize(
     ID3D12Device* device,
@@ -228,12 +229,21 @@ bool Pipeline::Initialize(
 
     pipelineDescription.SampleDesc.Count = 1;
 
-    result = device->CreateGraphicsPipelineState(&pipelineDescription, IID_PPV_ARGS(&m_pipelineState));
+    {
+        // M0c.5 diagnostics (ENGINE_STARTUP_TIMING): graphics pipeline creation on the startup timeline.
+        const TransitionTiming::Scope creationTiming("CreateGraphicsPipelineState", 0.1, TransitionTiming::Startup);
+        result = device->CreateGraphicsPipelineState(&pipelineDescription, IID_PPV_ARGS(&m_pipelineState));
+    }
 
     if (FAILED(result))
     {
         return false;
     }
+
+    // Debug name from the shaders (one string at creation): GPU-based validation messages then name the draw's pipeline.
+    const std::string pipelineName = "PSO " + (description.vertexShader ? description.vertexShader->GetName() : std::string()) +
+        " / " + (description.pixelShader ? description.pixelShader->GetName() : std::string());
+    m_pipelineState->SetName(std::wstring(pipelineName.begin(), pipelineName.end()).c_str());
 
     // A negative-determinant model matrix reverses screen-space winding, so its outward faces arrive
     // counterclockwise. The variant differs only in the front-face winding.
@@ -246,6 +256,9 @@ bool Pipeline::Initialize(
         {
             return false;
         }
+
+        const std::string mirroredName = pipelineName + " (mirrored)";
+        m_mirroredPipelineState->SetName(std::wstring(mirroredName.begin(), mirroredName.end()).c_str());
     }
 
     return true;

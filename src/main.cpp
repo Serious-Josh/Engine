@@ -597,15 +597,44 @@ int main(int argc, char** argv)
         catch(const std::exception& e) { Log::Error(std::string("Editor grid diagnostic: ")+e.what()); success=false; }
         engine->Shutdown(); return success ? 0 : 1;
     }
-    if(argc==2 && (std::string_view(argv[1])=="--verify-background-tasks" || std::string_view(argv[1])=="--background-tasks-demo" ||
-        std::string_view(argv[1])=="--verify-dxr-background-tasks" ||
-        std::string_view(argv[1])=="--verify-dxr-background-tasks-failure"))
+    // M0c.5 Stage 5.6: the DXR drivers take an optional project directory, whose manifest is opened as the startup project. Their checks need a
+    // starting configuration with nothing path-traced prepared (a Ray Tracing project); the default project's saved Path
+    // Tracing configuration is prepared during startup since M0c.4, which leaves those checks nothing to observe.
+    const bool dxrDriver = argc >= 2 && (std::string_view(argv[1])=="--verify-dxr-background-tasks" ||
+        std::string_view(argv[1])=="--verify-dxr-background-tasks-failure");
+    if((argc==2 && (std::string_view(argv[1])=="--verify-background-tasks" || std::string_view(argv[1])=="--background-tasks-demo" ||
+        dxrDriver)) || (argc==3 && dxrDriver))
     {
         const bool demo = std::string_view(argv[1]) == "--background-tasks-demo";
         const bool dxr = std::string_view(argv[1]) == "--verify-dxr-background-tasks";
         const bool dxrFailure = std::string_view(argv[1]) == "--verify-dxr-background-tasks-failure";
         auto engine = std::make_unique<Engine>();
         bool success = false;
+
+        if(argc == 3)
+        {
+            // The project's directory (EditorCommandLine refuses a project file beside an option); its manifest is opened.
+            std::filesystem::path manifest;
+
+            for(const auto& entry : std::filesystem::directory_iterator(std::filesystem::absolute(argv[2])))
+            {
+                if(entry.path().extension() == ".engineproj")
+                {
+                    manifest = entry.path();
+                }
+            }
+
+            std::string projectError;
+            auto project = ProjectLoader::Open(manifest, projectError);
+
+            if(!project)
+            {
+                Log::Error("Background tasks diagnostic: cannot open the project: " + projectError);
+                return 1;
+            }
+
+            engine->SetStartupProject(std::move(*project));
+        }
 
         try
         {
@@ -725,14 +754,41 @@ int main(int argc, char** argv)
     }
     if(argc >= 2 && std::string_view(argv[1]) == "--verify-scene-hierarchy-gpu")
     {
-        if(argc != 3)
+        if(argc != 3 && argc != 4)
         {
-            Log::Error("Usage: --verify-scene-hierarchy-gpu <schema-9-project-scene>");
+            Log::Error("Usage: --verify-scene-hierarchy-gpu <schema-9-project-scene> [<project directory>]");
             return 1;
         }
 
         auto engine = std::make_unique<Engine>();
         bool success = false;
+
+        // M0c.5 Stage 5.6: an optional startup project (by directory: EditorCommandLine refuses a project file beside an
+        // option). ER.1 Y's pending-work step needs a start whose saved configuration prepares nothing path-traced; the default
+        // project's saved Path Tracing configuration is prepared during startup since M0c.4.
+        if(argc == 4)
+        {
+            std::filesystem::path manifest;
+
+            for(const auto& entry : std::filesystem::directory_iterator(std::filesystem::absolute(argv[3])))
+            {
+                if(entry.path().extension() == ".engineproj")
+                {
+                    manifest = entry.path();
+                }
+            }
+
+            std::string projectError;
+            auto project = ProjectLoader::Open(manifest, projectError);
+
+            if(!project)
+            {
+                Log::Error("Scene hierarchy GPU diagnostic: cannot open the project: " + projectError);
+                return 1;
+            }
+
+            engine->SetStartupProject(std::move(*project));
+        }
 
         try
         {

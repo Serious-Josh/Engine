@@ -222,6 +222,17 @@ class PathTraceReferencePass
 
     std::vector<PipelineRequirement> GetRequiredPipelines(const PathTraceLibraryNeeds& needs) const;
 
+    // M0c.4 Stage 4.0 readiness probe: the state PrepareLibrary / PreparePipelines would report, observed without taking
+    // worker results, submitting, accepting or logging. A library is Ready once this pass accepted it; a pipeline once it
+    // is live or prepared for adoption at the current revision (a failed optional twin counts as Ready, as there).
+    // `detail` says what is pending or failed.
+    ShaderLibraryPreparationState ObserveLibrary(const ShaderLibraryCompileWorker* worker, bool packaged,
+        const std::filesystem::path& path, std::string& detail) const;
+    ShaderLibraryPreparationState ObservePipeline(const RayTracingPipelineWorker* worker, ID3D12Device5* device,
+        const PipelineRequirement& requirement, std::string& detail) const;
+    // The key a pipeline's description is prepared under (identifies one pipeline across configurations).
+    static std::string PipelineKey(const RayTracingPipelineDescription& description);
+
     // ER.1 Phase 4: polls the pipeline worker for every required pipeline, never blocking. Requires the configuration's
     // libraries accepted (PrepareLibrary Ready). Ready once each pipeline is live in its slot or prepared for adoption at
     // the current library revision; PreparingPipelines while any is queued or creating; Failed when a required one

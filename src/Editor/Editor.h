@@ -655,6 +655,15 @@ public:
 
     void SetViewportPublicationIdentity(std::uint64_t rendererLifetime, std::uint64_t bindingEpoch);
 
+    // M0c.4 Stage 4.3: shown over the viewport while the renderer prepares (or cannot prepare) the requested configuration;
+    // empty hides it.
+    // progress in [0, 1] draws a bar under the status; a negative value draws none.
+    void SetViewportPreparationStatus(std::string status, float progress)
+    {
+        m_viewportPreparationStatus = std::move(status);
+        m_viewportPreparationProgress = progress;
+    }
+
     // UPSCALING.3B Resolution Info overlay: the renderer's actual extents and presentation mode for this frame.
     struct ViewportResolutionInfo
     {
@@ -695,6 +704,8 @@ private:
     GameState m_gameState = GameState::Editing;
     bool m_canPlayGame = false;
     std::string m_gameMessage;
+    std::string m_viewportPreparationStatus;
+    float m_viewportPreparationProgress = -1.0f;
     std::optional<GameRequest> m_gameRequest;
     void DrawGamePlayControls(const EditorIcons& icons, float centerX);
 #if defined(ENGINE_HAS_VERIFICATION)

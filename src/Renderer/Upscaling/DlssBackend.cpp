@@ -116,6 +116,16 @@ void DlssBackend::Initialize(ID3D12Device*)
     Log::Info("DLSS Super Resolution: Not compiled. " + m_status.detail);
 }
 
+void DlssBackend::BeginInitialize(ID3D12Device* device)
+{
+    Initialize(device);
+}
+
+bool DlssBackend::CompleteInitialize(bool)
+{
+    return true;
+}
+
 void DlssBackend::Shutdown()
 {
 }
@@ -146,65 +156,118 @@ void DlssBackend::ReleaseFeature()
 
 #else
 
+std::string DlssBackend::ProjectId() const
+{
+    return projectIdForTesting ? *projectIdForTesting : std::string(ENGINE_DLSS_PROJECT_ID);
+}
+
+void DlssBackend::Adopt(InitializationOutcome outcome, ID3D12Device* device)
+{
+    m_status = std::move(outcome.status);
+    m_initialized = outcome.initialized;
+    m_device = device;
+    Log::Info(std::string("DLSS Super Resolution: ") + DlssAvailabilityName(m_status.availability) + ". " + m_status.detail +
+        " (" + std::to_string(m_status.initializeMilliseconds) + " ms)");
+}
+
 void DlssBackend::Initialize(ID3D12Device* device)
 {
+    if(m_pending.valid())
+    {
+        CompleteInitialize(true);
+        return;
+    }
+
     if(m_initialized)
     {
         return;
     }
 
-    const auto start = std::chrono::steady_clock::now();
-    m_status = {};
-    m_device = device;
+    Adopt(RunInitialize(device, ProjectId()), device);
+}
 
+void DlssBackend::BeginInitialize(ID3D12Device* device)
+{
+    if(m_initialized || m_pending.valid())
+    {
+        return;
+    }
+
+    m_pendingDevice = device;
+    // std::async with launch::async: a thread of its own; the future's destructor would also wait for it.
+    m_pending = std::async(std::launch::async, [device, projectId = ProjectId()]()
+    {
+        return RunInitialize(device, projectId);
+    });
+}
+
+bool DlssBackend::CompleteInitialize(bool wait)
+{
+    if(!m_pending.valid())
+    {
+        return true;
+    }
+
+    if(!wait && m_pending.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
+    {
+        return false;
+    }
+
+    Adopt(m_pending.get(), m_pendingDevice);
+    m_pendingDevice = nullptr;
+    return true;
+}
+
+DlssBackend::InitializationOutcome DlssBackend::RunInitialize(ID3D12Device* device, const std::string& projectId)
+{
+    InitializationOutcome outcome;
+    const auto start = std::chrono::steady_clock::now();
+
+    DlssStatus& status = outcome.status;
     const auto finish = [&](DlssAvailability availability, std::string detail)
     {
-        m_status.availability = availability;
-        m_status.detail = std::move(detail);
-        m_status.initializeMilliseconds =
+        status.availability = availability;
+        status.detail = std::move(detail);
+        status.initializeMilliseconds =
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
-        Log::Info(std::string("DLSS Super Resolution: ") + DlssAvailabilityName(availability) + ". " + m_status.detail);
+        return outcome;
     };
 
     // Stage 1: the runtime NGX would load. Without it NGX is not initialized at all.
     if(!device)
     {
-        finish(DlssAvailability::InitializationFailed, "No D3D12 device.");
-        return;
+        return finish(DlssAvailability::InitializationFailed, "No D3D12 device.");
     }
 
     if(!RuntimeBesideExecutable())
     {
-        finish(DlssAvailability::RuntimeMissing, "nvngx_dlss.dll is not next to the executable.");
-        return;
+        return finish(DlssAvailability::RuntimeMissing, "nvngx_dlss.dll is not next to the executable.");
     }
 
     // Stage 2: the NGX instance for this device. The engine version is Engine's CMake project version.
-    const std::string projectId = projectIdForTesting ? *projectIdForTesting : std::string(ENGINE_DLSS_PROJECT_ID);
+
     const std::filesystem::path dataDirectory = NgxDataDirectory();
     const NVSDK_NGX_Result initResult = NVSDK_NGX_D3D12_Init_with_ProjectID(projectId.c_str(),
         NVSDK_NGX_ENGINE_TYPE_CUSTOM, ENGINE_DLSS_ENGINE_VERSION, dataDirectory.c_str(), device);
-    m_status.initResult = static_cast<std::uint32_t>(initResult);
+    status.initResult = static_cast<std::uint32_t>(initResult);
 
     if(NVSDK_NGX_FAILED(initResult))
     {
-        finish(DlssAvailability::InitializationFailed, "NVSDK_NGX_D3D12_Init_with_ProjectID returned " + Hex(initResult) +
+        return finish(DlssAvailability::InitializationFailed, "NVSDK_NGX_D3D12_Init_with_ProjectID returned " + Hex(initResult) +
             "; see the NGX log in " + dataDirectory.string() + ".");
-        return;
     }
 
-    m_initialized = true;
+    outcome.initialized = true;
 
     // Stage 3: DLSS Super Resolution capability (DLSS Programming Guide 5.2.6).
     NVSDK_NGX_Parameter* parameters = nullptr;
     const NVSDK_NGX_Result capabilityResult = NVSDK_NGX_D3D12_GetCapabilityParameters(&parameters);
-    m_status.capabilityResult = static_cast<std::uint32_t>(capabilityResult);
+    status.capabilityResult = static_cast<std::uint32_t>(capabilityResult);
 
     if(NVSDK_NGX_FAILED(capabilityResult) || !parameters)
     {
-        finish(DlssAvailability::InitializationFailed, "NVSDK_NGX_D3D12_GetCapabilityParameters returned " +
+        return finish(DlssAvailability::InitializationFailed, "NVSDK_NGX_D3D12_GetCapabilityParameters returned " +
             Hex(capabilityResult) + " (an older driver may lack it).");
-        return;
     }
 
     int needsUpdatedDriver = 0;
@@ -222,40 +285,36 @@ void DlssBackend::Initialize(ID3D12Device* device)
         NVSDK_NGX_SUCCEED(parameters->Get(NVSDK_NGX_Parameter_SuperSampling_FeatureInitResult, &featureInitResult));
     NVSDK_NGX_D3D12_DestroyParameters(parameters);
 
-    m_status.needsUpdatedDriver = driverKnown && needsUpdatedDriver != 0;
-    m_status.minDriverVersionMajor = minDriverMajor;
-    m_status.minDriverVersionMinor = minDriverMinor;
-    m_status.superSamplingAvailable = availableKnown && available != 0;
-    m_status.featureInitResult = featureInitResult;
+    status.needsUpdatedDriver = driverKnown && needsUpdatedDriver != 0;
+    status.minDriverVersionMajor = minDriverMajor;
+    status.minDriverVersionMinor = minDriverMinor;
+    status.superSamplingAvailable = availableKnown && available != 0;
+    status.featureInitResult = featureInitResult;
 
-    if(m_status.needsUpdatedDriver)
+    if(status.needsUpdatedDriver)
     {
-        finish(DlssAvailability::DriverOutdated, "Requires driver " + std::to_string(minDriverMajor) + "." +
+        return finish(DlssAvailability::DriverOutdated, "Requires driver " + std::to_string(minDriverMajor) + "." +
             std::to_string(minDriverMinor) + " or newer.");
-        return;
     }
 
     if(!availableKnown)
     {
-        finish(DlssAvailability::InitializationFailed, "SuperSampling.Available capability query failed.");
-        return;
+        return finish(DlssAvailability::InitializationFailed, "SuperSampling.Available capability query failed.");
     }
 
-    if(!m_status.superSamplingAvailable)
+    if(!status.superSamplingAvailable)
     {
-        finish(DlssAvailability::Unsupported, "SuperSampling.Available is 0 on this GPU/driver.");
-        return;
+        return finish(DlssAvailability::Unsupported, "SuperSampling.Available is 0 on this GPU/driver.");
     }
 
     // A failed FeatureInitResult means NGX denies the feature for this application (Programming Guide 5.2.6).
     if(initResultKnown && NVSDK_NGX_FAILED(static_cast<NVSDK_NGX_Result>(featureInitResult)))
     {
-        finish(DlssAvailability::Unsupported, "SuperSampling.FeatureInitResult is " +
+        return finish(DlssAvailability::Unsupported, "SuperSampling.FeatureInitResult is " +
             Hex(static_cast<std::uint32_t>(featureInitResult)) + " (feature denied).");
-        return;
     }
 
-    finish(DlssAvailability::Available, "NGX initialized; Super Resolution capability available.");
+    return finish(DlssAvailability::Available, "NGX initialized; Super Resolution capability available.");
 }
 
 bool DlssBackend::EnsureParameters()
@@ -520,6 +579,9 @@ void DlssBackend::ReleaseFeature()
 
 void DlssBackend::Shutdown()
 {
+    // M0c.5 Stage 5.5: an initialization still running is waited for and adopted, so the NGX instance it creates is released
+    // below, before the device.
+    CompleteInitialize(true);
     ReleaseFeature();
 
     if(m_parameters)

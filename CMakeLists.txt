@@ -290,6 +290,10 @@ add_library(EngineCore OBJECT
     src/Core/BackgroundTasks.cpp
     src/Renderer/Renderer.cpp
     src/Renderer/LegacyLightingResources.cpp
+    src/Renderer/RendererReadiness.cpp
+    src/Renderer/RendererConfigurationPreparation.cpp
+    src/Renderer/ConfigurationPreparation.cpp
+    src/Renderer/Diagnostics/ConfigurationReadiness.cpp
     src/Renderer/RenderingConfiguration.cpp
     src/Renderer/RenderingConfigurationApply.cpp
     src/Renderer/Upscaling/DlssBackend.cpp

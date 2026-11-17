@@ -306,6 +306,16 @@ class RayTracingSceneResources
     const TopLevelAccelerationStructure& GetTopLevel() const;
 
     unsigned int GetInstanceDataDescriptorIndex() const;
+#ifndef NDEBUG
+    // M0c.4 diagnostics (Debug only, CPU only): the active membership's staged records, the ones uploaded for the GPU, against
+    // the material table this recording published. For every TLAS instance: its instance record exists, its vertex and index
+    // buffer descriptors are neither 0 nor the UINT_MAX sentinel, its slot buffers are the membership's own, and every slot
+    // material resolves to a published record whose texture indices are UINT_MAX (absent) or a real descriptor (never 0,
+    // which holds no 2D texture). Appends one line per finding (at most `limit`) and returns the number of findings. Repairs
+    // nothing.
+    std::size_t ValidateStagedRecords(const std::vector<GPUMaterial>& publishedMaterials, std::size_t limit,
+        std::string& report) const;
+#endif
     std::size_t GetInstanceCount() const;
     bool ValidateMaterialBindings(const Scene& scene) const;
 

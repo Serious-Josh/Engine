@@ -62,6 +62,12 @@ cbuffer PsrInPlaceConstants : register(b0)
     uint psr1RecordsIndex;
     // The geometry pass's texture mip bias (PsrRecoverMirror).
     float textureMipBias;
+    // The material tables, as PathTraceReference.hlsl's constants carry them: the missing-energy table (Texture2D<float2>),
+    // its average (Texture2D<float2>) and the cosine mapping. Every surface this pass finalizes evaluates them unless it is
+    // delta-specular (PathTraceFinalizeSurface's multiple-scatter estimate).
+    uint materialTableIndex;
+    uint materialAverageTableIndex;
+    uint materialTableCosineMapping;
 };
 
 RaytracingAccelerationStructure scene : register(t1);
@@ -341,13 +347,18 @@ float PathTraceResolveMetallic(GPUMaterial material, float2 uv, bool useARM, flo
     return metallic;
 }
 
-// PathTraceBuildSurface without the material tables (the replacement reads only B's material and deltaSpecular).
+// PathTraceReference.hlsl's PathTraceBuildSurface for the replacement's hits (B, and the terminal hit of a two-mirror
+// chain): the same surface fields, including the material tables, which PathTraceFinalizeSurface reads for every
+// non-delta surface. Keep the two in step.
 bool PathTraceBuildSurface(PathTracePayload payload, float3 rayDirection, out PathTraceSurface surface)
 {
     surface = (PathTraceSurface)0;
     surface.view = -rayDirection;
     surface.geometricNormal = payload.geometricNormal;
     surface.normal = payload.shadingNormal;
+    surface.materialTableIndex = materialTableIndex;
+    surface.materialAverageTableIndex = materialAverageTableIndex;
+    surface.materialTableCosineMapping = materialTableCosineMapping;
 
     // Surfaces are two-sided: face both normals towards the arriving ray.
     if(dot(surface.geometricNormal, surface.view) < 0.0f)
@@ -520,7 +531,8 @@ PixelOutput PSMain(VertexOutput input)
     StructuredBuffer<GPUMaterial> materials = ResourceDescriptorHeap[materialBufferIndex];
     PsrRecoveredMirror recovered;
     const bool recoveredMirror = PsrRecoverMirror(pixel, identity, mirrorCamera, objectTransforms, transformCount,
-        instanceDataIndex, materials, 0u, 0u, 0u, mirrorSampler, textureMipBias, false, recovered);
+        instanceDataIndex, materials, materialTableIndex, materialAverageTableIndex, materialTableCosineMapping, mirrorSampler,
+        textureMipBias, false, recovered);
 #if PSR_DIAGNOSTIC_HITS
     const uint3 surfaceHalves = f32tof16(recovered.gBuffer.surface.xyz);
     const uint3 geometricHalves = f32tof16(recovered.gBuffer.geometricNormal.xyz);

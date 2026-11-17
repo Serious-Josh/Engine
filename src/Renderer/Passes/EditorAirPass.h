@@ -157,6 +157,14 @@ public:
     // AIR.4D D3: releases only the split list and its arguments (recreated on the next hashed-point draw); the caller has drained
     // the GPU.
     void ReleaseSplitResources();
+    // M0c.6: the same buffers retired without a drain: moved to the retired list with `fence` (the last submission that may read
+    // them), destroyed by CollectRetiredDivergence once the GPU completes it, and recreated by the next hashed-point draw.
+    void RetireSplitResources(std::uint64_t fence);
+
+    bool HasSplitResources() const noexcept
+    {
+        return m_splitResourcesReady;
+    }
 
     // Returns the number of vectors recorded (0 when the field is invalid or the targets do not match). AIR.4D D3: hashed points are
     // drawn in two passes (EditorAirVectors.hlsli): the lean pass for every instance, and an indirect split pass for the instances

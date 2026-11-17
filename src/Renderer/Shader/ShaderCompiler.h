@@ -13,11 +13,20 @@ struct ShaderCompileDescription
     const wchar_t* path = nullptr;
     const wchar_t* entryPoint = nullptr;
     ShaderStage stage = ShaderStage::Vertex;
+    // M0c.5 Stage 5.4: runtime ShaderLibrary instances opt in to the persistent DXIL cache (DxilLibraryCache), keyed relative
+    // to this shader root. Offline cooking and direct compiler clients stay uncached.
+    const wchar_t* shaderRoot = nullptr;
+    bool usePersistentCache = false;
 };
 
 struct ShaderCompileResult
 {
     std::vector<char> bytecode;
+    bool cacheHit = false;
+    bool dxcInvoked = false;
+    bool cacheWritten = false;
+    double cacheReadMilliseconds = 0.0;
+    double dxcMilliseconds = 0.0;
 };
 
 // The DXIL library target. Every library keeps lib_6_6 unless ShaderCompiler::GetLibraryProfile maps its

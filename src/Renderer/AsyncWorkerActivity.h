@@ -6,7 +6,7 @@
 
 // A coherent, read-only view of one owned DXR worker, taken under the worker's own mutex. The counters are monotonic
 // for the worker object's lifetime, and every accepted job is in exactly one place:
-//     submitted == queued + (active ? 1 : 0) + finished + dropped
+//     submitted == queued + activeCount + finished + dropped
 //     finished  == untaken + taken + discarded
 // `finished` counts completions, successful or failed. `taken` counts results the owner moved out, which is when the
 // owner accepts or rejects them. `dropped` counts queued jobs removed at shutdown, `discarded` untaken results.
@@ -21,7 +21,10 @@ struct AsyncWorkerActivity
     std::size_t queued = 0;
     std::size_t untaken = 0;
     bool active = false;
-    // The key of the active job; empty when idle. Assigned into the caller's string, so polling reuses its capacity.
+    // M0c.5 Stage 5.4: jobs in flight (a worker may run several threads); active == (activeCount > 0).
+    std::size_t activeCount = 0;
+    // The key of an active job (the most recently started); empty when idle. Assigned into the caller's string, so polling
+    // reuses its capacity.
     std::string activeJob;
 
     bool IsBusy() const noexcept

@@ -6,6 +6,7 @@
 #include "Renderer/Pipeline.h"
 #include "Renderer/Shader/ShaderLibrary.h"
 
+#include <cstddef>
 #include <cstdint>
 
 // PSR.2 Stage 2 in-place replacement prototype (development only; PathTraceReferenceSettings::
@@ -41,8 +42,16 @@ public:
         std::uint32_t psr1RecordsIndex = 0;
         // The geometry pass's texture mip bias (CameraConstants::textureMipBias), for the mirror's recovered samples.
         float textureMipBias = 0.0f;
+        // The material tables (MaterialTableResources): the missing-energy and average Texture2D<float2> descriptors and the
+        // cosine mapping, as the path tracer's constants carry them. Required: the pass finalizes non-delta hits with them.
+        std::uint32_t materialTableIndex = UINT32_MAX;
+        std::uint32_t materialAverageTableIndex = UINT32_MAX;
+        std::uint32_t materialTableCosineMapping = 0;
+        // HLSL packs the three above into one 16-byte register; this keeps the C++ size a whole register.
+        std::uint32_t padding = 0;
     };
-    static_assert(sizeof(Constants) == 336);
+    static_assert(sizeof(Constants) == 352);
+    static_assert(offsetof(Constants, materialTableIndex) == 336);
 
     // PsrInPlaceReplace.hlsl's PsrObjectTransform: the geometry pass's ObjectConstants model and normal matrix, and the
     // current-to-previous world transform.

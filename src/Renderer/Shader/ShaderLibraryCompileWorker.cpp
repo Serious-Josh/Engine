@@ -3,6 +3,7 @@
 
 #include "Core/Log.h"
 
+#include <algorithm>
 #include <fstream>
 #include <iterator>
 #include <system_error>
@@ -37,11 +38,11 @@ ShaderLibraryCompileWorker::~ShaderLibraryCompileWorker()
     Shutdown();
 }
 
-bool ShaderLibraryCompileWorker::Start()
+bool ShaderLibraryCompileWorker::Start(unsigned int threadCount)
 {
     std::lock_guard lock(m_mutex);
 
-    if(m_thread.joinable())
+    if(!m_threads.empty())
     {
         return false;
     }
@@ -49,20 +50,23 @@ bool ShaderLibraryCompileWorker::Start()
     m_running = true;
     m_stopRequested = false;
 
-    try
+    for(unsigned int index = 0; index < (std::max)(threadCount, 1u); ++index)
     {
-        m_thread = std::thread([this]
+        try
         {
-            Run();
-        });
-    }
-    catch(const std::system_error&)
-    {
-        m_running = false;
-        return false;
+            m_threads.emplace_back([this]
+            {
+                Run();
+            });
+        }
+        catch(const std::system_error&)
+        {
+            break;
+        }
     }
 
-    return true;
+    m_running = !m_threads.empty();
+    return m_running;
 }
 
 void ShaderLibraryCompileWorker::Shutdown()
@@ -72,7 +76,7 @@ void ShaderLibraryCompileWorker::Shutdown()
     {
         std::lock_guard lock(m_mutex);
 
-        if(!m_thread.joinable())
+        if(m_threads.empty())
         {
             return;
         }
@@ -106,11 +110,16 @@ void ShaderLibraryCompileWorker::Shutdown()
         Log::Info("Waiting for an in-flight DXR shader library compilation to finish before shutdown.");
     }
 
-    // Never detached: the worker uses dxcompiler.dll and this object, so it must end before either goes.
-    m_thread.join();
+    // Never detached: the workers use dxcompiler.dll and this object, so they must end before either goes.
+    for(std::thread& thread : m_threads)
+    {
+        thread.join();
+    }
+
+    m_threads.clear();
 
     std::lock_guard lock(m_mutex);
-    // Only completed jobs remain after the join: queued ones were erased above and the one in flight has finished.
+    // Only completed jobs remain after the joins: queued ones were erased above and those in flight have finished.
     m_activity.discarded += m_jobs.size();
     m_activity.untaken = 0;
     m_jobs.clear();
@@ -215,6 +224,7 @@ void ShaderLibraryCompileWorker::Run()
         Job& job = m_jobs.at(libraryPath);
         job.state = ShaderLibraryCompileState::Compiling;
         --m_activity.queued;
+        ++m_activity.activeCount;
         m_activity.active = true;
         m_activity.activeJob = libraryPath.generic_string();
         const std::wstring sourcePath = job.request.sourcePath.wstring();
@@ -233,7 +243,7 @@ void ShaderLibraryCompileWorker::Run()
             description.profile = ShaderCompiler::GetLibraryProfile(libraryPath);
             description.includeDirectory = includeDirectory.empty() ? nullptr : includeDirectory.c_str();
             description.usePersistentCache = true;
-            TransitionTiming::Scope er1Scope("Worker CompileLibrary");
+            TransitionTiming::Scope er1Scope("Worker CompileLibrary", 0.1, TransitionTiming::TransitionsAndStartup);
             outcome.succeeded = compiler.CompileLibrary(description, outcome.library, outcome.diagnostics);
         }
         else
@@ -250,8 +260,25 @@ void ShaderLibraryCompileWorker::Run()
         // Shutdown never erases a compiling job, so the reference is still valid.
         job.outcome = std::move(outcome);
         job.state = ShaderLibraryCompileState::Completed;
-        m_activity.active = false;
-        m_activity.activeJob.clear();
+        --m_activity.activeCount;
+        m_activity.active = m_activity.activeCount > 0;
+
+        if(!m_activity.active)
+        {
+            m_activity.activeJob.clear();
+        }
+        else if(m_activity.activeJob == libraryPath.generic_string())
+        {
+            // Name another job still compiling.
+            for(const auto& [otherPath, other] : m_jobs)
+            {
+                if(other.state == ShaderLibraryCompileState::Compiling)
+                {
+                    m_activity.activeJob = otherPath.generic_string();
+                    break;
+                }
+            }
+        }
         ++m_activity.finished;
         ++m_activity.untaken;
     }

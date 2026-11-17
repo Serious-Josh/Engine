@@ -16,7 +16,10 @@ namespace
 {
     using Microsoft::WRL::ComPtr;
     using Digest = std::array<unsigned char, 32>;
-    constexpr std::uint32_t FormatVersion = 1;
+    // 2 (M0c.5 Stage 5.4): shader-root-relative identity and dependencies, no working directory; any target.
+    constexpr std::uint32_t FormatVersion = 2;
+    // Marks a path stored relative to the shader root (never the prefix of an absolute path).
+    constexpr std::string_view RootMarker = "<shader-root>/";
     constexpr std::size_t MaximumEntryBytes = 128 * 1024 * 1024;
     constexpr std::size_t MaximumBytecodeBytes = 64 * 1024 * 1024;
     constexpr std::size_t MaximumSourceBytes = 16 * 1024 * 1024;
@@ -74,16 +77,63 @@ namespace
         return bytes;
     }
 
-    std::string PathText(const std::filesystem::path& path)
-    {
-        const auto text = std::filesystem::absolute(path).u8string();
-        return std::string(text.begin(), text.end());
-    }
 
     std::string Utf8(const wchar_t* value)
     {
         const auto text = std::filesystem::path(value).u8string();
         return std::string(text.begin(), text.end());
+    }
+
+    std::string Utf8(const std::filesystem::path& path)
+    {
+        const auto text = path.u8string();
+        return std::string(text.begin(), text.end());
+    }
+
+    // A path inside the shader root as "<shader-root>/relative/path"; anything else (no root, or outside it) absolute.
+    std::string RootRelative(const std::filesystem::path& root, const std::filesystem::path& path)
+    {
+        const std::filesystem::path absolute = std::filesystem::absolute(path).lexically_normal();
+
+        if(!root.empty())
+        {
+            const std::filesystem::path relative = absolute.lexically_relative(root);
+
+            if(relative == ".")
+            {
+                return std::string(RootMarker);
+            }
+
+            if(!relative.empty() && !relative.is_absolute() && *relative.begin() != "..")
+            {
+                return std::string(RootMarker) + Utf8(std::filesystem::path(relative.generic_wstring()));
+            }
+        }
+
+        return Utf8(absolute);
+    }
+
+    std::filesystem::path ResolveStored(const std::filesystem::path& root, std::string_view text)
+    {
+        if(text.starts_with(RootMarker))
+        {
+            if(root.empty())
+            {
+                throw std::runtime_error("Root-relative cache path without a shader root");
+            }
+
+            const std::string_view relative = text.substr(RootMarker.size());
+            return (root / std::filesystem::path(std::u8string(relative.begin(), relative.end()))).lexically_normal();
+        }
+
+        return std::filesystem::path(std::u8string(text.begin(), text.end()));
+    }
+
+    // An argument naming a path inside the shader root is written relative to it; other arguments as they are.
+    std::string ArgumentIdentity(const std::filesystem::path& root, const wchar_t* argument)
+    {
+        const std::filesystem::path path(argument);
+        return path.is_absolute() ? RootRelative(root, path) : Utf8(path);
     }
 
     std::wstring Environment(const wchar_t* name)
@@ -105,6 +155,31 @@ namespace
 
         value.resize(copied);
         return value;
+    }
+
+    // ENGINE_DXIL_CACHE_DIR names the directory ("off" disables the cache); by default %LOCALAPPDATA%\Engine\ShaderCache\DXIL\v2.
+    std::filesystem::path CacheDirectory()
+    {
+        auto directory = Environment(L"ENGINE_DXIL_CACHE_DIR");
+
+        if(_wcsicmp(directory.c_str(), L"off") == 0)
+        {
+            return {};
+        }
+
+        if(directory.empty())
+        {
+            const auto local = Environment(L"LOCALAPPDATA");
+
+            if(local.empty())
+            {
+                return {};
+            }
+
+            directory = (std::filesystem::path(local) / L"Engine/ShaderCache/DXIL/v2").wstring();
+        }
+
+        return std::filesystem::absolute(directory);
     }
 
     void PutInteger(std::string& bytes, std::uint32_t value)
@@ -240,10 +315,9 @@ namespace
                 PutInteger(bytes, ENGINE_DXC_VERSION_MINOR);
                 PutInteger(bytes, ENGINE_DXC_COMMIT_COUNT);
                 PutText(bytes, ENGINE_DXC_COMMIT_HASH);
-                PutText(bytes, PathText(compilerPath));
+                // M0c.5 Stage 5.4: the files' contents identify them; their locations (each install's own copy) do not.
                 PutDigest(bytes, Hash(ReadFile(compilerPath, MaximumEntryBytes)));
                 const auto validatorPath = ModulePath(validator);
-                PutText(bytes, PathText(validatorPath));
                 PutDigest(bytes, Hash(ReadFile(validatorPath, MaximumEntryBytes)));
             }
             catch(const std::exception&)
@@ -297,53 +371,41 @@ namespace
 }
 
 DxilLibraryCache::DxilLibraryCache(const ShaderLibraryCompileDescription& description,
+    std::span<const wchar_t* const> arguments) noexcept :
+    DxilLibraryCache(description.usePersistentCache, description.path, description.includeDirectory,
+        description.profile == ShaderLibraryProfile::Library69 ? "lib_6_9" : "lib_6_6", arguments)
+{
+}
+
+DxilLibraryCache::DxilLibraryCache(bool enabled, const wchar_t* source, const wchar_t* shaderRoot, std::string_view target,
     std::span<const wchar_t* const> arguments) noexcept
 {
-    if(!description.usePersistentCache)
+    if(!enabled || !source || !shaderRoot || *shaderRoot == L'\0')
     {
         return;
     }
 
     try
     {
-        auto directory = Environment(L"ENGINE_DXIL_CACHE_DIR");
-
-        if(_wcsicmp(directory.c_str(), L"off") == 0)
-        {
-            return;
-        }
-
-        if(directory.empty())
-        {
-            const auto local = Environment(L"LOCALAPPDATA");
-
-            if(local.empty())
-            {
-                return;
-            }
-
-            directory = (std::filesystem::path(local) / L"Engine/ShaderCache/DXIL/v1").wstring();
-        }
-
+        const std::filesystem::path directory = CacheDirectory();
         const auto& compiler = Compiler();
 
-        if(compiler.bytes.empty())
+        if(directory.empty() || compiler.bytes.empty())
         {
             return;
         }
 
+        m_root = std::filesystem::absolute(shaderRoot).lexically_normal();
         PutInteger(m_identity, FormatVersion);
         PutText(m_identity, compiler.bytes);
-        PutInteger(m_identity, static_cast<std::uint32_t>(description.profile));
+        PutText(m_identity, target);
         PutInteger(m_identity, GetACP());
-        PutText(m_identity, PathText(description.path));
-        PutText(m_identity, PathText(std::filesystem::current_path()));
-        PutText(m_identity, description.includeDirectory ? PathText(description.includeDirectory) : "");
+        PutText(m_identity, RootRelative(m_root, source));
         PutInteger(m_identity, static_cast<std::uint32_t>(arguments.size()));
 
         for(const auto argument : arguments)
         {
-            PutText(m_identity, Utf8(argument));
+            PutText(m_identity, ArgumentIdentity(m_root, argument));
         }
 
         if(m_identity.size() > MaximumIdentityBytes)
@@ -351,7 +413,7 @@ DxilLibraryCache::DxilLibraryCache(const ShaderLibraryCompileDescription& descri
             return;
         }
 
-        m_file = std::filesystem::absolute(directory) / (Hex(Hash(m_identity)) + ".edxc");
+        m_file = directory / (Hex(Hash(m_identity)) + ".edxc");
     }
     catch(const std::exception&)
     {
@@ -359,7 +421,8 @@ DxilLibraryCache::DxilLibraryCache(const ShaderLibraryCompileDescription& descri
     }
 }
 
-bool DxilLibraryCache::Load(IDxcUtils* utils, ShaderLibraryCompileResult& output) const noexcept
+bool DxilLibraryCache::Load(IDxcUtils* utils, std::vector<char>& outputBytecode,
+    std::vector<ShaderSourceDependency>& outputDependencies) const noexcept
 {
     if(!Enabled())
     {
@@ -386,8 +449,7 @@ bool DxilLibraryCache::Load(IDxcUtils* utils, ShaderLibraryCompileResult& output
         Reader reader(payload);
 
         if(reader.Take(4) != "EDXC" || reader.Integer() != FormatVersion ||
-            reader.Text(MaximumIdentityBytes) != m_identity ||
-            reader.Integer() != static_cast<std::uint32_t>(output.profile))
+            reader.Text(MaximumIdentityBytes) != m_identity)
         {
             return false;
         }
@@ -412,7 +474,7 @@ bool DxilLibraryCache::Load(IDxcUtils* utils, ShaderLibraryCompileResult& output
             }
 
             ShaderSourceDependency dependency;
-            dependency.path = std::filesystem::path(std::u8string(pathText.begin(), pathText.end()));
+            dependency.path = ResolveStored(m_root, pathText);
             const auto exists = reader.Integer();
 
             if(!dependency.path.is_absolute() || exists > 1)
@@ -450,8 +512,8 @@ bool DxilLibraryCache::Load(IDxcUtils* utils, ShaderLibraryCompileResult& output
 
         // Commit only a complete, validated result. Existing freshness/revision gates receive the same
         // current source contents they would receive from RecordingIncludeHandler after a compilation.
-        output.bytecode.assign(bytecode.begin(), bytecode.end());
-        output.dependencies = std::move(dependencies);
+        outputBytecode.assign(bytecode.begin(), bytecode.end());
+        outputDependencies = std::move(dependencies);
         return true;
     }
     catch(const std::exception&)
@@ -460,7 +522,8 @@ bool DxilLibraryCache::Load(IDxcUtils* utils, ShaderLibraryCompileResult& output
     }
 }
 
-bool DxilLibraryCache::Store(const ShaderLibraryCompileResult& output) const noexcept
+bool DxilLibraryCache::Store(const std::vector<char>& outputBytecode,
+    const std::vector<ShaderSourceDependency>& outputDependencies) const noexcept
 {
     if(!Enabled())
     {
@@ -469,9 +532,9 @@ bool DxilLibraryCache::Store(const ShaderLibraryCompileResult& output) const noe
 
     try
     {
-        if(output.bytecode.empty() || output.bytecode.size() > MaximumBytecodeBytes ||
-            output.dependencies.empty() || output.dependencies.size() > MaximumDependencies ||
-            !ShaderCompiler::DependenciesUnchanged(output.dependencies))
+        if(outputBytecode.empty() || outputBytecode.size() > MaximumBytecodeBytes ||
+            outputDependencies.empty() || outputDependencies.size() > MaximumDependencies ||
+            !ShaderCompiler::DependenciesUnchanged(outputDependencies))
         {
             return false;
         }
@@ -479,12 +542,11 @@ bool DxilLibraryCache::Store(const ShaderLibraryCompileResult& output) const noe
         std::string bytes = "EDXC";
         PutInteger(bytes, FormatVersion);
         PutText(bytes, m_identity);
-        PutInteger(bytes, static_cast<std::uint32_t>(output.profile));
-        PutInteger(bytes, static_cast<std::uint32_t>(output.dependencies.size()));
+        PutInteger(bytes, static_cast<std::uint32_t>(outputDependencies.size()));
 
-        for(const auto& dependency : output.dependencies)
+        for(const auto& dependency : outputDependencies)
         {
-            const auto path = PathText(dependency.path);
+            const auto path = RootRelative(m_root, dependency.path);
 
             if(path.size() > MaximumPathBytes || dependency.contents.size() > MaximumSourceBytes ||
                 (!dependency.exists && !Absent(dependency.path)))
@@ -497,7 +559,7 @@ bool DxilLibraryCache::Store(const ShaderLibraryCompileResult& output) const noe
             PutDigest(bytes, Hash(dependency.contents));
         }
 
-        PutText(bytes, std::string_view(output.bytecode.data(), output.bytecode.size()));
+        PutText(bytes, std::string_view(outputBytecode.data(), outputBytecode.size()));
         PutDigest(bytes, Hash(bytes));
 
         if(bytes.size() > MaximumEntryBytes)
@@ -517,7 +579,8 @@ bool DxilLibraryCache::Store(const ShaderLibraryCompileResult& output) const noe
 
 void DxilLibraryCache::Report(const std::filesystem::path& path, const ShaderLibraryCompileResult& result)
 {
-    if(!TransitionTiming::Enabled())
+    // ER.1, and the M0c.5 startup timeline: cache hits and DXC times of each library.
+    if(!TransitionTiming::Enabled() && !TransitionTiming::StartupEnabled())
     {
         return;
     }

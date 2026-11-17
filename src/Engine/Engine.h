@@ -301,6 +301,11 @@ class Engine
     BackgroundTaskManager m_backgroundTasks;
     // BT.3: Editor frames only. The activity structs are reused so polling the workers does not allocate.
     DxrPreparationTasks m_dxrPreparationTasks;
+    // M0c.4 Stage 4.3: the pending rendering configuration as one Background Task (its DXR jobs are DxrPreparationTasks').
+    BackgroundTaskHandle m_configurationPreparationTask;
+    std::uint64_t m_configurationPreparationTaskGeneration = 0;
+    std::uint64_t m_configurationPreparationTaskSwitches = 0;
+    void UpdateConfigurationPreparationPresentation();
     AsyncWorkerActivity m_dxrLibraryActivity;
     AsyncWorkerActivity m_dxrPipelineActivity;
     PhysicsSimulationController m_physicsSimulation;
@@ -718,6 +723,14 @@ class Engine
     Input m_input;
 
     Renderer m_renderer;
+    // M0c.4 Stage 4.0 diagnostics: the configuration readiness trace, only when ENGINE_DIAG_READINESS is set (Editor and
+    // packaged). Observes after each Render; never changes rendering.
+    std::unique_ptr<ConfigurationReadinessTrace> m_readinessTrace;
+    // M0c.5 Stage 5.0 diagnostics (ENGINE_STARTUP_TIMING): one-shot startup milestones, logged by TransitionTiming.
+    bool m_startupBrowserFrameNoted = false;
+    bool m_startupSceneFrameNoted = false;
+    bool m_startupLitFrameNoted = false;
+    void NoteStartupFrame(Renderer::FrameRenderResult result);
 
 #if defined(ENGINE_HAS_VERIFICATION)
     friend class SceneDuplicationVerification;

@@ -7,6 +7,7 @@
 #include <stdexcept>
 #include <cstring>
 #include <array>
+#include <optional>
 #include <cstdint>
 
 bool ShaderLibrary::Initialize(const std::filesystem::path& shaderRoot)
@@ -35,6 +36,22 @@ void ShaderLibrary::Shutdown()
     m_compiler.Shutdown();
 }
 
+std::size_t ShaderLibrary::AdoptShaders(ShaderLibrary& other)
+{
+    std::size_t adopted = 0;
+
+    for(auto& [key, shader] : other.m_shaders)
+    {
+        if(shader && m_shaders.try_emplace(key, std::move(shader)).second)
+        {
+            ++adopted;
+        }
+    }
+
+    other.m_shaders.clear();
+    return adopted;
+}
+
 Shader* ShaderLibrary::Load(const ShaderDescription& description)
 {
     if (!description.path || !description.entryPoint)
@@ -59,13 +76,19 @@ Shader* ShaderLibrary::Load(const ShaderDescription& description)
 
     const std::wstring shaderPathString = shaderPath.wstring();
     const std::wstring entryPointString = std::filesystem::path(description.entryPoint).wstring();
+    const std::wstring shaderRootString = m_shaderRoot.wstring();
 
     ShaderCompileDescription compileDescription{};
     compileDescription.path = shaderPathString.c_str();
     compileDescription.entryPoint = entryPointString.c_str();
     compileDescription.stage = description.stage;
+    // M0c.5 Stage 5.4: every runtime library (the render thread's and the workers' private ones) uses the persistent cache.
+    compileDescription.shaderRoot = shaderRootString.c_str();
+    compileDescription.usePersistentCache = true;
 
-    TransitionTiming::Scope er1Scope("Main-thread shader Compile " + key.path + ":" + key.entryPoint);
+    // M0c.5 Stage 5.4: the scope is named by what the load did (a cache hit or DXC), and runs on whichever thread loads.
+    std::optional<TransitionTiming::Scope> er1Scope;
+    er1Scope.emplace("Shader load " + key.path + ":" + key.entryPoint, 0.1, TransitionTiming::TransitionsAndStartup);
     ShaderCompileResult compileResult{};
 
     if (m_packaged)
@@ -78,6 +101,19 @@ Shader* ShaderLibrary::Load(const ShaderDescription& description)
     {
         return nullptr;
     }
+    else
+    {
+        if(compileResult.cacheHit)
+        {
+            ++m_cacheHits;
+        }
+        else
+        {
+            ++m_compiles;
+        }
+
+        er1Scope->AppendName(compileResult.cacheHit ? " (cache hit)" : " (DXC)");
+    }
 
     std::unique_ptr<Shader> shader = std::make_unique<Shader>();
 
@@ -86,6 +122,7 @@ Shader* ShaderLibrary::Load(const ShaderDescription& description)
         return nullptr;
     }
 
+    shader->SetName(key.path + ":" + key.entryPoint);
     Shader* shaderPointer = shader.get();
 
     m_shaders.emplace(std::move(key), std::move(shader));

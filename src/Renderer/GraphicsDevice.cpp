@@ -5,6 +5,8 @@
 #include <dxgi1_6.h>
 #include <d3d12.h>
 #include <d3d12sdklayers.h>
+#include <climits>
+#include <cstdlib>
 #include <filesystem>
 #include <format>
 #include <string>
@@ -141,6 +143,69 @@ namespace
 }
 
 #ifdef _DEBUG
+namespace
+{
+    // DRED operation names for the operations Engine records; anything else is reported by number.
+    std::string BreadcrumbOperationName(D3D12_AUTO_BREADCRUMB_OP operation)
+    {
+        switch(operation)
+        {
+        case D3D12_AUTO_BREADCRUMB_OP_SETMARKER:
+            return "SetMarker";
+        case D3D12_AUTO_BREADCRUMB_OP_BEGINEVENT:
+            return "BeginEvent";
+        case D3D12_AUTO_BREADCRUMB_OP_ENDEVENT:
+            return "EndEvent";
+        case D3D12_AUTO_BREADCRUMB_OP_DRAWINSTANCED:
+            return "DrawInstanced";
+        case D3D12_AUTO_BREADCRUMB_OP_DRAWINDEXEDINSTANCED:
+            return "DrawIndexedInstanced";
+        case D3D12_AUTO_BREADCRUMB_OP_EXECUTEINDIRECT:
+            return "ExecuteIndirect";
+        case D3D12_AUTO_BREADCRUMB_OP_DISPATCH:
+            return "Dispatch";
+        case D3D12_AUTO_BREADCRUMB_OP_COPYBUFFERREGION:
+            return "CopyBufferRegion";
+        case D3D12_AUTO_BREADCRUMB_OP_COPYTEXTUREREGION:
+            return "CopyTextureRegion";
+        case D3D12_AUTO_BREADCRUMB_OP_COPYRESOURCE:
+            return "CopyResource";
+        case D3D12_AUTO_BREADCRUMB_OP_CLEARRENDERTARGETVIEW:
+            return "ClearRenderTargetView";
+        case D3D12_AUTO_BREADCRUMB_OP_CLEARUNORDEREDACCESSVIEW:
+            return "ClearUnorderedAccessView";
+        case D3D12_AUTO_BREADCRUMB_OP_CLEARDEPTHSTENCILVIEW:
+            return "ClearDepthStencilView";
+        case D3D12_AUTO_BREADCRUMB_OP_RESOURCEBARRIER:
+            return "ResourceBarrier";
+        case D3D12_AUTO_BREADCRUMB_OP_RESOLVEQUERYDATA:
+            return "ResolveQueryData";
+        case D3D12_AUTO_BREADCRUMB_OP_BUILDRAYTRACINGACCELERATIONSTRUCTURE:
+            return "BuildRaytracingAccelerationStructure";
+        case D3D12_AUTO_BREADCRUMB_OP_EMITRAYTRACINGACCELERATIONSTRUCTUREPOSTBUILDINFO:
+            return "EmitRaytracingAccelerationStructurePostbuildInfo";
+        case D3D12_AUTO_BREADCRUMB_OP_COPYRAYTRACINGACCELERATIONSTRUCTURE:
+            return "CopyRaytracingAccelerationStructure";
+        case D3D12_AUTO_BREADCRUMB_OP_DISPATCHRAYS:
+            return "DispatchRays";
+        case D3D12_AUTO_BREADCRUMB_OP_SETPIPELINESTATE1:
+            return "SetPipelineState1";
+        case D3D12_AUTO_BREADCRUMB_OP_BEGIN_COMMAND_LIST:
+            return "BeginCommandList";
+        default:
+            return "op " + std::to_string(static_cast<unsigned int>(operation));
+        }
+    }
+
+    // ENGINE_DIAG_DRED_FULL_HISTORY=<text>: command lists whose debug name contains <text> report their whole retained
+    // history (a controlled-removal capture maps a hung operation index of another run onto passes this way).
+    bool ReportsFullBreadcrumbHistory(const std::string& commandListName)
+    {
+        const char* filter = std::getenv("ENGINE_DIAG_DRED_FULL_HISTORY");
+        return filter && *filter != '\0' && commandListName.find(filter) != std::string::npos;
+    }
+}
+
 void GraphicsDevice::ReportDeviceRemovedData(
     ID3D12Device* device,
     const char* operationContext)
@@ -223,12 +288,13 @@ void GraphicsDevice::ReportDeviceRemovedData(
             Log::Info("DRED breadcrumb list is empty.");
         }
 
-        for (unsigned int nodeIndex = 0; node && nodeIndex < 64; ++nodeIndex, node = node->pNext)
+        // GPU-based validation adds a node per internal command list; 512 keeps the application's lists in the report.
+        for (unsigned int nodeIndex = 0; node && nodeIndex < 512; ++nodeIndex, node = node->pNext)
         {
+            const std::string listName = name(node->pCommandListDebugNameA, node->pCommandListDebugNameW);
             Log::Info(std::format("DRED queue {} ({:p}), list {} ({:p}); breadcrumb count: {}",
                                   name(node->pCommandQueueDebugNameA, node->pCommandQueueDebugNameW),
-                                  static_cast<const void*>(node->pCommandQueue),
-                                  name(node->pCommandListDebugNameA, node->pCommandListDebugNameW),
+                                  static_cast<const void*>(node->pCommandQueue), listName,
                                   static_cast<const void*>(node->pCommandList), node->BreadcrumbCount));
 
             if (!node->pLastBreadcrumbValue)
@@ -256,10 +322,17 @@ void GraphicsDevice::ReportDeviceRemovedData(
             // Only the last 65536 recorded operations remain in the history ring.
             const UINT oldest = node->BreadcrumbCount > 65536 ? node->BreadcrumbCount - 65536 : 0;
 
-            const UINT recent = completed > 8 ? completed - 8 : 0;
-            const UINT start = recent > oldest ? recent : oldest;
+            // M0c.4: an incomplete list (the one the GPU stopped in) reports a wider window, 48 completed operations
+            // before the first unconfirmed one, so the pass it belongs to can be recognized; complete lists keep the
+            // short window. A list selected by ENGINE_DIAG_DRED_FULL_HISTORY reports everything retained.
+            const bool incomplete = completed < node->BreadcrumbCount;
+            const bool fullHistory = ReportsFullBreadcrumbHistory(listName);
+            const UINT before = incomplete ? 48u : 8u;
+            const UINT after = incomplete ? 16u : 8u;
+            const UINT recent = completed > before ? completed - before : 0;
             const UINT remaining = node->BreadcrumbCount - completed;
-            const UINT end = completed + (remaining < 8 ? remaining : 8);
+            const UINT start = fullHistory ? oldest : (recent > oldest ? recent : oldest);
+            const UINT end = fullHistory ? node->BreadcrumbCount : completed + (remaining < after ? remaining : after);
 
             if (start >= end)
             {
@@ -268,15 +341,62 @@ void GraphicsDevice::ReportDeviceRemovedData(
 
             for (UINT operation = start; operation < end; ++operation)
             {
-                Log::Info(std::format("DRED operation {}: type {} ({})", operation,
-                                      static_cast<unsigned int>(node->pCommandHistory[operation % 65536]),
+                const D3D12_AUTO_BREADCRUMB_OP type = node->pCommandHistory[operation % 65536];
+                Log::Info(std::format("DRED operation {}: {} (type {}, {})", operation, BreadcrumbOperationName(type),
+                                      static_cast<unsigned int>(type),
                                       operation < completed ? "completed" : "not confirmed completed"));
+            }
+
+            // Marker and event strings recorded with their operation index (SetMarker/BeginEvent with a wide string).
+            for (UINT context = 0; context < node->BreadcrumbContextsCount && node->pBreadcrumbContexts; ++context)
+            {
+                const D3D12_DRED_BREADCRUMB_CONTEXT& entry = node->pBreadcrumbContexts[context];
+                const bool shown = fullHistory || (entry.BreadcrumbIndex >= start && entry.BreadcrumbIndex < end);
+
+                if (shown)
+                {
+                    Log::Info(std::format("DRED context at operation {}: {}", entry.BreadcrumbIndex,
+                                          name(nullptr, entry.pContextString)));
+                }
+            }
+
+            // The stage the first unconfirmed operation belongs to: the last marker recorded before it, wherever it lies
+            // (ENGINE_DIAG_DRED_MARKERS), and how many markers precede it, so its index converts to an unmarked run's.
+            if (incomplete)
+            {
+                UINT markers = 0;
+                UINT lastMarker = UINT_MAX;
+
+                for (UINT operation = oldest; operation <= completed; ++operation)
+                {
+                    const D3D12_AUTO_BREADCRUMB_OP type = node->pCommandHistory[operation % 65536];
+
+                    if (type == D3D12_AUTO_BREADCRUMB_OP_SETMARKER || type == D3D12_AUTO_BREADCRUMB_OP_BEGINEVENT)
+                    {
+                        ++markers;
+                        lastMarker = operation;
+                    }
+                }
+
+                std::string stage = "<no marker>";
+
+                for (UINT context = 0; context < node->BreadcrumbContextsCount && node->pBreadcrumbContexts; ++context)
+                {
+                    if (node->pBreadcrumbContexts[context].BreadcrumbIndex == lastMarker)
+                    {
+                        stage = name(nullptr, node->pBreadcrumbContexts[context].pContextString);
+                    }
+                }
+
+                Log::Info(std::format("DRED first unconfirmed operation {}: {} markers precede it; last marker at operation "
+                                      "{}: {}", completed, markers,
+                                      lastMarker == UINT_MAX ? std::string("none") : std::to_string(lastMarker), stage));
             }
         }
 
         if (node)
         {
-            Log::Info("DRED breadcrumb list truncated at 64 nodes.");
+            Log::Info("DRED breadcrumb list truncated at 512 nodes.");
         }
     }
 

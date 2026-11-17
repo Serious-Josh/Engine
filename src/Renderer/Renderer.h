@@ -41,6 +41,8 @@
 
 #include "Debug/DebugUI.h"
 #include "RenderingConfiguration.h"
+#include "ConfigurationPreparation.h"
+#include "Diagnostics/ConfigurationReadiness.h"
 
 #include "Math/Vector3.h"
 #include "Math/Matrix4.h"
@@ -319,9 +321,33 @@ class Renderer
         bool deferEditorResources = false,
         // Packaged runtime only: the archive's material table bootstrap entry (empty for archives that predate
         // it). Development loads assets/MaterialTables instead. Absence never fails initialization.
-        std::span<const std::byte> packagedMaterialTables = {});
+        std::span<const std::byte> packagedMaterialTables = {}, const RenderingConfiguration* initialConfiguration = nullptr,
+        // M0c.5 Stage 5.1: the Project Browser initializes only the core (device, shader library, heaps, ImGui, swap
+        // chain); EnsureSceneRenderer initializes the rest when a project is selected.
+        bool deferSceneRenderer = false,
+        // M0c.5 Stages 5.2/5.3: a Project Browser workflow start (a Browser selection or a command-line project). Its renderer
+        // bootstraps with the 16x8 neutral environment instead of the first .hdr, and creates AIR, its views, the mist pass and
+        // the Legacy passes on first use. Packaged, developer and verification starts create them eagerly, as before.
+        bool projectWorkflowStart = false);
+    // M0c.5 Stage 5.1: initializes the scene renderer deferred by Initialize, between frames. Idempotent once it
+    // succeeds; a failure is final (Shutdown releases the partial group). Required before any scene, configuration
+    // preparation or Editor resources.
+    bool EnsureSceneRenderer();
+    bool IsSceneRendererInitialized() const noexcept { return m_sceneRendererState == SceneRendererState::Initialized; }
+    // M0c.5 Stage 5.1: initializes NGX once, on the main thread between frames, when DLSS is requested. Called at project
+    // initialization (before the first frame sizes the scene) and by SetRenderScale. Failure is reported, never fatal.
+    void EnsureDlssBackend(bool dlssRequested);
+    // M0c.5 Stage 5.5: starts NGX's initialization on its own thread (DlssBackend::BeginInitialize) when DLSS is requested and
+    // NGX is neither initialized nor initializing. EnsureDlssBackend (the first frame that sizes the scene for DLSS) and
+    // configuration preparation (PollDlssBackend) complete it; nothing calls NGX meanwhile.
+    void BeginDlssBackend(bool dlssRequested);
+    // Adopts a finished initialization without waiting. True when none is pending.
+    bool PollDlssBackend();
+    // M0c.5 Stage 5.5: between InitializeProject's phases, polls the pending configuration's preparation as a frame would
+    // (accepts finished libraries, queues their DXR pipelines), without presenting or switching anything.
+    void AdvanceConfigurationPreparation();
     // First project selection only for interactive startup; legacy initialization calls this
-    // eagerly. Idempotent, with no project asset requests or scene recording.
+    // eagerly. Idempotent, with no project asset requests or scene recording. Requires the scene renderer.
     bool InitializeEditorResources();
     using FrameRenderResult = RendererDiagnostics::FrameRenderResult;
 
@@ -524,6 +550,42 @@ class Renderer
     const LightingModeTransitionStatus& GetLightingModeTransitionStatus() const noexcept
     {
         return m_lightingModeTransition.GetStatus();
+    }
+
+    // M0c.4 Stage 4.0 (diagnostics, RendererReadiness.cpp): whether the complete requested configuration is ready at this
+    // output extent, observed without creating, compiling, allocating, waiting or changing any state; and what the last
+    // recorded frame rendered.
+    ConfigurationReadiness EvaluateConfigurationReadiness(const RenderingConfiguration& configuration, unsigned int outputWidth,
+        unsigned int outputHeight) const;
+    RenderedConfiguration GetRenderedConfiguration() const;
+
+    // M0c.4 Stage 4.1/4.2 (RendererConfigurationPreparation.cpp): the configuration to present this frame. Called once per
+    // frame before the render scale is applied. While the request's identity (ConfigurationIdentity) differs from the
+    // presented one, the presented configuration is returned unchanged and the request is prepared in the background;
+    // once everything it needs is ready, the request is returned and becomes presented. Never blocks.
+    const RenderingConfiguration& SelectPresentedConfiguration(const RenderingConfiguration& requested);
+    // A later request in the same frame (the Editor's settings window draws after the scale is applied): returned when its
+    // identity is the one selected this frame (its per-frame values apply now), otherwise the selected configuration
+    // (the new identity is prepared from the next frame on).
+    RenderingConfiguration PresentConfiguration(const RenderingConfiguration& latest) const;
+    // DLSS eligibility of the presented configuration: Path Tracing with a denoiser, prepared and switching or active; while
+    // the first request prepares at startup, the request's own eligibility (its render extent is set up once).
+    bool IsPresentedDlssEligible() const;
+    // Stage 4.4: starts preparing a configuration as soon as it is known, before the first frame (packaged preflight, a
+    // command-line project, a Project Browser selection). Equivalent to the first frame's SelectPresentedConfiguration.
+    void BeginConfigurationPreparation(const RenderingConfiguration& requested);
+    // Stage 4.3: the first request is still preparing: frames record no lighting (no Ray Tracing, no path tracing) and
+    // present the preparation screen; uploads, residency, acceleration structures and AIR continue.
+    bool IsLightingSuppressed() const noexcept;
+    const ConfigurationPreparationStatus& GetConfigurationPreparationStatus() const noexcept
+    {
+        return m_configurationPreparation.GetStatus();
+    }
+
+    // Whether any configuration has been selected yet (BeginConfigurationPreparation or a frame).
+    bool HasPresentedConfiguration() const noexcept
+    {
+        return m_configurationPreparation.HasPresented();
     }
 
     // BT.3, read-only: the DXR workers' activity (zero when a worker does not exist), and what the last Render's
@@ -1717,6 +1779,62 @@ class Renderer
     bool m_hasPreviousRenderExecute = false;
     bool InitializeDevice();
     bool InitializeSwapChain(void* windowHandle);
+    // M0c.5 Stage 5.1: everything the Project Browser does not use: scene passes, Editor overlays and AIR views, AIR,
+    // mist, LUTs, material tables, Legacy passes, the bootstrap environment and the scene-extent targets.
+    bool InitializeSceneRenderer(const HDRImageData* initialEnvironment, std::string environmentIdentity,
+        std::span<const std::byte> packagedMaterialTables);
+
+    enum class SceneRendererState
+    {
+        NotInitialized,
+        Initialized,
+        Failed
+    };
+
+    SceneRendererState m_sceneRendererState = SceneRendererState::NotInitialized;
+    bool m_projectWorkflowStart = false;
+
+    // M0c.5 Stage 5.3: the Legacy passes, created at the first Legacy frame of a project workflow start (otherwise eagerly).
+    bool InitializeLegacyLighting();
+    bool m_legacyLightingInitialized = false;
+    bool m_legacyLightingFailed = false;
+
+    // M0c.5 Stage 5.3: a project workflow start's AIR field, AIR views and mist pass (haze included), prepared when a frame first
+    // requests any of them. The pipeline worker compiles their shaders into a private library (DXC only, plus throwaway pipelines that warm
+    // the driver cache); the render thread adopts the shaders and creates the real objects between frames. Until Ready, frames
+    // withhold those requests, and before the first lit frame they stay unlit (no partial lighting). Failure is final for the
+    // session: AIR, mist and haze stay off, as an uninitialized field already behaves.
+    enum class VolumetricState
+    {
+        NotRequested,
+        Preparing,
+        Ready,
+        Failed
+    };
+
+    static bool RequestsVolumetrics(const RendererOptions& options) noexcept;
+    bool PrepareVolumetrics();
+    bool InitializeVolumetrics();
+    VolumetricState m_volumetricState = VolumetricState::NotRequested;
+    std::shared_ptr<ShaderLibrary> m_volumetricShaders;
+    // M0c.5 Stage 5.5: the volumetric job's own worker, started by the first request (absent until then).
+    std::unique_ptr<RayTracingPipelineWorker> m_volumetricWorker;
+    // M0c.6: when a frame last requested enabled AIR (or the field held no storage); after ModeResourceGracePeriod without one the
+    // storage is retired (RecordRenderFrame).
+    std::chrono::steady_clock::time_point m_airLastRequested = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point m_airVectorsLastRequested = std::chrono::steady_clock::now();
+    std::uint64_t m_airStorageRetirements = 0;
+
+public:
+    std::uint64_t GetAirStorageRetirements() const noexcept
+    {
+        return m_airStorageRetirements;
+    }
+
+private:
+    std::chrono::steady_clock::time_point m_volumetricRequested;
+    bool m_litFramePresented = false;
+    bool m_volumetricHoldThisFrame = false;
 
     // SER S6B: chooses the path tracer's DXR library variant once, before any library is prepared
     // (SelectPathTraceLibraryVariant: ENGINE_PATH_TRACE_LIBRARIES and the device capabilities), and logs it.
@@ -1886,6 +2004,47 @@ class Renderer
     // reservoirs and the previous-frame G-buffer copy. Their pass objects stay Renderer members; this record owns their
     // lifecycle.
     ModeResourceResidency m_pathTracingResidency;
+    // M0c.4 Stage 4.1/4.2: the presented and pending configurations.
+    ConfigurationPreparation m_configurationPreparation;
+    // The preparation sets found ready for request generation m_preparedStepsGeneration (bits of PrepareConfiguration).
+    std::uint32_t m_preparedSteps = 0;
+    std::uint64_t m_preparedStepsGeneration = 0;
+#ifndef NDEBUG
+    // Verification only (M0c.4): a pending path-traced configuration stays Preparing (a slow compile) or fails to prepare.
+    bool m_configurationPreparationHoldForTesting = false;
+    bool m_configurationPreparationFailureForTesting = false;
+    // M0c.4 diagnostics: frames whose PSR replacement records were validated, and the findings (ValidatePsrFrameRecords).
+    std::uint64_t m_psrRecordCheckFrames = 0;
+    std::uint64_t m_psrRecordFindings = 0;
+    void ValidatePsrFrameRecords();
+    bool IsValidMaterialTableDescriptor(Texture& table) const;
+#endif
+    // M0c.4 diagnostics: a named DRED marker in the frame recording (Debug, ENGINE_DIAG_DRED_MARKERS only; no-op otherwise).
+    void MarkDredStage(ID3D12GraphicsCommandList* commandList, const wchar_t* stage) const;
+    // One non-blocking preparation step for the pending identity: the same preparation functions, with the same
+    // arguments, that the gates evaluate in the frame that switches to it, so that frame passes every gate.
+    PreparationStep PrepareConfiguration(const ConfigurationIdentity& identity, std::string& detail);
+    float EstimatePreparationProgress(const ConfigurationIdentity& identity) const;
+    // Stage 4.4: releases the Legacy textures Initialize created when no recording ever used them and the starting
+    // configuration does not render Legacy (they are created again by the first Legacy frame, as after retirement).
+    void ReleaseUnusedLegacyTextures();
+    void RecordPreparationScreen(ID3D12GraphicsCommandList* commandList, D3D12_CPU_DESCRIPTOR_HANDLE output, unsigned int width,
+        unsigned int height, bool drawProgress) const;
+    // Stage 4.3/4.5: set by unlit frames, so the first lit one snaps the auto exposure instead of adapting from black.
+    bool m_exposureSnapAfterUnlitFrames = false;
+    // Whether the last recorded frame lit anything (GetRenderedConfiguration).
+    bool m_litLastFrame = true;
+    // Stage 4.3: armed by SelectPresentedConfiguration while the first request prepares, consumed by the next recording.
+    bool m_lightingSuppressedForNextFrame = false;
+    const RenderingConfiguration& Presented();
+    // Whether the pending configuration (if any) needs these resources, so retirement keeps them for its switch.
+    bool IsPendingConfigurationMode(bool pathTraced) const;
+    // The group as its NrdRetentionGroup value (that enum is declared further down this class).
+    bool IsPendingConfigurationNrdGroup(int group) const;
+    // M0c.4 Stage 4.0: one set of DXR requirements observed through the const paths (libraries first; pipelines once every
+    // library is accepted, as PrepareDxrLibraries orders them).
+    DependencyReadiness ObserveDxrRequirements(const std::vector<PathTraceLibraryRequirement>& libraries,
+        const std::vector<PathTraceReferencePass::PipelineRequirement>& pipelines) const;
     // Retires the inactive Path Tracing resources. Called on recordings that do not render a path-traced mode.
     void UpdatePathTracingRetention();
     // Releases them (the caller has established that no submitted or recorded work references them).

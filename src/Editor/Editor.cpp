@@ -792,6 +792,29 @@ void Editor::DrawSceneViewport(
                 position,
                 ImVec2(position.x + size.x, position.y + size.y));
 
+            // M0c.4 Stage 4.3: the status centred over the viewport, with the preparation progress bar below it.
+            if(!m_viewportPreparationStatus.empty())
+            {
+                ImDrawList* draw = ImGui::GetWindowDrawList();
+                const ImVec2 textSize = ImGui::CalcTextSize(m_viewportPreparationStatus.c_str());
+                const float barTop = position.y + size.y * 0.6f;
+                const ImVec2 textPosition(position.x + (size.x - textSize.x) * 0.5f,
+                    barTop - textSize.y - ImGui::GetTextLineHeight());
+                draw->AddText(textPosition, IM_COL32(200, 210, 225, 255), m_viewportPreparationStatus.c_str());
+
+                if(m_viewportPreparationProgress >= 0.0f)
+                {
+                    const float barWidth = size.x * 0.4f;
+                    const float barHeight = (std::max)(4.0f, size.y / 120.0f);
+                    const float barLeft = position.x + (size.x - barWidth) * 0.5f;
+                    const float filled = barWidth * (std::min)(m_viewportPreparationProgress, 1.0f);
+                    draw->AddRectFilled(ImVec2(barLeft, barTop), ImVec2(barLeft + barWidth, barTop + barHeight),
+                        IM_COL32(31, 33, 38, 255));
+                    draw->AddRectFilled(ImVec2(barLeft, barTop), ImVec2(barLeft + filled, barTop + barHeight),
+                        IM_COL32(115, 148, 199, 255));
+                }
+            }
+
             if(!m_meshCreationStatus.empty())
             {
                 ImGui::GetWindowDrawList()->AddText(ImVec2(position.x + 12.0f, position.y + 12.0f),

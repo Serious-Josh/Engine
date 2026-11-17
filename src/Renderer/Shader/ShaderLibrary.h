@@ -91,6 +91,9 @@ class ShaderLibrary
 
     // "path:entry:stage" of every graphics or compute shader loaded this session (inventory verification).
     std::vector<std::string> GetLoadedShaderKeys() const;
+    // M0c.5 Stage 5.3: moves another library's compiled shaders into this one (render thread only, with the other library no
+    // longer used elsewhere). Keys this library already holds keep its own shader; Shader pointers into either stay valid.
+    std::size_t AdoptShaders(ShaderLibrary& other);
 
     Shader* Load(const ShaderDescription& description);
 
@@ -111,6 +114,15 @@ class ShaderLibrary
         const ShaderLibraryCompileResult& library) const;
 
     // DXC library compilations this session (packaged lookups excluded).
+    // M0c.5 Stage 5.4: raster/compute loads answered by the persistent cache, and those compiled by DXC.
+    unsigned int GetShaderCacheHitCount() const
+    {
+        return m_cacheHits;
+    }
+    unsigned int GetShaderCompileCount() const
+    {
+        return m_compiles;
+    }
     unsigned int GetLibraryCompileCount() const
     {
         return m_libraryCompileCount;
@@ -118,6 +130,8 @@ class ShaderLibrary
 
     private:
     unsigned int m_libraryCompileCount = 0;
+    unsigned int m_cacheHits = 0;
+    unsigned int m_compiles = 0;
     bool m_packaged = false;
     std::map<std::string, std::vector<char>> m_packagedBytecode;
     ShaderCompiler m_compiler;

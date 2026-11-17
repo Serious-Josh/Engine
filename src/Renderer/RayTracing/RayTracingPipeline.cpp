@@ -368,7 +368,7 @@ bool RayTracingPipeline::Initialize(
     stateObjectDescription.NumSubobjects = static_cast<UINT>(subobjects.size());
     stateObjectDescription.pSubobjects = subobjects.data();
 
-    TransitionTiming::Scope er1Scope("CreateStateObject");
+    TransitionTiming::Scope er1Scope("CreateStateObject", 0.1, TransitionTiming::TransitionsAndStartup);
     result = device->CreateStateObject(&stateObjectDescription, IID_PPV_ARGS(&m_stateObject));
 
     if (FAILED(result))
