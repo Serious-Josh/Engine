@@ -172,6 +172,10 @@ SceneMembershipPublication::Result SceneMembershipPublication::Prepare(Renderer&
         }
         p->target=std::make_unique<FileSceneRuntime>();
         p->target->m_fileScene=source.GetFileScene();
+        // The target replaces the source runtime, so it keeps the session's policies (W5 composite hooks, read-only state).
+        p->target->m_candidateValidator=source.m_candidateValidator;
+        p->target->m_newEntityPolicy=source.m_newEntityPolicy;
+        p->target->m_readOnlyReason=source.m_readOnlyReason;
         p->target->m_fileScene.EditDocument()=std::move(proposed);
 
         // The target continues the source's hierarchy revision sequence and installs the

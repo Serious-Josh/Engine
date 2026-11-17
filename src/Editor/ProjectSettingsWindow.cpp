@@ -333,7 +333,7 @@ void Editor::DrawProjectSettings(const IDemoScene& demoScene, const DebugUI& deb
 
     const std::string blocker = ProjectSettingsSaveBlocker();
     // Play and Physics Simulation own the scene and its rendering; the settings are read-only meanwhile.
-    const bool editable = !IsSceneEditingLocked() && !m_projectSettingsSavePending;
+    const bool editable = !IsSceneSimulationLocked() && !m_projectSettingsSavePending;
     const float footerHeight = ImGui::GetFrameHeightWithSpacing() * 2.0f + ImGui::GetTextLineHeightWithSpacing() * 3.0f;
 
     ImGui::BeginChild("ProjectSettingsCategories", ImVec2(170.0f, -footerHeight), ImGuiChildFlags_Borders);

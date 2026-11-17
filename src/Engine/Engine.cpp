@@ -50,6 +50,9 @@
 #include "assets/AssetRegistrySerializer.h"
 #include "assets/AssetReconciliationTransaction.h"
 #include "assets/ProjectAssetReconciliation.h"
+#include "assets/ProjectSceneAssets.h"
+#include "assets/ProjectSceneMigration.h"
+#include "Platform/Windows/WindowsText.h"
 #include "assets/ProjectAssetResolver.h"
 #include "Scene/MaterialParameterPropagation.h"
 #include "imgui.h"
@@ -1266,7 +1269,7 @@ bool Engine::InitializeProjectScene()
         const auto scenePath = ResolveLastEditedScene(error);
         SceneDocument document;
 
-        if(scenePath && LoadSceneDocument(*scenePath, document, &error))
+        if(scenePath && LoadSceneDocument(*scenePath, document, &error) && ValidateSceneKindOpenable(document, &error))
         {
             m_initialScenePath = *scenePath;
             source = SceneSource::SavedFile;
@@ -1496,6 +1499,35 @@ bool Engine::AdmitPackagedVoxelResidency(const FileBackedDemoScene& scene)
     return admitted;
 }
 
+namespace
+{
+    // W3: the active scene's environment fields: a file scene's resolved environment (World inheritance and Local overrides), or an
+    // archive activation's own cooked values (packaged scenes are never resolved before W10). Objects are not copied.
+    SceneDocument EnvironmentView(const FileBackedDemoScene& scene)
+    {
+        SceneDocument view;
+        static const SceneDocument empty;
+        const SceneDocument& document = scene.GetSceneDocument() ? *scene.GetSceneDocument() : empty;
+
+        if(scene.IsArchiveActivation())
+        {
+            view.environmentalHaze = document.environmentalHaze;
+            view.mistRendering = document.mistRendering;
+            view.airEnvironment = document.airEnvironment;
+            view.airSimulation = document.airSimulation;
+            return view;
+        }
+
+        const auto& effective = scene.GetEffectiveEnvironment();
+        view.id = document.id;
+        view.environmentalHaze = effective.environmentalHaze;
+        view.mistRendering = effective.mistRendering;
+        view.airEnvironment = effective.airEnvironment;
+        view.airSimulation = effective.airSimulation;
+        return view;
+    }
+}
+
 void Engine::BuildAirFrameRequest(AirFrameRequest& request, const AirSimulationSettings& simulation, FileBackedDemoScene* scene,
     const Vector3& camera, double deltaSeconds, const AirRequestControls& controls)
 {
@@ -1510,7 +1542,7 @@ void Engine::BuildAirFrameRequest(AirFrameRequest& request, const AirSimulationS
 
     // AIR.4F F4.5.1b: the active scene's air environment (its defaults without a scene document or block). R1.1: cooked from payload
     // 34, so archive activations and packaged games read it too.
-    const AirEnvironmentSettings environment = document != nullptr ? document->airEnvironment.value_or(AirEnvironmentSettings{}) :
+    const AirEnvironmentSettings environment = document != nullptr ? EnvironmentView(*scene).airEnvironment.value_or(AirEnvironmentSettings{}) :
         AirEnvironmentSettings{};
     request.solver.ambientTemperature = environment.ambientTemperature;
     request.solver.temperatureRelaxationTime = environment.relaxationTime;
@@ -2296,10 +2328,23 @@ bool Engine::InitializeProject()
     }
 
     // Initialize the project asset registry before runtime resources.
+    std::error_code pendingError;
+    const bool pendingTransaction = std::filesystem::exists(projectPaths.GetRoot() / ProjectSceneAssets::ReconciliationDirectory, pendingError);
+
+    if(pendingTransaction)
+    {
+        Log::Warning("An interrupted project transaction was found; recovering it before the project loads.");
+    }
+
     if(!AssetReconciliationTransaction::Recover(projectPaths, projectError))
     {
         Log::Error("Project reconciliation recovery failed: " + projectError);
         return false;
+    }
+
+    if(pendingTransaction)
+    {
+        Log::Info("Interrupted project transaction recovered.");
     }
 
     const std::filesystem::path registryPath = projectPaths.GetAssetRegistryPath();
@@ -2345,6 +2390,84 @@ bool Engine::InitializeProject()
         Log::Info("Created empty project asset registry: " + ProjectPathText(registryPath));
     }
 
+    // W1.4: every historical scene becomes a schema-28 Local Level before anything else reads scenes, as one project-wide
+    // transaction (scenes and registry together). A blocked or failed migration leaves the project unchanged and stops here.
+    {
+        ProjectSceneMigration::Report migration;
+        std::string migrationError;
+        bool migrated = false;
+
+        {
+            const TransitionTiming::Scope migrationTiming("Scene migration", 0.0, TransitionTiming::Startup);
+            migrated = ProjectSceneMigration::Run(projectPaths, m_projectAssetRegistry, migration, migrationError);
+        }
+
+        for(const auto& resolution : migration.backupResolutions)
+        {
+            Log::Warning("Scene migration backup: " + resolution);
+        }
+
+        if(migration.required)
+        {
+            Log::Info("Scene migration required: this project has scenes from before scene schema " +
+                std::to_string(SceneDocument::kSchemaVersion) + ".");
+        }
+
+        if(!migrated)
+        {
+            std::string summary = migration.blocking.empty() ?
+                migrationError + " The project was not changed." :
+                "Scene migration blocked; the project was not changed. Fix or remove these scenes, then reopen the project:";
+
+            for(const auto& problem : migration.blocking)
+            {
+                Log::Error("Scene migration blocked: " + problem);
+            }
+
+            Log::Error(summary);
+
+            for(std::size_t index = 0; index < migration.blocking.size() && index < 10; ++index)
+            {
+                summary += "\n- " + migration.blocking[index];
+            }
+
+            if(migration.blocking.size() > 10)
+            {
+                summary += "\n... and " + std::to_string(migration.blocking.size() - 10) + " more (see the log).";
+            }
+
+            if(!migration.backupDirectory.empty())
+            {
+                summary += "\nOriginal scenes are backed up in " + ProjectPathText(projectPaths.GetRoot() / migration.backupDirectory);
+            }
+
+            // As main's ReportStartupFailure: a shell launch keeps its console and reads the log; an Explorer launch (its own
+            // console, which closes on exit) also gets a message box. Unattended runs never block on a dialog.
+            DWORD consoleProcesses[2]{};
+
+            if(GetConsoleProcessList(consoleProcesses, 2) == 1)
+            {
+                MessageBoxW(static_cast<HWND>(m_window.GetNativeHandle()), WindowsText::FromUTF8(summary).c_str(),
+                    L"Cannot open project", MB_OK | MB_ICONERROR);
+            }
+
+            return false;
+        }
+
+        if(migration.completed)
+        {
+            Log::Info("Scene migration completed: " + std::to_string(migration.scenes.size()) +
+                " scenes are now unassigned Local Levels; original files backed up in " +
+                ProjectPathText(projectPaths.GetRoot() / migration.backupDirectory) + ".");
+
+            for(const auto& scene : migration.scenes)
+            {
+                Log::Info("Migrated scene " + scene.relativePath.generic_string() + " (schema " + std::to_string(scene.fromSchema) +
+                    (scene.oldID == scene.newID ? ", id unchanged)" : ", id " + scene.oldID + " -> " + scene.newID + ")"));
+            }
+        }
+    }
+
     ProjectAssetReconciliation::Report reconciliation;
     bool reconciled = false;
 
@@ -2378,6 +2501,52 @@ bool Engine::InitializeProject()
         for(const auto& file : reconciliation.filesModified)
         {
             Log::Info("Reconciled project file: " + file);
+        }
+    }
+
+    // W1.2: scene asset records follow the scene files (registration, external moves, deletions). Problems are reported and
+    // leave the affected records and files unchanged; like script discovery, a failure keeps the loaded registry.
+    {
+        ProjectSceneAssets::Report scenes;
+        std::string sceneError;
+        bool discovered = false;
+
+        {
+            const TransitionTiming::Scope discoveryTiming("Scene asset discovery", 0.0, TransitionTiming::Startup);
+            discovered = ProjectSceneAssets::Reconcile(projectPaths, m_projectAssetRegistry, scenes, sceneError);
+        }
+
+        if(!discovered)
+        {
+            Log::Warning("Scene asset discovery skipped; registry retained: " + sceneError);
+        }
+        else
+        {
+            if(scenes.registered || scenes.moved || scenes.removed)
+            {
+                Log::Info("Scene assets: " + std::to_string(scenes.registered) + " registered, " + std::to_string(scenes.moved) +
+                    " moved, " + std::to_string(scenes.removed) + " removed.");
+            }
+
+            for(const auto& problem : scenes.invalid)
+            {
+                Log::Warning("Invalid scene: " + problem);
+            }
+
+            for(const auto& problem : scenes.unsupported)
+            {
+                Log::Warning("Unsupported scene schema: " + problem);
+            }
+
+            for(const auto& problem : scenes.duplicates)
+            {
+                Log::Warning("Duplicate scene ID: " + problem);
+            }
+
+            for(const auto& problem : scenes.conflicts)
+            {
+                Log::Warning("Scene asset conflict: " + problem);
+            }
         }
     }
 
@@ -3521,7 +3690,16 @@ void Engine::Frame()
         uiProbe.emplace(m_renderer, Renderer::FrameHitchRegion::EngineUI);
     }
 
+    // W4: lock authored edits while a composite World preview is active (before any Editor drawing or request processing).
+    const auto* compositeScene = dynamic_cast<const FileBackedDemoScene*>(m_demoSceneManager.TryGetActiveScene());
+    m_editor.SetCompositePreview(compositeScene && compositeScene->GetCompositeWorld());
+    ReportCompositeWorldActivation(compositeScene);
+    ProcessCompositeSaveRequest(dynamic_cast<FileBackedDemoScene*>(m_demoSceneManager.TryGetActiveScene()));
+
     const std::vector<EnvironmentAsset>& environments = m_renderer.GetAvailableEnvironments();
+    // W3: the World environment editor offers the same HDRIs; built-in files are imported from the deployed assets on Apply.
+    static const std::filesystem::path builtinEnvironmentRoot = WindowsWindow::GetExecutableDirectory() / "assets";
+    m_editor.SyncWorldEnvironmentChoices(environments, builtinEnvironmentRoot);
 
     std::vector<std::string> environmentNames;
     environmentNames.reserve(environments.size());
@@ -3575,9 +3753,9 @@ void Engine::Frame()
         // cleanup retries without advancing time or successful-frame history.
         auto* owner = dynamic_cast<FileBackedDemoScene*>(&activeDemo);
         ProcessEditorGamePlay(owner ? owner->m_runtime.get() : nullptr, 0.0,
-            owner && !owner->IsArchiveActivation(), 0, 0);
+            owner && !owner->IsArchiveActivation() && !owner->GetCompositeWorld(), 0, 0);
         ProcessEditorPhysicsSimulation(owner ? owner->m_runtime.get() : nullptr, 0.0,
-            owner && !owner->IsArchiveActivation());
+            owner && !owner->IsArchiveActivation() && !owner->GetCompositeWorld());
         m_editor.SuspendViewportInteraction();
         m_editor.DrawMaterialLeaveConfirmation(activeDemo, GetActiveProject().GetPaths(), m_projectAssetRegistry);
         ProcessEditorSceneRequests(activeDemo);
@@ -3640,9 +3818,11 @@ void Engine::Frame()
     const Renderer::SceneResolution resolution = m_renderer.GetSceneResolution();
     m_editor.SetViewportResolutionInfo({resolution.outputWidth, resolution.outputHeight, resolution.renderWidth,
         resolution.renderHeight, m_renderer.GetPresentationModeName()});
+    const auto editorDrawStart = std::chrono::steady_clock::now();
     m_editor.Draw(activeDemo, m_demoSceneManager, debugUI, finalSceneImage.srv.ptr,
                   finalSceneImage.width, finalSceneImage.height, m_time.GetDeltaTime(),
                   inspectorPaths, m_projectAssetRegistry, m_renderer.GetMaterialPreviewImage());
+    m_frameCpuTimings.editorDraw = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - editorDrawStart).count();
 
     if(const EditorPhaseTiming::Frame* editorPhases = m_editor.GetPhaseTiming())
     {
@@ -3706,6 +3886,22 @@ void Engine::Frame()
         activeFileScene ? activeFileScene->GetScenePath() : std::filesystem::path{});
     m_editor.ProcessAssetDeletion(inspectorPaths, m_projectAssetRegistry);
     m_editor.ProcessAssetMove(inspectorPaths, m_projectAssetRegistry);
+    m_editor.ProcessSceneMembership(inspectorPaths, m_projectAssetRegistry, activeFileScene);
+
+    // W3: after a membership or World environment change, the open Local Level re-reads its World (never shows stale inherited values).
+    if(m_editor.TakeEnvironmentWorldChanged())
+    {
+        if(auto* owner = dynamic_cast<FileBackedDemoScene*>(m_demoSceneManager.TryGetActiveScene()); owner && !owner->IsArchiveActivation() &&
+            owner->RefreshEnvironmentPreview(true))
+        {
+            std::string environmentError;
+
+            if(!ApplySceneEnvironment(environmentError))
+            {
+                Log::Error("Scene environment preview update failed: " + environmentError);
+            }
+        }
+    }
 
     for (const auto& drop : m_window.TakeFileDrops())
     {
@@ -4121,7 +4317,8 @@ void Engine::Frame()
     // Accept bindings before physics validates and publishes the current presentation.
     ProcessViewportMaterialAssignment(activeDemo);
     auto* physicsScene = dynamic_cast<FileBackedDemoScene*>(&activeDemo);
-    const bool editableFileScene = physicsScene && !physicsScene->IsArchiveActivation();
+    // W4: a composite World preview is read-only; Play and Physics Simulation are W8 work for Worlds.
+    const bool editableFileScene = physicsScene && !physicsScene->IsArchiveActivation() && !physicsScene->GetCompositeWorld();
     // Game Play first: while it owns the shared simulation, the Physics Simulation tool steps aside.
     ProcessEditorGamePlay(physicsScene ? physicsScene->m_runtime.get() : nullptr, m_time.GetDeltaTime(),
         editableFileScene, finalSceneImage.width, finalSceneImage.height);
@@ -4149,8 +4346,10 @@ void Engine::Frame()
 
     // Capture after physics publication so mesh and collider use the same accepted pose.
     // This stack-owned payload outlives the synchronous Render call; Renderer retains none of it.
+    const auto overlayStart = std::chrono::steady_clock::now();
     const auto colliderOverlay = gamePlaying ? std::nullopt : CaptureEditorColliderOverlayForFrame(
         physicsScene ? physicsScene->m_runtime.get() : nullptr, editableFileScene);
+    m_frameCpuTimings.overlays = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - overlayStart).count();
     if (colliderOverlay)
     {
         rendererOptions.editorColliderOverlay = &*colliderOverlay;
@@ -4159,6 +4358,18 @@ void Engine::Frame()
     // Lighting uses the same accepted presentation as the meshes and overlays of this frame.
     if (physicsScene)
     {
+        // W3: the standalone preview environment (World inheritance, Local overrides). A changed effective sky goes through the S0.5
+        // asynchronous environment request; its intensity through the calibration check below.
+        if(!physicsScene->IsArchiveActivation() && physicsScene->RefreshEnvironmentPreview(false))
+        {
+            std::string environmentError;
+
+            if(!ApplySceneEnvironment(environmentError))
+            {
+                Log::Error("Scene environment preview update failed: " + environmentError);
+            }
+        }
+
         RefreshSceneEnvironmentCalibration();
         rendererOptions.lighting = CaptureSceneLightingForFrame(*physicsScene->m_runtime);
     }
@@ -4179,8 +4390,10 @@ void Engine::Frame()
         // R1.1: the simulation configuration comes from ResolveAirSimulation alone: the Editor's Play or Physics Simulation session
         // override, else the active scene's block (file or cooked), else the defaults. The Air window keeps pause, the views and Reset.
         const Editor::AirEditorSettings& air = m_editor.GetAirSettings();
-        const SceneDocument* airDocument = physicsScene && physicsScene->m_runtime ? &physicsScene->m_runtime->GetFileScene().GetDocument() :
-            nullptr;
+        // W3: the active scene's resolved environment (a World's AIR simulation with the Local Level's wind override, or its own).
+        const std::optional<SceneDocument> airView = physicsScene && physicsScene->m_runtime ?
+            std::optional<SceneDocument>(EnvironmentView(*physicsScene)) : std::nullopt;
+        const SceneDocument* airDocument = airView ? &*airView : nullptr;
         const std::optional<AirSimulationSettings> airOverride = physicsScene && physicsScene->m_runtime ?
             m_editor.GetAirSimulationOverride(physicsScene->GetRuntimeIdentity()) : std::nullopt;
         m_airConfiguration = ResolveAirSimulation(airDocument, airOverride);
@@ -4280,8 +4493,8 @@ void Engine::Frame()
         // AIR.4F.2d.3: the fog request also carries the scene's environmental haze, so it exists whenever the haze is enabled, with or
         // without AIR. R1.2b: built by BuildFogRenderRequest, as packaged frames build theirs, from the active scene's document whether
         // it is a file or an archive activation.
-        const SceneDocument* fogDocument = physicsScene && physicsScene->m_runtime ? &physicsScene->m_runtime->GetFileScene().GetDocument() :
-            nullptr;
+        // W3: the resolved haze and mist appearance (World inheritance, Local overrides).
+        const SceneDocument* fogDocument = airDocument;
         FogRenderInputs fog;
         fog.appearance = m_editor.GetEffectiveMistRendering(fogDocument, fogDocument != nullptr ? physicsScene->GetRuntimeIdentity() : 0);
         fog.haze = fogDocument != nullptr ? fogDocument->environmentalHaze.value_or(EnvironmentalHazeSettings{}) : EnvironmentalHazeSettings{};
@@ -7588,7 +7801,7 @@ bool Engine::StartBuildGame(BuildGame::Settings settings, std::string& error, bo
 
     SceneDocument document;
 
-    if(!LoadSceneDocument(startup.path, document, &error))
+    if(!LoadSceneDocument(startup.path, document, &error) || !ValidateSceneKindOpenable(document, &error))
     {
         error = "Cannot read the startup scene " + startupName + ": " + error;
         return false;

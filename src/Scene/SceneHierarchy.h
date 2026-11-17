@@ -77,7 +77,8 @@ namespace SceneHierarchy
                 return Fail(error, "Invalid hierarchy parent reference for object: " + object.id);
             }
 
-            if(!object.parentID.empty() && (object.physics || object.triggerCollider || object.characterController))
+            if(!object.parentID.empty() && !object.parentIsLevelNode &&
+                (object.physics || object.triggerCollider || object.characterController))
             {
                 return Fail(error, "Physics, Trigger Collider and Character Controller require a root object: " + object.id);
             }

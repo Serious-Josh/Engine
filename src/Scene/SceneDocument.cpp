@@ -86,6 +86,53 @@ bool ValidateSceneDocument(
         return Fail(errorMessage, "Scene ID cannot be empty.");
     }
 
+    if(document.kind != SceneKind::Local && document.kind != SceneKind::World)
+    {
+        return Fail(errorMessage, "Invalid scene kind.");
+    }
+
+    // W2: membership, per document. Agreement between a World and its Local Levels is checked across documents
+    // (ProjectSceneMembership), never here.
+    if(document.kind == SceneKind::Local)
+    {
+        if(!document.members.empty())
+        {
+            return Fail(errorMessage, "A Local Level cannot list member Local Levels.");
+        }
+
+        if(!document.owningWorld.empty() && (!AssetID::Parse(document.owningWorld) || document.owningWorld == document.id))
+        {
+            return Fail(errorMessage, "Invalid owning World '" + document.owningWorld + "': it must be another scene's canonical GUID.");
+        }
+    }
+    else
+    {
+        if(!document.owningWorld.empty())
+        {
+            return Fail(errorMessage, "A World cannot have an owning World.");
+        }
+
+        std::unordered_set<std::string> levels;
+
+        for(const auto& member : document.members)
+        {
+            if(!AssetID::Parse(member.level) || member.level == document.id)
+            {
+                return Fail(errorMessage, "Invalid member Local Level '" + member.level + "': it must be another scene's canonical GUID.");
+            }
+
+            if(!levels.insert(member.level).second)
+            {
+                return Fail(errorMessage, "Local Level " + member.level + " is listed more than once.");
+            }
+
+            if(!IsFinite(member.placement.position) || !IsFinite(member.placement.rotation))
+            {
+                return Fail(errorMessage, "The placement of Local Level " + member.level + " is not finite.");
+            }
+        }
+    }
+
     if (!IsFinite(document.camera.position) ||
         !IsFinite(document.camera.target) ||
         !std::isfinite(document.camera.verticalFov) ||
@@ -406,7 +453,7 @@ bool ValidateSceneObjectComponents(const SceneObjectDocument& object, std::strin
         return Fail(errorMessage, "Physics and Character Controller are mutually exclusive for object: " + object.id);
     }
 
-    if(!object.parentID.empty() && (object.physics || object.triggerCollider || object.characterController))
+    if(!object.parentID.empty() && !object.parentIsLevelNode && (object.physics || object.triggerCollider || object.characterController))
     {
         return Fail(errorMessage, "Physics, Trigger Collider and Character Controller require a root object: " + object.id);
     }
@@ -481,6 +528,40 @@ bool ValidateSceneDocumentPersistence(const SceneDocument& document, std::string
 {
     // Current codecs preserve authored hierarchy and all optional component values.
     return ValidateSceneDocument(document, errorMessage);
+}
+
+bool ValidateSceneDocumentWrite(const SceneDocument& document, std::string* errorMessage)
+{
+    if(!ValidateSceneDocumentPersistence(document, errorMessage))
+    {
+        return false;
+    }
+
+    // Never canonicalized here: a legacy id is changed only by explicit migration.
+    if(!AssetID::Parse(document.id))
+    {
+        return Fail(errorMessage, "Scene ID '" + document.id + "' is not a canonical GUID; scenes written in schema " +
+            std::to_string(SceneDocument::kSchemaVersion) + " require one. This scene predates schema " +
+            std::to_string(SceneDocument::kSceneKindSchemaVersion) + " and must be migrated before it can be saved.");
+    }
+
+    // W2: a World always has at least one Local Level; membership changes that would empty it are refused.
+    if(document.kind == SceneKind::World && document.members.empty())
+    {
+        return Fail(errorMessage, "World '" + document.name + "' has no Local Levels; a World must contain at least one.");
+    }
+
+    return true;
+}
+
+bool ValidateSceneKindOpenable(const SceneDocument& document, std::string* errorMessage)
+{
+    if(document.kind == SceneKind::World)
+    {
+        return Fail(errorMessage, "Scene '" + document.name + "' is a World; opening Worlds is not supported yet.");
+    }
+
+    return true;
 }
 
 AirSimulationSettings ResolveAirSimulation(const SceneDocument* document, const std::optional<AirSimulationSettings>& sessionOverride)

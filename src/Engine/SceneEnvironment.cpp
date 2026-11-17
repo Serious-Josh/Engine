@@ -93,6 +93,8 @@ bool Engine::ApplySceneEnvironment(std::string& error, bool activation)
         const float scale = ActiveEnvironmentRadianceScale();
         m_appliedEnvironmentRadianceScale = scale;
         const auto& reference = scene->GetScene().GetEnvironmentReference();
+        // W3: the standalone preview requests a changed effective sky only when it differs from this publication.
+        scene->NotePublishedEnvironment(reference);
         EnvironmentPreparationSource source;
 
         if(reference == SceneDocument::NoneEnvironmentReference)
@@ -204,6 +206,12 @@ bool Engine::AssignSceneEnvironment(size_t index,std::string& error)
         catch(const std::exception& e) { error=e.what(); return false; }
     }
     if(scene->IsArchiveActivation() || m_startup.mode!=EngineStartup::Mode::Editor) { error="Packaged HDRI assignments are immutable."; return false; }
+    // W3: an inherited sky belongs to the World (or the Engine defaults); it is assigned here only after enabling the Sky override.
+    if(const auto* document=scene->GetSceneDocument(); document && document->kind==SceneKind::Local && !document->environmentOverrides.sky)
+    {
+        error="The sky is inherited. Enable the Sky override (Environment, Local Level) to assign this Local Level's own HDRI.";
+        return false;
+    }
     const auto& available=m_renderer.GetAvailableEnvironments();
     if(index>=available.size()) { error="Invalid HDRI selection."; return false; }
     const auto selected=available[index]; std::string reference=selected.reference;

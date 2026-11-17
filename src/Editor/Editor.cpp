@@ -1,6 +1,7 @@
 #include "assets/ProjectAssetRename.h"
 #include "assets/ProjectAssetDeletion.h"
 #include "assets/ProjectAssetResolver.h"
+#include "assets/ProjectTextureImportService.h"
 #include "Core/Log.h"
 #include "Editor.h"
 #include "Editor/ExposureControls.h"
@@ -176,8 +177,9 @@ bool Editor::RequestApplicationClose()
 
 bool Editor::QueueFileRequest(FileRequest request)
 {
+    // A read-only World preview can always be left; only a running simulation or a pending operation holds the scene.
     if(m_sceneOperationPending || m_fileRequest || m_materialLeaveAction != MaterialLeaveAction::None ||
-        IsSceneEditingLocked())
+        IsSceneSimulationLocked())
     {
         ReportLifecycleMessage("Finish the pending operation and stop Game Play or physics before leaving the scene.");
         return false;
@@ -303,7 +305,7 @@ void Editor::DrawMainMenu(
     if(ImGui::BeginMenu("File"))
     {
         ImGui::BeginDisabled(m_sceneOperationPending || m_fileRequest.has_value() ||
-            m_materialLeaveAction != MaterialLeaveAction::None || IsSceneEditingLocked());
+            m_materialLeaveAction != MaterialLeaveAction::None || IsSceneSimulationLocked());
 
         if(ImGui::MenuItem("New Scene"))
         {
@@ -1125,6 +1127,13 @@ void Editor::DrawHierarchy(IDemoScene& demoScene, const std::string& activeScene
     const auto& scene = demoScene.GetScene();
     SceneHierarchySnapshot snapshot;
     snapshot.sceneName = activeSceneName;
+
+    // W5: a World lists its own entities first, then one folder node per Local Level holding that level's entities.
+    if(const auto* composite = dynamic_cast<const FileBackedDemoScene*>(&demoScene); composite && composite->GetCompositeWorld())
+    {
+        snapshot.sceneName = "World: " + composite->GetCompositeWorld()->worldName + "  (World entities at the top; each folder is a "
+            "Local Level)";
+    }
     std::string error;
 
     if(const auto* owner = dynamic_cast<const FileBackedDemoScene*>(&demoScene))
@@ -1188,6 +1197,14 @@ void Editor::DrawHierarchy(IDemoScene& demoScene, const std::string& activeScene
         {
             objectIcons.emplace(object.id, SceneObjectIcon(object.camera.has_value(), object.light ? &*object.light : nullptr));
         }
+
+        if(const CompositeWorld* composite = fileScene->GetCompositeWorld())
+        {
+            for(const auto& level : composite->levels)
+            {
+                objectIcons.insert_or_assign(level.id, EditorIcon::Folder);
+            }
+        }
     }
 
     const auto clicked = m_hierarchyPanel.Draw(m_workspace.GetHierarchy(), snapshot, selected, &scene, error,
@@ -1198,7 +1215,16 @@ void Editor::DrawHierarchy(IDemoScene& demoScene, const std::string& activeScene
         [&](const HierarchyDropRequest& request, std::string& reason)
         {
             SceneHierarchyEdit preview;
-            return PrepareHierarchyDrop(demoScene, request, preview, reason);
+            const bool prepared = PrepareHierarchyDrop(demoScene, request, preview, reason);
+            const CompositeWorld* composite = fileScene ? fileScene->GetCompositeWorld() : nullptr;
+
+            // W5: the same ownership rules the runtime applies on commit, shown while dragging.
+            if(prepared && composite && !ValidateCompositeEdit(*composite, preview.after, reason))
+            {
+                return false;
+            }
+
+            return prepared;
         }, [&](std::string_view id)
         {
             const auto found = objectIcons.find(id);
@@ -1347,7 +1373,7 @@ void Editor::ActivateObjectInspection(
 
     if(const auto* fileScene = dynamic_cast<const FileBackedDemoScene*>(&demoScene))
     {
-        const auto metadata = fileScene->GetObjectMetadata(m_selectedObject);
+        const auto metadata = SelectedObjectMetadata(*fileScene);
 
         if(!metadata)
         {
@@ -1398,7 +1424,7 @@ std::optional<SceneObjectInspectorView> Editor::ResolveObjectInspection(
     }
 
     EditorPhaseTiming::Scope metadataPhase(PhaseTiming(), EditorPhaseTiming::Phase::ObjectViewMetadata);
-    const auto metadata = fileScene->GetObjectMetadata(m_selectedObject);
+    const auto metadata = SelectedObjectMetadata(*fileScene);
     metadataPhase.End();
 
     if(!metadata || metadata->runtimeIdentity != m_objectInspectionIdentity->runtimeIdentity ||
@@ -1509,6 +1535,7 @@ void Editor::Draw(
 
     m_hierarchyPanel.SetIcons(debugUI.GetEditorIcons());
     m_assetBrowser.SetIcons(debugUI.GetEditorIcons());
+    m_assetBrowser.SetSceneMembership(&m_sceneMembership);
     m_inspectorPanel.SetIcons(debugUI.GetEditorIcons());
     Scene& scene = demoScene.GetScene();
     const std::string activeSceneName(sceneManager.GetActiveSceneName());
@@ -1835,6 +1862,8 @@ void Editor::Draw(
     EditorPhaseTiming::Scope modalsPhase(PhaseTiming(), EditorPhaseTiming::Phase::ModalsAndViewport);
     m_assetBrowser.DrawRenameModal(IsSceneEditingLocked() || m_inspectorPanel.HasUnsavedChanges() ||
         m_materialLeaveAction != MaterialLeaveAction::None || m_sceneOperationPending);
+    m_sceneMembership.Draw(IsSceneEditingLocked() || m_inspectorPanel.HasUnsavedChanges() ||
+        m_materialLeaveAction != MaterialLeaveAction::None || m_sceneOperationPending);
 
     m_assetBrowser.DrawDeletionConfirmation(IsSceneEditingLocked() || m_inspectorPanel.HasUnsavedChanges() ||
         m_materialLeaveAction != MaterialLeaveAction::None || m_sceneOperationPending);
@@ -1898,6 +1927,10 @@ void Editor::Draw(
             ImGui::Separator();
 
             DrawCamera(demoScene);
+
+            ImGui::Separator();
+
+            DrawEnvironmentOverrideControls(demoScene);
 
             ImGui::Separator();
 
@@ -2038,10 +2071,15 @@ void Editor::DrawDirectionalLight(IDemoScene& demoScene, const DebugUI& debugUI)
         ImGui::TextUnformatted("Directional lights are edited as objects in the hierarchy.");
         // Commit on deactivation only: each change rescales all lighting (reference exposure) or rebuilds the
         // environment (luminance scale), so a drag must not do either every frame.
+        // W3: inherited groups show the effective (World or default) value read-only.
+        ImGui::BeginDisabled(IsEnvironmentGroupInherited(demoScene, static_cast<int>(FileBackedDemoScene::EnvironmentGroup::Exposure)));
         ImGui::InputFloat("Reference Exposure (EV100)", &settings.referenceEV100, 0.5f, 1.0f, "%.2f");
         const bool referenceCommitted = ImGui::IsItemDeactivatedAfterEdit();
+        ImGui::EndDisabled();
+        ImGui::BeginDisabled(IsEnvironmentGroupInherited(demoScene, static_cast<int>(FileBackedDemoScene::EnvironmentGroup::Sky)));
         ImGui::InputFloat("Environment Luminance (cd/m^2 per HDRI unit)", &settings.environmentLuminanceScale, 0.0f, 0.0f, "%.6g");
         const bool environmentCommitted = ImGui::IsItemDeactivatedAfterEdit();
+        ImGui::EndDisabled();
         if((referenceCommitted || environmentCommitted) && ValidateSceneLightingSettings(settings))
             demoScene.GetScene().SetLightingSettings(settings);
         ImGui::TextDisabled("Reference exposure fixes the scene's GPU lighting scale (mid-grey metering at this EV).");
@@ -2161,7 +2199,13 @@ void Editor::DrawSelectedObjectTransformControls(IDemoScene& demoScene)
     fieldActivated |= ImGui::IsItemActivated();
     fieldDeactivated |= ImGui::IsItemDeactivatedAfterEdit();
 
-    if(ImGui::DragFloat3("Scale", &transform.scale.x, 0.01f, 0.01f, 100.0f))
+    // W5: a Local Level node is a placement (translation and rotation); it never scales.
+    const bool levelRootSelected = SelectionIncludesLevelRoot(demoScene);
+    ImGui::BeginDisabled(levelRootSelected);
+    const bool scaleEdited = ImGui::DragFloat3("Scale", &transform.scale.x, 0.01f, 0.01f, 100.0f);
+    ImGui::EndDisabled();
+
+    if(scaleEdited && !levelRootSelected)
     {
         transform.scale.x = (std::max)(0.01f, transform.scale.x);
         transform.scale.y = (std::max)(0.01f, transform.scale.y);
@@ -2272,7 +2316,7 @@ void Editor::RefreshSceneSelection(const IDemoScene& demoScene)
     {
         if(owner)
         {
-            if(const auto metadata = owner->GetObjectMetadata(m_selectedObject))
+            if(const auto metadata = SelectedObjectMetadata(*owner))
                 m_orderedSelection.push_back({metadata->objectID});
         }
         else m_orderedSelection.push_back({{}, m_selectedObject});
@@ -2580,6 +2624,12 @@ void Editor::DrawTransformGizmo(
 
         case GizmoMode::Scale:
         {
+            // W5: a Local Level node is a placement and never scales.
+            if(SelectionIncludesLevelRoot(demoScene))
+            {
+                break;
+            }
+
             transform.scale =
                 Vector3{(std::max)(0.01f, scale[0]), (std::max)(0.01f, scale[1]), (std::max)(0.01f, scale[2])};
 
@@ -3346,6 +3396,236 @@ void Editor::ProcessAssetRename(
     }
 }
 
+// Imports a built-in HDRI into the project's Textures/Environment and returns its asset reference.
+bool Editor::ImportBuiltinEnvironment(const ProjectPaths& paths, ProjectAssetRegistry& registry, const std::filesystem::path& source,
+    std::string& reference, std::string& error)
+{
+    const auto destination = paths.GetRoot() / "Textures" / "Environment";
+    std::error_code directoryError;
+    std::filesystem::create_directories(destination, directoryError);
+    std::filesystem::path imported;
+
+    if(!ProjectTextureImportService::Import(paths, registry, source, destination, imported, error))
+    {
+        return false;
+    }
+
+    const auto* record = registry.FindByPath(std::filesystem::relative(imported, paths.GetRoot()));
+
+    if(!record)
+    {
+        error = "The imported HDRI did not receive a project identity.";
+        return false;
+    }
+
+    reference = record->id.ToReference();
+    return true;
+}
+
+void Editor::ProcessSceneMembership(const ProjectPaths& paths, ProjectAssetRegistry& registry, const FileBackedDemoScene* activeScene)
+{
+    m_sceneMembership.Refresh(paths, registry);
+    const auto request = m_sceneMembership.TakeRequest();
+
+    if(!request)
+    {
+        return;
+    }
+
+    using Action = SceneMembershipPanel::Action;
+    std::string error;
+    std::string message;
+    const std::string activeID = activeScene ? std::string(activeScene->GetPersistentSceneID()) : std::string{};
+    // The Local Level whose file the operation rewrites.
+    const bool rewritesLocal = request->action == Action::Assign || request->action == Action::Unassign ||
+        (request->action == Action::CreateWorld && request->local);
+    // W4: an open composite World holds its World and every member in memory; changing any of them would leave the preview
+    // inconsistent with the files. Other Worlds and Local Levels stay editable.
+    const CompositeWorld* composite = activeScene ? activeScene->GetCompositeWorld() : nullptr;
+    const auto partOfComposite = [composite](const std::optional<AssetID>& id)
+    {
+        if(!composite || !id)
+        {
+            return false;
+        }
+
+        const std::string text = id->ToString();
+        return text == composite->worldID || std::any_of(composite->levels.begin(), composite->levels.end(),
+            [&text](const CompositeWorld::Level& level)
+            {
+                return level.id == text;
+            });
+    };
+    const bool simulationLocked = m_physicsState != PhysicsState::Stopped || m_gameState != GameState::Editing;
+
+    if(simulationLocked || m_inspectorPanel.HasUnsavedChanges() || m_materialLeaveAction != MaterialLeaveAction::None ||
+        m_sceneOperationPending)
+    {
+        error = "Scene membership changes are refused while edits or a scene operation are pending.";
+    }
+    else if(request->action != Action::Duplicate && (partOfComposite(request->world) || partOfComposite(request->local)))
+    {
+        // W5: membership of the open World changes only from a fully saved state, and the World is then reopened (rebuilt).
+        // Placement and environment are edited in the open World itself, where they are undoable and saved with it.
+        const bool rebuildable = request->action == Action::Assign || request->action == Action::CreateAndAssign ||
+            request->action == Action::Unassign;
+        bool dirty = false;
+        std::string dirtyError;
+
+        if(!rebuildable)
+        {
+            error = "World '" + composite->worldName + "' is open: move or rotate a Local Level with its node in the Scene Hierarchy, "
+                "and edit the World's environment in the scene panels.";
+        }
+        else if(!activeScene->CheckUnsavedChanges(dirty, &dirtyError) || dirty)
+        {
+            error = dirtyError.empty() ? "Save the open World's documents (Save All) before changing its membership." : dirtyError;
+        }
+        else
+        {
+            m_compositeRebuildPath = paths.GetRoot() / composite->worldRelativePath;
+        }
+    }
+    else if(rewritesLocal && request->local && !activeID.empty() && request->local->ToString() == activeID)
+    {
+        // The open scene's in-memory document and its undo history would no longer match its file, and a later Save or Undo
+        // would silently revert the membership. Changing membership of the open scene needs per-level documents (W5).
+        error = "This Local Level is the open scene. Open another scene first, then change its World membership.";
+    }
+    else if(request->action == Action::Duplicate && request->local && !activeID.empty() && request->local->ToString() == activeID)
+    {
+        bool dirty = false;
+        std::string dirtyError;
+
+        if(!activeScene->CheckUnsavedChanges(dirty, &dirtyError) || dirty)
+        {
+            error = dirtyError.empty() ? "Save the open scene first: a duplicate copies the scene file, not unsaved edits." : dirtyError;
+        }
+    }
+
+    ProjectSceneMembership::Result result;
+
+    if(error.empty())
+    {
+        switch(request->action)
+        {
+        case Action::CreateWorld:
+        {
+            ProjectSceneMembership::CreateWorldRequest create;
+            create.world = {request->worldPath, request->worldName};
+            create.environment = request->environment;
+
+            if(request->local)
+            {
+                create.existingLocal = request->local;
+            }
+            else
+            {
+                create.newLocal = ProjectSceneMembership::NewScene{request->localPath, request->localName};
+            }
+
+            if(ProjectSceneMembership::CreateWorld(paths, registry, create, result, error))
+            {
+                message = "Created World '" + request->worldName + "'.";
+            }
+
+            break;
+        }
+        case Action::Assign:
+            if(ProjectSceneMembership::AssignLocal(paths, registry, *request->world, *request->local, request->placement, result, error))
+            {
+                message = "Assigned the Local Level to the World.";
+            }
+
+            break;
+        case Action::CreateAndAssign:
+            if(ProjectSceneMembership::CreateAndAssignLocal(paths, registry, *request->world, {request->localPath, request->localName},
+                request->placement, result, error))
+            {
+                message = "Created and assigned Local Level '" + request->localName + "'.";
+            }
+
+            break;
+        case Action::Unassign:
+            if(ProjectSceneMembership::UnassignLocal(paths, registry, *request->local, result, error))
+            {
+                message = "Unassigned the Local Level; it is kept as an unassigned Local Level.";
+            }
+
+            break;
+        case Action::Placement:
+            if(ProjectSceneMembership::UpdatePlacement(paths, registry, *request->world, *request->local, request->placement, result, error))
+            {
+                message = "Placement updated.";
+            }
+
+            break;
+        case Action::Duplicate:
+            if(ProjectSceneMembership::DuplicateLocal(paths, registry, *request->local, {request->localPath, request->localName}, result, error))
+            {
+                message = "Duplicated as unassigned Local Level '" + request->localName + "'.";
+            }
+
+            break;
+        case Action::WorldEnvironment:
+        {
+            // A built-in HDRI becomes a project asset first (as a Local Level's HDRI assignment does), so the World stores a
+            // stable reference. The import is its own registry transaction; a refused World edit leaves an unused asset.
+            auto environment = request->worldEnvironment;
+
+            if(!request->worldBuiltinEnvironment.empty() &&
+                !ImportBuiltinEnvironment(paths, registry, request->worldBuiltinEnvironment, environment.environmentReference, error))
+            {
+                break;
+            }
+
+            if(ProjectSceneMembership::UpdateWorldEnvironment(paths, registry, *request->world, request->expectedEnvironment,
+                environment, result, error))
+            {
+                message = "World environment updated; Local Levels that inherit it follow.";
+            }
+
+            break;
+        }
+        }
+    }
+
+    // W3: assignment keeps the Local Level's overrides; say which inherited groups now look different.
+    if(error.empty() && !result.environmentChanges.empty())
+    {
+        message += " The Local Level's effective environment changed: " + result.environmentChanges + ".";
+        Log::Warning("Scene membership: " + message);
+    }
+
+    m_sceneMembership.OnCompleted(error, message);
+
+    if(!error.empty())
+    {
+        Log::Error("Scene membership change refused: " + error);
+        ReportLifecycleMessage(error);
+        m_compositeRebuildPath.clear();
+        return;
+    }
+
+    Log::Info(message);
+
+    // W5: the open World's membership changed on disk; reopen it. Its history is cleared only when the rebuilt World activates;
+    // a failed reopen keeps the current World and its history.
+    if(!m_compositeRebuildPath.empty())
+    {
+        QueueFileRequest(FileRequest{FileRequestType::Load, std::exchange(m_compositeRebuildPath, {})});
+    }
+
+    for(const auto& written : result.written)
+    {
+        Log::Info("  wrote " + written.generic_string());
+    }
+
+    m_assetBrowser.InvalidateFileListings();
+    // W3: the open Local Level may inherit from a World that changed; the Engine re-reads it and refreshes the preview.
+    m_environmentWorldChanged = true;
+}
+
 void Editor::ProcessAssetMove(const ProjectPaths& paths, ProjectAssetRegistry& registry)
 {
     if (IsSceneEditingLocked())
@@ -3781,7 +4061,7 @@ void Editor::DrawSceneObjectDeletionControls(IDemoScene& scene)
     if(keyboardAllowed && ImGui::IsKeyPressed(ImGuiKey_Delete, false))
     {
         const auto* owner = dynamic_cast<const FileBackedDemoScene*>(&scene);
-        const auto selected = owner ? owner->GetObjectMetadata(m_selectedObject) : std::nullopt;
+        const auto selected = owner ? SelectedObjectMetadata(*owner) : std::nullopt;
 
         if(selected && m_selectionStructureRevision == selected->structureRevision)
         {
@@ -4564,6 +4844,22 @@ void Editor::ReplaySceneHistory(IDemoScene& demoScene, bool redo)
         return;
     }
 
+    if(const auto* overrideEdit = std::get_if<std::unique_ptr<EnvironmentOverrideEdit>>(&entry.command); overrideEdit && *overrideEdit)
+    {
+        std::string error;
+
+        if(!ReplayEnvironmentOverride(demoScene, **overrideEdit, redo, error))
+        {
+            ReportSceneHistoryFailure(error);
+            return;
+        }
+
+        m_historyCursor = redo ? m_historyCursor + 1 : m_historyCursor - 1;
+        m_environmentOverrideStatus.clear();
+        m_sceneHistoryStatus.clear();
+        return;
+    }
+
     if(const auto* environment = std::get_if<std::unique_ptr<AirEnvironmentEdit>>(&entry.command); environment && *environment)
     {
         std::string error;
@@ -5144,7 +5440,7 @@ void Editor::DrawObjectPhysicsControls(IDemoScene& scene)
     std::optional<SceneObjectMetadata> selection(std::in_place);
     SceneObjectDocument object;
 
-    if(!owner->InspectSelectedObject(m_selectedObject, *selection, object))
+    if(!InspectSelection(*owner, *selection, object))
     {
         return;
     }
@@ -5577,7 +5873,7 @@ bool Editor::QueueHierarchyEdit(IDemoScene& scene, SceneHierarchyEdit edit,
         return true;
     }
 
-    const auto selected = owner->GetObjectMetadata(m_selectedObject);
+    const auto selected = SelectedObjectMetadata(*owner);
     HistoryReplayRequest request;
     request.identity = {AllocateSceneHistoryOperationID(), m_historyEpoch, false, selectionAfter};
     request.membership = true;
@@ -5606,7 +5902,7 @@ bool Editor::QueueHierarchyReparent(IDemoScene& scene, std::string_view objectID
         return false;
     }
 
-    const auto selected = owner->GetObjectMetadata(m_selectedObject);
+    const auto selected = SelectedObjectMetadata(*owner);
     return QueueHierarchyEdit(scene, std::move(edit),
         selected ? std::optional<std::string>(selected->objectID) : std::nullopt, error);
 }
@@ -5674,7 +5970,7 @@ bool Editor::SubmitHierarchyDrop(IDemoScene& scene, const HierarchyDropRequest& 
     }
 
     const auto* owner = dynamic_cast<const FileBackedDemoScene*>(&scene);
-    const auto selected = owner->GetObjectMetadata(m_selectedObject);
+    const auto selected = SelectedObjectMetadata(*owner);
     return QueueHierarchyEdit(scene, std::move(edit),
         selected ? std::optional<std::string>(selected->objectID) : std::nullopt, error);
 }
@@ -5699,4 +5995,72 @@ bool Editor::QueueHierarchyEmpty(IDemoScene& scene, std::string_view parentID, s
         error = exception.what();
         return false;
     }
+}
+
+// W5: whether the selection includes a composite World's Local Level node (a level root), which carries only a placement.
+bool Editor::SelectionIncludesLevelRoot(const IDemoScene& scene) const
+{
+    const auto* owner = dynamic_cast<const FileBackedDemoScene*>(&scene);
+    const CompositeWorld* composite = owner ? owner->GetCompositeWorld() : nullptr;
+
+    if(!composite || !owner->m_runtime)
+    {
+        return false;
+    }
+
+    for(const auto& [id, index] : owner->m_runtime->GetObjectMapping().idToRuntimeIndex)
+    {
+        const bool selected = std::ranges::find(m_selectedObjects, index) != m_selectedObjects.end() || index == m_selectedObject;
+
+        if(selected && std::ranges::any_of(composite->levels, [&id](const CompositeWorld::Level& level) { return level.id == id; }))
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool Editor::InspectSelection(const FileBackedDemoScene& owner, SceneObjectMetadata& metadata, SceneObjectDocument& object) const
+{
+    auto& cache = m_inspectionCache;
+    const bool current = cache.frame == ImGui::GetFrameCount() && cache.selection == m_selectedObject &&
+        cache.runtime == owner.m_runtime.get() && cache.runtimeIdentity == owner.GetRuntimeIdentity() &&
+        cache.structureRevision == owner.GetScene().GetStructureRevision() && cache.historySize == m_sceneHistory.size() &&
+        cache.historyCursor == m_historyCursor && cache.historyEpoch == m_historyEpoch;
+
+    if(!current)
+    {
+        cache.frame = ImGui::GetFrameCount();
+        cache.selection = m_selectedObject;
+        cache.runtime = owner.m_runtime.get();
+        cache.runtimeIdentity = owner.GetRuntimeIdentity();
+        cache.structureRevision = owner.GetScene().GetStructureRevision();
+        cache.historySize = m_sceneHistory.size();
+        cache.historyCursor = m_historyCursor;
+        cache.historyEpoch = m_historyEpoch;
+        cache.succeeded = owner.InspectSelectedObject(m_selectedObject, cache.metadata, cache.object);
+    }
+
+    if(!cache.succeeded)
+    {
+        return false;
+    }
+
+    metadata = cache.metadata;
+    object = cache.object;
+    return true;
+}
+
+std::optional<SceneObjectMetadata> Editor::SelectedObjectMetadata(const FileBackedDemoScene& owner) const
+{
+    SceneObjectMetadata metadata;
+    SceneObjectDocument object;
+
+    if(!InspectSelection(owner, metadata, object))
+    {
+        return std::nullopt;
+    }
+
+    return metadata;
 }

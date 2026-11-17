@@ -13,6 +13,7 @@
 #include <optional>
 #include <memory>
 #include <span>
+#include <functional>
 #include <string>
 #include <map>
 #include <thread>
@@ -401,6 +402,29 @@ public:
     // policy; FileBackedDemoScene configures it for this mode.
     bool LoadArchive(std::shared_ptr<const CookedScene::ArchiveScene> source, std::string* errorMessage = nullptr);
     bool IsArchiveActivation() const noexcept { return bool(m_archiveScene); }
+    // W4: a non-empty reason makes the runtime read-only (composite World preview). Document mutations, material assignment
+    // and every save path then fail with this reason. Residency and presentation are unaffected.
+    void SetReadOnly(std::string reason);
+    const std::string& GetReadOnlyReason() const noexcept { return m_readOnlyReason; }
+
+    // Forces the next metadata read to revalidate the whole scene (revised S0.3). Called by every funnel that changes runtime
+    // bindings or presentation without a document edit; callers that change render-object bindings directly must call it too.
+    void InvalidateValidatedObjects() noexcept
+    {
+        ++m_validityEpoch;
+    }
+    // W5: a composite World session validates every edited candidate document against its ownership rules, and gives new
+    // entities their level namespace (and default parent) before their identity is reported. Empty for ordinary scenes.
+    using CandidateValidator = std::function<bool(const SceneDocument& candidate, std::string& error)>;
+    using NewEntityPolicy = std::function<void(SceneObjectDocument& object)>;
+    void SetCompositeHooks(CandidateValidator validator, NewEntityPolicy newEntity);
+    void ApplyNewEntityPolicy(SceneObjectDocument& object) const
+    {
+        if(m_newEntityPolicy)
+        {
+            m_newEntityPolicy(object);
+        }
+    }
     // The archive this packaged runtime scene was loaded from; null for editable project scenes.
     const std::shared_ptr<const CookedScene::ArchiveScene>& GetArchiveScene() const noexcept { return m_archiveScene; }
     bool PrepareMetadata(FileSceneAssetCatalog& catalog, std::string* errorMessage = nullptr);
@@ -467,6 +491,10 @@ public:
         std::string* errorMessage = nullptr,
         bool replaceExisting = true);
 
+    // W2: exactly the document Save would write now (live runtime state captured into the open document), under the same
+    // preconditions, without writing anything. Save As of a saved scene copies this into a new asset.
+    bool CaptureDocumentForSave(SceneDocument& captured, std::string* errorMessage = nullptr) const;
+
 private:
     bool OwnsPhysicsPresentation(const Renderer& renderer, const PhysicsPresentationLease& lease) const noexcept;
     bool ValidatePhysicsPresentationAssociation(const Renderer& renderer,
@@ -483,6 +511,30 @@ private:
     MetadataValidationPass::Fingerprint CaptureMetadataFingerprint() const;
     // The active pass on the owner thread (S0.3); never owned here.
     mutable const MetadataValidationPass* m_metadataPass = nullptr;
+
+    // Revised S0.3 (Editor selection performance): entity inspection uses validated, generation-consistent scene state. One full
+    // validation result is kept between reads and rebuilt only when it may no longer hold:
+    //   - storage: the S0.3 fingerprint (document and object storage, count, structure revisions, mapping storage, archive). Any
+    //     reallocation, insertion, deletion, reorder, reload or archive change alters it, so no pointer is used after its storage
+    //     changed. A replaced runtime discards its index with itself.
+    //   - content: the document edit revision (every EditDocument write) plus m_validityEpoch, bumped by the binding and
+    //     publication funnels that change runtime state the validation checks (residency, material assignment, presentation,
+    //     load and commit).
+    // Entries point into the live document, so values read through them are current, never a stale copy. Owner thread only.
+    struct ValidatedObjectIndex
+    {
+        MetadataValidationPass::Fingerprint storage;
+        std::uint64_t editRevision = 0;
+        std::uint64_t validityEpoch = 0;
+        bool valid = false;
+        std::string error;
+        std::vector<const SceneObjectDocument*> byIndex;
+    };
+
+    mutable std::optional<ValidatedObjectIndex> m_validatedIndex;
+    std::uint64_t m_validityEpoch = 0;
+    const ValidatedObjectIndex& CurrentValidatedIndex() const;
+    bool InspectSelectedObjectFully(RenderObjectID runtimeIndex, SceneObjectMetadata& metadata, SceneObjectDocument& object) const;
     PhysicsPresentationReadiness GetPhysicsPresentationBoundaryReadiness(const Renderer& renderer,
         std::string& error, bool clearing) const;
     std::uint64_t m_physicsPresentationRevision = 0;
@@ -495,6 +547,11 @@ private:
     // Refresh internal evidence; previously issued external associations stay stale.
     void RevalidatePhysicsPresentationBindings(const Renderer& renderer) noexcept;
     std::shared_ptr<const CookedScene::ArchiveScene> m_archiveScene;
+    std::string m_readOnlyReason;
+    CandidateValidator m_candidateValidator;
+    NewEntityPolicy m_newEntityPolicy;
+    bool ValidateCompositeCandidate(const SceneDocument& candidate, std::string* errorMessage) const;
+    bool ReadOnlyError(std::string* errorMessage) const;
     // No coordinator exists in S.5B. Only the future matching renderer/DXR
     // transaction may call this at the main-thread pre-recording boundary.
     friend class SceneMembershipPublication;

@@ -223,7 +223,7 @@ void Editor::DrawObjectCameraControls(IDemoScene& scene)
     std::optional<SceneObjectMetadata> selection(std::in_place);
     SceneObjectDocument object;
 
-    if(!owner->InspectSelectedObject(m_selectedObject, *selection, object))
+    if(!InspectSelection(*owner, *selection, object))
     {
         return;
     }

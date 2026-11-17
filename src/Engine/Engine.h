@@ -128,6 +128,10 @@ class Engine
     friend class SceneLifecycleVerification;
     friend class AssetBrowserSceneVerification;
     friend class StartupSceneVerification;
+    friend class SceneMembershipEditorVerification;
+    friend class CompositeWorldEditorVerification;
+    friend class DemoWorldEditorVerification;
+    friend class CompositePlacementStress;
     friend class CausticVisibleVerification;
     friend class GamePlayGPUVerification;
     friend class AirPackagedParityVerification;
@@ -899,6 +903,30 @@ class Engine
     std::uint64_t m_airPhysicsSession = 0;
 
     std::optional<Editor::FileRequest> m_pendingEditorSceneOperation;
+    // W4: the World composed and validated when its open was queued; staged once the scene change is confirmed.
+    std::shared_ptr<CompositeWorld> m_pendingCompositeWorld;
+
+    // W4: World-open timings, logged once the composite scene is active (composition, then request to activation).
+    struct CompositeWorldTiming
+    {
+        double composeMilliseconds = 0.0;
+        std::chrono::steady_clock::time_point requested;
+        bool reported = true;
+    };
+
+    CompositeWorldTiming m_compositeWorldTiming;
+
+    // CPU time of the last frame's Editor drawing and its viewport overlay capture (colliders, camera frusta, light and AIR motor
+    // wireframes), for diagnostics: two clock reads per region, no synchronisation.
+    struct FrameCpuTimings
+    {
+        double editorDraw = 0.0;
+        double overlays = 0.0;
+    };
+
+    FrameCpuTimings m_frameCpuTimings;
+    void ReportCompositeWorldActivation(const FileBackedDemoScene* scene);
+    void ProcessCompositeSaveRequest(FileBackedDemoScene* scene);
 
     std::string m_sceneOperationError;
     bool m_sceneDecisionPending = false;
@@ -906,6 +934,7 @@ class Engine
     bool m_editorRelaunchStarted = false;
     bool CanPerformSceneLifecycle(std::string& error) const;
     enum class SceneSaveResult { Saved, Canceled, Failed };
+    SceneSaveResult SaveCompositeWorld(FileBackedDemoScene& scene, std::optional<std::size_t> onlyDocument);
     SceneSaveResult SaveEditorScene(FileBackedDemoScene& scene, bool saveAs,
         const std::filesystem::path& selectedPath = {}, bool overwriteConfirmed = false);
     void ResolveSceneChangeDecision(Editor::SceneChangeDecision decision);

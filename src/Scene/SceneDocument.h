@@ -92,6 +92,65 @@ struct SceneObjectDocument
     // Empty means root; otherwise the exact ID of another object in this scene. Persisted from
     // schema 9 / cooked payload 9; historical versions load every object as a root.
     std::string parentID;
+
+    // Runtime only, never serialized: in a composite World (W4/W5) this Local Level root entity is parented to its level's
+    // synthetic placement node, which stands in for "no parent". The root-object rule for Physics, Trigger Collider and Character
+    // Controller treats it as a root. Always false in a scene document read from or written to disk.
+    bool parentIsLevelNode = false;
+};
+
+// W1.1: a .scene document is either a World or a Local Level. Historical documents (schema < 28) are Local Levels.
+enum class SceneKind : std::uint8_t
+{
+    Local,
+    World
+};
+
+// W2: where a World places one of its Local Levels: translation and full 3D rotation (Euler radians, the Transform convention).
+// There is no scale. Entity transforms inside the Local Level stay in the level's own frame.
+struct ScenePlacement
+{
+    Vector3 position{0.0f, 0.0f, 0.0f};
+    Vector3 rotation{0.0f, 0.0f, 0.0f};
+
+    bool operator==(const ScenePlacement& other) const
+    {
+        return position.x == other.position.x && position.y == other.position.y && position.z == other.position.z &&
+            rotation.x == other.rotation.x && rotation.y == other.rotation.y && rotation.z == other.rotation.z;
+    }
+};
+
+// W2: one Local Level of a World, by the Local Level's asset ID (its document id, a canonical GUID).
+struct SceneMembership
+{
+    std::string level;
+    ScenePlacement placement;
+
+    bool operator==(const SceneMembership&) const = default;
+};
+
+// W3: a Local Level's environment override switches, one per group. An enabled group uses the Local Level's own stored values; a
+// disabled group inherits its World's values, or the Engine scene defaults when the Local Level has no (valid) World. Stored values
+// are kept whichever way a switch is set. Worlds have none. Documents from before schema 30 (and documents built in code) have every
+// group enabled, which is how Local Levels behaved before W3; new Local Levels start with every group disabled
+// (SceneEnvironmentOverrides::None()).
+struct SceneEnvironmentOverrides
+{
+    // environmentReference and lightingSettings.environmentLuminanceScale.
+    bool sky = true;
+    // lightingSettings.referenceEV100.
+    bool exposure = true;
+    // environmentalHaze.
+    bool haze = true;
+    // mistRendering.
+    bool mist = true;
+    // airEnvironment.
+    bool airEnvironment = true;
+    // airSimulation.ambientVelocity only; the rest of the AIR simulation configuration is World-owned.
+    bool wind = true;
+
+    static SceneEnvironmentOverrides None() { return {false, false, false, false, false, false}; }
+    bool operator==(const SceneEnvironmentOverrides&) const = default;
 };
 
 struct SceneDocument
@@ -139,10 +198,30 @@ struct SceneDocument
     // R1.5: moving-solid participation: airSimulation.movingSolids (optional, false when absent) and each physics component's
     // airParticipation (required from this version; earlier scenes read Automatic).
     static constexpr std::uint32_t kMovingSolidParticipationSchemaVersion = 27;
-    static constexpr std::uint32_t kSchemaVersion = kMovingSolidParticipationSchemaVersion;
+    // W1.1: the explicit scene kind (required) and a canonical GUID id (required when written). Older documents load as Local
+    // Levels with their id unchanged, and are written again only after migration.
+    static constexpr std::uint32_t kSceneKindSchemaVersion = 28;
+    // W2: World/Local membership. A Local Level states its owning World ("owningWorld": GUID or null, required); a World lists
+    // its Local Levels with their placements ("members", required). Earlier documents are unassigned Local Levels (or, schema
+    // 28 only, Worlds without members, which cannot be written).
+    static constexpr std::uint32_t kMembershipSchemaVersion = 29;
+    // W3: a Local Level's environment override switches ("environmentOverrides", required; Worlds have none). Earlier Local Levels
+    // read with every switch enabled.
+    static constexpr std::uint32_t kEnvironmentOverridesSchemaVersion = 30;
+    static constexpr std::uint32_t kSchemaVersion = kEnvironmentOverridesSchemaVersion;
 
     std::uint32_t schemaVersion = kSchemaVersion;
 
+    SceneKind kind = SceneKind::Local;
+
+    // Local Levels only: the owning World's asset ID, or empty when unassigned. Changed only by ProjectSceneMembership.
+    std::string owningWorld;
+    // Worlds only: the Local Levels, in authored order. Changed only by ProjectSceneMembership.
+    std::vector<SceneMembership> members;
+    // Local Levels only (W3): which environment groups use this document's own values.
+    SceneEnvironmentOverrides environmentOverrides;
+
+    // In memory, any non-empty id (historical documents keep theirs until migrated); written documents require a canonical GUID.
     std::string id;
     std::string name = "Untitled Scene";
     // Empty preserves the historical neutral environment; builtin:none explicitly disables it.
@@ -180,6 +259,10 @@ bool ValidateSceneDocument(
     const SceneDocument& document,
     std::string* errorMessage = nullptr);
 
+// W1.1: World documents serialize and validate, but nothing opens them until World loading exists (W4). Every path that opens a
+// scene as an ordinary (Local) scene calls this first, so a World is refused explicitly instead of being loaded as a Local Level.
+bool ValidateSceneKindOpenable(const SceneDocument& document, std::string* errorMessage = nullptr);
+
 // R1.1: the AIR simulation configuration a frame runs with, the one path the Engine uses. In order: the Editor's Play or Physics
 // Simulation session override, if any (the packaged runtime never has one); the scene's own block; the defaults. `document` is null
 // when no scene document is active.
@@ -189,3 +272,7 @@ AirSimulationSettings ResolveAirSimulation(const SceneDocument* document, const 
 bool ValidateSceneObjectComponents(const SceneObjectDocument& object, std::string* errorMessage = nullptr);
 // Shared output admission; all current codecs preserve the complete authored document.
 bool ValidateSceneDocumentPersistence(const SceneDocument& document, std::string* errorMessage = nullptr);
+// W1.1: admission for writing a .scene file (schema 28). Beyond ValidateSceneDocumentPersistence, the id must be a canonical GUID,
+// so a historical document with a legacy id cannot be written until it is migrated. Runtime preparation and cooking keep using
+// ValidateSceneDocumentPersistence, so legacy ids still load and run.
+bool ValidateSceneDocumentWrite(const SceneDocument& document, std::string* errorMessage = nullptr);

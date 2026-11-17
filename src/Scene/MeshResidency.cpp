@@ -760,6 +760,8 @@ MeshResidencySourcePins FileSceneRuntime::ValidatePreparedMeshResidency(const Me
 
 bool FileSceneRuntime::CommitMeshResidency(const MeshResidencyToken& token, FileSceneAssetCatalog& catalog, std::string* error)
 {
+    InvalidateValidatedObjects(); // Revised S0.3: runtime bindings or presentation change here.
+
     if (m_scene.HasPhysicsPresentation())
         return Fail(error, "Active physics presentation requires coordinated renderer residency publication.");
     auto sources = ValidatePreparedMeshResidency(token, catalog, error);

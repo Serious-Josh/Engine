@@ -23,7 +23,9 @@ namespace
     constexpr int kBakedReflectionsSchemaVersion = 7;
     constexpr int kBakedPathingSchemaVersion = 8;
     constexpr int kVoxelSchemaVersion = 9;
-    constexpr int kSchemaVersion = kVoxelSchemaVersion;
+    // W1.2: scene assets.
+    constexpr int kSceneSchemaVersion = 10;
+    constexpr int kSchemaVersion = kSceneSchemaVersion;
 
     const char* AssetTypeToString(AssetType type)
     {
@@ -50,6 +52,8 @@ namespace
                 return "voxelRegion";
             case AssetType::VoxelManifest:
                 return "voxelManifest";
+            case AssetType::Scene:
+                return "scene";
             default:
                 return nullptr;
         }
@@ -122,6 +126,12 @@ namespace
         if(value == "acousticMaterial")
         {
             type = AssetType::AcousticMaterial;
+            return true;
+        }
+
+        if(value == "scene")
+        {
+            type = AssetType::Scene;
             return true;
         }
 
@@ -206,9 +216,19 @@ nlohmann::json AssetRegistrySerializer::Serialize(const ProjectAssetRegistry& re
         {
             document["schemaVersion"] = (std::max)(document["schemaVersion"].get<int>(), kAcousticMaterialSchemaVersion);
         }
+
+        if(record.type == AssetType::Scene)
+        {
+            document["schemaVersion"] = (std::max)(document["schemaVersion"].get<int>(), kSceneSchemaVersion);
+        }
     }
 
     return document;
+}
+
+std::string AssetRegistrySerializer::ToBytes(const ProjectAssetRegistry& registry)
+{
+    return Serialize(registry).dump(4) + '\n';
 }
 
 bool AssetRegistrySerializer::Deserialize(
@@ -314,12 +334,17 @@ bool AssetRegistrySerializer::Deserialize(
                 return Fail(errorMessage, "Audio bank assets require registry schema 4.");
             }
 
+            if(type == AssetType::Scene && document["schemaVersion"].get<int>() < kSceneSchemaVersion)
+            {
+                return Fail(errorMessage, "Scene assets require registry schema 10.");
+            }
+
             const auto canonicalPath = record.relativePath.generic_u8string();
-            const bool discoveredType = type == AssetType::Script || type == AssetType::AudioBank;
+            const bool discoveredType = type == AssetType::Script || type == AssetType::AudioBank || type == AssetType::Scene;
 
             if(discoveredType && pathText != std::string(canonicalPath.begin(), canonicalPath.end()))
             {
-                return Fail(errorMessage, "Script and audio bank registry paths must use canonical spelling.");
+                return Fail(errorMessage, "Script, audio bank and scene registry paths must use canonical spelling.");
             }
 
             if(entry.contains("importUnits"))
@@ -364,7 +389,7 @@ bool AssetRegistrySerializer::SaveToFile(
     try
     {
         // Complete serialization must succeed before file creation.
-        const std::string serialized = Serialize(registry).dump(4) + '\n';
+        const std::string serialized = ToBytes(registry);
 
         if (path.empty() || !path.has_filename())
         {

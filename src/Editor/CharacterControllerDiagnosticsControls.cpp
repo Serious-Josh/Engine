@@ -58,7 +58,7 @@ void Editor::UpdateCharacterDriveInput(const IDemoScene& scene)
 
     // The drive follows one selected controller in one session; anything else disables it.
     const auto* owner = dynamic_cast<const FileBackedDemoScene*>(&scene);
-    const auto selection = owner ? owner->GetObjectMetadata(m_selectedObject) : std::nullopt;
+    const auto selection = owner ? SelectedObjectMetadata(*owner) : std::nullopt;
 
     if(m_physicsState != PhysicsState::Playing || !selection || selection->objectID != m_characterDrive->objectID ||
         !m_characterDiagnostics || m_characterDiagnostics->sessionGeneration != m_characterDrive->sessionGeneration)

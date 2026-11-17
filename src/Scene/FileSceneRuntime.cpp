@@ -3,6 +3,9 @@
 #include "Scene/FileSceneRuntime.h"
 
 #include <cassert>
+#include <cstdlib>
+
+#include <cassert>
 
 #include "Scene/SceneAssetResolver.h"
 #include "Scene/FileSceneAssetCatalog.h"
@@ -54,6 +57,11 @@ bool FileSceneRuntime::ReorderObjects(const SceneObjectOrderIdentity& identity,
     const std::vector<std::string>& expectedOrder, const std::vector<std::string>& replacementOrder,
     std::string* errorMessage)
 {
+    if(!m_readOnlyReason.empty())
+    {
+        return ReadOnlyError(errorMessage);
+    }
+
     const auto fail = [errorMessage](const char* message)
     {
         if(errorMessage)
@@ -149,12 +157,22 @@ bool FileSceneRuntime::SetObjectCamera(const SceneObjectMetadata& selection,
     const std::optional<CameraComponent>& expected,
     const std::optional<CameraComponent>& replacement, std::string* errorMessage)
 {
+    if(!m_readOnlyReason.empty())
+    {
+        return ReadOnlyError(errorMessage);
+    }
+
     const SceneCameraChange change{selection, expected, replacement};
     return SetObjectCameras({&change, 1}, errorMessage);
 }
 
 bool FileSceneRuntime::SetObjectCameras(std::span<const SceneCameraChange> changes, std::string* errorMessage)
 {
+    if(!m_readOnlyReason.empty())
+    {
+        return ReadOnlyError(errorMessage);
+    }
+
     const auto fail = [&](const char* message)
     {
         if(errorMessage)
@@ -232,7 +250,7 @@ bool FileSceneRuntime::SetObjectCameras(std::span<const SceneCameraChange> chang
         candidate.objects[indices[change]].camera = changes[change].replacement;
     }
 
-    if(!ValidateSceneDocument(candidate, errorMessage))
+    if(!(ValidateSceneDocument(candidate, errorMessage) && ValidateCompositeCandidate(candidate, errorMessage)))
     {
         return false;
     }
@@ -259,6 +277,11 @@ bool FileSceneRuntime::SetObjectLight(const SceneObjectMetadata& selection,
     const std::optional<LightComponent>& expected,
     const std::optional<LightComponent>& replacement, std::string* errorMessage)
 {
+    if(!m_readOnlyReason.empty())
+    {
+        return ReadOnlyError(errorMessage);
+    }
+
     const auto fail = [&](const char* message)
     {
         if(errorMessage)
@@ -311,7 +334,7 @@ bool FileSceneRuntime::SetObjectLight(const SceneObjectMetadata& selection,
 
     candidate.objects[index].light = replacement;
 
-    if(!ValidateSceneDocument(candidate, errorMessage))
+    if(!(ValidateSceneDocument(candidate, errorMessage) && ValidateCompositeCandidate(candidate, errorMessage)))
     {
         return false;
     }
@@ -332,6 +355,11 @@ bool FileSceneRuntime::SetObjectAirMotor(const SceneObjectMetadata& selection,
     const std::optional<AirMotorComponent>& expected,
     const std::optional<AirMotorComponent>& replacement, std::string* errorMessage)
 {
+    if(!m_readOnlyReason.empty())
+    {
+        return ReadOnlyError(errorMessage);
+    }
+
     const auto fail = [&](const char* message)
     {
         if(errorMessage)
@@ -384,7 +412,7 @@ bool FileSceneRuntime::SetObjectAirMotor(const SceneObjectMetadata& selection,
 
     candidate.objects[index].airMotor = replacement;
 
-    if(!ValidateSceneDocument(candidate, errorMessage))
+    if(!(ValidateSceneDocument(candidate, errorMessage) && ValidateCompositeCandidate(candidate, errorMessage)))
     {
         return false;
     }
@@ -405,6 +433,11 @@ bool FileSceneRuntime::SetObjectMistEmitter(const SceneObjectMetadata& selection
     const std::optional<MistEmitterComponent>& expected,
     const std::optional<MistEmitterComponent>& replacement, std::string* errorMessage)
 {
+    if(!m_readOnlyReason.empty())
+    {
+        return ReadOnlyError(errorMessage);
+    }
+
     const auto fail = [&](const char* message)
     {
         if(errorMessage)
@@ -457,7 +490,7 @@ bool FileSceneRuntime::SetObjectMistEmitter(const SceneObjectMetadata& selection
 
     candidate.objects[index].mistEmitter = replacement;
 
-    if(!ValidateSceneDocument(candidate, errorMessage))
+    if(!(ValidateSceneDocument(candidate, errorMessage) && ValidateCompositeCandidate(candidate, errorMessage)))
     {
         return false;
     }
@@ -477,6 +510,11 @@ bool FileSceneRuntime::SetObjectScript(const SceneObjectMetadata& selection,
     const std::optional<ScriptComponent>& expected,
     const std::optional<ScriptComponent>& replacement, std::string* errorMessage)
 {
+    if(!m_readOnlyReason.empty())
+    {
+        return ReadOnlyError(errorMessage);
+    }
+
     const auto fail = [&](const char* message)
     {
         if(errorMessage)
@@ -529,7 +567,7 @@ bool FileSceneRuntime::SetObjectScript(const SceneObjectMetadata& selection,
 
     candidate.objects[index].script = replacement;
 
-    if(!ValidateSceneDocument(candidate, errorMessage))
+    if(!(ValidateSceneDocument(candidate, errorMessage) && ValidateCompositeCandidate(candidate, errorMessage)))
     {
         return false;
     }
@@ -549,6 +587,11 @@ bool FileSceneRuntime::SetObjectScript(const SceneObjectMetadata& selection,
 bool FileSceneRuntime::SetObjectAudio(const SceneObjectMetadata& selection, const AudioComponentState& expected,
     const AudioComponentState& replacement, std::string* errorMessage)
 {
+    if(!m_readOnlyReason.empty())
+    {
+        return ReadOnlyError(errorMessage);
+    }
+
     const auto fail = [&](const char* message)
     {
         if(errorMessage)
@@ -602,7 +645,7 @@ bool FileSceneRuntime::SetObjectAudio(const SceneObjectMetadata& selection, cons
     candidate.objects[index].audioSource = replacement.source;
     candidate.objects[index].audioListener = replacement.listener;
 
-    if(!ValidateSceneDocument(candidate, errorMessage))
+    if(!(ValidateSceneDocument(candidate, errorMessage) && ValidateCompositeCandidate(candidate, errorMessage)))
     {
         return false;
     }
@@ -626,6 +669,11 @@ bool FileSceneRuntime::SetObjectAudio(const SceneObjectMetadata& selection, cons
 bool FileSceneRuntime::SetObjectAcoustics(const SceneObjectMetadata& selection, const std::optional<AcousticSettings>& expected,
     const std::optional<AcousticSettings>& replacement, std::string* errorMessage)
 {
+    if(!m_readOnlyReason.empty())
+    {
+        return ReadOnlyError(errorMessage);
+    }
+
     const auto fail = [&](const char* message)
     {
         if(errorMessage)
@@ -669,6 +717,11 @@ bool FileSceneRuntime::SetObjectAcoustics(const SceneObjectMetadata& selection, 
 
 bool FileSceneRuntime::SetObjectsVoxelSettings(const std::vector<VoxelSettingsChange>& changes, std::string* errorMessage)
 {
+    if(!m_readOnlyReason.empty())
+    {
+        return ReadOnlyError(errorMessage);
+    }
+
     const auto fail = [&](std::string message)
     {
         if(errorMessage)
@@ -728,6 +781,21 @@ bool FileSceneRuntime::SetObjectsVoxelSettings(const std::vector<VoxelSettingsCh
 bool FileSceneRuntime::SetSceneVoxelBake(const std::optional<VoxelBakeSettings>& expected, const std::optional<VoxelBakeSettings>& replacement,
     std::string* errorMessage)
 {
+    if(m_candidateValidator)
+    {
+        if(errorMessage)
+        {
+            *errorMessage = "Voxel bake settings belong to each Local Level and are not edited in a World (W9); open the Local Level.";
+        }
+
+        return false;
+    }
+
+    if(!m_readOnlyReason.empty())
+    {
+        return ReadOnlyError(errorMessage);
+    }
+
     if(m_fileScene.GetDocument().voxelBake != expected)
     {
         if(errorMessage)
@@ -755,6 +823,11 @@ bool FileSceneRuntime::SetSceneVoxelBake(const std::optional<VoxelBakeSettings>&
 bool FileSceneRuntime::SetSceneEnvironmentalHaze(const std::optional<EnvironmentalHazeSettings>& expected,
     const std::optional<EnvironmentalHazeSettings>& replacement, std::string* errorMessage)
 {
+    if(!m_readOnlyReason.empty())
+    {
+        return ReadOnlyError(errorMessage);
+    }
+
     if(m_fileScene.GetDocument().environmentalHaze != expected)
     {
         if(errorMessage)
@@ -781,6 +854,11 @@ bool FileSceneRuntime::SetSceneEnvironmentalHaze(const std::optional<Environment
 bool FileSceneRuntime::SetSceneAirEnvironment(const std::optional<AirEnvironmentSettings>& expected,
     const std::optional<AirEnvironmentSettings>& replacement, std::string* errorMessage)
 {
+    if(!m_readOnlyReason.empty())
+    {
+        return ReadOnlyError(errorMessage);
+    }
+
     if(m_fileScene.GetDocument().airEnvironment != expected)
     {
         if(errorMessage)
@@ -807,6 +885,11 @@ bool FileSceneRuntime::SetSceneAirEnvironment(const std::optional<AirEnvironment
 bool FileSceneRuntime::SetSceneAirSimulation(const std::optional<AirSimulationSettings>& expected,
     const std::optional<AirSimulationSettings>& replacement, std::string* errorMessage)
 {
+    if(!m_readOnlyReason.empty())
+    {
+        return ReadOnlyError(errorMessage);
+    }
+
     if(m_fileScene.GetDocument().airSimulation != expected)
     {
         if(errorMessage)
@@ -834,6 +917,11 @@ bool FileSceneRuntime::SetSceneAirSimulation(const std::optional<AirSimulationSe
 bool FileSceneRuntime::SetSceneMistRendering(const std::optional<MistRenderSettings>& expected,
     const std::optional<MistRenderSettings>& replacement, std::string* errorMessage)
 {
+    if(!m_readOnlyReason.empty())
+    {
+        return ReadOnlyError(errorMessage);
+    }
+
     if(m_fileScene.GetDocument().mistRendering != expected)
     {
         if(errorMessage)
@@ -866,6 +954,11 @@ bool FileSceneRuntime::SetSceneMistRendering(const std::optional<MistRenderSetti
 bool FileSceneRuntime::SetObjectProbeVolume(const SceneObjectMetadata& selection, const std::optional<ProbeVolumeComponent>& expected,
     const std::optional<ProbeVolumeComponent>& replacement, std::string* errorMessage)
 {
+    if(!m_readOnlyReason.empty())
+    {
+        return ReadOnlyError(errorMessage);
+    }
+
     const auto fail = [&](const char* message)
     {
         if(errorMessage)
@@ -911,6 +1004,11 @@ bool FileSceneRuntime::SetObjectPhysics(const SceneObjectMetadata& selection,
     const std::optional<Physics::PhysicsComponent>& expected,
     const std::optional<Physics::PhysicsComponent>& replacement, std::string* errorMessage)
 {
+    if(!m_readOnlyReason.empty())
+    {
+        return ReadOnlyError(errorMessage);
+    }
+
     const auto fail = [&](const char* message)
     {
         if(errorMessage)
@@ -975,6 +1073,11 @@ bool FileSceneRuntime::SetObjectPhysics(const SceneObjectMetadata& selection,
 bool FileSceneRuntime::RenameObject(const SceneObjectMetadata& selection, std::string_view expectedName,
     std::string name, std::string* errorMessage, SceneObjectNamePolicy policy)
 {
+    if(!m_readOnlyReason.empty())
+    {
+        return ReadOnlyError(errorMessage);
+    }
+
     const auto fail = [errorMessage](const char* message)
     {
         if(errorMessage)
@@ -1153,7 +1256,74 @@ bool FileSceneRuntime::ValidateObjectMetadataState(std::optional<RenderObjectID>
         return m_metadataPass->Resolve(selectedIndex, selected, errorMessage);
     }
 
-    return ValidateObjectMetadataStateFully(selectedIndex, selected, errorMessage);
+    // Revised S0.3: otherwise the persistent validated index, rebuilt (one full validation) only when storage or content changed.
+    const ValidatedObjectIndex& index = CurrentValidatedIndex();
+    selected = nullptr;
+
+    if(!index.valid)
+    {
+        if(errorMessage)
+        {
+            *errorMessage = index.error;
+        }
+
+        return false;
+    }
+
+    if(selectedIndex && *selectedIndex >= index.byIndex.size())
+    {
+        if(errorMessage)
+        {
+            *errorMessage = "Selected runtime object index is out of range.";
+        }
+
+        return false;
+    }
+
+    if(selectedIndex)
+    {
+        selected = index.byIndex[*selectedIndex];
+    }
+
+    return true;
+}
+
+const FileSceneRuntime::ValidatedObjectIndex& FileSceneRuntime::CurrentValidatedIndex() const
+{
+    const auto storage = CaptureMetadataFingerprint();
+    const std::uint64_t editRevision = m_fileScene.GetEditRevision();
+    const bool current = m_validatedIndex && m_validatedIndex->storage == storage && m_validatedIndex->editRevision == editRevision &&
+        m_validatedIndex->validityEpoch == m_validityEpoch;
+
+#ifndef NDEBUG
+    // Diagnostic verification mode (ENGINE_DIAG_METADATA_CROSSCHECK): every reuse is compared with a fresh full validation.
+    static const bool crossCheck = std::getenv("ENGINE_DIAG_METADATA_CROSSCHECK") != nullptr;
+
+    if(current && crossCheck)
+    {
+        std::vector<const SceneObjectDocument*> fresh(m_scene.GetRenderObjects().size(), nullptr);
+        const SceneObjectDocument* unused = nullptr;
+        std::string error;
+        const bool valid = ValidateObjectMetadataStateFully(std::nullopt, unused, &error, &fresh);
+        assert(valid == m_validatedIndex->valid && (!valid || fresh == m_validatedIndex->byIndex) &&
+            "FileSceneRuntime validated object index is stale: a mutation bypassed its invalidation");
+    }
+#endif
+
+    if(current)
+    {
+        return *m_validatedIndex;
+    }
+
+    ValidatedObjectIndex rebuilt;
+    rebuilt.storage = storage;
+    rebuilt.editRevision = editRevision;
+    rebuilt.validityEpoch = m_validityEpoch;
+    rebuilt.byIndex.assign(m_scene.GetRenderObjects().size(), nullptr);
+    const SceneObjectDocument* unused = nullptr;
+    rebuilt.valid = ValidateObjectMetadataStateFully(std::nullopt, unused, &rebuilt.error, &rebuilt.byIndex);
+    m_validatedIndex = std::move(rebuilt);
+    return *m_validatedIndex;
 }
 
 FileSceneRuntime::MetadataValidationPass::Fingerprint FileSceneRuntime::CaptureMetadataFingerprint() const
@@ -1406,6 +1576,12 @@ std::optional<SceneObjectMetadata> FileSceneRuntime::GetObjectMetadata(
 std::optional<MaterialAssignmentToken> FileSceneRuntime::PrepareMaterialAssignment(
     const SceneObjectMetadata& selection, std::string materialReference, std::string* errorMessage)
 {
+    if(!m_readOnlyReason.empty())
+    {
+        ReadOnlyError(errorMessage);
+        return std::nullopt;
+    }
+
     if(errorMessage)
     {
         errorMessage->clear();
@@ -1469,7 +1645,7 @@ std::optional<MaterialAssignmentToken> FileSceneRuntime::PrepareMaterialAssignme
             }
         }
 
-        if(!ValidateSceneDocument(candidate, errorMessage))
+        if(!(ValidateSceneDocument(candidate, errorMessage) && ValidateCompositeCandidate(candidate, errorMessage)))
         {
             return std::nullopt;
         }
@@ -1645,7 +1821,7 @@ std::optional<MaterialAssignmentToken> FileSceneRuntime::PrepareMaterialSlotAssi
             target->materialSlotBindings.erase(*prepared.slotID);
         }
 
-        if(!ValidateSceneDocument(candidate, errorMessage))
+        if(!(ValidateSceneDocument(candidate, errorMessage) && ValidateCompositeCandidate(candidate, errorMessage)))
         {
             return std::nullopt;
         }
@@ -1668,6 +1844,8 @@ Material* FileSceneRuntime::GetPreparedMaterialAssignmentMaterial(const Material
 bool FileSceneRuntime::CommitMaterialAssignment(
     const MaterialAssignmentToken& token, Material& retainedSceneMaterial, std::string* errorMessage)
 {
+    InvalidateValidatedObjects(); // Revised S0.3: runtime bindings or the document may change here.
+
     if (m_scene.HasPhysicsPresentation())
         return AssignmentError(errorMessage, "Clear physics presentation before legacy material assignment; use coordinated publication to retain overrides.");
     if(errorMessage)
@@ -1768,6 +1946,8 @@ bool FileSceneRuntime::CommitMaterialAssignment(
 
 bool FileSceneRuntime::RollbackMaterialAssignment(const MaterialAssignmentToken& token, std::string* errorMessage)
 {
+    InvalidateValidatedObjects(); // Revised S0.3: runtime bindings or the document may change here.
+
     if(errorMessage)
     {
         errorMessage->clear();
@@ -1832,6 +2012,8 @@ bool FileSceneRuntime::RollbackMaterialAssignment(const MaterialAssignmentToken&
 
 bool FileSceneRuntime::FinishMaterialAssignment(const MaterialAssignmentToken& token, std::string* errorMessage)
 {
+    InvalidateValidatedObjects(); // Revised S0.3: runtime bindings or the document may change here.
+
     if(errorMessage)
     {
         errorMessage->clear();
@@ -1868,6 +2050,8 @@ bool FileSceneRuntime::FinishMaterialAssignment(const MaterialAssignmentToken& t
 
 bool FileSceneRuntime::CancelMaterialAssignment(const MaterialAssignmentToken& token, std::string* errorMessage)
 {
+    InvalidateValidatedObjects(); // Revised S0.3: runtime bindings or the document may change here.
+
     if(errorMessage)
     {
         errorMessage->clear();
@@ -1920,6 +2104,8 @@ bool FileSceneRuntime::Prepare(
 
 bool FileSceneRuntime::Commit(std::string* errorMessage)
 {
+    InvalidateValidatedObjects(); // Revised S0.3: runtime bindings or the document may change here.
+
     if(m_materialAssignment)
     {
         return AssignmentError(errorMessage, "Finish/cancel/rollback the material assignment before scene lifecycle operations.");
@@ -1975,6 +2161,8 @@ bool FileSceneRuntime::Commit(std::string* errorMessage)
 
 bool FileSceneRuntime::LoadArchive(std::shared_ptr<const CookedScene::ArchiveScene> source, std::string* error)
 {
+    InvalidateValidatedObjects(); // Revised S0.3: runtime bindings or the document may change here.
+
     if(m_objectMapping.scene || m_materialAssignment || !source || !source->ValidateReferences(error))
         return AssignmentError(error,"Archive load requires an inactive runtime and a validated source.");
     if(!m_fileScene.LoadDocument(source->metadata.document,error)) return false;
@@ -2007,6 +2195,8 @@ bool FileSceneRuntime::PrepareMetadata(FileSceneAssetCatalog& catalog, std::stri
 
 bool FileSceneRuntime::CommitMetadata(FileSceneAssetCatalog& catalog, std::string* error)
 {
+    InvalidateValidatedObjects(); // Revised S0.3: runtime bindings or the document may change here.
+
     if(m_materialAssignment || !m_preparedMetadata || !m_fileScene.HasDocument())
     {
         return AssignmentError(error, "Metadata commit requires a prepared metadata scene without a material assignment.");
@@ -2065,6 +2255,8 @@ bool FileSceneRuntime::New(
     std::string sceneID,
     std::string sceneName)
 {
+    InvalidateValidatedObjects(); // Revised S0.3: runtime bindings or the document may change here.
+
     if(m_materialAssignment || m_archiveScene)
     {
         return false;
@@ -2089,6 +2281,8 @@ bool FileSceneRuntime::Open(
     const std::filesystem::path& path,
     std::string* errorMessage)
 {
+    InvalidateValidatedObjects(); // Revised S0.3: runtime bindings or the document may change here.
+
     if(m_materialAssignment)
     {
         return AssignmentError(errorMessage, "Finish/cancel/rollback the material assignment before scene lifecycle operations.");
@@ -2112,6 +2306,8 @@ bool FileSceneRuntime::LoadUnsavedDocument(
     SceneDocument document,
     std::string* errorMessage)
 {
+    InvalidateValidatedObjects(); // Revised S0.3: runtime bindings or the document may change here.
+
     if(m_materialAssignment)
     {
         return AssignmentError(errorMessage, "Finish/cancel/rollback the material assignment before scene lifecycle operations.");
@@ -2141,9 +2337,55 @@ bool FileSceneRuntime::LoadUnsavedDocument(
     return true;
 }
 
+// W4: a composite World preview is read-only until W5 gives each level its own editing context; every document mutation and
+// save path refuses here, independently of what the Editor UI allows.
+void FileSceneRuntime::SetReadOnly(std::string reason)
+{
+    m_readOnlyReason = std::move(reason);
+}
+
+bool FileSceneRuntime::ReadOnlyError(std::string* errorMessage) const
+{
+    if(errorMessage)
+    {
+        *errorMessage = m_readOnlyReason;
+    }
+
+    return false;
+}
+
+bool FileSceneRuntime::ValidateCompositeCandidate(const SceneDocument& candidate, std::string* errorMessage) const
+{
+    if(!m_candidateValidator)
+    {
+        return true;
+    }
+
+    std::string error;
+
+    if(m_candidateValidator(candidate, error))
+    {
+        return true;
+    }
+
+    if(errorMessage)
+    {
+        *errorMessage = error;
+    }
+
+    return false;
+}
+
+void FileSceneRuntime::SetCompositeHooks(CandidateValidator validator, NewEntityPolicy newEntity)
+{
+    m_candidateValidator = std::move(validator);
+    m_newEntityPolicy = std::move(newEntity);
+}
+
 SceneDocument& FileSceneRuntime::EditDocument()
 {
     if(m_archiveScene) throw std::logic_error("Packaged scenes are immutable.");
+    if(!m_readOnlyReason.empty()) throw std::logic_error(m_readOnlyReason);
     DiscardPreparedScene();
     return m_fileScene.EditDocument();
 }
@@ -2158,6 +2400,34 @@ bool FileSceneRuntime::SaveAs(
     std::string* errorMessage,
     bool replaceExisting)
 {
+    if(!m_readOnlyReason.empty())
+    {
+        return ReadOnlyError(errorMessage);
+    }
+
+    if(m_archiveScene) return AssignmentError(errorMessage,"Archive scenes are read-only; no loose scene save path.");
+    if(m_materialAssignment)
+    {
+        return AssignmentError(errorMessage, "Finish/cancel/rollback the material assignment before scene lifecycle operations.");
+    }
+
+    SceneDocument candidate;
+
+    if(!CaptureDocumentForSave(candidate, errorMessage))
+    {
+        return false;
+    }
+
+    return m_fileScene.SaveCaptured(std::move(candidate), path, errorMessage, replaceExisting);
+}
+
+bool FileSceneRuntime::CaptureDocumentForSave(SceneDocument& captured, std::string* errorMessage) const
+{
+    if(!m_readOnlyReason.empty())
+    {
+        return ReadOnlyError(errorMessage);
+    }
+
     if(m_archiveScene) return AssignmentError(errorMessage,"Archive scenes are read-only; no loose scene save path.");
     if(m_materialAssignment)
     {
@@ -2170,21 +2440,21 @@ bool FileSceneRuntime::SaveAs(
         return false;
     }
 
-    SceneDocument candidate;
-
-    if (!m_fileScene.HasDocument() ||
-        !CaptureSceneDocument(m_fileScene.GetDocument(), m_scene, m_objectMapping, candidate, errorMessage))
-    {
-        return false;
-    }
-
-    return m_fileScene.SaveCaptured(std::move(candidate), path, errorMessage, replaceExisting);
+    return m_fileScene.HasDocument() &&
+        CaptureSceneDocument(m_fileScene.GetDocument(), m_scene, m_objectMapping, captured, errorMessage);
 }
 
 bool FileSceneRuntime::CheckUnsavedChanges(
     bool& dirty,
     std::string* errorMessage) const
 {
+    // A read-only runtime (W4 composite preview) can never be saved, so it never holds unsaved changes to lose.
+    if(!m_readOnlyReason.empty() && m_fileScene.HasDocument())
+    {
+        dirty = false;
+        return true;
+    }
+
     SceneDocument candidate;
 
     if (!m_fileScene.HasDocument() ||
@@ -2260,9 +2530,11 @@ std::unique_ptr<FileSceneRuntime> FileSceneRuntime::PrepareObjectCreation(
         return nullptr;
     }
 
+    // W5: in a composite World the new entity joins the editing context's level (namespaced id, level root as parent).
+    ApplyNewEntityPolicy(added);
     document.objects.push_back(added);
 
-    if(!ValidateSceneDocument(document, errorMessage))
+    if(!(ValidateSceneDocument(document, errorMessage) && ValidateCompositeCandidate(document, errorMessage)))
     {
         return nullptr;
     }
@@ -2309,6 +2581,10 @@ std::unique_ptr<FileSceneRuntime> FileSceneRuntime::PrepareObjectCreation(
     prepared.objects.push_back(std::move(resolved.front()));
     auto candidate = std::make_unique<FileSceneRuntime>();
     candidate->m_fileScene = m_fileScene;
+    // The candidate replaces this runtime on acceptance, so it keeps the session's policies (composite hooks, read-only state).
+    candidate->m_candidateValidator = m_candidateValidator;
+    candidate->m_newEntityPolicy = m_newEntityPolicy;
+    candidate->m_readOnlyReason = m_readOnlyReason;
     candidate->m_fileScene.EditDocument() = std::move(document);
 
     if (auto* owner = dynamic_cast<FileSceneAssetCatalog*>(&resolver); owner &&
@@ -2386,7 +2662,7 @@ std::unique_ptr<FileSceneRuntime> FileSceneRuntime::PrepareObjectDeletion(
 
     document.objects.erase(removed);
 
-    if(!ValidateSceneDocument(document, errorMessage))
+    if(!(ValidateSceneDocument(document, errorMessage) && ValidateCompositeCandidate(document, errorMessage)))
     {
         return nullptr;
     }
@@ -2406,6 +2682,10 @@ std::unique_ptr<FileSceneRuntime> FileSceneRuntime::PrepareObjectDeletion(
 
     auto candidate = std::make_unique<FileSceneRuntime>();
     candidate->m_fileScene = m_fileScene;
+    // The candidate replaces this runtime on acceptance, so it keeps the session's policies (composite hooks, read-only state).
+    candidate->m_candidateValidator = m_candidateValidator;
+    candidate->m_newEntityPolicy = m_newEntityPolicy;
+    candidate->m_readOnlyReason = m_readOnlyReason;
     candidate->m_fileScene.EditDocument() = std::move(document);
 
     if (auto* owner = catalog; owner &&
@@ -2477,7 +2757,7 @@ std::unique_ptr<FileSceneRuntime> FileSceneRuntime::PrepareObjectRestoration(Sce
 
     document.objects.insert(document.objects.begin() + insertionIndex, restored);
 
-    if(!ValidateSceneDocument(document, errorMessage))
+    if(!(ValidateSceneDocument(document, errorMessage) && ValidateCompositeCandidate(document, errorMessage)))
     {
         return nullptr;
     }
@@ -2529,6 +2809,10 @@ std::unique_ptr<FileSceneRuntime> FileSceneRuntime::PrepareObjectRestoration(Sce
 
     auto candidate = std::make_unique<FileSceneRuntime>();
     candidate->m_fileScene = m_fileScene;
+    // The candidate replaces this runtime on acceptance, so it keeps the session's policies (composite hooks, read-only state).
+    candidate->m_candidateValidator = m_candidateValidator;
+    candidate->m_newEntityPolicy = m_newEntityPolicy;
+    candidate->m_readOnlyReason = m_readOnlyReason;
     candidate->m_fileScene.EditDocument() = std::move(document);
 
     if (auto* owner = dynamic_cast<FileSceneAssetCatalog*>(&resolver); owner &&
@@ -2693,7 +2977,9 @@ bool FileSceneRuntime::CaptureObjectInspection(std::string_view objectID, SceneO
     return true;
 }
 
-bool FileSceneRuntime::InspectSelectedObject(RenderObjectID runtimeIndex, SceneObjectMetadata& metadata,
+// The pre-revision inspection (one whole-scene validation and a capture per call). Packaged archive activations still use it, and
+// the Debug cross-check (ENGINE_DIAG_METADATA_CROSSCHECK) compares every fast inspection with it.
+bool FileSceneRuntime::InspectSelectedObjectFully(RenderObjectID runtimeIndex, SceneObjectMetadata& metadata,
     SceneObjectDocument& object) const
 {
     if(!m_fileScene.HasDocument())
@@ -2768,6 +3054,55 @@ bool FileSceneRuntime::InspectSelectedObject(RenderObjectID runtimeIndex, SceneO
         selected->materialSlotBindings, mapping.bindingRevisions[runtimeIndex]};
     object = *selected;
     object.transform = objects[runtimeIndex].transform;
+    return true;
+}
+
+// Revised S0.3: one object read through the validated index (no whole-scene validation, no scene capture). The returned object is
+// a copy of that one validated document object with its runtime transform, the same fields the capture returned for it.
+bool FileSceneRuntime::InspectSelectedObject(RenderObjectID runtimeIndex, SceneObjectMetadata& metadata,
+    SceneObjectDocument& object) const
+{
+    if(!m_fileScene.HasDocument() || m_archiveScene)
+    {
+        return InspectSelectedObjectFully(runtimeIndex, metadata, object);
+    }
+
+    const auto current = GetObjectMetadata(runtimeIndex);
+    const SceneObjectDocument* selected = nullptr;
+
+    if(!current || !ValidateObjectMetadataState(runtimeIndex, selected, nullptr) || !selected)
+    {
+        return false;
+    }
+
+    const auto& runtimeObject = m_scene.GetRenderObjects()[runtimeIndex];
+
+    if(!InspectionRuntimeTransformValid(*selected, runtimeObject.transform) || !InspectionRuntimeHeaderValid(m_fileScene.GetDocument(), m_scene))
+    {
+        return false;
+    }
+
+    metadata = *current;
+    object = *selected;
+    object.transform = runtimeObject.transform;
+
+#ifndef NDEBUG
+    static const bool crossCheck = std::getenv("ENGINE_DIAG_METADATA_CROSSCHECK") != nullptr;
+
+    if(crossCheck)
+    {
+        SceneObjectMetadata fullMetadata;
+        SceneObjectDocument fullObject;
+        const bool full = InspectSelectedObjectFully(runtimeIndex, fullMetadata, fullObject);
+        SceneDocument left;
+        SceneDocument right;
+        left.objects = {object};
+        right.objects = {fullObject};
+        assert(!full || (fullMetadata.objectID == metadata.objectID && SceneDocumentsEqual(left, right)) &&
+            "fast inspection differs from the full inspection");
+    }
+#endif
+
     return true;
 }
 

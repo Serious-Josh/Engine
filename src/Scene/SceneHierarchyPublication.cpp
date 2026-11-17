@@ -254,7 +254,7 @@ bool FileSceneRuntime::CommitHierarchyForVerification(std::span<const std::strin
         candidate.objects[index].parentID = parentIDs[index];
     }
 
-    if(!ValidateSceneDocument(candidate, errorMessage))
+    if(!(ValidateSceneDocument(candidate, errorMessage) && ValidateCompositeCandidate(candidate, errorMessage)))
     {
         return false;
     }
@@ -288,6 +288,21 @@ bool FileSceneRuntime::CommitHierarchyForVerification(std::span<const std::strin
 bool FileSceneRuntime::CommitHierarchyEdit(const SceneDocument& expected, SceneDocument replacement,
     std::string* errorMessage)
 {
+    if(!m_readOnlyReason.empty())
+    {
+        return ReadOnlyError(errorMessage);
+    }
+
+    // W5: in a composite World the Local Level root marker follows the new parent. A composite id without '/' is exactly a
+    // Local Level placement node (W4 runtime identity), so a reparented entity gains or loses the marker with its parent.
+    if(m_candidateValidator)
+    {
+        for(auto& object : replacement.objects)
+        {
+            object.parentIsLevelNode = !object.parentID.empty() && object.parentID.find('/') == std::string::npos;
+        }
+    }
+
     if(m_archiveScene || HasPreparedScene() || m_materialAssignment || m_activePresentationAssociation ||
         m_scene.HasPhysicsPresentation() || !ValidateHierarchyAssociation(errorMessage))
     {
@@ -298,9 +313,21 @@ bool FileSceneRuntime::CommitHierarchyEdit(const SceneDocument& expected, SceneD
 
     if(!CaptureSceneDocument(m_fileScene.GetDocument(), m_scene, m_objectMapping, current, errorMessage) ||
         expected.id != current.id || replacement.id != current.id ||
-        !SceneHierarchy::SameObjects(expected, current) || !ValidateSceneDocument(replacement, errorMessage))
+        !SceneHierarchy::SameObjects(expected, current))
     {
         return Fail(errorMessage, "Hierarchy expected state changed or candidate is invalid.");
+    }
+
+    // The candidate's own validation reason (for example a physics entity that must stay a root) reaches the user.
+    if(!ValidateSceneDocument(replacement, errorMessage))
+    {
+        return false;
+    }
+
+    // W5: ownership rules of a composite World (its own message, e.g. cross-level parenting).
+    if(!ValidateCompositeCandidate(replacement, errorMessage))
+    {
+        return false;
     }
 
     // Reject component/asset/name/membership changes on this renderer-independent path.

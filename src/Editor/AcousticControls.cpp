@@ -348,7 +348,7 @@ void Editor::DrawObjectAcousticControls(IDemoScene& scene, const ProjectPaths& p
     std::optional<SceneObjectMetadata> selection(std::in_place);
     SceneObjectDocument object;
 
-    if(!owner->InspectSelectedObject(m_selectedObject, *selection, object) || object.meshReference.empty())
+    if(!InspectSelection(*owner, *selection, object) || object.meshReference.empty())
     {
         return;
     }

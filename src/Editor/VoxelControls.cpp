@@ -555,7 +555,16 @@ void Editor::PollVoxelBake(IDemoScene& scene, const ProjectPaths& paths, Project
     else if(m_voxelBakeRequested)
     {
         m_voxelBakeRequested = false;
-        StartVoxelBake(scene, paths, registry);
+
+        // W5: per-level voxel bakes are W9 work; a composite World has no single voxel manifest.
+        if(m_compositePreview)
+        {
+            m_voxelMessage = "Voxel baking needs one bake per Local Level and is not available in a World (W9); open the Local Level to bake it.";
+        }
+        else
+        {
+            StartVoxelBake(scene, paths, registry);
+        }
     }
 
     if(m_showVoxelWindow)

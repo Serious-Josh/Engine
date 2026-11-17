@@ -86,6 +86,9 @@ bool ValidateAssetRecord(const AssetRecord& record)
             return IsCanonicalContentPath(record.relativePath, "Content/Scripts/", L".as");
         case AssetType::AudioBank:
             return IsCanonicalContentPath(record.relativePath, "Content/Audio/Banks/", L".bank");
+        case AssetType::Scene:
+            // Scenes may live in any project folder.
+            return IsCanonicalContentPath(record.relativePath, "", L".scene");
 
         default:
             return false;

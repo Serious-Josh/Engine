@@ -341,6 +341,23 @@ bool DemoSceneManager::RequestUnsavedScene(SceneDocument document, std::string* 
     return true;
 }
 
+// W4: the composite stages exactly as an unsaved document (the same S0 steps and residency); the scene it creates is read-only.
+bool DemoSceneManager::RequestCompositeWorld(std::shared_ptr<CompositeWorld> composite, std::string* errorMessage)
+{
+    if(!composite)
+    {
+        return FailFileRequest(errorMessage, "No composite World was supplied.");
+    }
+
+    if(!RequestUnsavedScene(composite->document, errorMessage))
+    {
+        return false;
+    }
+
+    m_requestedComposite = std::move(composite);
+    return true;
+}
+
 bool DemoSceneManager::RequestArchiveScene(std::shared_ptr<const CookedScene::ArchiveScene> source, std::string* error)
 {
     if(m_hasPendingSceneChange || HasPendingFileSceneRequest() || m_stagedFileScene || !source || !source->ValidateReferences(error))
@@ -390,7 +407,8 @@ bool DemoSceneManager::StageRequestedFileScene(
         }
         else if (m_requestedUnsavedDocument)
         {
-            candidate = std::make_unique<FileBackedDemoScene>(*m_requestedUnsavedDocument);
+            candidate = m_requestedComposite ? std::make_unique<FileBackedDemoScene>(m_requestedComposite) :
+                std::make_unique<FileBackedDemoScene>(*m_requestedUnsavedDocument);
         }
         else
         {
@@ -476,7 +494,8 @@ bool DemoSceneManager::AdvanceRequestedFileSceneStaging(
             }
             else if (m_requestedUnsavedDocument)
             {
-                m_stagingFileScene = std::make_unique<FileBackedDemoScene>(*m_requestedUnsavedDocument);
+                m_stagingFileScene = m_requestedComposite ? std::make_unique<FileBackedDemoScene>(m_requestedComposite) :
+                    std::make_unique<FileBackedDemoScene>(*m_requestedUnsavedDocument);
             }
             else
             {
@@ -570,6 +589,7 @@ bool DemoSceneManager::CommitStagedFileScene(std::string* errorMessage)
     m_requestedFilePath.clear();
     m_requestedArchive.reset();
     m_requestedUnsavedDocument.reset();
+    m_requestedComposite.reset();
     m_requestedMetadataOnly = false;
 
     if (errorMessage)
@@ -598,6 +618,7 @@ void DemoSceneManager::CancelFileSceneRequest()
     m_requestedFilePath.clear();
     m_requestedArchive.reset();
     m_requestedUnsavedDocument.reset();
+    m_requestedComposite.reset();
     m_requestedMetadataOnly = false;
 }
 

@@ -2,8 +2,7 @@
 
 #include "Project/ProjectPaths.h"
 #include "Scene/SceneSerializer.h"
-
-#include <objbase.h>
+#include "assets/AssetID.h"
 
 #include <cstdint>
 #include <limits>
@@ -23,28 +22,19 @@ namespace
         return false;
     }
 
-    // Encodes all UUID bytes; no clock or process-local counter is used as identity.
+    // W1.1: a canonical GUID, so the scene can be written in schema 28 and its id is its registry asset identity.
     bool GenerateSceneID(
         std::string& sceneID,
         std::string* errorMessage)
     {
-        GUID id{};
+        const auto id = AssetID::Generate();
 
-        if (FAILED(CoCreateGuid(&id)))
+        if (!id)
         {
             return Fail(errorMessage, "Failed to generate a new scene ID.");
         }
 
-        const auto* bytes = reinterpret_cast<const unsigned char*>(&id);
-        constexpr char hex[] = "0123456789abcdef";
-        sceneID = "scene-";
-
-        for (std::size_t index = 0; index < sizeof(id); ++index)
-        {
-            sceneID += hex[bytes[index] >> 4];
-            sceneID += hex[bytes[index] & 15];
-        }
-
+        sceneID = id->ToString();
         return true;
     }
 }
@@ -63,6 +53,8 @@ bool CreateCleanSceneDocument(
     // Camera, light, environment and schema version keep SceneDocument's defaults, the same
     // values every new scene file starts from. No objects, so no starter sphere.
     candidate.name = "Untitled Scene";
+    // W3: a new Local Level inherits its environment (from its World, or the Engine defaults) until a group is overridden.
+    candidate.environmentOverrides = SceneEnvironmentOverrides::None();
     document = std::move(candidate);
     return true;
 }
@@ -80,6 +72,8 @@ bool CreateNewSceneFile(
         }
 
         SceneDocument document;
+        // W3: new Local Levels start with every environment group inherited.
+        document.environmentOverrides = SceneEnvironmentOverrides::None();
 
         if (!GenerateSceneID(document.id, errorMessage))
         {

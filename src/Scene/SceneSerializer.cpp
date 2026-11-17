@@ -3,6 +3,7 @@
 #include "Scene/PhysicalLightingMigration.h"
 #include "Scene/ColliderScaleMigration.h"
 #include "Core/Log.h"
+#include "assets/AssetID.h"
 
 #include <nlohmann/json.hpp>
 
@@ -868,6 +869,7 @@ namespace
 
         Json scene = {
             {"schemaVersion", SceneDocument::kSchemaVersion},
+            {"kind", document.kind == SceneKind::World ? "world" : "local"},
             {"id", document.id},
             {"name", document.name},
             {"environmentReference",document.environmentReference},
@@ -884,6 +886,27 @@ namespace
             {"lightingSettings", {{"referenceEV100", document.lightingSettings.referenceEV100},
                 {"environmentLuminanceScale", document.lightingSettings.environmentLuminanceScale}}}
         };
+
+        // W2: a Local Level always states its owner (null when unassigned); a World always lists its members.
+        if(document.kind == SceneKind::Local)
+        {
+            scene["owningWorld"] = document.owningWorld.empty() ? Json(nullptr) : Json(document.owningWorld);
+            const auto& overrides = document.environmentOverrides;
+            scene["environmentOverrides"] = {{"sky", overrides.sky}, {"exposure", overrides.exposure}, {"haze", overrides.haze},
+                {"mist", overrides.mist}, {"airEnvironment", overrides.airEnvironment}, {"wind", overrides.wind}};
+        }
+        else
+        {
+            Json members = Json::array();
+
+            for(const auto& member : document.members)
+            {
+                members.push_back({{"level", member.level}, {"placement", {{"position", ToJson(member.placement.position)},
+                    {"rotation", ToJson(member.placement.rotation)}}}});
+            }
+
+            scene["members"] = std::move(members);
+        }
 
         if(document.voxelBake)
         {
@@ -962,7 +985,7 @@ namespace
 
     SceneDocument FromJson(const Json& value, const LegacyLightingMigrationOptions& migration = {})
     {
-        ValidateFields(value, {"schemaVersion", "id", "name", "camera", "directionalLight", "objects", "environmentReference", "lightingSettings",
+        ValidateFields(value, {"schemaVersion", "kind", "owningWorld", "members", "environmentOverrides", "id", "name", "camera", "directionalLight", "objects", "environmentReference", "lightingSettings",
             "voxelBake", "mistRendering", "airEnvironment", "airSimulation", "environmentalHaze"});
         const auto& schemaVersion = value.at("schemaVersion");
         if (!schemaVersion.is_number_integer() ||
@@ -992,7 +1015,10 @@ namespace
              schemaVersion != SceneDocument::kMistRenderingSchemaVersion &&
              schemaVersion != SceneDocument::kMistEmitterModeSchemaVersion &&
              schemaVersion != SceneDocument::kAirSimulationSchemaVersion &&
-             schemaVersion != SceneDocument::kMovingSolidParticipationSchemaVersion))
+             schemaVersion != SceneDocument::kMovingSolidParticipationSchemaVersion &&
+             schemaVersion != SceneDocument::kSceneKindSchemaVersion &&
+             schemaVersion != SceneDocument::kMembershipSchemaVersion &&
+             schemaVersion != SceneDocument::kEnvironmentOverridesSchemaVersion))
         {
             throw std::runtime_error("Unsupported scene schema version.");
         }
@@ -1003,6 +1029,142 @@ namespace
         // Transitional readers preserve protected project content. New saves write v13;
         // no migration is written to disk merely by loading a historical document.
         result.id = value.at("id").get<std::string>();
+
+        // W1.1: from schema 28 the kind is explicit and the id is a canonical GUID. Older documents are Local Levels whose id is kept
+        // exactly as written (never canonicalized on load; only migration changes it).
+        if(schemaVersion.get<std::uint32_t>() >= SceneDocument::kSceneKindSchemaVersion)
+        {
+            const auto kind = value.find("kind");
+
+            if(kind == value.end())
+            {
+                throw std::runtime_error("Scene schema " + std::to_string(SceneDocument::kSceneKindSchemaVersion) +
+                    " requires a kind (\"local\" or \"world\").");
+            }
+
+            if(!kind->is_string() || (*kind != "local" && *kind != "world"))
+            {
+                throw std::runtime_error("Invalid scene kind " + kind->dump() + "; expected \"local\" or \"world\".");
+            }
+
+            result.kind = *kind == "world" ? SceneKind::World : SceneKind::Local;
+
+            if(!AssetID::Parse(result.id))
+            {
+                throw std::runtime_error("Scene ID '" + result.id + "' is not a canonical GUID (lowercase 8-4-4-4-12 hex), "
+                    "required from scene schema " + std::to_string(SceneDocument::kSceneKindSchemaVersion) + ".");
+            }
+        }
+        else if(value.contains("kind"))
+        {
+            throw std::runtime_error("Unsupported scene field: kind (introduced in scene schema " +
+                std::to_string(SceneDocument::kSceneKindSchemaVersion) + ").");
+        }
+
+        // W2: membership. From schema 29 a Local Level states its owning World (a GUID or null) and a World lists its members;
+        // the other kind's field is refused. Earlier documents carry neither.
+        if(schemaVersion.get<std::uint32_t>() >= SceneDocument::kMembershipSchemaVersion)
+        {
+            const char* const required = result.kind == SceneKind::World ? "members" : "owningWorld";
+            const char* const forbidden = result.kind == SceneKind::World ? "owningWorld" : "members";
+
+            if(!value.contains(required))
+            {
+                throw std::runtime_error(std::string("Scene schema ") + std::to_string(SceneDocument::kMembershipSchemaVersion) +
+                    " requires \"" + required + "\" in a " + (result.kind == SceneKind::World ? "World." : "Local Level."));
+            }
+
+            if(value.contains(forbidden))
+            {
+                throw std::runtime_error(std::string("A ") + (result.kind == SceneKind::World ? "World" : "Local Level") +
+                    " cannot have \"" + forbidden + "\".");
+            }
+
+            if(result.kind == SceneKind::Local)
+            {
+                const auto& owner = value.at("owningWorld");
+
+                if(!owner.is_null() && !owner.is_string())
+                {
+                    throw std::runtime_error("owningWorld must be a World's asset ID or null.");
+                }
+
+                result.owningWorld = owner.is_null() ? std::string{} : owner.get<std::string>();
+
+                if(owner.is_string() && !AssetID::Parse(result.owningWorld))
+                {
+                    throw std::runtime_error("owningWorld '" + result.owningWorld + "' is not a canonical GUID.");
+                }
+            }
+            else
+            {
+                const auto& members = value.at("members");
+
+                if(!members.is_array())
+                {
+                    throw std::runtime_error("members must be an array.");
+                }
+
+                for(const auto& item : members)
+                {
+                    ValidateFields(item, {"level", "placement"});
+                    const auto& placement = item.at("placement");
+                    // Placement is translation and rotation only: a scale (or any other field) is refused.
+                    ValidateFields(placement, {"position", "rotation"});
+                    SceneMembership member;
+
+                    if(!item.at("level").is_string())
+                    {
+                        throw std::runtime_error("A member's level must be a Local Level's asset ID.");
+                    }
+
+                    member.level = item.at("level").get<std::string>();
+                    member.placement.position = ReadVector3(placement.at("position"));
+                    member.placement.rotation = ReadVector3(placement.at("rotation"));
+                    result.members.push_back(std::move(member));
+                }
+            }
+        }
+        else if(value.contains("owningWorld") || value.contains("members"))
+        {
+            throw std::runtime_error("Unsupported scene field: owningWorld/members (introduced in scene schema " +
+                std::to_string(SceneDocument::kMembershipSchemaVersion) + ").");
+        }
+
+        // W3: a Local Level's six environment override switches, required from schema 30 (exact keys, booleans); Worlds have none.
+        // Earlier Local Levels keep the default (every group enabled), which is how they behaved before W3.
+        if(schemaVersion.get<std::uint32_t>() >= SceneDocument::kEnvironmentOverridesSchemaVersion && result.kind == SceneKind::Local)
+        {
+            const auto overrides = value.find("environmentOverrides");
+
+            if(overrides == value.end())
+            {
+                throw std::runtime_error("Scene schema " + std::to_string(SceneDocument::kEnvironmentOverridesSchemaVersion) +
+                    " requires \"environmentOverrides\" in a Local Level.");
+            }
+
+            ValidateFields(*overrides, {"sky", "exposure", "haze", "mist", "airEnvironment", "wind"});
+            const auto flag = [&](const char* name)
+            {
+                const auto found = overrides->find(name);
+
+                if(found == overrides->end() || !found->is_boolean())
+                {
+                    throw std::runtime_error(std::string("environmentOverrides.") + name + " must be true or false.");
+                }
+
+                return found->get<bool>();
+            };
+
+            result.environmentOverrides = {flag("sky"), flag("exposure"), flag("haze"), flag("mist"), flag("airEnvironment"), flag("wind")};
+        }
+        else if(value.contains("environmentOverrides"))
+        {
+            throw std::runtime_error(result.kind == SceneKind::World ? "A World cannot have \"environmentOverrides\"." :
+                "Unsupported scene field: environmentOverrides (introduced in scene schema " +
+                std::to_string(SceneDocument::kEnvironmentOverridesSchemaVersion) + ").");
+        }
+
         result.name = value.at("name").get<std::string>();
         result.environmentReference=value.value("environmentReference",std::string{});
 
@@ -2041,6 +2203,12 @@ namespace
     }
 }
 
+// The written form of a document that passed ValidateSceneDocumentWrite; shared by SaveSceneDocument and SerializeSceneDocument.
+static std::string SceneDocumentBytes(const SceneDocument& document)
+{
+    return ToJson(document).dump(4) + '\n';
+}
+
 static CreateSceneDocumentResult WriteSceneDocument(
     const SceneDocument& document,
     const std::filesystem::path& path,
@@ -2049,7 +2217,7 @@ static CreateSceneDocumentResult WriteSceneDocument(
 {
     std::string validationError;
 
-    if (!ValidateSceneDocumentPersistence(document, &validationError))
+    if (!ValidateSceneDocumentWrite(document, &validationError))
     {
         Fail(errorMessage, validationError);
         return CreateSceneDocumentResult::Error;
@@ -2060,7 +2228,7 @@ static CreateSceneDocumentResult WriteSceneDocument(
     try
     {
         // Serialize before touching the filesystem.
-        const std::string serialized = ToJson(document).dump(4) + '\n';
+        const std::string serialized = SceneDocumentBytes(document);
 
         if (path.empty() || path.filename().empty())
         {
@@ -2235,6 +2403,77 @@ bool LoadSceneDocument(
     {
         return Fail(errorMessage, exception.what());
     }
+}
+
+bool ParseSceneDocument(std::string_view bytes, SceneDocument& document, std::string* errorMessage,
+    std::uint64_t* storedSchemaVersion)
+{
+    if (storedSchemaVersion)
+    {
+        *storedSchemaVersion = 0;
+    }
+
+    try
+    {
+        const Json json = ParseSceneJson(std::string(bytes));
+
+        if (storedSchemaVersion && json.is_object())
+        {
+            const auto version = json.find("schemaVersion");
+
+            if (version != json.end() && version->is_number_unsigned())
+            {
+                *storedSchemaVersion = version->get<std::uint64_t>();
+            }
+        }
+
+        SceneDocument loaded = FromJson(json);
+        std::string validationError;
+
+        if (!ValidateSceneDocument(loaded, &validationError))
+        {
+            return Fail(errorMessage, validationError);
+        }
+
+        document = std::move(loaded);
+
+        if (errorMessage)
+        {
+            errorMessage->clear();
+        }
+
+        return true;
+    }
+    catch (const std::exception& exception)
+    {
+        return Fail(errorMessage, exception.what());
+    }
+}
+
+bool SerializeSceneDocument(const SceneDocument& document, std::string& bytes, std::string* errorMessage)
+{
+    std::string validationError;
+
+    if (!ValidateSceneDocumentWrite(document, &validationError))
+    {
+        return Fail(errorMessage, validationError);
+    }
+
+    try
+    {
+        bytes = SceneDocumentBytes(document);
+    }
+    catch (const std::exception& exception)
+    {
+        return Fail(errorMessage, exception.what());
+    }
+
+    if (errorMessage)
+    {
+        errorMessage->clear();
+    }
+
+    return true;
 }
 
 bool LoadSceneDocumentForCooking(const std::filesystem::path& path, SceneDocument& document, size_t maxBytes, std::string* error)

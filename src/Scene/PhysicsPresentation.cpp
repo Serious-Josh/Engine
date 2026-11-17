@@ -244,6 +244,8 @@ bool FileSceneRuntime::ApplyPhysicsPresentation(Renderer& renderer,
     const PhysicsPresentationAssociation& association, const Physics::RuntimePoseSnapshot& snapshot, std::string& error,
     PhysicsPresentationLease* acceptedLease)
 {
+    InvalidateValidatedObjects(); // Revised S0.3: runtime bindings or presentation change here.
+
     error.clear();
     try
     {
@@ -307,6 +309,8 @@ bool FileSceneRuntime::ApplyPhysicsPresentation(Renderer& renderer,
 
 bool FileSceneRuntime::ClearPhysicsPresentation(Renderer& renderer, std::string& error)
 {
+    InvalidateValidatedObjects(); // Revised S0.3: runtime bindings or presentation change here.
+
     error.clear();
     try
     {

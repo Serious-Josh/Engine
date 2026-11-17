@@ -416,6 +416,9 @@ add_library(EngineCore OBJECT
     src/Editor/TextureThumbnailCache.cpp
     src/Editor/TextureThumbnailDiskCache.cpp
     src/Editor/AssetBrowser.cpp
+    src/Editor/SceneMembershipPanel.cpp
+    src/Editor/EnvironmentOverrideControls.cpp
+    src/Editor/CompositeWorldInspection.cpp
     src/Editor/ThumbnailAdmission.cpp
     src/Renderer/Passes/RayTracedReflectionPass.cpp
     src/Renderer/Passes/RayTracedReflectionDenoisePass.cpp
@@ -479,6 +482,13 @@ add_library(EngineCore OBJECT
     src/Scene/RenderView.cpp
     src/Scene/SceneLighting.cpp
     src/Scene/SceneSerializer.cpp
+    src/Scene/SceneAssetIdentity.cpp
+    src/Scene/SceneEnvironmentResolution.cpp
+    src/Scene/CompositeWorld.cpp
+    src/assets/ProjectSceneAssets.cpp
+    src/assets/ProjectSceneMigration.cpp
+    src/assets/ProjectSceneMembership.cpp
+    src/assets/ProjectCompositeWorld.cpp
     src/Scene/ColliderScaleMigration.cpp
     src/Scene/SceneFileCreation.cpp
     src/Project/ProjectPaths.cpp
@@ -713,6 +723,47 @@ endif()
 if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Engine/tests/MovingSolidParticipationTests.cpp")
     add_executable(MovingSolidParticipationTests src/Engine/tests/MovingSolidParticipationTests.cpp)
     target_link_libraries(MovingSolidParticipationTests PRIVATE EngineCore)
+endif()
+
+# W1.1 local-only regression: scene schema 28 (explicit kind, canonical GUID ids when written), historical schemas as Local
+# Levels, refused legacy saves, the World open guard and BuildGame::SceneIdentity. Run with an output directory.
+if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Scene/tests/SceneKindTests.cpp")
+    add_executable(SceneKindTests src/Scene/tests/SceneKindTests.cpp)
+    target_link_libraries(SceneKindTests PRIVATE EngineCore)
+endif()
+
+# W1.2/W1.3 local-only regression: scene asset registration (AssetType::Scene, ProjectSceneAssets) and legacy scene migration
+# on isolated projects. Run with an output directory.
+if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/assets/tests/SceneAssetTests.cpp")
+    add_executable(SceneAssetTests src/assets/tests/SceneAssetTests.cpp)
+    target_link_libraries(SceneAssetTests PRIVATE EngineCore)
+endif()
+
+# W2 local-only regression: World/Local membership schema, ProjectSceneMembership operations, invariants and recovery.
+if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/assets/tests/SceneMembershipTests.cpp")
+    add_executable(SceneMembershipTests src/assets/tests/SceneMembershipTests.cpp)
+    target_link_libraries(SceneMembershipTests PRIVATE EngineCore)
+endif()
+
+# W3 local-only regression: Local Level environment overrides and standalone environment resolution.
+if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Scene/tests/SceneEnvironmentTests.cpp")
+    add_executable(SceneEnvironmentTests src/Scene/tests/SceneEnvironmentTests.cpp)
+    target_link_libraries(SceneEnvironmentTests PRIVATE EngineCore)
+endif()
+
+# W4 local-only regression: composite World construction (identity, placement roots, sun policy, refusals).
+if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Scene/tests/CompositeWorldTests.cpp")
+    add_executable(CompositeWorldTests src/Scene/tests/CompositeWorldTests.cpp)
+    target_link_libraries(CompositeWorldTests PRIVATE EngineCore)
+    target_compile_definitions(CompositeWorldTests PRIVATE ENGINE_SOURCE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}")
+endif()
+
+# B5 local-only regression: project asset reconciliation startup services (missing assets, transaction recovery). Run with an
+# output directory.
+if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/assets/tests/ProjectAssetReconciliationVerification.cpp")
+    add_executable(ProjectAssetReconciliationVerification src/assets/tests/ProjectAssetReconciliationVerification.cpp)
+    target_link_libraries(ProjectAssetReconciliationVerification PRIVATE EngineCore)
+    target_compile_definitions(ProjectAssetReconciliationVerification PRIVATE NOMINMAX)
 endif()
 
 # R1.4a local-only regression: cooked voxel bake (payload 36), Build Game's voxel bake check and entries, the archive voxel store.

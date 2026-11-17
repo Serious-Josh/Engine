@@ -4,6 +4,8 @@
 #include "DemoContent/IDemoScene.h"
 #include "Scene/FileSceneRuntime.h"
 #include "Scene/FileSceneAssetCatalog.h"
+#include "Scene/CompositeWorld.h"
+#include "Scene/SceneEnvironmentResolution.h"
 
 #include <filesystem>
 #include <string>
@@ -18,6 +20,20 @@ public:
     // Never-saved scene: the document is loaded from memory and the scene has no path until
     // SaveAs. Uses the same metadata-first preparation as a file scene.
     explicit FileBackedDemoScene(SceneDocument unsavedDocument);
+    // W4: a World opened as a read-only composite preview (CompositeWorld). Set before staging.
+    explicit FileBackedDemoScene(std::shared_ptr<CompositeWorld> composite);
+    const CompositeWorld* GetCompositeWorld() const noexcept { return m_compositeWorld.get(); }
+
+    // W5: composite World editing. Dirty state and saves are per source document: index 0 is the World, i + 1 is levels[i].
+    bool GetCompositeDirtyDocuments(std::vector<bool>& dirty, std::string* errorMessage = nullptr) const;
+    // Writes the dirty documents (or only `onlyDocument`) in one transaction and advances their baselines; `saved` counts them.
+    bool SaveCompositeDocuments(const ProjectPaths& paths, ProjectAssetRegistry& registry, std::optional<std::size_t> onlyDocument,
+        std::size_t& saved, std::string* errorMessage = nullptr);
+    // The level new entities join (the World or one of its Local Levels).
+    const std::string& GetEditingLevel() const noexcept { return m_editingLevel; }
+    bool SetEditingLevel(const std::string& levelID);
+    // Gives a new entity its level namespace and default parent (see AssignCompositeEntity in the source).
+    void AssignCompositeEntity(SceneObjectDocument& object) const;
 
     bool IsArchiveActivation() const noexcept { return bool(m_archiveScene); }
 
@@ -74,6 +90,22 @@ public:
     {
         return m_runtime->GetFileScene().HasDocument() ?
             std::string_view(m_runtime->GetFileScene().GetDocument().id) : std::string_view{};
+    }
+    // W2: the open document as edited (including unsaved edits); null when none is open. Read-only.
+    const SceneDocument* GetSceneDocument() const noexcept
+    {
+        return m_runtime->GetFileScene().HasDocument() ? &m_runtime->GetFileScene().GetDocument() : nullptr;
+    }
+    // W2: the document Save would write now (live edits captured), without writing it.
+    bool CaptureDocumentForSave(SceneDocument& captured, std::string* errorMessage = nullptr) const
+    {
+        return m_runtime->CaptureDocumentForSave(captured, errorMessage);
+    }
+    // W2: the open Local Level's owning World (asset ID), empty when unassigned.
+    std::string_view GetOwningWorld() const noexcept
+    {
+        return m_runtime->GetFileScene().HasDocument() ?
+            std::string_view(m_runtime->GetFileScene().GetDocument().owningWorld) : std::string_view{};
     }
 
     const ImportedMesh* GetMeshGeometry(const Mesh& mesh) const noexcept override
@@ -226,7 +258,36 @@ public:
     void ResetDirectionalLight() override;
     void SetAspectRatio(float aspectRatio) override;
 
+    // W3 standalone environment preview. The owning World is read as a document (metadata only; its entities are never loaded),
+    // and ResolveSceneEnvironment decides the effective environment. The runtime Scene shows the effective sky and exposure for
+    // inherited groups; the document keeps the Local Level's own values (CaptureSceneDocument never writes inherited values).
+    const EffectiveSceneEnvironment& GetEffectiveEnvironment() const noexcept { return m_effectiveEnvironment; }
+    // Re-reads the owning World when asked, re-resolves and shows the result. Returns true when the effective sky reference changed
+    // since the last publication (the caller then requests the environment through the S0.5 path).
+    bool RefreshEnvironmentPreview(bool rereadWorld);
+    // The sky reference the Engine last published (keeps RefreshEnvironmentPreview from requesting it again).
+    void NotePublishedEnvironment(const std::string& reference) { m_publishedEnvironmentReference = reference; }
+    // The owning World has Directional Lights, which a standalone Local Level preview does not show (W4 decides World lighting).
+    bool WorldHasDirectionalLights() const noexcept { return m_worldHasDirectionalLights; }
+
+    enum class EnvironmentGroup
+    {
+        Sky,
+        Exposure,
+        Haze,
+        Mist,
+        AirEnvironment,
+        Wind
+    };
+
+    static bool GetOverride(const SceneEnvironmentOverrides& overrides, EnvironmentGroup group);
+    // Switches one override group of the open Local Level (marks it dirty). No stored value is lost: enabling sky or exposure shows
+    // the Local Level's stored values again; disabling first stores its live values.
+    bool SetEnvironmentOverride(EnvironmentGroup group, bool enabled, std::string* errorMessage = nullptr);
+
 private:
+    void ReadEnvironmentWorld();
+
     bool InitializeWithPolicy(ID3D12Device* device, ResourceUploader& uploader, DescriptorHeap& descriptorHeap,
         const Shader* vertexShader, const Shader* pixelShader, bool metadataOnly);
 
@@ -259,6 +320,10 @@ private:
     friend class SceneLifecycleVerification;
     friend class AssetBrowserSceneVerification;
     friend class StartupSceneVerification;
+    friend class SceneMembershipEditorVerification;
+    friend class CompositeWorldEditorVerification;
+    friend class DemoWorldEditorVerification;
+    friend class CompositePlacementStress;
     friend class ProjectSystemWorkflowVerification;
     friend class SceneMaterialBindingVerification;
     friend class SceneDuplicationVerification;
@@ -289,8 +354,20 @@ private:
 
     // Source document of a never-saved scene; cleared once SaveAs adopts a file.
     std::optional<SceneDocument> m_unsavedDocument;
+    std::shared_ptr<CompositeWorld> m_compositeWorld;
+    std::string m_editingLevel;
+    bool ProjectComposite(CompositeWorldProjection& projection, std::string* errorMessage) const;
     std::filesystem::path m_projectRoot;
     const ProjectAssetRegistry* m_registry = nullptr;
+
+    // W3 environment preview state (see RefreshEnvironmentPreview).
+    std::optional<SceneDocument> m_environmentWorld;
+    std::string m_environmentWorldProblem;
+    bool m_worldHasDirectionalLights = false;
+    EffectiveSceneEnvironment m_effectiveEnvironment;
+    // RefreshEnvironmentPreview's resolution input (environment fields only), kept to avoid per-frame allocations.
+    SceneDocument m_environmentInput;
+    std::string m_publishedEnvironmentReference;
 
     FileSceneAssetCatalog m_assets;
 

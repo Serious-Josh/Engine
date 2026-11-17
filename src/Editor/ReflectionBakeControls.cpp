@@ -191,6 +191,12 @@ std::optional<std::string> Editor::AcousticGeometryNotReady(const IDemoScene& sc
 
 void Editor::StartReflectionBake(IDemoScene& scene, std::vector<std::string> objectIDs, bool all, bool force, const std::string& title)
 {
+    if(m_compositePreview)
+    {
+        m_reflectionBakeMessage = "Reflection baking needs one bake per Local Level and is not available in a World (W9); open the Local Level to bake it.";
+        return;
+    }
+
     if(m_reflectionBake)
     {
         m_reflectionBakeMessage = "A bake is already running.";

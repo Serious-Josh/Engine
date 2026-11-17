@@ -116,6 +116,13 @@ bool ProjectAssetReconciliation::Run(
 
         for(const auto& record : registry.GetAssets())
         {
+            // W1.2: scene records belong to scene discovery (ProjectSceneAssets), which tells a moved or malformed scene from a
+            // deleted one. Nothing references a scene by asset ID, so there is nothing to prune here either.
+            if(record.type == AssetType::Scene)
+            {
+                continue;
+            }
+
             const auto resolution = ProjectAssetResolver::Resolve(paths, registry, record.id);
             // Missing scripts and audio banks retain identity for repair/reappearance (an FMOD Studio rebuild
             // rewrites banks in place). No reference pruning.

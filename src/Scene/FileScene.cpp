@@ -47,7 +47,7 @@ bool FileScene::Open(
 {
     SceneDocument loaded;
 
-    if (!LoadSceneDocument(path, loaded, errorMessage))
+    if (!LoadSceneDocument(path, loaded, errorMessage) || !ValidateSceneKindOpenable(loaded, errorMessage))
     {
         return false;
     }
@@ -63,7 +63,7 @@ bool FileScene::Open(
 
 bool FileScene::LoadDocument(SceneDocument document, std::string* error)
 {
-    if(!ValidateSceneDocument(document,error)) return false;
+    if(!ValidateSceneDocument(document,error) || !ValidateSceneKindOpenable(document,error)) return false;
     m_document = std::move(document); m_path.clear(); m_hasDocument = true; m_dirty = false;
     return true;
 }
@@ -119,6 +119,7 @@ const SceneDocument& FileScene::GetDocument() const noexcept
 SceneDocument& FileScene::EditDocument() noexcept
 {
     m_dirty = true;
+    ++m_editRevision;
     return m_document;
 }
 

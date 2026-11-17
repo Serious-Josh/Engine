@@ -21,7 +21,7 @@ std::optional<SceneObjectMetadata> Editor::ResolveComponentEditTarget(IDemoScene
         return std::nullopt;
     }
 
-    const auto selection = owner->GetObjectMetadata(m_selectedObject);
+    const auto selection = SelectedObjectMetadata(*owner);
     return selection && MatchesComponentEditIdentity(scene, *selection) ? selection : std::nullopt;
 }
 
@@ -176,7 +176,7 @@ void Editor::DrawAddComponentControls(IDemoScene& scene)
     std::optional<SceneObjectMetadata> selection(std::in_place);
     SceneObjectDocument object;
 
-    if(!owner->InspectSelectedObject(m_selectedObject, *selection, object))
+    if(!InspectSelection(*owner, *selection, object))
     {
         DismissAddComponentPopup();
         return;
@@ -500,7 +500,7 @@ void Editor::DrawObjectTriggerColliderControls(IDemoScene& scene)
     std::optional<SceneObjectMetadata> selection(std::in_place);
     SceneObjectDocument object;
 
-    if(!owner->InspectSelectedObject(m_selectedObject, *selection, object))
+    if(!InspectSelection(*owner, *selection, object))
     {
         return;
     }

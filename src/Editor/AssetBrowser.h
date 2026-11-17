@@ -30,6 +30,12 @@ struct MaterialPreviewImage;
 class AssetBrowser
 {
 public:
+    // W2: scene entries show World/Local status and offer the membership workflows (non-owning; may be null).
+    void SetSceneMembership(class SceneMembershipPanel* membership) noexcept
+    {
+        m_sceneMembership = membership;
+    }
+
     void SetIcons(const EditorIcons& icons)
     {
         m_icons = &icons;
@@ -173,6 +179,7 @@ private:
     void DrawAssetMoveSource(const std::filesystem::path& path, const std::string& name);
     void DrawAssetMoveTarget(const std::filesystem::path& directory);
     std::optional<MoveRequest> m_moveRequest;
+    class SceneMembershipPanel* m_sceneMembership = nullptr;
     std::filesystem::path m_moveSource;
 
     void DrawMeshDragSource(const std::filesystem::path& path, const std::string& name);

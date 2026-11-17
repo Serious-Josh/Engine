@@ -60,6 +60,8 @@ class DemoSceneManager
     // Replaces the active scene with a never-saved document through the same staging, GPU
     // drain/release and commit path as opening a file. Writes nothing.
     bool RequestUnsavedScene(SceneDocument document, std::string* errorMessage = nullptr);
+    // W4: opens a World as a read-only composite preview (see CompositeWorld).
+    bool RequestCompositeWorld(std::shared_ptr<CompositeWorld> composite, std::string* errorMessage = nullptr);
     bool RequestFileScene(
         const std::filesystem::path& path,
         std::string* errorMessage = nullptr);
@@ -147,6 +149,7 @@ class DemoSceneManager
     std::shared_ptr<const CookedScene::ArchiveScene> m_requestedArchive;
     std::filesystem::path m_requestedFilePath;
     std::optional<SceneDocument> m_requestedUnsavedDocument;
+    std::shared_ptr<CompositeWorld> m_requestedComposite;
     std::string m_stagedFileName;
     std::string m_activeFileName;
 

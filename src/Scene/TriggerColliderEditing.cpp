@@ -6,6 +6,11 @@ bool FileSceneRuntime::SetObjectTriggerCollider(const SceneObjectMetadata& selec
     const std::optional<Physics::TriggerColliderComponent>& expected,
     const std::optional<Physics::TriggerColliderComponent>& replacement, std::string* errorMessage)
 {
+    if(!m_readOnlyReason.empty())
+    {
+        return ReadOnlyError(errorMessage);
+    }
+
     const auto fail = [&](const char* message)
     {
         if(errorMessage)

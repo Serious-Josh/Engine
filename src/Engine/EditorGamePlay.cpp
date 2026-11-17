@@ -107,7 +107,7 @@ void Engine::ProcessEditorGamePlay(FileSceneRuntime* runtime, double elapsedSeco
 
         if(!compatibleScene || !CanStartEditorPhysics() || !IsEditorSceneStreamingSettled())
         {
-            m_gameMessage = !compatibleScene ? "Game Play requires an editable file-backed scene." :
+            m_gameMessage = !compatibleScene ? "Game Play requires an editable file-backed scene; a World preview cannot be played yet." :
                 !CanStartEditorPhysics() ? "Finish the current editor operation before playing." :
                 "Wait for the scene to finish streaming before playing.";
         }

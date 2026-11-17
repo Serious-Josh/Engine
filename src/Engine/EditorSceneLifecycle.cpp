@@ -5,6 +5,8 @@
 #include "Project/ProjectCreation.h"
 #include "Scene/SceneFileCreation.h"
 #include "Scene/SceneSerializer.h"
+#include "assets/ProjectCompositeWorld.h"
+#include "assets/ProjectSceneMembership.h"
 #include "imgui.h"
 
 namespace
@@ -99,6 +101,44 @@ Engine::SceneSaveResult Engine::SaveEditorScene(FileBackedDemoScene& scene, bool
         return SceneSaveResult::Failed;
     }
 
+    // W5: a composite World is saved as its source documents (Save = Save All), never as a scene of its own; Save As is refused
+    // before any dialog could open.
+    if(scene.GetCompositeWorld())
+    {
+        if(saveAs)
+        {
+            m_sceneOperationError = "A World cannot be saved as a new scene: it is composed from the World and its Local Levels. Use "
+                "Save (all changed documents) or save one document from the World panel.";
+            m_editor.ReportLifecycleMessage(m_sceneOperationError);
+            return SceneSaveResult::Failed;
+        }
+
+        return SaveCompositeWorld(scene, std::nullopt);
+    }
+
+    // W2: Save As of a saved scene creates a new, independent asset (new scene and entity identities) from the open document,
+    // then switches the Editor to it. It is refused for an assigned Local Level (the copy would claim its World membership) and
+    // for a World. The first save of a new, never-saved scene keeps its identity (it is not a copy).
+    const bool saveAsNewAsset = saveAs && !scene.IsUnsaved();
+
+    if(saveAsNewAsset)
+    {
+        const auto* document = scene.GetSceneDocument();
+
+        if(!document || document->kind == SceneKind::World)
+        {
+            m_sceneOperationError = "Save As is not available for a World.";
+            return SceneSaveResult::Failed;
+        }
+
+        if(!document->owningWorld.empty())
+        {
+            m_sceneOperationError = "Save As is not available for a Local Level assigned to a World: the copy would share its "
+                "World membership. Use Duplicate Local Level in the Asset Browser.";
+            return SceneSaveResult::Failed;
+        }
+    }
+
     const bool choosingPath = saveAs || scene.IsUnsaved();
     auto path = choosingPath ? selectedPath : scene.GetScenePath();
     const bool suppliedPath = !path.empty();
@@ -140,6 +180,50 @@ Engine::SceneSaveResult Engine::SaveEditorScene(FileBackedDemoScene& scene, bool
     {
         m_sceneOperationError = "Cannot inspect the destination scene file.";
         return SceneSaveResult::Failed;
+    }
+
+    if(saveAsNewAsset)
+    {
+        // A new asset never replaces a file: that file is another scene asset with its own identity.
+        if(exists)
+        {
+            m_sceneOperationError = "Save As creates a new scene and cannot replace the existing file " + resolved.filename().string() +
+                ". Choose a new file name.";
+            return SceneSaveResult::Failed;
+        }
+
+        const auto relative = resolved.lexically_relative(GetActiveProject().GetPaths().GetRoot());
+        ProjectSceneMembership::Result result;
+        // Exactly what Save would write now: the open document with its live (unsaved) edits captured.
+        SceneDocument snapshot;
+
+        if(!scene.CaptureDocumentForSave(snapshot, &m_sceneOperationError))
+        {
+            return SceneSaveResult::Failed;
+        }
+
+        // One transaction: the new file and its registry record. The open scene's file is untouched.
+        if(!ProjectSceneMembership::SaveLocalAsNew(GetActiveProject().GetPaths(), m_projectAssetRegistry, snapshot,
+            relative, result, m_sceneOperationError))
+        {
+            return SceneSaveResult::Failed;
+        }
+
+        // Continue editing the new asset: open it as a fresh scene (new entity identities need a new runtime and history). The
+        // edits are in the new file; if the open fails, the current scene stays open with its edits.
+        std::string requestError;
+
+        if(!m_demoSceneManager.RequestFileScene(resolved, &requestError))
+        {
+            m_sceneOperationError = "Saved as " + resolved.filename().string() + ", but it could not be opened: " + requestError;
+            m_editor.InvalidateSceneFiles();
+            return SceneSaveResult::Failed;
+        }
+
+        Log::Info("Saved as a new Local Level " + relative.generic_string() + " (" + result.local->ToString() + ").");
+        m_editor.InvalidateSceneFiles();
+        m_sceneOperationError.clear();
+        return SceneSaveResult::Saved;
     }
 
     if(choosingPath && exists && !overwriteConfirmed)
@@ -274,9 +358,41 @@ void Engine::ProcessEditorSceneRequests(IDemoScene& activeScene)
             {
                 SceneDocument document;
                 std::filesystem::path resolved;
+                m_pendingCompositeWorld.reset();
 
-                if(!ResolveSceneLocation(GetActiveProject(), operation.path, true, resolved, m_sceneOperationError) ||
-                    !LoadSceneDocument(resolved, document, &m_sceneOperationError))
+                const bool readable = ResolveSceneLocation(GetActiveProject(), operation.path, true, resolved, m_sceneOperationError) &&
+                    LoadSceneDocument(resolved, document, &m_sceneOperationError);
+
+                // W4: a World opens as a read-only composite of all its Local Levels. It is composed and validated completely
+                // here, before the current scene is touched, so an invalid World leaves the active scene in place.
+                if(readable && document.kind == SceneKind::World)
+                {
+                    const auto composeStart = std::chrono::steady_clock::now();
+                    auto composite = std::make_shared<CompositeWorld>();
+
+                    if(ProjectCompositeWorld::Load(GetActiveProject().GetPaths(), m_projectAssetRegistry, resolved, *composite,
+                        m_sceneOperationError))
+                    {
+                        for(const auto& problem : composite->unverifiedScenes)
+                        {
+                            Log::Warning("World '" + composite->worldName + "': membership not verified against an unreadable scene: " +
+                                problem);
+                        }
+
+                        m_pendingCompositeWorld = std::move(composite);
+                        m_compositeWorldTiming = {};
+                        m_compositeWorldTiming.composeMilliseconds =
+                            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - composeStart).count();
+                        m_compositeWorldTiming.requested = std::chrono::steady_clock::now();
+                        m_compositeWorldTiming.reported = false;
+                    }
+                }
+
+                // A World that could not be composed keeps the composition error (it is not a "World cannot be opened" case).
+                const bool isWorld = readable && document.kind == SceneKind::World;
+                const bool openable = readable && (isWorld ? bool(m_pendingCompositeWorld) : ValidateSceneKindOpenable(document, &m_sceneOperationError));
+
+                if(!openable)
                 {
                     // The dialog is not the only record: a failed open is also logged, so unattended runs can see why.
                     Log::Error("Could not open scene " + operation.path.string() + ": " + m_sceneOperationError);
@@ -425,7 +541,13 @@ void Engine::ContinueEditorSceneOperation()
 
         // S0.7B: the document was validated when the operation was queued, and staging parses it again (its Open step
         // reports a failure and preserves the current scene), so it is not parsed a third time here.
-        if(ResolveSceneLocation(GetActiveProject(), request.path, true, path, error))
+        if(m_pendingCompositeWorld)
+        {
+            // W4: the composite was built and validated when the operation was queued.
+            m_demoSceneManager.RequestCompositeWorld(std::move(m_pendingCompositeWorld), &error);
+            m_pendingCompositeWorld.reset();
+        }
+        else if(ResolveSceneLocation(GetActiveProject(), request.path, true, path, error))
         {
             m_demoSceneManager.RequestFileScene(path, &error);
         }
@@ -592,4 +714,63 @@ void Engine::CompleteRelaunch()
     m_editorRelaunchStarted = true;
     ImGui::GetIO().IniFilename = nullptr;
     m_window.Close(); // Current project's lock is released only by normal checked Shutdown.
+}
+
+// W4: logs a World open once its composite scene is active: composition time, request-to-activation latency and its size.
+void Engine::ReportCompositeWorldActivation(const FileBackedDemoScene* scene)
+{
+    const CompositeWorld* composite = scene ? scene->GetCompositeWorld() : nullptr;
+
+    if(m_compositeWorldTiming.reported || !composite)
+    {
+        return;
+    }
+
+    m_compositeWorldTiming.reported = true;
+    const double activationMilliseconds =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - m_compositeWorldTiming.requested).count();
+    Log::Info("World open: '" + composite->worldName + "', " + std::to_string(composite->levels.size()) + " Local Level(s), " +
+        std::to_string(composite->document.objects.size()) + " composite objects; compose " +
+        std::to_string(m_compositeWorldTiming.composeMilliseconds) + " ms, request to activation " +
+        std::to_string(activationMilliseconds) + " ms.");
+}
+
+// W5: saves the composite World's changed source documents (all, or one) in one transaction. Nothing is written, and no baseline
+// changes, unless every document validates and still matches the bytes it was read from.
+Engine::SceneSaveResult Engine::SaveCompositeWorld(FileBackedDemoScene& scene, std::optional<std::size_t> onlyDocument)
+{
+    std::size_t saved = 0;
+    m_sceneOperationError.clear();
+
+    if(!scene.SaveCompositeDocuments(GetActiveProject().GetPaths(), m_projectAssetRegistry, onlyDocument, saved, &m_sceneOperationError))
+    {
+        Log::Error("World save failed: " + m_sceneOperationError);
+        m_editor.ReportLifecycleMessage(m_sceneOperationError);
+        return SceneSaveResult::Failed;
+    }
+
+    Log::Info("World '" + scene.GetCompositeWorld()->worldName + "': saved " + std::to_string(saved) + " document(s).");
+    m_editor.InvalidateSceneFiles();
+    return SceneSaveResult::Saved;
+}
+
+// W5: a Save or Save All request from the World panel.
+void Engine::ProcessCompositeSaveRequest(FileBackedDemoScene* scene)
+{
+    const auto request = m_editor.TakeCompositeSaveRequest();
+
+    if(!request || !scene || !scene->GetCompositeWorld())
+    {
+        return;
+    }
+
+    std::string error;
+
+    if(!CanPerformSceneLifecycle(error))
+    {
+        m_editor.ReportLifecycleMessage(error);
+        return;
+    }
+
+    SaveCompositeWorld(*scene, *request);
 }

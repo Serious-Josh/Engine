@@ -13,6 +13,7 @@
 #include "assets/CookedScene.h"
 #include "assets/ImportedMesh.h"
 #include "Project/ProjectPaths.h"
+#include "Scene/SceneAssetIdentity.h"
 #include "Scene/SceneHierarchyTransforms.h"
 #include "Voxel/VoxelManifest.h"
 #include "Scene/RenderView.h"
@@ -1212,34 +1213,8 @@ bool ValidateTitle(std::string_view title, std::string& error)
 
 AssetID SceneIdentity(std::string_view persistentID)
 {
-    Require(!persistentID.empty(), "Current scene has no persistent identity.");
-
-    if (auto assetID = AssetID::Parse(persistentID))
-    {
-        return *assetID;
-    }
-
-    const std::string namespacedIdentity = "Engine.Scene:" + std::string(persistentID);
-    auto digest = CookedSurface::Hash(
-        std::as_bytes(std::span(namespacedIdentity.data(), namespacedIdentity.size())));
-    digest[6] = std::byte((std::to_integer<unsigned>(digest[6]) & 15) | 0x50);
-    digest[8] = std::byte((std::to_integer<unsigned>(digest[8]) & 63) | 0x80);
-
-    constexpr char hex[] = "0123456789abcdef";
-    std::string uuid;
-    for (size_t index = 0; index < 16; ++index)
-    {
-        if (index == 4 || index == 6 || index == 8 || index == 10)
-        {
-            uuid += '-';
-        }
-
-        auto byte = std::to_integer<unsigned>(digest[index]);
-        uuid += hex[byte >> 4];
-        uuid += hex[byte & 15];
-    }
-
-    return *AssetID::Parse(uuid);
+    // W1.3: the mapping lives in SceneAssetIdentity, shared with scene migration; the packaged identity is unchanged.
+    return SceneAssetIdentity(persistentID);
 }
 
 struct Service::State

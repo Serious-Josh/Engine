@@ -290,7 +290,7 @@ void Editor::DrawObjectScriptControls(IDemoScene& scene, const ProjectPaths& pat
     std::optional<SceneObjectMetadata> selection(std::in_place);
     SceneObjectDocument object;
 
-    if(!owner->InspectSelectedObject(m_selectedObject, *selection, object))
+    if(!InspectSelection(*owner, *selection, object))
     {
         return;
     }

@@ -113,6 +113,23 @@ bool CaptureSceneDocument(
     candidate.camera.exposure = scene.GetViewportExposure();
     candidate.lightingSettings = scene.GetLightingSettings();
 
+    // W3: for a Local Level's inherited sky and exposure groups the runtime Scene shows the effective (World or default) values,
+    // which are not the Local Level's own. Its stored values stay authoritative for those groups, so no capture (save, dirty
+    // checks, history, residency publication) ever writes inherited values into the document.
+    if(source.kind == SceneKind::Local)
+    {
+        if(!source.environmentOverrides.sky)
+        {
+            candidate.environmentReference = source.environmentReference;
+            candidate.lightingSettings.environmentLuminanceScale = source.lightingSettings.environmentLuminanceScale;
+        }
+
+        if(!source.environmentOverrides.exposure)
+        {
+            candidate.lightingSettings.referenceEV100 = source.lightingSettings.referenceEV100;
+        }
+    }
+
     if (!ValidateSceneDocument(candidate, errorMessage))
     {
         return false;
@@ -131,7 +148,8 @@ bool SceneDocumentsEqual(
         return a.x == b.x && a.y == b.y && a.z == b.z;
     };
 
-    if (left.schemaVersion != right.schemaVersion || left.id != right.id ||
+    if (left.schemaVersion != right.schemaVersion || left.kind != right.kind || left.owningWorld != right.owningWorld ||
+        left.members != right.members || left.environmentOverrides != right.environmentOverrides || left.id != right.id ||
         left.name != right.name || left.environmentReference!=right.environmentReference || left.objects.size() != right.objects.size())
     {
         return false;

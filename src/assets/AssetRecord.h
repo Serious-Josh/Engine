@@ -24,7 +24,9 @@ enum class AssetType : std::uint8_t
     BakedPathing,
     // VX.4B: one baked voxel region and one scene voxel manifest, in Content/Voxels/.
     VoxelRegion,
-    VoxelManifest
+    VoxelManifest,
+    // W1.2: a World or Local Level .scene document, anywhere in the project; its AssetID is the document's id.
+    Scene
 };
 
 struct AssetRecord

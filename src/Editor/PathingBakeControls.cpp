@@ -158,6 +158,12 @@ PathingBakes::Inputs Editor::CurrentPathingInputs(const FileBackedDemoScene& own
 
 void Editor::StartPathingBake(IDemoScene& scene, const SceneObjectDocument& object, const ProjectPaths& paths, const ProjectAssetRegistry& registry)
 {
+    if(m_compositePreview)
+    {
+        m_pathingMessage = "Pathing baking needs one bake per Local Level and is not available in a World (W9); open the Local Level to bake it.";
+        return;
+    }
+
     if(m_pathingBake || m_reflectionBake)
     {
         m_pathingMessage = "A bake is already running.";

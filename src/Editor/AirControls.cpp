@@ -4,6 +4,7 @@
 // (SceneDocument::airSimulation; a session override while Play or a simulation runs).
 
 #include "Editor/Editor.h"
+#include "Editor/MistAppearanceFields.h"
 
 #include "DemoContent/FileBackedDemoScene.h"
 #include "Debug/DebugUI.h"
@@ -60,9 +61,19 @@ void Editor::DrawAirWindow(IDemoScene& scene, DebugUI& debugUI)
     auto* simulationOwner = dynamic_cast<FileBackedDemoScene*>(&scene);
     const bool hasSceneDocument = simulationOwner && simulationOwner->m_runtime && !simulationOwner->IsArchiveActivation();
     const bool sessionOverrideMode = IsSceneEditingLocked();
-    const bool simulationEditable = sessionOverrideMode || (hasSceneDocument && m_gameState == GameState::Editing);
+    // W3: an assigned Local Level's AIR simulation is its World's (edited in World Membership); its wind override is edited in the
+    // Environment (Local Level) panel. Play and Physics Simulation session overrides are unchanged.
+    const bool worldSimulation = hasSceneDocument &&
+        simulationOwner->GetEffectiveEnvironment().source == EffectiveSceneEnvironment::Source::AssignedWorld;
+    const bool simulationEditable = sessionOverrideMode || (hasSceneDocument && m_gameState == GameState::Editing && !worldSimulation);
 
     ImGui::SeparatorText("Simulation");
+
+    if(worldSimulation && !sessionOverrideMode)
+    {
+        ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f), "AIR simulation belongs to World '%s' (edit it in World Membership). "
+            "Wind is set in Environment (Local Level).", simulationOwner->GetEffectiveEnvironment().worldName.c_str());
+    }
 
     if(sessionOverrideMode)
     {
@@ -877,6 +888,12 @@ void Editor::DrawAirEnvironmentControls(IDemoScene& scene)
         return;
     }
 
+    if(IsEnvironmentGroupInherited(scene, static_cast<int>(FileBackedDemoScene::EnvironmentGroup::AirEnvironment)))
+    {
+        ImGui::TextDisabled("Inherited. Enable the AIR environment override (Environment, Local Level) to edit this Local Level's own.");
+        return;
+    }
+
     const std::optional<AirEnvironmentSettings> stored = document->airEnvironment;
     const AirEnvironmentSettings current = stored.value_or(AirEnvironmentSettings{});
     AirEnvironmentSettings edited = current;
@@ -1009,6 +1026,12 @@ void Editor::DrawEnvironmentalHazeControls(IDemoScene& scene)
     if(document == nullptr)
     {
         ImGui::TextDisabled("Open a project scene to edit its environmental haze.");
+        return;
+    }
+
+    if(IsEnvironmentGroupInherited(scene, static_cast<int>(FileBackedDemoScene::EnvironmentGroup::Haze)))
+    {
+        ImGui::TextDisabled("Inherited. Enable the Haze override (Environment, Local Level) to edit this Local Level's own.");
         return;
     }
 
@@ -1217,33 +1240,11 @@ bool Editor::ReplayMistRendering(IDemoScene& scene, const MistRenderingEdit& edi
 
 // AIR.4F F4.4.1: the scene's mist appearance. A checkbox commits at once; a slider shows its value live (a draft) and commits on release,
 // so one drag is one history entry.
-void Editor::DrawMistRenderingControls(IDemoScene& scene)
+// Every MistRenderSettings field with its tooltip. A checkbox is a whole edit; a slider is one while it is held.
+MistFieldEdit DrawMistAppearanceFields(MistRenderSettings& settings)
 {
-    auto* owner = dynamic_cast<FileBackedDemoScene*>(&scene);
-    const SceneDocument* document = owner && owner->m_runtime && !owner->IsArchiveActivation() ? &owner->m_runtime->GetFileScene().GetDocument() :
-        nullptr;
-
-    const std::uint64_t runtimeIdentity = document != nullptr ? owner->GetRuntimeIdentity() : 0;
-
-    if(m_mistRenderingDraft && (document == nullptr || m_mistRenderingDraft->runtimeIdentity != runtimeIdentity))
-    {
-        m_mistRenderingDraft.reset();
-    }
-
-    ImGui::SeparatorText("Mist rendering (scene)");
-
-    if(document == nullptr)
-    {
-        ImGui::TextDisabled("Open a project scene to edit the mist's appearance.");
-        return;
-    }
-
-    const std::optional<MistRenderSettings> stored = document->mistRendering;
-    MistRenderSettings settings = GetEffectiveMistRendering(document, runtimeIdentity);
-    const bool editable = !IsSceneEditingLocked() && m_gameState == GameState::Editing;
     bool changed = false;
     bool commit = false;
-    // A checkbox is a whole edit; a slider is one while it is held.
     const auto checkbox = [&](const char* label, bool& value)
     {
         if(ImGui::Checkbox(label, &value))
@@ -1258,7 +1259,6 @@ void Editor::DrawMistRenderingControls(IDemoScene& scene)
         commit = commit || ImGui::IsItemDeactivatedAfterEdit();
     };
 
-    ImGui::BeginDisabled(!editable);
     slider(ImGui::DragFloat("Mist opacity", &settings.opacity, 0.01f, 0.0f, MistRenderSettings::MaximumOpacity, "%.2f"));
 
     if(ImGui::IsItemHovered())
@@ -1465,6 +1465,44 @@ void Editor::DrawMistRenderingControls(IDemoScene& scene)
 
     ImGui::EndDisabled();
     ImGui::EndDisabled();
+
+    return {changed, commit};
+}
+
+void Editor::DrawMistRenderingControls(IDemoScene& scene)
+{
+    auto* owner = dynamic_cast<FileBackedDemoScene*>(&scene);
+    const SceneDocument* document = owner && owner->m_runtime && !owner->IsArchiveActivation() ? &owner->m_runtime->GetFileScene().GetDocument() :
+        nullptr;
+
+    const std::uint64_t runtimeIdentity = document != nullptr ? owner->GetRuntimeIdentity() : 0;
+
+    if(m_mistRenderingDraft && (document == nullptr || m_mistRenderingDraft->runtimeIdentity != runtimeIdentity))
+    {
+        m_mistRenderingDraft.reset();
+    }
+
+    ImGui::SeparatorText("Mist rendering (scene)");
+
+    if(document == nullptr)
+    {
+        ImGui::TextDisabled("Open a project scene to edit the mist's appearance.");
+        return;
+    }
+
+    if(IsEnvironmentGroupInherited(scene, static_cast<int>(FileBackedDemoScene::EnvironmentGroup::Mist)))
+    {
+        ImGui::TextDisabled("Inherited. Enable the Mist appearance override (Environment, Local Level) to edit this Local Level's own.");
+        return;
+    }
+
+    const std::optional<MistRenderSettings> stored = document->mistRendering;
+    MistRenderSettings settings = GetEffectiveMistRendering(document, runtimeIdentity);
+    const bool editable = !IsSceneEditingLocked() && m_gameState == GameState::Editing;
+    ImGui::BeginDisabled(!editable);
+    const MistFieldEdit edit = DrawMistAppearanceFields(settings);
+    const bool changed = edit.changed;
+    const bool commit = edit.commit;
     ImGui::EndDisabled();
 
     if(!editable)

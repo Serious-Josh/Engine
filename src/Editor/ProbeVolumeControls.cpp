@@ -157,6 +157,12 @@ void Editor::RefreshProbeView(const FileBackedDemoScene& owner, const IDemoScene
 
 bool Editor::GenerateProbes(IDemoScene& scene, const FileBackedDemoScene& owner, const SceneObjectDocument& object, BackgroundTaskId parent)
 {
+    if(owner.GetCompositeWorld())
+    {
+        m_probeEditStatus = "Probe generation and acoustic baking needs one bake per Local Level and is not available in a World (W9); open the Local Level to bake it.";
+        return false;
+    }
+
     if(!m_audioSystem || m_probeGeneration || m_probeBatchRequest || m_probePublishTask.IsValid() || !m_historySession)
     {
         m_probeEditStatus = m_audioSystem ? "Another generation is running." : "Audio is not running.";
@@ -591,7 +597,7 @@ void Editor::DrawObjectProbeVolumeControls(IDemoScene& scene, const ProjectPaths
     std::optional<SceneObjectMetadata> selection(std::in_place);
     SceneObjectDocument object;
 
-    if(!owner->InspectSelectedObject(m_selectedObject, *selection, object) || !object.probeVolume)
+    if(!InspectSelection(*owner, *selection, object) || !object.probeVolume)
     {
         return;
     }

@@ -16,6 +16,9 @@ namespace AssetReconciliationTransaction
         std::filesystem::path relativePath;
         std::string bytes;
         std::optional<std::string> expectedOriginal;
+        // W2: a new file (the target must not exist; no expected original). Rollback removes it again, and only if it holds
+        // exactly the staged bytes.
+        bool create = false;
     };
 
     bool Commit(
@@ -32,4 +35,23 @@ namespace AssetReconciliationTransaction
         const std::filesystem::path& relativePath,
         std::string& bytes,
         std::string& error);
+
+#if defined(_DEBUG)
+    // W1.3 diagnostics (Debug builds only): simulates process death at one stage of the next Commit or Recover. The interrupted
+    // call returns false and leaves storage exactly as a crash would (no rollback, no cleanup), so the following Recover is what
+    // must restore a consistent project. `index` selects the target for the per-target stages. One-shot.
+    enum class FaultStage
+    {
+        None,
+        BeforeJournal,
+        AfterJournal,
+        DuringRetirement,
+        DuringInstallation,
+        BeforeCommitMarker,
+        AfterCommitMarker,
+        DuringRecovery
+    };
+
+    void InjectFaultForTesting(FaultStage stage, std::size_t index = 0);
+#endif
 }

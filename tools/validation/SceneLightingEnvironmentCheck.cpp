@@ -1,8 +1,11 @@
 #include "assets/PrimitiveMeshAssets.h"
 #include "assets/MaterialAssetSerializer.h"
 #include "assets/AssetRegistrySerializer.h"
+
+#include <functional>
 #include "Project/ProjectPaths.h"
 #include "Scene/LegacyLightingMigration.h"
+#include "Scene/PhysicalLightingMigration.h"
 #include "Scene/SceneDocumentAdapter.h"
 #include "Scene/SceneHierarchyEdits.h"
 #include "Scene/FileSceneRuntime.h"
@@ -39,6 +42,23 @@ void Check(bool ok, const std::string& message)
     ++checks;
     if(!ok) throw std::runtime_error(message);
 }
+std::vector<std::string> g_historicalCookedFailures;
+
+// Runs one historical cooked-fixture check. Its fixtures patch today's cooked bytes into schema 1-12 layouts, so a fixture that no
+// longer matches the current writer fails here (reported separately, and the run still fails) without hiding the current-format
+// results that follow.
+void HistoricalCookedCheck(const std::string& label, const std::function<void()>& body)
+{
+    try
+    {
+        body();
+    }
+    catch(const std::exception& exception)
+    {
+        g_historicalCookedFailures.push_back(label + ": " + exception.what());
+    }
+}
+
 bool Near(const Vector3& a, const Vector3& b)
 {
     return (a-b).Length() < 2e-5f;
@@ -56,7 +76,7 @@ FrameLighting Lighting(const SceneDocument& document)
     Check(BuildFrameLighting(legacy, &snapshot, frame, &error), error);
     return frame;
 }
-std::vector<std::byte> HistoricalCooked(SceneDocument document, unsigned version, const DirectionalLight& sun)
+std::vector<std::byte> HistoricalCooked(SceneDocument document, unsigned version, const LegacySceneSun& sun)
 {
     // Independent historical layout fixture: no objects, source scene header/camera followed
     // by the old nine-float scene sun. No reinterpretation of new component records.
@@ -90,14 +110,20 @@ void CheckLightingMigration(const std::filesystem::path& output)
     using Json = nlohmann::json;
     std::string error;
     SceneDocument original;
-    original.id = "directional-migration";
+    original.id = "00000000-0000-4000-8000-000000000011"; // Schema 28+ scene ids are canonical GUIDs.
     Check(SaveSceneDocument(original, output/"template.scene", &error), error);
     Json historical;
     { std::ifstream file(output/"template.scene"); file >> historical; }
     historical.erase("lightingSettings");
-    DirectionalLight sun;
+    // Schema 1-12 documents predate the scene kind (28), membership (29) and environment overrides (30).
+    for(const char* field : {"kind", "owningWorld", "members", "environmentOverrides"})
+    {
+        historical.erase(field);
+    }
+
+    LegacySceneSun sun;
     sun.direction = {0.3f,-0.8f,-0.5f};
-    sun.color = {2.0f,-0.25f,0.7f}; // Outside both the old component color and intensity limits.
+    sun.color = {2.0f,0.25f,0.7f}; // Above the old component color and intensity limits (negative channels are now refused).
     sun.intensity = 2000000.0f;
     sun.angularRadius = 0.04f;
     sun.ambientStrength = 0.63f;
@@ -117,35 +143,53 @@ void CheckLightingMigration(const std::filesystem::path& output)
         Check(after == text, "Loading rewrote a historical scene on disk.");
         Check(migrated.objects.size() == 1 && migrated.objects[0].light.has_value(), "Legacy sun was not migrated exactly once.");
         Check(Near(migrated.objects[0].transform.position, {}), "Migrated sun is not at origin.");
-        Check(migrated.objects[0].light->color.x == sun.color.x && migrated.objects[0].light->color.y == sun.color.y &&
-            migrated.objects[0].light->intensity == sun.intensity, "Legacy radiometry was clamped or rescaled.");
+        // Physical lighting migration moves a legacy Directional colour above 1 into the illuminance (colour divided by its
+        // largest channel) and converts the units; the channel ratios survive and nothing is clamped to zero.
+        const float largest = (std::max)({sun.color.x, sun.color.y, sun.color.z});
+        const Vector3 expectedColor = sun.color * (1.0f / largest);
+        const auto& migratedLight = *migrated.objects[0].light;
+        Check(Near(migratedLight.color, expectedColor) && std::isfinite(migratedLight.intensity) && migratedLight.intensity > 0.0f,
+            "Legacy radiometry was clamped instead of normalised into the illuminance.");
         const auto frame = Lighting(migrated);
-        Check(Near(frame.sun.direction, sun.direction.Normalized()) && frame.sun.angularRadius == sun.angularRadius &&
-            frame.sun.ambientStrength == sun.ambientStrength, "Legacy direction/radius/ambient changed.");
+        Check(Near(frame.sun.direction, sun.direction.Normalized()) && frame.sun.angularRadius == sun.angularRadius,
+            "Legacy direction/radius changed.");
+        // The legacy ambient strength has no rendering equivalent since physical lighting; migration reports it.
+        auto reported = original;
+        Check(MigrateLegacyLighting(reported, sun) == sun.ambientStrength, "Migration did not report the legacy ambient strength.");
         const auto source = MakeRtxdiSunSource(frame.sun);
         Check(source.cosAngularRadius == std::cos(sun.angularRadius), "RTXDI ignored component radius.");
-        const auto oldBytes = HistoricalCooked(original, version, sun);
-        const auto decoded = CookedScene::Decode(oldBytes);
-        Check(decoded.meshes.size() == decoded.document.objects.size() && decoded.document.objects.size() == 1,
-            "Historical cooked migration lost object/binding correspondence.");
-        Check(SceneDocumentsEqual(decoded.document, migrated), "Loose/cooked migration disagrees.");
-        const auto sceneID = *AssetID::Parse("00000000-0000-4000-8000-000000000002");
-        const EngineAssetPak::PreparedAsset entry{sceneID,EngineAssetPak::Type::Scene,version,1,oldBytes,16};
-        EngineAssetPak::Write(output/"legacy.toc",output/"legacy.eap",std::span(&entry,1));
-        Check(CookedScene::OpenArchive(output/"legacy.toc",output/"legacy.eap",sceneID)->ValidateReferences(&error),error);
+        HistoricalCookedCheck("schema " + std::to_string(version) + " cooked scene sun", [&]
+        {
+            const auto oldBytes = HistoricalCooked(original, version, sun);
+            const auto decoded = CookedScene::Decode(oldBytes);
+            Check(decoded.meshes.size() == decoded.document.objects.size() && decoded.document.objects.size() == 1,
+                "Historical cooked migration lost object/binding correspondence.");
+            Check(SceneDocumentsEqual(decoded.document, migrated), "Loose/cooked migration disagrees.");
+            const auto sceneID = *AssetID::Parse("00000000-0000-4000-8000-000000000002");
+            const EngineAssetPak::PreparedAsset entry{sceneID,EngineAssetPak::Type::Scene,version,1,oldBytes,16};
+            EngineAssetPak::Write(output/"legacy.toc",output/"legacy.eap",std::span(&entry,1));
+            Check(CookedScene::OpenArchive(output/"legacy.toc",output/"legacy.eap",sceneID)->ValidateReferences(&error),error);
+        });
     }
     auto darkSun = sun; darkSun.intensity = 0.0f;
     auto darkLegacy = original;
     darkLegacy.environmentReference = SceneDocument::NoneEnvironmentReference;
     MigrateLegacyLighting(darkLegacy,darkSun);
-    Check(Lighting(darkLegacy).sun.intensity == 0 &&
-        Lighting(darkLegacy).sun.ambientStrength == sun.ambientStrength, "Zero-intensity sun lost independent ambient settings.");
+    Check(Lighting(darkLegacy).sun.intensity == 0, "A zero-intensity legacy sun gained illumination.");
+    auto darkReported = original;
+    Check(MigrateLegacyLighting(darkReported, darkSun) == sun.ambientStrength, "A zero-intensity legacy sun lost its reported ambient.");
     // Pole and cardinal directions exercise the Engine +Z Euler convention.
     for(const Vector3 direction : {Vector3{0,1,0},Vector3{0,-1,0},Vector3{1,0,0},Vector3{0,0,-1},Vector3{0,0,1}})
     {
         auto cardinal = original; auto light = sun; light.direction = direction;
-        MigrateLegacyLighting(cardinal,light);
-        Check(Near(Lighting(cardinal).sun.direction,direction),"Cardinal legacy direction changed during migration.");
+        // The codec step, then the unit conversion that completes every historical load (PhysicalLightingMigration.h); the codec
+        // step alone leaves legacy radiometry that current Light validation rejects.
+        const float cardinalAmbient = MigrateLegacyLighting(cardinal,light);
+        MigrateLegacyLightUnits(cardinal, 12, cardinalAmbient, {}, {});
+        const Vector3 migratedDirection = Lighting(cardinal).sun.direction;
+        Check(Near(migratedDirection,direction),"Cardinal legacy direction changed during migration: (" + std::to_string(direction.x) + "," +
+            std::to_string(direction.y) + "," + std::to_string(direction.z) + ") became (" + std::to_string(migratedDirection.x) + "," +
+            std::to_string(migratedDirection.y) + "," + std::to_string(migratedDirection.z) + ").");
     }
     auto collision = original;
     SceneObjectDocument occupied; occupied.id = "legacy-directional-light"; collision.objects.push_back(occupied);
@@ -173,6 +217,7 @@ void CheckLightingMigration(const std::filesystem::path& output)
     existing["light"]["color"] = {0.2,0.4,0.6};
     existing["light"]["enabled"] = false;
     existing["light"].erase("angularRadius");
+    existing["light"].erase("rangeAttenuation"); // Introduced after schema 12.
     existing["parentID"] = "parent";
     auto parent = existing;
     parent["id"] = "parent"; parent["parentID"] = ""; parent.erase("light");
@@ -182,7 +227,9 @@ void CheckLightingMigration(const std::filesystem::path& output)
     SceneDocument existingScene;
     Check(LoadSceneDocument(output/"existing.scene",existingScene,&error),error);
     Check(existingScene.objects.size() == 2 && existingScene.objects[1].id == "existing-directional" &&
-        existingScene.objects[1].parentID == "parent" && existingScene.objects[1].light->intensity == 7 &&
+        // Historical intensities are converted to physical units on load, so the exact legacy value 7 is not kept.
+        existingScene.objects[1].parentID == "parent" && std::isfinite(existingScene.objects[1].light->intensity) &&
+        existingScene.objects[1].light->intensity > 0.0f &&
         existingScene.objects[1].light->angularRadius == sun.angularRadius && !existingScene.objects[1].light->enabled,
         "Existing directional objects lost precedence, identity or inherited radius.");
     Check(Lighting(existingScene).sun.intensity == 0, "Disabled existing directional reactivated the legacy sun.");
@@ -193,6 +240,7 @@ void CheckLightingMigration(const std::filesystem::path& output)
     oneComponent.objects[0].light->color = {0.2f,0.4f,0.6f};
     oneComponent.objects[0].light->intensity = 7;
     for(unsigned version : {11u,12u})
+    HistoricalCookedCheck("schema " + std::to_string(version) + " cooked component record", [&]
     {
         auto legacyBytes = CookedScene::Cook(oneComponent,{},registry);
         const size_t ambientOffset = 32 + 4 + oneComponent.id.size() + 4 + oneComponent.name.size() + 40;
@@ -207,15 +255,15 @@ void CheckLightingMigration(const std::filesystem::path& output)
         Check(oldComponent.objects.size() == 1 && oldComponent.objects[0].id == oneComponent.objects[0].id &&
             oldComponent.objects[0].light->intensity == 7 && oldComponent.objects[0].light->angularRadius == sun.angularRadius,
             "Historical cooked component lost identity, precedence or angular radius.");
-    }
+    });
 
     // Current data takes deterministic precedence over a stale legacy root.
     component["directionalLight"] = historical["directionalLight"];
     component["objects"] = Json::array();
-    component["lightingSettings"]["ambientStrength"] = 0.28f;
+    component["lightingSettings"]["referenceEV100"] = 9.5f;
     { std::ofstream file(output/"mixed.scene"); file << component; }
     Check(LoadSceneDocument(output/"mixed.scene",existingScene,&error) && existingScene.objects.empty() &&
-        existingScene.lightingSettings.ambientStrength == 0.28f, "Stale legacy root overrode current object ownership.");
+        existingScene.lightingSettings.referenceEV100 == 9.5f, "Stale legacy root overrode current object ownership.");
     historical.erase("directionalLight"); historical["objects"] = Json::array();
     { std::ofstream file(output/"absent.scene"); file << historical; }
     Check(LoadSceneDocument(output/"absent.scene",existingScene,&error) && existingScene.objects.empty(),
@@ -267,11 +315,13 @@ void CheckLightingMigration(const std::filesystem::path& output)
     runtime.GetScene().SetRenderObjectTransform(selection->runtimeIndex,transform);
     Check(runtime.CaptureSceneLighting(snapshot,error) && BuildFrameLighting(DirectionalLight{},&snapshot,frame,&error) &&
         Near(frame.sun.direction,rotatedDirection), "Moving directional light changed its illumination direction.");
-    auto settings = runtime.GetScene().GetLightingSettings(); settings.ambientStrength = 0.91f;
+    // Scene-level calibration that does not rescale Light records (EV100 would change every packed light and its RTXDI identity).
+    auto settings = runtime.GetScene().GetLightingSettings(); settings.environmentLuminanceScale *= 2.0f;
     runtime.GetScene().SetLightingSettings(settings);
     Check(runtime.SetObjectLight(*selection,edited,std::nullopt,&error) && runtime.CaptureSceneLighting(snapshot,error),error);
     Check(BuildFrameLighting(DirectionalLight{},&snapshot,frame,&error) && frame.sun.intensity == 0 &&
-        frame.sun.ambientStrength == settings.ambientStrength, "Removing final light lost independent ambient or resurrected sun.");
+        snapshot.lightingSettings.environmentLuminanceScale == settings.environmentLuminanceScale,
+        "Removing final light lost the scene calibration or resurrected the sun.");
     RtxdiLightSet removed;
     Check(BuildRtxdiLightSet(frame,{},removed) && removed.records.size() == 1 &&
         removed.identities[0].kind == RtxdiLightKind::Point && removed.identities[0].objectID == runtimePoint.id, "Deleted directional survived RTXDI light construction.");
@@ -307,14 +357,24 @@ void CheckLightingMigration(const std::filesystem::path& output)
         SceneObjectDocument point; point.id = "point-" + std::to_string(i); point.light = LightComponent{};
         crowded.objects.push_back(point);
     }
-    MigrateLegacyLighting(crowded,sun);
+    const float crowdedAmbient = MigrateLegacyLighting(crowded,sun);
+    MigrateLegacyLightUnits(crowded, 12, crowdedAmbient, {}, {}); // Completes the historical load, as above.
     Check(ValidateSceneDocument(crowded,&error) && Lighting(crowded).table.lightCount == MaximumSceneLights,
         "Migrating a full legacy light table exceeded capacity.");
-    auto radiometry = DefaultLightComponent(LightType::Directional);
-    radiometry.color = {-3,2,4}; radiometry.intensity = (std::numeric_limits<float>::max)();
-    Check(ValidateLightComponent(radiometry), "Finite legacy directional radiometry was narrowed.");
-    radiometry.type = LightType::Point;
-    Check(!ValidateLightComponent(radiometry), "Point/Spot radiometry bounds were broadened.");
+    // Physical lighting: every type keeps colour channels in [0, 1] and carries brightness in the intensity (up to the shared
+    // maximum). Legacy out-of-range colours are normalised by migration, never accepted as authored values.
+    for(const LightType type : {LightType::Directional, LightType::Point, LightType::Spot})
+    {
+        auto radiometry = DefaultLightComponent(type);
+        radiometry.color = {0.25f, 0.5f, 1.0f};
+        radiometry.intensity = LightComponent::MaximumIntensity;
+        Check(ValidateLightComponent(radiometry), "In-range colour at the maximum intensity was refused.");
+        radiometry.color = {-3, 2, 4};
+        Check(!ValidateLightComponent(radiometry), "Out-of-range colour channels were accepted.");
+        radiometry.color = {1, 1, 1};
+        radiometry.intensity = (std::numeric_limits<float>::max)();
+        Check(!ValidateLightComponent(radiometry), "Intensity above the shared maximum was accepted.");
+    }
 }
 
 void CreateControlledFixture(const std::filesystem::path& root)
@@ -339,7 +399,6 @@ void CreateControlledFixture(const std::filesystem::path& root)
     scene.id = "00000000-0000-4000-8000-000000000004";
     scene.name = "Controlled Point Light Only";
     scene.environmentReference = SceneDocument::NoneEnvironmentReference;
-    scene.lightingSettings.ambientStrength = 0;
     scene.camera.position = {5,3,-6}; scene.camera.target = {0,1,0};
     SceneObjectDocument floor;
     floor.id = "floor"; floor.name = "Rough Nonmetallic Floor"; floor.meshReference = cube;
@@ -381,7 +440,7 @@ int main(int argc, char** argv)
         CheckLightingMigration(output);
         CreateControlledFixture(output/"ControlledProject");
         SceneDocument scene;
-        scene.id = "lighting-environment-test";
+        scene.id = "00000000-0000-4000-8000-000000000012"; // Schema 28+ scene ids are canonical GUIDs.
         scene.environmentReference = SceneDocument::NoneEnvironmentReference;
         SceneObjectDocument point;
         point.id = "point";
@@ -418,6 +477,18 @@ int main(int argc, char** argv)
         nlohmann::json old;
         { std::ifstream file(output / "none.scene"); file >> old; }
         old["schemaVersion"] = 11;
+
+        // Schema 11 predates scene lighting settings (13), the scene kind (28), membership (29) and environment overrides (30).
+        for(const char* field : {"lightingSettings", "kind", "owningWorld", "members", "environmentOverrides"})
+        {
+            old.erase(field);
+        }
+
+        for(auto& object : old["objects"])
+        {
+            object["light"].erase("rangeAttenuation"); // Introduced after schema 12.
+        }
+
         for(const std::string reference : {std::string{}, id.ToReference()})
         {
             old["environmentReference"] = reference;
@@ -516,6 +587,19 @@ int main(int argc, char** argv)
             }
         }
         std::cout << checks << " checks passed (migration, object ownership, runtime edits/deletion, loose/cooked/archive persistence, GPU resources, RTXDI set/history).\n";
+
+        if(!g_historicalCookedFailures.empty())
+        {
+            std::cout << "HISTORICAL COOKED FIXTURES FAILED (" << g_historicalCookedFailures.size() << "):\n";
+
+            for(const auto& failure : g_historicalCookedFailures)
+            {
+                std::cout << "  " << failure << "\n";
+            }
+
+            return 2;
+        }
+
         return 0;
     }
     catch(const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }

@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdint>
+
 #include "Scene/SceneDocument.h"
 
 #include <filesystem>
@@ -33,6 +35,7 @@ public:
 
     const SceneDocument& GetDocument() const noexcept;
     SceneDocument& EditDocument() noexcept;
+    std::uint64_t GetEditRevision() const noexcept { return m_editRevision; }
 
     const std::filesystem::path& GetPath() const noexcept;
 
@@ -45,4 +48,7 @@ private:
 
     bool m_hasDocument = false;
     bool m_dirty = false;
+    // Incremented by every EditDocument call (the only writable access to the document): the content half of the persistent
+    // validated object index's invalidation (FileSceneRuntime, revised S0.3).
+    std::uint64_t m_editRevision = 0;
 };

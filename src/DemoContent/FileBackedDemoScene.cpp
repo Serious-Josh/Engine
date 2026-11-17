@@ -11,6 +11,10 @@
 #include "Project/ProjectPaths.h"
 #include "assets/ProjectAssetResolver.h"
 #include "assets/ProjectAssetRegistry.h"
+#include "Scene/SceneSerializer.h"
+#include "assets/ProjectSceneMembership.h"
+#include <fstream>
+#include <iterator>
 #include "Renderer/Mesh.h"
 #include "Renderer/Renderer.h"
 
@@ -54,6 +58,11 @@ FileBackedDemoScene::FileBackedDemoScene(std::shared_ptr<const CookedScene::Arch
 
 FileBackedDemoScene::FileBackedDemoScene(SceneDocument unsavedDocument)
     : m_unsavedDocument(std::move(unsavedDocument))
+{
+}
+
+FileBackedDemoScene::FileBackedDemoScene(std::shared_ptr<CompositeWorld> composite)
+    : m_unsavedDocument(composite->document), m_compositeWorld(std::move(composite))
 {
 }
 
@@ -159,6 +168,22 @@ bool FileBackedDemoScene::AdvanceStagedInitialization(bool& done)
         else if (m_unsavedDocument)
         {
             opened = m_runtime->LoadUnsavedDocument(*m_unsavedDocument, &error);
+
+            // W5: a composite World is edited in place; the runtime checks every edited candidate against the ownership rules
+            // and gives new entities the editing context's level.
+            if(opened && m_compositeWorld)
+            {
+                m_editingLevel = m_compositeWorld->worldID;
+                m_runtime->SetCompositeHooks(
+                    [this](const SceneDocument& candidate, std::string& error)
+                    {
+                        return ValidateCompositeEdit(*m_compositeWorld, candidate, error);
+                    },
+                    [this](SceneObjectDocument& object)
+                    {
+                        AssignCompositeEntity(object);
+                    });
+            }
         }
         else
         {
@@ -220,6 +245,12 @@ bool FileBackedDemoScene::AdvanceStagedInitialization(bool& done)
         m_stagingStep = StagingStep::Idle;
         m_initialized = true;
         m_metadataOnlyActivation = metadataOnly;
+
+        // W3: resolve the preview environment before the Engine requests the scene environment, so the first request is the
+        // effective sky (no request for a sky that is immediately replaced).
+        ReadEnvironmentWorld();
+        RefreshEnvironmentPreview(false);
+        m_publishedEnvironmentReference = m_runtime->GetScene().GetEnvironmentReference();
         done = true;
         return true;
 
@@ -425,6 +456,16 @@ bool FileBackedDemoScene::Save(std::string* errorMessage)
         return false;
     }
 
+    if(m_compositeWorld)
+    {
+        if(errorMessage)
+        {
+            *errorMessage = "A World preview cannot be saved: the World and its Local Levels are saved from their own documents.";
+        }
+
+        return false;
+    }
+
     if (IsUnsaved())
     {
         if (errorMessage)
@@ -440,11 +481,12 @@ bool FileBackedDemoScene::Save(std::string* errorMessage)
 
 bool FileBackedDemoScene::SaveAs(const std::filesystem::path& path, std::string* errorMessage, bool replaceExisting)
 {
-    if (!m_initialized || m_archiveScene)
+    if (!m_initialized || m_archiveScene || m_compositeWorld)
     {
         if (errorMessage)
         {
-            *errorMessage = "Save As requires an initialized, editable file-backed scene.";
+            *errorMessage = m_compositeWorld ? "A World preview cannot be saved as a scene: it is composed from the World and its "
+                "Local Levels, which keep their own documents." : "Save As requires an initialized, editable file-backed scene.";
         }
 
         return false;
@@ -678,7 +720,164 @@ bool FileBackedDemoScene::CheckUnsavedChanges(
     bool& dirty,
     std::string* errorMessage) const
 {
+    // W5: a composite World is unsaved when any of its source documents differs from its baseline.
+    if(m_compositeWorld)
+    {
+        std::vector<bool> documents;
+
+        if(!GetCompositeDirtyDocuments(documents, errorMessage))
+        {
+            return false;
+        }
+
+        dirty = std::ranges::find(documents, true) != documents.end();
+        return true;
+    }
+
     return m_runtime->CheckUnsavedChanges(dirty, errorMessage);
+}
+
+bool FileBackedDemoScene::ProjectComposite(CompositeWorldProjection& projection, std::string* errorMessage) const
+{
+    SceneDocument captured;
+    std::string error;
+
+    if(!m_compositeWorld || !m_runtime->CaptureDocumentForSave(captured, &error) ||
+        !ProjectCompositeDocuments(*m_compositeWorld, captured, projection, error))
+    {
+        if(errorMessage)
+        {
+            *errorMessage = error.empty() ? std::string("No composite World is open.") : error;
+        }
+
+        return false;
+    }
+
+    return true;
+}
+
+bool FileBackedDemoScene::GetCompositeDirtyDocuments(std::vector<bool>& dirty, std::string* errorMessage) const
+{
+    CompositeWorldProjection projection;
+
+    if(!ProjectComposite(projection, errorMessage))
+    {
+        return false;
+    }
+
+    dirty = DirtyCompositeDocuments(*m_compositeWorld, projection);
+    return true;
+}
+
+bool FileBackedDemoScene::SaveCompositeDocuments(const ProjectPaths& paths, ProjectAssetRegistry& registry,
+    std::optional<std::size_t> onlyDocument, std::size_t& saved, std::string* errorMessage)
+{
+    saved = 0;
+    CompositeWorldProjection projection;
+
+    if(!ProjectComposite(projection, errorMessage))
+    {
+        return false;
+    }
+
+    // Document 0 is the World; document i + 1 is levels[i]. Only dirty documents are written, each against its baseline bytes.
+    const auto dirty = DirtyCompositeDocuments(*m_compositeWorld, projection);
+    std::vector<ProjectSceneMembership::DocumentSave> saves;
+    std::vector<std::size_t> indices;
+
+    for(std::size_t index = 0; index < dirty.size(); ++index)
+    {
+        if(!dirty[index] || (onlyDocument && *onlyDocument != index))
+        {
+            continue;
+        }
+
+        const auto& baseline = index == 0 ? m_compositeWorld->worldSource : m_compositeWorld->localSources[index - 1];
+        const auto& document = index == 0 ? projection.world : projection.locals[index - 1];
+        saves.push_back({baseline.relativePath, document, baseline.bytes});
+        indices.push_back(index);
+    }
+
+    if(saves.empty())
+    {
+        return true;
+    }
+
+    ProjectSceneMembership::Result result;
+    std::string error;
+
+    if(!ProjectSceneMembership::SaveSceneDocuments(paths, registry, saves, result, error))
+    {
+        if(errorMessage)
+        {
+            *errorMessage = error;
+        }
+
+        return false;
+    }
+
+    // Committed: the written documents become the new baselines (exactly the bytes the transaction wrote).
+    for(std::size_t entry = 0; entry < saves.size(); ++entry)
+    {
+        auto& baseline = indices[entry] == 0 ? m_compositeWorld->worldSource : m_compositeWorld->localSources[indices[entry] - 1];
+        baseline.document = saves[entry].document;
+        SerializeSceneDocument(baseline.document, baseline.bytes);
+    }
+
+    for(std::size_t index = 0; index < m_compositeWorld->levels.size(); ++index)
+    {
+        m_compositeWorld->levels[index].placement = m_compositeWorld->worldSource.document.members[index].placement;
+    }
+
+    saved = saves.size();
+    return true;
+}
+
+bool FileBackedDemoScene::SetEditingLevel(const std::string& levelID)
+{
+    if(!m_compositeWorld)
+    {
+        return false;
+    }
+
+    const bool known = levelID == m_compositeWorld->worldID || std::ranges::any_of(m_compositeWorld->levels,
+        [&levelID](const CompositeWorld::Level& level)
+        {
+            return level.id == levelID;
+        });
+
+    if(known)
+    {
+        m_editingLevel = levelID;
+    }
+
+    return known;
+}
+
+// New entities: the level of their parent when they have one (duplicates stay beside their source), otherwise the editing context;
+// a Local Level's new root entity is parented to its level root. Identities that already carry a level (restored deletions) are kept.
+void FileBackedDemoScene::AssignCompositeEntity(SceneObjectDocument& object) const
+{
+    if(!m_compositeWorld || object.id.empty() || object.id.find('/') != std::string::npos)
+    {
+        return;
+    }
+
+    std::string level = m_editingLevel;
+
+    if(!object.parentID.empty())
+    {
+        const auto separator = object.parentID.find('/');
+        level = separator == std::string::npos ? object.parentID : object.parentID.substr(0, separator);
+    }
+
+    object.id = CompositeWorld::RuntimeID(level, object.id);
+
+    if(object.parentID.empty() && level != m_compositeWorld->worldID)
+    {
+        object.parentID = level;
+        object.parentIsLevelNode = true;
+    }
 }
 
 std::optional<RuntimeMaterialVersions> FileBackedDemoScene::GetMaterialVersions(
@@ -1049,4 +1248,206 @@ bool FileBackedDemoScene::ValidateObjectTransform(RenderObjectID index, const Tr
 
     error = "Transform target is absent from the authored scene.";
     return false;
+}
+
+void FileBackedDemoScene::ReadEnvironmentWorld()
+{
+    m_environmentWorld.reset();
+    m_environmentWorldProblem.clear();
+    m_worldHasDirectionalLights = false;
+
+    if(m_archiveScene || !m_runtime->GetFileScene().HasDocument())
+    {
+        return;
+    }
+
+    const auto& document = m_runtime->GetFileScene().GetDocument();
+
+    if(document.kind != SceneKind::Local || document.owningWorld.empty())
+    {
+        return;
+    }
+
+    // The World is read as a document only: its entities are never loaded into this preview.
+    const auto id = AssetID::Parse(document.owningWorld);
+    const auto* record = id && m_registry ? m_registry->Find(*id) : nullptr;
+
+    if(!record || record->type != AssetType::Scene)
+    {
+        m_environmentWorldProblem = "The owning World " + document.owningWorld + " is not a registered scene.";
+        return;
+    }
+
+    std::ifstream file(m_projectRoot / record->relativePath, std::ios::binary);
+    const std::string bytes = file ? std::string((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>()) : std::string{};
+
+    if(!file.is_open() || file.bad())
+    {
+        m_environmentWorldProblem = "The owning World " + record->relativePath.generic_string() + " cannot be read.";
+        return;
+    }
+
+    SceneDocument world;
+    std::string error;
+
+    if(!ParseSceneDocument(bytes, world, &error))
+    {
+        m_environmentWorldProblem = "The owning World " + record->relativePath.generic_string() + " is not a valid scene: " + error;
+        return;
+    }
+
+    m_worldHasDirectionalLights = std::any_of(world.objects.begin(), world.objects.end(), [](const SceneObjectDocument& object)
+    {
+        return object.light && object.light->type == LightType::Directional;
+    });
+    m_environmentWorld = std::move(world);
+}
+
+bool FileBackedDemoScene::RefreshEnvironmentPreview(bool rereadWorld)
+{
+    if(!m_runtime->GetFileScene().HasDocument())
+    {
+        return false;
+    }
+
+    if(rereadWorld)
+    {
+        ReadEnvironmentWorld();
+    }
+
+    const auto& document = m_runtime->GetFileScene().GetDocument();
+    auto& scene = m_runtime->GetScene();
+
+    // Resolution input: the environment fields only (never the objects), with the live sky and exposure of overridden groups
+    // (they are edited in the runtime Scene until saved). This runs every Editor frame, so the member input is reassigned,
+    // reusing its string capacity, rather than rebuilt.
+    SceneDocument& input = m_environmentInput;
+    input.kind = document.kind;
+    input.id = document.id;
+    input.name = document.name;
+    input.owningWorld = document.owningWorld;
+    input.environmentOverrides = document.environmentOverrides;
+    input.environmentReference = document.environmentOverrides.sky ? scene.GetEnvironmentReference() : document.environmentReference;
+    input.lightingSettings = document.lightingSettings;
+
+    if(document.environmentOverrides.sky)
+    {
+        input.lightingSettings.environmentLuminanceScale = scene.GetLightingSettings().environmentLuminanceScale;
+    }
+
+    if(document.environmentOverrides.exposure)
+    {
+        input.lightingSettings.referenceEV100 = scene.GetLightingSettings().referenceEV100;
+    }
+
+    input.environmentalHaze = document.environmentalHaze;
+    input.mistRendering = document.mistRendering;
+    input.airEnvironment = document.airEnvironment;
+    input.airSimulation = document.airSimulation;
+    m_effectiveEnvironment = ResolveSceneEnvironment(input, m_environmentWorld ? &*m_environmentWorld : nullptr, m_environmentWorldProblem);
+
+    // Show the effective sky and exposure; overridden groups already show their own live values.
+    if(scene.GetEnvironmentReference() != m_effectiveEnvironment.environmentReference)
+    {
+        scene.SetEnvironmentReference(m_effectiveEnvironment.environmentReference);
+    }
+
+    if(!(scene.GetLightingSettings() == m_effectiveEnvironment.lightingSettings))
+    {
+        scene.SetLightingSettings(m_effectiveEnvironment.lightingSettings);
+    }
+
+    return scene.GetEnvironmentReference() != m_publishedEnvironmentReference;
+}
+
+bool FileBackedDemoScene::GetOverride(const SceneEnvironmentOverrides& overrides, EnvironmentGroup group)
+{
+    switch(group)
+    {
+    case EnvironmentGroup::Sky:
+        return overrides.sky;
+    case EnvironmentGroup::Exposure:
+        return overrides.exposure;
+    case EnvironmentGroup::Haze:
+        return overrides.haze;
+    case EnvironmentGroup::Mist:
+        return overrides.mist;
+    case EnvironmentGroup::AirEnvironment:
+        return overrides.airEnvironment;
+    case EnvironmentGroup::Wind:
+        return overrides.wind;
+    }
+
+    return false;
+}
+
+bool FileBackedDemoScene::SetEnvironmentOverride(EnvironmentGroup group, bool enabled, std::string* errorMessage)
+{
+    if(!m_initialized || m_archiveScene || !m_runtime->GetFileScene().HasDocument() ||
+        m_runtime->GetFileScene().GetDocument().kind != SceneKind::Local)
+    {
+        if(errorMessage)
+        {
+            *errorMessage = "Environment overrides belong to an open, editable Local Level.";
+        }
+
+        return false;
+    }
+
+    if(GetOverride(m_runtime->GetFileScene().GetDocument().environmentOverrides, group) == enabled)
+    {
+        return true;
+    }
+
+    auto& document = m_runtime->EditDocument();
+    auto& scene = m_runtime->GetScene();
+    auto lighting = scene.GetLightingSettings();
+
+    // Sky and exposure live in the runtime Scene while edited: keep the Local Level's own values either way.
+    switch(group)
+    {
+    case EnvironmentGroup::Sky:
+        if(enabled)
+        {
+            scene.SetEnvironmentReference(document.environmentReference);
+            lighting.environmentLuminanceScale = document.lightingSettings.environmentLuminanceScale;
+            scene.SetLightingSettings(lighting);
+        }
+        else
+        {
+            document.environmentReference = scene.GetEnvironmentReference();
+            document.lightingSettings.environmentLuminanceScale = lighting.environmentLuminanceScale;
+        }
+
+        document.environmentOverrides.sky = enabled;
+        break;
+    case EnvironmentGroup::Exposure:
+        if(enabled)
+        {
+            lighting.referenceEV100 = document.lightingSettings.referenceEV100;
+            scene.SetLightingSettings(lighting);
+        }
+        else
+        {
+            document.lightingSettings.referenceEV100 = lighting.referenceEV100;
+        }
+
+        document.environmentOverrides.exposure = enabled;
+        break;
+    case EnvironmentGroup::Haze:
+        document.environmentOverrides.haze = enabled;
+        break;
+    case EnvironmentGroup::Mist:
+        document.environmentOverrides.mist = enabled;
+        break;
+    case EnvironmentGroup::AirEnvironment:
+        document.environmentOverrides.airEnvironment = enabled;
+        break;
+    case EnvironmentGroup::Wind:
+        document.environmentOverrides.wind = enabled;
+        break;
+    }
+
+    RefreshEnvironmentPreview(false);
+    return true;
 }

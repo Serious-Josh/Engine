@@ -7,6 +7,7 @@
 
 #pragma comment(lib, "bcrypt.lib")
 
+#include <algorithm>
 #include <memory>
 #include <cstring>
 #include <stdexcept>
@@ -19,6 +20,30 @@ namespace
     constexpr size_t maxTargets = 4096;
     constexpr size_t maxTransactionBytes = 256 * 1024 * 1024;
     const fs::path transactionName = ".asset-reconciliation";
+
+#if defined(_DEBUG)
+    // W1.3 fault injection: a simulated crash is never caught as an ordinary failure, so nothing is rolled back or cleaned.
+    struct SimulatedCrash : std::runtime_error
+    {
+        SimulatedCrash() : std::runtime_error("Simulated crash (fault injection).") {}
+    };
+
+    AssetReconciliationTransaction::FaultStage g_faultStage = AssetReconciliationTransaction::FaultStage::None;
+    size_t g_faultIndex = 0;
+
+    void Fault(AssetReconciliationTransaction::FaultStage stage, size_t index)
+    {
+        if(g_faultStage == stage && g_faultIndex == index)
+        {
+            g_faultStage = AssetReconciliationTransaction::FaultStage::None;
+            throw SimulatedCrash();
+        }
+    }
+
+#define TRANSACTION_FAULT(stage, index) Fault(AssetReconciliationTransaction::FaultStage::stage, (index))
+#else
+#define TRANSACTION_FAULT(stage, index) ((void)0)
+#endif
 
     std::string Digest(const std::string& bytes)
     {
@@ -263,7 +288,9 @@ namespace
 
     std::vector<fs::path> Targets(Session& session, const nlohmann::json& journal)
     {
-        Require(journal.at("version") == 1 && journal.at("root") == session.root.generic_string(), "Journal project/version mismatch");
+        // Version 2 (W2) adds create targets ("create": true, no original); version 1 journals never have them.
+        Require((journal.at("version") == 1 || journal.at("version") == 2) && journal.at("root") == session.root.generic_string(),
+            "Journal project/version mismatch");
         const auto& records = journal.at("targets");
         Require(records.is_array() && !records.empty() && records.size() <= maxTargets, "Invalid journal target count");
         std::vector<fs::path> targets;
@@ -272,6 +299,8 @@ namespace
         {
             const auto target = session.Target(fs::u8path(record.at("path").get<std::string>()));
             Require(record.at("oldHash").is_string() && record.at("newHash").is_string(), "Missing journal digests");
+            Require(!record.contains("create") || (record.at("create").is_boolean() && journal.at("version") == 2),
+                "Invalid journal create flag");
 
             for(const auto& existing : targets)
             {
@@ -316,15 +345,44 @@ namespace
         const auto journal = nlohmann::json::parse(Read(session.directory / "journal.json"));
         const auto targets = Targets(session, journal);
         std::vector<std::string> originals;
+        std::vector<bool> created;
         std::vector<std::unique_ptr<Handle>> current;
         size_t total = 0;
 
         // Validate every recovery input and lock every extant target before touching any target.
         for(size_t index = 0; index < targets.size(); ++index)
         {
+            const auto& record = journal.at("targets").at(index);
+            created.push_back(record.value("create", false));
+
+            if(created.back())
+            {
+                // A created target had no original: rollback removes it, and only if it is exactly what was staged.
+                const auto replacement = Read(File(session, index, ".new"));
+                Require(record.at("oldHash").get<std::string>().empty() && !Exists(File(session, index, ".old")) &&
+                    Digest(replacement) == record.at("newHash").get<std::string>(), "Recovery payload checksum mismatch");
+                total += replacement.size();
+                Require(total <= maxTransactionBytes, "Transaction exceeds aggregate size limit");
+                std::unique_ptr<Handle> file;
+
+                if(Exists(targets[index]))
+                {
+                    file = Open(targets[index], GENERIC_READ | DELETE, OPEN_EXISTING);
+                    Require(Read(file->value) == replacement, "Target changed externally: " + targets[index].string());
+                }
+
+                if(Exists(File(session, index, ".removed")))
+                {
+                    Require(Read(File(session, index, ".removed")) == replacement, "Invalid displaced recovery file");
+                }
+
+                originals.emplace_back();
+                current.push_back(std::move(file));
+                continue;
+            }
+
             originals.push_back(Read(File(session, index, ".old")));
             const auto replacement = Read(File(session, index, ".new"));
-            const auto& record = journal.at("targets").at(index);
             Require(Digest(originals.back()) == record.at("oldHash").get<std::string>() &&
                 Digest(replacement) == record.at("newHash").get<std::string>(),
                 "Recovery payload checksum mismatch");
@@ -356,6 +414,19 @@ namespace
 
         for(size_t index = 0; index < targets.size(); ++index)
         {
+            if(created[index])
+            {
+                if(current[index])
+                {
+                    Remove(File(session, index, ".removed"));
+                    Rename(current[index]->value, File(session, index, ".removed"));
+                    current[index].reset();
+                }
+
+                TRANSACTION_FAULT(DuringRecovery, index);
+                continue;
+            }
+
             Remove(File(session, index, ".apply"));
             Write(File(session, index, ".apply"), originals[index]);
 
@@ -369,6 +440,7 @@ namespace
             Rename(apply->value, targets[index]);
             restored.push_back(std::move(apply));
             current[index].reset();
+            TRANSACTION_FAULT(DuringRecovery, index);
         }
 
         Complete(session, "rolledback");
@@ -387,6 +459,13 @@ bool AssetReconciliationTransaction::Recover(const ProjectPaths& paths, std::str
         Recover(session);
         return true;
     }
+#if defined(_DEBUG)
+    catch(const SimulatedCrash& crash)
+    {
+        error = crash.what();
+        return false;
+    }
+#endif
     catch(const std::exception& exception)
     {
         error = std::string(exception.what()) + " Recovery retained at: " + (paths.GetRoot() / transactionName).string();
@@ -408,12 +487,23 @@ bool AssetReconciliationTransaction::Commit(
         Session session(paths);
         Require(!Exists(session.directory), "Recover the previous transaction before committing");
         Require(!replacements.empty() && replacements.size() <= maxTargets, "Invalid replacement count");
-        nlohmann::json journal{{"version", 1}, {"root", session.root.generic_string()}, {"targets", nlohmann::json::array()}};
+        const bool creates = std::any_of(replacements.begin(), replacements.end(), [](const Replacement& replacement)
+        {
+            return replacement.create;
+        });
+        nlohmann::json journal{{"version", creates ? 2 : 1}, {"root", session.root.generic_string()},
+            {"targets", nlohmann::json::array()}};
 
         for(const auto& replacement : replacements)
         {
             Require(replacement.bytes.size() <= maxFileBytes, "Replacement exceeds size limit");
+            Require(!replacement.create || !replacement.expectedOriginal, "A created file has no expected original");
             journal["targets"].push_back({{"path", replacement.relativePath.generic_string()}, {"oldHash", ""}, {"newHash", ""}});
+
+            if(replacement.create)
+            {
+                journal["targets"].back()["create"] = true;
+            }
         }
 
         const auto targets = Targets(session, journal);
@@ -423,6 +513,17 @@ bool AssetReconciliationTransaction::Commit(
 
         for(size_t index = 0; index < targets.size(); ++index)
         {
+            if(replacements[index].create)
+            {
+                Require(!Exists(targets[index]), "Destination already exists: " + targets[index].string());
+                originals.push_back(nullptr);
+                bytes.emplace_back();
+                journal["targets"][index]["newHash"] = Digest(replacements[index].bytes);
+                total += replacements[index].bytes.size();
+                Require(total <= maxTransactionBytes, "Transaction exceeds aggregate size limit");
+                continue;
+            }
+
             originals.push_back(Open(targets[index], GENERIC_READ | DELETE, OPEN_EXISTING));
             bytes.push_back(Read(originals.back()->value));
             Require(!replacements[index].expectedOriginal || bytes.back() == *replacements[index].expectedOriginal,
@@ -439,34 +540,56 @@ bool AssetReconciliationTransaction::Commit(
 
         for(size_t index = 0; index < targets.size(); ++index)
         {
-            Write(File(session, index, ".old"), bytes[index]);
+            if(!replacements[index].create)
+            {
+                Write(File(session, index, ".old"), bytes[index]);
+            }
+
             Write(File(session, index, ".new"), replacements[index].bytes);
             Write(File(session, index, ".apply"), replacements[index].bytes);
         }
 
+        TRANSACTION_FAULT(BeforeJournal, 0);
         Write(session.directory / "journal.tmp", journal.dump(2));
         Require(MoveFileExW((session.directory / "journal.tmp").c_str(), (session.directory / "journal.json").c_str(),
             MOVEFILE_WRITE_THROUGH) != FALSE, "Cannot publish transaction journal");
+        TRANSACTION_FAULT(AfterJournal, 0);
 
         std::vector<std::unique_ptr<Handle>> installed;
 
         for(size_t index = 0; index < targets.size(); ++index)
         {
-            Rename(originals[index]->value, File(session, index, ".removed"));
+            if(originals[index])
+            {
+                Rename(originals[index]->value, File(session, index, ".removed"));
+            }
+
+            TRANSACTION_FAULT(DuringRetirement, index);
             auto apply = Open(File(session, index, ".apply"), GENERIC_READ | DELETE, OPEN_EXISTING);
             Require(Read(apply->value) == replacements[index].bytes, "Staged replacement changed");
             Rename(apply->value, targets[index]);
             installed.push_back(std::move(apply));
             originals[index].reset();
+            TRANSACTION_FAULT(DuringInstallation, index);
         }
 
+        TRANSACTION_FAULT(BeforeCommitMarker, 0);
         // Commit point: all replacements installed and the completion marker durably written.
         Complete(session, "committed");
         committed = true;
+        TRANSACTION_FAULT(AfterCommitMarker, 0);
         installed.clear();
         Clean(session);
         return true;
     }
+#if defined(_DEBUG)
+    catch(const SimulatedCrash& crash)
+    {
+        // A crash runs no rollback: the next Recover sees exactly this state.
+        error = crash.what();
+        return false;
+    }
+#endif
     catch(const std::exception& exception)
     {
         error = exception.what();
@@ -481,6 +604,14 @@ bool AssetReconciliationTransaction::Commit(
         return committed;
     }
 }
+
+#if defined(_DEBUG)
+void AssetReconciliationTransaction::InjectFaultForTesting(FaultStage stage, std::size_t index)
+{
+    g_faultStage = stage;
+    g_faultIndex = index;
+}
+#endif
 
 bool AssetReconciliationTransaction::ReadExisting(
     const ProjectPaths& paths,

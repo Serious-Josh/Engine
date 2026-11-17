@@ -1,4 +1,5 @@
 #include "AssetBrowser.h"
+#include "SceneMembershipPanel.h"
 #include "EditorIcons.h"
 #include "Renderer/Renderer.h"
 #include "EditorWorkspace.h"
@@ -1248,10 +1249,12 @@ void AssetBrowser::DrawContents(const ProjectContext* project, const FileBackedD
 
             if (hovered)
             {
-                ImGui::SetTooltip("%s%s%s", entry.name.c_str(),
+                // W2: a scene's World/Local status.
+                const std::string sceneStatus = isScene && m_sceneMembership ? "\n" + m_sceneMembership->Describe(entry.path) : "";
+                ImGui::SetTooltip("%s%s%s%s", entry.name.c_str(),
                     entry.directory && !entry.navigable ? " (directory link; browsing disabled)" : "",
                     preview && !preview->error.empty() ? ("\n" + preview->error).c_str() :
-                    !materialError.empty() ? ("\n" + materialError).c_str() : "");
+                    !materialError.empty() ? ("\n" + materialError).c_str() : "", sceneStatus.c_str());
             }
 
             // Only decides whether the menu is offered; Rename/Delete re-check the filesystem when chosen.
@@ -1270,6 +1273,12 @@ void AssetBrowser::DrawContents(const ProjectContext* project, const FileBackedD
                 if(isScene && ImGui::MenuItem("Open Scene", nullptr, false, !m_sceneOpenRequest))
                 {
                     RequestSceneOpen(entry.path, *project);
+                }
+
+                // W2: World creation, assignment, membership and Local duplication (performed by the Editor).
+                if(isScene && m_sceneMembership)
+                {
+                    m_sceneMembership->DrawSceneContextItems(entry.path, canRequest);
                 }
 
                 // Scene file operations need lifecycle/workspace coordination in a later milestone.
@@ -1369,6 +1378,12 @@ void AssetBrowser::DrawContents(const ProjectContext* project, const FileBackedD
 
         if (CanBrowse(m_directory, error) && ImGui::BeginMenu("Create"))
         {
+            // W2: a World with its first Local Level, in this folder.
+            if (m_sceneMembership)
+            {
+                m_sceneMembership->DrawCreateWorldMenuItem(m_directory, true);
+            }
+
             if (ImGui::MenuItem("Folder"))
             {
                 m_folderDirectory = m_directory;

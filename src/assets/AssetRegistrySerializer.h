@@ -11,6 +11,8 @@ class AssetRegistrySerializer
 {
     public:
         static nlohmann::json Serialize(const ProjectAssetRegistry& registry);
+        // The exact file bytes SaveToFile writes (W1.3: staged into a reconciliation transaction by scene migration).
+        static std::string ToBytes(const ProjectAssetRegistry& registry);
 
         static bool Deserialize(
             const nlohmann::json& document,

@@ -26,7 +26,7 @@ void Editor::HandleSceneObjectDuplication(IDemoScene& scene)
     {
         return;
     }
-    const auto selected=owner->GetObjectMetadata(m_selectedObject);
+    const auto selected=SelectedObjectMetadata(*owner);
     if(!selected)
     {
         return;

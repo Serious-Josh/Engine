@@ -46,8 +46,11 @@
 #include <memory>
 #include <utility>
 
+#include "Editor/SceneMembershipPanel.h"
+
 class IDemoScene;
 class FileBackedDemoScene;
+struct CompositeWorld;
 class Scene;
 class SphereGridScene;
 class StressTestScene;
@@ -94,6 +97,17 @@ public:
         const std::filesystem::path& activeScenePath);
     void ProcessAssetDeletion(const ProjectPaths& paths, ProjectAssetRegistry& registry);
     void ProcessAssetMove(const ProjectPaths& paths, ProjectAssetRegistry& registry);
+    // W2: performs the Scene Membership panel's request (World creation, assignment, placement, duplication) through
+    // ProjectSceneMembership. Refused while edits or scene operations are pending, and for the open scene (see the .cpp).
+    // W3: the HDRIs the World environment editor offers (the Renderer's list; built-in files under `builtinRoot`).
+    void SyncWorldEnvironmentChoices(const std::vector<EnvironmentAsset>& environments, const std::filesystem::path& builtinRoot)
+    {
+        m_sceneMembership.SyncEnvironmentChoices(environments, builtinRoot);
+    }
+
+    void ProcessSceneMembership(const ProjectPaths& paths, ProjectAssetRegistry& registry, const FileBackedDemoScene* activeScene);
+    // W3: a membership or World environment change succeeded since the last call (the open Local Level's World may have changed).
+    bool TakeEnvironmentWorldChanged() noexcept { return std::exchange(m_environmentWorldChanged, false); }
     bool RequestApplicationClose();
     bool TakeApplicationCloseApproval();
 
@@ -216,8 +230,22 @@ public:
     // Authored edits are locked while Physics Simulation or Game Play owns the scene.
     bool IsSceneEditingLocked() const noexcept
     {
+        return IsSceneSimulationLocked();
+    }
+    // Physics Simulation or Game Play owns the scene: leaving it (opening another scene or project) is refused as well.
+    bool IsSceneSimulationLocked() const noexcept
+    {
         return m_physicsState != PhysicsState::Stopped || m_gameState != GameState::Editing;
     }
+    // W5: the active scene is a composite World. It is editable; the flag gates World-only restrictions (bakes, Play, Save As) and
+    // the per-document Save controls.
+    void SetCompositePreview(bool composite) noexcept { m_compositePreview = composite; }
+    // A Save request from the World panel: empty = Save All, otherwise one document (0 = World, i + 1 = Local Level i).
+    std::optional<std::optional<std::size_t>> TakeCompositeSaveRequest()
+    {
+        return std::exchange(m_compositeSaveRequest, std::nullopt);
+    }
+    bool IsCompositePreview() const noexcept { return m_compositePreview; }
     void OnSceneActivated();
     // Interaction cleanup alone does not change the history session or cursor.
     void ResetSceneInteractions();
@@ -451,6 +479,7 @@ public:
     void InvalidateSceneFiles()
     {
         m_assetBrowser.InvalidateFileListings();
+        m_sceneMembership.Invalidate();
     }
     void ReportLifecycleMessage(std::string message);
     bool RebindSceneHistoryAfterSaveAs(const FileBackedDemoScene& scene, const std::filesystem::path& previousPath);
@@ -693,6 +722,40 @@ public:
     }
 
 private:
+    bool m_compositePreview = false;
+    std::filesystem::path m_compositeRebuildPath;
+    bool SelectionIncludesLevelRoot(const IDemoScene& scene) const;
+    // The selected object's inspection (metadata and document), read once per frame and shared by every Inspector panel.
+    // Reading it validates and captures the whole scene; each component panel used to repeat that every frame. The cached read
+    // is discarded when the frame, the selection, the runtime or session, the scene structure or the history changes, so any
+    // committed edit is seen by the next panel; edits themselves re-check expected values in the runtime.
+    struct InspectionCache
+    {
+        int frame = -1;
+        size_t selection = InvalidObjectSelection;
+        const void* runtime = nullptr;
+        std::uint64_t runtimeIdentity = 0;
+        std::uint64_t structureRevision = 0;
+        size_t historySize = 0;
+        size_t historyCursor = 0;
+        std::uint64_t historyEpoch = 0;
+        bool succeeded = false;
+        SceneObjectMetadata metadata;
+        SceneObjectDocument object;
+    };
+
+    // A memoisation only (no observable state), so the const read paths can use it.
+    mutable InspectionCache m_inspectionCache;
+    bool InspectSelection(const FileBackedDemoScene& owner, SceneObjectMetadata& metadata, SceneObjectDocument& object) const;
+    std::optional<SceneObjectMetadata> SelectedObjectMetadata(const FileBackedDemoScene& owner) const;
+    std::optional<std::optional<std::size_t>> m_compositeSaveRequest;
+    std::string m_compositeSaveStatus;
+    void DrawCompositeWorldInspection(FileBackedDemoScene& owner);
+    void DrawCompositeDocuments(FileBackedDemoScene& owner, const CompositeWorld& composite);
+    std::vector<bool> m_compositeDirty;
+    int m_compositeDirtyCountdown = 0;
+    static bool ImportBuiltinEnvironment(const ProjectPaths& paths, ProjectAssetRegistry& registry, const std::filesystem::path& source,
+        std::string& reference, std::string& error);
 #if defined(ENGINE_HAS_VERIFICATION)
     friend class PresentationTransformVerification;
 #endif
@@ -718,6 +781,10 @@ private:
     friend class SceneLifecycleVerification;
     friend class AssetBrowserSceneVerification;
     friend class StartupSceneVerification;
+    friend class SceneMembershipEditorVerification;
+    friend class CompositeWorldEditorVerification;
+    friend class DemoWorldEditorVerification;
+    friend class CompositePlacementStress;
     friend class CausticVisibleVerification;
     friend class GamePlayGPUVerification;
     friend class MemoryRegistryVerification;
@@ -924,6 +991,8 @@ private:
     EditorPhaseTiming::Frame* PhaseTiming() const noexcept { return m_phaseTimingEnabled ? &m_phaseTiming : nullptr; }
 
     AssetBrowser m_assetBrowser;
+    SceneMembershipPanel m_sceneMembership;
+    bool m_environmentWorldChanged = false;
 
     EditorWorkspace m_workspace;
     BackgroundTasksUI m_backgroundTasksUI;
@@ -1220,6 +1289,22 @@ private:
     std::string m_mistRenderingStatus;
     // AIR.4F F4.5.1b: one edit of the scene's air environment (the Air window's Environment controls). Fields commit when their input
     // is finished, so there is no draft.
+    // W3: one Local Level environment override switch (FileBackedDemoScene::EnvironmentGroup as an integer).
+    struct EnvironmentOverrideEdit
+    {
+        SceneHistorySession session;
+        int group = 0;
+        bool before = false;
+        bool after = false;
+    };
+    bool CommitEnvironmentOverride(IDemoScene& scene, int group, bool enabled, std::string* error = nullptr);
+    bool ReplayEnvironmentOverride(IDemoScene& scene, const EnvironmentOverrideEdit& edit, bool redo, std::string& error);
+    // W3: the open scene's World/Local status and its six environment override switches.
+    void DrawEnvironmentOverrideControls(IDemoScene& scene);
+    // W3: the open Local Level inherits this group (FileBackedDemoScene::EnvironmentGroup): its editing controls are not offered.
+    static bool IsEnvironmentGroupInherited(IDemoScene& scene, int group);
+    std::string m_environmentOverrideStatus;
+
     struct AirEnvironmentEdit
     {
         SceneHistorySession session;
@@ -1781,7 +1866,7 @@ private:
         std::unique_ptr<ScriptEdit>, std::unique_ptr<AudioComponentsEdit>, std::unique_ptr<AcousticSettingsEdit>, std::unique_ptr<ProbeVolumeEdit>,
         std::unique_ptr<VoxelSettingsEdit>, std::unique_ptr<VoxelBakeEdit>, std::unique_ptr<AirMotorEdit>, std::unique_ptr<MistEmitterEdit>,
         std::unique_ptr<MistRenderingEdit>, std::unique_ptr<AirEnvironmentEdit>, std::unique_ptr<EnvironmentalHazeEdit>,
-        std::unique_ptr<AirSimulationEdit>>;
+        std::unique_ptr<AirSimulationEdit>, std::unique_ptr<EnvironmentOverrideEdit>>;
     struct SceneHistoryEntry
     {
         SceneHistoryCommand command;

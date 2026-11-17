@@ -6,6 +6,11 @@ bool FileSceneRuntime::SetObjectCharacterController(const SceneObjectMetadata& s
     const std::optional<Physics::CharacterControllerComponent>& expected,
     const std::optional<Physics::CharacterControllerComponent>& replacement, std::string* errorMessage)
 {
+    if(!m_readOnlyReason.empty())
+    {
+        return ReadOnlyError(errorMessage);
+    }
+
     const auto fail = [&](const char* message)
     {
         if(errorMessage)
