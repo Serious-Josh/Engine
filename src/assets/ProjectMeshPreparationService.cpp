@@ -1,4 +1,5 @@
 #include "assets/ProjectMeshPreparationService.h"
+#include "Debug/StreamingTelemetry.h"
 #include "Renderer/Preview/MaterialThumbnailValidation.h"
 
 #include <algorithm>
@@ -201,6 +202,7 @@ struct ProjectMeshPreparationService::State
         std::shared_ptr<const CookedMeshSource::Provider> provider;
         std::shared_ptr<Reservation> reservation;
         std::string error;
+        StreamingTelemetry::Clock::time_point queuedAt{}; // S0.0 diagnostics; stamped per stage enqueue.
     };
 
     struct Subscriber
@@ -321,6 +323,7 @@ struct ProjectMeshPreparationService::State
 
             if (created)
             {
+                job->queuedAt = StreamingTelemetry::QueueStamp();
                 queue.push_back(job);
             }
         }
@@ -459,8 +462,12 @@ struct ProjectMeshPreparationService::State
                 continue;
             }
 
+            StreamingTelemetry::RecordJobStart(job->queuedAt, StreamingTelemetry::Metric::MeshJobQueueNs,
+                StreamingTelemetry::Gauge::MeshQueueDepth, queue.size() + 1);
             const auto stage = job->stage;
             lock.unlock();
+            const StreamingTelemetry::Scope workTiming(StreamingTelemetry::Metric::MeshJobWorkNs,
+                StreamingTelemetry::Metric::MeshJobs);
             std::string digest;
             std::string error;
             Status status = Status::Available;
@@ -1049,6 +1056,7 @@ ProjectMeshPreparationService::Completion ProjectMeshPreparationService::Poll(st
 
             // Even cache hits get a fresh worker-side digest check. Never hash
             // on the main thread and never hold the source pin across frames.
+            job->queuedAt = StreamingTelemetry::QueueStamp();
             state.queue.push_back(job);
 
             if (geometry)

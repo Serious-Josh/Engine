@@ -131,7 +131,8 @@ bool Texture::Initialize(
     unsigned int mipLevels,
     DXGI_FORMAT format,
     D3D12_RESOURCE_FLAGS flags,
-    D3D12_RESOURCE_STATES initialState)
+    D3D12_RESOURCE_STATES initialState,
+    bool trackMemory)
 {
     if(m_retained)
     {
@@ -178,12 +179,20 @@ bool Texture::Initialize(
 
     if (FAILED(result))
     {
-        Log::Error("Failed to allocate texture resource. HRESULT: " + std::to_string(result));
+        m_resource = nullptr;
+
+        if (trackMemory)
+        {
+            Log::Error("Failed to allocate texture resource. HRESULT: " + std::to_string(result));
+        }
 
         return false;
     }
 
-    MemoryRegistry::TrackResource(m_resource);
+    if (trackMemory)
+    {
+        MemoryRegistry::TrackResource(m_resource);
+    }
 
     const unsigned int subresourceCount = arraySize * mipLevels;
 
@@ -196,6 +205,11 @@ bool Texture::Initialize(
     m_initialData.clear();
 
     return true;
+}
+
+void Texture::TrackMemory() const
+{
+    MemoryRegistry::TrackResource(m_resource);
 }
 
 unsigned int Texture::CalculateMipLevels(

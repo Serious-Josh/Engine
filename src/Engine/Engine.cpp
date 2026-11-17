@@ -1,4 +1,11 @@
 #include "Scene/SceneSwitchTiming.h"
+#include "Debug/StreamingTelemetry.h"
+#if defined(ENGINE_HAS_S0_RELEASE_DRIVER)
+#include <dxgi1_4.h>
+#include <malloc.h>
+#include <psapi.h>
+#include <wrl/client.h>
+#endif
 #include "Engine/Engine.h"
 #include "Debug/MemoryMonitor.h"
 #include "Debug/TransitionTiming.h"
@@ -58,6 +65,21 @@
 
 namespace
 {
+    // S0.0 diagnostics: ends the streaming telemetry frame when Engine::Frame returns.
+    struct StreamingFrameScope
+    {
+        StreamingTelemetry::Clock::time_point start = StreamingTelemetry::Clock::now();
+
+        StreamingFrameScope() = default;
+        StreamingFrameScope(const StreamingFrameScope&) = delete;
+        StreamingFrameScope& operator=(const StreamingFrameScope&) = delete;
+
+        ~StreamingFrameScope()
+        {
+            StreamingTelemetry::EndFrame(start);
+        }
+    };
+
     std::string ProjectPathText(const std::filesystem::path& path)
     {
         const auto text = path.u8string();
@@ -722,6 +744,8 @@ bool Engine::ActivateRequestedFileScene()
     CancelViewportMaterialAssignment("Scene activation canceled the material assignment.");
     const auto started = std::chrono::steady_clock::now();
     SceneSwitchTiming::Session timing(m_meshCPUCache);
+    const StreamingTelemetry::Scope streamingSwitchTiming(StreamingTelemetry::Metric::SceneSwitchNs,
+        StreamingTelemetry::Metric::SceneSwitches);
     IDemoScene* previous = m_demoSceneManager.TryGetActiveScene();
 
     if (!previous)
@@ -755,6 +779,8 @@ bool Engine::ActivateRequestedFileScene()
     }
 
     SceneSwitchTiming::Measure drainTiming(SceneSwitchTiming::Stage::DrainRelease);
+    std::optional<StreamingTelemetry::Scope> streamingDrainTiming;
+    streamingDrainTiming.emplace(StreamingTelemetry::Metric::SceneDrainReleaseNs);
 
     if (!DrainAndResolveEditorScene(*previous))
     {
@@ -771,6 +797,7 @@ bool Engine::ActivateRequestedFileScene()
     m_sceneResourcesReleasedForSwitch = true;
 
     drainTiming.Stop();
+    streamingDrainTiming.reset();
     const bool initialized = SceneSwitchTiming::MeasureCall(SceneSwitchTiming::Stage::Renderer, [&]()
     {
         return m_renderer.InitializeSceneResources(candidate->GetScene(), candidate->GetMaterials());
@@ -791,8 +818,16 @@ bool Engine::ActivateRequestedFileScene()
 
         m_sceneResourcesReleasedForSwitch = false;
 
-        OnFileSceneActivated(started);
-        m_editor.OnSceneActivated();
+        {
+            const StreamingTelemetry::Scope activatedTiming(StreamingTelemetry::Metric::SceneActivatedCallbackNs);
+            OnFileSceneActivated(started);
+        }
+
+        {
+            const StreamingTelemetry::Scope editorTiming(StreamingTelemetry::Metric::SceneEditorActivatedNs);
+            m_editor.OnSceneActivated();
+        }
+
         RecordLastEditedScene();
         m_renderedSceneStructureRevision = m_demoSceneManager.GetActiveScene().GetScene().GetStructureRevision();
         timing.outcome = "published";
@@ -1013,6 +1048,7 @@ bool Engine::Initialize(const EngineStartup& startup)
 {
     // M0c.5 diagnostics (ENGINE_STARTUP_TIMING): the startup timeline; this thread is the main thread.
     TransitionTiming::StartupMilestone("Engine::Initialize begins (main thread)");
+    StreamingTelemetry::SetMainThread();
     const TransitionTiming::Scope initializeTiming("Engine::Initialize", 0.0, TransitionTiming::Startup);
 
     if(!InitializeProjectIndependent(startup))
@@ -3136,6 +3172,9 @@ void Engine::Frame()
 {
     // ER.1/M0c.4 diagnostics (ENGINE_ER1_TIMING only): the whole frame's CPU time, for hitches around configuration switches.
     const TransitionTiming::Scope frameTiming("EngineFrame", 0.0);
+    // S0.0 diagnostics (ENGINE_STREAMING_TELEMETRY only): records this frame's unsmoothed time and metric changes on every
+    // return path.
+    const StreamingFrameScope streamingFrame;
 
     // Exactly one audio update when this frame ends, on every return path, after gameplay and presentation and
     // independent of whether the renderer submitted anything. It never waits on GPU work.
@@ -3149,6 +3188,7 @@ void Engine::Frame()
     }
 
     // Snapshot input before message dispatch so this frame retains input edges.
+    m_frameStarted = std::chrono::steady_clock::now();
     m_time.Update();
 
     m_input.Update();
@@ -3159,6 +3199,11 @@ void Engine::Frame()
     {
         return;
     }
+
+#if defined(ENGINE_HAS_S0_RELEASE_DRIVER)
+    // S0.1 local-only Release driver (Git-ignored; compiled only into diagnostics builds that contain the file).
+#include "Engine/tests/S0ReleaseDriver.inl"
+#endif
 
     if (m_window.GetWidth() == 0 || m_window.GetHeight() == 0)
     {
@@ -3246,6 +3291,8 @@ void Engine::Frame()
         // they render with their legacy sun exactly as before.
         options.lighting = CaptureSceneLightingForFrame(*owner->m_runtime);
         options.frameDeltaSeconds = m_time.GetDeltaTime();
+        // S0.5: as in the Editor frame, observe the scene environment request (failure handling).
+        PollSceneEnvironment();
         options.exposureReset = std::exchange(m_exposureResetPending, false);
 
         const auto renderStarted = std::chrono::steady_clock::now();
@@ -3341,7 +3388,46 @@ void Engine::Frame()
         return;
     }
 
-    if (m_demoSceneManager.HasPendingSceneChange())
+    // S0.7B: a requested file scene is staged in steps (open, catalog, preparation, commit) while the current scene keeps
+    // rendering. Steps continue within a frame while that frame's staging stays under a small budget, so a small scene
+    // still stages and switches in one frame and a large one spreads its steps over frames; the switch below runs in the
+    // frame that completes staging. The pending request blocks edits and the current scene's streaming meanwhile, as any
+    // pending scene change does.
+    bool fileSceneStaging = false;
+
+    if (m_demoSceneManager.HasPendingFileSceneRequest() && !m_demoSceneManager.GetStagedFileScene())
+    {
+        constexpr double stagingBudgetMilliseconds = 4.0;
+        const auto stagingStarted = std::chrono::steady_clock::now();
+        bool staged = false;
+
+        do
+        {
+            const StreamingTelemetry::Scope stagingTiming(StreamingTelemetry::Metric::SceneStagingNs,
+                StreamingTelemetry::Metric::SceneStagingSteps);
+            std::string error;
+
+            if (!m_demoSceneManager.AdvanceRequestedFileSceneStaging(m_renderer.GetDevice(), m_renderer.GetResourceUploader(),
+                    m_renderer.GetResourceDescriptorHeap(), m_demoVertexShader, m_demoPixelShader, staged, &error))
+            {
+                // As when staging inside activation failed: the current scene is preserved.
+                Log::Error("File scene staging failed; keeping the current scene: " + error);
+                m_editor.ReportLifecycleMessage("Cannot open scene; current scene preserved. " + error);
+                m_demoSceneManager.CancelFileSceneRequest();
+                break;
+            }
+        }
+        while (!staged && std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - stagingStarted).count() <
+            stagingBudgetMilliseconds);
+
+        // A frame whose staging already exceeded the budget switches in the next frame, so the last step and the switch
+        // never share one frame.
+        const bool overBudget = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - stagingStarted).count() >=
+            stagingBudgetMilliseconds;
+        fileSceneStaging = m_demoSceneManager.HasPendingFileSceneRequest() && (!staged || overBudget);
+    }
+
+    if (m_demoSceneManager.HasPendingSceneChange() && !fileSceneStaging)
     {
         CancelEditorMembership("Scene replacement canceled the pending membership edit.");
         const auto switchStarted = std::chrono::steady_clock::now();
@@ -3464,7 +3550,7 @@ void Engine::Frame()
     ProcessWorkingMaterialNotifications();
     ProcessSavedMaterialRevisions();
     PublishWorkingMaterialParameters();
-    ProcessSceneTextureStreaming();
+    ProcessSceneTextureStreaming(false);
 
     m_editor.SetThumbnailCompletedFence(m_renderer.GetEditorCompletedFence());
 
@@ -3993,6 +4079,8 @@ void Engine::Frame()
         m_renderer.PresentConfiguration(debugUI.GetRenderingConfiguration());
     ApplyRenderingConfiguration(frameRenderingConfiguration, m_renderer, rendererOptions);
     rendererOptions.frameDeltaSeconds = m_time.GetDeltaTime();
+    // S0.5: observe the scene environment request (failure handling; the exposure snap is applied by the publication).
+    PollSceneEnvironment();
     rendererOptions.exposureReset = std::exchange(m_exposureResetPending, false);
 
     if (debugUI.ConsumeCausticFaultAcknowledgeRequest() && !m_renderer.AcknowledgeDedicatedCausticsFault())
@@ -4023,6 +4111,7 @@ void Engine::Frame()
     }
 
     ProcessMeshResidencyDiagnostics();
+    ProcessSceneTextureStreaming(true);
 
     // Coordinated publication boundary: all editor/assets, scene update/rebuild
     // and thumbnail/preview preparation above are complete. Final validation
@@ -4485,8 +4574,9 @@ void Engine::Shutdown()
     Log::Info("Engine shutdown: finished.");
 }
 
-void Engine::ProcessSceneTextureStreaming()
+void Engine::ProcessSceneTextureStreaming(bool expensivePass)
 {
+    const StreamingTelemetry::Scope streamingTiming(StreamingTelemetry::Metric::TextureStreamingNs);
     auto* scene = dynamic_cast<FileBackedDemoScene*>(m_demoSceneManager.TryGetActiveScene());
 
     if(!scene || m_demoSceneManager.HasPendingSceneChange())
@@ -4516,7 +4606,26 @@ void Engine::ProcessSceneTextureStreaming()
         return true;
     };
 
-    scene->AdvanceTextureStreaming(m_texturePreparation, m_renderer, mayPublish);
+    if(!expensivePass)
+    {
+        scene->AdvanceTextureStreaming(FileSceneAssetCatalog::TextureStreamingPass::Cheap, 0.0, false, m_texturePreparation,
+            m_renderer, mayPublish);
+        return;
+    }
+
+    // S0.8A: upload queueing and publication yield to a frame that already spent its streaming time (a mesh batch
+    // publication, staging), so texture and mesh work do not stack in one frame; a texture is still advanced at least
+    // every few frames.
+    constexpr double frameStreamingBudget = 9.0;
+    constexpr double expensiveBudget = 2.0;
+    constexpr int maximumSkippedFrames = 3;
+    const double elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - m_frameStarted).count();
+    const double budget = elapsed < frameStreamingBudget ? (std::min)(expensiveBudget, frameStreamingBudget - elapsed) : 0.0;
+    const bool force = m_textureExpensiveSkippedFrames >= maximumSkippedFrames;
+    scene->AdvanceTextureStreaming(FileSceneAssetCatalog::TextureStreamingPass::Expensive, budget, force, m_texturePreparation,
+        m_renderer, mayPublish);
+    m_textureExpensiveSkippedFrames = scene->m_assets.TextureStreamingExpensiveAdvanced() || budget > 0.0 ? 0 :
+        m_textureExpensiveSkippedFrames + 1;
 }
 
 void Engine::ProcessSavedMaterialRevisions()
@@ -6358,6 +6467,11 @@ void Engine::LoadSceneCausticRegistration(FileBackedDemoScene& scene)
 
 void Engine::OnFileSceneActivated(std::chrono::steady_clock::time_point started)
 {
+    // S0.5: every activation (file-backed or not) supersedes an environment request of the scene it replaces, so a late
+    // preparation can never publish into the new scene.
+    m_renderer.CancelEnvironmentPreparation();
+    m_sceneEnvironmentTicket = 0;
+    m_sceneEnvironmentActivation = false;
     auto* scene = dynamic_cast<FileBackedDemoScene*>(m_demoSceneManager.TryGetActiveScene());
 
     if (!scene)
@@ -6366,8 +6480,11 @@ void Engine::OnFileSceneActivated(std::chrono::steady_clock::time_point started)
     }
 
     std::string environmentError;
-    if(!ApplySceneEnvironment(environmentError)) { Log::Error("Scene environment restore failed: "+environmentError); m_window.Close(); return; }
-    // A new scene's HDR is unrelated to the adapted exposure: snap automatic exposure on its first frame.
+    std::optional<StreamingTelemetry::Scope> environmentTiming(std::in_place, StreamingTelemetry::Metric::SceneEnvironmentNs);
+    if(!ApplySceneEnvironment(environmentError, true)) { Log::Error("Scene environment restore failed: "+environmentError); m_window.Close(); return; }
+    environmentTiming.reset();
+    // A new scene's HDR is unrelated to the adapted exposure: snap automatic exposure on its first frame (and again when
+    // its environment is published, PollSceneEnvironment).
     m_exposureResetPending = true;
     if (m_automaticResidencyIntent)
     {
@@ -6377,6 +6494,7 @@ void Engine::OnFileSceneActivated(std::chrono::steady_clock::time_point started)
 
     m_automaticMeshResidency = {};
     m_automaticResidencyIntent = 0;
+    CancelMeshImportPrefetch();
     LoadSceneCausticRegistration(*scene);
     if(scene->IsArchiveActivation())
     {
@@ -6756,6 +6874,8 @@ std::optional<MeshResidencyCandidate> Engine::DescribeSynchronousMeshCandidate(F
 {
     // Built-in or catalog-retained geometry only; never imports or uploads.
     // Describe validates catalog ownership and, for FBX, the source digest under a pin.
+    const StreamingTelemetry::Scope describeTiming(StreamingTelemetry::Metric::ResidencyDescribeNs,
+        StreamingTelemetry::Metric::ResidencyDescribeCalls);
     const auto kind = FileSceneAssetCatalog::ClassifyMeshReference(selection.meshReference);
     Mesh* mesh = nullptr;
 
@@ -6777,9 +6897,198 @@ std::optional<MeshResidencyCandidate> Engine::DescribeSynchronousMeshCandidate(F
     return scene.m_assets.DescribeMeshResidencyCandidate(selection.meshReference, *mesh, &error);
 }
 
+void Engine::CancelMeshImportPrefetch() noexcept
+{
+    for (const auto& prefetch : m_meshImportPrefetch)
+    {
+        m_meshPreparation.Cancel(prefetch.ticket);
+    }
+
+    m_meshImportPrefetch.clear();
+    m_meshImportPrefetchFailed.clear();
+    m_meshImportPrefetchRuntime = 0;
+    m_meshImportPrefetchGeneration = 0;
+}
+
+void Engine::PollMeshImportPrefetch(FileBackedDemoScene& scene)
+{
+    // A prefetch belongs to one runtime session and preparation generation.
+    if (m_meshImportPrefetchRuntime != scene.GetRuntimeIdentity() ||
+        m_meshImportPrefetchGeneration != m_meshPreparation.Generation())
+    {
+        CancelMeshImportPrefetch();
+        m_meshImportPrefetchRuntime = scene.GetRuntimeIdentity();
+        m_meshImportPrefetchGeneration = m_meshPreparation.Generation();
+        return;
+    }
+
+    // Every frame, even while a residency transaction is outstanding: Poll advances the service's own stages (worker hash ->
+    // owner-thread CPU cache lookup -> worker import) and collects finished results, so the worker never idles on an
+    // uncollected stage. It touches neither the catalog nor the scene.
+    const StreamingTelemetry::Scope pollTiming(StreamingTelemetry::Metric::MeshPrefetchPollNs);
+    const ProjectPaths paths(scene.GetProjectRoot());
+
+    for (auto& prefetch : m_meshImportPrefetch)
+    {
+        if (prefetch.completion)
+        {
+            continue;
+        }
+
+        auto completion = m_meshPreparation.Poll(prefetch.ticket, paths, m_projectAssetRegistry, m_meshCPUCache);
+
+        if (completion.status != ProjectMeshPreparationService::Status::Pending &&
+            completion.status != ProjectMeshPreparationService::Status::Retry)
+        {
+            prefetch.completion.emplace(std::move(completion));
+        }
+    }
+}
+
+void Engine::IntegrateMeshImportPrefetch(FileBackedDemoScene& scene)
+{
+    // Bounded main-thread work per frame: each integration validates the source and uploads the geometry. At least one
+    // completion is integrated per idle boundary, so progress never stalls on the budget.
+    constexpr double IntegrationBudgetMilliseconds = 3.0;
+    const auto started = std::chrono::steady_clock::now();
+    bool integrated = false;
+
+    for (auto prefetch = m_meshImportPrefetch.begin(); prefetch != m_meshImportPrefetch.end();)
+    {
+        const double elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+
+        if (integrated && elapsed >= IntegrationBudgetMilliseconds)
+        {
+            break;
+        }
+
+        if (!prefetch->completion)
+        {
+            ++prefetch;
+            continue;
+        }
+
+        integrated = true;
+
+        // The same checks and steps as the single-request path (AdvanceDiagnosticMeshPreparation).
+        auto& completion = *prefetch->completion;
+        const auto asset = AssetID::ParseReference(prefetch->meshReference);
+        std::string error;
+        Mesh* mesh = nullptr;
+        const bool usable = completion.status == ProjectMeshPreparationService::Status::Available &&
+            m_meshPreparation.IsCurrent(completion) && asset && completion.identity.assetID == asset->ToString();
+
+        StreamingTelemetry::Add(StreamingTelemetry::Metric::MeshPrefetchIntegrations, 1);
+        std::optional<StreamingTelemetry::Scope> stepTiming(std::in_place, StreamingTelemetry::Metric::MeshPrefetchCacheNs);
+        const bool cached = usable && m_meshPreparation.IntegrateCache(completion, m_meshCPUCache, error);
+        stepTiming.emplace(StreamingTelemetry::Metric::MeshPrefetchResolveNs);
+
+        if (cached)
+        {
+            // S0.8B: prefetched geometry uploads without a main-thread GPU wait; the batch scan waits for its publication.
+            mesh = scene.m_assets.ResolvePreparedMesh(prefetch->meshReference, completion, &error, &m_renderer);
+        }
+
+        stepTiming.reset();
+
+        if (!mesh)
+        {
+            // Its objects fall back to the single-request path, which reports and records the failure as before.
+            Log::Info("Mesh import prefetch not used for " + prefetch->meshReference + ": " +
+                (error.empty() ? completion.error : error));
+            m_meshImportPrefetchFailed.push_back(prefetch->meshReference);
+        }
+
+        m_meshPreparation.Cancel(prefetch->ticket);
+        prefetch = m_meshImportPrefetch.erase(prefetch);
+    }
+}
+
+bool Engine::PrefetchMeshImports(FileBackedDemoScene& scene, const SceneObjectMetadata& selection)
+{
+    const auto prefetchable = [&](const std::string& reference)
+    {
+        return FileSceneAssetCatalog::ClassifyMeshReference(reference) == FileSceneAssetCatalog::MeshReferenceKind::RegisteredAsset &&
+            !scene.m_assets.FindRetainedMesh(reference) &&
+            std::find(m_meshImportPrefetchFailed.begin(), m_meshImportPrefetchFailed.end(), reference) ==
+                m_meshImportPrefetchFailed.end();
+    };
+    const auto requested = [&](const std::string& reference)
+    {
+        return std::any_of(m_meshImportPrefetch.begin(), m_meshImportPrefetch.end(), [&](const auto& prefetch)
+        {
+            return prefetch.meshReference == reference;
+        });
+    };
+    // One new request per frame: Request resolves and pins the source file on this thread (~10 ms per FBX in Release), so
+    // issuing several at once would trade throughput for frame spikes. Imports take longer than a frame, so the queue stays fed.
+    size_t newRequests = 0;
+    const auto request = [&](const std::string& reference)
+    {
+        const auto asset = AssetID::ParseReference(reference);
+
+        if (!asset || m_meshImportPrefetch.size() >= MaxMeshImportPrefetch || newRequests >= MaxMeshImportRequestsPerFrame)
+        {
+            return false;
+        }
+
+        ++newRequests;
+
+        const StreamingTelemetry::Scope requestTiming(StreamingTelemetry::Metric::MeshPrefetchRequestNs);
+        const auto result = m_meshPreparation.Request(ProjectPaths(scene.GetProjectRoot()), m_projectAssetRegistry, *asset,
+            m_meshImportPrefetchGeneration);
+
+        if (result.status != ProjectMeshPreparationService::Status::Accepted &&
+            result.status != ProjectMeshPreparationService::Status::Available)
+        {
+            return false;
+        }
+
+        m_meshImportPrefetch.push_back({reference, result.ticket, std::nullopt});
+        return true;
+    };
+
+    if (!prefetchable(selection.meshReference))
+    {
+        return false;
+    }
+
+    if (!requested(selection.meshReference) && !request(selection.meshReference))
+    {
+        // Out of prefetch capacity: wait for the queued imports rather than requesting this one alone.
+        return !m_meshImportPrefetch.empty();
+    }
+
+    // Keep the worker busy: look ahead for further distinct meshes that need an import.
+    const auto& objects = scene.GetScene().GetRenderObjects();
+    const auto end = (std::min)(objects.size(), m_automaticMeshResidency.cursor + MeshImportPrefetchLookAhead);
+
+    for (size_t index = m_automaticMeshResidency.cursor + 1; index < end && m_meshImportPrefetch.size() < MaxMeshImportPrefetch;
+        ++index)
+    {
+        if (objects[index].mesh)
+        {
+            continue;
+        }
+
+        const auto metadata = scene.GetObjectMetadata(index, nullptr);
+
+        if (metadata && prefetchable(metadata->meshReference) && !requested(metadata->meshReference))
+        {
+            request(metadata->meshReference);
+        }
+    }
+
+    StreamingTelemetry::Raise(StreamingTelemetry::Gauge::MeshQueueDepth, m_meshImportPrefetch.size());
+    return true;
+}
+
 void Engine::SubmitAutomaticResidencyBatch(FileBackedDemoScene& scene,
     const std::vector<FileSceneRuntime::MeshResidencyRequest>& batch)
 {
+    StreamingTelemetry::Add(StreamingTelemetry::Metric::ResidencyBatchesSubmitted, 1);
+    StreamingTelemetry::Add(StreamingTelemetry::Metric::ResidencyBatchEntries, batch.size());
+
     try
     {
         m_residencyRequestBatch.clear();
@@ -6932,6 +7241,7 @@ void Engine::ReportAutomaticResidencyGate(const char* reason)
 
 void Engine::AdvanceAutomaticMeshResidency()
 {
+    const StreamingTelemetry::Scope streamingTiming(StreamingTelemetry::Metric::ResidencyAdvanceNs);
     if(m_pendingEditorMembership) return;
     auto& scheduler = m_automaticMeshResidency;
 
@@ -6947,6 +7257,11 @@ void Engine::AdvanceAutomaticMeshResidency()
         scheduler = {};
         return;
     }
+
+    // S0.8B: publish geometry whose deferred copies were submitted by an earlier frame.
+    scene->m_assets.PollMeshUploads(m_renderer);
+    // S0.4: keep prefetched imports moving every frame (integration itself waits for the idle boundary below).
+    PollMeshImportPrefetch(*scene);
 
     const bool outstanding = m_diagnosticCPUPreparation || m_diagnosticMeshToken ||
         m_meshResidencyPublication.HasCandidate();
@@ -6976,6 +7291,9 @@ void Engine::AdvanceAutomaticMeshResidency()
     {
         return;
     }
+
+    // S0.4: completed import prefetches become catalog-retained here, while no residency transaction is outstanding.
+    IntegrateMeshImportPrefetch(*scene);
 
     const auto& objects = scene->GetScene().GetRenderObjects();
     const auto revision = scene->GetScene().GetStructureRevision();
@@ -7010,6 +7328,13 @@ void Engine::AdvanceAutomaticMeshResidency()
     const size_t scanBudget = (std::max)(std::size_t{32}, 4 * FileSceneRuntime::MaxMeshResidencyBatch);
     std::vector<FileSceneRuntime::MeshResidencyRequest> batch;
     const FileSceneAssetCatalog::ValidationPass validationPass(scene->m_assets);
+    // S0.3: the scan's per-object metadata lookups share one whole-scene validation. The scan reads the runtime only (catalog
+    // lookups touch assets, not the document); the pass ends before any request or batch is submitted.
+    std::optional<FileSceneRuntime::MetadataValidationPass> metadataPass(std::in_place, std::as_const(*scene->m_runtime));
+    // S0.7A: one catalog validation pass for the scan's describes, so each source is resolved and hashed once per scan
+    // instead of once per object. Describe is read-only; the pass ends with the metadata pass, before any request, prefetch
+    // or batch can change the catalog.
+    std::optional<FileSceneAssetCatalog::ValidationPass> catalogPass(std::in_place, scene->m_assets);
 
     for (size_t scanned = 0; scanned < scanBudget && scheduler.cursor < objects.size() && batch.size() < limit; ++scanned)
     {
@@ -7049,6 +7374,12 @@ void Engine::AdvanceAutomaticMeshResidency()
             continue;
         }
 
+        // S0.8B: geometry whose copies are not yet submitted joins a later batch; the scan resumes here next frame.
+        if (scene->m_assets.IsMeshUploadPending(selection->meshReference))
+        {
+            break;
+        }
+
         // An object attributed in a rejected batch is retried alone, so the
         // objects gathered with it are not held back by it again.
         const bool isolated = selection->objectID == scheduler.isolate;
@@ -7067,6 +7398,16 @@ void Engine::AdvanceAutomaticMeshResidency()
                 break;
             }
 
+            // S0.4: an FBX import that can be prefetched is waited for here (with further imports queued behind it); once
+            // retained it publishes in a batch. Anything else keeps the single-request path below.
+            catalogPass.reset();
+
+            if (PrefetchMeshImports(*scene, *selection))
+            {
+                scheduler.settled = false;
+                return;
+            }
+
             ++scheduler.cursor;
             scheduler.isolate.clear();
             std::erase_if(scheduler.failures, [&](const auto& saved)
@@ -7075,6 +7416,9 @@ void Engine::AdvanceAutomaticMeshResidency()
             });
             scheduler.settled = false;
             ++scheduler.requests;
+            StreamingTelemetry::Add(StreamingTelemetry::Metric::ResidencySingleRequests, 1);
+            catalogPass.reset();
+            metadataPass.reset();
             BeginMeshResidencyRequest(*selection, true);
             return;
         }
@@ -7092,6 +7436,9 @@ void Engine::AdvanceAutomaticMeshResidency()
             break;
         }
     }
+
+    catalogPass.reset();
+    metadataPass.reset(); // Before staging mutates the runtime.
 
     if (!batch.empty())
     {

@@ -97,89 +97,136 @@ bool FileBackedDemoScene::InitializeMetadataOnly(ID3D12Device* device, ResourceU
 bool FileBackedDemoScene::InitializeWithPolicy(ID3D12Device* device, ResourceUploader& uploader,
     DescriptorHeap& descriptorHeap, const Shader* vertexShader, const Shader* pixelShader, bool metadataOnly)
 {
-    if (m_initialized)
+    if (m_initialized || m_stagingStep != StagingStep::Idle)
     {
         return false;
     }
 
-    // Initialization is performed while this scene is inactive.
-    // Engine remains responsible for GPU synchronization when
-    // replacing a previously active scene.
-    Shutdown();
+    BeginStagedInitialization(device, uploader, descriptorHeap, vertexShader, pixelShader);
+    m_stagingInputs.metadataOnly = metadataOnly;
+    bool done = false;
 
-    Log::Info(std::string("Preparing file scene activation: mode=") +
-        (metadataOnly ? "metadata-first" : "synchronous-full Debug diagnostic") + ", path=" + ProjectPathText(m_scenePath));
+    while (!done)
+    {
+        if (!AdvanceStagedInitialization(done))
+        {
+            return false;
+        }
+    }
 
+    return true;
+}
+
+void FileBackedDemoScene::BeginStagedInitialization(ID3D12Device* device, ResourceUploader& uploader,
+    DescriptorHeap& descriptorHeap, const Shader* vertexShader, const Shader* pixelShader)
+{
+    m_stagingInputs = {device, &uploader, &descriptorHeap, vertexShader, pixelShader, true};
+    m_stagingStep = m_initialized ? StagingStep::Idle : StagingStep::Open;
+}
+
+bool FileBackedDemoScene::AdvanceStagedInitialization(bool& done)
+{
+    done = false;
+    const bool metadataOnly = m_stagingInputs.metadataOnly;
     std::string error;
 
-    // Validate the document before allocating GPU resources.
-    bool opened = false;
-
-    if (m_archiveScene)
+    // Any failure leaves the candidate for its stager to shut down; the step is reset so it cannot resume.
+    const auto fail = [&]()
     {
-        opened = m_runtime->LoadArchive(m_archiveScene, &error);
-    }
-    else if (m_unsavedDocument)
-    {
-        opened = m_runtime->LoadUnsavedDocument(*m_unsavedDocument, &error);
-    }
-    else
-    {
-        opened = m_runtime->Open(m_scenePath, &error);
-    }
-
-    if (!opened)
-    {
-        Log::Error("Failed to open file-backed scene: " + error);
-        return false;
-    }
-
-    if (!m_assets.Initialize(
-            device,
-            uploader,
-            descriptorHeap,
-            vertexShader,
-            pixelShader))
-    {
-        Log::Error("Failed to initialize file-backed scene assets.");
+        m_stagingStep = StagingStep::Idle;
         Shutdown();
         return false;
-    }
+    };
 
-    if(m_archiveScene)
+    switch (m_stagingStep)
     {
-        m_assets.SetArchiveScene(m_archiveScene);
-    }
-    else if(m_registry)
+    case StagingStep::Open:
     {
-        m_assets.SetProjectAssets(ProjectPaths(m_projectRoot), *m_registry);
-    }
-
-    m_assets.SetTextureStreamingEnabled(m_textureStreamingEnabled || metadataOnly);
-    m_assets.SetMeshCPUCache(m_meshCPUCache);
-
-    const bool prepared = metadataOnly ? m_runtime->PrepareMetadata(m_assets, &error) : m_runtime->Prepare(m_assets, &error);
-
-    if(!prepared)
-    {
-        Log::Error("Failed to prepare file-backed scene: " + error + " " +
-            m_assets.GetLastMeshError() + " " + m_assets.GetLastMaterialError());
+        // Initialization is performed while this scene is inactive. Engine remains responsible for GPU synchronization
+        // when replacing a previously active scene.
         Shutdown();
+
+        Log::Info(std::string("Preparing file scene activation: mode=") +
+            (metadataOnly ? "metadata-first" : "synchronous-full Debug diagnostic") + ", path=" + ProjectPathText(m_scenePath));
+
+        // Validate the document before allocating GPU resources.
+        bool opened = false;
+
+        if (m_archiveScene)
+        {
+            opened = m_runtime->LoadArchive(m_archiveScene, &error);
+        }
+        else if (m_unsavedDocument)
+        {
+            opened = m_runtime->LoadUnsavedDocument(*m_unsavedDocument, &error);
+        }
+        else
+        {
+            opened = m_runtime->Open(m_scenePath, &error);
+        }
+
+        if (!opened)
+        {
+            Log::Error("Failed to open file-backed scene: " + error);
+            m_stagingStep = StagingStep::Idle;
+            return false;
+        }
+
+        m_stagingStep = StagingStep::Assets;
+        return true;
+    }
+
+    case StagingStep::Assets:
+        if (!m_assets.Initialize(m_stagingInputs.device, *m_stagingInputs.uploader, *m_stagingInputs.descriptorHeap,
+                m_stagingInputs.vertexShader, m_stagingInputs.pixelShader))
+        {
+            Log::Error("Failed to initialize file-backed scene assets.");
+            return fail();
+        }
+
+        if (m_archiveScene)
+        {
+            m_assets.SetArchiveScene(m_archiveScene);
+        }
+        else if (m_registry)
+        {
+            m_assets.SetProjectAssets(ProjectPaths(m_projectRoot), *m_registry);
+        }
+
+        m_assets.SetTextureStreamingEnabled(m_textureStreamingEnabled || metadataOnly);
+        m_assets.SetMeshCPUCache(m_meshCPUCache);
+        m_stagingStep = StagingStep::Prepare;
+        return true;
+
+    case StagingStep::Prepare:
+        if (!(metadataOnly ? m_runtime->PrepareMetadata(m_assets, &error) : m_runtime->Prepare(m_assets, &error)))
+        {
+            Log::Error("Failed to prepare file-backed scene: " + error + " " +
+                m_assets.GetLastMeshError() + " " + m_assets.GetLastMaterialError());
+            return fail();
+        }
+
+        m_stagingStep = StagingStep::Commit;
+        return true;
+
+    case StagingStep::Commit:
+        // The commit re-verifies the registry and disk against the preparation, so frames between the steps are safe.
+        if (!(metadataOnly ? m_runtime->CommitMetadata(m_assets, &error) : m_runtime->Commit(&error)))
+        {
+            Log::Error("Failed to commit file-backed scene: " + error);
+            return fail();
+        }
+
+        m_stagingStep = StagingStep::Idle;
+        m_initialized = true;
+        m_metadataOnlyActivation = metadataOnly;
+        done = true;
+        return true;
+
+    case StagingStep::Idle:
+    default:
         return false;
     }
-
-    const bool committed = metadataOnly ? m_runtime->CommitMetadata(m_assets, &error) : m_runtime->Commit(&error);
-
-    if(!committed)
-    {
-        Log::Error("Failed to commit file-backed scene: " + error);
-        Shutdown();
-        return false;
-    }
-
-    m_initialized = true;
-    m_metadataOnlyActivation = metadataOnly;
-    return true;
 }
 
 void FileBackedDemoScene::Shutdown()
@@ -202,7 +249,8 @@ void FileBackedDemoScene::Update(float deltaTime)
     (void)deltaTime;
 }
 
-void FileBackedDemoScene::AdvanceTextureStreaming(ProjectTexturePreparationService& preparation, Renderer& renderer,
+void FileBackedDemoScene::AdvanceTextureStreaming(FileSceneAssetCatalog::TextureStreamingPass pass, double expensiveBudget,
+    bool forceExpensive, ProjectTexturePreparationService& preparation, Renderer& renderer,
     const std::function<bool(const AssetID&, const MaterialAssetData&)>& mayPublish)
 {
     if(m_archiveScene || !m_initialized || m_objectMutationCandidate || m_runtime->HasMaterialAssignment())
@@ -210,7 +258,8 @@ void FileBackedDemoScene::AdvanceTextureStreaming(ProjectTexturePreparationServi
         return;
     }
 
-    m_assets.AdvanceTextureStreaming(preparation, renderer, GetRuntimeIdentity(), GetScene(), mayPublish);
+    m_assets.AdvanceTextureStreaming(preparation, renderer, GetRuntimeIdentity(), GetScene(), mayPublish, pass, expensiveBudget,
+        forceExpensive);
 }
 
 Scene& FileBackedDemoScene::GetScene()

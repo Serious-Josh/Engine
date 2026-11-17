@@ -67,6 +67,9 @@ public:
     enum class State { Queued, Recorded, Submitted, Ready, Rejected, Cancelled, Uncertain };
     enum class RecordResult { Recorded, Deferred, Rejected };
     explicit PreparedTextureUpload(const PreparedProjectTexture& prepared);
+    // S0.8A: shares the immutable prepared data instead of copying it (the copy was ~3.5 ms of main-thread time per 4K
+    // texture). The lease is released once Record has written the staging buffer, as the copy was.
+    explicit PreparedTextureUpload(std::shared_ptr<const PreparedProjectTexture> prepared);
     ~PreparedTextureUpload();
     PreparedTextureUpload(const PreparedTextureUpload&) = delete;
     PreparedTextureUpload& operator=(const PreparedTextureUpload&) = delete;
@@ -86,7 +89,7 @@ public:
 
     size_t CPUBytes() const noexcept
     {
-        return m_prepared.pixels.size();
+        return m_prepared ? m_prepared->pixels.size() : 0;
     }
 
     size_t StagingBytes() const noexcept
@@ -96,7 +99,7 @@ public:
 
     bool CanRetire() const noexcept;
 private:
-    PreparedProjectTexture m_prepared;
+    std::shared_ptr<const PreparedProjectTexture> m_prepared;
 
     Texture m_texture;
 

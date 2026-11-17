@@ -421,11 +421,11 @@ void Engine::ContinueEditorSceneOperation()
     }
     case Editor::FileRequestType::Load:
     {
-        SceneDocument document;
         std::filesystem::path path;
 
-        if(ResolveSceneLocation(GetActiveProject(), request.path, true, path, error) &&
-            LoadSceneDocument(path, document, &error))
+        // S0.7B: the document was validated when the operation was queued, and staging parses it again (its Open step
+        // reports a failure and preserves the current scene), so it is not parsed a third time here.
+        if(ResolveSceneLocation(GetActiveProject(), request.path, true, path, error))
         {
             m_demoSceneManager.RequestFileScene(path, &error);
         }

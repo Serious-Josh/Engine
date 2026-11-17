@@ -1,5 +1,6 @@
 #pragma once
 
+#include "DemoContent/FileBackedDemoScene.h"
 #include "DemoContent/IDemoScene.h"
 #include "DemoContent/SceneRegistry.h"
 #include "Scene/SceneDocument.h"
@@ -80,6 +81,18 @@ class DemoSceneManager
         const Shader* pixelShader,
         std::string* errorMessage = nullptr);
 
+    // S0.7B: the same staging, one initialization step per call, for metadata-first requests (the Debug synchronous
+    // diagnostic and other policies stage at once). Sets `staged` when GetStagedFileScene becomes available. False is a
+    // failure: the request keeps its pending state for the caller to cancel, as after StageRequestedFileScene.
+    bool AdvanceRequestedFileSceneStaging(
+        ID3D12Device* device,
+        ResourceUploader& uploader,
+        DescriptorHeap& descriptorHeap,
+        const Shader* vertexShader,
+        const Shader* pixelShader,
+        bool& staged,
+        std::string* errorMessage = nullptr);
+
     // Borrowed access only. Staging never initializes Renderer scene resources.
     IDemoScene* GetStagedFileScene() noexcept;
     const IDemoScene* GetStagedFileScene() const noexcept;
@@ -115,6 +128,10 @@ class DemoSceneManager
     std::span<const DemoSceneEntry> GetAvailableScenes() const;
     std::string_view GetActiveSceneName() const;
 
+#if defined(ENGINE_HAS_VERIFICATION)
+    friend class MemoryRegistryVerification;
+#endif
+
     private:
     void ConfigureProjectAssets(IDemoScene& scene) const;
 
@@ -124,6 +141,8 @@ class DemoSceneManager
 
     std::unique_ptr<IDemoScene> m_activeScene;
     std::unique_ptr<IDemoScene> m_stagedFileScene;
+    // S0.7B: a metadata-first candidate between staging steps (private: never rendered or published).
+    std::unique_ptr<FileBackedDemoScene> m_stagingFileScene;
 
     std::shared_ptr<const CookedScene::ArchiveScene> m_requestedArchive;
     std::filesystem::path m_requestedFilePath;

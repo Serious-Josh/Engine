@@ -1,5 +1,6 @@
 #include "Scene/MeshResidencyPublication.h"
 
+#include "Debug/StreamingTelemetry.h"
 #include "Renderer/Renderer.h"
 #include "Scene/FileSceneAssetCatalog.h"
 #include "Scene/FileSceneRuntime.h"
@@ -9,6 +10,7 @@
 #include <vector>
 #include <new>
 #include <string_view>
+#include <utility>
 
 static_assert(FileSceneRuntime::MaxMeshResidencyBatch == RayTracingSceneResources::MaxCandidateProposals,
     "One renderer candidate must be able to carry every entry of a residency batch.");
@@ -85,15 +87,23 @@ MeshResidencyPublication::Readiness MeshResidencyPublication::CheckPrepared(Rend
 
     try
     {
+        // S0.3: every check below still runs; the per-object metadata lookups inside them share one whole-scene validation.
+        // CheckPrepared reads the runtime only (it is const here), so the pass cannot span a mutation.
+        const FileSceneRuntime::MetadataValidationPass metadataPass(runtime);
+
         // Reject a superseded scene binding even while GPU preparation is pending.
         // This identity check acquires no source lock and performs no GPU work.
+        std::optional<StreamingTelemetry::Scope> detailTiming(std::in_place, StreamingTelemetry::Metric::PublicationIdentityNs);
+
         if (!runtime.ValidatePreparedMeshResidencyIdentity(sceneToken, catalog, &error, &failedObjectID))
         {
             return result(Status::Stale, std::move(error), std::move(failedObjectID));
         }
 
         // Poll proves completion/provenance, then current bindings and transforms.
+        detailTiming.emplace(StreamingTelemetry::Metric::PublicationPollNs);
         const auto candidateStatus = renderer.PollDXRMembershipCandidate(candidate, runtime, catalog, error);
+        detailTiming.reset();
 
         if (candidateStatus == RayTracingSceneResources::CandidateStatus::Pending)
         {
@@ -139,7 +149,9 @@ MeshResidencyPublication::Readiness MeshResidencyPublication::CheckPrepared(Rend
         // pins; final acceptance moves them to its caller and holds them through
         // commit. The pass ends with this function, before any later recording.
         const FileSceneAssetCatalog::ValidationPass validationPass(catalog);
+        detailTiming.emplace(StreamingTelemetry::Metric::PublicationSourceValidationNs);
         auto sources = runtime.ValidatePreparedMeshResidency(sceneToken, catalog, &error, &failedObjectID);
+        detailTiming.reset();
 
         if (!sources)
         {
@@ -160,8 +172,10 @@ MeshResidencyPublication::Readiness MeshResidencyPublication::CheckPrepared(Rend
         }
 
         RayTracingSceneResources::AdoptionEvidence evidence;
+        detailTiming.emplace(StreamingTelemetry::Metric::PublicationAdoptionNs);
         const auto adoption = resources.PrepareCandidateAdoption(candidate, adoptionEntries,
             renderer.m_materialPublication.desired.size(), evidence, error, &failedObjectID);
+        detailTiming.reset();
 
         if (adoption == RayTracingSceneResources::AdoptionReadiness::Unsupported)
         {
@@ -388,6 +402,9 @@ bool MeshResidencyPublication::Prepare(Renderer& renderer, const FileSceneRuntim
         {
             // Closes before candidate recording; no pass pin spans GPU work.
             const FileSceneAssetCatalog::ValidationPass validationPass(catalog);
+            // S0.3: the selection-mask and source validations below look up every staged entry; one whole-scene metadata
+            // validation serves them (the runtime is const here).
+            const FileSceneRuntime::MetadataValidationPass metadataPass(runtime);
 
             if (!PrepareSelectionMask(renderer, runtime, catalog, sceneToken, error))
             {
@@ -443,6 +460,10 @@ MeshResidencyPublication::AcceptanceResult MeshResidencyPublication::PublishAtBo
         return {Status::Retry, "No coordinated mesh residency candidate is prepared."};
     }
 
+    // S0.0 diagnostics: every boundary attempt with a candidate, including Retry results.
+    const StreamingTelemetry::Scope publicationTiming(StreamingTelemetry::Metric::PublicationNs,
+        StreamingTelemetry::Metric::PublicationAttempts);
+
     if (runtime.GetRuntimeIdentity() != m_sceneToken.runtimeIdentity ||
         renderer.m_sceneResourceLifetime != m_rendererLifetime ||
         renderer.m_sceneResourceScene != &runtime.GetScene())
@@ -476,15 +497,25 @@ MeshResidencyPublication::AcceptanceResult MeshResidencyPublication::PublishAtBo
     // optional preparation and the noexcept commit; result strings already exist.
     assert(sourcePins && static_cast<bool>(*sourcePins));
     // Optional advisory evidence: refusal never changes ordinary publication.
+    std::optional<StreamingTelemetry::Scope> detailTiming(std::in_place, StreamingTelemetry::Metric::PublicationHandoffNs);
+    // S0.3: one metadata validation for the join and handoff, which only read the runtime; it ends before the commit mutates.
+    std::optional<FileSceneRuntime::MetadataValidationPass> metadataPass(std::in_place, std::as_const(runtime));
     renderer.m_rayTracingScene.PrepareProspectiveJoin(*m_candidate, runtime, catalog,
         renderer.m_commandContext, renderer.m_sceneResourceLifetime);
     auto geometryHandoff = renderer.m_rayTracingScene.PreparePublicationHandoff(*m_candidate, runtime, this,
         RayTracingSceneResources::PublicationKind::Residency);
+    metadataPass.reset();
+    detailTiming.reset();
     result.published = true;
+    StreamingTelemetry::Add(StreamingTelemetry::Metric::Publications, 1);
+    StreamingTelemetry::Add(StreamingTelemetry::Metric::PublicationEntries, m_sceneToken.entryCount);
+    detailTiming.emplace(StreamingTelemetry::Metric::PublicationApplyNs);
     ApplyPreparedPublication(renderer, runtime, evidence);
+    detailTiming.emplace(StreamingTelemetry::Metric::PublicationCommitNs);
     // GPU adoption, CPU residency and presentation/binding updates are complete.
     renderer.m_rayTracingScene.CommitPublicationAcceptance(std::move(geometryHandoff), runtime,
         renderer.m_sceneResourceScene, renderer.m_sceneResourceLifetime, this);
+    detailTiming.reset();
     return result;
 }
 

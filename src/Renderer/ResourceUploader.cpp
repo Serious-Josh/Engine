@@ -1,5 +1,6 @@
 #include "ResourceUploader.h"
 #include "Debug/MemoryRegistry.h"
+#include "Debug/StreamingTelemetry.h"
 #include "Core/Log.h"
 #ifdef _DEBUG
 #include "GraphicsDevice.h"
@@ -16,6 +17,20 @@
 
 namespace
 {
+    // S0.0 diagnostics: one upload call, its whole duration, and whether it ran off the Engine thread.
+    struct UploadCallTelemetry
+    {
+        StreamingTelemetry::Scope total{StreamingTelemetry::Metric::UploadTotalNs, StreamingTelemetry::Metric::UploadCalls};
+
+        UploadCallTelemetry()
+        {
+            if(StreamingTelemetry::Enabled() && !StreamingTelemetry::IsMainThread())
+            {
+                StreamingTelemetry::Add(StreamingTelemetry::Metric::UploadCallsOffMainThread, 1);
+            }
+        }
+    };
+
     [[noreturn]] void FailUploadSynchronization(ID3D12Device* device, const std::string& message)
     {
         Log::Error(message);
@@ -139,6 +154,8 @@ bool ResourceUploader::UploadTexture(
     const void* data,
     size_t dataSize)
 {
+    const UploadCallTelemetry telemetry;
+
     if (!m_device ||
         !m_commandQueue ||
         !m_commandAllocator ||
@@ -202,9 +219,15 @@ bool ResourceUploader::UploadTexture(
     bufferDescription.SampleDesc.Count = 1;
     bufferDescription.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
 
-    HRESULT result =
-        m_device->CreateCommittedResource(&heapProperties, D3D12_HEAP_FLAG_NONE, &bufferDescription,
-                                          D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&uploadBuffer));
+    HRESULT result = S_OK;
+
+    {
+        // S0.0 diagnostics: the per-upload staging allocation and its size.
+        const StreamingTelemetry::Scope stagingTiming(StreamingTelemetry::Metric::UploadStagingCreateNs);
+        StreamingTelemetry::Add(StreamingTelemetry::Metric::UploadBytes, bufferDescription.Width);
+        result = m_device->CreateCommittedResource(&heapProperties, D3D12_HEAP_FLAG_NONE, &bufferDescription,
+                                                   D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&uploadBuffer));
+    }
 
     if (FAILED(result))
     {
@@ -276,6 +299,8 @@ bool ResourceUploader::UploadTexture(
     const TextureSubresourceData* subresources,
     unsigned int subresourceCount)
 {
+    const UploadCallTelemetry telemetry;
+
     if (!m_device ||
         !m_commandQueue ||
         !m_commandAllocator ||
@@ -376,9 +401,15 @@ bool ResourceUploader::UploadTexture(
 
     ID3D12Resource* uploadBuffer = nullptr;
 
-    HRESULT result =
-        m_device->CreateCommittedResource(&heapProperties, D3D12_HEAP_FLAG_NONE, &bufferDescription,
-                                          D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&uploadBuffer));
+    HRESULT result = S_OK;
+
+    {
+        // S0.0 diagnostics: the per-upload staging allocation and its size.
+        const StreamingTelemetry::Scope stagingTiming(StreamingTelemetry::Metric::UploadStagingCreateNs);
+        StreamingTelemetry::Add(StreamingTelemetry::Metric::UploadBytes, bufferDescription.Width);
+        result = m_device->CreateCommittedResource(&heapProperties, D3D12_HEAP_FLAG_NONE, &bufferDescription,
+                                                   D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&uploadBuffer));
+    }
 
     if (FAILED(result))
     {
@@ -500,7 +531,13 @@ bool ResourceUploader::FinishUpload(ID3D12Resource* uploadBuffer)
                                       "Failed to register upload fence event. HRESULT: " + std::to_string(result));
         }
 
-        const DWORD waitResult = WaitForSingleObject(static_cast<HANDLE>(m_fenceEvent), INFINITE);
+        DWORD waitResult = WAIT_FAILED;
+
+        {
+            // S0.0 diagnostics: the calling thread blocks here until the copy completes.
+            const StreamingTelemetry::Scope waitTiming(StreamingTelemetry::Metric::UploadWaitNs);
+            waitResult = WaitForSingleObject(static_cast<HANDLE>(m_fenceEvent), INFINITE);
+        }
 
         if (waitResult == WAIT_FAILED)
         {
@@ -540,6 +577,8 @@ bool ResourceUploader::UploadBuffer(
     size_t dataSize,
     D3D12_RESOURCE_STATES finalState)
 {
+    const UploadCallTelemetry telemetry;
+
     if (!m_device ||
         !m_commandQueue ||
         !m_commandAllocator ||
@@ -585,9 +624,15 @@ bool ResourceUploader::UploadBuffer(
 
     bufferDescription.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
 
-    HRESULT result =
-        m_device->CreateCommittedResource(&heapProperties, D3D12_HEAP_FLAG_NONE, &bufferDescription,
-                                          D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&uploadBuffer));
+    HRESULT result = S_OK;
+
+    {
+        // S0.0 diagnostics: the per-upload staging allocation and its size.
+        const StreamingTelemetry::Scope stagingTiming(StreamingTelemetry::Metric::UploadStagingCreateNs);
+        StreamingTelemetry::Add(StreamingTelemetry::Metric::UploadBytes, bufferDescription.Width);
+        result = m_device->CreateCommittedResource(&heapProperties, D3D12_HEAP_FLAG_NONE, &bufferDescription,
+                                                   D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&uploadBuffer));
+    }
 
     if (FAILED(result))
     {
@@ -609,6 +654,19 @@ bool ResourceUploader::UploadBuffer(
 
     std::memcpy(mappedData, data, dataSize);
     uploadBuffer->Unmap(0, nullptr);
+
+    if (m_deferredBatch)
+    {
+        // S0.8B: no submission and no wait; the batch owns the staging buffer from here.
+        DeferredBufferUpload deferred;
+        deferred.destination = destination;
+        deferred.staging.Attach(uploadBuffer);
+        deferred.size = dataSize;
+        deferred.finalState = finalState;
+        m_deferredBatch->bytes += dataSize;
+        m_deferredBatch->uploads.push_back(std::move(deferred));
+        return true;
+    }
 
     result = m_commandAllocator->Reset();
 

@@ -13,6 +13,8 @@ void StructuredBuffer::Swap(StructuredBuffer& other) noexcept
     std::swap(m_resource, other.m_resource);
     std::swap(m_descriptorHeap, other.m_descriptorHeap);
     std::swap(m_descriptorIndex, other.m_descriptorIndex);
+    std::swap(m_elementSize, other.m_elementSize);
+    std::swap(m_elementCount, other.m_elementCount);
 }
 
 bool StructuredBuffer::InitializeReadOnlyUpload(ID3D12Device* device, const void* data,
@@ -86,6 +88,67 @@ bool StructuredBuffer::Initialize(
         return false;
     }
 
+    return true;
+}
+
+bool StructuredBuffer::CreateStorageResource(ID3D12Device* device, size_t elementSize, unsigned int elementCount)
+{
+    if(!device || m_resource || elementSize == 0 || elementSize > UINT_MAX || elementCount == 0 ||
+       elementSize > (std::numeric_limits<size_t>::max)() / elementCount)
+    {
+        return false;
+    }
+
+    D3D12_HEAP_PROPERTIES heapProperties{};
+    heapProperties.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+    D3D12_RESOURCE_DESC resourceDescription{};
+    resourceDescription.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    resourceDescription.Width = elementSize * elementCount;
+    resourceDescription.Height = 1;
+    resourceDescription.DepthOrArraySize = 1;
+    resourceDescription.MipLevels = 1;
+    resourceDescription.Format = DXGI_FORMAT_UNKNOWN;
+    resourceDescription.SampleDesc.Count = 1;
+    resourceDescription.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+    if (FAILED(device->CreateCommittedResource(&heapProperties, D3D12_HEAP_FLAG_NONE, &resourceDescription,
+                                               D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&m_resource))))
+    {
+        m_resource = nullptr;
+        return false;
+    }
+
+    m_elementSize = elementSize;
+    m_elementCount = elementCount;
+    return true;
+}
+
+bool StructuredBuffer::CreateStorageView(ID3D12Device* device, DescriptorHeap& descriptorHeap)
+{
+    if (!device || !m_resource || m_descriptorIndex != UINT_MAX)
+    {
+        return false;
+    }
+
+    MemoryRegistry::TrackResource(m_resource);
+    m_descriptorIndex = descriptorHeap.Allocate();
+
+    if (m_descriptorIndex == UINT_MAX)
+    {
+        return false;
+    }
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC srvDescription{};
+    srvDescription.Format = DXGI_FORMAT_UNKNOWN;
+    srvDescription.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    srvDescription.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srvDescription.Buffer.FirstElement = 0;
+    srvDescription.Buffer.NumElements = m_elementCount;
+    srvDescription.Buffer.StructureByteStride = static_cast<unsigned int>(m_elementSize);
+    srvDescription.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_NONE;
+    device->CreateShaderResourceView(m_resource, &srvDescription, descriptorHeap.GetCPUHandle(m_descriptorIndex));
+    m_descriptorHeap = &descriptorHeap;
     return true;
 }
 

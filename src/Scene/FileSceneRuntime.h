@@ -16,6 +16,7 @@
 #include <string>
 #include <map>
 #include <thread>
+#include <vector>
 #include "assets/AssetID.h"
 
 // Copied document metadata. Identity fields are internal selection checks, not UI labels.
@@ -111,6 +112,51 @@ class PhysicsPresentationAssociation
 class FileSceneRuntime
 {
 public:
+    // S0.3: one logically read-only operation (a residency candidate build, poll, handoff or scheduler scan) validates the whole
+    // committed scene once, then resolves every GetObjectMetadata lookup inside it from the validated runtime-index table instead
+    // of revalidating the scene per call. Owner thread only; nests (an inner pass defers to the active one).
+    //
+    // A pass must not span a mutation of this runtime. Each lookup checks a structural fingerprint (document and object storage,
+    // structure revisions, mapping storage, archive, thread) and falls back to the full per-call validation when it differs, so a
+    // pass can only skip repetition, never a check. Debug builds revalidate fully when the pass ends and assert the same outcome.
+    class MetadataValidationPass
+    {
+    public:
+        explicit MetadataValidationPass(const FileSceneRuntime& runtime);
+        ~MetadataValidationPass();
+        MetadataValidationPass(const MetadataValidationPass&) = delete;
+        MetadataValidationPass& operator=(const MetadataValidationPass&) = delete;
+
+    private:
+        friend class FileSceneRuntime;
+
+        struct Fingerprint
+        {
+            const void* document = nullptr;
+            const void* documentObjects = nullptr;
+            std::size_t documentObjectCount = 0;
+            std::uint64_t sceneStructureRevision = 0;
+            std::size_t renderObjectCount = 0;
+            std::uint64_t mappingStructureRevision = 0;
+            const void* committedObjects = nullptr;
+            const void* archive = nullptr;
+            bool operator==(const Fingerprint&) const = default;
+        };
+
+        bool Matches(const FileSceneRuntime& runtime) const;
+        bool Resolve(std::optional<RenderObjectID> selectedIndex, const SceneObjectDocument*& selected,
+            std::string* errorMessage) const;
+
+        const FileSceneRuntime& m_runtime;
+        const MetadataValidationPass* m_previous = nullptr;
+        bool m_owner = false; // False when an equivalent pass was already active.
+        std::thread::id m_thread;
+        Fingerprint m_fingerprint;
+        bool m_valid = false;
+        std::string m_error;
+        std::vector<const SceneObjectDocument*> m_byIndex;
+    };
+
     FileSceneRuntime();
     std::optional<PhysicsPresentationAssociation> AssociatePhysicsPresentation(
         Renderer& renderer, const SceneDocument& registeredDocument, std::string& error) const;
@@ -430,6 +476,13 @@ private:
     // document object at `selectedIndex` when one is given (nullptr when none maps to it).
     bool ValidateObjectMetadataState(std::optional<RenderObjectID> selectedIndex,
         const SceneObjectDocument*& selected, std::string* errorMessage) const;
+    // The full per-call validation. `byIndex`, when given, receives every runtime index's document object.
+    bool ValidateObjectMetadataStateFully(std::optional<RenderObjectID> selectedIndex,
+        const SceneObjectDocument*& selected, std::string* errorMessage,
+        std::vector<const SceneObjectDocument*>* byIndex = nullptr) const;
+    MetadataValidationPass::Fingerprint CaptureMetadataFingerprint() const;
+    // The active pass on the owner thread (S0.3); never owned here.
+    mutable const MetadataValidationPass* m_metadataPass = nullptr;
     PhysicsPresentationReadiness GetPhysicsPresentationBoundaryReadiness(const Renderer& renderer,
         std::string& error, bool clearing) const;
     std::uint64_t m_physicsPresentationRevision = 0;

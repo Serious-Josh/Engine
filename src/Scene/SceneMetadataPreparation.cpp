@@ -39,7 +39,7 @@ bool FileSceneAssetCatalog::ValidateMetadataMeshReference(std::string_view refer
 
     try
     {
-        const auto project = std::filesystem::canonical(m_projectRoot);
+        const auto project = CanonicalProjectRoot();
 
         if(reference.empty() || ClassifyMeshReference(reference) == MeshReferenceKind::Builtin)
         {
@@ -124,7 +124,7 @@ bool FileSceneAssetCatalog::ValidateMetadataMaterialReferenceOnDisk(std::string_
 
     try
     {
-        const auto project = std::filesystem::canonical(m_projectRoot);
+        const auto project = CanonicalProjectRoot();
         const auto id = AssetID::ParseReference(reference);
         const auto* record = id ? m_registry->Find(*id) : nullptr;
         const ProjectPaths paths(project);
@@ -211,14 +211,22 @@ bool PrepareSceneMetadata(const SceneDocument& document, FileSceneAssetCatalog& 
         return false;
     }
 
+    // S0.7B: one catalog validation pass for this preparation (canonical root and per-reference results are shared).
+    // Each call (preparation, and the commit's re-verification) opens its own pass, so commit still re-checks the disk.
+    const FileSceneAssetCatalog::ValidationPass validationPass(catalog);
     PreparedMetadataScene candidate;
     candidate.document = document;
     candidate.objects.reserve(document.objects.size());
     std::set<std::string> checkedMaterials;
+    // S0.7B: like materials, each distinct mesh reference is validated once per preparation. The result is a function of
+    // the reference, the registry and the disk, none of which change during this call; per-object canonicalization and
+    // resolution were most of the activation staging cost of scenes sharing a mesh.
+    std::set<std::string> checkedMeshes;
 
     for(const auto& authored : document.objects)
     {
-        if(!catalog.ValidateMetadataMeshReference(authored.meshReference, error))
+        if(checkedMeshes.insert(authored.meshReference).second &&
+            !catalog.ValidateMetadataMeshReference(authored.meshReference, error))
         {
             return false;
         }

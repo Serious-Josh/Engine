@@ -23,6 +23,11 @@ class GGXMultiscatterIrradiancePass
         Texture& sourceTexture,
         Texture& brdfIntegrationLUT,
         Texture& irradianceCubemap);
+    // S0.5: one face of one mip, exactly as Execute draws it.
+    void RecordFace(ID3D12GraphicsCommandList* commandList, Texture& sourceTexture, Texture& brdfIntegrationLUT,
+        Texture& irradianceCubemap, unsigned int mip, unsigned int face);
+    unsigned int GetSize() const { return m_size; }
+    unsigned int GetMipLevels() const { return m_mipLevels; }
     void Shutdown();
 
     private:

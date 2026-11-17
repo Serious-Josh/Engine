@@ -1,5 +1,6 @@
 #include "Renderer/BuiltinEnvironment.h"
 #include "Debug/MemoryRegistry.h"
+#include "Debug/StreamingTelemetry.h"
 #include "Scene/SceneDocument.h"
 #include "Platform/Windows/WindowsWindow.h"
 #include <cassert>
@@ -6510,11 +6511,37 @@ bool Renderer::InitializeMaterials(const std::vector<Material*>& materials)
     return true;
 }
 
+namespace
+{
+    // S0.0 diagnostics: the newest completed GPU frame and TLAS update time, as per-frame gauges.
+    void RecordStreamingGpuGauges(const GpuTimestampProfiler::Results& results)
+    {
+        if(!StreamingTelemetry::Enabled())
+        {
+            return;
+        }
+
+        const auto record = [&](GpuTimestampProfiler::Region region, StreamingTelemetry::Gauge gauge)
+        {
+            const auto index = static_cast<unsigned int>(region);
+
+            if((results.validRegions & (1ull << index)) != 0)
+            {
+                StreamingTelemetry::Raise(gauge, static_cast<std::uint64_t>(results.milliseconds[index] * 1000.0));
+            }
+        };
+
+        record(GpuTimestampProfiler::Region::TotalFrame, StreamingTelemetry::Gauge::GpuFrameMicroseconds);
+        record(GpuTimestampProfiler::Region::TlasUpdate, StreamingTelemetry::Gauge::GpuTlasUpdateMicroseconds);
+    }
+}
+
 bool Renderer::InitializeRayTracingScene(const Scene& scene)
 {
     const MemoryCategoryScope memoryScope(MemoryCategory::AccelerationStructures);
 
     SceneSwitchTiming::Measure asTiming(SceneSwitchTiming::Stage::AccelerationStructures);
+    const StreamingTelemetry::Scope streamingAsTiming(StreamingTelemetry::Metric::SceneInitialAsNs);
     // No AS or instance buffer is needed when every object is intentionally meshless.
     // Scene-resource release still owns draining and destruction when switching scenes.
     if(!scene.HasRenderableMeshes())
@@ -6572,6 +6599,7 @@ bool Renderer::InitializeRayTracingScene(const Scene& scene)
     // A failed submission fence signal does not mean the build was discarded.
     const bool completed = SceneSwitchTiming::MeasureCall(SceneSwitchTiming::Stage::ASWait, [&]()
     {
+        const StreamingTelemetry::Scope streamingWaitTiming(StreamingTelemetry::Metric::SceneInitialAsWaitNs);
         return m_commandContext.WaitForGPU();
     });
 
@@ -6681,6 +6709,9 @@ bool Renderer::ReleaseSceneResources()
         Log::Error("Scene resource release could not prove material dependency retirement safety.");
         return false;
     }
+
+    // S0.8B: the scene's catalog releases its geometry next; no queued copy may outlive it.
+    ReleaseGeometryUploads();
 
     if(!ResolvePreviewAfterGPUDrain())
     {
@@ -11591,6 +11622,9 @@ Renderer::FrameRenderResult Renderer::Render(
     }
 
     admissionProbe.reset();
+    // S0.5: a fully prepared environment replaces the published one before this frame reads it.
+    PublishPreparedEnvironment();
+    CollectGeometryUploadRetirements();
 
     if (!RecordRenderFrame(scene, options))
     {
@@ -11980,6 +12014,7 @@ bool Renderer::RecordRenderFrame(
     if (m_gpuTimestampProfiler.CollectCompleted(m_commandContext.GetCompletedFenceValue()))
     {
         const GpuTimestampProfiler::Results& gpuResults = m_gpuTimestampProfiler.GetResults();
+        RecordStreamingGpuGauges(gpuResults);
 
         m_debugUI.RecordFramePacingGaps(gpuResults);
 
@@ -13660,7 +13695,8 @@ bool Renderer::RecordRenderFrame(
         m_exposureSnapAfterUnlitFrames = !litThisFrame;
         m_litLastFrame = litThisFrame;
         m_litFramePresented = m_litFramePresented || litThisFrame;
-        exposure.reset = options.exposureReset || snapAfterUnlitFrames || !m_exposureInitialized || !(frameView.identity == m_exposureViewIdentity) ||
+        exposure.reset = options.exposureReset || snapAfterUnlitFrames ||
+            std::exchange(m_exposureSnapAfterEnvironmentPublication, false) || !m_exposureInitialized || !(frameView.identity == m_exposureViewIdentity) ||
             lightingSettings.referenceEV100 != m_exposureReferenceEV100;
 
         if(!m_autoExposurePass.Ensure(m_graphicsDevice.GetDevice(), m_shaderLibrary, m_resourceDescriptorHeap) ||
@@ -14162,6 +14198,10 @@ bool Renderer::RecordRenderFrame(
 
     }
 
+    // S0.5: a budgeted share of a pending environment's copies and precompute, after everything this frame renders.
+    RecordEnvironmentPreparation(commandList);
+    // S0.8B: staged geometry copies, ahead of the next recording's BLAS builds on this queue.
+    RecordGeometryUploads(commandList);
     m_gpuTimestampProfiler.EndFrameAndResolve(commandList, frameIndex);
 
     m_cpuFrameTiming.recording = CpuTiming::MillisecondsSince(recordingStart);
@@ -14248,11 +14288,15 @@ bool Renderer::RecordRenderFrame(
         }
 
         m_gpuTimestampProfiler.BreakFrameSequence();
+        CommitEnvironmentPreparationSubmission(false);
+        CommitGeometryUploadSubmission(false);
 
         Log::Error("Failed to submit command list or signal its fence; GPU work may already be in flight.");
         return false;
     }
 
+    CommitEnvironmentPreparationSubmission(true);
+    CommitGeometryUploadSubmission(true);
     m_dlssFrameSubmitted = true;
     m_referenceRayCounts.Commit(frameIndex, textureUploadGeneration, m_commandContext);
 
@@ -14451,6 +14495,8 @@ void Renderer::Shutdown()
     }
 
     Log::Info("Renderer shutdown: GPU drain confirmed; discarding unsubmitted commands.");
+    ShutdownEnvironmentPreparation();
+    ReleaseGeometryUploads();
 
     if(m_commandContextInitialized && !m_commandContext.DiscardCommandsAfterGPUDrain())
     {
@@ -15557,6 +15603,8 @@ bool Renderer::SetEnvironment(size_t index, float radianceScale)
     const MemoryCategoryScope memoryScope(MemoryCategory::MeshesTextures);
 
     if(m_packagedRuntime) { Log::Error("Loose environment selection rejected in packaged mode."); return false; }
+    // A synchronous selection is newer intent than any asynchronous request in flight.
+    CancelEnvironmentPreparation();
     if (index >= m_availableEnvironments.size())
     {
         Log::Error("Invalid environment index.");
@@ -15623,6 +15671,7 @@ bool Renderer::SetEnvironmentImage(const HDRImageData* image,std::string identit
 
     // The source identity selects the built-in black environment; the calibrated one only detects changes.
     const bool none=!image && identity == SceneDocument::NoneEnvironmentReference;
+    CancelEnvironmentPreparation();
     identity=CalibratedEnvironmentIdentity(identity,radianceScale);
     if(identity==m_environmentIdentity) return true;
     if(m_activeRecordingGeneration || !m_commandContext.WaitForGPU() || !m_commandContext.DiscardCommandsAfterGPUDrain())
@@ -15901,8 +15950,31 @@ bool Renderer::CopyMaterialTableSnapshot(std::uint64_t identity, std::vector<GPU
 
 bool Renderer::QueuePreparedTextureUpload(const PreparedProjectTexture& prepared, std::uint64_t& ticket, std::string& error)
 {
+    try
+    {
+        return QueuePreparedTextureUpload(std::make_shared<const PreparedProjectTexture>(prepared), ticket, error);
+    }
+    catch(const std::exception& exception)
+    {
+        ticket = 0;
+        error = std::string("Rejected: cannot retain prepared texture request: ") + exception.what();
+        return false;
+    }
+}
+
+bool Renderer::QueuePreparedTextureUpload(std::shared_ptr<const PreparedProjectTexture> shared, std::uint64_t& ticket,
+    std::string& error)
+{
     error.clear();
     ticket = 0;
+
+    if(!shared)
+    {
+        error = "Rejected: prepared texture data or Renderer lifecycle is invalid.";
+        return false;
+    }
+
+    const PreparedProjectTexture& prepared = *shared;
 
     if(!m_graphicsDevice.GetDevice() || m_sceneResourceLifetime == 0 || m_sceneInitializationAttempt.candidate ||
        m_activeRecordingGeneration != 0 || m_displacementExitScopeGeneration != 0 ||
@@ -15943,7 +16015,7 @@ bool Renderer::QueuePreparedTextureUpload(const PreparedProjectTexture& prepared
             return false;
         }
 
-        auto upload = std::make_unique<PreparedTextureUpload>(prepared);
+        auto upload = std::make_unique<PreparedTextureUpload>(std::move(shared));
         m_preparedTextureUploads.push_back({identity, std::move(upload), {}});
         ticket = identity;
         return true;

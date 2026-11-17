@@ -32,6 +32,7 @@
 #include "ResourceUploader.h"
 #include "SwapChain.h"
 #include "EnvironmentMap.h"
+#include "EnvironmentPreparation.h"
 #include "RenderTarget.h"
 #include "DisplacementGPUPatchBuffer.h"
 #include "Displacement/DisplacementUpdateState.h"
@@ -1057,6 +1058,51 @@ class Renderer
     bool SetEnvironmentImage(const HDRImageData*, std::string identity, std::string displayName, std::string reference = {},
         float radianceScale = 1.0f);
     const std::string& GetEnvironmentIdentity() const noexcept { return m_environmentIdentity; }
+
+    // S0.5 asynchronous environment replacement (see EnvironmentPreparation.h). Rendering keeps the published environment
+    // until the requested one is fully prepared on the GPU; it then becomes active at the start of a frame. Only the newest
+    // request can publish: every request supersedes the previous one, and synchronous SetEnvironment/SetEnvironmentImage
+    // and CancelEnvironmentPreparation cancel any in flight. Returns the request's ticket (never 0).
+    std::uint64_t RequestEnvironment(EnvironmentPreparationSource source);
+    enum class EnvironmentPreparationState
+    {
+        Unknown,
+        Pending,
+        Published,
+        Failed,
+        Superseded,
+    };
+    EnvironmentPreparationState QueryEnvironmentPreparation(std::uint64_t ticket, std::string* error = nullptr) const;
+    void CancelEnvironmentPreparation();
+    // Also true while a replaced environment or staging buffer waits for its fence, so a settled scene's memory is final.
+    bool IsEnvironmentPreparationPending() const noexcept
+    {
+        return m_environmentState == EnvironmentPreparationState::Pending ||
+            std::any_of(m_environmentRetirements.begin(), m_environmentRetirements.end(),
+                [](const auto& retirement) { return retirement.fence != UINT64_MAX; });
+    }
+    // S0.8B asynchronous geometry uploads (RendererGeometryUploads.cpp). A batch of staged buffer copies (collected by
+    // ResourceUploader::SetDeferredBufferBatch) is recorded at the end of a later frame recording on the frame queue, at
+    // most 32 MiB per frame, so every later BLAS build and draw on that queue sees the data. TakeGeometryUploadState
+    // reports Submitted once that frame's submission is confirmed (the destination may then be published) and forgets
+    // the ticket. The destinations are borrowed: their owner keeps them alive while the ticket is Queued and, once
+    // recorded, until a GPU drain (scene resource release drains and calls ReleaseGeometryUploads). Queue returns 0 when
+    // the bounded queue (128 MiB of staging) is full; the caller then uploads synchronously as before.
+    enum class GeometryUploadState
+    {
+        Unknown,
+        Queued,
+        Submitted,
+        Uncertain,
+    };
+    bool CanQueueGeometryUploads(size_t bytes) const noexcept;
+    std::uint64_t QueueGeometryUploads(DeferredBufferUploadBatch&& batch);
+    GeometryUploadState TakeGeometryUploadState(std::uint64_t ticket);
+    void CancelGeometryUpload(std::uint64_t ticket) noexcept;
+
+    // Sources for the built-in neutral (no assignment) and black (None) environments, as SetEnvironmentImage selects them.
+    static EnvironmentPreparationSource NeutralEnvironmentSource(float radianceScale);
+    static EnvironmentPreparationSource NoneEnvironmentSource(float radianceScale);
     // The camera exposure state as last read back from the GPU (a few frames old; display only).
     const AutoExposurePass::Readback& GetExposureReadback() const noexcept { return m_autoExposurePass.GetReadback(); }
     // The identity SetEnvironmentImage records for a source identity at a radiance scale.
@@ -1131,6 +1177,9 @@ class Renderer
         std::vector<Texture::Dependency> dependencies, std::string* errorMessage = nullptr);
     // Main-thread requests; no material bindings change. Caller cancels rejected/unused tickets.
     bool QueuePreparedTextureUpload(const PreparedProjectTexture& prepared, std::uint64_t& ticket, std::string& error);
+    // S0.8A: the same, sharing the caller's immutable prepared data instead of copying it.
+    bool QueuePreparedTextureUpload(std::shared_ptr<const PreparedProjectTexture> prepared, std::uint64_t& ticket,
+        std::string& error);
     std::optional<PreparedTextureUpload::State> GetPreparedTextureUploadState(std::uint64_t ticket, std::string* error = nullptr) const;
     bool TakeCompletedPreparedTextureUpload(std::uint64_t ticket, Texture& destination);
     void CancelPreparedTextureUpload(std::uint64_t ticket);
@@ -1873,6 +1922,67 @@ private:
     bool InitializeRayTracingScene(const Scene& scene);
     bool DiscoverEnvironments();
     bool PreprocessEnvironment(EnvironmentMap& environment);
+
+    // S0.5 asynchronous environment preparation (RendererEnvironmentPreparation.cpp). m_environmentJob is the newest
+    // request, the only one that may publish. Superseded jobs whose worker is still running drain in
+    // m_environmentDrainingJobs (at most one: a newer request then waits in m_environmentQueuedSource, latest wins).
+    // Retirements hold GPU-referenced owners until their fence completes (UINT64_MAX: until shutdown's drain).
+    struct EnvironmentRetirement
+    {
+        std::uint64_t fence = 0;
+        std::unique_ptr<EnvironmentPreparationJob> job;
+        // A job's staging buffer, retired on its own once the copies reading it were submitted.
+        Microsoft::WRL::ComPtr<ID3D12Resource> staging;
+    };
+    std::unique_ptr<EnvironmentPreparationJob> m_environmentJob;
+    std::vector<std::unique_ptr<EnvironmentPreparationJob>> m_environmentDrainingJobs;
+    std::optional<EnvironmentPreparationSource> m_environmentQueuedSource;
+    std::uint64_t m_environmentQueuedTicket = 0;
+    std::vector<EnvironmentRetirement> m_environmentRetirements;
+    std::uint64_t m_environmentLatestTicket = 0;
+    EnvironmentPreparationState m_environmentState = EnvironmentPreparationState::Unknown;
+    std::string m_environmentError;
+    // Environments published by RequestEnvironment (diagnostics and verification).
+    std::uint64_t m_environmentPublications = 0;
+    // Set by a publication whose request snaps exposure; consumed by that frame's exposure pass.
+    bool m_exposureSnapAfterEnvironmentPublication = false;
+    // Per-frame budgets: staging bytes copied and estimated precompute GPU microseconds (ENGINE_ENVIRONMENT_PREP_COPY_MIB
+    // and ENGINE_ENVIRONMENT_PREP_GPU_US override them for measurement).
+    std::uint64_t m_environmentCopyBudget = 0;
+    std::uint64_t m_environmentWorkBudget = 0;
+    void StartEnvironmentJob(EnvironmentPreparationSource source, std::uint64_t ticket);
+    void SupersedeEnvironmentJob();
+    void RetireEnvironmentJob(std::unique_ptr<EnvironmentPreparationJob> job);
+    void CollectEnvironmentPreparation();
+    bool BeginEnvironmentGpuStage(EnvironmentPreparationJob& job);
+    void RecordEnvironmentPreparation(ID3D12GraphicsCommandList* commandList);
+    void CommitEnvironmentPreparationSubmission(bool executed);
+    void PublishPreparedEnvironment();
+    void FailEnvironmentJob(const std::string& error);
+    void ShutdownEnvironmentPreparation();
+
+    struct QueuedGeometryUpload
+    {
+        std::uint64_t ticket = 0;
+        DeferredBufferUploadBatch batch;
+        std::uint64_t lifetime = 0;
+        bool recordedUncommitted = false;
+        bool uncertain = false;
+    };
+    struct GeometryStagingRetirement
+    {
+        std::uint64_t fence = 0;
+        size_t bytes = 0;
+        Microsoft::WRL::ComPtr<ID3D12Resource> staging;
+    };
+    std::deque<QueuedGeometryUpload> m_geometryUploads;
+    std::vector<GeometryStagingRetirement> m_geometryStagingRetirements;
+    std::unordered_map<std::uint64_t, GeometryUploadState> m_geometryUploadStates;
+    std::uint64_t m_geometryUploadTicket = 0;
+    void RecordGeometryUploads(ID3D12GraphicsCommandList* commandList);
+    void CommitGeometryUploadSubmission(bool executed);
+    void CollectGeometryUploadRetirements();
+    void ReleaseGeometryUploads() noexcept;
 
     GraphicsDevice m_graphicsDevice;
 

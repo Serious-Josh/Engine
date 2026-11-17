@@ -1,5 +1,6 @@
 #include "TopLevelAccelerationStructure.h"
 #include "Debug/MemoryRegistry.h"
+#include "Debug/StreamingTelemetry.h"
 #include "Core/Log.h"
 #include "BottomLevelAccelerationStructure.h"
 #include "Math/Matrix4.h"
@@ -289,6 +290,9 @@ bool TopLevelAccelerationStructure::Initialize(
     const RayTracingTopLevelDescription& description,
     const std::vector<const BottomLevelAccelerationStructure*>& bottomLevelStructures)
 {
+    // S0.0 diagnostics: CPU time to allocate and record one full TLAS build, and its instance count.
+    const StreamingTelemetry::Scope buildTiming(StreamingTelemetry::Metric::TlasBuildNs, StreamingTelemetry::Metric::TlasBuilds);
+    StreamingTelemetry::Add(StreamingTelemetry::Metric::TlasBuildInstances, description.instances.size());
     m_recordingIdentity = 0;
     m_recordingSlot = UINT_MAX;
     m_capture.reset();
@@ -450,6 +454,9 @@ bool TopLevelAccelerationStructure::Initialize(
         return false;
     }
 
+    StreamingTelemetry::Add(StreamingTelemetry::Metric::TlasBuildBytes,
+        prebuildInfo.ResultDataMaxSizeInBytes + prebuildInfo.ScratchDataSizeInBytes);
+
     D3D12_HEAP_PROPERTIES defaultHeapProperties{};
     defaultHeapProperties.Type = D3D12_HEAP_TYPE_DEFAULT;
 
@@ -539,6 +546,9 @@ bool TopLevelAccelerationStructure::Update(
     const std::vector<std::size_t>& changedInstanceIndices,
     const std::vector<const BottomLevelAccelerationStructure*>& bottomLevelStructures)
 {
+    // S0.0 diagnostics: CPU time to record one TLAS update, and how many instances changed.
+    const StreamingTelemetry::Scope updateTiming(StreamingTelemetry::Metric::TlasUpdateNs, StreamingTelemetry::Metric::TlasUpdates);
+    StreamingTelemetry::Add(StreamingTelemetry::Metric::TlasUpdateInstances, changedInstanceIndices.size());
     m_recordingIdentity = 0;
     m_recordingSlot = UINT_MAX;
     m_capture.reset();

@@ -18,8 +18,9 @@ bool Engine::IsEditorSceneStreamingSettled() const
     // into, which stops it. Like the packaged runtime, Play waits until the scene is resident.
     const auto* scene = dynamic_cast<const FileBackedDemoScene*>(m_demoSceneManager.TryGetActiveScene());
     const bool meshesSettled = !m_automaticMeshResidency.enabled || m_automaticMeshResidency.settled;
+    // S0.5: the scene's environment is part of its residency.
     return meshesSettled && !m_residencyRequestSelection && !m_meshResidencyPublication.HasCandidate() &&
-        (!scene || scene->IsTextureStreamingSettled());
+        (!scene || scene->IsTextureStreamingSettled()) && !m_renderer.IsEnvironmentPreparationPending();
 }
 
 void Engine::RefreshEditorGameStatus(bool compatibleScene)

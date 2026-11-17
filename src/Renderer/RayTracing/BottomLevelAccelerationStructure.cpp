@@ -1,5 +1,6 @@
 #include "BottomLevelAccelerationStructure.h"
 #include "Debug/MemoryRegistry.h"
+#include "Debug/StreamingTelemetry.h"
 #include "BLASGeometryDescription.h"
 #include "Core/Log.h"
 
@@ -147,6 +148,8 @@ bool BottomLevelAccelerationStructure::InitializeBuild(
     const RayTracingBottomLevelDescription& description,
     BLASBuildIdentity identity)
 {
+    // S0.0 diagnostics: CPU time to allocate and record one BLAS build (not GPU build time).
+    const StreamingTelemetry::Scope buildTiming(StreamingTelemetry::Metric::BlasRecordNs, StreamingTelemetry::Metric::BlasBuilds);
     std::vector<D3D12_RAYTRACING_GEOMETRY_DESC> geometryDescriptions;
     geometryDescriptions.reserve(description.geometries.size());
 
@@ -205,6 +208,11 @@ bool BottomLevelAccelerationStructure::InitializeBuild(
     {
         return false;
     }
+
+    // Requested sizes; each is a separate committed allocation (64 KiB granularity).
+    StreamingTelemetry::Add(StreamingTelemetry::Metric::BlasAllocations, 2);
+    StreamingTelemetry::Add(StreamingTelemetry::Metric::BlasResultBytes, prebuildInfo.ResultDataMaxSizeInBytes);
+    StreamingTelemetry::Add(StreamingTelemetry::Metric::BlasScratchBytes, prebuildInfo.ScratchDataSizeInBytes);
 
     D3D12_HEAP_PROPERTIES heapProperties{};
     heapProperties.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -490,6 +498,8 @@ bool BottomLevelAccelerationStructure::Rebuild(
 
 void BottomLevelAccelerationStructure::ReleaseRetiredResources()
 {
+    StreamingTelemetry::Add(StreamingTelemetry::Metric::BlasRetirementReleases, m_retiredBatches.size());
+
     for (const RetiredBatch& batch : m_retiredBatches)
     {
         if (batch.result)

@@ -337,6 +337,7 @@ add_library(EngineCore OBJECT
     external/imgui/imgui_impl_dx12.cpp
     external/ImGuizmo/ImGuizmo.cpp
     src/Debug/DebugUI.cpp
+    src/Debug/StreamingTelemetry.cpp
     src/Scene/Scene.cpp
     src/Scene/SceneHierarchyTransforms.cpp
     src/Scene/SceneHierarchyPublication.cpp
@@ -347,6 +348,7 @@ add_library(EngineCore OBJECT
     src/Renderer/Passes/ToneMapPass.cpp
     src/Renderer/Passes/DeferrerLightingPass.cpp
     src/Renderer/EnvironmentMap.cpp
+    src/Renderer/EnvironmentPreparation.cpp
     src/Renderer/Passes/EquirectangularToCubemapPass.cpp
     src/Renderer/Passes/EnvironmentMipPass.cpp
     src/Renderer/Passes/BRDFIntegrationpass.cpp
@@ -360,6 +362,8 @@ add_library(EngineCore OBJECT
     src/Renderer/RayTracing/RayTracingSceneResources.cpp
     src/Renderer/RayTracing/RayTracingMembershipCandidate.cpp
     src/Renderer/RendererMembershipCandidate.cpp
+    src/Renderer/RendererEnvironmentPreparation.cpp
+    src/Renderer/RendererGeometryUploads.cpp
     src/Renderer/Passes/RayTracedShadowPass.cpp
     src/Renderer/Passes/PathTraceReferencePass.cpp
     src/Renderer/Passes/PathTraceSpatialPass.cpp
@@ -567,6 +571,10 @@ if(ENGINE_BUILD_DIAGNOSTICS)
     set(ENGINE_VERIFICATION_AVAILABLE ON)
     # A consistent definition across core, tests and entry points guards test-only access.
     target_compile_definitions(EngineCore PUBLIC $<$<CONFIG:Debug>:ENGINE_HAS_VERIFICATION=1>)
+    # S0.1 local-only Release streaming driver (Git-ignored file; inert unless ENGINE_S0_DRIVER_LOADS is set).
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Engine/tests/S0ReleaseDriver.inl")
+        target_compile_definitions(EngineCore PRIVATE ENGINE_HAS_S0_RELEASE_DRIVER=1)
+    endif()
     # PS.3 UI verification: Dear ImGui's item hooks, recorded by the ignored verifiers (Debug only, inert by default).
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Engine/tests/ImGuiTestEngineHooks.cpp")
         target_compile_definitions(EngineCore PRIVATE $<$<CONFIG:Debug>:IMGUI_ENABLE_TEST_ENGINE>)

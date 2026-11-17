@@ -28,6 +28,10 @@ class StructuredBuffer
     // Immutable small lookup table. No commands, upload submission or GPU wait.
     bool InitializeReadOnlyUpload(ID3D12Device* device, const void* data, size_t elementSize,
         unsigned int elementCount, DescriptorHeap& descriptorHeap);
+    // S0.5: InitializeStorage in two steps. CreateStorageResource touches only the device (any thread; the memory registry
+    // entry is deferred); CreateStorageView registers the resource and creates its SRV on the main thread.
+    bool CreateStorageResource(ID3D12Device* device, size_t elementSize, unsigned int elementCount);
+    bool CreateStorageView(ID3D12Device* device, DescriptorHeap& descriptorHeap);
     void Swap(StructuredBuffer& other) noexcept;
     void Shutdown();
 
@@ -39,4 +43,6 @@ class StructuredBuffer
 
     DescriptorHeap* m_descriptorHeap = nullptr;
     unsigned int m_descriptorIndex = UINT_MAX;
+    size_t m_elementSize = 0;
+    unsigned int m_elementCount = 0;
 };

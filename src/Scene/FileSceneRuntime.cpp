@@ -1,5 +1,8 @@
 #include "assets/CookedScene.h"
+#include "Debug/StreamingTelemetry.h"
 #include "Scene/FileSceneRuntime.h"
+
+#include <cassert>
 
 #include "Scene/SceneAssetResolver.h"
 #include "Scene/FileSceneAssetCatalog.h"
@@ -1109,6 +1112,10 @@ std::optional<SceneObjectMetadata> FileSceneRuntime::GetObjectMetadata(
     RenderObjectID runtimeIndex,
     std::string* errorMessage) const
 {
+    // S0.0 diagnostics: every lookup revalidates the whole committed scene.
+    const StreamingTelemetry::Scope lookupTiming(StreamingTelemetry::Metric::ObjectMetadataNs,
+        StreamingTelemetry::Metric::ObjectMetadataCalls);
+
     if(errorMessage)
     {
         errorMessage->clear();
@@ -1139,6 +1146,116 @@ std::optional<SceneObjectMetadata> FileSceneRuntime::GetObjectMetadata(
 
 bool FileSceneRuntime::ValidateObjectMetadataState(std::optional<RenderObjectID> selectedIndex,
     const SceneObjectDocument*& selected, std::string* errorMessage) const
+{
+    // S0.3: inside a matching validation pass the whole-scene result is already known; only the index is resolved.
+    if(m_metadataPass && m_metadataPass->Matches(*this))
+    {
+        return m_metadataPass->Resolve(selectedIndex, selected, errorMessage);
+    }
+
+    return ValidateObjectMetadataStateFully(selectedIndex, selected, errorMessage);
+}
+
+FileSceneRuntime::MetadataValidationPass::Fingerprint FileSceneRuntime::CaptureMetadataFingerprint() const
+{
+    MetadataValidationPass::Fingerprint fingerprint;
+
+    if(m_fileScene.HasDocument())
+    {
+        const auto& document = m_fileScene.GetDocument();
+        fingerprint.document = &document;
+        fingerprint.documentObjects = document.objects.data();
+        fingerprint.documentObjectCount = document.objects.size();
+    }
+
+    fingerprint.sceneStructureRevision = m_scene.GetStructureRevision();
+    fingerprint.renderObjectCount = m_scene.GetRenderObjects().size();
+    fingerprint.mappingStructureRevision = m_objectMapping.structureRevision;
+    fingerprint.committedObjects = m_objectMapping.committedObjects.data();
+    fingerprint.archive = m_archiveScene.get();
+    return fingerprint;
+}
+
+FileSceneRuntime::MetadataValidationPass::MetadataValidationPass(const FileSceneRuntime& runtime)
+    : m_runtime(runtime), m_previous(runtime.m_metadataPass), m_thread(std::this_thread::get_id())
+{
+    // Nested inside an equivalent pass: that pass already holds the validated result.
+    if(m_previous && m_previous->Matches(runtime))
+    {
+        return;
+    }
+
+    m_owner = true;
+    m_fingerprint = runtime.CaptureMetadataFingerprint();
+    m_byIndex.assign(runtime.m_scene.GetRenderObjects().size(), nullptr);
+    const SceneObjectDocument* unused = nullptr;
+    m_valid = runtime.ValidateObjectMetadataStateFully(std::nullopt, unused, &m_error, &m_byIndex);
+    runtime.m_metadataPass = this;
+}
+
+FileSceneRuntime::MetadataValidationPass::~MetadataValidationPass()
+{
+    if(!m_owner)
+    {
+        return;
+    }
+
+#ifndef NDEBUG
+    // A pass must not span a mutation: an unchanged structure must still validate exactly as it did.
+    if(Matches(m_runtime))
+    {
+        const SceneObjectDocument* unused = nullptr;
+        std::string error;
+        assert(m_runtime.ValidateObjectMetadataStateFully(std::nullopt, unused, &error) == m_valid &&
+            "FileSceneRuntime::MetadataValidationPass spanned a scene mutation");
+    }
+#endif
+
+    m_runtime.m_metadataPass = m_previous;
+}
+
+bool FileSceneRuntime::MetadataValidationPass::Matches(const FileSceneRuntime& runtime) const
+{
+    const MetadataValidationPass& active = m_owner || !m_previous ? *this : *m_previous;
+    return &runtime == &active.m_runtime && std::this_thread::get_id() == active.m_thread &&
+        runtime.CaptureMetadataFingerprint() == active.m_fingerprint;
+}
+
+bool FileSceneRuntime::MetadataValidationPass::Resolve(std::optional<RenderObjectID> selectedIndex,
+    const SceneObjectDocument*& selected, std::string* errorMessage) const
+{
+    selected = nullptr;
+
+    if(!m_valid)
+    {
+        if(errorMessage)
+        {
+            *errorMessage = m_error;
+        }
+
+        return false;
+    }
+
+    if(selectedIndex && *selectedIndex >= m_byIndex.size())
+    {
+        if(errorMessage)
+        {
+            *errorMessage = "Selected runtime object index is out of range.";
+        }
+
+        return false;
+    }
+
+    if(selectedIndex)
+    {
+        selected = m_byIndex[*selectedIndex];
+    }
+
+    return true;
+}
+
+bool FileSceneRuntime::ValidateObjectMetadataStateFully(std::optional<RenderObjectID> selectedIndex,
+    const SceneObjectDocument*& selected, std::string* errorMessage, std::vector<const SceneObjectDocument*>* byIndex) const
 {
     selected = nullptr;
 
@@ -1179,9 +1296,13 @@ bool FileSceneRuntime::ValidateObjectMetadataState(std::optional<RenderObjectID>
         return fail("Scene object metadata count does not match the committed mapping.");
     }
 
-    if(!ValidateSceneDocument(document, errorMessage))
     {
-        return false;
+        const StreamingTelemetry::Scope documentTiming(StreamingTelemetry::Metric::SceneDocumentValidationNs);
+
+        if(!ValidateSceneDocument(document, errorMessage))
+        {
+            return false;
+        }
     }
 
     std::vector<bool> visited(objects.size(), false);
@@ -1197,6 +1318,11 @@ bool FileSceneRuntime::ValidateObjectMetadataState(std::optional<RenderObjectID>
 
         const auto index = found->second;
         visited[index] = true;
+
+        if(byIndex)
+        {
+            (*byIndex)[index] = &object;
+        }
 
         if(!MatchesCommittedSceneObjectBindings(object, objects[index], mapping.committedObjects[index]))
         {

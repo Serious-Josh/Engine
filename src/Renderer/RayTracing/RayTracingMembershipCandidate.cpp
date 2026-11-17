@@ -226,6 +226,8 @@ std::optional<RayTracingSceneResources::ReplacementCandidate> RayTracingSceneRes
     // CPU-only preparation: recording and submission happen after this returns,
     // so the pass's source pins never span GPU work.
     const FileSceneAssetCatalog::ValidationPass validationPass(catalog);
+    // S0.3: the per-object lookups below share one whole-scene validation (read-only; see MetadataValidationPass).
+    const FileSceneRuntime::MetadataValidationPass metadataPass(runtime);
 
     // Every early return below is an ordinary failure unless marked as exhaustion.
     if (failure)
@@ -679,8 +681,10 @@ bool RayTracingSceneResources::RecordReplacementCandidate(ID3D12Device5* device,
 bool RayTracingSceneResources::ValidateCandidateBindings(const CandidateState& state, const FileSceneRuntime& runtime,
     FileSceneAssetCatalog& catalog, std::string& error) const
 {
-    // Whole-scene revalidation: shared materials and sources are checked once per call.
+    // Whole-scene revalidation: shared materials and sources are checked once per call, and so is the scene metadata
+    // (S0.3: one validation for the per-object lookups below).
     const FileSceneAssetCatalog::ValidationPass validationPass(catalog);
+    const FileSceneRuntime::MetadataValidationPass metadataPass(runtime);
     const auto& objects = runtime.GetScene().GetRenderObjects();
 
     if (!state.valid || state.scene != &runtime.GetScene() || state.catalog != &catalog ||
@@ -1260,6 +1264,8 @@ ProspectiveJoinStatus RayTracingSceneResources::BuildGeometryJoin(const Candidat
     output.reset();
     try
     {
+        // S0.3: one whole-scene metadata validation for this join's per-object lookups (read-only).
+        const FileSceneRuntime::MetadataValidationPass metadataPass(runtime);
         std::string error;
         const auto& snapshot = candidate ? *candidate->snapshot : *m_membership;
         const auto& blasPointers = candidate ? candidate->blasPointers : m_blasRegistry.bottomLevelPointers;

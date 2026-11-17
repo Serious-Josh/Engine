@@ -14,3 +14,15 @@ inline HDRImageData MakeBlackEnvironmentImage()
     for(size_t i = 3; i < image.pixels.size(); i += 4) image.pixels[i] = 1.0f;
     return image;
 }
+
+// The built-in neutral source (uniform 0.18 grey) every scene without an assigned environment uses.
+inline HDRImageData MakeNeutralEnvironmentImage()
+{
+    HDRImageData image;
+    image.width = 16;
+    image.height = 8;
+    image.channels = 4;
+    image.pixels.resize(16 * 8 * 4, 0.18f);
+    for(size_t i = 3; i < image.pixels.size(); i += 4) image.pixels[i] = 1.0f;
+    return image;
+}

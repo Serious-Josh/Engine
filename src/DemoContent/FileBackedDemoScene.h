@@ -46,12 +46,23 @@ public:
         const Shader* vertexShader, const Shader* pixelShader);
 #endif
 
+    // S0.7B: metadata-first initialization in steps (open, catalog, preparation, commit), one per call, so staging an
+    // inactive candidate can be spread over frames. Begin stores the borrowed renderer objects, which outlive staging.
+    // Advance returns false on failure (the candidate must then be shut down) and sets `done` after the commit. The
+    // candidate is private to its stager until done: nothing else reads or renders it.
+    void BeginStagedInitialization(ID3D12Device* device, ResourceUploader& uploader, DescriptorHeap& descriptorHeap,
+        const Shader* vertexShader, const Shader* pixelShader);
+    bool AdvanceStagedInitialization(bool& done);
+
     void SetProjectAssets(const std::filesystem::path& root, const ProjectAssetRegistry& registry);
     void SetMeshCPUCache(ProjectMeshCPUCache* cache) noexcept { m_meshCPUCache = cache; }
     void SetTextureStreamingEnabled(bool enabled) noexcept { m_textureStreamingEnabled = enabled; }
-    void AdvanceTextureStreaming(ProjectTexturePreparationService& preparation, Renderer& renderer,
+    void AdvanceTextureStreaming(FileSceneAssetCatalog::TextureStreamingPass pass, double expensiveBudget,
+        bool forceExpensive, ProjectTexturePreparationService& preparation, Renderer& renderer,
         const std::function<bool(const AssetID&, const MaterialAssetData&)>& mayPublish);
     bool IsTextureStreamingSettled() const { return m_assets.IsTextureStreamingSettled(); }
+    bool HasFullyStreamedMaterial() const { return m_assets.HasFullyStreamedMaterial(); }
+    bool HasFullyTexturedResidentMesh() const { return m_assets.HasFullyTexturedResidentMesh(GetScene()); }
 
     const std::filesystem::path& GetScenePath() const noexcept
     {
@@ -218,6 +229,28 @@ public:
 private:
     bool InitializeWithPolicy(ID3D12Device* device, ResourceUploader& uploader, DescriptorHeap& descriptorHeap,
         const Shader* vertexShader, const Shader* pixelShader, bool metadataOnly);
+
+    enum class StagingStep
+    {
+        Idle,
+        Open,
+        Assets,
+        Prepare,
+        Commit,
+    };
+
+    struct StagingInputs
+    {
+        ID3D12Device* device = nullptr;
+        ResourceUploader* uploader = nullptr;
+        DescriptorHeap* descriptorHeap = nullptr;
+        const Shader* vertexShader = nullptr;
+        const Shader* pixelShader = nullptr;
+        bool metadataOnly = true;
+    };
+
+    StagingStep m_stagingStep = StagingStep::Idle;
+    StagingInputs m_stagingInputs;
 
     friend class Editor;
     friend class Engine;

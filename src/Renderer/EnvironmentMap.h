@@ -4,6 +4,7 @@
 #include "Renderer/StructuredBuffer.h"
 
 #include <filesystem>
+#include <vector>
 
 struct HDRImageData;
 class ResourceUploader;
@@ -22,7 +23,21 @@ class EnvironmentMap
       float radianceScale = 1.0f);
 
     bool Initialize(ID3D12Device*, const HDRImageData&, ResourceUploader&, DescriptorHeap&, float radianceScale = 1.0f);
+    // S0.5: the resources of a width x height source without uploading anything, in two steps. CreateResourcesForUpload
+    // only creates committed resources (any thread: no memory registry entry, descriptor or log); CreateViewsForUpload then
+    // registers them and creates their shader views on the main thread. The CDF buffers start in COMMON and the source
+    // texture in COPY_DEST; the caller records their copies and the precompute passes.
+    bool CreateResourcesForUpload(ID3D12Device*, unsigned int width, unsigned int height, float totalWeight);
+    bool CreateViewsForUpload(ID3D12Device*, DescriptorHeap&);
     void Shutdown();
+    // Exchanges every resource, descriptor and importance value. Callers own the GPU lifetime of both sides.
+    void Swap(EnvironmentMap& other) noexcept;
+
+    // The importance distribution of an already calibrated image (row-conditional and marginal CDFs); returns the total
+    // weight. Thread-safe: no device or descriptor use.
+    static float BuildImportanceDistribution(const HDRImageData& image, std::vector<float>& conditionalCDF,
+        std::vector<float>& marginalCDF);
+    static unsigned int SourceMipLevels(unsigned int width, unsigned int height);
 
     Texture& GetSourceTexture();
     const Texture& GetSourceTexture() const;
@@ -47,6 +62,11 @@ class EnvironmentMap
     float GetImportanceTotalWeight() const;
 
     private:
+    bool InitializeSourceTexture(ID3D12Device* device, unsigned int width, unsigned int height);
+    bool CreatePrecomputeTargets(ID3D12Device* device, DescriptorHeap& descriptorHeap);
+    bool CreatePrecomputeTargetResources(ID3D12Device* device, bool trackMemory);
+    bool CreatePrecomputeTargetViews(ID3D12Device* device, DescriptorHeap& descriptorHeap);
+
     Texture m_sourceTexture;
     Texture m_cubemap;
     Texture m_diffuseIrradiance;

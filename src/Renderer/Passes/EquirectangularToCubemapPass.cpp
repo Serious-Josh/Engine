@@ -181,6 +181,43 @@ void EquirectangularToCubemapPass::Execute(
     cubemap.Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 }
 
+void EquirectangularToCubemapPass::RecordRows(ID3D12GraphicsCommandList* commandList, Texture& sourceTexture, Texture& cubemap,
+    unsigned int mip, unsigned int face, unsigned int rowBegin, unsigned int rowEnd)
+{
+    const unsigned int size = (std::max)(1u, m_size >> mip);
+
+    if (!commandList || !m_rtvHeap || mip >= m_mipLevels || face >= 6 || rowBegin >= rowEnd || rowEnd > size)
+    {
+        return;
+    }
+
+    const unsigned int subresource = mip + face * m_mipLevels;
+    cubemap.Transition(commandList, D3D12_RESOURCE_STATE_RENDER_TARGET, subresource);
+    commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    m_pipeline.Bind(commandList);
+
+    D3D12_VIEWPORT viewport{};
+    viewport.Width = static_cast<float>(size);
+    viewport.Height = static_cast<float>(size);
+    viewport.MaxDepth = 1.0f;
+    commandList->RSSetViewports(1, &viewport);
+
+    const D3D12_RECT scissor{0, static_cast<LONG>(rowBegin), static_cast<LONG>(size), static_cast<LONG>(rowEnd)};
+    commandList->RSSetScissorRects(1, &scissor);
+
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = m_rtvHeap->GetCPUHandle(m_rtvIndices[mip * 6 + face]);
+    commandList->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+
+    unsigned int constants[4] = {sourceTexture.GetDescriptorIndex(), face, mip, m_mipLevels};
+    commandList->SetGraphicsRoot32BitConstants(0, 4, constants, 0);
+    commandList->DrawInstanced(3, 1, 0, 0);
+
+    if (rowEnd == size)
+    {
+        cubemap.Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, subresource);
+    }
+}
+
 void EquirectangularToCubemapPass::Shutdown()
 {
     if (m_rtvHeap)

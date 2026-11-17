@@ -1,9 +1,12 @@
 #include "UploadBuffer.h"
 #include "Debug/MemoryRegistry.h"
+#include "Core/Log.h"
 #include "DescriptorHeap.h"
 
+#include <algorithm>
 #include <climits>
 #include <cstring>
+#include <string>
 #include <utility>
 
 void UploadBuffer::Swap(UploadBuffer& other) noexcept
@@ -14,6 +17,12 @@ void UploadBuffer::Swap(UploadBuffer& other) noexcept
     std::swap(m_frameOffset, other.m_frameOffset);
     std::swap(m_offset, other.m_offset);
     std::swap(m_frameCount, other.m_frameCount);
+    std::swap(m_device, other.m_device);
+    std::swap(m_overflowPages, other.m_overflowPages);
+    std::swap(m_frameIndex, other.m_frameIndex);
+    std::swap(m_overflowPage, other.m_overflowPage);
+    std::swap(m_overflowOffset, other.m_overflowOffset);
+    std::swap(m_overflowBytesUsed, other.m_overflowBytesUsed);
 }
 
 static std::size_t AlignUp(
@@ -76,11 +85,35 @@ bool UploadBuffer::Initialize(
     m_frameOffset = 0;
     m_offset = 0;
 
+    m_device = device;
+    m_overflowPages.assign(frameCount, {});
+    m_frameIndex = 0;
+    m_overflowPage = 0;
+    m_overflowOffset = 0;
+    m_overflowBytesUsed = 0;
+
     return true;
 }
 
 void UploadBuffer::Shutdown()
 {
+    // Callers shut down only after the GPU finished with every frame slot (as for the ring resource itself).
+    for (auto& pages : m_overflowPages)
+    {
+        for (auto& page : pages)
+        {
+            page.resource->Unmap(0, nullptr);
+            page.resource->Release();
+        }
+    }
+
+    m_overflowPages.clear();
+    m_device = nullptr;
+    m_frameIndex = 0;
+    m_overflowPage = 0;
+    m_overflowOffset = 0;
+    m_overflowBytesUsed = 0;
+
     if (m_resource)
     {
         m_resource->Unmap(0, nullptr);
@@ -106,6 +139,109 @@ void UploadBuffer::Reset(unsigned int frameIndex)
 
     m_frameOffset = m_capacityPerFrame * frameIndex;
     m_offset = m_frameOffset;
+
+    // The slot's overflow pages are reused from the start; their previous contents belong to a completed submission.
+    m_frameIndex = frameIndex;
+    m_overflowPage = 0;
+    m_overflowOffset = 0;
+    m_overflowBytesUsed = 0;
+}
+
+std::size_t UploadBuffer::GetOverflowBytesRetained() const noexcept
+{
+    std::size_t bytes = 0;
+
+    for (const auto& pages : m_overflowPages)
+    {
+        for (const auto& page : pages)
+        {
+            bytes += page.capacity;
+        }
+    }
+
+    return bytes;
+}
+
+D3D12_GPU_VIRTUAL_ADDRESS UploadBuffer::AllocateOverflow(
+    const void* data,
+    std::size_t size,
+    std::size_t alignment)
+{
+    if (!m_device || m_frameIndex >= m_overflowPages.size())
+    {
+        return 0;
+    }
+
+    auto& pages = m_overflowPages[m_frameIndex];
+
+    // Continue in the current page, then in the slot's later retained pages.
+    while (m_overflowPage < pages.size())
+    {
+        OverflowPage& page = pages[m_overflowPage];
+        const std::size_t alignedOffset = AlignUp(m_overflowOffset, alignment);
+
+        if (alignedOffset + size <= page.capacity)
+        {
+            std::memcpy(page.mappedData + alignedOffset, data, size);
+            m_overflowBytesUsed += alignedOffset + size - m_overflowOffset;
+            m_overflowOffset = alignedOffset + size;
+            return page.resource->GetGPUVirtualAddress() + alignedOffset;
+        }
+
+        m_overflowBytesUsed += page.capacity - m_overflowOffset;
+        ++m_overflowPage;
+        m_overflowOffset = 0;
+    }
+
+    // A new page for this slot: at least the ring region's size, so a large scene settles after a page or two.
+    const std::size_t capacity = AlignUp((std::max)(m_capacityPerFrame, size + alignment), 64u * 1024u);
+    std::size_t retained = 0;
+
+    for (const auto& page : pages)
+    {
+        retained += page.capacity;
+    }
+
+    if (retained + capacity > MaxOverflowBytesPerFrame)
+    {
+        return 0;
+    }
+
+    D3D12_HEAP_PROPERTIES heapProperties{};
+    heapProperties.Type = D3D12_HEAP_TYPE_UPLOAD;
+
+    D3D12_RESOURCE_DESC resourceDescription{};
+    resourceDescription.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    resourceDescription.Width = capacity;
+    resourceDescription.Height = 1;
+    resourceDescription.DepthOrArraySize = 1;
+    resourceDescription.MipLevels = 1;
+    resourceDescription.SampleDesc.Count = 1;
+    resourceDescription.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+    OverflowPage page;
+    page.capacity = capacity;
+
+    if (FAILED(m_device->CreateCommittedResource(&heapProperties, D3D12_HEAP_FLAG_NONE, &resourceDescription,
+            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&page.resource))))
+    {
+        return 0;
+    }
+
+    if (FAILED(page.resource->Map(0, nullptr, reinterpret_cast<void**>(&page.mappedData))))
+    {
+        page.resource->Release();
+        return 0;
+    }
+
+    MemoryRegistry::TrackResource(page.resource, MemoryCategory::UploadReadback);
+    pages.push_back(page);
+    Log::Info("Frame upload ring: frame slot " + std::to_string(m_frameIndex) + " grew an overflow page of " +
+        std::to_string(capacity >> 10) + " KiB (" + std::to_string((retained + capacity) >> 10) + " KiB retained).");
+
+    m_overflowPage = pages.size() - 1;
+    m_overflowOffset = 0;
+    return AllocateOverflow(data, size, alignment);
 }
 
 D3D12_GPU_VIRTUAL_ADDRESS UploadBuffer::Allocate(
@@ -131,7 +267,8 @@ D3D12_GPU_VIRTUAL_ADDRESS UploadBuffer::Allocate(
 
     if (alignedOffset + size > frameEnd)
     {
-        return 0;
+        // The ring region is full: continue in this slot's overflow pages (bounded, fence-safe, no waits).
+        return AllocateOverflow(data, size, alignment);
     }
 
     std::memcpy(m_mappedData + alignedOffset, data, size);

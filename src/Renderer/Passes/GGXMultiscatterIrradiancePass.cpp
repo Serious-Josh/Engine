@@ -192,6 +192,40 @@ void GGXMultiscatterIrradiancePass::Execute(
     }
 }
 
+void GGXMultiscatterIrradiancePass::RecordFace(ID3D12GraphicsCommandList* commandList, Texture& sourceTexture,
+    Texture& brdfIntegrationLUT, Texture& irradianceCubemap, unsigned int mip, unsigned int face)
+{
+    if (!commandList || !m_rtvHeap || mip >= m_mipLevels || face >= 6)
+    {
+        return;
+    }
+
+    const unsigned int mipSize = (std::max)(1u, m_size >> mip);
+    commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    m_pipeline.Bind(commandList);
+
+    D3D12_VIEWPORT viewport{};
+    viewport.Width = static_cast<float>(mipSize);
+    viewport.Height = static_cast<float>(mipSize);
+    viewport.MaxDepth = 1.0f;
+    commandList->RSSetViewports(1, &viewport);
+
+    const D3D12_RECT scissor{0, 0, static_cast<LONG>(mipSize), static_cast<LONG>(mipSize)};
+    commandList->RSSetScissorRects(1, &scissor);
+
+    const unsigned int subresource = mip + face * m_mipLevels;
+    irradianceCubemap.Transition(commandList, D3D12_RESOURCE_STATE_RENDER_TARGET, subresource);
+
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = m_rtvHeap->GetCPUHandle(m_rtvIndices[face * m_mipLevels + mip]);
+    commandList->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+
+    unsigned int constants[5] = {sourceTexture.GetDescriptorIndex(), brdfIntegrationLUT.GetDescriptorIndex(), face, mip,
+                                 m_mipLevels};
+    commandList->SetGraphicsRoot32BitConstants(0, 5, constants, 0);
+    commandList->DrawInstanced(3, 1, 0, 0);
+    irradianceCubemap.Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, subresource);
+}
+
 void GGXMultiscatterIrradiancePass::Shutdown()
 {
     if (m_rtvHeap)

@@ -10,20 +10,55 @@
 #include "Core/Log.h"
 namespace
 {
-bool LoadProjectEnvironment(Renderer& renderer,const std::filesystem::path& root,const ProjectAssetRegistry& registry,const std::string& reference,
-    float radianceScale)
+// The registry check runs on the calling thread (a missing or invalid assignment fails at once); the returned source reads,
+// validates and hashes the file on the renderer's preparation worker (S0.5).
+EnvironmentPreparationSource ProjectEnvironmentSource(const std::filesystem::path& root, const ProjectAssetRegistry& registry,
+    const std::string& reference, float radianceScale)
 {
-        const auto id=AssetID::ParseReference(reference);
-        const auto* record=id?registry.Find(*id):nullptr;
-        const auto resolved=id?ProjectAssetResolver::Resolve(ProjectPaths(root),registry,*id):AssetResolution{};
-        if(!record || record->type!=AssetType::Texture || resolved.status!=AssetAvailability::Available)
-            throw std::runtime_error("Required scene HDRI asset is missing or invalid.");
-        // Re-read on explicit assignment/scene replacement. No development file enters a packaged provider.
-        auto image=CookedEnvironment::ReadLoose(resolved.resolvedPath);
-        const auto hash=CookedSurface::Hash(std::as_bytes(std::span(image.pixels)));
-        std::string identity="project:"+std::filesystem::canonical(root).generic_string()+":"+id->ToString()+":"+std::to_string(image.width)+"x"+std::to_string(image.height)+":";
-        constexpr char hex[]="0123456789abcdef"; for(auto b:hash) { auto v=std::to_integer<unsigned>(b); identity+=hex[v>>4]; identity+=hex[v&15]; }
-        return renderer.SetEnvironmentImage(&image,identity,resolved.resolvedPath.stem().string(),reference,radianceScale);
+    const auto id = AssetID::ParseReference(reference);
+    const auto* record = id ? registry.Find(*id) : nullptr;
+    const auto resolved = id ? ProjectAssetResolver::Resolve(ProjectPaths(root), registry, *id) : AssetResolution{};
+
+    if(!record || record->type != AssetType::Texture || resolved.status != AssetAvailability::Available)
+    {
+        throw std::runtime_error("Required scene HDRI asset is missing or invalid.");
+    }
+
+    EnvironmentPreparationSource source;
+    source.displayName = resolved.resolvedPath.stem().string();
+    source.reference = reference;
+    source.radianceScale = radianceScale;
+
+    // Re-read on explicit assignment/scene replacement. No development file enters a packaged provider. The identity
+    // carries the pixel hash, so an unchanged reload is recognized only after the read.
+    source.load = [root, path = resolved.resolvedPath, asset = id->ToString()](std::string& identity)
+    {
+        auto image = CookedEnvironment::ReadLoose(path);
+        const auto hash = CookedSurface::Hash(std::as_bytes(std::span(image.pixels)));
+        identity = "project:" + std::filesystem::canonical(root).generic_string() + ":" + asset + ":" +
+            std::to_string(image.width) + "x" + std::to_string(image.height) + ":";
+        constexpr char hex[] = "0123456789abcdef";
+
+        for(auto byte : hash)
+        {
+            const auto value = std::to_integer<unsigned>(byte);
+            identity += hex[value >> 4];
+            identity += hex[value & 15];
+        }
+
+        return image;
+    };
+
+    return source;
+}
+
+// The synchronous path, kept for scenes that are not file-backed (their HDRI selection is applied at once).
+bool LoadProjectEnvironment(Renderer& renderer, const std::filesystem::path& root, const ProjectAssetRegistry& registry,
+    const std::string& reference, float radianceScale)
+{
+    auto source = ProjectEnvironmentSource(root, registry, reference, radianceScale);
+    auto image = source.load(source.identity);
+    return renderer.SetEnvironmentImage(&image, source.identity, source.displayName, reference, radianceScale);
 }
 }
 // The active scene's HDRI calibration (scene environment luminance scale times its render pre-scale).
@@ -40,29 +75,115 @@ void Engine::RefreshSceneEnvironmentCalibration()
     std::string error;
     if(!ApplySceneEnvironment(error)) Log::Error("Scene environment calibration failed: "+error);
 }
-bool Engine::ApplySceneEnvironment(std::string& error)
+// S0.5: requests the active scene's environment from the renderer, which keeps rendering the published one until the
+// request is prepared on the GPU. False reports only failures known before preparation (a missing or invalid assignment);
+// a load or preparation failure is reported by PollSceneEnvironment. An activation request keeps its activation
+// semantics (exposure snap on publication, closing the window on failure) when a calibration edit supersedes it.
+bool Engine::ApplySceneEnvironment(std::string& error, bool activation)
 {
     try
     {
-        auto* scene=dynamic_cast<FileBackedDemoScene*>(m_demoSceneManager.TryGetActiveScene());
-        if(!scene) return true;
-        const float scale=ActiveEnvironmentRadianceScale();
-        m_appliedEnvironmentRadianceScale=scale;
-        const auto& reference=scene->GetScene().GetEnvironmentReference();
-        if(reference == SceneDocument::NoneEnvironmentReference)
-            return m_renderer.SetEnvironmentImage(nullptr,reference,"None",reference,scale);
-        if(scene->IsArchiveActivation())
+        auto* scene = dynamic_cast<FileBackedDemoScene*>(m_demoSceneManager.TryGetActiveScene());
+
+        if(!scene)
         {
-            const auto source=scene->ArchiveSource(); const auto identity=CookedEnvironment::ArchiveIdentity(*source);
-            if(Renderer::CalibratedEnvironmentIdentity(identity,scale)==m_renderer.GetEnvironmentIdentity()) return true;
-            auto image=CookedEnvironment::ReadArchive(*source);
-            return m_renderer.SetEnvironmentImage(image?&*image:nullptr,identity,image?"Packaged HDRI":"Neutral",reference,scale);
+            return true;
         }
-        if(reference.empty()) return m_renderer.SetEnvironmentImage(nullptr,"neutral","Neutral",{},scale);
-        return LoadProjectEnvironment(m_renderer,scene->GetProjectRoot(),m_projectAssetRegistry,reference,scale);
+
+        const float scale = ActiveEnvironmentRadianceScale();
+        m_appliedEnvironmentRadianceScale = scale;
+        const auto& reference = scene->GetScene().GetEnvironmentReference();
+        EnvironmentPreparationSource source;
+
+        if(reference == SceneDocument::NoneEnvironmentReference)
+        {
+            source = Renderer::NoneEnvironmentSource(scale);
+        }
+        else if(scene->IsArchiveActivation())
+        {
+            const auto archive = scene->ArchiveSource();
+            const auto identity = CookedEnvironment::ArchiveIdentity(*archive);
+
+            if(identity == "neutral")
+            {
+                source = Renderer::NeutralEnvironmentSource(scale);
+            }
+            else
+            {
+                source.identity = identity;
+                source.displayName = "Packaged HDRI";
+                source.reference = reference;
+                source.radianceScale = scale;
+
+                // The archive reader serializes its payload reads; the scene snapshot is immutable and shared.
+                source.load = [archive](std::string&)
+                {
+                    auto image = CookedEnvironment::ReadArchive(*archive);
+
+                    if(!image)
+                    {
+                        throw std::runtime_error("Missing packaged scene environment.");
+                    }
+
+                    return std::move(*image);
+                };
+            }
+        }
+        else if(reference.empty())
+        {
+            source = Renderer::NeutralEnvironmentSource(scale);
+        }
+        else
+        {
+            source = ProjectEnvironmentSource(scene->GetProjectRoot(), m_projectAssetRegistry, reference, scale);
+        }
+
+        m_sceneEnvironmentActivation = activation || (m_sceneEnvironmentTicket != 0 && m_sceneEnvironmentActivation);
+        source.snapExposure = m_sceneEnvironmentActivation;
+        m_sceneEnvironmentTicket = m_renderer.RequestEnvironment(std::move(source));
+        return true;
     }
-    catch(const std::exception& e) { error=e.what(); return false; }
+    catch(const std::exception& exception)
+    {
+        error = exception.what();
+        return false;
+    }
 }
+
+// Once per frame: observes the scene environment request until it resolves. A published activation request already
+// snapped exposure in its publishing frame (EnvironmentPreparationSource::snapExposure).
+void Engine::PollSceneEnvironment()
+{
+    if(!m_sceneEnvironmentTicket)
+    {
+        return;
+    }
+
+    std::string error;
+    const auto state = m_renderer.QueryEnvironmentPreparation(m_sceneEnvironmentTicket, &error);
+
+    if(state == Renderer::EnvironmentPreparationState::Pending)
+    {
+        return;
+    }
+
+    const bool activation = std::exchange(m_sceneEnvironmentActivation, false);
+    m_sceneEnvironmentTicket = 0;
+
+    if(state != Renderer::EnvironmentPreparationState::Failed)
+    {
+        return;
+    }
+
+    // As before S0.5, a scene whose required environment cannot be restored closes the window.
+    Log::Error(std::string(activation ? "Scene environment restore failed: " : "Scene environment update failed: ") + error);
+
+    if(activation)
+    {
+        m_window.Close();
+    }
+}
+
 bool Engine::AssignSceneEnvironment(size_t index,std::string& error)
 {
     auto* scene=dynamic_cast<FileBackedDemoScene*>(m_demoSceneManager.TryGetActiveScene());

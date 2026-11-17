@@ -75,6 +75,7 @@ void FileSceneAssetCatalog::QueueMaterialTextures(const MaterialCacheKey& key, c
             }
 
             found = m_streamingTextures.try_emplace(textureKey).first;
+            found->second.sequence = ++m_streamingSequence;
         }
         else
         {
@@ -228,8 +229,11 @@ FileSceneAssetCatalog::TextureSource FileSceneAssetCatalog::ValidateStreamingSou
 
 void FileSceneAssetCatalog::AdvanceTextureStreaming(ProjectTexturePreparationService& preparation, Renderer& renderer,
     std::uint64_t runtimeIdentity, const Scene& scene,
-    const std::function<bool(const AssetID&, const MaterialAssetData&)>& mayPublish)
+    const std::function<bool(const AssetID&, const MaterialAssetData&)>& mayPublish, TextureStreamingPass pass,
+    double expensiveBudget, bool forceExpensive)
 {
+    m_streamingExpensiveAdvanced = false;
+
     if(!m_textureStreamingEnabled || !m_initialized || !m_registry || !runtimeIdentity ||
         renderer.GetMaterialTableIdentity() == 0 || m_streamingTextures.empty())
     {
@@ -253,36 +257,62 @@ void FileSceneAssetCatalog::AdvanceTextureStreaming(ProjectTexturePreparationSer
     m_texturePreparation = &preparation;
     m_textureRenderer = &renderer;
 
-    // Permit one expensive transition per update. Skip settled/cooldown jobs and
-    // cheap incomplete polls so the final pending asset is still serviced each frame.
-    for(size_t visited = 0; visited < m_streamingTextures.size(); ++visited)
-    {
-        auto selected = m_streamingTextures.begin();
-        std::advance(selected, m_streamingCursor++ % m_streamingTextures.size());
-        auto& texture = selected->second;
-        const auto phase = texture.phase;
+    // S0.8A: every texture advances at most one phase per update. The cheap pass advances every texture's cheap phase
+    // (request issue, completion poll, upload state), so the workers never wait on issue or collection. The expensive
+    // pass (upload queueing and material publication) runs in priority order, so a material's textures complete
+    // together, and stops at its budget; the Engine gives it the frame's remaining streaming time and forces a step when
+    // it has been starved, so every texture is serviced in turn.
+    using Phase = StreamingTexture::Phase;
+    std::vector<std::pair<const TextureCacheKey*, StreamingTexture*>> order;
+    order.reserve(m_streamingTextures.size());
 
-        if(phase == StreamingTexture::Phase::Resident || phase == StreamingTexture::Phase::Failed ||
-            Clock::now() < texture.retryAfter)
+    for(auto& [key, texture] : m_streamingTextures)
+    {
+        order.emplace_back(&key, &texture);
+    }
+
+    std::sort(order.begin(), order.end(), [](const auto& left, const auto& right)
+    {
+        return left.second->sequence < right.second->sequence;
+    });
+
+    const auto started = Clock::now();
+    bool expensiveAdvanced = false;
+
+    for(auto& [key, texture] : order)
+    {
+        const auto phase = texture->phase;
+
+        if(phase == Phase::Resident || phase == Phase::Failed || Clock::now() < texture->retryAfter)
         {
             continue;
         }
 
-        const auto deferred = m_streamingStatistics.deferred;
+        const bool expensive = phase == Phase::CPUReady || phase == Phase::Ready;
+
+        if(pass != TextureStreamingPass::All && expensive != (pass == TextureStreamingPass::Expensive))
+        {
+            continue;
+        }
+
+        const double spent = std::chrono::duration<double, std::milli>(Clock::now() - started).count();
+
+        if(expensive && spent >= expensiveBudget && !(forceExpensive && !expensiveAdvanced))
+        {
+            continue;
+        }
 
         try
         {
-            AdvanceStreamingTexture(selected->first, texture, scene, mayPublish);
+            AdvanceStreamingTexture(*key, *texture, scene, mayPublish);
         }
         catch(const std::exception& error)
         {
-            FailStreamingTexture(texture, error.what());
+            FailStreamingTexture(*texture, error.what());
         }
 
-        if(texture.phase != phase || m_streamingStatistics.deferred != deferred)
-        {
-            break;
-        }
+        expensiveAdvanced = expensiveAdvanced || (expensive && texture->phase != phase);
+        m_streamingExpensiveAdvanced = expensiveAdvanced;
     }
 
     ReportTextureStreaming();
@@ -338,7 +368,10 @@ void FileSceneAssetCatalog::AdvanceStreamingTexture(const TextureCacheKey& key, 
         {
             if(error.starts_with("Deferred:"))
             {
-                defer();
+                // S0.8A: request capacity frees as completions are collected (every update): retry next update rather
+                // than after the general deferral interval.
+                ++m_streamingStatistics.deferred;
+                texture.retryAfter = Clock::now() + std::chrono::milliseconds(1);
                 return;
             }
 
@@ -365,8 +398,11 @@ void FileSceneAssetCatalog::AdvanceStreamingTexture(const TextureCacheKey& key, 
         {
             if(completion->error.starts_with("Deferred:"))
             {
+                // S0.8A: the workers' memory budget frees within frames as uploads take their copies (several decode in
+                // parallel now), so retry after a short interval rather than the general deferral interval.
                 ResetStreamingTexture(texture);
-                defer();
+                ++m_streamingStatistics.deferred;
+                texture.retryAfter = Clock::now() + std::chrono::milliseconds(30);
                 return;
             }
 
@@ -385,7 +421,7 @@ void FileSceneAssetCatalog::AdvanceStreamingTexture(const TextureCacheKey& key, 
     {
         ValidateStreamingSource(key, texture);
 
-        if(!m_textureRenderer->QueuePreparedTextureUpload(*texture.completion->prepared, texture.gpuTicket, error))
+        if(!m_textureRenderer->QueuePreparedTextureUpload(texture.completion->prepared, texture.gpuTicket, error))
         {
             if(error.starts_with("Deferred:"))
             {
@@ -397,8 +433,8 @@ void FileSceneAssetCatalog::AdvanceStreamingTexture(const TextureCacheKey& key, 
             return;
         }
 
-        // QueuePreparedTextureUpload owns a copy. Keep identity/revocation but release
-        // the service's pixel lease; do not accumulate two full CPU copies per job.
+        // S0.8A: the upload shares the service's immutable pixels (no copy) and releases them once its staging is written.
+        // Keep identity/revocation here but drop this reference.
         texture.completion->prepared.reset();
         texture.phase = Phase::Uploading;
         return;
@@ -593,6 +629,86 @@ bool FileSceneAssetCatalog::IsTextureStreamingSettled() const
         const auto phase = entry.second.phase;
         return phase == Phase::Resident || phase == Phase::Failed || phase == Phase::Superseded;
     });
+}
+
+bool FileSceneAssetCatalog::HasFullyStreamedMaterial() const
+{
+    std::map<MaterialCacheKey, bool> complete;
+
+    for(const auto& [key, texture] : m_streamingTextures)
+    {
+        for(const auto& binding : texture.bindings)
+        {
+            auto [entry, inserted] = complete.emplace(binding.material, true);
+            entry->second = entry->second && texture.phase == StreamingTexture::Phase::Resident;
+        }
+    }
+
+    return std::any_of(complete.begin(), complete.end(), [](const auto& entry) { return entry.second; });
+}
+
+bool FileSceneAssetCatalog::HasFullyTexturedResidentMesh(const Scene& scene) const
+{
+    // Per material key: true while every streamed texture is resident.
+    std::map<MaterialCacheKey, bool> complete;
+
+    for(const auto& [key, texture] : m_streamingTextures)
+    {
+        for(const auto& binding : texture.bindings)
+        {
+            auto [entry, inserted] = complete.emplace(binding.material, true);
+            entry->second = entry->second && texture.phase == StreamingTexture::Phase::Resident;
+        }
+    }
+
+    // The catalog's materials are the ones render objects point to.
+    std::map<const Material*, bool> streamed;
+
+    for(const auto& [key, state] : complete)
+    {
+        const auto found = m_projectMaterials.find(key);
+
+        if(found != m_projectMaterials.end())
+        {
+            streamed.emplace(&found->second, state);
+        }
+    }
+
+    for(const auto& object : scene.GetRenderObjects())
+    {
+        if(!object.mesh)
+        {
+            continue;
+        }
+
+        bool anyStreamed = false;
+        bool allResident = true;
+
+        for(const auto& slot : object.mesh->GetMetadata().materialSlots)
+        {
+            const auto found = streamed.find(object.GetSlotMaterial(slot.id));
+
+            if(found != streamed.end())
+            {
+                anyStreamed = true;
+                allResident = allResident && found->second;
+            }
+        }
+
+        if(object.mesh->GetMetadata().materialSlots.empty())
+        {
+            const auto found = streamed.find(object.material);
+            anyStreamed = found != streamed.end();
+            allResident = anyStreamed && found->second;
+        }
+
+        if(anyStreamed && allResident)
+        {
+            return true;
+        }
+    }
+
+    return false;
 }
 
 void FileSceneAssetCatalog::ReportTextureStreaming()

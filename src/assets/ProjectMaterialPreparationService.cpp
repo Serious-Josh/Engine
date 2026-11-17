@@ -1,4 +1,5 @@
 #include "assets/ProjectMaterialPreparationService.h"
+#include "Debug/StreamingTelemetry.h"
 #include "assets/MaterialAssetSerializer.h"
 #include "Renderer/Preview/MaterialThumbnailValidation.h"
 #include <Windows.h>
@@ -106,6 +107,7 @@ struct ProjectMaterialPreparationService::State
 {
     struct Job
     {
+        StreamingTelemetry::Clock::time_point queuedAt{}; // S0.0 diagnostics.
         std::shared_ptr<Candidate> candidate;
         std::shared_ptr<MaterialSourceLease> source;
         std::array<std::uint64_t, 7> tickets{};
@@ -137,10 +139,14 @@ struct ProjectMaterialPreparationService::State
                 wake.wait(lock, [&] { return stopping || !queue.empty(); });
                 if(stopping) return;
                 job = queue.front(); queue.pop_front();
+                StreamingTelemetry::RecordJobStart(job->queuedAt, StreamingTelemetry::Metric::MaterialJobQueueNs,
+                    StreamingTelemetry::Gauge::MaterialQueueDepth, queue.size() + 1);
 #ifdef ENGINE_TEXTURE_PREPARATION_TESTS
                 pinned = pinnedHook;
 #endif
             }
+            const StreamingTelemetry::Scope workTiming(StreamingTelemetry::Metric::MaterialJobWorkNs,
+                StreamingTelemetry::Metric::MaterialJobs);
             std::string error;
             if(!job->canceled)
             {
@@ -199,6 +205,7 @@ ProjectMaterialPreparationService::Status ProjectMaterialPreparationService::Req
             std::lock_guard lock(state.mutex);
             // Canceled jobs are removed before enqueueing; one active worker may remain.
             std::erase_if(state.queue, [](const auto& queued) { return queued->canceled.load(); });
+            job->queuedAt = StreamingTelemetry::QueueStamp();
             state.queue.push_back(job);
         }
         catch(...) { state.jobs.erase(proposed); throw; }
@@ -223,7 +230,7 @@ ProjectMaterialPreparationService::Status ProjectMaterialPreparationService::Req
         auto& candidate=*job->candidate; candidate.assetID=id.ToString(); candidate.session=session; candidate.contentGeneration=entry->generation;
         candidate.digest=CookedSurface::Identity(*archive,id); candidate.archive=std::move(archive);
         const auto proposed=state.nextTicket++; state.jobs.emplace(proposed,job);
-        try { std::lock_guard lock(state.mutex); std::erase_if(state.queue,[](const auto& j){return j->canceled.load();}); state.queue.push_back(job); }
+        try { std::lock_guard lock(state.mutex); std::erase_if(state.queue,[](const auto& j){return j->canceled.load();}); job->queuedAt = StreamingTelemetry::QueueStamp(); state.queue.push_back(job); }
         catch(...) { state.jobs.erase(proposed); throw; }
         ticket=proposed; state.wake.notify_one(); return Status::Pending;
     }

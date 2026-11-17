@@ -353,7 +353,13 @@ bool ValidatePreparedProjectTexture(const PreparedProjectTexture& prepared)
     return Validate(prepared);
 }
 
-PreparedTextureUpload::PreparedTextureUpload(const PreparedProjectTexture& prepared) : m_prepared(prepared)
+PreparedTextureUpload::PreparedTextureUpload(const PreparedProjectTexture& prepared)
+    : m_prepared(std::make_shared<const PreparedProjectTexture>(prepared))
+{
+}
+
+PreparedTextureUpload::PreparedTextureUpload(std::shared_ptr<const PreparedProjectTexture> prepared)
+    : m_prepared(std::move(prepared))
 {
 }
 
@@ -375,7 +381,7 @@ PreparedTextureUpload::RecordResult PreparedTextureUpload::Record(ID3D12Device* 
 
     error.clear();
 
-    if(m_state != State::Queued || m_cancelled || !device || !commands || generation == 0 || !Validate(m_prepared))
+    if(m_state != State::Queued || m_cancelled || !device || !commands || generation == 0 || !m_prepared || !Validate(*m_prepared))
     {
         error = "Invalid prepared texture upload or recording context.";
 
@@ -389,7 +395,7 @@ PreparedTextureUpload::RecordResult PreparedTextureUpload::Record(ID3D12Device* 
 
     try
     {
-        const auto count = static_cast<unsigned int>(m_prepared.subresources.size());
+        const auto count = static_cast<unsigned int>(m_prepared->subresources.size());
         if(heap.GetAvailableCount() == 0)
         {
             error = "Deferred: texture descriptor capacity unavailable.";
@@ -397,12 +403,12 @@ PreparedTextureUpload::RecordResult PreparedTextureUpload::Record(ID3D12Device* 
         }
         D3D12_RESOURCE_DESC description{};
         description.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-        description.Width = m_prepared.width;
-        description.Height = m_prepared.height;
+        description.Width = m_prepared->width;
+        description.Height = m_prepared->height;
         description.DepthOrArraySize = 1;
 
         description.MipLevels = static_cast<UINT16>(count);
-        description.Format = m_prepared.resourceFormat;
+        description.Format = m_prepared->resourceFormat;
         description.SampleDesc.Count = 1;
         std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> footprints(count);
         std::vector<UINT> rows(count);
@@ -428,7 +434,7 @@ PreparedTextureUpload::RecordResult PreparedTextureUpload::Record(ID3D12Device* 
 
         for(unsigned int index = 0; index < count; ++index)
         {
-            const auto& mip = m_prepared.subresources[index];
+            const auto& mip = m_prepared->subresources[index];
 
             if(rows[index] == 0 || rowBytes[index] == 0 || rowBytes[index] > mip.rowPitch ||
                static_cast<UINT64>(rows[index] - 1) * mip.rowPitch + rowBytes[index] > mip.slicePitch ||
@@ -469,21 +475,21 @@ PreparedTextureUpload::RecordResult PreparedTextureUpload::Record(ID3D12Device* 
 
         for(unsigned int index = 0; index < count; ++index)
         {
-            const auto& mip = m_prepared.subresources[index];
+            const auto& mip = m_prepared->subresources[index];
 
             for(UINT row = 0; row < rows[index]; ++row)
             {
                 std::memcpy(static_cast<unsigned char*>(mapped) + footprints[index].Offset +
                     static_cast<size_t>(row) * footprints[index].Footprint.RowPitch,
-                    m_prepared.pixels.data() + mip.offset + static_cast<size_t>(row) * mip.rowPitch,
+                    m_prepared->pixels.data() + mip.offset + static_cast<size_t>(row) * mip.rowPitch,
                     static_cast<size_t>(rowBytes[index]));
             }
         }
 
         m_staging->Unmap(0, nullptr);
 
-        if(!m_texture.InitializeMipmapped(device, m_prepared.width, m_prepared.height, count, m_prepared.resourceFormat) ||
-           !m_texture.CreateSRV(device, heap, m_prepared.srvFormat))
+        if(!m_texture.InitializeMipmapped(device, m_prepared->width, m_prepared->height, count, m_prepared->resourceFormat) ||
+           !m_texture.CreateSRV(device, heap, m_prepared->srvFormat))
         {
             throw std::runtime_error("Cannot allocate unpublished texture or its SRV.");
         }
@@ -546,7 +552,7 @@ void PreparedTextureUpload::ConfirmSubmission(std::uint64_t generation, std::uin
 
         m_fence = fence;
         m_state = State::Submitted;
-        m_prepared = {}; // GPU now reads staging, not these original CPU bytes.
+        m_prepared.reset(); // GPU now reads staging, not these original CPU bytes.
     }
 }
 
@@ -607,7 +613,7 @@ void PreparedTextureUpload::ClearAfterGPUDrain()
     m_dependency.reset();
     m_staging.Reset();
     m_stagingBytes = 0;
-    m_prepared = {};
+    m_prepared.reset();
     m_state = State::Cancelled;
 }
 

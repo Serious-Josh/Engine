@@ -794,6 +794,21 @@ bool FileSceneAssetCatalog::Initialize(
 
 void FileSceneAssetCatalog::Shutdown()
 {
+    // S0.8B: copies not yet recorded must not outlive their destinations. Recorded ones were drained with the scene's
+    // resources (Renderer::ReleaseSceneResources) before any catalog shutdown that follows activation.
+    if(m_geometryRenderer)
+    {
+        for(const auto& [key, asset] : m_projectMeshes)
+        {
+            if(asset->uploadTicket)
+            {
+                m_geometryRenderer->CancelGeometryUpload(asset->uploadTicket);
+            }
+        }
+
+        m_geometryRenderer = nullptr;
+    }
+
     m_staticSourceSelection.reset();
     m_staticSourceDiagnostic = {};
     // m_admittedSources is intentionally not cleared: external historical
@@ -1768,7 +1783,8 @@ FileSceneAssetCatalog::StaticSourceAdmissionStatus FileSceneAssetCatalog::Config
 }
 
 Mesh* FileSceneAssetCatalog::CreateProjectMesh(const ProjectMeshCPUCache::Key& key,
-    std::shared_ptr<const ImportedMesh> prepared, std::shared_ptr<const CookedMeshResidencyEvidence> cooked)
+    std::shared_ptr<const ImportedMesh> prepared, std::shared_ptr<const CookedMeshResidencyEvidence> cooked,
+    Renderer* deferredUploads)
 {
     const MemoryCategoryScope memoryScope(MemoryCategory::MeshesTextures);
 
@@ -1892,6 +1908,29 @@ Mesh* FileSceneAssetCatalog::CreateProjectMesh(const ProjectMeshCPUCache::Key& k
             asset->mesh.Shutdown();
         }
 
+        // S0.8B: an ordinary mesh's copies are deferred to the Renderer when it has room; the buffers, views and tracked
+        // states are created exactly as by the synchronous upload.
+        const size_t bytes = geometry.vertices.size() * m_vertexLayout.GetStride() + geometry.indices.size() * sizeof(unsigned int);
+
+        if(deferredUploads && deferredUploads->CanQueueGeometryUploads(bytes))
+        {
+            DeferredBufferUploadBatch batch;
+            m_uploader->SetDeferredBufferBatch(&batch);
+            const bool initialized = asset->mesh.Initialize(m_device, *m_uploader, *m_descriptorHeap,
+                geometry.vertices.data(), geometry.vertices.size(), m_vertexLayout,
+                geometry.indices.data(), geometry.indices.size());
+            m_uploader->SetDeferredBufferBatch(nullptr);
+
+            if(!initialized)
+            {
+                return false; // Nothing was queued; the staging buffers are released with the batch.
+            }
+
+            asset->uploadTicket = deferredUploads->QueueGeometryUploads(std::move(batch));
+            m_geometryRenderer = deferredUploads;
+            return asset->uploadTicket != 0;
+        }
+
         return asset->mesh.Initialize(m_device, *m_uploader, *m_descriptorHeap,
             geometry.vertices.data(), geometry.vertices.size(), m_vertexLayout,
             geometry.indices.data(), geometry.indices.size());
@@ -1918,12 +1957,46 @@ Mesh* FileSceneAssetCatalog::CreateProjectMesh(const ProjectMeshCPUCache::Key& k
     }
 
     const auto inserted = m_projectMeshes.emplace(key, std::move(asset));
-    inserted.first->second->published = true;
+    inserted.first->second->published = inserted.first->second->uploadTicket == 0;
     return &inserted.first->second->mesh;
 }
 
+void FileSceneAssetCatalog::PollMeshUploads(Renderer& renderer)
+{
+    for(auto& [key, asset] : m_projectMeshes)
+    {
+        if(asset->published || !asset->uploadTicket)
+        {
+            continue;
+        }
+
+        // Submitted: every later recording on the frame queue (BLAS builds, draws) follows the copies.
+        if(renderer.TakeGeometryUploadState(asset->uploadTicket) == Renderer::GeometryUploadState::Submitted)
+        {
+            asset->uploadTicket = 0;
+            asset->published = true;
+        }
+    }
+}
+
+bool FileSceneAssetCatalog::IsMeshUploadPending(std::string_view reference) const
+{
+    const auto id = AssetID::ParseReference(reference);
+
+    if(!id)
+    {
+        return false;
+    }
+
+    const auto text = id->ToString();
+    return std::any_of(m_projectMeshes.begin(), m_projectMeshes.end(), [&](const auto& entry)
+    {
+        return std::get<1>(entry.first) == text && !entry.second->published && entry.second->uploadTicket != 0;
+    });
+}
+
 Mesh* FileSceneAssetCatalog::ResolvePreparedMesh(std::string_view reference,
-    const ProjectMeshPreparationService::Completion& completion, std::string* errorMessage)
+    const ProjectMeshPreparationService::Completion& completion, std::string* errorMessage, Renderer* deferredUploads)
 {
     m_meshError.clear();
     const auto fail = [&](const std::string& message) -> Mesh*
@@ -2009,7 +2082,7 @@ Mesh* FileSceneAssetCatalog::ResolvePreparedMesh(std::string_view reference,
             return fail("Prepared mesh geometry/metadata is invalid: " + metadataError);
         }
 
-        Mesh* mesh = CreateProjectMesh(key, completion.geometry);
+        Mesh* mesh = CreateProjectMesh(key, completion.geometry, {}, deferredUploads);
 
         if (!mesh)
         {

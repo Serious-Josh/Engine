@@ -22,6 +22,10 @@ class DiffuseIrradiancePass
         ID3D12GraphicsCommandList* commandList,
         Texture& sourceTexture,
         Texture& irradianceCubemap);
+    // S0.5: rows [rowBegin, rowEnd) of one face, as Execute draws them (see EquirectangularToCubemapPass::RecordRows).
+    void RecordRows(ID3D12GraphicsCommandList* commandList, Texture& sourceTexture, Texture& irradianceCubemap,
+        unsigned int face, unsigned int rowBegin, unsigned int rowEnd);
+    unsigned int GetSize() const { return m_size; }
     void Shutdown();
 
     private:

@@ -441,6 +441,96 @@ bool DemoSceneManager::StageRequestedFileScene(
     return true;
 }
 
+bool DemoSceneManager::AdvanceRequestedFileSceneStaging(
+    ID3D12Device* device,
+    ResourceUploader& uploader,
+    DescriptorHeap& descriptorHeap,
+    const Shader* vertexShader,
+    const Shader* pixelShader,
+    bool& staged,
+    std::string* errorMessage)
+{
+    staged = false;
+
+    if (!HasPendingFileSceneRequest() || m_hasPendingSceneChange || m_stagedFileScene)
+    {
+        return FailFileRequest(errorMessage, "An unstaged file scene request is required.");
+    }
+
+#ifdef _DEBUG
+    if (!m_requestedMetadataOnly)
+    {
+        const bool succeeded = StageRequestedFileScene(device, uploader, descriptorHeap, vertexShader, pixelShader, errorMessage);
+        staged = succeeded;
+        return succeeded;
+    }
+#endif
+
+    try
+    {
+        if (!m_stagingFileScene)
+        {
+            if (m_requestedArchive)
+            {
+                m_stagingFileScene = std::make_unique<FileBackedDemoScene>(m_requestedArchive);
+            }
+            else if (m_requestedUnsavedDocument)
+            {
+                m_stagingFileScene = std::make_unique<FileBackedDemoScene>(*m_requestedUnsavedDocument);
+            }
+            else
+            {
+                m_stagingFileScene = std::make_unique<FileBackedDemoScene>(m_requestedFilePath);
+            }
+
+            ConfigureProjectAssets(*m_stagingFileScene);
+            m_stagingFileScene->BeginStagedInitialization(device, uploader, descriptorHeap, vertexShader, pixelShader);
+        }
+
+        bool done = false;
+
+        if (!m_stagingFileScene->AdvanceStagedInitialization(done))
+        {
+            m_stagingFileScene->Shutdown();
+            m_stagingFileScene.reset();
+            return FailFileRequest(errorMessage, "Failed to initialize file scene candidate: " +
+                ProjectPathText(m_requestedFilePath) + ". See initialization diagnostics.");
+        }
+
+        if (!done)
+        {
+            if (errorMessage)
+            {
+                errorMessage->clear();
+            }
+
+            return true;
+        }
+
+        m_stagingFileScene->SetAspectRatio(m_aspectRatio);
+        m_stagedFileName = m_stagingFileScene->GetDisplayName();
+        m_stagedFileScene = std::move(m_stagingFileScene);
+        staged = true;
+    }
+    catch (const std::exception& exception)
+    {
+        if (m_stagingFileScene)
+        {
+            m_stagingFileScene->Shutdown();
+            m_stagingFileScene.reset();
+        }
+
+        return FailFileRequest(errorMessage, exception.what());
+    }
+
+    if (errorMessage)
+    {
+        errorMessage->clear();
+    }
+
+    return true;
+}
+
 IDemoScene* DemoSceneManager::GetStagedFileScene() noexcept
 {
     return m_stagedFileScene.get();
@@ -496,6 +586,12 @@ void DemoSceneManager::CancelFileSceneRequest()
     {
         m_stagedFileScene->Shutdown();
         m_stagedFileScene.reset();
+    }
+
+    if (m_stagingFileScene)
+    {
+        m_stagingFileScene->Shutdown();
+        m_stagingFileScene.reset();
     }
 
     m_stagedFileName.clear();

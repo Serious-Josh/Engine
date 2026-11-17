@@ -105,13 +105,32 @@ public:
     void SetTextureStreamingEnabled(bool enabled) noexcept { m_textureStreamingEnabled = enabled; }
     void BeginTextureStreaming();
     // Active scene only, on the Engine thread before command recording.
+    // S0.8A: an update runs either the cheap phases (request issue, completion poll, upload state) for every texture, or
+    // the expensive ones (upload queueing and material publication) in priority order within `expensiveBudget`
+    // milliseconds; with a zero budget none run unless `forceExpensive` permits one. All runs both, as one complete update
+    // (direct callers and diagnostics).
+    enum class TextureStreamingPass
+    {
+        Cheap,
+        Expensive,
+        All,
+    };
     void AdvanceTextureStreaming(ProjectTexturePreparationService& preparation, Renderer& renderer,
         std::uint64_t runtimeIdentity, const Scene& scene,
-        const std::function<bool(const AssetID&, const MaterialAssetData&)>& mayPublish);
+        const std::function<bool(const AssetID&, const MaterialAssetData&)>& mayPublish,
+        TextureStreamingPass pass = TextureStreamingPass::All, double expensiveBudget = 2.0, bool forceExpensive = true);
+    // The last expensive pass advanced a texture.
+    bool TextureStreamingExpensiveAdvanced() const noexcept { return m_streamingExpensiveAdvanced; }
     void CancelTextureStreaming();
     // Every streamed texture is resident, failed or superseded, so no further material
     // publication is coming (the condition the settled-residency report uses).
     bool IsTextureStreamingSettled() const;
+    // S0.5 diagnostics: some material that streams textures has all of them resident (observational; the material is not
+    // matched to a resident mesh).
+    bool HasFullyStreamedMaterial() const;
+    // S0.8A diagnostics: some resident mesh object in `scene` is drawn only with materials whose streamed textures are all
+    // resident, and at least one of its materials streams a texture (the material is matched to the object).
+    bool HasFullyTexturedResidentMesh(const Scene& scene) const;
     const std::string& GetLastMaterialError() const noexcept
     {
         return m_materialError;
@@ -143,8 +162,14 @@ public:
         std::string* errorMessage);
     // Main-thread only, outside renderer recording. Revalidates source then
     // synchronously uploads immutable worker buffers; never imports FBX.
+    // S0.8B: with `deferredUploads`, the geometry's GPU copies are queued with the Renderer instead of uploaded
+    // synchronously; the mesh stays unpublished (FindRetainedMesh and residency candidates ignore it) until
+    // PollMeshUploads observes their submission. Without it, or when the Renderer's queue is full, as before.
     Mesh* ResolvePreparedMesh(std::string_view reference,
-        const ProjectMeshPreparationService::Completion& completion, std::string* errorMessage);
+        const ProjectMeshPreparationService::Completion& completion, std::string* errorMessage,
+        Renderer* deferredUploads = nullptr);
+    void PollMeshUploads(Renderer& renderer);
+    bool IsMeshUploadPending(std::string_view reference) const;
     struct CookedPreparationResult
     {
         ProjectMeshPreparationService::Status status = ProjectMeshPreparationService::Status::Invalid;
@@ -292,13 +317,14 @@ private:
 #if defined(ENGINE_HAS_VERIFICATION)
     friend class PrimitiveCreationVerification;
     friend class SceneHierarchyVerification;
+    friend class MemoryRegistryVerification;
 #endif
     friend struct MaterialAdmissionState;
     friend class Renderer;
     std::map<std::string, std::string> m_admittedMaterialDigests;
     Mesh* CreateProjectMesh(const ProjectMeshCPUCache::Key& key,
         std::shared_ptr<const ImportedMesh> geometry,
-        std::shared_ptr<const CookedMeshResidencyEvidence> cooked = {});
+        std::shared_ptr<const CookedMeshResidencyEvidence> cooked = {}, Renderer* deferredUploads = nullptr);
     struct MeshAsset
     {
         std::shared_ptr<const ImportedMesh> geometry;
@@ -307,6 +333,8 @@ private:
         Mesh mesh;
 
         bool published = false;
+        // S0.8B: the Renderer ticket of the geometry copies while unpublished.
+        std::uint64_t uploadTicket = 0;
         ~MeshAsset();
     };
 
@@ -458,13 +486,28 @@ private:
             std::string digest;
         };
 
+        // S0.7A: the canonical project root and resolved source path of an authored FBX reference, computed once per
+        // pass. The pass is one read-only operation on the Engine thread, so the registry cannot change during it, and the
+        // pass pin excludes writers and deleters of the resolved file (and so renames of its directories).
+        struct ResolvedSource
+        {
+            std::filesystem::path project;
+            std::filesystem::path path;
+        };
+
         std::thread::id owner;
         std::unordered_map<std::string, MaterialResult> materials; // Exact authored reference.
         std::map<std::filesystem::path, PinnedSource> sources; // Resolved FBX path.
+        std::unordered_map<std::string, ResolvedSource> resolutions; // Exact authored reference.
+        // S0.7B: the canonical project root, resolved once per pass (the project directory cannot be replaced during one
+        // read-only Engine-thread operation).
+        std::optional<std::filesystem::path> canonicalProject;
     };
 
     mutable std::optional<ValidationPassState> m_validationPass;
     ValidationPassState* ActiveValidationPass() const noexcept;
+    // std::filesystem::canonical(m_projectRoot), cached by the active validation pass when there is one.
+    std::filesystem::path CanonicalProjectRoot() const;
     bool ValidateMetadataMaterialReferenceOnDisk(std::string_view reference, std::string* errorMessage) const;
 
     // Ordinary material binding revisions change only on saved texture publication.
@@ -493,6 +536,8 @@ private:
         std::uint64_t gpuTicket = 0;
 
         std::chrono::steady_clock::time_point retryAfter;
+        // S0.8A: service priority, in first-queued order (materials queue their textures together, in scene order).
+        std::uint64_t sequence = 0;
     };
     struct StreamingStatistics
     {
@@ -519,7 +564,10 @@ private:
     std::uint64_t m_streamingTable = 0;
     std::uint64_t m_streamingGeneration = 0;
 
-    size_t m_streamingCursor = 0;
+    std::uint64_t m_streamingSequence = 0;
+    // S0.8B: the Renderer holding this catalog's queued geometry copies (it outlives every scene catalog).
+    Renderer* m_geometryRenderer = nullptr;
+    bool m_streamingExpensiveAdvanced = false;
 
     bool m_textureStreamingEnabled = false;
     bool m_streamingReported = false;

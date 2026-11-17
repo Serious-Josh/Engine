@@ -3,6 +3,7 @@
 #include "Debug/TransitionTiming.h"
 
 #include "Core/Log.h"
+#include "Renderer/BuiltinEnvironment.h"
 #include "Renderer/DescriptorHeap.h"
 #include "Renderer/ImageLoader.h"
 #include "Renderer/ResourceUploader.h"
@@ -23,8 +24,7 @@ bool EnvironmentMap::Initialize(
 
     if(path.empty())
     {
-        image.width=16; image.height=8; image.channels=4; image.pixels.resize(16*8*4,0.18f);
-        for(size_t i=3;i<image.pixels.size();i+=4) image.pixels[i]=1.0f;
+        image = MakeNeutralEnvironmentImage();
     }
     else
     {
@@ -41,61 +41,17 @@ bool EnvironmentMap::Initialize(
 
     return Initialize(device,image,uploader,descriptorHeap,radianceScale);
 }
-bool EnvironmentMap::Initialize(ID3D12Device* device,const HDRImageData& source,ResourceUploader& uploader,DescriptorHeap& descriptorHeap,
-    float radianceScale)
+// Shared by the synchronous path and the S0.5 preparation worker, so both produce the same distribution bit for bit.
+float EnvironmentMap::BuildImportanceDistribution(const HDRImageData& image, std::vector<float>& conditionalCDF,
+    std::vector<float>& marginalCDF)
 {
-    const MemoryCategoryScope memoryScope(MemoryCategory::MeshesTextures);
+    conditionalCDF.assign(static_cast<size_t>(image.width) * static_cast<size_t>(image.height), 0.0f);
 
-    if(source.width == 0 || source.height == 0 || source.channels != 4 ||
-        source.pixels.size() != static_cast<size_t>(source.width) * source.height * 4)
-    {
-        Log::Error("Invalid environment image dimensions or pixel storage.");
-        return false;
-    }
-
-    if(!std::isfinite(radianceScale) || radianceScale < 0.0f)
-    {
-        Log::Error("Invalid environment radiance scale.");
-        return false;
-    }
-
-    // The calibrated copy feeds the source texture and the importance distribution alike (the CDF is normalized).
-    HDRImageData scaled;
-
-    if(radianceScale != 1.0f)
-    {
-        scaled = source;
-
-        for(size_t index = 0; index < scaled.pixels.size(); ++index)
-        {
-            if(index % 4 != 3)
-            {
-                scaled.pixels[index] *= radianceScale;
-            }
-        }
-    }
-
-    const HDRImageData& image = radianceScale != 1.0f ? scaled : source;
-
-    Log::Info("HDR environment loaded: " + std::to_string(image.width) + "x" + std::to_string(image.height));
-
-    // M0c.5 diagnostics (ENGINE_STARTUP_TIMING): the CPU importance distribution, then the GPU resources and precompute.
-    std::optional<TransitionTiming::Scope> phaseTiming;
-    phaseTiming.emplace("Environment importance CDF (CPU) and CDF buffers", 0.0, TransitionTiming::Startup);
-
-    std::vector<float> conditionalCDF(static_cast<size_t>(image.width) * static_cast<size_t>(image.height));
-
-    std::vector<float> marginalCDF(image.height);
+    marginalCDF.assign(image.height, 0.0f);
 
     std::vector<double> rowWeights(
         image.height,
         0.0);
-
-    m_importanceWidth = image.width;
-
-    m_importanceHeight = image.height;
-
-    m_importanceTotalWeight = 0.0f;
 
     double totalWeight = 0.0;
 
@@ -156,8 +112,6 @@ bool EnvironmentMap::Initialize(ID3D12Device* device,const HDRImageData& source,
         }
     }
 
-    m_importanceTotalWeight = static_cast<float>(totalWeight);
-
     double accumulatedMarginalWeight = 0.0;
 
     for (unsigned int y = 0; y < image.height; ++y)
@@ -182,6 +136,58 @@ bool EnvironmentMap::Initialize(ID3D12Device* device,const HDRImageData& source,
 
     marginalCDF.back() = 1.0f;
 
+    return static_cast<float>(totalWeight);
+}
+
+bool EnvironmentMap::Initialize(ID3D12Device* device,const HDRImageData& source,ResourceUploader& uploader,DescriptorHeap& descriptorHeap,
+    float radianceScale)
+{
+    const MemoryCategoryScope memoryScope(MemoryCategory::MeshesTextures);
+
+    if(source.width == 0 || source.height == 0 || source.channels != 4 ||
+        source.pixels.size() != static_cast<size_t>(source.width) * source.height * 4)
+    {
+        Log::Error("Invalid environment image dimensions or pixel storage.");
+        return false;
+    }
+
+    if(!std::isfinite(radianceScale) || radianceScale < 0.0f)
+    {
+        Log::Error("Invalid environment radiance scale.");
+        return false;
+    }
+
+    // The calibrated copy feeds the source texture and the importance distribution alike (the CDF is normalized).
+    HDRImageData scaled;
+
+    if(radianceScale != 1.0f)
+    {
+        scaled = source;
+
+        for(size_t index = 0; index < scaled.pixels.size(); ++index)
+        {
+            if(index % 4 != 3)
+            {
+                scaled.pixels[index] *= radianceScale;
+            }
+        }
+    }
+
+    const HDRImageData& image = radianceScale != 1.0f ? scaled : source;
+
+    Log::Info("HDR environment loaded: " + std::to_string(image.width) + "x" + std::to_string(image.height));
+
+    // M0c.5 diagnostics (ENGINE_STARTUP_TIMING): the CPU importance distribution, then the GPU resources and precompute.
+    std::optional<TransitionTiming::Scope> phaseTiming;
+    phaseTiming.emplace("Environment importance CDF (CPU) and CDF buffers", 0.0, TransitionTiming::Startup);
+
+    std::vector<float> conditionalCDF;
+    std::vector<float> marginalCDF;
+
+    m_importanceWidth = image.width;
+    m_importanceHeight = image.height;
+    m_importanceTotalWeight = BuildImportanceDistribution(image, conditionalCDF, marginalCDF);
+
     if (!m_importanceConditionalCDF.Initialize(device, uploader, conditionalCDF.data(), sizeof(float),
                                                static_cast<unsigned int>(conditionalCDF.size()), descriptorHeap))
     {
@@ -203,15 +209,8 @@ bool EnvironmentMap::Initialize(ID3D12Device* device,const HDRImageData& source,
     phaseTiming.reset();
     phaseTiming.emplace("Environment source, cubemap and irradiance resources and precompute", 0.0, TransitionTiming::Startup);
 
-    const unsigned int sourceMipLevels =
-        static_cast<unsigned int>(std::floor(std::log2(static_cast<double>((std::max)(image.width, image.height))))) +
-        1;
-
-    if (!m_sourceTexture.Initialize(device, image.width, image.height, 1, sourceMipLevels,
-                                    DXGI_FORMAT_R32G32B32A32_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
-                                    D3D12_RESOURCE_STATE_COPY_DEST))
+    if (!InitializeSourceTexture(device, image.width, image.height))
     {
-        Log::Error("Failed to initialize environment texture.");
         return false;
     }
 
@@ -230,29 +229,57 @@ bool EnvironmentMap::Initialize(ID3D12Device* device,const HDRImageData& source,
         return false;
     }
 
-    constexpr unsigned int cubemapSize = 1024;
-    constexpr unsigned int cubemapMipLevels = 11;
+    return CreatePrecomputeTargets(device, descriptorHeap);
+}
 
-    if (!m_cubemap.Initialize(device, cubemapSize, cubemapSize, 6, cubemapMipLevels, DXGI_FORMAT_R16G16B16A16_FLOAT,
-                              D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET))
+unsigned int EnvironmentMap::SourceMipLevels(unsigned int width, unsigned int height)
+{
+    return static_cast<unsigned int>(std::floor(std::log2(static_cast<double>((std::max)(width, height))))) + 1;
+}
+
+// The source texture starts in COPY_DEST: the synchronous uploader or the S0.5 frame-recorded copies write mip 0.
+bool EnvironmentMap::InitializeSourceTexture(ID3D12Device* device, unsigned int width, unsigned int height)
+{
+    if (!m_sourceTexture.Initialize(device, width, height, 1, SourceMipLevels(width, height),
+                                    DXGI_FORMAT_R32G32B32A32_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                                    D3D12_RESOURCE_STATE_COPY_DEST))
     {
-        Log::Error("Failed to init environment cubemap.");
+        Log::Error("Failed to initialize environment texture.");
         return false;
     }
 
+    return true;
+}
+
+namespace
+{
+constexpr unsigned int CubemapSize = 1024;
+constexpr unsigned int CubemapMipLevels = 11;
+constexpr unsigned int DiffuseIrradianceSize = 128;
+constexpr unsigned int GGXMultiscatterSize = 64;
+constexpr unsigned int GGXMultiscatterMipLevels = 7;
+}
+
+// The cubemap, irradiance and multiscatter targets the precompute passes render. trackMemory = false: worker-safe (no
+// registry entry, no logging).
+bool EnvironmentMap::CreatePrecomputeTargetResources(ID3D12Device* device, bool trackMemory)
+{
+    return m_cubemap.Initialize(device, CubemapSize, CubemapSize, 6, CubemapMipLevels, DXGI_FORMAT_R16G16B16A16_FLOAT,
+               D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET, trackMemory) &&
+        m_diffuseIrradiance.Initialize(device, DiffuseIrradianceSize, DiffuseIrradianceSize, 6, 1,
+            DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET,
+            trackMemory) &&
+        m_ggxMultiscatterIrradiance.Initialize(device, GGXMultiscatterSize, GGXMultiscatterSize, 6, GGXMultiscatterMipLevels,
+            DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET,
+            trackMemory);
+}
+
+// Their shader views (main thread: descriptor allocation).
+bool EnvironmentMap::CreatePrecomputeTargetViews(ID3D12Device* device, DescriptorHeap& descriptorHeap)
+{
     if (!m_cubemap.CreateCubeSRV(device, descriptorHeap))
     {
         Log::Error("Failed to create environmental cubemap SRV");
-        return false;
-    }
-
-    constexpr unsigned int diffuseIrradianceSize = 128;
-
-    if (!m_diffuseIrradiance.Initialize(device, diffuseIrradianceSize, diffuseIrradianceSize, 6, 1,
-                                        DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
-                                        D3D12_RESOURCE_STATE_RENDER_TARGET))
-    {
-        Log::Error("Failed to init diffuse irradiance cubemap.");
         return false;
     }
 
@@ -284,18 +311,6 @@ bool EnvironmentMap::Initialize(ID3D12Device* device,const HDRImageData& source,
     device->CreateShaderResourceView(m_diffuseIrradiance.GetResource(), &arrayView,
                                      descriptorHeap.GetCPUHandle(m_diffuseIrradianceArrayIndex));
 
-    constexpr unsigned int ggxMultiscatterSize = 64;
-    constexpr unsigned int ggxMultiscatterMipLevels = 7;
-
-    if (!m_ggxMultiscatterIrradiance.Initialize(device, ggxMultiscatterSize, ggxMultiscatterSize, 6,
-                                                ggxMultiscatterMipLevels, DXGI_FORMAT_R16G16B16A16_FLOAT,
-                                                D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
-                                                D3D12_RESOURCE_STATE_RENDER_TARGET))
-    {
-        Log::Error("Failed to init GGX multiscatter irradiance cubemap.");
-        return false;
-    }
-
     if (!m_ggxMultiscatterIrradiance.CreateCubeSRV(device, descriptorHeap))
     {
         Log::Error("Failed to create GGX multiscatter irradiance cubemap SRV.");
@@ -303,6 +318,68 @@ bool EnvironmentMap::Initialize(ID3D12Device* device,const HDRImageData& source,
     }
 
     return true;
+}
+
+bool EnvironmentMap::CreatePrecomputeTargets(ID3D12Device* device, DescriptorHeap& descriptorHeap)
+{
+    if (!CreatePrecomputeTargetResources(device, true))
+    {
+        Log::Error("Failed to init environment cubemap or irradiance targets.");
+        return false;
+    }
+
+    return CreatePrecomputeTargetViews(device, descriptorHeap);
+}
+
+bool EnvironmentMap::CreateResourcesForUpload(ID3D12Device* device, unsigned int width, unsigned int height, float totalWeight)
+{
+    if (!device || width == 0 || height == 0 || m_sourceTexture.GetResource())
+    {
+        return false;
+    }
+
+    m_importanceWidth = width;
+    m_importanceHeight = height;
+    m_importanceTotalWeight = totalWeight;
+    // The source texture starts in COPY_DEST, as InitializeSourceTexture creates it.
+    return m_importanceConditionalCDF.CreateStorageResource(device, sizeof(float), width * height) &&
+        m_importanceMarginalCDF.CreateStorageResource(device, sizeof(float), height) &&
+        m_sourceTexture.Initialize(device, width, height, 1, SourceMipLevels(width, height), DXGI_FORMAT_R32G32B32A32_FLOAT,
+            D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_DEST, false) &&
+        CreatePrecomputeTargetResources(device, false);
+}
+
+bool EnvironmentMap::CreateViewsForUpload(ID3D12Device* device, DescriptorHeap& descriptorHeap)
+{
+    const MemoryCategoryScope memoryScope(MemoryCategory::MeshesTextures);
+    m_sourceTexture.TrackMemory();
+    m_cubemap.TrackMemory();
+    m_diffuseIrradiance.TrackMemory();
+    m_ggxMultiscatterIrradiance.TrackMemory();
+
+    if (!m_importanceConditionalCDF.CreateStorageView(device, descriptorHeap) ||
+        !m_importanceMarginalCDF.CreateStorageView(device, descriptorHeap) || !m_sourceTexture.CreateSRV(device, descriptorHeap))
+    {
+        Log::Error("Failed to create environment texture or importance CDF views.");
+        return false;
+    }
+
+    return CreatePrecomputeTargetViews(device, descriptorHeap);
+}
+
+void EnvironmentMap::Swap(EnvironmentMap& other) noexcept
+{
+    std::swap(m_sourceTexture, other.m_sourceTexture);
+    std::swap(m_cubemap, other.m_cubemap);
+    std::swap(m_diffuseIrradiance, other.m_diffuseIrradiance);
+    std::swap(m_diffuseIrradianceArrayHeap, other.m_diffuseIrradianceArrayHeap);
+    std::swap(m_diffuseIrradianceArrayIndex, other.m_diffuseIrradianceArrayIndex);
+    std::swap(m_ggxMultiscatterIrradiance, other.m_ggxMultiscatterIrradiance);
+    m_importanceConditionalCDF.Swap(other.m_importanceConditionalCDF);
+    m_importanceMarginalCDF.Swap(other.m_importanceMarginalCDF);
+    std::swap(m_importanceWidth, other.m_importanceWidth);
+    std::swap(m_importanceHeight, other.m_importanceHeight);
+    std::swap(m_importanceTotalWeight, other.m_importanceTotalWeight);
 }
 
 void EnvironmentMap::Shutdown()

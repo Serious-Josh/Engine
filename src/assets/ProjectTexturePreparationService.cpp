@@ -1,4 +1,5 @@
 #include "assets/CookedSurface.h"
+#include "Debug/StreamingTelemetry.h"
 #include "assets/ProjectTexturePreparationService.h"
 
 #include "Renderer/Preview/MaterialThumbnailValidation.h"
@@ -16,6 +17,8 @@
 #include <thread>
 #include <stdexcept>
 #include <utility>
+#include <cstdlib>
+#include <vector>
 #include <type_traits>
 #include <Windows.h>
 
@@ -211,6 +214,7 @@ struct ProjectTexturePreparationService::State
     struct Job
     {
         Identity identity;
+        StreamingTelemetry::Clock::time_point queuedAt{}; // S0.0 diagnostics.
         bool done = false;
         std::shared_ptr<const PreparedProjectTexture> prepared;
         std::shared_ptr<TextureSourceEvidence> source;
@@ -228,7 +232,10 @@ struct ProjectTexturePreparationService::State
     std::shared_ptr<std::atomic_size_t> bytes = std::make_shared<std::atomic_size_t>(0);
     std::mutex mutex;
     std::condition_variable wake;
-    std::thread worker;
+    // S0.8A: a bounded pool. Jobs are taken and completed under `mutex`; decoding (stb, DirectXTex DDS) and hashing run
+    // outside it with per-call state only; memory is reserved through the shared atomic `bytes` budget, and at most
+    // `limits.completed` results wait uncollected whichever worker produced them.
+    std::vector<std::thread> workers;
     std::deque<std::shared_ptr<Job>> queue;
     std::map<std::uint64_t, Subscriber> subscribers;
     struct Token
@@ -322,7 +329,11 @@ struct ProjectTexturePreparationService::State
                 continue;
             }
 
+            StreamingTelemetry::RecordJobStart(job->queuedAt, StreamingTelemetry::Metric::TextureJobQueueNs,
+                StreamingTelemetry::Gauge::TextureQueueDepth, queue.size() + 1);
             lock.unlock();
+            const StreamingTelemetry::Scope workTiming(StreamingTelemetry::Metric::TextureJobWorkNs,
+                StreamingTelemetry::Metric::TextureJobs);
             std::shared_ptr<const PreparedProjectTexture> prepared;
             std::shared_ptr<TextureSourceEvidence> evidence;
             Identity completedIdentity;
@@ -469,7 +480,7 @@ bool ProjectTexturePreparationService::Start(const Limits& limits, std::string& 
     error.clear();
     auto& state = *m_state;
 
-    if(state.worker.joinable() || !limits.requests || !limits.completed || !limits.sourceBytes ||
+    if(!state.workers.empty() || !limits.requests || !limits.completed || !limits.sourceBytes ||
         !limits.preparationBytes || limits.retainedBytes < limits.preparationBytes)
     {
         error = "Invalid texture service limits or service already started.";
@@ -482,7 +493,27 @@ bool ProjectTexturePreparationService::Start(const Limits& limits, std::string& 
 
     try
     {
-        state.worker = std::thread([&state] { state.Run(); });
+        // Background decoding must not compete with the frame thread. One worker by default: with the S0.8A consumer
+        // changes it already keeps up with collection (first fully textured material 0.14 s on FirstFileBackedScene, the
+        // same as two or four workers), while more workers lengthened concurrent main-thread work (mesh publication
+        // validation) through shared CPU and memory bandwidth. ENGINE_TEXTURE_WORKERS=1..4 overrides it for measurement.
+        unsigned int count = 1;
+        char text[8]{};
+
+        if(GetEnvironmentVariableA("ENGINE_TEXTURE_WORKERS", text, sizeof(text)) > 0)
+        {
+            count = (std::clamp)(static_cast<unsigned int>(std::atoi(text)), 1u, 4u);
+        }
+
+        for(unsigned int index = 0; index < count; ++index)
+        {
+            state.workers.emplace_back([&state]
+            {
+                SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+                state.Run();
+            });
+        }
+
         return true;
     }
     catch(const std::exception& exception)
@@ -519,10 +550,15 @@ void ProjectTexturePreparationService::Shutdown()
 
     state.wake.notify_all();
 
-    if(state.worker.joinable())
+    for(auto& worker : state.workers)
     {
-        state.worker.join();
+        if(worker.joinable())
+        {
+            worker.join();
+        }
     }
+
+    state.workers.clear();
 }
 
 std::uint64_t ProjectTexturePreparationService::Generation() const { return m_state->generation; }
@@ -668,6 +704,7 @@ bool ProjectTexturePreparationService::RequestIdentity(Identity identity,std::ui
         {
             job = std::make_shared<State::Job>();
             job->identity = std::move(identity);
+            job->queuedAt = StreamingTelemetry::QueueStamp();
             state.queue.push_back(job);
         }
 
@@ -681,7 +718,7 @@ bool ProjectTexturePreparationService::RequestIdentity(Identity identity,std::ui
             state.RevokeIfUnused(job->source);
             throw;
         }
-        state.wake.notify_one();
+        state.wake.notify_all();
         return true;
     }
     catch(const std::exception& e) { ticket=0; error=e.what(); return false; }
@@ -732,7 +769,7 @@ std::optional<ProjectTexturePreparationService::Completion> ProjectTexturePrepar
         m_state->subscribers.erase(found);
     }
 
-    m_state->wake.notify_one();
+    m_state->wake.notify_all();
 
     if(completion.prepared && !(completion.identity.archive ? ValidateArchive(completion,completion.error) :
         (paths && registry && ValidateSource(completion,*paths,*registry,completion.error))))

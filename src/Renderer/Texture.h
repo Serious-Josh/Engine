@@ -63,7 +63,11 @@ class Texture
         unsigned int mipLevels,
         DXGI_FORMAT format,
         D3D12_RESOURCE_FLAGS flags,
-        D3D12_RESOURCE_STATES initialState);
+        D3D12_RESOURCE_STATES initialState,
+        bool trackMemory = true);
+    // trackMemory = false (S0.5): no memory registration and no logging, so the call is safe off the main thread (the
+    // device is free-threaded); the caller reports failure and later registers the resource with TrackMemory.
+    void TrackMemory() const;
     bool InitializeMipmapped(
         ID3D12Device* device,
         unsigned int width,

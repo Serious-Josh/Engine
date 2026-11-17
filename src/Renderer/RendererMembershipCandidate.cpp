@@ -1,6 +1,7 @@
 #include "Renderer.h"
 #include "Scene/FileSceneRuntime.h"
 #include "Scene/FileSceneAssetCatalog.h"
+#include "Debug/StreamingTelemetry.h"
 
 #include <exception>
 
@@ -28,6 +29,10 @@ std::optional<RayTracingSceneResources::ReplacementCandidate> Renderer::PrepareD
     unsigned int frameSlot, std::string& error, const FileSceneRuntime* membershipSource,
     RayTracingSceneResources::CandidateFailure* failure)
 {
+    // S0.0 diagnostics: the whole synchronous preparation (slot wait, allocation, uploads, recording, submission).
+    const StreamingTelemetry::Scope prepareTiming(StreamingTelemetry::Metric::CandidatePrepareNs,
+        StreamingTelemetry::Metric::CandidatePrepares);
+    StreamingTelemetry::Add(StreamingTelemetry::Metric::CandidateProposals, proposals.size());
     error.clear();
 
     // Deferrals and rejections below are ordinary failures; only the candidate itself
@@ -48,7 +53,14 @@ std::optional<RayTracingSceneResources::ReplacementCandidate> Renderer::PrepareD
 
     // The frame would wait on this slot fence in Begin moments later. Waiting here
     // instead of deferring keeps GPU-bound frames from never observing it complete.
-    if (!m_commandContext.WaitForFrameFence(frameSlot))
+    bool slotCompleted = false;
+
+    {
+        const StreamingTelemetry::Scope slotWaitTiming(StreamingTelemetry::Metric::CandidateSlotWaitNs);
+        slotCompleted = m_commandContext.WaitForFrameFence(frameSlot);
+    }
+
+    if (!slotCompleted)
     {
         error = "Candidate allocator fence wait failed; renderer requires checked recovery.";
         return std::nullopt;
@@ -58,9 +70,11 @@ std::optional<RayTracingSceneResources::ReplacementCandidate> Renderer::PrepareD
 
     try
     {
+        std::optional<StreamingTelemetry::Scope> detailTiming(std::in_place, StreamingTelemetry::Metric::CandidateBuildNs);
         auto candidate = m_rayTracingScene.PrepareReplacementCandidate(m_graphicsDevice.GetRayTracingDevice(),
             m_resourceDescriptorHeap, runtime, catalog, proposals, m_materialPublication.desired.size(), error, membershipSource,
             failure);
+        detailTiming.emplace(StreamingTelemetry::Metric::CandidateRecordNs);
 
         if (!candidate)
         {
@@ -143,6 +157,8 @@ bool Renderer::RefreshDXRMembershipCandidateTransforms(const RayTracingSceneReso
         error = "Candidate transform refresh requires no conflicting transaction or recording.";
         return false;
     }
+
+    StreamingTelemetry::Add(StreamingTelemetry::Metric::CandidateTransformRefreshes, 1);
 
     const auto status = PollDXRMembershipCandidate(candidate, runtime, catalog, error);
 

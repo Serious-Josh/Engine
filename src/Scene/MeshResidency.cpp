@@ -104,6 +104,23 @@ FileSceneAssetCatalog::ValidationPass::~ValidationPass()
     }
 }
 
+std::filesystem::path FileSceneAssetCatalog::CanonicalProjectRoot() const
+{
+    auto* pass = ActiveValidationPass();
+
+    if(!pass)
+    {
+        return std::filesystem::canonical(m_projectRoot);
+    }
+
+    if(!pass->canonicalProject)
+    {
+        pass->canonicalProject = std::filesystem::canonical(m_projectRoot);
+    }
+
+    return *pass->canonicalProject;
+}
+
 FileSceneAssetCatalog::ValidationPassState* FileSceneAssetCatalog::ActiveValidationPass() const noexcept
 {
     if(!m_validationPass || m_validationPass->owner != std::this_thread::get_id())
@@ -258,19 +275,62 @@ MeshResidencySourceLock FileSceneAssetCatalog::ValidateMeshResidencyCandidate(
     try
     {
         const auto id = AssetID::ParseReference(reference);
-        const auto project = std::filesystem::canonical(m_projectRoot);
         const auto* record = m_registry ? m_registry->Find(*id) : nullptr;
-        const auto resolved = ProjectAssetResolver::Resolve(ProjectPaths(project), *m_registry, *id);
+        auto* pass = ActiveValidationPass();
+        ValidationPassState::ResolvedSource resolution;
+        const auto cachedResolution = pass ? pass->resolutions.find(std::string(reference)) :
+            std::unordered_map<std::string, ValidationPassState::ResolvedSource>::iterator{};
 
-        if(project != std::get<0>(candidate.key) || !record || record->type != AssetType::Mesh ||
-            resolved.status != AssetAvailability::Available ||
-            _wcsicmp(resolved.resolvedPath.extension().c_str(), L".fbx") != 0)
+        // S0.7A: the filesystem resolution runs once per reference per pass (canonicalization and resolution were the
+        // dominant per-entry cost of each publication); the registry checks below still run for every call.
+        if(pass && cachedResolution != pass->resolutions.end())
+        {
+            resolution = cachedResolution->second;
+        }
+        else
+        {
+            resolution.project = CanonicalProjectRoot();
+            const auto resolved = ProjectAssetResolver::Resolve(ProjectPaths(resolution.project), *m_registry, *id);
+
+            if(resolved.status != AssetAvailability::Available)
+            {
+                return reject("Residency candidate project, registration, type or contained source changed.");
+            }
+
+            resolution.path = resolved.resolvedPath;
+        }
+
+        if(resolution.project != std::get<0>(candidate.key) || !record || record->type != AssetType::Mesh ||
+            _wcsicmp(resolution.path.extension().c_str(), L".fbx") != 0)
         {
             return reject("Residency candidate project, registration, type or contained source changed.");
         }
 
-        HANDLE handle = CreateFileW(resolved.resolvedPath.c_str(), GENERIC_READ, FILE_SHARE_READ,
-            nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+        const ValidationPassState::PinnedSource* pinned = nullptr;
+
+        if(pass)
+        {
+            const auto found = pass->sources.find(resolution.path);
+            pinned = found == pass->sources.end() ? nullptr : &found->second;
+        }
+
+        // A source already pinned by this pass is locked by duplicating the pass handle: the same file object, so writer
+        // and deleter exclusion is continuous and the returned lock still owns its own handle beyond the pass.
+        HANDLE handle = INVALID_HANDLE_VALUE;
+
+        if(pinned)
+        {
+            if(!DuplicateHandle(GetCurrentProcess(), static_cast<HANDLE>(pinned->pin.m_handle), GetCurrentProcess(), &handle,
+                0, FALSE, DUPLICATE_SAME_ACCESS))
+            {
+                handle = INVALID_HANDLE_VALUE;
+            }
+        }
+        else
+        {
+            handle = CreateFileW(resolution.path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+        }
 
         if(handle == INVALID_HANDLE_VALUE)
         {
@@ -278,13 +338,10 @@ MeshResidencySourceLock FileSceneAssetCatalog::ValidateMeshResidencyCandidate(
         }
 
         MeshResidencySourceLock source(handle);
-        auto* pass = ActiveValidationPass();
-        const ValidationPassState::PinnedSource* pinned = nullptr;
 
-        if(pass)
+        if(pass && cachedResolution == pass->resolutions.end())
         {
-            const auto found = pass->sources.find(resolved.resolvedPath);
-            pinned = found == pass->sources.end() ? nullptr : &found->second;
+            pass->resolutions.emplace(std::string(reference), resolution);
         }
 
         std::string digest;
@@ -296,18 +353,18 @@ MeshResidencySourceLock FileSceneAssetCatalog::ValidateMeshResidencyCandidate(
         else
         {
             MaterialThumbnailValidation validation;
-            digest = validation.Digest(resolved.resolvedPath);
+            digest = validation.Digest(resolution.path);
 
             // Open the pass pin while `source` still excludes writers, so exclusion
             // is continuous from before the digest until the pass ends.
             if(pass)
             {
-                HANDLE passHandle = CreateFileW(resolved.resolvedPath.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                HANDLE passHandle = CreateFileW(resolution.path.c_str(), GENERIC_READ, FILE_SHARE_READ,
                     nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
 
                 if(passHandle != INVALID_HANDLE_VALUE)
                 {
-                    pass->sources.emplace(resolved.resolvedPath,
+                    pass->sources.emplace(resolution.path,
                         ValidationPassState::PinnedSource{MeshResidencySourceLock(passHandle), digest});
                 }
             }
@@ -392,6 +449,10 @@ std::optional<MeshResidencyToken> FileSceneRuntime::PrepareMeshResidencyBatch(
     prepared.catalog = &catalog;
     prepared.entries.reserve(requests.size());
 
+    // S0.3: entry validation only reads the runtime; its per-entry metadata lookups share one whole-scene validation.
+    // The pass ends with this block, before the staging below mutates the runtime.
+    std::optional<MetadataValidationPass> metadataPass(std::in_place, *this);
+
     for(const auto& request : requests)
     {
         auto entry = PrepareMeshResidencyEntry(request, catalog, prepared.entries, error);
@@ -409,6 +470,7 @@ std::optional<MeshResidencyToken> FileSceneRuntime::PrepareMeshResidencyBatch(
         prepared.entries.push_back(std::move(*entry));
     }
 
+    metadataPass.reset();
     prepared.token = {m_instanceIdentity, m_nextMeshResidency, prepared.entries.size()};
     const auto token = prepared.token;
     m_meshResidency.emplace(std::move(prepared));

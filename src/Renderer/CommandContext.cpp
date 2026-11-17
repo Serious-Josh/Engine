@@ -1,6 +1,7 @@
 #include "CommandContext.h"
 #include "Debug/TransitionTiming.h"
 #include "Debug/CpuFrameTiming.h"
+#include "Debug/StreamingTelemetry.h"
 #include "Core/Log.h"
 #ifdef _DEBUG
 #include "GraphicsDevice.h"
@@ -212,6 +213,8 @@ void CommandContext::Shutdown()
 bool CommandContext::WaitForFrameFence(unsigned int frameIndex)
 {
     TransitionTiming::Scope er1Scope("GPU WaitForFrameFence", 1.0);
+    const StreamingTelemetry::Scope streamingTiming(StreamingTelemetry::Metric::FrameFenceWaitNs,
+        StreamingTelemetry::Metric::FrameFenceWaitCalls);
     if (!m_fence || frameIndex >= FrameCount)
     {
         return false;
@@ -442,6 +445,8 @@ bool CommandContext::Execute(unsigned int frameIndex)
 bool CommandContext::WaitForGPU()
 {
     TransitionTiming::Scope er1Scope("GPU WaitForGPU (idle)", 0.0, TransitionTiming::TransitionsAndStartup);
+    const StreamingTelemetry::Scope streamingTiming(StreamingTelemetry::Metric::GpuIdleWaitNs,
+        StreamingTelemetry::Metric::GpuIdleWaitCalls);
     ++m_gpuDrainCount;
     if (!m_commandQueue || !m_fence || !m_fenceEvent)
     {

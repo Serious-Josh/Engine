@@ -415,7 +415,12 @@ class Engine
     bool AdvanceEditorMembership();
     void CancelEditorMembership(const std::string&);
     void PopulateArchiveScene(std::shared_ptr<const CookedScene::ArchiveScene>);
-    bool ApplySceneEnvironment(std::string& error);
+    // S0.5: requests the active scene's environment asynchronously (see SceneEnvironment.cpp); PollSceneEnvironment
+    // observes the request once per frame. m_sceneEnvironmentTicket is 0 when no request is observed.
+    bool ApplySceneEnvironment(std::string& error, bool activation = false);
+    void PollSceneEnvironment();
+    std::uint64_t m_sceneEnvironmentTicket = 0;
+    bool m_sceneEnvironmentActivation = false;
     float ActiveEnvironmentRadianceScale() const;
     void RefreshSceneEnvironmentCalibration();
     // The HDRI calibration ApplySceneEnvironment last applied (NaN before the first).
@@ -582,6 +587,33 @@ class Engine
     };
 
     AutomaticMeshResidency m_automaticMeshResidency;
+
+    // S0.4: bounded import prefetch for automatic residency. While the scheduler waits on an object whose FBX mesh is not yet
+    // catalog-retained, the worker is given up to MaxMeshImportPrefetch distinct imports at once instead of one. A completed
+    // import is turned into catalog-retained GPU geometry by exactly the single-request path's steps (currentness, cache
+    // integration, source-validated ResolvePreparedMesh), only at the scheduler's own idle boundary (no residency token, CPU
+    // request or candidate outstanding), so no in-flight candidate sees the catalog change. Retained meshes then publish through
+    // the existing batch path. Tickets belong to one runtime session and generation; anything stale is canceled and dropped, and
+    // a failed prefetch only sends its object back to the single-request path, which records failures as before.
+    struct MeshImportPrefetch
+    {
+        std::string meshReference;
+        std::uint64_t ticket = 0;
+        std::optional<ProjectMeshPreparationService::Completion> completion;
+    };
+
+    static constexpr size_t MaxMeshImportPrefetch = 8;
+    static constexpr size_t MeshImportPrefetchLookAhead = 256;
+    static constexpr size_t MaxMeshImportRequestsPerFrame = 1;
+    std::vector<MeshImportPrefetch> m_meshImportPrefetch;
+    std::vector<std::string> m_meshImportPrefetchFailed; // References that fall back to the single-request path.
+    std::uint64_t m_meshImportPrefetchRuntime = 0;
+    std::uint64_t m_meshImportPrefetchGeneration = 0;
+    void CancelMeshImportPrefetch() noexcept;
+    void PollMeshImportPrefetch(FileBackedDemoScene& scene);
+    void IntegrateMeshImportPrefetch(FileBackedDemoScene& scene);
+    // True when `selection`'s mesh is (now) being prefetched, so the scheduler waits instead of requesting it alone.
+    bool PrefetchMeshImports(FileBackedDemoScene& scene, const SceneObjectMetadata& selection);
     void CountAutomaticPublicationAttempt(const MeshResidencyPublication::AcceptanceResult& result);
     void CountAutomaticRetry(const std::string& reason);
     const char* GetAutomaticResidencyGate(const FileSceneRuntime& runtime) const;
@@ -680,7 +712,18 @@ class Engine
     bool ChangeMeshImportUnits(const ProjectPaths& paths, const AssetBrowser::MeshImportUnitsRequest& request,
         const FileBackedDemoScene* activeScene, std::string& error);
     void ProcessSavedMaterialRevisions();
-    void ProcessSceneTextureStreaming();
+    // S0.8A: the cheap pass runs early in the frame; the expensive pass runs after mesh residency, within the frame's
+    // remaining streaming budget (see Engine.cpp).
+    void ProcessSceneTextureStreaming(bool expensivePass);
+    // Both passes as one complete update (diagnostics that drive frames by hand).
+    void ProcessSceneTextureStreaming()
+    {
+        ProcessSceneTextureStreaming(false);
+        m_frameStarted = std::chrono::steady_clock::now();
+        ProcessSceneTextureStreaming(true);
+    }
+    std::chrono::steady_clock::time_point m_frameStarted;
+    int m_textureExpensiveSkippedFrames = 0;
     void ProcessWorkingMaterialNotifications();
     void PublishWorkingMaterialParameters();
     struct WorkingMaterialOverride
