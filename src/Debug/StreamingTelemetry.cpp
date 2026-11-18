@@ -396,7 +396,7 @@ namespace StreamingTelemetry
             "ResidencyBatchesSubmitted", "ResidencyBatchEntries", "ResidencySingleRequests", "ResidencyAdvanceNs",
             "TextureStreamingNs",
             "PublicationIdentityNs", "PublicationPollNs", "PublicationSourceValidationNs", "PublicationAdoptionNs",
-            "PublicationHandoffNs", "PublicationApplyNs", "PublicationCommitNs", "CandidateBuildNs", "CandidateRecordNs",
+            "PublicationApplyNs", "CandidateBuildNs", "CandidateRecordNs",
             "MeshJobs", "MeshJobQueueNs", "MeshJobWorkNs", "TextureJobs", "TextureJobQueueNs", "TextureJobWorkNs",
             "MaterialJobs", "MaterialJobQueueNs", "MaterialJobWorkNs",
             "SceneSwitches", "SceneSwitchNs", "SceneDrainReleaseNs", "SceneInitialAsNs", "SceneInitialAsWaitNs",

@@ -1161,8 +1161,6 @@ RenderingDiagnostics DebugUI::GetRenderingDiagnostics() const
     sharc.adaptiveResolution = m_sharcSpatialResolution == 1;
     sharc.historyPrior = m_sharcHistoryPrior;
 
-    diagnostics.pixelCausticView = m_pixelCausticView;
-    diagnostics.pixelCausticInsertion = m_pixelCausticInsertion;
     ApplyReferenceOverrides(m_renderingOverrides, diagnostics);
 
     return diagnostics;
@@ -1695,99 +1693,6 @@ void DebugUI::DrawPathTraceReferenceSettings()
     else
     {
         ImGui::TextUnformatted("Waiting for a scene with ray-traced geometry.");
-    }
-
-    // R.9I.3: added to the undenoised path-traced image, which keeps its own naturally sampled caustics. Restricted
-    // domain (registered static reflector/receiver, one point light, PT denoiser Off); refusals render unchanged.
-    // Path Tracing's caustics are project settings; Reference's are Debug-only overrides.
-    {
-        ImGui::SeparatorText("Dedicated Caustics");
-        bool dedicatedCaustics = false;
-
-        if(reference)
-        {
-            dedicatedCaustics = OverrideCheckbox("Dedicated caustics (experimental, Debug only)",
-                overrides.referenceDedicatedCaustics.value_or(false), overrides.referenceDedicatedCaustics,
-                RenderingOverrideField::referenceDedicatedCaustics);
-            ImGui::BeginDisabled(!dedicatedCaustics);
-            OverrideCheckbox("Caustic-only view", overrides.referenceCausticOnlyView.value_or(false),
-                overrides.referenceCausticOnlyView, RenderingOverrideField::referenceCausticOnlyView);
-            ImGui::EndDisabled();
-        }
-        else
-        {
-            const bool wasDedicated = pathTracing.dedicatedCaustics;
-            dedicatedCaustics = OverrideCheckbox("Dedicated caustics (experimental)", wasDedicated,
-                overrides.dedicatedCaustics, RenderingOverrideField::dedicatedCaustics);
-
-            // The two caustics passes are exclusive; enabling one switches the other off.
-            if(dedicatedCaustics && !wasDedicated && pathTracing.pixelCentredCaustics)
-            {
-                overrides.pixelCentredCaustics = false;
-            }
-
-            ImGui::BeginDisabled(!dedicatedCaustics);
-            OverrideCheckbox("Caustic-only view", pathTracing.causticOnlyView, overrides.causticOnlyView,
-                RenderingOverrideField::causticOnlyView);
-            ImGui::EndDisabled();
-        }
-
-        // R.9I.3 production integration (P1: K = 1 estimator, caustics-only views): Path Tracing only.
-        ImGui::BeginDisabled(!isPathTracing);
-        const bool wasPixelCentred = pathTracing.pixelCentredCaustics;
-        const bool pixelCentredCaustics = OverrideCheckbox("Pixel-centred caustics (experimental)", wasPixelCentred,
-            overrides.pixelCentredCaustics, RenderingOverrideField::pixelCentredCaustics);
-
-        if(pixelCentredCaustics && !wasPixelCentred && pathTracing.dedicatedCaustics)
-        {
-            overrides.dedicatedCaustics = false;
-        }
-
-        ImGui::EndDisabled();
-
-        if (pixelCentredCaustics)
-        {
-            static const char* const views[] = {"Ordinary image", "Caustic diffuse", "Caustic specular",
-                                                "Caustic combined", "Caustic validity"};
-            int view = static_cast<int>(m_pixelCausticView);
-
-            if (ImGui::Combo("Caustic view", &view, views, IM_ARRAYSIZE(views)))
-            {
-                m_pixelCausticView = static_cast<std::uint32_t>(view);
-            }
-
-            // P2: needs a PT denoiser (the extraction it adds into); maxPathDepth 1 avoids the known overlap.
-            ImGui::Checkbox("Add to lighting before denoising (experimental)", &m_pixelCausticInsertion);
-
-            ImGui::TextWrapped("Pixel-centred: %s", m_pixelCausticReason.c_str());
-            ImGui::Text("Seams verified: %llu of %llu", static_cast<unsigned long long>(m_pixelCausticVerifiedSeams),
-                        static_cast<unsigned long long>(m_pixelCausticSeamVisits));
-            ImGui::Text("GPU-completed frames: %llu (faulted %llu, last flags 0x%X)",
-                        static_cast<unsigned long long>(m_pixelCausticCompletedFrames),
-                        static_cast<unsigned long long>(m_pixelCausticFaultedFrames), m_pixelCausticLastFaults);
-            ImGui::Text("Caustic memory: %.2f MiB",
-                        static_cast<double>(m_pixelCausticResourceBytes) / (1024.0 * 1024.0));
-        }
-
-        if (resolved.dedicatedCaustics)
-        {
-            ImGui::TextWrapped("Status: %s", m_causticReason.c_str());
-            ImGui::Text("Presented last frame: %s", m_causticPresented ? "yes" : "no");
-            ImGui::Text("Accumulated frames: %llu x 65536 attempts",
-                        static_cast<unsigned long long>(m_causticHistoryFrames));
-            ImGui::Text("Caustic memory: %.2f MiB", static_cast<double>(m_causticResourceBytes) / (1024.0 * 1024.0));
-        }
-
-        if (m_causticFaulted)
-        {
-            ImGui::TextWrapped("Numerical fault latched (flags 0x%X); contribution refused until acknowledged.",
-                               m_causticFaultFlags);
-
-            if (ImGui::Button("Acknowledge fault and reset caustics"))
-            {
-                m_causticAcknowledgeRequested = true;
-            }
-        }
     }
 
     ImGui::Separator();

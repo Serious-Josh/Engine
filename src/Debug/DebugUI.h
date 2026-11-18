@@ -35,7 +35,7 @@ class DebugUI
 {
     // Local diagnostics drive the Editor's render settings directly (UPSCALING.3C.2).
     friend class SceneHierarchyVerification;
-    friend class CausticVisibleVerification;
+    friend class RenderingVerification;
 
     public:
     bool ReferenceRayCountsEnabled() const { return m_referenceRayCountsEnabled; }
@@ -127,8 +127,6 @@ class DebugUI
         std::uint64_t accumulationBytes = 0;
         std::string denoiserPreparation;
         SharcStatus sharc;
-        std::string dedicatedCausticsReason;
-        bool dedicatedCausticsPresented = false;
     };
 
     RenderingStatus GetRenderingStatus() const
@@ -145,8 +143,6 @@ class DebugUI
         status.accumulationBytes = m_pathTraceResourceBytes;
         status.denoiserPreparation = m_pathTraceDenoiserPreparation;
         status.sharc = m_sharcStatus;
-        status.dedicatedCausticsReason = m_causticReason;
-        status.dedicatedCausticsPresented = m_causticPresented;
         return status;
     }
 
@@ -197,35 +193,6 @@ class DebugUI
     PathTraceDenoiserMode GetSelectedPathTraceDenoiserMode() const
     {
         return static_cast<PathTraceDenoiserMode>(GetEffectiveRenderingSettings().pathTracing.denoiser);
-    }
-
-    void SetPixelCausticsStatus(const std::string& reason, std::uint64_t verifiedSeams, std::uint64_t seamVisits,
-        std::uint64_t completedFrames, std::uint64_t faultedFrames, std::uint32_t lastFaults, std::uint64_t resourceBytes)
-    {
-        m_pixelCausticReason = reason;
-        m_pixelCausticVerifiedSeams = verifiedSeams;
-        m_pixelCausticSeamVisits = seamVisits;
-        m_pixelCausticCompletedFrames = completedFrames;
-        m_pixelCausticFaultedFrames = faultedFrames;
-        m_pixelCausticLastFaults = lastFaults;
-        m_pixelCausticResourceBytes = resourceBytes;
-    }
-
-    // One request per button press; the Engine forwards it to the explicit fault recovery boundary.
-    bool ConsumeCausticFaultAcknowledgeRequest()
-    {
-        return std::exchange(m_causticAcknowledgeRequested, false);
-    }
-
-    void SetDedicatedCausticsStatus(const std::string& reason, bool presentedLastFrame, bool faulted,
-        std::uint32_t faultFlags, std::uint64_t historyFrames, std::uint64_t resourceBytes)
-    {
-        m_causticReason = reason;
-        m_causticPresented = presentedLastFrame;
-        m_causticFaulted = faulted;
-        m_causticFaultFlags = faultFlags;
-        m_causticHistoryFrames = historyFrames;
-        m_causticResourceBytes = resourceBytes;
     }
 
     // DLSS eligibility against the transition and denoiser state last published to the panel (the shared rules).
@@ -499,22 +466,6 @@ class DebugUI
     bool m_pathTraceActiveLastFrame = false;
     std::uint32_t m_pathTraceAccumulatedSamples = 0;
     std::uint64_t m_pathTraceResourceBytes = 0;
-    std::string m_pixelCausticReason;
-    std::uint64_t m_pixelCausticVerifiedSeams = 0;
-    std::uint64_t m_pixelCausticSeamVisits = 0;
-    std::uint64_t m_pixelCausticCompletedFrames = 0;
-    std::uint64_t m_pixelCausticFaultedFrames = 0;
-    std::uint32_t m_pixelCausticLastFaults = 0;
-    std::uint64_t m_pixelCausticResourceBytes = 0;
-    std::uint32_t m_pixelCausticView = 0;
-    bool m_pixelCausticInsertion = false;
-    bool m_causticAcknowledgeRequested = false;
-    std::string m_causticReason;
-    bool m_causticPresented = false;
-    bool m_causticFaulted = false;
-    std::uint32_t m_causticFaultFlags = 0;
-    std::uint64_t m_causticHistoryFrames = 0;
-    std::uint64_t m_causticResourceBytes = 0;
 
     PathTraceRasterPrimaryStatus m_rasterPrimaryStatus;
 

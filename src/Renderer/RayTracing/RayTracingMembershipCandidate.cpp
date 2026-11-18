@@ -204,9 +204,6 @@ struct RayTracingSceneResources::CandidateState
     std::uint64_t generation = 0;
     std::uint64_t fence = 0;
     std::uint64_t fenceLifetime = 0;
-    // Provenance owner for newBLAS builds; reused stable BLAS are never attributed here.
-    std::uint64_t recordingOwner = 0;
-    std::uint64_t lastTLASGeneration = 0;
     bool uncertain = false;
     bool failed = false;
     bool valid = true;
@@ -894,11 +891,9 @@ bool RayTracingSceneResources::RecordReplacementCandidate(ID3D12Device5* device,
         return Fail(error, "Candidate recording state is invalid.");
     }
 
-    InvalidateProspectiveJoin();
     auto& state = *m_candidate;
     state.generation = generation; // Pin before the first build/copy command.
     state.failed = true;
-    state.recordingOwner = EnsureRecordingOwner();
 
     for (std::size_t index = 0; index < state.newMeshes.size(); ++index)
     {
@@ -912,11 +907,6 @@ bool RayTracingSceneResources::RecordReplacementCandidate(ID3D12Device5* device,
         {
             return Fail(error, "Candidate BLAS recording failed.");
         }
-
-        // Refused (left Unattributed) when owner identities are exhausted.
-        bottomLevel.AttributeCurrentBuild(bottomLevel.GetCurrentBuildCapture().identity,
-            {state.recordingOwner, generation});
-        AssociateRecordedBuild(device, *state.newMeshes[index], bottomLevel);
     }
 
     for (auto& dependency : state.dependencies)
@@ -951,10 +941,6 @@ bool RayTracingSceneResources::RecordReplacementCandidate(ID3D12Device5* device,
     {
         return Fail(error, "Candidate TLAS recording failed.");
     }
-
-    snapshot.topLevel.AttributeCurrentCapture(snapshot.topLevel.GetRecordingCapture(), {state.recordingOwner, generation});
-    state.lastTLASGeneration = generation;
-    InvalidateProspectiveJoin();
 
     state.failed = false;
     return true;
@@ -1130,7 +1116,6 @@ bool RayTracingSceneResources::RefreshReplacementTransforms(const ReplacementCan
         return Fail(error, "Candidate transform refresh state is invalid.");
     }
 
-    InvalidateProspectiveJoin();
     auto& state = *m_candidate;
     auto& snapshot = *state.snapshot;
     std::vector<std::size_t> allIndices;
@@ -1151,10 +1136,6 @@ bool RayTracingSceneResources::RefreshReplacementTransforms(const ReplacementCan
         return Fail(error, "Candidate full-transform TLAS refresh failed.");
     }
 
-    snapshot.topLevel.AttributeCurrentCapture(snapshot.topLevel.GetRecordingCapture(), {state.recordingOwner, generation});
-    state.lastTLASGeneration = generation;
-    InvalidateProspectiveJoin();
-
     state.failed = false;
     return true;
 }
@@ -1172,15 +1153,6 @@ bool RayTracingSceneResources::AttemptCandidateSubmission(std::uint64_t generati
     }
 
     m_candidate->uncertain = true;
-    m_candidate->snapshot->topLevel.TransitionCaptures({m_candidate->recordingOwner, generation},
-        TLASRecordingState::SubmissionUncertain);
-
-    for (auto& bottomLevel : m_candidate->newBLAS)
-    {
-        bottomLevel->TransitionRecording({m_candidate->recordingOwner, generation},
-            BLASRecordingState::SubmissionUncertain);
-    }
-
     return true;
 }
 
@@ -1199,15 +1171,6 @@ bool RayTracingSceneResources::ConfirmCandidateSubmission(std::uint64_t generati
 
     m_candidate->fence = context.GetLastSubmissionFenceValue();
     m_candidate->fenceLifetime = context.GetSubmissionLifetime();
-    m_candidate->snapshot->topLevel.ConfirmCaptures({m_candidate->recordingOwner, generation}, m_candidate->fence,
-        m_candidate->fenceLifetime);
-
-    for (auto& bottomLevel : m_candidate->newBLAS)
-    {
-        bottomLevel->ConfirmRecording({m_candidate->recordingOwner, generation}, m_candidate->fence,
-            m_candidate->fenceLifetime);
-    }
-
     m_candidate->generation = 0;
     m_candidate->uncertain = false;
     return true;
@@ -1218,14 +1181,6 @@ void RayTracingSceneResources::CandidateNotSubmitted(std::uint64_t generation)
     if (m_candidate && m_candidate->generation == generation)
     {
         m_candidate->uncertain = false;
-        m_candidate->snapshot->topLevel.TransitionCaptures({m_candidate->recordingOwner, generation},
-            TLASRecordingState::NotSubmitted);
-
-        for (auto& bottomLevel : m_candidate->newBLAS)
-        {
-            bottomLevel->TransitionRecording({m_candidate->recordingOwner, generation},
-                BLASRecordingState::NotSubmitted);
-        }
     }
 }
 
@@ -1235,65 +1190,6 @@ void RayTracingSceneResources::DiscardCandidateRecording(std::uint64_t generatio
     {
         m_candidate->generation = 0;
         m_candidate->failed = true;
-        m_candidate->snapshot->topLevel.TransitionCaptures({m_candidate->recordingOwner, generation}, TLASRecordingState::Discarded);
-
-        for (auto& bottomLevel : m_candidate->newBLAS)
-        {
-            bottomLevel->TransitionRecording({m_candidate->recordingOwner, generation},
-                BLASRecordingState::Discarded);
-        }
-    }
-}
-
-const BLASBuildRecording* RayTracingSceneResources::FindCandidateBuildRecording(
-    BLASBuildIdentity identity) const noexcept
-{
-    if (!m_candidate)
-    {
-        return nullptr;
-    }
-
-    for (const auto& bottomLevel : m_candidate->newBLAS)
-    {
-        if (!bottomLevel)
-        {
-            continue;
-        }
-
-        const auto& current = bottomLevel->GetCurrentBuildCapture().identity;
-
-        if (current.ownerLifetime == identity.ownerLifetime && current.buildID == identity.buildID)
-        {
-            return &bottomLevel->GetCurrentBuildRecording();
-        }
-    }
-
-    return nullptr;
-}
-
-TopLevelAccelerationStructure* RayTracingSceneResources::GetCandidateTopLevel() noexcept
-{
-    return m_candidate && m_candidate->snapshot ? &m_candidate->snapshot->topLevel : nullptr;
-}
-
-void RayTracingSceneResources::ObserveCandidateCompletion(std::uint64_t completed, std::uint64_t lifetime) noexcept
-{
-    if (!m_candidate)
-    {
-        return;
-    }
-
-    if(auto* topLevel = GetCandidateTopLevel())
-    {
-        topLevel->ObserveCaptureCompletion(completed, lifetime, m_candidate->recordingOwner);
-    }
-
-    for (auto& bottomLevel : m_candidate->newBLAS)
-    {
-        if (bottomLevel)
-        {
-            bottomLevel->ObserveCompletion(completed, lifetime);
-        }
     }
 }
 
@@ -1317,12 +1213,10 @@ void RayTracingSceneResources::CollectReplacementCandidate(const CommandContext&
 
     m_candidate->Shutdown();
     m_candidate.reset();
-    InvalidateProspectiveJoin();
 }
 
 void RayTracingSceneResources::ShutdownReplacementCandidate()
 {
-    InvalidateProspectiveJoin();
     if (m_candidate)
     {
         // Existing checked scene teardown has drained GPU work and discarded
@@ -1518,447 +1412,9 @@ RayTracingSceneResources::AdoptionReadiness RayTracingSceneResources::PrepareReg
     return AdoptionReadiness::Ready;
 }
 
-void RayTracingSceneResources::InvalidateProspectiveJoin() noexcept
-{
-    m_stagedProspectiveJoin.reset();
-    m_prospectiveJoinStatus = ProspectiveJoinStatus::Unavailable;
-}
-
-ProspectiveJoinStatus RayTracingSceneResources::PrepareProspectiveJoin(const ReplacementCandidate& candidate,
-    const FileSceneRuntime& runtime, FileSceneAssetCatalog& catalog, const CommandContext& context,
-    std::uint64_t rendererLifetime) noexcept
-{
-    InvalidateProspectiveJoin();
-    auto status = ProspectiveJoinStatus::WrongLifetime;
-    ProspectiveTLASGeometryJoinHandle joined;
-    if(rendererLifetime && candidate.m_rendererLifetime == rendererLifetime && candidate.m_state && candidate.m_state->snapshot &&
-        candidate.m_state->snapshot->instances.size() > MaxProspectiveRows)
-    {
-        status = ProspectiveJoinStatus::IncompleteCapture;
-    }
-    else if(rendererLifetime && candidate.m_rendererLifetime == rendererLifetime)
-    {
-        try
-        {
-            std::string error;
-            status = PollReplacementCandidate(candidate, context, runtime, catalog, error) == CandidateStatus::Ready ?
-                BuildGeometryJoin(candidate.m_state.get(), runtime, catalog, context, rendererLifetime, joined) :
-                ProspectiveJoinStatus::StaleCandidate;
-        }
-        catch(const std::bad_alloc&)
-        {
-            status = ProspectiveJoinStatus::AllocationFailed;
-        }
-        catch(...)
-        {
-            status = ProspectiveJoinStatus::ValidationFailed;
-        }
-    }
-    m_prospectiveJoinStatus = status;
-    if(status == ProspectiveJoinStatus::Ready)
-    {
-        m_stagedProspectiveJoin = std::move(joined);
-    }
-    return status;
-}
-
-ProspectiveJoinStatus RayTracingSceneResources::BuildGeometryJoin(const CandidateState* candidate,
-    const FileSceneRuntime& runtime, FileSceneAssetCatalog& catalog, const CommandContext& context,
-    std::uint64_t rendererLifetime, ProspectiveTLASGeometryJoinHandle& output, std::uint64_t currentFrameGeneration) noexcept
-{
-    output.reset();
-    try
-    {
-        // S0.3: one whole-scene metadata validation for this join's per-object lookups (read-only).
-        const FileSceneRuntime::MetadataValidationPass metadataPass(runtime);
-        std::string error;
-        const auto& snapshot = candidate ? *candidate->snapshot : *m_membership;
-        const auto& blasPointers = candidate ? candidate->blasPointers : m_blasRegistry.bottomLevelPointers;
-        const auto capture = snapshot.topLevel.GetRecordingCapture();
-
-        // W6.1: refuse an oversized capture before deriving any per-object identity.
-        if(!capture || capture->instances.size() > MaxProspectiveRows)
-        {
-            return ProspectiveJoinStatus::IncompleteCapture;
-        }
-
-        // Committed identities from the runtime. For a candidate, its Ready poll just proved them unchanged since preparation.
-        std::vector<SceneObjectMetadata> identities;
-        {
-            const auto objectCount = runtime.GetScene().GetRenderObjects().size();
-            identities.resize(objectCount);
-            std::vector<bool> seen(objectCount);
-
-            for(const auto& authored : runtime.GetFileScene().GetDocument().objects)
-            {
-                const auto metadata = runtime.GetObjectMetadata(authored.id, &error);
-
-                if(!metadata || metadata->runtimeIndex >= objectCount || seen[metadata->runtimeIndex])
-                {
-                    return ProspectiveJoinStatus::ValidationFailed;
-                }
-
-                seen[metadata->runtimeIndex] = true;
-                identities[metadata->runtimeIndex] = *metadata;
-            }
-
-            if(std::find(seen.begin(), seen.end(), false) != seen.end())
-            {
-                return ProspectiveJoinStatus::ValidationFailed;
-            }
-        }
-
-        const auto proposals = candidate ? std::span<const ResidencyProposal>(candidate->proposals) :
-            std::span<const ResidencyProposal>{};
-        const auto runtimeIdentity = candidate ? candidate->runtimeIdentity : runtime.GetRuntimeIdentity();
-        const auto structureRevision = candidate ? candidate->structureRevision : runtime.GetScene().GetStructureRevision();
-        const auto residencyRevision = candidate ? candidate->residencyRevision : runtime.GetResidencyRevision();
-        if(!capture->completeBLASReferences ||
-            capture->instances.size() != snapshot.instances.size() ||
-            capture->bottomLevels.size() != capture->instances.size() ||
-            snapshot.renderObjectToInstance.size() != identities.size() ||
-            snapshot.materialBindings.size() != identities.size())
-        {
-            return ProspectiveJoinStatus::IncompleteCapture;
-        }
-        TLASSubmissionEvidence submission;
-        bool proven = false;
-
-        if(currentFrameGeneration)
-        {
-            // P5B: the active membership's capture recorded in this still-open list, attributed to it; no fence yet.
-            proven = !candidate && m_recordingOwner && m_membership->recordingGeneration == currentFrameGeneration &&
-                !m_membership->submissionUncertain && snapshot.topLevel.GetSubmissionEvidence(capture, submission) &&
-                submission.state == TLASRecordingState::Recorded &&
-                submission.provenance.recordingOwner == m_recordingOwner &&
-                submission.provenance.generation == currentFrameGeneration;
-        }
-        else
-        {
-            proven = snapshot.topLevel.GetSubmissionEvidence(capture, submission) &&
-                submission.state == TLASRecordingState::Completed &&
-                submission.provenance.recordingOwner == m_recordingOwner && m_recordingOwner &&
-                submission.submissionFence && submission.submissionFence != UINT64_MAX &&
-                submission.submissionLifetime == context.GetSubmissionLifetime();
-        }
-
-        if(candidate)
-        {
-            proven = proven && candidate->lastTLASGeneration &&
-                submission.provenance.generation == candidate->lastTLASGeneration &&
-                candidate->recordingOwner == m_recordingOwner && submission.submissionFence == candidate->fence &&
-                submission.submissionLifetime == candidate->fenceLifetime;
-        }
-        else
-        {
-            // Latest active capture: its own observed Phase 2A completion, any generation.
-            proven = proven && submission.provenance.generation != 0;
-        }
-        if(!proven)
-        {
-            return ProspectiveJoinStatus::UnprovenRecording;
-        }
-        // Current-frame joins use their own bounded slots, so they never exhaust persistent/publication capacity.
-        auto* slots = currentFrameGeneration ? m_currentFrameJoins.data() : m_prospectiveJoins.data();
-        const std::size_t slotCount = currentFrameGeneration ? m_currentFrameJoins.size() : m_prospectiveJoins.size();
-        std::weak_ptr<const ProspectiveTLASGeometryJoin>* available = nullptr;
-        for(std::size_t slot = 0; slot < slotCount; ++slot)
-        {
-            if(slots[slot].expired())
-            {
-                available = &slots[slot];
-                break;
-            }
-        }
-        if(!available)
-        {
-            return ProspectiveJoinStatus::CapacityExceeded;
-        }
-        const auto budget = (std::min)(m_prospectiveMappingBudget, MaxProspectiveMappingBytes);
-        std::size_t bytes = sizeof(ProspectiveTLASGeometryJoin) + sizeof(AcceptedTLASGeometry);
-        const auto& sceneID = runtime.GetFileScene().GetDocument().id;
-        if(identities.size() > budget / sizeof(ProspectiveTLASGeometryJoin::Row) ||
-            !Charge(identities.size() * sizeof(ProspectiveTLASGeometryJoin::Row), budget, bytes) ||
-            !Charge(sceneID.size() + 1, budget, bytes))
-        {
-            return ProspectiveJoinStatus::MappingBudgetExceeded;
-        }
-        for(const auto& identity : identities)
-        {
-            if(!Charge(identity.objectID.size() + 1, budget, bytes) ||
-                !Charge(identity.meshReference.size() + 1, budget, bytes))
-            {
-                return ProspectiveJoinStatus::MappingBudgetExceeded;
-            }
-        }
-        if(m_materialBindingEpoch == UINT64_MAX || residencyRevision == UINT64_MAX)
-        {
-            return ProspectiveJoinStatus::ValidationFailed;
-        }
-        auto joined = std::make_shared<ProspectiveTLASGeometryJoin>();
-        joined->recordingOwner = m_recordingOwner;
-        joined->rendererLifetime = rendererLifetime;
-        joined->runtimeIdentity = runtimeIdentity;
-        joined->structureRevision = structureRevision;
-        joined->hierarchyRevision = runtime.GetHierarchyRevision();
-        joined->residencyRevision = residencyRevision;
-        joined->residencyCommitPending = !proposals.empty();
-        joined->anticipatedResidencyRevision = residencyRevision + (joined->residencyCommitPending ? 1 : 0);
-        joined->bindingEpoch = m_materialBindingEpoch;
-        // Candidate adoption advances the binding epoch; the active membership already owns its epoch.
-        joined->anticipatedBindingEpoch = m_materialBindingEpoch + (candidate ? 1 : 0);
-        joined->sceneID = sceneID;
-        joined->tlasCapture = capture;
-        joined->submission = submission;
-        joined->rows.reserve(identities.size());
-        const auto& authored = runtime.GetFileScene().GetDocument().objects;
-        std::unordered_map<std::string_view, std::size_t> authoredIndices;
-        authoredIndices.reserve(authored.size());
-
-        for(std::size_t index = 0; index < authored.size(); ++index)
-        {
-            authoredIndices.emplace(authored[index].id, index);
-        }
-
-        std::size_t nativeCount = 0;
-        const FileSceneAssetCatalog::ValidationPass validationPass(catalog);
-        for(std::size_t dense = 0; dense < identities.size(); ++dense)
-        {
-            const auto& identity = identities[dense];
-            if(identity.runtimeIndex != dense || identity.runtimeIdentity != runtimeIdentity || identity.sceneID != sceneID)
-            {
-                return ProspectiveJoinStatus::ValidationFailed;
-            }
-            ProspectiveTLASGeometryJoin::Row row;
-            row.objectID = identity.objectID;
-            row.meshReference = identity.meshReference;
-            row.denseSlot = dense;
-            if(const auto found = authoredIndices.find(identity.objectID); found != authoredIndices.end())
-            {
-                row.authoredIndex = found->second;
-            }
-            if(row.authoredIndex == SIZE_MAX)
-            {
-                return ProspectiveJoinStatus::ValidationFailed;
-            }
-            row.nativeInstance = snapshot.renderObjectToInstance[dense];
-            row.bindingRevision = identity.bindingRevision;
-            row.presentationTransform = runtime.GetScene().GetRenderObjects()[dense].GetPresentationTransform().currentModel;
-            const bool replaced = std::any_of(proposals.begin(), proposals.end(),
-                [&identity](const ResidencyProposal& proposal) { return proposal.objectID == identity.objectID; });
-            if(replaced && identity.bindingRevision == UINT64_MAX)
-            {
-                return ProspectiveJoinStatus::ValidationFailed;
-            }
-            row.anticipatedBindingRevision = identity.bindingRevision + (replaced ? 1 : 0);
-            row.mesh = snapshot.materialBindings[dense].mesh;
-            if(row.mesh)
-            {
-                if(row.nativeInstance != nativeCount || nativeCount >= capture->instances.size())
-                {
-                    return ProspectiveJoinStatus::DescriptorMismatch;
-                }
-                const auto& native = capture->instances[nativeCount];
-                const auto& logical = snapshot.instances[nativeCount];
-                const auto& reference = capture->bottomLevels[nativeCount];
-                if(logical.instanceID != dense || native.InstanceID != dense || native.InstanceMask != logical.mask ||
-                    native.Flags != D3D12_RAYTRACING_INSTANCE_FLAG_NONE || native.InstanceContributionToHitGroupIndex != 0 ||
-                    logical.bottomLevelIndex >= blasPointers.size() || !blasPointers[logical.bottomLevelIndex])
-                {
-                    return ProspectiveJoinStatus::DescriptorMismatch;
-                }
-                const auto& build = *blasPointers[logical.bottomLevelIndex];
-                row.registryIndex = logical.bottomLevelIndex;
-                const auto& actual = build.GetCurrentBuildCapture();
-                if(actual.identity.ownerLifetime != reference.identity.ownerLifetime || actual.identity.buildID != reference.identity.buildID ||
-                    actual.result != reference.result || !reference.result || reference.result.Get() != build.GetResource() ||
-                    native.AccelerationStructure != reference.result->GetGPUVirtualAddress())
-                {
-                    return ProspectiveJoinStatus::DescriptorMismatch;
-                }
-                for(unsigned int r = 0; r < 3; ++r)
-                {
-                    for(unsigned int c = 0; c < 4; ++c)
-                    {
-                        if(std::memcmp(&native.Transform[r][c], &logical.transform[r][c], sizeof(float)) != 0)
-                        {
-                            return ProspectiveJoinStatus::DescriptorMismatch;
-                        }
-
-                        // P5B: the recorded instance is exactly this row's presentation transform of this frame.
-                        if(currentFrameGeneration &&
-                            std::memcmp(&native.Transform[r][c], &row.presentationTransform.m[r][c], sizeof(float)) != 0)
-                        {
-                            return ProspectiveJoinStatus::DescriptorMismatch;
-                        }
-                    }
-                }
-                const auto receipt = catalog.DescribeMeshResidencyCandidate(row.meshReference, *row.mesh, &error);
-                if(!receipt || !catalog.ValidateMeshResidencyCandidate(*receipt, row.meshReference, &error) ||
-                    !(row.source = row.mesh->GetStaticSourceGeneration()) || !row.mesh->IsCurrentStaticSource(row.source))
-                {
-                    return ProspectiveJoinStatus::SourceUnavailable;
-                }
-                row.association = FindProspectiveAssociation(*row.mesh, reference);
-                if(!row.association)
-                {
-                    return ProspectiveJoinStatus::MissingAssociation;
-                }
-                ++nativeCount;
-            }
-            else if(row.nativeInstance != SIZE_MAX)
-            {
-                return ProspectiveJoinStatus::DescriptorMismatch;
-            }
-            joined->rows.push_back(std::move(row));
-        }
-        if(nativeCount != capture->instances.size())
-        {
-            return ProspectiveJoinStatus::DescriptorMismatch;
-        }
-        bytes = sizeof(*joined) + sizeof(AcceptedTLASGeometry);
-        if(!Charge(joined->rows.capacity() * sizeof(ProspectiveTLASGeometryJoin::Row), budget, bytes) ||
-            !Charge(joined->sceneID.capacity() + 1, budget, bytes))
-        {
-            return ProspectiveJoinStatus::MappingBudgetExceeded;
-        }
-        for(const auto& row : joined->rows)
-        {
-            if(!Charge(row.objectID.capacity() + 1, budget, bytes) || !Charge(row.meshReference.capacity() + 1, budget, bytes))
-            {
-                return ProspectiveJoinStatus::MappingBudgetExceeded;
-            }
-        }
-        joined->mappingBytes = bytes;
-        *available = joined;
-        output = std::move(joined);
-        return ProspectiveJoinStatus::Ready;
-    }
-    catch(const std::bad_alloc&)
-    {
-        return ProspectiveJoinStatus::AllocationFailed;
-    }
-    catch(...)
-    {
-        return ProspectiveJoinStatus::ValidationFailed;
-    }
-}
-
-RayTracingSceneResources::ReconstructionAcceptance RayTracingSceneResources::AcceptReconstructedGeometry(
-    const FileSceneRuntime& runtime, FileSceneAssetCatalog& catalog, const CommandContext& context,
-    const Scene* rendererScene, std::uint64_t rendererLifetime) noexcept
-{
-    // An unresolved candidate (including a canceled one awaiting collection) may
-    // still adopt; its coordinator remains authoritative until it is gone.
-    if(m_candidate || !m_publicationHandoff.expired() || m_membership->recordingGeneration)
-    {
-        return ReconstructionAcceptance::Pending;
-    }
-    const auto capture = m_membership->topLevel.GetRecordingCapture();
-    TLASSubmissionEvidence submission;
-    if(capture && m_membership->topLevel.GetSubmissionEvidence(capture, submission) &&
-        submission.state == TLASRecordingState::Submitted && !m_membership->submissionUncertain)
-    {
-        return ReconstructionAcceptance::Pending; // Drained, but not yet observed by collection.
-    }
-    if(!rendererLifetime || rendererScene != &runtime.GetScene() || m_acceptedGeometry)
-    {
-        return ReconstructionAcceptance::Refused;
-    }
-    ProspectiveTLASGeometryJoinHandle joined;
-    if(BuildGeometryJoin(nullptr, runtime, catalog, context, rendererLifetime, joined) != ProspectiveJoinStatus::Ready)
-    {
-        return ReconstructionAcceptance::Refused;
-    }
-    try
-    {
-        auto record = std::make_shared<AcceptedTLASGeometry>();
-        record->geometry = std::move(joined);
-        record->runtime = &runtime;
-        record->residencyRevision = record->geometry->residencyRevision;
-        record->bindingEpoch = record->geometry->bindingEpoch;
-        if(!MatchesAcceptedGeometry(*record, runtime, rendererScene, rendererLifetime))
-        {
-            return ReconstructionAcceptance::Refused;
-        }
-        m_acceptedGeometry = std::move(record);
-        return ReconstructionAcceptance::Accepted;
-    }
-    catch(...)
-    {
-        return ReconstructionAcceptance::Refused;
-    }
-}
-
-RayTracingSceneResources::PublicationHandoff RayTracingSceneResources::PreparePublicationHandoff(
-    const ReplacementCandidate& candidate, const FileSceneRuntime& runtime, const void* transaction,
-    PublicationKind kind) noexcept
-{
-    // A publication replacing this membership cannot leave older evidence current
-    // when optional preparation is unavailable. No accepted state is issued here.
-    m_acceptedGeometry.reset();
-    PublicationHandoff handoff;
-    if(!m_publicationHandoff.expired() || !transaction || !m_stagedProspectiveJoin || !candidate.m_state || candidate.m_state != m_candidate ||
-        !candidate.m_state->valid || candidate.m_state->failed || candidate.m_state->uncertain ||
-        candidate.m_state->generation || m_stagedProspectiveJoin->runtimeIdentity != runtime.GetRuntimeIdentity() ||
-        m_stagedProspectiveJoin->rendererLifetime != candidate.m_rendererLifetime ||
-        m_stagedProspectiveJoin->residencyCommitPending != (kind == PublicationKind::Residency) ||
-        m_stagedProspectiveJoin->tlasCapture != candidate.m_state->snapshot->topLevel.GetRecordingCapture())
-    {
-        return handoff;
-    }
-    try
-    {
-        handoff.record = std::make_shared<AcceptedTLASGeometry>();
-        handoff.record->geometry = m_stagedProspectiveJoin;
-        handoff.record->runtime = &runtime;
-        handoff.record->residencyRevision = m_stagedProspectiveJoin->anticipatedResidencyRevision;
-        handoff.record->bindingEpoch = m_stagedProspectiveJoin->anticipatedBindingEpoch;
-        handoff.candidate = candidate.m_state;
-        handoff.snapshot = candidate.m_state->snapshot.get();
-        handoff.runtime = &runtime;
-        handoff.transaction = transaction;
-        m_publicationHandoff = handoff.record;
-        m_stagedProspectiveJoin.reset(); // One consumed stage, one immediate transaction.
-    }
-    catch(...)
-    {
-        // Optional evidence allocation never affects ordinary publication.
-        handoff = {};
-    }
-    return handoff;
-}
-
-void RayTracingSceneResources::CommitPublicationAcceptance(PublicationHandoff&& handoff,
-    const FileSceneRuntime& runtime, const Scene* rendererScene, std::uint64_t rendererLifetime,
-    const void* transaction) noexcept
-{
-    m_acceptedGeometry.reset();
-    // Only an adopted exact candidate from the same immediate coordinator
-    // transaction can reach this commit. No lookup, hash, allocation or I/O.
-    const bool ownsHandoff = handoff.record && m_publicationHandoff.lock() == handoff.record;
-    if(ownsHandoff && handoff.candidate && !handoff.candidate->valid &&
-        handoff.snapshot == m_membership.get() && handoff.runtime == &runtime &&
-        transaction && transaction == handoff.transaction &&
-        MatchesAcceptedGeometry(*handoff.record, runtime, rendererScene, rendererLifetime))
-    {
-        m_acceptedGeometry = std::move(handoff.record);
-    }
-    if(ownsHandoff)
-    {
-        m_publicationHandoff.reset();
-    }
-    handoff = {};
-}
-
 void RayTracingSceneResources::AdoptPreparedCandidate(
     const ReplacementCandidate& candidate, const AdoptionEvidence& evidence) noexcept
 {
-    // Ordinary adoption clears staging/current evidence. Only a private token
-    // retained by the final publication owner can survive this operation.
-    m_acceptedGeometry.reset();
-    InvalidateProspectiveJoin();
-    ++m_membershipAdoptions;
     assert(candidate.m_state && candidate.m_state == m_candidate);
     auto& state = *m_candidate;
     const auto needed = evidence.stableBLASCount + evidence.newBLASCount;

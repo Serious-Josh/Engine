@@ -133,7 +133,7 @@ class Engine
     friend class CompositeWorldEditorVerification;
     friend class DemoWorldEditorVerification;
     friend class CompositePlacementStress;
-    friend class CausticVisibleVerification;
+    friend class RenderingVerification;
     friend class GamePlayGPUVerification;
     friend class AirPackagedParityVerification;
     friend class MemoryRegistryVerification;
@@ -526,11 +526,6 @@ class Engine
     bool BeginMeshResidencyRequest(const SceneObjectMetadata& selection, bool automatic);
     void StartAutomaticMeshResidency();
     void OnFileSceneActivated(std::chrono::steady_clock::time_point started);
-    // R.9I.3: explicit opt-in roles from "<scene>.caustics.json" beside a development scene file.
-    // Absent, malformed or naming missing objects: no registration (caustics refuse as Unregistered).
-    // A registered asset mesh is requested as the catalog's static source before residency starts.
-    void LoadSceneCausticRegistration(FileBackedDemoScene& scene);
-    std::optional<Renderer::CausticRegistration> m_sceneCausticRegistration;
     void ContinueAutomaticMeshResidencyAfterReplacement(std::uint64_t previousRuntimeIdentity) noexcept;
     void AdvanceAutomaticMeshResidency();
     // failedObjectID names the batch entry responsible for a rejection, when known.

@@ -290,11 +290,7 @@ namespace
             PT::MaximumUncertaintyFloorLog10);
 
         pathTracingReader.Child("sharc").Bool("enabled", pathTracing.sharc);
-
-        const auto caustics = pathTracingReader.Child("caustics");
-        caustics.Bool("dedicated", pathTracing.dedicatedCaustics);
-        caustics.Bool("causticOnlyView", pathTracing.causticOnlyView);
-        caustics.Bool("pixelCentred", pathTracing.pixelCentredCaustics);
+        // PT.1: an older file's rendering.pathTracing.caustics block (removed estimators) is ignored.
     }
 
     // The JSON object member `key`, created (or replaced, when it is not an object) for writing.
@@ -446,15 +442,6 @@ bool ValidateProjectSettings(ProjectSettings& settings, std::vector<std::string>
     Repair(pathTracing.uncertaintyFloorLog10, ClampFloat(pathTracing.uncertaintyFloorLog10, PT::MinimumUncertaintyFloorLog10,
         PT::MaximumUncertaintyFloorLog10, pathTracingDefaults.uncertaintyFloorLog10),
         "rendering.pathTracing.denoising.uncertaintyFloorLog10 was outside -6 to -1; clamped.", warnings, valid);
-
-    // Enabling one caustic technique turns the other off in the Debug panel, so both can never be
-    // requested together; a file that asks for both keeps dedicated caustics.
-    if(pathTracing.dedicatedCaustics && pathTracing.pixelCentredCaustics)
-    {
-        Repair(pathTracing.pixelCentredCaustics, false,
-            "rendering.pathTracing.caustics: dedicated and pixelCentred are mutually exclusive; pixelCentred turned off.",
-            warnings, valid);
-    }
 
     return valid;
 }
@@ -636,11 +623,8 @@ namespace ProjectSettingsFile
         denoising["uncertaintyFloorLog10"] = pt.uncertaintyFloorLog10;
 
         ObjectMember(pathTracing, "sharc")["enabled"] = pt.sharc;
-
-        auto& caustics = ObjectMember(pathTracing, "caustics");
-        caustics["dedicated"] = pt.dedicatedCaustics;
-        caustics["causticOnlyView"] = pt.causticOnlyView;
-        caustics["pixelCentred"] = pt.pixelCentredCaustics;
+        // PT.1: the removed estimators' block is not carried forward from an older file.
+        pathTracing.erase("caustics");
 
         auto& steamAudio = ObjectMember(ObjectMember(document, "audio"), "steamAudio");
         steamAudio["enabled"] = settings.audio.steamAudio;

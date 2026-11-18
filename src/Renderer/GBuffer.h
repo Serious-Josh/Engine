@@ -16,8 +16,8 @@ class GBuffer
 
     // R.9I.3 P5D.2A raster identity (render target 4): (TLAS InstanceID + 1, TLAS primitive index) of the surviving
     // fragment. Cleared to (0, 0) = background; (InvalidIdentity, InvalidIdentity) = a draw with no exact TLAS mapping.
-    // Always allocated with the G-buffer: D3D12 permits a null RTV only where the pipeline format is UNKNOWN, so a
-    // caustics-only allocation would need a second set of G-buffer pipelines.
+    // Always allocated with the G-buffer (PSR and NRD preparation read it): D3D12 permits a null RTV only where the
+    // pipeline format is UNKNOWN, so an optional allocation would need a second set of G-buffer pipelines.
     static constexpr DXGI_FORMAT IdentityFormat = DXGI_FORMAT_R32G32_UINT;
     static constexpr unsigned int InvalidIdentity = 0xFFFFFFFFu;
 

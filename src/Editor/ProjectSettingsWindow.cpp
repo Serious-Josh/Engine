@@ -497,7 +497,7 @@ void Editor::DrawRenderingSettingsCategory(const DebugUI& debugUI, bool editable
     ImGui::PushTextWrapPos(0.0f);
     ImGui::TextDisabled("Saved in ProjectSettings.json and packaged by Build Game. Built games render every lighting "
         "mode, PSR, SHARC and DLSS. DLSS needs nvngx_dlss.dll beside the game's executable, which Build Game does not "
-        "ship yet; without it the game renders at Native. Caustics are Editor-only.");
+        "ship yet; without it the game renders at Native.");
     ImGui::PopTextWrapPos();
     const std::size_t overrides = CountOverrides(debugUI.GetRenderingOverrides());
 
@@ -636,30 +636,6 @@ void Editor::DrawRenderingSettingsCategory(const DebugUI& debugUI, bool editable
         ImGui::Checkbox("Enable SHARC (experimental)", &pathTracing.sharc);
         Tooltip("Cached radiance for path continuation. Its tuning stays in the Debug panel.");
         SessionOverrideNote(debugUI, Field::sharc);
-
-        ImGui::SeparatorText("Dedicated Caustics");
-
-        // The two caustics passes are exclusive; enabling one switches the other off.
-        if(ImGui::Checkbox("Dedicated caustics (experimental)", &pathTracing.dedicatedCaustics) &&
-            pathTracing.dedicatedCaustics)
-        {
-            pathTracing.pixelCentredCaustics = false;
-        }
-
-        Tooltip("Restricted domain: a registered static reflector and receiver, one point light, PT denoiser Off.");
-        SessionOverrideNote(debugUI, Field::dedicatedCaustics);
-        ImGui::BeginDisabled(!pathTracing.dedicatedCaustics);
-        ImGui::Checkbox("Caustic-only view", &pathTracing.causticOnlyView);
-        SessionOverrideNote(debugUI, Field::causticOnlyView);
-        ImGui::EndDisabled();
-
-        if(ImGui::Checkbox("Pixel-centred caustics (experimental)", &pathTracing.pixelCentredCaustics) &&
-            pathTracing.pixelCentredCaustics)
-        {
-            pathTracing.dedicatedCaustics = false;
-        }
-
-        SessionOverrideNote(debugUI, Field::pixelCentredCaustics);
     }
 
     ImGui::EndDisabled();
@@ -792,9 +768,6 @@ void Editor::DrawRenderingRuntimeStatus(const DebugUI& debugUI)
     {
         ImGui::TextWrapped("SHARC: %s", status.sharc.preparation.c_str());
     }
-
-    ImGui::TextWrapped("Dedicated caustics: %s", status.dedicatedCausticsReason.empty() ? "off" :
-        status.dedicatedCausticsReason.c_str());
 }
 
 void Editor::DrawStartupSceneSection(const IDemoScene& demoScene)

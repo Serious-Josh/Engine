@@ -337,7 +337,7 @@ private:
     friend class DescriptorRecoveryVerification;
     friend class ViewportMaterialDropVerification;
     friend class ResidencyBatchVerification;
-    friend class CausticVisibleVerification;
+    friend class RenderingVerification;
     friend class GamePlayGPUVerification;
     friend class MemoryRegistryVerification;
     friend class AirPackagedParityVerification;

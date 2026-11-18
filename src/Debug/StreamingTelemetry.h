@@ -76,9 +76,7 @@ namespace StreamingTelemetry
         PublicationPollNs,
         PublicationSourceValidationNs,
         PublicationAdoptionNs,
-        PublicationHandoffNs,
         PublicationApplyNs,
-        PublicationCommitNs,
         CandidateBuildNs,
         CandidateRecordNs,
 

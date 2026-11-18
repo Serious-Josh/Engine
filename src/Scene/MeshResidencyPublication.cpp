@@ -493,34 +493,14 @@ MeshResidencyPublication::AcceptanceResult MeshResidencyPublication::PublishAtBo
         return result;
     }
 
-    // Ordinary readiness is complete. Keep every unique source pinned through
-    // optional preparation and the noexcept commit; result strings already exist.
+    // Ordinary readiness is complete. Every unique source stays pinned through the noexcept commit; result strings
+    // already exist.
     assert(sourcePins && static_cast<bool>(*sourcePins));
-    // Optional advisory evidence: refusal never changes ordinary publication.
-    std::optional<StreamingTelemetry::Scope> detailTiming(std::in_place, StreamingTelemetry::Metric::PublicationHandoffNs);
-    // S0.3: one metadata validation for the join and handoff, which only read the runtime; it ends before the commit mutates.
-    std::optional<FileSceneRuntime::MetadataValidationPass> metadataPass(std::in_place, std::as_const(runtime));
-    // W6.1: only when a consumer reads accepted geometry (the handoff below then carries nothing).
-    if (renderer.WantsAcceptedTLASGeometry())
-    {
-        renderer.m_rayTracingScene.PrepareProspectiveJoin(*m_candidate, runtime, catalog,
-            renderer.m_commandContext, renderer.m_sceneResourceLifetime);
-    }
-
-    auto geometryHandoff = renderer.m_rayTracingScene.PreparePublicationHandoff(*m_candidate, runtime, this,
-        RayTracingSceneResources::PublicationKind::Residency);
-    metadataPass.reset();
-    detailTiming.reset();
     result.published = true;
     StreamingTelemetry::Add(StreamingTelemetry::Metric::Publications, 1);
     StreamingTelemetry::Add(StreamingTelemetry::Metric::PublicationEntries, m_sceneToken.entryCount);
-    detailTiming.emplace(StreamingTelemetry::Metric::PublicationApplyNs);
+    const StreamingTelemetry::Scope applyTiming(StreamingTelemetry::Metric::PublicationApplyNs);
     ApplyPreparedPublication(renderer, runtime, evidence);
-    detailTiming.emplace(StreamingTelemetry::Metric::PublicationCommitNs);
-    // GPU adoption, CPU residency and presentation/binding updates are complete.
-    renderer.m_rayTracingScene.CommitPublicationAcceptance(std::move(geometryHandoff), runtime,
-        renderer.m_sceneResourceScene, renderer.m_sceneResourceLifetime, this);
-    detailTiming.reset();
     return result;
 }
 

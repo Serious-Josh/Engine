@@ -429,8 +429,6 @@ add_library(EngineCore OBJECT
     src/Renderer/Passes/NrdHistoryConfidencePass.cpp
     src/Renderer/Passes/ReflectionContributionLimitPass.cpp
     src/Renderer/Passes/NrdReflectionResolvePass.cpp
-    src/Renderer/Caustics/CausticPass.cpp
-    src/Renderer/Caustics/PixelCausticPass.cpp
     src/DemoContent/DemoSceneManager.cpp
     src/DemoContent/MirrorTestScene.cpp
     src/Renderer/GpuTimestampProfiler.cpp
@@ -834,18 +832,6 @@ if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Engine/t
     endif()
 endif()
 # Local-only R.9I.3A classification verification; no production shader dependency.
-if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Renderer/tests/AdaptiveCaustic/CMakeLists.txt")
-    add_subdirectory(src/Renderer/tests/AdaptiveCaustic)
-endif()
-
-if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Renderer/tests/CausticContracts/CMakeLists.txt")
-    add_subdirectory(src/Renderer/tests/CausticContracts)
-endif()
-
-if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Renderer/tests/CausticClassification/CMakeLists.txt")
-    add_subdirectory(src/Renderer/tests/CausticClassification)
-endif()
-
 # Local-only RTXPT.3 Batch 1 RTXDI foundation verification (headless D3D12), same guard as LightDataTests.
 if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Renderer/tests/RtxdiFoundationTests.cpp")
     add_executable(RtxdiFoundationTests src/Renderer/tests/RtxdiFoundationTests.cpp)

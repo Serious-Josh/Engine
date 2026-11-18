@@ -797,7 +797,7 @@ private:
     friend class CompositeWorldEditorVerification;
     friend class DemoWorldEditorVerification;
     friend class CompositePlacementStress;
-    friend class CausticVisibleVerification;
+    friend class RenderingVerification;
     friend class GamePlayGPUVerification;
     friend class MemoryRegistryVerification;
     friend class ScriptWorkflowVerification;

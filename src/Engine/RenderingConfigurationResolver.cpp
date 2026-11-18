@@ -208,17 +208,6 @@ RenderingConfiguration ResolveRenderingConfiguration(const RenderingSettings& se
             ToPsrDebugView(pathTracing.psrDebugView) : ToneMapDebugView::None;
         configuration.cameraJitter = pathTracing.cameraJitter;
         configuration.renderScaleIndex = ToRenderScaleIndex(pathTracing, diagnostics);
-
-        configuration.dedicatedCaustics = pathTracing.dedicatedCaustics;
-        configuration.causticOnlyView = pathTracing.dedicatedCaustics && pathTracing.causticOnlyView;
-        configuration.pixelCentredCaustics = pathTracing.pixelCentredCaustics && !pathTracing.dedicatedCaustics;
-        configuration.pixelCausticView = configuration.pixelCentredCaustics ? diagnostics.pixelCausticView : 0u;
-        configuration.pixelCausticInsertion = configuration.pixelCentredCaustics && diagnostics.pixelCausticInsertion;
-    }
-    else if(isReference)
-    {
-        configuration.dedicatedCaustics = diagnostics.referenceDedicatedCaustics;
-        configuration.causticOnlyView = diagnostics.referenceDedicatedCaustics && diagnostics.referenceCausticOnlyView;
     }
 
     return configuration;

@@ -31,8 +31,6 @@ void ApplyReferenceOverrides(const RenderingOverrides& overrides, RenderingDiagn
         diagnostics.referenceQuality = quality;
     }
 
-    diagnostics.referenceDedicatedCaustics = overrides.referenceDedicatedCaustics.value_or(false);
-    diagnostics.referenceCausticOnlyView = overrides.referenceCausticOnlyView.value_or(false);
 }
 
 bool IsOverridden(const RenderingOverrides& overrides, RenderingOverrideField field)

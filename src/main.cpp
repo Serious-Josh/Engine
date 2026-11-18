@@ -41,7 +41,7 @@ int VerifyCompositePlacementStress(const std::filesystem::path& outputRoot);
 int VerifyResidencyBoundary(const std::filesystem::path& outputRoot);
 int VerifyLevelEditModes(const std::filesystem::path& outputRoot);
 int VerifySceneDocumentCache(const std::filesystem::path& outputRoot);
-int VerifyCausticsVisible(const std::filesystem::path& project, const std::filesystem::path& out);
+int VerifyRendering(const std::filesystem::path& project, const std::filesystem::path& out);
 int VerifyGamePlayGPU(const std::filesystem::path& projectDirectory, const std::filesystem::path& scene);
 int VerifyMemoryRegistry(const std::filesystem::path& projectDirectory, const std::filesystem::path& scene);
 int VerifyMemorySoak(const std::filesystem::path& projectDirectory, const std::filesystem::path& scene, int cycles);
@@ -530,9 +530,9 @@ int main(int argc, char** argv)
     {
         return MigrateSceneLighting(std::filesystem::absolute(argv[2]), std::stof(argv[3]), std::filesystem::absolute(argv[4]));
     }
-    if(argc == 4 && std::string_view(argv[1]) == "--verify-caustics-visible")
+    if(argc == 4 && std::string_view(argv[1]) == "--verify-rendering")
     {
-        return VerifyCausticsVisible(std::filesystem::absolute(argv[2]), std::filesystem::absolute(argv[3]));
+        return VerifyRendering(std::filesystem::absolute(argv[2]), std::filesystem::absolute(argv[3]));
     }
     if(argc == 4 && std::string_view(argv[1]) == "--verify-physics-performance")
     {

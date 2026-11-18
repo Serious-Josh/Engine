@@ -141,12 +141,6 @@ struct PathTracingRenderingSettings
 
     bool sharc = false;
 
-    // Dedicated and pixel-centred caustics are mutually exclusive. Caustic-only view applies only with
-    // dedicated caustics, but its value is kept while they are off (the Debug panel behaves the same).
-    bool dedicatedCaustics = false;
-    bool causticOnlyView = false;
-    bool pixelCentredCaustics = false;
-
     bool operator==(const PathTracingRenderingSettings&) const = default;
 };
 

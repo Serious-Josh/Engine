@@ -50,13 +50,6 @@ struct RenderingConfiguration
     bool dlssRequested = false;
     bool dlssInputPreparation = false;
     SharcSettings sharc{};
-    bool pixelCentredCaustics = false;
-    std::uint32_t pixelCausticView = 0;
-    bool pixelCausticInsertion = false;
-
-    // Path Tracing, and Reference through a Debug panel request only.
-    bool dedicatedCaustics = false;
-    bool causticOnlyView = false;
 
     // R1.3: the volumetric fog's quality preset and resolution basis, in every lighting mode (RenderingSettings::volumetrics).
     AirMistQuality volumetricQuality = AirMistQuality::Medium;
@@ -75,15 +68,10 @@ struct RenderingDiagnostics
     PathTraceDenoiserStages denoiserStages{};
     // SHARC tuning; enabled comes from the settings, and historyPrior is the request (Engine denoiser only).
     SharcSettings sharcTuning{};
-    std::uint32_t pixelCausticView = 0;
-    bool pixelCausticInsertion = false;
 
     // Reference quality requested by the Debug panel, whose quality sliders both path-traced modes share
     // until PS.2C. Absent: Reference's fixed internal quality.
     std::optional<PathTraceReferenceSettings> referenceQuality;
-    // Dedicated caustics requested for Reference by the Debug panel (no project setting reaches Reference).
-    bool referenceDedicatedCaustics = false;
-    bool referenceCausticOnlyView = false;
 
     bool operator==(const RenderingDiagnostics&) const = default;
 };
@@ -99,8 +87,7 @@ bool IsDlssConfigurationEligible(const RenderingConfiguration& configuration, Re
 bool IsDlssPreparing(const RenderingConfiguration& configuration, RendererLightingMode activeMode,
     bool denoiserPreparing);
 
-// The one application path of a configuration: its per-frame values into options, and the caustic
-// passes through their renderer setters (before the frame's caustic snapshot boundary).
+// The one application path of a configuration: its per-frame values into options.
 void ApplyRenderingConfiguration(const RenderingConfiguration& configuration, Renderer& renderer,
     RendererOptions& options);
 

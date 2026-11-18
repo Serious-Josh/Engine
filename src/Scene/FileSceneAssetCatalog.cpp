@@ -28,12 +28,6 @@
 #include <stdexcept>
 #include <utility>
 
-namespace
-{
-    // Provenance only, never asset identity: marks the catalog builtin triangle's source generation.
-    constexpr std::uint64_t BuiltinTriangleFixtureID = 0x6275696C74726931ull;
-}
-
 const Mesh* FileSceneAssetCatalog::FindBuiltinMesh(std::string_view reference) const noexcept
 {
     if (reference == "builtin:sphere")
@@ -702,8 +696,7 @@ bool FileSceneAssetCatalog::Initialize(
     m_sphereGeometry.boundsMax = m_sphereMesh.GetBounds().max;
     m_sphereGeometry.metadata = m_sphereMesh.GetMetadata();
 
-    // 4x4 right triangle in the XZ plane facing +Y. Every coordinate is on the 1/1024 grid and the
-    // normal is exactly axial, so the caustic geometry certificate admits it without widening.
+    // 4x4 right triangle in the XZ plane facing +Y.
     m_triangleGeometry.vertices.resize(3);
     const float corners[3][2] = {{-2.0f, -2.0f}, {-2.0f, 2.0f}, {2.0f, -2.0f}};
 
@@ -720,13 +713,10 @@ bool FileSceneAssetCatalog::Initialize(
     }
 
     m_triangleGeometry.indices = {0, 1, 2};
-    CausticContracts::Geometry::GeometrySourceHandle triangleSource;
-    const CausticContracts::Geometry::StaticSourceRequest triangleRequest{m_triangleGeometry.vertices,
-        m_triangleGeometry.indices, CausticContracts::Geometry::Topology::IndexedUInt32Triangles, 0, 1, {},
-        BuiltinTriangleFixtureID};
 
-    if (m_triangleMesh.InitializeWithStaticSource(device, uploader, descriptorHeap, triangleRequest,
-            triangleSource).status != CausticContracts::Geometry::AdmissionStatus::Ready)
+    if (!m_triangleMesh.Initialize(device, uploader, descriptorHeap, m_triangleGeometry.vertices.data(),
+            m_triangleGeometry.vertices.size(), m_vertexLayout, m_triangleGeometry.indices.data(),
+            m_triangleGeometry.indices.size()))
     {
         Shutdown();
         return false;
@@ -734,7 +724,6 @@ bool FileSceneAssetCatalog::Initialize(
 
     m_triangleGeometry.boundsMin = m_triangleMesh.GetBounds().min;
     m_triangleGeometry.boundsMax = m_triangleMesh.GetBounds().max;
-    // Exactly the default metadata; SetMetadata would revoke the static source.
     m_triangleGeometry.metadata = m_triangleMesh.GetMetadata();
 
     constexpr unsigned char whitePixel[4] = {
@@ -809,10 +798,6 @@ void FileSceneAssetCatalog::Shutdown()
         m_geometryRenderer = nullptr;
     }
 
-    m_staticSourceSelection.reset();
-    m_staticSourceDiagnostic = {};
-    // m_admittedSources is intentionally not cleared: external historical
-    // generations must remain charged across this owner's reinitialization.
     CancelTextureStreaming();
     m_streamingTextures.clear();
     m_materialBindingRevisions.clear();
@@ -1664,124 +1649,6 @@ bool FileSceneAssetCatalog::PublishWorkingMaterialParameters(const RuntimeMateri
     }
 }
 
-bool FileSceneAssetCatalog::ValidateStaticSourceSelection(const StaticSourceSelection& selection) const
-{
-    if(!m_initialized || selection.catalogIdentity != m_catalogIdentity || !selection.cooked ||
-        !selection.cooked->asset || !selection.cooked->metadata)
-    {
-        return false;
-    }
-
-    const auto& evidence = *selection.cooked;
-    const auto reference = evidence.asset->assetID.ToReference();
-
-    if(!ValidateCookedMeshResidencyEvidence(evidence, reference))
-    {
-        return false;
-    }
-
-    if(m_archiveScene)
-    {
-        return ValidateArchiveMesh(reference, evidence.asset.get(), evidence.metadata.get(), nullptr);
-    }
-
-    const auto* record = m_registry ? m_registry->Find(evidence.asset->assetID) : nullptr;
-    return record && record->type == AssetType::Mesh && record->meshImportUnits == evidence.asset->units &&
-        std::filesystem::canonical(m_projectRoot).generic_string() == evidence.asset->mapping.projectNamespace;
-}
-
-FileSceneAssetCatalog::StaticSourceRequestStatus FileSceneAssetCatalog::RequestStaticSourceAssets(
-    std::vector<std::string> assetIDs)
-{
-    m_staticSourceAssetRequests.clear();
-
-    if(assetIDs.empty())
-        return StaticSourceRequestStatus::Cleared;
-
-    if(std::any_of(assetIDs.begin(), assetIDs.end(), [](const std::string& id) { return id.empty(); }))
-        return StaticSourceRequestStatus::EmptyAssetID;
-
-    if(assetIDs.size() > MaxStaticSources)
-        return StaticSourceRequestStatus::Overflow;
-
-    std::sort(assetIDs.begin(), assetIDs.end());
-
-    if(std::adjacent_find(assetIDs.begin(), assetIDs.end()) != assetIDs.end())
-        return StaticSourceRequestStatus::Duplicate;
-
-    m_staticSourceAssetRequests = std::move(assetIDs);
-    return StaticSourceRequestStatus::Ready;
-}
-
-bool FileSceneAssetCatalog::HasLiveStaticSource() const noexcept
-{
-    return std::any_of(m_admittedSources.begin(), m_admittedSources.end(),
-        [](const AdmittedStaticSource& slot) { return !slot.generation.expired(); });
-}
-
-bool FileSceneAssetCatalog::HasLiveStaticSource(const std::string& assetID) const noexcept
-{
-    return std::any_of(m_admittedSources.begin(), m_admittedSources.end(),
-        [&](const AdmittedStaticSource& slot) { return slot.assetID == assetID && !slot.generation.expired(); });
-}
-
-FileSceneAssetCatalog::AdmittedStaticSource* FileSceneAssetCatalog::FindFreeStaticSourceSlot() noexcept
-{
-    for(auto& slot : m_admittedSources)
-    {
-        if(slot.generation.expired())
-            return &slot;
-    }
-
-    return nullptr;
-}
-
-FileSceneAssetCatalog::StaticSourceAdmissionStatus FileSceneAssetCatalog::ConfigureStaticSourceAdmission(
-    const ProjectMeshPreparationService::Completion& completion, const ProjectMeshPreparationService& preparation,
-    std::uint32_t firstPrimitive, std::uint32_t primitiveCount, std::uint64_t fixtureID)
-{
-    using Status = StaticSourceAdmissionStatus;
-    m_staticSourceDiagnostic = {Status::InvalidSource};
-
-    if(completion.identity.sourceKind != MeshPreparationSourceKind::Cooked ||
-        completion.identity.mode != ProjectMeshPreparationService::PreparationMode::Geometry ||
-        !completion.geometry || !fixtureID || !primitiveCount)
-    {
-        return m_staticSourceDiagnostic.status;
-    }
-
-    // Existing consumption validation proves the provider/project binding,
-    // cancellation receipt and full geometry/metadata agreement without uploading.
-    const auto retained = RetainPreparedCookedMetadata(
-        completion.identity.cooked ? completion.identity.cooked->assetID.ToReference() : std::string{},
-        completion, preparation);
-
-    if(retained.status != ProjectMeshPreparationService::Status::Available)
-    {
-        return m_staticSourceDiagnostic.status;
-    }
-
-    const auto key = completion.identity.CacheKey();
-
-    if(m_projectMeshes.contains(key))
-    {
-        m_staticSourceDiagnostic.status = Status::LateConfiguration;
-        return m_staticSourceDiagnostic.status;
-    }
-
-    StaticSourceSelection selection{key, completion.geometry, retained.evidence, m_catalogIdentity,
-        firstPrimitive, primitiveCount, fixtureID};
-
-    if(!ValidateStaticSourceSelection(selection))
-    {
-        return m_staticSourceDiagnostic.status;
-    }
-
-    m_staticSourceSelection = std::move(selection);
-    m_staticSourceDiagnostic.status = Status::Configured;
-    return m_staticSourceDiagnostic.status;
-}
-
 Mesh* FileSceneAssetCatalog::CreateProjectMesh(const ProjectMeshCPUCache::Key& key,
     std::shared_ptr<const ImportedMesh> prepared, std::shared_ptr<const CookedMeshResidencyEvidence> cooked,
     Renderer* deferredUploads)
@@ -1792,122 +1659,8 @@ Mesh* FileSceneAssetCatalog::CreateProjectMesh(const ProjectMeshCPUCache::Key& k
     asset->geometry = std::move(prepared);
     asset->cooked = std::move(cooked);
     const auto& geometry = *asset->geometry;
-    using Status = StaticSourceAdmissionStatus;
-    using namespace CausticContracts::Geometry;
-    m_staticSourceDiagnostic = {m_staticSourceSelection ? Status::NotSelected : Status::Disabled};
-    bool admitted = false;
     const bool uploaded = SceneSwitchTiming::MeasureCall(SceneSwitchTiming::Stage::MeshUpload, [&]()
     {
-        if(m_staticSourceSelection && m_staticSourceSelection->key == key)
-        {
-            const auto& selection = *m_staticSourceSelection;
-            const auto selectedGeometry = selection.geometry.lock();
-            const bool sameOwner = selectedGeometry == asset->geometry &&
-                !selectedGeometry.owner_before(asset->geometry) && !asset->geometry.owner_before(selectedGeometry);
-            const bool sameCooked = asset->cooked && selection.cooked->asset &&
-                *asset->cooked->asset == *selection.cooked->asset &&
-                asset->cooked->provider == selection.cooked->provider &&
-                asset->cooked->current == selection.cooked->current;
-            std::string validation;
-
-            if(!sameOwner || !sameCooked || !ValidateStaticSourceSelection(selection))
-            {
-                m_staticSourceDiagnostic.status = Status::InvalidSource;
-            }
-            else if(!ValidateMeshMetadata(geometry.metadata, geometry.indices.size(), validation))
-            {
-                m_staticSourceDiagnostic.status = Status::InvalidMetadata;
-            }
-            else if(geometry.indices.size() > UINT32_MAX)
-            {
-                m_staticSourceDiagnostic.status = Status::InvalidMetadata;
-            }
-            else if(HasLiveStaticSource())
-            {
-                // The cooked selection keeps its single-source contract: any live generation refuses it.
-                m_staticSourceDiagnostic.status = Status::CapacityExceeded;
-            }
-            else
-            {
-                // Owner-thread transaction: no callbacks or competing admission
-                // run while this empty Mesh reserves the sole generation slot.
-                StaticSourceRequest request{geometry.vertices, geometry.indices, Topology::IndexedUInt32Triangles,
-                    selection.firstPrimitive, selection.primitiveCount, {}, selection.fixtureID};
-                GeometrySourceHandle source;
-                // The prepared metadata is installed inside the admission (never SetMetadata,
-                // which deliberately revokes); material identity still comes from these slots.
-                const auto result = asset->mesh.InitializeWithStaticSource(
-                    m_device, *m_uploader, *m_descriptorHeap, request, source, &geometry.metadata);
-                m_staticSourceDiagnostic.preparation = result;
-
-                if(result.status == AdmissionStatus::Ready)
-                {
-                    if(asset->mesh.GetMetadata() != geometry.metadata)
-                    {
-                        m_meshError = "Admitted mesh metadata differs from prepared metadata.";
-                        return false;
-                    }
-
-                    *FindFreeStaticSourceSlot() = {std::get<1>(key), source};
-                    admitted = true;
-                    m_staticSourceDiagnostic.status = Status::Ready;
-                    return true;
-                }
-
-                m_staticSourceDiagnostic.status = Status::PreparationFailed;
-                // This is still unpublished. P2.1 may have started initialization;
-                // discard every partial buffer/descriptor before ordinary fallback.
-                // Uncertain uploads retain the uploader's fatal synchronization policy.
-                asset->mesh.Shutdown();
-            }
-        }
-
-        // Scene-requested source import: the digest-pinned prepared geometry is copied into an
-        // immutable source; every triangle must pass the certificate. Refusal keeps ordinary geometry.
-        // Each requested asset is admitted independently; its fixture provenance is its position in the
-        // sorted request set, so a single request keeps the original BuiltinTriangleFixtureID + 1.
-        const auto& requested = m_staticSourceAssetRequests;
-        const auto requestedAsset = std::lower_bound(requested.begin(), requested.end(), std::get<1>(key));
-        const bool isRequested = !m_staticSourceSelection && !asset->cooked &&
-            requestedAsset != requested.end() && *requestedAsset == std::get<1>(key) &&
-            !HasLiveStaticSource(std::get<1>(key)) &&
-            geometry.indices.size() <= MaximumElements && geometry.indices.size() % 3 == 0;
-        AdmittedStaticSource* slot = isRequested ? FindFreeStaticSourceSlot() : nullptr;
-
-        if(isRequested && !slot)
-        {
-            m_staticSourceDiagnostic.status = Status::CapacityExceeded;
-            Log::Warning("Caustic static source refused for asset " + std::get<1>(key) + ": all " +
-                std::to_string(MaxStaticSources) + " source generations are live; ordinary geometry is used.");
-        }
-        else if(isRequested)
-        {
-            const auto requestIndex = static_cast<std::uint64_t>(requestedAsset - requested.begin());
-            StaticSourceRequest request{geometry.vertices, geometry.indices, Topology::IndexedUInt32Triangles, 0,
-                static_cast<std::uint32_t>(geometry.indices.size() / 3), {}, BuiltinTriangleFixtureID + 1 + requestIndex};
-            GeometrySourceHandle source;
-            const auto result = asset->mesh.InitializeWithStaticSource(
-                m_device, *m_uploader, *m_descriptorHeap, request, source, &geometry.metadata);
-            m_staticSourceDiagnostic.preparation = result;
-
-            if(result.status == AdmissionStatus::Ready)
-            {
-                *slot = {std::get<1>(key), source};
-                admitted = true;
-                m_staticSourceDiagnostic.status = Status::Ready;
-                Log::Info("Caustic static source admitted: asset " + std::get<1>(key) + ", " +
-                    std::to_string(request.primitiveCount) + " certified triangles.");
-                return true;
-            }
-
-            m_staticSourceDiagnostic.status = Status::PreparationFailed;
-            Log::Warning("Caustic static source refused for asset " + std::get<1>(key) + " (status " +
-                std::to_string(static_cast<int>(result.status)) + ", certificate primitive " +
-                std::to_string(result.geometry.offendingPrimitive) + ", geometry status " +
-                std::to_string(static_cast<int>(result.geometry.status)) + "); ordinary geometry is used.");
-            asset->mesh.Shutdown();
-        }
-
         // S0.8B: an ordinary mesh's copies are deferred to the Renderer when it has room; the buffers, views and tracked
         // states are created exactly as by the synchronous upload.
         const size_t bytes = geometry.vertices.size() * m_vertexLayout.GetStride() + geometry.indices.size() * sizeof(unsigned int);
@@ -1944,7 +1697,7 @@ Mesh* FileSceneAssetCatalog::CreateProjectMesh(const ProjectMeshCPUCache::Key& k
 
     std::string metadataError;
 
-    if (!admitted && !asset->mesh.SetMetadata(geometry.metadata, metadataError))
+    if (!asset->mesh.SetMetadata(geometry.metadata, metadataError))
     {
         m_meshError = "Imported mesh metadata is invalid: " + metadataError;
         return nullptr;

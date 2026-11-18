@@ -24,11 +24,6 @@ void ApplyRenderingConfiguration(const RenderingConfiguration& configuration, Re
     options.pathTraceDenoiserVisualization = configuration.denoiserVisualization;
     options.pathTraceCameraJitter = configuration.cameraJitter;
     options.dlssInputPreparation = configuration.dlssInputPreparation;
-
-    // A toggle resets only the dedicated caustic history.
-    renderer.SetDedicatedCaustics(configuration.dedicatedCaustics, configuration.causticOnlyView);
-    renderer.SetPixelCentredCaustics(configuration.pixelCentredCaustics,
-        static_cast<PixelCausticView>(configuration.pixelCausticView), configuration.pixelCausticInsertion);
 }
 
 void ApplyRenderScale(const RenderingConfiguration& configuration, Renderer& renderer, bool dlssEligible,

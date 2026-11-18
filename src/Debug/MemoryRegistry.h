@@ -28,7 +28,6 @@ enum class MemoryCategory : std::uint8_t
     AccelerationStructures,
     AirVolumetrics,
     VoxelResidency,
-    Caustics,
     UploadReadback,
     Editor,
     Unattributed,
@@ -116,8 +115,6 @@ namespace MemoryRegistry
                 return "AIR / Volumetrics";
             case MemoryCategory::VoxelResidency:
                 return "Voxel Residency";
-            case MemoryCategory::Caustics:
-                return "Caustics";
             case MemoryCategory::UploadReadback:
                 return "Upload / Readback";
             case MemoryCategory::Editor:

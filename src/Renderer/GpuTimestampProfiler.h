@@ -74,21 +74,6 @@ class GpuTimestampProfiler
         NrdHybridSpecular,
         // HYBRID.5: the selected hybrid's production resolve.
         NrdHybridResolve,
-        CausticTrace,
-        CausticAccumulate,
-        CausticComposite,
-        CausticClear,
-        CausticMaximum,
-        CausticInitialize,
-        CausticReplay,
-        CausticDecode,
-        CausticInvalidate,
-        CausticFinish,
-        CausticReferenceLight,
-        CausticReferenceCamera,
-        // R.9I.3 pixel-centred caustics: the complete tiled estimator, and the caustics-only debug view.
-        PixelCausticEstimate,
-        PixelCausticView,
         // PSR.1a-P: the primary surface replacement record pass and the PSR raster primary, nested inside
         // PathTraceReference on frames that record PSR.
         PathTracePsrRecord,

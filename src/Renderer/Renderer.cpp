@@ -273,1245 +273,6 @@ namespace
 // Pending displacement ownership and recording validation
 // --------------
 
-AcceptedTLASGeometryHandle Renderer::QueryAcceptedTLASGeometry(const FileSceneRuntime& runtime) const noexcept
-{
-    if(m_geometryUpdateFailed || m_sceneInitializationAttempt.failed || m_commandSubmissionAttempted)
-    {
-        return {};
-    }
-    return m_rayTracingScene.QueryAcceptedGeometry(runtime, m_sceneResourceScene, m_sceneResourceLifetime);
-}
-
-void Renderer::AcceptReconstructedTLASGeometry(const FileSceneRuntime& runtime, FileSceneAssetCatalog& catalog) noexcept
-{
-    auto& token = m_reconstructionAcceptance;
-
-    if(!token.lifetime)
-    {
-        return;
-    }
-
-    // A replaced lifetime/association, terminal geometry failure or any adopted
-    // publication ends this reconstruction's claim; that publication owns its evidence.
-    if(m_geometryUpdateFailed || m_sceneInitializationAttempt.candidate || m_sceneInitializationAttempt.failed ||
-        token.lifetime != m_sceneResourceLifetime || token.scene != m_sceneResourceScene ||
-        token.recordingOwner != m_rayTracingScene.GetSceneResourceLifetime() ||
-        token.membershipAdoptions != m_rayTracingScene.GetMembershipAdoptionCount())
-    {
-        token = {};
-        return;
-    }
-
-    // Another runtime is not this association; an open or unresolved list must settle first.
-    if(&runtime.GetScene() != token.scene || m_commandRecordingGeneration || m_commandSubmissionAttempted)
-    {
-        return;
-    }
-
-    if(m_rayTracingScene.AcceptReconstructedGeometry(runtime, catalog, m_commandContext, m_sceneResourceScene,
-        m_sceneResourceLifetime) != RayTracingSceneResources::ReconstructionAcceptance::Pending)
-    {
-        token = {};
-    }
-}
-
-void Renderer::RequestTLASGeometryReacceptance(const FileSceneRuntime& runtime) noexcept
-{
-    const auto adoptions = m_rayTracingScene.GetMembershipAdoptionCount();
-
-    // R.9I.3 P5A: a transform-only TLAS update withdraws accepted geometry without a membership adoption. A TLAS
-    // recording that is unchanged since the previous call is settled (motion re-records it every frame), and each
-    // settled recording of a membership is requested at most once, so moving frames start no acceptance work.
-    const auto recording = m_rayTracingScene.GetTLASRecordingIdentity();
-    const bool settled = recording == m_reacceptanceObservedRecording;
-    m_reacceptanceObservedRecording = recording;
-
-    if(m_reconstructionAcceptance.lifetime || !m_sceneResourceLifetime || m_sceneResourceScene != &runtime.GetScene())
-    {
-        return;
-    }
-
-    // Geometry accepted by any path (including scene initialization's token) is the current state: the latches take
-    // its membership and recording, so its later withdrawal is requested once, as a new settled recording.
-    if(QueryAcceptedTLASGeometry(runtime))
-    {
-        m_reacceptanceAdoptions = adoptions;
-        m_reacceptanceRecording = recording;
-        return;
-    }
-
-    const bool newMembership = adoptions != m_reacceptanceAdoptions;
-    const bool newSettledRecording = settled && recording != m_reacceptanceRecording;
-
-    if(!newMembership && !newSettledRecording)
-    {
-        return;
-    }
-
-    m_reacceptanceAdoptions = adoptions;
-    m_reacceptanceRecording = recording;
-    m_reconstructionAcceptance = {m_sceneResourceLifetime, m_rayTracingScene.GetSceneResourceLifetime(), adoptions,
-        m_sceneResourceScene};
-}
-
-RayTracingSceneResources::GeometryReader Renderer::AcquireAcceptedGeometryReader(const FileSceneRuntime& runtime,
-    const AcceptedTLASGeometryHandle& accepted) noexcept
-{
-    // Same latches as the public query; an open or unresolved list cannot acquire.
-    if(m_geometryUpdateFailed || m_sceneInitializationAttempt.candidate || m_sceneInitializationAttempt.failed ||
-        m_commandSubmissionAttempted || m_commandRecordingGeneration)
-    {
-        return {};
-    }
-
-    // Retire readers whose submissions are already observed complete, so a slot freed while the
-    // renderer waited on frame pacing is reusable by this frame. The device-removal sentinel retires nothing.
-    if(const auto completed = m_commandContext.GetCompletedFenceValue(); completed != UINT64_MAX)
-    {
-        m_rayTracingScene.CollectGeometryReaders(completed, m_commandContext.GetSubmissionLifetime());
-    }
-
-    return m_rayTracingScene.AcquireGeometryReader(accepted, runtime, m_sceneResourceScene, m_sceneResourceLifetime);
-}
-
-bool Renderer::RecordAcceptedGeometryReader(const RayTracingSceneResources::GeometryReader& reader,
-    D3D12_GPU_VIRTUAL_ADDRESS& topLevel) noexcept
-{
-    topLevel = 0;
-
-    if(m_geometryUpdateFailed || !m_sceneResourceLifetime || !m_commandRecordingGeneration ||
-        m_commandSubmissionAttempted || m_commandRecordingGeneration != m_activeRecordingGeneration)
-    {
-        return false;
-    }
-
-    return m_rayTracingScene.RecordGeometryReader(reader, m_commandRecordingGeneration, m_sceneResourceLifetime, topLevel);
-}
-
-std::uint64_t Renderer::SetCausticRegistration(CausticRegistration registration) noexcept
-{
-    // Frame boundary only; an open list keeps the registration it started with.
-    // An automatic receiver names no object; an explicit one must.
-    if(!m_sceneResourceLifetime || m_commandRecordingGeneration || m_causticIdentity == UINT64_MAX ||
-        registration.lightObjectID.empty() ||
-        registration.receiverObjectID.empty() != registration.automaticReceivers)
-    {
-        return 0;
-    }
-
-    // Automatic registrations name no reflectors; each frame discovers them (RecordCausticSnapshot).
-    if(registration.automaticReflectors)
-    {
-        if(!registration.reflectorObjectID.empty() || !registration.additionalReflectorObjectIDs.empty())
-        {
-            return 0;
-        }
-
-        m_causticRegistration.registration = std::move(registration);
-        m_causticRegistration.identity = ++m_causticIdentity;
-        m_causticRegistration.lifetime = m_sceneResourceLifetime;
-        return m_causticRegistration.identity;
-    }
-
-    // Reflectors are distinct, never the receiver, and bounded.
-    std::vector<std::string> reflectors{registration.reflectorObjectID};
-    reflectors.insert(reflectors.end(), registration.additionalReflectorObjectIDs.begin(),
-        registration.additionalReflectorObjectIDs.end());
-    std::sort(reflectors.begin(), reflectors.end());
-
-    const auto invalidReflector = [&](const std::string& id)
-    {
-        return id.empty() || id == registration.receiverObjectID;
-    };
-
-    if(reflectors.size() > MaxCausticReflectors ||
-        std::adjacent_find(reflectors.begin(), reflectors.end()) != reflectors.end() ||
-        std::any_of(reflectors.begin(), reflectors.end(), invalidReflector))
-    {
-        return 0;
-    }
-
-    m_causticRegistration.registration = std::move(registration);
-    m_causticRegistration.identity = ++m_causticIdentity;
-    m_causticRegistration.lifetime = m_sceneResourceLifetime;
-    return m_causticRegistration.identity;
-}
-
-void Renderer::ClearCausticRegistration() noexcept
-{
-    m_causticRegistration = {};
-    m_causticFrameReader = {};
-}
-
-void Renderer::SetCausticDiagnosticRecorder(CausticDiagnosticRecorder recorder)
-{
-    m_causticRecorder = std::move(recorder);
-    m_causticFrameReader = {};
-    m_causticStatus = CausticSnapshotStatus::Disabled;
-}
-
-void Renderer::SetDedicatedCaustics(bool enabled, bool causticOnlyView) noexcept
-{
-    if(enabled != m_dedicatedCausticsEnabled)
-    {
-        // A fresh contribution starts from an empty caustic history; Reference history is untouched.
-        m_causticPass.ResetHistory();
-        m_causticFrameReader = {};
-    }
-
-    m_dedicatedCausticsEnabled = enabled;
-    m_causticOnlyView = causticOnlyView;
-
-    if(!enabled)
-    {
-        m_dedicatedCausticsReason = "off";
-    }
-    else
-    {
-        // The two caustics passes are never active together.
-        m_pixelCausticsEnabled = false;
-    }
-}
-
-void Renderer::SetPixelCentredCaustics(bool enabled, PixelCausticView view, bool insertion) noexcept
-{
-    const bool effective = enabled && !m_dedicatedCausticsEnabled;
-    m_pixelCausticView = effective ? view : PixelCausticView::None;
-    m_pixelCausticInsertion = effective && insertion;
-
-    if(effective != m_pixelCausticsEnabled)
-    {
-        m_frameCausticSnapshot.reset();
-        m_causticFrameReader = {};
-    }
-
-    m_pixelCausticsEnabled = effective;
-
-    // Status only; a seam is counted only when RecordPathTraceReference reaches it.
-    if(!effective)
-    {
-        m_pixelCausticPass.SetInactiveReason(enabled ?
-            "refused: the light-first Dedicated Caustics pass is enabled" : "off");
-    }
-}
-
-bool Renderer::VerifyPixelCausticSeam(const AcceptedCausticSnapshot* snapshot, unsigned int frameIndex) noexcept
-{
-    PixelCausticSeamResult result;
-    result.recordingGeneration = m_commandRecordingGeneration;
-    result.extractionAvailable = m_pathTraceExtractedLastFrame;
-
-    const auto verdict = [&]() -> std::string
-    {
-        if(!snapshot)
-        {
-            return "no accepted caustic snapshot this frame: " + m_dedicatedCausticsReason;
-        }
-
-        result.snapshotIdentity = snapshot->identity;
-        const auto& join = *snapshot->geometry->geometry;
-        ID3D12Resource* materialBuffer = m_activeRecordingSlot < CommandContext::FrameCount ?
-            m_materialBuffers[m_activeRecordingSlot].GetResource() : nullptr;
-
-        // Recording: this list, its frame slot.
-        if(snapshot->recordingGeneration == 0 || snapshot->recordingGeneration != m_commandRecordingGeneration)
-        {
-            return "snapshot belongs to another recording generation";
-        }
-
-        if(snapshot->frameSlot != frameIndex || frameIndex != m_activeRecordingSlot)
-        {
-            return "snapshot belongs to another frame slot";
-        }
-
-        // Scene: the current scene-resource lifetime and registration.
-        if(snapshot->sceneLifetime != m_sceneResourceLifetime ||
-            snapshot->registrationIdentity != m_causticRegistration.identity ||
-            m_causticRegistration.lifetime != m_sceneResourceLifetime)
-        {
-            return "snapshot scene lifetime or registration is no longer current";
-        }
-
-        // Geometry: the reader is still bound to this list, and no TLAS write followed its acceptance.
-        if(snapshot->reader.GetState() != RayTracingSceneResources::GeometryReaderState::Recorded)
-        {
-            return "snapshot geometry reader is not recorded into this list";
-        }
-
-        if(snapshot->topLevel != m_rayTracingScene.GetTopLevel().GetGPUAddress() || !join.tlasCapture ||
-            join.tlasCapture->recordingIdentity != m_rayTracingScene.GetTLASRecordingIdentity())
-        {
-            return "the TLAS changed after snapshot acceptance";
-        }
-
-        // Materials: the revision recorded into this list, in this slot's table.
-        if(snapshot->materialRevision != m_materialPublication.revision || !materialBuffer ||
-            snapshot->materialTable != materialBuffer->GetGPUVirtualAddress())
-        {
-            return "the material table changed after snapshot acceptance";
-        }
-
-        // Camera domain: the dispatch's extent, unjittered and native.
-        if(snapshot->width != m_sceneWidth || snapshot->height != m_sceneHeight || m_cameraJitterStatus.active ||
-            m_dlssModeThisFrame)
-        {
-            return "the snapshot's camera domain differs from this dispatch";
-        }
-
-        return {};
-    };
-
-    std::string failure = verdict();
-    result.verified = failure.empty();
-    result.reason = result.verified ? "seam verified" : "seam refused: " + failure;
-    const bool verified = result.verified;
-    m_pixelCausticPass.RecordSeam(std::move(result));
-    return verified;
-}
-
-void Renderer::RecordPixelCaustics(const AcceptedCausticSnapshot& snapshot, ID3D12GraphicsCommandList* commandList,
-    unsigned int frameIndex, const Matrix4& inverseCameraRelativeViewProjection, const Vector3& cameraPosition) noexcept
-{
-    const auto refuse = [this](const std::string& reason)
-    {
-        m_pixelCausticPass.SetSeamRecorded(false, "seam verified; estimator refused: " + reason);
-    };
-
-    try
-    {
-        if(!m_pixelCausticPass.Initialize(m_graphicsDevice, m_shaderLibrary))
-        {
-            return refuse("pipelines are unavailable (FP64 required)");
-        }
-
-        const auto& join = *snapshot.geometry->geometry;
-        const auto& receiver = join.rows[snapshot.receiverRow];
-
-        if(receiver.nativeInstance == SIZE_MAX || snapshot.reflectorRows.empty() ||
-            snapshot.reflectorMaterialIndices.size() != snapshot.reflectorRows.size())
-        {
-            return refuse("registered rows are outside the certified source domain");
-        }
-
-        // Deterministic population order: reflector dense slot, then source primitive. Registration
-        // order never changes the sampled population.
-        std::vector<std::size_t> order(snapshot.reflectorRows.size());
-
-        for(std::size_t index = 0; index < order.size(); ++index)
-        {
-            order[index] = index;
-        }
-
-        std::sort(order.begin(), order.end(), [&](std::size_t x, std::size_t y)
-        {
-            return join.rows[snapshot.reflectorRows[x]].denseSlot < join.rows[snapshot.reflectorRows[y]].denseSlot;
-        });
-
-        const auto subtract = [](const std::array<double, 3>& a, const std::array<double, 3>& b)
-        {
-            return std::array<double, 3>{a[0] - b[0], a[1] - b[1], a[2] - b[2]};
-        };
-        const auto length = [](const std::array<double, 3>& a)
-        {
-            return std::sqrt(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]);
-        };
-
-        const auto populationStarted = std::chrono::steady_clock::now();
-        PixelCausticFrameInput input;
-        double area = 0.0;
-
-        for(const std::size_t reflectorIndex : order)
-        {
-            const auto& reflector = join.rows[snapshot.reflectorRows[reflectorIndex]];
-
-            // Each reflector: one certified static source whose primitive i is BLAS primitive i, a native
-            // instance, and a non-delta material (the proposal clamps GGX roughness at 0.045).
-            if(!reflector.source || reflector.source->Source().Certificate().firstPrimitive != 0 ||
-                reflector.nativeInstance == SIZE_MAX || reflector.denseSlot > UINT32_MAX ||
-                reflector.nativeInstance > UINT32_MAX)
-            {
-                return refuse("registered rows are outside the certified source domain");
-            }
-
-            if(!(snapshot.reflectorMaterials[reflectorIndex].roughness > 0.001f))
-            {
-                return refuse("delta (mirror) reflectors are not supported");
-            }
-
-            // World triangles exactly as the B3-T host builds them: float transform, FP64 area, degenerate
-            // exclusion, cumulative area for the broad branch's CDF, and the exact light-ray identity.
-            const auto& source = reflector.source->Source();
-            const auto vertices = source.Vertices();
-            const auto indices = source.Indices();
-            const auto& model = reflector.presentationTransform;
-
-            if(indices.empty() || indices.size() % 3 != 0)
-            {
-                return refuse("the reflector source has no triangle list");
-            }
-
-            const auto world = [&](std::uint32_t index)
-            {
-                const auto& p = vertices[index].position;
-                std::array<double, 3> v{};
-
-                for(int k = 0; k < 3; ++k)
-                {
-                    const float component = model.m[k][0] * p[0] + model.m[k][1] * p[1] + model.m[k][2] * p[2] +
-                        model.m[k][3];
-                    v[k] = component;
-                }
-
-                return v;
-            };
-
-            for(std::uint32_t triangle = 0; triangle < indices.size() / 3; ++triangle)
-            {
-                const auto a = world(indices[triangle * 3]);
-                const auto b = world(indices[triangle * 3 + 1]);
-                const auto c = world(indices[triangle * 3 + 2]);
-                const auto e1 = subtract(b, a);
-                const auto e2 = subtract(c, a);
-                const std::array<double, 3> normal{e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2],
-                    e1[0] * e2[1] - e1[1] * e2[0]};
-                const double triangleArea = 0.5 * length(normal);
-                const double longest = (std::max)({length(e1), length(e2), length(subtract(c, b))});
-
-                if(!std::isfinite(triangleArea))
-                {
-                    return refuse("a transformed reflector triangle is not finite");
-                }
-
-                if(!(triangleArea > 1e-7 * longest * longest))
-                {
-                    continue;
-                }
-
-                if(input.triangles.size() == PixelCausticPass::MaximumTriangles)
-                {
-                    return refuse("the reflectors' accepted triangle count exceeds " +
-                        std::to_string(PixelCausticPass::MaximumTriangles));
-                }
-
-                area += triangleArea;
-                PixelCausticTriangle record;
-
-                for(int k = 0; k < 3; ++k)
-                {
-                    record.a[k] = static_cast<float>(a[k]);
-                    record.b[k] = static_cast<float>(b[k]);
-                    record.c[k] = static_cast<float>(c[k]);
-                }
-
-                record.area = static_cast<float>(triangleArea);
-                record.areaCumulative = static_cast<float>(area);
-                record.primitive = triangle;
-                record.instanceID = static_cast<std::uint32_t>(reflector.denseSlot);
-                record.instanceIndex = static_cast<std::uint32_t>(reflector.nativeInstance);
-                record.material = snapshot.reflectorMaterialIndices[reflectorIndex];
-                input.triangles.push_back(record);
-            }
-        }
-
-        ++m_pixelCausticPopulationCount;
-        m_pixelCausticPopulationNanoseconds += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now() - populationStarted).count());
-        const auto& reflector = join.rows[snapshot.reflectorRows[order.front()]];
-
-        if(input.triangles.empty() || input.triangles.size() > PixelCausticPass::MaximumTriangles || !std::isfinite(area))
-        {
-            return refuse("the reflector's accepted triangle count is outside 1.." +
-                std::to_string(PixelCausticPass::MaximumTriangles));
-        }
-
-        // A recording identity of zero would be indistinguishable from an unwritten latch.
-        const auto epoch = static_cast<std::uint32_t>(snapshot.identity);
-
-        if(epoch == 0)
-        {
-            return refuse("the snapshot identity has no nonzero 32-bit epoch");
-        }
-
-        // A fresh hash per recording; attempts are independent across frames.
-        std::uint32_t seed = epoch * 0x9E3779B9u;
-        seed ^= seed >> 16;
-        seed *= 0x7FEB352Du;
-        seed ^= seed >> 15;
-
-        input.topLevel = snapshot.topLevel;
-        input.materialTable = snapshot.materialTable;
-        input.materialTableDescriptor = m_materialBuffers[snapshot.frameSlot].GetDescriptorIndex();
-        input.reflectorMaterial = snapshot.reflectorMaterialIndices[order.front()];
-        input.receiverMaterial = snapshot.receiverMaterialIndex;
-        input.materialEnergyTable = m_materialTables.GetMissingEnergyTexture().GetDescriptorIndex();
-        input.materialAverageTable = m_materialTables.GetAverageTexture().GetDescriptorIndex();
-        input.materialCosineMapping = static_cast<std::uint32_t>(m_materialTables.GetCosineMapping());
-        input.reflectorDense = static_cast<std::uint32_t>(reflector.denseSlot);
-        input.reflectorNative = static_cast<std::uint32_t>(reflector.nativeInstance);
-        input.receiverDense = static_cast<std::uint32_t>(receiver.denseSlot);
-        input.receiverNative = static_cast<std::uint32_t>(receiver.nativeInstance);
-
-        // P5D.2B: one entry per TLAS InstanceID (= join row): {eligible, native instance, material index, 0}.
-        if(snapshot.registration.automaticReceivers)
-        {
-            if(snapshot.receiverRows.size() != snapshot.receiverMaterialIndices.size() || join.rows.size() > UINT32_MAX)
-            {
-                return refuse("the automatic receiver set is inconsistent");
-            }
-
-            input.automaticReceivers = true;
-            input.receiverDense = UINT32_MAX;
-            input.receiverNative = UINT32_MAX;
-            input.receiverTable.assign(join.rows.size(), {0u, UINT32_MAX, UINT32_MAX, 0u});
-
-            for(std::size_t index = 0; index < snapshot.receiverRows.size(); ++index)
-            {
-                const auto& row = join.rows[snapshot.receiverRows[index]];
-                input.receiverTable[snapshot.receiverRows[index]] = {1u, static_cast<std::uint32_t>(row.nativeInstance),
-                    snapshot.receiverMaterialIndices[index], 0u};
-            }
-
-            if(m_receiverTableVerificationTruncate)
-            {
-                input.receiverTable.resize(1);
-            }
-        }
-        input.epoch = epoch;
-        input.seed = seed;
-        static_assert(sizeof(GPULight) == sizeof(input.lightRecord));
-        std::memcpy(input.lightRecord.data(), &snapshot.light, sizeof(GPULight));
-        input.inverseCameraRelativeViewProjection = inverseCameraRelativeViewProjection;
-        input.cameraPosition = {cameraPosition.x, cameraPosition.y, cameraPosition.z};
-        input.depthIndex = m_gBuffer.GetDepth().GetSRVIndex();
-        input.materialIndex = m_gBuffer.GetMaterial().GetSRVIndex();
-        input.surfaceIndex = m_gBuffer.GetSurface().GetSRVIndex();
-        input.geometricNormalIndex = m_gBuffer.GetGeometricNormal().GetSRVIndex();
-        input.identityIndex = m_gBuffer.GetIdentity().GetSRVIndex();
-        input.width = m_sceneWidth;
-        input.height = m_sceneHeight;
-        input.totalArea = static_cast<float>(area);
-
-        // P2: the pre-denoiser insertion transaction, only into this frame's own extraction (a PT denoiser
-        // selected); without it the caustic outputs feed only the caustics-only views.
-        PixelCausticInsertionTarget insertion;
-        const bool insert = m_pixelCausticInsertion && m_pathTraceExtractedLastFrame;
-
-        if(insert)
-        {
-            insertion.diffuse = &m_pathTraceReferencePass.GetDiffuseTexture();
-            insertion.specular = &m_pathTraceReferencePass.GetSpecularTexture();
-            insertion.rawDiffuseHitDistance = m_pathTraceReferencePass.WroteRawDiffuseHitDistance() ?
-                &m_pathTraceReferencePass.GetRawDiffuseHitDistanceTexture() : nullptr;
-        }
-
-        if(!m_pixelCausticPass.Record(commandList, m_graphicsDevice.GetDevice(), m_resourceDescriptorHeap, m_uploadBuffer,
-            input, insert ? &insertion : nullptr, m_commandContext, m_commandRecordingGeneration, m_gpuTimestampProfiler,
-            frameIndex))
-        {
-            return refuse(m_pixelCausticPass.GetReason());
-        }
-
-        const std::string insertionStatus = insert ? "; pre-denoiser insertion recorded" :
-            m_pixelCausticInsertion ? "; insertion skipped: no extraction this frame (PT denoiser Off)" : "";
-        m_pixelCausticPass.SetSeamRecorded(true, "recorded (K = " + std::to_string(PixelCausticPass::AttemptsPerReceiver) +
-            ", " + std::to_string(input.triangles.size()) + " triangles on " + std::to_string(order.size()) +
-            " reflector" + (order.size() == 1 ? "" : "s") + ")" + insertionStatus);
-        m_pixelCausticPass.SetInsertionRecorded(insert);
-    }
-    catch(...)
-    {
-        refuse("recording failed");
-    }
-}
-
-bool Renderer::AcknowledgeDedicatedCausticsFault() noexcept
-{
-    if(m_commandRecordingGeneration || m_commandSubmissionAttempted)
-    {
-        return false;
-    }
-
-    try
-    {
-        return m_causticPass.AcknowledgeFaultAndReset(m_commandContext);
-    }
-    catch(...)
-    {
-        return false;
-    }
-}
-
-void Renderer::RecordDedicatedCaustics(const AcceptedCausticSnapshot& snapshot, bool validationOnly) noexcept
-{
-    const auto refuse = [this](std::string reason)
-    {
-        m_dedicatedCausticsReason = std::move(reason);
-    };
-
-    try
-    {
-        // Production image/performance certification is still pending. The explicit experimental
-        // toggle may contribute once execution safety is validated; nothing here bypasses the
-        // pass's fault latch, accepted snapshot or domain refusals below.
-#if !defined(ENGINE_HAS_VERIFICATION)
-        validationOnly = false;
-#endif
-        if(!CausticPass::ProductionContributionValidated && !CausticPass::ExperimentalExecutionSafetyValidated &&
-            !validationOnly)
-        {
-            return refuse("dedicated caustic execution safety validation is pending; contribution disabled");
-        }
-
-        if(!m_causticPass.Initialize(m_graphicsDevice, m_shaderLibrary))
-        {
-            return refuse("dedicated caustic pipelines are unavailable");
-        }
-
-        if(snapshot.reflectorRows.size() != 1 || snapshot.registration.automaticReflectors ||
-            snapshot.registration.automaticReceivers)
-        {
-            return refuse("dedicated caustics support exactly one designated reflector and receiver");
-        }
-
-        // The validated domain: both rows on the one admitted static source, rotation-and-positive-scale
-        // instance transforms, a non-delta reflector. Every certified source normal is exactly axial, so
-        // with orthogonal transform columns the shader's object-to-world normal has the inverse-transpose
-        // direction; shear or mirroring would not, and refuses.
-        const auto& join = *snapshot.geometry->geometry;
-        const auto& reflector = join.rows[snapshot.reflectorRow];
-        const auto& receiver = join.rows[snapshot.receiverRow];
-        const auto rotationScale = [](const Matrix4& model)
-        {
-            double column[3][3]{};
-
-            for(unsigned int r = 0; r < 4; ++r)
-            {
-                for(unsigned int c = 0; c < 4; ++c)
-                {
-                    if(!std::isfinite(model.m[r][c]))
-                    {
-                        return false;
-                    }
-                }
-            }
-
-            for(unsigned int c = 0; c < 3; ++c)
-            {
-                for(unsigned int r = 0; r < 3; ++r)
-                {
-                    column[c][r] = model.m[r][c];
-                }
-            }
-
-            const auto dot = [](const double* a, const double* b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; };
-
-            for(unsigned int a = 0; a < 3; ++a)
-            {
-                for(unsigned int b = a + 1; b < 3; ++b)
-                {
-                    if(std::abs(dot(column[a], column[b])) > 1.0e-5 * std::sqrt(dot(column[a], column[a]) * dot(column[b], column[b])))
-                    {
-                        return false;
-                    }
-                }
-            }
-
-            const double determinant =
-                column[0][0] * (column[1][1] * column[2][2] - column[1][2] * column[2][1]) -
-                column[1][0] * (column[0][1] * column[2][2] - column[0][2] * column[2][1]) +
-                column[2][0] * (column[0][1] * column[1][2] - column[0][2] * column[1][1]);
-            return determinant > 0.0 && model.m[3][0] == 0.0f && model.m[3][1] == 0.0f &&
-                model.m[3][2] == 0.0f && model.m[3][3] == 1.0f;
-        };
-
-        if(!reflector.source || reflector.source != receiver.source || !rotationScale(reflector.presentationTransform) ||
-            !rotationScale(receiver.presentationTransform) || reflector.nativeInstance == SIZE_MAX ||
-            receiver.nativeInstance == SIZE_MAX || reflector.source->Source().Certificate().firstPrimitive != 0)
-        {
-            return refuse("registered rows are outside the certified single-source rotation/scale domain");
-        }
-
-        if(!(snapshot.reflectorMaterial.roughness > 0.001f))
-        {
-            return refuse("delta (mirror) reflectors are not supported");
-        }
-
-        if(m_pathTraceDenoiserMode != PathTraceDenoiserMode::Off)
-        {
-            return refuse("dedicated caustics compose only with the undenoised path-traced image (set PT denoiser Off); "
-                "pre-denoiser routing is not implemented");
-        }
-
-        const auto& membership = *m_rayTracingScene.m_membership;
-        const auto& source = reflector.source->Source();
-        CausticFrameInput input;
-        input.topLevel = snapshot.topLevel;
-        input.materialTable = snapshot.materialTable;
-        input.lightTable = snapshot.lightTable;
-        input.instanceData = membership.instanceDataBuffer.GetResource()->GetGPUVirtualAddress();
-        input.slotMaterials = membership.slotMaterials.GetResource()->GetGPUVirtualAddress();
-        input.vertices = reflector.source->VertexResource()->GetGPUVirtualAddress();
-        input.indices = reflector.source->IndexResource()->GetGPUVirtualAddress();
-        input.lightOffset = static_cast<std::uint32_t>(offsetof(SceneLightConstants, lights) +
-            snapshot.lightIndex * sizeof(GPULight));
-        input.reflectorDense = static_cast<std::uint32_t>(snapshot.reflectorRow);
-        input.reflectorNative = static_cast<std::uint32_t>(reflector.nativeInstance);
-        input.receiverDense = static_cast<std::uint32_t>(snapshot.receiverRow);
-        input.receiverNative = static_cast<std::uint32_t>(receiver.nativeInstance);
-        input.materialEnergyTable = m_materialTables.GetMissingEnergyTexture().GetDescriptorIndex();
-        input.materialAverageTable = m_materialTables.GetAverageTexture().GetDescriptorIndex();
-        input.materialCosineMapping = static_cast<std::uint32_t>(m_materialTables.GetCosineMapping());
-        input.viewProjection = snapshot.viewProjection;
-        input.inverseViewProjection = snapshot.inverseViewProjection;
-        input.cameraPosition = snapshot.cameraPosition;
-        input.cameraForward = snapshot.cameraForward;
-        input.jacobianScale = snapshot.jacobianScale;
-        input.width = snapshot.width;
-        input.height = snapshot.height;
-        input.outputFormat = m_pathTraceReferencePass.GetOutputTexture().GetResource() ?
-            m_pathTraceReferencePass.GetOutputTexture().GetResource()->GetDesc().Format : DXGI_FORMAT_UNKNOWN;
-        input.identity = {snapshot.sceneLifetime, snapshot.registrationIdentity, join.runtimeIdentity,
-            join.tlasCapture->recordingIdentity, snapshot.materialRevision,
-            (std::uint64_t(snapshot.reflectorMaterialIndex) << 32) | snapshot.receiverMaterialIndex};
-        static_assert(sizeof(GPULight) == sizeof(input.lightRecord));
-        std::memcpy(input.lightRecord.data(), &snapshot.light, sizeof(GPULight));
-
-        input.triangleCount = source.Certificate().primitiveCount;
-
-        if(!CausticPass::BuildEmissionProposal(source.Vertices(), source.Indices(), input.triangleCount,
-            reflector.presentationTransform,
-            {snapshot.light.position[0], snapshot.light.position[1], snapshot.light.position[2]}, input))
-        {
-            return refuse("the reflector's certified emission proposal is unavailable");
-        }
-
-        // A fresh hash per recorded frame; attempts are independent across frames.
-        std::uint32_t seed = ++m_causticSeed;
-        seed ^= seed >> 16;
-        seed *= 0x7FEB352Du;
-        seed ^= seed >> 15;
-
-        m_causticPass.SetTimingContext(m_gpuTimestampProfiler, snapshot.frameSlot);
-
-        if(!m_causticPass.Record(m_commandContext.GetCommandList(), m_graphicsDevice.GetDevice(), m_resourceUploader,
-            m_resourceDescriptorHeap, m_uploadBuffer, input, seed, m_commandContext, m_commandRecordingGeneration))
-        {
-            return refuse(m_causticPass.GetReason());
-        }
-
-        m_causticFrameRecorded = true;
-        m_dedicatedCausticsReason = "recorded";
-    }
-    catch(...)
-    {
-        refuse("dedicated caustic recording failed");
-    }
-}
-
-void Renderer::ResetCausticSceneState() noexcept
-{
-    // Old snapshots keep their own retained values; only current association ends here.
-    m_causticRegistration = {};
-    m_causticFrameReader = {};
-    m_causticFallbackTexture = {};
-    m_lastCausticSnapshot.reset();
-    m_frameCausticSnapshot.reset();
-}
-
-void Renderer::PrepareCausticSnapshotForFrame(const FileSceneRuntime& runtime, FileSceneAssetCatalog& catalog) noexcept
-{
-    // An unrecorded reader from an earlier boundary never carries into another frame.
-    m_causticFrameReader = {};
-    m_causticFallbackTexture = {};
-    m_causticFrameRuntime = nullptr;
-    m_causticFrameCatalog = nullptr;
-
-    if(!m_causticRecorder && !m_dedicatedCausticsEnabled && !m_pixelCausticsEnabled)
-    {
-        m_causticStatus = CausticSnapshotStatus::Disabled;
-        return;
-    }
-
-    if(!m_causticRegistration.identity || m_causticRegistration.lifetime != m_sceneResourceLifetime)
-    {
-        m_causticRegistration = {};
-        m_causticStatus = CausticSnapshotStatus::Unregistered;
-        m_dedicatedCausticsReason = "scene has no caustic registration";
-        return;
-    }
-
-    // The only admitted texture: the catalog's immutable 1x1 white fallback, identified by its
-    // exact retained upload bytes, format, extent and SRV, with no UAV through which to write it.
-    if(const auto* texture = catalog.GetImmutableFallbackTexture())
-    {
-        auto* resource = texture->GetResource();
-        const auto* texel = static_cast<const std::uint8_t*>(texture->GetInitialData());
-        const auto description = resource ? resource->GetDesc() : D3D12_RESOURCE_DESC{};
-
-        if(resource && texel && texture->GetInitialDataSize() == 4 && texture->GetDescriptorIndex() != UINT_MAX &&
-            texture->GetUAVIndex() == UINT_MAX && description.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
-            description.Width == 1 && description.Height == 1 && description.MipLevels == 1 &&
-            description.DepthOrArraySize == 1 && description.Format == DXGI_FORMAT_R8G8B8A8_UNORM &&
-            std::all_of(texel, texel + 4, [](std::uint8_t value) { return value == 255; }))
-        {
-            m_causticFallbackTexture = {texture, texture->GetDescriptorIndex(), resource, {texel[0], texel[1], texel[2], texel[3]}};
-        }
-    }
-
-    // P5B: kept for this frame's recording only, where pixel caustics may admit the current-frame TLAS recording
-    // when no completed capture is accepted (transform-only motion). Cleared at every boundary.
-    m_causticFrameRuntime = &runtime;
-    m_causticFrameCatalog = &catalog;
-    const auto accepted = QueryAcceptedTLASGeometry(runtime);
-
-    if(!accepted)
-    {
-        m_causticStatus = CausticSnapshotStatus::GeometryUnavailable;
-        m_dedicatedCausticsReason = "no accepted static-source TLAS geometry (every resident mesh must be one admitted source)";
-        return;
-    }
-
-    m_causticFrameReader = AcquireAcceptedGeometryReader(runtime, accepted);
-    m_causticStatus = m_causticFrameReader ? CausticSnapshotStatus::Recorded : CausticSnapshotStatus::ReaderUnavailable;
-
-    if(!m_causticFrameReader)
-    {
-        m_dedicatedCausticsReason = "accepted geometry reader unavailable";
-    }
-}
-
-void Renderer::RecordCausticSnapshot(unsigned int frameSlot, bool referencePathTrace,
-    std::uint64_t recordedMaterialRevision, const FrameLighting& lighting, D3D12_GPU_VIRTUAL_ADDRESS lightTable,
-    const Matrix4& renderViewProjection, const Matrix4& renderProjection, const Vector3& cameraPosition) noexcept
-{
-    m_causticFrameRecorded = false;
-    m_causticPresentedLastFrame = false;
-    m_frameCausticSnapshot.reset();
-
-    if(m_pixelCausticsEnabled)
-    {
-        m_pixelCausticPass.BeginFrame();
-    }
-
-    if(!m_causticRecorder && !m_dedicatedCausticsEnabled && !m_pixelCausticsEnabled)
-    {
-        return; // Disabled.
-    }
-
-    // P5B: transform-only motion. Without a completed accepted capture, pixel caustics (only) may use a record of the
-    // TLAS recorded earlier in this list; it binds to this generation alone and is never the accepted geometry.
-    if(!m_causticFrameReader && m_pixelCausticsEnabled && m_currentFrameGeometryEnabled && !m_causticRecorder &&
-        m_causticFrameRuntime &&
-        m_causticFrameCatalog && m_causticRegistration.identity && m_causticRegistration.lifetime == m_sceneResourceLifetime &&
-        !m_geometryUpdateFailed && !m_commandSubmissionAttempted && m_commandRecordingGeneration == m_activeRecordingGeneration)
-    {
-        const auto record = m_rayTracingScene.BuildCurrentFrameGeometry(*m_causticFrameRuntime, *m_causticFrameCatalog,
-            m_commandContext, m_sceneResourceScene, m_sceneResourceLifetime, m_commandRecordingGeneration);
-
-        if(record)
-        {
-            m_causticFrameReader = m_rayTracingScene.AcquireCurrentFrameGeometryReader(record, *m_causticFrameRuntime,
-                m_sceneResourceScene, m_sceneResourceLifetime, m_commandRecordingGeneration);
-        }
-    }
-
-    m_causticFrameRuntime = nullptr;
-    m_causticFrameCatalog = nullptr;
-
-    if(!m_causticFrameReader)
-    {
-        return; // The boundary already reported why no reader exists, or the current recording was refused.
-    }
-
-    // Single use: a refused frame's Acquired reader is released by the next collection.
-    auto reader = std::move(m_causticFrameReader);
-    const auto refuse = [this](CausticSnapshotStatus status)
-    {
-        m_causticStatus = status;
-        m_dedicatedCausticsReason = "accepted caustic snapshot refused (status " +
-            std::to_string(static_cast<int>(status)) + ")";
-    };
-
-    try
-    {
-        const auto& registration = m_causticRegistration;
-
-        if(!registration.identity || registration.lifetime != m_sceneResourceLifetime)
-        {
-            return refuse(CausticSnapshotStatus::Unregistered);
-        }
-
-        if(!referencePathTrace)
-        {
-            return refuse(CausticSnapshotStatus::ModeUnsupported);
-        }
-
-        if(m_causticIdentity == UINT64_MAX)
-        {
-            return refuse(CausticSnapshotStatus::IdentityExhausted);
-        }
-
-        // Camera domain: the validated pixel measure assumes an unjittered, native (non-DLSS) frame.
-        if(m_cameraJitterStatus.active || m_dlssModeThisFrame || !m_sceneWidth || !m_sceneHeight)
-        {
-            return refuse(CausticSnapshotStatus::CameraUnsupported);
-        }
-
-        auto snapshot = std::make_shared<AcceptedCausticSnapshot>();
-        snapshot->sceneLifetime = m_sceneResourceLifetime;
-        snapshot->registrationIdentity = registration.identity;
-        snapshot->registration = registration.registration;
-        snapshot->geometry = reader.GetAcceptedGeometry();
-        const auto& join = *snapshot->geometry->geometry;
-
-        // Membership: every registered object is a distinct resident row of the accepted join. A missing
-        // reflector refuses the whole frame; the rest of the scene is unaffected. Automatic registrations
-        // designate no reflector here; they are discovered once the material table is known.
-        const bool automatic = registration.registration.automaticReflectors;
-        std::vector<std::string> reflectorIDs;
-
-        if(!automatic)
-        {
-            reflectorIDs.push_back(registration.registration.reflectorObjectID);
-            reflectorIDs.insert(reflectorIDs.end(), registration.registration.additionalReflectorObjectIDs.begin(),
-                registration.registration.additionalReflectorObjectIDs.end());
-        }
-
-        snapshot->reflectorRows.assign(reflectorIDs.size(), SIZE_MAX);
-        const bool automaticReceivers = registration.registration.automaticReceivers;
-
-        for(std::size_t row = 0; row < join.rows.size(); ++row)
-        {
-            for(std::size_t reflector = 0; reflector < reflectorIDs.size(); ++reflector)
-            {
-                if(join.rows[row].objectID == reflectorIDs[reflector])
-                {
-                    snapshot->reflectorRows[reflector] = row;
-                }
-            }
-
-            if(!automaticReceivers && join.rows[row].objectID == registration.registration.receiverObjectID)
-            {
-                snapshot->receiverRow = row;
-            }
-        }
-
-        const auto& bindings = m_rayTracingScene.m_membership->materialBindings;
-
-        if(std::any_of(snapshot->reflectorRows.begin(), snapshot->reflectorRows.end(),
-                [&](std::size_t row) { return row == SIZE_MAX || !join.rows[row].mesh; }) ||
-            (!automaticReceivers && (snapshot->receiverRow == SIZE_MAX || !join.rows[snapshot->receiverRow].mesh)) ||
-            bindings.size() != join.rows.size())
-        {
-            return refuse(CausticSnapshotStatus::MembershipUnsupported);
-        }
-
-        // Material table: exactly the revision recorded into this list, unchanged since.
-        const auto& desired = m_materialPublication.desired;
-
-        if(!recordedMaterialRevision || recordedMaterialRevision != m_materialPublication.revision ||
-            frameSlot >= CommandContext::FrameCount || !m_materialBuffers[frameSlot].GetResource())
-        {
-            return refuse(CausticSnapshotStatus::MaterialUnsupported);
-        }
-
-        enum class Role { Reflector, Receiver };
-        bool usesFallback = false;
-        std::string textureDetail;
-        const auto acceptMaterial = [&](std::size_t row, Role role, std::uint32_t& index, GPUMaterial& record)
-        {
-            const auto& binding = bindings[row];
-            const auto& slots = join.rows[row].mesh->GetMetadata().materialSlots;
-
-            // The tracer reads the instance's first slot-table entry for every primitive, so only a
-            // single-slot mesh has one effective material: its slot binding (or the base fallback).
-            if(slots.size() != 1 || binding.materialsDeferred)
-            {
-                return CausticSnapshotStatus::MaterialUnsupported;
-            }
-
-            const Material* material = binding.GetSlotMaterial(slots.front().id);
-
-            if(!material || material->gpuIndex >= desired.size())
-            {
-                return CausticSnapshotStatus::MaterialUnsupported;
-            }
-
-            // Initial domain: constant parameters, plus at most the admitted immutable fallback
-            // as base color. A stable descriptor index alone is not content proof: the texture
-            // object, its descriptor and its resource must all still be the admitted ones.
-            const auto& fallback = m_causticFallbackTexture;
-            const Texture* textures[] = {material->normalTexture, material->roughnessTexture,
-                material->metallicTexture, material->armTexture, material->aoTexture, material->heightTexture};
-            const auto& recorded = desired[material->gpuIndex];
-            const unsigned int indices[] = {recorded.normalTextureIndex, recorded.roughnessTextureIndex,
-                recorded.metallicTextureIndex, recorded.armTextureIndex, recorded.aoTextureIndex, recorded.heightTextureIndex};
-            const bool baseAdmitted = material->texture ?
-                fallback.texture && material->texture == fallback.texture &&
-                    fallback.texture->GetDescriptorIndex() == fallback.descriptor &&
-                    fallback.texture->GetResource() == fallback.resource && recorded.textureIndex == fallback.descriptor :
-                recorded.textureIndex == UINT_MAX;
-
-            if(!baseAdmitted ||
-                std::any_of(std::begin(textures), std::end(textures), [](const Texture* texture) { return texture != nullptr; }) ||
-                std::any_of(std::begin(indices), std::end(indices), [](unsigned int value) { return value != UINT_MAX; }))
-            {
-                textureDetail = baseAdmitted ? " (a non-base texture is bound)" : !fallback.texture ?
-                    " (the catalog's white fallback was not admitted this frame)" : !material->texture ?
-                    " (no base texture; recorded index " + std::to_string(recorded.textureIndex) + ")" :
-                    " (the base texture is not the catalog's immutable white fallback)";
-                return CausticSnapshotStatus::TextureUnsupported;
-            }
-
-            if(material->texture)
-            {
-                usesFallback = true;
-            }
-
-            // Opaque glossy metal reflector; opaque receiver. No transmission model exists here.
-            const auto model = static_cast<MaterialModel>(recorded.model);
-            const bool metallic = model == MaterialModel::Conductor ||
-                (model == MaterialModel::MetallicRoughness && recorded.metallic == 1.0f);
-
-            if(role == Role::Reflector && !metallic)
-            {
-                return CausticSnapshotStatus::MaterialUnsupported;
-            }
-
-            index = material->gpuIndex;
-            record = recorded;
-            return CausticSnapshotStatus::Recorded;
-        };
-
-        // P5D.1 discovery, in row order: a row is a reflector exactly when the designated path would accept it
-        // (certified static source with BLAS primitive i = source primitive i, native instance, single-slot opaque
-        // metal with only the admitted fallback texture, non-delta). Every other row stays ordinary geometry
-        // for visibility and occlusion. More eligible rows than the bound refuse the frame; nothing is truncated.
-        if(automatic)
-        {
-            for(std::size_t row = 0; row < join.rows.size(); ++row)
-            {
-                const auto& candidate = join.rows[row];
-
-                if(row == snapshot->receiverRow || !candidate.mesh)
-                {
-                    continue;
-                }
-
-                ++snapshot->automaticCandidates;
-                const bool sourced = candidate.source && candidate.source->Source().Certificate().firstPrimitive == 0 &&
-                    candidate.nativeInstance != SIZE_MAX;
-                const bool fallbackBefore = usesFallback;
-                std::uint32_t index = UINT_MAX;
-                GPUMaterial record{};
-                const bool materialAccepted = sourced &&
-                    acceptMaterial(row, Role::Reflector, index, record) == CausticSnapshotStatus::Recorded;
-                const bool nonDelta = materialAccepted && record.roughness > 0.001f;
-
-                if(!nonDelta)
-                {
-                    // A rejected candidate must not mark the fallback texture as used by this snapshot.
-                    usesFallback = fallbackBefore;
-                    ++snapshot->automaticIneligible;
-                    continue;
-                }
-
-                snapshot->reflectorRows.push_back(row);
-                snapshot->reflectorMaterialIndices.push_back(index);
-                snapshot->reflectorMaterials.push_back(record);
-            }
-
-            textureDetail.clear();
-
-            if(snapshot->reflectorRows.empty())
-            {
-                refuse(CausticSnapshotStatus::NoEligibleReflector);
-                m_dedicatedCausticsReason += " (no eligible reflector among " +
-                    std::to_string(snapshot->automaticCandidates) + " candidate rows)";
-                return;
-            }
-
-            if(snapshot->reflectorRows.size() > MaxCausticReflectors)
-            {
-                refuse(CausticSnapshotStatus::ReflectorCapacityExceeded);
-                m_dedicatedCausticsReason += " (" + std::to_string(snapshot->reflectorRows.size()) +
-                    " eligible reflectors exceed " + std::to_string(MaxCausticReflectors) + ")";
-                return;
-            }
-        }
-
-        snapshot->reflectorMaterialIndices.resize(snapshot->reflectorRows.size(), UINT_MAX);
-        snapshot->reflectorMaterials.resize(snapshot->reflectorRows.size());
-
-        if(!automatic)
-        {
-            for(std::size_t reflector = 0; reflector < snapshot->reflectorRows.size(); ++reflector)
-            {
-                if(const auto status = acceptMaterial(snapshot->reflectorRows[reflector], Role::Reflector,
-                    snapshot->reflectorMaterialIndices[reflector], snapshot->reflectorMaterials[reflector]);
-                    status != CausticSnapshotStatus::Recorded)
-                {
-                    refuse(status);
-                    m_dedicatedCausticsReason += " for reflector " + reflectorIDs[reflector] + textureDetail;
-                    return;
-                }
-            }
-        }
-
-        snapshot->reflectorRow = snapshot->reflectorRows.front();
-        snapshot->reflectorMaterialIndex = snapshot->reflectorMaterialIndices.front();
-        snapshot->reflectorMaterial = snapshot->reflectorMaterials.front();
-
-        if(!automaticReceivers)
-        {
-            if(const auto status = acceptMaterial(snapshot->receiverRow, Role::Receiver, snapshot->receiverMaterialIndex,
-                snapshot->receiverMaterial); status != CausticSnapshotStatus::Recorded)
-            {
-                refuse(status);
-                m_dedicatedCausticsReason += " for the receiver" + textureDetail;
-                return;
-            }
-
-            snapshot->receiverRows = {snapshot->receiverRow};
-            snapshot->receiverMaterialIndices = {snapshot->receiverMaterialIndex};
-        }
-        else
-        {
-            // P5D.2B discovery, in row order: a receiver is a resident row with a native instance that is not this
-            // frame's reflector and whose single slot passes the receiver material domain (any opaque model, admitted
-            // fallback texture only; near-delta allowed). Reflectors are excluded for now (no self-receiving).
-            for(std::size_t row = 0; row < join.rows.size(); ++row)
-            {
-                const auto& candidate = join.rows[row];
-                const bool reflects = std::find(snapshot->reflectorRows.begin(), snapshot->reflectorRows.end(), row) !=
-                    snapshot->reflectorRows.end();
-
-                if(reflects || !candidate.mesh)
-                {
-                    continue;
-                }
-
-                const bool fallbackBefore = usesFallback;
-                std::uint32_t index = UINT_MAX;
-                GPUMaterial record{};
-                const bool eligible = candidate.nativeInstance != SIZE_MAX && candidate.nativeInstance < UINT32_MAX &&
-                    acceptMaterial(row, Role::Receiver, index, record) == CausticSnapshotStatus::Recorded;
-
-                if(!eligible)
-                {
-                    // A rejected candidate must not mark the fallback texture as used by this snapshot.
-                    usesFallback = fallbackBefore;
-                    ++snapshot->automaticReceiverIneligible;
-                    continue;
-                }
-
-                snapshot->receiverRows.push_back(row);
-                snapshot->receiverMaterialIndices.push_back(index);
-
-                if(snapshot->receiverRows.size() == 1)
-                {
-                    snapshot->receiverMaterial = record;
-                }
-            }
-
-            textureDetail.clear();
-
-            if(snapshot->receiverRows.empty())
-            {
-                return refuse(CausticSnapshotStatus::NoEligibleReceiver);
-            }
-
-            snapshot->receiverRow = snapshot->receiverRows.front();
-            snapshot->receiverMaterialIndex = snapshot->receiverMaterialIndices.front();
-        }
-
-        if(usesFallback)
-        {
-            snapshot->textureCount = 1;
-            snapshot->fallbackTextureDescriptor = m_causticFallbackTexture.descriptor;
-            snapshot->fallbackTextureResource = m_causticFallbackTexture.resource;
-            snapshot->fallbackTexel = m_causticFallbackTexture.texel;
-        }
-
-        snapshot->materialRevision = recordedMaterialRevision;
-        snapshot->materialTable = m_materialBuffers[frameSlot].GetResource()->GetGPUVirtualAddress();
-        snapshot->materialCount = desired.size();
-
-        // Light: exactly one uploaded point record carrying the registered stable ID.
-        const auto count = (std::min)(lighting.table.lightCount, SceneLightConstants::Capacity);
-        std::size_t matches = 0;
-
-        for(std::uint32_t index = 0; index < count; ++index)
-        {
-            if(lighting.tableLightIDs[index] == registration.registration.lightObjectID)
-            {
-                ++matches;
-                snapshot->lightIndex = index;
-            }
-        }
-
-        if(!lightTable || matches != 1 ||
-            lighting.table.lights[snapshot->lightIndex].type != static_cast<std::uint32_t>(LightType::Point))
-        {
-            return refuse(CausticSnapshotStatus::LightUnavailable);
-        }
-
-        snapshot->light = lighting.table.lights[snapshot->lightIndex];
-        snapshot->lightTable = lightTable;
-
-        // Geometry last: the reader binds to this list only while its accepted capture is still
-        // the latest TLAS contents, so any earlier same-frame TLAS write refuses.
-        if(!RecordAcceptedGeometryReader(reader, snapshot->topLevel))
-        {
-            return refuse(CausticSnapshotStatus::StaleCapture);
-        }
-
-        // Camera: exactly the matrix the Reference dispatch inverts this frame. The forward axis is the
-        // unprojected image centre, so it carries the projection's own handedness and conventions.
-        snapshot->viewProjection = renderViewProjection;
-        snapshot->inverseViewProjection = renderViewProjection.Inverse();
-        snapshot->cameraPosition = {cameraPosition.x, cameraPosition.y, cameraPosition.z};
-        const auto unproject = [&](float depth)
-        {
-            const auto& m = snapshot->inverseViewProjection.m;
-            const float w = m[3][2] * depth + m[3][3];
-            return Vector3{(m[0][2] * depth + m[0][3]) / w, (m[1][2] * depth + m[1][3]) / w, (m[2][2] * depth + m[2][3]) / w};
-        };
-        const Vector3 forward = (unproject(1.0f) - unproject(0.0f)).Normalized();
-        snapshot->cameraForward = {forward.x, forward.y, forward.z};
-        snapshot->jacobianScale = std::abs(renderProjection.m[0][0] * renderProjection.m[1][1]) / 4.0f;
-        snapshot->width = m_sceneWidth;
-        snapshot->height = m_sceneHeight;
-        snapshot->identity = ++m_causticIdentity;
-        snapshot->frameSlot = frameSlot;
-        snapshot->recordingGeneration = m_commandRecordingGeneration;
-        snapshot->reader = std::move(reader);
-        m_lastCausticSnapshot = snapshot;
-        m_causticStatus = CausticSnapshotStatus::Recorded;
-
-        // Frame-scoped: consumed by this recording's RecordPathTraceReference, cleared at the next boundary.
-        if(m_pixelCausticsEnabled)
-        {
-            m_frameCausticSnapshot = snapshot;
-        }
-
-        // A recorder failure leaves only its own commands; the reader resolves with this list.
-        if(m_causticRecorder && !m_causticRecorder(*snapshot, *m_commandContext.GetRayTracingCommandList()))
-        {
-            Log::Warning("Caustic diagnostic recorder declined accepted snapshot " + std::to_string(snapshot->identity) + ".");
-        }
-
-        if(m_dedicatedCausticsEnabled)
-        {
-            RecordDedicatedCaustics(*snapshot);
-        }
-    }
-    catch(...)
-    {
-        refuse(CausticSnapshotStatus::MembershipUnsupported);
-    }
-}
-
 Renderer::~Renderer()
 {
     if (m_heightmapRegistration.owner)
@@ -1807,8 +568,6 @@ bool Renderer::BeginTrackedRecording(unsigned int frameSlot)
         }
     }
 
-    m_causticPass.CollectCompleted(m_commandContext);
-    m_pixelCausticPass.CollectCompleted(m_commandContext);
     m_rayTracingScene.CollectRetiredMemberships(m_commandContext);
     InvalidateRecordingEligibility(); // Includes allocator/list reset attempts.
     const std::uint64_t generation = AllocateRendererIdentity();
@@ -2012,8 +771,6 @@ bool Renderer::AbortTrackedRecording()
     {
         m_referenceRayCounts.Abort(materialSlot, uploadGeneration);
         m_textureThumbnails.Discarded(m_commandRecordingGeneration);
-        m_causticPass.DiscardRecording(m_commandRecordingGeneration);
-        m_pixelCausticPass.DiscardRecording(m_commandRecordingGeneration);
         m_rayTracingScene.DiscardMembershipRecording(m_commandRecordingGeneration);
 
         if(!m_materialPreviewRenderer.DiscardRecording(m_commandRecordingGeneration))
@@ -2080,17 +837,11 @@ bool Renderer::ExecuteTrackedRecording(unsigned int frameSlot)
         return false;
     }
 
-    m_causticPass.ArmSubmission(m_commandRecordingGeneration);
-    m_pixelCausticPass.ArmSubmission(m_commandRecordingGeneration);
     m_commandSubmissionAttempted = true;
     const bool executed = m_commandContext.Execute(frameSlot);
 
     if(executed)
     {
-        m_causticPass.ConfirmSubmission(m_commandRecordingGeneration, m_commandContext.GetLastSubmissionFenceValue(),
-            m_commandContext.GetSubmissionLifetime());
-        m_pixelCausticPass.ConfirmSubmission(m_commandRecordingGeneration,
-            m_commandContext.GetLastSubmissionFenceValue(), m_commandContext.GetSubmissionLifetime());
         if (!m_rayTracingScene.ConfirmMembershipSubmission(m_commandRecordingGeneration, m_commandContext))
         {
             Log::Error("DXR membership submission association failed; retaining snapshot ownership.");
@@ -2487,15 +1238,11 @@ ReservedSubmissionResult Renderer::ExecuteCoveredDisplacementRecording(
         return ReservedSubmissionResult::SubmissionUncertain;
     }
 
-    m_causticPass.ArmSubmission(m_commandRecordingGeneration);
-    m_pixelCausticPass.ArmSubmission(m_commandRecordingGeneration);
     m_commandSubmissionAttempted = true;
     const auto result = m_commandContext.ExecuteReserved(frameSlot, reservation, submitted);
 
     if(result == ReservedSubmissionResult::Submitted)
     {
-        m_causticPass.ConfirmSubmission(m_commandRecordingGeneration, submitted.fenceValue, submitted.lifetime);
-        m_pixelCausticPass.ConfirmSubmission(m_commandRecordingGeneration, submitted.fenceValue, submitted.lifetime);
         if (!m_rayTracingScene.ConfirmMembershipSubmission(m_commandRecordingGeneration, m_commandContext))
         {
             Log::Error("DXR membership reserved submission association failed; retaining snapshot ownership.");
@@ -2518,8 +1265,6 @@ ReservedSubmissionResult Renderer::ExecuteCoveredDisplacementRecording(
     }
     else if(result == ReservedSubmissionResult::NotSubmitted)
     {
-        m_causticPass.ProvenNotSubmitted(m_commandRecordingGeneration);
-        m_pixelCausticPass.ProvenNotSubmitted(m_commandRecordingGeneration);
         m_rayTracingScene.MembershipNotSubmitted(m_commandRecordingGeneration);
         m_commandSubmissionAttempted = false;
     }
@@ -4177,7 +2922,6 @@ bool Renderer::Initialize(
     // PS.5C: the worker's private shader library for the PSR auxiliary pipelines reads the same cooked bootstrap.
     m_packagedShaderPayload = m_packagedRuntime ?
         std::make_shared<const std::vector<std::byte>>(packagedShaders.begin(), packagedShaders.end()) : nullptr;
-    m_reconstructionAcceptance = {};
     m_sceneResourceLifetime = 0;
     m_sceneResourceScene = nullptr;
 
@@ -5296,13 +4040,6 @@ bool Renderer::ResizeScene(unsigned int width, unsigned int height)
         return false;
     }
 
-    // Drained: no recorded frame still uses the resolution-sized caustic resources.
-    m_causticPass.CollectCompleted(m_commandContext);
-    m_causticPass.DiscardRecording(m_commandRecordingGeneration);
-    m_causticPass.ReleaseResources();
-    m_pixelCausticPass.CollectCompleted(m_commandContext);
-    m_pixelCausticPass.DiscardRecording(m_commandRecordingGeneration);
-    m_pixelCausticPass.ReleaseResources();
 
     if(m_dlssRetryPending)
     {
@@ -6078,8 +4815,7 @@ void Renderer::DrawMaterialRange(
     // indexed mesh of an object the membership places in the TLAS; any other draw writes the invalid identity.
     const bool exactMapping = geometry.source == DrawGeometrySource::PublishedMesh && geometry.indexed &&
         firstIndex % 3 == 0 && renderObjectIndex < UINT32_MAX - 1 &&
-        m_rayTracingScene.GetNativeInstance(renderObjectIndex) != RayTracingSceneResources::InvalidInstanceIndex &&
-        renderObjectIndex != m_rasterIdentityInvalidObject;
+        m_rayTracingScene.GetNativeInstance(renderObjectIndex) != RayTracingSceneResources::InvalidInstanceIndex;
     const std::uint32_t rasterIdentity[] = {
         exactMapping ? static_cast<std::uint32_t>(renderObjectIndex) : GBuffer::InvalidIdentity,
         exactMapping ? firstIndex / 3 : GBuffer::InvalidIdentity};
@@ -6330,7 +5066,6 @@ bool Renderer::InitializeSceneResources(
         return false;
     }
 
-    m_reconstructionAcceptance = {};
     m_sceneInitializationAttempt = {};
     m_sceneInitializationAttempt.candidate = &scene;
 
@@ -6387,13 +5122,6 @@ bool Renderer::InitializeSceneResources(
         ResetSceneHistory();
         m_sceneResourceLifetime = lifetime;
         m_sceneResourceScene = &scene;
-
-        if(scene.HasRenderableMeshes())
-        {
-            m_reconstructionAcceptance = {lifetime, m_rayTracingScene.GetSceneResourceLifetime(),
-                m_rayTracingScene.GetMembershipAdoptionCount(), &scene};
-        }
-
         return true;
     };
 
@@ -6658,8 +5386,6 @@ bool Renderer::CleanupFailedSceneInitialization(const Scene& candidate)
     }
 
     InvalidateRecordingEligibility();
-    m_reconstructionAcceptance = {};
-    ResetCausticSceneState();
 
     m_rayTracingScene.Shutdown();
     ShutdownMaterialTables();
@@ -6719,9 +5445,6 @@ bool Renderer::ReleaseSceneResources()
     }
 
     InvalidateRecordingEligibility();
-    m_reconstructionAcceptance = {};
-    ResetCausticSceneState();
-    m_causticPass.ResetHistory();
     m_sceneResourceLifetime = 0;
     m_sceneResourceScene = nullptr;
     m_rayTracingScene.Shutdown();
@@ -8929,8 +7652,7 @@ bool Renderer::RecordPathTraceReference(
     const Vector3& cameraPosition,
     const FrameLighting& frameLighting,
     D3D12_GPU_VIRTUAL_ADDRESS sceneLightConstantsAddress,
-    const PathTraceReferenceSettings& settings,
-    const AcceptedCausticSnapshot* causticSnapshot)
+    const PathTraceReferenceSettings& settings)
 {
     m_nrdPathTraceDiagnosticRanLastFrame = false;
     m_pathTraceRawDiffuseHitDistanceLastFrame = false;
@@ -9368,15 +8090,6 @@ bool Renderer::RecordPathTraceReference(
                 renderCacheAddress, renderCacheLibrary, rawExtraction, primarySurfaceReplacement,
                 m_psrGBufferConstantsAddress, m_psrGBufferTransformsAddress);
             m_psrLightingLastFrame = m_pathTraceReferencePass.WrotePrimarySurfaceReplacementGBuffer();
-
-            // R.9I.3 pixel-centred caustics seam: the split's output barriers are recorded and no denoiser has read
-            // the extraction yet. A verified seam records the estimator into this list; its outputs feed only the
-            // caustics-only views (P1), never the extraction or a denoiser.
-            if(m_pixelCausticsEnabled && VerifyPixelCausticSeam(causticSnapshot, frameIndex))
-            {
-                RecordPixelCaustics(*causticSnapshot, commandList, frameIndex,
-                    constants.inverseCameraRelativeViewProjection, cameraPosition);
-            }
         }
         else
         {
@@ -9615,24 +8328,7 @@ bool Renderer::RecordPathTraceReference(
     if(!m_sharcDiagnosticPresentedThisFrame)
 #endif
     {
-        // Dedicated caustics (additive development) replace only this display copy, on undenoised,
-        // non-temporal Reference frames. The Reference output and accumulation are never written, so a
-        // held converged frame stays correct and OFF restores the original image on the next frame.
-        m_causticPresentedLastFrame = m_causticFrameRecorded && !m_pathTraceTemporalRanLastFrame &&
-            m_pathTraceDenoiserMode == PathTraceDenoiserMode::Off &&
-            m_causticPass.Present(commandList, m_resourceDescriptorHeap, m_uploadBuffer,
-                m_pathTraceReferencePass.GetOutputTexture(), m_sceneColor, m_causticOnlyView);
-
-        // R.9I.3 pixel-centred caustics-only views (debug) replace only this display copy, and only on a frame that
-        // recorded the estimator; the path-traced output, extraction and denoiser histories are untouched.
-        const bool pixelCausticViewPresented = !m_causticPresentedLastFrame && m_pixelCausticsEnabled &&
-            m_pixelCausticPass.RecordView(commandList, m_resourceDescriptorHeap, m_uploadBuffer, m_pixelCausticView,
-                m_sceneColor, m_gpuTimestampProfiler, frameIndex);
-
-        if(!m_causticPresentedLastFrame && !pixelCausticViewPresented)
-        {
-            m_pathTraceReferencePass.CopyToSceneColor(commandList, m_sceneColor);
-        }
+        m_pathTraceReferencePass.CopyToSceneColor(commandList, m_sceneColor);
     }
 
     return true;
@@ -12919,23 +11615,6 @@ bool Renderer::RecordRenderFrame(
         return false;
     }
 
-    // Earliest point holding this list's material table, uploaded lights, resolved mode
-    // and every same-frame TLAS write. Optional and noncontributing; never fails the frame.
-    // The render view-projection and jitter are already resolved above for this recording.
-    // The dedicated estimator is mode-independent; each path-traced mode's history is still kept separate.
-    const bool causticPathTrace = runPathTrace && (recordedMode == RendererLightingMode::PathTracedReference ||
-        recordedMode == RendererLightingMode::PathTracedRasterPrimary ||
-        recordedMode == RendererLightingMode::PathTracedRasterPrimaryReSTIRDI);
-
-    if(causticPathTrace && recordedMode != m_causticRecordedMode)
-    {
-        m_causticPass.ResetHistory();
-        m_causticRecordedMode = recordedMode;
-    }
-
-    RecordCausticSnapshot(frameIndex, causticPathTrace, materialRevision, frameLighting, sceneLightConstantsAddress,
-        renderViewProjection, renderProjection, frameView.position);
-
     // These history resets/writes intentionally precede later uploads and recording failures.
     const Vector3 currentLightDirection = light.direction.Normalized();
     bool giLightingChanged = m_hasPreviousGILocalLights &&
@@ -13271,13 +11950,11 @@ bool Renderer::RecordRenderFrame(
         // NRD.2: path tracing never uses the hybrid mode's NRD instances. ER.1 Phase 3: they are kept for the next Legacy
         // frame, which restarts them with CLEAR_AND_RESTART (m_nrdExecutedLastFrame is false after a path-traced frame).
 
-        // R.9I.3: only this recording's accepted snapshot reaches the pixel caustics seam (null when disabled).
-        const CausticSnapshotHandle pixelCausticSnapshot = std::move(m_frameCausticSnapshot);
         MarkDredStage(commandList, L"Frame: path tracing");
 
         if(!RecordPathTraceReference(commandList, frameIndex, pathTracePrimary, currentView, renderProjection,
             currentProjection, reconstructionConstants.inverseViewProjection, frameView.position, frameLighting,
-            sceneLightConstantsAddress, options.pathTraceReference, pixelCausticSnapshot.get()))
+            sceneLightConstantsAddress, options.pathTraceReference))
         {
             return false;
         }
@@ -14481,9 +13158,6 @@ void Renderer::Shutdown()
         std::abort();
     }
 
-    m_reconstructionAcceptance = {};
-    ResetCausticSceneState();
-    m_causticRecorder = {};
     m_sceneResourceLifetime = 0;
     m_sceneResourceScene = nullptr;
     Log::Info("Renderer shutdown: waiting for GPU...");
@@ -14507,13 +13181,7 @@ void Renderer::Shutdown()
 
     Log::Info("Renderer shutdown: releasing ray tracing scene resources.");
     m_rayTracingScene.Shutdown();
-    m_causticPass.CollectCompleted(m_commandContext);
-    m_causticPass.DiscardRecording(m_commandRecordingGeneration);
-    m_causticPass.Shutdown();
-    m_pixelCausticPass.CollectCompleted(m_commandContext);
-    m_pixelCausticPass.DiscardRecording(m_commandRecordingGeneration);
-    m_pixelCausticPass.Shutdown();
-    Log::Info("Renderer shutdown: ray tracing and caustic resources released.");
+    Log::Info("Renderer shutdown: ray tracing resources released.");
     m_textureThumbnails.ClearAfterGPUDrain();
 
     // No DLSS work can be in flight after the drain; NGX must be released before the device.

@@ -38,21 +38,16 @@
     X(differenceAmplification, pathTracing.differenceAmplification) \
     X(uncertaintyFloorLog10, pathTracing.uncertaintyFloorLog10) \
     X(sharc, pathTracing.sharc) \
-    X(dedicatedCaustics, pathTracing.dedicatedCaustics) \
-    X(causticOnlyView, pathTracing.causticOnlyView) \
-    X(pixelCentredCaustics, pathTracing.pixelCentredCaustics) \
     X(volumetricQuality, volumetrics.quality) \
     X(volumetricResolutionBasis, volumetrics.resolutionBasis)
 
 // Debug-only Reference Path Tracer development overrides (name, type). No project setting reaches Reference;
-// without these it renders with its fixed internal quality and no dedicated caustics.
+// without these it renders with its fixed internal quality.
 #define ENGINE_REFERENCE_DEBUG_OVERRIDES(X) \
     X(referenceSamplesPerFrame, std::uint32_t) \
     X(referenceMaxPathDepth, std::uint32_t) \
     X(referenceRouletteFromDepth, std::uint32_t) \
-    X(referenceSampleTarget, std::uint32_t) \
-    X(referenceDedicatedCaustics, bool) \
-    X(referenceCausticOnlyView, bool)
+    X(referenceSampleTarget, std::uint32_t)
 
 enum class RenderingOverrideField
 {
@@ -78,8 +73,8 @@ struct RenderingOverrides
 // The saved settings with every present setting override applied (the Reference overrides do not apply here).
 RenderingSettings ApplyRenderingOverrides(const RenderingSettings& saved, const RenderingOverrides& overrides);
 
-// Writes the Reference overrides into diagnostics: a quality request starting from Reference's fixed quality,
-// and dedicated caustics. Nothing is written when no Reference override is present.
+// Writes the Reference overrides into diagnostics: a quality request starting from Reference's fixed quality.
+// Nothing is written when no Reference override is present.
 void ApplyReferenceOverrides(const RenderingOverrides& overrides, RenderingDiagnostics& diagnostics);
 
 bool IsOverridden(const RenderingOverrides& overrides, RenderingOverrideField field);
