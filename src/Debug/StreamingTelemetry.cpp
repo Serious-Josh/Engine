@@ -408,6 +408,8 @@ namespace StreamingTelemetry
             "EnvironmentCopyBytes", "EnvironmentWorkUnits", "EnvironmentPublishNs", "EnvironmentPublications",
             "EnvironmentSuperseded", "EnvironmentRetirementReleases", "SceneStagingSteps", "SceneStagingNs",
             "GeometryUploadsQueued", "GeometryUploadBytes", "GeometryUploadRecordNs",
+            "SceneDocumentReads", "SceneDocumentReadBytes", "SceneDocumentCacheHits", "SceneDocumentCompareNs",
+            "SceneDocumentCopies", "SceneDocumentCopyNs", "SceneParses", "SceneParseBytes", "SceneParseNs",
         };
 
         return names[static_cast<std::size_t>(metric)];

@@ -35,6 +35,7 @@
 
 #include "Scene/Scene.h"
 #include "Scene/SceneFileCreation.h"
+#include "Scene/SceneDocumentCache.h"
 #include "Scene/SceneSerializer.h"
 #include "Project/ProjectCreation.h"
 
@@ -414,6 +415,14 @@ bool Engine::ExecuteMaterialAssignment()
 
     const auto request = std::move(*m_pendingMaterialAssignment);
     m_pendingMaterialAssignment.reset();
+
+    // W6 finalization: a resident object's assignment publishes incrementally; the pending flow reports completion, or
+    // returns the request here with `reconstruct` set when the incremental path cannot take it.
+    if(!request.reconstruct && BeginIncrementalMaterialAssignment(request))
+    {
+        return true;
+    }
+
     // Report every exit, including exceptions, without changing execution/rollback semantics.
     struct AssignmentFeedback
     {
@@ -1267,9 +1276,10 @@ bool Engine::InitializeProjectScene()
     {
         std::string error;
         const auto scenePath = ResolveLastEditedScene(error);
-        SceneDocument document;
+        SceneDocumentCache::Parsed document;
 
-        if(scenePath && LoadSceneDocument(*scenePath, document, &error) && ValidateSceneKindOpenable(document, &error))
+        if(scenePath && SceneDocumentCache::Load(*scenePath, document, &error, "Engine last edited scene") &&
+            ValidateSceneKindOpenable(*document.document, &error))
         {
             m_initialScenePath = *scenePath;
             source = SceneSource::SavedFile;
@@ -2251,6 +2261,9 @@ bool Engine::InitializeProject()
     }
 
     const bool archiveDiagnostic = m_startup.mode != EngineStartup::Mode::Editor;
+
+    // Parsed scene documents are reused only within one project (W6.0): a project change releases them.
+    SceneDocumentCache::Clear();
 
     // An explicitly opened project arrives validated and locked through SetStartupProject.
     // Otherwise this is the single place the running Engine asks ProjectLocator for a root.
@@ -4306,16 +4319,24 @@ void Engine::Frame()
         renderProbe.emplace(m_renderer, Renderer::FrameHitchRegion::EngineRender);
     }
 
+    const auto residencyStart = std::chrono::steady_clock::now();
     ProcessMeshResidencyDiagnostics();
+    const auto textureStart = std::chrono::steady_clock::now();
     ProcessSceneTextureStreaming(true);
+    m_frameCpuTimings.residency = std::chrono::duration<double, std::milli>(textureStart - residencyStart).count();
+    m_frameCpuTimings.textureStreaming = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - textureStart).count();
 
     // Coordinated publication boundary: all editor/assets, scene update/rebuild
     // and thumbnail/preview preparation above are complete. Final validation
     // and the noexcept ownership/binding transfer finish before Render records.
+    const auto acceptStart = std::chrono::steady_clock::now();
     AcceptPreparedMeshResidencyForFrame(activeDemo);
+    m_frameCpuTimings.acceptResidency = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - acceptStart).count();
+    ObserveAutomaticResidencyFrame();
 
     // Accept bindings before physics validates and publishes the current presentation.
     ProcessViewportMaterialAssignment(activeDemo);
+    ProcessIncrementalMaterialAssignment(activeDemo);
     auto* physicsScene = dynamic_cast<FileBackedDemoScene*>(&activeDemo);
     // W4: a composite World preview is read-only; Play and Physics Simulation are W8 work for Worlds.
     const bool editableFileScene = physicsScene && !physicsScene->IsArchiveActivation() && !physicsScene->GetCompositeWorld();
@@ -6826,10 +6847,15 @@ void Engine::ContinueAutomaticMeshResidencyAfterReplacement(std::uint64_t previo
 
         Log::Info("Automatic mesh residency session " + std::to_string(previousRuntimeIdentity) +
             " superseded by editor replacement; old requests canceled, counters/failure generations discarded.");
+        const bool hadFailures = !m_automaticMeshResidency.failures.empty();
         StartAutomaticMeshResidency();
         // Rebuild bounded failure state rather than reconciling old epochs. A
         // conservative cooldown prevents immediate repeated imports after edits.
-        m_automaticMeshResidency.retryAfter = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        // W6.3: only a session with recorded failures can repeat an import; otherwise an edit's new object is scheduled at once.
+        if (hadFailures)
+        {
+            m_automaticMeshResidency.retryAfter = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        }
     }
     catch (const std::exception&)
     {
@@ -6868,7 +6894,10 @@ void Engine::FinishAutomaticMeshResidency(MeshResidencyPublication::Status statu
         }
 
         scheduler.backpressure.clear();
-        scheduler.batchLimit = FileSceneRuntime::MaxMeshResidencyBatch;
+        // W6.4: adapted at this frame's end, once the publication stage's cost is known (ObserveAutomaticResidencyFrame).
+        scheduler.batchLimit = scheduler.adaptiveLimit;
+        scheduler.completedBatch = entries.size();
+        scheduler.adaptationPending = true;
         m_residencyRequestAutomatic = false;
         return;
     }
@@ -6924,7 +6953,7 @@ void Engine::FinishAutomaticMeshResidency(MeshResidencyPublication::Status statu
                 return failure.selection.objectID == responsible->objectID;
             });
 
-            if (scheduler.failures.size() < 4096)
+            if (scheduler.failures.size() < RayTracingSceneResources::MaxCandidateObjects)
             {
                 scheduler.failures.push_back({*responsible, sourceIdentity});
             }
@@ -7296,6 +7325,85 @@ bool Engine::PrefetchMeshImports(FileBackedDemoScene& scene, const SceneObjectMe
     return true;
 }
 
+namespace
+{
+    // W6.4 residency batching controls, read once:
+    //   ENGINE_RESIDENCY_BUDGET_MS=<ms>           main-thread budget of one residency stage (default 8)
+    //   ENGINE_RESIDENCY_BATCH=<n>                fixed batch size instead of the adaptive one (32 = the pre-W6.4 behaviour)
+    //   ENGINE_RESIDENCY_NEW_GEOMETRY_INDICES=<n> index count of new BLAS geometry one batch may add (default 3,000,000)
+    double ResidencyStageBudgetMilliseconds()
+    {
+        static const double budget = []
+        {
+            const char* text = std::getenv("ENGINE_RESIDENCY_BUDGET_MS");
+            const double value = text ? std::atof(text) : 0.0;
+            return value > 0.0 ? value : 8.0;
+        }();
+
+        return budget;
+    }
+
+    std::size_t FixedResidencyBatch()
+    {
+        static const std::size_t fixed = []
+        {
+            const char* text = std::getenv("ENGINE_RESIDENCY_BATCH");
+            const long long value = text ? std::atoll(text) : 0;
+            return value > 0 ? (std::min)(static_cast<std::size_t>(value), FileSceneRuntime::MaxMeshResidencyBatch) : std::size_t{0};
+        }();
+
+        return fixed;
+    }
+}
+
+std::size_t Engine::ResidencyNewGeometryBudget()
+{
+    static const std::size_t budget = []
+    {
+        const char* text = std::getenv("ENGINE_RESIDENCY_NEW_GEOMETRY_INDICES");
+        const long long value = text ? std::atoll(text) : 0;
+        return value > 0 ? static_cast<std::size_t>(value) : std::size_t{3000000};
+    }();
+
+    return budget;
+}
+
+void Engine::ObserveAutomaticResidencyFrame()
+{
+    auto& scheduler = m_automaticMeshResidency;
+    const double stage = (std::max)(m_frameCpuTimings.residency, m_frameCpuTimings.acceptResidency);
+
+    if (scheduler.adaptationPending)
+    {
+        // The published batch's last stage was this frame's publication.
+        scheduler.batchWorstStageMilliseconds = (std::max)(scheduler.batchWorstStageMilliseconds, stage);
+        const double budget = ResidencyStageBudgetMilliseconds();
+
+        if (const auto fixed = FixedResidencyBatch())
+        {
+            scheduler.adaptiveLimit = fixed;
+        }
+        else if (scheduler.batchWorstStageMilliseconds > budget)
+        {
+            scheduler.adaptiveLimit = (std::max)(MinimumResidencyBatch, scheduler.adaptiveLimit / 2);
+        }
+        else if (scheduler.batchWorstStageMilliseconds < budget / 2 && scheduler.completedBatch >= scheduler.adaptiveLimit)
+        {
+            scheduler.adaptiveLimit = (std::min)(FileSceneRuntime::MaxMeshResidencyBatch, scheduler.adaptiveLimit * 2);
+        }
+
+        scheduler.batchLimit = scheduler.adaptiveLimit;
+        scheduler.adaptationPending = false;
+        scheduler.batchWorstStageMilliseconds = 0.0;
+        return;
+    }
+
+    if (m_residencyRequestAutomatic && !m_residencyRequestBatch.empty())
+    {
+        scheduler.batchWorstStageMilliseconds = (std::max)(scheduler.batchWorstStageMilliseconds, stage);
+    }
+}
+
 void Engine::SubmitAutomaticResidencyBatch(FileBackedDemoScene& scene,
     const std::vector<FileSceneRuntime::MeshResidencyRequest>& batch)
 {
@@ -7492,7 +7600,8 @@ void Engine::AdvanceAutomaticMeshResidency()
     ReportAutomaticResidencyGate(scheduler.settled ? nullptr : GetAutomaticResidencyGate(*scene->m_runtime));
 
     if (m_diagnosticCPUPreparation || m_diagnosticMeshToken || m_meshResidencyPublication.HasCandidate() ||
-        m_pendingEditorSceneOperation || m_pendingMaterialAssignment || m_demoSceneManager.HasPendingSceneChange() ||
+        m_pendingEditorSceneOperation || m_pendingMaterialAssignment || m_pendingIncrementalMaterial ||
+        m_demoSceneManager.HasPendingSceneChange() ||
         !MeshResidencyPublication::CanPrepareGeometry(m_renderer, *scene->m_runtime))
     {
         return;
@@ -7524,9 +7633,28 @@ void Engine::AdvanceAutomaticMeshResidency()
         });
     }
 
-    if (objects.size() > 4096)
+    // Settled with no recorded failure, every object with a mesh reference is resident. Only a structure change (handled above),
+    // a document edit, a binding change or a residency change can create new work, so an unchanged state skips the rescan and
+    // its validation passes. Recorded failures keep the periodic rescan, which notices a changed source.
+    const std::array<std::uint64_t, 3> runtimeState{scene->m_runtime->GetFileScene().GetEditRevision(),
+        scene->m_runtime->GetValidityEpoch(), scene->m_runtime->GetResidencyRevision()};
+
+    if (scheduler.cursor == 0)
     {
-        Log::Warning("Automatic mesh residency stopped: scene exceeds the 4096-object candidate/scheduler bound.");
+        if (scheduler.settled && scheduler.failures.empty() && runtimeState == scheduler.scannedState)
+        {
+            return;
+        }
+
+        scheduler.scanStartState = runtimeState;
+    }
+
+    // Unreachable for a scene the hierarchy admits (asserted against SceneHierarchy::Policy::maxObjects); kept so a larger
+    // runtime can never reach the renderer's candidate bound unreported.
+    if (objects.size() > RayTracingSceneResources::MaxCandidateObjects)
+    {
+        Log::Error("Automatic mesh residency stopped: the scene has " + std::to_string(objects.size()) +
+            " objects, above the renderer candidate bound of " + std::to_string(RayTracingSceneResources::MaxCandidateObjects) + ".");
         scheduler.enabled = false;
         return;
     }
@@ -7538,7 +7666,11 @@ void Engine::AdvanceAutomaticMeshResidency()
     const size_t limit = (std::min)(scheduler.batchLimit, FileSceneRuntime::MaxMeshResidencyBatch);
     // Bounded per-frame scan, wide enough that resident objects interleaved in
     // the scene do not cut a full batch short.
-    const size_t scanBudget = (std::max)(std::size_t{32}, 4 * FileSceneRuntime::MaxMeshResidencyBatch);
+    const size_t scanBudget = (std::max)(std::size_t{32}, 4 * limit);
+    // W6.4: the geometry a batch adds to the BLAS registry (index count of meshes it is the first to make resident) is bounded,
+    // so many or unusually large unique meshes spread over batches. A batch always takes its first object (no starvation).
+    std::set<const Mesh*> newGeometry;
+    std::size_t newGeometryIndices = 0;
     std::vector<FileSceneRuntime::MeshResidencyRequest> batch;
     const FileSceneAssetCatalog::ValidationPass validationPass(scene->m_assets);
     // S0.3: the scan's per-object metadata lookups share one whole-scene validation. The scan reads the runtime only (catalog
@@ -7636,6 +7768,16 @@ void Engine::AdvanceAutomaticMeshResidency()
             return;
         }
 
+        if (candidate->mesh && !m_renderer.HasStableBLAS(candidate->mesh) && newGeometry.insert(candidate->mesh).second)
+        {
+            newGeometryIndices += candidate->mesh->GetIndexCount();
+
+            if (!batch.empty() && newGeometryIndices > ResidencyNewGeometryBudget())
+            {
+                break; // This object starts the next batch.
+            }
+        }
+
         std::erase_if(scheduler.failures, [&](const auto& saved)
         {
             return saved.selection.objectID == selection->objectID;
@@ -7698,6 +7840,7 @@ void Engine::AdvanceAutomaticMeshResidency()
 
     // Low-frequency discovery resumes to notice binding/source changes after
     // settlement. No import retry occurs for an unchanged recorded failure.
+    scheduler.scannedState = scheduler.scanStartState;
     scheduler.cursor = 0;
     scheduler.retryAfter = now + std::chrono::seconds(1);
 }

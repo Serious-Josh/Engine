@@ -79,6 +79,19 @@ void SceneHierarchyPanel::UpdateTree(const SceneHierarchySnapshot& snapshot, std
         m_expansionScene = sceneIdentity;
         m_dropStatus.clear();
         m_rowsDirty = true;
+        m_treeGeneration = 0;
+    }
+
+    // The tree was built from, or compared with, this exact snapshot.
+    if(m_snapshotGeneration != 0 && m_snapshotGeneration == m_treeGeneration && m_tree.objectIDs.size() == snapshot.entries.size())
+    {
+        if(m_rowsDirty)
+        {
+            m_rows = VisibleHierarchyRows(m_tree, m_collapsed);
+            m_rowsDirty = false;
+        }
+
+        return;
     }
 
     const bool sameTopology = snapshot.entries.size() == m_treeSnapshot.entries.size() &&
@@ -98,6 +111,7 @@ void SceneHierarchyPanel::UpdateTree(const SceneHierarchySnapshot& snapshot, std
             m_tree = {};
             m_pendingRevealID.clear();
             m_dropStatus = error;
+            m_treeGeneration = 0;
             return;
         }
 
@@ -106,6 +120,8 @@ void SceneHierarchyPanel::UpdateTree(const SceneHierarchySnapshot& snapshot, std
         std::erase_if(m_collapsed, [&](const auto& id) { return !present.contains(id); });
         m_rowsDirty = true;
     }
+
+    m_treeGeneration = m_snapshotGeneration;
 
     if(m_rowsDirty)
     {
@@ -367,6 +383,60 @@ void SceneHierarchyPanel::DrawRenameInput()
     }
 }
 
+// Object Edit shows a box (entities edited individually); Level Edit a four-way move glyph (the Local moves as one placement).
+// The button sits over the row's right end; the row's Selectable allows the overlap, so a click toggles without selecting.
+// The button is the row's last item, on the row's own line and of the row's height, so after it the layout cursor is where the
+// next row begins, as it was after the Selectable (no cursor restore: ImGui refuses a cursor move without a following item).
+void SceneHierarchyPanel::DrawLevelModeToggle(const std::string& levelID, bool levelEdit, ImVec2 rowPosition)
+{
+    const float size = ImGui::GetFrameHeight();
+    const float right = rowPosition.x + ImGui::GetContentRegionAvail().x;
+    ImGui::SetCursorScreenPos(ImVec2(right - size, rowPosition.y));
+
+    if(ImGui::InvisibleButton("##LevelEditMode", ImVec2(size, size)))
+    {
+        m_levelModeToggle = levelID;
+    }
+
+    const bool hovered = ImGui::IsItemHovered();
+
+    if(hovered)
+    {
+        ImGui::SetTooltip(levelEdit ?
+            "Level Edit: selecting this Local selects its placement; the gizmo moves and rotates the whole Local.\nClick for Object Edit." :
+            "Object Edit: this Local's entities are selected and edited individually.\nClick for Level Edit.");
+    }
+
+    auto* draw = ImGui::GetWindowDrawList();
+    const ImU32 color = ImGui::GetColorU32(hovered ? ImGuiCol_ButtonHovered : ImGuiCol_Text);
+    const ImVec2 centre(right - size * 0.5f, rowPosition.y + size * 0.5f);
+    const float half = size * 0.32f;
+
+    if(levelEdit)
+    {
+        const float arm = half;
+        const float head = size * 0.12f;
+        draw->AddLine(ImVec2(centre.x - arm, centre.y), ImVec2(centre.x + arm, centre.y), color, 1.5f);
+        draw->AddLine(ImVec2(centre.x, centre.y - arm), ImVec2(centre.x, centre.y + arm), color, 1.5f);
+        draw->AddTriangleFilled(ImVec2(centre.x + arm + head, centre.y), ImVec2(centre.x + arm - head, centre.y - head),
+            ImVec2(centre.x + arm - head, centre.y + head), color);
+        draw->AddTriangleFilled(ImVec2(centre.x - arm - head, centre.y), ImVec2(centre.x - arm + head, centre.y + head),
+            ImVec2(centre.x - arm + head, centre.y - head), color);
+        draw->AddTriangleFilled(ImVec2(centre.x, centre.y - arm - head), ImVec2(centre.x + head, centre.y - arm + head),
+            ImVec2(centre.x - head, centre.y - arm + head), color);
+        draw->AddTriangleFilled(ImVec2(centre.x, centre.y + arm + head), ImVec2(centre.x - head, centre.y + arm - head),
+            ImVec2(centre.x + head, centre.y + arm - head), color);
+    }
+    else if(m_icons)
+    {
+        m_icons->Draw(*draw, EditorIcon::Box, ImVec2(centre.x - half, centre.y - half), ImVec2(half * 2.0f, half * 2.0f), color);
+    }
+    else
+    {
+        draw->AddRect(ImVec2(centre.x - half, centre.y - half), ImVec2(centre.x + half, centre.y + half), color);
+    }
+}
+
 std::optional<std::size_t> SceneHierarchyPanel::Draw(const EditorWorkspaceRect& rectangle,
     const SceneHierarchySnapshot& snapshot, std::optional<std::size_t> selectedObject,
     const void* sceneIdentity, const std::string& error,
@@ -599,7 +669,11 @@ std::optional<std::size_t> SceneHierarchyPanel::Draw(const EditorWorkspaceRect& 
                 }
                 else
                 {
-                    if(ImGui::Selectable("##Object", selected, ImGuiSelectableFlags_None,
+                    // W5 refinement: a Local Level row has a mode toggle drawn over its right end.
+                    const std::optional<bool> levelEditMode = m_levelEditModeQuery && !entry.objectID.empty() ?
+                        m_levelEditModeQuery(entry.objectID) : std::nullopt;
+
+                    if(ImGui::Selectable("##Object", selected, levelEditMode ? ImGuiSelectableFlags_AllowOverlap : ImGuiSelectableFlags_None,
                         ImVec2(0, ImGui::GetFrameHeight())))
                     {
                         if(hasChildren && ImGui::GetIO().MousePos.x >= rowPosition.x + indent &&
@@ -707,6 +781,11 @@ std::optional<std::size_t> SceneHierarchyPanel::Draw(const EditorWorkspaceRect& 
                         {
                             draw->AddText(warningOrigin, warningColor, "!");
                         }
+                    }
+
+                    if(levelEditMode)
+                    {
+                        DrawLevelModeToggle(entry.objectID, *levelEditMode, rowPosition);
                     }
                 }
 

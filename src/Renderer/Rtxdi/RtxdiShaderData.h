@@ -29,7 +29,8 @@ struct PathTraceRtxdiConstants
     std::uint32_t reservoirBufferIndex = 0;
     std::uint32_t localLightSamples = 0;
     std::uint32_t infiniteLightSamples = 0;
-    std::uint32_t padding = 0;
+    // WNP.2: 1 shadow-tests the selected initial sample before reuse (PathTraceReference.hlsl rtxdiInitialVisibility).
+    std::uint32_t initialVisibility = 0;
 
     // (kind, sourceIndex) for each RTXDI light index.
     std::uint32_t lightRecords[RecordWords]{};

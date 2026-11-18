@@ -350,7 +350,7 @@ bool FileSceneRuntime::SetObjectLight(const SceneObjectMetadata& selection,
     m_fileScene.EditDocument().objects[index].light = replacement;
     return true;
 }
-
+
 bool FileSceneRuntime::SetObjectAirMotor(const SceneObjectMetadata& selection,
     const std::optional<AirMotorComponent>& expected,
     const std::optional<AirMotorComponent>& replacement, std::string* errorMessage)
@@ -1133,6 +1133,25 @@ bool FileSceneRuntime::RenameObject(const SceneObjectMetadata& selection, std::s
 
     const size_t index = static_cast<size_t>(found - objects.begin());
 
+    // A composite World checks the renamed candidate against its ownership rules like every other edit (a Local Level node
+    // holds only its placement, so renaming it would leave the World unsavable). Standalone scenes have no validator.
+    if(m_candidateValidator)
+    {
+        SceneDocument candidate;
+
+        if(!CaptureSceneDocument(m_fileScene.GetDocument(), m_scene, m_objectMapping, candidate, errorMessage))
+        {
+            return false;
+        }
+
+        candidate.objects[index].name = name;
+
+        if(!(ValidateSceneDocument(candidate, errorMessage) && ValidateCompositeCandidate(candidate, errorMessage)))
+        {
+            return false;
+        }
+    }
+
     // All validation and string allocation precede the dirty-marking commit point.
     m_fileScene.EditDocument().objects[index].name.swap(name);
     return true;
@@ -1141,16 +1160,19 @@ bool FileSceneRuntime::RenameObject(const SceneObjectMetadata& selection, std::s
 bool FileSceneRuntime::BuildHierarchySnapshot(
     SceneHierarchySnapshot& snapshot, std::string* errorMessage) const
 {
-    const auto fail = [errorMessage](const char* message)
+    const auto retained = GetHierarchySnapshot(errorMessage);
+
+    if(!retained)
     {
-        if(errorMessage)
-        {
-            *errorMessage = message;
-        }
-
         return false;
-    };
+    }
 
+    snapshot = *retained;
+    return true;
+}
+
+std::shared_ptr<const SceneHierarchySnapshot> FileSceneRuntime::GetHierarchySnapshot(std::string* errorMessage) const
+{
     if(errorMessage)
     {
         errorMessage->clear();
@@ -1158,57 +1180,77 @@ bool FileSceneRuntime::BuildHierarchySnapshot(
 
     if(!m_fileScene.HasDocument())
     {
-        return fail("No scene document is loaded.");
-    }
-
-    const auto& document = m_fileScene.GetDocument();
-    if(m_archiveScene && !SceneDocumentsEqual(document,m_archiveScene->metadata.document))
-        return fail("Immutable packaged scene metadata changed; reload the archive scene.");
-    const auto& objects = m_scene.GetRenderObjects();
-    const auto& mapping = m_objectMapping;
-
-    if(!ValidateSceneDocument(document, errorMessage))
-    {
-        return false;
-    }
-
-    if(mapping.scene != &m_scene || mapping.structureRevision != m_scene.GetStructureRevision() ||
-        mapping.committedObjects.size() != objects.size() || mapping.idToRuntimeIndex.size() != objects.size() ||
-        mapping.bindingRevisions.size() != objects.size() ||
-        document.objects.size() != objects.size())
-    {
-        return fail("Scene hierarchy mapping is stale.");
-    }
-
-    SceneHierarchySnapshot candidate;
-    candidate.sceneName = document.name;
-    candidate.entries.reserve(document.objects.size());
-    std::vector<bool> visited(objects.size(), false);
-
-    for(const auto& object : document.objects)
-    {
-        const auto found = mapping.idToRuntimeIndex.find(object.id);
-
-        if(found == mapping.idToRuntimeIndex.end() || found->second >= objects.size() || visited[found->second])
+        if(errorMessage)
         {
-            return fail("Scene hierarchy object mapping is invalid.");
+            *errorMessage = "No scene document is loaded.";
         }
 
-        const auto index = found->second;
-        const auto& runtime = objects[index];
-        const auto& committed = mapping.committedObjects[index];
-
-        if(!MatchesCommittedSceneObjectBindings(object, runtime, committed))
-        {
-            return fail("Scene hierarchy asset bindings are stale.");
-        }
-
-        visited[index] = true;
-        candidate.entries.push_back({object.id, object.name, index, object.parentID});
+        return nullptr;
     }
 
-    snapshot = std::move(candidate);
-    return true;
+    // The validated index has already checked everything the hierarchy needs: the document, the mapping's counts and
+    // revision, one unique runtime index per document object, and the asset bindings. It repeats that whole-scene validation
+    // only when storage or content changed, and the snapshot is rebuilt from it under the same key.
+    const ValidatedObjectIndex& index = CurrentValidatedIndex();
+    const bool current = m_retainedHierarchy && m_retainedHierarchy->storage == index.storage &&
+        m_retainedHierarchy->editRevision == index.editRevision && m_retainedHierarchy->validityEpoch == index.validityEpoch;
+
+    if(!current)
+    {
+        RetainedHierarchy rebuilt{index.storage, index.editRevision, index.validityEpoch};
+
+        if(!index.valid)
+        {
+            rebuilt.error = index.error;
+        }
+        else
+        {
+            const auto& document = m_fileScene.GetDocument();
+            auto snapshot = std::make_shared<SceneHierarchySnapshot>();
+            snapshot->sceneName = document.name;
+            snapshot->entries.reserve(document.objects.size());
+
+            for(const auto& object : document.objects)
+            {
+                snapshot->entries.push_back({object.id, object.name, m_objectMapping.idToRuntimeIndex.at(object.id), object.parentID});
+            }
+
+            rebuilt.snapshot = std::move(snapshot);
+        }
+
+        m_retainedHierarchy = std::move(rebuilt);
+    }
+#ifndef NDEBUG
+    else
+    {
+        // Diagnostic verification mode (ENGINE_DIAG_METADATA_CROSSCHECK): every reuse must equal a snapshot built now.
+        static const bool crossCheck = std::getenv("ENGINE_DIAG_METADATA_CROSSCHECK") != nullptr;
+
+        if(crossCheck && m_retainedHierarchy->snapshot)
+        {
+            const auto& document = m_fileScene.GetDocument();
+            const auto& entries = m_retainedHierarchy->snapshot->entries;
+            bool same = m_retainedHierarchy->snapshot->sceneName == document.name && entries.size() == document.objects.size();
+
+            for(std::size_t position = 0; same && position < entries.size(); ++position)
+            {
+                const auto& object = document.objects[position];
+                same = entries[position].objectID == object.id && entries[position].name == object.name &&
+                    entries[position].parentID == object.parentID &&
+                    entries[position].runtimeIndex == m_objectMapping.idToRuntimeIndex.at(object.id);
+            }
+
+            assert(same && "FileSceneRuntime retained hierarchy snapshot is stale: a mutation bypassed its invalidation");
+        }
+    }
+#endif
+
+    if(!m_retainedHierarchy->snapshot && errorMessage)
+    {
+        *errorMessage = m_retainedHierarchy->error;
+    }
+
+    return m_retainedHierarchy->snapshot;
 }
 
 std::optional<SceneObjectMetadata> FileSceneRuntime::GetObjectMetadata(
@@ -1326,6 +1368,51 @@ const FileSceneRuntime::ValidatedObjectIndex& FileSceneRuntime::CurrentValidated
     return *m_validatedIndex;
 }
 
+FileSceneRuntime::AuthoredStamp FileSceneRuntime::GetAuthoredStamp() const
+{
+    const auto storage = CaptureMetadataFingerprint();
+    AuthoredStamp stamp;
+    stamp.runtimeIdentity = m_instanceIdentity;
+    stamp.document = storage.document;
+    stamp.documentObjects = storage.documentObjects;
+    stamp.documentObjectCount = storage.documentObjectCount;
+    stamp.editRevision = m_fileScene.GetEditRevision();
+    stamp.sceneStructureRevision = storage.sceneStructureRevision;
+    stamp.renderObjectCount = storage.renderObjectCount;
+    stamp.mappingStructureRevision = storage.mappingStructureRevision;
+    stamp.committedObjects = storage.committedObjects;
+    stamp.archive = storage.archive;
+    return stamp;
+}
+
+bool FileSceneRuntime::ValidateObjectMapping(std::string* errorMessage) const
+{
+    const auto& index = CurrentValidatedIndex();
+
+    if(!index.valid)
+    {
+        if(errorMessage)
+        {
+            *errorMessage = index.error;
+        }
+
+        return false;
+    }
+
+    if(index.byIndex.size() != m_scene.GetRenderObjects().size() ||
+        std::find(index.byIndex.begin(), index.byIndex.end(), nullptr) != index.byIndex.end())
+    {
+        if(errorMessage)
+        {
+            *errorMessage = "A runtime object has no document metadata.";
+        }
+
+        return false;
+    }
+
+    return true;
+}
+
 FileSceneRuntime::MetadataValidationPass::Fingerprint FileSceneRuntime::CaptureMetadataFingerprint() const
 {
     MetadataValidationPass::Fingerprint fingerprint;
@@ -1355,11 +1442,17 @@ FileSceneRuntime::MetadataValidationPass::MetadataValidationPass(const FileScene
         return;
     }
 
+    // Revised S0.3: the pass starts from the persistent validated object index, which repeats the full validation only when
+    // storage or content changed since it was last built. A pass opened on an unchanged scene therefore costs one copy of the
+    // index, not one whole-scene validation.
+    const ValidatedObjectIndex& index = runtime.CurrentValidatedIndex();
     m_owner = true;
-    m_fingerprint = runtime.CaptureMetadataFingerprint();
-    m_byIndex.assign(runtime.m_scene.GetRenderObjects().size(), nullptr);
-    const SceneObjectDocument* unused = nullptr;
-    m_valid = runtime.ValidateObjectMetadataStateFully(std::nullopt, unused, &m_error, &m_byIndex);
+    m_fingerprint = index.storage;
+    m_editRevision = index.editRevision;
+    m_validityEpoch = index.validityEpoch;
+    m_valid = index.valid;
+    m_error = index.error;
+    m_byIndex = index.byIndex;
     runtime.m_metadataPass = this;
 }
 
@@ -1371,13 +1464,21 @@ FileSceneRuntime::MetadataValidationPass::~MetadataValidationPass()
     }
 
 #ifndef NDEBUG
-    // A pass must not span a mutation: an unchanged structure must still validate exactly as it did.
+    // A pass must not span a mutation. A document edit or binding change under an unchanged structure is caught by its
+    // revision. The diagnostic cross-check mode also repeats the full validation, which must still give the same result.
     if(Matches(m_runtime))
     {
-        const SceneObjectDocument* unused = nullptr;
-        std::string error;
-        assert(m_runtime.ValidateObjectMetadataStateFully(std::nullopt, unused, &error) == m_valid &&
+        assert(m_runtime.GetFileScene().GetEditRevision() == m_editRevision && m_runtime.m_validityEpoch == m_validityEpoch &&
             "FileSceneRuntime::MetadataValidationPass spanned a scene mutation");
+        static const bool crossCheck = std::getenv("ENGINE_DIAG_METADATA_CROSSCHECK") != nullptr;
+
+        if(crossCheck)
+        {
+            const SceneObjectDocument* unused = nullptr;
+            std::string error;
+            assert(m_runtime.ValidateObjectMetadataStateFully(std::nullopt, unused, &error) == m_valid &&
+                "FileSceneRuntime::MetadataValidationPass spanned a scene mutation");
+        }
     }
 #endif
 

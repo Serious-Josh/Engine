@@ -3,6 +3,7 @@
 #include "Scene/PhysicalLightingMigration.h"
 #include "Scene/ColliderScaleMigration.h"
 #include "Core/Log.h"
+#include "Debug/StreamingTelemetry.h"
 #include "assets/AssetID.h"
 
 #include <nlohmann/json.hpp>
@@ -2379,6 +2380,7 @@ bool LoadSceneDocument(
             return Fail(errorMessage, "Failed to open scene file.");
         }
 
+        const StreamingTelemetry::Scope parseTiming(StreamingTelemetry::Metric::SceneParseNs, StreamingTelemetry::Metric::SceneParses);
         Json json = ParseSceneJson(file);
 
         SceneDocument loaded = FromJson(json, migration);
@@ -2412,6 +2414,9 @@ bool ParseSceneDocument(std::string_view bytes, SceneDocument& document, std::st
     {
         *storedSchemaVersion = 0;
     }
+
+    const StreamingTelemetry::Scope parseTiming(StreamingTelemetry::Metric::SceneParseNs, StreamingTelemetry::Metric::SceneParses);
+    StreamingTelemetry::Add(StreamingTelemetry::Metric::SceneParseBytes, bytes.size());
 
     try
     {

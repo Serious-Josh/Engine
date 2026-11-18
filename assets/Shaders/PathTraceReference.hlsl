@@ -167,7 +167,8 @@ cbuffer RtxdiConstants : register(b2)
     uint rtxdiReservoirBufferIndex;
     uint rtxdiLocalLightSamples;
     uint rtxdiInfiniteLightSamples;
-    uint rtxdiPadding;
+    // WNP.2: 1 shadow-tests the selected initial sample before reuse (RtxdiBridgeInitialVisible).
+    uint rtxdiInitialVisibility;
 
     uint4 rtxdiLightRecords[RTXDI_LIGHT_RECORD_REGISTERS];
 
@@ -348,6 +349,7 @@ int RtxdiBridgeTranslateLightIndex(int lightIndex, bool currentToPrevious)
 #define RTXDI_BRIDGE_ENVIRONMENT_SAMPLER environmentSampler
 #define RTXDI_LIGHT_RESERVOIR_BUFFER RtxdiReservoirs()
 #define RTXDI_BRIDGE_PREVIOUS_TO_CURRENT_LIGHT(index) RtxdiBridgeTranslateLightIndex(int(index), false)
+#define RTXDI_BRIDGE_TRACED_INITIAL_VISIBILITY 1
 #include "RtxdiApplicationBridge.hlsli"
 #endif
 
@@ -798,6 +800,12 @@ bool RtxdiBridgeVisible(RAB_Surface bridgeSurface, RAB_LightSample lightSample)
         lightSample.sample.direction, lightSample.sample.distance, g_rtxdiReuseRays);
 }
 
+// WNP.2 initial visibility: the same shadow ray shading uses, from the current surface, counted with the reuse rays.
+bool RtxdiBridgeInitialVisible(RAB_Surface bridgeSurface, RAB_LightSample lightSample)
+{
+    return lightSample.sample.valid && RtxdiBridgeVisible(bridgeSurface, lightSample);
+}
+
 int2 RtxdiBridgeViewSize()
 {
     return int2(resolution);
@@ -831,10 +839,16 @@ float3 PathTraceRtxdiDirectLighting(PathTraceSurface surface, float3 position, i
     bridgeSurface.valid = true;
     bridgeSurface.linearDepth = dot(rtxdiCameraForward, position - cameraPosition);
 
+    // WNP.2: with initial visibility, an occluded initial sample is discarded (W = 0, M kept) before reuse. Its shaded
+    // value would have been zero anyway (F V W with V = 0), so without history the estimate is unchanged; with history
+    // it can no longer outweigh a visible reused sample. This matches ray-traced bias correction, whose stored reservoirs
+    // are already visibility-filtered (RtxdiReuseBridge.hlsli). The ray is counted with the reuse rays.
     RAB_LightSample selectedSample;
+    g_rtxdiReuseRays = 0u;
     RTXDI_DIReservoir reservoir = RtxdiBridgeSampleInitialReservoir(bridgeSurface, g_rtxdiPixel, g_rtxdiSampleSeed,
-        RtxdiBridgeInitialSamplingParameters(rtxdiLocalLightSamples, rtxdiInfiniteLightSamples), rtxdiLightBuffer,
-        selectedSample);
+        RtxdiBridgeInitialSamplingParameters(rtxdiLocalLightSamples, rtxdiInfiniteLightSamples, rtxdiInitialVisibility),
+        rtxdiLightBuffer, selectedSample);
+    rayCount += g_rtxdiReuseRays;
 
     // Split history: only sample 0, the sample that publishes the pixel's reservoir, reuses the previous frame. Every
     // later sample of the frame keeps its fresh initial reservoir, so it is independent of that shared history

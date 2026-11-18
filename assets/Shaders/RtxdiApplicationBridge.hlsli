@@ -215,19 +215,31 @@ float RAB_EvaluateEnvironmentMapSamplingPdf(float3 direction)
     return 0.0f;
 }
 
-// Initial visibility is disabled (enableInitialVisibility = 0); shading traces the selected sample's
-// visibility itself. "Visible" is the no-information answer and never removes a sample.
+#if defined(RTXDI_BRIDGE_TRACED_INITIAL_VISIBILITY)
+// Initial visibility (enableInitialVisibility = 1): the includer traces the selected initial sample from the surface.
+// RTXDI then discards an occluded initial sample (W = 0, M kept) before any reuse. This is RTXDI's only caller of this
+// callback in the headers Engine includes (InitialSampling.hlsli).
+bool RtxdiBridgeInitialVisible(RAB_Surface surface, RAB_LightSample lightSample);
+
+bool RAB_GetConservativeVisibility(RAB_Surface surface, RAB_LightSample lightSample)
+{
+    return RtxdiBridgeInitialVisible(surface, lightSample);
+}
+#else
+// No traced initial visibility in this includer: "visible" is the no-information answer and never removes a sample.
 bool RAB_GetConservativeVisibility(RAB_Surface surface, RAB_LightSample lightSample)
 {
     return true;
 }
+#endif
 
 #include "Rtxdi/DI/InitialSampling.hlsli"
 #include "Rtxdi/DI/ReservoirStorage.hlsli"
 
-// Fixed R3.4 configuration (RTXPT.3 Gate 2): uniform local selection, light candidates only.
+// Fixed R3.4 configuration (RTXPT.3 Gate 2): uniform local selection, light candidates only. initialVisibility (WNP.2)
+// shadow-tests the selected initial sample and discards it when occluded; it needs RTXDI_BRIDGE_TRACED_INITIAL_VISIBILITY.
 RTXDI_DIInitialSamplingParameters RtxdiBridgeInitialSamplingParameters(uint localLightSamples,
-    uint infiniteLightSamples)
+    uint infiniteLightSamples, uint initialVisibility = 0u)
 {
     RTXDI_DIInitialSamplingParameters parameters = (RTXDI_DIInitialSamplingParameters)0;
     parameters.numLocalLightSamples = localLightSamples;
@@ -237,7 +249,7 @@ RTXDI_DIInitialSamplingParameters RtxdiBridgeInitialSamplingParameters(uint loca
     parameters.brdfCutoff = 0.0f;
     parameters.brdfRayMinT = 0.0f;
     parameters.localLightSamplingMode = ReSTIRDI_LocalLightSamplingMode_UNIFORM;
-    parameters.enableInitialVisibility = 0u;
+    parameters.enableInitialVisibility = initialVisibility;
     return parameters;
 }
 

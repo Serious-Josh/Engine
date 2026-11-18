@@ -418,6 +418,15 @@ bool ProjectCompositeDocuments(const CompositeWorld& composite, const SceneDocum
         if(documents.contains(object.id) && object.id != composite.worldID)
         {
             // A level root is a placement only: anything else attached to it would have no document to be saved in.
+            const auto built = composite.runtimeIndex.find(object.id);
+
+            if(built != composite.runtimeIndex.end() && composite.document.objects[built->second].name != object.name)
+            {
+                error = "Local Level node '" + composite.document.objects[built->second].name + "' cannot be renamed; a Local Level "
+                    "node holds only its placement.";
+                return false;
+            }
+
             if(!IsPristineLevelRoot(composite, object))
             {
                 error = "Local Level node '" + object.name + "' carries entity data (a component, mesh, parent or new name); a Local "

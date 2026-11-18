@@ -142,6 +142,19 @@ namespace StreamingTelemetry
         GeometryUploadBytes,
         GeometryUploadRecordNs,
 
+        // W6.0 scene documents: files presented to SceneDocumentCache after their consumer read them, cache hits and the
+        // exact-content comparison each costs, document copies made for consumers that edit, and every full scene parse
+        // (through the cache or not; a write's read-back verification is one).
+        SceneDocumentReads,
+        SceneDocumentReadBytes,
+        SceneDocumentCacheHits,
+        SceneDocumentCompareNs,
+        SceneDocumentCopies,
+        SceneDocumentCopyNs,
+        SceneParses,
+        SceneParseBytes,
+        SceneParseNs,
+
         Count
     };
 

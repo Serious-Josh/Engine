@@ -38,6 +38,9 @@ int VerifySceneMembershipEditor(const std::filesystem::path& outputRoot);
 int VerifyCompositeWorldEditor(const std::filesystem::path& outputRoot);
 int VerifyDemoWorldEditor(const std::filesystem::path& outputRoot);
 int VerifyCompositePlacementStress(const std::filesystem::path& outputRoot);
+int VerifyResidencyBoundary(const std::filesystem::path& outputRoot);
+int VerifyLevelEditModes(const std::filesystem::path& outputRoot);
+int VerifySceneDocumentCache(const std::filesystem::path& outputRoot);
 int VerifyCausticsVisible(const std::filesystem::path& project, const std::filesystem::path& out);
 int VerifyGamePlayGPU(const std::filesystem::path& projectDirectory, const std::filesystem::path& scene);
 int VerifyMemoryRegistry(const std::filesystem::path& projectDirectory, const std::filesystem::path& scene);
@@ -589,6 +592,18 @@ int main(int argc, char** argv)
     if(argc == 3 && std::string_view(argv[1]) == "--verify-composite-placement-stress")
     {
         return VerifyCompositePlacementStress(std::filesystem::absolute(argv[2]));
+    }
+    if(argc == 3 && std::string_view(argv[1]) == "--verify-level-edit-modes")
+    {
+        return VerifyLevelEditModes(std::filesystem::absolute(argv[2]));
+    }
+    if(argc == 3 && std::string_view(argv[1]) == "--verify-scene-document-cache")
+    {
+        return VerifySceneDocumentCache(std::filesystem::absolute(argv[2]));
+    }
+    if(argc == 3 && std::string_view(argv[1]) == "--verify-residency-boundary")
+    {
+        return VerifyResidencyBoundary(std::filesystem::absolute(argv[2]));
     }
     if(argc == 3 && std::string_view(argv[1]) == "--verify-demo-world-editor")
     {

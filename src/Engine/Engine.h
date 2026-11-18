@@ -31,6 +31,7 @@
 #include "Project/ProjectWorkspace.h"
 #include "Editor/EditorPreferences.h"
 #include "Editor/ProjectBrowser.h"
+#include <array>
 #include <chrono>
 
 #include <cstdint>
@@ -556,7 +557,7 @@ class Engine
             std::string sourceIdentity;
         };
 
-        std::vector<Failure> failures; // At most one current failure per runtime object; max 4096.
+        std::vector<Failure> failures; // At most one current failure per runtime object (RayTracingSceneResources::MaxCandidateObjects).
         std::uint64_t runtimeIdentity = 0;
         std::uint64_t structureRevision = 0;
         size_t cursor = 0;
@@ -566,13 +567,26 @@ class Engine
         size_t stale = 0;
         bool enabled = false;
         bool settled = false;
+        // The runtime state (document edit revision, validity epoch, residency revision) when the current scan started, and
+        // when the last complete scan started. While settled with no recorded failure, an unchanged state cannot hold new
+        // work, so the periodic rescan is skipped.
+        std::array<std::uint64_t, 3> scanStartState{};
+        std::array<std::uint64_t, 3> scannedState{};
         std::chrono::steady_clock::time_point activated;
         std::chrono::steady_clock::time_point retryAfter;
         std::string backpressure;
 
         // Bounded batching. An unattributed multi-object failure halves the limit
         // until a publication succeeds; an attributed object is retried alone.
-        size_t batchLimit = FileSceneRuntime::MaxMeshResidencyBatch;
+        size_t batchLimit = MinimumResidencyBatch;
+
+        // W6.4: frame-budgeted batch size, between MinimumResidencyBatch (the former fixed size) and the renderer bound. After
+        // each published batch: doubled when the batch was full and its worst main-thread residency stage (scan, staging and
+        // candidate preparation, or publication) stayed under half the budget; halved when it exceeded the budget.
+        size_t adaptiveLimit = MinimumResidencyBatch;
+        double batchWorstStageMilliseconds = 0.0;
+        size_t completedBatch = 0;
+        bool adaptationPending = false;
         std::string isolate;
         size_t batchesPublished = 0;
 
@@ -591,6 +605,13 @@ class Engine
     };
 
     AutomaticMeshResidency m_automaticMeshResidency;
+
+    // W6.4: the smallest adaptive residency batch (the pre-W6.4 fixed size), so no scene batches less than before.
+    static constexpr size_t MinimumResidencyBatch = 32;
+    // Called once per frame after the publication boundary: records the outstanding batch's stage costs and applies a
+    // published batch's adaptation.
+    void ObserveAutomaticResidencyFrame();
+    static std::size_t ResidencyNewGeometryBudget();
 
     // S0.4: bounded import prefetch for automatic residency. While the scheduler waits on an object whose FBX mesh is not yet
     // catalog-retained, the worker is given up to MaxMeshImportPrefetch distinct imports at once instead of one. A completed
@@ -708,6 +729,8 @@ class Engine
         std::optional<std::string> slotID;
         std::optional<AssetID> slotMaterial;
         bool requireEditorSelection = false;
+        // W6 finalization: the incremental path refused or timed out; rebuild scene resources as before.
+        bool reconstruct = false;
     };
     bool QueueMaterialAssignment(MaterialAssignmentRequest request, std::string& error);
     std::optional<MaterialAssignmentRequest> m_pendingMaterialAssignment;
@@ -803,6 +826,29 @@ class Engine
         std::chrono::steady_clock::time_point retryAfter{}, progressAfter{};
     };
     SceneMaterialBindingPublication m_viewportMaterialPublication;
+
+    // W6 finalization: a resident object's material assignment published incrementally: material-table admission when the
+    // material is new, then SceneMaterialBindingPublication at the frame boundary. No scene resources, BLAS, geometry or
+    // membership are released. A refusal or a ten-second stall returns the request to the reconstruction path.
+    struct PendingIncrementalMaterial
+    {
+        MaterialAssignmentRequest request;
+        std::chrono::steady_clock::time_point started;
+        std::optional<AssetID> material; // Admitted first when not yet in the renderer's table; empty for a built-in reference.
+        std::uint64_t preparationTicket = 0;
+        std::shared_ptr<const ProjectMaterialPreparationService::Candidate> candidate;
+        bool admissionStarted = false;
+        bool prepared = false;
+        std::chrono::steady_clock::time_point retryAfter{};
+        double prepareMilliseconds = 0.0;
+        std::size_t frames = 0;
+    };
+    std::optional<PendingIncrementalMaterial> m_pendingIncrementalMaterial;
+    SceneMaterialBindingPublication m_incrementalMaterialPublication;
+    bool BeginIncrementalMaterialAssignment(const MaterialAssignmentRequest& request);
+    void ProcessIncrementalMaterialAssignment(IDemoScene& scene);
+    void ReleaseIncrementalMaterialPreparation() noexcept;
+    void FallBackFromIncrementalMaterial(std::string_view reason);
     std::optional<PendingViewportMaterialBinding> m_pendingViewportMaterialBinding;
     void ProcessViewportMaterialAssignment(IDemoScene& scene);
     void CancelViewportMaterialAssignment(std::string_view reason) noexcept;
@@ -922,6 +968,9 @@ class Engine
     {
         double editorDraw = 0.0;
         double overlays = 0.0;
+        double residency = 0.0;
+        double textureStreaming = 0.0;
+        double acceptResidency = 0.0;
     };
 
     FrameCpuTimings m_frameCpuTimings;

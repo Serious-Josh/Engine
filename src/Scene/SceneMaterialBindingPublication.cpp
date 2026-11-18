@@ -26,9 +26,13 @@ namespace
 struct SceneMaterialBindingPublication::Prepared
 {
     SceneObjectMetadata selection;
-    FileScene original;
-    FileScene candidate;
-    SceneDocument liveBefore;
+    // W6 finalization: the authored state preparation read (any document edit or reallocation changes it), the object's
+    // document position, and its new authored fields, swapped into the document at acceptance. No document copies.
+    FileSceneRuntime::AuthoredStamp stamp;
+    std::filesystem::path scenePath;
+    std::size_t documentIndex = 0;
+    std::string authoredFallback;
+    std::map<std::string, std::string> authoredOverrides;
     Mesh* mesh = nullptr;
     D3D12_GPU_VIRTUAL_ADDRESS vertexAddress = 0;
     D3D12_GPU_VIRTUAL_ADDRESS indexAddress = 0;
@@ -36,10 +40,14 @@ struct SceneMaterialBindingPublication::Prepared
     std::size_t indexCount = 0;
     MeshMetadata layout;
     Material* fallback = nullptr;
+    // W6 finalization: the new fallback and its authored reference, when the assignment changes it (null: unchanged).
+    Material* replacementFallback = nullptr;
+    std::string fallbackReference;
     std::map<std::string, Material*> runtimeSlots;
     std::map<std::string, Material*> committedSlots;
-    std::vector<RenderObject> bindings;
-    std::vector<std::vector<unsigned int>> indices;
+    // W6.2: copy-on-write copies of the active tables; only the target object's chunk is cloned.
+    ChunkedTable<RenderObject> bindings;
+    ChunkedTable<std::vector<unsigned int>> indices;
     std::vector<RayTracingInstanceData> records;
     StructuredBuffer instances;
     StructuredBuffer slots;
@@ -175,28 +183,22 @@ SceneMaterialBindingPublication::Result SceneMaterialBindingPublication::Validat
         return {Stale, "Resident mesh layout or active renderer bindings changed."};
     if(runtime.m_objectMapping.bindingRevisions[current->runtimeIndex] == UINT64_MAX)
         return {Stale, "Object binding identities exhausted."};
-    SceneDocument live;
-    if(runtime.m_fileScene.GetPath() != prepared.original.GetPath() ||
-        runtime.m_fileScene.IsDirty() != prepared.original.IsDirty() ||
-        !SceneDocumentsEqual(runtime.m_fileScene.GetDocument(), prepared.original.GetDocument()) ||
-        !CaptureSceneDocument(runtime.m_fileScene.GetDocument(), runtime.GetScene(), runtime.m_objectMapping, live, &error) ||
-        !SceneDocumentsEqual(live, prepared.liveBefore))
+    const auto& document = runtime.m_fileScene.GetDocument();
+    if(runtime.m_fileScene.GetPath() != prepared.scenePath || runtime.GetAuthoredStamp() != prepared.stamp ||
+        prepared.documentIndex >= document.objects.size() || document.objects[prepared.documentIndex].id != current->objectID)
         return {Stale, "Scene/document changed after material-binding preparation."};
 
     if(!catalog.ValidateRetainedResidencyMaterial(current->materialReference, prepared.fallback, &error) ||
         !renderer.HasPublishedMaterial(*prepared.fallback))
         return {Stale, "Fallback material registration or renderer admission changed. " + error};
-    const auto& authored = prepared.candidate.GetDocument().objects;
-    const auto target = std::find_if(authored.begin(), authored.end(),
-        [&](const auto& entry) { return entry.id == current->objectID; });
-    if(target == authored.end())
-        return {Stale, "Prepared object disappeared."};
+    if(prepared.replacementFallback && (!renderer.HasPublishedMaterial(*prepared.replacementFallback) ||
+        !catalog.ValidateRetainedResidencyMaterial(prepared.fallbackReference, prepared.replacementFallback, &error)))
+        return {Stale, "Replacement fallback material registration or renderer admission changed. " + error};
     for(std::size_t slotIndex = 0; slotIndex < prepared.layout.materialSlots.size(); ++slotIndex)
     {
         const auto& slot = prepared.layout.materialSlots[slotIndex];
-        const auto override = target->materialSlotBindings.find(slot.id);
-        const auto& reference = override == target->materialSlotBindings.end() ?
-            target->materialReference : override->second;
+        const auto override = prepared.authoredOverrides.find(slot.id);
+        const auto& reference = override == prepared.authoredOverrides.end() ? prepared.authoredFallback : override->second;
         const auto material = prepared.runtimeSlots.at(slot.id);
         if(!catalog.ValidateRetainedResidencyMaterial(reference, material, &error) ||
             !renderer.HasPublishedMaterial(*material) ||
@@ -210,12 +212,29 @@ SceneMaterialBindingPublication::Result SceneMaterialBindingPublication::Prepare
     Renderer& renderer, const FileSceneRuntime& runtime, FileSceneAssetCatalog& catalog,
     const SceneObjectMetadata& expected, const std::map<std::string, std::string>& overrides)
 {
+    return PrepareBindings(renderer, runtime, catalog, expected, overrides, std::nullopt);
+}
+
+SceneMaterialBindingPublication::Result SceneMaterialBindingPublication::PrepareFallback(
+    Renderer& renderer, const FileSceneRuntime& runtime, FileSceneAssetCatalog& catalog,
+    const SceneObjectMetadata& expected, const std::string& reference)
+{
+    return PrepareBindings(renderer, runtime, catalog, expected, expected.materialSlotBindings, reference);
+}
+
+SceneMaterialBindingPublication::Result SceneMaterialBindingPublication::PrepareBindings(
+    Renderer& renderer, const FileSceneRuntime& runtime, FileSceneAssetCatalog& catalog,
+    const SceneObjectMetadata& expected, const std::map<std::string, std::string>& overrides,
+    const std::optional<std::string>& fallbackReference)
+{
     using enum Status;
     if(std::this_thread::get_id() != m_thread)
         return {Stale, "Material publication requires its Engine thread."};
     Cancel();
     try
     {
+        if(!runtime.GetReadOnlyReason().empty())
+            return {Unsupported, runtime.GetReadOnlyReason()};
         if(!renderer.CanEditPendingMaterialBindings(runtime.GetScene()) || runtime.HasPreparedScene() ||
             runtime.HasMaterialAssignment() || runtime.m_meshResidency || renderer.m_rayTracingScene.m_candidate)
             return {Retry, "Material preparation requires an idle active-scene boundary."};
@@ -239,6 +258,17 @@ SceneMaterialBindingPublication::Result SceneMaterialBindingPublication::Prepare
         prepared->indexCount = object.mesh->GetIndexCount();
         prepared->layout = object.mesh->GetMetadata();
         prepared->fallback = object.material;
+        Material* fallback = object.material;
+        if(fallbackReference)
+        {
+            // An unchanged reference keeps the retained version; a new one must already be admitted to the table.
+            fallback = *fallbackReference == current->materialReference ? object.material :
+                catalog.FindPublishedMaterial(*fallbackReference, renderer);
+            if(!fallback || !renderer.HasPublishedMaterial(*fallback))
+                return {Unsupported, "Fallback material is not admitted to the active fixed renderer table."};
+            prepared->replacementFallback = fallback;
+            prepared->fallbackReference = *fallbackReference;
+        }
         for(const auto& [id, reference] : overrides)
         {
             if(!AssetID::ParseReference(reference) || std::none_of(prepared->layout.materialSlots.begin(),
@@ -248,7 +278,7 @@ SceneMaterialBindingPublication::Result SceneMaterialBindingPublication::Prepare
         for(const auto& slot : prepared->layout.materialSlots)
         {
             const auto found = overrides.find(slot.id);
-            Material* material = prepared->fallback;
+            Material* material = fallback;
             if(found != overrides.end())
             {
                 // Preserve a retained version when its authored ID is unchanged.
@@ -261,24 +291,21 @@ SceneMaterialBindingPublication::Result SceneMaterialBindingPublication::Prepare
             prepared->runtimeSlots.emplace(slot.id, material);
         }
         prepared->committedSlots = prepared->runtimeSlots;
-        prepared->original = runtime.m_fileScene;
-        prepared->candidate = runtime.m_fileScene;
-        if(!CaptureSceneDocument(runtime.m_fileScene.GetDocument(), runtime.GetScene(), runtime.m_objectMapping,
-            prepared->liveBefore, &error))
-            return {Stale, std::move(error)};
-        prepared->noOp = current->materialSlotBindings == overrides;
-        if(!prepared->noOp)
-        {
-            auto document = prepared->liveBefore;
-            const auto target = std::find_if(document.objects.begin(), document.objects.end(),
-                [&](const auto& entry) { return entry.id == current->objectID; });
-            if(target == document.objects.end())
-                return {Stale, "Object disappeared from captured scene."};
-            target->materialSlotBindings = overrides;
-            if(!ValidateSceneDocument(document, &error))
-                return {Unsupported, std::move(error)};
-            prepared->candidate.EditDocument() = std::move(document);
-        }
+        // W6 finalization: staleness is the authored stamp (validated again at acceptance), not document snapshots. Only this
+        // object's material fields change; they carry no ownership (a composite World projects them to the owning document,
+        // and level nodes are never resident), so the composite rules are unaffected.
+        prepared->stamp = runtime.GetAuthoredStamp();
+        prepared->scenePath = runtime.m_fileScene.GetPath();
+        const auto& authoredObjects = runtime.m_fileScene.GetDocument().objects;
+        const auto authoredObject = std::find_if(authoredObjects.begin(), authoredObjects.end(),
+            [&](const auto& entry) { return entry.id == current->objectID; });
+        if(authoredObject == authoredObjects.end())
+            return {Stale, "Object disappeared from the scene document."};
+        prepared->documentIndex = static_cast<std::size_t>(authoredObject - authoredObjects.begin());
+        prepared->authoredOverrides = overrides;
+        prepared->authoredFallback = fallbackReference ? *fallbackReference : current->materialReference;
+        prepared->noOp = current->materialSlotBindings == overrides &&
+            (!fallbackReference || *fallbackReference == current->materialReference);
         auto& resources = renderer.m_rayTracingScene;
         prepared->rendererLifetime = renderer.m_sceneResourceLifetime;
         prepared->bindingEpoch = resources.m_materialBindingEpoch;
@@ -310,8 +337,10 @@ SceneMaterialBindingPublication::Result SceneMaterialBindingPublication::Prepare
         stage.records = membership.instanceRecords;
         stage.indices = membership.slotMaterialIndices;
         stage.bindings = membership.materialBindings;
-        stage.bindings[current->runtimeIndex].slotMaterials = stage.runtimeSlots;
-        auto& targetIndices = stage.indices[current->runtimeIndex];
+        stage.bindings.Mutable(current->runtimeIndex).slotMaterials = stage.runtimeSlots;
+        if(stage.replacementFallback)
+            stage.bindings.Mutable(current->runtimeIndex).material = stage.replacementFallback;
+        auto& targetIndices = stage.indices.Mutable(current->runtimeIndex);
         if(targetIndices.size() != stage.layout.materialSlots.size())
         { Cancel(); return {Stale, "Active target slot count changed."}; }
         for(std::size_t slot = 0; slot < targetIndices.size(); ++slot)
@@ -387,11 +416,19 @@ SceneMaterialBindingPublication::Result SceneMaterialBindingPublication::Publish
         const auto index = runtime.m_objectMapping.idToRuntimeIndex.at(stage.selection.objectID);
         stage.retirement->fence = membership.lastUseFence;
         stage.retirement->lifetime = renderer.m_commandContext.GetSubmissionLifetime();
-        static_assert(std::is_nothrow_move_assignable_v<FileScene>);
-        runtime.m_fileScene = std::move(stage.candidate);
+        // The object's authored fields (prepared strings and maps, swapped without allocation; marks the document dirty).
+        auto& authoredObject = runtime.m_fileScene.EditDocument().objects[stage.documentIndex];
+        authoredObject.materialSlotBindings.swap(stage.authoredOverrides);
+        authoredObject.materialReference.swap(stage.authoredFallback);
         runtime.m_scene.GetRenderObjects()[index].slotMaterials.swap(stage.runtimeSlots);
         runtime.m_objectMapping.committedObjects[index].slotMaterials.swap(stage.committedSlots);
+        if(stage.replacementFallback)
+        {
+            runtime.m_scene.GetRenderObjects()[index].material = stage.replacementFallback;
+            runtime.m_objectMapping.committedObjects[index].material = stage.replacementFallback;
+        }
         ++runtime.m_objectMapping.bindingRevisions[index];
+        runtime.InvalidateValidatedObjects();
         resources.m_membership->instanceDataBuffer.Swap(stage.retirement->instances);
         resources.m_membership->slotMaterials.Swap(stage.retirement->slots);
         resources.m_membership->instanceDataBuffer.Swap(stage.instances);

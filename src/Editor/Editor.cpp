@@ -1125,34 +1125,49 @@ void Editor::CommitObjectReorder(IDemoScene& scene, const HierarchyReorderReques
 void Editor::DrawHierarchy(IDemoScene& demoScene, const std::string& activeSceneName)
 {
     const auto& scene = demoScene.GetScene();
-    SceneHierarchySnapshot snapshot;
-    snapshot.sceneName = activeSceneName;
+    // Shown only when no document snapshot is available; a valid snapshot carries the document's own name.
+    SceneHierarchySnapshot fallback;
+    fallback.sceneName = activeSceneName;
 
     // W5: a World lists its own entities first, then one folder node per Local Level holding that level's entities.
     if(const auto* composite = dynamic_cast<const FileBackedDemoScene*>(&demoScene); composite && composite->GetCompositeWorld())
     {
-        snapshot.sceneName = "World: " + composite->GetCompositeWorld()->worldName + "  (World entities at the top; each folder is a "
+        fallback.sceneName = "World: " + composite->GetCompositeWorld()->worldName + "  (World entities at the top; each folder is a "
             "Local Level)";
     }
     std::string error;
+    std::shared_ptr<const SceneHierarchySnapshot> retained;
 
     if(const auto* owner = dynamic_cast<const FileBackedDemoScene*>(&demoScene))
     {
-        owner->BuildHierarchySnapshot(snapshot, &error);
+        // The retained snapshot: an unchanged scene reuses it without validating or copying anything.
+        retained = owner->GetHierarchySnapshot(&error);
     }
     else
     {
         const auto& objects = scene.GetRenderObjects();
-        snapshot.entries.reserve(objects.size());
+        fallback.entries.reserve(objects.size());
 
         for(size_t index = 0; index < objects.size(); ++index)
         {
-            snapshot.entries.push_back({{}, "Object " + std::to_string(index), index});
+            fallback.entries.push_back({{}, "Object " + std::to_string(index), index});
         }
     }
 
+    if(!retained || retained != m_hierarchyView.snapshot)
+    {
+        // The icon keys view the old snapshot's identifiers: drop them while it is still alive. Swapping with an empty map
+        // frees the nodes without hashing (clear() may hash every key to update its buckets).
+        decltype(m_hierarchyView.icons)().swap(m_hierarchyView.icons);
+        m_hierarchyView.snapshot = retained;
+        ++m_hierarchyView.generation;
+    }
+
+    const SceneHierarchySnapshot& snapshot = retained ? *retained : fallback;
     const std::optional<size_t> selected = m_selectedObject == InvalidObjectSelection ?
         std::nullopt : std::optional<size_t>{m_selectedObject};
+    // A fallback list is rebuilt every frame, so the panel compares it rather than trusting a generation.
+    m_hierarchyPanel.SetSnapshotGeneration(retained ? m_hierarchyView.generation : 0);
     m_hierarchyPanel.ObserveSelection(snapshot, selected, m_historyEpoch, &scene);
 
     if(!m_workspace.HierarchyVisible())
@@ -1186,25 +1201,61 @@ void Editor::DrawHierarchy(IDemoScene& demoScene, const std::string& activeScene
         fileScene ? fileScene->m_runtime->GetHierarchyRevision() : 0};
 
     ImGui::BeginDisabled(blocked);
-    std::unordered_map<std::string_view, EditorIcon> objectIcons;
+    const CompositeWorld* iconComposite = fileScene ? fileScene->GetCompositeWorld() : nullptr;
 
-    if(fileScene && fileScene->m_runtime->GetFileScene().HasDocument())
+    // Icons depend on each object's Camera and Light components and on the composite's level roots. A component edit produces a
+    // new snapshot, so the map is rebuilt only with a new snapshot or a different composite World. Keys view the retained
+    // snapshot's identifiers, which live as long as the map.
+    if(m_hierarchyView.iconGeneration != m_hierarchyView.generation || m_hierarchyView.iconComposite != iconComposite)
     {
-        const auto& objects = fileScene->m_runtime->GetFileScene().GetDocument().objects;
-        objectIcons.reserve(objects.size());
+        decltype(m_hierarchyView.icons)().swap(m_hierarchyView.icons);
+        m_hierarchyView.iconGeneration = m_hierarchyView.generation;
+        m_hierarchyView.iconComposite = iconComposite;
 
-        for(const auto& object : objects)
+        if(retained && fileScene && fileScene->m_runtime->GetFileScene().HasDocument())
         {
-            objectIcons.emplace(object.id, SceneObjectIcon(object.camera.has_value(), object.light ? &*object.light : nullptr));
-        }
+            const auto& objects = fileScene->m_runtime->GetFileScene().GetDocument().objects;
+            m_hierarchyView.icons.reserve(retained->entries.size());
 
-        if(const CompositeWorld* composite = fileScene->GetCompositeWorld())
-        {
-            for(const auto& level : composite->levels)
+            // The snapshot lists the document's objects in document order.
+            for(std::size_t position = 0; position < retained->entries.size() && position < objects.size(); ++position)
             {
-                objectIcons.insert_or_assign(level.id, EditorIcon::Folder);
+                const auto& object = objects[position];
+                m_hierarchyView.icons.emplace(retained->entries[position].objectID,
+                    SceneObjectIcon(object.camera.has_value(), object.light ? &*object.light : nullptr));
+            }
+
+            if(iconComposite)
+            {
+                for(const auto& level : iconComposite->levels)
+                {
+                    if(const auto found = m_hierarchyView.icons.find(level.id); found != m_hierarchyView.icons.end())
+                    {
+                        found->second = EditorIcon::Folder;
+                    }
+                }
             }
         }
+    }
+
+    const auto& objectIcons = m_hierarchyView.icons;
+
+    // W5 refinement: Local Level rows carry their editing-mode toggle.
+    if(iconComposite)
+    {
+        m_hierarchyPanel.SetLevelEditModeQuery([this, iconComposite](std::string_view id) -> std::optional<bool>
+        {
+            const bool isLevel = std::ranges::any_of(iconComposite->levels, [&](const CompositeWorld::Level& level)
+            {
+                return level.id == id;
+            });
+
+            return isLevel ? std::optional<bool>(IsLevelEditMode(id)) : std::nullopt;
+        });
+    }
+    else
+    {
+        m_hierarchyPanel.SetLevelEditModeQuery({});
     }
 
     const auto clicked = m_hierarchyPanel.Draw(m_workspace.GetHierarchy(), snapshot, selected, &scene, error,
@@ -1234,6 +1285,11 @@ void Editor::DrawHierarchy(IDemoScene& demoScene, const std::string& activeScene
             return ReflectionBakeWarning(id);
         });
     ImGui::EndDisabled();
+
+    if(const auto toggled = m_hierarchyPanel.TakeLevelModeToggle())
+    {
+        SetLevelEditMode(demoScene, *toggled, !IsLevelEditMode(*toggled));
+    }
 
     if(auto primitive=m_hierarchyPanel.TakePrimitiveRequest())
     {
@@ -2291,7 +2347,8 @@ void Editor::SelectSceneObject(const IDemoScene& demoScene, size_t index, bool t
         {
             const auto metadata = owner->GetObjectMetadata(index);
             if(!metadata) return;
-            identity.objectID = metadata->objectID;
+            // W5 refinement: an entity of a Local in Level Edit selects that Local's placement (its level node).
+            identity.objectID = ResolveLevelEditSelection(*owner, metadata->objectID);
         }
         else
         {
@@ -5998,6 +6055,93 @@ bool Editor::QueueHierarchyEmpty(IDemoScene& scene, std::string_view parentID, s
 }
 
 // W5: whether the selection includes a composite World's Local Level node (a level root), which carries only a placement.
+bool Editor::IsLevelEditMode(std::string_view levelID) const
+{
+    const auto found = m_levelEditModes.find(std::string(levelID));
+    return found != m_levelEditModes.end() && found->second;
+}
+
+std::string Editor::ResolveLevelEditSelection(const FileBackedDemoScene& owner, const std::string& objectID) const
+{
+    const CompositeWorld* composite = owner.GetCompositeWorld();
+
+    if(!composite || m_levelEditModes.empty())
+    {
+        return objectID;
+    }
+
+    // A Local's entities are "<level>/<id>"; the level node itself is the bare level id and is already the placement.
+    for(const auto& level : composite->levels)
+    {
+        const bool ownedByLevel = objectID.size() > level.id.size() && objectID.starts_with(level.id) &&
+            objectID[level.id.size()] == '/';
+
+        if(ownedByLevel && IsLevelEditMode(level.id))
+        {
+            return level.id;
+        }
+    }
+
+    return objectID;
+}
+
+void Editor::SetLevelEditMode(const IDemoScene& scene, const std::string& levelID, bool levelEdit)
+{
+    // Never while a gizmo drag is in progress: the drag's target must not change under it.
+    if(ImGuizmo::IsUsing() || m_gizmoWasUsing)
+    {
+        return;
+    }
+
+    if(!levelEdit)
+    {
+        // Back to Object Edit: the current selection (possibly the level node) stays valid as it is.
+        m_levelEditModes.erase(levelID);
+        return;
+    }
+
+    m_levelEditModes[levelID] = true;
+    const auto* owner = dynamic_cast<const FileBackedDemoScene*>(&scene);
+
+    if(!owner)
+    {
+        return;
+    }
+
+    // Selected entities of this Local become its level node (once), so the gizmo can only move the placement.
+    std::vector<SelectedObjectIdentity> remapped;
+    bool changed = false;
+
+    for(auto identity : m_orderedSelection)
+    {
+        const std::string target = ResolveLevelEditSelection(*owner, identity.objectID);
+
+        if(target != identity.objectID)
+        {
+            identity.objectID = target;
+            changed = true;
+        }
+
+        const bool duplicate = std::ranges::any_of(remapped, [&](const SelectedObjectIdentity& kept)
+        {
+            return !kept.objectID.empty() && kept.objectID == identity.objectID;
+        });
+
+        if(!duplicate)
+        {
+            remapped.push_back(std::move(identity));
+        }
+    }
+
+    if(changed)
+    {
+        m_orderedSelection = std::move(remapped);
+        m_selectedObject = InvalidObjectSelection;
+        RefreshSceneSelection(scene);
+        m_objectInspectionRequested = true;
+    }
+}
+
 bool Editor::SelectionIncludesLevelRoot(const IDemoScene& scene) const
 {
     const auto* owner = dynamic_cast<const FileBackedDemoScene*>(&scene);

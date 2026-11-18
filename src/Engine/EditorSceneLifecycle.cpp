@@ -4,6 +4,7 @@
 #include "Platform/Windows/EditorFileDialogs.h"
 #include "Project/ProjectCreation.h"
 #include "Scene/SceneFileCreation.h"
+#include "Scene/SceneDocumentCache.h"
 #include "Scene/SceneSerializer.h"
 #include "assets/ProjectCompositeWorld.h"
 #include "assets/ProjectSceneMembership.h"
@@ -356,16 +357,18 @@ void Engine::ProcessEditorSceneRequests(IDemoScene& activeScene)
 
             if(operation.type == Editor::FileRequestType::Load)
             {
-                SceneDocument document;
+                // Only the kind is inspected here; the parse is shared with the open that follows (W6.0).
+                SceneDocumentCache::Parsed parsed;
                 std::filesystem::path resolved;
                 m_pendingCompositeWorld.reset();
 
                 const bool readable = ResolveSceneLocation(GetActiveProject(), operation.path, true, resolved, m_sceneOperationError) &&
-                    LoadSceneDocument(resolved, document, &m_sceneOperationError);
+                    SceneDocumentCache::Load(resolved, parsed, &m_sceneOperationError, "Editor open request");
+                const SceneKind kind = readable ? parsed.document->kind : SceneKind::Local;
 
                 // W4: a World opens as a read-only composite of all its Local Levels. It is composed and validated completely
                 // here, before the current scene is touched, so an invalid World leaves the active scene in place.
-                if(readable && document.kind == SceneKind::World)
+                if(readable && kind == SceneKind::World)
                 {
                     const auto composeStart = std::chrono::steady_clock::now();
                     auto composite = std::make_shared<CompositeWorld>();
@@ -389,8 +392,9 @@ void Engine::ProcessEditorSceneRequests(IDemoScene& activeScene)
                 }
 
                 // A World that could not be composed keeps the composition error (it is not a "World cannot be opened" case).
-                const bool isWorld = readable && document.kind == SceneKind::World;
-                const bool openable = readable && (isWorld ? bool(m_pendingCompositeWorld) : ValidateSceneKindOpenable(document, &m_sceneOperationError));
+                const bool isWorld = readable && kind == SceneKind::World;
+                const bool openable = readable &&
+                    (isWorld ? bool(m_pendingCompositeWorld) : ValidateSceneKindOpenable(*parsed.document, &m_sceneOperationError));
 
                 if(!openable)
                 {

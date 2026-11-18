@@ -44,6 +44,26 @@ public:
     // Observe even while hidden; Editor remains the sole selection owner.
     void ObserveSelection(const SceneHierarchySnapshot& snapshot, std::optional<size_t> selectedObject,
         std::uint64_t epoch, const void* sceneIdentity);
+    // W5 refinement: Local Level rows carry an editing-mode toggle on their right. The query returns nullopt for other rows,
+    // otherwise whether that Local is in Level Edit mode. A click is reported once through TakeLevelModeToggle.
+    void SetLevelEditModeQuery(std::function<std::optional<bool>(std::string_view)> query)
+    {
+        m_levelEditModeQuery = std::move(query);
+    }
+
+    std::optional<std::string> TakeLevelModeToggle()
+    {
+        auto toggled = std::move(m_levelModeToggle);
+        m_levelModeToggle.reset();
+        return toggled;
+    }
+
+    // Identifies the snapshot later calls pass: the same non-zero generation promises unchanged contents, so the tree is kept
+    // without comparing every entry. Zero (the default) compares every call.
+    void SetSnapshotGeneration(std::uint64_t generation) noexcept
+    {
+        m_snapshotGeneration = generation;
+    }
 
     // Returns a click intent only; selection remains owned by Editor.
     std::optional<std::size_t> Draw(const EditorWorkspaceRect& rectangle,
@@ -57,6 +77,7 @@ public:
 private:
     const EditorIcons* m_icons = nullptr;
     void DrawRenameInput();
+    void DrawLevelModeToggle(const std::string& levelID, bool levelEdit, ImVec2 rowPosition);
     void DrawDropInteraction(const SceneHierarchyEntry* entry, const HierarchyDragIdentity& identity,
         const DropValidator& validateDrop);
     void UpdateTree(const SceneHierarchySnapshot& snapshot, std::uint64_t epoch, const void* sceneIdentity);
@@ -84,12 +105,17 @@ private:
     std::uint64_t m_expansionEpoch = 0;
     const void* m_expansionScene = nullptr;
     bool m_rowsDirty = true;
+    std::uint64_t m_snapshotGeneration = 0;
+    std::function<std::optional<bool>(std::string_view)> m_levelEditModeQuery;
+    std::optional<std::string> m_levelModeToggle;
+    std::uint64_t m_treeGeneration = 0;
     std::string m_observedSelectionID;
     std::string m_pendingRevealID;
     std::vector<char> m_dragBytes;
     std::string m_dropStatus;
 #if defined(ENGINE_HAS_VERIFICATION)
     friend class SceneHierarchyVerification;
+    friend class CompositePlacementStress;
     std::unordered_map<std::string, std::pair<ImVec2, ImVec2>> m_verificationRows;
     std::pair<ImVec2, ImVec2> m_verificationRoot;
 #endif

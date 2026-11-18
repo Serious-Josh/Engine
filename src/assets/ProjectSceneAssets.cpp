@@ -2,7 +2,7 @@
 
 #include "Project/ProjectPaths.h"
 #include "Scene/SceneAssetIdentity.h"
-#include "Scene/SceneSerializer.h"
+#include "Scene/SceneDocumentCache.h"
 #include "assets/AssetRegistrySerializer.h"
 #include "assets/ProjectAssetRegistry.h"
 
@@ -41,14 +41,14 @@ namespace
             ProjectAssetRegistry::PathsEqual(relative, ProjectSceneAssets::MigrationDirectory);
     }
 
-    void Classify(ProjectSceneAssets::SceneFile& file)
+    void Classify(ProjectSceneAssets::SceneFile& file, const fs::path& absolutePath)
     {
         using ProjectSceneAssets::SceneFileStatus;
-        // One parse: the reader reports the stored schema version even when the document is refused.
-        SceneDocument document;
+        // One parse per content (W6.0): the reader reports the stored schema version even when the document is refused.
+        SceneDocumentCache::Parsed parsedDocument;
         std::string error;
-        std::uint64_t schema = 0;
-        const bool parsed = ParseSceneDocument(file.bytes, document, &error, &schema);
+        const bool parsed = SceneDocumentCache::Parse(absolutePath, file.bytes, parsedDocument, &error, "ProjectSceneAssets");
+        const std::uint64_t schema = parsedDocument.storedSchemaVersion;
 
         if(schema > SceneDocument::kSchemaVersion)
         {
@@ -68,19 +68,19 @@ namespace
 
         file.schemaVersion = static_cast<std::uint32_t>(schema);
 
-        file.documentID = document.id;
-        file.kind = document.kind;
+        file.documentID = parsedDocument.document->id;
+        file.kind = parsedDocument.document->kind;
 
         if(file.schemaVersion >= SceneDocument::kSceneKindSchemaVersion)
         {
             // The schema-28 reader already requires a canonical GUID.
             file.status = SceneFileStatus::Current;
-            file.assetID = AssetID::Parse(document.id);
+            file.assetID = AssetID::Parse(parsedDocument.document->id);
             return;
         }
 
         file.status = SceneFileStatus::Legacy;
-        file.assetID = SceneAssetIdentity(document.id);
+        file.assetID = SceneAssetIdentity(parsedDocument.document->id);
     }
 }
 
@@ -155,7 +155,7 @@ bool ScanProject(const ProjectPaths& paths, Scan& scan, std::string& error)
             }
 
             file.bytes = bytes.str();
-            Classify(file);
+            Classify(file, entry->path());
             result.files.push_back(std::move(file));
         }
     }

@@ -153,6 +153,8 @@ public:
         bool m_owner = false; // False when an equivalent pass was already active.
         std::thread::id m_thread;
         Fingerprint m_fingerprint;
+        std::uint64_t m_editRevision = 0;
+        std::uint64_t m_validityEpoch = 0;
         bool m_valid = false;
         std::string m_error;
         std::vector<const SceneObjectDocument*> m_byIndex;
@@ -367,8 +369,12 @@ public:
         std::string name, std::string* errorMessage = nullptr,
         SceneObjectNamePolicy policy = SceneObjectNamePolicy::TrimmedInput);
 
-    // Ordered, copied metadata; validates the document and mapping once.
+    // Ordered, copied metadata; a copy of the retained snapshot below.
     bool BuildHierarchySnapshot(SceneHierarchySnapshot& snapshot, std::string* errorMessage = nullptr) const;
+    // The retained hierarchy snapshot, in document order; null with the validation error when the scene state is invalid. It
+    // is derived from the validated object index and rebuilt only when that index is (storage, document edit or validity
+    // change), so an unchanged scene returns the same immutable snapshot every call. Owner thread only.
+    std::shared_ptr<const SceneHierarchySnapshot> GetHierarchySnapshot(std::string* errorMessage = nullptr) const;
 
     // CPU preparation only; one outstanding assignment per runtime.
     std::optional<MaterialAssignmentToken> PrepareMaterialAssignment(
@@ -413,6 +419,34 @@ public:
     {
         ++m_validityEpoch;
     }
+    // Changes whenever InvalidateValidatedObjects() is called. With the structure, edit and residency revisions it tells a
+    // reader whether any runtime object's metadata or binding may have changed since it last looked.
+    std::uint64_t GetValidityEpoch() const noexcept { return m_validityEpoch; }
+
+    // W6.1: the authored state a renderer candidate was prepared against. While it compares equal (same runtime, document
+    // storage and edit revision, scene and mapping structure, archive), every object's persistent ID, references and
+    // overrides are unchanged. Runtime binding changes advance the per-object binding revisions, compared separately.
+    struct AuthoredStamp
+    {
+        std::uint64_t runtimeIdentity = 0;
+        const void* document = nullptr;
+        const void* documentObjects = nullptr;
+        std::size_t documentObjectCount = 0;
+        std::uint64_t editRevision = 0;
+        std::uint64_t sceneStructureRevision = 0;
+        std::size_t renderObjectCount = 0;
+        std::uint64_t mappingStructureRevision = 0;
+        const void* committedObjects = nullptr;
+        const void* archive = nullptr;
+
+        bool operator==(const AuthoredStamp&) const = default;
+    };
+
+    AuthoredStamp GetAuthoredStamp() const;
+
+    // Whether every runtime object maps to exactly one document object: the whole-scene metadata validation, reused while
+    // the validated index is current.
+    bool ValidateObjectMapping(std::string* errorMessage = nullptr) const;
     // W5: a composite World session validates every edited candidate document against its ownership rules, and gives new
     // entities their level namespace (and default parent) before their identity is reported. Empty for ordinary scenes.
     using CandidateValidator = std::function<bool(const SceneDocument& candidate, std::string& error)>;
@@ -437,8 +471,9 @@ public:
     };
 
     // Matches RayTracingSceneResources::MaxCandidateProposals; one renderer
-    // candidate carries every entry of a batch.
-    static constexpr size_t MaxMeshResidencyBatch = 32;
+    // candidate carries every entry of a batch. W6.4: the bound of the Engine's
+    // frame-budgeted batch size, not a typical batch.
+    static constexpr size_t MaxMeshResidencyBatch = 1024;
 
     // All-or-nothing: stages every request as one transaction, or none. On
     // failure, failedObjectID names the request responsible.
@@ -532,6 +567,18 @@ private:
     };
 
     mutable std::optional<ValidatedObjectIndex> m_validatedIndex;
+
+    // The hierarchy snapshot derived from the validated index it was built from (same key).
+    struct RetainedHierarchy
+    {
+        MetadataValidationPass::Fingerprint storage;
+        std::uint64_t editRevision = 0;
+        std::uint64_t validityEpoch = 0;
+        std::shared_ptr<const SceneHierarchySnapshot> snapshot;
+        std::string error;
+    };
+
+    mutable std::optional<RetainedHierarchy> m_retainedHierarchy;
     std::uint64_t m_validityEpoch = 0;
     const ValidatedObjectIndex& CurrentValidatedIndex() const;
     bool InspectSelectedObjectFully(RenderObjectID runtimeIndex, SceneObjectMetadata& metadata, SceneObjectDocument& object) const;

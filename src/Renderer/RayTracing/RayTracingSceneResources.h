@@ -11,6 +11,7 @@
 #include "Scene/MeshResidency.h"
 
 #include <d3d12.h>
+#include <algorithm>
 #include <array>
 #include <memory>
 #include <optional>
@@ -138,6 +139,120 @@ enum class ProspectiveJoinStatus
     MappingBudgetExceeded, AllocationFailed, ValidationFailed
 };
 
+// W6.2: a copy-on-write table of per-object values. Copying shares the chunks (O(objects / ChunkSize) pointers); Mutable clones
+// only a chunk another table still shares. A residency candidate copies the active membership's tables and changes its batch's
+// entries, so it costs O(batch), and a published membership's chunks are never written. Owner (main) thread only.
+template<typename Value>
+class ChunkedTable
+{
+public:
+    static constexpr std::size_t ChunkSize = 256;
+
+    std::size_t size() const noexcept
+    {
+        return m_size;
+    }
+
+    bool empty() const noexcept
+    {
+        return m_size == 0;
+    }
+
+    const Value& operator[](std::size_t index) const
+    {
+        return (*m_chunks[index / ChunkSize])[index % ChunkSize];
+    }
+
+    // An entry this table may change. Clones its chunk first when any other table shares it.
+    Value& Mutable(std::size_t index)
+    {
+        auto& chunk = m_chunks[index / ChunkSize];
+
+        if(chunk.use_count() > 1)
+        {
+            chunk = std::make_shared<std::vector<Value>>(*chunk);
+        }
+
+        return (*chunk)[index % ChunkSize];
+    }
+
+    void Assign(const std::vector<Value>& values)
+    {
+        Resize(values.size());
+
+        for(std::size_t index = 0; index < values.size(); ++index)
+        {
+            (*m_chunks[index / ChunkSize])[index % ChunkSize] = values[index];
+        }
+    }
+
+    // Default-valued entries in unshared chunks.
+    void Resize(std::size_t count)
+    {
+        m_chunks.clear();
+        m_size = count;
+
+        for(std::size_t first = 0; first < count; first += ChunkSize)
+        {
+            m_chunks.push_back(std::make_shared<std::vector<Value>>((std::min)(ChunkSize, count - first)));
+        }
+    }
+
+    void clear() noexcept
+    {
+        m_chunks.clear();
+        m_size = 0;
+    }
+
+    void swap(ChunkedTable& other) noexcept
+    {
+        m_chunks.swap(other.m_chunks);
+        std::swap(m_size, other.m_size);
+    }
+
+    class ConstIterator
+    {
+    public:
+        ConstIterator(const ChunkedTable* table, std::size_t index) : m_table(table), m_index(index)
+        {
+        }
+
+        const Value& operator*() const
+        {
+            return (*m_table)[m_index];
+        }
+
+        ConstIterator& operator++()
+        {
+            ++m_index;
+            return *this;
+        }
+
+        bool operator!=(const ConstIterator& other) const noexcept
+        {
+            return m_index != other.m_index;
+        }
+
+    private:
+        const ChunkedTable* m_table = nullptr;
+        std::size_t m_index = 0;
+    };
+
+    ConstIterator begin() const
+    {
+        return {this, 0};
+    }
+
+    ConstIterator end() const
+    {
+        return {this, m_size};
+    }
+
+private:
+    std::vector<std::shared_ptr<std::vector<Value>>> m_chunks;
+    std::size_t m_size = 0;
+};
+
 class RayTracingSceneResources
 {
     struct CandidateState;
@@ -221,12 +336,18 @@ class RayTracingSceneResources
     static constexpr std::size_t MaxProspectiveJoins = 3;
     static constexpr std::size_t MaxProspectiveRows = 4096;
     static constexpr std::size_t MaxProspectiveMappingBytes = 1024 * 1024;
+    // Every scene object takes part in each candidate, so the candidate's dense per-object work is bounded by the largest
+    // scene the Engine admits (SceneHierarchy::Policy::maxObjects, asserted where both are visible). Content-dependent
+    // storage stays bounded by the metadata, table and AS byte budgets below.
+    static constexpr std::size_t MaxCandidateObjects = 8192;
     // Bounded batch target, not an architectural constant: every proposal is
     // charged against the metadata/table/AS budgets below, and a candidate
-    // retires one membership whatever its size.
-    static constexpr std::size_t MaxCandidateProposals = 32;
-    static constexpr std::size_t MaxCandidateObjects = 4096;
-    static constexpr std::size_t MaxCandidateMetadataBytes = 16 * 1024 * 1024;
+    // retires one membership whatever its size. W6.4: the Engine sizes batches
+    // by a frame budget up to this bound.
+    static constexpr std::size_t MaxCandidateProposals = 1024;
+    // About 3 KiB of the conservative copy estimate per object with short identifiers and one sphere mesh (measured), more with
+    // World identifiers and long names: 8 KiB per object at the object bound keeps headroom for both.
+    static constexpr std::size_t MaxCandidateMetadataBytes = 8 * 1024 * MaxCandidateObjects;
     static constexpr std::size_t MaxCandidateTableBytes = 16 * 1024 * 1024;
     static constexpr std::size_t MaxCandidateASBytes = 256 * 1024 * 1024;
 
@@ -345,6 +466,7 @@ class RayTracingSceneResources
     friend class SceneDuplicationVerification;
     friend class PresentationTransformVerification;
     friend class SceneMembershipVerification;
+    friend class CompositePlacementStress;
     friend class SceneHierarchyVerification;
     friend class DescriptorRecoveryVerification;
     friend class ResidencyBatchVerification;
@@ -547,16 +669,23 @@ class RayTracingSceneResources
         std::vector<RayTracingInstanceDescription> instances;
         std::vector<std::size_t> renderObjectToInstance;
 
-        std::unordered_map<const Mesh*, MeshMetadata> slotGeometry;
-        std::vector<RenderObject> materialBindings;
-        std::vector<std::vector<unsigned int>> slotMaterialIndices;
+        // W6.2: shared, immutable metadata copies (a candidate copies the map's pointers, never the metadata).
+        std::unordered_map<const Mesh*, std::shared_ptr<const MeshMetadata>> slotGeometry;
+        ChunkedTable<RenderObject> materialBindings;
+        ChunkedTable<std::vector<unsigned int>> slotMaterialIndices;
         // CPU copy of immutable lookup metadata, independent of TLAS transforms.
         std::vector<RayTracingInstanceData> instanceRecords;
+        // W6.2: CPU copies of the uploaded triangle-slot table and each multi-slot mesh's offset in it, so a later candidate
+        // extends them instead of rebuilding. Empty for memberships that predate W6.2 tables (initial scene builds).
+        std::vector<unsigned int> triangleTable;
+        std::unordered_map<const Mesh*, unsigned int> triangleOffsets;
     };
 
     static bool BuildMaterialSlotData(MembershipSnapshot& snapshot, const std::vector<RenderObject>& objects,
         std::vector<RayTracingInstanceData>& instances, std::vector<unsigned int>& triangles,
         std::vector<unsigned int>& materials);
+    // The vertex, index and attribute lookup of one resident object; table offsets and descriptors are set by the caller.
+    static bool BuildInstanceRecord(const RenderObject& renderObject, RayTracingInstanceData& record);
     static bool BuildInstanceData(MembershipSnapshot& snapshot, const std::vector<RenderObject>& objects,
         const std::unordered_map<const Mesh*, std::size_t>& meshIndices,
         std::vector<RayTracingInstanceData>& instances);

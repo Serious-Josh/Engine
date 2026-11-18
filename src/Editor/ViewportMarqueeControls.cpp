@@ -87,7 +87,30 @@ void Editor::RefreshViewportMarqueePreview(const IDemoScene& scene)
         {
             continue;
         }
-        gesture.candidates.push_back(gesture.objectIdentities[index]);
+        auto candidate = gesture.objectIdentities[index];
+
+        // W5 refinement: entities of a Local in Level Edit select its level node, added once however many are hit.
+        if(owner)
+        {
+            std::string target = ResolveLevelEditSelection(*owner, candidate.objectID);
+
+            if(target != candidate.objectID)
+            {
+                const bool alreadyAdded = std::ranges::any_of(gesture.candidates, [&](const SelectedObjectIdentity& added)
+                {
+                    return added.objectID == target;
+                });
+
+                if(alreadyAdded)
+                {
+                    continue;
+                }
+
+                candidate.objectID = std::move(target);
+            }
+        }
+
+        gesture.candidates.push_back(std::move(candidate));
     }
     ViewportMarquee::CombineSelection(gesture.originalSelection, gesture.candidates, gesture.mode, gesture.previewSelection);
     gesture.previewIndices.clear();

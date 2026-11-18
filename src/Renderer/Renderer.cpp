@@ -8177,6 +8177,7 @@ bool Renderer::PrepareRtxdiFrame(ID3D12GraphicsCommandList* commandList, const F
         RtxdiInitialLocalLightSamples;
     rtxdiConstants.infiniteLightSamples = m_rtxdiInfiniteLightSamplesForTesting != 0 ?
         m_rtxdiInfiniteLightSamplesForTesting : RtxdiInitialInfiniteLightSamples;
+    rtxdiConstants.initialVisibility = m_rtxdiInitialVisibility ? 1u : 0u;
 
     for(std::size_t index = 0; index < frame.lightRecords.size(); ++index)
     {

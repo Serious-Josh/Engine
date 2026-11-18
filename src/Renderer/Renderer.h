@@ -897,6 +897,20 @@ class Renderer
         return m_dedicatedCausticsEnabled || m_pixelCausticsEnabled;
     }
 
+    // W6.4: whether the stable BLAS registry already holds this mesh (a residency batch builds a BLAS for each mesh it lacks).
+    bool HasStableBLAS(const Mesh* mesh) const
+    {
+        return m_rayTracingScene.m_blasRegistry.meshToBottomLevel.contains(mesh);
+    }
+
+    // W6.1: whether anything reads accepted TLAS geometry (either caustics pass or the diagnostic recorder). Without a
+    // consumer, publication skips the advisory geometry join; reacceptance rebuilds it from the active membership once a
+    // consumer appears.
+    bool WantsAcceptedTLASGeometry() const noexcept
+    {
+        return GetCausticSnapshotsRequested() || static_cast<bool>(m_causticRecorder);
+    }
+
     // Preparation only. No scene mesh binding or active DXR snapshot publication.
     std::optional<RayTracingSceneResources::ReplacementCandidate> PrepareDXRMembershipCandidate(
         const FileSceneRuntime& runtime, FileSceneAssetCatalog& catalog,
@@ -1154,8 +1168,12 @@ class Renderer
     // initialization; Editor preview caches can hold up to ~137 more (64 texture thumbnails,
     // 9 mesh thumbnail jobs, 32 material images, 32 preview textures); each unique resident mesh
     // needs 2 and each texture 1. The previous 256 could be exhausted by the Editor alone.
-    // 4096 matches MaterialAdmissionLimit and costs ~128 KiB. Exhaustion still recovers (B.1).
-    static constexpr unsigned int ResourceDescriptorCapacity = 4096;
+    // W6 finalization: one fixed heap sized for Engine's documented maxima, never grown or replaced (so no in-flight GPU work
+    // can see a heap change): 8,192 unique resident meshes x 2 (16,384), up to MaterialAdmissionLimit materials with their
+    // textures, Editor previews, and per-membership tables (active, candidate, up to four retired) with room to spare.
+    // 65,536 descriptors cost ~2 MiB (32-byte descriptors), far below D3D12's 1,000,000 shader-visible limit. Exhaustion
+    // still fails each transaction gracefully and recovers (B.1).
+    static constexpr unsigned int ResourceDescriptorCapacity = 65536;
     bool CanEditPendingMaterialBindings(const Scene& scene) const noexcept;
     struct SelectionPublicationIdentity
     {
@@ -1254,6 +1272,7 @@ class Renderer
 #if defined(ENGINE_HAS_VERIFICATION)
     friend class SceneDuplicationVerification;
     friend class SceneMembershipVerification;
+    friend class CompositePlacementStress;
     friend class ResidencyBatchVerification;
     friend class CausticVisibleVerification;
     friend class GamePlayGPUVerification;
@@ -2349,6 +2368,10 @@ private:
     // RTXDI.1 diagnostics: initial RTXDI candidate counts in place of RtxdiInitialLocalLightSamples and
     // RtxdiInitialInfiniteLightSamples (0 = the production constant).
     std::uint32_t m_rtxdiLocalLightSamplesForTesting = 0;
+    // WNP.2: shadow-test the selected initial ReSTIR DI sample at the primary vertex and discard it when occluded, before
+    // reuse (RTXDI enableInitialVisibility). Costs one shadow ray per ReSTIR DI sample. False restores the previous
+    // visibility-blind initial sampling exactly.
+    bool m_rtxdiInitialVisibility = true;
     std::uint32_t m_rtxdiInfiniteLightSamplesForTesting = 0;
     // Whether the last path-traced frame rendered with the cached-radiance library.
     bool m_sharcRenderedLastFrame = false;

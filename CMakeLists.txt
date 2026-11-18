@@ -482,6 +482,7 @@ add_library(EngineCore OBJECT
     src/Scene/RenderView.cpp
     src/Scene/SceneLighting.cpp
     src/Scene/SceneSerializer.cpp
+    src/Scene/SceneDocumentCache.cpp
     src/Scene/SceneAssetIdentity.cpp
     src/Scene/SceneEnvironmentResolution.cpp
     src/Scene/CompositeWorld.cpp

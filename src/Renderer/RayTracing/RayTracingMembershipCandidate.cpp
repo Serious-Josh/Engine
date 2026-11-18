@@ -88,12 +88,28 @@ namespace
         return ChargeGPUAllocation(info.ResultDataMaxSizeInBytes, total) && ChargeGPUAllocation(scratch, total);
     }
 
-    bool SameBinding(const SceneObjectMetadata& a, const SceneObjectMetadata& b)
+    // ENGINE_W6_FULL_CANDIDATES=1 builds every residency candidate from the whole scene (the pre-W6.2 path), for comparison.
+    bool FullCandidatesForced()
     {
-        return a.runtimeIdentity == b.runtimeIdentity && a.sceneID == b.sceneID && a.objectID == b.objectID &&
-            a.runtimeIndex == b.runtimeIndex && a.structureRevision == b.structureRevision &&
-            a.bindingRevision == b.bindingRevision && a.meshReference == b.meshReference &&
-            a.materialReference == b.materialReference && a.materialSlotBindings == b.materialSlotBindings;
+        static const bool forced = std::getenv("ENGINE_W6_FULL_CANDIDATES") != nullptr;
+        return forced;
+    }
+
+    std::shared_ptr<const std::vector<std::string>> CollectMaterialReferences(const FileSceneRuntime& runtime)
+    {
+        std::set<std::string_view> unique;
+
+        for (const auto& authored : runtime.GetFileScene().GetDocument().objects)
+        {
+            unique.insert(authored.materialReference);
+
+            for (const auto& [slot, reference] : authored.materialSlotBindings)
+            {
+                unique.insert(reference);
+            }
+        }
+
+        return std::make_shared<const std::vector<std::string>>(unique.begin(), unique.end());
     }
 
     bool CreateUpload(ID3D12Device* device, const void* data, std::size_t bytes, ComPtr<ID3D12Resource>& upload)
@@ -157,6 +173,7 @@ struct RayTracingSceneResources::CandidateState
     std::vector<std::unique_ptr<BottomLevelAccelerationStructure>> newBLAS;
     std::vector<const Mesh*> newMeshes;
     std::vector<const BottomLevelAccelerationStructure*> blasPointers;
+    // Sorted by mesh (W6.2): an incremental candidate copies and extends its base's set.
     std::vector<GeometryDependency> dependencies;
     // Complete prospective index registry. Readiness stages it; adoption will
     // swap it, avoiding unordered_map node allocation during atomic acceptance.
@@ -167,8 +184,15 @@ struct RayTracingSceneResources::CandidateState
     std::array<ComPtr<ID3D12Resource>, 3> uploads;
     std::array<std::size_t, 3> uploadBytes{};
 
-    std::vector<SceneObjectMetadata> identities;
-    std::vector<RenderObject> originalObjects;
+    // W6.1: what preparation read, revalidated by each poll without per-object metadata copies. The authored stamp proves
+    // every persistent ID, reference and override unchanged; the binding revisions and live render-object bindings cover
+    // runtime changes. Every object except a proposal equals its snapshot binding, so only proposals keep their
+    // pre-residency bindings (sorted by object index).
+    FileSceneRuntime::AuthoredStamp authoredStamp;
+    std::vector<std::uint64_t> bindingRevisions;
+    // Unique authored material references (fallbacks and slot overrides), shared with later candidates of the same stamp.
+    std::shared_ptr<const std::vector<std::string>> materialReferences;
+    std::vector<std::pair<std::size_t, RenderObject>> proposalOriginals;
     std::vector<ResidencyProposal> proposals;
     const Scene* scene = nullptr;
     const FileSceneAssetCatalog* catalog = nullptr;
@@ -247,10 +271,26 @@ std::optional<RayTracingSceneResources::ReplacementCandidate> RayTracingSceneRes
         return std::nullopt;
     }
 
-    std::size_t metadataBytes = objects.size() * (sizeof(RenderObject) * 3 + sizeof(SceneObjectMetadata));
+    // W6.2: a residency batch extends the active membership when it carries complete W6.2 tables and the adopted candidate
+    // that built it (its sorted geometry dependencies). Otherwise, and for every membership change, the full build runs.
+    const auto* previous = m_membership->dependencyOwner.get();
+    const auto& active = *m_membership;
+    const bool incremental = !membershipSource && !FullCandidatesForced() && previous &&
+        active.materialBindings.size() == objects.size() && active.slotMaterialIndices.size() == objects.size() &&
+        active.instanceRecords.size() == objects.size() && active.renderObjectToInstance.size() == objects.size() &&
+        !active.triangleTable.empty();
+
+    // The full build copies every object's metadata, so its budget is charged over the scene; an incremental candidate
+    // copies only the arriving objects' (charged below with each proposal).
+    std::size_t metadataBytes = incremental ? 0 : objects.size() * (sizeof(RenderObject) * 3 + sizeof(SceneObjectMetadata));
 
     for (const auto& authored : runtime.GetFileScene().GetDocument().objects)
     {
+        if (incremental)
+        {
+            break;
+        }
+
         if (!ChargeText(authored.id, metadataBytes) || !ChargeText(authored.name, metadataBytes) ||
             !ChargeText(authored.meshReference, metadataBytes) || !ChargeText(authored.materialReference, metadataBytes))
         {
@@ -270,6 +310,11 @@ std::optional<RayTracingSceneResources::ReplacementCandidate> RayTracingSceneRes
 
     for (const auto& object : objects)
     {
+        if (incremental)
+        {
+            break;
+        }
+
         if (object.mesh && !ChargeMetadata(object.mesh->GetMetadata(), metadataBytes))
         {
             Fail(error, "Candidate resident mesh metadata exceeds its memory budget.");
@@ -316,32 +361,22 @@ std::optional<RayTracingSceneResources::ReplacementCandidate> RayTracingSceneRes
     state.stableBLASCount = m_blasRegistry.bottomLevels.size();
     state.materialCount = materialCount;
 
-    state.originalObjects = objects;
-
-    state.identities.resize(objects.size());
-    std::vector<bool> seen(objects.size());
-
-    for (const auto& authored : runtime.GetFileScene().GetDocument().objects)
+    // W6.1: one whole-scene mapping validation (reused by the runtime while unchanged) instead of a metadata copy per object.
+    if (!runtime.ValidateObjectMapping(&error) || runtime.GetObjectMapping().bindingRevisions.size() != objects.size())
     {
-        const auto metadata = runtime.GetObjectMetadata(authored.id, &error);
-
-        if (!metadata || metadata->runtimeIndex >= objects.size() || seen[metadata->runtimeIndex])
-        {
-            Fail(error, "Candidate object identity mapping is incomplete.");
-            return std::nullopt;
-        }
-
-        seen[metadata->runtimeIndex] = true;
-        state.identities[metadata->runtimeIndex] = *metadata;
-    }
-
-    if (std::find(seen.begin(), seen.end(), false) != seen.end())
-    {
-        Fail(error, "Candidate object mapping omitted a runtime object.");
+        Fail(error, "Candidate object identity mapping is incomplete.");
         return std::nullopt;
     }
 
-    auto effective = objects;
+    state.authoredStamp = runtime.GetAuthoredStamp();
+    state.bindingRevisions = runtime.GetObjectMapping().bindingRevisions;
+    // Unique authored references: the adopted previous candidate's set while the authored stamp is unchanged.
+    state.materialReferences = previous && previous->materialReferences && previous->authoredStamp == state.authoredStamp ?
+        previous->materialReferences : CollectMaterialReferences(runtime);
+
+    // Each proposal with the binding it will have once resident, in object order.
+    std::vector<std::pair<std::size_t, RenderObject>> arriving;
+    arriving.reserve(proposals.size());
     std::set<std::size_t> proposedIndices;
     std::vector<MeshResidencySourceLock> sourceLocks;
 
@@ -369,7 +404,9 @@ std::optional<RayTracingSceneResources::ReplacementCandidate> RayTracingSceneRes
         }
 
         sourceLocks.push_back(std::move(source));
-        auto& object = effective[metadata->runtimeIndex];
+        state.proposalOriginals.emplace_back(metadata->runtimeIndex, objects[metadata->runtimeIndex]);
+        arriving.emplace_back(metadata->runtimeIndex, objects[metadata->runtimeIndex]);
+        auto& object = arriving.back().second;
         const auto& slots = proposal.mesh.mesh->GetMetadata().materialSlots;
 
         for (const auto& [slotID, reference] : metadata->materialSlotBindings)
@@ -417,24 +454,19 @@ std::optional<RayTracingSceneResources::ReplacementCandidate> RayTracingSceneRes
         }
     }
 
-    // Preflight before constructing full triangle tables, AS or staging buffers.
+    std::sort(arriving.begin(), arriving.end(), [](const auto& left, const auto& right) { return left.first < right.first; });
+
+    // Preflight before constructing tables, AS or staging buffers.
     std::size_t tableBytes = objects.size() * sizeof(RayTracingInstanceData) + sizeof(unsigned int);
     std::size_t asBytes = 0;
-    std::size_t residents = 0;
-    std::set<const Mesh*> meshes;
-    auto meshIndices = m_blasRegistry.meshToBottomLevel;
     state.blasPointers = m_blasRegistry.bottomLevelPointers;
-
+    // Registry index of each BLAS this candidate builds.
+    std::unordered_map<const Mesh*, std::size_t> newMeshIndices;
     const auto ownedMaterials = catalog.GetMaterials();
 
-    for (const auto& object : effective)
+    // A resident object's geometry, slot metadata and slot materials (the candidate's admission rules).
+    const auto validateResident = [&](const RenderObject& object)
     {
-        if (!object.mesh)
-        {
-            continue;
-        }
-
-        ++residents;
         const auto& mesh = *object.mesh;
         const auto& metadata = mesh.GetMetadata();
 
@@ -449,8 +481,7 @@ std::optional<RayTracingSceneResources::ReplacementCandidate> RayTracingSceneRes
             !ValidateMeshMetadata(metadata, mesh.GetIndexCount(), error) ||
             !Charge(metadata.materialSlots.size() * sizeof(unsigned int), MaxCandidateTableBytes, tableBytes))
         {
-            Fail(error, "Candidate geometry is incomplete or exceeds the lookup-table budget.");
-            return std::nullopt;
+            return Fail(error, "Candidate geometry is incomplete or exceeds the lookup-table budget.");
         }
 
         for (const auto& slot : metadata.materialSlots)
@@ -460,21 +491,22 @@ std::optional<RayTracingSceneResources::ReplacementCandidate> RayTracingSceneRes
             if (!material || material->gpuIndex >= materialCount ||
                 std::find(ownedMaterials.begin(), ownedMaterials.end(), material) == ownedMaterials.end())
             {
-                Fail(error, "Candidate slot material is absent from the retained scene material table.");
-                return std::nullopt;
+                return Fail(error, "Candidate slot material is absent from the retained scene material table.");
             }
         }
 
-        if (!meshes.insert(&mesh).second)
-        {
-            continue;
-        }
+        return true;
+    };
+
+    // One resident mesh's geometry pins, and a new BLAS when the stable registry has none (only an arriving mesh may lack one).
+    const auto addDependency = [&](const Mesh& mesh, bool arrivingMesh)
+    {
+        const auto& metadata = mesh.GetMetadata();
 
         if (metadata.materialSlots.size() > 1 &&
             !Charge(mesh.GetIndexCount() / 3 * sizeof(unsigned int), MaxCandidateTableBytes, tableBytes))
         {
-            Fail(error, "Candidate triangle lookup exceeds its budget.");
-            return std::nullopt;
+            return Fail(error, "Candidate triangle lookup exceeds its budget.");
         }
 
         CandidateState::GeometryDependency dependency;
@@ -482,13 +514,12 @@ std::optional<RayTracingSceneResources::ReplacementCandidate> RayTracingSceneRes
         dependency.vertices = mesh.GetVertexBufferResource();
         dependency.indices = mesh.GetIndexBufferResource();
         dependency.vertexDescriptor = mesh.GetVertexBufferDescriptorIndex();
-
         dependency.indexDescriptor = mesh.GetIndexBufferDescriptorIndex();
         dependency.vertexCount = mesh.GetVertexCount();
         dependency.indexCount = mesh.GetIndexCount();
-        const auto registered = meshIndices.find(&mesh);
+        const auto registered = m_blasRegistry.meshToBottomLevel.find(&mesh);
 
-        if (registered != meshIndices.end())
+        if (registered != m_blasRegistry.meshToBottomLevel.end())
         {
             dependency.blas = state.blasPointers[registered->second];
             dependency.blasResource = dependency.blas->GetResource();
@@ -496,11 +527,9 @@ std::optional<RayTracingSceneResources::ReplacementCandidate> RayTracingSceneRes
         }
         else
         {
-            if (std::none_of(proposals.begin(), proposals.end(),
-                [&](const auto& proposal) { return proposal.mesh.mesh == &mesh; }))
+            if (!arrivingMesh)
             {
-                Fail(error, "Existing resident mesh is missing its stable BLAS registration.");
-                return std::nullopt;
+                return Fail(error, "Existing resident mesh is missing its stable BLAS registration.");
             }
 
             D3D12_RAYTRACING_GEOMETRY_DESC geometry{};
@@ -508,7 +537,6 @@ std::optional<RayTracingSceneResources::ReplacementCandidate> RayTracingSceneRes
             geometry.Flags = D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE;
             geometry.Triangles.VertexBuffer = {mesh.GetVertexBufferAddress(), mesh.GetVertexStride()};
             geometry.Triangles.VertexCount = static_cast<UINT>(mesh.GetVertexCount());
-
             geometry.Triangles.VertexFormat = DXGI_FORMAT_R32G32B32_FLOAT;
             geometry.Triangles.IndexBuffer = mesh.GetIndexBufferAddress();
             geometry.Triangles.IndexCount = static_cast<UINT>(mesh.GetIndexCount());
@@ -519,49 +547,297 @@ std::optional<RayTracingSceneResources::ReplacementCandidate> RayTracingSceneRes
             inputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
             inputs.NumDescs = 1;
             inputs.pGeometryDescs = &geometry;
-
             inputs.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
 
             if (!ChargeAS(device, inputs, asBytes) || state.newMeshes.size() >= MaxCandidateProposals)
             {
-                Fail(error, "Candidate new-BLAS build exceeds its work budget.");
-                return std::nullopt;
+                return Fail(error, "Candidate new-BLAS build exceeds its work budget.");
             }
 
-            meshIndices.emplace(&mesh, state.blasPointers.size());
+            newMeshIndices.emplace(&mesh, state.blasPointers.size());
             state.newMeshes.push_back(&mesh);
             state.newBLAS.push_back(std::make_unique<BottomLevelAccelerationStructure>());
             dependency.blas = state.newBLAS.back().get();
             state.blasPointers.push_back(dependency.blas);
         }
 
+        // Appended here; sorted by mesh once complete (below), so a later incremental candidate searches and extends them.
         state.dependencies.push_back(std::move(dependency));
-    }
-
-    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS tlas{};
-    tlas.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
-    tlas.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
-    tlas.NumDescs = static_cast<UINT>(residents);
-    tlas.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE |
-        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE;
-
-    if ((!membershipSource && !residents) || (residents && (!ChargeAS(device, tlas, asBytes) ||
-        !ChargeGPUAllocation(residents * sizeof(D3D12_RAYTRACING_INSTANCE_DESC), asBytes) ||
-        !ChargeGPUAllocation(residents * sizeof(D3D12_RAYTRACING_INSTANCE_DESC), asBytes))))
+        return true;
+    };
+    const auto byMesh = [](const CandidateState::GeometryDependency& left, const CandidateState::GeometryDependency& right)
     {
-        Fail(error, "Candidate TLAS build exceeds its work budget.");
-        return std::nullopt;
-    }
+        return std::less<const Mesh*>{}(left.mesh, right.mesh);
+    };
 
-    std::vector<RayTracingInstanceData> gpuInstances(objects.size());
-    std::vector<unsigned int> triangles{0};
+    const auto chargeTopLevel = [&](std::size_t residents)
+    {
+        D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS tlas{};
+        tlas.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
+        tlas.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+        tlas.NumDescs = static_cast<UINT>(residents);
+        tlas.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE |
+            D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE;
+
+        if ((!membershipSource && !residents) || (residents && (!ChargeAS(device, tlas, asBytes) ||
+            !ChargeGPUAllocation(residents * sizeof(D3D12_RAYTRACING_INSTANCE_DESC), asBytes) ||
+            !ChargeGPUAllocation(residents * sizeof(D3D12_RAYTRACING_INSTANCE_DESC), asBytes))))
+        {
+            return Fail(error, "Candidate TLAS build exceeds its work budget.");
+        }
+
+        return true;
+    };
+
+    std::vector<RayTracingInstanceData> gpuInstances;
+    std::vector<unsigned int> triangles;
     std::vector<unsigned int> materials;
     auto& snapshot = *state.snapshot;
+    bool tablesBuilt = false;
 
-    const bool slotsBuilt=BuildMaterialSlotData(snapshot, effective, gpuInstances, triangles, materials);
-    if(membershipSource && !residents) materials.push_back(0);
-    if ((!slotsBuilt && !(membershipSource && !residents)) ||
-        !BuildInstanceData(snapshot, effective, meshIndices, gpuInstances) ||
+    if (!incremental)
+    {
+        auto effective = objects;
+
+        for (auto& [index, object] : arriving)
+        {
+            effective[index] = object;
+        }
+
+        std::set<const Mesh*> meshes;
+        std::size_t residents = 0;
+
+        for (const auto& object : effective)
+        {
+            if (!object.mesh)
+            {
+                continue;
+            }
+
+            ++residents;
+
+            if (!validateResident(object))
+            {
+                return std::nullopt;
+            }
+
+            if (meshes.insert(object.mesh).second)
+            {
+                const bool arrivingMesh = std::any_of(proposals.begin(), proposals.end(),
+                    [&](const auto& proposal) { return proposal.mesh.mesh == object.mesh; });
+
+                if (!addDependency(*object.mesh, arrivingMesh))
+                {
+                    return std::nullopt;
+                }
+            }
+        }
+
+        std::sort(state.dependencies.begin(), state.dependencies.end(), byMesh);
+
+        if (!chargeTopLevel(residents))
+        {
+            return std::nullopt;
+        }
+
+        auto meshIndices = m_blasRegistry.meshToBottomLevel;
+        meshIndices.insert(newMeshIndices.begin(), newMeshIndices.end());
+        gpuInstances.resize(objects.size());
+        triangles = {0};
+        const bool slotsBuilt = BuildMaterialSlotData(snapshot, effective, gpuInstances, triangles, materials);
+
+        if (membershipSource && !residents)
+        {
+            materials.push_back(0);
+        }
+
+        tablesBuilt = (slotsBuilt || (membershipSource && !residents)) && BuildInstanceData(snapshot, effective, meshIndices, gpuInstances);
+    }
+    else
+    {
+        // W6.2: start from the active membership's tables (shared chunks and plain copies) and change only what differs.
+        snapshot.materialBindings = active.materialBindings;
+        snapshot.slotMaterialIndices = active.slotMaterialIndices;
+        snapshot.slotGeometry = active.slotGeometry;
+        snapshot.triangleTable = active.triangleTable;
+        snapshot.triangleOffsets = active.triangleOffsets;
+        gpuInstances = active.instanceRecords;
+        state.dependencies = previous->dependencies;
+
+        // Objects not arriving: a resident binding equals the active membership's (admission checked it); a pending one may
+        // have been rebound since, and is carried as the full build would copy it.
+        auto next = arriving.begin();
+
+        for (std::size_t index = 0; index < objects.size(); ++index)
+        {
+            if (next != arriving.end() && next->first == index)
+            {
+                ++next;
+                continue;
+            }
+
+            const auto& current = objects[index];
+            const auto& carried = snapshot.materialBindings[index];
+
+            if (current.mesh != carried.mesh || current.material != carried.material ||
+                current.slotMaterials != carried.slotMaterials || current.materialsDeferred != carried.materialsDeferred)
+            {
+                if (current.mesh)
+                {
+                    Fail(error, "Candidate base membership differs from a resident binding.");
+                    return std::nullopt;
+                }
+
+                snapshot.materialBindings.Mutable(index) = current;
+            }
+        }
+
+        // Arriving objects: their geometry, metadata, slot materials, instance record and triangle lookup. A mesh already
+        // resident has its dependency in the base set (sorted); one added by this batch is remembered.
+        const std::size_t baseDependencies = state.dependencies.size();
+        std::set<const Mesh*> addedMeshes;
+
+        for (auto& [index, object] : arriving)
+        {
+            const auto& mesh = *object.mesh;
+            const auto& metadata = mesh.GetMetadata();
+            const auto baseEnd = state.dependencies.begin() + static_cast<std::ptrdiff_t>(baseDependencies);
+            const auto found = std::lower_bound(state.dependencies.begin(), baseEnd, &mesh,
+                [](const CandidateState::GeometryDependency& existing, const Mesh* key) { return std::less<const Mesh*>{}(existing.mesh, key); });
+            const bool known = (found != baseEnd && found->mesh == &mesh) || addedMeshes.contains(&mesh);
+
+            if (!validateResident(object))
+            {
+                return std::nullopt;
+            }
+
+            if (!known)
+            {
+                if (!addDependency(mesh, true))
+                {
+                    return std::nullopt;
+                }
+
+                addedMeshes.insert(&mesh);
+            }
+
+            if (!snapshot.slotGeometry.contains(&mesh))
+            {
+                snapshot.slotGeometry.emplace(&mesh, std::make_shared<const MeshMetadata>(metadata));
+            }
+
+            auto& slotIndices = snapshot.slotMaterialIndices.Mutable(index);
+            slotIndices.clear();
+
+            for (const auto& slot : metadata.materialSlots)
+            {
+                slotIndices.push_back(object.GetSlotMaterial(slot.id)->gpuIndex);
+            }
+
+            auto& record = gpuInstances[index];
+            record = {};
+
+            if (!BuildInstanceRecord(object, record))
+            {
+                Fail(error, "Candidate arriving mesh lacks the ray-tracing vertex attributes.");
+                return std::nullopt;
+            }
+
+            record.triangleSlotBufferIndex = UINT_MAX;
+
+            if (metadata.materialSlots.size() > 1)
+            {
+                auto offset = snapshot.triangleOffsets.find(&mesh);
+
+                if (offset == snapshot.triangleOffsets.end())
+                {
+                    const auto first = static_cast<unsigned int>(snapshot.triangleTable.size());
+                    snapshot.triangleTable.resize(snapshot.triangleTable.size() + mesh.GetIndexCount() / 3);
+
+                    for (const auto& submesh : metadata.submeshes)
+                    {
+                        std::fill_n(snapshot.triangleTable.begin() + first + submesh.firstIndex / 3, submesh.indexCount / 3,
+                            submesh.materialSlot);
+                    }
+
+                    offset = snapshot.triangleOffsets.emplace(&mesh, first).first;
+                }
+
+                record.triangleSlotOffset = offset->second;
+                record.triangleSlotBufferIndex = 0; // Patched after successful GPU allocation.
+            }
+
+            snapshot.materialBindings.Mutable(index) = std::move(object);
+        }
+
+        std::sort(state.dependencies.begin() + static_cast<std::ptrdiff_t>(baseDependencies), state.dependencies.end(), byMesh);
+        std::inplace_merge(state.dependencies.begin(), state.dependencies.begin() + static_cast<std::ptrdiff_t>(baseDependencies),
+            state.dependencies.end(), byMesh);
+
+        // Object-order passes over plain data: each resident object's slot-material offset is the running total (material
+        // publication requires that layout), and the TLAS lists resident objects densely in object order with their current
+        // presentation transforms.
+        snapshot.instances.reserve(active.instances.size() + arriving.size());
+        snapshot.renderObjectToInstance.assign(objects.size(), InvalidInstanceIndex);
+        bool consistent = true;
+
+        for (std::size_t index = 0; index < objects.size() && consistent; ++index)
+        {
+            const auto* mesh = snapshot.materialBindings[index].mesh;
+
+            if (!mesh)
+            {
+                continue;
+            }
+
+            const auto& indices = snapshot.slotMaterialIndices[index];
+            const auto registered = m_blasRegistry.meshToBottomLevel.find(mesh);
+            const auto created = newMeshIndices.find(mesh);
+            consistent = !indices.empty() && (registered != m_blasRegistry.meshToBottomLevel.end() || created != newMeshIndices.end()) &&
+                std::all_of(indices.begin(), indices.end(), [&](unsigned int material) { return material < materialCount; });
+
+            if (!consistent)
+            {
+                break;
+            }
+
+            auto& record = gpuInstances[index];
+            record.slotMaterialOffset = static_cast<unsigned int>(materials.size());
+            record.materialIndex = indices.front();
+            materials.insert(materials.end(), indices.begin(), indices.end());
+
+            RayTracingInstanceDescription description{};
+            description.transform = objects[index].GetPresentationTransform().currentModel;
+            description.instanceID = static_cast<unsigned int>(index);
+            description.mask = 0xFF;
+            description.bottomLevelIndex = registered != m_blasRegistry.meshToBottomLevel.end() ? registered->second : created->second;
+            snapshot.renderObjectToInstance[index] = snapshot.instances.size();
+            snapshot.instances.push_back(description);
+        }
+
+        if (!consistent || materials.empty())
+        {
+            Fail(error, "Candidate incremental tables are inconsistent with the active membership.");
+            return std::nullopt;
+        }
+
+        triangles = snapshot.triangleTable;
+
+        if (!chargeTopLevel(snapshot.instances.size()))
+        {
+            return std::nullopt;
+        }
+
+        if (!Charge((triangles.size() + materials.size()) * sizeof(unsigned int), MaxCandidateTableBytes, tableBytes))
+        {
+            Fail(error, "Candidate lookup tables exceed their budget.");
+            return std::nullopt;
+        }
+
+        tablesBuilt = true;
+    }
+
+    if (!tablesBuilt ||
         !snapshot.triangleSlots.InitializeStorage(device, sizeof(unsigned int), static_cast<UINT>(triangles.size()), heap) ||
         !snapshot.slotMaterials.InitializeStorage(device, sizeof(unsigned int), static_cast<UINT>(materials.size()), heap) ||
         !snapshot.instanceDataBuffer.InitializeStorage(device, sizeof(RayTracingInstanceData), static_cast<UINT>((std::max)(objects.size(),std::size_t{1})), heap))
@@ -573,7 +849,11 @@ std::optional<RayTracingSceneResources::ReplacementCandidate> RayTracingSceneRes
             *failure = CandidateFailure::DescriptorExhausted;
         }
 
-        Fail(error, "Candidate membership/table allocation failed.");
+        if (error.empty() || tablesBuilt)
+        {
+            Fail(error, "Candidate membership/table allocation failed.");
+        }
+
         return std::nullopt;
     }
 
@@ -591,6 +871,8 @@ std::optional<RayTracingSceneResources::ReplacementCandidate> RayTracingSceneRes
         return std::nullopt;
     }
 
+    std::sort(state.proposalOriginals.begin(), state.proposalOriginals.end(),
+        [](const auto& left, const auto& right) { return left.first < right.first; });
     state.proposals = proposals;
     state.failed = false;
 
@@ -690,30 +972,48 @@ bool RayTracingSceneResources::ValidateCandidateBindings(const CandidateState& s
     if (!state.valid || state.scene != &runtime.GetScene() || state.catalog != &catalog ||
         state.originalMembership != m_membership.get() || state.runtimeIdentity != runtime.GetRuntimeIdentity() ||
         state.residencyRevision != runtime.GetResidencyRevision() ||
-        state.structureRevision != runtime.GetScene().GetStructureRevision() || objects.size() != state.identities.size())
+        state.structureRevision != runtime.GetScene().GetStructureRevision() || objects.size() != state.bindingRevisions.size())
     {
         return Fail(error, "Candidate belongs to an obsolete scene session or membership.");
     }
 
+    // W6.1: an unchanged authored stamp means every persistent ID, reference and override is the one preparation read; any
+    // document edit makes the candidate stale (it is prepared again). Runtime binding changes advance binding revisions.
+    if (runtime.GetAuthoredStamp() != state.authoredStamp)
+    {
+        return Fail(error, "Candidate scene document changed after preparation.");
+    }
+
+    if (runtime.GetObjectMapping().bindingRevisions != state.bindingRevisions || !runtime.ValidateObjectMapping(&error))
+    {
+        return Fail(error, "Candidate object identity or material binding changed.");
+    }
+
+    for (const auto& reference : *state.materialReferences)
+    {
+        if (!catalog.ValidateMetadataMaterialReference(reference, &error))
+        {
+            return false;
+        }
+    }
+
+    // Live bindings: every object still holds what preparation copied (a proposal its pre-residency binding).
+    auto proposal = state.proposalOriginals.begin();
+
     for (std::size_t index = 0; index < objects.size(); ++index)
     {
-        const auto& saved = state.identities[index];
-        const auto current = runtime.GetObjectMetadata(saved.objectID, &error);
-        const auto& original = state.originalObjects[index];
+        const RenderObject* original = &state.snapshot->materialBindings[index];
 
-        if (!current || !SameBinding(saved, *current) ||
-            !catalog.ValidateMetadataMaterialReference(saved.materialReference, &error) || objects[index].mesh != original.mesh ||
-            objects[index].material != original.material || objects[index].slotMaterials != original.slotMaterials)
+        if (proposal != state.proposalOriginals.end() && proposal->first == index)
         {
-            return Fail(error, "Candidate object identity or material binding changed.");
+            original = &proposal->second;
+            ++proposal;
         }
 
-        for (const auto& [slot, reference] : saved.materialSlotBindings)
+        if (objects[index].mesh != original->mesh || objects[index].material != original->material ||
+            objects[index].slotMaterials != original->slotMaterials)
         {
-            if (!catalog.ValidateMetadataMaterialReference(reference, &error))
-            {
-                return false;
-            }
+            return Fail(error, "Candidate object identity or material binding changed.");
         }
     }
 
@@ -736,7 +1036,7 @@ bool RayTracingSceneResources::ValidateCandidateBindings(const CandidateState& s
             mesh.GetVertexBufferDescriptorIndex() != dependency.vertexDescriptor ||
             mesh.GetIndexBufferDescriptorIndex() != dependency.indexDescriptor ||
             mesh.GetVertexCount() != dependency.vertexCount || mesh.GetIndexCount() != dependency.indexCount ||
-            mesh.GetMetadata() != state.snapshot->slotGeometry.at(&mesh) ||
+            mesh.GetMetadata() != *state.snapshot->slotGeometry.at(&mesh) ||
             dependency.blas->GetGPUAddress() != dependency.blasAddress)
         {
             return Fail(error, "Candidate geometry or stable BLAS changed.");
@@ -1231,7 +1531,12 @@ ProspectiveJoinStatus RayTracingSceneResources::PrepareProspectiveJoin(const Rep
     InvalidateProspectiveJoin();
     auto status = ProspectiveJoinStatus::WrongLifetime;
     ProspectiveTLASGeometryJoinHandle joined;
-    if(rendererLifetime && candidate.m_rendererLifetime == rendererLifetime)
+    if(rendererLifetime && candidate.m_rendererLifetime == rendererLifetime && candidate.m_state && candidate.m_state->snapshot &&
+        candidate.m_state->snapshot->instances.size() > MaxProspectiveRows)
+    {
+        status = ProspectiveJoinStatus::IncompleteCapture;
+    }
+    else if(rendererLifetime && candidate.m_rendererLifetime == rendererLifetime)
     {
         try
         {
@@ -1269,36 +1574,46 @@ ProspectiveJoinStatus RayTracingSceneResources::BuildGeometryJoin(const Candidat
         std::string error;
         const auto& snapshot = candidate ? *candidate->snapshot : *m_membership;
         const auto& blasPointers = candidate ? candidate->blasPointers : m_blasRegistry.bottomLevelPointers;
-        std::vector<SceneObjectMetadata> committed;
-        if(!candidate)
+        const auto capture = snapshot.topLevel.GetRecordingCapture();
+
+        // W6.1: refuse an oversized capture before deriving any per-object identity.
+        if(!capture || capture->instances.size() > MaxProspectiveRows)
         {
-            // Same committed-mapping derivation as candidate creation.
+            return ProspectiveJoinStatus::IncompleteCapture;
+        }
+
+        // Committed identities from the runtime. For a candidate, its Ready poll just proved them unchanged since preparation.
+        std::vector<SceneObjectMetadata> identities;
+        {
             const auto objectCount = runtime.GetScene().GetRenderObjects().size();
-            committed.resize(objectCount);
+            identities.resize(objectCount);
             std::vector<bool> seen(objectCount);
+
             for(const auto& authored : runtime.GetFileScene().GetDocument().objects)
             {
                 const auto metadata = runtime.GetObjectMetadata(authored.id, &error);
+
                 if(!metadata || metadata->runtimeIndex >= objectCount || seen[metadata->runtimeIndex])
                 {
                     return ProspectiveJoinStatus::ValidationFailed;
                 }
+
                 seen[metadata->runtimeIndex] = true;
-                committed[metadata->runtimeIndex] = *metadata;
+                identities[metadata->runtimeIndex] = *metadata;
             }
+
             if(std::find(seen.begin(), seen.end(), false) != seen.end())
             {
                 return ProspectiveJoinStatus::ValidationFailed;
             }
         }
-        const auto& identities = candidate ? candidate->identities : committed;
+
         const auto proposals = candidate ? std::span<const ResidencyProposal>(candidate->proposals) :
             std::span<const ResidencyProposal>{};
         const auto runtimeIdentity = candidate ? candidate->runtimeIdentity : runtime.GetRuntimeIdentity();
         const auto structureRevision = candidate ? candidate->structureRevision : runtime.GetScene().GetStructureRevision();
         const auto residencyRevision = candidate ? candidate->residencyRevision : runtime.GetResidencyRevision();
-        const auto capture = snapshot.topLevel.GetRecordingCapture();
-        if(!capture || !capture->completeBLASReferences || capture->instances.size() > MaxProspectiveRows ||
+        if(!capture->completeBLASReferences ||
             capture->instances.size() != snapshot.instances.size() ||
             capture->bottomLevels.size() != capture->instances.size() ||
             snapshot.renderObjectToInstance.size() != identities.size() ||
@@ -1396,6 +1711,15 @@ ProspectiveJoinStatus RayTracingSceneResources::BuildGeometryJoin(const Candidat
         joined->tlasCapture = capture;
         joined->submission = submission;
         joined->rows.reserve(identities.size());
+        const auto& authored = runtime.GetFileScene().GetDocument().objects;
+        std::unordered_map<std::string_view, std::size_t> authoredIndices;
+        authoredIndices.reserve(authored.size());
+
+        for(std::size_t index = 0; index < authored.size(); ++index)
+        {
+            authoredIndices.emplace(authored[index].id, index);
+        }
+
         std::size_t nativeCount = 0;
         const FileSceneAssetCatalog::ValidationPass validationPass(catalog);
         for(std::size_t dense = 0; dense < identities.size(); ++dense)
@@ -1409,14 +1733,9 @@ ProspectiveJoinStatus RayTracingSceneResources::BuildGeometryJoin(const Candidat
             row.objectID = identity.objectID;
             row.meshReference = identity.meshReference;
             row.denseSlot = dense;
-            const auto& authored = runtime.GetFileScene().GetDocument().objects;
-            for(std::size_t index = 0; index < authored.size(); ++index)
+            if(const auto found = authoredIndices.find(identity.objectID); found != authoredIndices.end())
             {
-                if(authored[index].id == identity.objectID)
-                {
-                    row.authoredIndex = index;
-                    break;
-                }
+                row.authoredIndex = found->second;
             }
             if(row.authoredIndex == SIZE_MAX)
             {

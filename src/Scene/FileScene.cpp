@@ -1,5 +1,6 @@
 #include "Scene/FileScene.h"
 
+#include "Scene/SceneDocumentCache.h"
 #include "Scene/SceneSerializer.h"
 
 #include <utility>
@@ -45,14 +46,16 @@ bool FileScene::Open(
     const std::filesystem::path& path,
     std::string* errorMessage)
 {
-    SceneDocument loaded;
+    // W6.0: parsed once per file content (the open request has usually parsed the same bytes); the scene edits its own copy.
+    SceneDocumentCache::Parsed loaded;
 
-    if (!LoadSceneDocument(path, loaded, errorMessage) || !ValidateSceneKindOpenable(loaded, errorMessage))
+    if (!SceneDocumentCache::Load(path, loaded, errorMessage, "FileScene open") ||
+        !ValidateSceneKindOpenable(*loaded.document, errorMessage))
     {
         return false;
     }
 
-    m_document = std::move(loaded);
+    m_document = SceneDocumentCache::Copy(*loaded.document);
     m_path = path;
 
     m_hasDocument = true;

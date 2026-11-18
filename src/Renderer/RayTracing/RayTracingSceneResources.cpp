@@ -1558,7 +1558,7 @@ bool RayTracingSceneResources::ValidateMaterialBindings(const Scene& scene) cons
         }
 
         const auto& current = object.mesh->GetMetadata();
-        const auto& original = m_membership->slotGeometry.at(object.mesh);
+        const auto& original = *m_membership->slotGeometry.at(object.mesh);
 
         if(current.materialSlots != original.materialSlots ||
             (current.materialSlots.size() > 1 && current.submeshes != original.submeshes))
@@ -1788,8 +1788,8 @@ bool RayTracingSceneResources::BuildMaterialSlotData(MembershipSnapshot& snapsho
     std::vector<unsigned int>& triangles, std::vector<unsigned int>& materials)
 {
     std::unordered_map<const Mesh*, unsigned int> triangleOffsets;
-    snapshot.materialBindings = objects;
-    snapshot.slotMaterialIndices.resize(objects.size());
+    snapshot.materialBindings.Assign(objects);
+    snapshot.slotMaterialIndices.Resize(objects.size());
 
     for(size_t i = 0; i < objects.size(); ++i)
     {
@@ -1802,12 +1802,19 @@ bool RayTracingSceneResources::BuildMaterialSlotData(MembershipSnapshot& snapsho
 
         const auto& metadata = object.mesh->GetMetadata();
         const size_t indexCount = object.mesh->IsIndexed() ? object.mesh->GetIndexCount() : object.mesh->GetVertexCount();
-        std::string error;
 
-        if(!ValidateMeshMetadata(metadata, indexCount, error))
+        // W6.2: validated and copied once per unique mesh; every object of the mesh shares the copy.
+        if(!snapshot.slotGeometry.contains(object.mesh))
         {
-            Log::Error("Invalid DXR mesh slot metadata: " + error);
-            return false;
+            std::string error;
+
+            if(!ValidateMeshMetadata(metadata, indexCount, error))
+            {
+                Log::Error("Invalid DXR mesh slot metadata: " + error);
+                return false;
+            }
+
+            snapshot.slotGeometry.emplace(object.mesh, std::make_shared<const MeshMetadata>(metadata));
         }
 
         if(metadata.materialSlots.size() > UINT_MAX - materials.size())
@@ -1819,7 +1826,7 @@ bool RayTracingSceneResources::BuildMaterialSlotData(MembershipSnapshot& snapsho
         auto& instance = instances[i];
         instance.slotMaterialOffset = static_cast<unsigned int>(materials.size());
         instance.triangleSlotBufferIndex = UINT_MAX;
-        snapshot.slotGeometry.emplace(object.mesh, metadata);
+        auto& slotIndices = snapshot.slotMaterialIndices.Mutable(i);
 
         for(const auto& slot : metadata.materialSlots)
         {
@@ -1832,7 +1839,7 @@ bool RayTracingSceneResources::BuildMaterialSlotData(MembershipSnapshot& snapsho
             }
 
             materials.push_back(material->gpuIndex);
-            snapshot.slotMaterialIndices[i].push_back(material->gpuIndex);
+            slotIndices.push_back(material->gpuIndex);
         }
 
         instance.materialIndex = materials[instance.slotMaterialOffset];
@@ -1870,6 +1877,9 @@ bool RayTracingSceneResources::BuildMaterialSlotData(MembershipSnapshot& snapsho
         instance.triangleSlotBufferIndex = 0; // Patched after successful GPU allocation.
     }
 
+    // W6.2: kept so a later candidate extends the triangle table instead of rebuilding it.
+    snapshot.triangleTable = triangles;
+    snapshot.triangleOffsets = std::move(triangleOffsets);
     return !materials.empty();
 }
 
@@ -1886,6 +1896,53 @@ void RayTracingSceneResources::PatchTableDescriptors(const MembershipSnapshot& s
         }
     }
 
+}
+
+bool RayTracingSceneResources::BuildInstanceRecord(const RenderObject& renderObject, RayTracingInstanceData& record)
+{
+    if (!renderObject.mesh || !renderObject.material)
+    {
+        return false;
+    }
+
+    unsigned int normalOffset = UINT_MAX;
+    unsigned int uvOffset = UINT_MAX;
+    unsigned int tangentOffset = UINT_MAX;
+
+    for (const VertexAttribute& attribute : renderObject.mesh->GetVertexLayout().GetAttributes())
+    {
+        if (std::strcmp(attribute.semantic, "NORMAL") == 0 && attribute.semanticIndex == 0 &&
+            attribute.type == VertexAttributeType::Float3)
+        {
+            normalOffset = attribute.offset;
+        }
+
+        if (std::strcmp(attribute.semantic, "TEXCOORD") == 0 && attribute.semanticIndex == 0 &&
+            attribute.type == VertexAttributeType::Float2)
+        {
+            uvOffset = attribute.offset;
+        }
+
+        if (std::strcmp(attribute.semantic, "TANGENT") == 0 && attribute.semanticIndex == 0 &&
+            attribute.type == VertexAttributeType::Float4)
+        {
+            tangentOffset = attribute.offset;
+        }
+    }
+
+    if (normalOffset == UINT_MAX || uvOffset == UINT_MAX)
+    {
+        return false;
+    }
+
+    record.vertexBufferIndex = renderObject.mesh->GetVertexBufferDescriptorIndex();
+    record.indexBufferIndex = renderObject.mesh->IsIndexed() ? renderObject.mesh->GetIndexBufferDescriptorIndex() : UINT_MAX;
+    record.vertexStride = renderObject.mesh->GetVertexStride();
+    record.normalOffset = normalOffset;
+    record.uvOffset = uvOffset;
+    record.tangentOffset = tangentOffset;
+    record.indexed = renderObject.mesh->IsIndexed() ? 1u : 0u;
+    return true;
 }
 
 bool RayTracingSceneResources::BuildInstanceData(MembershipSnapshot& snapshot,
@@ -1906,76 +1963,18 @@ bool RayTracingSceneResources::BuildInstanceData(MembershipSnapshot& snapshot,
 
         const auto bottomLevelIt = meshIndices.find(renderObject.mesh);
 
-        if (bottomLevelIt == meshIndices.end())
+        if (bottomLevelIt == meshIndices.end() || !BuildInstanceRecord(renderObject, instances[i]))
         {
             return false;
         }
-
-        if (!renderObject.material)
-        {
-            return false;
-        }
-
-        unsigned int normalOffset = UINT_MAX;
-
-        unsigned int uvOffset = UINT_MAX;
-        unsigned int tangentOffset = UINT_MAX;
-
-        for (const VertexAttribute& attribute : renderObject.mesh->GetVertexLayout().GetAttributes())
-        {
-            if (std::strcmp(attribute.semantic, "NORMAL") == 0 && attribute.semanticIndex == 0 &&
-
-                attribute.type == VertexAttributeType::Float3)
-            {
-                normalOffset = attribute.offset;
-            }
-
-            if (std::strcmp(attribute.semantic, "TEXCOORD") == 0 && attribute.semanticIndex == 0 &&
-
-                attribute.type == VertexAttributeType::Float2)
-            {
-                uvOffset = attribute.offset;
-            }
-
-            if (std::strcmp(attribute.semantic, "TANGENT") == 0 && attribute.semanticIndex == 0 &&
-
-                attribute.type == VertexAttributeType::Float4)
-            {
-                tangentOffset = attribute.offset;
-            }
-        }
-
-        if (normalOffset == UINT_MAX || uvOffset == UINT_MAX)
-        {
-            return false;
-        }
-
-        RayTracingInstanceData gpuInstance = instances[i];
-
-        gpuInstance.vertexBufferIndex = renderObject.mesh->GetVertexBufferDescriptorIndex();
-        gpuInstance.indexBufferIndex =
-
-            renderObject.mesh->IsIndexed() ? renderObject.mesh->GetIndexBufferDescriptorIndex() : UINT_MAX;
-        gpuInstance.vertexStride = renderObject.mesh->GetVertexStride();
-        gpuInstance.normalOffset = normalOffset;
-        gpuInstance.uvOffset = uvOffset;
-
-        gpuInstance.tangentOffset = tangentOffset;
-        gpuInstance.indexed = renderObject.mesh->IsIndexed() ? 1u : 0u;
-
-        instances[i] = gpuInstance;
 
         RayTracingInstanceDescription instanceDescription{};
         instanceDescription.transform = renderObject.GetPresentationTransform().currentModel;
         instanceDescription.instanceID = i;
         instanceDescription.mask = 0xFF;
-
         instanceDescription.bottomLevelIndex = bottomLevelIt->second;
 
-        const std::size_t instanceIndex = snapshot.instances.size();
-
-        snapshot.renderObjectToInstance[i] = instanceIndex;
-
+        snapshot.renderObjectToInstance[i] = snapshot.instances.size();
         snapshot.instances.push_back(instanceDescription);
     }
 

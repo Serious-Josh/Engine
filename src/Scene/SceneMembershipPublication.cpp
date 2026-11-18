@@ -3,9 +3,14 @@
 #include "Scene/FileSceneAssetCatalog.h"
 #include "Scene/SceneDocumentAdapter.h"
 #include "Renderer/Renderer.h"
+#include "Scene/SceneHierarchy.h"
 #include <algorithm>
 #include <new>
 #include <stdexcept>
+
+// Every scene the Engine admits must fit one renderer membership candidate; otherwise a valid scene could load and render nothing.
+static_assert(RayTracingSceneResources::MaxCandidateObjects >= SceneHierarchy::Policy{}.maxObjects,
+    "Renderer membership candidates must admit the largest permitted scene");
 
 struct SceneMembershipPublication::Prepared
 {
@@ -299,8 +304,13 @@ SceneMembershipPublication::Result SceneMembershipPublication::PublishAtBoundary
         p.target->GetScene().SetLightingSettings(active->GetScene().GetLightingSettings());
         Result success{Status::Ready,"Membership published."};
         // All final validation has passed. This allocates only optional advisory evidence.
-        r.m_rayTracingScene.PrepareProspectiveJoin(p.gpu, *p.target, catalog,
-            r.m_commandContext, r.m_sceneResourceLifetime);
+        // W6.1: only when a consumer reads accepted geometry (the handoff below then carries nothing).
+        if(r.WantsAcceptedTLASGeometry())
+        {
+            r.m_rayTracingScene.PrepareProspectiveJoin(p.gpu, *p.target, catalog,
+                r.m_commandContext, r.m_sceneResourceLifetime);
+        }
+
         auto geometryHandoff = r.m_rayTracingScene.PreparePublicationHandoff(p.gpu, *p.target, this,
             RayTracingSceneResources::PublicationKind::Membership);
         // Allocation-free exclusive commit: no frame observes mixed CPU/GPU order.

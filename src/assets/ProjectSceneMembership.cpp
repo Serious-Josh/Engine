@@ -2,6 +2,7 @@
 
 #include "Project/ProjectPaths.h"
 #include "Scene/SceneEnvironmentResolution.h"
+#include "Scene/SceneDocumentCache.h"
 #include "Scene/SceneFileCreation.h"
 #include "Scene/SceneSerializer.h"
 #include "assets/AssetReconciliationTransaction.h"
@@ -35,7 +36,15 @@ namespace
         }
     }
 
-    // A scene read for an operation: its bytes are the transaction's expected original.
+    // A scene read for inspection: its exact bytes and the shared document they parse to (W6.0: parsed once per content).
+    struct Read
+    {
+        fs::path relativePath;
+        std::string bytes;
+        std::shared_ptr<const SceneDocument> document;
+    };
+
+    // A scene read for an operation that changes it: its bytes are the transaction's expected original.
     struct Loaded
     {
         fs::path relativePath;
@@ -43,19 +52,28 @@ namespace
         SceneDocument document;
     };
 
-    Loaded Load(const ProjectPaths& paths, const ProjectAssetRegistry& registry, const AssetID& id)
+    Read ReadScene(const ProjectPaths& paths, const ProjectAssetRegistry& registry, const AssetID& id)
     {
         const auto* record = registry.Find(id);
         Require(record && record->type == AssetType::Scene, "Scene " + id.ToReference() + " is not a registered scene.");
-        Loaded loaded;
-        loaded.relativePath = record->relativePath;
+        Read read;
+        read.relativePath = record->relativePath;
         std::string error;
-        Require(AssetReconciliationTransaction::ReadExisting(paths, record->relativePath, loaded.bytes, error),
+        Require(AssetReconciliationTransaction::ReadExisting(paths, record->relativePath, read.bytes, error),
             "Cannot read " + UTF8(record->relativePath) + ": " + error);
-        Require(ParseSceneDocument(loaded.bytes, loaded.document, &error), UTF8(record->relativePath) + " is not a valid scene: " + error);
-        Require(loaded.document.id == id.ToString(), UTF8(record->relativePath) + " no longer has the identity " + id.ToString() +
+        SceneDocumentCache::Parsed parsed;
+        Require(SceneDocumentCache::Parse(paths.GetRoot() / record->relativePath, read.bytes, parsed, &error, "ProjectSceneMembership"),
+            UTF8(record->relativePath) + " is not a valid scene: " + error);
+        read.document = std::move(parsed.document);
+        Require(read.document->id == id.ToString(), UTF8(record->relativePath) + " no longer has the identity " + id.ToString() +
             " its registry record names.");
-        return loaded;
+        return read;
+    }
+
+    Loaded Load(const ProjectPaths& paths, const ProjectAssetRegistry& registry, const AssetID& id)
+    {
+        Read read = ReadScene(paths, registry, id);
+        return {std::move(read.relativePath), std::move(read.bytes), SceneDocumentCache::Copy(*read.document)};
     }
 
     std::string Describe(const SceneDocument& document, const fs::path& path)
@@ -65,17 +83,17 @@ namespace
 
     // Every World of the project, read to check that a Local Level is listed nowhere else. Any unreadable scene makes the
     // check impossible, so it refuses the operation.
-    std::vector<Loaded> LoadWorlds(const ProjectPaths& paths, const ProjectAssetRegistry& registry)
+    std::vector<Read> LoadWorlds(const ProjectPaths& paths, const ProjectAssetRegistry& registry)
     {
-        std::vector<Loaded> worlds;
+        std::vector<Read> worlds;
 
         for(const auto& record : registry.GetAssets(AssetType::Scene))
         {
-            Loaded loaded = Load(paths, registry, record.id);
+            Read read = ReadScene(paths, registry, record.id);
 
-            if(loaded.document.kind == SceneKind::World)
+            if(read.document->kind == SceneKind::World)
             {
-                worlds.push_back(std::move(loaded));
+                worlds.push_back(std::move(read));
             }
         }
 
@@ -83,7 +101,7 @@ namespace
     }
 
     // An unassigned Local Level that no World lists.
-    void RequireUnassignedLocal(const Loaded& local, const std::vector<Loaded>& worlds)
+    void RequireUnassignedLocal(const Loaded& local, const std::vector<Read>& worlds)
     {
         Require(local.document.kind == SceneKind::Local, Describe(local.document, local.relativePath) + " is a World, not a Local Level.");
         Require(local.document.owningWorld.empty(), Describe(local.document, local.relativePath) + " already belongs to World " +
@@ -91,9 +109,9 @@ namespace
 
         for(const auto& world : worlds)
         {
-            for(const auto& member : world.document.members)
+            for(const auto& member : world.document->members)
             {
-                Require(member.level != local.document.id, "World " + Describe(world.document, world.relativePath) + " lists " +
+                Require(member.level != local.document.id, "World " + Describe(*world.document, world.relativePath) + " lists " +
                     Describe(local.document, local.relativePath) + ", which does not name it as its owner; resolve the conflict first.");
             }
         }
@@ -110,15 +128,15 @@ namespace
     }
 
     // The World and Local Level agree in both directions.
-    void RequireAgreement(const Loaded& world, const Loaded& local)
+    void RequireAgreement(const Loaded& world, const SceneDocument& local, const fs::path& localPath)
     {
         Require(world.document.kind == SceneKind::World, Describe(world.document, world.relativePath) + " is not a World.");
-        Require(local.document.kind == SceneKind::Local, Describe(local.document, local.relativePath) + " is not a Local Level.");
-        const bool listed = FindMember(world.document, local.document.id) != nullptr;
-        const bool owned = local.document.owningWorld == world.document.id;
+        Require(local.kind == SceneKind::Local, Describe(local, localPath) + " is not a Local Level.");
+        const bool listed = FindMember(world.document, local.id) != nullptr;
+        const bool owned = local.owningWorld == world.document.id;
         Require(listed && owned, "Membership disagrees: World " + Describe(world.document, world.relativePath) +
-            (listed ? " lists " : " does not list ") + Describe(local.document, local.relativePath) + ", whose owner is " +
-            (local.document.owningWorld.empty() ? std::string("none") : local.document.owningWorld) + ". Nothing was changed.");
+            (listed ? " lists " : " does not list ") + Describe(local, localPath) + ", whose owner is " +
+            (local.owningWorld.empty() ? std::string("none") : local.owningWorld) + ". Nothing was changed.");
     }
 
     void RequireNewScenePath(const ProjectPaths& paths, const ProjectAssetRegistry& registry, const fs::path& relative)
@@ -146,13 +164,13 @@ namespace
         return document;
     }
 
-    std::string Serialize(const SceneDocument& document)
+    // The bytes to write, verified by reading them back; the read-back parse is kept for the document cache.
+    std::string Serialize(const SceneDocument& document, SceneDocument& readBack, std::uint64_t& readBackSchema)
     {
         std::string bytes;
         std::string error;
         Require(SerializeSceneDocument(document, bytes, &error), "Cannot write '" + document.name + "': " + error);
-        SceneDocument readBack;
-        Require(ParseSceneDocument(bytes, readBack, &error), "'" + document.name + "' does not read back: " + error);
+        Require(ParseSceneDocument(bytes, readBack, &error, &readBackSchema), "'" + document.name + "' does not read back: " + error);
         return bytes;
     }
 
@@ -205,12 +223,15 @@ namespace
         }
 
         std::vector<AssetReconciliationTransaction::Replacement> replacements;
+        std::vector<SceneDocument> readBacks(changes.size());
+        std::vector<std::uint64_t> readBackSchemas(changes.size());
 
-        for(const auto& change : changes)
+        for(std::size_t index = 0; index < changes.size(); ++index)
         {
+            const auto& change = changes[index];
             AssetReconciliationTransaction::Replacement replacement;
             replacement.relativePath = change.relativePath;
-            replacement.bytes = Serialize(change.document);
+            replacement.bytes = Serialize(change.document, readBacks[index], readBackSchemas[index]);
             replacement.expectedOriginal = change.expectedOriginal;
             replacement.create = change.create;
             replacements.push_back(std::move(replacement));
@@ -230,6 +251,13 @@ namespace
         std::string error;
         Require(AssetReconciliationTransaction::Commit(paths, replacements, error), "The change was not committed: " + error);
         registry = std::move(candidate);
+
+        // The written bytes are on disk; their verified parse serves the next reader (a later edit on disk is different content).
+        for(std::size_t index = 0; index < changes.size(); ++index)
+        {
+            SceneDocumentCache::Seed(paths.GetRoot() / replacements[index].relativePath, replacements[index].bytes,
+                std::move(readBacks[index]), readBackSchemas[index]);
+        }
     }
 
     void Register(ProjectAssetRegistry& candidate, const SceneDocument& document, const fs::path& relative)
@@ -524,7 +552,7 @@ bool UnassignLocal(const ProjectPaths& paths, ProjectAssetRegistry& registry, co
         Require(worldID && registry.Find(*worldID), Describe(local.document, local.relativePath) + " names World " +
             local.document.owningWorld + ", which is not a registered scene; nothing was changed.");
         Loaded world = Load(paths, registry, *worldID);
-        RequireAgreement(world, local);
+        RequireAgreement(world, local.document, local.relativePath);
         Require(world.document.members.size() > 1, "'" + local.document.name + "' is the only Local Level of World '" +
             world.document.name + "'; a World must keep at least one. Assign another Local Level first.");
         // W3: keep the effective environment: store it in the Local Level and override every group, so it looks and simulates the
@@ -554,12 +582,12 @@ bool UpdatePlacement(const ProjectPaths& paths, ProjectAssetRegistry& registry, 
     return Run(error, [&]
     {
         Loaded world = Load(paths, registry, worldID);
-        Loaded local = Load(paths, registry, localID);
-        RequireAgreement(world, local);
+        const Read local = ReadScene(paths, registry, localID);
+        RequireAgreement(world, *local.document, local.relativePath);
 
         for(auto& member : world.document.members)
         {
-            if(member.level == local.document.id)
+            if(member.level == local.document->id)
             {
                 member.placement = placement;
             }
@@ -579,11 +607,11 @@ bool DuplicateLocal(const ProjectPaths& paths, ProjectAssetRegistry& registry, c
     result = {};
     return Run(error, [&]
     {
-        const Loaded source = Load(paths, registry, localID);
-        Require(source.document.kind == SceneKind::Local, Describe(source.document, source.relativePath) +
+        const Read source = ReadScene(paths, registry, localID);
+        Require(source.document->kind == SceneKind::Local, Describe(*source.document, source.relativePath) +
             " is a World; only Local Levels can be duplicated.");
-        CommitIndependentLocal(paths, registry, source.document,
-            duplicate.name.empty() ? source.document.name + " (Copy)" : duplicate.name, duplicate.relativePath, result);
+        CommitIndependentLocal(paths, registry, *source.document,
+            duplicate.name.empty() ? source.document->name + " (Copy)" : duplicate.name, duplicate.relativePath, result);
     });
 }
 
@@ -609,9 +637,10 @@ bool ReadScenes(const ProjectPaths& paths, const ProjectAssetRegistry& registry,
     {
         try
         {
-            const Loaded loaded = Load(paths, registry, record.id);
-            scenes.push_back({record.id, record.relativePath, loaded.document.kind, loaded.document.name,
-                loaded.document.owningWorld, loaded.document.members, ResolveSceneEnvironment(loaded.document, nullptr)});
+            const Read read = ReadScene(paths, registry, record.id);
+            const SceneDocument& document = *read.document;
+            scenes.push_back({record.id, record.relativePath, document.kind, document.name, document.owningWorld, document.members,
+                ResolveSceneEnvironment(document, nullptr)});
         }
         catch(const std::exception& exception)
         {

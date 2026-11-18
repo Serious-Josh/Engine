@@ -1,7 +1,7 @@
 #include "assets/ProjectCompositeWorld.h"
 
 #include "Project/ProjectPaths.h"
-#include "Scene/SceneSerializer.h"
+#include "Scene/SceneDocumentCache.h"
 #include "assets/AssetReconciliationTransaction.h"
 #include "assets/ProjectAssetRegistry.h"
 #include "assets/ProjectSceneMembership.h"
@@ -20,15 +20,18 @@ namespace ProjectCompositeWorld
             std::string& error)
         {
             std::string loadError;
+            SceneDocumentCache::Parsed parsed;
 
             // The exact bytes are kept as the save baseline: Save hands them to the transaction as the expected original, so a file
-            // changed on disk since it was read is never overwritten.
+            // changed on disk since it was read is never overwritten. The document is parsed once per content (W6.0) and copied,
+            // because composition edits it.
             if(!AssetReconciliationTransaction::ReadExisting(paths, relativePath, source.bytes, loadError) ||
-                !ParseSceneDocument(source.bytes, source.document, &loadError))
+                !SceneDocumentCache::Parse(paths.GetRoot() / relativePath, source.bytes, parsed, &loadError, "ProjectCompositeWorld"))
             {
                 return Fail(error, "Cannot read " + relativePath.generic_string() + ": " + loadError);
             }
 
+            source.document = SceneDocumentCache::Copy(*parsed.document);
             source.relativePath = relativePath;
             return true;
         }

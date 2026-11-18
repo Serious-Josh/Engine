@@ -41,6 +41,8 @@
 #include <map>
 #include <optional>
 #include <string>
+#include <string_view>
+#include <unordered_map>
 #include <vector>
 #include <variant>
 #include <memory>
@@ -725,6 +727,16 @@ private:
     bool m_compositePreview = false;
     std::filesystem::path m_compositeRebuildPath;
     bool SelectionIncludesLevelRoot(const IDemoScene& scene) const;
+
+    // W5 refinement: each Local Level of a World is in Object Edit (default) or Level Edit mode. Editor-only state, never
+    // serialized. In Level Edit the Local is edited as one placement: selecting any of its entities (viewport, marquee or
+    // hierarchy) selects its level node, whose transform is the placement (translation and rotation only).
+    std::unordered_map<std::string, bool> m_levelEditModes;
+    bool IsLevelEditMode(std::string_view levelID) const;
+    // The object a selection of objectID should target: the level node when objectID belongs to a Local in Level Edit.
+    std::string ResolveLevelEditSelection(const FileBackedDemoScene& owner, const std::string& objectID) const;
+    // Changes no transform and records no history. Entering Level Edit moves any selected entity of that Local to its node.
+    void SetLevelEditMode(const IDemoScene& scene, const std::string& levelID, bool levelEdit);
     // The selected object's inspection (metadata and document), read once per frame and shared by every Inspector panel.
     // Reading it validates and captures the whole scene; each component panel used to repeat that every frame. The cached read
     // is discarded when the frame, the selection, the runtime or session, the scene structure or the history changes, so any
@@ -1001,6 +1013,20 @@ private:
     // Why the scene's acoustic geometry cannot be read yet, or nullopt.
     std::optional<std::string> AcousticGeometryNotReady(const IDemoScene& scene) const;
     SceneHierarchyPanel m_hierarchyPanel;
+
+    // The Hierarchy's retained inputs. The runtime returns the same immutable snapshot until the scene's storage, document or
+    // bindings change; holding it here keeps its address unique, so a new address is a new generation for the panel. The
+    // object icons are derived from the same document state and rebuilt only with it (or when the composite World changes).
+    struct HierarchyView
+    {
+        std::shared_ptr<const SceneHierarchySnapshot> snapshot;
+        std::uint64_t generation = 0;
+        std::uint64_t iconGeneration = 0;
+        const void* iconComposite = nullptr;
+        std::unordered_map<std::string_view, EditorIcon> icons;
+    };
+
+    HierarchyView m_hierarchyView;
 
     InspectorPanel m_inspectorPanel;
 

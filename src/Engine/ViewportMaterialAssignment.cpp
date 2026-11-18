@@ -1,5 +1,8 @@
 #include "Engine/Engine.h"
 #include "DemoContent/FileBackedDemoScene.h"
+#include "Core/Log.h"
+
+#include <cstdlib>
 
 void Engine::ReleaseViewportMaterialPreparation() noexcept
 {
@@ -178,4 +181,276 @@ void Engine::ProcessViewportMaterialAssignment(IDemoScene& scene)
     }
     catch(const std::exception& exception) { CancelViewportMaterialAssignment(exception.what()); }
     catch(...) { CancelViewportMaterialAssignment("Unexpected material publication failure."); }
+}
+
+// ---- W6 finalization: incremental Inspector material assignment ----------------------------------------------------------
+
+bool Engine::BeginIncrementalMaterialAssignment(const MaterialAssignmentRequest& request)
+{
+    // ENGINE_W6_RECONSTRUCT_MATERIALS=1 keeps every assignment on the reconstruction path (comparison and rollback).
+    static const bool reconstructOnly = std::getenv("ENGINE_W6_RECONSTRUCT_MATERIALS") != nullptr;
+    auto* owner = dynamic_cast<FileBackedDemoScene*>(m_demoSceneManager.TryGetActiveScene());
+
+    if(reconstructOnly || !owner || owner->IsArchiveActivation() || m_pendingViewportMaterialBinding || !owner->m_registry ||
+        m_pendingEditorSceneOperation || m_demoSceneManager.HasPendingSceneChange())
+    {
+        return false;
+    }
+
+    if(request.requireEditorSelection && m_editor.GetSelectedObject() != request.selection.runtimeIndex)
+    {
+        return false; // The reconstruction path reports the changed selection.
+    }
+
+    const auto target = owner->GetObjectMetadata(request.selection.objectID);
+
+    if(!target || !owner->GetScene().GetRenderObjects()[target->runtimeIndex].mesh)
+    {
+        return false; // Pending objects keep their existing authored-only path.
+    }
+
+    PendingIncrementalMaterial pending;
+    pending.request = request;
+    pending.started = std::chrono::steady_clock::now();
+    const std::string reference = request.slotMaterial ? request.slotMaterial->ToReference() : request.reference;
+
+    if(const auto id = AssetID::ParseReference(reference))
+    {
+        pending.material = *id;
+    }
+    else if(!owner->m_assets.FindPublishedMaterial(reference, m_renderer))
+    {
+        return false; // A built-in material outside the renderer's table.
+    }
+
+    m_pendingIncrementalMaterial = std::move(pending);
+    return true;
+}
+
+void Engine::ReleaseIncrementalMaterialPreparation() noexcept
+{
+    if(!m_pendingIncrementalMaterial)
+    {
+        return;
+    }
+
+    auto& pending = *m_pendingIncrementalMaterial;
+
+    if(pending.admissionStarted)
+    {
+        m_renderer.CancelMaterialAdmission();
+    }
+
+    pending.admissionStarted = false;
+
+    if(m_materialPreparation && pending.preparationTicket)
+    {
+        m_materialPreparation->Cancel(pending.preparationTicket);
+    }
+
+    pending.preparationTicket = 0;
+    pending.candidate.reset();
+}
+
+void Engine::FallBackFromIncrementalMaterial(std::string_view reason)
+{
+    m_incrementalMaterialPublication.Cancel();
+    ReleaseIncrementalMaterialPreparation();
+    auto request = std::move(m_pendingIncrementalMaterial->request);
+    m_pendingIncrementalMaterial.reset();
+    Log::Info("Incremental material assignment declined (" + std::string(reason) + "); rebuilding scene resources instead.");
+
+    if(m_pendingMaterialAssignment)
+    {
+        m_editor.OnMaterialAssignmentCompleted(request.selection, false, "A newer material assignment superseded this one.");
+        return;
+    }
+
+    request.reconstruct = true;
+    m_pendingMaterialAssignment = std::move(request);
+}
+
+void Engine::ProcessIncrementalMaterialAssignment(IDemoScene& scene)
+{
+    using Status = SceneMaterialBindingPublication::Status;
+    using Admission = MaterialAdmissionStatus;
+    using Preparation = ProjectMaterialPreparationService::Status;
+
+    if(!m_pendingIncrementalMaterial)
+    {
+        return;
+    }
+
+    auto& pending = *m_pendingIncrementalMaterial;
+    ++pending.frames;
+    auto* owner = dynamic_cast<FileBackedDemoScene*>(&scene);
+    const auto complete = [&](bool succeeded, std::string message)
+    {
+        m_incrementalMaterialPublication.Cancel();
+        ReleaseIncrementalMaterialPreparation();
+        const auto selection = pending.request.selection;
+        m_pendingIncrementalMaterial.reset();
+        m_editor.OnMaterialAssignmentCompleted(selection, succeeded, std::move(message));
+    };
+
+    try
+    {
+        if(!owner || owner->GetRuntimeIdentity() != pending.request.selection.runtimeIdentity ||
+            m_demoSceneManager.HasPendingSceneChange() || m_pendingEditorSceneOperation)
+        {
+            complete(false, "Scene changed or another operation started before the material was published.");
+            return;
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+
+        if(now - pending.started > std::chrono::seconds(10))
+        {
+            FallBackFromIncrementalMaterial("renderer busy for ten seconds");
+            return;
+        }
+
+        if(now < pending.retryAfter)
+        {
+            return;
+        }
+
+        const auto waitBriefly = [&]
+        {
+            pending.retryAfter = now + std::chrono::milliseconds(100);
+        };
+
+        // 1. A material not yet in the renderer's table is prepared and admitted (table growth without reconstruction).
+        if(pending.material && !owner->IsAssignmentMaterialAdmitted(pending.material->ToReference(), m_renderer))
+        {
+            if(!m_materialPreparation)
+            {
+                m_materialPreparation = std::make_unique<ProjectMaterialPreparationService>(m_texturePreparation);
+            }
+
+            const ProjectPaths paths(std::filesystem::canonical(owner->GetProjectRoot()));
+            std::string error;
+
+            if(!pending.preparationTicket)
+            {
+                const auto status = m_materialPreparation->Request(paths, *owner->m_registry, *pending.material,
+                    owner->GetRuntimeIdentity(), pending.preparationTicket, error);
+
+                if(status == Preparation::Retry)
+                {
+                    waitBriefly();
+                    return;
+                }
+
+                if(status != Preparation::Pending)
+                {
+                    FallBackFromIncrementalMaterial(error);
+                    return;
+                }
+            }
+
+            if(!pending.candidate)
+            {
+                auto result = m_materialPreparation->Poll(pending.preparationTicket, paths, *owner->m_registry,
+                    owner->GetRuntimeIdentity());
+
+                if(result.status == Preparation::Pending || result.status == Preparation::Retry)
+                {
+                    return;
+                }
+
+                if(result.status != Preparation::Ready)
+                {
+                    FallBackFromIncrementalMaterial(result.message);
+                    return;
+                }
+
+                pending.candidate = std::move(result.candidate);
+            }
+
+            pending.admissionStarted = true;
+            const auto admission = m_renderer.AdvanceMaterialAdmission(*m_materialPreparation, pending.candidate, owner->m_assets,
+                paths, *owner->m_registry, *owner->m_runtime);
+
+            if(admission.status == Admission::Pending)
+            {
+                return;
+            }
+
+            if(admission.status == Admission::Retry)
+            {
+                waitBriefly();
+                return;
+            }
+
+            if(admission.status != Admission::Ready || !admission.material || !m_renderer.HasPublishedMaterial(*admission.material))
+            {
+                FallBackFromIncrementalMaterial(admission.message);
+                return;
+            }
+
+            ReleaseIncrementalMaterialPreparation(); // Admitted: release the CPU source pins before binding.
+        }
+
+        // 2. Prepare the binding (fallback or one slot), then 3. publish it at this boundary.
+        SceneMaterialBindingPublication::Result result;
+
+        if(!pending.prepared)
+        {
+            const auto start = std::chrono::steady_clock::now();
+
+            if(pending.request.slotID)
+            {
+                auto overrides = pending.request.selection.materialSlotBindings;
+                overrides[*pending.request.slotID] = pending.request.slotMaterial->ToReference();
+                result = m_incrementalMaterialPublication.Prepare(m_renderer, *owner->m_runtime, owner->m_assets,
+                    pending.request.selection, overrides);
+            }
+            else
+            {
+                result = m_incrementalMaterialPublication.PrepareFallback(m_renderer, *owner->m_runtime, owner->m_assets,
+                    pending.request.selection, pending.request.reference);
+            }
+
+            pending.prepareMilliseconds += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+
+            if(result.status == Status::Retry)
+            {
+                return;
+            }
+
+            if(result.status != Status::Ready)
+            {
+                FallBackFromIncrementalMaterial(result.message);
+                return;
+            }
+
+            pending.prepared = true;
+        }
+
+        const auto publishStart = std::chrono::steady_clock::now();
+        result = m_incrementalMaterialPublication.PublishAtBoundary(m_renderer, *owner->m_runtime, owner->m_assets);
+        const double publishMilliseconds = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - publishStart).count();
+
+        if(result.status == Status::Retry)
+        {
+            return;
+        }
+
+        if(result.status != Status::Ready)
+        {
+            FallBackFromIncrementalMaterial(result.message);
+            return;
+        }
+
+        Log::Info("Incremental material assignment published: prepare " + std::to_string(pending.prepareMilliseconds) +
+            " ms, publish " + std::to_string(publishMilliseconds) + " ms, " + std::to_string(pending.frames) +
+            " frames; no scene resources rebuilt.");
+        m_editor.InvalidateSceneHistoryRedoAfterEdit();
+        complete(true, result.published ? "Material updated; save the scene to persist it." : "Material is already assigned.");
+    }
+    catch(const std::exception& exception)
+    {
+        FallBackFromIncrementalMaterial(exception.what());
+    }
 }

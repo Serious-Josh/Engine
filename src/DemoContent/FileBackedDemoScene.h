@@ -124,6 +124,8 @@ public:
         const std::optional<MaterialAssetData>& parameters, Renderer& renderer, std::string& error);
     const std::string& GetDisplayName() const noexcept;
     bool BuildHierarchySnapshot(SceneHierarchySnapshot& snapshot, std::string* errorMessage = nullptr) const;
+    // The runtime's retained snapshot (see FileSceneRuntime::GetHierarchySnapshot); null with the reason when unavailable.
+    std::shared_ptr<const SceneHierarchySnapshot> GetHierarchySnapshot(std::string* errorMessage = nullptr) const;
     bool ReorderObjects(const SceneObjectOrderIdentity& identity,
         const std::vector<std::string>& expectedOrder, const std::vector<std::string>& replacementOrder,
         std::string* errorMessage = nullptr);

@@ -1,6 +1,7 @@
 #include "Engine/Engine.h"
 #include "Core/Log.h"
 #include "DemoContent/FileBackedDemoScene.h"
+#include "Scene/SceneDocumentCache.h"
 #include "Scene/SceneSerializer.h"
 
 // Shared project settings (PR.9): the Build Game startup scene stored in the .engineproj manifest.
@@ -138,11 +139,11 @@ bool Engine::SetProjectStartupScene(const std::filesystem::path& scene, std::str
     {
         // The same containment and document validation as File > Open Scene.
         std::filesystem::path resolved;
-        SceneDocument document;
+        SceneDocumentCache::Parsed document;
         std::string reason;
 
         if(!ResolveEditorSceneLocation(scene, true, resolved, reason) ||
-            !LoadSceneDocument(resolved, document, &reason))
+            !SceneDocumentCache::Load(resolved, document, &reason, "Project settings startup scene"))
         {
             message = "Cannot use " + PathText(scene) + " as the game startup scene: " + reason;
             return false;

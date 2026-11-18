@@ -11,6 +11,7 @@
 #include "Project/ProjectPaths.h"
 #include "assets/ProjectAssetResolver.h"
 #include "assets/ProjectAssetRegistry.h"
+#include "Scene/SceneDocumentCache.h"
 #include "Scene/SceneSerializer.h"
 #include "assets/ProjectSceneMembership.h"
 #include <fstream>
@@ -425,6 +426,21 @@ bool FileBackedDemoScene::BuildHierarchySnapshot(
     }
 
     return m_runtime->BuildHierarchySnapshot(snapshot, errorMessage);
+}
+
+std::shared_ptr<const SceneHierarchySnapshot> FileBackedDemoScene::GetHierarchySnapshot(std::string* errorMessage) const
+{
+    if(!m_initialized)
+    {
+        if(errorMessage)
+        {
+            *errorMessage = "Scene hierarchy is unavailable before scene initialization.";
+        }
+
+        return nullptr;
+    }
+
+    return m_runtime->GetHierarchySnapshot(errorMessage);
 }
 
 std::optional<SceneObjectMetadata> FileBackedDemoScene::GetObjectMetadata(
@@ -1287,20 +1303,21 @@ void FileBackedDemoScene::ReadEnvironmentWorld()
         return;
     }
 
-    SceneDocument world;
+    SceneDocumentCache::Parsed world;
     std::string error;
 
-    if(!ParseSceneDocument(bytes, world, &error))
+    if(!SceneDocumentCache::Parse(m_projectRoot / record->relativePath, bytes, world, &error, "Owning World environment"))
     {
         m_environmentWorldProblem = "The owning World " + record->relativePath.generic_string() + " is not a valid scene: " + error;
         return;
     }
 
-    m_worldHasDirectionalLights = std::any_of(world.objects.begin(), world.objects.end(), [](const SceneObjectDocument& object)
+    const auto& objects = world.document->objects;
+    m_worldHasDirectionalLights = std::any_of(objects.begin(), objects.end(), [](const SceneObjectDocument& object)
     {
         return object.light && object.light->type == LightType::Directional;
     });
-    m_environmentWorld = std::move(world);
+    m_environmentWorld = SceneDocumentCache::Copy(*world.document);
 }
 
 bool FileBackedDemoScene::RefreshEnvironmentPreview(bool rereadWorld)

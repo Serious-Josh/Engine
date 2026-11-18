@@ -500,8 +500,13 @@ MeshResidencyPublication::AcceptanceResult MeshResidencyPublication::PublishAtBo
     std::optional<StreamingTelemetry::Scope> detailTiming(std::in_place, StreamingTelemetry::Metric::PublicationHandoffNs);
     // S0.3: one metadata validation for the join and handoff, which only read the runtime; it ends before the commit mutates.
     std::optional<FileSceneRuntime::MetadataValidationPass> metadataPass(std::in_place, std::as_const(runtime));
-    renderer.m_rayTracingScene.PrepareProspectiveJoin(*m_candidate, runtime, catalog,
-        renderer.m_commandContext, renderer.m_sceneResourceLifetime);
+    // W6.1: only when a consumer reads accepted geometry (the handoff below then carries nothing).
+    if (renderer.WantsAcceptedTLASGeometry())
+    {
+        renderer.m_rayTracingScene.PrepareProspectiveJoin(*m_candidate, runtime, catalog,
+            renderer.m_commandContext, renderer.m_sceneResourceLifetime);
+    }
+
     auto geometryHandoff = renderer.m_rayTracingScene.PreparePublicationHandoff(*m_candidate, runtime, this,
         RayTracingSceneResources::PublicationKind::Residency);
     metadataPass.reset();
