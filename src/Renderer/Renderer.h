@@ -29,6 +29,7 @@
 #include "RendererStatistics.h"
 #include "SceneLightingEpoch.h"
 #include "RadianceCache/RadianceCacheD6.h"
+#include "Sharc/SharcCache.h"
 #include "ResourceUploader.h"
 #include "SwapChain.h"
 #include "EnvironmentMap.h"
@@ -2106,6 +2107,49 @@ private:
     std::optional<AirMistRenderRequest> m_lastAirMistRequestForTesting;
 
     void UpdateSharcStatus(unsigned int frameSlot);
+
+    // NVIDIA SHARC Checkpoint A (Documentation/Rendering/NVIDIA_SHARC_Integration_A.md): the cache, its allocation state
+    // and its validity rules. Only one of the two caches has resources at a time.
+    struct NvidiaSharcSemantics
+    {
+        std::uint64_t sceneResourceLifetime = 0;
+        unsigned int environmentTextureIndex = UINT_MAX;
+        unsigned int environmentConditionalCDFIndex = UINT_MAX;
+        std::uint32_t maxPathDepth = 0;
+        std::uint32_t russianRouletteDepth = 0;
+        PathTraceRadianceCacheImplementation implementation = PathTraceRadianceCacheImplementation::Nvidia;
+
+        bool operator==(const NvidiaSharcSemantics&) const = default;
+    };
+
+    bool NvidiaSharcSelected() const noexcept
+    {
+        return m_sharcSettings.enabled && m_sharcSettings.implementation == SharcImplementation::Nvidia;
+    }
+
+    // Why NVIDIA SHARC cannot run here (capabilities, deployed headers), checked once; empty when it can.
+    const std::string& NvidiaSharcCapabilityFailure();
+    void UpdateNvidiaSharc(bool enabled);
+    // After the scene-lighting latch: clears the cache when what its radiance means changed (scene lifetime, environment
+    // replacement, path estimator). Moving objects and lights, light and material edits and residency changes do not clear
+    // it: NVIDIA's accumulation window and stale-entry eviction adapt to them.
+    void ApplyNvidiaSharcValidity(const PathTraceAccumulationKey& key);
+    SharcCache::Constants MakeNvidiaSharcConstants(const Vector3& cameraPosition, const PathTraceReferenceSettings& settings);
+
+    SharcCache m_sharcNvidia;
+    bool m_sharcNvidiaFailed = false;
+    std::optional<std::string> m_sharcNvidiaCapabilityFailure;
+    std::optional<NvidiaSharcSemantics> m_sharcNvidiaSemantics;
+    std::uint64_t m_sharcNvidiaEpochAdvances = 0;
+    std::optional<Vector3> m_sharcNvidiaPreviousCamera;
+    std::uint32_t m_sharcNvidiaFrameIndex = 0;
+    // Diagnostics: the next allocation fails; a forced capability failure; precision overrides.
+    bool m_sharcNvidiaFailAllocationForTesting = false;
+    std::optional<std::string> m_sharcNvidiaCapabilityFailureForTesting;
+    std::optional<float> m_sharcNvidiaRadianceScaleForTesting;
+    float m_sharcNvidiaDepositLuminanceLimitForTesting = 0.0f;
+    std::uint32_t m_sharcNvidiaQueryVertexForTesting = 2;
+    std::uint32_t m_sharcNvidiaTrainingMaxDepthForTesting = 8;
     // The query-side library the frame's settings select (Query, QueryTermination or Render). NRD.RELAX.2B:
     // rawDiffuseHitDistance selects the render library's raw-distance build for an extraction frame.
     // The render library SHARC substitutes cached radiance with (SHARC.4E, 4E.1, 5B; NRD.RELAX.2B raw distance).
@@ -2125,6 +2169,32 @@ private:
     // visibility-blind initial sampling exactly.
     bool m_rtxdiInitialVisibility = true;
     std::uint32_t m_rtxdiInfiniteLightSamplesForTesting = 0;
+    // PT.2A: keep ReSTIR DI history through transform-only TLAS updates (moving objects). Reused samples are still shaded
+    // with current visibility; bias-correction visibility is traced from the previous surfaces through the current TLAS
+    // (RtxdiReuseBridge.hlsli). False restores the pre-PT.2A policy, which discarded all history whenever any transform
+    // changed.
+    bool m_rtxdiPreserveHistoryThroughTransforms = true;
+    // PT.2A: the final shading ray reuses the initial-visibility result when it is provably the same ray (same surface,
+    // bit-identical direction and distance, same TLAS within the dispatch). False always traces it.
+    bool m_rtxdiReuseInitialVisibility = true;
+    // PT.2A diagnostics: where the final ray is reused, trace it anyway and count disagreements (RTXDI diagnostic counter
+    // finalReuseMismatches); shading then uses the traced result.
+    bool m_rtxdiVerifyInitialVisibilityReuseForTesting = false;
+    // PT.2A diagnostics: a RWByteAddressBuffer UAV of the RTXDI_DIAGNOSTIC_* words (PathTraceReference.hlsl) the ReSTIR DI
+    // direct pass adds to. UINT_MAX (production) counts nothing.
+    std::uint32_t m_rtxdiDiagnosticCountersIndexForTesting = UINT_MAX;
+    // PT.2B: a light that moved or changed keeps its ReSTIR DI samples (translated by stable object ID; bias correction
+    // evaluates them with the light's previous record). False restores the pre-PT.2B rule: any change of a light's
+    // parameters drops its samples.
+    bool m_rtxdiPreserveHistoryThroughLightChanges = true;
+    // PT.2B diagnostics: the RTXDI light layout of another environment strategy, for a build whose path tracer libraries
+    // were compiled with that strategy (RtxdiEnvironmentConfig.hlsli swapped in the build's assets). Unset in production,
+    // which always uses CompiledRtxdiEnvironmentStrategy().
+    std::optional<RtxdiEnvironmentStrategy> m_rtxdiEnvironmentStrategyForTesting;
+    // PT.2B diagnostics, Reservoir strategy: environment and BSDF candidate counts in place of
+    // RtxdiInitialEnvironmentSamples and RtxdiInitialBrdfSamples (UINT_MAX = the production constant).
+    std::uint32_t m_rtxdiEnvironmentSamplesForTesting = UINT_MAX;
+    std::uint32_t m_rtxdiBrdfSamplesForTesting = UINT_MAX;
     // Whether the last path-traced frame rendered with the cached-radiance library.
     bool m_sharcRenderedLastFrame = false;
     // SHARC.6A: this frame's render dispatch writes the history prior the temporal pass reads.

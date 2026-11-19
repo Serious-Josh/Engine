@@ -289,15 +289,20 @@ void CheckLightingMigration(const std::filesystem::path& output)
     FrameLighting frame;
     Check(BuildFrameLighting(DirectionalLight{},&snapshot,frame,&error) && frame.sun.angularRadius == edited->angularRadius,error);
     RtxdiLightSet setBefore;
-    Check(BuildRtxdiLightSet(frame,{},setBefore) && setBefore.records.size() == 2 && setBefore.identities[1].kind == RtxdiLightKind::Sun,"Runtime sun missing from RTXDI.");
+    Check(BuildRtxdiLightSet(frame,{},CompiledRtxdiEnvironmentStrategy(),setBefore) && setBefore.records.size() == 2 && setBefore.identities[1].kind == RtxdiLightKind::Sun,"Runtime sun missing from RTXDI.");
     auto changedRadius = frame;
     changedRadius.sun.angularRadius += 0.1f;
     RtxdiLightSet radiusSet;
-    Check(BuildRtxdiLightSet(changedRadius,{},radiusSet), "Cannot build edited-radius RTXDI set.");
+    Check(BuildRtxdiLightSet(changedRadius,{},CompiledRtxdiEnvironmentStrategy(),radiusSet), "Cannot build edited-radius RTXDI set.");
     std::vector<std::int32_t> radiusForward,radiusBackward;
-    BuildRtxdiLightTranslation(setBefore,radiusSet,radiusForward,radiusBackward);
+    // Strict light history (pre-PT.2B): any sun change drops its samples.
+    BuildRtxdiLightTranslation(setBefore,radiusSet,false,radiusForward,radiusBackward);
     Check(radiusBackward.size() == 2 && radiusBackward[0] == 0 && radiusBackward[1] == -1,
-        "Changing angular radius retained an incompatible RTXDI sun history mapping.");
+        "Changing angular radius retained an RTXDI sun history mapping under the strict policy.");
+    // PT.2B light history: the same sun keeps its samples through a cone change (bias correction reads its previous record).
+    BuildRtxdiLightTranslation(setBefore,radiusSet,true,radiusForward,radiusBackward);
+    Check(radiusBackward.size() == 2 && radiusBackward[0] == 0 && radiusBackward[1] == 1,
+        "Changing angular radius dropped the sun's RTXDI history under the preserving policy.");
     Check(runtime.SetObjectLight(*selection,edited,initial,&error) && runtime.SetObjectLight(*selection,initial,edited,&error),
         "Component undo/redo values failed.");
     auto disabled = edited; disabled->enabled = false;
@@ -323,11 +328,14 @@ void CheckLightingMigration(const std::filesystem::path& output)
         snapshot.lightingSettings.environmentLuminanceScale == settings.environmentLuminanceScale,
         "Removing final light lost the scene calibration or resurrected the sun.");
     RtxdiLightSet removed;
-    Check(BuildRtxdiLightSet(frame,{},removed) && removed.records.size() == 1 &&
+    Check(BuildRtxdiLightSet(frame,{},CompiledRtxdiEnvironmentStrategy(),removed) && removed.records.size() == 1 &&
         removed.identities[0].kind == RtxdiLightKind::Point && removed.identities[0].objectID == runtimePoint.id, "Deleted directional survived RTXDI light construction.");
     std::vector<std::int32_t> toPrevious,toCurrent;
-    BuildRtxdiLightTranslation(setBefore,removed,toPrevious,toCurrent);
-    Check(toCurrent.size() == 2 && toCurrent[0] == 0 && toCurrent[1] == -1,"Deleted sun retained an RTXDI history mapping.");
+    for(const bool preserveThroughLightChanges : {false, true})
+    {
+        BuildRtxdiLightTranslation(setBefore,removed,preserveThroughLightChanges,toPrevious,toCurrent);
+        Check(toCurrent.size() == 2 && toCurrent[0] == 0 && toCurrent[1] == -1,"Deleted sun retained an RTXDI history mapping.");
+    }
     Check(runtime.SaveAs(output/"runtime-deleted.scene",&error),error);
     SceneDocument afterDelete;
     Check(LoadSceneDocument(output/"runtime-deleted.scene",afterDelete,&error) && Lighting(afterDelete).sun.intensity == 0 &&
@@ -424,7 +432,7 @@ void CreateControlledFixture(const std::filesystem::path& root)
     SceneDocument reloaded;
     Check(LoadSceneDocument(root/"Scenes/ControlledPointOnly.scene",reloaded,&error),error);
     RtxdiLightSet actual;
-    Check(BuildRtxdiLightSet(Lighting(reloaded),{},actual) && actual.records.size() == 1 &&
+    Check(BuildRtxdiLightSet(Lighting(reloaded),{},CompiledRtxdiEnvironmentStrategy(),actual) && actual.records.size() == 1 &&
         actual.identities[0].objectID == point.id && actual.identities[0].kind == RtxdiLightKind::Point,
         "Controlled floor/occluder/None scene has an unintended RTXDI light.");
 }
@@ -548,7 +556,9 @@ int main(int argc, char** argv)
             FrameLighting frame;
             Check(BuildFrameLighting(DirectionalLight{}, &snapshot, frame, &error), error);
             RtxdiLightSet set;
-            Check(BuildRtxdiLightSet(frame, source, set), "RTXDI set construction failed.");
+            // The environment record's lifecycle is checked in the layout that holds it (InfiniteLight); PT.2B's production
+            // separate-MIS layout never makes the HDRI an RTXDI light.
+            Check(BuildRtxdiLightSet(frame, source, RtxdiEnvironmentStrategy::InfiniteLight, set), "RTXDI set construction failed.");
             Check(set.records.size() == 1 && set.identities[0].kind == RtxdiLightKind::Point &&
                 set.identities[0].objectID == point.id, "Actual RTXDI set contains an unintended light.");
             environment.Shutdown();
@@ -565,11 +575,20 @@ int main(int argc, char** argv)
             source.marginalCDFIndex = environment.GetImportanceMarginalCDF().GetDescriptorIndex();
             source.totalWeight = environment.GetImportanceTotalWeight();
             RtxdiLightSet withEnvironment;
-            Check(BuildRtxdiLightSet(frame, source, withEnvironment) && withEnvironment.records.size() == 2,
-                "RTXDI environment restoration failed.");
+            Check(BuildRtxdiLightSet(frame, source, RtxdiEnvironmentStrategy::InfiniteLight, withEnvironment) &&
+                withEnvironment.records.size() == 2, "RTXDI environment restoration failed.");
             std::vector<std::int32_t> forward, backward;
-            BuildRtxdiLightTranslation(withEnvironment, set, forward, backward);
-            Check(backward.size() == 2 && backward[1] == -1, "Removed RTXDI environment retained a history mapping.");
+
+            for(const bool preserveThroughLightChanges : {false, true})
+            {
+                BuildRtxdiLightTranslation(withEnvironment, set, preserveThroughLightChanges, forward, backward);
+                Check(backward.size() == 2 && backward[1] == -1, "Removed RTXDI environment retained a history mapping.");
+            }
+
+            RtxdiLightSet separateMis;
+            Check(BuildRtxdiLightSet(frame, source, RtxdiEnvironmentStrategy::SeparateMis, separateMis) &&
+                separateMis.records.size() == 1 && separateMis.bufferParameters.environmentLightParams.lightPresent == 0,
+                "The separate-MIS layout made the HDRI an RTXDI light.");
             environment.Shutdown();
             Check(heap.GetAvailableCount() == available, "Switching environments leaked descriptors.");
         }

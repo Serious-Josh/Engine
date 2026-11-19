@@ -165,7 +165,8 @@ std::size_t UploadBuffer::GetOverflowBytesRetained() const noexcept
 D3D12_GPU_VIRTUAL_ADDRESS UploadBuffer::AllocateOverflow(
     const void* data,
     std::size_t size,
-    std::size_t alignment)
+    std::size_t alignment,
+    UploadLocation& location)
 {
     if (!m_device || m_frameIndex >= m_overflowPages.size())
     {
@@ -185,6 +186,7 @@ D3D12_GPU_VIRTUAL_ADDRESS UploadBuffer::AllocateOverflow(
             std::memcpy(page.mappedData + alignedOffset, data, size);
             m_overflowBytesUsed += alignedOffset + size - m_overflowOffset;
             m_overflowOffset = alignedOffset + size;
+            location = {page.resource, alignedOffset};
             return page.resource->GetGPUVirtualAddress() + alignedOffset;
         }
 
@@ -241,13 +243,23 @@ D3D12_GPU_VIRTUAL_ADDRESS UploadBuffer::AllocateOverflow(
 
     m_overflowPage = pages.size() - 1;
     m_overflowOffset = 0;
-    return AllocateOverflow(data, size, alignment);
+    return AllocateOverflow(data, size, alignment, location);
 }
 
 D3D12_GPU_VIRTUAL_ADDRESS UploadBuffer::Allocate(
     const void* data,
     std::size_t size,
     std::size_t alignment)
+{
+    UploadLocation location;
+    return Allocate(data, size, alignment, location);
+}
+
+D3D12_GPU_VIRTUAL_ADDRESS UploadBuffer::Allocate(
+    const void* data,
+    std::size_t size,
+    std::size_t alignment,
+    UploadLocation& location)
 {
     if (!m_resource ||
         !m_mappedData ||
@@ -268,7 +280,7 @@ D3D12_GPU_VIRTUAL_ADDRESS UploadBuffer::Allocate(
     if (alignedOffset + size > frameEnd)
     {
         // The ring region is full: continue in this slot's overflow pages (bounded, fence-safe, no waits).
-        return AllocateOverflow(data, size, alignment);
+        return AllocateOverflow(data, size, alignment, location);
     }
 
     std::memcpy(m_mappedData + alignedOffset, data, size);
@@ -276,6 +288,7 @@ D3D12_GPU_VIRTUAL_ADDRESS UploadBuffer::Allocate(
     const D3D12_GPU_VIRTUAL_ADDRESS gpuAddress = m_resource->GetGPUVirtualAddress() + alignedOffset;
 
     m_offset = alignedOffset + size;
+    location = {m_resource, alignedOffset};
 
     return gpuAddress;
 }

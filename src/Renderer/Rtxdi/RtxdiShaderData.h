@@ -9,18 +9,49 @@
 #include <cstdint>
 
 // RTXPT.3 R3.4 fixed initial-sampling configuration (Gate 2): candidates per path sample at the primary
-// vertex. Uniform local-light selection; no BRDF or environment-region candidates.
-inline constexpr std::uint32_t RtxdiInitialLocalLightSamples = 8;
+// vertex. Uniform local-light selection.
+// PT.2C: 16 stratified uniform local candidates (was 8): 0.45-0.55x the raw variance in local-light scenes for +0.14-0.5 ms of
+// direct pass at 720p. Candidates trace no rays; only the selected sample is shadow-tested.
+inline constexpr std::uint32_t RtxdiInitialLocalLightSamples = 16;
 inline constexpr std::uint32_t RtxdiInitialInfiniteLightSamples = 4;
+// PT.2B, the Reservoir environment strategy only (RtxdiEnvironmentConfig.hlsli): HDRI candidates drawn through Engine's CDF
+// warp, and BSDF candidates, each tracing one ray that enters the HDRI when it escapes.
+inline constexpr std::uint32_t RtxdiInitialEnvironmentSamples = 1;
+inline constexpr std::uint32_t RtxdiInitialBrdfSamples = 1;
 
-// Root constant buffer b2 of PathTraceReSTIRDISplitDirectRayGeneration only; identical layout to
-// RtxdiConstants in PathTraceReference.hlsl. Light records are packed two per uint4; the light translation
-// (current-to-previous entries, then previous-to-current entries) four per uint4.
+
+// PT.2B: the frame's RTXDI light data, a raw buffer the direct pass reads (RtxdiResources::GetLightDataSRVIndex). In order:
+// currentLightCount records, previousLightCount records (RtxdiLightRecord, 64 bytes each), then currentLightCount
+// current-to-previous and previousLightCount previous-to-current translation entries (int32, -1 for no counterpart).
+struct RtxdiLightDataLayout
+{
+    static constexpr std::uint32_t RecordBytes = sizeof(RtxdiLightRecord);
+    static constexpr std::uint32_t TranslationBytes = sizeof(std::int32_t);
+    // Both frames at full capacity.
+    static constexpr std::uint32_t CapacityBytes = 2 * RtxdiLightSet::Capacity * (RecordBytes + TranslationBytes);
+
+    static constexpr std::uint32_t PreviousRecordsOffset(std::uint32_t currentCount) noexcept
+    {
+        return currentCount * RecordBytes;
+    }
+
+    static constexpr std::uint32_t TranslationOffset(std::uint32_t currentCount, std::uint32_t previousCount) noexcept
+    {
+        return (currentCount + previousCount) * RecordBytes;
+    }
+
+    static constexpr std::uint32_t Bytes(std::uint32_t currentCount, std::uint32_t previousCount) noexcept
+    {
+        return (currentCount + previousCount) * (RecordBytes + TranslationBytes);
+    }
+};
+
+static_assert(RtxdiLightDataLayout::RecordBytes == 64);
+
+// Root constant buffer b2 of PathTraceReSTIRDISplitDirectRayGeneration only; identical layout to RtxdiConstants in
+// PathTraceReference.hlsl. NrdHistoryConfidence.hlsli reads the leading rows up to motionIndex.
 struct PathTraceRtxdiConstants
 {
-    static constexpr std::uint32_t RecordWords = RtxdiLightSet::Capacity * 2;
-    static constexpr std::uint32_t TranslationWords = RtxdiLightSet::Capacity * 2;
-
     RTXDI_LightBufferParameters lightBuffer{};
     RTXDI_ReservoirBufferParameters reservoirBuffer{};
     RTXDI_DIBufferIndices bufferIndices{};
@@ -32,58 +63,66 @@ struct PathTraceRtxdiConstants
     // WNP.2: 1 shadow-tests the selected initial sample before reuse (PathTraceReference.hlsl rtxdiInitialVisibility).
     std::uint32_t initialVisibility = 0;
 
-    // (kind, sourceIndex) for each RTXDI light index.
-    std::uint32_t lightRecords[RecordWords]{};
+    // PT.2B: the raw SRV of the frame's light data (RtxdiLightDataLayout) and its two record counts.
+    std::uint32_t lightDataIndex = 0xFFFFFFFFu;
+    std::uint32_t currentLightCount = 0;
+    std::uint32_t previousLightCount = 0;
+    // PT.2B, Reservoir environment strategy only: candidates per path sample (RTXDI's numEnvironmentSamples and
+    // numBrdfSamples); 0 elsewhere.
+    std::uint32_t environmentSamples = 0;
+
+    std::uint32_t brdfSamples = 0;
+    // 1 when previous reservoirs, previous surfaces, previous light records and the translation may be read.
+    std::uint32_t historyValid = 0;
+    // Buffer<float2> neighbor offsets and the G-buffer motion texture (current UV - previous UV, view-depth delta).
+    std::uint32_t neighborOffsetsIndex = 0;
+    std::uint32_t motionIndex = 0;
 
     // RTXPT.3 R3.5/R3.6: fused spatiotemporal reuse.
     RTXDI_RuntimeParameters runtime{};
     RTXDI_DISpatioTemporalResamplingParameters spatioTemporal{};
 
-    // 1 when previous reservoirs, previous surfaces and the translation below may be read.
-    std::uint32_t historyValid = 0;
-    // Buffer<float2> neighbor offsets and the G-buffer motion texture (current UV - previous UV, view-depth delta).
-    std::uint32_t neighborOffsetsIndex = 0;
-    std::uint32_t motionIndex = 0;
-    std::uint32_t currentLightCount = 0;
-
-    std::uint32_t previousLightCount = 0;
     std::uint32_t previousDepthIndex = 0;
     std::uint32_t previousSurfaceIndex = 0;
     std::uint32_t previousGeometricNormalIndex = 0;
-
     std::uint32_t previousMaterialIndex = 0;
-    std::uint32_t padding2[3]{};
+
+    // PT.2A: 1 lets final shading reuse the initial-visibility result for a provably identical ray; 2 (diagnostics) also
+    // traces that ray and counts disagreements.
+    std::uint32_t reuseInitialVisibility = 0;
+    // PT.2A diagnostics: RtxdiDiagnosticCounter UAV, or UINT32_MAX (no counting).
+    std::uint32_t diagnosticCountersIndex = 0xFFFFFFFFu;
+    std::uint32_t padding0 = 0;
+    std::uint32_t padding1 = 0;
 
     // Linear depth is dot(forward, position - camera position) for the current and the previous camera.
     float previousCameraPosition[3]{};
-    float padding3 = 0.0f;
+    float padding2 = 0.0f;
     float cameraForward[3]{};
-    float padding4 = 0.0f;
+    float padding3 = 0.0f;
     float previousCameraForward[3]{};
-    float padding5 = 0.0f;
+    float padding4 = 0.0f;
 
     Matrix4 previousInverseCameraRelativeViewProjection;
-
-    std::int32_t lightTranslation[TranslationWords]{};
 };
 
-static_assert(PathTraceRtxdiConstants::RecordWords % 4 == 0, "Light records must fill whole uint4 registers.");
-static_assert(PathTraceRtxdiConstants::TranslationWords % 4 == 0, "Translation must fill whole int4 registers.");
 static_assert(sizeof(RTXDI_LightBufferParameters) == 48);
+static_assert(sizeof(RTXDI_ReservoirBufferParameters) == 16);
+static_assert(sizeof(RTXDI_DIBufferIndices) == 32);
 static_assert(sizeof(RTXDI_RuntimeParameters) == 16);
 static_assert(sizeof(RTXDI_DISpatioTemporalResamplingParameters) == 48);
 static_assert(sizeof(Matrix4) == 64);
 static_assert(offsetof(PathTraceRtxdiConstants, reservoirBuffer) == 48);
 static_assert(offsetof(PathTraceRtxdiConstants, bufferIndices) == 64);
 static_assert(offsetof(PathTraceRtxdiConstants, reservoirBufferIndex) == 96);
-static_assert(offsetof(PathTraceRtxdiConstants, lightRecords) == 112);
-static_assert(offsetof(PathTraceRtxdiConstants, runtime) == 112 + 4 * PathTraceRtxdiConstants::RecordWords);
-static_assert(offsetof(PathTraceRtxdiConstants, historyValid) == offsetof(PathTraceRtxdiConstants, runtime) + 64);
-static_assert(offsetof(PathTraceRtxdiConstants, previousCameraPosition) ==
-    offsetof(PathTraceRtxdiConstants, historyValid) + 48);
-static_assert(offsetof(PathTraceRtxdiConstants, previousInverseCameraRelativeViewProjection) ==
-    offsetof(PathTraceRtxdiConstants, previousCameraPosition) + 48);
-static_assert(offsetof(PathTraceRtxdiConstants, lightTranslation) ==
-    offsetof(PathTraceRtxdiConstants, previousInverseCameraRelativeViewProjection) + 64);
+static_assert(offsetof(PathTraceRtxdiConstants, lightDataIndex) == 112);
+static_assert(offsetof(PathTraceRtxdiConstants, brdfSamples) == 128);
+// HLSL starts each structure member on a 16-byte register.
+static_assert(offsetof(PathTraceRtxdiConstants, runtime) == 144);
+static_assert(offsetof(PathTraceRtxdiConstants, spatioTemporal) == 160);
+static_assert(offsetof(PathTraceRtxdiConstants, previousDepthIndex) == 208);
+static_assert(offsetof(PathTraceRtxdiConstants, reuseInitialVisibility) == 224);
+static_assert(offsetof(PathTraceRtxdiConstants, previousCameraPosition) == 240);
+static_assert(offsetof(PathTraceRtxdiConstants, previousInverseCameraRelativeViewProjection) == 288);
 // Matches the HLSL cbuffer size DXC reflects for RtxdiConstants.
-static_assert(sizeof(PathTraceRtxdiConstants) == 1392);
+static_assert(sizeof(PathTraceRtxdiConstants) == 352);

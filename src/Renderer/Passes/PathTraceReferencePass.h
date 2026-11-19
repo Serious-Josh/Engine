@@ -57,6 +57,17 @@ const char* PathTraceLibraryVariantName(PathTraceLibraryVariant variant);
 // library's ReSTIR DI indirect-pass exports (normal, and with signal extraction), for ExecuteReSTIRDISplit. NRD.RELAX.2B:
 // the *RawDiffuseHitDistance entries are those two extraction exports from the render library's raw-distance build
 // (PathTraceReferenceRadianceCacheRenderRawDiffuseHitDistance*.hlsl), for frames that also write the raw diffuse hit distance.
+// NVIDIA SHARC Checkpoint A: which cache the radiance-cache libraries serve. Each has its own pipelines per library slot
+// (PathTraceReferencePass::SetRadianceCacheImplementation selects the set). NvidiaDepthMatched is NVIDIA SHARC's
+// diagnostic update library without cache resampling; its render library is NVIDIA's.
+enum class PathTraceRadianceCacheImplementation
+{
+    EngineD6,
+    Nvidia,
+    NvidiaDepthMatched,
+    Count
+};
+
 enum class PathTraceRadianceCacheLibrary
 {
     Deferred,
@@ -90,6 +101,7 @@ struct PathTraceLibraryNeeds
     // SHARC: the sparse training library and the render library that substitutes cached radiance.
     bool radianceCache = false;
     PathTraceRadianceCacheLibrary radianceCacheRender = PathTraceRadianceCacheLibrary::Render;
+    PathTraceRadianceCacheImplementation radianceCacheImplementation = PathTraceRadianceCacheImplementation::EngineD6;
 };
 
 // One DXR library a configuration acquires. An optional library is a GI.6 or DI.1 RayQuery twin: its failure keeps
@@ -413,6 +425,18 @@ class PathTraceReferencePass
     bool IsRadianceCacheLearningReady(PathTraceRadianceCacheLibrary library) const
     {
         return m_radianceCache[static_cast<size_t>(library)].ready;
+    }
+
+    // The cache whose libraries EnsureRadianceCacheLearning, ExecuteRadianceCacheTraining and the render paths use.
+    void SetRadianceCacheImplementation(PathTraceRadianceCacheImplementation implementation)
+    {
+        m_radianceCacheImplementation = implementation;
+        m_radianceCache = m_radianceCacheSets[static_cast<size_t>(implementation)];
+    }
+
+    PathTraceRadianceCacheImplementation GetRadianceCacheImplementation() const
+    {
+        return m_radianceCacheImplementation;
     }
 
     // Diagnostics (SHARC.4D-P/4D-Q): the driver's stack size of the Raster Primary ray generation, in the production
@@ -874,7 +898,11 @@ class PathTraceReferencePass
         std::string failure;
     };
 
-    RadianceCacheLearningPipeline m_radianceCache[static_cast<size_t>(PathTraceRadianceCacheLibrary::Count)];
+    RadianceCacheLearningPipeline m_radianceCacheSets[static_cast<size_t>(PathTraceRadianceCacheImplementation::Count)]
+        [static_cast<size_t>(PathTraceRadianceCacheLibrary::Count)];
+    // The selected implementation's set (SetRadianceCacheImplementation).
+    RadianceCacheLearningPipeline* m_radianceCache = m_radianceCacheSets[0];
+    PathTraceRadianceCacheImplementation m_radianceCacheImplementation = PathTraceRadianceCacheImplementation::EngineD6;
 
     // PSR.1a, created on first use (EnsurePrimarySurfaceReplacement): the record pass and the raster primary of the PSR
     // library, and 48 bytes per pixel of records (PATH_TRACE_PSR_RECORD_STRIDE), recreated with the extent.

@@ -62,6 +62,14 @@ class TopLevelAccelerationStructure
         return m_recordingIdentity;
     }
 
+    // PT.2A: identity of what the TLAS references, apart from instance transforms. A build allocates one; an update keeps
+    // it when every changed instance kept its BLAS, instance ID, mask and flags (a transform-only update) and allocates a
+    // new one otherwise (a rebuilt BLAS, displacement, a re-resolved reference). 0 after a failed recording.
+    uint64_t GetGeometryIdentity() const
+    {
+        return m_geometryIdentity;
+    }
+
     // Instance-upload slot of the last successful recording, or UINT_MAX.
     unsigned int GetRecordingSlot() const
     {
@@ -90,5 +98,6 @@ class TopLevelAccelerationStructure
     std::vector<bool> m_pendingInstanceUpdates[FrameCount];
     std::vector<std::size_t> m_pendingInstanceIndices[FrameCount];
     uint64_t m_recordingIdentity = 0;
+    uint64_t m_geometryIdentity = 0;
     unsigned int m_recordingSlot = UINT_MAX;
 };

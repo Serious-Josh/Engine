@@ -1,6 +1,7 @@
 #pragma once
 
 #include <climits>
+#include <cstdint>
 #include <d3d12.h>
 
 class DescriptorHeap;
@@ -64,6 +65,11 @@ class Buffer
     bool CreateRawUAV(
         ID3D12Device* device,
         DescriptorHeap& descriptorHeap);
+    // A structured UAV of `stride`-byte elements in place of the raw one (NVIDIA SHARC's RWStructuredBuffer bindings).
+    bool CreateStructuredUAV(
+        ID3D12Device* device,
+        DescriptorHeap& descriptorHeap,
+        std::uint32_t stride);
     void Shutdown();
 
     D3D12_GPU_VIRTUAL_ADDRESS GetGPUAddress() const;

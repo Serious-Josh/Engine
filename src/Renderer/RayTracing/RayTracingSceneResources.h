@@ -269,6 +269,12 @@ class RayTracingSceneResources
         return m_membership->topLevel.GetRecordingIdentity();
     }
 
+    // PT.2A: the active TLAS's geometry identity (TopLevelAccelerationStructure::GetGeometryIdentity).
+    std::uint64_t GetTLASGeometryIdentity() const
+    {
+        return m_membership->topLevel.GetGeometryIdentity();
+    }
+
     bool TryGetTLASGeometryEvidence(
         const Mesh* mesh,
         SceneBLASRetirementBatchIdentity batch,

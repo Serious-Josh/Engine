@@ -688,6 +688,21 @@ void GraphicsDevice::QueryShaderCapabilities()
     }
 
     Log::Info(std::string("Shader execution reordering actually reorders: ") + (m_serActuallyReorders ? "yes" : "no"));
+
+    // NVIDIA SHARC (optional): 64-bit integer shader operations and atomics on descriptor-heap resources for its hash
+    // keys, and native 16-bit types for its resolved data. A failed query only means "no"; nothing else depends on them.
+    D3D12_FEATURE_DATA_D3D12_OPTIONS1 options1{};
+    m_int64ShaderOps = SUCCEEDED(m_device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &options1, sizeof(options1))) &&
+        options1.Int64ShaderOps != FALSE;
+    D3D12_FEATURE_DATA_D3D12_OPTIONS4 options4{};
+    m_native16BitShaderOps = SUCCEEDED(m_device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS4, &options4,
+        sizeof(options4))) && options4.Native16BitShaderOpsSupported != FALSE;
+    D3D12_FEATURE_DATA_D3D12_OPTIONS11 options11{};
+    m_atomicInt64OnDescriptorHeapResources = SUCCEEDED(m_device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS11,
+        &options11, sizeof(options11))) && options11.AtomicInt64OnDescriptorHeapResourceSupported != FALSE;
+    Log::Info(std::format("Int64 shader ops: {}; native 16-bit shader ops: {}; int64 atomics on descriptor-heap resources: {}",
+        m_int64ShaderOps ? "yes" : "no", m_native16BitShaderOps ? "yes" : "no",
+        m_atomicInt64OnDescriptorHeapResources ? "yes" : "no"));
 }
 
 void GraphicsDevice::Shutdown()
@@ -744,4 +759,19 @@ D3D_SHADER_MODEL GraphicsDevice::GetHighestShaderModel() const
 bool GraphicsDevice::ShaderExecutionReorderingActuallyReorders() const
 {
     return m_serActuallyReorders;
+}
+
+bool GraphicsDevice::SupportsInt64ShaderOps() const
+{
+    return m_int64ShaderOps;
+}
+
+bool GraphicsDevice::SupportsNative16BitShaderOps() const
+{
+    return m_native16BitShaderOps;
+}
+
+bool GraphicsDevice::SupportsAtomicInt64OnDescriptorHeapResources() const
+{
+    return m_atomicInt64OnDescriptorHeapResources;
 }

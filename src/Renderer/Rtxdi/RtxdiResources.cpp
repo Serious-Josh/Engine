@@ -1,10 +1,12 @@
 #include "Renderer/Rtxdi/RtxdiResources.h"
 #include "Debug/MemoryRegistry.h"
 #include "Renderer/DescriptorHeap.h"
+#include "Renderer/UploadBuffer.h"
 #include "Core/Log.h"
 
 #include "Rtxdi/RtxdiUtils.h"
 
+#include <algorithm>
 #include <cstring>
 #include <string>
 
@@ -61,14 +63,17 @@ bool RtxdiResources::Initialize(
     m_descriptorHeap = &descriptorHeap;
 
     if(!m_reservoirs.InitializeGPUWritable(device, static_cast<size_t>(elements * ReservoirStride)) ||
-        !CreateReservoirUAV(device, descriptorHeap, elements) || !CreateNeighborOffsets(device, descriptorHeap))
+        !CreateReservoirUAV(device, descriptorHeap, elements) || !CreateNeighborOffsets(device, descriptorHeap) ||
+        !m_lightData.InitializeGPUWritable(device, RtxdiLightDataLayout::CapacityBytes) ||
+        !m_lightData.CreateRawSRV(device, descriptorHeap))
     {
-        Log::Error("Failed to create the RTXDI reservoir buffer or neighbor offsets.");
+        Log::Error("Failed to create the RTXDI reservoir buffer, neighbor offsets or light data.");
         Shutdown();
         return false;
     }
 
     m_reservoirs.GetResource()->SetName(L"RTXDI DI Reservoirs");
+    m_lightData.GetResource()->SetName(L"RTXDI Light Data");
 
     m_width = width;
     m_height = height;
@@ -114,6 +119,7 @@ void RtxdiResources::Shutdown()
     m_reservoirUAVIndex = UINT_MAX;
     m_neighborOffsetsSRVIndex = UINT_MAX;
     m_reservoirs.Shutdown();
+    m_lightData.Shutdown();
     m_context.reset();
     m_frameIndex = 0;
     m_lastFrameUsedHistory = false;
@@ -124,10 +130,11 @@ void RtxdiResources::Shutdown()
 }
 
 bool RtxdiResources::BeginFrame(const RtxdiLightSet& lights, const RtxdiHistorySignature& signature,
-    bool previousSurfacesAvailable, RtxdiFrame& frame)
+    bool previousSurfacesAvailable, const RtxdiHistoryPolicy& policy, RtxdiFrame& frame)
 {
     m_pending.reset();
     m_lastFrameUsedHistory = false;
+    m_lastHistoryDecision = RtxdiHistoryDecision::NoCommittedFrame;
 
     if(!m_initialized)
     {
@@ -147,9 +154,42 @@ bool RtxdiResources::BeginFrame(const RtxdiLightSet& lights, const RtxdiHistoryS
     spatioTemporalParameters.uniformRandomNumber = rtxdi::JenkinsHash(m_frameIndex + 1);
     pending.context.SetSpatioTemporalResamplingParameters(spatioTemporalParameters);
 
-    // Previous reservoirs are reusable only against the same visibility geometry and materials, and only when
-    // the previous surfaces they were computed on can be reconstructed.
-    const bool historyUsable = m_historyValid && m_committedSignature == signature && previousSurfacesAvailable;
+    // Previous reservoirs are reusable only against the same geometry and materials, and only when the previous surfaces
+    // they were computed on can be reconstructed. Moved instances keep history unless the conservative policy is chosen.
+    const RtxdiHistorySignature& committed = m_committedSignature;
+    RtxdiHistoryDecision decision = RtxdiHistoryDecision::Reused;
+
+    if(!m_historyValid)
+    {
+        decision = RtxdiHistoryDecision::NoCommittedFrame;
+    }
+    else if(!previousSurfacesAvailable)
+    {
+        decision = RtxdiHistoryDecision::PreviousSurfacesUnavailable;
+    }
+    else if(committed.sceneResourceLifetime != signature.sceneResourceLifetime)
+    {
+        decision = RtxdiHistoryDecision::SceneResources;
+    }
+    else if(committed.topLevelAddress != signature.topLevelAddress)
+    {
+        decision = RtxdiHistoryDecision::TopLevel;
+    }
+    else if(committed.topLevelGeometry != signature.topLevelGeometry || signature.topLevelGeometry == 0)
+    {
+        decision = RtxdiHistoryDecision::Geometry;
+    }
+    else if(committed.materialRevision != signature.materialRevision)
+    {
+        decision = RtxdiHistoryDecision::Material;
+    }
+    else if(!policy.preserveThroughTransforms && committed.topLevelRecording != signature.topLevelRecording)
+    {
+        decision = RtxdiHistoryDecision::Transforms;
+    }
+
+    const bool historyUsable = decision == RtxdiHistoryDecision::Reused;
+    m_lastHistoryDecision = decision;
 
     RtxdiFrame candidate;
     candidate.reservoirBufferParameters = pending.context.GetReservoirBufferParameters();
@@ -165,7 +205,9 @@ bool RtxdiResources::BeginFrame(const RtxdiLightSet& lights, const RtxdiHistoryS
 
     if(historyUsable)
     {
-        BuildRtxdiLightTranslation(m_committedLights, lights, currentToPrevious, previousToCurrent);
+        BuildRtxdiLightTranslation(m_committedLights, lights, policy.preserveThroughLightChanges, currentToPrevious,
+            previousToCurrent);
+        candidate.previousLightRecords = m_committedLights.records;
     }
     else
     {
@@ -180,6 +222,49 @@ bool RtxdiResources::BeginFrame(const RtxdiLightSet& lights, const RtxdiHistoryS
     m_pending.emplace(std::move(pending));
     m_lastFrameUsedHistory = historyUsable;
     frame = std::move(candidate);
+    return true;
+}
+
+bool RtxdiResources::RecordLightData(ID3D12GraphicsCommandList* commandList, UploadBuffer& upload, const RtxdiFrame& frame)
+{
+    const auto currentCount = static_cast<std::uint32_t>(frame.lightRecords.size());
+    const auto previousCount = static_cast<std::uint32_t>(frame.previousLightRecords.size());
+
+    if(!m_initialized || !commandList || currentCount > RtxdiLightSet::Capacity ||
+        previousCount > RtxdiLightSet::Capacity || frame.previousLightCount != previousCount ||
+        frame.lightTranslation.size() != static_cast<std::size_t>(currentCount) + previousCount)
+    {
+        return false;
+    }
+
+    // An empty frame still writes one word, so every frame records the same copy. The staging bytes keep their capacity.
+    std::vector<std::uint8_t>& bytes = m_lightDataStaging;
+    bytes.assign((std::max)(RtxdiLightDataLayout::Bytes(currentCount, previousCount), 4u), 0);
+    std::uint8_t* destination = bytes.data();
+
+    const auto append = [&](const void* source, std::size_t size)
+    {
+        if(size != 0)
+        {
+            std::memcpy(destination, source, size);
+            destination += size;
+        }
+    };
+
+    append(frame.lightRecords.data(), frame.lightRecords.size() * RtxdiLightDataLayout::RecordBytes);
+    append(frame.previousLightRecords.data(), frame.previousLightRecords.size() * RtxdiLightDataLayout::RecordBytes);
+    append(frame.lightTranslation.data(), frame.lightTranslation.size() * RtxdiLightDataLayout::TranslationBytes);
+
+    UploadLocation source;
+
+    if(upload.Allocate(bytes.data(), bytes.size(), 16, source) == 0)
+    {
+        return false;
+    }
+
+    m_lightData.Transition(commandList, D3D12_RESOURCE_STATE_COPY_DEST);
+    commandList->CopyBufferRegion(m_lightData.GetResource(), 0, source.resource, source.offset, bytes.size());
+    m_lightData.Transition(commandList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     return true;
 }
 
@@ -220,7 +305,7 @@ std::uint64_t RtxdiResources::GetResourceBytes() const noexcept
 
     const std::uint64_t reservoirBytes = ReservoirArrayElements(m_width, m_height) * ReservoirArrayCount *
         ReservoirStride;
-    return reservoirBytes + NeighborOffsetCount * 2;
+    return reservoirBytes + NeighborOffsetCount * 2 + RtxdiLightDataLayout::CapacityBytes;
 }
 
 std::uint64_t RtxdiResources::ReservoirArrayElements(unsigned int width, unsigned int height)

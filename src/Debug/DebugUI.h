@@ -436,13 +436,17 @@ class DebugUI
 
     // SHARC.4E tuning (Debug-only): indices into the density (5x5, 8x8) and minimum-sample (8, 16, 32, 64, 256)
     // choices. Enabling SHARC is a project setting.
-    int m_sharcDensity = 0;
+    int m_sharcDensity = 1;
     int m_sharcMinimumSamples = 3;
     bool m_sharcFreezeTraining = false;
     bool m_sharcStatistics = false;
     std::uint32_t m_sharcResetRequest = 0;
     int m_sharcSpatialResolution = 1;
     bool m_sharcHistoryPrior = false;
+    // NVIDIA SHARC: 0 Engine D6 (comparison only), 1 NVIDIA (production); capacity index into 2^20..2^22 (default 2^20).
+    int m_sharcImplementation = 1;
+    int m_sharcNvidiaCapacity = 0;
+    bool m_sharcNvidiaFeedback = true;
     SharcStatus m_sharcStatus;
     void DrawSharcSettings();
     std::string m_pathTraceNrdStatus;

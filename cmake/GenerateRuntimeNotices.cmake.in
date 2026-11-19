@@ -22,6 +22,13 @@ foreach(license IN ITEMS
     string(APPEND notices "===== ${component} =====\n${text}\n\n")
 endforeach()
 
+# NVIDIA SHARC v1.8.3 (RTXGI SDK), compiled into the cooked shader bootstrap when its checkout is available. Only its
+# license accompanies the runtime; its shader source is never distributed (Documentation/Rendering/NVIDIA_SHARC_Replacement_B.md).
+if(EXISTS "@ENGINE_SHARC_ROOT@/License.md")
+    file(READ "@ENGINE_SHARC_ROOT@/License.md" text)
+    string(APPEND notices "===== NVIDIA SHARC v1.8.3 (NVIDIA RTXGI SDK) =====\n${text}\n\n")
+endif()
+
 # Dear ImGui ships no license file in external/imgui; Engine keeps its MIT text beside these scripts.
 file(READ "${source}/cmake/ImGuiLicense.txt" text)
 string(APPEND notices "===== Dear ImGui =====\n${text}\n\n")

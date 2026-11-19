@@ -16,7 +16,9 @@
 // Ray-traced bias correction (the approved configuration) weights each previous neighbor by its target times
 // its visibility, which assumes stored reservoirs no longer hold occluded samples: the includer stores with
 // RTXDI_StoreVisibilityInDIReservoir(..., discardIfInvisible = true). Previous-surface visibility is traced
-// through the current TLAS, which equals the previous one because history survives only identical geometry.
+// through the current TLAS. While no transform changed since the reused frame, that TLAS is the previous one and the
+// test is exact. PT.2A keeps history through transform-only updates (any other geometry change still drops it); the
+// previous TLAS is not retained, so after moved transforms the test sees the current occluders (see below).
 
 struct RAB_Material
 {
@@ -78,8 +80,13 @@ int RAB_TranslateLightIndex(uint lightIndex, bool currentToPrevious)
     return RtxdiBridgeTranslateLightIndex(int(lightIndex), currentToPrevious);
 }
 
-// Visibility of a light sample from a previous surface. The sample was formed at previousSurface, so the ray
-// starts there; currentSurface is the SDK's fallback for the temporal neighbor and is not needed.
+// Visibility of a light sample from a previous surface, for the bias-correction weight of that neighbor. The sample was
+// formed at previousSurface, so the ray starts there; currentSurface is the SDK's fallback and is not needed.
+// PT.2A, after moved transforms: the ray still starts at the previous surface but meets the current occluders, a
+// transient bias in the MIS normalization near moving objects and their shadows. RTXDI's documented alternative, starting
+// from currentSurface (the temporal neighbor's fallback) toward the same light point, measured clearly more biased (up to
+// 6-7% of 16 x 16 tiles off by more than 5%, against 2% here; PT2A_ReSTIR_DI_History_Visibility.md). Shading is unaffected:
+// the selected sample is always shadow-tested from the current surface through the current TLAS.
 bool RAB_GetTemporalConservativeVisibility(RAB_Surface currentSurface, RAB_Surface previousSurface,
     RAB_LightSample lightSample)
 {

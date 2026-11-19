@@ -75,9 +75,8 @@ cbuffer SceneLightConstants : register(b1)
 };
 
 // The leading fields of PathTraceRtxdiConstants (RtxdiShaderData.h, PathTraceReference.hlsl b2), bound from the frame's
-// RTXDI constants: the light records RTXDI indices address, two per register.
-#define NRD_CONFIDENCE_LIGHT_RECORD_REGISTERS 33
-
+// RTXDI constants. PT.2B: the light records RTXDI indices address are the first rtxdiCurrentLightCount records of the light
+// data (RtxdiLightDataLayout).
 cbuffer RtxdiConstants : register(b2)
 {
     RTXDI_LightBufferParameters rtxdiLightBuffer;
@@ -87,17 +86,17 @@ cbuffer RtxdiConstants : register(b2)
     uint rtxdiReservoirBufferIndex;
     uint rtxdiLocalLightSamples;
     uint rtxdiInfiniteLightSamples;
-    uint rtxdiPadding;
+    uint rtxdiInitialVisibility;
 
-    uint4 rtxdiLightRecords[NRD_CONFIDENCE_LIGHT_RECORD_REGISTERS];
+    uint rtxdiLightDataIndex;
+    uint rtxdiCurrentLightCount;
+    uint rtxdiPreviousLightCount;
+    uint rtxdiEnvironmentSamples;
 
-    RTXDI_RuntimeParameters rtxdiRuntime;
-    RTXDI_DISpatioTemporalResamplingParameters rtxdiSpatioTemporal;
-
+    uint rtxdiBrdfSamples;
     uint rtxdiHistoryValid;
     uint rtxdiNeighborOffsetsIndex;
     uint rtxdiMotionIndex;
-    uint rtxdiCurrentLightCount;
 };
 
 RaytracingAccelerationStructure scene : register(t0);
@@ -215,15 +214,6 @@ bool NrdConfidenceVisible(float3 position, float3 geometricNormal, float3 direct
     return query.CommittedStatus() == COMMITTED_NOTHING;
 }
 
-PathTraceSun NrdConfidenceSun()
-{
-    PathTraceSun sun;
-    sun.directionToSun = probeConstants.sunDirectionToLight;
-    sun.cosAngularRadius = probeConstants.sunCosAngularRadius;
-    sun.irradiance = probeConstants.sunIrradiance;
-    return sun;
-}
-
 PathTraceEnvironment NrdConfidenceEnvironment()
 {
     PathTraceEnvironment environment;
@@ -234,6 +224,13 @@ PathTraceEnvironment NrdConfidenceEnvironment()
     environment.height = probeConstants.environmentHeight;
     environment.totalWeight = probeConstants.environmentTotalWeight;
     return environment;
+}
+
+// This frame's RTXDI light record lightIndex (below rtxdiCurrentLightCount).
+GPULight NrdConfidenceLightRecord(uint lightIndex)
+{
+    ByteAddressBuffer lightData = ResourceDescriptorHeap[rtxdiLightDataIndex];
+    return RtxdiLoadLightRecord(lightData, lightIndex * RTXDI_LIGHT_RECORD_BYTES);
 }
 
 // The RTXDI light lightIndex sampled at uv, as RtxdiApplicationBridge.hlsli RAB_LoadLightInfo and
@@ -247,27 +244,8 @@ PathTraceLightSample NrdConfidenceSampleLight(uint lightIndex, float3 position, 
         return invalid;
     }
 
-    uint4 pair = rtxdiLightRecords[lightIndex >> 1u];
-    bool second = (lightIndex & 1u) != 0u;
-
-    RtxdiLightRecord record;
-    record.kind = second ? pair.z : pair.x;
-    record.sourceIndex = second ? pair.w : pair.y;
-
-    GPULight tableLight = (GPULight)0;
-
-    if(record.kind <= RTXDI_LIGHT_KIND_DIRECTIONAL)
-    {
-        if(record.sourceIndex >= min(sceneLightCount, SCENE_LIGHT_CAPACITY))
-        {
-            return invalid;
-        }
-
-        tableLight = sceneLights[record.sourceIndex];
-    }
-
-    return RtxdiSampleLight(record, tableLight, NrdConfidenceSun(), NrdConfidenceEnvironment(), environmentSampler,
-        position, uv);
+    return RtxdiSampleLight(NrdConfidenceLightRecord(lightIndex), NrdConfidenceEnvironment(), environmentSampler, position,
+        uv);
 }
 
 // T: the unshadowed irradiance-weighted contribution, luminance(Le) cos / pdf (cos E for delta lights). The diffuse
@@ -348,8 +326,7 @@ void CSProbe(uint3 dispatchThreadID : SV_DispatchThreadID)
                 change = float2(contribution * abs(visibility - previousVisibility), contribution);
 
                 // The stored record's light kind (the same record lookup NrdConfidenceSampleLight made).
-                uint4 pair = rtxdiLightRecords[lightIndex >> 1u];
-                uint kind = (lightIndex & 1u) != 0u ? pair.z : pair.x;
+                uint kind = NrdConfidenceLightRecord(lightIndex).type;
 
                 if(visibility < previousVisibility)
                 {

@@ -97,13 +97,21 @@ inline bool IsNrdPathTraceDenoiserMode(PathTraceDenoiserMode mode)
         mode == PathTraceDenoiserMode::NrdHybrid;
 }
 
+// NVIDIA SHARC Checkpoint A: the temporary comparison switch between Engine's D6 cache and NVIDIA SHARC v1.8.3
+// (Documentation/Rendering/NVIDIA_SHARC_Integration_A.md). Session only; packaged games always use the D6 cache.
+enum class SharcImplementation
+{
+    EngineD6,
+    Nvidia
+};
+
 // SHARC.4E experimental cached-radiance rendering (Path Traced Raster Primary, and with ReSTIR DI since SHARC.5B;
 // off by default, not saved).
 struct SharcSettings
 {
     bool enabled = false;
-    // One sparse training path per trainingTile x trainingTile pixels per frame (5 or 8).
-    std::uint32_t trainingTile = 5;
+    // One sparse training path per trainingTile x trainingTile pixels per frame: 8 (production) or 5.
+    std::uint32_t trainingTile = 8;
     // A cache entry completes a path only with at least this many samples.
     std::uint32_t minimumSamples = 64;
     // No training, insertion or resolve; the existing cache keeps being queried.
@@ -116,6 +124,18 @@ struct SharcSettings
     bool adaptiveResolution = true;
     // SHARC.6A (experimental): SHARC-assisted initialization of rejected diffuse denoiser history. Needs the denoiser.
     bool historyPrior = false;
+
+    // NVIDIA SHARC Checkpoint A. trainingTile, freezeTraining, statistics and resetRequest apply to both caches; the D6
+    // cache's minimumSamples, adaptiveResolution and historyPrior do not apply to NVIDIA SHARC.
+    SharcImplementation implementation = SharcImplementation::Nvidia;
+    // NVIDIA's cache resampling in its update pass (its multi-bounce feedback). False: the depth-matched diagnostic, whose
+    // cache holds exactly what the production-depth path traces after the query vertex.
+    bool nvidiaCacheFeedback = true;
+    // log2 entries: 20 (40 MiB, production), 21 or 22 (80 or 160 MiB).
+    std::uint32_t nvidiaCapacityLog2 = 20;
+    std::uint32_t nvidiaAccumulationFrames = 16;
+    std::uint32_t nvidiaStaleFrames = 64;
+    float nvidiaSceneScale = 35.0f;
 
     bool operator==(const SharcSettings&) const = default;
 };
@@ -133,6 +153,9 @@ struct SharcStatus
     std::uint64_t cacheBytes = 0;
     // ER.1 Phase 2: why a requested SHARC is not active yet (its libraries are compiling or failed); empty otherwise.
     std::string preparation;
+    // NVIDIA SHARC Checkpoint A: the implementation in use, and its statistics (SharcCache::Statistic*, two frames old).
+    SharcImplementation implementation = SharcImplementation::EngineD6;
+    std::uint32_t nvidiaStatistics[16]{};
 };
 
 inline bool IsValidPathTraceReferenceSettings(const PathTraceReferenceSettings& settings)

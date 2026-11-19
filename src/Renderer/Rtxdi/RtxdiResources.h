@@ -2,6 +2,7 @@
 
 #include "Renderer/Buffer.h"
 #include "Renderer/Rtxdi/RtxdiLightBridge.h"
+#include "Renderer/Rtxdi/RtxdiShaderData.h"
 
 #include "Rtxdi/DI/ReSTIRDI.h"
 
@@ -13,19 +14,46 @@
 #include <vector>
 
 class DescriptorHeap;
+class UploadBuffer;
 
-// RTXPT.3 R3.5: what previous reservoirs were computed against. Reuse needs identical visibility geometry (the
-// previous-surface visibility rays of ray-traced bias correction are traced through the current TLAS) and
-// identical materials (previous-surface target PDFs). These are the renderer's existing accumulation-reset
-// identities: scene-resource lifetime, TLAS address and TLAS recording, material revision.
+// RTXPT.3 R3.5 / PT.2A: what previous reservoirs were computed against. Reuse always needs the same scene resources,
+// the same TLAS (address) referencing the same geometry (TopLevelAccelerationStructure::GetGeometryIdentity: no rebuilt
+// BLAS, membership change or re-resolved instance) and the same materials (previous-surface target PDFs).
+// topLevelRecording changes with every TLAS recording, including transform-only updates. Before PT.2A it was part of the
+// required identity, so any moving object discarded all history; it is now compared only under the conservative policy.
+// When it differs, bias-correction visibility of previous surfaces is traced through the moved TLAS (RtxdiReuseBridge.hlsli).
 struct RtxdiHistorySignature
 {
     std::uint64_t sceneResourceLifetime = 0;
     D3D12_GPU_VIRTUAL_ADDRESS topLevelAddress = 0;
+    std::uint64_t topLevelGeometry = 0;
     std::uint64_t topLevelRecording = 0;
     std::uint64_t materialRevision = 0;
 
     bool operator==(const RtxdiHistorySignature&) const = default;
+};
+
+// PT.2A: why the most recent BeginFrame did or did not reuse history (the first failing condition, in this order).
+enum class RtxdiHistoryDecision : std::uint8_t
+{
+    Reused,
+    NoCommittedFrame,
+    PreviousSurfacesUnavailable,
+    SceneResources,
+    TopLevel,
+    Geometry,
+    Material,
+    Transforms
+};
+
+// Which changes keep history. preserveThroughTransforms (PT.2A): moved instances keep history; otherwise any TLAS recording
+// change drops it. preserveThroughLightChanges (PT.2B): a light that moved or changed keeps its samples (translated by stable
+// key, evaluated with its previous record by bias correction); otherwise only lights whose whole identity is unchanged
+// translate. Both off is the pre-PT.2A conservative behaviour.
+struct RtxdiHistoryPolicy
+{
+    bool preserveThroughTransforms = true;
+    bool preserveThroughLightChanges = true;
 };
 
 // What one ReSTIR DI recording may use. Values only; valid until the next BeginFrame, CommitFrame,
@@ -42,18 +70,21 @@ struct RtxdiFrame
     // is -1.
     bool historyValid = false;
 
-    // Uploaded per frame through the renderer's frame upload buffer, like the scene light table.
+    // PT.2B: the light data RecordLightData copies to the GPU. The previous records are those the previous reservoirs were
+    // computed with (empty without history).
     std::vector<RtxdiLightRecord> lightRecords;
+    std::vector<RtxdiLightRecord> previousLightRecords;
     // currentToPrevious (one entry per current light) followed by previousToCurrent (one per previous light).
     std::vector<std::int32_t> lightTranslation;
     std::uint32_t previousLightCount = 0;
 };
 
 // RTXPT.3: renderer-owned RTXDI state of the raster-primary ReSTIR DI variant (uniform local-light selection,
-// fused spatiotemporal reuse, no RIS or environment resources). Owns one RWStructuredBuffer of
+// fused spatiotemporal reuse, no RIS or presampling resources). Owns one RWStructuredBuffer of
 // RTXDI_PackedDIReservoir holding the SDK's three reservoir arrays in its block-linear layout, the SDK's
-// neighbor-offset table (immutable), the SDK's ReSTIRDIContext that rotates the arrays, and the light set and
-// history signature the previous reservoirs refer to.
+// neighbor-offset table (immutable), the light data buffer (PT.2B, RtxdiLightDataLayout, rewritten every frame), the
+// SDK's ReSTIRDIContext that rotates the arrays, and the light set and history signature the previous reservoirs refer
+// to.
 //
 // Lifetime follows PreviousGBufferHistory and the WaitForGPU model: Initialize, Resize and Shutdown release
 // immediately, so the caller guarantees the queue is idle. History follows R4: BeginFrame prepares a pending
@@ -97,11 +128,19 @@ class RtxdiResources
     void Shutdown();
 
     // Prepares this recording from the committed state and the frame's light set. History is usable only if
-    // a committed frame exists, its signature equals `signature`, and the previous surfaces it was computed on
-    // are available (`previousSurfacesAvailable`). Replaces any earlier pending frame. Returns false, leaving
-    // `frame` untouched, while unallocated.
+    // a committed frame exists, the previous surfaces it was computed on are available (`previousSurfacesAvailable`)
+    // and its signature matches `signature`: every field except topLevelRecording, which must also match only without
+    // policy.preserveThroughTransforms. Lights translate under policy.preserveThroughLightChanges
+    // (BuildRtxdiLightTranslation). Replaces any earlier pending frame. Returns false, leaving `frame` untouched, while
+    // unallocated.
     bool BeginFrame(const RtxdiLightSet& lights, const RtxdiHistorySignature& signature,
-        bool previousSurfacesAvailable, RtxdiFrame& frame);
+        bool previousSurfacesAvailable, const RtxdiHistoryPolicy& policy, RtxdiFrame& frame);
+
+    // PT.2B: copies the frame's light data (RtxdiLightDataLayout) from a frame upload allocation into the light data buffer
+    // and leaves it readable by non-pixel shaders. The copy runs on the GPU timeline after every earlier reader of the
+    // buffer in this queue, so one buffer serves all frames in flight. Returns false while unallocated, or when the frame
+    // exceeds the capacity or the upload fails.
+    bool RecordLightData(ID3D12GraphicsCommandList* commandList, UploadBuffer& upload, const RtxdiFrame& frame);
 
     // After the recording's command list was submitted: its reservoirs and lights become the previous frame.
     // Does nothing without a pending frame.
@@ -123,10 +162,15 @@ class RtxdiResources
         return m_historyValid;
     }
 
-    // Evidence only: whether the most recent BeginFrame allowed reuse of history.
+    // Evidence only: whether the most recent BeginFrame allowed reuse of history, and why.
     bool LastFrameUsedHistory() const noexcept
     {
         return m_lastFrameUsedHistory;
+    }
+
+    RtxdiHistoryDecision LastHistoryDecision() const noexcept
+    {
+        return m_lastHistoryDecision;
     }
 
     Buffer& GetReservoirBuffer() noexcept
@@ -144,6 +188,18 @@ class RtxdiResources
     unsigned int GetNeighborOffsetsSRVIndex() const noexcept
     {
         return m_neighborOffsetsSRVIndex;
+    }
+
+    // ByteAddressBuffer SRV of the light data (RtxdiLightDataLayout::CapacityBytes); valid while allocated.
+    unsigned int GetLightDataSRVIndex() const noexcept
+    {
+        return m_lightData.GetDescriptorIndex();
+    }
+
+    // Left in NON_PIXEL_SHADER_RESOURCE by RecordLightData.
+    Buffer& GetLightDataBuffer() noexcept
+    {
+        return m_lightData;
     }
 
     // Bytes of GPU memory owned; 0 while unallocated.
@@ -167,6 +223,8 @@ class RtxdiResources
     };
 
     Buffer m_reservoirs;
+    Buffer m_lightData;
+    std::vector<std::uint8_t> m_lightDataStaging;
     DescriptorHeap* m_descriptorHeap = nullptr;
     unsigned int m_reservoirUAVIndex = UINT_MAX;
     ID3D12Resource* m_neighborOffsets = nullptr;
@@ -180,6 +238,7 @@ class RtxdiResources
     std::uint32_t m_frameIndex = 0;
     bool m_historyValid = false;
     bool m_lastFrameUsedHistory = false;
+    RtxdiHistoryDecision m_lastHistoryDecision = RtxdiHistoryDecision::NoCommittedFrame;
 
     unsigned int m_width = 0;
     unsigned int m_height = 0;

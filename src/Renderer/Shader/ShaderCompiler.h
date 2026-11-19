@@ -114,6 +114,11 @@ class ShaderCompiler
     // path-keyed identity (cache entries, worker jobs, cooked records) never mixes profiles.
     static ShaderLibraryProfile GetLibraryProfile(const std::filesystem::path& libraryPath);
 
+    // NVIDIA SHARC (Documentation/Rendering/NVIDIA_SHARC_Integration_A.md): shaders under a SharcNv/ directory compile with
+    // -enable-16bit-types, which SharcTypes.h requires. Like the profile, a pure function of the path; every other shader
+    // keeps its arguments, so no other DXIL changes.
+    static bool UsesNative16BitTypes(const std::filesystem::path& shaderPath);
+
     private:
     // Logs through Engine when diagnostics is null; otherwise appends to it.
     bool Initialize(std::string* diagnostics);

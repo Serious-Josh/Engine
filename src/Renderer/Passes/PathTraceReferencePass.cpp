@@ -71,7 +71,7 @@ namespace
     // RTXPT D.1B.2: the library of the extraction direct pass. It never shares a library with the production direct
     // pass (PathTraceReSTIRDIExtract.hlsl), so the production ReSTIR DI library is unchanged.
     // SHARC.4D: the cache libraries of each variant (the reference library with PATH_TRACE_RADIANCE_CACHE_LIBRARY).
-    const char* RadianceCacheLibraryPath(PathTraceLibraryVariant variant, PathTraceRadianceCacheLibrary library)
+    const char* D6RadianceCacheLibraryPath(PathTraceLibraryVariant variant, PathTraceRadianceCacheLibrary library)
     {
         static constexpr const char* paths[][3] = {
             {"PathTraceReferenceRadianceCacheDeferred.hlsl", "PathTraceReferenceRadianceCacheDeferredSM69.hlsl",
@@ -119,6 +119,85 @@ namespace
         }
 
         return paths[static_cast<size_t>(library)][column];
+    }
+
+    // NVIDIA SHARC v1.8.3: its variant tree (SharcNv/, compiled with -enable-16bit-types). The training slot holds the
+    // update library (with cache resampling, or without it for the depth-matched diagnostic); the four render slots share
+    // one library and the two raw-distance slots another, exactly as the D6 cache's. The D6 cache's diagnostic and PSR
+    // libraries have no NVIDIA counterpart (nullptr).
+    const char* NvidiaRadianceCacheLibraryPath(PathTraceLibraryVariant variant, PathTraceRadianceCacheLibrary library,
+        bool depthMatched)
+    {
+        static constexpr const char* training[] = {"SharcNv/PathTraceSharcNvTraining.hlsl",
+            "SharcNv/PathTraceSharcNvTrainingSM69.hlsl", "SharcNv/PathTraceSharcNvTrainingSERSM69.hlsl"};
+        static constexpr const char* trainingDepthMatched[] = {"SharcNv/PathTraceSharcNvTrainingDepthMatched.hlsl",
+            "SharcNv/PathTraceSharcNvTrainingDepthMatchedSM69.hlsl", "SharcNv/PathTraceSharcNvTrainingDepthMatchedSERSM69.hlsl"};
+        static constexpr const char* render[] = {"SharcNv/PathTraceSharcNvRender.hlsl", "SharcNv/PathTraceSharcNvRenderSM69.hlsl",
+            "SharcNv/PathTraceSharcNvRenderSERSM69.hlsl"};
+        static constexpr const char* renderRaw[] = {"SharcNv/PathTraceSharcNvRenderRawDiffuseHitDistance.hlsl",
+            "SharcNv/PathTraceSharcNvRenderRawDiffuseHitDistanceSM69.hlsl",
+            "SharcNv/PathTraceSharcNvRenderRawDiffuseHitDistanceSERSM69.hlsl"};
+        // PSR.2: the same libraries with the PSR G-buffer (PsrChainLibraryPath adds the two-bounce PsrK2/ prefix).
+        static constexpr const char* psrTraining[] = {"SharcNv/PathTraceSharcNvPsrTraining.hlsl",
+            "SharcNv/PathTraceSharcNvPsrTrainingSM69.hlsl", "SharcNv/PathTraceSharcNvPsrTrainingSERSM69.hlsl"};
+        static constexpr const char* psrTrainingDepthMatched[] = {"SharcNv/PathTraceSharcNvPsrTrainingDepthMatched.hlsl",
+            "SharcNv/PathTraceSharcNvPsrTrainingDepthMatchedSM69.hlsl",
+            "SharcNv/PathTraceSharcNvPsrTrainingDepthMatchedSERSM69.hlsl"};
+        static constexpr const char* psrRender[] = {"SharcNv/PathTraceSharcNvPsrRender.hlsl",
+            "SharcNv/PathTraceSharcNvPsrRenderSM69.hlsl", "SharcNv/PathTraceSharcNvPsrRenderSERSM69.hlsl"};
+        static constexpr const char* psrRenderRaw[] = {"SharcNv/PathTraceSharcNvPsrRenderRawDiffuseHitDistance.hlsl",
+            "SharcNv/PathTraceSharcNvPsrRenderRawDiffuseHitDistanceSM69.hlsl",
+            "SharcNv/PathTraceSharcNvPsrRenderRawDiffuseHitDistanceSERSM69.hlsl"};
+        size_t column = 0;
+
+        if(variant == PathTraceLibraryVariant::SM69)
+        {
+            column = 1;
+        }
+        else if(variant == PathTraceLibraryVariant::SM69SER)
+        {
+            column = 2;
+        }
+
+        switch(library)
+        {
+        case PathTraceRadianceCacheLibrary::Training:
+            return depthMatched ? trainingDepthMatched[column] : training[column];
+        case PathTraceRadianceCacheLibrary::Render:
+        case PathTraceRadianceCacheLibrary::RenderExtraction:
+        case PathTraceRadianceCacheLibrary::RenderSplitIndirect:
+        case PathTraceRadianceCacheLibrary::RenderSplitIndirectExtraction:
+            return render[column];
+        case PathTraceRadianceCacheLibrary::RenderExtractionRawDiffuseHitDistance:
+        case PathTraceRadianceCacheLibrary::RenderSplitIndirectExtractionRawDiffuseHitDistance:
+            return renderRaw[column];
+        case PathTraceRadianceCacheLibrary::PsrTraining:
+            return depthMatched ? psrTrainingDepthMatched[column] : psrTraining[column];
+        case PathTraceRadianceCacheLibrary::PsrRenderSplitIndirect:
+        case PathTraceRadianceCacheLibrary::PsrRenderSplitIndirectExtraction:
+            return psrRender[column];
+        case PathTraceRadianceCacheLibrary::PsrRenderSplitIndirectExtractionRawDiffuseHitDistance:
+            return psrRenderRaw[column];
+        default:
+            return nullptr;
+        }
+    }
+
+    const char* RadianceCacheLibraryPath(PathTraceLibraryVariant variant, PathTraceRadianceCacheLibrary library,
+        PathTraceRadianceCacheImplementation implementation = PathTraceRadianceCacheImplementation::EngineD6)
+    {
+        switch(implementation)
+        {
+        case PathTraceRadianceCacheImplementation::Nvidia:
+            return NvidiaRadianceCacheLibraryPath(variant, library, false);
+        case PathTraceRadianceCacheImplementation::NvidiaDepthMatched:
+            return NvidiaRadianceCacheLibraryPath(variant, library, true);
+        case PathTraceRadianceCacheImplementation::EngineD6:
+        case PathTraceRadianceCacheImplementation::Count:
+            break;
+        }
+
+        return D6RadianceCacheLibraryPath(variant, library);
     }
 
     bool IsPsrCacheLibrary(PathTraceRadianceCacheLibrary library)
@@ -331,14 +410,18 @@ namespace
 
     // SHARC.4D: the Raster Primary pipeline with a learning library and the cache binding (b3) appended.
     RayTracingPipelineDescription BuildRadianceCachePipelineDescription(PathTraceLibraryVariant variant,
-        PathTraceRadianceCacheLibrary library)
+        PathTraceRadianceCacheLibrary library,
+        PathTraceRadianceCacheImplementation implementation = PathTraceRadianceCacheImplementation::EngineD6)
     {
         RayTracingPipelineDescription description = BuildPathTracePipelineDescription(PathTracePrimary::Raster, variant);
-        description.shaderPath = RadianceCacheLibraryPath(variant, library);
+        const char* path = RadianceCacheLibraryPath(variant, library, implementation);
+        description.shaderPath = path ? path : "";
+        const bool nvidia = implementation != PathTraceRadianceCacheImplementation::EngineD6;
 
         if(library == PathTraceRadianceCacheLibrary::Training || library == PathTraceRadianceCacheLibrary::PsrTraining)
         {
-            description.rayGenerationShader = L"PathTraceRadianceCacheTrainingRayGeneration";
+            description.rayGenerationShader = nvidia ? L"PathTraceSharcNvTrainingRayGeneration" :
+                L"PathTraceRadianceCacheTrainingRayGeneration";
         }
         else if(library == PathTraceRadianceCacheLibrary::RenderExtraction ||
             library == PathTraceRadianceCacheLibrary::RenderExtractionRawDiffuseHitDistance)
@@ -451,7 +534,9 @@ namespace
             return std::filesystem::path("DI1") / path;
         }
 
-        if(name.starts_with("PathTraceReference") && name.find("Training") == std::string::npos)
+        // NVIDIA SHARC's render libraries (SharcNv/) pair like the reference render libraries; its update libraries do not.
+        if((name.starts_with("PathTraceReference") || name.starts_with("PathTraceSharcNv")) &&
+            name.find("Training") == std::string::npos)
         {
             return std::filesystem::path("GI6") / path;
         }
@@ -852,11 +937,14 @@ ShaderLibraryPreparation PathTraceReferencePass::PrepareLibrary(
         m_extractSplitRawFailed = false;
         m_extractSplitRawFailure.clear();
 
-        // SHARC.4D: the learning libraries include the reference library.
-        for(RadianceCacheLearningPipeline& learning : m_radianceCache)
+        // SHARC.4D: the learning libraries include the reference library (NVIDIA SHARC's too).
+        for(auto& set : m_radianceCacheSets)
         {
-            learning.failed = false;
-            learning.failure.clear();
+            for(RadianceCacheLearningPipeline& learning : set)
+            {
+                learning.failed = false;
+                learning.failure.clear();
+            }
         }
 
         Log::Info("Accepted the asynchronously compiled " + libraryName + " DXR library.");
@@ -971,8 +1059,16 @@ std::vector<PathTraceLibraryRequirement> PathTraceReferencePass::GetRequiredLibr
 
     if(needs.radianceCache)
     {
-        add(RadianceCacheLibraryPath(m_libraryVariant, PathTraceRadianceCacheLibrary::Training));
-        add(RadianceCacheLibraryPath(m_libraryVariant, needs.radianceCacheRender));
+        const char* training = RadianceCacheLibraryPath(m_libraryVariant, PathTraceRadianceCacheLibrary::Training,
+            needs.radianceCacheImplementation);
+        const char* render = RadianceCacheLibraryPath(m_libraryVariant, needs.radianceCacheRender,
+            needs.radianceCacheImplementation);
+
+        if(training && render)
+        {
+            add(training);
+            add(render);
+        }
     }
 
     return libraries;
@@ -986,8 +1082,8 @@ std::vector<PathTraceLibraryRequirement> PathTraceReferencePass::GetPackagedLibr
 
     // PS.5C: the ordinary path with every denoiser's extraction, and each PSR chain (single, two-bounce) with and
     // without extraction and the raw diffuse hit distance, as PSR prepares exactly the set its frame needs.
-    // PS.5D: each of those with SHARC, whose ReSTIR DI render library follows the signal (Renderer::SharcRenderLibrary);
-    // the experimental D6 cache's query and deferred libraries are never used by packaged games.
+    // PS.5D: each of those with SHARC, whose ReSTIR DI render library follows the signal (Renderer::SharcRenderLibrary).
+    // NVIDIA SHARC (the production cache) is cooked as compiled DXIL; its shader source is never packaged.
     constexpr PathTraceRadianceCacheLibrary sharcRender[] = {PathTraceRadianceCacheLibrary::RenderSplitIndirect,
         PathTraceRadianceCacheLibrary::RenderSplitIndirectExtraction,
         PathTraceRadianceCacheLibrary::RenderSplitIndirectExtractionRawDiffuseHitDistance};
@@ -1004,6 +1100,7 @@ std::vector<PathTraceLibraryRequirement> PathTraceReferencePass::GetPackagedLibr
             needs.rawDiffuseHitDistance = signal == 2;
             needs.radianceCache = sharc;
             needs.radianceCacheRender = sharcRender[signal];
+            needs.radianceCacheImplementation = PathTraceRadianceCacheImplementation::Nvidia;
 
             for(PathTraceLibraryRequirement& library : pass->GetRequiredLibraries(needs))
             {
@@ -1070,7 +1167,13 @@ std::vector<PathTraceReferencePass::PipelineRequirement> PathTraceReferencePass:
             for(auto library : {PathTraceRadianceCacheLibrary::PsrTraining,
                 PsrRenderLibrary(needs.extraction, needs.rawDiffuseHitDistance)})
             {
-                auto description = BuildRadianceCachePipelineDescription(m_libraryVariant, library);
+                if(!RadianceCacheLibraryPath(m_libraryVariant, library, needs.radianceCacheImplementation))
+                {
+                    continue;
+                }
+
+                auto description = BuildRadianceCachePipelineDescription(m_libraryVariant, library,
+                    needs.radianceCacheImplementation);
                 description.shaderPath = chainPath(description.shaderPath);
                 add(description);
             }
@@ -1114,10 +1217,13 @@ std::vector<PathTraceReferencePass::PipelineRequirement> PathTraceReferencePass:
     }
 
     // EnsureRadianceCacheLearning: SHARC's sparse training and render pipelines.
-    if(needs.radianceCache)
+    if(needs.radianceCache && RadianceCacheLibraryPath(m_libraryVariant, needs.radianceCacheRender,
+        needs.radianceCacheImplementation))
     {
-        add(BuildRadianceCachePipelineDescription(m_libraryVariant, PathTraceRadianceCacheLibrary::Training));
-        add(BuildRadianceCachePipelineDescription(m_libraryVariant, needs.radianceCacheRender));
+        add(BuildRadianceCachePipelineDescription(m_libraryVariant, PathTraceRadianceCacheLibrary::Training,
+            needs.radianceCacheImplementation));
+        add(BuildRadianceCachePipelineDescription(m_libraryVariant, needs.radianceCacheRender,
+            needs.radianceCacheImplementation));
     }
 
     return pipelines;
@@ -1150,11 +1256,14 @@ bool PathTraceReferencePass::IsPipelineLive(const std::string& identity) const
         return true;
     }
 
-    for(const RadianceCacheLearningPipeline& learning : m_radianceCache)
+    for(const auto& set : m_radianceCacheSets)
     {
-        if(live(learning.pipeline))
+        for(const RadianceCacheLearningPipeline& learning : set)
         {
-            return true;
+            if(live(learning.pipeline))
+            {
+                return true;
+            }
         }
     }
 
@@ -2457,14 +2566,17 @@ void PathTraceReferencePass::ResetPrimarySurfaceReplacementChainPipelines()
     }
 
     // The combined PSR + SHARC learning pipelines and their GI.6 twins.
-    for(size_t index = 0; index < std::size(m_radianceCache); ++index)
+    // Only the D6 cache has combined PSR libraries.
+    RadianceCacheLearningPipeline* d6Pipelines = m_radianceCacheSets[static_cast<size_t>(PathTraceRadianceCacheImplementation::EngineD6)];
+
+    for(size_t index = 0; index < static_cast<size_t>(PathTraceRadianceCacheLibrary::Count); ++index)
     {
         if(!IsPsrCacheLibrary(static_cast<PathTraceRadianceCacheLibrary>(index)))
         {
             continue;
         }
 
-        RadianceCacheLearningPipeline& learning = m_radianceCache[index];
+        RadianceCacheLearningPipeline& learning = d6Pipelines[index];
         const auto twin = m_psrRayQueryPipelines.find(&learning.pipeline);
 
         if(twin != m_psrRayQueryPipelines.end())
@@ -2593,7 +2705,14 @@ bool PathTraceReferencePass::EnsureRadianceCacheLearning(
         return false;
     }
 
-    RayTracingPipelineDescription description = BuildRadianceCachePipelineDescription(m_libraryVariant, library);
+    if(!RadianceCacheLibraryPath(m_libraryVariant, library, m_radianceCacheImplementation))
+    {
+        failureReason = "NVIDIA SHARC has no counterpart of this D6 cache library.";
+        return false;
+    }
+
+    RayTracingPipelineDescription description = BuildRadianceCachePipelineDescription(m_libraryVariant, library,
+        m_radianceCacheImplementation);
 
     // Multibounce PSR: the combined PSR + SHARC libraries follow the PSR chain length.
     if(IsPsrCacheLibrary(library))
@@ -2957,14 +3076,20 @@ Texture* PathTraceReferencePass::EnsureRawDiffuseHitDistanceTexture(ID3D12Device
 
 bool PathTraceReferencePass::HasRawDiffuseHitDistanceResources() const
 {
-    const auto& renderExtraction =
-        m_radianceCache[static_cast<size_t>(PathTraceRadianceCacheLibrary::RenderExtractionRawDiffuseHitDistance)];
-    const auto& renderSplitExtraction = m_radianceCache[static_cast<size_t>(
-        PathTraceRadianceCacheLibrary::RenderSplitIndirectExtractionRawDiffuseHitDistance)];
+    bool cacheLibraries = false;
+
+    for(const auto& set : m_radianceCacheSets)
+    {
+        const auto& renderExtraction =
+            set[static_cast<size_t>(PathTraceRadianceCacheLibrary::RenderExtractionRawDiffuseHitDistance)];
+        const auto& renderSplitExtraction = set[static_cast<size_t>(
+            PathTraceRadianceCacheLibrary::RenderSplitIndirectExtractionRawDiffuseHitDistance)];
+        cacheLibraries = cacheLibraries || renderExtraction.ready || renderSplitExtraction.ready || renderExtraction.failed ||
+            renderSplitExtraction.failed;
+    }
 
     return m_rawDiffuseHitDistanceTexture.GetResource() || m_extractRasterRawReady || m_extractSplitRawReady ||
-        m_extractRasterRawFailed || m_extractSplitRawFailed || renderExtraction.ready || renderSplitExtraction.ready ||
-        renderExtraction.failed || renderSplitExtraction.failed;
+        m_extractRasterRawFailed || m_extractSplitRawFailed || cacheLibraries;
 }
 
 void PathTraceReferencePass::ReleaseRawDiffuseHitDistanceResources()
@@ -2992,10 +3117,13 @@ void PathTraceReferencePass::ReleaseRawDiffuseHitDistanceResources()
     releaseTwin(m_extractRasterRawPipeline);
     releaseTwin(m_extractSplitIndirectRawPipeline);
 
-    for(const PathTraceRadianceCacheLibrary library : {PathTraceRadianceCacheLibrary::RenderExtractionRawDiffuseHitDistance,
-        PathTraceRadianceCacheLibrary::RenderSplitIndirectExtractionRawDiffuseHitDistance})
+    for(auto& set : m_radianceCacheSets)
     {
-        releaseTwin(m_radianceCache[static_cast<size_t>(library)].pipeline);
+        for(const PathTraceRadianceCacheLibrary library : {PathTraceRadianceCacheLibrary::RenderExtractionRawDiffuseHitDistance,
+            PathTraceRadianceCacheLibrary::RenderSplitIndirectExtractionRawDiffuseHitDistance})
+        {
+            releaseTwin(set[static_cast<size_t>(library)].pipeline);
+        }
     }
 
     m_extractRasterRawPipeline.Shutdown();
@@ -3007,14 +3135,17 @@ void PathTraceReferencePass::ReleaseRawDiffuseHitDistanceResources()
     m_extractRasterRawFailure.clear();
     m_extractSplitRawFailure.clear();
 
-    for(const PathTraceRadianceCacheLibrary library : {PathTraceRadianceCacheLibrary::RenderExtractionRawDiffuseHitDistance,
-        PathTraceRadianceCacheLibrary::RenderSplitIndirectExtractionRawDiffuseHitDistance})
+    for(auto& set : m_radianceCacheSets)
     {
-        RadianceCacheLearningPipeline& pipeline = m_radianceCache[static_cast<size_t>(library)];
-        pipeline.pipeline.Shutdown();
-        pipeline.ready = false;
-        pipeline.failed = false;
-        pipeline.failure.clear();
+        for(const PathTraceRadianceCacheLibrary library : {PathTraceRadianceCacheLibrary::RenderExtractionRawDiffuseHitDistance,
+            PathTraceRadianceCacheLibrary::RenderSplitIndirectExtractionRawDiffuseHitDistance})
+        {
+            RadianceCacheLearningPipeline& pipeline = set[static_cast<size_t>(library)];
+            pipeline.pipeline.Shutdown();
+            pipeline.ready = false;
+            pipeline.failed = false;
+            pipeline.failure.clear();
+        }
     }
 }
 
@@ -3482,18 +3613,21 @@ void PathTraceReferencePass::ReleaseResources()
     m_historyPriorTexture.Shutdown();
     m_rawDiffuseHitDistanceTexture.Shutdown();
 
-    for(RadianceCacheLearningPipeline& learning : m_radianceCache)
+    for(auto& set : m_radianceCacheSets)
     {
-        const auto twin = m_psrRayQueryPipelines.find(&learning.pipeline);
-        if(twin != m_psrRayQueryPipelines.end())
+        for(RadianceCacheLearningPipeline& learning : set)
         {
-            if(twin->second) twin->second->Shutdown();
-            m_psrRayQueryPipelines.erase(twin);
+            const auto twin = m_psrRayQueryPipelines.find(&learning.pipeline);
+            if(twin != m_psrRayQueryPipelines.end())
+            {
+                if(twin->second) twin->second->Shutdown();
+                m_psrRayQueryPipelines.erase(twin);
+            }
+            learning.pipeline.Shutdown();
+            learning.ready = false;
+            learning.failed = false;
+            learning.failure.clear();
         }
-        learning.pipeline.Shutdown();
-        learning.ready = false;
-        learning.failed = false;
-        learning.failure.clear();
     }
 
     ReleasePrimarySurfaceReplacementPipelines();

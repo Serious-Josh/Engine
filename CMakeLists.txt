@@ -37,6 +37,39 @@ add_subdirectory(
     "${CMAKE_CURRENT_BINARY_DIR}/RTXDI"
 )
 
+# NVIDIA SHARC v1.8.3 (NVIDIA-RTX/SHARC 4e21b585) - optional shader-only dependency, kept outside the Engine repository
+# under NVIDIA's RTX SDK license. Its unmodified headers are deployed beside the Editor's shaders for runtime DXC
+# compilation only: never into EngineRuntime, packaged games or any redistributable folder while source redistribution
+# rights are unconfirmed (Documentation/Rendering/NVIDIA_SHARC_Integration_A.md). Without the checkout, NVIDIA SHARC is
+# unavailable at run time and every other rendering path is unchanged.
+set(ENGINE_SHARC_ROOT
+    "${CMAKE_CURRENT_SOURCE_DIR}/../SHARC"
+    CACHE PATH "Path to the NVIDIA SHARC checkout (v1.8.3, commit 4e21b585)"
+)
+set(ENGINE_SHARC_HEADERS SharcCommon.h SharcTypes.h HashGridCommon.h HashGridTypes.h)
+set(ENGINE_SHARC_AVAILABLE ON)
+
+foreach(header IN LISTS ENGINE_SHARC_HEADERS)
+    if(NOT EXISTS "${ENGINE_SHARC_ROOT}/include/${header}")
+        set(ENGINE_SHARC_AVAILABLE OFF)
+    endif()
+endforeach()
+
+if(ENGINE_SHARC_AVAILABLE)
+    file(STRINGS "${ENGINE_SHARC_ROOT}/include/SharcCommon.h" ENGINE_SHARC_VERSION_LINES REGEX "#define SHARC_VERSION_(MAJOR|MINOR|BUILD) ")
+    string(REGEX REPLACE "[^0-9;]" "" ENGINE_SHARC_VERSION_DIGITS "${ENGINE_SHARC_VERSION_LINES}")
+
+    if(NOT ENGINE_SHARC_VERSION_DIGITS STREQUAL "1;8;3")
+        message(WARNING "NVIDIA SHARC at '${ENGINE_SHARC_ROOT}' is not v1.8.3 (found ${ENGINE_SHARC_VERSION_DIGITS}); "
+            "NVIDIA SHARC stays unavailable.")
+        set(ENGINE_SHARC_AVAILABLE OFF)
+    endif()
+else()
+    message(STATUS "NVIDIA SHARC not found at '${ENGINE_SHARC_ROOT}'; NVIDIA SHARC is unavailable in this build.")
+endif()
+
+list(TRANSFORM ENGINE_SHARC_HEADERS PREPEND "${ENGINE_SHARC_ROOT}/include/" OUTPUT_VARIABLE ENGINE_SHARC_HEADER_PATHS)
+
 include(FetchContent)
 
 # Assimp
@@ -369,6 +402,7 @@ add_library(EngineCore OBJECT
     src/Renderer/Passes/PathTraceSpatialPass.cpp
     src/Renderer/Passes/PathTraceTemporalPass.cpp
     src/Renderer/RadianceCache/RadianceCache.cpp
+    src/Renderer/Sharc/SharcCache.cpp
     src/Renderer/PreviousGBufferHistory.cpp
     src/Renderer/Rtxdi/RtxdiLightBridge.cpp
     src/Renderer/Rtxdi/RtxdiResources.cpp
@@ -840,6 +874,14 @@ if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Renderer
     target_compile_definitions(RtxdiFoundationTests PRIVATE ENGINE_SOURCE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}"
         ENGINE_RTXDI_INCLUDE="${ENGINE_RTXDI_ROOT}/Include")
 endif()
+# Local-only NVIDIA SHARC Checkpoint A radiance precision probe (headless D3D12), same guard; needs the SHARC checkout.
+if(ENGINE_BUILD_DIAGNOSTICS AND ENGINE_SHARC_AVAILABLE AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Renderer/tests/SharcPrecisionTests.cpp")
+    add_executable(SharcPrecisionTests src/Renderer/tests/SharcPrecisionTests.cpp)
+    target_link_libraries(SharcPrecisionTests PRIVATE EngineCore)
+    engine_use_agility(SharcPrecisionTests)
+    target_compile_definitions(SharcPrecisionTests PRIVATE ENGINE_SOURCE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}"
+        ENGINE_SHARC_INCLUDE="${ENGINE_SHARC_ROOT}/include")
+endif()
 # Local-only path-trace DXR library reuse regression (headless D3D12), same guard.
 if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Renderer/tests/PathTraceLibraryReuseTests.cpp")
     add_executable(PathTraceLibraryReuseTests src/Renderer/tests/PathTraceLibraryReuseTests.cpp)
@@ -954,6 +996,20 @@ add_custom_command(
 
     COMMENT "Copying runtime assets and dependencies"
 )
+
+# NVIDIA SHARC headers, Editor only (after the asset copy above, which replaces assets/). See ENGINE_SHARC_ROOT.
+if(ENGINE_SHARC_AVAILABLE)
+    add_custom_command(
+        TARGET Engine
+        POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:Engine>/assets/Shaders/Sharc"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${ENGINE_SHARC_HEADER_PATHS}
+            "$<TARGET_FILE_DIR:Engine>/assets/Shaders/Sharc"
+        COMMENT "Deploying NVIDIA SHARC v1.8.3 shader headers (Editor only)"
+        VERBATIM
+    )
+endif()
+
 engine_deploy_dxc(Engine)
 # The Editor and (PS.5E) the packaged runtime both initialize DLSS. EngineRuntime's directory gets the SDK's production
 # runtime too; Build Game ships it only in games whose saved settings can use DLSS (BuildGame.cpp DeployRuntimeFiles).

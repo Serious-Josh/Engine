@@ -32,6 +32,10 @@ class GraphicsDevice
     D3D12_RAYTRACING_TIER GetRayTracingTier() const;
     D3D_SHADER_MODEL GetHighestShaderModel() const;
     bool ShaderExecutionReorderingActuallyReorders() const;
+    // NVIDIA SHARC's requirements (SharcCache::CapabilityFailure). Reported at initialization, never required.
+    bool SupportsInt64ShaderOps() const;
+    bool SupportsNative16BitShaderOps() const;
+    bool SupportsAtomicInt64OnDescriptorHeapResources() const;
 
     private:
     void QueryShaderCapabilities();
@@ -47,4 +51,7 @@ class GraphicsDevice
     // 0 when the query failed.
     D3D_SHADER_MODEL m_highestShaderModel = static_cast<D3D_SHADER_MODEL>(0);
     bool m_serActuallyReorders = false;
+    bool m_int64ShaderOps = false;
+    bool m_native16BitShaderOps = false;
+    bool m_atomicInt64OnDescriptorHeapResources = false;
 };

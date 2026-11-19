@@ -12,6 +12,8 @@
 #include "PathTraceLights.hlsli"
 #include "PathTracePrimarySurface.hlsli"
 #include "RayTracingInstanceData.hlsli"
+// PT.2B: who estimates the HDRI at the ReSTIR DI vertex; read by the ReSTIR DI direct pass and by every split indirect pass.
+#include "RtxdiEnvironmentConfig.hlsli"
 
 // RTXPT.3: PathTraceReSTIRDI.hlsl compiles this file with PATH_TRACE_RESTIR_DI_LIBRARY defined, for the ReSTIR DI
 // direct pass. Every RTXDI addition below is inside that specialization, so this library (the reference,
@@ -153,9 +155,6 @@ cbuffer SceneLightConstants : register(b1)
 };
 
 #ifdef PATH_TRACE_RESTIR_DI_LIBRARY
-// RTXDI light records, two per register: RtxdiLightSet::Capacity / 2.
-#define RTXDI_LIGHT_RECORD_REGISTERS 33
-
 // RTXPT.3, read only by PathTraceReSTIRDISplitDirectRayGeneration, whose pipeline alone binds b2.
 // Identical layout to PathTraceRtxdiConstants (RtxdiShaderData.h).
 cbuffer RtxdiConstants : register(b2)
@@ -170,37 +169,45 @@ cbuffer RtxdiConstants : register(b2)
     // WNP.2: 1 shadow-tests the selected initial sample before reuse (RtxdiBridgeInitialVisible).
     uint rtxdiInitialVisibility;
 
-    uint4 rtxdiLightRecords[RTXDI_LIGHT_RECORD_REGISTERS];
+    // PT.2B: the raw SRV of the frame's light data (RtxdiLightDataLayout: current records, previous records, then the
+    // current-to-previous and previous-to-current translation) and its two record counts.
+    uint rtxdiLightDataIndex;
+    uint rtxdiCurrentLightCount;
+    uint rtxdiPreviousLightCount;
+    // PT.2B, Reservoir environment strategy only: environment and BSDF candidates per path sample.
+    uint rtxdiEnvironmentSamples;
+
+    uint rtxdiBrdfSamples;
+    // 1 when previous reservoirs, previous surfaces, previous light records and the translation may be read.
+    uint rtxdiHistoryValid;
+    uint rtxdiNeighborOffsetsIndex;
+    uint rtxdiMotionIndex;
 
     // R3.5/R3.6 fused spatiotemporal reuse.
     RTXDI_RuntimeParameters rtxdiRuntime;
     RTXDI_DISpatioTemporalResamplingParameters rtxdiSpatioTemporal;
 
-    // 1 when previous reservoirs, previous surfaces and the translation below may be read.
-    uint rtxdiHistoryValid;
-    uint rtxdiNeighborOffsetsIndex;
-    uint rtxdiMotionIndex;
-    uint rtxdiCurrentLightCount;
-
-    uint rtxdiPreviousLightCount;
     uint rtxdiPreviousDepthIndex;
     uint rtxdiPreviousSurfaceIndex;
     uint rtxdiPreviousGeometricNormalIndex;
-
     uint rtxdiPreviousMaterialIndex;
-    uint3 rtxdiPadding2;
+
+    // PT.2A: 1 lets final shading reuse the initial-visibility result for a provably identical ray; 2 (diagnostics) also
+    // traces it and counts disagreements (RTXDI_DIAGNOSTIC_FINAL_REUSE_MISMATCHES).
+    uint rtxdiReuseInitialVisibility;
+    // PT.2A diagnostics: RWByteAddressBuffer of RTXDI_DIAGNOSTIC_* counters, or 0xFFFFFFFF (none).
+    uint rtxdiDiagnosticCountersIndex;
+    uint rtxdiPadding0;
+    uint rtxdiPadding1;
 
     float3 rtxdiPreviousCameraPosition;
-    float rtxdiPadding3;
+    float rtxdiPadding2;
     float3 rtxdiCameraForward;
-    float rtxdiPadding4;
+    float rtxdiPadding3;
     float3 rtxdiPreviousCameraForward;
-    float rtxdiPadding5;
+    float rtxdiPadding4;
 
     row_major float4x4 rtxdiPreviousInverseCameraRelativeViewProjection;
-
-    // Current-to-previous entries (rtxdiCurrentLightCount), then previous-to-current (rtxdiPreviousLightCount).
-    int4 rtxdiLightTranslation[RTXDI_LIGHT_RECORD_REGISTERS];
 };
 #endif
 
@@ -301,25 +308,20 @@ PathTraceSun PathTraceFrameSun()
 // RTXPT.3 RTXDI application bridge inputs (ReSTIR DI variant only): the frame's own lights and HDRI.
 // -----------------------------------------------------------------------------
 
-RtxdiLightRecord RtxdiBridgeLoadLightRecord(uint lightIndex)
+// PT.2B: a light of this frame's set, or (previousFrame) of the set the previous reservoirs were computed with, from the
+// light data. Previous records exist only while history is valid; any index outside its frame's set is no light.
+GPULight RtxdiBridgeLoadLight(uint lightIndex, bool previousFrame)
 {
-    uint4 pair = rtxdiLightRecords[lightIndex >> 1u];
-    bool second = (lightIndex & 1u) != 0u;
+    uint count = previousFrame ? (rtxdiHistoryValid != 0u ? rtxdiPreviousLightCount : 0u) : rtxdiCurrentLightCount;
 
-    RtxdiLightRecord record;
-    record.kind = second ? pair.z : pair.x;
-    record.sourceIndex = second ? pair.w : pair.y;
-    return record;
-}
+    if(lightIndex >= count)
+    {
+        return RtxdiInvalidLightRecord();
+    }
 
-GPULight RtxdiBridgeLoadTableLight(uint sourceIndex)
-{
-    return sceneLights[sourceIndex];
-}
-
-PathTraceSun RtxdiBridgeSun()
-{
-    return PathTraceFrameSun();
+    ByteAddressBuffer lightData = ResourceDescriptorHeap[rtxdiLightDataIndex];
+    uint first = previousFrame ? rtxdiCurrentLightCount : 0u;
+    return RtxdiLoadLightRecord(lightData, (first + lightIndex) * RTXDI_LIGHT_RECORD_BYTES);
 }
 
 PathTraceEnvironment RtxdiBridgeEnvironment()
@@ -332,7 +334,8 @@ RWStructuredBuffer<RTXDI_PackedDIReservoir> RtxdiReservoirs()
     return ResourceDescriptorHeap[rtxdiReservoirBufferIndex];
 }
 
-// R3.2 strict translation: -1 when a light has no counterpart whose whole identity is unchanged.
+// The light's index in the other frame (RtxdiLightBridge.h BuildRtxdiLightTranslation): -1 when it has no reusable
+// counterpart there.
 int RtxdiBridgeTranslateLightIndex(int lightIndex, bool currentToPrevious)
 {
     uint count = currentToPrevious ? rtxdiCurrentLightCount : rtxdiPreviousLightCount;
@@ -342,13 +345,14 @@ int RtxdiBridgeTranslateLightIndex(int lightIndex, bool currentToPrevious)
         return -1;
     }
 
+    ByteAddressBuffer lightData = ResourceDescriptorHeap[rtxdiLightDataIndex];
     uint entry = currentToPrevious ? uint(lightIndex) : rtxdiCurrentLightCount + uint(lightIndex);
-    return rtxdiLightTranslation[entry >> 2u][entry & 3u];
+    uint translationOffset = (rtxdiCurrentLightCount + rtxdiPreviousLightCount) * RTXDI_LIGHT_RECORD_BYTES;
+    return asint(lightData.Load(translationOffset + entry * 4u));
 }
 
 #define RTXDI_BRIDGE_ENVIRONMENT_SAMPLER environmentSampler
 #define RTXDI_LIGHT_RESERVOIR_BUFFER RtxdiReservoirs()
-#define RTXDI_BRIDGE_PREVIOUS_TO_CURRENT_LIGHT(index) RtxdiBridgeTranslateLightIndex(int(index), false)
 #define RTXDI_BRIDGE_TRACED_INITIAL_VISIBILITY 1
 #include "RtxdiApplicationBridge.hlsli"
 #endif
@@ -531,6 +535,17 @@ float PathTraceIndirectClampScale(float3 contribution)
     return luminance > PATH_TRACE_INDIRECT_LUMINANCE_CLAMP ? PATH_TRACE_INDIRECT_LUMINANCE_CLAMP / luminance : 1.0f;
 }
 
+// PT.2B Approach B (RTXDI_ENVIRONMENT_STRATEGY_SEPARATE_MIS): only the HDRI term of PathTraceMissRadiance for a non-delta
+// continuation, power-heuristic weighted against the HDRI light sample exactly as there.
+float3 PathTraceMissEnvironmentRadiance(float3 direction, float previousPdf)
+{
+    PathTraceEnvironment environment = PathTraceFrameEnvironment();
+    float3 environmentRadiance = PathTraceEnvironmentRadiance(environment, environmentSampler, direction);
+    float environmentWeight = PathTraceEnvironmentSamplingEnabled(environment) ?
+        PathTracePowerHeuristic(previousPdf, PathTraceEnvironmentPdf(environment, direction)) : 1.0f;
+    return environmentRadiance * environmentWeight;
+}
+
 float3 PathTraceMissRadiance(float3 direction, bool previousDelta, float previousPdf)
 {
     PathTraceEnvironment environment = PathTraceFrameEnvironment();
@@ -639,6 +654,83 @@ float3 PathTraceDirectLightingLobes(PathTraceSurface surface, float3 position, i
     return radiance;
 }
 
+#ifdef PATH_TRACE_SHARC_NV_TRAINING
+// NVIDIA SHARC training's next-event estimation: the sun and environment as PathTraceDirectLightingLobes, but one table
+// light instead of all of them. A single-pass weighted reservoir picks light i with probability w_i / sum(w), where w_i
+// is the luminance of its unshadowed incident radiance here (no rays). w_i is zero only where the light contributes
+// nothing (out of range, outside its cone), so dividing the shaded sample by its probability is unbiased. Table lights
+// are delta lights (pdf 0), so no BSDF-sampled MIS weight depends on the selection.
+float3 PathTraceSharcNvTrainingDirectLighting(PathTraceSurface surface, float3 position, inout PathTraceRandom random,
+    inout uint rayCount, out float3 diffuseRadiance)
+{
+    float3 radiance = float3(0.0f, 0.0f, 0.0f);
+    diffuseRadiance = float3(0.0f, 0.0f, 0.0f);
+    float3 sampleDiffuse;
+    float2 sunRandom = PathTraceNextFloat2(random);
+    float4 environmentRandom = PathTraceNextFloat4(random);
+    float selectionRandom = PathTraceNextFloat(random);
+
+    PathTraceSun sun = PathTraceFrameSun();
+
+    if(PathTraceSunHasEnergy(sun))
+    {
+        radiance += PathTraceShadeLightSampleLobes(surface, position, PathTraceSampleSun(sun, sunRandom), rayCount,
+            sampleDiffuse);
+        diffuseRadiance += sampleDiffuse;
+    }
+
+    uint lightCount = min(sceneLightCount, SCENE_LIGHT_CAPACITY);
+    float totalWeight = 0.0f;
+    float selectedWeight = 0.0f;
+    PathTraceLightSample selected = (PathTraceLightSample)0;
+
+    for(uint lightIndex = 0u; lightIndex < lightCount; ++lightIndex)
+    {
+        PathTraceLightSample lightSample = PathTraceSampleTableLight(sceneLights[lightIndex], position);
+        float weight = lightSample.valid ? PathTraceLuminance(lightSample.radiance) : 0.0f;
+
+        if(!(weight > 0.0f) || !isfinite(weight))
+        {
+            continue;
+        }
+
+        totalWeight += weight;
+
+        // Keeps candidate i with probability w_i / (running total); the survivor has probability w_i / sum(w).
+        if(selectionRandom * totalWeight < weight)
+        {
+            selected = lightSample;
+            selectedWeight = weight;
+            selectionRandom = selectionRandom * totalWeight / weight;
+        }
+        else
+        {
+            selectionRandom = (selectionRandom * totalWeight - weight) / (totalWeight - weight);
+        }
+    }
+
+    if(selectedWeight > 0.0f && isfinite(totalWeight))
+    {
+        float inverseProbability = totalWeight / selectedWeight;
+        radiance += PathTraceShadeLightSampleLobes(surface, position, selected, rayCount, sampleDiffuse) *
+            inverseProbability;
+        diffuseRadiance += sampleDiffuse * inverseProbability;
+    }
+
+    PathTraceEnvironment environment = PathTraceFrameEnvironment();
+
+    if(PathTraceEnvironmentSamplingEnabled(environment))
+    {
+        PathTraceLightSample environmentSample = PathTraceSampleEnvironment(environment, environmentSampler,
+            environmentRandom);
+        radiance += PathTraceShadeLightSampleLobes(surface, position, environmentSample, rayCount, sampleDiffuse);
+        diffuseRadiance += sampleDiffuse;
+    }
+
+    return radiance;
+}
+#endif
+
 float3 PathTraceDirectLighting(PathTraceSurface surface, float3 position, inout PathTraceRandom random,
     inout uint rayCount)
 {
@@ -740,6 +832,48 @@ static bool g_rtxdiStoreReservoir;
 static bool g_rtxdiReservoirStored;
 // Visibility rays traced by RTXDI's bias correction, added to the pixel's ray count after reuse.
 static uint g_rtxdiReuseRays;
+// PT.2A: the initial-visibility ray of this path sample (RtxdiBridgeInitialVisible). It leaves the current surface at the
+// position and geometric normal shading uses, so a final ray with the same direction and distance bits is the same ray.
+static bool g_rtxdiInitialRayKnown;
+static float3 g_rtxdiInitialRayDirection;
+static float g_rtxdiInitialRayDistance;
+static bool g_rtxdiInitialRayVisible;
+// PT.2A diagnostics: initial-visibility rays of this path sample.
+static uint g_rtxdiInitialRays;
+
+// PT.2A diagnostics: word offsets (x4 bytes) of the counters the ReSTIR DI direct pass adds to when
+// rtxdiDiagnosticCountersIndex is bound (Renderer::m_rtxdiDiagnosticCountersIndexForTesting).
+static const uint RTXDI_DIAGNOSTIC_SAMPLES = 0u;
+static const uint RTXDI_DIAGNOSTIC_REUSED = 1u;
+static const uint RTXDI_DIAGNOSTIC_INITIAL_RAYS = 2u;
+static const uint RTXDI_DIAGNOSTIC_REUSE_RAYS = 3u;
+static const uint RTXDI_DIAGNOSTIC_FINAL_RAYS = 4u;
+static const uint RTXDI_DIAGNOSTIC_FINAL_RAYS_REUSED = 5u;
+static const uint RTXDI_DIAGNOSTIC_FINAL_VISIBLE = 6u;
+static const uint RTXDI_DIAGNOSTIC_FINAL_REUSE_MISMATCHES = 7u;
+// PT.2B, separate-MIS strategy: the RTXDI random-sampler pass of the HDRI light sample (unused by the SDK's passes).
+static const uint PATH_TRACE_RTXDI_ENVIRONMENT_RANDOM_SEED = 41u;
+
+// PT.2B: BSDF-candidate rays (Reservoir environment strategy) and HDRI light-sample shadow rays (separate-MIS strategy).
+static const uint RTXDI_DIAGNOSTIC_BRDF_RAYS = 8u;
+static const uint RTXDI_DIAGNOSTIC_ENVIRONMENT_RAYS = 9u;
+
+void RtxdiCountDiagnostic(uint counter, uint value)
+{
+    if(rtxdiDiagnosticCountersIndex == 0xFFFFFFFFu)
+    {
+        return;
+    }
+
+    // One atomic per wave.
+    uint total = WaveActiveSum(value);
+
+    if(WaveIsFirstLane() && total != 0u)
+    {
+        RWByteAddressBuffer counters = ResourceDescriptorHeap[rtxdiDiagnosticCountersIndex];
+        counters.InterlockedAdd(counter * 4u, total);
+    }
+}
 
 // -----------------------------------------------------------------------------
 // RTXPT.3 R3.5/R3.6 reuse inputs: previous surfaces from the R4 G-buffer history, visibility through the
@@ -801,10 +935,34 @@ bool RtxdiBridgeVisible(RAB_Surface bridgeSurface, RAB_LightSample lightSample)
 }
 
 // WNP.2 initial visibility: the same shadow ray shading uses, from the current surface, counted with the reuse rays.
+// PT.2A: the ray and its result are remembered for final shading.
 bool RtxdiBridgeInitialVisible(RAB_Surface bridgeSurface, RAB_LightSample lightSample)
 {
-    return lightSample.sample.valid && RtxdiBridgeVisible(bridgeSurface, lightSample);
+    if(!lightSample.sample.valid)
+    {
+        return false;
+    }
+
+    ++g_rtxdiInitialRays;
+    g_rtxdiInitialRayVisible = RtxdiBridgeVisible(bridgeSurface, lightSample);
+    g_rtxdiInitialRayDirection = lightSample.sample.direction;
+    g_rtxdiInitialRayDistance = lightSample.sample.distance;
+    g_rtxdiInitialRayKnown = true;
+    return g_rtxdiInitialRayVisible;
 }
+
+#if RTXDI_ENVIRONMENT_STRATEGY == RTXDI_ENVIRONMENT_STRATEGY_RESERVOIR
+// PT.2B: BSDF-candidate rays of this path sample (RAB_TraceRayForLocalLight), also counted with the reuse rays.
+static uint g_rtxdiBrdfRays;
+
+// A BSDF candidate's ray: the shadow ray shading would trace toward a distant light in that direction.
+bool RtxdiBridgeEscapes(RAB_Surface bridgeSurface, float3 direction)
+{
+    ++g_rtxdiBrdfRays;
+    return PathTraceVisible(bridgeSurface.position, bridgeSurface.surface.geometricNormal, direction,
+        PATH_TRACE_DISTANT_LIGHT_DISTANCE, g_rtxdiReuseRays);
+}
+#endif
 
 int2 RtxdiBridgeViewSize()
 {
@@ -822,8 +980,9 @@ Buffer<float2> RtxdiNeighborOffsets()
 // RTXPT.3 Gate 1: vertex-0 direct light from one RTXDI reservoir, with MIS weight 1: a fresh initial reservoir,
 // then (R3.5/R3.6) fused spatiotemporal reuse of the previous frame's reservoirs when history is valid. The
 // estimate is F(y) * V(y) * W (RtxdiApplicationBridge.hlsli); the indirect pass's non-delta continuation misses
-// then add no sun or HDRI radiance. The six randoms PathTraceDirectLighting would draw are drawn and discarded,
-// matching PathTraceSplitDirectLighting.
+// then add no sun radiance, and no HDRI radiance unless the HDRI is estimated separately (PT.2B, below). The six randoms
+// PathTraceDirectLighting would draw are drawn and discarded, matching PathTraceSplitDirectLighting; the caller's
+// stream is a placeholder (zero state), so nothing here may use those values.
 // RTXPT D.1B.2: diffuseContribution is the diffuse-lobe part of the returned estimate, F_diffuse(y) V(y) W with the
 // same selected sample and reservoir weight (signal extraction only).
 float3 PathTraceRtxdiDirectLighting(PathTraceSurface surface, float3 position, inout PathTraceRandom random,
@@ -845,9 +1004,14 @@ float3 PathTraceRtxdiDirectLighting(PathTraceSurface surface, float3 position, i
     // are already visibility-filtered (RtxdiReuseBridge.hlsli). The ray is counted with the reuse rays.
     RAB_LightSample selectedSample;
     g_rtxdiReuseRays = 0u;
+    g_rtxdiInitialRays = 0u;
+    g_rtxdiInitialRayKnown = false;
+#if RTXDI_ENVIRONMENT_STRATEGY == RTXDI_ENVIRONMENT_STRATEGY_RESERVOIR
+    g_rtxdiBrdfRays = 0u;
+#endif
     RTXDI_DIReservoir reservoir = RtxdiBridgeSampleInitialReservoir(bridgeSurface, g_rtxdiPixel, g_rtxdiSampleSeed,
-        RtxdiBridgeInitialSamplingParameters(rtxdiLocalLightSamples, rtxdiInfiniteLightSamples, rtxdiInitialVisibility),
-        rtxdiLightBuffer, selectedSample);
+        RtxdiBridgeInitialSamplingParameters(rtxdiLocalLightSamples, rtxdiInfiniteLightSamples, rtxdiInitialVisibility,
+            rtxdiEnvironmentSamples, rtxdiBrdfSamples), rtxdiLightBuffer, selectedSample);
     rayCount += g_rtxdiReuseRays;
 
     // Split history: only sample 0, the sample that publishes the pixel's reservoir, reuses the previous frame. Every
@@ -872,10 +1036,14 @@ float3 PathTraceRtxdiDirectLighting(PathTraceSurface surface, float3 position, i
             screenSpaceMotion, rtxdiBufferIndices.temporalResamplingInputBufferIndex, rtxdiRuntime,
             rtxdiReservoirBuffer, rtxdiSpatioTemporal, temporalSamplePixel, selectedSample);
         rayCount += g_rtxdiReuseRays;
+        RtxdiCountDiagnostic(RTXDI_DIAGNOSTIC_REUSE_RAYS, g_rtxdiReuseRays);
     }
 
     float3 contribution = float3(0.0f, 0.0f, 0.0f);
     bool visible = false;
+    uint finalRays = 0u;
+    uint finalRaysReused = 0u;
+    uint finalReuseMismatches = 0u;
 
     if(RTXDI_IsValidDIReservoir(reservoir))
     {
@@ -885,12 +1053,73 @@ float3 PathTraceRtxdiDirectLighting(PathTraceSurface surface, float3 position, i
 
         if(weight > 0.0f && isfinite(weight) && any(unshadowed > 0.0f))
         {
-            visible = PathTraceVisible(position, surface.geometricNormal, selectedSample.sample.direction,
-                selectedSample.sample.distance, rayCount);
+            // PT.2A: the initial-visibility ray of this dispatch left the same surface (position and geometric normal) through
+            // the same TLAS. When the final sample's direction and distance are bit-identical, the final ray is that ray, so
+            // its result is reused; anything else (a reused or reconnected sample, a different light point) is traced.
+            bool sameRay = rtxdiReuseInitialVisibility != 0u && g_rtxdiInitialRayKnown &&
+                all(asuint(selectedSample.sample.direction) == asuint(g_rtxdiInitialRayDirection)) &&
+                asuint(selectedSample.sample.distance) == asuint(g_rtxdiInitialRayDistance);
+
+            if(sameRay)
+            {
+                visible = g_rtxdiInitialRayVisible;
+                finalRaysReused = 1u;
+
+                if(rtxdiReuseInitialVisibility == 2u)
+                {
+                    uint verificationRays = 0u;
+                    bool traced = PathTraceVisible(position, surface.geometricNormal, selectedSample.sample.direction,
+                        selectedSample.sample.distance, verificationRays);
+                    finalReuseMismatches = traced != visible ? 1u : 0u;
+                    visible = traced;
+                }
+            }
+            else
+            {
+                visible = PathTraceVisible(position, surface.geometricNormal, selectedSample.sample.direction,
+                    selectedSample.sample.distance, rayCount);
+                finalRays = 1u;
+            }
+
             contribution = visible ? unshadowed * weight : float3(0.0f, 0.0f, 0.0f);
             diffuseContribution = visible ? unshadowedDiffuse * weight : float3(0.0f, 0.0f, 0.0f);
         }
     }
+
+#if RTXDI_ENVIRONMENT_STRATEGY == RTXDI_ENVIRONMENT_STRATEGY_SEPARATE_MIS
+    // PT.2B Approach B: the HDRI is no RTXDI light. One HDRI light sample, power-heuristic weighted against the BSDF
+    // continuation, which the indirect pass adds when it escapes (PathTraceMissEnvironmentRadiance): the reference path
+    // tracer's estimator of the HDRI at this vertex. Its randoms are an independent per-pixel, per-sample RTXDI sequence.
+    PathTraceEnvironment environment = PathTraceFrameEnvironment();
+
+    if(PathTraceEnvironmentSamplingEnabled(environment))
+    {
+        RTXDI_RandomSamplerState environmentRng = RTXDI_InitRandomSampler(g_rtxdiPixel, g_rtxdiSampleSeed,
+            PATH_TRACE_RTXDI_ENVIRONMENT_RANDOM_SEED);
+        float4 environmentRandom;
+        environmentRandom.x = RTXDI_GetNextRandom(environmentRng);
+        environmentRandom.y = RTXDI_GetNextRandom(environmentRng);
+        environmentRandom.z = RTXDI_GetNextRandom(environmentRng);
+        environmentRandom.w = RTXDI_GetNextRandom(environmentRng);
+        uint raysBefore = rayCount;
+        float3 environmentDiffuse;
+        contribution += PathTraceShadeLightSampleLobes(surface, position,
+            PathTraceSampleEnvironment(environment, environmentSampler, environmentRandom), rayCount, environmentDiffuse);
+        diffuseContribution += environmentDiffuse;
+        RtxdiCountDiagnostic(RTXDI_DIAGNOSTIC_ENVIRONMENT_RAYS, rayCount - raysBefore);
+    }
+#endif
+
+    RtxdiCountDiagnostic(RTXDI_DIAGNOSTIC_SAMPLES, 1u);
+    RtxdiCountDiagnostic(RTXDI_DIAGNOSTIC_REUSED, reuseHistory ? 1u : 0u);
+    RtxdiCountDiagnostic(RTXDI_DIAGNOSTIC_INITIAL_RAYS, g_rtxdiInitialRays);
+    RtxdiCountDiagnostic(RTXDI_DIAGNOSTIC_FINAL_RAYS, finalRays);
+    RtxdiCountDiagnostic(RTXDI_DIAGNOSTIC_FINAL_RAYS_REUSED, finalRaysReused);
+    RtxdiCountDiagnostic(RTXDI_DIAGNOSTIC_FINAL_VISIBLE, visible ? 1u : 0u);
+    RtxdiCountDiagnostic(RTXDI_DIAGNOSTIC_FINAL_REUSE_MISMATCHES, finalReuseMismatches);
+#if RTXDI_ENVIRONMENT_STRATEGY == RTXDI_ENVIRONMENT_STRATEGY_RESERVOIR
+    RtxdiCountDiagnostic(RTXDI_DIAGNOSTIC_BRDF_RAYS, g_rtxdiBrdfRays);
+#endif
 
     // Ray-traced bias correction treats stored reservoirs as visibility-filtered: an occluded sample is removed
     // (its M kept) before the reservoir becomes history.
@@ -1589,6 +1818,18 @@ PathTraceExtraction PathTraceEmptyExtraction()
 #include "PsrSharcEnergyDiagnostic.hlsli"
 #endif
 
+// NVIDIA SHARC v1.8.3 (the SharcNv/ libraries only, PathTraceSharcNv.hlsli): its update and render hooks. In every other
+// library PATH_TRACE_SHARC_NV expands to nothing, the loop's depth is maxPathDepth and every vertex is shaded.
+#if defined(PATH_TRACE_SHARC_NV_TRAINING) || defined(PATH_TRACE_SHARC_NV_RENDER)
+#include "PathTraceSharcNv.hlsli"
+#define PATH_TRACE_SHARC_NV(statement) statement
+#define PATH_TRACE_LOOP_MAX_DEPTH PATH_TRACE_SHARC_NV_MAX_DEPTH
+#else
+#define PATH_TRACE_SHARC_NV(statement)
+#define PATH_TRACE_LOOP_MAX_DEPTH maxPathDepth
+#define PATH_TRACE_SHARC_NV_SHADES(vertex) true
+#endif
+
 float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex rasterFirstVertex,
     inout PathTraceRandom random, inout uint rayCount, bool extract, inout PathTraceExtraction extraction)
 {
@@ -1600,6 +1841,7 @@ float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex 
     bool previousDelta = true;
     float previousPdf = 0.0f;
     PATH_TRACE_RADIANCE_CACHE_HARVEST(PathTraceRadianceCacheHarvest harvest = PathTraceRadianceCacheHarvestBegin());
+    PATH_TRACE_SHARC_NV(PathTraceSharcNvPath sharcNvPath = PathTraceSharcNvBegin(rasterFirstVertex));
 #ifdef PATH_TRACE_PSR_LIBRARY
 #if defined(PATH_TRACE_PSR_SHARC_INFRASTRUCTURE) && defined(PATH_TRACE_RADIANCE_CACHE_TRAINING)
     harvest.psrReplaced = PathTracePsrReplaced(rasterFirstVertex.psrState);
@@ -1644,7 +1886,7 @@ float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex 
 
     // vertex counts surface interactions. The ray traced after the last allowed vertex is still
     // traced so distant lights reached by BSDF sampling pair with that vertex's light samples.
-    for(uint vertex = 0u; vertex <= maxPathDepth; ++vertex)
+    for(uint vertex = 0u; vertex <= PATH_TRACE_LOOP_MAX_DEPTH; ++vertex)
     {
         float3 position;
         PathTraceSurface surface;
@@ -1718,7 +1960,7 @@ float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex 
                     break;
                 }
 
-                if(rasterFirstVertex.state < 0 || vertex == maxPathDepth)
+                if(rasterFirstVertex.state < 0 || vertex == PATH_TRACE_LOOP_MAX_DEPTH)
                 {
                     break;
                 }
@@ -1776,17 +2018,39 @@ float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex 
                         if(vertex >= 3u) energy.suffixImage += throughput * missRadiance;
 #endif
                         PATH_TRACE_RADIANCE_CACHE_HARVEST(PathTraceRadianceCacheHarvestMiss(harvest, vertex, missRadiance));
+                        PATH_TRACE_SHARC_NV(PathTraceSharcNvMiss(sharcNvPath, missRadiance));
 
                         if(extract)
                         {
                             extraction.diffuse += extraction.diffuseThroughput * missRadiance;
                         }
                     }
+#if RTXDI_ENVIRONMENT_STRATEGY == RTXDI_ENVIRONMENT_STRATEGY_SEPARATE_MIS
+                    else
+                    {
+                        // PT.2B Approach B: RTXDI estimated only the sun and the table lights through the non-delta lobes; the
+                        // HDRI's BSDF-sampled share is this escaped continuation, power-heuristic weighted against the direct
+                        // pass's HDRI light sample. It is the RTXDI vertex's direct light, so it is never clamped.
+                        float3 missRadiance = PathTraceMissEnvironmentRadiance(ray.Direction, previousPdf);
+                        radiance += throughput * missRadiance;
+#ifdef PATH_TRACE_PSR_SHARC_ENERGY_DIAGNOSTIC
+                        if(vertex == 2u) energy.immediateImage += throughput * missRadiance;
+                        if(vertex >= 3u) energy.suffixImage += throughput * missRadiance;
+#endif
+                        PATH_TRACE_RADIANCE_CACHE_HARVEST(PathTraceRadianceCacheHarvestMiss(harvest, vertex, missRadiance));
+                        PATH_TRACE_SHARC_NV(PathTraceSharcNvMiss(sharcNvPath, missRadiance));
+
+                        if(extract)
+                        {
+                            extraction.diffuse += extraction.diffuseThroughput * missRadiance;
+                        }
+                    }
+#endif
 
                     break;
                 }
 
-                if(vertex == maxPathDepth)
+                if(vertex == PATH_TRACE_LOOP_MAX_DEPTH)
                 {
                     break;
                 }
@@ -1931,9 +2195,17 @@ float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex 
         }
 #endif
         PATH_TRACE_RADIANCE_CACHE_HARVEST(PathTraceRadianceCacheHarvestVertex(harvest, primary, vertex, position, surface));
+#ifdef PATH_TRACE_SHARC_NV_RENDER
+        // NVIDIA SHARC: an admitted, cached vertex supplies everything from its own next-event estimation on.
+        if(PathTraceSharcNvQuery(sharcNvPath, primary, vertex, position, ray.Origin, surface, throughput, radiance, extract,
+            extraction))
+        {
+            break;
+        }
+#endif
         bool hasNonDeltaLobe = !surface.deltaSpecular || surface.specularProbability < 1.0f;
 
-        if(hasNonDeltaLobe)
+        if(hasNonDeltaLobe && PATH_TRACE_SHARC_NV_SHADES(vertex))
         {
             float3 direct;
             float3 directDiffuse = float3(0.0f, 0.0f, 0.0f);
@@ -1954,7 +2226,11 @@ float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex 
             }
             else
             {
+#ifdef PATH_TRACE_SHARC_NV_TRAINING
+                direct = PathTraceSharcNvTrainingDirectLighting(surface, position, random, rayCount, directDiffuse);
+#else
                 direct = PathTraceDirectLightingLobes(surface, position, random, rayCount, directDiffuse);
+#endif
             }
 
             // Indirect next-event estimation (vertex >= 1): one contribution, scaled with its diffuse share.
@@ -1969,6 +2245,12 @@ float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex 
             if(vertex >= 2u) energy.suffixImage += throughput * direct;
 #endif
             PATH_TRACE_RADIANCE_CACHE_HARVEST(PathTraceRadianceCacheHarvestDirect(harvest, vertex, direct));
+#ifdef PATH_TRACE_SHARC_NV_TRAINING
+            if(!PathTraceSharcNvDeposit(sharcNvPath, vertex, position, surface, direct, random))
+            {
+                break;
+            }
+#endif
 
             // Vertex 0's direct light is split per lobe; later vertices' is carried by the diffuse throughput.
             if(extract)
@@ -2022,14 +2304,20 @@ float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex 
         }
 #endif
         throughput *= bsdfSample.weight;
+        PATH_TRACE_SHARC_NV(PathTraceSharcNvSegment(sharcNvPath, vertex, bsdfSample, specularStrategy, surface));
         PATH_TRACE_RADIANCE_CACHE_HARVEST(PathTraceRadianceCacheHarvestContinue(harvest, vertex, bsdfSample));
         previousDelta = bsdfSample.delta;
         previousPdf = bsdfSample.pdf;
 
-        // Russian roulette before continuing to a vertex at or beyond the configured depth.
+        // Russian roulette before continuing to a vertex at or beyond the configured depth. NVIDIA SHARC's update pass has
+        // none: a deposit's importance to the paths that later read the voxel is not this path's throughput.
         float survivalRandom = PathTraceNextFloat(random);
 
+#ifdef PATH_TRACE_SHARC_NV_TRAINING
+        if(false)
+#else
         if(vertex + 1u >= russianRouletteDepth)
+#endif
         {
             float survival = min(max(throughput.r, max(throughput.g, throughput.b)), 0.95f);
 
@@ -2071,6 +2359,7 @@ float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex 
 #endif
     PATH_TRACE_RADIANCE_CACHE_HARVEST(PathTraceRadianceCacheHarvestEnd(harvest));
 #undef PATH_TRACE_EXTRACTION_VERTEX
+#undef PATH_TRACE_LOOP_MAX_DEPTH
     return radiance;
 }
 
@@ -2495,7 +2784,9 @@ void PathTracePsrRayGeneration()
 }
 
 // -----------------------------------------------------------------------------
-#ifndef PATH_TRACE_PSR_SHARC_INFRASTRUCTURE
+// NVIDIA SHARC's libraries bind their cache constants at b3, which the guides use.
+#if !defined(PATH_TRACE_PSR_SHARC_INFRASTRUCTURE) && !defined(PATH_TRACE_SHARC_NV_TRAINING) && \
+    !defined(PATH_TRACE_SHARC_NV_RENDER)
 // PSR.1b virtual surface guides (diagnostic consumers only). PathTracePsrGuideRayGeneration replaces the record pass on
 // guide frames: it writes the identical record, from the identical ray and closest-hit evaluation, and in addition one
 // guide per pixel. Physical coordinates (lighting, visibility) stay in the record and the raster vertex 0; the guide

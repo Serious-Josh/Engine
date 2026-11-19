@@ -2,9 +2,17 @@
 
 #include <d3d12.h>
 #include <cstddef>
+#include <cstdint>
 #include <vector>
 
 class DescriptorHeap;
+
+// Where an upload allocation lives, for copies out of it (CopyBufferRegion source): the ring resource or an overflow page.
+struct UploadLocation
+{
+    ID3D12Resource* resource = nullptr;
+    std::uint64_t offset = 0;
+};
 
 class UploadBuffer
 {
@@ -43,6 +51,13 @@ class UploadBuffer
         std::size_t size,
         std::size_t alignment);
 
+    // The same allocation, also reporting its resource and offset; `location` is untouched on failure (0).
+    D3D12_GPU_VIRTUAL_ADDRESS Allocate(
+        const void* data,
+        std::size_t size,
+        std::size_t alignment,
+        UploadLocation& location);
+
     ID3D12Resource* GetResource() const
     {
         return m_resource;
@@ -68,7 +83,8 @@ class UploadBuffer
     // Bounds overflow per frame slot, so a runaway caller fails its allocation instead of growing without limit.
     static constexpr std::size_t MaxOverflowBytesPerFrame = 64u * 1024u * 1024u;
 
-    D3D12_GPU_VIRTUAL_ADDRESS AllocateOverflow(const void* data, std::size_t size, std::size_t alignment);
+    D3D12_GPU_VIRTUAL_ADDRESS AllocateOverflow(const void* data, std::size_t size, std::size_t alignment,
+        UploadLocation& location);
 
     ID3D12Device* m_device = nullptr;
     ID3D12Resource* m_resource = nullptr;

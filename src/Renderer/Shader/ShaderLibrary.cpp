@@ -208,9 +208,23 @@ std::vector<std::byte> ShaderLibrary::CookBootstrap(
     std::map<std::string,std::vector<char>> entries;
     ShaderBootstrapStatistics cooked;
 
+    // NVIDIA SHARC compiles only with its headers deployed beside the shaders (ENGINE_SHARC_ROOT). Without them its
+    // entries are left out, and a packaged game reports SHARC unavailable instead of failing to build.
+    const bool sharcHeaders = std::filesystem::is_regular_file(root / "Sharc" / "SharcCommon.h");
+
+    if(!sharcHeaders)
+    {
+        Log::Info("NVIDIA SHARC headers are not deployed; SHARC is left out of the packaged shader bootstrap.");
+    }
+
     // The arguments Load uses at runtime: the source under the shader root, its own directory as the include path.
     for(const PackagedShaderEntry& shader : shaders)
     {
+        if(!sharcHeaders && shader.feature == PackagedShaderFeature::Sharc)
+        {
+            continue;
+        }
+
         const auto path = (root / shader.path).wstring();
         const auto entryPoint = std::filesystem::path(shader.entryPoint).wstring();
         ShaderCompileResult result;
@@ -236,6 +250,11 @@ std::vector<std::byte> ShaderLibrary::CookBootstrap(
     // subdirectories resolve the RTXDI SDK's angled includes through it) and the persistent DXIL cache.
     for(const PackagedLibraryEntry& library : libraries)
     {
+        if(!sharcHeaders && ShaderCompiler::UsesNative16BitTypes(library.path))
+        {
+            continue;
+        }
+
         const auto path = (root / library.path).wstring();
         const auto includeDirectory = root.wstring();
         ShaderLibraryCompileDescription description{};

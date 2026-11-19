@@ -103,13 +103,12 @@ namespace
         {"NrdPathTracePreparePsr.hlsl", "CSPrepareHybrid", Compute, Feature::PrimarySurfaceReplacement},
         {"NrdPathTracePreparePsr.hlsl", "CSResolveDenoisedHybrid", Compute, Feature::PrimarySurfaceReplacement},
 
-        // SHARC: the cache's clear, header and resolve (RadianceCacheD6::EnsureResources) and its record insertion
-        // (EnsureInsertPipeline), which production SHARC frames create.
-        {"RadianceCacheD6.hlsl", "CSClearWords", Compute, Feature::Sharc},
-        {"RadianceCacheD6.hlsl", "CSWriteHeader", Compute, Feature::Sharc},
-        {"RadianceCacheD6Resolve.hlsl", "CSResolve", Compute, Feature::Sharc},
-        {"RadianceCacheD6Insert.hlsl", "CSInsertRecords", Compute, Feature::Sharc},
-        {"RadianceCacheD6Insert.hlsl", "CSClearRecordStamps", Compute, Feature::Sharc},
+        // SHARC: NVIDIA SHARC's clear, resolve and statistics passes (SharcCache::EnsurePipelines), cooked as DXIL.
+        {"SharcNv/SharcNvResolve.hlsl", "CSClear", Compute, Feature::Sharc},
+        {"SharcNv/SharcNvResolve.hlsl", "CSClearStatistics", Compute, Feature::Sharc},
+        {"SharcNv/SharcNvResolve.hlsl", "CSAccumulationStatistics", Compute, Feature::Sharc},
+        {"SharcNv/SharcNvResolve.hlsl", "CSResolve", Compute, Feature::Sharc},
+        {"SharcNv/SharcNvResolve.hlsl", "CSResolvedStatistics", Compute, Feature::Sharc},
 
         // DLSS: the input preparation every DLSS frame records (Renderer::RecordRenderFrame, DlssInputPreparationPass).
         {"DlssInputPreparation.hlsl", "CSMain", Compute, Feature::Dlss},

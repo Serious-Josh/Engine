@@ -30,6 +30,7 @@ bool TopLevelAccelerationStructure::Initialize(
     const StreamingTelemetry::Scope buildTiming(StreamingTelemetry::Metric::TlasBuildNs, StreamingTelemetry::Metric::TlasBuilds);
     StreamingTelemetry::Add(StreamingTelemetry::Metric::TlasBuildInstances, description.instances.size());
     m_recordingIdentity = 0;
+    m_geometryIdentity = 0;
     m_recordingSlot = UINT_MAX;
 
     if (!device || !commandList || description.instances.empty() || bottomLevelStructures.empty() ||
@@ -40,8 +41,9 @@ bool TopLevelAccelerationStructure::Initialize(
     }
 
     const auto recordingIdentity = AllocateTLASRecordingIdentity();
+    const auto geometryIdentity = AllocateTLASRecordingIdentity();
 
-    if(!recordingIdentity)
+    if(!recordingIdentity || !geometryIdentity)
     {
         return false;
     }
@@ -233,6 +235,7 @@ bool TopLevelAccelerationStructure::Initialize(
     m_instanceCount = description.instances.size();
     m_buildFlags = buildInputs.Flags;
     m_recordingIdentity = recordingIdentity;
+    m_geometryIdentity = geometryIdentity;
     m_recordingSlot = 0;
     return true;
 }
@@ -248,6 +251,8 @@ bool TopLevelAccelerationStructure::Update(
     const StreamingTelemetry::Scope updateTiming(StreamingTelemetry::Metric::TlasUpdateNs, StreamingTelemetry::Metric::TlasUpdates);
     StreamingTelemetry::Add(StreamingTelemetry::Metric::TlasUpdateInstances, changedInstanceIndices.size());
     m_recordingIdentity = 0;
+    const std::uint64_t previousGeometryIdentity = m_geometryIdentity;
+    m_geometryIdentity = 0;
     m_recordingSlot = UINT_MAX;
     const auto recordingIdentity = AllocateTLASRecordingIdentity();
 
@@ -272,6 +277,7 @@ bool TopLevelAccelerationStructure::Update(
     }
 
     // Update the persistent native DXR descriptors for the instances whose scene transforms changed.
+    bool geometryChanged = previousGeometryIdentity == 0;
 
     for (std::size_t instanceIndex : changedInstanceIndices)
     {
@@ -304,6 +310,7 @@ bool TopLevelAccelerationStructure::Update(
             }
         }
 
+        const D3D12_RAYTRACING_INSTANCE_DESC before = instance;
         instance.InstanceID = sourceInstance.instanceID;
 
         instance.InstanceMask = sourceInstance.mask;
@@ -311,6 +318,10 @@ bool TopLevelAccelerationStructure::Update(
         instance.Flags = D3D12_RAYTRACING_INSTANCE_FLAG_NONE;
 
         instance.AccelerationStructure = bottomLevel->GetGPUAddress();
+        geometryChanged = geometryChanged || instance.InstanceID != before.InstanceID ||
+            instance.InstanceMask != before.InstanceMask ||
+            instance.InstanceContributionToHitGroupIndex != before.InstanceContributionToHitGroupIndex ||
+            instance.Flags != before.Flags || instance.AccelerationStructure != before.AccelerationStructure;
 
         for (unsigned int pendingFrame = 0; pendingFrame < FrameCount; ++pendingFrame)
         {
@@ -371,7 +382,15 @@ bool TopLevelAccelerationStructure::Update(
 
     commandList->ResourceBarrier(1, &barrier);
 
+    const std::uint64_t geometryIdentity = geometryChanged ? AllocateTLASRecordingIdentity() : previousGeometryIdentity;
+
+    if (geometryIdentity == 0)
+    {
+        return false;
+    }
+
     m_recordingIdentity = recordingIdentity;
+    m_geometryIdentity = geometryIdentity;
     m_recordingSlot = frameIndex;
     return true;
 }
@@ -439,6 +458,7 @@ void TopLevelAccelerationStructure::Shutdown()
     // The caller proves that no submitted GPU work still references these resources (membership snapshots retire on
     // their last-use fence; scene teardown drains the GPU).
     m_recordingIdentity = 0;
+    m_geometryIdentity = 0;
     m_recordingSlot = UINT_MAX;
 
     for (unsigned int i = 0; i < FrameCount; ++i)

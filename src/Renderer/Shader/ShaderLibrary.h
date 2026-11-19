@@ -58,6 +58,12 @@ class ShaderLibrary
 
     bool Initialize(const std::filesystem::path& shaderRoot);
     void Shutdown();
+
+    // The loose shader directory (empty for a packaged bootstrap, which has no shader sources).
+    const std::filesystem::path& GetShaderRoot() const noexcept
+    {
+        return m_shaderRoot;
+    }
     bool InitializePackaged(std::span<const std::byte> payload);
 
     // The shader bootstrap limits InitializePackaged admits.

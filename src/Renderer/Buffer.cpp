@@ -452,6 +452,56 @@ bool Buffer::CreateRawUAV(
     return true;
 }
 
+bool Buffer::CreateStructuredUAV(
+    ID3D12Device* device,
+    DescriptorHeap& descriptorHeap,
+    std::uint32_t stride)
+{
+    if (!device || !m_resource || m_uavDescriptorIndex != UINT_MAX || stride == 0)
+    {
+        return false;
+    }
+
+    if (m_descriptorHeap && m_descriptorHeap != &descriptorHeap)
+    {
+        return false;
+    }
+
+    const D3D12_RESOURCE_DESC description = m_resource->GetDesc();
+
+    if (description.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER ||
+        !(description.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) ||
+        description.Width == 0 ||
+        description.Width % stride != 0 ||
+        description.Width / stride > UINT_MAX)
+    {
+        return false;
+    }
+
+    const unsigned int index = descriptorHeap.Allocate();
+
+    if (index == UINT_MAX)
+    {
+        return false;
+    }
+
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uavDescription{};
+    uavDescription.Format = DXGI_FORMAT_UNKNOWN;
+    uavDescription.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+    uavDescription.Buffer.FirstElement = 0;
+    uavDescription.Buffer.NumElements = static_cast<UINT>(description.Width / stride);
+    uavDescription.Buffer.StructureByteStride = stride;
+    uavDescription.Buffer.CounterOffsetInBytes = 0;
+    uavDescription.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_NONE;
+
+    device->CreateUnorderedAccessView(m_resource, nullptr, &uavDescription, descriptorHeap.GetCPUHandle(index));
+
+    m_uavDescriptorIndex = index;
+    m_descriptorHeap = &descriptorHeap;
+
+    return true;
+}
+
 void Buffer::Shutdown()
 {
     if (m_descriptorHeap)

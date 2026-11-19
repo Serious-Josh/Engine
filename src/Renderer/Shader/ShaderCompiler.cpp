@@ -261,8 +261,14 @@ bool ShaderCompiler::Compile(
 
     std::wstring shaderDirectory = shaderPath.parent_path().wstring();
 
-    const wchar_t* arguments[] = {description.path, L"-E", description.entryPoint, L"-T", profile, L"-HV",
-                                  L"2021",          L"-I", shaderDirectory.c_str()};
+    std::vector<const wchar_t*> arguments = {description.path, L"-E", description.entryPoint, L"-T", profile, L"-HV",
+                                             L"2021",          L"-I", shaderDirectory.c_str()};
+
+    // NVIDIA SHARC's compute shaders (its resolve) store fp16 data like its libraries.
+    if(UsesNative16BitTypes(description.path))
+    {
+        arguments.push_back(L"-enable-16bit-types");
+    }
 
     // M0c.5 Stage 5.4: the persistent cache, for the same target and arguments. A miss compiles exactly as before.
     const auto cacheStart = std::chrono::steady_clock::now();
@@ -315,7 +321,7 @@ bool ShaderCompiler::Compile(
     const auto compileStart = std::chrono::steady_clock::now();
     output.dxcInvoked = true;
     result =
-        m_compiler->Compile(&sourceBuffer, arguments, static_cast<UINT32>(sizeof(arguments) / sizeof(arguments[0])),
+        m_compiler->Compile(&sourceBuffer, arguments.data(), static_cast<UINT32>(arguments.size()),
                             &recordingIncludeHandler, IID_PPV_ARGS(&compileResult));
     output.dxcMilliseconds = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - compileStart).count();
 
@@ -434,6 +440,12 @@ bool ShaderCompiler::CompileLibrary(
     const wchar_t* profile = description.profile == ShaderLibraryProfile::Library69 ? L"lib_6_9" : L"lib_6_6";
     std::vector<const wchar_t*> arguments = {description.path, L"-T", profile, L"-HV", L"2021", L"-I",
         shaderDirectory.c_str()};
+
+    // NVIDIA SHARC stores fp16 data (SharcTypes.h): only its own variant tree compiles with native 16-bit types.
+    if(UsesNative16BitTypes(description.path))
+    {
+        arguments.push_back(L"-enable-16bit-types");
+    }
     std::error_code sameDirectoryError;
 
     // Root-level libraries keep exactly their original arguments.
@@ -614,7 +626,26 @@ ShaderLibraryProfile ShaderCompiler::GetLibraryProfile(const std::filesystem::pa
         return ShaderLibraryProfile::Library69;
     }
 
+    // NVIDIA SHARC's variant tree follows the same naming: SM69 and SERSM69 wrappers are lib_6_9.
+    if(UsesNative16BitTypes(libraryPath) && fileName.string().ends_with("SM69.hlsl"))
+    {
+        return ShaderLibraryProfile::Library69;
+    }
+
     return ShaderLibraryProfile::Library66;
+}
+
+bool ShaderCompiler::UsesNative16BitTypes(const std::filesystem::path& shaderPath)
+{
+    for(const std::filesystem::path& component : shaderPath)
+    {
+        if(component == "SharcNv")
+        {
+            return true;
+        }
+    }
+
+    return false;
 }
 
 bool ShaderCompiler::DependenciesUnchanged(const std::vector<ShaderSourceDependency>& dependencies)

@@ -5,12 +5,12 @@
 // vertex. Used only by the raster-primary ReSTIR DI variant and its verification.
 //
 // The includer first includes RtxdiLights.hlsli and then provides, before including this file:
-//   RtxdiLightRecord RtxdiBridgeLoadLightRecord(uint lightIndex);
-//   GPULight RtxdiBridgeLoadTableLight(uint sourceIndex);
-//   PathTraceSun RtxdiBridgeSun();
+//   GPULight RtxdiBridgeLoadLight(uint lightIndex, bool previousFrame);  (RtxdiInvalidLightRecord() outside that frame's set)
 //   PathTraceEnvironment RtxdiBridgeEnvironment();
 //   #define RTXDI_BRIDGE_ENVIRONMENT_SAMPLER   (a SamplerState)
 //   #define RTXDI_LIGHT_RESERVOIR_BUFFER       (a RWStructuredBuffer<RTXDI_PackedDIReservoir>)
+// and, for the Reservoir environment strategy (RtxdiEnvironmentConfig.hlsli):
+//   bool RtxdiBridgeEscapes(RAB_Surface surface, float3 direction);  (a ray from the surface reaches the distant HDRI)
 //
 // Estimator. Every candidate is a point y in RTXDI's uv domain [0, 1]^2 of one light. Its contribution there is
 //   F(y) = BSDF * cos * Le / pdf_w(y)   for the sun cone and the HDRI (pdf_w: Engine's solid-angle density of
@@ -18,11 +18,22 @@
 //   F(y) = BSDF * cos * E              for delta lights (point, spot, directional, delta sun; uv unused),
 // exactly the value PathTraceShadeLightSample weights before MIS. RTXDI's target is luminance(F), unshadowed,
 // which is positive wherever F is. RTXDI returns the selected sample y and the reservoir's unbiased contribution
-// weight W; the direct-light estimate is F(y) * V(y) * W. Only light sampling is used (no BRDF candidates and no
-// initial visibility), so this estimate carries MIS weight 1 (RTXPT.3 Gate 1).
+// weight W; the direct-light estimate is F(y) * V(y) * W.
+//
+// Candidate strategies. Local and infinite lights are sampled by light (no BSDF strategy can reach a delta light or the
+// sun, which no BSDF candidate enters), so their candidates carry MIS weight 1 (RTXPT.3 Gate 1). PT.2B, Reservoir strategy
+// only: the HDRI is RTXDI's environment light and has two strategies over the same uv domain. Environment candidates draw
+// uv uniformly; Engine's CDF warp makes that luminance importance sampling, so their uv-space density is 1 on every cell
+// with mass. BSDF candidates sample the surface's non-delta BSDF (density PathTracePdf) and, when their ray escapes, enter
+// the HDRI at the inverse-warped uv (uv-space density PathTracePdf / pdf_w). RTXDI_LightBrdfMisWeight combines the two
+// with the balance heuristic over the candidate counts; the result is the solid-angle balance heuristic of the reference
+// estimator, and a BSDF candidate whose ray is blocked is a zero-weight candidate (its F V is 0 anyway).
 
-// Presampling (RIS buffers, environment region) is not part of this configuration. An includer that needs RTXDI
-// types before this file must define it to 0 itself, before its first RTXDI include.
+#include "RtxdiEnvironmentConfig.hlsli"
+
+// Presampling (RIS buffers, presampled environment tiles) is not part of this configuration: Engine's CDF warp samples
+// the HDRI directly, and local lights are selected uniformly (stratified; PT.2C measured power RIS against it). An includer
+// that needs RTXDI types before this file must define it to 0 itself, before its first RTXDI include.
 #ifndef RTXDI_ENABLE_PRESAMPLING
 #define RTXDI_ENABLE_PRESAMPLING 0
 #elif RTXDI_ENABLE_PRESAMPLING != 0
@@ -44,9 +55,8 @@ struct RAB_Surface
 
 struct RAB_LightInfo
 {
-    RtxdiLightRecord record;
-    // Read only for table kinds.
-    GPULight tableLight;
+    // The light's record in the frame it was loaded for (RtxdiLights.hlsli).
+    GPULight light;
 };
 
 struct RAB_LightSample
@@ -63,7 +73,9 @@ RAB_Surface RAB_EmptySurface()
 
 RAB_LightInfo RAB_EmptyLightInfo()
 {
-    return (RAB_LightInfo)0;
+    RAB_LightInfo lightInfo;
+    lightInfo.light = RtxdiInvalidLightRecord();
+    return lightInfo;
 }
 
 RAB_LightSample RAB_EmptyLightSample()
@@ -73,42 +85,21 @@ RAB_LightSample RAB_EmptyLightSample()
     return lightSample;
 }
 
+// PT.2B: previousFrame loads the previous frame's record at a previous-frame index, as RTXDI asks for it (bias correction
+// evaluates a reused sample at the previous surface it was formed on, with the light as it was then). A light that moved
+// or changed translates by stable key (RtxdiLightBridge.h), so this is its previous state, never its current one.
 RAB_LightInfo RAB_LoadLightInfo(uint index, bool previousFrame)
 {
-    RAB_LightInfo lightInfo = RAB_EmptyLightInfo();
-
-    // Reuse (RtxdiReuseBridge.hlsli) asks for previous-frame lights. Only lights whose whole identity is unchanged
-    // translate (R3.2), so a previous light is its current counterpart's record; one without a counterpart is
-    // an empty light with no contribution.
-#ifdef RTXDI_BRIDGE_PREVIOUS_TO_CURRENT_LIGHT
-    if(previousFrame)
-    {
-        int currentIndex = RTXDI_BRIDGE_PREVIOUS_TO_CURRENT_LIGHT(index);
-
-        if(currentIndex < 0)
-        {
-            return lightInfo;
-        }
-
-        index = uint(currentIndex);
-    }
-#endif
-
-    lightInfo.record = RtxdiBridgeLoadLightRecord(index);
-
-    if(lightInfo.record.kind <= RTXDI_LIGHT_KIND_DIRECTIONAL)
-    {
-        lightInfo.tableLight = RtxdiBridgeLoadTableLight(lightInfo.record.sourceIndex);
-    }
-
+    RAB_LightInfo lightInfo;
+    lightInfo.light = RtxdiBridgeLoadLight(index, previousFrame);
     return lightInfo;
 }
 
 RAB_LightSample RAB_SamplePolymorphicLight(RAB_LightInfo lightInfo, RAB_Surface surface, float2 uv)
 {
     RAB_LightSample lightSample;
-    lightSample.sample = RtxdiSampleLight(lightInfo.record, lightInfo.tableLight, RtxdiBridgeSun(),
-        RtxdiBridgeEnvironment(), RTXDI_BRIDGE_ENVIRONMENT_SAMPLER, surface.position, uv);
+    lightSample.sample = RtxdiSampleLight(lightInfo.light, RtxdiBridgeEnvironment(), RTXDI_BRIDGE_ENVIRONMENT_SAMPLER,
+        surface.position, uv);
     return lightSample;
 }
 
@@ -184,8 +175,56 @@ float RAB_SurfaceEvaluateBrdfPdf(RAB_Surface surface, float3 direction)
     return PathTracePdf(surface.surface, direction);
 }
 
-// BRDF candidates are not part of this configuration (numBrdfSamples = 0): the SDK's BRDF strategy cannot reach
-// the sun or the HDRI, which are infinite lights here. These callbacks report "no candidate" if ever reached.
+float RAB_EvaluateLocalLightSourcePdf(uint lightIndex)
+{
+    return 0.0f;
+}
+
+#if RTXDI_ENVIRONMENT_STRATEGY == RTXDI_ENVIRONMENT_STRATEGY_RESERVOIR
+bool RtxdiBridgeEscapes(RAB_Surface surface, float3 direction);
+
+// The surface RTXDI_SampleBrdf samples (its callbacks receive only a position), set by RtxdiBridgeSampleLightsForSurface.
+static RAB_Surface g_rtxdiBrdfSurface;
+
+// A BSDF candidate: PathTraceSampleBSDF's non-delta events, whose density is PathTracePdf. A delta event (the mirror
+// lobe) or a zero-valued event is no candidate; the delta lobe stays with the path's continuation.
+bool RAB_SurfaceImportanceSampleBrdf(RAB_Surface surface, inout RTXDI_RandomSamplerState rng, out float3 direction)
+{
+    float3 random;
+    random.x = RTXDI_GetNextRandom(rng);
+    random.y = RTXDI_GetNextRandom(rng);
+    random.z = RTXDI_GetNextRandom(rng);
+    PathTraceBSDFSample bsdfSample = PathTraceSampleBSDF(surface.surface, random);
+    direction = bsdfSample.direction;
+    return bsdfSample.valid && !bsdfSample.delta;
+}
+
+// Engine's RTXDI lights include no emissive geometry, so a BSDF ray never finds a local light: it either hits something
+// (no candidate) or escapes, and RTXDI_SampleBrdf then enters the environment light.
+bool RAB_TraceRayForLocalLight(float3 origin, float3 direction, float tMin, float tMax, out uint o_lightIndex,
+    out float2 o_randXY)
+{
+    o_lightIndex = RTXDI_InvalidLightIndex;
+    o_randXY = float2(0.0f, 0.0f);
+    return !RtxdiBridgeEscapes(g_rtxdiBrdfSurface, direction);
+}
+
+float2 RAB_GetEnvironmentMapRandXYFromDir(float3 direction)
+{
+    float2 uv;
+    RtxdiEnvironmentUVFromDirection(RtxdiBridgeEnvironment(), direction, uv);
+    return uv;
+}
+
+// The environment strategy's uv-space density at the direction's uv: 1 where a cell with mass maps there, else 0.
+float RAB_EvaluateEnvironmentMapSamplingPdf(float3 direction)
+{
+    float2 uv;
+    return RtxdiEnvironmentUVFromDirection(RtxdiBridgeEnvironment(), direction, uv) ? 1.0f : 0.0f;
+}
+#else
+// BRDF candidates are not part of this configuration (numBrdfSamples = 0): the HDRI is not RTXDI's environment light, and
+// the SDK's BRDF strategy reaches no other light. These callbacks report "no candidate" if ever reached.
 bool RAB_SurfaceImportanceSampleBrdf(RAB_Surface surface, inout RTXDI_RandomSamplerState rng, out float3 direction)
 {
     direction = surface.surface.normal;
@@ -200,11 +239,6 @@ bool RAB_TraceRayForLocalLight(float3 origin, float3 direction, float tMin, floa
     return false;
 }
 
-float RAB_EvaluateLocalLightSourcePdf(uint lightIndex)
-{
-    return 0.0f;
-}
-
 float2 RAB_GetEnvironmentMapRandXYFromDir(float3 direction)
 {
     return float2(0.0f, 0.0f);
@@ -214,6 +248,7 @@ float RAB_EvaluateEnvironmentMapSamplingPdf(float3 direction)
 {
     return 0.0f;
 }
+#endif
 
 #if defined(RTXDI_BRIDGE_TRACED_INITIAL_VISIBILITY)
 // Initial visibility (enableInitialVisibility = 1): the includer traces the selected initial sample from the surface.
@@ -236,22 +271,141 @@ bool RAB_GetConservativeVisibility(RAB_Surface surface, RAB_LightSample lightSam
 #include "Rtxdi/DI/InitialSampling.hlsli"
 #include "Rtxdi/DI/ReservoirStorage.hlsli"
 
-// Fixed R3.4 configuration (RTXPT.3 Gate 2): uniform local selection, light candidates only. initialVisibility (WNP.2)
-// shadow-tests the selected initial sample and discards it when occluded; it needs RTXDI_BRIDGE_TRACED_INITIAL_VISIBILITY.
+// Fixed R3.4 configuration (RTXPT.3 Gate 2): uniform local selection. initialVisibility (WNP.2) shadow-tests the selected
+// initial sample and discards it when occluded; it needs RTXDI_BRIDGE_TRACED_INITIAL_VISIBILITY. PT.2B: environment and BSDF
+// candidates are read only by the Reservoir environment strategy (0 elsewhere).
 RTXDI_DIInitialSamplingParameters RtxdiBridgeInitialSamplingParameters(uint localLightSamples,
-    uint infiniteLightSamples, uint initialVisibility = 0u)
+    uint infiniteLightSamples, uint initialVisibility = 0u, uint environmentSamples = 0u, uint brdfSamples = 0u)
 {
     RTXDI_DIInitialSamplingParameters parameters = (RTXDI_DIInitialSamplingParameters)0;
     parameters.numLocalLightSamples = localLightSamples;
     parameters.numInfiniteLightSamples = infiniteLightSamples;
+#if RTXDI_ENVIRONMENT_STRATEGY == RTXDI_ENVIRONMENT_STRATEGY_RESERVOIR
+    parameters.numEnvironmentSamples = environmentSamples;
+    parameters.numBrdfSamples = brdfSamples;
+#else
     parameters.numEnvironmentSamples = 0u;
     parameters.numBrdfSamples = 0u;
+#endif
+    // No MIS cutoff: a BSDF ray is never shortened (the HDRI is at infinity).
     parameters.brdfCutoff = 0.0f;
     parameters.brdfRayMinT = 0.0f;
     parameters.localLightSamplingMode = ReSTIRDI_LocalLightSamplingMode_UNIFORM;
     parameters.enableInitialVisibility = initialVisibility;
     return parameters;
 }
+
+#if RTXDI_ENVIRONMENT_STRATEGY == RTXDI_ENVIRONMENT_STRATEGY_RESERVOIR
+// PT.2B Reservoir strategy: RTXDI_SampleEnvironmentMap without presampling. Its presampled tile would hold uv with the inverse
+// of their density; Engine's CDF warp already importance-samples luminance from uniform uv, so each candidate draws uv
+// directly with inverse density 1. Weights, normalization and selection are the SDK's (RTXDI_LightBrdfMisWeight,
+// RTXDI_StreamSample, RTXDI_FinalizeResampling over all MIS candidates).
+RTXDI_DIReservoir RtxdiBridgeSampleEnvironment(inout RTXDI_RandomSamplerState rng, RAB_Surface surface,
+    RTXDI_DIInitialSamplingParameters parameters, RTXDI_InitialSamplingMisData misData,
+    RTXDI_EnvironmentLightBufferParameters environmentParameters, out RAB_LightSample o_selectedSample)
+{
+    RTXDI_DIReservoir state = RTXDI_EmptyDIReservoir();
+    o_selectedSample = RAB_EmptyLightSample();
+
+    if(environmentParameters.lightPresent == 0u || parameters.numEnvironmentSamples == 0u)
+    {
+        return state;
+    }
+
+    RAB_LightInfo lightInfo = RAB_LoadLightInfo(environmentParameters.lightIndex, false);
+
+    for(uint candidate = 0u; candidate < parameters.numEnvironmentSamples; ++candidate)
+    {
+        float2 uv;
+        uv.x = RTXDI_GetNextRandom(rng);
+        uv.y = RTXDI_GetNextRandom(rng);
+        RAB_LightSample candidateSample = RAB_SamplePolymorphicLight(lightInfo, surface, uv);
+        float blendedSourcePdf = RTXDI_LightBrdfMisWeight(surface, candidateSample, 1.0f,
+            misData.environmentMapMisWeight, true, misData.brdfMisWeight, parameters.brdfCutoff);
+        float targetPdf = RAB_GetLightSampleTargetPdfForSurface(candidateSample, surface);
+        float risRandom = RTXDI_GetNextRandom(rng);
+
+        if(!(blendedSourcePdf > 0.0f))
+        {
+            continue;
+        }
+
+        if(RTXDI_StreamSample(state, environmentParameters.lightIndex, uv, risRandom, targetPdf, 1.0f / blendedSourcePdf))
+        {
+            o_selectedSample = candidateSample;
+        }
+    }
+
+    RTXDI_FinalizeResampling(state, 1.0f, float(misData.numMisSamples));
+    state.M = 1;
+    return state;
+}
+
+// RTXDI_SampleLightsForSurface (InitialSampling.hlsli) with the environment reservoir above in place of the presampled one;
+// every other step, and the order the reservoirs combine in, is the SDK's.
+RTXDI_DIReservoir RtxdiBridgeSampleLightsForSurface(inout RTXDI_RandomSamplerState rng,
+    inout RTXDI_RandomSamplerState coherentRng, RAB_Surface surface, RTXDI_DIInitialSamplingParameters parameters,
+    RTXDI_LightBufferParameters lightBufferParameters, out RAB_LightSample o_lightSample)
+{
+    o_lightSample = RAB_EmptyLightSample();
+    RTXDI_InitialSamplingMisData misData = RTXDI_ComputeInitialSamplingMisData(parameters);
+
+    RAB_LightSample localSample = RAB_EmptyLightSample();
+    RTXDI_DIReservoir localReservoir = RTXDI_SampleLocalLights(rng, coherentRng, surface, parameters, misData,
+        parameters.localLightSamplingMode, lightBufferParameters.localLightBufferRegion, localSample);
+
+    RAB_LightSample infiniteSample = RAB_EmptyLightSample();
+    RTXDI_DIReservoir infiniteReservoir = RTXDI_SampleInfiniteLights(rng, surface, parameters.numInfiniteLightSamples,
+        lightBufferParameters.infiniteLightBufferRegion, infiniteSample);
+
+    RAB_LightSample environmentSample;
+    RTXDI_DIReservoir environmentReservoir = RtxdiBridgeSampleEnvironment(rng, surface, parameters, misData,
+        lightBufferParameters.environmentLightParams, environmentSample);
+
+    g_rtxdiBrdfSurface = surface;
+    RAB_LightSample brdfSample = RAB_EmptyLightSample();
+    RTXDI_DIReservoir brdfReservoir = RTXDI_SampleBrdf(rng, surface, parameters.numBrdfSamples, parameters.brdfCutoff,
+        parameters.brdfRayMinT, misData, coherentRng, lightBufferParameters, brdfSample);
+
+    RTXDI_DIReservoir state = RTXDI_EmptyDIReservoir();
+    RTXDI_CombineDIReservoirs(state, localReservoir, 0.5f, localReservoir.targetPdf);
+    bool selectInfinite = RTXDI_CombineDIReservoirs(state, infiniteReservoir, RTXDI_GetNextRandom(rng),
+        infiniteReservoir.targetPdf);
+    bool selectEnvironment = RTXDI_CombineDIReservoirs(state, environmentReservoir, RTXDI_GetNextRandom(rng),
+        environmentReservoir.targetPdf);
+    bool selectBrdf = RTXDI_CombineDIReservoirs(state, brdfReservoir, RTXDI_GetNextRandom(rng), brdfReservoir.targetPdf);
+
+    RTXDI_FinalizeResampling(state, 1.0f, 1.0f);
+    state.M = 1;
+
+    if(selectBrdf)
+    {
+        o_lightSample = brdfSample;
+    }
+    else if(selectEnvironment)
+    {
+        o_lightSample = environmentSample;
+    }
+    else if(selectInfinite)
+    {
+        o_lightSample = infiniteSample;
+    }
+    else
+    {
+        o_lightSample = localSample;
+    }
+
+    if(parameters.enableInitialVisibility && RTXDI_IsValidDIReservoir(state))
+    {
+        if(!RAB_GetConservativeVisibility(surface, o_lightSample))
+        {
+            RTXDI_StoreVisibilityInDIReservoir(state, 0, true);
+        }
+    }
+
+    return state;
+}
+#endif
 
 // One independent initial reservoir for a surface. sampleSeed must differ for every path sample of a pixel
 // (the progressive mean relies on independent estimates). selectedSample is the exact candidate RTXDI chose.
@@ -264,8 +418,13 @@ RTXDI_DIReservoir RtxdiBridgeSampleInitialReservoir(RAB_Surface surface, uint2 p
     RTXDI_RandomSamplerState coherentRng = RTXDI_InitRandomSampler(pixel / RTXDI_TILE_SIZE_IN_PIXELS, sampleSeed,
         RTXDI_DI_GENERATE_INITIAL_SAMPLES_RANDOM_SEED);
 
+#if RTXDI_ENVIRONMENT_STRATEGY == RTXDI_ENVIRONMENT_STRATEGY_RESERVOIR
+    return RtxdiBridgeSampleLightsForSurface(rng, coherentRng, surface, parameters, lightBufferParameters,
+        selectedSample);
+#else
     return RTXDI_SampleLightsForSurface(rng, coherentRng, surface, parameters, lightBufferParameters,
         selectedSample);
+#endif
 }
 
 #endif
