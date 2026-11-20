@@ -373,7 +373,7 @@ namespace
 DxilLibraryCache::DxilLibraryCache(const ShaderLibraryCompileDescription& description,
     std::span<const wchar_t* const> arguments) noexcept :
     DxilLibraryCache(description.usePersistentCache, description.path, description.includeDirectory,
-        description.profile == ShaderLibraryProfile::Library69 ? "lib_6_9" : "lib_6_6", arguments)
+        ShaderCompiler::GetLibraryTarget(description.profile), arguments)
 {
 }
 

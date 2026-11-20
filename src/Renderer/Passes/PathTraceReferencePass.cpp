@@ -15,6 +15,9 @@
 #include "Renderer/RayTracing/RayTracingSceneResources.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <cwchar>
+#include <filesystem>
 #include <iterator>
 #include <optional>
 #include <string>
@@ -22,6 +25,50 @@
 
 namespace
 {
+    // RayQuery 2L diagnostics (Debug builds, ENGINE_DIAG_PIX_EVENTS set): names a path-trace dispatch as a PIX event
+    // region, so profilers (Nsight GPU Trace regimes) attribute metrics to it. Metadata 0 is the unversioned PIX format
+    // (a null-terminated wide string), as MarkDredStage uses. No-ops otherwise.
+    void BeginPathTraceEvent([[maybe_unused]] ID3D12GraphicsCommandList* commandList, [[maybe_unused]] const wchar_t* name)
+    {
+#ifndef NDEBUG
+        static const bool enabled = std::getenv("ENGINE_DIAG_PIX_EVENTS") != nullptr;
+
+        if(enabled && commandList)
+        {
+            commandList->BeginEvent(0, name, static_cast<UINT>((std::wcslen(name) + 1) * sizeof(wchar_t)));
+        }
+#endif
+    }
+
+    void EndPathTraceEvent([[maybe_unused]] ID3D12GraphicsCommandList* commandList)
+    {
+#ifndef NDEBUG
+        static const bool enabled = std::getenv("ENGINE_DIAG_PIX_EVENTS") != nullptr;
+
+        if(enabled && commandList)
+        {
+            commandList->EndEvent();
+        }
+#endif
+    }
+
+    // RayQuery 2M E3: logs, once per distinct combination, which implementation ran the ReSTIR DI direct pass (the
+    // production compute shader, or the DXR comparison backend), so the backend is identifiable in every log.
+    void LogDirectPassBackend(const std::string& backend, bool extract, std::uint32_t psrChain)
+    {
+        static std::vector<std::string> logged;
+        const std::string line = "ReSTIR DI direct pass: " + backend + (extract ? ", extraction" : "") + ", PSR chain " +
+            std::to_string(psrChain);
+
+        if(std::find(logged.begin(), logged.end(), line) != logged.end())
+        {
+            return;
+        }
+
+        logged.push_back(line);
+        Log::Info(line + ".");
+    }
+
     // True when the export name occurs in the DXIL container (its function table stores every entry point's
     // name, mangled around it). Absence is conclusive; presence is confirmed by state-object creation.
     bool LibraryNamesExport(const std::vector<char>& bytecode, const std::wstring& exportName)
@@ -53,23 +100,6 @@ namespace
         return "PathTraceReference.hlsl";
     }
 
-    const char* ReSTIRDILibraryPath(PathTraceLibraryVariant variant)
-    {
-        switch(variant)
-        {
-        case PathTraceLibraryVariant::SM69:
-            return "PathTraceReSTIRDISM69.hlsl";
-        case PathTraceLibraryVariant::SM69SER:
-            return "PathTraceReSTIRDISERSM69.hlsl";
-        case PathTraceLibraryVariant::SM66:
-            break;
-        }
-
-        return "PathTraceReSTIRDI.hlsl";
-    }
-
-    // RTXPT D.1B.2: the library of the extraction direct pass. It never shares a library with the production direct
-    // pass (PathTraceReSTIRDIExtract.hlsl), so the production ReSTIR DI library is unchanged.
     // SHARC.4D: the cache libraries of each variant (the reference library with PATH_TRACE_RADIANCE_CACHE_LIBRARY).
     const char* D6RadianceCacheLibraryPath(PathTraceLibraryVariant variant, PathTraceRadianceCacheLibrary library)
     {
@@ -229,22 +259,6 @@ namespace
         return "PathTraceReferenceRawDiffuseHitDistance.hlsl";
     }
 
-    // PSR.1c-A: the ReSTIR DI library built with PATH_TRACE_PSR_LIBRARY (its direct pass only).
-    const char* PrimarySurfaceReplacementReSTIRDILibraryPath(PathTraceLibraryVariant variant)
-    {
-        switch(variant)
-        {
-        case PathTraceLibraryVariant::SM69:
-            return "PathTraceReSTIRDIPsrSM69.hlsl";
-        case PathTraceLibraryVariant::SM69SER:
-            return "PathTraceReSTIRDIPsrSERSM69.hlsl";
-        case PathTraceLibraryVariant::SM66:
-            break;
-        }
-
-        return "PathTraceReSTIRDIPsr.hlsl";
-    }
-
     // PSR.1a: the reference library built with PATH_TRACE_PSR_LIBRARY. The production libraries never contain its code.
     const char* PrimarySurfaceReplacementLibraryPath(PathTraceLibraryVariant variant)
     {
@@ -261,45 +275,44 @@ namespace
         return "PathTraceReferencePsr.hlsl";
     }
 
-    // PSR.2 Stage 3A: the PSR.1c-A split pair's libraries with PATH_TRACE_PSR_GBUFFER (G-buffer storage).
-    const char* PrimarySurfaceReplacementGBufferLibraryPath(bool directPass, PathTraceLibraryVariant variant)
+    // PSR.2 Stage 3A: the indirect pass's library with PATH_TRACE_PSR_GBUFFER (G-buffer storage). The direct pass is a
+    // compute shader (DirectPassDescription).
+    const char* PrimarySurfaceReplacementGBufferLibraryPath(PathTraceLibraryVariant variant)
     {
         switch(variant)
         {
         case PathTraceLibraryVariant::SM69:
-            return directPass ? "PathTraceReSTIRDIPsrGBufferSM69.hlsl" : "PathTraceReferencePsrGBufferSM69.hlsl";
+            return "PathTraceReferencePsrGBufferSM69.hlsl";
         case PathTraceLibraryVariant::SM69SER:
-            return directPass ? "PathTraceReSTIRDIPsrGBufferSERSM69.hlsl" : "PathTraceReferencePsrGBufferSERSM69.hlsl";
+            return "PathTraceReferencePsrGBufferSERSM69.hlsl";
         case PathTraceLibraryVariant::SM66:
             break;
         }
 
-        return directPass ? "PathTraceReSTIRDIPsrGBuffer.hlsl" : "PathTraceReferencePsrGBuffer.hlsl";
+        return "PathTraceReferencePsrGBuffer.hlsl";
     }
 
-    // PSR.2 Stage 3B: the extraction libraries with PATH_TRACE_PSR_GBUFFER. The extraction indirect export is in the
-    // PSR.2 reference library; the raw-distance one and the extraction direct pass have libraries of their own.
-    const char* PrimarySurfaceReplacementGBufferExtractionLibraryPath(bool directPass, bool rawDiffuseHitDistance,
+    // PSR.2 Stage 3B: the indirect extraction libraries with PATH_TRACE_PSR_GBUFFER. The extraction indirect export is
+    // in the PSR.2 reference library; the raw-distance one has a library of its own.
+    const char* PrimarySurfaceReplacementGBufferExtractionLibraryPath(bool rawDiffuseHitDistance,
         PathTraceLibraryVariant variant)
     {
-        if(!directPass && !rawDiffuseHitDistance)
+        if(!rawDiffuseHitDistance)
         {
-            return PrimarySurfaceReplacementGBufferLibraryPath(false, variant);
+            return PrimarySurfaceReplacementGBufferLibraryPath(variant);
         }
 
         switch(variant)
         {
         case PathTraceLibraryVariant::SM69:
-            return directPass ? "PathTraceReSTIRDIExtractPsrGBufferSM69.hlsl" :
-                "PathTraceReferenceRawDiffuseHitDistancePsrGBufferSM69.hlsl";
+            return "PathTraceReferenceRawDiffuseHitDistancePsrGBufferSM69.hlsl";
         case PathTraceLibraryVariant::SM69SER:
-            return directPass ? "PathTraceReSTIRDIExtractPsrGBufferSERSM69.hlsl" :
-                "PathTraceReferenceRawDiffuseHitDistancePsrGBufferSERSM69.hlsl";
+            return "PathTraceReferenceRawDiffuseHitDistancePsrGBufferSERSM69.hlsl";
         case PathTraceLibraryVariant::SM66:
             break;
         }
 
-        return directPass ? "PathTraceReSTIRDIExtractPsrGBuffer.hlsl" : "PathTraceReferenceRawDiffuseHitDistancePsrGBuffer.hlsl";
+        return "PathTraceReferenceRawDiffuseHitDistancePsrGBuffer.hlsl";
     }
 
     bool IsRawDiffuseHitDistanceLibrary(PathTraceRadianceCacheLibrary library)
@@ -309,30 +322,11 @@ namespace
             library == PathTraceRadianceCacheLibrary::PsrRenderSplitIndirectExtractionRawDiffuseHitDistance;
     }
 
-    const char* ReSTIRDIExtractionLibraryPath(PathTraceLibraryVariant variant)
+
+    // The library a primary's DXR pipelines come from: the reference library for every primary (RTXPT.3 ReSTIR DI's
+    // indirect pass is in it; its direct pass is a compute shader, DirectPassDescription).
+    std::filesystem::path PathTraceLibraryPath(PathTracePrimary, PathTraceLibraryVariant variant)
     {
-        switch(variant)
-        {
-        case PathTraceLibraryVariant::SM69:
-            return "PathTraceReSTIRDIExtractSM69.hlsl";
-        case PathTraceLibraryVariant::SM69SER:
-            return "PathTraceReSTIRDIExtractSERSM69.hlsl";
-        case PathTraceLibraryVariant::SM66:
-            break;
-        }
-
-        return "PathTraceReSTIRDIExtract.hlsl";
-    }
-
-    // The library a primary's pipelines come from. RTXPT.3 ReSTIR DI also needs the reference library (its indirect
-    // pass), which every mode prepares first.
-    std::filesystem::path PathTraceLibraryPath(PathTracePrimary primary, PathTraceLibraryVariant variant)
-    {
-        if(primary == PathTracePrimary::RasterReSTIRDI)
-        {
-            return ReSTIRDILibraryPath(variant);
-        }
-
         return ReferenceLibraryPath(variant);
     }
 
@@ -397,8 +391,9 @@ namespace
         {
             RayTracingPipelineDescription description =
                 BuildPathTracePipelineDescription(PathTracePrimary::Raster, variant);
-            description.shaderPath = ReSTIRDILibraryPath(variant);
-            description.rayGenerationShader = L"PathTraceReSTIRDISplitDirectRayGeneration";
+            // The direct pass's root signature and hit groups; DirectPassDescription supplies its compute shader.
+            description.shaderPath.clear();
+            description.rayGenerationShader = ShaderCompiler::ComputeLibraryEntryPoint;
             description.rootParameters.push_back({RootParameterType::ConstantBuffer, 2});
             return description;
         }
@@ -505,8 +500,7 @@ namespace
 
         if(directPass)
         {
-            description.shaderPath = ReSTIRDIExtractionLibraryPath(variant);
-            description.rayGenerationShader = L"PathTraceReSTIRDISplitDirectExtractRayGeneration";
+            description.rayGenerationShader = ShaderCompiler::ComputeLibraryEntryPoint;
         }
         else
         {
@@ -516,22 +510,63 @@ namespace
         return description;
     }
 
-    // Whether the library is itself a RayQuery twin (they live under DI1/ and GI6/).
+    // RayQuery 2M E3: the production ReSTIR DI direct pass's compute shader for a PSR chain (0: PSR off) and NRD signal
+    // extraction. DirectLighting/ is compiled as cs_6_6 (ShaderLibraryProfile::Compute66).
+    std::filesystem::path DirectLightingComputePath(bool extraction, std::uint32_t psrChain)
+    {
+        std::string name = "ReSTIRDIDirect";
+
+        if(psrChain >= 2u)
+        {
+            name += "PsrK2";
+        }
+        else if(psrChain == 1u)
+        {
+            name += "Psr";
+        }
+
+        if(extraction)
+        {
+            name += "Extract";
+        }
+
+        return std::filesystem::path("DirectLighting") / (name + ".hlsl");
+    }
+
+    // RayQuery 2M E3: the compute direct pass traces its one radiance ray (the two-bounce PSR chain retrace) as these DXR
+    // pipelines do only while they have one hit group running PathTraceClosestHit without an any-hit shader and the
+    // radiance miss PathTraceMiss (PathTraceTraceRadianceInline). A description that breaks this has no compute pass.
+    bool ComputeRetraceContractHolds(const RayTracingPipelineDescription& description)
+    {
+        return description.hitGroups.size() == 1 && description.hitGroups[0].closestHitShader == L"PathTraceClosestHit" &&
+            description.hitGroups[0].anyHitShader.empty() && !description.missShaders.empty() &&
+            description.missShaders[0] == L"PathTraceMiss";
+    }
+
+    // The entry check of a pipeline's library: its ray generation export (a compute shader has one fixed entry point, which
+    // pipeline creation validates).
+    bool LibraryHasEntryPoint(const std::vector<char>& bytecode, const RayTracingPipelineDescription& description)
+    {
+        return description.computeShader || LibraryNamesExport(bytecode, description.rayGenerationShader);
+    }
+
+    // Whether the library is itself a RayQuery twin (they live under GI6/).
     bool RayQueryTwinOf(const std::filesystem::path& path)
     {
         const std::filesystem::path first = *path.begin();
-        return first == "DI1" || first == "GI6";
+        return first == "GI6";
     }
 
-    // The RayQuery twin InitializeVisibilityPipelines pairs with a pipeline's library, if any. DI.1 pairs only the
-    // ReSTIR DI direct libraries; GI.6 pairs the reference libraries except training.
+    // The RayQuery twin InitializeVisibilityPipelines pairs with a pipeline's library, if any: GI.6 pairs the reference
+    // libraries except training.
     std::optional<std::filesystem::path> RayQueryTwinLibraryPath(const std::filesystem::path& path)
     {
         const std::string name = path.filename().string();
 
-        if(name.starts_with("PathTraceReSTIRDI"))
+        // RayQuery 2M E3: the compute direct pass already traces inline RayQuery; it has no twin.
+        if(!path.empty() && *path.begin() == "DirectLighting")
         {
-            return std::filesystem::path("DI1") / path;
+            return std::nullopt;
         }
 
         // NVIDIA SHARC's render libraries (SharcNv/) pair like the reference render libraries; its update libraries do not.
@@ -583,6 +618,11 @@ namespace
         if(description.rasterMaterialSampler)
         {
             key += "|s2";
+        }
+
+        if(description.computeShader)
+        {
+            key += "|cs";
         }
 
         return key;
@@ -722,7 +762,7 @@ bool PathTraceReferencePass::EnsurePrimaryPipeline(
         m_pipelineFailure[index] = "The " + libraryName + " DXR library is unavailable or failed to compile" +
             TroubleshootingHint() + ".";
     }
-    else if(!LibraryNamesExport(library->bytecode, description.rayGenerationShader))
+    else if(!LibraryHasEntryPoint(library->bytecode, description))
     {
         m_pipelineFailure[index] = "The " + libraryName + " DXR library has no entry point for this primary "
             "(a shader bundle from before RTXPT.2 R3).";
@@ -811,8 +851,7 @@ void PathTraceReferencePass::ReportMissingPackagedTwin(const std::filesystem::pa
     // One report per twin, however many pipelines pair with it.
     if(m_reportedMissingTwins.insert(path.generic_string()).second)
     {
-        const bool primaryDi = path.filename().string().starts_with("PathTraceReSTIRDI");
-        Log::Warning(std::string(primaryDi ? "DI.1" : "GI.6") + " RayQuery variant is not in this game's shaders; the "
+        Log::Warning(std::string("GI.6") + " RayQuery variant is not in this game's shaders; the "
             "original TraceRay pipeline is used: " + path.generic_string());
     }
 }
@@ -1045,11 +1084,11 @@ std::vector<PathTraceLibraryRequirement> PathTraceReferencePass::GetRequiredLibr
     add(ReferenceLibraryPath(m_libraryVariant));
 
     // EnsureReSTIRDISplitPipelines creates the direct pass and, before the primary visibility selector is enabled,
-    // the extraction direct pass.
+    // the extraction direct pass (RayQuery 2M E3: their compute shaders in production).
     if(needs.primary == PathTracePrimary::RasterReSTIRDI)
     {
-        add(ReSTIRDILibraryPath(m_libraryVariant));
-        add(ReSTIRDIExtractionLibraryPath(m_libraryVariant));
+        add(DirectPassDescription(false, 0u).shaderPath);
+        add(DirectPassDescription(true, 0u).shaderPath);
     }
 
     if(needs.rawDiffuseHitDistance)
@@ -1144,11 +1183,18 @@ std::vector<PathTraceReferencePass::PipelineRequirement> PathTraceReferencePass:
         };
         const auto lighting = [&](bool direct, bool extraction, bool raw)
         {
+            // RayQuery 2M E3: the direct pass's own description (its compute shader in production).
+            if(direct)
+            {
+                add(DirectPassDescription(extraction, needs.psrChain));
+                return;
+            }
+
             auto description = extraction ? BuildReSTIRDISplitExtractionPipelineDescription(direct, m_libraryVariant) :
                 BuildReSTIRDISplitPipelineDescription(direct, m_libraryVariant);
             description.shaderPath = chainPath(extraction ?
-                PrimarySurfaceReplacementGBufferExtractionLibraryPath(direct, raw, m_libraryVariant) :
-                PrimarySurfaceReplacementGBufferLibraryPath(direct, m_libraryVariant));
+                PrimarySurfaceReplacementGBufferExtractionLibraryPath(raw, m_libraryVariant) :
+                PrimarySurfaceReplacementGBufferLibraryPath(m_libraryVariant));
             description.rootParameters.push_back({RootParameterType::ConstantBuffer, 4});
             description.rootParameters.push_back({RootParameterType::ShaderResource, 2});
             description.rasterMaterialSampler = true;
@@ -1191,9 +1237,9 @@ std::vector<PathTraceReferencePass::PipelineRequirement> PathTraceReferencePass:
     {
         // ReSTIR DI evaluates the Raster primary prerequisite before its own split pair.
         add(BuildPathTracePipelineDescription(PathTracePrimary::Raster, m_libraryVariant));
-        add(BuildReSTIRDISplitPipelineDescription(true, m_libraryVariant));
+        add(DirectPassDescription(false, 0u));
         add(BuildReSTIRDISplitPipelineDescription(false, m_libraryVariant));
-        add(BuildReSTIRDISplitExtractionPipelineDescription(true, m_libraryVariant));
+        add(DirectPassDescription(true, 0u));
     }
     else if(needs.primary != PathTracePrimary::Camera)
     {
@@ -1272,8 +1318,7 @@ bool PathTraceReferencePass::IsPipelineLive(const std::string& identity) const
         &m_psrGBufferExtractDirectPipeline, &m_psrGBufferExtractIndirectPipeline, &m_psrGBufferExtractIndirectRawPipeline})
         if(live(*pipeline)) return true;
 
-    for(const auto* alternates : {&m_rayQueryPipelines, &m_primaryDiRayQueryPipelines,
-        &m_psrRayQueryPipelines, &m_psrPrimaryDiRayQueryPipelines})
+    for(const auto* alternates : {&m_rayQueryPipelines, &m_psrRayQueryPipelines})
     {
         for(const auto& [original, alternate] : *alternates)
         {
@@ -1948,7 +1993,7 @@ unsigned int PathTraceReferencePass::EnsurePrimarySurfaceReplacement(
                 m_psrFailure = "The " + libraryName + " DXR library is unavailable or failed to compile" +
                     TroubleshootingHint() + ".";
             }
-            else if(!LibraryNamesExport(library->bytecode, description.rayGenerationShader))
+            else if(!LibraryHasEntryPoint(library->bytecode, description))
             {
                 m_psrFailure = "The " + libraryName + " DXR library has no primary surface replacement entry point.";
             }
@@ -2032,7 +2077,7 @@ unsigned int PathTraceReferencePass::EnsurePrimarySurfaceReplacementGuides(
             m_psrGuideFailure = "The " + libraryName + " DXR library is unavailable or failed to compile" +
                 TroubleshootingHint() + ".";
         }
-        else if(!LibraryNamesExport(library->bytecode, description.rayGenerationShader))
+        else if(!LibraryHasEntryPoint(library->bytecode, description))
         {
             m_psrGuideFailure = "The " + libraryName + " DXR library has no primary surface replacement guide entry point.";
         }
@@ -2083,85 +2128,6 @@ unsigned int PathTraceReferencePass::EnsurePrimarySurfaceReplacementGuides(
     return m_psrGuides.GetUAVDescriptorIndex();
 }
 
-bool PathTraceReferencePass::EnsurePrimarySurfaceReplacementReSTIRDI(
-    GraphicsDevice& graphicsDevice,
-    ShaderLibrary& shaderLibrary,
-    std::string& failureReason)
-{
-    if(!m_initialized || !m_psrPipelinesReady)
-    {
-        failureReason = "Primary surface replacement is not prepared.";
-        return false;
-    }
-
-    if(m_psrSplitPipelinesFailed)
-    {
-        failureReason = m_psrSplitFailure;
-        return false;
-    }
-
-    if(m_psrSplitPipelinesReady)
-    {
-        return true;
-    }
-
-    RayTracingPipeline* pipelines[2] = {&m_psrSplitDirectPipeline, &m_psrSplitIndirectPipeline};
-
-    for(int pass = 0; pass < 2 && m_psrSplitFailure.empty(); ++pass)
-    {
-        const bool directPass = pass == 0;
-        RayTracingPipelineDescription description = BuildReSTIRDISplitPipelineDescription(directPass, m_libraryVariant);
-        description.shaderPath = directPass ? PrimarySurfaceReplacementReSTIRDILibraryPath(m_libraryVariant) :
-            PrimarySurfaceReplacementLibraryPath(m_libraryVariant);
-        const std::string libraryName = description.shaderPath.generic_string();
-        const ShaderLibraryCompileResult* library = AcquireLibrary(shaderLibrary, description.shaderPath);
-
-        if(!library)
-        {
-            m_psrSplitFailure = "The " + libraryName + " DXR library is unavailable or failed to compile" +
-                TroubleshootingHint() + ".";
-        }
-        else if(!LibraryNamesExport(library->bytecode, description.rayGenerationShader))
-        {
-            m_psrSplitFailure = "The " + libraryName + " DXR library has no split ReSTIR DI entry point.";
-        }
-        else if(!InitializeVisibilityPipelines(graphicsDevice, shaderLibrary, *pipelines[pass], library->bytecode,
-            description))
-        {
-            m_psrSplitFailure = "The " + libraryName + " primary surface replacement ReSTIR DI pipeline could not be created" +
-                TroubleshootingHint() + ".";
-        }
-
-        // Twins leave the shared readiness sets (DI.1 for the direct pass, GI.6 for the indirect pass).
-        auto& shared = directPass ? m_primaryDiRayQueryPipelines : m_rayQueryPipelines;
-        auto& isolated = directPass ? m_psrPrimaryDiRayQueryPipelines : m_psrRayQueryPipelines;
-        const auto twin = shared.find(pipelines[pass]);
-
-        if(twin != shared.end())
-        {
-            isolated[pipelines[pass]] = std::move(twin->second);
-            shared.erase(twin);
-        }
-    }
-
-    if(!m_psrSplitFailure.empty())
-    {
-        for(RayTracingPipeline* pipeline : pipelines)
-        {
-            pipeline->Shutdown();
-            m_psrPrimaryDiRayQueryPipelines.erase(pipeline);
-            m_psrRayQueryPipelines.erase(pipeline);
-        }
-
-        m_psrSplitPipelinesFailed = true;
-        failureReason = m_psrSplitFailure;
-        return false;
-    }
-
-    m_psrSplitPipelinesReady = true;
-    return true;
-}
-
 bool PathTraceReferencePass::EnsurePrimarySurfaceReplacementGBuffer(
     GraphicsDevice& graphicsDevice,
     ShaderLibrary& shaderLibrary,
@@ -2190,12 +2156,18 @@ bool PathTraceReferencePass::EnsurePrimarySurfaceReplacementGBuffer(
     {
         const bool directPass = pass == 0;
         RayTracingPipelineDescription description = BuildReSTIRDISplitPipelineDescription(directPass, m_libraryVariant);
-        description.shaderPath = PsrChainLibraryPath(PrimarySurfaceReplacementGBufferLibraryPath(directPass,
-            m_libraryVariant));
+        description.shaderPath = PsrChainLibraryPath(PrimarySurfaceReplacementGBufferLibraryPath(m_libraryVariant));
         // After the split pair's own parameters: b4 (the replacement pass's camera and identity) and t2 (its transforms).
         description.rootParameters.push_back({RootParameterType::ConstantBuffer, 4});
         description.rootParameters.push_back({RootParameterType::ShaderResource, 2});
         description.rasterMaterialSampler = true;
+
+        // RayQuery 2M E3: the direct pass's own description (its compute shader in production).
+        if(directPass)
+        {
+            description = DirectPassDescription(false, m_psrChain);
+        }
+
         const std::string libraryName = description.shaderPath.generic_string();
         const ShaderLibraryCompileResult* library = AcquireLibrary(shaderLibrary, description.shaderPath);
 
@@ -2204,7 +2176,7 @@ bool PathTraceReferencePass::EnsurePrimarySurfaceReplacementGBuffer(
             m_psrGBufferFailure = "The " + libraryName + " DXR library is unavailable or failed to compile" +
                 TroubleshootingHint() + ".";
         }
-        else if(!LibraryNamesExport(library->bytecode, description.rayGenerationShader))
+        else if(!LibraryHasEntryPoint(library->bytecode, description))
         {
             m_psrGBufferFailure = "The " + libraryName + " DXR library has no split ReSTIR DI entry point.";
         }
@@ -2215,15 +2187,13 @@ bool PathTraceReferencePass::EnsurePrimarySurfaceReplacementGBuffer(
                 TroubleshootingHint() + ".";
         }
 
-        // Twins leave the shared readiness sets (DI.1 for the direct pass, GI.6 for the indirect pass).
-        auto& shared = directPass ? m_primaryDiRayQueryPipelines : m_rayQueryPipelines;
-        auto& isolated = directPass ? m_psrPrimaryDiRayQueryPipelines : m_psrRayQueryPipelines;
-        const auto twin = shared.find(pipelines[pass]);
+        // GI.6 twins leave the shared readiness set (the compute direct pass has none).
+        const auto twin = m_rayQueryPipelines.find(pipelines[pass]);
 
-        if(twin != shared.end())
+        if(twin != m_rayQueryPipelines.end())
         {
-            isolated[pipelines[pass]] = std::move(twin->second);
-            shared.erase(twin);
+            m_psrRayQueryPipelines[pipelines[pass]] = std::move(twin->second);
+            m_rayQueryPipelines.erase(twin);
         }
     }
 
@@ -2232,7 +2202,6 @@ bool PathTraceReferencePass::EnsurePrimarySurfaceReplacementGBuffer(
         for(RayTracingPipeline* pipeline : pipelines)
         {
             pipeline->Shutdown();
-            m_psrPrimaryDiRayQueryPipelines.erase(pipeline);
             m_psrRayQueryPipelines.erase(pipeline);
         }
 
@@ -2283,11 +2252,18 @@ bool PathTraceReferencePass::EnsurePrimarySurfaceReplacementGBufferExtraction(Gr
     {
         RayTracingPipelineDescription description = BuildReSTIRDISplitExtractionPipelineDescription(directPass,
             m_libraryVariant);
-        description.shaderPath = PsrChainLibraryPath(PrimarySurfaceReplacementGBufferExtractionLibraryPath(directPass,
+        description.shaderPath = PsrChainLibraryPath(PrimarySurfaceReplacementGBufferExtractionLibraryPath(
             rawDiffuseHitDistance, m_libraryVariant));
         description.rootParameters.push_back({RootParameterType::ConstantBuffer, 4});
         description.rootParameters.push_back({RootParameterType::ShaderResource, 2});
         description.rasterMaterialSampler = true;
+
+        // RayQuery 2M E3: the direct pass's own description (its compute shader in production).
+        if(directPass)
+        {
+            description = DirectPassDescription(true, m_psrChain);
+        }
+
         const std::string libraryName = description.shaderPath.generic_string();
         const ShaderLibraryCompileResult* library = AcquireLibrary(shaderLibrary, description.shaderPath);
 
@@ -2296,7 +2272,7 @@ bool PathTraceReferencePass::EnsurePrimarySurfaceReplacementGBufferExtraction(Gr
             failure = "The " + libraryName + " DXR library is unavailable or failed to compile" + TroubleshootingHint() +
                 ".";
         }
-        else if(!LibraryNamesExport(library->bytecode, description.rayGenerationShader))
+        else if(!LibraryHasEntryPoint(library->bytecode, description))
         {
             failure = "The " + libraryName + " DXR library has no signal extraction entry point.";
         }
@@ -2306,14 +2282,12 @@ bool PathTraceReferencePass::EnsurePrimarySurfaceReplacementGBufferExtraction(Gr
                 ".";
         }
 
-        auto& shared = directPass ? m_primaryDiRayQueryPipelines : m_rayQueryPipelines;
-        auto& isolated = directPass ? m_psrPrimaryDiRayQueryPipelines : m_psrRayQueryPipelines;
-        const auto twin = shared.find(pipeline);
+        const auto twin = m_rayQueryPipelines.find(pipeline);
 
-        if(twin != shared.end())
+        if(twin != m_rayQueryPipelines.end())
         {
-            isolated[pipeline] = std::move(twin->second);
-            shared.erase(twin);
+            m_psrRayQueryPipelines[pipeline] = std::move(twin->second);
+            m_rayQueryPipelines.erase(twin);
         }
 
         if(!failure.empty())
@@ -2321,7 +2295,6 @@ bool PathTraceReferencePass::EnsurePrimarySurfaceReplacementGBufferExtraction(Gr
             for(const auto& created : pipelines)
             {
                 created.first->Shutdown();
-                m_psrPrimaryDiRayQueryPipelines.erase(created.first);
                 m_psrRayQueryPipelines.erase(created.first);
             }
 
@@ -2340,7 +2313,6 @@ bool PathTraceReferencePass::IsPrimarySurfaceReplacementGBufferExtractionReady(b
     RayTracingPipeline* indirect = rawDiffuseHitDistance ? &m_psrGBufferExtractIndirectRawPipeline :
         &m_psrGBufferExtractIndirectPipeline;
     return m_psrGBufferExtractReady[rawDiffuseHitDistance ? 1 : 0] &&
-        (!m_primaryDiShadowRayQuery || m_psrPrimaryDiRayQueryPipelines[&m_psrGBufferExtractDirectPipeline]) &&
         (!m_secondaryShadowRayQuery || m_psrRayQueryPipelines[indirect]);
 }
 
@@ -2357,7 +2329,7 @@ bool PathTraceReferencePass::EnsurePsrProbePipelinesForTesting(GraphicsDevice& g
         const bool gBuffer = storage == 1;
         RayTracingPipelineDescription description = BuildReSTIRDISplitPipelineDescription(false, m_libraryVariant);
         description.rayGenerationShader = L"PathTracePsrProbeRayGeneration";
-        description.shaderPath = gBuffer ? PrimarySurfaceReplacementGBufferLibraryPath(false, m_libraryVariant) :
+        description.shaderPath = gBuffer ? PrimarySurfaceReplacementGBufferLibraryPath(m_libraryVariant) :
             PrimarySurfaceReplacementLibraryPath(m_libraryVariant);
 
         if(gBuffer)
@@ -2379,35 +2351,24 @@ bool PathTraceReferencePass::EnsurePsrProbePipelinesForTesting(GraphicsDevice& g
 }
 
 bool PathTraceReferencePass::EnsurePsrChainProbePipelinesForTesting(GraphicsDevice& graphicsDevice,
-    ShaderLibrary& shaderLibrary, const std::filesystem::path& indirectLibrary, const std::filesystem::path& directLibrary)
+    ShaderLibrary& shaderLibrary, const std::filesystem::path& indirectLibrary)
 {
-    for(int pass = 0; pass < 2; ++pass)
-    {
-        // The PSR.2 split pass's own description (the direct pass adds b2), with its PSR bindings appended.
-        const bool directPass = pass == 1;
-        RayTracingPipelineDescription description = BuildReSTIRDISplitPipelineDescription(directPass, m_libraryVariant);
-        description.rayGenerationShader = L"PsrChainProbeRayGeneration";
-        description.shaderPath = directPass ? directLibrary : indirectLibrary;
-        description.rootParameters.push_back({RootParameterType::ConstantBuffer, 4});
-        description.rootParameters.push_back({RootParameterType::ShaderResource, 2});
-        description.rasterMaterialSampler = true;
-        m_psrChainProbePipelines[pass].Shutdown();
-        const ShaderLibraryCompileResult* library = AcquireLibrary(shaderLibrary, description.shaderPath);
-
-        if(!library || !CreatePipeline(graphicsDevice, m_psrChainProbePipelines[pass], library->bytecode, description))
-        {
-            return false;
-        }
-    }
-
-    return true;
+    // The PSR.2 indirect pass's own description, with its PSR bindings appended.
+    RayTracingPipelineDescription description = BuildReSTIRDISplitPipelineDescription(false, m_libraryVariant);
+    description.rayGenerationShader = L"PsrChainProbeRayGeneration";
+    description.shaderPath = indirectLibrary;
+    description.rootParameters.push_back({RootParameterType::ConstantBuffer, 4});
+    description.rootParameters.push_back({RootParameterType::ShaderResource, 2});
+    description.rasterMaterialSampler = true;
+    m_psrChainProbePipeline.Shutdown();
+    const ShaderLibraryCompileResult* library = AcquireLibrary(shaderLibrary, description.shaderPath);
+    return library && CreatePipeline(graphicsDevice, m_psrChainProbePipeline, library->bytecode, description);
 }
 
 bool PathTraceReferencePass::IsPrimarySurfaceReplacementGBufferReady()
 {
-    // The twins the frame's visibility selections need (DI.1 for the direct pass, GI.6 for the indirect pass).
+    // The twin the frame's visibility selection needs (GI.6 for the indirect pass).
     return m_psrGBufferPipelinesReady &&
-        (!m_primaryDiShadowRayQuery || m_psrPrimaryDiRayQueryPipelines[&m_psrGBufferDirectPipeline]) &&
         (!m_secondaryShadowRayQuery || m_psrRayQueryPipelines[&m_psrGBufferIndirectPipeline]);
 }
 
@@ -2427,21 +2388,12 @@ void PathTraceReferencePass::ReleasePrimarySurfaceReplacementPipelines()
 {
     // The GI.6 twins are registered against these slots; dropping them keeps the secondary selector's readiness about
     // the pipelines that exist.
-    for(auto& [original, alternate] : m_psrPrimaryDiRayQueryPipelines)
-    {
-        if(alternate)
-        {
-            RetainPsrPipeline(*alternate);
-        }
-    }
-
-    m_psrPrimaryDiRayQueryPipelines.clear();
     for(auto& pipeline : m_psrSharcEnergyPipelines) pipeline.Shutdown();
 
     for(RayTracingPipeline* original : {&m_psrRecordPipeline, &m_psrRasterPipeline, &m_psrGuidePipeline,
-        &m_psrSplitDirectPipeline, &m_psrSplitIndirectPipeline, &m_psrGBufferDirectPipeline,
+        &m_psrGBufferDirectPipeline,
         &m_psrGBufferIndirectPipeline, &m_psrSharcImageProbePipeline, &m_psrSharcTrainingProbePipeline, &m_psrProbePipelines[0], &m_psrProbePipelines[1],
-        &m_psrChainProbePipelines[0], &m_psrChainProbePipelines[1],
+        &m_psrChainProbePipeline,
         &m_psrGBufferExtractDirectPipeline, &m_psrGBufferExtractIndirectPipeline, &m_psrGBufferExtractIndirectRawPipeline})
     {
         const auto found = m_psrRayQueryPipelines.find(original);
@@ -2461,7 +2413,6 @@ void PathTraceReferencePass::ReleasePrimarySurfaceReplacementPipelines()
 
     m_psrPipelinesReady = false;
     m_psrGuidePipelineReady = false;
-    m_psrSplitPipelinesReady = false;
     m_psrGBufferPipelinesReady = false;
     m_psrGBufferExtractReady[0] = false;
     m_psrGBufferExtractReady[1] = false;
@@ -2728,7 +2679,7 @@ bool PathTraceReferencePass::EnsureRadianceCacheLearning(
         learning.failure = "The " + libraryName + " DXR library is unavailable or failed to compile" +
             TroubleshootingHint() + ".";
     }
-    else if(!LibraryNamesExport(compiled->bytecode, description.rayGenerationShader))
+    else if(!LibraryHasEntryPoint(compiled->bytecode, description))
     {
         learning.failure = "The " + libraryName + " DXR library has no Raster Primary entry point.";
     }
@@ -2816,8 +2767,9 @@ bool PathTraceReferencePass::EnsureReSTIRDISplitPipelines(
     for(int pass = 0; pass < 2; ++pass)
     {
         const bool directPass = pass == 0;
-        const RayTracingPipelineDescription description =
-            BuildReSTIRDISplitPipelineDescription(directPass, m_libraryVariant);
+        // RayQuery 2M E3: the direct pass's own description (its compute shader in production).
+        const RayTracingPipelineDescription description = directPass ? DirectPassDescription(false, 0u) :
+            BuildReSTIRDISplitPipelineDescription(false, m_libraryVariant);
         const std::string libraryName = description.shaderPath.generic_string();
         const ShaderLibraryCompileResult* library = AcquireLibrary(shaderLibrary, description.shaderPath);
 
@@ -2826,7 +2778,7 @@ bool PathTraceReferencePass::EnsureReSTIRDISplitPipelines(
             m_splitPipelineFailure = "The " + libraryName + " DXR library is unavailable or failed to compile" +
                 TroubleshootingHint() + ".";
         }
-        else if(!LibraryNamesExport(library->bytecode, description.rayGenerationShader))
+        else if(!LibraryHasEntryPoint(library->bytecode, description))
         {
             m_splitPipelineFailure = "The " + libraryName + " DXR library has no split ReSTIR DI " +
                 (directPass ? "direct" : "indirect") + " entry point.";
@@ -2939,8 +2891,7 @@ bool PathTraceReferencePass::EnsureExtractionPipelines(
         {
             if(!m_primaryDiExtractionPipelineReady)
             {
-                pipelines.emplace_back(&m_extractSplitDirectPipeline,
-                    BuildReSTIRDISplitExtractionPipelineDescription(true, m_libraryVariant));
+                pipelines.emplace_back(&m_extractSplitDirectPipeline, DirectPassDescription(true, 0u));
             }
 
             pipelines.emplace_back(&m_extractSplitIndirectPipeline,
@@ -2961,7 +2912,7 @@ bool PathTraceReferencePass::EnsureExtractionPipelines(
                 failure = "The " + libraryName + " DXR library is unavailable or failed to compile" +
                     TroubleshootingHint() + ".";
             }
-            else if(!LibraryNamesExport(library->bytecode, description.rayGenerationShader))
+            else if(!LibraryHasEntryPoint(library->bytecode, description))
             {
                 failure = "The " + libraryName + " DXR library has no signal extraction entry point.";
             }
@@ -3280,7 +3231,6 @@ void PathTraceReferencePass::ExecuteReSTIRDISplit(
     D3D12_GPU_VIRTUAL_ADDRESS radianceCacheConstants,
     PathTraceRadianceCacheLibrary radianceCacheLibrary,
     bool rawDiffuseHitDistance,
-    bool primarySurfaceReplacement,
     D3D12_GPU_VIRTUAL_ADDRESS psrGBufferConstants,
     D3D12_GPU_VIRTUAL_ADDRESS psrGBufferTransforms)
 {
@@ -3319,29 +3269,19 @@ void PathTraceReferencePass::ExecuteReSTIRDISplit(
     const bool cachedIndirect = radianceCacheConstants != 0 &&
         (radianceCacheLibrary == expectedLibrary || combined) && radianceCache.ready;
     const bool rawPipeline = raw && !cachedIndirect && m_extractSplitRawReady;
-    // PSR.1c-A: without extraction or a cache library, with every PSR pipeline the frame's visibility selection needs
-    // (the DI.1 twin of the direct pass, the GI.6 twins of the record and indirect passes); otherwise the production pair.
-    const bool directVisibility = !m_primaryDiShadowRayQuery || m_psrPrimaryDiRayQueryPipelines[&m_psrSplitDirectPipeline];
-    const bool secondaryVisibility = !m_secondaryShadowRayQuery || (m_psrRayQueryPipelines[&m_psrRecordPipeline] &&
-        m_psrRayQueryPipelines[&m_psrSplitIndirectPipeline]);
-    // PSR.2 Stage 3A: without a cache library, with both of its bindings; it takes precedence over PSR.1. Stage 3B: with
-    // extraction, its extraction pair (raw-distance indirect when the frame records raw distances).
+    // PSR.2 Stage 3A: without a cache library, with both of its bindings. Stage 3B: with extraction, its extraction pair
+    // (raw-distance indirect when the frame records raw distances).
     const bool gBufferReplacement = psrGBufferConstants != 0 && psrGBufferTransforms != 0 && (!cachedIndirect || combined) &&
         (extract ? IsPrimarySurfaceReplacementGBufferExtractionReady(raw) : IsPrimarySurfaceReplacementGBufferReady());
-    const bool replacement = !gBufferReplacement && primarySurfaceReplacement && !extract && !cachedIndirect &&
-        m_psrPipelinesReady && m_psrSplitPipelinesReady && directVisibility && secondaryVisibility &&
-        m_psrRecords.GetResource() && m_psrRecords.GetResource()->GetDesc().Width >=
-        static_cast<std::uint64_t>(width) * height * PrimarySurfaceReplacementRecordStride;
-    RayTracingPipeline& directPipeline = PrimaryDiVisibilityPipeline(extract ?
+    // The direct pass is a compute shader (DirectPassDescription); only the indirect pass has RayQuery twins.
+    RayTracingPipeline& directPipeline = extract ?
         (gBufferReplacement ? m_psrGBufferExtractDirectPipeline : m_extractSplitDirectPipeline) :
-        (gBufferReplacement ? m_psrGBufferDirectPipeline :
-        (replacement ? m_psrSplitDirectPipeline : m_splitDirectPipeline)));
+        (gBufferReplacement ? m_psrGBufferDirectPipeline : m_splitDirectPipeline);
     RayTracingPipeline& indirectPipeline = VisibilityPipeline(cachedIndirect ?
         m_radianceCache[static_cast<size_t>(radianceCacheLibrary)].pipeline :
         (extract ? (gBufferReplacement ? (raw ? m_psrGBufferExtractIndirectRawPipeline : m_psrGBufferExtractIndirectPipeline) :
         (rawPipeline ? m_extractSplitIndirectRawPipeline : m_extractSplitIndirectPipeline)) :
-        (gBufferReplacement ? m_psrGBufferIndirectPipeline :
-        (replacement ? m_psrSplitIndirectPipeline : m_splitIndirectPipeline))));
+        (gBufferReplacement ? m_psrGBufferIndirectPipeline : m_splitIndirectPipeline)));
 
     m_accumulationTexture.Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     m_outputTexture.Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -3367,23 +3307,6 @@ void PathTraceReferencePass::ExecuteReSTIRDISplit(
         commandList->SetComputeRootConstantBufferView(5, sceneLightConstantsAddress);
     };
 
-    // PSR.1c-A: the record pass, before the direct pass, which reads the records as the indirect pass does.
-    if(replacement)
-    {
-        m_psrRecords.Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        profiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::PathTracePsrRecord);
-        RayTracingPipeline& recordPipeline = VisibilityPipeline(m_psrRecordPipeline);
-        recordPipeline.Bind(commandList);
-        bindSharedRootParameters();
-        recordPipeline.Dispatch(commandList, width, height);
-        D3D12_RESOURCE_BARRIER recordBarrier{};
-        recordBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-        recordBarrier.UAV.pResource = m_psrRecords.GetResource();
-        commandList->ResourceBarrier(1, &recordBarrier);
-        profiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::PathTracePsrRecord);
-        m_psrWritten = true;
-    }
-
     // Direct pass: RTXDI sampling, reuse, visibility and reservoir publication; writes the direct radiance.
     profiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::PathTraceSplitDirect);
     directPipeline.Bind(commandList);
@@ -3396,21 +3319,13 @@ void PathTraceReferencePass::ExecuteReSTIRDISplit(
         commandList->SetComputeRootShaderResourceView(8, psrGBufferTransforms);
     }
 
+    BeginPathTraceEvent(commandList, L"Engine/PT/ReSTIRDI/DirectLighting");
+    // RayQuery 2M E3: the direct pipelines are compute shaders (DirectPassDescription), dispatched in thread groups.
     directPipeline.Dispatch(commandList, width, height);
+    LogDirectPassBackend("compute shader, inline RayQuery visibility", extract, gBufferReplacement ? m_psrChain : 0u);
+    EndPathTraceEvent(commandList);
     profiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::PathTraceSplitDirect);
     m_splitDirectDiffuseWritten = extract;
-
-    // Verification only (M2-A): the direct library's chain probe, with the direct pass's bindings.
-    if(m_psrProbeForTesting && gBufferReplacement && !combined && m_psrChainProbePipelines[1].IsInitialized())
-    {
-        m_psrProbeForTesting->Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        m_psrChainProbePipelines[1].Bind(commandList);
-        bindSharedRootParameters();
-        commandList->SetComputeRootConstantBufferView(6, rtxdiConstantsAddress);
-        commandList->SetComputeRootConstantBufferView(7, psrGBufferConstants);
-        commandList->SetComputeRootShaderResourceView(8, psrGBufferTransforms);
-        m_psrChainProbePipelines[1].Dispatch(commandList, width, height);
-    }
 
     // The indirect pass reads every direct radiance slot the direct pass wrote, and with extraction every direct
     // diffuse slot. Both passes only add to the statistics row atomically, so it needs no ordering between them.
@@ -3441,7 +3356,9 @@ void PathTraceReferencePass::ExecuteReSTIRDISplit(
         commandList->SetComputeRootShaderResourceView(7, psrGBufferTransforms);
     }
 
+    BeginPathTraceEvent(commandList, L"Engine/PT/ReSTIRDI/IndirectLighting");
     indirectPipeline.Dispatch(commandList, width, height);
+    EndPathTraceEvent(commandList);
 #if PATH_TRACE_SHARC_SPATIAL_DIAGNOSTIC != 0
     m_sharcDiagnosticWritten = cachedIndirect;
 #endif
@@ -3453,10 +3370,10 @@ void PathTraceReferencePass::ExecuteReSTIRDISplit(
 
     // Verification only: the recorded PSR pair's probe, with its indirect pass's bindings.
     RayTracingPipeline& probePipeline = combined ? m_psrSharcImageProbePipeline :
-        (gBufferReplacement && m_psrChainProbePipelines[0].IsInitialized() ? m_psrChainProbePipelines[0] :
+        (gBufferReplacement && m_psrChainProbePipeline.IsInitialized() ? m_psrChainProbePipeline :
         m_psrProbePipelines[gBufferReplacement ? 1 : 0]);
 
-    if(m_psrProbeForTesting && !m_psrSharcEnergyForTesting && !m_psrSharcTrainingProbeForTesting && (gBufferReplacement || replacement) && probePipeline.IsInitialized())
+    if(m_psrProbeForTesting && !m_psrSharcEnergyForTesting && !m_psrSharcTrainingProbeForTesting && gBufferReplacement && probePipeline.IsInitialized())
     {
         m_psrProbeForTesting->Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         probePipeline.Bind(commandList);
@@ -3555,7 +3472,7 @@ void PathTraceReferencePass::Shutdown()
 void PathTraceReferencePass::ReleaseResources()
 {
     // Same idle-device contract as the original pipeline teardown below.
-    for(auto* pipelines : {&m_rayQueryPipelines, &m_primaryDiRayQueryPipelines})
+    for(auto* pipelines : {&m_rayQueryPipelines})
     {
         for(auto& [original, alternate] : *pipelines)
         {
@@ -3569,7 +3486,6 @@ void PathTraceReferencePass::ReleaseResources()
     }
 
     m_secondaryShadowRayQuery = false;
-    m_primaryDiShadowRayQuery = false;
     m_primaryDiExtractionPipelineReady = false;
 
     m_accumulationTexture.Shutdown();
@@ -3637,8 +3553,6 @@ void PathTraceReferencePass::ReleaseResources()
     m_psrWritten = false;
     m_psrGuidePipelineFailed = false;
     m_psrGuideFailure.clear();
-    m_psrSplitPipelinesFailed = false;
-    m_psrSplitFailure.clear();
     m_psrGBufferPipelinesFailed = false;
     m_psrGBufferFailure.clear();
 
@@ -3824,7 +3738,7 @@ bool PathTraceReferencePass::InitializeVisibilityPipelines(
         return false;
     }
 
-    // DI.1 pairs only direct libraries; GI.6's secondary eligibility and training exclusion stay unchanged.
+    // GI.6: the RayQuery twin of an indirect, Reference or raster library (the compute direct pass has none).
     const std::optional<std::filesystem::path> twinPath = RayQueryTwinLibraryPath(description.shaderPath);
 
     if(!twinPath)
@@ -3832,9 +3746,7 @@ bool PathTraceReferencePass::InitializeVisibilityPipelines(
         return true;
     }
 
-    const bool primaryDi = description.shaderPath.filename().string().starts_with("PathTraceReSTIRDI");
-    auto& alternates = primaryDi ? m_primaryDiRayQueryPipelines : m_rayQueryPipelines;
-    auto& alternate = alternates[&original];
+    auto& alternate = m_rayQueryPipelines[&original];
 
     if(alternate)
     {
@@ -3867,7 +3779,7 @@ bool PathTraceReferencePass::InitializeVisibilityPipelines(
     {
         alternate->Shutdown();
         alternate.reset();
-        const std::string message = std::string(primaryDi ? "DI.1" : "GI.6") +
+        const std::string message = std::string("GI.6") +
             " RayQuery unavailable; original TraceRay retained: " + queryDescription.shaderPath.string();
 
         if(shaders.IsPackaged())
@@ -3918,42 +3830,6 @@ RayTracingPipeline& PathTraceReferencePass::VisibilityPipeline(RayTracingPipelin
     return original;
 }
 
-bool PathTraceReferencePass::IsPrimaryDiShadowRayQueryReady() const
-{
-    return m_initialized && m_splitPipelinesReady && m_primaryDiExtractionPipelineReady &&
-        !m_primaryDiRayQueryPipelines.empty() &&
-        std::all_of(m_primaryDiRayQueryPipelines.begin(), m_primaryDiRayQueryPipelines.end(),
-            [](const auto& entry)
-            {
-                return entry.second != nullptr;
-            });
-}
-
-void PathTraceReferencePass::SelectPrimaryDiShadowRayQuery(bool enabled)
-{
-    m_primaryDiShadowRayQuery = enabled && IsPrimaryDiShadowRayQueryReady();
-}
-
-RayTracingPipeline& PathTraceReferencePass::PrimaryDiVisibilityPipeline(RayTracingPipeline& original)
-{
-    const auto found = m_primaryDiRayQueryPipelines.find(&original);
-
-    if(m_primaryDiShadowRayQuery && found != m_primaryDiRayQueryPipelines.end() && found->second)
-    {
-        return *found->second;
-    }
-
-    // PSR.1c-A: the PSR direct pass's twin, outside the shared readiness set.
-    const auto replacement = m_psrPrimaryDiRayQueryPipelines.find(&original);
-
-    if(m_primaryDiShadowRayQuery && replacement != m_psrPrimaryDiRayQueryPipelines.end() && replacement->second)
-    {
-        return *replacement->second;
-    }
-
-    return original;
-}
-
 bool PathTraceReferencePass::PreparePrimaryDiExtractionPipeline(GraphicsDevice& device, ShaderLibrary& shaders)
 {
     TransitionTiming::Scope er1Scope("PreparePrimaryDiExtractionPipeline", 0.5);
@@ -3962,11 +3838,10 @@ bool PathTraceReferencePass::PreparePrimaryDiExtractionPipeline(GraphicsDevice& 
         return true;
     }
 
-    const RayTracingPipelineDescription description =
-        BuildReSTIRDISplitExtractionPipelineDescription(true, m_libraryVariant);
+    const RayTracingPipelineDescription description = DirectPassDescription(true, 0u);
     const ShaderLibraryCompileResult* library = AcquireLibrary(shaders, description.shaderPath);
 
-    if(!library || !LibraryNamesExport(library->bytecode, description.rayGenerationShader) ||
+    if(!library || !LibraryHasEntryPoint(library->bytecode, description) ||
         !InitializeVisibilityPipelines(device, shaders, m_extractSplitDirectPipeline, library->bytecode, description))
     {
         Log::Warning("DI.1 direct extraction preparation unavailable; primary visibility selector disabled.");
@@ -3975,4 +3850,45 @@ bool PathTraceReferencePass::PreparePrimaryDiExtractionPipeline(GraphicsDevice& 
 
     m_primaryDiExtractionPipelineReady = true;
     return true;
+}
+
+RayTracingPipelineDescription PathTraceReferencePass::DirectPassDescription(bool extraction, std::uint32_t psrChain) const
+{
+    RayTracingPipelineDescription description = extraction ?
+        BuildReSTIRDISplitExtractionPipelineDescription(true, m_libraryVariant) :
+        BuildReSTIRDISplitPipelineDescription(true, m_libraryVariant);
+
+    // PSR.2 (G-buffer storage): after the split pair's own parameters, b4 (the replacement pass's camera and identity)
+    // and t2 (its transforms), with the geometry pass's material sampler.
+    if(psrChain != 0u)
+    {
+        description.rootParameters.push_back({RootParameterType::ConstantBuffer, 4});
+        description.rootParameters.push_back({RootParameterType::ShaderResource, 2});
+        description.rasterMaterialSampler = true;
+    }
+
+    // The compute shader reproduces this description's radiance hit and miss (PathTraceTraceRadianceInline); if they no
+    // longer match, it has no shader path, so its preparation fails visibly instead of lighting incorrectly.
+    const bool contract = ComputeRetraceContractHolds(description);
+
+    if(!contract)
+    {
+        static bool reported = false;
+
+        if(!reported)
+        {
+            reported = true;
+            Log::Error("The ReSTIR DI direct pass's hit groups no longer match its compute shader's inline radiance ray "
+                "(PathTraceTraceRadianceInline); the compute direct pass is unavailable.");
+        }
+    }
+
+    description.shaderPath = contract ? DirectLightingComputePath(extraction, psrChain) : std::filesystem::path();
+    description.computeShader = true;
+    description.rayGenerationShader = ShaderCompiler::ComputeLibraryEntryPoint;
+    description.missShaders.clear();
+    description.hitGroups.clear();
+    description.maxPayloadSize = 0;
+    description.maxAttributeSize = 0;
+    return description;
 }

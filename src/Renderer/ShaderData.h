@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <vector>
 
 struct MaterialConstants
 {
@@ -320,16 +321,24 @@ struct GPULight
     bool operator==(const GPULight&) const = default;
 };
 
-// Root constant buffer b3 of deferred lighting and b2 of RTGI. Only lightCount records are
-// read; the table is never partially filled with stale values.
+// Many-light M2: the frame's scene light table on the CPU, in shader order (BuildFrameLighting). lights holds exactly
+// lightCount records; the GPU copy is SceneLightBuffer's.
+struct SceneLightTable
+{
+    std::uint32_t lightCount = 0;
+    std::vector<GPULight> lights;
+
+    bool operator==(const SceneLightTable&) const = default;
+};
+
+// The root constant buffer every scene-light consumer binds (deferred b3, RTGI b2, path tracing b1, mist, NRD): the light
+// count and the bindless structured SRV of the scene light buffer, whose records are GPULights at a 64-byte stride
+// (StructuredBuffer<GPULight>). Shaders read no record at or beyond lightCount.
 struct SceneLightConstants
 {
-    static constexpr std::uint32_t Capacity = 64;
-
     std::uint32_t lightCount;
-    std::uint32_t padding[3];
-
-    GPULight lights[Capacity];
+    std::uint32_t lightBufferIndex;
+    std::uint32_t padding[2];
 };
 
 struct GPUMaterial
@@ -413,8 +422,10 @@ static_assert(sizeof(GPULight) == 64);
 static_assert(offsetof(GPULight, direction) == 16);
 static_assert(offsetof(GPULight, radiance) == 32);
 static_assert(offsetof(GPULight, cosInnerCone) == 48);
-static_assert(sizeof(SceneLightConstants) == 16 + 64 * SceneLightConstants::Capacity);
-static_assert(offsetof(SceneLightConstants, lights) == 16);
+static_assert(offsetof(GPULight, type) == 12);
+static_assert(offsetof(GPULight, range) == 28);
+static_assert(offsetof(GPULight, cosOuterCone) == 44);
+static_assert(sizeof(SceneLightConstants) == 16);
 static_assert(sizeof(ReflectionConstants) == 160);
 static_assert(sizeof(RayTracingInstanceData) == 48);
 static_assert(offsetof(RayTracingInstanceData, triangleSlotBufferIndex) == 32);

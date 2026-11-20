@@ -79,8 +79,8 @@ ConstantBuffer<DirectionalLightConstants> lightConstants : register(b1);
 cbuffer SceneLightConstants : register(b2)
 {
     uint sceneLightCount;
-    uint3 sceneLightPadding;
-    GPULight sceneLights[SCENE_LIGHT_CAPACITY];
+    uint sceneLightBufferIndex;
+    uint2 sceneLightPadding;
 };
 
 SamplerState materialSampler : register(s0);
@@ -436,9 +436,9 @@ float3 ShadeGISecondarySurface(GIPayload surface, float3 secondaryPosition, uint
     float3 biasNormal = normalize(surface.worldNormal);
     float3 localRadiance = 0.0f;
 
-    for(uint lightIndex = 0u; lightIndex < min(sceneLightCount, SCENE_LIGHT_CAPACITY); ++lightIndex)
+    for(uint lightIndex = 0u; lightIndex < sceneLightCount; ++lightIndex)
     {
-        GPULight localLight = sceneLights[lightIndex];
+        GPULight localLight = SceneLightLoad(sceneLightBufferIndex, lightIndex);
 
         // The owner is exclusively in b1; non-owner Directionals remain direct-only.
         if(localLight.type != SCENE_LIGHT_POINT && localLight.type != SCENE_LIGHT_SPOT)

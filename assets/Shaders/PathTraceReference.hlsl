@@ -15,8 +15,8 @@
 // PT.2B: who estimates the HDRI at the ReSTIR DI vertex; read by the ReSTIR DI direct pass and by every split indirect pass.
 #include "RtxdiEnvironmentConfig.hlsli"
 
-// RTXPT.3: PathTraceReSTIRDI.hlsl compiles this file with PATH_TRACE_RESTIR_DI_LIBRARY defined, for the ReSTIR DI
-// direct pass. Every RTXDI addition below is inside that specialization, so this library (the reference,
+// RTXPT.3: the compute wrappers in DirectLighting/ compile this file with PATH_TRACE_RESTIR_DI_LIBRARY defined, for the
+// ReSTIR DI direct pass. Every RTXDI addition below is inside that specialization, so this library (the reference,
 // raster-primary, pixel-centre and ReSTIR DI indirect pipelines) contains no RTXDI code and does not depend on the
 // RTXDI SDK headers.
 #ifdef PATH_TRACE_RESTIR_DI_LIBRARY
@@ -115,8 +115,8 @@ cbuffer PathTraceConstants : register(b0)
     uint gBufferMaterialIndex;
     uint gBufferSurfaceIndex;
     uint gBufferGeometricNormalIndex;
-    // RTXPT.3 ReSTIR DI: the raw UAV of the per-sample vertex-0 direct radiance, written by
-    // PathTraceReSTIRDISplitDirectRayGeneration and read by PathTraceReSTIRDISplitIndirectRayGeneration.
+    // RTXPT.3 ReSTIR DI: the raw UAV of the per-sample vertex-0 direct radiance, written by the direct pass
+    // (PathTraceReSTIRDIDirectCS) and read by PathTraceReSTIRDISplitIndirectRayGeneration.
     uint splitDirectRadianceIndex;
 
 #ifdef PATH_TRACE_RAW_DIFFUSE_HIT_DISTANCE_LIBRARY
@@ -150,12 +150,12 @@ cbuffer PathTraceConstants : register(b0)
 cbuffer SceneLightConstants : register(b1)
 {
     uint sceneLightCount;
-    uint3 sceneLightPadding;
-    GPULight sceneLights[SCENE_LIGHT_CAPACITY];
+    uint sceneLightBufferIndex;
+    uint2 sceneLightPadding;
 };
 
 #ifdef PATH_TRACE_RESTIR_DI_LIBRARY
-// RTXPT.3, read only by PathTraceReSTIRDISplitDirectRayGeneration, whose pipeline alone binds b2.
+// RTXPT.3, read only by the ReSTIR DI direct pass (PathTraceReSTIRDIDirectCS), whose pipeline alone binds b2.
 // Identical layout to PathTraceRtxdiConstants (RtxdiShaderData.h).
 cbuffer RtxdiConstants : register(b2)
 {
@@ -632,11 +632,11 @@ float3 PathTraceDirectLightingLobes(PathTraceSurface surface, float3 position, i
         diffuseRadiance += sampleDiffuse;
     }
 
-    uint lightCount = min(sceneLightCount, SCENE_LIGHT_CAPACITY);
+    uint lightCount = sceneLightCount;
 
     for(uint lightIndex = 0u; lightIndex < lightCount; ++lightIndex)
     {
-        PathTraceLightSample lightSample = PathTraceSampleTableLight(sceneLights[lightIndex], position);
+        PathTraceLightSample lightSample = PathTraceSampleTableLight(SceneLightLoad(sceneLightBufferIndex, lightIndex), position);
         radiance += PathTraceShadeLightSampleLobes(surface, position, lightSample, rayCount, sampleDiffuse);
         diffuseRadiance += sampleDiffuse;
     }
@@ -679,14 +679,14 @@ float3 PathTraceSharcNvTrainingDirectLighting(PathTraceSurface surface, float3 p
         diffuseRadiance += sampleDiffuse;
     }
 
-    uint lightCount = min(sceneLightCount, SCENE_LIGHT_CAPACITY);
+    uint lightCount = sceneLightCount;
     float totalWeight = 0.0f;
     float selectedWeight = 0.0f;
     PathTraceLightSample selected = (PathTraceLightSample)0;
 
     for(uint lightIndex = 0u; lightIndex < lightCount; ++lightIndex)
     {
-        PathTraceLightSample lightSample = PathTraceSampleTableLight(sceneLights[lightIndex], position);
+        PathTraceLightSample lightSample = PathTraceSampleTableLight(SceneLightLoad(sceneLightBufferIndex, lightIndex), position);
         float weight = lightSample.valid ? PathTraceLuminance(lightSample.radiance) : 0.0f;
 
         if(!(weight > 0.0f) || !isfinite(weight))
@@ -776,6 +776,12 @@ void PathTraceTraceRadianceReordered(RayDesc ray, uint instanceMask, bool reorde
 
     dx::HitObject::Invoke(hit, payload);
 }
+#endif
+
+#ifdef PATH_TRACE_DIRECT_COMPUTE
+// The ReSTIR DI direct pass as a compute shader (DirectLighting/): a radiance ray traced with inline RayQuery, defined
+// after the closest-hit helpers it shares with PathTraceClosestHit.
+void PathTraceTraceRadianceInline(RayDesc ray, uint instanceMask, inout PathTracePayload payload);
 #endif
 
 // How the path loop forms its first vertex. Every ray-generation entry passes one of these as a literal,
@@ -1611,7 +1617,10 @@ bool PathTracePsrChainDirectSurface(uint2 pixel, PathTraceRasterFirstVertex firs
     payload.shadingNormal = float3(0.0f, 0.0f, 1.0f);
     payload.uv = float2(0.0f, 0.0f);
     payload.materialIndex = 0u;
-#ifdef PATH_TRACE_SER
+#if defined(PATH_TRACE_DIRECT_COMPUTE)
+    // The compute direct pass: the same ray and closest-hit evaluation with inline RayQuery.
+    PathTraceTraceRadianceInline(ray, 0xFF, payload);
+#elif defined(PATH_TRACE_SER)
     PathTraceTraceRadianceReordered(ray, 0xFF, false, payload);
 #else
     TraceRay(scene, RAY_FLAG_NONE, 0xFF, 0, 1, PATH_TRACE_MISS_RADIANCE, ray, payload);
@@ -3168,16 +3177,21 @@ void PathTracePsrProbeRayGeneration()
 #endif
 
 #ifdef PATH_TRACE_RESTIR_DI_LIBRARY
-// RTXPT.3 ReSTIR DI direct pass (PathTraceReSTIRDI.hlsl only): the RTXDI work of vertex 0 for every sample of this
+// RTXPT.3 ReSTIR DI direct pass (DirectLighting/ only): the RTXDI work of vertex 0 for every sample of this
 // dispatch, initial sampling, sample 0's spatiotemporal reuse, visibility and reservoir publication, with no path
 // continuation. Each sample's estimate is stored for the indirect pass; samples whose path never reaches vertex-0
 // direct lighting store zero, and the indirect pass never reads them. Every active pixel writes its reservoir each
 // dispatch; a pixel whose sample 0 ran no RTXDI sampling (background, unusable sample, pure delta mirror) writes
 // an empty one. Only rays are counted here; the indirect pass counts samples. extract (a literal) also stores each
 // sample's diffuse-lobe part, at the same address in the splitDirectDiffuseIndex buffer (RTXPT D.1B.2).
+#ifdef PATH_TRACE_DIRECT_COMPUTE
+// RayQuery 2M E3: the compute direct pass's pixel, its dispatch thread (PathTraceReSTIRDIDirectCS).
+static uint2 g_pathTraceDirectComputePixel = uint2(0u, 0u);
+#endif
+
 void PathTraceRunReSTIRDISplitDirect(bool extract)
 {
-    uint2 pixel = DispatchRaysIndex().xy;
+    uint2 pixel = g_pathTraceDirectComputePixel;
     bool active = all(pixel < resolution);
     uint rayCount = 0u;
 
@@ -3273,22 +3287,22 @@ void PathTraceRunReSTIRDISplitDirect(bool extract)
     }
 }
 
-// A DXR library holds one of the two direct passes, never both: with a second RTXDI direct-pass ray generation in
-// the same library (even an exact duplicate of the production one), the production direct pass rendered different,
-// darker images at runtime (RTXPT D.1B.2 bisection; the compiled DXIL of the production export was unchanged).
-// PathTraceReSTIRDIExtract*.hlsl define PATH_TRACE_RESTIR_DI_EXTRACTION_LIBRARY for the extraction one.
-#ifndef PATH_TRACE_RESTIR_DI_EXTRACTION_LIBRARY
-[shader("raygeneration")]
-void PathTraceReSTIRDISplitDirectRayGeneration()
+// The extraction wrappers (DirectLighting/*Extract.hlsl) define PATH_TRACE_RESTIR_DI_EXTRACTION_LIBRARY.
+#if defined(PATH_TRACE_DIRECT_COMPUTE)
+// RayQuery 2M E3: the production direct pass, compiled as a compute shader (DirectLighting/, cs_6_6) outside any DXR
+// state object: a DXR direct pass's visibility depended on the library it was linked from (RayQuery 2C-2M). One thread
+// per pixel in PATH_TRACE_DIRECT_COMPUTE_GROUP_SIZE squares (RayTracingPipelineDescription::computeThreadGroupSize).
+static const uint PATH_TRACE_DIRECT_COMPUTE_GROUP_SIZE = 8u;
+
+[numthreads(PATH_TRACE_DIRECT_COMPUTE_GROUP_SIZE, PATH_TRACE_DIRECT_COMPUTE_GROUP_SIZE, 1)]
+void PathTraceReSTIRDIDirectCS(uint3 thread : SV_DispatchThreadID)
 {
-    PathTraceRunReSTIRDISplitDirect(false);
-}
-#else
-// RTXPT D.1B.2: the direct pass with signal extraction.
-[shader("raygeneration")]
-void PathTraceReSTIRDISplitDirectExtractRayGeneration()
-{
+    g_pathTraceDirectComputePixel = thread.xy;
+#ifdef PATH_TRACE_RESTIR_DI_EXTRACTION_LIBRARY
     PathTraceRunReSTIRDISplitDirect(true);
+#else
+    PathTraceRunReSTIRDISplitDirect(false);
+#endif
 }
 #endif
 #endif
@@ -3371,109 +3385,71 @@ uint3 PathTraceTriangleIndices(RayTracingInstanceData instance, uint primitiveIn
 [shader("closesthit")]
 void PathTraceClosestHit(inout PathTracePayload payload, BuiltInTriangleIntersectionAttributes attributes)
 {
-    StructuredBuffer<RayTracingInstanceData> instances = ResourceDescriptorHeap[instanceDataIndex];
-    RayTracingInstanceData instance = instances[InstanceID()];
-    instance.materialIndex = ResolveHitMaterial(instance, PrimitiveIndex());
+    // The evaluation is shared with the compute direct pass's inline radiance ray (PathTraceClosestHitBody.hlsli).
+#define PATH_TRACE_HIT_INSTANCE_ID InstanceID()
+#define PATH_TRACE_HIT_PRIMITIVE_INDEX PrimitiveIndex()
+#define PATH_TRACE_HIT_BARYCENTRICS attributes.barycentrics
+#define PATH_TRACE_HIT_WORLD_TO_OBJECT WorldToObject3x4()
+#define PATH_TRACE_HIT_OBJECT_TO_WORLD ObjectToWorld3x4()
+#define PATH_TRACE_HIT_WORLD_RAY_DIRECTION WorldRayDirection()
+#define PATH_TRACE_HIT_T RayTCurrent()
+#include "PathTraceClosestHitBody.hlsli"
+#undef PATH_TRACE_HIT_INSTANCE_ID
+#undef PATH_TRACE_HIT_PRIMITIVE_INDEX
+#undef PATH_TRACE_HIT_BARYCENTRICS
+#undef PATH_TRACE_HIT_WORLD_TO_OBJECT
+#undef PATH_TRACE_HIT_OBJECT_TO_WORLD
+#undef PATH_TRACE_HIT_WORLD_RAY_DIRECTION
+#undef PATH_TRACE_HIT_T
+}
 
-    ByteAddressBuffer vertexBuffer = ResourceDescriptorHeap[NonUniformResourceIndex(instance.vertexBufferIndex)];
-    uint3 indices = PathTraceTriangleIndices(instance, PrimitiveIndex());
-    float3 barycentrics = float3(1.0f - attributes.barycentrics.x - attributes.barycentrics.y,
-        attributes.barycentrics.x, attributes.barycentrics.y);
+#ifdef PATH_TRACE_DIRECT_COMPUTE
+// RayQuery 2M E3: a radiance ray exactly as the DXR direct pipelines trace it (TraceRay with PATH_TRACE_MISS_RADIANCE),
+// for the compute direct pass, whose only radiance ray is the two-bounce PSR chain retrace. Equivalence relies on the
+// geometry contract of the direct pipelines (RayQuery_Compute_Direct_Pass_Production_Integration_2M.md):
+// - one hit group, PathTraceHitGroup (PathTraceClosestHit, no any-hit shader), and hit-group contribution 0 on every TLAS
+//   instance, so every hit runs PathTraceClosestHit: the shared PathTraceClosestHitBody.hlsli below;
+// - triangles only: no procedural geometry. Without an any-hit shader DXR accepts every non-opaque candidate, so each is
+//   committed (Engine's geometry is opaque, so none occurs); without ACCEPT_FIRST_HIT the committed hit is the closest;
+// - a miss runs PathTraceMiss, which sets only hitDistance.
+// An any-hit (alpha-tested) path, a second hit group or procedural geometry needs matching handling here.
+void PathTraceTraceRadianceInline(RayDesc ray, uint instanceMask, inout PathTracePayload payload)
+{
+    RayQuery<RAY_FLAG_NONE> query;
+    query.TraceRayInline(scene, RAY_FLAG_NONE, instanceMask, ray);
 
-    // Normals use the inverse transpose of object-to-world (row vector times world-to-object).
-    float3x3 normalTransform = (float3x3)WorldToObject3x4();
-    float3 position0 = PathTraceLoadPosition(vertexBuffer, indices.x, instance.vertexStride);
-    float3 position1 = PathTraceLoadPosition(vertexBuffer, indices.y, instance.vertexStride);
-    float3 position2 = PathTraceLoadPosition(vertexBuffer, indices.z, instance.vertexStride);
-    float3 objectGeometricNormal = cross(position1 - position0, position2 - position0);
-    float3 geometricNormal = mul(objectGeometricNormal, normalTransform);
-    float geometricLengthSquared = dot(geometricNormal, geometricNormal);
-
-    float3 objectNormal = PathTraceLoadNormal(vertexBuffer, indices.x, instance) * barycentrics.x +
-        PathTraceLoadNormal(vertexBuffer, indices.y, instance) * barycentrics.y +
-        PathTraceLoadNormal(vertexBuffer, indices.z, instance) * barycentrics.z;
-    float3 worldNormal = mul(objectNormal, normalTransform);
-    float worldNormalLengthSquared = dot(worldNormal, worldNormal);
-
-    float2 uv = PathTraceLoadUV(vertexBuffer, indices.x, instance) * barycentrics.x +
-        PathTraceLoadUV(vertexBuffer, indices.y, instance) * barycentrics.y +
-        PathTraceLoadUV(vertexBuffer, indices.z, instance) * barycentrics.z;
-
-    if(!(geometricLengthSquared > 1.0e-30f) || !isfinite(geometricLengthSquared))
+    while(query.Proceed())
     {
-        geometricNormal = -WorldRayDirection();
-    }
-    else
-    {
-        geometricNormal *= rsqrt(geometricLengthSquared);
-    }
-
-    if(!(worldNormalLengthSquared > 1.0e-16f) || !isfinite(worldNormalLengthSquared))
-    {
-        worldNormal = geometricNormal;
-    }
-    else
-    {
-        worldNormal *= rsqrt(worldNormalLengthSquared);
-    }
-
-    // Interpolated normals keep the triangle's orientation so two-sided flipping stays consistent.
-    if(dot(worldNormal, geometricNormal) < 0.0f)
-    {
-        geometricNormal = -geometricNormal;
-    }
-
-    float3 shadingNormal = worldNormal;
-    StructuredBuffer<GPUMaterial> materials = ResourceDescriptorHeap[materialBufferIndex];
-    uint materialCount;
-    uint materialStride;
-    materials.GetDimensions(materialCount, materialStride);
-
-    // Tangent-space normal mapping, identical to the RTGI/G-buffer convention.
-    if(instance.materialIndex < materialCount && instance.tangentOffset != 0xFFFFFFFFu &&
-        materials[instance.materialIndex].normalTextureIndex != 0xFFFFFFFFu)
-    {
-        GPUMaterial material = materials[instance.materialIndex];
-        float4 objectTangent = PathTraceLoadTangent(vertexBuffer, indices.x, instance) * barycentrics.x +
-            PathTraceLoadTangent(vertexBuffer, indices.y, instance) * barycentrics.y +
-            PathTraceLoadTangent(vertexBuffer, indices.z, instance) * barycentrics.z;
-        float3 tangent = mul((float3x3)ObjectToWorld3x4(), objectTangent.xyz);
-        tangent -= worldNormal * dot(worldNormal, tangent);
-        float tangentLengthSquared = dot(tangent, tangent);
-        float instanceDeterminant = determinant((float3x3)ObjectToWorld3x4());
-        float handedness = objectTangent.w * (instanceDeterminant < 0.0f ? -1.0f : 1.0f);
-
-        Texture2D<float4> normalTexture = ResourceDescriptorHeap[NonUniformResourceIndex(material.normalTextureIndex)];
-        float2 normalXY = normalTexture.SampleLevel(materialSampler, uv, 0.0f).rg * 2.0f - 1.0f;
-        float3 sampledNormal = float3(normalXY, sqrt(saturate(1.0f - dot(normalXY, normalXY))));
-        float sampledLengthSquared = dot(sampledNormal, sampledNormal);
-
-        bool frameValid = all(isfinite(tangent)) && isfinite(tangentLengthSquared) && tangentLengthSquared > 1.0e-8f &&
-            all(isfinite(sampledNormal)) && sampledLengthSquared > 1.0e-8f && isfinite(handedness) &&
-            abs(handedness) > 1.0e-8f && isfinite(instanceDeterminant) && instanceDeterminant != 0.0f;
-
-        if(frameValid)
+        if(query.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE)
         {
-            sampledNormal = normalize(sampledNormal);
-            float3 tangentDirection = normalize(tangent);
-            float3 bitangent = cross(worldNormal, tangentDirection) * handedness;
-            float3 mappedNormal = tangentDirection * sampledNormal.x + bitangent * sampledNormal.y +
-                worldNormal * sampledNormal.z;
-            float mappedLengthSquared = dot(mappedNormal, mappedNormal);
-
-            if(all(isfinite(mappedNormal)) && isfinite(mappedLengthSquared) && mappedLengthSquared > 1.0e-8f)
-            {
-                shadingNormal = mappedNormal * rsqrt(mappedLengthSquared);
-            }
+            query.CommitNonOpaqueTriangleHit();
         }
     }
 
-    payload.hitDistance = RayTCurrent();
-    payload.geometricNormal = geometricNormal;
-    payload.shadingNormal = shadingNormal;
-    payload.uv = uv;
-    payload.materialIndex = instance.materialIndex;
+    if(query.CommittedStatus() == COMMITTED_TRIANGLE_HIT)
+    {
+#define PATH_TRACE_HIT_INSTANCE_ID query.CommittedInstanceID()
+#define PATH_TRACE_HIT_PRIMITIVE_INDEX query.CommittedPrimitiveIndex()
+#define PATH_TRACE_HIT_BARYCENTRICS query.CommittedTriangleBarycentrics()
+#define PATH_TRACE_HIT_WORLD_TO_OBJECT query.CommittedWorldToObject3x4()
+#define PATH_TRACE_HIT_OBJECT_TO_WORLD query.CommittedObjectToWorld3x4()
+#define PATH_TRACE_HIT_WORLD_RAY_DIRECTION query.WorldRayDirection()
+#define PATH_TRACE_HIT_T query.CommittedRayT()
+#include "PathTraceClosestHitBody.hlsli"
+#undef PATH_TRACE_HIT_INSTANCE_ID
+#undef PATH_TRACE_HIT_PRIMITIVE_INDEX
+#undef PATH_TRACE_HIT_BARYCENTRICS
+#undef PATH_TRACE_HIT_WORLD_TO_OBJECT
+#undef PATH_TRACE_HIT_OBJECT_TO_WORLD
+#undef PATH_TRACE_HIT_WORLD_RAY_DIRECTION
+#undef PATH_TRACE_HIT_T
+    }
+    else
+    {
+        payload.hitDistance = -1.0f;
+    }
 }
+#endif
 
 #ifdef PATH_TRACE_PSR_LIBRARY
 // PSR.1b guide hit group: PathTraceClosestHit plus the hit's TLAS instance and primitive. The evaluation is a verbatim

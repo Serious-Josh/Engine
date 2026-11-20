@@ -108,9 +108,10 @@ bool BuildFrameLighting(const DirectionalLight& legacySun, const SceneLightingSn
         return true;
     }
 
-    if(snapshot->additionalLights.size() > SceneLightConstants::Capacity)
+    // Many-light M2: the table grows with the scene. The only bound is the 32-bit light index shaders use.
+    if(snapshot->additionalLights.size() > UINT32_MAX)
     {
-        return Fail(error, "Scene lighting exceeds the GPU light table capacity.");
+        return Fail(error, "Scene lighting exceeds 32-bit light indexing.");
     }
 
     // Captured file scenes are authoritative even when empty. Only explicit procedural-demo
@@ -139,14 +140,20 @@ bool BuildFrameLighting(const DirectionalLight& legacySun, const SceneLightingSn
         return Fail(error, "The shadow-owner Directional Light is not finite.");
     }
 
+    candidate.table.lights.reserve(snapshot->additionalLights.size());
+    candidate.tableLightIDs.reserve(snapshot->additionalLights.size());
+
     for(const ResolvedSceneLight& light : snapshot->additionalLights)
     {
-        if(!PackLight(light, renderScale, candidate.table.lights[candidate.table.lightCount]))
+        GPULight record{};
+
+        if(!PackLight(light, renderScale, record))
         {
             return Fail(error, "A scene Light is not finite; lighting was not published.");
         }
 
-        candidate.tableLightIDs[candidate.table.lightCount] = light.objectID;
+        candidate.table.lights.push_back(record);
+        candidate.tableLightIDs.push_back(light.objectID);
         ++candidate.table.lightCount;
     }
 
@@ -154,11 +161,11 @@ bool BuildFrameLighting(const DirectionalLight& legacySun, const SceneLightingSn
     return true;
 }
 
-bool SameLocalLightInputs(const SceneLightConstants& left, const SceneLightConstants& right)
+bool SameLocalLightInputs(const SceneLightTable& left, const SceneLightTable& right)
 {
     std::uint32_t leftIndex = 0;
     std::uint32_t rightIndex = 0;
-    const auto skipDirectionals = [](const SceneLightConstants& table, std::uint32_t& index)
+    const auto skipDirectionals = [](const SceneLightTable& table, std::uint32_t& index)
     {
         while(index < table.lightCount &&
             table.lights[index].type == static_cast<std::uint32_t>(LightType::Directional))

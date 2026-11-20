@@ -22,6 +22,7 @@
 #include "ProjectTextureLoader.h"
 #include "CommandContext.h"
 #include "ReferenceRayCounts.h"
+#include "SceneLightBuffer.h"
 #include "DescriptorHeap.h"
 #include "GraphicsDevice.h"
 #include "GpuTimestampProfiler.h"
@@ -267,11 +268,6 @@ struct PathTraceReferenceStatus
     bool activeLastFrame = false;
     bool secondaryShadowRayQueryReady = false;
     bool secondaryShadowRayQueryActive = false;
-    bool primaryDiShadowRayQueryReady = false;
-    bool primaryDiShadowRayQueryActive = false;
-    bool primaryDiShadowRayQueryFailed = false;
-    // F01.1: RayQuery was requested but the SM 6.9 + SER variant routes primary DI visibility to TraceRay.
-    bool primaryDiShadowRayQuerySerWorkaround = false;
     std::uint64_t visibilityTimingEpoch = 0;
     std::uint32_t accumulatedSamples = 0;
     std::uint64_t accumulationResets = 0;
@@ -2031,7 +2027,7 @@ private:
         std::uint32_t height = 0;
         PathTraceReferenceSettings settings;
         DirectionalLight sun;
-        SceneLightConstants lights{};
+        SceneLightTable lights{};
         D3D12_GPU_VIRTUAL_ADDRESS topLevelAddress = 0;
         std::uint64_t topLevelRecording = 0;
         std::uint64_t materialRevision = 0;
@@ -2217,8 +2213,6 @@ private:
     // takes PathTraceSequenceSeed of its first frame's serial relative to m_pathTraceSequenceOrigin, so a moving
     // camera, which restarts accumulation every frame, no longer repeats one random sequence.
     std::optional<std::uint32_t> m_pathTraceRandomSeed;
-    // F01.1 verification only: disables the SM 6.9 + SER primary DI TraceRay routing (the guard's negative control).
-    bool m_primaryDiSerWorkaroundDisabledForTesting = false;
     // The seed of the current accumulation run, latched when accumulation restarts.
     std::uint32_t m_pathTraceRunSeed = 0;
     // m_gpuProfilerFrameSerial at the last ResetSceneHistory: the first run after a reset uses seed 0.
@@ -2330,7 +2324,7 @@ private:
         std::uint32_t maxPathDepth = 0;
         std::uint32_t russianRouletteDepth = 0;
         DirectionalLight sun;
-        SceneLightConstants lights{};
+        SceneLightTable lights{};
     };
 
     std::optional<PathTraceTemporalKey> m_pathTraceTemporalKey;
@@ -3028,7 +3022,13 @@ private:
 
     bool m_hasPreviousGILight = false;
 
-    SceneLightConstants m_previousGILocalLights{};
+    SceneLightTable m_previousGILocalLights{};
+    // Many-light M2: the GPU scene light table every scene-light consumer reads.
+    SceneLightBuffer m_sceneLightBuffer;
+
+    // Verification only: records `count` lights into the scene light buffer in the current command list and returns the
+    // address of their SceneLightConstants (0 on failure), for harnesses that drive passes directly.
+    D3D12_GPU_VIRTUAL_ADDRESS UploadSceneLightsForTesting(const GPULight* lights, std::uint32_t count);
     bool m_hasPreviousGILocalLights = false;
 
     bool m_packagedRuntime = false;

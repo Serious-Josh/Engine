@@ -70,8 +70,8 @@ ConstantBuffer<NrdHistoryConfidenceProbeConstants> probeConstants : register(b0)
 cbuffer SceneLightConstants : register(b1)
 {
     uint sceneLightCount;
-    uint3 sceneLightPadding;
-    GPULight sceneLights[SCENE_LIGHT_CAPACITY];
+    uint sceneLightBufferIndex;
+    uint2 sceneLightPadding;
 };
 
 // The leading fields of PathTraceRtxdiConstants (RtxdiShaderData.h, PathTraceReference.hlsl b2), bound from the frame's

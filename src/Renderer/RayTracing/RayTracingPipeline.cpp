@@ -25,6 +25,12 @@ namespace
 
     bool IsValidDescription(ID3D12Device5* device, const RayTracingPipelineDescription& description)
     {
+        // RayQuery 2M E3: a compute pipeline needs only its shader and root signature.
+        if (description.computeShader)
+        {
+            return device && !description.shaderPath.empty() && !description.rootParameters.empty();
+        }
+
         if (!device ||
             description.shaderPath.empty() ||
             description.rayGenerationShader.empty() ||
@@ -96,6 +102,12 @@ bool RayTracingPipeline::Initialize(
     if (!IsValidDescription(device, description) || library.empty())
     {
         return false;
+    }
+
+    // RayQuery 2M E3: a compute shader, built as a compute pipeline with the same global root signature.
+    if (description.computeShader)
+    {
+        return InitializeCompute(device, library, description);
     }
 
     const std::wstring& rayGenerationShader = description.rayGenerationShader;
@@ -174,6 +186,150 @@ bool RayTracingPipeline::Initialize(
     D3D12_RAYTRACING_PIPELINE_CONFIG pipelineConfig{};
     pipelineConfig.MaxTraceRecursionDepth = description.maxRecursionDepth;
 
+    if (!CreateGlobalRootSignature(device, description))
+    {
+        return false;
+    }
+
+    D3D12_GLOBAL_ROOT_SIGNATURE globalRootSignatureDescription{};
+
+    globalRootSignatureDescription.pGlobalRootSignature = m_globalRootSignature;
+
+    std::vector<D3D12_STATE_SUBOBJECT> subobjects;
+    subobjects.reserve(4 + hitGroupDescriptions.size());
+
+    D3D12_STATE_SUBOBJECT librarySubobject{};
+
+    librarySubobject.Type = D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY;
+    librarySubobject.pDesc = &libraryDescription;
+
+    subobjects.push_back(librarySubobject);
+
+    for (D3D12_HIT_GROUP_DESC& hitGroupDescription : hitGroupDescriptions)
+    {
+        D3D12_STATE_SUBOBJECT hitGroupSubobject{};
+        hitGroupSubobject.Type = D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP;
+        hitGroupSubobject.pDesc = &hitGroupDescription;
+
+        subobjects.push_back(hitGroupSubobject);
+    }
+
+    D3D12_STATE_SUBOBJECT shaderConfigSubobject{};
+    shaderConfigSubobject.Type = D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_SHADER_CONFIG;
+    shaderConfigSubobject.pDesc = &shaderConfig;
+
+    subobjects.push_back(shaderConfigSubobject);
+
+    D3D12_STATE_SUBOBJECT pipelineConfigSubobject{};
+
+    pipelineConfigSubobject.Type = D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG;
+    pipelineConfigSubobject.pDesc = &pipelineConfig;
+
+    subobjects.push_back(pipelineConfigSubobject);
+
+    D3D12_STATE_SUBOBJECT rootSignatureSubobject{};
+    rootSignatureSubobject.Type = D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE;
+    rootSignatureSubobject.pDesc = &globalRootSignatureDescription;
+
+    subobjects.push_back(rootSignatureSubobject);
+
+    D3D12_STATE_OBJECT_DESC stateObjectDescription{};
+    stateObjectDescription.Type = D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE;
+    stateObjectDescription.NumSubobjects = static_cast<UINT>(subobjects.size());
+    stateObjectDescription.pSubobjects = subobjects.data();
+
+    TransitionTiming::Scope er1Scope("CreateStateObject", 0.1, TransitionTiming::TransitionsAndStartup);
+    HRESULT result = device->CreateStateObject(&stateObjectDescription, IID_PPV_ARGS(&m_stateObject));
+
+    if (FAILED(result))
+    {
+        Log::Error("Failed to create DXR pipeline state object. HRESULT: " + std::to_string(result));
+        return false;
+    }
+
+    const std::wstring debugName = description.shaderPath.wstring() + L":" + description.rayGenerationShader;
+    m_stateObject->SetName(debugName.c_str());
+
+    ID3D12StateObjectProperties* stateObjectProperties = nullptr;
+
+    result = m_stateObject->QueryInterface(IID_PPV_ARGS(&stateObjectProperties));
+
+    if (FAILED(result))
+    {
+        Log::Error("Failed to query ID3D12StateObjectProperties. HRESULT: " + std::to_string(result));
+        Shutdown();
+        return false;
+    }
+
+    const void* rayGenerationIdentifier = stateObjectProperties->GetShaderIdentifier(rayGenerationShader.c_str());
+
+    if (!rayGenerationIdentifier)
+    {
+        Log::Error("Missing DXR ray-generation shader identifier for export: " + ExportNameForLog(rayGenerationShader));
+        stateObjectProperties->Release();
+        Shutdown();
+
+        return false;
+    }
+
+    const std::vector<ShaderRecord> rayGenerationRecords = {{rayGenerationIdentifier}};
+
+    std::vector<ShaderRecord> missRecords;
+    missRecords.reserve(description.missShaders.size());
+
+    for (const std::wstring& missShader : description.missShaders)
+    {
+        const void* identifier = stateObjectProperties->GetShaderIdentifier(missShader.c_str());
+
+        if (!identifier)
+        {
+            Log::Error("Missing DXR miss shader identifier for export: " + ExportNameForLog(missShader));
+
+            stateObjectProperties->Release();
+            Shutdown();
+            return false;
+        }
+
+        missRecords.push_back({identifier});
+    }
+
+    std::vector<ShaderRecord> hitGroupRecords;
+
+    hitGroupRecords.reserve(description.hitGroups.size());
+
+    for (const RayTracingHitGroupDescription& hitGroup : description.hitGroups)
+    {
+        const void* identifier = stateObjectProperties->GetShaderIdentifier(hitGroup.name.c_str());
+
+        if (!identifier)
+        {
+            Log::Error("Missing DXR hit-group shader identifier for export: " + ExportNameForLog(hitGroup.name));
+
+            stateObjectProperties->Release();
+            Shutdown();
+            return false;
+        }
+
+        hitGroupRecords.push_back({identifier});
+    }
+
+    if (!m_rayGenerationShaderTable.Initialize(device, rayGenerationRecords) ||
+        !m_missShaderTable.Initialize(device, missRecords) ||
+        !m_hitGroupShaderTable.Initialize(device, hitGroupRecords))
+    {
+        stateObjectProperties->Release();
+        Shutdown();
+        return false;
+    }
+
+    stateObjectProperties->Release();
+
+    return true;
+}
+
+// The description's global root signature: its root parameters and the static samplers every path-tracing pipeline shares.
+bool RayTracingPipeline::CreateGlobalRootSignature(ID3D12Device5* device, const RayTracingPipelineDescription& description)
+{
     std::vector<D3D12_ROOT_PARAMETER> rootParameters;
     rootParameters.reserve(description.rootParameters.size());
 
@@ -321,139 +477,35 @@ bool RayTracingPipeline::Initialize(
         return false;
     }
 
-    D3D12_GLOBAL_ROOT_SIGNATURE globalRootSignatureDescription{};
+    return true;
+}
 
-    globalRootSignatureDescription.pGlobalRootSignature = m_globalRootSignature;
-
-    std::vector<D3D12_STATE_SUBOBJECT> subobjects;
-    subobjects.reserve(4 + hitGroupDescriptions.size());
-
-    D3D12_STATE_SUBOBJECT librarySubobject{};
-
-    librarySubobject.Type = D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY;
-    librarySubobject.pDesc = &libraryDescription;
-
-    subobjects.push_back(librarySubobject);
-
-    for (D3D12_HIT_GROUP_DESC& hitGroupDescription : hitGroupDescriptions)
+bool RayTracingPipeline::InitializeCompute(ID3D12Device5* device, const std::vector<char>& shader,
+    const RayTracingPipelineDescription& description)
+{
+    if (!CreateGlobalRootSignature(device, description))
     {
-        D3D12_STATE_SUBOBJECT hitGroupSubobject{};
-        hitGroupSubobject.Type = D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP;
-        hitGroupSubobject.pDesc = &hitGroupDescription;
-
-        subobjects.push_back(hitGroupSubobject);
+        return false;
     }
 
-    D3D12_STATE_SUBOBJECT shaderConfigSubobject{};
-    shaderConfigSubobject.Type = D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_SHADER_CONFIG;
-    shaderConfigSubobject.pDesc = &shaderConfig;
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pipelineDescription{};
+    pipelineDescription.pRootSignature = m_globalRootSignature;
+    pipelineDescription.CS = {shader.data(), shader.size()};
 
-    subobjects.push_back(shaderConfigSubobject);
-
-    D3D12_STATE_SUBOBJECT pipelineConfigSubobject{};
-
-    pipelineConfigSubobject.Type = D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG;
-    pipelineConfigSubobject.pDesc = &pipelineConfig;
-
-    subobjects.push_back(pipelineConfigSubobject);
-
-    D3D12_STATE_SUBOBJECT rootSignatureSubobject{};
-    rootSignatureSubobject.Type = D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE;
-    rootSignatureSubobject.pDesc = &globalRootSignatureDescription;
-
-    subobjects.push_back(rootSignatureSubobject);
-
-    D3D12_STATE_OBJECT_DESC stateObjectDescription{};
-    stateObjectDescription.Type = D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE;
-    stateObjectDescription.NumSubobjects = static_cast<UINT>(subobjects.size());
-    stateObjectDescription.pSubobjects = subobjects.data();
-
-    TransitionTiming::Scope er1Scope("CreateStateObject", 0.1, TransitionTiming::TransitionsAndStartup);
-    result = device->CreateStateObject(&stateObjectDescription, IID_PPV_ARGS(&m_stateObject));
+    TransitionTiming::Scope er1Scope("CreateComputePipelineState", 0.1, TransitionTiming::TransitionsAndStartup);
+    const HRESULT result = device->CreateComputePipelineState(&pipelineDescription, IID_PPV_ARGS(&m_computePipeline));
 
     if (FAILED(result))
     {
-        Log::Error("Failed to create DXR pipeline state object. HRESULT: " + std::to_string(result));
-        return false;
-    }
-
-    const std::wstring debugName = description.shaderPath.wstring() + L":" + description.rayGenerationShader;
-    m_stateObject->SetName(debugName.c_str());
-
-    ID3D12StateObjectProperties* stateObjectProperties = nullptr;
-
-    result = m_stateObject->QueryInterface(IID_PPV_ARGS(&stateObjectProperties));
-
-    if (FAILED(result))
-    {
-        Log::Error("Failed to query ID3D12StateObjectProperties. HRESULT: " + std::to_string(result));
+        // The pipeline is left empty: the owner records the failure and never binds it.
+        Log::Error("Failed to create the " + description.shaderPath.generic_string() + " compute pipeline. HRESULT: " +
+            std::to_string(result));
+        m_computePipeline = nullptr;
         Shutdown();
         return false;
     }
 
-    const void* rayGenerationIdentifier = stateObjectProperties->GetShaderIdentifier(rayGenerationShader.c_str());
-
-    if (!rayGenerationIdentifier)
-    {
-        Log::Error("Missing DXR ray-generation shader identifier for export: " + ExportNameForLog(rayGenerationShader));
-        stateObjectProperties->Release();
-        Shutdown();
-
-        return false;
-    }
-
-    const std::vector<ShaderRecord> rayGenerationRecords = {{rayGenerationIdentifier}};
-
-    std::vector<ShaderRecord> missRecords;
-    missRecords.reserve(description.missShaders.size());
-
-    for (const std::wstring& missShader : description.missShaders)
-    {
-        const void* identifier = stateObjectProperties->GetShaderIdentifier(missShader.c_str());
-
-        if (!identifier)
-        {
-            Log::Error("Missing DXR miss shader identifier for export: " + ExportNameForLog(missShader));
-
-            stateObjectProperties->Release();
-            Shutdown();
-            return false;
-        }
-
-        missRecords.push_back({identifier});
-    }
-
-    std::vector<ShaderRecord> hitGroupRecords;
-
-    hitGroupRecords.reserve(description.hitGroups.size());
-
-    for (const RayTracingHitGroupDescription& hitGroup : description.hitGroups)
-    {
-        const void* identifier = stateObjectProperties->GetShaderIdentifier(hitGroup.name.c_str());
-
-        if (!identifier)
-        {
-            Log::Error("Missing DXR hit-group shader identifier for export: " + ExportNameForLog(hitGroup.name));
-
-            stateObjectProperties->Release();
-            Shutdown();
-            return false;
-        }
-
-        hitGroupRecords.push_back({identifier});
-    }
-
-    if (!m_rayGenerationShaderTable.Initialize(device, rayGenerationRecords) ||
-        !m_missShaderTable.Initialize(device, missRecords) ||
-        !m_hitGroupShaderTable.Initialize(device, hitGroupRecords))
-    {
-        stateObjectProperties->Release();
-        Shutdown();
-        return false;
-    }
-
-    stateObjectProperties->Release();
-
+    m_computePipeline->SetName(description.shaderPath.wstring().c_str());
     return true;
 }
 
@@ -468,6 +520,12 @@ void RayTracingPipeline::Shutdown()
     {
         m_stateObject->Release();
         m_stateObject = nullptr;
+    }
+
+    if (m_computePipeline)
+    {
+        m_computePipeline->Release();
+        m_computePipeline = nullptr;
     }
 
     if (m_globalRootSignature)
@@ -504,7 +562,15 @@ void RayTracingPipeline::Bind(ID3D12GraphicsCommandList4* commandList) const
         return;
     }
 
-    commandList->SetPipelineState1(m_stateObject);
+    if (m_computePipeline)
+    {
+        commandList->SetPipelineState(m_computePipeline);
+    }
+    else
+    {
+        commandList->SetPipelineState1(m_stateObject);
+    }
+
     commandList->SetComputeRootSignature(m_globalRootSignature);
 }
 
@@ -517,6 +583,13 @@ void RayTracingPipeline::Dispatch(
 {
     if (!commandList || width == 0 || height == 0 || depth == 0)
     {
+        return;
+    }
+
+    if (m_computePipeline)
+    {
+        constexpr unsigned int groupSize = RayTracingPipelineDescription::computeThreadGroupSize;
+        commandList->Dispatch((width + groupSize - 1) / groupSize, (height + groupSize - 1) / groupSize, depth);
         return;
     }
 
@@ -544,6 +617,7 @@ void RayTracingPipeline::Dispatch(
 void RayTracingPipeline::Swap(RayTracingPipeline& other) noexcept
 {
     std::swap(m_stateObject, other.m_stateObject);
+    std::swap(m_computePipeline, other.m_computePipeline);
     std::swap(m_globalRootSignature, other.m_globalRootSignature);
     m_rayGenerationShaderTable.Swap(other.m_rayGenerationShaderTable);
     m_missShaderTable.Swap(other.m_missShaderTable);

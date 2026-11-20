@@ -62,6 +62,12 @@ class Buffer
     bool CreateRawSRV(
         ID3D12Device* device,
         DescriptorHeap& descriptorHeap);
+    // A structured SRV of `stride`-byte elements in place of the raw one (the whole allocation; the width must be a
+    // multiple of the stride).
+    bool CreateStructuredSRV(
+        ID3D12Device* device,
+        DescriptorHeap& descriptorHeap,
+        std::uint32_t stride);
     bool CreateRawUAV(
         ID3D12Device* device,
         DescriptorHeap& descriptorHeap);

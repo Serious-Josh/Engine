@@ -64,7 +64,7 @@ bool RtxdiResources::Initialize(
 
     if(!m_reservoirs.InitializeGPUWritable(device, static_cast<size_t>(elements * ReservoirStride)) ||
         !CreateReservoirUAV(device, descriptorHeap, elements) || !CreateNeighborOffsets(device, descriptorHeap) ||
-        !m_lightData.InitializeGPUWritable(device, RtxdiLightDataLayout::CapacityBytes) ||
+        !m_lightData.InitializeGPUWritable(device, RtxdiLightDataLayout::InitialBytes) ||
         !m_lightData.CreateRawSRV(device, descriptorHeap))
     {
         Log::Error("Failed to create the RTXDI reservoir buffer, neighbor offsets or light data.");
@@ -74,6 +74,7 @@ bool RtxdiResources::Initialize(
 
     m_reservoirs.GetResource()->SetName(L"RTXDI DI Reservoirs");
     m_lightData.GetResource()->SetName(L"RTXDI Light Data");
+    m_lightDataCapacityBytes = RtxdiLightDataLayout::InitialBytes;
 
     m_width = width;
     m_height = height;
@@ -120,6 +121,14 @@ void RtxdiResources::Shutdown()
     m_neighborOffsetsSRVIndex = UINT_MAX;
     m_reservoirs.Shutdown();
     m_lightData.Shutdown();
+    m_lightDataCapacityBytes = 0;
+
+    for(RetiredLightData& retired : m_retiredLightData)
+    {
+        retired.buffer.Shutdown();
+    }
+
+    m_retiredLightData.clear();
     m_context.reset();
     m_frameIndex = 0;
     m_lastFrameUsedHistory = false;
@@ -225,16 +234,60 @@ bool RtxdiResources::BeginFrame(const RtxdiLightSet& lights, const RtxdiHistoryS
     return true;
 }
 
-bool RtxdiResources::RecordLightData(ID3D12GraphicsCommandList* commandList, UploadBuffer& upload, const RtxdiFrame& frame)
+bool RtxdiResources::RecordLightData(ID3D12Device* device, ID3D12GraphicsCommandList* commandList, UploadBuffer& upload,
+    const RtxdiFrame& frame, std::uint64_t lastSubmittedFence, std::uint64_t completedFence)
 {
     const auto currentCount = static_cast<std::uint32_t>(frame.lightRecords.size());
     const auto previousCount = static_cast<std::uint32_t>(frame.previousLightRecords.size());
 
-    if(!m_initialized || !commandList || currentCount > RtxdiLightSet::Capacity ||
-        previousCount > RtxdiLightSet::Capacity || frame.previousLightCount != previousCount ||
+    if(!m_initialized || !device || !commandList || frame.previousLightCount != previousCount ||
         frame.lightTranslation.size() != static_cast<std::size_t>(currentCount) + previousCount)
     {
         return false;
+    }
+
+    // Retired light data buffers whose last possible reader has completed.
+    std::erase_if(m_retiredLightData,
+        [&](RetiredLightData& retired)
+        {
+            if(retired.submissionFence > completedFence)
+            {
+                return false;
+            }
+
+            retired.buffer.Shutdown();
+            return true;
+        });
+
+    // Many-light M2: the light data grows with the light count (doubling, at least the need); submitted frames may still
+    // read the current buffer through its descriptor, so it is retired, not released.
+    const std::uint64_t neededBytes = (std::max)(std::uint64_t{RtxdiLightDataLayout::Bytes(currentCount, previousCount)},
+        std::uint64_t{4});
+
+    if(neededBytes > m_lightDataCapacityBytes)
+    {
+        std::uint64_t capacity = (std::max)(m_lightDataCapacityBytes, std::uint64_t{RtxdiLightDataLayout::InitialBytes});
+
+        while(capacity < neededBytes)
+        {
+            capacity *= 2;
+        }
+
+        const MemoryCategoryScope memoryScope(MemoryCategory::PathTracing);
+        Buffer grown;
+
+        if(capacity > UINT32_MAX || !grown.InitializeGPUWritable(device, static_cast<size_t>(capacity)) ||
+            !m_descriptorHeap || !grown.CreateRawSRV(device, *m_descriptorHeap))
+        {
+            grown.Shutdown();
+            Log::Error("Failed to grow the RTXDI light data to " + std::to_string(capacity) + " bytes.");
+            return false;
+        }
+
+        grown.GetResource()->SetName(L"RTXDI Light Data");
+        m_retiredLightData.push_back(RetiredLightData{std::move(m_lightData), lastSubmittedFence});
+        m_lightData = std::move(grown);
+        m_lightDataCapacityBytes = capacity;
     }
 
     // An empty frame still writes one word, so every frame records the same copy. The staging bytes keep their capacity.
@@ -305,7 +358,7 @@ std::uint64_t RtxdiResources::GetResourceBytes() const noexcept
 
     const std::uint64_t reservoirBytes = ReservoirArrayElements(m_width, m_height) * ReservoirArrayCount *
         ReservoirStride;
-    return reservoirBytes + NeighborOffsetCount * 2 + RtxdiLightDataLayout::CapacityBytes;
+    return reservoirBytes + NeighborOffsetCount * 2 + m_lightDataCapacityBytes;
 }
 
 std::uint64_t RtxdiResources::ReservoirArrayElements(unsigned int width, unsigned int height)

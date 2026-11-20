@@ -57,9 +57,6 @@ struct PathTraceReferenceSettings
     // Runtime-only selection: RayQuery by default; TraceRay retained for diagnostic comparison.
     bool secondaryShadowRayQuery = true;
 
-    // Independent runtime-only selection: DI.1 RayQuery by default; TraceRay retained for comparison and fallback.
-    bool primaryDiShadowRayQuery = true;
-
     // PSR.1a development toggle: primary surface replacement through pure-delta vertex-0 mirrors, Raster Primary with the
     // denoiser Off and no SHARC only. Part of the accumulation key, so a change restarts accumulation.
     bool primarySurfaceReplacement = false;

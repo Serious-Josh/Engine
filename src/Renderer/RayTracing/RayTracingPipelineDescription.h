@@ -32,4 +32,11 @@ struct RayTracingPipelineDescription
 
     // PSR.2 Stage 3A: adds s2, the geometry pass's material sampler (trilinear clamp), to the global root signature.
     bool rasterMaterialSampler = false;
+
+    // RayQuery 2M E3: shaderPath is a compute shader (ShaderLibraryProfile::Compute66), built as a compute pipeline with
+    // this description's global root signature. Ray generation, miss, hit-group and payload settings are unused.
+    bool computeShader = false;
+
+    // The compute shader's thread-group width and height (PATH_TRACE_DIRECT_COMPUTE_GROUP_SIZE in PathTraceReference.hlsl).
+    static constexpr unsigned int computeThreadGroupSize = 8;
 };

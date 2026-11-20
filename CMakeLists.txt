@@ -473,6 +473,7 @@ add_library(EngineCore OBJECT
     src/DemoContent/StressTestScene.cpp
     src/Renderer/EditorColliderOverlay.cpp
     src/Renderer/FrameLighting.cpp
+    src/Renderer/SceneLightBuffer.cpp
     src/Renderer/Passes/EditorColliderPass.cpp
     src/Renderer/Passes/EditorVoxelPass.cpp
     src/Renderer/Passes/EditorAirPass.cpp

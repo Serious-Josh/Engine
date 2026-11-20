@@ -28,13 +28,11 @@ class ShaderLibrary;
 class RayTracingSceneResources;
 
 // SER S6B: the DXR library set every path-tracing primary uses, chosen once at startup.
-//   SM66    PathTraceReference.hlsl and PathTraceReSTIRDI.hlsl (lib_6_6): the conventional path.
-//   SM69    PathTraceReferenceSM69.hlsl and PathTraceReSTIRDISM69.hlsl: diagnostic only, the bit-exact non-SER
-//           baseline of SM69SER.
-//   SM69SER PathTraceReferenceSERSM69.hlsl and PathTraceReSTIRDISERSM69.hlsl: shader execution reordering on the
-//           continuation rays of Reference, Raster Primary and ReSTIR DI; Pixel Centre traces conventionally.
-// RTXPT D.1B.2 signal extraction (diagnostics only) adds, per variant, PathTraceReSTIRDIExtract[SM69|SERSM69].hlsl:
-// the extraction direct pass, which never shares a library with the production direct pass.
+//   SM66    PathTraceReference.hlsl (lib_6_6): the conventional path.
+//   SM69    PathTraceReferenceSM69.hlsl: diagnostic only, the bit-exact non-SER baseline of SM69SER.
+//   SM69SER PathTraceReferenceSERSM69.hlsl: shader execution reordering on the continuation rays of Reference, Raster
+//           Primary and ReSTIR DI; Pixel Centre traces conventionally.
+// The ReSTIR DI direct pass is a compute shader (DirectLighting/, cs_6_6) in every variant.
 enum class PathTraceLibraryVariant
 {
     SM66,
@@ -359,7 +357,7 @@ class PathTraceReferencePass
     // Diagnostics only: discards the PSR GI.6 twins, as a failed twin build would leave them.
     void DropPrimarySurfaceReplacementRayQueryForTesting()
     {
-        for(auto* twins : {&m_psrRayQueryPipelines, &m_psrPrimaryDiRayQueryPipelines})
+        for(auto* twins : {&m_psrRayQueryPipelines})
         {
             for(auto& [original, alternate] : *twins)
             {
@@ -508,7 +506,6 @@ class PathTraceReferencePass
         D3D12_GPU_VIRTUAL_ADDRESS radianceCacheConstants = 0,
         PathTraceRadianceCacheLibrary radianceCacheLibrary = PathTraceRadianceCacheLibrary::RenderSplitIndirect,
         bool rawDiffuseHitDistance = false,
-        bool primarySurfaceReplacement = false,
         D3D12_GPU_VIRTUAL_ADDRESS psrGBufferConstants = 0,
         D3D12_GPU_VIRTUAL_ADDRESS psrGBufferTransforms = 0);
 
@@ -552,21 +549,11 @@ class PathTraceReferencePass
     {
         return m_psrProbeForTesting ? m_psrProbeForTesting->GetUAVDescriptorIndex() : 0u;
     }
-    // Multibounce PSR M2-A verification only: chain probes built from diagnostic libraries that include the PSR.2 split
-    // pair's production libraries (raygeneration PsrChainProbeRayGeneration). With the probe buffer set they replace the
-    // PSR.2 probe after the indirect pass and also run after the direct pass, each with its pass's bindings. Uninitialized
-    // in normal rendering.
+    // Multibounce PSR M2-A verification only: the chain probe built from a diagnostic library that includes the PSR.2
+    // indirect pass's production library (raygeneration PsrChainProbeRayGeneration). With the probe buffer set it replaces
+    // the PSR.2 probe after the indirect pass, with that pass's bindings. Uninitialized in normal rendering.
     bool EnsurePsrChainProbePipelinesForTesting(GraphicsDevice& graphicsDevice, ShaderLibrary& shaderLibrary,
-        const std::filesystem::path& indirectLibrary, const std::filesystem::path& directLibrary);
-
-    // PSR.1c-A (development, default off): creates, on first use, the PSR split pair: the direct pass from the PSR ReSTIR
-    // DI library and the indirect pass from the PSR reference library. EnsurePrimarySurfaceReplacement must have
-    // succeeded first (record pipeline and records). ExecuteReSTIRDISplit with primarySurfaceReplacement then records the
-    // record pass and the PSR pair in place of the production pair, without extraction or a SHARC library only.
-    bool EnsurePrimarySurfaceReplacementReSTIRDI(
-        GraphicsDevice& graphicsDevice,
-        ShaderLibrary& shaderLibrary,
-        std::string& failureReason);
+        const std::filesystem::path& indirectLibrary);
 
     // NRD.RELAX.2B: whether the last Execute or ExecuteReSTIRDISplit recorded a raw-distance extraction, which wrote the
     // raw diffuse hit distance texture. Only then may that frame's texture be read.
@@ -675,21 +662,6 @@ class PathTraceReferencePass
     bool IsSecondaryShadowRayQueryReady() const;
     void SelectSecondaryShadowRayQuery(bool enabled);
 
-    bool IsPrimaryDiShadowRayQueryReady() const;
-    void SelectPrimaryDiShadowRayQuery(bool enabled);
-
-    // Both direct entries are prepared synchronously with the split pipelines, so not ready afterwards is a failure
-    // (logged as "DI.1 ..."), not unfinished preparation.
-    bool IsPrimaryDiShadowRayQueryFailed() const
-    {
-        return m_initialized && m_splitPipelinesReady && !IsPrimaryDiShadowRayQueryReady();
-    }
-
-    bool IsPrimaryDiShadowRayQueryActive() const
-    {
-        return m_primaryDiShadowRayQuery;
-    }
-
     bool IsSecondaryShadowRayQueryActive() const
     {
         return m_secondaryShadowRayQuery;
@@ -700,14 +672,12 @@ class PathTraceReferencePass
         RayTracingPipeline& original, const std::vector<char>& bytecode,
         const RayTracingPipelineDescription& description);
     RayTracingPipeline& VisibilityPipeline(RayTracingPipeline& original);
-    RayTracingPipeline& PrimaryDiVisibilityPipeline(RayTracingPipeline& original);
+    // Prepares the compute extraction direct pass (m_extractSplitDirectPipeline).
     bool PreparePrimaryDiExtractionPipeline(GraphicsDevice& device, ShaderLibrary& shaders);
 
     // Retained alongside the originals until the caller's existing idle teardown boundary.
     std::map<RayTracingPipeline*, std::unique_ptr<RayTracingPipeline>> m_rayQueryPipelines;
     bool m_secondaryShadowRayQuery = false;
-    std::map<RayTracingPipeline*, std::unique_ptr<RayTracingPipeline>> m_primaryDiRayQueryPipelines;
-    bool m_primaryDiShadowRayQuery = false;
     bool m_primaryDiExtractionPipelineReady = false;
 
     // True once any library or pipeline exists, after which the library selection cannot change.
@@ -927,15 +897,6 @@ class PathTraceReferencePass
     // readiness never gates IsSecondaryShadowRayQueryReady.
     std::map<RayTracingPipeline*, std::unique_ptr<RayTracingPipeline>> m_psrRayQueryPipelines;
 
-    // PSR.1c-A: the PSR split ReSTIR DI pair, created on first use (EnsurePrimarySurfaceReplacementReSTIRDI), and the
-    // direct pass's DI.1 twin, kept apart from m_primaryDiRayQueryPipelines as the GI.6 twins are.
-    RayTracingPipeline m_psrSplitDirectPipeline;
-    RayTracingPipeline m_psrSplitIndirectPipeline;
-    bool m_psrSplitPipelinesReady = false;
-    bool m_psrSplitPipelinesFailed = false;
-    std::string m_psrSplitFailure;
-    std::map<RayTracingPipeline*, std::unique_ptr<RayTracingPipeline>> m_psrPrimaryDiRayQueryPipelines;
-
     // PSR.2 Stage 3A: the G-buffer-storage split pair (EnsurePrimarySurfaceReplacementGBuffer); twins in the PSR maps.
     RayTracingPipeline m_psrSharcEnergyPipelines[2];
     RayTracingPipeline m_psrSharcImageProbePipeline;
@@ -947,6 +908,10 @@ class PathTraceReferencePass
     std::string m_psrGBufferFailure;
     // Multibounce PSR (SetPrimarySurfaceReplacementChain).
     std::uint32_t m_psrChain = 1;
+    // RayQuery 2M E3: the ReSTIR DI direct pass's pipeline description for a PSR chain (0: PSR off) and NRD signal
+    // extraction: the DirectLighting/ compute shader. It keeps the DXR split description's root signature (so the pass
+    // binds the same root arguments) and checks its hit groups against the compute shader's inline radiance ray.
+    RayTracingPipelineDescription DirectPassDescription(bool extraction, std::uint32_t psrChain) const;
     std::filesystem::path m_psrChainDirectoryForTesting;
     // A PSR lighting library's path for m_psrChain: PsrK2/<path> for two-mirror chains.
     std::filesystem::path PsrChainLibraryPath(const std::filesystem::path& path) const
@@ -972,8 +937,8 @@ class PathTraceReferencePass
     // Verification only: the probe buffer and the probe pipelines of the PSR.1 and PSR.2 libraries.
     Buffer* m_psrProbeForTesting = nullptr;
     RayTracingPipeline m_psrProbePipelines[2];
-    // Verification only (M2-A): the chain probes of the PSR.2 indirect (0) and direct (1) libraries.
-    RayTracingPipeline m_psrChainProbePipelines[2];
+    // Verification only (M2-A): the chain probe of the PSR.2 indirect library.
+    RayTracingPipeline m_psrChainProbePipeline;
 
     // Shuts down both PSR pipelines and their GI.6 twins. Caller guarantees the queue is idle.
     void ReleasePrimarySurfaceReplacementPipelines();

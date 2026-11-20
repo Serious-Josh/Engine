@@ -397,6 +397,48 @@ bool Buffer::CreateRawSRV(
     return true;
 }
 
+bool Buffer::CreateStructuredSRV(
+    ID3D12Device* device,
+    DescriptorHeap& descriptorHeap,
+    std::uint32_t stride)
+{
+    if (!device || !m_resource || m_descriptorIndex != UINT_MAX || stride == 0 ||
+        (m_descriptorHeap && m_descriptorHeap != &descriptorHeap))
+    {
+        return false;
+    }
+
+    const D3D12_RESOURCE_DESC description = m_resource->GetDesc();
+
+    if (description.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || description.Width == 0 ||
+        description.Width % stride != 0 || description.Width / stride > UINT_MAX)
+    {
+        return false;
+    }
+
+    m_descriptorIndex = descriptorHeap.Allocate();
+
+    if (m_descriptorIndex == UINT_MAX)
+    {
+        return false;
+    }
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC srvDescription{};
+    srvDescription.Format = DXGI_FORMAT_UNKNOWN;
+    srvDescription.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    srvDescription.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srvDescription.Buffer.FirstElement = 0;
+    srvDescription.Buffer.NumElements = static_cast<UINT>(description.Width / stride);
+    srvDescription.Buffer.StructureByteStride = stride;
+    srvDescription.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_NONE;
+
+    device->CreateShaderResourceView(m_resource, &srvDescription, descriptorHeap.GetCPUHandle(m_descriptorIndex));
+
+    m_descriptorHeap = &descriptorHeap;
+
+    return true;
+}
+
 bool Buffer::CreateRawUAV(
     ID3D12Device* device,
     DescriptorHeap& descriptorHeap)

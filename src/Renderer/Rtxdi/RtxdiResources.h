@@ -11,6 +11,7 @@
 #include <climits>
 #include <cstdint>
 #include <optional>
+#include <deque>
 #include <vector>
 
 class DescriptorHeap;
@@ -138,9 +139,11 @@ class RtxdiResources
 
     // PT.2B: copies the frame's light data (RtxdiLightDataLayout) from a frame upload allocation into the light data buffer
     // and leaves it readable by non-pixel shaders. The copy runs on the GPU timeline after every earlier reader of the
-    // buffer in this queue, so one buffer serves all frames in flight. Returns false while unallocated, or when the frame
-    // exceeds the capacity or the upload fails.
-    bool RecordLightData(ID3D12GraphicsCommandList* commandList, UploadBuffer& upload, const RtxdiFrame& frame);
+    // buffer in this queue, so one buffer serves all frames in flight. Many-light M2: when the frame needs more room the
+    // buffer is replaced by one twice as large (at least the need), the old one retired with lastSubmittedFence and
+    // released once completedFence reaches it. Returns false while unallocated, or when allocation or the upload fails.
+    bool RecordLightData(ID3D12Device* device, ID3D12GraphicsCommandList* commandList, UploadBuffer& upload,
+        const RtxdiFrame& frame, std::uint64_t lastSubmittedFence, std::uint64_t completedFence);
 
     // After the recording's command list was submitted: its reservoirs and lights become the previous frame.
     // Does nothing without a pending frame.
@@ -190,7 +193,8 @@ class RtxdiResources
         return m_neighborOffsetsSRVIndex;
     }
 
-    // ByteAddressBuffer SRV of the light data (RtxdiLightDataLayout::CapacityBytes); valid while allocated.
+    // ByteAddressBuffer SRV of the light data (grown by RecordLightData); valid while allocated. Read it after the frame's
+    // RecordLightData, since growth replaces the buffer and its descriptor.
     unsigned int GetLightDataSRVIndex() const noexcept
     {
         return m_lightData.GetDescriptorIndex();
@@ -224,6 +228,15 @@ class RtxdiResources
 
     Buffer m_reservoirs;
     Buffer m_lightData;
+    std::uint64_t m_lightDataCapacityBytes = 0;
+
+    struct RetiredLightData
+    {
+        Buffer buffer;
+        std::uint64_t submissionFence = 0;
+    };
+
+    std::deque<RetiredLightData> m_retiredLightData;
     std::vector<std::uint8_t> m_lightDataStaging;
     DescriptorHeap* m_descriptorHeap = nullptr;
     unsigned int m_reservoirUAVIndex = UINT_MAX;

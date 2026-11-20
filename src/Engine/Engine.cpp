@@ -1792,8 +1792,9 @@ void Engine::ReportPackagedLightingMode(double renderMilliseconds)
         {
             report += " (unavailable: " + failure + ")";
         }
-        report += std::string(" | Visibility: ") + (pathTrace.primaryDiShadowRayQueryActive ? "RayQuery" : "TraceRay") +
-            " direct, " + (pathTrace.secondaryShadowRayQueryActive ? "RayQuery" : "TraceRay") + " secondary";
+        // The ReSTIR DI direct pass is a compute shader with inline RayQuery visibility.
+        report += std::string(" | Visibility: Compute (inline RayQuery) direct, ") +
+            (pathTrace.secondaryShadowRayQueryActive ? "RayQuery" : "TraceRay") + " secondary";
 
         // PS.5C: the saved PSR mode against the replacement chain that actually ran.
         const PathTraceReferenceSettings& requestedPathTrace = m_packagedRenderingConfiguration.pathTrace;
@@ -3793,9 +3794,6 @@ void Engine::Frame()
     }
 
     const PathTraceReferenceStatus& pathTraceStatus = m_renderer.GetPathTraceReferenceStatus();
-    debugUI.SetPrimaryDiShadowVisibilityStatus(pathTraceStatus.primaryDiShadowRayQueryReady,
-        pathTraceStatus.primaryDiShadowRayQueryActive, pathTraceStatus.primaryDiShadowRayQueryFailed,
-        pathTraceStatus.primaryDiShadowRayQuerySerWorkaround);
     debugUI.SetSecondaryShadowVisibilityStatus(pathTraceStatus.secondaryShadowRayQueryReady,
         pathTraceStatus.secondaryShadowRayQueryActive,
         pathTraceStatus.visibilityTimingEpoch + m_renderer.GetShaderLibrary().GetLibraryCompileCount());

@@ -35,7 +35,10 @@ enum class ShaderLibraryProfile
 {
     Library66,
     // The experimental SM 6.9 wrappers only (SER S1; the SER variant from S3A).
-    Library69
+    Library69,
+    // RayQuery 2M E3: a path-tracing compute shader (cs_6_6, entry ShaderCompiler::ComputeLibraryEntryPoint) handled like
+    // a library: DirectLighting/, the ReSTIR DI direct pass. Its bytecode is a compute shader, not a DXIL library.
+    Compute66
 };
 
 struct ShaderLibraryCompileDescription
@@ -43,7 +46,7 @@ struct ShaderLibraryCompileDescription
     const wchar_t* path = nullptr;
     ShaderLibraryProfile profile = ShaderLibraryProfile::Library66;
     // The shader root. Added as a second -I only when it differs from the source's directory, so variant
-    // wrappers in subdirectories (DI1/, GI6/) resolve the RTXDI SDK's angled includes like their originals.
+    // wrappers in subdirectories (GI6/, PsrK2/) resolve the RTXDI SDK's angled includes like their originals.
     const wchar_t* includeDirectory = nullptr;
     // Runtime callers opt in explicitly. Offline cooking and direct compiler clients remain uncached.
     bool usePersistentCache = false;
@@ -109,10 +112,16 @@ class ShaderCompiler
     // True when every recorded dependency still has the recorded contents (or is still absent).
     static bool DependenciesUnchanged(const std::vector<ShaderSourceDependency>& dependencies);
 
-    // The one mapping from a library's key (for example "PathTraceReSTIRDISM69.hlsl") to its profile, used
+    // The one mapping from a library's key (for example "PathTraceReferenceSM69.hlsl") to its profile, used
     // by synchronous, asynchronous and offline compilation alike. A profile is a pure function of the key, so
     // path-keyed identity (cache entries, worker jobs, cooked records) never mixes profiles.
     static ShaderLibraryProfile GetLibraryProfile(const std::filesystem::path& libraryPath);
+
+    // The DXC target of a library profile ("lib_6_6", "lib_6_9" or "cs_6_6").
+    static const char* GetLibraryTarget(ShaderLibraryProfile profile);
+
+    // The entry point of every Compute66 "library" (DirectLighting/ shaders).
+    static constexpr const wchar_t* ComputeLibraryEntryPoint = L"PathTraceReSTIRDIDirectCS";
 
     // NVIDIA SHARC (Documentation/Rendering/NVIDIA_SHARC_Integration_A.md): shaders under a SharcNv/ directory compile with
     // -enable-16bit-types, which SharcTypes.h requires. Like the profile, a pure function of the path; every other shader

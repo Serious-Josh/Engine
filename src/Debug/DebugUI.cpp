@@ -527,6 +527,17 @@ bool DebugUI::Initialize(
     return true;
 }
 
+const char* DebugUI::PrimaryDiShadowBackendName() const
+{
+    if(m_lightingTransition.active != RendererLightingMode::PathTracedRasterPrimaryReSTIRDI)
+    {
+        return "Not in use";
+    }
+
+    // The ReSTIR DI direct pass is a compute shader with inline RayQuery visibility (its only backend).
+    return "Compute (inline RayQuery)";
+}
+
 void DebugUI::Shutdown()
 {
     m_editorIcons.Shutdown();
@@ -564,7 +575,6 @@ DebugUI::GpuTimingConfiguration DebugUI::CurrentGpuTimingConfiguration() const
     configuration.settings = GetPathTraceReferenceSettings();
     configuration.pathTraceActive = m_pathTraceActiveLastFrame;
     configuration.secondaryShadowActive = m_secondaryShadowActive;
-    configuration.primaryDiShadowActive = m_primaryDiShadowActive;
     configuration.denoiser = GetPathTraceDenoiserMode();
     configuration.denoiserPreparing = !m_pathTraceDenoiserPreparation.empty();
     configuration.temporalHistory = m_pathTraceDenoiserStages.temporalHistory;
@@ -756,9 +766,7 @@ void DebugUI::DrawPerformanceWindow(
 
             drawGpuTiming("  NRD reflection resolve", GpuTimestampProfiler::Region::NrdResolve);
 
-            ImGui::Text("Primary DI shadows: %s",
-                m_lightingTransition.active == RendererLightingMode::PathTracedRasterPrimaryReSTIRDI ?
-                (m_primaryDiShadowActive ? "RayQuery (DI.1)" : "TraceRay (Original)") : "Not in use");
+            ImGui::Text("Primary DI shadows: %s", PrimaryDiShadowBackendName());
             ImGui::Text("Secondary shadows: %s | rolling GPU median (last 30 samples)",
                 m_secondaryShadowActive ? "RayQuery (GI.6)" : "TraceRay (Original)");
             if(ImGui::Button("Restart GPU comparison warm-up"))
@@ -1508,24 +1516,7 @@ void DebugUI::DrawPathTraceReferenceSettings()
     const bool reference = lightingMode == ProjectLightingMode::ReferencePathTracer;
 
     const char* visibilityModes[] = {"TraceRay (Original)", "RayQuery (GI.6)"};
-    const char* primaryDiVisibilityModes[] = {"TraceRay (Original)", "RayQuery (DI.1)"};
-    ImGui::Text("Active primary DI shadows: %s",
-        m_lightingTransition.active == RendererLightingMode::PathTracedRasterPrimaryReSTIRDI ?
-        primaryDiVisibilityModes[m_primaryDiShadowActive ? 1 : 0] : "Not in use");
-
-    if(isPathTracing && m_primaryDiShadowSerWorkaround)
-    {
-        ImGui::TextDisabled("SER compatibility: DI.1 RayQuery visibility is wrong with SM 6.9 + SER; TraceRay used.");
-    }
-    else if(isPathTracing && m_primaryDiShadowFailed)
-    {
-        ImGui::TextDisabled("DI.1 pipelines failed (see the DI.1 log warning); original retained.");
-    }
-    else if(isPathTracing && !m_primaryDiShadowReady)
-    {
-        ImGui::TextDisabled("DI.1 pipelines still preparing; original retained.");
-    }
-
+    ImGui::Text("Active primary DI shadows: %s", PrimaryDiShadowBackendName());
     ImGui::Text("Active secondary shadows: %s", visibilityModes[m_secondaryShadowActive ? 1 : 0]);
 
     if(!m_secondaryShadowReady)

@@ -56,9 +56,8 @@ cbuffer DirectionalLightConstants : register(b2)
 cbuffer SceneLightConstants : register(b3)
 {
     uint sceneLightCount;
-    uint3 sceneLightPadding;
-
-    GPULight sceneLights[SCENE_LIGHT_CAPACITY];
+    uint sceneLightBufferIndex;
+    uint2 sceneLightPadding;
 }
 
 SamplerState sampler0 : register(s0);
@@ -1271,12 +1270,12 @@ float4 PSMain(VSOutput input) : SV_Target0
     // LIGHT.1 table Lights: unshadowed direct light only. They are not RTGI inputs, so nothing
     // here is also counted as indirect light, and material AO stays indirect-only as for the sun.
     float3 sceneLightDirect = float3(0.0f, 0.0f, 0.0f);
-    uint boundedLightCount = min(sceneLightCount, SCENE_LIGHT_CAPACITY);
+    uint boundedLightCount = sceneLightCount;
 
     [loop]
     for(uint lightIndex = 0u; lightIndex < boundedLightCount; ++lightIndex)
     {
-        GPULight sceneLight = sceneLights[lightIndex];
+        GPULight sceneLight = SceneLightLoad(sceneLightBufferIndex, lightIndex);
         float3 directionToSceneLight;
         float3 incidentRadiance = EvaluateSceneLightIncidence(sceneLight, worldPosition.xyz, directionToSceneLight);
         float sceneLightNdotL = saturate(dot(normal, directionToSceneLight));

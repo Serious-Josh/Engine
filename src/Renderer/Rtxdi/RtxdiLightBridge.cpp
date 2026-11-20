@@ -118,8 +118,9 @@ bool BuildRtxdiLightSet(const FrameLighting& lighting, const RtxdiEnvironmentSou
     RtxdiEnvironmentStrategy strategy, RtxdiLightSet& set)
 {
     RtxdiLightSet candidate;
-    candidate.records.reserve(RtxdiLightSet::Capacity);
-    candidate.identities.reserve(RtxdiLightSet::Capacity);
+    // Every table light plus the sun and the HDRI (many-light M2: no fixed capacity).
+    candidate.records.reserve(std::size_t{lighting.table.lightCount} + 2);
+    candidate.identities.reserve(std::size_t{lighting.table.lightCount} + 2);
 
     const auto addTableLights = [&](bool local)
     {

@@ -264,14 +264,6 @@ class DebugUI
         m_gpuTimingDlssActive = dlssActive;
     }
 
-    void SetPrimaryDiShadowVisibilityStatus(bool ready, bool active, bool failed, bool serWorkaround)
-    {
-        m_primaryDiShadowReady = ready;
-        m_primaryDiShadowActive = active;
-        m_primaryDiShadowFailed = failed;
-        m_primaryDiShadowSerWorkaround = serWorkaround;
-    }
-
     // The raster-primary capability: the shared prerequisites (the diagnostic exhaustive estimator) and ReSTIR DI's own.
     void SetPathTraceRasterPrimaryStatus(const PathTraceRasterPrimaryStatus& status)
     {
@@ -301,6 +293,9 @@ class DebugUI
     }
 
     private:
+    // The active ReSTIR DI direct pass's primary DI shadow backend, for the status and timing displays.
+    const char* PrimaryDiShadowBackendName() const;
+
     // Views of GetRenderingConfiguration for the panel's own status and timing displays.
     RendererLightingMode GetLightingMode() const
     {
@@ -360,10 +355,6 @@ class DebugUI
     std::string m_psrLightingUnavailable;
     bool m_secondaryShadowReady = false;
     bool m_secondaryShadowActive = false;
-    bool m_primaryDiShadowReady = false;
-    bool m_primaryDiShadowActive = false;
-    bool m_primaryDiShadowFailed = false;
-    bool m_primaryDiShadowSerWorkaround = false;
     std::uint64_t m_visibilityTimingEpoch = 0;
     std::uint64_t m_sampledVisibilityEpoch = UINT64_MAX;
     std::uint64_t m_visibilityWarmupUntil = 0;
@@ -393,7 +384,6 @@ class DebugUI
         PathTraceReferenceSettings settings{};
         bool pathTraceActive = false;
         bool secondaryShadowActive = false;
-        bool primaryDiShadowActive = false;
         PathTraceDenoiserMode denoiser = PathTraceDenoiserMode::Off;
         bool denoiserPreparing = false;
         bool temporalHistory = false;

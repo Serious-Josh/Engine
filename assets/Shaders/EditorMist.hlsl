@@ -212,8 +212,8 @@ cbuffer EditorMistConstants : register(b0)
 cbuffer SceneLightTable : register(b1)
 {
     uint sceneLightCount;
-    uint3 sceneLightPadding;
-    GPULight sceneLights[SCENE_LIGHT_CAPACITY];
+    uint sceneLightBufferIndex;
+    uint2 sceneLightPadding;
 };
 
 // AIR.4F F4.3: the scene's acceleration structure, for the sun's visibility.
@@ -500,12 +500,12 @@ float3 InScattered(float3 world, float3 rayDirection, float sunVisibility, float
         light += sunRadiance * (indirectScattering * (1.0 - sunVisibility) * indirect / (4.0 * 3.14159265));
     }
 
-    const uint count = min(sceneLightCount, SCENE_LIGHT_CAPACITY);
+    const uint count = sceneLightCount;
 
     for(uint index = 0; index < count; ++index)
     {
         float3 directionToLight;
-        const float3 incidence = EvaluateSceneLightIncidence(sceneLights[index], world, directionToLight);
+        const float3 incidence = EvaluateSceneLightIncidence(SceneLightLoad(sceneLightBufferIndex, index), world, directionToLight);
 
         if(any(incidence > 0.0))
         {
@@ -521,12 +521,12 @@ float3 InScattered(float3 world, float3 rayDirection, float sunVisibility, float
 // AddSceneLights: the table Lights' term added onto `light` (CSFroxelLocalLights stores it from 0, per froxel, along the froxel's ray).
 float3 AddSceneLights(float3 world, float3 rayDirection, float3 light)
 {
-    const uint count = min(sceneLightCount, SCENE_LIGHT_CAPACITY);
+    const uint count = sceneLightCount;
 
     for(uint index = 0; index < count; ++index)
     {
         float3 directionToLight;
-        const float3 incidence = EvaluateSceneLightIncidence(sceneLights[index], world, directionToLight);
+        const float3 incidence = EvaluateSceneLightIncidence(SceneLightLoad(sceneLightBufferIndex, index), world, directionToLight);
 
         if(any(incidence > 0.0))
         {
@@ -2109,16 +2109,16 @@ float FarLightShare(float d)
 float3 FarSceneLights(float3 world, float3 rayDirection)
 {
     float3 light = float3(0.0, 0.0, 0.0);
-    const uint count = min(sceneLightCount, SCENE_LIGHT_CAPACITY);
+    const uint count = sceneLightCount;
 
     for(uint index = 0; index < count; ++index)
     {
         float3 directionToLight;
-        const float3 incidence = EvaluateSceneLightIncidence(sceneLights[index], world, directionToLight);
+        const float3 incidence = EvaluateSceneLightIncidence(SceneLightLoad(sceneLightBufferIndex, index), world, directionToLight);
 
         if(any(incidence > 0.0))
         {
-            const float share = sceneLights[index].type == SCENE_LIGHT_DIRECTIONAL ? 1.0 : FarLightShare(length(sceneLights[index].position - world));
+            const float share = SceneLightLoad(sceneLightBufferIndex, index).type == SCENE_LIGHT_DIRECTIONAL ? 1.0 : FarLightShare(length(SceneLightLoad(sceneLightBufferIndex, index).position - world));
             light += share * incidence * HenyeyGreenstein(dot(directionToLight, rayDirection), anisotropy);
         }
     }
@@ -2379,11 +2379,11 @@ float3 NearLights(float2 uv, float3 direction, float rayEnd, bool bounded)
     const float3 hazeScattering = hazeAlbedo * scatteringTint * scattering;
     const float reach = 2.0 * froxelNearLightRadius;
     const float rangeEnd = min(rayEnd, FroxelDistanceOf(float(froxelSize.z)));
-    const uint count = min(sceneLightCount, SCENE_LIGHT_CAPACITY);
+    const uint count = sceneLightCount;
 
     for(uint index = 0; index < count; ++index)
     {
-        const GPULight sceneLight = sceneLights[index];
+        const GPULight sceneLight = SceneLightLoad(sceneLightBufferIndex, index);
 
         if(sceneLight.type == SCENE_LIGHT_DIRECTIONAL)
         {

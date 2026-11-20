@@ -6895,7 +6895,8 @@ bool Renderer::PrepareRtxdiFrame(ID3D12GraphicsCommandList* commandList, const F
 
     if(!BuildRtxdiLightSet(frameLighting, environment, strategy, lights) ||
         !m_rtxdiResources.BeginFrame(lights, signature, previousSurfacesAvailable, policy, frame) ||
-        !m_rtxdiResources.RecordLightData(commandList, m_uploadBuffer, frame))
+        !m_rtxdiResources.RecordLightData(m_graphicsDevice.GetDevice(), commandList, m_uploadBuffer, frame,
+            m_commandContext.GetLastSubmissionFenceValue(), m_commandContext.GetCompletedFenceValue()))
     {
         Log::Error("Failed to prepare the RTXDI frame.");
         return false;
@@ -8101,22 +8102,15 @@ bool Renderer::RecordPathTraceReference(
                 m_materialPublication.desired.end(), MaterialCanBeDeltaMirror);
         }
 
-        // PSR.1c-A: also split ReSTIR DI, with its PSR pair. PSR.2 lighting takes precedence and skips PSR.1's records.
-        if(settings.primarySurfaceReplacement && m_psrGBufferConstantsAddress == 0 &&
-            (primary == PathTracePrimary::Raster || primary == PathTracePrimary::RasterReSTIRDI) && !extract &&
-            !m_radianceCacheD6.IsUsable() && m_primarySurfaceReplacementPossible)
+        // PSR.1 runs on the plain Raster Primary only (Stage 3 retired its ReSTIR DI pair, PSR.1c-A, with the DXR direct
+        // pass). PSR.2 lighting takes precedence and skips PSR.1's records.
+        if(settings.primarySurfaceReplacement && m_psrGBufferConstantsAddress == 0 && primary == PathTracePrimary::Raster &&
+            !extract && !m_radianceCacheD6.IsUsable() && m_primarySurfaceReplacementPossible)
         {
             std::string replacementFailure;
             const unsigned int recordIndex = m_pathTraceReferencePass.EnsurePrimarySurfaceReplacement(m_graphicsDevice,
                 m_shaderLibrary, m_resourceDescriptorHeap, replacementFailure);
             primarySurfaceReplacement = recordIndex != UINT_MAX;
-
-            if(primarySurfaceReplacement && primary == PathTracePrimary::RasterReSTIRDI &&
-                !m_pathTraceReferencePass.EnsurePrimarySurfaceReplacementReSTIRDI(m_graphicsDevice, m_shaderLibrary,
-                    replacementFailure))
-            {
-                primarySurfaceReplacement = false;
-            }
 
             if(primarySurfaceReplacement)
             {
@@ -8322,8 +8316,8 @@ bool Renderer::RecordPathTraceReference(
             m_pathTraceReferencePass.ExecuteReSTIRDISplit(m_commandContext.GetRayTracingCommandList(),
                 m_gpuTimestampProfiler, frameIndex, m_resourceDescriptorHeap, m_rayTracingScene, constantsAddress,
                 sceneLightConstantsAddress, m_sceneWidth, m_sceneHeight, rtxdiConstantsAddress, extract,
-                renderCacheAddress, renderCacheLibrary, rawExtraction, primarySurfaceReplacement,
-                m_psrGBufferConstantsAddress, m_psrGBufferTransformsAddress);
+                renderCacheAddress, renderCacheLibrary, rawExtraction, m_psrGBufferConstantsAddress,
+                m_psrGBufferTransformsAddress);
             m_psrLightingLastFrame = m_pathTraceReferencePass.WrotePrimarySurfaceReplacementGBuffer();
         }
         else
@@ -11052,31 +11046,17 @@ bool Renderer::RecordRenderFrame(
     ApplyPathTraceDenoiserStages(options.pathTraceDenoiserStages);
     const bool queryReady = m_pathTraceReferencePass.IsSecondaryShadowRayQueryReady();
     const bool queryActive = options.pathTraceReference.secondaryShadowRayQuery && queryReady;
-    const bool primaryQueryReady = m_pathTraceReferencePass.IsPrimaryDiShadowRayQueryReady();
-    // F01.1: the production DI.1 direct pass compiled as SM 6.9 + SER returns wrong RayQuery visibility (RTX 4080,
-    // driver 621.01); that variant keeps TraceRay. The request is preserved and the override reported.
-    const bool primaryQuerySerWorkaround = options.pathTraceReference.primaryDiShadowRayQuery &&
-        m_pathTraceReferencePass.GetLibraryVariant() == PathTraceLibraryVariant::SM69SER &&
-        !m_primaryDiSerWorkaroundDisabledForTesting;
-    const bool primaryQueryActive = options.pathTraceReference.primaryDiShadowRayQuery && primaryQueryReady &&
-        !primaryQuerySerWorkaround;
     m_pathTraceStatus.secondaryShadowRayQueryReady = queryReady;
-    m_pathTraceStatus.primaryDiShadowRayQueryReady = primaryQueryReady;
-    m_pathTraceStatus.primaryDiShadowRayQueryFailed = m_pathTraceReferencePass.IsPrimaryDiShadowRayQueryFailed();
-    m_pathTraceStatus.primaryDiShadowRayQuerySerWorkaround = primaryQuerySerWorkaround;
 
-    if(queryActive != m_pathTraceStatus.secondaryShadowRayQueryActive ||
-        primaryQueryActive != m_pathTraceStatus.primaryDiShadowRayQueryActive)
+    if(queryActive != m_pathTraceStatus.secondaryShadowRayQueryActive)
     {
         // CPU selection only: both state objects and tables stay alive across in-flight submissions.
         // Reset before jitter, G-buffer reuse, NRD and DLSS consume this frame's history flags.
         ResetSceneHistory();
         m_pathTraceStatus.secondaryShadowRayQueryActive = queryActive;
-        m_pathTraceStatus.primaryDiShadowRayQueryActive = primaryQueryActive;
     }
 
     m_pathTraceReferencePass.SelectSecondaryShadowRayQuery(queryActive);
-    m_pathTraceReferencePass.SelectPrimaryDiShadowRayQuery(primaryQueryActive);
 
     ApplyCameraJitter(options.pathTraceCameraJitter);
     ApplyDlssInputPreparation(options.dlssInputPreparation);
@@ -11883,10 +11863,20 @@ bool Renderer::RecordRenderFrame(
         return false;
     }
 
-    // The whole table (about 4 KB) is uploaded so the bound buffer always covers the declared
-    // cbuffer; unused records are zero and the shader reads no further than lightCount.
+    // Many-light M2: the table goes to the scene light buffer (copied in this command list, before any consumer), and
+    // every consumer binds the same small constants: the light count and the buffer's SRV.
+    SceneLightConstants sceneLightConstants{};
+
+    if(!m_sceneLightBuffer.Record(m_graphicsDevice.GetDevice(), m_resourceDescriptorHeap, commandList, m_uploadBuffer,
+        frameLighting.table, m_commandContext.GetLastSubmissionFenceValue(), m_commandContext.GetCompletedFenceValue(),
+        sceneLightConstants))
+    {
+        Log::Error("Failed to record the scene light buffer.");
+        return false;
+    }
+
     const D3D12_GPU_VIRTUAL_ADDRESS sceneLightConstantsAddress = m_uploadBuffer.Allocate(
-        &frameLighting.table, sizeof(SceneLightConstants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
+        &sceneLightConstants, sizeof(SceneLightConstants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
 
     if (sceneLightConstantsAddress == 0)
     {
@@ -13609,6 +13599,7 @@ void Renderer::Shutdown()
     m_previousGBufferPrimary.reset();
     m_rtxdiResources.Shutdown();
     m_rtxdiResourcesFailed = false;
+    m_sceneLightBuffer.Shutdown();
     m_rasterPrimaryStatus = {};
     m_materialTables.Shutdown();
     m_materialTableUnavailableReason.clear();
@@ -15330,6 +15321,23 @@ void Renderer::ValidatePsrFrameRecords()
 // M0c.4 diagnostics (GBV streaming hang): with ENGINE_DIAG_DRED_MARKERS set in a Debug build, the frame recording names its
 // stages with markers, so a DRED report (a hang, or a controlled RemoveDevice capture) attributes breadcrumb operation indices
 // to passes. Off by default: each marker is a DRED operation of its own and would shift the indices other runs report.
+D3D12_GPU_VIRTUAL_ADDRESS Renderer::UploadSceneLightsForTesting(const GPULight* lights, std::uint32_t count)
+{
+    SceneLightTable table;
+    table.lightCount = count;
+    table.lights.assign(lights, lights + count);
+    SceneLightConstants constants{};
+
+    if(!m_sceneLightBuffer.Record(m_graphicsDevice.GetDevice(), m_resourceDescriptorHeap, m_commandContext.GetCommandList(),
+        m_uploadBuffer, table, m_commandContext.GetLastSubmissionFenceValue(), m_commandContext.GetCompletedFenceValue(),
+        constants))
+    {
+        return 0;
+    }
+
+    return m_uploadBuffer.Allocate(&constants, sizeof(constants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
+}
+
 void Renderer::MarkDredStage([[maybe_unused]] ID3D12GraphicsCommandList* commandList,
     [[maybe_unused]] const wchar_t* stage) const
 {

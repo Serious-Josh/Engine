@@ -96,9 +96,6 @@ struct RtxdiLightIdentity
 
 struct RtxdiLightSet
 {
-    // Every table light plus the sun and the HDRI.
-    static constexpr std::uint32_t Capacity = SceneLightConstants::Capacity + 2;
-
     std::vector<RtxdiLightRecord> records;
     // Parallel to records.
     std::vector<RtxdiLightIdentity> identities;

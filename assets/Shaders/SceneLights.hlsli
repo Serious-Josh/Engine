@@ -21,10 +21,19 @@ struct GPULight
     float3 padding;
 };
 
-static const uint SCENE_LIGHT_CAPACITY = 64u;
 static const uint SCENE_LIGHT_POINT = 0u;
 static const uint SCENE_LIGHT_SPOT = 1u;
 static const uint SCENE_LIGHT_DIRECTIONAL = 2u;
+
+// Many-light M2: the scene light table is a structured buffer of GPULight records (stride 64; SceneLightBuffer publishes
+// the matching structured SRV), bound by descriptor index with the light count (SceneLightConstants). Callers read only
+// indices below the count. A structured view, not a raw one: exhaustive light loops run measurably faster with it
+// (Dynamic_Many_Light_StructuredBuffer_AB).
+GPULight SceneLightLoad(uint lightBufferIndex, uint lightIndex)
+{
+    StructuredBuffer<GPULight> lights = ResourceDescriptorHeap[lightBufferIndex];
+    return lights[lightIndex];
+}
 
 // Inverse-square attenuation is evaluated no closer than 1 cm, so a surface at a Light's
 // position receives a large but finite contribution.

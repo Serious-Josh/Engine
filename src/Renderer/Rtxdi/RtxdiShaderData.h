@@ -27,8 +27,9 @@ struct RtxdiLightDataLayout
 {
     static constexpr std::uint32_t RecordBytes = sizeof(RtxdiLightRecord);
     static constexpr std::uint32_t TranslationBytes = sizeof(std::int32_t);
-    // Both frames at full capacity.
-    static constexpr std::uint32_t CapacityBytes = 2 * RtxdiLightSet::Capacity * (RecordBytes + TranslationBytes);
+    // Many-light M2: the initial allocation (both frames with the sun, the HDRI and one table light); the buffer grows with
+    // the light count (RtxdiResources::RecordLightData).
+    static constexpr std::uint32_t InitialBytes = 2 * 3 * (RecordBytes + TranslationBytes);
 
     static constexpr std::uint32_t PreviousRecordsOffset(std::uint32_t currentCount) noexcept
     {
@@ -48,8 +49,8 @@ struct RtxdiLightDataLayout
 
 static_assert(RtxdiLightDataLayout::RecordBytes == 64);
 
-// Root constant buffer b2 of PathTraceReSTIRDISplitDirectRayGeneration only; identical layout to RtxdiConstants in
-// PathTraceReference.hlsl. NrdHistoryConfidence.hlsli reads the leading rows up to motionIndex.
+// Root constant buffer b2 of the ReSTIR DI direct pass (PathTraceReSTIRDIDirectCS) only; identical layout to
+// RtxdiConstants in PathTraceReference.hlsl. NrdHistoryConfidence.hlsli reads the leading rows up to motionIndex.
 struct PathTraceRtxdiConstants
 {
     RTXDI_LightBufferParameters lightBuffer{};

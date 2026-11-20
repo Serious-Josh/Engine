@@ -21,7 +21,7 @@
 // IsCurrent before it is published.
 struct ShaderLibraryCompileRequest
 {
-    // The caller's key for the library, for example "PathTraceReSTIRDI.hlsl".
+    // The caller's key for the library, for example "PathTraceReference.hlsl".
     std::filesystem::path libraryPath;
     // The resolved source file DXC reads (the shader root joined with libraryPath).
     std::filesystem::path sourcePath;

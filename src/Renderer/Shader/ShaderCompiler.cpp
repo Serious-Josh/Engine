@@ -437,9 +437,16 @@ bool ShaderCompiler::CompileLibrary(
     const auto cacheStart = std::chrono::steady_clock::now();
     std::filesystem::path shaderPath = description.path;
     std::wstring shaderDirectory = shaderPath.parent_path().wstring();
-    const wchar_t* profile = description.profile == ShaderLibraryProfile::Library69 ? L"lib_6_9" : L"lib_6_6";
-    std::vector<const wchar_t*> arguments = {description.path, L"-T", profile, L"-HV", L"2021", L"-I",
+    const std::wstring profile = std::filesystem::path(GetLibraryTarget(description.profile)).wstring();
+    std::vector<const wchar_t*> arguments = {description.path, L"-T", profile.c_str(), L"-HV", L"2021", L"-I",
         shaderDirectory.c_str()};
+
+    // RayQuery 2M E3: a compute "library" is one entry point.
+    if(description.profile == ShaderLibraryProfile::Compute66)
+    {
+        arguments.push_back(L"-E");
+        arguments.push_back(ComputeLibraryEntryPoint);
+    }
 
     // NVIDIA SHARC stores fp16 data (SharcTypes.h): only its own variant tree compiles with native 16-bit types.
     if(UsesNative16BitTypes(description.path))
@@ -581,9 +588,30 @@ bool ShaderCompiler::CompileLibrary(
     return true;
 }
 
+const char* ShaderCompiler::GetLibraryTarget(ShaderLibraryProfile profile)
+{
+    switch(profile)
+    {
+    case ShaderLibraryProfile::Library69:
+        return "lib_6_9";
+    case ShaderLibraryProfile::Compute66:
+        return "cs_6_6";
+    case ShaderLibraryProfile::Library66:
+        break;
+    }
+
+    return "lib_6_6";
+}
+
 ShaderLibraryProfile ShaderCompiler::GetLibraryProfile(const std::filesystem::path& libraryPath)
 {
     const std::filesystem::path fileName = libraryPath.filename();
+
+    // RayQuery 2M E3: the ReSTIR DI direct pass's compute shaders.
+    if(!libraryPath.empty() && *libraryPath.begin() == "DirectLighting")
+    {
+        return ShaderLibraryProfile::Compute66;
+    }
 
     if(fileName == "PathTraceReferencePsrSharcEnergyTrainingSM69.hlsl" ||
         fileName == "PathTraceReferencePsrSharcEnergyTrainingSERSM69.hlsl" ||
@@ -595,9 +623,7 @@ ShaderLibraryProfile ShaderCompiler::GetLibraryProfile(const std::filesystem::pa
         fileName == "PathTraceReferencePsrSharcRenderRawDiffuseHitDistanceSERSM69.hlsl" ||
         fileName == "PathTraceReferencePsrSharcTrainingSM69.hlsl" ||
         fileName == "PathTraceReferencePsrSharcTrainingSERSM69.hlsl" ||
-        fileName == "PathTraceReferenceSM69.hlsl" || fileName == "PathTraceReSTIRDISM69.hlsl" ||
-        fileName == "PathTraceReferenceSERSM69.hlsl" || fileName == "PathTraceReSTIRDISERSM69.hlsl" ||
-        fileName == "PathTraceReSTIRDIExtractSM69.hlsl" || fileName == "PathTraceReSTIRDIExtractSERSM69.hlsl" ||
+        fileName == "PathTraceReferenceSM69.hlsl" || fileName == "PathTraceReferenceSERSM69.hlsl" ||
         fileName == "PathTraceReferenceRadianceCacheDeferredSM69.hlsl" ||
         fileName == "PathTraceReferenceRadianceCacheDeferredSERSM69.hlsl" ||
         fileName == "PathTraceReferenceRadianceCacheDeferredLateSM69.hlsl" ||
@@ -615,11 +641,7 @@ ShaderLibraryProfile ShaderCompiler::GetLibraryProfile(const std::filesystem::pa
         fileName == "PathTraceReferenceRadianceCacheRenderRawDiffuseHitDistanceSM69.hlsl" ||
         fileName == "PathTraceReferenceRadianceCacheRenderRawDiffuseHitDistanceSERSM69.hlsl" ||
         fileName == "PathTraceReferencePsrSM69.hlsl" || fileName == "PathTraceReferencePsrSERSM69.hlsl" ||
-        fileName == "PathTraceReSTIRDIPsrSM69.hlsl" || fileName == "PathTraceReSTIRDIPsrSERSM69.hlsl" ||
         fileName == "PathTraceReferencePsrGBufferSM69.hlsl" || fileName == "PathTraceReferencePsrGBufferSERSM69.hlsl" ||
-        fileName == "PathTraceReSTIRDIPsrGBufferSM69.hlsl" || fileName == "PathTraceReSTIRDIPsrGBufferSERSM69.hlsl" ||
-        fileName == "PathTraceReSTIRDIExtractPsrGBufferSM69.hlsl" ||
-        fileName == "PathTraceReSTIRDIExtractPsrGBufferSERSM69.hlsl" ||
         fileName == "PathTraceReferenceRawDiffuseHitDistancePsrGBufferSM69.hlsl" ||
         fileName == "PathTraceReferenceRawDiffuseHitDistancePsrGBufferSERSM69.hlsl")
     {

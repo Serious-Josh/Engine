@@ -264,7 +264,8 @@ std::vector<std::byte> ShaderLibrary::CookBootstrap(
         description.usePersistentCache = true;
         ShaderLibraryCompileResult result;
 
-        if(description.profile != ShaderLibraryProfile::Library66)
+        // Packaged games use SM 6.6: DXR libraries, and (RayQuery 2M E3) the cs_6_6 direct-lighting compute shaders.
+        if(description.profile == ShaderLibraryProfile::Library69)
         {
             throw std::runtime_error("Packaged games use SM 6.6 DXR libraries only: " + library.path.generic_string());
         }
@@ -359,8 +360,9 @@ namespace
         return value;
     }
 
-    // A DXBC container (header, part offsets, parts) whose DXIL program part is a library of at most the profile's
-    // shader model. Only structure is checked; the driver validates the bitcode itself at pipeline creation.
+    // A DXBC container (header, part offsets, parts) whose DXIL program part is a library (a compute shader for Compute66)
+    // of at most the profile's shader model. Only structure is checked; the driver validates the bitcode itself at
+    // pipeline creation.
     std::string DxilLibraryContainerProblem(const std::vector<char>& bytes, ShaderLibraryProfile profile)
     {
         constexpr std::size_t HeaderBytes = 32;
@@ -392,17 +394,21 @@ namespace
                 continue;
             }
 
-            // DxilProgramHeader::ProgramVersion: kind in bits 16-31, major in 4-7, minor in 0-3. Kind 6 is a library.
+            // DxilProgramHeader::ProgramVersion: kind in bits 16-31, major in 4-7, minor in 0-3. Kind 6 is a library,
+            // kind 5 a compute shader (the Compute66 profile).
             const std::uint32_t version = ReadWord(bytes, offset + 8);
             const std::uint32_t kind = version >> 16;
             const std::uint32_t model = ((version >> 4) & 0xF) * 10 + (version & 0xF);
             const std::uint32_t supported = profile == ShaderLibraryProfile::Library69 ? 69u : 66u;
+            const bool compute = profile == ShaderLibraryProfile::Compute66;
+            const std::uint32_t expectedKind = compute ? 5u : 6u;
 
-            if(kind != 6 || model > supported)
+            if(kind != expectedKind || model > supported)
             {
                 return "is incompatible (a shader of kind " + std::to_string(kind) + ", model " +
-                    std::to_string(model / 10) + "." + std::to_string(model % 10) + "; this game needs a library of model " +
-                    std::to_string(supported / 10) + "." + std::to_string(supported % 10) + ")";
+                    std::to_string(model / 10) + "." + std::to_string(model % 10) + "; this game needs " +
+                    (compute ? "a compute shader" : "a library") + " of model " + std::to_string(supported / 10) + "." +
+                    std::to_string(supported % 10) + ")";
             }
 
             return {};

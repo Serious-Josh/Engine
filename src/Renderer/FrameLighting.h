@@ -5,11 +5,8 @@
 #include "Scene/PhotometricUnits.h"
 #include "Scene/SceneLighting.h"
 
-#include <array>
 #include <string>
-
-static_assert(SceneLightConstants::Capacity == SceneLightingSnapshot::MaximumAdditionalLights,
-    "The GPU light table must hold every Light a valid scene can author.");
+#include <vector>
 
 // The renderer's per-frame lighting inputs, derived from a captured snapshot. Values only, in GPU render units:
 // every physical light value is converted here, once, for all rendering paths (PhotometricUnits.h).
@@ -19,12 +16,12 @@ struct FrameLighting
     // RTGI and reflection secondary lighting) and the ray-traced shadow direction.
     DirectionalLight sun;
 
-    // Deferred direct lights (b3), also bound unchanged for local secondary-hit RTGI (b2).
-    SceneLightConstants table{};
+    // The scene light table (many-light M2: uploaded to SceneLightBuffer and read by every scene-light consumer).
+    SceneLightTable table{};
 
     // RTXPT.3: stable scene object IDs, used only by the RTXDI light bridge. tableLightIDs parallels the
-    // first table.lightCount records; sunObjectID names the shadow owner and is empty for the legacy sun.
-    std::array<std::string, SceneLightConstants::Capacity> tableLightIDs;
+    // table.lightCount records; sunObjectID names the shadow owner and is empty for the legacy sun.
+    std::vector<std::string> tableLightIDs;
     std::string sunObjectID;
 };
 
@@ -40,4 +37,4 @@ bool BuildFrameLighting(const DirectionalLight& legacySun, const SceneLightingSn
     FrameLighting& lighting, std::string* error = nullptr, const SceneLightingSettings* proceduralSettings = nullptr);
 
 // Only local lights affect this key. Additional Directionals retain direct-only semantics.
-bool SameLocalLightInputs(const SceneLightConstants& left, const SceneLightConstants& right);
+bool SameLocalLightInputs(const SceneLightTable& left, const SceneLightTable& right);
