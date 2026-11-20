@@ -16,9 +16,10 @@
 namespace
 {
     namespace fs = std::filesystem;
-    constexpr size_t maxFileBytes = 64 * 1024 * 1024;
-    constexpr size_t maxTargets = 4096;
-    constexpr size_t maxTransactionBytes = 256 * 1024 * 1024;
+    // The published limits (AssetReconciliationTransaction.h).
+    constexpr size_t maxFileBytes = AssetReconciliationTransaction::MaximumFileBytes;
+    constexpr size_t maxTargets = AssetReconciliationTransaction::MaximumTargets;
+    constexpr size_t maxTransactionBytes = AssetReconciliationTransaction::MaximumTransactionBytes;
     const fs::path transactionName = ".asset-reconciliation";
 
 #if defined(_DEBUG)

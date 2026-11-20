@@ -27,9 +27,11 @@ namespace
     using ProjectSceneAssets::SceneFileStatus;
 
     // AssetReconciliationTransaction's limits, checked before anything is written so an oversized project fails cleanly.
-    constexpr std::size_t MaximumTargets = 4096;
-    constexpr std::size_t MaximumFileBytes = 64ull * 1024 * 1024;
-    constexpr std::size_t MaximumTransactionBytes = 256ull * 1024 * 1024;
+    static_assert(AssetReconciliationTransaction::MaximumFileBytes == MaximumSceneSourceBytes,
+        "The largest admitted scene file must be savable in one transaction");
+    constexpr std::size_t MaximumTargets = AssetReconciliationTransaction::MaximumTargets;
+    constexpr std::size_t MaximumFileBytes = AssetReconciliationTransaction::MaximumFileBytes;
+    constexpr std::size_t MaximumTransactionBytes = AssetReconciliationTransaction::MaximumTransactionBytes;
     const fs::path RegistryFile = "Assets.registry.json";
 
     std::string UTF8(const fs::path& path)

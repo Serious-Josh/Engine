@@ -358,17 +358,19 @@ void CheckLightingMigration(const std::filesystem::path& output)
     Check(SceneHierarchy::DeleteSubtree(lifecycle,duplicateID,duplicated,error),error);
     Check(Lighting(duplicated).sun.intensity == 0,"Deleting final object resurrected legacy illumination.");
 
-    // Preserve the former 64 table lights plus legacy sun at maximum scene capacity.
+    // Preserve a full historical table (the former 64-light capacity) plus the legacy sun through migration. Many-light M3
+    // removed the cap; the historical size is kept because it is what legacy scenes can contain.
+    constexpr unsigned HistoricalTableLights = 64;
     SceneDocument crowded = original;
-    for(unsigned i = 0; i < MaximumSceneLights; ++i)
+    for(unsigned i = 0; i < HistoricalTableLights; ++i)
     {
         SceneObjectDocument point; point.id = "point-" + std::to_string(i); point.light = LightComponent{};
         crowded.objects.push_back(point);
     }
     const float crowdedAmbient = MigrateLegacyLighting(crowded,sun);
     MigrateLegacyLightUnits(crowded, 12, crowdedAmbient, {}, {}); // Completes the historical load, as above.
-    Check(ValidateSceneDocument(crowded,&error) && Lighting(crowded).table.lightCount == MaximumSceneLights,
-        "Migrating a full legacy light table exceeded capacity.");
+    Check(ValidateSceneDocument(crowded,&error) && Lighting(crowded).table.lightCount == HistoricalTableLights,
+        "Migrating a full legacy light table lost or added lights.");
     // Physical lighting: every type keeps colour channels in [0, 1] and carries brightness in the intensity (up to the shared
     // maximum). Legacy out-of-range colours are normalised by migration, never accepted as authored values.
     for(const LightType type : {LightType::Directional, LightType::Point, LightType::Spot})

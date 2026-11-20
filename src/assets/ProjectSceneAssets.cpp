@@ -20,8 +20,9 @@ namespace
 {
     namespace fs = std::filesystem;
 
-    // The reconciliation transaction's per-file limit; a larger file is reported as invalid rather than read.
-    constexpr std::uintmax_t MaximumSceneBytes = 64ull * 1024 * 1024;
+    // The scene source bound (M3.5; also the reconciliation transaction's per-file limit); a larger file is reported as invalid
+    // rather than read.
+    constexpr std::uintmax_t MaximumSceneBytes = MaximumSceneSourceBytes;
 
     std::string UTF8(const fs::path& path)
     {
@@ -137,7 +138,7 @@ bool ScanProject(const ProjectPaths& paths, Scan& scan, std::string& error)
             if(sizeError || size > MaximumSceneBytes)
             {
                 file.status = SceneFileStatus::Invalid;
-                file.problem = sizeError ? "cannot read file size: " + sizeError.message() : "file exceeds the 64 MiB scene limit";
+                file.problem = sizeError ? "cannot read file size: " + sizeError.message() : "file exceeds the 1 GiB scene limit";
                 result.files.push_back(std::move(file));
                 continue;
             }

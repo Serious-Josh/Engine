@@ -198,9 +198,9 @@ class RayTracingSceneResources
     enum class CandidateStatus { Pending, Ready, NeedsTransformRefresh, Stale, Failed };
 
     // Every scene object takes part in each candidate, so the candidate's dense per-object work is bounded by the largest
-    // scene the Engine admits (SceneHierarchy::Policy::maxObjects, asserted where both are visible). Content-dependent
-    // storage stays bounded by the metadata, table and AS byte budgets below.
-    static constexpr std::size_t MaxCandidateObjects = 8192;
+    // scene the Engine admits (MaximumSceneObjects, M3.5; asserted equal where both are visible). Content-dependent storage
+    // stays bounded by the metadata, table and AS byte budgets below, which are limits, not allocations.
+    static constexpr std::size_t MaxCandidateObjects = 65536;
     // Bounded batch target, not an architectural constant: every proposal is
     // charged against the metadata/table/AS budgets below, and a candidate
     // retires one membership whatever its size. W6.4: the Engine sizes batches

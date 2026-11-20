@@ -13,8 +13,8 @@ namespace SceneHierarchy
 {
     struct Policy
     {
-        // Matches the existing default cooked-scene admission limits.
-        size_t maxObjects = 8192;
+        // The scene object bound (MaximumSceneObjects), shared with document validation and cooked-scene admission.
+        size_t maxObjects = MaximumSceneObjects;
         size_t maxParentIDBytes = 4096;
     };
 

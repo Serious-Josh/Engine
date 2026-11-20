@@ -35,6 +35,8 @@ bool FileScene::New(
 
     m_document = std::move(document);
     m_path.clear();
+    // M3.5: a replaced document is new content for every revision-keyed cache.
+    ++m_editRevision;
 
     m_hasDocument = true;
     m_dirty = true;
@@ -57,6 +59,7 @@ bool FileScene::Open(
 
     m_document = SceneDocumentCache::Copy(*loaded.document);
     m_path = path;
+    ++m_editRevision;
 
     m_hasDocument = true;
     m_dirty = false;
@@ -67,7 +70,11 @@ bool FileScene::Open(
 bool FileScene::LoadDocument(SceneDocument document, std::string* error)
 {
     if(!ValidateSceneDocument(document,error) || !ValidateSceneKindOpenable(document,error)) return false;
-    m_document = std::move(document); m_path.clear(); m_hasDocument = true; m_dirty = false;
+    m_document = std::move(document);
+    m_path.clear();
+    ++m_editRevision;
+    m_hasDocument = true;
+    m_dirty = false;
     return true;
 }
 
@@ -164,6 +171,7 @@ bool FileScene::SaveCaptured(
 
     m_document = std::move(candidate);
     m_path = std::move(savedPath);
+    ++m_editRevision;
     m_dirty = false;
     return true;
 }

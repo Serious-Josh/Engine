@@ -220,6 +220,12 @@ public:
     // document and this frame's accepted presentation worlds, resolved by stable object ID. Owner
     // thread only. Nothing is retained; the snapshot holds values only.
     bool CaptureSceneLighting(SceneLightingSnapshot& snapshot, std::string& error) const;
+    // M3.5: the same snapshot, shared and rebuilt only when an input changed. It is reused while the document storage and
+    // content (the S0.3 storage fingerprint and the edit revision), the hierarchy revision, the scene's lighting settings and
+    // every Light's presentation world (compared exactly each call) are unchanged. A rebuilt snapshot carries a new,
+    // process-unique `revision`; a reused one keeps its revision, so consumers can skip their own rebuilds. Null (with
+    // `error`) where CaptureSceneLighting fails. Owner thread only.
+    std::shared_ptr<const SceneLightingSnapshot> CaptureSceneLightingShared(std::string& error) const;
     // LIGHT.1: appends one wireframe set per Light (selected Lights last) to an overlay that is
     // empty or already captured for this scene and renderer, like CaptureEditorCameraFrusta.
     // Editable scenes only. A Light whose world is invalid is omitted and named in `rejected`.
@@ -579,6 +585,20 @@ private:
     };
 
     mutable std::optional<RetainedHierarchy> m_retainedHierarchy;
+
+    // M3.5: CaptureSceneLightingShared's last snapshot and the inputs it was built from. lightWorlds holds, per document Light
+    // in document order, its runtime slot (npos when unmapped) and the presentation world the snapshot resolved.
+    struct LightingCache
+    {
+        MetadataValidationPass::Fingerprint storage;
+        std::uint64_t editRevision = 0;
+        std::uint64_t hierarchyRevision = 0;
+        SceneLightingSettings lightingSettings;
+        std::vector<std::pair<RenderObjectID, Matrix4>> lightWorlds;
+        std::shared_ptr<const SceneLightingSnapshot> snapshot;
+    };
+
+    mutable std::optional<LightingCache> m_lightingCache;
     std::uint64_t m_validityEpoch = 0;
     const ValidatedObjectIndex& CurrentValidatedIndex() const;
     bool InspectSelectedObjectFully(RenderObjectID runtimeIndex, SceneObjectMetadata& metadata, SceneObjectDocument& object) const;

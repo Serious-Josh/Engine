@@ -3405,7 +3405,7 @@ void Engine::Frame()
 
         // Archive-only lighting from the cooked document; payloads before 11 carry no Lights, so
         // they render with their legacy sun exactly as before.
-        options.lighting = CaptureSceneLightingForFrame(*owner->m_runtime);
+        options.sharedLighting = CaptureSharedSceneLightingForFrame(*owner->m_runtime);
         options.frameDeltaSeconds = m_time.GetDeltaTime();
         // S0.5: as in the Editor frame, observe the scene environment request (failure handling).
         PollSceneEnvironment();
@@ -4309,7 +4309,7 @@ void Engine::Frame()
         }
 
         RefreshSceneEnvironmentCalibration();
-        rendererOptions.lighting = CaptureSceneLightingForFrame(*physicsScene->m_runtime);
+        rendererOptions.sharedLighting = CaptureSharedSceneLightingForFrame(*physicsScene->m_runtime);
     }
 
     // VX.5: static voxel residency follows the scene's published bake and the camera that renders this frame (the Game Play
@@ -7421,8 +7421,9 @@ void Engine::AdvanceAutomaticMeshResidency()
         scheduler.scanStartState = runtimeState;
     }
 
-    // Unreachable for a scene the hierarchy admits (asserted against SceneHierarchy::Policy::maxObjects); kept so a larger
-    // runtime can never reach the renderer's candidate bound unreported.
+    // Unreachable for an admitted scene: document validation enforces MaximumSceneObjects for flat and hierarchical scenes alike
+    // (M3.5), and the candidate bound equals it (asserted in SceneMembershipPublication). Kept so a larger runtime can never
+    // reach the renderer's candidate bound unreported.
     if (objects.size() > RayTracingSceneResources::MaxCandidateObjects)
     {
         Log::Error("Automatic mesh residency stopped: the scene has " + std::to_string(objects.size()) +
@@ -7826,15 +7827,26 @@ std::optional<EditorColliderOverlay> Engine::CaptureEditorColliderOverlayForFram
 
 SceneLightingSnapshot Engine::CaptureSceneLightingForFrame(const FileSceneRuntime& runtime) const
 {
-    SceneLightingSnapshot snapshot;
-    std::string error;
+    // A by-value copy (verification harnesses edit theirs): revision 0, so a modified copy is never mistaken for the
+    // shared snapshot it came from.
+    SceneLightingSnapshot snapshot = *CaptureSharedSceneLightingForFrame(runtime);
+    snapshot.revision = 0;
+    return snapshot;
+}
 
-    if(!runtime.CaptureSceneLighting(snapshot, error))
+std::shared_ptr<const SceneLightingSnapshot> Engine::CaptureSharedSceneLightingForFrame(const FileSceneRuntime& runtime) const
+{
+    // M3.5: the runtime reuses an unchanged snapshot (same revision), so an unchanged scene does no per-frame light rebuild.
+    std::string error;
+    std::shared_ptr<const SceneLightingSnapshot> snapshot = runtime.CaptureSceneLightingShared(error);
+
+    if(!snapshot)
     {
         // No partial list: publish no component Lights and no legacy sun, so a rejected capture
-        // can never double-illuminate or silently fall back.
-        snapshot = {};
-        snapshot.lightingSettings = runtime.GetScene().GetLightingSettings();
+        // can never double-illuminate or silently fall back. Revision 0: never reused.
+        auto empty = std::make_shared<SceneLightingSnapshot>();
+        empty->lightingSettings = runtime.GetScene().GetLightingSettings();
+        snapshot = std::move(empty);
 
         if(error != m_lightingCaptureError)
         {
@@ -7842,8 +7854,30 @@ SceneLightingSnapshot Engine::CaptureSceneLightingForFrame(const FileSceneRuntim
         }
     }
 
+#ifndef NDEBUG
+    // M3.5 diagnostic (ENGINE_DIAG_LIGHT_PUBLICATION_VERIFY): every frame also rebuilds the snapshot uncached and requires the
+    // shared one to be identical; a difference means an input change the cache key missed.
+    static const bool verify = std::getenv("ENGINE_DIAG_LIGHT_PUBLICATION_VERIFY") != nullptr;
+
+    if(verify && snapshot->revision != 0)
+    {
+        SceneLightingSnapshot fresh;
+        std::string freshError;
+        const bool same = runtime.CaptureSceneLighting(fresh, freshError) &&
+            SameSceneLightingContent(fresh, *snapshot);
+        ++m_lightPublicationVerifications;
+
+        if(!same)
+        {
+            ++m_lightPublicationMismatches;
+            Log::Error("Light publication verification: the cached lighting snapshot (revision " +
+                std::to_string(snapshot->revision) + ") differs from a fresh capture.");
+        }
+    }
+#endif
+
     m_lightingCaptureError = error;
-    ReportLightOmissions(snapshot.rejectedNames, "Light skipped (transform cannot place or orient it)",
+    ReportLightOmissions(snapshot->rejectedNames, "Light skipped (transform cannot place or orient it)",
         m_lightingOmissions);
     return snapshot;
 }

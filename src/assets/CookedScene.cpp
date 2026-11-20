@@ -5,12 +5,17 @@
 #include "assets/CookedEnvironment.h"
 #include "assets/CookedSurface.h"
 #include "Scene/SceneSerializer.h"
+#include "assets/EngineAssetPak.h"
 #include <algorithm>
 #include <bit>
 #include <cmath>
 #include <map>
 #include <set>
 #include <stdexcept>
+
+// M3.5: a cooked scene the policy admits must also fit one asset pak entry.
+static_assert(CookedScene::Policy{}.maxBytes <= EngineAssetPak::Limits{}.payloadBytes &&
+    CookedScene::Policy{}.maxBytes <= EngineAssetPak::Limits{}.readBytes, "Cooked scenes must fit an asset pak entry");
 
 namespace CookedScene
 {
@@ -1633,7 +1638,7 @@ std::vector<std::byte> CookFile(const std::filesystem::path& file, std::span<con
 {
     SceneDocument document;
     std::string error;
-    if (!LoadSceneDocumentForCooking(file, document, policy.maxBytes, &error))
+    if (!LoadSceneDocumentForCooking(file, document, policy.maxSourceBytes, &error))
     {
         throw std::runtime_error("Scene cooker: " + error);
     }

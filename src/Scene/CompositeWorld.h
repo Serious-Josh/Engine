@@ -82,9 +82,8 @@ struct CompositeWorld
     std::filesystem::path worldRelativePath;
     // The frame-wide environment (A1): the World's own values.
     EffectiveSceneEnvironment worldEnvironment;
+    // Light components across the World and its Local Levels (informational; there is no light-count limit).
     std::size_t lightCount = 0;
-    // The scene light limit that applies (64, or 65 when any level has a Directional Light).
-    std::size_t lightCapacity = 0;
     // Project scenes the loader could not read, so their membership could not be checked against this World (a double claim by
     // an unreadable World cannot be ruled out). Empty when every project scene was read.
     std::vector<std::string> unverifiedScenes;
@@ -108,7 +107,7 @@ struct CompositeWorld
 };
 
 // Validates the World and its members and builds the composite. `locals` must hold one source per World member (any order). Fails,
-// leaving `composite` unchanged, on any invalid document, membership mismatch, cross-level parent reference, light capacity overflow
+// leaving `composite` unchanged, on any invalid document, membership mismatch, cross-level parent reference, object capacity overflow
 // or composite validation failure; nothing is skipped silently.
 bool BuildCompositeWorld(const CompositeWorldSource& world, const std::vector<CompositeWorldSource>& locals, CompositeWorld& composite,
     std::string& error);

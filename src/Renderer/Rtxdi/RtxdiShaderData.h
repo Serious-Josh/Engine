@@ -30,18 +30,21 @@ struct RtxdiLightDataLayout
     // Many-light M2: the initial allocation (both frames with the sun, the HDRI and one table light); the buffer grows with
     // the light count (RtxdiResources::RecordLightData).
     static constexpr std::uint32_t InitialBytes = 2 * 3 * (RecordBytes + TranslationBytes);
+    // Many-light M3: shaders address the buffer with 32-bit byte offsets, so the whole layout must stay within 4 GiB.
+    // Sizes and offsets are computed in 64 bits so a caller can check them against this before narrowing.
+    static constexpr std::uint64_t MaximumBytes = UINT32_MAX;
 
-    static constexpr std::uint32_t PreviousRecordsOffset(std::uint32_t currentCount) noexcept
+    static constexpr std::uint64_t PreviousRecordsOffset(std::uint64_t currentCount) noexcept
     {
         return currentCount * RecordBytes;
     }
 
-    static constexpr std::uint32_t TranslationOffset(std::uint32_t currentCount, std::uint32_t previousCount) noexcept
+    static constexpr std::uint64_t TranslationOffset(std::uint64_t currentCount, std::uint64_t previousCount) noexcept
     {
         return (currentCount + previousCount) * RecordBytes;
     }
 
-    static constexpr std::uint32_t Bytes(std::uint32_t currentCount, std::uint32_t previousCount) noexcept
+    static constexpr std::uint64_t Bytes(std::uint64_t currentCount, std::uint64_t previousCount) noexcept
     {
         return (currentCount + previousCount) * (RecordBytes + TranslationBytes);
     }

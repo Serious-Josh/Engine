@@ -157,9 +157,16 @@ bool ValidateSceneDocument(
     if(const char* reason = nullptr; !ValidateCameraExposure(document.camera.exposure, &reason))
         return Fail(errorMessage, std::string("Viewport camera exposure: ") + reason);
 
+    // M3.5: the object bound applies to every document, flat or hierarchical (the hierarchy checks it again below), so an
+    // oversized scene is refused at load, save and cook rather than only at activation.
+    if(document.objects.size() > MaximumSceneObjects)
+    {
+        return Fail(errorMessage, "The scene has " + std::to_string(document.objects.size()) + " objects; a scene holds at most " +
+            std::to_string(MaximumSceneObjects) + ".");
+    }
+
     std::unordered_set<std::string> objectIDs;
     const SceneObjectDocument* mainCamera = nullptr;
-    std::uint32_t lightCount = 0;
 
     for (const SceneObjectDocument& object : document.objects)
     {
@@ -196,13 +203,6 @@ bool ValidateSceneDocument(
             mainCamera = &object;
         }
 
-        // Disabled Lights count too: the bound is the renderer's fixed per-frame light capacity.
-        if(object.light && ++lightCount > MaximumSceneLights + 1)
-        {
-            return Fail(errorMessage, "The scene has more than " + std::to_string(MaximumSceneLights + 1) +
-                " Light components (including the dedicated sun slot).");
-        }
-
         for(const auto& [slotID, reference] : object.materialSlotBindings)
         {
             if(slotID.empty() || !AssetID::ParseReference(reference))
@@ -211,11 +211,6 @@ bool ValidateSceneDocument(
             }
         }
     }
-
-    const bool hasDirectional = std::any_of(document.objects.begin(), document.objects.end(),
-        [](const auto& object) { return object.light && object.light->type == LightType::Directional; });
-    if(lightCount > MaximumSceneLights && !hasDirectional)
-        return Fail(errorMessage, "Lights exceed the table capacity without a directional sun slot.");
 
     // Existing flat validation above already checks identities/components. Avoid
     // graph allocation on ordinary frame-time captures and preserve loose count policy.

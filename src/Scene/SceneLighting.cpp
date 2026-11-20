@@ -3,6 +3,7 @@
 #include "Scene/SceneDocument.h"
 #include "Scene/SceneHierarchyTransforms.h"
 
+#include <cstring>
 #include <cmath>
 
 namespace
@@ -151,7 +152,7 @@ const SceneObjectDocument* FindDirectionalShadowOwner(const SceneDocument& docum
 
 bool BuildSceneLightingSnapshot(const SceneDocument& document,
     const std::function<std::optional<Matrix4>(const SceneObjectDocument&)>& worldOf,
-    SceneLightingSnapshot& snapshot, std::string* error)
+    SceneLightingSnapshot& snapshot, [[maybe_unused]] std::string* error)
 {
     SceneLightingSnapshot candidate;
     candidate.lightingSettings = document.lightingSettings;
@@ -204,12 +205,50 @@ bool BuildSceneLightingSnapshot(const SceneDocument& document,
         }
     }
 
-    if(candidate.additionalLights.size() > SceneLightingSnapshot::MaximumAdditionalLights)
+    snapshot = std::move(candidate);
+    return true;
+}
+
+namespace
+{
+    bool SameBits(const void* left, const void* right, std::size_t bytes)
     {
-        return Fail(error, "The scene has more Light components than the renderer light table holds (" +
-            std::to_string(SceneLightingSnapshot::MaximumAdditionalLights) + ").");
+        return std::memcmp(left, right, bytes) == 0;
     }
 
-    snapshot = std::move(candidate);
+    bool SameResolvedLight(const ResolvedSceneLight& left, const ResolvedSceneLight& right)
+    {
+        return left.type == right.type && SameBits(&left.position, &right.position, sizeof(Vector3)) &&
+            SameBits(&left.direction, &right.direction, sizeof(Vector3)) && SameBits(&left.color, &right.color, sizeof(Vector3)) &&
+            SameBits(&left.intensity, &right.intensity, sizeof(float)) &&
+            SameBits(&left.angularRadius, &right.angularRadius, sizeof(float)) &&
+            SameBits(&left.range, &right.range, sizeof(float)) && left.rangeAttenuation == right.rangeAttenuation &&
+            SameBits(&left.innerConeAngle, &right.innerConeAngle, sizeof(float)) &&
+            SameBits(&left.outerConeAngle, &right.outerConeAngle, sizeof(float)) && left.objectID == right.objectID;
+    }
+}
+
+bool SameSceneLightingContent(const SceneLightingSnapshot& left, const SceneLightingSnapshot& right)
+{
+    if(left.suppressLegacyDirectional != right.suppressLegacyDirectional || !(left.lightingSettings == right.lightingSettings) ||
+        left.sunDirectional.has_value() != right.sunDirectional.has_value() ||
+        left.additionalLights.size() != right.additionalLights.size() || left.rejectedNames != right.rejectedNames)
+    {
+        return false;
+    }
+
+    if(left.sunDirectional && !SameResolvedLight(*left.sunDirectional, *right.sunDirectional))
+    {
+        return false;
+    }
+
+    for(std::size_t index = 0; index < left.additionalLights.size(); ++index)
+    {
+        if(!SameResolvedLight(left.additionalLights[index], right.additionalLights[index]))
+        {
+            return false;
+        }
+    }
+
     return true;
 }

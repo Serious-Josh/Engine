@@ -379,6 +379,11 @@ class Engine
     // LIGHT.1: this frame's lighting snapshot for any file-backed scene (Editor or packaged).
     // A failed capture yields a dark, component-free snapshot rather than the legacy sun.
     SceneLightingSnapshot CaptureSceneLightingForFrame(const FileSceneRuntime& runtime) const;
+    // M3.5: the frame's snapshot, shared and reused while unchanged (FileSceneRuntime::CaptureSceneLightingShared).
+    std::shared_ptr<const SceneLightingSnapshot> CaptureSharedSceneLightingForFrame(const FileSceneRuntime& runtime) const;
+    // M3.5 ENGINE_DIAG_LIGHT_PUBLICATION_VERIFY (Debug): cached-snapshot checks made and differences found.
+    mutable std::uint64_t m_lightPublicationVerifications = 0;
+    mutable std::uint64_t m_lightPublicationMismatches = 0;
     // Bounded diagnostics, logged only when the named set changes, never once per frame.
     void ReportLightOmissions(const std::vector<std::string>& rejected, const char* context,
         std::string& lastReported) const;

@@ -116,7 +116,11 @@ namespace CookedScene
     }
     struct Policy
     {
-        size_t maxBytes = 16 * 1024 * 1024, maxObjects = 8193, maxStringBytes = 4096, maxSlots = 4096;
+        // M3.5: the cooked payload bound matches the asset pak's per-entry payload and read limits (EngineAssetPak::Limits),
+        // which a larger scene could not be stored in anyway; the source bound is the JSON the cooker reads. Both bound
+        // untrusted input and are checked against actual sizes before reading; nothing is allocated to them.
+        size_t maxBytes = 256 * 1024 * 1024, maxObjects = MaximumSceneObjects, maxStringBytes = 4096, maxSlots = 4096;
+        std::uintmax_t maxSourceBytes = MaximumSceneSourceBytes;
     };
     struct MeshInput
     {

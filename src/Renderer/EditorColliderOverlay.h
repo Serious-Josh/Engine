@@ -70,7 +70,8 @@ struct ColliderOverlayMarker
 struct EditorColliderOverlay
 {
     // All six solid/trigger shape batches share one bound.
-    static constexpr std::size_t MaxColliders = 16384; // Two optional colliders per 8192 scene objects.
+    // Two optional colliders per object at the scene bound (MaximumSceneObjects, asserted in SceneLightCapture.cpp).
+    static constexpr std::size_t MaxColliders = 2 * 65536;
 
     // A unit box: twelve edges, two line-list endpoints each.
     static constexpr unsigned int VerticesPerBox = 24;

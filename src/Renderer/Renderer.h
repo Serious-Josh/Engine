@@ -176,6 +176,16 @@ struct RendererOptions
     // Absent: procedural demos use their explicit sun; object-owned file scenes stay dark. Copied by value.
     std::optional<SceneLightingSnapshot> lighting;
 
+    // M3.5: the same, shared (FileSceneRuntime::CaptureSceneLightingShared). When set it is used instead of `lighting`, and
+    // an unchanged snapshot revision lets the renderer reuse its frame lighting and skip republishing the light table.
+    std::shared_ptr<const SceneLightingSnapshot> sharedLighting;
+
+    // The frame's snapshot: sharedLighting, else lighting, else none.
+    const SceneLightingSnapshot* GetLighting() const noexcept
+    {
+        return sharedLighting ? sharedLighting.get() : (lighting ? &*lighting : nullptr);
+    }
+
     // RTXPT.1 experimental lighting mode for this frame only. Legacy is the default; the selection is
     // never persisted. An unavailable reference mode renders Legacy and reports why.
     RendererLightingMode lightingMode = RendererLightingMode::Legacy;
@@ -1481,6 +1491,24 @@ class Renderer
         const ShadowConstants& shadowConstants,
         unsigned int width,
         unsigned int height);
+    // M3.5: the frame's lighting, reused while the snapshot revision (non-zero), sun and settings are unchanged; `revision` is
+    // set to the content's revision (0 when it must not be reused). Never modified once returned.
+    // M3.5: whether a path-traced mode's estimated exhaustive light work for this frame is safely below the GPU timeout
+    // (with hysteresis); otherwise `failure` says why and the frame renders Legacy. Logged once per change.
+    bool IsPathTraceWorkloadSafe(std::uint32_t tableLights, const PathTraceReferenceSettings& settings, std::string& failure);
+    bool m_pathTraceWorkloadGuarded = false;
+    std::uint64_t m_pathTraceWorkloadGuardChanges = 0;
+    double m_pathTraceWorkloadEstimateMilliseconds = 0.0;
+    std::shared_ptr<const FrameLighting> AcquireFrameLighting(const DirectionalLight& legacySun,
+        const SceneLightingSnapshot* snapshot, const SceneLightingSettings& proceduralSettings, std::uint64_t& revision);
+    std::shared_ptr<const FrameLighting> m_frameLightingCache;
+    std::uint64_t m_frameLightingCacheRevision = 0;
+    DirectionalLight m_frameLightingCacheSun;
+    SceneLightingSettings m_frameLightingCacheSettings;
+    // M3.5 ENGINE_DIAG_LIGHT_PUBLICATION_VERIFY (Debug): reused frame lightings checked and differences found.
+    std::uint64_t m_frameLightingVerifications = 0;
+    std::uint64_t m_frameLightingMismatches = 0;
+
     bool RecordRenderFrame(
         const Scene& scene,
         const RendererOptions& options);
@@ -3023,8 +3051,15 @@ private:
     bool m_hasPreviousGILight = false;
 
     SceneLightTable m_previousGILocalLights{};
+    // M3.5: the lighting revision m_previousGILocalLights holds (0 = unknown); equal revisions skip the comparison and copy.
+    std::uint64_t m_previousGILightingRevision = 0;
     // Many-light M2: the GPU scene light table every scene-light consumer reads.
     SceneLightBuffer m_sceneLightBuffer;
+    // Many-light M3: true while frames render without table lights (the scene light buffer or RTXDI's light data cannot hold
+    // the table) or without RTXDI temporal reuse (RTXDI's light data cannot also hold the previous frame's lights). Logged
+    // once when an episode starts and once when it ends; episodes are counted for tests.
+    bool m_sceneLightPublicationFailing = false;
+    std::uint32_t m_sceneLightPublicationFailureEpisodes = 0;
 
     // Verification only: records `count` lights into the scene light buffer in the current command list and returns the
     // address of their SceneLightConstants (0 on failure), for harnesses that drive passes directly.

@@ -209,6 +209,21 @@ namespace SceneDocumentCache
             return false;
         }
 
+        // M3.5: the same source bound as every other scene reader, checked before the file is read.
+        std::error_code sizeError;
+        const auto size = fs::file_size(path, sizeError);
+
+        if(sizeError || size > MaximumSceneSourceBytes)
+        {
+            if(errorMessage)
+            {
+                *errorMessage = sizeError ? "Failed to read scene file." : "Scene file exceeds the largest admitted scene file (" +
+                    std::to_string(MaximumSceneSourceBytes) + " bytes).";
+            }
+
+            return false;
+        }
+
         std::string contents((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
 
         if(file.bad())

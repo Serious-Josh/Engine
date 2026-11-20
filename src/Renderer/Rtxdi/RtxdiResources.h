@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <optional>
 #include <deque>
+#include <string>
 #include <vector>
 
 class DescriptorHeap;
@@ -145,6 +146,30 @@ class RtxdiResources
     bool RecordLightData(ID3D12Device* device, ID3D12GraphicsCommandList* commandList, UploadBuffer& upload,
         const RtxdiFrame& frame, std::uint64_t lastSubmittedFence, std::uint64_t completedFence);
 
+    // Many-light M3: grows the light data, as RecordLightData would, so it can hold a frame of `currentCount` lights with
+    // `previousCount` previous lights. The renderer calls it before any consumer reads the frame's lights, so an allocation
+    // failure is found while the frame can still be lit consistently without table lights. False (with `error`) while
+    // unallocated, above the 32-bit addressable size, or when the allocation fails; the current buffer is then unchanged.
+    bool ReserveLightData(ID3D12Device* device, std::size_t currentCount, std::size_t previousCount,
+        std::uint64_t lastSubmittedFence, std::uint64_t completedFence, std::string& error);
+
+    // The light count the next frame's translation would read as previous lights (0 without usable committed history).
+    std::size_t GetCommittedLightCount() const noexcept
+    {
+        return m_historyValid ? m_committedLights.records.size() : 0;
+    }
+
+    std::uint64_t GetLightDataCapacityBytes() const noexcept
+    {
+        return m_lightDataCapacityBytes;
+    }
+
+    // Test-only: light data growth beyond this many bytes fails as if the allocation had failed; nullopt removes the limit.
+    void SetLightDataCapacityLimitForTesting(std::optional<std::uint64_t> bytes) noexcept
+    {
+        m_lightDataCapacityLimitForTesting = bytes;
+    }
+
     // After the recording's command list was submitted: its reservoirs and lights become the previous frame.
     // Does nothing without a pending frame.
     void CommitFrame();
@@ -218,6 +243,8 @@ class RtxdiResources
 
     bool CreateReservoirUAV(ID3D12Device* device, DescriptorHeap& descriptorHeap, std::uint64_t elements);
     bool CreateNeighborOffsets(ID3D12Device* device, DescriptorHeap& descriptorHeap);
+    void ReleaseCompletedLightData(std::uint64_t completedFence);
+    bool GrowLightData(ID3D12Device* device, std::uint64_t neededBytes, std::uint64_t lastSubmittedFence, std::string& error);
 
     struct PendingFrame
     {
@@ -229,6 +256,7 @@ class RtxdiResources
     Buffer m_reservoirs;
     Buffer m_lightData;
     std::uint64_t m_lightDataCapacityBytes = 0;
+    std::optional<std::uint64_t> m_lightDataCapacityLimitForTesting;
 
     struct RetiredLightData
     {

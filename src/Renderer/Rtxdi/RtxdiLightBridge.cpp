@@ -5,7 +5,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <functional>
 #include <iterator>
+#include <string_view>
+#include <vector>
 
 namespace
 {
@@ -40,26 +43,83 @@ namespace
         return left.kind == right.kind && left.objectID == right.objectID;
     }
 
-    // The only index in `set` carrying the key of `identity`, or -1 when none or several do.
-    std::int32_t FindUniqueKey(const RtxdiLightSet& set, const RtxdiLightIdentity& identity)
+    std::size_t HashKey(const RtxdiLightIdentity& identity) noexcept
     {
-        std::int32_t found = -1;
+        const std::size_t idHash = std::hash<std::string_view>{}(identity.objectID);
+        return idHash ^ (static_cast<std::size_t>(identity.kind) * 0x9E3779B97F4A7C15ull);
+    }
 
-        for(std::size_t index = 0; index < set.identities.size(); ++index)
+    // Many-light M3: the keys (kind, object ID) of one light set, each with the only index carrying it or "ambiguous" when
+    // several do. Built in one expected-O(N) pass, it answers "the only index with this key, or -1 when none or several do"
+    // in expected O(1), where the pre-M3 linear scan per query made translation O(N^2). The answers are identical (the
+    // equivalence test in RtxdiFoundationTests compares them with the original scan). An open-addressing table in one
+    // allocation, sized to at most half full, so small sets cost no more than the scan did.
+    class UniqueKeyIndex
+    {
+        public:
+        explicit UniqueKeyIndex(const RtxdiLightSet& set) :
+            m_set(set)
         {
-            if(SameKey(set.identities[index], identity))
-            {
-                if(found >= 0)
-                {
-                    return -1;
-                }
+            std::size_t slotCount = 8;
 
-                found = static_cast<std::int32_t>(index);
+            while(slotCount < set.identities.size() * 2)
+            {
+                slotCount *= 2;
+            }
+
+            m_slots.resize(slotCount);
+
+            for(std::size_t position = 0; position < set.identities.size(); ++position)
+            {
+                Slot& slot = m_slots[ProbeSlot(set.identities[position])];
+
+                if(slot.first < 0)
+                {
+                    slot.first = static_cast<std::int32_t>(position);
+                }
+                else
+                {
+                    // A repeated key is ambiguous however many more lights carry it.
+                    slot.ambiguous = true;
+                }
             }
         }
 
-        return found;
-    }
+        // The only index carrying the key of `identity`, or -1 when none or several do.
+        std::int32_t Find(const RtxdiLightIdentity& identity) const
+        {
+            const Slot& slot = m_slots[ProbeSlot(identity)];
+            return slot.ambiguous ? -1 : slot.first;
+        }
+
+        private:
+        struct Slot
+        {
+            // The first index carrying the slot's key; -1 for an empty slot.
+            std::int32_t first = -1;
+            bool ambiguous = false;
+        };
+
+        // The slot holding the key of `identity`, or the empty slot where it would be inserted (linear probing; the table is
+        // never more than half full, so an empty slot always ends the probe).
+        std::size_t ProbeSlot(const RtxdiLightIdentity& identity) const
+        {
+            const std::size_t mask = m_slots.size() - 1;
+
+            for(std::size_t slot = HashKey(identity) & mask;; slot = (slot + 1) & mask)
+            {
+                const Slot& candidate = m_slots[slot];
+
+                if(candidate.first < 0 || SameKey(m_set.identities[candidate.first], identity))
+                {
+                    return slot;
+                }
+            }
+        }
+
+        const RtxdiLightSet& m_set;
+        std::vector<Slot> m_slots;
+    };
 
     // PT.2B: a spot light's samples survive only radiance changes. A moved, rotated or reshaped cone made reused samples near
     // its steep edge high-variance (measured: up to 1.7x the error of dropping them), the D.2C.2R cone-edge mechanism.
@@ -210,16 +270,19 @@ void BuildRtxdiLightTranslation(const RtxdiLightSet& previous, const RtxdiLightS
     currentToPrevious.assign(current.identities.size(), -1);
     previousToCurrent.assign(previous.identities.size(), -1);
 
+    const UniqueKeyIndex currentKeys(current);
+    const UniqueKeyIndex previousKeys(previous);
+
     for(std::size_t currentIndex = 0; currentIndex < current.identities.size(); ++currentIndex)
     {
         const RtxdiLightIdentity& identity = current.identities[currentIndex];
 
-        if(FindUniqueKey(current, identity) != static_cast<std::int32_t>(currentIndex))
+        if(currentKeys.Find(identity) != static_cast<std::int32_t>(currentIndex))
         {
             continue;
         }
 
-        const std::int32_t previousIndex = FindUniqueKey(previous, identity);
+        const std::int32_t previousIndex = previousKeys.Find(identity);
 
         if(previousIndex < 0)
         {

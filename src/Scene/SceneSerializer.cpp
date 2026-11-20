@@ -73,29 +73,99 @@ namespace
         }
     }
 
-    template <typename Input>
-    Json ParseSceneJson(Input&& input)
+    // Builds the scene's JSON tree exactly as Json::parse does, and refuses any object that repeats a field (plain parsing
+    // would silently keep the last one). M3.5: this replaces Json::parse with a parser callback, whose cost grew
+    // quadratically with the scene (5.2 s instead of 0.37 s for an 8,410-object scene, minutes at 65,536 objects); the SAX
+    // handler forwards to nlohmann's own DOM builder (nlohmann::detail, pinned at 3.12.0) and is linear.
+    class DuplicateCheckingSceneParser
     {
-        std::vector<std::set<std::string>> objectFields;
-        return Json::parse(std::forward<Input>(input), [&](int, Json::parse_event_t event, Json& value)
+        public:
+        explicit DuplicateCheckingSceneParser(Json& result) :
+            m_dom(result, true)
         {
-            if (event == Json::parse_event_t::object_start)
+        }
+
+        bool null() { return m_dom.null(); }
+        bool boolean(bool value) { return m_dom.boolean(value); }
+        bool number_integer(Json::number_integer_t value) { return m_dom.number_integer(value); }
+        bool number_unsigned(Json::number_unsigned_t value) { return m_dom.number_unsigned(value); }
+        bool number_float(Json::number_float_t value, const std::string& text) { return m_dom.number_float(value, text); }
+        bool string(std::string& value) { return m_dom.string(value); }
+        bool binary(Json::binary_t& value) { return m_dom.binary(value); }
+        bool start_array(std::size_t size) { return m_dom.start_array(size); }
+        bool end_array() { return m_dom.end_array(); }
+
+        bool start_object(std::size_t size)
+        {
+            m_objectFields.emplace_back();
+            return m_dom.start_object(size);
+        }
+
+        bool end_object()
+        {
+            m_objectFields.pop_back();
+            return m_dom.end_object();
+        }
+
+        bool key(std::string& value)
+        {
+            if(!m_objectFields.back().insert(value).second)
             {
-                objectFields.emplace_back();
+                throw std::runtime_error("Duplicate scene field: " + value);
             }
-            else if (event == Json::parse_event_t::key)
-            {
-                if (!objectFields.back().insert(value.get<std::string>()).second)
-                {
-                    throw std::runtime_error("Duplicate scene field: " + value.get<std::string>());
-                }
-            }
-            else if (event == Json::parse_event_t::object_end)
-            {
-                objectFields.pop_back();
-            }
-            return true;
-        });
+
+            return m_dom.key(value);
+        }
+
+        bool parse_error(std::size_t position, const std::string& token, const nlohmann::detail::exception& error)
+        {
+            return m_dom.parse_error(position, token, error);
+        }
+
+        private:
+        nlohmann::detail::json_sax_dom_parser<Json, nlohmann::detail::string_input_adapter_type> m_dom;
+        std::vector<std::set<std::string>> m_objectFields;
+    };
+
+    Json ParseSceneJson(std::string_view bytes)
+    {
+        Json result;
+        DuplicateCheckingSceneParser parser(result);
+        Json::sax_parse(bytes.data(), bytes.data() + bytes.size(), &parser);
+        return result;
+    }
+
+    // M3.5: reads a whole scene source file after checking its size against MaximumSceneSourceBytes, so an oversized file is
+    // refused before anything is allocated for it.
+    bool ReadSceneSource(const std::filesystem::path& path, std::string& bytes, std::string& error)
+    {
+        std::error_code sizeError;
+        const auto size = std::filesystem::file_size(path, sizeError);
+
+        if(sizeError)
+        {
+            error = "Failed to open scene file.";
+            return false;
+        }
+
+        if(size > MaximumSceneSourceBytes || size > SIZE_MAX)
+        {
+            error = "Scene file is " + std::to_string(size) + " bytes; the largest admitted scene file is " +
+                std::to_string(MaximumSceneSourceBytes) + " bytes.";
+            return false;
+        }
+
+        std::ifstream file(path, std::ios::binary);
+        bytes.assign(static_cast<std::size_t>(size), '\0');
+
+        if(!file || !file.read(bytes.data(), static_cast<std::streamsize>(bytes.size())) ||
+            file.peek() != std::char_traits<char>::eof())
+        {
+            error = "Failed to read scene file (it may have changed while being read).";
+            return false;
+        }
+
+        return true;
     }
 
     Json ToJson(const Vector3& value)
@@ -2373,15 +2443,16 @@ bool LoadSceneDocument(
 {
     try
     {
-        std::ifstream file(path, std::ios::binary);
+        std::string bytes;
+        std::string readError;
 
-        if (!file)
+        if(!ReadSceneSource(path, bytes, readError))
         {
-            return Fail(errorMessage, "Failed to open scene file.");
+            return Fail(errorMessage, readError);
         }
 
         const StreamingTelemetry::Scope parseTiming(StreamingTelemetry::Metric::SceneParseNs, StreamingTelemetry::Metric::SceneParses);
-        Json json = ParseSceneJson(file);
+        Json json = ParseSceneJson(bytes);
 
         SceneDocument loaded = FromJson(json, migration);
 
@@ -2420,7 +2491,13 @@ bool ParseSceneDocument(std::string_view bytes, SceneDocument& document, std::st
 
     try
     {
-        const Json json = ParseSceneJson(std::string(bytes));
+        if(bytes.size() > MaximumSceneSourceBytes)
+        {
+            return Fail(errorMessage, "Scene source exceeds the largest admitted scene file (" +
+                std::to_string(MaximumSceneSourceBytes) + " bytes).");
+        }
+
+        const Json json = ParseSceneJson(bytes);
 
         if (storedSchemaVersion && json.is_object())
         {

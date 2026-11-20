@@ -237,62 +237,30 @@ bool RtxdiResources::BeginFrame(const RtxdiLightSet& lights, const RtxdiHistoryS
 bool RtxdiResources::RecordLightData(ID3D12Device* device, ID3D12GraphicsCommandList* commandList, UploadBuffer& upload,
     const RtxdiFrame& frame, std::uint64_t lastSubmittedFence, std::uint64_t completedFence)
 {
-    const auto currentCount = static_cast<std::uint32_t>(frame.lightRecords.size());
-    const auto previousCount = static_cast<std::uint32_t>(frame.previousLightRecords.size());
+    const std::size_t currentCount = frame.lightRecords.size();
+    const std::size_t previousCount = frame.previousLightRecords.size();
 
     if(!m_initialized || !device || !commandList || frame.previousLightCount != previousCount ||
-        frame.lightTranslation.size() != static_cast<std::size_t>(currentCount) + previousCount)
+        frame.lightTranslation.size() != currentCount + previousCount)
     {
         return false;
     }
 
-    // Retired light data buffers whose last possible reader has completed.
-    std::erase_if(m_retiredLightData,
-        [&](RetiredLightData& retired)
-        {
-            if(retired.submissionFence > completedFence)
-            {
-                return false;
-            }
+    ReleaseCompletedLightData(completedFence);
 
-            retired.buffer.Shutdown();
-            return true;
-        });
+    // Many-light M3: the size is computed in 64 bits and checked before it is narrowed or allocated.
+    const std::uint64_t neededBytes = (std::max)(RtxdiLightDataLayout::Bytes(currentCount, previousCount), std::uint64_t{4});
+    std::string growthError;
 
-    // Many-light M2: the light data grows with the light count (doubling, at least the need); submitted frames may still
-    // read the current buffer through its descriptor, so it is retired, not released.
-    const std::uint64_t neededBytes = (std::max)(std::uint64_t{RtxdiLightDataLayout::Bytes(currentCount, previousCount)},
-        std::uint64_t{4});
-
-    if(neededBytes > m_lightDataCapacityBytes)
+    if(!GrowLightData(device, neededBytes, lastSubmittedFence, growthError))
     {
-        std::uint64_t capacity = (std::max)(m_lightDataCapacityBytes, std::uint64_t{RtxdiLightDataLayout::InitialBytes});
-
-        while(capacity < neededBytes)
-        {
-            capacity *= 2;
-        }
-
-        const MemoryCategoryScope memoryScope(MemoryCategory::PathTracing);
-        Buffer grown;
-
-        if(capacity > UINT32_MAX || !grown.InitializeGPUWritable(device, static_cast<size_t>(capacity)) ||
-            !m_descriptorHeap || !grown.CreateRawSRV(device, *m_descriptorHeap))
-        {
-            grown.Shutdown();
-            Log::Error("Failed to grow the RTXDI light data to " + std::to_string(capacity) + " bytes.");
-            return false;
-        }
-
-        grown.GetResource()->SetName(L"RTXDI Light Data");
-        m_retiredLightData.push_back(RetiredLightData{std::move(m_lightData), lastSubmittedFence});
-        m_lightData = std::move(grown);
-        m_lightDataCapacityBytes = capacity;
+        Log::Error(growthError);
+        return false;
     }
 
     // An empty frame still writes one word, so every frame records the same copy. The staging bytes keep their capacity.
     std::vector<std::uint8_t>& bytes = m_lightDataStaging;
-    bytes.assign((std::max)(RtxdiLightDataLayout::Bytes(currentCount, previousCount), 4u), 0);
+    bytes.assign(static_cast<std::size_t>(neededBytes), 0);
     std::uint8_t* destination = bytes.data();
 
     const auto append = [&](const void* source, std::size_t size)
@@ -318,6 +286,82 @@ bool RtxdiResources::RecordLightData(ID3D12Device* device, ID3D12GraphicsCommand
     m_lightData.Transition(commandList, D3D12_RESOURCE_STATE_COPY_DEST);
     commandList->CopyBufferRegion(m_lightData.GetResource(), 0, source.resource, source.offset, bytes.size());
     m_lightData.Transition(commandList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    return true;
+}
+
+bool RtxdiResources::ReserveLightData(ID3D12Device* device, std::size_t currentCount, std::size_t previousCount,
+    std::uint64_t lastSubmittedFence, std::uint64_t completedFence, std::string& error)
+{
+    if(!m_initialized || !device)
+    {
+        error = "RTXDI resources are not allocated.";
+        return false;
+    }
+
+    ReleaseCompletedLightData(completedFence);
+    const std::uint64_t neededBytes = (std::max)(RtxdiLightDataLayout::Bytes(currentCount, previousCount), std::uint64_t{4});
+    return GrowLightData(device, neededBytes, lastSubmittedFence, error);
+}
+
+void RtxdiResources::ReleaseCompletedLightData(std::uint64_t completedFence)
+{
+    // Retired light data buffers whose last possible reader has completed.
+    std::erase_if(m_retiredLightData,
+        [&](RetiredLightData& retired)
+        {
+            if(retired.submissionFence > completedFence)
+            {
+                return false;
+            }
+
+            retired.buffer.Shutdown();
+            return true;
+        });
+}
+
+bool RtxdiResources::GrowLightData(ID3D12Device* device, std::uint64_t neededBytes, std::uint64_t lastSubmittedFence,
+    std::string& error)
+{
+    if(neededBytes <= m_lightDataCapacityBytes)
+    {
+        return true;
+    }
+
+    // Shaders address the light data with 32-bit byte offsets.
+    if(neededBytes > RtxdiLightDataLayout::MaximumBytes)
+    {
+        error = "The RTXDI light data would need " + std::to_string(neededBytes) + " bytes, above the 32-bit addressable " +
+            std::to_string(RtxdiLightDataLayout::MaximumBytes) + ".";
+        return false;
+    }
+
+    // Many-light M2: the light data grows with the light count (doubling, at least the need); submitted frames may still
+    // read the current buffer through its descriptor, so it is retired, not released.
+    std::uint64_t capacity = (std::max)(m_lightDataCapacityBytes, std::uint64_t{RtxdiLightDataLayout::InitialBytes});
+
+    while(capacity < neededBytes)
+    {
+        capacity *= 2;
+    }
+
+    const bool refusedForTesting = m_lightDataCapacityLimitForTesting && capacity > *m_lightDataCapacityLimitForTesting;
+    const MemoryCategoryScope memoryScope(MemoryCategory::PathTracing);
+    Buffer grown;
+
+    if(refusedForTesting || capacity > RtxdiLightDataLayout::MaximumBytes ||
+        !grown.InitializeGPUWritable(device, static_cast<size_t>(capacity)) || !m_descriptorHeap ||
+        !grown.CreateRawSRV(device, *m_descriptorHeap))
+    {
+        grown.Shutdown();
+        error = "Failed to grow the RTXDI light data to " + std::to_string(capacity) + " bytes" +
+            (refusedForTesting ? " (refused by the test capacity limit)." : ".");
+        return false;
+    }
+
+    grown.GetResource()->SetName(L"RTXDI Light Data");
+    m_retiredLightData.push_back(RetiredLightData{std::move(m_lightData), lastSubmittedFence});
+    m_lightData = std::move(grown);
+    m_lightDataCapacityBytes = capacity;
     return true;
 }
 

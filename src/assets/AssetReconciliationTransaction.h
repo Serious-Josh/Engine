@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <filesystem>
 #include <optional>
 #include <string>
@@ -11,6 +12,14 @@ class ProjectPaths;
 // Bytes are opaque: callers retain responsibility for document validation.
 namespace AssetReconciliationTransaction
 {
+    // M3.5: per-file and aggregate byte limits. A file may be as large as the largest admitted scene source
+    // (MaximumSceneSourceBytes, 1 GiB), so the largest scene can be saved; a transaction may hold two such files (a replacement
+    // and the original it backs up) plus 256 MiB for everything else. They bound memory for actual files; nothing is
+    // allocated to them. Callers that pre-check (ProjectSceneMigration) use these same values.
+    inline constexpr std::size_t MaximumFileBytes = std::size_t{1} << 30;
+    inline constexpr std::size_t MaximumTargets = 4096;
+    inline constexpr std::size_t MaximumTransactionBytes = 2 * MaximumFileBytes + 256 * 1024 * 1024;
+
     struct Replacement
     {
         std::filesystem::path relativePath;

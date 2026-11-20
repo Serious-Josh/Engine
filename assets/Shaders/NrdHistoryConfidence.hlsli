@@ -102,10 +102,15 @@ cbuffer RtxdiConstants : register(b2)
 RaytracingAccelerationStructure scene : register(t0);
 SamplerState environmentSampler : register(s1);
 
+// One probe record, 32 bytes (NrdHistoryConfidencePass.cpp RecordBytes):
+//   word 0-2  position (float3)        word 3  packed geometric normal
+//   word 4    flags (VALID, VISIBLE)   word 5  quantized uv (x | y << 16)
+//   word 6    contribution (float)     word 7  RTXDI light index (32-bit)
+// M3.5: the light index moved from the low 16 bits of the flags word into word 7, which was always written as 0, so every
+// RTXDI index (the table lights plus the sun and HDRI, over 65,535 at the 65,536-object scene bound) is stored exactly.
 static const uint NRD_CONFIDENCE_RECORD_BYTES = 32u;
 static const uint NRD_CONFIDENCE_VALID = 0x80000000u;
 static const uint NRD_CONFIDENCE_VISIBLE = 0x40000000u;
-static const uint NRD_CONFIDENCE_LIGHT_MASK = 0xFFFFu;
 static const uint NRD_CONFIDENCE_CANDIDATES = 4u;
 
 // R.9B.2 probe state of the evaluated (previous) record, for signal view 6 only. Diagnostic: the records, signal and
@@ -312,7 +317,7 @@ void CSProbe(uint3 dispatchThreadID : SV_DispatchThreadID)
             // A record without a surface stays (0, 0, 0, 0): w = 0 (no geometry for the filter either).
             recordGeometry = float4(position, NrdConfidenceGeometryNormal(record0.w));
 
-            uint lightIndex = record1.x & NRD_CONFIDENCE_LIGHT_MASK;
+            uint lightIndex = record1.w;
             float2 uv = float2(record1.y & 0xFFFFu, record1.y >> 16u) / 65535.0f;
             float contribution = asfloat(record1.z);
             float previousVisibility = (record1.x & NRD_CONFIDENCE_VISIBLE) != 0u ? 1.0f : 0.0f;
@@ -426,9 +431,9 @@ void CSProbe(uint3 dispatchThreadID : SV_DispatchThreadID)
     }
 
     bool visible = NrdConfidenceVisible(position, geometricNormal, chosenSample.direction, chosenSample.distance);
-    uint flags = NRD_CONFIDENCE_VALID | (visible ? NRD_CONFIDENCE_VISIBLE : 0u) | chosenLight;
+    uint flags = NRD_CONFIDENCE_VALID | (visible ? NRD_CONFIDENCE_VISIBLE : 0u);
     records.Store4(address, uint4(asuint(position), NrdConfidencePackNormal(geometricNormal)));
-    records.Store4(address + 16u, uint4(flags, chosenUv, asuint(chosenContribution), 0u));
+    records.Store4(address + 16u, uint4(flags, chosenUv, asuint(chosenContribution), chosenLight));
 }
 
 #endif

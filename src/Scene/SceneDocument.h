@@ -23,6 +23,15 @@
 #include <map>
 #include <optional>
 
+// M3.5: the most objects one scene (or one composite World, its level nodes included) may hold. Every object counts: Lights,
+// meshes, Cameras and empties alike. Admission (document validation, the hierarchy, composite Worlds, cooked scenes and the
+// renderer's membership candidates) enforces exactly this bound; storage is sized to the actual count, never to the bound.
+inline constexpr std::size_t MaximumSceneObjects = 65536;
+
+// M3.5: the largest scene source file (JSON) any reader admits: authoring loads, the document cache, the project scan, asset
+// transactions and the cooker. A bound on untrusted input, checked against the file size before reading; nothing allocates it.
+inline constexpr std::uintmax_t MaximumSceneSourceBytes = 1ull << 30;
+
 struct SceneCameraDocument
 {
     Vector3 position{0.0f, 0.0f, -5.0f};

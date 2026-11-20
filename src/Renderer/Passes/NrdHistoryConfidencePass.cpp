@@ -10,7 +10,8 @@
 
 namespace
 {
-    // NrdHistoryConfidence.hlsli NRD_CONFIDENCE_RECORD_BYTES.
+    // NrdHistoryConfidence.hlsli NRD_CONFIDENCE_RECORD_BYTES: two uint4 words per probe, laid out there (M3.5: word 7 holds
+    // the full 32-bit RTXDI light index). Only shaders read or write records; the CPU sizes the buffer.
     constexpr std::uint64_t RecordBytes = 32;
 
     Shader* LoadComputeShader(ShaderLibrary& shaderLibrary, const char* path, const char* entryPoint)

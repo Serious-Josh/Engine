@@ -48,7 +48,8 @@ private:
 
     bool m_hasDocument = false;
     bool m_dirty = false;
-    // Incremented by every EditDocument call (the only writable access to the document): the content half of the persistent
-    // validated object index's invalidation (FileSceneRuntime, revised S0.3).
+    // Incremented by every EditDocument call (the only writable access to the document) and, since M3.5, by every document
+    // replacement (New, Open, LoadDocument, Save As): the content half of the persistent validated object index's and the
+    // lighting snapshot cache's invalidation (FileSceneRuntime, revised S0.3).
     std::uint64_t m_editRevision = 0;
 };

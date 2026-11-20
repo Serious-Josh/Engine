@@ -42,8 +42,10 @@ struct ResolvedSceneLight
 // Other directionals retain the existing direct table-light behavior.
 struct SceneLightingSnapshot
 {
-    // Renderer GPU table capacity; the dedicated directional owner uses a separate sun slot.
-    static constexpr std::uint32_t MaximumAdditionalLights = MaximumSceneLights;
+    // M3.5: identifies this snapshot's content. Equal non-zero revisions mean identical snapshots (FileSceneRuntime::
+    // CaptureSceneLightingShared assigns a new process-unique value whenever it rebuilds), so consumers may reuse what they
+    // derived from it. 0 means unknown: always rebuild (hand-built and per-frame snapshots).
+    std::uint64_t revision = 0;
 
     // Explicit procedural-demo/diagnostic compatibility only. Captured file scenes always
     // leave this true; their Scene has no legacy storage regardless of this flag.
@@ -88,7 +90,12 @@ Matrix4 BuildDirectionalLightArrowsModel(const Matrix4& rigidWorld);
 // Builds a whole snapshot from a validated document. worldOf returns an object's accepted world,
 // or nothing when the object is not part of the committed runtime scene. A Light whose world is
 // missing or invalid is skipped (named in rejectedNames) and the remaining Lights still publish.
-// Fails without touching the output when the document exceeds the GPU light table.
+// Many-light M3: there is no light-count limit, so this currently always succeeds; the result and `error` remain for the
+// callers' existing failure handling.
 bool BuildSceneLightingSnapshot(const SceneDocument& document,
     const std::function<std::optional<Matrix4>(const SceneObjectDocument&)>& worldOf,
     SceneLightingSnapshot& snapshot, std::string* error = nullptr);
+
+// M3.5: whether two snapshots hold the same lighting, bit for bit, ignoring their revisions (the cached-snapshot
+// verification compares a reused snapshot with a fresh capture).
+bool SameSceneLightingContent(const SceneLightingSnapshot& left, const SceneLightingSnapshot& right);

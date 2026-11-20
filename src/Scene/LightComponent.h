@@ -85,10 +85,6 @@ struct LightComponent
     }
 };
 
-// GPU table capacity. A scene may also use the existing dedicated sun slot: at most
-// 65 components with a Directional, otherwise at most 64 (enabled or disabled).
-inline constexpr std::uint32_t MaximumSceneLights = 64;
-
 // Defaults used by Hierarchy creation for each type. Add Component uses LightComponent{} (Point).
 inline LightComponent DefaultLightComponent(LightType type)
 {

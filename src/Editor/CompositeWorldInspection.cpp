@@ -1,5 +1,5 @@
 // W4: read-only inspection of a World opened as a composite preview: the World, its Local Levels and placements, the selected
-// entity's owning level, the frame-wide environment and sun (approved decisions A1/B1) and the shared light capacity. Nothing here
+// entity's owning level, the frame-wide environment and sun (approved decisions A1/B1) and the shared light count. Nothing here
 // edits; World editing arrives in W5.
 #include "Editor/Editor.h"
 
@@ -80,7 +80,7 @@ void Editor::DrawCompositeWorldInspection(FileBackedDemoScene& owner)
             composite->suppressedDirectionalLights.size());
     }
 
-    ImGui::Text("Light components: %zu of %zu (shared by all levels)", composite->lightCount, composite->lightCapacity);
+    ImGui::Text("Light components: %zu (shared by all levels)", composite->lightCount);
 
     if(!composite->unverifiedScenes.empty())
     {

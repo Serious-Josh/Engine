@@ -3253,6 +3253,14 @@ bool Renderer::Initialize(
         return false;
     }
 
+    // Many-light M3: the one-record scene light buffer exists from the start, so a frame whose table cannot be published
+    // always has a valid empty binding to fall back to (released in Shutdown, after the GPU drain).
+    if(!m_sceneLightBuffer.Initialize(device, m_resourceDescriptorHeap))
+    {
+        Log::Error("Failed to init the scene light buffer.");
+        return false;
+    }
+
     // M0c.5 Stage 5.1: the Project Browser needs only the core above, ImGui and the swap chain; its project's selection
     // initializes the scene renderer (EnsureSceneRenderer). Every other start initializes it here, before the UI.
     startupPhase.reset();
@@ -10701,6 +10709,129 @@ bool Renderer::RecordAmbientOcclusionPasses(
     return true;
 }
 
+bool Renderer::IsPathTraceWorkloadSafe(std::uint32_t tableLights, const PathTraceReferenceSettings& settings,
+    std::string& failure)
+{
+    // Exhaustive next-event estimation shades every table Light at every path vertex (M4 replaces it with sampling). Cost
+    // model, calibrated on M3's production timings (1080p, one sample per frame, depth 3: 92.5 ms of indirect light at 1,024
+    // Lights over two indirect vertices): about 0.022 ms per Light, per megapixel, per sample and vertex. Every vertex is
+    // counted, which overestimates the ReSTIR DI mode (its first vertex samples). This is an estimate, not a guarantee: it
+    // ignores geometry, ranges and occlusion, and other workloads can still be slow.
+    constexpr double MillisecondsPerLightMegapixelVertex = 0.022;
+    // Far below the 2 s Windows GPU timeout; guarded above the first, released below the second (no flicker at the edge).
+    constexpr double GuardMilliseconds = 250.0;
+    constexpr double ReleaseMilliseconds = 200.0;
+
+    const double megapixels = static_cast<double>(m_sceneWidth) * static_cast<double>(m_sceneHeight) / 1.0e6;
+    const double vertices = static_cast<double>((std::max)(settings.maxPathDepth, 1u));
+    const double estimate = static_cast<double>(tableLights) * megapixels * static_cast<double>(settings.samplesPerFrame) *
+        vertices * MillisecondsPerLightMegapixelVertex;
+    const bool guarded = m_pathTraceWorkloadGuarded ? estimate >= ReleaseMilliseconds : estimate > GuardMilliseconds;
+
+    if(guarded != m_pathTraceWorkloadGuarded)
+    {
+        m_pathTraceWorkloadGuarded = guarded;
+        ++m_pathTraceWorkloadGuardChanges;
+
+        if(guarded)
+        {
+            Log::Error("Path Tracing paused for this workload, rendering Legacy: " + std::to_string(tableLights) +
+                " Lights at " + std::to_string(m_sceneWidth) + "x" + std::to_string(m_sceneHeight) + ", " +
+                std::to_string(settings.samplesPerFrame) + " samples per frame and depth " +
+                std::to_string(settings.maxPathDepth) + " are estimated at " + std::to_string(static_cast<int>(estimate)) +
+                " ms per frame of exhaustive light sampling (guard " + std::to_string(static_cast<int>(GuardMilliseconds)) +
+                " ms). Every Light is kept; Path Tracing resumes when the estimate falls below " +
+                std::to_string(static_cast<int>(ReleaseMilliseconds)) + " ms.");
+        }
+        else
+        {
+            Log::Info("Path Tracing workload is within its guard again (" + std::to_string(tableLights) + " Lights, estimated " +
+                std::to_string(static_cast<int>(estimate)) + " ms); Path Tracing resumes.");
+        }
+    }
+
+    m_pathTraceWorkloadEstimateMilliseconds = estimate;
+
+    if(guarded)
+    {
+        failure = "Path Tracing paused: the estimated exhaustive light work (" + std::to_string(static_cast<int>(estimate)) +
+            " ms per frame for " + std::to_string(tableLights) + " Lights) could approach the GPU timeout; rendering Legacy.";
+        return false;
+    }
+
+    return true;
+}
+
+std::shared_ptr<const FrameLighting> Renderer::AcquireFrameLighting(const DirectionalLight& legacySun,
+    const SceneLightingSnapshot* snapshot, const SceneLightingSettings& proceduralSettings, std::uint64_t& revision)
+{
+    const auto sameSun = [](const DirectionalLight& left, const DirectionalLight& right)
+    {
+        return std::memcmp(&left.direction, &right.direction, sizeof(Vector3)) == 0 &&
+            std::memcmp(&left.color, &right.color, sizeof(Vector3)) == 0 &&
+            std::memcmp(&left.intensity, &right.intensity, sizeof(float)) == 0 &&
+            std::memcmp(&left.angularRadius, &right.angularRadius, sizeof(float)) == 0;
+    };
+
+    revision = snapshot ? snapshot->revision : 0;
+    const bool reusable = revision != 0 && m_frameLightingCache && m_frameLightingCacheRevision == revision &&
+        sameSun(m_frameLightingCacheSun, legacySun) && m_frameLightingCacheSettings == proceduralSettings;
+
+    if(reusable)
+    {
+#ifndef NDEBUG
+        // M3.5 diagnostic (ENGINE_DIAG_LIGHT_PUBLICATION_VERIFY): a reused frame lighting must equal a fresh build.
+        static const bool verify = std::getenv("ENGINE_DIAG_LIGHT_PUBLICATION_VERIFY") != nullptr;
+
+        if(verify)
+        {
+            FrameLighting fresh;
+            const bool same = BuildFrameLighting(legacySun, snapshot, fresh, nullptr, &proceduralSettings) &&
+                fresh.table == m_frameLightingCache->table && fresh.tableLightIDs == m_frameLightingCache->tableLightIDs &&
+                sameSun(fresh.sun, m_frameLightingCache->sun) && fresh.sunObjectID == m_frameLightingCache->sunObjectID;
+            ++m_frameLightingVerifications;
+
+            if(!same)
+            {
+                ++m_frameLightingMismatches;
+                Log::Error("Light publication verification: the reused frame lighting (revision " + std::to_string(revision) +
+                    ") differs from a fresh build.");
+            }
+        }
+#endif
+
+        return m_frameLightingCache;
+    }
+
+    auto built = std::make_shared<FrameLighting>();
+    std::string lightingError;
+
+    if(!BuildFrameLighting(legacySun, snapshot, *built, &lightingError, &proceduralSettings))
+    {
+        // Nothing unconverted may reach the GPU: a rejected frame is lit by nothing.
+        Log::Error("Scene lighting rejected for this frame: " + lightingError);
+        *built = FrameLighting{};
+        built->sun = legacySun;
+        built->sun.intensity = 0.0f;
+        built->sun.color = {0.0f, 0.0f, 0.0f};
+        revision = 0;
+    }
+
+    if(revision != 0)
+    {
+        m_frameLightingCache = built;
+        m_frameLightingCacheRevision = revision;
+        m_frameLightingCacheSun = legacySun;
+        m_frameLightingCacheSettings = proceduralSettings;
+    }
+    else
+    {
+        m_frameLightingCache.reset();
+    }
+
+    return built;
+}
+
 bool Renderer::RecordRenderFrame(
     const Scene& scene,
     const RendererOptions& options)
@@ -11242,9 +11373,6 @@ bool Renderer::RecordRenderFrame(
 
     // One coherent lighting source per frame: the legacy sun or the component shadow owner, never
     // both, plus the unshadowed Light table. A rejected snapshot publishes no component Lights.
-    FrameLighting frameLighting;
-    std::string lightingError;
-
     DirectionalLight legacySun;
     if(scene.UsesObjectLighting())
     {
@@ -11253,20 +11381,17 @@ bool Renderer::RecordRenderFrame(
         legacySun.angularRadius = 0.0f;
     }
     else legacySun = scene.GetDirectionalLight();
-    if(!BuildFrameLighting(legacySun, options.lighting ? &*options.lighting : nullptr,
-        frameLighting, &lightingError, &scene.GetLightingSettings()))
-    {
-        // Nothing unconverted may reach the GPU: a rejected frame is lit by nothing.
-        Log::Error("Scene lighting rejected for this frame: " + lightingError);
-        frameLighting = FrameLighting{};
-        frameLighting.sun = legacySun;
-        frameLighting.sun.intensity = 0.0f;
-        frameLighting.sun.color = {0.0f, 0.0f, 0.0f};
-    }
 
-    const DirectionalLight& light = frameLighting.sun;
-    m_recordedSun = frameLighting.sun;
-    m_recordedAdditionalLightCount = frameLighting.table.lightCount;
+    // M3.5: rebuilt only when the snapshot revision, sun or settings change (AcquireFrameLighting). activeLighting is the
+    // frame's lighting until the publication decision below; `lightingRevision` (0 = unknown) identifies its table content.
+    std::uint64_t lightingRevision = 0;
+    const std::shared_ptr<const FrameLighting> builtLighting = AcquireFrameLighting(legacySun, options.GetLighting(),
+        scene.GetLightingSettings(), lightingRevision);
+    const FrameLighting* activeLighting = builtLighting.get();
+
+    const DirectionalLight& light = activeLighting->sun;
+    m_recordedSun = activeLighting->sun;
+    m_recordedAdditionalLightCount = activeLighting->table.lightCount;
 
     // A new view identity is a camera cut. Deferred frames return before recording, so a pending
     // cut is consumed only here, with the existing stateful history policy of this recording.
@@ -11331,9 +11456,22 @@ bool Renderer::RecordRenderFrame(
                 m_pathTraceReferencePass.EnsurePrimaryPipeline(m_graphicsDevice, m_shaderLibrary, primary,
                     referenceFailure));
         };
-        const bool runnable = pathTraceSettingsValid &&
+        bool runnable = pathTraceSettingsValid &&
             ((referenceRequested && referenceRunnable()) || (rasterPrimaryRequested && rasterPrimaryAvailable) ||
             (restirDIRequested && restirDIAvailable));
+
+        // M3.5: a path-traced mode whose estimated exhaustive light work could approach the GPU timeout is not runnable this
+        // frame: the recording renders Legacy and reports why, the request is kept, and it resumes once the workload is safe.
+        std::string workloadFailure;
+        const bool workloadSafe = mode == RendererLightingMode::Legacy ||
+            IsPathTraceWorkloadSafe(activeLighting->table.lightCount, options.pathTraceReference, workloadFailure);
+
+        if(runnable && !workloadSafe)
+        {
+            runnable = false;
+            failure = workloadFailure;
+            return runnable;
+        }
 
         if(runnable || mode == RendererLightingMode::Legacy)
         {
@@ -11866,14 +12004,90 @@ bool Renderer::RecordRenderFrame(
     // Many-light M2: the table goes to the scene light buffer (copied in this command list, before any consumer), and
     // every consumer binds the same small constants: the light count and the buffer's SRV.
     SceneLightConstants sceneLightConstants{};
+    std::string lightPublicationError;
+    const SceneLightBuffer::RecordResult lightBufferResult = m_sceneLightBuffer.Record(m_graphicsDevice.GetDevice(),
+        m_resourceDescriptorHeap, commandList, m_uploadBuffer, activeLighting->table,
+        m_commandContext.GetLastSubmissionFenceValue(), m_commandContext.GetCompletedFenceValue(), sceneLightConstants,
+        &lightPublicationError, lightingRevision);
 
-    if(!m_sceneLightBuffer.Record(m_graphicsDevice.GetDevice(), m_resourceDescriptorHeap, commandList, m_uploadBuffer,
-        frameLighting.table, m_commandContext.GetLastSubmissionFenceValue(), m_commandContext.GetCompletedFenceValue(),
-        sceneLightConstants))
+    if(lightBufferResult == SceneLightBuffer::RecordResult::Failed)
     {
-        Log::Error("Failed to record the scene light buffer.");
+        Log::Error("Failed to record the scene light buffer: " + lightPublicationError);
         return false;
     }
+
+    // Many-light M3: RTXDI's light data is grown here too, before any consumer reads the frame's lights. It holds this
+    // frame's lights (the table plus at most the sun and HDRI) and, for history, the committed previous frame's.
+    bool tablePublished = lightBufferResult == SceneLightBuffer::RecordResult::Published;
+    bool rtxdiHistoryDropped = false;
+
+    if(tablePublished && m_rtxdiResources.IsInitialized())
+    {
+        // The steady state needs room for this frame's lights and a history at least as large, whether or not the previous
+        // frame recorded RTXDI (frames that do not, such as Legacy or preparation frames, commit nothing). Reserving for it
+        // keeps the decision below stable from frame to frame.
+        const std::size_t currentLights = std::size_t{activeLighting->table.lightCount} + 2;
+        const std::size_t previousLights = (std::max)(m_rtxdiResources.GetCommittedLightCount(), currentLights);
+        const auto reserve = [&](std::size_t previous)
+        {
+            return m_rtxdiResources.ReserveLightData(m_graphicsDevice.GetDevice(), currentLights, previous,
+                m_commandContext.GetLastSubmissionFenceValue(), m_commandContext.GetCompletedFenceValue(),
+                lightPublicationError);
+        };
+
+        if(!reserve(previousLights))
+        {
+            // Without history the light data holds only this frame's lights: the table still renders, without temporal
+            // reuse, rather than alternating between frames with and without lights. Only if even that fails does the
+            // frame go without table lights.
+            const std::string historyError = lightPublicationError;
+            rtxdiHistoryDropped = reserve(0);
+            tablePublished = rtxdiHistoryDropped;
+            lightPublicationError = historyError;
+        }
+    }
+
+    // A table that either buffer cannot hold is not published at all: the whole frame renders without table lights. Every
+    // later consumer (history keys, RTXDI, path tracing, GI, mist, NRD) reads frameLighting, which then refers to a sun-only
+    // copy (the cached lighting itself is shared and never modified), so they stay consistent; the scene light buffer's copy,
+    // if recorded, is never read at count 0. The next frame retries.
+    std::optional<FrameLighting> unpublishedLighting;
+
+    if(!tablePublished)
+    {
+        unpublishedLighting.emplace();
+        unpublishedLighting->sun = activeLighting->sun;
+        unpublishedLighting->sunObjectID = activeLighting->sunObjectID;
+        activeLighting = &*unpublishedLighting;
+        lightingRevision = 0;
+        m_recordedAdditionalLightCount = 0;
+        sceneLightConstants.lightCount = 0;
+    }
+
+    // Reservoirs refer to the previous frame's lights. Without the table, or without room for the previous lights, they are
+    // dropped; RTXDI's light data then needs only this frame's lights, which the reservation above (or, without the table,
+    // its initial allocation of the sun and HDRI) holds.
+    if(!tablePublished || rtxdiHistoryDropped)
+    {
+        m_rtxdiResources.InvalidateHistory();
+
+        if(!m_sceneLightPublicationFailing)
+        {
+            Log::Error("Scene lights could not be published in full (" + lightPublicationError + "); " +
+                (tablePublished ? "rendering without RTXDI temporal reuse" : "rendering without scene lights") +
+                " until they can be.");
+            m_sceneLightPublicationFailing = true;
+            ++m_sceneLightPublicationFailureEpisodes;
+        }
+    }
+    else if(m_sceneLightPublicationFailing)
+    {
+        Log::Info("Scene lights published again (" + std::to_string(activeLighting->table.lightCount) + " lights).");
+        m_sceneLightPublicationFailing = false;
+    }
+
+    // Every later consumer reads the frame's final lighting.
+    const FrameLighting& frameLighting = *activeLighting;
 
     const D3D12_GPU_VIRTUAL_ADDRESS sceneLightConstantsAddress = m_uploadBuffer.Allocate(
         &sceneLightConstants, sizeof(SceneLightConstants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
@@ -11886,7 +12100,9 @@ bool Renderer::RecordRenderFrame(
 
     // These history resets/writes intentionally precede later uploads and recording failures.
     const Vector3 currentLightDirection = light.direction.Normalized();
-    bool giLightingChanged = m_hasPreviousGILocalLights &&
+    const bool sameGILightingRevision = m_hasPreviousGILocalLights && lightingRevision != 0 &&
+        lightingRevision == m_previousGILightingRevision;
+    bool giLightingChanged = m_hasPreviousGILocalLights && !sameGILightingRevision &&
         !SameLocalLightInputs(m_previousGILocalLights, frameLighting.table);
 
     if(giLightingChanged)
@@ -11894,7 +12110,12 @@ bool Renderer::RecordRenderFrame(
         m_giSignedCorrectionPass.ResetHistory();
     }
 
-    m_previousGILocalLights = frameLighting.table;
+    if(!sameGILightingRevision)
+    {
+        m_previousGILocalLights = frameLighting.table;
+    }
+
+    m_previousGILightingRevision = lightingRevision;
     m_hasPreviousGILocalLights = true;
 
     if (m_hasPreviousShadowLightDirection)
@@ -12630,7 +12851,7 @@ bool Renderer::RecordRenderFrame(
     // HDR values are not comparable with the adapted history.
     {
         const SceneLightingSettings& lightingSettings =
-            options.lighting ? options.lighting->lightingSettings : scene.GetLightingSettings();
+            options.GetLighting() ? options.GetLighting()->lightingSettings : scene.GetLightingSettings();
         AutoExposurePass::Settings exposure;
         exposure.exposure = frameExposure;
         exposure.referenceEV100 = lightingSettings.referenceEV100;
@@ -15328,9 +15549,9 @@ D3D12_GPU_VIRTUAL_ADDRESS Renderer::UploadSceneLightsForTesting(const GPULight* 
     table.lights.assign(lights, lights + count);
     SceneLightConstants constants{};
 
-    if(!m_sceneLightBuffer.Record(m_graphicsDevice.GetDevice(), m_resourceDescriptorHeap, m_commandContext.GetCommandList(),
+    if(m_sceneLightBuffer.Record(m_graphicsDevice.GetDevice(), m_resourceDescriptorHeap, m_commandContext.GetCommandList(),
         m_uploadBuffer, table, m_commandContext.GetLastSubmissionFenceValue(), m_commandContext.GetCompletedFenceValue(),
-        constants))
+        constants) != SceneLightBuffer::RecordResult::Published)
     {
         return 0;
     }

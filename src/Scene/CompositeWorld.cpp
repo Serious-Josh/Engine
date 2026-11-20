@@ -35,14 +35,6 @@ namespace
         return count;
     }
 
-    bool HasDirectionalLight(const SceneDocument& document)
-    {
-        return std::any_of(document.objects.begin(), document.objects.end(), [](const SceneObjectDocument& object)
-        {
-            return object.light && object.light->type == LightType::Directional;
-        });
-    }
-
     // Appends one level's entities with namespaced ids. Parents must resolve inside the same document: a parent id that is not one
     // of the level's own entities is an unsupported cross-level reference (architecture §4.2). Document validation already
     // requires parents in the same document; this keeps the composite safe, with a specific message, if that rule ever loosens.
@@ -206,30 +198,13 @@ bool BuildCompositeWorld(const CompositeWorldSource& world, const std::vector<Co
         return Fail(error, "A Local Level that World " + Describe(world) + " does not list was supplied.");
     }
 
-    // 2. Light capacity: the composite is one renderer scene, so every level's Light components share it. The rule is the scene
-    // rule (SceneDocument validation): the GPU table holds 64 enabled non-sun Lights and the sun has its own slot, so a scene may
-    // hold 64 Light components, or 65 when one of them is a Directional Light. Disabled Lights count; they never reach the table,
-    // which is why these bounds can never overflow it.
+    // 2. Lights: the composite is one renderer scene, so every level's Light components are counted together (informational;
+    // many-light M3 removed the light-count limit, and Lights are bounded only as objects, below).
     std::size_t totalLights = CountLights(world.document);
-    bool anyDirectional = HasDirectionalLight(world.document);
-    std::string perLevel = "World " + Describe(world) + ": " + std::to_string(totalLights);
 
     for(const auto& member : world.document.members)
     {
-        const auto& local = *byID.at(member.level);
-        const std::size_t lights = CountLights(local.document);
-        totalLights += lights;
-        anyDirectional = anyDirectional || HasDirectionalLight(local.document);
-        perLevel += "; " + Describe(local) + ": " + std::to_string(lights);
-    }
-
-    const std::size_t capacity = MaximumSceneLights + (anyDirectional ? 1u : 0u);
-
-    if(totalLights > capacity)
-    {
-        return Fail(error, "World " + Describe(world) + " has " + std::to_string(totalLights) + " Light components across its levels; one " +
-            "renderer scene holds at most " + std::to_string(MaximumSceneLights) + " plus one sun slot when a Directional Light exists (" +
-            std::to_string(capacity) + " here). Per level: " + perLevel + ". Remove Lights or split the World.");
+        totalLights += CountLights(byID.at(member.level)->document);
     }
 
     // 2b. Object capacity: a composite always has a hierarchy (its level nodes), and a hierarchical scene holds at most
@@ -262,7 +237,6 @@ bool BuildCompositeWorld(const CompositeWorldSource& world, const std::vector<Co
     candidate.worldSource = world;
     candidate.worldEnvironment = ResolveSceneEnvironment(world.document, nullptr);
     candidate.lightCount = totalLights;
-    candidate.lightCapacity = capacity;
 
     SceneDocument& document = candidate.document;
     document = world.document;

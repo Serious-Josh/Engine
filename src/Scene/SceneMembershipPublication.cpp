@@ -9,8 +9,9 @@
 #include <stdexcept>
 
 // Every scene the Engine admits must fit one renderer membership candidate; otherwise a valid scene could load and render nothing.
-static_assert(RayTracingSceneResources::MaxCandidateObjects >= SceneHierarchy::Policy{}.maxObjects,
-    "Renderer membership candidates must admit the largest permitted scene");
+static_assert(RayTracingSceneResources::MaxCandidateObjects == MaximumSceneObjects &&
+    SceneHierarchy::Policy{}.maxObjects == MaximumSceneObjects,
+    "Renderer membership candidates must admit exactly the largest permitted scene");
 
 struct SceneMembershipPublication::Prepared
 {

@@ -126,18 +126,8 @@ SceneObjectDocument PrepareLightObject(const SceneDocument& document, LightType 
         throw std::invalid_argument("Unsupported Light type for creation.");
     }
 
-    const auto existingLights = std::count_if(document.objects.begin(), document.objects.end(),
-        [](const SceneObjectDocument& existing) { return existing.light.has_value(); });
-
-    // Checked before any identity is allocated; commit revalidates the whole scene as well.
-    const bool hasDirectional = type == LightType::Directional || std::any_of(document.objects.begin(), document.objects.end(),
-        [](const auto& object) { return object.light && object.light->type == LightType::Directional; });
-    if(existingLights >= static_cast<std::ptrdiff_t>(MaximumSceneLights + (hasDirectional ? 1u : 0u)))
-    {
-        throw std::runtime_error("The scene already has the maximum of " + std::to_string(MaximumSceneLights + (hasDirectional ? 1u : 0u)) +
-            " Light components for this light set.");
-    }
-
+    // No light-count check: a scene holds as many Lights as objects. Commit still revalidates the whole scene, including the
+    // object bound.
     SceneObjectDocument object;
     object.name = std::string(typeName) + " Light";
     PlaceAtEditorView(object, viewPosition, viewTarget, "Light");
