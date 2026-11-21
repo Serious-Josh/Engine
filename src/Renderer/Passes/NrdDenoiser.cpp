@@ -152,6 +152,7 @@ void NrdDenoiser::Shutdown()
     // Destroy waits for the GPU (autoWaitForIdle) before the outputs it may still be writing are released. An externally
     // synchronized instance (ER.1 Phase 3.1) does not wait: its caller proved that no submitted work references it.
     m_integration.Destroy();
+    m_poolStates.Reset({});
     ReleaseOutputs();
 
     for (Denoiser& denoiser : m_denoisers)
@@ -195,6 +196,7 @@ bool NrdDenoiser::Recreate(
     // caller drained it instead: Renderer resizes only after WaitForGPU). Callers must also discard any
     // unsubmitted recording that referenced the old instance. The following SDK Recreate starts from empty state.
     m_integration.Destroy();
+    m_poolStates.Reset({});
     ReleaseOutputs();
     m_width = 0;
     m_height = 0;
@@ -247,6 +249,11 @@ bool NrdDenoiser::Recreate(
         Shutdown();
         return false;
     }
+
+    // R.1: the new pool's initial states (no recording has used it).
+    std::vector<nri::AccessLayoutStage> poolStates(m_integration.GetPoolStateNum());
+    m_integration.GetPoolStates(poolStates.data());
+    m_poolStates.Reset(std::move(poolStates));
 
     // Specular before diffuse, per denoiser: the descriptor order the reflection and GI instances always had.
     for (size_t index = 0; index < m_description.denoisers.size(); ++index)
@@ -474,8 +481,17 @@ bool NrdDenoiser::Denoise(
 
     commandBuffer.d3d12CommandList = commandList;
 
+    // R.1: the pool starts from the tracked states (the last submitted ones after a discarded recording), and the states
+    // Denoise leaves stay provisional until this recording is submitted.
+    const std::vector<nri::AccessLayoutStage>& trackedPool = m_poolStates.Get();
+    m_integration.SetPoolStates(trackedPool.data(), static_cast<uint32_t>(trackedPool.size()));
+
     // NRD binds its own descriptor heap and root signature; the caller restores Engine's heap afterwards.
     m_integration.DenoiseD3D12(&identifier, 1, commandBuffer, snapshot);
+
+    std::vector<nri::AccessLayoutStage>& poolStates = m_poolStates.Change(commandList);
+    poolStates.resize(m_integration.GetPoolStateNum());
+    m_integration.GetPoolStates(poolStates.data());
     return true;
 }
 

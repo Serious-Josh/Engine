@@ -3,6 +3,7 @@
 #include "Debug/CpuFrameTiming.h"
 #include "Debug/StreamingTelemetry.h"
 #include "Core/Log.h"
+#include "ResourceStateTransaction.h"
 #ifdef _DEBUG
 #include "GraphicsDevice.h"
 #endif
@@ -339,7 +340,14 @@ bool CommandContext::Begin(unsigned int frameIndex)
 
     result = m_commandList->Reset(commandAllocator, nullptr);
 
-    return SUCCEEDED(result);
+    if (FAILED(result))
+    {
+        return false;
+    }
+
+    // R.1: the tracked resource states this recording changes stay provisional until Execute submits it.
+    ResourceStateTransaction::BeginRecording(m_commandList, m_rayTracingCommandList);
+    return true;
 }
 
 bool CommandContext::End()
@@ -355,7 +363,8 @@ bool CommandContext::AbortRecording()
     }
 
     // Close the command list without submitting it.
-    // The next Begin() will reset it.
+    // The next Begin() will reset it. R.1: its barriers never run, so the tracked states return to the submitted ones.
+    ResourceStateTransaction::DiscardRecording();
     return SUCCEEDED(m_commandList->Close());
 }
 
@@ -389,6 +398,8 @@ bool CommandContext::Execute(unsigned int frameIndex)
     }
 
     m_commandQueue->ExecuteCommandLists(1, commandLists);
+    // R.1: submitted (whether or not the fence signal below succeeds): its state changes are authoritative.
+    ResourceStateTransaction::CommitRecording();
 
     if (m_executeCpuTimingEnabled)
     {
@@ -851,6 +862,9 @@ bool CommandContext::DiscardCommandsAfterGPUDrain()
     {
         return false;
     }
+
+    // R.1: an open recording on the old list is never submitted.
+    ResourceStateTransaction::DiscardRecording();
 
     // Use a fresh allocator: the old list might still be open or poisoned by
     // a failed Close/Reset. Nothing is replaced until the new closed list is ready.

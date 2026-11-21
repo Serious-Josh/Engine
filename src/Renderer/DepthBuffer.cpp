@@ -54,7 +54,7 @@ bool DepthBuffer::Initialize(
 
     MemoryRegistry::TrackResource(m_resource);
 
-    m_state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+    m_state.Reset(D3D12_RESOURCE_STATE_DEPTH_WRITE);
 
     m_dsvIndex = dsvHeap.Allocate();
 
@@ -117,7 +117,7 @@ void DepthBuffer::Transition(
     ID3D12GraphicsCommandList* commandList,
     D3D12_RESOURCE_STATES newState)
 {
-    if (!m_resource || !commandList || m_state == newState)
+    if (!m_resource || !commandList || m_state.Get() == newState)
     {
         return;
     }
@@ -127,12 +127,12 @@ void DepthBuffer::Transition(
     barrier.Transition.pResource = m_resource;
 
     barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    barrier.Transition.StateBefore = m_state;
+    barrier.Transition.StateBefore = m_state.Get();
     barrier.Transition.StateAfter = newState;
 
     commandList->ResourceBarrier(1, &barrier);
 
-    m_state = newState;
+    m_state.Change(commandList, m_resource) = newState;
 }
 
 void DepthBuffer::Shutdown()
@@ -170,7 +170,7 @@ void DepthBuffer::Shutdown()
     m_width = 0;
     m_height = 0;
 
-    m_state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+    m_state.Reset(D3D12_RESOURCE_STATE_DEPTH_WRITE);
 }
 
 ID3D12Resource* DepthBuffer::GetResource() const

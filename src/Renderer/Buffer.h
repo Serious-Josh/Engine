@@ -4,6 +4,8 @@
 #include <cstdint>
 #include <d3d12.h>
 
+#include "ResourceStateTransaction.h"
+
 class DescriptorHeap;
 class ResourceUploader;
 
@@ -83,19 +85,21 @@ class Buffer
 
     D3D12_RESOURCE_STATES GetResourceState() const;
 
-    // CPU tracking only. Use only after discarding unsubmitted barriers.
+    // CPU tracking only. Use only after discarding unsubmitted barriers. (R.1: discarded recordings also restore tracked
+    // states automatically; this explicit restore is authoritative and ends the buffer's transaction.)
     void RestoreStateAfterAbort(D3D12_RESOURCE_STATES state)
     {
-        m_resourceState = state;
+        m_resourceState.Reset(state);
     }
 
     void Transition(
         ID3D12GraphicsCommandList* commandList,
         D3D12_RESOURCE_STATES newState);
 
-    // The transition to `newState` as a barrier for the caller to submit (in the same command list, before any use in the new state),
+    // The transition to `newState` as a barrier for the caller to record in `commandList` (before any use in the new state),
     // tracked as done; false, with `barrier` untouched, when the buffer is already there.
     bool PrepareTransition(
+        ID3D12GraphicsCommandList* commandList,
         D3D12_RESOURCE_STATES newState,
         D3D12_RESOURCE_BARRIER& barrier);
 
@@ -113,5 +117,5 @@ class Buffer
     unsigned int m_descriptorIndex = UINT_MAX;
     unsigned int m_uavDescriptorIndex = UINT_MAX;
 
-    D3D12_RESOURCE_STATES m_resourceState = D3D12_RESOURCE_STATE_COMMON;
+    TransactionalResourceState<D3D12_RESOURCE_STATES> m_resourceState{D3D12_RESOURCE_STATE_COMMON};
 };

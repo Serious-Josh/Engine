@@ -7,15 +7,13 @@
 
 Buffer::Buffer(Buffer&& other) noexcept
     : m_resource(other.m_resource), m_descriptorHeap(other.m_descriptorHeap),
-      m_descriptorIndex(other.m_descriptorIndex), m_uavDescriptorIndex(other.m_uavDescriptorIndex),
-      m_resourceState(other.m_resourceState)
+      m_descriptorIndex(other.m_descriptorIndex), m_uavDescriptorIndex(other.m_uavDescriptorIndex)
 {
+    m_resourceState.TakeFrom(other.m_resourceState, D3D12_RESOURCE_STATE_COMMON);
     other.m_resource = nullptr;
     other.m_descriptorHeap = nullptr;
     other.m_descriptorIndex = UINT_MAX;
     other.m_uavDescriptorIndex = UINT_MAX;
-
-    other.m_resourceState = D3D12_RESOURCE_STATE_COMMON;
 }
 
 Buffer& Buffer::operator=(Buffer&& other) noexcept
@@ -29,13 +27,12 @@ Buffer& Buffer::operator=(Buffer&& other) noexcept
         m_descriptorIndex = other.m_descriptorIndex;
         m_uavDescriptorIndex = other.m_uavDescriptorIndex;
 
-        m_resourceState = other.m_resourceState;
+        m_resourceState.TakeFrom(other.m_resourceState, D3D12_RESOURCE_STATE_COMMON);
         other.m_resource = nullptr;
         other.m_descriptorHeap = nullptr;
         other.m_descriptorIndex = UINT_MAX;
 
         other.m_uavDescriptorIndex = UINT_MAX;
-        other.m_resourceState = D3D12_RESOURCE_STATE_COMMON;
     }
 
     return *this;
@@ -87,7 +84,7 @@ bool Buffer::Initialize(
         return false;
     }
 
-    m_resourceState = finalState;
+    m_resourceState.Reset(finalState);
 
     return true;
 }
@@ -130,7 +127,7 @@ bool Buffer::InitializeGPUWritableSeeded(
     // COMMON when ExecuteCommandLists completes (even after explicit barriers).
     // Its synchronous wait has confirmed that decay. Subsequent reads promote
     // from COMMON; Transition() also starts from this actual completed state.
-    m_resourceState = D3D12_RESOURCE_STATE_COMMON;
+    m_resourceState.Reset(D3D12_RESOURCE_STATE_COMMON);
     return true;
 }
 
@@ -184,7 +181,7 @@ bool Buffer::AllocateGPUWritable(
     MemoryRegistry::TrackResource(resource);
 
     m_resource = resource;
-    m_resourceState = initialState;
+    m_resourceState.Reset(initialState);
 
     return true;
 }
@@ -271,7 +268,7 @@ bool Buffer::CommitReplacement(
     ID3D12Resource* previous = m_resource;
 
     m_resource = prepared.m_resource;
-    m_resourceState = prepared.m_resourceState;
+    m_resourceState.Reset(prepared.m_resourceState.Get());
     prepared.m_resource = nullptr;
 
     previous->Release();
@@ -354,7 +351,7 @@ bool Buffer::ReplaceData(
 
     ID3D12Resource* previous = m_resource;
     m_resource = replacement;
-    m_resourceState = finalState;
+    m_resourceState.Reset(finalState);
     previous->Release();
 
     return true;
@@ -566,7 +563,7 @@ void Buffer::Shutdown()
         m_resource = nullptr;
     }
 
-    m_resourceState = D3D12_RESOURCE_STATE_COMMON;
+    m_resourceState.Reset(D3D12_RESOURCE_STATE_COMMON);
     m_descriptorHeap = nullptr;
     m_descriptorIndex = UINT_MAX;
 
@@ -600,14 +597,14 @@ unsigned int Buffer::GetUAVDescriptorIndex() const
 
 D3D12_RESOURCE_STATES Buffer::GetResourceState() const
 {
-    return m_resourceState;
+    return m_resourceState.Get();
 }
 
 void Buffer::Transition(
     ID3D12GraphicsCommandList* commandList,
     D3D12_RESOURCE_STATES newState)
 {
-    if (!commandList || !m_resource || m_resourceState == newState)
+    if (!commandList || !m_resource || m_resourceState.Get() == newState)
     {
         return;
     }
@@ -619,19 +616,20 @@ void Buffer::Transition(
 
     barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
 
-    barrier.Transition.StateBefore = m_resourceState;
+    barrier.Transition.StateBefore = m_resourceState.Get();
     barrier.Transition.StateAfter = newState;
 
     commandList->ResourceBarrier(1, &barrier);
 
-    m_resourceState = newState;
+    m_resourceState.Change(commandList, m_resource) = newState;
 }
 
 bool Buffer::PrepareTransition(
+    ID3D12GraphicsCommandList* commandList,
     D3D12_RESOURCE_STATES newState,
     D3D12_RESOURCE_BARRIER& barrier)
 {
-    if (!m_resource || m_resourceState == newState)
+    if (!m_resource || m_resourceState.Get() == newState)
     {
         return false;
     }
@@ -641,8 +639,8 @@ bool Buffer::PrepareTransition(
     barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
     barrier.Transition.pResource = m_resource;
     barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    barrier.Transition.StateBefore = m_resourceState;
+    barrier.Transition.StateBefore = m_resourceState.Get();
     barrier.Transition.StateAfter = newState;
-    m_resourceState = newState;
+    m_resourceState.Change(commandList, m_resource) = newState;
     return true;
 }

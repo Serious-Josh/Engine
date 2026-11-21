@@ -8,8 +8,9 @@
 RenderTarget::RenderTarget(RenderTarget&& other) noexcept
     : m_resource(other.m_resource), m_rtvHeap(other.m_rtvHeap), m_resourceHeap(other.m_resourceHeap),
       m_rtvIndex(other.m_rtvIndex), m_srvIndex(other.m_srvIndex), m_width(other.m_width), m_height(other.m_height),
-      m_format(other.m_format), m_state(other.m_state)
+      m_format(other.m_format)
 {
+    m_state.TakeFrom(other.m_state, D3D12_RESOURCE_STATE_RENDER_TARGET);
     other.m_resource = nullptr;
     other.m_rtvHeap = nullptr;
     other.m_resourceHeap = nullptr;
@@ -19,8 +20,6 @@ RenderTarget::RenderTarget(RenderTarget&& other) noexcept
     other.m_width = 0;
     other.m_height = 0;
     other.m_format = DXGI_FORMAT_UNKNOWN;
-
-    other.m_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
 }
 
 RenderTarget& RenderTarget::operator=(RenderTarget&& other) noexcept
@@ -39,7 +38,7 @@ RenderTarget& RenderTarget::operator=(RenderTarget&& other) noexcept
         m_height = other.m_height;
         m_format = other.m_format;
 
-        m_state = other.m_state;
+        m_state.TakeFrom(other.m_state, D3D12_RESOURCE_STATE_RENDER_TARGET);
 
         other.m_resource = nullptr;
         other.m_rtvHeap = nullptr;
@@ -50,8 +49,6 @@ RenderTarget& RenderTarget::operator=(RenderTarget&& other) noexcept
         other.m_width = 0;
         other.m_height = 0;
         other.m_format = DXGI_FORMAT_UNKNOWN;
-
-        other.m_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
     }
 
     return *this;
@@ -109,7 +106,7 @@ bool RenderTarget::Initialize(
 
     MemoryRegistry::TrackResource(m_resource);
 
-    m_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    m_state.Reset(D3D12_RESOURCE_STATE_RENDER_TARGET);
 
     m_rtvIndex = rtvHeap.Allocate();
 
@@ -160,7 +157,7 @@ void RenderTarget::Transition(
     ID3D12GraphicsCommandList* commandList,
     D3D12_RESOURCE_STATES newState)
 {
-    if (!m_resource || !commandList || m_state == newState)
+    if (!m_resource || !commandList || m_state.Get() == newState)
     {
         return;
     }
@@ -171,12 +168,12 @@ void RenderTarget::Transition(
     barrier.Transition.pResource = m_resource;
 
     barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    barrier.Transition.StateBefore = m_state;
+    barrier.Transition.StateBefore = m_state.Get();
     barrier.Transition.StateAfter = newState;
 
     commandList->ResourceBarrier(1, &barrier);
 
-    m_state = newState;
+    m_state.Change(commandList, m_resource) = newState;
 }
 
 void RenderTarget::Shutdown()
@@ -209,7 +206,7 @@ void RenderTarget::Shutdown()
     m_height = 0;
     m_format = DXGI_FORMAT_UNKNOWN;
 
-    m_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    m_state.Reset(D3D12_RESOURCE_STATE_RENDER_TARGET);
 }
 
 ID3D12Resource* RenderTarget::GetResource() const

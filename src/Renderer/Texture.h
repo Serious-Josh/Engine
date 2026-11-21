@@ -6,6 +6,8 @@
 #include <vector>
 #include <memory>
 
+#include "ResourceStateTransaction.h"
+
 class DescriptorHeap;
 
 class Texture
@@ -90,14 +92,15 @@ class Texture
 
     std::vector<D3D12_RESOURCE_STATES> GetSubresourceStates() const
     {
-        return m_subresourceStates;
+        return m_subresourceStates.Get();
     }
 
     // CPU tracking only; snapshot must belong to this unchanged resource.
-    // Use only after discarding unsubmitted barriers.
+    // Use only after discarding unsubmitted barriers. (R.1: discarded recordings also restore tracked states automatically;
+    // this explicit restore is authoritative and ends the texture's transaction.)
     void RestoreStatesAfterAbort(const std::vector<D3D12_RESOURCE_STATES>& states)
     {
-        m_subresourceStates = states;
+        m_subresourceStates.Reset(states);
     }
 
     ID3D12Resource* GetResource() const;
@@ -137,5 +140,5 @@ class Texture
 
     DXGI_FORMAT m_format = DXGI_FORMAT_UNKNOWN;
 
-    std::vector<D3D12_RESOURCE_STATES> m_subresourceStates;
+    TransactionalResourceState<std::vector<D3D12_RESOURCE_STATES>> m_subresourceStates;
 };

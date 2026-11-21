@@ -352,7 +352,7 @@ void AirPressure::Barrier(ID3D12GraphicsCommandList* commandList, Buffer* transi
 {
     D3D12_RESOURCE_BARRIER barriers[2]{};
     barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-    const bool moved = transition != nullptr && transition->PrepareTransition(state, barriers[1]);
+    const bool moved = transition != nullptr && transition->PrepareTransition(commandList, state, barriers[1]);
     commandList->ResourceBarrier(moved ? 2 : 1, barriers);
     ++m_recording.barriers;
 }

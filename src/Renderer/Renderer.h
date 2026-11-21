@@ -2425,6 +2425,10 @@ private:
     bool m_abortFrameRequiresReGIRForTesting = true;
     bool m_abortedFrameForTesting = false;
     std::uint32_t m_abortedFramesForTesting = 0;
+    // R.1 harness: the next frame with an armed displacement exit scope fails after its commands are recorded (before the
+    // end-of-frame staging); the scope discards it. Render reports it Deferred when the discard is confirmed.
+    bool m_failDisplacementFrameAfterRecordingForTesting = false;
+    bool m_injectedFrameFailureForTesting = false;
     // M4.3.5 timing: the last frame's PrepareReGIRFrame CPU time (eligibility, constants, presampling dispatch record).
     double m_regirPrepareMillisecondsForTesting = 0.0;
     // M4.3: ReGIR settings (window, slots, candidates; ENGINE_REGIR_* overrides at startup) and the frame's presampling.

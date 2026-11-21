@@ -186,6 +186,9 @@ class NrdDenoiser
     void ReleaseOutputs();
 
     nrd::Integration m_integration;
+    // R.1: the integration's texture-pool barrier states, mirrored transactionally (NRD tracks them itself): a discarded
+    // recording that ran Denoise returns them to the last submitted states before the next Denoise.
+    TransactionalResourceState<std::vector<nri::AccessLayoutStage>> m_poolStates;
     // R.9A: the last SetCommonSettings' FrameSettings::historyConfidence, which Denoise's confidence bindings follow.
     bool m_historyConfidence = false;
     Description m_description;

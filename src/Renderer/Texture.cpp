@@ -11,9 +11,9 @@
 Texture::Texture(Texture&& other) noexcept
     : m_retained(std::move(other.m_retained)), m_resource(other.m_resource), m_width(other.m_width), m_height(other.m_height), m_srvIndex(other.m_srvIndex),
       m_uavIndex(other.m_uavIndex), m_descriptorHeap(other.m_descriptorHeap),
-      m_initialData(std::move(other.m_initialData)), m_format(other.m_format),
-      m_subresourceStates(std::move(other.m_subresourceStates))
+      m_initialData(std::move(other.m_initialData)), m_format(other.m_format)
 {
+    m_subresourceStates.TakeFrom(other.m_subresourceStates, {});
     other.m_resource = nullptr;
     other.m_width = 0;
     other.m_height = 0;
@@ -23,7 +23,6 @@ Texture::Texture(Texture&& other) noexcept
     other.m_descriptorHeap = nullptr;
     other.m_format = DXGI_FORMAT_UNKNOWN;
     other.m_initialData.clear();
-    other.m_subresourceStates.clear();
 }
 
 Texture& Texture::operator=(Texture&& other) noexcept
@@ -44,7 +43,7 @@ Texture& Texture::operator=(Texture&& other) noexcept
         m_descriptorHeap = other.m_descriptorHeap;
         m_format = other.m_format;
 
-        m_subresourceStates = std::move(other.m_subresourceStates);
+        m_subresourceStates.TakeFrom(other.m_subresourceStates, {});
 
         other.m_srvIndex = UINT_MAX;
         other.m_uavIndex = UINT_MAX;
@@ -55,7 +54,6 @@ Texture& Texture::operator=(Texture&& other) noexcept
         other.m_height = 0;
         other.m_format = DXGI_FORMAT_UNKNOWN;
         other.m_initialData.clear();
-        other.m_subresourceStates.clear();
     }
 
     return *this;
@@ -110,7 +108,7 @@ bool Texture::Initialize(
 
     MemoryRegistry::TrackResource(m_resource);
 
-    m_subresourceStates.assign(1, D3D12_RESOURCE_STATE_COPY_DEST);
+    m_subresourceStates.Reset(std::vector<D3D12_RESOURCE_STATES>(1, D3D12_RESOURCE_STATE_COPY_DEST));
 
     m_width = width;
 
@@ -196,7 +194,7 @@ bool Texture::Initialize(
 
     const unsigned int subresourceCount = arraySize * mipLevels;
 
-    m_subresourceStates.assign(subresourceCount, initialState);
+    m_subresourceStates.Reset(std::vector<D3D12_RESOURCE_STATES>(subresourceCount, initialState));
 
     m_width = width;
 
@@ -295,7 +293,7 @@ void Texture::Shutdown()
         m_uavIndex = UINT_MAX;
     }
 
-    m_subresourceStates.clear();
+    m_subresourceStates.Reset({});
     m_srvIndex = UINT_MAX;
     m_descriptorHeap = nullptr;
     m_width = 0;
@@ -315,7 +313,9 @@ void Texture::Transition(
         return;
     }
 
-    for (unsigned int subresource = 0; subresource < m_subresourceStates.size(); ++subresource)
+    const std::size_t subresources = m_subresourceStates.Get().size();
+
+    for (unsigned int subresource = 0; subresource < subresources; ++subresource)
     {
         Transition(commandList, newState, subresource);
     }
@@ -327,13 +327,13 @@ void Texture::Transition(
     D3D12_RESOURCE_STATES newState,
     unsigned int subresource)
 {
-    if (!m_resource || !commandList || subresource >= m_subresourceStates.size())
+    if (!m_resource || !commandList || subresource >= m_subresourceStates.Get().size())
     {
 
         return;
     }
 
-    D3D12_RESOURCE_STATES& currentState = m_subresourceStates[subresource];
+    const D3D12_RESOURCE_STATES currentState = m_subresourceStates.Get()[subresource];
 
     if (currentState == newState)
     {
@@ -353,7 +353,7 @@ void Texture::Transition(
 
     commandList->ResourceBarrier(1, &barrier);
 
-    currentState = newState;
+    m_subresourceStates.Change(commandList, m_resource)[subresource] = newState;
 }
 
 bool Texture::CreateSRV(
@@ -532,12 +532,14 @@ unsigned int Texture::GetDescriptorIndex() const
 
 D3D12_RESOURCE_STATES Texture::GetSubresourceState(unsigned int subresource) const
 {
-    if (subresource >= m_subresourceStates.size())
+    const auto& states = m_subresourceStates.Get();
+
+    if (subresource >= states.size())
     {
         return D3D12_RESOURCE_STATE_COMMON;
     }
 
-    return m_subresourceStates[subresource];
+    return states[subresource];
 }
 
 Texture::RetainedAllocation::~RetainedAllocation()

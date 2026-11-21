@@ -10801,6 +10801,18 @@ Renderer::FrameRenderResult Renderer::Render(
         InvalidatePreviousGBufferHistory();
         m_rtxdiResources.InvalidateHistory();
 
+        if(m_injectedFrameFailureForTesting)
+        {
+            // R.1 harness: the injected displacement failure; Deferred only when the exit scope confirmed the discard.
+            m_injectedFrameFailureForTesting = false;
+
+            if(m_commandRecordingGeneration == 0)
+            {
+                ++m_abortedFramesForTesting;
+                return FrameRenderResult::Deferred;
+            }
+        }
+
         if(m_abortedFrameForTesting)
         {
             // The M4.3.5 harness's discarded frame: same resets as a failure, nothing executed or presented.
@@ -13940,6 +13952,15 @@ bool Renderer::RecordRenderFrame(
 
         commandList->ResourceBarrier(1, &barrier);
 
+    }
+
+    // R.1 harness: a displacement frame fails after its commands are recorded, as a late pass failure would; the armed
+    // displacement exit scope then discards the recording (ResolveDisplacementFrameExit, the production path).
+    if(m_failDisplacementFrameAfterRecordingForTesting && displacementExit && displacementExit->armed)
+    {
+        m_failDisplacementFrameAfterRecordingForTesting = false;
+        m_injectedFrameFailureForTesting = true;
+        return false;
     }
 
     // S0.5: a budgeted share of a pending environment's copies and precompute, after everything this frame renders.

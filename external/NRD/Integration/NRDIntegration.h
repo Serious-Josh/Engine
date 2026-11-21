@@ -276,6 +276,26 @@ struct Integration {
         return double(m_TransientPoolSize) / (1024.0 * 1024.0);
     }
 
+    // ENGINE LOCAL ADDITION (R.1): the texture pool's tracked barrier states. A host that discards an unsubmitted command
+    // list containing "Denoise" returns them to the states of its last submitted work (barriers recorded in the discarded
+    // list never ran). Not part of the NRD distribution.
+    inline uint32_t GetPoolStateNum() const {
+        return (uint32_t)m_TexturePool.size();
+    }
+
+    inline void GetPoolStates(nri::AccessLayoutStage* states) const {
+        for (size_t i = 0; i < m_TexturePool.size(); i++)
+            states[i] = m_TexturePool[i].state;
+    }
+
+    inline void SetPoolStates(const nri::AccessLayoutStage* states, uint32_t statesNum) {
+        if (statesNum != m_TexturePool.size())
+            return;
+
+        for (size_t i = 0; i < m_TexturePool.size(); i++)
+            m_TexturePool[i].state = states[i];
+    }
+
 private:
     Integration(const Integration&) = delete;
 

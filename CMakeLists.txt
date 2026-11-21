@@ -341,6 +341,7 @@ add_library(EngineCore OBJECT
     src/Renderer/Diagnostics/FrameHitchDiagnostics.cpp
     src/Renderer/Displacement/DisplacementGeometryBinding.cpp
     src/Renderer/Buffer.cpp
+    src/Renderer/ResourceStateTransaction.cpp
     src/Renderer/Mesh.cpp
     src/Renderer/Pipeline.cpp
     src/Renderer/VertexLayout.cpp

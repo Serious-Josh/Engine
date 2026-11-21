@@ -1,6 +1,8 @@
 #pragma once
 
 #include <d3d12.h>
+
+#include "ResourceStateTransaction.h"
 #include <climits>
 
 class Camera;
@@ -38,13 +40,13 @@ class DepthBuffer
     unsigned int GetHeight() const;
     D3D12_RESOURCE_STATES GetState() const noexcept
     {
-        return m_state;
+        return m_state.Get();
     }
 
     // CPU tracking only, after confirmed discard of this unchanged resource.
     void RestoreStateAfterAbort(D3D12_RESOURCE_STATES state) noexcept
     {
-        m_state = state;
+        m_state.Reset(state);
     }
 
     private:
@@ -60,5 +62,5 @@ class DepthBuffer
     unsigned int m_width = 0;
     unsigned int m_height = 0;
 
-    D3D12_RESOURCE_STATES m_state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+    TransactionalResourceState<D3D12_RESOURCE_STATES> m_state{D3D12_RESOURCE_STATE_DEPTH_WRITE};
 };

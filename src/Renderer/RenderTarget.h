@@ -1,6 +1,8 @@
 #pragma once
 
 #include <d3d12.h>
+
+#include "ResourceStateTransaction.h"
 #include <dxgiformat.h>
 #include <climits>
 #include <array>
@@ -41,13 +43,13 @@ class RenderTarget
     DXGI_FORMAT GetFormat() const;
     D3D12_RESOURCE_STATES GetState() const noexcept
     {
-        return m_state;
+        return m_state.Get();
     }
 
     // CPU tracking only, after confirmed discard of this unchanged resource.
     void RestoreStateAfterAbort(D3D12_RESOURCE_STATES state) noexcept
     {
-        m_state = state;
+        m_state.Reset(state);
     }
 
     private:
@@ -64,5 +66,5 @@ class RenderTarget
 
     DXGI_FORMAT m_format = DXGI_FORMAT_UNKNOWN;
 
-    D3D12_RESOURCE_STATES m_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    TransactionalResourceState<D3D12_RESOURCE_STATES> m_state{D3D12_RESOURCE_STATE_RENDER_TARGET};
 };
