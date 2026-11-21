@@ -78,6 +78,57 @@ if(ENGINE_DLSS_AVAILABLE)
     message(STATUS "DLSS Super Resolution backend enabled (SDK: ${ENGINE_DLSS_ROOT})")
 endif()
 
+# RR.1A: DLSS Ray Reconstruction (NGX feature "DLSS-D"), detected separately from Super Resolution in the same SDK checkout.
+# It needs the Super Resolution backend (the same NGX instance). AUTO enables it when its headers and production runtime are
+# present; OFF disables it; ON requires it. Missing RR files never disable Super Resolution. The runtime is deployed beside
+# the Editor only: NVIDIA's RR guide (4.2) and the SDK license disagree about redistributing it, so packaged games never
+# receive it (Documentation/Rendering/DLSS_Ray_Reconstruction_RR0_Investigation.md §4.4).
+set(ENGINE_ENABLE_DLSS_RR "AUTO" CACHE STRING "DLSS Ray Reconstruction build policy: AUTO, ON or OFF")
+set_property(CACHE ENGINE_ENABLE_DLSS_RR PROPERTY STRINGS AUTO ON OFF)
+string(TOUPPER "${ENGINE_ENABLE_DLSS_RR}" ENGINE_DLSS_RR_POLICY)
+if(NOT ENGINE_DLSS_RR_POLICY MATCHES "^(AUTO|ON|OFF)$")
+    message(FATAL_ERROR "ENGINE_ENABLE_DLSS_RR must be AUTO, ON or OFF")
+endif()
+set(ENGINE_DLSS_RR_AVAILABLE OFF)
+# The production runtime. The development DLL in lib/Windows_x86_64/dev (debug overlay) must never be deployed.
+set(ENGINE_DLSS_RR_RUNTIME "${ENGINE_DLSS_ROOT}/lib/Windows_x86_64/rel/nvngx_dlssd.dll")
+
+if(NOT ENGINE_DLSS_RR_POLICY STREQUAL "OFF")
+    if(NOT ENGINE_DLSS_AVAILABLE)
+        if(ENGINE_DLSS_RR_POLICY STREQUAL "ON")
+            message(FATAL_ERROR "DLSS Ray Reconstruction explicitly required, but the DLSS Super Resolution backend it builds "
+                "on is disabled. Set ENGINE_ENABLE_DLSS to AUTO/ON with a complete SDK, or use ENGINE_ENABLE_DLSS_RR AUTO/OFF.")
+        endif()
+        message(STATUS "DLSS Ray Reconstruction AUTO: disabled (the DLSS Super Resolution backend is disabled)")
+    else()
+        set(ENGINE_DLSS_RR_REQUIRED_FILES
+            "${ENGINE_DLSS_INCLUDE_DIR}/nvsdk_ngx_defs_dlssd.h"
+            "${ENGINE_DLSS_INCLUDE_DIR}/nvsdk_ngx_params_dlssd.h"
+            "${ENGINE_DLSS_INCLUDE_DIR}/nvsdk_ngx_helpers_dlssd.h"
+            "${ENGINE_DLSS_INCLUDE_DIR}/nvsdk_ngx_helpers_dlssd_d3d.h"
+            "${ENGINE_DLSS_RR_RUNTIME}"
+        )
+
+        set(ENGINE_DLSS_RR_MISSING "")
+        foreach(required IN LISTS ENGINE_DLSS_RR_REQUIRED_FILES)
+            if(NOT EXISTS "${required}")
+                list(APPEND ENGINE_DLSS_RR_MISSING "${required}")
+            endif()
+        endforeach()
+
+        if(ENGINE_DLSS_RR_MISSING)
+            if(ENGINE_DLSS_RR_POLICY STREQUAL "ON")
+                message(FATAL_ERROR "DLSS Ray Reconstruction explicitly required, missing dependencies: "
+                    "${ENGINE_DLSS_RR_MISSING}. Set ENGINE_DLSS_ROOT or use ENGINE_ENABLE_DLSS_RR AUTO/OFF.")
+            endif()
+            message(STATUS "DLSS Ray Reconstruction AUTO: disabled; missing dependencies: ${ENGINE_DLSS_RR_MISSING}")
+        else()
+            set(ENGINE_DLSS_RR_AVAILABLE ON)
+            message(STATUS "DLSS Ray Reconstruction support enabled (Editor runtime: ${ENGINE_DLSS_RR_RUNTIME})")
+        endif()
+    endif()
+endif()
+
 # Compiles the backend against the SDK when enabled. The NGX library reaches every executable that links the object
 # library through its link interface.
 function(engine_configure_dlss target)
@@ -90,6 +141,9 @@ function(engine_configure_dlss target)
         ENGINE_DLSS_PROJECT_ID="${ENGINE_DLSS_PROJECT_ID}"
         ENGINE_DLSS_ENGINE_VERSION="${PROJECT_VERSION}"
     )
+    if(ENGINE_DLSS_RR_AVAILABLE)
+        target_compile_definitions(${target} PRIVATE ENGINE_HAS_DLSS_RR=1)
+    endif()
     target_include_directories(${target} PRIVATE "${ENGINE_DLSS_INCLUDE_DIR}")
     target_link_libraries(${target} INTERFACE
         "$<$<CONFIG:Debug>:${ENGINE_DLSS_LIBRARY_DIR}/nvsdk_ngx_d_dbg.lib>"
@@ -107,6 +161,20 @@ function(engine_deploy_dlss target)
     add_custom_command(TARGET ${target} POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different "${ENGINE_DLSS_RUNTIME}" "$<TARGET_FILE_DIR:${target}>"
         COMMENT "Deploying NVIDIA DLSS Super Resolution runtime for ${target}"
+        VERBATIM
+    )
+endfunction()
+
+# RR.1A: copies the production DLSS Ray Reconstruction runtime next to the Editor executable. Never called for EngineRuntime,
+# whose directory Build Game deploys games from (RR is Editor-only until its redistribution terms are confirmed).
+function(engine_deploy_dlss_rr target)
+    if(NOT ENGINE_DLSS_RR_AVAILABLE)
+        return()
+    endif()
+
+    add_custom_command(TARGET ${target} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${ENGINE_DLSS_RR_RUNTIME}" "$<TARGET_FILE_DIR:${target}>"
+        COMMENT "Deploying NVIDIA DLSS Ray Reconstruction runtime for ${target} (Editor only)"
         VERBATIM
     )
 endfunction()

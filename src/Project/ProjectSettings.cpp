@@ -47,7 +47,8 @@ namespace
         {ProjectPathTraceDenoiser::Engine, "engine"},
         {ProjectPathTraceDenoiser::NrdReblur, "nrdReblur"},
         {ProjectPathTraceDenoiser::NrdRelax, "nrdRelax"},
-        {ProjectPathTraceDenoiser::NrdHybrid, "nrdHybrid"}};
+        {ProjectPathTraceDenoiser::NrdHybrid, "nrdHybrid"},
+        {ProjectPathTraceDenoiser::DlssRayReconstruction, "dlssRayReconstruction"}};
     constexpr std::pair<ProjectPathTraceDenoiserView, std::string_view> kDenoiserViews[] = {
         {ProjectPathTraceDenoiserView::Normal, "normal"},
         {ProjectPathTraceDenoiserView::Temporal, "temporal"},

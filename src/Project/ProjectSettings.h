@@ -68,7 +68,11 @@ enum class ProjectPathTraceDenoiser
     Engine,
     NrdReblur,
     NrdRelax,
-    NrdHybrid
+    NrdHybrid,
+    // RR.1D: experimental DLSS Ray Reconstruction (Editor only). The path tracer runs as for NrdHybrid, whose signal extraction RR
+    // reads; RR replaces NRD and DLSS Super Resolution. dlss and dlssQuality select its preset (dlss off: DLAA). Unavailable or
+    // failed, NRD Hybrid renders (plus Super Resolution at a preset); packaged games always render NRD Hybrid.
+    DlssRayReconstruction
 };
 
 enum class ProjectPathTraceDenoiserView

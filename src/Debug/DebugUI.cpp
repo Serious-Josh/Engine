@@ -1613,6 +1613,33 @@ void DebugUI::DrawPathTraceReferenceSettings()
         m_dlssRetry = true;
     }
 
+    // RR.1D: selected as the PT denoiser ("DLSS Ray Reconstruction (experimental)"). Its quality is the DLSS control above:
+    // off renders DLAA (native), on renders the preset. Requested and effective state come from the renderer.
+    ImGui::SeparatorText("DLSS Ray Reconstruction (experimental)");
+
+    if(IsRayReconstructionSelected())
+    {
+        ImGui::TextWrapped("Selected as the PT denoiser. It replaces NRD Hybrid and Super Resolution; quality: %s.",
+            dlssEnabled ? "the DLSS preset above" : "DLAA (native; enable DLSS above for a preset)");
+    }
+    else
+    {
+        ImGui::TextDisabled("Select \"DLSS Ray Reconstruction (experimental)\" as the PT denoiser to use it.");
+    }
+
+    ImGui::TextWrapped("%s", m_rayReconstructionState.c_str());
+
+    if(m_rayReconstructionCanRetry && ImGui::Button("Retry Ray Reconstruction"))
+    {
+        m_dlssRetry = true;
+    }
+
+    if(ImGui::TreeNode("Ray Reconstruction details"))
+    {
+        ImGui::TextWrapped("%s", m_rayReconstructionDetail.c_str());
+        ImGui::TreePop();
+    }
+
     if(ImGui::TreeNode("Advanced upscaling diagnostics"))
     {
         const char* diagnosticScales[] = {"Native", "75% bilinear", "75% DLSS"};
@@ -1644,8 +1671,9 @@ void DebugUI::DrawPathTraceReferenceSettings()
 
         // NRD.2: only the implemented modes are offered, in ProjectPathTraceDenoiser order. NRD.4B: REBLUR
         // (experimental); NRD.RELAX.4: RELAX (experimental); HYBRID.5: the hybrid (experimental, the default).
+        // RR.1D: DLSS Ray Reconstruction (experimental, Editor only).
         const char* denoiserModes[] = {"Off", "Engine", "NRD REBLUR (experimental)", "NRD RELAX (experimental)",
-                                       "NRD Hybrid (experimental)"};
+                                       "NRD Hybrid (experimental)", "DLSS Ray Reconstruction (experimental)"};
         OverrideCombo("PT denoiser", pathTracing.denoiser, denoiserModes, IM_ARRAYSIZE(denoiserModes),
             overrides.denoiser, RenderingOverrideField::denoiser);
 
@@ -1654,7 +1682,8 @@ void DebugUI::DrawPathTraceReferenceSettings()
             ImGui::TextWrapped("%s", m_pathTraceDenoiserPreparation.c_str());
         }
 
-        if (IsNrdPathTraceDenoiserMode(GetSelectedPathTraceDenoiserMode()))
+        // RR.1D: Ray Reconstruction maps to the hybrid configuration but never runs NRD, so NRD's status does not apply.
+        if (IsNrdPathTraceDenoiserMode(GetSelectedPathTraceDenoiserMode()) && !IsRayReconstructionSelected())
         {
             if (!m_pathTraceNrdStatus.empty())
             {

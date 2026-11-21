@@ -32,6 +32,8 @@ void ApplyRenderScale(const RenderingConfiguration& configuration, Renderer& ren
     const int scale = std::clamp(configuration.renderScaleIndex, 0,
         static_cast<int>(Renderer::RenderScale::DlssPerformance));
 
+    // RR.1D: the selection, applied by the same ResizeScene as the scale (the renderer keeps it apart from its effective state).
+    renderer.SetRayReconstructionRequested(configuration.rayReconstructionRequested);
     renderer.SetRenderScale(static_cast<Renderer::RenderScale>(scale), dlssEligible, dlssRetry,
         configuration.dlssRequested);
 }

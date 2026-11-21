@@ -597,7 +597,8 @@ void Editor::DrawRenderingSettingsCategory(const DebugUI& debugUI, bool editable
 
         ImGui::SeparatorText("DLSS Super Resolution");
         ImGui::Checkbox("Enable DLSS", &pathTracing.dlss);
-        Tooltip("Needs a PT denoiser; DLSS activates once the lighting mode and the denoiser are prepared.");
+        Tooltip("Needs a PT denoiser; DLSS activates once the lighting mode and the denoiser are prepared.\n"
+            "With DLSS Ray Reconstruction as the PT denoiser this selects its quality: off renders DLAA (native), on the preset.");
         SessionOverrideNote(debugUI, Field::dlss);
         ImGui::BeginDisabled(!pathTracing.dlss);
         const char* dlssQualities[] = {"Quality", "Balanced", "Performance"};
@@ -609,9 +610,11 @@ void Editor::DrawRenderingSettingsCategory(const DebugUI& debugUI, bool editable
         ImGui::Checkbox("PT camera jitter (experimental)", &pathTracing.cameraJitter);
         SessionOverrideNote(debugUI, Field::cameraJitter);
         const char* denoisers[] = {"Off", "Engine", "NRD REBLUR (experimental)", "NRD RELAX (experimental)",
-            "NRD Hybrid (experimental)"};
+            "NRD Hybrid (experimental)", "DLSS Ray Reconstruction (experimental)"};
         DraftCombo("PT denoiser", pathTracing.denoiser, denoisers);
-        Tooltip("NRD Hybrid (RELAX diffuse, REBLUR specular) is the default.");
+        Tooltip("NRD Hybrid (RELAX diffuse, REBLUR specular) is the default.\n"
+            "DLSS Ray Reconstruction (experimental, Editor only) replaces NRD and DLSS Super Resolution; the DLSS setting above\n"
+            "selects its quality. It falls back to NRD Hybrid when unavailable, and packaged games always use NRD Hybrid.");
         SessionOverrideNote(debugUI, Field::denoiser);
         const char* denoiserViews[] = {"Normal", "Temporal (demodulated)", "Spatial (demodulated)",
             "Spatial - temporal difference", "Estimated uncertainty", "History length", "Raw extraction"};

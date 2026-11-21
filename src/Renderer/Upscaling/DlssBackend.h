@@ -32,6 +32,33 @@ enum class DlssAvailability
 
 const char* DlssAvailabilityName(DlssAvailability availability) noexcept;
 
+// RR.1A: what DLSS Ray Reconstruction (NGX feature DLSS-D) can do on this machine, queried with Super Resolution on the
+// same NGX instance. Available means an RR feature may be created; nothing renders with it yet (RR.1C).
+enum class DlssRayReconstructionAvailability
+{
+    // Built without ENGINE_ENABLE_DLSS_RR (or without the Super Resolution backend it needs).
+    NotCompiled,
+    // The packaged runtime: RR is Editor-only until NVIDIA's redistribution terms are confirmed.
+    NotPermitted,
+    // Initialize has not run (or Shutdown ran).
+    NotInitialized,
+    // nvngx_dlssd.dll is not next to the executable.
+    RuntimeMissing,
+    // NGX itself was not initialized (its init failed, or the Super Resolution runtime it is gated on is missing).
+    NgxInitializationFailed,
+    // The NGX capability parameters could not be read, or SuperSamplingDenoising.Available was absent.
+    CapabilityQueryFailed,
+    // SuperSamplingDenoising.NeedsUpdatedDriver (see the minimum driver version).
+    DriverOutdated,
+    // SuperSamplingDenoising.Available is 0 on this GPU/driver.
+    Unsupported,
+    // SuperSamplingDenoising.FeatureInitResult is a failure (RR denied or failed to initialize for this application).
+    FeatureInitFailed,
+    Available
+};
+
+const char* DlssRayReconstructionAvailabilityName(DlssRayReconstructionAvailability availability) noexcept;
+
 // UPSCALING.3D: the NGX Super Resolution quality modes Engine offers, whose render extents come from the NGX
 // optimal-settings query (never from fixed scale factors).
 enum class DlssQualityPreset
@@ -42,6 +69,32 @@ enum class DlssQualityPreset
 };
 
 const char* DlssQualityPresetName(DlssQualityPreset preset) noexcept;
+
+// RR.1A: the NGX execution modes Ray Reconstruction can be created for (RR guide 3.2). DLAA renders at the output extent.
+enum class DlssRayReconstructionQuality
+{
+    Dlaa,
+    Quality,
+    Balanced,
+    Performance
+};
+
+const char* DlssRayReconstructionQualityName(DlssRayReconstructionQuality quality) noexcept;
+
+// RR.1A: Ray Reconstruction's capability, read from the same capability parameters as Super Resolution's.
+struct DlssRayReconstructionStatus
+{
+    DlssRayReconstructionAvailability availability = DlssRayReconstructionAvailability::NotInitialized;
+    // nvngx_dlssd.dll beside the executable (checked whenever RR is compiled and permitted).
+    bool runtimePresent = false;
+    // SuperSamplingDenoising.* capability parameters, valid once the capability query succeeded.
+    bool available = false;
+    bool needsUpdatedDriver = false;
+    std::uint32_t minDriverVersionMajor = 0;
+    std::uint32_t minDriverVersionMinor = 0;
+    std::int32_t featureInitResult = 0;
+    std::string detail;
+};
 
 struct DlssStatus
 {
@@ -59,9 +112,12 @@ struct DlssStatus
     double initializeMilliseconds = 0.0;
     // One line for logs and the Editor readout.
     std::string detail;
+    // RR.1A.
+    DlssRayReconstructionStatus rayReconstruction;
 };
 
-// UPSCALING.3C: the DLSS Super Resolution feature of one render/output extent pair.
+// UPSCALING.3C: the DLSS Super Resolution feature of one render/output extent pair; RR.1A: also the Ray Reconstruction
+// feature's (its own instance).
 struct DlssFeatureStatus
 {
     bool active = false;
@@ -76,6 +132,8 @@ struct DlssFeatureStatus
     // Raw NVSDK_NGX_Result values of the last creation and evaluation (0: not called).
     std::uint32_t createResult = 0;
     std::uint32_t evaluateResult = 0;
+    // RR.1A: evaluations in submitted recordings since the feature was created. A recorded evaluation counts only once its
+    // recording is submitted (ConfirmRecordingSubmitted); a discarded one never does.
     std::uint64_t evaluations = 0;
     const char* perfQualityName = "";
     // The dynamic render ranges NGX reports per quality mode for this output extent.
@@ -98,12 +156,63 @@ struct DlssEvaluation
     float jitterOffsetY = 0.0f;
     unsigned int renderWidth = 0;
     unsigned int renderHeight = 0;
+    // The caller's history discontinuity. Evaluate adds its own (EvaluationNeedsReset).
     bool reset = false;
 };
 
+// RR.1C: one Ray Reconstruction evaluation (RR guide 3.4; NVSDK_NGX_D3D12_DLSSD_Eval_Params). Inputs at the render
+// extent in NON_PIXEL_SHADER_RESOURCE, output at the output extent in UNORDERED_ACCESS, as for Super Resolution.
+struct DlssRayReconstructionEvaluation
+{
+    // Noisy linear HDR radiance of this frame (RGBA16F).
+    ID3D12Resource* color = nullptr;
+    ID3D12Resource* output = nullptr;
+    // Hardware depth (the feature is created with NVSDK_NGX_DLSS_Depth_Type_HW).
+    ID3D12Resource* depth = nullptr;
+    // Ordinary motion vectors (RG16F, render pixels, previous = current + vector, jitter excluded).
+    ID3D12Resource* motionVectors = nullptr;
+    // pInMotionVectorsReflections (NVSDK_NGX_Parameter_GBuffer_SpecularMvec): the same convention.
+    ID3D12Resource* specularMotionVectors = nullptr;
+    // Linear diffuse and specular albedo (RGBA8_UNORM).
+    ID3D12Resource* diffuseAlbedo = nullptr;
+    ID3D12Resource* specularAlbedo = nullptr;
+    // World-space shading normal, linear (perceptual) roughness in alpha (NVSDK_NGX_DLSS_Roughness_Mode_Packed).
+    ID3D12Resource* normalRoughness = nullptr;
+    // Optional exposure (1x1); RR guide 3.7 calls exposure unsupported, RR.1C measures it (null: not passed).
+    ID3D12Resource* exposure = nullptr;
+    // NGX InPreExposure (0: the helper's default 1).
+    float preExposure = 0.0f;
+    float jitterOffsetX = 0.0f;
+    float jitterOffsetY = 0.0f;
+    unsigned int renderWidth = 0;
+    unsigned int renderHeight = 0;
+    float frameTimeDeltaMilliseconds = 0.0f;
+    // The caller's history discontinuity. EvaluateRayReconstruction adds its own (EvaluationNeedsReset).
+    bool reset = false;
+};
+
+// RR.1A: the two NGX features Engine can own. At most one holds GPU resources at a time (the caller releases the other
+// before creating one; FeatureCreationNeeded / ReleaseFeature).
+enum class DlssFeatureKind
+{
+    SuperResolution,
+    RayReconstruction
+};
+
 // UPSCALING.3A: owns the NGX SDK instance for one D3D12 device: initialization, the DLSS Super Resolution capability
-// query and shutdown; UPSCALING.3C: the DLSS Super Resolution feature (creation, evaluation, release). Every NGX call in
-// Engine goes through this class. Not thread-safe (NGX is not); the render thread owns it.
+// query and shutdown; UPSCALING.3C: the DLSS Super Resolution feature (creation, evaluation, release); RR.1A: Ray
+// Reconstruction's capability and feature slot. Every NGX call in Engine goes through this class. Not thread-safe (NGX is
+// not); the render thread owns it.
+//
+// RR.1A NGX lifecycle (Documentation/Rendering/DLSS_Ray_Reconstruction_RR1A.md):
+//  - Creation records on a lifecycle command list that the caller submits on the frame queue right away
+//    (CommandContext::SubmitLifecycleCommands), never on the discardable frame recording. The caller reports the outcome
+//    with ConfirmFeatureCreation or AbandonFeatureCreation; Evaluate refuses a feature whose creation was not submitted.
+//  - Evaluation records on the frame recording. It counts (evaluations) only when ConfirmRecordingSubmitted reports that
+//    recording submitted. A discarded (R.1 ResourceStateTransaction) or unconfirmed one forces InReset on the next
+//    evaluation of that feature: NGX's internal temporal state cannot be rolled back.
+//  - Release requires that no evaluation is pending in an open recording and that the GPU has completed every submitted
+//    use (completedFenceValue at or past the last confirmed one, or gpuIdle).
 class DlssBackend
 {
 public:
@@ -111,6 +220,9 @@ public:
     DlssBackend(const DlssBackend&) = delete;
     DlssBackend& operator=(const DlssBackend&) = delete;
     ~DlssBackend();
+
+    // RR.1A: before Initialize. False (the packaged runtime) reports Ray Reconstruction NotPermitted without querying it.
+    void SetRayReconstructionPermitted(bool permitted) noexcept { m_rayReconstructionPermitted = permitted; }
 
     // Once per device, after it is created. Never fails the caller: every outcome is reported through GetStatus. A
     // second call without Shutdown is ignored. M0c.5 Stage 5.5: completes (waits for) an initialization BeginInitialize
@@ -132,7 +244,8 @@ public:
         return m_pending.valid();
     }
 
-    // Releases the NGX instance only after GPU completion, before releasing the device. Idempotent.
+    // Releases both features, their parameter maps and the NGX instance. Only after GPU completion (the caller drains),
+    // before releasing the device. Idempotent.
     void Shutdown();
 
     const DlssStatus& GetStatus() const noexcept { return m_status; }
@@ -142,32 +255,136 @@ public:
     bool QueryOptimalRenderExtent(DlssQualityPreset preset, unsigned int outputWidth, unsigned int outputHeight,
         unsigned int& renderWidth, unsigned int& renderHeight);
 
-    // UPSCALING.3C: creates the feature for this extent pair on commandList when none exists or the extents changed
-    // (a changed feature is released first, which requires no DLSS work in flight: callers change extents only after a
-    // GPU drain). True when a feature for exactly these extents is active. A failure is recorded in GetFeatureStatus and
-    // not retried for the same extents. UPSCALING.3D preset: the feature uses that NGX quality mode, which must hold the
-    // render extent; without one, the first mode whose range holds it (the diagnostic 75% mode).
-    bool EnsureFeature(ID3D12GraphicsCommandList* commandList, unsigned int renderWidth, unsigned int renderHeight,
+    // RR.1A: whether EnsureFeature would record a creation for these extents: no active feature for exactly them, and no
+    // memoized failure. Cheap; no NGX call.
+    bool FeatureCreationNeeded(unsigned int renderWidth, unsigned int renderHeight, unsigned int outputWidth,
+        unsigned int outputHeight, std::optional<DlssQualityPreset> preset = std::nullopt) const;
+
+    // UPSCALING.3C: creates the feature for this extent pair on lifecycleList when none exists or the extents changed.
+    // RR.1A: lifecycleList is a lifecycle command list (never the frame recording) that the caller submits immediately and
+    // reports with ConfirmFeatureCreation/AbandonFeatureCreation. A feature for other extents must already be released
+    // (ReleaseFeature): creation never releases one itself. True when a feature for exactly these extents exists. A failure
+    // is recorded in GetFeatureStatus and not retried for the same extents. UPSCALING.3D preset: the feature uses that NGX
+    // quality mode, which must hold the render extent; without one, the first mode whose range holds it (the diagnostic
+    // 75% mode).
+    bool EnsureFeature(ID3D12GraphicsCommandList* lifecycleList, unsigned int renderWidth, unsigned int renderHeight,
         unsigned int outputWidth, unsigned int outputHeight, std::optional<DlssQualityPreset> preset = std::nullopt);
 
-    // Records one DLSS evaluation on commandList. NGX leaves the command list's state undefined (Programming Guide
-    // 5.2.5): the caller rebinds descriptor heaps, pipeline, root signature, topology, viewport and targets afterwards.
+    // Records one DLSS evaluation on commandList (the frame recording). NGX leaves the command list's state undefined
+    // (Programming Guide 5.2.5): the caller rebinds descriptor heaps, pipeline, root signature, topology, viewport and
+    // targets afterwards. InReset is evaluation.reset or EvaluationNeedsReset.
     bool Evaluate(ID3D12GraphicsCommandList* commandList, const DlssEvaluation& evaluation);
 
-    // Releases the feature. Only when no recorded DLSS work is in flight (after a GPU drain).
-    void ReleaseFeature();
+    // RR.1A: whether the next evaluation of kind's feature must reset its history regardless of the caller: no submitted
+    // evaluation since creation, or the last recorded one was discarded or never confirmed submitted.
+    bool EvaluationNeedsReset(DlssFeatureKind kind) const;
 
-    const DlssFeatureStatus& GetFeatureStatus() const noexcept { return m_feature; }
+    // RR.1A: the NGX instance must be restarted (drained Shutdown + Initialize) before any further evaluation or creation:
+    // an evaluation recorded with one of its features was discarded or never confirmed submitted. Measured: the next
+    // submitted evaluation then reports D3D12 #527 on NGX's own nv.ngx.dlss.resource textures (UAV and
+    // NON_PIXEL_SHADER_RESOURCE swapped), and the same resources survive feature release with FreeMemOnReleaseFeature.
+    // Inferred: NGX records the barrier states of its pooled internal resources while recording an evaluation. Engine
+    // never touches NGX's private state; a restarted instance is the recovery. Sticky: Shutdown keeps it, and only
+    // MarkRecovered (after a successful Initialize) clears it. Evaluate and the feature creations refuse while it is set.
+    bool RecoveryRequired() const;
+    void MarkRecovered();
+    // RR.1A: the lifecycle submission that recorded kind's pending creation was executed on the frame queue (fenceValue) or
+    // could not be (Abandon: the handle, whose creation never ran, is released and the failure memoized with detail).
+    void ConfirmFeatureCreation(DlssFeatureKind kind, std::uint64_t fenceValue);
+    void AbandonFeatureCreation(DlssFeatureKind kind, const std::string& detail);
+
+    // RR.1A: the frame recording `recording` (ResourceStateTransaction::RecordingFor, read before ExecuteCommandLists) was
+    // submitted and will signal fenceValue. Its recorded evaluations become submitted ones.
+    void ConfirmRecordingSubmitted(std::uint64_t recording, std::uint64_t fenceValue);
+
+    // RR.1A: whether kind's feature may be released now: nothing pending in an open recording, and every submitted use
+    // completed (completedFenceValue at or past it) or gpuIdle (the caller just drained the queue).
+    bool CanReleaseFeature(DlssFeatureKind kind, std::uint64_t completedFenceValue, bool gpuIdle) const;
+
+    // Releases kind's feature when CanReleaseFeature allows it (true; also true when there is none). freeMemory sets
+    // NVSDK_NGX_Parameter_FreeMemOnReleaseFeature so NGX frees the feature's memory instead of caching it (Programming
+    // Guide 3.14). A refused release changes nothing and logs why.
+    bool ReleaseFeature(DlssFeatureKind kind, std::uint64_t completedFenceValue, bool gpuIdle, bool freeMemory = false);
+
+    bool HasFeature(DlssFeatureKind kind) const noexcept;
+
+    const DlssFeatureStatus& GetFeatureStatus() const noexcept { return m_superResolution.status; }
+
+    // RR.1A Ray Reconstruction feature slot. Evaluation is RR.1C.
+    bool QueryRayReconstructionOptimalRenderExtent(DlssRayReconstructionQuality quality, unsigned int outputWidth,
+        unsigned int outputHeight, unsigned int& renderWidth, unsigned int& renderHeight);
+    bool RayReconstructionCreationNeeded(unsigned int renderWidth, unsigned int renderHeight, unsigned int outputWidth,
+        unsigned int outputHeight, DlssRayReconstructionQuality quality) const;
+    // As EnsureFeature, for Ray Reconstruction: linear HDR colour, render-extent motion vectors, hardware depth, roughness
+    // packed in the normals' alpha (the RR.0 design), NGX's default RR preset.
+    bool EnsureRayReconstructionFeature(ID3D12GraphicsCommandList* lifecycleList, unsigned int renderWidth,
+        unsigned int renderHeight, unsigned int outputWidth, unsigned int outputHeight, DlssRayReconstructionQuality quality);
+    const DlssFeatureStatus& GetRayReconstructionFeatureStatus() const noexcept { return m_rayReconstruction.status; }
+    // RR.1C: records one Ray Reconstruction evaluation on commandList (the frame recording), with the same lifecycle
+    // bookkeeping as Evaluate: pending until ConfirmRecordingSubmitted, a discarded or unconfirmed one sets
+    // RecoveryRequired, and an instance awaiting its restart is never evaluated. NGX leaves the command list's state
+    // undefined; the caller restores it.
+    bool EvaluateRayReconstruction(ID3D12GraphicsCommandList* commandList, const DlssRayReconstructionEvaluation& evaluation);
+    // NGX_DLSSD_GET_STATS: VRAM NGX holds for Ray Reconstruction (every instance, plus its cache). False when unavailable.
+    bool QueryRayReconstructionMemory(std::uint64_t& bytes);
+
+    // The live NGX feature handles (0 after Shutdown), for lifecycle verification.
+    unsigned int LiveFeatureCount() const noexcept;
 
     // Diagnostics only: the project ID in place of ENGINE_DLSS_PROJECT_ID (an invalid one exercises the failure path).
     std::optional<std::string> projectIdForTesting;
     // Diagnostics only: any value but Available makes EnsureFeature report no feature (simulates an unavailable DLSS)
     // while an existing feature stays untouched.
     std::optional<DlssAvailability> availabilityOverrideForTesting;
+    // Diagnostics only (RR.1A): the file name the Ray Reconstruction runtime check looks for beside the executable.
+    std::optional<std::string> rayReconstructionRuntimeNameForTesting;
+    // Diagnostics only (RR.1A): the next feature creation reports failure after NGX created it (exercises release after a
+    // partial initialization: the handle exists, its creation is abandoned).
+    bool failNextCreationForTesting = false;
+    // Diagnostics only (RR.1A): the InReset of the last recorded Super Resolution evaluation.
+    bool lastEvaluationResetForTesting = false;
+    // Diagnostics only (RR.1C): the InReset of the last recorded Ray Reconstruction evaluation.
+    bool lastRayReconstructionResetForTesting = false;
+    // Diagnostics only (RR.1C): the next Ray Reconstruction evaluation reports failure without calling NGX.
+    bool failNextRayReconstructionEvaluationForTesting = false;
 
 private:
-    // The capability parameter map (allocated once); false with the failure in m_feature.
-    bool EnsureParameters();
+    // RR.1A: one NGX feature and its lifecycle bookkeeping.
+    struct FeatureSlot
+    {
+        // NVSDK_NGX_Parameter* (the slot's own capability map) and NVSDK_NGX_Handle*, opaque here so that the header
+        // needs no SDK.
+        void* parameters = nullptr;
+        void* handle = nullptr;
+        DlssFeatureStatus status;
+        // A creation recorded on a lifecycle list not yet reported submitted (Evaluate refuses the feature meanwhile).
+        bool creationPending = false;
+        // The frame recording (and its list) holding an evaluation not yet confirmed submitted (0: none). Resolved lazily
+        // against R.1's recording state, hence mutable.
+        mutable std::uint64_t pendingRecording = 0;
+        mutable const void* pendingList = nullptr;
+        // The latest fence of a submitted use (creation or evaluation); unknown when a submission's fence is not known.
+        std::uint64_t lastUseFence = 0;
+        mutable bool lastUseUnknown = false;
+        // A pending evaluation was discarded, failed to submit or was never confirmed: the next evaluation resets.
+        mutable bool historyInvalid = false;    };
+
+    // Resolves the slot's pending evaluation against R.1's recording state: an open one stays pending; a discarded or
+    // otherwise unconfirmed one invalidates the history.
+    void ResolvePendingEvaluation(const FeatureSlot& slot) const;
+    // RR.1C: the bookkeeping after a successful NGX evaluation call on commandList (shared by both features).
+    void RecordPendingEvaluation(FeatureSlot& slot, ID3D12GraphicsCommandList* commandList);
+    bool EnsureParameters(FeatureSlot& slot, const char* featureName);
+    bool CanRelease(const FeatureSlot& slot, std::uint64_t completedFenceValue, bool gpuIdle, std::string& reason) const;
+    void ReleaseSlot(FeatureSlot& slot, bool freeMemory);
+    FeatureSlot& Slot(DlssFeatureKind kind) noexcept
+    {
+        return kind == DlssFeatureKind::SuperResolution ? m_superResolution : m_rayReconstruction;
+    }
+    const FeatureSlot& Slot(DlssFeatureKind kind) const noexcept
+    {
+        return kind == DlssFeatureKind::SuperResolution ? m_superResolution : m_rayReconstruction;
+    }
 
     // M0c.5 Stage 5.5: everything Initialize decides, computed without touching this object (so on any thread).
     struct InitializationOutcome
@@ -177,18 +394,26 @@ private:
         bool initialized = false;
     };
 
-    static InitializationOutcome RunInitialize(ID3D12Device* device, const std::string& projectId);
+    struct InitializationRequest
+    {
+        std::string projectId;
+        bool rayReconstructionPermitted = true;
+        std::string rayReconstructionRuntimeName;
+    };
+
+    static InitializationOutcome RunInitialize(ID3D12Device* device, const InitializationRequest& request);
     void Adopt(InitializationOutcome outcome, ID3D12Device* device);
-    std::string ProjectId() const;
+    InitializationRequest MakeInitializationRequest() const;
 
     std::future<InitializationOutcome> m_pending;
     ID3D12Device* m_pendingDevice = nullptr;
 
     ID3D12Device* m_device = nullptr;
     bool m_initialized = false;
+    bool m_rayReconstructionPermitted = true;
+    // RR.1A: RecoveryRequired (set while resolving a pending evaluation, hence mutable).
+    mutable bool m_recoveryRequired = false;
     DlssStatus m_status;
-    // NVSDK_NGX_Parameter* and NVSDK_NGX_Handle*, opaque here so that the header needs no SDK.
-    void* m_parameters = nullptr;
-    void* m_featureHandle = nullptr;
-    DlssFeatureStatus m_feature;
+    FeatureSlot m_superResolution;
+    FeatureSlot m_rayReconstruction;
 };

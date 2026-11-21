@@ -907,6 +907,12 @@ if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Renderer
     target_link_libraries(ReGIRTests PRIVATE EngineCore)
     engine_use_agility(ReGIRTests)
 endif()
+# Local-only BSDF-aware temporal NEE T0 CPU prototype study, same guard.
+if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Renderer/tests/NeeT0Study.cpp")
+    add_executable(NeeT0Study src/Renderer/tests/NeeT0Study.cpp)
+    target_link_libraries(NeeT0Study PRIVATE EngineCore)
+    engine_use_agility(NeeT0Study)
+endif()
 # Local-only workload guard estimate regression (pure arithmetic), same guard.
 if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Renderer/tests/WorkloadGuardTests.cpp")
     add_executable(WorkloadGuardTests src/Renderer/tests/WorkloadGuardTests.cpp)
@@ -1046,6 +1052,8 @@ engine_deploy_dxc(Engine)
 # runtime too; Build Game ships it only in games whose saved settings can use DLSS (BuildGame.cpp DeployRuntimeFiles).
 engine_deploy_dlss(Engine)
 engine_deploy_dlss(EngineRuntime)
+# RR.1A: DLSS Ray Reconstruction's runtime beside the Editor only (never EngineRuntime, Build Game's source).
+engine_deploy_dlss_rr(Engine)
 # Both executables start audio. The Editor uses FMOD's logging DLLs in Debug; EngineRuntime, whose directory Build Game
 # deploys games from, always uses the production DLLs (cmake/FMOD.cmake, ENGINE_FMOD_LOGGING).
 set_target_properties(Engine PROPERTIES ENGINE_FMOD_LOGGING ON)

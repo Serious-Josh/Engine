@@ -48,6 +48,9 @@ struct RenderingConfiguration
     int renderScaleIndex = 0;
     // The user asked for DLSS Super Resolution (normal, not diagnostic, DLSS).
     bool dlssRequested = false;
+    // RR.1D: the user selected DLSS Ray Reconstruction (Path Tracing only; denoiser then holds NrdHybrid, whose extraction RR
+    // reads). The renderer decides whether it is effective (Renderer::SetRayReconstructionRequested).
+    bool rayReconstructionRequested = false;
     bool dlssInputPreparation = false;
     SharcSettings sharc{};
 

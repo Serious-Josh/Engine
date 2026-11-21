@@ -62,6 +62,18 @@ class CommandContext
     std::uint64_t GetGPUDrainCount() const noexcept { return m_gpuDrainCount; }
     bool WaitForGPU();
 
+    // RR.1A: a short lifecycle command list on the frame queue, outside the frame recording, for NGX feature creation. The
+    // frame recording can be discarded (R.1); work recorded here is submitted at once, so it is on the queue ahead of every
+    // later frame submission without a CPU wait. Begin waits only if the previous lifecycle submission is still running
+    // (its allocator is reused) and returns nullptr while one is open or when it cannot reset. Submit closes and executes
+    // the list, then signals the frame fence: fenceValue is the signalled value, 0 when the signal failed after execution
+    // (completion unknown). False: nothing was executed (the list is closed and may be begun again). Abandon closes it
+    // without executing anything. Tracked resources (R.1) are never transitioned on this list. Render thread only.
+    ID3D12GraphicsCommandList* BeginLifecycleCommands();
+    bool SubmitLifecycleCommands(std::uint64_t& fenceValue);
+    void AbandonLifecycleCommands();
+    std::uint64_t GetLifecycleSubmissionCount() const noexcept { return m_lifecycleSubmissions; }
+
     ID3D12GraphicsCommandList* GetCommandList() const;
     ID3D12CommandQueue* GetCommandQueue() const;
     ID3D12GraphicsCommandList4* GetRayTracingCommandList() const;
@@ -157,6 +169,15 @@ class CommandContext
     ID3D12GraphicsCommandList* m_commandList = nullptr;
 
     ID3D12GraphicsCommandList4* m_rayTracingCommandList = nullptr;
+
+    // RR.1A lifecycle list (created on first use).
+    ID3D12CommandAllocator* m_lifecycleAllocator = nullptr;
+    ID3D12GraphicsCommandList* m_lifecycleList = nullptr;
+    bool m_lifecycleOpen = false;
+    // The fence value of the last lifecycle submission (0: none, or its signal failed and m_lifecycleUncertain is set).
+    std::uint64_t m_lifecycleFenceValue = 0;
+    bool m_lifecycleUncertain = false;
+    std::uint64_t m_lifecycleSubmissions = 0;
 
     ID3D12Fence* m_fence = nullptr;
     unsigned long long m_fenceValue = 0;

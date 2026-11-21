@@ -14,6 +14,9 @@
 // PSR.2 Stage 3B phase 4: the path-traced NRD preparation and resolves with NRD_PATH_TRACE_PSR (PsrDenoise.hlsli),
 // selected on frames that light replaced pixels. Development only; production frames keep NrdPathTracePrepare.hlsl.
 {"NrdPathTracePreparePsr.hlsl", "NrdPathTracePrepare.hlsl", "NRD_PATH_TRACE_PSR=1", ""},
+// RR.1B: the DLSS Ray Reconstruction input preparation with RR_INPUT_PSR (PsrDenoise.hlsli), on frames that light replaced
+// pixels. Editor diagnostics only (RR is not a rendering mode before RR.1D); not cooked.
+{"RrInputPreparationPsr.hlsl", "RrInputPreparation.hlsl", "RR_INPUT_PSR=1", ""},
 // PSR.1a: Raster Primary primary surface replacement (PATH_TRACE_PSR_LIBRARY, PathTraceReference.hlsl), in a DXR
 // library of its own so every production library compiles exactly as before. Development only: created when the PSR
 // toggle is on; not in the cooked manifests, so packaged runtimes report it unavailable. Compiled as lib_6_6, as

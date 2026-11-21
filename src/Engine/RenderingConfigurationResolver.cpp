@@ -40,6 +40,8 @@ namespace
             return PathTraceDenoiserMode::NrdReblur;
         case ProjectPathTraceDenoiser::NrdRelax:
             return PathTraceDenoiserMode::NrdRelax;
+        // RR.1D: Ray Reconstruction reads the hybrid configuration's extraction; the renderer skips NRD on RR frames.
+        case ProjectPathTraceDenoiser::DlssRayReconstruction:
         case ProjectPathTraceDenoiser::NrdHybrid:
         default:
             return PathTraceDenoiserMode::NrdHybrid;
@@ -203,6 +205,7 @@ RenderingConfiguration ResolveRenderingConfiguration(const RenderingSettings& se
     if(isPathTracing)
     {
         configuration.denoiser = ToPathTraceDenoiser(pathTracing.denoiser);
+        configuration.rayReconstructionRequested = pathTracing.denoiser == ProjectPathTraceDenoiser::DlssRayReconstruction;
         configuration.denoiserVisualization = ToDenoiserVisualization(pathTracing);
         configuration.psrDebugView = pathTracing.psrMode != ProjectPsrMode::Off ?
             ToPsrDebugView(pathTracing.psrDebugView) : ToneMapDebugView::None;

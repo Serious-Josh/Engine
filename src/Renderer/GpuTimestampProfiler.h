@@ -82,6 +82,10 @@ class GpuTimestampProfiler
         PsrInPlaceReplace,
         // M4.1: the shared light-sampling structures' copy (lighting-revision changes only).
         LightSamplingUpload,
+        // RR.1B: the Ray Reconstruction input preparation (RR frames, or the diagnostic hook), after DlssInputPreparation.
+        RrInputPreparation,
+        // RR.1C: the NGX Ray Reconstruction evaluation (in DlssEvaluate's place on RR frames).
+        RrEvaluate,
         Count
     };
 

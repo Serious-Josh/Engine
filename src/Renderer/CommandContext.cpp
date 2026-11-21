@@ -194,6 +194,23 @@ void CommandContext::Shutdown()
         }
     }
 
+    // RR.1A: the lifecycle list. Its submissions signal the frame fence, so the caller's drain covers them.
+    if (m_lifecycleList)
+    {
+        m_lifecycleList->Release();
+        m_lifecycleList = nullptr;
+    }
+
+    if (m_lifecycleAllocator)
+    {
+        m_lifecycleAllocator->Release();
+        m_lifecycleAllocator = nullptr;
+    }
+
+    m_lifecycleOpen = false;
+    m_lifecycleFenceValue = 0;
+    m_lifecycleUncertain = false;
+
     if (m_commandQueue)
     {
         m_commandQueue->Release();
@@ -451,6 +468,126 @@ bool CommandContext::Execute(unsigned int frameIndex)
     }
 
     return true;
+}
+
+ID3D12GraphicsCommandList* CommandContext::BeginLifecycleCommands()
+{
+    if (m_lifecycleOpen || !m_commandQueue || !m_fence || !m_fenceEvent)
+    {
+        Log::Error("Cannot begin lifecycle commands: one is already open or the command context is not initialized.");
+        return nullptr;
+    }
+
+    if (m_lifecycleUncertain)
+    {
+        // A lifecycle submission whose signal failed may still run: its allocator cannot be reset safely.
+        Log::Error("Cannot begin lifecycle commands after an uncertain lifecycle submission.");
+        return nullptr;
+    }
+
+    if (!m_lifecycleAllocator)
+    {
+        ID3D12Device* device = nullptr;
+
+        if (FAILED(m_commandQueue->GetDevice(IID_PPV_ARGS(&device))))
+        {
+            return nullptr;
+        }
+
+        const bool created =
+            SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&m_lifecycleAllocator))) &&
+            SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, m_lifecycleAllocator, nullptr,
+                IID_PPV_ARGS(&m_lifecycleList))) &&
+            SUCCEEDED(m_lifecycleList->Close());
+        device->Release();
+
+        if (!created)
+        {
+            Log::Error("Failed to create the lifecycle command list.");
+            return nullptr;
+        }
+
+        m_lifecycleAllocator->SetName(L"Lifecycle Command Allocator");
+        m_lifecycleList->SetName(L"Lifecycle Command List");
+    }
+
+    // The allocator is reused: its previous submission must have completed (rare; lifecycle submissions are rare).
+    if (m_lifecycleFenceValue != 0 && m_fence->GetCompletedValue() < m_lifecycleFenceValue)
+    {
+        if (FAILED(m_fence->SetEventOnCompletion(m_lifecycleFenceValue, static_cast<HANDLE>(m_fenceEvent))) ||
+            WaitForSingleObject(static_cast<HANDLE>(m_fenceEvent), INFINITE) != WAIT_OBJECT_0 ||
+            m_fence->GetCompletedValue() == UINT64_MAX)
+        {
+            Log::Error("Failed waiting for the previous lifecycle submission.");
+            return nullptr;
+        }
+    }
+
+    if (FAILED(m_lifecycleAllocator->Reset()) || FAILED(m_lifecycleList->Reset(m_lifecycleAllocator, nullptr)))
+    {
+        Log::Error("Failed to reset the lifecycle command list.");
+        return nullptr;
+    }
+
+    m_lifecycleOpen = true;
+    return m_lifecycleList;
+}
+
+bool CommandContext::SubmitLifecycleCommands(std::uint64_t& fenceValue)
+{
+    fenceValue = 0;
+
+    if (!m_lifecycleOpen)
+    {
+        return false;
+    }
+
+    m_lifecycleOpen = false;
+
+    if (FAILED(m_lifecycleList->Close()))
+    {
+        Log::Error("Failed to close the lifecycle command list; nothing was executed.");
+        return false;
+    }
+
+    if (m_fenceValue == 0 || m_fenceValue == UINT64_MAX)
+    {
+        Log::Error("Cannot submit lifecycle commands: fence values exhausted or uninitialized.");
+        return false;
+    }
+
+    ID3D12CommandList* lists[] = {m_lifecycleList};
+    m_commandQueue->ExecuteCommandLists(1, lists);
+    ++m_lifecycleSubmissions;
+
+    // The frame fence, like WaitForGPU's idle signal: values stay ordered with frame submissions on the one queue, and
+    // m_lastSubmissionFence (frame submissions only) is unchanged.
+    const unsigned long long signalled = m_fenceValue;
+
+    if (FAILED(m_commandQueue->Signal(m_fence, signalled)))
+    {
+        Log::Error("Failed to signal the frame fence after lifecycle commands; their completion is unknown.");
+        m_lifecycleUncertain = true;
+        m_lifecycleFenceValue = 0;
+        return true;
+    }
+
+    ++m_fenceValue;
+    m_lifecycleFenceValue = signalled;
+    fenceValue = signalled;
+    return true;
+}
+
+void CommandContext::AbandonLifecycleCommands()
+{
+    if (!m_lifecycleOpen)
+    {
+        return;
+    }
+
+    // Closed, never executed; the next Begin resets the allocator.
+    m_lifecycleOpen = false;
+    m_lifecycleList->Close();
 }
 
 bool CommandContext::WaitForGPU()

@@ -52,5 +52,7 @@ inline constexpr const char* GpuTimingRegionNames[] = {"GPU frame",
                                                        "PT PSR record",
                                                        "PT PSR raster",
                                                        "PSR in-place replace",
-                                                       "Light sampling upload"};
+                                                       "Light sampling upload",
+                                                       "RR input preparation",
+                                                       "RR evaluate"};
 static_assert(sizeof(GpuTimingRegionNames) / sizeof(GpuTimingRegionNames[0]) == GpuTimingMonitor::RegionCount);

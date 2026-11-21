@@ -61,6 +61,7 @@
 #include "Passes/ToneMapPass.h"
 #include "Passes/PresentationResolvePass.h"
 #include "Passes/DlssInputPreparationPass.h"
+#include "Passes/RrInputPreparationPass.h"
 #include "Passes/AutoExposurePass.h"
 #include "Upscaling/DlssBackend.h"
 #include "Passes/DeferredLightingPass.h"
@@ -466,7 +467,12 @@ class Renderer
     // Takes effect at the next ResizeScene, which recreates the extent-sized resources only when the render extent
     // changes. Set it before ResizeScene, outside any frame recording.
     void SetRenderScale(RenderScale scale, bool eligible = true, bool retry = false, bool normalRequest = false);
-    bool HasPendingDlssFallback() const noexcept { return !m_dlssFailure.empty() && IsDlssRenderScale(m_renderScale); }
+    // RR.1C: a latched Ray Reconstruction failure is a pending fallback too.
+    bool HasPendingDlssFallback() const noexcept
+    {
+        return (!m_dlssFailure.empty() && IsDlssRenderScale(m_renderScale)) ||
+            (!m_rrFailure.empty() && m_rayReconstructionEffective);
+    }
     RenderScale GetRenderScale() const noexcept { return m_renderScale; }
 
     // UPSCALING.2B: length of the camera jitter sequence (Halton(2, 3), indices 1..8).
@@ -483,6 +489,17 @@ class Renderer
     // UPSCALING.3B/3C: how the last frame was presented.
     const char* GetPresentationModeName() const noexcept
     {
+        // RR.1C: the experimental Ray Reconstruction path, at DLAA or a preset.
+        if(m_rayReconstructionEffective)
+        {
+            if(!m_rrEvaluatedLastFrame)
+            {
+                return "DLSS Ray Reconstruction (inactive)";
+            }
+
+            return m_renderScale == RenderScale::Native ? "DLSS Ray Reconstruction DLAA" : "DLSS Ray Reconstruction";
+        }
+
         if(!PresentationResolveActive())
         {
             return "Native";
@@ -1889,9 +1906,10 @@ private:
 
     // UPSCALING.2A/2C: the render extent for a requested output extent. Native: the output extent itself. Diagnostic75
     // and Dlss75: each axis round(0.75 * output) (half up), at least 1. UPSCALING.3D presets: the NGX optimal extent;
-    // presetSupported is false (and the extent 75%) when NGX reports none.
+    // presetSupported is false (and the extent 75%) when NGX reports none. RR.1C rayReconstruction: a preset's extent is
+    // Ray Reconstruction's optimal one instead of Super Resolution's.
     SceneResolution ResolveSceneResolution(unsigned int outputWidth, unsigned int outputHeight, RenderScale scale,
-        bool& presetSupported);
+        bool& presetSupported, bool rayReconstruction = false);
 
     // Private resize stages: called only after Resize() confirms the queue is idle.
     bool ResizeApplicationResources(
@@ -3105,6 +3123,9 @@ private:
     std::string m_dlssFailure;
     std::string m_dlssPublishedState;
     std::string m_dlssPublishedDetail;
+    // RR.1A: the last Ray Reconstruction readout published (logged on change only).
+    std::string m_rayReconstructionPublishedState;
+    std::string m_rayReconstructionPublishedDetail;
 
     // UPSCALING.2C output-extent targets of the diagnostic presentation resolve: HDR colour (tone mapping's input),
     // selection mask (the outline's) and depth (the outline's and the Editor overlays'). Allocated only while the render
@@ -3123,6 +3144,35 @@ private:
     void ApplyDlssInputPreparation(bool requested);
     bool m_dlssInputPreparation = false;
     DlssInputPreparationPass m_dlssInputPreparationPass;
+    // RR.1B: the Ray Reconstruction inputs (diagnostics only before RR.1C; Editor only). Prepared on path-traced frames
+    // that extracted and prepared the DLSS inputs while m_rrInputPreparationForTesting is set; its targets are allocated
+    // only then and released on resize and when preparation stops (SetRrInputPreparationForTesting).
+    RrInputPreparationPass m_rrInputPreparationPass;
+    bool m_rrInputPreparationForTesting = false;
+    // Adds the PSR throughput target (RrInputPreparation.hlsl).
+    bool m_rrInputDiagnosticsForTesting = false;
+    bool m_rrInputsPreparedLastFrame = false;
+    std::string m_rrInputPreparationFailure;
+    // RR.1C: requested (SetRayReconstructionRequested), applied by ResizeScene, and this frame's RR mode.
+    bool m_rayReconstructionRequested = false;
+    // ENGINE_EXPERIMENTAL_RR was read (ResizeScene, once per session), and whether it requested RR (ORed with every request).
+    bool m_rayReconstructionEnvironmentApplied = false;
+    bool m_rayReconstructionEnvironmentRequest = false;
+    bool m_rayReconstructionEffective = false;
+    bool m_rrModeThisFrame = false;
+    bool m_rrEvaluatedLastFrame = false;
+    // RR.1C: the latched failure (empty: none); the next ResizeScene falls back.
+    std::string m_rrFailure;
+    const char* m_rrInactiveReason = "";
+    // RR.1C: whether ResizeScene would apply Ray Reconstruction now (requested, permitted, available, not failed, and a
+    // scale it supports), and the RR quality of a scale.
+    bool RayReconstructionApplicable(RenderScale scale) const;
+    static DlssRayReconstructionQuality RayReconstructionQuality(RenderScale scale) noexcept;
+    void FailRayReconstruction(const std::string& stage, const std::string& detail);
+    // The RR feature for this frame's extents (created on the lifecycle list, Super Resolution's released first).
+    bool EnsureRayReconstructionFeature(std::string& failure);
+    // Records the RR evaluation of this frame's prepared inputs into m_presentationColor; false leaves the resolve's colour.
+    bool RecordRayReconstructionEvaluation(ID3D12GraphicsCommandList* commandList, unsigned int frameIndex);
     // Physical Lighting C2: this frame's camera exposure, read by tone mapping and the DLSS exposure texture.
     AutoExposurePass m_autoExposurePass;
     bool m_exposureInitialized = false;
@@ -3185,6 +3235,107 @@ private:
     void PublishDlssReadout();
     void FailDlss(const std::string& stage, const std::string& detail);
     void RestoreDlssGraphicsState(ID3D12GraphicsCommandList* commandList);
+
+    // RR.1A NGX lifecycle (DLSS_Ray_Reconstruction_RR1A.md). The Super Resolution feature for this frame's extents, created
+    // when needed on a lifecycle list (CreateDlssFeatureOnLifecycleList) instead of the discardable frame recording; failure
+    // explains a failure that the feature status does not.
+    bool EnsureDlssFeature(const UpscalerFrameInputs& inputs, std::string& failure);
+    // Records create(list) on the lifecycle list and submits it on the frame queue; a creation that did not succeed is
+    // abandoned (never executed) and its handle released.
+    bool CreateDlssFeatureOnLifecycleList(DlssFeatureKind kind, const std::function<bool(ID3D12GraphicsCommandList*)>& create,
+        std::string& failure);
+    // Releases kind's feature once its submitted uses completed: at once when the fences show it (or gpuIdle, a drained
+    // caller), otherwise after a GPU drain (lifecycle transitions only). False when it cannot be released (an evaluation
+    // pending in the open recording, or a failed drain).
+    bool ReleaseDlssFeature(DlssFeatureKind kind, bool freeMemory, bool gpuIdle);
+    // Submission and discard of a frame recording, as NGX bookkeeping sees them (both submission paths; AbortTrackedRecording).
+    void ConfirmNgxRecordingSubmitted(std::uint64_t recording, std::uint64_t fenceValue);
+    void DiscardNgxRecordingState();
+    // The open recording consumed a pending upscaler history reset (returned to pending if the recording is discarded).
+    bool m_upscalerResetConsumedInRecording = false;
+    // RR.1A: a pending NGX restart (DlssBackend::RecoveryRequired) runs between frames: drain, Shutdown, Initialize. A
+    // failed attempt blocks further attempts (fail closed: the instance is never evaluated) until DLSS Retry.
+    void RecoverNgxIfRequired();
+    bool m_ngxRecoveryBlocked = false;
+
+public:
+    // RR.1A diagnostics: the Ray Reconstruction feature slot exercised without rendering (no evaluation exists before
+    // RR.1C). Create releases Super Resolution's feature first (the ownership policy) and creates Ray Reconstruction's for
+    // the current output extent at quality; call between frames.
+    bool CreateRayReconstructionFeatureForTesting(DlssRayReconstructionQuality quality, std::string& failure);
+    bool ReleaseRayReconstructionFeatureForTesting();
+    // RR.1A harness: the next frame that records a DLSS evaluation is discarded right after it (AbortTrackedRecording);
+    // Render reports it Deferred, as the M4.3.5 hook does.
+    bool m_abortFrameAfterDlssEvaluationForTesting = false;
+    // With it: only a frame whose DLSS feature was created (on the lifecycle list) during this recording is discarded.
+    bool m_abortRequiresDlssCreationForTesting = false;
+    bool m_dlssFeatureCreatedThisRecording = false;
+    // RR.1A: NGX feature creations submitted on the lifecycle list, and releases that had to drain the GPU first.
+    std::uint64_t m_ngxLifecycleCreationsForTesting = 0;
+    std::uint64_t m_ngxReleaseWaitsForTesting = 0;
+    // RR.1A: NGX restarts after a discarded evaluation (DlssBackend::RecoveryRequired), with the last one's render-thread
+    // cost, and the CPU time of the last lifecycle-list feature creation.
+    struct NgxRecoveryTiming
+    {
+        double drainMilliseconds = 0.0;
+        double shutdownMilliseconds = 0.0;
+        double initializeMilliseconds = 0.0;
+    };
+
+    std::uint64_t m_ngxRecoveriesForTesting = 0;
+    NgxRecoveryTiming m_lastNgxRecoveryTiming;
+    double m_lastNgxCreationMilliseconds = 0.0;
+    bool IsNgxRecoveryBlocked() const noexcept { return m_ngxRecoveryBlocked; }    DlssBackend& GetDlssBackendForTesting() noexcept { return m_dlssBackend; }
+    // RR.1B diagnostics: starts or stops the Ray Reconstruction input preparation (between frames). Stopping releases its
+    // targets after a GPU drain (no recorded frame reads them afterwards; Texture::Shutdown defers nothing).
+    void SetRrInputPreparationForTesting(bool enabled, bool diagnostics = false);
+
+    // RR.1C experimental DLSS Ray Reconstruction (DLSS_Ray_Reconstruction_RR1C.md). RR.1D: requested every frame by the
+    // resolved configuration (ApplyRenderScale; the project's "dlssRayReconstruction" denoiser), or for the session by
+    // ENGINE_EXPERIMENTAL_RR; never in the packaged runtime (RR is Editor-only). The request takes effect at the
+    // next ResizeScene, a drained boundary that recreates the extent-sized resources and releases both NGX features. It is
+    // effective while Ray Reconstruction is available, not failed, and the render scale is Native (RR at DLAA) or a DLSS
+    // preset (RR at that preset's extent); Dlss75 and Diagnostic75 keep their paths. An RR frame is a raster-primary
+    // path-traced NRD Hybrid frame: the path tracer, its extraction and the RR inputs run, NRD Hybrid, the Engine stages
+    // and DLSS Super Resolution do not, and RR's output at the output extent goes through the ordinary mist, exposure,
+    // tone-mapping and overlay path. A failure latches a reason and falls back (NRD Hybrid, plus SR at a preset) at the
+    // next ResizeScene; Retry (SetRenderScale with retry) clears it.
+    void SetRayReconstructionRequested(bool requested);
+    bool IsRayReconstructionRequested() const noexcept { return m_rayReconstructionRequested; }
+    // The applied state (ResizeScene) and whether the last frame presented an RR evaluation.
+    bool IsRayReconstructionEffective() const noexcept { return m_rayReconstructionEffective; }
+    bool IsRayReconstructionActiveLastFrame() const noexcept { return m_rrEvaluatedLastFrame; }
+    const std::string& GetRayReconstructionFailure() const noexcept { return m_rrFailure; }
+    // RR's jitter phase floor (RR guide 3.6: "at least 32"); the count is max(this, DlssJitterPhaseCount).
+    static constexpr std::uint32_t RayReconstructionMinimumJitterPhases = 32;
+
+    // RR.1C exposure experiment (diagnostics only): how RR's colour is exposed. None passes raw radiance and no exposure
+    // input (the production configuration, RR.1C section 7); ExposureTexture also binds the auto-exposure texture;
+    // PreExposed scales the noisy colour by m_rrPreExposureForTesting (RrInputPreparation.hlsl colorScale) and passes it as
+    // InPreExposure. RR's output then stays scaled (the presented image is brighter by that factor): measurement only.
+    enum class RayReconstructionExposureMode
+    {
+        None,
+        ExposureTexture,
+        PreExposed
+    };
+
+    RayReconstructionExposureMode m_rrExposureModeForTesting = RayReconstructionExposureMode::None;
+    float m_rrPreExposureForTesting = 1.0f;
+    // RR.1C harness: the next RR evaluation reports failure (DlssBackend::failNextRayReconstructionEvaluationForTesting).
+    bool m_rrEvaluationFailureForTesting = false;
+    // RR.2 boiling investigation (diagnostics only): RR's specular-motion input is the ordinary (surface) motion vectors
+    // instead of RR.1B's reflection-aware ones. False in production.
+    bool m_rrSurfaceMotionAsSpecularForTesting = false;
+    // RR.1C harness: RR evaluations recorded in submitted frames, and the last one's InReset.
+    std::uint64_t GetRayReconstructionEvaluationsForTesting() const noexcept
+    {
+        return m_dlssBackend.GetRayReconstructionFeatureStatus().evaluations;
+    }
+    RrInputPreparationPass& GetRrInputPreparationPassForTesting() noexcept { return m_rrInputPreparationPass; }
+    RenderTarget& GetPresentationColorForTesting() noexcept { return m_presentationColor; }
+
+private:
     bool PresentationResolveActive() const noexcept
     {
         return m_sceneWidth != m_outputWidth || m_sceneHeight != m_outputHeight;

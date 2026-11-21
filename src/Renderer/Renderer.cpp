@@ -13,6 +13,7 @@
 #include "Core/Log.h"
 #include "Core/Assert.h"
 #include "Renderer.h"
+#include "ResourceStateTransaction.h"
 #include "DisplacementGPUIndexLayout.h"
 #include "Displacement/DisplacementUpdateCoordinator.h"
 #include "Displacement/DisplacementCommandRecorder.h"
@@ -769,6 +770,7 @@ bool Renderer::AbortTrackedRecording()
 
     if(discarded)
     {
+        DiscardNgxRecordingState();
         m_referenceRayCounts.Abort(materialSlot, uploadGeneration);
         // M4.1: a light-sampling copy recorded in the discarded list never ran.
         m_lightSamplingBuffer.DiscardRecording(m_commandContext.GetLastSubmissionFenceValue());
@@ -841,10 +843,14 @@ bool Renderer::ExecuteTrackedRecording(unsigned int frameSlot)
     }
 
     m_commandSubmissionAttempted = true;
+    // RR.1A: read before submission, while the recording is still open.
+    const std::uint64_t ngxRecording = ResourceStateTransaction::RecordingFor(m_commandContext.GetCommandList());
     const bool executed = m_commandContext.Execute(frameSlot);
 
     if(executed)
     {
+        ConfirmNgxRecordingSubmitted(ngxRecording, m_commandContext.GetLastSubmissionFenceValue());
+
         if (!m_rayTracingScene.ConfirmMembershipSubmission(m_commandRecordingGeneration, m_commandContext))
         {
             Log::Error("DXR membership submission association failed; retaining snapshot ownership.");
@@ -1244,10 +1250,14 @@ ReservedSubmissionResult Renderer::ExecuteCoveredDisplacementRecording(
     }
 
     m_commandSubmissionAttempted = true;
+    // RR.1A: read before submission, while the recording is still open.
+    const std::uint64_t ngxRecording = ResourceStateTransaction::RecordingFor(m_commandContext.GetCommandList());
     const auto result = m_commandContext.ExecuteReserved(frameSlot, reservation, submitted);
 
     if(result == ReservedSubmissionResult::Submitted)
     {
+        ConfirmNgxRecordingSubmitted(ngxRecording, submitted.fenceValue);
+
         if (!m_rayTracingScene.ConfirmMembershipSubmission(m_commandRecordingGeneration, m_commandContext))
         {
             Log::Error("DXR membership reserved submission association failed; retaining snapshot ownership.");
@@ -2923,6 +2933,9 @@ bool Renderer::Initialize(
     m_dlssPublishedState.clear();
     m_dlssPublishedDetail.clear();
     m_packagedRuntime = !packagedShaders.empty();
+    // RR.1A: Ray Reconstruction is Editor-only (its runtime is never deployed with packaged games); a packaged run reports
+    // it NotPermitted without querying NGX for it.
+    m_dlssBackend.SetRayReconstructionPermitted(!m_packagedRuntime);
     m_projectWorkflowStart = projectWorkflowStart && !m_packagedRuntime;
     // PS.5C: the worker's private shader library for the PSR auxiliary pipelines reads the same cooked bootstrap.
     m_packagedShaderPayload = m_packagedRuntime ?
@@ -4125,13 +4138,37 @@ bool Renderer::ResizeScene(unsigned int width, unsigned int height)
 
     if(width == 0 || height == 0) return true;
     if(width != m_outputWidth || height != m_outputHeight) m_dlssFailure.clear();
+
+    // RR.1C diagnostics: ENGINE_EXPERIMENTAL_RR requests experimental Ray Reconstruction for the session, whatever the
+    // project selects (manual inspection, the dev-DLL overlay). Never persisted; the packaged runtime ignores it
+    // (RayReconstructionApplicable).
+    if(!m_rayReconstructionEnvironmentApplied)
+    {
+        m_rayReconstructionEnvironmentApplied = true;
+
+        if(std::getenv("ENGINE_EXPERIMENTAL_RR") && !m_packagedRuntime)
+        {
+            Log::Info("DLSS Ray Reconstruction: experimental path requested by ENGINE_EXPERIMENTAL_RR.");
+            m_rayReconstructionEnvironmentRequest = true;
+            SetRayReconstructionRequested(true);
+        }
+    }
+
     const auto effectiveScale = [&]()
     {
+        // RR.1C: Ray Reconstruction renders at its own preset extent (or DLAA at Native), independently of Super
+        // Resolution's state.
+        if(RayReconstructionApplicable(m_requestedRenderScale))
+        {
+            return m_requestedRenderScale;
+        }
+
         return IsDlssRenderScale(m_requestedRenderScale) &&
             (!m_dlssEligible || m_dlssBackend.GetStatus().availability != DlssAvailability::Available || !m_dlssFailure.empty()) ?
             RenderScale::Native : m_requestedRenderScale;
     };
-    if(width == m_outputWidth && height == m_outputHeight && effectiveScale() == m_renderScale && !m_dlssRetryPending)
+    if(width == m_outputWidth && height == m_outputHeight && effectiveScale() == m_renderScale && !m_dlssRetryPending &&
+        RayReconstructionApplicable(m_requestedRenderScale) == m_rayReconstructionEffective)
     {
         PublishDlssReadout();
         return true;
@@ -4151,23 +4188,45 @@ bool Renderer::ResizeScene(unsigned int width, unsigned int height)
 
     if(m_dlssRetryPending)
     {
-        m_dlssBackend.ReleaseFeature();
-        if(m_dlssBackend.GetStatus().availability != DlssAvailability::Available)
+        // Drained above.
+        ReleaseDlssFeature(DlssFeatureKind::SuperResolution, false, true);
+        if(m_dlssBackend.RecoveryRequired())
+        {
+            // RR.1A: a failed NGX restart is attempted again before the next frame (RecoverNgxIfRequired), which also
+            // reinitializes; nothing is initialized twice here.
+            m_ngxRecoveryBlocked = false;
+        }
+        else if(m_dlssBackend.GetStatus().availability != DlssAvailability::Available)
         {
             m_dlssBackend.Shutdown();
             m_dlssBackend.Initialize(m_graphicsDevice.GetDevice());
         }
         m_dlssFailure.clear();
+        m_rrFailure.clear();
         m_dlssRetryPending = false;
     }
     bool presetSupported = true;
     RenderScale effective = effectiveScale();
-    const SceneResolution resolution = ResolveSceneResolution(width, height, effective, presetSupported);
+    // RR.1C: ResizeSceneResources releases both NGX features (the GPU is drained above); the next RR frame creates its
+    // feature on the lifecycle list.
+    bool rayReconstruction = RayReconstructionApplicable(m_requestedRenderScale);
+    SceneResolution resolution = ResolveSceneResolution(width, height, effective, presetSupported, rayReconstruction);
+    if(!presetSupported && rayReconstruction)
+    {
+        FailRayReconstruction("Optimal settings", m_dlssBackend.GetRayReconstructionFeatureStatus().detail);
+        rayReconstruction = false;
+        effective = effectiveScale();
+        presetSupported = true;
+        resolution = ResolveSceneResolution(width, height, effective, presetSupported, false);
+    }
     if(!presetSupported)
     {
         FailDlss("Optimal settings", m_dlssBackend.GetFeatureStatus().detail);
         effective = RenderScale::Native;
     }
+
+    // Read by ResizeSceneResources (RR at DLAA presents through the output-extent targets as well).
+    m_rayReconstructionEffective = rayReconstruction;
 
     if(!ResizeSceneResources(resolution))
     {
@@ -4177,6 +4236,7 @@ bool Renderer::ResizeScene(unsigned int width, unsigned int height)
     m_renderScale = effective;
     m_dlssActiveLastFrame = false;
     m_dlssEvaluatedLastFrame = false;
+    m_rrEvaluatedLastFrame = false;
     m_dlssPresetUnsupported = !presetSupported;
     m_resizeFailed = false;
     PublishDlssReadout();
@@ -4199,7 +4259,7 @@ std::optional<DlssQualityPreset> Renderer::GetDlssPreset(RenderScale scale) noex
 }
 
 Renderer::SceneResolution Renderer::ResolveSceneResolution(unsigned int outputWidth, unsigned int outputHeight,
-    RenderScale scale, bool& presetSupported)
+    RenderScale scale, bool& presetSupported, bool rayReconstruction)
 {
     presetSupported = true;
 
@@ -4208,15 +4268,18 @@ Renderer::SceneResolution Renderer::ResolveSceneResolution(unsigned int outputWi
         return {outputWidth, outputHeight, outputWidth, outputHeight};
     }
 
-    // UPSCALING.3D: a preset renders at NGX's optimal extent for this output extent.
+    // UPSCALING.3D: a preset renders at NGX's optimal extent for this output extent. RR.1C: Ray Reconstruction's own
+    // optimal settings (NGX_DLSSD_GET_OPTIMAL_SETTINGS) for its frames.
     const std::optional<DlssQualityPreset> preset = GetDlssPreset(scale);
 
     if(preset)
     {
         unsigned int renderWidth = 0;
         unsigned int renderHeight = 0;
-        presetSupported = m_dlssBackend.QueryOptimalRenderExtent(*preset, outputWidth, outputHeight, renderWidth,
-            renderHeight);
+        presetSupported = rayReconstruction ?
+            m_dlssBackend.QueryRayReconstructionOptimalRenderExtent(RayReconstructionQuality(scale), outputWidth, outputHeight,
+                renderWidth, renderHeight) :
+            m_dlssBackend.QueryOptimalRenderExtent(*preset, outputWidth, outputHeight, renderWidth, renderHeight);
 
         if(presetSupported)
         {
@@ -4349,7 +4412,9 @@ bool Renderer::ResizeSceneResources(const SceneResolution& resolution)
     m_presentationSelectionMask.Shutdown();
     m_presentationDepth.Shutdown();
 
-    const bool presentationResolve = width != resolution.outputWidth || height != resolution.outputHeight;
+    // RR.1C: Ray Reconstruction at DLAA writes its output there too (NGX's output must not alias its colour input).
+    const bool presentationResolve = width != resolution.outputWidth || height != resolution.outputHeight ||
+        m_rayReconstructionEffective;
 
     if(presentationResolve)
     {
@@ -4439,8 +4504,12 @@ bool Renderer::ResizeSceneResources(const SceneResolution& resolution)
     m_upscalerHistoryResetPending = true;
     // UPSCALING.3B: sized for the old render extent; the next prepared frame creates them again.
     m_dlssInputPreparationPass.ReleaseTextures();
-    // UPSCALING.3C: the GPU is idle here (ResizeScene drained it); the next DLSS frame creates the feature again.
-    m_dlssBackend.ReleaseFeature();
+    // RR.1B: sized for the old render extent too.
+    m_rrInputPreparationPass.ReleaseTextures();
+    // UPSCALING.3C: the GPU is idle here (ResizeScene drained it); the next DLSS frame creates the feature again. RR.1A: the
+    // Ray Reconstruction feature is sized for the old extents too.
+    ReleaseDlssFeature(DlssFeatureKind::SuperResolution, false, true);
+    ReleaseDlssFeature(DlssFeatureKind::RayReconstruction, true, true);
     // UPSCALING.3C.4: output-extent overlay targets; the next jittered Editor frame creates them again.
     m_overlayDepth.Shutdown();
     m_overlaySelectionMask.Shutdown();
@@ -7648,6 +7717,253 @@ void Renderer::FailDlss(const std::string& stage, const std::string& detail)
     m_dlssEvaluatedLastFrame = false;
 }
 
+bool Renderer::EnsureDlssFeature(const UpscalerFrameInputs& inputs, std::string& failure)
+{
+    const std::optional<DlssQualityPreset> preset = GetDlssPreset(m_renderScale);
+
+    // An existing feature for these extents (or a memoized failure): no NGX creation, nothing recorded.
+    if(!m_dlssBackend.FeatureCreationNeeded(inputs.renderWidth, inputs.renderHeight, inputs.outputWidth, inputs.outputHeight,
+        preset))
+    {
+        return m_dlssBackend.EnsureFeature(nullptr, inputs.renderWidth, inputs.renderHeight, inputs.outputWidth,
+            inputs.outputHeight, preset);
+    }
+
+    // Only the reconstruction feature in use keeps NGX resources: Ray Reconstruction's is released (and its memory freed),
+    // and a Super Resolution feature for other extents is released before the new one is created.
+    if(!ReleaseDlssFeature(DlssFeatureKind::RayReconstruction, true, false) ||
+        !ReleaseDlssFeature(DlssFeatureKind::SuperResolution, false, false))
+    {
+        failure = "an earlier NGX feature could not be released safely";
+        return false;
+    }
+
+    return CreateDlssFeatureOnLifecycleList(DlssFeatureKind::SuperResolution, [&](ID3D12GraphicsCommandList* list)
+    {
+        return m_dlssBackend.EnsureFeature(list, inputs.renderWidth, inputs.renderHeight, inputs.outputWidth,
+            inputs.outputHeight, preset);
+    }, failure);
+}
+
+void Renderer::RecoverNgxIfRequired()
+{
+    // Only between frames: never while a recording (which may hold an NGX evaluation) is open, never after a failed
+    // attempt until Retry, and only when a discarded evaluation made the instance's state tracking unreliable.
+    if(!m_dlssBackend.RecoveryRequired() || m_ngxRecoveryBlocked || m_commandRecordingGeneration != 0 ||
+        m_activeRecordingGeneration != 0)
+    {
+        return;
+    }
+
+    using Clock = std::chrono::steady_clock;
+    const auto milliseconds = [](Clock::time_point from, Clock::time_point to)
+    {
+        return std::chrono::duration<double, std::milli>(to - from).count();
+    };
+    const TransitionTiming::Scope recoveryTiming("NGX restart after a discarded evaluation", 0.0,
+        TransitionTiming::TransitionsAndStartup);
+    NgxRecoveryTiming timing;
+    const Clock::time_point start = Clock::now();
+
+    // 1. Every submitted use of NGX (frames and lifecycle submissions, all on this queue) completes.
+    if(!m_commandContext.WaitForGPU())
+    {
+        m_ngxRecoveryBlocked = true;
+        FailDlss("NGX recovery", "the GPU drain before the NGX restart failed");
+        return;
+    }
+
+    const Clock::time_point drained = Clock::now();
+    // 2. Every feature handle and parameter map, then the instance itself (and with it NGX's pooled resources).
+    m_dlssBackend.Shutdown();
+    const Clock::time_point shutDown = Clock::now();
+    // 3. The existing initialization path, synchronously (this is the failure path).
+    m_dlssBackend.Initialize(m_graphicsDevice.GetDevice());
+    const Clock::time_point initialized = Clock::now();
+    timing.drainMilliseconds = milliseconds(start, drained);
+    timing.shutdownMilliseconds = milliseconds(drained, shutDown);
+    timing.initializeMilliseconds = milliseconds(shutDown, initialized);
+    m_lastNgxRecoveryTiming = timing;
+
+    if(m_dlssBackend.GetStatus().availability != DlssAvailability::Available)
+    {
+        // Fail closed: the recovery requirement stays set, so nothing evaluates or creates on this instance; the existing
+        // failure latch presents Native from the next safe boundary. Retry may attempt the restart again.
+        m_ngxRecoveryBlocked = true;
+        FailDlss("NGX recovery", "NGX reinitialization failed: " + m_dlssBackend.GetStatus().detail);
+        return;
+    }
+
+    // 4. A consistent instance: the next eligible frame creates its feature on the lifecycle list and evaluates it from a
+    // reset (a new feature has no submitted evaluation; the upscaler reset is requested as well).
+    m_dlssBackend.MarkRecovered();
+    m_upscalerHistoryResetPending = true;
+    m_dlssEvaluatedLastFrame = false;
+    m_dlssActiveLastFrame = false;
+    m_rrEvaluatedLastFrame = false;
+    ++m_ngxRecoveriesForTesting;
+    Log::Info("DLSS: NGX restarted after a discarded evaluation (drain " + std::to_string(timing.drainMilliseconds) +
+        " ms, shutdown " + std::to_string(timing.shutdownMilliseconds) + " ms, initialize " +
+        std::to_string(timing.initializeMilliseconds) + " ms).");
+}
+
+bool Renderer::CreateDlssFeatureOnLifecycleList(DlssFeatureKind kind,
+    const std::function<bool(ID3D12GraphicsCommandList*)>& create, std::string& failure)
+{
+    const auto creationStart = std::chrono::steady_clock::now();
+    ID3D12GraphicsCommandList* const lifecycleList = m_commandContext.BeginLifecycleCommands();
+
+    if(!lifecycleList)
+    {
+        failure = "the NGX lifecycle command list is unavailable";
+        return false;
+    }
+
+    const bool created = create(lifecycleList);
+
+    if(!m_dlssBackend.HasFeature(kind))
+    {
+        // NGX created nothing: whatever it may have recorded is never executed.
+        m_commandContext.AbandonLifecycleCommands();
+        return false;
+    }
+
+    if(!created)
+    {
+        // A handle without a usable creation (a partial initialization): its creation commands never execute, so the
+        // handle is released at once.
+        const std::string detail = kind == DlssFeatureKind::SuperResolution ? m_dlssBackend.GetFeatureStatus().detail :
+            m_dlssBackend.GetRayReconstructionFeatureStatus().detail;
+        m_commandContext.AbandonLifecycleCommands();
+        m_dlssBackend.AbandonFeatureCreation(kind, detail);
+        return false;
+    }
+
+    std::uint64_t fenceValue = 0;
+
+    if(!m_commandContext.SubmitLifecycleCommands(fenceValue))
+    {
+        failure = "the NGX lifecycle command list could not be submitted";
+        m_dlssBackend.AbandonFeatureCreation(kind, failure);
+        return false;
+    }
+
+    // On the frame queue ahead of every later frame submission, so the first evaluation follows the creation; no wait.
+    m_dlssBackend.ConfirmFeatureCreation(kind, fenceValue);
+    ++m_ngxLifecycleCreationsForTesting;
+    m_dlssFeatureCreatedThisRecording = true;
+    m_lastNgxCreationMilliseconds =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - creationStart).count();
+    return true;
+}
+
+bool Renderer::ReleaseDlssFeature(DlssFeatureKind kind, bool freeMemory, bool gpuIdle)
+{
+    // Without a handle the release still clears the feature status, including a memoized creation failure, so a resize or
+    // Retry tries the creation again (the pre-RR.1A ReleaseFeature behaviour).
+    if(!m_dlssBackend.HasFeature(kind))
+    {
+        return m_dlssBackend.ReleaseFeature(kind, 0, true, freeMemory);
+    }
+
+    const std::uint64_t completed = m_commandContext.GetCompletedFenceValue();
+
+    if(gpuIdle || m_dlssBackend.CanReleaseFeature(kind, completed, false))
+    {
+        return m_dlssBackend.ReleaseFeature(kind, completed, gpuIdle, freeMemory);
+    }
+
+    // A lifecycle transition whose feature's last submitted use has not completed: wait for it (never in steady frames).
+    const TransitionTiming::Scope waitTiming("DLSS feature release wait", 0.0, TransitionTiming::TransitionsAndStartup);
+    ++m_ngxReleaseWaitsForTesting;
+    return m_commandContext.WaitForGPU() &&
+        m_dlssBackend.ReleaseFeature(kind, m_commandContext.GetCompletedFenceValue(), true, freeMemory);
+}
+
+void Renderer::ConfirmNgxRecordingSubmitted(std::uint64_t recording, std::uint64_t fenceValue)
+{
+    m_dlssBackend.ConfirmRecordingSubmitted(recording, fenceValue);
+    m_upscalerResetConsumedInRecording = false;
+}
+
+void Renderer::DiscardNgxRecordingState()
+{
+    // A discarded recording's DLSS outcome never reached the GPU: it is not "the last frame evaluated", and a history reset
+    // it consumed is requested again. The backend independently resets any feature whose evaluation it discarded.
+    m_dlssEvaluatedLastFrame = false;
+    m_dlssActiveLastFrame = false;
+    m_rrEvaluatedLastFrame = false;
+
+    if(std::exchange(m_upscalerResetConsumedInRecording, false))
+    {
+        m_upscalerHistoryResetPending = true;
+    }
+
+    // RR.1A: resolves the backend's pending evaluation now, so a discarded one marks the NGX instance for its restart
+    // before the next frame (RecoverNgxIfRequired).
+    m_dlssBackend.RecoveryRequired();
+}
+
+bool Renderer::CreateRayReconstructionFeatureForTesting(DlssRayReconstructionQuality quality, std::string& failure)
+{
+    unsigned int renderWidth = m_outputWidth;
+    unsigned int renderHeight = m_outputHeight;
+
+    if(quality != DlssRayReconstructionQuality::Dlaa && !m_dlssBackend.QueryRayReconstructionOptimalRenderExtent(quality,
+        m_outputWidth, m_outputHeight, renderWidth, renderHeight))
+    {
+        failure = m_dlssBackend.GetRayReconstructionFeatureStatus().detail;
+        return false;
+    }
+
+    if(!m_dlssBackend.RayReconstructionCreationNeeded(renderWidth, renderHeight, m_outputWidth, m_outputHeight, quality))
+    {
+        return m_dlssBackend.EnsureRayReconstructionFeature(nullptr, renderWidth, renderHeight, m_outputWidth, m_outputHeight,
+            quality);
+    }
+
+    // The ownership policy RR.1C will use: Super Resolution's feature is released (memory freed) before Ray Reconstruction's
+    // is created.
+    if(!ReleaseDlssFeature(DlssFeatureKind::SuperResolution, true, false) ||
+        !ReleaseDlssFeature(DlssFeatureKind::RayReconstruction, true, false))
+    {
+        failure = "an earlier NGX feature could not be released safely";
+        return false;
+    }
+
+    const bool created = CreateDlssFeatureOnLifecycleList(DlssFeatureKind::RayReconstruction,
+        [&](ID3D12GraphicsCommandList* list)
+    {
+        return m_dlssBackend.EnsureRayReconstructionFeature(list, renderWidth, renderHeight, m_outputWidth, m_outputHeight,
+            quality);
+    }, failure);
+
+    if(!created && failure.empty())
+    {
+        failure = m_dlssBackend.GetRayReconstructionFeatureStatus().detail;
+    }
+
+    // The next Super Resolution frame recreates its feature (and with it the history).
+    m_dlssEvaluatedLastFrame = false;
+    return created;
+}
+
+void Renderer::SetRrInputPreparationForTesting(bool enabled, bool diagnostics)
+{
+    m_rrInputPreparationForTesting = enabled;
+    m_rrInputDiagnosticsForTesting = enabled && diagnostics;
+
+    if(!enabled && m_rrInputPreparationPass.HasTextures() && m_commandContext.WaitForGPU())
+    {
+        m_rrInputPreparationPass.ReleaseTextures();
+    }
+}
+
+bool Renderer::ReleaseRayReconstructionFeatureForTesting()
+{
+    return ReleaseDlssFeature(DlssFeatureKind::RayReconstruction, true, false);
+}
+
 void Renderer::RestoreDlssGraphicsState(ID3D12GraphicsCommandList* commandList)
 {
     ID3D12DescriptorHeap* heaps[] = {m_resourceDescriptorHeap.GetHeap()};
@@ -7667,7 +7983,9 @@ void Renderer::PublishDlssReadout()
     const auto& feature = m_dlssBackend.GetFeatureStatus();
     const bool requested = m_dlssNormalRequest || IsDlssRenderScale(m_requestedRenderScale);
     std::string state;
-    if(!requested) state = backend.availability == DlssAvailability::Available ? "Available (disabled)" : "Disabled";
+    // RR.1D: an effective Ray Reconstruction replaces Super Resolution on every frame.
+    if(m_rayReconstructionEffective) state = "Replaced by DLSS Ray Reconstruction";
+    else if(!requested) state = backend.availability == DlssAvailability::Available ? "Available (disabled)" : "Disabled";
     else if(!m_dlssFailure.empty()) state = "Failed";
     else if(backend.availability != DlssAvailability::Available) state = "Unavailable";
     else if(!m_dlssEligible) state = m_debugUI.IsDlssPreparing() ? "Initializing (waiting for mode / denoiser)" : "Unavailable";
@@ -7694,6 +8012,68 @@ void Renderer::PublishDlssReadout()
     const bool canRetry = backend.availability != DlssAvailability::NotCompiled &&
         (!m_dlssFailure.empty() || (requested && backend.availability != DlssAvailability::Available));
     m_debugUI.SetDlssReadout(std::move(state), std::move(detail), canRetry);
+
+    // RR.1A: Ray Reconstruction's capability and feature slot. RR.1D: the selection's requested and effective state.
+    const DlssRayReconstructionStatus& rr = backend.rayReconstruction;
+    const DlssFeatureStatus& rrFeature = m_dlssBackend.GetRayReconstructionFeatureStatus();
+    const bool srFeature = m_dlssBackend.HasFeature(DlssFeatureKind::SuperResolution);
+    const bool rrHandle = m_dlssBackend.HasFeature(DlssFeatureKind::RayReconstruction);
+    const char* const rrQuality = DlssRayReconstructionQualityName(RayReconstructionQuality(m_renderScale));
+    std::string rrState;
+
+    if(!m_rayReconstructionRequested)
+    {
+        rrState = std::string("Not selected (") + DlssRayReconstructionAvailabilityName(rr.availability) + ")";
+    }
+    else if(!m_rrFailure.empty())
+    {
+        rrState = "Failed; NRD Hybrid fallback";
+    }
+    else if(!m_rayReconstructionEffective)
+    {
+        rrState = std::string("Selected but unavailable (") + DlssRayReconstructionAvailabilityName(rr.availability) +
+            "); NRD Hybrid renders";
+    }
+    else if(m_rrEvaluatedLastFrame)
+    {
+        rrState = std::string("Active (") + rrQuality + ")";
+    }
+    else
+    {
+        rrState = std::string("Selected (") + rrQuality + "); awaiting an eligible frame";
+    }
+
+#if defined(ENGINE_HAS_DLSS_RR)
+    std::string rrDetail = "Compiled: yes. ";
+#else
+    std::string rrDetail = "Compiled: no. ";
+#endif
+    rrDetail += std::string("Runtime nvngx_dlssd.dll: ") + (rr.runtimePresent ? "present" : "not found") + ". NGX: " +
+        (rr.available ? "available" : "not available") + ". " + rr.detail;
+    rrDetail += rrHandle ? " Feature: created (" + std::to_string(rrFeature.renderWidth) + "x" +
+        std::to_string(rrFeature.renderHeight) + " -> " + std::to_string(rrFeature.outputWidth) + "x" +
+        std::to_string(rrFeature.outputHeight) + ")." : " Feature: none.";
+    rrDetail += std::string(" Active NGX feature: ") + (srFeature ? "Super Resolution" : rrHandle ? "Ray Reconstruction" : "none") +
+        ".";
+    rrDetail += std::string(" Requested: ") + (m_rayReconstructionRequested ? "yes" : "no") +
+        "; effective: " + (m_rayReconstructionEffective ? "yes" : "no") + "; last frame: " +
+        (m_rrEvaluatedLastFrame ? "evaluated" : m_rrInactiveReason[0] != '\0' ? m_rrInactiveReason : "not evaluated") + ".";
+    if(!m_rrFailure.empty()) rrDetail += " Failure: " + m_rrFailure + " (NRD Hybrid fallback).";
+    if(m_rrEvaluatedLastFrame && !rrFeature.detail.empty()) rrDetail += " " + rrFeature.detail;
+
+    if(m_rayReconstructionRequested && !m_rayReconstructionEffective && m_rrFailure.empty() &&
+        rr.availability == DlssRayReconstructionAvailability::Available)
+        rrDetail += " Ray Reconstruction needs Native or a DLSS preset (the diagnostic render scales keep their paths).";
+
+    if(rrState != m_rayReconstructionPublishedState || rrDetail != m_rayReconstructionPublishedDetail)
+    {
+        Log::Info("DLSS Ray Reconstruction: " + rrState + ". " + rrDetail);
+        m_rayReconstructionPublishedState = rrState;
+        m_rayReconstructionPublishedDetail = rrDetail;
+        // A latched failure can be retried: Retry clears it at the next ResizeScene (an unavailable runtime cannot).
+        const bool rrCanRetry = m_rayReconstructionRequested && !m_rrFailure.empty();
+        m_debugUI.SetRayReconstructionReadout(std::move(rrState), std::move(rrDetail), rrCanRetry);
+    }
 }
 
 bool Renderer::RecordEditorOverlayPrepass(ID3D12GraphicsCommandList* commandList, const Scene& scene,
@@ -7790,13 +8170,22 @@ bool Renderer::RecordDlssEvaluation(ID3D12GraphicsCommandList* commandList, unsi
         return false;
     }
 
+    // RR.1A: an NGX instance awaiting its restart (a discard detected during this recording) is not used. This frame
+    // presents the transitional resolve without latching a DLSS failure; the restart runs before the next recording.
+    if(m_dlssBackend.RecoveryRequired())
+    {
+        m_dlssInactiveReason = "NGX recovery pending after a discarded evaluation";
+        return false;
+    }
+
     TransitionTiming::Scope dlssFeatureScope("DlssEnsureFeature", 0.5);
-    const bool featureReady = m_dlssBackend.EnsureFeature(commandList, inputs.renderWidth, inputs.renderHeight, inputs.outputWidth,
-        inputs.outputHeight, GetDlssPreset(m_renderScale));
-    RestoreDlssGraphicsState(commandList);
+    m_dlssFeatureCreatedThisRecording = false;
+    // RR.1A: created (when needed) on a lifecycle list submitted ahead of this frame, never on this discardable recording.
+    std::string creationFailure;
+    const bool featureReady = EnsureDlssFeature(inputs, creationFailure);
     if(!featureReady)
     {
-        FailDlss("Feature creation", m_dlssBackend.GetFeatureStatus().detail);
+        FailDlss("Feature creation", creationFailure.empty() ? m_dlssBackend.GetFeatureStatus().detail : creationFailure);
         m_dlssInactiveReason = m_dlssBackend.GetStatus().availability != DlssAvailability::Available ?
             "DLSS unavailable" : "DLSS feature creation failed";
         return false;
@@ -7824,8 +8213,9 @@ bool Renderer::RecordDlssEvaluation(ID3D12GraphicsCommandList* commandList, unsi
     evaluation.jitterOffsetY = signY * inputs.jitterY;
     evaluation.renderWidth = inputs.renderWidth;
     evaluation.renderHeight = inputs.renderHeight;
-    // A history discontinuity, a fresh feature or a gap in DLSS frames starts DLSS history again.
-    evaluation.reset = inputs.reset || !m_dlssEvaluatedLastFrame || m_dlssBackend.GetFeatureStatus().evaluations == 0;
+    // A history discontinuity or a gap in DLSS frames starts DLSS history again. RR.1A: Evaluate adds a fresh feature (no
+    // submitted evaluation yet) and a discarded or unconfirmed earlier evaluation (DlssBackend::EvaluationNeedsReset).
+    evaluation.reset = inputs.reset || !m_dlssEvaluatedLastFrame;
 
     m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::DlssEvaluate);
     const bool evaluated = m_dlssBackend.Evaluate(commandList, evaluation);
@@ -7841,6 +8231,186 @@ bool Renderer::RecordDlssEvaluation(ID3D12GraphicsCommandList* commandList, unsi
     }
 
     m_dlssInactiveReason = "";
+    return true;
+}
+
+void Renderer::SetRayReconstructionRequested(bool requested)
+{
+    requested = requested || m_rayReconstructionEnvironmentRequest;
+
+    // A changed request clears a latched failure (a new attempt); an unchanged one, made every frame, keeps it, so the
+    // fallback holds without ever rewriting the request.
+    if(requested != m_rayReconstructionRequested)
+    {
+        m_rrFailure.clear();
+    }
+
+    m_rayReconstructionRequested = requested;
+
+    // As a DLSS request: NGX initializes (between frames) before the next ResizeScene applies the request.
+    if(requested)
+    {
+        EnsureDlssBackend(true);
+    }
+}
+
+bool Renderer::RayReconstructionApplicable(RenderScale scale) const
+{
+    return m_rayReconstructionRequested && !m_packagedRuntime && m_rrFailure.empty() &&
+        m_dlssBackend.GetStatus().rayReconstruction.availability == DlssRayReconstructionAvailability::Available &&
+        (scale == RenderScale::Native || GetDlssPreset(scale).has_value());
+}
+
+DlssRayReconstructionQuality Renderer::RayReconstructionQuality(RenderScale scale) noexcept
+{
+    switch(scale)
+    {
+    case RenderScale::DlssQuality:
+        return DlssRayReconstructionQuality::Quality;
+    case RenderScale::DlssBalanced:
+        return DlssRayReconstructionQuality::Balanced;
+    case RenderScale::DlssPerformance:
+        return DlssRayReconstructionQuality::Performance;
+    default:
+        return DlssRayReconstructionQuality::Dlaa;
+    }
+}
+
+void Renderer::FailRayReconstruction(const std::string& stage, const std::string& detail)
+{
+    const std::string failure = stage + ": " + (detail.empty() ? "unavailable" : detail);
+
+    if(m_rrFailure.empty())
+    {
+        Log::Warning("DLSS Ray Reconstruction: " + failure + "; NRD Hybrid fallback scheduled.");
+        m_rrFailure = failure;
+    }
+
+    m_rrEvaluatedLastFrame = false;
+}
+
+bool Renderer::EnsureRayReconstructionFeature(std::string& failure)
+{
+    const DlssRayReconstructionQuality quality = RayReconstructionQuality(m_renderScale);
+
+    // An existing feature for these extents (or a memoized failure): no NGX creation, nothing recorded.
+    if(!m_dlssBackend.RayReconstructionCreationNeeded(m_sceneWidth, m_sceneHeight, m_outputWidth, m_outputHeight, quality))
+    {
+        return m_dlssBackend.EnsureRayReconstructionFeature(nullptr, m_sceneWidth, m_sceneHeight, m_outputWidth,
+            m_outputHeight, quality);
+    }
+
+    // Only the feature in use keeps NGX resources: Super Resolution's is released with its memory freed, and a Ray
+    // Reconstruction feature for other extents is released before the new one is created.
+    if(!ReleaseDlssFeature(DlssFeatureKind::SuperResolution, true, false) ||
+        !ReleaseDlssFeature(DlssFeatureKind::RayReconstruction, true, false))
+    {
+        failure = "an earlier NGX feature could not be released safely";
+        return false;
+    }
+
+    const bool created = CreateDlssFeatureOnLifecycleList(DlssFeatureKind::RayReconstruction,
+        [&](ID3D12GraphicsCommandList* list)
+    {
+        return m_dlssBackend.EnsureRayReconstructionFeature(list, m_sceneWidth, m_sceneHeight, m_outputWidth, m_outputHeight,
+            quality);
+    }, failure);
+
+    if(!created && failure.empty())
+    {
+        failure = m_dlssBackend.GetRayReconstructionFeatureStatus().detail;
+    }
+
+    return created;
+}
+
+bool Renderer::RecordRayReconstructionEvaluation(ID3D12GraphicsCommandList* commandList, unsigned int frameIndex)
+{
+    const UpscalerFrameInputs& inputs = m_upscalerInputs;
+
+    // Stage 1: this frame's prepared inputs and a usable NGX instance.
+    if(!inputs.prepared || !m_rrInputsPreparedLastFrame)
+    {
+        FailRayReconstruction("Input preparation", "inputs not prepared");
+        return false;
+    }
+
+    // RR.1A: an NGX instance awaiting its restart is not used; this frame presents the resolve without latching a failure,
+    // and the restart runs before the next recording.
+    if(m_dlssBackend.RecoveryRequired())
+    {
+        m_rrInactiveReason = "NGX recovery pending after a discarded evaluation";
+        return false;
+    }
+
+    TransitionTiming::Scope featureScope("RrEnsureFeature", 0.5);
+    m_dlssFeatureCreatedThisRecording = false;
+    std::string creationFailure;
+
+    if(!EnsureRayReconstructionFeature(creationFailure))
+    {
+        FailRayReconstruction("Feature creation", creationFailure);
+        return false;
+    }
+
+    // Stage 2: the states NGX requires; the RR inputs already end there (RrInputPreparationPass::Record).
+    constexpr D3D12_RESOURCE_STATES input = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    RrInputPreparationPass& rr = m_rrInputPreparationPass;
+    rr.GetColor().Transition(commandList, input);
+    rr.GetDiffuseAlbedo().Transition(commandList, input);
+    rr.GetSpecularAlbedo().Transition(commandList, input);
+    rr.GetNormalRoughness().Transition(commandList, input);
+    rr.GetSpecularMotion().Transition(commandList, input);
+    inputs.depth->Transition(commandList, input);
+    inputs.dlssMotionVectors->Transition(commandList, input);
+    inputs.exposure->Transition(commandList, input);
+    m_presentationColor.Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+    // Stage 3: the evaluation. Jitter converts from Engine's convention exactly as Super Resolution's does (the same NGX
+    // convention, Programming Guide 3.7).
+    const float signX = m_dlssJitterSignForTesting ? (*m_dlssJitterSignForTesting)[0] : DlssJitterSignX;
+    const float signY = m_dlssJitterSignForTesting ? (*m_dlssJitterSignForTesting)[1] : DlssJitterSignY;
+    DlssRayReconstructionEvaluation evaluation{};
+    evaluation.color = rr.GetColor().GetResource();
+    evaluation.output = m_presentationColor.GetResource();
+    evaluation.depth = inputs.depth->GetResource();
+    evaluation.motionVectors = inputs.dlssMotionVectors->GetResource();
+    evaluation.specularMotionVectors = m_rrSurfaceMotionAsSpecularForTesting ? inputs.dlssMotionVectors->GetResource() :
+        rr.GetSpecularMotion().GetResource();
+    evaluation.diffuseAlbedo = rr.GetDiffuseAlbedo().GetResource();
+    evaluation.specularAlbedo = rr.GetSpecularAlbedo().GetResource();
+    evaluation.normalRoughness = rr.GetNormalRoughness().GetResource();
+    // RR.1C section 7: raw radiance and no exposure input in production; the other modes are the experiment's.
+    evaluation.exposure = m_rrExposureModeForTesting == RayReconstructionExposureMode::ExposureTexture ?
+        inputs.exposure->GetResource() : nullptr;
+    evaluation.preExposure = m_rrExposureModeForTesting == RayReconstructionExposureMode::PreExposed ?
+        m_rrPreExposureForTesting : 0.0f;
+    evaluation.jitterOffsetX = signX * inputs.jitterX;
+    evaluation.jitterOffsetY = signY * inputs.jitterY;
+    evaluation.renderWidth = inputs.renderWidth;
+    evaluation.renderHeight = inputs.renderHeight;
+    // A history discontinuity or a gap in RR frames restarts RR's history; Evaluate adds a fresh feature and a discarded
+    // or unconfirmed earlier evaluation.
+    evaluation.reset = inputs.reset || !m_rrEvaluatedLastFrame;
+
+    if(std::exchange(m_rrEvaluationFailureForTesting, false))
+    {
+        m_dlssBackend.failNextRayReconstructionEvaluationForTesting = true;
+    }
+
+    m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::RrEvaluate);
+    const bool evaluated = m_dlssBackend.EvaluateRayReconstruction(commandList, evaluation);
+    RestoreDlssGraphicsState(commandList);
+    m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::RrEvaluate);
+
+    if(!evaluated)
+    {
+        // The caller overwrites the complete output with the resolve, even if NGX partially wrote it.
+        FailRayReconstruction("Evaluation", m_dlssBackend.GetRayReconstructionFeatureStatus().detail);
+        return false;
+    }
+
+    m_rrInactiveReason = "";
     return true;
 }
 
@@ -8115,7 +8685,9 @@ bool Renderer::RecordPathTraceReference(
     // which needs a fresh sample every frame (a held frame would break its history).
     // NRD.RELAX.4: RELAX, like REBLUR, needs fresh samples every frame (its history, not the progressive mean, converges).
     // HYBRID.5: so does the hybrid.
-    const bool traceEveryFrame = m_dlssModeThisFrame || m_pathTraceDenoiserMode == PathTraceDenoiserMode::NrdReblur ||
+    // RR.1C: so does Ray Reconstruction (its history converges, not the progressive mean).
+    const bool traceEveryFrame = m_dlssModeThisFrame || m_rrModeThisFrame ||
+        m_pathTraceDenoiserMode == PathTraceDenoiserMode::NrdReblur ||
         m_pathTraceDenoiserMode == PathTraceDenoiserMode::NrdRelax ||
         m_pathTraceDenoiserMode == PathTraceDenoiserMode::NrdHybrid;
     const std::uint32_t frameSamples = traceEveryFrame ? settings.samplesPerFrame :
@@ -8607,7 +9179,10 @@ bool Renderer::RecordPathTraceReference(
         // HYBRID.5: the same for the hybrid (RELAX diffuse and REBLUR specular from one instance).
         bool hybridFrame = false;
 
-        if(m_pathTraceDenoiserMode == PathTraceDenoiserMode::NrdHybrid && m_pathTraceExtractedLastFrame)
+        // RR.1C: never on a Ray Reconstruction frame, which reconstructs the extraction itself (NRD and RR never run on
+        // the same frame; the gap restarts the hybrid's history when NRD returns).
+        if(m_pathTraceDenoiserMode == PathTraceDenoiserMode::NrdHybrid && m_pathTraceExtractedLastFrame &&
+            !m_rrModeThisFrame)
         {
             if(!m_pathTraceRawDiffuseHitDistanceLastFrame)
             {
@@ -8622,7 +9197,8 @@ bool Renderer::RecordPathTraceReference(
         // RTXPT D.2B: temporal reconstruction consumes this frame's extraction outputs, so it runs only on frames
         // that extracted, before the presentation copy below. It is timed inside the path-tracing region, which
         // therefore includes it in temporal frames (diagnostics only; without it the region is unchanged).
-        if(m_pathTraceTemporal && m_pathTraceExtractedLastFrame && !nrdFrame && !relaxFrame && !hybridFrame)
+        if(m_pathTraceTemporal && m_pathTraceExtractedLastFrame && !nrdFrame && !relaxFrame && !hybridFrame &&
+            !m_rrModeThisFrame)
         {
             // RTXPT D.3B: decided first, because the spatial pass replaces the temporal pass's own presentation. A
             // D.3B.0 diagnostic view also runs it, for display only.
@@ -8933,7 +9509,7 @@ bool Renderer::RecordPathTraceTemporal(
     // updated it); it is used only after PathTraceExtendedStableFrames such frames.
     m_pathTraceExtendedUsed = false;
     // UPSCALING.3C: DLSS keeps its own history; the extended accumulator is left out in DLSS mode.
-    const bool extended = m_pathTraceExtendedDiffuse && !m_dlssModeThisFrame &&
+    const bool extended = m_pathTraceExtendedDiffuse && !m_dlssModeThisFrame && !m_rrModeThisFrame &&
         m_pathTraceTemporalPass.EnsureExtended(m_graphicsDevice.GetDevice(), m_resourceDescriptorHeap);
 
     if(extended)
@@ -10700,6 +11276,8 @@ Renderer::FrameRenderResult Renderer::Render(
     const RendererOptions& options = withheldOptions ? *withheldOptions : requestedOptions;
     // M0c.5 Stage 5.5: a finished NGX initialization is adopted here, between frames, without waiting.
     PollDlssBackend();
+    // RR.1A: a pending NGX restart (an evaluation was discarded) runs here, before this frame's recording opens.
+    RecoverNgxIfRequired();
     m_referenceRayCounts.StartFrame();
     struct RayCountFrameScope
     {
@@ -12269,18 +12847,61 @@ bool Renderer::RecordRenderFrame(
         m_dlssFallbackReason = "the path-tracing denoiser is off (no per-frame denoised colour)";
     }
 
-    m_dlssModeThisFrame = jitterApplies && IsDlssRenderScale(m_renderScale) && m_dlssFailure.empty() && m_dlssFallbackReason[0] == '\0';
+    // RR.1C: an applied Ray Reconstruction replaces Super Resolution on every frame (never both on one frame).
+    m_dlssModeThisFrame = jitterApplies && IsDlssRenderScale(m_renderScale) && m_dlssFailure.empty() &&
+        m_dlssFallbackReason[0] == '\0' && !m_rayReconstructionEffective;
     // Stage 4.3/4.5: an unlit startup frame or an empty path-traced frame keeps the DLSS render extent it was sized for; it
     // presents through the ordinary resolve, and DLSS evaluates again with the first lit frame.
     const bool dlssHeldForUnlitFrame = lightingSuppressed || pathTracedSceneEmpty;
 
-    if(IsDlssRenderScale(m_renderScale) && !m_dlssModeThisFrame && m_dlssFailure.empty() && !dlssHeldForUnlitFrame)
+    if(IsDlssRenderScale(m_renderScale) && !m_dlssModeThisFrame && m_dlssFailure.empty() && !dlssHeldForUnlitFrame &&
+        !m_rayReconstructionEffective)
         FailDlss("Frame eligibility", jitterApplies ? m_dlssFallbackReason : "not an active raster-primary frame");
+
+    // RR.1C: an RR frame is a raster-primary path-traced frame of the NRD Hybrid configuration (whose extraction RR reads;
+    // NRD itself is not dispatched). Other lighting modes and unlit frames present through the resolve without a failure;
+    // a different denoiser, a failed feature or a lost runtime latch the fallback.
+    m_rrModeThisFrame = false;
+    m_rrInactiveReason = "";
+
+    if(m_rayReconstructionEffective && m_rrFailure.empty())
+    {
+        const DlssFeatureStatus& rrFeature = m_dlssBackend.GetRayReconstructionFeatureStatus();
+        const bool rrFeatureFailed = rrFeature.createResult != 0 && !rrFeature.active &&
+            rrFeature.renderWidth == m_sceneWidth && rrFeature.renderHeight == m_sceneHeight &&
+            rrFeature.outputWidth == m_outputWidth && rrFeature.outputHeight == m_outputHeight;
+
+        if(!jitterApplies || dlssHeldForUnlitFrame)
+        {
+            m_rrInactiveReason = "not a lit raster-primary path-traced frame";
+        }
+        else if(m_dlssBackend.GetStatus().rayReconstruction.availability != DlssRayReconstructionAvailability::Available)
+        {
+            FailRayReconstruction("Frame eligibility", "Ray Reconstruction is unavailable");
+        }
+        else if(m_pathTraceDenoiserMode != PathTraceDenoiserMode::NrdHybrid)
+        {
+            FailRayReconstruction("Frame eligibility", "Ray Reconstruction replaces the NRD Hybrid denoiser, which is not selected");
+        }
+        else if(rrFeatureFailed)
+        {
+            FailRayReconstruction("Feature creation", rrFeature.detail);
+        }
+        else
+        {
+            m_rrModeThisFrame = true;
+        }
+    }
+
     const bool dlssPhases = m_dlssInputPreparation || m_dlssModeThisFrame;
-    const std::uint32_t jitterPhaseCount = dlssPhases ?
-        DlssJitterPhaseCount(m_sceneWidth, m_sceneHeight, m_outputWidth, m_outputHeight) : CameraJitterPhaseCount;
-    m_cameraJitterStatus = NextCameraJitter(jitterApplies && (m_cameraJitterOption || m_dlssModeThisFrame),
-        jitterPhaseCount);
+    // RR.1C: RR frames use at least RayReconstructionMinimumJitterPhases (RR guide 3.6); every other frame keeps its count.
+    const std::uint32_t jitterPhaseCount = m_rrModeThisFrame ?
+        (std::max)(RayReconstructionMinimumJitterPhases,
+            DlssJitterPhaseCount(m_sceneWidth, m_sceneHeight, m_outputWidth, m_outputHeight)) :
+        dlssPhases ? DlssJitterPhaseCount(m_sceneWidth, m_sceneHeight, m_outputWidth, m_outputHeight) :
+        CameraJitterPhaseCount;
+    m_cameraJitterStatus = NextCameraJitter(jitterApplies && (m_cameraJitterOption || m_dlssModeThisFrame ||
+        m_rrModeThisFrame), jitterPhaseCount);
     m_debugUI.SetPathTraceCameraJitterReadout(m_cameraJitterStatus.active, m_cameraJitterStatus.phase,
         m_cameraJitterStatus.phaseCount, m_cameraJitterStatus.x, m_cameraJitterStatus.y);
     const Matrix4 renderProjection = m_cameraJitterStatus.active ?
@@ -12504,7 +13125,8 @@ bool Renderer::RecordRenderFrame(
     // UPSCALING.3D: DLSS reconstructs output-resolution texture detail from biased render samples.
     cameraConstants.textureMipBias = 0.0f;
 
-    if(m_dlssModeThisFrame)
+    // RR.1C: RR frames reconstruct output-resolution detail the same way (log2(render / output), 0 at DLAA).
+    if(m_dlssModeThisFrame || m_rrModeThisFrame)
     {
         const float offset = m_dlssMipBiasOffsetForTesting ? *m_dlssMipBiasOffsetForTesting : DlssTextureMipBiasOffset;
         cameraConstants.textureMipBias = std::isnan(offset) ? 0.0f :
@@ -13471,7 +14093,21 @@ bool Renderer::RecordRenderFrame(
     // them yet (UPSCALING.3C evaluates DLSS here, in place of the diagnostic resolve's colour).
     m_upscalerInputs.prepared = false;
 
-    if(((m_dlssInputPreparation && m_dlssFailure.empty()) || m_dlssModeThisFrame)
+    // RR.1C: Ray Reconstruction frames need the same depth and motion vectors.
+    const auto failInputPreparation = [&](const std::string& reason)
+    {
+        if(m_rrModeThisFrame)
+        {
+            FailRayReconstruction("Input preparation", reason);
+            m_rrModeThisFrame = false;
+            return;
+        }
+
+        FailDlss("Input preparation", reason);
+        m_dlssModeThisFrame = false;
+    };
+
+    if(((m_dlssInputPreparation && m_dlssFailure.empty()) || m_dlssModeThisFrame || m_rrModeThisFrame)
 #if PATH_TRACE_SHARC_SPATIAL_DIAGNOSTIC != 0
         && !m_sharcDiagnosticPresentedThisFrame
 #endif
@@ -13482,8 +14118,7 @@ bool Renderer::RecordRenderFrame(
             if(!m_dlssInputPreparationPass.Ensure(m_graphicsDevice.GetDevice(), m_shaderLibrary, m_resourceDescriptorHeap,
                 m_sceneWidth, m_sceneHeight))
             {
-                FailDlss("Input preparation", m_dlssInputPreparationPass.FailureReason());
-                m_dlssModeThisFrame = false;
+                failInputPreparation(m_dlssInputPreparationPass.FailureReason());
                 break;
             }
 
@@ -13499,8 +14134,7 @@ bool Renderer::RecordRenderFrame(
 
             if(!prepared)
             {
-                FailDlss("Input preparation", m_dlssInputPreparationPass.FailureReason());
-                m_dlssModeThisFrame = false;
+                failInputPreparation(m_dlssInputPreparationPass.FailureReason());
                 break;
             }
 
@@ -13525,7 +14159,68 @@ bool Renderer::RecordRenderFrame(
             inputs.jitterPhaseCount = m_cameraJitterStatus.phaseCount;
             inputs.reset = m_upscalerHistoryResetPending;
             m_upscalerHistoryResetPending = false;
+            // RR.1A: a discarded recording returns the request (DiscardNgxRecordingState).
+            m_upscalerResetConsumedInRecording = m_upscalerResetConsumedInRecording || inputs.reset;
         } while(false);
+    }
+
+    // RR.1B: the Ray Reconstruction inputs from this frame's extraction, G-buffer and DLSS motion vectors, into the pass's
+    // own targets. RR.1C: on RR frames NGX reads them directly (the noisy colour target is RR's colour input, so nothing is
+    // copied into sceneColor, which keeps the path tracer's presentation for exposure metering and the fallback resolve).
+    // Otherwise only the diagnostic hook prepares them, and nothing reads them.
+    m_rrInputsPreparedLastFrame = false;
+
+    if(m_rrModeThisFrame && !(runPathTrace && m_pathTraceExtractedLastFrame && m_upscalerInputs.prepared))
+    {
+        FailRayReconstruction("Input preparation", "the frame did not extract its signal or prepare the DLSS inputs");
+        m_rrModeThisFrame = false;
+    }
+
+    if((m_rrInputPreparationForTesting || m_rrModeThisFrame) && runPathTrace && m_pathTraceExtractedLastFrame &&
+        m_upscalerInputs.prepared)
+    {
+        const bool psr = m_psrLightingLastFrame && m_psrDenoiseConstantsAddress != 0 && m_psrGBufferTransformsAddress != 0;
+
+        if(m_rrInputPreparationPass.Ensure(m_graphicsDevice.GetDevice(), m_shaderLibrary, m_resourceDescriptorHeap,
+            m_sceneWidth, m_sceneHeight, psr, m_rrInputDiagnosticsForTesting))
+        {
+            RrInputPreparationPass::Inputs rrInputs;
+            rrInputs.inverseViewProjection = reconstructionConstants.inverseViewProjection;
+            rrInputs.viewProjection = cameraConstants.unjitteredViewProjection;
+            rrInputs.previousViewProjection = cameraConstants.previousViewProjection;
+            rrInputs.cameraPosition = cameraPosition;
+            rrInputs.depth = &m_gBuffer.GetDepth();
+            rrInputs.material = &m_gBuffer.GetMaterial();
+            rrInputs.surface = &m_gBuffer.GetSurface();
+            rrInputs.geometricNormal = &m_gBuffer.GetGeometricNormal();
+            rrInputs.gBufferMotion = &m_gBuffer.GetMotion();
+            rrInputs.diffuseExtraction = &m_pathTraceReferencePass.GetDiffuseTexture();
+            rrInputs.specularExtraction = &m_pathTraceReferencePass.GetSpecularTexture();
+            rrInputs.presentation = &m_pathTraceReferencePass.GetOutputTexture();
+            rrInputs.motionVectors = &m_dlssInputPreparationPass.GetMotionVectors();
+            rrInputs.materialBufferIndex = CurrentMaterialBuffer().GetDescriptorIndex();
+            rrInputs.psrConstants = psr ? m_psrDenoiseConstantsAddress : 0;
+            rrInputs.psrTransforms = psr ? m_psrGBufferTransformsAddress : 0;
+            // RR.1C: a two-mirror chain's second mirror is retraced against the frame's TLAS (RrPsrChain.hlsli).
+            rrInputs.topLevel = psr ? m_rayTracingScene.GetTopLevel().GetGPUAddress() : 0;
+            rrInputs.colorScale = m_rrModeThisFrame && m_rrExposureModeForTesting == RayReconstructionExposureMode::PreExposed ?
+                m_rrPreExposureForTesting : 1.0f;
+            m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::RrInputPreparation);
+            m_rrInputsPreparedLastFrame = m_rrInputPreparationPass.Record(commandList, m_uploadBuffer, rrInputs);
+            m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::RrInputPreparation);
+        }
+
+        if(!m_rrInputsPreparedLastFrame && m_rrInputPreparationPass.FailureReason() != m_rrInputPreparationFailure)
+        {
+            m_rrInputPreparationFailure = m_rrInputPreparationPass.FailureReason();
+            Log::Error("Ray Reconstruction input preparation: " + m_rrInputPreparationFailure);
+        }
+
+        if(!m_rrInputsPreparedLastFrame && m_rrModeThisFrame)
+        {
+            FailRayReconstruction("Input preparation", m_rrInputPreparationPass.FailureReason());
+            m_rrModeThisFrame = false;
+        }
     }
 
 #if PATH_TRACE_SHARC_SPATIAL_DIAGNOSTIC != 0
@@ -13545,7 +14240,7 @@ bool Renderer::RecordRenderFrame(
         m_dlssEvaluatedLastFrame = false;
         m_dlssInactiveReason = "";
 
-        if(IsDlssRenderScale(m_renderScale))
+        if(IsDlssRenderScale(m_renderScale) && !m_rayReconstructionEffective)
         {
             m_dlssInactiveReason = jitterApplies ? m_dlssFallbackReason : "not a raster-primary path-traced frame";
 #if PATH_TRACE_SHARC_SPATIAL_DIAGNOSTIC != 0
@@ -13566,7 +14261,13 @@ bool Renderer::RecordRenderFrame(
     Texture* presentedDebugTexture = debugTexture;
     RenderTarget* presentedDebugRenderTarget = debugRenderTarget;
 
-    if(PresentationResolveActive())
+    // RR.1C: Ray Reconstruction presents through the output-extent targets at DLAA too.
+    if(!m_rrModeThisFrame)
+    {
+        m_rrEvaluatedLastFrame = false;
+    }
+
+    if(PresentationResolveActive() || m_rayReconstructionEffective)
     {
         MarkDredStage(commandList, L"Frame: presentation resolve and DLSS");
         const D3D12_VIEWPORT outputViewport{0.0f, 0.0f, static_cast<float>(m_outputWidth),
@@ -13597,7 +14298,9 @@ bool Renderer::RecordRenderFrame(
             m_gpuTimestampProfiler.EndRegion(commandList, frameIndex,
                 GpuTimestampProfiler::Region::PresentationResolve);
         };
-        const bool dlssFirst = m_dlssModeThisFrame && overlayPrepass
+        // RR.1C: a Ray Reconstruction frame reconstructs in Super Resolution's place (the same ordering and fallback).
+        const bool reconstruction = m_dlssModeThisFrame || m_rrModeThisFrame;
+        const bool dlssFirst = reconstruction && overlayPrepass
 #if PATH_TRACE_SHARC_SPATIAL_DIAGNOSTIC != 0
             && !m_sharcDiagnosticPresentedThisFrame
 #endif
@@ -13610,14 +14313,34 @@ bool Renderer::RecordRenderFrame(
 
         // UPSCALING.3C: NGX leaves the command list's state undefined, so everything the following passes rely on is
         // set again.
-        const bool dlssEvaluated = m_dlssModeThisFrame &&
+        bool dlssEvaluated = false;
+
+        if(m_rrModeThisFrame)
+        {
+            dlssEvaluated = RecordRayReconstructionEvaluation(commandList, frameIndex);
+            m_rrEvaluatedLastFrame = dlssEvaluated;
+        }
+        else
+        {
+            dlssEvaluated = m_dlssModeThisFrame &&
 #if PATH_TRACE_SHARC_SPATIAL_DIAGNOSTIC != 0
-            !m_sharcDiagnosticPresentedThisFrame &&
+                !m_sharcDiagnosticPresentedThisFrame &&
 #endif
-            RecordDlssEvaluation(commandList, frameIndex);
-        m_dlssActiveLastFrame = dlssEvaluated;
-        m_dlssEvaluatedLastFrame = dlssEvaluated;
+                RecordDlssEvaluation(commandList, frameIndex);
+            m_dlssActiveLastFrame = dlssEvaluated;
+            m_dlssEvaluatedLastFrame = dlssEvaluated;
+        }
+
         m_presentationResolveSkippedLastFrame = dlssFirst && dlssEvaluated;
+
+        // RR.1A harness: discard this recording right after an NGX evaluation was recorded in it (as a recording failure).
+        if(m_abortFrameAfterDlssEvaluationForTesting && dlssEvaluated &&
+            (!m_abortRequiresDlssCreationForTesting || m_dlssFeatureCreatedThisRecording))
+        {
+            m_abortFrameAfterDlssEvaluationForTesting = false;
+            m_abortedFrameForTesting = AbortTrackedRecording();
+            return false;
+        }
 
         if(dlssEvaluated)
         {
@@ -13629,7 +14352,7 @@ bool Renderer::RecordRenderFrame(
         }
 
         // DLSS did not evaluate (creation or evaluation failed, or inputs missing): the resolve's colour is presented.
-        if(!dlssEvaluated && (dlssFirst || m_dlssModeThisFrame))
+        if(!dlssEvaluated && (dlssFirst || reconstruction))
         {
             recordResolve();
         }
@@ -14276,6 +14999,7 @@ void Renderer::Shutdown()
     // No DLSS work can be in flight after the drain; NGX must be released before the device.
     m_dlssBackend.Shutdown();
     m_dlssInputPreparationPass.Shutdown();
+    m_rrInputPreparationPass.Shutdown();
     m_autoExposurePass.Shutdown();
 
     Log::Info("Renderer shutdown: GPU finished.");

@@ -189,10 +189,17 @@ class DebugUI
         m_sharcStatus = status;
     }
 
-    // The selector's value: the effective Path Tracing denoiser (the enums share their order).
+    // The selector's value: the effective Path Tracing denoiser (the enums share their order up to NrdHybrid). RR.1D: Ray
+    // Reconstruction runs the hybrid configuration's path tracer, so its selection reads as NrdHybrid here.
     PathTraceDenoiserMode GetSelectedPathTraceDenoiserMode() const
     {
-        return static_cast<PathTraceDenoiserMode>(GetEffectiveRenderingSettings().pathTracing.denoiser);
+        const ProjectPathTraceDenoiser denoiser = GetEffectiveRenderingSettings().pathTracing.denoiser;
+        return denoiser == ProjectPathTraceDenoiser::DlssRayReconstruction ? PathTraceDenoiserMode::NrdHybrid :
+            static_cast<PathTraceDenoiserMode>(denoiser);
+    }
+    bool IsRayReconstructionSelected() const
+    {
+        return GetEffectiveRenderingSettings().pathTracing.denoiser == ProjectPathTraceDenoiser::DlssRayReconstruction;
     }
 
     // DLSS eligibility against the transition and denoiser state last published to the panel (the shared rules).
@@ -214,6 +221,15 @@ class DebugUI
         m_dlssCanRetry = canRetry;
         m_dlssState = std::move(state);
         m_dlssDetail = std::move(detail);
+    }
+
+    // RR.1A: DLSS Ray Reconstruction's capability and feature slot. RR.1D: its requested/effective state and whether a
+    // latched failure may be retried (the DLSS Retry request clears it).
+    void SetRayReconstructionReadout(std::string state, std::string detail, bool canRetry = false)
+    {
+        m_rayReconstructionState = std::move(state);
+        m_rayReconstructionDetail = std::move(detail);
+        m_rayReconstructionCanRetry = canRetry;
     }
 
     // The renderer's jitter of the last recorded frame (render pixels), shown under the control.
@@ -447,6 +463,9 @@ class DebugUI
     bool m_dlssCanRetry = false;
     bool m_dlssInputPreparation = false;
     std::string m_dlssDetail;
+    std::string m_rayReconstructionState = "Not initialized";
+    std::string m_rayReconstructionDetail;
+    bool m_rayReconstructionCanRetry = false;
     // UPSCALING.2C/3C: 0 = 100% (Native), 1 = 75% (diagnostic resolve), 2 = 75% DLSS (experimental).
     int m_pathTraceRenderScale = 0;
     bool m_pathTraceCameraJitterActive = false;

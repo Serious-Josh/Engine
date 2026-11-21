@@ -1055,6 +1055,14 @@ void DeployRuntimeFiles(const Request& request, const AssetID& sceneAssetID,
     // holds the SDK's production lib/Windows_x86_64/rel copy (engine_deploy_dlss(EngineRuntime)); the watermarked
     // development DLL is never deployed there. A game that requests DLSS is never built without its runtime.
     const RenderingSettings& rendering = request.projectSettings.rendering;
+
+    // RR.1D: Ray Reconstruction is Editor-only (its runtime is never deployed); the packaged game renders NRD Hybrid.
+    if(rendering.pathTracing.denoiser == ProjectPathTraceDenoiser::DlssRayReconstruction)
+    {
+        Log::Info("Build Game: the project selects DLSS Ray Reconstruction (experimental, Editor only); the packaged game "
+            "renders NRD Hybrid and nvngx_dlssd.dll is not deployed.");
+    }
+
     const bool dlssUsable = rendering.lightingMode == ProjectLightingMode::PathTracing && rendering.pathTracing.dlss &&
         rendering.pathTracing.denoiser != ProjectPathTraceDenoiser::Off;
 
