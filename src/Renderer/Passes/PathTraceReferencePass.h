@@ -673,6 +673,20 @@ class PathTraceReferencePass
     // SHARC update library's separate sampled-NEE permutation (the M42A libraries). Off by default; production libraries
     // never contain the sampled estimator.
     static bool SampledIndirectNeeLibrariesRequested();
+    // M4.3.5: the ReSTIR DI direct passes' ReGIR permutations (DirectLighting/ReGIR) are prepared by default; ENGINE_REGIR=0
+    // disables ReGIR entirely (no permutations, no presampling: uniform local-light candidates as before M4.3).
+    static bool ReGIRLibrariesRequested();
+    // M4.3: whether the next recorded frame's direct pass uses its ReGIR permutation (when it has one), and whether the
+    // last recorded frame did.
+    void SelectReGIR(bool enabled)
+    {
+        m_regir = enabled;
+    }
+
+    bool RecordedReGIR() const
+    {
+        return m_regirRecorded;
+    }
 
     // M4.2C: whether this frame's image paths and SHARC training use their sampled permutations (set by the renderer
     // together with the SceneLightConstants mode bits, before recording). A pipeline without one runs the exhaustive
@@ -703,7 +717,12 @@ class PathTraceReferencePass
     // M4.2C: builds owner's sampled permutation from description's M42A library, or clears it.
     void AttachSampledVariant(GraphicsDevice& device, ShaderLibrary& shaders, RayTracingPipeline& owner,
         const RayTracingPipelineDescription& description);
+    // M4.3: builds owner's ReGIR permutation from description's DirectLighting/ReGIR library, or clears it.
+    void AttachReGIRVariant(GraphicsDevice& device, ShaderLibrary& shaders, RayTracingPipeline& owner,
+        const RayTracingPipelineDescription& description);
     RayTracingPipeline& VisibilityPipeline(RayTracingPipeline& original);
+    bool m_regir = false;
+    bool m_regirRecorded = false;
     bool m_sampledImage = false;
     bool m_sampledTraining = false;
     bool m_sampledImageRecorded = false;

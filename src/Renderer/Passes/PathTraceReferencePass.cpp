@@ -607,6 +607,19 @@ namespace
         return std::nullopt;
     }
 
+    // M4.3: the ReGIR permutation of a ReSTIR DI direct pass (DirectLighting/<pass>.hlsl -> DirectLighting/ReGIR/<pass>.hlsl)
+    // unless ENGINE_REGIR=0 disables ReGIR; nothing else has one.
+    std::optional<std::filesystem::path> ReGIRVariantLibraryPath(const std::filesystem::path& path)
+    {
+        if(!PathTraceReferencePass::ReGIRLibrariesRequested() || path.empty() || *path.begin() != "DirectLighting" ||
+            path.parent_path() != "DirectLighting")
+        {
+            return std::nullopt;
+        }
+
+        return std::filesystem::path("DirectLighting") / "ReGIR" / path.filename();
+    }
+
     // ER.1 Phase 4: everything a DXR pipeline is built from besides the library bytes (its path, exports, root signature
     // and pipeline configuration), so two descriptions share a prepared pipeline only when they would build the same one.
     std::string PipelineDescriptionKey(const RayTracingPipelineDescription& description)
@@ -1113,6 +1126,14 @@ std::vector<PathTraceLibraryRequirement> PathTraceReferencePass::GetRequiredLibr
         {
             libraries.push_back(PathTraceLibraryRequirement{*sampledPath, true});
         }
+
+        // M4.3: the ReGIR permutation of a direct pass (optional: without it the uniform candidates run).
+        const std::optional<std::filesystem::path> regirPath = ReGIRVariantLibraryPath(path);
+
+        if(regirPath && !listed(*regirPath))
+        {
+            libraries.push_back(PathTraceLibraryRequirement{*regirPath, true});
+        }
     };
 
     // Initialize creates the Camera pipeline for every primary; Raster Primary, the ReSTIR DI indirect pass and the
@@ -1215,6 +1236,14 @@ std::vector<PathTraceReferencePass::PipelineRequirement> PathTraceReferencePass:
             RayTracingPipelineDescription sampled = description;
             sampled.shaderPath = *sampledPath;
             pipelines.push_back(PipelineRequirement{std::move(sampled), true});
+        }
+
+        // M4.3: the ReGIR permutation of a direct pass, optional likewise.
+        if(const std::optional<std::filesystem::path> regirPath = ReGIRVariantLibraryPath(description.shaderPath))
+        {
+            RayTracingPipelineDescription regir = description;
+            regir.shaderPath = *regirPath;
+            pipelines.push_back(PipelineRequirement{std::move(regir), true});
         }
     };
     if(needs.psrChain != 0)
@@ -3328,9 +3357,13 @@ void PathTraceReferencePass::ExecuteReSTIRDISplit(
     const bool gBufferReplacement = psrGBufferConstants != 0 && psrGBufferTransforms != 0 && (!cachedIndirect || combined) &&
         (extract ? IsPrimarySurfaceReplacementGBufferExtractionReady(raw) : IsPrimarySurfaceReplacementGBufferReady());
     // The direct pass is a compute shader (DirectPassDescription); only the indirect pass has RayQuery twins.
-    RayTracingPipeline& directPipeline = extract ?
+    RayTracingPipeline& productionDirectPipeline = extract ?
         (gBufferReplacement ? m_psrGBufferExtractDirectPipeline : m_extractSplitDirectPipeline) :
         (gBufferReplacement ? m_psrGBufferDirectPipeline : m_splitDirectPipeline);
+    // M4.3: the direct pass's ReGIR permutation on a frame that presampled ReGIR slots (SelectReGIR).
+    RayTracingPipeline* const regirDirectPipeline = m_regir ? productionDirectPipeline.GetReGIRVariant() : nullptr;
+    m_regirRecorded = regirDirectPipeline != nullptr;
+    RayTracingPipeline& directPipeline = regirDirectPipeline ? *regirDirectPipeline : productionDirectPipeline;
     RayTracingPipeline& indirectPipeline = VisibilityPipeline(cachedIndirect ?
         m_radianceCache[static_cast<size_t>(radianceCacheLibrary)].pipeline :
         (extract ? (gBufferReplacement ? (raw ? m_psrGBufferExtractIndirectRawPipeline : m_psrGBufferExtractIndirectPipeline) :
@@ -3799,6 +3832,8 @@ bool PathTraceReferencePass::InitializeVisibilityPipelines(
     {
         // M4.2C: an NVIDIA SHARC update library's sampled permutation is a TraceRay pipeline of its own.
         AttachSampledVariant(device, shaders, original, description);
+        // M4.3: a ReSTIR DI direct pass's ReGIR permutation.
+        AttachReGIRVariant(device, shaders, original, description);
         return true;
     }
 
@@ -3884,6 +3919,46 @@ void PathTraceReferencePass::AttachSampledVariant(GraphicsDevice& device, Shader
 
     ++m_pipelineStatistics.sampledVariants;
     owner.SetSampledVariant(std::move(variant));
+}
+
+void PathTraceReferencePass::AttachReGIRVariant(GraphicsDevice& device, ShaderLibrary& shaders, RayTracingPipeline& owner,
+    const RayTracingPipelineDescription& description)
+{
+    const std::optional<std::filesystem::path> regirPath = ReGIRVariantLibraryPath(description.shaderPath);
+
+    if(!regirPath)
+    {
+        owner.SetReGIRVariant(nullptr);
+        return;
+    }
+
+    RayTracingPipelineDescription regirDescription = description;
+    regirDescription.shaderPath = *regirPath;
+    auto variant = std::make_unique<RayTracingPipeline>();
+    const ShaderLibraryCompileResult* library = AcquireLibrary(shaders, regirDescription.shaderPath);
+
+    // Without it, the uniform candidates run (and it is said once).
+    if(!library || !CreatePipeline(device, *variant, library->bytecode, regirDescription))
+    {
+        variant->Shutdown();
+        Log::Warning("M4.3 ReGIR direct-pass permutation unavailable; uniform candidates run instead: " +
+            regirDescription.shaderPath.generic_string());
+        owner.SetReGIRVariant(nullptr);
+        return;
+    }
+
+    owner.SetReGIRVariant(std::move(variant));
+}
+
+bool PathTraceReferencePass::ReGIRLibrariesRequested()
+{
+    static const bool requested = []
+    {
+        const char* value = std::getenv("ENGINE_REGIR");
+        return !(value && std::string(value) == "0");
+    }();
+
+    return requested;
 }
 
 bool PathTraceReferencePass::SampledIndirectNeeLibrariesRequested()

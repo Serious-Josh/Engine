@@ -295,6 +295,83 @@ RTXDI_DIInitialSamplingParameters RtxdiBridgeInitialSamplingParameters(uint loca
     return parameters;
 }
 
+#ifdef PATH_TRACE_REGIR
+// M4.3 ReGIR (experimental; the M43/DirectLighting variants only): RTXDI_SampleLocalLightsInternal (InitialSampling.hlsli)
+// with RTXDI's ReGIR selection context, reading the slots ReGIRPresample.hlsl wrote this frame (a 64-byte header, then
+// uint2(RTXDI local index, W) per slot) through their UAV, rtxdiPadding0 (0xFFFFFFFF: none, use the uniform candidates).
+// The cell is RTXDI_CalculateReGIRCellIndex's (position jittered by (U - 0.5) samplingJitter cellSize per axis with
+// coherentRng, then the Grid lookup against the header's window); outside the window, RTXDI's uniform fallback. Each
+// candidate is a stratified slot pick whose W is its inverse source pdf, streamed with the SDK's
+// RTXDI_StreamLocalLightAtUVIntoReservoir and finalized as the SDK does (Documentation/Rendering/ReGIR_M4_3_Math.md).
+static const uint RTXDI_BRIDGE_REGIR_HEADER_BYTES = 64u;
+static const uint RTXDI_BRIDGE_REGIR_MAGIC = 0x52654749u;
+
+RTXDI_DIReservoir RtxdiBridgeSampleLocalLightsReGIR(inout RTXDI_RandomSamplerState rng,
+    inout RTXDI_RandomSamplerState coherentRng, RAB_Surface surface, RTXDI_DIInitialSamplingParameters parameters,
+    RTXDI_InitialSamplingMisData misData, RTXDI_LightBufferRegion localLightBufferRegion, out RAB_LightSample o_selectedSample)
+{
+    o_selectedSample = RAB_EmptyLightSample();
+    int cellIndex = -1;
+    uint lightsPerCell = 0u;
+
+    if(rtxdiPadding0 != 0xFFFFFFFFu)
+    {
+        RWByteAddressBuffer header = ResourceDescriptorHeap[rtxdiPadding0];
+        const uint4 row0 = header.Load4(0u);
+        const uint4 row1 = header.Load4(16u);
+        const uint4 row2 = header.Load4(32u);
+
+        if(row0.x == RTXDI_BRIDGE_REGIR_MAGIC)
+        {
+            const float3 center = asfloat(row0.yzw);
+            const uint3 cells = row1.xyz;
+            const float cellSize = asfloat(row2.x);
+            const float samplingJitter = asfloat(row2.y);
+            lightsPerCell = row1.w;
+            float3 jitter = float3(RTXDI_GetNextRandom(coherentRng), RTXDI_GetNextRandom(coherentRng),
+                RTXDI_GetNextRandom(coherentRng)) - 0.5f;
+            const float3 samplingPosition = RAB_GetSurfaceWorldPos(surface) + jitter * (samplingJitter * cellSize);
+            const float3 origin = center - float3(cells) * (cellSize * 0.5f);
+            const int3 cell = int3(floor((samplingPosition - origin) / cellSize));
+
+            if(all(cell >= 0) && all(cell < int3(cells)))
+            {
+                cellIndex = cell.x + (cell.y + cell.z * int(cells.y)) * int(cells.x);
+            }
+        }
+    }
+
+    if(cellIndex < 0 || lightsPerCell == 0u)
+    {
+        return RTXDI_SampleLocalLights(rng, coherentRng, surface, parameters, misData,
+            ReSTIRDI_LocalLightSamplingMode_UNIFORM, localLightBufferRegion, o_selectedSample);
+    }
+
+    RWByteAddressBuffer slots = ResourceDescriptorHeap[rtxdiPadding0];
+    RTXDI_DIReservoir state = RTXDI_EmptyDIReservoir();
+
+    for(uint candidate = 0u; candidate < parameters.numLocalLightSamples; ++candidate)
+    {
+        float random = RTXDI_GetNextRandom(rng);
+#if RTXDI_STRATIFY_LOCAL_SAMPLING
+        random = (random + candidate) / parameters.numLocalLightSamples;
+#endif
+        const uint slot = min(uint(floor(random * lightsPerCell)), lightsPerCell - 1u);
+        const uint2 word = slots.Load2(RTXDI_BRIDGE_REGIR_HEADER_BYTES + (uint(cellIndex) * lightsPerCell + slot) * 8u);
+        const uint lightIndex = word.x;
+        const float inverseSourcePdf = asfloat(word.y);
+        const RAB_LightInfo lightInfo = RAB_LoadLightInfo(lightIndex, false);
+        const float2 uv = RTXDI_RandomlySelectLocalLightUV(rng);
+        RTXDI_StreamLocalLightAtUVIntoReservoir(rng, misData, surface, parameters.brdfCutoff, misData.localLightMisWeight,
+            lightIndex, uv, inverseSourcePdf, lightInfo, state, o_selectedSample);
+    }
+
+    RTXDI_FinalizeResampling(state, 1.0f, misData.numMisSamples);
+    state.M = 1;
+    return state;
+}
+#endif
+
 #if RTXDI_ENVIRONMENT_STRATEGY == RTXDI_ENVIRONMENT_STRATEGY_RESERVOIR
 // PT.2B Reservoir strategy: RTXDI_SampleEnvironmentMap without presampling. Its presampled tile would hold uv with the inverse
 // of their density; Engine's CDF warp already importance-samples luminance from uniform uv, so each candidate draws uv
@@ -351,8 +428,13 @@ RTXDI_DIReservoir RtxdiBridgeSampleLightsForSurface(inout RTXDI_RandomSamplerSta
     RTXDI_InitialSamplingMisData misData = RTXDI_ComputeInitialSamplingMisData(parameters);
 
     RAB_LightSample localSample = RAB_EmptyLightSample();
+#ifdef PATH_TRACE_REGIR
+    RTXDI_DIReservoir localReservoir = RtxdiBridgeSampleLocalLightsReGIR(rng, coherentRng, surface, parameters, misData,
+        lightBufferParameters.localLightBufferRegion, localSample);
+#else
     RTXDI_DIReservoir localReservoir = RTXDI_SampleLocalLights(rng, coherentRng, surface, parameters, misData,
         parameters.localLightSamplingMode, lightBufferParameters.localLightBufferRegion, localSample);
+#endif
 
     RAB_LightSample infiniteSample = RAB_EmptyLightSample();
     RTXDI_DIReservoir infiniteReservoir = RTXDI_SampleInfiniteLights(rng, surface, parameters.numInfiniteLightSamples,
@@ -407,6 +489,57 @@ RTXDI_DIReservoir RtxdiBridgeSampleLightsForSurface(inout RTXDI_RandomSamplerSta
 }
 #endif
 
+#if defined(PATH_TRACE_REGIR) && RTXDI_ENVIRONMENT_STRATEGY != RTXDI_ENVIRONMENT_STRATEGY_RESERVOIR
+// M4.3 ReGIR, separate-MIS strategy: RTXDI_SampleLightsForSurface (InitialSampling.hlsli, presampling disabled) with
+// RtxdiBridgeSampleLocalLightsReGIR in place of RTXDI_SampleLocalLights; every other step and the order the reservoirs
+// combine in are the SDK's.
+RTXDI_DIReservoir RtxdiBridgeSampleLightsForSurfaceReGIR(inout RTXDI_RandomSamplerState rng,
+    inout RTXDI_RandomSamplerState coherentRng, RAB_Surface surface, RTXDI_DIInitialSamplingParameters sampleParams,
+    RTXDI_LightBufferParameters lightBufferParams, out RAB_LightSample o_lightSample)
+{
+    o_lightSample = RAB_EmptyLightSample();
+    RTXDI_InitialSamplingMisData misData = RTXDI_ComputeInitialSamplingMisData(sampleParams);
+
+    RAB_LightSample localSample = RAB_EmptyLightSample();
+    RTXDI_DIReservoir localReservoir = RtxdiBridgeSampleLocalLightsReGIR(rng, coherentRng, surface, sampleParams,
+        misData, lightBufferParams.localLightBufferRegion, localSample);
+
+    RAB_LightSample infiniteSample = RAB_EmptyLightSample();
+    RTXDI_DIReservoir infiniteReservoir = RTXDI_SampleInfiniteLights(rng, surface, sampleParams.numInfiniteLightSamples,
+        lightBufferParams.infiniteLightBufferRegion, infiniteSample);
+
+    RAB_LightSample brdfSample = RAB_EmptyLightSample();
+    RTXDI_DIReservoir brdfReservoir = RTXDI_SampleBrdf(rng, surface, sampleParams.numBrdfSamples,
+        sampleParams.brdfCutoff, sampleParams.brdfRayMinT, misData, coherentRng, lightBufferParams, brdfSample);
+
+    RTXDI_DIReservoir state = RTXDI_EmptyDIReservoir();
+    RTXDI_CombineDIReservoirs(state, localReservoir, 0.5, localReservoir.targetPdf);
+    bool selectInfinite = RTXDI_CombineDIReservoirs(state, infiniteReservoir, RTXDI_GetNextRandom(rng),
+        infiniteReservoir.targetPdf);
+    bool selectBrdf = RTXDI_CombineDIReservoirs(state, brdfReservoir, RTXDI_GetNextRandom(rng), brdfReservoir.targetPdf);
+
+    RTXDI_FinalizeResampling(state, 1.0, 1.0);
+    state.M = 1;
+
+    if(selectBrdf)
+        o_lightSample = brdfSample;
+    else if(selectInfinite)
+        o_lightSample = infiniteSample;
+    else
+        o_lightSample = localSample;
+
+    if(sampleParams.enableInitialVisibility && RTXDI_IsValidDIReservoir(state))
+    {
+        if(!RAB_GetConservativeVisibility(surface, o_lightSample))
+        {
+            RTXDI_StoreVisibilityInDIReservoir(state, 0, true);
+        }
+    }
+
+    return state;
+}
+#endif
+
 // One independent initial reservoir for a surface. sampleSeed must differ for every path sample of a pixel
 // (the progressive mean relies on independent estimates). selectedSample is the exact candidate RTXDI chose.
 RTXDI_DIReservoir RtxdiBridgeSampleInitialReservoir(RAB_Surface surface, uint2 pixel, uint sampleSeed,
@@ -420,6 +553,9 @@ RTXDI_DIReservoir RtxdiBridgeSampleInitialReservoir(RAB_Surface surface, uint2 p
 
 #if RTXDI_ENVIRONMENT_STRATEGY == RTXDI_ENVIRONMENT_STRATEGY_RESERVOIR
     return RtxdiBridgeSampleLightsForSurface(rng, coherentRng, surface, parameters, lightBufferParameters,
+        selectedSample);
+#elif defined(PATH_TRACE_REGIR)
+    return RtxdiBridgeSampleLightsForSurfaceReGIR(rng, coherentRng, surface, parameters, lightBufferParameters,
         selectedSample);
 #else
     return RTXDI_SampleLightsForSurface(rng, coherentRng, surface, parameters, lightBufferParameters,

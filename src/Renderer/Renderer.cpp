@@ -3282,7 +3282,21 @@ bool Renderer::Initialize(
     if(const char* lightSampling = std::getenv("ENGINE_LIGHT_SAMPLING"); lightSampling && std::strcmp(lightSampling, "1") == 0)
     {
         m_lightSamplingEnabled = true;
+        m_lightSamplingAlways = true;
         Log::Info("Shared light sampling enabled (ENGINE_LIGHT_SAMPLING=1).");
+    }
+
+    // M4.3: ReGIR presampling reads the shared light sampling. M4.3.5: on by default (ENGINE_REGIR=0 disables ReGIR); the
+    // structures are built only on frames that use ReGIR (path-traced ReSTIR DI above the local-light threshold).
+    if(PathTraceReferencePass::ReGIRLibrariesRequested())
+    {
+        m_lightSamplingEnabled = true;
+        Log::Info("ReGIR enabled above " + std::to_string(m_regirSettings.localLightThreshold) +
+            " local lights (ENGINE_REGIR=0 disables it).");
+    }
+    else
+    {
+        Log::Info("ReGIR disabled (ENGINE_REGIR=0).");
     }
 
     // M4.2A experimental sampled indirect NEE: the M42A libraries need the shared light sampling. Environment overrides:
@@ -3293,6 +3307,7 @@ bool Renderer::Initialize(
     if(m_sampledNeeReport.librariesRequested)
     {
         m_lightSamplingEnabled = true;
+        m_lightSamplingAlways = true;
         const auto environment = [](const char* name)
         {
             const char* value = std::getenv(name);
@@ -6951,6 +6966,116 @@ void Renderer::EvaluatePathTraceReSTIRDI()
     }
 }
 
+// M4.3 ReGIR presampling (experimental; ReGIR_M4_3_Math.md): fills the slots the DirectLighting/ReGIR permutation reads,
+// in this frame's command list after the light-sampling publication (RecordLightSampling) and before the direct pass.
+// ReGIR is used only when every input belongs to this frame's light table: the structures were published for exactly this
+// table (the presampling pass reads their header and translation; table light indices of this table become RTXDI local
+// indices of the RTXDI light set built from the same table this frame), the table has more lights than the sampled-NEE
+// threshold, and the pipeline and slot buffer exist. The slots are rebuilt every frame, so no slot outlives the frame or
+// its table; ReSTIR reservoirs hold lights, never slots, and stay under the existing RTXDI history rules. Otherwise UINT_MAX
+// (the uniform candidates run).
+std::uint32_t Renderer::PrepareReGIRFrame(ID3D12GraphicsCommandList* commandList, const FrameLighting& frameLighting,
+    const PathTraceReferenceConstants& constants)
+{
+    CpuTiming::ScopedDuration prepareDuration(m_regirPrepareMillisecondsForTesting);
+    m_regirUsedLastFrameForTesting = m_pathTraceReferencePass.RecordedReGIR();
+    const std::uint32_t tableLights = frameLighting.table.lightCount;
+
+    if(!m_regirRequestedForTesting || !PathTraceReferencePass::ReGIRLibrariesRequested() ||
+        m_frameReGIRLocalLights <= m_regirSettings.localLightThreshold || !m_lightSamplingCache ||
+        !m_lightSamplingReport.available ||
+        m_lightSamplingCacheTable.lightCount != tableLights || m_frameLightSamplingBufferIndex == 0 ||
+        m_frameLightSamplingBufferIndex == UINT_MAX || m_frameSceneLightBufferIndex == UINT_MAX)
+    {
+        return UINT_MAX;
+    }
+
+    ID3D12Device* device = m_graphicsDevice.GetDevice();
+
+    if(!m_regirPresampleAttempted)
+    {
+        m_regirPresampleAttempted = true;
+        const auto setting = [](const char* name, std::uint32_t fallback)
+        {
+            const char* value = std::getenv(name);
+            return value && *value ? static_cast<std::uint32_t>(std::strtoul(value, nullptr, 0)) : fallback;
+        };
+        const std::uint32_t cells = setting("ENGINE_REGIR_WINDOW", m_regirSettings.windowCells[0]);
+        m_regirSettings.windowCells[0] = m_regirSettings.windowCells[1] = m_regirSettings.windowCells[2] = cells;
+        m_regirSettings.lightsPerCell = setting("ENGINE_REGIR_SLOTS", m_regirSettings.lightsPerCell);
+        m_regirSettings.buildSamples = setting("ENGINE_REGIR_CANDIDATES", m_regirSettings.buildSamples);
+
+        if(const char* wide = std::getenv("ENGINE_REGIR_WIDE_FRACTION"); wide && *wide)
+        {
+            m_regirSettings.wideFraction = std::strtof(wide, nullptr);
+        }
+
+        const Shader* shader = m_shaderLibrary.Load({"ReGIRPresample.hlsl", "main", ShaderStage::Compute});
+        ComputePipelineDescription description{};
+        description.computeShader = shader;
+        RootParameterDescription parameter{};
+        parameter.type = RootParameterType::ConstantBuffer;
+        parameter.shaderRegister = 0;
+        parameter.visibility = D3D12_SHADER_VISIBILITY_ALL;
+        description.rootParameters.push_back(parameter);
+        const std::uint64_t slotBytes = ReGIRSlotHeaderBytes + std::uint64_t{m_regirSettings.windowCells[0]} *
+            m_regirSettings.windowCells[1] * m_regirSettings.windowCells[2] * m_regirSettings.lightsPerCell * 8u;
+
+        if(!shader || !m_regirPresamplePipeline.Initialize(device, description) ||
+            !m_regirSlots.InitializeGPUWritable(device, static_cast<std::size_t>(slotBytes)) ||
+            !m_regirSlots.CreateRawUAV(device, m_resourceDescriptorHeap))
+        {
+            Log::Error("M4.3 ReGIR presampling unavailable; ReSTIR DI keeps its uniform candidates.");
+            m_regirSlots.Shutdown();
+            m_regirPresamplePipeline.Shutdown();
+            return UINT_MAX;
+        }
+
+        Log::Info("M4.3 ReGIR presampling: window " + std::to_string(cells) + "^3, " +
+            std::to_string(m_regirSettings.lightsPerCell) + " slots per cell, " +
+            std::to_string(m_regirSettings.buildSamples) + " candidates, wide fraction " +
+            std::to_string(m_regirSettings.wideFraction) + ", " + std::to_string(slotBytes) + " bytes.");
+    }
+
+    if(!m_regirSlots.GetResource())
+    {
+        return UINT_MAX;
+    }
+
+    const float camera[3] = {constants.cameraPosition[0], constants.cameraPosition[1], constants.cameraPosition[2]};
+    const ReGIRWindow window = MakeReGIRWindow(*m_lightSamplingCache, camera, m_regirSettings);
+
+    if(!window.valid)
+    {
+        return UINT_MAX;
+    }
+
+    ReGIRPresampleConstants presample = MakeReGIRPresampleConstants(window, m_regirSettings, tableLights,
+        0x52454749u ^ (++m_regirFrame * 0x9E3779B9u));
+    presample.lightSamplingIndex = m_frameLightSamplingBufferIndex;
+    presample.sceneLightBufferIndex = m_frameSceneLightBufferIndex;
+    presample.outputIndex = m_regirSlots.GetUAVDescriptorIndex();
+    const D3D12_GPU_VIRTUAL_ADDRESS address = m_uploadBuffer.Allocate(&presample, sizeof(presample),
+        D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
+
+    if(address == 0)
+    {
+        return UINT_MAX;
+    }
+
+    const std::uint32_t slots = window.CellCount() * m_regirSettings.lightsPerCell;
+    m_regirSlots.Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    m_regirPresamplePipeline.Bind(commandList);
+    commandList->SetComputeRootConstantBufferView(0, address);
+    commandList->Dispatch((slots + 63) / 64, 1, 1);
+    // The direct pass reads the slots through the same UAV.
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    barrier.UAV.pResource = m_regirSlots.GetResource();
+    commandList->ResourceBarrier(1, &barrier);
+    return m_regirSlots.GetUAVDescriptorIndex();
+}
+
 bool Renderer::PrepareRtxdiFrame(ID3D12GraphicsCommandList* commandList, const FrameLighting& frameLighting,
     const PathTraceReferenceConstants& constants, const Matrix4& view,
     D3D12_GPU_VIRTUAL_ADDRESS& rtxdiConstantsAddress)
@@ -7024,6 +7149,10 @@ bool Renderer::PrepareRtxdiFrame(ID3D12GraphicsCommandList* commandList, const F
         m_rtxdiVerifyInitialVisibilityReuseForTesting ? 2u : 1u;
     rtxdiConstants.diagnosticCountersIndex = m_rtxdiDiagnosticCountersIndexForTesting;
     rtxdiConstants.neighborOffsetsIndex = m_rtxdiResources.GetNeighborOffsetsSRVIndex();
+    // M4.3 ReGIR (experimental): this frame's presampled slots (their UAV, read by the DirectLighting/ReGIR permutation the
+    // pass then selects), or none. Production permutations never read padding0.
+    rtxdiConstants.padding0 = PrepareReGIRFrame(commandList, frameLighting, constants);
+    m_pathTraceReferencePass.SelectReGIR(rtxdiConstants.padding0 != UINT_MAX);
     rtxdiConstants.motionIndex = m_gBuffer.GetMotion().GetSRVIndex();
 
     // Linear depth along each camera's forward axis (row 2 of a left-handed view, as Matrix4::LookAt builds it).
@@ -10555,6 +10684,19 @@ Renderer::FrameRenderResult Renderer::Render(
         withheldOptions->airVisualization.reset();
     }
 
+    // M4.3 harness (test only): the Raster Primary mode without ReSTIR DI (every table light shaded with its own shadow ray at
+    // the first vertex) in place of a requested ReSTIR DI frame, the exhaustive direct-light reference.
+    if(m_rasterPrimaryInsteadOfReSTIRForTesting &&
+        requestedOptions.lightingMode == RendererLightingMode::PathTracedRasterPrimaryReSTIRDI)
+    {
+        if(!withheldOptions)
+        {
+            withheldOptions = requestedOptions;
+        }
+
+        withheldOptions->lightingMode = RendererLightingMode::PathTracedRasterPrimary;
+    }
+
     const RendererOptions& options = withheldOptions ? *withheldOptions : requestedOptions;
     // M0c.5 Stage 5.5: a finished NGX initialization is adopted here, between frames, without waiting.
     PollDlssBackend();
@@ -10658,6 +10800,15 @@ Renderer::FrameRenderResult Renderer::Render(
         m_pathTracePendingSamples = 0;
         InvalidatePreviousGBufferHistory();
         m_rtxdiResources.InvalidateHistory();
+
+        if(m_abortedFrameForTesting)
+        {
+            // The M4.3.5 harness's discarded frame: same resets as a failure, nothing executed or presented.
+            m_abortedFrameForTesting = false;
+            ++m_abortedFramesForTesting;
+            return FrameRenderResult::Deferred;
+        }
+
         LogAsyncDisplacementError();
         return FrameRenderResult::Error;
     }
@@ -10990,12 +11141,13 @@ std::shared_ptr<const FrameLighting> Renderer::AcquireFrameLighting(const Direct
 }
 
 D3D12_GPU_VIRTUAL_ADDRESS Renderer::RecordLightSampling(ID3D12GraphicsCommandList* commandList,
-    const FrameLighting& lighting, std::uint64_t lightingRevision)
+    const FrameLighting& lighting, std::uint64_t lightingRevision, bool regirFrame)
 {
     m_lightSamplingReport.enabled = m_lightSamplingEnabled;
     m_lightSamplingReport.available = false;
 
-    if(!m_lightSamplingEnabled)
+    // M4.3.5: with ReGIR the only consumer, nothing is built (or published) on frames that do not use it.
+    if(!m_lightSamplingEnabled || (!m_lightSamplingAlways && !regirFrame))
     {
         return 0;
     }
@@ -12420,6 +12572,8 @@ bool Renderer::RecordRenderFrame(
         return false;
     }
 
+    m_frameSceneLightBufferIndex = sceneLightConstants.lightCount != 0 ? sceneLightConstants.lightBufferIndex : UINT_MAX;
+
     // Many-light M3: RTXDI's light data is grown here too, before any consumer reads the frame's lights. It holds this
     // frame's lights (the table plus at most the sun and HDRI) and, for history, the committed previous frame's.
     bool tablePublished = lightBufferResult == SceneLightBuffer::RecordResult::Published;
@@ -12495,7 +12649,12 @@ bool Renderer::RecordRenderFrame(
 
     // M4.1: the shared light-sampling structures of exactly this table (same revision), published after it. Disabled by
     // default; M4.2A's experimental libraries read them through the scene light constants.
-    m_frameLightSamplingConstants = RecordLightSampling(commandList, frameLighting, lightingRevision);
+    // M4.3.5: ReGIR frames are path-traced ReSTIR DI frames with ReGIR requested and more local lights than its threshold.
+    m_frameReGIRLocalLights = m_regirRequestedForTesting && PathTraceReferencePass::ReGIRLibrariesRequested() ?
+        CountReGIRLocalLights(frameLighting.table) : 0u;
+    const bool regirFrame = runPathTrace && pathTracePrimary == PathTracePrimary::RasterReSTIRDI &&
+        m_frameReGIRLocalLights > m_regirSettings.localLightThreshold;
+    m_frameLightSamplingConstants = RecordLightSampling(commandList, frameLighting, lightingRevision, regirFrame);
     ApplySampledIndirectNee(frameLighting, sceneLightConstants);
 
     const D3D12_GPU_VIRTUAL_ADDRESS sceneLightConstantsAddress = m_uploadBuffer.Allocate(
@@ -12855,6 +13014,14 @@ bool Renderer::RecordRenderFrame(
             currentProjection, reconstructionConstants.inverseViewProjection, frameView.position, frameLighting,
             sceneLightConstantsAddress, options.pathTraceReference))
         {
+            return false;
+        }
+
+        if(m_abortFrameAfterReGIRForTesting &&
+            (!m_abortFrameRequiresReGIRForTesting || m_pathTraceReferencePass.RecordedReGIR()))
+        {
+            m_abortFrameAfterReGIRForTesting = false;
+            m_abortedFrameForTesting = AbortTrackedRecording();
             return false;
         }
 
@@ -14231,6 +14398,9 @@ void Renderer::Shutdown()
     m_rtxdiResourcesFailed = false;
     m_sceneLightBuffer.Shutdown();
     m_lightSamplingBuffer.Shutdown();
+    m_regirSlots.Shutdown();
+    m_regirPresamplePipeline.Shutdown();
+    m_regirPresampleAttempted = false;
 
     // A background rebuild only reads its own table copy; waiting for it keeps the release from outliving it.
     if(m_lightSamplingRebuild.valid())

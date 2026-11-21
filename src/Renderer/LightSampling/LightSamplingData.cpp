@@ -736,14 +736,19 @@ bool BuildLightSamplingData(const SceneLightTable& table, const LightSamplingSet
     const std::uint64_t wideCapacity = wideLights.size() + reserve;
     const std::uint64_t globalCapacity = globalLights.size() + reserve;
 
-    // Layout: cells, lists, wide alias, global alias, directional indices (all 16-byte aligned).
+    // Layout: cells, lists, wide alias, global alias, directional indices, and (M4.3) the RTXDI local-light translation
+    // (all 16-byte aligned).
     const auto alignWords = [](std::uint64_t words) { return (words + 3) & ~std::uint64_t{3}; };
     const std::uint64_t cellsWords = cellCount * CellWords;
     const std::uint64_t listsStart = alignWords(cellsWords);
     const std::uint64_t wideStart = alignWords(listsStart + totalReferences);
     const std::uint64_t globalStart = wideStart + wideCapacity * AliasWords;
     const std::uint64_t directionalStart = globalStart + globalCapacity * AliasWords;
-    const std::uint64_t totalWords = (std::max)(alignWords(directionalStart + directionalLights.size()), std::uint64_t{4});
+    // M4.3: per table light, its RTXDI local-light index (its rank among the table's non-directional lights, the order
+    // BuildRtxdiLightSet adds them in; 0xFFFFFFFF for directional lights), read by the ReGIR presampling pass. It depends
+    // only on the light count and types, which every incremental update keeps (it rejects changes to them).
+    const std::uint64_t translationStart = alignWords(directionalStart + directionalLights.size());
+    const std::uint64_t totalWords = (std::max)(alignWords(translationStart + lightCount), std::uint64_t{4});
 
     if(totalWords * 4 > MaximumBufferBytes)
     {
@@ -801,6 +806,14 @@ bool BuildLightSamplingData(const SceneLightTable& table, const LightSamplingSet
     AppendAliasTable(wideLights, wideWeights, settings.defensiveShare, static_cast<std::size_t>(reserve), words);
     AppendAliasTable(globalLights, globalWeights, settings.defensiveShare, static_cast<std::size_t>(reserve), words);
     words.insert(words.end(), directionalLights.begin(), directionalLights.end());
+    words.resize(static_cast<std::size_t>(translationStart), 0u);
+    std::uint32_t localIndex = 0;
+
+    for(std::uint32_t index = 0; index < lightCount; ++index)
+    {
+        words.push_back(table.lights[index].type == LightSamplingDirectionalType ? 0xFFFFFFFFu : localIndex++);
+    }
+
     words.resize(static_cast<std::size_t>(totalWords), 0u);
 
     phase(statistics.distributionMilliseconds);
@@ -868,6 +881,7 @@ bool BuildLightSamplingData(const SceneLightTable& table, const LightSamplingSet
     constants.directionalOffset = static_cast<std::uint32_t>(directionalStart * 4);
     constants.directionalCount = static_cast<std::uint32_t>(directionalLights.size());
     constants.tableLightCount = lightCount;
+    constants.padding = static_cast<std::uint32_t>(translationStart * 4);
     data = std::move(result);
     return true;
 }

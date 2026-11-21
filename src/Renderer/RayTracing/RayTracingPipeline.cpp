@@ -517,6 +517,12 @@ void RayTracingPipeline::Shutdown()
         m_sampledVariant.reset();
     }
 
+    if(m_regirVariant)
+    {
+        m_regirVariant->Shutdown();
+        m_regirVariant.reset();
+    }
+
     m_identity.clear();
     m_hitGroupShaderTable.Shutdown();
     m_missShaderTable.Shutdown();
@@ -630,4 +636,5 @@ void RayTracingPipeline::Swap(RayTracingPipeline& other) noexcept
     m_hitGroupShaderTable.Swap(other.m_hitGroupShaderTable);
     std::swap(m_identity, other.m_identity);
     std::swap(m_sampledVariant, other.m_sampledVariant);
+    std::swap(m_regirVariant, other.m_regirVariant);
 }

@@ -477,6 +477,7 @@ add_library(EngineCore OBJECT
     src/Renderer/SceneLightBuffer.cpp
     src/Renderer/LightSampling/LightSamplingData.cpp
     src/Renderer/LightSampling/LightSamplingBuffer.cpp
+    src/Renderer/LightSampling/ReGIRPresampling.cpp
     src/Renderer/Passes/EditorColliderPass.cpp
     src/Renderer/Passes/EditorVoxelPass.cpp
     src/Renderer/Passes/EditorAirPass.cpp
@@ -898,6 +899,12 @@ if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Renderer
     add_executable(PathTraceLibraryReuseTests src/Renderer/tests/PathTraceLibraryReuseTests.cpp)
     target_link_libraries(PathTraceLibraryReuseTests PRIVATE EngineCore)
     engine_use_agility(PathTraceLibraryReuseTests)
+endif()
+# Local-only ReGIR presampling regression (CPU), same guard.
+if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Renderer/tests/ReGIRTests.cpp")
+    add_executable(ReGIRTests src/Renderer/tests/ReGIRTests.cpp)
+    target_link_libraries(ReGIRTests PRIVATE EngineCore)
+    engine_use_agility(ReGIRTests)
 endif()
 # Local-only workload guard estimate regression (pure arithmetic), same guard.
 if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Renderer/tests/WorkloadGuardTests.cpp")

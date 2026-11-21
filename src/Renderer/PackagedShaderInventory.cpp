@@ -78,6 +78,8 @@ namespace
         {"NrdPathTracePrepare.hlsl", "CSResolveRelaxSignalView", Compute, Feature::PathTraceDenoiser},
         {"NrdPathTracePrepare.hlsl", "CSPrepareHybrid", Compute, Feature::PathTraceDenoiser},
         {"NrdPathTracePrepare.hlsl", "CSResolveDenoisedHybrid", Compute, Feature::PathTraceDenoiser},
+        // M4.3.5: ReGIR presampling (Renderer::PrepareReGIRFrame), on by default with the ReSTIR DI ReGIR permutations.
+        {"ReGIRPresample.hlsl", "main", Compute, Feature::PathTracing},
 
         // PresentationResolvePass (its SHARC spatial diagnostic pixel shader is a compile-time diagnostic, never packaged).
         {"PresentationResolve.hlsl", "VSMain", Vertex, Feature::Presentation},

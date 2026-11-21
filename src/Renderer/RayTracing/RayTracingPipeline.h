@@ -82,6 +82,23 @@ class RayTracingPipeline
         m_sampledVariant = std::move(variant);
     }
 
+    // M4.3: the separate permutation of a ReSTIR DI direct pass with ReGIR local-light candidates (DirectLighting/ReGIR),
+    // used instead of it on frames whose ReGIR slots were presampled. Owned like the sampled variant; null when none.
+    RayTracingPipeline* GetReGIRVariant() const
+    {
+        return m_regirVariant && m_regirVariant->IsInitialized() ? m_regirVariant.get() : nullptr;
+    }
+
+    void SetReGIRVariant(std::unique_ptr<RayTracingPipeline> variant)
+    {
+        if(m_regirVariant)
+        {
+            m_regirVariant->Shutdown();
+        }
+
+        m_regirVariant = std::move(variant);
+    }
+
     void Bind(ID3D12GraphicsCommandList4* commandList) const;
     // Diagnostics: the stack size the driver reports for one export of the state object (0 when unavailable).
     std::uint64_t GetShaderStackSize(const wchar_t* exportName) const;
@@ -108,4 +125,5 @@ class RayTracingPipeline
     ShaderTable m_hitGroupShaderTable;
     std::string m_identity;
     std::unique_ptr<RayTracingPipeline> m_sampledVariant;
+    std::unique_ptr<RayTracingPipeline> m_regirVariant;
 };

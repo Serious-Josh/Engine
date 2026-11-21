@@ -283,6 +283,16 @@
     "PATH_TRACE_PSR_CHAIN=2 PATH_TRACE_RESTIR_DI_EXTRACTION_LIBRARY=1 PATH_TRACE_PSR_LIBRARY=1 "
     "PATH_TRACE_PSR_GBUFFER=1", ""},
 
+// M4.3 ReGIR (experimental, ENGINE_REGIR=1): each ReSTIR DI direct pass with ReGIR local-light candidates
+// (PATH_TRACE_REGIR, RtxdiApplicationBridge.hlsli), selected only on frames whose ReGIR slots were presampled for the
+// frame's light table; production frames keep the passes above.
+{"DirectLighting/ReGIR/ReSTIRDIDirect.hlsl", "DirectLighting/ReSTIRDIDirect.hlsl", "PATH_TRACE_REGIR=1", ""},
+{"DirectLighting/ReGIR/ReSTIRDIDirectExtract.hlsl", "DirectLighting/ReSTIRDIDirectExtract.hlsl", "PATH_TRACE_REGIR=1", ""},
+{"DirectLighting/ReGIR/ReSTIRDIDirectPsr.hlsl", "DirectLighting/ReSTIRDIDirectPsr.hlsl", "PATH_TRACE_REGIR=1", ""},
+{"DirectLighting/ReGIR/ReSTIRDIDirectPsrExtract.hlsl", "DirectLighting/ReSTIRDIDirectPsrExtract.hlsl", "PATH_TRACE_REGIR=1", ""},
+{"DirectLighting/ReGIR/ReSTIRDIDirectPsrK2.hlsl", "DirectLighting/ReSTIRDIDirectPsrK2.hlsl", "PATH_TRACE_REGIR=1", ""},
+{"DirectLighting/ReGIR/ReSTIRDIDirectPsrK2Extract.hlsl", "DirectLighting/ReSTIRDIDirectPsrK2Extract.hlsl", "PATH_TRACE_REGIR=1", ""},
+
 // ---- GI6 ----
 // Diagnostic GI.6 image-path visibility variant; original wrapper preserves profile and SER.
 {"GI6/PathTraceReference.hlsl", "PathTraceReference.hlsl", "PATH_TRACE_SECONDARY_SHADOW_RAY_QUERY=1", ""},

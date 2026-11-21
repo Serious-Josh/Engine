@@ -25,6 +25,8 @@
 #include "SceneLightBuffer.h"
 #include "LightSampling/LightSamplingBuffer.h"
 #include "LightSampling/LightSamplingData.h"
+#include "LightSampling/ReGIRPresampling.h"
+#include "ComputePipeline.h"
 #include "DescriptorHeap.h"
 #include "GraphicsDevice.h"
 #include "GpuTimestampProfiler.h"
@@ -993,8 +995,9 @@ class Renderer
 
     LightSamplingReport GetLightSamplingReport() const;
 
-    // M4.1: whether the shared light-sampling structures are built and published (ENGINE_LIGHT_SAMPLING=1, or tests). Off by
-    // default until a consumer exists (M4.2).
+    // M4.1: whether the shared light-sampling structures may be built and published. M4.3.5: on by default for ReGIR, which
+    // builds them only on its own frames; ENGINE_LIGHT_SAMPLING=1 and sampled NEE build them every frame. Tests turn it off
+    // to make the publication unavailable.
     void SetLightSamplingEnabled(bool enabled) noexcept
     {
         m_lightSamplingEnabled = enabled;
@@ -1660,8 +1663,12 @@ class Renderer
     // M4.1: builds (or reuses, for the same non-zero revision) the shared light-sampling structures of the frame's published
     // light table and records their publication; returns the frame's LightSamplingConstants address (0 when disabled).
     D3D12_GPU_VIRTUAL_ADDRESS RecordLightSampling(ID3D12GraphicsCommandList* commandList, const FrameLighting& lighting,
-        std::uint64_t lightingRevision);
+        std::uint64_t lightingRevision, bool regirFrame);
     bool m_lightSamplingEnabled = false;
+    // M4.3.5: built every frame (ENGINE_LIGHT_SAMPLING=1, sampled NEE), not only on ReGIR frames.
+    bool m_lightSamplingAlways = false;
+    // M4.3.5: the frame's RTXDI local lights while ReGIR is requested (0 otherwise), for ReGIR's threshold.
+    std::uint32_t m_frameReGIRLocalLights = 0;
     LightSamplingSettings m_lightSamplingSettings;
     LightSamplingBuffer m_lightSamplingBuffer;
     // M4.1.1: the structures sampling m_lightSamplingCacheTable (lighting revision m_lightSamplingCacheRevision), updated
@@ -1677,6 +1684,16 @@ class Renderer
     std::future<std::shared_ptr<LightSamplingData>> m_lightSamplingRebuild;
     SceneLightTable m_lightSamplingRebuildTable;
     D3D12_GPU_VIRTUAL_ADDRESS m_frameLightSamplingConstants = 0;
+    // M4.3 ReGIR: the frame's scene light buffer SRV (for the presampling pass), the presampling pipeline and its slot
+    // buffer (allocated on first use for the fixed settings, released at shutdown), and a frame counter for its seeds.
+    std::uint32_t m_frameSceneLightBufferIndex = UINT_MAX;
+    ComputePipeline m_regirPresamplePipeline;
+    bool m_regirPresampleAttempted = false;
+    Buffer m_regirSlots;
+    std::uint32_t m_regirFrame = 0;
+    // Records this frame's ReGIR presampling when ReGIR can be used; returns the slot buffer's UAV index or UINT_MAX.
+    std::uint32_t PrepareReGIRFrame(ID3D12GraphicsCommandList* commandList, const FrameLighting& frameLighting,
+        const PathTraceReferenceConstants& constants);
     // The descriptor index of the buffer published this frame (valid with m_lightSamplingReport.available).
     std::uint32_t m_frameLightSamplingBufferIndex = 0;
     // M4.2A: the mode word and buffer index the path tracer reads from SceneLightConstants.padding.
@@ -2392,6 +2409,26 @@ private:
     // PT.2A diagnostics: a RWByteAddressBuffer UAV of the RTXDI_DIAGNOSTIC_* words (PathTraceReference.hlsl) the ReSTIR DI
     // direct pass adds to. UINT_MAX (production) counts nothing.
     std::uint32_t m_rtxdiDiagnosticCountersIndexForTesting = UINT_MAX;
+    // M4.3 ReGIR: whether ReSTIR DI uses ReGIR candidates where they are available (M4.3.5: on by default above
+    // ReGIRSettings::localLightThreshold local lights; ENGINE_REGIR=0 disables it; the harness toggles it), and whether the
+    // last recorded frame's direct pass used them.
+    bool m_regirRequestedForTesting = PathTraceReferencePass::ReGIRLibrariesRequested();
+    bool m_regirUsedLastFrameForTesting = false;
+    // M4.3 harness: render requested ReSTIR DI frames in the Raster Primary mode without ReSTIR DI (the exhaustive reference).
+    bool m_rasterPrimaryInsteadOfReSTIRForTesting = false;
+    // M4.3.5 harness: the next frame whose direct pass records ReGIR (presampling recorded) is discarded through
+    // AbortTrackedRecording before submission, as a recording failure would be; Render then reports it Deferred (nothing
+    // executed or presented) instead of Error, so the Editor keeps running. Cleared when it fires; m_abortedFrameForTesting
+    // records whether the discard was confirmed.
+    bool m_abortFrameAfterReGIRForTesting = false;
+    // The control case: false fires on the next path-traced frame whether or not it records ReGIR.
+    bool m_abortFrameRequiresReGIRForTesting = true;
+    bool m_abortedFrameForTesting = false;
+    std::uint32_t m_abortedFramesForTesting = 0;
+    // M4.3.5 timing: the last frame's PrepareReGIRFrame CPU time (eligibility, constants, presampling dispatch record).
+    double m_regirPrepareMillisecondsForTesting = 0.0;
+    // M4.3: ReGIR settings (window, slots, candidates; ENGINE_REGIR_* overrides at startup) and the frame's presampling.
+    ReGIRSettings m_regirSettings;
     // PT.2B: a light that moved or changed keeps its ReSTIR DI samples (translated by stable object ID; bias correction
     // evaluates them with the light's previous record). False restores the pre-PT.2B rule: any change of a light's
     // parameters drops its samples.
