@@ -511,6 +511,12 @@ bool RayTracingPipeline::InitializeCompute(ID3D12Device5* device, const std::vec
 
 void RayTracingPipeline::Shutdown()
 {
+    if(m_sampledVariant)
+    {
+        m_sampledVariant->Shutdown();
+        m_sampledVariant.reset();
+    }
+
     m_identity.clear();
     m_hitGroupShaderTable.Shutdown();
     m_missShaderTable.Shutdown();
@@ -623,4 +629,5 @@ void RayTracingPipeline::Swap(RayTracingPipeline& other) noexcept
     m_missShaderTable.Swap(other.m_missShaderTable);
     m_hitGroupShaderTable.Swap(other.m_hitGroupShaderTable);
     std::swap(m_identity, other.m_identity);
+    std::swap(m_sampledVariant, other.m_sampledVariant);
 }

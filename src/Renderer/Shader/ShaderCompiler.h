@@ -45,8 +45,9 @@ struct ShaderLibraryCompileDescription
 {
     const wchar_t* path = nullptr;
     ShaderLibraryProfile profile = ShaderLibraryProfile::Library66;
-    // The shader root. Added as a second -I only when it differs from the source's directory, so variant
-    // wrappers in subdirectories (GI6/, PsrK2/) resolve the RTXDI SDK's angled includes like their originals.
+    // The shader root. Added as a second -I only when it differs from the source's directory, so variants in
+    // subdirectories (GI6/, PsrK2/) resolve the RTXDI SDK's angled includes like their originals. Also where
+    // ShaderVariants looks up a path that names a variant rather than a file.
     const wchar_t* includeDirectory = nullptr;
     // Runtime callers opt in explicitly. Offline cooking and direct compiler clients remain uncached.
     bool usePersistentCache = false;

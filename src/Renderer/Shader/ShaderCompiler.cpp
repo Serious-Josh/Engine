@@ -1,11 +1,13 @@
 #include "Core/Log.h"
 #include "ShaderCompiler.h"
 #include "DxilLibraryCache.h"
+#include "ShaderVariants.h"
 
 #include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -67,16 +69,29 @@ namespace
     // Forwards to the default handler and records every lookup, including the misses: a file appearing
     // earlier in the search order would change which source an include resolves to. Lives on the stack
     // for one Compile call, which releases every reference it takes before returning.
+    //
+    // A shader variant (ShaderVariants) included by a file is served from its generated text. It is recorded as an
+    // existing dependency with that text, which no file can match, so such a compilation is never answered from or
+    // stored in the persistent cache: the variant table is not part of the including file's cache identity.
     class RecordingIncludeHandler final : public IDxcIncludeHandler
     {
         public:
-        RecordingIncludeHandler(IDxcIncludeHandler* inner, std::vector<ShaderSourceDependency>& dependencies) :
-            m_inner(inner), m_dependencies(dependencies)
+        RecordingIncludeHandler(IDxcIncludeHandler* inner, std::vector<ShaderSourceDependency>& dependencies,
+            IDxcUtils* utils, const wchar_t* shaderRoot) :
+            m_inner(inner), m_dependencies(dependencies), m_utils(utils), m_shaderRoot(shaderRoot)
         {
         }
 
         HRESULT STDMETHODCALLTYPE LoadSource(LPCWSTR filename, IDxcBlob** includeSource) override
         {
+            const ShaderVariant* variant = m_shaderRoot && *m_shaderRoot != L'\0' ?
+                ShaderVariants::FindUnder(m_shaderRoot, filename) : nullptr;
+
+            if(variant)
+            {
+                return LoadVariant(*variant, filename, includeSource);
+            }
+
             const HRESULT result = m_inner->LoadSource(filename, includeSource);
             RecordDependency(m_dependencies, filename, SUCCEEDED(result) ? *includeSource : nullptr);
             return result;
@@ -105,9 +120,76 @@ namespace
         }
 
         private:
+        HRESULT LoadVariant(const ShaderVariant& variant, LPCWSTR filename, IDxcBlob** includeSource)
+        {
+            const std::optional<std::string> text = ShaderVariants::Source(variant);
+
+            if(!text)
+            {
+                return E_FAIL;
+            }
+
+            IDxcBlobEncoding* blob = nullptr;
+            const HRESULT result = m_utils->CreateBlob(text->data(), static_cast<UINT32>(text->size()), DXC_CP_UTF8, &blob);
+
+            if(FAILED(result))
+            {
+                return result;
+            }
+
+            RecordDependency(m_dependencies, filename, blob);
+            *includeSource = blob;
+            return S_OK;
+        }
+
         IDxcIncludeHandler* m_inner = nullptr;
         std::vector<ShaderSourceDependency>& m_dependencies;
+        IDxcUtils* m_utils = nullptr;
+        const wchar_t* m_shaderRoot = nullptr;
     };
+
+    // The variant at path under shaderRoot (ShaderVariants), with the text it compiles as; nothing for a file.
+    struct VariantSource
+    {
+        const ShaderVariant* variant = nullptr;
+        std::string text;
+    };
+
+    // A variant whose base chain is broken reports it here; the compilation then fails as for a missing file.
+    std::optional<VariantSource> FindVariantSource(const wchar_t* path, const wchar_t* shaderRoot)
+    {
+        if(!path || !shaderRoot || *shaderRoot == L'\0')
+        {
+            return VariantSource{};
+        }
+
+        const ShaderVariant* variant = ShaderVariants::FindUnder(shaderRoot, path);
+
+        if(!variant)
+        {
+            return VariantSource{};
+        }
+
+        std::optional<std::string> text = ShaderVariants::Source(*variant);
+
+        if(!text)
+        {
+            return std::nullopt;
+        }
+
+        return VariantSource{variant, std::move(*text)};
+    }
+
+    // The main source: a variant's generated text, or the file DXC reads as before.
+    HRESULT LoadMainSource(IDxcUtils* utils, const wchar_t* path, const VariantSource& variant, IDxcBlobEncoding** source)
+    {
+        if(variant.variant)
+        {
+            return utils->CreateBlob(variant.text.data(), static_cast<UINT32>(variant.text.size()), DXC_CP_UTF8, source);
+        }
+
+        return utils->LoadFile(path, nullptr, source);
+    }
 }
 
 namespace
@@ -270,10 +352,20 @@ bool ShaderCompiler::Compile(
         arguments.push_back(L"-enable-16bit-types");
     }
 
+    // Shader variants (ShaderVariants) compile from their generated text instead of a file.
+    const std::optional<VariantSource> variant = FindVariantSource(description.path, description.shaderRoot);
+
+    if(!variant)
+    {
+        Log::Error("Shader variant has an invalid base chain: " + std::filesystem::path(description.path).string());
+        return false;
+    }
+
     // M0c.5 Stage 5.4: the persistent cache, for the same target and arguments. A miss compiles exactly as before.
     const auto cacheStart = std::chrono::steady_clock::now();
     const std::string target = std::filesystem::path(profile).string() + ":" + std::filesystem::path(description.entryPoint).string();
-    const DxilLibraryCache cache(description.usePersistentCache, description.path, description.shaderRoot, target, arguments);
+    const DxilLibraryCache cache(description.usePersistentCache, description.path, description.shaderRoot, target, arguments,
+        variant->text);
     std::vector<ShaderSourceDependency> dependencies;
     output.cacheHit = cache.Load(m_utils, output.bytecode, dependencies);
     output.cacheReadMilliseconds = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - cacheStart).count();
@@ -288,7 +380,7 @@ bool ShaderCompiler::Compile(
 
     IDxcBlobEncoding* source = nullptr;
 
-    HRESULT result = m_utils->LoadFile(description.path, nullptr, &source);
+    HRESULT result = LoadMainSource(m_utils, description.path, *variant, &source);
 
     if (FAILED(result))
     {
@@ -314,9 +406,15 @@ bool ShaderCompiler::Compile(
     }
 
     IDxcResult* compileResult = nullptr;
-    // Every file read and include lookup, for the cache entry (as CompileLibrary records them).
-    RecordDependency(dependencies, description.path, source);
-    RecordingIncludeHandler recordingIncludeHandler(includeHandler, dependencies);
+
+    // Every file read and include lookup, for the cache entry (as CompileLibrary records them). A variant's text is in
+    // the cache identity instead: it has no file to check.
+    if(!variant->variant)
+    {
+        RecordDependency(dependencies, description.path, source);
+    }
+
+    RecordingIncludeHandler recordingIncludeHandler(includeHandler, dependencies, m_utils, description.shaderRoot);
 
     const auto compileStart = std::chrono::steady_clock::now();
     output.dxcInvoked = true;
@@ -463,7 +561,17 @@ bool ShaderCompiler::CompileLibrary(
         arguments.push_back(description.includeDirectory);
     }
 
-    DxilLibraryCache cache(description, arguments);
+    // Shader variants (ShaderVariants) compile from their generated text instead of a file.
+    const std::optional<VariantSource> variant = FindVariantSource(description.path, description.includeDirectory);
+
+    if(!variant)
+    {
+        ReportLibraryError(diagnostics, "Shader variant has an invalid base chain: " +
+            std::filesystem::path(description.path).string());
+        return false;
+    }
+
+    DxilLibraryCache cache(description, arguments, variant->text);
     const bool cacheHit = cache.Load(m_utils, output);
     output.cacheReadMilliseconds = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - cacheStart).count();
@@ -478,7 +586,7 @@ bool ShaderCompiler::CompileLibrary(
 
     IDxcBlobEncoding* source = nullptr;
 
-    HRESULT result = m_utils->LoadFile(description.path, nullptr, &source);
+    HRESULT result = LoadMainSource(m_utils, description.path, *variant, &source);
 
     if (FAILED(result))
     {
@@ -505,8 +613,15 @@ bool ShaderCompiler::CompileLibrary(
     }
 
     IDxcResult* compileResult = nullptr;
-    RecordDependency(output.dependencies, description.path, source);
-    RecordingIncludeHandler recordingIncludeHandler(includeHandler, output.dependencies);
+
+    // A variant's text is in the cache identity instead of the dependencies: it has no file to check.
+    if(!variant->variant)
+    {
+        RecordDependency(output.dependencies, description.path, source);
+    }
+
+    RecordingIncludeHandler recordingIncludeHandler(includeHandler, output.dependencies, m_utils,
+        description.includeDirectory);
 
     const auto compileStart = std::chrono::steady_clock::now();
     output.dxcInvoked = true;

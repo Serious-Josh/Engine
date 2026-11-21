@@ -770,6 +770,9 @@ bool Renderer::AbortTrackedRecording()
     if(discarded)
     {
         m_referenceRayCounts.Abort(materialSlot, uploadGeneration);
+        // M4.1: a light-sampling copy recorded in the discarded list never ran.
+        m_lightSamplingBuffer.DiscardRecording(m_commandContext.GetLastSubmissionFenceValue());
+        m_frameLightSamplingConstants = 0;
         m_textureThumbnails.Discarded(m_commandRecordingGeneration);
         m_rayTracingScene.DiscardMembershipRecording(m_commandRecordingGeneration);
 
@@ -849,6 +852,8 @@ bool Renderer::ExecuteTrackedRecording(unsigned int frameSlot)
         }
 
         m_textureThumbnails.Submitted(m_commandRecordingGeneration, m_commandContext.GetLastSubmissionFenceValue());
+        // M4.2C: the light-sampling staging copies of this recording are released once its fence completes.
+        m_lightSamplingBuffer.Submitted(m_commandRecordingGeneration, m_commandContext.GetLastSubmissionFenceValue());
 
         if(!m_materialPreviewRenderer.ConfirmSubmission(m_commandRecordingGeneration,
             m_commandContext.GetLastSubmissionFenceValue()))
@@ -2985,6 +2990,18 @@ bool Renderer::Initialize(
             selectors += " ENGINE_NRD_RELAX_DIFFUSE_PREPASS";
         }
 
+        // M4.2C firefly investigation: ENGINE_NRD_RELAX_ANTI_FIREFLY exactly "1" enables RELAX's anti-firefly filter
+        // (SDK default off for RELAX; REBLUR's, which the hybrid's specular uses, is on). Unset or anything else:
+        // production.
+        char relaxAntiFirefly[2]{};
+
+        if (GetEnvironmentVariableA("ENGINE_NRD_RELAX_ANTI_FIREFLY", relaxAntiFirefly, sizeof(relaxAntiFirefly)) == 1 &&
+            relaxAntiFirefly[0] == '1')
+        {
+            relaxSettings.enableAntiFirefly = true;
+            selectors += " ENGINE_NRD_RELAX_ANTI_FIREFLY";
+        }
+
         if (!selectors.empty())
         {
             m_nrdRelaxSettingsOverride = relaxSettings;
@@ -3259,6 +3276,74 @@ bool Renderer::Initialize(
     {
         Log::Error("Failed to init the scene light buffer.");
         return false;
+    }
+
+    // M4.1: the shared light-sampling structures are built only on request until a consumer exists (M4.2).
+    if(const char* lightSampling = std::getenv("ENGINE_LIGHT_SAMPLING"); lightSampling && std::strcmp(lightSampling, "1") == 0)
+    {
+        m_lightSamplingEnabled = true;
+        Log::Info("Shared light sampling enabled (ENGINE_LIGHT_SAMPLING=1).");
+    }
+
+    // M4.2A experimental sampled indirect NEE: the M42A libraries need the shared light sampling. Environment overrides:
+    // ENGINE_SAMPLED_NEE_ESTIMATOR=exhaustive, ENGINE_SAMPLED_NEE_K=<2..8>, ENGINE_SAMPLED_NEE_THRESHOLD=<lights>,
+    // ENGINE_SAMPLED_NEE_CLAMP=nee-off|off (test only).
+    m_sampledNeeReport.librariesRequested = PathTraceReferencePass::SampledIndirectNeeLibrariesRequested();
+
+    if(m_sampledNeeReport.librariesRequested)
+    {
+        m_lightSamplingEnabled = true;
+        const auto environment = [](const char* name)
+        {
+            const char* value = std::getenv(name);
+            return std::string(value ? value : "");
+        };
+        const std::string estimator = environment("ENGINE_SAMPLED_NEE_ESTIMATOR");
+        const std::string candidates = environment("ENGINE_SAMPLED_NEE_K");
+        const std::string threshold = environment("ENGINE_SAMPLED_NEE_THRESHOLD");
+        const std::string clamp = environment("ENGINE_SAMPLED_NEE_CLAMP");
+        m_sampledNeeSettings.sampled = estimator != "exhaustive";
+
+        if(!candidates.empty())
+        {
+            m_sampledNeeSettings.candidates = std::clamp(static_cast<std::uint32_t>(std::stoul(candidates)), 2u, 8u);
+        }
+
+        if(!threshold.empty())
+        {
+            m_sampledNeeSettings.threshold = static_cast<std::uint32_t>(std::stoul(threshold));
+        }
+
+        m_sampledNeeSettings.noNeeClamp = clamp == "nee-off";
+        m_sampledNeeSettings.noClamp = clamp == "off";
+        const std::string clampPolicy = environment("ENGINE_SAMPLED_NEE_CLAMP_POLICY");
+        const std::string temper = environment("ENGINE_SAMPLED_NEE_TEMPER");
+
+        if(!clampPolicy.empty())
+        {
+            m_sampledNeeSettings.clampPolicy = clampPolicy == "joint" ? 0u : (clampPolicy == "separate" ? 2u : 1u);
+        }
+
+        m_sampledNeeSettings.targetTemper = temper == "0.75" ? 1u : (temper == "0.5" ? 2u : 0u);
+        // M4.2C: SHARC training's estimator and clamp policy.
+        const std::string training = environment("ENGINE_SAMPLED_NEE_TRAINING");
+        const std::string trainingClampPolicy = environment("ENGINE_SAMPLED_NEE_TRAINING_CLAMP_POLICY");
+        m_sampledNeeSettings.trainingSampled = training != "exhaustive";
+
+        if(!trainingClampPolicy.empty())
+        {
+            m_sampledNeeSettings.trainingClampPolicy = trainingClampPolicy == "joint" ? 0u :
+                (trainingClampPolicy == "separate" ? 2u : 1u);
+        }
+
+        Log::Info("M4.2C experimental sampled NEE permutations (ENGINE_SAMPLED_NEE=1): estimator " +
+            std::string(m_sampledNeeSettings.sampled ? "sampled" : "exhaustive") + ", K " +
+            std::to_string(m_sampledNeeSettings.candidates) + ", above " + std::to_string(m_sampledNeeSettings.threshold) +
+            " lights, clamp " + (m_sampledNeeSettings.noClamp ? "off (test)" : m_sampledNeeSettings.noNeeClamp ?
+            "off for NEE (test)" : "on") + ", sampled-NEE clamp policy " + std::to_string(m_sampledNeeSettings.clampPolicy) +
+            ", target temper " + std::to_string(m_sampledNeeSettings.targetTemper) + ", SHARC training " +
+            (m_sampledNeeSettings.trainingSampled ? "sampled" : "exhaustive") + " (clamp policy " +
+            std::to_string(m_sampledNeeSettings.trainingClampPolicy) + ").");
     }
 
     // M0c.5 Stage 5.1: the Project Browser needs only the core above, ImGui and the swap chain; its project's selection
@@ -10709,8 +10794,7 @@ bool Renderer::RecordAmbientOcclusionPasses(
     return true;
 }
 
-bool Renderer::IsPathTraceWorkloadSafe(std::uint32_t tableLights, const PathTraceReferenceSettings& settings,
-    std::string& failure)
+Renderer::PathTraceWorkloadModel Renderer::EstimatePathTraceWorkload(const PathTraceWorkloadInputs& inputs) noexcept
 {
     // Exhaustive next-event estimation shades every table Light at every path vertex (M4 replaces it with sampling). Cost
     // model, calibrated on M3's production timings (1080p, one sample per frame, depth 3: 92.5 ms of indirect light at 1,024
@@ -10718,14 +10802,87 @@ bool Renderer::IsPathTraceWorkloadSafe(std::uint32_t tableLights, const PathTrac
     // counted, which overestimates the ReSTIR DI mode (its first vertex samples). This is an estimate, not a guarantee: it
     // ignores geometry, ranges and occlusion, and other workloads can still be slow.
     constexpr double MillisecondsPerLightMegapixelVertex = 0.022;
-    // Far below the 2 s Windows GPU timeout; guarded above the first, released below the second (no flicker at the edge).
-    constexpr double GuardMilliseconds = 250.0;
-    constexpr double ReleaseMilliseconds = 200.0;
+    const double megapixels = static_cast<double>(inputs.width) * static_cast<double>(inputs.height) / 1.0e6;
+    const double vertices = static_cast<double>((std::max)(inputs.maxPathDepth, 1u));
+    const double samples = static_cast<double>((std::max)(inputs.samplesPerFrame, 1u));
+    PathTraceWorkloadModel model;
+    model.exhaustiveImageMilliseconds = static_cast<double>(inputs.tableLights) * megapixels * samples * vertices *
+        MillisecondsPerLightMegapixelVertex;
+    model.imageMilliseconds = model.exhaustiveImageMilliseconds;
+    model.totalMilliseconds = model.exhaustiveImageMilliseconds;
 
-    const double megapixels = static_cast<double>(m_sceneWidth) * static_cast<double>(m_sceneHeight) / 1.0e6;
-    const double vertices = static_cast<double>((std::max)(settings.maxPathDepth, 1u));
-    const double estimate = static_cast<double>(tableLights) * megapixels * static_cast<double>(settings.samplesPerFrame) *
-        vertices * MillisecondsPerLightMegapixelVertex;
+    // M4.2C estimator-aware model, only with the experimental sampled-NEE permutations (production keeps the model above).
+    // Each part is priced by what it will run: sampled NEE costs a bounded amount per vertex (K candidates, the directional
+    // lights and one shadow ray), exhaustive NEE grows with every light, and so does SHARC training's exhaustive selection
+    // (which the production model never counted). Sampling is trusted only for a table whose structures are already
+    // built and published: the first frame of a new table runs exhaustively, so it is priced so. Calibration (RTX 4080,
+    // Debug; Documentation/Rendering/Scalable_Light_Sampling_M4_2C_Unified_Completion.md): the worst measured sampled cost
+    // per megapixel and vertex with 50% margin, and the exhaustive training cost per light at 8,192 lights (where the light
+    // loop dominates), which overestimates smaller scenes.
+    if(!inputs.estimatorAware)
+    {
+        return model;
+    }
+
+    constexpr double SampledMillisecondsPerMegapixelVertex = 2.0;
+    constexpr double SampledMillisecondsPerCandidateMegapixelVertex = 0.5;
+    constexpr double TrainingMillisecondsPerLightMegapixelVertex = 0.052;
+    constexpr double SampledTrainingMillisecondsPerMegapixelVertex = 40.0;
+    const bool aboveThreshold = inputs.tableLights > inputs.threshold;
+    model.estimatorAware = true;
+    model.sampledImage = inputs.sampledRequested && aboveThreshold && inputs.structuresReady && inputs.rayQueryActive;
+    model.sampledTraining = inputs.trainingSampledRequested && aboveThreshold && inputs.structuresReady;
+    const double candidates = static_cast<double>(std::clamp(inputs.candidates, 2u, 8u)) +
+        (inputs.structuresReady ? static_cast<double>(inputs.directionalLights) : 0.0);
+
+    if(model.sampledImage)
+    {
+        model.imageMilliseconds = megapixels * samples * vertices *
+            (SampledMillisecondsPerMegapixelVertex + SampledMillisecondsPerCandidateMegapixelVertex * candidates);
+    }
+
+    if(inputs.sharcEnabled)
+    {
+        const double tile = static_cast<double>((std::max)(inputs.trainingTile, 1u));
+        const double trainingMegapixels = megapixels / (tile * tile);
+        const double trainingVertices = static_cast<double>((std::max)(inputs.maxPathDepth, inputs.trainingMaxDepth));
+        model.exhaustiveTrainingMilliseconds = static_cast<double>(inputs.tableLights) * trainingMegapixels *
+            trainingVertices * TrainingMillisecondsPerLightMegapixelVertex;
+        model.trainingMilliseconds = model.sampledTraining ?
+            trainingMegapixels * trainingVertices * SampledTrainingMillisecondsPerMegapixelVertex :
+            model.exhaustiveTrainingMilliseconds;
+    }
+
+    model.totalMilliseconds = model.imageMilliseconds + model.trainingMilliseconds;
+    return model;
+}
+
+bool Renderer::IsPathTraceWorkloadSafe(std::uint32_t tableLights, const PathTraceReferenceSettings& settings,
+    const SharcSettings& sharc, std::string& failure)
+{
+    constexpr double GuardMilliseconds = PathTraceWorkloadGuardMilliseconds;
+    constexpr double ReleaseMilliseconds = PathTraceWorkloadReleaseMilliseconds;
+    PathTraceWorkloadInputs inputs;
+    inputs.tableLights = tableLights;
+    inputs.width = m_sceneWidth;
+    inputs.height = m_sceneHeight;
+    inputs.samplesPerFrame = settings.samplesPerFrame;
+    inputs.maxPathDepth = settings.maxPathDepth;
+    inputs.estimatorAware = m_sampledNeeReport.librariesRequested;
+    inputs.sampledRequested = m_sampledNeeSettings.sampled;
+    inputs.trainingSampledRequested = m_sampledNeeSettings.trainingSampled;
+    inputs.threshold = m_sampledNeeSettings.threshold;
+    inputs.candidates = m_sampledNeeSettings.candidates;
+    inputs.structuresReady = m_lightSamplingCache && m_lightSamplingCacheRevision != 0 &&
+        m_lightSamplingCacheTable.lightCount == tableLights && m_lightSamplingReport.available;
+    inputs.directionalLights = inputs.structuresReady ? m_lightSamplingCache->statistics.directionalLights : 0u;
+    inputs.rayQueryActive = m_pathTraceReferencePass.IsSecondaryShadowRayQueryActive();
+    inputs.sharcEnabled = sharc.enabled;
+    inputs.trainingTile = sharc.trainingTile;
+    inputs.trainingMaxDepth = m_sharcNvidiaTrainingMaxDepthForTesting;
+    m_pathTraceWorkloadModel = EstimatePathTraceWorkload(inputs);
+    m_pathTraceWorkloadModel.recordingGeneration = m_commandRecordingGeneration;
+    const double estimate = m_pathTraceWorkloadModel.totalMilliseconds;
     const bool guarded = m_pathTraceWorkloadGuarded ? estimate >= ReleaseMilliseconds : estimate > GuardMilliseconds;
 
     if(guarded != m_pathTraceWorkloadGuarded)
@@ -10832,12 +10989,258 @@ std::shared_ptr<const FrameLighting> Renderer::AcquireFrameLighting(const Direct
     return built;
 }
 
+D3D12_GPU_VIRTUAL_ADDRESS Renderer::RecordLightSampling(ID3D12GraphicsCommandList* commandList,
+    const FrameLighting& lighting, std::uint64_t lightingRevision)
+{
+    m_lightSamplingReport.enabled = m_lightSamplingEnabled;
+    m_lightSamplingReport.available = false;
+
+    if(!m_lightSamplingEnabled)
+    {
+        return 0;
+    }
+
+    // M4.1.1: a completed background rebuild was built from an older table; brought up to date incrementally, it replaces
+    // the structures (binning the lights incremental updates moved to the wide pool). If it cannot be, it is discarded.
+    // M4.2C: it is also discarded when, brought up to date, it holds at least as many wide-pool (Dynamic) lights as the
+    // current structures: lights that kept moving since its snapshot are demoted again by that update, so adopting it would
+    // re-bin nothing and only replace the data (a whole-buffer upload). Either structure samples the current table exactly,
+    // so discarding never affects correctness, only which lights are binned.
+    if(m_lightSamplingRebuild.valid() &&
+        m_lightSamplingRebuild.wait_for(std::chrono::seconds(0)) == std::future_status::ready)
+    {
+        std::shared_ptr<LightSamplingData> rebuilt = m_lightSamplingRebuild.get();
+        std::vector<LightSamplingDirtyRange> unusedRanges;
+        const bool sameLights = m_lightSamplingRebuildTable.lights.size() == m_lightSamplingCacheTable.lights.size() &&
+            std::memcmp(m_lightSamplingRebuildTable.lights.data(), m_lightSamplingCacheTable.lights.data(),
+            m_lightSamplingCacheTable.lights.size() * sizeof(GPULight)) == 0;
+        const bool current = rebuilt && m_lightSamplingCache && m_lightSamplingCacheRevision != 0 &&
+            (sameLights || UpdateLightSamplingIncremental(m_lightSamplingCacheTable, m_lightSamplingRebuildTable,
+            m_lightSamplingSettings, *rebuilt, unusedRanges));
+        const bool bins = current && rebuilt->statistics.dynamicLights < m_lightSamplingCache->statistics.dynamicLights;
+
+        if(bins)
+        {
+            m_lightSamplingCache = std::move(rebuilt);
+            ++m_lightSamplingPublication;
+            ++m_lightSamplingReport.rebuildsAdopted;
+        }
+        else
+        {
+            ++m_lightSamplingReport.rebuildsDiscarded;
+        }
+
+        m_lightSamplingRebuildTable = {};
+    }
+
+    // Built for a new revision: in place when the change allows it (M4.1.1), else in full. Revision 0 (content not
+    // identified) always builds in full and is never kept.
+    std::shared_ptr<LightSamplingData> data = m_lightSamplingCache;
+    std::vector<LightSamplingDirtyRange> dirty;
+    bool incremental = false;
+    const std::uint64_t basePublication = m_lightSamplingPublication;
+    const bool revisionChanged = lightingRevision == 0 || !data || m_lightSamplingCacheRevision != lightingRevision;
+
+    if(lightingRevision == 0 || !data || m_lightSamplingCacheRevision != lightingRevision)
+    {
+        incremental = lightingRevision != 0 && data && m_lightSamplingCacheRevision != 0 &&
+            UpdateLightSamplingIncremental(lighting.table, m_lightSamplingCacheTable, m_lightSamplingSettings, *data, dirty);
+
+        if(incremental)
+        {
+            ++m_lightSamplingReport.incrementalUpdates;
+            m_lightSamplingReport.lastIncrementalMilliseconds = data->statistics.incrementalMilliseconds;
+            m_lightSamplingReport.maximumIncrementalMilliseconds = (std::max)(
+                m_lightSamplingReport.maximumIncrementalMilliseconds, data->statistics.incrementalMilliseconds);
+        }
+        else
+        {
+            auto built = std::make_shared<LightSamplingData>();
+            std::string error;
+            const auto started = std::chrono::steady_clock::now();
+            const bool success = BuildLightSamplingData(lighting.table, m_lightSamplingSettings, *built, &error);
+            const double milliseconds = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                started).count();
+            ++m_lightSamplingReport.builds;
+            m_lightSamplingReport.lastBuildMilliseconds = milliseconds;
+            m_lightSamplingReport.maximumBuildMilliseconds = (std::max)(m_lightSamplingReport.maximumBuildMilliseconds,
+                milliseconds);
+
+            if(!success)
+            {
+                ++m_lightSamplingReport.failures;
+                Log::Error("Light sampling could not be built for this frame: " + error);
+                m_lightSamplingCache.reset();
+                m_lightSamplingCacheRevision = 0;
+                return 0;
+            }
+
+            static const bool logBuilds = std::getenv("ENGINE_LIGHT_SAMPLING_STATS") != nullptr;
+
+            if(logBuilds || built->statistics.budgetForcedDemotion)
+            {
+                Log::Info("Light sampling build (revision " + std::to_string(lightingRevision) + ", " +
+                    std::to_string(milliseconds) + " ms): " + DescribeLightSamplingStatistics(*built));
+            }
+
+            data = built;
+        }
+
+        ++m_lightSamplingPublication;
+        m_lightSamplingCache = lightingRevision != 0 ? data : nullptr;
+        m_lightSamplingCacheRevision = lightingRevision;
+        m_lightSamplingCacheTable = lightingRevision != 0 ? lighting.table : SceneLightTable{};
+    }
+
+    // M4.1.1: while lights sit in the wide pool after incremental updates, rebuild in full on a worker (one at a time).
+    // M4.2C: only when it can bin something: the lighting did not change this frame (every Dynamic light has settled), or
+    // some Dynamic light did not move in the latest update. Lights that move every frame start no rebuild, so continuous
+    // movement does not rebuild (and replace the data) every frame; a light that stops is binned within a few frames.
+    const bool lightingChanged = revisionChanged;
+    const bool settledLights = data && (!lightingChanged || data->statistics.settledDynamicLights != 0);
+
+    if(lightingRevision != 0 && data && data->statistics.dynamicLights != 0 && settledLights &&
+        !m_lightSamplingRebuild.valid())
+    {
+        ++m_lightSamplingReport.rebuildsLaunched;
+        m_lightSamplingRebuildTable = m_lightSamplingCacheTable;
+        m_lightSamplingRebuild = std::async(std::launch::async,
+            [table = m_lightSamplingRebuildTable, settings = m_lightSamplingSettings]() -> std::shared_ptr<LightSamplingData>
+            {
+                auto rebuilt = std::make_shared<LightSamplingData>();
+                return BuildLightSamplingData(table, settings, *rebuilt) ? rebuilt : nullptr;
+            });
+    }
+
+    LightSamplingConstants constants{};
+    std::string failure;
+    const unsigned int frameIndex = m_swapChain.GetCurrentBackBufferIndex();
+    // An incremental update publishes its changed words on top of the previous publication, if the buffer holds it.
+    const LightSamplingPatch patch{basePublication, &dirty};
+    m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::LightSamplingUpload);
+    const LightSamplingBuffer::RecordResult result = m_lightSamplingBuffer.Record(m_graphicsDevice.GetDevice(),
+        m_resourceDescriptorHeap, commandList, *data, m_lightSamplingPublication, m_commandRecordingGeneration,
+        m_commandContext.GetLastSubmissionFenceValue(), m_commandContext.GetCompletedFenceValue(), constants, &failure,
+        incremental ? &patch : nullptr);
+    m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::LightSamplingUpload);
+
+    if(result == LightSamplingBuffer::RecordResult::Failed)
+    {
+        ++m_lightSamplingReport.failures;
+
+        if(!m_lightSamplingFailing)
+        {
+            Log::Error("Light sampling could not be published (" + failure + "); its consumers fall back until it can be.");
+            m_lightSamplingFailing = true;
+        }
+    }
+    else if(m_lightSamplingFailing)
+    {
+        Log::Info("Light sampling published again.");
+        m_lightSamplingFailing = false;
+    }
+
+    m_lightSamplingReport.available = constants.valid != 0;
+    m_frameLightSamplingBufferIndex = constants.bufferIndex;
+    m_lightSamplingReport.revision = lightingRevision;
+    m_lightSamplingReport.copies = m_lightSamplingBuffer.GetCopyCount();
+    m_lightSamplingReport.lastCopyBytes = m_lightSamplingBuffer.GetLastCopyBytes();
+    m_lightSamplingReport.capacityBytes = m_lightSamplingBuffer.GetCapacityBytes();
+    m_lightSamplingReport.statistics = data->statistics;
+    m_lightSamplingReport.patches = m_lightSamplingBuffer.GetPatchCount();
+    m_lightSamplingReport.fullCopies = m_lightSamplingBuffer.GetCopyCount() - m_lightSamplingBuffer.GetPatchCount();
+    m_lightSamplingReport.uploadBytes = m_lightSamplingBuffer.GetTotalCopyBytes();
+    m_lightSamplingReport.lastCopyWasPatch = m_lightSamplingBuffer.GetLastCopyWasPatch();
+    return m_uploadBuffer.Allocate(&constants, sizeof(constants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
+}
+
+Renderer::LightSamplingReport Renderer::GetLightSamplingReport() const
+{
+    return m_lightSamplingReport;
+}
+
+void Renderer::ApplySampledIndirectNee(const FrameLighting& lighting, SceneLightConstants& constants)
+{
+    m_sampledNeeReport.sampledLastFrame = false;
+    m_sampledNeeReport.sampledTrainingLastFrame = false;
+
+    if(!m_sampledNeeReport.librariesRequested)
+    {
+        m_pathTraceReferencePass.SelectSampledNee(false, false);
+        return;
+    }
+
+    // Sampled only for this frame's own published structures (same table and revision) and above the threshold.
+    const bool aboveThreshold = lighting.table.lightCount > m_sampledNeeSettings.threshold;
+    const bool requested = m_sampledNeeSettings.sampled && aboveThreshold && constants.lightCount != 0;
+    const bool available = m_lightSamplingReport.available && m_lightSamplingReport.statistics.tableLights == constants.lightCount;
+    const bool sampled = requested && available;
+
+    if(requested && !available)
+    {
+        ++m_sampledNeeReport.fallbackFrames;
+
+        if(!m_sampledNeeFallbackLogged)
+        {
+            Log::Warning("M4.2A sampled indirect NEE: no light-sampling structures for this light table; using the "
+                "exhaustive estimator until they are published.");
+            m_sampledNeeFallbackLogged = true;
+        }
+    }
+
+    // M4.2C: SHARC training samples under the same conditions (threshold, published structures) when selected.
+    const bool sampledTraining = m_sampledNeeSettings.trainingSampled && aboveThreshold && constants.lightCount != 0 &&
+        available;
+    std::uint32_t mode = std::clamp(m_sampledNeeSettings.candidates, 2u, 8u) << 1;
+    mode |= sampled ? 1u : 0u;
+    mode |= m_sampledNeeSettings.noNeeClamp ? 1u << 5 : 0u;
+    mode |= m_sampledNeeSettings.noClamp ? 1u << 6 : 0u;
+    mode |= (std::min)(m_sampledNeeSettings.clampPolicy, 2u) << 7;
+    mode |= (std::min)(m_sampledNeeSettings.targetTemper, 2u) << 9;
+    mode |= sampledTraining ? 1u << 11 : 0u;
+    mode |= (std::min)(m_sampledNeeSettings.trainingClampPolicy, 2u) << 12;
+    constants.padding[0] = sampled || sampledTraining ? m_frameLightSamplingBufferIndex : 0u;
+    constants.padding[1] = mode;
+
+    // M4.2C: the image paths' sampled permutations are RayQuery twins (with TraceRay visibility selected, the original
+    // exhaustive libraries run); SHARC training's are TraceRay update libraries. Selected with the mode bits.
+    m_sampledNeeReport.sampledLastFrame = sampled && m_pathTraceReferencePass.IsSecondaryShadowRayQueryActive();
+    m_sampledNeeReport.sampledTrainingLastFrame = sampledTraining;
+
+    // M4.2C fail-safe: the workload guard ran before this frame's structures were published and trusted sampling (they were
+    // published for this table last frame). If publication failed after all, this frame would run exhaustively; when that
+    // exceeds the guard, the frame renders without its table lights (as a frame whose light table cannot be published
+    // does) instead of risking the GPU timeout. The next frame's guard sees the structures unavailable and decides again.
+    const PathTraceWorkloadModel& model = m_pathTraceWorkloadModel;
+    const bool estimatedThisRecording = model.recordingGeneration != 0 &&
+        model.recordingGeneration == m_commandRecordingGeneration;
+    const bool imageFellBack = model.sampledImage && !m_sampledNeeReport.sampledLastFrame;
+    const bool trainingFellBack = model.sampledTraining && !sampledTraining;
+    const double fallbackMilliseconds =
+        (imageFellBack ? model.exhaustiveImageMilliseconds : model.imageMilliseconds) +
+        (trainingFellBack ? model.exhaustiveTrainingMilliseconds : model.trainingMilliseconds);
+
+    if(estimatedThisRecording && (imageFellBack || trainingFellBack) &&
+        fallbackMilliseconds > PathTraceWorkloadGuardMilliseconds)
+    {
+        constants.lightCount = 0;
+        ++m_sampledNeeReport.unsafeFallbackFrames;
+        Log::Error("Sampled light structures were unavailable for a frame whose exhaustive light work (" +
+            std::to_string(static_cast<int>(fallbackMilliseconds)) + " ms estimated) exceeds the workload guard; that frame "
+            "renders without its table lights.");
+    }
+    m_pathTraceReferencePass.SelectSampledNee(m_sampledNeeReport.sampledLastFrame, sampledTraining);
+    ++(m_sampledNeeReport.sampledLastFrame ? m_sampledNeeReport.sampledFrames : m_sampledNeeReport.exhaustiveFrames);
+    m_sampledNeeReport.sampledTrainingFrames += sampledTraining ? 1u : 0u;
+}
+
 bool Renderer::RecordRenderFrame(
     const Scene& scene,
     const RendererOptions& options)
 {
     // Read by RecordPathTraceReference, which runs inside this frame's recording.
     m_requestedPathTraceVisualization = options.pathTraceDenoiserVisualization;
+    m_frameLightSamplingConstants = 0;
 
     FinalSceneImage finalImage{};
 
@@ -11464,7 +11867,8 @@ bool Renderer::RecordRenderFrame(
         // frame: the recording renders Legacy and reports why, the request is kept, and it resumes once the workload is safe.
         std::string workloadFailure;
         const bool workloadSafe = mode == RendererLightingMode::Legacy ||
-            IsPathTraceWorkloadSafe(activeLighting->table.lightCount, options.pathTraceReference, workloadFailure);
+            IsPathTraceWorkloadSafe(activeLighting->table.lightCount, options.pathTraceReference, options.sharc,
+            workloadFailure);
 
         if(runnable && !workloadSafe)
         {
@@ -12088,6 +12492,11 @@ bool Renderer::RecordRenderFrame(
 
     // Every later consumer reads the frame's final lighting.
     const FrameLighting& frameLighting = *activeLighting;
+
+    // M4.1: the shared light-sampling structures of exactly this table (same revision), published after it. Disabled by
+    // default; M4.2A's experimental libraries read them through the scene light constants.
+    m_frameLightSamplingConstants = RecordLightSampling(commandList, frameLighting, lightingRevision);
+    ApplySampledIndirectNee(frameLighting, sceneLightConstants);
 
     const D3D12_GPU_VIRTUAL_ADDRESS sceneLightConstantsAddress = m_uploadBuffer.Allocate(
         &sceneLightConstants, sizeof(SceneLightConstants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
@@ -13821,6 +14230,20 @@ void Renderer::Shutdown()
     m_rtxdiResources.Shutdown();
     m_rtxdiResourcesFailed = false;
     m_sceneLightBuffer.Shutdown();
+    m_lightSamplingBuffer.Shutdown();
+
+    // A background rebuild only reads its own table copy; waiting for it keeps the release from outliving it.
+    if(m_lightSamplingRebuild.valid())
+    {
+        m_lightSamplingRebuild.wait();
+        m_lightSamplingRebuild = {};
+    }
+
+    m_lightSamplingCache.reset();
+    m_lightSamplingCacheRevision = 0;
+    m_lightSamplingCacheTable = {};
+    m_lightSamplingRebuildTable = {};
+    m_frameLightSamplingConstants = 0;
     m_rasterPrimaryStatus = {};
     m_materialTables.Shutdown();
     m_materialTableUnavailableReason.clear();

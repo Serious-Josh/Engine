@@ -579,6 +579,34 @@ namespace
         return std::nullopt;
     }
 
+    // M4.2C: the library of a pipeline's separate sampled-NEE permutation, when ENGINE_SAMPLED_NEE=1 requests them: for a
+    // library with a RayQuery twin, the M42A wrapper of that twin (a sampled RayQuery twin, used where the twin would be);
+    // for an NVIDIA SHARC update library, the M42A wrapper of the update library itself. Exhaustive frames keep the GI.6
+    // twins and SharcNv update libraries, so they never carry the sampled estimator's code.
+    std::optional<std::filesystem::path> SampledVariantLibraryPath(const std::filesystem::path& path)
+    {
+        if(!PathTraceReferencePass::SampledIndirectNeeLibrariesRequested() || path.empty())
+        {
+            return std::nullopt;
+        }
+
+        if(RayQueryTwinLibraryPath(path))
+        {
+            return std::filesystem::path("M42A") / path;
+        }
+
+        const std::string name = path.filename().string();
+        const bool sharcTree = std::any_of(path.begin(), path.end(),
+            [](const std::filesystem::path& component) { return component == "SharcNv"; });
+
+        if(sharcTree && name.starts_with("PathTraceSharcNv") && name.find("Training") != std::string::npos)
+        {
+            return std::filesystem::path("M42A") / path;
+        }
+
+        return std::nullopt;
+    }
+
     // ER.1 Phase 4: everything a DXR pipeline is built from besides the library bytes (its path, exports, root signature
     // and pipeline configuration), so two descriptions share a prepared pipeline only when they would build the same one.
     std::string PipelineDescriptionKey(const RayTracingPipelineDescription& description)
@@ -1077,6 +1105,14 @@ std::vector<PathTraceLibraryRequirement> PathTraceReferencePass::GetRequiredLibr
         {
             libraries.push_back(PathTraceLibraryRequirement{*twinPath, true});
         }
+
+        // M4.2C: the separate sampled-NEE permutation (optional: without it the exhaustive one runs).
+        const std::optional<std::filesystem::path> sampledPath = SampledVariantLibraryPath(path);
+
+        if(sampledPath && !listed(*sampledPath))
+        {
+            libraries.push_back(PathTraceLibraryRequirement{*sampledPath, true});
+        }
     };
 
     // Initialize creates the Camera pipeline for every primary; Raster Primary, the ReSTIR DI indirect pass and the
@@ -1171,6 +1207,14 @@ std::vector<PathTraceReferencePass::PipelineRequirement> PathTraceReferencePass:
             RayTracingPipelineDescription twin = description;
             twin.shaderPath = *twinPath;
             pipelines.push_back(PipelineRequirement{std::move(twin), true});
+        }
+
+        // M4.2C: the separate sampled-NEE permutation, optional like the twin.
+        if(const std::optional<std::filesystem::path> sampledPath = SampledVariantLibraryPath(description.shaderPath))
+        {
+            RayTracingPipelineDescription sampled = description;
+            sampled.shaderPath = *sampledPath;
+            pipelines.push_back(PipelineRequirement{std::move(sampled), true});
         }
     };
     if(needs.psrChain != 0)
@@ -2583,7 +2627,17 @@ void PathTraceReferencePass::ExecuteRadianceCacheTraining(
     }
 
     // The Raster Primary root signature: the image tables are bound but the training ray generation writes none of them.
-    RayTracingPipeline& trainingPipeline = psr && m_psrSharcEnergyForTesting ? m_psrSharcEnergyPipelines[0] : training.pipeline;
+    RayTracingPipeline* trainingSelection = psr && m_psrSharcEnergyForTesting ? &m_psrSharcEnergyPipelines[0] :
+        &training.pipeline;
+
+    // M4.2C: on a sampled-training frame, the update library's sampled permutation where one was built.
+    if(m_sampledTraining && trainingSelection == &training.pipeline && training.pipeline.GetSampledVariant())
+    {
+        trainingSelection = training.pipeline.GetSampledVariant();
+        m_sampledTrainingRecorded = true;
+    }
+
+    RayTracingPipeline& trainingPipeline = *trainingSelection;
     if(!trainingPipeline.IsInitialized()) return;
     trainingPipeline.Bind(commandList);
     commandList->SetComputeRootShaderResourceView(0, rayTracingScene.GetTopLevel().GetGPUAddress());
@@ -3743,6 +3797,8 @@ bool PathTraceReferencePass::InitializeVisibilityPipelines(
 
     if(!twinPath)
     {
+        // M4.2C: an NVIDIA SHARC update library's sampled permutation is a TraceRay pipeline of its own.
+        AttachSampledVariant(device, shaders, original, description);
         return true;
     }
 
@@ -3791,8 +3847,54 @@ bool PathTraceReferencePass::InitializeVisibilityPipelines(
             Log::Warning(message);
         }
     }
+    else
+    {
+        // M4.2C: the sampled permutation of a RayQuery twin is itself a RayQuery twin; it is used where the twin is.
+        AttachSampledVariant(device, shaders, *alternate, description);
+    }
 
     return true;
+}
+
+void PathTraceReferencePass::AttachSampledVariant(GraphicsDevice& device, ShaderLibrary& shaders, RayTracingPipeline& owner,
+    const RayTracingPipelineDescription& description)
+{
+    const std::optional<std::filesystem::path> sampledPath = SampledVariantLibraryPath(description.shaderPath);
+
+    if(!sampledPath)
+    {
+        owner.SetSampledVariant(nullptr);
+        return;
+    }
+
+    RayTracingPipelineDescription sampledDescription = description;
+    sampledDescription.shaderPath = *sampledPath;
+    auto variant = std::make_unique<RayTracingPipeline>();
+    const ShaderLibraryCompileResult* library = AcquireLibrary(shaders, sampledDescription.shaderPath);
+
+    // Without it, sampled frames run the exhaustive permutation (the estimators agree in expectation), and say so once.
+    if(!library || !CreatePipeline(device, *variant, library->bytecode, sampledDescription))
+    {
+        variant->Shutdown();
+        Log::Warning("M4.2C sampled-NEE permutation unavailable; the exhaustive one runs instead: " +
+            sampledDescription.shaderPath.generic_string());
+        owner.SetSampledVariant(nullptr);
+        return;
+    }
+
+    ++m_pipelineStatistics.sampledVariants;
+    owner.SetSampledVariant(std::move(variant));
+}
+
+bool PathTraceReferencePass::SampledIndirectNeeLibrariesRequested()
+{
+    static const bool requested = []
+    {
+        const char* value = std::getenv("ENGINE_SAMPLED_NEE");
+        return value && std::string(value) == "1";
+    }();
+
+    return requested;
 }
 
 bool PathTraceReferencePass::IsSecondaryShadowRayQueryReady() const
@@ -3812,11 +3914,26 @@ void PathTraceReferencePass::SelectSecondaryShadowRayQuery(bool enabled)
 
 RayTracingPipeline& PathTraceReferencePass::VisibilityPipeline(RayTracingPipeline& original)
 {
+    // M4.2C: on a sampled frame, the twin's sampled permutation where one was built.
+    const auto select = [&](RayTracingPipeline& twin) -> RayTracingPipeline&
+    {
+        if(m_sampledImage)
+        {
+            if(RayTracingPipeline* sampled = twin.GetSampledVariant())
+            {
+                m_sampledImageRecorded = true;
+                return *sampled;
+            }
+        }
+
+        return twin;
+    };
+
     const auto found = m_rayQueryPipelines.find(&original);
 
     if(m_secondaryShadowRayQuery && found != m_rayQueryPipelines.end() && found->second)
     {
-        return *found->second;
+        return select(*found->second);
     }
 
     // PSR.1a-P: the PSR twins, outside the shared readiness set.
@@ -3824,7 +3941,7 @@ RayTracingPipeline& PathTraceReferencePass::VisibilityPipeline(RayTracingPipelin
 
     if(m_secondaryShadowRayQuery && replacement != m_psrRayQueryPipelines.end() && replacement->second)
     {
-        return *replacement->second;
+        return select(*replacement->second);
     }
 
     return original;

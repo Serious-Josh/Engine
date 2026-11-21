@@ -371,14 +371,14 @@ namespace
 }
 
 DxilLibraryCache::DxilLibraryCache(const ShaderLibraryCompileDescription& description,
-    std::span<const wchar_t* const> arguments) noexcept :
+    std::span<const wchar_t* const> arguments, std::string_view variantSource) noexcept :
     DxilLibraryCache(description.usePersistentCache, description.path, description.includeDirectory,
-        ShaderCompiler::GetLibraryTarget(description.profile), arguments)
+        ShaderCompiler::GetLibraryTarget(description.profile), arguments, variantSource)
 {
 }
 
 DxilLibraryCache::DxilLibraryCache(bool enabled, const wchar_t* source, const wchar_t* shaderRoot, std::string_view target,
-    std::span<const wchar_t* const> arguments) noexcept
+    std::span<const wchar_t* const> arguments, std::string_view variantSource) noexcept
 {
     if(!enabled || !source || !shaderRoot || *shaderRoot == L'\0')
     {
@@ -406,6 +406,11 @@ DxilLibraryCache::DxilLibraryCache(bool enabled, const wchar_t* source, const wc
         for(const auto argument : arguments)
         {
             PutText(m_identity, ArgumentIdentity(m_root, argument));
+        }
+
+        if(!variantSource.empty())
+        {
+            PutText(m_identity, variantSource);
         }
 
         if(m_identity.size() > MaximumIdentityBytes)

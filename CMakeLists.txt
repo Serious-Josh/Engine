@@ -360,6 +360,7 @@ add_library(EngineCore OBJECT
     src/Renderer/Shader/DxilLibraryCache.cpp
     src/Renderer/Shader/ShaderLibrary.cpp
     src/Renderer/Shader/ShaderLibraryCompileWorker.cpp
+    src/Renderer/Shader/ShaderVariants.cpp
     src/Renderer/RayTracing/RayTracingPipelineWorker.cpp
     src/Renderer/LightingModeTransition.cpp
     external/imgui/imgui.cpp
@@ -474,6 +475,8 @@ add_library(EngineCore OBJECT
     src/Renderer/EditorColliderOverlay.cpp
     src/Renderer/FrameLighting.cpp
     src/Renderer/SceneLightBuffer.cpp
+    src/Renderer/LightSampling/LightSamplingData.cpp
+    src/Renderer/LightSampling/LightSamplingBuffer.cpp
     src/Renderer/Passes/EditorColliderPass.cpp
     src/Renderer/Passes/EditorVoxelPass.cpp
     src/Renderer/Passes/EditorAirPass.cpp
@@ -875,6 +878,13 @@ if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Renderer
     target_compile_definitions(RtxdiFoundationTests PRIVATE ENGINE_SOURCE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}"
         ENGINE_RTXDI_INCLUDE="${ENGINE_RTXDI_ROOT}/Include")
 endif()
+# Local-only M4.1 shared light-sampling verification (headless D3D12), same guard as RtxdiFoundationTests.
+if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Renderer/tests/LightSamplingTests.cpp")
+    add_executable(LightSamplingTests src/Renderer/tests/LightSamplingTests.cpp)
+    target_link_libraries(LightSamplingTests PRIVATE EngineCore)
+    engine_use_agility(LightSamplingTests)
+    target_compile_definitions(LightSamplingTests PRIVATE ENGINE_SOURCE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}")
+endif()
 # Local-only NVIDIA SHARC Checkpoint A radiance precision probe (headless D3D12), same guard; needs the SHARC checkout.
 if(ENGINE_BUILD_DIAGNOSTICS AND ENGINE_SHARC_AVAILABLE AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Renderer/tests/SharcPrecisionTests.cpp")
     add_executable(SharcPrecisionTests src/Renderer/tests/SharcPrecisionTests.cpp)
@@ -888,6 +898,18 @@ if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Renderer
     add_executable(PathTraceLibraryReuseTests src/Renderer/tests/PathTraceLibraryReuseTests.cpp)
     target_link_libraries(PathTraceLibraryReuseTests PRIVATE EngineCore)
     engine_use_agility(PathTraceLibraryReuseTests)
+endif()
+# Local-only workload guard estimate regression (pure arithmetic), same guard.
+if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Renderer/tests/WorkloadGuardTests.cpp")
+    add_executable(WorkloadGuardTests src/Renderer/tests/WorkloadGuardTests.cpp)
+    target_link_libraries(WorkloadGuardTests PRIVATE EngineCore)
+    engine_use_agility(WorkloadGuardTests)
+endif()
+# Local-only shader-variant table regression (headless DXC), same guard.
+if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Renderer/tests/ShaderVariantTests.cpp")
+    add_executable(ShaderVariantTests src/Renderer/tests/ShaderVariantTests.cpp)
+    target_link_libraries(ShaderVariantTests PRIVATE EngineCore)
+    engine_use_agility(ShaderVariantTests)
 endif()
 # Local-only async DXR preparation Gate 1 compile-worker regression (headless DXC), same guard.
 if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Renderer/tests/ShaderLibraryCompileWorkerTests.cpp")

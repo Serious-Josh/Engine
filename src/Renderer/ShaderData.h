@@ -341,6 +341,42 @@ struct SceneLightConstants
     std::uint32_t padding[2];
 };
 
+// M4.1: the shared light-sampling structures of one published light table (LightSamplingData.h), identical in layout to
+// LightSamplingConstants in assets/Shaders/LightSampling.hlsli. Offsets are byte offsets into the raw buffer at
+// bufferIndex: per-cell {list offset, nominal count, padded count} (12 bytes), the cell lists (light indices, 4 bytes),
+// the wide and global alias tables (16-byte entries) and the directional light indices. valid = 0 means no structures
+// are published for this frame: consumers must not read the buffer.
+struct LightSamplingConstants
+{
+    float gridOrigin[3];
+    float cellSize;
+
+    std::uint32_t gridDimensions[3];
+    std::uint32_t cellCount;
+
+    float inverseCellSize;
+    float paddedMargin;
+    std::uint32_t bufferIndex;
+    std::uint32_t valid;
+
+    std::uint32_t cellsOffset;
+    std::uint32_t listsOffset;
+    std::uint32_t wideOffset;
+    std::uint32_t wideCount;
+
+    std::uint32_t globalOffset;
+    std::uint32_t globalCount;
+    std::uint32_t directionalOffset;
+    std::uint32_t directionalCount;
+
+    std::uint32_t tableLightCount;
+    std::uint32_t revisionLow;
+    std::uint32_t revisionHigh;
+    std::uint32_t padding;
+};
+
+static_assert(sizeof(LightSamplingConstants) == 96, "LightSamplingConstants must match LightSampling.hlsli.");
+
 struct GPUMaterial
 {
     unsigned int model;

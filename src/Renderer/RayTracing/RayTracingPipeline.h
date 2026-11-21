@@ -6,6 +6,7 @@
 #include <d3d12.h>
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -58,9 +59,28 @@ class RayTracingPipeline
         return m_identity;
     }
 
-    // ER.1 Phase 4: exchanges every owned object with another pipeline (state object, root signature, tables). The
-    // render thread adopts a pipeline the background worker built this way; neither is in use by the GPU.
+    // ER.1 Phase 4: exchanges every owned object with another pipeline (state object, root signature, tables, and the
+    // M4.2C sampled variant). The render thread adopts a pipeline the background worker built this way; neither is in
+    // use by the GPU.
     void Swap(RayTracingPipeline& other) noexcept;
+
+    // M4.2C: the separate permutation of this pipeline with the sampled light estimator (Engine's M42A libraries), used
+    // instead of it on frames that select sampled NEE. Owned by this pipeline, so it is shut down, retained and adopted
+    // with it; null when none was built.
+    RayTracingPipeline* GetSampledVariant() const
+    {
+        return m_sampledVariant && m_sampledVariant->IsInitialized() ? m_sampledVariant.get() : nullptr;
+    }
+
+    void SetSampledVariant(std::unique_ptr<RayTracingPipeline> variant)
+    {
+        if(m_sampledVariant)
+        {
+            m_sampledVariant->Shutdown();
+        }
+
+        m_sampledVariant = std::move(variant);
+    }
 
     void Bind(ID3D12GraphicsCommandList4* commandList) const;
     // Diagnostics: the stack size the driver reports for one export of the state object (0 when unavailable).
@@ -87,4 +107,5 @@ class RayTracingPipeline
     ShaderTable m_missShaderTable;
     ShaderTable m_hitGroupShaderTable;
     std::string m_identity;
+    std::unique_ptr<RayTracingPipeline> m_sampledVariant;
 };

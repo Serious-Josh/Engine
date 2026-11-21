@@ -258,6 +258,8 @@ class PathTraceReferencePass
         std::uint64_t submitted = 0;
         std::uint64_t failures = 0;
         std::uint64_t discarded = 0;
+        // M4.2C: sampled-NEE permutations built.
+        std::uint64_t sampledVariants = 0;
         std::size_t prepared = 0;
     };
 
@@ -667,11 +669,45 @@ class PathTraceReferencePass
         return m_secondaryShadowRayQuery;
     }
 
+    // M4.2A/M4.2C: ENGINE_SAMPLED_NEE=1 (read once, unpackaged runs) also builds each RayQuery twin's and each NVIDIA
+    // SHARC update library's separate sampled-NEE permutation (the M42A libraries). Off by default; production libraries
+    // never contain the sampled estimator.
+    static bool SampledIndirectNeeLibrariesRequested();
+
+    // M4.2C: whether this frame's image paths and SHARC training use their sampled permutations (set by the renderer
+    // together with the SceneLightConstants mode bits, before recording). A pipeline without one runs the exhaustive
+    // permutation, which falls back to the same estimate in expectation.
+    void SelectSampledNee(bool image, bool training)
+    {
+        m_sampledImage = image;
+        m_sampledTraining = training;
+        m_sampledImageRecorded = false;
+        m_sampledTrainingRecorded = false;
+    }
+
+    // M4.2C: whether the last recorded image path / SHARC training dispatch used a sampled permutation.
+    bool RecordedSampledImage() const
+    {
+        return m_sampledImageRecorded;
+    }
+
+    bool RecordedSampledTraining() const
+    {
+        return m_sampledTrainingRecorded;
+    }
+
     private:
     bool InitializeVisibilityPipelines(GraphicsDevice& device, ShaderLibrary& shaders,
         RayTracingPipeline& original, const std::vector<char>& bytecode,
         const RayTracingPipelineDescription& description);
+    // M4.2C: builds owner's sampled permutation from description's M42A library, or clears it.
+    void AttachSampledVariant(GraphicsDevice& device, ShaderLibrary& shaders, RayTracingPipeline& owner,
+        const RayTracingPipelineDescription& description);
     RayTracingPipeline& VisibilityPipeline(RayTracingPipeline& original);
+    bool m_sampledImage = false;
+    bool m_sampledTraining = false;
+    bool m_sampledImageRecorded = false;
+    bool m_sampledTrainingRecorded = false;
     // Prepares the compute extraction direct pass (m_extractSplitDirectPipeline).
     bool PreparePrimaryDiExtractionPipeline(GraphicsDevice& device, ShaderLibrary& shaders);
 

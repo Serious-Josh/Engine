@@ -154,6 +154,69 @@ cbuffer SceneLightConstants : register(b1)
     uint2 sceneLightPadding;
 };
 
+#ifdef PATH_TRACE_SAMPLED_NEE
+// M4.2A experimental sampled indirect NEE: compiled only into the M42A twin libraries (ENGINE_SAMPLED_NEE=1); production
+// libraries never read sceneLightPadding. sceneLightPadding.x is the shared light-sampling buffer's descriptor index
+// (LightSamplingBuffer, published with this frame's light table) and sceneLightPadding.y the mode:
+//   bit 0      sampled finite-light NEE at vertices >= 1 (otherwise the exhaustive loop below);
+//   bits 1-4   K, the RIS candidate count (2..8);
+//   bit 5      test only: no indirect luminance clamp on next-event estimates;
+//   bit 6      test only: no indirect luminance clamp anywhere (next-event estimates, misses, cache queries);
+//   bits 7-8   M4.2B clamp policy for the sampled finite-light estimate: 0 joint (clamped with the vertex's sun, HDRI and
+//              directional estimates, as exhaustive NEE), 1 exempt (only the rest is clamped), 2 separate (each part clamped
+//              on its own);
+//   bits 9-10  M4.2B RIS target tempering: p_hat^gamma with gamma 1, 0.75 or 0.5 (any target positive wherever the
+//              contribution is keeps the estimator unbiased; a flatter one lets occluded bright lights dominate less).
+#include "LightSampling.hlsli"
+
+static const uint PATH_TRACE_SAMPLED_NEE_ENABLED = 1u;
+static const uint PATH_TRACE_SAMPLED_NEE_CANDIDATE_SHIFT = 1u;
+static const uint PATH_TRACE_SAMPLED_NEE_CANDIDATE_MASK = 0xFu;
+static const uint PATH_TRACE_SAMPLED_NEE_NO_NEE_CLAMP = 1u << 5;
+static const uint PATH_TRACE_SAMPLED_NEE_NO_CLAMP = 1u << 6;
+static const uint PATH_TRACE_SAMPLED_NEE_CLAMP_POLICY_SHIFT = 7u;
+static const uint PATH_TRACE_SAMPLED_NEE_CLAMP_JOINT = 0u;
+static const uint PATH_TRACE_SAMPLED_NEE_CLAMP_EXEMPT = 1u;
+static const uint PATH_TRACE_SAMPLED_NEE_CLAMP_SEPARATE = 2u;
+static const uint PATH_TRACE_SAMPLED_NEE_TEMPER_SHIFT = 9u;
+// M4.2C: SHARC training's own switch and clamp policy, so its estimator is chosen apart from the image's.
+static const uint PATH_TRACE_SAMPLED_NEE_TRAINING = 1u << 11;
+static const uint PATH_TRACE_SAMPLED_NEE_TRAINING_CLAMP_POLICY_SHIFT = 12u;
+
+// The mode bit that enables the sampled estimator in this library: SHARC training's, or the image's.
+#ifdef PATH_TRACE_SHARC_NV_TRAINING
+#define PATH_TRACE_SAMPLED_NEE_ACTIVE PATH_TRACE_SAMPLED_NEE_TRAINING
+#else
+#define PATH_TRACE_SAMPLED_NEE_ACTIVE PATH_TRACE_SAMPLED_NEE_ENABLED
+#endif
+
+// M4.2B: the sampled finite-light estimate of the current vertex when the clamp policy keeps it apart from the rest of
+// the vertex's next-event estimate (exempt or separate), consumed and reset by the vertex loop's clamp.
+static float3 g_pathTraceSampledFinite = float3(0.0f, 0.0f, 0.0f);
+static float3 g_pathTraceSampledFiniteDiffuse = float3(0.0f, 0.0f, 0.0f);
+
+uint PathTraceSampledNeeClampPolicy()
+{
+#ifdef PATH_TRACE_SHARC_NV_TRAINING
+    return (sceneLightPadding.y >> PATH_TRACE_SAMPLED_NEE_TRAINING_CLAMP_POLICY_SHIFT) & 3u;
+#else
+    return (sceneLightPadding.y >> PATH_TRACE_SAMPLED_NEE_CLAMP_POLICY_SHIFT) & 3u;
+#endif
+}
+
+// The RIS target from the unshadowed contribution's luminance, tempered per the mode.
+float PathTraceSampledNeeTarget(float luminance)
+{
+    const uint temper = (sceneLightPadding.y >> PATH_TRACE_SAMPLED_NEE_TEMPER_SHIFT) & 3u;
+    return temper == 0u ? luminance : (temper == 1u ? pow(luminance, 0.75f) : sqrt(luminance));
+}
+
+// The path vertex whose next-event estimate is being computed (set by the vertex loop; 0 elsewhere, so primary and
+// non-loop callers keep the exhaustive estimator).
+static uint g_pathTraceNeeVertex = 0u;
+
+#endif
+
 #ifdef PATH_TRACE_RESTIR_DI_LIBRARY
 // RTXPT.3, read only by the ReSTIR DI direct pass (PathTraceReSTIRDIDirectCS), whose pipeline alone binds b2.
 // Identical layout to PathTraceRtxdiConstants (RtxdiShaderData.h).
@@ -255,6 +318,17 @@ float PathTraceNextFloat(inout PathTraceRandom random)
     word = (word >> 22u) ^ word;
     return float(word >> 8u) * (1.0f / 16777216.0f);
 }
+
+#ifdef PATH_TRACE_SAMPLED_NEE
+// The same PCG step as PathTraceNextFloat, returning the whole uniformly distributed 32-bit output word (the light-sampling
+// draws' probabilities assume uniform uint32 inputs).
+uint PathTraceNextUint(inout PathTraceRandom random)
+{
+    random.state = random.state * 747796405u + 2891336453u;
+    uint word = ((random.state >> ((random.state >> 28u) + 4u)) ^ random.state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+#endif
 
 float2 PathTraceNextFloat2(inout PathTraceRandom random)
 {
@@ -531,6 +605,13 @@ bool PathTraceIndirectClampActive(uint vertex)
 // the contribution's diffuse-extraction share and its radiance-cache harvest, so the signals stay consistent.
 float PathTraceIndirectClampScale(float3 contribution)
 {
+#ifdef PATH_TRACE_SAMPLED_NEE
+    if((sceneLightPadding.y & PATH_TRACE_SAMPLED_NEE_NO_CLAMP) != 0u)
+    {
+        return 1.0f;
+    }
+#endif
+
     float luminance = PathTraceLuminance(contribution);
     return luminance > PATH_TRACE_INDIRECT_LUMINANCE_CLAMP ? PATH_TRACE_INDIRECT_LUMINANCE_CLAMP / luminance : 1.0f;
 }
@@ -612,6 +693,139 @@ float3 PathTraceShadeLightSample(PathTraceSurface surface, float3 position, Path
     return PathTraceShadeLightSampleLobes(surface, position, lightSample, rayCount, diffuseRadiance);
 }
 
+#ifdef PATH_TRACE_SAMPLED_NEE
+// PathTraceShadeLightSampleLobes before its visibility test: the light sample's unshadowed contribution f * cos * Li (and
+// its diffuse-lobe part), zero exactly where the shade helper returns zero without tracing. Table lights are delta lights
+// (pdf 0), so the shade helper's MIS weight is one for them.
+float3 PathTraceUnshadowedLightSampleLobes(PathTraceSurface surface, PathTraceLightSample lightSample,
+    out float3 diffuseValue)
+{
+    diffuseValue = float3(0.0f, 0.0f, 0.0f);
+
+    if(!lightSample.valid || !PathTraceDirectionAboveSurface(surface, lightSample.direction))
+    {
+        return float3(0.0f, 0.0f, 0.0f);
+    }
+
+    float3 diffuseLobe;
+    const float cosine = dot(surface.normal, lightSample.direction);
+    const float3 value = PathTraceEvaluateBSDFLobes(surface, lightSample.direction, diffuseLobe) * cosine *
+        lightSample.radiance;
+
+    if(!any(value > 0.0f))
+    {
+        return float3(0.0f, 0.0f, 0.0f);
+    }
+
+    diffuseValue = diffuseLobe * cosine * lightSample.radiance;
+    return value;
+}
+
+// M4.2A sampled table-light NEE at an indirect vertex: the directional table lights enumerated as in the exhaustive loop,
+// then fixed-allocation RIS over the disjoint finite-light pools (LightSamplingAllocate) with one visibility test for the
+// selected light. Candidate weights w = p_hat / (K_t p_t), p_hat the luminance of the unshadowed contribution; the
+// selected light Y contributes f(Y) V(Y) * sum(w) / p_hat(Y). Adds to radiance and diffuseRadiance and returns true; returns
+// false (nothing added, no random numbers drawn) when the exhaustive loop must run instead: mode off, a primary vertex,
+// or no light-sampling structures published for exactly this light table.
+bool PathTraceSampledTableLighting(PathTraceSurface surface, float3 position, inout PathTraceRandom random,
+    inout uint rayCount, inout float3 radiance, inout float3 diffuseRadiance)
+{
+    const uint mode = sceneLightPadding.y;
+
+    if((mode & PATH_TRACE_SAMPLED_NEE_ACTIVE) == 0u || g_pathTraceNeeVertex == 0u)
+    {
+        return false;
+    }
+
+    const LightSamplingConstants sampling = LightSamplingLoadConstants(sceneLightPadding.x);
+
+    if(sampling.valid == 0u || sampling.tableLightCount != sceneLightCount)
+    {
+        return false;
+    }
+
+    float3 sampleDiffuse;
+
+    for(uint directional = 0u; directional < sampling.directionalCount; ++directional)
+    {
+        const uint lightIndex = LightSamplingDirectionalLight(sampling, directional);
+        PathTraceLightSample lightSample = PathTraceSampleTableLight(SceneLightLoad(sceneLightBufferIndex, lightIndex),
+            position);
+        radiance += PathTraceShadeLightSampleLobes(surface, position, lightSample, rayCount, sampleDiffuse);
+        diffuseRadiance += sampleDiffuse;
+    }
+
+    const LightSamplingPools pools = LightSamplingPoolsAt(sampling, position);
+    const uint candidates = clamp((mode >> PATH_TRACE_SAMPLED_NEE_CANDIDATE_SHIFT) & PATH_TRACE_SAMPLED_NEE_CANDIDATE_MASK,
+        2u, 8u);
+    const LightSamplingAllocation allocation = LightSamplingAllocate(sampling, pools, candidates);
+    const uint candidateCount = LightSamplingCandidateCount(allocation);
+    float weightSum = 0.0f;
+    float selectedTarget = 0.0f;
+    float3 selectedValue = float3(0.0f, 0.0f, 0.0f);
+    float3 selectedDiffuse = float3(0.0f, 0.0f, 0.0f);
+    PathTraceLightSample selected = (PathTraceLightSample)0;
+
+    [loop]
+    for(uint candidateIndex = 0u; candidateIndex < candidateCount; ++candidateIndex)
+    {
+        const uint random0 = PathTraceNextUint(random);
+        const uint random1 = PathTraceNextUint(random);
+        const float selectionRandom = PathTraceNextFloat(random);
+        const LightSamplingCandidate candidate = LightSamplingDrawCandidate(sampling, pools, allocation, candidateIndex,
+            random0, random1);
+
+        if(!candidate.valid)
+        {
+            continue;
+        }
+
+        const PathTraceLightSample lightSample = PathTraceSampleTableLight(SceneLightLoad(sceneLightBufferIndex,
+            candidate.light), position);
+        float3 diffuseValue;
+        const float3 value = PathTraceUnshadowedLightSampleLobes(surface, lightSample, diffuseValue);
+        const float target = PathTraceSampledNeeTarget(PathTraceLuminance(value));
+        const float weight = target / candidate.density;
+
+        // A zero, negative or non-finite weight is a candidate that contributes nothing; it still counts in K.
+        if(!(weight > 0.0f) || !isfinite(weight) || !all(isfinite(value)))
+        {
+            continue;
+        }
+
+        weightSum += weight;
+
+        if(selectionRandom * weightSum < weight)
+        {
+            selected = lightSample;
+            selectedTarget = target;
+            selectedValue = value;
+            selectedDiffuse = diffuseValue;
+        }
+    }
+
+    if(weightSum > 0.0f && isfinite(weightSum) &&
+        PathTraceVisible(position, surface.geometricNormal, selected.direction, selected.distance, rayCount))
+    {
+        const float scale = weightSum / selectedTarget;
+
+        // M4.2B: with the exempt or separate clamp policy the vertex loop clamps this estimate apart from the rest.
+        if(PathTraceSampledNeeClampPolicy() == PATH_TRACE_SAMPLED_NEE_CLAMP_JOINT)
+        {
+            radiance += selectedValue * scale;
+            diffuseRadiance += selectedDiffuse * scale;
+        }
+        else
+        {
+            g_pathTraceSampledFinite = selectedValue * scale;
+            g_pathTraceSampledFiniteDiffuse = selectedDiffuse * scale;
+        }
+    }
+
+    return true;
+}
+#endif
+
 float3 PathTraceDirectLightingLobes(PathTraceSurface surface, float3 position, inout PathTraceRandom random,
     inout uint rayCount, out float3 diffuseRadiance)
 {
@@ -633,6 +847,14 @@ float3 PathTraceDirectLightingLobes(PathTraceSurface surface, float3 position, i
     }
 
     uint lightCount = sceneLightCount;
+
+#ifdef PATH_TRACE_SAMPLED_NEE
+    // M4.2A: the sampled estimator replaces the table loop below at indirect vertices when it is active.
+    if(PathTraceSampledTableLighting(surface, position, random, rayCount, radiance, diffuseRadiance))
+    {
+        lightCount = 0u;
+    }
+#endif
 
     for(uint lightIndex = 0u; lightIndex < lightCount; ++lightIndex)
     {
@@ -683,6 +905,16 @@ float3 PathTraceSharcNvTrainingDirectLighting(PathTraceSurface surface, float3 p
     float totalWeight = 0.0f;
     float selectedWeight = 0.0f;
     PathTraceLightSample selected = (PathTraceLightSample)0;
+
+#ifdef PATH_TRACE_SAMPLED_NEE
+    // M4.2C: the M4.2B sampled estimator (directionals enumerated, RIS over the disjoint finite-light pools, one shadow
+    // ray) replaces the one-light reservoir over every table light when the training mode bit selects it. Both are
+    // unbiased estimates of the vertex's table-light NEE; the clamp policy of the vertex loop applies to either.
+    if(PathTraceSampledTableLighting(surface, position, random, rayCount, radiance, diffuseRadiance))
+    {
+        lightCount = 0u;
+    }
+#endif
 
     for(uint lightIndex = 0u; lightIndex < lightCount; ++lightIndex)
     {
@@ -2236,17 +2468,56 @@ float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex 
             else
             {
 #ifdef PATH_TRACE_SHARC_NV_TRAINING
+#ifdef PATH_TRACE_SAMPLED_NEE
+                g_pathTraceNeeVertex = vertex;
+#endif
                 direct = PathTraceSharcNvTrainingDirectLighting(surface, position, random, rayCount, directDiffuse);
+#ifdef PATH_TRACE_SAMPLED_NEE
+                g_pathTraceNeeVertex = 0u;
+#endif
 #else
+#ifdef PATH_TRACE_SAMPLED_NEE
+                g_pathTraceNeeVertex = vertex;
+#endif
                 direct = PathTraceDirectLightingLobes(surface, position, random, rayCount, directDiffuse);
+#ifdef PATH_TRACE_SAMPLED_NEE
+                g_pathTraceNeeVertex = 0u;
+#endif
 #endif
             }
 
             // Indirect next-event estimation (vertex >= 1): one contribution, scaled with its diffuse share.
+#ifdef PATH_TRACE_SAMPLED_NEE
+            const bool clampNee = PathTraceIndirectClampActive(vertex) &&
+                (sceneLightPadding.y & PATH_TRACE_SAMPLED_NEE_NO_NEE_CLAMP) == 0u;
+
+            if(clampNee)
+#else
             if(PathTraceIndirectClampActive(vertex))
+#endif
             {
                 direct *= PathTraceIndirectClampScale(throughput * direct);
             }
+
+#ifdef PATH_TRACE_SAMPLED_NEE
+            // M4.2B: the sampled finite-light estimate kept apart by the exempt or separate clamp policy.
+            {
+                float3 sampledFinite = g_pathTraceSampledFinite;
+                float3 sampledFiniteDiffuse = g_pathTraceSampledFiniteDiffuse;
+                g_pathTraceSampledFinite = float3(0.0f, 0.0f, 0.0f);
+                g_pathTraceSampledFiniteDiffuse = float3(0.0f, 0.0f, 0.0f);
+
+                if(clampNee && PathTraceSampledNeeClampPolicy() == PATH_TRACE_SAMPLED_NEE_CLAMP_SEPARATE)
+                {
+                    const float sampledScale = PathTraceIndirectClampScale(throughput * sampledFinite);
+                    sampledFinite *= sampledScale;
+                    sampledFiniteDiffuse *= sampledScale;
+                }
+
+                direct += sampledFinite;
+                directDiffuse += sampledFiniteDiffuse;
+            }
+#endif
 
             radiance += throughput * direct;
 #ifdef PATH_TRACE_PSR_SHARC_ENERGY_DIAGNOSTIC

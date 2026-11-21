@@ -80,6 +80,8 @@ class GpuTimestampProfiler
         PathTracePsrRaster,
         // PSR.2: the in-place replacement pass, after the geometry pass.
         PsrInPlaceReplace,
+        // M4.1: the shared light-sampling structures' copy (lighting-revision changes only).
+        LightSamplingUpload,
         Count
     };
 

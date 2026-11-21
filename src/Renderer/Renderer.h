@@ -23,6 +23,8 @@
 #include "CommandContext.h"
 #include "ReferenceRayCounts.h"
 #include "SceneLightBuffer.h"
+#include "LightSampling/LightSamplingBuffer.h"
+#include "LightSampling/LightSamplingData.h"
 #include "DescriptorHeap.h"
 #include "GraphicsDevice.h"
 #include "GpuTimestampProfiler.h"
@@ -99,6 +101,7 @@
 #include <d3d12.h>
 #include <filesystem>
 #include <functional>
+#include <future>
 #include <span>
 #include <string>
 #include <vector>
@@ -958,6 +961,109 @@ class Renderer
 
     const RendererStatistics& GetStatistics() const;
 
+    // M4.1 shared light sampling: the latest build, its CPU cost and the publication counters. Diagnostics only.
+    struct LightSamplingReport
+    {
+        bool enabled = false;
+        bool available = false;
+        std::uint64_t revision = 0;
+        std::uint64_t builds = 0;
+        std::uint64_t copies = 0;
+        std::uint64_t failures = 0;
+        double lastBuildMilliseconds = 0.0;
+        double maximumBuildMilliseconds = 0.0;
+        std::uint64_t lastCopyBytes = 0;
+        std::uint64_t capacityBytes = 0;
+        LightSamplingStatistics statistics;
+        // M4.1.1: incremental updates, patch copies, background rebuilds adopted and discarded, and the last
+        // incremental update's CPU time.
+        std::uint64_t incrementalUpdates = 0;
+        std::uint64_t patches = 0;
+        std::uint64_t rebuildsAdopted = 0;
+        std::uint64_t rebuildsDiscarded = 0;
+        // M4.2C: background rebuilds started, whole copies, bytes uploaded in total, and the largest incremental update's
+        // CPU time.
+        std::uint64_t rebuildsLaunched = 0;
+        std::uint64_t fullCopies = 0;
+        std::uint64_t uploadBytes = 0;
+        double maximumIncrementalMilliseconds = 0.0;
+        double lastIncrementalMilliseconds = 0.0;
+        bool lastCopyWasPatch = false;
+    };
+
+    LightSamplingReport GetLightSamplingReport() const;
+
+    // M4.1: whether the shared light-sampling structures are built and published (ENGINE_LIGHT_SAMPLING=1, or tests). Off by
+    // default until a consumer exists (M4.2).
+    void SetLightSamplingEnabled(bool enabled) noexcept
+    {
+        m_lightSamplingEnabled = enabled;
+    }
+
+    // M4.2A experimental sampled indirect NEE: only with ENGINE_SAMPLED_NEE=1 (the M42A twin libraries), whose estimator
+    // these settings select per frame. Sampled NEE runs only when the shared light sampling is published for the frame's
+    // table and the table has more than `threshold` lights; otherwise the experimental libraries' exhaustive loop runs.
+    struct SampledIndirectNeeSettings
+    {
+        // false: the exhaustive loop (the in-library reference for A/B comparisons).
+        bool sampled = true;
+        // K, the RIS candidates per indirect vertex (2..8). M4.2C: 8, the best quality per millisecond in M4.2B.
+        std::uint32_t candidates = 8;
+        // Sampled only above this many table lights (M4.0: 64). Tests may lower it.
+        std::uint32_t threshold = 64;
+        // Test only: no indirect luminance clamp on next-event estimates, or on any indirect contribution.
+        bool noNeeClamp = false;
+        bool noClamp = false;
+        // M4.2B: how the indirect luminance clamp treats the sampled finite-light estimate: 0 joint (with the vertex's sun,
+        // HDRI and directional estimates, as exhaustive NEE), 1 exempt, 2 separate (clamped on its own).
+        std::uint32_t clampPolicy = 1;
+        // M4.2B: RIS target p_hat^gamma: 0 gamma 1, 1 gamma 0.75, 2 gamma 0.5.
+        std::uint32_t targetTemper = 0;
+        // M4.2C: NVIDIA SHARC training's next-event estimation: false keeps its one-light reservoir over every table light
+        // (the comparison path). Above the same threshold, with the same K and tempering.
+        bool trainingSampled = true;
+        // M4.2C: the clamp policy of SHARC training's sampled estimate (as clampPolicy).
+        std::uint32_t trainingClampPolicy = 1;
+    };
+
+    struct SampledIndirectNeeReport
+    {
+        bool librariesRequested = false;
+        // The frame selected the sampled estimator for its image paths (mode set, RayQuery twins active).
+        bool sampledLastFrame = false;
+        // M4.2C: the frame selected sampled SHARC training.
+        bool sampledTrainingLastFrame = false;
+        std::uint64_t sampledTrainingFrames = 0;
+        // M4.2C: frames rendered without table lights because sampling the guard had trusted was unavailable and the
+        // exhaustive fallback would have exceeded the workload guard.
+        std::uint64_t unsafeFallbackFrames = 0;
+        std::uint64_t sampledFrames = 0;
+        std::uint64_t exhaustiveFrames = 0;
+        // Frames that requested sampling above the threshold but had no light-sampling structures for their table.
+        std::uint64_t fallbackFrames = 0;
+    };
+
+    void SetSampledIndirectNeeSettings(const SampledIndirectNeeSettings& settings) noexcept
+    {
+        m_sampledNeeSettings = settings;
+    }
+
+    const SampledIndirectNeeSettings& GetSampledIndirectNeeSettings() const noexcept
+    {
+        return m_sampledNeeSettings;
+    }
+
+    const SampledIndirectNeeReport& GetSampledIndirectNeeReport() const noexcept
+    {
+        return m_sampledNeeReport;
+    }
+
+    // The frame's LightSamplingConstants address (0 when not published); valid during the frame's recording.
+    D3D12_GPU_VIRTUAL_ADDRESS GetFrameLightSamplingConstants() const noexcept
+    {
+        return m_frameLightSamplingConstants;
+    }
+
     const CpuTiming::FrameSample& GetCpuFrameTiming() const
     {
         return m_cpuFrameTiming;
@@ -1495,12 +1601,91 @@ class Renderer
     // set to the content's revision (0 when it must not be reused). Never modified once returned.
     // M3.5: whether a path-traced mode's estimated exhaustive light work for this frame is safely below the GPU timeout
     // (with hysteresis); otherwise `failure` says why and the frame renders Legacy. Logged once per change.
-    bool IsPathTraceWorkloadSafe(std::uint32_t tableLights, const PathTraceReferenceSettings& settings, std::string& failure);
+    bool IsPathTraceWorkloadSafe(std::uint32_t tableLights, const PathTraceReferenceSettings& settings,
+        const SharcSettings& sharc, std::string& failure);
+
+    public:
+    // M4.2C: the path-tracing workload estimate, a pure function of its inputs (unit-tested without a renderer).
+    // Far below the 2 s Windows GPU timeout; guarded above the first, released below the second (no flicker at the edge).
+    static constexpr double PathTraceWorkloadGuardMilliseconds = 250.0;
+    static constexpr double PathTraceWorkloadReleaseMilliseconds = 200.0;
+
+    struct PathTraceWorkloadInputs
+    {
+        std::uint32_t tableLights = 0;
+        std::uint32_t width = 0;
+        std::uint32_t height = 0;
+        std::uint32_t samplesPerFrame = 1;
+        std::uint32_t maxPathDepth = 1;
+        // The experimental sampled-NEE permutations are requested (otherwise the production model applies).
+        bool estimatorAware = false;
+        bool sampledRequested = false;
+        bool trainingSampledRequested = false;
+        std::uint32_t threshold = 64;
+        std::uint32_t candidates = 8;
+        std::uint32_t directionalLights = 0;
+        // This table's sampling structures are built and were published, and RayQuery visibility is active.
+        bool structuresReady = false;
+        bool rayQueryActive = false;
+        bool sharcEnabled = false;
+        std::uint32_t trainingTile = 8;
+        std::uint32_t trainingMaxDepth = 8;
+    };
+
+    // What an estimate priced. totalMilliseconds is what the guard compares; the exhaustive parts are what the frame would
+    // cost if sampling turned out to be unavailable after all (the failed-publication fail-safe).
+    struct PathTraceWorkloadModel
+    {
+        bool estimatorAware = false;
+        bool sampledImage = false;
+        bool sampledTraining = false;
+        double imageMilliseconds = 0.0;
+        double trainingMilliseconds = 0.0;
+        double exhaustiveImageMilliseconds = 0.0;
+        double exhaustiveTrainingMilliseconds = 0.0;
+        double totalMilliseconds = 0.0;
+        // The recording the estimate was made for (0: none).
+        std::uint64_t recordingGeneration = 0;
+    };
+
+    static PathTraceWorkloadModel EstimatePathTraceWorkload(const PathTraceWorkloadInputs& inputs) noexcept;
+
+    private:
+    PathTraceWorkloadModel m_pathTraceWorkloadModel;
     bool m_pathTraceWorkloadGuarded = false;
     std::uint64_t m_pathTraceWorkloadGuardChanges = 0;
     double m_pathTraceWorkloadEstimateMilliseconds = 0.0;
     std::shared_ptr<const FrameLighting> AcquireFrameLighting(const DirectionalLight& legacySun,
         const SceneLightingSnapshot* snapshot, const SceneLightingSettings& proceduralSettings, std::uint64_t& revision);
+    // M4.1: builds (or reuses, for the same non-zero revision) the shared light-sampling structures of the frame's published
+    // light table and records their publication; returns the frame's LightSamplingConstants address (0 when disabled).
+    D3D12_GPU_VIRTUAL_ADDRESS RecordLightSampling(ID3D12GraphicsCommandList* commandList, const FrameLighting& lighting,
+        std::uint64_t lightingRevision);
+    bool m_lightSamplingEnabled = false;
+    LightSamplingSettings m_lightSamplingSettings;
+    LightSamplingBuffer m_lightSamplingBuffer;
+    // M4.1.1: the structures sampling m_lightSamplingCacheTable (lighting revision m_lightSamplingCacheRevision), updated
+    // in place by incremental updates. Owned by the render thread; the background rebuild works on its own copy.
+    std::shared_ptr<LightSamplingData> m_lightSamplingCache;
+    std::uint64_t m_lightSamplingCacheRevision = 0;
+    SceneLightTable m_lightSamplingCacheTable;
+    // M4.1.1: identifies m_lightSamplingCache's contents for the buffer (every build, update or adoption is new), since an
+    // adopted rebuild holds different words for the same lighting revision.
+    std::uint64_t m_lightSamplingPublication = 0;
+    // M4.1.1: a full build of m_lightSamplingRebuildTable on a worker, started while the structures hold lights an
+    // incremental update moved to the wide pool. Adopted (brought up to date incrementally) when it completes.
+    std::future<std::shared_ptr<LightSamplingData>> m_lightSamplingRebuild;
+    SceneLightTable m_lightSamplingRebuildTable;
+    D3D12_GPU_VIRTUAL_ADDRESS m_frameLightSamplingConstants = 0;
+    // The descriptor index of the buffer published this frame (valid with m_lightSamplingReport.available).
+    std::uint32_t m_frameLightSamplingBufferIndex = 0;
+    // M4.2A: the mode word and buffer index the path tracer reads from SceneLightConstants.padding.
+    void ApplySampledIndirectNee(const FrameLighting& lighting, SceneLightConstants& constants);
+    SampledIndirectNeeSettings m_sampledNeeSettings;
+    SampledIndirectNeeReport m_sampledNeeReport;
+    bool m_sampledNeeFallbackLogged = false;
+    LightSamplingReport m_lightSamplingReport;
+    bool m_lightSamplingFailing = false;
     std::shared_ptr<const FrameLighting> m_frameLightingCache;
     std::uint64_t m_frameLightingCacheRevision = 0;
     DirectionalLight m_frameLightingCacheSun;

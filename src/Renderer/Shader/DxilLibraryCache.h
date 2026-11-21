@@ -21,12 +21,14 @@ class DxilLibraryCache
 {
 public:
     // DXR libraries (ShaderCompiler::CompileLibrary): the shader root is the description's include directory.
+    // variantSource: for a shader variant (ShaderVariants), the text it compiles as. A variant has no file to record as a
+    // dependency, so its text joins the identity instead; empty for a file, whose identity is unchanged.
     DxilLibraryCache(const ShaderLibraryCompileDescription& description,
-        std::span<const wchar_t* const> arguments) noexcept;
+        std::span<const wchar_t* const> arguments, std::string_view variantSource = {}) noexcept;
 
     // Any compilation: enabled only when requested and a shader root is known.
     DxilLibraryCache(bool enabled, const wchar_t* source, const wchar_t* shaderRoot, std::string_view target,
-        std::span<const wchar_t* const> arguments) noexcept;
+        std::span<const wchar_t* const> arguments, std::string_view variantSource = {}) noexcept;
 
     bool Load(IDxcUtils* utils, std::vector<char>& bytecode, std::vector<ShaderSourceDependency>& dependencies) const noexcept;
     bool Store(const std::vector<char>& bytecode, const std::vector<ShaderSourceDependency>& dependencies) const noexcept;
