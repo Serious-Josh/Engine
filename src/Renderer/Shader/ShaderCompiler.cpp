@@ -4,6 +4,7 @@
 #include "ShaderVariants.h"
 
 #include <chrono>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -352,6 +353,12 @@ bool ShaderCompiler::Compile(
         arguments.push_back(L"-enable-16bit-types");
     }
 
+    // M5.1 T-2.1: configuration B's ReSTIRPT/ tree compiles with strict IEEE semantics (UsesStrictFloatingPoint).
+    if(UsesStrictFloatingPoint(description.path))
+    {
+        arguments.push_back(L"-Gis");
+    }
+
     // Shader variants (ShaderVariants) compile from their generated text instead of a file.
     const std::optional<VariantSource> variant = FindVariantSource(description.path, description.shaderRoot);
 
@@ -551,6 +558,13 @@ bool ShaderCompiler::CompileLibrary(
     {
         arguments.push_back(L"-enable-16bit-types");
     }
+
+    // M5.1 T-2.1: configuration B's ReSTIRPT/ tree compiles with strict IEEE semantics (UsesStrictFloatingPoint).
+    if(UsesStrictFloatingPoint(description.path))
+    {
+        arguments.push_back(L"-Gis");
+    }
+
     std::error_code sameDirectoryError;
 
     // Root-level libraries keep exactly their original arguments.
@@ -777,6 +791,28 @@ bool ShaderCompiler::UsesNative16BitTypes(const std::filesystem::path& shaderPat
     for(const std::filesystem::path& component : shaderPath)
     {
         if(component == "SharcNv")
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool ShaderCompiler::UsesStrictFloatingPoint(const std::filesystem::path& shaderPath)
+{
+    // M5.2 C0 performance baseline only (diagnostic): ENGINE_RESTIR_PT_STRICT_FP=0 compiles the tree without -Gis. The
+    // persistent cache keys on the arguments, so the two variants never mix.
+    const char* const strict = std::getenv("ENGINE_RESTIR_PT_STRICT_FP");
+
+    if(strict != nullptr && std::string(strict) == "0")
+    {
+        return false;
+    }
+
+    for(const std::filesystem::path& component : shaderPath)
+    {
+        if(component == "ReSTIRPT")
         {
             return true;
         }

@@ -3312,6 +3312,87 @@ bool Renderer::Initialize(
         Log::Info("ReGIR disabled (ENGINE_REGIR=0).");
     }
 
+    // M5.1 ReSTIR PT Enhanced (configuration B) diagnostics (unpackaged runs; never selected by a project): the M5.1 gates'
+    // estimator variants. ENGINE_RESTIR_PT_RIS=0 (one light-tile candidate), _RESERVOIR=0 (every candidate accumulated),
+    // _NORMALIZATION=onem (the Q-2 counter-hypothesis), _ISOLATE=direct|indirect, _CANDIDATES=<primary RIS candidates>,
+    // _ROULETTE=production|never|<paper vertex>, _DEBUG_VIEW=<n>, _COUNTERS=1.
+    if(!m_packagedRuntime)
+    {
+        const auto environment = [](const char* name)
+        {
+            const char* value = std::getenv(name);
+            return std::string(value ? value : "");
+        };
+        const std::string ris = environment("ENGINE_RESTIR_PT_RIS");
+        const std::string reservoir = environment("ENGINE_RESTIR_PT_RESERVOIR");
+        const std::string isolate = environment("ENGINE_RESTIR_PT_ISOLATE");
+        const std::string candidates = environment("ENGINE_RESTIR_PT_CANDIDATES");
+        const std::string roulette = environment("ENGINE_RESTIR_PT_ROULETTE");
+        const std::string debugView = environment("ENGINE_RESTIR_PT_DEBUG_VIEW");
+        m_restirPtSettings.ris = ris != "0";
+        m_restirPtSettings.reservoir = reservoir != "0";
+        m_restirPtSettings.normalizationOneOverM = environment("ENGINE_RESTIR_PT_NORMALIZATION") == "onem";
+        m_restirPtSettings.directOnly = isolate == "direct";
+        m_restirPtSettings.indirectOnly = isolate == "indirect";
+        m_restirPtSettings.counters = environment("ENGINE_RESTIR_PT_COUNTERS") == "1";
+        // M5.1 T-1.8 test only: ENGINE_RESTIR_PT_INJECT=candidate|result injects NaN at a sparse pixel lattice.
+        const std::string inject = environment("ENGINE_RESTIR_PT_INJECT");
+        m_restirPtSettings.inject = inject == "candidate" ? ReSTIRPTSettings::Inject::CandidateNaN :
+            inject == "result" ? ReSTIRPTSettings::Inject::ResultNaN : ReSTIRPTSettings::Inject::None;
+        // M5.1-6 F3 experiment: ENGINE_RESTIR_PT_OUTPUT=sum (the published output, f(Y) W, otherwise).
+        m_restirPtSettings.outputSum = environment("ENGINE_RESTIR_PT_OUTPUT") == "sum";
+        // M5.1-4 T-2.1 test only: ENGINE_RESTIR_PT_SELF_SHIFT=1.
+        m_restirPtSettings.selfShift = environment("ENGINE_RESTIR_PT_SELF_SHIFT") == "1";
+        // M5.2 C0 performance baseline only: ENGINE_RESTIR_PT_VISIBILITY_BENCH=excluding|plain.
+        const std::string visibilityBench = environment("ENGINE_RESTIR_PT_VISIBILITY_BENCH");
+        m_restirPtSettings.visibilityBench = visibilityBench == "excluding" ? ReSTIRPTSettings::VisibilityBench::Excluding :
+            visibilityBench == "plain" ? ReSTIRPTSettings::VisibilityBench::Plain : ReSTIRPTSettings::VisibilityBench::None;
+        // M5.2: ENGINE_RESTIR_PT_TEMPORAL=1 turns on temporal reuse (off by default until M5.2 is reviewed).
+        m_restirPtSettings.temporal = environment("ENGINE_RESTIR_PT_TEMPORAL") == "1";
+        // M5.4 C1: ENGINE_RESTIR_PT_TEMPORAL_PASS=0 keeps the fused M5.2 kernel (comparison and bit-identity runs).
+        m_restirPtSettings.temporalPass = environment("ENGINE_RESTIR_PT_TEMPORAL_PASS") != "0";
+        // M5.4 C4: the published criteria by default (validated); ENGINE_RESTIR_PT_CRITERIA=original for the old ones; ENGINE_RESTIR_PT_NEE_INVERSE=proxy (test only, A').
+        m_restirPtSettings.footprintCriteria = environment("ENGINE_RESTIR_PT_CRITERIA") != "original";
+        m_restirPtSettings.neeInverseProxy = environment("ENGINE_RESTIR_PT_NEE_INVERSE") == "proxy";
+        // M5.4 C5: replay compaction in the temporal pass (exact; measured faster); ENGINE_RESTIR_PT_REPLAY_COMPACTION=0 off.
+        m_restirPtSettings.replayCompaction = environment("ENGINE_RESTIR_PT_REPLAY_COMPACTION") != "0";
+        // M5.4 C6: dual motion vectors in the temporal lookup (unbiased; validated); ENGINE_RESTIR_PT_DUAL_MOTION=0 off.
+        m_restirPtSettings.dualMotion = environment("ENGINE_RESTIR_PT_DUAL_MOTION") != "0";
+        // M5.4 C7: ENGINE_RESTIR_PT_DUPLICATION=measure|apply (off by default; apply is biased).
+        const std::string duplication = environment("ENGINE_RESTIR_PT_DUPLICATION");
+        m_restirPtSettings.duplication = duplication == "apply" ? ReSTIRPTSettings::Duplication::Apply :
+            duplication == "measure" ? ReSTIRPTSettings::Duplication::Measure : ReSTIRPTSettings::Duplication::Off;
+        // M5.3: ENGINE_RESTIR_PT_SPATIAL=1 turns on paired spatial reuse (off by default until M5.3 is reviewed);
+        // ENGINE_RESTIR_PT_SPATIAL_COLOUR=0 shades with F(Y) W in place of colour-noise reduction.
+        m_restirPtSettings.spatial = environment("ENGINE_RESTIR_PT_SPATIAL") == "1";
+        m_restirPtSettings.spatialColourNoiseReduction = environment("ENGINE_RESTIR_PT_SPATIAL_COLOUR") != "0";
+
+        if(m_restirPtSettings.outputSum)
+        {
+            Log::Info("ReSTIR PT (configuration B): F3 experiment active: the output is the path tree's sum, not f(Y) W "
+                "(ENGINE_RESTIR_PT_OUTPUT=sum).");
+        }
+
+        if(!candidates.empty())
+        {
+            m_restirPtSettings.primaryCandidates = std::clamp(static_cast<std::uint32_t>(std::stoul(candidates)), 1u, 256u);
+        }
+
+        if(roulette == "never")
+        {
+            m_restirPtSettings.rouletteFromVertex = ReSTIRPTSettings::NeverRoulette;
+        }
+        else if(!roulette.empty() && roulette != "production")
+        {
+            m_restirPtSettings.rouletteFromVertex = std::clamp(static_cast<std::uint32_t>(std::stoul(roulette)), 1u, 64u);
+        }
+
+        if(!debugView.empty())
+        {
+            m_restirPtSettings.debugView = static_cast<std::uint32_t>(std::stoul(debugView));
+        }
+    }
+
     // M4.2A experimental sampled indirect NEE: the M42A libraries need the shared light sampling. Environment overrides:
     // ENGINE_SAMPLED_NEE_ESTIMATOR=exhaustive, ENGINE_SAMPLED_NEE_K=<2..8>, ENGINE_SAMPLED_NEE_THRESHOLD=<lights>,
     // ENGINE_SAMPLED_NEE_CLAMP=nee-off|off (test only).
@@ -4436,6 +4517,9 @@ bool Renderer::ResizeSceneResources(const SceneResolution& resolution)
         }
     }
 
+    // M5.1: configuration B's reservoirs are recreated at the new extent by its next frame (the GPU is idle here).
+    m_restirPtPass.ReleaseTextures();
+
     // The reference path tracer is optional: a failed resize disables it but never fails Legacy.
     // M0c.3: retired textures stay released; EnsurePathTracingResident creates them at the extent of their next frame.
     if(m_pathTracingResidency.resident && m_pathTraceReferencePass.IsInitialized() &&
@@ -4491,6 +4575,7 @@ bool Renderer::ResizeSceneResources(const SceneResolution& resolution)
     }
 
     m_rtxdiResources.InvalidateHistory();
+    m_restirPtPass.InvalidateHistory();
     m_rtxdiResourcesFailed = false;
 
     if(!m_rtxdiResources.Resize(m_graphicsDevice.GetDevice(), m_resourceDescriptorHeap, width, height))
@@ -4743,6 +4828,7 @@ void Renderer::UpdatePathTracingRetention()
 void Renderer::ReleasePathTracingResources()
 {
     m_pathTraceReferencePass.ReleaseTextures();
+    m_restirPtPass.ReleaseTextures();
     m_pathTraceTemporalPass.ReleaseHistory();
     m_pathTraceSpatialPass.ReleaseIntermediate();
     // Both are created again on their next path-traced use (EnsureRtxdiResources, EnsurePreviousGBufferHistory).
@@ -5683,6 +5769,7 @@ void Renderer::ResetSceneHistory()
     m_upscalerHistoryResetPending = true;
     InvalidatePreviousGBufferHistory();
     m_rtxdiResources.InvalidateHistory();
+    m_restirPtPass.InvalidateHistory();
 }
 
 void Renderer::LoadMaterialTables(std::span<const std::byte> packagedMaterialTables)
@@ -6238,6 +6325,7 @@ PathTracePrimary Renderer::GetLightingModePrimary(RendererLightingMode mode) con
     case RendererLightingMode::PathTracedRasterPrimary:
         return PathTracePrimary::Raster;
     case RendererLightingMode::PathTracedRasterPrimaryReSTIRDI:
+    case RendererLightingMode::PathTracedRasterPrimaryReSTIRPT:
         return PathTracePrimary::RasterReSTIRDI;
     case RendererLightingMode::PathTracedReference:
     case RendererLightingMode::Legacy:
@@ -6252,6 +6340,12 @@ bool Renderer::IsLightingModeReady(RendererLightingMode mode) const
     if(!m_pathTraceReferencePass.IsPrimaryReady(GetLightingModePrimary(mode)))
     {
         return false;
+    }
+
+    // M5.1: ReSTIR PT Enhanced needs its own pass instead of the RTXDI reservoirs.
+    if(mode == RendererLightingMode::PathTracedRasterPrimaryReSTIRPT)
+    {
+        return m_restirPtPass.IsInitialized();
     }
 
     return mode != RendererLightingMode::PathTracedRasterPrimaryReSTIRDI || m_rtxdiResources.IsInitialized();
@@ -6587,7 +6681,12 @@ void Renderer::CreateLightingModeResources(RendererLightingMode mode)
 
     m_lightingModeTransition.SetActivationStage(LightingModeTransitionStage::InitializingResources);
 
-    if(primary == PathTracePrimary::RasterReSTIRDI && m_pathTraceReferencePass.IsPrimaryReady(primary))
+    if(mode == RendererLightingMode::PathTracedRasterPrimaryReSTIRPT)
+    {
+        // M5.1: configuration B's pipelines, light tiles and counters (compiled here, on the render thread, on activation).
+        EnsureReSTIRPT();
+    }
+    else if(primary == PathTracePrimary::RasterReSTIRDI && m_pathTraceReferencePass.IsPrimaryReady(primary))
     {
         EnsureRtxdiResources();
     }
@@ -7033,6 +7132,354 @@ void Renderer::EvaluatePathTraceReSTIRDI()
             Log::Info("Path Tracing (raster-primary ReSTIR DI) unavailable, rendering Legacy: " + status.reason);
         }
     }
+}
+
+// M5.1 ReSTIR PT Enhanced (configuration B): the raster-primary prerequisites and the ReSTIR DI mode's primary pipeline
+// (configuration B records its G-buffer path, targets and denoisers), then its own pass. Editor-only: a packaged runtime
+// never makes it available (its shaders are not cooked).
+void Renderer::EvaluatePathTraceReSTIRPT()
+{
+    EvaluatePathTraceRasterPrimary();
+    PathTraceModeAvailability& status = m_restirPtAvailability;
+    const PathTraceModeAvailability previous = status;
+    std::string pipelineFailure;
+
+    if(m_packagedRuntime)
+    {
+        status = {PathTraceRasterPrimaryAvailability::Unavailable,
+            "ReSTIR PT Enhanced is Editor-only (experimental); packaged games render ReSTIR DI."};
+    }
+    else if(m_rasterPrimaryStatus.rasterPrimary.availability != PathTraceRasterPrimaryAvailability::Available)
+    {
+        status = {PathTraceRasterPrimaryAvailability::Unavailable, m_rasterPrimaryStatus.rasterPrimary.reason};
+    }
+    else if(!m_pathTraceReferencePass.EnsurePrimaryPipeline(m_graphicsDevice, m_shaderLibrary,
+        PathTracePrimary::RasterReSTIRDI, pipelineFailure))
+    {
+        status = {PathTraceRasterPrimaryAvailability::Unavailable, pipelineFailure};
+    }
+    else if(!EnsureReSTIRPT())
+    {
+        status = {PathTraceRasterPrimaryAvailability::Unavailable, "ReSTIR PT: " + m_restirPtPass.GetFailure()};
+    }
+    else
+    {
+        status = {PathTraceRasterPrimaryAvailability::Available, std::string()};
+    }
+
+    if(status != previous)
+    {
+        if(status.availability == PathTraceRasterPrimaryAvailability::Available)
+        {
+            Log::Info("Path Tracing (ReSTIR PT Enhanced, experimental) available.");
+        }
+        else
+        {
+            Log::Info("Path Tracing (ReSTIR PT Enhanced, experimental) unavailable, rendering Legacy: " + status.reason);
+        }
+    }
+}
+
+// M5.1: records a configuration B frame in the split passes' place, inside the PathTraceReference region: this frame's light
+// tiles from the light sampling published for exactly this table, then the unified initial path sampling into the path
+// tracer's own targets. A frame without published light sampling for a table that has lights records nothing and logs once
+// (the finite table lights could not be sampled; rendering them incompletely would be silently biased).
+void Renderer::RecordReSTIRPTFrame(ID3D12GraphicsCommandList* commandList, unsigned int frameIndex,
+    D3D12_GPU_VIRTUAL_ADDRESS constantsAddress, D3D12_GPU_VIRTUAL_ADDRESS sceneLightConstantsAddress,
+    const FrameLighting& frameLighting, const PathTraceReferenceSettings& settings, const Matrix4& view,
+    const Matrix4& projection, bool extract, bool rawExtraction)
+{
+    m_restirPtFrameLastFrame = false;
+
+    if(!EnsureReSTIRPT() || !m_restirPtPass.EnsureReservoirs(m_graphicsDevice.GetDevice(), m_resourceDescriptorHeap,
+        m_sceneWidth, m_sceneHeight))
+    {
+        m_restirPtPass.InvalidateHistory();
+        return;
+    }
+
+    const std::uint32_t tableLights = frameLighting.table.lightCount;
+    const bool samplingPublished = m_lightSamplingReport.available && m_lightSamplingPublishedLightCount == tableLights;
+
+    if(tableLights != 0 && !samplingPublished)
+    {
+        if(!m_restirPtSamplingFailureLogged)
+        {
+            Log::Error("ReSTIR PT (configuration B): no light sampling was published for this frame's " +
+                std::to_string(tableLights) + " Lights; the frame is not recorded.");
+            m_restirPtSamplingFailureLogged = true;
+        }
+
+        // M5.2: no reservoirs are written, so the committed ones would no longer belong to the immediately preceding frame.
+        m_restirPtPass.InvalidateHistory();
+        return;
+    }
+
+    m_restirPtSamplingFailureLogged = false;
+    const std::uint32_t lightSamplingIndex = samplingPublished ? m_frameLightSamplingBufferIndex : 0xFFFFFFFFu;
+    ++m_restirPtFrame;
+
+    m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::RestirPtLightTiles);
+    m_restirPtPass.RecordLightTiles(commandList, m_uploadBuffer, lightSamplingIndex, tableLights,
+        m_restirPtFrame * 0x9E3779B9u);
+    m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::RestirPtLightTiles);
+
+    // M5.2: this recording's reservoir sets and whether the previous frame's may be read.
+    PreviousGBufferView previousGBuffer;
+    const bool previousSurfacesAvailable = TryGetPreviousGBuffer(previousGBuffer);
+    const ReSTIRPTFrame restirPtFrame = m_restirPtPass.BeginFrame(MakeReSTIRPTHistorySignature(settings),
+        previousSurfacesAvailable);
+    m_restirPtHistoryDecision = restirPtFrame.decision;
+    // M5.3: spatial reuse needs one sample per frame (the paper's single path tree per pixel) and its buffers.
+    const bool spatial = m_restirPtSettings.reservoir && m_restirPtSettings.spatial && settings.samplesPerFrame == 1u &&
+        m_restirPtPass.EnsureSpatialResources(m_graphicsDevice.GetDevice(), m_resourceDescriptorHeap);
+    m_restirPtSpatialLastFrame = spatial;
+    // M5.4 C1: temporal reuse in its own pass at one sample per frame (the fused kernel otherwise: replacing one sample
+    // of a multi-sample mean would need the canonical's diffuse split, which the reservoir does not store).
+    const bool temporalPass = m_restirPtSettings.reservoir && m_restirPtSettings.temporal &&
+        m_restirPtSettings.temporalPass && settings.samplesPerFrame == 1u;
+    // M5.4 C5: the replay list, when replay compaction is on (it falls back to the uncompacted pass if allocation fails).
+    const bool replayCompaction = temporalPass && m_restirPtSettings.replayCompaction &&
+        m_restirPtPass.EnsureReplayList(m_graphicsDevice.GetDevice(), m_resourceDescriptorHeap);
+    // M5.4 C7: the duplication maps (before MakeConstants reads them).
+    const bool duplicationMap = m_restirPtSettings.temporal &&
+        m_restirPtSettings.duplication != ReSTIRPTSettings::Duplication::Off &&
+        m_restirPtPass.EnsureDuplicationMaps(m_graphicsDevice.GetDevice(), m_resourceDescriptorHeap);
+
+    // M5.4 C6: the instance history for dual motion vectors (before MakeConstants reads it).
+    if(m_restirPtSettings.dualMotion && m_restirPtSettings.temporal)
+    {
+        m_restirPtPass.EnsureInstanceHistory(m_graphicsDevice.GetDevice(), m_resourceDescriptorHeap);
+    }
+
+    ReSTIRPTConstants constants = m_restirPtPass.MakeConstants(m_restirPtSettings, extract, rawExtraction,
+        lightSamplingIndex, tableLights, m_restirPtFrame, settings.russianRouletteDepth, restirPtFrame, spatial,
+        temporalPass);
+    constants.motionIndex = m_gBuffer.GetMotion().GetSRVIndex();
+    // M5.4 C6: the current camera-relative view-projection and the raster identity (dual motion vectors).
+    const Matrix4 cameraRelativeViewProjection = CameraRelativeViewProjection(view, projection);
+    std::memcpy(constants.cameraRelativeViewProjection, &cameraRelativeViewProjection, sizeof(float) * 16);
+    constants.identityIndex = m_gBuffer.GetIdentity().GetSRVIndex();
+    // Linear depth along each camera's forward axis (row 2 of a left-handed view, as Matrix4::LookAt builds it).
+    constants.cameraForward[0] = view.m[2][0];
+    constants.cameraForward[1] = view.m[2][1];
+    constants.cameraForward[2] = view.m[2][2];
+
+    if(constants.historyValid != 0u)
+    {
+        constants.previousDepthIndex = previousGBuffer.depthIndex;
+        constants.previousSurfaceIndex = previousGBuffer.surfaceIndex;
+        constants.previousGeometricNormalIndex = previousGBuffer.geometricNormalIndex;
+        constants.previousMaterialIndex = previousGBuffer.materialIndex;
+        constants.previousCameraPosition[0] = previousGBuffer.camera.position.x;
+        constants.previousCameraPosition[1] = previousGBuffer.camera.position.y;
+        constants.previousCameraPosition[2] = previousGBuffer.camera.position.z;
+        constants.previousCameraForward[0] = previousGBuffer.camera.view.m[2][0];
+        constants.previousCameraForward[1] = previousGBuffer.camera.view.m[2][1];
+        constants.previousCameraForward[2] = previousGBuffer.camera.view.m[2][2];
+        std::memcpy(constants.previousInverseCameraRelativeViewProjection,
+            &previousGBuffer.camera.inverseCameraRelativeViewProjection, sizeof(float) * 16);
+    }
+
+    if(m_restirPtTransforms.empty())
+    {
+        m_restirPtTransforms.assign(1, ReSTIRPTInstanceTransform{});
+    }
+
+    constants.reconnectionMinDistance = m_restirPtReconnectionMinDistance;
+    constants.transformCount = static_cast<std::uint32_t>(m_restirPtTransforms.size());
+    const D3D12_GPU_VIRTUAL_ADDRESS address = m_uploadBuffer.Allocate(&constants, sizeof(constants),
+        D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
+    // M5.4 C5: the replay dispatch's constants (the same, selecting the list).
+    D3D12_GPU_VIRTUAL_ADDRESS replayAddress = 0;
+
+    if(replayCompaction && constants.replayListIndex != 0xFFFFFFFFu)
+    {
+        ReSTIRPTConstants replayConstants = constants;
+        replayConstants.replayPass = 1u;
+        replayAddress = m_uploadBuffer.Allocate(&replayConstants, sizeof(replayConstants),
+            D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
+    }
+    const D3D12_GPU_VIRTUAL_ADDRESS transformsAddress = m_uploadBuffer.Allocate(m_restirPtTransforms.data(),
+        m_restirPtTransforms.size() * sizeof(ReSTIRPTInstanceTransform), D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT);
+
+    if(address == 0 || transformsAddress == 0)
+    {
+        Log::Error("ReSTIR PT (configuration B): its constants or instance transforms could not be allocated.");
+        m_restirPtPass.InvalidateHistory();
+        return;
+    }
+
+    m_restirPtPass.PrepareInitialPass(commandList);
+    m_pathTraceReferencePass.ExecuteReSTIRPT(commandList, m_gpuTimestampProfiler, frameIndex, m_resourceDescriptorHeap,
+        m_rayTracingScene, constantsAddress, sceneLightConstantsAddress, m_sceneWidth, m_sceneHeight,
+        m_restirPtPass.GetInitialPipeline(m_restirPtSettings, temporalPass), address, transformsAddress, extract,
+        rawExtraction, spatial ? &m_restirPtPass.GetSpatialPairsPipeline(m_restirPtSettings) : nullptr,
+        spatial ? &m_restirPtPass.GetSpatialResamplePipeline() : nullptr,
+        temporalPass ? &m_restirPtPass.GetTemporalPassPipeline(m_restirPtSettings) : nullptr, replayAddress,
+        duplicationMap && constants.duplicationOutputIndex != 0xFFFFFFFFu ? &m_restirPtPass.GetDuplicationPipeline() : nullptr);
+    m_restirPtFrameLastFrame = true;
+}
+
+namespace
+{
+    // FNV-1a over raw bytes (M5.2 history signature hashes).
+    std::uint64_t HashBytes(std::uint64_t hash, const void* data, std::size_t bytes)
+    {
+        const auto* byte = static_cast<const unsigned char*>(data);
+
+        for(std::size_t index = 0; index < bytes; ++index)
+        {
+            hash = (hash ^ byte[index]) * 0x100000001B3ull;
+        }
+
+        return hash;
+    }
+
+    template <typename Value>
+    std::uint64_t HashValue(std::uint64_t hash, const Value& value)
+    {
+        return HashBytes(hash, &value, sizeof(Value));
+    }
+}
+
+// M5.2: what this frame's B reservoirs are computed against (ReSTIRPTHistorySignature). The lighting hash covers the sun,
+// every table light record, the environment's texture, conditional CDF and total weight (the sampling distribution) and
+// its calibrated identity; the settings hash the path-space settings. Read from this frame's accumulation key, which
+// PathTraceReference set before the B frame records.
+ReSTIRPTHistorySignature Renderer::MakeReSTIRPTHistorySignature(const PathTraceReferenceSettings& settings) const
+{
+    ReSTIRPTHistorySignature signature;
+    signature.sceneResourceLifetime = m_sceneResourceLifetime;
+    signature.topLevelAddress = m_rayTracingScene.GetTopLevel().GetGPUAddress();
+    signature.topLevelGeometry = m_rayTracingScene.GetTLASGeometryIdentity();
+    signature.materialRevision = m_materialPublication.revision;
+    signature.width = m_sceneWidth;
+    signature.height = m_sceneHeight;
+    std::uint64_t lighting = 0xCBF29CE484222325ull;
+
+    if(m_pathTraceAccumulationKey)
+    {
+        const PathTraceAccumulationKey& key = *m_pathTraceAccumulationKey;
+        lighting = HashValue(lighting, key.sun.direction);
+        lighting = HashValue(lighting, key.sun.color);
+        lighting = HashValue(lighting, key.sun.intensity);
+        lighting = HashValue(lighting, key.sun.angularRadius);
+        lighting = HashValue(lighting, key.lights.lightCount);
+
+        if(!key.lights.lights.empty())
+        {
+            lighting = HashBytes(lighting, key.lights.lights.data(), key.lights.lights.size() * sizeof(GPULight));
+        }
+
+        lighting = HashValue(lighting, key.environmentTextureIndex);
+        lighting = HashValue(lighting, key.environmentConditionalCDFIndex);
+        lighting = HashValue(lighting, key.environmentTotalWeight);
+    }
+
+    lighting = HashBytes(lighting, m_environmentIdentity.data(), m_environmentIdentity.size());
+    signature.lightingHash = lighting;
+
+    std::uint64_t path = 0xCBF29CE484222325ull;
+    path = HashValue(path, settings.samplesPerFrame);
+    path = HashValue(path, settings.maxPathDepth);
+    path = HashValue(path, settings.russianRouletteDepth);
+    path = HashValue(path, m_restirPtSettings.ris);
+    path = HashValue(path, m_restirPtSettings.reservoir);
+    path = HashValue(path, m_restirPtSettings.normalizationOneOverM);
+    path = HashValue(path, m_restirPtSettings.directOnly);
+    path = HashValue(path, m_restirPtSettings.indirectOnly);
+    path = HashValue(path, m_restirPtSettings.primaryCandidates);
+    path = HashValue(path, m_restirPtSettings.tileCount);
+    path = HashValue(path, m_restirPtSettings.tileSize);
+    path = HashValue(path, m_restirPtSettings.rouletteFromVertex);
+    path = HashValue(path, m_restirPtSettings.temporal);
+    path = HashValue(path, m_restirPtSettings.temporalConfidenceCap);
+    path = HashValue(path, m_restirPtSettings.spatial);
+    path = HashValue(path, m_restirPtSettings.spatialColourNoiseReduction);
+    path = HashValue(path, m_restirPtSettings.footprintCriteria);
+    path = HashValue(path, m_restirPtSettings.neeInverseProxy);
+    path = HashValue(path, m_restirPtSettings.dualMotion);
+    path = HashValue(path, static_cast<int>(m_restirPtSettings.duplication));
+    signature.settingsHash = path;
+    return signature;
+}
+
+void Renderer::PrepareReSTIRPTTransforms(const Scene& scene)
+{
+    const auto& renderObjects = scene.GetRenderObjects();
+    // At least one record, so the root SRV is always valid (the shader reads only below transformCount).
+    m_restirPtTransforms.assign((std::max)(renderObjects.size(), std::size_t{1}), ReSTIRPTInstanceTransform{});
+    Vector3 low{1.0e30f, 1.0e30f, 1.0e30f};
+    Vector3 high{-1.0e30f, -1.0e30f, -1.0e30f};
+
+    for(std::size_t index = 0; index < renderObjects.size(); ++index)
+    {
+        // The geometry the TLAS holds this frame: the presentation transform (PSR's transforms use the same).
+        const PresentationTransform& presentation = renderObjects[index].GetPresentationTransform();
+        const Matrix4 model = presentation.currentModel;
+        const Matrix4 inverse = model.Inverse();
+        ReSTIRPTInstanceTransform& record = m_restirPtTransforms[index];
+        // M5.4 C6: exactly the identity for an unmoved instance (as PSR's currentToPrevious), so static geometry has
+        // exactly zero dual motion.
+        const bool unchanged = std::memcmp(presentation.currentModel.m, presentation.previousModel.m,
+            sizeof(presentation.currentModel.m)) == 0;
+        const Matrix4 previousToCurrent = unchanged ? Matrix4::Identity() :
+            presentation.currentModel * presentation.previousModel.Inverse();
+
+        for(int row = 0; row < 3; ++row)
+        {
+            for(int column = 0; column < 4; ++column)
+            {
+                record.objectToWorld[row * 4 + column] = model.m[row][column];
+                record.worldToObject[row * 4 + column] = inverse.m[row][column];
+                record.previousToCurrent[row * 4 + column] = previousToCurrent.m[row][column];
+            }
+        }
+
+        const Mesh* mesh = renderObjects[index].mesh;
+
+        if(!mesh || !mesh->GetBounds().valid)
+        {
+            continue;
+        }
+
+        const MeshBounds& bounds = mesh->GetBounds();
+
+        for(int corner = 0; corner < 8; ++corner)
+        {
+            const float x = corner & 1 ? bounds.max.x : bounds.min.x;
+            const float y = corner & 2 ? bounds.max.y : bounds.min.y;
+            const float z = corner & 4 ? bounds.max.z : bounds.min.z;
+            const Vector3 world{model.m[0][0] * x + model.m[0][1] * y + model.m[0][2] * z + model.m[0][3],
+                model.m[1][0] * x + model.m[1][1] * y + model.m[1][2] * z + model.m[1][3],
+                model.m[2][0] * x + model.m[2][1] * y + model.m[2][2] * z + model.m[2][3]};
+            low = {(std::min)(low.x, world.x), (std::min)(low.y, world.y), (std::min)(low.z, world.z)};
+            high = {(std::max)(high.x, world.x), (std::max)(high.y, world.y), (std::max)(high.z, world.z)};
+        }
+    }
+
+    // [P 14] original criteria: d_min = 2% of the smallest scene dimension (0 without bounds: distance never rejects).
+    const float smallest = high.x >= low.x ? (std::min)({high.x - low.x, high.y - low.y, high.z - low.z}) : 0.0f;
+    m_restirPtReconnectionMinDistance = 0.02f * (std::max)(smallest, 0.0f);
+}
+
+bool Renderer::EnsureReSTIRPT()
+{
+    if(m_restirPtPass.IsInitialized())
+    {
+        return true;
+    }
+
+    if(m_restirPtPass.HasFailed())
+    {
+        return false;
+    }
+
+    // Creation only: no GPU work is recorded, so creating during recording is safe.
+    TransitionTiming::Scope er1Scope("EnsureReSTIRPT");
+    return m_restirPtPass.Initialize(m_graphicsDevice.GetDevice(), m_shaderLibrary, m_resourceDescriptorHeap,
+        m_resourceUploader, m_restirPtSettings);
 }
 
 // M4.3 ReGIR presampling (experimental; ReGIR_M4_3_Math.md): fills the slots the DirectLighting/ReGIR permutation reads,
@@ -7690,6 +8137,7 @@ void Renderer::ApplyCameraJitter(bool requested)
     m_pathTraceTemporalPass.InvalidateHistory();
     InvalidatePreviousGBufferHistory();
     m_rtxdiResources.InvalidateHistory();
+    m_restirPtPass.InvalidateHistory();
 }
 
 std::uint32_t Renderer::DlssJitterPhaseCount(unsigned int renderWidth, unsigned int renderHeight,
@@ -8795,7 +9243,9 @@ bool Renderer::RecordPathTraceReference(
 
         // RTXPT.3: the per-sample direct radiance the ReSTIR DI passes exchange, sized for the configured samples
         // per frame (every frame of a configuration records at most that many). Nothing is recorded without it.
-        const bool splitReSTIRDI = primary == PathTracePrimary::RasterReSTIRDI;
+        // M5.1: a configuration B frame records the ReSTIR DI primary's targets but neither split pass.
+        const bool restirPtFrame = m_restirPtFrameThisFrame && primary == PathTracePrimary::RasterReSTIRDI;
+        const bool splitReSTIRDI = primary == PathTracePrimary::RasterReSTIRDI && !restirPtFrame;
 
         if(splitReSTIRDI)
         {
@@ -8984,7 +9434,7 @@ bool Renderer::RecordPathTraceReference(
 
         // RTXPT.3: the ReSTIR DI variant's RTXDI constants and reservoir buffer.
         D3D12_GPU_VIRTUAL_ADDRESS rtxdiConstantsAddress = 0;
-        const bool usesRtxdi = primary == PathTracePrimary::RasterReSTIRDI;
+        const bool usesRtxdi = primary == PathTracePrimary::RasterReSTIRDI && !restirPtFrame;
 
         if(usesRtxdi && !PrepareRtxdiFrame(commandList, frameLighting, constants, view, rtxdiConstantsAddress))
         {
@@ -9105,7 +9555,12 @@ bool Renderer::RecordPathTraceReference(
         bool referenceDispatched = false;
         m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::PathTraceReference);
 
-        if(splitReSTIRDI)
+        if(restirPtFrame)
+        {
+            RecordReSTIRPTFrame(commandList, frameIndex, constantsAddress, sceneLightConstantsAddress, frameLighting,
+                settings, view, projection, extract, rawExtraction);
+        }
+        else if(splitReSTIRDI)
         {
             m_pathTraceReferencePass.ExecuteReSTIRDISplit(m_commandContext.GetRayTracingCommandList(),
                 m_gpuTimestampProfiler, frameIndex, m_resourceDescriptorHeap, m_rayTracingScene, constantsAddress,
@@ -11378,6 +11833,7 @@ Renderer::FrameRenderResult Renderer::Render(
         m_pathTracePendingSamples = 0;
         InvalidatePreviousGBufferHistory();
         m_rtxdiResources.InvalidateHistory();
+        m_restirPtPass.InvalidateHistory();
 
         if(m_injectedFrameFailureForTesting)
         {
@@ -11614,9 +12070,9 @@ bool Renderer::IsPathTraceWorkloadSafe(std::uint32_t tableLights, const PathTrac
     inputs.trainingSampledRequested = m_sampledNeeSettings.trainingSampled;
     inputs.threshold = m_sampledNeeSettings.threshold;
     inputs.candidates = m_sampledNeeSettings.candidates;
-    inputs.structuresReady = m_lightSamplingCache && m_lightSamplingCacheRevision != 0 &&
-        m_lightSamplingCacheTable.lightCount == tableLights && m_lightSamplingReport.available;
-    inputs.directionalLights = inputs.structuresReady ? m_lightSamplingCache->statistics.directionalLights : 0u;
+    inputs.structuresReady = SampledLightStructuresTrusted(m_lightSamplingReport.available,
+        m_lightSamplingPublishedLightCount, tableLights);
+    inputs.directionalLights = inputs.structuresReady ? m_lightSamplingReport.statistics.directionalLights : 0u;
     inputs.rayQueryActive = m_pathTraceReferencePass.IsSecondaryShadowRayQueryActive();
     inputs.sharcEnabled = sharc.enabled;
     inputs.trainingTile = sharc.trainingTile;
@@ -11633,11 +12089,22 @@ bool Renderer::IsPathTraceWorkloadSafe(std::uint32_t tableLights, const PathTrac
 
         if(guarded)
         {
+            // Which estimator the estimate priced, and (estimator-aware runs) which condition kept sampling untrusted.
+            std::string pricing = m_pathTraceWorkloadModel.sampledImage ? "sampled light sampling" :
+                "exhaustive light sampling";
+
+            if(inputs.estimatorAware && inputs.sampledRequested && !m_pathTraceWorkloadModel.sampledImage)
+            {
+                pricing += std::string(" (sampled not trusted: structures ") + (inputs.structuresReady ? "ready" : "not ready") +
+                    ", RayQuery visibility " + (inputs.rayQueryActive ? "active" : "inactive") + ", " +
+                    std::to_string(tableLights) + " Lights against threshold " + std::to_string(inputs.threshold) + ")";
+            }
+
             Log::Error("Path Tracing paused for this workload, rendering Legacy: " + std::to_string(tableLights) +
                 " Lights at " + std::to_string(m_sceneWidth) + "x" + std::to_string(m_sceneHeight) + ", " +
                 std::to_string(settings.samplesPerFrame) + " samples per frame and depth " +
                 std::to_string(settings.maxPathDepth) + " are estimated at " + std::to_string(static_cast<int>(estimate)) +
-                " ms per frame of exhaustive light sampling (guard " + std::to_string(static_cast<int>(GuardMilliseconds)) +
+                " ms per frame of " + pricing + " (guard " + std::to_string(static_cast<int>(GuardMilliseconds)) +
                 " ms). Every Light is kept; Path Tracing resumes when the estimate falls below " +
                 std::to_string(static_cast<int>(ReleaseMilliseconds)) + " ms.");
         }
@@ -11652,7 +12119,9 @@ bool Renderer::IsPathTraceWorkloadSafe(std::uint32_t tableLights, const PathTrac
 
     if(guarded)
     {
-        failure = "Path Tracing paused: the estimated exhaustive light work (" + std::to_string(static_cast<int>(estimate)) +
+        failure = std::string("Path Tracing paused: the estimated ") +
+            (m_pathTraceWorkloadModel.sampledImage ? "sampled" : "exhaustive") + " light work (" +
+            std::to_string(static_cast<int>(estimate)) +
             " ms per frame for " + std::to_string(tableLights) + " Lights) could approach the GPU timeout; rendering Legacy.";
         return false;
     }
@@ -11731,13 +12200,14 @@ std::shared_ptr<const FrameLighting> Renderer::AcquireFrameLighting(const Direct
 }
 
 D3D12_GPU_VIRTUAL_ADDRESS Renderer::RecordLightSampling(ID3D12GraphicsCommandList* commandList,
-    const FrameLighting& lighting, std::uint64_t lightingRevision, bool regirFrame)
+    const FrameLighting& lighting, std::uint64_t lightingRevision, bool regirFrame, bool restirPtFrame)
 {
-    m_lightSamplingReport.enabled = m_lightSamplingEnabled;
+    m_lightSamplingReport.enabled = m_lightSamplingEnabled || restirPtFrame;
     m_lightSamplingReport.available = false;
 
-    // M4.3.5: with ReGIR the only consumer, nothing is built (or published) on frames that do not use it.
-    if(!m_lightSamplingEnabled || (!m_lightSamplingAlways && !regirFrame))
+    // M4.3.5: with ReGIR the only consumer, nothing is built (or published) on frames that do not use it. M5.1:
+    // configuration B's light tiles always need it.
+    if(!restirPtFrame && (!m_lightSamplingEnabled || (!m_lightSamplingAlways && !regirFrame)))
     {
         return 0;
     }
@@ -11883,6 +12353,7 @@ D3D12_GPU_VIRTUAL_ADDRESS Renderer::RecordLightSampling(ID3D12GraphicsCommandLis
     }
 
     m_lightSamplingReport.available = constants.valid != 0;
+    m_lightSamplingPublishedLightCount = constants.valid != 0 ? lighting.table.lightCount : 0u;
     m_frameLightSamplingBufferIndex = constants.bufferIndex;
     m_lightSamplingReport.revision = lightingRevision;
     m_lightSamplingReport.copies = m_lightSamplingBuffer.GetCopyCount();
@@ -12259,7 +12730,7 @@ bool Renderer::RecordRenderFrame(
     // SHARC.4C: before the material table and the scene-lighting latch, whose inputs include the cache identity.
     // SHARC and the denoiser option cover both raster-primary path-traced modes (SHARC.5B adds ReSTIR DI).
     const bool rasterPrimaryMode = options.lightingMode == RendererLightingMode::PathTracedRasterPrimary ||
-        options.lightingMode == RendererLightingMode::PathTracedRasterPrimaryReSTIRDI;
+        IsRasterPrimaryReSTIRMode(options.lightingMode);
     // ER.1 Phase 2: the requested denoiser and SHARC become effective only once their DXR libraries are prepared.
     const PathTraceDenoiserMode denoiser = GateDenoiserRequest(options.lightingMode,
         rasterPrimaryMode ? options.pathTraceDenoiserMode : PathTraceDenoiserMode::Off);
@@ -12292,7 +12763,9 @@ bool Renderer::RecordRenderFrame(
     const bool sharcRequested = options.sharc.enabled && rasterPrimaryMode;
     const std::string nvidiaFailure = sharcRequested && sharc.implementation == SharcImplementation::Nvidia ?
         NvidiaSharcCapabilityFailure() : std::string{};
-    sharc.enabled = nvidiaFailure.empty() && GateSharcRequest(options.lightingMode, denoiser, sharcRequested);
+    // M5.1: configuration B never runs SHARC.
+    sharc.enabled = nvidiaFailure.empty() && options.lightingMode != RendererLightingMode::PathTracedRasterPrimaryReSTIRPT &&
+        GateSharcRequest(options.lightingMode, denoiser, sharcRequested);
     ApplySharcSettings(sharc, rasterPrimaryMode);
     m_sharcStatus.preparation = nvidiaFailure.empty() ? m_sharcPreparation : "SHARC unavailable: " + nvidiaFailure;
 
@@ -12568,6 +13041,8 @@ bool Renderer::RecordRenderFrame(
         const bool referenceRequested = mode == RendererLightingMode::PathTracedReference;
         const bool rasterPrimaryRequested = mode == RendererLightingMode::PathTracedRasterPrimary;
         const bool restirDIRequested = mode == RendererLightingMode::PathTracedRasterPrimaryReSTIRDI;
+        // M5.1: ReSTIR PT Enhanced (configuration B) records the ReSTIR DI mode's primary without RTXDI.
+        const bool restirPTRequested = mode == RendererLightingMode::PathTracedRasterPrimaryReSTIRPT;
 
         if(rasterPrimaryRequested)
         {
@@ -12577,6 +13052,11 @@ bool Renderer::RecordRenderFrame(
         if(restirDIRequested)
         {
             EvaluatePathTraceReSTIRDI();
+        }
+
+        if(restirPTRequested)
+        {
+            EvaluatePathTraceReSTIRPT();
         }
 
         const bool rasterPrimaryAvailable =
@@ -12589,7 +13069,7 @@ bool Renderer::RecordRenderFrame(
         {
             primary = PathTracePrimary::Raster;
         }
-        else if(restirDIRequested)
+        else if(restirDIRequested || restirPTRequested)
         {
             primary = PathTracePrimary::RasterReSTIRDI;
         }
@@ -12603,7 +13083,8 @@ bool Renderer::RecordRenderFrame(
         };
         bool runnable = pathTraceSettingsValid &&
             ((referenceRequested && referenceRunnable()) || (rasterPrimaryRequested && rasterPrimaryAvailable) ||
-            (restirDIRequested && restirDIAvailable));
+            (restirDIRequested && restirDIAvailable) ||
+            (restirPTRequested && m_restirPtAvailability.availability == PathTraceRasterPrimaryAvailability::Available));
 
         // M3.5: a path-traced mode whose estimated exhaustive light work could approach the GPU timeout is not runnable this
         // frame: the recording renders Legacy and reports why, the request is kept, and it resumes once the workload is safe.
@@ -12635,6 +13116,10 @@ bool Renderer::RecordRenderFrame(
         else if(rasterPrimaryRequested)
         {
             failure = m_rasterPrimaryStatus.rasterPrimary.reason;
+        }
+        else if(restirPTRequested)
+        {
+            failure = m_restirPtAvailability.reason;
         }
         else
         {
@@ -12688,6 +13173,10 @@ bool Renderer::RecordRenderFrame(
         {
             publish(m_rasterPrimaryStatus.restirDI, "Path Tracing (raster-primary ReSTIR DI)");
         }
+        else if(options.lightingMode == RendererLightingMode::PathTracedRasterPrimaryReSTIRPT)
+        {
+            publish(m_restirPtAvailability, "Path Tracing (ReSTIR PT Enhanced, experimental)");
+        }
     }
 
     if(m_lightingModeTransition.GetStatus().stage == LightingModeTransitionStage::CreatingPipeline)
@@ -12724,6 +13213,16 @@ bool Renderer::RecordRenderFrame(
     if(pathTracedSceneEmpty)
     {
         runPathTrace = false;
+    }
+
+    // M5.2: B's reservoir history belongs to the immediately preceding B frame only (set after this frame's mode below).
+    // M5.1: this recording's path-traced frame is configuration B (ReSTIR PT Enhanced): the ReSTIR DI mode's primary, its
+    // lighting from ReSTIRPTPass in place of RTXDI and the split passes; no PSR and no SHARC.
+    m_restirPtFrameThisFrame = runPathTrace && recordedMode == RendererLightingMode::PathTracedRasterPrimaryReSTIRPT;
+
+    if(!m_restirPtFrameThisFrame)
+    {
+        m_restirPtPass.InvalidateHistory();
     }
 
     // M0c.1/M0c.2: before anything in this recording reads a Legacy pass (constants below, then the Legacy branch), a
@@ -12794,6 +13293,7 @@ bool Renderer::RecordRenderFrame(
     m_nrdConfidenceDispatchedThisFrame = false;
     m_previousGBufferAvailableThisFrame = false;
     m_rtxdiResources.AbandonFrame();
+    m_restirPtPass.AbandonFrame();
 
     const bool pathTracePrimaryChanged = runPathTrace && m_previousGBufferPrimary &&
         *m_previousGBufferPrimary != pathTracePrimary;
@@ -12802,6 +13302,7 @@ bool Renderer::RecordRenderFrame(
     {
         InvalidatePreviousGBufferHistory();
         m_rtxdiResources.InvalidateHistory();
+        m_restirPtPass.InvalidateHistory();
     }
 
     if(runPathTrace)
@@ -12950,7 +13451,8 @@ bool Renderer::RecordRenderFrame(
     // PSR.2 Stage 1 (development prototype): eligibility marking and in-place replacement on Path Tracing (ReSTIR DI)
     // frames only, with the path tracer's camera. PathTracePsrEligible's maxPathDepth > 0 is checked here.
     const bool psrRequested = runPathTrace && pathTracePrimary == PathTracePrimary::RasterReSTIRDI &&
-        options.pathTraceReference.primarySurfaceReplacementInPlace && options.pathTraceReference.maxPathDepth > 0u;
+        !m_restirPtFrameThisFrame && options.pathTraceReference.primarySurfaceReplacementInPlace &&
+        options.pathTraceReference.maxPathDepth > 0u;
     // PSR.2 Stage 3A: only the PSR.2 lighting pair lights replaced pixels, and it needs the denoiser Off (no extraction),
     // a path that reaches the reflected surface (vertex 1). SHARC remains excluded outside the development-only
     // infrastructure harness, which prepares the combined set before replacement. Without a diagnostic view the
@@ -13262,6 +13764,7 @@ bool Renderer::RecordRenderFrame(
     if(!tablePublished || rtxdiHistoryDropped)
     {
         m_rtxdiResources.InvalidateHistory();
+        m_restirPtPass.InvalidateHistory();
 
         if(!m_sceneLightPublicationFailing)
         {
@@ -13288,7 +13791,8 @@ bool Renderer::RecordRenderFrame(
         CountReGIRLocalLights(frameLighting.table) : 0u;
     const bool regirFrame = runPathTrace && pathTracePrimary == PathTracePrimary::RasterReSTIRDI &&
         m_frameReGIRLocalLights > m_regirSettings.localLightThreshold;
-    m_frameLightSamplingConstants = RecordLightSampling(commandList, frameLighting, lightingRevision, regirFrame);
+    m_frameLightSamplingConstants = RecordLightSampling(commandList, frameLighting, lightingRevision, regirFrame,
+        m_restirPtFrameThisFrame);
     ApplySampledIndirectNee(frameLighting, sceneLightConstants);
 
     const D3D12_GPU_VIRTUAL_ADDRESS sceneLightConstantsAddress = m_uploadBuffer.Allocate(
@@ -13643,6 +14147,11 @@ bool Renderer::RecordRenderFrame(
         // frame, which restarts them with CLEAR_AND_RESTART (m_nrdExecutedLastFrame is false after a path-traced frame).
 
         MarkDredStage(commandList, L"Frame: path tracing");
+
+        if(m_restirPtFrameThisFrame)
+        {
+            PrepareReSTIRPTTransforms(scene);
+        }
 
         if(!RecordPathTraceReference(commandList, frameIndex, pathTracePrimary, currentView, renderProjection,
             currentProjection, reconstructionConstants.inverseViewProjection, frameView.position, frameLighting,
@@ -14859,6 +15368,7 @@ bool Renderer::RecordRenderFrame(
     m_nrdHybridExecutedLastFrame = m_nrdHybridDispatchedThisFrame;
     m_nrdHybridDispatchedThisFrame = false;
     m_rtxdiResources.CommitFrame();
+    m_restirPtPass.CommitFrame();
     m_radianceCacheD6.CommitSubmission();
     m_sharcNvidia.CommitSubmission();
 
@@ -15108,6 +15618,7 @@ void Renderer::Shutdown()
     m_denoiserPreparation.clear();
     m_sharcPreparation.clear();
     m_referenceRayCounts.Shutdown();
+    m_restirPtPass.Shutdown();
     m_pathTraceReferencePass.Shutdown();
     m_pathTraceTemporalPass.Shutdown();
     m_pathTraceSpatialPass.Shutdown();

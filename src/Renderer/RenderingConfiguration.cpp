@@ -17,7 +17,7 @@ PathTraceReferenceSettings GetReferencePathTracerQuality()
 bool IsDlssConfigurationEligible(const RenderingConfiguration& configuration, RendererLightingMode activeMode,
     bool denoiserPreparing)
 {
-    return configuration.lightingMode == RendererLightingMode::PathTracedRasterPrimaryReSTIRDI &&
+    return IsRasterPrimaryReSTIRMode(configuration.lightingMode) &&
         activeMode == configuration.lightingMode && configuration.denoiser != PathTraceDenoiserMode::Off &&
         !denoiserPreparing;
 }
@@ -25,7 +25,7 @@ bool IsDlssConfigurationEligible(const RenderingConfiguration& configuration, Re
 bool IsDlssPreparing(const RenderingConfiguration& configuration, RendererLightingMode activeMode,
     bool denoiserPreparing)
 {
-    return configuration.lightingMode == RendererLightingMode::PathTracedRasterPrimaryReSTIRDI &&
+    return IsRasterPrimaryReSTIRMode(configuration.lightingMode) &&
         configuration.denoiser != PathTraceDenoiserMode::Off &&
         (activeMode != configuration.lightingMode || denoiserPreparing);
 }

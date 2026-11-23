@@ -38,6 +38,7 @@
     X(differenceAmplification, pathTracing.differenceAmplification) \
     X(uncertaintyFloorLog10, pathTracing.uncertaintyFloorLog10) \
     X(sharc, pathTracing.sharc) \
+    X(estimator, pathTracing.estimator) \
     X(volumetricQuality, volumetrics.quality) \
     X(volumetricResolutionBasis, volumetrics.resolutionBasis)
 

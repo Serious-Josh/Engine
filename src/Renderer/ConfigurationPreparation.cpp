@@ -18,6 +18,8 @@ namespace
             return "Raster Primary";
         case RendererLightingMode::PathTracedRasterPrimaryReSTIRDI:
             return "Path Tracing (ReSTIR DI)";
+        case RendererLightingMode::PathTracedRasterPrimaryReSTIRPT:
+            return "Path Tracing (ReSTIR PT Enhanced)";
         }
 
         return "?";
@@ -44,8 +46,7 @@ namespace
 
     bool IsRasterPrimary(RendererLightingMode mode)
     {
-        return mode == RendererLightingMode::PathTracedRasterPrimary ||
-            mode == RendererLightingMode::PathTracedRasterPrimaryReSTIRDI;
+        return mode == RendererLightingMode::PathTracedRasterPrimary || IsRasterPrimaryReSTIRMode(mode);
     }
 
     double Seconds(ConfigurationPreparation::Clock::duration duration)
@@ -61,7 +62,9 @@ ConfigurationIdentity MakeConfigurationIdentity(const RenderingConfiguration& co
     const bool rasterPrimary = IsRasterPrimary(configuration.lightingMode);
     const bool restirDI = configuration.lightingMode == RendererLightingMode::PathTracedRasterPrimaryReSTIRDI;
     identity.denoiser = rasterPrimary ? configuration.denoiser : PathTraceDenoiserMode::Off;
-    identity.sharc = rasterPrimary && configuration.sharc.enabled;
+    // M5.1: ReSTIR PT Enhanced uses neither SHARC nor PSR (restirDI alone decides the PSR chain below).
+    identity.sharc = rasterPrimary && configuration.sharc.enabled &&
+        configuration.lightingMode != RendererLightingMode::PathTracedRasterPrimaryReSTIRPT;
 
     // As RecordRenderFrame decides psrRequested and its chain.
     const PathTraceReferenceSettings& pathTrace = configuration.pathTrace;

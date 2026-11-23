@@ -42,6 +42,8 @@ inline const char* GetLightingModeDisplayName(RendererLightingMode mode)
         return "Path Tracing (exhaustive direct, diagnostic)";
     case RendererLightingMode::PathTracedRasterPrimaryReSTIRDI:
         return "Path Tracing";
+    case RendererLightingMode::PathTracedRasterPrimaryReSTIRPT:
+        return "Path Tracing (ReSTIR PT Enhanced, experimental)";
     }
 
     return "Unknown";

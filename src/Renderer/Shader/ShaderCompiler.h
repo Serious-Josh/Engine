@@ -128,6 +128,10 @@ class ShaderCompiler
     // -enable-16bit-types, which SharcTypes.h requires. Like the profile, a pure function of the path; every other shader
     // keeps its arguments, so no other DXIL changes.
     static bool UsesNative16BitTypes(const std::filesystem::path& shaderPath);
+    // M5.1 T-2.1 (ReSTIR PT Enhanced, configuration B): shaders under a ReSTIRPT/ directory compile with -Gis (strict IEEE:
+    // no reassociation or contraction), so a shift evaluates exactly what capture cached when given the same inputs. Like
+    // the profile, a pure function of the path; every other shader keeps its arguments, so no other DXIL changes.
+    static bool UsesStrictFloatingPoint(const std::filesystem::path& shaderPath);
 
     private:
     // Logs through Engine when diagnostics is null; otherwise appends to it.

@@ -21,6 +21,7 @@
 #include <memory>
 #include <set>
 
+class ComputePipeline;
 class DescriptorHeap;
 class GraphicsDevice;
 class RenderTarget;
@@ -510,6 +511,37 @@ class PathTraceReferencePass
         bool rawDiffuseHitDistance = false,
         D3D12_GPU_VIRTUAL_ADDRESS psrGBufferConstants = 0,
         D3D12_GPU_VIRTUAL_ADDRESS psrGBufferTransforms = 0);
+
+    // M5.1 ReSTIR PT Enhanced (configuration B): records the unified initial path sampling in the split passes' place. The
+    // pipeline (ReSTIRPTPass::GetInitialPipeline) has this pass's root signature (TLAS, accumulation, output, statistics,
+    // b0, b1) plus RestirPtConstants at b2, and writes this pass's accumulation, output and statistics and, with extract,
+    // its diffuse and specular extraction textures (and, with rawDiffuseHitDistance, the raw diffuse hit distance), so
+    // every consumer of those reads configuration B's frame unchanged. Timed in RestirPtInitial. Records nothing when the
+    // extent differs or extraction is requested without its textures.
+    void ExecuteReSTIRPT(
+        ID3D12GraphicsCommandList* commandList,
+        GpuTimestampProfiler& profiler,
+        unsigned int frameIndex,
+        DescriptorHeap& descriptorHeap,
+        const RayTracingSceneResources& rayTracingScene,
+        D3D12_GPU_VIRTUAL_ADDRESS constantsAddress,
+        D3D12_GPU_VIRTUAL_ADDRESS sceneLightConstantsAddress,
+        unsigned int width,
+        unsigned int height,
+        const ComputePipeline& pipeline,
+        D3D12_GPU_VIRTUAL_ADDRESS restirPtConstantsAddress,
+        D3D12_GPU_VIRTUAL_ADDRESS restirPtTransformsAddress,
+        bool extract,
+        bool rawDiffuseHitDistance,
+        // M5.3: the spatial pre-pass and resample pipelines (same bindings), dispatched after the initial pass when given.
+        const ComputePipeline* spatialPairs = nullptr,
+        const ComputePipeline* spatialResample = nullptr,
+        // M5.4 C1: the temporal reuse pass (same bindings), dispatched between the initial pass and spatial reuse when given.
+        const ComputePipeline* temporalPass = nullptr,
+        // M5.4 C5: the replay dispatch's constants (replay compaction); 0 for none.
+        D3D12_GPU_VIRTUAL_ADDRESS replayConstantsAddress = 0,
+        // M5.4 C7: the duplication map pass, after the final reservoirs; null for none.
+        const ComputePipeline* duplication = nullptr);
 
     // PSR.2 Stage 3A (development, default off): creates, on first use, the PSR.2 lighting pair, the PSR.1c-A split
     // pair built with G-buffer storage (PATH_TRACE_PSR_GBUFFER) and its DI.1/GI.6 twins. A failure is sticky.

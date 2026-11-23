@@ -18,6 +18,8 @@ namespace
             return "Raster Primary";
         case RendererLightingMode::PathTracedRasterPrimaryReSTIRDI:
             return "Path Tracing (ReSTIR DI)";
+        case RendererLightingMode::PathTracedRasterPrimaryReSTIRPT:
+            return "Path Tracing (ReSTIR PT Enhanced)";
         }
 
         return "?";

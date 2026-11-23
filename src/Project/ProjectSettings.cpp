@@ -49,6 +49,9 @@ namespace
         {ProjectPathTraceDenoiser::NrdRelax, "nrdRelax"},
         {ProjectPathTraceDenoiser::NrdHybrid, "nrdHybrid"},
         {ProjectPathTraceDenoiser::DlssRayReconstruction, "dlssRayReconstruction"}};
+    constexpr std::pair<ProjectPathTraceEstimator, std::string_view> kEstimators[] = {
+        {ProjectPathTraceEstimator::ReSTIRDI, "restirDI"},
+        {ProjectPathTraceEstimator::ReSTIRPTEnhanced, "restirPTEnhanced"}};
     constexpr std::pair<ProjectPathTraceDenoiserView, std::string_view> kDenoiserViews[] = {
         {ProjectPathTraceDenoiserView::Normal, "normal"},
         {ProjectPathTraceDenoiserView::Temporal, "temporal"},
@@ -291,6 +294,8 @@ namespace
             PT::MaximumUncertaintyFloorLog10);
 
         pathTracingReader.Child("sharc").Bool("enabled", pathTracing.sharc);
+        // M5.1: an older file has no estimator, so it keeps ReSTIR DI.
+        pathTracingReader.Name("estimator", pathTracing.estimator, kEstimators);
         // PT.1: an older file's rendering.pathTracing.caustics block (removed estimators) is ignored.
     }
 
@@ -482,6 +487,11 @@ std::string_view ToSerializedName(ProjectPathTraceDenoiser value)
     return NameOf(kDenoisers, value);
 }
 
+std::string_view ToSerializedName(ProjectPathTraceEstimator value)
+{
+    return NameOf(kEstimators, value);
+}
+
 std::string_view ToSerializedName(ProjectPathTraceDenoiserView value)
 {
     return NameOf(kDenoiserViews, value);
@@ -624,6 +634,7 @@ namespace ProjectSettingsFile
         denoising["uncertaintyFloorLog10"] = pt.uncertaintyFloorLog10;
 
         ObjectMember(pathTracing, "sharc")["enabled"] = pt.sharc;
+        pathTracing["estimator"] = ToSerializedName(pt.estimator);
         // PT.1: the removed estimators' block is not carried forward from an older file.
         pathTracing.erase("caustics");
 

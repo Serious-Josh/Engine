@@ -1063,6 +1063,12 @@ void DeployRuntimeFiles(const Request& request, const AssetID& sceneAssetID,
             "renders NRD Hybrid and nvngx_dlssd.dll is not deployed.");
     }
 
+    if(rendering.pathTracing.estimator == ProjectPathTraceEstimator::ReSTIRPTEnhanced)
+    {
+        Log::Info("Build Game: the project selects ReSTIR PT Enhanced (M5, experimental, Editor only); the packaged game "
+            "renders ReSTIR DI.");
+    }
+
     const bool dlssUsable = rendering.lightingMode == ProjectLightingMode::PathTracing && rendering.pathTracing.dlss &&
         rendering.pathTracing.denoiser != ProjectPathTraceDenoiser::Off;
 

@@ -607,6 +607,12 @@ void Editor::DrawRenderingSettingsCategory(const DebugUI& debugUI, bool editable
         ImGui::EndDisabled();
 
         ImGui::SeparatorText("Path tracing and denoising");
+        const char* estimators[] = {"ReSTIR DI (production)", "ReSTIR PT Enhanced (experimental)"};
+        DraftCombo("PT estimator", pathTracing.estimator, estimators);
+        Tooltip("ReSTIR DI with the indirect path tracer is production. ReSTIR PT Enhanced (M5, experimental, Editor only)\n"
+            "samples direct and indirect light into one path reservoir; it runs without PSR and SHARC, and packaged games\n"
+            "always render ReSTIR DI.");
+        SessionOverrideNote(debugUI, Field::estimator);
         ImGui::Checkbox("PT camera jitter (experimental)", &pathTracing.cameraJitter);
         SessionOverrideNote(debugUI, Field::cameraJitter);
         const char* denoisers[] = {"Off", "Engine", "NRD REBLUR (experimental)", "NRD RELAX (experimental)",

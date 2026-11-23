@@ -101,6 +101,8 @@ namespace
             return "Raster primary (verification)";
         case RendererLightingMode::PathTracedRasterPrimaryReSTIRDI:
             return "Path Tracing";
+        case RendererLightingMode::PathTracedRasterPrimaryReSTIRPT:
+            return "Path Tracing (ReSTIR PT Enhanced, experimental)";
         case RendererLightingMode::Legacy:
         default:
             return "Legacy";
@@ -1773,7 +1775,7 @@ void Engine::ReportPackagedLightingMode(double renderMilliseconds)
 
     const PathTraceReferenceStatus& pathTrace = m_renderer.GetPathTraceReferenceStatus();
 
-    if(status.active == RendererLightingMode::PathTracedRasterPrimaryReSTIRDI)
+    if(IsRasterPrimaryReSTIRMode(status.active))
     {
         // PS.5F: the effective denoiser, and the requested one while it prepares or after it failed.
         const std::string failure = m_renderer.GetPathTraceDenoiserFailure();

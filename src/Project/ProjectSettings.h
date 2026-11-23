@@ -75,6 +75,15 @@ enum class ProjectPathTraceDenoiser
     DlssRayReconstruction
 };
 
+// M5.1: Path Tracing's light-transport estimator. ReSTIRDI is production (ReSTIR DI direct light plus the indirect path tracer);
+// ReSTIRPTEnhanced is the experimental unified ReSTIR PT Enhanced renderer (configuration B), Editor-only: packaged games
+// always render ReSTIRDI.
+enum class ProjectPathTraceEstimator
+{
+    ReSTIRDI,
+    ReSTIRPTEnhanced
+};
+
 enum class ProjectPathTraceDenoiserView
 {
     Normal,
@@ -144,6 +153,9 @@ struct PathTracingRenderingSettings
     float uncertaintyFloorLog10 = -3.0f;
 
     bool sharc = false;
+
+    // M5.1: serialized as rendering.pathTracing.estimator ("restirDI" | "restirPTEnhanced"); older files keep ReSTIRDI.
+    ProjectPathTraceEstimator estimator = ProjectPathTraceEstimator::ReSTIRDI;
 
     bool operator==(const PathTracingRenderingSettings&) const = default;
 };
@@ -226,6 +238,7 @@ std::string_view ToSerializedName(ProjectPsrMode value);
 std::string_view ToSerializedName(ProjectPsrDebugView value);
 std::string_view ToSerializedName(ProjectDlssQuality value);
 std::string_view ToSerializedName(ProjectPathTraceDenoiser value);
+std::string_view ToSerializedName(ProjectPathTraceEstimator value);
 std::string_view ToSerializedName(ProjectPathTraceDenoiserView value);
 std::string_view ToSerializedName(ProjectPathTraceDenoiserSignal value);
 std::string_view ToSerializedName(ProjectVolumetricQuality value);

@@ -197,7 +197,9 @@ ConfigurationReadiness Renderer::EvaluateConfigurationReadiness(const RenderingC
     const RendererLightingMode mode = configuration.lightingMode;
     const bool pathTraced = mode != RendererLightingMode::Legacy;
     const bool restirDI = mode == RendererLightingMode::PathTracedRasterPrimaryReSTIRDI;
-    const bool rasterPrimary = restirDI || mode == RendererLightingMode::PathTracedRasterPrimary;
+    // M5.1: ReSTIR PT Enhanced is a raster-primary mode (denoisers, DLSS) without PSR or SHARC.
+    const bool restirPT = mode == RendererLightingMode::PathTracedRasterPrimaryReSTIRPT;
+    const bool rasterPrimary = restirDI || restirPT || mode == RendererLightingMode::PathTracedRasterPrimary;
     const RenderScale requestedScale = static_cast<RenderScale>(configuration.renderScaleIndex);
 
     // Identity: what preparation depends on, as RecordRenderFrame and ResizeScene derive it.
@@ -206,7 +208,7 @@ ConfigurationReadiness Renderer::EvaluateConfigurationReadiness(const RenderingC
     requirements.psrChain = restirDI && configuration.pathTrace.primarySurfaceReplacementInPlace &&
         configuration.pathTrace.maxPathDepth > 0u ?
         (configuration.pathTrace.primarySurfaceReplacementChain >= 2u && configuration.pathTrace.maxPathDepth >= 3u ? 2u : 1u) : 0u;
-    requirements.sharc = rasterPrimary && configuration.sharc.enabled;
+    requirements.sharc = rasterPrimary && !restirPT && configuration.sharc.enabled;
     requirements.nrdReflections = !pathTraced && configuration.reflectionDenoiser == ReflectionDenoiserMode::Nrd;
     requirements.renderScaleIndex = configuration.renderScaleIndex;
     requirements.dlss = configuration.dlssRequested && IsDlssRenderScale(requestedScale);
@@ -324,6 +326,19 @@ ConfigurationReadiness Renderer::EvaluateConfigurationReadiness(const RenderingC
             else if(!m_rtxdiResources.IsInitialized())
             {
                 Combine(resources, Make(ReadinessState::Preparing, "RTXDI reservoirs created on activation"));
+            }
+        }
+
+        // M5.1: ReSTIR PT Enhanced's pipelines, light tiles and counters (its reservoirs follow the render extent).
+        if(restirPT)
+        {
+            if(m_restirPtPass.HasFailed())
+            {
+                Combine(resources, Make(ReadinessState::Failed, "ReSTIR PT: " + m_restirPtPass.GetFailure()));
+            }
+            else if(!m_restirPtPass.IsInitialized())
+            {
+                Combine(resources, Make(ReadinessState::Preparing, "ReSTIR PT pipelines created on activation"));
             }
         }
 

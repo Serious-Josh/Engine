@@ -19,8 +19,21 @@ enum class RendererLightingMode
     PathTracedRasterPrimary,
     // RTXPT.3: the raster-primary mode with RTXDI initial sampling for direct light at the first vertex
     // (secondary vertices keep exhaustive next-event estimation). Renders Legacy when unavailable.
-    PathTracedRasterPrimaryReSTIRDI
+    PathTracedRasterPrimaryReSTIRDI,
+    // M5.1 ReSTIR PT Enhanced (configuration B; Editor-only, experimental): the raster-primary mode whose direct and
+    // indirect light come from one unified path-space reservoir (ReSTIRPTPass) instead of ReSTIR DI and the indirect path
+    // tracer. It shares the ReSTIR DI mode's primary (RasterReSTIRDI: raster G-buffer, path-tracing targets, denoisers,
+    // DLSS) but uses neither RTXDI, SHARC nor PSR. Renders Legacy when unavailable.
+    PathTracedRasterPrimaryReSTIRPT
 };
+
+// M5.1: the raster-primary modes whose first vertex and denoising follow the Path Tracing (ReSTIR) mode: ReSTIR DI and
+// ReSTIR PT Enhanced. Everything that the two share (preparation, DLSS and denoiser eligibility, status) asks this.
+inline bool IsRasterPrimaryReSTIRMode(RendererLightingMode mode)
+{
+    return mode == RendererLightingMode::PathTracedRasterPrimaryReSTIRDI ||
+        mode == RendererLightingMode::PathTracedRasterPrimaryReSTIRPT;
+}
 
 // How the path tracer forms the first path vertex.
 enum class PathTracePrimary

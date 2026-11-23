@@ -155,8 +155,17 @@ RenderingConfiguration ResolveRenderingConfiguration(const RenderingSettings& se
     const RenderingDiagnostics& diagnostics)
 {
     const PathTracingRenderingSettings& pathTracing = settings.pathTracing;
-    const RendererLightingMode mode = ToRendererLightingMode(settings.lightingMode);
-    const bool isPathTracing = mode == RendererLightingMode::PathTracedRasterPrimaryReSTIRDI;
+    RendererLightingMode mode = ToRendererLightingMode(settings.lightingMode);
+
+    // M5.1: Path Tracing's estimator selects the experimental ReSTIR PT Enhanced mode (the renderer refuses it in packaged
+    // runtimes and renders ReSTIR DI there).
+    if(mode == RendererLightingMode::PathTracedRasterPrimaryReSTIRDI &&
+        pathTracing.estimator == ProjectPathTraceEstimator::ReSTIRPTEnhanced)
+    {
+        mode = RendererLightingMode::PathTracedRasterPrimaryReSTIRPT;
+    }
+
+    const bool isPathTracing = IsRasterPrimaryReSTIRMode(mode);
     const bool isReference = mode == RendererLightingMode::PathTracedReference;
 
     RenderingConfiguration configuration;
@@ -198,7 +207,9 @@ RenderingConfiguration ResolveRenderingConfiguration(const RenderingSettings& se
 
     // SHARC's history prior needs the Engine denoiser to be the selection, whatever the mode.
     configuration.sharc = diagnostics.sharcTuning;
-    configuration.sharc.enabled = isPathTracing && pathTracing.sharc;
+    // M5.1: ReSTIR PT Enhanced runs without SHARC (and without PSR; the renderer ignores its PSR request).
+    configuration.sharc.enabled = isPathTracing && mode != RendererLightingMode::PathTracedRasterPrimaryReSTIRPT &&
+        pathTracing.sharc;
     configuration.sharc.historyPrior = diagnostics.sharcTuning.historyPrior &&
         pathTracing.denoiser == ProjectPathTraceDenoiser::Engine;
 

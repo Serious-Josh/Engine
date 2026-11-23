@@ -5,6 +5,7 @@
 
 #include "Core/Log.h"
 
+#include "Renderer/ComputePipeline.h"
 #include "Renderer/DescriptorHeap.h"
 #include "Renderer/GraphicsDevice.h"
 #include "Renderer/RenderTarget.h"
@@ -2794,6 +2795,150 @@ bool PathTraceReferencePass::EnsureRadianceCacheLearning(
 
     learning.ready = true;
     return true;
+}
+
+void PathTraceReferencePass::ExecuteReSTIRPT(
+    ID3D12GraphicsCommandList* commandList,
+    GpuTimestampProfiler& profiler,
+    unsigned int frameIndex,
+    DescriptorHeap& descriptorHeap,
+    const RayTracingSceneResources& rayTracingScene,
+    D3D12_GPU_VIRTUAL_ADDRESS constantsAddress,
+    D3D12_GPU_VIRTUAL_ADDRESS sceneLightConstantsAddress,
+    unsigned int width,
+    unsigned int height,
+    const ComputePipeline& pipeline,
+    D3D12_GPU_VIRTUAL_ADDRESS restirPtConstantsAddress,
+    D3D12_GPU_VIRTUAL_ADDRESS restirPtTransformsAddress,
+    bool extract,
+    bool rawDiffuseHitDistance,
+    const ComputePipeline* spatialPairs,
+    const ComputePipeline* spatialResample,
+    const ComputePipeline* temporalPass,
+    D3D12_GPU_VIRTUAL_ADDRESS replayConstantsAddress,
+    const ComputePipeline* duplication)
+{
+    m_rawDiffuseHitDistanceWritten = false;
+    m_splitDirectDiffuseWritten = false;
+    m_psrWritten = false;
+    m_psrGuidesWritten = false;
+    m_psrGBufferWritten = false;
+#if PATH_TRACE_SHARC_SPATIAL_DIAGNOSTIC != 0
+    m_sharcDiagnosticWritten = false;
+#endif
+
+    const bool extractionReady = !extract || (m_diffuseTexture.GetResource() && m_specularTexture.GetResource());
+
+    if(!m_initialized || !commandList || width != m_width || height != m_height || !extractionReady ||
+        restirPtConstantsAddress == 0 || restirPtTransformsAddress == 0)
+    {
+        return;
+    }
+
+    const bool raw = extract && rawDiffuseHitDistance && m_rawDiffuseHitDistanceTexture.GetResource();
+    m_accumulationTexture.Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    m_outputTexture.Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    m_statisticsTexture.Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+    if(extract)
+    {
+        m_diffuseTexture.Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        m_specularTexture.Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    }
+
+    if(raw)
+    {
+        m_rawDiffuseHitDistanceTexture.Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    }
+
+    // Every ReSTIR PT kernel shares one root layout; a pipeline change re-binds it.
+    const auto bind = [&](const ComputePipeline& kernel)
+    {
+        kernel.Bind(commandList);
+        commandList->SetComputeRootShaderResourceView(0, rayTracingScene.GetTopLevel().GetGPUAddress());
+        commandList->SetComputeRootDescriptorTable(1, descriptorHeap.GetGPUHandle(m_accumulationTexture.GetUAVIndex()));
+        commandList->SetComputeRootDescriptorTable(2, descriptorHeap.GetGPUHandle(m_outputTexture.GetUAVIndex()));
+        commandList->SetComputeRootDescriptorTable(3, descriptorHeap.GetGPUHandle(m_statisticsTexture.GetUAVIndex()));
+        commandList->SetComputeRootConstantBufferView(4, constantsAddress);
+        commandList->SetComputeRootConstantBufferView(5, sceneLightConstantsAddress);
+        commandList->SetComputeRootConstantBufferView(6, restirPtConstantsAddress);
+        // M5.1-4: the per-instance transforms (t1); the caller always provides at least one record.
+        commandList->SetComputeRootShaderResourceView(7, restirPtTransformsAddress);
+    };
+    // One thread per pixel in 8 x 8 groups (RESTIR_PT_GROUP_SIZE).
+    const UINT groupsX = (width + 7u) / 8u;
+    const UINT groupsY = (height + 7u) / 8u;
+
+    profiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::RestirPtInitial);
+    bind(pipeline);
+    BeginPathTraceEvent(commandList, L"Engine/PT/ReSTIRPT/InitialSampling");
+    commandList->Dispatch(groupsX, groupsY, 1);
+    EndPathTraceEvent(commandList);
+    profiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::RestirPtInitial);
+
+    // The reservoirs and pair records are raw buffers reached through the descriptor heap, so a global UAV barrier orders
+    // each step after the initial pass.
+    D3D12_RESOURCE_BARRIER ordering{};
+    ordering.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    ordering.UAV.pResource = nullptr;
+
+    // M5.4 C1: temporal reuse in its own pass: it resamples the stored canonical reservoirs with history in place and,
+    // without spatial reuse, forms the image.
+    if(temporalPass)
+    {
+        commandList->ResourceBarrier(1, &ordering);
+        profiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::RestirPtTemporal);
+        bind(*temporalPass);
+        BeginPathTraceEvent(commandList, L"Engine/PT/ReSTIRPT/Temporal");
+        commandList->Dispatch(groupsX, groupsY, 1);
+        EndPathTraceEvent(commandList);
+
+        // M5.4 C5: the deferred (replaying) pixels over the compacted list, with the replay constants (same bindings).
+        if(replayConstantsAddress != 0)
+        {
+            commandList->ResourceBarrier(1, &ordering);
+            commandList->SetComputeRootConstantBufferView(6, replayConstantsAddress);
+            BeginPathTraceEvent(commandList, L"Engine/PT/ReSTIRPT/TemporalReplay");
+            commandList->Dispatch(groupsX, groupsY, 1);
+            EndPathTraceEvent(commandList);
+        }
+
+        profiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::RestirPtTemporal);
+    }
+
+    // M5.3 paired spatial reuse: the pre-pass reads the initial pass's (scratch) reservoirs and writes the pair records;
+    // the resample pass reads both and writes the final reservoirs and the image.
+    if(spatialPairs && spatialResample)
+    {
+        commandList->ResourceBarrier(1, &ordering);
+        profiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::RestirPtSpatialPairs);
+        bind(*spatialPairs);
+        BeginPathTraceEvent(commandList, L"Engine/PT/ReSTIRPT/SpatialPairs");
+        commandList->Dispatch(groupsX, groupsY, 1);
+        EndPathTraceEvent(commandList);
+        profiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::RestirPtSpatialPairs);
+        commandList->ResourceBarrier(1, &ordering);
+        profiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::RestirPtSpatialResample);
+        bind(*spatialResample);
+        BeginPathTraceEvent(commandList, L"Engine/PT/ReSTIRPT/SpatialResample");
+        commandList->Dispatch(groupsX, groupsY, 1);
+        EndPathTraceEvent(commandList);
+        profiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::RestirPtSpatialResample);
+    }
+
+    // M5.4 C7: the duplication map of the final reservoirs.
+    if(duplication)
+    {
+        commandList->ResourceBarrier(1, &ordering);
+        profiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::RestirPtDuplication);
+        bind(*duplication);
+        BeginPathTraceEvent(commandList, L"Engine/PT/ReSTIRPT/Duplication");
+        commandList->Dispatch(groupsX, groupsY, 1);
+        EndPathTraceEvent(commandList);
+        profiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::RestirPtDuplication);
+    }
+    m_rawDiffuseHitDistanceWritten = raw;
+    RecordOutputBarriers(commandList, extract);
 }
 
 void PathTraceReferencePass::RecordOutputBarriers(ID3D12GraphicsCommandList* commandList, bool extract)

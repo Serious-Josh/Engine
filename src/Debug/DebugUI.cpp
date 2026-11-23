@@ -1515,6 +1515,16 @@ void DebugUI::DrawPathTraceReferenceSettings()
     const bool isPathTracing = lightingMode == ProjectLightingMode::PathTracing;
     const bool reference = lightingMode == ProjectLightingMode::ReferencePathTracer;
 
+    // M5.1: Path Tracing's light-transport estimator. ReSTIR PT Enhanced (configuration B) is experimental and Editor-only.
+    if(isPathTracing)
+    {
+        const char* estimators[] = {"ReSTIR DI (production)", "ReSTIR PT Enhanced (experimental)"};
+        ImGui::BeginDisabled(preparing);
+        OverrideCombo("PT estimator", effective.pathTracing.estimator, estimators, IM_ARRAYSIZE(estimators),
+            overrides.estimator, RenderingOverrideField::estimator);
+        ImGui::EndDisabled();
+    }
+
     const char* visibilityModes[] = {"TraceRay (Original)", "RayQuery (GI.6)"};
     ImGui::Text("Active primary DI shadows: %s", PrimaryDiShadowBackendName());
     ImGui::Text("Active secondary shadows: %s", visibilityModes[m_secondaryShadowActive ? 1 : 0]);

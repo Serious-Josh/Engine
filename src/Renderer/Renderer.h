@@ -62,6 +62,7 @@
 #include "Passes/PresentationResolvePass.h"
 #include "Passes/DlssInputPreparationPass.h"
 #include "Passes/RrInputPreparationPass.h"
+#include "Passes/ReSTIRPTPass.h"
 #include "Passes/AutoExposurePass.h"
 #include "Upscaling/DlssBackend.h"
 #include "Passes/DeferredLightingPass.h"
@@ -1670,6 +1671,18 @@ class Renderer
 
     static PathTraceWorkloadModel EstimatePathTraceWorkload(const PathTraceWorkloadInputs& inputs) noexcept;
 
+    // M5.1: whether this frame's sampled light structures can be trusted by the guard (its structuresReady input). The
+    // structures a frame samples are rebuilt or updated and published for exactly that frame's table, so sampling is
+    // available unless publication fails; the last recorded publication is the evidence. It must have succeeded for a table
+    // of the same light count (a changed count is a new table: its first frame is priced exhaustively, as before). The
+    // lighting revision does not matter: revision-0 content is rebuilt every frame and published just the same. If
+    // publication fails after all, the existing per-frame fail-safe drops the table lights rather than run exhaustively.
+    static bool SampledLightStructuresTrusted(bool lastPublicationAvailable, std::uint32_t lastPublishedLightCount,
+        std::uint32_t tableLights) noexcept
+    {
+        return lastPublicationAvailable && tableLights != 0 && lastPublishedLightCount == tableLights;
+    }
+
     private:
     PathTraceWorkloadModel m_pathTraceWorkloadModel;
     bool m_pathTraceWorkloadGuarded = false;
@@ -1680,7 +1693,7 @@ class Renderer
     // M4.1: builds (or reuses, for the same non-zero revision) the shared light-sampling structures of the frame's published
     // light table and records their publication; returns the frame's LightSamplingConstants address (0 when disabled).
     D3D12_GPU_VIRTUAL_ADDRESS RecordLightSampling(ID3D12GraphicsCommandList* commandList, const FrameLighting& lighting,
-        std::uint64_t lightingRevision, bool regirFrame);
+        std::uint64_t lightingRevision, bool regirFrame, bool restirPtFrame);
     bool m_lightSamplingEnabled = false;
     // M4.3.5: built every frame (ENGINE_LIGHT_SAMPLING=1, sampled NEE), not only on ReGIR frames.
     bool m_lightSamplingAlways = false;
@@ -1719,6 +1732,10 @@ class Renderer
     SampledIndirectNeeReport m_sampledNeeReport;
     bool m_sampledNeeFallbackLogged = false;
     LightSamplingReport m_lightSamplingReport;
+    // M5.1 guard fix: the light count of the table the last recorded publication sampled (0 when that publication failed or
+    // nothing was published). Unlike m_lightSamplingCacheTable it is kept for every lighting revision, including revision 0
+    // (content not identified), whose structures are rebuilt and published for exactly that frame's table.
+    std::uint32_t m_lightSamplingPublishedLightCount = 0;
     bool m_lightSamplingFailing = false;
     std::shared_ptr<const FrameLighting> m_frameLightingCache;
     std::uint64_t m_frameLightingCacheRevision = 0;
@@ -2254,6 +2271,36 @@ private:
     RtxdiResources m_rtxdiResources;
     bool m_rtxdiResourcesFailed = false;
     void EnsureRtxdiResources();
+
+    // M5.1 ReSTIR PT Enhanced (configuration B; Editor-only, experimental). The pass is created on the mode's first request
+    // (EnsureReSTIRPT: pipelines, light tiles, counters) and released at shutdown; its reservoirs follow the render extent
+    // and are released with the path-tracing textures. m_restirPtSettings are the published defaults, overridden only by
+    // the ENGINE_RESTIR_PT_* diagnostics (Initialize) and the M5.1 harnesses. m_restirPtFrameLastFrame: the last recorded
+    // path-traced frame ran configuration B.
+    ReSTIRPTPass m_restirPtPass;
+    ReSTIRPTSettings m_restirPtSettings;
+    PathTraceModeAvailability m_restirPtAvailability;
+    std::uint32_t m_restirPtFrame = 0;
+    bool m_restirPtFrameLastFrame = false;
+    // M5.3: whether the last configuration B recording ran spatial reuse.
+    bool m_restirPtSpatialLastFrame = false;
+    bool m_restirPtFrameThisFrame = false;
+    bool EnsureReSTIRPT();
+    bool m_restirPtSamplingFailureLogged = false;
+    // M5.1-4 (M5.2 prerequisite): this frame's per-instance transforms (by TLAS InstanceID = render-object index) and the
+    // original reconnection criteria's minimum distance (2% of the smallest dimension of the scene's world bounds), from
+    // the scene's render objects. Only on configuration B frames.
+    void PrepareReSTIRPTTransforms(const Scene& scene);
+    std::vector<ReSTIRPTInstanceTransform> m_restirPtTransforms;
+    float m_restirPtReconnectionMinDistance = 0.0f;
+    void RecordReSTIRPTFrame(ID3D12GraphicsCommandList* commandList, unsigned int frameIndex,
+        D3D12_GPU_VIRTUAL_ADDRESS constantsAddress, D3D12_GPU_VIRTUAL_ADDRESS sceneLightConstantsAddress,
+        const FrameLighting& frameLighting, const PathTraceReferenceSettings& settings, const Matrix4& view,
+        const Matrix4& projection, bool extract, bool rawExtraction);
+    // M5.2: the signature the B frame's reservoirs are computed against (temporal history reuse requires a match).
+    ReSTIRPTHistorySignature MakeReSTIRPTHistorySignature(const PathTraceReferenceSettings& settings) const;
+    // M5.2: why the most recent B frame did or did not read history (diagnostics and the harness).
+    ReSTIRPTHistoryDecision m_restirPtHistoryDecision = ReSTIRPTHistoryDecision::NoCommittedFrame;
 
     // RTXPT.1A.2 bundled GGX single-scatter complement tables, required by the path tracer only. Loaded and
     // published once during Initialize; immutable afterwards; released in Shutdown after the final drain.
@@ -2868,6 +2915,7 @@ private:
     PathTraceRasterPrimaryStatus m_rasterPrimaryStatus;
     void EvaluatePathTraceRasterPrimary();
     void EvaluatePathTraceReSTIRDI();
+    void EvaluatePathTraceReSTIRPT();
 
     // Prepares this recording's RTXDI frame (light set, SDK buffer indices, reuse inputs, constants b2) and
     // leaves the reservoir buffer in UNORDERED_ACCESS. The frame stays pending until CommitFrame after

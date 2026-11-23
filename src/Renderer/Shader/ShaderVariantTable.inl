@@ -972,3 +972,28 @@
 // resampling (NVIDIA's multi-bounce feedback), compiled as lib_6_9 with -enable-16bit-types (SharcNv/ variant tree).
 {"SharcNv/PathTraceSharcNvTrainingSM69.hlsl", "PathTraceReference.hlsl",
     "SHARC_UPDATE=1 PATH_TRACE_SHARC_NV_TRAINING=1", "PathTraceSharcNvTraining.hlsli"},
+
+// ---- ReSTIRPT ----
+// M5.1 ReSTIR PT Enhanced (configuration B, Editor-only, experimental): the unified initial path sampling as a compute
+// shader (cs_6_6, entry RestirPtInitialCS), compiled from PathTraceReference.hlsl in its compute form so it shares the
+// surfaces, lights, BSDF primitives and inline radiance tracing: PATH_TRACE_DIRECT_COMPUTE (inline radiance rays),
+// PATH_TRACE_SECONDARY_SHADOW_RAY_QUERY (inline visibility), PATH_TRACE_RAW_DIFFUSE_HIT_DISTANCE_LIBRARY (the raw-distance
+// constant row). PATH_TRACE_RESTIR_PT_LIBRARY marks the build; the path tree itself is ReSTIRPT/RestirPtInitialBody.hlsli.
+// No production library includes it.
+{"ReSTIRPT/RestirPtInitial.hlsl", "PathTraceReference.hlsl",
+    "PATH_TRACE_DIRECT_COMPUTE=1 PATH_TRACE_SECONDARY_SHADOW_RAY_QUERY=1 PATH_TRACE_RAW_DIFFUSE_HIT_DISTANCE_LIBRARY=1 "
+    "PATH_TRACE_RESTIR_PT_LIBRARY=1", "ReSTIRPT/RestirPtInitialBody.hlsli"},
+// M5.2: the same kernel with temporal reuse compiled in (RESTIR_PT_TEMPORAL), selected while temporal reuse is on; the
+// row above carries none of the temporal code.
+{"ReSTIRPT/RestirPtInitialTemporal.hlsl", "PathTraceReference.hlsl",
+    "PATH_TRACE_DIRECT_COMPUTE=1 PATH_TRACE_SECONDARY_SHADOW_RAY_QUERY=1 PATH_TRACE_RAW_DIFFUSE_HIT_DISTANCE_LIBRARY=1 "
+    "PATH_TRACE_RESTIR_PT_LIBRARY=1 RESTIR_PT_TEMPORAL=1", "ReSTIRPT/RestirPtInitialBody.hlsli"},
+// M5.2 C0: test-only variants of the same kernel, isolated so production B never compiles their state (it lowered
+// occupancy): the T-2.1 self-shift and its diagnostics (RESTIR_PT_DIAGNOSTICS), and the reconnection visibility bench
+// (RESTIR_PT_VISIBILITY_BENCH). ReSTIRPTPass selects one only when its diagnostic setting is on.
+{"ReSTIRPT/RestirPtInitialDiagnostics.hlsl", "PathTraceReference.hlsl",
+    "PATH_TRACE_DIRECT_COMPUTE=1 PATH_TRACE_SECONDARY_SHADOW_RAY_QUERY=1 PATH_TRACE_RAW_DIFFUSE_HIT_DISTANCE_LIBRARY=1 "
+    "PATH_TRACE_RESTIR_PT_LIBRARY=1 RESTIR_PT_DIAGNOSTICS=1", "ReSTIRPT/RestirPtInitialBody.hlsli"},
+{"ReSTIRPT/RestirPtInitialVisibilityBench.hlsl", "PathTraceReference.hlsl",
+    "PATH_TRACE_DIRECT_COMPUTE=1 PATH_TRACE_SECONDARY_SHADOW_RAY_QUERY=1 PATH_TRACE_RAW_DIFFUSE_HIT_DISTANCE_LIBRARY=1 "
+    "PATH_TRACE_RESTIR_PT_LIBRARY=1 RESTIR_PT_VISIBILITY_BENCH=1", "ReSTIRPT/RestirPtInitialBody.hlsli"},

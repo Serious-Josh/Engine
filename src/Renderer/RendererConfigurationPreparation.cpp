@@ -299,13 +299,13 @@ bool Renderer::IsPresentedDlssEligible() const
     // scene is sized once for it and the switch needs no second resize. No DLSS work runs in those frames.
     if(status.startupPreparing)
     {
-        return status.pending && status.pending->lightingMode == RendererLightingMode::PathTracedRasterPrimaryReSTIRDI &&
+        return status.pending && IsRasterPrimaryReSTIRMode(status.pending->lightingMode) &&
             status.pending->denoiser != PathTraceDenoiserMode::Off;
     }
 
     const RenderingConfiguration& presented = m_configurationPreparation.GetPresented();
 
-    if(presented.lightingMode != RendererLightingMode::PathTracedRasterPrimaryReSTIRDI ||
+    if(!IsRasterPrimaryReSTIRMode(presented.lightingMode) ||
         presented.denoiser == PathTraceDenoiserMode::Off || !m_denoiserPreparation.empty())
     {
         return false;

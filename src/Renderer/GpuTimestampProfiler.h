@@ -86,6 +86,17 @@ class GpuTimestampProfiler
         RrInputPreparation,
         // RR.1C: the NGX Ray Reconstruction evaluation (in DlssEvaluate's place on RR frames).
         RrEvaluate,
+        // M5.1 ReSTIR PT Enhanced (configuration B): the light-tile presampling and the unified initial path sampling, in
+        // the split passes' place inside PathTraceReference on ReSTIR PT frames.
+        RestirPtLightTiles,
+        RestirPtInitial,
+        // M5.3: the paired spatial reuse's pre-pass (shifts into partners) and resampling pass.
+        RestirPtSpatialPairs,
+        RestirPtSpatialResample,
+        // M5.4 C1: temporal reuse in its own pass, after the initial sampling (one sample per frame).
+        RestirPtTemporal,
+        // M5.4 C7: the duplication map of the final reservoirs (when on).
+        RestirPtDuplication,
         Count
     };
 

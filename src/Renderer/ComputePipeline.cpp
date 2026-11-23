@@ -14,6 +14,11 @@ bool ComputePipeline::Initialize(
 
     rootParameters.reserve(description.rootParameters.size());
 
+    // M5.1: descriptor-table parameters (one range each), as RayTracingPipeline builds them; reserved up front so the
+    // parameters' range pointers stay valid. Pipelines without tables build exactly the root signature they did before.
+    std::vector<D3D12_DESCRIPTOR_RANGE> descriptorRanges;
+    descriptorRanges.reserve(description.rootParameters.size());
+
     for (const RootParameterDescription& parameterDescription : description.rootParameters)
     {
         D3D12_ROOT_PARAMETER parameter{};
@@ -42,6 +47,22 @@ bool ComputePipeline::Initialize(
             parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
             parameter.Descriptor.ShaderRegister = parameterDescription.shaderRegister;
             parameter.Descriptor.RegisterSpace = 0;
+            break;
+        }
+        case RootParameterType::DescriptorTable:
+        {
+            D3D12_DESCRIPTOR_RANGE range{};
+            range.RangeType = parameterDescription.descriptorRangeType == DescriptorRangeType::UnorderedAccess ?
+                D3D12_DESCRIPTOR_RANGE_TYPE_UAV : D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+            range.NumDescriptors = parameterDescription.descriptorCount;
+            range.BaseShaderRegister = parameterDescription.shaderRegister;
+            range.RegisterSpace = 0;
+            range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+            descriptorRanges.push_back(range);
+
+            parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            parameter.DescriptorTable.NumDescriptorRanges = 1;
+            parameter.DescriptorTable.pDescriptorRanges = &descriptorRanges.back();
             break;
         }
         }
