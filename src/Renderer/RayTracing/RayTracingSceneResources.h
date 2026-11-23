@@ -292,6 +292,18 @@ class RayTracingSceneResources
 
     const TopLevelAccelerationStructure& GetTopLevel() const;
 
+    // M5.5 Stage 1 (ReSTIR PT history scene): the active membership's TLAS instances and the BLAS view its builds and updates
+    // index (bottomLevelIndex), as Update() passes them.
+    const std::vector<RayTracingInstanceDescription>& GetActiveInstances() const
+    {
+        return m_membership->instances;
+    }
+
+    const std::vector<const BottomLevelAccelerationStructure*>& GetBottomLevelPointers() const
+    {
+        return m_blasRegistry.bottomLevelPointers;
+    }
+
     unsigned int GetInstanceDataDescriptorIndex() const;
 #ifndef NDEBUG
     // M0c.4 diagnostics (Debug only, CPU only): the active membership's staged records, the ones uploaded for the GPU, against

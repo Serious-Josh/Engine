@@ -2097,6 +2097,11 @@ private:
     bool m_psrTemporalLastFrame = false;
     // Whether the last path-traced frame recorded the PSR.2 lighting pair.
     bool m_psrLightingLastFrame = false;
+    // M5.5 guide-only PSR for ReSTIR PT (configuration B): requested and prepared this frame (eligibility marking in the
+    // geometry pass, replacement after lighting and the previous G-buffer copy), and whether it replaced the G-buffer for
+    // RR's guides this frame. B's lighting estimator never reads the replaced G-buffer.
+    bool m_psrGuideOnlyThisFrame = false;
+    bool m_psrGuideOnlyLastFrame = false;
 
     BRDFIntegrationPass m_brdfIntegrationPass;
 

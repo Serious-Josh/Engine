@@ -3362,6 +3362,20 @@ bool Renderer::Initialize(
         const std::string duplication = environment("ENGINE_RESTIR_PT_DUPLICATION");
         m_restirPtSettings.duplication = duplication == "apply" ? ReSTIRPTSettings::Duplication::Apply :
             duplication == "measure" ? ReSTIRPTSettings::Duplication::Measure : ReSTIRPTSettings::Duplication::Off;
+        // M5.5-B experiments (unpackaged diagnostics, off by default): ENGINE_RESTIR_PT_DECORRELATE=<p> final-shading
+        // decorrelation probability (0..1); ENGINE_RESTIR_PT_CONFIDENCE_CAP=<n> the temporal confidence cap (20).
+        if(const std::string decorrelate = environment("ENGINE_RESTIR_PT_DECORRELATE"); !decorrelate.empty())
+        {
+            m_restirPtSettings.decorrelation = std::clamp(std::stof(decorrelate), 0.0f, 1.0f);
+        }
+
+        // M5.5 Stage 1: ENGINE_RESTIR_PT_HISTORY_SCENE=1 evaluates temporal-domain shifts in the history scene.
+        m_restirPtSettings.historyScene = environment("ENGINE_RESTIR_PT_HISTORY_SCENE") == "1";
+
+        if(const std::string cap = environment("ENGINE_RESTIR_PT_CONFIDENCE_CAP"); !cap.empty())
+        {
+            m_restirPtSettings.temporalConfidenceCap = (std::max)(1u, static_cast<std::uint32_t>(std::stoul(cap)));
+        }
         // M5.3: ENGINE_RESTIR_PT_SPATIAL=1 turns on paired spatial reuse (off by default until M5.3 is reviewed);
         // ENGINE_RESTIR_PT_SPATIAL_COLOUR=0 shades with F(Y) W in place of colour-noise reduction.
         m_restirPtSettings.spatial = environment("ENGINE_RESTIR_PT_SPATIAL") == "1";
@@ -6915,7 +6929,7 @@ bool Renderer::RecordPsrInPlaceReplacement(ID3D12GraphicsCommandList* commandLis
         transforms.size() * sizeof(PsrInPlaceReplacePass::ObjectTransform), D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT);
 
     // PSR.2 Stage 3A: the lighting pair recovers each mirror with this pass's camera and transforms.
-    if(m_psrLightingThisFrame && constantsAddress != 0 && transformsAddress != 0)
+    if((m_psrLightingThisFrame || m_psrGuideOnlyThisFrame) && constantsAddress != 0 && transformsAddress != 0)
     {
         PathTracePsrGBufferConstants lighting{};
         lighting.cameraRelativeViewProjection = constants.cameraRelativeViewProjection;
@@ -7279,6 +7293,35 @@ void Renderer::RecordReSTIRPTFrame(ID3D12GraphicsCommandList* commandList, unsig
     constants.cameraForward[1] = view.m[2][1];
     constants.cameraForward[2] = view.m[2][2];
 
+    // M5.5 temporal correctness, Stage 1 (ENGINE_RESTIR_PT_HISTORY_SCENE=1): shifts into the temporal domain trace the
+    // history scene, a TLAS of the committed frame's instances over this frame's BLASes (same geometry identity only).
+    // This recording's instances become the next frame's history scene when it commits.
+    if(m_restirPtSettings.historyScene && m_restirPtSettings.temporal && constants.historyValid != 0u)
+    {
+        const std::uint32_t historyScene = m_restirPtPass.PrepareHistoryScene(m_graphicsDevice.GetRayTracingDevice(),
+            m_commandContext.GetRayTracingCommandList(), frameIndex, m_resourceDescriptorHeap,
+            m_rayTracingScene.GetTLASGeometryIdentity(), m_rayTracingScene.GetBottomLevelPointers());
+
+        if(historyScene != 0xFFFFFFFFu)
+        {
+            constants.historySceneIndex = historyScene;
+            constants.flags |= 1u << 29;
+        }
+
+        // Diagnostics: one line when it first engages, and whenever it fails to while history is valid.
+        static bool historySceneLogged = false;
+
+        if(!historySceneLogged || historyScene == 0xFFFFFFFFu)
+        {
+            Log::Info(std::string("ReSTIR PT history scene: ") + (historyScene != 0xFFFFFFFFu ? "active" :
+                "unavailable this frame") + " (" + std::to_string(m_rayTracingScene.GetActiveInstances().size()) +
+                " instances).");
+            historySceneLogged = historySceneLogged || historyScene != 0xFFFFFFFFu;
+        }
+    }
+
+    m_restirPtPass.SetPendingScene(m_rayTracingScene.GetActiveInstances(), m_rayTracingScene.GetTLASGeometryIdentity());
+
     if(constants.historyValid != 0u)
     {
         constants.previousDepthIndex = previousGBuffer.depthIndex;
@@ -7440,6 +7483,9 @@ void Renderer::PrepareReSTIRPTTransforms(const Scene& scene)
             sizeof(presentation.currentModel.m)) == 0;
         const Matrix4 previousToCurrent = unchanged ? Matrix4::Identity() :
             presentation.currentModel * presentation.previousModel.Inverse();
+        // M5.5 Stage 1: the history scene's transforms (exactly the current ones for an unmoved instance).
+        const Matrix4 previousModel = unchanged ? model : presentation.previousModel;
+        const Matrix4 previousInverse = unchanged ? inverse : presentation.previousModel.Inverse();
 
         for(int row = 0; row < 3; ++row)
         {
@@ -7448,6 +7494,8 @@ void Renderer::PrepareReSTIRPTTransforms(const Scene& scene)
                 record.objectToWorld[row * 4 + column] = model.m[row][column];
                 record.worldToObject[row * 4 + column] = inverse.m[row][column];
                 record.previousToCurrent[row * 4 + column] = previousToCurrent.m[row][column];
+                record.previousObjectToWorld[row * 4 + column] = previousModel.m[row][column];
+                record.previousWorldToObject[row * 4 + column] = previousInverse.m[row][column];
             }
         }
 
@@ -13476,6 +13524,8 @@ bool Renderer::RecordRenderFrame(
     m_psrGBufferTransformsAddress = 0;
     m_psrDenoiseConstantsAddress = 0;
     m_psrLightingLastFrame = false;
+    m_psrGuideOnlyThisFrame = false;
+    m_psrGuideOnlyLastFrame = false;
     std::string psrLightingUnavailable;
     // Prepare a complete chain/lighting/extraction/cache set without touching the currently bound slots.
     // A compatible last active chain may continue; otherwise the ordinary path renders while preparation runs.
@@ -13617,9 +13667,39 @@ bool Renderer::RecordRenderFrame(
     }
 
     if(m_psrLightingThisFrame && !psrPreparation.empty()) psrLightingUnavailable = psrPreparation;
-    m_psrActiveChain = m_psrLightingThisFrame ? m_psrChainThisFrame : 0u;
+    // M5.5: guide-only PSR on ReSTIR PT frames with RR. Only the replacement pipeline is needed (no ReSTIR DI lighting
+    // libraries): B lights the real mirror primary; the replacement runs after lighting, for RR's guides only.
+    const bool psrGuideRequested = runPathTrace && m_restirPtFrameThisFrame &&
+        options.pathTraceReference.primarySurfaceReplacementInPlace && options.pathTraceReference.maxPathDepth > 0u;
+
+    if(psrGuideRequested)
+    {
+        if(!m_rrModeThisFrame)
+        {
+            psrLightingUnavailable = "ReSTIR PT applies PSR guides with Ray Reconstruction only";
+        }
+        else
+        {
+            const std::uint64_t resultsTakenBefore = GetDxrResultsTaken();
+            const auto auxiliary = PreparePsrAuxiliary();
+            RecordDxrPreparation(auxiliary, true, GetDxrResultsTaken() != resultsTakenBefore);
+
+            if(auxiliary.state == ShaderLibraryPreparationState::Ready)
+            {
+                m_psrGuideOnlyThisFrame = true;
+                m_psrChainThisFrame = options.pathTraceReference.primarySurfaceReplacementChain >= 2u &&
+                    options.pathTraceReference.maxPathDepth >= 3u && m_psrInPlaceReplacePass.IsChainAvailable() ? 2u : 1u;
+            }
+            else
+            {
+                psrLightingUnavailable = "preparing the PSR replacement pipeline";
+            }
+        }
+    }
+
+    m_psrActiveChain = m_psrLightingThisFrame || m_psrGuideOnlyThisFrame ? m_psrChainThisFrame : 0u;
     m_debugUI.SetPsrActiveMode(m_psrActiveChain);
-    m_debugUI.SetPsrLightingStatus(psrRequested, psrLightingUnavailable);
+    m_debugUI.SetPsrLightingStatus(psrRequested || psrGuideRequested, psrLightingUnavailable);
     m_psrStatus = {psrRequested, m_psrActiveChain, psrLightingUnavailable};
     // Diagnostic views must not force a virtual G-buffer into an ordinary cache pipeline
     // after combined preparation failed (or while the development boundary is closed).
@@ -13627,7 +13707,8 @@ bool Renderer::RecordRenderFrame(
         (m_psrLightingThisFrame || (!m_sharcSettings.enabled && !options.experimentalD6RadianceCache &&
             options.psrDebugView != ToneMapDebugView::None));
 
-    if(psrInPlace)
+    // M5.5: guide-only PSR marks eligibility too (the identity flag; B's shaders strip it), replacing after lighting.
+    if(psrInPlace || m_psrGuideOnlyThisFrame)
     {
         cameraConstants.psrEligibility = 1u;
         cameraConstants.psrResolution[0] = m_sceneWidth;
@@ -14189,6 +14270,18 @@ bool Renderer::RecordRenderFrame(
         m_previousGBufferAvailableThisFrame = m_previousGBufferValid;
         MarkDredStage(commandList, L"Frame: previous G-buffer copy");
         RecordPreviousGBufferCopy(commandList, copiedCamera);
+
+        // M5.5 guide-only PSR (ReSTIR PT + RR): the in-place replacement after lighting and after the history copy, so
+        // only RR's guides and the later passes see the virtual surfaces (B's estimator and its history never do).
+        if(m_psrGuideOnlyThisFrame && m_restirPtFrameLastFrame)
+        {
+            MarkDredStage(commandList, L"Frame: PSR guide-only replacement");
+            m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::PsrInPlaceReplace);
+            m_psrInPlaceReplacedLastFrame = RecordPsrInPlaceReplacement(commandList, scene, currentView, renderProjection,
+                frameView.position, cameraConstants);
+            m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::PsrInPlaceReplace);
+            m_psrGuideOnlyLastFrame = m_psrInPlaceReplacedLastFrame;
+        }
     }
     // Preserve the fixed AO -> shadows -> reflections -> GI -> denoise -> lighting order.
     else if (legacyLightingAllowed)
@@ -14702,7 +14795,8 @@ bool Renderer::RecordRenderFrame(
     if((m_rrInputPreparationForTesting || m_rrModeThisFrame) && runPathTrace && m_pathTraceExtractedLastFrame &&
         m_upscalerInputs.prepared)
     {
-        const bool psr = m_psrLightingLastFrame && m_psrDenoiseConstantsAddress != 0 && m_psrGBufferTransformsAddress != 0;
+        const bool psr = (m_psrLightingLastFrame || m_psrGuideOnlyLastFrame) && m_psrDenoiseConstantsAddress != 0 &&
+            m_psrGBufferTransformsAddress != 0;
 
         if(m_rrInputPreparationPass.Ensure(m_graphicsDevice.GetDevice(), m_shaderLibrary, m_resourceDescriptorHeap,
             m_sceneWidth, m_sceneHeight, psr, m_rrInputDiagnosticsForTesting))

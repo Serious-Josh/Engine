@@ -47,7 +47,8 @@ cbuffer RestirPtConstants : register(b2)
     float restirPtReconnectionMinDistance;
     float restirPtReconnectionRoughness;
     uint restirPtTransformCount;
-    uint restirPtPadding;
+    // M5.5 temporal correctness (Stage 1): the history scene's TLAS descriptor (RESTIR_PT_FLAG_HISTORY_SCENE).
+    uint restirPtHistorySceneIndex;
 
     // M5.2 temporal reuse: the previous frame's reservoirs (raw UAV; 0xFFFFFFFF without history), whether history may be
     // read, the G-buffer motion texture (current UV - previous UV, previous - current view depth), the confidence cap.
@@ -91,7 +92,8 @@ cbuffer RestirPtConstants : register(b2)
     uint restirPtIdentityIndex;
     uint restirPtPreviousInstanceIndex;
     uint restirPtInstanceOutputIndex;
-    uint restirPtPaddingDual;
+    // M5.5-B experiment (off at 0): final-shading decorrelation probability (RTXDI "Uniform" mode).
+    float restirPtDecorrelation;
 
     // M5.4 C7 duplication map [P 9-10, section 5; spec section 6.6]: this frame's map (written after the final reservoirs)
     // and last frame's (read by temporal reuse), ping-ponged with the reservoir sets.
@@ -99,6 +101,21 @@ cbuffer RestirPtConstants : register(b2)
     uint restirPtPreviousDuplicationIndex;
     uint2 restirPtPaddingDuplication;
 };
+
+// M5.5-B experiment: final-shading decorrelation (NVIDIA RTXDI RTXDI_PTApplyDecorrelation, "Uniform" mode only). True with
+// the constant probability restirPtDecorrelation, from a hash stream of its own (pixel, frame), so the decision is
+// independent of every reservoir and of both estimates. The caller then shows the initial kernel's estimate (the extraction
+// textures, which the last pass reads before writing). Always false at 0: the outputs are unchanged.
+bool RestirPtDecorrelate(uint2 pixel)
+{
+    if(!(restirPtDecorrelation > 0.0f))
+    {
+        return false;
+    }
+
+    const uint hash = PathTraceHash(pixel.x ^ PathTraceHash(pixel.y ^ PathTraceHash(restirPtFrameIndex ^ 0x44434F52u)));
+    return float(hash >> 8u) * (1.0f / 16777216.0f) < restirPtDecorrelation;
+}
 
 // M5.1-4 (M5.2 prerequisite): per-instance transforms by TLAS InstanceID (ReSTIRPTInstanceTransform): the first three rows
 // of the model matrix (world = M p) and of its inverse.
@@ -109,9 +126,43 @@ struct RestirPtInstanceTransform
     // M5.4 C6: the previous frame's world space to this frame's for points on this instance (exactly the identity for an
     // unmoved instance).
     row_major float3x4 previousToCurrent;
+    // M5.5 Stage 1: the previous frame's model matrix and its inverse (the history scene's instance transforms).
+    row_major float3x4 previousObjectToWorld;
+    row_major float3x4 previousWorldToObject;
 };
 
 StructuredBuffer<RestirPtInstanceTransform> restirPtTransforms : register(t1);
+
+// M5.5 temporal correctness, Stage 1: shifts into the temporal domain (toPrevious) are evaluated in the scene that domain's
+// samples were drawn from. GRIS needs p_t(T^-1 x) = 0 wherever domain t could not have produced the path; the current
+// scene gives it weight for paths a moved occluder blocked last frame, which under-counts newly unoccluded light. With
+// RESTIR_PT_FLAG_HISTORY_SCENE, every ray of such a shift is traced against the history TLAS (the committed frame's
+// instances at their transforms over the same BLASes) and x_k is rebuilt with the previous transforms.
+static bool g_restirPtHistoryScene = false;
+
+#define RESTIR_PT_TRACE_INLINE(query, flags, ray) \
+    if(g_restirPtHistoryScene) \
+    { \
+        RaytracingAccelerationStructure historyScene = ResourceDescriptorHeap[restirPtHistorySceneIndex]; \
+        query.TraceRayInline(historyScene, flags, 0xFF, ray); \
+    } \
+    else \
+    { \
+        query.TraceRayInline(scene, flags, 0xFF, ray); \
+    }
+
+RestirPtInstanceTransform RestirPtLoadInstanceTransform(uint instanceID)
+{
+    RestirPtInstanceTransform transform = restirPtTransforms[instanceID];
+
+    if(g_restirPtHistoryScene)
+    {
+        transform.objectToWorld = transform.previousObjectToWorld;
+        transform.worldToObject = transform.previousWorldToObject;
+    }
+
+    return transform;
+}
 
 static const uint RESTIR_PT_FLAG_EXTRACT = 1u << 0;
 static const uint RESTIR_PT_FLAG_RAW_DIFFUSE_HIT_DISTANCE = 1u << 1;
@@ -169,6 +220,8 @@ static const uint RESTIR_PT_COUNTER_DUAL = 14192u;
 // (biased, [P 10]: it breaks the MIS weights' partition of unity where it acts). Off by default.
 static const uint RESTIR_PT_FLAG_DUPLICATION_MAP = 1u << 27;
 static const uint RESTIR_PT_FLAG_DUPLICATION_APPLY = 1u << 28;
+// M5.5 Stage 1: shifts into the temporal domain use the history scene (restirPtHistorySceneIndex).
+static const uint RESTIR_PT_FLAG_HISTORY_SCENE = 1u << 29;
 // [P 9]: c_Cap = lerp(c_Cap_default, c_Cap_min, D^alpha) with c_Cap_min = 1 and alpha = 0.1; D = duplicates / 288 in 17 x 17.
 static const float RESTIR_PT_DUPLICATION_MIN_CAP = 1.0f;
 static const float RESTIR_PT_DUPLICATION_ALPHA = 0.1f;
@@ -1044,7 +1097,7 @@ void RestirPtTraceInline(RayDesc ray, inout PathTracePayload payload, out Restir
 {
     identity = (RestirPtHitIdentity)0;
     RayQuery<RAY_FLAG_NONE> query;
-    query.TraceRayInline(scene, RAY_FLAG_NONE, 0xFF, ray);
+    RESTIR_PT_TRACE_INLINE(query, RAY_FLAG_NONE, ray);
 
     while(query.Proceed())
     {
@@ -1111,7 +1164,7 @@ bool RestirPtVertexPosition(uint instanceID, uint primitive, float2 storedBaryce
         PathTraceLoadPosition(rebuildVertices, rebuildIndices.x, rebuildInstance.vertexStride) * weights.x +
         PathTraceLoadPosition(rebuildVertices, rebuildIndices.y, rebuildInstance.vertexStride) * weights.y +
         PathTraceLoadPosition(rebuildVertices, rebuildIndices.z, rebuildInstance.vertexStride) * weights.z;
-    position = mul(restirPtTransforms[instanceID].objectToWorld, float4(objectPosition, 1.0f));
+    position = mul(RestirPtLoadInstanceTransform(instanceID).objectToWorld, float4(objectPosition, 1.0f));
     return true;
 }
 
@@ -1128,7 +1181,7 @@ bool RestirPtRebuildVertex(uint instanceID, uint primitive, float2 storedBarycen
         return false;
     }
 
-    const RestirPtInstanceTransform transform = restirPtTransforms[instanceID];
+    const RestirPtInstanceTransform transform = RestirPtLoadInstanceTransform(instanceID);
     const float3 offset = position - origin;
     const float distance = length(offset);
 
@@ -2030,7 +2083,7 @@ bool RestirPtSegmentVisibleExcept(float3 origin, float3 direction, float tMax, u
     ray.TMax = tMax;
     const bool exclude = excludedInstance != 0xFFFFFFFFu;
     RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> query;
-    query.TraceRayInline(scene, exclude ? RAY_FLAG_FORCE_NON_OPAQUE : RAY_FLAG_NONE, 0xFF, ray);
+    RESTIR_PT_TRACE_INLINE(query, exclude ? RAY_FLAG_FORCE_NON_OPAQUE : RAY_FLAG_NONE, ray);
 
     while(query.Proceed())
     {
@@ -2132,7 +2185,7 @@ uint RestirPtReferenceVisibility(float3 origin, float3 vertexPosition, uint vert
     ray.TMin = 0.0f;
     ray.TMax = distance + contactBand;
     RayQuery<RAY_FLAG_NONE> query;
-    query.TraceRayInline(scene, RAY_FLAG_NONE, 0xFF, ray);
+    RESTIR_PT_TRACE_INLINE(query, RAY_FLAG_NONE, ray);
 
     while(query.Proceed())
     {
@@ -2216,7 +2269,7 @@ uint RestirPtReferenceLightVisibility(float3 receiver, float3 geometricNormal, f
     ray.TMin = 0.0f;
     ray.TMax = distance;
     RayQuery<RAY_FLAG_NONE> query;
-    query.TraceRayInline(scene, RAY_FLAG_NONE, 0xFF, ray);
+    RESTIR_PT_TRACE_INLINE(query, RAY_FLAG_NONE, ray);
 
     while(query.Proceed())
     {
@@ -2991,6 +3044,9 @@ struct RestirPtTemporalResult
     uint pathFlags;
     RestirPtReconnection rc;
     bool temporalSelected;
+    // M5.5 diagnostics (debug view 2): the canonical sample's MIS weight m_c and the temporal confidence M_t'.
+    float canonicalMis;
+    float temporalConfidence;
     // Diagnostics: the lookup stage (RestirPtTemporalNeighbor), whether the forward and reverse shifts succeeded.
     uint stage;
     bool forwardValid;
@@ -3142,8 +3198,11 @@ RestirPtTemporalResult RestirPtTemporalResample(uint2 pixel, PathTraceRasterFirs
 
         const float footprintThreshold = toPrevious ? RestirPtFootprintThreshold(restirPtPreviousCameraPosition,
             destination) : RestirPtFootprintThreshold(cameraPosition, destination);
+        // M5.5 Stage 1: a shift into the temporal domain is evaluated in that domain's scene.
+        g_restirPtHistoryScene = toPrevious && (restirPtFlags & RESTIR_PT_FLAG_HISTORY_SCENE) != 0u;
         const RestirPtShifted shifted = RestirPtShiftSample(destination, shiftIndex == 1u ? seed : temporal.initSeed,
             shiftIndex == 1u ? canonicalFlags : temporal.pathFlags, source, footprintThreshold);
+        g_restirPtHistoryScene = false;
 
         if(shiftIndex == 0u)
         {
@@ -3186,6 +3245,8 @@ RestirPtTemporalResult RestirPtTemporalResample(uint2 pixel, PathTraceRasterFirs
     const float canonicalTerm = canonicalConfidence * canonicalTarget;
     const float canonicalMis = canonicalTerm > 0.0f ? canonicalTerm / (canonicalTerm + reverseTerm) : 0.0f;
     const float canonicalResampling = canonicalMis * canonicalTarget * canonicalWeight;
+    result.canonicalMis = canonicalMis;
+    result.temporalConfidence = temporalConfidence;
 
     // Temporal MIS weight and resampling weight.
     float temporalResampling = 0.0f;
@@ -4170,7 +4231,11 @@ void RestirPtInitialCS(uint3 thread : SV_DispatchThreadID)
     {
         Texture2D<uint2> identity = ResourceDescriptorHeap[restirPtIdentityIndex];
         RWByteAddressBuffer instanceOutput = ResourceDescriptorHeap[restirPtInstanceOutputIndex];
-        instanceOutput.Store(4u * (pixel.y * resolution.x + pixel.x), identity.Load(int3(pixel, 0)).x);
+        // M5.5 guide-only PSR: the geometry pass may set the PSR eligibility flag (bit 31) in identity.x; the instance
+        // history keeps the identity without it (unmapped all-ones unchanged), as B renders without PSR.
+        const uint identityX = identity.Load(int3(pixel, 0)).x;
+        instanceOutput.Store(4u * (pixel.y * resolution.x + pixel.x), identityX == 0xFFFFFFFFu ? identityX :
+            identityX & 0x7FFFFFFFu);
     }
 
     // M5.4 C5: the temporal pass's replay list starts empty (a UAV barrier separates this from the temporal pass).
@@ -4856,6 +4921,20 @@ void RestirPtTemporalCS(uint3 thread : SV_DispatchThreadID)
             radiance = temporalResult.contribution * temporalResult.unbiasedContributionWeight;
             resampled = true;
             temporalSelected = temporalResult.temporalSelected;
+
+            // M5.5 diagnostics (debug view 2; harness only): per pixel, the selected sample's source (1 canonical, 2
+            // temporal), its reconnection kind (0 none/replay-only, 1 light endpoint, 2 environment endpoint, 3 hit + NEE
+            // edge: cached light visibility, 4 hit + continuation), m_c and M_t'. The image and accumulation are unchanged.
+            if(restirPtDebugView == 2u)
+            {
+                const uint selectedLength = temporalResult.pathFlags & 15u;
+                const uint selectedIndex = temporalResult.rc.index;
+                const bool selectedNee = (temporalResult.pathFlags & RESTIR_PT_PATH_NEE) != 0u;
+                const float kind = selectedIndex == 0u ? 0.0f : selectedIndex == selectedLength ? (selectedNee ? 1.0f : 2.0f) :
+                    (selectedNee && selectedIndex + 1u == selectedLength ? 3.0f : 4.0f);
+                outputTexture[pixel] = float4(temporalResult.temporalSelected ? 2.0f : 1.0f, kind,
+                    temporalResult.canonicalMis, temporalResult.temporalConfidence);
+            }
             selectedDiffuseLobe = ((temporalResult.pathFlags >> RESTIR_PT_PATH_LOBES_SHIFT) & 3u) == RESTIR_PT_LOBE_COSINE;
             unbiasedContributionWeight = temporalResult.unbiasedContributionWeight;
             RestirPtStoreReservoirFields(pixel, temporalResult.unbiasedContributionWeight, temporalResult.contribution,
@@ -4896,6 +4975,17 @@ void RestirPtTemporalCS(uint3 thread : SV_DispatchThreadID)
                 radiance = float3(0.0f, 0.0f, 0.0f);
             }
 
+            // M5.5-B decorrelation: show the initial kernel's estimate (the extraction textures, left as they are); the
+            // stored reservoir is unchanged.
+            const bool decorrelated = extract && firstVertex.state > 0 && RestirPtDecorrelate(pixel);
+
+            if(decorrelated)
+            {
+                RWTexture2D<float4> initialDiffuse = ResourceDescriptorHeap[diffuseOutputIndex];
+                RWTexture2D<float4> initialSpecular = ResourceDescriptorHeap[specularOutputIndex];
+                radiance = initialDiffuse[pixel].rgb + initialSpecular[pixel].rgb;
+            }
+
             const float previousCount = float(accumulatedSamples);
             const float totalCount = float(accumulatedSamples + samplesPerFrame);
             float3 mean = radiance / totalCount;
@@ -4907,7 +4997,8 @@ void RestirPtTemporalCS(uint3 thread : SV_DispatchThreadID)
 
             accumulationTexture[pixel] = float4(mean, 1.0f);
 
-            if(restirPtDebugView != 1u)
+            // Debug views 1 (selected length) and 2 (M5.5 temporal diagnostics) keep their output.
+            if(restirPtDebugView == 0u)
             {
                 outputTexture[pixel] = float4(min(mean, PATH_TRACE_HALF_MAXIMUM), 1.0f);
             }
@@ -4915,7 +5006,7 @@ void RestirPtTemporalCS(uint3 thread : SV_DispatchThreadID)
             // Denoiser signals only, where resampling ran (elsewhere the initial kernel's split is this pixel's): the
             // selected path's x1 lobe (lambda_1) when the temporal sample won, else the canonical's diffuse share, which
             // the initial kernel wrote at its own W (rescaled to the resampled W).
-            if(extract && resampled)
+            if(extract && resampled && !decorrelated)
             {
                 RWTexture2D<float4> diffuseOutput = ResourceDescriptorHeap[diffuseOutputIndex];
                 RWTexture2D<float4> specularOutput = ResourceDescriptorHeap[specularOutputIndex];
@@ -5270,6 +5361,16 @@ void RestirPtSpatialResampleCS(uint3 thread : SV_DispatchThreadID)
         RestirPtStoreReservoirFieldsTo(restirPtSpatialOutputIndex, pixel, unbiasedContributionWeight, contribution,
             initSeed, pathFlags, rc);
 
+        // M5.5-B decorrelation: show the initial kernel's estimate (still in the extraction textures) instead of the reused
+        // one; the stored final reservoir above is unchanged.
+        if(extract && self.state > 0 && RestirPtDecorrelate(pixel))
+        {
+            RWTexture2D<float4> initialDiffuse = ResourceDescriptorHeap[diffuseOutputIndex];
+            RWTexture2D<float4> initialSpecular = ResourceDescriptorHeap[specularOutputIndex];
+            diffuse = initialDiffuse[pixel].rgb;
+            radiance = diffuse + initialSpecular[pixel].rgb;
+        }
+
         // The image (spatial reuse requires one sample per frame; the initial kernel skipped these writes).
         const float previousCount = float(accumulatedSamples);
         const float totalCount = float(accumulatedSamples + samplesPerFrame);
@@ -5281,7 +5382,12 @@ void RestirPtSpatialResampleCS(uint3 thread : SV_DispatchThreadID)
         }
 
         accumulationTexture[pixel] = float4(mean, 1.0f);
-        outputTexture[pixel] = float4(min(mean, PATH_TRACE_HALF_MAXIMUM), 1.0f);
+
+        // M5.5 debug view 2 keeps the temporal pass's diagnostics in the output.
+        if(restirPtDebugView != 2u)
+        {
+            outputTexture[pixel] = float4(min(mean, PATH_TRACE_HALF_MAXIMUM), 1.0f);
+        }
 
         // Denoiser signals only: the colour split by each candidate's x1 lobe (lambda_1); hit distances stay the initial
         // kernel's.

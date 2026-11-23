@@ -2,6 +2,7 @@
 
 #include "Renderer/Buffer.h"
 #include "Renderer/ComputePipeline.h"
+#include "Renderer/RayTracing/TopLevelAccelerationStructure.h"
 
 #include <d3d12.h>
 
@@ -108,6 +109,16 @@ struct ReSTIRPTSettings
         Apply
     };
     Duplication duplication = Duplication::Off;
+    // M5.5-B experiment (NVIDIA RTXDI final-shading decorrelation, "Uniform" mode only): with this constant probability a
+    // pixel's final pass shows the initial kernel's independent estimate f(Y_init) W_init (from the extraction textures)
+    // instead of the reused one. Both are unbiased for the same integral and the choice is independent of both, so the
+    // mixture is unbiased. Shading only: reservoirs, history, MIS and shifts are untouched. Extraction (denoiser) frames
+    // only; 0 is off and leaves every output bit-identical. Default 0.35 (user request 2026-11-22, for visual evaluation
+    // after Checkpoint B: RR flicker -37%, Tri-Test gates pass); ENGINE_RESTIR_PT_DECORRELATE=0 turns it off.
+    float decorrelation = 0.35f;
+    // M5.5 temporal correctness, Stage 1 (experimental, off by default): shifts into the temporal domain are evaluated in
+    // the history scene (the committed frame's instance transforms over the same BLASes), as GRIS requires.
+    bool historyScene = false;
 };
 
 // M5.2: what the previous frame's reservoirs were computed against. History is reused only when every field matches
@@ -180,7 +191,8 @@ struct ReSTIRPTConstants
     float reconnectionMinDistance = 0.0f;
     float reconnectionRoughness = 0.2f;
     std::uint32_t transformCount = 0;
-    std::uint32_t padding = 0;
+    // M5.5 Stage 1: the history scene's TLAS descriptor (0xFFFFFFFF without one).
+    std::uint32_t historySceneIndex = 0xFFFFFFFFu;
 
     // M5.2 temporal reuse: the previous frame's reservoirs (raw UAV, 0xFFFFFFFF without history), whether history may be
     // read, the G-buffer motion texture (current UV - previous UV, view-depth change), and the temporal confidence cap.
@@ -221,7 +233,8 @@ struct ReSTIRPTConstants
     std::uint32_t identityIndex = 0xFFFFFFFFu;
     std::uint32_t previousInstanceIndex = 0xFFFFFFFFu;
     std::uint32_t instanceOutputIndex = 0xFFFFFFFFu;
-    std::uint32_t paddingDual = 0;
+    // M5.5-B: the final-shading decorrelation probability (ReSTIRPTSettings::decorrelation).
+    float decorrelation = 0.0f;
     // M5.4 C7: this frame's duplication map (written) and last frame's (read by temporal reuse).
     std::uint32_t duplicationOutputIndex = 0xFFFFFFFFu;
     std::uint32_t previousDuplicationIndex = 0xFFFFFFFFu;
@@ -237,6 +250,9 @@ struct ReSTIRPTInstanceTransform
     float worldToObject[12]{};
     // M5.4 C6: previous-frame world space to this frame's for this instance's points (the identity when unmoved).
     float previousToCurrent[12]{};
+    // M5.5 Stage 1: the previous frame's model matrix and its inverse (rows 0-2), for the history scene.
+    float previousObjectToWorld[12]{};
+    float previousWorldToObject[12]{};
 };
 
 static_assert(sizeof(ReSTIRPTConstants) == 368, "ReSTIRPTConstants must match RestirPtConstants (b2).");
@@ -332,6 +348,16 @@ class ReSTIRPTPass
     void AbandonFrame();
     // Drops the committed and any pending frame.
     void InvalidateHistory();
+
+    // M5.5 Stage 1: this recording's TLAS instances and geometry identity, committed and abandoned with its history.
+    void SetPendingScene(const std::vector<RayTracingInstanceDescription>& instances, std::uint64_t geometryIdentity);
+    // The history scene for this frame: a TLAS of the committed frame's instances over the current BLASes, rebuilt in this
+    // frame slot's own TLAS (the slot's previous use is fence-complete when the frame index is acquired). Valid only while
+    // the committed frame's geometry identity equals the current one (history is invalid otherwise). Returns its SRV
+    // descriptor index, or 0xFFFFFFFF.
+    std::uint32_t PrepareHistoryScene(ID3D12Device5* device, ID3D12GraphicsCommandList4* commandList, unsigned int frameIndex,
+        DescriptorHeap& descriptorHeap, std::uint64_t geometryIdentity,
+        const std::vector<const BottomLevelAccelerationStructure*>& bottomLevels);
 
     // Records this frame's light tiles from the published light sampling (lightSamplingIndex, of a table with
     // tableLightCount lights). Leaves the tiles readable by the initial pass. Returns false when nothing was recorded.
@@ -464,6 +490,24 @@ class ReSTIRPTPass
     std::uint32_t m_committedSet = 0;
     ReSTIRPTHistorySignature m_committedSignature;
     bool m_pending = false;
+    // M5.5 Stage 1: the pending and committed frames' TLAS instances and geometry identities, and one history TLAS per
+    // frame slot (with its SRV descriptor).
+    std::vector<RayTracingInstanceDescription> m_pendingSceneInstances;
+    std::vector<RayTracingInstanceDescription> m_committedSceneInstances;
+    std::uint64_t m_pendingSceneIdentity = 0;
+    std::uint64_t m_committedSceneIdentity = 0;
+    struct HistoryScene
+    {
+        TopLevelAccelerationStructure topLevel;
+        std::uint32_t descriptor = 0xFFFFFFFFu;
+        std::uint64_t geometryIdentity = 0;
+        std::size_t instanceCount = 0;
+        D3D12_GPU_VIRTUAL_ADDRESS address = 0;
+        bool initialized = false;
+    };
+    static constexpr unsigned int HistorySceneSlots = 2;
+    HistoryScene m_historyScenes[HistorySceneSlots];
+    DescriptorHeap* m_historySceneHeap = nullptr;
     std::uint32_t m_pendingSet = 0;
     ReSTIRPTHistorySignature m_pendingSignature;
     std::uint32_t m_lastWriteSet = 0;

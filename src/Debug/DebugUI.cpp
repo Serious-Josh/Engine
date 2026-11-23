@@ -1599,7 +1599,9 @@ void DebugUI::DrawPathTraceReferenceSettings()
 
         if(!m_psrLightingRequested)
         {
-            ImGui::TextWrapped("Inactive: select the Path Tracing (ReSTIR DI) lighting mode.");
+            // M5.5: ReSTIR PT Enhanced applies PSR as RR guides only (its lighting is unchanged).
+            ImGui::TextWrapped("Inactive: select the Path Tracing lighting mode (ReSTIR DI, or ReSTIR PT Enhanced with "
+                "Ray Reconstruction for guide-only PSR).");
         }
         else if(!m_psrLightingUnavailable.empty())
         {

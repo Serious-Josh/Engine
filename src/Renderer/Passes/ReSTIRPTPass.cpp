@@ -606,17 +606,114 @@ void ReSTIRPTPass::CommitFrame()
     m_committedSet = m_pendingSet;
     m_committedSignature = m_pendingSignature;
     m_pending = false;
+    // M5.5 Stage 1: the committed frame's scene goes with its reservoirs.
+    m_committedSceneInstances.swap(m_pendingSceneInstances);
+    m_committedSceneIdentity = m_pendingSceneIdentity;
+    m_pendingSceneInstances.clear();
+    m_pendingSceneIdentity = 0;
 }
 
 void ReSTIRPTPass::AbandonFrame()
 {
     m_pending = false;
+    m_pendingSceneInstances.clear();
+    m_pendingSceneIdentity = 0;
 }
 
 void ReSTIRPTPass::InvalidateHistory()
 {
     m_committed = false;
     m_pending = false;
+    m_pendingSceneInstances.clear();
+    m_committedSceneInstances.clear();
+    m_pendingSceneIdentity = 0;
+    m_committedSceneIdentity = 0;
+}
+
+void ReSTIRPTPass::SetPendingScene(const std::vector<RayTracingInstanceDescription>& instances, std::uint64_t geometryIdentity)
+{
+    m_pendingSceneInstances = instances;
+    m_pendingSceneIdentity = geometryIdentity;
+}
+
+std::uint32_t ReSTIRPTPass::PrepareHistoryScene(ID3D12Device5* device, ID3D12GraphicsCommandList4* commandList,
+    unsigned int frameIndex, DescriptorHeap& descriptorHeap, std::uint64_t geometryIdentity,
+    const std::vector<const BottomLevelAccelerationStructure*>& bottomLevels)
+{
+    // Only while the committed frame used this exact geometry (the same BLAS set): then only instance transforms differ, and
+    // the history TLAS references BLASes the current TLAS keeps alive for this frame's work.
+    if(!device || !commandList || !m_committed || m_committedSceneInstances.empty() || geometryIdentity == 0 ||
+        m_committedSceneIdentity != geometryIdentity || bottomLevels.empty())
+    {
+        return 0xFFFFFFFFu;
+    }
+
+    HistoryScene& slot = m_historyScenes[frameIndex % HistorySceneSlots];
+
+    if(slot.descriptor == 0xFFFFFFFFu)
+    {
+        slot.descriptor = descriptorHeap.Allocate();
+
+        if(slot.descriptor == UINT_MAX)
+        {
+            slot.descriptor = 0xFFFFFFFFu;
+            return 0xFFFFFFFFu;
+        }
+
+        m_historySceneHeap = &descriptorHeap;
+    }
+
+    bool recorded = false;
+
+    // This slot was last used by the frame that previously held this frame index, which is complete once the index is
+    // acquired; refit when the instance set is unchanged, else rebuild.
+    if(slot.initialized && slot.geometryIdentity == geometryIdentity && slot.instanceCount == m_committedSceneInstances.size())
+    {
+        std::vector<std::size_t> every(m_committedSceneInstances.size());
+
+        for(std::size_t index = 0; index < every.size(); ++index)
+        {
+            every[index] = index;
+        }
+
+        recorded = slot.topLevel.Update(commandList, frameIndex, m_committedSceneInstances, every, bottomLevels);
+    }
+    else
+    {
+        slot.topLevel.Shutdown();
+        RayTracingTopLevelDescription description;
+        description.instances = m_committedSceneInstances;
+        recorded = slot.topLevel.Initialize(device, commandList, description, bottomLevels);
+        slot.geometryIdentity = geometryIdentity;
+        slot.instanceCount = m_committedSceneInstances.size();
+    }
+
+    slot.initialized = recorded;
+
+    if(!recorded)
+    {
+        return 0xFFFFFFFFu;
+    }
+
+    const D3D12_GPU_VIRTUAL_ADDRESS address = slot.topLevel.GetGPUAddress();
+
+    if(address != slot.address)
+    {
+        D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+        view.Format = DXGI_FORMAT_UNKNOWN;
+        view.ViewDimension = D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE;
+        view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        view.RaytracingAccelerationStructure.Location = address;
+        device->CreateShaderResourceView(nullptr, &view, descriptorHeap.GetCPUHandle(slot.descriptor));
+        slot.address = address;
+    }
+
+    // The build or refit is read by the ReSTIR PT dispatches that follow.
+    D3D12_RESOURCE_BARRIER ordering{};
+    ordering.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    ordering.UAV.pResource = nullptr;
+    commandList->ResourceBarrier(1, &ordering);
+    return slot.descriptor;
 }
 
 const char* ReSTIRPTHistoryDecisionName(ReSTIRPTHistoryDecision decision)
@@ -650,6 +747,25 @@ const char* ReSTIRPTHistoryDecisionName(ReSTIRPTHistoryDecision decision)
 
 void ReSTIRPTPass::Shutdown()
 {
+    // M5.5 Stage 1: the history TLASes and their descriptors (teardown follows GPU completion).
+    for(HistoryScene& slot : m_historyScenes)
+    {
+        slot.topLevel.Shutdown();
+
+        if(slot.descriptor != 0xFFFFFFFFu && m_historySceneHeap)
+        {
+            m_historySceneHeap->Free(slot.descriptor);
+        }
+
+        slot.descriptor = 0xFFFFFFFFu;
+        slot.geometryIdentity = 0;
+        slot.instanceCount = 0;
+        slot.address = 0;
+        slot.initialized = false;
+    }
+
+    m_pendingSceneInstances.clear();
+    m_committedSceneInstances.clear();
     ReleaseTextures();
     m_counters.Shutdown();
     m_lightTiles.Shutdown();
@@ -716,6 +832,8 @@ ReSTIRPTConstants ReSTIRPTPass::MakeConstants(const ReSTIRPTSettings& settings, 
     constants.previousReservoirIndex = constants.historyValid != 0u ? previousReservoirs.GetUAVDescriptorIndex() :
         0xFFFFFFFFu;
     constants.temporalConfidenceCap = settings.temporalConfidenceCap;
+    // M5.5-B: final-shading only, so it is not part of the history signature.
+    constants.decorrelation = settings.decorrelation;
     constants.lightTileIndex = m_lightTiles.GetResource() ? m_lightTiles.GetDescriptorIndex() : 0xFFFFFFFFu;
     constants.lightSamplingIndex = lightSamplingIndex;
     constants.flags = (extract ? FlagExtract : 0u) | (extract && rawDiffuseHitDistance ? FlagRawDiffuseHitDistance : 0u) |
