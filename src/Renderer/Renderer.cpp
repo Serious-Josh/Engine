@@ -3366,6 +3366,8 @@ bool Renderer::Initialize(
         // ENGINE_RESTIR_PT_SPATIAL_COLOUR=0 shades with F(Y) W in place of colour-noise reduction.
         m_restirPtSettings.spatial = environment("ENGINE_RESTIR_PT_SPATIAL") == "1";
         m_restirPtSettings.spatialColourNoiseReduction = environment("ENGINE_RESTIR_PT_SPATIAL_COLOUR") != "0";
+        // The Debug UI's reuse toggles start from these (Rendering Settings, under the PT estimator).
+        m_debugUI.SetRestirPtReuse(m_restirPtSettings.temporal, m_restirPtSettings.spatial);
 
         if(m_restirPtSettings.outputSum)
         {
@@ -7190,6 +7192,18 @@ void Renderer::RecordReSTIRPTFrame(ID3D12GraphicsCommandList* commandList, unsig
     const Matrix4& projection, bool extract, bool rawExtraction)
 {
     m_restirPtFrameLastFrame = false;
+
+    // The Debug UI's reuse toggles, applied only when the user changed one (direct callers that set m_restirPtSettings
+    // themselves, such as the verification harness, are never overridden). The history signature includes both, so a
+    // change resets ReSTIR PT history; reuse resources are created on first use.
+    bool temporalReuse = false;
+    bool spatialReuse = false;
+
+    if(m_debugUI.ConsumeRestirPtReuseChange(temporalReuse, spatialReuse))
+    {
+        m_restirPtSettings.temporal = temporalReuse;
+        m_restirPtSettings.spatial = spatialReuse;
+    }
 
     if(!EnsureReSTIRPT() || !m_restirPtPass.EnsureReservoirs(m_graphicsDevice.GetDevice(), m_resourceDescriptorHeap,
         m_sceneWidth, m_sceneHeight))

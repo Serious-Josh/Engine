@@ -174,6 +174,24 @@ class DebugUI
     void SetExposureDisplay(const ExposureDisplay& display) { m_exposureDisplay = display; }
     const ExposureDisplay& GetExposureDisplay() const { return m_exposureDisplay; }
 
+    // ReSTIR PT Enhanced reuse toggles (Debug UI, Rendering Settings, shown while ReSTIR PT Enhanced is the estimator).
+    // The renderer seeds them from its startup settings (ENGINE_RESTIR_PT_TEMPORAL / _SPATIAL) and applies them only
+    // when the user changes one, so direct callers that set the renderer's settings themselves are never overridden.
+    void SetRestirPtReuse(bool temporal, bool spatial)
+    {
+        m_restirPtTemporalReuse = temporal;
+        m_restirPtSpatialReuse = spatial;
+    }
+
+    bool ConsumeRestirPtReuseChange(bool& temporal, bool& spatial)
+    {
+        temporal = m_restirPtTemporalReuse;
+        spatial = m_restirPtSpatialReuse;
+        const bool changed = m_restirPtReuseChanged;
+        m_restirPtReuseChanged = false;
+        return changed;
+    }
+
     bool IsShadingNormalCorrectionEnabled() const
     {
 #ifndef NDEBUG
@@ -432,6 +450,11 @@ class DebugUI
     std::uint64_t m_totalTLASUpdates = 0;
 
     int m_requestedEnvironmentIndex = -1;
+
+    // ReSTIR PT Enhanced reuse toggles (SetRestirPtReuse / ConsumeRestirPtReuseChange).
+    bool m_restirPtTemporalReuse = false;
+    bool m_restirPtSpatialReuse = false;
+    bool m_restirPtReuseChanged = false;
 
 #ifndef NDEBUG
     bool m_shadingNormalCorrectionEnabled = true;

@@ -1523,6 +1523,23 @@ void DebugUI::DrawPathTraceReferenceSettings()
         OverrideCombo("PT estimator", effective.pathTracing.estimator, estimators, IM_ARRAYSIZE(estimators),
             overrides.estimator, RenderingOverrideField::estimator);
         ImGui::EndDisabled();
+
+        // ReSTIR PT Enhanced's reuse (Debug-only; the startup default comes from ENGINE_RESTIR_PT_TEMPORAL / _SPATIAL).
+        // A change resets ReSTIR PT history (its settings are part of the history signature). Spatial reuse runs at one
+        // sample per frame only.
+        if(effective.pathTracing.estimator == ProjectPathTraceEstimator::ReSTIRPTEnhanced)
+        {
+            ImGui::Indent();
+            m_restirPtReuseChanged |= ImGui::Checkbox("Temporal reuse", &m_restirPtTemporalReuse);
+            m_restirPtReuseChanged |= ImGui::Checkbox("Spatial reuse", &m_restirPtSpatialReuse);
+
+            if(m_restirPtSpatialReuse && resolved.pathTrace.samplesPerFrame != 1u)
+            {
+                ImGui::TextDisabled("Spatial reuse runs at 1 sample per frame only.");
+            }
+
+            ImGui::Unindent();
+        }
     }
 
     const char* visibilityModes[] = {"TraceRay (Original)", "RayQuery (GI.6)"};
