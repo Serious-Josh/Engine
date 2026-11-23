@@ -1718,6 +1718,8 @@ class Renderer
     // buffer (allocated on first use for the fixed settings, released at shutdown), and a frame counter for its seeds.
     std::uint32_t m_frameSceneLightBufferIndex = UINT_MAX;
     ComputePipeline m_regirPresamplePipeline;
+    // Point-light noise fix #1: ReSTIR PT's exact cell-proposal build (ReGIRPresample.hlsl mainExact; one group per cell).
+    ComputePipeline m_regirPresampleExactPipeline;
     bool m_regirPresampleAttempted = false;
     Buffer m_regirSlots;
     std::uint32_t m_regirFrame = 0;
@@ -1748,6 +1750,9 @@ class Renderer
     std::uint32_t m_restirPtUiRegirWindow = 16;
     std::uint32_t m_restirPtUiRegirSpatialPairs = 0;
     bool m_restirPtUiRegirCone = true;
+    bool m_restirPtUiRegirExact = true;
+    bool m_restirPtUiRegirSpotTarget = true;
+    bool m_restirPtUiRegirList = true;
     bool m_restirPtUiRegirDirect = true;
     // The descriptor index of the buffer published this frame (valid with m_lightSamplingReport.available).
     std::uint32_t m_frameLightSamplingBufferIndex = 0;

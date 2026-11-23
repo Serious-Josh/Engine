@@ -5,6 +5,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <execution>
 #include <limits>
@@ -388,10 +389,38 @@ namespace
     }
 }
 
+double LightSamplingEmissionSolidAngle(const GPULight& light) noexcept
+{
+    static const bool intensityOnly = []
+    {
+        const char* value = std::getenv("ENGINE_LIGHT_SAMPLING_POWER");
+        return value != nullptr && std::string(value) == "intensity";
+    }();
+    constexpr double Pi = 3.14159265358979323846;
+
+    if(intensityOnly || light.type == 2u)
+    {
+        return 1.0;
+    }
+
+    if(light.type != 1u)
+    {
+        return 4.0 * Pi;
+    }
+
+    // Photometry::SpotEmissionSolidAngle over the uploaded cosines (SceneLights.hlsli's profile: full inside the inner
+    // cone, ((cos - cosOuter) / width)^2 in the transition).
+    const double cosOuter = light.cosOuterCone;
+    const double cosInner = light.cosInnerCone;
+    const double width = (std::max)(cosInner - cosOuter, 1.0e-4);
+    const double full = (std::max)(1.0 - cosOuter - width, 0.0);
+    return 2.0 * Pi * (full + width / 3.0);
+}
+
 double LightSamplingPower(const GPULight& light) noexcept
 {
-    const double power = LuminanceRed * light.radiance[0] + LuminanceGreen * light.radiance[1] +
-        LuminanceBlue * light.radiance[2];
+    const double power = (LuminanceRed * light.radiance[0] + LuminanceGreen * light.radiance[1] +
+        LuminanceBlue * light.radiance[2]) * LightSamplingEmissionSolidAngle(light);
     return std::isfinite(power) && power > 0.0 ? power : 0.0;
 }
 

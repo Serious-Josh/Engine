@@ -8,9 +8,24 @@
 //   power has exactly one entry; a local light without one keeps 0, which the path tree treats as an invalid candidate).
 
 #include "../LightSampling.hlsli"
+#include "../SceneLights.hlsli"
 
 // ReSTIRPTPass::ReGIRLightCapacity x 8 bytes: the table-indexed probabilities follow the local-indexed map.
 static const uint RESTIR_PT_REGIR_TABLE_P1 = 131072u * 8u;
+// ReGIR architecture investigation (experimental): per table light, a 32-byte proposal record for the list sampler, from
+// byte RESTIR_PT_REGIR_COMPACT = capacity x 12: {position, range | luminance of radiance, octahedral spot axis (2 x snorm16),
+// cos(outer) widened by 2e-3 (so the record's cone contains the light's), 1 / cone width (0 for point lights)}. Written
+// only when padding (the scene light buffer index) is valid.
+static const uint RESTIR_PT_REGIR_COMPACT = 131072u * 12u;
+
+uint RestirPtOctEncode(float3 direction)
+{
+    direction /= abs(direction.x) + abs(direction.y) + abs(direction.z);
+    float2 folded = direction.z >= 0.0f ? direction.xy :
+        (1.0f - abs(direction.yx)) * float2(direction.x >= 0.0f ? 1.0f : -1.0f, direction.y >= 0.0f ? 1.0f : -1.0f);
+    const uint2 quantized = uint2(round(saturate(folded * 0.5f + 0.5f) * 65535.0f));
+    return quantized.x | (quantized.y << 16u);
+}
 
 // The light-tile constants' layout (ReSTIRPTLightTileConstants): tileCount, tileSize and frameSeed unused, padding.x the
 // phase.
@@ -49,6 +64,18 @@ void main(uint3 thread : SV_DispatchThreadID)
         if(light < tableLightCount)
         {
             output.Store(RESTIR_PT_REGIR_TABLE_P1 + light * 4u, 0u);
+
+            if(padding != 0xFFFFFFFFu)
+            {
+                const GPULight record = SceneLightLoad(padding, light);
+                const float luminance = 0.2126f * record.radiance.x + 0.7152f * record.radiance.y + 0.0722f * record.radiance.z;
+                const bool spot = record.type == SCENE_LIGHT_SPOT;
+                const float width = max(record.cosInnerCone - record.cosOuterCone, 1.0e-4f);
+                output.Store4(RESTIR_PT_REGIR_COMPACT + light * 32u, uint4(asuint(record.position), asuint(abs(record.range))));
+                output.Store4(RESTIR_PT_REGIR_COMPACT + light * 32u + 16u, uint4(asuint(record.type == SCENE_LIGHT_DIRECTIONAL ?
+                    0.0f : luminance), RestirPtOctEncode(normalize(record.direction)), asuint(record.cosOuterCone - 2.0e-3f),
+                    asuint(spot ? 1.0f / width : 0.0f)));
+            }
             const uint local = structures.Load(translation + light * 4u);
 
             if(local < tableLightCount)

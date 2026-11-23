@@ -44,6 +44,10 @@ struct ReGIRSettings
     // instead of its power alias table: the M4.2C moving lights are wide while they move, and a power-proportional draw
     // finds a weak light next to the cell almost never. 0 always uses the alias table.
     std::uint32_t wideTargetLimit = 64;
+    // The cell target's options (ReGIRPresample.hlsl REGIR_FLAG_*, the shader's headerPadding): 1 the spot-cone bound,
+    // 8 the representative spot factor (point-light noise fix #2). 0 for ReSTIR DI; the renderer sets ReSTIR PT's per
+    // frame.
+    std::uint32_t targetFlags = 0;
     // M4.3.5: ReGIR runs only above this many RTXDI local lights (CountReGIRLocalLights); at or below it the uniform
     // candidates already cover the local lights well.
     std::uint32_t localLightThreshold = 64;
@@ -100,7 +104,8 @@ ReGIRCellSource ReGIRCellSourceAt(const LightSamplingData& data, const ReGIRWind
 // window(d) / max(d^2, (cellSize / 2)^2) with d the distance from the light to the region (Engine's range window,
 // SceneLights.hlsli). Positive exactly when the light reaches some point of the region; 0 for directional lights.
 // Computed in float in the shader's order of operations.
-float ReGIRCellTarget(const GPULight& light, const float regionLow[3], const float regionHigh[3], float cellSize);
+float ReGIRCellTarget(const GPULight& light, const float regionLow[3], const float regionHigh[3], float cellSize,
+    std::uint32_t flags = 0);
 
 // PCG32 step shared with the presampling shader.
 std::uint32_t ReGIRNextRandom(std::uint32_t& state) noexcept;
@@ -129,6 +134,27 @@ struct ReGIRCandidateTrace
 // settings.buildSamples candidates.
 ReGIRSlot ReGIRPresampleSlot(const LightSamplingData& data, const SceneLightTable& table, const ReGIRCellSource& source,
     const ReGIRSettings& settings, std::uint32_t& random, ReGIRCandidateTrace* trace = nullptr);
+
+// Point-light noise fix #1 (ReSTIR PT; ReGIRPresample.hlsl mainExact): a cell's slots drawn exactly in proportion to
+// the cell target. Inside the M4.1 grid, with a wide pool of at most wideTargetLimit lights and at most
+// ReGIRExactCapacity members (padded list, then wide pool), each light with t_c > 0 gets an integer width w >= 1, the
+// widths sum to 2^32 - 1, and a slot holds the light whose interval contains its random value, with W = 2^32 / w (exactly
+// 1 / q). `ends` holds the cumulative widths (exclusive ends) of `lights`. Other cells are not exact: they keep the RIS
+// draw (ReGIRPresampleSlot).
+inline constexpr std::uint32_t ReGIRExactCapacity = 1024;
+
+struct ReGIRExactCell
+{
+    bool exact = false;
+    std::vector<std::uint32_t> lights;
+    std::vector<std::uint32_t> ends;
+};
+
+ReGIRExactCell ReGIRBuildExactCell(const LightSamplingData& data, const SceneLightTable& table,
+    const ReGIRCellSource& source, const ReGIRSettings& settings);
+
+// The slot `slot` (window cell * slots per cell + slot in cell) of an exact cell in frame `frameSeed`.
+ReGIRSlot ReGIRPresampleExactSlot(const ReGIRExactCell& cell, std::uint32_t slot, std::uint32_t frameSeed);
 
 // Scene-table index -> RTXDI local-light index (the light's rank among the table's non-directional lights, the order
 // BuildRtxdiLightSet adds them in); 0xFFFFFFFF for directional lights.

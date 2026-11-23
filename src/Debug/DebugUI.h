@@ -269,6 +269,41 @@ class DebugUI
         return m_restirPtRegirCone;
     }
 
+    // Point-light noise fix #1: ReSTIR PT's ReGIR slots drawn exactly from the cell target (off: 4-candidate RIS).
+    void SetRestirPtRegirExact(bool exact)
+    {
+        m_restirPtRegirExact = exact;
+    }
+
+    bool GetRestirPtRegirExact() const
+    {
+        return m_restirPtRegirExact;
+    }
+
+    // Point-light noise fix #2: the representative spot factor in ReSTIR PT's ReGIR cell target (off: the cone bound).
+    void SetRestirPtRegirSpotTarget(bool spotTarget)
+    {
+        m_restirPtRegirSpotTarget = spotTarget;
+    }
+
+    bool GetRestirPtRegirSpotTarget() const
+    {
+        return m_restirPtRegirSpotTarget;
+    }
+
+    // ReGIR architecture investigation (experimental): the list prototype's switch; available only when the Engine was
+    // launched with ENGINE_RESTIR_PT_LIST_PROTOTYPE=1.
+    void SetRestirPtRegirList(bool list, bool available)
+    {
+        m_restirPtRegirList = list;
+        m_restirPtRegirListAvailable = available;
+    }
+
+    bool GetRestirPtRegirList() const
+    {
+        return m_restirPtRegirList;
+    }
+
     void SetRestirPtRegirDirect(bool direct)
     {
         m_restirPtRegirDirect = direct;
@@ -560,6 +595,10 @@ class DebugUI
     int m_restirPtRegirSpatialPairs = 0;
     int m_restirPtRegirSlots = 512;
     bool m_restirPtRegirCone = true;
+    bool m_restirPtRegirExact = true;
+    bool m_restirPtRegirSpotTarget = true;
+    bool m_restirPtRegirList = true;
+    bool m_restirPtRegirListAvailable = false;
     bool m_restirPtRegirDirect = true;
 
 #ifndef NDEBUG

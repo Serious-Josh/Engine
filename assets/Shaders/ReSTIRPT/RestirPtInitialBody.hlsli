@@ -515,6 +515,17 @@ static const uint RESTIR_PT_REGIR_HEADER_BYTES = 64u;
 static const uint RESTIR_PT_REGIR_MAGIC = 0x52654749u;
 // M5.6 O0.2: the light map's table-indexed p_1 (RestirPtReGIRLights.hlsl; ReSTIRPTPass::ReGIRLightCapacity x 8 bytes in).
 static const uint RESTIR_PT_REGIR_TABLE_P1 = 131072u * 8u;
+// ReGIR architecture investigation (experimental): the list sampler's 32-byte proposal records (RestirPtReGIRLights.hlsl).
+static const uint RESTIR_PT_REGIR_COMPACT = 131072u * 12u;
+
+float3 RestirPtOctDecode(uint packed)
+{
+    const float2 folded = float2(packed & 65535u, packed >> 16u) * (2.0f / 65535.0f) - 1.0f;
+    float3 direction = float3(folded, 1.0f - abs(folded.x) - abs(folded.y));
+    const float t = saturate(-direction.z);
+    direction.xy += float2(direction.x >= 0.0f ? -t : t, direction.y >= 0.0f ? -t : t);
+    return normalize(direction);
+}
 static const uint RESTIR_PT_DIMENSION_STREAM = 200u;
 // M5.2: the temporal neighbour's reprojection jitter (two dimensions at vertex 0).
 static const uint RESTIR_PT_DIMENSION_TEMPORAL = 240u;
@@ -1291,7 +1302,365 @@ float3 RestirPtTableLightNee(PathTraceSurface surface, float3 position, uint see
     }
 #endif
 
-    for(uint candidate = 0u; candidate < candidates; ++candidate)
+    // ReGIR architecture investigation (experimental, RESTIR_PT_LIST_PROTOTYPE: ENGINE_RESTIR_PT_LIST_PROTOTYPE=1, ReGIR kernel
+    // only): candidates from a per-receiver proposal over the M4.1 light grid's list for this point (the nominal list of
+    // its cell, which holds every binned light reaching the point, plus the wide pool), q(l) = t(l) / T with the cheap target
+    // t = luminance(incident radiance) max(n . omega, 0.05) for lights that reach the point above its surface (0 otherwise;
+    // positive wherever the full target is). M candidates are drawn systematically (stratified: candidate k at
+    // (k + xi) T / M of the cumulative targets); a light drawn n times is evaluated once with weight n p_hat / (M q), which
+    // is the stratified RIS estimate (unbiased: each stratum's candidate has density M q on its stratum). p_1 for the
+    // integrand stays the table's global probability (as direct fetch). No ReGIR slots, window or fallback.
+    uint standardCandidates = candidates;
+#if defined(RESTIR_PT_REGIR) && defined(RESTIR_PT_LIST_PROTOTYPE)
+    const LightSamplingConstants listSampling = LightSamplingLoadConstants(restirPtLightSamplingIndex);
+
+    // Experiment modes (restirPtRegirPadding.x): bit 2 list proposals on; bit 3 single pass (one light by weighted reservoir
+    // sampling over the cheap targets, q = t / T exactly, no second pass); bit 4 list at x1 only (deeper vertices use the
+    // light tiles: the slots are not built); bit 5 list only where ReGIR has no cell (outside the window, slots built).
+    const uint listMode = restirPtRegirPadding.x;
+    const bool listVertex = (listMode & 16u) == 0u || vertex == 1u;
+    const bool listFallbackOnly = (listMode & 32u) != 0u;
+
+    const bool deepReGIR = (listMode & 64u) != 0u;
+    const bool deepUniform = (listMode & 128u) != 0u;
+
+    if((listMode & 4u) != 0u && !listVertex && !deepReGIR)
+    {
+        regirCell = -1;
+    }
+
+    if((listMode & 4u) != 0u && !listVertex && deepUniform && restirPtLightSamplingIndex != 0xFFFFFFFFu &&
+        restirPtRegirLightsIndex != 0xFFFFFFFFu && listSampling.valid != 0u && listSampling.tableLightCount == sceneLightCount)
+    {
+        // Deeper vertices: the M candidates drawn uniformly from the receiver's cell list and the wide pool (members N,
+        // each drawn with the realized probability LightSamplingUniformProbability), RIS weight p_hat / (M q).
+        standardCandidates = 0u;
+        const LightSamplingPools pools = LightSamplingPoolsAt(listSampling, position);
+        ByteAddressBuffer structures = LightSamplingBuffer(listSampling);
+        const uint nominal = pools.cell.nominalCount;
+        const uint members = nominal + pools.wideCount;
+        regirCell = pools.cellIndex >= 0 ? pools.cellIndex : 0;
+
+        for(uint candidate = 0u; candidate < candidates && members != 0u; ++candidate)
+        {
+            const uint draw = LightSamplingMulHi(RestirPtRandomUint(seed, vertex, RESTIR_PT_DIMENSION_RIS + 2u * candidate),
+                members);
+            const float probability = LightSamplingUniformProbability(draw, members);
+            const uint light = draw < nominal ?
+                structures.Load(LIGHT_SAMPLING_HEADER_BYTES + listSampling.listsOffset + (pools.cell.offset + draw) * 4u) :
+                structures.Load(LIGHT_SAMPLING_HEADER_BYTES + listSampling.wideOffset + (draw - nominal) * 16u + 12u);
+            const GPULight candidateLight = SceneLightLoad(sceneLightBufferIndex, light);
+            const PathTraceLightSample lightSample = PathTraceSampleTableLight(candidateLight, position);
+            float3 candidateDiffuse;
+            const float3 value = RestirPtUnshadowed(surface, lightSample, candidateDiffuse);
+            const float target = PathTraceLuminance(value);
+
+            if(!(target > 0.0f) || !all(isfinite(value)))
+            {
+                continue;
+            }
+
+            const float weight = target / (float(candidates) * probability);
+            weightSum += weight;
+
+            if(RestirPtRandom(seed, vertex, RESTIR_PT_DIMENSION_RIS + 2u * candidate + 1u) * weightSum <= weight)
+            {
+                selectedTarget = target;
+                selectedValue = value;
+                selectedDiffuse = candidateDiffuse;
+                selectedSample = lightSample;
+                selectedTable = candidateLight.type == SCENE_LIGHT_POINT || candidateLight.type == SCENE_LIGHT_SPOT;
+                lightIndex = light;
+            }
+        }
+
+        if(selectedTarget > 0.0f)
+        {
+            ByteAddressBuffer regirLights = ResourceDescriptorHeap[restirPtRegirLightsIndex];
+            selectedSourcePdf = asfloat(regirLights.Load(RESTIR_PT_REGIR_TABLE_P1 + lightIndex * 4u));
+            selectedTarget = selectedSourcePdf > 0.0f ? selectedTarget : 0.0f;
+        }
+    }
+
+    if((listMode & 4u) != 0u && listVertex && (!listFallbackOnly || regirCell < 0) &&
+        restirPtLightSamplingIndex != 0xFFFFFFFFu && restirPtRegirLightsIndex != 0xFFFFFFFFu && listSampling.valid != 0u &&
+        listSampling.tableLightCount == sceneLightCount && (listMode & 256u) != 0u)
+    {
+        // Adaptive systematic sampling in one pass (bit 8): member l (cheap target t_l > 0, in list order) is crossed with
+        // the spacing s_l = (T_{l-1} + t_l) (N / l) / M, the running extrapolation of the total, which depends only on the
+        // members before it. The phase phi in [0, 1) (units of the current spacing) starts uniform and stays uniform from
+        // member to member (a rotation mod 1), so member l receives c_l = number of k >= 0 with (phi + k) s_l < t_l samples
+        // with E[c_l] = t_l / s_l exactly. Each sample weighs p_hat s_l / t_l (Horvitz-Thompson), so the weight sum is an
+        // unbiased estimate of sum p_hat and RIS over the samples is unbiased (by linearity over the candidates, whatever
+        // their number); a member's count is at most about M l / N.
+        standardCandidates = 0u;
+        const LightSamplingPools pools = LightSamplingPoolsAt(listSampling, position);
+        ByteAddressBuffer structures = LightSamplingBuffer(listSampling);
+        const uint nominal = pools.cell.nominalCount;
+        const uint members = nominal + pools.wideCount;
+        regirCell = pools.cellIndex >= 0 ? pools.cellIndex : 0;
+        float cumulative = 0.0f;
+        float phase = RestirPtRandom(seed, vertex, RESTIR_PT_DIMENSION_RIS);
+        // Experiment: ENGINE_RESTIR_PT_LIST_M (bits 16-23) overrides M; bit 9 uses the 32-byte proposal records (hard range
+        // cutoff, precomputed luminance, cone only for spots; positive wherever the light's incident radiance is).
+        const uint listCandidates = ((listMode >> 16u) & 255u) != 0u ? (listMode >> 16u) & 255u : candidates;
+        const bool compactRecords = (listMode & 512u) != 0u;
+        ByteAddressBuffer records = ResourceDescriptorHeap[restirPtRegirLightsIndex];
+
+        for(uint member = 0u; member < members; ++member)
+        {
+            const uint light = member < nominal ?
+                structures.Load(LIGHT_SAMPLING_HEADER_BYTES + listSampling.listsOffset + (pools.cell.offset + member) * 4u) :
+                structures.Load(LIGHT_SAMPLING_HEADER_BYTES + listSampling.wideOffset + (member - nominal) * 16u + 12u);
+            float cheap = 0.0f;
+            GPULight candidateLight = (GPULight)0;
+            PathTraceLightSample lightSample = (PathTraceLightSample)0;
+
+            if(compactRecords)
+            {
+                const uint4 head = records.Load4(RESTIR_PT_REGIR_COMPACT + light * 32u);
+                const float3 toLight = asfloat(head.xyz) - position;
+                const float distanceSquared = dot(toLight, toLight);
+                const float range = asfloat(head.w);
+
+                if(distanceSquared < range * range && distanceSquared > 0.0f)
+                {
+                    const float3 direction = toLight * rsqrt(distanceSquared);
+
+                    if(PathTraceDirectionAboveSurface(surface, direction))
+                    {
+                        const uint4 tail = records.Load4(RESTIR_PT_REGIR_COMPACT + light * 32u + 16u);
+                        cheap = asfloat(tail.x) / max(distanceSquared, 1.0e-4f) * max(dot(surface.normal, direction), 0.05f);
+                        const float inverseWidth = asfloat(tail.w);
+
+                        if(inverseWidth > 0.0f)
+                        {
+                            const float factor = saturate((dot(-direction, RestirPtOctDecode(tail.y)) - asfloat(tail.z)) *
+                                inverseWidth);
+                            cheap *= factor * factor;
+                        }
+                    }
+                }
+            }
+            else
+            {
+                candidateLight = SceneLightLoad(sceneLightBufferIndex, light);
+                lightSample = PathTraceSampleTableLight(candidateLight, position);
+                cheap = lightSample.valid && PathTraceDirectionAboveSurface(surface, lightSample.direction) ?
+                    PathTraceLuminance(lightSample.radiance) * max(dot(surface.normal, lightSample.direction), 0.05f) : 0.0f;
+            }
+
+            if(!(cheap > 0.0f) || !isfinite(cheap))
+            {
+                continue;
+            }
+
+            cumulative += cheap;
+            const float spacing = cumulative * (float(members) / float(member + 1u)) / float(listCandidates);
+            const float span = cheap / spacing;
+            // Samples at (phase + k) spacing for k >= 0 below cheap; the next member's phase is (phase + count) - span.
+            const uint count = span > phase ? uint(ceil(span - phase)) : 0u;
+            phase = frac(phase + float(count) - span);
+
+            if(count == 0u)
+            {
+                continue;
+            }
+
+            if(compactRecords)
+            {
+                candidateLight = SceneLightLoad(sceneLightBufferIndex, light);
+                lightSample = PathTraceSampleTableLight(candidateLight, position);
+            }
+
+            float3 candidateDiffuse;
+            const float3 value = RestirPtUnshadowed(surface, lightSample, candidateDiffuse);
+            const float target = PathTraceLuminance(value);
+
+            if(!(target > 0.0f) || !all(isfinite(value)))
+            {
+                continue;
+            }
+
+            const float weight = float(count) * target * spacing / cheap;
+            weightSum += weight;
+
+            if(RestirPtRandom(seed, vertex, RESTIR_PT_DIMENSION_RIS + 2u * member + 1u) * weightSum <= weight)
+            {
+                selectedTarget = target;
+                selectedValue = value;
+                selectedDiffuse = candidateDiffuse;
+                selectedSample = lightSample;
+                selectedTable = candidateLight.type == SCENE_LIGHT_POINT || candidateLight.type == SCENE_LIGHT_SPOT;
+                lightIndex = light;
+            }
+        }
+
+        if(selectedTarget > 0.0f)
+        {
+            ByteAddressBuffer regirLights = ResourceDescriptorHeap[restirPtRegirLightsIndex];
+            selectedSourcePdf = asfloat(regirLights.Load(RESTIR_PT_REGIR_TABLE_P1 + lightIndex * 4u));
+            selectedTarget = selectedSourcePdf > 0.0f ? selectedTarget : 0.0f;
+        }
+    }
+    else if((listMode & 4u) != 0u && listVertex && (!listFallbackOnly || regirCell < 0) &&
+        restirPtLightSamplingIndex != 0xFFFFFFFFu && restirPtRegirLightsIndex != 0xFFFFFFFFu && listSampling.valid != 0u &&
+        listSampling.tableLightCount == sceneLightCount && (listMode & 8u) != 0u)
+    {
+        // Single pass: weighted reservoir sampling of one light in proportion to its cheap target t, then its full target.
+        standardCandidates = 0u;
+        const LightSamplingPools pools = LightSamplingPoolsAt(listSampling, position);
+        ByteAddressBuffer structures = LightSamplingBuffer(listSampling);
+        const uint nominal = pools.cell.nominalCount;
+        const uint members = nominal + pools.wideCount;
+        regirCell = pools.cellIndex >= 0 ? pools.cellIndex : 0;
+        float total = 0.0f;
+        float chosenCheap = 0.0f;
+        uint chosen = 0xFFFFFFFFu;
+        PathTraceLightSample chosenSample = (PathTraceLightSample)0;
+        uint chosenType = 0u;
+
+        for(uint member = 0u; member < members; ++member)
+        {
+            const uint light = member < nominal ?
+                structures.Load(LIGHT_SAMPLING_HEADER_BYTES + listSampling.listsOffset + (pools.cell.offset + member) * 4u) :
+                structures.Load(LIGHT_SAMPLING_HEADER_BYTES + listSampling.wideOffset + (member - nominal) * 16u + 12u);
+            const GPULight memberLight = SceneLightLoad(sceneLightBufferIndex, light);
+            const PathTraceLightSample memberSample = PathTraceSampleTableLight(memberLight, position);
+            const float cheap = memberSample.valid && PathTraceDirectionAboveSurface(surface, memberSample.direction) ?
+                PathTraceLuminance(memberSample.radiance) * max(dot(surface.normal, memberSample.direction), 0.05f) : 0.0f;
+
+            if(!(cheap > 0.0f))
+            {
+                continue;
+            }
+
+            total += cheap;
+
+            if(RestirPtRandom(seed, vertex, RESTIR_PT_DIMENSION_RIS + 2u * member + 1u) * total < cheap)
+            {
+                chosen = light;
+                chosenCheap = cheap;
+                chosenSample = memberSample;
+                chosenType = memberLight.type;
+            }
+        }
+
+        if(chosen != 0xFFFFFFFFu && total > 0.0f && isfinite(total))
+        {
+            float3 candidateDiffuse;
+            const float3 value = RestirPtUnshadowed(surface, chosenSample, candidateDiffuse);
+            const float target = PathTraceLuminance(value);
+
+            if(target > 0.0f && all(isfinite(value)))
+            {
+                // M = 1: the RIS weight is p_hat / q, q = t / T.
+                weightSum = target * total / chosenCheap;
+                selectedTarget = target;
+                selectedValue = value;
+                selectedDiffuse = candidateDiffuse;
+                selectedSample = chosenSample;
+                selectedTable = chosenType == SCENE_LIGHT_POINT || chosenType == SCENE_LIGHT_SPOT;
+                lightIndex = chosen;
+                ByteAddressBuffer regirLights = ResourceDescriptorHeap[restirPtRegirLightsIndex];
+                selectedSourcePdf = asfloat(regirLights.Load(RESTIR_PT_REGIR_TABLE_P1 + lightIndex * 4u));
+                selectedTarget = selectedSourcePdf > 0.0f ? selectedTarget : 0.0f;
+            }
+        }
+    }
+    else if((listMode & 4u) != 0u && listVertex && (!listFallbackOnly || regirCell < 0) &&
+        restirPtLightSamplingIndex != 0xFFFFFFFFu && restirPtRegirLightsIndex != 0xFFFFFFFFu && listSampling.valid != 0u &&
+        listSampling.tableLightCount == sceneLightCount)
+    {
+        standardCandidates = 0u;
+        const LightSamplingPools pools = LightSamplingPoolsAt(listSampling, position);
+        ByteAddressBuffer structures = LightSamplingBuffer(listSampling);
+        const uint nominal = pools.cell.nominalCount;
+        const uint members = nominal + pools.wideCount;
+        regirCell = pools.cellIndex >= 0 ? pools.cellIndex : 0;
+        float total = 0.0f;
+
+        for(uint member = 0u; member < members; ++member)
+        {
+            const uint light = member < nominal ?
+                structures.Load(LIGHT_SAMPLING_HEADER_BYTES + listSampling.listsOffset + (pools.cell.offset + member) * 4u) :
+                structures.Load(LIGHT_SAMPLING_HEADER_BYTES + listSampling.wideOffset + (member - nominal) * 16u + 12u);
+            const PathTraceLightSample cheapSample = PathTraceSampleTableLight(SceneLightLoad(sceneLightBufferIndex, light),
+                position);
+            total += cheapSample.valid && PathTraceDirectionAboveSurface(surface, cheapSample.direction) ?
+                PathTraceLuminance(cheapSample.radiance) * max(dot(surface.normal, cheapSample.direction), 0.05f) : 0.0f;
+        }
+
+        if(total > 0.0f && isfinite(total))
+        {
+            const float xi = RestirPtRandom(seed, vertex, RESTIR_PT_DIMENSION_RIS);
+            const float step = total / float(candidates);
+            float cumulative = 0.0f;
+            uint emitted = 0u;
+
+            for(uint member = 0u; member < members && emitted < candidates; ++member)
+            {
+                const uint light = member < nominal ?
+                    structures.Load(LIGHT_SAMPLING_HEADER_BYTES + listSampling.listsOffset + (pools.cell.offset + member) * 4u) :
+                    structures.Load(LIGHT_SAMPLING_HEADER_BYTES + listSampling.wideOffset + (member - nominal) * 16u + 12u);
+                const GPULight candidateLight = SceneLightLoad(sceneLightBufferIndex, light);
+                const PathTraceLightSample lightSample = PathTraceSampleTableLight(candidateLight, position);
+                const float cheap = lightSample.valid && PathTraceDirectionAboveSurface(surface, lightSample.direction) ?
+                    PathTraceLuminance(lightSample.radiance) * max(dot(surface.normal, lightSample.direction), 0.05f) : 0.0f;
+
+                if(!(cheap > 0.0f))
+                {
+                    continue;
+                }
+
+                cumulative += cheap;
+                uint count = 0u;
+
+                while(emitted < candidates && (float(emitted) + xi) * step < cumulative)
+                {
+                    ++count;
+                    ++emitted;
+                }
+
+                if(count == 0u)
+                {
+                    continue;
+                }
+
+                float3 candidateDiffuse;
+                const float3 value = RestirPtUnshadowed(surface, lightSample, candidateDiffuse);
+                const float target = PathTraceLuminance(value);
+
+                if(!(target > 0.0f) || !all(isfinite(value)))
+                {
+                    continue;
+                }
+
+                const float weight = float(count) * target * total / (float(candidates) * cheap);
+                weightSum += weight;
+
+                if(RestirPtRandom(seed, vertex, RESTIR_PT_DIMENSION_RIS + 2u * member + 1u) * weightSum <= weight)
+                {
+                    selectedTarget = target;
+                    selectedValue = value;
+                    selectedDiffuse = candidateDiffuse;
+                    selectedSample = lightSample;
+                    selectedTable = candidateLight.type == SCENE_LIGHT_POINT || candidateLight.type == SCENE_LIGHT_SPOT;
+                    lightIndex = light;
+                }
+            }
+
+            if(selectedTarget > 0.0f)
+            {
+                ByteAddressBuffer regirLights = ResourceDescriptorHeap[restirPtRegirLightsIndex];
+                selectedSourcePdf = asfloat(regirLights.Load(RESTIR_PT_REGIR_TABLE_P1 + lightIndex * 4u));
+                selectedTarget = selectedSourcePdf > 0.0f ? selectedTarget : 0.0f;
+            }
+        }
+    }
+#endif
+
+    for(uint candidate = 0u; candidate < standardCandidates; ++candidate)
     {
         const uint candidateRandom = RestirPtRandomUint(seed, vertex, RESTIR_PT_DIMENSION_RIS + 2u * candidate);
         uint2 entry;

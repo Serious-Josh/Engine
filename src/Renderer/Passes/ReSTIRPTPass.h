@@ -121,19 +121,20 @@ struct ReSTIRPTSettings
     // ENGINE_RESTIR_PT_HISTORY_SCENE=0 turns it off for comparisons.
     bool historyScene = true;
     // Optimization A5 (ENGINE_RESTIR_PT_SPATIAL_PAIRS=1..3, or the Editor's "Spatial pairs"): spatial partners per pixel.
-    // Default 2 (user-approved 2026-11-23: about -3 ms on Demo, acceptable visually; known regression: more RR fireflies
-    // on ManyLight_1024). 3 is the published, higher-quality option; 1 shows blockiness on reflections (experiments only).
-    std::uint32_t spatialPairs = 2;
+    // Default 1 (user decision 2026-11-23, after the adaptive light sampler; previously 2, user-approved earlier the same
+    // day; 1 showed blockiness on reflections in the M5.5 experiments). 3 is the published, higher-quality option.
+    std::uint32_t spatialPairs = 1;
     // Optimization experiment B1a (ENGINE_RESTIR_PT_DECORRELATION_MODE=stagnancy, or the Editor's "Decorrelation"):
     // NVIDIA RTXDI's Stagnancy mode in place of Uniform. p = saturate(4 * stagnancyFactor * sqrt(smoothed age / 40)),
     // with the age carried in the reservoir and smoothed by an EMA over the reprojected map (RTXDI defaults). Biased (the
-    // probability depends on sample history). Off by default (Uniform).
+    // probability depends on sample history). Default Stagnancy (user decision 2026-11-23);
+    // ENGINE_RESTIR_PT_DECORRELATION_MODE=uniform restores Uniform.
     enum class DecorrelationMode
     {
         Uniform,
         Stagnancy
     };
-    DecorrelationMode decorrelationMode = DecorrelationMode::Uniform;
+    DecorrelationMode decorrelationMode = DecorrelationMode::Stagnancy;
     float stagnancyFactor = 0.4f;
     // Optimization B1b (user-approved default 2026-11-23; ENGINE_RESTIR_PT_FIREFLY=0 or the Editor's "Firefly replacement"
     // turns it off): NVIDIA RTXDI's firefly replacement. The resample pass flags pixels whose shaded luminance exceeds
@@ -148,9 +149,10 @@ struct ReSTIRPTSettings
     // shifts and MIS are unchanged and the switch is not part of the history signature.
     bool regir = true;
     // M5.6 O0.1: ReSTIR PT's own ReGIR window, in cells per axis (ReSTIR DI keeps ReGIRSettings::windowCells; one shared
-    // slot buffer is sized for either). 16 (64 m across at 4 m cells) is the O0 default; 32 covers 128 m.
-    // ENGINE_RESTIR_PT_REGIR_WINDOW or the Editor's "ReGIR grid" (16 or 32). Proposal only: not in the history signature.
-    std::uint32_t regirWindow = 16;
+    // slot buffer is sized for either). 16 (64 m across at 4 m cells) was the O0 default; 32 (128 m) is the default since
+    // the user decision of 2026-11-23. ENGINE_RESTIR_PT_REGIR_WINDOW or the Editor's "ReGIR grid" (16 or 32). Proposal
+    // only: not in the history signature.
+    std::uint32_t regirWindow = 32;
     // M5.6 O0.1: the spatial partners used on frames whose candidates come from ReGIR (0: spatialPairs, as on other frames).
     // ENGINE_RESTIR_PT_REGIR_SPATIAL_PAIRS or the Editor's "Spatial pairs with ReGIR".
     std::uint32_t regirSpatialPairs = 0;
@@ -171,6 +173,22 @@ struct ReSTIRPTSettings
     // cell" slider (up to Renderer::ReGIRMaximumSlotsPerCell, the buffer's capacity). Measured (32-cell window): 64 -> 256
     // -> 1024 slots: still flashing 3% -> 0.07% -> 0%, grid build 0.26 -> 1.0 -> 4.3 ms.
     std::uint32_t regirSlots = 512;
+    // Point-light noise fix #1 (user-approved 2026-11-23): ReSTIR PT's ReGIR slots are drawn exactly in proportion to the
+    // cell target over the cell's padded list and small wide pool, with W = 1 / q, instead of by 4-candidate RIS, whose
+    // W only estimates 1 / q (ReGIRPresample.hlsl mainExact; cells outside the M4.1 grid or with a large wide pool keep the
+    // RIS draw). Changes the proposal: q is the cell target itself. ENGINE_RESTIR_PT_REGIR_PROPOSAL=ris or the Editor's
+    // "ReGIR exact slot proposal" restores the RIS draw.
+    bool regirExactProposal = true;
+    // Point-light noise fix #2 (user-approved 2026-11-23): a spot light's cone factor in the ReGIR cell target is its mean
+    // over a 3 x 3 x 3 grid of the cell's lookup region (at least 0.05 of the conservative bound, so coverage is unchanged)
+    // instead of the bound alone, which let spots crowd point lights out of the slots where their cones barely reach.
+    // Proposal only. ENGINE_RESTIR_PT_REGIR_SPOT_TARGET=bound or the Editor's "ReGIR representative spot target" restores
+    // the bound (with regirCone).
+    bool regirSpotTarget = true;
+    // ReGIR architecture investigation (experimental, not a production option): with ENGINE_RESTIR_PT_LIST_PROTOTYPE=1 at
+    // launch (which compiles the prototype), the Editor's "ReGIR list prototype" switches ReSTIR PT's ReGIR candidates to
+    // per-receiver proposals over the light grid's lists at run time. Ignored otherwise.
+    bool regirListPrototype = true;
 };
 
 // M5.2: what the previous frame's reservoirs were computed against. History is reused only when every field matches
@@ -455,8 +473,10 @@ class ReSTIRPTPass
     // M5.6 O0: this frame's RTXDI local light -> (table index, global realized probability) map for the ReGIR candidates
     // (RestirPtReGIRLights.hlsl, from the published light sampling's translation and global alias table). Returns its SRV
     // index, or 0xFFFFFFFF (more than ReGIRLightCapacity table lights, or not initialized: the light tiles are used).
+    // sceneLightBufferIndex (ReGIR architecture investigation, experimental): also write the list sampler's 32-byte
+    // proposal records (RestirPtReGIRLights.hlsl) when valid.
     std::uint32_t RecordReGIRLights(ID3D12GraphicsCommandList* commandList, UploadBuffer& uploadBuffer,
-        std::uint32_t lightSamplingIndex, std::uint32_t tableLightCount);
+        std::uint32_t lightSamplingIndex, std::uint32_t tableLightCount, std::uint32_t sceneLightBufferIndex = 0xFFFFFFFFu);
     static constexpr std::uint32_t ReGIRLightCapacity = 1u << 17;
     // This frame's RestirPtConstants: the settings' flags, the buffers' descriptors and the frame inputs. extract and
     // rawDiffuseHitDistance select the signal outputs (RESTIR_PT_FLAG_EXTRACT / _RAW_DIFFUSE_HIT_DISTANCE).

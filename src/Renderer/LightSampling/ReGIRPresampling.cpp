@@ -9,6 +9,7 @@
 namespace
 {
     constexpr std::uint32_t DirectionalType = 2;
+    constexpr std::uint32_t SpotType = 1;
     constexpr std::uint32_t CellWords = 3;
     constexpr std::uint32_t AliasWords = 4;
 
@@ -64,7 +65,7 @@ namespace
     constexpr std::uint32_t WideDefensiveThreshold = 1u << 26;
 
     bool DrawWideByTarget(const LightSamplingData& data, const SceneLightTable& lights, const ReGIRCellSource& source,
-        std::uint32_t random1, std::uint32_t random2, std::uint32_t& light, float& probability)
+        std::uint32_t flags, std::uint32_t random1, std::uint32_t random2, std::uint32_t& light, float& probability)
     {
         const LightSamplingConstants& constants = data.constants;
         const std::size_t entries = constants.wideOffset / 4;
@@ -72,7 +73,7 @@ namespace
         const auto targetOf = [&](std::uint32_t member)
         {
             return member < lights.lightCount ? ReGIRCellTarget(lights.lights[member], source.regionLow, source.regionHigh,
-                constants.cellSize) : 0.0f;
+                constants.cellSize, flags) : 0.0f;
         };
         float total = 0.0f;
         std::uint32_t reaching = 0;
@@ -218,7 +219,8 @@ ReGIRCellSource ReGIRCellSourceAt(const LightSamplingData& data, const ReGIRWind
     return source;
 }
 
-float ReGIRCellTarget(const GPULight& light, const float regionLow[3], const float regionHigh[3], float cellSize)
+float ReGIRCellTarget(const GPULight& light, const float regionLow[3], const float regionHigh[3], float cellSize,
+    std::uint32_t flags)
 {
     // ReGIRCellTarget in ReGIRPresample.hlsl, in float.
     const float luminance = Luminance(light.radiance);
@@ -254,7 +256,72 @@ float ReGIRCellTarget(const GPULight& light, const float regionLow[3], const flo
     }
 
     const float halfCell = 0.5f * cellSize;
-    const float target = luminance * window / (std::max)(distanceSquared, halfCell * halfCell);
+    float target = luminance * window / (std::max)(distanceSquared, halfCell * halfCell);
+
+    // The spot factor (flags 1 and 8), as the shader: the conservative bound over the region's bounding sphere, and with
+    // flag 8 the mean over a 3 x 3 x 3 grid of the region, at least 0.05 times the bound.
+    if((flags & 9u) != 0u && light.type == SpotType)
+    {
+        float centre[3];
+        float diagonal[3];
+        float toCentre[3];
+
+        for(int axis = 0; axis < 3; ++axis)
+        {
+            centre[axis] = 0.5f * (regionLow[axis] + regionHigh[axis]);
+            diagonal[axis] = regionHigh[axis] - regionLow[axis];
+            toCentre[axis] = centre[axis] - light.position[axis];
+        }
+
+        const auto length = [](const float v[3]) { return std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]); };
+        const float radius = 0.5f * length(diagonal);
+        const float centreDistance = length(toCentre);
+        const float axisLength = length(light.direction);
+        const float axis[3] = {light.direction[0] / axisLength, light.direction[1] / axisLength,
+            light.direction[2] / axisLength};
+        const float coneWidth = (std::max)(light.cosInnerCone - light.cosOuterCone, 1.0e-4f);
+        const auto saturate = [](float value) { return std::clamp(value, 0.0f, 1.0f); };
+        float coneFactor = 1.0f;
+
+        if(centreDistance > radius)
+        {
+            const float cosine = (toCentre[0] * axis[0] + toCentre[1] * axis[1] + toCentre[2] * axis[2]) / centreDistance;
+            const float axisAngle = std::acos(std::clamp(cosine, -1.0f, 1.0f));
+            const float angularRadius = std::asin(saturate(radius / centreDistance)) + 1.0e-3f;
+            const float smallestCosine = std::cos((std::max)(axisAngle - angularRadius, 0.0f));
+            const float coneBound = saturate((smallestCosine - light.cosOuterCone) / coneWidth);
+            coneFactor = coneBound * coneBound;
+        }
+
+        if((flags & 8u) != 0u && coneFactor > 0.0f)
+        {
+            float sum = 0.0f;
+
+            for(std::uint32_t point = 0; point < 27; ++point)
+            {
+                const float fraction[3] = {static_cast<float>(point % 3) * 0.5f, static_cast<float>((point / 3) % 3) * 0.5f,
+                    static_cast<float>(point / 9) * 0.5f};
+                float offset[3];
+
+                for(int axisIndex = 0; axisIndex < 3; ++axisIndex)
+                {
+                    offset[axisIndex] = regionLow[axisIndex] + diagonal[axisIndex] * fraction[axisIndex] -
+                        light.position[axisIndex];
+                }
+
+                const float pointDistance = length(offset);
+                const float pointCosine = pointDistance > 0.0f ? (offset[0] * axis[0] + offset[1] * axis[1] +
+                    offset[2] * axis[2]) / pointDistance : 1.0f;
+                const float factor = saturate((pointCosine - light.cosOuterCone) / coneWidth);
+                sum += factor * factor;
+            }
+
+            coneFactor = (std::max)(sum * (1.0f / 27.0f), 0.05f * coneFactor);
+        }
+
+        target *= coneFactor;
+    }
+
     return target > 0.0f ? target : 0.0f;
 }
 
@@ -311,7 +378,7 @@ ReGIRSlot ReGIRPresampleSlot(const LightSamplingData& data, const SceneLightTabl
         {
             if(source.wideCount <= settings.wideTargetLimit)
             {
-                if(!DrawWideByTarget(data, table, source, random1, random2, light, probability))
+                if(!DrawWideByTarget(data, table, source, settings.targetFlags, random1, random2, light, probability))
                 {
                     light = 0xFFFFFFFFu;
                     probability = 0.0f;
@@ -336,7 +403,7 @@ ReGIRSlot ReGIRPresampleSlot(const LightSamplingData& data, const SceneLightTabl
 
         const bool usable = light != 0xFFFFFFFFu && probability > 0.0f && light < table.lightCount;
         const float target = usable ? ReGIRCellTarget(table.lights[light], source.regionLow, source.regionHigh,
-            constants.cellSize) : 0.0f;
+            constants.cellSize, settings.targetFlags) : 0.0f;
 
         if(trace)
         {
@@ -375,6 +442,92 @@ ReGIRSlot ReGIRPresampleSlot(const LightSamplingData& data, const SceneLightTabl
     }
 
     return slot;
+}
+
+ReGIRExactCell ReGIRBuildExactCell(const LightSamplingData& data, const SceneLightTable& table,
+    const ReGIRCellSource& source, const ReGIRSettings& settings)
+{
+    // mainExact in ReGIRPresample.hlsl, in float and uint32 in the shader's order of operations.
+    const LightSamplingConstants& constants = data.constants;
+    ReGIRExactCell cell;
+    const bool inGrid = source.gridCell >= 0;
+    const std::uint32_t wideMembers = inGrid ? source.wideCount : 0u;
+    const std::uint32_t members = source.paddedCount + wideMembers;
+    cell.exact = inGrid && wideMembers <= settings.wideTargetLimit && members <= ReGIRExactCapacity;
+
+    if(!cell.exact)
+    {
+        return cell;
+    }
+
+    std::vector<std::uint32_t> lights(members);
+    std::vector<float> targets(members);
+
+    for(std::uint32_t member = 0; member < members; ++member)
+    {
+        lights[member] = member < source.paddedCount ? data.words[constants.listsOffset / 4 + source.listOffset + member] :
+            data.words[constants.wideOffset / 4 + std::size_t{member - source.paddedCount} * AliasWords + 3];
+        targets[member] = lights[member] < table.lightCount ? ReGIRCellTarget(table.lights[lights[member]],
+            source.regionLow, source.regionHigh, constants.cellSize, settings.targetFlags) : 0.0f;
+    }
+
+    const auto usable = [](float target) { return target > 0.0f && std::isfinite(target); };
+    float total = 0.0f;
+    std::uint32_t positive = 0;
+
+    for(const float target : targets)
+    {
+        total += usable(target) ? target : 0.0f;
+        positive += usable(target) ? 1u : 0u;
+    }
+
+    if(positive == 0 || !(total > 0.0f) || !std::isfinite(total))
+    {
+        return cell;
+    }
+
+    // Each positive-target light: 1 + its share of the remaining 2^32 - 1 - positive; the last takes the remainder.
+    const std::uint32_t budget = 0xFFFFFFFFu - positive;
+    const float scale = static_cast<float>(budget) / total;
+    std::uint32_t spent = 0;
+    std::uint32_t end = 0;
+
+    for(std::uint32_t member = 0; member < members; ++member)
+    {
+        if(!usable(targets[member]))
+        {
+            continue;
+        }
+
+        const bool last = cell.lights.size() + 1 == positive;
+        const std::uint32_t share = last ? budget - spent :
+            (std::min)(static_cast<std::uint32_t>((std::min)(targets[member] * scale, 4294967040.0f)), budget - spent);
+        spent += share;
+        end += 1u + share;
+        cell.lights.push_back(lights[member]);
+        cell.ends.push_back(end);
+    }
+
+    return cell;
+}
+
+ReGIRSlot ReGIRPresampleExactSlot(const ReGIRExactCell& cell, std::uint32_t slot, std::uint32_t frameSeed)
+{
+    ReGIRSlot result;
+    std::uint32_t random = ReGIRSlotSeed(slot, frameSeed);
+    const std::uint32_t value = ReGIRNextRandom(random);
+
+    if(cell.ends.empty() || value >= cell.ends.back())
+    {
+        return result;
+    }
+
+    const std::size_t index = static_cast<std::size_t>(std::upper_bound(cell.ends.begin(), cell.ends.end(), value) -
+        cell.ends.begin());
+    const std::uint32_t width = cell.ends[index] - (index != 0 ? cell.ends[index - 1] : 0u);
+    result.light = cell.lights[index];
+    result.weight = 4294967296.0f / static_cast<float>(width);
+    return result;
 }
 
 void BuildReGIRLocalIndexTranslation(const SceneLightTable& table, std::vector<std::uint32_t>& translation)
@@ -421,6 +574,7 @@ ReGIRPresampleConstants MakeReGIRPresampleConstants(const ReGIRWindow& window, c
     const double threshold = std::round(static_cast<double>(settings.wideFraction) * 4294967296.0);
     constants.wideThreshold = static_cast<std::uint32_t>(std::clamp(threshold, 1.0, 4294967295.0));
     constants.wideTargetLimit = settings.wideTargetLimit;
+    constants.headerPadding = settings.targetFlags;
     constants.samplingJitter = window.samplingJitter;
     constants.precisionGuard = static_cast<float>(window.precisionGuard);
 

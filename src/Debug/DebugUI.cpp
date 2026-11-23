@@ -1555,6 +1555,21 @@ void DebugUI::DrawPathTraceReferenceSettings()
                 ImGui::SliderInt("ReGIR slots per cell", &m_restirPtRegirSlots, 16, 1024);
                 ImGui::Checkbox("ReGIR spot-cone bound", &m_restirPtRegirCone);
                 ImGui::Checkbox("ReGIR direct fetch", &m_restirPtRegirDirect);
+                // Point-light noise fix #1: slots drawn exactly in proportion to the cell target (off: 4-candidate RIS).
+                ImGui::Checkbox("ReGIR exact slot proposal", &m_restirPtRegirExact);
+                // Point-light noise fix #2: spot lights' cell target from their mean cone factor over the cell, not the bound.
+                ImGui::Checkbox("ReGIR representative spot target", &m_restirPtRegirSpotTarget);
+
+                // ReGIR architecture investigation (experimental): per-receiver light-grid list proposals.
+                if(m_restirPtRegirListAvailable)
+                {
+                    // Off: the three-fix ReGIR baseline; on: adaptive x1 + uniform-list hybrid (history reset on switch).
+                    ImGui::Checkbox("Adaptive x1 light sampling (experimental; off = ReGIR baseline)", &m_restirPtRegirList);
+                }
+                else
+                {
+                    ImGui::TextDisabled("Adaptive x1 light sampling: compiled out (ENGINE_RESTIR_PT_LIST_PROTOTYPE=0)");
+                }
             }
 
             if(m_restirPtSpatialReuse && resolved.pathTrace.samplesPerFrame != 1u)

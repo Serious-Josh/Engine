@@ -3377,7 +3377,7 @@ bool Renderer::Initialize(
         // scene instead (the pre-Stage 1 behaviour).
         m_restirPtSettings.historyScene = environment("ENGINE_RESTIR_PT_HISTORY_SCENE") != "0";
 
-        // Optimization experiment A5: ENGINE_RESTIR_PT_SPATIAL_PAIRS=1|2|3 spatial partners (default 3); the Editor's
+        // Optimization experiment A5: ENGINE_RESTIR_PT_SPATIAL_PAIRS=1|2|3 spatial partners (default 1); the Editor's
         // "Spatial pairs" slider starts from it.
         if(const std::string pairs = environment("ENGINE_RESTIR_PT_SPATIAL_PAIRS"); !pairs.empty())
         {
@@ -3387,11 +3387,16 @@ bool Renderer::Initialize(
         m_debugUI.SetRestirPtSpatialPairs(m_restirPtSettings.spatialPairs);
         m_restirPtUiSpatialPairs = m_restirPtSettings.spatialPairs;
 
-        // Optimization experiment B1a: ENGINE_RESTIR_PT_DECORRELATION_MODE=stagnancy (default uniform);
-        // ENGINE_RESTIR_PT_STAGNANCY_FACTOR=<f> (default 0.4, RTXDI's). The Editor's "Decorrelation" combo starts from it.
-        if(environment("ENGINE_RESTIR_PT_DECORRELATION_MODE") == "stagnancy")
+        // Optimization experiment B1a: ENGINE_RESTIR_PT_DECORRELATION_MODE=uniform|stagnancy (default stagnancy since
+        // 2026-11-23); ENGINE_RESTIR_PT_STAGNANCY_FACTOR=<f> (default 0.4, RTXDI's). The Editor's "Decorrelation" combo
+        // starts from it.
+        if(const std::string mode = environment("ENGINE_RESTIR_PT_DECORRELATION_MODE"); mode == "stagnancy")
         {
             m_restirPtSettings.decorrelationMode = ReSTIRPTSettings::DecorrelationMode::Stagnancy;
+        }
+        else if(mode == "uniform")
+        {
+            m_restirPtSettings.decorrelationMode = ReSTIRPTSettings::DecorrelationMode::Uniform;
         }
 
         if(const std::string factor = environment("ENGINE_RESTIR_PT_STAGNANCY_FACTOR"); !factor.empty())
@@ -3441,6 +3446,25 @@ bool Renderer::Initialize(
         m_restirPtUiRegirDirect = m_restirPtSettings.regirDirectFetch;
         m_debugUI.SetRestirPtRegirCone(m_restirPtUiRegirCone);
         m_debugUI.SetRestirPtRegirDirect(m_restirPtUiRegirDirect);
+        // Point-light noise fix #1: exact slot proposal (default on; ENGINE_RESTIR_PT_REGIR_PROPOSAL=ris restores RIS).
+        m_restirPtSettings.regirExactProposal = environment("ENGINE_RESTIR_PT_REGIR_PROPOSAL") != "ris";
+        m_restirPtUiRegirExact = m_restirPtSettings.regirExactProposal;
+        m_debugUI.SetRestirPtRegirExact(m_restirPtUiRegirExact);
+        // Point-light noise fix #2: representative spot target (default on; ENGINE_RESTIR_PT_REGIR_SPOT_TARGET=bound off).
+        m_restirPtSettings.regirSpotTarget = environment("ENGINE_RESTIR_PT_REGIR_SPOT_TARGET") != "bound";
+        m_restirPtUiRegirSpotTarget = m_restirPtSettings.regirSpotTarget;
+        m_debugUI.SetRestirPtRegirSpotTarget(m_restirPtUiRegirSpotTarget);
+        // ReGIR architecture investigation (experimental): the list prototype's switch (on when compiled in).
+        const char* listPrototype = std::getenv("ENGINE_RESTIR_PT_LIST_PROTOTYPE");
+        const bool listAvailable = !(listPrototype && std::string(listPrototype) == "0");
+
+        if(const char* start = std::getenv("ENGINE_RESTIR_PT_LIST_START"); start && std::string(start) == "off")
+        {
+            m_restirPtSettings.regirListPrototype = false;
+        }
+
+        m_restirPtUiRegirList = m_restirPtSettings.regirListPrototype;
+        m_debugUI.SetRestirPtRegirList(m_restirPtUiRegirList, listAvailable);
         m_restirPtUiRegirWindow = m_restirPtSettings.regirWindow;
         m_restirPtUiRegirSpatialPairs = m_restirPtSettings.regirSpatialPairs;
         m_debugUI.SetRestirPtRegirWindow(m_restirPtUiRegirWindow);
@@ -7274,6 +7298,44 @@ void Renderer::EvaluatePathTraceReSTIRPT()
 // tiles from the light sampling published for exactly this table, then the unified initial path sampling into the path
 // tracer's own targets. A frame without published light sampling for a table that has lights records nothing and logs once
 // (the finite table lights could not be sampled; rendering them incompletely would be silently biased).
+// ReGIR architecture investigation (experimental): ENGINE_RESTIR_PT_LIST_PROTOTYPE=1 (with the matching shader define, see
+// ShaderCompiler) builds only ReSTIR PT's ReGIR header (presample flag 16): the per-receiver list prototype reads no slots.
+// ReGIR architecture investigation (experimental): ENGINE_RESTIR_PT_REGIR_STRATIFIED=1 stratifies ReSTIR PT's exact slots
+// (presample flag 32).
+static bool ReGIRStratifiedExperiment()
+{
+    static const bool enabled = []
+    {
+        // Default on (user decision 2026-11-23); ENGINE_RESTIR_PT_REGIR_STRATIFIED=0 restores independent slot draws.
+        const char* value = std::getenv("ENGINE_RESTIR_PT_REGIR_STRATIFIED");
+        return !(value && std::string(value) == "0");
+    }();
+    return enabled;
+}
+
+static bool ReGIRListFallbackOnly()
+{
+    static const bool enabled = []
+    {
+        const char* value = std::getenv("ENGINE_RESTIR_PT_LIST_MODE");
+        // Modes that read slots (fallback-only, ReGIR at deeper vertices) keep the full build.
+        return value && (std::string(value).find("fallback") != std::string::npos ||
+            std::string(value).find("deepregir") != std::string::npos);
+    }();
+    return enabled;
+}
+
+static bool ReGIRListPrototype()
+{
+    static const bool enabled = []
+    {
+        // Default on (user decision 2026-11-23); ENGINE_RESTIR_PT_LIST_PROTOTYPE=0 compiles the adaptive sampler out.
+        const char* value = std::getenv("ENGINE_RESTIR_PT_LIST_PROTOTYPE");
+        return !(value && std::string(value) == "0");
+    }();
+    return enabled;
+}
+
 void Renderer::RecordReSTIRPTFrame(ID3D12GraphicsCommandList* commandList, unsigned int frameIndex,
     D3D12_GPU_VIRTUAL_ADDRESS constantsAddress, D3D12_GPU_VIRTUAL_ADDRESS sceneLightConstantsAddress,
     const FrameLighting& frameLighting, const PathTraceReferenceSettings& settings, const Matrix4& view,
@@ -7320,6 +7382,29 @@ void Renderer::RecordReSTIRPTFrame(ID3D12GraphicsCommandList* commandList, unsig
     {
         m_restirPtUiRegirCone = cone;
         m_restirPtSettings.regirCone = cone;
+    }
+
+    if(const bool exact = m_debugUI.GetRestirPtRegirExact(); exact != m_restirPtUiRegirExact)
+    {
+        m_restirPtUiRegirExact = exact;
+        m_restirPtSettings.regirExactProposal = exact;
+    }
+
+    if(const bool spotTarget = m_debugUI.GetRestirPtRegirSpotTarget(); spotTarget != m_restirPtUiRegirSpotTarget)
+    {
+        m_restirPtUiRegirSpotTarget = spotTarget;
+        m_restirPtSettings.regirSpotTarget = spotTarget;
+    }
+
+    if(const bool list = m_debugUI.GetRestirPtRegirList(); list != m_restirPtUiRegirList)
+    {
+        // Switching samplers drops ReSTIR PT's reservoirs, RR's history (InReset) and the accumulation, so a comparison
+        // never shows one sampler's history under the other.
+        m_restirPtUiRegirList = list;
+        m_restirPtSettings.regirListPrototype = list;
+        m_restirPtPass.InvalidateHistory();
+        m_upscalerHistoryResetPending = true;
+        m_pathTraceResetPending = true;
     }
 
     if(const bool direct = m_debugUI.GetRestirPtRegirDirect(); direct != m_restirPtUiRegirDirect)
@@ -7399,11 +7484,16 @@ void Renderer::RecordReSTIRPTFrame(ID3D12GraphicsCommandList* commandList, unsig
         m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::RestirPtReGIR);
         const std::uint32_t slots = PrepareReGIRFrame(commandList, frameLighting, m_frameCameraPosition, true,
             m_restirPtSettings.regirWindow, (m_restirPtSettings.regirCone ? 1u : 0u) |
-            (m_restirPtSettings.regirDirectFetch ? 2u : 0u), m_restirPtSettings.regirSlots);
+            (m_restirPtSettings.regirDirectFetch ? 2u : 0u) | (m_restirPtSettings.regirExactProposal ? 4u : 0u) |
+            (m_restirPtSettings.regirSpotTarget ? 8u : 0u) |
+            (ReGIRListPrototype() && m_restirPtSettings.regirListPrototype && !ReGIRListFallbackOnly() ? 16u : 0u) |
+            (ReGIRStratifiedExperiment() ? 32u : 0u),
+            m_restirPtSettings.regirSlots);
 
         if(slots != UINT_MAX)
         {
-            regirLightsIndex = m_restirPtPass.RecordReGIRLights(commandList, m_uploadBuffer, lightSamplingIndex, tableLights);
+            regirLightsIndex = m_restirPtPass.RecordReGIRLights(commandList, m_uploadBuffer, lightSamplingIndex, tableLights,
+                ReGIRListPrototype() ? m_frameSceneLightBufferIndex : 0xFFFFFFFFu);
             regirSlotsIndex = regirLightsIndex != 0xFFFFFFFFu ? slots : 0xFFFFFFFFu;
         }
 
@@ -7475,7 +7565,24 @@ void Renderer::RecordReSTIRPTFrame(ID3D12GraphicsCommandList* commandList, unsig
         const char* value = std::getenv("ENGINE_RESTIR_PT_PNC_LOG");
         return value && std::string(value) == "1";
     }();
-    constants.regirPadding[0] = (regirExact ? 1u : 0u) | (pncLog ? 2u : 0u);
+    // ReGIR architecture investigation (experimental): bit 2 switches the compiled-in list prototype on.
+    // ENGINE_RESTIR_PT_LIST_MODE (experimental, ';'-separated): single (bit 3), x1 (bit 4), fallback (bit 5).
+    static const std::uint32_t listModeBits = []
+    {
+        // Without ENGINE_RESTIR_PT_LIST_MODE: the hybrid under test (adaptive x1, uniform lists deeper; compact records
+        // measured neutral to slower, so off).
+        const char* value = std::getenv("ENGINE_RESTIR_PT_LIST_MODE");
+        const std::string text = value ? std::string(value) : std::string("adaptive;x1;deepuniform");
+        return (text.find("single") != std::string::npos ? 8u : 0u) | (text.find("x1") != std::string::npos ? 16u : 0u) |
+            (text.find("fallback") != std::string::npos ? 32u : 0u) | (text.find("deepregir") != std::string::npos ? 64u : 0u) |
+            (text.find("deepuniform") != std::string::npos ? 128u : 0u) |
+            (text.find("adaptive") != std::string::npos ? 256u : 0u) | (text.find("compact") != std::string::npos ? 512u : 0u) |
+            // ENGINE_RESTIR_PT_LIST_M: the x1 list sampler's M (bits 16-23; 0 = the vertex's candidate count).
+            ((std::getenv("ENGINE_RESTIR_PT_LIST_M") ? (std::min)(255ul, std::strtoul(std::getenv("ENGINE_RESTIR_PT_LIST_M"),
+                nullptr, 10)) : 0ul) << 16);
+    }();
+    constants.regirPadding[0] = (regirExact ? 1u : 0u) | (pncLog ? 2u : 0u) |
+        (ReGIRListPrototype() && m_restirPtSettings.regirListPrototype ? 4u | listModeBits : 0u);
     // M5.6 B4 cost attribution (diagnostic only, biased): ENGINE_RESTIR_PT_DIAG_SKIP_DISTANT = 1 sun NEE, 2 environment NEE,
     // 3 both skipped (timing comparisons only; never a rendering mode).
     static const std::uint32_t skipDistant = []
@@ -7843,6 +7950,16 @@ std::uint32_t Renderer::PrepareReGIRFrame(ID3D12GraphicsCommandList* commandList
             m_regirSettings.windowCells[1] * m_regirSettings.windowCells[2], capacityCells * capacityCells * capacityCells) *
             m_regirSlotCapacity * 8u;
 
+        // Point-light noise fix #1: ReSTIR PT's exact build, the same root signature (a missing one keeps the RIS build).
+        ComputePipelineDescription exactDescription = description;
+        exactDescription.computeShader = m_shaderLibrary.Load({"ReGIRPresample.hlsl", "mainExact", ShaderStage::Compute});
+
+        if(!exactDescription.computeShader || !m_regirPresampleExactPipeline.Initialize(device, exactDescription))
+        {
+            Log::Warning("ReGIR exact slot proposal unavailable; ReSTIR PT keeps the RIS slot build.");
+            m_regirPresampleExactPipeline.Shutdown();
+        }
+
         if(!shader || !m_regirPresamplePipeline.Initialize(device, description) ||
             !m_regirSlots.InitializeGPUWritable(device, static_cast<std::size_t>(slotBytes)) ||
             !m_regirSlots.CreateRawUAV(device, m_resourceDescriptorHeap))
@@ -7904,9 +8021,19 @@ std::uint32_t Renderer::PrepareReGIRFrame(ID3D12GraphicsCommandList* commandList
 
     const std::uint32_t slots = window.CellCount() * settings.lightsPerCell;
     m_regirSlots.Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    m_regirPresamplePipeline.Bind(commandList);
+    // Point-light noise fix #1 (ReSTIR PT, presample flag 4): one group per window cell draws the cell's slots exactly.
+    const bool exact = (presampleFlags & 4u) != 0u && m_regirPresampleExactPipeline.GetRootSignature() != nullptr;
+    (exact ? m_regirPresampleExactPipeline : m_regirPresamplePipeline).Bind(commandList);
     commandList->SetComputeRootConstantBufferView(0, address);
-    commandList->Dispatch((slots + 63) / 64, 1, 1);
+
+    if(exact)
+    {
+        commandList->Dispatch(window.cells[0], window.cells[1], window.cells[2]);
+    }
+    else
+    {
+        commandList->Dispatch((slots + 63) / 64, 1, 1);
+    }
     // The direct pass reads the slots through the same UAV.
     D3D12_RESOURCE_BARRIER barrier{};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
@@ -16036,6 +16163,7 @@ void Renderer::Shutdown()
     m_lightSamplingBuffer.Shutdown();
     m_regirSlots.Shutdown();
     m_regirPresamplePipeline.Shutdown();
+    m_regirPresampleExactPipeline.Shutdown();
     m_regirPresampleAttempted = false;
 
     // A background rebuild only reads its own table copy; waiting for it keeps the release from outliving it.

@@ -196,9 +196,18 @@ bool BuildLightSamplingData(const SceneLightTable& table, const LightSamplingSet
 bool UpdateLightSamplingIncremental(const SceneLightTable& table, const SceneLightTable& previousTable,
     const LightSamplingSettings& settings, LightSamplingData& data, std::vector<LightSamplingDirtyRange>& dirty);
 
-// The light's sampling weight for the wide and global distributions: luminance of its radiance record (intensity for
-// Point/Spot, illuminance for Directional). Zero, negative or non-finite means the light is excluded.
+// The light's sampling weight for the wide and global distributions. Zero, negative or non-finite means the light is
+// excluded. Point-light noise fix #3 (user-approved 2026-11-23): its emitted power, the luminance of its radiance record
+// (luminous intensity for Point/Spot) times its emission solid angle: 4 pi for a Point, the Spot profile's integral
+// (Photometry::SpotEmissionSolidAngle over the uploaded cone cosines) for a Spot, 1 for Directional (illuminance, never
+// in these distributions). Before the fix it was the intensity alone, which weighted a Spot of equal flux 4 pi / Omega
+// (about 18x for a 36 degree cone) over a Point. ENGINE_LIGHT_SAMPLING_POWER=intensity restores that weighting. Every
+// consumer divides by the realized alias probability, so the weighting changes only variance.
 double LightSamplingPower(const GPULight& light) noexcept;
+
+// The emission solid angle LightSamplingPower applies: 4 pi (Point), the Spot profile's integral, 1 (Directional or
+// ENGINE_LIGHT_SAMPLING_POWER=intensity).
+double LightSamplingEmissionSolidAngle(const GPULight& light) noexcept;
 
 // One-line summary for logs.
 std::string DescribeLightSamplingStatistics(const LightSamplingData& data);

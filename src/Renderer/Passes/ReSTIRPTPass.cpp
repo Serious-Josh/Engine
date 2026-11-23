@@ -544,7 +544,8 @@ bool ReSTIRPTPass::Initialize(ID3D12Device* device, ShaderLibrary& shaderLibrary
         return Fail("the light tiles could not be allocated.");
     }
 
-    if(!m_regirLights.InitializeGPUWritable(device, std::size_t{ReGIRLightCapacity} * 12u) ||
+    // ReGIR architecture investigation (experimental): + 32 bytes per light for the list sampler's proposal records.
+    if(!m_regirLights.InitializeGPUWritable(device, std::size_t{ReGIRLightCapacity} * 44u) ||
         !m_regirLights.CreateRawUAV(device, descriptorHeap) || !m_regirLights.CreateRawSRV(device, descriptorHeap))
     {
         return Fail("the ReGIR light map could not be allocated.");
@@ -905,7 +906,7 @@ bool ReSTIRPTPass::RecordLightTiles(ID3D12GraphicsCommandList* commandList, Uplo
 }
 
 std::uint32_t ReSTIRPTPass::RecordReGIRLights(ID3D12GraphicsCommandList* commandList, UploadBuffer& uploadBuffer,
-    std::uint32_t lightSamplingIndex, std::uint32_t tableLightCount)
+    std::uint32_t lightSamplingIndex, std::uint32_t tableLightCount, std::uint32_t sceneLightBufferIndex)
 {
     if(!m_initialized || !commandList || !m_regirLights.GetResource() || tableLightCount == 0 ||
         tableLightCount > ReGIRLightCapacity || lightSamplingIndex == 0xFFFFFFFFu)
@@ -925,6 +926,7 @@ std::uint32_t ReSTIRPTPass::RecordReGIRLights(ID3D12GraphicsCommandList* command
         constants.outputIndex = m_regirLights.GetUAVDescriptorIndex();
         constants.tableLightCount = tableLightCount;
         constants.padding[0] = phase;
+        constants.padding[1] = sceneLightBufferIndex;
         const D3D12_GPU_VIRTUAL_ADDRESS address = uploadBuffer.Allocate(&constants, sizeof(constants),
             D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
 

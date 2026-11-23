@@ -15,6 +15,29 @@
 
 namespace
 {
+    // The adaptive light sampler (default since the user decision of 2026-11-23): the ReSTIRPT/ tree compiles with
+    // RESTIR_PT_LIST_PROTOTYPE (per-receiver light-grid list proposals in the ReGIR kernel) unless
+    // ENGINE_RESTIR_PT_LIST_PROTOTYPE=0.
+    bool UsesListPrototype(const std::filesystem::path& shaderPath)
+    {
+        const char* value = std::getenv("ENGINE_RESTIR_PT_LIST_PROTOTYPE");
+
+        if(value != nullptr && std::string(value) == "0")
+        {
+            return false;
+        }
+
+        for(const std::filesystem::path& component : shaderPath)
+        {
+            if(component == "ReSTIRPT")
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     std::filesystem::path DependencyPath(const wchar_t* path)
     {
         std::error_code error;
@@ -379,6 +402,12 @@ bool ShaderCompiler::Compile(
         arguments.push_back(L"RESTIR_PT_NO_SMALL_LIGHTS=1");
     }
 
+    if(UsesListPrototype(description.path))
+    {
+        arguments.push_back(L"-D");
+        arguments.push_back(L"RESTIR_PT_LIST_PROTOTYPE=1");
+    }
+
     // Shader variants (ShaderVariants) compile from their generated text instead of a file.
     const std::optional<VariantSource> variant = FindVariantSource(description.path, description.shaderRoot);
 
@@ -603,6 +632,12 @@ bool ShaderCompiler::CompileLibrary(
     {
         arguments.push_back(L"-D");
         arguments.push_back(L"RESTIR_PT_NO_SMALL_LIGHTS=1");
+    }
+
+    if(UsesListPrototype(description.path))
+    {
+        arguments.push_back(L"-D");
+        arguments.push_back(L"RESTIR_PT_LIST_PROTOTYPE=1");
     }
 
     std::error_code sameDirectoryError;
