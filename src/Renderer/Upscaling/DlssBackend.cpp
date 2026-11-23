@@ -1261,6 +1261,29 @@ bool DlssBackend::EnsureRayReconstructionFeature(ID3D12GraphicsCommandList* life
     create.InPerfQualityValue = perfQuality;
     create.InFeatureCreateFlags = NVSDK_NGX_DLSS_Feature_Flags_IsHDR | NVSDK_NGX_DLSS_Feature_Flags_MVLowRes;
     create.InEnableOutputSubrects = false;
+    // M5.6 (user-approved default 2026-11-23): the RR model, hinted for every quality mode
+    // (NVSDK_NGX_RayReconstruction_Hint_Render_Preset). Default E, the latest transformer model: it halved still-camera and
+    // after-stop silhouette shimmer and reduced it about 8-10% in motion on ManyLight_1024 for about +0.5 ms
+    // (M5.6 report section 10). ENGINE_RR_PRESET=F restores the RR2 model NGX used by default before (D: the earlier
+    // transformer; "none": no hint, NGX's own default, which may change after OTA updates).
+    static const unsigned int rrPreset = []
+    {
+        const char* value = std::getenv("ENGINE_RR_PRESET");
+        const std::string text = value ? value : "";
+        return text == "none" ? 0u : text == "D" ? 4u : text == "F" ? 6u : 5u;
+    }();
+
+    if(rrPreset != 0u)
+    {
+        NVSDK_NGX_Parameter_SetUI(parameters, NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_DLAA, rrPreset);
+        NVSDK_NGX_Parameter_SetUI(parameters, NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Quality, rrPreset);
+        NVSDK_NGX_Parameter_SetUI(parameters, NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Balanced, rrPreset);
+        NVSDK_NGX_Parameter_SetUI(parameters, NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Performance, rrPreset);
+        NVSDK_NGX_Parameter_SetUI(parameters, NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_UltraPerformance,
+            rrPreset);
+        Log::Info("DLSS Ray Reconstruction: render preset hint " + std::to_string(rrPreset) + " (ENGINE_RR_PRESET).");
+    }
+
     NVSDK_NGX_Handle* handle = nullptr;
     const NVSDK_NGX_Result created = NGX_D3D12_CREATE_DLSSD_EXT(lifecycleList, 1, 1, &handle, parameters, &create);
     feature.createResult = static_cast<std::uint32_t>(created);

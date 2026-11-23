@@ -1722,8 +1722,33 @@ class Renderer
     Buffer m_regirSlots;
     std::uint32_t m_regirFrame = 0;
     // Records this frame's ReGIR presampling when ReGIR can be used; returns the slot buffer's UAV index or UINT_MAX.
+    // M5.6 O0: shared by ReSTIR DI (PrepareRtxdiFrame) and ReSTIR PT (RecordReSTIRPTFrame); the two never run in one frame,
+    // so the one slot buffer serves whichever estimator is active.
     std::uint32_t PrepareReGIRFrame(ID3D12GraphicsCommandList* commandList, const FrameLighting& frameLighting,
-        const PathTraceReferenceConstants& constants);
+        const float cameraPosition[3], bool restirPt = false, std::uint32_t windowCells = 0,
+        std::uint32_t presampleFlags = 0, std::uint32_t slotsPerCell = 0);
+    // M5.6 flashing fix: the slot buffer's slots per cell (fixed at its creation: the larger of ReSTIR DI's and ReSTIR
+    // PT's setting then).
+    std::uint32_t m_regirSlotCapacity = 0;
+    // The Editor slider's range: the buffer is created with room for this many slots per cell (32-cell window: about
+    // 268 MB), so ReSTIR PT's slots can change at run time without reallocation.
+    static constexpr std::uint32_t ReGIRMaximumSlotsPerCell = 1024;
+    std::uint32_t m_restirPtUiRegirSlots = 512;
+    // M5.6 O0.1: the slot buffer holds the larger of ReSTIR DI's window and this many cells per axis, so ReSTIR PT's own
+    // window (ReSTIRPTSettings::regirWindow, at most this) shares it.
+    static constexpr std::uint32_t ReGIRMaximumWindowCells = 32;
+    // M5.6 O0: the light-sampling structures published this frame (null when none were), whatever their revision. ReSTIR
+    // PT's ReGIR uses them when m_lightSamplingCache is empty (revision 0, e.g. harness snapshots); ReSTIR DI keeps the
+    // cache only, unchanged.
+    std::shared_ptr<LightSamplingData> m_frameLightSamplingData;
+    // M5.6 O0: this frame's path-tracing camera position (PathTraceReferenceConstants), for ReSTIR PT's ReGIR window.
+    float m_frameCameraPosition[3]{};
+    // M5.6 O0: the Editor's "ReGIR light candidates" state last applied.
+    bool m_restirPtUiRegir = true;
+    std::uint32_t m_restirPtUiRegirWindow = 16;
+    std::uint32_t m_restirPtUiRegirSpatialPairs = 0;
+    bool m_restirPtUiRegirCone = true;
+    bool m_restirPtUiRegirDirect = true;
     // The descriptor index of the buffer published this frame (valid with m_lightSamplingReport.available).
     std::uint32_t m_frameLightSamplingBufferIndex = 0;
     // M4.2A: the mode word and buffer index the path tracer reads from SceneLightConstants.padding.
@@ -2295,6 +2320,8 @@ private:
     bool m_restirPtFrameLastFrame = false;
     // M5.3: whether the last configuration B recording ran spatial reuse.
     bool m_restirPtSpatialLastFrame = false;
+    // M5.6 O0: whether the last ReSTIR PT frame drew its table-light candidates from the shared ReGIR slots.
+    bool m_restirPtReGIRLastFrame = false;
     bool m_restirPtFrameThisFrame = false;
     bool EnsureReSTIRPT();
     bool m_restirPtSamplingFailureLogged = false;

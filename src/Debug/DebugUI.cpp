@@ -1543,6 +1543,18 @@ void DebugUI::DrawPathTraceReferenceSettings()
                 ImGui::Combo("Decorrelation", &m_restirPtStagnancyMode, decorrelationModes, IM_ARRAYSIZE(decorrelationModes));
                 // Optimization experiment B1b: NVIDIA RTXDI firefly replacement (needs temporal + spatial reuse).
                 ImGui::Checkbox("Firefly replacement", &m_restirPtFirefly);
+                // M5.6 O0: range-aware light candidates from the shared ReGIR cells (more than 64 local lights).
+                ImGui::Checkbox("ReGIR light candidates", &m_restirPtRegir);
+                // M5.6 O0.1: ReSTIR PT's ReGIR grid (16 cells: 64 m across at 4 m cells; 32: 128 m), and the spatial
+                // pairs used while ReGIR supplies the candidates (0: the "Spatial pairs" value).
+                ImGui::Checkbox("ReGIR 32-cell grid", &m_restirPtRegirWindow32);
+                ImGui::SliderInt("Spatial pairs with ReGIR (0 = same)", &m_restirPtRegirSpatialPairs, 0, 3);
+                // M5.6 O0.2: spot-cone bound in the ReGIR cell target; slots with scene-table indices (no index map).
+                // M5.6 flashing fix: slots per ReGIR cell (more slots: less cell-wide frame-to-frame fluctuation; build cost
+                // grows linearly). 64 is the pre-fix value.
+                ImGui::SliderInt("ReGIR slots per cell", &m_restirPtRegirSlots, 16, 1024);
+                ImGui::Checkbox("ReGIR spot-cone bound", &m_restirPtRegirCone);
+                ImGui::Checkbox("ReGIR direct fetch", &m_restirPtRegirDirect);
             }
 
             if(m_restirPtSpatialReuse && resolved.pathTrace.samplesPerFrame != 1u)

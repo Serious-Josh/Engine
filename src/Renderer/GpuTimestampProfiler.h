@@ -97,6 +97,8 @@ class GpuTimestampProfiler
         RestirPtTemporal,
         // M5.4 C7: the duplication map of the final reservoirs (when on).
         RestirPtDuplication,
+        // M5.6 O0: the shared ReGIR presampling and ReSTIR PT's ReGIR light map, on ReSTIR PT frames that use ReGIR.
+        RestirPtReGIR,
         Count
     };
 

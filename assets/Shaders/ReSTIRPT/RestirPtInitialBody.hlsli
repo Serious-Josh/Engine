@@ -103,6 +103,17 @@ cbuffer RestirPtConstants : register(b2)
     // Optimization experiment A5: the spatial partner count (1-3; RESTIR_PT_SPATIAL_NEIGHBOURS pairing textures exist).
     uint restirPtSpatialPairCount;
     uint restirPtStagnancyPreviousIndex;
+
+    // M5.6 O0: this frame's shared ReGIR slots (raw UAV; 0xFFFFFFFF: the light tiles) and the ReGIR light map
+    // (RestirPtReGIRLights.hlsl, raw SRV).
+    uint restirPtRegirSlotsIndex;
+    uint restirPtRegirLightsIndex;
+    uint2 restirPtRegirPadding;
+
+    // M5.6 B4 cost attribution (diagnostic only, biased): bit 0 skips the sun's NEE stream, bit 1 the environment's.
+    uint restirPtDiagnosticFlags;
+    // M5.6 C7 reinvestigation: {alpha, minCap, threshold} of the duplication response (all 0: the original).
+    float3 restirPtDuplicationResponse;
 };
 
 // M5.5-B experiment: final-shading decorrelation (NVIDIA RTXDI RTXDI_PTApplyDecorrelation, "Uniform" mode only). True with
@@ -497,6 +508,13 @@ static const uint RESTIR_PT_DIMENSION_ROULETTE = 3u;
 static const uint RESTIR_PT_DIMENSION_SUN = 4u;
 static const uint RESTIR_PT_DIMENSION_ENVIRONMENT = 6u;
 static const uint RESTIR_PT_DIMENSION_RIS = 16u;
+// M5.6 O0: the ReGIR cell lookup's jitter (3 dimensions; RIS uses 16 .. 79).
+static const uint RESTIR_PT_DIMENSION_REGIR = 190u;
+// M5.6 O0: the shared ReGIR slot buffer's header (ReGIRPresample.hlsl REGIR_SLOT_HEADER_BYTES and REGIR_SLOT_MAGIC).
+static const uint RESTIR_PT_REGIR_HEADER_BYTES = 64u;
+static const uint RESTIR_PT_REGIR_MAGIC = 0x52654749u;
+// M5.6 O0.2: the light map's table-indexed p_1 (RestirPtReGIRLights.hlsl; ReSTIRPTPass::ReGIRLightCapacity x 8 bytes in).
+static const uint RESTIR_PT_REGIR_TABLE_P1 = 131072u * 8u;
 static const uint RESTIR_PT_DIMENSION_STREAM = 200u;
 // M5.2: the temporal neighbour's reprojection jitter (two dimensions at vertex 0).
 static const uint RESTIR_PT_DIMENSION_TEMPORAL = 240u;
@@ -914,6 +932,27 @@ float3 RestirPtBsdfCos(PathTraceSurface surface, float3 direction, out float3 di
     return value;
 }
 
+// M5.6 B3a: RestirPtUnshadowed that also returns f_all cos, the intermediate it multiplies by Li (the value RestirPtBsdfCos
+// would recompute for the same direction), so a caller keeps it instead of evaluating the BSDF again.
+float3 RestirPtUnshadowedWithBsdf(PathTraceSurface surface, PathTraceLightSample lightSample, out float3 diffuse,
+    out float3 bsdfCos)
+{
+    diffuse = float3(0.0f, 0.0f, 0.0f);
+    bsdfCos = float3(0.0f, 0.0f, 0.0f);
+
+    if(!lightSample.valid || !PathTraceDirectionAboveSurface(surface, lightSample.direction))
+    {
+        return float3(0.0f, 0.0f, 0.0f);
+    }
+
+    float3 diffuseValue;
+    const float cosine = dot(surface.normal, lightSample.direction);
+    bsdfCos = PathTraceEvaluateBSDFLobes(surface, lightSample.direction, diffuseValue) * cosine;
+    const float3 value = bsdfCos * lightSample.radiance;
+    diffuse = diffuseValue * cosine * lightSample.radiance;
+    return value;
+}
+
 // Unshadowed f_all cos Li for a light sample, and its diffuse part.
 float3 RestirPtUnshadowed(PathTraceSurface surface, PathTraceLightSample lightSample, out float3 diffuse)
 {
@@ -932,9 +971,22 @@ float3 RestirPtUnshadowed(PathTraceSurface surface, PathTraceLightSample lightSa
     return value;
 }
 
+// Audit T1-c (2026-11-23): diagnostic counters compile only when requested: RESTIR_PT_COUNTERS (ShaderCompiler adds it for
+// ENGINE_RESTIR_PT_COUNTERS=1 or ENGINE_RESTIR_PT_DIAGNOSTIC_COUNTERS=1) or the diagnostics variant. Otherwise every
+// counter write, and the code that only feeds counters, folds away (runtime-gated counter code in hot kernels cost time
+// even when off: M5.6 B5).
+#if defined(RESTIR_PT_DIAGNOSTICS) && !defined(RESTIR_PT_COUNTERS)
+#define RESTIR_PT_COUNTERS 1
+#endif
+#if defined(RESTIR_PT_COUNTERS)
+static const bool RESTIR_PT_COUNTERS_COMPILED = true;
+#else
+static const bool RESTIR_PT_COUNTERS_COMPILED = false;
+#endif
+
 void RestirPtCount(uint counter, uint value)
 {
-    if(restirPtCounterIndex == 0xFFFFFFFFu)
+    if(!RESTIR_PT_COUNTERS_COMPILED || restirPtCounterIndex == 0xFFFFFFFFu)
     {
         return;
     }
@@ -946,6 +998,92 @@ void RestirPtCount(uint counter, uint value)
         RWByteAddressBuffer counters = ResourceDescriptorHeap[restirPtCounterIndex];
         counters.InterlockedAdd(counter * 4u, total);
     }
+}
+
+// M5.6 Stage 0 (counters on only; nothing else changes): why fresh path trees contribute zero. 80 words from
+// RESTIR_PT_COUNTER_ZERO:
+//   (v - 1) * 12 + n, NEE vertex v = 1 .. 4 (deeper vertices count as 4), the table-light RIS:
+//     candidates by class [0 invalid tile entry, 1 out of range (point or spot at distance >= |range|), 2 in range with
+//     no emission toward the point (spot cone, range window underflow, non-finite), 3 light below the shading horizon,
+//     4 f cos zero or non-finite target, 5 nonzero unshadowed target];
+//     the event by outcome [6 no light tiles or lights, 7 every candidate out of range or invalid, 8 no nonzero target
+//     with a candidate in range, 9 selected light occluded, 10 selected light visible];
+//     11 nonzero-target candidates summed over the occluded events (the alternatives a visibility-aware choice had);
+//   48 + class * 3 + outcome: single-sample NEE, class [0 directional table light, 1 sun, 2 environment], outcome
+//     [0 zero unshadowed, 1 occluded, 2 visible];
+//   60 + n, fresh path trees (one per sample): 0 with a primary surface, 1 of those nonzero; the zero ones by precedence
+//     [2 some NEE selection occluded, 3 else some table-light event entirely out of range, 4 else some NEE event in range
+//     with a zero target (horizon, BSDF, emission profile), 5 else no NEE event at all (delta-only vertices, no lights,
+//     path ended)]; 6 background (camera sees the sky), 7 of those zero; 8 no primary surface.
+//   M5.6 O0 (ReGIR slots bound): 69 table-light events from a ReGIR cell, 70 events that fell back to the light tiles
+//     (jittered position outside the window), 71 ReGIR picks whose light has no global probability (expected 0).
+static const uint RESTIR_PT_COUNTER_ZERO = 14208u;
+// M5.6 O0 investigation (counters on only; 64 words from RESTIR_PT_COUNTER_ZERO2):
+//   b * 4 + n, primary-hit camera distance bucket b [< 2, 2-4, 4-8, 8-16, 16-32, >= 32 m]: n = 0 fresh surface paths,
+//     1 of those nonzero, 2 x1 table-light events from a ReGIR cell, 3 x1 events that fell back to the light tiles;
+//   x1 estimate check (restirPtRegirPadding.x != 0 only; loops over every table light): rho = the RIS estimate of the
+//   unshadowed table-light sum (weightSum) / its exact value E, binned [0 rho = 0, 1 < 1/64, 2 < 1/8, 3 < 1/2, 4 < 1,
+//   5 < 2, 6 < 8, 7 < 64, 8 < 512, 9 >= 512]: 24 + bin ReGIR events, 34 + bin tile events; 44 ReGIR and 45 tile events
+//   with E = 0; 46 events with E = 0 but a nonzero estimate (must stay 0); 48-49 ReGIR and 50-51 tile sums of rho
+//   (64-bit, x 1024).
+static const uint RESTIR_PT_COUNTER_ZERO2 = 14288u;
+static const uint RESTIR_PT_ZERO_BIT_X1_REGIR = 16u;
+static const uint RESTIR_PT_ZERO_BIT_X1_FALLBACK = 32u;
+static const uint RESTIR_PT_ZERO_BIT_OCCLUDED = 1u;
+static const uint RESTIR_PT_ZERO_BIT_RANGE = 2u;
+static const uint RESTIR_PT_ZERO_BIT_IN_RANGE = 4u;
+static const uint RESTIR_PT_ZERO_BIT_EVENT = 8u;
+// This path tree's RESTIR_PT_ZERO_BIT_* (reset per tree) and the last single-sample NEE's outcome.
+static uint g_restirPtZeroBits = 0u;
+static uint g_restirPtNeeOutcome = 0u;
+
+bool RestirPtZeroDiagnostics()
+{
+    return RESTIR_PT_COUNTERS_COMPILED && restirPtCounterIndex != 0xFFFFFFFFu;
+}
+
+// Adds 1 to base + outcome (outcome < count); base must be the same for the active lanes.
+void RestirPtCountOutcome(uint base, uint count, uint outcome)
+{
+    for(uint index = 0u; index < count; ++index)
+    {
+        RestirPtCount(base + index, outcome == index ? 1u : 0u);
+    }
+}
+
+// M5.6 O0 investigation: adds value * 1024 to a 64-bit counter (low, high words with carry; per lane).
+void RestirPtAddFixed64(uint word, float value)
+{
+    const float scaled = round(max(value, 0.0f) * 1024.0f);
+
+    if(!RESTIR_PT_COUNTERS_COMPILED || restirPtCounterIndex == 0xFFFFFFFFu || !(scaled >= 1.0f) || !(scaled < 1.0e18f))
+    {
+        return;
+    }
+
+    RWByteAddressBuffer counters = ResourceDescriptorHeap[restirPtCounterIndex];
+    const uint high = uint(scaled * (1.0f / 4294967296.0f));
+    const uint low = uint(max(scaled - float(high) * 4294967296.0f, 0.0f));
+    uint previous;
+    counters.InterlockedAdd(word * 4u, low, previous);
+    const uint carry = previous + low < previous ? 1u : 0u;
+
+    if(high + carry != 0u)
+    {
+        counters.InterlockedAdd((word + 1u) * 4u, high + carry);
+    }
+}
+
+void RestirPtZeroSingleNee(uint lightClass)
+{
+    if(!RestirPtZeroDiagnostics())
+    {
+        return;
+    }
+
+    g_restirPtZeroBits |= RESTIR_PT_ZERO_BIT_EVENT | (g_restirPtNeeOutcome == 0u ? RESTIR_PT_ZERO_BIT_IN_RANGE : 0u) |
+        (g_restirPtNeeOutcome == 1u ? RESTIR_PT_ZERO_BIT_OCCLUDED : 0u);
+    RestirPtCountOutcome(RESTIR_PT_COUNTER_ZERO + 48u + lightClass * 3u, 3u, g_restirPtNeeOutcome);
 }
 
 // The light tile of this 8x8 screen tile, sample and bounce (specification section 4.4; per-bounce choice approved).
@@ -973,6 +1111,55 @@ uint RestirPtCandidatesAtVertex(uint vertex)
 // The RIS effect goes into the candidate's unbiased contribution weight instead: sourceWeight = W_RIS p_1, which the
 // stream multiplies into the candidate's resampling weight (W_U = W_RIS p_1 / Q). Returns the integrand and its diffuse
 // part.
+// Point-light noise investigation (temporary, counters builds with ENGINE_RESTIR_PT_PNC_LOG=1, restirPtRegirPadding.x bit 1):
+// every x1 NEE event of the pixels at (16 i + 8, 16 j + 8) writes one 16-word record at RESTIR_PT_COUNTER_PNC_LOG +
+// (j * 128 + i) * 20, overwritten each frame (the harness reads every frame): {pixel x | y << 16, frame, light, flags (bit 0
+// spot, bit 1 ReGIR cell, bit 2 selected, bit 3 visible), distance, cell, slot, slot W, p_1, target, weight sum, M,
+// nonzero-target candidates, contribution C = weight sum V (the luminance of the NEE estimate), position, normal}.
+static const uint RESTIR_PT_COUNTER_PNC_LOG = 14384u;
+static uint2 g_restirPtPixel = uint2(0u, 0u);
+
+void RestirPtPncLog(uint vertex, float3 position, PathTraceSurface surface, uint light, uint flags, float distance,
+    int cell, uint slot, float slotWeight, float sourcePdf, float target, float weightSum, uint candidates, uint nonzero,
+    float contribution)
+{
+    const uint2 pixel = g_restirPtPixel;
+
+    if(!RESTIR_PT_COUNTERS_COMPILED || restirPtCounterIndex == 0xFFFFFFFFu || vertex != 1u ||
+        (restirPtRegirPadding.x & 2u) == 0u || any((pixel & 15u) != 8u))
+    {
+        return;
+    }
+
+    RWByteAddressBuffer counters = ResourceDescriptorHeap[restirPtCounterIndex];
+    const uint offset = (RESTIR_PT_COUNTER_PNC_LOG + ((pixel.y >> 4u) * 128u + (pixel.x >> 4u)) * 20u) * 4u;
+    counters.Store4(offset, uint4(pixel.x | (pixel.y << 16u), restirPtFrameIndex, light, flags));
+    counters.Store4(offset + 16u, uint4(asuint(distance), asuint(cell), slot, asuint(slotWeight)));
+    counters.Store4(offset + 32u, uint4(asuint(sourcePdf), asuint(target), asuint(weightSum), candidates));
+    counters.Store4(offset + 48u, uint4(nonzero, asuint(contribution), asuint(position.x), asuint(position.y)));
+    counters.Store4(offset + 64u, uint4(asuint(position.z), asuint(surface.normal.x), asuint(surface.normal.y),
+        asuint(surface.normal.z)));
+}
+
+// Audit T1-b (2026-11-23): the small-light path. With few table lights, lights repeat among the candidates (Demo x1: 91%
+// of 32 candidates repeat one of 3 lights; Tri-Test x1: 73% repeat one of 10). A light's unshadowed value, diffuse part
+// and target are a pure function of (light, position, surface), so the path evaluates every light once in a uniform loop,
+// then runs the unchanged candidate loop (same entries, random numbers, weights and selection) on the stored targets, and
+// takes the selected light's value and diffuse from the stores. The precompute evaluates exactly the original expression
+// (value, diffuse and target all live): with the diffuse part dead, relaxed floating point reassociated the value and
+// changed the image (strict was identical). A lazy per-candidate cache saves no warp time (ManyLight: 0% of candidate
+// iterations repeat a light in every lane of a wave), so lights above the limit keep the original loop.
+// Used only with at least RESTIR_PT_SMALL_LIGHT_RATIO candidates per light (Tri-Test, 10 lights: 32 candidates -0.8 ms,
+// 25 candidates +1.0 ms, 16 candidates +0.2 ms, 12 candidates +0.9 ms; Demo's x2, 8 candidates for 3 lights, would gain
+// about 1 ms at a 2.5 ratio, which the Tri-Test 25-candidate regression rules out). Not in the ReGIR kernel (above 64
+// lights only) or counters builds (the per-candidate classification counters). ENGINE_RESTIR_PT_SMALL_LIGHTS=0 compiles
+// it out (RESTIR_PT_NO_SMALL_LIGHTS).
+#if !defined(RESTIR_PT_REGIR) && !defined(RESTIR_PT_COUNTERS) && !defined(RESTIR_PT_NO_SMALL_LIGHTS)
+#define RESTIR_PT_SMALL_LIGHTS 1
+static const uint RESTIR_PT_SMALL_LIGHT_LIMIT = 16u;
+static const uint RESTIR_PT_SMALL_LIGHT_RATIO = 3u;
+#endif
+
 float3 RestirPtTableLightNee(PathTraceSurface surface, float3 position, uint seed, uint vertex, uint tileBase,
     inout uint shadowRays, out float3 diffuse, out uint lightIndex, out RestirPtNeeParts parts, out float sourceWeight)
 {
@@ -980,14 +1167,84 @@ float3 RestirPtTableLightNee(PathTraceSurface surface, float3 position, uint see
     lightIndex = 0xFFFFFFFFu;
     parts = RestirPtNoNeeParts();
     sourceWeight = 1.0f;
+    const bool zeroDiagnostics = RestirPtZeroDiagnostics();
+    const uint zeroBase = RESTIR_PT_COUNTER_ZERO + (min(vertex, 4u) - 1u) * 12u;
 
     if(restirPtLightTileIndex == 0xFFFFFFFFu || restirPtTileSize == 0u || sceneLightCount == 0u)
     {
+        if(zeroDiagnostics)
+        {
+            RestirPtCountOutcome(zeroBase + 6u, 5u, 0u);
+        }
+
         return float3(0.0f, 0.0f, 0.0f);
     }
 
+    // M5.6 Stage 0: the candidates by class (RESTIR_PT_COUNTER_ZERO).
+    // Classes 0-2 and 3-5 (registers, not an indexed array).
+    uint3 zeroLow = uint3(0u, 0u, 0u);
+    uint3 zeroHigh = uint3(0u, 0u, 0u);
+    // Audit T1-b duplication measurement (counters builds only): the valid candidates' lights so far in this event.
+    uint seenLights[32];
+    uint seenCount = 0u;
+    uint duplicateCandidates = 0u;
+    uint validCandidates = 0u;
+    // Lane-iterations whose whole wave (active lanes) repeats a light: the only case a lazy cache saves warp time.
+    uint waveRepeats = 0u;
+
     ByteAddressBuffer tiles = ResourceDescriptorHeap[restirPtLightTileIndex];
     const uint candidates = RestirPtCandidatesAtVertex(vertex);
+
+    // M5.6 O0: this point's shared ReGIR cell (RTXDI's Grid lookup of the position jittered once per event by
+    // (U - 0.5) samplingJitter cellSize per axis, as the ReSTIR DI bridge does), or -1: the light tiles. A ReGIR candidate
+    // is a uniform slot pick carrying the slot's unbiased contribution weight W (E[W 1{X = l}] = 1 for every light reaching
+    // the point); its RIS weight is target W / M. The integrand keeps p_1 = the light's global realized probability (the
+    // value a light-tile entry stores), so only the proposal changes (M5.6 report section 0.6).
+    // Compiled only into the ReGIR variant (RESTIR_PT_REGIR, RestirPtInitialReGIR.hlsl): the production kernel keeps the
+    // light-tile code alone (the ReGIR branch cost it 1.4 ms on Demo even when not taken).
+    int regirCell = -1;
+    uint regirLightsPerCell = 0u;
+    // M5.6 O0.2: the slots hold scene-table indices (header flag REGIR_FLAG_TABLE_INDEX); p_1 is read for the selection only.
+    bool regirDirect = false;
+
+#if defined(RESTIR_PT_REGIR)
+    if(restirPtRegirSlotsIndex != 0xFFFFFFFFu && restirPtRegirLightsIndex != 0xFFFFFFFFu)
+    {
+        RWByteAddressBuffer header = ResourceDescriptorHeap[restirPtRegirSlotsIndex];
+        const uint4 row0 = header.Load4(0u);
+        const uint4 row1 = header.Load4(16u);
+        const uint4 row2 = header.Load4(32u);
+
+        if(row0.x == RESTIR_PT_REGIR_MAGIC && row1.w != 0u)
+        {
+            const float cellSize = asfloat(row2.x);
+            const float3 jitter = float3(RestirPtRandom(seed, vertex, RESTIR_PT_DIMENSION_REGIR),
+                RestirPtRandom(seed, vertex, RESTIR_PT_DIMENSION_REGIR + 1u),
+                RestirPtRandom(seed, vertex, RESTIR_PT_DIMENSION_REGIR + 2u)) - 0.5f;
+            const float3 samplingPosition = position + jitter * (asfloat(row2.y) * cellSize);
+            const float3 origin = asfloat(row0.yzw) - float3(row1.xyz) * (cellSize * 0.5f);
+            const int3 cell = int3(floor((samplingPosition - origin) / cellSize));
+
+            if(all(cell >= 0) && all(cell < int3(row1.xyz)))
+            {
+                regirCell = cell.x + (cell.y + cell.z * int(row1.y)) * int(row1.x);
+                regirLightsPerCell = row1.w;
+                regirDirect = (row2.w & 2u) != 0u;
+            }
+        }
+
+        if(zeroDiagnostics)
+        {
+            RestirPtCount(RESTIR_PT_COUNTER_ZERO + 69u, regirCell >= 0 ? 1u : 0u);
+            RestirPtCount(RESTIR_PT_COUNTER_ZERO + 70u, regirCell >= 0 ? 0u : 1u);
+
+            if(vertex == 1u)
+            {
+                g_restirPtZeroBits |= regirCell >= 0 ? RESTIR_PT_ZERO_BIT_X1_REGIR : RESTIR_PT_ZERO_BIT_X1_FALLBACK;
+            }
+        }
+    }
+#endif
     float weightSum = 0.0f;
     float selectedTarget = 0.0f;
     float3 selectedValue = float3(0.0f, 0.0f, 0.0f);
@@ -995,31 +1252,167 @@ float3 RestirPtTableLightNee(PathTraceSurface surface, float3 position, uint see
     PathTraceLightSample selectedSample = (PathTraceLightSample)0;
     bool selectedTable = false;
     float selectedSourcePdf = 0.0f;
+    // M5.6 B3a: the selected candidate's f_all cos from the RIS loop (not re-evaluated after selection).
+    float3 selectedBsdfCos = float3(0.0f, 0.0f, 0.0f);
+    // Point-light noise investigation (event log only).
+    uint selectedSlot = 0xFFFFFFFFu;
+    float selectedSlotWeight = 0.0f;
+
+#if defined(RESTIR_PT_SMALL_LIGHTS)
+    // Audit T1-b: a light's stored target is 0 where the loop would skip it (zero or non-finite).
+    const bool smallLights = sceneLightCount <= RESTIR_PT_SMALL_LIGHT_LIMIT &&
+        RESTIR_PT_SMALL_LIGHT_RATIO * sceneLightCount <= candidates;
+    float smallTargets[RESTIR_PT_SMALL_LIGHT_LIMIT];
+    float3 smallValues[RESTIR_PT_SMALL_LIGHT_LIMIT];
+    float3 smallDiffuse[RESTIR_PT_SMALL_LIGHT_LIMIT];
+#if !defined(RESTIR_PT_UNFUSED_BSDF)
+    float3 smallBsdfCos[RESTIR_PT_SMALL_LIGHT_LIMIT];
+#endif
+
+    if(smallLights)
+    {
+        for(uint light = 0u; light < sceneLightCount; ++light)
+        {
+            const GPULight tableLight = SceneLightLoad(sceneLightBufferIndex, light);
+            const PathTraceLightSample lightSample = PathTraceSampleTableLight(tableLight, position);
+            float3 candidateDiffuse;
+#if defined(RESTIR_PT_UNFUSED_BSDF)
+            const float3 value = RestirPtUnshadowed(surface, lightSample, candidateDiffuse);
+#else
+            float3 candidateBsdfCos;
+            const float3 value = RestirPtUnshadowedWithBsdf(surface, lightSample, candidateDiffuse, candidateBsdfCos);
+            smallBsdfCos[light] = candidateBsdfCos;
+#endif
+            const float target = PathTraceLuminance(value);
+            smallTargets[light] = target > 0.0f && all(isfinite(value)) ? target : 0.0f;
+            smallValues[light] = value;
+            smallDiffuse[light] = candidateDiffuse;
+        }
+    }
+#endif
 
     for(uint candidate = 0u; candidate < candidates; ++candidate)
     {
-        const uint entryIndex = LightSamplingMulHi(RestirPtRandomUint(seed, vertex, RESTIR_PT_DIMENSION_RIS + 2u * candidate),
-            restirPtTileSize);
-        const uint2 entry = tiles.Load2((tileBase + entryIndex) * 8u);
+        const uint candidateRandom = RestirPtRandomUint(seed, vertex, RESTIR_PT_DIMENSION_RIS + 2u * candidate);
+        uint2 entry;
+        // ReGIR: the slot's W (the candidate's inverse source density); tiles: unused (1 / sourcePdf, as before).
+        float regirWeight = 0.0f;
+        uint candidateSlot = 0xFFFFFFFFu;
+
+#if defined(RESTIR_PT_REGIR)
+        if(regirCell >= 0)
+        {
+            RWByteAddressBuffer slots = ResourceDescriptorHeap[restirPtRegirSlotsIndex];
+            ByteAddressBuffer regirLights = ResourceDescriptorHeap[restirPtRegirLightsIndex];
+            const uint slot = LightSamplingMulHi(candidateRandom, regirLightsPerCell);
+            candidateSlot = slot;
+            const uint2 word = slots.Load2(RESTIR_PT_REGIR_HEADER_BYTES + (uint(regirCell) * regirLightsPerCell + slot) * 8u);
+            regirWeight = asfloat(word.y);
+            // An empty slot (no light) is a zero-weight candidate; the map gives (table index, p_1).
+            // Direct: the slot's table index, p_1 deferred to the selected light (a placeholder 1 here; the RIS weights never
+            // use p_1).
+            entry = !(word.x < sceneLightCount && regirWeight > 0.0f) ? uint2(0xFFFFFFFFu, 0u) :
+                regirDirect ? uint2(word.x, asuint(1.0f)) : regirLights.Load2(word.x * 8u);
+
+            if(zeroDiagnostics && entry.x < sceneLightCount && !(asfloat(entry.y) > 0.0f))
+            {
+                // A ReGIR light without a global entry (expected never).
+                RestirPtCount(RESTIR_PT_COUNTER_ZERO + 71u, 1u);
+            }
+        }
+        else
+#endif
+        {
+            entry = tiles.Load2((tileBase + LightSamplingMulHi(candidateRandom, restirPtTileSize)) * 8u);
+        }
+
         const float sourcePdf = asfloat(entry.y);
 
         if(entry.x >= sceneLightCount || !(sourcePdf > 0.0f))
         {
+            zeroLow.x += zeroDiagnostics ? 1u : 0u;
             continue;
+        }
+
+#if defined(RESTIR_PT_SMALL_LIGHTS)
+        if(smallLights)
+        {
+            const float storedTarget = smallTargets[entry.x];
+
+            if(!(storedTarget > 0.0f))
+            {
+                continue;
+            }
+
+            const float storedWeight = storedTarget / (float(candidates) * sourcePdf);
+            weightSum += storedWeight;
+
+            if(RestirPtRandom(seed, vertex, RESTIR_PT_DIMENSION_RIS + 2u * candidate + 1u) * weightSum <= storedWeight)
+            {
+                selectedTarget = storedTarget;
+                selectedSourcePdf = sourcePdf;
+                lightIndex = entry.x;
+            }
+
+            continue;
+        }
+#endif
+
+        if(zeroDiagnostics)
+        {
+            bool seen = false;
+
+            for(uint index = 0u; index < seenCount; ++index)
+            {
+                seen = seen || seenLights[index] == entry.x;
+            }
+
+            duplicateCandidates += seen ? 1u : 0u;
+            validCandidates += 1u;
+            waveRepeats += WaveActiveAllTrue(seen) ? 1u : 0u;
+
+            if(!seen && seenCount < 32u)
+            {
+                seenLights[seenCount++] = entry.x;
+            }
         }
 
         const GPULight candidateLight = SceneLightLoad(sceneLightBufferIndex, entry.x);
         const PathTraceLightSample lightSample = PathTraceSampleTableLight(candidateLight, position);
         float3 candidateDiffuse;
+#if defined(RESTIR_PT_UNFUSED_BSDF)
         const float3 value = RestirPtUnshadowed(surface, lightSample, candidateDiffuse);
+#else
+        float3 candidateBsdfCos;
+        const float3 value = RestirPtUnshadowedWithBsdf(surface, lightSample, candidateDiffuse, candidateBsdfCos);
+#endif
         const float target = PathTraceLuminance(value);
+
+        if(zeroDiagnostics)
+        {
+            // The classes in the order the estimator rejects them (PathTraceSampleTableLight, then RestirPtUnshadowed).
+            const bool outOfRange = candidateLight.type != SCENE_LIGHT_DIRECTIONAL &&
+                !(length(candidateLight.position - position) < abs(candidateLight.range));
+            const bool zeroEmission = !outOfRange && !lightSample.valid;
+            const bool belowHorizon = lightSample.valid && !PathTraceDirectionAboveSurface(surface, lightSample.direction);
+            const bool nonzero = target > 0.0f && all(isfinite(value));
+            const bool zeroTarget = lightSample.valid && !belowHorizon && !nonzero;
+            zeroLow += uint3(0u, outOfRange ? 1u : 0u, zeroEmission ? 1u : 0u);
+            zeroHigh += uint3(belowHorizon ? 1u : 0u, zeroTarget ? 1u : 0u, nonzero ? 1u : 0u);
+        }
 
         if(!(target > 0.0f) || !all(isfinite(value)))
         {
             continue;
         }
 
+        // Tiles: the source density is p_1 itself (the original expression, unchanged); ReGIR: the slot's W.
+#if defined(RESTIR_PT_REGIR)
+        const float weight = regirCell >= 0 ? target * regirWeight / float(candidates) :
+            target / (float(candidates) * sourcePdf);
+#else
         const float weight = target / (float(candidates) * sourcePdf);
+#endif
         weightSum += weight;
 
         if(RestirPtRandom(seed, vertex, RESTIR_PT_DIMENSION_RIS + 2u * candidate + 1u) * weightSum <= weight)
@@ -1031,33 +1424,162 @@ float3 RestirPtTableLightNee(PathTraceSurface surface, float3 position, uint see
             selectedTable = candidateLight.type == SCENE_LIGHT_POINT || candidateLight.type == SCENE_LIGHT_SPOT;
             selectedSourcePdf = sourcePdf;
             lightIndex = entry.x;
+            selectedSlot = candidateSlot;
+            selectedSlotWeight = regirWeight;
+#if !defined(RESTIR_PT_UNFUSED_BSDF)
+            selectedBsdfCos = candidateBsdfCos;
+#endif
         }
     }
 
-    if(!(selectedTarget > 0.0f) || !(weightSum > 0.0f))
+#if defined(RESTIR_PT_REGIR)
+    // M5.6 O0 investigation (RESTIR_PT_COUNTER_ZERO2 + 24 ..): at x1, the RIS estimate of the unshadowed table-light sum
+    // (weightSum = sum_i p_hat(X_i) W_i / M) against its exact value over every finite table light. Its mean ratio is 1
+    // for an unbiased proposal; its upper tail is the outlier risk the proposal adds before visibility and reuse.
+    if(zeroDiagnostics && vertex == 1u && (restirPtRegirPadding.x & 1u) != 0u)
     {
+        float exact = 0.0f;
+
+        for(uint light = 0u; light < sceneLightCount; ++light)
+        {
+            const GPULight tableLight = SceneLightLoad(sceneLightBufferIndex, light);
+
+            if(tableLight.type == SCENE_LIGHT_DIRECTIONAL)
+            {
+                continue;
+            }
+
+            float3 unused;
+            const float3 value = RestirPtUnshadowed(surface, PathTraceSampleTableLight(tableLight, position), unused);
+            exact += all(isfinite(value)) ? PathTraceLuminance(value) : 0.0f;
+        }
+
+        if(exact > 0.0f)
+        {
+            const float rho = weightSum / exact;
+            const uint bin = !(rho > 0.0f) ? 0u : rho < 1.0f / 64.0f ? 1u : rho < 0.125f ? 2u : rho < 0.5f ? 3u :
+                rho < 1.0f ? 4u : rho < 2.0f ? 5u : rho < 8.0f ? 6u : rho < 64.0f ? 7u : rho < 512.0f ? 8u : 9u;
+
+            for(uint index = 0u; index < 10u; ++index)
+            {
+                RestirPtCount(RESTIR_PT_COUNTER_ZERO2 + 24u + index, regirCell >= 0 && bin == index ? 1u : 0u);
+                RestirPtCount(RESTIR_PT_COUNTER_ZERO2 + 34u + index, regirCell < 0 && bin == index ? 1u : 0u);
+            }
+
+            RestirPtAddFixed64(RESTIR_PT_COUNTER_ZERO2 + (regirCell >= 0 ? 48u : 50u), rho);
+        }
+        else
+        {
+            RestirPtCount(RESTIR_PT_COUNTER_ZERO2 + 44u, regirCell >= 0 ? 1u : 0u);
+            RestirPtCount(RESTIR_PT_COUNTER_ZERO2 + 45u, regirCell >= 0 ? 0u : 1u);
+            RestirPtCount(RESTIR_PT_COUNTER_ZERO2 + 46u, weightSum > 0.0f ? 1u : 0u);
+        }
+    }
+#endif
+
+#if defined(RESTIR_PT_SMALL_LIGHTS)
+    if(smallLights && selectedTarget > 0.0f)
+    {
+        // The sample (direction, distance, radiance) is cheap and needed for the shadow ray and the parts; recomputed.
+        const GPULight selectedLight = SceneLightLoad(sceneLightBufferIndex, lightIndex);
+        selectedSample = PathTraceSampleTableLight(selectedLight, position);
+        selectedValue = smallValues[lightIndex];
+        selectedDiffuse = smallDiffuse[lightIndex];
+#if !defined(RESTIR_PT_UNFUSED_BSDF)
+        selectedBsdfCos = smallBsdfCos[lightIndex];
+#endif
+        selectedTable = selectedLight.type == SCENE_LIGHT_POINT || selectedLight.type == SCENE_LIGHT_SPOT;
+    }
+#endif
+
+#if defined(RESTIR_PT_REGIR)
+    // M5.6 O0.2 direct fetch: the selected light's p_1 (table-indexed, after the local-indexed map). A light without a global
+    // entry (never observed: counter 71) contributes nothing, as the map path's skip does.
+    if(regirCell >= 0 && regirDirect && selectedTarget > 0.0f)
+    {
+        ByteAddressBuffer regirLights = ResourceDescriptorHeap[restirPtRegirLightsIndex];
+        selectedSourcePdf = asfloat(regirLights.Load(RESTIR_PT_REGIR_TABLE_P1 + lightIndex * 4u));
+
+        if(!(selectedSourcePdf > 0.0f))
+        {
+            RestirPtCount(RESTIR_PT_COUNTER_ZERO + 71u, zeroDiagnostics ? 1u : 0u);
+            selectedTarget = 0.0f;
+        }
+    }
+#endif
+
+    const bool selected = selectedTarget > 0.0f && weightSum > 0.0f;
+
+    if(zeroDiagnostics)
+    {
+        // Audit T1-b: per NEE vertex (1-3), valid candidates, candidates repeating a light, distinct lights.
+        const uint duplicationBase = RESTIR_PT_COUNTER_ZERO2 + 52u + (min(vertex, 3u) - 1u) * 3u;
+        RestirPtCount(duplicationBase, validCandidates);
+        RestirPtCount(duplicationBase + 1u, duplicateCandidates);
+        RestirPtCount(duplicationBase + 2u, seenCount);
+        RestirPtCount(RESTIR_PT_COUNTER_ZERO2 + 61u + min(vertex, 3u) - 1u, waveRepeats);
+        RestirPtCount(zeroBase + 0u, zeroLow.x);
+        RestirPtCount(zeroBase + 1u, zeroLow.y);
+        RestirPtCount(zeroBase + 2u, zeroLow.z);
+        RestirPtCount(zeroBase + 3u, zeroHigh.x);
+        RestirPtCount(zeroBase + 4u, zeroHigh.y);
+        RestirPtCount(zeroBase + 5u, zeroHigh.z);
+        g_restirPtZeroBits |= RESTIR_PT_ZERO_BIT_EVENT;
+
+        if(!selected)
+        {
+            // Every candidate out of range (or an invalid entry): nothing in reach. Otherwise some in range, all zero.
+            const bool inRange = zeroLow.z + zeroHigh.x + zeroHigh.y + zeroHigh.z != 0u;
+            g_restirPtZeroBits |= inRange ? RESTIR_PT_ZERO_BIT_IN_RANGE : RESTIR_PT_ZERO_BIT_RANGE;
+            RestirPtCountOutcome(zeroBase + 6u, 5u, inRange ? 2u : 1u);
+        }
+    }
+
+    if(!selected)
+    {
+        RestirPtPncLog(vertex, position, surface, 0xFFFFFFFFu, regirCell >= 0 ? 2u : 0u, 0.0f, regirCell, 0xFFFFFFFFu,
+            0.0f, 0.0f, 0.0f, weightSum, candidates, zeroHigh.z, 0.0f);
         lightIndex = 0xFFFFFFFFu;
         return float3(0.0f, 0.0f, 0.0f);
     }
+
+    const uint pncFlags = !RESTIR_PT_COUNTERS_COMPILED ? 0u :
+        (SceneLightLoad(sceneLightBufferIndex, lightIndex).type == SCENE_LIGHT_SPOT ? 1u : 0u) | (regirCell >= 0 ? 2u : 0u) | 4u;
 
     uint rays = 0u;
     const bool visible = PathTraceVisible(position, surface.geometricNormal, selectedSample.direction,
         selectedSample.distance, rays);
     shadowRays += rays;
 
+    if(zeroDiagnostics)
+    {
+        g_restirPtZeroBits |= visible ? 0u : RESTIR_PT_ZERO_BIT_OCCLUDED;
+        RestirPtCountOutcome(zeroBase + 6u, 5u, visible ? 4u : 3u);
+        RestirPtCount(zeroBase + 11u, visible ? 0u : zeroHigh.z);
+    }
+
     if(!visible)
     {
+        RestirPtPncLog(vertex, position, surface, lightIndex, pncFlags, selectedSample.distance, regirCell, selectedSlot,
+            selectedSlotWeight, selectedSourcePdf, selectedTarget, weightSum, candidates, zeroHigh.z, 0.0f);
         return float3(0.0f, 0.0f, 0.0f);
     }
+
+    RestirPtPncLog(vertex, position, surface, lightIndex, pncFlags | 8u, selectedSample.distance, regirCell, selectedSlot,
+        selectedSlotWeight, selectedSourcePdf, selectedTarget, weightSum, candidates, zeroHigh.z, weightSum);
 
     // W_RIS = (1 / p_hat(y)) (1 / M) sum_c p_hat(c) / p_tile(c) (specification section 4.2).
     const float risWeight = weightSum / selectedTarget;
     const float inverseSourcePdf = 1.0f / selectedSourcePdf;
     sourceWeight = risWeight * selectedSourcePdf;
     diffuse = selectedDiffuse * inverseSourcePdf;
-    float3 bsdfDiffuse;
     parts.direction = selectedSample.direction;
+#if defined(RESTIR_PT_UNFUSED_BSDF)
+    float3 bsdfDiffuse;
     parts.bsdfCos = RestirPtBsdfCos(surface, selectedSample.direction, bsdfDiffuse);
+#else
+    parts.bsdfCos = selectedBsdfCos;
+#endif
     parts.lightTerm = selectedSample.radiance * inverseSourcePdf;
     parts.incident = selectedSample.radiance;
     parts.inverseSourcePdf = inverseSourcePdf;
@@ -1065,14 +1587,156 @@ float3 RestirPtTableLightNee(PathTraceSurface surface, float3 position, uint see
     return selectedValue * inverseSourcePdf;
 }
 
+// M5.6 B4a: environment sampling in ReSTIR PT (the shared PathTraceSampleEnvironment's algorithm), with
+//   restirPtDiagnosticFlags bit 6 (ENGINE_RESTIR_PT_ENV_SEARCH=8ary): an 8-ary search that returns exactly the binary
+//     search's index (the first entry above the random number, else the last), in about log8 instead of log2 dependent
+//     steps: same samples, bit for bit;
+//   bits 2-5 (ENGINE_RESTIR_PT_DIAG_ENV, diagnostic only, biased: timing attribution): 2 no CDF search (direct index),
+//     3 no density lookup (constant), 4 no texture fetch (constant radiance), 5 no shadow ray for environment samples.
+static const uint RESTIR_PT_DIAG_ENV_NO_SEARCH = 4u;
+static const uint RESTIR_PT_DIAG_ENV_NO_PDF = 8u;
+static const uint RESTIR_PT_DIAG_ENV_NO_TEXTURE = 16u;
+static const uint RESTIR_PT_DIAG_ENV_NO_SHADOW = 32u;
+static const uint RESTIR_PT_ENV_SEARCH_8ARY = 64u;
+// Set around an environment NEE sample (bit 5 only).
+static bool g_restirPtSkipVisibility = false;
+
+// PathTraceSampleCDF's result (binary search: first index i < count - 1 with randomValue < cdf[offset + i], else
+// count - 1) with up to 7 independent probes per step. The CDF is non-decreasing, so each probe narrows the same
+// interval the binary search would: identical index.
+uint RestirPtSampleCDF8(StructuredBuffer<float> cdf, uint offset, uint count, float randomValue)
+{
+    uint low = 0u;
+    uint high = count - 1u;
+
+    [loop]
+    while(low < high)
+    {
+        const uint span = high - low;
+        uint probes[7];
+        bool above[7];
+
+        [unroll]
+        for(uint index = 0u; index < 7u; ++index)
+        {
+            probes[index] = low + (span * (index + 1u)) / 8u;
+            above[index] = probes[index] < high && randomValue < cdf[offset + probes[index]];
+        }
+
+        uint newLow = low;
+        uint newHigh = high;
+        bool found = false;
+
+        [unroll]
+        for(uint index = 0u; index < 7u; ++index)
+        {
+            if(!found && probes[index] < high)
+            {
+                if(above[index])
+                {
+                    newHigh = probes[index];
+                    found = true;
+                }
+                else
+                {
+                    newLow = probes[index] + 1u;
+                }
+            }
+        }
+
+        // span < 8 can repeat probes at low: always make progress (one binary step).
+        if(newLow == low && newHigh == high)
+        {
+            const uint middle = low + span / 2u;
+
+            if(randomValue < cdf[offset + middle])
+            {
+                newHigh = middle;
+            }
+            else
+            {
+                newLow = middle + 1u;
+            }
+        }
+
+        low = newLow;
+        high = newHigh;
+    }
+
+    return low;
+}
+
+PathTraceLightSample RestirPtSampleEnvironment(PathTraceEnvironment environment, float4 random)
+{
+    const uint flags = restirPtDiagnosticFlags;
+
+    if((flags & (RESTIR_PT_DIAG_ENV_NO_SEARCH | RESTIR_PT_DIAG_ENV_NO_PDF | RESTIR_PT_DIAG_ENV_NO_TEXTURE |
+        RESTIR_PT_ENV_SEARCH_8ARY)) == 0u)
+    {
+        return PathTraceSampleEnvironment(environment, environmentSampler, random);
+    }
+
+    PathTraceLightSample result;
+    result.valid = false;
+    result.direction = float3(0.0f, 1.0f, 0.0f);
+    result.distance = PATH_TRACE_DISTANT_LIGHT_DISTANCE;
+    result.radiance = float3(0.0f, 0.0f, 0.0f);
+    result.pdf = 0.0f;
+
+    if(!PathTraceEnvironmentSamplingEnabled(environment))
+    {
+        return result;
+    }
+
+    StructuredBuffer<float> rows = ResourceDescriptorHeap[environment.marginalCDFIndex];
+    StructuredBuffer<float> columns = ResourceDescriptorHeap[environment.conditionalCDFIndex];
+    uint row;
+    uint column;
+
+    if((flags & RESTIR_PT_DIAG_ENV_NO_SEARCH) != 0u)
+    {
+        row = min(uint(random.x * float(environment.height)), environment.height - 1u);
+        column = min(uint(random.y * float(environment.width)), environment.width - 1u);
+    }
+    else if((flags & RESTIR_PT_ENV_SEARCH_8ARY) != 0u)
+    {
+        row = RestirPtSampleCDF8(rows, 0u, environment.height, random.x);
+        column = RestirPtSampleCDF8(columns, row * environment.width, environment.width, random.y);
+    }
+    else
+    {
+        row = PathTraceSampleCDF(rows, 0u, environment.height, random.x);
+        column = PathTraceSampleCDF(columns, row * environment.width, environment.width, random.y);
+    }
+
+    // As PathTraceSampleEnvironment: uniform in longitude and in cos(theta) inside the cell.
+    const float u = (float(column) + random.z) / float(environment.width);
+    const float cosTheta = lerp(cos(PI * float(row) / float(environment.height)),
+        cos(PI * float(row + 1u) / float(environment.height)), random.w);
+    const float v = acos(clamp(cosTheta, -1.0f, 1.0f)) / PI;
+    result.direction = normalize(EquirectangularUVToDirection(float2(u, v)));
+    result.pdf = (flags & RESTIR_PT_DIAG_ENV_NO_PDF) != 0u ? 1.0f / (4.0f * PI) :
+        PathTraceEnvironmentPdf(environment, result.direction);
+    result.radiance = (flags & RESTIR_PT_DIAG_ENV_NO_TEXTURE) != 0u ? float3(1.0f, 1.0f, 1.0f) :
+        PathTraceEnvironmentRadiance(environment, environmentSampler, result.direction);
+    result.valid = result.pdf > 0.0f && isfinite(result.pdf);
+    return result;
+}
+
 // One delta (table directional) or MIS-weighted (sun, environment) light sample: f_all cos Li V m / pdf.
 float3 RestirPtSingleLightNee(PathTraceSurface surface, float3 position, PathTraceLightSample lightSample,
     inout uint shadowRays, out float3 diffuse, out RestirPtNeeParts parts)
 {
     float3 unshadowedDiffuse;
+#if defined(RESTIR_PT_UNFUSED_BSDF)
     const float3 value = RestirPtUnshadowed(surface, lightSample, unshadowedDiffuse);
+#else
+    float3 unshadowedBsdfCos;
+    const float3 value = RestirPtUnshadowedWithBsdf(surface, lightSample, unshadowedDiffuse, unshadowedBsdfCos);
+#endif
     diffuse = float3(0.0f, 0.0f, 0.0f);
     parts = RestirPtNoNeeParts();
+    g_restirPtNeeOutcome = 0u;
 
     if(!any(value > 0.0f))
     {
@@ -1080,16 +1744,19 @@ float3 RestirPtSingleLightNee(PathTraceSurface surface, float3 position, PathTra
     }
 
     float weight = 1.0f;
+    // M5.6 B3a: the BSDF density toward the light, evaluated once (also the MIS weight's below).
+    const float bsdfPdf = lightSample.pdf > 0.0f ? PathTracePdf(surface, lightSample.direction) : 0.0f;
 
     if(lightSample.pdf > 0.0f)
     {
-        weight = RestirPtBalanceHeuristic(lightSample.pdf, PathTracePdf(surface, lightSample.direction)) / lightSample.pdf;
+        weight = RestirPtBalanceHeuristic(lightSample.pdf, bsdfPdf) / lightSample.pdf;
     }
 
     uint rays = 0u;
-    const bool visible = PathTraceVisible(position, surface.geometricNormal, lightSample.direction, lightSample.distance,
-        rays);
+    const bool visible = g_restirPtSkipVisibility || PathTraceVisible(position, surface.geometricNormal,
+        lightSample.direction, lightSample.distance, rays);
     shadowRays += rays;
+    g_restirPtNeeOutcome = visible ? 2u : 1u;
 
     if(!visible)
     {
@@ -1097,13 +1764,16 @@ float3 RestirPtSingleLightNee(PathTraceSurface surface, float3 position, PathTra
     }
 
     diffuse = unshadowedDiffuse * weight;
-    float3 bsdfDiffuse;
     parts.direction = lightSample.direction;
+#if defined(RESTIR_PT_UNFUSED_BSDF)
+    float3 bsdfDiffuse;
     parts.bsdfCos = RestirPtBsdfCos(surface, lightSample.direction, bsdfDiffuse);
+#else
+    parts.bsdfCos = unshadowedBsdfCos;
+#endif
     parts.lightPdf = lightSample.pdf;
     // weight = m / pdf for MIS-weighted samples, 1 for delta lights: lightTerm = Li / pdf (or Li), mis = m.
-    parts.mis = lightSample.pdf > 0.0f ? RestirPtBalanceHeuristic(lightSample.pdf, PathTracePdf(surface,
-        lightSample.direction)) : 1.0f;
+    parts.mis = lightSample.pdf > 0.0f ? RestirPtBalanceHeuristic(lightSample.pdf, bsdfPdf) : 1.0f;
     parts.lightTerm = lightSample.pdf > 0.0f ? lightSample.radiance / lightSample.pdf : lightSample.radiance;
     return value * weight;
 }
@@ -1498,6 +2168,8 @@ RestirPtTreeResult RestirPtTracePathTree(uint2 pixel, uint sampleIndex, PathTrac
     result.primaryHitDistance = PATH_TRACE_EXTRACTION_NO_SPECULAR;
     result.primarySpecular = false;
     result.wouldClamp = 0u;
+    g_restirPtZeroBits = 0u;
+    g_restirPtPixel = pixel;
 
     if(firstVertex.state == 0)
     {
@@ -1581,6 +2253,7 @@ RestirPtTreeResult RestirPtTracePathTree(uint2 pixel, uint sampleIndex, PathTrac
                 const PathTraceLightSample lightSample = PathTraceSampleTableLight(
                     SceneLightLoad(sceneLightBufferIndex, directionalLight), position);
                 contribution = RestirPtSingleLightNee(surface, position, lightSample, result.shadowRays, diffuse, parts);
+                RestirPtZeroSingleNee(0u);
                 // P3: a directional table light is rebuilt from its index too (fixed direction; p_1 = 1).
                 parts.incident = lightSample.radiance;
                 parts.inverseSourcePdf = 1.0f;
@@ -1593,13 +2266,15 @@ RestirPtTreeResult RestirPtTracePathTree(uint2 pixel, uint sampleIndex, PathTrac
                 vertexNee += throughput * contribution;
             }
 
-            // The sun and the environment: one MIS-weighted sample each.
-            if(PathTraceSunHasEnergy(sun))
+            // The sun and the environment: one MIS-weighted sample each. M5.6 B4 cost attribution (diagnostic only,
+            // biased: timing): restirPtDiagnosticFlags bit 0 skips the sun's NEE stream, bit 1 the environment's.
+            if(PathTraceSunHasEnergy(sun) && (restirPtDiagnosticFlags & 1u) == 0u)
             {
                 const float2 sunRandom = float2(RestirPtRandom(seed, vertex, RESTIR_PT_DIMENSION_SUN),
                     RestirPtRandom(seed, vertex, RESTIR_PT_DIMENSION_SUN + 1u));
                 contribution = RestirPtSingleLightNee(surface, position, PathTraceSampleSun(sun, sunRandom),
                     result.shadowRays, diffuse, parts);
+                RestirPtZeroSingleNee(1u);
                 RestirPtStreamCandidate(result.stream, RestirPtWithReconnection(RestirPtMakeCandidate(
                     throughput * contribution, primary ? diffuse : throughput * contribution * diffuseShare, survival,
                     vertex + 1u, RESTIR_PT_END_SUN, 0u), RestirPtNeeReconnection(prefix, vertex, parts,
@@ -1608,14 +2283,17 @@ RestirPtTreeResult RestirPtTracePathTree(uint2 pixel, uint sampleIndex, PathTrac
                 vertexNee += throughput * contribution;
             }
 
-            if(PathTraceEnvironmentSamplingEnabled(environment))
+            if(PathTraceEnvironmentSamplingEnabled(environment) && (restirPtDiagnosticFlags & 2u) == 0u)
             {
                 const float4 environmentRandom = float4(RestirPtRandom(seed, vertex, RESTIR_PT_DIMENSION_ENVIRONMENT),
                     RestirPtRandom(seed, vertex, RESTIR_PT_DIMENSION_ENVIRONMENT + 1u),
                     RestirPtRandom(seed, vertex, RESTIR_PT_DIMENSION_ENVIRONMENT + 2u),
                     RestirPtRandom(seed, vertex, RESTIR_PT_DIMENSION_ENVIRONMENT + 3u));
-                contribution = RestirPtSingleLightNee(surface, position, PathTraceSampleEnvironment(environment,
-                    environmentSampler, environmentRandom), result.shadowRays, diffuse, parts);
+                g_restirPtSkipVisibility = (restirPtDiagnosticFlags & RESTIR_PT_DIAG_ENV_NO_SHADOW) != 0u;
+                contribution = RestirPtSingleLightNee(surface, position, RestirPtSampleEnvironment(environment,
+                    environmentRandom), result.shadowRays, diffuse, parts);
+                g_restirPtSkipVisibility = false;
+                RestirPtZeroSingleNee(2u);
                 RestirPtStreamCandidate(result.stream, RestirPtWithReconnection(RestirPtMakeCandidate(
                     throughput * contribution, primary ? diffuse : throughput * contribution * diffuseShare, survival,
                     vertex + 1u, RESTIR_PT_END_ENVIRONMENT, 0u), RestirPtNeeReconnection(prefix, vertex, parts,
@@ -3192,8 +3870,13 @@ RestirPtTemporalResult RestirPtTemporalResample(uint2 pixel, PathTraceRasterFirs
         RWByteAddressBuffer duplication = ResourceDescriptorHeap[restirPtPreviousDuplicationIndex];
         const float duplicated = float(duplication.Load(4u * (uint(neighbor.pixel.y) * resolution.x +
             uint(neighbor.pixel.x)))) / 288.0f;
-        const float cap = lerp(float(restirPtTemporalConfidenceCap), RESTIR_PT_DUPLICATION_MIN_CAP,
-            pow(saturate(duplicated), RESTIR_PT_DUPLICATION_ALPHA));
+        // M5.6 C7 reinvestigation: an optional response {alpha, minCap, threshold} (all 0: the original M5.4 one).
+        const bool original = !any(restirPtDuplicationResponse != 0.0f);
+        const float alpha = original ? RESTIR_PT_DUPLICATION_ALPHA : restirPtDuplicationResponse.x;
+        const float minimumCap = original ? RESTIR_PT_DUPLICATION_MIN_CAP : restirPtDuplicationResponse.y;
+        const float threshold = original ? 0.0f : restirPtDuplicationResponse.z;
+        const float strength = saturate((duplicated - threshold) / max(1.0f - threshold, 1.0e-6f));
+        const float cap = lerp(float(restirPtTemporalConfidenceCap), minimumCap, pow(strength, alpha));
         temporalConfidence = min(float((temporal.pathFlags >> 8u) & 255u), cap);
     }
 
@@ -4377,8 +5060,8 @@ void RestirPtInitialCS(uint3 thread : SV_DispatchThreadID)
 
 #if defined(RESTIR_PT_TEMPORAL_KERNEL)
         // M5.2 C1 probe: the temporal lookup's stages and what the previous reservoir holds (counters on, history valid).
-        if(restirPtCounterIndex != 0xFFFFFFFFu && restirPtHistoryValid != 0u && firstVertex.state > 0 &&
-            (restirPtFlags & RESTIR_PT_FLAG_TEMPORAL_PASS) == 0u)
+        if(RESTIR_PT_COUNTERS_COMPILED && restirPtCounterIndex != 0xFFFFFFFFu && restirPtHistoryValid != 0u &&
+            firstVertex.state > 0 && (restirPtFlags & RESTIR_PT_FLAG_TEMPORAL_PASS) == 0u)
         {
             const RestirPtTemporalNeighbor neighbor = RestirPtFindTemporalNeighbor(pixel, firstVertex,
                 RestirPtInitialSeed(pixel, accumulatedSamples));
@@ -4403,6 +5086,38 @@ void RestirPtInitialCS(uint3 thread : SV_DispatchThreadID)
             const uint sampleIndex = accumulatedSamples + sampleOffset;
             const uint seed = RestirPtInitialSeed(pixel, sampleIndex);
             const RestirPtTreeResult tree = RestirPtTracePathTree(pixel, sampleIndex, firstVertex, seed);
+
+            // M5.6 Stage 0: this fresh path tree's outcome (RESTIR_PT_COUNTER_ZERO + 60), zero ones by precedence.
+            if(RestirPtZeroDiagnostics())
+            {
+                const bool nonzero = tree.stream.weightSum > 0.0f;
+                const uint bits = g_restirPtZeroBits;
+                const uint zeroCause = (bits & RESTIR_PT_ZERO_BIT_OCCLUDED) != 0u ? 2u :
+                    (bits & RESTIR_PT_ZERO_BIT_RANGE) != 0u ? 3u : (bits & RESTIR_PT_ZERO_BIT_IN_RANGE) != 0u ? 4u : 5u;
+                const bool surfacePath = firstVertex.state > 0;
+                RestirPtCount(RESTIR_PT_COUNTER_ZERO + 60u, surfacePath ? 1u : 0u);
+                RestirPtCountOutcome(RESTIR_PT_COUNTER_ZERO + 61u, 5u, !surfacePath ? 5u : nonzero ? 0u : zeroCause - 1u);
+                RestirPtCount(RESTIR_PT_COUNTER_ZERO + 66u, firstVertex.state == 0 ? 1u : 0u);
+                RestirPtCount(RESTIR_PT_COUNTER_ZERO + 67u, firstVertex.state == 0 && !nonzero ? 1u : 0u);
+                RestirPtCount(RESTIR_PT_COUNTER_ZERO + 68u, firstVertex.state < 0 ? 1u : 0u);
+
+                // M5.6 O0 investigation: by primary-hit camera distance (RESTIR_PT_COUNTER_ZERO2 + bucket * 4).
+                const float distance = surfacePath ? length(firstVertex.position - cameraPosition) : 0.0f;
+                const uint bucket = distance < 2.0f ? 0u : distance < 4.0f ? 1u : distance < 8.0f ? 2u :
+                    distance < 16.0f ? 3u : distance < 32.0f ? 4u : 5u;
+
+                for(uint index = 0u; index < 6u; ++index)
+                {
+                    const bool here = surfacePath && bucket == index;
+                    RestirPtCount(RESTIR_PT_COUNTER_ZERO2 + index * 4u, here ? 1u : 0u);
+                    RestirPtCount(RESTIR_PT_COUNTER_ZERO2 + index * 4u + 1u, here && nonzero ? 1u : 0u);
+                    RestirPtCount(RESTIR_PT_COUNTER_ZERO2 + index * 4u + 2u,
+                        here && (bits & RESTIR_PT_ZERO_BIT_X1_REGIR) != 0u ? 1u : 0u);
+                    RestirPtCount(RESTIR_PT_COUNTER_ZERO2 + index * 4u + 3u,
+                        here && (bits & RESTIR_PT_ZERO_BIT_X1_FALLBACK) != 0u ? 1u : 0u);
+                }
+            }
+
             continuationRays += tree.continuationRays;
             shadowRays += tree.shadowRays;
             candidates += tree.stream.count;
@@ -4955,7 +5670,8 @@ void RestirPtTemporalCS(uint3 thread : SV_DispatchThreadID)
 
         // M5.2 C1 probe: the temporal lookup's stages and what the previous reservoir holds (counters on, history valid;
         // a deferred pixel's lane leaves before its counts are added, and the replay dispatch probes it again: once each).
-        if(restirPtCounterIndex != 0xFFFFFFFFu && restirPtHistoryValid != 0u && firstVertex.state > 0)
+        if(RESTIR_PT_COUNTERS_COMPILED && restirPtCounterIndex != 0xFFFFFFFFu && restirPtHistoryValid != 0u &&
+            firstVertex.state > 0)
         {
             const RestirPtTemporalNeighbor neighbor = RestirPtFindTemporalNeighbor(pixel, firstVertex, seed);
             temporalProbe[0] = 1u;
@@ -5298,6 +6014,8 @@ void RestirPtSpatialResampleCS(uint3 thread : SV_DispatchThreadID, uint3 groupTh
     bool finalExtract = false;
     int finalState = 0;
     uint finalPathFlags = 0u;
+    // M5.6 motion investigation (debug view 3 only): the final sample's endpoint light class.
+    uint finalLightClass = 0u;
     float3 finalRadiance = float3(0.0f, 0.0f, 0.0f);
     float3 finalDiffuse = float3(0.0f, 0.0f, 0.0f);
     // Counters (RESTIR_PT_COUNTER_SPATIAL + 8 + n): 0 surface pixels resampled, 1 valid partners, 2 partner candidates
@@ -5454,6 +6172,18 @@ void RestirPtSpatialResampleCS(uint3 thread : SV_DispatchThreadID, uint3 groupTh
         finalExtract = extract;
         finalState = self.state;
         finalPathFlags = pathFlags;
+
+        // M5.6 motion investigation (debug view 3 only): 0 indirect/escape, 1 point, 2 spot, 3 sun or environment, 4 other.
+        if(restirPtDebugView == 3u && (pathFlags & RESTIR_PT_PATH_NEE) != 0u && rc.index == (pathFlags & 15u))
+        {
+            finalLightClass = rc.lightType == RESTIR_PT_LIGHT_SUN || rc.lightType == RESTIR_PT_LIGHT_ENVIRONMENT ? 3u : 4u;
+
+            if(rc.lightType == RESTIR_PT_LIGHT_TABLE && rc.instance < sceneLightCount)
+            {
+                const uint type = SceneLightLoad(sceneLightBufferIndex, rc.instance).type;
+                finalLightClass = type == SCENE_LIGHT_POINT ? 1u : type == SCENE_LIGHT_SPOT ? 2u : 4u;
+            }
+        }
         finalRadiance = radiance;
         finalDiffuse = diffuse;
     }
@@ -5535,6 +6265,19 @@ void RestirPtSpatialResampleCS(uint3 thread : SV_DispatchThreadID, uint3 groupTh
         }
 
         accumulationTexture[pixel] = float4(mean, 1.0f);
+
+        // M5.6 O0.1 pulsing diagnostics (debug view 3, harness only; the image and every output are unchanged): the final
+        // sample's path length, its age (+ 100 when firefly replacement acted), the reservoir's shading luminance and the
+        // shaded luminance, into their own buffer (restirPtRegirPadding.y = descriptor index + 1).
+        if(restirPtDebugView == 3u && restirPtRegirPadding.y != 0u)
+        {
+            RWByteAddressBuffer debugPixels = ResourceDescriptorHeap[restirPtRegirPadding.y - 1u];
+            const float age = float(RestirPtPathAge(finalPathFlags)) + (firefly ? 100.0f : 0.0f) +
+                1000.0f * float(finalLightClass);
+            debugPixels.Store4((pixel.y * resolution.x + pixel.x) * 16u, asuint(float4(float(finalPathFlags & 15u), age,
+                finalState > 0 && all(isfinite(finalRadiance)) ? PathTraceLuminance(finalRadiance) : 0.0f,
+                all(isfinite(radiance)) ? PathTraceLuminance(radiance) : 0.0f)));
+        }
 
         // M5.5 debug view 2 keeps the temporal pass's diagnostics in the output.
         if(restirPtDebugView != 2u)

@@ -359,6 +359,26 @@ bool ShaderCompiler::Compile(
         arguments.push_back(L"-Gis");
     }
 
+    // M5.6 B3a: the ReSTIRPT/ tree's pre-B3a BSDF evaluation on request (UsesUnfusedBsdf).
+    if(UsesUnfusedBsdf(description.path))
+    {
+        arguments.push_back(L"-D");
+        arguments.push_back(L"RESTIR_PT_UNFUSED_BSDF=1");
+    }
+
+    // Audit T1-c: the ReSTIRPT/ tree's diagnostic counters only on request (UsesDiagnosticCounters).
+    if(UsesDiagnosticCounters(description.path))
+    {
+        arguments.push_back(L"-D");
+        arguments.push_back(L"RESTIR_PT_COUNTERS=1");
+    }
+
+    if(DisablesSmallLightPath(description.path))
+    {
+        arguments.push_back(L"-D");
+        arguments.push_back(L"RESTIR_PT_NO_SMALL_LIGHTS=1");
+    }
+
     // Shader variants (ShaderVariants) compile from their generated text instead of a file.
     const std::optional<VariantSource> variant = FindVariantSource(description.path, description.shaderRoot);
 
@@ -563,6 +583,26 @@ bool ShaderCompiler::CompileLibrary(
     if(UsesStrictFloatingPoint(description.path))
     {
         arguments.push_back(L"-Gis");
+    }
+
+    // M5.6 B3a: the ReSTIRPT/ tree's pre-B3a BSDF evaluation on request (UsesUnfusedBsdf).
+    if(UsesUnfusedBsdf(description.path))
+    {
+        arguments.push_back(L"-D");
+        arguments.push_back(L"RESTIR_PT_UNFUSED_BSDF=1");
+    }
+
+    // Audit T1-c: the ReSTIRPT/ tree's diagnostic counters only on request (UsesDiagnosticCounters).
+    if(UsesDiagnosticCounters(description.path))
+    {
+        arguments.push_back(L"-D");
+        arguments.push_back(L"RESTIR_PT_COUNTERS=1");
+    }
+
+    if(DisablesSmallLightPath(description.path))
+    {
+        arguments.push_back(L"-D");
+        arguments.push_back(L"RESTIR_PT_NO_SMALL_LIGHTS=1");
     }
 
     std::error_code sameDirectoryError;
@@ -808,6 +848,77 @@ bool ShaderCompiler::UsesStrictFloatingPoint(const std::filesystem::path& shader
     const char* const strict = std::getenv("ENGINE_RESTIR_PT_STRICT_FP");
 
     if(strict == nullptr || std::string(strict) != "1")
+    {
+        return false;
+    }
+
+    for(const std::filesystem::path& component : shaderPath)
+    {
+        if(component == "ReSTIRPT")
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool ShaderCompiler::UsesDiagnosticCounters(const std::filesystem::path& shaderPath)
+{
+    // Audit T1-c: the ReSTIRPT/ tree compiles its diagnostic counters only on request (ENGINE_RESTIR_PT_COUNTERS=1, the
+    // runtime switch that also turns them on, or ENGINE_RESTIR_PT_DIAGNOSTIC_COUNTERS=1 for harness runs that read them).
+    // The persistent cache keys on the arguments.
+    const auto requested = [](const char* name)
+    {
+        const char* value = std::getenv(name);
+        return value != nullptr && std::string(value) == "1";
+    };
+
+    if(!requested("ENGINE_RESTIR_PT_COUNTERS") && !requested("ENGINE_RESTIR_PT_DIAGNOSTIC_COUNTERS"))
+    {
+        return false;
+    }
+
+    for(const std::filesystem::path& component : shaderPath)
+    {
+        if(component == "ReSTIRPT")
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool ShaderCompiler::DisablesSmallLightPath(const std::filesystem::path& shaderPath)
+{
+    // Audit T1-b: the small-light NEE path (RestirPtInitialBody.hlsli) is on unless ENGINE_RESTIR_PT_SMALL_LIGHTS=0.
+    const char* value = std::getenv("ENGINE_RESTIR_PT_SMALL_LIGHTS");
+
+    if(value == nullptr || std::string(value) != "0")
+    {
+        return false;
+    }
+
+    for(const std::filesystem::path& component : shaderPath)
+    {
+        if(component == "ReSTIRPT")
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool ShaderCompiler::UsesUnfusedBsdf(const std::filesystem::path& shaderPath)
+{
+    // M5.6 B3a: the ReSTIRPT/ tree compiles with RESTIR_PT_UNFUSED_BSDF (the pre-B3a evaluation: production unchanged)
+    // unless ENGINE_RESTIR_PT_FUSED_BSDF=1 selects the fused evaluation (B3a measured no gain beyond process variance;
+    // awaiting review). The persistent cache keys on the arguments.
+    const char* const fused = std::getenv("ENGINE_RESTIR_PT_FUSED_BSDF");
+
+    if(fused != nullptr && std::string(fused) == "1")
     {
         return false;
     }

@@ -399,6 +399,30 @@ bool ReSTIRPTPass::EnsureStagnancyMaps(ID3D12Device* device, DescriptorHeap& des
     return true;
 }
 
+bool ReSTIRPTPass::EnsureDebugPixels(ID3D12Device* device, DescriptorHeap& descriptorHeap)
+{
+    if(!m_initialized || m_width == 0 || m_height == 0)
+    {
+        return false;
+    }
+
+    if(m_debugPixels.GetResource())
+    {
+        return true;
+    }
+
+    const MemoryCategoryScope memoryScope(MemoryCategory::PathTracing);
+
+    if(!m_debugPixels.InitializeGPUWritable(device, static_cast<std::size_t>(std::uint64_t{m_width} * m_height * 16u)) ||
+        !m_debugPixels.CreateRawUAV(device, descriptorHeap))
+    {
+        m_debugPixels.Shutdown();
+        return false;
+    }
+
+    return true;
+}
+
 bool ReSTIRPTPass::EnsureInstanceHistory(ID3D12Device* device, DescriptorHeap& descriptorHeap)
 {
     if(!m_initialized || m_width == 0 || m_height == 0)
@@ -452,6 +476,7 @@ bool ReSTIRPTPass::Initialize(ID3D12Device* device, ShaderLibrary& shaderLibrary
     // carries their state).
     if(!CreateInitialPipeline(device, shaderLibrary, "ReSTIRPT/RestirPtInitial.hlsl", m_initialPipeline) ||
         !CreateInitialPipeline(device, shaderLibrary, "ReSTIRPT/RestirPtInitialTemporal.hlsl", m_temporalPipeline) ||
+        !CreateInitialPipeline(device, shaderLibrary, "ReSTIRPT/RestirPtInitialReGIR.hlsl", m_initialReGIRPipeline) ||
         !CreateInitialPipeline(device, shaderLibrary, "ReSTIRPT/RestirPtInitialDiagnostics.hlsl", m_diagnosticsPipeline) ||
         !CreateInitialPipeline(device, shaderLibrary, "ReSTIRPT/RestirPtInitialVisibilityBench.hlsl",
             m_visibilityBenchPipeline) ||
@@ -495,6 +520,21 @@ bool ReSTIRPTPass::Initialize(ID3D12Device* device, ShaderLibrary& shaderLibrary
         return Fail("the light-tile pipeline could not be created.");
     }
 
+    // M5.6 O0: the ReGIR light map.
+    ShaderDescription regirLightsShader{};
+    regirLightsShader.path = "ReSTIRPT/RestirPtReGIRLights.hlsl";
+    regirLightsShader.entryPoint = "main";
+    regirLightsShader.stage = ShaderStage::Compute;
+    Shader* regirLights = shaderLibrary.Load(regirLightsShader);
+    ComputePipelineDescription regirLightsDescription{};
+    regirLightsDescription.computeShader = regirLights;
+    regirLightsDescription.rootParameters = {Parameter(RootParameterType::ConstantBuffer, 0)};
+
+    if(!regirLights || !m_regirLightsPipeline.Initialize(device, regirLightsDescription))
+    {
+        return Fail("ReSTIRPT/RestirPtReGIRLights.hlsl did not compile or its pipeline could not be created.");
+    }
+
     const MemoryCategoryScope memoryScope(MemoryCategory::PathTracing);
     const std::uint64_t tileBytes = std::uint64_t{settings.tileCount} * settings.tileSize * LightTileEntryBytes;
 
@@ -502,6 +542,12 @@ bool ReSTIRPTPass::Initialize(ID3D12Device* device, ShaderLibrary& shaderLibrary
         !m_lightTiles.CreateRawUAV(device, descriptorHeap) || !m_lightTiles.CreateRawSRV(device, descriptorHeap))
     {
         return Fail("the light tiles could not be allocated.");
+    }
+
+    if(!m_regirLights.InitializeGPUWritable(device, std::size_t{ReGIRLightCapacity} * 12u) ||
+        !m_regirLights.CreateRawUAV(device, descriptorHeap) || !m_regirLights.CreateRawSRV(device, descriptorHeap))
+    {
+        return Fail("the ReGIR light map could not be allocated.");
     }
 
     if(!m_counters.InitializeGPUWritable(device, CounterCount * sizeof(std::uint32_t)) ||
@@ -568,6 +614,7 @@ void ReSTIRPTPass::ReleaseTextures()
     m_duplication[1].Shutdown();
     m_stagnancy[0].Shutdown();
     m_stagnancy[1].Shutdown();
+    m_debugPixels.Shutdown();
 
     // The reservoirs' contents are gone with them.
     InvalidateHistory();
@@ -803,7 +850,10 @@ void ReSTIRPTPass::Shutdown()
     m_counters.Shutdown();
     m_lightTiles.Shutdown();
     m_lightTilePipeline.Shutdown();
+    m_regirLights.Shutdown();
+    m_regirLightsPipeline.Shutdown();
     m_initialPipeline.Shutdown();
+    m_initialReGIRPipeline.Shutdown();
     m_temporalPipeline.Shutdown();
     m_diagnosticsPipeline.Shutdown();
     m_visibilityBenchPipeline.Shutdown();
@@ -828,6 +878,7 @@ bool ReSTIRPTPass::RecordLightTiles(ID3D12GraphicsCommandList* commandList, Uplo
         return false;
     }
 
+    m_regirThisFrame = false;
     ReSTIRPTLightTileConstants constants{};
     constants.lightSamplingIndex = lightSamplingIndex;
     constants.outputIndex = m_lightTiles.GetUAVDescriptorIndex();
@@ -851,6 +902,53 @@ bool ReSTIRPTPass::RecordLightTiles(ID3D12GraphicsCommandList* commandList, Uplo
     commandList->Dispatch((entries + 255u) / 256u, 1, 1);
     m_lightTiles.Transition(commandList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     return true;
+}
+
+std::uint32_t ReSTIRPTPass::RecordReGIRLights(ID3D12GraphicsCommandList* commandList, UploadBuffer& uploadBuffer,
+    std::uint32_t lightSamplingIndex, std::uint32_t tableLightCount)
+{
+    if(!m_initialized || !commandList || !m_regirLights.GetResource() || tableLightCount == 0 ||
+        tableLightCount > ReGIRLightCapacity || lightSamplingIndex == 0xFFFFFFFFu)
+    {
+        return 0xFFFFFFFFu;
+    }
+
+    // Phase 0 (one thread per table light) writes (table index, 0) at the light's RTXDI local index; phase 1 (one thread
+    // per global alias entry) then writes the entry light's realized probability. Every local light is rewritten.
+    m_regirLights.Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    m_regirLightsPipeline.Bind(commandList);
+
+    for(std::uint32_t phase = 0; phase < 2; ++phase)
+    {
+        ReSTIRPTLightTileConstants constants{};
+        constants.lightSamplingIndex = lightSamplingIndex;
+        constants.outputIndex = m_regirLights.GetUAVDescriptorIndex();
+        constants.tableLightCount = tableLightCount;
+        constants.padding[0] = phase;
+        const D3D12_GPU_VIRTUAL_ADDRESS address = uploadBuffer.Allocate(&constants, sizeof(constants),
+            D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
+
+        if(address == 0)
+        {
+            return 0xFFFFFFFFu;
+        }
+
+        commandList->SetComputeRootConstantBufferView(0, address);
+        // Phase 1 covers the global table's entries, at most one per table light.
+        commandList->Dispatch((tableLightCount + 255u) / 256u, 1, 1);
+
+        if(phase == 0)
+        {
+            D3D12_RESOURCE_BARRIER barrier{};
+            barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+            barrier.UAV.pResource = m_regirLights.GetResource();
+            commandList->ResourceBarrier(1, &barrier);
+        }
+    }
+
+    m_regirLights.Transition(commandList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    m_regirThisFrame = true;
+    return m_regirLights.GetDescriptorIndex();
 }
 
 ReSTIRPTConstants ReSTIRPTPass::MakeConstants(const ReSTIRPTSettings& settings, bool extract, bool rawDiffuseHitDistance,
@@ -1027,6 +1125,11 @@ std::uint64_t ReSTIRPTPass::GetResourceBytes() const
     if(m_lightTiles.GetResource())
     {
         bytes += std::uint64_t{m_tileCount} * m_tileSize * LightTileEntryBytes;
+    }
+
+    if(m_regirLights.GetResource())
+    {
+        bytes += std::uint64_t{ReGIRLightCapacity} * 12u;
     }
 
     if(m_counters.GetResource())

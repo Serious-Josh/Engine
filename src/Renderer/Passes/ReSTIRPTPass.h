@@ -141,6 +141,36 @@ struct ReSTIRPTSettings
     // for new fireflies). Needs temporal + spatial reuse and extraction (denoiser frames). Accepted bias: final-shading
     // only, about -0.44% energy (Tri-Test); reservoirs and history unchanged.
     bool fireflyReplacement = true;
+    // M5.6 O0 (ENGINE_RESTIR_PT_REGIR=0 or the Editor's "ReGIR light candidates" turns it off; ENGINE_REGIR=0 disables
+    // ReGIR for both estimators): above ReGIRSettings::localLightThreshold local lights, the table-light NEE candidates
+    // come from the shared ReGIR cells (Renderer::PrepareReGIRFrame) instead of the global light tiles. Proposal only:
+    // the candidate's integrand keeps p_1 = the light's global realized probability (RestirPtTableLightNee), so history,
+    // shifts and MIS are unchanged and the switch is not part of the history signature.
+    bool regir = true;
+    // M5.6 O0.1: ReSTIR PT's own ReGIR window, in cells per axis (ReSTIR DI keeps ReGIRSettings::windowCells; one shared
+    // slot buffer is sized for either). 16 (64 m across at 4 m cells) is the O0 default; 32 covers 128 m.
+    // ENGINE_RESTIR_PT_REGIR_WINDOW or the Editor's "ReGIR grid" (16 or 32). Proposal only: not in the history signature.
+    std::uint32_t regirWindow = 16;
+    // M5.6 O0.1: the spatial partners used on frames whose candidates come from ReGIR (0: spatialPairs, as on other frames).
+    // ENGINE_RESTIR_PT_REGIR_SPATIAL_PAIRS or the Editor's "Spatial pairs with ReGIR".
+    std::uint32_t regirSpatialPairs = 0;
+    // M5.6 O0.2 (user-approved defaults 2026-11-23: both on wherever ReGIR is active; ReSTIR PT builds only, ReSTIR DI's
+    // slots are unchanged; ENGINE_RESTIR_PT_REGIR_CONE=0 / _DIRECT=0 or the Editor turn either off):
+    //   regirCone: the ReGIR cell target includes an upper bound of a spot light's cone factor over the cell's lookup region
+    //     (ENGINE_RESTIR_PT_REGIR_CONE=1, Editor "ReGIR spot-cone bound"). Changes the proposal only;
+    //   regirDirectFetch: slots hold scene-table indices, so a candidate needs no index map, and p_1 is read once for the
+    //     selected light (ENGINE_RESTIR_PT_REGIR_DIRECT=1, Editor "ReGIR direct fetch"). Same distribution as the map path.
+    bool regirCone = true;
+    bool regirDirectFetch = true;
+    // M5.6 flashing fix (user-approved 2026-11-23): ReSTIR PT's ReGIR slots per cell (ReSTIR DI keeps
+    // ReGIRSettings::lightsPerCell, 64). Every pixel of a cell draws from the same per-frame slots, so with 64 slots a
+    // cell's estimate brightens or darkens coherently frame to frame and RR shows it as flashing; 256 removed the still-
+    // camera flashing (ManyLight_1024: 3% -> 0.07% of tiles) for about +1 ms at a 32-cell window. Proposal only (each slot
+    // keeps its unbiased W). Default 512 (user choice after visual testing: no flashing still or moving);
+    // ENGINE_RESTIR_PT_REGIR_SLOTS or the Editor's "ReGIR slots per
+    // cell" slider (up to Renderer::ReGIRMaximumSlotsPerCell, the buffer's capacity). Measured (32-cell window): 64 -> 256
+    // -> 1024 slots: still flashing 3% -> 0.07% -> 0%, grid build 0.26 -> 1.0 -> 4.3 ms.
+    std::uint32_t regirSlots = 512;
 };
 
 // M5.2: what the previous frame's reservoirs were computed against. History is reused only when every field matches
@@ -264,6 +294,20 @@ struct ReSTIRPTConstants
     // Optimization experiment A5: spatial partners used (ReSTIRPTSettings::spatialPairs).
     std::uint32_t spatialPairCount = 3;
     std::uint32_t stagnancyPreviousIndex = 0xFFFFFFFFu;
+
+    // M5.6 O0: this frame's ReGIR slots (raw UAV: 64-byte header, then uint2(RTXDI local index, W) per slot; 0xFFFFFFFF:
+    // the light tiles) and, per RTXDI local light, uint2(table index, asuint(global realized probability)) (raw SRV).
+    std::uint32_t regirSlotsIndex = 0xFFFFFFFFu;
+    std::uint32_t regirLightsIndex = 0xFFFFFFFFu;
+    std::uint32_t regirPadding[2]{};
+
+    // M5.6 B4 cost attribution (diagnostic only, biased; ENGINE_RESTIR_PT_DIAG_SKIP_DISTANT): bit 0 skips the sun's NEE
+    // stream, bit 1 the environment's. 0 in every rendering mode.
+    std::uint32_t diagnosticFlags = 0;
+    // M5.6 C7 reinvestigation: the duplication response cap' = lerp(cap, minCap, pow(saturate((D - threshold) /
+    // (1 - threshold)), alpha)) as {alpha, minCap, threshold}; all 0 = the original M5.4 response (alpha 0.1, minCap 1,
+    // threshold 0). ENGINE_RESTIR_PT_DUPLICATION_RESPONSE="alpha;minCap;threshold". Used only with Duplication::Apply.
+    float duplicationResponse[3]{};
 };
 
 // M5.1-4 (M5.2 prerequisite): one render object's transforms, indexed by TLAS InstanceID (the render-object index, as PSR's
@@ -280,7 +324,7 @@ struct ReSTIRPTInstanceTransform
     float previousWorldToObject[12]{};
 };
 
-static_assert(sizeof(ReSTIRPTConstants) == 368, "ReSTIRPTConstants must match RestirPtConstants (b2).");
+static_assert(sizeof(ReSTIRPTConstants) == 400, "ReSTIRPTConstants must match RestirPtConstants (b2).");
 
 // GPU layout of RestirPtLightTileConstants (register b0, assets/Shaders/ReSTIRPT/RestirPtLightTiles.hlsl).
 struct ReSTIRPTLightTileConstants
@@ -315,8 +359,11 @@ class ReSTIRPTPass
     public:
     static constexpr std::uint64_t ReservoirBytes = 64;
     // 64 counters, then the T-2.1 round 3 diagnostics (test only, self-shift runs): histograms, energy sums and dumps (see
-    // RESTIR_PT_COUNTER_GEOMETRY .. RESTIR_PT_COUNTER_DUMPS in RestirPtInitialBody.hlsli).
-    static constexpr std::uint32_t CounterCount = 14208;
+    // RESTIR_PT_COUNTER_GEOMETRY .. RESTIR_PT_COUNTER_DUMPS in RestirPtInitialBody.hlsli). M5.6 Stage 0: 80 words from 14208,
+    // the zero-contribution classification (RESTIR_PT_COUNTER_ZERO); M5.6 O0 investigation: 64 words from 14288
+    // (RESTIR_PT_COUNTER_ZERO2); M5.6 B5: 32 words from 14352 (RESTIR_PT_COUNTER_SHIFTS). Point-light noise investigation
+    // (temporary): 128 x 68 records of 20 words from 14384 (RESTIR_PT_COUNTER_PNC_LOG).
+    static constexpr std::uint32_t CounterCount = 14384 + 128 * 68 * 20;
     // M5.3: pair records per pixel (three partners x 32 B) and the pairing textures' sides [P 3.2]. M5.4 C3 measured 20 B
     // records 1-2.6 ms slower in the pre-pass, so the record stays 32 B (RESTIR_PT_PAIR_BYTES).
     static constexpr std::uint64_t PairRecordBytes = 32;
@@ -343,6 +390,12 @@ class ReSTIRPTPass
     const ComputePipeline& GetDuplicationPipeline() const
     {
         return m_duplicationPipeline;
+    }
+
+    // M5.6 C7 reinvestigation (harness): the last committed frame's duplication map (duplicate count per pixel, 0..288).
+    Buffer* GetCommittedDuplicationMap()
+    {
+        return m_committed && m_duplication[m_committedSet].GetResource() ? &m_duplication[m_committedSet] : nullptr;
     }
     // Creates the reservoirs for this render extent (recreated when it changes).
     bool EnsureReservoirs(ID3D12Device* device, DescriptorHeap& descriptorHeap, unsigned int width, unsigned int height);
@@ -375,6 +428,15 @@ class ReSTIRPTPass
     void InvalidateHistory();
     // Optimization experiment B1a: the two stagnancy maps (4 B per pixel each, paired with the reservoir sets).
     bool EnsureStagnancyMaps(ID3D12Device* device, DescriptorHeap& descriptorHeap);
+    // M5.6 O0.1 pulsing diagnostics (debug view 3, harness only): per render pixel, float4(selected path length, sample age
+    // + 100 when firefly replacement acted, reservoir shading luminance, shaded luminance), written by the final resample
+    // pass. Extent-sized; released with the textures.
+    bool EnsureDebugPixels(ID3D12Device* device, DescriptorHeap& descriptorHeap);
+
+    Buffer& GetDebugPixels()
+    {
+        return m_debugPixels;
+    }
 
     // M5.5 Stage 1: this recording's TLAS instances and geometry identity, committed and abandoned with its history.
     void SetPendingScene(const std::vector<RayTracingInstanceDescription>& instances, std::uint64_t geometryIdentity);
@@ -390,6 +452,12 @@ class ReSTIRPTPass
     // tableLightCount lights). Leaves the tiles readable by the initial pass. Returns false when nothing was recorded.
     bool RecordLightTiles(ID3D12GraphicsCommandList* commandList, UploadBuffer& uploadBuffer,
         std::uint32_t lightSamplingIndex, std::uint32_t tableLightCount, std::uint32_t frameSeed);
+    // M5.6 O0: this frame's RTXDI local light -> (table index, global realized probability) map for the ReGIR candidates
+    // (RestirPtReGIRLights.hlsl, from the published light sampling's translation and global alias table). Returns its SRV
+    // index, or 0xFFFFFFFF (more than ReGIRLightCapacity table lights, or not initialized: the light tiles are used).
+    std::uint32_t RecordReGIRLights(ID3D12GraphicsCommandList* commandList, UploadBuffer& uploadBuffer,
+        std::uint32_t lightSamplingIndex, std::uint32_t tableLightCount);
+    static constexpr std::uint32_t ReGIRLightCapacity = 1u << 17;
     // This frame's RestirPtConstants: the settings' flags, the buffers' descriptors and the frame inputs. extract and
     // rawDiffuseHitDistance select the signal outputs (RESTIR_PT_FLAG_EXTRACT / _RAW_DIFFUSE_HIT_DISTANCE).
     ReSTIRPTConstants MakeConstants(const ReSTIRPTSettings& settings, bool extract, bool rawDiffuseHitDistance,
@@ -421,7 +489,8 @@ class ReSTIRPTPass
             return m_temporalPipeline;
         }
 
-        return m_initialPipeline;
+        // M5.6 O0: the ReGIR variant only on frames whose ReGIR light map was recorded (RecordReGIRLights).
+        return m_regirThisFrame ? m_initialReGIRPipeline : m_initialPipeline;
     }
 
     // M5.4 C1: the temporal reuse pass (its diagnostics variant with the temporal round trip).
@@ -495,6 +564,14 @@ class ReSTIRPTPass
     ComputePipeline m_visibilityBenchPipeline;
     ComputePipeline m_lightTilePipeline;
     Buffer m_lightTiles;
+    // M5.6 O0: the ReGIR light map (ReGIRLightCapacity x 8 bytes, then O0.2's table-indexed p_1, 4 bytes each; raw UAV +
+    // SRV, rebuilt on frames that use ReGIR).
+    ComputePipeline m_regirLightsPipeline;
+    Buffer m_regirLights;
+    // M5.6 O0: the production initial kernel with RESTIR_PT_REGIR, and whether this frame recorded the ReGIR light map
+    // (reset by RecordLightTiles, which every ReSTIR PT frame records first).
+    ComputePipeline m_initialReGIRPipeline;
+    bool m_regirThisFrame = false;
     Buffer m_counters;
     Buffer m_reservoirs[2];
     // M5.3: spatial pipelines, the scratch reservoirs (the initial/temporal kernel's output while spatial reuse runs), the
@@ -511,6 +588,7 @@ class ReSTIRPTPass
     Buffer m_duplication[2];
     // Optimization experiment B1a: the smoothed stagnancy maps (paired with the reservoir sets).
     Buffer m_stagnancy[2];
+    Buffer m_debugPixels;
     ComputePipeline m_duplicationPipeline;
     Buffer m_pairing;
     std::vector<std::uint32_t> m_pairingTexels;

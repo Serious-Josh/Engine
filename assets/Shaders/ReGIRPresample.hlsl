@@ -50,8 +50,14 @@ cbuffer ReGIRPresampleConstants : register(b0)
     // The window as RTXDI's Grid mode locates it (ReGIR_CommonParameters center): its grid origin is
     // windowCenter - windowCells * cellSize / 2.
     float3 windowCenter;
+    // M5.6 O0.2 flags (0 for ReSTIR DI, unchanged): REGIR_FLAG_CONE, REGIR_FLAG_TABLE_INDEX. Echoed in header word 11.
     uint headerPadding;
 };
+
+// M5.6 O0.2 (ReSTIR PT builds only): the cell target includes an upper bound of a spot light's cone factor over the lookup
+// region, and slots hold scene-table indices instead of RTXDI local indices.
+static const uint REGIR_FLAG_CONE = 1u;
+static const uint REGIR_FLAG_TABLE_INDEX = 2u;
 
 static const uint REGIR_SLOT_HEADER_BYTES = 64u;
 static const uint REGIR_SLOT_MAGIC = 0x52654749u;
@@ -106,7 +112,31 @@ float ReGIRCellTarget(GPULight light, float3 low, float3 high, float cellSize)
     }
 
     const float halfCell = 0.5f * cellSize;
-    const float target = luminance * window / max(distanceSquared, halfCell * halfCell);
+    float target = luminance * window / max(distanceSquared, halfCell * halfCell);
+
+    // M5.6 O0.2: a spot light's cone factor, t^2 with t = saturate((cos - cosOuter) / (cosInner - cosOuter)), is at most its
+    // value at the smallest angle between the spot axis and any point of the region's bounding sphere: max(theta - alpha,
+    // 0), with theta the axis angle to the sphere centre and alpha the sphere's angular radius (widened by 1e-3 rad
+    // against rounding). The bound is 0 exactly when no point of the region lies inside the outer cone, so every light
+    // that can reach a point of the region keeps a positive target (coverage unchanged).
+    if((headerPadding & REGIR_FLAG_CONE) != 0u && light.type == SCENE_LIGHT_SPOT)
+    {
+        const float3 centre = 0.5f * (low + high);
+        const float radius = 0.5f * length(high - low);
+        const float3 toCentre = centre - light.position;
+        const float centreDistance = length(toCentre);
+
+        if(centreDistance > radius)
+        {
+            const float axisAngle = acos(clamp(dot(toCentre / centreDistance, normalize(light.direction)), -1.0f, 1.0f));
+            const float angularRadius = asin(saturate(radius / centreDistance)) + 1.0e-3f;
+            const float smallestCosine = cos(max(axisAngle - angularRadius, 0.0f));
+            const float coneWidth = max(light.cosInnerCone - light.cosOuterCone, 1.0e-4f);
+            const float coneBound = saturate((smallestCosine - light.cosOuterCone) / coneWidth);
+            target *= coneBound * coneBound;
+        }
+    }
+
     return target > 0.0f ? target : 0.0f;
 }
 
@@ -298,7 +328,9 @@ void main(uint3 thread : SV_DispatchThreadID)
 
     if(selectedLight != REGIR_NO_LIGHT && selectedTarget > 0.0f)
     {
-        const uint rtxdiIndex = structures.Load(LIGHT_SAMPLING_HEADER_BYTES + sampling.padding + selectedLight * 4u);
+        // M5.6 O0.2: ReSTIR PT builds may store the scene-table index itself (no translation for its consumer).
+        const uint rtxdiIndex = (headerPadding & REGIR_FLAG_TABLE_INDEX) != 0u ? selectedLight :
+            structures.Load(LIGHT_SAMPLING_HEADER_BYTES + sampling.padding + selectedLight * 4u);
 
         // A light without an RTXDI local index (directional; excluded above by its zero target) never enters a slot.
         if(rtxdiIndex != REGIR_NO_LIGHT)
@@ -314,6 +346,6 @@ void main(uint3 thread : SV_DispatchThreadID)
     {
         slots.Store4(0u, uint4(REGIR_SLOT_MAGIC, asuint(windowCenter)));
         slots.Store4(16u, uint4(windowCells, lightsPerCell));
-        slots.Store4(32u, uint4(asuint(sampling.cellSize), asuint(samplingJitter), frameSeed, 0u));
+        slots.Store4(32u, uint4(asuint(sampling.cellSize), asuint(samplingJitter), frameSeed, headerPadding));
     }
 }

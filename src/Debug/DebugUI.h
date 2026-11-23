@@ -225,6 +225,70 @@ class DebugUI
         return m_restirPtFirefly;
     }
 
+    // M5.6 O0: ReSTIR PT's table-light candidates from the shared ReGIR cells (above 64 local lights).
+    void SetRestirPtRegir(bool regir)
+    {
+        m_restirPtRegir = regir;
+    }
+
+    bool GetRestirPtRegir() const
+    {
+        return m_restirPtRegir;
+    }
+
+    // M5.6 O0.1: ReSTIR PT's ReGIR window (cells per axis: 16 or 32) and its spatial pairs on ReGIR frames (0: same).
+    void SetRestirPtRegirWindow(std::uint32_t cells)
+    {
+        m_restirPtRegirWindow32 = cells >= 32u;
+    }
+
+    std::uint32_t GetRestirPtRegirWindow() const
+    {
+        return m_restirPtRegirWindow32 ? 32u : 16u;
+    }
+
+    // M5.6 flashing fix: ReSTIR PT's ReGIR slots per cell.
+    void SetRestirPtRegirSlots(std::uint32_t slots)
+    {
+        m_restirPtRegirSlots = static_cast<int>(slots);
+    }
+
+    std::uint32_t GetRestirPtRegirSlots() const
+    {
+        return static_cast<std::uint32_t>(m_restirPtRegirSlots);
+    }
+
+    // M5.6 O0.2: ReSTIR PT's ReGIR spot-cone bound and direct candidate fetch.
+    void SetRestirPtRegirCone(bool cone)
+    {
+        m_restirPtRegirCone = cone;
+    }
+
+    bool GetRestirPtRegirCone() const
+    {
+        return m_restirPtRegirCone;
+    }
+
+    void SetRestirPtRegirDirect(bool direct)
+    {
+        m_restirPtRegirDirect = direct;
+    }
+
+    bool GetRestirPtRegirDirect() const
+    {
+        return m_restirPtRegirDirect;
+    }
+
+    void SetRestirPtRegirSpatialPairs(std::uint32_t pairs)
+    {
+        m_restirPtRegirSpatialPairs = static_cast<int>(pairs);
+    }
+
+    std::uint32_t GetRestirPtRegirSpatialPairs() const
+    {
+        return static_cast<std::uint32_t>(m_restirPtRegirSpatialPairs);
+    }
+
     bool IsShadingNormalCorrectionEnabled() const
     {
 #ifndef NDEBUG
@@ -491,6 +555,12 @@ class DebugUI
     int m_restirPtSpatialPairs = 3;
     int m_restirPtStagnancyMode = 0;
     bool m_restirPtFirefly = false;
+    bool m_restirPtRegir = true;
+    bool m_restirPtRegirWindow32 = false;
+    int m_restirPtRegirSpatialPairs = 0;
+    int m_restirPtRegirSlots = 512;
+    bool m_restirPtRegirCone = true;
+    bool m_restirPtRegirDirect = true;
 
 #ifndef NDEBUG
     bool m_shadingNormalCorrectionEnabled = true;

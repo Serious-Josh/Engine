@@ -132,6 +132,14 @@ class ShaderCompiler
     // IEEE: no reassociation or contraction), so a shift evaluates exactly what capture cached. Since optimization A1 this
     // applies only with ENGINE_RESTIR_PT_STRICT_FP=1 (default relaxed). Every other shader keeps its arguments.
     static bool UsesStrictFloatingPoint(const std::filesystem::path& shaderPath);
+    // M5.6 B3a: ReSTIRPT/ shaders compile with RESTIR_PT_UNFUSED_BSDF (pre-B3a evaluation) unless ENGINE_RESTIR_PT_FUSED_BSDF=1.
+    static bool UsesUnfusedBsdf(const std::filesystem::path& shaderPath);
+    // Audit T1-c: ReSTIRPT/ shaders compile their diagnostic counters only for ENGINE_RESTIR_PT_COUNTERS=1 or
+    // ENGINE_RESTIR_PT_DIAGNOSTIC_COUNTERS=1.
+    static bool UsesDiagnosticCounters(const std::filesystem::path& shaderPath);
+    // Audit T1-b: ReSTIRPT/ shaders compile with RESTIR_PT_NO_SMALL_LIGHTS (no small-light NEE path) only for
+    // ENGINE_RESTIR_PT_SMALL_LIGHTS=0.
+    static bool DisablesSmallLightPath(const std::filesystem::path& shaderPath);
 
     private:
     // Logs through Engine when diagnostics is null; otherwise appends to it.

@@ -51,6 +51,8 @@
 #include <atomic>
 #include <optional>
 #include <stdexcept>
+#include <array>
+#include <sstream>
 
 namespace
 {
@@ -3359,6 +3361,8 @@ bool Renderer::Initialize(
         // M5.4 C6: dual motion vectors in the temporal lookup (unbiased; validated); ENGINE_RESTIR_PT_DUAL_MOTION=0 off.
         m_restirPtSettings.dualMotion = environment("ENGINE_RESTIR_PT_DUAL_MOTION") != "0";
         // M5.4 C7: ENGINE_RESTIR_PT_DUPLICATION=measure|apply (off by default; apply is biased).
+        // M5.4 C7 (biased; off by default, restored 2026-11-23 after the M5.6 reinvestigation and audit T1-a):
+        // ENGINE_RESTIR_PT_DUPLICATION=apply applies the duplication response, =measure computes the map only.
         const std::string duplication = environment("ENGINE_RESTIR_PT_DUPLICATION");
         m_restirPtSettings.duplication = duplication == "apply" ? ReSTIRPTSettings::Duplication::Apply :
             duplication == "measure" ? ReSTIRPTSettings::Duplication::Measure : ReSTIRPTSettings::Duplication::Off;
@@ -3402,6 +3406,45 @@ bool Renderer::Initialize(
         m_restirPtSettings.fireflyReplacement = environment("ENGINE_RESTIR_PT_FIREFLY") != "0";
         m_restirPtUiFirefly = m_restirPtSettings.fireflyReplacement;
         m_debugUI.SetRestirPtFirefly(m_restirPtUiFirefly);
+
+        // M5.6 O0 (default on): ENGINE_RESTIR_PT_REGIR=0 keeps the global light tiles; the Editor checkbox starts from it.
+        m_restirPtSettings.regir = environment("ENGINE_RESTIR_PT_REGIR") != "0";
+        m_restirPtUiRegir = m_restirPtSettings.regir;
+        m_debugUI.SetRestirPtRegir(m_restirPtUiRegir);
+
+        // M5.6 O0.1: ReSTIR PT's own ReGIR window (16 or 32 cells per axis) and spatial pairs on ReGIR frames (0: same).
+        if(const std::string window = environment("ENGINE_RESTIR_PT_REGIR_WINDOW"); !window.empty())
+        {
+            m_restirPtSettings.regirWindow = std::clamp(static_cast<std::uint32_t>(std::stoul(window)), 4u,
+                ReGIRMaximumWindowCells);
+        }
+
+        if(const std::string pairs = environment("ENGINE_RESTIR_PT_REGIR_SPATIAL_PAIRS"); !pairs.empty())
+        {
+            m_restirPtSettings.regirSpatialPairs = std::clamp(static_cast<std::uint32_t>(std::stoul(pairs)), 0u, 3u);
+        }
+
+        // M5.6 flashing fix: ReSTIR PT's ReGIR slots per cell (default 512; 64 is the pre-fix value); the Editor slider
+        // starts from it.
+        if(const std::string slots = environment("ENGINE_RESTIR_PT_REGIR_SLOTS"); !slots.empty())
+        {
+            m_restirPtSettings.regirSlots = std::clamp(static_cast<std::uint32_t>(std::stoul(slots)), 1u, 4096u);
+        }
+
+        m_restirPtUiRegirSlots = m_restirPtSettings.regirSlots;
+        m_debugUI.SetRestirPtRegirSlots(m_restirPtUiRegirSlots);
+
+        // M5.6 O0.2: spot-cone bound and direct fetch (default on; "0" turns either off).
+        m_restirPtSettings.regirCone = environment("ENGINE_RESTIR_PT_REGIR_CONE") != "0";
+        m_restirPtSettings.regirDirectFetch = environment("ENGINE_RESTIR_PT_REGIR_DIRECT") != "0";
+        m_restirPtUiRegirCone = m_restirPtSettings.regirCone;
+        m_restirPtUiRegirDirect = m_restirPtSettings.regirDirectFetch;
+        m_debugUI.SetRestirPtRegirCone(m_restirPtUiRegirCone);
+        m_debugUI.SetRestirPtRegirDirect(m_restirPtUiRegirDirect);
+        m_restirPtUiRegirWindow = m_restirPtSettings.regirWindow;
+        m_restirPtUiRegirSpatialPairs = m_restirPtSettings.regirSpatialPairs;
+        m_debugUI.SetRestirPtRegirWindow(m_restirPtUiRegirWindow);
+        m_debugUI.SetRestirPtRegirSpatialPairs(m_restirPtUiRegirSpatialPairs);
 
         if(const std::string cap = environment("ENGINE_RESTIR_PT_CONFIDENCE_CAP"); !cap.empty())
         {
@@ -7257,6 +7300,47 @@ void Renderer::RecordReSTIRPTFrame(ID3D12GraphicsCommandList* commandList, unsig
         m_restirPtSettings.fireflyReplacement = firefly;
     }
 
+    // M5.6 O0: the Editor's ReGIR light candidates, applied only when it changes.
+    if(const bool regir = m_debugUI.GetRestirPtRegir(); regir != m_restirPtUiRegir)
+    {
+        m_restirPtUiRegir = regir;
+        m_restirPtSettings.regir = regir;
+    }
+
+    // M5.6 flashing fix: the Editor's ReGIR slots per cell, applied only when it changes (clamped to the buffer's capacity
+    // when the slots are built).
+    if(const std::uint32_t slots = m_debugUI.GetRestirPtRegirSlots(); slots != m_restirPtUiRegirSlots)
+    {
+        m_restirPtUiRegirSlots = slots;
+        m_restirPtSettings.regirSlots = slots;
+    }
+
+    // M5.6 O0.2: the Editor's spot-cone bound and direct fetch, applied only when they change.
+    if(const bool cone = m_debugUI.GetRestirPtRegirCone(); cone != m_restirPtUiRegirCone)
+    {
+        m_restirPtUiRegirCone = cone;
+        m_restirPtSettings.regirCone = cone;
+    }
+
+    if(const bool direct = m_debugUI.GetRestirPtRegirDirect(); direct != m_restirPtUiRegirDirect)
+    {
+        m_restirPtUiRegirDirect = direct;
+        m_restirPtSettings.regirDirectFetch = direct;
+    }
+
+    // M5.6 O0.1: the Editor's ReGIR grid and spatial pairs with ReGIR, applied only when they change.
+    if(const std::uint32_t window = m_debugUI.GetRestirPtRegirWindow(); window != m_restirPtUiRegirWindow)
+    {
+        m_restirPtUiRegirWindow = window;
+        m_restirPtSettings.regirWindow = window;
+    }
+
+    if(const std::uint32_t pairs = m_debugUI.GetRestirPtRegirSpatialPairs(); pairs != m_restirPtUiRegirSpatialPairs)
+    {
+        m_restirPtUiRegirSpatialPairs = pairs;
+        m_restirPtSettings.regirSpatialPairs = pairs;
+    }
+
     // B1a: the Editor's decorrelation mode, applied only when it changes.
     if(const bool stagnancy = m_debugUI.GetRestirPtStagnancy(); stagnancy != m_restirPtUiStagnancy)
     {
@@ -7305,6 +7389,29 @@ void Renderer::RecordReSTIRPTFrame(ID3D12GraphicsCommandList* commandList, unsig
         m_restirPtFrame * 0x9E3779B9u);
     m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::RestirPtLightTiles);
 
+    // M5.6 O0: the shared ReGIR slots (PrepareReGIRFrame applies ENGINE_REGIR, the local-light threshold and the published
+    // light sampling) and ReSTIR PT's light map for them; both or neither (then the light tiles are used everywhere).
+    std::uint32_t regirSlotsIndex = 0xFFFFFFFFu;
+    std::uint32_t regirLightsIndex = 0xFFFFFFFFu;
+
+    if(m_restirPtSettings.regir && samplingPublished)
+    {
+        m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::RestirPtReGIR);
+        const std::uint32_t slots = PrepareReGIRFrame(commandList, frameLighting, m_frameCameraPosition, true,
+            m_restirPtSettings.regirWindow, (m_restirPtSettings.regirCone ? 1u : 0u) |
+            (m_restirPtSettings.regirDirectFetch ? 2u : 0u), m_restirPtSettings.regirSlots);
+
+        if(slots != UINT_MAX)
+        {
+            regirLightsIndex = m_restirPtPass.RecordReGIRLights(commandList, m_uploadBuffer, lightSamplingIndex, tableLights);
+            regirSlotsIndex = regirLightsIndex != 0xFFFFFFFFu ? slots : 0xFFFFFFFFu;
+        }
+
+        m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::RestirPtReGIR);
+    }
+
+    m_restirPtReGIRLastFrame = regirSlotsIndex != 0xFFFFFFFFu;
+
     // M5.2: this recording's reservoir sets and whether the previous frame's may be read.
     PreviousGBufferView previousGBuffer;
     const bool previousSurfacesAvailable = TryGetPreviousGBuffer(previousGBuffer);
@@ -7327,6 +7434,10 @@ void Renderer::RecordReSTIRPTFrame(ID3D12GraphicsCommandList* commandList, unsig
         m_restirPtSettings.duplication != ReSTIRPTSettings::Duplication::Off &&
         m_restirPtPass.EnsureDuplicationMaps(m_graphicsDevice.GetDevice(), m_resourceDescriptorHeap);
 
+    // M5.6 O0.1: debug view 3's per-pixel buffer (harness only).
+    const bool debugPixels = m_restirPtSettings.debugView == 3u &&
+        m_restirPtPass.EnsureDebugPixels(m_graphicsDevice.GetDevice(), m_resourceDescriptorHeap);
+
     // Optimization experiment B1a: the stagnancy maps (before MakeConstants reads them).
     if(m_restirPtSettings.decorrelationMode == ReSTIRPTSettings::DecorrelationMode::Stagnancy)
     {
@@ -7342,6 +7453,70 @@ void Renderer::RecordReSTIRPTFrame(ID3D12GraphicsCommandList* commandList, unsig
     ReSTIRPTConstants constants = m_restirPtPass.MakeConstants(m_restirPtSettings, extract, rawExtraction,
         lightSamplingIndex, tableLights, m_restirPtFrame, settings.russianRouletteDepth, restirPtFrame, spatial,
         temporalPass);
+    constants.regirSlotsIndex = regirSlotsIndex;
+    constants.regirLightsIndex = regirLightsIndex;
+
+    // M5.6 O0.1: the spatial partners on ReGIR frames, when configured separately.
+    if(regirSlotsIndex != 0xFFFFFFFFu && m_restirPtSettings.regirSpatialPairs != 0u)
+    {
+        constants.spatialPairCount = (std::min)(m_restirPtSettings.regirSpatialPairs, ReSTIRPTPass::SpatialNeighbours);
+    }
+    // M5.6 O0 investigation (diagnostics only, counters on): ENGINE_RESTIR_PT_REGIR_EXACT=1 checks each x1 light estimate
+    // against the exact sum over every table light (RESTIR_PT_COUNTER_ZERO2; slow).
+    static const bool regirExact = []
+    {
+        const char* value = std::getenv("ENGINE_RESTIR_PT_REGIR_EXACT");
+        return value && std::string(value) == "1";
+    }();
+    // Point-light noise investigation (counters builds only): ENGINE_RESTIR_PT_PNC_LOG=1 logs the x1 NEE events of a sparse
+    // pixel grid into the counters (RESTIR_PT_COUNTER_PNC_LOG; bit 1).
+    static const bool pncLog = []
+    {
+        const char* value = std::getenv("ENGINE_RESTIR_PT_PNC_LOG");
+        return value && std::string(value) == "1";
+    }();
+    constants.regirPadding[0] = (regirExact ? 1u : 0u) | (pncLog ? 2u : 0u);
+    // M5.6 B4 cost attribution (diagnostic only, biased): ENGINE_RESTIR_PT_DIAG_SKIP_DISTANT = 1 sun NEE, 2 environment NEE,
+    // 3 both skipped (timing comparisons only; never a rendering mode).
+    static const std::uint32_t skipDistant = []
+    {
+        const char* value = std::getenv("ENGINE_RESTIR_PT_DIAG_SKIP_DISTANT");
+        return value && *value ? static_cast<std::uint32_t>(std::strtoul(value, nullptr, 0)) & 3u : 0u;
+    }();
+    // M5.6 B4a: ENGINE_RESTIR_PT_ENV_SEARCH=8ary (experimental, identical samples) and ENGINE_RESTIR_PT_DIAG_ENV (bits
+    // 2-5 of restirPtDiagnosticFlags; diagnostic only, biased: timing attribution of the environment sampler).
+    static const std::uint32_t environmentFlags = []
+    {
+        const char* search = std::getenv("ENGINE_RESTIR_PT_ENV_SEARCH");
+        const char* diagnostic = std::getenv("ENGINE_RESTIR_PT_DIAG_ENV");
+        const std::uint32_t eightAry = search && std::string(search) == "8ary" ? 64u : 0u;
+        const std::uint32_t parts = diagnostic && *diagnostic ?
+            (static_cast<std::uint32_t>(std::strtoul(diagnostic, nullptr, 0)) & 15u) << 2 : 0u;
+        return eightAry | parts;
+    }();
+    constants.diagnosticFlags = skipDistant | environmentFlags;
+    // M5.6 C7 reinvestigation: ENGINE_RESTIR_PT_DUPLICATION_RESPONSE="alpha;minCap;threshold" (with ..._DUPLICATION=apply).
+    static const std::array<float, 3> duplicationResponse = []
+    {
+        std::array<float, 3> values{};
+        const char* text = std::getenv("ENGINE_RESTIR_PT_DUPLICATION_RESPONSE");
+
+        if(text && *text)
+        {
+            std::stringstream stream(text);
+            std::string part;
+
+            for(std::size_t index = 0; index < values.size() && std::getline(stream, part, ';'); ++index)
+            {
+                values[index] = std::strtof(part.c_str(), nullptr);
+            }
+        }
+
+        return values;
+    }();
+    std::memcpy(constants.duplicationResponse, duplicationResponse.data(), sizeof(constants.duplicationResponse));
+    // M5.6 O0.1: debug view 3's buffer, as descriptor index + 1 (0: none).
+    constants.regirPadding[1] = debugPixels ? m_restirPtPass.GetDebugPixels().GetUAVDescriptorIndex() + 1u : 0u;
     constants.motionIndex = m_gBuffer.GetMotion().GetSRVIndex();
     // M5.4 C6: the current camera-relative view-projection and the raster identity (dual motion vectors).
     const Matrix4 cameraRelativeViewProjection = CameraRelativeViewProjection(view, projection);
@@ -7612,16 +7787,20 @@ bool Renderer::EnsureReSTIRPT()
 // its table; ReSTIR reservoirs hold lights, never slots, and stay under the existing RTXDI history rules. Otherwise UINT_MAX
 // (the uniform candidates run).
 std::uint32_t Renderer::PrepareReGIRFrame(ID3D12GraphicsCommandList* commandList, const FrameLighting& frameLighting,
-    const PathTraceReferenceConstants& constants)
+    const float cameraPosition[3], bool restirPt, std::uint32_t windowCells, std::uint32_t presampleFlags,
+    std::uint32_t slotsPerCell)
 {
     CpuTiming::ScopedDuration prepareDuration(m_regirPrepareMillisecondsForTesting);
-    m_regirUsedLastFrameForTesting = m_pathTraceReferencePass.RecordedReGIR();
     const std::uint32_t tableLights = frameLighting.table.lightCount;
+    // M5.6 O0: ReSTIR PT also accepts the structures published this frame without a known revision (never cached); they are
+    // exactly what the GPU buffer holds for this table. ReSTIR DI keeps the cached structures only (unchanged).
+    const bool cached = m_lightSamplingCache && m_lightSamplingCacheTable.lightCount == tableLights;
+    const LightSamplingData* sampling = cached ? m_lightSamplingCache.get() :
+        restirPt && m_lightSamplingPublishedLightCount == tableLights ? m_frameLightSamplingData.get() : nullptr;
 
     if(!m_regirRequestedForTesting || !PathTraceReferencePass::ReGIRLibrariesRequested() ||
-        m_frameReGIRLocalLights <= m_regirSettings.localLightThreshold || !m_lightSamplingCache ||
-        !m_lightSamplingReport.available ||
-        m_lightSamplingCacheTable.lightCount != tableLights || m_frameLightSamplingBufferIndex == 0 ||
+        m_frameReGIRLocalLights <= m_regirSettings.localLightThreshold || !sampling ||
+        !m_lightSamplingReport.available || m_frameLightSamplingBufferIndex == 0 ||
         m_frameLightSamplingBufferIndex == UINT_MAX || m_frameSceneLightBufferIndex == UINT_MAX)
     {
         return UINT_MAX;
@@ -7655,8 +7834,14 @@ std::uint32_t Renderer::PrepareReGIRFrame(ID3D12GraphicsCommandList* commandList
         parameter.shaderRegister = 0;
         parameter.visibility = D3D12_SHADER_VISIBILITY_ALL;
         description.rootParameters.push_back(parameter);
-        const std::uint64_t slotBytes = ReGIRSlotHeaderBytes + std::uint64_t{m_regirSettings.windowCells[0]} *
-            m_regirSettings.windowCells[1] * m_regirSettings.windowCells[2] * m_regirSettings.lightsPerCell * 8u;
+        // M5.6 O0.1: room for ReSTIR PT's window too (ReGIRMaximumWindowCells), whichever estimator creates the buffer.
+        const std::uint64_t capacityCells = (std::max)(m_regirSettings.windowCells[0], ReGIRMaximumWindowCells);
+        // M5.6 flashing fix: room for ReSTIR PT's slots per cell too.
+        m_regirSlotCapacity = (std::max)((std::max)(m_regirSettings.lightsPerCell, m_restirPtSettings.regirSlots),
+            ReGIRMaximumSlotsPerCell);
+        const std::uint64_t slotBytes = ReGIRSlotHeaderBytes + (std::max)(std::uint64_t{m_regirSettings.windowCells[0]} *
+            m_regirSettings.windowCells[1] * m_regirSettings.windowCells[2], capacityCells * capacityCells * capacityCells) *
+            m_regirSlotCapacity * 8u;
 
         if(!shader || !m_regirPresamplePipeline.Initialize(device, description) ||
             !m_regirSlots.InitializeGPUWritable(device, static_cast<std::size_t>(slotBytes)) ||
@@ -7679,19 +7864,36 @@ std::uint32_t Renderer::PrepareReGIRFrame(ID3D12GraphicsCommandList* commandList
         return UINT_MAX;
     }
 
-    const float camera[3] = {constants.cameraPosition[0], constants.cameraPosition[1], constants.cameraPosition[2]};
-    const ReGIRWindow window = MakeReGIRWindow(*m_lightSamplingCache, camera, m_regirSettings);
+    // M5.6 O0.1: a caller's own window (ReSTIR PT), within the buffer's capacity; ReSTIR DI passes 0 (its own settings).
+    ReGIRSettings settings = m_regirSettings;
+
+    if(windowCells != 0)
+    {
+        const std::uint32_t cells = (std::min)(windowCells, (std::max)(m_regirSettings.windowCells[0],
+            ReGIRMaximumWindowCells));
+        settings.windowCells[0] = settings.windowCells[1] = settings.windowCells[2] = cells;
+    }
+
+    // M5.6 flashing fix: a caller's own slots per cell (ReSTIR PT), within the buffer's capacity.
+    if(slotsPerCell != 0)
+    {
+        settings.lightsPerCell = std::clamp(slotsPerCell, 1u, m_regirSlotCapacity);
+    }
+
+    const ReGIRWindow window = MakeReGIRWindow(*sampling, cameraPosition, settings);
 
     if(!window.valid)
     {
         return UINT_MAX;
     }
 
-    ReGIRPresampleConstants presample = MakeReGIRPresampleConstants(window, m_regirSettings, tableLights,
+    ReGIRPresampleConstants presample = MakeReGIRPresampleConstants(window, settings, tableLights,
         0x52454749u ^ (++m_regirFrame * 0x9E3779B9u));
     presample.lightSamplingIndex = m_frameLightSamplingBufferIndex;
     presample.sceneLightBufferIndex = m_frameSceneLightBufferIndex;
     presample.outputIndex = m_regirSlots.GetUAVDescriptorIndex();
+    // M5.6 O0.2: ReSTIR PT's build options (ReGIRPresample.hlsl REGIR_FLAG_*; 0 for ReSTIR DI).
+    presample.headerPadding = presampleFlags;
     const D3D12_GPU_VIRTUAL_ADDRESS address = m_uploadBuffer.Allocate(&presample, sizeof(presample),
         D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
 
@@ -7700,7 +7902,7 @@ std::uint32_t Renderer::PrepareReGIRFrame(ID3D12GraphicsCommandList* commandList
         return UINT_MAX;
     }
 
-    const std::uint32_t slots = window.CellCount() * m_regirSettings.lightsPerCell;
+    const std::uint32_t slots = window.CellCount() * settings.lightsPerCell;
     m_regirSlots.Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     m_regirPresamplePipeline.Bind(commandList);
     commandList->SetComputeRootConstantBufferView(0, address);
@@ -7788,7 +7990,8 @@ bool Renderer::PrepareRtxdiFrame(ID3D12GraphicsCommandList* commandList, const F
     rtxdiConstants.neighborOffsetsIndex = m_rtxdiResources.GetNeighborOffsetsSRVIndex();
     // M4.3 ReGIR (experimental): this frame's presampled slots (their UAV, read by the DirectLighting/ReGIR permutation the
     // pass then selects), or none. Production permutations never read padding0.
-    rtxdiConstants.padding0 = PrepareReGIRFrame(commandList, frameLighting, constants);
+    m_regirUsedLastFrameForTesting = m_pathTraceReferencePass.RecordedReGIR();
+    rtxdiConstants.padding0 = PrepareReGIRFrame(commandList, frameLighting, constants.cameraPosition);
     m_pathTraceReferencePass.SelectReGIR(rtxdiConstants.padding0 != UINT_MAX);
     rtxdiConstants.motionIndex = m_gBuffer.GetMotion().GetSRVIndex();
 
@@ -9552,6 +9755,9 @@ bool Renderer::RecordPathTraceReference(
             Log::Error("Failed to allocate path tracing constants.");
             return false;
         }
+
+        // M5.6 O0: ReSTIR PT's ReGIR window is centred on the same camera as ReSTIR DI's.
+        std::memcpy(m_frameCameraPosition, constants.cameraPosition, sizeof(m_frameCameraPosition));
 
         // RTXPT.3: the ReSTIR DI variant's RTXDI constants and reservoir buffer.
         D3D12_GPU_VIRTUAL_ADDRESS rtxdiConstantsAddress = 0;
@@ -12325,6 +12531,7 @@ D3D12_GPU_VIRTUAL_ADDRESS Renderer::RecordLightSampling(ID3D12GraphicsCommandLis
 {
     m_lightSamplingReport.enabled = m_lightSamplingEnabled || restirPtFrame;
     m_lightSamplingReport.available = false;
+    m_frameLightSamplingData.reset();
 
     // M4.3.5: with ReGIR the only consumer, nothing is built (or published) on frames that do not use it. M5.1:
     // configuration B's light tiles always need it.
@@ -12456,6 +12663,12 @@ D3D12_GPU_VIRTUAL_ADDRESS Renderer::RecordLightSampling(ID3D12GraphicsCommandLis
         m_commandContext.GetLastSubmissionFenceValue(), m_commandContext.GetCompletedFenceValue(), constants, &failure,
         incremental ? &patch : nullptr);
     m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::LightSamplingUpload);
+
+    // M5.6 O0: the structures this frame publishes, also when their revision is unknown (0: never cached).
+    if(result != LightSamplingBuffer::RecordResult::Failed)
+    {
+        m_frameLightSamplingData = data;
+    }
 
     if(result == LightSamplingBuffer::RecordResult::Failed)
     {
