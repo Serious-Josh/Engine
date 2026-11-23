@@ -353,7 +353,7 @@ bool ShaderCompiler::Compile(
         arguments.push_back(L"-enable-16bit-types");
     }
 
-    // M5.1 T-2.1: configuration B's ReSTIRPT/ tree compiles with strict IEEE semantics (UsesStrictFloatingPoint).
+    // M5.1 T-2.1: configuration B's ReSTIRPT/ tree with strict IEEE only on request (UsesStrictFloatingPoint; A1).
     if(UsesStrictFloatingPoint(description.path))
     {
         arguments.push_back(L"-Gis");
@@ -559,7 +559,7 @@ bool ShaderCompiler::CompileLibrary(
         arguments.push_back(L"-enable-16bit-types");
     }
 
-    // M5.1 T-2.1: configuration B's ReSTIRPT/ tree compiles with strict IEEE semantics (UsesStrictFloatingPoint).
+    // M5.1 T-2.1: configuration B's ReSTIRPT/ tree with strict IEEE only on request (UsesStrictFloatingPoint; A1).
     if(UsesStrictFloatingPoint(description.path))
     {
         arguments.push_back(L"-Gis");
@@ -801,11 +801,13 @@ bool ShaderCompiler::UsesNative16BitTypes(const std::filesystem::path& shaderPat
 
 bool ShaderCompiler::UsesStrictFloatingPoint(const std::filesystem::path& shaderPath)
 {
-    // M5.2 C0 performance baseline only (diagnostic): ENGINE_RESTIR_PT_STRICT_FP=0 compiles the tree without -Gis. The
-    // persistent cache keys on the arguments, so the two variants never mix.
+    // Optimization A1 (user-approved 2026-11-23): the ReSTIRPT/ tree compiles without -Gis by default (Demo -4.6 ms,
+    // Tri-Test -7.9 ms; gates pass, no visible difference). ENGINE_RESTIR_PT_STRICT_FP=1 restores strict IEEE for
+    // diagnostics and comparisons (the M5.1 exact-identity tests need it). The persistent cache keys on the arguments, so
+    // the two variants never mix.
     const char* const strict = std::getenv("ENGINE_RESTIR_PT_STRICT_FP");
 
-    if(strict != nullptr && std::string(strict) == "0")
+    if(strict == nullptr || std::string(strict) != "1")
     {
         return false;
     }

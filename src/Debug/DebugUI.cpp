@@ -1533,6 +1533,18 @@ void DebugUI::DrawPathTraceReferenceSettings()
             m_restirPtReuseChanged |= ImGui::Checkbox("Temporal reuse", &m_restirPtTemporalReuse);
             m_restirPtReuseChanged |= ImGui::Checkbox("Spatial reuse", &m_restirPtSpatialReuse);
 
+            // Optimization experiment A5: spatial partners per pixel (3 = published default).
+            if(m_restirPtSpatialReuse)
+            {
+                ImGui::SliderInt("Spatial pairs", &m_restirPtSpatialPairs, 1, 3);
+
+                // Optimization experiment B1a: Uniform (p constant) or Stagnancy (NVIDIA RTXDI, per-pixel by sample age).
+                const char* decorrelationModes[] = {"Uniform", "Stagnancy"};
+                ImGui::Combo("Decorrelation", &m_restirPtStagnancyMode, decorrelationModes, IM_ARRAYSIZE(decorrelationModes));
+                // Optimization experiment B1b: NVIDIA RTXDI firefly replacement (needs temporal + spatial reuse).
+                ImGui::Checkbox("Firefly replacement", &m_restirPtFirefly);
+            }
+
             if(m_restirPtSpatialReuse && resolved.pathTrace.samplesPerFrame != 1u)
             {
                 ImGui::TextDisabled("Spatial reuse runs at 1 sample per frame only.");

@@ -192,6 +192,39 @@ class DebugUI
         return changed;
     }
 
+    // Optimization experiment A5: ReSTIR PT's spatial partner count (1-3), shown under "Spatial reuse".
+    void SetRestirPtSpatialPairs(std::uint32_t pairs)
+    {
+        m_restirPtSpatialPairs = static_cast<int>(pairs);
+    }
+
+    std::uint32_t GetRestirPtSpatialPairs() const
+    {
+        return static_cast<std::uint32_t>(m_restirPtSpatialPairs);
+    }
+
+    // Optimization experiment B1a: decorrelation mode (false Uniform, true Stagnancy), shown under the reuse toggles.
+    void SetRestirPtStagnancy(bool stagnancy)
+    {
+        m_restirPtStagnancyMode = stagnancy ? 1 : 0;
+    }
+
+    bool GetRestirPtStagnancy() const
+    {
+        return m_restirPtStagnancyMode != 0;
+    }
+
+    // Optimization experiment B1b: firefly replacement, shown under the reuse toggles.
+    void SetRestirPtFirefly(bool firefly)
+    {
+        m_restirPtFirefly = firefly;
+    }
+
+    bool GetRestirPtFirefly() const
+    {
+        return m_restirPtFirefly;
+    }
+
     bool IsShadingNormalCorrectionEnabled() const
     {
 #ifndef NDEBUG
@@ -455,6 +488,9 @@ class DebugUI
     bool m_restirPtTemporalReuse = false;
     bool m_restirPtSpatialReuse = false;
     bool m_restirPtReuseChanged = false;
+    int m_restirPtSpatialPairs = 3;
+    int m_restirPtStagnancyMode = 0;
+    bool m_restirPtFirefly = false;
 
 #ifndef NDEBUG
     bool m_shadingNormalCorrectionEnabled = true;

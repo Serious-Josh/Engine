@@ -53,6 +53,8 @@ namespace
     // M5.4 C7: the duplication map computed, and applied to temporal reuse.
     constexpr std::uint32_t FlagDuplicationMap = 1u << 27;
     constexpr std::uint32_t FlagDuplicationApply = 1u << 28;
+    constexpr std::uint32_t FlagStagnancy = 1u << 30;
+    constexpr std::uint32_t FlagFirefly = 1u << 31;
 
     // M5.3 pairing texture [P 3.1]: consecutive link indices (raster pairs), n tiled 2x2 random shuffles (every other
     // one offset diagonally by one, wrapping), the two cells of each link joined by their coordinate delta, links longer
@@ -368,6 +370,35 @@ bool ReSTIRPTPass::EnsureDuplicationMaps(ID3D12Device* device, DescriptorHeap& d
     return true;
 }
 
+bool ReSTIRPTPass::EnsureStagnancyMaps(ID3D12Device* device, DescriptorHeap& descriptorHeap)
+{
+    if(!m_initialized || m_width == 0 || m_height == 0)
+    {
+        return false;
+    }
+
+    if(m_stagnancy[0].GetResource() && m_stagnancy[1].GetResource())
+    {
+        return true;
+    }
+
+    const MemoryCategoryScope memoryScope(MemoryCategory::PathTracing);
+    const std::uint64_t bytes = std::uint64_t{m_width} * m_height * sizeof(float);
+
+    for(Buffer& map : m_stagnancy)
+    {
+        if(!map.InitializeGPUWritable(device, static_cast<std::size_t>(bytes)) || !map.CreateRawUAV(device, descriptorHeap))
+        {
+            m_stagnancy[0].Shutdown();
+            m_stagnancy[1].Shutdown();
+            Log::Error("ReSTIR PT (configuration B): the stagnancy maps could not be allocated.");
+            return false;
+        }
+    }
+
+    return true;
+}
+
 bool ReSTIRPTPass::EnsureInstanceHistory(ID3D12Device* device, DescriptorHeap& descriptorHeap)
 {
     if(!m_initialized || m_width == 0 || m_height == 0)
@@ -535,6 +566,8 @@ void ReSTIRPTPass::ReleaseTextures()
     m_instanceHistory[1].Shutdown();
     m_duplication[0].Shutdown();
     m_duplication[1].Shutdown();
+    m_stagnancy[0].Shutdown();
+    m_stagnancy[1].Shutdown();
 
     // The reservoirs' contents are gone with them.
     InvalidateHistory();
@@ -834,6 +867,7 @@ ReSTIRPTConstants ReSTIRPTPass::MakeConstants(const ReSTIRPTSettings& settings, 
     constants.temporalConfidenceCap = settings.temporalConfidenceCap;
     // M5.5-B: final-shading only, so it is not part of the history signature.
     constants.decorrelation = settings.decorrelation;
+    constants.spatialPairCount = std::clamp(settings.spatialPairs, 1u, SpatialNeighbours);
     constants.lightTileIndex = m_lightTiles.GetResource() ? m_lightTiles.GetDescriptorIndex() : 0xFFFFFFFFu;
     constants.lightSamplingIndex = lightSamplingIndex;
     constants.flags = (extract ? FlagExtract : 0u) | (extract && rawDiffuseHitDistance ? FlagRawDiffuseHitDistance : 0u) |
@@ -879,6 +913,27 @@ ReSTIRPTConstants ReSTIRPTPass::MakeConstants(const ReSTIRPTSettings& settings, 
             constants.flags |= FlagDuplicationApply;
             constants.previousDuplicationIndex = m_duplication[frame.previousSet].GetUAVDescriptorIndex();
         }
+    }
+
+    // Optimization experiment B1a: stagnancy decorrelation writes this frame's smoothed map in the final (resample) pass
+    // and reads last frame's only with valid history; its factor replaces the Uniform probability.
+    if(settings.decorrelationMode == ReSTIRPTSettings::DecorrelationMode::Stagnancy && settings.reservoir &&
+        m_stagnancy[0].GetResource() && m_stagnancy[1].GetResource())
+    {
+        constants.flags |= FlagStagnancy;
+        constants.decorrelation = settings.stagnancyFactor;
+        constants.stagnancyOutputIndex = m_stagnancy[frame.writeSet].GetUAVDescriptorIndex();
+
+        if(constants.historyValid != 0u)
+        {
+            constants.stagnancyPreviousIndex = m_stagnancy[frame.previousSet].GetUAVDescriptorIndex();
+        }
+    }
+
+    // Optimization experiment B1b: firefly replacement in the resample pass (temporal + spatial reuse).
+    if(settings.fireflyReplacement && settings.reservoir && settings.temporal && settings.spatial)
+    {
+        constants.flags |= FlagFirefly;
     }
 
     // M5.4 C5: replay compaction needs the separate temporal pass and the list.
@@ -951,7 +1006,7 @@ void ReSTIRPTPass::PrepareInitialPass(ID3D12GraphicsCommandList* commandList)
 
     // M5.3: the scratch reservoirs and pair records (UAV throughout).
     for(Buffer* spatial : {&m_spatialScratch, &m_pairs, &m_replayList, &m_instanceHistory[0], &m_instanceHistory[1],
-        &m_duplication[0], &m_duplication[1]})
+        &m_duplication[0], &m_duplication[1], &m_stagnancy[0], &m_stagnancy[1]})
     {
         if(spatial->GetResource())
         {
@@ -1002,7 +1057,8 @@ std::uint64_t ReSTIRPTPass::GetResourceBytes() const
         bytes += (std::uint64_t{m_width} * m_height + 4u) * sizeof(std::uint32_t);
     }
 
-    for(const Buffer* perPixel : {&m_instanceHistory[0], &m_instanceHistory[1], &m_duplication[0], &m_duplication[1]})
+    for(const Buffer* perPixel : {&m_instanceHistory[0], &m_instanceHistory[1], &m_duplication[0], &m_duplication[1],
+        &m_stagnancy[0], &m_stagnancy[1]})
     {
         if(perPixel->GetResource())
         {

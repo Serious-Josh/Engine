@@ -116,9 +116,31 @@ struct ReSTIRPTSettings
     // only; 0 is off and leaves every output bit-identical. Default 0.35 (user request 2026-11-22, for visual evaluation
     // after Checkpoint B: RR flicker -37%, Tri-Test gates pass); ENGINE_RESTIR_PT_DECORRELATE=0 turns it off.
     float decorrelation = 0.35f;
-    // M5.5 temporal correctness, Stage 1 (experimental, off by default): shifts into the temporal domain are evaluated in
-    // the history scene (the committed frame's instance transforms over the same BLASes), as GRIS requires.
-    bool historyScene = false;
+    // M5.5 temporal correctness, Stage 1: shifts into the temporal domain are evaluated in the history scene (the committed
+    // frame's instance transforms over the same BLASes), as GRIS requires. On by default (user-approved A2, 2026-11-23);
+    // ENGINE_RESTIR_PT_HISTORY_SCENE=0 turns it off for comparisons.
+    bool historyScene = true;
+    // Optimization A5 (ENGINE_RESTIR_PT_SPATIAL_PAIRS=1..3, or the Editor's "Spatial pairs"): spatial partners per pixel.
+    // Default 2 (user-approved 2026-11-23: about -3 ms on Demo, acceptable visually; known regression: more RR fireflies
+    // on ManyLight_1024). 3 is the published, higher-quality option; 1 shows blockiness on reflections (experiments only).
+    std::uint32_t spatialPairs = 2;
+    // Optimization experiment B1a (ENGINE_RESTIR_PT_DECORRELATION_MODE=stagnancy, or the Editor's "Decorrelation"):
+    // NVIDIA RTXDI's Stagnancy mode in place of Uniform. p = saturate(4 * stagnancyFactor * sqrt(smoothed age / 40)),
+    // with the age carried in the reservoir and smoothed by an EMA over the reprojected map (RTXDI defaults). Biased (the
+    // probability depends on sample history). Off by default (Uniform).
+    enum class DecorrelationMode
+    {
+        Uniform,
+        Stagnancy
+    };
+    DecorrelationMode decorrelationMode = DecorrelationMode::Uniform;
+    float stagnancyFactor = 0.4f;
+    // Optimization B1b (user-approved default 2026-11-23; ENGINE_RESTIR_PT_FIREFLY=0 or the Editor's "Firefly replacement"
+    // turns it off): NVIDIA RTXDI's firefly replacement. The resample pass flags pixels whose shaded luminance exceeds
+    // 5.29x their 8 x 8 group's average nonzero luminance (strength 0.7) and shows their initial estimate instead (bound 15
+    // for new fireflies). Needs temporal + spatial reuse and extraction (denoiser frames). Accepted bias: final-shading
+    // only, about -0.44% energy (Tri-Test); reservoirs and history unchanged.
+    bool fireflyReplacement = true;
 };
 
 // M5.2: what the previous frame's reservoirs were computed against. History is reused only when every field matches
@@ -214,7 +236,8 @@ struct ReSTIRPTConstants
     float previousCameraForward[3]{};
     std::uint32_t replayPass = 0;
     float cameraForward[3]{};
-    std::uint32_t paddingForward = 0;
+    // Optimization experiment B1a: the stagnancy maps (written this frame, read from the previous frame).
+    std::uint32_t stagnancyOutputIndex = 0xFFFFFFFFu;
 
     // The previous camera-relative inverse view-projection (row-major, as PreviousGBufferCamera holds it).
     float previousInverseCameraRelativeViewProjection[16]{};
@@ -238,7 +261,9 @@ struct ReSTIRPTConstants
     // M5.4 C7: this frame's duplication map (written) and last frame's (read by temporal reuse).
     std::uint32_t duplicationOutputIndex = 0xFFFFFFFFu;
     std::uint32_t previousDuplicationIndex = 0xFFFFFFFFu;
-    std::uint32_t paddingDuplication[2] = {};
+    // Optimization experiment A5: spatial partners used (ReSTIRPTSettings::spatialPairs).
+    std::uint32_t spatialPairCount = 3;
+    std::uint32_t stagnancyPreviousIndex = 0xFFFFFFFFu;
 };
 
 // M5.1-4 (M5.2 prerequisite): one render object's transforms, indexed by TLAS InstanceID (the render-object index, as PSR's
@@ -348,6 +373,8 @@ class ReSTIRPTPass
     void AbandonFrame();
     // Drops the committed and any pending frame.
     void InvalidateHistory();
+    // Optimization experiment B1a: the two stagnancy maps (4 B per pixel each, paired with the reservoir sets).
+    bool EnsureStagnancyMaps(ID3D12Device* device, DescriptorHeap& descriptorHeap);
 
     // M5.5 Stage 1: this recording's TLAS instances and geometry identity, committed and abandoned with its history.
     void SetPendingScene(const std::vector<RayTracingInstanceDescription>& instances, std::uint64_t geometryIdentity);
@@ -482,6 +509,8 @@ class ReSTIRPTPass
     Buffer m_replayList;
     Buffer m_instanceHistory[2];
     Buffer m_duplication[2];
+    // Optimization experiment B1a: the smoothed stagnancy maps (paired with the reservoir sets).
+    Buffer m_stagnancy[2];
     ComputePipeline m_duplicationPipeline;
     Buffer m_pairing;
     std::vector<std::uint32_t> m_pairingTexels;

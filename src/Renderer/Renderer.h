@@ -2101,6 +2101,12 @@ private:
     // geometry pass, replacement after lighting and the previous G-buffer copy), and whether it replaced the G-buffer for
     // RR's guides this frame. B's lighting estimator never reads the replaced G-buffer.
     bool m_psrGuideOnlyThisFrame = false;
+    // Optimization A5: the Editor's last applied spatial pair count (RecordReSTIRPTFrame applies changes only).
+    std::uint32_t m_restirPtUiSpatialPairs = 3;
+    // Optimization B1a: the Editor's last applied decorrelation mode (true: stagnancy).
+    bool m_restirPtUiStagnancy = false;
+    // Optimization B1b: the Editor's last applied firefly replacement setting.
+    bool m_restirPtUiFirefly = false;
     bool m_psrGuideOnlyLastFrame = false;
 
     BRDFIntegrationPass m_brdfIntegrationPass;

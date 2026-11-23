@@ -3369,8 +3369,39 @@ bool Renderer::Initialize(
             m_restirPtSettings.decorrelation = std::clamp(std::stof(decorrelate), 0.0f, 1.0f);
         }
 
-        // M5.5 Stage 1: ENGINE_RESTIR_PT_HISTORY_SCENE=1 evaluates temporal-domain shifts in the history scene.
-        m_restirPtSettings.historyScene = environment("ENGINE_RESTIR_PT_HISTORY_SCENE") == "1";
+        // M5.5 Stage 1 (on by default): ENGINE_RESTIR_PT_HISTORY_SCENE=0 evaluates temporal-domain shifts in the current
+        // scene instead (the pre-Stage 1 behaviour).
+        m_restirPtSettings.historyScene = environment("ENGINE_RESTIR_PT_HISTORY_SCENE") != "0";
+
+        // Optimization experiment A5: ENGINE_RESTIR_PT_SPATIAL_PAIRS=1|2|3 spatial partners (default 3); the Editor's
+        // "Spatial pairs" slider starts from it.
+        if(const std::string pairs = environment("ENGINE_RESTIR_PT_SPATIAL_PAIRS"); !pairs.empty())
+        {
+            m_restirPtSettings.spatialPairs = std::clamp(static_cast<std::uint32_t>(std::stoul(pairs)), 1u, 3u);
+        }
+
+        m_debugUI.SetRestirPtSpatialPairs(m_restirPtSettings.spatialPairs);
+        m_restirPtUiSpatialPairs = m_restirPtSettings.spatialPairs;
+
+        // Optimization experiment B1a: ENGINE_RESTIR_PT_DECORRELATION_MODE=stagnancy (default uniform);
+        // ENGINE_RESTIR_PT_STAGNANCY_FACTOR=<f> (default 0.4, RTXDI's). The Editor's "Decorrelation" combo starts from it.
+        if(environment("ENGINE_RESTIR_PT_DECORRELATION_MODE") == "stagnancy")
+        {
+            m_restirPtSettings.decorrelationMode = ReSTIRPTSettings::DecorrelationMode::Stagnancy;
+        }
+
+        if(const std::string factor = environment("ENGINE_RESTIR_PT_STAGNANCY_FACTOR"); !factor.empty())
+        {
+            m_restirPtSettings.stagnancyFactor = std::clamp(std::stof(factor), 0.0f, 1.0f);
+        }
+
+        m_restirPtUiStagnancy = m_restirPtSettings.decorrelationMode == ReSTIRPTSettings::DecorrelationMode::Stagnancy;
+        m_debugUI.SetRestirPtStagnancy(m_restirPtUiStagnancy);
+
+        // Optimization B1b (default on): ENGINE_RESTIR_PT_FIREFLY=0 turns it off; the Editor checkbox starts from it.
+        m_restirPtSettings.fireflyReplacement = environment("ENGINE_RESTIR_PT_FIREFLY") != "0";
+        m_restirPtUiFirefly = m_restirPtSettings.fireflyReplacement;
+        m_debugUI.SetRestirPtFirefly(m_restirPtUiFirefly);
 
         if(const std::string cap = environment("ENGINE_RESTIR_PT_CONFIDENCE_CAP"); !cap.empty())
         {
@@ -7219,6 +7250,28 @@ void Renderer::RecordReSTIRPTFrame(ID3D12GraphicsCommandList* commandList, unsig
         m_restirPtSettings.spatial = spatialReuse;
     }
 
+    // B1b: the Editor's firefly replacement, applied only when it changes.
+    if(const bool firefly = m_debugUI.GetRestirPtFirefly(); firefly != m_restirPtUiFirefly)
+    {
+        m_restirPtUiFirefly = firefly;
+        m_restirPtSettings.fireflyReplacement = firefly;
+    }
+
+    // B1a: the Editor's decorrelation mode, applied only when it changes.
+    if(const bool stagnancy = m_debugUI.GetRestirPtStagnancy(); stagnancy != m_restirPtUiStagnancy)
+    {
+        m_restirPtUiStagnancy = stagnancy;
+        m_restirPtSettings.decorrelationMode = stagnancy ? ReSTIRPTSettings::DecorrelationMode::Stagnancy :
+            ReSTIRPTSettings::DecorrelationMode::Uniform;
+    }
+
+    // A5: the Editor's spatial pair count, applied only when it changes (direct callers such as the harness keep theirs).
+    if(const std::uint32_t pairs = m_debugUI.GetRestirPtSpatialPairs(); pairs != m_restirPtUiSpatialPairs)
+    {
+        m_restirPtUiSpatialPairs = pairs;
+        m_restirPtSettings.spatialPairs = pairs;
+    }
+
     if(!EnsureReSTIRPT() || !m_restirPtPass.EnsureReservoirs(m_graphicsDevice.GetDevice(), m_resourceDescriptorHeap,
         m_sceneWidth, m_sceneHeight))
     {
@@ -7273,6 +7326,12 @@ void Renderer::RecordReSTIRPTFrame(ID3D12GraphicsCommandList* commandList, unsig
     const bool duplicationMap = m_restirPtSettings.temporal &&
         m_restirPtSettings.duplication != ReSTIRPTSettings::Duplication::Off &&
         m_restirPtPass.EnsureDuplicationMaps(m_graphicsDevice.GetDevice(), m_resourceDescriptorHeap);
+
+    // Optimization experiment B1a: the stagnancy maps (before MakeConstants reads them).
+    if(m_restirPtSettings.decorrelationMode == ReSTIRPTSettings::DecorrelationMode::Stagnancy)
+    {
+        m_restirPtPass.EnsureStagnancyMaps(m_graphicsDevice.GetDevice(), m_resourceDescriptorHeap);
+    }
 
     // M5.4 C6: the instance history for dual motion vectors (before MakeConstants reads it).
     if(m_restirPtSettings.dualMotion && m_restirPtSettings.temporal)

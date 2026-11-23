@@ -71,7 +71,8 @@ cbuffer RestirPtConstants : register(b2)
     float3 restirPtPreviousCameraForward;
     uint restirPtReplayPass;
     float3 restirPtCameraForward;
-    uint restirPtPaddingForward;
+    // Optimization experiment B1a: the stagnancy maps (this frame's smoothed map, written; last frame's, read).
+    uint restirPtStagnancyOutputIndex;
 
     row_major float4x4 restirPtPreviousInverseCameraRelativeViewProjection;
 
@@ -99,22 +100,24 @@ cbuffer RestirPtConstants : register(b2)
     // and last frame's (read by temporal reuse), ping-ponged with the reservoir sets.
     uint restirPtDuplicationOutputIndex;
     uint restirPtPreviousDuplicationIndex;
-    uint2 restirPtPaddingDuplication;
+    // Optimization experiment A5: the spatial partner count (1-3; RESTIR_PT_SPATIAL_NEIGHBOURS pairing textures exist).
+    uint restirPtSpatialPairCount;
+    uint restirPtStagnancyPreviousIndex;
 };
 
 // M5.5-B experiment: final-shading decorrelation (NVIDIA RTXDI RTXDI_PTApplyDecorrelation, "Uniform" mode only). True with
 // the constant probability restirPtDecorrelation, from a hash stream of its own (pixel, frame), so the decision is
 // independent of every reservoir and of both estimates. The caller then shows the initial kernel's estimate (the extraction
 // textures, which the last pass reads before writing). Always false at 0: the outputs are unchanged.
-bool RestirPtDecorrelate(uint2 pixel)
+bool RestirPtDecorrelate(uint2 pixel, float probability)
 {
-    if(!(restirPtDecorrelation > 0.0f))
+    if(!(probability > 0.0f))
     {
         return false;
     }
 
     const uint hash = PathTraceHash(pixel.x ^ PathTraceHash(pixel.y ^ PathTraceHash(restirPtFrameIndex ^ 0x44434F52u)));
-    return float(hash >> 8u) * (1.0f / 16777216.0f) < restirPtDecorrelation;
+    return float(hash >> 8u) * (1.0f / 16777216.0f) < probability;
 }
 
 // M5.1-4 (M5.2 prerequisite): per-instance transforms by TLAS InstanceID (ReSTIRPTInstanceTransform): the first three rows
@@ -222,6 +225,10 @@ static const uint RESTIR_PT_FLAG_DUPLICATION_MAP = 1u << 27;
 static const uint RESTIR_PT_FLAG_DUPLICATION_APPLY = 1u << 28;
 // M5.5 Stage 1: shifts into the temporal domain use the history scene (restirPtHistorySceneIndex).
 static const uint RESTIR_PT_FLAG_HISTORY_SCENE = 1u << 29;
+// Optimization experiment B1a: stagnancy-driven decorrelation (NVIDIA RTXDI "Stagnancy" mode) in place of Uniform.
+static const uint RESTIR_PT_FLAG_STAGNANCY = 1u << 30;
+// Optimization experiment B1b: firefly replacement (NVIDIA RTXDI boiling filter forcing the decorrelation swap).
+static const uint RESTIR_PT_FLAG_FIREFLY = 1u << 31;
 // [P 9]: c_Cap = lerp(c_Cap_default, c_Cap_min, D^alpha) with c_Cap_min = 1 and alpha = 0.1; D = duplicates / 288 in 17 x 17.
 static const float RESTIR_PT_DUPLICATION_MIN_CAP = 1.0f;
 static const float RESTIR_PT_DUPLICATION_ALPHA = 0.1f;
@@ -256,6 +263,70 @@ static const uint RESTIR_PT_PATH_LOBES_SHIFT = 20u;
 static const uint RESTIR_PT_PATH_REPLAY_ONLY = 1u << 24;
 // lambda_k, the lobe x_k's continuation sampled (bits 25-26; T-2.1 P1).
 static const uint RESTIR_PT_PATH_VERTEX_LOBE_SHIFT = 25u;
+// Optimization experiment B1a: the sample's age in frames (bits 27-31, saturating at 31): 0 for a fresh sample, +1 each
+// time temporal reuse keeps it, carried when spatial reuse adopts it (RTXDI's reservoir age). Updated only in stagnancy
+// mode; no shift, weight or MIS reads it.
+static const uint RESTIR_PT_PATH_AGE_SHIFT = 27u;
+
+uint RestirPtPathAge(uint pathFlags)
+{
+    return pathFlags >> RESTIR_PT_PATH_AGE_SHIFT;
+}
+
+uint RestirPtFlagsAged(uint pathFlags)
+{
+    return (pathFlags & ~(31u << RESTIR_PT_PATH_AGE_SHIFT)) |
+        (min(RestirPtPathAge(pathFlags) + 1u, 31u) << RESTIR_PT_PATH_AGE_SHIFT);
+}
+
+// The final-shading decorrelation probability (call once per active pixel in the final pass). Uniform: the constant
+// restirPtDecorrelation. Stagnancy (RTXDI_PTApplyDecorrelation, RTXDI_PTComputeSmoothedDuplicationMap): the selected
+// sample's age / 40, smoothed by an EMA (0.2) against a 5 x 5 (step 2) average of last frame's smoothed map at the
+// reprojected pixel; p = saturate(4 * factor * smoothed^0.5) with factor = restirPtDecorrelation (RTXDI defaults: 0.4,
+// exponent 0.5, EMA 0.2). The smoothed map is written here. Biased (age correlates with the sample; smoothing reduces it).
+float RestirPtDecorrelationProbability(uint2 pixel, uint selectedPathFlags)
+{
+    if((restirPtFlags & RESTIR_PT_FLAG_STAGNANCY) == 0u || restirPtStagnancyOutputIndex == 0xFFFFFFFFu)
+    {
+        return restirPtDecorrelation;
+    }
+
+    const float current = min(1.0f, float(RestirPtPathAge(selectedPathFlags)) / 40.0f);
+    float smoothed = current;
+
+    if(restirPtHistoryValid != 0u && restirPtStagnancyPreviousIndex != 0xFFFFFFFFu)
+    {
+        Texture2D<float4> motionTexture = ResourceDescriptorHeap[restirPtMotionIndex];
+        RWByteAddressBuffer previousMap = ResourceDescriptorHeap[restirPtStagnancyPreviousIndex];
+        const float2 motion = motionTexture.Load(int3(pixel, 0)).xy;
+        // Engine's motion is currentUV - previousUV.
+        const int2 previousPixel = int2(float2(pixel) + 0.5f - motion * float2(resolution));
+        float sum = 0.0f;
+        float taps = 0.0f;
+
+        [unroll]
+        for(int dy = -2; dy <= 2; ++dy)
+        {
+            [unroll]
+            for(int dx = -2; dx <= 2; ++dx)
+            {
+                const int2 tap = previousPixel + int2(dx, dy) * 2;
+
+                if(all(tap >= 0) && all(tap < int2(resolution)))
+                {
+                    sum += asfloat(previousMap.Load(4u * (uint(tap.y) * resolution.x + uint(tap.x))));
+                    taps += 1.0f;
+                }
+            }
+        }
+
+        smoothed = taps > 0.0f ? 0.2f * current + 0.8f * (sum / taps) : current;
+    }
+
+    RWByteAddressBuffer outputMap = ResourceDescriptorHeap[restirPtStagnancyOutputIndex];
+    outputMap.Store(4u * (pixel.y * resolution.x + pixel.x), asuint(smoothed));
+    return saturate(4.0f * restirPtDecorrelation * sqrt(saturate(smoothed)));
+}
 // lightType (bits 18-19): the end vertex's emitter class.
 static const uint RESTIR_PT_LIGHT_ENVIRONMENT = 0u;
 static const uint RESTIR_PT_LIGHT_SUN = 1u;
@@ -3283,6 +3354,12 @@ RestirPtTemporalResult RestirPtTemporalResample(uint2 pixel, PathTraceRasterFirs
         result.initSeed = temporal.initSeed;
         result.pathFlags = RestirPtFlagsWithConfidence(temporal.pathFlags, confidence);
         result.rc = forward.rc;
+
+        // B1a/B1b: the kept sample ages by one frame (stagnancy or firefly mode only; default reservoirs unchanged).
+        if((restirPtFlags & (RESTIR_PT_FLAG_STAGNANCY | RESTIR_PT_FLAG_FIREFLY)) != 0u)
+        {
+            result.pathFlags = RestirPtFlagsAged(result.pathFlags);
+        }
     }
     else
     {
@@ -4977,7 +5054,9 @@ void RestirPtTemporalCS(uint3 thread : SV_DispatchThreadID)
 
             // M5.5-B decorrelation: show the initial kernel's estimate (the extraction textures, left as they are); the
             // stored reservoir is unchanged.
-            const bool decorrelated = extract && firstVertex.state > 0 && RestirPtDecorrelate(pixel);
+            // B1a stagnancy runs in the resample pass (spatial reuse); temporal-only keeps the Uniform probability.
+            const bool decorrelated = extract && firstVertex.state > 0 &&
+                RestirPtDecorrelate(pixel, restirPtDecorrelation);
 
             if(decorrelated)
             {
@@ -5143,7 +5222,7 @@ void RestirPtSpatialPairsCS(uint3 thread : SV_DispatchThreadID)
         RWByteAddressBuffer pairs = ResourceDescriptorHeap[restirPtPairsIndex];
 
         [loop]
-        for(uint t = 0u; t < RESTIR_PT_SPATIAL_NEIGHBOURS; ++t)
+        for(uint t = 0u; t < min(restirPtSpatialPairCount, RESTIR_PT_SPATIAL_NEIGHBOURS); ++t)
         {
             RestirPtShifted shifted = (RestirPtShifted)0;
             int2 partner;
@@ -5206,11 +5285,21 @@ void RestirPtSpatialPairsCS(uint3 thread : SV_DispatchThreadID)
 //   w_c = m_c p_c(Y_c) W_c,  w_i = m_i p_c(T X_qi) W_qi J_(qi->c);  Y ~ w;  W = sum w / p_c(Y);  M = M_c + sum M_qi.
 // The weights sum to 1 over the k + 1 techniques for every path. Shading: F(Y) W, or with colour-noise reduction
 // [P 6.3] the vector sum of m_i F_i W_i J_i. No shift or visibility ray here: the pre-pass traced them.
+// B1b: the group's shaded weights for the firefly test (RTXDI_BoilingFilterInternal over this 8 x 8 group).
+groupshared float s_restirPtFireflyWeights[RESTIR_PT_GROUP_SIZE * RESTIR_PT_GROUP_SIZE];
+groupshared float s_restirPtFireflyAverage;
+
 [numthreads(RESTIR_PT_GROUP_SIZE, RESTIR_PT_GROUP_SIZE, 1)]
-void RestirPtSpatialResampleCS(uint3 thread : SV_DispatchThreadID)
+void RestirPtSpatialResampleCS(uint3 thread : SV_DispatchThreadID, uint3 groupThread : SV_GroupThreadID)
 {
     const uint2 pixel = thread.xy;
     const bool active = all(pixel < resolution);
+    // The shading below runs after the (group-uniform) firefly test, so its inputs live at function scope.
+    bool finalExtract = false;
+    int finalState = 0;
+    uint finalPathFlags = 0u;
+    float3 finalRadiance = float3(0.0f, 0.0f, 0.0f);
+    float3 finalDiffuse = float3(0.0f, 0.0f, 0.0f);
     // Counters (RESTIR_PT_COUNTER_SPATIAL + 8 + n): 0 surface pixels resampled, 1 valid partners, 2 partner candidates
     // with weight, 3 partner selected, 4 non-finite results (emptied).
     uint counts[5] = {0u, 0u, 0u, 0u, 0u};
@@ -5236,7 +5325,9 @@ void RestirPtSpatialResampleCS(uint3 thread : SV_DispatchThreadID)
             uint validMask = 0u;
 
             // The pre-pass recorded each pair's validity (RestirPtSpatialPairValid, both pixels agree by symmetry).
-            for(uint t = 0u; t < RESTIR_PT_SPATIAL_NEIGHBOURS; ++t)
+            // Optimization experiment A5: only the first restirPtSpatialPairCount pairs exist this frame; paired MIS
+            // normalizes over the valid ones (k + 1), so any count stays consistent.
+            for(uint t = 0u; t < min(restirPtSpatialPairCount, RESTIR_PT_SPATIAL_NEIGHBOURS); ++t)
             {
                 validMask |= RestirPtLoadPair(t, pixel).pairValid ? 1u << t : 0u;
             }
@@ -5360,15 +5451,77 @@ void RestirPtSpatialResampleCS(uint3 thread : SV_DispatchThreadID)
 
         RestirPtStoreReservoirFieldsTo(restirPtSpatialOutputIndex, pixel, unbiasedContributionWeight, contribution,
             initSeed, pathFlags, rc);
+        finalExtract = extract;
+        finalState = self.state;
+        finalPathFlags = pathFlags;
+        finalRadiance = radiance;
+        finalDiffuse = diffuse;
+    }
+
+    // B1b firefly replacement (RTXDI_PTDetectDecorrelationFireflies with RTXDI_BoilingFilterInternal): a pixel whose shaded
+    // reservoir luminance exceeds (10 / strength - 9) x the group's average nonzero luminance (strength 0.7: 5.29x) is
+    // decorrelated with probability 1. Only with temporal history and extraction (RR or NRD frames). Every thread of the
+    // group takes part (barriers).
+    bool firefly = false;
+
+    if((restirPtFlags & RESTIR_PT_FLAG_FIREFLY) != 0u)
+    {
+        const uint lane = groupThread.y * RESTIR_PT_GROUP_SIZE + groupThread.x;
+        const float weight = finalState > 0 && all(isfinite(finalRadiance)) ? PathTraceLuminance(finalRadiance) : 0.0f;
+        s_restirPtFireflyWeights[lane] = weight;
+        GroupMemoryBarrierWithGroupSync();
+
+        if(lane == 0u)
+        {
+            float sum = 0.0f;
+            float count = 0.0f;
+
+            for(uint index = 0u; index < RESTIR_PT_GROUP_SIZE * RESTIR_PT_GROUP_SIZE; ++index)
+            {
+                sum += s_restirPtFireflyWeights[index];
+                count += s_restirPtFireflyWeights[index] > 0.0f ? 1.0f : 0.0f;
+            }
+
+            s_restirPtFireflyAverage = count > 0.0f ? sum / count : 0.0f;
+        }
+
+        GroupMemoryBarrierWithGroupSync();
+        firefly = restirPtHistoryValid != 0u && weight > s_restirPtFireflyAverage * (10.0f / 0.7f - 9.0f);
+    }
+
+    if(active)
+    {
+        const bool extract = finalExtract;
+        float3 radiance = finalRadiance;
+        float3 diffuse = finalDiffuse;
 
         // M5.5-B decorrelation: show the initial kernel's estimate (still in the extraction textures) instead of the reused
         // one; the stored final reservoir above is unchanged.
-        if(extract && self.state > 0 && RestirPtDecorrelate(pixel))
+        // B1a: the probability is evaluated for every active pixel (stagnancy mode writes its smoothed map here).
+        // B1b: a firefly is decorrelated with probability 1.
+        const float decorrelationProbability = RestirPtDecorrelationProbability(pixel, finalState > 0 ? finalPathFlags : 0u);
+
+        if(extract && finalState > 0 && (firefly || RestirPtDecorrelate(pixel, decorrelationProbability)))
         {
             RWTexture2D<float4> initialDiffuse = ResourceDescriptorHeap[diffuseOutputIndex];
             RWTexture2D<float4> initialSpecular = ResourceDescriptorHeap[specularOutputIndex];
-            diffuse = initialDiffuse[pixel].rgb;
-            radiance = diffuse + initialSpecular[pixel].rgb;
+            float3 initialDiffuseValue = initialDiffuse[pixel].rgb;
+            float3 initialRadiance = initialDiffuseValue + initialSpecular[pixel].rgb;
+
+            // RTXDI's bias reduction (fireflyReplacementBiasReduction, bound 15): for a new firefly (age 0) the replacement
+            // may not exceed 15 x the replaced value, so one firefly is not traded for a brighter one.
+            if(firefly && RestirPtPathAge(finalPathFlags) == 0u)
+            {
+                const float replacedLuminance = PathTraceLuminance(radiance);
+                const float initialLuminance = PathTraceLuminance(initialRadiance);
+                const float scale = initialLuminance > 15.0f * replacedLuminance && initialLuminance > 0.0f ?
+                    15.0f * replacedLuminance / initialLuminance : 1.0f;
+                initialRadiance *= scale;
+                initialDiffuseValue *= scale;
+            }
+
+            diffuse = initialDiffuseValue;
+            radiance = initialRadiance;
         }
 
         // The image (spatial reuse requires one sample per frame; the initial kernel skipped these writes).
@@ -5391,7 +5544,7 @@ void RestirPtSpatialResampleCS(uint3 thread : SV_DispatchThreadID)
 
         // Denoiser signals only: the colour split by each candidate's x1 lobe (lambda_1); hit distances stay the initial
         // kernel's.
-        if(extract && self.state > 0)
+        if(extract && finalState > 0)
         {
             RWTexture2D<float4> diffuseOutput = ResourceDescriptorHeap[diffuseOutputIndex];
             RWTexture2D<float4> specularOutput = ResourceDescriptorHeap[specularOutputIndex];
