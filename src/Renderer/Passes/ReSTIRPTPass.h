@@ -19,6 +19,11 @@ class UploadBuffer;
 // Specification.md); the other values exist for the M5.1 correctness gates and are never selected by a project.
 struct ReSTIRPTSettings
 {
+    // The SHARC radiance cache at x3 (Documentation/Rendering/SHARC_ReSTIR_PT_Investigation.md): every path ends at x3 with
+    // NVIDIA SHARC's multi-bounce radiance where SHARC admits x3 (no further light where it refuses), except mirror chains
+    // seen from the camera; cache endings are not reused. Off: conventional depth-limited paths. Needs NVIDIA SHARC
+    // (SharcCache::CapabilityFailure) and a path depth of at least 3; the Editor's switch resets ReSTIR PT's history.
+    bool sharc = true;
     // M5.1-2: RIS over light-tile candidates (32 at the primary hit, 32 / j^2 at bounce j); off: one candidate.
     bool ris = true;
     // M5.1-3: one candidate per tree in the reservoir; off: every candidate accumulated (plain lobe-indexed path tracing).
@@ -326,6 +331,19 @@ struct ReSTIRPTConstants
     // (1 - threshold)), alpha)) as {alpha, minCap, threshold}; all 0 = the original M5.4 response (alpha 0.1, minCap 1,
     // threshold 0). ENGINE_RESTIR_PT_DUPLICATION_RESPONSE="alpha;minCap;threshold". Used only with Duplication::Apply.
     float duplicationResponse[3]{};
+
+    // The SHARC radiance cache at x3 (read only by kernels compiled with RESTIR_PT_SHARC): this frame's NVIDIA SHARC buffers
+    // (raw UAV descriptors; sharcCapacity 0: no cache this frame, and paths run as without SHARC), the hash grid's camera
+    // and scale.
+    std::uint32_t sharcHashEntriesIndex = 0xFFFFFFFFu;
+    std::uint32_t sharcAccumulationIndex = 0xFFFFFFFFu;
+    std::uint32_t sharcResolvedIndex = 0xFFFFFFFFu;
+    std::uint32_t sharcCapacity = 0;
+    float sharcCameraPosition[3]{};
+    float sharcSceneScale = 0.0f;
+    float sharcRadianceScale = 0.0f;
+    std::uint32_t sharcFlags = 0;
+    std::uint32_t sharcPadding[2]{};
 };
 
 // M5.1-4 (M5.2 prerequisite): one render object's transforms, indexed by TLAS InstanceID (the render-object index, as PSR's
@@ -342,7 +360,7 @@ struct ReSTIRPTInstanceTransform
     float previousWorldToObject[12]{};
 };
 
-static_assert(sizeof(ReSTIRPTConstants) == 400, "ReSTIRPTConstants must match RestirPtConstants (b2).");
+static_assert(sizeof(ReSTIRPTConstants) == 448, "ReSTIRPTConstants must match RestirPtConstants (b2).");
 
 // GPU layout of RestirPtLightTileConstants (register b0, assets/Shaders/ReSTIRPT/RestirPtLightTiles.hlsl).
 struct ReSTIRPTLightTileConstants

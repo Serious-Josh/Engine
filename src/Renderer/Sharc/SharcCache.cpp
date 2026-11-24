@@ -30,8 +30,9 @@ namespace
         return true;
     }
 
+    // invalidation: the pass also binds SharcNvInvalidationConstants at b1 (CSInvalidateRegions).
     bool CreatePipeline(ID3D12Device* device, ShaderLibrary& shaderLibrary, const char* entryPoint,
-        ComputePipeline& pipeline)
+        ComputePipeline& pipeline, bool invalidation = false)
     {
         ShaderDescription shaderDescription{};
         shaderDescription.path = "SharcNv/SharcNvResolve.hlsl";
@@ -45,6 +46,14 @@ namespace
         constants.shaderRegister = 0;
         constants.visibility = D3D12_SHADER_VISIBILITY_ALL;
         pipelineDescription.rootParameters.push_back(constants);
+
+        if(invalidation)
+        {
+            RootParameterDescription regions = constants;
+            regions.shaderRegister = 1;
+            pipelineDescription.rootParameters.push_back(regions);
+        }
+
         return computeShader && pipeline.Initialize(device, pipelineDescription);
     }
 }
@@ -209,6 +218,8 @@ void SharcCache::Shutdown()
     m_accumulationStatisticsPipeline.Shutdown();
     m_resolvePipeline.Shutdown();
     m_resolvedStatisticsPipeline.Shutdown();
+    m_invalidatePipeline.Shutdown();
+    m_pendingRegions.clear();
     m_pipelinesReady = false;
     m_pipelinesFailed = false;
     m_readback.Reset();
@@ -248,6 +259,23 @@ void SharcCache::MarkSubmissionUncertain()
 void SharcCache::RequestClear()
 {
     m_clearNeeded = true;
+    m_pendingRegions.clear();
+}
+
+void SharcCache::RequestInvalidation(const std::vector<std::array<float, 4>>& regions)
+{
+    if(m_clearNeeded || regions.empty())
+    {
+        return;
+    }
+
+    if(m_pendingRegions.size() + regions.size() > MaximumInvalidationRegions)
+    {
+        RequestClear();
+        return;
+    }
+
+    m_pendingRegions.insert(m_pendingRegions.end(), regions.begin(), regions.end());
 }
 
 SharcCache::Constants SharcCache::MakeConstants() const
@@ -266,6 +294,7 @@ SharcCache::Constants SharcCache::MakeConstants() const
     constants.sceneScale = m_settings.sceneScale;
     constants.radianceScale = m_settings.radianceScale;
     constants.accumulationFrames = m_settings.accumulationFrames;
+
     constants.staleFrames = m_settings.staleFrames;
     constants.statisticsIndex = m_resources->statistics.GetUAVDescriptorIndex();
     return constants;
@@ -300,6 +329,29 @@ bool SharcCache::RecordFrameBegin(ID3D12GraphicsCommandList* commandList, Upload
         m_clearRecorded = true;
         m_resolvedFrames = 0;
         ++m_diagnostics.clearsRecorded;
+        m_pendingRegions.clear();
+    }
+
+    // Lighting discontinuities: before the update, so this frame's training refills the forgotten entries.
+    if(!m_pendingRegions.empty())
+    {
+        InvalidationConstants invalidation{};
+        invalidation.count[0] = static_cast<std::uint32_t>(m_pendingRegions.size());
+
+        for(std::size_t region = 0; region < m_pendingRegions.size(); ++region)
+        {
+            std::memcpy(invalidation.regions[region], m_pendingRegions[region].data(), sizeof(invalidation.regions[region]));
+        }
+
+        if(!RecordDispatch(commandList, uploadBuffer, constants, m_invalidatePipeline, constants.capacity, &invalidation))
+        {
+            return false;
+        }
+
+        RecordUAVBarrier(commandList);
+        ++m_diagnostics.invalidationsRecorded;
+        m_diagnostics.regionsInvalidated += m_pendingRegions.size();
+        m_pendingRegions.clear();
     }
 
     if((constants.flags & FlagStatistics) != 0)
@@ -463,7 +515,8 @@ bool SharcCache::EnsurePipelines(ID3D12Device* device, ShaderLibrary& shaderLibr
         !CreatePipeline(device, shaderLibrary, "CSClearStatistics", m_clearStatisticsPipeline) ||
         !CreatePipeline(device, shaderLibrary, "CSAccumulationStatistics", m_accumulationStatisticsPipeline) ||
         !CreatePipeline(device, shaderLibrary, "CSResolve", m_resolvePipeline) ||
-        !CreatePipeline(device, shaderLibrary, "CSResolvedStatistics", m_resolvedStatisticsPipeline))
+        !CreatePipeline(device, shaderLibrary, "CSResolvedStatistics", m_resolvedStatisticsPipeline) ||
+        !CreatePipeline(device, shaderLibrary, "CSInvalidateRegions", m_invalidatePipeline, true))
     {
         Log::Error("The NVIDIA SHARC compute pipelines could not be created; the cache stays disabled.");
         m_clearPipeline.Shutdown();
@@ -471,6 +524,7 @@ bool SharcCache::EnsurePipelines(ID3D12Device* device, ShaderLibrary& shaderLibr
         m_accumulationStatisticsPipeline.Shutdown();
         m_resolvePipeline.Shutdown();
         m_resolvedStatisticsPipeline.Shutdown();
+        m_invalidatePipeline.Shutdown();
         m_pipelinesFailed = true;
         return false;
     }
@@ -480,7 +534,8 @@ bool SharcCache::EnsurePipelines(ID3D12Device* device, ShaderLibrary& shaderLibr
 }
 
 bool SharcCache::RecordDispatch(ID3D12GraphicsCommandList* commandList, UploadBuffer& uploadBuffer,
-    const Constants& constants, const ComputePipeline& pipeline, std::uint32_t threads)
+    const Constants& constants, const ComputePipeline& pipeline, std::uint32_t threads,
+    const InvalidationConstants* invalidation)
 {
     const D3D12_GPU_VIRTUAL_ADDRESS address = uploadBuffer.Allocate(&constants, sizeof(Constants),
         D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
@@ -491,8 +546,28 @@ bool SharcCache::RecordDispatch(ID3D12GraphicsCommandList* commandList, UploadBu
         return false;
     }
 
+    D3D12_GPU_VIRTUAL_ADDRESS invalidationAddress = 0;
+
+    if(invalidation)
+    {
+        invalidationAddress = uploadBuffer.Allocate(invalidation, sizeof(InvalidationConstants),
+            D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
+
+        if(invalidationAddress == 0)
+        {
+            Log::Error("Failed to allocate the NVIDIA SHARC invalidation regions.");
+            return false;
+        }
+    }
+
     pipeline.Bind(commandList);
     commandList->SetComputeRootConstantBufferView(0, address);
+
+    if(invalidation)
+    {
+        commandList->SetComputeRootConstantBufferView(1, invalidationAddress);
+    }
+
     commandList->Dispatch((threads + GroupSize - 1) / GroupSize, 1, 1);
     return true;
 }

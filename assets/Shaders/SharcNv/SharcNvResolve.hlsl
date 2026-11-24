@@ -1,10 +1,12 @@
 // NVIDIA SHARC v1.8.3 cache maintenance (Renderer/Sharc/SharcCache), compiled with -enable-16bit-types (SharcNv/):
 //   CSClear              zeroes every entry of the three cache buffers (a new allocation, or an invalidation).
 //   CSClearStatistics    zeroes the statistics words.
+//   CSInvalidateRegions  before the update: forgets the cached radiance of entries inside this frame's lighting
+//                        discontinuities (SharcNvInvalidationConstants at b1).
 //   CSAccumulationStatistics  before the resolve: occupancy and this frame's accumulation range (overflow headroom).
 //   CSResolve            NVIDIA's SharcResolveEntry for every entry.
 //   CSResolvedStatistics after the resolve: occupied entries and saturated (fp16-limit) resolved values.
-// One thread per entry; the only root parameter is the SharcNvConstants buffer at b0.
+// One thread per entry; the root parameter is the SharcNvConstants buffer at b0 (CSInvalidateRegions adds b1).
 
 #include "../SharcNvCommon.hlsli"
 
@@ -31,6 +33,60 @@ void CSClear(uint3 thread : SV_DispatchThreadID)
     hashEntries[entry] = HASH_GRID_INVALID_HASH_KEY;
     accumulation[entry] = SharcZeroAccumulationData();
     resolved[entry] = SharcZeroPackedData();
+}
+
+// Must match SharcCache::InvalidationConstants: a count, then spheres (centre xyz, radius w) in world space.
+static const uint SHARC_NV_MAXIMUM_INVALIDATION_REGIONS = 64u;
+
+cbuffer SharcNvInvalidationConstants : register(b1)
+{
+    uint4 invalidationCount;
+    float4 invalidationRegions[SHARC_NV_MAXIMUM_INVALIDATION_REGIONS];
+};
+
+// Lighting discontinuities (FrameLighting.h DetectLightingDiscontinuities; SHARC_ReSTIR_PT_Investigation.md §9.5): an
+// entry whose voxel touches a region keeps its key but loses its radiance and samples, so queries refuse it (the path
+// tracer truncates there, as on a cold cache) until this frame's training refills it. Recorded before the update.
+[numthreads(SHARC_NV_GROUP_SIZE, 1, 1)]
+void CSInvalidateRegions(uint3 thread : SV_DispatchThreadID)
+{
+    uint entry = thread.x;
+
+    if(entry >= sharcNv.capacity)
+    {
+        return;
+    }
+
+    RWStructuredBuffer<uint64_t> hashEntries = ResourceDescriptorHeap[sharcNv.hashEntriesIndex];
+    uint64_t key = hashEntries[entry];
+
+    if(key == HASH_GRID_INVALID_HASH_KEY)
+    {
+        return;
+    }
+
+    HashGridParameters grid = SharcNvGridParameters(sharcNv);
+    uint level = uint((key >> HASH_GRID_LEVEL_BIT_OFFSET) & HASH_GRID_LEVEL_BIT_MASK);
+    // The voxel's centre, and its half diagonal as the margin.
+    float3 centre = HashGridGetPositionFromKey(key, grid) - HASH_GRID_POSITION_BIAS;
+    float margin = 0.8660254f * HashGridGetVoxelSize(level, grid);
+    uint count = min(invalidationCount.x, SHARC_NV_MAXIMUM_INVALIDATION_REGIONS);
+
+    for(uint region = 0u; region < count; ++region)
+    {
+        float4 sphere = invalidationRegions[region];
+        float3 offset = centre - sphere.xyz;
+        float reach = sphere.w + margin;
+
+        if(dot(offset, offset) <= reach * reach)
+        {
+            RWStructuredBuffer<SharcAccumulationData> accumulation = ResourceDescriptorHeap[sharcNv.accumulationIndex];
+            RWStructuredBuffer<SharcPackedData> resolved = ResourceDescriptorHeap[sharcNv.resolvedIndex];
+            accumulation[entry] = SharcZeroAccumulationData();
+            resolved[entry] = SharcZeroPackedData();
+            return;
+        }
+    }
 }
 
 [numthreads(SHARC_NV_STATISTIC_COUNT, 1, 1)]

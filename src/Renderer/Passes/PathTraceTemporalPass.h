@@ -60,9 +60,9 @@ struct PathTraceTemporalConstants
     // RTXPT D.2C.3 luminance second moments (RG32F: diffuse lighting, specular radiance).
     std::uint32_t historyMomentsIndex = 0;
     std::uint32_t outputMomentsIndex = 0;
-    // SHARC.6A history prior (PathTraceTemporal.hlsl step 6) and its counters; 0 = off.
-    std::uint32_t priorIndex = 0;
-    std::uint32_t priorCountersIndex = 0;
+    // Reserved (formerly the SHARC.6A history prior, removed with the D6 radiance cache); must stay zero.
+    std::uint32_t reserved0 = 0;
+    std::uint32_t reserved1 = 0;
 
     // DENOISE.3B extended diffuse history (PathTraceTemporal.hlsl step 7): its UAV (0 = off), a restart, its length cap
     // and whether the presentation uses it. The UAV index is filled in by Execute.
@@ -113,7 +113,7 @@ class PathTraceTemporalPass
 
     // Records one frame. constants carries the inputs, cameras and flags; the history indices and validity are
     // filled in here. Afterwards the outputs are in shader-resource state. The written slot is pending until
-    // CommitHistory. priorCacheBinding (SHARC.6A): the frame's SHARC query binding when constants.priorIndex is set.
+    // CommitHistory.
     // extended (DENOISE.3B): also update the extended diffuse history (EnsureExtended first), which is then in
     // shader-resource state too.
     void Execute(
@@ -122,7 +122,6 @@ class PathTraceTemporalPass
         PathTraceTemporalConstants constants,
         unsigned int width,
         unsigned int height,
-        D3D12_GPU_VIRTUAL_ADDRESS priorCacheBinding = 0,
         bool extended = false,
         D3D12_GPU_VIRTUAL_ADDRESS psrConstants = 0,
         D3D12_GPU_VIRTUAL_ADDRESS psrTransforms = 0);

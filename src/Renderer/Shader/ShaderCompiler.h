@@ -128,6 +128,9 @@ class ShaderCompiler
     // -enable-16bit-types, which SharcTypes.h requires. Like the profile, a pure function of the path; every other shader
     // keeps its arguments, so no other DXIL changes.
     static bool UsesNative16BitTypes(const std::filesystem::path& shaderPath);
+    // The SHARC radiance cache at x3: whether ReSTIRPT/ shaders compile with it (RESTIR_PT_SHARC). The Renderer sets it from
+    // NVIDIA SHARC's capability check before ReSTIR PT's pipelines are created; off (the default), they compile without.
+    static void SetRestirPtSharc(bool available);
     // M5.1 T-2.1 (ReSTIR PT Enhanced, configuration B): shaders under a ReSTIRPT/ directory may compile with -Gis (strict
     // IEEE: no reassociation or contraction), so a shift evaluates exactly what capture cached. Since optimization A1 this
     // applies only with ENGINE_RESTIR_PT_STRICT_FP=1 (default relaxed). Every other shader keeps its arguments.

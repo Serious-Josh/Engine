@@ -37,13 +37,6 @@ bool PathTraceTemporalPass::Initialize(GraphicsDevice& graphicsDevice, ShaderLib
     constants.visibility = D3D12_SHADER_VISIBILITY_ALL;
     pipelineDescription.rootParameters.push_back(constants);
 
-    // SHARC.6A: the frame's SHARC query binding for the history prior (b1).
-    RootParameterDescription priorCache{};
-    priorCache.type = RootParameterType::ConstantBuffer;
-    priorCache.shaderRegister = 1;
-    priorCache.visibility = D3D12_SHADER_VISIBILITY_ALL;
-    pipelineDescription.rootParameters.push_back(priorCache);
-
     if(!computeShader || !m_pipeline.Initialize(graphicsDevice.GetDevice(), pipelineDescription))
     {
         Log::Error("The path tracing temporal pass could not be created.");
@@ -70,11 +63,12 @@ bool PathTraceTemporalPass::EnsurePsrVariant(GraphicsDevice& graphicsDevice, Sha
     shaderDescription.stage = ShaderStage::Compute;
     Shader* computeShader = shaderLibrary.Load(shaderDescription);
 
-    // The production root signature, then b2 (PsrDenoiseConstants), t0 (the replacement pass's transforms) and s0.
+    // The production root signature (b0), then b2 (PsrDenoiseConstants), t0 (the replacement pass's transforms) and s0.
+    // b1 is unused since the SHARC.6A history prior was removed.
     ComputePipelineDescription pipelineDescription{};
     pipelineDescription.computeShader = computeShader;
 
-    for(std::uint32_t shaderRegister : {0u, 1u, 2u})
+    for(std::uint32_t shaderRegister : {0u, 2u})
     {
         RootParameterDescription buffer{};
         buffer.type = RootParameterType::ConstantBuffer;
@@ -206,7 +200,6 @@ void PathTraceTemporalPass::Execute(
     PathTraceTemporalConstants constants,
     unsigned int width,
     unsigned int height,
-    D3D12_GPU_VIRTUAL_ADDRESS priorCacheBinding,
     bool extended,
     D3D12_GPU_VIRTUAL_ADDRESS psrConstants,
     D3D12_GPU_VIRTUAL_ADDRESS psrTransforms)
@@ -259,14 +252,11 @@ void PathTraceTemporalPass::Execute(
     const bool psr = psrConstants != 0 && psrTransforms != 0 && m_psrVariantReady;
     (psr ? m_psrPipeline : m_pipeline).Bind(commandList);
     commandList->SetComputeRootConstantBufferView(0, constantsAddress);
-    // Without a prior the shader never reads b1; the constants stand in for it.
-    commandList->SetComputeRootConstantBufferView(1,
-        constants.priorIndex != 0 && priorCacheBinding != 0 ? priorCacheBinding : constantsAddress);
 
     if(psr)
     {
-        commandList->SetComputeRootConstantBufferView(2, psrConstants);
-        commandList->SetComputeRootShaderResourceView(3, psrTransforms);
+        commandList->SetComputeRootConstantBufferView(1, psrConstants);
+        commandList->SetComputeRootShaderResourceView(2, psrTransforms);
     }
 
     m_psrLastFrame = psr;

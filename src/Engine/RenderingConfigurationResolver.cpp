@@ -205,13 +205,10 @@ RenderingConfiguration ResolveRenderingConfiguration(const RenderingSettings& se
     configuration.dlssRequested = pathTracing.dlss;
     configuration.dlssInputPreparation = diagnostics.dlssInputPreparation;
 
-    // SHARC's history prior needs the Engine denoiser to be the selection, whatever the mode.
     configuration.sharc = diagnostics.sharcTuning;
     // M5.1: ReSTIR PT Enhanced runs without SHARC (and without PSR; the renderer ignores its PSR request).
     configuration.sharc.enabled = isPathTracing && mode != RendererLightingMode::PathTracedRasterPrimaryReSTIRPT &&
         pathTracing.sharc;
-    configuration.sharc.historyPrior = diagnostics.sharcTuning.historyPrior &&
-        pathTracing.denoiser == ProjectPathTraceDenoiser::Engine;
 
     if(isPathTracing)
     {

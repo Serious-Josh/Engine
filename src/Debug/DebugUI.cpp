@@ -1140,7 +1140,6 @@ void DebugUI::SetTLASUpdated(bool updated)
 namespace
 {
     constexpr std::uint32_t SharcTrainingTiles[] = {5, 8};
-    constexpr std::uint32_t SharcMinimumSamples[] = {8, 16, 32, 64, 256};
     constexpr std::uint32_t SharcNvidiaCapacities[] = {20, 21, 22};
 }
 
@@ -1164,13 +1163,9 @@ RenderingDiagnostics DebugUI::GetRenderingDiagnostics() const
 
     SharcSettings& sharc = diagnostics.sharcTuning;
     sharc.trainingTile = SharcTrainingTiles[m_sharcDensity];
-    sharc.minimumSamples = SharcMinimumSamples[m_sharcMinimumSamples];
     sharc.freezeTraining = m_sharcFreezeTraining;
     sharc.statistics = m_sharcStatistics;
     sharc.resetRequest = m_sharcResetRequest;
-    sharc.adaptiveResolution = m_sharcSpatialResolution == 1;
-    sharc.historyPrior = m_sharcHistoryPrior;
-    sharc.implementation = m_sharcImplementation == 1 ? SharcImplementation::Nvidia : SharcImplementation::EngineD6;
     sharc.nvidiaCacheFeedback = m_sharcNvidiaFeedback;
     sharc.nvidiaCapacityLog2 = SharcNvidiaCapacities[m_sharcNvidiaCapacity];
 
@@ -1273,32 +1268,12 @@ void DebugUI::DrawSharcSettings()
         return;
     }
 
-    // NVIDIA SHARC Checkpoint A: the temporary comparison switch (session only).
-    const char* implementations[] = {"Engine D6 cache", "NVIDIA SHARC v1.8.3"};
-    ImGui::Combo("Implementation", &m_sharcImplementation, implementations, IM_ARRAYSIZE(implementations));
-    const bool nvidia = m_sharcImplementation == 1;
     const char* densities[] = {"5x5 (1/25)", "8x8 (1/64)"};
     ImGui::Combo("Training density", &m_sharcDensity, densities, IM_ARRAYSIZE(densities));
-
-    if (nvidia)
-    {
-        // Switching reallocates and clears the cache.
-        const char* capacities[] = {"2^20 entries (40 MiB)", "2^21 entries (80 MiB)", "2^22 entries (160 MiB)"};
-        ImGui::Combo("Cache size", &m_sharcNvidiaCapacity, capacities, IM_ARRAYSIZE(capacities));
-        ImGui::Checkbox("Multi-bounce feedback (off: depth-matched diagnostic)", &m_sharcNvidiaFeedback);
-    }
-    else
-    {
-        const char* minimumSamples[] = {"8", "16", "32", "64", "256"};
-        ImGui::Combo("Minimum cache samples", &m_sharcMinimumSamples, minimumSamples, IM_ARRAYSIZE(minimumSamples));
-        // Switching rebuilds the cache.
-        const char* spatialResolutions[] = {"Uniform 10 cm", "Adaptive (default)"};
-        ImGui::Combo("Spatial resolution", &m_sharcSpatialResolution, spatialResolutions, IM_ARRAYSIZE(spatialResolutions));
-        // Initializes rejected denoiser history from the cache, so it needs the Engine PT denoiser.
-        ImGui::BeginDisabled(GetSelectedPathTraceDenoiserMode() != PathTraceDenoiserMode::Engine);
-        ImGui::Checkbox("SHARC-assisted history initialization (experimental)", &m_sharcHistoryPrior);
-        ImGui::EndDisabled();
-    }
+    // Switching reallocates and clears the cache.
+    const char* capacities[] = {"2^20 entries (40 MiB)", "2^21 entries (80 MiB)", "2^22 entries (160 MiB)"};
+    ImGui::Combo("Cache size", &m_sharcNvidiaCapacity, capacities, IM_ARRAYSIZE(capacities));
+    ImGui::Checkbox("Multi-bounce feedback (off: depth-matched diagnostic)", &m_sharcNvidiaFeedback);
 
     ImGui::Checkbox("Freeze training", &m_sharcFreezeTraining);
     ImGui::SameLine();
@@ -1334,18 +1309,15 @@ void DebugUI::DrawSharcSettings()
                     m_sharcStatus.eligibleQueries);
         ImGui::Text("Occupied entries: %u", m_sharcStatus.occupiedEntries);
 
-        if (m_sharcStatus.implementation == SharcImplementation::Nvidia)
-        {
-            const std::uint32_t* words = m_sharcStatus.nvidiaStatistics;
-            ImGui::Text("x2 reached %u, admitted %u, cached %u", words[SharcCache::StatisticQueryReached],
-                        words[SharcCache::StatisticQueryAdmitted], words[SharcCache::StatisticQueryHit]);
-            ImGui::Text("Training paths %u, deposits %u (stopped %u), misses %u", words[SharcCache::StatisticTrainingPaths],
-                        words[SharcCache::StatisticDeposits], words[SharcCache::StatisticDepositStops],
-                        words[SharcCache::StatisticMisses]);
-            ImGui::Text("Max per-entry accumulation %u of 2^32, entries above 2^31: %u, saturated resolves: %u",
-                        words[SharcCache::StatisticMaximumAccumulation], words[SharcCache::StatisticHighAccumulation],
-                        words[SharcCache::StatisticSaturated]);
-        }
+        const std::uint32_t* words = m_sharcStatus.nvidiaStatistics;
+        ImGui::Text("x2 reached %u, admitted %u, cached %u", words[SharcCache::StatisticQueryReached],
+                    words[SharcCache::StatisticQueryAdmitted], words[SharcCache::StatisticQueryHit]);
+        ImGui::Text("Training paths %u, deposits %u (stopped %u), misses %u", words[SharcCache::StatisticTrainingPaths],
+                    words[SharcCache::StatisticDeposits], words[SharcCache::StatisticDepositStops],
+                    words[SharcCache::StatisticMisses]);
+        ImGui::Text("Max per-entry accumulation %u of 2^32, entries above 2^31: %u, saturated resolves: %u",
+                    words[SharcCache::StatisticMaximumAccumulation], words[SharcCache::StatisticHighAccumulation],
+                    words[SharcCache::StatisticSaturated]);
     }
 }
 
@@ -1569,6 +1541,17 @@ void DebugUI::DrawPathTraceReferenceSettings()
                 else
                 {
                     ImGui::TextDisabled("Adaptive x1 light sampling: compiled out (ENGINE_RESTIR_PT_LIST_PROTOTYPE=0)");
+                }
+
+                // The SHARC radiance cache at x3 (off: conventional depth-limited paths). Switching resets the history;
+                // switching on starts from an empty cache (about 100 frames to converge).
+                if(m_restirPtSharcAvailable)
+                {
+                    ImGui::Checkbox("SHARC radiance cache at x3", &m_restirPtSharc);
+                }
+                else
+                {
+                    ImGui::TextDisabled("SHARC radiance cache: unavailable (NVIDIA SHARC is not usable here)");
                 }
             }
 

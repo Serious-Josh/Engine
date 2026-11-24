@@ -33,7 +33,6 @@
 #include "RenderObject.h"
 #include "RendererStatistics.h"
 #include "SceneLightingEpoch.h"
-#include "RadianceCache/RadianceCacheD6.h"
 #include "Sharc/SharcCache.h"
 #include "ResourceUploader.h"
 #include "SwapChain.h"
@@ -198,13 +197,8 @@ struct RendererOptions
     RendererLightingMode lightingMode = RendererLightingMode::Legacy;
     PathTraceReferenceSettings pathTraceReference;
 
-    // SHARC.4C experimental D6 radiance cache, default off. On: its GPU resources exist and their generation follows
-    // the scene-lighting epoch on path-traced frames. No rendering stage reads or writes the cache yet, so the image is
-    // unchanged. Off: no allocation and no dispatch. Unsupported in the packaged runtime.
-    bool experimentalD6RadianceCache = false;
-
-    // SHARC.4E experimental cached-radiance rendering, default off (it also enables the D6 cache). Off: the reference
-    // pipeline, with no SHARC dispatch, lookup or allocation.
+    // SHARC (NVIDIA SHARC v1.8.3) cached-radiance rendering, default off. Off: the reference pipeline, with no SHARC
+    // dispatch, lookup or allocation.
     SharcSettings sharc;
 
     // SHARC.4E.1: the path-tracing denoiser (RTXPT D.1B signal extraction, D.2B temporal reconstruction, D.3B spatial
@@ -1753,6 +1747,8 @@ class Renderer
     bool m_restirPtUiRegirExact = true;
     bool m_restirPtUiRegirSpotTarget = true;
     bool m_restirPtUiRegirList = true;
+    // The SHARC radiance cache's Editor switch (mirrors ReSTIRPTSettings::sharc).
+    bool m_restirPtUiSharc = true;
     bool m_restirPtUiRegirDirect = true;
     // The descriptor index of the buffer published this frame (valid with m_lightSamplingReport.available).
     std::uint32_t m_frameLightSamplingBufferIndex = 0;
@@ -2108,7 +2104,6 @@ private:
 #ifndef NDEBUG
     // Verification only: withholds the combined PSR + SHARC path, as a failed preparation does.
     bool m_psrSharcPreparationFailureForTesting = false;
-    Buffer* m_psrSharcEnergyReferenceForTesting = nullptr;
 #endif
     bool m_psrLightingThisFrame = false;
     static bool PsrLightingSupportsDenoiser(PathTraceDenoiserMode mode);
@@ -2397,24 +2392,7 @@ private:
     void LatchSceneLighting(const PathTraceAccumulationKey& key);
     SceneLightingEpoch m_sceneLightingEpoch;
     std::optional<SceneLightingInputs> m_sceneLightingInputs;
-    // The D6 cache's identity while it has resources, otherwise all zero (UpdateRadianceCacheD6).
-    RadianceCacheConfigurationIdentity m_radianceCacheConfiguration;
-
-    // SHARC.4C experimental D6 radiance cache (RendererOptions::experimentalD6RadianceCache): resources and generation
-    // lifecycle only. UpdateRadianceCacheD6 runs at the start of each scene-frame recording, before the latch.
-    RadianceCacheD6 m_radianceCacheD6;
-    RadianceCacheD6::Settings m_radianceCacheD6Settings;
-    // A failed allocation is not retried every frame; turning the option off clears it.
-    bool m_radianceCacheD6Failed = false;
-    // Diagnostics fault injection: the next allocation fails.
-    bool m_radianceCacheD6FailAllocationForTesting = false;
-    void UpdateRadianceCacheD6(bool enabled);
-    // SHARC.4D learning: the cache library's pipeline and the frame's insertion binding (0: this frame does not learn).
-    // SHARC.4D-Q: deferred insertion also needs a record per path (pixels x samplesPerFrame).
-    D3D12_GPU_VIRTUAL_ADDRESS PrepareRadianceCacheLearning(ID3D12GraphicsCommandList* commandList,
-        std::uint32_t samplesPerFrame);
-    // SHARC.4E: applies the frame's SharcSettings to the cache (before UpdateRadianceCacheD6's generation work);
-    // estimator-changing settings restart accumulation. m_sharcStatus is read from the frame slot's readback.
+    // SHARC.4E: applies the frame's SharcSettings; estimator-changing settings restart accumulation. m_sharcStatus is read from the frame slot's readback.
     void ApplySharcSettings(const SharcSettings& requested, bool rasterPrimary);
     // SHARC.4E.1: sets the denoiser's stage flags when the effective denoiser (RendererOptions::pathTraceDenoiserMode, the
     // raster-primary modes only) changes, so diagnostics that drive the flags directly are left alone while it is
@@ -2443,7 +2421,7 @@ private:
     void UpdateSharcStatus(unsigned int frameSlot);
 
     // NVIDIA SHARC Checkpoint A (Documentation/Rendering/NVIDIA_SHARC_Integration_A.md): the cache, its allocation state
-    // and its validity rules. Only one of the two caches has resources at a time.
+    // and its validity rules.
     struct NvidiaSharcSemantics
     {
         std::uint64_t sceneResourceLifetime = 0;
@@ -2458,7 +2436,7 @@ private:
 
     bool NvidiaSharcSelected() const noexcept
     {
-        return m_sharcSettings.enabled && m_sharcSettings.implementation == SharcImplementation::Nvidia;
+        return m_sharcSettings.enabled;
     }
 
     // Why NVIDIA SHARC cannot run here (capabilities, deployed headers), checked once; empty when it can.
@@ -2468,9 +2446,18 @@ private:
     // replacement, path estimator). Moving objects and lights, light and material edits and residency changes do not clear
     // it: NVIDIA's accumulation window and stale-entry eviction adapt to them.
     void ApplyNvidiaSharcValidity(const PathTraceAccumulationKey& key);
+    // Before the frame's cache update: a sudden lighting change since the previous SHARC frame (a light switched, an
+    // intensity or colour jump, a sun or directional change; FrameLighting.h DetectLightingDiscontinuities) makes the cache
+    // forget the stale radiance, around the changed lights or everywhere. Its multi-bounce feedback would otherwise keep
+    // the old light for tens of frames (SHARC_ReSTIR_PT_Investigation.md §9.5).
+    void ApplySharcLightingDiscontinuities(const FrameLighting& lighting);
     SharcCache::Constants MakeNvidiaSharcConstants(const Vector3& cameraPosition, const PathTraceReferenceSettings& settings);
 
     SharcCache m_sharcNvidia;
+    // The lighting of the latest frame that recorded the cache (ApplySharcLightingDiscontinuities).
+    std::shared_ptr<FrameLighting> m_sharcPreviousLighting;
+    // The SHARC radiance cache at x3: this configuration B frame's resolved cache, which its kernels query; empty otherwise.
+    std::optional<SharcCache::Constants> m_restirPtSharcConstants;
     bool m_sharcNvidiaFailed = false;
     std::optional<std::string> m_sharcNvidiaCapabilityFailure;
     std::optional<NvidiaSharcSemantics> m_sharcNvidiaSemantics;
@@ -2484,17 +2471,10 @@ private:
     float m_sharcNvidiaDepositLuminanceLimitForTesting = 0.0f;
     std::uint32_t m_sharcNvidiaQueryVertexForTesting = 2;
     std::uint32_t m_sharcNvidiaTrainingMaxDepthForTesting = 8;
-    // The query-side library the frame's settings select (Query, QueryTermination or Render). NRD.RELAX.2B:
-    // rawDiffuseHitDistance selects the render library's raw-distance build for an extraction frame.
     // The render library SHARC substitutes cached radiance with (SHARC.4E, 4E.1, 5B; NRD.RELAX.2B raw distance).
     static PathTraceRadianceCacheLibrary SharcRenderLibrary(bool extract, bool splitReSTIRDI, bool rawDiffuseHitDistance);
-    PathTraceRadianceCacheLibrary RadianceCacheQueryLibrary(bool extract, bool splitReSTIRDI,
-        bool rawDiffuseHitDistance = false) const;
     SharcSettings m_sharcSettings;
     SharcStatus m_sharcStatus;
-    // Diagnostics only (SHARC.5B): the render library's queryMode in place of 1 (2: the cached part zeroed, 3: also the
-    // miss term, 4: the cached part unclamped), to compare a terminated path's terms one by one. 0 in production.
-    std::uint32_t m_sharcDiagnosticQueryMode = 0;
     // RTXDI.1 diagnostics: initial RTXDI candidate counts in place of RtxdiInitialLocalLightSamples and
     // RtxdiInitialInfiniteLightSamples (0 = the production constant).
     std::uint32_t m_rtxdiLocalLightSamplesForTesting = 0;
@@ -2555,21 +2535,7 @@ private:
     std::uint32_t m_rtxdiBrdfSamplesForTesting = UINT_MAX;
     // Whether the last path-traced frame rendered with the cached-radiance library.
     bool m_sharcRenderedLastFrame = false;
-    // SHARC.6A: this frame's render dispatch writes the history prior the temporal pass reads.
-    bool m_sharcHistoryPriorWritten = false;
-    // Its query binding's constants, which the temporal pass reads to look the prior up.
-    D3D12_GPU_VIRTUAL_ADDRESS m_sharcHistoryPriorBinding = 0;
-    // SHARC.4D-R (diagnostics): the query library's binding for the frame (0: render with the reference library).
-    D3D12_GPU_VIRTUAL_ADDRESS PrepareRadianceCacheQuery(ID3D12GraphicsCommandList* commandList, bool extract,
-        bool splitReSTIRDI, bool rawDiffuseHitDistance = false);
-    // The learning library of the frame PrepareRadianceCacheLearning prepared.
-    PathTraceRadianceCacheLibrary m_radianceCacheLearningLibrary = PathTraceRadianceCacheLibrary::Training;
-    // Diagnostics (SHARC.4D-Q): the library Insertion::Deferred frames learn with (Deferred or DeferredLate).
-    PathTraceRadianceCacheLibrary m_radianceCacheDeferredLibrary = PathTraceRadianceCacheLibrary::Deferred;
-    // Diagnostics fault injection: the next record-buffer allocation fails.
-    bool m_radianceCacheRecordsFailAllocationForTesting = false;
-    // Whether the last path-traced frame recorded learning (the cache library and a resolve).
-    bool m_radianceCacheLearnedLastFrame = false;
+    // A SHARC pipeline failure is logged once.
     bool m_radianceCacheLearningFailureLogged = false;
     // RTXPT D.1A: a fixed seed for every accumulation run (diagnostics only). Empty in production, where each run
     // takes PathTraceSequenceSeed of its first frame's serial relative to m_pathTraceSequenceOrigin, so a moving

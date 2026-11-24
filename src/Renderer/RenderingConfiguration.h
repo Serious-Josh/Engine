@@ -69,7 +69,7 @@ struct RenderingDiagnostics
     int diagnosticRenderScale = 0;
     bool dlssInputPreparation = false;
     PathTraceDenoiserStages denoiserStages{};
-    // SHARC tuning; enabled comes from the settings, and historyPrior is the request (Engine denoiser only).
+    // SHARC tuning; enabled comes from the settings.
     SharcSettings sharcTuning{};
 
     // Reference quality requested by the Debug panel, whose quality sliders both path-traced modes share

@@ -3,6 +3,7 @@
 #include "Renderer/Buffer.h"
 #include "Renderer/ComputePipeline.h"
 
+#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <optional>
@@ -34,8 +35,9 @@ public:
         // NVIDIA's HashGridParameters::sceneScale: a voxel edge is about 2^level / sceneScale metres, level ~ log2 of the
         // camera distance (at least 1).
         float sceneScale = 35.0f;
-        // SharcResolveParameters: the temporal window (frames) and the stale-entry lifetime.
-        std::uint32_t accumulationFrames = 16;
+        // SharcResolveParameters: the temporal window (frames; SharcSettings::nvidiaAccumulationFrames) and the stale-entry
+        // lifetime.
+        std::uint32_t accumulationFrames = 4;
         std::uint32_t staleFrames = 64;
         // SharcParameters::radianceScale: the fixed-point scale of the per-frame 32-bit accumulation. A fixed value in
         // Engine's GPU radiance units (scene-linear, already scaled by the scene's reference exposure EV_ref), never
@@ -84,7 +86,21 @@ public:
 
     static_assert(sizeof(Constants) == 8 * 16);
 
+    // Must match SharcNvInvalidationConstants (SharcNv/SharcNvResolve.hlsl): world-space spheres (centre xyz, radius w).
+    static constexpr std::uint32_t MaximumInvalidationRegions = 64;
+
+    struct InvalidationConstants
+    {
+        std::uint32_t count[4]{};
+        float regions[MaximumInvalidationRegions][4]{};
+    };
+
+    static_assert(sizeof(InvalidationConstants) == 16 + MaximumInvalidationRegions * 16);
+
     static constexpr std::uint32_t FlagStatistics = 1;
+    // ReSTIR PT's radiance cache: training skips the path tracer's indirect clamp (SharcNvCommon.hlsli), as ReSTIR PT's
+    // estimator is unclamped.
+    static constexpr std::uint32_t FlagUnclampedDeposits = 2;
     static constexpr std::uint32_t MinimumCapacityLog2 = 20;
     static constexpr std::uint32_t MaximumCapacityLog2 = 22;
     // Hash key (uint64), accumulation (uint4) and resolved (float16_t4 + 2 uints) per entry: NVIDIA's 40-byte layout.
@@ -122,6 +138,9 @@ public:
         std::uint64_t clearsCommitted = 0;
         std::uint64_t uncertainSubmissions = 0;
         std::uint64_t resolvesRecorded = 0;
+        // Frames that forgot regions of the cache (RequestInvalidation), and the regions they forgot.
+        std::uint64_t invalidationsRecorded = 0;
+        std::uint64_t regionsInvalidated = 0;
     };
 
     // Why NVIDIA SHARC cannot run on this device or installation; empty when it can. shaderRoot is the deployed
@@ -155,6 +174,10 @@ public:
     void MarkSubmissionUncertain();
     // The next frame clears the cache (an invalidation of what the cached radiance means).
     void RequestClear();
+    // The next frame forgets the cached radiance inside these world-space spheres (centre xyz, radius w): a lighting
+    // discontinuity there (FrameLighting.h DetectLightingDiscontinuities). Regions accumulate until a frame records them;
+    // more than MaximumInvalidationRegions pending become a clear.
+    void RequestInvalidation(const std::vector<std::array<float, 4>>& regions);
 
     // The frame's constants with this cache's buffers, capacity and settings filled in (the caller sets the rest).
     Constants MakeConstants() const;
@@ -239,7 +262,7 @@ private:
     static void ReleaseResources(Resources& resources);
     bool EnsurePipelines(ID3D12Device* device, ShaderLibrary& shaderLibrary);
     bool RecordDispatch(ID3D12GraphicsCommandList* commandList, UploadBuffer& uploadBuffer, const Constants& constants,
-        const ComputePipeline& pipeline, std::uint32_t threads);
+        const ComputePipeline& pipeline, std::uint32_t threads, const InvalidationConstants* invalidation = nullptr);
     bool EnsureReadback(ID3D12Device* device);
 
     ComputePipeline m_clearPipeline;
@@ -247,6 +270,7 @@ private:
     ComputePipeline m_accumulationStatisticsPipeline;
     ComputePipeline m_resolvePipeline;
     ComputePipeline m_resolvedStatisticsPipeline;
+    ComputePipeline m_invalidatePipeline;
     bool m_pipelinesReady = false;
     bool m_pipelinesFailed = false;
 
@@ -258,6 +282,7 @@ private:
 
     // The contents need a clear (new allocation, invalidation, uncertain submission).
     bool m_clearNeeded = true;
+    std::vector<std::array<float, 4>> m_pendingRegions;
     // A clear was recorded in the current, not yet submitted recording.
     bool m_clearRecorded = false;
     bool m_usable = false;

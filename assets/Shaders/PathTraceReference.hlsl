@@ -468,7 +468,7 @@ bool PathTraceVisible(float3 position, float3 geometricNormal, float3 direction,
         distance * (1.0f - 1.0e-4f);
 
 #if (defined(PATH_TRACE_PRIMARY_DI_SHADOW_RAY_QUERY) && defined(PATH_TRACE_RESTIR_DI_LIBRARY)) || \
-    (defined(PATH_TRACE_SECONDARY_SHADOW_RAY_QUERY) && !defined(PATH_TRACE_RESTIR_DI_LIBRARY) && !defined(PATH_TRACE_RADIANCE_CACHE_TRAINING))
+    (defined(PATH_TRACE_SECONDARY_SHADOW_RAY_QUERY) && !defined(PATH_TRACE_RESTIR_DI_LIBRARY))
     RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> query;
     PathTraceCountReferenceRay(2u);
     query.TraceRayInline(scene, RAY_FLAG_NONE, 0xFF, ray);
@@ -2046,18 +2046,6 @@ PathTraceExtraction PathTraceEmptyExtraction()
 // G-buffer sample where the camera primaries trace and build their first hit; everything after it (sampling,
 // BSDF, MIS, bounces, roulette) is the same code. extract is a literal at every call site; without it the
 // extraction state is never read, and the loop is the production loop.
-// SHARC.4D: learning hooks of the cache library only (PathTraceRadianceCacheHarvest.hlsli). In every other library
-// PATH_TRACE_RADIANCE_CACHE_HARVEST expands to nothing, leaving an empty statement.
-#ifdef PATH_TRACE_RADIANCE_CACHE_LIBRARY
-#include "PathTraceRadianceCacheHarvest.hlsli"
-#define PATH_TRACE_RADIANCE_CACHE_HARVEST(statement) statement
-#else
-#define PATH_TRACE_RADIANCE_CACHE_HARVEST(statement)
-#endif
-
-#ifdef PATH_TRACE_PSR_SHARC_ENERGY_DIAGNOSTIC
-#include "PsrSharcEnergyDiagnostic.hlsli"
-#endif
 
 // NVIDIA SHARC v1.8.3 (the SharcNv/ libraries only, PathTraceSharcNv.hlsli): its update and render hooks. In every other
 // library PATH_TRACE_SHARC_NV expands to nothing, the loop's depth is maxPathDepth and every vertex is shaded.
@@ -2069,6 +2057,7 @@ PathTraceExtraction PathTraceEmptyExtraction()
 #define PATH_TRACE_SHARC_NV(statement)
 #define PATH_TRACE_LOOP_MAX_DEPTH maxPathDepth
 #define PATH_TRACE_SHARC_NV_SHADES(vertex) true
+#define PATH_TRACE_SHARC_NV_CLAMPS true
 #endif
 
 float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex rasterFirstVertex,
@@ -2076,17 +2065,10 @@ float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex 
 {
     float3 radiance = float3(0.0f, 0.0f, 0.0f);
     float3 throughput = float3(1.0f, 1.0f, 1.0f);
-#ifdef PATH_TRACE_PSR_SHARC_ENERGY_DIAGNOSTIC
-    PsrSharcEnergyObservation energy = (PsrSharcEnergyObservation)0;
-#endif
     bool previousDelta = true;
     float previousPdf = 0.0f;
-    PATH_TRACE_RADIANCE_CACHE_HARVEST(PathTraceRadianceCacheHarvest harvest = PathTraceRadianceCacheHarvestBegin());
     PATH_TRACE_SHARC_NV(PathTraceSharcNvPath sharcNvPath = PathTraceSharcNvBegin(rasterFirstVertex));
 #ifdef PATH_TRACE_PSR_LIBRARY
-#if defined(PATH_TRACE_PSR_SHARC_INFRASTRUCTURE) && defined(PATH_TRACE_RADIANCE_CACHE_TRAINING)
-    harvest.psrReplaced = PathTracePsrReplaced(rasterFirstVertex.psrState);
-#endif
     // PSR.1c-A: the vertex whose direct light RTXDI estimated (the direct pass's split direct radiance).
     uint rtxdiVertex = primary == PATH_TRACE_PRIMARY_RASTER_SPLIT_INDIRECT ?
         PathTraceEffectivePrimaryVertex(rasterFirstVertex) : 0u;
@@ -2159,10 +2141,6 @@ float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex 
             bool replacementVertex = (primary == PATH_TRACE_PRIMARY_RASTER ||
                 primary == PATH_TRACE_PRIMARY_RASTER_SPLIT_INDIRECT) && vertex == 1u &&
                 PathTracePsrReplaced(rasterFirstVertex.psrState);
-#ifdef PATH_TRACE_PSR_SHARC_ENERGY_REFERENCE
-            // B is independently reached through the physical TLAS, from recovered mirror A.
-            replacementVertex = false;
-#endif
             bool untracedVertex = gBufferVertex || replacementVertex;
 #endif
             // PSR.1a-P: the call stays unconditional. A wave-uniform skip (WaveActiveAllTrue(replacementVertex)) is
@@ -2248,17 +2226,12 @@ float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex 
                         float3 missRadiance = PathTraceMissRadiance(ray.Direction, previousDelta, previousPdf);
 
                         // The miss of the ray leaving vertex - 1 (vertex 0's own BSDF-sampled light stays unclamped).
-                        if(PathTraceIndirectClampActive(vertex - 1u))
+                        if(PathTraceIndirectClampActive(vertex - 1u) && PATH_TRACE_SHARC_NV_CLAMPS)
                         {
                             missRadiance *= PathTraceIndirectClampScale(throughput * missRadiance);
                         }
 
                         radiance += throughput * missRadiance;
-#ifdef PATH_TRACE_PSR_SHARC_ENERGY_DIAGNOSTIC
-                        if(vertex == 2u) energy.immediateImage += throughput * missRadiance;
-                        if(vertex >= 3u) energy.suffixImage += throughput * missRadiance;
-#endif
-                        PATH_TRACE_RADIANCE_CACHE_HARVEST(PathTraceRadianceCacheHarvestMiss(harvest, vertex, missRadiance));
                         PATH_TRACE_SHARC_NV(PathTraceSharcNvMiss(sharcNvPath, missRadiance));
 
                         if(extract)
@@ -2274,11 +2247,6 @@ float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex 
                         // pass's HDRI light sample. It is the RTXDI vertex's direct light, so it is never clamped.
                         float3 missRadiance = PathTraceMissEnvironmentRadiance(ray.Direction, previousPdf);
                         radiance += throughput * missRadiance;
-#ifdef PATH_TRACE_PSR_SHARC_ENERGY_DIAGNOSTIC
-                        if(vertex == 2u) energy.immediateImage += throughput * missRadiance;
-                        if(vertex >= 3u) energy.suffixImage += throughput * missRadiance;
-#endif
-                        PATH_TRACE_RADIANCE_CACHE_HARVEST(PathTraceRadianceCacheHarvestMiss(harvest, vertex, missRadiance));
                         PATH_TRACE_SHARC_NV(PathTraceSharcNvMiss(sharcNvPath, missRadiance));
 
                         if(extract)
@@ -2423,19 +2391,6 @@ float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex 
             }
         }
 #endif
-#ifdef PATH_TRACE_PSR_SHARC_ENERGY_DIAGNOSTIC
-        if(vertex == 1u)
-        {
-            energy.seen = true;
-            energy.position = position;
-            energy.normal = surface.geometricNormal;
-            energy.metallic = surface.material.metallic;
-            energy.roughness = surface.material.roughness;
-            energy.eligible = !surface.deltaSpecular && surface.material.model <= 1u && surface.material.metallic <= 0.1f;
-            energy.mirrorThroughput = throughput;
-        }
-#endif
-        PATH_TRACE_RADIANCE_CACHE_HARVEST(PathTraceRadianceCacheHarvestVertex(harvest, primary, vertex, position, surface));
 #ifdef PATH_TRACE_SHARC_NV_RENDER
         // NVIDIA SHARC: an admitted, cached vertex supplies everything from its own next-event estimation on.
         if(PathTraceSharcNvQuery(sharcNvPath, primary, vertex, position, ray.Origin, surface, throughput, radiance, extract,
@@ -2488,12 +2443,12 @@ float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex 
 
             // Indirect next-event estimation (vertex >= 1): one contribution, scaled with its diffuse share.
 #ifdef PATH_TRACE_SAMPLED_NEE
-            const bool clampNee = PathTraceIndirectClampActive(vertex) &&
+            const bool clampNee = PathTraceIndirectClampActive(vertex) && PATH_TRACE_SHARC_NV_CLAMPS &&
                 (sceneLightPadding.y & PATH_TRACE_SAMPLED_NEE_NO_NEE_CLAMP) == 0u;
 
             if(clampNee)
 #else
-            if(PathTraceIndirectClampActive(vertex))
+            if(PathTraceIndirectClampActive(vertex) && PATH_TRACE_SHARC_NV_CLAMPS)
 #endif
             {
                 direct *= PathTraceIndirectClampScale(throughput * direct);
@@ -2520,11 +2475,6 @@ float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex 
 #endif
 
             radiance += throughput * direct;
-#ifdef PATH_TRACE_PSR_SHARC_ENERGY_DIAGNOSTIC
-            if(vertex == 1u) energy.direct = direct;
-            if(vertex >= 2u) energy.suffixImage += throughput * direct;
-#endif
-            PATH_TRACE_RADIANCE_CACHE_HARVEST(PathTraceRadianceCacheHarvestDirect(harvest, vertex, direct));
 #ifdef PATH_TRACE_SHARC_NV_TRAINING
             if(!PathTraceSharcNvDeposit(sharcNvPath, vertex, position, surface, direct, random))
             {
@@ -2572,20 +2522,8 @@ float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex 
             }
         }
 
-#ifdef PATH_TRACE_PSR_SHARC_ENERGY_DIAGNOSTIC
-        if(vertex == 1u)
-        {
-            energy.valid = bsdfSample.valid;
-            energy.sampled = !bsdfSample.delta;
-            energy.bsdfWeight = bsdfSample.weight;
-            energy.continuationThroughput = throughput * bsdfSample.weight;
-            energy.direction = bsdfSample.direction;
-            energy.pdf = bsdfSample.pdf;
-        }
-#endif
         throughput *= bsdfSample.weight;
         PATH_TRACE_SHARC_NV(PathTraceSharcNvSegment(sharcNvPath, vertex, bsdfSample, specularStrategy, surface));
-        PATH_TRACE_RADIANCE_CACHE_HARVEST(PathTraceRadianceCacheHarvestContinue(harvest, vertex, bsdfSample));
         previousDelta = bsdfSample.delta;
         previousPdf = bsdfSample.pdf;
 
@@ -2607,7 +2545,6 @@ float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex 
             }
 
             throughput /= survival;
-            PATH_TRACE_RADIANCE_CACHE_HARVEST(PathTraceRadianceCacheHarvestSurvive(harvest, vertex, survival));
 
             if(extract)
             {
@@ -2634,10 +2571,6 @@ float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex 
         ray.TMax = PATH_TRACE_DISTANT_LIGHT_DISTANCE;
     }
 
-#ifdef PATH_TRACE_PSR_SHARC_ENERGY_DIAGNOSTIC
-    PsrSharcEnergyStore(energy, rasterFirstVertex, radiance);
-#endif
-    PATH_TRACE_RADIANCE_CACHE_HARVEST(PathTraceRadianceCacheHarvestEnd(harvest));
 #undef PATH_TRACE_EXTRACTION_VERTEX
 #undef PATH_TRACE_LOOP_MAX_DEPTH
     return radiance;
@@ -2822,14 +2755,8 @@ void PathTraceRunRayGeneration(uint primary, bool extract)
             }
 
             PathTraceExtraction extraction = PathTraceEmptyExtraction();
-#if defined(PATH_TRACE_RADIANCE_CACHE_RENDER) && PATH_TRACE_SHARC_SPATIAL_DIAGNOSTIC != 0
-            PathTraceSharcDiagnosticBeginSample();
-#endif
             float3 sampleRadiance = PathTracePrimaryRadiance(primary, pixel, rasterFirstVertex, random, rayCount, extract,
                 extraction);
-#if defined(PATH_TRACE_RADIANCE_CACHE_RENDER) && PATH_TRACE_SHARC_SPATIAL_DIAGNOSTIC != 0
-            g_pathTraceSharcDiagnosticSum += g_pathTraceSharcDiagnosticSample;
-#endif
 
             // A non-finite estimate is a defect, never silently averaged; it is counted and dropped.
             if(!all(isfinite(sampleRadiance)) || any(sampleRadiance < 0.0f))
@@ -2934,17 +2861,6 @@ void PathTraceRunRayGeneration(uint primary, bool extract)
                 min(hitDistance, PATH_TRACE_HALF_MAXIMUM));
         }
 
-#if defined(PATH_TRACE_RADIANCE_CACHE_RENDER) && PATH_TRACE_SHARC_SPATIAL_DIAGNOSTIC != 0
-        // Display only: leave the production accumulation and extracted signals above unchanged.
-        float3 diagnostic = g_pathTraceSharcDiagnosticSum / float(max(samplesPerFrame, 1u));
-#if PATH_TRACE_SHARC_SPATIAL_DIAGNOSTIC == 3
-        // Fixed visualization of the frame-mean cached RGB: c/(1+c), then sRGB. Never physical illumination.
-        diagnostic = diagnostic / (1.0f + diagnostic);
-        diagnostic = select(diagnostic <= 0.0031308f, diagnostic * 12.92f,
-            1.055f * pow(diagnostic, 1.0f / 2.4f) - 0.055f);
-#endif
-        outputTexture[pixel] = float4(diagnostic, 1.0f);
-#endif
     }
 
     // One atomic per wave keeps instrumentation cheap relative to the traced work.
@@ -3065,8 +2981,7 @@ void PathTracePsrRayGeneration()
 
 // -----------------------------------------------------------------------------
 // NVIDIA SHARC's libraries bind their cache constants at b3, which the guides use.
-#if !defined(PATH_TRACE_PSR_SHARC_INFRASTRUCTURE) && !defined(PATH_TRACE_SHARC_NV_TRAINING) && \
-    !defined(PATH_TRACE_SHARC_NV_RENDER)
+#if !defined(PATH_TRACE_SHARC_NV_TRAINING) && !defined(PATH_TRACE_SHARC_NV_RENDER)
 // PSR.1b virtual surface guides (diagnostic consumers only). PathTracePsrGuideRayGeneration replaces the record pass on
 // guide frames: it writes the identical record, from the identical ray and closest-hit evaluation, and in addition one
 // guide per pixel. Physical coordinates (lighting, visibility) stay in the record and the raster vertex 0; the guide
@@ -3429,15 +3344,6 @@ void PathTracePsrProbe(uint2 pixel)
     probe.Store4(address + 144u, uint4(asuint(surface.specularProbability), asuint(surface.normalDotView),
         asuint(firstVertex.surface.view.xy)));
     probe.Store4(address + 160u, uint4(asuint(firstVertex.surface.view.z), 0u, 0u, 0u));
-#ifdef PATH_TRACE_PSR_SHARC_INFRASTRUCTURE
-    uint2 key = 0u;
-    uint level = 0u;
-    bool keyed = shaded && RadianceCacheD6MakeClassKey(radianceCache, position, surface.geometricNormal, false, key, level);
-    probe.Store4(address + 176u, uint4(key, level, keyed ? PathTraceEffectivePrimaryVertex(firstVertex) : 0xFFFFFFFFu));
-    Texture2D<float4> storedSurface = ResourceDescriptorHeap[gBufferSurfaceIndex];
-    probe.Store(address + 164u, asuint(storedSurface.Load(int3(pixel, 0)).w));
-    probe.Store(address + 168u, firstVertex.psrPixel.y * resolution.x + firstVertex.psrPixel.x);
-#endif
 }
 
 [shader("raygeneration")]

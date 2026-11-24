@@ -101,61 +101,9 @@ namespace
         return "PathTraceReference.hlsl";
     }
 
-    // SHARC.4D: the cache libraries of each variant (the reference library with PATH_TRACE_RADIANCE_CACHE_LIBRARY).
-    const char* D6RadianceCacheLibraryPath(PathTraceLibraryVariant variant, PathTraceRadianceCacheLibrary library)
-    {
-        static constexpr const char* paths[][3] = {
-            {"PathTraceReferenceRadianceCacheDeferred.hlsl", "PathTraceReferenceRadianceCacheDeferredSM69.hlsl",
-                "PathTraceReferenceRadianceCacheDeferredSERSM69.hlsl"},
-            {"PathTraceReferenceRadianceCacheDeferredLate.hlsl", "PathTraceReferenceRadianceCacheDeferredLateSM69.hlsl",
-                "PathTraceReferenceRadianceCacheDeferredLateSERSM69.hlsl"},
-            {"PathTraceReferenceRadianceCacheQuery.hlsl", "PathTraceReferenceRadianceCacheQuerySM69.hlsl",
-                "PathTraceReferenceRadianceCacheQuerySERSM69.hlsl"},
-            {"PathTraceReferenceRadianceCacheTraining.hlsl", "PathTraceReferenceRadianceCacheTrainingSM69.hlsl",
-                "PathTraceReferenceRadianceCacheTrainingSERSM69.hlsl"},
-            {"PathTraceReferenceRadianceCacheQueryTermination.hlsl",
-                "PathTraceReferenceRadianceCacheQueryTerminationSM69.hlsl",
-                "PathTraceReferenceRadianceCacheQueryTerminationSERSM69.hlsl"},
-            {"PathTraceReferenceRadianceCacheRender.hlsl", "PathTraceReferenceRadianceCacheRenderSM69.hlsl",
-                "PathTraceReferenceRadianceCacheRenderSERSM69.hlsl"},
-            {"PathTraceReferenceRadianceCacheRender.hlsl", "PathTraceReferenceRadianceCacheRenderSM69.hlsl",
-                "PathTraceReferenceRadianceCacheRenderSERSM69.hlsl"},
-            {"PathTraceReferenceRadianceCacheRender.hlsl", "PathTraceReferenceRadianceCacheRenderSM69.hlsl",
-                "PathTraceReferenceRadianceCacheRenderSERSM69.hlsl"},
-            {"PathTraceReferenceRadianceCacheRender.hlsl", "PathTraceReferenceRadianceCacheRenderSM69.hlsl",
-                "PathTraceReferenceRadianceCacheRenderSERSM69.hlsl"},
-            {"PathTraceReferenceRadianceCacheRenderRawDiffuseHitDistance.hlsl",
-                "PathTraceReferenceRadianceCacheRenderRawDiffuseHitDistanceSM69.hlsl",
-                "PathTraceReferenceRadianceCacheRenderRawDiffuseHitDistanceSERSM69.hlsl"},
-            {"PathTraceReferenceRadianceCacheRenderRawDiffuseHitDistance.hlsl",
-                "PathTraceReferenceRadianceCacheRenderRawDiffuseHitDistanceSM69.hlsl",
-                "PathTraceReferenceRadianceCacheRenderRawDiffuseHitDistanceSERSM69.hlsl"},
-            {"PathTraceReferencePsrSharcTraining.hlsl", "PathTraceReferencePsrSharcTrainingSM69.hlsl", "PathTraceReferencePsrSharcTrainingSERSM69.hlsl"},
-            {"PathTraceReferencePsrSharcRender.hlsl", "PathTraceReferencePsrSharcRenderSM69.hlsl", "PathTraceReferencePsrSharcRenderSERSM69.hlsl"},
-            {"PathTraceReferencePsrSharcRender.hlsl", "PathTraceReferencePsrSharcRenderSM69.hlsl", "PathTraceReferencePsrSharcRenderSERSM69.hlsl"},
-            {"PathTraceReferencePsrSharcRenderRawDiffuseHitDistance.hlsl", "PathTraceReferencePsrSharcRenderRawDiffuseHitDistanceSM69.hlsl", "PathTraceReferencePsrSharcRenderRawDiffuseHitDistanceSERSM69.hlsl"}};
-        static_assert(std::size(paths) == static_cast<size_t>(PathTraceRadianceCacheLibrary::Count));
-        size_t column = 0;
-
-        switch(variant)
-        {
-        case PathTraceLibraryVariant::SM69:
-            column = 1;
-            break;
-        case PathTraceLibraryVariant::SM69SER:
-            column = 2;
-            break;
-        case PathTraceLibraryVariant::SM66:
-            break;
-        }
-
-        return paths[static_cast<size_t>(library)][column];
-    }
-
     // NVIDIA SHARC v1.8.3: its variant tree (SharcNv/, compiled with -enable-16bit-types). The training slot holds the
     // update library (with cache resampling, or without it for the depth-matched diagnostic); the four render slots share
-    // one library and the two raw-distance slots another, exactly as the D6 cache's. The D6 cache's diagnostic and PSR
-    // libraries have no NVIDIA counterpart (nullptr).
+    // one library and the two raw-distance slots another.
     const char* NvidiaRadianceCacheLibraryPath(PathTraceLibraryVariant variant, PathTraceRadianceCacheLibrary library,
         bool depthMatched)
     {
@@ -215,7 +163,7 @@ namespace
     }
 
     const char* RadianceCacheLibraryPath(PathTraceLibraryVariant variant, PathTraceRadianceCacheLibrary library,
-        PathTraceRadianceCacheImplementation implementation = PathTraceRadianceCacheImplementation::EngineD6)
+        PathTraceRadianceCacheImplementation implementation = PathTraceRadianceCacheImplementation::Nvidia)
     {
         switch(implementation)
         {
@@ -223,12 +171,11 @@ namespace
             return NvidiaRadianceCacheLibraryPath(variant, library, false);
         case PathTraceRadianceCacheImplementation::NvidiaDepthMatched:
             return NvidiaRadianceCacheLibraryPath(variant, library, true);
-        case PathTraceRadianceCacheImplementation::EngineD6:
         case PathTraceRadianceCacheImplementation::Count:
             break;
         }
 
-        return D6RadianceCacheLibraryPath(variant, library);
+        return nullptr;
     }
 
     bool IsPsrCacheLibrary(PathTraceRadianceCacheLibrary library)
@@ -407,17 +354,15 @@ namespace
     // SHARC.4D: the Raster Primary pipeline with a learning library and the cache binding (b3) appended.
     RayTracingPipelineDescription BuildRadianceCachePipelineDescription(PathTraceLibraryVariant variant,
         PathTraceRadianceCacheLibrary library,
-        PathTraceRadianceCacheImplementation implementation = PathTraceRadianceCacheImplementation::EngineD6)
+        PathTraceRadianceCacheImplementation implementation = PathTraceRadianceCacheImplementation::Nvidia)
     {
         RayTracingPipelineDescription description = BuildPathTracePipelineDescription(PathTracePrimary::Raster, variant);
         const char* path = RadianceCacheLibraryPath(variant, library, implementation);
         description.shaderPath = path ? path : "";
-        const bool nvidia = implementation != PathTraceRadianceCacheImplementation::EngineD6;
 
         if(library == PathTraceRadianceCacheLibrary::Training || library == PathTraceRadianceCacheLibrary::PsrTraining)
         {
-            description.rayGenerationShader = nvidia ? L"PathTraceSharcNvTrainingRayGeneration" :
-                L"PathTraceRadianceCacheTrainingRayGeneration";
+            description.rayGenerationShader = L"PathTraceSharcNvTrainingRayGeneration";
         }
         else if(library == PathTraceRadianceCacheLibrary::RenderExtraction ||
             library == PathTraceRadianceCacheLibrary::RenderExtractionRawDiffuseHitDistance)
@@ -586,21 +531,24 @@ namespace
     // twins and SharcNv update libraries, so they never carry the sampled estimator's code.
     std::optional<std::filesystem::path> SampledVariantLibraryPath(const std::filesystem::path& path)
     {
-        if(!PathTraceReferencePass::SampledIndirectNeeLibrariesRequested() || path.empty())
+        if(path.empty())
         {
             return std::nullopt;
         }
 
-        if(RayQueryTwinLibraryPath(path))
-        {
-            return std::filesystem::path("M42A") / path;
-        }
-
+        // NVIDIA SHARC's update libraries always carry the permutation: ReSTIR PT's radiance cache trains with the sampled
+        // estimator (Renderer::ApplySampledIndirectNee); the classic path tracer's SHARC selects it only with
+        // ENGINE_SAMPLED_NEE=1.
         const std::string name = path.filename().string();
         const bool sharcTree = std::any_of(path.begin(), path.end(),
             [](const std::filesystem::path& component) { return component == "SharcNv"; });
 
         if(sharcTree && name.starts_with("PathTraceSharcNv") && name.find("Training") != std::string::npos)
+        {
+            return std::filesystem::path("M42A") / path;
+        }
+
+        if(PathTraceReferencePass::SampledIndirectNeeLibrariesRequested() && RayQueryTwinLibraryPath(path))
         {
             return std::filesystem::path("M42A") / path;
         }
@@ -1843,7 +1791,6 @@ void PathTraceReferencePass::ReleaseTextures()
     ReleaseSplitDirectRadiance();
     m_diffuseTexture.Shutdown();
     m_specularTexture.Shutdown();
-    m_historyPriorTexture.Shutdown();
     m_rawDiffuseHitDistanceTexture.Shutdown();
     // PSR.1a: sized for the old extent; the next replacement frame allocates it again (PSR.1b: and the guides).
     m_psrRecords.Shutdown();
@@ -2462,11 +2409,9 @@ void PathTraceReferencePass::ReleasePrimarySurfaceReplacementPipelines()
 {
     // The GI.6 twins are registered against these slots; dropping them keeps the secondary selector's readiness about
     // the pipelines that exist.
-    for(auto& pipeline : m_psrSharcEnergyPipelines) pipeline.Shutdown();
-
     for(RayTracingPipeline* original : {&m_psrRecordPipeline, &m_psrRasterPipeline, &m_psrGuidePipeline,
         &m_psrGBufferDirectPipeline,
-        &m_psrGBufferIndirectPipeline, &m_psrSharcImageProbePipeline, &m_psrSharcTrainingProbePipeline, &m_psrProbePipelines[0], &m_psrProbePipelines[1],
+        &m_psrGBufferIndirectPipeline, &m_psrProbePipelines[0], &m_psrProbePipelines[1],
         &m_psrChainProbePipeline,
         &m_psrGBufferExtractDirectPipeline, &m_psrGBufferExtractIndirectPipeline, &m_psrGBufferExtractIndirectRawPipeline})
     {
@@ -2490,50 +2435,6 @@ void PathTraceReferencePass::ReleasePrimarySurfaceReplacementPipelines()
     m_psrGBufferPipelinesReady = false;
     m_psrGBufferExtractReady[0] = false;
     m_psrGBufferExtractReady[1] = false;
-}
-
-bool PathTraceReferencePass::EnsurePsrSharcProbesForTesting(GraphicsDevice& device, ShaderLibrary& shaders, std::string& failure)
-{
-    const MemoryCategoryScope memoryScope(MemoryCategory::PathTracing);
-
-    RayTracingPipeline* pipelines[] = {&m_psrSharcImageProbePipeline, &m_psrSharcTrainingProbePipeline};
-    for(int index = 0; index < 2; ++index)
-    {
-        if(pipelines[index]->IsInitialized()) continue;
-        auto description = BuildRadianceCachePipelineDescription(m_libraryVariant, index == 0 ?
-            PathTraceRadianceCacheLibrary::PsrRenderSplitIndirect : PathTraceRadianceCacheLibrary::PsrTraining);
-        description.rayGenerationShader = index == 0 ? L"PathTracePsrProbeRayGeneration" :
-            L"PathTracePsrSharcTrainingProbeRayGeneration";
-        const auto* library = AcquireLibrary(shaders, description.shaderPath);
-        if(!library || !pipelines[index]->Initialize(device.GetRayTracingDevice(), library->bytecode, description))
-        {
-            failure = "PSR + SHARC diagnostic state object failed.";
-            return false;
-        }
-    }
-    return true;
-}
-
-bool PathTraceReferencePass::EnsurePsrSharcEnergyForTesting(GraphicsDevice& device, ShaderLibrary& shaders, std::string& failure)
-{
-    const MemoryCategoryScope memoryScope(MemoryCategory::PathTracing);
-
-    const char* suffix = m_libraryVariant == PathTraceLibraryVariant::SM66 ? "" :
-        m_libraryVariant == PathTraceLibraryVariant::SM69 ? "SM69" : "SERSM69";
-    for(int index = 0; index < 2; ++index)
-    {
-        auto& pipeline = m_psrSharcEnergyPipelines[index];
-        if(pipeline.IsInitialized()) continue;
-        auto description = BuildRadianceCachePipelineDescription(m_libraryVariant, PathTraceRadianceCacheLibrary::PsrTraining);
-        description.shaderPath = std::string("PathTraceReferencePsrSharcEnergy") + (index == 0 ? "Training" : "Reference") + suffix + ".hlsl";
-        const auto* library = AcquireLibrary(shaders, description.shaderPath);
-        if(!library || !pipeline.Initialize(device.GetRayTracingDevice(), library->bytecode, description))
-        {
-            failure = "M2A energy diagnostic pipeline unavailable.";
-            return false;
-        }
-    }
-    return true;
 }
 
 bool PathTraceReferencePass::PsrSharcInfrastructureReady(bool extract, bool raw)
@@ -2589,36 +2490,6 @@ void PathTraceReferencePass::ResetPrimarySurfaceReplacementChainPipelines()
         m_psrGBufferExtractFailed[kind] = false;
         m_psrGBufferExtractFailure[kind].clear();
     }
-
-    // The combined PSR + SHARC learning pipelines and their GI.6 twins.
-    // Only the D6 cache has combined PSR libraries.
-    RadianceCacheLearningPipeline* d6Pipelines = m_radianceCacheSets[static_cast<size_t>(PathTraceRadianceCacheImplementation::EngineD6)];
-
-    for(size_t index = 0; index < static_cast<size_t>(PathTraceRadianceCacheLibrary::Count); ++index)
-    {
-        if(!IsPsrCacheLibrary(static_cast<PathTraceRadianceCacheLibrary>(index)))
-        {
-            continue;
-        }
-
-        RadianceCacheLearningPipeline& learning = d6Pipelines[index];
-        const auto twin = m_psrRayQueryPipelines.find(&learning.pipeline);
-
-        if(twin != m_psrRayQueryPipelines.end())
-        {
-            if(twin->second)
-            {
-                RetainPsrPipeline(*twin->second);
-            }
-
-            m_psrRayQueryPipelines.erase(twin);
-        }
-
-        RetainPsrPipeline(learning.pipeline);
-        learning.ready = false;
-        learning.failed = false;
-        learning.failure.clear();
-    }
 }
 
 bool PathTraceReferencePass::EnsurePsrSharcInfrastructure(GraphicsDevice& device, ShaderLibrary& shaders,
@@ -2657,8 +2528,7 @@ void PathTraceReferencePass::ExecuteRadianceCacheTraining(
     }
 
     // The Raster Primary root signature: the image tables are bound but the training ray generation writes none of them.
-    RayTracingPipeline* trainingSelection = psr && m_psrSharcEnergyForTesting ? &m_psrSharcEnergyPipelines[0] :
-        &training.pipeline;
+    RayTracingPipeline* trainingSelection = &training.pipeline;
 
     // M4.2C: on a sampled-training frame, the update library's sampled permutation where one was built.
     if(m_sampledTraining && trainingSelection == &training.pipeline && training.pipeline.GetSampledVariant())
@@ -2683,35 +2553,6 @@ void PathTraceReferencePass::ExecuteRadianceCacheTraining(
         commandList->SetComputeRootShaderResourceView(8, psrTransforms);
     }
     trainingPipeline.Dispatch(commandList, threads, 1);
-    if(psr && m_psrSharcEnergyForTesting && m_psrSharcEnergyPipelines[1].IsInitialized())
-    {
-        m_psrSharcEnergyPipelines[1].Bind(commandList);
-        commandList->SetComputeRootShaderResourceView(0, rayTracingScene.GetTopLevel().GetGPUAddress());
-        commandList->SetComputeRootDescriptorTable(1, descriptorHeap.GetGPUHandle(m_accumulationTexture.GetUAVIndex()));
-        commandList->SetComputeRootDescriptorTable(2, descriptorHeap.GetGPUHandle(m_outputTexture.GetUAVIndex()));
-        commandList->SetComputeRootDescriptorTable(3, descriptorHeap.GetGPUHandle(m_statisticsTexture.GetUAVIndex()));
-        commandList->SetComputeRootConstantBufferView(4, constantsAddress);
-        commandList->SetComputeRootConstantBufferView(5, sceneLightConstantsAddress);
-        commandList->SetComputeRootConstantBufferView(6, trainingConstants);
-        commandList->SetComputeRootConstantBufferView(7, psrConstants);
-        commandList->SetComputeRootShaderResourceView(8, psrTransforms);
-        m_psrSharcEnergyPipelines[1].Dispatch(commandList, threads, 1);
-    }
-    if(psr && m_psrSharcTrainingProbeForTesting && m_psrSharcTrainingProbePipeline.IsInitialized())
-    {
-        // Readback follows this dispatch; the image probe and sparse probe use separate frames.
-        m_psrSharcTrainingProbePipeline.Bind(commandList);
-        commandList->SetComputeRootShaderResourceView(0, rayTracingScene.GetTopLevel().GetGPUAddress());
-        commandList->SetComputeRootDescriptorTable(1, descriptorHeap.GetGPUHandle(m_accumulationTexture.GetUAVIndex()));
-        commandList->SetComputeRootDescriptorTable(2, descriptorHeap.GetGPUHandle(m_outputTexture.GetUAVIndex()));
-        commandList->SetComputeRootDescriptorTable(3, descriptorHeap.GetGPUHandle(m_statisticsTexture.GetUAVIndex()));
-        commandList->SetComputeRootConstantBufferView(4, constantsAddress);
-        commandList->SetComputeRootConstantBufferView(5, sceneLightConstantsAddress);
-        commandList->SetComputeRootConstantBufferView(6, trainingConstants);
-        commandList->SetComputeRootConstantBufferView(7, psrConstants);
-        commandList->SetComputeRootShaderResourceView(8, psrTransforms);
-        m_psrSharcTrainingProbePipeline.Dispatch(commandList, threads, 1);
-    }
 }
 
 bool PathTraceReferencePass::EnsureRadianceCacheLearning(
@@ -2742,7 +2583,7 @@ bool PathTraceReferencePass::EnsureRadianceCacheLearning(
 
     if(!RadianceCacheLibraryPath(m_libraryVariant, library, m_radianceCacheImplementation))
     {
-        failureReason = "NVIDIA SHARC has no counterpart of this D6 cache library.";
+        failureReason = "NVIDIA SHARC has no library in this slot.";
         return false;
     }
 
@@ -3207,29 +3048,6 @@ bool PathTraceReferencePass::CreateExtractionTextures(ID3D12Device* device, Desc
     return true;
 }
 
-Texture* PathTraceReferencePass::EnsureHistoryPriorTexture(ID3D12Device* device, DescriptorHeap& descriptorHeap)
-{
-    if(m_historyPriorTexture.GetResource())
-    {
-        return &m_historyPriorTexture;
-    }
-
-    const MemoryCategoryScope memoryScope(MemoryCategory::PathTracing);
-
-    if(m_width == 0 || m_height == 0 || !m_historyPriorTexture.Initialize(device, m_width, m_height, 1, 1,
-        DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-        D3D12_RESOURCE_STATE_UNORDERED_ACCESS) || !m_historyPriorTexture.CreateSRV(device, descriptorHeap) ||
-        !m_historyPriorTexture.CreateUAV(device, descriptorHeap))
-    {
-        Log::Error("Failed to create the SHARC history prior texture; history initialization is skipped.");
-        m_historyPriorTexture.Shutdown();
-        return nullptr;
-    }
-
-    m_historyPriorTexture.GetResource()->SetName(L"SHARC History Prior");
-    return &m_historyPriorTexture;
-}
-
 Texture* PathTraceReferencePass::EnsureRawDiffuseHitDistanceTexture(ID3D12Device* device, DescriptorHeap& descriptorHeap)
 {
     if(m_rawDiffuseHitDistanceTexture.GetResource())
@@ -3601,11 +3419,10 @@ void PathTraceReferencePass::ExecuteReSTIRDISplit(
     m_psrGBufferWritten = gBufferReplacement;
 
     // Verification only: the recorded PSR pair's probe, with its indirect pass's bindings.
-    RayTracingPipeline& probePipeline = combined ? m_psrSharcImageProbePipeline :
-        (gBufferReplacement && m_psrChainProbePipeline.IsInitialized() ? m_psrChainProbePipeline :
-        m_psrProbePipelines[gBufferReplacement ? 1 : 0]);
+    RayTracingPipeline& probePipeline = gBufferReplacement && m_psrChainProbePipeline.IsInitialized() ?
+        m_psrChainProbePipeline : m_psrProbePipelines[gBufferReplacement ? 1 : 0];
 
-    if(m_psrProbeForTesting && !m_psrSharcEnergyForTesting && !m_psrSharcTrainingProbeForTesting && gBufferReplacement && probePipeline.IsInitialized())
+    if(m_psrProbeForTesting && !combined && gBufferReplacement && probePipeline.IsInitialized())
     {
         m_psrProbeForTesting->Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         probePipeline.Bind(commandList);
@@ -3670,11 +3487,6 @@ std::uint64_t PathTraceReferencePass::GetResourceBytes() const
     if(m_diffuseTexture.GetResource())
     {
         bytes += pixels * (8 + 8);
-    }
-
-    if(m_historyPriorTexture.GetResource())
-    {
-        bytes += pixels * 8;
     }
 
     if(m_rawDiffuseHitDistanceTexture.GetResource())
@@ -3758,7 +3570,6 @@ void PathTraceReferencePass::ReleaseResources()
     m_rawDiffuseHitDistanceWritten = false;
     m_diffuseTexture.Shutdown();
     m_specularTexture.Shutdown();
-    m_historyPriorTexture.Shutdown();
     m_rawDiffuseHitDistanceTexture.Shutdown();
 
     for(auto& set : m_radianceCacheSets)

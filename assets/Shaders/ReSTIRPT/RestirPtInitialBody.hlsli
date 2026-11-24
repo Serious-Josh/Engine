@@ -114,6 +114,20 @@ cbuffer RestirPtConstants : register(b2)
     uint restirPtDiagnosticFlags;
     // M5.6 C7 reinvestigation: {alpha, minCap, threshold} of the duplication response (all 0: the original).
     float3 restirPtDuplicationResponse;
+#if defined(RESTIR_PT_SHARC)
+
+    // The SHARC radiance cache at x3: this frame's NVIDIA SHARC buffers (raw UAVs; capacity 0: no cache this frame, and
+    // every path runs as without SHARC), and the hash grid's camera and scale.
+    uint restirPtSharcHashEntriesIndex;
+    uint restirPtSharcAccumulationIndex;
+    uint restirPtSharcResolvedIndex;
+    uint restirPtSharcCapacity;
+    float3 restirPtSharcCameraPosition;
+    float restirPtSharcSceneScale;
+    float restirPtSharcRadianceScale;
+    uint restirPtSharcFlags;
+    uint2 restirPtSharcPadding;
+#endif
 };
 
 // M5.5-B experiment: final-shading decorrelation (NVIDIA RTXDI RTXDI_PTApplyDecorrelation, "Uniform" mode only). True with
@@ -269,6 +283,16 @@ static const uint RESTIR_PT_FLAG_TEMPORAL_ROUND_TRIP = 1u << 18;
 static const uint RESTIR_PT_PATH_RC_INDEX_SHIFT = 4u;
 static const uint RESTIR_PT_PATH_NEE = 1u << 16;
 static const uint RESTIR_PT_PATH_PREVIOUS_DELTA = 1u << 17;
+#if defined(RESTIR_PT_SHARC)
+// The sample ends at x3 in the SHARC cache (bit 17, otherwise unused).
+static const uint RESTIR_PT_PATH_CACHE = 1u << 17;
+#endif
+// SHARC and reuse diagnostics (counter builds only; the words of the reverted M5.6 B5 shift counters), 32 words:
+//   initial sampling: 0 paths whose x2 continuation hit x3 (outside mirror chains), 1 of those ended by the cache,
+//   4 reservoirs stored, 5 of those holding a cache ending; shifts: 11 light-endpoint NEE re-evaluations, 12 NEE-at-x_k
+//   evaluations; 16 + 4 pass + n per reuse pass (0 temporal, 1 spatial pairs, 2 spatial resample): n = 0 shifts,
+//   1 shifts of cache endings (refused), 2 rays traced (replay, escape), 3 visibility tests.
+static const uint RESTIR_PT_COUNTER_SHARC = 14352u;
 static const uint RESTIR_PT_PATH_LIGHT_TYPE_SHIFT = 18u;
 static const uint RESTIR_PT_PATH_LOBES_SHIFT = 20u;
 static const uint RESTIR_PT_PATH_REPLAY_ONLY = 1u << 24;
@@ -486,6 +510,10 @@ static const uint RESTIR_PT_END_SUN = 2u;
 static const uint RESTIR_PT_END_ENVIRONMENT = 3u;
 static const uint RESTIR_PT_END_ESCAPE = 4u;
 static const uint RESTIR_PT_END_CAMERA = 5u;
+#if defined(RESTIR_PT_SHARC)
+// A path ended at x3 by the SHARC cache (length 3, technique cache; its own domain).
+static const uint RESTIR_PT_END_CACHE = 6u;
+#endif
 
 static const uint RESTIR_PT_RESERVOIR_BYTES = 64u;
 
@@ -1010,6 +1038,24 @@ void RestirPtCount(uint counter, uint value)
         counters.InterlockedAdd(counter * 4u, total);
     }
 }
+
+// SHARC investigation: shift work by reuse pass (RESTIR_PT_COUNTER_SHARC + 16 ..), compiled only into counter builds (the
+// shift kernels' codegen is sensitive even to runtime-gated counters: M5.6 B5).
+#if defined(RESTIR_PT_COUNTERS)
+static uint g_restirPtShiftPass = 3u;
+
+void RestirPtCountShiftWork(uint metric, uint value)
+{
+    if(g_restirPtShiftPass < 3u)
+    {
+        RestirPtCount(RESTIR_PT_COUNTER_SHARC + 16u + g_restirPtShiftPass * 4u + metric, value);
+    }
+}
+
+#define RESTIR_PT_SHIFT_COUNT(statement) statement
+#else
+#define RESTIR_PT_SHIFT_COUNT(statement)
+#endif
 
 // M5.6 Stage 0 (counters on only; nothing else changes): why fresh path trees contribute zero. 80 words from
 // RESTIR_PT_COUNTER_ZERO:
@@ -2416,6 +2462,78 @@ struct RestirPtPrefixState
     float footprintThreshold;
 };
 
+#if defined(RESTIR_PT_SHARC)
+// -----------------------------------------------------------------------------
+// The SHARC radiance cache at x3 (Documentation/Rendering/SHARC_ReSTIR_PT_Investigation.md)
+// -----------------------------------------------------------------------------
+// Every path ends at x3 (uniform termination: whole warps skip x3's work; ending only some lanes saves nothing). Where
+// NVIDIA SHARC admits x3 and holds an entry, the path ends with SHARC's multi-bounce outgoing radiance L_cache(x3) as its
+// own candidate (length 3, technique cache: RESTIR_PT_END_CACHE); where SHARC refuses x3 or has no entry, the path ends
+// with no further light, as depth 2 truncates it. Mirror chains seen from the camera (x1 and x2 continuing by delta
+// bounces) are exempt and continue as before, so a mirror seen in a mirror is not black; they are coherent on screen.
+// The cache is trained by the NVIDIA SHARC update pass (Renderer: sampled light estimator, unclamped deposits).
+// Cache endings are not reused: a shift of one fails, so their domain is estimated by the canonical candidate alone (the
+// MIS weights stay a partition of unity), and temporal and spatial reuse keep the cost of conventional paths only.
+#include "../SharcNvCommon.hlsli"
+
+SharcParameters RestirPtSharcParameters()
+{
+    SharcNvConstants constants = (SharcNvConstants)0;
+    constants.hashEntriesIndex = restirPtSharcHashEntriesIndex;
+    constants.accumulationIndex = restirPtSharcAccumulationIndex;
+    constants.resolvedIndex = restirPtSharcResolvedIndex;
+    constants.capacity = restirPtSharcCapacity;
+    constants.cameraPosition = restirPtSharcCameraPosition;
+    constants.sceneScale = restirPtSharcSceneScale;
+    constants.radianceScale = restirPtSharcRadianceScale;
+    return SharcNvParameters(constants);
+}
+
+// The cache's outgoing radiance at x3 (position; geometricNormal facing the ray from x2) for a continuation from x2 by lobe
+// over distance, with x2's GGX alpha, under the classic integration's admission rules (PathTraceSharcNvQuery): no delta
+// continuation, x3 not purely delta, the segment longer than the voxel diagonal, and a GGX continuation's cone wider than
+// the voxel. False when refused, absent (no samples yet) or not finite.
+bool RestirPtSharcLookup(float3 position, float3 geometricNormal, bool deltaSurface, uint lobe, float alpha,
+    float distance, out float3 radiance)
+{
+    radiance = float3(0.0f, 0.0f, 0.0f);
+
+    if(restirPtSharcCapacity == 0u || deltaSurface || lobe == RESTIR_PT_LOBE_DELTA)
+    {
+        return false;
+    }
+
+    HashGridParameters grid;
+    grid.cameraPosition = restirPtSharcCameraPosition;
+    grid.logarithmBase = SHARC_GRID_LOGARITHM_BASE;
+    grid.sceneScale = restirPtSharcSceneScale;
+    grid.levelBias = SHARC_GRID_LEVEL_BIAS;
+    const float voxelSize = HashGridGetVoxelSize(HashGridGetLevel(position, grid), grid);
+
+    if(!(distance > voxelSize * 1.7320508f))
+    {
+        return false;
+    }
+
+    if(lobe == RESTIR_PT_LOBE_GGX)
+    {
+        const float alphaSquared = alpha * alpha;
+        const float spread = alphaSquared < 1.0f ? 2.0f * distance * sqrt(0.5f * alphaSquared / (1.0f - alphaSquared)) :
+            1.0e30f;
+
+        if(!(spread > voxelSize))
+        {
+            return false;
+        }
+    }
+
+    SharcHitData hit;
+    hit.positionWorld = position;
+    hit.normalWorld = geometricNormal;
+    return SharcGetCachedRadiance(RestirPtSharcParameters(), hit, radiance, false) && all(isfinite(radiance));
+}
+#endif
+
 // An NEE candidate's reconnection data at shading vertex v (contribution = throughput * bsdfCos * lightTerm * mis).
 // reconnectionSurface: x_k seen along omega' (used when x_k is the shading vertex).
 RestirPtReconnection RestirPtNeeReconnection(RestirPtPrefixState prefix, uint vertex, RestirPtNeeParts parts,
@@ -2823,6 +2941,33 @@ RestirPtTreeResult RestirPtTracePathTree(uint2 pixel, uint sampleIndex, PathTrac
             break;
         }
 
+#if defined(RESTIR_PT_SHARC)
+        // SHARC: x2's continuation hit x3 (surface is still x2 here). Every path ends at x3: as the cache candidate where
+        // SHARC admits x3 and holds an entry, with no further light otherwise. Mirror chains seen from the camera (x1 and x2
+        // both delta) continue as without SHARC. The ending's reconnection data is never read (cache endings are not
+        // reused), so x3's reconnection test is skipped.
+        if(vertex == 2u && maxPathDepth >= 3u && restirPtSharcCapacity != 0u &&
+            !(lobeSample.lobe == RESTIR_PT_LOBE_DELTA && (prefix.lobes & 3u) == RESTIR_PT_LOBE_DELTA))
+        {
+            PathTraceSurface cacheSurface;
+            float3 cached;
+            RestirPtCount(RESTIR_PT_COUNTER_SHARC, 1u);
+
+            if(PathTraceBuildSurface(payload, ray.Direction, cacheSurface) && RestirPtSharcLookup(ray.Origin + ray.Direction *
+                payload.hitDistance, cacheSurface.geometricNormal, cacheSurface.deltaSpecular, lobeSample.lobe,
+                PathTraceGGXAlpha(surface.material.roughness), payload.hitDistance, cached))
+            {
+                const float3 contribution = nextThroughput * cached;
+                RestirPtStreamCandidate(result.stream, RestirPtWithReconnection(RestirPtMakeCandidate(contribution,
+                    contribution * diffuseShare, survival, vertex + 1u, RESTIR_PT_END_CACHE, 0u), RestirPtNoReconnection(),
+                    prefix.lobes), RestirPtRandom(seed, vertex, RESTIR_PT_DIMENSION_STREAM + 4u));
+                RestirPtCount(RESTIR_PT_COUNTER_SHARC + 1u, 1u);
+            }
+
+            break;
+        }
+#endif
+
         if(vertex == maxPathDepth)
         {
             break;
@@ -3108,11 +3253,15 @@ uint RestirPtPathFlags(RestirPtCandidate selected)
         lightType = RESTIR_PT_LIGHT_TABLE;
     }
 
-    return min(selected.length, 15u) | (min(selected.rc.index, 15u) << RESTIR_PT_PATH_RC_INDEX_SHIFT) | (1u << 8u) |
+    uint flags = min(selected.length, 15u) | (min(selected.rc.index, 15u) << RESTIR_PT_PATH_RC_INDEX_SHIFT) | (1u << 8u) |
         (nee ? RESTIR_PT_PATH_NEE : 0u) | (lightType << RESTIR_PT_PATH_LIGHT_TYPE_SHIFT) |
         ((selected.lobes & 15u) << RESTIR_PT_PATH_LOBES_SHIFT) |
         (selected.rc.index == 0u ? RESTIR_PT_PATH_REPLAY_ONLY : 0u) |
         ((selected.rc.vertexLobe & 3u) << RESTIR_PT_PATH_VERTEX_LOBE_SHIFT);
+#if defined(RESTIR_PT_SHARC)
+    flags |= selected.endClass == RESTIR_PT_END_CACHE ? RESTIR_PT_PATH_CACHE : 0u;
+#endif
+    return flags;
 }
 
 // rcRandomSeed (specification sections 4.3 and 7.1; Algorithm 1's rcVertexRandomSeed): with the counter-based generator it
@@ -3138,6 +3287,10 @@ void RestirPtStoreReservoir(uint2 pixel, uint seed, RestirPtCandidate selected, 
     RWByteAddressBuffer reservoirs = ResourceDescriptorHeap[restirPtReservoirIndex];
     const uint address = (pixel.y * resolution.x + pixel.x) * RESTIR_PT_RESERVOIR_BYTES;
     const RestirPtReconnection rc = selected.rc;
+#if defined(RESTIR_PT_SHARC)
+    RestirPtCount(RESTIR_PT_COUNTER_SHARC + 4u, 1u);
+    RestirPtCount(RESTIR_PT_COUNTER_SHARC + 5u, selected.endClass == RESTIR_PT_END_CACHE ? 1u : 0u);
+#endif
     // The instance word is the light index for a light endpoint rebuilt from its index.
     reservoirs.Store4(address, uint4(asuint(unbiasedContributionWeight), asuint(selected.contribution)));
     reservoirs.Store4(address + 16u, uint4(seed, asuint(rc.barycentrics.x), RestirPtPathFlags(selected), rc.instance));
@@ -3687,8 +3840,17 @@ RestirPtShifted RestirPtShiftSample(PathTraceRasterFirstVertex destination, uint
     const uint pathLength = pathFlags & 15u;
     const bool nee = (pathFlags & RESTIR_PT_PATH_NEE) != 0u;
     const uint storedLobes = (pathFlags >> RESTIR_PT_PATH_LOBES_SHIFT) & 15u;
+#if defined(RESTIR_PT_SHARC)
+    const bool cacheEnd = (pathFlags & RESTIR_PT_PATH_CACHE) != 0u;
+#else
+    const bool cacheEnd = false;
+#endif
+    RESTIR_PT_SHIFT_COUNT(RestirPtCountShiftWork(0u, 1u));
+    RESTIR_PT_SHIFT_COUNT(RestirPtCountShiftWork(1u, cacheEnd ? 1u : 0u));
 
-    if(pathLength < 2u || destination.state <= 0)
+    // A SHARC cache ending is not reused: its domain is estimated by the canonical candidate alone (a failed shift has no
+    // support there, so the MIS weights stay a partition of unity). Reusing it would replay a bounce in most shifts.
+    if(pathLength < 2u || destination.state <= 0 || cacheEnd)
     {
         return shifted;
     }
@@ -3744,6 +3906,7 @@ RestirPtShifted RestirPtShiftSample(PathTraceRasterFirstVertex destination, uint
         payload.hitDistance = -1.0f;
         RestirPtHitIdentity identity;
         RestirPtTraceInline(ray, payload, identity);
+        RESTIR_PT_SHIFT_COUNT(RestirPtCountShiftWork(2u, 1u));
 
         if(payload.hitDistance < 0.0f)
         {
@@ -3835,6 +3998,7 @@ RestirPtShifted RestirPtShiftSample(PathTraceRasterFirstVertex destination, uint
         escapePayload.hitDistance = -1.0f;
         RestirPtHitIdentity escapeIdentity;
         RestirPtTraceInline(escapeRay, escapePayload, escapeIdentity);
+        RESTIR_PT_SHIFT_COUNT(RestirPtCountShiftWork(2u, 1u));
 
         if(escapePayload.hitDistance >= 0.0f)
         {
@@ -3903,6 +4067,8 @@ RestirPtShifted RestirPtShiftSample(PathTraceRasterFirstVertex destination, uint
         }
 
         uint rays = 0u;
+        RESTIR_PT_SHIFT_COUNT(RestirPtCountShiftWork(3u, 1u));
+        RESTIR_PT_SHIFT_COUNT(RestirPtCount(RESTIR_PT_COUNTER_SHARC + 11u, 1u));
 
         if(!PathTraceVisible(position, surface.geometricNormal, direction, distance, rays))
         {
@@ -3949,6 +4115,7 @@ RestirPtShifted RestirPtShiftSample(PathTraceRasterFirstVertex destination, uint
         escapePayload.hitDistance = -1.0f;
         RestirPtHitIdentity escapeIdentity;
         RestirPtTraceInline(escapeRay, escapePayload, escapeIdentity);
+        RESTIR_PT_SHIFT_COUNT(RestirPtCountShiftWork(2u, 1u));
 
         if(escapePayload.hitDistance >= 0.0f)
         {
@@ -4033,6 +4200,8 @@ RestirPtShifted RestirPtShiftSample(PathTraceRasterFirstVertex destination, uint
         uint blockerPrimitive;
         float blockerFraction;
         float blockerEdge;
+        RESTIR_PT_SHIFT_COUNT(RestirPtCountShiftWork(3u, 1u));
+        RESTIR_PT_SHIFT_COUNT(RestirPtCount(RESTIR_PT_COUNTER_SHARC + 12u, neeAtVertex ? 1u : 0u));
 
         if(!RestirPtReconnectionVisible(position, surface.geometricNormal, vertexPosition, rc.instance, rc.primitive,
             blockerInstance, blockerPrimitive, blockerFraction, blockerEdge))
@@ -4206,6 +4375,14 @@ bool RestirPtShiftNeedsReplay(uint pathFlags)
     {
         return false;
     }
+
+#if defined(RESTIR_PT_SHARC)
+    // SHARC cache endings are never shifted, so they are not deferred to the replay dispatch either.
+    if((pathFlags & RESTIR_PT_PATH_CACHE) != 0u)
+    {
+        return false;
+    }
+#endif
 
     return (rcIndex == 0u ? pathLength - 1u : rcIndex - 1u) > 1u;
 }
@@ -6002,6 +6179,7 @@ RestirPtPairRecord RestirPtLoadPair(uint t, uint2 pixel)
 [numthreads(RESTIR_PT_GROUP_SIZE, RESTIR_PT_GROUP_SIZE, 1)]
 void RestirPtTemporalCS(uint3 thread : SV_DispatchThreadID)
 {
+    RESTIR_PT_SHIFT_COUNT(g_restirPtShiftPass = 0u);
     // M5.4 C5: the replay dispatch (restirPtReplayPass 1) takes its pixels from the compacted list, in order.
     const bool compaction = (restirPtFlags & RESTIR_PT_FLAG_REPLAY_COMPACTION) != 0u &&
         restirPtReplayListIndex != 0xFFFFFFFFu;
@@ -6292,6 +6470,7 @@ void RestirPtDuplicationCS(uint3 group : SV_GroupID, uint3 local : SV_GroupThrea
 [numthreads(RESTIR_PT_GROUP_SIZE, RESTIR_PT_GROUP_SIZE, 1)]
 void RestirPtSpatialPairsCS(uint3 thread : SV_DispatchThreadID)
 {
+    RESTIR_PT_SHIFT_COUNT(g_restirPtShiftPass = 1u);
     const uint2 pixel = thread.xy;
     const bool active = all(pixel < resolution);
     // Counters (RESTIR_PT_COUNTER_SPATIAL + n): 0 pairs from surfaces, 1 partner on screen and compatible, 2 with a
@@ -6377,6 +6556,7 @@ groupshared float s_restirPtFireflyAverage;
 [numthreads(RESTIR_PT_GROUP_SIZE, RESTIR_PT_GROUP_SIZE, 1)]
 void RestirPtSpatialResampleCS(uint3 thread : SV_DispatchThreadID, uint3 groupThread : SV_GroupThreadID)
 {
+    RESTIR_PT_SHIFT_COUNT(g_restirPtShiftPass = 2u);
     const uint2 pixel = thread.xy;
     const bool active = all(pixel < resolution);
     // The shading below runs after the (group-uniform) firefly test, so its inputs live at function scope.

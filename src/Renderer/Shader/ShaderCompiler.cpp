@@ -3,6 +3,7 @@
 #include "DxilLibraryCache.h"
 #include "ShaderVariants.h"
 
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
@@ -36,6 +37,30 @@ namespace
         }
 
         return false;
+    }
+
+    // The SHARC radiance cache at x3 in ReSTIR PT: compiled into the ReSTIRPT/ tree (RESTIR_PT_SHARC, with native 16-bit
+    // types for NVIDIA SHARC's packed fp16 data) once the Renderer has found NVIDIA SHARC usable on this device and build
+    // (ShaderCompiler::SetRestirPtSharc, before ReSTIR PT's pipelines are created).
+    std::atomic<bool> g_restirPtSharc{false};
+
+    void AddRestirPtSharcArguments(const std::filesystem::path& shaderPath, std::vector<const wchar_t*>& arguments)
+    {
+        if(!g_restirPtSharc.load(std::memory_order_relaxed))
+        {
+            return;
+        }
+
+        for(const std::filesystem::path& component : shaderPath)
+        {
+            if(component == "ReSTIRPT")
+            {
+                arguments.push_back(L"-enable-16bit-types");
+                arguments.push_back(L"-D");
+                arguments.push_back(L"RESTIR_PT_SHARC=1");
+                return;
+            }
+        }
     }
 
     std::filesystem::path DependencyPath(const wchar_t* path)
@@ -408,6 +433,8 @@ bool ShaderCompiler::Compile(
         arguments.push_back(L"RESTIR_PT_LIST_PROTOTYPE=1");
     }
 
+    AddRestirPtSharcArguments(description.path, arguments);
+
     // Shader variants (ShaderVariants) compile from their generated text instead of a file.
     const std::optional<VariantSource> variant = FindVariantSource(description.path, description.shaderRoot);
 
@@ -541,6 +568,27 @@ bool ShaderCompiler::Compile(
     compileResult->Release();
     source->Release();
 
+    // Diagnostics (SHARC-in-ReSTIR PT investigation, off by default): ENGINE_DXIL_DUMP_DIR=<directory> writes each compiled
+    // ReSTIRPT/ shader's DXIL there as <path>-<entry>.dxil, for offline disassembly (dxc -dumpbin).
+    if(const char* dumpDirectory = std::getenv("ENGINE_DXIL_DUMP_DIR"); dumpDirectory && *dumpDirectory &&
+        std::wstring_view(description.path).find(L"ReSTIRPT") != std::wstring_view::npos)
+    {
+        std::wstring name = std::wstring(description.path) + L"-" + description.entryPoint + L".dxil";
+
+        for(wchar_t& character : name)
+        {
+            if(character == L'/' || character == L'\\' || character == L':')
+            {
+                character = L'_';
+            }
+        }
+
+        std::error_code error;
+        std::filesystem::create_directories(dumpDirectory, error);
+        std::ofstream dump(std::filesystem::path(dumpDirectory) / name, std::ios::binary);
+        dump.write(reinterpret_cast<const char*>(output.bytecode.data()), static_cast<std::streamsize>(output.bytecode.size()));
+    }
+
     // Only a successful compilation is stored, so a failing source is never answered from the cache.
     output.cacheWritten = cache.Store(output.bytecode, dependencies);
 
@@ -639,6 +687,8 @@ bool ShaderCompiler::CompileLibrary(
         arguments.push_back(L"-D");
         arguments.push_back(L"RESTIR_PT_LIST_PROTOTYPE=1");
     }
+
+    AddRestirPtSharcArguments(description.path, arguments);
 
     std::error_code sameDirectoryError;
 
@@ -817,33 +867,9 @@ ShaderLibraryProfile ShaderCompiler::GetLibraryProfile(const std::filesystem::pa
         return ShaderLibraryProfile::Compute66;
     }
 
-    if(fileName == "PathTraceReferencePsrSharcEnergyTrainingSM69.hlsl" ||
-        fileName == "PathTraceReferencePsrSharcEnergyTrainingSERSM69.hlsl" ||
-        fileName == "PathTraceReferencePsrSharcEnergyReferenceSM69.hlsl" ||
-        fileName == "PathTraceReferencePsrSharcEnergyReferenceSERSM69.hlsl" ||
-        fileName == "PathTraceReferencePsrSharcRenderSM69.hlsl" ||
-        fileName == "PathTraceReferencePsrSharcRenderSERSM69.hlsl" ||
-        fileName == "PathTraceReferencePsrSharcRenderRawDiffuseHitDistanceSM69.hlsl" ||
-        fileName == "PathTraceReferencePsrSharcRenderRawDiffuseHitDistanceSERSM69.hlsl" ||
-        fileName == "PathTraceReferencePsrSharcTrainingSM69.hlsl" ||
-        fileName == "PathTraceReferencePsrSharcTrainingSERSM69.hlsl" ||
-        fileName == "PathTraceReferenceSM69.hlsl" || fileName == "PathTraceReferenceSERSM69.hlsl" ||
-        fileName == "PathTraceReferenceRadianceCacheDeferredSM69.hlsl" ||
-        fileName == "PathTraceReferenceRadianceCacheDeferredSERSM69.hlsl" ||
-        fileName == "PathTraceReferenceRadianceCacheDeferredLateSM69.hlsl" ||
-        fileName == "PathTraceReferenceRadianceCacheDeferredLateSERSM69.hlsl" ||
-        fileName == "PathTraceReferenceRadianceCacheQuerySM69.hlsl" ||
-        fileName == "PathTraceReferenceRadianceCacheQuerySERSM69.hlsl" ||
-        fileName == "PathTraceReferenceRadianceCacheTrainingSM69.hlsl" ||
-        fileName == "PathTraceReferenceRadianceCacheTrainingSERSM69.hlsl" ||
-        fileName == "PathTraceReferenceRadianceCacheQueryTerminationSM69.hlsl" ||
-        fileName == "PathTraceReferenceRadianceCacheQueryTerminationSERSM69.hlsl" ||
-        fileName == "PathTraceReferenceRadianceCacheRenderSM69.hlsl" ||
-        fileName == "PathTraceReferenceRadianceCacheRenderSERSM69.hlsl" ||
+    if(fileName == "PathTraceReferenceSM69.hlsl" || fileName == "PathTraceReferenceSERSM69.hlsl" ||
         fileName == "PathTraceReferenceRawDiffuseHitDistanceSM69.hlsl" ||
         fileName == "PathTraceReferenceRawDiffuseHitDistanceSERSM69.hlsl" ||
-        fileName == "PathTraceReferenceRadianceCacheRenderRawDiffuseHitDistanceSM69.hlsl" ||
-        fileName == "PathTraceReferenceRadianceCacheRenderRawDiffuseHitDistanceSERSM69.hlsl" ||
         fileName == "PathTraceReferencePsrSM69.hlsl" || fileName == "PathTraceReferencePsrSERSM69.hlsl" ||
         fileName == "PathTraceReferencePsrGBufferSM69.hlsl" || fileName == "PathTraceReferencePsrGBufferSERSM69.hlsl" ||
         fileName == "PathTraceReferenceRawDiffuseHitDistancePsrGBufferSM69.hlsl" ||
@@ -859,6 +885,11 @@ ShaderLibraryProfile ShaderCompiler::GetLibraryProfile(const std::filesystem::pa
     }
 
     return ShaderLibraryProfile::Library66;
+}
+
+void ShaderCompiler::SetRestirPtSharc(bool available)
+{
+    g_restirPtSharc.store(available, std::memory_order_relaxed);
 }
 
 bool ShaderCompiler::UsesNative16BitTypes(const std::filesystem::path& shaderPath)

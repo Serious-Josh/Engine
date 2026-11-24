@@ -67,6 +67,8 @@ PathTraceSharcNvPath PathTraceSharcNvBegin(PathTraceRasterFirstVertex rasterFirs
 #ifdef PATH_TRACE_SHARC_NV_TRAINING
 // The update library's path depth replaces maxPathDepth in the loop.
 #define PATH_TRACE_SHARC_NV_MAX_DEPTH sharcNv.trainingMaxDepth
+// Whether the loop's indirect clamp applies to this training path's deposits and misses (SHARC_NV_FLAG_UNCLAMPED_DEPOSITS).
+#define PATH_TRACE_SHARC_NV_CLAMPS ((sharcNv.flags & SHARC_NV_FLAG_UNCLAMPED_DEPOSITS) == 0u)
 
 // The miss of the ray leaving the latest vertex: its (MIS-weighted, clamped) radiance propagates to the stored vertices.
 void PathTraceSharcNvMiss(PathTraceSharcNvPath path, float3 missRadiance)
@@ -150,6 +152,7 @@ bool PathTraceSharcNvTrainingPixel(uint thread, out uint2 pixel)
 #else
 #define PATH_TRACE_SHARC_NV_MAX_DEPTH maxPathDepth
 #define PATH_TRACE_SHARC_NV_SHADES(vertex) true
+#define PATH_TRACE_SHARC_NV_CLAMPS true
 
 void PathTraceSharcNvMiss(PathTraceSharcNvPath path, float3 missRadiance)
 {

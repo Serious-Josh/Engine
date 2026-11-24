@@ -5,6 +5,8 @@
 #include "Scene/PhotometricUnits.h"
 #include "Scene/SceneLighting.h"
 
+#include <array>
+#include <cstddef>
 #include <string>
 #include <vector>
 
@@ -38,3 +40,32 @@ bool BuildFrameLighting(const DirectionalLight& legacySun, const SceneLightingSn
 
 // Only local lights affect this key. Additional Directionals retain direct-only semantics.
 bool SameLocalLightInputs(const SceneLightTable& left, const SceneLightTable& right);
+
+// Discrete lighting changes a radiance cache cannot follow by accumulation (SHARC_ReSTIR_PT_Investigation.md §9.5): its
+// cached multi-bounce light feeds back into itself, so after a sudden change it lags for tens of frames. Continuous
+// changes (a moving light, a slowly turning sun, a gently animated intensity) stay below the thresholds and are left
+// to the cache's accumulation window.
+struct LightingDiscontinuities
+{
+    // A world-space sphere (centre xyz, radius w) whose cached radiance no longer holds.
+    using Region = std::array<float, 4>;
+
+    // The sun, an additional Directional or the whole table changed: everything cached is stale.
+    bool global = false;
+    std::vector<Region> regions;
+
+    bool Empty() const
+    {
+        return !global && regions.empty();
+    }
+};
+
+// Compares one frame's lighting with the previous frame's. Local lights are matched by tableLightIDs (by table index when
+// the IDs are not unique). A local light is a discontinuity when it appears or disappears, when its emitted radiance
+// changes by more than `relativeThreshold` in any channel (switched on or off, an intensity or colour jump), when its
+// range or cone changes as much, or when it jumps more than half its range or turns by more than 30 degrees in one
+// frame; its region is its influence sphere before and after. The sun or a table Directional changing radiance by more
+// than the threshold, or turning by more than `directionalDegrees`, is global, as is a light without a finite range.
+// More than maxRegions regions also become global.
+LightingDiscontinuities DetectLightingDiscontinuities(const FrameLighting& previous, const FrameLighting& current,
+    float relativeThreshold = 0.2f, float directionalDegrees = 5.0f, std::size_t maxRegions = 64);

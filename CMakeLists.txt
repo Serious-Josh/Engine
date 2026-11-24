@@ -404,7 +404,6 @@ add_library(EngineCore OBJECT
     src/Renderer/Passes/PathTraceSpatialPass.cpp
     src/Renderer/Passes/PathTraceTemporalPass.cpp
     src/Renderer/Passes/ReSTIRPTPass.cpp
-    src/Renderer/RadianceCache/RadianceCache.cpp
     src/Renderer/Sharc/SharcCache.cpp
     src/Renderer/PreviousGBufferHistory.cpp
     src/Renderer/Rtxdi/RtxdiLightBridge.cpp

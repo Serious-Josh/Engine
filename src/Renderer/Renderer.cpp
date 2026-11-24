@@ -3465,6 +3465,9 @@ bool Renderer::Initialize(
 
         m_restirPtUiRegirList = m_restirPtSettings.regirListPrototype;
         m_debugUI.SetRestirPtRegirList(m_restirPtUiRegirList, listAvailable);
+        // The SHARC radiance cache's switch: offered once ReSTIR PT has found NVIDIA SHARC usable (EnsureReSTIRPT).
+        m_restirPtUiSharc = m_restirPtSettings.sharc;
+        m_debugUI.SetRestirPtSharc(m_restirPtUiSharc, false);
         m_restirPtUiRegirWindow = m_restirPtSettings.regirWindow;
         m_restirPtUiRegirSpatialPairs = m_restirPtSettings.regirSpatialPairs;
         m_debugUI.SetRestirPtRegirWindow(m_restirPtUiRegirWindow);
@@ -7039,12 +7042,6 @@ bool Renderer::RecordPsrInPlaceReplacement(ID3D12GraphicsCommandList* commandLis
         lighting.padding[0] = m_pathTraceReferencePass.PsrProbeUAVIndex();
         // Multibounce PSR: the motion target, whose w holds each replaced pixel's chain length (PsrK2/ libraries only).
         lighting.padding[2] = m_gBuffer.GetMotion().GetSRVIndex();
-#ifndef NDEBUG
-        if(m_psrSharcEnergyReferenceForTesting)
-        {
-            lighting.padding[2] = m_psrSharcEnergyReferenceForTesting->GetUAVDescriptorIndex();
-        }
-#endif
         lighting.SetTextureMipBias(constants.textureMipBias);
         m_psrGBufferConstantsAddress = m_uploadBuffer.Allocate(&lighting, sizeof(lighting),
             D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
@@ -7396,6 +7393,17 @@ void Renderer::RecordReSTIRPTFrame(ID3D12GraphicsCommandList* commandList, unsig
         m_restirPtSettings.regirSpotTarget = spotTarget;
     }
 
+    if(const bool sharc = m_debugUI.GetRestirPtSharc(); sharc != m_restirPtUiSharc)
+    {
+        // The SHARC radiance cache's switch drops ReSTIR PT's reservoirs (they hold cache endings), RR's history and the
+        // accumulation, like the sampler switch below; the cache itself is released while off.
+        m_restirPtUiSharc = sharc;
+        m_restirPtSettings.sharc = sharc;
+        m_restirPtPass.InvalidateHistory();
+        m_upscalerHistoryResetPending = true;
+        m_pathTraceResetPending = true;
+    }
+
     if(const bool list = m_debugUI.GetRestirPtRegirList(); list != m_restirPtUiRegirList)
     {
         // Switching samplers drops ReSTIR PT's reservoirs, RR's history (InReset) and the accumulation, so a comparison
@@ -7583,6 +7591,21 @@ void Renderer::RecordReSTIRPTFrame(ID3D12GraphicsCommandList* commandList, unsig
     }();
     constants.regirPadding[0] = (regirExact ? 1u : 0u) | (pncLog ? 2u : 0u) |
         (ReGIRListPrototype() && m_restirPtSettings.regirListPrototype ? 4u | listModeBits : 0u);
+
+    // The SHARC radiance cache: this frame's, resolved before configuration B's kernels (sharcCapacity 0: none).
+    if(m_restirPtSharcConstants)
+    {
+        const SharcCache::Constants& sharc = *m_restirPtSharcConstants;
+        constants.sharcHashEntriesIndex = sharc.hashEntriesIndex;
+        constants.sharcAccumulationIndex = sharc.accumulationIndex;
+        constants.sharcResolvedIndex = sharc.resolvedIndex;
+        constants.sharcCapacity = sharc.capacity;
+        constants.sharcCameraPosition[0] = sharc.cameraPosition[0];
+        constants.sharcCameraPosition[1] = sharc.cameraPosition[1];
+        constants.sharcCameraPosition[2] = sharc.cameraPosition[2];
+        constants.sharcSceneScale = sharc.sceneScale;
+        constants.sharcRadianceScale = sharc.radianceScale;
+    }
     // M5.6 B4 cost attribution (diagnostic only, biased): ENGINE_RESTIR_PT_DIAG_SKIP_DISTANT = 1 sun NEE, 2 environment NEE,
     // 3 both skipped (timing comparisons only; never a rendering mode).
     static const std::uint32_t skipDistant = []
@@ -7881,6 +7904,10 @@ bool Renderer::EnsureReSTIRPT()
 
     // Creation only: no GPU work is recorded, so creating during recording is safe.
     TransitionTiming::Scope er1Scope("EnsureReSTIRPT");
+    // The SHARC radiance cache at x3 is compiled into the kernels exactly when NVIDIA SHARC is usable here.
+    const bool sharcAvailable = NvidiaSharcCapabilityFailure().empty();
+    ShaderCompiler::SetRestirPtSharc(sharcAvailable);
+    m_debugUI.SetRestirPtSharc(m_restirPtSettings.sharc, sharcAvailable);
     return m_restirPtPass.Initialize(m_graphicsDevice.GetDevice(), m_shaderLibrary, m_resourceDescriptorHeap,
         m_resourceUploader, m_restirPtSettings);
 }
@@ -8209,7 +8236,7 @@ bool Renderer::SameSceneLightingInputs(const SceneLightingInputs& left, const Sc
 void Renderer::LatchSceneLighting(const PathTraceAccumulationKey& key)
 {
     const SceneLightingInputs inputs = MakeSceneLightingInputs(key, m_rayTracingScene.m_materialBindingEpoch,
-        m_pathTraceReferencePass.GetLibraryVariant(), m_radianceCacheConfiguration);
+        m_pathTraceReferencePass.GetLibraryVariant(), RadianceCacheConfigurationIdentity{});
     const bool changed = !m_sceneLightingInputs || !SameSceneLightingInputs(*m_sceneLightingInputs, inputs);
     const bool usable = key.sceneResourceLifetime != 0 && m_sceneResourceScene != nullptr;
     m_sceneLightingEpoch.Latch(changed, usable);
@@ -8224,35 +8251,6 @@ void Renderer::InvalidateSceneLighting(SceneLightingInvalidation reason) noexcep
 const SceneLightingEpoch::Status& Renderer::GetSceneLightingEpoch() const noexcept
 {
     return m_sceneLightingEpoch.GetStatus();
-}
-
-void Renderer::UpdateRadianceCacheD6(bool enabled)
-{
-    TransitionTiming::Scope er1Scope("UpdateRadianceCacheD6", 0.5);
-    // A generation recorded by an earlier, unsubmitted recording never ran.
-    m_radianceCacheD6.BeginRecording();
-    m_radianceCacheD6.ReleaseRetired(m_commandContext.GetCompletedFenceValue());
-    const std::uint64_t lastSubmissionFence = m_commandContext.GetLastSubmissionFenceValue();
-
-    // PS.5D: packaged games allocate the cache too; it is SHARC's (and the experimental D6 cache's) only storage.
-    if(!enabled)
-    {
-        m_radianceCacheD6.Retire(lastSubmissionFence);
-        m_radianceCacheD6Failed = false;
-    }
-    else if(!m_radianceCacheD6Failed)
-    {
-        const bool failForTesting = std::exchange(m_radianceCacheD6FailAllocationForTesting, false);
-
-        if(!m_radianceCacheD6.EnsureResources(m_graphicsDevice.GetDevice(), m_resourceUploader, m_shaderLibrary,
-            m_resourceDescriptorHeap, m_radianceCacheD6Settings, lastSubmissionFence, failForTesting))
-        {
-            m_radianceCacheD6Failed = true;
-        }
-    }
-
-    // A change of identity (allocation, reconfiguration, release) is a scene-lighting input change.
-    m_radianceCacheConfiguration = m_radianceCacheD6.GetIdentity();
 }
 
 const std::string& Renderer::NvidiaSharcCapabilityFailure()
@@ -8347,6 +8345,42 @@ void Renderer::ApplyNvidiaSharcValidity(const PathTraceAccumulationKey& key)
     m_sharcNvidiaSemantics = semantics;
 }
 
+void Renderer::ApplySharcLightingDiscontinuities(const FrameLighting& lighting)
+{
+    if(m_sharcPreviousLighting)
+    {
+        const FrameLighting& previous = *m_sharcPreviousLighting;
+        const auto same = [](const Vector3& left, const Vector3& right)
+        {
+            return left.x == right.x && left.y == right.y && left.z == right.z;
+        };
+        const bool unchanged = same(previous.sun.direction, lighting.sun.direction) &&
+            previous.sun.intensity == lighting.sun.intensity && same(previous.sun.color, lighting.sun.color) &&
+            previous.table == lighting.table && previous.tableLightIDs == lighting.tableLightIDs;
+
+        if(unchanged)
+        {
+            return;
+        }
+
+        const LightingDiscontinuities changes = DetectLightingDiscontinuities(previous, lighting);
+
+        if(changes.global)
+        {
+            m_sharcNvidia.RequestClear();
+        }
+        else
+        {
+            m_sharcNvidia.RequestInvalidation(changes.regions);
+        }
+
+        *m_sharcPreviousLighting = lighting;
+        return;
+    }
+
+    m_sharcPreviousLighting = std::make_shared<FrameLighting>(lighting);
+}
+
 SharcCache::Constants Renderer::MakeNvidiaSharcConstants(const Vector3& cameraPosition,
     const PathTraceReferenceSettings& settings)
 {
@@ -8386,53 +8420,6 @@ SharcCache::Constants Renderer::MakeNvidiaSharcConstants(const Vector3& cameraPo
     return constants;
 }
 
-D3D12_GPU_VIRTUAL_ADDRESS Renderer::PrepareRadianceCacheLearning(ID3D12GraphicsCommandList* commandList,
-    std::uint32_t samplesPerFrame)
-{
-    TransitionTiming::Scope er1Scope("PrepareRadianceCacheLearning", 0.5);
-    std::string failure;
-    const RadianceCacheD6::Insertion insertion = m_radianceCacheD6.GetInsertion();
-    const bool sparse = insertion == RadianceCacheD6::Insertion::Sparse;
-    m_radianceCacheLearningLibrary = sparse ? PathTraceRadianceCacheLibrary::Training : m_radianceCacheDeferredLibrary;
-
-    // SHARC.4D-R: sparse training with no tile size trains nothing this frame.
-    if(sparse && m_radianceCacheD6.GetTrainingTile() == 0)
-    {
-        return 0;
-    }
-
-    if(!m_pathTraceReferencePass.EnsureRadianceCacheLearning(m_graphicsDevice, m_shaderLibrary, failure,
-        m_radianceCacheLearningLibrary))
-    {
-        if(!m_radianceCacheLearningFailureLogged)
-        {
-            Log::Error("D6 radiance cache learning is unavailable; the reference path tracer is unaffected: " + failure);
-            m_radianceCacheLearningFailureLogged = true;
-        }
-
-        return 0;
-    }
-
-    // SHARC.4D-Q: one record per path of the dispatch. Without room for them the frame renders without learning.
-    // SHARC.4D-R: a sparse training dispatch's paths are its threads' (one per tile).
-    const std::uint64_t paths = sparse ? m_radianceCacheD6.TrainingThreads(m_sceneWidth, m_sceneHeight) :
-        static_cast<std::uint64_t>(m_sceneWidth) * m_sceneHeight;
-    // SHARC.6A: with the history prior, each training path also stores a primary-class record after the x1 records.
-    const bool primaryRecords = sparse && m_radianceCacheD6.UsesHistoryPrior();
-    const std::uint64_t recordCount = paths * samplesPerFrame * (primaryRecords ? 2u : 1u);
-    m_radianceCacheD6.SetPrimaryRecordOffset(primaryRecords ? static_cast<std::uint32_t>(paths * samplesPerFrame) : 0u);
-
-    if(!m_radianceCacheD6.EnsureRecords(m_graphicsDevice.GetDevice(), m_shaderLibrary,
-        m_resourceDescriptorHeap, recordCount, m_commandContext.GetLastSubmissionFenceValue(),
-        std::exchange(m_radianceCacheRecordsFailAllocationForTesting, false)))
-    {
-        return 0;
-    }
-
-    return m_radianceCacheD6.RecordLearningBegin(commandList, m_uploadBuffer, m_sceneLightingEpoch.GetStatus(),
-        recordCount, sparse ? m_radianceCacheD6.TrainingTilesX(m_sceneWidth) : 0);
-}
-
 PathTraceRadianceCacheLibrary Renderer::SharcRenderLibrary(bool extract, bool splitReSTIRDI,
     bool rawDiffuseHitDistance)
 {
@@ -8457,18 +8444,6 @@ PathTraceRadianceCacheLibrary Renderer::SharcRenderLibrary(bool extract, bool sp
     return extract ? PathTraceRadianceCacheLibrary::RenderExtraction : PathTraceRadianceCacheLibrary::Render;
 }
 
-PathTraceRadianceCacheLibrary Renderer::RadianceCacheQueryLibrary(bool extract, bool splitReSTIRDI,
-    bool rawDiffuseHitDistance) const
-{
-    if(m_radianceCacheD6.UsesQueryRenderLibrary())
-    {
-        return SharcRenderLibrary(extract, splitReSTIRDI, rawDiffuseHitDistance);
-    }
-
-    return m_radianceCacheD6.UsesQueryTerminationLibrary() ? PathTraceRadianceCacheLibrary::QueryTermination :
-        PathTraceRadianceCacheLibrary::Query;
-}
-
 void Renderer::ApplySharcSettings(const SharcSettings& requested, bool rasterPrimary)
 {
     TransitionTiming::Scope er1Scope("ApplySharcSettings", 0.5);
@@ -8477,21 +8452,11 @@ void Renderer::ApplySharcSettings(const SharcSettings& requested, bool rasterPri
     settings.trainingTile = requested.trainingTile == 8 ? 8u : 5u;
     const SharcSettings previous = std::exchange(m_sharcSettings, settings);
 
-    // A different estimator (on/off, threshold) or a reset cache restarts accumulation; density, freezing and the
-    // statistics do not change what a path estimates.
-    const bool estimatorChanged = settings.minimumSamples != previous.minimumSamples ||
-        settings.resetRequest != previous.resetRequest || settings.adaptiveResolution != previous.adaptiveResolution ||
-        settings.historyPrior != previous.historyPrior || settings.implementation != previous.implementation ||
+    // A different estimator (on/off, feedback, capacity, scale) or a reset cache restarts accumulation; density, freezing
+    // and the statistics do not change what a path estimates.
+    const bool estimatorChanged = settings.resetRequest != previous.resetRequest ||
         settings.nvidiaCacheFeedback != previous.nvidiaCacheFeedback ||
         settings.nvidiaCapacityLog2 != previous.nvidiaCapacityLog2 || settings.nvidiaSceneScale != previous.nvidiaSceneScale;
-
-    // SHARC.5F: the mapping is part of the cache's settings and identity, so a switch reallocates and clears it and no
-    // entry is read under the other mapping. Only SHARC selects it: a cache kept without SHARC (diagnostics) keeps its
-    // mapping, so leaving SHARC does not rebuild it, and diagnostics that never enable SHARC keep the uniform grid.
-    if(settings.enabled)
-    {
-        m_radianceCacheD6Settings.adaptive = settings.adaptiveResolution;
-    }
 
     if(settings.enabled != previous.enabled || (settings.enabled && estimatorChanged))
     {
@@ -8504,34 +8469,14 @@ void Renderer::ApplySharcSettings(const SharcSettings& requested, bool rasterPri
         m_nrdHybridHistoryValid = false;
     }
 
-    RadianceCacheD6& cache = m_radianceCacheD6;
-
     if(!settings.enabled)
     {
-        // Diagnostics drive the cache directly; only leaving SHARC restores the defaults.
-        if(previous.enabled)
-        {
-            cache.SetQueryRender(false, 0.0f, false);
-            cache.SetQuery(false, 0);
-            cache.SetTrainingTile(5);
-            cache.SetInsertion(RadianceCacheD6::Insertion::Sparse);
-            cache.SetHistoryPrior(false);
-        }
-
         m_sharcStatus = {};
         return;
     }
 
-    // Sparse training (none while frozen), and the render library substituting at the threshold.
-    cache.SetInsertion(RadianceCacheD6::Insertion::Sparse);
-    cache.SetTrainingTile(settings.freezeTraining ? 0u : settings.trainingTile);
-    cache.SetQuery(true, m_sharcDiagnosticQueryMode != 0 ? m_sharcDiagnosticQueryMode : 1u);
-    cache.SetQueryRender(true, static_cast<float>(settings.minimumSamples), settings.statistics);
-    cache.SetHistoryPrior(settings.historyPrior);
-
     if(settings.resetRequest != previous.resetRequest)
     {
-        cache.RequestClear();
         m_sharcNvidia.RequestClear();
     }
 }
@@ -9407,98 +9352,21 @@ void Renderer::ApplyPathTraceDenoiserStages(const PathTraceDenoiserStages& stage
 
 void Renderer::UpdateSharcStatus(unsigned int frameSlot)
 {
-    m_sharcStatus.implementation = m_sharcSettings.implementation;
-
-    if(m_sharcSettings.implementation == SharcImplementation::Nvidia)
-    {
-        m_sharcStatus.active = NvidiaSharcSelected() && m_sharcNvidia.HasResources() && m_sharcRenderedLastFrame;
-        m_sharcStatus.trainedFrames = m_sharcNvidia.GetResolvedFrames();
-        m_sharcStatus.cacheBytes = m_sharcNvidia.HasResources() ? SharcCache::ResourceBytes(m_sharcNvidia.GetSettings()) : 0;
-        std::uint32_t words[SharcCache::StatisticWords]{};
-        m_sharcStatus.statisticsValid = m_sharcStatus.active && m_sharcSettings.statistics &&
-            m_sharcNvidia.ReadStatistics(frameSlot, words);
-
-        if(m_sharcStatus.statisticsValid)
-        {
-            std::copy(std::begin(words), std::end(words), std::begin(m_sharcStatus.nvidiaStatistics));
-            m_sharcStatus.eligibleQueries = words[SharcCache::StatisticQueryReached];
-            m_sharcStatus.lookupHits = words[SharcCache::StatisticQueryHit];
-            m_sharcStatus.substitutions = words[SharcCache::StatisticQueryHit];
-            m_sharcStatus.occupiedEntries = words[SharcCache::StatisticResolvedOccupied];
-        }
-
-        return;
-    }
-
-    // PS.5D: a cache that cannot learn is not active either (RecordRenderFrame reports why).
-    m_sharcStatus.active = m_sharcSettings.enabled && m_radianceCacheD6.HasResources() && m_sharcRenderedLastFrame &&
-        !m_radianceCacheD6.IsLearningUnavailable();
-    m_sharcStatus.trainedFrames = m_radianceCacheD6.GetTrainedFrames();
-    m_sharcStatus.cacheBytes = 0;
-
-    if(m_radianceCacheD6.HasResources())
-    {
-        m_sharcStatus.cacheBytes = RadianceCacheD6::ResourceBytes(m_radianceCacheD6Settings) +
-            m_radianceCacheD6.GetRecordBufferBytes();
-    }
-
-    std::uint32_t words[RadianceCacheD6::ReadbackWords]{};
+    m_sharcStatus.active = NvidiaSharcSelected() && m_sharcNvidia.HasResources() && m_sharcRenderedLastFrame;
+    m_sharcStatus.trainedFrames = m_sharcNvidia.GetResolvedFrames();
+    m_sharcStatus.cacheBytes = m_sharcNvidia.HasResources() ? SharcCache::ResourceBytes(m_sharcNvidia.GetSettings()) : 0;
+    std::uint32_t words[SharcCache::StatisticWords]{};
     m_sharcStatus.statisticsValid = m_sharcStatus.active && m_sharcSettings.statistics &&
-        m_radianceCacheD6.ReadStatistics(frameSlot, words);
+        m_sharcNvidia.ReadStatistics(frameSlot, words);
 
     if(m_sharcStatus.statisticsValid)
     {
-        m_sharcStatus.eligibleQueries = words[RadianceCacheD6::QueryEligible];
-        m_sharcStatus.lookupHits = words[RadianceCacheD6::QueryFound];
-        m_sharcStatus.substitutions = words[RadianceCacheD6::QueryTerminated];
-        m_sharcStatus.occupiedEntries = words[RadianceCacheD6::QueryWords + RadianceCacheD6::StatisticOccupied];
+        std::copy(std::begin(words), std::end(words), std::begin(m_sharcStatus.nvidiaStatistics));
+        m_sharcStatus.eligibleQueries = words[SharcCache::StatisticQueryReached];
+        m_sharcStatus.lookupHits = words[SharcCache::StatisticQueryHit];
+        m_sharcStatus.substitutions = words[SharcCache::StatisticQueryHit];
+        m_sharcStatus.occupiedEntries = words[SharcCache::StatisticResolvedOccupied];
     }
-}
-
-D3D12_GPU_VIRTUAL_ADDRESS Renderer::PrepareRadianceCacheQuery(ID3D12GraphicsCommandList* commandList, bool extract,
-    bool splitReSTIRDI, bool rawDiffuseHitDistance)
-{
-    TransitionTiming::Scope er1Scope("PrepareRadianceCacheQuery", 0.5);
-    std::string failure;
-
-    if(!m_radianceCacheD6.UsesQueryLibrary() || !m_pathTraceReferencePass.EnsureRadianceCacheLearning(m_graphicsDevice,
-        m_shaderLibrary, failure, RadianceCacheQueryLibrary(extract, splitReSTIRDI, rawDiffuseHitDistance)))
-    {
-        return 0;
-    }
-
-    if(m_radianceCacheD6.QueryCounts() &&
-        !m_radianceCacheD6.EnsureQueryStatistics(m_graphicsDevice.GetDevice(), m_resourceDescriptorHeap))
-    {
-        return 0;
-    }
-
-    // SHARC.6A: extraction frames with the history prior write it for the temporal pass.
-    Texture* prior = nullptr;
-
-    if(extract && m_pathTraceTemporal && m_radianceCacheD6.UsesHistoryPrior())
-    {
-        prior = m_pathTraceReferencePass.EnsureHistoryPriorTexture(m_graphicsDevice.GetDevice(),
-            m_resourceDescriptorHeap);
-    }
-
-    if(prior && m_radianceCacheD6.QueryCounts())
-    {
-        m_radianceCacheD6.EnsurePriorCounters(m_graphicsDevice.GetDevice(), m_resourceDescriptorHeap);
-    }
-
-    if(prior)
-    {
-        prior->Transition(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    }
-
-    m_radianceCacheD6.SetHistoryPriorOutput(prior ? prior->GetUAVIndex() : 0u);
-    const D3D12_GPU_VIRTUAL_ADDRESS address =
-        m_radianceCacheD6.RecordQueryBegin(commandList, m_uploadBuffer, m_sceneLightingEpoch.GetStatus());
-    m_sharcHistoryPriorWritten = prior && address != 0;
-    m_sharcHistoryPriorBinding = m_sharcHistoryPriorWritten ? address : 0;
-    m_radianceCacheD6.SetHistoryPriorOutput(0u);
-    return address;
 }
 
 bool Renderer::RecordPathTraceReference(
@@ -9543,16 +9411,6 @@ bool Renderer::RecordPathTraceReference(
     // SHARC.4B: this frame's material table, TLAS update and environment are recorded by now.
     LatchSceneLighting(key);
     ApplyNvidiaSharcValidity(key);
-
-    // SHARC.4C: the D6 cache's generation for the latched epoch, ahead of any cache access in this list.
-    m_radianceCacheLearnedLastFrame = false;
-
-    if(m_radianceCacheD6.HasResources())
-    {
-        m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::RadianceCacheGeneration);
-        m_radianceCacheD6.RecordGeneration(commandList, m_uploadBuffer, m_sceneLightingEpoch.GetStatus());
-        m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::RadianceCacheGeneration);
-    }
 
     const bool keyChanged = !m_pathTraceAccumulationKey || !SamePathTraceAccumulationKey(*m_pathTraceAccumulationKey, key);
 
@@ -9800,7 +9658,7 @@ bool Renderer::RecordPathTraceReference(
         // PSR.1 runs on the plain Raster Primary only (Stage 3 retired its ReSTIR DI pair, PSR.1c-A, with the DXR direct
         // pass). PSR.2 lighting takes precedence and skips PSR.1's records.
         if(settings.primarySurfaceReplacement && m_psrGBufferConstantsAddress == 0 && primary == PathTracePrimary::Raster &&
-            !extract && !m_radianceCacheD6.IsUsable() && m_primarySurfaceReplacementPossible)
+            !extract && m_primarySurfaceReplacementPossible)
         {
             std::string replacementFailure;
             const unsigned int recordIndex = m_pathTraceReferencePass.EnsurePrimarySurfaceReplacement(m_graphicsDevice,
@@ -9901,44 +9759,9 @@ bool Renderer::RecordPathTraceReference(
             m_gBuffer.GetMotion().Transition(commandList, shaderReadState);
         }
 
-        // SHARC.4D learning: a usable cache's Raster Primary frames without extraction trace through the cache
-        // library, which renders the same image and inserts D6 training samples. Every other frame is unchanged.
-        // SHARC.4D-R (diagnostics): with sparse training the image renders with the reference library, or the query
-        // library, and a separate training dispatch follows it. SHARC.4E.1: sparse training does not touch the image's
-        // dispatch, so it also runs on the denoiser's extraction frames (the render library's extraction export).
-        D3D12_GPU_VIRTUAL_ADDRESS radianceCacheAddress = 0;
+        // SHARC: the image renders with the reference library unless NVIDIA SHARC supplies a render binding below.
         D3D12_GPU_VIRTUAL_ADDRESS renderCacheAddress = 0;
-        m_sharcHistoryPriorWritten = false;
         PathTraceRadianceCacheLibrary renderCacheLibrary = PathTraceRadianceCacheLibrary::Render;
-        const bool sparseTraining = m_radianceCacheD6.GetInsertion() == RadianceCacheD6::Insertion::Sparse;
-
-        // SHARC.5B: sparse SHARC also serves ReSTIR DI frames, through the indirect pass (the direct pass is unchanged).
-        const bool cachePrimary = primary == PathTracePrimary::Raster ||
-            (sparseTraining && primary == PathTracePrimary::RasterReSTIRDI);
-
-        if(m_radianceCacheD6.IsUsable() && cachePrimary && (!extract || sparseTraining))
-        {
-            m_radianceCacheD6.SetSpatialAnchor(cameraPosition.x, cameraPosition.y, cameraPosition.z);
-            radianceCacheAddress = PrepareRadianceCacheLearning(commandList, settings.samplesPerFrame);
-
-            if(!sparseTraining)
-            {
-                renderCacheAddress = radianceCacheAddress;
-                renderCacheLibrary = m_radianceCacheLearningLibrary;
-            }
-            else
-            {
-                // Without a query binding (0) the reference pipeline renders.
-                renderCacheAddress = PrepareRadianceCacheQuery(commandList, extract, splitReSTIRDI, rawExtraction);
-                renderCacheLibrary = RadianceCacheQueryLibrary(extract, splitReSTIRDI, rawExtraction);
-                // PSR.2 lighting with SHARC is only granted through the combined preparation below: its replaced
-                // pixels need the combined library's physical decoder (B traced, never substituted).
-                if(m_psrLightingThisFrame && renderCacheAddress != 0)
-                    renderCacheLibrary = !extract ? PathTraceRadianceCacheLibrary::PsrRenderSplitIndirect :
-                        rawExtraction ? PathTraceRadianceCacheLibrary::PsrRenderSplitIndirectExtractionRawDiffuseHitDistance :
-                        PathTraceRadianceCacheLibrary::PsrRenderSplitIndirectExtraction;
-            }
-        }
 
         // NVIDIA SHARC: [clear] -> update (sparse training) -> resolve -> the image querying the cache, all in this list and
         // ordered by UAV barriers, so the image reads this frame's resolve. PSR.2 frames use the PSR libraries, whose
@@ -9948,7 +9771,14 @@ bool Renderer::RecordPathTraceReference(
 
         if(NvidiaSharcSelected() && m_sharcNvidia.HasResources() && nvidiaPrimary && m_sceneLightingEpoch.GetStatus().valid)
         {
-            const SharcCache::Constants sharcConstants = MakeNvidiaSharcConstants(cameraPosition, settings);
+            SharcCache::Constants sharcConstants = MakeNvidiaSharcConstants(cameraPosition, settings);
+
+            // ReSTIR PT's estimator is unclamped, so the training deposits of its radiance cache are too.
+            if(restirPtFrame)
+            {
+                sharcConstants.flags |= SharcCache::FlagUnclampedDeposits;
+            }
+
             PathTraceRadianceCacheLibrary renderLibrary = SharcRenderLibrary(extract, splitReSTIRDI, rawExtraction);
 
             if(m_psrLightingThisFrame)
@@ -9961,9 +9791,11 @@ bool Renderer::RecordPathTraceReference(
             const PathTraceRadianceCacheLibrary trainingLibrary = m_psrLightingThisFrame ?
                 PathTraceRadianceCacheLibrary::PsrTraining : PathTraceRadianceCacheLibrary::Training;
             std::string failure;
+            // ReSTIR PT queries the cache from its own kernels: it needs the update library only.
             const bool pipelines = m_pathTraceReferencePass.EnsureRadianceCacheLearning(m_graphicsDevice, m_shaderLibrary,
-                failure, trainingLibrary) &&
-                m_pathTraceReferencePass.EnsureRadianceCacheLearning(m_graphicsDevice, m_shaderLibrary, failure, renderLibrary);
+                failure, trainingLibrary) && (restirPtFrame ||
+                m_pathTraceReferencePass.EnsureRadianceCacheLearning(m_graphicsDevice, m_shaderLibrary, failure, renderLibrary));
+            ApplySharcLightingDiscontinuities(frameLighting);
             m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::RadianceCacheGeneration);
             const bool usable = pipelines && m_sharcNvidia.RecordFrameBegin(commandList, m_uploadBuffer, sharcConstants);
             m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::RadianceCacheGeneration);
@@ -10008,6 +9840,7 @@ bool Renderer::RecordPathTraceReference(
 
         bool referenceDispatched = false;
         m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::PathTraceReference);
+        m_restirPtSharcConstants = restirPtFrame ? nvidiaSharcFrame : std::nullopt;
 
         if(restirPtFrame)
         {
@@ -10123,39 +9956,6 @@ bool Renderer::RecordPathTraceReference(
 
         m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::PathTraceReference);
 
-        // SHARC.4D: the frame's samples become cache history after the dispatch that inserted them. SHARC.4D-Q: a
-        // deferred learning frame inserts its records first.
-        if(radianceCacheAddress != 0)
-        {
-            if(sparseTraining)
-            {
-                m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex,
-                    GpuTimestampProfiler::Region::RadianceCacheTraining);
-                m_pathTraceReferencePass.ExecuteRadianceCacheTraining(m_commandContext.GetRayTracingCommandList(),
-                    m_resourceDescriptorHeap, m_rayTracingScene, constantsAddress, sceneLightConstantsAddress,
-                    radianceCacheAddress,
-                    static_cast<std::uint32_t>(m_radianceCacheD6.TrainingThreads(m_sceneWidth, m_sceneHeight)),
-                    m_psrLightingLastFrame ? m_psrGBufferConstantsAddress : 0,
-                    m_psrLightingLastFrame ? m_psrGBufferTransformsAddress : 0);
-                m_gpuTimestampProfiler.EndRegion(commandList, frameIndex,
-                    GpuTimestampProfiler::Region::RadianceCacheTraining);
-            }
-
-            if(m_radianceCacheD6.GetLearningBinding().deferred != 0)
-            {
-                m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex,
-                    GpuTimestampProfiler::Region::RadianceCacheInsertion);
-                m_radianceCacheD6.RecordDeferredInsertion(commandList, m_uploadBuffer);
-                m_gpuTimestampProfiler.EndRegion(commandList, frameIndex,
-                    GpuTimestampProfiler::Region::RadianceCacheInsertion);
-            }
-
-            m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::RadianceCacheResolve);
-            m_radianceCacheLearnedLastFrame = m_radianceCacheD6.RecordResolve(commandList, m_uploadBuffer,
-                m_sceneLightingEpoch.GetStatus());
-            m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::RadianceCacheResolve);
-        }
-
         if(nvidiaSharcFrame)
         {
             m_sharcNvidia.RecordStatisticsReadback(commandList, *nvidiaSharcFrame, frameIndex);
@@ -10171,12 +9971,6 @@ bool Renderer::RecordPathTraceReference(
             renderCacheLibrary == PathTraceRadianceCacheLibrary::PsrRenderSplitIndirect ||
             renderCacheLibrary == PathTraceRadianceCacheLibrary::PsrRenderSplitIndirectExtraction ||
             renderCacheLibrary == PathTraceRadianceCacheLibrary::PsrRenderSplitIndirectExtractionRawDiffuseHitDistance);
-
-        // SHARC.4E statistics: this frame's counters, read back when its slot comes round again.
-        if(m_sharcSettings.enabled && m_sharcSettings.statistics && renderCacheAddress != 0)
-        {
-            m_radianceCacheD6.RecordStatisticsReadback(m_graphicsDevice.GetDevice(), commandList, frameIndex);
-        }
 
         if(m_pathTraceSpatialRequested && m_pathTraceTemporalRanLastFrame)
         {
@@ -10400,19 +10194,6 @@ bool Renderer::RecordPathTraceTemporal(
     constants.previousGeometricNormalIndex = havePrevious ? previous.geometricNormalIndex :
         m_gBuffer.GetGeometricNormal().GetSRVIndex();
 
-    // SHARC.6A: this frame's history prior, when its render dispatch wrote one (the transition orders the writes).
-    if(m_sharcHistoryPriorWritten)
-    {
-        Texture& prior = m_pathTraceReferencePass.GetHistoryPriorTexture();
-        prior.Transition(commandList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        constants.priorIndex = prior.GetDescriptorIndex();
-
-        if(m_radianceCacheD6.PriorCountedThisFrame())
-        {
-            constants.priorCountersIndex = m_radianceCacheD6.GetPriorCounters().GetUAVDescriptorIndex();
-        }
-    }
-
     // DENOISE.3B: the extended diffuse history restarts unless this frame continues an unchanged scene and view
     // (accumulation not restarted, temporal history valid, the same valid scene-lighting epoch, the previous frame
     // updated it); it is used only after PathTraceExtendedStableFrames such frames.
@@ -10438,8 +10219,7 @@ bool Renderer::RecordPathTraceTemporal(
         m_pathTraceExtendedFrames = 0;
     }
 
-    m_pathTraceTemporalPass.Execute(commandList, m_uploadBuffer, constants, m_sceneWidth, m_sceneHeight,
-        constants.priorIndex != 0 ? m_sharcHistoryPriorBinding : 0, extended,
+    m_pathTraceTemporalPass.Execute(commandList, m_uploadBuffer, constants, m_sceneWidth, m_sceneHeight, extended,
         psrDenoise ? m_psrDenoiseConstantsAddress : 0, psrDenoise ? m_psrGBufferTransformsAddress : 0);
     return true;
 }
@@ -12837,8 +12617,11 @@ void Renderer::ApplySampledIndirectNee(const FrameLighting& lighting, SceneLight
 {
     m_sampledNeeReport.sampledLastFrame = false;
     m_sampledNeeReport.sampledTrainingLastFrame = false;
+    // ReSTIR PT's SHARC radiance cache trains with the sampled estimator (its update libraries always carry the
+    // permutation); ENGINE_SAMPLED_NEE=1 (M4.2C, experimental) extends sampling to the classic path tracer's paths and SHARC.
+    const bool restirPtSharcTraining = m_restirPtFrameThisFrame && NvidiaSharcSelected();
 
-    if(!m_sampledNeeReport.librariesRequested)
+    if(!m_sampledNeeReport.librariesRequested && !restirPtSharcTraining)
     {
         m_pathTraceReferencePass.SelectSampledNee(false, false);
         return;
@@ -12846,7 +12629,8 @@ void Renderer::ApplySampledIndirectNee(const FrameLighting& lighting, SceneLight
 
     // Sampled only for this frame's own published structures (same table and revision) and above the threshold.
     const bool aboveThreshold = lighting.table.lightCount > m_sampledNeeSettings.threshold;
-    const bool requested = m_sampledNeeSettings.sampled && aboveThreshold && constants.lightCount != 0;
+    const bool requested = m_sampledNeeReport.librariesRequested && m_sampledNeeSettings.sampled && aboveThreshold &&
+        constants.lightCount != 0;
     const bool available = m_lightSamplingReport.available && m_lightSamplingReport.statistics.tableLights == constants.lightCount;
     const bool sampled = requested && available;
 
@@ -13196,15 +12980,22 @@ bool Renderer::RecordRenderFrame(
     const PathTraceDenoiserMode denoiser = GateDenoiserRequest(options.lightingMode,
         rasterPrimaryMode ? options.pathTraceDenoiserMode : PathTraceDenoiserMode::Off);
     SharcSettings sharc = options.sharc;
-    // NVIDIA SHARC Checkpoint A: the selected cache's libraries are the ones SHARC waits for. A switch between caches is a
-    // new request (the other cache's pipelines may still be compiling) and a different estimator.
-    PathTraceRadianceCacheImplementation cacheImplementation = PathTraceRadianceCacheImplementation::EngineD6;
+    // The SHARC radiance cache at x3: configuration B runs NVIDIA SHARC with multi-bounce feedback while ReSTIR PT's cache is
+    // on and paths reach x3, whatever the classic SHARC settings request (their training density, capacity, freezing and
+    // reset still apply).
+    const bool restirPtSharc = options.lightingMode == RendererLightingMode::PathTracedRasterPrimaryReSTIRPT &&
+        m_restirPtSettings.sharc && options.pathTraceReference.maxPathDepth >= 3;
 
-    if(sharc.implementation == SharcImplementation::Nvidia)
+    if(restirPtSharc)
     {
-        cacheImplementation = sharc.nvidiaCacheFeedback ? PathTraceRadianceCacheImplementation::Nvidia :
-            PathTraceRadianceCacheImplementation::NvidiaDepthMatched;
+        sharc.enabled = true;
+        sharc.nvidiaCacheFeedback = true;
     }
+
+    // NVIDIA SHARC Checkpoint A: the selected library set (with or without cache feedback) is the one SHARC waits for. A
+    // switch between sets is a new request (the other set's pipelines may still be compiling) and a different estimator.
+    const PathTraceRadianceCacheImplementation cacheImplementation = sharc.nvidiaCacheFeedback ?
+        PathTraceRadianceCacheImplementation::Nvidia : PathTraceRadianceCacheImplementation::NvidiaDepthMatched;
 
     if(cacheImplementation != m_pathTraceReferencePass.GetRadianceCacheImplementation())
     {
@@ -13221,34 +13012,20 @@ bool Renderer::RecordRenderFrame(
         m_pathTraceReferencePass.SetRadianceCacheImplementation(cacheImplementation);
     }
 
-    const bool sharcRequested = options.sharc.enabled && rasterPrimaryMode;
-    const std::string nvidiaFailure = sharcRequested && sharc.implementation == SharcImplementation::Nvidia ?
-        NvidiaSharcCapabilityFailure() : std::string{};
-    // M5.1: configuration B never runs SHARC.
-    sharc.enabled = nvidiaFailure.empty() && options.lightingMode != RendererLightingMode::PathTracedRasterPrimaryReSTIRPT &&
+    const bool sharcRequested = sharc.enabled && rasterPrimaryMode;
+    const std::string nvidiaFailure = sharcRequested ? NvidiaSharcCapabilityFailure() : std::string{};
+    // M5.1: configuration B runs SHARC only as its radiance cache at x3.
+    sharc.enabled = nvidiaFailure.empty() &&
+        (options.lightingMode != RendererLightingMode::PathTracedRasterPrimaryReSTIRPT || restirPtSharc) &&
         GateSharcRequest(options.lightingMode, denoiser, sharcRequested);
     ApplySharcSettings(sharc, rasterPrimaryMode);
     m_sharcStatus.preparation = nvidiaFailure.empty() ? m_sharcPreparation : "SHARC unavailable: " + nvidiaFailure;
 
-    // PS.5D: cache and learning failures are sticky (UpdateRadianceCacheD6, PrepareRadianceCacheLearning); say so
-    // rather than leave SHARC silently off once its libraries are prepared.
-    if(sharc.enabled && m_sharcStatus.preparation.empty() && sharc.implementation == SharcImplementation::Nvidia)
+    // PS.5D: cache failures are sticky (UpdateNvidiaSharc); say so rather than leave SHARC silently off once its
+    // libraries are prepared.
+    if(sharc.enabled && m_sharcStatus.preparation.empty() && m_sharcNvidiaFailed)
     {
-        if(m_sharcNvidiaFailed)
-        {
-            m_sharcStatus.preparation = "SHARC unavailable: NVIDIA SHARC's pipelines or buffers could not be created.";
-        }
-    }
-    else if(sharc.enabled && m_sharcStatus.preparation.empty())
-    {
-        if(m_radianceCacheD6Failed)
-        {
-            m_sharcStatus.preparation = "SHARC unavailable: its cache pipelines or resources could not be created.";
-        }
-        else if(m_radianceCacheD6.IsLearningUnavailable())
-        {
-            m_sharcStatus.preparation = "SHARC unavailable: its training pipelines or records could not be created.";
-        }
+        m_sharcStatus.preparation = "SHARC unavailable: NVIDIA SHARC's pipelines or buffers could not be created.";
     }
 
     m_debugUI.SetPathTraceDenoiserPreparation(m_denoiserPreparation);
@@ -13270,8 +13047,6 @@ bool Renderer::RecordRenderFrame(
 
     ApplyCameraJitter(options.pathTraceCameraJitter);
     ApplyDlssInputPreparation(options.dlssInputPreparation);
-    UpdateRadianceCacheD6(options.experimentalD6RadianceCache ||
-        (m_sharcSettings.enabled && m_sharcSettings.implementation == SharcImplementation::EngineD6));
     UpdateNvidiaSharc(NvidiaSharcSelected());
     // Keep generation/revision evidence through End, which invalidates active eligibility.
     const auto textureUploadGeneration = m_activeRecordingGeneration;
@@ -13998,7 +13773,7 @@ bool Renderer::RecordRenderFrame(
         {
             psrLightingUnavailable = "requires a supported path-tracing denoiser";
         }
-        else if(m_sharcSettings.enabled || options.experimentalD6RadianceCache)
+        else if(m_sharcSettings.enabled)
         {
             // PSR.2 + SHARC: replaced pixels trace physical B through the combined libraries, ordinary pixels keep
             // SHARC. Every pipeline and resource is prepared before replacement; otherwise PSR lighting waits.
@@ -14006,9 +13781,7 @@ bool Renderer::RecordRenderFrame(
 #ifndef NDEBUG
                 !m_psrSharcPreparationFailureForTesting &&
 #endif
-                m_sharcSettings.enabled &&
-                !options.experimentalD6RadianceCache && options.pathTraceReference.maxPathDepth >= 2u &&
-                (NvidiaSharcSelected() ? m_sharcNvidia.HasResources() : m_radianceCacheD6.HasResources()) &&
+                m_sharcSettings.enabled && options.pathTraceReference.maxPathDepth >= 2u && m_sharcNvidia.HasResources() &&
                 [&]()
                 {
                     const auto submitted = m_commandContext.GetLastSubmissionFenceValue();
@@ -14032,11 +13805,10 @@ bool Renderer::RecordRenderFrame(
                     psrExtraction, psrRawExtraction, failure))
                 m_psrLightingThisFrame = true;
             else
-                psrLightingUnavailable = options.experimentalD6RadianceCache ? "requires the experimental D6 radiance cache off" :
-                    options.pathTraceReference.maxPathDepth < 2u ? "requires PT max path depth 2 or more" :
+                psrLightingUnavailable = options.pathTraceReference.maxPathDepth < 2u ? "requires PT max path depth 2 or more" :
                     !failure.empty() ? failure :
                     // PS.5F: a failed cache is sticky, so PSR's combined path will not become ready; say why.
-                    (NvidiaSharcSelected() ? m_sharcNvidiaFailed : m_radianceCacheD6Failed) ?
+                    m_sharcNvidiaFailed ?
                     "PSR with SHARC needs the SHARC cache, which could not be created" :
                     "PSR + SHARC pipelines are not ready";
         }
@@ -14103,7 +13875,7 @@ bool Renderer::RecordRenderFrame(
     // Diagnostic views must not force a virtual G-buffer into an ordinary cache pipeline
     // after combined preparation failed (or while the development boundary is closed).
     const bool psrInPlace = psrRequested && psrPrepared &&
-        (m_psrLightingThisFrame || (!m_sharcSettings.enabled && !options.experimentalD6RadianceCache &&
+        (m_psrLightingThisFrame || (!m_sharcSettings.enabled &&
             options.psrDebugView != ToneMapDebugView::None));
 
     // M5.5: guide-only PSR marks eligibility too (the identity flag; B's shaders strip it), replacing after lighting.
@@ -15784,7 +15556,6 @@ bool Renderer::RecordRenderFrame(
         m_referenceRayCounts.Invalidate();
         m_debugUI.SetReferenceRayCounts(m_referenceRayCounts.Get());
         m_materialDependencies.MarkUncertain(frameIndex);
-        m_radianceCacheD6.MarkSubmissionUncertain();
         m_sharcNvidia.MarkSubmissionUncertain();
 
         for (auto& entry : m_preparedTextureUploads)
@@ -15876,7 +15647,6 @@ bool Renderer::RecordRenderFrame(
     m_nrdHybridDispatchedThisFrame = false;
     m_rtxdiResources.CommitFrame();
     m_restirPtPass.CommitFrame();
-    m_radianceCacheD6.CommitSubmission();
     m_sharcNvidia.CommitSubmission();
 
     // Capture the successful submission fence now; confirmation retains owners, not completion proof.
@@ -16186,9 +15956,6 @@ void Renderer::Shutdown()
     m_sceneLightingEpoch.Restart();
     m_sceneLightingInputs.reset();
     // After the drain above: nothing can still use the cache or its retired resources.
-    m_radianceCacheD6.Shutdown();
-    m_radianceCacheD6Failed = false;
-    m_radianceCacheConfiguration = {};
     m_sharcNvidia.Shutdown();
     m_sharcNvidiaFailed = false;
     m_sharcNvidiaSemantics.reset();

@@ -40,13 +40,11 @@ class GpuTimestampProfiler
         PathTraceSplitIndirect,
         // RTXPT D.3B spatial filter, after (not inside) PathTraceReference.
         PathTraceSpatial,
-        // SHARC.4D experimental D6 radiance cache: the generation clear (before PathTraceReference) and the resolve
-        // (after it). Its sample insertion runs inside PathTraceReference.
+        // NVIDIA SHARC: the frame begin (clear), the resolve and the sparse training dispatch.
         RadianceCacheGeneration,
         RadianceCacheResolve,
-        // SHARC.4D-Q deferred insertion (CSInsertRecords), after PathTraceReference and before the resolve.
+        // Unused since the D6 cache was removed (its deferred insertion); kept so diagnostic region tables are unchanged.
         RadianceCacheInsertion,
-        // SHARC.4D-R sparse training dispatch, after PathTraceReference and before the insertion.
         RadianceCacheTraining,
         // UPSCALING.2C diagnostic presentation resolve (reduced render scale only), before ToneMap.
         PresentationResolve,

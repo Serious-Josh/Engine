@@ -64,6 +64,9 @@ struct SharcNvConstants
 };
 
 static const uint SHARC_NV_FLAG_STATISTICS = 1u;
+// ReSTIR PT's radiance cache: training deposits and misses skip the path tracer's indirect clamp, so the cache matches
+// ReSTIR PT's unclamped estimator. Set for ReSTIR PT frames only (Renderer).
+static const uint SHARC_NV_FLAG_UNCLAMPED_DEPOSITS = 2u;
 
 // Statistics words (cleared every frame they are recorded).
 static const uint SHARC_NV_STATISTIC_QUERY_REACHED = 0u;
