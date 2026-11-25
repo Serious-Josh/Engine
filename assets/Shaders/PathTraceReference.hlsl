@@ -8,8 +8,14 @@
 // Accumulation: accumulationTexture stores the running mean in RGBA32F. With n previous samples and s new
 // samples, mean' = mean * n / (n + s) + sum / (n + s). n = 0 ignores previous contents entirely.
 
+// Physical sky S5B: table lights through the clouds' moon shadow (SceneLights.hlsli; SceneLightMoonCloudShadow is defined below).
+#define SCENE_LIGHTS_MOON_CLOUD_SHADOW 1
 #include "PathTraceBSDF.hlsli"
 #include "PathTraceLights.hlsli"
+#include "SkyFrame.hlsli"
+// Physical sky S5: RtxdiLights.hlsli shades the sun through the cloud shadow (SkyFrameInfoIndexForLights, defined below).
+#define SKY_FRAME_HAS_INFO_FUNCTION 1
+uint SkyFrameInfoIndexForLights();
 #include "PathTracePrimarySurface.hlsli"
 #include "RayTracingInstanceData.hlsli"
 // PT.2B: who estimates the HDRI at the ReSTIR DI vertex; read by the ReSTIR DI direct pass and by every split indirect pass.
@@ -145,6 +151,14 @@ cbuffer PathTraceConstants : register(b0)
     uint2 referenceRayCountPadding;
 #endif
 #endif
+
+    // Physical sky S3, appended: the published sky-view map for camera rays and delta-mirror misses, or 0xFFFFFFFF.
+    uint skyBackgroundIndex;
+    // S4: 1 when skyBackgroundIndex is an HDRI sky's background equirect, 0 for a sky-view map.
+    uint skyBackgroundEquirect;
+    // S5: the physical sky's frame information (SkyFrame.hlsli), or 0xFFFFFFFF.
+    uint skyFrameInfoIndex;
+    uint skyBackgroundPadding;
 };
 
 cbuffer SceneLightConstants : register(b1)
@@ -366,6 +380,16 @@ PathTraceEnvironment PathTraceFrameEnvironment()
     environment.height = environmentHeight;
     environment.totalWeight = environmentTotalWeight;
     return environment;
+}
+
+uint SkyFrameInfoIndexForLights()
+{
+    return skyFrameInfoIndex;
+}
+
+float SceneLightMoonCloudShadow(float3 surfacePosition)
+{
+    return SkyFrameMoonCloudShadow(skyFrameInfoIndex, surfacePosition);
 }
 
 PathTraceSun PathTraceFrameSun()
@@ -627,7 +651,25 @@ float3 PathTraceMissEnvironmentRadiance(float3 direction, float previousPdf)
     return environmentRadiance * environmentWeight;
 }
 
-float3 PathTraceMissRadiance(float3 direction, bool previousDelta, float previousPdf)
+// Sun disk edge (2026-11-25): the angular size of one camera pixel toward a direction (radians): the pixel at the view axis (two
+// pixel-centre rays through the frame's inverse view-projection, as PathTraceCameraRay builds them), times cos^2 of the direction's
+// angle from the axis, as a pinhole's pixel shrinks off axis. The visible sun disk's edge is filtered over it.
+float PathTraceCameraPixelAngle(float3 direction)
+{
+    const float2 step = 2.0f / float2(resolution);
+    const float4 axisNear = mul(inverseViewProjection, float4(0.0f, 0.0f, 0.0f, 1.0f));
+    const float4 axisFar = mul(inverseViewProjection, float4(0.0f, 0.0f, 1.0f, 1.0f));
+    const float4 nextFar = mul(inverseViewProjection, float4(0.0f, step.y, 1.0f, 1.0f));
+    const float3 origin = axisNear.xyz / axisNear.w;
+    const float3 axis = normalize(axisFar.xyz / axisFar.w - origin);
+    const float3 next = normalize(nextFar.xyz / nextFar.w - origin);
+    const float cosAxis = saturate(dot(normalize(direction), axis));
+    return length(next - axis) * cosAxis * cosAxis;
+}
+
+// S5: origin is the vertex the ray left (world metres): the clouds' shadow on a BSDF-sampled sun. cameraRay: the camera's own ray,
+// whose clouds the full-resolution composite adds; a delta continuation sees the published set's cloud map instead.
+float3 PathTraceMissRadiance(float3 origin, float3 direction, bool previousDelta, float previousPdf, bool cameraRay)
 {
     PathTraceEnvironment environment = PathTraceFrameEnvironment();
     PathTraceSun sun = PathTraceFrameSun();
@@ -637,14 +679,57 @@ float3 PathTraceMissRadiance(float3 direction, bool previousDelta, float previou
 
     if(previousDelta)
     {
-        // Camera rays and delta-mirror continuations: no light-sampling strategy could produce them.
-        return environmentRadiance + sunRadiance;
+        // Camera rays and delta-mirror continuations: no light-sampling strategy could produce them, so they may show the
+        // sharper sky-view map instead of the sampled equirect (Physical sky S3), or an HDRI sky's higher-resolution background
+        // (S4). The disk is shown within the display maximum (Physical sky S2).
+        bool clearSkyView = false;
+
+        if(skyBackgroundIndex != 0xFFFFFFFFu)
+        {
+            if(skyBackgroundEquirect != 0u)
+            {
+                Texture2D<float4> background = ResourceDescriptorHeap[skyBackgroundIndex];
+                environmentRadiance = background.SampleLevel(environmentSampler, DirectionToEquirectangularUV(direction), 0.0f).rgb;
+            }
+            else
+            {
+                environmentRadiance = SampleSkyView(skyBackgroundIndex, direction);
+                clearSkyView = true;
+            }
+        }
+
+        // Physical sky S5: the stars and the moon's disk per pixel. The sky-view map is cloud-free: a delta continuation adds the
+        // published set's clouds over it; the camera's own rays get theirs from the full-resolution composite (never both).
+        // Sun disk edge (2026-11-25): the disk limb-darkened and filtered over the camera pixel's footprint (Common.hlsli's
+        // SunDiskDisplayRadiance), evaluated within a degree of the disk only.
+        // The stars keep footprint 0 here (the samples accumulate, S5B); the moon's disk edge is filtered like the sun's.
+        const float pixelAngle = PathTraceCameraPixelAngle(direction);
+        float3 sunDisk = float3(0.0f, 0.0f, 0.0f);
+
+        if(!PathTraceSunIsDelta(sun) && PathTraceSunHasEnergy(sun) &&
+            dot(direction, sun.directionToSun) >= cos(acos(sun.cosAngularRadius) + 0.0175f))
+        {
+            const float sinSquared = (1.0f - sun.cosAngularRadius) * (1.0f + sun.cosAngularRadius);
+            sunDisk = SunDiskDisplayRadiance(sun.irradiance / (PI * sinSquared), sun.directionToSun, direction, sun.cosAngularRadius,
+                pixelAngle);
+        }
+
+        float3 background = environmentRadiance + sunDisk + SkyFrameNightBackground(skyFrameInfoIndex, direction, 0.0f, pixelAngle);
+
+        if(clearSkyView && !cameraRay)
+        {
+            const float4 clouds = SkyFrameCloudEnvironment(skyFrameInfoIndex, direction);
+            background = background * clouds.a + clouds.rgb;
+        }
+
+        return background;
     }
 
     float environmentWeight = PathTraceEnvironmentSamplingEnabled(environment) ?
         PathTracePowerHeuristic(previousPdf, PathTraceEnvironmentPdf(environment, direction)) : 1.0f;
     float sunWeight = PathTracePowerHeuristic(previousPdf, PathTraceSunPdf(sun, direction));
-    return environmentRadiance * environmentWeight + sunRadiance * sunWeight;
+    // S5: the clouds' shadow on the sun, as on its light samples.
+    return environmentRadiance * environmentWeight + sunRadiance * sunWeight * SkyFrameCloudShadow(skyFrameInfoIndex, origin);
 }
 
 // Adds one light sample: f * cos * Li * visibility * MIS / pdf. Delta lights (pdf 0) use weight 1. diffuseRadiance
@@ -841,8 +926,10 @@ float3 PathTraceDirectLightingLobes(PathTraceSurface surface, float3 position, i
 
     if(PathTraceSunHasEnergy(sun))
     {
-        radiance += PathTraceShadeLightSampleLobes(surface, position, PathTraceSampleSun(sun, sunRandom), rayCount,
-            sampleDiffuse);
+        // S5: through the clouds' shadow at this vertex.
+        PathTraceLightSample sunSample = PathTraceSampleSun(sun, sunRandom);
+        sunSample.radiance *= SkyFrameCloudShadow(skyFrameInfoIndex, position);
+        radiance += PathTraceShadeLightSampleLobes(surface, position, sunSample, rayCount, sampleDiffuse);
         diffuseRadiance += sampleDiffuse;
     }
 
@@ -896,8 +983,10 @@ float3 PathTraceSharcNvTrainingDirectLighting(PathTraceSurface surface, float3 p
 
     if(PathTraceSunHasEnergy(sun))
     {
-        radiance += PathTraceShadeLightSampleLobes(surface, position, PathTraceSampleSun(sun, sunRandom), rayCount,
-            sampleDiffuse);
+        // S5: through the clouds' shadow at this vertex.
+        PathTraceLightSample sunSample = PathTraceSampleSun(sun, sunRandom);
+        sunSample.radiance *= SkyFrameCloudShadow(skyFrameInfoIndex, position);
+        radiance += PathTraceShadeLightSampleLobes(surface, position, sunSample, rayCount, sampleDiffuse);
         diffuseRadiance += sampleDiffuse;
     }
 
@@ -2173,8 +2262,8 @@ float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex 
             {
                 if(rasterFirstVertex.state == 0)
                 {
-                    float3 background = PathTraceMissRadiance(rasterFirstVertex.backgroundDirection, previousDelta,
-                        previousPdf);
+                    float3 background = PathTraceMissRadiance(ray.Origin, rasterFirstVertex.backgroundDirection, previousDelta,
+                        previousPdf, true);
                     radiance += throughput * background;
                     break;
                 }
@@ -2223,7 +2312,8 @@ float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex 
 
                     if(!directFromRtxdi)
                     {
-                        float3 missRadiance = PathTraceMissRadiance(ray.Direction, previousDelta, previousPdf);
+                        float3 missRadiance = PathTraceMissRadiance(ray.Origin, ray.Direction, previousDelta, previousPdf,
+                            vertex == 0u);
 
                         // The miss of the ray leaving vertex - 1 (vertex 0's own BSDF-sampled light stays unclamped).
                         if(PathTraceIndirectClampActive(vertex - 1u) && PATH_TRACE_SHARC_NV_CLAMPS)
@@ -2352,7 +2442,7 @@ float3 PathTraceTracePath(RayDesc ray, uint primary, PathTraceRasterFirstVertex 
 
             if(payload.hitDistance < 0.0f)
             {
-                float3 missRadiance = PathTraceMissRadiance(ray.Direction, previousDelta, previousPdf);
+                float3 missRadiance = PathTraceMissRadiance(ray.Origin, ray.Direction, previousDelta, previousPdf, vertex == 0u);
 
                 // Camera-ray misses (vertex 0) and vertex 0's BSDF-sampled light stay unclamped.
                 if(vertex >= 1u && PathTraceIndirectClampActive(vertex - 1u))

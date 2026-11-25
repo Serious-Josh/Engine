@@ -55,6 +55,10 @@ struct PipelineDescription
     // existing pipelines keep their opaque writes.
     bool alphaBlend = false;
 
+    // destination * source alpha + source color (ONE, SRC_ALPHA); destination alpha is preserved. The shader writes the light to
+    // add and, in alpha, the transmittance of what is already drawn (the camera clouds' composite). Takes precedence over alphaBlend.
+    bool transmittanceBlend = false;
+
     // Also creates the counterclockwise-front variant that Bind selects for mirrored (negative-determinant)
     // object transforms. Only pipelines that draw scene objects need it.
     bool mirroredWindingVariant = false;

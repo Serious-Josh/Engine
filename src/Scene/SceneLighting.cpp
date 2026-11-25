@@ -189,6 +189,7 @@ bool BuildSceneLightingSnapshot(const SceneDocument& document,
         resolved.color = light.color;
         resolved.intensity = light.intensity;
         resolved.angularRadius = light.angularRadius;
+        resolved.affectsAtmosphere = light.affectsAtmosphere;
         resolved.range = light.range;
         resolved.rangeAttenuation = light.rangeAttenuation;
         resolved.innerConeAngle = light.innerConeAngle;

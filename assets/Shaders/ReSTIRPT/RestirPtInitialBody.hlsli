@@ -2260,8 +2260,11 @@ PathTraceLightSample RestirPtSampleEnvironment(PathTraceEnvironment environment,
 }
 
 // One delta (table directional) or MIS-weighted (sun, environment) light sample: f_all cos Li V m / pdf.
+// Physical sky S5B: cloudShadow (the sun's SkyFrameCloudShadow at this vertex, 1 for other lights) multiplies the value as the
+// shadow ray's visibility does. Like visibility it is not part of the light term (parts.lightTerm): a shift evaluates it at its
+// own vertex.
 float3 RestirPtSingleLightNee(PathTraceSurface surface, float3 position, PathTraceLightSample lightSample,
-    inout uint shadowRays, out float3 diffuse, out RestirPtNeeParts parts)
+    inout uint shadowRays, out float3 diffuse, out RestirPtNeeParts parts, float cloudShadow = 1.0f)
 {
     float3 unshadowedDiffuse;
 #if defined(RESTIR_PT_UNFUSED_BSDF)
@@ -2299,7 +2302,7 @@ float3 RestirPtSingleLightNee(PathTraceSurface surface, float3 position, PathTra
         return float3(0.0f, 0.0f, 0.0f);
     }
 
-    diffuse = unshadowedDiffuse * weight;
+    diffuse = unshadowedDiffuse * (weight * cloudShadow);
     parts.direction = lightSample.direction;
 #if defined(RESTIR_PT_UNFUSED_BSDF)
     float3 bsdfDiffuse;
@@ -2311,16 +2314,18 @@ float3 RestirPtSingleLightNee(PathTraceSurface surface, float3 position, PathTra
     // weight = m / pdf for MIS-weighted samples, 1 for delta lights: lightTerm = Li / pdf (or Li), mis = m.
     parts.mis = lightSample.pdf > 0.0f ? RestirPtBalanceHeuristic(lightSample.pdf, bsdfPdf) : 1.0f;
     parts.lightTerm = lightSample.pdf > 0.0f ? lightSample.radiance / lightSample.pdf : lightSample.radiance;
-    return value * weight;
+    return value * (weight * cloudShadow);
 }
 
 // BSDF-sampled escape radiance with balance-heuristic weights against the sun and environment light samples.
-float3 RestirPtEscapeRadiance(float3 direction, bool previousDelta, float previousPdfAll)
+// Physical sky S5B: the sun through the clouds' shadow at origin, the vertex the escape leaves (as the reference path tracer's
+// miss and the sun's NEE); a shift passes its own vertex.
+float3 RestirPtEscapeRadiance(float3 origin, float3 direction, bool previousDelta, float previousPdfAll)
 {
     const PathTraceEnvironment environment = PathTraceFrameEnvironment();
     const PathTraceSun sun = PathTraceFrameSun();
     const float3 environmentRadiance = PathTraceEnvironmentRadiance(environment, environmentSampler, direction);
-    const float3 sunRadiance = PathTraceSunRadiance(sun, direction);
+    const float3 sunRadiance = PathTraceSunRadiance(sun, direction) * SkyFrameCloudShadow(skyFrameInfoIndex, origin);
 
     if(previousDelta)
     {
@@ -2992,7 +2997,7 @@ RestirPtTreeResult RestirPtTracePathTree(uint2 pixel, uint sampleIndex, PathTrac
     if(firstVertex.state == 0)
     {
         // A background pixel: the camera sees the sun and environment directly (k = 1).
-        const float3 radiance = PathTraceMissRadiance(firstVertex.backgroundDirection, true, 0.0f);
+        const float3 radiance = PathTraceMissRadiance(float3(0.0f, 0.0f, 0.0f), firstVertex.backgroundDirection, true, 0.0f, true);
         RestirPtStreamCandidate(result.stream, RestirPtMakeCandidate(radiance, float3(0.0f, 0.0f, 0.0f), 1.0f, 1u,
             RESTIR_PT_END_CAMERA, 0u), RestirPtRandom(seed, 0u, RESTIR_PT_DIMENSION_STREAM));
         return result;
@@ -3128,7 +3133,7 @@ RestirPtTreeResult RestirPtTracePathTree(uint2 pixel, uint sampleIndex, PathTrac
                 const float2 sunRandom = float2(RestirPtRandom(seed, vertex, RESTIR_PT_DIMENSION_SUN),
                     RestirPtRandom(seed, vertex, RESTIR_PT_DIMENSION_SUN + 1u));
                 contribution = RestirPtSingleLightNee(surface, position, PathTraceSampleSun(sun, sunRandom),
-                    result.shadowRays, diffuse, parts);
+                    result.shadowRays, diffuse, parts, SkyFrameCloudShadow(skyFrameInfoIndex, position));
                 RestirPtZeroSingleNee(1u);
                 RestirPtStreamCandidate(result.stream, RestirPtWithReconnection(RestirPtMakeCandidate(
                     throughput * contribution, primary ? diffuse : throughput * contribution * diffuseShare, survival,
@@ -3293,11 +3298,11 @@ RestirPtTreeResult RestirPtTracePathTree(uint2 pixel, uint sampleIndex, PathTrac
                 const float3 storedDirection = RestirPtStoredDirection(lobeSample.direction);
                 const float storedDensity = prefix.rc.index == vertex ? PathTracePdf(reconnectionSurface, storedDirection) :
                     PathTracePdf(surface, storedDirection);
-                radiance = RestirPtEscapeRadiance(storedDirection, false, storedDensity);
+                radiance = RestirPtEscapeRadiance(position, storedDirection, false, storedDensity);
             }
             else
             {
-                radiance = RestirPtEscapeRadiance(lobeSample.direction, lobeSample.lobe == RESTIR_PT_LOBE_DELTA,
+                radiance = RestirPtEscapeRadiance(position, lobeSample.direction, lobeSample.lobe == RESTIR_PT_LOBE_DELTA,
                     lobeSample.pdfAll);
             }
 
@@ -3959,8 +3964,11 @@ uint RestirPtReferenceLightVisibility(float3 receiver, float3 geometricNormal, f
 
 // T-2.1 P4: a distant-light NEE sample's direction (sun disk or environment), regenerated from the path's initSeed at the
 // NEE vertex exactly as the path tree drew it: the same random dimensions and the frame's sun and environment. Its density
-// comes with it (for the MIS recomputation). Neither depends on the receiving position.
-bool RestirPtDistantLightDirection(uint lightType, uint initSeed, uint vertex, out float3 direction, out float pdf)
+// comes with it (for the MIS recomputation), and so does its light term with this frame's lights (Li / pdf, or Li for a delta
+// sun: RestirPtNeeParts::lightTerm). None depends on the receiving position: the sun's cloud shadow (S5B), which does, is applied
+// by the shift at its vertex, as visibility is.
+bool RestirPtDistantLightSample(uint lightType, uint initSeed, uint vertex, out float3 direction, out float pdf,
+    out float3 lightTerm)
 {
     PathTraceLightSample lightSample;
 
@@ -3980,7 +3988,23 @@ bool RestirPtDistantLightDirection(uint lightType, uint initSeed, uint vertex, o
 
     direction = lightSample.direction;
     pdf = lightSample.pdf;
+    lightTerm = lightSample.pdf > 0.0f ? lightSample.radiance / lightSample.pdf : lightSample.radiance;
     return lightSample.valid;
+}
+
+bool RestirPtDistantLightDirection(uint lightType, uint initSeed, uint vertex, out float3 direction, out float pdf)
+{
+    float3 lightTerm;
+    return RestirPtDistantLightSample(lightType, initSeed, vertex, direction, pdf, lightTerm);
+}
+
+// Physical sky S2 (§4.5.3): with temporal reuse, a sample can come from a frame whose sun or sky differed (time of day, a sky
+// edit). Its distant-light endpoint is then re-evaluated at the regenerated direction with this frame's lights: the stored light
+// term and density (rc.radiance, rc.lightPdf) are replaced, so the shift no longer mixes two frames' emitters. With unchanged
+// lights the values are the stored ones. Without temporal reuse every sample is this frame's and nothing changes.
+bool RestirPtRefreshesDistantLights()
+{
+    return (restirPtFlags & RESTIR_PT_FLAG_TEMPORAL) != 0u;
 }
 
 // Test only (T-2.1a edge ties): the world-space distance from location to the nearest edge of a stored triangle (instance,
@@ -4358,18 +4382,31 @@ RestirPtShifted RestirPtShiftSample(PathTraceRasterFirstVertex destination, uint
     const bool endpoint = rc.index == pathLength;
     const bool neeAtVertex = nee && rc.index == pathLength - 1u;
 
+    // S5B: a refreshed sun light term at x_k lacks the clouds' shadow there, which the stored one (captured from the NEE's value)
+    // holds; applied once x_k is rebuilt.
+    bool cloudShadowAtVertex = false;
+
     // P4 for NEE leaving x_k toward a distant light: the direction regenerated from the seed at x_k (pathLength - 1).
     if(neeAtVertex && (rc.lightType == RESTIR_PT_LIGHT_SUN || rc.lightType == RESTIR_PT_LIGHT_ENVIRONMENT))
     {
         float3 regenerated;
         float regeneratedPdf;
+        float3 lightTerm;
 
-        if(!RestirPtDistantLightDirection(rc.lightType, initSeed, pathLength - 1u, regenerated, regeneratedPdf))
+        if(!RestirPtDistantLightSample(rc.lightType, initSeed, pathLength - 1u, regenerated, regeneratedPdf, lightTerm))
         {
             return shifted;
         }
 
         rc.wi = regenerated;
+
+        // NEE leaving x_k: rcRadiance is the light term there (RestirPtNeeReconnection).
+        if(RestirPtRefreshesDistantLights())
+        {
+            rc.radiance = lightTerm;
+            rc.lightPdf = regeneratedPdf;
+            cloudShadowAtVertex = rc.lightType == RESTIR_PT_LIGHT_SUN;
+        }
     }
 
     if(replayOnly)
@@ -4405,7 +4442,7 @@ RestirPtShifted RestirPtShiftSample(PathTraceRasterFirstVertex destination, uint
             return shifted;
         }
 
-        shifted.contribution = throughput * previousLobe.weight * RestirPtEscapeRadiance(previousLobe.direction,
+        shifted.contribution = throughput * previousLobe.weight * RestirPtEscapeRadiance(position, previousLobe.direction,
             previousLobe.lobe == RESTIR_PT_LOBE_DELTA, previousLobe.pdfAll);
         shifted.jacobian = 1.0f;
     }
@@ -4443,10 +4480,24 @@ RestirPtShifted RestirPtShiftSample(PathTraceRasterFirstVertex destination, uint
         {
             // P4: the distant light's direction regenerated from the seed at the NEE vertex.
             float regeneratedPdf;
+            float3 lightTerm;
 
-            if(!RestirPtDistantLightDirection(rc.lightType, initSeed, pathLength - 1u, direction, regeneratedPdf))
+            if(!RestirPtDistantLightSample(rc.lightType, initSeed, pathLength - 1u, direction, regeneratedPdf, lightTerm))
             {
                 return shifted;
+            }
+
+            // The forced light-vertex reconnection: rcRadiance is the light term.
+            if(RestirPtRefreshesDistantLights())
+            {
+                rc.radiance = lightTerm;
+                rc.lightPdf = regeneratedPdf;
+            }
+
+            // S5B: the sun through the clouds' shadow at this y_(k-1), evaluated in each domain as the shadow ray below is.
+            if(rc.lightType == RESTIR_PT_LIGHT_SUN)
+            {
+                incident = SkyFrameCloudShadow(skyFrameInfoIndex, position).xxx;
             }
         }
         else
@@ -4526,9 +4577,9 @@ RestirPtShifted RestirPtShiftSample(PathTraceRasterFirstVertex destination, uint
         // The escape's MIS weights against sun and environment NEE, recomputed with y_(k-1)'s own mixture density
         // (specification section 5, step 3). M5.3 fix (user-approved 2026-11-22): M5.2 used rcRadiance, into which
         // capture folds the source vertex's weights.
-        const float3 escapeRadiance = RestirPtEscapeRadiance(rc.wi, false, PathTracePdf(surface, rc.wi));
+        const float3 escapeRadiance = RestirPtEscapeRadiance(position, rc.wi, false, PathTracePdf(surface, rc.wi));
 #if defined(RESTIR_PT_DIAGNOSTICS)
-        RestirPtCountEscapeMis(rc.radiance, RestirPtEscapeRadiance(rc.wi, false, PathTracePdf(surface, rc.wi)));
+        RestirPtCountEscapeMis(rc.radiance, RestirPtEscapeRadiance(position, rc.wi, false, PathTracePdf(surface, rc.wi)));
 #endif
         shifted.contribution = throughput * RestirPtEvaluateLobe(surface, reconnectLobe, rc.wi, diffuseValue) *
             dot(surface.normal, rc.wi) / density * escapeRadiance;
@@ -4610,6 +4661,12 @@ RestirPtShifted RestirPtShiftSample(PathTraceRasterFirstVertex destination, uint
         }
 
         const float geometry = abs(dot(rebuilt.geometricNormal, direction)) / (distance * distance);
+
+        if(cloudShadowAtVertex)
+        {
+            rc.radiance *= SkyFrameCloudShadow(skyFrameInfoIndex, vertexPosition);
+        }
+
         const RestirPtHitEvaluation evaluation = RestirPtEvaluateHit(surface, reconnectLobe, direction, rebuilt,
             direction, geometry, rc, initSeed, neeAtVertex);
 
@@ -4624,7 +4681,8 @@ RestirPtShifted RestirPtShiftSample(PathTraceRasterFirstVertex destination, uint
 #if defined(RESTIR_PT_DIAGNOSTICS)
         if(!nee && pathLength == rc.index + 1u)
         {
-            RestirPtCountEscapeMis(rc.radiance, RestirPtEscapeRadiance(rc.wi, false, PathTracePdf(vertexSurface, rc.wi)));
+            RestirPtCountEscapeMis(rc.radiance, RestirPtEscapeRadiance(vertexPosition, rc.wi, false,
+                PathTracePdf(vertexSurface, rc.wi)));
         }
 #endif
 
@@ -4632,7 +4690,7 @@ RestirPtShifted RestirPtShiftSample(PathTraceRasterFirstVertex destination, uint
         // from y_(k-1): recomputed (specification section 5, step 3; the M5.3 fix above).
         if(!nee && pathLength == rc.index + 1u)
         {
-            value = evaluation.previousWeight * evaluation.local * RestirPtEscapeRadiance(rc.wi, false,
+            value = evaluation.previousWeight * evaluation.local * RestirPtEscapeRadiance(vertexPosition, rc.wi, false,
                 PathTracePdf(vertexSurface, rc.wi));
         }
 

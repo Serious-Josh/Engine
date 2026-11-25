@@ -36,6 +36,22 @@ namespace
     }
 }
 
+bool SceneSkyUsesEnvironmentAsset(SkyType skyType, const std::string& environmentReference)
+{
+    return skyType == SkyType::Hdri && !environmentReference.empty() &&
+        environmentReference != SceneDocument::NoneEnvironmentReference;
+}
+
+SkyType SceneDocumentSkyType(const SceneDocument& document)
+{
+    return ResolveSkyType(document.skyType, document.environmentReference);
+}
+
+bool SceneSkyUsesEnvironmentAsset(const SceneDocument& document)
+{
+    return SceneSkyUsesEnvironmentAsset(SceneDocumentSkyType(document), document.environmentReference);
+}
+
 bool ValidateSceneDocument(
     const SceneDocument& document,
     std::string* errorMessage)
@@ -56,6 +72,16 @@ bool ValidateSceneDocument(
     if(std::string hazeError; document.environmentalHaze && !ValidateEnvironmentalHazeSettings(*document.environmentalHaze, &hazeError))
     {
         return Fail(errorMessage, ("Invalid environmental haze: " + hazeError).c_str());
+    }
+
+    if(document.skyType && !IsValidSkyType(*document.skyType))
+    {
+        return Fail(errorMessage, "Invalid scene sky type.");
+    }
+
+    if(std::string skyError; document.physicalSky && !ValidatePhysicalSkySettings(*document.physicalSky, &skyError))
+    {
+        return Fail(errorMessage, "Invalid physical sky: " + skyError);
     }
 
     if(std::string environmentError; document.airEnvironment && !ValidateAirEnvironmentSettings(*document.airEnvironment, &environmentError))

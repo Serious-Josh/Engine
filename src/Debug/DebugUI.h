@@ -16,6 +16,7 @@
 #include "FramePacingMonitor.h"
 #include "Editor/EditorIcons.h"
 
+#include <chrono>
 #include <climits>
 #include <cstdint>
 #include <optional>
@@ -513,6 +514,16 @@ class DebugUI
         m_gpuTimingDlssActive = dlssActive;
     }
 
+    // Pass Timings' Presented FPS, from Engine before DrawPerformanceWindow: whether the Frame Generation present path
+    // runs, and its presenter's present counters since it last started (generated presents included in presents).
+    void SetFramePresentationCounts(bool frameGenerationPresentation, std::uint64_t presents,
+        std::uint64_t generatedPresents)
+    {
+        m_frameGenerationPresentation = frameGenerationPresentation;
+        m_frameGenerationPresents = presents;
+        m_frameGenerationGeneratedPresents = generatedPresents;
+    }
+
     // The raster-primary capability: the shared prerequisites (the diagnostic exhaustive estimator) and ReSTIR DI's own.
     void SetPathTraceRasterPrimaryStatus(const PathTraceRasterPrimaryStatus& status)
     {
@@ -539,6 +550,18 @@ class DebugUI
         m_requestedEnvironmentIndex = -1;
 
         return index;
+    }
+
+    // Physical sky S4 (§4.12.1): a project scene's HDRI is chosen in Level > Sky, so the HDRI combo becomes a link there. Procedural
+    // demo scenes (no document) keep the combo.
+    void SetSkyEditedInLevelSky(bool edited) noexcept
+    {
+        m_skyEditedInLevelSky = edited;
+    }
+
+    bool TakeOpenSkyWindowRequest() noexcept
+    {
+        return std::exchange(m_openSkyWindowRequested, false);
     }
 
     private:
@@ -584,6 +607,34 @@ class DebugUI
 
     bool m_showRenderingSettings = false;
     bool m_showPassTimings = false;
+
+    // Pass Timings' Real FPS and Presented FPS, counted over the same half-second windows so the two compare directly.
+    // Real counts DrawPerformanceWindow calls (one per rendered frame). Presented counts the presenter's presents while the
+    // Frame Generation present path runs, generated frames included, and one per real frame otherwise.
+    struct FrameRateMeter
+    {
+        std::chrono::steady_clock::time_point windowStart{};
+        bool started = false;
+        bool frameGenerationPresentation = false;
+        std::uint64_t presentsBaseline = 0;
+        std::uint64_t generatedBaseline = 0;
+        std::uint64_t realFrames = 0;
+        std::uint64_t presentedFrames = 0;
+        std::uint64_t generatedFrames = 0;
+
+        // The last completed window since the meter (re)started.
+        bool valid = false;
+        double realFps = 0.0;
+        double presentedFps = 0.0;
+        double generatedFps = 0.0;
+    };
+
+    void UpdateFrameRateMeter();
+    void DrawFrameRates() const;
+    FrameRateMeter m_frameRates;
+    bool m_frameGenerationPresentation = false;
+    std::uint64_t m_frameGenerationPresents = 0;
+    std::uint64_t m_frameGenerationGeneratedPresents = 0;
 
     void DrawFramePacingSpikes();
     void DrawPathTraceReferenceSettings();
@@ -665,6 +716,8 @@ class DebugUI
     std::uint64_t m_totalTLASUpdates = 0;
 
     int m_requestedEnvironmentIndex = -1;
+    bool m_skyEditedInLevelSky = false;
+    bool m_openSkyWindowRequested = false;
 
     // ReSTIR PT Enhanced reuse toggles (SetRestirPtReuse / ConsumeRestirPtReuseChange). The Renderer seeds every value at
     // startup; these initial values match its launch defaults.

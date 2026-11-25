@@ -1067,7 +1067,7 @@ float3 ShadeSecondarySurface(ReflectionPayload surface, float3 rayDirection, flo
 
     float environmentMip =
         material.roughness *
-        10.0f;
+        EnvironmentCubeMaximumMip(environmentCubemap);
 
     float3 prefilteredEnvironment =
         environmentCubemap.SampleLevel(
@@ -1104,7 +1104,7 @@ float3 ShadeSecondarySurface(ReflectionPayload surface, float3 rayDirection, flo
 
     float multiscatterMip =
         material.roughness *
-        6.0f;
+        EnvironmentCubeMaximumMip(ggxMultiscatterIrradiance);
 
     float3 multiscatterIrradiance =
         ggxMultiscatterIrradiance.SampleLevel(

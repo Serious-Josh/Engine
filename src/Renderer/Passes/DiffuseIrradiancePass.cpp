@@ -9,7 +9,8 @@ bool DiffuseIrradiancePass::Initialize(
     ID3D12Device* device,
     ShaderLibrary& shaderLibrary,
     DescriptorHeap& rtvHeap,
-    Texture& irradianceCubemap)
+    Texture& irradianceCubemap,
+    const char* shaderPath)
 {
     if (!device || !irradianceCubemap.GetResource())
     {
@@ -21,7 +22,7 @@ bool DiffuseIrradiancePass::Initialize(
     m_rtvIndices.fill(UINT_MAX);
 
     ShaderDescription vertexDescription{};
-    vertexDescription.path = "DiffuseIrradiance.hlsl";
+    vertexDescription.path = shaderPath;
     vertexDescription.entryPoint = "VSMain";
     vertexDescription.stage = ShaderStage::Vertex;
 
@@ -35,7 +36,7 @@ bool DiffuseIrradiancePass::Initialize(
 
     ShaderDescription pixelDescription{};
 
-    pixelDescription.path = "DiffuseIrradiance.hlsl";
+    pixelDescription.path = shaderPath;
     pixelDescription.entryPoint = "PSMain";
     pixelDescription.stage = ShaderStage::Pixel;
 

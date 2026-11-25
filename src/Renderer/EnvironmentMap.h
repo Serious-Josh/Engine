@@ -29,6 +29,25 @@ class EnvironmentMap
     // texture in COPY_DEST; the caller records their copies and the precompute passes.
     bool CreateResourcesForUpload(ID3D12Device*, unsigned int width, unsigned int height, float totalWeight);
     bool CreateViewsForUpload(ID3D12Device*, DescriptorHeap&);
+
+    // Physical sky S1 (Physical_Sky_Design_Proposal.md §4.4): the sizes of one persistent sky environment set.
+    struct PersistentSkyLayout
+    {
+        unsigned int width = 1024;
+        unsigned int height = 512;
+        unsigned int cubemapSize = 256;
+        unsigned int cubemapMipLevels = 9;
+        unsigned int irradianceSize = 64;
+        unsigned int multiscatterSize = 64;
+        unsigned int multiscatterMipLevels = 7;
+    };
+
+    // Physical sky S1: one of SkyAtmosphere's two persistent sets, with the same resources and getters as an HDRI environment but
+    // written on the GPU instead of uploaded: an RGBA16F equirect with its full mip chain (render target for the mips, unordered
+    // access for mip 0), importance CDF buffers the GPU writes, and the three cubes at the sky's sizes. Committed resources, created
+    // once at renderer initialization and released only by Shutdown at renderer shutdown (never while the session runs). The total
+    // weight is the constant 1 (§4.5.1). Every resource starts in a shader-read state, the CDF buffers in COMMON.
+    bool InitializePersistentSky(ID3D12Device* device, DescriptorHeap& descriptorHeap, const PersistentSkyLayout& layout);
     void Shutdown();
     // Exchanges every resource, descriptor and importance value. Callers own the GPU lifetime of both sides.
     void Swap(EnvironmentMap& other) noexcept;
@@ -65,6 +84,10 @@ class EnvironmentMap
     bool InitializeSourceTexture(ID3D12Device* device, unsigned int width, unsigned int height);
     bool CreatePrecomputeTargets(ID3D12Device* device, DescriptorHeap& descriptorHeap);
     bool CreatePrecomputeTargetResources(ID3D12Device* device, bool trackMemory);
+    // The same at explicit sizes, in initialState (the HDRI path: RENDER_TARGET).
+    bool CreatePrecomputeTargetResources(ID3D12Device* device, bool trackMemory, unsigned int cubemapSize,
+        unsigned int cubemapMipLevels, unsigned int irradianceSize, unsigned int multiscatterSize, unsigned int multiscatterMipLevels,
+        D3D12_RESOURCE_STATES initialState);
     bool CreatePrecomputeTargetViews(ID3D12Device* device, DescriptorHeap& descriptorHeap);
 
     Texture m_sourceTexture;

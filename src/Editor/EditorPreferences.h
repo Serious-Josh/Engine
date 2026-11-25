@@ -21,6 +21,15 @@ struct ViewportPreferences
     bool operator==(const ViewportPreferences&) const = default;
 };
 
+// Physical sky S1: which Editor windows reopen at startup. Only the Level > Sky window so far; the other windows' visibility is not
+// persisted yet.
+struct EditorWindowPreferences
+{
+    bool skyWindowVisible = false;
+
+    bool operator==(const EditorWindowPreferences&) const = default;
+};
+
 // A project the user opened, for the PR.6 Project Browser. The manifest path is absolute (this
 // is personal, per-machine state); the project ID lets PR.6 recognise a relocated project.
 struct RecentProject
@@ -58,6 +67,9 @@ public:
     const ViewportPreferences& GetViewport() const noexcept;
     void SetViewport(const ViewportPreferences& viewport);
 
+    const EditorWindowPreferences& GetWindows() const noexcept;
+    void SetWindows(const EditorWindowPreferences& windows);
+
     const std::vector<RecentProject>& GetRecentProjects() const noexcept;
 
     // Moves the project to the front, replacing any entry for the same manifest (Windows path
@@ -72,5 +84,6 @@ public:
 private:
     nlohmann::json m_document = nlohmann::json::object();
     ViewportPreferences m_viewport;
+    EditorWindowPreferences m_windows;
     std::vector<RecentProject> m_recentProjects;
 };

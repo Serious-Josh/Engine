@@ -32,6 +32,10 @@ struct EffectiveSceneEnvironment
     std::string worldName;
     std::string worldProblem;
 
+    // The Sky group: the sky type, the physical sky, the HDRI reference and (in lightingSettings) the environment luminance scale.
+    // The sky type as its document stores it (absent: derived from environmentReference; EffectiveSkyType resolves it).
+    std::optional<SkyType> skyType;
+    std::optional<PhysicalSkySettings> physicalSky;
     std::string environmentReference;
     SceneLightingSettings lightingSettings;
     std::optional<EnvironmentalHazeSettings> environmentalHaze;
@@ -51,6 +55,9 @@ EffectiveSceneEnvironment ResolveSceneEnvironment(const SceneDocument& scene, co
 // Writes an environment's values into a document's environment fields: a Local Level's own values when it is unassigned (keeping
 // its effective environment), a World's values on Import Environment and World environment edits. Overrides are not changed.
 void StoreEnvironment(SceneDocument& local, const EffectiveSceneEnvironment& environment);
+
+// The resolved sky type of a resolution (its stored type, or the one its environment reference derives).
+SkyType EffectiveSkyType(const EffectiveSceneEnvironment& environment);
 
 // The groups whose effective values differ between two resolutions (empty when none): for assignment warnings.
 std::string DescribeEnvironmentDifferences(const EffectiveSceneEnvironment& before, const EffectiveSceneEnvironment& after);

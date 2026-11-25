@@ -203,6 +203,14 @@ struct IntegrationCreationDesc {
     // Promote FP16 to FP32 (overkill, kills performance)
     bool promoteFloat16to32 = false;
 
+    // Engine local edit begin (allocator P3; ENGINE_LOCAL_EDITS.md): with "RecreateD3D12", the application may supply the
+    // texture pool. Called once per pool texture with its NRI description and debug name; returns an "ID3D12Resource*" in
+    // COMMON state (one reference, which the integration takes over) or nullptr to fail creation. Null keeps NRD's own
+    // memory allocation. Not part of the NRD distribution.
+    void* (*createTextureD3D12)(void* userArg, const nri::TextureDesc& textureDesc, const char* name) = nullptr;
+    void* createTextureUserArg = nullptr;
+    // Engine local edit end
+
     // TODO: there can be an option for UNORM/SNORM 8/16-bit promotion/demotion, but only for resources
     // marked as history (i.e. not normal-roughness and internal data resources)
 };

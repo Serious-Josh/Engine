@@ -693,6 +693,8 @@ bool ResourceUploader::UploadBuffer(
     // The following barrier is in the same ExecuteCommandLists submission,
     // before buffer decay, so COPY_DEST is the correct StateBefore.
 
+    // A placed buffer is activated before the copy that initializes it (TextureMemoryAllocator.h).
+    TextureMemoryAllocator::RecordActivation(m_commandList, destination, D3D12_RESOURCE_STATE_COMMON);
     m_commandList->CopyBufferRegion(destination, 0, uploadBuffer, 0, dataSize);
 
     if (finalState != D3D12_RESOURCE_STATE_COPY_DEST)

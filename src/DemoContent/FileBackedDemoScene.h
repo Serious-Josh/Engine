@@ -183,6 +183,8 @@ public:
     // AIR.4F F4.4.1.
     bool SetSceneEnvironmentalHaze(const std::optional<EnvironmentalHazeSettings>& expected,
         const std::optional<EnvironmentalHazeSettings>& replacement, std::string* errorMessage = nullptr);
+    // Physical sky S1: the open document's sky type and physical sky (the Sky window), as SetSceneEnvironmentalHaze.
+    bool SetSceneSky(const SceneSky& expected, const SceneSky& replacement, std::string* errorMessage = nullptr);
     bool SetSceneAirEnvironment(const std::optional<AirEnvironmentSettings>& expected, const std::optional<AirEnvironmentSettings>& replacement,
         std::string* errorMessage = nullptr);
     // R1.1.
@@ -267,8 +269,17 @@ public:
     // Re-reads the owning World when asked, re-resolves and shows the result. Returns true when the effective sky reference changed
     // since the last publication (the caller then requests the environment through the S0.5 path).
     bool RefreshEnvironmentPreview(bool rereadWorld);
-    // The sky reference the Engine last published (keeps RefreshEnvironmentPreview from requesting it again).
+    // The environment request the Engine last published (keeps RefreshEnvironmentPreview from requesting it again).
     void NotePublishedEnvironment(const std::string& reference) { m_publishedEnvironmentReference = reference; }
+    // Physical sky S0: the effective sky: a file scene's resolved Sky group, an archive activation's own cooked values (packaged
+    // scenes are never resolved before W10).
+    SkyType GetEffectiveSkyType() const noexcept;
+    // The physical sky the renderer bakes: the effective one (its defaults when none is stored) when the effective type is
+    // Physical, else none.
+    std::optional<PhysicalSkySettings> GetEffectivePhysicalSky() const;
+    // The environment the S0.5 path prepares for the effective sky: an Hdri sky's reference (empty: neutral, builtin:none:
+    // black); the neutral environment (empty) for Neutral and Physical skies, whose HDRI reference stays stored but unused.
+    std::string GetEnvironmentRequestReference() const;
     // The owning World has Directional Lights, which a standalone Local Level preview does not show (W4 decides World lighting).
     bool WorldHasDirectionalLights() const noexcept { return m_worldHasDirectionalLights; }
 

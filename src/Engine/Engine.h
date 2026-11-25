@@ -435,10 +435,18 @@ class Engine
     void PollSceneEnvironment();
     std::uint64_t m_sceneEnvironmentTicket = 0;
     bool m_sceneEnvironmentActivation = false;
+    // Physical sky S4, HDRI option A: the observed ticket is the renderer's HDRI sky request (QuerySkyHdri), and the runtime
+    // identity of the scene whose HDRI sky was requested (0: none; that scene's frames set RendererOptions::hdriSky).
+    bool m_sceneEnvironmentTicketIsSky = false;
+    std::uint64_t m_skyHdriRuntimeIdentity = 0;
     float ActiveEnvironmentRadianceScale() const;
+    float ActiveEnvironmentRotationDegrees() const;
     void RefreshSceneEnvironmentCalibration();
-    // The HDRI calibration ApplySceneEnvironment last applied (NaN before the first).
+    // Whether this frame's active scene renders the HDRI sky it requested.
+    bool ActiveSceneUsesSkyHdri() const;
+    // The HDRI calibration ApplySceneEnvironment last applied (NaN before the first), and the rotation.
     float m_appliedEnvironmentRadianceScale = std::numeric_limits<float>::quiet_NaN();
+    float m_appliedEnvironmentRotationDegrees = std::numeric_limits<float>::quiet_NaN();
     // Set on scene activation; the next frame's automatic exposure snaps to its target.
     bool m_exposureResetPending = true;
     bool AssignSceneEnvironment(size_t index, std::string& error);

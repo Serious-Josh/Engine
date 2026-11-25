@@ -1,0 +1,61 @@
+{
+    "format": "EngineCloudPresets",
+    "version": 1,
+    "comment": "Physical sky S5 (Physical_Sky_Design_Proposal.md section 14.2): cloud layer presets. Choosing a preset in Level > Sky copies these values into the layer; scenes store the expanded values, so editing this file never changes a saved scene. Fields and units as in a scene's sky.physical.clouds[] entries.",
+    "presets": [
+        {
+            "name": "Sparse",
+            "kind": "volumetric",
+            "altitudeKm": 1.5, "thicknessKm": 2.0, "coverage": 0.25, "density": 260.0,
+            "shape": {"scaleKm": 14.0, "detailScaleKm": 1.2, "erosion": 0.45, "factor": 0.7},
+            "lighting": {"albedo": [0.96, 0.96, 0.96], "phaseForward": 0.75, "phaseBackward": -0.25, "phaseBlend": 0.6,
+                "multipleScattering": 0.6, "ambientStrength": 1.0},
+            "wind": {"directionDegrees": 0.0, "speedMetersPerSecond": 6.0}
+        },
+        {
+            "name": "Cloudy",
+            "kind": "volumetric",
+            "altitudeKm": 1.5, "thicknessKm": 2.5, "coverage": 0.45, "density": 120.0,
+            "shape": {"scaleKm": 12.0, "detailScaleKm": 1.0, "erosion": 0.35, "factor": 0.6},
+            "lighting": {"albedo": [0.95, 0.95, 0.95], "phaseForward": 0.75, "phaseBackward": -0.25, "phaseBlend": 0.6,
+                "multipleScattering": 0.6, "ambientStrength": 1.0},
+            "wind": {"directionDegrees": 0.0, "speedMetersPerSecond": 8.0}
+        },
+        {
+            "name": "Overcast",
+            "kind": "volumetric",
+            "altitudeKm": 1.0, "thicknessKm": 2.0, "coverage": 0.9, "density": 25.0,
+            "shape": {"scaleKm": 20.0, "detailScaleKm": 1.5, "erosion": 0.2, "factor": 0.2},
+            "lighting": {"albedo": [0.94, 0.94, 0.94], "phaseForward": 0.7, "phaseBackward": -0.2, "phaseBlend": 0.55,
+                "multipleScattering": 0.7, "ambientStrength": 1.2},
+            "wind": {"directionDegrees": 0.0, "speedMetersPerSecond": 5.0}
+        },
+        {
+            "name": "Stormy",
+            "kind": "volumetric",
+            "altitudeKm": 0.8, "thicknessKm": 6.0, "coverage": 0.75, "density": 60.0,
+            "shape": {"scaleKm": 10.0, "detailScaleKm": 0.8, "erosion": 0.3, "factor": 0.9},
+            "lighting": {"albedo": [0.9, 0.9, 0.9], "phaseForward": 0.7, "phaseBackward": -0.3, "phaseBlend": 0.6,
+                "multipleScattering": 0.5, "ambientStrength": 0.8},
+            "wind": {"directionDegrees": 0.0, "speedMetersPerSecond": 15.0}
+        },
+        {
+            "name": "Cirrus",
+            "kind": "layer",
+            "altitudeKm": 9.0, "thicknessKm": 0.0, "coverage": 0.4, "density": 0.6,
+            "shape": {"scaleKm": 25.0, "detailScaleKm": 2.5, "erosion": 0.6, "factor": 0.0},
+            "lighting": {"albedo": [0.98, 0.98, 0.98], "phaseForward": 0.85, "phaseBackward": -0.2, "phaseBlend": 0.7,
+                "multipleScattering": 0.3, "ambientStrength": 1.0},
+            "wind": {"directionDegrees": 0.0, "speedMetersPerSecond": 25.0}
+        },
+        {
+            "name": "Altocumulus",
+            "kind": "layer",
+            "altitudeKm": 4.0, "thicknessKm": 0.0, "coverage": 0.5, "density": 2.5,
+            "shape": {"scaleKm": 6.0, "detailScaleKm": 0.6, "erosion": 0.5, "factor": 0.0},
+            "lighting": {"albedo": [0.95, 0.95, 0.95], "phaseForward": 0.75, "phaseBackward": -0.25, "phaseBlend": 0.6,
+                "multipleScattering": 0.5, "ambientStrength": 1.0},
+            "wind": {"directionDegrees": 0.0, "speedMetersPerSecond": 12.0}
+        }
+    ]
+}

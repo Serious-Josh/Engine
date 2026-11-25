@@ -574,7 +574,6 @@ void SceneMembershipPanel::DrawWorldEnvironment(const SceneInfo& world, bool loc
     auto& draft = *m_worldEnvironmentDraft;
     ImGui::BeginDisabled(locked || m_pending);
     DrawWorldSky(draft);
-    ImGui::InputFloat("Environment luminance", &draft.lightingSettings.environmentLuminanceScale, 0.0f, 0.0f, "%.6g");
     ImGui::InputFloat("Reference exposure (EV100)", &draft.lightingSettings.referenceEV100, 0.5f, 1.0f, "%.2f");
 
     bool haze = draft.environmentalHaze && draft.environmentalHaze->enabled;
@@ -729,21 +728,12 @@ void SceneMembershipPanel::DrawWorldSky(EffectiveSceneEnvironment& draft)
         preview = shown->displayName;
     }
 
-    if(!ImGui::BeginCombo("World HDRI", preview.c_str()))
-    {
-        return;
-    }
-
-    for(const auto& choice : m_environmentChoices)
-    {
-        if(ImGui::Selectable(choice.displayName.c_str(), &choice == shown))
-        {
-            draft.environmentReference = choice.reference;
-            m_worldBuiltinEnvironmentDraft = choice.builtinSource;
-        }
-    }
-
-    ImGui::EndCombo();
+    // Physical sky S4 (§4.12.1): the World's sky is shown here and edited only in Level > Sky with the World open, so no second path
+    // writes it.
+    const SkyType type = EffectiveSkyType(draft);
+    ImGui::Text("World sky: %s", type == SkyType::Physical ? "Physically Based Sky" :
+        (type == SkyType::Hdri ? ("HDRI Sky, " + preview).c_str() : "Neutral"));
+    ImGui::TextDisabled("Edit it in Level > Sky with the World open.");
 }
 
 // The World's mist appearance: absent until enabled, then every field of the Local Level mist panel.

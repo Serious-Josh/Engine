@@ -18,6 +18,11 @@ SamplerState sampler0 : register(s0);
 
 static const float SOURCE_MIP_BIAS = 1.0f;
 
+// GGX prefilter samples per texel. The physical sky compiles this file with fewer (SkyEquirectangularToCubemap.hlsl).
+#ifndef ENVIRONMENT_PREFILTER_SAMPLE_COUNT
+#define ENVIRONMENT_PREFILTER_SAMPLE_COUNT 4096u
+#endif
+
 VSOutput VSMain(uint vertexID : SV_VertexID)
 {
     VSOutput output;
@@ -413,7 +418,7 @@ float4 PSMain(VSOutput input) : SV_Target0
     float totalWeight =
         0.0f;
 
-    static const uint SAMPLE_COUNT = 4096u;
+    static const uint SAMPLE_COUNT = ENVIRONMENT_PREFILTER_SAMPLE_COUNT;
 
     for(uint i = 0u; i < SAMPLE_COUNT; ++i)
     {

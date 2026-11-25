@@ -11,6 +11,7 @@
 #include "Scene/AirEnvironmentSettings.h"
 #include "Scene/AirSimulationSettings.h"
 #include "Scene/EnvironmentalHazeSettings.h"
+#include "Scene/PhysicalSkySettings.h"
 #include "Scene/MistRenderSettings.h"
 #include "Scene/VoxelComponents.h"
 #include "Physics/PhysicsComponent.h"
@@ -145,7 +146,7 @@ struct SceneMembership
 // (SceneEnvironmentOverrides::None()).
 struct SceneEnvironmentOverrides
 {
-    // environmentReference and lightingSettings.environmentLuminanceScale.
+    // skyType, physicalSky, environmentReference and lightingSettings.environmentLuminanceScale.
     bool sky = true;
     // lightingSettings.referenceEV100.
     bool exposure = true;
@@ -217,7 +218,18 @@ struct SceneDocument
     // W3: a Local Level's environment override switches ("environmentOverrides", required; Worlds have none). Earlier Local Levels
     // read with every switch enabled.
     static constexpr std::uint32_t kEnvironmentOverridesSchemaVersion = 30;
-    static constexpr std::uint32_t kSchemaVersion = kEnvironmentOverridesSchemaVersion;
+    // Physical sky S0: the optional "sky" block (type, and the physical sky's settings). Earlier documents, and later ones without
+    // the block, derive the sky type from environmentReference (DeriveSkyType).
+    static constexpr std::uint32_t kPhysicalSkySchemaVersion = 31;
+    // Physical sky S2: a Directional Light's "affectsAtmosphere" (written only when false). Earlier documents read true.
+    static constexpr std::uint32_t kLightAtmosphereSchemaVersion = 32;
+    // Physical sky S4: lightingSettings' "environmentRotationDegrees", the HDRI sky's yaw (written only when not 0). Earlier
+    // documents read 0.
+    static constexpr std::uint32_t kHdriRotationSchemaVersion = 33;
+    // Physical sky S5: the physical sky's "night" and "clouds" (each written only when not the default). Earlier documents read
+    // the defaults (no clouds).
+    static constexpr std::uint32_t kCloudSchemaVersion = 34;
+    static constexpr std::uint32_t kSchemaVersion = kCloudSchemaVersion;
 
     std::uint32_t schemaVersion = kSchemaVersion;
 
@@ -237,6 +249,15 @@ struct SceneDocument
     // Otherwise a canonical project texture asset reference.
     static constexpr const char* NoneEnvironmentReference = "builtin:none";
     std::string environmentReference;
+
+    // Physical sky S0: which sky lights the scene, in the Sky environment group with environmentReference (SceneDocumentSkyType).
+    // Absent until a sky type is chosen: the type is then derived from environmentReference, exactly as every earlier scene
+    // rendered, so code that only sets the reference keeps its meaning. Hdri uses environmentReference as before; Neutral and
+    // Physical keep it stored (the HDRI identity) but do not use it.
+    std::optional<SkyType> skyType;
+    // The physical sky's settings; absent until first edited, and then PhysicalSkySettings' defaults (Earth) apply. Persisted from
+    // schema 31 and cooked from payload 38.
+    std::optional<PhysicalSkySettings> physicalSky;
 
     std::vector<SceneObjectDocument> objects;
 
@@ -271,6 +292,14 @@ bool ValidateSceneDocument(
 // W1.1: World documents serialize and validate, but nothing opens them until World loading exists (W4). Every path that opens a
 // scene as an ordinary (Local) scene calls this first, so a World is refused explicitly instead of being loaded as a Local Level.
 bool ValidateSceneKindOpenable(const SceneDocument& document, std::string* errorMessage = nullptr);
+
+// Physical sky S0: the document's sky type, its stored one or the one its environment reference derives (ResolveSkyType).
+SkyType SceneDocumentSkyType(const SceneDocument& document);
+
+// Physical sky S0: whether the scene's sky reads a project HDRI asset (an Hdri sky with an asset reference). Only such a scene
+// needs an environment resource when cooked or packaged; Neutral and Physical skies, empty references and builtin:none need none.
+bool SceneSkyUsesEnvironmentAsset(SkyType skyType, const std::string& environmentReference);
+bool SceneSkyUsesEnvironmentAsset(const SceneDocument& document);
 
 // R1.1: the AIR simulation configuration a frame runs with, the one path the Engine uses. In order: the Editor's Play or Physics
 // Simulation session override, if any (the packaged runtime never has one); the scene's own block; the defaults. `document` is null

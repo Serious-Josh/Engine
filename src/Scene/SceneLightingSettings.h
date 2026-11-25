@@ -15,6 +15,11 @@ struct SceneLightingSettings
     // unchanged on the GPU at the default reference exposure.
     float environmentLuminanceScale = Photometry::NeutralEnvironmentLuminanceScaleFloat(Photometry::DefaultReferenceEV100);
 
+    // Physical sky S4 (Physical_Sky_Design_Proposal.md §4.12.3, HDRI Sky): the HDRI's yaw about +Y in degrees, applied when it is
+    // resampled into the sky (positive moves features toward increasing longitude). Part of the Sky group, like the luminance.
+    static constexpr float MaximumEnvironmentRotationDegrees = 360.0f;
+    float environmentRotationDegrees = 0.0f;
+
     bool operator==(const SceneLightingSettings&) const = default;
 };
 
@@ -30,6 +35,11 @@ inline bool ValidateSceneLightingSettings(const SceneLightingSettings& settings,
     else if(!std::isfinite(settings.environmentLuminanceScale) || settings.environmentLuminanceScale < 0.0f)
     {
         failure = "Environment luminance scale must be finite and nonnegative.";
+    }
+    else if(!std::isfinite(settings.environmentRotationDegrees) ||
+        std::abs(settings.environmentRotationDegrees) > SceneLightingSettings::MaximumEnvironmentRotationDegrees)
+    {
+        failure = "HDRI rotation must be between -360 and 360 degrees.";
     }
 
     if(reason)

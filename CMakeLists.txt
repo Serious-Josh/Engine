@@ -387,6 +387,9 @@ add_library(EngineCore OBJECT
     src/Renderer/Passes/DeferrerLightingPass.cpp
     src/Renderer/EnvironmentMap.cpp
     src/Renderer/EnvironmentPreparation.cpp
+    src/Renderer/SkyAtmosphere.cpp
+    src/Renderer/SkyAtmosphereModel.cpp
+    src/Renderer/SkyHdriPreparation.cpp
     src/Renderer/Passes/EquirectangularToCubemapPass.cpp
     src/Renderer/Passes/EnvironmentMipPass.cpp
     src/Renderer/Passes/BRDFIntegrationpass.cpp
@@ -403,6 +406,7 @@ add_library(EngineCore OBJECT
     src/Renderer/RendererMembershipCandidate.cpp
     src/Renderer/TextureMemoryAllocator.cpp
     src/Renderer/RendererEnvironmentPreparation.cpp
+    src/Renderer/RendererPhysicalSky.cpp
     src/Renderer/RendererGeometryUploads.cpp
     src/Renderer/RendererLatency.cpp
     src/Renderer/RendererPresentation.cpp
@@ -461,6 +465,7 @@ add_library(EngineCore OBJECT
     src/Editor/AssetBrowser.cpp
     src/Editor/SceneMembershipPanel.cpp
     src/Editor/EnvironmentOverrideControls.cpp
+    src/Editor/SkyControls.cpp
     src/Editor/CompositeWorldInspection.cpp
     src/Editor/ThumbnailAdmission.cpp
     src/Renderer/Passes/RayTracedReflectionPass.cpp
@@ -527,6 +532,7 @@ add_library(EngineCore OBJECT
     src/Scene/RenderView.cpp
     src/Scene/SceneLighting.cpp
     src/Scene/SceneSerializer.cpp
+    src/Scene/CloudPresets.cpp
     src/Scene/SceneDocumentCache.cpp
     src/Scene/SceneAssetIdentity.cpp
     src/Scene/SceneEnvironmentResolution.cpp
@@ -795,6 +801,14 @@ endif()
 if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Scene/tests/SceneEnvironmentTests.cpp")
     add_executable(SceneEnvironmentTests src/Scene/tests/SceneEnvironmentTests.cpp)
     target_link_libraries(SceneEnvironmentTests PRIVATE EngineCore)
+endif()
+
+# Physical sky S0/S1 local-only regression: PhysicalSkySettings validation, scene JSON and cooked round trips and old files, the
+# Sky group's World/Local resolution, and the float64 atmosphere's transmittance against the design's reference model. CPU only.
+if(ENGINE_BUILD_DIAGNOSTICS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/Scene/tests/PhysicalSkyTests.cpp")
+    add_executable(PhysicalSkyTests src/Scene/tests/PhysicalSkyTests.cpp)
+    target_link_libraries(PhysicalSkyTests PRIVATE EngineCore)
+    target_compile_definitions(PhysicalSkyTests PRIVATE ENGINE_SOURCE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}")
 endif()
 
 # W4 local-only regression: composite World construction (identity, placement roots, sun policy, refusals).

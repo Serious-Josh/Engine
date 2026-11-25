@@ -1,4 +1,5 @@
 #pragma once
+#include "Scene/CloudPresets.h"
 #include "Scene/SceneHierarchyEdits.h"
 
 #include "Scene/Transform.h"
@@ -106,6 +107,23 @@ public:
     void SyncWorldEnvironmentChoices(const std::vector<EnvironmentAsset>& environments, const std::filesystem::path& builtinRoot)
     {
         m_sceneMembership.SyncEnvironmentChoices(environments, builtinRoot);
+        // Physical sky S4: the Sky window's HDRI Sky picker offers the same list (indices are the Renderer's).
+        SyncSkyHdriChoices(environments);
+    }
+
+    void SyncSkyHdriChoices(const std::vector<EnvironmentAsset>& environments);
+
+    // Physical sky S4: the HDRI chosen in the Sky window's HDRI Sky section (an index into the Renderer's list), once. Engine
+    // applies it as the former Debug > Rendering Settings HDRI combo did (Engine::AssignSceneEnvironment).
+    std::optional<size_t> TakeSkyHdriRequest() noexcept
+    {
+        return std::exchange(m_skyHdriRequest, std::nullopt);
+    }
+
+    // Physical sky S4: opens Level > Sky (the redirect of the former HDRI and luminance controls).
+    void OpenSkyWindow() noexcept
+    {
+        m_showSkyWindow = true;
     }
 
     void ProcessSceneMembership(const ProjectPaths& paths, ProjectAssetRegistry& registry, const FileBackedDemoScene* activeScene);
@@ -593,6 +611,20 @@ public:
     // defaults): the value being dragged in the Air window for that runtime, else the scene's own (its defaults when it has none).
     MistRenderSettings GetEffectiveMistRendering(const SceneDocument* document, std::uint64_t runtimeIdentity) const;
 
+    // Physical sky S1: the physical sky the renderer bakes for `scene`: the value being dragged in the Sky window for that scene's
+    // runtime, else the scene's effective one (FileBackedDemoScene::GetEffectivePhysicalSky); none unless the effective sky type is
+    // Physical.
+    std::optional<PhysicalSkySettings> GetRenderedPhysicalSky(const FileBackedDemoScene& scene) const;
+    // S4: the Sky window's Update Now (an On Demand sky's rebuild), once.
+    bool ConsumeSkyUpdateRequest() noexcept
+    {
+        return std::exchange(m_skyUpdateRequested, false);
+    }
+
+    // Physical sky S1: the windows that reopen at startup (the Level > Sky window), kept in the Editor preferences.
+    EditorWindowPreferences GetWindowPreferences() const;
+    void ApplyWindowPreferences(const EditorWindowPreferences& preferences);
+
     // AIR.4D D2: the latest emission status of each Air Motor the air field ran, keyed by AirMotorTag of its object's ID (Engine::
     // Frame passes it on from the Renderer); shown by the Air Motor Inspector.
     void SetAirMotorEmission(std::map<std::uint64_t, AirMotorEmissionStatus> emission)
@@ -1067,6 +1099,15 @@ private:
     // AIR.4F F4.5.1b: the scene's air environment (ambient temperature, thermal relaxation time).
     void DrawAirEnvironmentControls(IDemoScene& scene);
     bool m_showAirWindow = false;
+    // Physical sky S1: the Level > Sky window (SkyControls.cpp), HDRP's Visual Environment and Physically Based Sky for the open
+    // document's Sky group. Its visibility is an Editor preference (GetWindowPreferences).
+    void DrawSkyWindow(IDemoScene& scene);
+    // S4: HDRP's HDRI Sky section (the HDRI, its luminance and its rotation), editing the open scene's Sky group.
+    void DrawSkyHdriSection(IDemoScene& scene, bool editable);
+    // Physical sky S2: the Sky window's Sun section (the scene's sun owner: its elevation and azimuth, one transform history
+    // entry per drag, and its atmosphere flag).
+    void DrawSkySunSection(IDemoScene& scene, FileBackedDemoScene& owner);
+    bool m_showSkyWindow = false;
     AirEditorSettings m_airSettings;
     bool m_airResetRequested = false;
     bool m_mistClearRequested = false;
@@ -1422,6 +1463,48 @@ private:
     bool ReplayEnvironmentalHaze(IDemoScene& scene, const EnvironmentalHazeEdit& edit, bool redo, std::string& error);
     static size_t EnvironmentalHazeEditPayloadBytes(const EnvironmentalHazeEdit& edit);
     std::string m_environmentalHazeStatus;
+    // Physical sky S1: one edit of the open document's sky type and physical sky (the Sky window), as the environmental haze's. A
+    // combo, checkbox or reset commits at once; a drag re-bakes live from a draft and commits on release, so one drag or one typed
+    // value is one history entry.
+    struct SkyEdit
+    {
+        SceneHistorySession session;
+        SceneSky before;
+        SceneSky after;
+    };
+    bool CommitSky(IDemoScene& scene, const SceneSky& before, const SceneSky& after, std::string* error = nullptr);
+    bool ReplaySky(IDemoScene& scene, const SkyEdit& edit, bool redo, std::string& error);
+    static size_t SkyEditPayloadBytes(const SkyEdit& edit);
+    // While a Sky window drag is held: the physical sky drawn for the scene runtime `runtimeIdentity`. Never saved and never a
+    // second source of truth: it is dropped on commit, cancel, undo and redo, and applies to no other runtime.
+    struct PhysicalSkyDraft
+    {
+        std::uint64_t runtimeIdentity = 0;
+        PhysicalSkySettings settings;
+    };
+    std::optional<PhysicalSkyDraft> m_physicalSkyDraft;
+    std::string m_skyStatus;
+    // The Sun section's drag (elevation, azimuth in degrees) and its transform history capture.
+    bool m_skyUpdateRequested = false;
+    // S5: the cloud presets (assets/Sky/CloudPresets.json, loaded on first use) for the Sky window's Clouds section.
+    std::vector<CloudPreset> m_cloudPresets;
+    std::string m_cloudPresetError;
+    bool m_cloudPresetsLoaded = false;
+    // S4: the HDRI Sky picker's list (the Renderer's, in its order) and request.
+    struct SkyHdriChoice
+    {
+        std::string displayName;
+        std::string reference;
+        // A built-in HDRI, imported into the project when chosen.
+        bool builtin = false;
+    };
+    std::vector<SkyHdriChoice> m_skyHdriChoices;
+    std::optional<size_t> m_skyHdriRequest;
+    std::array<float, 2> m_skySunDrafts{};
+    bool m_skySunEditing = false;
+    Transform m_skySunUndoStart;
+    std::optional<HistoryTarget> m_skySunHistoryTarget;
+    std::uint64_t m_skySunHistoryEpoch = 0;
     bool CommitObjectMistEmitter(IDemoScene& scene, const SceneObjectMetadata& selection,
         const std::optional<MistEmitterComponent>& before, const std::optional<MistEmitterComponent>& after);
     static size_t MistEmitterEditPayloadBytes(const MistEmitterEdit& edit);
@@ -1929,7 +2012,7 @@ private:
         std::unique_ptr<ScriptEdit>, std::unique_ptr<AudioComponentsEdit>, std::unique_ptr<AcousticSettingsEdit>, std::unique_ptr<ProbeVolumeEdit>,
         std::unique_ptr<VoxelSettingsEdit>, std::unique_ptr<VoxelBakeEdit>, std::unique_ptr<AirMotorEdit>, std::unique_ptr<MistEmitterEdit>,
         std::unique_ptr<MistRenderingEdit>, std::unique_ptr<AirEnvironmentEdit>, std::unique_ptr<EnvironmentalHazeEdit>,
-        std::unique_ptr<AirSimulationEdit>, std::unique_ptr<EnvironmentOverrideEdit>>;
+        std::unique_ptr<AirSimulationEdit>, std::unique_ptr<EnvironmentOverrideEdit>, std::unique_ptr<SkyEdit>>;
     struct SceneHistoryEntry
     {
         SceneHistoryCommand command;

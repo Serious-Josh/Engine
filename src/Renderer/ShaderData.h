@@ -51,7 +51,12 @@ struct ReconstructionConstants
     float cameraPosition[3];
     unsigned int geometricNormalIndex;
     uint32_t motionIndex;
-    uint32_t padding[3];
+    // Physical sky S3: the published sky-view map for DeferredLighting's background, or 0xFFFFFFFF (the equirect).
+    uint32_t skyViewIndex = 0xFFFFFFFFu;
+    // S4: an HDRI sky's background slot equirect (DirectionToEquirectangularUV) for the background, or 0xFFFFFFFF.
+    uint32_t backgroundEquirectIndex = 0xFFFFFFFFu;
+    // S5: the physical sky's frame information (SkyFrame.hlsli: stars, the moon's disk, the cloud shadow), or 0xFFFFFFFF.
+    uint32_t skyFrameInfoIndex = 0xFFFFFFFFu;
 };
 
 struct ShadowConstants
@@ -197,9 +202,17 @@ struct PathTraceReferenceConstants
     // (PathTraceReferencePsr*.hlsl); every other library still declares the word as padding.
     std::uint32_t psrRecordIndex = 0;
     std::uint32_t rawDiffuseHitDistancePadding = 0;
+
+    // Physical sky S3, appended: the published sky-view map for camera rays and delta-mirror misses, or 0xFFFFFFFF.
+    std::uint32_t skyBackgroundIndex = 0xFFFFFFFFu;
+    // S4: 1 when skyBackgroundIndex is an HDRI sky's background equirect (DirectionToEquirectangularUV), 0 for a sky-view map.
+    std::uint32_t skyBackgroundEquirect = 0;
+    // S5: the physical sky's frame information (SkyFrame.hlsli), or 0xFFFFFFFF.
+    std::uint32_t skyFrameInfoIndex = 0xFFFFFFFFu;
+    std::uint32_t skyBackgroundPadding[1] = {};
 };
 
-static_assert(sizeof(PathTraceReferenceConstants) == 64 + 7 * 16 + 64 + 3 * 16);
+static_assert(sizeof(PathTraceReferenceConstants) == 64 + 7 * 16 + 64 + 4 * 16);
 static_assert(offsetof(PathTraceReferenceConstants, sunDirectionToLight) == 64 + 4 * 16);
 static_assert(offsetof(PathTraceReferenceConstants, inverseCameraRelativeViewProjection) == 64 + 7 * 16);
 static_assert(offsetof(PathTraceReferenceConstants, rawDiffuseHitDistanceIndex) == 272);
@@ -316,6 +329,8 @@ struct GPULight
     float cosOuterCone;
 
     float cosInnerCone;
+    // Physical sky S5B: padding[0] is 1 for the physical sky's moon (a Directional the clouds' moon shadow map shadows; SceneLights.hlsli
+    // SCENE_LIGHTS_MOON_CLOUD_SHADOW), else 0.
     float padding[3];
 
     bool operator==(const GPULight&) const = default;
@@ -432,7 +447,9 @@ static_assert(offsetof(ReconstructionConstants, inverseViewProjection) == 0);
 static_assert(offsetof(ReconstructionConstants, cameraPosition) == 64);
 static_assert(offsetof(ReconstructionConstants, geometricNormalIndex) == 76);
 static_assert(offsetof(ReconstructionConstants, motionIndex) == 80);
-static_assert(offsetof(ReconstructionConstants, padding) == 84);
+static_assert(offsetof(ReconstructionConstants, skyViewIndex) == 84);
+static_assert(offsetof(ReconstructionConstants, backgroundEquirectIndex) == 88);
+static_assert(offsetof(ReconstructionConstants, skyFrameInfoIndex) == 92);
 static_assert(sizeof(GPUMaterial) == 108);
 static_assert(offsetof(GPUMaterial, model) == 0);
 static_assert(offsetof(GPUMaterial, roughness) == 4);

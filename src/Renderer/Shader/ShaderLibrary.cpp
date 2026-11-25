@@ -227,9 +227,12 @@ std::vector<std::byte> ShaderLibrary::CookBootstrap(
 
         const auto path = (root / shader.path).wstring();
         const auto entryPoint = std::filesystem::path(shader.entryPoint).wstring();
+        // The shader root, so a ShaderVariantTable entry (no file; e.g. PsrInPlaceReplaceK2.hlsl) resolves to its generated
+        // text as at runtime. Uncached, as before.
+        const auto shaderRoot = root.wstring();
         ShaderCompileResult result;
 
-        if(!compiler.Compile({path.c_str(), entryPoint.c_str(), shader.stage}, result))
+        if(!compiler.Compile({path.c_str(), entryPoint.c_str(), shader.stage, shaderRoot.c_str(), false}, result))
         {
             throw std::runtime_error(std::string("Offline shader compilation failed: ") + shader.path + ":" +
                 shader.entryPoint + " (" + PackagedShaderFeatureName(shader.feature) + ")");

@@ -23,6 +23,18 @@ namespace
     constexpr std::pair<ProjectVolumetricResolutionBasis, std::string_view> kVolumetricResolutionBases[] = {
         {ProjectVolumetricResolutionBasis::Internal, "internal"},
         {ProjectVolumetricResolutionBasis::Output, "output"}};
+    constexpr std::pair<ProjectHdriSkyQuality, std::string_view> kHdriSkyQualities[] = {
+        {ProjectHdriSkyQuality::Q1024, "1024"},
+        {ProjectHdriSkyQuality::Q2048, "2048"},
+        {ProjectHdriSkyQuality::Q4096, "4096"}};
+    constexpr std::pair<ProjectSkyEnvironmentResolution, std::string_view> kSkyEnvironmentResolutions[] = {
+        {ProjectSkyEnvironmentResolution::R512, "512"},
+        {ProjectSkyEnvironmentResolution::R1024, "1024"},
+        {ProjectSkyEnvironmentResolution::R2048, "2048"}};
+    constexpr std::pair<ProjectSkyCubeSize, std::string_view> kSkyCubeSizes[] = {
+        {ProjectSkyCubeSize::C128, "128"},
+        {ProjectSkyCubeSize::C256, "256"},
+        {ProjectSkyCubeSize::C512, "512"}};
     constexpr std::pair<ProjectToneMapper, std::string_view> kToneMappers[] = {
         {ProjectToneMapper::AgX, "agx"},
         {ProjectToneMapper::GT7, "gt7"}};
@@ -261,6 +273,11 @@ namespace
         // NVIDIA Reflex and (FG.3) DLSS Frame Generation: an older file has neither group, so both stay off.
         rendering.Child("latency").Name("reflex", settings.latency.reflex, kReflexModes);
         rendering.Child("frameGeneration").Bool("enabled", settings.frameGeneration.enabled);
+        // Physical sky S4: an older file has no group, so it keeps 2048.
+        const auto sky = rendering.Child("sky");
+        sky.Name("hdriQuality", settings.sky.hdriQuality, kHdriSkyQualities);
+        sky.Name("environmentResolution", settings.sky.environmentResolution, kSkyEnvironmentResolutions);
+        sky.Name("reflectionCubeSize", settings.sky.reflectionCubeSize, kSkyCubeSizes);
 
         auto& legacy = settings.legacy;
         const auto legacyReader = rendering.Child("legacy");
@@ -381,6 +398,24 @@ bool ValidateProjectSettings(ProjectSettings& settings, std::vector<std::string>
     {
         Repair(rendering.volumetrics.resolutionBasis, defaults.volumetrics.resolutionBasis,
             "rendering.volumetrics.resolutionBasis was invalid; using internal.", warnings, valid);
+    }
+
+    if(!IsKnown(kHdriSkyQualities, rendering.sky.hdriQuality))
+    {
+        Repair(rendering.sky.hdriQuality, defaults.sky.hdriQuality, "rendering.sky.hdriQuality was invalid; using 2048.", warnings,
+            valid);
+    }
+
+    if(!IsKnown(kSkyEnvironmentResolutions, rendering.sky.environmentResolution))
+    {
+        Repair(rendering.sky.environmentResolution, defaults.sky.environmentResolution,
+            "rendering.sky.environmentResolution was invalid; using 1024.", warnings, valid);
+    }
+
+    if(!IsKnown(kSkyCubeSizes, rendering.sky.reflectionCubeSize))
+    {
+        Repair(rendering.sky.reflectionCubeSize, defaults.sky.reflectionCubeSize,
+            "rendering.sky.reflectionCubeSize was invalid; using 256.", warnings, valid);
     }
 
     if(!IsKnown(kReflexModes, rendering.latency.reflex))
@@ -531,6 +566,21 @@ std::string_view ToSerializedName(ProjectReflexMode value)
     return NameOf(kReflexModes, value);
 }
 
+std::string_view ToSerializedName(ProjectHdriSkyQuality value)
+{
+    return NameOf(kHdriSkyQualities, value);
+}
+
+std::string_view ToSerializedName(ProjectSkyEnvironmentResolution value)
+{
+    return NameOf(kSkyEnvironmentResolutions, value);
+}
+
+std::string_view ToSerializedName(ProjectSkyCubeSize value)
+{
+    return NameOf(kSkyCubeSizes, value);
+}
+
 namespace ProjectSettingsFile
 {
     LoadedProjectSettings Parse(std::string_view text)
@@ -625,6 +675,11 @@ namespace ProjectSettingsFile
 
         auto& frameGeneration = ObjectMember(rendering, "frameGeneration");
         frameGeneration["enabled"] = source.frameGeneration.enabled;
+
+        auto& sky = ObjectMember(rendering, "sky");
+        sky["hdriQuality"] = ToSerializedName(source.sky.hdriQuality);
+        sky["environmentResolution"] = ToSerializedName(source.sky.environmentResolution);
+        sky["reflectionCubeSize"] = ToSerializedName(source.sky.reflectionCubeSize);
 
         auto& legacy = ObjectMember(rendering, "legacy");
         legacy["reflectionDenoiser"] = ToSerializedName(source.legacy.reflectionDenoiser);

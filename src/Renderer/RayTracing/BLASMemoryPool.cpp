@@ -2,6 +2,7 @@
 
 #include "Core/Log.h"
 #include "Debug/MemoryRegistry.h"
+#include "Renderer/TextureMemoryAllocator.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -46,6 +47,17 @@ namespace
         description.SampleDesc.Count = 1;
         description.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
         description.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+
+        // Engine-owned memory (TextureMemoryAllocator.h), activated by the first BLAS built in it; committed otherwise. A block
+        // the pool releases returns its range to that allocator.
+        ID3D12Resource* placed = nullptr;
+
+        if(SUCCEEDED(TextureMemoryAllocator::CreateBuffer(device, description,
+            D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE, &placed)))
+        {
+            resource.Attach(placed);
+            return S_OK;
+        }
 
         return device->CreateCommittedResource(&heapProperties, D3D12_HEAP_FLAG_NONE, &description,
             D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE, nullptr, IID_PPV_ARGS(&resource));

@@ -156,7 +156,12 @@ PathTraceLightSample RtxdiSampleLight(GPULight record, PathTraceEnvironment envi
 {
     if(record.type == RTXDI_LIGHT_KIND_SUN)
     {
-        return PathTraceSampleSun(RtxdiSunFromRecord(record), uv);
+        PathTraceLightSample sunSample = PathTraceSampleSun(RtxdiSunFromRecord(record), uv);
+#if defined(SKY_FRAME_HAS_INFO_FUNCTION)
+        // Physical sky S5: through the clouds' shadow at the shaded point (the target PDF and the shading alike).
+        sunSample.radiance *= SkyFrameCloudShadow(SkyFrameInfoIndexForLights(), position);
+#endif
+        return sunSample;
     }
 
     if(record.type == RTXDI_LIGHT_KIND_ENVIRONMENT)

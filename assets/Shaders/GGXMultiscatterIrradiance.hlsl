@@ -1,3 +1,8 @@
+// Multiscatter samples per texel. The physical sky compiles this file with fewer (SkyGGXMultiscatterIrradiance.hlsl).
+#ifndef ENVIRONMENT_MULTISCATTER_SAMPLE_COUNT
+#define ENVIRONMENT_MULTISCATTER_SAMPLE_COUNT 1024u
+#endif
+
 #include "Common.hlsli"
 
 struct VSOutput
@@ -313,7 +318,7 @@ float4 PSMain(
     );
 
     static const uint SAMPLE_COUNT =
-        1024u;
+        ENVIRONMENT_MULTISCATTER_SAMPLE_COUNT;
 
     float3 weightedIrradiance =
         float3(

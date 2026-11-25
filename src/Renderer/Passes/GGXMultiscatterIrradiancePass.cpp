@@ -11,7 +11,8 @@ bool GGXMultiscatterIrradiancePass::Initialize(
     ID3D12Device* device,
     ShaderLibrary& shaderLibrary,
     DescriptorHeap& rtvHeap,
-    Texture& irradianceCubemap)
+    Texture& irradianceCubemap,
+    const char* shaderPath)
 {
     if (!device || !irradianceCubemap.GetResource())
     {
@@ -21,7 +22,7 @@ bool GGXMultiscatterIrradiancePass::Initialize(
     m_rtvHeap = &rtvHeap;
 
     ShaderDescription vertexDescription{};
-    vertexDescription.path = "GGXMultiscatterIrradiance.hlsl";
+    vertexDescription.path = shaderPath;
     vertexDescription.entryPoint = "VSMain";
     vertexDescription.stage = ShaderStage::Vertex;
 
@@ -35,7 +36,7 @@ bool GGXMultiscatterIrradiancePass::Initialize(
 
     ShaderDescription pixelDescription{};
 
-    pixelDescription.path = "GGXMultiscatterIrradiance.hlsl";
+    pixelDescription.path = shaderPath;
     pixelDescription.entryPoint = "PSMain";
     pixelDescription.stage = ShaderStage::Pixel;
 
@@ -140,6 +141,9 @@ void GGXMultiscatterIrradiancePass::Execute(
         return;
     }
 
+    // Every face of every mip is a render target for the whole pass, so the draws may overlap on the GPU (each is small and
+    // latency-bound); a transition after every draw serialized them. The draws and their results are unchanged.
+    irradianceCubemap.Transition(commandList, D3D12_RESOURCE_STATE_RENDER_TARGET);
     commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
     m_pipeline.Bind(commandList);
@@ -170,10 +174,6 @@ void GGXMultiscatterIrradiancePass::Execute(
 
         for (unsigned int face = 0; face < 6; ++face)
         {
-            const unsigned int subresource = mip + face * m_mipLevels;
-
-            irradianceCubemap.Transition(commandList, D3D12_RESOURCE_STATE_RENDER_TARGET, subresource);
-
             const unsigned int rtvIndex = face * m_mipLevels + mip;
 
             D3D12_CPU_DESCRIPTOR_HANDLE rtv = m_rtvHeap->GetCPUHandle(m_rtvIndices[rtvIndex]);
@@ -186,10 +186,10 @@ void GGXMultiscatterIrradiancePass::Execute(
             commandList->SetGraphicsRoot32BitConstants(0, 5, constants, 0);
 
             commandList->DrawInstanced(3, 1, 0, 0);
-
-            irradianceCubemap.Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, subresource);
         }
     }
+
+    irradianceCubemap.Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 }
 
 void GGXMultiscatterIrradiancePass::RecordFace(ID3D12GraphicsCommandList* commandList, Texture& sourceTexture,

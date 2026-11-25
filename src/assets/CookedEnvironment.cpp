@@ -60,6 +60,13 @@ HDRImageData Decode(std::span<const std::byte> bytes,const AssetID& id,std::uint
 }
 std::optional<HDRImageData> ReadArchive(const CookedScene::ArchiveScene& scene)
 {
+    // Physical sky S0: a Neutral or Physical sky renders the neutral environment underneath; the renderer's sky lights a
+    // Physical one.
+    if(SceneDocumentSkyType(scene.metadata.document) != SkyType::Hdri)
+    {
+        return {};
+    }
+
     if(scene.metadata.document.environmentReference.empty()) return {};
     if(scene.metadata.document.environmentReference == SceneDocument::NoneEnvironmentReference)
         return MakeBlackEnvironmentImage();
@@ -70,6 +77,11 @@ std::optional<HDRImageData> ReadArchive(const CookedScene::ArchiveScene& scene)
 }
 std::string ArchiveIdentity(const CookedScene::ArchiveScene& scene)
 {
+    if(SceneDocumentSkyType(scene.metadata.document) != SkyType::Hdri)
+    {
+        return "neutral";
+    }
+
     if(scene.metadata.document.environmentReference.empty()) return "neutral";
     if(scene.metadata.document.environmentReference == SceneDocument::NoneEnvironmentReference) return SceneDocument::NoneEnvironmentReference;
     return CookedSurface::Identity(*scene.provider,*AssetID::ParseReference(scene.metadata.document.environmentReference));

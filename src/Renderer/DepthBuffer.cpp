@@ -2,6 +2,7 @@
 #include "Debug/MemoryRegistry.h"
 #include "DescriptorHeap.h"
 #include "Core/Log.h"
+#include "Renderer/TextureMemoryAllocator.h"
 
 #include <string>
 
@@ -42,9 +43,17 @@ bool DepthBuffer::Initialize(
     clearValue.DepthStencil.Depth = 1.0f;
     clearValue.DepthStencil.Stencil = 0;
 
-    HRESULT result =
-        device->CreateCommittedResource(&heapProperties, D3D12_HEAP_FLAG_NONE, &description,
-                                        D3D12_RESOURCE_STATE_DEPTH_WRITE, &clearValue, IID_PPV_ARGS(&m_resource));
+    // Engine-owned memory on the renderer's thread, which the allocator activates on the frame recording
+    // (TextureMemoryAllocator.h); a committed resource otherwise.
+    HRESULT result = TextureMemoryAllocator::CreateTexture(device, description, D3D12_RESOURCE_STATE_DEPTH_WRITE,
+        &m_resource, &clearValue);
+
+    if (FAILED(result))
+    {
+        m_resource = nullptr;
+        result = device->CreateCommittedResource(&heapProperties, D3D12_HEAP_FLAG_NONE, &description,
+                                                 D3D12_RESOURCE_STATE_DEPTH_WRITE, &clearValue, IID_PPV_ARGS(&m_resource));
+    }
 
     if (FAILED(result))
     {

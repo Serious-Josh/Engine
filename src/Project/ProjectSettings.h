@@ -185,6 +185,60 @@ struct VolumetricRenderingSettings
     bool operator==(const VolumetricRenderingSettings&) const = default;
 };
 
+// Physical sky S4 (Physical_Sky_Design_Proposal.md §4.11, §4.12.5): an HDRI sky's resolution. The tier sizes the HDRI sky's
+// background equirect (its width; height is half) and its GGX reflection cube (a quarter of the width). 1024 uses the sky's two
+// persistent environment sets alone; 2048 and 4096 add one fixed background slot. Read once when the renderer starts (a change
+// applies from the next launch), because resizing would mean a release.
+enum class ProjectHdriSkyQuality
+{
+    Q1024,
+    Q2048,
+    Q4096
+};
+
+// The tier's background width in texels.
+inline unsigned int HdriSkyBackgroundWidth(ProjectHdriSkyQuality quality)
+{
+    return quality == ProjectHdriSkyQuality::Q4096 ? 4096u : (quality == ProjectHdriSkyQuality::Q2048 ? 2048u : 1024u);
+}
+
+// Physical sky S4 (§4.12.5): the sky's environment sets, for every sky type: the equirect width (lighting, importance sampling and
+// the HDRI sky's 1024-quality background) and the GGX reflection cube's size. Read once when the renderer starts.
+enum class ProjectSkyEnvironmentResolution
+{
+    R512,
+    R1024,
+    R2048
+};
+
+enum class ProjectSkyCubeSize
+{
+    C128,
+    C256,
+    C512
+};
+
+inline unsigned int SkyEnvironmentWidth(ProjectSkyEnvironmentResolution resolution)
+{
+    return resolution == ProjectSkyEnvironmentResolution::R2048 ? 2048u :
+        (resolution == ProjectSkyEnvironmentResolution::R512 ? 512u : 1024u);
+}
+
+inline unsigned int SkyCubeSize(ProjectSkyCubeSize size)
+{
+    return size == ProjectSkyCubeSize::C512 ? 512u : (size == ProjectSkyCubeSize::C128 ? 128u : 256u);
+}
+
+// Serialized as rendering.sky; an older file keeps 2048, 1024 and 256.
+struct SkyRenderingSettings
+{
+    ProjectHdriSkyQuality hdriQuality = ProjectHdriSkyQuality::Q2048;
+    ProjectSkyEnvironmentResolution environmentResolution = ProjectSkyEnvironmentResolution::R1024;
+    ProjectSkyCubeSize reflectionCubeSize = ProjectSkyCubeSize::C256;
+
+    bool operator==(const SkyRenderingSettings&) const = default;
+};
+
 // NVIDIA Reflex Low Latency, NVIDIA's three user-facing modes. Off (the default) is Engine's behaviour before Reflex.
 enum class ProjectReflexMode
 {
@@ -223,6 +277,8 @@ struct RenderingSettings
     // Serialized as rendering.latency; an older file keeps Off.
     LatencyRenderingSettings latency;
     FrameGenerationRenderingSettings frameGeneration;
+    // Physical sky S4: mode-independent, read at renderer start.
+    SkyRenderingSettings sky;
 
     bool operator==(const RenderingSettings&) const = default;
 };
@@ -273,6 +329,9 @@ std::string_view ToSerializedName(ProjectPathTraceDenoiserSignal value);
 std::string_view ToSerializedName(ProjectVolumetricQuality value);
 std::string_view ToSerializedName(ProjectVolumetricResolutionBasis value);
 std::string_view ToSerializedName(ProjectReflexMode value);
+std::string_view ToSerializedName(ProjectHdriSkyQuality value);
+std::string_view ToSerializedName(ProjectSkyEnvironmentResolution value);
+std::string_view ToSerializedName(ProjectSkyCubeSize value);
 
 // ProjectSettings.json as loaded: the effective settings, why they look the way they do, and the
 // retained document whose unknown members a later save writes back.

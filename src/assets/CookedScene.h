@@ -72,7 +72,20 @@ namespace CookedScene
     // R1.5: moving-solid participation: each physics record's airParticipation (u32), and the scene's AIR moving-solid enable (u32)
     // after the voxel bake. Earlier payloads read Automatic and off.
     inline constexpr std::uint32_t MovingSolidParticipationVersion = 37;
-    inline constexpr std::uint32_t Version = MovingSolidParticipationVersion;
+    // Physical sky S0: the scene's stored sky type and physical sky (SceneDocument::skyType, physicalSky), after the moving-solid
+    // setting. Earlier payloads store neither (the type is derived from the environment reference, DeriveSkyType). Only an Hdri sky
+    // with an asset reference carries an environment binding (SceneSkyUsesEnvironmentAsset).
+    inline constexpr std::uint32_t PhysicalSkyVersion = 38;
+    // Physical sky S2: a Light's range-attenuation word also carries bit 1, set when the light does not affect the atmosphere
+    // (LightComponent::affectsAtmosphere false). Earlier payloads allow bit 0 only and read true.
+    inline constexpr std::uint32_t LightAtmosphereVersion = 39;
+    // Physical sky S4: the HDRI sky's yaw (SceneLightingSettings::environmentRotationDegrees), one float after the sky record.
+    // Earlier payloads read 0.
+    inline constexpr std::uint32_t HdriRotationVersion = 40;
+    // Physical sky S5: with a physical sky, its night sky and cloud layers, after the HDRI rotation. Earlier payloads read the
+    // defaults (no clouds).
+    inline constexpr std::uint32_t CloudVersion = 41;
+    inline constexpr std::uint32_t Version = CloudVersion;
 
     constexpr bool IsSupportedVersion(std::uint32_t version)
     {
@@ -112,7 +125,11 @@ namespace CookedScene
             version == AirConfigurationVersion ||
             version == MistRenderingVersion ||
             version == VoxelBakeVersion ||
-            version == MovingSolidParticipationVersion;
+            version == MovingSolidParticipationVersion ||
+            version == PhysicalSkyVersion ||
+            version == LightAtmosphereVersion ||
+            version == HdriRotationVersion ||
+            version == CloudVersion;
     }
     struct Policy
     {

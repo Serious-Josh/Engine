@@ -164,6 +164,12 @@ bool SharcCache::EnsureResources(ID3D12Device* device, ShaderLibrary& shaderLibr
     m_clearNeeded = true;
     m_clearRecorded = false;
     ++m_diagnostics.allocations;
+#ifndef NDEBUG
+    // ManyLight PT-switch hang lead (temporary, Debug only).
+    Log::Info("SHARC hang trace: created " + std::to_string(BytesPerEntry << settings.capacityLog2) +
+        " bytes (capacity 2^" + std::to_string(settings.capacityLog2) + ") after submission fence " +
+        std::to_string(lastSubmissionFence) + ".");
+#endif
     return true;
 }
 
@@ -176,6 +182,12 @@ void SharcCache::Retire(std::uint64_t lastSubmissionFence)
         return;
     }
 
+#ifndef NDEBUG
+    // ManyLight PT-switch hang lead (temporary, Debug only; FgTiming_ManyLight_Switch_Hangs.md §12).
+    Log::Info("SHARC hang trace: retired " + std::to_string(BytesPerEntry << m_settings.capacityLog2) +
+        " bytes (capacity 2^" + std::to_string(m_settings.capacityLog2) + ") behind submission fence " +
+        std::to_string(lastSubmissionFence) + ".");
+#endif
     m_retired.push_back(RetiredResources{std::move(*m_resources), lastSubmissionFence});
     m_resources.reset();
     m_readbackRecorded[0] = false;
@@ -189,6 +201,18 @@ void SharcCache::ReleaseRetired(std::uint64_t completedFence)
     {
         if(m_retired[index].lastUseFence <= completedFence)
         {
+#ifndef NDEBUG
+            // ManyLight PT-switch hang lead (temporary, Debug only): the moment the retired set's memory is freed.
+            const auto bytes = [](const Buffer& buffer)
+            {
+                return buffer.GetResource() ? buffer.GetResource()->GetDesc().Width : 0ull;
+            };
+            const RetiredResources& retired = m_retired[index];
+            Log::Info("SHARC hang trace: released " + std::to_string(bytes(retired.resources.hashEntries) +
+                bytes(retired.resources.accumulation) + bytes(retired.resources.resolved) +
+                bytes(retired.resources.statistics)) + " bytes of a set retired behind fence " +
+                std::to_string(retired.lastUseFence) + " (completed fence " + std::to_string(completedFence) + ").");
+#endif
             ReleaseResources(m_retired[index].resources);
             m_retired.erase(m_retired.begin() + static_cast<std::ptrdiff_t>(index));
         }

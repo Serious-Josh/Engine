@@ -12,9 +12,11 @@
 Texture::Texture(Texture&& other) noexcept
     : m_retained(std::move(other.m_retained)), m_resource(other.m_resource), m_width(other.m_width), m_height(other.m_height), m_srvIndex(other.m_srvIndex),
       m_uavIndex(other.m_uavIndex), m_descriptorHeap(other.m_descriptorHeap),
-      m_initialData(std::move(other.m_initialData)), m_format(other.m_format)
+      m_initialData(std::move(other.m_initialData)), m_format(other.m_format),
+      m_activationPending(other.m_activationPending)
 {
     m_subresourceStates.TakeFrom(other.m_subresourceStates, {});
+    other.m_activationPending = false;
     other.m_resource = nullptr;
     other.m_width = 0;
     other.m_height = 0;
@@ -43,9 +45,11 @@ Texture& Texture::operator=(Texture&& other) noexcept
         m_uavIndex = other.m_uavIndex;
         m_descriptorHeap = other.m_descriptorHeap;
         m_format = other.m_format;
+        m_activationPending = other.m_activationPending;
 
         m_subresourceStates.TakeFrom(other.m_subresourceStates, {});
 
+        other.m_activationPending = false;
         other.m_srvIndex = UINT_MAX;
         other.m_uavIndex = UINT_MAX;
         other.m_descriptorHeap = nullptr;
@@ -173,9 +177,11 @@ bool Texture::Initialize(
     D3D12_HEAP_PROPERTIES heapProperties{};
     heapProperties.Type = D3D12_HEAP_TYPE_DEFAULT;
 
-    // Large textures live in Engine-owned heaps that are never returned to the OS during a session
-    // (TextureMemoryAllocator.h); the rest, and everything the allocator declines, are committed resources.
+    // Large textures and the renderer's unordered-access textures live in Engine-owned heaps that are never returned to
+    // the OS during a session (TextureMemoryAllocator.h); the rest, and everything the allocator declines, are committed
+    // resources.
     HRESULT result = TextureMemoryAllocator::CreateTexture(device, description, initialState, &m_resource);
+    const bool placed = SUCCEEDED(result);
 
     if (FAILED(result))
     {
@@ -210,6 +216,7 @@ bool Texture::Initialize(
     m_height = height;
     m_format = format;
     m_initialData.clear();
+    m_activationPending = placed;
 
     return true;
 }
@@ -303,6 +310,7 @@ void Texture::Shutdown()
     }
 
     m_subresourceStates.Reset({});
+    m_activationPending = false;
     m_srvIndex = UINT_MAX;
     m_descriptorHeap = nullptr;
     m_width = 0;
@@ -343,6 +351,14 @@ void Texture::Transition(
     }
 
     const D3D12_RESOURCE_STATES currentState = m_subresourceStates.Get()[subresource];
+
+    // A placed texture's first transition precedes its first use: activate it first if no one did (every subresource is
+    // still in its creation state).
+    if (m_activationPending)
+    {
+        m_activationPending = false;
+        TextureMemoryAllocator::RecordActivation(commandList, m_resource, currentState);
+    }
 
     if (currentState == newState)
     {

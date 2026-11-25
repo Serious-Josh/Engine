@@ -4,6 +4,7 @@
 #include "Debug/StreamingTelemetry.h"
 #include "Core/Log.h"
 #include "ResourceStateTransaction.h"
+#include "TextureMemoryAllocator.h"
 #ifdef _DEBUG
 #include "GraphicsDevice.h"
 #endif
@@ -364,11 +365,15 @@ bool CommandContext::Begin(unsigned int frameIndex)
 
     // R.1: the tracked resource states this recording changes stay provisional until Execute submits it.
     ResourceStateTransaction::BeginRecording(m_commandList, m_rayTracingCommandList);
+    // Placed render-thread targets created since the last recording (or whose activation was discarded) are activated
+    // first; the ones created while this recording is open, at once (TextureMemoryAllocator.h).
+    TextureMemoryAllocator::BeginFrameRecording(m_commandList);
     return true;
 }
 
 bool CommandContext::End()
 {
+    TextureMemoryAllocator::EndFrameRecording();
     return SUCCEEDED(m_commandList->Close());
 }
 
@@ -380,8 +385,10 @@ bool CommandContext::AbortRecording()
     }
 
     // Close the command list without submitting it.
-    // The next Begin() will reset it. R.1: its barriers never run, so the tracked states return to the submitted ones.
+    // The next Begin() will reset it. R.1: its barriers never run, so the tracked states return to the submitted ones, and
+    // the texture activations it held are recorded again by the next Begin.
     ResourceStateTransaction::DiscardRecording();
+    TextureMemoryAllocator::EndFrameRecording();
     return SUCCEEDED(m_commandList->Close());
 }
 
@@ -1002,6 +1009,7 @@ bool CommandContext::DiscardCommandsAfterGPUDrain()
 
     // R.1: an open recording on the old list is never submitted.
     ResourceStateTransaction::DiscardRecording();
+    TextureMemoryAllocator::EndFrameRecording();
 
     // Use a fresh allocator: the old list might still be open or poisoned by
     // a failed Close/Reset. Nothing is replaced until the new closed list is ready.

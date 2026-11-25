@@ -631,6 +631,25 @@ void Editor::DrawRenderingSettingsCategory(const DebugUI& debugUI, bool editable
         "output image. The fog is always composited at the output.");
     SessionOverrideNote(debugUI, Field::volumetricResolutionBasis);
 
+    // Physical sky S4 (§4.11, §4.12.5): the sky's resources, allocated once when Engine starts.
+    ImGui::SeparatorText("Sky");
+    const char* environmentResolutions[] = {"512 (2 x 7 MiB)", "1024 (2 x 12 MiB, default)", "2048 (2 x 38 MiB)"};
+    DraftCombo("Environment resolution", draft.sky.environmentResolution, environmentResolutions);
+    Tooltip("The sky's environment (every sky type): the equirect every lighting mode lights and importance-samples from, and its\n"
+        "importance tables. Two sets are kept (one shown, one rebuilt). Larger is sharper in reflections and in the 1024 HDRI\n"
+        "background, and costs more memory and rebuild time.");
+    const char* cubeSizes[] = {"128", "256 (default)", "512"};
+    DraftCombo("Reflection cube size", draft.sky.reflectionCubeSize, cubeSizes);
+    Tooltip("The GGX-prefiltered reflection cube of the sky's sets (smooth reflections of the sky in Legacy and raster lighting).");
+    const char* hdriSkyQualities[] = {"1024 (the sky's sets only)", "2048 (background slot +37 MiB)",
+        "4096 (background slot +149 MiB)"};
+    DraftCombo("HDRI sky quality", draft.sky.hdriQuality, hdriSkyQualities);
+    Tooltip("An HDRI sky's background and reflection-cube resolution: the equirect width (2048 or 4096) and a GGX cube a quarter of\n"
+        "that. Lighting and importance sampling always use the sky's 1024 environment. The memory is allocated once at\n"
+        "startup and never released during a session, so a change applies from the next launch, in the Editor and in built\n"
+        "games.");
+    ImGui::TextDisabled("Applies from the next launch.");
+
     // FG.3: DLSS Frame Generation (2x), in every lighting mode, Editor viewport only for now.
     ImGui::SeparatorText("DLSS Frame Generation");
     ImGui::Checkbox("Frame Generation (2x)", &draft.frameGeneration.enabled);

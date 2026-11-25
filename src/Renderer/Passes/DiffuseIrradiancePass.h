@@ -13,11 +13,13 @@ class Texture;
 class DiffuseIrradiancePass
 {
     public:
+    // shaderPath: the pass's shader file, or a variant that includes it with other sample counts (the physical sky's).
     bool Initialize(
       ID3D12Device* device,
       ShaderLibrary& shaderLibrary,
       DescriptorHeap& rtvHeap,
-      Texture& irradianceCubemap);
+      Texture& irradianceCubemap,
+      const char* shaderPath = "DiffuseIrradiance.hlsl");
     void Execute(
         ID3D12GraphicsCommandList* commandList,
         Texture& sourceTexture,

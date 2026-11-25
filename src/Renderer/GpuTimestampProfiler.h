@@ -99,6 +99,11 @@ class GpuTimestampProfiler
         RestirPtReGIR,
         // FG.3: the NGX Frame Generation evaluation (generated frame), after the Editor overlays.
         FrameGenerationEvaluate,
+        // Physical sky S1: SkyAtmosphere's re-bake (passes [1]-[5]) on the frames that record one; about zero otherwise.
+        PhysicalSkyBake,
+        // Physical sky S3: the aerial perspective's composite, and (S4) its volume.
+        PhysicalSkyAerialPerspective,
+        PhysicalSkyAerialVolume,
         Count
     };
 

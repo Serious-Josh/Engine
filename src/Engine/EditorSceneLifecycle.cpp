@@ -534,6 +534,7 @@ void Engine::ContinueEditorSceneOperation()
 
         if(CreateCleanSceneDocument(document, &error))
         {
+            ApplyNewSceneSkyDefaults(document);
             m_demoSceneManager.RequestUnsavedScene(std::move(document), &error);
         }
 

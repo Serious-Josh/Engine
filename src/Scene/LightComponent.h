@@ -48,6 +48,9 @@ inline const char* LightTypeName(LightType type)
 //   Neither changes the light's flux definition.
 // - intensity, Directional: illuminance in lux on a surface facing the light.
 // - angularRadius (radians), Directional: the sun disk half-angle (shadow owner only).
+// - affectsAtmosphere, Directional (physical sky S2, HDRP's "Affect Physically Based Sky"): with a physical sky, the sun owner's
+//   intensity is its illuminance above the atmosphere; the atmosphere attenuates and tints it on the way down and it lights the
+//   sky. Off keeps the authored illuminance at the ground and the light does not light the sky. No effect without a physical sky.
 // - innerConeAngle/outerConeAngle (radians), Spot: half-angles from the +Z axis.
 struct LightComponent
 {
@@ -65,6 +68,7 @@ struct LightComponent
     Vector3 color{1.0f, 1.0f, 1.0f};
     float intensity = 1000.0f; // Lumens: roughly a 75 W incandescent bulb.
     float angularRadius = ToRadians(0.27f);
+    bool affectsAtmosphere = true;
     float range = 10.0f;
     bool rangeAttenuation = true;
     float innerConeAngle = 0.34906585040f; // 20 degrees.
@@ -74,7 +78,8 @@ struct LightComponent
     {
         return enabled == other.enabled && type == other.type && color.x == other.color.x &&
             color.y == other.color.y && color.z == other.color.z && intensity == other.intensity &&
-            angularRadius == other.angularRadius && range == other.range && rangeAttenuation == other.rangeAttenuation &&
+            angularRadius == other.angularRadius && affectsAtmosphere == other.affectsAtmosphere && range == other.range &&
+            rangeAttenuation == other.rangeAttenuation &&
             innerConeAngle == other.innerConeAngle &&
             outerConeAngle == other.outerConeAngle;
     }

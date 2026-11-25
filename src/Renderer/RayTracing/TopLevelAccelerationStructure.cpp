@@ -3,6 +3,7 @@
 #include "Debug/StreamingTelemetry.h"
 #include "Core/Log.h"
 #include "BottomLevelAccelerationStructure.h"
+#include "Renderer/TextureMemoryAllocator.h"
 #include "Math/Matrix4.h"
 
 #include <algorithm>
@@ -190,9 +191,18 @@ bool TopLevelAccelerationStructure::Initialize(
 
     resourceDescription.Width =
         (std::max)(prebuildInfo.ScratchDataSizeInBytes, prebuildInfo.UpdateScratchDataSizeInBytes);
-    HRESULT result =
-        device->CreateCommittedResource(&defaultHeapProperties, D3D12_HEAP_FLAG_NONE, &resourceDescription,
-                                        D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&m_scratchResource));
+    // Scratch and result in Engine-owned memory (TextureMemoryAllocator.h), activated below before the build; committed
+    // otherwise.
+    const TextureMemoryAllocator::ActivatedBufferScope placement;
+    HRESULT result = TextureMemoryAllocator::CreateBuffer(device, resourceDescription, D3D12_RESOURCE_STATE_COMMON,
+        &m_scratchResource);
+
+    if (FAILED(result))
+    {
+        m_scratchResource = nullptr;
+        result = device->CreateCommittedResource(&defaultHeapProperties, D3D12_HEAP_FLAG_NONE, &resourceDescription,
+                                                 D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&m_scratchResource));
+    }
 
     if (FAILED(result))
     {
@@ -205,9 +215,16 @@ bool TopLevelAccelerationStructure::Initialize(
 
     resourceDescription.Width = prebuildInfo.ResultDataMaxSizeInBytes;
 
-    result = device->CreateCommittedResource(&defaultHeapProperties, D3D12_HEAP_FLAG_NONE, &resourceDescription,
-                                             D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE, nullptr,
-                                             IID_PPV_ARGS(&m_resource));
+    result = TextureMemoryAllocator::CreateBuffer(device, resourceDescription,
+        D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE, &m_resource);
+
+    if (FAILED(result))
+    {
+        m_resource = nullptr;
+        result = device->CreateCommittedResource(&defaultHeapProperties, D3D12_HEAP_FLAG_NONE, &resourceDescription,
+                                                 D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE, nullptr,
+                                                 IID_PPV_ARGS(&m_resource));
+    }
 
     if (FAILED(result))
     {
@@ -217,6 +234,9 @@ bool TopLevelAccelerationStructure::Initialize(
     }
 
     MemoryRegistry::TrackResource(m_resource, MemoryCategory::AccelerationStructures);
+    // The build writes both in full; a reused range needs only the aliasing barrier.
+    TextureMemoryAllocator::RecordActivation(commandList, m_scratchResource, D3D12_RESOURCE_STATE_COMMON);
+    TextureMemoryAllocator::RecordActivation(commandList, m_resource, D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE);
 
     D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC buildDescription{};
     buildDescription.Inputs = buildInputs;

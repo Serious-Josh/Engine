@@ -381,12 +381,17 @@ void Renderer::RecordEnvironmentPreparation(ID3D12GraphicsCommandList* commandLi
 
     if(job.stage == EnvironmentPreparationStage::Copy)
     {
-        // Placed environment textures start undefined: activate them before the first copy or draw
-        // (TextureMemoryAllocator.h; each is activated once).
+        // Placed environment resources start undefined: activate them before the first copy or draw
+        // (TextureMemoryAllocator.h; each is activated once). The CDF buffers are in COMMON until their copies.
         for(Texture* texture : {&environment.GetSourceTexture(), &environment.GetCubemap(),
                 &environment.GetDiffuseIrradiance(), &environment.GetGGXMultiscatterIrradiance()})
         {
             TextureMemoryAllocator::RecordActivation(commandList, texture->GetResource(), texture->GetSubresourceState(0));
+        }
+
+        for(StructuredBuffer* buffer : {&environment.GetImportanceConditionalCDF(), &environment.GetImportanceMarginalCDF()})
+        {
+            TextureMemoryAllocator::RecordActivation(commandList, buffer->GetResource(), D3D12_RESOURCE_STATE_COMMON);
         }
 
         // Mip 0 rows, then the CDFs, at most the copy budget per frame. The texture is in COPY_DEST since creation; the

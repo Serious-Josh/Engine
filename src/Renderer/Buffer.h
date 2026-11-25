@@ -107,10 +107,13 @@ class Buffer
     unsigned int GetUAVDescriptorIndex() const;
 
     private:
+    // placementAllowed: the buffer may be placed in Engine-owned memory (TextureMemoryAllocator.h); false keeps it
+    // committed (seeded buffers, whose unwritten remainder owners may expect zeroed).
     bool AllocateGPUWritable(
       ID3D12Device* device,
       size_t capacityBytes,
-      D3D12_RESOURCE_STATES initialState);
+      D3D12_RESOURCE_STATES initialState,
+      bool placementAllowed = true);
     ID3D12Resource* m_resource = nullptr;
 
     DescriptorHeap* m_descriptorHeap = nullptr;

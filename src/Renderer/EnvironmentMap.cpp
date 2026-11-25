@@ -144,9 +144,9 @@ bool EnvironmentMap::Initialize(ID3D12Device* device,const HDRImageData& source,
     float radianceScale)
 {
     const MemoryCategoryScope memoryScope(MemoryCategory::MeshesTextures);
-    // The source and the cube may be placed in Engine-owned heaps: the uploader activates the source before its copy and
-    // the renderer's environment preprocessing activates the cube before its first draw.
-    const TextureMemoryAllocator::RenderablePlacementScope placement;
+    // Every environment resource is placed in Engine-owned heaps: the uploader activates the source and the CDF buffers
+    // before their copies, and the renderer's environment preprocessing activates the cubes before their first draws.
+    const TextureMemoryAllocator::ActivatedPlacementScope placement;
 
     if(source.width == 0 || source.height == 0 || source.channels != 4 ||
         source.pixels.size() != static_cast<size_t>(source.width) * source.height * 4)
@@ -268,13 +268,21 @@ constexpr unsigned int GGXMultiscatterMipLevels = 7;
 // registry entry, no logging).
 bool EnvironmentMap::CreatePrecomputeTargetResources(ID3D12Device* device, bool trackMemory)
 {
-    return m_cubemap.Initialize(device, CubemapSize, CubemapSize, 6, CubemapMipLevels, DXGI_FORMAT_R16G16B16A16_FLOAT,
-               D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET, trackMemory) &&
-        m_diffuseIrradiance.Initialize(device, DiffuseIrradianceSize, DiffuseIrradianceSize, 6, 1,
-            DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET,
+    return CreatePrecomputeTargetResources(device, trackMemory, CubemapSize, CubemapMipLevels, DiffuseIrradianceSize,
+        GGXMultiscatterSize, GGXMultiscatterMipLevels, D3D12_RESOURCE_STATE_RENDER_TARGET);
+}
+
+bool EnvironmentMap::CreatePrecomputeTargetResources(ID3D12Device* device, bool trackMemory, unsigned int cubemapSize,
+    unsigned int cubemapMipLevels, unsigned int irradianceSize, unsigned int multiscatterSize, unsigned int multiscatterMipLevels,
+    D3D12_RESOURCE_STATES initialState)
+{
+    return m_cubemap.Initialize(device, cubemapSize, cubemapSize, 6, cubemapMipLevels, DXGI_FORMAT_R16G16B16A16_FLOAT,
+               D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, initialState, trackMemory) &&
+        m_diffuseIrradiance.Initialize(device, irradianceSize, irradianceSize, 6, 1,
+            DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, initialState,
             trackMemory) &&
-        m_ggxMultiscatterIrradiance.Initialize(device, GGXMultiscatterSize, GGXMultiscatterSize, 6, GGXMultiscatterMipLevels,
-            DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET,
+        m_ggxMultiscatterIrradiance.Initialize(device, multiscatterSize, multiscatterSize, 6, multiscatterMipLevels,
+            DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, initialState,
             trackMemory);
 }
 
@@ -342,9 +350,9 @@ bool EnvironmentMap::CreateResourcesForUpload(ID3D12Device* device, unsigned int
         return false;
     }
 
-    // The source and the cube are large render-target textures: they may be placed in Engine-owned heaps, and
+    // Every environment resource (source, cubes, importance CDFs) is placed in Engine-owned heaps;
     // Renderer::RecordEnvironmentPreparation activates them before their first use.
-    const TextureMemoryAllocator::RenderablePlacementScope placement;
+    const TextureMemoryAllocator::ActivatedPlacementScope placement;
     m_importanceWidth = width;
     m_importanceHeight = height;
     m_importanceTotalWeight = totalWeight;
@@ -372,6 +380,46 @@ bool EnvironmentMap::CreateViewsForUpload(ID3D12Device* device, DescriptorHeap& 
     }
 
     return CreatePrecomputeTargetViews(device, descriptorHeap);
+}
+
+bool EnvironmentMap::InitializePersistentSky(ID3D12Device* device, DescriptorHeap& descriptorHeap, const PersistentSkyLayout& layout)
+{
+    const MemoryCategoryScope memoryScope(MemoryCategory::MeshesTextures);
+
+    if(!device || m_sourceTexture.GetResource() || layout.width == 0 || layout.height == 0 || layout.cubemapSize == 0 ||
+        layout.cubemapMipLevels == 0 || layout.irradianceSize == 0 || layout.multiscatterSize == 0 || layout.multiscatterMipLevels < 2)
+    {
+        Log::Error("Invalid persistent sky environment layout.");
+        return false;
+    }
+
+    // No ActivatedPlacementScope: render-target and unordered-access resources then stay committed (TextureMemoryAllocator.h), so
+    // nothing here needs RecordActivation, and nothing is ever returned to the allocator during the session.
+    constexpr D3D12_RESOURCE_STATES shaderRead =
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    m_importanceWidth = layout.width;
+    m_importanceHeight = layout.height;
+    m_importanceTotalWeight = 1.0f;
+
+    const bool created =
+        m_sourceTexture.Initialize(device, layout.width, layout.height, 1, SourceMipLevels(layout.width, layout.height),
+            DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            shaderRead) &&
+        m_sourceTexture.CreateSRV(device, descriptorHeap) && m_sourceTexture.CreateUAV(device, descriptorHeap) &&
+        m_importanceConditionalCDF.InitializeUnorderedStorage(device, sizeof(float), layout.width * layout.height, descriptorHeap) &&
+        m_importanceMarginalCDF.InitializeUnorderedStorage(device, sizeof(float), layout.height, descriptorHeap) &&
+        CreatePrecomputeTargetResources(device, true, layout.cubemapSize, layout.cubemapMipLevels, layout.irradianceSize,
+            layout.multiscatterSize, layout.multiscatterMipLevels, shaderRead) &&
+        CreatePrecomputeTargetViews(device, descriptorHeap);
+
+    if(!created)
+    {
+        Log::Error("Failed to create a persistent sky environment set.");
+        Shutdown();
+        return false;
+    }
+
+    return true;
 }
 
 void EnvironmentMap::Swap(EnvironmentMap& other) noexcept

@@ -122,6 +122,7 @@ bool CaptureSceneDocument(
         {
             candidate.environmentReference = source.environmentReference;
             candidate.lightingSettings.environmentLuminanceScale = source.lightingSettings.environmentLuminanceScale;
+            candidate.lightingSettings.environmentRotationDegrees = source.lightingSettings.environmentRotationDegrees;
         }
 
         if(!source.environmentOverrides.exposure)
@@ -174,6 +175,11 @@ bool SceneDocumentsEqual(
     if(left.airEnvironment != right.airEnvironment) return false;
     if(left.airSimulation != right.airSimulation) return false;
     if(left.environmentalHaze != right.environmentalHaze) return false;
+
+    if(left.skyType != right.skyType || left.physicalSky != right.physicalSky)
+    {
+        return false;
+    }
 
     for (std::size_t index = 0; index < left.objects.size(); ++index)
     {

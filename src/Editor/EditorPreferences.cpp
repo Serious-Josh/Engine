@@ -31,7 +31,8 @@ namespace
         message += addition;
     }
 
-    void ReadBool(const nlohmann::json& object, const char* key, bool& value, std::string& message)
+    void ReadBool(const nlohmann::json& object, const char* key, bool& value, std::string& message,
+        const char* group = "viewport")
     {
         const auto found = object.find(key);
 
@@ -42,7 +43,7 @@ namespace
 
         if(!found->is_boolean())
         {
-            AppendMessage(message, std::string("viewport.") + key + " is not a boolean; using the default.");
+            AppendMessage(message, std::string(group) + "." + key + " is not a boolean; using the default.");
             return;
         }
 
@@ -177,6 +178,13 @@ EditorPreferences EditorPreferences::Parse(std::string_view text, LoadResult& re
         ReadBool(*viewport, "gridVisible", preferences.m_viewport.gridVisible, result.message);
     }
 
+    const auto windows = document.find("windows");
+
+    if(windows != document.end() && windows->is_object())
+    {
+        ReadBool(*windows, "sky", preferences.m_windows.skyWindowVisible, result.message, "windows");
+    }
+
     const auto recent = document.find("recentProjects");
 
     if(recent != document.end() && recent->is_array())
@@ -225,6 +233,15 @@ std::string EditorPreferences::Serialize() const
     viewport["rotationSnapIntervalDegrees"] = m_viewport.rotationSnapIntervalDegrees;
     viewport["gridVisible"] = m_viewport.gridVisible;
 
+    auto& windows = document["windows"];
+
+    if(!windows.is_object())
+    {
+        windows = nlohmann::json::object();
+    }
+
+    windows["sky"] = m_windows.skyWindowVisible;
+
     nlohmann::json recent = nlohmann::json::array();
 
     for(const auto& project : m_recentProjects)
@@ -249,6 +266,16 @@ const ViewportPreferences& EditorPreferences::GetViewport() const noexcept
 void EditorPreferences::SetViewport(const ViewportPreferences& viewport)
 {
     m_viewport = viewport;
+}
+
+const EditorWindowPreferences& EditorPreferences::GetWindows() const noexcept
+{
+    return m_windows;
+}
+
+void EditorPreferences::SetWindows(const EditorWindowPreferences& windows)
+{
+    m_windows = windows;
 }
 
 const std::vector<RecentProject>& EditorPreferences::GetRecentProjects() const noexcept

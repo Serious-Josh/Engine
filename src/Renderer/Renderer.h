@@ -38,6 +38,9 @@
 #include "SwapChain.h"
 #include "EnvironmentMap.h"
 #include "EnvironmentPreparation.h"
+#include "SkyAtmosphere.h"
+#include "SkyHdriPreparation.h"
+#include "SunAtmosphere.h"
 #include "RenderTarget.h"
 #include "DisplacementGPUPatchBuffer.h"
 #include "Displacement/DisplacementUpdateState.h"
@@ -223,6 +226,15 @@ struct RendererOptions
     // Snap automatic exposure to its target this frame (scene activation); camera cuts and reference-exposure
     // changes snap on their own.
     bool exposureReset = false;
+    // Physical sky S1: the scene's effective physical sky while its effective sky type is Physical
+    // (FileBackedDemoScene::GetEffectivePhysicalSky, or the Sky window's held drag). Absent: the S0.5 environment (HDRI, neutral
+    // or none) lights the frame. Copied by value.
+    std::optional<PhysicalSkySettings> physicalSky;
+    // S4: rebuild the physical sky now (its On Demand update; the Sky window's Update Now).
+    bool physicalSkyUpdateRequest = false;
+    // S4, HDRI option A: the frame's effective sky is the HDRI sky last requested with RequestSkyHdri. The sky's persistent sets
+    // light the frame once they hold it (until then, whatever they published last; before any publication, the S0.5 environment).
+    bool hdriSky = false;
 };
 
 // UPSCALING.3B: Engine's per-frame upscaler input contract, filled on frames that prepare DLSS inputs. Everything a
@@ -541,6 +553,9 @@ class Renderer
     const Matrix4& GetRecordedView() const noexcept { return m_recordedView; }
     const Matrix4& GetRecordedProjection() const noexcept { return m_recordedProjection; }
     std::uint64_t GetCameraCutCount() const noexcept { return m_cameraCutCount; }
+    // Physical sky S5B: the lighting cuts applied (a 2-stop jump of the sun, a Directional or the published sky), each handled as a
+    // camera cut.
+    std::uint64_t GetLightingCutCount() const noexcept { return m_lightingCutCount; }
     // LIGHT.1 evidence: the sun and the deferred light count of the last recorded frame.
     const DirectionalLight& GetRecordedSun() const noexcept { return m_recordedSun; }
     std::uint32_t GetRecordedAdditionalLightCount() const noexcept { return m_recordedAdditionalLightCount; }
@@ -927,6 +942,30 @@ class Renderer
         float radianceScale = 1.0f);
     const std::string& GetEnvironmentIdentity() const noexcept { return m_environmentIdentity; }
 
+    // Physical sky S1: the renderer's persistent atmosphere (its published generation and failure, for the Editor and tests).
+    const SkyAtmosphere& GetSkyAtmosphere() const noexcept { return m_skyAtmosphere; }
+    // Whether the most recent frame lit from the physical sky's published environment.
+    bool IsSkyEnvironmentActive() const noexcept { return m_skyEnvironmentThisFrame; }
+
+    // Physical sky S4 (§4.11, §4.12.5): the sky's sizes (the Sky project settings: environment width, reflection cube size and the
+    // HDRI sky quality), read when the scene renderer initializes; later calls change nothing (the resources are allocated once
+    // for the session).
+    void SetSkyResourceSizes(unsigned int environmentWidth, unsigned int cubeSize, unsigned int hdriBackgroundWidth) noexcept
+    {
+        m_skyResourceSizes.environmentWidth = environmentWidth;
+        m_skyResourceSizes.cubeSize = cubeSize;
+        m_skyResourceSizes.hdriBackgroundWidth = hdriBackgroundWidth;
+    }
+    // Prepares an HDRI sky on a worker; the sky's sets then bake it (RendererOptions::hdriSky frames). The previous HDRI sky keeps
+    // rendering until the new one publishes. The ticket (never 0) is Published once the sky's published set holds it, Failed when
+    // the preparation fails (those frames then light from the S0.5 environment). Supersedes any earlier request.
+    std::uint64_t RequestSkyHdri(SkyHdriSource source);
+    // Forgets the HDRI sky request (Physical, Neutral and None skies); its preparation is cancelled. QuerySkyHdri (below, with the
+    // S0.5 states) observes a request.
+    void ClearSkyHdri();
+    // The prepared HDRI sky (null while none is prepared).
+    const SkyHdriTexels* GetPreparedSkyHdri() const noexcept { return m_skyHdri.get(); }
+
     // S0.5 asynchronous environment replacement (see EnvironmentPreparation.h). Rendering keeps the published environment
     // until the requested one is fully prepared on the GPU; it then becomes active at the start of a frame. Only the newest
     // request can publish: every request supersedes the previous one, and synchronous SetEnvironment/SetEnvironmentImage
@@ -941,6 +980,8 @@ class Renderer
         Superseded,
     };
     EnvironmentPreparationState QueryEnvironmentPreparation(std::uint64_t ticket, std::string* error = nullptr) const;
+    // Physical sky S4: an HDRI sky request's state (RequestSkyHdri), in the same states.
+    EnvironmentPreparationState QuerySkyHdri(std::uint64_t ticket, std::string* error = nullptr) const;
     void CancelEnvironmentPreparation();
     // Also true while a replaced environment or staging buffer waits for its fence, so a settled scene's memory is final.
     bool IsEnvironmentPreparationPending() const noexcept
@@ -1247,6 +1288,10 @@ class Renderer
     private:
     friend class MeshResidencyPublication;
     friend class FileSceneRuntime;
+#if defined(ENGINE_HAS_S0_RELEASE_DRIVER)
+    // Local Release diagnostics drivers (Git-ignored, diagnostics builds only) run inside Engine::Frame.
+    friend class Engine;
+#endif
 #if defined(ENGINE_HAS_VERIFICATION)
     friend class PresentationTransformVerification;
     friend class ScenePhysicsDataVerification;
@@ -1724,8 +1769,14 @@ class Renderer
     bool m_pathTraceWorkloadGuarded = false;
     std::uint64_t m_pathTraceWorkloadGuardChanges = 0;
     double m_pathTraceWorkloadEstimateMilliseconds = 0.0;
+    // atmosphere: the frame's physical sky (S2 sun coupling), or null. A cached frame lighting is reused while the sky's settings
+    // are equal and the camera altitude stays within SunAltitudeTolerance of the one it was built for.
     std::shared_ptr<const FrameLighting> AcquireFrameLighting(const DirectionalLight& legacySun,
-        const SceneLightingSnapshot* snapshot, const SceneLightingSettings& proceduralSettings, std::uint64_t& revision);
+        const SceneLightingSnapshot* snapshot, const SceneLightingSettings& proceduralSettings, std::uint64_t& revision,
+        const SunAtmosphere* atmosphere = nullptr);
+    // Physical sky S2: the camera altitude change (m) that rebuilds a coupled frame lighting (the sun's transmittance changes by
+    // about 0.1% over it at the ground).
+    static constexpr double SunAltitudeTolerance = 10.0;
     // M4.1: builds (or reuses, for the same non-zero revision) the shared light-sampling structures of the frame's published
     // light table and records their publication; returns the frame's LightSamplingConstants address (0 when disabled).
     D3D12_GPU_VIRTUAL_ADDRESS RecordLightSampling(ID3D12GraphicsCommandList* commandList, const FrameLighting& lighting,
@@ -1809,6 +1860,41 @@ class Renderer
     std::uint64_t m_frameLightingCacheRevision = 0;
     DirectionalLight m_frameLightingCacheSun;
     SceneLightingSettings m_frameLightingCacheSettings;
+    std::optional<SunAtmosphere> m_frameLightingCacheAtmosphere;
+    // Physical sky S2: the published sky's inputs SHARC last saw (its global discontinuity rule for sky edits).
+    std::optional<SkyAtmosphere::BakeInputs> m_sharcSkyInputs;
+    // Diagnostics (Release sky checks): false draws the physical sky's backgrounds from the equirect, as in S1-S2, instead of
+    // the sky-view map.
+    bool m_skyViewBackgroundForTesting = true;
+    // Diagnostics (Release sky checks): false draws an HDRI sky's background and reflection cube from the sets (1024) instead of
+    // the background slot.
+    bool m_hdriBackgroundForTesting = true;
+    // Diagnostics (Release sky checks, S5): false skips the camera-cloud composite (the double-cloud check).
+    bool m_cloudCompositeForTesting = true;
+    // S4, HDRI option A: the quality, the request and its preparation (the newest job; superseded jobs drain until their
+    // worker finishes, so no frame waits on a load), the prepared HDRI the sets bake, and what the previous sky frame showed
+    // (an HDRI identity, or empty for the physical sky) and with which background.
+    SkyAtmosphere::ResourceSizes m_skyResourceSizes{1024, 256, 2048, 2};
+    std::unique_ptr<SkyHdriJob> m_skyHdriJob;
+    std::vector<std::unique_ptr<SkyHdriJob>> m_skyHdriDrainingJobs;
+    std::shared_ptr<const SkyHdriTexels> m_skyHdri;
+    bool m_skyHdriRequested = false;
+    // Whether m_skyHdri is the newest request's HDRI (while a newer one prepares, the previous one keeps rendering but cannot resolve
+    // the newer request).
+    bool m_skyHdriCurrent = false;
+    bool m_skyHdriSnapExposure = false;
+    std::uint64_t m_skyHdriLatestTicket = 0;
+    EnvironmentPreparationState m_skyHdriState = EnvironmentPreparationState::Unknown;
+    std::string m_skyHdriError;
+    std::optional<std::string> m_frameSkyIdentity;
+    // The frame's background and reflection cube when the HDRI background slot serves them (null: the published set's).
+    Texture* m_frameHdriBackground = nullptr;
+    Texture* m_frameHdriReflectionCube = nullptr;
+    // Frame start: adopts finished HDRI sky preparations and resolves the request once the sky publishes it.
+    void UpdateSkyHdri();
+    void ResolveSkyHdriPublication();
+    // The frame's GGX reflection cube: the HDRI background slot's when it serves the frame, else ActiveEnvironment()'s.
+    Texture& FrameReflectionCube() noexcept;
     // M3.5 ENGINE_DIAG_LIGHT_PUBLICATION_VERIFY (Debug): reused frame lightings checked and differences found.
     std::uint64_t m_frameLightingVerifications = 0;
     std::uint64_t m_frameLightingMismatches = 0;
@@ -2286,11 +2372,12 @@ private:
     bool EnsureLegacyLightingExtent();
 
     // M0c.2 / M0c.3: the residency policy shared by the Legacy and Path Tracing resource owners (ModeResourceResidency.h).
-    // An inactive mode keeps its resources until DXGI reports memory pressure (or its owner's own rule makes them due),
-    // not after a grace period: releasing hundreds of MiB of GPU-used memory can hang the next first traversals of new
-    // acceleration structures on the RTX 4080 with driver 621.01 (Documentation/Rendering/
-    // FgTiming_ManyLight_Switch_Hangs.md), and VRAM is not the bottleneck. AIR's storage and vector views follow the same
-    // rule. ModeResourceGracePeriod remains the time a mode counts as recently used.
+    // An inactive mode keeps its resources this long after the last frame that used them before they may retire; NRD
+    // retention groups, AIR's storage and AIR's vector views follow the same rule. Retiring returns their textures and
+    // buffers to Engine-owned heaps (TextureMemoryAllocator.h) rather than freeing GPU-used memory, which can hang the next
+    // first traversals of new acceleration structures on the RTX 4080 with driver 621.01
+    // (Documentation/Rendering/FgTiming_ManyLight_Switch_Hangs.md). An NRD instance still frees NRI's small zero and
+    // constant buffers.
     static constexpr std::chrono::seconds ModeResourceGracePeriod{5};
 
     enum class ModeResourceDecision
@@ -2551,6 +2638,9 @@ private:
         unsigned int environmentTextureIndex = UINT_MAX;
         unsigned int environmentConditionalCDFIndex = UINT_MAX;
         float environmentTotalWeight = 0.0f;
+        // Physical sky S1: the published sky's generation (0 while the S0.5 environment lights the frame). The sky's sets keep
+        // their descriptor indices for the session, so the indices alone would not see a re-bake.
+        std::uint64_t skyGeneration = 0;
     };
 
     std::optional<PathTraceAccumulationKey> m_pathTraceAccumulationKey;
@@ -3049,6 +3139,7 @@ private:
         PathTraceTemporalKey lights;
         std::uint32_t environment[5]{};
         float environmentTotalWeight = 0.0f;
+        std::uint64_t skyGeneration = 0;
         unsigned int width = 0;
         unsigned int height = 0;
     };
@@ -3654,6 +3745,41 @@ private:
 
     EnvironmentMap m_environment;
     std::string m_environmentIdentity;
+
+    // Physical sky S1 (SkyAtmosphere.h): allocated once at initialization, released at Shutdown. ActiveEnvironment() is the
+    // environment every consumer reads this frame: the sky's published set while the frame's effective sky is Physical and the
+    // sky has published, otherwise m_environment (which the S0.5 path keeps for Hdri and Neutral skies, and holds the neutral
+    // environment while the sky is Physical).
+    SkyAtmosphere m_skyAtmosphere;
+    bool m_skyEnvironmentThisFrame = false;
+    bool m_skyEnvironmentLastFrame = false;
+    std::uint64_t m_frameSkyGeneration = 0;
+    // S5 (§14.3): the sky clock (seconds of frame time, clamped per frame) the clouds' wind moves with.
+    double m_skyTimeSeconds = 0.0;
+    // S5B: lighting cuts. A jump the temporal histories cannot follow (FrameLighting.h historyCut for the lights; the published
+    // sky's irradiance-cube mean changing by LightingCutRatio) gets the camera cut's history handling: ApplyLightingCut.
+    // m_cutLighting: the last recorded frame's lighting. m_skyIrradianceMean: the published sky's mean (render units) once read
+    // back, the lights' ambient floor.
+    std::shared_ptr<const FrameLighting> m_cutLighting;
+    std::optional<double> m_skyIrradianceMean;
+    std::uint64_t m_lightingCutCount = 0;
+    // The latest cut's cause and the quantity compared (render units: the sun's illuminance, or the sky's irradiance-cube mean), for
+    // diagnostics and the Release sky checks.
+    struct LightingCutRecord
+    {
+        const char* cause = "";
+        double before = 0.0;
+        double after = 0.0;
+    } m_lastLightingCut;
+    void ApplyLightingCut(const char* cause, double before, double after);
+    EnvironmentMap& ActiveEnvironment() noexcept;
+    // Frame start: decides ActiveEnvironment() for the frame; a switch between the sky and m_environment resets histories as an
+    // environment publication does.
+    void SelectFrameEnvironment(const RendererOptions& options);
+    // Inside the frame recording, before any environment reader: a re-bake into the inactive set when needed (§4.9), or (S4) a
+    // slice of the HDRI background slot's build.
+    void RecordPhysicalSkyBake(ID3D12GraphicsCommandList* commandList, const RendererOptions& options,
+        const FrameLighting& frameLighting, const Vector3& cameraPosition, unsigned int frameIndex);
 
     RenderTarget m_sceneColor;
     RenderTarget m_finalSceneColor;

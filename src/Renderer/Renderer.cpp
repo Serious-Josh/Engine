@@ -31,6 +31,7 @@
 #include "ShaderData.h"
 #include "Scene/DirectionalLight.h"
 #include "Renderer/FrameLighting.h"
+#include "Renderer/SkyAtmosphereModel.h"
 #include "Renderer/Rtxdi/RtxdiShaderData.h"
 #include "Scene/Scene.h"
 #include "DemoContent/MirrorTestScene.h"
@@ -2931,6 +2932,10 @@ bool Renderer::Initialize(
         return false;
     }
 
+    // Render targets, depth buffers and unordered-access textures created on this thread are placed in Engine-owned heaps
+    // and activated on the frame recording, so resizes and mode changes free nothing to the OS (TextureMemoryAllocator.h).
+    TextureMemoryAllocator::PlaceRenderThreadTargets();
+
     m_dlssFailure.clear();
     m_dlssRetryPending = false;
     m_dlssPublishedState.clear();
@@ -3953,6 +3958,20 @@ bool Renderer::InitializeSceneRenderer(const HDRImageData* initialEnvironment, s
         return false;
     }
 
+    // Physical sky S1: allocated once for the session, in the Editor and in EngineRuntime, whatever the scene's sky (§4.4). A
+    // failure is not fatal: frames then light from the S0.5 environment only, as before the physical sky.
+    beginStartupPhase("Physical sky resources");
+    m_skyResourceSizes.frameCount = CommandContext::FrameCount;
+
+    {
+        // The sky's session-lifetime sets are never freed during a session, and its passes record no activation for them
+        // (EnvironmentMap::InitializePersistentSky): they stay committed, as written.
+        const TextureMemoryAllocator::CommittedTargetScope committedSky;
+        m_skyAtmosphere.Initialize(device, m_shaderLibrary, m_resourceDescriptorHeap, m_skyResourceSizes);
+    }
+
+    m_skyAtmosphere.EnableDiagnostics(device, m_gpuTimestampProfiler.GetTimestampFrequency());
+
     beginStartupPhase("Scene and final colour");
     if (!m_sceneColor.Initialize(device, m_sceneWidth, m_sceneHeight, DXGI_FORMAT_R16G16B16A16_FLOAT, m_rtvDescriptorHeap,
                                  m_resourceDescriptorHeap))
@@ -3966,6 +3985,13 @@ bool Renderer::InitializeSceneRenderer(const HDRImageData* initialEnvironment, s
     {
         Log::Error("Failed to initialize final scene color.");
         return false;
+    }
+
+    // Physical sky S5B: the camera clouds' quarter-resolution targets for the initial output. Later resizes recreate them
+    // (ResizeSceneResources); a packaged game whose window never resizes had none, so it drew no camera clouds.
+    if(m_skyAtmosphere.IsInitialized())
+    {
+        m_skyAtmosphere.ResizeClouds(device, m_resourceDescriptorHeap, m_outputWidth, m_outputHeight);
     }
 
     beginStartupPhase("G-buffer and selection mask");
@@ -4409,6 +4435,10 @@ bool Renderer::ResizeScene(unsigned int width, unsigned int height)
         return false;
     }
 
+    // Allocator P6a: the targets released below are recreated into their own memory once the frame queue has completed
+    // them, checked against its fence at each release, instead of only from the next frame (TextureMemoryAllocator.h).
+    const TextureMemoryAllocator::ReclaimScope reclaim({{m_commandContext.GetFence(),
+        [this]() { return m_commandContext.GetLastSubmissionFenceValue(); }, m_commandContext.GetSubmissionLifetime()}});
 
     if(m_dlssRetryPending)
     {
@@ -4674,6 +4704,13 @@ bool Renderer::ResizeSceneResources(const SceneResolution& resolution)
         return false;
     }
 
+    // Physical sky S5: the camera clouds' quarter-resolution targets follow the output (after the GPU drain above).
+    if(m_skyAtmosphere.IsInitialized())
+    {
+        m_skyAtmosphere.ResizeClouds(m_graphicsDevice.GetDevice(), m_resourceDescriptorHeap, resolution.outputWidth,
+            resolution.outputHeight);
+    }
+
     // UPSCALING.2C: the presentation resolve's output-extent targets exist only while the extents differ.
     m_presentationColor.Shutdown();
     m_presentationSelectionMask.Shutdown();
@@ -4862,8 +4899,8 @@ Renderer::ModeResourceDecision Renderer::EvaluateModeResourceRetirement(ModeReso
         return ModeResourceDecision::Keep;
     }
 
-    // Inactive resources stay resident until memory pressure (see ModeResourceGracePeriod) or the caller's own rule.
-    const bool graceExpired = dueRegardless;
+    const bool graceExpired =
+        dueRegardless || std::chrono::steady_clock::now() - residency.lastActive >= ModeResourceGracePeriod;
     const bool underPressure = !graceExpired && IsModeResourceMemoryUnderPressure();
 
     if(!graceExpired && !underPressure)
@@ -4964,7 +5001,7 @@ void Renderer::UpdateLegacyLightingRetention()
     m_legacyLighting.ReleaseTextures();
     m_legacyLighting.retention.resident = false;
     Log::Info(std::string("Retired the inactive Legacy lighting resources (") +
-        (decision == ModeResourceDecision::RetireUnderPressure ? "video memory pressure" : "due") + ").");
+        (decision == ModeResourceDecision::RetireUnderPressure ? "video memory pressure" : "grace period ended") + ").");
 }
 
 // M0c.3 Phase A: called on recordings that do not render a path-traced mode, after the frame's mode is committed and
@@ -5008,8 +5045,7 @@ void Renderer::UpdatePathTracingRetention()
     ReleasePathTracingResources();
     m_pathTracingResidency.resident = false;
     Log::Info(std::string("Retired the inactive Path Tracing resources (") +
-        (decision == ModeResourceDecision::RetireUnderPressure ? "video memory pressure" : "due") + ").");
-
+        (decision == ModeResourceDecision::RetireUnderPressure ? "video memory pressure" : "grace period ended") + ").");
 }
 
 void Renderer::ReleasePathTracingResources()
@@ -7985,6 +8021,7 @@ ReSTIRPTHistorySignature Renderer::MakeReSTIRPTHistorySignature(const PathTraceR
         lighting = HashValue(lighting, key.environmentTextureIndex);
         lighting = HashValue(lighting, key.environmentConditionalCDFIndex);
         lighting = HashValue(lighting, key.environmentTotalWeight);
+        lighting = HashValue(lighting, key.skyGeneration);
     }
 
     lighting = HashBytes(lighting, m_environmentIdentity.data(), m_environmentIdentity.size());
@@ -8559,7 +8596,7 @@ bool Renderer::SamePathTraceAccumulationKey(const PathTraceAccumulationKey& left
         left.sceneResourceLifetime == right.sceneResourceLifetime &&
         left.environmentTextureIndex == right.environmentTextureIndex &&
         left.environmentConditionalCDFIndex == right.environmentConditionalCDFIndex &&
-        left.environmentTotalWeight == right.environmentTotalWeight;
+        left.environmentTotalWeight == right.environmentTotalWeight && left.skyGeneration == right.skyGeneration;
 }
 
 Renderer::SceneLightingInputs Renderer::MakeSceneLightingInputs(const PathTraceAccumulationKey& key,
@@ -9820,9 +9857,11 @@ bool Renderer::RecordPathTraceReference(
     key.topLevelRecording = m_rayTracingScene.GetTLASRecordingIdentity();
     key.materialRevision = m_materialPublication.revision;
     key.sceneResourceLifetime = m_sceneResourceLifetime;
-    key.environmentTextureIndex = m_environment.GetSourceTexture().GetDescriptorIndex();
-    key.environmentConditionalCDFIndex = m_environment.GetImportanceConditionalCDF().GetDescriptorIndex();
-    key.environmentTotalWeight = m_environment.GetImportanceTotalWeight();
+    key.environmentTextureIndex = ActiveEnvironment().GetSourceTexture().GetDescriptorIndex();
+    key.environmentConditionalCDFIndex = ActiveEnvironment().GetImportanceConditionalCDF().GetDescriptorIndex();
+    key.environmentTotalWeight = ActiveEnvironment().GetImportanceTotalWeight();
+    // Physical sky S1: a re-bake keeps the sets' descriptor indices, so its generation restarts accumulation.
+    key.skyGeneration = m_frameSkyGeneration;
 
     // SHARC.4B: this frame's material table, TLAS update and environment are recorded by now.
     LatchSceneLighting(key);
@@ -9897,7 +9936,7 @@ bool Renderer::RecordPathTraceReference(
         constexpr D3D12_RESOURCE_STATES shaderReadState =
             D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 
-        m_environment.GetSourceTexture().Transition(commandList, shaderReadState);
+        ActiveEnvironment().GetSourceTexture().Transition(commandList, shaderReadState);
         m_materialTables.GetMissingEnergyTexture().Transition(commandList, shaderReadState);
         m_materialTables.GetAverageTexture().Transition(commandList, shaderReadState);
 
@@ -9926,10 +9965,24 @@ bool Renderer::RecordPathTraceReference(
         constants.materialBufferIndex = CurrentMaterialBuffer().GetDescriptorIndex();
         constants.environmentTextureIndex = key.environmentTextureIndex;
         constants.environmentConditionalCDFIndex = key.environmentConditionalCDFIndex;
-        constants.environmentMarginalCDFIndex = m_environment.GetImportanceMarginalCDF().GetDescriptorIndex();
-        constants.environmentWidth = m_environment.GetImportanceWidth();
-        constants.environmentHeight = m_environment.GetImportanceHeight();
+        constants.environmentMarginalCDFIndex = ActiveEnvironment().GetImportanceMarginalCDF().GetDescriptorIndex();
+        constants.environmentWidth = ActiveEnvironment().GetImportanceWidth();
+        constants.environmentHeight = ActiveEnvironment().GetImportanceHeight();
         constants.environmentTotalWeight = key.environmentTotalWeight;
+        // S5: stars, the moon's disk, the cloud shadow and (delta misses) the published set's clouds.
+        constants.skyFrameInfoIndex = m_skyAtmosphere.GetFrameInfoIndex();
+        // Camera rays and delta misses: the physical sky's sky-view map, or (S4) the HDRI background slot's equirect.
+        if(m_frameHdriBackground)
+        {
+            m_frameHdriBackground->Transition(commandList, shaderReadState);
+            constants.skyBackgroundIndex = m_frameHdriBackground->GetDescriptorIndex();
+            constants.skyBackgroundEquirect = 1u;
+        }
+        else
+        {
+            constants.skyBackgroundIndex = m_skyEnvironmentThisFrame && m_skyViewBackgroundForTesting &&
+                !m_skyAtmosphere.PublishedHdri() ? m_skyAtmosphere.GetPublishedSkyView().GetDescriptorIndex() : 0xFFFFFFFFu;
+        }
         constants.materialTableIndex = m_materialTables.GetMissingEnergyTexture().GetDescriptorIndex();
         constants.materialAverageTableIndex = m_materialTables.GetAverageTexture().GetDescriptorIndex();
         constants.materialTableCosineMapping = static_cast<std::uint32_t>(m_materialTables.GetCosineMapping());
@@ -11159,6 +11212,7 @@ void Renderer::RecordNrdConfidenceProbes(
     identity.environment[3] = constants.environmentWidth;
     identity.environment[4] = constants.environmentHeight;
     identity.environmentTotalWeight = constants.environmentTotalWeight;
+    identity.skyGeneration = m_frameSkyGeneration;
     identity.width = m_sceneWidth;
     identity.height = m_sceneHeight;
 
@@ -11183,7 +11237,8 @@ void Renderer::RecordNrdConfidenceProbes(
         state = "reset: lights, sun or path settings changed";
     }
     else if(std::memcmp(committed->environment, identity.environment, sizeof(identity.environment)) != 0 ||
-        committed->environmentTotalWeight != identity.environmentTotalWeight)
+        committed->environmentTotalWeight != identity.environmentTotalWeight ||
+        committed->skyGeneration != identity.skyGeneration)
     {
         state = "reset: environment changed";
     }
@@ -12562,6 +12617,12 @@ Renderer::FrameRenderResult Renderer::Render(
     admissionProbe.reset();
     // S0.5: a fully prepared environment replaces the published one before this frame reads it.
     PublishPreparedEnvironment();
+    // Physical sky S1: likewise a bake submitted by an earlier frame; then this frame's ActiveEnvironment(). S4: an HDRI sky's
+    // preparation is adopted first, and its request resolves once the sky publishes it.
+    UpdateSkyHdri();
+    m_skyAtmosphere.PublishSubmittedBake();
+    ResolveSkyHdriPublication();
+    SelectFrameEnvironment(options);
     CollectGeometryUploadRetirements();
     CollectBLASMemory();
     CollectTextureMemory();
@@ -12871,8 +12932,21 @@ bool Renderer::IsPathTraceWorkloadSafe(std::uint32_t tableLights, const PathTrac
 }
 
 std::shared_ptr<const FrameLighting> Renderer::AcquireFrameLighting(const DirectionalLight& legacySun,
-    const SceneLightingSnapshot* snapshot, const SceneLightingSettings& proceduralSettings, std::uint64_t& revision)
+    const SceneLightingSnapshot* snapshot, const SceneLightingSettings& proceduralSettings, std::uint64_t& revision,
+    const SunAtmosphere* atmosphere)
 {
+    const auto sameAtmosphere = [&]()
+    {
+        if(!atmosphere || !m_frameLightingCacheAtmosphere)
+        {
+            return !atmosphere && !m_frameLightingCacheAtmosphere;
+        }
+
+        return atmosphere->settings == m_frameLightingCacheAtmosphere->settings &&
+            std::abs(atmosphere->cameraAltitudeMeters - m_frameLightingCacheAtmosphere->cameraAltitudeMeters) <=
+            SunAltitudeTolerance;
+    };
+
     const auto sameSun = [](const DirectionalLight& left, const DirectionalLight& right)
     {
         return std::memcmp(&left.direction, &right.direction, sizeof(Vector3)) == 0 &&
@@ -12883,7 +12957,7 @@ std::shared_ptr<const FrameLighting> Renderer::AcquireFrameLighting(const Direct
 
     revision = snapshot ? snapshot->revision : 0;
     const bool reusable = revision != 0 && m_frameLightingCache && m_frameLightingCacheRevision == revision &&
-        sameSun(m_frameLightingCacheSun, legacySun) && m_frameLightingCacheSettings == proceduralSettings;
+        sameSun(m_frameLightingCacheSun, legacySun) && m_frameLightingCacheSettings == proceduralSettings && sameAtmosphere();
 
     if(reusable)
     {
@@ -12894,7 +12968,8 @@ std::shared_ptr<const FrameLighting> Renderer::AcquireFrameLighting(const Direct
         if(verify)
         {
             FrameLighting fresh;
-            const bool same = BuildFrameLighting(legacySun, snapshot, fresh, nullptr, &proceduralSettings) &&
+            const bool same = BuildFrameLighting(legacySun, snapshot, fresh, nullptr, &proceduralSettings,
+                m_frameLightingCacheAtmosphere ? &*m_frameLightingCacheAtmosphere : nullptr) &&
                 fresh.table == m_frameLightingCache->table && fresh.tableLightIDs == m_frameLightingCache->tableLightIDs &&
                 sameSun(fresh.sun, m_frameLightingCache->sun) && fresh.sunObjectID == m_frameLightingCache->sunObjectID;
             ++m_frameLightingVerifications;
@@ -12914,7 +12989,7 @@ std::shared_ptr<const FrameLighting> Renderer::AcquireFrameLighting(const Direct
     auto built = std::make_shared<FrameLighting>();
     std::string lightingError;
 
-    if(!BuildFrameLighting(legacySun, snapshot, *built, &lightingError, &proceduralSettings))
+    if(!BuildFrameLighting(legacySun, snapshot, *built, &lightingError, &proceduralSettings, atmosphere))
     {
         // Nothing unconverted may reach the GPU: a rejected frame is lit by nothing.
         Log::Error("Scene lighting rejected for this frame: " + lightingError);
@@ -12931,6 +13006,7 @@ std::shared_ptr<const FrameLighting> Renderer::AcquireFrameLighting(const Direct
         m_frameLightingCacheRevision = revision;
         m_frameLightingCacheSun = legacySun;
         m_frameLightingCacheSettings = proceduralSettings;
+        m_frameLightingCacheAtmosphere = atmosphere ? std::optional<SunAtmosphere>(*atmosphere) : std::nullopt;
     }
     else
     {
@@ -13605,13 +13681,12 @@ bool Renderer::RecordRenderFrame(
     {
         m_airLastRequested = airNow;
     }
-    else if(airNow - m_airLastRequested >= ModeResourceGracePeriod && IsModeResourceMemoryUnderPressure())
+    else if(airNow - m_airLastRequested >= ModeResourceGracePeriod)
     {
-        // Unused AIR storage is released only under memory pressure (ModeResourceGracePeriod).
         m_airField.Release(m_commandContext.GetLastSubmissionFenceValue());
         ++m_airStorageRetirements;
-        Log::Info("AIR storage retired (unused, video memory pressure); released once the GPU completes fence " +
-            std::to_string(m_commandContext.GetLastSubmissionFenceValue()) + ".");
+        Log::Info("AIR storage retired (AIR unused for " + std::to_string(ModeResourceGracePeriod.count()) +
+            " s); released once the GPU completes fence " + std::to_string(m_commandContext.GetLastSubmissionFenceValue()) + ".");
     }
 
     // M0c.6: the AIR vector view's split list (16 MiB, sized for the largest vector budget) the same way, after the grace period
@@ -13622,10 +13697,10 @@ bool Renderer::RecordRenderFrame(
         {
             m_airVectorsLastRequested = airNow;
         }
-        else if(airNow - m_airVectorsLastRequested >= ModeResourceGracePeriod && IsModeResourceMemoryUnderPressure())
+        else if(airNow - m_airVectorsLastRequested >= ModeResourceGracePeriod)
         {
             m_editorAirPass.RetireSplitResources(m_commandContext.GetLastSubmissionFenceValue());
-            Log::Info("AIR vector view resources retired (unused, video memory pressure).");
+            Log::Info("AIR vector view resources retired (unused for " + std::to_string(ModeResourceGracePeriod.count()) + " s).");
         }
     }
 
@@ -13750,8 +13825,17 @@ bool Renderer::RecordRenderFrame(
     // M3.5: rebuilt only when the snapshot revision, sun or settings change (AcquireFrameLighting). activeLighting is the
     // frame's lighting until the publication decision below; `lightingRevision` (0 = unknown) identifies its table content.
     std::uint64_t lightingRevision = 0;
+    // Physical sky S2: the sun owner's light reaches the scene through the frame's physical sky.
+    std::optional<SunAtmosphere> sunAtmosphere;
+
+    if(options.physicalSky)
+    {
+        sunAtmosphere = SunAtmosphere{*options.physicalSky,
+            SkyAtmosphereModel::CameraAltitudeMeters(*options.physicalSky, double(frameView.position.y))};
+    }
+
     const std::shared_ptr<const FrameLighting> builtLighting = AcquireFrameLighting(legacySun, options.GetLighting(),
-        scene.GetLightingSettings(), lightingRevision);
+        scene.GetLightingSettings(), lightingRevision, sunAtmosphere ? &*sunAtmosphere : nullptr);
     const FrameLighting* activeLighting = builtLighting.get();
 
     const DirectionalLight& light = activeLighting->sun;
@@ -13765,6 +13849,18 @@ bool Renderer::RecordRenderFrame(
         ResetSceneHistory();
         ++m_cameraCutCount;
     }
+
+    // Physical sky S5B: a lighting jump the histories cannot follow (FrameLighting.h historyCut: the sun or a Directional changing
+    // by 2 stops above the sky's irradiance, or turning by more than 5 degrees) is handled as a camera cut.
+    if(m_cutLighting && m_cutLighting != builtLighting &&
+        DetectLightingDiscontinuities(*m_cutLighting, *activeLighting, 0.2f, 5.0f, 64,
+            m_skyEnvironmentThisFrame ? m_skyIrradianceMean.value_or(0.0) : 0.0).historyCut)
+    {
+        ApplyLightingCut("a light", Photometry::Luminance(m_cutLighting->sun.color) * m_cutLighting->sun.intensity,
+            Photometry::Luminance(activeLighting->sun.color) * activeLighting->sun.intensity);
+    }
+
+    m_cutLighting = builtLighting;
 
     m_renderedViewIdentity = frameView.identity;
     m_recordedView = frameView.view;
@@ -14438,6 +14534,13 @@ bool Renderer::RecordRenderFrame(
     reconstructionConstants.geometricNormalIndex = m_gBuffer.GetGeometricNormal().GetSRVIndex();
 
     reconstructionConstants.motionIndex = m_gBuffer.GetMotion().GetSRVIndex();
+    reconstructionConstants.skyViewIndex = m_skyEnvironmentThisFrame && m_skyViewBackgroundForTesting &&
+        !m_skyAtmosphere.PublishedHdri() ? m_skyAtmosphere.GetPublishedSkyView().GetDescriptorIndex() : 0xFFFFFFFFu;
+    // S4: an HDRI sky's background from its background slot once complete (else the published set's equirect, as before).
+    reconstructionConstants.backgroundEquirectIndex = m_frameHdriBackground ? m_frameHdriBackground->GetDescriptorIndex() :
+        0xFFFFFFFFu;
+    // S5: stars, the moon's disk and the cloud shadow.
+    reconstructionConstants.skyFrameInfoIndex = m_skyAtmosphere.GetFrameInfoIndex();
 
     D3D12_GPU_VIRTUAL_ADDRESS reconstructionConstantsAddress = m_uploadBuffer.Allocate(
         &reconstructionConstants, sizeof(ReconstructionConstants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
@@ -14460,6 +14563,8 @@ bool Renderer::RecordRenderFrame(
     lightConstants.color[0] = light.color.x;
     lightConstants.color[1] = light.color.y;
     lightConstants.color[2] = light.color.z;
+    // Physical sky S2: the visible sun disk's cos(angular radius) for the background; 2 (never reached) draws none.
+    lightConstants.padding = m_skyEnvironmentThisFrame && light.angularRadius > 0.0f ? std::cos(light.angularRadius) : 2.0f;
 
     D3D12_GPU_VIRTUAL_ADDRESS lightConstantsAddress = m_uploadBuffer.Allocate(
         &lightConstants, sizeof(DirectionalLightConstants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
@@ -14529,6 +14634,7 @@ bool Renderer::RecordRenderFrame(
     {
         unpublishedLighting.emplace();
         unpublishedLighting->sun = activeLighting->sun;
+        unpublishedLighting->atmosphereSun = activeLighting->atmosphereSun;
         unpublishedLighting->sunObjectID = activeLighting->sunObjectID;
         activeLighting = &*unpublishedLighting;
         lightingRevision = 0;
@@ -14561,6 +14667,13 @@ bool Renderer::RecordRenderFrame(
 
     // Every later consumer reads the frame's final lighting.
     const FrameLighting& frameLighting = *activeLighting;
+
+    // Physical sky S1: a re-bake when the effective physical sky, the sun or the camera's altitude moved past the thresholds.
+    // It writes the inactive set, which nothing in this frame reads; later passes set their own pipeline state.
+    MarkDredStage(commandList, L"Frame: physical sky bake");
+    m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::PhysicalSkyBake);
+    RecordPhysicalSkyBake(commandList, options, frameLighting, frameView.position, frameIndex);
+    m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::PhysicalSkyBake);
 
     // M4.1: the shared light-sampling structures of exactly this table (same revision), published after it. Disabled by
     // default; M4.2A's experimental libraries read them through the scene light constants.
@@ -14684,27 +14797,27 @@ bool Renderer::RecordRenderFrame(
     reflectionConstants.instanceDataIndex = m_rayTracingScene.GetInstanceDataDescriptorIndex();
 
     reflectionConstants.materialBufferIndex = CurrentMaterialBuffer().GetDescriptorIndex();
-    reflectionConstants.environmentIndex = m_environment.GetSourceTexture().GetDescriptorIndex();
+    reflectionConstants.environmentIndex = ActiveEnvironment().GetSourceTexture().GetDescriptorIndex();
     reflectionConstants.brdfIntegrationLUTIndex = m_brdfIntegrationLUT.GetDescriptorIndex();
 
     reflectionConstants.ggxAverageAlbedoLUTIndex = m_ggxAverageAlbedoLUT.GetDescriptorIndex();
 
     reflectionConstants.frameIndex = m_reflectionSampleIndex++;
-    reflectionConstants.environmentCubemapIndex = m_environment.GetCubemap().GetDescriptorIndex();
+    reflectionConstants.environmentCubemapIndex = FrameReflectionCube().GetDescriptorIndex();
 
-    reflectionConstants.diffuseIrradianceIndex = m_environment.GetDiffuseIrradiance().GetDescriptorIndex();
+    reflectionConstants.diffuseIrradianceIndex = ActiveEnvironment().GetDiffuseIrradiance().GetDescriptorIndex();
     reflectionConstants.ggxMultiscatterIrradianceIndex =
 
-        m_environment.GetGGXMultiscatterIrradiance().GetDescriptorIndex();
+        ActiveEnvironment().GetGGXMultiscatterIrradiance().GetDescriptorIndex();
     reflectionConstants.materialIndex = m_gBuffer.GetMaterial().GetSRVIndex();
     reflectionConstants.importanceConditionalCDFIndex =
 
-        m_environment.GetImportanceConditionalCDF().GetDescriptorIndex();
+        ActiveEnvironment().GetImportanceConditionalCDF().GetDescriptorIndex();
 
-    reflectionConstants.importanceMarginalCDFIndex = m_environment.GetImportanceMarginalCDF().GetDescriptorIndex();
-    reflectionConstants.importanceWidth = m_environment.GetImportanceWidth();
-    reflectionConstants.importanceHeight = m_environment.GetImportanceHeight();
-    reflectionConstants.importanceTotalWeight = m_environment.GetImportanceTotalWeight();
+    reflectionConstants.importanceMarginalCDFIndex = ActiveEnvironment().GetImportanceMarginalCDF().GetDescriptorIndex();
+    reflectionConstants.importanceWidth = ActiveEnvironment().GetImportanceWidth();
+    reflectionConstants.importanceHeight = ActiveEnvironment().GetImportanceHeight();
+    reflectionConstants.importanceTotalWeight = ActiveEnvironment().GetImportanceTotalWeight();
 
     // Unjittered: the next frame's motion vectors exclude jitter.
     m_previousViewProjection = currentViewProjection;
@@ -14742,14 +14855,14 @@ bool Renderer::RecordRenderFrame(
     giConstants.instanceDataIndex = reflectionConstants.instanceDataIndex;
     giConstants.materialBufferIndex = reflectionConstants.materialBufferIndex;
     giConstants.environmentIndex = reflectionConstants.environmentIndex;
-    giConstants.diffuseIrradianceIndex = m_environment.GetDiffuseIrradiance().GetDescriptorIndex();
+    giConstants.diffuseIrradianceIndex = ActiveEnvironment().GetDiffuseIrradiance().GetDescriptorIndex();
 
-    giConstants.diffuseIrradianceArrayIndex = m_environment.GetDiffuseIrradianceArrayIndex();
-    giConstants.importanceConditionalCDFIndex = m_environment.GetImportanceConditionalCDF().GetDescriptorIndex();
-    giConstants.importanceMarginalCDFIndex = m_environment.GetImportanceMarginalCDF().GetDescriptorIndex();
-    giConstants.importanceWidth = m_environment.GetImportanceWidth();
-    giConstants.importanceHeight = m_environment.GetImportanceHeight();
-    giConstants.importanceTotalWeight = m_environment.GetImportanceTotalWeight();
+    giConstants.diffuseIrradianceArrayIndex = ActiveEnvironment().GetDiffuseIrradianceArrayIndex();
+    giConstants.importanceConditionalCDFIndex = ActiveEnvironment().GetImportanceConditionalCDF().GetDescriptorIndex();
+    giConstants.importanceMarginalCDFIndex = ActiveEnvironment().GetImportanceMarginalCDF().GetDescriptorIndex();
+    giConstants.importanceWidth = ActiveEnvironment().GetImportanceWidth();
+    giConstants.importanceHeight = ActiveEnvironment().GetImportanceHeight();
+    giConstants.importanceTotalWeight = ActiveEnvironment().GetImportanceTotalWeight();
 
     if (runSignedCorrection)
     {
@@ -15003,11 +15116,12 @@ bool Renderer::RecordRenderFrame(
 
             D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 
-        m_environment.GetSourceTexture().Transition(commandList, shaderReadState);
+        ActiveEnvironment().GetSourceTexture().Transition(commandList, shaderReadState);
 
-        m_environment.GetCubemap().Transition(commandList, shaderReadState);
-        m_environment.GetDiffuseIrradiance().Transition(commandList, shaderReadState);
-        m_environment.GetGGXMultiscatterIrradiance().Transition(commandList, shaderReadState);
+        ActiveEnvironment().GetCubemap().Transition(commandList, shaderReadState);
+        FrameReflectionCube().Transition(commandList, shaderReadState);
+        ActiveEnvironment().GetDiffuseIrradiance().Transition(commandList, shaderReadState);
+        ActiveEnvironment().GetGGXMultiscatterIrradiance().Transition(commandList, shaderReadState);
         m_brdfIntegrationLUT.Transition(commandList, shaderReadState);
         m_ggxAverageAlbedoLUT.Transition(commandList, shaderReadState);
 
@@ -15052,7 +15166,7 @@ bool Renderer::RecordRenderFrame(
             }
 
             if (!m_giSignedCorrectionPass.Reconstruct(commandList, m_uploadBuffer, m_gBuffer,
-                                                      m_environment.GetDiffuseIrradiance(),
+                                                      ActiveEnvironment().GetDiffuseIrradiance(),
                                                       m_legacyLighting.rayTracedGIPass.GetRawGITexture()))
             {
                 Log::Error("Failed to reconstruct signed GI irradiance.");
@@ -15255,10 +15369,11 @@ bool Renderer::RecordRenderFrame(
 
         m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::DeferredLighting);
 
+        EnvironmentMap& environment = ActiveEnvironment();
         m_deferredLightingPass.Execute(
-            commandList, m_gBuffer, CurrentMaterialBuffer(), m_environment.GetSourceTexture(), m_environment.GetCubemap(),
-            m_environment.GetDiffuseIrradiance(), m_brdfIntegrationLUT, m_ggxAverageAlbedoLUT,
-            m_environment.GetGGXMultiscatterIrradiance(), m_legacyLighting.shadowDenoisePass.GetFilteredVisibilityTexture(),
+            commandList, m_gBuffer, CurrentMaterialBuffer(), environment.GetSourceTexture(), FrameReflectionCube(),
+            environment.GetDiffuseIrradiance(), m_brdfIntegrationLUT, m_ggxAverageAlbedoLUT,
+            environment.GetGGXMultiscatterIrradiance(), m_legacyLighting.shadowDenoisePass.GetFilteredVisibilityTexture(),
             finalReflection, m_legacyLighting.giSpatialDenoisePass.GetOutputTexture(), m_legacyLighting.aoResolvePass.GetOutputTexture(),
             options.enableRTGI, options.rtgiContactAOStrength, m_sceneColor, reconstructionConstantsAddress,
             lightConstantsAddress, sceneLightConstantsAddress, static_cast<unsigned int>(debugView),
@@ -15347,10 +15462,16 @@ bool Renderer::RecordRenderFrame(
         // establish, or GPU-based validation reports the texture in a pixel-shader-only layout (#1358).
         constexpr D3D12_RESOURCE_STATES shaderReadState =
             D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-        m_environment.GetSourceTexture().Transition(commandList, shaderReadState);
-        m_environment.GetCubemap().Transition(commandList, shaderReadState);
-        m_environment.GetDiffuseIrradiance().Transition(commandList, shaderReadState);
-        m_environment.GetGGXMultiscatterIrradiance().Transition(commandList, shaderReadState);
+        ActiveEnvironment().GetSourceTexture().Transition(commandList, shaderReadState);
+        ActiveEnvironment().GetCubemap().Transition(commandList, shaderReadState);
+        FrameReflectionCube().Transition(commandList, shaderReadState);
+        ActiveEnvironment().GetDiffuseIrradiance().Transition(commandList, shaderReadState);
+        ActiveEnvironment().GetGGXMultiscatterIrradiance().Transition(commandList, shaderReadState);
+
+        if(m_frameHdriBackground)
+        {
+            m_frameHdriBackground->Transition(commandList, shaderReadState);
+        }
         m_brdfIntegrationLUT.Transition(commandList, shaderReadState);
         m_ggxAverageAlbedoLUT.Transition(commandList, shaderReadState);
     }
@@ -15697,6 +15818,40 @@ bool Renderer::RecordRenderFrame(
         presentedDepth = &m_overlayDepth;
     }
 
+    // Physical sky S3 (§4.7): the aerial perspective, over geometry at output resolution, before haze and mist (which then scatter
+    // over it), in every mode and in packaged builds.
+    if(m_skyEnvironmentThisFrame && options.physicalSky && options.physicalSky->atmosphericScattering)
+    {
+        MarkDredStage(commandList, L"Frame: aerial perspective");
+        m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex, GpuTimestampProfiler::Region::PhysicalSkyAerialVolume);
+        const auto betweenParts = [&](bool volumeDone)
+        {
+            if(volumeDone)
+            {
+                m_gpuTimestampProfiler.EndRegion(commandList, frameIndex, GpuTimestampProfiler::Region::PhysicalSkyAerialVolume);
+                m_gpuTimestampProfiler.BeginRegion(commandList, frameIndex,
+                    GpuTimestampProfiler::Region::PhysicalSkyAerialPerspective);
+            }
+            else
+            {
+                m_gpuTimestampProfiler.EndRegion(commandList, frameIndex,
+                    GpuTimestampProfiler::Region::PhysicalSkyAerialPerspective);
+            }
+        };
+        m_skyAtmosphere.RecordAerialPerspective(commandList, m_resourceDescriptorHeap, m_uploadBuffer, *presentedColor,
+            *presentedDepth, currentViewProjection, frameView.position,
+            SkyAtmosphereModel::CameraAltitudeMeters(*options.physicalSky, double(frameView.position.y)), betweenParts);
+    }
+
+    // Physical sky S5 (§14.3): the camera clouds over the frame (after the aerial perspective, before haze and mist), in every mode.
+    // Their passes are timed by SkyAtmosphere's own queries (ENGINE_DIAG_SKY_PASS_TIMING): the GPU profiler's regions are full.
+    if(m_skyEnvironmentThisFrame && options.physicalSky && m_skyAtmosphere.PublishedHasClouds() && m_cloudCompositeForTesting)
+    {
+        m_skyAtmosphere.RecordClouds(commandList, m_resourceDescriptorHeap, m_uploadBuffer, *presentedColor, *presentedDepth,
+            currentViewProjection, frameView.position,
+            SkyAtmosphereModel::CameraAltitudeMeters(*options.physicalSky, double(frameView.position.y)), m_skyTimeSeconds);
+    }
+
     // AIR.4F F4.3: lit mist scatters the scene's light, so it is scene radiance: composited into the HDR scene colour before tone mapping
     // (and after exposure metering, which therefore does not see it). It reads the sun, the Light table and the TLAS as this frame's
     // deferred lighting and sun shadow do. Unlit mist keeps its place after tone mapping, below.
@@ -15727,7 +15882,7 @@ bool Renderer::RecordRenderFrame(
         mistLighting.sunRadiance = light.color * light.intensity;
         mistLighting.lightTable = sceneLightConstantsAddress;
         mistLighting.topLevel = m_rayTracingScene.GetTopLevel().GetGPUAddress();
-        mistLighting.environmentIrradiance = m_environment.GetDiffuseIrradiance().GetDescriptorIndex();
+        mistLighting.environmentIrradiance = ActiveEnvironment().GetDiffuseIrradiance().GetDescriptorIndex();
         MarkDredStage(commandList, L"Frame: lit mist");
         m_editorMistPass.Execute(commandList, m_resourceDescriptorHeap, m_uploadBuffer, *presentedColor, *presentedDepth,
             currentViewProjection, frameView.position, m_airField.GetBinding(), m_airField.GetMistBinding(), *mistRequest,
@@ -16101,6 +16256,7 @@ bool Renderer::RecordRenderFrame(
 
         m_gpuTimestampProfiler.BreakFrameSequence();
         CommitEnvironmentPreparationSubmission(false);
+        m_skyAtmosphere.CommitSubmission(false);
         CommitGeometryUploadSubmission(false);
 
         Log::Error("Failed to submit command list or signal its fence; GPU work may already be in flight.");
@@ -16108,6 +16264,7 @@ bool Renderer::RecordRenderFrame(
     }
 
     CommitEnvironmentPreparationSubmission(true);
+    m_skyAtmosphere.CommitSubmission(true, m_commandContext.GetLastSubmissionFenceValue());
     CommitGeometryUploadSubmission(true);
     m_dlssFrameSubmitted = true;
     m_referenceRayCounts.Commit(frameIndex, textureUploadGeneration, m_commandContext);
@@ -16540,6 +16697,7 @@ void Renderer::Shutdown()
 
     m_uploadBuffer.Shutdown();
     m_environment.Shutdown();
+    m_skyAtmosphere.Shutdown();
     m_sceneColor.Shutdown();
     m_finalSceneColor.Shutdown();
     m_selectionMask.Shutdown();
@@ -17616,14 +17774,18 @@ bool Renderer::PreprocessEnvironment(EnvironmentMap& environment)
 
     environmentMipPass.Execute(commandList, environment.GetSourceTexture());
 
+    // Placed cubes start undefined: discard each before its first draw (TextureMemoryAllocator.h). The source and the
+    // CDF buffers were activated before their uploads.
+    TextureMemoryAllocator::RecordActivation(commandList, environment.GetDiffuseIrradiance().GetResource(),
+        environment.GetDiffuseIrradiance().GetSubresourceState(0));
     diffuseIrradiancePass.Execute(commandList, environment.GetSourceTexture(), environment.GetDiffuseIrradiance());
 
-    // A placed cube starts undefined: discard it before its first draw (TextureMemoryAllocator.h). The source was
-    // activated before its upload.
     TextureMemoryAllocator::RecordActivation(commandList, environment.GetCubemap().GetResource(),
         environment.GetCubemap().GetSubresourceState(0));
     equirectangularToCubemapPass.Execute(commandList, environment.GetSourceTexture(), environment.GetCubemap());
 
+    TextureMemoryAllocator::RecordActivation(commandList, environment.GetGGXMultiscatterIrradiance().GetResource(),
+        environment.GetGGXMultiscatterIrradiance().GetSubresourceState(0));
     ggxMultiscatterIrradiancePass.Execute(commandList, environment.GetSourceTexture(), m_brdfIntegrationLUT,
                                           environment.GetGGXMultiscatterIrradiance());
 

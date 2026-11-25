@@ -2,6 +2,7 @@
 
 #include "Project/ProjectPaths.h"
 #include "Scene/SceneSerializer.h"
+#include "Scene/SunDirection.h"
 #include "assets/AssetID.h"
 
 #include <cstdint>
@@ -59,6 +60,26 @@ bool CreateCleanSceneDocument(
     return true;
 }
 
+void ApplyNewSceneSkyDefaults(SceneDocument& document)
+{
+    constexpr float NewSceneReferenceEV100 = 15.0f;
+    constexpr float NewSceneSunLux = 120000.0f;
+    document.environmentOverrides.sky = true;
+    document.environmentOverrides.exposure = true;
+    document.skyType = SkyType::Physical;
+    document.lightingSettings.referenceEV100 = NewSceneReferenceEV100;
+    document.lightingSettings.environmentLuminanceScale = Photometry::NeutralEnvironmentLuminanceScaleFloat(NewSceneReferenceEV100);
+
+    SceneObjectDocument sun;
+    sun.id = "sun-" + document.id;
+    sun.name = "Sun";
+    sun.light = DefaultLightComponent(LightType::Directional);
+    sun.light->intensity = NewSceneSunLux;
+    sun.transform.position = {0.0f, 10.0f, 0.0f};
+    sun.transform.rotation = SunDirection::RotationFromAngles(SunAngles{});
+    document.objects.insert(document.objects.begin(), std::move(sun));
+}
+
 bool CreateNewSceneFile(
     const ProjectPaths& project,
     std::filesystem::path& createdPath,
@@ -90,6 +111,7 @@ bool CreateNewSceneFile(
 
         // SceneObjectDocument supplies the identity transform by default.
         document.objects.push_back(std::move(sphere));
+        ApplyNewSceneSkyDefaults(document);
 
         for (std::uint64_t suffix = 0;; ++suffix)
         {

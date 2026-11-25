@@ -365,6 +365,13 @@ void Editor::DrawMainMenu(
         ImGui::EndMenu();
     }
 
+    // Physical sky S1: the open level's environment. Sky is its first entry (the other environment groups join it later).
+    if(ImGui::BeginMenu("Level"))
+    {
+        ImGui::MenuItem("Sky", nullptr, &m_showSkyWindow);
+        ImGui::EndMenu();
+    }
+
     if (ImGui::BeginMenu("Editor"))
     {
         ImGui::MenuItem("Scene Inspector", nullptr, &m_showEditorPanel);
@@ -688,6 +695,18 @@ ViewportPreferences Editor::GetViewportPreferences() const
     preferences.rotationSnapIntervalDegrees = m_rotationSnapIntervalDegrees;
     preferences.gridVisible = m_showViewportGrid;
     return preferences;
+}
+
+EditorWindowPreferences Editor::GetWindowPreferences() const
+{
+    EditorWindowPreferences preferences;
+    preferences.skyWindowVisible = m_showSkyWindow;
+    return preferences;
+}
+
+void Editor::ApplyWindowPreferences(const EditorWindowPreferences& preferences)
+{
+    m_showSkyWindow = preferences.skyWindowVisible;
 }
 
 void Editor::ApplyViewportPreferences(const ViewportPreferences& preferences)
@@ -1930,6 +1949,7 @@ void Editor::Draw(
     DrawBuildGame(demoScene);
     DrawVoxelWindow(demoScene);
     DrawAirWindow(demoScene, debugUI);
+    DrawSkyWindow(demoScene);
     DrawSceneViewport(sceneTextureHandle, sceneWidth, sceneHeight);
     DrawMeshDropTarget(demoScene, projectPaths, assetRegistry);
     DrawMaterialDropTarget(demoScene, projectPaths, assetRegistry);
@@ -2135,11 +2155,12 @@ void Editor::DrawDirectionalLight(IDemoScene& demoScene, const DebugUI& debugUI)
         ImGui::InputFloat("Reference Exposure (EV100)", &settings.referenceEV100, 0.5f, 1.0f, "%.2f");
         const bool referenceCommitted = ImGui::IsItemDeactivatedAfterEdit();
         ImGui::EndDisabled();
-        ImGui::BeginDisabled(IsEnvironmentGroupInherited(demoScene, static_cast<int>(FileBackedDemoScene::EnvironmentGroup::Sky)));
-        ImGui::InputFloat("Environment Luminance (cd/m^2 per HDRI unit)", &settings.environmentLuminanceScale, 0.0f, 0.0f, "%.6g");
-        const bool environmentCommitted = ImGui::IsItemDeactivatedAfterEdit();
-        ImGui::EndDisabled();
-        if((referenceCommitted || environmentCommitted) && ValidateSceneLightingSettings(settings))
+        // Physical sky S4: the environment luminance is the HDRI Sky's intensity, edited in Level > Sky.
+        ImGui::TextUnformatted("Environment luminance:");
+        ImGui::SameLine();
+        if(ImGui::SmallButton("Level > Sky##SceneLightingSky"))
+            m_showSkyWindow = true;
+        if(referenceCommitted && ValidateSceneLightingSettings(settings))
             demoScene.GetScene().SetLightingSettings(settings);
         ImGui::TextDisabled("Reference exposure fixes the scene's GPU lighting scale (mid-grey metering at this EV).");
         return;
@@ -4900,6 +4921,23 @@ void Editor::ReplaySceneHistory(IDemoScene& demoScene, bool redo)
         m_historyCursor = redo ? m_historyCursor + 1 : m_historyCursor - 1;
         m_airSimulationDraft.reset();
         m_airSimulationStatus.clear();
+        m_sceneHistoryStatus.clear();
+        return;
+    }
+
+    if(const auto* sky = std::get_if<std::unique_ptr<SkyEdit>>(&entry.command); sky && *sky)
+    {
+        std::string error;
+
+        if(!ReplaySky(demoScene, **sky, redo, error))
+        {
+            ReportSceneHistoryFailure(error);
+            return;
+        }
+
+        m_historyCursor = redo ? m_historyCursor + 1 : m_historyCursor - 1;
+        m_physicalSkyDraft.reset();
+        m_skyStatus.clear();
         m_sceneHistoryStatus.clear();
         return;
     }

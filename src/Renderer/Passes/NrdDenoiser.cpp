@@ -6,11 +6,14 @@
 #include "Debug/MemoryRegistry.h"
 #include "Debug/TransitionTiming.h"
 #include "Renderer/DescriptorHeap.h"
+#include "Renderer/TextureMemoryAllocator.h"
 #include "Math/Matrix4.h"
 #include "Core/Log.h"
 
 #include <NRDIntegration.hpp>
 
+#include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <string>
@@ -18,6 +21,23 @@
 
 namespace
 {
+    // Allocator P3: NRD's texture pool in Engine-owned memory. Debug ENGINE_NRD_HEAP_POOL=0 keeps NRI's own pool heaps
+    // (A/B); Release: always.
+    bool NrdHeapPoolEnabled()
+    {
+#ifdef NDEBUG
+        return true;
+#else
+        static const bool enabled = []
+        {
+            const char* value = std::getenv("ENGINE_NRD_HEAP_POOL");
+            return !(value && value[0] == '0');
+        }();
+
+        return enabled;
+#endif
+    }
+
     void StoreNrdMatrix(
         float destination[16],
         const Matrix4& matrix)
@@ -241,6 +261,8 @@ void NrdDenoiser::Shutdown()
 
     // Destroy waits for the GPU (autoWaitForIdle) before the outputs it may still be writing are released. An externally
     // synchronized instance (ER.1 Phase 3.1) does not wait: its caller proved that no submitted work references it.
+    // The supplied pool textures go with the integration's references (their ranges return after the fence).
+    m_poolTextures.clear();
     m_integration.Destroy();
     m_poolStates.Reset({});
     ReleaseOutputs();
@@ -286,6 +308,7 @@ bool NrdDenoiser::Recreate(
     // Destroy drains submitted work before its external outputs are released (an externally synchronized instance's
     // caller drained it instead: Renderer resizes only after WaitForGPU). Callers must also discard any
     // unsubmitted recording that referenced the old instance. The following SDK Recreate starts from empty state.
+    m_poolTextures.clear();
     m_integration.Destroy();
     m_poolStates.Reset({});
     ReleaseOutputs();
@@ -345,8 +368,64 @@ nrd::Result NrdDenoiser::CreateSdkInstance(uint32_t width, uint32_t height)
     deviceDesc.disableD3D12EnhancedBarriers = true;
     deviceDesc.disableNVAPIInitialization = true;
 
+    // Allocator P3: the texture pool from Engine-owned memory (CreatePoolTexture), and NRI's per-device zero buffer, which
+    // NRD does not use (only buffer clears read it), at 64 KiB instead of 4 MiB: it stays a committed allocation that each
+    // instance recreation frees.
+    m_poolTextures.clear();
+
+    if(NrdHeapPoolEnabled())
+    {
+        integrationDesc.createTextureD3D12 = &NrdDenoiser::CreatePoolTexture;
+        integrationDesc.createTextureUserArg = this;
+        deviceDesc.d3dZeroBufferSize = 64 * 1024;
+    }
+
     TransitionTiming::Scope er1Scope("NRD RecreateD3D12 " + m_description.name);
     return m_integration.RecreateD3D12(integrationDesc, instanceDesc, deviceDesc);
+}
+
+void* NrdDenoiser::CreatePoolTexture(void* userArg, const nri::TextureDesc& textureDesc, const char* name)
+{
+    NrdDenoiser& denoiser = *static_cast<NrdDenoiser*>(userArg);
+    D3D12_RESOURCE_DESC description{};
+    description.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    description.Width = textureDesc.width;
+    description.Height = textureDesc.height;
+    description.DepthOrArraySize = static_cast<UINT16>((std::max)(textureDesc.layerNum, static_cast<nri::Dim_t>(1)));
+    description.MipLevels = static_cast<UINT16>((std::max)(textureDesc.mipNum, static_cast<nri::Dim_t>(1)));
+    description.Format = static_cast<DXGI_FORMAT>(nri::nriConvertNRIFormatToDXGI(textureDesc.format));
+    description.SampleDesc.Count = 1;
+    description.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    description.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    ID3D12Resource* resource = nullptr;
+    HRESULT result = E_FAIL;
+
+    {
+        // Any thread (BeginInitialize creates on its own): Denoise activates the texture before NRD's first use.
+        const TextureMemoryAllocator::ActivatedPlacementScope placement;
+        result = TextureMemoryAllocator::CreateTexture(denoiser.m_device, description, D3D12_RESOURCE_STATE_COMMON,
+            &resource);
+    }
+
+    if(FAILED(result))
+    {
+        resource = nullptr;
+        D3D12_HEAP_PROPERTIES heapProperties{};
+        heapProperties.Type = D3D12_HEAP_TYPE_DEFAULT;
+        result = denoiser.m_device->CreateCommittedResource(&heapProperties, D3D12_HEAP_FLAG_NONE, &description,
+            D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&resource));
+    }
+
+    if(FAILED(result) || !resource)
+    {
+        return nullptr;
+    }
+
+    const std::string narrow = name ? name : "NRD pool texture";
+    resource->SetName(std::wstring(narrow.begin(), narrow.end()).c_str());
+    // The integration takes over the creation reference; this one keeps it for Denoise's activation.
+    denoiser.m_poolTextures.emplace_back(resource);
+    return resource;
 }
 
 bool NrdDenoiser::CreateOutputs(DescriptorHeap& descriptorHeap, uint32_t width, uint32_t height)
@@ -586,6 +665,14 @@ bool NrdDenoiser::Denoise(
     // Denoise leaves stay provisional until this recording is submitted.
     const std::vector<nri::AccessLayoutStage>& trackedPool = m_poolStates.Get();
     m_integration.SetPoolStates(trackedPool.data(), static_cast<uint32_t>(trackedPool.size()));
+
+    // Allocator P3: placed pool textures start with undefined compression metadata. Before NRD's first use (they are in
+    // COMMON, NRD's UNDEFINED): the aliasing barrier and the discard. A call once the activation was submitted does nothing;
+    // one after a discarded recording records it again.
+    for(const Microsoft::WRL::ComPtr<ID3D12Resource>& texture : m_poolTextures)
+    {
+        TextureMemoryAllocator::RecordActivation(commandList, texture.Get(), D3D12_RESOURCE_STATE_COMMON);
+    }
 
     // NRD binds its own descriptor heap and root signature; the caller restores Engine's heap afterwards.
     m_integration.DenoiseD3D12(&identifier, 1, commandBuffer, snapshot);

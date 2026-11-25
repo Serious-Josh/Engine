@@ -356,6 +356,9 @@ public:
     // AIR.4F.2d.3: the scene's environmental haze, as SetSceneAirEnvironment.
     bool SetSceneEnvironmentalHaze(const std::optional<EnvironmentalHazeSettings>& expected,
         const std::optional<EnvironmentalHazeSettings>& replacement, std::string* errorMessage = nullptr);
+    // Physical sky S1: the scene's sky type and physical sky, as SetSceneEnvironmentalHaze. The Engine reads them each frame through the
+    // effective environment, so nothing else changes here.
+    bool SetSceneSky(const SceneSky& expected, const SceneSky& replacement, std::string* errorMessage = nullptr);
     bool SetSceneAirEnvironment(const std::optional<AirEnvironmentSettings>& expected, const std::optional<AirEnvironmentSettings>& replacement,
         std::string* errorMessage = nullptr);
     // R1.1: the scene's AIR simulation configuration, as SetSceneAirEnvironment; read by the Engine each frame through ResolveAirSimulation.

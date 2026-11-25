@@ -202,6 +202,437 @@ namespace
         };
     }
 
+    // Physical sky S0: the scene JSON names of the sky type and the physical sky's enums.
+    const char* SkyTypeName(SkyType type)
+    {
+        switch(type)
+        {
+        case SkyType::Hdri:
+            return "hdri";
+        case SkyType::Physical:
+            return "physical";
+        case SkyType::Neutral:
+        default:
+            return "neutral";
+        }
+    }
+
+    SkyType ReadSkyType(const Json& value)
+    {
+        if(value.is_string())
+        {
+            const std::string text = value.get<std::string>();
+
+            if(text == "neutral")
+            {
+                return SkyType::Neutral;
+            }
+
+            if(text == "hdri")
+            {
+                return SkyType::Hdri;
+            }
+
+            if(text == "physical")
+            {
+                return SkyType::Physical;
+            }
+        }
+
+        throw std::runtime_error("Sky type must be \"neutral\", \"hdri\" or \"physical\"; found " + value.dump() + ".");
+    }
+
+    const char* PhysicalSkyModelName(PhysicalSkyModel model)
+    {
+        switch(model)
+        {
+        case PhysicalSkyModel::EarthAdvanced:
+            return "earthAdvanced";
+        case PhysicalSkyModel::CustomPlanet:
+            return "customPlanet";
+        case PhysicalSkyModel::EarthSimple:
+        default:
+            return "earthSimple";
+        }
+    }
+
+    const char* PhysicalSkyIntensityModeName(PhysicalSkyIntensityMode mode)
+    {
+        return mode == PhysicalSkyIntensityMode::Multiplier ? "multiplier" : "exposure";
+    }
+
+    const char* PhysicalSkyUpdateModeName(PhysicalSkyUpdateMode mode)
+    {
+        switch(mode)
+        {
+        case PhysicalSkyUpdateMode::OnDemand:
+            return "onDemand";
+        case PhysicalSkyUpdateMode::Realtime:
+            return "realtime";
+        case PhysicalSkyUpdateMode::OnChanged:
+        default:
+            return "onChanged";
+        }
+    }
+
+    // One of `names` (matched exactly), as its index; anything else refuses the scene.
+    std::size_t ReadPhysicalSkyChoice(const Json& value, const char* field, std::initializer_list<const char*> names)
+    {
+        if(value.is_string())
+        {
+            std::size_t index = 0;
+
+            for(const char* name : names)
+            {
+                if(value.get<std::string>() == name)
+                {
+                    return index;
+                }
+
+                ++index;
+            }
+        }
+
+        throw std::runtime_error(std::string("Physical sky ") + field + " has an unknown value " + value.dump() + ".");
+    }
+
+    Json ToJson(const std::array<float, 3>& value)
+    {
+        return Json::array({value[0], value[1], value[2]});
+    }
+
+    void ReadChannels(const Json& value, const char* field, std::array<float, 3>& channels)
+    {
+        if(!value.is_array() || value.size() != 3)
+        {
+            throw std::runtime_error(std::string("Physical sky ") + field + " must be three numbers.");
+        }
+
+        for(std::size_t channel = 0; channel < 3; ++channel)
+        {
+            channels[channel] = ReadNumber(value[channel], field);
+        }
+    }
+
+    // Every field, grouped as the Sky window shows them, so a saved scene never depends on the defaults of a later version.
+    Json ToJson(const PhysicalSkySettings& sky)
+    {
+        return {
+            {"model", PhysicalSkyModelName(sky.model)},
+            {"planet", {{"radiusKm", sky.planetRadiusKm}, {"seaLevelMeters", sky.seaLevelMeters},
+                {"atmosphereHeightKm", sky.atmosphereHeightKm}, {"groundAlbedo", ToJson(sky.groundAlbedo)}}},
+            {"air", {{"scatteringPerMeter", ToJson(sky.rayleighScattering)}, {"absorptionPerMeter", ToJson(sky.rayleighAbsorption)},
+                {"scaleHeightKm", sky.rayleighScaleHeightKm}}},
+            {"aerosols", {{"scatteringPerMeter", ToJson(sky.mieScattering)}, {"absorptionPerMeter", ToJson(sky.mieAbsorption)},
+                {"anisotropy", sky.mieAnisotropy}, {"scaleHeightKm", sky.mieScaleHeightKm}}},
+            {"ozone", {{"absorptionPerMeter", ToJson(sky.ozoneAbsorption)}, {"minimumAltitudeKm", sky.ozoneMinimumAltitudeKm},
+                {"layerWidthKm", sky.ozoneLayerWidthKm}}},
+            {"multipleScattering", sky.multipleScattering},
+            {"atmosphericScattering", sky.atmosphericScattering},
+            {"showGroundBelowHorizon", sky.showGroundBelowHorizon},
+            {"sampleBelowHorizon", sky.sampleBelowHorizon},
+            {"intensity", {{"mode", PhysicalSkyIntensityModeName(sky.intensityMode)},
+                {"exposureCompensation", sky.exposureCompensation}, {"multiplier", sky.multiplier}}},
+            {"artisticOverrides", {{"colorSaturation", sky.colorSaturation}, {"horizonTint", ToJson(sky.horizonTint)},
+                {"zenithTint", ToJson(sky.zenithTint)}, {"horizonZenithShift", sky.horizonZenithShift}}},
+            {"update", {{"mode", PhysicalSkyUpdateModeName(sky.updateMode)}, {"periodSeconds", sky.updatePeriodSeconds}}}
+        };
+    }
+
+    // S5: the night sky and the cloud layers, added to a physical sky's block only when they differ from the defaults, so a
+    // document without them is unchanged.
+    void AddNightAndClouds(Json& block, const PhysicalSkySettings& sky)
+    {
+        const PhysicalSkySettings defaults;
+
+        if(sky.nightSkyIntensity != defaults.nightSkyIntensity || sky.airglowLuminance != defaults.airglowLuminance ||
+            sky.planetRotationDegrees != defaults.planetRotationDegrees)
+        {
+            block["night"] = {{"intensity", sky.nightSkyIntensity}, {"airglowCdM2", sky.airglowLuminance},
+                {"planetRotationDegrees", sky.planetRotationDegrees}};
+        }
+
+        if(sky.cloudLayers.empty())
+        {
+            return;
+        }
+
+        Json layers = Json::array();
+
+        for(const CloudLayerSettings& layer : sky.cloudLayers)
+        {
+            layers.push_back({
+                {"kind", layer.kind == CloudLayerKind::Layer ? "layer" : "volumetric"},
+                {"controlMode", layer.controlMode == CloudControlMode::Simple ? "simple" :
+                    (layer.controlMode == CloudControlMode::Advanced ? "advanced" : "manual")},
+                {"preset", layer.preset},
+                {"altitudeKm", layer.altitudeKm},
+                {"thicknessKm", layer.thicknessKm},
+                {"coverage", layer.coverage},
+                {"density", layer.density},
+                {"shape", {{"scaleKm", layer.shapeScaleKm}, {"detailScaleKm", layer.detailScaleKm}, {"erosion", layer.erosion},
+                    {"factor", layer.shapeFactor}}},
+                {"lighting", {{"albedo", ToJson(layer.albedo)}, {"phaseForward", layer.phaseForward},
+                    {"phaseBackward", layer.phaseBackward}, {"phaseBlend", layer.phaseBlend},
+                    {"multipleScattering", layer.multipleScattering}, {"ambientStrength", layer.ambientStrength}}},
+                {"wind", {{"directionDegrees", layer.windDirectionDegrees}, {"speedMetersPerSecond", layer.windSpeedMetersPerSecond}}},
+                {"castShadows", layer.castShadows},
+                {"coverageMap", {{"reference", layer.coverageMap}, {"extentKm", layer.coverageMapExtentKm}}}
+            });
+        }
+
+        block["clouds"] = std::move(layers);
+    }
+
+    // Missing fields keep their defaults; unknown fields, wrong types and invalid values refuse the scene (never clamped).
+    PhysicalSkySettings ReadPhysicalSky(const Json& block, std::uint32_t schemaVersion)
+    {
+        ValidateFields(block, {"model", "planet", "air", "aerosols", "ozone", "multipleScattering", "atmosphericScattering",
+            "showGroundBelowHorizon", "sampleBelowHorizon", "intensity", "artisticOverrides", "update", "night", "clouds"});
+        PhysicalSkySettings sky;
+
+        if((block.contains("night") || block.contains("clouds")) && schemaVersion < SceneDocument::kCloudSchemaVersion)
+        {
+            throw std::runtime_error("The physical sky's night and clouds require scene schema 34.");
+        }
+
+        const auto readFlag = [](const Json& object, const char* field, bool& target)
+        {
+            if(!object.contains(field))
+            {
+                return;
+            }
+
+            if(!object.at(field).is_boolean())
+            {
+                throw std::runtime_error(std::string("Physical sky ") + field + " must be a boolean.");
+            }
+
+            target = object.at(field).get<bool>();
+        };
+
+        const auto readFloat = [](const Json& object, const char* field, float& target)
+        {
+            if(object.contains(field))
+            {
+                target = ReadNumber(object.at(field), field);
+            }
+        };
+
+        const auto readChannels = [](const Json& object, const char* field, std::array<float, 3>& target)
+        {
+            if(object.contains(field))
+            {
+                ReadChannels(object.at(field), field, target);
+            }
+        };
+
+        if(block.contains("model"))
+        {
+            sky.model = static_cast<PhysicalSkyModel>(ReadPhysicalSkyChoice(block.at("model"), "model",
+                {"earthSimple", "earthAdvanced", "customPlanet"}));
+        }
+
+        if(block.contains("planet"))
+        {
+            const Json& planet = block.at("planet");
+            ValidateFields(planet, {"radiusKm", "seaLevelMeters", "atmosphereHeightKm", "groundAlbedo"});
+            readFloat(planet, "radiusKm", sky.planetRadiusKm);
+            readFloat(planet, "seaLevelMeters", sky.seaLevelMeters);
+            readFloat(planet, "atmosphereHeightKm", sky.atmosphereHeightKm);
+            readChannels(planet, "groundAlbedo", sky.groundAlbedo);
+        }
+
+        if(block.contains("air"))
+        {
+            const Json& air = block.at("air");
+            ValidateFields(air, {"scatteringPerMeter", "absorptionPerMeter", "scaleHeightKm"});
+            readChannels(air, "scatteringPerMeter", sky.rayleighScattering);
+            readChannels(air, "absorptionPerMeter", sky.rayleighAbsorption);
+            readFloat(air, "scaleHeightKm", sky.rayleighScaleHeightKm);
+        }
+
+        if(block.contains("aerosols"))
+        {
+            const Json& aerosols = block.at("aerosols");
+            ValidateFields(aerosols, {"scatteringPerMeter", "absorptionPerMeter", "anisotropy", "scaleHeightKm"});
+            readChannels(aerosols, "scatteringPerMeter", sky.mieScattering);
+            readChannels(aerosols, "absorptionPerMeter", sky.mieAbsorption);
+            readFloat(aerosols, "anisotropy", sky.mieAnisotropy);
+            readFloat(aerosols, "scaleHeightKm", sky.mieScaleHeightKm);
+        }
+
+        if(block.contains("ozone"))
+        {
+            const Json& ozone = block.at("ozone");
+            ValidateFields(ozone, {"absorptionPerMeter", "minimumAltitudeKm", "layerWidthKm"});
+            readChannels(ozone, "absorptionPerMeter", sky.ozoneAbsorption);
+            readFloat(ozone, "minimumAltitudeKm", sky.ozoneMinimumAltitudeKm);
+            readFloat(ozone, "layerWidthKm", sky.ozoneLayerWidthKm);
+        }
+
+        readFloat(block, "multipleScattering", sky.multipleScattering);
+        readFlag(block, "atmosphericScattering", sky.atmosphericScattering);
+        readFlag(block, "showGroundBelowHorizon", sky.showGroundBelowHorizon);
+        readFlag(block, "sampleBelowHorizon", sky.sampleBelowHorizon);
+
+        if(block.contains("intensity"))
+        {
+            const Json& intensity = block.at("intensity");
+            ValidateFields(intensity, {"mode", "exposureCompensation", "multiplier"});
+
+            if(intensity.contains("mode"))
+            {
+                sky.intensityMode = static_cast<PhysicalSkyIntensityMode>(ReadPhysicalSkyChoice(intensity.at("mode"),
+                    "intensity mode", {"exposure", "multiplier"}));
+            }
+
+            readFloat(intensity, "exposureCompensation", sky.exposureCompensation);
+            readFloat(intensity, "multiplier", sky.multiplier);
+        }
+
+        if(block.contains("artisticOverrides"))
+        {
+            const Json& overrides = block.at("artisticOverrides");
+            ValidateFields(overrides, {"colorSaturation", "horizonTint", "zenithTint", "horizonZenithShift"});
+            readFloat(overrides, "colorSaturation", sky.colorSaturation);
+            readChannels(overrides, "horizonTint", sky.horizonTint);
+            readChannels(overrides, "zenithTint", sky.zenithTint);
+            readFloat(overrides, "horizonZenithShift", sky.horizonZenithShift);
+        }
+
+        if(block.contains("update"))
+        {
+            const Json& update = block.at("update");
+            ValidateFields(update, {"mode", "periodSeconds"});
+
+            if(update.contains("mode"))
+            {
+                sky.updateMode = static_cast<PhysicalSkyUpdateMode>(ReadPhysicalSkyChoice(update.at("mode"), "update mode",
+                    {"onChanged", "onDemand", "realtime"}));
+            }
+
+            readFloat(update, "periodSeconds", sky.updatePeriodSeconds);
+        }
+
+        // S5: the night sky.
+        if(block.contains("night"))
+        {
+            const Json& night = block.at("night");
+            ValidateFields(night, {"intensity", "airglowCdM2", "planetRotationDegrees"});
+            readFloat(night, "intensity", sky.nightSkyIntensity);
+            readFloat(night, "airglowCdM2", sky.airglowLuminance);
+            readFloat(night, "planetRotationDegrees", sky.planetRotationDegrees);
+        }
+
+        // S5: the cloud layers, bottom to top.
+        if(block.contains("clouds"))
+        {
+            const Json& clouds = block.at("clouds");
+
+            if(!clouds.is_array() || clouds.size() > PhysicalSkySettings::MaximumCloudLayers)
+            {
+                throw std::runtime_error("Physical sky clouds must be an array of at most 4 layers.");
+            }
+
+            for(const Json& entry : clouds)
+            {
+                ValidateFields(entry, {"kind", "controlMode", "preset", "altitudeKm", "thicknessKm", "coverage", "density", "shape",
+                    "lighting", "wind", "castShadows", "coverageMap"});
+                CloudLayerSettings layer;
+
+                if(entry.contains("kind"))
+                {
+                    layer.kind = static_cast<CloudLayerKind>(ReadPhysicalSkyChoice(entry.at("kind"), "cloud layer kind",
+                        {"layer", "volumetric"}));
+                }
+
+                if(entry.contains("controlMode"))
+                {
+                    layer.controlMode = static_cast<CloudControlMode>(ReadPhysicalSkyChoice(entry.at("controlMode"),
+                        "cloud control mode", {"simple", "advanced", "manual"}));
+                }
+
+                if(entry.contains("preset"))
+                {
+                    if(!entry.at("preset").is_string())
+                    {
+                        throw std::runtime_error("A cloud layer's preset must be a string.");
+                    }
+
+                    layer.preset = entry.at("preset").get<std::string>();
+                }
+
+                readFloat(entry, "altitudeKm", layer.altitudeKm);
+                readFloat(entry, "thicknessKm", layer.thicknessKm);
+                readFloat(entry, "coverage", layer.coverage);
+                readFloat(entry, "density", layer.density);
+
+                if(entry.contains("shape"))
+                {
+                    const Json& shape = entry.at("shape");
+                    ValidateFields(shape, {"scaleKm", "detailScaleKm", "erosion", "factor"});
+                    readFloat(shape, "scaleKm", layer.shapeScaleKm);
+                    readFloat(shape, "detailScaleKm", layer.detailScaleKm);
+                    readFloat(shape, "erosion", layer.erosion);
+                    readFloat(shape, "factor", layer.shapeFactor);
+                }
+
+                if(entry.contains("lighting"))
+                {
+                    const Json& lighting = entry.at("lighting");
+                    ValidateFields(lighting, {"albedo", "phaseForward", "phaseBackward", "phaseBlend", "multipleScattering",
+                        "ambientStrength"});
+                    readChannels(lighting, "albedo", layer.albedo);
+                    readFloat(lighting, "phaseForward", layer.phaseForward);
+                    readFloat(lighting, "phaseBackward", layer.phaseBackward);
+                    readFloat(lighting, "phaseBlend", layer.phaseBlend);
+                    readFloat(lighting, "multipleScattering", layer.multipleScattering);
+                    readFloat(lighting, "ambientStrength", layer.ambientStrength);
+                }
+
+                if(entry.contains("wind"))
+                {
+                    const Json& wind = entry.at("wind");
+                    ValidateFields(wind, {"directionDegrees", "speedMetersPerSecond"});
+                    readFloat(wind, "directionDegrees", layer.windDirectionDegrees);
+                    readFloat(wind, "speedMetersPerSecond", layer.windSpeedMetersPerSecond);
+                }
+
+                readFlag(entry, "castShadows", layer.castShadows);
+
+                if(entry.contains("coverageMap"))
+                {
+                    const Json& map = entry.at("coverageMap");
+                    ValidateFields(map, {"reference", "extentKm"});
+
+                    if(map.contains("reference"))
+                    {
+                        if(!map.at("reference").is_string())
+                        {
+                            throw std::runtime_error("A cloud layer's coverage map reference must be a string.");
+                        }
+
+                        layer.coverageMap = map.at("reference").get<std::string>();
+                    }
+
+                    readFloat(map, "extentKm", layer.coverageMapExtentKm);
+                }
+
+                sky.cloudLayers.push_back(std::move(layer));
+            }
+        }
+
+        std::string error;
+
+        if(!ValidatePhysicalSkySettings(sky, &error))
+        {
+            throw std::runtime_error("Invalid physical sky: " + error);
+        }
+
+        return sky;
+    }
+
     Json ToJson(const Transform& value)
     {
         return {
@@ -522,7 +953,7 @@ namespace
     // file stays readable; angles are radians like the Camera FOV.
     Json ToJson(const LightComponent& light)
     {
-        return {
+        Json json = {
             {"enabled", light.enabled},
             {"type", LightTypeName(light.type)},
             {"color", ToJson(light.color)},
@@ -533,6 +964,14 @@ namespace
             {"outerConeAngle", light.outerConeAngle},
             {"angularRadius", light.angularRadius}
         };
+
+        // Schema 32: only the non-default value is written, so lights that affect the atmosphere keep their schema 31 form.
+        if(!light.affectsAtmosphere)
+        {
+            json["affectsAtmosphere"] = false;
+        }
+
+        return json;
     }
 
     // legacyRange is set (and the historical rules apply, before MigrateLegacyLightUnits) for legacy-unit input.
@@ -545,7 +984,7 @@ namespace
         else
         {
             ValidateFields(value, {"enabled", "type", "color", "intensity", "range", "rangeAttenuation", "innerConeAngle",
-                "outerConeAngle", "angularRadius"});
+                "outerConeAngle", "angularRadius", "affectsAtmosphere"});
         }
 
         if(!value.at("enabled").is_boolean())
@@ -601,6 +1040,16 @@ namespace
         }
 
         light.rangeAttenuation = value.at("rangeAttenuation").get<bool>();
+
+        if(value.contains("affectsAtmosphere"))
+        {
+            if(!value.at("affectsAtmosphere").is_boolean())
+            {
+                throw std::runtime_error("Light affectsAtmosphere must be a boolean.");
+            }
+
+            light.affectsAtmosphere = value.at("affectsAtmosphere").get<bool>();
+        }
 
         std::string error;
 
@@ -958,6 +1407,12 @@ namespace
                 {"environmentLuminanceScale", document.lightingSettings.environmentLuminanceScale}}}
         };
 
+        // Physical sky S4: only a rotated HDRI writes its yaw, so other documents are unchanged.
+        if(document.lightingSettings.environmentRotationDegrees != 0.0f)
+        {
+            scene["lightingSettings"]["environmentRotationDegrees"] = document.lightingSettings.environmentRotationDegrees;
+        }
+
         // W2: a Local Level always states its owner (null when unassigned); a World always lists its members.
         if(document.kind == SceneKind::Local)
         {
@@ -1051,13 +1506,33 @@ namespace
             };
         }
 
+        // Physical sky S0: the block exists only for a stored sky type or physical sky, so a scene that never chose either keeps
+        // exactly its earlier content (and its type stays derived from the environment reference).
+        if(document.skyType || document.physicalSky)
+        {
+            Json sky = Json::object();
+
+            if(document.skyType)
+            {
+                sky["type"] = SkyTypeName(*document.skyType);
+            }
+
+            if(document.physicalSky)
+            {
+                sky["physical"] = ToJson(*document.physicalSky);
+                AddNightAndClouds(sky["physical"], *document.physicalSky);
+            }
+
+            scene["sky"] = std::move(sky);
+        }
+
         return scene;
     }
 
     SceneDocument FromJson(const Json& value, const LegacyLightingMigrationOptions& migration = {})
     {
         ValidateFields(value, {"schemaVersion", "kind", "owningWorld", "members", "environmentOverrides", "id", "name", "camera", "directionalLight", "objects", "environmentReference", "lightingSettings",
-            "voxelBake", "mistRendering", "airEnvironment", "airSimulation", "environmentalHaze"});
+            "voxelBake", "mistRendering", "airEnvironment", "airSimulation", "environmentalHaze", "sky"});
         const auto& schemaVersion = value.at("schemaVersion");
         if (!schemaVersion.is_number_integer() ||
             (schemaVersion != SceneDocument::kLegacySchemaVersion &&
@@ -1089,7 +1564,11 @@ namespace
              schemaVersion != SceneDocument::kMovingSolidParticipationSchemaVersion &&
              schemaVersion != SceneDocument::kSceneKindSchemaVersion &&
              schemaVersion != SceneDocument::kMembershipSchemaVersion &&
-             schemaVersion != SceneDocument::kEnvironmentOverridesSchemaVersion))
+             schemaVersion != SceneDocument::kEnvironmentOverridesSchemaVersion &&
+             schemaVersion != SceneDocument::kPhysicalSkySchemaVersion &&
+             schemaVersion != SceneDocument::kLightAtmosphereSchemaVersion &&
+             schemaVersion != SceneDocument::kHdriRotationSchemaVersion &&
+             schemaVersion != SceneDocument::kCloudSchemaVersion))
         {
             throw std::runtime_error("Unsupported scene schema version.");
         }
@@ -1238,6 +1717,30 @@ namespace
 
         result.name = value.at("name").get<std::string>();
         result.environmentReference=value.value("environmentReference",std::string{});
+
+        // Physical sky S0 (schema 31): the optional sky block. Without it (or without its type) the type stays derived from the
+        // environment reference exactly as every earlier scene rendered (DeriveSkyType); nothing is converted.
+        if(value.contains("sky"))
+        {
+            if(schemaVersion.get<std::uint32_t>() < SceneDocument::kPhysicalSkySchemaVersion)
+            {
+                throw std::runtime_error("The sky block requires scene schema version " +
+                    std::to_string(SceneDocument::kPhysicalSkySchemaVersion) + ".");
+            }
+
+            const Json& sky = value.at("sky");
+            ValidateFields(sky, {"type", "physical"});
+
+            if(sky.contains("type"))
+            {
+                result.skyType = ReadSkyType(sky.at("type"));
+            }
+
+            if(sky.contains("physical"))
+            {
+                result.physicalSky = ReadPhysicalSky(sky.at("physical"), schemaVersion.get<std::uint32_t>());
+            }
+        }
 
         if(value.contains("voxelBake"))
         {
@@ -1655,10 +2158,21 @@ namespace
         if(physicalLighting)
         {
             const auto& settings = value.at("lightingSettings");
-            ValidateFields(settings, {"referenceEV100", "environmentLuminanceScale"});
+            ValidateFields(settings, {"referenceEV100", "environmentLuminanceScale", "environmentRotationDegrees"});
             result.lightingSettings.referenceEV100 = ReadNumber(settings.at("referenceEV100"), "Reference exposure");
             result.lightingSettings.environmentLuminanceScale =
                 ReadNumber(settings.at("environmentLuminanceScale"), "Environment luminance scale");
+
+            if(settings.contains("environmentRotationDegrees"))
+            {
+                if(schemaVersion.get<std::uint32_t>() < SceneDocument::kHdriRotationSchemaVersion)
+                {
+                    throw std::runtime_error("HDRI rotation requires scene schema 33.");
+                }
+
+                result.lightingSettings.environmentRotationDegrees =
+                    ReadNumber(settings.at("environmentRotationDegrees"), "HDRI rotation");
+            }
         }
         else if(objectLighting)
         {

@@ -139,9 +139,8 @@ void ValidateMetadata(const Metadata& sceneMetadata, const Policy& policy)
     {
         throw std::runtime_error("Invalid cooked scene document: " + error);
     }
-    const auto& reference = sceneMetadata.document.environmentReference;
-    Require(sceneMetadata.environment.has_value() ==
-        (!reference.empty() && reference != SceneDocument::NoneEnvironmentReference),
+    // Physical sky S0: only an Hdri sky with an asset reference is bound to a cooked environment.
+    Require(sceneMetadata.environment.has_value() == SceneSkyUsesEnvironmentAsset(sceneMetadata.document),
         "Environment binding does not match scene selection.");
     Require(sceneMetadata.document.objects.size() <= policy.maxObjects &&
                 sceneMetadata.meshes.size() == sceneMetadata.document.objects.size(),
@@ -592,7 +591,8 @@ void WriteLightComponent(Writer& writer, const std::optional<LightComponent>& li
     writer.WriteFloat(light->innerConeAngle);
     writer.WriteFloat(light->outerConeAngle);
     writer.WriteFloat(light->angularRadius);
-    writer.WriteUnsigned(light->rangeAttenuation ? 1 : 0, 4);
+    // V39: bit 1 marks a light that does not affect the atmosphere, so the default writes the V38 word.
+    writer.WriteUnsigned((light->rangeAttenuation ? 1u : 0u) | (light->affectsAtmosphere ? 0u : 2u), 4);
 }
 
 // Payloads before 14 carry legacy units: their range goes to legacyRange and the historical rules apply
@@ -1162,6 +1162,201 @@ void ReadMovingSolidSetting(Reader& reader, std::optional<AirSimulationSettings>
     }
 }
 
+// V38 (physical sky S0) sky, after the moving-solid setting: u32 sky type stored; u32 sky type (0 Neutral, 1 Hdri, 2 Physical; 0
+// when not stored); u32 physical present; if so, in PhysicalSkySettings' declaration order: u32 model; f32 planet radius, f32 sea level, f32 atmosphere height, 3 x f32 ground
+// albedo; 3 x f32 Rayleigh scattering, 3 x f32 Rayleigh absorption, f32 Rayleigh scale height; 3 x f32 Mie scattering, 3 x f32 Mie
+// absorption, f32 Mie anisotropy, f32 Mie scale height; 3 x f32 ozone absorption, f32 ozone minimum altitude, f32 ozone layer width;
+// f32 multiple scattering; u32 atmospheric scattering, u32 show ground, u32 sample below horizon; u32 intensity mode, f32 exposure
+// compensation, f32 multiplier; f32 colour saturation, 3 x f32 horizon tint, 3 x f32 zenith tint, f32 horizon-zenith shift; u32 update
+// mode, f32 update period (44 values, 176 bytes after the presence word).
+void WriteChannels(Writer& writer, const std::array<float, 3>& channels)
+{
+    for(const float channel : channels)
+    {
+        writer.WriteFloat(channel);
+    }
+}
+
+void ReadChannels(Reader& reader, std::array<float, 3>& channels)
+{
+    for(float& channel : channels)
+    {
+        channel = reader.ReadFloat();
+    }
+}
+
+void WriteSky(Writer& writer, const std::optional<SkyType>& skyType, const std::optional<PhysicalSkySettings>& physicalSky)
+{
+    writer.WriteUnsigned(skyType.has_value() ? 1 : 0, 4);
+    writer.WriteUnsigned(skyType ? static_cast<std::uint32_t>(*skyType) : 0u, 4);
+    writer.WriteUnsigned(physicalSky.has_value() ? 1 : 0, 4);
+
+    if(!physicalSky)
+    {
+        return;
+    }
+
+    const PhysicalSkySettings& sky = *physicalSky;
+    writer.WriteUnsigned(static_cast<std::uint32_t>(sky.model), 4);
+    writer.WriteFloat(sky.planetRadiusKm);
+    writer.WriteFloat(sky.seaLevelMeters);
+    writer.WriteFloat(sky.atmosphereHeightKm);
+    WriteChannels(writer, sky.groundAlbedo);
+    WriteChannels(writer, sky.rayleighScattering);
+    WriteChannels(writer, sky.rayleighAbsorption);
+    writer.WriteFloat(sky.rayleighScaleHeightKm);
+    WriteChannels(writer, sky.mieScattering);
+    WriteChannels(writer, sky.mieAbsorption);
+    writer.WriteFloat(sky.mieAnisotropy);
+    writer.WriteFloat(sky.mieScaleHeightKm);
+    WriteChannels(writer, sky.ozoneAbsorption);
+    writer.WriteFloat(sky.ozoneMinimumAltitudeKm);
+    writer.WriteFloat(sky.ozoneLayerWidthKm);
+    writer.WriteFloat(sky.multipleScattering);
+    writer.WriteUnsigned(sky.atmosphericScattering ? 1 : 0, 4);
+    writer.WriteUnsigned(sky.showGroundBelowHorizon ? 1 : 0, 4);
+    writer.WriteUnsigned(sky.sampleBelowHorizon ? 1 : 0, 4);
+    writer.WriteUnsigned(static_cast<std::uint32_t>(sky.intensityMode), 4);
+    writer.WriteFloat(sky.exposureCompensation);
+    writer.WriteFloat(sky.multiplier);
+    writer.WriteFloat(sky.colorSaturation);
+    WriteChannels(writer, sky.horizonTint);
+    WriteChannels(writer, sky.zenithTint);
+    writer.WriteFloat(sky.horizonZenithShift);
+    writer.WriteUnsigned(static_cast<std::uint32_t>(sky.updateMode), 4);
+    writer.WriteFloat(sky.updatePeriodSeconds);
+}
+
+void ReadSky(Reader& reader, std::optional<SkyType>& skyType, std::optional<PhysicalSkySettings>& physicalSky)
+{
+    const auto readFlag = [&](const char* message)
+    {
+        const std::uint32_t flag = static_cast<std::uint32_t>(reader.ReadUnsigned(4));
+        Require(flag <= 1, message);
+        return flag == 1;
+    };
+
+    const bool typeStored = readFlag("Invalid cooked sky type presence.");
+    const std::uint32_t type = static_cast<std::uint32_t>(reader.ReadUnsigned(4));
+    Require(type <= static_cast<std::uint32_t>(SkyType::Physical) && (typeStored || type == 0), "Invalid cooked sky type.");
+    skyType = typeStored ? std::optional<SkyType>(static_cast<SkyType>(type)) : std::nullopt;
+    physicalSky.reset();
+
+    if(!readFlag("Invalid cooked physical sky presence."))
+    {
+        return;
+    }
+
+    PhysicalSkySettings sky;
+    const std::uint32_t model = static_cast<std::uint32_t>(reader.ReadUnsigned(4));
+    Require(model <= static_cast<std::uint32_t>(PhysicalSkyModel::CustomPlanet), "Invalid cooked physical sky model.");
+    sky.model = static_cast<PhysicalSkyModel>(model);
+    sky.planetRadiusKm = reader.ReadFloat();
+    sky.seaLevelMeters = reader.ReadFloat();
+    sky.atmosphereHeightKm = reader.ReadFloat();
+    ReadChannels(reader, sky.groundAlbedo);
+    ReadChannels(reader, sky.rayleighScattering);
+    ReadChannels(reader, sky.rayleighAbsorption);
+    sky.rayleighScaleHeightKm = reader.ReadFloat();
+    ReadChannels(reader, sky.mieScattering);
+    ReadChannels(reader, sky.mieAbsorption);
+    sky.mieAnisotropy = reader.ReadFloat();
+    sky.mieScaleHeightKm = reader.ReadFloat();
+    ReadChannels(reader, sky.ozoneAbsorption);
+    sky.ozoneMinimumAltitudeKm = reader.ReadFloat();
+    sky.ozoneLayerWidthKm = reader.ReadFloat();
+    sky.multipleScattering = reader.ReadFloat();
+    sky.atmosphericScattering = readFlag("Invalid cooked physical sky atmospheric scattering flag.");
+    sky.showGroundBelowHorizon = readFlag("Invalid cooked physical sky ground flag.");
+    sky.sampleBelowHorizon = readFlag("Invalid cooked physical sky below-horizon sampling flag.");
+    const std::uint32_t intensityMode = static_cast<std::uint32_t>(reader.ReadUnsigned(4));
+    Require(intensityMode <= static_cast<std::uint32_t>(PhysicalSkyIntensityMode::Multiplier),
+        "Invalid cooked physical sky intensity mode.");
+    sky.intensityMode = static_cast<PhysicalSkyIntensityMode>(intensityMode);
+    sky.exposureCompensation = reader.ReadFloat();
+    sky.multiplier = reader.ReadFloat();
+    sky.colorSaturation = reader.ReadFloat();
+    ReadChannels(reader, sky.horizonTint);
+    ReadChannels(reader, sky.zenithTint);
+    sky.horizonZenithShift = reader.ReadFloat();
+    const std::uint32_t updateMode = static_cast<std::uint32_t>(reader.ReadUnsigned(4));
+    Require(updateMode <= static_cast<std::uint32_t>(PhysicalSkyUpdateMode::Realtime), "Invalid cooked physical sky update mode.");
+    sky.updateMode = static_cast<PhysicalSkyUpdateMode>(updateMode);
+    sky.updatePeriodSeconds = reader.ReadFloat();
+
+    std::string error;
+    Require(ValidatePhysicalSkySettings(sky, &error), error.c_str());
+    physicalSky = sky;
+}
+
+// Physical sky S5 (V41): a physical sky's night sky and cloud layers.
+void WriteNightAndClouds(Writer& writer, const PhysicalSkySettings& sky)
+{
+    writer.WriteFloat(sky.nightSkyIntensity);
+    writer.WriteFloat(sky.airglowLuminance);
+    writer.WriteFloat(sky.planetRotationDegrees);
+    writer.WriteUnsigned(static_cast<std::uint32_t>(sky.cloudLayers.size()), 4);
+
+    for(const CloudLayerSettings& layer : sky.cloudLayers)
+    {
+        writer.WriteUnsigned(static_cast<std::uint32_t>(layer.kind), 4);
+        writer.WriteUnsigned(static_cast<std::uint32_t>(layer.controlMode), 4);
+        writer.WriteString(layer.preset);
+
+        for(const float value : {layer.altitudeKm, layer.thicknessKm, layer.coverage, layer.density, layer.shapeScaleKm,
+            layer.detailScaleKm, layer.erosion, layer.shapeFactor, layer.phaseForward, layer.phaseBackward, layer.phaseBlend,
+            layer.multipleScattering, layer.ambientStrength, layer.windDirectionDegrees, layer.windSpeedMetersPerSecond})
+        {
+            writer.WriteFloat(value);
+        }
+
+        WriteChannels(writer, layer.albedo);
+        writer.WriteUnsigned(layer.castShadows ? 1 : 0, 4);
+        writer.WriteString(layer.coverageMap);
+        writer.WriteFloat(layer.coverageMapExtentKm);
+    }
+}
+
+void ReadNightAndClouds(Reader& reader, PhysicalSkySettings& sky)
+{
+    sky.nightSkyIntensity = reader.ReadFloat();
+    sky.airglowLuminance = reader.ReadFloat();
+    sky.planetRotationDegrees = reader.ReadFloat();
+    const std::uint32_t count = static_cast<std::uint32_t>(reader.ReadUnsigned(4));
+    Require(count <= PhysicalSkySettings::MaximumCloudLayers, "Invalid cooked cloud layer count.");
+    sky.cloudLayers.clear();
+
+    for(std::uint32_t index = 0; index < count; ++index)
+    {
+        CloudLayerSettings layer;
+        const std::uint32_t kind = static_cast<std::uint32_t>(reader.ReadUnsigned(4));
+        const std::uint32_t mode = static_cast<std::uint32_t>(reader.ReadUnsigned(4));
+        Require(kind <= static_cast<std::uint32_t>(CloudLayerKind::Volumetric) &&
+            mode <= static_cast<std::uint32_t>(CloudControlMode::Manual), "Invalid cooked cloud layer kind or control mode.");
+        layer.kind = static_cast<CloudLayerKind>(kind);
+        layer.controlMode = static_cast<CloudControlMode>(mode);
+        layer.preset = reader.ReadString();
+
+        for(float* value : {&layer.altitudeKm, &layer.thicknessKm, &layer.coverage, &layer.density, &layer.shapeScaleKm,
+            &layer.detailScaleKm, &layer.erosion, &layer.shapeFactor, &layer.phaseForward, &layer.phaseBackward, &layer.phaseBlend,
+            &layer.multipleScattering, &layer.ambientStrength, &layer.windDirectionDegrees, &layer.windSpeedMetersPerSecond})
+        {
+            *value = reader.ReadFloat();
+        }
+
+        ReadChannels(reader, layer.albedo);
+        const std::uint32_t shadows = static_cast<std::uint32_t>(reader.ReadUnsigned(4));
+        Require(shadows <= 1, "Invalid cooked cloud shadow flag.");
+        layer.castShadows = shadows == 1;
+        layer.coverageMap = reader.ReadString();
+        layer.coverageMapExtentKm = reader.ReadFloat();
+        sky.cloudLayers.push_back(std::move(layer));
+    }
+
+    std::string error;
+    Require(ValidatePhysicalSkySettings(sky, &error), error.c_str());
+}
+
 void WriteMistEmitter(Writer& writer, const std::optional<MistEmitterComponent>& emitter)
 {
     writer.WriteUnsigned(emitter.has_value() ? 1 : 0, 4);
@@ -1417,9 +1612,10 @@ std::optional<LightComponent> ReadLightComponent(Reader& reader, std::uint32_t v
         return light;
     }
 
-    const auto rangeAttenuation = reader.ReadUnsigned(4);
-    Require(rangeAttenuation <= 1, "Invalid cooked Light range attenuation flag.");
-    light.rangeAttenuation = rangeAttenuation != 0;
+    const auto flags = reader.ReadUnsigned(4);
+    Require(flags <= (version >= LightAtmosphereVersion ? 3u : 1u), "Invalid cooked Light range attenuation flag.");
+    light.rangeAttenuation = (flags & 1u) != 0;
+    light.affectsAtmosphere = (flags & 2u) == 0;
 
     std::string error;
 
@@ -1473,6 +1669,15 @@ std::vector<std::byte> Encode(const Metadata& sceneMetadata, const Policy& polic
     WriteMistRendering(writer, document.mistRendering);
     WriteVoxelBake(writer, document.voxelBake);
     WriteMovingSolidSetting(writer, document.airSimulation);
+    WriteSky(writer, document.skyType, document.physicalSky);
+    // Physical sky S4 (V40): the HDRI sky's yaw, after the sky record.
+    writer.WriteFloat(document.lightingSettings.environmentRotationDegrees);
+
+    // Physical sky S5 (V41): a physical sky's night sky and clouds.
+    if(document.physicalSky)
+    {
+        WriteNightAndClouds(writer, *document.physicalSky);
+    }
 
     for (size_t index = 0; index < document.objects.size(); ++index)
     {
@@ -1616,7 +1821,8 @@ std::vector<std::byte> Cook(const SceneDocument& document, std::span<const MeshI
         }
         sceneMetadata.meshes.push_back(found->second);
     }
-    if (!document.environmentReference.empty() && document.environmentReference != SceneDocument::NoneEnvironmentReference)
+    // Physical sky S0: a Neutral or Physical sky keeps its stored HDRI reference but needs no environment; none is cooked.
+    if (SceneSkyUsesEnvironmentAsset(document))
     {
         const auto id = AssetID::ParseReference(document.environmentReference);
         const auto* record = id ? registry.Find(*id) : nullptr;
@@ -1766,6 +1972,27 @@ Metadata Decode(std::span<const std::byte> bytes, const Policy& policy)
         if(payloadVersion >= MovingSolidParticipationVersion)
         {
             ReadMovingSolidSetting(reader, document.airSimulation);
+        }
+
+        // Physical sky S0: before V38 a scene stores no sky type (it is derived from the environment reference) and no physical sky.
+        if(payloadVersion >= PhysicalSkyVersion)
+        {
+            ReadSky(reader, document.skyType, document.physicalSky);
+        }
+
+        // Physical sky S4: before V40 an HDRI sky is not rotated.
+        if(payloadVersion >= HdriRotationVersion)
+        {
+            document.lightingSettings.environmentRotationDegrees = reader.ReadFloat();
+            Require(std::isfinite(document.lightingSettings.environmentRotationDegrees) &&
+                std::abs(document.lightingSettings.environmentRotationDegrees) <=
+                SceneLightingSettings::MaximumEnvironmentRotationDegrees, "Invalid cooked HDRI rotation.");
+        }
+
+        // Physical sky S5: before V41 a physical sky has the default night sky and no clouds.
+        if(payloadVersion >= CloudVersion && document.physicalSky)
+        {
+            ReadNightAndClouds(reader, *document.physicalSky);
         }
     }
     else if(payloadVersion == ObjectLightingVersion)
@@ -2057,7 +2284,7 @@ bool ArchiveScene::ValidateReferences(std::string* error) const
     {
         return fail("Stale archive scene entry/type/version/generation.");
     }
-    if (!metadata.document.environmentReference.empty() && metadata.document.environmentReference != SceneDocument::NoneEnvironmentReference)
+    if (SceneSkyUsesEnvironmentAsset(metadata.document))
     {
         const auto id = AssetID::ParseReference(metadata.document.environmentReference);
         const auto* entry = id ? provider->ArchiveEntry(*id) : nullptr;

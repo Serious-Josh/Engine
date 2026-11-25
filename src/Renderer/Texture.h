@@ -140,5 +140,9 @@ class Texture
 
     DXGI_FORMAT m_format = DXGI_FORMAT_UNKNOWN;
 
+    // A placed texture (TextureMemoryAllocator.h) whose first Transition still calls RecordActivation: the aliasing
+    // barrier, and the discard for unordered-access textures, unless an owner or the allocator activated it already.
+    bool m_activationPending = false;
+
     TransactionalResourceState<std::vector<D3D12_RESOURCE_STATES>> m_subresourceStates;
 };

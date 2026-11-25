@@ -25,6 +25,8 @@ EffectiveSceneEnvironment ResolveSceneEnvironment(const SceneDocument& scene, co
     {
         result.source = EffectiveSceneEnvironment::Source::World;
         result.worldName = scene.name;
+        result.skyType = scene.skyType;
+        result.physicalSky = scene.physicalSky;
         result.environmentReference = scene.environmentReference;
         result.lightingSettings = scene.lightingSettings;
         result.environmentalHaze = scene.environmentalHaze;
@@ -72,9 +74,14 @@ EffectiveSceneEnvironment ResolveSceneEnvironment(const SceneDocument& scene, co
     const SceneDocument& inherited = owner ? *owner : defaults;
     const auto& overrides = scene.environmentOverrides;
 
+    // Physical sky S0: the sky type and the physical sky belong to the Sky group, with the HDRI reference and its luminance.
+    result.skyType = overrides.sky ? scene.skyType : inherited.skyType;
+    result.physicalSky = overrides.sky ? scene.physicalSky : inherited.physicalSky;
     result.environmentReference = overrides.sky ? scene.environmentReference : inherited.environmentReference;
     result.lightingSettings.environmentLuminanceScale = overrides.sky ? scene.lightingSettings.environmentLuminanceScale :
         inherited.lightingSettings.environmentLuminanceScale;
+    result.lightingSettings.environmentRotationDegrees = overrides.sky ? scene.lightingSettings.environmentRotationDegrees :
+        inherited.lightingSettings.environmentRotationDegrees;
     result.lightingSettings.referenceEV100 = overrides.exposure ? scene.lightingSettings.referenceEV100 :
         inherited.lightingSettings.referenceEV100;
     result.environmentalHaze = overrides.haze ? scene.environmentalHaze : inherited.environmentalHaze;
@@ -106,8 +113,15 @@ EffectiveSceneEnvironment ResolveSceneEnvironment(const SceneDocument& scene, co
     return result;
 }
 
+SkyType EffectiveSkyType(const EffectiveSceneEnvironment& environment)
+{
+    return ResolveSkyType(environment.skyType, environment.environmentReference);
+}
+
 void StoreEnvironment(SceneDocument& local, const EffectiveSceneEnvironment& environment)
 {
+    local.skyType = environment.skyType;
+    local.physicalSky = environment.physicalSky;
     local.environmentReference = environment.environmentReference;
     local.lightingSettings = environment.lightingSettings;
     local.environmentalHaze = environment.environmentalHaze;
@@ -127,8 +141,11 @@ std::string DescribeEnvironmentDifferences(const EffectiveSceneEnvironment& befo
         }
     };
 
-    add(before.environmentReference != after.environmentReference ||
-        before.lightingSettings.environmentLuminanceScale != after.lightingSettings.environmentLuminanceScale, "sky");
+    // The resolved type: a derived Hdri sky and a stored Hdri sky with the same reference are the same sky.
+    add(EffectiveSkyType(before) != EffectiveSkyType(after) || !Same(before.physicalSky, after.physicalSky) ||
+        before.environmentReference != after.environmentReference ||
+        before.lightingSettings.environmentLuminanceScale != after.lightingSettings.environmentLuminanceScale ||
+        before.lightingSettings.environmentRotationDegrees != after.lightingSettings.environmentRotationDegrees, "sky");
     add(before.lightingSettings.referenceEV100 != after.lightingSettings.referenceEV100, "exposure reference");
     add(!Same(before.environmentalHaze, after.environmentalHaze), "haze");
     add(!Same(before.mistRendering, after.mistRendering), "mist appearance");

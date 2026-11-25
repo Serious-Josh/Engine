@@ -84,6 +84,7 @@ void Engine::LoadEditorPreferences()
     }
 
     m_editor.ApplyViewportPreferences(m_editorPreferences.GetViewport());
+    m_editor.ApplyWindowPreferences(m_editorPreferences.GetWindows());
 }
 
 // The development Editor used to keep its layout in the working directory's imgui.ini. Personal
@@ -222,6 +223,7 @@ void Engine::SaveEditorPreferences()
     }
 
     m_editorPreferences.SetViewport(m_editor.GetViewportPreferences());
+    m_editorPreferences.SetWindows(m_editor.GetWindowPreferences());
     const auto serialized = m_editorPreferences.Serialize();
 
     if(serialized == m_editorPreferencesSaved)

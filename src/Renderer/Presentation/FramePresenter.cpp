@@ -2,6 +2,7 @@
 
 #include "Core/Log.h"
 #include "Renderer/SwapChain.h"
+#include "Renderer/TextureMemoryAllocator.h"
 
 #include <Windows.h>
 
@@ -189,7 +190,12 @@ bool FramePresenter::Start(SwapChain& swapChain, ID3D12Fence* frameFence, unsign
 
     for(unsigned int index = 0; index < CompositeCount; ++index)
     {
-        if(FAILED(m_device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &description,
+        // Engine-owned memory when created on the renderer's thread, which the allocator activates on the frame recording
+        // before the first clear (TextureMemoryAllocator.h); Stop drains the present queue before releasing them.
+        const bool placed = SUCCEEDED(TextureMemoryAllocator::CreateTexture(m_device, description,
+            D3D12_RESOURCE_STATE_COPY_SOURCE, m_composites[index].ReleaseAndGetAddressOf()));
+
+        if(!placed && FAILED(m_device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &description,
             D3D12_RESOURCE_STATE_COPY_SOURCE, nullptr, IID_PPV_ARGS(&m_composites[index]))))
         {
             m_composites = {};

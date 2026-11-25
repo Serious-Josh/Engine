@@ -1,5 +1,6 @@
 #include "MaterialLighting.hlsli"
 #include "ShadingNormal.hlsli"
+#include "SkyFrame.hlsli"
 
 static const float RT_REFLECTION_ROUGHNESS_FADE_START = 0.30f;
 static const float RT_REFLECTION_ROUGHNESS_FADE_END = 0.40f;
@@ -39,7 +40,12 @@ cbuffer ReconstructionConstants : register(b1)
     float3 cameraPosition;
     uint geometricNormalIndex;
     uint motionIndex;
-    uint3 reconstructionPadding;
+    // Physical sky S3: the published sky-view map for the background, or 0xFFFFFFFF (the equirect, as before).
+    uint skyViewIndex;
+    // S4: an HDRI sky's background slot equirect, or 0xFFFFFFFF.
+    uint backgroundEquirectIndex;
+    // S5: the physical sky's frame information (SkyFrame.hlsli), or 0xFFFFFFFF.
+    uint skyFrameInfoIndex;
 }
 
 cbuffer DirectionalLightConstants : register(b2)
@@ -48,9 +54,12 @@ cbuffer DirectionalLightConstants : register(b2)
     float lightIntensity;
 
     float3 lightColor;
-    float lightPadding;
+    // Physical sky S2: cos(angular radius) of the visible sun disk in the background, or 2 for none (HDRI and neutral frames).
+    float lightDiskCosine;
 }
 
+// Physical sky S5B: the moon's table light through the clouds' moon shadow (SceneLightMoonCloudShadow, defined below).
+#define SCENE_LIGHTS_MOON_CLOUD_SHADOW 1
 #include "SceneLights.hlsli"
 
 cbuffer SceneLightConstants : register(b3)
@@ -62,6 +71,11 @@ cbuffer SceneLightConstants : register(b3)
 
 SamplerState sampler0 : register(s0);
 SamplerState diagnosticEnvironmentSampler : register(s1);
+
+float SceneLightMoonCloudShadow(float3 surfacePosition)
+{
+    return SkyFrameMoonCloudShadow(skyFrameInfoIndex, surfacePosition);
+}
 
 // The material's direct BRDF for one light direction, using exactly the sun path's LUT inputs and
 // per-model evaluation, so table Lights and the sun shade identically.
@@ -308,12 +322,41 @@ float4 PSMain(VSOutput input) : SV_Target0
                 worldDirection
             );
 
-        float3 environmentColor =
-            environmentTexture.SampleLevel(
-                sampler0,
-                environmentUV,
-                0.0f
-            ).rgb;
+        float3 environmentColor;
+
+        if(skyViewIndex != 0xFFFFFFFFu)
+        {
+            environmentColor = SampleSkyView(skyViewIndex, worldDirection);
+        }
+        else if(backgroundEquirectIndex != 0xFFFFFFFFu)
+        {
+            Texture2D<float4> background = ResourceDescriptorHeap[backgroundEquirectIndex];
+            environmentColor = background.SampleLevel(sampler0, environmentUV, 0.0f).rgb;
+        }
+        else
+        {
+            environmentColor = environmentTexture.SampleLevel(sampler0, environmentUV, 0.0f).rgb;
+        }
+
+        // Physical sky S5: the stars and the moon's disk, per pixel (the clouds are composited over the frame later). S5B: with the
+        // pixel's angular footprint, so stars smaller than a pixel spread over it rather than shimmer.
+        uint targetWidth;
+        uint targetHeight;
+        depthTexture.GetDimensions(targetWidth, targetHeight);
+        const float3 centreDirection = normalize(worldDirection);
+        const float footprint = max(
+            length(normalize(ReconstructWorldDirection(input.uv + float2(1.0f / float(targetWidth), 0.0f))) - centreDirection),
+            length(normalize(ReconstructWorldDirection(input.uv + float2(0.0f, 1.0f / float(targetHeight)))) - centreDirection));
+        environmentColor += SkyFrameNightBackground(skyFrameInfoIndex, worldDirection, footprint);
+
+        // Physical sky S2: the sun disk (never baked into the sky), E / (pi sin^2 alpha) clamped to the display maximum. Sun disk edge
+        // (2026-11-25): limb-darkened and covered over the pixel's footprint (Common.hlsli), so the edge does not alias.
+        if(lightDiskCosine < 1.0f)
+        {
+            float sinSquared = (1.0f - lightDiskCosine) * (1.0f + lightDiskCosine);
+            environmentColor += SunDiskDisplayRadiance(lightColor * lightIntensity / (PI * max(sinSquared, 1.0e-12f)), -lightDirection,
+                worldDirection, lightDiskCosine, footprint);
+        }
 
         return float4(
             environmentColor,
@@ -357,6 +400,9 @@ float4 PSMain(VSOutput input) : SV_Target0
     {
         return float4(0.0f, 0.0f, 0.0f, 1.0f);
     }
+
+    // Physical sky S5: the clouds' shadow on the sun.
+    shadowVisibility *= SkyFrameCloudShadow(skyFrameInfoIndex, worldPosition.xyz);
 
     // Reserved for material AO composition; leave lighting unchanged in this step.
     Texture2D<float4> motionTexture = ResourceDescriptorHeap[motionIndex];
@@ -791,7 +837,7 @@ float4 PSMain(VSOutput input) : SV_Target0
             );
 
         float maxEnvironmentMip =
-            10.0f;
+            EnvironmentCubeMaximumMip(environmentCubemap);
 
         float environmentMip =
             roughness *
@@ -848,7 +894,7 @@ float4 PSMain(VSOutput input) : SV_Target0
             );
 
         float multiscatterMip =
-            roughness * 6.0f;
+            roughness * EnvironmentCubeMaximumMip(ggxMultiscatterIrradiance);
 
         float3 multiscatterIrradiance =
             ggxMultiscatterIrradiance.SampleLevel(
@@ -984,7 +1030,7 @@ float4 PSMain(VSOutput input) : SV_Target0
             );
 
         float maxEnvironmentMip =
-            10.0f;
+            EnvironmentCubeMaximumMip(environmentCubemap);
 
         float environmentMip =
             roughness *
@@ -1041,7 +1087,7 @@ float4 PSMain(VSOutput input) : SV_Target0
             );
 
         float multiscatterMip =
-            roughness * 6.0f;
+            roughness * EnvironmentCubeMaximumMip(ggxMultiscatterIrradiance);
 
         float3 multiscatterIrradiance =
             ggxMultiscatterIrradiance.SampleLevel(
@@ -1159,7 +1205,7 @@ float4 PSMain(VSOutput input) : SV_Target0
             );
 
         float maxEnvironmentMip =
-            10.0f;
+            EnvironmentCubeMaximumMip(environmentCubemap);
 
         float environmentMip =
             roughness *
@@ -1220,7 +1266,7 @@ float4 PSMain(VSOutput input) : SV_Target0
             );
 
         float multiscatterMip =
-            roughness * 6.0f;
+            roughness * EnvironmentCubeMaximumMip(ggxMultiscatterIrradiance);
 
         float3 multiscatterIrradiance =
             ggxMultiscatterIrradiance.SampleLevel(

@@ -314,8 +314,11 @@ namespace
     {
         // Only switches an enabled group off; a group already inherited stays inherited (its effective value is the World's).
         auto& overrides = local.environmentOverrides;
-        const bool sameSky = local.environmentReference == world.environmentReference &&
-            local.lightingSettings.environmentLuminanceScale == world.lightingSettings.environmentLuminanceScale;
+        const bool sameSky = SceneDocumentSkyType(local) == SceneDocumentSkyType(world) &&
+            SameOptional(local.physicalSky, world.physicalSky) &&
+            local.environmentReference == world.environmentReference &&
+            local.lightingSettings.environmentLuminanceScale == world.lightingSettings.environmentLuminanceScale &&
+            local.lightingSettings.environmentRotationDegrees == world.lightingSettings.environmentRotationDegrees;
         overrides.sky = overrides.sky && !sameSky;
         overrides.exposure = overrides.exposure && local.lightingSettings.referenceEV100 != world.lightingSettings.referenceEV100;
         overrides.haze = overrides.haze && !SameOptional(local.environmentalHaze, world.environmentalHaze);

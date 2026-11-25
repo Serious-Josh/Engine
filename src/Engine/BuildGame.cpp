@@ -698,7 +698,9 @@ void CookSceneAssets(const Request& request, const AssetID& sceneAssetID,
         meshInputs.push_back({asset.id, asset.generation, asset.bytes});
     }
     std::optional<CookedScene::EnvironmentInput> environmentInput;
-    if (!request.document.environmentReference.empty() && request.document.environmentReference != SceneDocument::NoneEnvironmentReference)
+    // Physical sky S0: only an Hdri sky reads an HDRI asset. A physical (or neutral) sky has nothing to cook, pin or validate
+    // beyond its settings block, which the scene payload carries.
+    if (SceneSkyUsesEnvironmentAsset(request.document))
     {
         progress.Report(.3f, "Cooking assigned HDR environment...");
         const auto assetID = *AssetID::ParseReference(request.document.environmentReference);

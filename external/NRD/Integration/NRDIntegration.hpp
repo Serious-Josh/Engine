@@ -234,6 +234,7 @@ bool Integration::_CreateResources() {
     const InstanceDesc& instanceDesc = *GetInstanceDesc(*m_Instance);
     const nri::DeviceDesc& deviceDesc = m_iCore.GetDeviceDesc(*m_Device);
     const uint32_t poolSize = instanceDesc.permanentPoolSize + instanceDesc.transientPoolSize;
+    bool applicationTextures = false; // Engine local edit (allocator P3; ENGINE_LOCAL_EDITS.md)
 
     { // Texture pool
         // No reallocation, please!
@@ -272,7 +273,31 @@ bool Integration::_CreateResources() {
                 textureDesc.width = w;
                 textureDesc.height = h;
 
-                NRD_INTEGRATION_RETURN_FALSE_ON_FAILURE(m_iCore.CreateTexture(*m_Device, textureDesc, texture));
+                // Engine local edit begin (allocator P3; ENGINE_LOCAL_EDITS.md): an application-supplied pool texture,
+                // wrapped like the inputs in "DenoiseD3D12"; otherwise NRD's own (the original line).
+                bool applicationTexture = false;
+#ifdef NRI_WRAPPER_D3D12_H
+                applicationTexture = m_Wrapped == nri::GraphicsAPI::D3D12 && m_Desc.createTextureD3D12;
+                if (applicationTexture) {
+                    if (i < instanceDesc.permanentPoolSize)
+                        snprintf(name, sizeof(name), "%s::P(%u)", m_Desc.name, i);
+                    else
+                        snprintf(name, sizeof(name), "%s::T(%u)", m_Desc.name, i - instanceDesc.permanentPoolSize);
+
+                    ID3D12Resource* d3d12Resource = (ID3D12Resource*)m_Desc.createTextureD3D12(m_Desc.createTextureUserArg, textureDesc, name);
+                    NRD_INTEGRATION_RETURN_FALSE_ON_FAILURE(d3d12Resource ? nri::Result::SUCCESS : nri::Result::FAILURE);
+
+                    nri::TextureD3D12Desc textureD3D12Desc = {};
+                    textureD3D12Desc.d3d12Resource = d3d12Resource;
+                    const nri::Result wrapped = m_iWrapperD3D12.CreateTextureD3D12(*m_Device, textureD3D12Desc, texture);
+                    d3d12Resource->Release(); // the wrapper holds its own reference
+                    NRD_INTEGRATION_RETURN_FALSE_ON_FAILURE(wrapped);
+                }
+#endif
+                if (!applicationTexture)
+                    NRD_INTEGRATION_RETURN_FALSE_ON_FAILURE(m_iCore.CreateTexture(*m_Device, textureDesc, texture));
+                applicationTextures = applicationTextures || applicationTexture;
+                // Engine local edit end
 
                 if (i < instanceDesc.permanentPoolSize)
                     snprintf(name, sizeof(name), "%s::P(%u)", m_Desc.name, i);
@@ -330,6 +355,8 @@ bool Integration::_CreateResources() {
         nri::ResourceGroupDesc resourceGroupDesc = {};
         resourceGroupDesc.memoryLocation = nri::MemoryLocation::DEVICE;
         resourceGroupDesc.textureNum = (uint32_t)textures.size();
+        if (applicationTextures) // Engine local edit (allocator P3; ENGINE_LOCAL_EDITS.md): their memory is the application's
+            resourceGroupDesc.textureNum = 0;
         resourceGroupDesc.textures = textures.data();
         resourceGroupDesc.residencyPriority = m_Desc.residencyPriority;
 

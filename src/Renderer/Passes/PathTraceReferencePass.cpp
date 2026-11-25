@@ -9,6 +9,7 @@
 #include "Renderer/DescriptorHeap.h"
 #include "Renderer/GraphicsDevice.h"
 #include "Renderer/RenderTarget.h"
+#include "Renderer/TextureMemoryAllocator.h"
 
 #include "Renderer/Shader/ShaderLibrary.h"
 
@@ -1766,6 +1767,9 @@ bool PathTraceReferencePass::CreateTextures(
     // Statistics survive resize: they are cumulative and only read as differences.
     if(!m_statisticsTexture.GetResource())
     {
+        // Accumulated with InterlockedAdd from creation and never cleared, so committed (zeroed) memory, for the session.
+        const TextureMemoryAllocator::CommittedTargetScope committedStatistics;
+
         if(!m_statisticsTexture.Initialize(device, StatisticsWidth, 1, 1, 1, DXGI_FORMAT_R32_UINT,
             unorderedAccess, initialState) ||
             !m_statisticsTexture.CreateUAV(device, descriptorHeap))

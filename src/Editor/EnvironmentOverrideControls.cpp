@@ -19,7 +19,7 @@ namespace
     };
 
     constexpr GroupInfo Groups[] = {
-        {Group::Sky, "Sky", "HDRI and environment luminance"},
+        {Group::Sky, "Sky", "sky type, physical sky, HDRI and environment luminance"},
         {Group::Exposure, "Exposure reference", "reference EV100"},
         {Group::Haze, "Haze", "environmental haze"},
         {Group::Mist, "Mist appearance", "mist rendering"},

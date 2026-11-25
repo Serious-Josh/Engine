@@ -1,5 +1,6 @@
 #include "BottomLevelAccelerationStructure.h"
 #include "BLASMemoryPool.h"
+#include "Renderer/TextureMemoryAllocator.h"
 #include "Debug/MemoryRegistry.h"
 #include "Debug/StreamingTelemetry.h"
 #include "BLASGeometryDescription.h"
@@ -223,9 +224,18 @@ bool BottomLevelAccelerationStructure::InitializeBuild(
 
     resourceDescription.Width = prebuildInfo.ScratchDataSizeInBytes;
 
-    HRESULT result =
-        device->CreateCommittedResource(&heapProperties, D3D12_HEAP_FLAG_NONE, &resourceDescription,
-                                        D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&m_scratchResource));
+    // Scratch and pool blocks in Engine-owned memory (TextureMemoryAllocator.h), activated below before the build;
+    // committed otherwise.
+    const TextureMemoryAllocator::ActivatedBufferScope placement;
+    HRESULT result = TextureMemoryAllocator::CreateBuffer(device, resourceDescription, D3D12_RESOURCE_STATE_COMMON,
+        &m_scratchResource);
+
+    if (FAILED(result))
+    {
+        m_scratchResource = nullptr;
+        result = device->CreateCommittedResource(&heapProperties, D3D12_HEAP_FLAG_NONE, &resourceDescription,
+                                                 D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&m_scratchResource));
+    }
 
     if (FAILED(result))
     {
@@ -247,6 +257,12 @@ bool BottomLevelAccelerationStructure::InitializeBuild(
         Shutdown();
         return false;
     }
+
+    // A reused range needs only the aliasing barrier: the build writes the scratch and the result in full. A pool block is
+    // activated by its first BLAS (later calls do nothing).
+    TextureMemoryAllocator::RecordActivation(commandList, m_scratchResource, D3D12_RESOURCE_STATE_COMMON);
+    TextureMemoryAllocator::RecordActivation(commandList, m_result->GetResource(),
+        D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE);
 
     D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC buildDescription{};
     buildDescription.Inputs = buildInputs;

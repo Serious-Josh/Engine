@@ -2,6 +2,7 @@
 #include "Debug/MemoryRegistry.h"
 #include "DescriptorHeap.h"
 #include "ResourceUploader.h"
+#include "TextureMemoryAllocator.h"
 
 #include <cstdint>
 
@@ -68,8 +69,20 @@ bool Buffer::Initialize(
     resourceDescription.SampleDesc.Count = 1;
     resourceDescription.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
 
-    HRESULT result = device->CreateCommittedResource(&heapProperties, D3D12_HEAP_FLAG_NONE, &resourceDescription,
-                                                     D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&m_resource));
+    HRESULT result = E_FAIL;
+
+    {
+        // Engine-owned memory: the upload below writes every byte and activates the buffer first (TextureMemoryAllocator.h).
+        const TextureMemoryAllocator::ActivatedBufferScope placement;
+        result = TextureMemoryAllocator::CreateBuffer(device, resourceDescription, D3D12_RESOURCE_STATE_COMMON, &m_resource);
+    }
+
+    if (FAILED(result))
+    {
+        m_resource = nullptr;
+        result = device->CreateCommittedResource(&heapProperties, D3D12_HEAP_FLAG_NONE, &resourceDescription,
+                                                 D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&m_resource));
+    }
 
     if (FAILED(result))
     {
@@ -105,9 +118,10 @@ bool Buffer::InitializeGPUWritableSeeded(
     size_t capacityBytes,
     D3D12_RESOURCE_STATES finalState)
 {
+    // Committed: the upload writes only `size` of `capacityBytes`, and the rest stays zeroed as it always did.
     if (!data || size == 0 || size > capacityBytes ||
 
-        !AllocateGPUWritable(device, capacityBytes, D3D12_RESOURCE_STATE_COMMON))
+        !AllocateGPUWritable(device, capacityBytes, D3D12_RESOURCE_STATE_COMMON, false))
     {
         return false;
     }
@@ -134,7 +148,8 @@ bool Buffer::InitializeGPUWritableSeeded(
 bool Buffer::AllocateGPUWritable(
     ID3D12Device* device,
     size_t capacityBytes,
-    D3D12_RESOURCE_STATES initialState)
+    D3D12_RESOURCE_STATES initialState,
+    bool placementAllowed)
 {
     if (!device ||
         capacityBytes == 0 ||
@@ -170,8 +185,17 @@ bool Buffer::AllocateGPUWritable(
 
     ID3D12Resource* resource = nullptr;
 
-    const HRESULT result = device->CreateCommittedResource(&heapProperties, D3D12_HEAP_FLAG_NONE, &resourceDescription,
-                                                           initialState, nullptr, IID_PPV_ARGS(&resource));
+    // Engine-owned memory on the render thread (zero-filled when the allocator activates it) or for an owner that activates
+    // it (TextureMemoryAllocator.h); committed otherwise.
+    HRESULT result = placementAllowed ?
+        TextureMemoryAllocator::CreateBuffer(device, resourceDescription, initialState, &resource) : E_NOTIMPL;
+
+    if (FAILED(result))
+    {
+        resource = nullptr;
+        result = device->CreateCommittedResource(&heapProperties, D3D12_HEAP_FLAG_NONE, &resourceDescription,
+                                                 initialState, nullptr, IID_PPV_ARGS(&resource));
+    }
 
     if (FAILED(result))
     {
@@ -315,10 +339,21 @@ bool Buffer::ReplaceData(
     resourceDescription.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
 
     ID3D12Resource* replacement = nullptr;
+    HRESULT result = E_FAIL;
 
-    const HRESULT result =
-        device->CreateCommittedResource(&heapProperties, D3D12_HEAP_FLAG_NONE, &resourceDescription,
-                                        D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&replacement));
+    {
+        // Engine-owned memory: the upload below writes every byte and activates the buffer first (TextureMemoryAllocator.h).
+        const TextureMemoryAllocator::ActivatedBufferScope placement;
+        result = TextureMemoryAllocator::CreateBuffer(device, resourceDescription, D3D12_RESOURCE_STATE_COPY_DEST,
+            &replacement);
+    }
+
+    if (FAILED(result))
+    {
+        replacement = nullptr;
+        result = device->CreateCommittedResource(&heapProperties, D3D12_HEAP_FLAG_NONE, &resourceDescription,
+                                                 D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&replacement));
+    }
 
     if (FAILED(result))
     {

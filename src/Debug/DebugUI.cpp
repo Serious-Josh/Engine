@@ -588,13 +588,112 @@ DebugUI::GpuTimingConfiguration DebugUI::CurrentGpuTimingConfiguration() const
     return configuration;
 }
 
+void DebugUI::UpdateFrameRateMeter()
+{
+    using Clock = std::chrono::steady_clock;
+    constexpr double WindowSeconds = 0.5;
+    FrameRateMeter& meter = m_frameRates;
+    const Clock::time_point now = Clock::now();
+
+    // Switching the present path drains the GPU and restarts the presenter: a fresh window, in the new mode only.
+    if(!meter.started || meter.frameGenerationPresentation != m_frameGenerationPresentation)
+    {
+        meter = {};
+        meter.windowStart = now;
+        meter.started = true;
+        meter.frameGenerationPresentation = m_frameGenerationPresentation;
+        meter.presentsBaseline = m_frameGenerationPresents;
+        meter.generatedBaseline = m_frameGenerationGeneratedPresents;
+        return;
+    }
+
+    // One call per rendered frame: each counts the interval since the previous one.
+    ++meter.realFrames;
+
+    if(meter.frameGenerationPresentation)
+    {
+        // The presenter's counters restart with it (a resize restarts the present path without leaving it).
+        if(m_frameGenerationPresents < meter.presentsBaseline || m_frameGenerationGeneratedPresents < meter.generatedBaseline)
+        {
+            meter.presentsBaseline = 0;
+            meter.generatedBaseline = 0;
+        }
+
+        meter.presentedFrames += m_frameGenerationPresents - meter.presentsBaseline;
+        meter.generatedFrames += m_frameGenerationGeneratedPresents - meter.generatedBaseline;
+        meter.presentsBaseline = m_frameGenerationPresents;
+        meter.generatedBaseline = m_frameGenerationGeneratedPresents;
+    }
+    else
+    {
+        // Ordinary presentation presents each rendered frame once.
+        ++meter.presentedFrames;
+    }
+
+    const double elapsed = std::chrono::duration<double>(now - meter.windowStart).count();
+
+    if(elapsed < WindowSeconds)
+    {
+        return;
+    }
+
+    meter.valid = true;
+    meter.realFps = static_cast<double>(meter.realFrames) / elapsed;
+    meter.presentedFps = static_cast<double>(meter.presentedFrames) / elapsed;
+    meter.generatedFps = static_cast<double>(meter.generatedFrames) / elapsed;
+    meter.windowStart = now;
+    meter.realFrames = 0;
+    meter.presentedFrames = 0;
+    meter.generatedFrames = 0;
+}
+
+void DebugUI::DrawFrameRates() const
+{
+    const FrameRateMeter& rates = m_frameRates;
+
+    if(!rates.valid)
+    {
+        ImGui::TextUnformatted("Real FPS: -- (measuring)");
+        ImGui::TextUnformatted("Presented FPS: -- (measuring)");
+        return;
+    }
+
+    ImGui::Text("Real FPS: %.1f (%.2f ms per rendered frame)", rates.realFps, 1000.0 / rates.realFps);
+
+    if(ImGui::IsItemHovered())
+    {
+        ImGui::SetTooltip("Frames the renderer rendered, over the last half second.");
+    }
+
+    if(!rates.frameGenerationPresentation)
+    {
+        ImGui::Text("Presented FPS: %.1f (Frame Generation off)", rates.presentedFps);
+    }
+    else if(rates.generatedFps > 0.0)
+    {
+        ImGui::Text("Presented FPS: %.1f (%.1f of them generated)", rates.presentedFps, rates.generatedFps);
+    }
+    else
+    {
+        ImGui::Text("Presented FPS: %.1f (Frame Generation on, none generated)", rates.presentedFps);
+    }
+
+    if(ImGui::IsItemHovered())
+    {
+        ImGui::SetTooltip("Frames handed to the display, over the same half second: real frames plus DLSS Frame Generation's\n"
+            "generated frames while it runs. Above the monitor's refresh rate, Windows drops some of them.");
+    }
+}
+
 void DebugUI::DrawPerformanceWindow(
     const std::vector<std::string>& environmentNames,
     size_t currentEnvironmentIndex,
     const RendererStatistics& statistics)
 {
-    ImGuiIO& io = ImGui::GetIO();
     const GpuTimestampProfiler::Results& gpu = statistics.gpuTimings;
+
+    // Counted whether or not Pass Timings is open, so the readout is current when it opens.
+    UpdateFrameRateMeter();
 
     // D1: a different pass graph starts fresh statistics. Frames up to the newest completed one plus every slot still
     // in flight were recorded before this request reaches the renderer, so they are skipped as well.
@@ -650,12 +749,7 @@ void DebugUI::DrawPerformanceWindow(
 
         if(ImGui::Begin("Pass Timings", &m_showPassTimings))
         {
-            ImGui::Text("%.1f FPS", io.Framerate);
-
-            if (io.Framerate > 0.0f)
-            {
-                ImGui::Text("%.2f ms (smoothed frame interval)", 1000.0f / io.Framerate);
-            }
+            DrawFrameRates();
 
             ImGui::Separator();
 
@@ -846,7 +940,18 @@ void DebugUI::DrawPerformanceWindow(
                                                      ? environmentNames[currentEnvironmentIndex].c_str()
                                                      : "Unknown";
 
-            if (ImGui::BeginCombo("HDRI", currentEnvironmentName))
+            if (m_skyEditedInLevelSky)
+            {
+                // Physical sky S4: the project scene's sky (its HDRI, intensity and rotation) is edited in Level > Sky.
+                ImGui::TextUnformatted("HDRI and sky:");
+                ImGui::SameLine();
+
+                if (ImGui::SmallButton("Level > Sky##DebugSky"))
+                {
+                    m_openSkyWindowRequested = true;
+                }
+            }
+            else if (ImGui::BeginCombo("HDRI", currentEnvironmentName))
             {
                 for (size_t i = 0; i < environmentNames.size(); ++i)
                 {

@@ -251,7 +251,7 @@ bool FileBackedDemoScene::AdvanceStagedInitialization(bool& done)
         // effective sky (no request for a sky that is immediately replaced).
         ReadEnvironmentWorld();
         RefreshEnvironmentPreview(false);
-        m_publishedEnvironmentReference = m_runtime->GetScene().GetEnvironmentReference();
+        m_publishedEnvironmentReference = GetEnvironmentRequestReference();
         done = true;
         return true;
 
@@ -1164,6 +1164,28 @@ bool FileBackedDemoScene::SetSceneEnvironmentalHaze(const std::optional<Environm
     return m_runtime->SetSceneEnvironmentalHaze(expected, replacement, errorMessage);
 }
 
+bool FileBackedDemoScene::SetSceneSky(const SceneSky& expected, const SceneSky& replacement, std::string* errorMessage)
+{
+    if(!m_initialized || m_objectMutationCandidate)
+    {
+        if(errorMessage)
+        {
+            *errorMessage = "The scene is not ready for sky edits.";
+        }
+
+        return false;
+    }
+
+    if(!m_runtime->SetSceneSky(expected, replacement, errorMessage))
+    {
+        return false;
+    }
+
+    // The effective sky (and its environment request) follows at once, as an override switch does.
+    RefreshEnvironmentPreview(false);
+    return true;
+}
+
 bool FileBackedDemoScene::SetSceneAirEnvironment(const std::optional<AirEnvironmentSettings>& expected,
     const std::optional<AirEnvironmentSettings>& replacement, std::string* errorMessage)
 {
@@ -1344,12 +1366,16 @@ bool FileBackedDemoScene::RefreshEnvironmentPreview(bool rereadWorld)
     input.name = document.name;
     input.owningWorld = document.owningWorld;
     input.environmentOverrides = document.environmentOverrides;
+    // Physical sky S0: the sky type and physical sky are edited in the document (the Sky window), so the document's are live.
+    input.skyType = document.skyType;
+    input.physicalSky = document.physicalSky;
     input.environmentReference = document.environmentOverrides.sky ? scene.GetEnvironmentReference() : document.environmentReference;
     input.lightingSettings = document.lightingSettings;
 
     if(document.environmentOverrides.sky)
     {
         input.lightingSettings.environmentLuminanceScale = scene.GetLightingSettings().environmentLuminanceScale;
+        input.lightingSettings.environmentRotationDegrees = scene.GetLightingSettings().environmentRotationDegrees;
     }
 
     if(document.environmentOverrides.exposure)
@@ -1374,7 +1400,44 @@ bool FileBackedDemoScene::RefreshEnvironmentPreview(bool rereadWorld)
         scene.SetLightingSettings(m_effectiveEnvironment.lightingSettings);
     }
 
-    return scene.GetEnvironmentReference() != m_publishedEnvironmentReference;
+    return GetEnvironmentRequestReference() != m_publishedEnvironmentReference;
+}
+
+SkyType FileBackedDemoScene::GetEffectiveSkyType() const noexcept
+{
+    if(IsArchiveActivation())
+    {
+        const SceneDocument* document = GetSceneDocument();
+        return document ? SceneDocumentSkyType(*document) : SkyType::Neutral;
+    }
+
+    return EffectiveSkyType(m_effectiveEnvironment);
+}
+
+std::optional<PhysicalSkySettings> FileBackedDemoScene::GetEffectivePhysicalSky() const
+{
+    if(GetEffectiveSkyType() != SkyType::Physical)
+    {
+        return std::nullopt;
+    }
+
+    if(IsArchiveActivation())
+    {
+        const SceneDocument* document = GetSceneDocument();
+        return document && document->physicalSky ? *document->physicalSky : PhysicalSkySettings{};
+    }
+
+    return m_effectiveEnvironment.physicalSky.value_or(PhysicalSkySettings{});
+}
+
+std::string FileBackedDemoScene::GetEnvironmentRequestReference() const
+{
+    if(GetEffectiveSkyType() != SkyType::Hdri)
+    {
+        return {};
+    }
+
+    return m_runtime->GetScene().GetEnvironmentReference();
 }
 
 bool FileBackedDemoScene::GetOverride(const SceneEnvironmentOverrides& overrides, EnvironmentGroup group)
@@ -1428,12 +1491,14 @@ bool FileBackedDemoScene::SetEnvironmentOverride(EnvironmentGroup group, bool en
         {
             scene.SetEnvironmentReference(document.environmentReference);
             lighting.environmentLuminanceScale = document.lightingSettings.environmentLuminanceScale;
+            lighting.environmentRotationDegrees = document.lightingSettings.environmentRotationDegrees;
             scene.SetLightingSettings(lighting);
         }
         else
         {
             document.environmentReference = scene.GetEnvironmentReference();
             document.lightingSettings.environmentLuminanceScale = lighting.environmentLuminanceScale;
+            document.lightingSettings.environmentRotationDegrees = lighting.environmentRotationDegrees;
         }
 
         document.environmentOverrides.sky = enabled;

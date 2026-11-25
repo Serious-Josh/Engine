@@ -5,6 +5,10 @@
 #include <malloc.h>
 #include <psapi.h>
 #include <wrl/client.h>
+#include "Renderer/FrameLighting.h"
+#include "Renderer/ImageLoader.h"
+#include "Scene/CloudPresets.h"
+#include <sstream>
 #endif
 #include "Engine/Engine.h"
 #include "Debug/MemoryMonitor.h"
@@ -2046,6 +2050,23 @@ bool Engine::InitializeProjectIndependent(const EngineStartup& startup)
         initialConfiguration = ResolveRenderingConfiguration(GetActiveProject().GetProjectSettings().settings.rendering);
     }
 
+    // Physical sky S4: the HDRI sky quality (Project Settings, Rendering > Sky; cooked into packaged games) sizes its background
+    // slot, allocated once when the scene renderer initializes. A Project Browser start sets it in InitializeProject.
+    const auto applySkySizes = [&](const SkyRenderingSettings& sky)
+    {
+        m_renderer.SetSkyResourceSizes(SkyEnvironmentWidth(sky.environmentResolution), SkyCubeSize(sky.reflectionCubeSize),
+            HdriSkyBackgroundWidth(sky.hdriQuality));
+    };
+
+    if(packaged)
+    {
+        applySkySizes(m_packagedRenderingSettings.sky);
+    }
+    else if(m_activeProject)
+    {
+        applySkySizes(GetActiveProject().GetProjectSettings().settings.rendering.sky);
+    }
+
     m_rendererAttempted=true;
     const auto rendererStarted = std::chrono::steady_clock::now();
     bool rendererInitialized = false;
@@ -2302,7 +2323,12 @@ bool Engine::InitializeProject()
         Renderer::IsDlssRenderScale(static_cast<Renderer::RenderScale>(projectConfiguration.renderScaleIndex)));
 
     // M0c.5 Stage 5.1: a Project Browser start completes the renderer here, once, before any preparation or scene. A failure
-    // fails project initialization (closed, as before); other starts initialized it in Renderer::Initialize.
+    // fails project initialization (closed, as before); other starts initialized it in Renderer::Initialize. Physical sky S4: with
+    // the project's HDRI sky quality (ignored once the scene renderer exists).
+    const SkyRenderingSettings& projectSky = GetActiveProject().GetProjectSettings().settings.rendering.sky;
+    m_renderer.SetSkyResourceSizes(SkyEnvironmentWidth(projectSky.environmentResolution), SkyCubeSize(projectSky.reflectionCubeSize),
+        HdriSkyBackgroundWidth(projectSky.hdriQuality));
+
     if(!m_renderer.EnsureSceneRenderer())
     {
         Log::Error("Failed to initialize the scene renderer.");
@@ -3474,6 +3500,9 @@ void Engine::Frame()
         // Archive-only lighting from the cooked document; payloads before 11 carry no Lights, so
         // they render with their legacy sun exactly as before.
         options.sharedLighting = CaptureSharedSceneLightingForFrame(*owner->m_runtime);
+        // Physical sky S1: the cooked sky (payload 38; earlier archives derive Hdri or Neutral and have none). S4: an HDRI sky.
+        options.physicalSky = owner->GetEffectivePhysicalSky();
+        options.hdriSky = ActiveSceneUsesSkyHdri();
         options.frameDeltaSeconds = m_time.GetDeltaTime();
         // S0.5: as in the Editor frame, observe the scene environment request (failure handling).
         PollSceneEnvironment();
@@ -3531,6 +3560,23 @@ void Engine::Frame()
     if (!DeliverFrameDisplacementCompletion(displacementCompletionDelivered))
     {
         return;
+    }
+
+    // Physical sky S4: the Sky window's HDRI Sky picker, applied as the Debug combo's choice is (a failure is reported, the scene
+    // keeps its sky).
+    if (const auto skyHdri = m_editor.TakeSkyHdriRequest())
+    {
+        std::string environmentError;
+
+        if (!AssignSceneEnvironment(*skyHdri, environmentError))
+        {
+            Log::Error("Failed to choose the HDRI sky: " + environmentError);
+        }
+    }
+
+    if (debugUI.TakeOpenSkyWindowRequest())
+    {
+        m_editor.OpenSkyWindow();
     }
 
     if (debugUI.HasEnvironmentChangeRequest())
@@ -3874,6 +3920,11 @@ void Engine::Frame()
     debugUI.SetSharcStatus(m_renderer.GetSharcStatus());
     // The snapshot of the last recording; this frame's request reaches the Renderer after the UI is drawn.
     debugUI.SetLightingModeTransitionStatus(m_renderer.GetLightingModeTransitionStatus());
+    debugUI.SetSkyEditedInLevelSky(dynamic_cast<const FileBackedDemoScene*>(&activeDemo) != nullptr);
+    // Pass Timings' Presented FPS counts the Frame Generation present path's presents, generated frames included.
+    const FramePresenter::Statistics framePresentation = m_renderer.GetFramePresentationStatistics();
+    debugUI.SetFramePresentationCounts(m_renderer.IsFrameGenerationPresentationActive(), framePresentation.presents,
+        framePresentation.generatedPresents);
     debugUI.DrawPerformanceWindow(environmentNames, m_renderer.GetCurrentEnvironmentIndex(),
                                   m_renderer.GetStatistics());
     debugUI.DrawLightingModeTransitionIndicator(viewportRectangle.position.x, viewportRectangle.position.y,
@@ -4379,6 +4430,12 @@ void Engine::Frame()
 
         RefreshSceneEnvironmentCalibration();
         rendererOptions.sharedLighting = CaptureSharedSceneLightingForFrame(*physicsScene->m_runtime);
+        // Physical sky S1: the effective physical sky (World inheritance, Local overrides), or the value being dragged in the Sky
+        // window, which re-bakes live and commits as one edit on release.
+        rendererOptions.physicalSky = m_editor.GetRenderedPhysicalSky(*physicsScene);
+        rendererOptions.physicalSkyUpdateRequest = m_editor.ConsumeSkyUpdateRequest();
+        // S4: the HDRI sky this scene requested (ApplySceneEnvironment).
+        rendererOptions.hdriSky = ActiveSceneUsesSkyHdri();
     }
 
     // VX.5: static voxel residency follows the scene's published bake and the camera that renders this frame (the Game Play

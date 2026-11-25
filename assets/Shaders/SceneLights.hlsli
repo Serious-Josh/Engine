@@ -45,11 +45,24 @@ static const float SCENE_LIGHT_MINIMUM_DISTANCE = 0.01f;
 // saturate(1 - (d / range)^4)^2; without (range < 0) the inverse-square law holds up to the cutoff.
 // Spot: additionally t^2 between the outer and inner cone cosines, the profile its flux is normalized
 // over (Photometry::SpotEmissionSolidAngle). Directional: constant illuminance.
+#if defined(SCENE_LIGHTS_MOON_CLOUD_SHADOW)
+// Physical sky S5B: the physical sky's moon (a Directional whose padding.x is 1; FrameLighting.cpp) through the clouds' moon shadow at
+// the surface. A shader defines SCENE_LIGHTS_MOON_CLOUD_SHADOW before including this file and defines this function (SkyFrame.hlsli's
+// SkyFrameMoonCloudShadow with its frame information index); elsewhere the moon is not shadowed by clouds, as the sun is not.
+float SceneLightMoonCloudShadow(float3 surfacePosition);
+#endif
+
 float3 EvaluateSceneLightIncidence(GPULight light, float3 surfacePosition, out float3 directionToLight)
 {
     if(light.type == SCENE_LIGHT_DIRECTIONAL)
     {
         directionToLight = -light.direction;
+#if defined(SCENE_LIGHTS_MOON_CLOUD_SHADOW)
+        if(light.padding.x > 0.5f)
+        {
+            return light.radiance * SceneLightMoonCloudShadow(surfacePosition);
+        }
+#endif
         return light.radiance;
     }
 

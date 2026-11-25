@@ -12,7 +12,8 @@ bool EquirectangularToCubemapPass::Initialize(
     ID3D12Device* device,
     ShaderLibrary& shaderLibrary,
     DescriptorHeap& rtvHeap,
-    Texture& cubemap)
+    Texture& cubemap,
+    const char* shaderPath)
 {
     if (!device || !cubemap.GetResource())
     {
@@ -22,7 +23,7 @@ bool EquirectangularToCubemapPass::Initialize(
     m_rtvHeap = &rtvHeap;
 
     ShaderDescription vertexDescription{};
-    vertexDescription.path = "EquirectangularToCubemap.hlsl";
+    vertexDescription.path = shaderPath;
     vertexDescription.entryPoint = "VSMain";
     vertexDescription.stage = ShaderStage::Vertex;
 
@@ -36,7 +37,7 @@ bool EquirectangularToCubemapPass::Initialize(
 
     ShaderDescription pixelDescription{};
 
-    pixelDescription.path = "EquirectangularToCubemap.hlsl";
+    pixelDescription.path = shaderPath;
     pixelDescription.entryPoint = "PSMain";
     pixelDescription.stage = ShaderStage::Pixel;
 
@@ -215,6 +216,57 @@ void EquirectangularToCubemapPass::RecordRows(ID3D12GraphicsCommandList* command
     if (rowEnd == size)
     {
         cubemap.Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, subresource);
+    }
+}
+
+void EquirectangularToCubemapPass::RecordMips(ID3D12GraphicsCommandList* commandList, Texture& sourceTexture, Texture& cubemap,
+    unsigned int firstMip, unsigned int endMip)
+{
+    endMip = (std::min)(endMip, m_mipLevels);
+
+    if (!commandList || !m_rtvHeap || firstMip >= endMip)
+    {
+        return;
+    }
+
+    for (unsigned int mip = firstMip; mip < endMip; ++mip)
+    {
+        for (unsigned int face = 0; face < 6; ++face)
+        {
+            cubemap.Transition(commandList, D3D12_RESOURCE_STATE_RENDER_TARGET, mip + face * m_mipLevels);
+        }
+    }
+
+    commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    m_pipeline.Bind(commandList);
+
+    for (unsigned int mip = firstMip; mip < endMip; ++mip)
+    {
+        const unsigned int size = (std::max)(1u, m_size >> mip);
+        D3D12_VIEWPORT viewport{};
+        viewport.Width = static_cast<float>(size);
+        viewport.Height = static_cast<float>(size);
+        viewport.MaxDepth = 1.0f;
+        commandList->RSSetViewports(1, &viewport);
+        const D3D12_RECT scissor{0, 0, static_cast<LONG>(size), static_cast<LONG>(size)};
+        commandList->RSSetScissorRects(1, &scissor);
+
+        for (unsigned int face = 0; face < 6; ++face)
+        {
+            D3D12_CPU_DESCRIPTOR_HANDLE rtv = m_rtvHeap->GetCPUHandle(m_rtvIndices[mip * 6 + face]);
+            commandList->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+            unsigned int constants[4] = {sourceTexture.GetDescriptorIndex(), face, mip, m_mipLevels};
+            commandList->SetGraphicsRoot32BitConstants(0, 4, constants, 0);
+            commandList->DrawInstanced(3, 1, 0, 0);
+        }
+    }
+
+    for (unsigned int mip = firstMip; mip < endMip; ++mip)
+    {
+        for (unsigned int face = 0; face < 6; ++face)
+        {
+            cubemap.Transition(commandList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, mip + face * m_mipLevels);
+        }
     }
 }
 

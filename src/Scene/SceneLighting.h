@@ -25,6 +25,8 @@ struct ResolvedSceneLight
     Vector3 color{1.0f, 1.0f, 1.0f};
     float intensity = 0.0f;
     float angularRadius = 0.0f;
+    // Physical sky S2: LightComponent::affectsAtmosphere (Directional).
+    bool affectsAtmosphere = true;
     float range = 0.0f;
     bool rangeAttenuation = true;
     float innerConeAngle = 0.0f;

@@ -15,6 +15,7 @@
 #endif
 
 #include <d3d12.h>
+#include <wrl/client.h>
 
 #include <NRD.h>
 #include <NRI.h>
@@ -220,6 +221,9 @@ class NrdDenoiser
         uint32_t height);
     // The SDK part of a (re)creation: device calls only, so it may run on the creation thread.
     nrd::Result CreateSdkInstance(uint32_t width, uint32_t height);
+    // Allocator P3: the integration's pool texture creation (IntegrationCreationDesc::createTextureD3D12, an Engine local
+    // edit of NRDIntegration): a placed texture in Engine-owned memory (TextureMemoryAllocator.h), committed otherwise.
+    static void* CreatePoolTexture(void* userArg, const nri::TextureDesc& textureDesc, const char* name);
     // The renderer-thread part: the pool states and the output textures with their descriptors.
     bool CreateOutputs(DescriptorHeap& descriptorHeap, uint32_t width, uint32_t height);
     Denoiser* FindDenoiser(nrd::Identifier identifier);
@@ -235,6 +239,9 @@ class NrdDenoiser
     // R.1: the integration's texture-pool barrier states, mirrored transactionally (NRD tracks them itself): a discarded
     // recording that ran Denoise returns them to the last submitted states before the next Denoise.
     TransactionalResourceState<std::vector<nri::AccessLayoutStage>> m_poolStates;
+    // Allocator P3: the pool textures this instance supplied, activated by Denoise before NRD uses them (each call records
+    // what no submitted recording has activated yet). Released before the integration is destroyed.
+    std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>> m_poolTextures;
     // R.9A: the last SetCommonSettings' FrameSettings::historyConfidence, which Denoise's confidence bindings follow.
     bool m_historyConfidence = false;
     Description m_description;

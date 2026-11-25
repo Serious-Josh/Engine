@@ -351,6 +351,25 @@ void Editor::DrawObjectLightControls(IDemoScene& scene)
         }
     }
 
+    if(light.type == LightType::Directional)
+    {
+        bool affectsAtmosphere = light.affectsAtmosphere;
+
+        if(ImGui::Checkbox("Affect Physically Based Sky", &affectsAtmosphere) && !blocked)
+        {
+            auto edited = light;
+            edited.affectsAtmosphere = affectsAtmosphere;
+            CommitObjectLight(scene, *selection, object.light, edited);
+        }
+
+        if(ImGui::IsItemHovered())
+        {
+            ImGui::SetTooltip("With a physically based sky: on, the illuminance is above the atmosphere, which attenuates and "
+                "tints the sun on its way down and is lit by it (the scene sun only). Off: the illuminance is at the ground "
+                "and the sky is not lit by this light.");
+        }
+    }
+
     for(size_t index = 0; index < kLightFields.size(); ++index)
     {
         if(!IsFieldShown(light.type, index))

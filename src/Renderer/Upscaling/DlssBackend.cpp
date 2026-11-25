@@ -2,14 +2,19 @@
 
 #include "Core/Log.h"
 #include "Renderer/ResourceStateTransaction.h"
+#include "Renderer/TextureMemoryAllocator.h"
 
 #include <Windows.h>
 #include <ShlObj.h>
 #include <d3d12.h>
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <iterator>
 #include <limits>
@@ -858,6 +863,156 @@ DlssBackend::InitializationOutcome DlssBackend::RunInitialize(ID3D12Device* devi
     return finish(DlssAvailability::Available, "NGX initialized; Super Resolution capability available.");
 }
 
+namespace
+{
+    // Allocator P4 (TextureMemoryAllocator.h): NGX's own resources in Engine-owned memory, through NGX's resource
+    // callbacks (DLSS Programming Guide §6, "Resource Management"). The callbacks carry no user data, so the device and the
+    // command list NGX records on while it allocates are process-wide here; NGX creates and evaluates features on the
+    // render thread, inside NgxCommandListScope.
+    ID3D12Device* g_ngxAllocationDevice = nullptr;
+    thread_local ID3D12GraphicsCommandList* t_ngxCommandList = nullptr;
+    // Debug: what the callbacks created, for the coverage line logged at each feature creation.
+    std::atomic<std::uint64_t> g_ngxPlacedResources{0};
+    std::atomic<std::uint64_t> g_ngxPlacedBytes{0};
+    std::atomic<std::uint64_t> g_ngxCommittedResources{0};
+    std::atomic<std::uint64_t> g_ngxCommittedBytes{0};
+    // Why committed: a buffer, another heap type, outside an NGX call, or a texture the allocator declined.
+    std::array<std::atomic<std::uint64_t>, 4> g_ngxCommittedByReason{};
+
+    // Debug A/B: ENGINE_NGX_HEAP_POOL=0 sets no callbacks (NGX allocates committed resources itself). Release: always.
+    bool NgxHeapPoolEnabled()
+    {
+#ifdef NDEBUG
+        return true;
+#else
+        static const bool enabled = []
+        {
+            const char* value = std::getenv("ENGINE_NGX_HEAP_POOL");
+            return !(value && value[0] == '0');
+        }();
+
+        return enabled;
+#endif
+    }
+
+    // The command list an NGX create or evaluate call records on, for the callbacks it makes meanwhile.
+    class NgxCommandListScope
+    {
+    public:
+        explicit NgxCommandListScope(ID3D12GraphicsCommandList* commandList) : m_previous(t_ngxCommandList)
+        {
+            t_ngxCommandList = commandList;
+        }
+
+        ~NgxCommandListScope()
+        {
+            t_ngxCommandList = m_previous;
+        }
+
+        NgxCommandListScope(const NgxCommandListScope&) = delete;
+        NgxCommandListScope& operator=(const NgxCommandListScope&) = delete;
+
+    private:
+        ID3D12GraphicsCommandList* m_previous = nullptr;
+    };
+
+    // A default-heap 2D texture is placed, and activated on the list NGX is recording (aliasing barrier, discard for
+    // render-target, depth and unordered-access textures) before NGX's own commands on it. Buffers (NGX may rely on their
+    // zeroed contents), other heaps and dimensions, and calls outside an NGX create or evaluate are committed, as the
+    // guide's example does.
+    void NVSDK_CONV AllocateNgxResource(D3D12_RESOURCE_DESC* description, int state, CD3DX12_HEAP_PROPERTIES* heap,
+        ID3D12Resource** resource)
+    {
+        if(!resource)
+        {
+            return;
+        }
+
+        *resource = nullptr;
+        // CD3DX12_HEAP_PROPERTIES derives from D3D12_HEAP_PROPERTIES and adds no data (NGX only declares it).
+        const auto* heapProperties = reinterpret_cast<const D3D12_HEAP_PROPERTIES*>(heap);
+        const auto initialState = static_cast<D3D12_RESOURCE_STATES>(state);
+        ID3D12Device* device = g_ngxAllocationDevice;
+        ID3D12GraphicsCommandList* commands = t_ngxCommandList;
+
+        if(!device || !description || !heapProperties)
+        {
+            return;
+        }
+
+        const bool placeable = commands && heapProperties->Type == D3D12_HEAP_TYPE_DEFAULT &&
+            description->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        HRESULT result = E_NOTIMPL;
+
+        if(placeable)
+        {
+            const TextureMemoryAllocator::ActivatedPlacementScope placement;
+            result = TextureMemoryAllocator::CreateTexture(device, *description, initialState, resource);
+
+            if(SUCCEEDED(result))
+            {
+                TextureMemoryAllocator::RecordActivation(commands, *resource, initialState);
+            }
+        }
+
+        const std::uint64_t bytes = device->GetResourceAllocationInfo(0, 1, description).SizeInBytes;
+
+        if(SUCCEEDED(result))
+        {
+            g_ngxPlacedResources.fetch_add(1, std::memory_order_relaxed);
+            g_ngxPlacedBytes.fetch_add(bytes, std::memory_order_relaxed);
+            return;
+        }
+
+        *resource = nullptr;
+
+        if(SUCCEEDED(device->CreateCommittedResource(heapProperties, D3D12_HEAP_FLAG_NONE, description, initialState,
+            nullptr, IID_PPV_ARGS(resource))))
+        {
+            g_ngxCommittedResources.fetch_add(1, std::memory_order_relaxed);
+            g_ngxCommittedBytes.fetch_add(bytes, std::memory_order_relaxed);
+            const std::size_t reason = description->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? 0 :
+                heapProperties->Type != D3D12_HEAP_TYPE_DEFAULT ? 1 : !commands ? 2 : 3;
+            g_ngxCommittedByReason[reason].fetch_add(bytes, std::memory_order_relaxed);
+        }
+    }
+
+    // NGX hands back every resource it allocated, once (a placed range returns to the allocator after the fence; Engine
+    // releases features only after the GPU is past them).
+    void NVSDK_CONV ReleaseNgxResource(IUnknown* resource)
+    {
+        if(resource)
+        {
+            resource->Release();
+        }
+    }
+
+    // Debug: the callbacks' totals after a feature creation (whether NGX allocates through them, and how much).
+    void LogNgxAllocations(const char* featureName)
+    {
+#ifndef NDEBUG
+        if(!NgxHeapPoolEnabled())
+        {
+            return;
+        }
+
+        const auto mebibytes = [](std::uint64_t bytes)
+        {
+            return std::to_string(static_cast<double>(bytes) / (1024.0 * 1024.0));
+        };
+        Log::Info(std::string(featureName) + ": NGX resource callbacks so far: " +
+            std::to_string(g_ngxPlacedResources.load()) + " placed (" + mebibytes(g_ngxPlacedBytes.load()) + " MiB), " +
+            std::to_string(g_ngxCommittedResources.load()) + " committed (" + mebibytes(g_ngxCommittedBytes.load()) +
+            " MiB: buffers " + mebibytes(g_ngxCommittedByReason[0].load()) + ", other heaps " +
+            mebibytes(g_ngxCommittedByReason[1].load()) + ", outside an NGX call " +
+            mebibytes(g_ngxCommittedByReason[2].load()) + ", declined textures " +
+            mebibytes(g_ngxCommittedByReason[3].load()) + ").");
+#else
+        (void)featureName;
+#endif
+    }
+}
+
 bool DlssBackend::EnsureParameters(FeatureSlot& slot, const char* featureName)
 {
     if(slot.parameters)
@@ -880,6 +1035,15 @@ bool DlssBackend::EnsureParameters(FeatureSlot& slot, const char* featureName)
     }
 
     slot.parameters = parameters;
+
+    // Allocator P4: the feature's resources through Engine's callbacks (AllocateNgxResource).
+    if(NgxHeapPoolEnabled() && m_device)
+    {
+        g_ngxAllocationDevice = m_device;
+        parameters->Set(NVSDK_NGX_Parameter_ResourceAllocCallback, reinterpret_cast<void*>(&AllocateNgxResource));
+        parameters->Set(NVSDK_NGX_Parameter_ResourceReleaseCallback, reinterpret_cast<void*>(&ReleaseNgxResource));
+    }
+
     return true;
 }
 
@@ -1053,7 +1217,12 @@ bool DlssBackend::EnsureFeature(ID3D12GraphicsCommandList* lifecycleList, unsign
     create.Feature.InPerfQualityValue = qualities[selected];
     create.InFeatureCreateFlags = NVSDK_NGX_DLSS_Feature_Flags_IsHDR | NVSDK_NGX_DLSS_Feature_Flags_MVLowRes;
     NVSDK_NGX_Handle* handle = nullptr;
-    const NVSDK_NGX_Result created = NGX_D3D12_CREATE_DLSS_EXT(lifecycleList, 1, 1, &handle, parameters, &create);
+    const NVSDK_NGX_Result created = [&]
+    {
+        const NgxCommandListScope ngxCommandList(lifecycleList);
+        return NGX_D3D12_CREATE_DLSS_EXT(lifecycleList, 1, 1, &handle, parameters, &create);
+    }();
+    LogNgxAllocations("DLSS Super Resolution");
     feature.createResult = static_cast<std::uint32_t>(created);
     feature.perfQuality = static_cast<int>(qualities[selected]);
     feature.perfQualityName = qualityNames[selected];
@@ -1140,6 +1309,7 @@ bool DlssBackend::Evaluate(ID3D12GraphicsCommandList* commandList, const DlssEva
     parameters.InPreExposure = 1.0f;
     parameters.InExposureScale = 1.0f;
 
+    const NgxCommandListScope ngxCommandList(commandList);
     const NVSDK_NGX_Result result = NGX_D3D12_EVALUATE_DLSS_EXT(commandList,
         static_cast<NVSDK_NGX_Handle*>(slot.handle), static_cast<NVSDK_NGX_Parameter*>(slot.parameters), &parameters);
     slot.status.evaluateResult = static_cast<std::uint32_t>(result);
@@ -1231,6 +1401,7 @@ bool DlssBackend::EvaluateRayReconstruction(ID3D12GraphicsCommandList* commandLi
     parameters.InMVScaleY = 1.0f;
     parameters.InFrameTimeDeltaInMsec = evaluation.frameTimeDeltaMilliseconds;
 
+    const NgxCommandListScope ngxCommandList(commandList);
     const NVSDK_NGX_Result result = NGX_D3D12_EVALUATE_DLSSD_EXT(commandList,
         static_cast<NVSDK_NGX_Handle*>(slot.handle), static_cast<NVSDK_NGX_Parameter*>(slot.parameters), &parameters);
     slot.status.evaluateResult = static_cast<std::uint32_t>(result);
@@ -1454,7 +1625,12 @@ bool DlssBackend::EnsureRayReconstructionFeature(ID3D12GraphicsCommandList* life
     }
 
     NVSDK_NGX_Handle* handle = nullptr;
-    const NVSDK_NGX_Result created = NGX_D3D12_CREATE_DLSSD_EXT(lifecycleList, 1, 1, &handle, parameters, &create);
+    const NVSDK_NGX_Result created = [&]
+    {
+        const NgxCommandListScope ngxCommandList(lifecycleList);
+        return NGX_D3D12_CREATE_DLSSD_EXT(lifecycleList, 1, 1, &handle, parameters, &create);
+    }();
+    LogNgxAllocations("DLSS Ray Reconstruction");
     feature.createResult = static_cast<std::uint32_t>(created);
     feature.perfQuality = static_cast<int>(perfQuality);
     feature.perfQualityName = DlssRayReconstructionQualityName(quality);
@@ -1566,8 +1742,13 @@ bool DlssBackend::EnsureFrameGenerationFeature(ID3D12GraphicsCommandList* lifecy
     create.DynamicResolutionScaling = false;
 
     NVSDK_NGX_Handle* handle = nullptr;
-    const NVSDK_NGX_Result created = NGX_D3D12_CREATE_DLSSG(lifecycleList, 1, 1, &handle,
-        static_cast<NVSDK_NGX_Parameter*>(slot.parameters), &create);
+    const NVSDK_NGX_Result created = [&]
+    {
+        const NgxCommandListScope ngxCommandList(lifecycleList);
+        return NGX_D3D12_CREATE_DLSSG(lifecycleList, 1, 1, &handle, static_cast<NVSDK_NGX_Parameter*>(slot.parameters),
+            &create);
+    }();
+    LogNgxAllocations("DLSS Frame Generation");
     feature.createResult = static_cast<std::uint32_t>(created);
 
     if(NVSDK_NGX_FAILED(created) || !handle)
@@ -1663,6 +1844,7 @@ bool DlssBackend::EvaluateFrameGeneration(ID3D12GraphicsCommandList* commandList
     options.depthSubrectSize = {evaluation.renderWidth, evaluation.renderHeight};
     lastFrameGenerationResetForTesting = reset;
 
+    const NgxCommandListScope ngxCommandList(commandList);
     const NVSDK_NGX_Result result = NGX_D3D12_EVALUATE_DLSSG(commandList, static_cast<NVSDK_NGX_Handle*>(slot.handle),
         static_cast<NVSDK_NGX_Parameter*>(slot.parameters), &resources, &options);
     slot.status.evaluateResult = static_cast<std::uint32_t>(result);

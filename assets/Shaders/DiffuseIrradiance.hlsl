@@ -1,6 +1,11 @@
 #include "Common.hlsli"
 #include "DiffuseHDRIConfig.hlsli"
 
+// Irradiance samples per texel. The physical sky compiles this file with fewer (SkyDiffuseIrradiance.hlsl).
+#ifndef ENVIRONMENT_IRRADIANCE_SAMPLE_COUNT
+#define ENVIRONMENT_IRRADIANCE_SAMPLE_COUNT 4096u
+#endif
+
 struct VSOutput
 {
     float4 position : SV_POSITION;
@@ -292,7 +297,7 @@ float4 PSMain(
     );
 
     static const uint SAMPLE_COUNT =
-        4096u;
+        ENVIRONMENT_IRRADIANCE_SAMPLE_COUNT;
 
     float3 irradiance =
         float3(

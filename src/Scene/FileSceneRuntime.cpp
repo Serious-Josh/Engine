@@ -851,6 +851,50 @@ bool FileSceneRuntime::SetSceneEnvironmentalHaze(const std::optional<Environment
     return true;
 }
 
+bool FileSceneRuntime::SetSceneSky(const SceneSky& expected, const SceneSky& replacement, std::string* errorMessage)
+{
+    if(!m_readOnlyReason.empty())
+    {
+        return ReadOnlyError(errorMessage);
+    }
+
+    const SceneDocument& document = m_fileScene.GetDocument();
+
+    if(document.skyType != expected.type || document.physicalSky != expected.physical)
+    {
+        if(errorMessage)
+        {
+            *errorMessage = "The scene's sky changed meanwhile; edit rejected.";
+        }
+
+        return false;
+    }
+
+    if(replacement.type && !IsValidSkyType(*replacement.type))
+    {
+        if(errorMessage)
+        {
+            *errorMessage = "Invalid scene sky type.";
+        }
+
+        return false;
+    }
+
+    if(replacement.physical && !ValidatePhysicalSkySettings(*replacement.physical, errorMessage))
+    {
+        return false;
+    }
+
+    if(!(expected == replacement))
+    {
+        SceneDocument& edited = m_fileScene.EditDocument();
+        edited.skyType = replacement.type;
+        edited.physicalSky = replacement.physical;
+    }
+
+    return true;
+}
+
 bool FileSceneRuntime::SetSceneAirEnvironment(const std::optional<AirEnvironmentSettings>& expected,
     const std::optional<AirEnvironmentSettings>& replacement, std::string* errorMessage)
 {

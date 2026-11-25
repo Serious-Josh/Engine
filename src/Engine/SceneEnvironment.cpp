@@ -67,11 +67,25 @@ float Engine::ActiveEnvironmentRadianceScale() const
     const auto* scene=m_demoSceneManager.TryGetActiveScene();
     return EnvironmentRadianceMultiplier(scene ? scene->GetScene().GetLightingSettings() : SceneLightingSettings{});
 }
+// Physical sky S4: the active scene's HDRI rotation (its effective Sky group), applied when the HDRI is resampled into the sky.
+float Engine::ActiveEnvironmentRotationDegrees() const
+{
+    const auto* scene=m_demoSceneManager.TryGetActiveScene();
+    return scene ? scene->GetScene().GetLightingSettings().environmentRotationDegrees : 0.0f;
+}
+
+bool Engine::ActiveSceneUsesSkyHdri() const
+{
+    const auto* scene = dynamic_cast<const FileBackedDemoScene*>(m_demoSceneManager.TryGetActiveScene());
+    return scene && m_skyHdriRuntimeIdentity != 0 && scene->GetRuntimeIdentity() == m_skyHdriRuntimeIdentity;
+}
+
 // Rebuilds the scene environment when its calibration was edited (scene changes apply it on activation).
 void Engine::RefreshSceneEnvironmentCalibration()
 {
     if(!dynamic_cast<FileBackedDemoScene*>(m_demoSceneManager.TryGetActiveScene())) return;
-    if(ActiveEnvironmentRadianceScale()==m_appliedEnvironmentRadianceScale) return;
+    if(ActiveEnvironmentRadianceScale()==m_appliedEnvironmentRadianceScale &&
+        ActiveEnvironmentRotationDegrees()==m_appliedEnvironmentRotationDegrees) return;
     std::string error;
     if(!ApplySceneEnvironment(error)) Log::Error("Scene environment calibration failed: "+error);
 }
@@ -91,8 +105,13 @@ bool Engine::ApplySceneEnvironment(std::string& error, bool activation)
         }
 
         const float scale = ActiveEnvironmentRadianceScale();
+        const float rotation = ActiveEnvironmentRotationDegrees();
         m_appliedEnvironmentRadianceScale = scale;
-        const auto& reference = scene->GetScene().GetEnvironmentReference();
+        m_appliedEnvironmentRotationDegrees = rotation;
+        // Physical sky S0: an Hdri sky prepares its reference; Neutral and Physical skies the neutral environment (a Physical
+        // sky lights the frame through the renderer's SkyAtmosphere once it has baked; until then, and as the S0.5 environment,
+        // the neutral one is shown).
+        const std::string reference = scene->GetEnvironmentRequestReference();
         // W3: the standalone preview requests a changed effective sky only when it differs from this publication.
         scene->NotePublishedEnvironment(reference);
         EnvironmentPreparationSource source;
@@ -142,6 +161,33 @@ bool Engine::ApplySceneEnvironment(std::string& error, bool activation)
 
         m_sceneEnvironmentActivation = activation || (m_sceneEnvironmentTicket != 0 && m_sceneEnvironmentActivation);
         source.snapExposure = m_sceneEnvironmentActivation;
+
+        // Physical sky S4, HDRI option A (§4.11): an HDRI image is resampled into the sky's persistent resources; the S0.5
+        // environment then holds the neutral fallback (shown until the sky first publishes, or if the HDRI cannot be prepared).
+        // builtin:none and the neutral environment stay on the S0.5 path.
+        const bool skyHdri = scene->GetEffectiveSkyType() == SkyType::Hdri && !reference.empty() &&
+            reference != SceneDocument::NoneEnvironmentReference && source.identity != "neutral";
+
+        if(skyHdri && m_renderer.GetSkyAtmosphere().IsInitialized())
+        {
+            SkyHdriSource sky;
+            sky.load = std::move(source.load);
+            sky.identity = source.identity;
+            sky.displayName = source.displayName;
+            sky.reference = source.reference;
+            sky.radianceScale = scale;
+            sky.rotationDegrees = rotation;
+            sky.snapExposure = source.snapExposure;
+            m_renderer.RequestEnvironment(Renderer::NeutralEnvironmentSource(scale));
+            m_sceneEnvironmentTicket = m_renderer.RequestSkyHdri(std::move(sky));
+            m_sceneEnvironmentTicketIsSky = true;
+            m_skyHdriRuntimeIdentity = scene->GetRuntimeIdentity();
+            return true;
+        }
+
+        m_renderer.ClearSkyHdri();
+        m_skyHdriRuntimeIdentity = 0;
+        m_sceneEnvironmentTicketIsSky = false;
         m_sceneEnvironmentTicket = m_renderer.RequestEnvironment(std::move(source));
         return true;
     }
@@ -162,7 +208,8 @@ void Engine::PollSceneEnvironment()
     }
 
     std::string error;
-    const auto state = m_renderer.QueryEnvironmentPreparation(m_sceneEnvironmentTicket, &error);
+    const auto state = m_sceneEnvironmentTicketIsSky ? m_renderer.QuerySkyHdri(m_sceneEnvironmentTicket, &error) :
+        m_renderer.QueryEnvironmentPreparation(m_sceneEnvironmentTicket, &error);
 
     if(state == Renderer::EnvironmentPreparationState::Pending)
     {
@@ -230,7 +277,35 @@ bool Engine::AssignSceneEnvironment(size_t index,std::string& error)
         }
         const auto previous=scene->GetScene().GetEnvironmentReference();
         scene->GetScene().SetEnvironmentReference(reference);
-        if(!ApplySceneEnvironment(error)) { scene->GetScene().SetEnvironmentReference(previous); return false; }
+
+        // Physical sky S0: choosing an HDRI (or Neutral, or None) here returns the sky type to the one the choice derives (an
+        // HDRI or None: Hdri; Neutral: Neutral), so the choice is what renders. The HDRI combo stays the place to pick an HDRI
+        // until Level > Sky gains its HDRI section (S4). The sky type is the document's (the Sky window's edits are), and the
+        // stored physical sky is kept.
+        const SceneDocument* document = scene->GetSceneDocument();
+        const SceneSky before = document ? SceneSky{document->skyType, document->physicalSky} : SceneSky{};
+        const SceneSky after{std::nullopt, before.physical};
+        const bool skyChanged = document && !(before == after);
+
+        if(skyChanged && !scene->SetSceneSky(before, after, &error))
+        {
+            scene->GetScene().SetEnvironmentReference(previous);
+            return false;
+        }
+
+        if(!ApplySceneEnvironment(error))
+        {
+            scene->GetScene().SetEnvironmentReference(previous);
+
+            if(skyChanged)
+            {
+                std::string restoreError;
+                scene->SetSceneSky(after, before, &restoreError);
+            }
+
+            return false;
+        }
+
         return true;
     }
     catch(const std::exception& e) { error=e.what(); return false; }
